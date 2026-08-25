@@ -25,6 +25,47 @@ Upstream range: `7584430716ee229751771ed0d6bbcb780d105eeb` (single point)
 Blocks 01-05 and 07-10 are mutually independent and may be applied in any
 order; **block 06 goes last, always**. The order above is the verified order.
 
+## Block stacking tags (git-native path)
+
+The repo also carries lightweight tags `block/01-… block/10-…`, each pointing
+at a squashed commit whose diff-vs-parent is exactly that block's change (the
+commits are stacked in apply order, rooted at an orphan commit whose tree is
+the upstream baseline `758443071`).
+
+**Tags are numbered by APPLY order.** The patch filenames keep the plan's
+topic numbering (block 06 is the "fused core"); the tag number instead
+encodes the sequence - so the fused core, applied last, is `block/10-fused-core`:
+
+| apply | tag | patch file |
+|-------|-----|-----------|
+| 1 | `block/01-adaptive-mtp` | `01-adaptive-mtp.patch` |
+| 2 | `block/02-chunked-gdn` | `02-chunked-gdn.patch` |
+| 3 | `block/03-bf16-kv-cache` | `03-bf16-kv-cache.patch` |
+| 4 | `block/04-wmma-flash-attn` | `04-wmma-flash-attn.patch` |
+| 5 | `block/05-bit-identical-decode-cpu` | `05-bit-identical-decode-cpu.patch` |
+| 6 | `block/06-gfx1151-mmvq-table` | `07-gfx1151-mmvq-table.patch` |
+| 7 | `block/07-host-buffer-revert` | `08-host-buffer-revert.patch` |
+| 8 | `block/08-meta-device-wrapper-skip` | `09-meta-device-wrapper-skip.patch` |
+| 9 | `block/09-q6k-mmvq-vdr2` | `10-q6k-mmvq-vdr2.patch` |
+| 10 (LAST) | `block/10-fused-core` | `06-fused-core.patch` |
+
+Consumer (git-native alternative to `git apply`):
+
+```
+git remote add rdna-boosts git@github.com:stew675/llama-cpp-rdna-boosts.git
+git fetch rdna-boosts --tags
+# on the llama.cpp checkout at the baseline, in apply order:
+git cherry-pick block/01-adaptive-mtp
+...
+git cherry-pick block/10-fused-core     # last
+```
+
+Cherry-pick uses 3-way merge, so each block degrades gracefully when upstream
+master drifts past the recorded baseline. The tags are derived artifacts -
+`scripts/make-patches.sh` rebuilds the whole lineage and force-moves the tags
+deterministically (identical trees, messages and SHAs across runs). The patch
+files remain the primary, reviewable artifact.
+
 ## Verified apply sequence (this branch)
 
 On a fresh checkout of the baseline SHA, the sequence

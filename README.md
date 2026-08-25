@@ -70,6 +70,25 @@ cmake --build build -j
 
 `scripts/apply-all.sh` automates step 3.
 
+### Git-native alternative: block tags
+
+The repo also carries `block/01-… block/10-…` tags - one squashed commit per
+block, stacked in apply order (so the fused core is `block/10-fused-core`,
+applied last; the tag number encodes the sequence, unlike the patch filenames
+which are plan topic IDs). Each tag's diff-vs-parent is exactly that block:
+
+```
+git remote add rdna-boosts git@github.com:stew675/llama-cpp-rdna-boosts.git
+git fetch rdna-boosts --tags
+git cherry-pick block/01-adaptive-mtp   # ... then block/02 … block/10, in order
+git cherry-pick block/10-fused-core     # last
+```
+
+Cherry-picking uses 3-way merge, so blocks degrade more gracefully than
+`git apply` when upstream drifts. The tag->patch mapping is in
+`MANIFESTS.md`; the tags are regenerated deterministically by
+`scripts/make-patches.sh`.
+
 ## When upstream master moves
 
 ```

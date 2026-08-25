@@ -23,7 +23,11 @@ BRANCH="${3:-chunked-gdn}"
 PATCHES="$REPO_DIR/patches"
 TMP="$(mktemp -d /tmp/rdna-patches.XXXXXX)"
 IDENT=(-c user.name=make-patches -c user.email=make-patches@localhost)
-trap 'git -C "$FORK" worktree remove --force "$TMP" 2>/dev/null || true; rm -rf "$TMP"' EXIT
+trap '
+    git -C "$FORK" worktree remove --force "$TMP/wt" 2>/dev/null || true
+    git -C "$REPO_DIR" worktree remove --force "$TMP/tagwt" 2>/dev/null || true
+    rm -rf "$TMP"
+' EXIT
 
 if [ -z "$BASELINE" ]; then
     BASELINE="$(grep -o '`[0-9a-f]\{40\}`' "$REPO_DIR/BASELINE.md" | head -1 | tr -d '`')"
@@ -122,7 +126,7 @@ for name in "${!BLOCKS_MULTI[@]}"; do
       an="$(git show -s --format='%an <%ae>' "$src")"
       ad="$(git show -s --format='%aI' "$src")"
       git reset -q --soft "$BASELINE"
-      git "${IDENT[@]}" commit -q --author="$an" --date="$ad" -m "$msg"
+      GIT_COMMITTER_DATE="$ad" git "${IDENT[@]}" commit -q --author="$an" --date="$ad" -m "$msg"
       git format-patch -1 --stdout > "$PATCHES/$name" )
     ( cd "$TMP/wt" && git reset -q --hard "$BASELINE" )
 done
@@ -153,6 +157,41 @@ fi
 # ---- convenience all-in-one ----
 echo "== rdna-boosts-all.patch"
 git diff "$BASELINE" "$BRANCH" > "$PATCHES/rdna-boosts-all.patch"
+
+# ---- block stacking tags (optional git-native path) ----
+# Build a side lineage in THIS repo: root commit = upstream baseline tree,
+# then one commit per block applied in manifest apply order. Each commit's
+# diff vs its parent is exactly that block's change, so cherry-picking a tag
+# applies just that block (with 3-way merge). Tags are numbered by APPLY
+# order: the fused core is applied last, so it is block/10 - the number
+# encodes the sequence, unlike the patch filenames which are plan topic IDs.
+# Tags are derived artifacts: force-moved on every regeneration.
+echo "== block stacking tags"
+TAG_ORDER="01-adaptive-mtp 02-chunked-gdn 03-bf16-kv-cache 04-wmma-flash-attn 05-bit-identical-decode-cpu 07-gfx1151-mmvq-table 08-host-buffer-revert 09-meta-device-wrapper-skip 10-q6k-mmvq-vdr2 06-fused-core"
+TAG_NAMES="block/01-adaptive-mtp block/02-chunked-gdn block/03-bf16-kv-cache block/04-wmma-flash-attn block/05-bit-identical-decode-cpu block/06-gfx1151-mmvq-table block/07-host-buffer-revert block/08-meta-device-wrapper-skip block/09-q6k-mmvq-vdr2 block/10-fused-core"
+git -C "$REPO_DIR" worktree add --detach "$TMP/tagwt" HEAD >/dev/null
+( cd "$TMP/tagwt"
+  git checkout -q --orphan rdna-tag-build
+  git rm -rfq . >/dev/null
+  git -C "$FORK" archive "$BASELINE" | tar -x
+  git add -A -f   # force: upstream ships files that also match .gitignore (e.g. *.log)
+  # fixed dates: the whole tag lineage is derived, so keep its commits
+  # byte-deterministic across regenerations
+  FIXDATE="$(git -C "$FORK" show -s --format='%aI' "$BASELINE")"
+  export GIT_AUTHOR_DATE="$FIXDATE" GIT_COMMITTER_DATE="$FIXDATE"
+  git "${IDENT[@]}" commit -q -m "upstream llama.cpp baseline $BASELINE"
+  i=0
+  for name in $TAG_ORDER; do
+      i=$((i+1))
+      tag="$(echo $TAG_NAMES | cut -d' ' -f$i)"
+      git apply "$PATCHES/$name.patch"
+      git add -A
+      git "${IDENT[@]}" commit -q -m "$name"
+      git tag -f "$tag"
+      echo "   $tag  ($name)"
+  done
+  git checkout -q --detach
+  git branch -qD rdna-tag-build )
 
 echo
 echo "Done. Verify on a fresh stock checkout at $BASELINE with"
