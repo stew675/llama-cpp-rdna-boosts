@@ -1,0 +1,170 @@
+commit cd35abd1962cb7d49b6138ab7fd12a9cb5245055
+Author: Stew Forster <stew675@gmail.com>
+Date:   Wed Aug 12 20:31:39 2026 -0500
+
+    cuda : Q6_K mmvq VDR=2 decode kernel
+    
+    Process both 8-element chunks of a Q6_K vec_dot in one call so the
+    ql/qh/scales/d8 loads are amortized over 4 dp4a ops instead of 2, and the
+    thread block covers the same row with half the loop iterations. Verified
+    bit-identical to the VDR=1 kernel via a Python simulation and
+    test-backend-ops (1194/1194 MUL_MAT OK).
+    
+    tg64 on Qwen3.6-27B-Q6_K, gfx1201, BF16 KV: d8192 23.35 -> 23.48 t/s,
+    d65536 20.51 -> 20.57 t/s. Decode is DRAM-bound (~645 GB/s, at parity
+    with Q8_0 per byte), so the gain is modest.
+    
+    Also: make GGML_CUDA_OP_TIMING disable CUDA graph capture (event records
+    are illegal during capture; previously aborted), and add decode-shaped
+    (n=1) Q6_K/Q8_0 MUL_MAT perf cases at the qwen35 27B shapes.
+    
+    Assisted-by: pi
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 21b91ff17..54d187094 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4656,13 +4656,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     bool cuda_graph_update_required = false;
+     const void * graph_key = nullptr;
+ 
++    // op timing instruments each node with stream events, which is not possible during capture
++    const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
++
+ #ifdef USE_CUDA_GRAPH
+     graph_key = ggml_cuda_graph_get_key(cgraph);
+ 
+     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+ 
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+-    if (graph->is_enabled()) {
++    if (!op_timing && graph->is_enabled()) {
+         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+         if (graph_compatible) {
+             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index b9ad85fe5..cd0cafebb 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -23,7 +23,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
+         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
+         case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
+         case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
+-        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
++        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1_vdr2;
+         case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
+         case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
+         case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 0f039c735..371d687db 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -620,7 +620,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
+     return dm4f.x*sumf_d - dm4f.y*sumf_m;
+ }
+ 
+-#define VDR_Q6_K_Q8_1_MMVQ 1
++#define VDR_Q6_K_Q8_1_MMVQ 2
+ #define VDR_Q6_K_Q8_1_MMQ  8
+ 
+ // contiguous v/x values
+@@ -646,6 +646,35 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
+     return d*sumf;
+ }
+ 
++// VDR=2 variant: processes two adjacent 8-element chunks (16 elements).
++// Both chunks share the q8_1 block pair, the two sub-scales and the d8 values,
++// so the loads are amortized over twice the dp4a work of the VDR=1 kernel.
++static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq_vdr2(
++    const int & vl0, const int & vl1, const int & vh0, const int & vh1,
++    const int * __restrict__ u, const int8_t * __restrict__ scales,
++    const float & d, const float * __restrict__ d8) {
++
++    float sumf = 0.0f;
++
++#pragma unroll
++    for (int i = 0; i < 2*QR6_K; ++i) {
++        const int sc = scales[4*(i&1)];
++
++        const int vl = (i < QR6_K) ? vl0 : vl1;
++        const int vh = (i < QR6_K) ? vh0 : vh1;
++
++        const int vil = (vl >> (4*(i&1))) & 0x0F0F0F0F;
++
++        const int vih = ((vh >> (4*(i&1))) << 4) & 0x30303030;
++
++        const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
++
++        sumf += d8[i&1] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
++    }
++
++    return d*sumf;
++}
++
+ // contiguous v/x + u/y values
+ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
+     const int * __restrict__ v, const int * __restrict__ u, const int8_t * __restrict__ sc,
+@@ -1025,6 +1054,41 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+ }
+ 
++// VDR=2 entry point: iqs must be even (the mmvq kernel strides kqs by VDR).
++// Processes 16 elements per call, splitting the ql/qh/u loads over two chunks.
++static __device__ __forceinline__ float vec_dot_q6_K_q8_1_vdr2(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
++
++    // both chunks share these offsets: iqs+1 lands in the same (iqs/16, (iqs%16)/8) cell
++    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
++    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
++    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
++    const int vh_idx = (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4);
++
++    const int vl0 = get_int_b4(bq6_K->ql, iqs);
++    const int vl1 = get_int_b4(bq6_K->ql, iqs + 1);
++    const int vh0 = get_int_b2(bq6_K->qh, vh_idx) >> vh_shift;
++    const int vh1 = get_int_b2(bq6_K->qh, vh_idx + 1) >> vh_shift;
++
++    const int8_t * scales = bq6_K->scales + scale_offset;
++
++    int    u[2*QR6_K];
++    float d8[QR6_K];
++
++    // iqs is even, so iqs%QI8_1 and (iqs%QI8_1)+1 are adjacent int32 groups in the block
++    const int i8 = iqs % QI8_1;
++    u[0] = get_int_b4(bq8_1[bq8_offset + 0].qs, i8);
++    u[1] = get_int_b4(bq8_1[bq8_offset + 2].qs, i8);
++    u[2] = get_int_b4(bq8_1[bq8_offset + 0].qs, i8 + 1);
++    u[3] = get_int_b4(bq8_1[bq8_offset + 2].qs, i8 + 1);
++    d8[0] = __low2float(bq8_1[bq8_offset + 0].ds);
++    d8[1] = __low2float(bq8_1[bq8_offset + 2].ds);
++
++    return vec_dot_q6_K_q8_1_impl_mmvq_vdr2(vl0, vl1, vh0, vh1, u, scales, bq6_K->d, d8);
++}
++
+ #define VDR_IQ2_XXS_Q8_1_MMVQ 2
+ #define VDR_IQ2_XXS_Q8_1_MMQ  2
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10303,6 +10303,18 @@
+         }
+     }
+ 
++    // Qwen3.6-27B decode shapes (n=1, mmvq path), Q6_K vs Q8_0:
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1})); // ffn
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // lm_head
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1})); // qkv
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1})); // ssm z
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1})); // kv proj
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1})); // ffn
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // lm_head
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1})); // qkv
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1})); // ssm z
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1})); // kv proj
++
+     // qwen3-30b-a3b
+     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {

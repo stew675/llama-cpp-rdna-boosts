@@ -1,0 +1,380 @@
+commit beaf69fb6a87ddeebb31c9977903a23638eee88d
+Author: Stew Forster <stew675@gmail.com>
+Date:   Wed Aug 12 16:13:45 2026 -0500
+
+    cuda : RDNA4 WMMA flash-attn and Q6_K mmq prefill performance work
+    
+    Squashed from the q6-vulkan-parity branch (8 commits) into one:
+    
+    - fix the head-256 WMMA flash-attn combine race and tune its RDNA4 config
+      (nthreads 256, nbatch_fa 32, nbatch_combine 32)
+    - fix the tile_Q reuse race for np == 1 configs (head 192x128): sync between
+      flash-attn tile iterations in the kernel's kbc loop
+    - tune the head 320x256/512x512/576x512 WMMA FA configs (256 threads,
+      nbatch_fa 64-128, nbatch_K2 96, nbatch_V2 16, nbatch_combine 16; 320 also
+      reaches occ 2) and enable the WMMA path up to head 576 by default on RDNA4
+      (GGML_CUDA_FA_WMMA_256=0 opts out; RDNA3/3.5 stay at head <= 128)
+    - hoist and fold the Q6_K mmq sub-scales into the row base-scale to remove
+      the int-mul from the wmma-result scale chain (Q6_K mmq 40 -> 58 TFLOPS)
+    - add mmq/FA perf cases and per-op timing tooling
+    
+    Verified on gfx1201: Q6_K pp512 d16384 759 t/s (Vulkan 736), Q8_0 949;
+    Gemma 4 31B (head 512, softcap 30) pp512 d4096 945 vs 804 t/s tile;
+    4552/4552 FLASH_ATTN_EXT cases on all 3 GPUs.
+    
+    Assisted-by: pi
+
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 7f4cfd551..780b7aa63 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -158,19 +158,19 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 2,  32, 128, 128, 128, 1, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32, 128, 128, 128, 1, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 1, true);
+-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  64, 128, 128,  64, 1, true);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 2,  32, 128, 128,  32, 1, true);
+ 
+-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 160, 128, 128, 1, true);
+-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 128, 2,  32, 160, 128, 128, 1, true);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 256, 2,  64,  96,  16,  16, 1, true);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 256, 2,  64,  96,  16,  16, 1, true);
+ 
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
+-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 3,  64,  96,  64, 128, 1, true);
+-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128, 128, 1, true);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 2,  64,  96,  16,  16, 1, true);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 256, 2, 128,  96,  16,  16, 1, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 128, 2,  32, 128, 128, 128, 1, true);
+ 
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
+-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 16, 128, 3,  64,  96,  64, 128, 1, true);
+-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 128, 2,  32, 160, 128, 128, 1, true);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 16, 128, 2,  64,  96,  16,  16, 1, true);
++    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 256, 2, 128,  96,  64,  16, 1, true);
+     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 128, 2,  32, 160, 128, 128, 1, true);
+ 
+     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
+@@ -1687,7 +1687,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+                 }
+             }
+         }
+-        if (np > 1) {
++        // The tile_Q buffer is reused for the next k00 iteration, so all warps must sync here
++        // before its data is overwritten. With np > 1 only some warps read back, but they all write.
++        if (np > 1 || k00 + nbatch_combine < DV/2) {
+             __syncthreads();
+         }
+     }
+@@ -1759,7 +1761,7 @@ static __global__ void flash_attn_ext_f16(
+ #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+ 
+ #if defined(AMD_WMMA_AVAILABLE)
+-    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 128) {
++    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 576) {
+         NO_DEVICE_CODE;
+         return;
+     }
+@@ -1839,6 +1841,11 @@ static __global__ void flash_attn_ext_f16(
+                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+         }
+ 
++        // The next process_tile call reuses the tile_Q buffer for its Q/K tiles, so all warps must
++        // have finished reading the combined results before any of them starts the next call.
++        // (With np == 1 the end-of-k00 barrier does not fire, so this is required for correctness.)
++        __syncthreads();
++
+         kbc += iter_k;
+         kbc -= kbc % iter_k;
+ 
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 6b8fb0243..57cb1d11b 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -373,6 +373,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+     float max_bias = 0.0f;
+     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+ 
++    float logit_softcap = 0.0f;
++    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
++
+     // The effective batch size for the kernel can be increased by gqa_ratio.
+     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
+     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+@@ -512,8 +515,17 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+     }
+ 
+     // AMD WMMA is always faster than the tile kernel if the full tile width of 16 can be utilized.
+-    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 128) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
+-        return BEST_FATTN_KERNEL_MMA_F16;
++    // RDNA4 WMMA has higher throughput than RDNA3; heads up to 576 (incl. the DKQ != DV shapes)
++    // are enabled by default there. Set GGML_CUDA_FA_WMMA_256=0 to force the WMMA path off for
++    // heads > 128 (e.g. to compare against the tile kernel).
++    const char * wmma_256_env = getenv("GGML_CUDA_FA_WMMA_256");
++    const bool wmma_256 = wmma_256_env == nullptr || std::atoi(wmma_256_env) != 0;
++    const int wmma_max_head = (wmma_256 && GGML_CUDA_CC_IS_RDNA4(cc)) ? 576 : 128;
++    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
++        // The kernel instantiates logit_softcap only for heads 128/256/512.
++        if (logit_softcap == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512) {
++            return BEST_FATTN_KERNEL_MMA_F16;
++        }
+     }
+ 
+     // If there are no tensor cores available, use the generic tile kernel:
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 6c09cd1dc..21b91ff17 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -71,6 +71,7 @@
+ #include "ggml.h"
+ 
+ #include <algorithm>
++#include <numeric>
+ #include <array>
+ #include <atomic>
+ #include <charconv>
+@@ -4330,6 +4331,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+     bool graph_evaluated_or_captured = false;
+ 
++    // per-op timing instrumentation (env-gated, diagnostic only)
++    const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
++    std::vector<cudaEvent_t> op_ev0;
++    std::vector<cudaEvent_t> op_ev1;
++    std::vector<std::pair<const ggml_tensor *, int>> op_nodes;
++    if (op_timing) {
++        op_ev0.resize(cgraph->n_nodes);
++        op_ev1.resize(cgraph->n_nodes);
++        op_nodes.reserve(cgraph->n_nodes);
++        for (int i = 0; i < cgraph->n_nodes; i++) {
++#ifdef GGML_USE_HIP
++            CUDA_CHECK(cudaEventCreateWithFlags(&op_ev0[i], hipEventDefault));
++            CUDA_CHECK(cudaEventCreateWithFlags(&op_ev1[i], hipEventDefault));
++#else
++            CUDA_CHECK(cudaEventCreateWithFlags(&op_ev0[i], cudaEventDefault));
++            CUDA_CHECK(cudaEventCreateWithFlags(&op_ev1[i], cudaEventDefault));
++#endif
++        }
++    }
++
+     // flag used to determine whether it is an integrated_gpu
+     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
+ 
+@@ -4496,12 +4517,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 GGML_UNUSED(integrated);
+ #endif  // NDEBUG
+ 
++                if (op_timing) {
++                    CUDA_CHECK(cudaEventRecord(op_ev0[i], cuda_ctx->stream()));
++                }
++
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                 if (!ok) {
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+                 GGML_ASSERT(ok);
+ 
++                if (op_timing) {
++                    CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
++                    op_nodes.emplace_back(node, i);
++                }
++
+                 if (!is_concurrent_event_active) {
+                     try_launch_concurrent_event(node);
+                }
+@@ -4543,6 +4573,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+         graph_evaluated_or_captured = true;
+ #endif  // USE_CUDA_GRAPH
+     }
++
++    if (op_timing) {
++        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
++        static std::map<std::string, double> op_ms_total;
++        static std::map<std::string, int>    op_cnt_total;
++        std::map<std::string, double> op_ms;
++        std::map<std::string, int>    op_cnt;
++        for (const auto & [node, idx] : op_nodes) {
++            float ms = 0.0f;
++#ifdef GGML_USE_HIP
++            CUDA_CHECK(hipEventElapsedTime(&ms, (hipEvent_t) op_ev0[idx], (hipEvent_t) op_ev1[idx]));
++#else
++            CUDA_CHECK(cudaEventElapsedTime(&ms, op_ev0[idx], op_ev1[idx]));
++#endif
++            std::string key = ggml_op_name(node->op);
++            key += " ";
++            key += node->name;
++            if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && node->src[1] != nullptr) {
++                char buf[64];
++                snprintf(buf, sizeof(buf), " [%lldx%lldx%lld]",
++                         (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1],
++                         (long long) node->src[1]->ne[1]);
++                key += buf;
++            }
++            op_ms[key] += ms;
++            op_cnt[key]++;
++            op_ms_total[key] += ms;
++            op_cnt_total[key]++;
++        }
++        std::vector<std::pair<std::string, double>> sorted(op_ms.begin(), op_ms.end());
++        std::sort(sorted.begin(), sorted.end(),
++                  [](const auto & a, const auto & b) { return a.second > b.second; });
++        double total = 0.0;
++        for (const auto & [k, v] : sorted) {
++            total += v;
++        }
++        GGML_LOG_INFO("%s: op timing: total %.2f ms over %zu nodes:\n", __func__, total, op_nodes.size());
++        for (const auto & [k, v] : sorted) {
++            GGML_LOG_INFO("  %8.3f ms %5.1f%%  x%-4d %s\n", v, 100.0 * v / total, op_cnt[k], k.c_str());
++        }
++        GGML_LOG_INFO("%s: op timing cumulative: %.2f ms over %d nodes\n", __func__,
++                      std::accumulate(op_ms_total.begin(), op_ms_total.end(), 0.0,
++                                      [](double acc, const auto & p) { return acc + p.second; }),
++                      std::accumulate(op_cnt_total.begin(), op_cnt_total.end(), 0,
++                                      [](int acc, const auto & p) { return acc + p.second; }));
++        for (cudaEvent_t e : op_ev0) {
++            CUDA_CHECK(cudaEventDestroy(e));
++        }
++        for (cudaEvent_t e : op_ev1) {
++            CUDA_CHECK(cudaEventDestroy(e));
++        }
++    }
+ }
+ 
+ #ifdef USE_CUDA_GRAPH
+diff --git a/ggml/src/ggml-cuda/mmq-vec-dot.cuh b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
+index d57343386..fd0414e8d 100644
+--- a/ggml/src/ggml-cuda/mmq-vec-dot.cuh
++++ b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
+@@ -1038,6 +1038,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+ 
+     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+ 
++    // Row base scales are invariant over the k01 and j0 loops; load them once.
++    // Each thread owns fixed elements of the C tile, so one value per element suffices.
++    float x_df_reg[ntx][tile_C::ne];
++#pragma unroll
++    for (int n = 0; n < ntx; ++n) {
++#pragma unroll
++        for (int l = 0; l < tile_C::ne; ++l) {
++            const int i = i0 + n*tile_C::I + tile_C::get_i(l);
++            x_df_reg[n][l] = x_df[i*sram_stride];
++        }
++    }
++
+     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
+         const int k0 = k00 + k01;
+ 
+@@ -1047,6 +1059,28 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+             load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+         }
+ 
++        // Sub-scales for this k01 chunk; invariant over the j0 loop.
++        int8_t x_sc_reg[ntx][tile_C::ne];
++#pragma unroll
++        for (int n = 0; n < ntx; ++n) {
++#pragma unroll
++            for (int l = 0; l < tile_C::ne; ++l) {
++                const int i = i0 + n*tile_C::I + tile_C::get_i(l);
++                x_sc_reg[n][l] = ((const int8_t *) (x_sc + i*sram_stride + k00/16))[k01/4];
++            }
++        }
++
++        // Fold the sub-scale and the row base scale into one f32 per element;
++        // saves one int-multiply and one convert per element in the j0 loop.
++        float x_s2_reg[ntx][tile_C::ne];
++#pragma unroll
++        for (int n = 0; n < ntx; ++n) {
++#pragma unroll
++            for (int l = 0; l < tile_C::ne; ++l) {
++                x_s2_reg[n][l] = (float) x_sc_reg[n][l] * x_df_reg[n][l];
++            }
++        }
++
+ #pragma unroll
+         for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+             tile_B B;
+@@ -1062,9 +1096,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+ 
+ #pragma unroll
+                 for (int l = 0; l < tile_C::ne; ++l) {
+-                    const int i = i0 + n*tile_C::I + tile_C::get_i(l);
+-                    const int8_t * sc = (const int8_t *) (x_sc + i*sram_stride + k00/16);
+-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l] * sc[k01/4] * x_df[i*sram_stride] * dB;
++                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += (float) C.x[l] * x_s2_reg[n][l] * dB;
+                 }
+             }
+         }
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 2eb15fdfa..247d81728 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -360,6 +360,10 @@ static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, in
+ static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fallback, const int cc, const int64_t ne11) {
+     int ret = std::min(ne11, int64_t(512));
+     ret -= ret % 8;
++    const char * env = getenv("GGML_CUDA_MMQ_J_MAX");
++    if (env != nullptr) {
++        ret = std::min(ret, std::atoi(env));
++    }
+     for (;ret > 0; ret -= 8) {
+         if (ggml_cuda_mmq_get_config(type, ret, fallback, cc).type != GGML_TYPE_COUNT) {
+             return ret;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 795ba4875..113c5af77 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9150,6 +9150,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1})); // q8_0 at ffn shape
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1})); // q8_0 at ffn shape
++
++    // Qwen3.6-27B Q6_K prefill shapes (perf tuning targets):
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1})); // ffn_up/ffn_gate
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 5120,  512, 17408, {1, 1}, {1, 1})); // ffn_out
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 512, 5120, {1, 1}, {1, 1})); // attn qkv
+ #endif
+ 
+     for (ggml_type type_a : all_types) {
+@@ -9888,7 +9895,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+                     for (float max_bias : { 0.0f, 8.0f }) {
+                         if (!mask && max_bias > 0.0f) continue;
+                         for (float logit_softcap : {0.0f, 10.0f}) {
+-                            if (hsk != 128 && logit_softcap != 0.0f) continue;
++                            // The mma kernel instantiates logit_softcap for heads 128/256/512 only.
++                            if (hsk != 128 && hsk != 256 && hsk != 512 && logit_softcap != 0.0f) continue;
+                             for (int nh : { 1, 4 }) {
+                                 if (nh == 1 && hsk != 320 && hsk != 576) continue;
+                                 for (int nr3 : { 1, 3, }) {
+@@ -10151,6 +10159,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+             GGML_TYPE_F32, {n_kv, 512, 64, 1}, false, {2, 1, 0, 3}));
+     }
+ 
++    // Qwen3.6-27B Q6_K prefill shapes:
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1})); // ffn_up/ffn_gate
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 5120,  512, 17408, {1, 1}, {1, 1})); // ffn_out
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 512, 5120, {1, 1}, {1, 1})); // attn qkv
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1})); // q8_0 at ffn shape
++    // f16/f32 references at the same shapes:
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 5120,  512, 17408, {1, 1}, {1, 1}));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1}));
++
++    // Flash attention perf: head 256 (default-on WMMA) vs 512/320/576 (DKQ != DV).
++    // A/B with GGML_CUDA_FA_WMMA_256=0 (forces the tile kernel for head > 128 on RDNA4).
++    for (const auto & fa : {std::tuple<int,int,int,int,int>{256, 256, 8, 4, 256},
++                            {512, 512, 4, 8, 128},
++                            {320, 256, 4, 32, 128},
++                            {576, 512, 4, 4, 128},
++                            {192, 128, 4, 8, 128},
++                            {512, 512, 4, 8, 1},
++                            {576, 512, 4, 4, 1}}) {
++        const auto [hsk, hsv, nh, nr2, nb] = fa;
++        test_cases.emplace_back(new test_flash_attn_ext(hsk, hsv, nh, {nr2, 1}, 16384, nb, true, false, 0, 0,
++                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++
+     // Conv2d: K=CRS=NPQ=4096 matmul performance
+     uint32_t                        iwh_idx  = 0;
+     uint32_t                        kwh_idx  = 1;

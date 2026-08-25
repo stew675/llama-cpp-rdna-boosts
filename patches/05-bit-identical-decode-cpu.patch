@@ -1,0 +1,42 @@
+commit 89ac4ba1f6c350f34200d7cc22851d07eabb89c1
+Author: Stew Forster <stew675@gmail.com>
+Date:   Sat Aug 15 22:13:59 2026 -0500
+
+    cpu : make decode and speculative verify batches bit-identical
+    
+    llamafile_sgemm rejected n < 2 ("only enable sgemm for prompt processing"),
+    so decode (n_q = 1) attention matmuls ran the plain vec_dot kernel while
+    speculative verify batches (n_q >= 2) ran tinyBLAS. The two kernels
+    accumulate the F16 dot products differently (double-precision scalar tail
+    vs F32 FMA chains), so logits diverged from the first token and MTP verify
+    acceptance checks were unsound.
+    
+    Reject n <= 8 instead, routing every decode-scale batch (n_q 1..8) through
+    the same vec_dot kernels; llamafile is kept for prefill (n_q > 8).
+    
+    Verified on gfx1201 (CPU build): batch-vs-seq 0/64 flips, max|d| = 0.0000
+    for Qwen3.5-4B and Gemma4-12B, flash on/off, n_batch 1..5; server MTP
+    byte-identical to no-spec.
+    
+    Assisted-by: pi
+
+diff --git a/ggml/src/ggml-cpu/llamafile/sgemm.cpp b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+index 99b7d5afa..73e582acd 100644
+--- a/ggml/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -3816,8 +3816,14 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+     assert(params->ith < params->nth);
+ 
+     // only enable sgemm for prompt processing
++    // decode (n_q = 1) and speculative verify batches (n_q = n_draft+1) must run the
++    // same kernels: llamafile rejects n < 2, so verify batches (n_q >= 2) ran tinyBLAS
++    // while decode ran vec_dot, accumulating differently and breaking the
++    // batch-vs-seq bit-identity that speculative acceptance checks rely on.
++    // Route every decode-scale batch through the plain vec_dot path and use
++    // llamafile only for prefill (n_q > 8, i.e. beyond the speculative batch range).
+ #if !defined(__MMA__)
+-    if (n < 2)
++    if (n <= 8)
+         return false;
+ #endif
+ 
