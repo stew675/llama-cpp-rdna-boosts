@@ -1,0 +1,39 @@
+From 1bacc17dcb3838630e6353f6c87abc5b2678dfc1 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 25 Aug 2026 06:05:37 -0500
+Subject: [PATCH] meta : increase compute container headroom for recurrent
+ snapshot views
+
+The compute containers hold view tensors of the buffer's static tensors that
+are created during graph allocation. Hybrid recurrent models with n_rs_seq
+snapshotting create ~2*(n_rs_seq+1) views per recurrent layer for the
+conv-state snapshot copies, which can exceed the previous 16x headroom and
+abort with 'not enough space in the context's memory pool'.
+
+Assisted-by: pi
+(cherry picked from commit f2a22a716a2090e4a6d92ac7a4e6085def73a0b3)
+---
+ ggml/src/ggml-backend-meta.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index fe58ea3bb..a01b7ee93 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1696,7 +1696,12 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
+ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
+     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+ 
+-    constexpr size_t compute_headroom = 16; // Maximum number of views per statically allocated tensor that can be created between evals.
++    // Views of the static tensors that are created between graph evals are stored in the compute
++    // containers. The number of such views is proportional to the number of tensors in the graph
++    // that share the buffer, which for hybrid recurrent models with n_rs_seq snapshotting can be
++    // much larger than 16 per static tensor (e.g. Qwen35: ~2*(n_rs_seq+1) views per recurrent
++    // layer are created for the conv-state snapshot copies). Size the headroom accordingly.
++    constexpr size_t compute_headroom = 128;
+     const ggml_init_params params_static = {
+         /*.mem_size   =*/ ggml_get_mem_size(ctx),
+         /*.mem_buffer =*/ nullptr,
+-- 
+2.55.0
+

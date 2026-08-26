@@ -21,6 +21,7 @@ Upstream range: `7584430716ee229751771ed0d6bbcb780d105eeb` (single point)
 | 09 | `09-meta-device-wrapper-skip.patch` | src/llama.cpp | none |
 | 10 | `10-q6k-mmvq-vdr2.patch` | ggml/src/ggml-cuda/{ggml-cuda.cu,mmvq.cu,vecdotq.cuh}, tests/test-backend-ops.cpp | none (test hunk re-based to stock) |
 | 06 | `06-fused-core.patch` | mmvq.{cu,cuh}, ggml-cuda.cu (try_fuse), norm.{cu,cuh}, unary.{cu,cuh}, common.cuh, fattn.cu, fattn-tile.cuh | **blocks 03 and 04 MUST be applied first** (fattn-tile.cuh / fattn.cu territory) |
+| 11 | `11-meta-headroom.patch` | ggml/src/ggml-backend-meta.cpp | none (independent; apply last) |
 
 Blocks 01-05 and 07-10 are mutually independent and may be applied in any
 order; **block 06 goes last, always**. The order above is the verified order.
@@ -47,7 +48,8 @@ encodes the sequence - so the fused core, applied last, is `block/10-fused-core`
 | 7 | `block/07-host-buffer-revert` | `08-host-buffer-revert.patch` |
 | 8 | `block/08-meta-device-wrapper-skip` | `09-meta-device-wrapper-skip.patch` |
 | 9 | `block/09-q6k-mmvq-vdr2` | `10-q6k-mmvq-vdr2.patch` |
-| 10 (LAST) | `block/10-fused-core` | `06-fused-core.patch` |
+| 10 | `block/10-fused-core` | `06-fused-core.patch` |
+| 11 | `block/11-meta-headroom` | `11-meta-headroom.patch` |
 
 Consumer (git-native alternative to `git apply`):
 
@@ -81,6 +83,7 @@ git apply patches/08-host-buffer-revert.patch
 git apply patches/09-meta-device-wrapper-skip.patch
 git apply patches/10-q6k-mmvq-vdr2.patch
 git apply patches/06-fused-core.patch
+git apply patches/11-meta-headroom.patch
 ```
 
 applies with zero fuzz and produces a tree byte-identical to the source fork
@@ -115,6 +118,12 @@ per-block flow when you want reviewable increments).
 
 ## Known notes
 
+- **Block 11 (`11-meta-headroom.patch`)**: meta-buffer compute-container
+  headroom 16x -> 128x for hybrid recurrent models. Fixes the llama-server
+  graph-allocation abort (ggml.c:1804, "not enough space in the context's
+  memory pool") seen with speculative MTP drafting under `--split-mode
+  tensor`; source is fork branch `rdna-boosts` commit `f2a22a71` (not on
+  `chunked-gdn`). Apply last; verified clean on this baseline.
 - **Block 10 test hunk** was re-based against the baseline: its original
   context lines (Q6_K perf cases) were added by block 04, so the 12
   Qwen3.6-27B decode-shape cases are placed after the generic `mul_mat` perf
