@@ -461,7 +461,7 @@ index 99b7d5afa..73e582acd 100644
  #endif
  
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 14dd1098c..5c00c4306 100644
+index 14dd1098c..18c348a79 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -770,6 +770,59 @@ static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const half2 v,
@@ -524,7 +524,7 @@ index 14dd1098c..5c00c4306 100644
  static __device__ __forceinline__ void ggml_cuda_mad(half2 & acc, const half2 v, const half2 u) {
  #ifdef FAST_FP16_AVAILABLE
      acc += v*u;
-@@ -1481,6 +1534,71 @@ struct ggml_backend_cuda_context {
+@@ -1481,6 +1534,74 @@ struct ggml_backend_cuda_context {
          name(GGML_CUDA_NAME + std::to_string(device)) {
      }
  
@@ -533,13 +533,16 @@ index 14dd1098c..5c00c4306 100644
 +    // Matmuls sharing the same src1 data (e.g. the qkv/z/alpha/beta projections
 +    // of one layer, or views of the same tensor) quantize it once and reuse the
 +    // result. Entries are keyed by the view root of src1 (the tensor that owns
-+    // the data) plus the quantize layout, so strided views never collide. The
-+    // cache is valid only within one graph execution: a tensor is written once
-+    // and its data is immutable until the next graph. Cleared at graph start;
-+    // entries are also keyed by the stream they were quantized on, so forked
-+    // streams never read unsynchronized data.
++    // the data) plus the data pointer and the quantize layout, so strided views
++    // never collide and stack-allocated per-expert slices of the mul_mat_id
++    // fallback (same tensor address, distinct data) never reuse each other's
++    // quantized tokens. The cache is valid only within one graph execution: a
++    // tensor is written once and its data is immutable until the next graph.
++    // Cleared at graph start; entries are also keyed by the stream they were
++    // quantized on, so forked streams never read unsynchronized data.
 +    struct q8_1_cache_entry {
 +        const ggml_tensor * src1 = nullptr;
++        const void * data = nullptr;
 +        int stream_no = 0;
 +        int64_t ne10 = 0;
 +        int64_t ne11 = 0;
@@ -568,7 +571,7 @@ index 14dd1098c..5c00c4306 100644
 +                          int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
 +                          int64_t s11, int64_t s12, int64_t s13, bool & found) {
 +        for (const auto & e : q8_1_cache) {
-+            if (e.src1 == src1 && e.stream_no == stream_no &&
++            if (e.src1 == src1 && e.data == src1->data && e.stream_no == stream_no &&
 +                e.ne10 == ne10 && e.ne11 == ne11 && e.ne12 == ne12 && e.ne13 == ne13 &&
 +                e.s11 == s11 && e.s12 == s12 && e.s13 == s13) {
 +                found = true;
@@ -588,7 +591,7 @@ index 14dd1098c..5c00c4306 100644
 +            q8_1_arena_size = new_size;
 +        }
 +        void * data = q8_1_arena + q8_1_arena_pos;
-+        q8_1_cache.push_back({ src1, stream_no, ne10, ne11, ne12, ne13, s11, s12, s13, q8_1_arena_pos, size });
++        q8_1_cache.push_back({ src1, src1->data, stream_no, ne10, ne11, ne12, ne13, s11, s12, s13, q8_1_arena_pos, size });
 +        q8_1_arena_pos += size;
 +        return data;
 +    }
@@ -596,7 +599,7 @@ index 14dd1098c..5c00c4306 100644
      ggml_cuda_stream_context concurrent_stream_context;
  
      ~ggml_backend_cuda_context();
-@@ -1538,6 +1656,20 @@ struct ggml_cuda_mm_fusion_args_host {
+@@ -1538,6 +1659,20 @@ struct ggml_cuda_mm_fusion_args_host {
      const ggml_tensor * gate_bias = nullptr;
      const ggml_tensor * x_scale = nullptr;
      const ggml_tensor * gate_scale = nullptr;
@@ -617,7 +620,7 @@ index 14dd1098c..5c00c4306 100644
      ggml_glu_op glu_op;
  };
  struct ggml_cuda_mm_fusion_args_device {
-@@ -1546,6 +1678,11 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -1546,6 +1681,11 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * gate_bias = nullptr;
      const void * x_scale = nullptr;
      const void * gate_scale = nullptr;

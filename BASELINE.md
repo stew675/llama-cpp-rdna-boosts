@@ -80,6 +80,13 @@ The original source commits on the fork branch `chunked-gdn` (parent
 | `09-meta-device-wrapper-skip.patch` | `32670eec8` |
 | `10-q6k-mmvq-vdr2.patch` | `cd35abd19` |
 | `11-meta-headroom.patch` | `f2a22a71` (fork branch `rdna-boosts`, NOT on `chunked-gdn`) |
+
+> `06-fused-core.patch` additionally carries a local correctness fix on top of
+> the fork commits: the Q8_1 input cache now keys entries by `src1->data` in
+> addition to the view root, so the stack-allocated per-expert `src1_slice`
+> tensors of the mul_mat_id host-sort fallback never collide (equal token
+> counts produced identical keys, reusing the wrong expert's quantized
+> tokens; nondeterministic iq1_m MUL_MAT_ID failures on RDNA4).
 | `rdna-boosts-all.patch` | all 48 commits of `758443071..chunked-gdn` + `f2a22a71` |
 
 ## Older branches
