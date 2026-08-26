@@ -8,7 +8,9 @@ application to mainline llama.cpp.
 The branch is 48 commits of RDNA work on top of upstream master
 (`758443071`). Those commits decompose into **10 functional blocks**: 9 clean
 standalone diffs and 1 "fused core" (16 mutually-entangled commits extracted as
-one combined diff, applied last).
+one combined diff, applied last). One follow-up fix was added later as
+**block 11** (`11-meta-headroom.patch`, meta-buffer compute-container
+headroom), so the full set is 11 patches in apply order.
 
 This is the authoritative apply order and the verification contract for the
 patch set. It is written for humans AND LLM coding agents. Follow it exactly;
@@ -21,7 +23,7 @@ range)
 
 ## Validation record (2026-08-25, ROCm 7.14, gfx1201)
 
-All 10 patches applied in the order below to a fresh checkout of
+All 11 patches applied in the order below to a fresh checkout of
 `d222767c7`, built `GGML_HIP=ON Release`:
 
 - `test-backend-ops` (ROCm0/1/2 + CPU): **14883/14883 passed, 0 failures**

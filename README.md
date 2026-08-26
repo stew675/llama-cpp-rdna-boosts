@@ -30,7 +30,7 @@ workflow below uses the current branch.
     └── apply-all.sh       # applies in manifest order + runs the verification commands
 ```
 
-## The 10 blocks
+## The 11 blocks
 
 | patch | what | size |
 |-------|------|------|
@@ -39,11 +39,15 @@ workflow below uses the current branch.
 | `03-bf16-kv-cache.patch` | native-BF16 flash-attn tile kernel, BF16 KV cache, IMRoPE + set-rows fusion | 8 commits |
 | `04-wmma-flash-attn.patch` | RDNA4 WMMA flash-attention path; Q6_K mmq prefill tuning | 1 commit |
 | `05-bit-identical-decode-cpu.patch` | bit-identical CPU decode / speculative-verify batches | 1 commit |
-| `10-fused-core.patch` | fused quantized-matmul kernels + graph fusions (SSM/MoE), GPU bit-identical decode; **apply last** | 16 commits, 1 diff |
 | `06-gfx1151-mmvq-table.patch` | RDNA3_5 mmvq parameter table + nwarps=2 Q8_0 decode | 1 commit |
 | `07-host-buffer-revert.patch` | back out integrated-GPU host buffers on HIP (PR #24233) | 1 commit |
 | `08-meta-device-wrapper-skip.patch` | skip the Meta device wrapper with a single GPU | 1 commit |
 | `09-q6k-mmvq-vdr2.patch` | Q6_K mmvq VDR=2 decode kernel | 1 commit |
+| `10-fused-core.patch` | fused quantized-matmul kernels + graph fusions (SSM/MoE), GPU bit-identical decode | 16 commits, 1 diff |
+| `11-meta-headroom.patch` | meta-buffer compute-container headroom | 1 commit |
+
+Blocks are listed in apply order; `10-fused-core` needs blocks 03+04 in the
+tree (see MANIFESTS.md), `11` is a follow-up fix applied last.
 
 ## Consumer workflow
 
