@@ -16,9 +16,9 @@ one combined diff, applied last).
 ├── README.md              # this file: overview + consumer workflow
 ├── MANIFESTS.md           # THE CONTRACT: apply order, deps, verify, failure handling
 ├── BASELINE.md            # pinned baseline SHA, per-patch provenance, drift policy
+├── rdna-boosts-all.patch      # convenience: the entire net as ONE patch
 ├── patches/
-│   ├── 01-adaptive-mtp.patch          … 10-fused-core.patch
-│   └── rdna-boosts-all.patch          # convenience: the entire 48-commit net, one patch
+│   └── 01-adaptive-mtp.patch          … 10-fused-core.patch, 11-meta-headroom.patch
 └── scripts/
     ├── make-patches.sh    # regenerates all patches from the fork (needs the fork checkout)
     └── apply-all.sh       # applies in manifest order + runs the verification commands

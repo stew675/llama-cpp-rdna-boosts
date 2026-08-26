@@ -32,7 +32,7 @@ for WebGPU (#27654)"), the parent commit of the fork branch `chunked-gdn` in
 | `07-host-buffer-revert.patch` | `edb8d44c0` |
 | `08-meta-device-wrapper-skip.patch` | `32670eec8` |
 | `09-q6k-mmvq-vdr2.patch` | `cd35abd19` |
-| `rdna-boosts-all.patch` | all 48 commits of `758443071..chunked-gdn` |
+| `rdna-boosts-all.patch` (repo root) | all 48 commits of `758443071..chunked-gdn` |
 
 ## Drift policy
 

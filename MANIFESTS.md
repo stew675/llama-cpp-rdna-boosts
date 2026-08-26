@@ -106,7 +106,7 @@ branch `chunked-gdn` for every production file.
 | 10 | `./bin/test-backend-ops -b ROCm0` (MUL_MAT Q6_K cases) + Q6_K decode on gfx1201 | 1194/1194 MUL_MAT OK |
 | 06 | full `./bin/test-backend-ops`; speculative-decode bit-identity check; SSM/MoE model smoke | pass |
 
-Convenience: `patches/rdna-boosts-all.patch` is the entire 48-commit net diff in
+Convenience: `rdna-boosts-all.patch` (repo root) is the entire 48-commit net diff in
 one patch (applies cleanly on the baseline SHA alone; not a substitute for the
 per-block flow when you want reviewable increments).
 

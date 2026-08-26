@@ -156,7 +156,7 @@ fi
 
 # ---- convenience all-in-one ----
 echo "== rdna-boosts-all.patch"
-git diff "$BASELINE" "$BRANCH" > "$PATCHES/rdna-boosts-all.patch"
+git diff "$BASELINE" "$BRANCH" > "$REPO_DIR/rdna-boosts-all.patch"
 
 # ---- block stacking tags (optional git-native path) ----
 # Build a side lineage in THIS repo: root commit = upstream baseline tree,
