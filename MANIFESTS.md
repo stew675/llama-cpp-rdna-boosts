@@ -165,7 +165,11 @@ per-block flow when you want reviewable increments).
   ctx, BF16 KV, mmproj) loads, serves, and survives requests. Without block
   11, pristine upstream `d222767c7` still crashes (upstream has not fixed
   it); the fix originates from the fork's `rdna-boosts` branch (`f2a22a71`),
-  which is not part of `chunked-gdn`.
+  which is not part of `chunked-gdn`. Timeline: adaptive MTP is new (created
+  ~1 week before this crash report) - the crash surfaced on fix-less builds
+  (chunked-gdn lineage) only; the prior fixed-depth MTP config ran for ~3
+  months on the fork's `rdna-boosts` branch, which has always carried
+  `f2a22a71`.
 - **Block 02 carries the test-harness seeding fix** (restores upstream
   `random_device` seeding in `init_tensor_uniform`; the fork's deterministic
   seed exposed pre-existing `rms_norm_back` / `cross_entropy_loss_back`
