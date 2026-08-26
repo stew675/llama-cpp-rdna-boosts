@@ -38,9 +38,10 @@ debugging the bf16 GDN kernel, deterministically fails `rms_norm_back` /
 | 09 | `09-meta-device-wrapper-skip.patch` | src/llama.cpp | none |
 | 10 | `10-q6k-mmvq-vdr2.patch` | ggml/src/ggml-cuda/{ggml-cuda.cu,mmvq.cu,vecdotq.cuh}, tests/test-backend-ops.cpp | none (test hunk re-based to stock) |
 | 06 | `06-fused-core.patch` | mmvq.{cu,cuh}, ggml-cuda.cu (try_fuse), norm.{cu,cuh}, unary.{cu,cuh}, common.cuh, fattn.cu, fattn-tile.cuh | **blocks 03 and 04 MUST be applied first** (fattn-tile.cuh / fattn.cu territory) |
+| 11 | `11-meta-headroom.patch` | ggml/src/ggml-backend-meta.cpp | none (independent; apply last) |
 
-Blocks 01-05 and 07-10 are mutually independent and may be applied in any
-order; **block 06 goes last, always**. The order above is the verified order.
+Blocks 01-05 and 07-11 are mutually independent and may be applied in any
+order; **block 06 goes before 11, always**. The order above is the verified order.
 
 ## Block stacking tags (git-native path)
 
@@ -65,8 +66,17 @@ encodes the sequence - so the fused core, applied last, is `block/10-fused-core`
 | 7 | `block/07-host-buffer-revert` | `08-host-buffer-revert.patch` |
 | 8 | `block/08-meta-device-wrapper-skip` | `09-meta-device-wrapper-skip.patch` |
 | 9 | `block/09-q6k-mmvq-vdr2` | `10-q6k-mmvq-vdr2.patch` |
-| 10 (LAST) | `block/10-fused-core` | `06-fused-core.patch` |
+| 10 | `block/10-fused-core` | `06-fused-core.patch` |
+| 11 | `block/11-meta-headroom` | `11-meta-headroom.patch` |
 
+`block/11-meta-headroom` fixes the meta-buffer compute-container headroom
+(16x -> 128x) for hybrid recurrent models: the GDN/SSM conv-state snapshot
+views create ~2*(n_rs_seq+1) views per recurrent layer, which previously
+aborted graph allocation with "not enough space in the context's memory
+pool" (ggml.c:1804) - exactly what `--split-mode tensor` + MTP draft hit
+in the server. Source: fork branch `rdna-boosts` commit `f2a22a71` (not on
+`chunked-gdn`); needed by any recurrent model under tensor split, applied
+last or anywhere (independent file).
 Consumer (git-native alternative to `git apply`):
 
 ```
@@ -134,14 +144,16 @@ per-block flow when you want reviewable increments).
 
 ## Known notes
 
-- **Upstream limitation (not ours): speculative MTP draft + `--split-mode tensor`
-  crashes graph allocation** (`ggml.c:1804` `GGML_ASSERT(obj_new)` - the meta
-  buffer's 1M-tensor FIXME pool exhausts during MTP draft graph alloc).
-  Reproduced on pristine upstream `d222767c7` with plain `draft-mtp` (both
-  32K and 262K ctx); the adaptive-MTP variant rides the same path. MTP draft
-  works with layer split (default) and single GPU; ngram-only spec works with
-  tensor split. Workaround: drop `--split-mode tensor` (or drop the MTP
-  spec) when using the server with MTP drafting.
+- **MTP draft + `--split-mode tensor` crash - FIXED by block 11.** The
+  `ggml.c:1804` graph-allocation abort seen with speculative MTP drafting
+  under tensor split was the meta-buffer compute-container headroom (16x)
+  being exceeded by hybrid-recurrent (GDN/SSM) conv-state snapshot views
+  (~2*(n_rs_seq+1) per recurrent layer). Block 11 raises it to 128x,
+  verified: full server config (adaptive MTP + ngram, tensor split, 262K
+  ctx, BF16 KV, mmproj) loads, serves, and survives requests. Without block
+  11, pristine upstream `d222767c7` still crashes (upstream has not fixed
+  it); the fix originates from the fork's `rdna-boosts` branch (`f2a22a71`),
+  which is not part of `chunked-gdn`.
 - **Block 02 carries the test-harness seeding fix** (restores upstream
   `random_device` seeding in `init_tensor_uniform`; the fork's deterministic
   seed exposed pre-existing `rms_norm_back` / `cross_entropy_loss_back`

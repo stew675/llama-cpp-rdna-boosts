@@ -25,26 +25,39 @@ Release), and running the full test suite.
   for every production file (the only intentional divergence is the test
   harness fix described below).
 
-### The one fix vs the fork: test-harness seeding
+### Two fixes vs the fork
 
-The fork's chunked-GDN work carried a **deterministic seed** into
-`init_tensor_uniform` in `tests/test-backend-ops.cpp` (added while debugging
-the bf16 GDN kernel):
+The patch set carries two fixes that are NOT on `chunked-gdn`; both come from
+the fork's `rdna-boosts` branch (the production lineage) or from this
+validation:
 
-```cpp
-// fork (chunked-gdn): static std::atomic<unsigned> g_seed(12345); (void) g_seed;
-// thread_local std::default_random_engine gen(12345 + (unsigned) start * 101);
-// this branch:         thread_local std::default_random_engine gen(std::random_device{}());
-```
+1. **Test-harness seeding (folded into block 02).** The fork's chunked-GDN
+   work carried a deterministic seed into `init_tensor_uniform` in
+   `tests/test-backend-ops.cpp` (added while debugging the bf16 GDN kernel):
 
-The fixed seed correlates tensor data across rows and deterministically
-exposes a pre-existing numerical fragility in `rms_norm_back` and
-`cross_entropy_loss_back` on RDNA4 (CPU/GPU comparison fails with fixed
-seeds; passes with `random_device` seeding). GDN results are unaffected
-(46/46 in all configs either way). This branch restores the upstream
-`random_device` seeding; the GDN kernels themselves are untouched. Full
-diagnostic: fixed seeds 12345 and 54321 both fail those 9 cases; only the
-seeding line differs in the passing build.
+   ```cpp
+   // fork (chunked-gdn): static std::atomic<unsigned> g_seed(12345); (void) g_seed;
+   // thread_local std::default_random_engine gen(12345 + (unsigned) start * 101);
+   // this branch:         thread_local std::default_random_engine gen(std::random_device{}());
+   ```
+
+   The fixed seed correlates tensor data across rows and deterministically
+   exposes a pre-existing numerical fragility in `rms_norm_back` and
+   `cross_entropy_loss_back` on RDNA4 (CPU/GPU comparison fails with fixed
+   seeds; passes with `random_device` seeding). GDN results are unaffected
+   (46/46 in all configs either way). Full diagnostic: fixed seeds 12345 and
+   54321 both fail those 9 cases; only the seeding line differs in the
+   passing build.
+
+2. **Meta-buffer compute-container headroom (block 11, `f2a22a71`).**
+   `compute_headroom` 16x -> 128x in `ggml-backend-meta.cpp`. Hybrid
+   recurrent models (GDN/SSM) create ~2*(n_rs_seq+1) conv-state snapshot
+   views per recurrent layer during graph allocation, exceeding 16x and
+   aborting with "not enough space in the context's memory pool"
+   (ggml.c:1804). Without it, speculative MTP drafting under
+   `--split-mode tensor` crashes on first decode. Source commit is on the
+   fork branch `rdna-boosts`, not `chunked-gdn`; upstream has not fixed it
+   either (reproduced on pristine `d222767c7`).
 
 ## Per-block provenance
 
@@ -66,7 +79,8 @@ The original source commits on the fork branch `chunked-gdn` (parent
 | `08-host-buffer-revert.patch` | `edb8d44c0` |
 | `09-meta-device-wrapper-skip.patch` | `32670eec8` |
 | `10-q6k-mmvq-vdr2.patch` | `cd35abd19` |
-| `rdna-boosts-all.patch` | all 48 commits of `758443071..chunked-gdn` |
+| `11-meta-headroom.patch` | `f2a22a71` (fork branch `rdna-boosts`, NOT on `chunked-gdn`) |
+| `rdna-boosts-all.patch` | all 48 commits of `758443071..chunked-gdn` + `f2a22a71` |
 
 ## Older branches
 
