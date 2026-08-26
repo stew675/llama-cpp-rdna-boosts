@@ -1,14 +1,10 @@
 # llama-cpp-rdna-boosts
 
-Squashed, standalone diff blocks of RDNA-specific performance and correctness
-work from the `chunked-gdn` branch of the
-[llama.cpp fork](https://github.com/stew675/llama.cpp), packaged for easy
-application to mainline llama.cpp.
-
-The branch is 48 commits of RDNA work on top of upstream master
-(`758443071`). Those commits decompose into **10 functional blocks**: 9 clean
-standalone diffs and 1 "fused core" (16 mutually-entangled commits extracted as
-one combined diff, applied last).
+A set of sectioned patches that may be applied to a fresh llama.cpp master
+branch, offering a variety of feature enhancements and ROCm-targeted
+performance fixes. When the `scripts/apply-all.sh` script is run, a new
+`rdna-boosts` branch is automatically created with all the patches applied in
+order.
 
 ## Branches (one per verified upstream range)
 
@@ -126,10 +122,11 @@ known-good sets for older upstream versions.
 
 ## Upstreaming
 
-These blocks are candidates for upstream PRs to ggml-org/llama.cpp. The
-branch-per-upstream-range versioning keeps every patch set reproducible against
-a pinned upstream tip. See `MANIFESTS.md` for per-block verification and
-`BASELINE.md` for provenance.
+Some of these blocks are candidates for upstream contribution to
+[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp); others are
+expected to stay fork-local. The branch-per-upstream-range versioning keeps
+every patch set reproducible against a pinned upstream tip. See
+`MANIFESTS.md` for per-block verification and `BASELINE.md` for provenance.
 
 ## License
 

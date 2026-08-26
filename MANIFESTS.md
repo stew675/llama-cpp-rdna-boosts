@@ -1,5 +1,15 @@
 # MANIFESTS - apply order and verification contract
 
+Squashed, standalone diff blocks of RDNA-specific performance and correctness
+work from the `chunked-gdn` branch of the
+[llama.cpp fork](https://github.com/stew675/llama.cpp), packaged for easy
+application to mainline llama.cpp.
+
+The branch is 48 commits of RDNA work on top of upstream master
+(`758443071`). Those commits decompose into **10 functional blocks**: 9 clean
+standalone diffs and 1 "fused core" (16 mutually-entangled commits extracted as
+one combined diff, applied last).
+
 This is the authoritative apply order and the verification contract for the
 patch set. It is written for humans AND LLM coding agents. Follow it exactly;
 do not skip blocks.
