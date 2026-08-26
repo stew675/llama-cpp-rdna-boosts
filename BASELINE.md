@@ -74,14 +74,14 @@ The original source commits on the fork branch `chunked-gdn` (parent
 | `03-bf16-kv-cache.patch` | `5485e79e4` `b98265cfd` `07767a88a` `ef3673358` `b6bfa422e` `5e6072558` `bd5bf0ea3` `d33ce1adf` |
 | `04-wmma-flash-attn.patch` | `beaf69fb6` |
 | `05-bit-identical-decode-cpu.patch` | `89ac4ba1f` |
-| `06-fused-core.patch` | `14e5dd427` `d0e6119a7` `333e8f950` `c11752b18` `10e016df4` `85387ba3a` `8e1300159` `ac08b6d85` `a84112dcf` `9b4554626` `555e79ab2` `00f53040f` `ec09a818e` `bb64338f9` `4c0440841` `3d65d7979` |
-| `07-gfx1151-mmvq-table.patch` | `5b320ed94` |
-| `08-host-buffer-revert.patch` | `edb8d44c0` |
-| `09-meta-device-wrapper-skip.patch` | `32670eec8` |
-| `10-q6k-mmvq-vdr2.patch` | `cd35abd19` |
+| `10-fused-core.patch` | `14e5dd427` `d0e6119a7` `333e8f950` `c11752b18` `10e016df4` `85387ba3a` `8e1300159` `ac08b6d85` `a84112dcf` `9b4554626` `555e79ab2` `00f53040f` `ec09a818e` `bb64338f9` `4c0440841` `3d65d7979` |
+| `06-gfx1151-mmvq-table.patch` | `5b320ed94` |
+| `07-host-buffer-revert.patch` | `edb8d44c0` |
+| `08-meta-device-wrapper-skip.patch` | `32670eec8` |
+| `09-q6k-mmvq-vdr2.patch` | `cd35abd19` |
 | `11-meta-headroom.patch` | `f2a22a71` (fork branch `rdna-boosts`, NOT on `chunked-gdn`) |
 
-> `06-fused-core.patch` additionally carries a local correctness fix on top of
+> `10-fused-core.patch` additionally carries a local correctness fix on top of
 > the fork commits: the Q8_1 input cache now keys entries by `src1->data` in
 > addition to the view root, so the stack-allocated per-expert `src1_slice`
 > tensors of the mul_mat_id host-sort fallback never collide (equal token

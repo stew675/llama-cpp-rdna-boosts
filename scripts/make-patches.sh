@@ -13,7 +13,7 @@
 # branch; if the fork is rebased, update them (see BASELINE.md, "Drift
 # policy"). Manual touch points after regeneration:
 #   - the block 10 test hunk anchor (make_test_cases_perf() in stock may move)
-#   - the block 06 descriptive header
+#   - the block 10 (fused core) descriptive header
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -37,10 +37,10 @@ fi
 declare -A BLOCKS_SINGLE
 BLOCKS_SINGLE[04-wmma-flash-attn.patch]="beaf69fb6"
 BLOCKS_SINGLE[05-bit-identical-decode-cpu.patch]="89ac4ba1f"
-BLOCKS_SINGLE[07-gfx1151-mmvq-table.patch]="5b320ed94"
-BLOCKS_SINGLE[08-host-buffer-revert.patch]="edb8d44c0"
-BLOCKS_SINGLE[09-meta-device-wrapper-skip.patch]="32670eec8"
-BLOCKS_SINGLE[10-q6k-mmvq-vdr2.patch]="cd35abd19"
+BLOCKS_SINGLE[06-gfx1151-mmvq-table.patch]="5b320ed94"
+BLOCKS_SINGLE[07-host-buffer-revert.patch]="edb8d44c0"
+BLOCKS_SINGLE[08-meta-device-wrapper-skip.patch]="32670eec8"
+BLOCKS_SINGLE[09-q6k-mmvq-vdr2.patch]="cd35abd19"
 
 declare -A BLOCKS_MULTI
 BLOCKS_MULTI[01-adaptive-mtp.patch]="87ad1db26 b56926039 d0d7ff27e 8d70e21f5 0cf87e989"
@@ -49,7 +49,7 @@ BLOCKS_MULTI[03-bf16-kv-cache.patch]="5485e79e4 b98265cfd 07767a88a ef3673358 b6
 
 BLOCK_06_COMMITS="14e5dd427 d0e6119a7 333e8f950 c11752b18 10e016df4 85387ba3a 8e1300159 ac08b6d85 a84112dcf 9b4554626 555e79ab2 00f53040f ec09a818e bb64338f9 4c0440841 3d65d7979"
 BLOCK_06_FILES="ggml/src/ggml-cuda/common.cuh ggml/src/ggml-cuda/fattn-tile.cuh ggml/src/ggml-cuda/fattn.cu ggml/src/ggml-cuda/ggml-cuda.cu ggml/src/ggml-cuda/mmvq.cu ggml/src/ggml-cuda/mmvq.cuh ggml/src/ggml-cuda/norm.cu ggml/src/ggml-cuda/norm.cuh ggml/src/ggml-cuda/unary.cu ggml/src/ggml-cuda/unary.cuh"
-PRE_BLOCKS="01-adaptive-mtp.patch 02-chunked-gdn.patch 03-bf16-kv-cache.patch 04-wmma-flash-attn.patch 05-bit-identical-decode-cpu.patch 07-gfx1151-mmvq-table.patch 08-host-buffer-revert.patch 09-meta-device-wrapper-skip.patch 10-q6k-mmvq-vdr2.patch"
+PRE_BLOCKS="01-adaptive-mtp.patch 02-chunked-gdn.patch 03-bf16-kv-cache.patch 04-wmma-flash-attn.patch 05-bit-identical-decode-cpu.patch 06-gfx1151-mmvq-table.patch 07-host-buffer-revert.patch 08-meta-device-wrapper-skip.patch 09-q6k-mmvq-vdr2.patch"
 
 echo "== fork: $FORK  baseline: $BASELINE  branch: $BRANCH"
 cd "$FORK"
@@ -76,7 +76,7 @@ done
 # mul_mat perf loop in make_test_cases_perf(), i.e. just before the
 # "// qwen3-30b-a3b" comment. Content is identical to the fork; only the
 # position differs.
-echo "== 10-q6k-mmvq-vdr2.patch: re-based test hunk"
+echo "== 09-q6k-mmvq-vdr2.patch: re-based test hunk"
 git show "$BRANCH:tests/test-backend-ops.cpp" > "$TMP/fork-test-ops.cpp"
 git show "$BASELINE:tests/test-backend-ops.cpp" > "$TMP/stock-test-ops.cpp"
 awk '/^    \/\/ Qwen3\.6-27B decode shapes/{grab=1} grab{print} grab && n++>=10{exit}' \
@@ -91,15 +91,15 @@ awk -v lines="$TMP/block10-lines.txt" '
         next
     }
     { print }
-' "$TMP/stock-test-ops.cpp" > "$TMP/stock-test-ops+10.cpp"
-# splice the re-based test hunk into the block-10 patch (drop the original test section)
-awk '/^diff --git a\/tests\/test-backend-ops.cpp/{exit} {print}' "$PATCHES/10-q6k-mmvq-vdr2.patch" > "$TMP/b10-head"
+' "$TMP/stock-test-ops.cpp" > "$TMP/stock-test-ops+09.cpp"
+# splice the re-based test hunk into the block-09 patch (drop the original test section)
+awk '/^diff --git a\/tests\/test-backend-ops.cpp/{exit} {print}' "$PATCHES/09-q6k-mmvq-vdr2.patch" > "$TMP/b09-head"
 {
     echo "diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp"
     diff -u --label a/tests/test-backend-ops.cpp --label b/tests/test-backend-ops.cpp \
-        "$TMP/stock-test-ops.cpp" "$TMP/stock-test-ops+10.cpp" || true
-} >> "$TMP/b10-head"
-cat "$TMP/b10-head" > "$PATCHES/10-q6k-mmvq-vdr2.patch"
+        "$TMP/stock-test-ops.cpp" "$TMP/stock-test-ops+09.cpp" || true
+} >> "$TMP/b09-head"
+cat "$TMP/b09-head" > "$PATCHES/09-q6k-mmvq-vdr2.patch"
 echo "   regenerated (12 decode-shape lines + comment). If the anchor moved, re-base manually."
 
 # ---- multi-commit blocks: cherry-pick onto baseline, squash, format-patch ----
@@ -131,19 +131,19 @@ for name in "${!BLOCKS_MULTI[@]}"; do
     ( cd "$TMP/wt" && git reset -q --hard "$BASELINE" )
 done
 
-# ---- block 06: subtractive residual vs a synthetic base ----
-# synthetic base = stock + blocks 01-05 + 07-10 applied; the residual diff is
-# exactly block 06 (its 16 commits are mutually entangled, extracted as one).
-echo "== 06-fused-core.patch"
+# ---- block 10 (fused core): subtractive residual vs a synthetic base ----
+# synthetic base = stock + blocks 01-09 (i.e. everything but the fused core)
+# applied; the residual diff is exactly block 10 (16 entangled commits).
+echo "== 10-fused-core.patch"
 ( cd "$TMP/wt"
   for name in $PRE_BLOCKS; do git apply "$PATCHES/$name"; done
   git add -A
   git "${IDENT[@]}" commit -q -m "synthetic base (regeneration)"
   git diff HEAD "$BRANCH" -- $BLOCK_06_FILES > "$TMP/block06.diff" )
-if [ -f "$PATCHES/06-fused-core.patch" ]; then
-    header="$(awk '/^---$/{exit} {print}' "$PATCHES/06-fused-core.patch")"
+if [ -f "$PATCHES/10-fused-core.patch" ]; then
+    header="$(awk '/^---$/{exit} {print}' "$PATCHES/10-fused-core.patch")"
 else
-    header="Subject: [PATCH] cuda : fused-core prefill kernels and GPU bit-identical decode (squashed block 06)
+    header="Subject: [PATCH] cuda : fused-core prefill kernels and GPU bit-identical decode (squashed block 10)
 
 Regenerated by make-patches.sh - edit this header if the block content changed."
 fi
@@ -152,7 +152,7 @@ fi
     echo "---"
     echo
     cat "$TMP/block06.diff"
-} > "$PATCHES/06-fused-core.patch"
+} > "$PATCHES/10-fused-core.patch"
 
 # ---- convenience all-in-one ----
 echo "== rdna-boosts-all.patch"
@@ -167,7 +167,7 @@ git diff "$BASELINE" "$BRANCH" > "$PATCHES/rdna-boosts-all.patch"
 # encodes the sequence, unlike the patch filenames which are plan topic IDs.
 # Tags are derived artifacts: force-moved on every regeneration.
 echo "== block stacking tags"
-TAG_ORDER="01-adaptive-mtp 02-chunked-gdn 03-bf16-kv-cache 04-wmma-flash-attn 05-bit-identical-decode-cpu 07-gfx1151-mmvq-table 08-host-buffer-revert 09-meta-device-wrapper-skip 10-q6k-mmvq-vdr2 06-fused-core"
+TAG_ORDER="01-adaptive-mtp 02-chunked-gdn 03-bf16-kv-cache 04-wmma-flash-attn 05-bit-identical-decode-cpu 06-gfx1151-mmvq-table 07-host-buffer-revert 08-meta-device-wrapper-skip 09-q6k-mmvq-vdr2 10-fused-core"
 TAG_NAMES="block/01-adaptive-mtp block/02-chunked-gdn block/03-bf16-kv-cache block/04-wmma-flash-attn block/05-bit-identical-decode-cpu block/06-gfx1151-mmvq-table block/07-host-buffer-revert block/08-meta-device-wrapper-skip block/09-q6k-mmvq-vdr2 block/10-fused-core"
 git -C "$REPO_DIR" worktree add --detach "$TMP/tagwt" HEAD >/dev/null
 ( cd "$TMP/tagwt"
@@ -196,4 +196,4 @@ git -C "$REPO_DIR" worktree add --detach "$TMP/tagwt" HEAD >/dev/null
 echo
 echo "Done. Verify on a fresh stock checkout at $BASELINE with"
 echo "  scripts/apply-all.sh"
-echo "Manual touch points: block 10 test hunk anchor, block 06 header."
+echo "Manual touch points: block 09 test hunk anchor, block 10 (fused core) header."

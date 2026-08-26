@@ -27,7 +27,7 @@ workflow below uses the current branch.
 ├── MANIFESTS.md           # THE CONTRACT: apply order, deps, verify, failure handling
 ├── BASELINE.md            # pinned baseline SHA, per-patch provenance, drift policy
 ├── patches/
-│   ├── 01-adaptive-mtp.patch          … 10-q6k-mmvq-vdr2.patch
+│   ├── 01-adaptive-mtp.patch          … 10-fused-core.patch
 │   └── rdna-boosts-all.patch          # convenience: the entire 48-commit net, one patch
 └── scripts/
     ├── make-patches.sh    # regenerates all patches from the fork (needs the fork checkout)
@@ -43,11 +43,11 @@ workflow below uses the current branch.
 | `03-bf16-kv-cache.patch` | native-BF16 flash-attn tile kernel, BF16 KV cache, IMRoPE + set-rows fusion | 8 commits |
 | `04-wmma-flash-attn.patch` | RDNA4 WMMA flash-attention path; Q6_K mmq prefill tuning | 1 commit |
 | `05-bit-identical-decode-cpu.patch` | bit-identical CPU decode / speculative-verify batches | 1 commit |
-| `06-fused-core.patch` | fused quantized-matmul kernels + graph fusions (SSM/MoE), GPU bit-identical decode; **apply last** | 16 commits, 1 diff |
-| `07-gfx1151-mmvq-table.patch` | RDNA3_5 mmvq parameter table + nwarps=2 Q8_0 decode | 1 commit |
-| `08-host-buffer-revert.patch` | back out integrated-GPU host buffers on HIP (PR #24233) | 1 commit |
-| `09-meta-device-wrapper-skip.patch` | skip the Meta device wrapper with a single GPU | 1 commit |
-| `10-q6k-mmvq-vdr2.patch` | Q6_K mmvq VDR=2 decode kernel | 1 commit |
+| `10-fused-core.patch` | fused quantized-matmul kernels + graph fusions (SSM/MoE), GPU bit-identical decode; **apply last** | 16 commits, 1 diff |
+| `06-gfx1151-mmvq-table.patch` | RDNA3_5 mmvq parameter table + nwarps=2 Q8_0 decode | 1 commit |
+| `07-host-buffer-revert.patch` | back out integrated-GPU host buffers on HIP (PR #24233) | 1 commit |
+| `08-meta-device-wrapper-skip.patch` | skip the Meta device wrapper with a single GPU | 1 commit |
+| `09-q6k-mmvq-vdr2.patch` | Q6_K mmvq VDR=2 decode kernel | 1 commit |
 
 ## Consumer workflow
 
@@ -66,10 +66,10 @@ git checkout d222767c7   # the SHA recorded in MANIFESTS.md
 # 2. fresh branch
 git checkout -b rdna-boosts
 
-# 3. apply in manifest order, verifying each (block 06 LAST)
+# 3. apply in manifest order, verifying each (block 10 LAST before block 11)
 git apply ../rdna-boosts/patches/01-adaptive-mtp.patch
 ... # blocks 02-05, 07-10 in any order
-git apply ../rdna-boosts/patches/06-fused-core.patch
+git apply ../rdna-boosts/patches/10-fused-core.patch
 
 # 4. full verification
 cmake -B build -DGGML_HIP=ON -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ ...
@@ -82,16 +82,18 @@ cmake --build build -j
 
 ### Git-native alternative: block tags
 
-The repo also carries `block/01-… block/10-…` tags - one squashed commit per
-block, stacked in apply order (so the fused core is `block/10-fused-core`,
-applied last; the tag number encodes the sequence, unlike the patch filenames
-which are plan topic IDs). Each tag's diff-vs-parent is exactly that block:
+The repo also carries `block/01-… block/11-…` tags - one squashed commit per
+block, stacked in apply order. Block numbers are the apply order everywhere
+(patch filenames, tag names, block labels in the git history): `01` applies
+first, `11` last. The fused core needs blocks 03+04 in the tree, so it sits
+at position 10. Each tag's diff-vs-parent is exactly that block:
 
 ```
 git remote add rdna-boosts git@github.com:stew675/llama-cpp-rdna-boosts.git
 git fetch rdna-boosts --tags
 git cherry-pick block/01-adaptive-mtp   # ... then block/02 … block/10, in order
 git cherry-pick block/10-fused-core     # last
+git cherry-pick block/11-meta-headroom
 ```
 
 Cherry-picking uses 3-way merge, so blocks degrade more gracefully than
