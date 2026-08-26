@@ -41,6 +41,8 @@ stable to <1%.
 
 ### 1 GPU (Q6_K weights, 22.9 GB, 640 MB/s single card)
 
+![Prefill - 1 GPU](graphs/prefill-1gpu.png)
+
 Prefill (t/s)
 
 | backend | 4K | 8K | 32K | 64K |
@@ -50,6 +52,8 @@ Prefill (t/s)
 | C fork | 858.5 | **919.8** | **858.7** | **733.9** |
 | V Vulkan | **909.1** | 894.2 | 767.7 | 638.7 |
 | **C vs A** | +40.0% | +47.4% | +63.3% | +73.7% |
+
+![Decode - 1 GPU](graphs/decode-1gpu.png)
 
 Decode (t/s)
 
@@ -64,6 +68,8 @@ Decode (t/s)
 
 ### 2 GPUs (Q8_0 weights, 29 GB, tensor split)
 
+![Prefill - 2 GPUs](graphs/prefill-2gpu.png)
+
 Prefill (t/s)
 
 | backend | 4K | 8K | 32K | 64K |
@@ -73,6 +79,8 @@ Prefill (t/s)
 | C fork | **1772.4** | **1816.5** | **1645.9** | **1395.0** |
 | V Vulkan | 1126.8 | 1376.1 | 1463.0 | 1235.2 |
 | **C vs A** | +10.8% | +15.7% | +33.2% | +48.2% |
+
+![Decode - 2 GPUs](graphs/decode-2gpu.png)
 
 Decode (t/s)
 
@@ -87,6 +95,8 @@ Decode (t/s)
 
 ### 3 GPUs (Q8_0 weights, 29 GB, tensor split)
 
+![Prefill - 3 GPUs](graphs/prefill-3gpu.png)
+
 Prefill (t/s)
 
 | backend | 4K | 8K | 32K | 64K |
@@ -96,6 +106,8 @@ Prefill (t/s)
 | C fork | **1843.9** | **1930.2** | **1739.6** | **1449.8** |
 | V Vulkan | 1069.4 | 1216.6 | 1144.9 | 960.4 |
 | **C vs A** | +9.9% | +13.8% | +34.3% | +52.1% |
+
+![Decode - 3 GPUs](graphs/decode-3gpu.png)
 
 Decode (t/s)
 

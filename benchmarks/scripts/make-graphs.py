@@ -57,7 +57,7 @@ TABLES = {
 
 
 def plot(name, meta):
-    fig, ax = plt.subplots(figsize=(6.4, 4.8), dpi=100)  # 640 x 480 px
+    fig, ax = plt.subplots(figsize=(8.0, 4.8), dpi=100)  # 800 x 480 px
     fig.patch.set_facecolor("black")
     ax.set_facecolor("black")
 
