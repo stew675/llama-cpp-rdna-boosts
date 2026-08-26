@@ -144,6 +144,16 @@ per-block flow when you want reviewable increments).
 
 ## Known notes
 
+- **Known flaky test: `iq1_m` MUL_MAT_ID.** Nondeterministic, ~20% per-run
+  chance that one or two `MUL_MAT_ID(type_a=iq1_m, ...)` cases exceed the
+  5e-4 tolerance (ERR ~0.4) on this patch set (reproduced on the fork's own
+  build; absent on pristine upstream; not caused by block 06 - the flake
+  persists with it reverted). The `vec_dot_iq1_m_q8_1` kernel is byte-
+  identical to upstream, so it is a dispatch/launch-config interaction in
+  the mmvq/mmq changes (blocks 04/07/10), not a kernel rewrite. iq1_m is an
+  extreme 1-bit format not used by production models (Q8_0/Q6_K/BF16 paths
+  are unaffected); treat a rare iq1_m MUL_MAT_ID FAIL in `test-backend-ops`
+  as the known flake and re-run before investigating.
 - **MTP draft + `--split-mode tensor` crash - FIXED by block 11.** The
   `ggml.c:1804` graph-allocation abort seen with speculative MTP drafting
   under tensor split was the meta-buffer compute-container headroom (16x)
