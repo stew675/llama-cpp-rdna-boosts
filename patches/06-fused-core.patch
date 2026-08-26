@@ -1,29 +1,21 @@
-From c6d1ab516fe83d42c0abfe1f4b51d1b9e0000000 Mon Sep 17 00:00:00 2001
+From d2270dea70786266dd3c5da33d214c6575070c64 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
-Subject: [PATCH] cuda : fused-core prefill kernels and GPU bit-identical decode (squashed block 06)
-
-The co-developed fused-quantized-matmul kernel set plus graph fusions and
-the GPU decode/verify bit-identity work. These 16 commits reworked the same
-kernel regions and are extracted as ONE combined diff (they cannot be split
-without hunk surgery):
-
-- fused mmvq matmuls over a shared activation; Q8_1 quantized-input cache
-- SSM gate/beta, conv-input concat, conv+L2-norm, pre-scan chain fusions
-- MoE topk-weights fold into the down projection; norm-input Q8_1 quantize
-  fold into rms norm; shared-expert chain fusion; paired-mmvq fusion;
-  gating-MUL Q8_1 writes
-- MTP batch-vs-seq consistency fix for fused kernels and gfx1151 mmvq
-- GPU bit-identical decode/verify batches: flash-attn (fattn-tile.cuh,
-  fattn.cu), non-flash attention (ggml-cuda.cu), RDNA4/RDNA3_0 mmvq
-
-Files: mmvq.cu/mmvq.cuh, ggml-cuda.cu (try_fuse machinery), norm.cu/cuh,
-unary.cu/cuh, common.cuh, fattn.cu, fattn-tile.cuh.
-
-Source commits: 14e5dd427 d0e6119a7 333e8f950 c11752b18 10e016df4
-85387ba3a 8e1300159 ac08b6d85 a84112dcf 9b4554626 555e79ab2 00f53040f
-ec09a818e bb64338f9 4c0440841 3d65d7979
+Date: Tue, 25 Aug 2026 18:36:28 -0500
+Subject: [PATCH 10/10] block 06: fused-core prefill kernels and GPU
+ bit-identical decode
 
 ---
+ ggml/src/ggml-cuda/common.cuh     |  84 ++++
+ ggml/src/ggml-cuda/fattn-tile.cuh |  16 +
+ ggml/src/ggml-cuda/fattn.cu       |   5 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu   | 527 +++++++++++++++++++++++-
+ ggml/src/ggml-cuda/mmvq.cu        | 664 +++++++++++++++++++++++++++---
+ ggml/src/ggml-cuda/mmvq.cuh       |  23 ++
+ ggml/src/ggml-cuda/norm.cu        | 215 ++++++++++
+ ggml/src/ggml-cuda/norm.cuh       |   7 +
+ ggml/src/ggml-cuda/unary.cu       |  99 +++++
+ ggml/src/ggml-cuda/unary.cuh      |   4 +
+ 10 files changed, 1579 insertions(+), 65 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
 index 7aca2757f..5c00c4306 100644
@@ -2051,3 +2043,6 @@ index 81ed873ec..ea6b295f0 100644
  void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
  
  __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
+-- 
+2.55.0
+

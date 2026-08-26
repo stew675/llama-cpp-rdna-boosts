@@ -1,30 +1,20 @@
-commit cd35abd1962cb7d49b6138ab7fd12a9cb5245055
-Author: Stew Forster <stew675@gmail.com>
-Date:   Wed Aug 12 20:31:39 2026 -0500
+From b5f77b4f32733be4fefdef0f12debadd2e094ae2 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 25 Aug 2026 18:35:32 -0500
+Subject: [PATCH 09/10] block 10: Q6_K mmvq VDR=2 decode kernel
 
-    cuda : Q6_K mmvq VDR=2 decode kernel
-    
-    Process both 8-element chunks of a Q6_K vec_dot in one call so the
-    ql/qh/scales/d8 loads are amortized over 4 dp4a ops instead of 2, and the
-    thread block covers the same row with half the loop iterations. Verified
-    bit-identical to the VDR=1 kernel via a Python simulation and
-    test-backend-ops (1194/1194 MUL_MAT OK).
-    
-    tg64 on Qwen3.6-27B-Q6_K, gfx1201, BF16 KV: d8192 23.35 -> 23.48 t/s,
-    d65536 20.51 -> 20.57 t/s. Decode is DRAM-bound (~645 GB/s, at parity
-    with Q8_0 per byte), so the gain is modest.
-    
-    Also: make GGML_CUDA_OP_TIMING disable CUDA graph capture (event records
-    are illegal during capture; previously aborted), and add decode-shaped
-    (n=1) Q6_K/Q8_0 MUL_MAT perf cases at the qwen35 27B shapes.
-    
-    Assisted-by: pi
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  5 ++-
+ ggml/src/ggml-cuda/mmvq.cu      |  2 +-
+ ggml/src/ggml-cuda/vecdotq.cuh  | 66 ++++++++++++++++++++++++++++++++-
+ tests/test-backend-ops.cpp      | 12 ++++++
+ 4 files changed, 82 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 21b91ff17..54d187094 100644
+index e8d23a91c..3979a2c3b 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4656,13 +4656,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4340,13 +4340,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
  
@@ -43,7 +33,7 @@ index 21b91ff17..54d187094 100644
          if (graph_compatible) {
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index b9ad85fe5..cd0cafebb 100644
+index cfb30ac26..d4f2a9353 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -23,7 +23,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
@@ -147,9 +137,10 @@ index 0f039c735..371d687db 100644
  #define VDR_IQ2_XXS_Q8_1_MMQ  2
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index fe088e0c7..a42b7fe4f 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10303,6 +10303,18 @@
+@@ -10417,6 +10417,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -168,3 +159,6 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
      // qwen3-30b-a3b
      for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
          for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
+-- 
+2.55.0
+

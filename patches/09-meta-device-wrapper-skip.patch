@@ -1,22 +1,11 @@
-commit 32670eec8d87303e5734fa2f1d59fe0ee9a757bf
-Author: Stew Forster <stew675@gmail.com>
-Date:   Wed Aug 12 21:00:12 2026 -0500
+From 1d7156dcf0875bcbdf87dccf4dc4358160fdf276 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 25 Aug 2026 18:35:10 -0500
+Subject: [PATCH 08/10] block 09-meta-device-wrapper-skip
 
-    llama : skip the Meta device wrapper with a single GPU
-    
-    -s tensor creates a Meta device that wraps the GPU backends and splits
-    the graph into subgraphs at every partial-split node, even when only one
-    device is available and no splitting is possible. Each subgraph is then a
-    separate graph compute call on the CUDA backend, which multiplies the
-    per-token launch overhead and clears the Q8_1 quantize cache between
-    subgraphs.
-    
-    Use the plain device when n_devices == 1; the Meta path is kept for
-    multi-GPU tensor parallelism. tg64 on Qwen3.6-27B-Q6_K, gfx1201, BF16 KV:
-    d8192 23.48 -> 23.91 t/s (+1.8%), d65536 20.57 -> 20.89 (+1.6%),
-    d256 24.14 -> 24.49 (+1.4%). Verified 2-GPU meta path still works.
-    
-    Assisted-by: pi
+---
+ src/llama.cpp | 40 +++++++++++++++++++++++++---------------
+ 1 file changed, 25 insertions(+), 15 deletions(-)
 
 diff --git a/src/llama.cpp b/src/llama.cpp
 index 1609fec88..a9e91cce4 100644
@@ -77,3 +66,6 @@ index 1609fec88..a9e91cce4 100644
          } else {
              for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                  ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+-- 
+2.55.0
+

@@ -1,27 +1,15 @@
-From 902cd37b28ac179d95b8c960a514bdf8097850dd Mon Sep 17 00:00:00 2001
+From bd1434867a3a09f244fd3dfd03327328102de094 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
-Date: Mon, 24 Aug 2026 23:57:49 -0500
-Subject: [PATCH] cuda : fused chunked gated-delta-net prefill kernel (squashed
+Date: Tue, 25 Aug 2026 18:32:37 -0500
+Subject: [PATCH 02/10] block 02: fused chunked gated-delta-net prefill kernel
 
- block 02)
-
-One-pass state-in-LDS scan + separate KKT solve, GQA v-heads sharing L2,
-diag(eg) folded into W, v_corr spread across all threads, fp32 path then
-the bf16/WMMA tensor-core variant as the S_v=128 default; fused-cache
-routing (K=1) and state-phase K re-read pipelining. New files
-gated_delta_net_chunked.{cu,cuh}, gated_delta_net_chunked_bf16.cu;
-test-backend-ops GATED_DELTA_NET cases (46/46 on all dispatch configs).
-
-Source commits: 876ef1f0b 5d2090e96 b220647b1 a4982afa2 659f94987
-2a1e5c5a8 1da07e19b 77d51ee28 abfa24265 be46c7621 3441b7d40
-246136122 05cab3c41
 ---
  ggml/src/ggml-cuda/gated_delta_net.cu         |  28 +
  ggml/src/ggml-cuda/gated_delta_net_chunked.cu | 700 +++++++++++++
  .../src/ggml-cuda/gated_delta_net_chunked.cuh |  32 +
  .../ggml-cuda/gated_delta_net_chunked_bf16.cu | 962 ++++++++++++++++++
- tests/test-backend-ops.cpp                    |  99 +-
- 5 files changed, 1815 insertions(+), 6 deletions(-)
+ tests/test-backend-ops.cpp                    |  97 +-
+ 5 files changed, 1814 insertions(+), 5 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
@@ -1783,18 +1771,9 @@ index 000000000..1066d7eaf
 +
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 8e3b273a1..74f4538db 100644
+index 99014df09..60ed6606f 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -59,7 +59,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
-         static const size_t n_threads = N_THREADS;
- 
-         auto init_thread = [&](size_t start, size_t end) {
--            thread_local std::default_random_engine gen(std::random_device{}());
-+            static std::atomic<unsigned> g_seed(12345); (void) g_seed; thread_local std::default_random_engine gen(12345 + (unsigned) start * 101);
-             std::uniform_real_distribution<float> distribution(min, max);
-             for (size_t i = start; i < end; i++) {
-                 data[i] = distribution(gen);
 @@ -1471,14 +1471,64 @@ struct test_case {
                  }
              }

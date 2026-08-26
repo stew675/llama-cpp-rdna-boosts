@@ -1,17 +1,8 @@
-From aabacdfddf7e0f2596d1fedadbed50c8ded81ba1 Mon Sep 17 00:00:00 2001
+From cc2a7331cb6c43a73a95a96457f413c561f02965 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
-Date: Sun, 9 Aug 2026 16:15:48 -0500
-Subject: [PATCH] cuda : BF16 KV cache and native-BF16 flash-attn (squashed
+Date: Tue, 25 Aug 2026 18:33:14 -0500
+Subject: [PATCH 03/10] block 03: BF16 KV cache and native-BF16 flash-attn
 
- block 03)
-
-Read BF16 K/V natively in the flash-attn tile kernel with FP32
-accumulation, all head sizes; packed native-BF16 PV path; BF16 KQ buffer;
-IMRoPE + set-rows fusion for the BF16 KV cache (rope.cu, ggml-cuda.cu).
-BF16 KV test cases added to test-backend-ops.
-
-Source commits: 5485e79e4 b98265cfd 07767a88a ef3673358 b6bfa422e
-5e6072558 bd5bf0ea3 d33ce1adf
 ---
  ggml/src/ggml-cuda/common.cuh     |  53 +++
  ggml/src/ggml-cuda/fattn-tile.cu  |  41 +-
@@ -1306,10 +1297,10 @@ index e546fb655..76ff68450 100644
              GGML_ABORT("fatal error");
          }
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 8e3b273a1..795ba4875 100644
+index 60ed6606f..c6606e256 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -9876,8 +9876,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9944,8 +9944,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -1320,7 +1311,7 @@ index 8e3b273a1..795ba4875 100644
              if (hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
              if (hsk == 192 && (hsv != 128 && hsv != 192)) continue;
              if (hsk == 576 && hsv != 512) continue; // DeepSeek MLA
-@@ -9906,7 +9906,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9974,7 +9974,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                  for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
                                                      if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
                                                      for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {

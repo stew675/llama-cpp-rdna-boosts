@@ -10,6 +10,16 @@ The branch is 48 commits of RDNA work on top of upstream master
 standalone diffs and 1 "fused core" (16 mutually-entangled commits extracted as
 one combined diff, applied last).
 
+## Branches (one per verified upstream range)
+
+| branch | upstream range | status |
+|--------|----------------|--------|
+| `baseline/d222767c7` | `758443071` .. `d222767c7` | **current, recommended** - full suite validated 14883/14883 on ROCm 7.14/gfx1201, includes the test-harness seeding fix |
+| `baseline/758443071` | `758443071` (single point) | original set mirroring the fork; known-good for the old upstream, carries the fork's deterministic test-harness seed (see BASELINE.md) |
+
+Pick the branch whose recorded range matches your upstream tip; the
+workflow below uses the current branch.
+
 ## Layout
 
 ```
@@ -46,12 +56,12 @@ one combined diff, applied last).
 #    (branches are named baseline/<sha>; MANIFESTS.md records the upstream
 #    range each was generated against - choose the closest one)
 git clone https://github.com/stew675/llama-cpp-rdna-boosts ../rdna-boosts
-cd ../rdna-boosts && git checkout baseline/758443071
+cd ../rdna-boosts && git checkout baseline/d222767c7
 
 # 1. fresh clone of upstream llama.cpp (or an existing one), at the matched range
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-git checkout 758443071   # the SHA recorded in MANIFESTS.md
+git checkout d222767c7   # the SHA recorded in MANIFESTS.md
 
 # 2. fresh branch
 git checkout -b rdna-boosts

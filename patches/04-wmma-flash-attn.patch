@@ -1,28 +1,16 @@
-commit beaf69fb6a87ddeebb31c9977903a23638eee88d
-Author: Stew Forster <stew675@gmail.com>
-Date:   Wed Aug 12 16:13:45 2026 -0500
+From 48d63545bb279652c1012186dc091488249526b8 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 25 Aug 2026 18:34:13 -0500
+Subject: [PATCH 04/10] block 04: RDNA4 WMMA flash-attn + Q6_K mmq prefill perf
 
-    cuda : RDNA4 WMMA flash-attn and Q6_K mmq prefill performance work
-    
-    Squashed from the q6-vulkan-parity branch (8 commits) into one:
-    
-    - fix the head-256 WMMA flash-attn combine race and tune its RDNA4 config
-      (nthreads 256, nbatch_fa 32, nbatch_combine 32)
-    - fix the tile_Q reuse race for np == 1 configs (head 192x128): sync between
-      flash-attn tile iterations in the kernel's kbc loop
-    - tune the head 320x256/512x512/576x512 WMMA FA configs (256 threads,
-      nbatch_fa 64-128, nbatch_K2 96, nbatch_V2 16, nbatch_combine 16; 320 also
-      reaches occ 2) and enable the WMMA path up to head 576 by default on RDNA4
-      (GGML_CUDA_FA_WMMA_256=0 opts out; RDNA3/3.5 stay at head <= 128)
-    - hoist and fold the Q6_K mmq sub-scales into the row base-scale to remove
-      the int-mul from the wmma-result scale chain (Q6_K mmq 40 -> 58 TFLOPS)
-    - add mmq/FA perf cases and per-op timing tooling
-    
-    Verified on gfx1201: Q6_K pp512 d16384 759 t/s (Vulkan 736), Q8_0 949;
-    Gemma 4 31B (head 512, softcap 30) pp512 d4096 945 vs 804 t/s tile;
-    4552/4552 FLASH_ATTN_EXT cases on all 3 GPUs.
-    
-    Assisted-by: pi
+---
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh | 25 ++++++---
+ ggml/src/ggml-cuda/fattn.cu          | 16 +++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu      | 82 ++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmq-vec-dot.cuh   | 38 ++++++++++++-
+ ggml/src/ggml-cuda/mmq.cuh           |  4 ++
+ tests/test-backend-ops.cpp           | 34 +++++++++++-
+ 6 files changed, 184 insertions(+), 15 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 index 7f4cfd551..780b7aa63 100644
@@ -122,7 +110,7 @@ index 6b8fb0243..57cb1d11b 100644
  
      // If there are no tensor cores available, use the generic tile kernel:
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 6c09cd1dc..21b91ff17 100644
+index 720ee8b7b..78dd445e5 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -71,6 +71,7 @@
@@ -133,7 +121,7 @@ index 6c09cd1dc..21b91ff17 100644
  #include <array>
  #include <atomic>
  #include <charconv>
-@@ -4330,6 +4331,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4012,6 +4013,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
      bool graph_evaluated_or_captured = false;
  
@@ -160,7 +148,7 @@ index 6c09cd1dc..21b91ff17 100644
      // flag used to determine whether it is an integrated_gpu
      const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
  
-@@ -4496,12 +4517,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4178,12 +4199,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  GGML_UNUSED(integrated);
  #endif  // NDEBUG
  
@@ -182,7 +170,7 @@ index 6c09cd1dc..21b91ff17 100644
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
                 }
-@@ -4543,6 +4573,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4225,6 +4255,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          graph_evaluated_or_captured = true;
  #endif  // USE_CUDA_GRAPH
      }
@@ -320,10 +308,10 @@ index 2eb15fdfa..247d81728 100644
          if (ggml_cuda_mmq_get_config(type, ret, fallback, cc).type != GGML_TYPE_COUNT) {
              return ret;
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 795ba4875..113c5af77 100644
+index c6606e256..fe088e0c7 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -9150,6 +9150,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9218,6 +9218,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
@@ -337,7 +325,7 @@ index 795ba4875..113c5af77 100644
  #endif
  
      for (ggml_type type_a : all_types) {
-@@ -9888,7 +9895,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9956,7 +9963,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      for (float max_bias : { 0.0f, 8.0f }) {
                          if (!mask && max_bias > 0.0f) continue;
                          for (float logit_softcap : {0.0f, 10.0f}) {
@@ -347,7 +335,7 @@ index 795ba4875..113c5af77 100644
                              for (int nh : { 1, 4 }) {
                                  if (nh == 1 && hsk != 320 && hsk != 576) continue;
                                  for (int nr3 : { 1, 3, }) {
-@@ -10151,6 +10159,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10231,6 +10239,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
              GGML_TYPE_F32, {n_kv, 512, 64, 1}, false, {2, 1, 0, 3}));
      }
  
@@ -378,3 +366,6 @@ index 795ba4875..113c5af77 100644
      // Conv2d: K=CRS=NPQ=4096 matmul performance
      uint32_t                        iwh_idx  = 0;
      uint32_t                        kwh_idx  = 1;
+-- 
+2.55.0
+

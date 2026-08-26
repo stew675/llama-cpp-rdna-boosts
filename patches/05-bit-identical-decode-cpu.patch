@@ -1,24 +1,11 @@
-commit 89ac4ba1f6c350f34200d7cc22851d07eabb89c1
-Author: Stew Forster <stew675@gmail.com>
-Date:   Sat Aug 15 22:13:59 2026 -0500
+From e55b8512d332fa6191c699b3e7fbdbef8d13c553 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 25 Aug 2026 18:34:56 -0500
+Subject: [PATCH 05/10] block 05: CPU bit-identical decode/verify batches
 
-    cpu : make decode and speculative verify batches bit-identical
-    
-    llamafile_sgemm rejected n < 2 ("only enable sgemm for prompt processing"),
-    so decode (n_q = 1) attention matmuls ran the plain vec_dot kernel while
-    speculative verify batches (n_q >= 2) ran tinyBLAS. The two kernels
-    accumulate the F16 dot products differently (double-precision scalar tail
-    vs F32 FMA chains), so logits diverged from the first token and MTP verify
-    acceptance checks were unsound.
-    
-    Reject n <= 8 instead, routing every decode-scale batch (n_q 1..8) through
-    the same vec_dot kernels; llamafile is kept for prefill (n_q > 8).
-    
-    Verified on gfx1201 (CPU build): batch-vs-seq 0/64 flips, max|d| = 0.0000
-    for Qwen3.5-4B and Gemma4-12B, flash on/off, n_batch 1..5; server MTP
-    byte-identical to no-spec.
-    
-    Assisted-by: pi
+---
+ ggml/src/ggml-cpu/llamafile/sgemm.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cpu/llamafile/sgemm.cpp b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
 index 99b7d5afa..73e582acd 100644
@@ -40,3 +27,6 @@ index 99b7d5afa..73e582acd 100644
          return false;
  #endif
  
+-- 
+2.55.0
+

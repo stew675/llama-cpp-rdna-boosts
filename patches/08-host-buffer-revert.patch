@@ -1,22 +1,17 @@
-commit edb8d44c07d7b769879811c70042ec0f169f10fe
-Author: Stew Forster <stew675@gmail.com>
-Date:   Tue Aug 11 09:28:25 2026 -0500
+From 0c74d8852a932c2988b3dd9a33c0dfe5d2b54aa4 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 25 Aug 2026 18:35:10 -0500
+Subject: [PATCH 07/10] block 08-host-buffer-revert
 
-    cuda : back out integrated-GPU host buffers on HIP (PR #24233)
-    
-    The PR restored prop.integrated on HIP builds, enabling the CUDA
-    host-buffer path on APUs. On this Strix Halo iGPU that path corrupts
-    full-model results under async execution (PPL 5.9243 -> 8.51+ without
-    HIP_LAUNCH_BLOCKING). Forcing integrated=false restores async-safe
-    operation in every load mode at no decode/prefill cost.
-    
-    Assisted-by: pi
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 3ad79aadf..6c09cd1dc 100644
+index 78dd445e5..e8d23a91c 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -303,7 +303,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
+@@ -304,7 +304,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
          info.default_tensor_split[id] = total_vram;
          total_vram += device_vram;
  #if defined(GGML_USE_HIP)
@@ -30,3 +25,6 @@ index 3ad79aadf..6c09cd1dc 100644
  #else
          info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
  #endif
+-- 
+2.55.0
+

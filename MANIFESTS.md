@@ -4,8 +4,25 @@ This is the authoritative apply order and the verification contract for the
 patch set. It is written for humans AND LLM coding agents. Follow it exactly;
 do not skip blocks.
 
-Branch: `baseline/758443071`
-Upstream range: `7584430716ee229751771ed0d6bbcb780d105eeb` (single point)
+Branch: `baseline/d222767c7` (current, recommended)
+Upstream range: `758443071` .. `d222767c7` (patches generated against
+`d222767c7`; the older branch `baseline/758443071` covers the original
+range)
+
+## Validation record (2026-08-25, ROCm 7.14, gfx1201)
+
+All 10 patches applied in the order below to a fresh checkout of
+`d222767c7`, built `GGML_HIP=ON Release`:
+
+- `test-backend-ops` (ROCm0/1/2 + CPU): **14883/14883 passed, 0 failures**
+- `GATED_DELTA_NET` `-b ROCm0`: **46/46** in all four dispatch configs
+- `test-arg-parser`, `test-speculative-adaptive`: all tests OK
+
+**One fix vs the fork:** block 02 restored upstream `random_device` seeding
+in `init_tensor_uniform` (the fork's deterministic seed, added while
+debugging the bf16 GDN kernel, deterministically fails `rms_norm_back` /
+`cross_entropy_loss_back` on RDNA4). GDN results are unaffected. See
+`BASELINE.md` for the full diagnostic.
 
 ## Apply order
 
@@ -30,7 +47,8 @@ order; **block 06 goes last, always**. The order above is the verified order.
 The repo also carries lightweight tags `block/01-… block/10-…`, each pointing
 at a squashed commit whose diff-vs-parent is exactly that block's change (the
 commits are stacked in apply order, rooted at an orphan commit whose tree is
-the upstream baseline `758443071`).
+the upstream baseline `d222767c7`). The tags track the CURRENT baseline
+branch; they are force-moved whenever a new validated baseline is cut.
 
 **Tags are numbered by APPLY order.** The patch filenames keep the plan's
 topic numbering (block 06 is the "fused core"); the tag number instead
@@ -68,7 +86,7 @@ files remain the primary, reviewable artifact.
 
 ## Verified apply sequence (this branch)
 
-On a fresh checkout of the baseline SHA, the sequence
+On a fresh checkout of `d222767c7`, the sequence
 
 ```
 git apply patches/01-adaptive-mtp.patch
@@ -83,8 +101,9 @@ git apply patches/10-q6k-mmvq-vdr2.patch
 git apply patches/06-fused-core.patch
 ```
 
-applies with zero fuzz and produces a tree byte-identical to the source fork
-branch `chunked-gdn` for every production file.
+applies with zero fuzz and, after the block-02 test-harness fix, passes the
+full backend test suite (14883/14883). The patch set was validated exactly
+this way; see BASELINE.md for the byte-identity and validation details.
 
 ## Verification per block
 
@@ -115,11 +134,15 @@ per-block flow when you want reviewable increments).
 
 ## Known notes
 
-- **Block 10 test hunk** was re-based against the baseline: its original
-  context lines (Q6_K perf cases) were added by block 04, so the 12
-  Qwen3.6-27B decode-shape cases are placed after the generic `mul_mat` perf
-  loop in `make_test_cases_perf()` instead. Content is identical to the fork;
-  only position differs.
+- **Block 02 carries the test-harness seeding fix** (restores upstream
+  `random_device` seeding in `init_tensor_uniform`; the fork's deterministic
+  seed exposed pre-existing `rms_norm_back` / `cross_entropy_loss_back`
+  numerical fragility on RDNA4). The GDN kernels are untouched. Full
+  diagnostic in BASELINE.md.
+- **Block 10 test hunk** was re-based against the original baseline: its
+  original context lines (Q6_K perf cases) were added by block 04. On this
+  branch the hunk applies with the re-based placement; content is identical
+  to the fork, only position differs.
 - **`test-backend-ops.cpp` is shared** by blocks 02/03/04/10. The hunks are in
   different case regions; if upstream adds cases in those regions, re-base the
   affected hunks (each patch applies independently on the baseline, so
