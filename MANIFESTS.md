@@ -118,6 +118,18 @@ per-block flow when you want reviewable increments).
 
 ## Known notes
 
+- **iq1_m MUL_MAT_ID flake - FIXED (block 10 / `06-fused-core.patch`).** The
+  nondeterministic failures of `MUL_MAT_ID(type_a=iq1_m,...,m=64,n=16,k=768)`
+  (ERR ~0.4 vs 5e-4 tolerance) on this patch set were a real bug in the
+  fused-core Q8_1 input cache, not a numerical quirk: the cache keyed matmuls
+  by the view root of `src1` only, but the mul_mat_id host-sort fallback
+  reuses one stack-allocated `src1_slice` tensor for every expert. Experts
+  with equal token counts produced identical keys, so the second expert
+  reused the first one's quantized tokens. Fix: add the `src1->data` pointer
+  to the cache key (same-tensor reuse across qkv/alpha/beta projections is
+  preserved). Verified on the newer baseline (`d222767c7`): 20/20 clean
+  single-case runs, 15/15 MUL_MAT_ID groups, full suite 14883/14883, GDN
+  46/46 in all dispatch configs.
 - **Block 11 (`11-meta-headroom.patch`)**: meta-buffer compute-container
   headroom 16x -> 128x for hybrid recurrent models. Fixes the llama-server
   graph-allocation abort (ggml.c:1804, "not enough space in the context's

@@ -422,6 +422,24 @@ index 4eef2212e..be1f4b620 100644
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index fe58ea3bb..a01b7ee93 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1696,7 +1696,12 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
+ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
+     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+ 
+-    constexpr size_t compute_headroom = 16; // Maximum number of views per statically allocated tensor that can be created between evals.
++    // Views of the static tensors that are created between graph evals are stored in the compute
++    // containers. The number of such views is proportional to the number of tensors in the graph
++    // that share the buffer, which for hybrid recurrent models with n_rs_seq snapshotting can be
++    // much larger than 16 per static tensor (e.g. Qwen35: ~2*(n_rs_seq+1) views per recurrent
++    // layer are created for the conv-state snapshot copies). Size the headroom accordingly.
++    constexpr size_t compute_headroom = 128;
+     const ggml_init_params params_static = {
+         /*.mem_size   =*/ ggml_get_mem_size(ctx),
+         /*.mem_buffer =*/ nullptr,
 diff --git a/ggml/src/ggml-cpu/llamafile/sgemm.cpp b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
 index 99b7d5afa..73e582acd 100644
 --- a/ggml/src/ggml-cpu/llamafile/sgemm.cpp
@@ -443,7 +461,7 @@ index 99b7d5afa..73e582acd 100644
  #endif
  
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 14dd1098c..5c00c4306 100644
+index 14dd1098c..18c348a79 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -770,6 +770,59 @@ static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const half2 v,
@@ -506,7 +524,7 @@ index 14dd1098c..5c00c4306 100644
  static __device__ __forceinline__ void ggml_cuda_mad(half2 & acc, const half2 v, const half2 u) {
  #ifdef FAST_FP16_AVAILABLE
      acc += v*u;
-@@ -1481,6 +1534,71 @@ struct ggml_backend_cuda_context {
+@@ -1481,6 +1534,74 @@ struct ggml_backend_cuda_context {
          name(GGML_CUDA_NAME + std::to_string(device)) {
      }
  
@@ -515,13 +533,16 @@ index 14dd1098c..5c00c4306 100644
 +    // Matmuls sharing the same src1 data (e.g. the qkv/z/alpha/beta projections
 +    // of one layer, or views of the same tensor) quantize it once and reuse the
 +    // result. Entries are keyed by the view root of src1 (the tensor that owns
-+    // the data) plus the quantize layout, so strided views never collide. The
-+    // cache is valid only within one graph execution: a tensor is written once
-+    // and its data is immutable until the next graph. Cleared at graph start;
-+    // entries are also keyed by the stream they were quantized on, so forked
-+    // streams never read unsynchronized data.
++    // the data) plus the data pointer and the quantize layout, so strided views
++    // never collide and stack-allocated per-expert slices of the mul_mat_id
++    // fallback (same tensor address, distinct data) never reuse each other's
++    // quantized tokens. The cache is valid only within one graph execution: a
++    // tensor is written once and its data is immutable until the next graph.
++    // Cleared at graph start; entries are also keyed by the stream they were
++    // quantized on, so forked streams never read unsynchronized data.
 +    struct q8_1_cache_entry {
 +        const ggml_tensor * src1 = nullptr;
++        const void * data = nullptr;
 +        int stream_no = 0;
 +        int64_t ne10 = 0;
 +        int64_t ne11 = 0;
@@ -550,7 +571,7 @@ index 14dd1098c..5c00c4306 100644
 +                          int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
 +                          int64_t s11, int64_t s12, int64_t s13, bool & found) {
 +        for (const auto & e : q8_1_cache) {
-+            if (e.src1 == src1 && e.stream_no == stream_no &&
++            if (e.src1 == src1 && e.data == src1->data && e.stream_no == stream_no &&
 +                e.ne10 == ne10 && e.ne11 == ne11 && e.ne12 == ne12 && e.ne13 == ne13 &&
 +                e.s11 == s11 && e.s12 == s12 && e.s13 == s13) {
 +                found = true;
@@ -570,7 +591,7 @@ index 14dd1098c..5c00c4306 100644
 +            q8_1_arena_size = new_size;
 +        }
 +        void * data = q8_1_arena + q8_1_arena_pos;
-+        q8_1_cache.push_back({ src1, stream_no, ne10, ne11, ne12, ne13, s11, s12, s13, q8_1_arena_pos, size });
++        q8_1_cache.push_back({ src1, src1->data, stream_no, ne10, ne11, ne12, ne13, s11, s12, s13, q8_1_arena_pos, size });
 +        q8_1_arena_pos += size;
 +        return data;
 +    }
@@ -578,7 +599,7 @@ index 14dd1098c..5c00c4306 100644
      ggml_cuda_stream_context concurrent_stream_context;
  
      ~ggml_backend_cuda_context();
-@@ -1538,6 +1656,20 @@ struct ggml_cuda_mm_fusion_args_host {
+@@ -1538,6 +1659,20 @@ struct ggml_cuda_mm_fusion_args_host {
      const ggml_tensor * gate_bias = nullptr;
      const ggml_tensor * x_scale = nullptr;
      const ggml_tensor * gate_scale = nullptr;
@@ -599,7 +620,7 @@ index 14dd1098c..5c00c4306 100644
      ggml_glu_op glu_op;
  };
  struct ggml_cuda_mm_fusion_args_device {
-@@ -1546,6 +1678,11 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -1546,6 +1681,11 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * gate_bias = nullptr;
      const void * x_scale = nullptr;
      const void * gate_scale = nullptr;
@@ -6056,7 +6077,7 @@ index ba58f852e..94735fa69 100644
      assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
      assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 8e3b273a1..7d8507118 100644
+index 8e3b273a1..2f2dcdd0c 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -59,7 +59,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
@@ -6228,7 +6249,7 @@ index 8e3b273a1..7d8507118 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
-@@ -10149,6 +10239,42 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10149,6 +10239,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
              GGML_TYPE_F32, {n_kv, 512, 64, 1}, false, {2, 1, 0, 3}));
      }
  
@@ -6236,18 +6257,6 @@ index 8e3b273a1..7d8507118 100644
 +    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1})); // ffn_up/ffn_gate
 +    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 5120,  512, 17408, {1, 1}, {1, 1})); // ffn_out
 +    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 512, 5120, {1, 1}, {1, 1})); // attn qkv
-+
-+    // Qwen3.6-27B decode shapes (n=1, mmvq path), Q6_K vs Q8_0:
-+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1})); // ffn
-+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // lm_head
-+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1})); // qkv
-+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1})); // ssm z
-+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1})); // kv proj
-+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1})); // ffn
-+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // lm_head
-+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1})); // qkv
-+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1})); // ssm z
-+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1})); // kv proj
 +    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1})); // q8_0 at ffn shape
 +    // f16/f32 references at the same shapes:
 +    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1}));
@@ -6271,6 +6280,25 @@ index 8e3b273a1..7d8507118 100644
      // Conv2d: K=CRS=NPQ=4096 matmul performance
      uint32_t                        iwh_idx  = 0;
      uint32_t                        kwh_idx  = 1;
+@@ -10303,6 +10417,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    // Qwen3.6-27B decode shapes (n=1, mmvq path), Q6_K vs Q8_0:
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1})); // ffn
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // lm_head
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1})); // qkv
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1})); // ssm z
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1})); // kv proj
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1})); // ffn
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // lm_head
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1})); // qkv
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1})); // ssm z
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1})); // kv proj
++
+     // qwen3-30b-a3b
+     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
 @@ -10493,6 +10619,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64

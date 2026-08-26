@@ -1,35 +1,27 @@
-From c6d1ab516fe83d42c0abfe1f4b51d1b9e0000000 Mon Sep 17 00:00:00 2001
+From 530ea8a20706c4b468fbd1068833dbf386bd65e5 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
-Subject: [PATCH] cuda : fused-core prefill kernels and GPU bit-identical decode (squashed block 06)
-
-The co-developed fused-quantized-matmul kernel set plus graph fusions and
-the GPU decode/verify bit-identity work. These 16 commits reworked the same
-kernel regions and are extracted as ONE combined diff (they cannot be split
-without hunk surgery):
-
-- fused mmvq matmuls over a shared activation; Q8_1 quantized-input cache
-- SSM gate/beta, conv-input concat, conv+L2-norm, pre-scan chain fusions
-- MoE topk-weights fold into the down projection; norm-input Q8_1 quantize
-  fold into rms norm; shared-expert chain fusion; paired-mmvq fusion;
-  gating-MUL Q8_1 writes
-- MTP batch-vs-seq consistency fix for fused kernels and gfx1151 mmvq
-- GPU bit-identical decode/verify batches: flash-attn (fattn-tile.cuh,
-  fattn.cu), non-flash attention (ggml-cuda.cu), RDNA4/RDNA3_0 mmvq
-
-Files: mmvq.cu/mmvq.cuh, ggml-cuda.cu (try_fuse machinery), norm.cu/cuh,
-unary.cu/cuh, common.cuh, fattn.cu, fattn-tile.cuh.
-
-Source commits: 14e5dd427 d0e6119a7 333e8f950 c11752b18 10e016df4
-85387ba3a 8e1300159 ac08b6d85 a84112dcf 9b4554626 555e79ab2 00f53040f
-ec09a818e bb64338f9 4c0440841 3d65d7979
+Date: Tue, 25 Aug 2026 18:36:28 -0500
+Subject: [PATCH 10/10] block 06: fused-core prefill kernels and GPU
+ bit-identical decode
 
 ---
+ ggml/src/ggml-cuda/common.cuh     |  87 ++++
+ ggml/src/ggml-cuda/fattn-tile.cuh |  16 +
+ ggml/src/ggml-cuda/fattn.cu       |   5 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu   | 527 +++++++++++++++++++++++-
+ ggml/src/ggml-cuda/mmvq.cu        | 664 +++++++++++++++++++++++++++---
+ ggml/src/ggml-cuda/mmvq.cuh       |  23 ++
+ ggml/src/ggml-cuda/norm.cu        | 215 ++++++++++
+ ggml/src/ggml-cuda/norm.cuh       |   7 +
+ ggml/src/ggml-cuda/unary.cu       |  99 +++++
+ ggml/src/ggml-cuda/unary.cuh      |   4 +
+ 10 files changed, 1582 insertions(+), 65 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 7aca2757f..5c00c4306 100644
+index 7aca2757f..18c348a79 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1534,6 +1534,71 @@ struct ggml_backend_cuda_context {
+@@ -1534,6 +1534,74 @@ struct ggml_backend_cuda_context {
          name(GGML_CUDA_NAME + std::to_string(device)) {
      }
  
@@ -38,13 +30,16 @@ index 7aca2757f..5c00c4306 100644
 +    // Matmuls sharing the same src1 data (e.g. the qkv/z/alpha/beta projections
 +    // of one layer, or views of the same tensor) quantize it once and reuse the
 +    // result. Entries are keyed by the view root of src1 (the tensor that owns
-+    // the data) plus the quantize layout, so strided views never collide. The
-+    // cache is valid only within one graph execution: a tensor is written once
-+    // and its data is immutable until the next graph. Cleared at graph start;
-+    // entries are also keyed by the stream they were quantized on, so forked
-+    // streams never read unsynchronized data.
++    // the data) plus the data pointer and the quantize layout, so strided views
++    // never collide and stack-allocated per-expert slices of the mul_mat_id
++    // fallback (same tensor address, distinct data) never reuse each other's
++    // quantized tokens. The cache is valid only within one graph execution: a
++    // tensor is written once and its data is immutable until the next graph.
++    // Cleared at graph start; entries are also keyed by the stream they were
++    // quantized on, so forked streams never read unsynchronized data.
 +    struct q8_1_cache_entry {
 +        const ggml_tensor * src1 = nullptr;
++        const void * data = nullptr;
 +        int stream_no = 0;
 +        int64_t ne10 = 0;
 +        int64_t ne11 = 0;
@@ -73,7 +68,7 @@ index 7aca2757f..5c00c4306 100644
 +                          int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
 +                          int64_t s11, int64_t s12, int64_t s13, bool & found) {
 +        for (const auto & e : q8_1_cache) {
-+            if (e.src1 == src1 && e.stream_no == stream_no &&
++            if (e.src1 == src1 && e.data == src1->data && e.stream_no == stream_no &&
 +                e.ne10 == ne10 && e.ne11 == ne11 && e.ne12 == ne12 && e.ne13 == ne13 &&
 +                e.s11 == s11 && e.s12 == s12 && e.s13 == s13) {
 +                found = true;
@@ -93,7 +88,7 @@ index 7aca2757f..5c00c4306 100644
 +            q8_1_arena_size = new_size;
 +        }
 +        void * data = q8_1_arena + q8_1_arena_pos;
-+        q8_1_cache.push_back({ src1, stream_no, ne10, ne11, ne12, ne13, s11, s12, s13, q8_1_arena_pos, size });
++        q8_1_cache.push_back({ src1, src1->data, stream_no, ne10, ne11, ne12, ne13, s11, s12, s13, q8_1_arena_pos, size });
 +        q8_1_arena_pos += size;
 +        return data;
 +    }
@@ -101,7 +96,7 @@ index 7aca2757f..5c00c4306 100644
      ggml_cuda_stream_context concurrent_stream_context;
  
      ~ggml_backend_cuda_context();
-@@ -1591,6 +1656,20 @@ struct ggml_cuda_mm_fusion_args_host {
+@@ -1591,6 +1659,20 @@ struct ggml_cuda_mm_fusion_args_host {
      const ggml_tensor * gate_bias = nullptr;
      const ggml_tensor * x_scale = nullptr;
      const ggml_tensor * gate_scale = nullptr;
@@ -122,7 +117,7 @@ index 7aca2757f..5c00c4306 100644
      ggml_glu_op glu_op;
  };
  struct ggml_cuda_mm_fusion_args_device {
-@@ -1599,6 +1678,11 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -1599,6 +1681,11 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * gate_bias = nullptr;
      const void * x_scale = nullptr;
      const void * gate_scale = nullptr;
@@ -2051,3 +2046,6 @@ index 81ed873ec..ea6b295f0 100644
  void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
  
  __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
+-- 
+2.55.0
+
