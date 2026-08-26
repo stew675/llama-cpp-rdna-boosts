@@ -19,7 +19,8 @@ Configs under test (full protocol in [methodology.md](methodology.md)):
 - **Prefill**: C beats A by +33% (32K, 2 cards) up to +74% (64K, 1 card);
   the fork's edge grows with depth because bf16 halves the attention KV
   traffic. Peak prefill anywhere: **1930 t/s** (8K depth, 3 cards, +13.8%).
-- **Decode**: C beats A by a flat +6-9% at every depth and card count.
+- **Decode**: C beats A by +6-9% on 2-3 GPUs (+3-4% on the single card),
+  roughly constant across depths.
 - **B's silent-f16 penalty** (decode): -2% (4K) to -34% (64K, 1 card),
   growing with depth and bandwidth pressure. B's prefill is indistinguishable
   from A's.
@@ -31,43 +32,81 @@ Configs under test (full protocol in [methodology.md](methodology.md)):
 
 ## Throughput
 
-The 1-card rows use the Q6_K model on a single 640 MB/s card; the 2c/3c rows
-use Q8_0. ROCm runs use tensor split, Vulkan uses layer split (Vulkan has no
-tensor split). Values are means of 1-2 rounds, stable to <1%.
+The tables are grouped by GPU count; within each, the backend is on the
+left and the context depth runs along the top (4K/8K/32K/64K). The 1-GPU
+table uses the Q6_K model (22.9 GB) on a single 640 MB/s card; the 2- and
+3-GPU tables use Q8_0 (29 GB). ROCm runs use tensor split, Vulkan uses
+layer split (Vulkan has no tensor split). Values are means of 1-2 rounds,
+stable to <1%.
 
-### Prefill (t/s)
+### 1 GPU (Q6_K weights, 22.9 GB, 640 MB/s single card)
 
-| run | A f16 | B bf16 | C fork | V Vulkan | C vs A |
-|-----|-------|--------|--------|----------|--------|
-| 4K, 1 card | 613.3 | 606.5 | 858.5 | 909.1 | +40.0% |
-| 4K, 2 cards | 1600.2 | 1602.8 | 1772.4 | 1126.8 | +10.8% |
-| 4K, 3 cards | 1678.1 | 1675.5 | 1843.9 | 1069.4 | +9.9% |
-| 8K, 1 card | 623.9 | 619.4 | 919.8 | 894.2 | +47.4% |
-| 8K, 2 cards | 1570.6 | 1575.4 | 1816.5 | 1376.1 | +15.7% |
-| 8K, 3 cards | 1696.7 | 1689.4 | **1930.2** | 1216.6 | +13.8% |
-| 32K, 1 card | 525.9 | 523.6 | 858.7 | 767.7 | +63.3% |
-| 32K, 2 cards | 1235.8 | 1229.3 | 1645.9 | 1463.0 | +33.2% |
-| 32K, 3 cards | 1295.1 | 1281.9 | 1739.6 | 1144.9 | +34.3% |
-| 64K, 1 card | 422.4 | 420.1 | 733.9 | 638.7 | +73.7% |
-| 64K, 2 cards | 941.4 | 939.3 | 1395.0 | 1235.2 | +48.2% |
-| 64K, 3 cards | 953.5 | 953.2 | 1449.8 | 960.4 | +52.1% |
+Prefill (t/s)
 
-### Decode (t/s)
+| backend | 4K | 8K | 32K | 64K |
+|---------|-----|-----|------|------|
+| A f16 | 613.3 | 623.9 | 525.9 | 422.4 |
+| B bf16 | 606.5 | 619.4 | 523.6 | 420.1 |
+| C fork | 858.5 | **919.8** | **858.7** | **733.9** |
+| V Vulkan | **909.1** | 894.2 | 767.7 | 638.7 |
+| **C vs A** | +40.0% | +47.4% | +63.3% | +73.7% |
 
-| run | A f16 | B bf16 | C fork | V Vulkan | C vs A | B vs A |
-|-----|-------|--------|--------|----------|--------|--------|
-| 4K, 1 card | 22.99 | 22.13 | 23.79 | 24.18 | +3.5% | -3.7% |
-| 4K, 2 cards | 30.05 | 29.35 | 32.06 | 18.02 | +6.7% | -2.3% |
-| 4K, 3 cards | 35.75 | 34.78 | 38.79 | 16.50 | +8.5% | -2.7% |
-| 8K, 1 card | 22.79 | 21.05 | 23.60 | 23.87 | +3.6% | -7.6% |
-| 8K, 2 cards | 29.92 | 28.50 | 31.92 | 17.90 | +6.7% | -4.7% |
-| 8K, 3 cards | 35.60 | 33.66 | 38.69 | 16.12 | +8.7% | -5.5% |
-| 32K, 1 card | 21.61 | 16.81 | 22.32 | 22.63 | +3.3% | -22.2% |
-| 32K, 2 cards | 28.80 | 24.73 | 30.60 | 17.23 | +6.3% | -14.1% |
-| 32K, 3 cards | 34.08 | 28.70 | 36.87 | 14.81 | +8.2% | -15.8% |
-| 64K, 1 card | 20.22 | 13.39 | 20.87 | 21.07 | +3.2% | -33.8% |
-| 64K, 2 cards | 27.46 | 20.83 | 29.20 | 16.32 | +6.3% | -24.1% |
-| 64K, 3 cards | 32.26 | 23.59 | 34.74 | 14.16 | +7.7% | -26.9% |
+Decode (t/s)
+
+| backend | 4K | 8K | 32K | 64K |
+|---------|-----|-----|------|------|
+| A f16 | 22.99 | 22.79 | 21.61 | 20.22 |
+| B bf16 | 22.13 | 21.05 | 16.81 | 13.39 |
+| C fork | 23.79 | 23.60 | 22.32 | 20.87 |
+| V Vulkan | **24.18** | **23.87** | **22.63** | **21.07** |
+| **C vs A** | +3.5% | +3.6% | +3.3% | +3.2% |
+| **B vs A** | -3.7% | -7.6% | -22.2% | -33.8% |
+
+### 2 GPUs (Q8_0 weights, 29 GB, tensor split)
+
+Prefill (t/s)
+
+| backend | 4K | 8K | 32K | 64K |
+|---------|-----|-----|------|------|
+| A f16 | 1600.2 | 1570.6 | 1235.8 | 941.4 |
+| B bf16 | 1602.8 | 1575.4 | 1229.3 | 939.3 |
+| C fork | **1772.4** | **1816.5** | **1645.9** | **1395.0** |
+| V Vulkan | 1126.8 | 1376.1 | 1463.0 | 1235.2 |
+| **C vs A** | +10.8% | +15.7% | +33.2% | +48.2% |
+
+Decode (t/s)
+
+| backend | 4K | 8K | 32K | 64K |
+|---------|-----|-----|------|------|
+| A f16 | 30.05 | 29.92 | 28.80 | 27.46 |
+| B bf16 | 29.35 | 28.50 | 24.73 | 20.83 |
+| C fork | **32.06** | **31.92** | **30.60** | **29.20** |
+| V Vulkan | 18.02 | 17.90 | 17.23 | 16.32 |
+| **C vs A** | +6.7% | +6.7% | +6.3% | +6.3% |
+| **B vs A** | -2.3% | -4.7% | -14.1% | -24.1% |
+
+### 3 GPUs (Q8_0 weights, 29 GB, tensor split)
+
+Prefill (t/s)
+
+| backend | 4K | 8K | 32K | 64K |
+|---------|-----|-----|------|------|
+| A f16 | 1678.1 | 1696.7 | 1295.1 | 953.5 |
+| B bf16 | 1675.5 | 1689.4 | 1281.9 | 953.2 |
+| C fork | **1843.9** | **1930.2** | **1739.6** | **1449.8** |
+| V Vulkan | 1069.4 | 1216.6 | 1144.9 | 960.4 |
+| **C vs A** | +9.9% | +13.8% | +34.3% | +52.1% |
+
+Decode (t/s)
+
+| backend | 4K | 8K | 32K | 64K |
+|---------|-----|-----|------|------|
+| A f16 | 35.75 | 35.60 | 34.08 | 32.26 |
+| B bf16 | 34.78 | 33.66 | 28.70 | 23.59 |
+| C fork | **38.79** | **38.69** | **36.87** | **34.74** |
+| V Vulkan | 16.50 | 16.12 | 14.81 | 14.16 |
+| **C vs A** | +8.5% | +8.7% | +8.2% | +7.7% |
+| **B vs A** | -2.7% | -5.5% | -15.8% | -26.9% |
 
 ### Reading the throughput tables
 
@@ -84,14 +123,17 @@ tensor split). Values are means of 1-2 rounds, stable to <1%.
   single card at 64K. The per-token f16 conversion cost scales with KV
   traffic. B's prefill is unaffected (it is compute-bound, not conversion
   bound).
-- **C's decode edge is a flat +6-9%** everywhere: decode touches only the
-  final KV depth, so the bf16 advantage is constant rather than growing.
-- **Vulkan**: prefill beats master ROCm on 1 card at every depth (+46-51%)
-  and on 2-3 cards at 32K/64K (+18-31%), but loses badly at shallow
-  multi-card (4K: -30% 2c, -36% 3c) where the layer-split sync dominates.
-  Its prefill never beats the fork's ROCm bf16. Decode collapses on
-  multi-card (17.23 2c / 14.81 3c at 32K; 14.16-16.32 at 64K) but matches
-  or slightly beats C on 1 card (+1%, a recent upstream Vulkan improvement).
+- **C's decode edge is roughly constant rather than growing**: +6-9% on
+  2-3 GPUs, +3-4% on the single card. Decode touches only the final KV
+  depth, so the bf16 advantage does not compound with depth the way
+  prefill's does.
+- **Vulkan**: prefill beats master ROCm on 1 GPU at every depth (+43-51%)
+  and on 2 GPUs at 32K/64K (+18-31%), but loses at shallow multi-GPU
+  (4K: -30% 2c, -36% 3c) and at 3 GPUs even at depth (32K: -12%; 64K:
+  ~tie) where the layer-split sync dominates. Its prefill never beats the
+  fork's ROCm bf16. Decode collapses on multi-GPU (17.23 2c / 14.81 3c at
+  32K; 14.16-16.32 at 64K) but matches or slightly beats C on 1 GPU
+  (+1-2%, a recent upstream Vulkan improvement).
 - **Multi-card scaling, 2 -> 3 cards** (Q8_0):
 
   | config | prefill (32K / 64K) | decode (32K / 64K) |
