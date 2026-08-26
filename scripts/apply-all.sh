@@ -8,7 +8,8 @@
 #
 # Requires a clean llama.cpp working tree checked out at the baseline SHA
 # recorded in MANIFESTS.md. Creates a branch `rdna-boosts` and applies the
-# patches in manifest order, falling back to 3-way merge per patch.
+# patches in manifest order, falling back to 3-way merge per patch; each
+# patch is committed individually with its block label as the message.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -42,10 +43,23 @@ for p in $ORDER; do
             exit 1
         fi
     fi
-done
+    git add -A
+    msg="rdna-boosts: apply $p"
+    subj="$(sed -n 's/^Subject: \[PATCH [0-9]*\/[0-9]*\] //p' "$PATCHES/$p" | head -1)"
+    if [ -n "$subj" ]; then
+        msg="rdna-boosts: $subj"
+    fi
+    git commit -q -m "$msg"
+    echo "   committed"
+ done
 
 echo
-echo "All patches applied on branch $BRANCH."
+if [ "$(git log --oneline | wc -l)" -eq 11 ]; then
+    echo "All 11 patches applied and committed on branch $BRANCH, one commit each:"
+    git log --oneline
+else
+    echo "All patches applied on branch $BRANCH (check git status for uncommitted leftovers)."
+fi
 echo "Next steps (per-block verification from MANIFESTS.md):"
 echo "  cmake -B build -DGGML_HIP=ON -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ -DGGML_HIP_ROCBLAS=ON"
 echo "  cmake --build build -j"
