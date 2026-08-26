@@ -134,6 +134,14 @@ per-block flow when you want reviewable increments).
 
 ## Known notes
 
+- **Upstream limitation (not ours): speculative MTP draft + `--split-mode tensor`
+  crashes graph allocation** (`ggml.c:1804` `GGML_ASSERT(obj_new)` - the meta
+  buffer's 1M-tensor FIXME pool exhausts during MTP draft graph alloc).
+  Reproduced on pristine upstream `d222767c7` with plain `draft-mtp` (both
+  32K and 262K ctx); the adaptive-MTP variant rides the same path. MTP draft
+  works with layer split (default) and single GPU; ngram-only spec works with
+  tensor split. Workaround: drop `--split-mode tensor` (or drop the MTP
+  spec) when using the server with MTP drafting.
 - **Block 02 carries the test-harness seeding fix** (restores upstream
   `random_device` seeding in `init_tensor_uniform`; the fork's deterministic
   seed exposed pre-existing `rms_norm_back` / `cross_entropy_loss_back`
