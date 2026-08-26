@@ -87,7 +87,7 @@ The original source commits on the fork branch `chunked-gdn` (parent
 > tensors of the mul_mat_id host-sort fallback never collide (equal token
 > counts produced identical keys, reusing the wrong expert's quantized
 > tokens; nondeterministic iq1_m MUL_MAT_ID failures on RDNA4).
-| `rdna-boosts-all.patch` | all 48 commits of `758443071..chunked-gdn` + `f2a22a71` |
+| `rdna-boosts-all.patch` (repo root) | all 48 commits of `758443071..chunked-gdn` + `f2a22a71` |
 
 ## Older branches
 
