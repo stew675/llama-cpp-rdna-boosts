@@ -16,13 +16,14 @@ import matplotlib.pyplot as plt
 DEPTHS = [4, 8, 32, 64]  # K tokens (linear x-axis)
 
 SERIES = [
-    # (label, color, marker, linestyle, alpha)
-    # A and B nearly coincide on prefill; alpha-blend them and dash B so the
-    # overlap is visible instead of B hiding A. C and V stay full-strength.
-    ("A: master f16",  "#E63946", "o", "-",  0.85),
-    ("B: master bf16", "#2ECC71", "s", "--", 0.85),
-    ("C: rdna-boosts", "#FFB000", "^", "-",  1.0),
-    ("V: Vulkan bf16", "#2E86FF", "D", "-",  1.0),
+    # (label, color, marker, alpha)
+    # A and B nearly coincide on prefill: alpha-blend them and dash B so the
+    # overlap is visible instead of B hiding A (see plot(); on the decode
+    # charts the lines separate and B stays solid). C and V stay full-strength.
+    ("A: master f16",  "#E63946", "o", 0.85),
+    ("B: master bf16", "#2ECC71", "s", 0.85),
+    ("C: rdna-boosts", "#FFB000", "^", 1.0),
+    ("V: Vulkan bf16", "#2E86FF", "D", 1.0),
 ]
 
 TABLES = {
@@ -64,7 +65,9 @@ def plot(name, meta):
     fig.patch.set_facecolor("black")
     ax.set_facecolor("black")
 
-    for key, color, marker, ls, alpha in SERIES:
+    dash_b = name.startswith("prefill")  # A/B coincide only on prefill
+    for key, color, marker, alpha in SERIES:
+        ls = "--" if (key[0] == "B" and dash_b) else "-"
         ax.plot(DEPTHS, meta[key[0]], color=color, marker=marker,
                 linestyle=ls, alpha=alpha,
                 linewidth=3, markersize=7, label=key, zorder=3)
