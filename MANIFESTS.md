@@ -16,15 +16,17 @@ Upstream range: `7584430716ee229751771ed0d6bbcb780d105eeb` (single point)
 | 03 | `03-bf16-kv-cache.patch` | fattn-tile.{cu,cuh}, fattn.cu, common.cuh, rope.cu, ggml-cuda.cu (IMRoPE fuse), tests/test-backend-ops.cpp | none |
 | 04 | `04-wmma-flash-attn.patch` | fattn-mma-f16.cuh, mmq-vec-dot.cuh, mmq.cuh, fattn.cu, ggml-cuda.cu (WMMA dispatch), tests/test-backend-ops.cpp | none |
 | 05 | `05-bit-identical-decode-cpu.patch` | ggml/src/ggml-cpu/llamafile/sgemm.cpp | none |
-| 07 | `07-gfx1151-mmvq-table.patch` | ggml/src/ggml-cuda/mmvq.cu | none |
-| 08 | `08-host-buffer-revert.patch` | ggml/src/ggml-cuda/ggml-cuda.cu | none |
-| 09 | `09-meta-device-wrapper-skip.patch` | src/llama.cpp | none |
-| 10 | `10-q6k-mmvq-vdr2.patch` | ggml/src/ggml-cuda/{ggml-cuda.cu,mmvq.cu,vecdotq.cuh}, tests/test-backend-ops.cpp | none (test hunk re-based to stock) |
-| 06 | `06-fused-core.patch` | mmvq.{cu,cuh}, ggml-cuda.cu (try_fuse), norm.{cu,cuh}, unary.{cu,cuh}, common.cuh, fattn.cu, fattn-tile.cuh | **blocks 03 and 04 MUST be applied first** (fattn-tile.cuh / fattn.cu territory) |
+| 06 | `06-gfx1151-mmvq-table.patch` | ggml/src/ggml-cuda/mmvq.cu | none |
+| 07 | `07-host-buffer-revert.patch` | ggml/src/ggml-cuda/ggml-cuda.cu | none |
+| 08 | `08-meta-device-wrapper-skip.patch` | src/llama.cpp | none |
+| 09 | `09-q6k-mmvq-vdr2.patch` | ggml/src/ggml-cuda/{ggml-cuda.cu,mmvq.cu,vecdotq.cuh}, tests/test-backend-ops.cpp | none (test hunk re-based to stock) |
+| 10 | `10-fused-core.patch` | mmvq.{cu,cuh}, ggml-cuda.cu (try_fuse), norm.{cu,cuh}, unary.{cu,cuh}, common.cuh, fattn.cu, fattn-tile.cuh | **blocks 03 and 04 MUST be applied first** (fattn-tile.cuh / fattn.cu territory) |
 | 11 | `11-meta-headroom.patch` | ggml/src/ggml-backend-meta.cpp | none (independent; apply last) |
 
-Blocks 01-05 and 07-10 are mutually independent and may be applied in any
-order; **block 06 goes last, always**. The order above is the verified order.
+Block numbers are the apply order: `01` is the smallest number and applies
+first, `11` last. All blocks are mutually independent except **block 10
+(fused core) requires blocks 03 and 04 in the tree** - so it is applied at
+position 10, just before block 11.
 
 ## Block stacking tags (git-native path)
 
@@ -34,7 +36,7 @@ commits are stacked in apply order, rooted at an orphan commit whose tree is
 the upstream baseline `758443071`).
 
 **Tags are numbered by APPLY order.** The patch filenames keep the plan's
-topic numbering (block 06 is the "fused core"); the tag number instead
+apply order: the fused core is `block/10-fused-core`, applied last
 encodes the sequence - so the fused core, applied last, is `block/10-fused-core`:
 
 | apply | tag | patch file |
@@ -44,11 +46,11 @@ encodes the sequence - so the fused core, applied last, is `block/10-fused-core`
 | 3 | `block/03-bf16-kv-cache` | `03-bf16-kv-cache.patch` |
 | 4 | `block/04-wmma-flash-attn` | `04-wmma-flash-attn.patch` |
 | 5 | `block/05-bit-identical-decode-cpu` | `05-bit-identical-decode-cpu.patch` |
-| 6 | `block/06-gfx1151-mmvq-table` | `07-gfx1151-mmvq-table.patch` |
-| 7 | `block/07-host-buffer-revert` | `08-host-buffer-revert.patch` |
-| 8 | `block/08-meta-device-wrapper-skip` | `09-meta-device-wrapper-skip.patch` |
-| 9 | `block/09-q6k-mmvq-vdr2` | `10-q6k-mmvq-vdr2.patch` |
-| 10 | `block/10-fused-core` | `06-fused-core.patch` |
+| 6 | `block/06-gfx1151-mmvq-table` | `06-gfx1151-mmvq-table.patch` |
+| 7 | `block/07-host-buffer-revert` | `07-host-buffer-revert.patch` |
+| 8 | `block/08-meta-device-wrapper-skip` | `08-meta-device-wrapper-skip.patch` |
+| 9 | `block/09-q6k-mmvq-vdr2` | `09-q6k-mmvq-vdr2.patch` |
+| 10 | `block/10-fused-core` | `10-fused-core.patch` |
 | 11 | `block/11-meta-headroom` | `11-meta-headroom.patch` |
 
 Consumer (git-native alternative to `git apply`):
@@ -78,11 +80,11 @@ git apply patches/02-chunked-gdn.patch
 git apply patches/03-bf16-kv-cache.patch
 git apply patches/04-wmma-flash-attn.patch
 git apply patches/05-bit-identical-decode-cpu.patch
-git apply patches/07-gfx1151-mmvq-table.patch
-git apply patches/08-host-buffer-revert.patch
-git apply patches/09-meta-device-wrapper-skip.patch
-git apply patches/10-q6k-mmvq-vdr2.patch
-git apply patches/06-fused-core.patch
+git apply patches/06-gfx1151-mmvq-table.patch
+git apply patches/07-host-buffer-revert.patch
+git apply patches/08-meta-device-wrapper-skip.patch
+git apply patches/09-q6k-mmvq-vdr2.patch
+git apply patches/10-fused-core.patch
 git apply patches/11-meta-headroom.patch
 ```
 
@@ -118,7 +120,7 @@ per-block flow when you want reviewable increments).
 
 ## Known notes
 
-- **iq1_m MUL_MAT_ID flake - FIXED (block 10 / `06-fused-core.patch`).** The
+- **iq1_m MUL_MAT_ID flake - FIXED (block 10 / `10-fused-core.patch`).** The
   nondeterministic failures of `MUL_MAT_ID(type_a=iq1_m,...,m=64,n=16,k=768)`
   (ERR ~0.4 vs 5e-4 tolerance) on this patch set were a real bug in the
   fused-core Q8_1 input cache, not a numerical quirk: the cache keyed matmuls
