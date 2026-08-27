@@ -6,7 +6,7 @@
 #                 ../llama.cpp relative to this repo)
 #   baseline-sha  the upstream baseline SHA the patches are generated against
 #                 (default: the SHA recorded in BASELINE.md)
-#   branch        the fork branch to split for blocks 02-12 (default:
+#   branch        the fork branch to split for blocks 02-08, 10 (default:
 #                 chunked-gdn)
 #
 # Block 01 comes from the fork's `adaptive-mtp` branch (re-based on the
@@ -16,17 +16,18 @@
 # commits. The block commit SHA lists below are those of the current
 # branches; if the fork is rebased, update them (see BASELINE.md, "Drift
 # policy"). Manual touch points after regeneration:
-#   - the block 10 test hunk anchor (make_test_cases_perf() in stock may move)
-#   - the block 10 (fused core) descriptive header
+#   - the block 08 (fused core) test hunk anchor (make_test_cases_perf() in
+#     stock may move)
+#   - the block 08 (fused core) descriptive header
 #   - block 02's test-harness seeding fix (this repo restores upstream
 #     `random_device` seeding in init_tensor_uniform; the fork's chunked-gdn
 #     carries the deterministic 12345 seed, so a fork-driven regeneration
 #     reverts it - re-apply the fix, see BASELINE.md)
-#   - block 10's subtractive diff is computed against <branch>, so a full
+#   - block 08's subtractive diff is computed against <branch>, so a full
 #     regeneration is only valid when <branch> descends from <baseline-sha>;
 #     for a post-192067b72 baseline the fork branches must be re-based first
 #     (the 2026-08-27 cut regenerated block 01 from `adaptive-mtp` and kept
-#     blocks 02-12 byte-identical instead - see BASELINE.md "Drift fix")
+#     blocks 02-10 byte-identical instead - see BASELINE.md "Drift fix")
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -50,17 +51,19 @@ fi
 declare -A BLOCKS_SINGLE
 BLOCKS_SINGLE[04-wmma-flash-attn.patch]="beaf69fb6"
 BLOCKS_SINGLE[05-bit-identical-decode-cpu.patch]="89ac4ba1f"
-BLOCKS_SINGLE[06-gfx1151-mmvq-table.patch]="5b320ed94"
-BLOCKS_SINGLE[07-host-buffer-revert.patch]="edb8d44c0"
-BLOCKS_SINGLE[08-meta-device-wrapper-skip.patch]="32670eec8"
-BLOCKS_SINGLE[11-meta-headroom.patch]="f2a22a71"
-# block 09 was retired: its Q6_K VDR=2 content was folded into the block 12
-# k-quant umbrella (see BASELINE.md). Block 12 is a COMBINED patch
-# (Q6_K+Q4_K/Q5_K/Q8_0+mmq+MoE whitelist) regenerated from the consumer
-# application, not from a single fork commit - regenerate it as
-#   git diff <stock+01-08+10+11 tree> <validated rdna-boosts tree> -- <the
+BLOCKS_SINGLE[06-host-buffer-revert.patch]="edb8d44c0"
+BLOCKS_SINGLE[07-meta-device-wrapper-skip.patch]="32670eec8"
+BLOCKS_SINGLE[09-meta-headroom.patch]="f2a22a71"
+# blocks 09, 06 and 12 (old numbering) were retired: block 09's Q6_K VDR=2
+# content, block 06's gfx1151 (RDNA3_5) mmvq parameter table and block 12's
+# k-quant work are now all in block 10 (the k-quant/mmvq umbrella) in the
+# compacted numbering. Block 10 is a COMBINED patch
+# (Q6_K+Q4_K/Q5_K/Q8_0+RDNA3_5 table+mmq+MoE whitelist) regenerated from the
+# consumer application, not from a single fork commit - regenerate it as
+#   git diff <stock+01-07+08+09 tree> <validated rdna-boosts tree> -- <the
 #   five k-quant files>
-# (see the block-10 test hunk note below for the same pattern).
+# (see the fused-core test hunk note below for the same pattern). Block 08's
+# RDNA3_5 calc_nwarps verify-batch hunk moved to block 10 with the table.
 
 declare -A BLOCKS_MULTI
 # block 01 source is the fork's `adaptive-mtp` branch (5 commits, re-based on
@@ -73,7 +76,7 @@ BLOCKS_MULTI[03-bf16-kv-cache.patch]="5485e79e4 b98265cfd 07767a88a ef3673358 b6
 
 BLOCK_06_COMMITS="14e5dd427 d0e6119a7 333e8f950 c11752b18 10e016df4 85387ba3a 8e1300159 ac08b6d85 a84112dcf 9b4554626 555e79ab2 00f53040f ec09a818e bb64338f9 4c0440841 3d65d7979"
 BLOCK_06_FILES="ggml/src/ggml-cuda/common.cuh ggml/src/ggml-cuda/fattn-tile.cuh ggml/src/ggml-cuda/fattn.cu ggml/src/ggml-cuda/ggml-cuda.cu ggml/src/ggml-cuda/mmvq.cu ggml/src/ggml-cuda/mmvq.cuh ggml/src/ggml-cuda/norm.cu ggml/src/ggml-cuda/norm.cuh ggml/src/ggml-cuda/unary.cu ggml/src/ggml-cuda/unary.cuh"
-PRE_BLOCKS="01-adaptive-mtp.patch 02-chunked-gdn.patch 03-bf16-kv-cache.patch 04-wmma-flash-attn.patch 05-bit-identical-decode-cpu.patch 06-gfx1151-mmvq-table.patch 07-host-buffer-revert.patch 08-meta-device-wrapper-skip.patch"
+PRE_BLOCKS="01-adaptive-mtp.patch 02-chunked-gdn.patch 03-bf16-kv-cache.patch 04-wmma-flash-attn.patch 05-bit-identical-decode-cpu.patch 06-host-buffer-revert.patch 07-meta-device-wrapper-skip.patch"
 
 echo "== fork: $FORK  baseline: $BASELINE  branch: $BRANCH"
 cd "$FORK"
@@ -92,16 +95,18 @@ done
 
 mkdir -p "$PATCHES"
 
-# ---- single-commit blocks (incl. block 10 production parts) ----
+# ---- single-commit blocks (incl. fused-core production parts) ----
 for name in "${!BLOCKS_SINGLE[@]}"; do
     echo "== $name"
     git show "${BLOCKS_SINGLE[$name]}" > "$PATCHES/$name"
 done
 
-# Block 09 was retired (Q6_K VDR=2 folded into block 12). The combined
-# block-12 patch carries the Q6_K/Q4_K/Q5_K/Q8_0 decode-shape perf rows
-# anchored after the generic mul_mat loop - re-base that hunk manually if it
-# drifts against a new baseline.
+# Old blocks 09 and 06 were retired (Q6_K VDR=2 and the gfx1151 RDNA3_5
+# mmvq parameter table folded into block 10, incl. the calc_nwarps
+# verify-batch hunk block 08 used to carry). The combined block-10 patch
+# carries the Q6_K/Q4_K/Q5_K/Q8_0 decode-shape perf rows and the RDNA3_5
+# table anchored in make_test_cases_perf/calc_nwarps - re-base those hunks
+# manually if they drift against a new baseline.
 
 # ---- multi-commit blocks: cherry-pick onto baseline, squash, format-patch ----
 git worktree add --detach "$TMP/wt" "$BASELINE" >/dev/null
@@ -132,19 +137,21 @@ for name in "${!BLOCKS_MULTI[@]}"; do
     ( cd "$TMP/wt" && git reset -q --hard "$BASELINE" )
 done
 
-# ---- block 10 (fused core): subtractive residual vs a synthetic base ----
-# synthetic base = stock + blocks 01-09 (i.e. everything but the fused core)
-# applied; the residual diff is exactly block 10 (16 entangled commits).
-echo "== 10-fused-core.patch"
+# ---- block 08 (fused core): subtractive residual vs a synthetic base ----
+# synthetic base = stock + PRE_BLOCKS (blocks 01-07; old blocks 09/06 folded
+# into block 10) applied; the residual diff is exactly block 08 (16 entangled
+# commits). Note: block 08's RDNA3_5 calc_nwarps verify-batch hunk moved to
+# block 10 (it modifies the RDNA3_5 table folded in there).
+echo "== 08-fused-core.patch"
 ( cd "$TMP/wt"
   for name in $PRE_BLOCKS; do git apply "$PATCHES/$name"; done
   git add -A
   git "${IDENT[@]}" commit -q -m "synthetic base (regeneration)"
   git diff HEAD "$BRANCH" -- $BLOCK_06_FILES > "$TMP/block06.diff" )
-if [ -f "$PATCHES/10-fused-core.patch" ]; then
-    header="$(awk '/^---$/{exit} {print}' "$PATCHES/10-fused-core.patch")"
+if [ -f "$PATCHES/08-fused-core.patch" ]; then
+    header="$(awk '/^---$/{exit} {print}' "$PATCHES/08-fused-core.patch")"
 else
-    header="Subject: [PATCH] cuda : fused-core prefill kernels and GPU bit-identical decode (squashed block 10)
+    header="Subject: [PATCH] cuda : fused-core prefill kernels and GPU bit-identical decode (squashed block 08)
 
 Regenerated by make-patches.sh - edit this header if the block content changed."
 fi
@@ -153,17 +160,17 @@ fi
     echo "---"
     echo
     cat "$TMP/block06.diff"
-} > "$PATCHES/10-fused-core.patch"
+} > "$PATCHES/08-fused-core.patch"
 
 # ---- convenience all-in-one (consumer-application method) ----
 # The net diff is built by applying the just-regenerated patches to a fresh
 # checkout of the baseline (the "consumer application"), not by diffing the
-# fork branches - block 01 lives on `adaptive-mtp` while blocks 02-12 live
-# on <branch>, so no single fork branch carries the whole set.
+# fork branches - block 01 lives on `adaptive-mtp` while blocks 02-08, 10
+# live on <branch>, so no single fork branch carries the whole set.
 echo "== rdna-boosts-all.patch"
 ( cd "$TMP/wt"
   git reset -q --hard "$BASELINE"
-  for p in $PRE_BLOCKS 10-fused-core.patch 11-meta-headroom.patch 12-k-quant-boosts.patch; do
+  for p in $PRE_BLOCKS 08-fused-core.patch 09-meta-headroom.patch 10-k-quant-boosts.patch; do
       git apply "$PATCHES/$p"
   done
   git add -A
@@ -178,8 +185,8 @@ echo "== rdna-boosts-all.patch"
 # encodes the sequence, unlike the patch filenames which are plan topic IDs.
 # Tags are derived artifacts: force-moved on every regeneration.
 echo "== block stacking tags"
-TAG_ORDER="01-adaptive-mtp 02-chunked-gdn 03-bf16-kv-cache 04-wmma-flash-attn 05-bit-identical-decode-cpu 06-gfx1151-mmvq-table 07-host-buffer-revert 08-meta-device-wrapper-skip 10-fused-core 11-meta-headroom 12-k-quant-boosts"
-TAG_NAMES="block/01-adaptive-mtp block/02-chunked-gdn block/03-bf16-kv-cache block/04-wmma-flash-attn block/05-bit-identical-decode-cpu block/06-gfx1151-mmvq-table block/07-host-buffer-revert block/08-meta-device-wrapper-skip block/10-fused-core block/11-meta-headroom block/12-k-quant-boosts"
+TAG_ORDER="01-adaptive-mtp 02-chunked-gdn 03-bf16-kv-cache 04-wmma-flash-attn 05-bit-identical-decode-cpu 06-host-buffer-revert 07-meta-device-wrapper-skip 08-fused-core 09-meta-headroom 10-k-quant-boosts"
+TAG_NAMES="block/01-adaptive-mtp block/02-chunked-gdn block/03-bf16-kv-cache block/04-wmma-flash-attn block/05-bit-identical-decode-cpu block/06-host-buffer-revert block/07-meta-device-wrapper-skip block/08-fused-core block/09-meta-headroom block/10-k-quant-boosts"
 git -C "$REPO_DIR" worktree add --detach "$TMP/tagwt" HEAD >/dev/null
 ( cd "$TMP/tagwt"
   git checkout -q --orphan rdna-tag-build
@@ -207,4 +214,4 @@ git -C "$REPO_DIR" worktree add --detach "$TMP/tagwt" HEAD >/dev/null
 echo
 echo "Done. Verify on a fresh stock checkout at $BASELINE with"
 echo "  scripts/apply-all.sh"
-echo "Manual touch points: block 09 test hunk anchor, block 10 (fused core) header."
+echo "Manual touch points: block 10 test hunk anchor, block 08 (fused core) header."

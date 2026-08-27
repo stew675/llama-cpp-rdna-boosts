@@ -81,6 +81,35 @@ deterministic within a build but can flip across configs (1 of 3 test
 prompts diverged at char 176). Excluding block 12 restores purity; it is
 applied last.
 
+## Validation record (2026-08-28, AMD Radeon AI PRO R9700 x3, ROCm 7.14) - mmvq umbrella fold + renumber
+
+Block 06 (old numbering) retired; its gfx1151 (RDNA3_5) mmvq parameter
+table folded into block 10 (the k-quant + mmvq-parameter umbrella),
+completing the plan from `~/stew675/bundle-k-quant-boosts.md` section 7.
+Block 10 now carries the only decode-numerics changes in the set across ALL
+architectures (RDNA3, RDNA3_5, RDNA4): the Q6_K/Q4_K/Q5_K/Q8_0 VDR kernels,
+the RDNA3_5 nwarps=2 Q8_0 table, and the RDNA4 MoE mmid whitelist. Block
+08's RDNA3_5 verify-batch hunk (`ncols_dst <= MMVQ_MAX_BATCH_SIZE`) moved
+to block 10 with the table (it modifies block-06 content). The set is 10
+patches numbered 01-10 with no gaps (old 07->06, 08->07, 10->08, 11->09,
+12->10). Re-validated: fresh master `fe235f434` checkout, apply-all
+01-10 - zero-fuzz apply, no 3-way fallback, applied tree **byte-identical
+(0 diff lines)** to the pre-fold validated tree (every block's file bytes
+unchanged; only the hunk boundaries moved between patches 08 and 10).
+Block-01 behavior unchanged (`test-speculative-adaptive`, `test-arg-parser`);
+MUL_MAT 1193/1193, GDN 46/46 (4/4 backends), q4_K/q5_K/q8_0 OK on the fresh
+build. RDNA3_5 table semantics unchanged from the validated block-06/08
+combination.
+
+Greedy-purity note (block 10 is now the ONLY patch that changes decode
+numerics on any architecture): compute outputs are not bit-identical to a
+build without it - max logit diff 0.184 vs 0.203 for flash-attn on/off;
+greedy streams are deterministic within a build but can flip across
+configs (1 of 3 test prompts diverged at char 176). Excluding block 10
+restores 100% greedy purity on RDNA3, RDNA3_5 and RDNA4 alike (block 06's
+gfx1151 table was the last non-block-10 numerics change and is now inside
+block 10); it is applied last.
+
 ### Validation record (2026-08-27, AMD Radeon AI PRO R9700 x3, ROCm 7.14)
 
 Master tip `fe235f434` + the 11-block patch set (applied with `apply-all.sh`,
@@ -146,7 +175,7 @@ validation:
    54321 both fail those 9 cases; only the seeding line differs in the
    passing build.
 
-2. **Meta-buffer compute-container headroom (block 11, `f2a22a71`).**
+2. **Meta-buffer compute-container headroom (block 09, `f2a22a71`).**
    `compute_headroom` 16x -> 128x in `ggml-backend-meta.cpp`. Hybrid
    recurrent models (GDN/SSM) create ~2*(n_rs_seq+1) conv-state snapshot
    views per recurrent layer during graph allocation, exceeding 16x and
@@ -171,20 +200,19 @@ The original source commits on the fork branch `chunked-gdn` (parent
 | `03-bf16-kv-cache.patch` | `5485e79e4` `b98265cfd` `07767a88a` `ef3673358` `b6bfa422e` `5e6072558` `bd5bf0ea3` `d33ce1adf` |
 | `04-wmma-flash-attn.patch` | `beaf69fb6` |
 | `05-bit-identical-decode-cpu.patch` | `89ac4ba1f` |
-| `10-fused-core.patch` | `14e5dd427` `d0e6119a7` `333e8f950` `c11752b18` `10e016df4` `85387ba3a` `8e1300159` `ac08b6d85` `a84112dcf` `9b4554626` `555e79ab2` `00f53040f` `ec09a818e` `bb64338f9` `4c0440841` `3d65d7979` |
-| `06-gfx1151-mmvq-table.patch` | `5b320ed94` |
-| `07-host-buffer-revert.patch` | `edb8d44c0` |
-| `08-meta-device-wrapper-skip.patch` | `32670eec8` |
-| `11-meta-headroom.patch` | `f2a22a71` (fork branch `rdna-boosts`, NOT on `chunked-gdn`) |
-| `12-k-quant-boosts.patch` | combined k-quant umbrella: `cd35abd19` (Q6_K, ex-block 09) + `a7d092368`, `f1a072dcd` (Q4_K/Q5_K/Q8_0) - all fork branch `rdna-boosts`, NOT on `chunked-gdn`; the patch is regenerated from the consumer application, see `scripts/make-patches.sh` |
+| `08-fused-core.patch` | `14e5dd427` `d0e6119a7` `333e8f950` `c11752b18` `10e016df4` `85387ba3a` `8e1300159` `ac08b6d85` `a84112dcf` `9b4554626` `555e79ab2` `00f53040f` `ec09a818e` `bb64338f9` `4c0440841` `3d65d7979` |
+| `06-host-buffer-revert.patch` | `edb8d44c0` |
+| `07-meta-device-wrapper-skip.patch` | `32670eec8` |
+| `09-meta-headroom.patch` | `f2a22a71` (fork branch `rdna-boosts`, NOT on `chunked-gdn`) |
+| `10-k-quant-boosts.patch` | combined k-quant + mmvq-parameter umbrella: `cd35abd19` (Q6_K, ex-block 09) + `a7d092368`, `f1a072dcd` (Q4_K/Q5_K/Q8_0) + `5b320ed94` (RDNA3_5 table, ex-block 06, incl. the verify-batch hunk block 08 used to carry) - all fork branch `rdna-boosts`, NOT on `chunked-gdn`; the patch is regenerated from the consumer application, see `scripts/make-patches.sh` |
 
-> `10-fused-core.patch` additionally carries a local correctness fix on top of
+> `08-fused-core.patch` additionally carries a local correctness fix on top of
 > the fork commits: the Q8_1 input cache now keys entries by `src1->data` in
 > addition to the view root, so the stack-allocated per-expert `src1_slice`
 > tensors of the mul_mat_id host-sort fallback never collide (equal token
 > counts produced identical keys, reusing the wrong expert's quantized
 > tokens; nondeterministic iq1_m MUL_MAT_ID failures on RDNA4).
-| `rdna-boosts-all.patch` (repo root) | regenerated from the consumer application at `fe235f434` (diff of the fresh-master checkout with all 11 blocks applied vs `fe235f434`); the block-01 content is the fork `adaptive-mtp` branch, the rest is the `758443071..chunked-gdn` + `f2a22a71` + `a7d092368` + `f1a072dcd` content carried forward unchanged |
+| `rdna-boosts-all.patch` (repo root) | regenerated from the consumer application at `fe235f434` (diff of the fresh-master checkout with all 10 blocks applied vs `fe235f434`); the block-01 content is the fork `adaptive-mtp` branch, the rest is the `758443071..chunked-gdn` + `f2a22a71` + `a7d092368` + `f1a072dcd` + `5b320ed94` content carried forward unchanged |
 
 ## Older branches
 

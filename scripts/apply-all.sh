@@ -16,7 +16,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LLAMA="${1:-$(pwd)}"
 RDNA="${2:-$REPO_DIR}"
 PATCHES="$RDNA/patches"
-ORDER="01-adaptive-mtp.patch 02-chunked-gdn.patch 03-bf16-kv-cache.patch 04-wmma-flash-attn.patch 05-bit-identical-decode-cpu.patch 06-gfx1151-mmvq-table.patch 07-host-buffer-revert.patch 08-meta-device-wrapper-skip.patch 10-fused-core.patch 11-meta-headroom.patch 12-k-quant-boosts.patch"
+ORDER="01-adaptive-mtp.patch 02-chunked-gdn.patch 03-bf16-kv-cache.patch 04-wmma-flash-attn.patch 05-bit-identical-decode-cpu.patch 06-host-buffer-revert.patch 07-meta-device-wrapper-skip.patch 08-fused-core.patch 09-meta-headroom.patch 10-k-quant-boosts.patch"
 
 cd "$LLAMA"
 
