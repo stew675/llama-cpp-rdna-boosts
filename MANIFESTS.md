@@ -18,7 +18,8 @@ This is the authoritative apply order and the verification contract for the
 patch set. It is written for humans AND LLM coding agents. Follow it exactly;
 do not skip blocks.
 
-Branch: `baseline/192067b72` (current, recommended)
+Branch: `main` points at the current checkpoint, currently
+`baseline/192067b72` (current, recommended)
 Upstream range: `d222767c7` .. `192067b72` (13 commits past the original
 baseline; the patch files are unchanged - they apply zero-fuzz to both tips,
 see BASELINE.md. Older branches: `baseline/d222767c7`, `baseline/758443071`)

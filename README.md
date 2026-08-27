@@ -8,14 +8,23 @@ order.
 
 ## Branches (one per verified upstream range)
 
+`main` is a floating pointer: it always points at the CURRENT checkpoint
+branch, so a plain clone (default branch) gets the recommended set. The
+`baseline/<sha>` branches are pinned checkpoints - one per verified upstream
+range. To cut a new checkpoint, create `baseline/<new-sha>` and re-point
+`main` at it (`git branch -f main baseline/<new-sha> && git push origin
+main --force`).
+
 | branch | upstream range | status |
 |--------|----------------|--------|
+| `main` | points at the current checkpoint | currently `baseline/192067b72` |
 | `baseline/192067b72` | `d222767c7` .. `192067b72` | **current, recommended** - same patch files as `d222767c7`, zero-fuzz apply to master at `192067b72`, fresh build + real-model sanity validated 2026-08-26 (ROCm 7.14/gfx1201) |
 | `baseline/d222767c7` | `758443071` .. `d222767c7` | 12-block set, full suite validated 14883/14883 on ROCm 7.14/gfx1201, includes the test-harness seeding fix |
 | `baseline/758443071` | `758443071` (single point) | original set mirroring the fork; known-good for the old upstream, carries the fork's deterministic test-harness seed (see BASELINE.md) |
 
-Pick the branch whose recorded range matches your upstream tip; the
-workflow below uses the current branch.
+Pick the branch whose recorded range matches your upstream tip (`main` is
+fine when your master is at or near the current checkpoint); the workflow
+below uses the current branch.
 
 ## Layout
 
@@ -128,8 +137,17 @@ git apply patches/01-adaptive-mtp.patch   # re-apply; fix drift with git apply -
 
 When more than one block needs manual re-base hunks, the maintainer regenerates
 the set against the new upstream tip (`scripts/make-patches.sh`, run in the
-fork) and cuts a new `baseline/<new-sha>` branch here. Old branches stay as the
-known-good sets for older upstream versions.
+fork), cuts a new `baseline/<new-sha>` branch here, and re-points `main` at
+it so the default branch follows:
+
+```
+git checkout baseline/<new-sha>
+# ... validate (apply-all.sh + build + suite), commit the doc updates ...
+git branch -f main baseline/<new-sha>
+git push origin main --force   # main is a pointer; force is intended
+```
+
+Old branches stay as the known-good sets for older upstream versions.
 
 ## Upstreaming
 

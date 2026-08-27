@@ -1,6 +1,7 @@
 # BASELINE - provenance and drift policy
 
-Branch: `baseline/192067b72` (current, recommended)
+Branch: `main` points at the current checkpoint, currently
+`baseline/192067b72` (current, recommended)
 Upstream range: `d222767c7` .. `192067b72` ("hexagon: support for multi-NPU
 devices (IQ9, IQ10) and fully asynchronous backend (#26501)")
 
