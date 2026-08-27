@@ -106,7 +106,64 @@ magnitude ranges; neither is provably closer to the exact result.
   stock's bits, you must reproduce stock's exact association order — that is
   the entire reason block 10 is structured as one excludable patch.
 
-## 6. Measured magnitude of the variance
+## 6. Speculative decoding: same kernels, same drift, orthogonal composition
+
+Speculative decoding (draft + verify) does not add a separate source of
+variance — it runs the *same* mmvq decode kernels on a wider batch. The
+target model verifies the draft tokens in **one batch of `n_draft+1` rows**
+(default `n_draft = 8`, so up to 9 rows), which hits the identical
+`mul_mat_vec_q` kernels as single-token greedy, just with
+`ncols_dst = n_draft+1`. Acceptance then compares each sampled token
+against the draft:
+
+```cpp
+for (; i < draft.size(); i++) {
+    const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], ...);
+    if (draft[i] != id) break;    // acceptance decision
+}
+```
+
+Two invariants make block 10's interaction with speculation safe and
+bounded:
+
+1. **VDR is per-type only**, not per-column-count: `get_vdr_mmvq(type)`
+   returns the same value for n=1 (single-token decode) and n=2..8
+   (verify batch). Block 10 changes the *values* uniformly, so both paths
+   use the same VDR=4 kernels.
+2. **Block 08's `ncols_dst <= MMVQ_MAX_BATCH_SIZE` rule** forces the
+   verify batch onto the same nwarps as decode, so its per-row
+   accumulation is bit-identical to one-at-a-time decode *within a
+   build*.
+
+Together these guarantee the distribution-preservation property that
+speculative decoding relies on: the acceptance criterion reproduces the
+target model's distribution exactly — with or without block 10. Block 10
+changes the *rounding path* of that distribution, uniformly across both
+paths; it does not break the consistency between them.
+
+The interaction therefore splits along the same line as plain decoding:
+
+| | temp = 0 (greedy) | temp > 0 (stochastic) |
+|---|---|---|
+| **acceptance decisions** | draft accepted iff `argmax(target logits) == draft` — a deterministic comparison; a ≤0.184 logit drift can flip near-tie acceptances | acceptance is a random draw from the (slightly shifted) distribution; the drift perturbs *probabilities*, not decisions |
+| **block 10's effect** | can change which tokens are accepted in near-ties → a different greedy stream (the 1-of-3-prompts divergence, same as plain greedy) | shifts acceptance probabilities by ≤~20% relative on the worst token, typically far less; the RNG draw varies run-to-run by more |
+| **correctness impact** | none — both are valid deterministic paths | none — the sampling *distribution* is what matters, and PPL is bit-unchanged |
+
+**The one nuance:** at temp>0 the drift does not vanish — it slightly
+changes the *acceptance rate* (how many draft tokens get accepted per
+block), a marginal throughput effect. It does not change what the model
+produces in any meaningful sense: the output distribution is preserved
+either way, which is the entire point of the spec-decode acceptance
+criterion.
+
+**Bottom line:** block 10 + speculation = block 10 without speculation,
+from the output-distribution standpoint. Speculation is an accelerator;
+block 10 is a rounding-path choice; they compose orthogonally. The only
+place the composition shows up is greedy acceptance (temp=0), where the
+≤0.184 drift can flip near-tie acceptances — the same bounded,
+characterized divergence described throughout this document.
+
+## 7. Measured magnitude of the variance
 
 From the validation runs on gfx1201 (ROCm 7.14):
 
@@ -142,7 +199,7 @@ unambiguously fine: it is one of many valid rounding paths, and the evidence
 shows it neither helps nor hurts what the model produces — only whether the
 bits match stock's arbitrary-but-pinned order.
 
-## 7. Practical guidance
+## 8. Practical guidance
 
 - **Within a single build:** greedy output is fully deterministic, with or
   without block 10. The variance only appears when comparing *different
