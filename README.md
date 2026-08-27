@@ -31,6 +31,7 @@ below uses the current branch.
 
 ```
 ├── README.md              # this file: overview + consumer workflow
+├── GREEDY-PURITY.md       # block 10 decode variance: reduction mechanics, correctness, numbers
 ├── MANIFESTS.md           # THE CONTRACT: apply order, deps, verify, failure handling
 ├── BASELINE.md            # pinned baseline SHA, per-patch provenance, drift policy
 ├── rdna-boosts-all.patch      # convenience: the entire net as ONE patch
@@ -70,11 +71,16 @@ set is 10 patches numbered 01-10 with no gaps.
 > the reduction on gfx1151 too - so compute outputs are not bit-identical
 > to a build without it (max logit diff 0.184 vs 0.203 for flash-attn
 > on/off; greedy streams are deterministic within a build but can flip
-> across configs). PPL is unaffected (prefill path untouched). If you
-> require 100% greedy purity across builds, do not install
+> across configs). This is a different rounding path, not a correctness
+> change: block 10 computes the same real-number result as stock through a
+> different order of fp32 additions - stock is the reference standard, not
+> the mathematically special order (PPL is bit-unchanged: 6.3162/6.3563).
+> If you require 100% greedy purity across builds, do not install
 > `10-k-quant-boosts.patch` - it is the last patch, so excluding it is a
 > one-line change to `scripts/apply-all.sh` (and it restores purity on
-> RDNA3, RDNA3_5 and RDNA4 alike).
+> RDNA3, RDNA3_5 and RDNA4 alike). **Full discussion of the variance, the
+> reduction mechanics, and what "correctness" means here:
+> [`GREEDY-PURITY.md`](GREEDY-PURITY.md).**
 
 ## Consumer workflow
 

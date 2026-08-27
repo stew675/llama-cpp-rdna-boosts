@@ -146,7 +146,10 @@ BASELINE.md); source commits on fork branch `rdna-boosts`: `cd35abd19`
 > RDNA3_5 nwarps=2 table also changes the reduction). Compute outputs are
 > not bit-identical to a build without it: max logit diff 0.184 vs 0.203 for
 > flash-attn on/off; greedy streams are deterministic within a build but can
-> flip across configs (1 of 3 test prompts diverged). PPL is unaffected
+> flip across configs (1 of 3 test prompts diverged). This is a different
+> fp32 rounding path, not a correctness change - block 10 computes the same
+> real-number result as stock (see [`GREEDY-PURITY.md`](GREEDY-PURITY.md)
+> for the full analysis). PPL is unaffected
 > (prefill path untouched): 6.3162/6.3563 on wikitext-2, matching the
 > pre-block-10 records. Excluding this patch restores 100% greedy purity on
 > ALL architectures (RDNA3, RDNA3_5, RDNA4) - block 06's gfx1151 table was

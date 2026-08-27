@@ -105,7 +105,9 @@ Greedy-purity note (block 10 is now the ONLY patch that changes decode
 numerics on any architecture): compute outputs are not bit-identical to a
 build without it - max logit diff 0.184 vs 0.203 for flash-attn on/off;
 greedy streams are deterministic within a build but can flip across
-configs (1 of 3 test prompts diverged at char 176). Excluding block 10
+configs (1 of 3 test prompts diverged at char 176). This is a different
+fp32 rounding path, not a correctness change (see
+[`GREEDY-PURITY.md`](GREEDY-PURITY.md)); PPL is bit-unchanged. Excluding block 10
 restores 100% greedy purity on RDNA3, RDNA3_5 and RDNA4 alike (block 06's
 gfx1151 table was the last non-block-10 numerics change and is now inside
 block 10); it is applied last.
