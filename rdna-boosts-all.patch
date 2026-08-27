@@ -423,10 +423,10 @@ index 4eef2212e..be1f4b620 100644
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index fe58ea3bb..a01b7ee93 100644
+index 3ec40fb1a..87667beb2 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -1696,7 +1696,12 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
+@@ -1712,7 +1712,12 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
  struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
      const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
  
@@ -4437,10 +4437,10 @@ index d57343386..89708176c 100644
              }
          }
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index 2eb15fdfa..247d81728 100644
+index c978b4421..0998f7bca 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
-@@ -360,6 +360,10 @@ static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, in
+@@ -366,6 +366,10 @@ static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, in
  static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fallback, const int cc, const int64_t ne11) {
      int ret = std::min(ne11, int64_t(512));
      ret -= ret % 8;
@@ -5915,10 +5915,25 @@ index 81ed873ec..ea6b295f0 100644
  
  __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index 0f039c735..28a979ff7 100644
+index 0f039c735..4f0854860 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
-@@ -501,7 +501,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
+@@ -240,7 +240,14 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
+     return sumi*d5d8 + m5s8 / (QI5_1 / vdr);
+ }
+ 
++#if defined(RDNA4)
++// VDR=4 measured on gfx1200/gfx1201 (RX 9000): decode -10..-33% on the
++// compute-bound shapes, neutral on the DRAM-bound lm_head. RDNA3/RDNA3_5
++// keep VDR=2 pending verification on those GPUs.
++#define VDR_Q8_0_Q8_1_MMVQ 4
++#else
+ #define VDR_Q8_0_Q8_1_MMVQ 2
++#endif
+ #define VDR_Q8_0_Q8_1_MMQ 8
+ 
+ template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_q8_1_impl(
+@@ -501,7 +508,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
      return d3*d8 * sumi;
  }
  
@@ -5927,7 +5942,7 @@ index 0f039c735..28a979ff7 100644
  #define VDR_Q4_K_Q8_1_MMQ  8
  
  // contiguous v/x values
-@@ -529,6 +529,34 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
+@@ -529,6 +536,34 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
      return dm4f.x*sumf_d - dm4f.y*sumf_m;
  }
  
@@ -5962,7 +5977,7 @@ index 0f039c735..28a979ff7 100644
  // contiguous v/x + u/y values
  static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
      const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
-@@ -557,7 +585,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
+@@ -557,7 +592,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
      return dm4f.x*sumf_d - dm4f.y*sumf_m;
  }
  
@@ -5971,7 +5986,7 @@ index 0f039c735..28a979ff7 100644
  #define VDR_Q5_K_Q8_1_MMQ  8
  
  // contiguous v/x values
-@@ -592,6 +620,41 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
+@@ -592,6 +627,41 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
      return dm5f.x*sumf_d - dm5f.y*sumf_m;
  }
  
@@ -6013,7 +6028,7 @@ index 0f039c735..28a979ff7 100644
  // contiguous v/x + u/y values
  static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
      const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
-@@ -620,7 +683,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
+@@ -620,7 +690,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
      return dm4f.x*sumf_d - dm4f.y*sumf_m;
  }
  
@@ -6022,7 +6037,7 @@ index 0f039c735..28a979ff7 100644
  #define VDR_Q6_K_Q8_1_MMQ  8
  
  // contiguous v/x values
-@@ -646,6 +709,35 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
+@@ -646,6 +716,35 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
      return d*sumf;
  }
  
@@ -6058,7 +6073,7 @@ index 0f039c735..28a979ff7 100644
  // contiguous v/x + u/y values
  static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
      const int * __restrict__ v, const int * __restrict__ u, const int8_t * __restrict__ sc,
-@@ -953,6 +1045,59 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+@@ -953,6 +1052,59 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
      return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
  }
  
@@ -6118,7 +6133,7 @@ index 0f039c735..28a979ff7 100644
  static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
      const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
  
-@@ -999,6 +1144,64 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
+@@ -999,6 +1151,64 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
      return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
  }
  
@@ -6183,7 +6198,7 @@ index 0f039c735..28a979ff7 100644
  static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
      const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
  
-@@ -1025,6 +1228,41 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+@@ -1025,6 +1235,41 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
      return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
  }
  
@@ -6341,7 +6356,7 @@ index ba58f852e..94735fa69 100644
      assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
      assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 99014df09..6473a94b5 100644
+index b1d86a4e2..91737084f 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1471,14 +1471,64 @@ struct test_case {
@@ -6414,7 +6429,7 @@ index 99014df09..6473a94b5 100644
                  ud->ok = false;
              }
              return true;
-@@ -4350,6 +4400,24 @@ struct test_gated_delta_net : public test_case {
+@@ -4357,6 +4407,24 @@ struct test_gated_delta_net : public test_case {
          return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
      }
  
@@ -6439,7 +6454,7 @@ index 99014df09..6473a94b5 100644
      test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
              int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
              int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
-@@ -9150,6 +9218,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9161,6 +9229,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
@@ -6453,7 +6468,7 @@ index 99014df09..6473a94b5 100644
  #endif
  
      for (ggml_type type_a : all_types) {
-@@ -9876,8 +9951,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9887,8 +9962,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -6464,7 +6479,7 @@ index 99014df09..6473a94b5 100644
              if (hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
              if (hsk == 192 && (hsv != 128 && hsv != 192)) continue;
              if (hsk == 576 && hsv != 512) continue; // DeepSeek MLA
-@@ -9888,7 +9963,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9899,7 +9974,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      for (float max_bias : { 0.0f, 8.0f }) {
                          if (!mask && max_bias > 0.0f) continue;
                          for (float logit_softcap : {0.0f, 10.0f}) {
@@ -6474,7 +6489,7 @@ index 99014df09..6473a94b5 100644
                              for (int nh : { 1, 4 }) {
                                  if (nh == 1 && hsk != 320 && hsk != 576) continue;
                                  for (int nr3 : { 1, 3, }) {
-@@ -9906,7 +9982,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9917,7 +9993,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                  for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
                                                      if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
                                                      for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
@@ -6485,7 +6500,7 @@ index 99014df09..6473a94b5 100644
                                                          // DeepSeek MLA: the V cache is a sub-view of the K cache
                                                          const bool v_is_view_of_k = hsk == 576;
                                                          test_cases.emplace_back(new test_flash_attn_ext(
-@@ -10054,6 +10132,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10065,6 +10143,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
@@ -6504,7 +6519,7 @@ index 99014df09..6473a94b5 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
-@@ -10149,6 +10239,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10160,6 +10250,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
              GGML_TYPE_F32, {n_kv, 512, 64, 1}, false, {2, 1, 0, 3}));
      }
  
@@ -6535,7 +6550,7 @@ index 99014df09..6473a94b5 100644
      // Conv2d: K=CRS=NPQ=4096 matmul performance
      uint32_t                        iwh_idx  = 0;
      uint32_t                        kwh_idx  = 1;
-@@ -10303,9 +10417,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10314,9 +10428,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -6571,7 +6586,7 @@ index 99014df09..6473a94b5 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -10313,8 +10451,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10324,8 +10462,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -6582,7 +6597,7 @@ index 99014df09..6473a94b5 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 1792, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));
-@@ -10493,6 +10631,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10504,6 +10642,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
  

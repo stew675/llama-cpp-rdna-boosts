@@ -40,6 +40,26 @@ hunk line hints and blob SHAs shift).
   for every production file (the only intentional divergence is the test
   harness fix described below).
 
+### Validation record (2026-08-26, AMD Radeon AI PRO R9700 x3, ROCm 7.14) - k-quant bundle
+
+Block 09 retired; its Q6_K VDR=2 content folded into block 12 (the combined
+k-quant umbrella, incl. RDNA4-gated Q8_0 VDR=4). The set is now 11 patches
+(01-08, 10, 11, 12). Re-validated: fresh master `192067b72` checkout,
+apply-all 01-08 + 10 + 11 + 12 - zero-fuzz apply, applied tree byte-identical (0 diff
+lines) to the pre-bundle validated tree. MUL_MAT q4_K/q5_K/q8_0 54+47,
+MUL_MAT_ID 76/76, GDN 46/46. Real-model sanity unchanged (Q4_K_XL decode
++5.5-5.7%, Q8_0 model +0.8%). PPL re-run on the Q8_0 model: 6.3162
+(128 chunks) and 6.3563 (full corpus) - bit-identical to the pre-block-12
+records (PPL is prefill-only; the VDR changes do not touch the prefill
+path).
+
+Greedy-purity note (block 12 is the only patch that changes decode
+numerics): compute outputs are not bit-identical to a build without it - max
+logit diff 0.184 vs 0.203 for flash-attn on/off; greedy streams are
+deterministic within a build but can flip across configs (1 of 3 test
+prompts diverged at char 176). Excluding block 12 restores purity; it is
+applied last.
+
 ### Validation record (2026-08-26, AMD Radeon AI PRO R9700 x3, ROCm 7.14)
 
 Master tip `192067b72` + the 12-block patch set (applied with `apply-all.sh`,
@@ -119,9 +139,8 @@ The original source commits on the fork branch `chunked-gdn` (parent
 | `06-gfx1151-mmvq-table.patch` | `5b320ed94` |
 | `07-host-buffer-revert.patch` | `edb8d44c0` |
 | `08-meta-device-wrapper-skip.patch` | `32670eec8` |
-| `09-q6k-mmvq-vdr2.patch` | `cd35abd19` |
 | `11-meta-headroom.patch` | `f2a22a71` (fork branch `rdna-boosts`, NOT on `chunked-gdn`) |
-| `12-k-quant-boosts.patch` | `a7d092368` (fork branch `rdna-boosts`, NOT on `chunked-gdn`) |
+| `12-k-quant-boosts.patch` | combined k-quant umbrella: `cd35abd19` (Q6_K, ex-block 09) + `a7d092368`, `f1a072dcd` (Q4_K/Q5_K/Q8_0) - all fork branch `rdna-boosts`, NOT on `chunked-gdn`; the patch is regenerated from the consumer application, see `scripts/make-patches.sh` |
 
 > `10-fused-core.patch` additionally carries a local correctness fix on top of
 > the fork commits: the Q8_1 input cache now keys entries by `src1->data` in
@@ -129,7 +148,7 @@ The original source commits on the fork branch `chunked-gdn` (parent
 > tensors of the mul_mat_id host-sort fallback never collide (equal token
 > counts produced identical keys, reusing the wrong expert's quantized
 > tokens; nondeterministic iq1_m MUL_MAT_ID failures on RDNA4).
-| `rdna-boosts-all.patch` (repo root) | all 48 commits of `758443071..chunked-gdn` + `f2a22a71` + `a7d092368` |
+| `rdna-boosts-all.patch` (repo root) | all 48 commits of `758443071..chunked-gdn` + `f2a22a71` + `a7d092368` + `f1a072dcd` |
 
 ## Older branches
 

@@ -40,7 +40,7 @@ below uses the current branch.
     └── apply-all.sh       # applies in manifest order + runs the verification commands
 ```
 
-## The 12 blocks
+## The 11 blocks
 
 | patch | what | size |
 |-------|------|------|
@@ -52,14 +52,24 @@ below uses the current branch.
 | `06-gfx1151-mmvq-table.patch` | RDNA3_5 mmvq parameter table + nwarps=2 Q8_0 decode | 1 commit |
 | `07-host-buffer-revert.patch` | back out integrated-GPU host buffers on HIP (PR #24233) | 1 commit |
 | `08-meta-device-wrapper-skip.patch` | skip the Meta device wrapper with a single GPU | 1 commit |
-| `09-q6k-mmvq-vdr2.patch` | Q6_K mmvq VDR=2 decode kernel | 1 commit |
 | `10-fused-core.patch` | fused quantized-matmul kernels + graph fusions (SSM/MoE), GPU bit-identical decode | 16 commits, 1 diff |
 | `11-meta-headroom.patch` | meta-buffer compute-container headroom | 1 commit |
-| `12-k-quant-boosts.patch` | k-quant boosts: Q4_K/Q5_K mmvq VDR=4 decode, mmq scale-load hoist, RDNA4 MoE mmid whitelist | 1 commit |
+| `12-k-quant-boosts.patch` | k-quant umbrella: Q6_K VDR=2 (ex-block 09) + Q4_K/Q5_K/Q8_0 VDR=4 mmvq decode, mmq scale-load hoist, RDNA4 MoE mmid whitelist | combined |
 
 Blocks are listed in apply order; `10-fused-core` needs blocks 03+04 in the
 tree (see MANIFESTS.md), `11` is a follow-up fix applied last, `12` is the
-k-quant umbrella (future quant kernel optimizations land here).
+k-quant umbrella (all k-quant VDR/decode work, present and future, lives
+here). **Block 09 was retired**: its Q6_K VDR=2 decode work is folded into
+block 12, so the set is 11 patches numbered 01-08, 10, 11, 12.
+
+> **Greedy-purity note (read before shipping):** block 12 is the only patch
+> that changes decode numerics - its VDR kernels reorder the fp32 reduction,
+> so compute outputs are not bit-identical to a build without it (max logit
+> diff 0.184 vs 0.203 for flash-attn on/off; greedy streams are deterministic
+> within a build but can flip across configs). PPL is unaffected (prefill
+> path untouched). If you require 100% greedy purity across builds, do not
+> install `12-k-quant-boosts.patch` - it is the last patch, so excluding it
+> is a one-line change to `scripts/apply-all.sh`.
 
 ## Consumer workflow
 
@@ -80,10 +90,10 @@ git checkout -b rdna-boosts
 
 # 3. apply in manifest order, verifying each (block 10 LAST before blocks 11/12)
 git apply ../rdna-boosts/patches/01-adaptive-mtp.patch
-... # blocks 02-05, 07-10 in any order
+... # blocks 02-08, then 10, then 11
 git apply ../rdna-boosts/patches/10-fused-core.patch
 git apply ../rdna-boosts/patches/11-meta-headroom.patch
-git apply ../rdna-boosts/patches/12-k-quant-boosts.patch
+git apply ../rdna-boosts/patches/12-k-quant-boosts.patch   # omit for greedy purity
 
 # 4. full verification
 cmake -B build -DGGML_HIP=ON -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ ...
@@ -96,11 +106,12 @@ cmake --build build -j
 
 ### Git-native alternative: block tags
 
-The repo also carries `block/01-… block/12-…` tags - one squashed commit per
-block, stacked in apply order. Block numbers are the apply order everywhere
-(patch filenames, tag names, block labels in the git history): `01` applies
-first, `12` last. The fused core needs blocks 03+04 in the tree, so it sits
-at position 10. Each tag's diff-vs-parent is exactly that block:
+The repo also carries `block/01-… block/08-…`, `block/10-… block/12-…` tags
+(block 09 retired) - one squashed commit per block, stacked in apply order.
+Block numbers are the apply order everywhere (patch filenames, tag names,
+block labels in the git history): `01` applies first, `12` last. The fused
+core needs blocks 03+04 in the tree, so it sits at position 10. Each tag's
+diff-vs-parent is exactly that block:
 
 ```
 git remote add rdna-boosts git@github.com:stew675/llama-cpp-rdna-boosts.git

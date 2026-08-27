@@ -11,8 +11,12 @@ standalone diffs and 1 "fused core" (16 mutually-entangled commits extracted as
 one combined diff, applied last). One follow-up fix was added later as
 **block 11** (`11-meta-headroom.patch`, meta-buffer compute-container
 headroom) and the k-quant kernel boosts landed as **block 12**
-(`12-k-quant-boosts.patch`, Q4_K/Q5_K VDR=4 decode, mmq scale-load hoist,
-RDNA4 MoE mmid whitelist), so the full set is 12 patches in apply order.
+(`12-k-quant-boosts.patch`, Q6_K VDR=2 + Q4_K/Q5_K/Q8_0 VDR=4 decode, mmq
+scale-load hoist, RDNA4 MoE mmid whitelist), so the full set is 11 patches
+in apply order. **Block 09 was retired**: its Q6_K VDR=2 decode work was
+folded into block 12 so that all k-quant VDR/decode work lives in the one
+umbrella patch - excluding it restores 100% greedy-purity (see the
+Greedy-purity note below). Numbers run 01-08, 10, 11, 12.
 
 This is the authoritative apply order and the verification contract for the
 patch set. It is written for humans AND LLM coding agents. Follow it exactly;
@@ -35,7 +39,7 @@ Full 14883/14883 suite record carries from the identical block code.
 
 ## Validation record (2026-08-25, ROCm 7.14, gfx1201)
 
-All 12 patches applied in the order below to a fresh checkout of
+All 11 patches applied in the order below to a fresh checkout of
 `d222767c7`, built `GGML_HIP=ON Release`:
 
 - `test-backend-ops` (ROCm0/1/2 + CPU): **14883/14883 passed, 0 failures**
@@ -60,10 +64,9 @@ debugging the bf16 GDN kernel, deterministically fails `rms_norm_back` /
 | 06 | `06-gfx1151-mmvq-table.patch` | ggml/src/ggml-cuda/mmvq.cu | none |
 | 07 | `07-host-buffer-revert.patch` | ggml/src/ggml-cuda/ggml-cuda.cu | none |
 | 08 | `08-meta-device-wrapper-skip.patch` | src/llama.cpp | none |
-| 09 | `09-q6k-mmvq-vdr2.patch` | ggml/src/ggml-cuda/{ggml-cuda.cu,mmvq.cu,vecdotq.cuh}, tests/test-backend-ops.cpp | none (test hunk re-based to stock) |
 | 10 | `10-fused-core.patch` | mmvq.{cu,cuh}, ggml-cuda.cu (try_fuse), norm.{cu,cuh}, unary.{cu,cuh}, common.cuh, fattn.cu, fattn-tile.cuh | **blocks 03 and 04 MUST be applied first** (fattn-tile.cuh / fattn.cu territory) |
 | 11 | `11-meta-headroom.patch` | ggml/src/ggml-backend-meta.cpp | none (independent; apply last) |
-| 12 | `12-k-quant-boosts.patch` | ggml/src/ggml-cuda/{mmq-vec-dot.cuh,mmvq.cu,vecdotq.cuh}, tests/test-backend-ops.cpp | none (apply last) |
+| 12 | `12-k-quant-boosts.patch` | ggml/src/ggml-cuda/{ggml-cuda.cu,mmq-vec-dot.cuh,mmvq.cu,vecdotq.cuh}, tests/test-backend-ops.cpp | none (apply last; omit for greedy purity) |
 
 Block numbers are the apply order: `01` is the smallest number and applies
 first, `11` last. All blocks are mutually independent except **block 10
@@ -92,7 +95,6 @@ blocks 03+04 in the tree, so it sits at position 10:
 | 6 | `block/06-gfx1151-mmvq-table` | `06-gfx1151-mmvq-table.patch` |
 | 7 | `block/07-host-buffer-revert` | `07-host-buffer-revert.patch` |
 | 8 | `block/08-meta-device-wrapper-skip` | `08-meta-device-wrapper-skip.patch` |
-| 9 | `block/09-q6k-mmvq-vdr2` | `09-q6k-mmvq-vdr2.patch` |
 | 10 | `block/10-fused-core` | `10-fused-core.patch` |
 | 11 | `block/11-meta-headroom` | `11-meta-headroom.patch` |
 | 12 | `block/12-k-quant-boosts` | `12-k-quant-boosts.patch` |
@@ -106,15 +108,30 @@ in the server. Source: fork branch `rdna-boosts` commit `f2a22a71` (not on
 `chunked-gdn`); needed by any recurrent model under tensor split, applied
 last or anywhere (independent file).
 
-`block/12-k-quant-boosts` is the k-quant umbrella: it brings the block-04/09
-optimizations to Q4_K/Q5_K - mmvq VDR=4 decode kernels (32 elements/thread,
-shared scale/d8 loads), the mmq prefill scale-load hoist in
-`vec_dot_q8_1_q8_1_mma`, the RDNA4 MoE mmid whitelist Q4_K 4->7, and the
+`block/12-k-quant-boosts` is the k-quant umbrella: all k-quant VDR/decode
+work in one patch. It carries the Q6_K VDR=2 decode kernel (ex-block 09,
+plus the `GGML_CUDA_OP_TIMING` graph-capture guard), the Q4_K/Q5_K mmvq
+VDR=4 kernels (32 elements/thread, shared scale/d8 loads), the Q8_0 mmvq
+VDR=4 kernel (RDNA4-gated, `__GFX12__`), the mmq prefill scale-load hoist
+in `vec_dot_q8_1_q8_1_mma`, the RDNA4 MoE mmid whitelist Q4_K 4->7, and the
 matching perf-harness cases. Measured on gfx1201: decode n=1 -13%..-18%
-(q4_K) / -8%..-15% (q5_K); verify batch n=2..8 -2%..-13%; MoE n=5/6/7 per
-expert -22%..-28%; real-model (Qwen3.8-27B Q4_K_XL, mixed quants) decode
-+5.5-5.7%. Future k-quant kernel optimizations land in this block. Source:
-fork branch `rdna-boosts` commit `a7d092368`.
+(q4_K), -8%..-15% (q5_K), -10%..-33% (q8_0 compute-bound shapes); verify
+batch n=2..8 -2%..-13%; MoE n=5/6/7 per expert -22%..-28%; real-model
+(Qwen3.8-27B Q4_K_XL, mixed quants) decode +5.5-5.7%. Future k-quant
+optimizations land in this block. Combined patch regenerated from the
+consumer application (see BASELINE.md); source commits on fork branch
+`rdna-boosts`: `cd35abd19` (Q6_K), `a7d092368` + `f1a072dcd` (Q4_K/Q5_K +
+Q8_0).
+
+> **Greedy-purity note:** this is the ONLY patch in the set that changes
+> decode numerics (VDR reorders the fp32 cross-thread reduction). Compute
+> outputs are not bit-identical to a build without it: max logit diff 0.184
+> vs 0.203 for flash-attn on/off; greedy streams are deterministic within a
+> build but can flip across configs (1 of 3 test prompts diverged). PPL is
+> unaffected (prefill path untouched): 6.3162/6.3563 on wikitext-2, matching
+> the pre-block-12 records. Excluding this patch restores 100% greedy
+> purity; it is applied last, so `apply-all.sh` needs only the one ORDER
+> entry dropped.
 Consumer (git-native alternative to `git apply`):
 
 ```
@@ -126,7 +143,7 @@ git cherry-pick block/01-adaptive-mtp
 git cherry-pick block/10-fused-core     # last
 ...
 git cherry-pick block/11-meta-headroom
-git cherry-pick block/12-k-quant-boosts
+git cherry-pick block/12-k-quant-boosts   # omit for greedy purity
 ```
 
 Cherry-pick uses 3-way merge, so each block degrades gracefully when upstream
@@ -148,10 +165,9 @@ git apply patches/05-bit-identical-decode-cpu.patch
 git apply patches/06-gfx1151-mmvq-table.patch
 git apply patches/07-host-buffer-revert.patch
 git apply patches/08-meta-device-wrapper-skip.patch
-git apply patches/09-q6k-mmvq-vdr2.patch
 git apply patches/10-fused-core.patch
 git apply patches/11-meta-headroom.patch
-git apply patches/12-k-quant-boosts.patch
+git apply patches/12-k-quant-boosts.patch   # omit for greedy purity
 ```
 
 applies with zero fuzz and, after the block-02 test-harness fix, passes the

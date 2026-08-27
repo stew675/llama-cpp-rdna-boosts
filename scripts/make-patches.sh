@@ -40,9 +40,14 @@ BLOCKS_SINGLE[05-bit-identical-decode-cpu.patch]="89ac4ba1f"
 BLOCKS_SINGLE[06-gfx1151-mmvq-table.patch]="5b320ed94"
 BLOCKS_SINGLE[07-host-buffer-revert.patch]="edb8d44c0"
 BLOCKS_SINGLE[08-meta-device-wrapper-skip.patch]="32670eec8"
-BLOCKS_SINGLE[09-q6k-mmvq-vdr2.patch]="cd35abd19"
 BLOCKS_SINGLE[11-meta-headroom.patch]="f2a22a71"
-BLOCKS_SINGLE[12-k-quant-boosts.patch]="a7d092368"
+# block 09 was retired: its Q6_K VDR=2 content was folded into the block 12
+# k-quant umbrella (see BASELINE.md). Block 12 is a COMBINED patch
+# (Q6_K+Q4_K/Q5_K/Q8_0+mmq+MoE whitelist) regenerated from the consumer
+# application, not from a single fork commit - regenerate it as
+#   git diff <stock+01-08+10+11 tree> <validated rdna-boosts tree> -- <the
+#   five k-quant files>
+# (see the block-10 test hunk note below for the same pattern).
 
 declare -A BLOCKS_MULTI
 BLOCKS_MULTI[01-adaptive-mtp.patch]="87ad1db26 b56926039 d0d7ff27e 8d70e21f5 0cf87e989"
@@ -51,7 +56,7 @@ BLOCKS_MULTI[03-bf16-kv-cache.patch]="5485e79e4 b98265cfd 07767a88a ef3673358 b6
 
 BLOCK_06_COMMITS="14e5dd427 d0e6119a7 333e8f950 c11752b18 10e016df4 85387ba3a 8e1300159 ac08b6d85 a84112dcf 9b4554626 555e79ab2 00f53040f ec09a818e bb64338f9 4c0440841 3d65d7979"
 BLOCK_06_FILES="ggml/src/ggml-cuda/common.cuh ggml/src/ggml-cuda/fattn-tile.cuh ggml/src/ggml-cuda/fattn.cu ggml/src/ggml-cuda/ggml-cuda.cu ggml/src/ggml-cuda/mmvq.cu ggml/src/ggml-cuda/mmvq.cuh ggml/src/ggml-cuda/norm.cu ggml/src/ggml-cuda/norm.cuh ggml/src/ggml-cuda/unary.cu ggml/src/ggml-cuda/unary.cuh"
-PRE_BLOCKS="01-adaptive-mtp.patch 02-chunked-gdn.patch 03-bf16-kv-cache.patch 04-wmma-flash-attn.patch 05-bit-identical-decode-cpu.patch 06-gfx1151-mmvq-table.patch 07-host-buffer-revert.patch 08-meta-device-wrapper-skip.patch 09-q6k-mmvq-vdr2.patch"
+PRE_BLOCKS="01-adaptive-mtp.patch 02-chunked-gdn.patch 03-bf16-kv-cache.patch 04-wmma-flash-attn.patch 05-bit-identical-decode-cpu.patch 06-gfx1151-mmvq-table.patch 07-host-buffer-revert.patch 08-meta-device-wrapper-skip.patch"
 
 echo "== fork: $FORK  baseline: $BASELINE  branch: $BRANCH"
 cd "$FORK"
@@ -71,38 +76,10 @@ for name in "${!BLOCKS_SINGLE[@]}"; do
     git show "${BLOCKS_SINGLE[$name]}" > "$PATCHES/$name"
 done
 
-# ---- block 10 test hunk: re-based to a stock-stable anchor ----
-# The original test hunk context (Q6_K perf cases) was added by block 04, so
-# it cannot apply to stock alone. Re-generate the 12 decode-shape test lines
-# (extracted from the fork tree) as a fresh hunk anchored after the generic
-# mul_mat perf loop in make_test_cases_perf(), i.e. just before the
-# "// qwen3-30b-a3b" comment. Content is identical to the fork; only the
-# position differs.
-echo "== 09-q6k-mmvq-vdr2.patch: re-based test hunk"
-git show "$BRANCH:tests/test-backend-ops.cpp" > "$TMP/fork-test-ops.cpp"
-git show "$BASELINE:tests/test-backend-ops.cpp" > "$TMP/stock-test-ops.cpp"
-awk '/^    \/\/ Qwen3\.6-27B decode shapes/{grab=1} grab{print} grab && n++>=10{exit}' \
-    "$TMP/fork-test-ops.cpp" > "$TMP/block10-lines.txt"
-awk -v lines="$TMP/block10-lines.txt" '
-    /^    for \(int bs : \{1, 2, 3, 4, 5, 8, 512\}\) \{$/ { in_loop=1 }
-    in_loop && /^    \}$/ {
-        print $0
-        print ""
-        while ((getline l < lines) > 0) print l
-        in_loop = 0
-        next
-    }
-    { print }
-' "$TMP/stock-test-ops.cpp" > "$TMP/stock-test-ops+09.cpp"
-# splice the re-based test hunk into the block-09 patch (drop the original test section)
-awk '/^diff --git a\/tests\/test-backend-ops.cpp/{exit} {print}' "$PATCHES/09-q6k-mmvq-vdr2.patch" > "$TMP/b09-head"
-{
-    echo "diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp"
-    diff -u --label a/tests/test-backend-ops.cpp --label b/tests/test-backend-ops.cpp \
-        "$TMP/stock-test-ops.cpp" "$TMP/stock-test-ops+09.cpp" || true
-} >> "$TMP/b09-head"
-cat "$TMP/b09-head" > "$PATCHES/09-q6k-mmvq-vdr2.patch"
-echo "   regenerated (12 decode-shape lines + comment). If the anchor moved, re-base manually."
+# Block 09 was retired (Q6_K VDR=2 folded into block 12). The combined
+# block-12 patch carries the Q6_K/Q4_K/Q5_K/Q8_0 decode-shape perf rows
+# anchored after the generic mul_mat loop - re-base that hunk manually if it
+# drifts against a new baseline.
 
 # ---- multi-commit blocks: cherry-pick onto baseline, squash, format-patch ----
 git worktree add --detach "$TMP/wt" "$BASELINE" >/dev/null
@@ -169,8 +146,8 @@ git diff "$BASELINE" "$BRANCH" > "$REPO_DIR/rdna-boosts-all.patch"
 # encodes the sequence, unlike the patch filenames which are plan topic IDs.
 # Tags are derived artifacts: force-moved on every regeneration.
 echo "== block stacking tags"
-TAG_ORDER="01-adaptive-mtp 02-chunked-gdn 03-bf16-kv-cache 04-wmma-flash-attn 05-bit-identical-decode-cpu 06-gfx1151-mmvq-table 07-host-buffer-revert 08-meta-device-wrapper-skip 09-q6k-mmvq-vdr2 10-fused-core 11-meta-headroom 12-k-quant-boosts"
-TAG_NAMES="block/01-adaptive-mtp block/02-chunked-gdn block/03-bf16-kv-cache block/04-wmma-flash-attn block/05-bit-identical-decode-cpu block/06-gfx1151-mmvq-table block/07-host-buffer-revert block/08-meta-device-wrapper-skip block/09-q6k-mmvq-vdr2 block/10-fused-core block/11-meta-headroom block/12-k-quant-boosts"
+TAG_ORDER="01-adaptive-mtp 02-chunked-gdn 03-bf16-kv-cache 04-wmma-flash-attn 05-bit-identical-decode-cpu 06-gfx1151-mmvq-table 07-host-buffer-revert 08-meta-device-wrapper-skip 10-fused-core 11-meta-headroom 12-k-quant-boosts"
+TAG_NAMES="block/01-adaptive-mtp block/02-chunked-gdn block/03-bf16-kv-cache block/04-wmma-flash-attn block/05-bit-identical-decode-cpu block/06-gfx1151-mmvq-table block/07-host-buffer-revert block/08-meta-device-wrapper-skip block/10-fused-core block/11-meta-headroom block/12-k-quant-boosts"
 git -C "$REPO_DIR" worktree add --detach "$TMP/tagwt" HEAD >/dev/null
 ( cd "$TMP/tagwt"
   git checkout -q --orphan rdna-tag-build

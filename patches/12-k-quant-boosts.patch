@@ -1,30 +1,58 @@
-From a7d09236861dd11fac2b88e4c3472eeec0a895a1 Mon Sep 17 00:00:00 2001
+From f1a072dcd61dd11fac2b88e4c3472eeec0a895a1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Wed, 26 Aug 2026 21:24:44 -0500
-Subject: [PATCH 12/12] block 12: k-quant-boosts Q4_K/Q5_K VDR=4 decode,
- mmq scale hoist, MoE whitelist
+Subject: [PATCH 12/12] block 12: k-quant-boosts - Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR decode, mmq scale hoist, MoE whitelist
 
-Q4_K/Q5_K were the remaining k-quants on mainline mmvq/mmap paths. This
-block applies the block-04/09 optimizations to them:
+The single umbrella patch for k-quant kernel work on RDNA4. Q6_K VDR=2
+(block 09) was folded in here so that excluding this one patch restores
+100% greedy-decoding purity (all other blocks leave decode bit-identical
+within a build):
 
-- VDR=4 mmvq decode kernels (32 elements/thread, shared scale/d8 loads):
-  decode n=1 improves -13%..-18% (q4_K) and -8%..-15% (q5_K) on the
-  Qwen3.6-27B shapes; verify batch n=2..8 -2%..-13%. Real-model
-  (Qwen3.8-27B Q4_K_XL, mixed Q4_K/Q5_K/Q6_K/Q8_0): decode +5.5-5.7%.
-- mmq prefill scale-load hoist in vec_dot_q8_1_q8_1_mma (block-04 style):
-  q4_K n=16 prefill -4.6%.
-- RDNA4 MoE mmid whitelist Q4_K 4->7 (n=5/6/7 per expert -22%..-28%);
-  Q5_K stays at 5 (wash vs mmq, verified against a CUDA-graph artifact).
-- perf harness: Q4_K/Q5_K decode + prefill rows, MUL_MAT_ID bs=5/6/7.
+- Q6_K mmvq VDR=2 decode kernel (formerly block 09, plus the
+  GGML_CUDA_OP_TIMING graph-capture guard).
+- Q4_K/Q5_K mmvq VDR=4 decode kernels (32 elements/thread, shared
+  scale/d8 loads): decode n=1 -13%..-18% (q4_K) / -8%..-15% (q5_K).
+- Q8_0 mmvq VDR=4 decode, RDNA4-gated (__GFX12__): -10%..-33% on the
+  compute-bound shapes; other archs keep VDR=2 pending RDNA3/RDNA3_5
+  verification.
+- mmq prefill scale-load hoist in vec_dot_q8_1_q8_1_mma: q4_K n=16 -4.6%.
+- RDNA4 MoE mmid whitelist Q4_K 4->7 (n=5/6/7 per expert -22%..-28%).
+- perf harness: Q4_K/Q5_K/Q6_K/Q8_0 decode + prefill rows, MUL_MAT_ID
+  bs=5/6/7.
+
+Numerics (read before shipping): the VDR kernels reorder the fp32
+cross-thread reduction, so compute outputs are not bit-identical to VDR=2
+builds (max logit diff 0.184 vs flash-attn on/off's 0.203; greedy streams
+are deterministic within a build but can flip across configs - 1 of 3 test
+prompts diverged). PPL is unaffected (prefill path untouched): 6.3162/6.3563
+on wikitext-2, matching the pre-block-12 records. If you require 100%
+greedy purity across builds, do not apply this patch.
 
 Assisted-by: pi
 ---
- ggml/src/ggml-cuda/mmq-vec-dot.cuh |  17 ++-
- ggml/src/ggml-cuda/mmvq.cu         |   6 +-
- ggml/src/ggml-cuda/vecdotq.cuh     | 178 ++++++++++++++++++++++++++++-
- tests/test-backend-ops.cpp         |  20 +++-
- 4 files changed, 208 insertions(+), 13 deletions(-)
-
+  5 files changed, 297 insertions(+), 16 deletions(-)
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index d57b6a120..cc7841dc1 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4845,13 +4845,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     bool cuda_graph_update_required = false;
+     const void * graph_key = nullptr;
+ 
++    // op timing instruments each node with stream events, which is not possible during capture
++    const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
++
+ #ifdef USE_CUDA_GRAPH
+     graph_key = ggml_cuda_graph_get_key(cgraph);
+ 
+     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+ 
+     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+-    if (graph->is_enabled()) {
++    if (!op_timing && graph->is_enabled()) {
+         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+         if (graph_compatible) {
+             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 diff --git a/ggml/src/ggml-cuda/mmq-vec-dot.cuh b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
 index fd0414e8d..89708176c 100644
 --- a/ggml/src/ggml-cuda/mmq-vec-dot.cuh
@@ -61,20 +89,22 @@ index fd0414e8d..89708176c 100644
              }
          }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index b1b292475..559cd3ed7 100644
+index 7d4297117..559cd3ed7 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -21,8 +21,8 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
+@@ -21,9 +21,9 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
          case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
          case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
          case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
 -        case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
 -        case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
+-        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
 +        case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1_vdr4;
 +        case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1_vdr4;
-         case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1_vdr2;
++        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1_vdr2;
          case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
          case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
+         case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
 @@ -248,7 +248,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
          case GGML_TYPE_Q3_K:    return 4;
          case GGML_TYPE_Q4_0:    return 7;
@@ -85,10 +115,25 @@ index b1b292475..559cd3ed7 100644
          case GGML_TYPE_Q5_1:    return 7;
          case GGML_TYPE_Q5_K:    return 5;
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index 371d687db..28a979ff7 100644
+index 0f039c735..4f0854860 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
-@@ -501,7 +501,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
+@@ -240,7 +240,14 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
+     return sumi*d5d8 + m5s8 / (QI5_1 / vdr);
+ }
+ 
++#if defined(RDNA4)
++// VDR=4 measured on gfx1200/gfx1201 (RX 9000): decode -10..-33% on the
++// compute-bound shapes, neutral on the DRAM-bound lm_head. RDNA3/RDNA3_5
++// keep VDR=2 pending verification on those GPUs.
++#define VDR_Q8_0_Q8_1_MMVQ 4
++#else
+ #define VDR_Q8_0_Q8_1_MMVQ 2
++#endif
+ #define VDR_Q8_0_Q8_1_MMQ 8
+ 
+ template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_q8_1_impl(
+@@ -501,7 +508,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
      return d3*d8 * sumi;
  }
  
@@ -97,7 +142,7 @@ index 371d687db..28a979ff7 100644
  #define VDR_Q4_K_Q8_1_MMQ  8
  
  // contiguous v/x values
-@@ -529,6 +529,34 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
+@@ -529,6 +536,34 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
      return dm4f.x*sumf_d - dm4f.y*sumf_m;
  }
  
@@ -132,7 +177,7 @@ index 371d687db..28a979ff7 100644
  // contiguous v/x + u/y values
  static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
      const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
-@@ -557,7 +585,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
+@@ -557,7 +592,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
      return dm4f.x*sumf_d - dm4f.y*sumf_m;
  }
  
@@ -141,7 +186,7 @@ index 371d687db..28a979ff7 100644
  #define VDR_Q5_K_Q8_1_MMQ  8
  
  // contiguous v/x values
-@@ -592,6 +620,41 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
+@@ -592,6 +627,41 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
      return dm5f.x*sumf_d - dm5f.y*sumf_m;
  }
  
@@ -183,7 +228,52 @@ index 371d687db..28a979ff7 100644
  // contiguous v/x + u/y values
  static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
      const int * __restrict__ v, const int * __restrict__ u, const uint8_t * __restrict__ sc,
-@@ -982,6 +1045,59 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+@@ -620,7 +690,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
+     return dm4f.x*sumf_d - dm4f.y*sumf_m;
+ }
+ 
+-#define VDR_Q6_K_Q8_1_MMVQ 1
++#define VDR_Q6_K_Q8_1_MMVQ 2
+ #define VDR_Q6_K_Q8_1_MMQ  8
+ 
+ // contiguous v/x values
+@@ -646,6 +716,35 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
+     return d*sumf;
+ }
+ 
++// VDR=2 variant: processes two adjacent 8-element chunks (16 elements).
++// Both chunks share the q8_1 block pair, the two sub-scales and the d8 values,
++// so the loads are amortized over twice the dp4a work of the VDR=1 kernel.
++static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq_vdr2(
++    const int & vl0, const int & vl1, const int & vh0, const int & vh1,
++    const int * __restrict__ u, const int8_t * __restrict__ scales,
++    const float & d, const float * __restrict__ d8) {
++
++    float sumf = 0.0f;
++
++#pragma unroll
++    for (int i = 0; i < 2*QR6_K; ++i) {
++        const int sc = scales[4*(i&1)];
++
++        const int vl = (i < QR6_K) ? vl0 : vl1;
++        const int vh = (i < QR6_K) ? vh0 : vh1;
++
++        const int vil = (vl >> (4*(i&1))) & 0x0F0F0F0F;
++
++        const int vih = ((vh >> (4*(i&1))) << 4) & 0x30303030;
++
++        const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
++
++        sumf += d8[i&1] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
++    }
++
++    return d*sumf;
++}
++
+ // contiguous v/x + u/y values
+ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
+     const int * __restrict__ v, const int * __restrict__ u, const int8_t * __restrict__ sc,
+@@ -953,6 +1052,59 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
      return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
  }
  
@@ -243,7 +333,7 @@ index 371d687db..28a979ff7 100644
  static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
      const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
  
-@@ -1028,6 +1144,64 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
+@@ -999,6 +1151,64 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
      return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
  }
  
@@ -308,14 +398,68 @@ index 371d687db..28a979ff7 100644
  static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
      const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
  
+@@ -1025,6 +1235,41 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+ }
+ 
++// VDR=2 entry point: iqs must be even (the mmvq kernel strides kqs by VDR).
++// Processes 16 elements per call, splitting the ql/qh/u loads over two chunks.
++static __device__ __forceinline__ float vec_dot_q6_K_q8_1_vdr2(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
++
++    // both chunks share these offsets: iqs+1 lands in the same (iqs/16, (iqs%16)/8) cell
++    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
++    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
++    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
++    const int vh_idx = (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4);
++
++    const int vl0 = get_int_b4(bq6_K->ql, iqs);
++    const int vl1 = get_int_b4(bq6_K->ql, iqs + 1);
++    const int vh0 = get_int_b2(bq6_K->qh, vh_idx) >> vh_shift;
++    const int vh1 = get_int_b2(bq6_K->qh, vh_idx + 1) >> vh_shift;
++
++    const int8_t * scales = bq6_K->scales + scale_offset;
++
++    int    u[2*QR6_K];
++    float d8[QR6_K];
++
++    // iqs is even, so iqs%QI8_1 and (iqs%QI8_1)+1 are adjacent int32 groups in the block
++    const int i8 = iqs % QI8_1;
++    u[0] = get_int_b4(bq8_1[bq8_offset + 0].qs, i8);
++    u[1] = get_int_b4(bq8_1[bq8_offset + 2].qs, i8);
++    u[2] = get_int_b4(bq8_1[bq8_offset + 0].qs, i8 + 1);
++    u[3] = get_int_b4(bq8_1[bq8_offset + 2].qs, i8 + 1);
++    d8[0] = __low2float(bq8_1[bq8_offset + 0].ds);
++    d8[1] = __low2float(bq8_1[bq8_offset + 2].ds);
++
++    return vec_dot_q6_K_q8_1_impl_mmvq_vdr2(vl0, vl1, vh0, vh1, u, scales, bq6_K->d, d8);
++}
++
+ #define VDR_IQ2_XXS_Q8_1_MMVQ 2
+ #define VDR_IQ2_XXS_Q8_1_MMQ  2
+ 
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index a42b7fe4f..6473a94b5 100644
+index 2f71f4caa..91737084f 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10429,9 +10429,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
-     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1})); // ssm z
-     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1})); // kv proj
+@@ -10428,9 +10428,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
  
++    // Qwen3.6-27B decode shapes (n=1, mmvq path), Q6_K vs Q8_0:
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1})); // ffn
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // lm_head
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1})); // qkv
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1})); // ssm z
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1})); // kv proj
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1})); // ffn
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // lm_head
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1})); // qkv
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1})); // ssm z
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1})); // kv proj
++
 +    // same shapes, Q4_K/Q5_K decode (n=1, mmvq) and prefill (mmq) rows:
 +    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
 +        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1})); // ffn
@@ -336,7 +480,7 @@ index a42b7fe4f..6473a94b5 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -10439,8 +10451,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10438,8 +10462,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -347,6 +491,3 @@ index a42b7fe4f..6473a94b5 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 1792, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));
--- 
-2.55.0
-
