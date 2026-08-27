@@ -61,44 +61,63 @@ per-layer KV math. Verified: 1-card server (Q6_K, BF16 KV, ctx 140000)
 loads and answers `/health` OK; Q4_K_XL loads and runs on the boosted build
 (`llama-bench`: pp32 429.9 t/s, tg8 24.9 t/s).
 
-## Config matrix (8 rows)
+## Config matrix (16 rows: 2 builds × 2 KV types × 4 model/card sets)
 
 | row | build | GPUs (`HIP_VISIBLE_DEVICES`) | model | ctx | KV |
 |-----|-------|------|-------|-----|----|
-| M-1Q6 | master | `0` | Q6_K | 140000 | bf16/bf16 |
-| B-1Q6 | boosts | `0` | Q6_K | 140000 | bf16/bf16 |
-| M-1Q4 | master | `0` | Q4_K_XL | 140000 | bf16/bf16 |
-| B-1Q4 | boosts | `0` | Q4_K_XL | 140000 | bf16/bf16 |
-| M-2 | master | `0,2` | Q8_0 | 262144 | bf16/bf16 |
-| B-2 | boosts | `0,2` | Q8_0 | 262144 | bf16/bf16 |
-| M-3 | master | `0,1,2` | Q8_0 | 262144 | bf16/bf16 |
-| B-3 | boosts | `0,1,2` | Q8_0 | 262144 | bf16/bf16 |
+| M-1Q6-f16 | master | `0` | Q6_K | 140000 | f16/f16 |
+| M-1Q6-bf16 | master | `0` | Q6_K | 140000 | bf16/bf16 |
+| B-1Q6-f16 | boosts | `0` | Q6_K | 140000 | f16/f16 |
+| B-1Q6-bf16 | boosts | `0` | Q6_K | 140000 | bf16/bf16 |
+| M-1Q4-f16 | master | `0` | Q4_K_XL | 140000 | f16/f16 |
+| M-1Q4-bf16 | master | `0` | Q4_K_XL | 140000 | bf16/bf16 |
+| B-1Q4-f16 | boosts | `0` | Q4_K_XL | 140000 | f16/f16 |
+| B-1Q4-bf16 | boosts | `0` | Q4_K_XL | 140000 | bf16/bf16 |
+| M-2-f16 | master | `0,2` | Q8_0 | 262144 | f16/f16 |
+| M-2-bf16 | master | `0,2` | Q8_0 | 262144 | bf16/bf16 |
+| B-2-f16 | boosts | `0,2` | Q8_0 | 262144 | f16/f16 |
+| B-2-bf16 | boosts | `0,2` | Q8_0 | 262144 | bf16/bf16 |
+| M-3-f16 | master | `0,1,2` | Q8_0 | 262144 | f16/f16 |
+| M-3-bf16 | master | `0,1,2` | Q8_0 | 262144 | bf16/bf16 |
+| B-3-f16 | boosts | `0,1,2` | Q8_0 | 262144 | f16/f16 |
+| B-3-bf16 | boosts | `0,1,2` | Q8_0 | 262144 | bf16/bf16 |
+
+The 2×2 build × KV-type design is deliberate; each corner answers one
+question:
+
+| | f16 KV | bf16 KV |
+|---|---|---|
+| **master** | the true upstream default (v1 config A) — the baseline | upstream BF16 (v1 config B): ROCm silently stores f16 and pays a per-token conversion cost — the degradation being measured |
+| **boosts** | the fork on the conservative path: same KV type as the baseline, showing the other blocks' contribution in isolation | the fork's headline config (v1 config C): native BF16 KV + FP32-accumulate attention |
+
+The story the suite tells: master-bf16 is strictly worse than master-f16
+(decode penalty growing with depth); boosts-bf16 is faster than master-f16
+AND more accurate (PPL) — no reason to pick either baseline corner. The
+boosts-f16 column exists so that if someone insists on f16 KV for their own
+reasons, they can see the fork still beats master at the same KV type
+(and quantify what giving up BF16 costs on the fork).
 
 Notes:
 
-- KV cache type is bf16/bf16 for every row, per the project's standard
-  configuration. On master (ROCm) this silently falls back to f16 storage
-  plus a per-token conversion cost (v1 config B behavior); on the boosted
-  build it is native BF16 (v1 config C behavior). This is intentional: it is
-  the fork's headline differentiation and the comparison the benchmarks are
-  designed to show. An optional master-f16 row (true upstream default, v1
-  config A) can be added for parity — see "Optional rows".
+- KV cache types: f16/f16 is the conservative baseline; bf16/bf16 is the
+  project's standard. On master (ROCm) bf16 silently falls back to f16
+  storage plus a per-token conversion cost; on the boosted build it is
+  native BF16. This is exactly the difference the suite measures.
 - Single-card rows use the two quantizations that fit with the full depth
   ladder: Q6_K (the v1 standard) and Q4_K_XL (added 2026-08-27).
 - 2/3-card rows use Q8_0 as in v1.
 - GPU sets `0,2` (2 cards) and `0,1,2` (3 cards) match v1; ROCm tensor split
-  (`--split-mode tensor`).
-
-### Optional rows
-
-- `M-1Q6-f16` / `M-1Q4-f16`: master with f16/f16 KV (upstream default), to
-  isolate the silent-f16-conversion penalty from the fork comparison.
+  (`--split-mode tensor`). NOTE: HIP enumerates the R9700s in a rotated
+  order vs `rocm-smi` (HIP 0 = physical GPU[1] = bus 06, HIP 1 = GPU[2] =
+  bus 09, HIP 2 = GPU[0] = bus 03, verified 2026-08-27). All three cards
+  are identical, so results are unaffected — but "GPU 0" in the logs is
+  the physical card at bus 03 only when HIP_VISIBLE_DEVICES maps it so.
 - A 1-card Q8_0 row is NOT possible at ctx 140000 (29 GB weights + KV
   exceeds 34 GiB); Q6_K is the v1 single-card standard for that reason.
 
 ## Server launch command
 
-Identical across configs except model/alias/ctx/GPU env. Port 8033
+Identical across configs except model/alias/ctx/GPU env/KV types. Port 8033
 (`--base-url http://localhost:8033/v1`). The server MUST be started with
 `--alias <model-tag>` — llama-benchy sends the `--model` value in every
 request and the server resolves it against loaded model names/aliases.
@@ -113,11 +132,13 @@ GGML_CUDA_DISABLE_GRAPHS=0 NCCL_P2P_DISABLE=1 \
   --predict 98304 --threads-http 4 --load-mode mlock --cache-ram 16384 \
   --ctx-size <ctx> --flash-attn auto --temperature 0.0 \
   --batch-size 1024 --ubatch-size 1024 --n-gpu-layers all --no-kv-unified \
-  --cache-type-k bf16 --cache-type-v bf16 --ctx-checkpoints 64 \
+  --cache-type-k <K> --cache-type-v <V> --ctx-checkpoints 64 \
   --cache-idle-slots --reasoning-budget 65536 --reasoning-preserve \
   --checkpoint-min-step 4096 --repeat-penalty 1.0 --presence-penalty 1.5 \
   --seed 675 --split-mode tensor
 ```
+
+`<K>/<V>` = `f16/f16` or `bf16/bf16` per the matrix.
 
 - `--fit false` is required: `llama_params_fit` aborts on tensor split.
 - `--temperature 0.0` keeps generation deterministic (benchmarking is about
@@ -145,7 +166,7 @@ uvx llama-benchy \
   --exit-on-first-fail
 ```
 
-With `--model`:
+With `--model` (same for both KV types of a model set):
 
 | row set | `--model` |
 |---------|-----------|
@@ -211,19 +232,56 @@ llama-benchy measures at the client. From `llama_benchy/results.py`:
   827K tokens; at 1-card rates (~600–900 t/s prefill) that is ~15–17 min of
   prefill per single-card row, plus ~5 min of decode (7 × 240 × 3 tokens at
   ~24 t/s). 2/3-card rows are faster (up to ~1900 t/s prefill).
-  Full suite ≈ 2–2.5 h.
-- KV envelope at the deepest cell: 133,592 tokens × 0.254 MiB/token (BF16,
-  hybrid-attention layout) ≈ 34 GiB of KV on the 1-card rows — this is why
-  ctx 140000 is the 1-card ceiling and why Q6_K/Q4_K_XL are the 1-card
-  quantizations. The ladder fits by construction (verified: 1-card server
-  at ctx 140000 with BF16 KV comes up OK).
+  Full suite (16 rows) ≈ 4–5 h.
+- KV envelope at the deepest cell: this is a hybrid-attention model
+  (`full_attention_interval = 4`), so only 16 of the 65 layers carry a full
+  KV cache; the rest use sliding-window KV. Measured at ctx 140000 on a
+  single card: total VRAM 32.2 GB with Q6_K (21.3 GiB) + BF16 KV + compute
+  buffers, i.e. ≈ 8.6 GiB of KV for 140,032 cells ≈ 0.064 MiB/token (vs
+  0.254 for a full-attention layout). At the deepest cell (133,592 tokens)
+  the KV is ≈ 8.3 GiB — comfortably inside the 34 GiB card for both Q6_K
+  (21.3 GiB) and Q4_K_XL (16.3 GiB). Verified: 1-card servers at ctx
+  140000 come up OK on both builds with bf16/bf16 AND f16/f16 KV.
+- Why ctx 140000 then? It is the round number above the ladder's deepest
+  cell (131072 + 2520 = 133,592) that the user verified end-to-end on a
+  single card; it also leaves room for the 240 generated tokens.
+
+## Perplexity (accuracy) protocol
+
+Throughput is only half the story; the 2×2 matrix exists to show the fork
+is faster AND at least as accurate. PPL is deterministic (no sampling), so
+it is run once per model via `llama-perplexity` (same protocol as v1,
+128 chunks × 2048 ctx over `wikitext-2-raw/wiki.test.raw`, flash-attn on):
+
+```
+HIP_VISIBLE_DEVICES=0,2 NCCL_P2P_DISABLE=1 <bin>/llama-perplexity \
+  -m <model> -f /llm/models/wikitext-2-raw/wiki.test.raw \
+  -c 2048 --chunks 128 -fa on -ctk <K> -ctv <V> -sm tensor -ngl 99
+```
+
+with the same 4 corners (scripts/run-ppl.sh):
+
+| corner | build | KV | v1 mapping |
+|--------|-------|----|------------|
+| A | master | f16 | config A (upstream default) |
+| B | master | bf16 | config B (silently f16 on ROCm + conversion cost) |
+| C | boosts | bf16 | config C (native BF16, FP32-accumulate attention) |
+| D | boosts | f16 | (new) |
+
+Run per model: Q8_0 (2/3-card), Q6_K and Q4_K_XL (1-card). Expected v1
+baseline: A ≈ B ≈ C within ±0.04 (all wash), directionally C lowest; the
+full matrix will show whether D differs from C on the fork and whether the
+Q4_K_XL quants carry a PPL cost vs Q6_K/Q8_0 at the same corners. The
+message the suite is designed to support: the fastest config is also at-or-
+below the others in PPL, so neither baseline corner is ever justified.
 
 ## Harness
 
-`scripts/benchy-run.sh` starts the server for a row, waits for `/health`,
-runs the fixed llama-benchy command, saves JSON + md, and tears the server
-down. `scripts/run-benchy-suite.sh` drives all 8 rows in sequence. Both are
-described in [benchmarks/README.md](README.md).
+`scripts/benchy-run.sh` starts the server for a row (build, model, alias,
+GPUs, ctx, KV types), waits for `/health`, runs the fixed llama-benchy
+command, saves JSON + md, and tears the server down. `scripts/run-benchy-suite.sh`
+drives all 16 rows in sequence. Both are described in
+[benchmarks/README.md](README.md).
 
 ## Validation of the harness (2026-08-27)
 
@@ -234,8 +292,10 @@ described in [benchmarks/README.md](README.md).
   chunk carries `usage.completion_tokens`), unknown `return_token_ids`
   silently ignored (no strict validation), no API key required,
   `/v1/models` present (latency mode `api`).
-- 1-card server (Q6_K, bf16/bf16, ctx 140000, tensor split) reaches
-  `/health` OK; `--fit false` required on tensor split.
+- 1-card servers at ctx 140000 (Q6_K, tensor split) reach `/health` OK on
+  both builds with bf16/bf16 AND f16/f16 KV; `--fit false` required on
+  tensor split.
 - Q4_K_XL loads and runs on the boosted build.
 - Block 10's VDR table covers the Q4_K_XL dominant quant types
   (Q4_K/Q5_K/Q6_K/Q8_0), so the new row exercises the boosted path.
+- HIP↔rocm-smi device mapping verified (rotation: HIP 0 = physical GPU[1]).

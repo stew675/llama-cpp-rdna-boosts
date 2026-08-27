@@ -1,14 +1,15 @@
 #!/bin/bash
 # benchy-run.sh - run one llama-benchy row against a live llama-server.
 #
-# usage: benchy-run.sh <row-label> <build-bin-dir> <model-path> <alias> <gpus> <ctx>
+# usage: benchy-run.sh <row-label> <build-bin-dir> <model-path> <alias> <gpus> <ctx> [<ktype> <vtype>]
 #
-#   row-label   e.g. B-1Q6   (also used for result file names)
+#   row-label   e.g. B-1Q6-bf16   (also used for result file names)
 #   build-bin   dir containing llama-server, e.g. ~/llama.cpp/build-rdna-boosts/bin
 #   model-path  path to the .gguf
 #   alias       model alias; MUST equal the llama-benchy --model value
 #   gpus        HIP_VISIBLE_DEVICES value, e.g. 0 or 0,2 or 0,1,2
 #   ctx         server context size, e.g. 140000 or 262144
+#   ktype vtype KV cache types (default: bf16 bf16), e.g. f16 f16
 #
 # Output: benchmarks/results/benchy/<row>.json and <row>.md
 # Requires: uvx (llama-benchy), curl, python3.
@@ -17,6 +18,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"   # repo root
 ROW="${1:?row-label}"; BIN="${2:?build-bin}"; MODEL="${3:?model-path}"
 ALIAS="${4:?alias}"; GPUS="${5:?gpus}"; CTX="${6:?ctx}"
+KT="${7:-bf16}"; VT="${8:-bf16}"
 PORT=8033
 RESULTS="$ROOT/benchmarks/results/benchy"
 mkdir -p "$RESULTS"
@@ -27,12 +29,12 @@ COMMON_ARGS=( --prio 2 --fit false --top-k 20 --port "$PORT" --threads 8 --paral
   --predict 98304 --threads-http 4 --load-mode mlock --cache-ram 16384 \
   --ctx-size "$CTX" --flash-attn auto --temperature 0.0 \
   --batch-size 1024 --ubatch-size 1024 --n-gpu-layers all --no-kv-unified \
-  --cache-type-k bf16 --cache-type-v bf16 --ctx-checkpoints 64 --cache-idle-slots \
+  --cache-type-k "$KT" --cache-type-v "$VT" --ctx-checkpoints 64 --cache-idle-slots \
   --reasoning-budget 65536 --reasoning-preserve --checkpoint-min-step 4096 \
   --repeat-penalty 1.0 --presence-penalty 1.5 --seed 675 --split-mode tensor )
 
 LOG="/tmp/benchy-${ROW}.log"
-echo "== [$ROW] starting server (${ALIAS}, gpus=${GPUS}, ctx=${CTX})"
+echo "== [$ROW] starting server (${ALIAS}, gpus=${GPUS}, ctx=${CTX}, kv=${KT}/${VT})"
 env HIP_VISIBLE_DEVICES="$GPUS" NCCL_PROXY_CPUSET=8,9,10,11,12,13,14,15 \
   GGML_CUDA_DISABLE_GRAPHS=0 NCCL_P2P_DISABLE=1 \
   "$BIN/llama-server" --model "$MODEL" --alias "$ALIAS" "${COMMON_ARGS[@]}" > "$LOG" 2>&1 &
