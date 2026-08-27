@@ -1,5 +1,13 @@
 # Benchmark results: llama.cpp master vs rdna-boosts
 
+> **v2 (2026-08-27)**: the performance-testing plan has moved to a new
+> live-server protocol using [`llama-benchy`](https://pypi.org/project/llama-benchy/)
+> against `/v1/chat/completions`. See
+> [benchy-methodology.md](benchy-methodology.md) for the v2 plan, the
+> [scripts/](scripts/) `benchy-run.sh` / `run-benchy-suite.sh` harness, and
+> [results/benchy/](results/benchy/) for the standardized output. The v1
+> numbers below (curl + `/completion`) are the historical record.
+
 Date: 2026-08-26
 Machine: 3x Radeon R9700 (gfx1201, 34 GB, ~640 MB/s each), ROCm 7.14
 Model: Qwen3.8-27B - Q8_0 (29 GB) for the 2c/3c rows, Q6_K (22.9 GB) for the
