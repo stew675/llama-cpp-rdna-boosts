@@ -17,8 +17,9 @@ main --force`).
 
 | branch | upstream range | status |
 |--------|----------------|--------|
-| `main` | points at the current checkpoint | currently `baseline/192067b72` |
-| `baseline/192067b72` | `d222767c7` .. `192067b72` | **current, recommended** - same patch files as `d222767c7`, zero-fuzz apply to master at `192067b72`, fresh build + real-model sanity validated 2026-08-26 (ROCm 7.14/gfx1201) |
+| `main` | points at the current checkpoint | currently `baseline/fe235f434` |
+| `baseline/fe235f434` | `192067b72` .. `fe235f434` | **current, recommended** - block 01 re-based for the `common_speculative_impl` n_max drift (fork `adaptive-mtp` branch), blocks 02-12 unchanged; zero-fuzz apply to master at `fe235f434` (2026-08-27, block-01 content byte-identical to the fork branch) |
+| `baseline/192067b72` | `d222767c7` .. `192067b72` | same patch files as `d222767c7`, zero-fuzz apply to master at `192067b72`, fresh build + real-model sanity validated 2026-08-26 (ROCm 7.14/gfx1201); superseded by the drift-fix cut above |
 | `baseline/d222767c7` | `758443071` .. `d222767c7` | 12-block set, full suite validated 14883/14883 on ROCm 7.14/gfx1201, includes the test-harness seeding fix |
 | `baseline/758443071` | `758443071` (single point) | original set mirroring the fork; known-good for the old upstream, carries the fork's deterministic test-harness seed (see BASELINE.md) |
 
@@ -78,12 +79,12 @@ block 12, so the set is 11 patches numbered 01-08, 10, 11, 12.
 #    (branches are named baseline/<sha>; MANIFESTS.md records the upstream
 #    range each was generated against - choose the closest one)
 git clone https://github.com/stew675/llama-cpp-rdna-boosts ../rdna-boosts
-cd ../rdna-boosts && git checkout baseline/d222767c7
+cd ../rdna-boosts && git checkout baseline/fe235f434
 
 # 1. fresh clone of upstream llama.cpp (or an existing one), at the matched range
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-git checkout d222767c7   # the SHA recorded in MANIFESTS.md
+git checkout fe235f434   # the SHA recorded in MANIFESTS.md
 
 # 2. fresh branch
 git checkout -b rdna-boosts

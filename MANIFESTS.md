@@ -23,10 +23,19 @@ patch set. It is written for humans AND LLM coding agents. Follow it exactly;
 do not skip blocks.
 
 Branch: `main` points at the current checkpoint, currently
-`baseline/192067b72` (current, recommended)
-Upstream range: `d222767c7` .. `192067b72` (13 commits past the original
-baseline; the patch files are unchanged - they apply zero-fuzz to both tips,
-see BASELINE.md. Older branches: `baseline/d222767c7`, `baseline/758443071`)
+`baseline/fe235f434` (current, recommended)
+Upstream range: `192067b72` .. `fe235f434` (7 commits; block 01 was
+re-based for the `common_speculative_impl` n_max drift, blocks 02-12 are
+unchanged - see BASELINE.md. Older branches: `baseline/192067b72`,
+`baseline/d222767c7`, `baseline/758443071`)
+
+## Validation record (2026-08-27, ROCm 7.14, gfx1201) - drift fix
+
+All 11 patches applied zero-fuzz to master at `fe235f434`
+(`scripts/apply-all.sh`, no 3-way fallback; block 01 regenerated from the
+fork's `adaptive-mtp` branch). Applied block-01 tree byte-identical to
+`adaptive-mtp`; blocks 02-12 byte-identical to the `192067b72` record.
+Block-01 behavior: `test-speculative-adaptive` and `test-arg-parser` pass.
 
 ## Validation record (2026-08-26, ROCm 7.14, gfx1201) - new checkpoint
 
@@ -78,7 +87,7 @@ position 10, just before block 11.
 The repo also carries lightweight tags `block/01-… block/10-…`, each pointing
 at a squashed commit whose diff-vs-parent is exactly that block's change (the
 commits are stacked in apply order, rooted at an orphan commit whose tree is
-the upstream baseline `d222767c7`). The tags track the CURRENT baseline
+the upstream baseline `fe235f434`). The tags track the CURRENT baseline
 branch; they are force-moved whenever a new validated baseline is cut.
 
 **Tags are numbered by APPLY order** and so are the patch filenames and the
@@ -154,7 +163,7 @@ files remain the primary, reviewable artifact.
 
 ## Verified apply sequence (this branch)
 
-On a fresh checkout of `d222767c7`, the sequence
+On a fresh checkout of `fe235f434`, the sequence
 
 ```
 git apply patches/01-adaptive-mtp.patch

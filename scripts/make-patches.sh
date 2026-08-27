@@ -6,14 +6,27 @@
 #                 ../llama.cpp relative to this repo)
 #   baseline-sha  the upstream baseline SHA the patches are generated against
 #                 (default: the SHA recorded in BASELINE.md)
-#   branch        the fork branch to split (default: chunked-gdn)
+#   branch        the fork branch to split for blocks 02-12 (default:
+#                 chunked-gdn)
 #
-# The fork must be on a clean worktree whose <branch> descends from
-# <baseline-sha>. The block commit SHA lists below are those of the current
-# branch; if the fork is rebased, update them (see BASELINE.md, "Drift
+# Block 01 comes from the fork's `adaptive-mtp` branch (re-based on the
+# current master tip, see BLOCKS_MULTI below); the other blocks come from
+# <branch>. The fork must be on a clean worktree whose `adaptive-mtp`
+# descends from <baseline-sha> and whose <branch> contains the other source
+# commits. The block commit SHA lists below are those of the current
+# branches; if the fork is rebased, update them (see BASELINE.md, "Drift
 # policy"). Manual touch points after regeneration:
 #   - the block 10 test hunk anchor (make_test_cases_perf() in stock may move)
 #   - the block 10 (fused core) descriptive header
+#   - block 02's test-harness seeding fix (this repo restores upstream
+#     `random_device` seeding in init_tensor_uniform; the fork's chunked-gdn
+#     carries the deterministic 12345 seed, so a fork-driven regeneration
+#     reverts it - re-apply the fix, see BASELINE.md)
+#   - block 10's subtractive diff is computed against <branch>, so a full
+#     regeneration is only valid when <branch> descends from <baseline-sha>;
+#     for a post-192067b72 baseline the fork branches must be re-based first
+#     (the 2026-08-27 cut regenerated block 01 from `adaptive-mtp` and kept
+#     blocks 02-12 byte-identical instead - see BASELINE.md "Drift fix")
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -50,7 +63,11 @@ BLOCKS_SINGLE[11-meta-headroom.patch]="f2a22a71"
 # (see the block-10 test hunk note below for the same pattern).
 
 declare -A BLOCKS_MULTI
-BLOCKS_MULTI[01-adaptive-mtp.patch]="87ad1db26 b56926039 d0d7ff27e 8d70e21f5 0cf87e989"
+# block 01 source is the fork's `adaptive-mtp` branch (5 commits, re-based on
+# the current master tip fe235f434 with the n_max constructor fix), NOT the
+# older chunked-gdn lineage (87ad1db26...0cf87e989) which predates the
+# common_speculative_impl n_max parameter.
+BLOCKS_MULTI[01-adaptive-mtp.patch]="c0f398ec5 f3208c5c5 0bbd7f3c2 b5c99b890 b26c775e1"
 BLOCKS_MULTI[02-chunked-gdn.patch]="876ef1f0b 5d2090e96 b220647b1 a4982afa2 659f94987 2a1e5c5a8 1da07e19b 77d51ee28 abfa24265 be46c7621 3441b7d40 246136122 05cab3c41"
 BLOCKS_MULTI[03-bf16-kv-cache.patch]="5485e79e4 b98265cfd 07767a88a ef3673358 b6bfa422e 5e6072558 bd5bf0ea3 d33ce1adf"
 
@@ -64,9 +81,14 @@ cd "$FORK"
 if [ -n "$(git status --porcelain)" ]; then
     echo "ERROR: fork working tree is not clean" >&2; exit 1
 fi
-if [ "$(git merge-base "$BASELINE" "$BRANCH")" != "$BASELINE" ]; then
-    echo "ERROR: $BRANCH does not descend from $BASELINE" >&2; exit 1
+if ! git merge-base --is-ancestor "$BASELINE" adaptive-mtp; then
+    echo "ERROR: adaptive-mtp does not descend from $BASELINE" >&2; exit 1
 fi
+for c in ${BLOCKS_MULTI[01-adaptive-mtp.patch]} ${BLOCKS_MULTI[02-chunked-gdn.patch]} ${BLOCKS_MULTI[03-bf16-kv-cache.patch]} $BLOCK_06_COMMITS ${BLOCKS_SINGLE[@]}; do
+    if ! git cat-file -e "$c^{commit}" 2>/dev/null; then
+        echo "ERROR: source commit $c not found in the fork (is $BRANCH / adaptive-mtp stale?)" >&2; exit 1
+    fi
+done
 
 mkdir -p "$PATCHES"
 
@@ -91,7 +113,7 @@ for name in "${!BLOCKS_MULTI[@]}"; do
       if [ -f "$PATCHES/$name" ]; then
           # reuse the existing patch's full message (subject + body)
           msg="$(awk '
-              /^Subject: \[PATCH\] / { sub(/^Subject: \[PATCH\] /, ""); msg=$0; in_msg=1; sep=0; next }
+              /^Subject: \[PATCH( [0-9]+\/[0-9]+)?\] / { sub(/^Subject: \[PATCH( [0-9]+\/[0-9]+)?\] /, ""); msg=$0; in_msg=1; sep=0; next }
               in_msg && /^---$/ { exit }
               in_msg && /^(From|Date): / { next }
               in_msg {
@@ -133,9 +155,19 @@ fi
     cat "$TMP/block06.diff"
 } > "$PATCHES/10-fused-core.patch"
 
-# ---- convenience all-in-one ----
+# ---- convenience all-in-one (consumer-application method) ----
+# The net diff is built by applying the just-regenerated patches to a fresh
+# checkout of the baseline (the "consumer application"), not by diffing the
+# fork branches - block 01 lives on `adaptive-mtp` while blocks 02-12 live
+# on <branch>, so no single fork branch carries the whole set.
 echo "== rdna-boosts-all.patch"
-git diff "$BASELINE" "$BRANCH" > "$REPO_DIR/rdna-boosts-all.patch"
+( cd "$TMP/wt"
+  git reset -q --hard "$BASELINE"
+  for p in $PRE_BLOCKS 10-fused-core.patch 11-meta-headroom.patch 12-k-quant-boosts.patch; do
+      git apply "$PATCHES/$p"
+  done
+  git add -A
+  git diff "$BASELINE" > "$REPO_DIR/rdna-boosts-all.patch" )
 
 # ---- block stacking tags (optional git-native path) ----
 # Build a side lineage in THIS repo: root commit = upstream baseline tree,

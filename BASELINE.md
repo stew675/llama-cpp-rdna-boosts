@@ -1,21 +1,24 @@
 # BASELINE - provenance and drift policy
 
 Branch: `main` points at the current checkpoint, currently
-`baseline/192067b72` (current, recommended)
-Upstream range: `d222767c7` .. `192067b72` ("hexagon: support for multi-NPU
-devices (IQ9, IQ10) and fully asynchronous backend (#26501)")
+`baseline/fe235f434` (current, recommended)
+Upstream range: `192067b72` .. `fe235f434` (7 upstream commits, incl. the
+`common_speculative_impl` n_max parameter and new arg.cpp contexts)
 
-Older branches: `baseline/d222767c7` (12-block set, validated against
-`d222767c7`; patch content is identical to this branch) and
-`baseline/758443071` (the original set for the older upstream range; see
-"Older branches" below).
+Older branches: `baseline/192067b72` (same patch files as `d222767c7`,
+zero-fuzz-validated at `192067b72`; superseded here because block 01 needed
+re-base for the `n_max` drift), `baseline/d222767c7` (12-block set,
+validated against `d222767c7`) and `baseline/758443071` (the original set
+for the older upstream range; see "Older branches" below).
 
 ## Baseline
 
 All patches on this branch are generated against **llama.cpp upstream master
-at `d222767c7`** and were validated by applying them, one at a time, to a
-fresh checkout of that SHA, building with ROCm 7.14 (gfx1201, GGML_HIP=ON,
-Release), and running the full test suite.
+at `fe235f434`** (block 01 regenerated from the fork's `adaptive-mtp` branch;
+blocks 02-12 carried forward unchanged from `d222767c7`, where they were
+validated by applying them, one at a time, to a fresh checkout of that SHA,
+building with ROCm 7.14 (gfx1201, GGML_HIP=ON, Release), and running the
+full test suite).
 
 The same patch files apply **zero-fuzz to master at `192067b72`** (13
 upstream commits past `d222767c7`): `scripts/apply-all.sh` applied all 12
@@ -25,9 +28,27 @@ only touch files outside the blocks). A fresh full build
 (`~/bin/build-llama-rocm-714`, ROCm 7.14, gfx1201) succeeds, and the
 real-model sanity run (Qwen3.8-27B Q4_K_XL, 1 card) matches the validated
 numbers (pp512 1330 t/s, tg64 30.9 t/s; llama-cli generation 30.7 t/s).
-This branch records that new stable checkpoint; the patch files are
-unchanged (regeneration from the new tip produces identical content - only
-hunk line hints and blob SHAs shift).
+That checkpoint is `baseline/192067b72`; its patch files are unchanged from
+`d222767c7` (regeneration from the new tip produces identical content -
+only hunk line hints and blob SHAs shift).
+
+### Drift fix (2026-08-27): block 01 re-based against master `fe235f434`
+
+Master moved 7 commits past `192067b72` to `fe235f434`. Block 01
+(`01-adaptive-mtp.patch`) no longer applied: upstream added the
+`n_max` parameter to `common_speculative_impl` (`spec: Add
+benchmark-only synthetic speculative acceptance options`, `2bb9bddaf`), so
+the old hunks in `common/arg.cpp`, `common/speculative.cpp` and
+`tests/test-arg-parser.cpp` conflicted (`git apply -3` left conflicts in
+`common/speculative.cpp` and `tests/test-arg-parser.cpp`). The fix comes
+from the fork's `adaptive-mtp` branch (`/home/stew675/stew675/llama-master-before`,
+same 5-commit series re-based on `fe235f434` with the `n_max` constructor
+adapted - only `common/speculative.cpp` differs from the old block-01
+content, by 2 lines). `01-adaptive-mtp.patch` was regenerated from that
+branch; all 11 patches then apply **zero-fuzz to master `fe235f434`** via
+`scripts/apply-all.sh` (no 3-way fallback), and the applied block-01 tree is
+byte-identical to `adaptive-mtp` for all 10 block files. The other 10 blocks
+are untouched (their patch files apply zero-fuzz unchanged).
 
 ### Validation record (2026-08-25, AMD Radeon AI PRO R9700 x3, ROCm 7.14)
 
@@ -59,6 +80,21 @@ logit diff 0.184 vs 0.203 for flash-attn on/off; greedy streams are
 deterministic within a build but can flip across configs (1 of 3 test
 prompts diverged at char 176). Excluding block 12 restores purity; it is
 applied last.
+
+### Validation record (2026-08-27, AMD Radeon AI PRO R9700 x3, ROCm 7.14)
+
+Master tip `fe235f434` + the 11-block patch set (applied with `apply-all.sh`,
+zero-fuzz, block 01 regenerated from fork `adaptive-mtp`):
+
+- `scripts/apply-all.sh` applied all 11 patches in manifest order with no
+  3-way fallback (block 10 in context after 03+04, as required).
+- The applied block-01 tree is byte-identical to the fork branch
+  `adaptive-mtp` for all 10 block files; blocks 02-12 are byte-identical to
+the `192067b72`-validated block code (their patch files were not changed).
+- Block-01 behavior verified: `./bin/test-speculative-adaptive` and
+  `./bin/test-arg-parser` pass (same tests as the `d222767c7` record);
+  `--draft-mtp-adaptive` range validation (n_min_adaptive vs n_max,
+  incl. the MTP-layer-capped n_max case) matches the fork branch.
 
 ### Validation record (2026-08-26, AMD Radeon AI PRO R9700 x3, ROCm 7.14)
 
@@ -130,7 +166,7 @@ The original source commits on the fork branch `chunked-gdn` (parent
 
 | patch | source commits on `chunked-gdn` (history order) |
 |-------|--------------------------------------------------|
-| `01-adaptive-mtp.patch` | `87ad1db26` `b56926039` `d0d7ff27e` `8d70e21f5` `0cf87e989` |
+| `01-adaptive-mtp.patch` | fork branch `adaptive-mtp` (re-based on `fe235f434`): `c0f398ec5` `f3208c5c5` `0bbd7f3c2` `b5c99b890` `b26c775e1` - same 5-commit series as the old `chunked-gdn` lineage (`87ad1db26` `b56926039` `d0d7ff27e` `8d70e21f5` `0cf87e989`), re-based with the `common_speculative_impl` `n_max` constructor fix |
 | `02-chunked-gdn.patch` | `876ef1f0b` `5d2090e96` `b220647b1` `a4982afa2` `659f94987` `2a1e5c5a8` `1da07e19b` `77d51ee28` `abfa24265` `be46c7621` `3441b7d40` `246136122` `05cab3c41` |
 | `03-bf16-kv-cache.patch` | `5485e79e4` `b98265cfd` `07767a88a` `ef3673358` `b6bfa422e` `5e6072558` `bd5bf0ea3` `d33ce1adf` |
 | `04-wmma-flash-attn.patch` | `beaf69fb6` |
@@ -148,9 +184,15 @@ The original source commits on the fork branch `chunked-gdn` (parent
 > tensors of the mul_mat_id host-sort fallback never collide (equal token
 > counts produced identical keys, reusing the wrong expert's quantized
 > tokens; nondeterministic iq1_m MUL_MAT_ID failures on RDNA4).
-| `rdna-boosts-all.patch` (repo root) | all 48 commits of `758443071..chunked-gdn` + `f2a22a71` + `a7d092368` + `f1a072dcd` |
+| `rdna-boosts-all.patch` (repo root) | regenerated from the consumer application at `fe235f434` (diff of the fresh-master checkout with all 11 blocks applied vs `fe235f434`); the block-01 content is the fork `adaptive-mtp` branch, the rest is the `758443071..chunked-gdn` + `f2a22a71` + `a7d092368` + `f1a072dcd` content carried forward unchanged |
 
 ## Older branches
+
+`baseline/192067b72` holds the previous checkpoint (same patch files as
+`d222767c7`, zero-fuzz-validated at `192067b72`, full-suite + real-model
+records in the validation sections above). It is superseded because block 01
+drifted (see the drift-fix section); it remains the known-good set for that
+upstream range.
 
 `baseline/758443071` holds the original patch set (generated against
 `758443071`, mirroring the fork `chunked-gdn` exactly). It remains the
@@ -175,9 +217,19 @@ master:
    validated baseline is cut, the whole set is regenerated from the
    consumer application (as done for `baseline/d222767c7`) and a new
    `baseline/<new-sha>` branch is created here. Old branches stay as the
-   known-good sets for older upstream versions (rule of thumb: cut a new
-   baseline branch whenever more than one block needs manual re-base hunks,
-   or when a validated full-suite run exists for a newer tip).
+   known-good sets for older upstream versions.
+
+Rule of thumb for cutting a new baseline branch: cut one whenever **more
+than one block needs manual re-base hunks**, whenever **a validated
+full-suite run exists for a newer tip**, or whenever **merge-conflict drift
+has occurred** (any block that needed `git apply -3` or manual hunk
+re-basing to apply). Merge-conflict drift means the upstream context the
+block was generated against has changed - even a single-block fix is
+permanent new content (the block's net diff vs the new baseline differs
+from the old patch), so it gets its own checkpoint rather than silently
+editing the committed patch files on an older baseline branch. The
+`baseline/fe235f434` cut is the first application of this rule (block 01
+was the only conflicted block).
 
 `MANIFESTS.md` records the upstream range per branch so consumers can match
 their upstream version.

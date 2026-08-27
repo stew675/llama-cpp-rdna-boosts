@@ -1,5 +1,5 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 86f8610a5..3ef272679 100644
+index 403cc2b78..6f6fb1885 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -363,9 +363,8 @@ common_models_handler common_models_handler_init(const common_params & params, l
@@ -22,9 +22,9 @@ index 86f8610a5..3ef272679 100644
          params.lr.init();
      } catch (const std::invalid_argument & ex) {
          fprintf(stderr, "%s\n", ex.what());
-@@ -4110,6 +4110,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4165,6 +4165,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          }
-     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_RATES"));
  
 +    add_opt(common_arg(
 +        {"--spec-draft-n-min-adaptive"}, "N",
@@ -52,10 +52,10 @@ index 3d54bd600..33afee83d 100644
      return mparams;
  }
 diff --git a/common/common.h b/common/common.h
-index de49dac9f..ae82839c4 100644
+index 1cfb01e1e..383531a49 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -168,18 +168,19 @@ enum common_params_sampling_config : uint64_t {
+@@ -169,18 +169,19 @@ enum common_params_sampling_config : uint64_t {
  };
  
  enum common_speculative_type {
@@ -86,7 +86,7 @@ index de49dac9f..ae82839c4 100644
  };
  
  // Grammar type enumeration
-@@ -324,6 +325,7 @@ struct common_params_model {
+@@ -325,6 +326,7 @@ struct common_params_model {
  struct common_params_speculative_draft {
      int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
      int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
@@ -94,7 +94,7 @@ index de49dac9f..ae82839c4 100644
  
      float p_split = 0.1f; // speculative decoding split probability
      float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
-@@ -385,7 +387,11 @@ struct common_params_speculative {
+@@ -393,7 +395,11 @@ struct common_params_speculative {
  
      uint32_t need_n_rs_seq() const {
          bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
@@ -206,7 +206,7 @@ index 000000000..ab9f98818
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 4eef2212e..be1f4b620 100644
+index 393a73bc3..44af70ed9 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,7 @@
@@ -217,7 +217,7 @@ index 4eef2212e..be1f4b620 100644
  
  #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
  
-@@ -34,6 +35,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
+@@ -35,6 +36,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
      {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
      {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
      {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
@@ -225,12 +225,12 @@ index 4eef2212e..be1f4b620 100644
      {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
      {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
      {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
-@@ -1314,8 +1316,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1317,8 +1319,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      std::vector<int>                i_last;
      std::vector<std::vector<float>> chain_h;
  
 -    common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
--        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
+-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
 +    // Adaptive draft depth (draft-mtp-adaptive), see common_speculative_adaptive
 +    bool adaptive = false;
 +    std::vector<int> n_cap;   // [n_seq] effective draft cap for the current draft() call
@@ -238,11 +238,11 @@ index 4eef2212e..be1f4b620 100644
 +    std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq] per-seq adaptive depth controller
 +
 +    common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq, bool adaptive = false)
-+        : common_speculative_impl(adaptive ? COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE : COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
++        : common_speculative_impl(adaptive ? COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE : COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
          , params(params.draft)
      {
          auto * ctx_tgt = this->params.ctx_tgt;
-@@ -1327,6 +1335,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1330,6 +1338,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  "MTP input row width must match the target h_nextn width");
          n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
  
@@ -254,7 +254,7 @@ index 4eef2212e..be1f4b620 100644
          SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
          SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
          SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
-@@ -1374,6 +1387,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1377,6 +1390,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
          chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
  
@@ -264,9 +264,9 @@ index 4eef2212e..be1f4b620 100644
          if (chain_heads) {
              this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
  
-@@ -1383,6 +1399,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-             }
+@@ -1387,6 +1403,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
+         this->n_max = this->params.n_max;
  
 +        if (adaptive) {
 +            // a floor above the ceiling would pin the depth below the floor, so the
@@ -293,7 +293,7 @@ index 4eef2212e..be1f4b620 100644
          pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
  
          i_last.assign(n_seq, -1);
-@@ -1419,6 +1457,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1423,6 +1461,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              return;
          }
  
@@ -306,7 +306,7 @@ index 4eef2212e..be1f4b620 100644
          auto * ctx_dft = this->params.ctx_dft;
          const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
  
-@@ -1571,6 +1615,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1575,6 +1619,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              drafting[seq_id] = true;
              common_sampler_reset(smpls[seq_id].get());
  
@@ -320,7 +320,7 @@ index 4eef2212e..be1f4b620 100644
              common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
              std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
  
-@@ -1647,7 +1698,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1651,7 +1702,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
  
                  result.push_back(id);
  
@@ -329,7 +329,7 @@ index 4eef2212e..be1f4b620 100644
                      drafting[seq_id] = false;
                      n_drafting--;
                      continue;
-@@ -1694,17 +1745,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1698,17 +1749,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  continue;
              }
  
@@ -364,7 +364,7 @@ index 4eef2212e..be1f4b620 100644
          const int32_t n_rows = verify_h_rows[seq_id];
          if (n_rows <= 0) {
              return;
-@@ -2197,6 +2263,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
+@@ -2203,6 +2269,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
          case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
          case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
          case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
@@ -372,7 +372,7 @@ index 4eef2212e..be1f4b620 100644
          case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
          case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
          case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
-@@ -2288,6 +2355,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
+@@ -2294,6 +2361,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
              case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
              case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
@@ -380,7 +380,7 @@ index 4eef2212e..be1f4b620 100644
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
              case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                  n_max = std::max(n_max, std::max(0, spec->draft.n_max));
-@@ -2379,7 +2447,10 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2480,7 +2548,10 @@ common_speculative_init_result::common_speculative_init_result(
      const bool has_draft = params.speculative.has_dft();
      const bool spec_mtp = std::find(params.speculative.types.begin(),
                                      params.speculative.types.end(),
@@ -392,7 +392,7 @@ index 4eef2212e..be1f4b620 100644
  
      auto mparams = common_model_params_to_llama(params);
      auto cparams = common_context_params_to_llama(params);
-@@ -2471,7 +2542,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2572,7 +2643,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
@@ -401,7 +401,7 @@ index 4eef2212e..be1f4b620 100644
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -2484,6 +2555,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2585,6 +2656,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
@@ -409,7 +409,7 @@ index 4eef2212e..be1f4b620 100644
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
      }
-@@ -2503,7 +2575,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2604,7 +2676,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
@@ -6330,12 +6330,12 @@ index b9f9d4b78..4125c70b7 100644
  # the test serves its repos from an httplib server, and the library links it privately
  target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 diff --git a/tests/test-arg-parser.cpp b/tests/test-arg-parser.cpp
-index ba58f852e..94735fa69 100644
+index e0907631a..84f1ed986 100644
 --- a/tests/test-arg-parser.cpp
 +++ b/tests/test-arg-parser.cpp
-@@ -197,6 +197,21 @@ static void test(void) {
-     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
-     assert(params.speculative.draft.n_max == 123);
+@@ -274,6 +274,21 @@ static void test(void) {
+         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
+     }
  
 +    // the adaptive floor defaults to 2 and parses explicitly
 +    argv = {"binary_name", "-m", "model_file.gguf"};
@@ -6836,10 +6836,10 @@ index 000000000..ea959f223
 +    return 0;
 +}
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index a9edbd7be..645079916 100644
+index e6c991f7c..2c1acc690 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -971,7 +971,10 @@ private:
+@@ -1019,7 +1019,10 @@ private:
          const bool has_draft = params.speculative.has_dft();
          const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                          params_base.speculative.types.end(),
