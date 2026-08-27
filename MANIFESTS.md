@@ -18,10 +18,19 @@ This is the authoritative apply order and the verification contract for the
 patch set. It is written for humans AND LLM coding agents. Follow it exactly;
 do not skip blocks.
 
-Branch: `baseline/d222767c7` (current, recommended)
-Upstream range: `758443071` .. `d222767c7` (patches generated against
-`d222767c7`; the older branch `baseline/758443071` covers the original
-range)
+Branch: `baseline/192067b72` (current, recommended)
+Upstream range: `d222767c7` .. `192067b72` (13 commits past the original
+baseline; the patch files are unchanged - they apply zero-fuzz to both tips,
+see BASELINE.md. Older branches: `baseline/d222767c7`, `baseline/758443071`)
+
+## Validation record (2026-08-26, ROCm 7.14, gfx1201) - new checkpoint
+
+Same patch files applied zero-fuzz to master at `192067b72`
+(`scripts/apply-all.sh`, no 3-way fallback); applied tree byte-identical to
+the `d222767c7` record for every block file. Fresh full build clean;
+real-model sanity (Qwen3.8-27B Q4_K_XL, 1 card): pp512 1330 t/s, tg64
+30.9 t/s, llama-cli generation 30.7 t/s - matches the validated numbers.
+Full 14883/14883 suite record carries from the identical block code.
 
 ## Validation record (2026-08-25, ROCm 7.14, gfx1201)
 

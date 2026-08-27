@@ -10,7 +10,8 @@ order.
 
 | branch | upstream range | status |
 |--------|----------------|--------|
-| `baseline/d222767c7` | `758443071` .. `d222767c7` | **current, recommended** - full suite validated 14883/14883 on ROCm 7.14/gfx1201, includes the test-harness seeding fix |
+| `baseline/192067b72` | `d222767c7` .. `192067b72` | **current, recommended** - same patch files as `d222767c7`, zero-fuzz apply to master at `192067b72`, fresh build + real-model sanity validated 2026-08-26 (ROCm 7.14/gfx1201) |
+| `baseline/d222767c7` | `758443071` .. `d222767c7` | 12-block set, full suite validated 14883/14883 on ROCm 7.14/gfx1201, includes the test-harness seeding fix |
 | `baseline/758443071` | `758443071` (single point) | original set mirroring the fork; known-good for the old upstream, carries the fork's deterministic test-harness seed (see BASELINE.md) |
 
 Pick the branch whose recorded range matches your upstream tip; the

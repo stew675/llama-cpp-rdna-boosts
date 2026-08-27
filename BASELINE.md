@@ -1,11 +1,13 @@
 # BASELINE - provenance and drift policy
 
-Branch: `baseline/d222767c7` (current, recommended)
-Upstream range: `7584430716ee229751771ed0d6bbcb780d105eeb` .. `d222767c7`
-("kleidiai: Rework KleidiAI Build System/Integration (#26077)")
+Branch: `baseline/192067b72` (current, recommended)
+Upstream range: `d222767c7` .. `192067b72` ("hexagon: support for multi-NPU
+devices (IQ9, IQ10) and fully asynchronous backend (#26501)")
 
-Older branch: `baseline/758443071` - the known-good set for the upstream
-range around `758443071` (see "Older branches" below).
+Older branches: `baseline/d222767c7` (12-block set, validated against
+`d222767c7`; patch content is identical to this branch) and
+`baseline/758443071` (the original set for the older upstream range; see
+"Older branches" below).
 
 ## Baseline
 
@@ -13,6 +15,18 @@ All patches on this branch are generated against **llama.cpp upstream master
 at `d222767c7`** and were validated by applying them, one at a time, to a
 fresh checkout of that SHA, building with ROCm 7.14 (gfx1201, GGML_HIP=ON,
 Release), and running the full test suite.
+
+The same patch files apply **zero-fuzz to master at `192067b72`** (13
+upstream commits past `d222767c7`): `scripts/apply-all.sh` applied all 12
+patches without 3-way fallback, and the applied tree is byte-identical to
+the `d222767c7`-validated tree for every block file (the 13 drift commits
+only touch files outside the blocks). A fresh full build
+(`~/bin/build-llama-rocm-714`, ROCm 7.14, gfx1201) succeeds, and the
+real-model sanity run (Qwen3.8-27B Q4_K_XL, 1 card) matches the validated
+numbers (pp512 1330 t/s, tg64 30.9 t/s; llama-cli generation 30.7 t/s).
+This branch records that new stable checkpoint; the patch files are
+unchanged (regeneration from the new tip produces identical content - only
+hunk line hints and blob SHAs shift).
 
 ### Validation record (2026-08-25, AMD Radeon AI PRO R9700 x3, ROCm 7.14)
 
@@ -24,6 +38,20 @@ Release), and running the full test suite.
 - The applied tree is byte-identical to the source fork branch `chunked-gdn`
   for every production file (the only intentional divergence is the test
   harness fix described below).
+
+### Validation record (2026-08-26, AMD Radeon AI PRO R9700 x3, ROCm 7.14)
+
+Master tip `192067b72` + the 12-block patch set (applied with `apply-all.sh`,
+zero-fuzz):
+
+- Fresh full build (`~/bin/build-llama-rocm-714`): clean, all targets
+  (incl. llama-server, llama-cli, test-backend-ops).
+- Real-model sanity (Qwen3.8-27B Q4_K_XL, 1 card): llama-bench pp512
+  1330 t/s, tg64 30.9 t/s; llama-cli --single-turn generates correctly
+  (30.7 t/s). Matches the `d222767c7`-validated numbers.
+- The block code is byte-identical to the 2026-08-25/26 records below (the
+  13 drift commits do not overlap any block file region - proven by the
+  zero-fuzz apply).
 
 ### Validation record (2026-08-26, AMD Radeon AI PRO R9700 x3, ROCm 7.14)
 
