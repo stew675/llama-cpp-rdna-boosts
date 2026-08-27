@@ -16,7 +16,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LLAMA="${1:-$(pwd)}"
 RDNA="${2:-$REPO_DIR}"
 PATCHES="$RDNA/patches"
-ORDER="01-adaptive-mtp.patch 02-chunked-gdn.patch 03-bf16-kv-cache.patch 04-wmma-flash-attn.patch 05-bit-identical-decode-cpu.patch 06-gfx1151-mmvq-table.patch 07-host-buffer-revert.patch 08-meta-device-wrapper-skip.patch 09-q6k-mmvq-vdr2.patch 10-fused-core.patch 11-meta-headroom.patch"
+ORDER="01-adaptive-mtp.patch 02-chunked-gdn.patch 03-bf16-kv-cache.patch 04-wmma-flash-attn.patch 05-bit-identical-decode-cpu.patch 06-gfx1151-mmvq-table.patch 07-host-buffer-revert.patch 08-meta-device-wrapper-skip.patch 09-q6k-mmvq-vdr2.patch 10-fused-core.patch 11-meta-headroom.patch 12-k-quant-boosts.patch"
 
 cd "$LLAMA"
 
@@ -54,9 +54,10 @@ for p in $ORDER; do
  done
 
 echo
-if [ "$(git log --oneline | wc -l)" -eq 11 ]; then
-    echo "All 11 patches applied and committed on branch $BRANCH, one commit each:"
-    git log --oneline
+N_BLOCKS="$(echo $ORDER | wc -w)"
+if [ "$(git rev-list --count HEAD ^HEAD~$N_BLOCKS)" -eq "$N_BLOCKS" ]; then
+    echo "All $N_BLOCKS patches applied and committed on branch $BRANCH, one commit each:"
+    git log --oneline -$N_BLOCKS
 else
     echo "All patches applied on branch $BRANCH (check git status for uncommitted leftovers)."
 fi

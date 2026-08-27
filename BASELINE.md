@@ -25,6 +25,18 @@ Release), and running the full test suite.
   for every production file (the only intentional divergence is the test
   harness fix described below).
 
+### Validation record (2026-08-26, AMD Radeon AI PRO R9700 x3, ROCm 7.14)
+
+Blocks 01-11 as above, plus **block 12** (`12-k-quant-boosts.patch`,
+`a7d092368`):
+
+- `test-backend-ops` (ROCm0 + CPU): **14883/14883 passed, 0 failures** on the
+  block-11+12 tree.
+- `MUL_MAT` q4_K/q5_K: **54/54**; `MUL_MAT_ID` q4_K/q5_K: **76/76**.
+- Real-model (Qwen3.8-27B Q4_K_XL, 17 GB, mixed Q4_K/Q5_K/Q6_K/Q8_0, 1 card,
+  llama-bench): decode +5.5-5.7% (tg32/tg128), prefill +0.6-1.0%
+  (pp128/512/1024) vs the block-11 tree.
+
 ### Two fixes vs the fork
 
 The patch set carries two fixes that are NOT on `chunked-gdn`; both come from
@@ -80,6 +92,7 @@ The original source commits on the fork branch `chunked-gdn` (parent
 | `08-meta-device-wrapper-skip.patch` | `32670eec8` |
 | `09-q6k-mmvq-vdr2.patch` | `cd35abd19` |
 | `11-meta-headroom.patch` | `f2a22a71` (fork branch `rdna-boosts`, NOT on `chunked-gdn`) |
+| `12-k-quant-boosts.patch` | `a7d092368` (fork branch `rdna-boosts`, NOT on `chunked-gdn`) |
 
 > `10-fused-core.patch` additionally carries a local correctness fix on top of
 > the fork commits: the Q8_1 input cache now keys entries by `src1->data` in
@@ -87,7 +100,7 @@ The original source commits on the fork branch `chunked-gdn` (parent
 > tensors of the mul_mat_id host-sort fallback never collide (equal token
 > counts produced identical keys, reusing the wrong expert's quantized
 > tokens; nondeterministic iq1_m MUL_MAT_ID failures on RDNA4).
-| `rdna-boosts-all.patch` (repo root) | all 48 commits of `758443071..chunked-gdn` + `f2a22a71` |
+| `rdna-boosts-all.patch` (repo root) | all 48 commits of `758443071..chunked-gdn` + `f2a22a71` + `a7d092368` |
 
 ## Older branches
 

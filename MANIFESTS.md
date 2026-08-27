@@ -10,7 +10,9 @@ The branch is 48 commits of RDNA work on top of upstream master
 standalone diffs and 1 "fused core" (16 mutually-entangled commits extracted as
 one combined diff, applied last). One follow-up fix was added later as
 **block 11** (`11-meta-headroom.patch`, meta-buffer compute-container
-headroom), so the full set is 11 patches in apply order.
+headroom) and the k-quant kernel boosts landed as **block 12**
+(`12-k-quant-boosts.patch`, Q4_K/Q5_K VDR=4 decode, mmq scale-load hoist,
+RDNA4 MoE mmid whitelist), so the full set is 12 patches in apply order.
 
 This is the authoritative apply order and the verification contract for the
 patch set. It is written for humans AND LLM coding agents. Follow it exactly;
@@ -23,7 +25,7 @@ range)
 
 ## Validation record (2026-08-25, ROCm 7.14, gfx1201)
 
-All 11 patches applied in the order below to a fresh checkout of
+All 12 patches applied in the order below to a fresh checkout of
 `d222767c7`, built `GGML_HIP=ON Release`:
 
 - `test-backend-ops` (ROCm0/1/2 + CPU): **14883/14883 passed, 0 failures**
@@ -51,6 +53,7 @@ debugging the bf16 GDN kernel, deterministically fails `rms_norm_back` /
 | 09 | `09-q6k-mmvq-vdr2.patch` | ggml/src/ggml-cuda/{ggml-cuda.cu,mmvq.cu,vecdotq.cuh}, tests/test-backend-ops.cpp | none (test hunk re-based to stock) |
 | 10 | `10-fused-core.patch` | mmvq.{cu,cuh}, ggml-cuda.cu (try_fuse), norm.{cu,cuh}, unary.{cu,cuh}, common.cuh, fattn.cu, fattn-tile.cuh | **blocks 03 and 04 MUST be applied first** (fattn-tile.cuh / fattn.cu territory) |
 | 11 | `11-meta-headroom.patch` | ggml/src/ggml-backend-meta.cpp | none (independent; apply last) |
+| 12 | `12-k-quant-boosts.patch` | ggml/src/ggml-cuda/{mmq-vec-dot.cuh,mmvq.cu,vecdotq.cuh}, tests/test-backend-ops.cpp | none (apply last) |
 
 Block numbers are the apply order: `01` is the smallest number and applies
 first, `11` last. All blocks are mutually independent except **block 10
@@ -82,6 +85,7 @@ blocks 03+04 in the tree, so it sits at position 10:
 | 9 | `block/09-q6k-mmvq-vdr2` | `09-q6k-mmvq-vdr2.patch` |
 | 10 | `block/10-fused-core` | `10-fused-core.patch` |
 | 11 | `block/11-meta-headroom` | `11-meta-headroom.patch` |
+| 12 | `block/12-k-quant-boosts` | `12-k-quant-boosts.patch` |
 
 `block/11-meta-headroom` fixes the meta-buffer compute-container headroom
 (16x -> 128x) for hybrid recurrent models: the GDN/SSM conv-state snapshot
@@ -91,6 +95,16 @@ pool" (ggml.c:1804) - exactly what `--split-mode tensor` + MTP draft hit
 in the server. Source: fork branch `rdna-boosts` commit `f2a22a71` (not on
 `chunked-gdn`); needed by any recurrent model under tensor split, applied
 last or anywhere (independent file).
+
+`block/12-k-quant-boosts` is the k-quant umbrella: it brings the block-04/09
+optimizations to Q4_K/Q5_K - mmvq VDR=4 decode kernels (32 elements/thread,
+shared scale/d8 loads), the mmq prefill scale-load hoist in
+`vec_dot_q8_1_q8_1_mma`, the RDNA4 MoE mmid whitelist Q4_K 4->7, and the
+matching perf-harness cases. Measured on gfx1201: decode n=1 -13%..-18%
+(q4_K) / -8%..-15% (q5_K); verify batch n=2..8 -2%..-13%; MoE n=5/6/7 per
+expert -22%..-28%; real-model (Qwen3.8-27B Q4_K_XL, mixed quants) decode
++5.5-5.7%. Future k-quant kernel optimizations land in this block. Source:
+fork branch `rdna-boosts` commit `a7d092368`.
 Consumer (git-native alternative to `git apply`):
 
 ```
@@ -100,6 +114,9 @@ git fetch rdna-boosts --tags
 git cherry-pick block/01-adaptive-mtp
 ...
 git cherry-pick block/10-fused-core     # last
+...
+git cherry-pick block/11-meta-headroom
+git cherry-pick block/12-k-quant-boosts
 ```
 
 Cherry-pick uses 3-way merge, so each block degrades gracefully when upstream
@@ -123,6 +140,8 @@ git apply patches/07-host-buffer-revert.patch
 git apply patches/08-meta-device-wrapper-skip.patch
 git apply patches/09-q6k-mmvq-vdr2.patch
 git apply patches/10-fused-core.patch
+git apply patches/11-meta-headroom.patch
+git apply patches/12-k-quant-boosts.patch
 ```
 
 applies with zero fuzz and, after the block-02 test-harness fix, passes the
@@ -142,6 +161,8 @@ this way; see BASELINE.md for the byte-identity and validation details.
 | 08 | build + decode perf on integrated-GPU HIP target | pass / perf |
 | 09 | `llama-server --list-devices` with one GPU | no Meta wrapper |
 | 10 | `./bin/test-backend-ops -b ROCm0` (MUL_MAT Q6_K cases) + Q6_K decode on gfx1201 | 1194/1194 MUL_MAT OK |
+| 11 | build + server `--split-mode tensor` + MTP draft smoke | loads/serves, no graph-alloc abort |
+| 12 | `./bin/test-backend-ops -b ROCm0` (MUL_MAT + MUL_MAT_ID q4_K/q5_K cases) + Q4_K/Q5_K decode on gfx1201 | 54/54 MUL_MAT, 76/76 MUL_MAT_ID OK |
 | 06 | full `./bin/test-backend-ops`; speculative-decode bit-identity check; SSM/MoE model smoke | pass |
 
 Convenience: `rdna-boosts-all.patch` (repo root) is the entire net diff in
@@ -193,10 +214,14 @@ per-block flow in `patches/` when you want reviewable increments).
   original context lines (Q6_K perf cases) were added by block 04. On this
   branch the hunk applies with the re-based placement; content is identical
   to the fork, only position differs.
-- **`test-backend-ops.cpp` is shared** by blocks 02/03/04/10. The hunks are in
-  different case regions; if upstream adds cases in those regions, re-base the
-  affected hunks (each patch applies independently on the baseline, so
-  re-basing is local to the failing file).
+- **Block 12 test hunks** anchor on block-09 content (the Q6_K/Q8_0
+  decode-shape rows and the `qwen3-30b-a3b` loops). Applied in manifest order
+  they sit on the re-based block-09 hunk; do not re-order the test hunks when
+  re-basing.
+- **`test-backend-ops.cpp` is shared** by blocks 02/03/04/09/10/12. The hunks
+  are in different case regions; if upstream adds cases in those regions,
+  re-base the affected hunks (each patch applies independently on the
+  baseline, so re-basing is local to the failing file).
 - **Block 06 is genuinely inseparable**: its 16 commits co-developed the fused
   mmvq kernel region, the `ggml-cuda.cu` try_fuse machinery, and the `fattn.cu`
   dispatch cluster. It is extracted as ONE combined diff on purpose. Do not try

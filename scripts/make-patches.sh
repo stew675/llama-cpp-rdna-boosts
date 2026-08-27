@@ -41,6 +41,8 @@ BLOCKS_SINGLE[06-gfx1151-mmvq-table.patch]="5b320ed94"
 BLOCKS_SINGLE[07-host-buffer-revert.patch]="edb8d44c0"
 BLOCKS_SINGLE[08-meta-device-wrapper-skip.patch]="32670eec8"
 BLOCKS_SINGLE[09-q6k-mmvq-vdr2.patch]="cd35abd19"
+BLOCKS_SINGLE[11-meta-headroom.patch]="f2a22a71"
+BLOCKS_SINGLE[12-k-quant-boosts.patch]="a7d092368"
 
 declare -A BLOCKS_MULTI
 BLOCKS_MULTI[01-adaptive-mtp.patch]="87ad1db26 b56926039 d0d7ff27e 8d70e21f5 0cf87e989"
@@ -167,8 +169,8 @@ git diff "$BASELINE" "$BRANCH" > "$REPO_DIR/rdna-boosts-all.patch"
 # encodes the sequence, unlike the patch filenames which are plan topic IDs.
 # Tags are derived artifacts: force-moved on every regeneration.
 echo "== block stacking tags"
-TAG_ORDER="01-adaptive-mtp 02-chunked-gdn 03-bf16-kv-cache 04-wmma-flash-attn 05-bit-identical-decode-cpu 06-gfx1151-mmvq-table 07-host-buffer-revert 08-meta-device-wrapper-skip 09-q6k-mmvq-vdr2 10-fused-core"
-TAG_NAMES="block/01-adaptive-mtp block/02-chunked-gdn block/03-bf16-kv-cache block/04-wmma-flash-attn block/05-bit-identical-decode-cpu block/06-gfx1151-mmvq-table block/07-host-buffer-revert block/08-meta-device-wrapper-skip block/09-q6k-mmvq-vdr2 block/10-fused-core"
+TAG_ORDER="01-adaptive-mtp 02-chunked-gdn 03-bf16-kv-cache 04-wmma-flash-attn 05-bit-identical-decode-cpu 06-gfx1151-mmvq-table 07-host-buffer-revert 08-meta-device-wrapper-skip 09-q6k-mmvq-vdr2 10-fused-core 11-meta-headroom 12-k-quant-boosts"
+TAG_NAMES="block/01-adaptive-mtp block/02-chunked-gdn block/03-bf16-kv-cache block/04-wmma-flash-attn block/05-bit-identical-decode-cpu block/06-gfx1151-mmvq-table block/07-host-buffer-revert block/08-meta-device-wrapper-skip block/09-q6k-mmvq-vdr2 block/10-fused-core block/11-meta-headroom block/12-k-quant-boosts"
 git -C "$REPO_DIR" worktree add --detach "$TMP/tagwt" HEAD >/dev/null
 ( cd "$TMP/tagwt"
   git checkout -q --orphan rdna-tag-build

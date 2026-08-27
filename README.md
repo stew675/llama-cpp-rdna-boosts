@@ -24,13 +24,13 @@ workflow below uses the current branch.
 ├── BASELINE.md            # pinned baseline SHA, per-patch provenance, drift policy
 ├── rdna-boosts-all.patch      # convenience: the entire net as ONE patch
 ├── patches/
-│   └── 01-adaptive-mtp.patch          … 10-fused-core.patch, 11-meta-headroom.patch
+│   └── 01-adaptive-mtp.patch          … 11-meta-headroom.patch, 12-k-quant-boosts.patch
 └── scripts/
     ├── make-patches.sh    # regenerates all patches from the fork (needs the fork checkout)
     └── apply-all.sh       # applies in manifest order + runs the verification commands
 ```
 
-## The 11 blocks
+## The 12 blocks
 
 | patch | what | size |
 |-------|------|------|
@@ -45,9 +45,11 @@ workflow below uses the current branch.
 | `09-q6k-mmvq-vdr2.patch` | Q6_K mmvq VDR=2 decode kernel | 1 commit |
 | `10-fused-core.patch` | fused quantized-matmul kernels + graph fusions (SSM/MoE), GPU bit-identical decode | 16 commits, 1 diff |
 | `11-meta-headroom.patch` | meta-buffer compute-container headroom | 1 commit |
+| `12-k-quant-boosts.patch` | k-quant boosts: Q4_K/Q5_K mmvq VDR=4 decode, mmq scale-load hoist, RDNA4 MoE mmid whitelist | 1 commit |
 
 Blocks are listed in apply order; `10-fused-core` needs blocks 03+04 in the
-tree (see MANIFESTS.md), `11` is a follow-up fix applied last.
+tree (see MANIFESTS.md), `11` is a follow-up fix applied last, `12` is the
+k-quant umbrella (future quant kernel optimizations land here).
 
 ## Consumer workflow
 
@@ -66,10 +68,12 @@ git checkout d222767c7   # the SHA recorded in MANIFESTS.md
 # 2. fresh branch
 git checkout -b rdna-boosts
 
-# 3. apply in manifest order, verifying each (block 10 LAST before block 11)
+# 3. apply in manifest order, verifying each (block 10 LAST before blocks 11/12)
 git apply ../rdna-boosts/patches/01-adaptive-mtp.patch
 ... # blocks 02-05, 07-10 in any order
 git apply ../rdna-boosts/patches/10-fused-core.patch
+git apply ../rdna-boosts/patches/11-meta-headroom.patch
+git apply ../rdna-boosts/patches/12-k-quant-boosts.patch
 
 # 4. full verification
 cmake -B build -DGGML_HIP=ON -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ ...
@@ -82,10 +86,10 @@ cmake --build build -j
 
 ### Git-native alternative: block tags
 
-The repo also carries `block/01-… block/11-…` tags - one squashed commit per
+The repo also carries `block/01-… block/12-…` tags - one squashed commit per
 block, stacked in apply order. Block numbers are the apply order everywhere
 (patch filenames, tag names, block labels in the git history): `01` applies
-first, `11` last. The fused core needs blocks 03+04 in the tree, so it sits
+first, `12` last. The fused core needs blocks 03+04 in the tree, so it sits
 at position 10. Each tag's diff-vs-parent is exactly that block:
 
 ```
@@ -93,7 +97,9 @@ git remote add rdna-boosts git@github.com:stew675/llama-cpp-rdna-boosts.git
 git fetch rdna-boosts --tags
 git cherry-pick block/01-adaptive-mtp   # ... then block/02 … block/10, in order
 git cherry-pick block/10-fused-core     # last
+... # blocks 11-12 after the fused core
 git cherry-pick block/11-meta-headroom
+git cherry-pick block/12-k-quant-boosts
 ```
 
 Cherry-picking uses 3-way merge, so blocks degrade more gracefully than
