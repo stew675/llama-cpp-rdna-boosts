@@ -1,7 +1,7 @@
 # Strategy B: fused cross-layer SSM (DeltaNet) decode kernel — engineering plan
 
 Goal: eliminate the per-layer inter-kernel barrier + launch tax of the
-42 `gated_delta_net_cuda` calls (and their surrounding per-layer kernels) by
+48 `gated_delta_net_cuda` calls (and their surrounding per-layer kernels) by
 running the entire recurrent SSM decode as ONE persisted kernel that loops
 over layers internally with on-chip state carry.
 
@@ -46,13 +46,13 @@ stream, but the SSM-region barriers are removable). A realistic target is
 `is_recr_impl[i] = (i < n_layer) && ((i+1) % 4 != 0)` → **48 SSM layers**
 (blk 0,1,2,4,5,6,8,...), 16 full-attn (blk 3,7,11,...63).
 
-**OPEN QUESTION (resolve first):** the decode kernel trace shows **42** GDN
-dispatches/token, not 48 (matches 42 ssm_conv / mul_mat_vec_f / l2_norm_pair).
-Determine why 42: likely the MTP block layer is not in the single-token decode
-path, and/or the last few trunk layers or the MTP trunk layer are handled
-elsewhere. **B's fused kernel must loop the exact runtime count** (42), so
-resolve this count before writing the loop. (Trace method: count
-`gated_delta_net_cuda<128>` dispatches in a decode phase; already 42.)
+**[RESOLVED in Phase 0]** The decode graph fires **48** GDN per pass.
+Empirical: 336 total `gated_delta_net_cuda<128>` in a `-n 8` trace ÷ 48 = 7.0
+decode graphs (the 8th token comes from the adaptive-MTP draft head, a
+full-attn block that runs NO GDN). The earlier "42" was an arithmetic error
+(336 ÷ 8 `-n` tokens instead of ÷ 48 recurrent layers). The fused kernel must
+loop **48** recurrent layers. MTP block (layer 64) is NOT in this loop. See
+`~/llama.cpp/phase0-gdn-layer-count.md`.
 
 ## 2. The op sequence B must fuse (one SSM layer)
 
@@ -121,11 +121,11 @@ state across the layer loop (decode).
 
 ## 5. Implementation phases
 
-### Phase 0 — Resolve the 42-vs-48 count + establish a fused-kernel A/B
-- [ ] Confirm the exact recurrent-layer count in the decode path (42).
-- [ ] Capture a clean decode baseline already available (`gdn-decode-baseline.md`).
-- [ ] Freeze `GGML_CUDA_GDN_*_FUSED` env switches for A/B (reuse the chunked
-      kernel's toggle pattern).
+### Phase 0 — [COMPLETE] layer count resolved (48, not 42)
+- [x] Confirm the recurrent-layer count in the decode path: **48** (source
+      `qwen35.cpp` + trace 336/7=48). See `phase0-gdn-layer-count.md`.
+- [x] Establish that the MTP block (layer 64) does NOT add GDN.
+- [x] Frozen the fused kernel's loop count at **48**.
 
 ### Phase 1 — Single-layer fused kernel (prove the pattern on ONE layer)
 Write one kernel that does, for a single SSM layer: conv → silu → split →
@@ -137,7 +137,7 @@ performance on one layer before the cross-layer loop.
 - [ ] Validate: bit-exact or near-lossless (decide — see §6), test-backend-ops.
 
 ### Phase 2 — Cross-layer loop (the actual "persistent" kernel)
-Extend to a persistent kernel that loops over the 42 SSM layers, carrying the
+Extend to a persistent kernel that loops over the 48 SSM layers, carrying the
 recurrent state on-chip (or in a modest scratch) and calling the small per-layer
 ops inline. The heavy mmvq weight matmuls are done as cooperative subtiles
 (they must round-trip to DRAM, but the launch overhead is amortized).
@@ -159,7 +159,7 @@ ops inline. The heavy mmvq weight matmuls are done as cooperative subtiles
 - [ ] Grid/block sizing, shared mem budget, occupancy.
 - [ ] test-backend-ops (GDN, MUL_MAT, flash-attn) full suite.
 - [ ] Bit-exact / PPL A/B (see §6).
-- [ ] Benchmark `tg64 @ d256/d2048/d65536` vs the 42-kernel baseline.
+- [ ] Benchmark `tg64 @ d256/d2048/d65536` vs the 48-kernel baseline.
 
 ## 6. Numerics decision (make EARLY, it shapes the kernel)
 
@@ -210,10 +210,10 @@ Documented fallback if B stalls. Smaller, surgical, captures part of the same
 gain.
 
 ### What A does
-Since the 42 GDN calls are each interleaved with ~6 directly-adjacent kernels
+Since the 48 GDN calls are each interleaved with ~6 directly-adjacent kernels
 in the SSM layer (norm, l2_norm, silu, quantize, state cpy), fuse ONLY those
 immediate neighbors into the GDN kernel per layer — no cross-layer carry, no
-persistent loop. This collapses the ~42 GDN barriers AND several adjacent
+persistent loop. This collapses the ~48 GDN barriers AND several adjacent
 barriers without touching the mmvq or the recurrent dependency.
 
 ### Scope
@@ -224,7 +224,7 @@ barriers without touching the mmvq or the recurrent dependency.
 - **Bit-exact is feasible** (no accumulation-order change across layers).
 
 ### Expected gain
-- Removes the ~42 GDN barriers (0.17 ms) + a fraction of the adjacent kernel
+- Removes the ~48 GDN barriers (0.17 ms) + a fraction of the adjacent kernel
   barriers. Modest — roughly **0.3–0.6 ms/token**. May or may not fully close
   the ~0.45 ms target, but it's low-risk and could combine with B's Phase 1.
 
@@ -243,7 +243,7 @@ barriers without touching the mmvq or the recurrent dependency.
 
 ## References
 - Baseline: `gdn-decode-baseline.md`
-- Fusion feasibility + 42-vs-48: `gdn-fusion-analysis.md`
+- Fusion feasibility + 48-vs-42 (RESOLVED=48): `gdn-fusion-analysis.md`
 - Precedent kernels: `ggml/src/ggml-cuda/gated_delta_net_chunked*.cu`
   (`gated_delta_net_chunked.cu` 700 lines, `_bf16` 962 lines)
 - Fused-node plumbing: `src/llama-graph.{h,cpp}`,
@@ -267,7 +267,7 @@ Phase 0 can be resumed without re-deriving them. Verified 2026-08-28.
   HIP 1 = GPU[2] = bus 09; HIP 2 = GPU[0] = bus 03. Use `HIP_VISIBLE_DEVICES=1`
   for the single-card runs below.
 
-## Measure the exact GDN per-token dispatch count (Phase 0 target: 42 vs 48)
+## Measure the GDN per-decode-graph dispatch count (RESOLVED: 48)
 
 ### Step 1: rocprofv3 kernel trace
 ```
@@ -287,14 +287,14 @@ occupy dispatch indices ~0-10342; the sequential DECODE kernel
 `gated_delta_net_cuda<128,false,false>` starts at ~10399 and runs to ~19133.
 The 8 generation tokens = ~1498 dispatches. **Decode window: idx >= 10399.**
 
-### Step 3: count GDN calls per token
+### Step 3: count GDN calls per decode graph
 ```python
 import csv
 rows=list(csv.DictReader(open('/tmp/rocprof-v2/k_kernel_trace.csv')))
 gdn=[(i,r) for i,r in enumerate(rows) if 'gated_delta_net_cuda<128' in r['Kernel_Name']]
 print('total decode GDN:', len(gdn))          # 336
-print('per token:', len(gdn)/8)               # 42.0
-# per-call geometry (identical for all 42):
+print('per decode graph:', len(gdn)/48)       # 7.0   (48 recurrent layers each)
+# per-call geometry (identical for all 48):
 print(gdn[0][1]['Grid_Size_X'], gdn[0][1]['Grid_Size_Y'], gdn[0][1]['Grid_Size_Z'])  # 1536 4 32
 # per-call duration (us): min/med/max; total
 import statistics
@@ -331,10 +331,10 @@ Keys: `qwen35.block_count=65`, `qwen35.embedding_length=5120`,
 The prefill chunked GDN uses env toggles `GGML_CUDA_GDN_CHUNKED` (=0 forces
 fallback) and `GGML_CUDA_GDN_CHUNKED_BF16` (=0 opts out of bf16/WMMA). New
 fused decode kernel should add a matching toggle (e.g.
-`GGML_CUDA_GDN_SSM_FUSED`) for A/B against the 42-kernel path.
+`GGML_CUDA_GDN_SSM_FUSED`) for A/B against the 48-kernel path.
 
 ## Reclassification note (important)
 The /tmp/rocprof-v2 trace (`k_kernel_trace.csv`) is the ONLY profile that has
 been run. It is NOT committed (7.4 MB); regenerate it with the command above
-if re-running. The decode GDN count (42) and per-token numerology in the
+if re-running. The decode GDN count (48) and per-graph numerology in the
 docs are all derived from it.
