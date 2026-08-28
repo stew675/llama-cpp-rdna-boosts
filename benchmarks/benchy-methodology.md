@@ -36,6 +36,10 @@ card (34 GiB class).
 |-------|------|-------|---------------|
 | M | upstream `master` | `~/llama.cpp/build-rocm/bin/llama-server` | `fe235f434` |
 | B | `rdna-boosts` (all 10 blocks) | `~/llama.cpp/build-rdna-boosts/bin/llama-server` | `a265041b1` |
+| V | upstream `master` (Vulkan) | `~/llama.cpp/build-vulkan/bin/llama-server` | `fe235f434` |
+
+All three are built from the same source lineage: V is the same master tip
+as M but on the Vulkan backend (RADV), giving a full cross-backend gamut.
 
 Both builds are ROCm 7.14 / Clang 23 Release, gfx1201.
 
@@ -61,7 +65,9 @@ per-layer KV math. Verified: 1-card server (Q6_K, BF16 KV, ctx 140000)
 loads and answers `/health` OK; Q4_K_XL loads and runs on the boosted build
 (`llama-bench`: pp32 429.9 t/s, tg8 24.9 t/s).
 
-## Config matrix (16 rows: 2 builds × 2 KV types × 4 model/card sets)
+## Config matrix (24 rows: 2 ROCm builds × 2 KV × 4 model/card sets + 1 Vulkan build × 2 KV × 4 sets)
+
+ROCm rows (as above, 16):
 
 | row | build | GPUs (`HIP_VISIBLE_DEVICES`) | model | ctx | KV |
 |-----|-------|------|-------|-----|----|
@@ -81,6 +87,31 @@ loads and answers `/health` OK; Q4_K_XL loads and runs on the boosted build
 | M-3-bf16 | master | `0,1,2` | Q8_0 | 262144 | bf16/bf16 |
 | B-3-f16 | boosts | `0,1,2` | Q8_0 | 262144 | f16/f16 |
 | B-3-bf16 | boosts | `0,1,2` | Q8_0 | 262144 | bf16/bf16 |
+
+Vulkan rows (8, same master tip `fe235f434`, layer split):
+
+| row | build | GPUs (`GGML_VK_VISIBLE_DEVICES`) | model | ctx | KV |
+|-----|-------|------|-------|-----|----|
+| V-1Q6-f16 | master (Vulkan) | `1` | Q6_K | 140000 | f16/f16 |
+| V-1Q6-bf16 | master (Vulkan) | `1` | Q6_K | 140000 | bf16/bf16 |
+| V-1Q4-f16 | master (Vulkan) | `1` | Q4_K_XL | 140000 | f16/f16 |
+| V-1Q4-bf16 | master (Vulkan) | `1` | Q4_K_XL | 140000 | bf16/bf16 |
+| V-2-f16 | master (Vulkan) | `1,2` | Q8_0 | 262144 | f16/f16 |
+| V-2-bf16 | master (Vulkan) | `1,2` | Q8_0 | 262144 | bf16/bf16 |
+| V-3-f16 | master (Vulkan) | `1,2,3` | Q8_0 | 262144 | f16/f16 |
+| V-3-bf16 | master (Vulkan) | `1,2,3` | Q8_0 | 262144 | bf16/bf16 |
+
+The Vulkan leg completes the gamut: the same master source on a different
+backend end-to-end (RADV gfx1201). Vulkan device indices differ from HIP:
+Vulkan 0 = the iGPU, **1/2/3 = the three R9700s** (verified 2026-08-27 via
+`llama-bench --list-devices` and `vulkaninfo`). Vulkan uses layer split
+(`--split-mode layer`; it has no tensor split) and genuinely supports
+native BF16 KV (`bf16: 1`, KHR_coopmat) — unlike ROCm master, which
+silently stores f16. So V-bf16 is the true native-BF16 reference from the
+upstream tree, and V-f16 is the Vulkan default.
+
+Note on the Vulkan GPU sets: 1-card = `1` (first R9700), 2-card = `1,2`,
+3-card = `1,2,3` (matching v1).
 
 The 2×2 build × KV-type design is deliberate; each corner answers one
 question:
@@ -267,21 +298,28 @@ with the same 4 corners (scripts/run-ppl.sh):
 | B | master | bf16 | config B (silently f16 on ROCm + conversion cost) |
 | C | boosts | bf16 | config C (native BF16, FP32-accumulate attention) |
 | D | boosts | f16 | (new) |
+| V | master (Vulkan) | f16 | (new) |
+| V | master (Vulkan) | bf16 | config V (true native BF16 on Vulkan) |
 
-Run per model: Q8_0 (2/3-card), Q6_K and Q4_K_XL (1-card). Expected v1
-baseline: A ≈ B ≈ C within ±0.04 (all wash), directionally C lowest; the
-full matrix will show whether D differs from C on the fork and whether the
-Q4_K_XL quants carry a PPL cost vs Q6_K/Q8_0 at the same corners. The
-message the suite is designed to support: the fastest config is also at-or-
-below the others in PPL, so neither baseline corner is ever justified.
+Run per model: Q8_0 (2/3-card), Q6_K and Q4_K_XL (1-card). The Vulkan
+corners use `GGML_VK_VISIBLE_DEVICES=1,2` and `-sm layer` (Vulkan has no
+tensor split). Expected v1 baseline: A ≈ B ≈ C within ±0.04 (all wash),
+directionally C lowest; Vulkan landed highest in v1 (6.3293 Q8_0 BF16,
+attributed to BF16-everywhere attention numerics). The full matrix will
+show whether D differs from C on the fork, whether V-f16 vs V-bf16 differ,
+and whether the Q4_K_XL quants carry a PPL cost vs Q6_K/Q8_0 at the same
+corners. The message the suite is designed to support: the fastest config
+is also at-or-below the others in PPL, so neither baseline corner is ever
+justified.
 
 ## Harness
 
 `scripts/benchy-run.sh` starts the server for a row (build, model, alias,
-GPUs, ctx, KV types), waits for `/health`, runs the fixed llama-benchy
-command, saves JSON + md, and tears the server down. `scripts/run-benchy-suite.sh`
-drives all 16 rows in sequence. Both are described in
-[benchmarks/README.md](README.md).
+GPUs, ctx, KV types, backend rocm|vulkan), waits for `/health`, runs the
+fixed llama-benchy command, saves JSON + md, and tears the server down.
+`scripts/run-benchy-suite.sh` drives the 16 ROCm rows;
+`scripts/run-benchy-vulkan-suite.sh` drives the 8 Vulkan rows. Both are
+described in [benchmarks/README.md](README.md).
 
 ## Validation of the harness (2026-08-27)
 

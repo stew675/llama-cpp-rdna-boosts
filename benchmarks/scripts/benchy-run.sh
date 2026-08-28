@@ -1,15 +1,17 @@
 #!/bin/bash
 # benchy-run.sh - run one llama-benchy row against a live llama-server.
 #
-# usage: benchy-run.sh <row-label> <build-bin-dir> <model-path> <alias> <gpus> <ctx> [<ktype> <vtype>]
+# usage: benchy-run.sh <row-label> <build-bin-dir> <model-path> <alias> <gpus> <ctx> [<ktype> <vtype>] [<backend>]
 #
 #   row-label   e.g. B-1Q6-bf16   (also used for result file names)
 #   build-bin   dir containing llama-server, e.g. ~/llama.cpp/build-rdna-boosts/bin
 #   model-path  path to the .gguf
 #   alias       model alias; MUST equal the llama-benchy --model value
-#   gpus        HIP_VISIBLE_DEVICES value, e.g. 0 or 0,2 or 0,1,2
+#   gpus        backend device indices: HIP_VISIBLE_DEVICES (rocm) or
+#               GGML_VK_VISIBLE_DEVICES (vulkan), e.g. 0 or 0,2 or 0,1,2
 #   ctx         server context size, e.g. 140000 or 262144
 #   ktype vtype KV cache types (default: bf16 bf16), e.g. f16 f16
+#   backend     rocm (default) or vulkan
 #
 # Output: benchmarks/results/benchy/<row>.json and <row>.md
 # Requires: uvx (llama-benchy), curl, python3.
@@ -18,12 +20,17 @@ set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"   # repo root
 ROW="${1:?row-label}"; BIN="${2:?build-bin}"; MODEL="${3:?model-path}"
 ALIAS="${4:?alias}"; GPUS="${5:?gpus}"; CTX="${6:?ctx}"
-KT="${7:-bf16}"; VT="${8:-bf16}"
+KT="${7:-bf16}"; VT="${8:-bf16}"; BACKEND="${9:-rocm}"
 PORT=8033
 RESULTS="$ROOT/benchmarks/results/benchy"
 mkdir -p "$RESULTS"
 
 # ---------- fixed flags (must match benchy-methodology.md) ----------
+if [ "$BACKEND" = vulkan ]; then
+    SPLIT=layer   # Vulkan has no tensor split
+else
+    SPLIT=tensor
+fi
 COMMON_ARGS=( --prio 2 --fit false --top-k 20 --port "$PORT" --threads 8 --parallel 1 \
   --top-p 0.95 --min-p 0.001 --verbosity 3 --host 0.0.0.0 --cpu-strict 1 --cpu-range 0-7 \
   --predict 98304 --threads-http 4 --load-mode mlock --cache-ram 16384 \
@@ -31,13 +38,18 @@ COMMON_ARGS=( --prio 2 --fit false --top-k 20 --port "$PORT" --threads 8 --paral
   --batch-size 1024 --ubatch-size 1024 --n-gpu-layers all --no-kv-unified \
   --cache-type-k "$KT" --cache-type-v "$VT" --ctx-checkpoints 64 --cache-idle-slots \
   --reasoning-budget 65536 --reasoning-preserve --checkpoint-min-step 4096 \
-  --repeat-penalty 1.0 --presence-penalty 1.5 --seed 675 --split-mode tensor )
+  --repeat-penalty 1.0 --presence-penalty 1.5 --seed 675 --split-mode "$SPLIT" )
 
 LOG="/tmp/benchy-${ROW}.log"
-echo "== [$ROW] starting server (${ALIAS}, gpus=${GPUS}, ctx=${CTX}, kv=${KT}/${VT})"
-env HIP_VISIBLE_DEVICES="$GPUS" NCCL_PROXY_CPUSET=8,9,10,11,12,13,14,15 \
-  GGML_CUDA_DISABLE_GRAPHS=0 NCCL_P2P_DISABLE=1 \
-  "$BIN/llama-server" --model "$MODEL" --alias "$ALIAS" "${COMMON_ARGS[@]}" > "$LOG" 2>&1 &
+echo "== [$ROW] starting server (${ALIAS}, backend=${BACKEND}, gpus=${GPUS}, ctx=${CTX}, kv=${KT}/${VT})"
+if [ "$BACKEND" = vulkan ]; then
+    env GGML_VK_VISIBLE_DEVICES="$GPUS" \
+      "$BIN/llama-server" --model "$MODEL" --alias "$ALIAS" "${COMMON_ARGS[@]}" > "$LOG" 2>&1 &
+else
+    env HIP_VISIBLE_DEVICES="$GPUS" NCCL_PROXY_CPUSET=8,9,10,11,12,13,14,15 \
+      GGML_CUDA_DISABLE_GRAPHS=0 NCCL_P2P_DISABLE=1 \
+      "$BIN/llama-server" --model "$MODEL" --alias "$ALIAS" "${COMMON_ARGS[@]}" > "$LOG" 2>&1 &
+fi
 SRV=$!
 
 cleanup() { kill "$SRV" 2>/dev/null; for _ in $(seq 1 20); do kill -0 "$SRV" 2>/dev/null || break; sleep 1; done; kill -9 "$SRV" 2>/dev/null; }

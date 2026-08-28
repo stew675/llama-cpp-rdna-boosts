@@ -25,7 +25,18 @@ run() { # run <label> <bin> <ktype> <vtype>
         -sm tensor -ngl 99 2>&1 | grep -E "Final estimate"
 }
 
+run_vk() { # run_vk <label> <bin> <ktype> <vtype>   (Vulkan: layer split, devices 1,2)
+    echo "== $1 ($2 vulkan, $3/$4)"
+    GGML_VK_VISIBLE_DEVICES=1,2 "$2/llama-perplexity" \
+        -m "$MODEL" -f "$WIKI" -c 2048 --chunks 128 -fa on -ctk "$3" -ctv "$4" \
+        -sm layer -ngl 99 2>&1 | grep -E "Final estimate"
+}
+
+BIN_V="${BIN_M%/bin}"; BIN_V="${BIN_V%/*}/build-vulkan/bin"   # sibling build-vulkan dir
+
 run "A master f16"       "$BIN_M" f16  f16
 run "B master bf16"      "$BIN_M" bf16 bf16
 run "C rdna-boosts bf16" "$BIN_R" bf16 bf16
 run "D rdna-boosts f16"  "$BIN_R" f16  f16
+run_vk "V master vulkan f16"  "$BIN_V" f16  f16
+run_vk "V master vulkan bf16" "$BIN_V" bf16 bf16
