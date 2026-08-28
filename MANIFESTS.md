@@ -44,6 +44,17 @@ PPL 8.6017 (default bf16 chunked) / 8.5989 (fp32 chunked) / 8.5972
 (sequential) - the bf16 delta (+0.05%) matches the documented +0.056%.
 Gated-delta-net 46/46 in all three dispatch configs; full test-backend-ops
 14887/14887 on ROCm0/1/2; test-speculative-adaptive and test-arg-parser OK.
+27B Q4_K_XL (the model-shaped GDN config, v_repeat=3) also runs clean in all
+three configs: PPL 5.0370 / 5.0213 / 5.0141 (8 chunks x 2048), coherent
+generation, no fallback warnings. P2P probe: all six device pairs report
+can_access_peer=1 and enable successfully on the validation rig, but
+GGML_CUDA_P2P=1 does not reproduce the issue-#2 401 locally (the reporter's
+kernel 7.1.9-zen/firmware delta remains machine-specific).
+
+**Issue #2 confirmed resolved by the reporter** (2026-08-28): the crash no
+longer reproduces on their rig with the regenerated patches, no env-var
+workaround needed (the sequential fallback covers any residual
+machine-specific dispatch rejection).
 
 ## Validation record (2026-08-28, ROCm 7.14, gfx1100) - issue #1 build fix
 
