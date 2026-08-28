@@ -214,6 +214,7 @@ this way; see BASELINE.md for the byte-identity and validation details.
 | 08 | `./bin/test-backend-ops -b ROCm0` (MUL_MAT Q6_K cases) + Q6_K decode on gfx1201 | 1194/1194 MUL_MAT OK |
 | 09 | build + server `--split-mode tensor` + MTP draft smoke | loads/serves, no graph-alloc abort |
 | 10 | `./bin/test-backend-ops -b ROCm0` (MUL_MAT + MUL_MAT_ID q4_K/q5_K cases) + Q4_K/Q5_K/Q8_0 decode on gfx1201; RDNA3_5 table: Q8_0 decode on gfx1151 | 54/54 MUL_MAT, 76/76 MUL_MAT_ID OK |
+| 11 | build + prefill perf A/B on gfx1201 (pp128/256/512 vs longer) | decode unchanged; prefill +6-18% for single-ubatch (pp <= ~512), neutral (~0.1%) beyond |
 
 Convenience: `rdna-boosts-all.patch` (repo root) is the entire net diff in
 one patch (applies cleanly on the baseline SHA alone; not a substitute for the
@@ -286,3 +287,30 @@ per-block flow in `patches/` when you want reviewable increments).
   needs manual re-base hunks, use `scripts/make-patches.sh` from the fork to
   regenerate the set against the new tip and cut a new `baseline/<sha>`
   branch here instead of patching this branch's files by hand.
+
+## Block 11 perf profile (skip CUDA graphs for multi-token prefill)
+
+The win is a **fixed ~30-39 ms per prefill that only appears when the prompt
+fits within a single ubatch** (default `-ub 512`, so prompts up to ~512
+tokens). It does NOT scale with context depth - it is a single-ubatch
+phenomenon. Measured on Qwen3.8-27B Q6_K, R9700 gfx1201, ROCm 7.14, 1 card
+(`llama-bench -p <pp> -n 1`, graphs OFF [block 11] vs graphs ON-prefill):
+
+| pp | prefill on_ms | saved by fix (ms) | % |
+|----:|----:|----:|----:|
+| 128 | 213 | 39 | -18.3% |
+| 256 | 314 | 32 | -10.2% |
+| 512 | 530 | 32 | -6.1% |
+| 768 | 784 | 2 | -0.2% |
+| 1024 | 1003 | 1 | -0.1% |
+
+Key findings:
+- **Short prompt (fits one ubatch):** recovers a fixed ~32-39 ms of the
+  per-graph-probe/capture overhead -> large % win (up to +18% at pp128).
+- **Long prompt (multi-ubatch):** neutral (~0.1%, no regression). The graph
+  overhead amortizes away relative to the much larger prefill compute.
+- **Mechanism confirmed:** with `-ub 128` a pp256 (now multi-ubatch) shows
+  ~0.0 ms saved; with `-ub 256` pp256 shows ~32 ms saved. The win appears
+  only when pp <= ubatch (a single graph shape to probe).
+- **Decode (tg128) unchanged** at 24.55 t/s (graphs still help decode).
+- **No numeric drift:** generated tokens byte-identical to the no-graph path.
