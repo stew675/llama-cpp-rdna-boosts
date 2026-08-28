@@ -93,7 +93,7 @@ are per-layer, not per-head. No head-level fusion to harvest.
 
 ## Recommendation
 
-**Don't pursue A** (the surrounding kernels are already folded; the GDN is
+Don't pursue A (the surrounding kernels are already folded; the GDN is
 launch/memory-bound, not neighbor-bound, so fusing neighbors buys little).
 
 **The GDN barrier cost cannot be removed by fusing the GDN calls together** —
@@ -109,3 +109,14 @@ Before committing to B, two things to verify:
    change accumulation order (the fork convention is bit-exact PPL)? The
    prefill chunked kernel already accepted a near-lossless bf16 path
    (PPL +0.056%); the decode path must decide bit-exact vs near-lossless.
+
+---
+
+**User decision (2026-08-28):** commit to Strategy B (the cross-layer
+persistent SSM kernel) as the primary effort, with A as a documented
+fallback. The full engineering plan is in
+**[gdn-strategy-B-plan.md](gdn-strategy-B-plan.md)** (phases, state layout,
+risks, effort ~12-17 days, realistic 1.5-2.5 ms/token). A (fuse GDN with its
+per-layer neighbors, ~2-3 days, 0.3-0.6 ms/token) is documented there as
+the fallback. Recommended: do B Phase 1 first (shared prerequisite), then
+continue to Phase 2 if tractable, else ship Phase 1 as A.
