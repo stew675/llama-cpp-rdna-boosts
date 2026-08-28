@@ -117,3 +117,10 @@ is no device-side primitive behind it.
 Breaking changes are confined to the AMD SMI ABI (library SONAME, field
 widths, renamed/deprecated APIs) — not the HIP launch path. gfx1201
 (R9700 / RDNA4) is still explicitly supported.
+
+**Confirmed empirically** with a microbenchmark (a HIP kernel launched
+N=4096 times, graph-replay, same source compiled by each SDK's hipcc and
+run against its own runtime): the ROCm 10.0.0 graph-replay inter-kernel
+gap is ~5% SLOWER than 7.14 (dev 1: 4.075 vs 3.861 us/kernel; dev 2:
+4.107 vs 3.901). See `rocm101-microbench/RESULTS.md`. **Stay on ROCm
+7.14** — the upgrade does not help the decode gap and may regress it.
