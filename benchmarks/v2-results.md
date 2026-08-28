@@ -168,6 +168,37 @@ rows complete the gamut:
   numerics (BF16-everywhere on the coopmat path) are the least precise of
   the gamut.
 
+#### Why Vulkan edges 1-card decode: kernel speed vs launch latency
+
+The 1-card decode comparison is close (-0.9 to -1.4% for Vulkan on Q6_K,
++1.1 to +1.3% for boosts on Q4_K_XL), and the direction of the gap is
+informative. On a kernel-per-kernel basis the ROCm BF16 kernels are
+substantially faster than Vulkan's (~20% on the k-quant decode path).
+What keeps Vulkan ahead on 1-card decode is inter-kernel launch latency:
+Vulkan's kernel launcher (RADV) dispatches the per-token decode kernel
+chain with less overhead than the ROCm HIP launcher. Decode is a long
+chain of small kernels per token, so launch latency is a first-order cost
+at every depth.
+
+The two models bracket the crossover, which is exactly where block 10's
+per-kernel work is strongest:
+
+- **Q6_K (C trails V by ~1%)**: block 10's VDR boost here is modest
+  (Q6_K 1->2, Q8_0 2->4; the decode edge over master is only ~+3%). The
+  per-kernel advantage is too small to overcome the launch-latency gap, so
+  Vulkan's launcher wins.
+- **Q4_K_XL (C leads V by ~1.2%)**: block 10's VDR boost is large (Q4_K
+  2->4, Q5_K 2->4; the decode edge over master is ~+11%). The ~20%
+  per-kernel advantage is big enough to flip the crossover, so ROCm's
+  kernels win despite the launcher.
+
+Reading: the ROCm BF16 kernels are the reference implementation; the ~1%
+1-card decode deficit is the ROCm driver's launch overhead, not a kernel
+deficiency - a gap llama.cpp cannot close from userspace. The multi-card
+Vulkan decode collapse (-40 to -59%) is a separate, much larger effect
+(layer-split sync overhead), and there the boosts kernel advantage shows
+as +80-89% (2c) and +138-162% (3c).
+
 | | V vs A prefill (128K) | V vs A decode (128K) | B-bf16 vs V decode (128K) |
 |---|---|---|---|
 | 1-card Q6_K | +102% | +4.2% | -0.9% |
