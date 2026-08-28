@@ -17,8 +17,9 @@ Design:
 - y origin at 0 for prefill; decode uses a zoomed window so the tight
   C/D/V cluster is separated (its span is ~17-24 t/s, not 0..max).
 - 3 series, one per backend: master (red), boosts (amber), vulkan (blue).
-  The KV type is in the title; bf16 uses dashed lines to distinguish from
-  the f16 chart when compared side by side.
+  The KV type is in the title; all lines are solid (no dashed/solid
+  convention - the title already states the KV type). Legend sits below
+  the axis and is always rendered into the PNG.
 - black background, faint gridlines, matching the v1 graphs.
 
 Usage: python3 benchmarks/scripts/make-v2-graphs.py
@@ -90,11 +91,10 @@ def plot(metric, setname, set_suffix, title, kv):
     ax.set_facecolor("black")
 
     runs = load(None, setname, set_suffix, kv, metric)
-    ls = "--" if kv == "bf16" else "-"
     for bld, label, color, marker in SERIES:
         ys = [metric_value(runs[bld][d], metric) for d in DEPTHS]
-        ax.plot(X, ys, color=color, marker=marker, linestyle=ls,
-                linewidth=2.5, markersize=6, label=f"{label} ({kv})", zorder=3)
+        ax.plot(X, ys, color=color, marker=marker, linestyle="-",
+                linewidth=2.5, markersize=6, label=label, zorder=3)
 
     axe = f"{'Prefill' if metric=='pp' else 'Decode'} - {title} [{kv.upper()}]"
     ax.set_title(axe, color="white", fontsize=13, pad=10)
@@ -122,12 +122,15 @@ def plot(metric, setname, set_suffix, title, kv):
     for spine in ("left", "bottom"):
         ax.spines[spine].set_color("#888888")
 
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=3,
-              frameon=False, labelcolor="white", fontsize=9,
-              columnspacing=1.4, handletextpad=0.6)
+    # legend inside the saved image, below the axis frame, always rendered
+    # (bbox_inches=tight below guarantees it is not clipped).
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=3,
+              frameon=False, labelcolor="white", fontsize=10,
+              columnspacing=1.6, handletextpad=0.8)
     os.makedirs(OUT, exist_ok=True)
     path = os.path.join(OUT, f"v2-{metric}-{setname}-{kv}.png")
-    fig.savefig(path, dpi=100, facecolor="black")
+    fig.savefig(path, dpi=100, facecolor="black",
+                bbox_inches="tight", pad_inches=0.2)
     plt.close(fig)
     print(path)
 

@@ -6,10 +6,15 @@ type so each compares the three backends (master / boosts / vulkan) at a
 single KV type — 3 series per chart, not 6, so the tight decode cluster is
 legible.
 
-Conventions:
-- **Colors**: red = master, amber = boosts, blue = vulkan.
-- **Line style**: solid = f16 KV, dashed = bf16 KV (so the f16 and bf16
-  charts of a given set line up when viewed side by side).
+**View them all on one page: [ALL-CHARTS.md](ALL-CHARTS.md)**, which
+embeds the full 16-chart grid (prefill/decode × 4 model sets × f16/bf16).
+
+## Conventions
+
+- **Colors**: red = master, amber = boosts, blue = vulkan. The same
+  color key is in every chart's legend (below the axis frame).
+- **Line style**: all lines are solid. The KV type is stated in the
+  title (`[F16]` or `[BF16]`), so there is no dashed/solid convention.
 - **Depth axis**: sqrt-scaled, labeled with the real context depth
   (0K/4K/8K/16K/32K/64K/128K). The depths are heavily non-linear; sqrt
   spreads the shallow anchors while keeping the deep end readable.
@@ -32,15 +37,7 @@ Conventions:
 - `v2-tg-1Q6-f16.png`: the mirror. on Q6_K (weaker VDR boost) vulkan
   edges boosts by ~1% at every depth; both above master.
 
-## All 16
+## File naming
 
-| set | metric | f16 | bf16 |
-|-----|--------|-----|------|
-| 1 card Q6_K (22.9 GB) | prefill | v2-pp-1Q6-f16.png | v2-pp-1Q6-bf16.png |
-| | decode | v2-tg-1Q6-f16.png | v2-tg-1Q6-bf16.png |
-| 1 card Q4_K_XL (17.6 GB) | prefill | v2-pp-1Q4-f16.png | v2-pp-1Q4-bf16.png |
-| | decode | v2-tg-1Q4-f16.png | v2-tg-1Q4-bf16.png |
-| 2 cards Q8_0 (29 GB) | prefill | v2-pp-2c-f16.png | v2-pp-2c-bf16.png |
-| | decode | v2-tg-2c-f16.png | v2-tg-2c-bf16.png |
-| 3 cards Q8_0 (29 GB) | prefill | v2-pp-3c-f16.png | v2-pp-3c-bf16.png |
-| | decode | v2-tg-3c-f16.png | v2-tg-3c-bf16.png |
+`v2-{metric}-{set}-{kv}.png` where metric = `pp` (prefill) or `tg`
+(decode), set = `1Q6` / `1Q4` / `2c` / `3c`, kv = `f16` / `bf16`.

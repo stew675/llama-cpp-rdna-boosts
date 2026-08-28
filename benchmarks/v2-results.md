@@ -78,10 +78,10 @@ baseline approach.
 
 ## Graphs
 
-Full set (16 charts, split by KV type) in [graphs/README.md](graphs/README.md),
-regenerated from the raw JSON by `scripts/make-v2-graphs.py`. Each chart
-compares the three backends at one KV type (3 series, not 6):
-`![decode bf16 - 1 card Q6_K](graphs/v2-tg-1Q6-bf16.png)`
+**All 16 charts on one page: [graphs/ALL-CHARTS.md](graphs/ALL-CHARTS.md)**
+(regenerated from the raw JSON by `scripts/make-v2-graphs.py`). Each chart
+compares the three backends at one KV type (3 series, not 6); the legend
+under every axis is **red = master, amber = boosts, blue = vulkan**.
 
 ![decode bf16 - 1 card Q6_K](graphs/v2-tg-1Q6-bf16.png)
 ![decode bf16 - 3 cards Q8_0](graphs/v2-tg-3c-bf16.png)
