@@ -1,12 +1,17 @@
 # Benchmark results: llama.cpp master vs rdna-boosts
 
-> **v2 (2026-08-27)**: the performance-testing plan has moved to a new
-> live-server protocol using [`llama-benchy`](https://pypi.org/project/llama-benchy/)
-> against `/v1/chat/completions`. See
-> [benchy-methodology.md](benchy-methodology.md) for the v2 plan, the
-> [scripts/](scripts/) `benchy-run.sh` / `run-benchy-suite.sh` harness, and
-> [results/benchy/](results/benchy/) for the standardized output. The v1
-> numbers below (curl + `/completion`) are the historical record.
+> **v2 (2026-08-27)**: the current results are the llama-benchy live-server
+> suite — see **[v2-results.md](v2-results.md)** (16-row throughput matrix +
+> 12 PPL corners). The v1 numbers below (curl + `/completion`) are the
+> historical record.
+> 
+> **v2 headline**: master BF16 decode penalty reaches −38 to −51% at 128K
+> depth; boosts-bf16 is faster than master-f16 at every depth (+44–89%
+> prefill, 1 card) AND more accurate (PPL lowest on every model); even
+> boosts-f16 beats master-f16 at the same KV type.
+>
+> Protocol: [benchy-methodology.md](benchy-methodology.md) · Harness:
+> [scripts/](scripts/) · Raw data: [results/benchy/](results/benchy/).
 
 Date: 2026-08-26
 Machine: 3x Radeon R9700 (gfx1201, 34 GB, ~640 MB/s each), ROCm 7.14
