@@ -199,6 +199,52 @@ Vulkan decode collapse (-40 to -59%) is a separate, much larger effect
 (layer-split sync overhead), and there the boosts kernel advantage shows
 as +80-89% (2c) and +138-162% (3c).
 
+#### The launch-gap is measured, not inferred (fused-matmuls project, 2026-08-12)
+
+Prior profiling (rocprof, Q6_K @ d256, `fused-matmuls.md` experiment log)
+quantified the exact mechanism:
+
+- **Vulkan inter-kernel gap: ~0.1 ms/token total**; ROCm: **~4.5 ms/token
+  (~3.5 us x ~1290 kernels)**. Decode wall was 43.7 ms/token: 35.4 ms
+  mmvq (DRAM-bound at ~645 GB/s, no headroom) + ~4.5 ms launch/graph/sync
+  gaps + ~4 ms of norms/get_rows/conv-state kernels.
+- The pre-project ROCm-vs-Vulkan decode gap was **~15%**; the fusion
+  campaign (C1 K/V dual-output mmvq, C6 Meta-wrapper removal at single
+  device, etc.) closed it to **~0.6%** by cutting kernel count - i.e. by
+  reducing the number of times the ~3.5 us launch tax is paid, not by
+  making any single kernel faster.
+- The C6 fix (skip the Meta(ROCm0) wrapper when n_devices==1, commit
+  469538e5b) alone recovered +1.4-1.8% by eliminating ~130 sub-graph
+  captures per token. C1 (fuse the 32 per-layer K/V projections) saved
+  only ~0.15 ms: those dispatches were ~9 us of real L2-bound work each,
+  not pure launch overhead - confirming the remaining gap is the ~3.5 us
+  per-launch tax on ~1290 kernels, not kernel speed.
+- The "persistent mega-kernel" idea (zero kernel boundaries, recovering
+  the full ~4.5 ms/token = ~10% decode) was scoped and parked as "a very
+  large project". That ~10% is the same headroom the fork's decode edges
+  (Q4_K_XL +11% over master) are now partially harvesting per-kernel.
+
+So the ~1% 1-card deficit measured in this suite is the *residual* of
+that campaign: ROCm kernel speed now exceeds Vulkan's, but the ~3.5 us x
+~1290-kernel launch tax still costs more than Vulkan's ~0.1 ms gap.
+
+#### Two-week swing: ROCm was ahead on Aug 13, Vulkan ahead again now
+
+On 2026-08-13 the fork's decode was at **parity or slightly ahead** of
+Vulkan (fused-matmuls final status: "within ~0.6%"; rocm-prefill-handoff:
+19.63 vs 19.49 t/s on Q8_0). Two weeks later this suite measures Vulkan
+~1% ahead on Q6_K decode. The llama.cpp code between the two builds is
+not the cause: only two Vulkan commits landed in the window (a warp-size
+clamp #27726 and a cross_entropy_loss impl #27216 - neither touches the
+decode hot path), and the only CUDA-side change (fc35562ba) is prefill-
+side MoE. The swing is therefore most plausibly the **RADV library**
+(Mesa 26.1.7 currently) finding a little extra dispatch/launch throughput
+- consistent with the user's observation that both implementations are
+approaching their code-side limits and the remaining gap is in library
+support. If AMD fixes the HIP launch path (the ~3.5 us x ~1290 kernels
+overhead), the fork's per-kernel advantage should put ROCm decisively
+ahead: the Q4_K_XL row already shows the direction.
+
 | | V vs A prefill (128K) | V vs A decode (128K) | B-bf16 vs V decode (128K) |
 |---|---|---|---|
 | 1-card Q6_K | +102% | +4.2% | -0.9% |
