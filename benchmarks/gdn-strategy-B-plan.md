@@ -245,5 +245,96 @@ barriers without touching the mmvq or the recurrent dependency.
 - Baseline: `gdn-decode-baseline.md`
 - Fusion feasibility + 42-vs-48: `gdn-fusion-analysis.md`
 - Precedent kernels: `ggml/src/ggml-cuda/gated_delta_net_chunked*.cu`
+  (`gated_delta_net_chunked.cu` 700 lines, `_bf16` 962 lines)
 - Fused-node plumbing: `src/llama-graph.{h,cpp}`,
   `ggml/src/ggml-cuda/ggml-cuda.cu` (GDN fused-cache entries)
+
+---
+
+# Appendix: Phase 0 reproduction (operational facts for resuming)
+
+This appendix captures the concrete commands, paths, and parsing method so
+Phase 0 can be resumed without re-deriving them. Verified 2026-08-28.
+
+## Environment (the physical box)
+- Machine: `soar`, 3x Radeon AI PRO R9700 (gfx1201, 34 GiB, ~640 MB/s), ROCm
+  7.14 (installed at `/opt/rocm-7.14-gfx1201`).
+- Build: `~/llama.cpp/build-rdna-boosts` @ `a265041b1` (block 10).
+- Model: `/llm/models/Qwen3.8/27B/Q6_K/Qwen3.8-27B-Q6_K.gguf` (22.9 GB).
+- Build binaries: `~/llama.cpp/build-rdna-boosts/bin/` (`llama-cli`,
+  `llama-bench`, `llama-gguf`).
+- HIP device mapping (rotates, verified): HIP 0 = physical GPU[1] = bus 06;
+  HIP 1 = GPU[2] = bus 09; HIP 2 = GPU[0] = bus 03. Use `HIP_VISIBLE_DEVICES=1`
+  for the single-card runs below.
+
+## Measure the exact GDN per-token dispatch count (Phase 0 target: 42 vs 48)
+
+### Step 1: rocprofv3 kernel trace
+```
+mkdir -p /tmp/rocprof-v2
+/opt/rocm-7.14-gfx1201/bin/rocprofv3 --kernel-trace --sys-trace false \
+  -o /tmp/rocprof-v2/k -d /tmp/rocprof-v2 -f csv -- \
+  ~/llama.cpp/build-rdna-boosts/bin/llama-cli --single-turn -fa 1 \
+  -m /llm/models/Qwen3.8/27B/Q6_K/Qwen3.8-27B-Q6_K.gguf \
+  -p "The quick brown fox jumps over the lazy dog and keeps running through the forest" \
+  -n 8 -ctk bf16 -ctv bf16 -b 1024 -ub 1024 -c 2048 --no-display-prompt
+```
+-> output `/tmp/rocprof-v2/k_kernel_trace.csv` (~7.4 MB, ~19163 dispatches).
+
+### Step 2: identify the decode window
+The chunked prefill GDN kernels (`gdn_bf16_scan_cuda`, `gdn_bf16_kkt_cuda<3>`)
+occupy dispatch indices ~0-10342; the sequential DECODE kernel
+`gated_delta_net_cuda<128,false,false>` starts at ~10399 and runs to ~19133.
+The 8 generation tokens = ~1498 dispatches. **Decode window: idx >= 10399.**
+
+### Step 3: count GDN calls per token
+```python
+import csv
+rows=list(csv.DictReader(open('/tmp/rocprof-v2/k_kernel_trace.csv')))
+gdn=[(i,r) for i,r in enumerate(rows) if 'gated_delta_net_cuda<128' in r['Kernel_Name']]
+print('total decode GDN:', len(gdn))          # 336
+print('per token:', len(gdn)/8)               # 42.0
+# per-call geometry (identical for all 42):
+print(gdn[0][1]['Grid_Size_X'], gdn[0][1]['Grid_Size_Y'], gdn[0][1]['Grid_Size_Z'])  # 1536 4 32
+# per-call duration (us): min/med/max; total
+import statistics
+durs=[(int(r['End_Timestamp'])-int(r['Start_Timestamp']))/1e3 for i,r in gdn if i>=10399]
+print('total ms:', sum(durs)/1e3, 'median us:', statistics.median(durs))
+```
+
+## Verified model geometry (GGUF metadata via `llama-gguf r`)
+```
+~/llama.cpp/build-rdna-boosts/bin/llama-gguf \
+  /llm/models/Qwen3.8/27B/Q6_K/Qwen3.8-27B-Q6_K.gguf r
+```
+Keys: `qwen35.block_count=65`, `qwen35.embedding_length=5120`,
+`qwen35.attention.head_count=24`, `head_count_kv=4`,
+`qwen35.ssm.conv_kernel=4`, `ssm.state_size(S_v)=128`,
+`ssm.group_count=16`, `ssm.time_step_rank=48`, `ssm.inner_size=6144`,
+`qwen35.full_attention_interval=4`, `nextn_predict_layers=1`.
+`n_embd_s = S_v*S_v*n_v_heads = 128*128*48 = 786432`.
+
+## Key source locations for Phase 1 (single-layer fused kernel)
+- SSM layer body: `src/models/qwen35.cpp` `build_ssm` (~line 340) and
+  `build_layer_attn_linear` (~line 339).
+- GDN op/launch: `src/models/delta-net-base.cpp` `build_recurrent_attn`
+  (~line 532) and `ggml/src/ggml-cuda/gated_delta_net.cu` (sequential decode
+  kernel; `launch_gated_delta_net` ~line 171; S_v case 128 ~line 211).
+- Fused-node plumbing: `src/llama-graph.h` `llm_graph_fused_node` (~line 886),
+  `add_fused_node` (~line 1440), `LLM_FUSED_OP_GDN_AR/CH` (~line 45).
+- Fused-cache backend: `ggml/src/ggml-cuda/ggml-cuda.cu` lines ~2836, ~3413,
+  ~3420 (`ggml_cuda_gated_delta_net_fused_cache`).
+- Recurrent state per-layer tensors: `src/llama-memory-recurrent.cpp` (~line 100,
+  `ggml_new_tensor_2d(ctx, type_s, n_embd_s, n_rows)` for `cache_s_l{il}`).
+
+## A/B toggle pattern to mimic
+The prefill chunked GDN uses env toggles `GGML_CUDA_GDN_CHUNKED` (=0 forces
+fallback) and `GGML_CUDA_GDN_CHUNKED_BF16` (=0 opts out of bf16/WMMA). New
+fused decode kernel should add a matching toggle (e.g.
+`GGML_CUDA_GDN_SSM_FUSED`) for A/B against the 42-kernel path.
+
+## Reclassification note (important)
+The /tmp/rocprof-v2 trace (`k_kernel_trace.csv`) is the ONLY profile that has
+been run. It is NOT committed (7.4 MB); regenerate it with the command above
+if re-running. The decode GDN count (42) and per-token numerology in the
+docs are all derived from it.
