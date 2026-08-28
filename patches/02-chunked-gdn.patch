@@ -2,20 +2,19 @@ From bd1434867a3a09f244fd3dfd03327328102de094 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 25 Aug 2026 18:32:37 -0500
 Subject: [PATCH 02/10] block 02: fused chunked gated-delta-net prefill kernel
-
 ---
- ggml/src/ggml-cuda/gated_delta_net.cu         |  28 +
- ggml/src/ggml-cuda/gated_delta_net_chunked.cu | 700 +++++++++++++
- .../src/ggml-cuda/gated_delta_net_chunked.cuh |  32 +
+ ggml/src/ggml-cuda/gated_delta_net.cu         |  40 +
+ ggml/src/ggml-cuda/gated_delta_net_chunked.cu | 702 +++++++++++++++
+ ggml/src/ggml-cuda/gated_delta_net_chunked.cuh |  48 +
  .../ggml-cuda/gated_delta_net_chunked_bf16.cu | 962 ++++++++++++++++++
  tests/test-backend-ops.cpp                    |  97 +-
- 5 files changed, 1814 insertions(+), 5 deletions(-)
+ 5 files changed, 1844 insertions(+), 5 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a724..e0abba7b7 100644
+index 1b431a724..1b7485fc6 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,4 +1,5 @@
@@ -24,7 +23,7 @@ index 1b431a724..e0abba7b7 100644
  #include "ggml-cuda/common.cuh"
  
  template <int S_v, bool KDA, bool keep_rs_t>
-@@ -286,6 +287,33 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -286,6 +287,45 @@ static void ggml_cuda_op_gated_delta_net_impl(
      const int K = ggml_get_op_params_i32(dst, 0);
      const bool keep_rs = K > 1;
  
@@ -34,6 +33,12 @@ index 1b431a724..e0abba7b7 100644
 +    // GGML_CUDA_GDN_CHUNKED=0 forces the sequential fallback (A/B perf comparison).
 +    // The fused GDN->cpy (cache != nullptr) is honoured for K == 1: the chunked kernel writes
 +    // its new state directly into the cache slot, so the cpy node can be skipped.
++    // The chunked ops report a synchronous launch rejection (ROCm: AQL dispatch refused, e.g. a
++    // code object carrying a hidden hostcall buffer on a platform without PCIe atomics ->
++    // hipErrorIllegalState, llama-cpp-rdna-boosts#2) and we recompute with the sequential
++    // kernel below instead of aborting -- a rejected launch has no side effects, so the
++    // fallback is bit-identical to running with GGML_CUDA_GDN_CHUNKED=0. An async fault inside
++    // a launched kernel is NOT caught here and still surfaces at the next sync point.
 +    if ((cache == nullptr || K == 1) && !kda && K == 1 && n_tokens > 1 &&
 +        (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
 +        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
@@ -46,12 +51,18 @@ index 1b431a724..e0abba7b7 100644
 +#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
 +            const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
 +            if (S_v == 128 && (envb == nullptr || strcmp(envb, "0") != 0)) {
-+                ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_d_ext);
-+                return;
-+            }
++                if (ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_d_ext)) {
++                    return;
++                }
++                GGML_LOG_WARN("%s: bf16 chunked GDN launch rejected by the driver; falling back to the sequential kernel (GGML_CUDA_GDN_CHUNKED=0 equivalent)\n", __func__);
++            } else
 +#endif
-+            ggml_cuda_op_gated_delta_net_chunked(ctx, dst, state_d_ext);
-+            return;
++            {
++                if (ggml_cuda_op_gated_delta_net_chunked(ctx, dst, state_d_ext)) {
++                    return;
++                }
++                GGML_LOG_WARN("%s: fp32 chunked GDN launch rejected by the driver; falling back to the sequential kernel (GGML_CUDA_GDN_CHUNKED=0 equivalent)\n", __func__);
++            }
 +        }
 +    }
 +
@@ -60,10 +71,10 @@ index 1b431a724..e0abba7b7 100644
      int64_t state_slot_stride = S_v * S_v * H * n_seqs;
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked.cu
 new file mode 100644
-index 000000000..36b8b14a3
+index 000000000..235522647
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked.cu
-@@ -0,0 +1,700 @@
+@@ -0,0 +1,702 @@
 +#include "gated_delta_net_chunked.cuh"
 +#include "gated_delta_net.cuh"
 +#include "ggml-cuda/common.cuh"
@@ -161,8 +172,6 @@ index 000000000..36b8b14a3
 +    float el[GDN_CHUNKED_CS];   // e^{g_last - gcs} (<= 1; 0 on padding)
 +    float bt[GDN_CHUNKED_CS];   // beta
 +};
-+
-+__device__ int gdn_dbg_f32 = 0;
 +
 +// ---------------------------------------------------------------------------------------------
 +// kkt_solve: gram once per (chunk, k-head, seq), A per v-head, KQ_gram per k-head.
@@ -270,10 +279,16 @@ index 000000000..36b8b14a3
 +        }
 +        __syncthreads();
 +
-+        // (I+L)x = e_col by back substitution, lane per column (unit upper: x[i]=0 for i>col)
++        // (I+L)x = e_col by back substitution, lane per column (unit upper: x[i]=0 for i>col).
++        // The substitution READS the original upper-triangular L out of s.A while the in-place
++        // column overwrites below replace s.A with the inverse. Without a barrier between the
++        // two phases this is a cross-warp data race: thread col reads s.A[i][j] (j > i) while
++        // thread j overwrites it, and the outcome depends on the driver's warp scheduler. Split
++        // the block in two with a full-block barrier so every thread finishes reading the
++        // original L before any thread stores its column (llama-cpp-rdna-boosts#2).
++        float x[GDN_CHUNKED_CS];
 +        if (tid < GDN_CHUNKED_CS) {
 +            const int col = tid;
-+            float x[GDN_CHUNKED_CS];
 +#pragma unroll
 +            for (int i = GDN_CHUNKED_CS - 1; i >= 0; --i) {
 +                float acc = 0.0f;
@@ -282,6 +297,10 @@ index 000000000..36b8b14a3
 +                    acc += s.A[i][j] * x[j];
 +                x[i] = ((i == col) ? 1.0f : 0.0f) - acc;
 +            }
++        }
++        __syncthreads();   // all threads' reads of the original s.A are complete
++        if (tid < GDN_CHUNKED_CS) {
++            const int col = tid;
 +#pragma unroll
 +            for (int i = 0; i < GDN_CHUNKED_CS; ++i)
 +                s.A[i][col] = x[i];
@@ -584,10 +603,6 @@ index 000000000..36b8b14a3
 +                *(float4 *) (obase + (int64_t) t * H * S_v + v0g + vv) =
 +                    make_float4(acc[0], acc[1], acc[2], acc[3]);
 +            }
-+            if (gdn_dbg_f32 != 0 && c == 0 && h == 0 && t == 0 && vv == 0 && tid == 0)
-+                printf("  fp32[DBG] o[0][0..3] = %f %f %f %f | KQ00=%f vnew[0]=%f %f | eg0=%f QS0=%f\n",
-+                       acc[0], acc[1], acc[2], acc[3], s.AK[0], s.UV[0][0], s.UV[0][1],
-+                       s.eg[0], s.QS[0][0]);
 +        }
 +
 +        // the o phase reads s.S (the chunk's INCOMING state) and s.UV; the state update below
@@ -658,7 +673,7 @@ index 000000000..36b8b14a3
 +// ---------------------------------------------------------------------------------------------
 +
 +template <int S_v>
-+static void launch_gdn_chunked(
++static bool launch_gdn_chunked(
 +        const float * q_d, const float * k_d, const float * v_d,
 +        const float * g_d, const float * b_d, const float * s_d,
 +        float * dst_d, float * state_d,
@@ -670,34 +685,32 @@ index 000000000..36b8b14a3
 +        float scale, int64_t state_seq_stride, cudaStream_t stream) {
 +    const int n_chunks = (int) ((n_tokens + GDN_CHUNKED_CS - 1) / GDN_CHUNKED_CS);
 +    const int64_t hg_ratio = H / H_k;
-+    if (getenv("GDN_DBG_F32") != nullptr) {
-+        const int one = 1;
-+        GGML_ASSERT(hipMemcpyToSymbol(gdn_dbg_f32, &one, sizeof(int), 0, hipMemcpyHostToDevice) == hipSuccess);
-+    }
 +
 +    if (getenv("GDN_DBG_SKIP_KKT") == nullptr) {
 +        dim3 grid((unsigned) n_chunks, (unsigned) H, (unsigned) n_seqs);
 +        const dim3 block(GDN_CHUNKED_NTHREADS);
 +        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
-+        ggml_cuda_kernel_launch(gdn_chunked_kkt_cuda<S_v>, launch_params,
-+            k_d, q_d, g_d, b_d, A_sc, KQ_sc, H_k, H, hg_ratio, n_tokens, n_seqs,
-+            sq1, sq2, sq3, scale);
++        if (!ggml_cuda_kernel_launch_try(gdn_chunked_kkt_cuda<S_v>, launch_params,
++                k_d, q_d, g_d, b_d, A_sc, KQ_sc, H_k, H, hg_ratio, n_tokens, n_seqs,
++                sq1, sq2, sq3, scale)) {
++            return false;
++        }
 +    }
-+    if (getenv("GDN_DBG_SKIP_SCAN") != nullptr) return;
++    if (getenv("GDN_DBG_SKIP_SCAN") != nullptr) return true;
 +    {
 +        dim3 grid((unsigned) (S_v / GDN_CHUNKED_VT), (unsigned) (H_k * hg_ratio), (unsigned) n_seqs);
 +        const dim3 block(GDN_CHUNKED_NTHREADS);
 +        const uint3 neqk1_magic = init_fastdiv_values(neqk1);
 +        const uint3 rq3_magic   = init_fastdiv_values(rq3);
 +        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
-+        ggml_cuda_kernel_launch(gdn_chunked_scan_cuda<S_v>, launch_params,
++        return ggml_cuda_kernel_launch_try(gdn_chunked_scan_cuda<S_v>, launch_params,
 +            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc, KQ_sc,
 +            H, H_k, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
 +            neqk1_magic, rq3_magic, scale, state_seq_stride);
 +    }
 +}
 +
-+void ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext) {
++bool ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext) {
 +    ggml_tensor * src_q     = dst->src[0];
 +    ggml_tensor * src_k     = dst->src[1];
 +    ggml_tensor * src_v     = dst->src[2];
@@ -751,25 +764,25 @@ index 000000000..36b8b14a3
 +    ggml_cuda_pool_alloc<float> KQ_sc(ctx.pool(), (size_t) n_chunks * neqk1 * n_seqs * PACKED_CS);
 +
 +    switch (S_v) {
-+        case 16:  launch_gdn_chunked<16 >(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(), KQ_sc.get(),
-+                    H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream); break;
-+        case 32:  launch_gdn_chunked<32 >(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(), KQ_sc.get(),
-+                    H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream); break;
-+        case 64:  launch_gdn_chunked<64 >(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(), KQ_sc.get(),
-+                    H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream); break;
-+        case 128: launch_gdn_chunked<128>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(), KQ_sc.get(),
-+                    H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream); break;
++        case 16:  return launch_gdn_chunked<16 >(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(), KQ_sc.get(),
++                    H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream);
++        case 32:  return launch_gdn_chunked<32 >(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(), KQ_sc.get(),
++                    H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream);
++        case 64:  return launch_gdn_chunked<64 >(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(), KQ_sc.get(),
++                    H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream);
++        case 128: return launch_gdn_chunked<128>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(), KQ_sc.get(),
++                    H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3, scale, state_seq_stride, stream);
 +        default:
 +            GGML_ABORT("fatal error");
-+            break;
++            return false;
 +    }
 +}
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh b/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
 new file mode 100644
-index 000000000..6eba8685c
+index 000000000..f09b00752
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,48 @@
 +// Fused chunked kernel for GGML_OP_GATED_DELTA_NET prefill (n_tokens > 1, K == 1, non-KDA).
 +//
 +// The chunked recurrence is sequential in the state, so it runs as TWO launches (see the .cu):
@@ -795,16 +808,32 @@ index 000000000..6eba8685c
 +#pragma once
 +#include "common.cuh"
 +
-+void ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr);
++// Non-aborting launch used by the chunked GDN ops. Returns false (and consumes the sticky
++// error) when the HSA/CUDA runtime rejects the dispatch SYNCHRONOUSLY -- e.g. ROCr refusing
++// an AQL dispatch whose code object carries a hidden hostcall buffer on platforms without
++// PCIe atomics (surfaces as hipErrorIllegalState at launch, llama-cpp-rdna-boosts#2). A
++// rejected launch has no side effects, so the caller can safely recompute the same op with
++// the sequential kernel instead of aborting. (An ASYNC fault inside a launched kernel is not
++// visible here and still surfaces at the next synchronization point.)
++template<typename Kernel, typename... Args>
++static __inline__ bool ggml_cuda_kernel_launch_try(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
++    kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
++    return cudaGetLastError() == cudaSuccess;
++}
++
++// Both chunked ops return true when their kernels were accepted for launch (or skipped by a
++// GDN_DBG_* env hook) and false when a launch was rejected; the dispatcher then falls back
++// to the sequential gated_delta_net kernel.
++bool ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr);
 +
 +// bf16/WMMA tensor-core variant (S_v == 128 only; near-lossless: PPL +0.056% / KL 0.0036 on
 +// wikitext-2 vs the fp32 path). DEFAULT for S_v == 128 on the HIP build (opt out with
 +// GGML_CUDA_GDN_CHUNKED_BF16=0); the fp32 chunked path stays the fallback and the
 +// bit-exact option.
-+void ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr);
++bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr);
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 new file mode 100644
-index 000000000..1066d7eaf
+index 000000000..af8b88e42
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 @@ -0,0 +1,962 @@
@@ -1647,7 +1676,7 @@ index 000000000..1066d7eaf
 +// ---------------------------------------------------------------------------------------------
 +
 +template <int HG_RATIO>
-+static void launch_gdn_bf16_kkt(
++static bool launch_gdn_bf16_kkt(
 +        const float * k_d, const float * g_d, const float * b_d, unsigned short * A_sc,
 +        int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
 +        int64_t sq1, int64_t sq2, int64_t sq3, cudaStream_t stream, int dbg) {
@@ -1655,11 +1684,11 @@ index 000000000..1066d7eaf
 +    const dim3 grid((unsigned) n_chunks, (unsigned) H_k, (unsigned) n_seqs);
 +    const dim3 block(GDN_BF16_KKT_NTHR);
 +    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
-+    ggml_cuda_kernel_launch(gdn_bf16_kkt_cuda<HG_RATIO>, launch_params,
++    return ggml_cuda_kernel_launch_try(gdn_bf16_kkt_cuda<HG_RATIO>, launch_params,
 +        k_d, g_d, b_d, A_sc, H, H_k, n_tokens, n_seqs, sq1, sq2, sq3, dbg);
 +}
 +
-+static void launch_gdn_bf16_scan(
++static bool launch_gdn_bf16_scan(
 +        const float * q_d, const float * k_d, const float * v_d,
 +        const float * g_d, const float * b_d, const float * s_d,
 +        float * dst_d, float * state_d, const unsigned short * A_sc,
@@ -1673,13 +1702,13 @@ index 000000000..1066d7eaf
 +    const uint3 neqk1_magic = init_fastdiv_values(neqk1);
 +    const uint3 rq3_magic   = init_fastdiv_values(rq3);
 +    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
-+    ggml_cuda_kernel_launch(gdn_bf16_scan_cuda, launch_params,
++    return ggml_cuda_kernel_launch_try(gdn_bf16_scan_cuda, launch_params,
 +        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc,
 +        H, H_k, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
 +        neqk1_magic, rq3_magic, scale, state_seq_stride, dbg);
 +}
 +
-+void ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext) {
++bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext) {
 +    ggml_tensor * src_q     = dst->src[0];
 +    ggml_tensor * src_k     = dst->src[1];
 +    ggml_tensor * src_v     = dst->src[2];
@@ -1736,12 +1765,12 @@ index 000000000..1066d7eaf
 +    const int64_t hg_ratio = H / neqk1;
 +    const int dbg = getenv("GDN_DBG_P") != nullptr ? 1 : (getenv("GDN_DBG_ONES") != nullptr ? 2 : 0);
 +    switch (hg_ratio) {
-+        case 1:  launch_gdn_bf16_kkt<1>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg); break;
-+        case 2:  launch_gdn_bf16_kkt<2>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg); break;
-+        case 3:  launch_gdn_bf16_kkt<3>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg); break;
-+        case 4:  launch_gdn_bf16_kkt<4>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg); break;
-+        case 6:  launch_gdn_bf16_kkt<6>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg); break;
-+        case 8:  launch_gdn_bf16_kkt<8>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg); break;
++        case 1:  if (!launch_gdn_bf16_kkt<1>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 2:  if (!launch_gdn_bf16_kkt<2>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 3:  if (!launch_gdn_bf16_kkt<3>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 4:  if (!launch_gdn_bf16_kkt<4>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 6:  if (!launch_gdn_bf16_kkt<6>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
++        case 8:  if (!launch_gdn_bf16_kkt<8>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
 +        default: GGML_ABORT("gated_delta_net_chunked_bf16: unsupported GQA ratio");
 +    }
 +    if (getenv("GDN_DBG_A") != nullptr) {
@@ -1764,7 +1793,7 @@ index 000000000..1066d7eaf
 +                           (long long) cc, (long long) hh, at(0, 0), at(1, 0), at(1, 1), at(63, 63));
 +            }
 +    }
-+    launch_gdn_bf16_scan(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(),
++    return launch_gdn_bf16_scan(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(),
 +        H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, neqk1, rq3,
 +        scale, state_seq_stride, stream, dbg);
 +}
@@ -1904,4 +1933,3 @@ index 99014df09..60ed6606f 100644
          for (int bs : { 1, 512, 2048 }) {
 -- 
 2.55.0
-

@@ -32,6 +32,19 @@ re-based for the `common_speculative_impl` n_max drift, blocks 02-12 are
 unchanged - see BASELINE.md. Older branches: `baseline/192067b72`,
 `baseline/d222767c7`, `baseline/758443071`)
 
+## Validation record (2026-08-28, ROCm 7.14, gfx1201) - issue #2 fix
+
+All 11 patches applied zero-fuzz to master at `fe235f434`; the applied tree
+is byte-identical to the `rdna-boosts` branch (`a937dbe8`). Block 02 was
+regenerated to carry the issue-#2 fix (device-printf/hostcall removal, kkt
+back-substitution barrier, and a sequential-kernel fallback when the driver
+rejects the chunked dispatch synchronously - see the commit message).
+Model-level sanity on Qwen3.5-4B-Q8_0, wikitext-2 test, 32 chunks x 2048:
+PPL 8.6017 (default bf16 chunked) / 8.5989 (fp32 chunked) / 8.5972
+(sequential) - the bf16 delta (+0.05%) matches the documented +0.056%.
+Gated-delta-net 46/46 in all three dispatch configs; full test-backend-ops
+14887/14887 on ROCm0/1/2; test-speculative-adaptive and test-arg-parser OK.
+
 ## Validation record (2026-08-27, ROCm 7.14, gfx1201) - drift fix
 
 All 10 patches applied zero-fuzz to master at `fe235f434`
