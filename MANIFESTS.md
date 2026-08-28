@@ -81,6 +81,7 @@ debugging the bf16 GDN kernel, deterministically fails `rms_norm_back` /
 | 08 | `08-fused-core.patch` | mmvq.{cu,cuh}, ggml-cuda.cu (try_fuse), norm.{cu,cuh}, unary.{cu,cuh}, common.cuh, fattn.cu, fattn-tile.cuh | **blocks 03 and 04 MUST be applied first** (fattn-tile.cuh / fattn.cu territory) |
 | 09 | `09-meta-headroom.patch` | ggml/src/ggml-backend-meta.cpp | none (independent; apply last) |
 | 10 | `10-k-quant-boosts.patch` | ggml/src/ggml-cuda/{ggml-cuda.cu,mmq-vec-dot.cuh,mmvq.cu,vecdotq.cuh}, tests/test-backend-ops.cpp | none (apply last; omit for greedy purity) |
+| 11 | `11-cuda-prefill-graph-skip.patch` | ggml/src/ggml-cuda/ggml-cuda.cu | none (independent; apply last) |
 
 Block numbers are the apply order: `01` is the smallest number and applies
 first, `10` last. All blocks are mutually independent except **block 08
@@ -111,6 +112,7 @@ blocks 03+04 in the tree, so it sits at position 08:
 | 8 | `block/08-fused-core` | `08-fused-core.patch` |
 | 9 | `block/09-meta-headroom` | `09-meta-headroom.patch` |
 | 10 | `block/10-k-quant-boosts` | `10-k-quant-boosts.patch` |
+| 11 | `block/11-cuda-prefill-graph-skip` | `11-cuda-prefill-graph-skip.patch` |
 
 `block/09-meta-headroom` fixes the meta-buffer compute-container headroom
 (16x -> 128x) for hybrid recurrent models: the GDN/SSM conv-state snapshot
@@ -167,6 +169,7 @@ git cherry-pick block/08-fused-core     # after blocks 03+04
 ...
 git cherry-pick block/09-meta-headroom
 git cherry-pick block/10-k-quant-boosts   # omit for greedy purity
+git cherry-pick block/11-cuda-prefill-graph-skip
 ```
 
 Cherry-pick uses 3-way merge, so each block degrades gracefully when upstream
@@ -190,6 +193,7 @@ git apply patches/07-meta-device-wrapper-skip.patch
 git apply patches/08-fused-core.patch
 git apply patches/09-meta-headroom.patch
 git apply patches/10-k-quant-boosts.patch   # omit for greedy purity
+git apply patches/11-cuda-prefill-graph-skip.patch
 ```
 
 applies with zero fuzz and, after the block-02 test-harness fix, passes the

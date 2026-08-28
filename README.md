@@ -36,13 +36,13 @@ below uses the current branch.
 ├── BASELINE.md            # pinned baseline SHA, per-patch provenance, drift policy
 ├── rdna-boosts-all.patch      # convenience: the entire net as ONE patch
 ├── patches/
-│   └── 01-adaptive-mtp.patch          … 09-meta-headroom.patch, 10-k-quant-boosts.patch
+│   └── 01-adaptive-mtp.patch          … 10-k-quant-boosts.patch, 11-cuda-prefill-graph-skip.patch
 └── scripts/
     ├── make-patches.sh    # regenerates all patches from the fork (needs the fork checkout)
     └── apply-all.sh       # applies in manifest order + runs the verification commands
 ```
 
-## The 10 blocks
+## The 11 blocks
 
 | patch | what | size |
 |-------|------|------|
@@ -56,6 +56,7 @@ below uses the current branch.
 | `08-fused-core.patch` | fused quantized-matmul kernels + graph fusions (SSM/MoE), GPU bit-identical decode | 16 commits, 1 diff |
 | `09-meta-headroom.patch` | meta-buffer compute-container headroom | 1 commit |
 | `10-k-quant-boosts.patch` | k-quant + mmvq-parameter umbrella: Q6_K VDR=2 (ex-block 09) + Q4_K/Q5_K/Q8_0 VDR=4 mmvq decode, RDNA3_5 gfx1151 param table (ex-block 06), mmq scale-load hoist, RDNA4 MoE mmid whitelist | combined |
+| `11-cuda-prefill-graph-skip.patch` | skip CUDA graphs for multi-token PRE-FILL graphs (varying ubatch makes capture pure overhead); decode keeps graph replay | 1 commit |
 
 Blocks are listed in apply order; `08-fused-core` needs blocks 03+04 in the
 tree (see MANIFESTS.md), `09` is a follow-up fix applied last, `10` is the
@@ -105,6 +106,7 @@ git apply ../rdna-boosts/patches/01-adaptive-mtp.patch
 git apply ../rdna-boosts/patches/08-fused-core.patch
 git apply ../rdna-boosts/patches/09-meta-headroom.patch
 git apply ../rdna-boosts/patches/10-k-quant-boosts.patch   # omit for greedy purity
+git apply ../rdna-boosts/patches/11-cuda-prefill-graph-skip.patch
 
 # 4. full verification
 cmake -B build -DGGML_HIP=ON -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ ...

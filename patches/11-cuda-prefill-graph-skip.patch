@@ -1,0 +1,65 @@
+From fc7fd905b407f21e745df76585e09ad8a18a284c Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Fri, 28 Aug 2026 13:52:37 -0500
+Subject: [PATCH 11/11] block 11: skip CUDA graphs for multi-token PRE-FILL
+ graphs
+
+The CUDA-graph re-capture during prefill is pure overhead. The graph key is
+cgraph->nodes[0] (a norm tensor) whose ne[1] = n_tokens. Prefill uses varying
+ubatch sizes (ne[1] = 512, 42, 26, 16, 4, 2), so EACH ubatch is a separate
+graph key: every one runs ggml_cuda_graph_update_required (a full per-node
+memcmp probe) and a never-amortized capture attempt, then executes directly.
+Decode uses ne[1]==1 (stable shape), replays, and benefits.
+
+Fix: skip the entire CUDA-graph path (including the update_required probe)
+when the graph key node[0].ne[1] > 1 (multi-token = prefill). Decode
+(ne[1]==1) keeps graph replay. This is a pure insertion - the existing decode
+graph logic is unchanged, only wrapped in an else.
+
+Measured (Qwen3.8-27B Q6_K, R9700 gfx1201, ROCm 7.14, single card):
+- prefill pp512: ~980 -> ~1046 t/s (+6.7%); graphs OFF was 1042 t/s.
+- decode tg128: 24.55 t/s (unchanged; graphs still help decode +1.2%).
+- generated tokens byte-identical to the no-graph path (no numeric drift).
+
+Upstream context: CUDA/HIP graphs capture kernels into a replayed graph.
+They amortize launch overhead only when the graph is stable (identical shapes
+every call = decode). Prefill's varying ubatch sizes defeat this, so attempting
+capture is pure cost. node[0].ne[1] cleanly distinguishes decode (==1) from
+multi-token prefill (>1).
+
+Assisted-by: pi
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 11 ++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 2068f3f36..6a3febfea 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4878,6 +4878,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     if (!op_timing && graph->is_enabled()) {
+         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+         if (graph_compatible) {
++            // PRE-FILL graphs (the graph key node[0].ne[1] > 1) use varying ubatch
++            // sizes, so each is a separate graph key and CUDA-graph capture never
++            // amortizes: the per-call update_required probe + failed capture is pure
++            // overhead. Measured pp512 is ~6.7% faster with graphs OFF. Only decode
++            // (ne[1]==1, stable shape) benefits from graph replay. Skip the whole
++            // graph path (incl. the update_required probe) for multi-token graphs.
++            if (cgraph->n_nodes > 0 && cgraph->nodes[0]->ne[1] > 1) {
++                use_cuda_graph = false;
++            } else {
+             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+ 
+             if (!graph->warmup_complete) {
+@@ -4900,6 +4909,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+                     cuda_graph_update_required = graph->instance == nullptr;
+                 }
+             }
++            } // else: not prefill
+         }
+     }
+ #endif // USE_CUDA_GRAPH
+-- 
+2.55.0
+

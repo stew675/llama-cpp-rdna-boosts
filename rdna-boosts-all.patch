@@ -3549,7 +3549,7 @@ index 000000000..1066d7eaf
 +
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 2456f7dcc..cc7841dc1 100644
+index 2456f7dcc..321cb930b 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -71,6 +71,7 @@
@@ -3617,12 +3617,12 @@ index 2456f7dcc..cc7841dc1 100644
      const int mode = ((const int32_t *) rope->op_params)[2];
 -    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
 +    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX && mode != GGML_ROPE_TYPE_IMROPE) {
-         return false;
-     }
- 
-     return true;
- }
- 
++        return false;
++    }
++
++    return true;
++}
++
 +static bool ggml_cuda_should_fuse_mul_q8_1(const ggml_tensor * mul,
 +                                           const ggml_tensor * mm) {
 +    if (mul->op != GGML_OP_MUL || (mm->op != GGML_OP_MUL_MAT && mm->op != GGML_OP_MUL_MAT_ID)) {
@@ -3654,12 +3654,12 @@ index 2456f7dcc..cc7841dc1 100644
 +        !ggml_is_contiguous(mul->src[0]) || !ggml_is_contiguous(mul->src[1]) ||
 +        !ggml_is_contiguous(mul) || mul->ne[0] % QK8_1 != 0 ||
 +        ggml_nelements(mul) != ggml_nelements(mm_src1)) {
-+        return false;
-+    }
-+
-+    return true;
-+}
-+
+         return false;
+     }
+ 
+     return true;
+ }
+ 
 +// If the MUL output feeds a single mmvq matmul (directly or via a no-op
 +// reshape at the next node), return that matmul; otherwise return nullptr.
 +static const ggml_tensor * ggml_cuda_find_mul_q8_1_matmul(const ggml_cgraph * cgraph,
@@ -4317,7 +4317,7 @@ index 2456f7dcc..cc7841dc1 100644
  }
  
  #ifdef USE_CUDA_GRAPH
-@@ -4249,17 +4838,23 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4249,19 +4838,34 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_set_device(cuda_ctx->device);
  
@@ -4341,7 +4341,26 @@ index 2456f7dcc..cc7841dc1 100644
 +    if (!op_timing && graph->is_enabled()) {
          const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
          if (graph_compatible) {
++            // PRE-FILL graphs (the graph key node[0].ne[1] > 1) use varying ubatch
++            // sizes, so each is a separate graph key and CUDA-graph capture never
++            // amortizes: the per-call update_required probe + failed capture is pure
++            // overhead. Measured pp512 is ~6.7% faster with graphs OFF. Only decode
++            // (ne[1]==1, stable shape) benefits from graph replay. Skip the whole
++            // graph path (incl. the update_required probe) for multi-token graphs.
++            if (cgraph->n_nodes > 0 && cgraph->nodes[0]->ne[1] > 1) {
++                use_cuda_graph = false;
++            } else {
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+ 
+             if (!graph->warmup_complete) {
+@@ -4284,6 +4888,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+                     cuda_graph_update_required = graph->instance == nullptr;
+                 }
+             }
++            } // else: not prefill
+         }
+     }
+ #endif // USE_CUDA_GRAPH
 diff --git a/ggml/src/ggml-cuda/mmq-vec-dot.cuh b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
 index d57343386..89708176c 100644
 --- a/ggml/src/ggml-cuda/mmq-vec-dot.cuh
