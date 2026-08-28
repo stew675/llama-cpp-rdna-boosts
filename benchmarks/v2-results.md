@@ -76,6 +76,17 @@ baseline approach.
 | 65536 | 886 / 31.82 | 881 / 22.70 | 1361 / 34.57 | 1350 / 34.59 | 1042 / 13.94 | 885 / 13.97 |
 | 131072 | 581 / 28.66 | 576 / 16.85 | 1021 / 30.85 | 1011 / 30.87 | 835 / 11.76 | 653 / 11.75 |
 
+## Graphs
+
+Full set (16 charts, split by KV type) in [graphs/README.md](graphs/README.md),
+regenerated from the raw JSON by `scripts/make-v2-graphs.py`. Each chart
+compares the three backends at one KV type (3 series, not 6):
+`![decode bf16 - 1 card Q6_K](graphs/v2-tg-1Q6-bf16.png)`
+
+![decode bf16 - 1 card Q6_K](graphs/v2-tg-1Q6-bf16.png)
+![decode bf16 - 3 cards Q8_0](graphs/v2-tg-3c-bf16.png)
+![decode f16 - 1 card Q4_K_XL](graphs/v2-tg-1Q4-f16.png)
+
 ## What the numbers say
 
 ### 1. Master ROCm BF16 = a depth-growing decode penalty, prefill unaffected
