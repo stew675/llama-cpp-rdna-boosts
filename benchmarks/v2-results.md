@@ -83,9 +83,9 @@ baseline approach.
 compares the three backends at one KV type (3 series, not 6); the legend
 under every axis is **red = master, amber = boosts, blue = vulkan**.
 
+![decode f16 - 1 card Q4_K_XL](graphs/v2-tg-1Q4-f16.png)
 ![decode bf16 - 1 card Q6_K](graphs/v2-tg-1Q6-bf16.png)
 ![decode bf16 - 3 cards Q8_0](graphs/v2-tg-3c-bf16.png)
-![decode f16 - 1 card Q4_K_XL](graphs/v2-tg-1Q4-f16.png)
 
 ## What the numbers say
 
