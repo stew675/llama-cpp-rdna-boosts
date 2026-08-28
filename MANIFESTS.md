@@ -45,6 +45,24 @@ PPL 8.6017 (default bf16 chunked) / 8.5989 (fp32 chunked) / 8.5972
 Gated-delta-net 46/46 in all three dispatch configs; full test-backend-ops
 14887/14887 on ROCm0/1/2; test-speculative-adaptive and test-arg-parser OK.
 
+## Validation record (2026-08-28, ROCm 7.14, gfx1100) - issue #1 build fix
+
+Block 02 regenerated again to carry the RDNA4-only guard for the bf16/WMMA
+chunked GDN kernel (issue #1: `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12`
+is a gfx12 intrinsic - building for RDNA3/RDNA3.5 (e.g. RX 7900 XTX,
+gfx1100) fails with "needs target feature wmma-128b-insts,wavefrontsize32").
+`gated_delta_net_chunked_bf16.cu` and its dispatch in `gated_delta_net.cu`
+are now gated on the codebase's `RDNA4` macro; on non-RDNA4 the fp32 chunked
+path is used (the documented default for non-gfx12 targets), so RDNA3 builds
+work and the bf16 tensor-core path activates automatically on RDNA4
+(gfx120x). Consumer validation on gfx1100: full 11-patch apply zero-fuzz,
+applied tree byte-identical to the validated rdna-boosts application;
+GATED_DELTA_NET 46/46 on ROCm0; greedy decode byte-identical across runs;
+wikitext-2 PPL 6.7295 +/- 0.046 (Qwen3.8-27B Q4_K_M, 36 chunks x 4096) -
+matches the pre-fix 6.7296, i.e. the guard changes nothing numerically on
+RDNA4 or RDNA3. This is the second intentional divergence of block 02 from
+the fork's `chunked-gdn` branch (the first is the test-harness seeding fix).
+
 ## Validation record (2026-08-27, ROCm 7.14, gfx1201) - drift fix
 
 All 10 patches applied zero-fuzz to master at `fe235f434`
@@ -85,7 +103,7 @@ debugging the bf16 GDN kernel, deterministically fails `rms_norm_back` /
 | # | patch | files | deps |
 |---|-------|-------|------|
 | 01 | `01-adaptive-mtp.patch` | common/arg.cpp, common/common.{h,cpp}, common/speculative.cpp, common/speculative-adaptive.h, tools/server/server-context.cpp, src/models/delta-net-base.cpp, tests/test-speculative-adaptive.cpp, tests/test-arg-parser.cpp, tests/CMakeLists.txt | none |
-| 02 | `02-chunked-gdn.patch` | ggml/src/ggml-cuda/gated_delta_net.cu, gated_delta_net_chunked.{cu,cuh}, gated_delta_net_chunked_bf16.cu, tests/test-backend-ops.cpp | none |
+| 02 | `02-chunked-gdn.patch` | ggml/src/ggml-cuda/gated_delta_net.cu, gated_delta_net_chunked.{cu,cuh}, gated_delta_net_chunked_bf16.cu (RDNA4-only, guarded on the `RDNA4` macro - issue #1), tests/test-backend-ops.cpp | none |
 | 03 | `03-bf16-kv-cache.patch` | fattn-tile.{cu,cuh}, fattn.cu, common.cuh, rope.cu, ggml-cuda.cu (IMRoPE fuse), tests/test-backend-ops.cpp | none |
 | 04 | `04-wmma-flash-attn.patch` | fattn-mma-f16.cuh, mmq-vec-dot.cuh, mmq.cuh, fattn.cu, ggml-cuda.cu (WMMA dispatch), tests/test-backend-ops.cpp | none |
 | 05 | `05-bit-identical-decode-cpu.patch` | ggml/src/ggml-cpu/llamafile/sgemm.cpp | none |

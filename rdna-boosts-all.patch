@@ -1793,7 +1793,7 @@ index ab7a3b297..63c9b5ccf 100644
              need_f16_K = true;
              need_f16_V = true;
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a724..1b7485fc6 100644
+index 1b431a724..a73ae216e 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,4 +1,5 @@
@@ -1827,7 +1827,7 @@ index 1b431a724..1b7485fc6 100644
 +            // 0.0036 on wikitext-2 vs the fp32 path; not bit-exact). Everything else keeps
 +            // the fp32 chunked path.
 +            float * state_d_ext = cache ? cache->data : nullptr;
-+#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
++#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__) && defined(RDNA4)
 +            const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
 +            if (S_v == 128 && (envb == nullptr || strcmp(envb, "0") != 0)) {
 +                if (ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_d_ext)) {
@@ -2612,14 +2612,17 @@ index 000000000..f09b00752
 +bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr);
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 new file mode 100644
-index 000000000..af8b88e42
+index 000000000..ec436c6ec
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
-@@ -0,0 +1,962 @@
-+#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
+@@ -0,0 +1,965 @@
++#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__) && defined(RDNA4)
 +
 +// ---------------------------------------------------------------------------------------------
 +// Fused chunked GGML_OP_GATED_DELTA_NET prefill on the gfx1201 bf16 WMMA units.
++// RDNA4-only: uses the gfx12 wmma_f32_16x16x16_bf16 intrinsic, which does not exist on
++// RDNA3/RDNA3.5 - this whole file compiles to nothing there and the dispatch in
++// gated_delta_net.cu falls back to the fp32 chunked path (GGML_CUDA_GDN_CHUNKED_BF16).
 +//
 +// This is the tensor-core half of the chunked-GDN lever: the SAME chunked algorithm as the
 +// fp32 path (gated_delta_net_chunked.cu), but every GEMM runs on the RDNA4 WMMA instruction
