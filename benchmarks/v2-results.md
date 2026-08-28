@@ -213,7 +213,35 @@ as +80-89% (2c) and +138-162% (3c).
 #### The launch-gap is measured, not inferred (fused-matmuls project, 2026-08-12)
 
 Prior profiling (rocprof, Q6_K @ d256, `fused-matmuls.md` experiment log)
-quantified the exact mechanism:
+quantified the exact mechanism. The per-token wall was 43.7 ms; the
+rocprof per-op decomposition is below.
+
+| op (per token, Q6_K @ d256, BF16 KV) | count | time | note |
+|---|---|---:|---|
+| `mul_mat_vec_q` (mmvq, weights) | 321 | 35.4 ms | **DRAM-bound, no headroom** (~645 GB/s ≈ card peak) |
+| `gated_delta_net_cuda` (SSM) | 49 | 1.19 ms | one per layer, the SSM core op |
+| `rms_norm_q8_1_f32<1024>` | 128 | 0.68 ms | fused norm+quantize already |
+| `k_get_rows_float(_vec)` | 49+50 | 0.41 ms | |
+| `mul_mat_vec_f` (F32 small matmuls) | 96 | 0.39 ms | includes the [5120×48] gates |
+| `unary_gated_op_kernel` (SWIGLU) | 51 | 0.35 ms | |
+| `rms_norm_f32<256>` | 82 | 0.33 ms | |
+| `k_bin_bcast` | 133 | 0.33 ms | |
+| `flash_attn_tile` + `flash_attn_ext` | 16-17 | 0.26 ms | |
+| `cpy_scalar` (conv_state_update) | 65 | 0.19 ms | |
+| `concat` (conv_input) | 49+48 | 0.19 ms | |
+| `ssm_conv_f32` + `ssm_conv_long_token` | | 0.13 ms | |
+| `l2_norm_pair_f32` | 49 | 0.12 ms | |
+| `quantize_q8_1` residual | 65 | 0.09 ms | the rest is folded |
+| `unary_op` / `unary_gated_q8_1` / misc | | 0.15 ms | |
+| **kernel work subtotal** | ~1290 | **~39.6 ms** | GPU busy |
+| **CPU launch + graph capture/replay + sync gap** | | **~4.1 ms** | the launch tax |
+| **wall total** | | **~43.7 ms** | = ~22.88 t/s |
+
+Read it as: **~84% of the wall is the mmvq weights stream** (DRAM-bound, no
+headroom). Of the remaining ~8.3 ms, ~4.1 ms is **pure launch/sync gap**
+behind ~1290 kernel dispatches (~3.5 µs each). That launch tax is what
+Vulkan's launcher avoids (~0.1 ms/token total), and it is what the fusion
+campaign attacked — by cutting kernel *count*, not making any kernel faster.
 
 - **Vulkan inter-kernel gap: ~0.1 ms/token total**; ROCm: **~4.5 ms/token
   (~3.5 us x ~1290 kernels)**. Decode wall was 43.7 ms/token: 35.4 ms

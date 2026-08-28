@@ -318,8 +318,8 @@ justified.
 GPUs, ctx, KV types, backend rocm|vulkan), waits for `/health`, runs the
 fixed llama-benchy command, saves JSON + md, and tears the server down.
 `scripts/run-benchy-suite.sh` drives the 16 ROCm rows;
-`scripts/run-benchy-vulkan-suite.sh` drives the 8 Vulkan rows. Both are
-described in [benchmarks/README.md](README.md).
+`scripts/run-benchy-vulkan-suite.sh` drives the 8 Vulkan rows. (Results and
+headline numbers: [v2-results.md](v2-results.md).)
 
 ## Validation of the harness (2026-08-27)
 

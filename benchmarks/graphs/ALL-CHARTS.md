@@ -22,19 +22,19 @@ hardcoded values).
 
 ---
 
-## 1 card — Q6_K (22.9 GB)
-
-| f16 | bf16 |
-|-----|------|
-| ![prefill f16](v2-pp-1Q6-f16.png) | ![prefill bf16](v2-pp-1Q6-bf16.png) |
-| ![decode f16](v2-tg-1Q6-f16.png) | ![decode bf16](v2-tg-1Q6-bf16.png) |
-
 ## 1 card — Q4_K_XL (17.6 GB)
 
 | f16 | bf16 |
 |-----|------|
 | ![prefill f16](v2-pp-1Q4-f16.png) | ![prefill bf16](v2-pp-1Q4-bf16.png) |
 | ![decode f16](v2-tg-1Q4-f16.png) | ![decode bf16](v2-tg-1Q4-bf16.png) |
+
+## 1 card — Q6_K (22.9 GB)
+
+| f16 | bf16 |
+|-----|------|
+| ![prefill f16](v2-pp-1Q6-f16.png) | ![prefill bf16](v2-pp-1Q6-bf16.png) |
+| ![decode f16](v2-tg-1Q6-f16.png) | ![decode bf16](v2-tg-1Q6-bf16.png) |
 
 ## 2 cards — Q8_0 (29 GB)
 
