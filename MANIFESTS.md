@@ -28,11 +28,11 @@ patch set. It is written for humans AND LLM coding agents. Follow it exactly;
 do not skip blocks.
 
 Branch: `main` points at the current checkpoint, currently
-`baseline/fe235f434` (current, recommended)
-Upstream range: `192067b72` .. `fe235f434` (7 commits; block 01 was
-re-based for the `common_speculative_impl` n_max drift, blocks 02-12 are
-unchanged - see BASELINE.md. Older branches: `baseline/192067b72`,
-`baseline/d222767c7`, `baseline/758443071`)
+`baseline/cc83d7b48` (current, recommended)
+Upstream range: `d7bd3bfca` .. `cc83d7b48` (4 commits; block 01 was
+re-based for the `common_speculative_impl` n_max drift at the previous
+checkpoint; blocks 02-12 unchanged. Older branches: `baseline/192067b72`,
+`baseline/d222767c7`, `baseline/758443071`; see BASELINE.md)
 
 ## Validation record (2026-08-28, ROCm 7.14, gfx1201) - gfx12/gfx11 segregation fix
 

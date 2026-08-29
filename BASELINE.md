@@ -1,24 +1,41 @@
 # BASELINE - provenance and drift policy
 
 Branch: `main` points at the current checkpoint, currently
-`baseline/fe235f434` (current, recommended)
-Upstream range: `192067b72` .. `fe235f434` (7 upstream commits, incl. the
-`common_speculative_impl` n_max parameter and new arg.cpp contexts)
+`baseline/cc83d7b48` (current, recommended)
+Upstream range: `d7bd3bfca` .. `cc83d7b48` (4 upstream commits: SYCL/Vulkan/
+metal/mul_mat_id-test only - none touch the block files)
 
-Older branches: `baseline/192067b72` (same patch files as `d222767c7`,
-zero-fuzz-validated at `192067b72`; superseded here because block 01 needed
-re-base for the `n_max` drift), `baseline/d222767c7` (12-block set,
-validated against `d222767c7`) and `baseline/758443071` (the original set
-for the older upstream range; see "Older branches" below).
+Older branches: `baseline/fe235f434` (the gfx12/gfx11 segregation baseline,
+validated on all three architectures - gfx1100, gfx1151, gfx1201),
+`baseline/192067b72` (same patch files as `d222767c7`,
+zero-fuzz-validated at `192067b72`; superseded by the block 01 re-base for
+the `n_max` drift), `baseline/d222767c7` (12-block set, validated against
+`d222767c7`) and `baseline/758443071` (the original set for the older
+upstream range; see "Older branches" below).
 
 ## Baseline
 
 All patches on this branch are generated against **llama.cpp upstream master
-at `fe235f434`** (block 01 regenerated from the fork's `adaptive-mtp` branch;
-blocks 02-12 carried forward unchanged from `d222767c7`, where they were
-validated by applying them, one at a time, to a fresh checkout of that SHA,
-building with ROCm 7.14 (gfx1201, GGML_HIP=ON, Release), and running the
-full test suite).
+at `d7bd3bfca`** (the gfx12/gfx11 segregation + gfx1151-ports unified set;
+blocks 01-11 as in `baseline/fe235f434`, validated on gfx1100, gfx1151 and
+gfx1201).
+
+### Checkpoint cut (2026-08-29): master `cc83d7b48` - cross-architecture consolidation bookend
+
+Master moved 4 commits past `d7bd3bfca` to `cc83d7b48` (sycl --fit
+improvement, vulkan fastdiv/duplicate cleanup, metal fa-vec tunings, vulkan
+mul_mat_id K-pad change + issue-27873 mul_mat_id test cases). None of the
+4 commits touch the block footprint except `tests/test-backend-ops.cpp`
+(the issue-27873 test additions in `make_test_cases_eval`, ~line 9367 -
+outside every block hunk). `scripts/apply-all.sh` applies all 11 patches
+**zero-fuzz to master `cc83d7b48`** (no 3-way fallback), and the applied
+tree is byte-identical to the validated `d7bd3bfca` tree for every block
+file except `fattn.cu` (the gfx1151-ports RDNA3_5 ternary, which is the
+current official block-04 content and is strictly RDNA3_5-gated) and
+`tests/test-backend-ops.cpp` (which carries exactly upstream's issue-27873
+addition). The 3-arch validation (gfx1100/gfx1151/gfx1201) recorded in
+MANIFESTS.md therefore carries over unchanged. Checkpoint:
+`baseline/cc83d7b48`.
 
 The same patch files apply **zero-fuzz to master at `192067b72`** (13
 upstream commits past `d222767c7`): `scripts/apply-all.sh` applied all 12
