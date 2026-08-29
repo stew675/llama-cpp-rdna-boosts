@@ -213,6 +213,57 @@ A/B matrix, same depth-16384 tg240 protocol (Q8_0, bf16 KV, tensor split):
 
 Prize if the dispatch wait is removed: ~34 t/s at depth-16384 (from 32.34).
 
+## Fused-stage experiment (session 8, 2026-08-29) — NEGATIVE, code REVERTED
+
+Attempted the "fuse phase-1 staging into the subgraph tail" design
+(handoff item 3, ~2-4% decode promised by removing the graph->AR dispatch
+premium on the late card).  Built and tested FOUR designs; ALL net-negative
+or broken.  Code fully REVERTED to the clean pre-fusion baseline (working
+tree == the wip patch state; `git status` shows the same 4 files as always).
+
+**MECHANISM PROVEN**: fusing the stage (shard->wire + arrival) into the
+captured graph as its last node ELIMINATES the one-sided wait: the decode
+spins collapsed from ~21/22 us (dev1/dev2) to ~2.4/2.4 us in the first
+compute-kernel variant (v1).  The wait is real and the fusion concept is
+sound.
+
+**PLATFORM CONSTRAINTS FOUND (the killer)**:
+1. `__threadfence_system()` inside a HIP graph replay costs ~50 us on RDNA4
+   (measured: no-copy stage = 53-63 us; the same fence outside the graph is
+   ~1-2 us).  The fence drains the graph's pending memory ops.  This alone
+   makes any compute-kernel in-graph GTT write + fence net-negative.
+2. The wire-before-arrival ordering requires the fence IN the kernel that
+   wrote the wire (thread-scoped fences; a later kernel's fence does NOT
+   order an earlier kernel's GTT writes — v3 split the copy/stage from the
+   arrival and produced SILENT CORRUPTION, caught by the llama-cli coherence
+   gate).
+3. Cross-device SDMA D2H memcpy nodes (v4: convert->memcpy wire->memcpy
+   arrival, the SDMA completion as the visibility barrier) hit capture /
+   ordering / multi-block-spin issues (page faults, deadlock from blocks
+   1-7 spinning on unwritten arrival slots, then corruption).  v4 also
+   needed per-device control buffers (cross-device D2H source faulted).
+
+**CAVEAT — measurements suspect**: the GPU wedge that forced the final
+reboot (KFD hang, rocm-smi "map::at" exception) may have been BUILDING
+during the fusion experiments (repeated aborts/deadlocks/faults).  The
+v1-v4 tg numbers (26-34 t/s) and the 50 us fence measurement may be
+contaminated by a degrading GPU state; the *structural* findings (fence
+cost direction, ordering requirement) are sound but the exact magnitudes
+need re-verification on a healthy machine if the thread is ever resumed.
+
+**To resume the investigation (if ever)**: re-run the fusion A/B on a
+healthy machine AFTER a fresh reboot; the cheapest next variant is the
+v4-SDMA with the 1-block fused reduce (the multi-block spin deadlock is
+fixed; the corruption + ordering remain unsolved).  Recommended gate:
+coherence (llama-cli same-seed) BEFORE any tg measurement, and monitor
+rocm-smi for the wedge (rocm-smi breaking = STOP).
+
+**Session 8 state**: GPUs wedged at session end; reboot required.  After
+reboot: verify `uname -r` = 7.1.10-200, pin = auto (unpinned — the
+known-good config), then ONE coherence + tg512 sanity check (expect ~41.6
+with the healthy baseline) before any further work.  All session-8 commits
+preserved; the fusion code is NOT in the tree.
+
 ## rocprof-mimic investigation (session 6 idea, from the user)
 
 Question: rocprofv3 tracing makes the one-sided AR wait disappear (pair
