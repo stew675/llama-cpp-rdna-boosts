@@ -22,14 +22,18 @@ at `192067b72`), `baseline/d222767c7` (validated against `d222767c7`) and
 
 
 All 12 patches are generated against **llama.cpp upstream master at
-`17252c769`**: blocks 01-11 = the fork's `rdna-boosts` branch commits
-`2b7a135cb..f6f8f6778` (exported with `git format-patch`); block 12 = the
-fork's working-tree delta vs `f6f8f6778` over four files
-(`allreduce-hip.cu` new, `allreduce.cu`, `allreduce.cuh`, `ggml-cuda.cu`),
-including the RDNA4-only gate. `scripts/make-patches.sh` regenerates both.
-Verified 2026-08-29: clean apply (`git am` 01-11 + `git apply` 12) on a
-fresh checkout at `17252c769`, full build clean, llama-cli same-seed
-coherence IDENTICAL to the fork build, tg64 38.12 / tg512 41.08.
+`17252c769`**: blocks 01-11 = the fork's `rdna-boosts` block commits
+(originally `2b7a135cb..f6f8f6778`, preserved on `old-rdna-boosts`; the
+current whitespace-clean regeneration is `3209e83b4..cc985ba9a`, tip
+`12d10267b` with block 12 committed); block 12 = the hybrid HIP all-reduce
+delta over four files (`allreduce-hip.cu` new, `allreduce.cu`,
+`allreduce.cuh`, `ggml-cuda.cu`), including the RDNA4-only gate.
+`scripts/make-patches.sh` regenerates both. Verified 2026-08-29: clean
+apply (`git am` 01-11 + `git apply` 12) on a fresh checkout at
+`17252c769`, full build clean, llama-cli same-seed coherence IDENTICAL to
+the fork build, tg64 38.12 / tg512 41.08 — and the apply is
+**whitespace-free** (zero git warnings) after the whitespace-clean
+regeneration of 2026-08-29.
 
 ## Two fixes vs the fork
 
@@ -67,13 +71,15 @@ validation:
 
 ## Per-block provenance
 
-The CURRENT delivery patches (0001-0011) are the fork's `rdna-boosts` branch
-commits `2b7a135cb..f6f8f6778` exported with `git format-patch` (one commit
-per block, `17252c769` as the base); block 12 is the fork's working-tree
-delta vs `f6f8f6778` (four files, RDNA4-gated). The ORIGINAL source commits
-on the fork branch `chunked-gdn` (the pre-consolidation lineage) and the old
-`baseline/*`-branch checkpoint history moved to
-`archive/docs/baseline-history.md`.
+The CURRENT delivery patches (0001-0011) are the fork's `rdna-boosts` block
+commits exported with `git format-patch` (one commit per block,
+`17252c769` as the base) — originally `2b7a135cb..f6f8f6778`, currently
+the whitespace-clean regeneration `3209e83b4..cc985ba9a` (tip `12d10267b`
+with block 12 committed; the original fork history is preserved on
+`old-rdna-boosts`). Block 12 is the hybrid HIP all-reduce delta over four
+files (RDNA4-gated). The ORIGINAL source commits on the fork branch
+`chunked-gdn` (the pre-consolidation lineage) and the old `baseline/*`-branch
+checkpoint history moved to `archive/docs/baseline-history.md`.
 
 ## Drift policy
 
@@ -86,8 +92,9 @@ to apply against a newer upstream master:
 3. Do NOT hand-edit the committed patches as the permanent fix: when more
    than one block needs manual re-base hunks, regenerate the whole set from
    the fork with `scripts/make-patches.sh` (which re-exports blocks 01-11
-   from `17252c769..f6f8f6778` and the block-12 working-tree delta), then
-   re-verify the clean-apply simulation (fresh worktree at the new fork
-   point, `scripts/apply-all.sh`, build, coherence) and update the fork
-   point + verification numbers in `patches/README.md` and `README.md`.
+   from `17252c769..<blocks-tip>` and the block-12 delta; defaults target
+the current clean blocks tip `cc985ba9a`), then re-verify the clean-apply
+simulation (fresh worktree at the new fork point, `scripts/apply-all.sh`,
+build, coherence) and update the fork point + verification numbers in
+`patches/README.md` and `README.md`.
 

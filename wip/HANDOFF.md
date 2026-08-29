@@ -18,7 +18,9 @@ Key orientation for that task:
   (fused-stage + pacing), preserved for a future ROCm re-evaluation.
 - `benchmarks/` = the benchy methodology + v2-results; MANIFESTS.md/BASELINE.md
   = the block manifests + baselines; GREEDY-PURITY.md = bit-identical decode.
-- The fork lives at `~/llama.cpp` (branch `rdna-boosts`, HEAD 155debcdc);
+- The fork lives at `~/llama.cpp` (branch `rdna-boosts`, rebuilt clean as
+  12 commits, tip `12d10267b`; historical fork on `old-rdna-boosts`,
+  HEAD 155debcdc);
   builds: `build-rocm-hybrid` (the hybrid, current); the server config at
   `~/.llama-server-config.yaml` now points rocmstew1/2/3 at the hybrid build.
 - Verified numbers (2026-08-29): 3-GPU hybrid depth-16384 38.71 t/s; tg512
@@ -57,10 +59,37 @@ WIP experiments (fused-stage, pacing) archived at `archive/work/fused-stage-paci
 
 ---
 
+## Session 9.6 — whitespace-clean regeneration: VERIFIED (2026-08-29)
+
+`apply-all.sh` on a clean master printed git whitespace warnings on every
+apply (8 trailing-whitespace lines — pure-whitespace blank lines in block
+02's two bf16 GDN files — plus one blank-at-EOF line in block 12's
+`allreduce.cuh`).  Cleaned at the SOURCE (no warning suppression): the
+fork's `rdna-boosts` block commits were rebuilt in place (each commit's
+diff re-applied with `git apply --whitespace=fix`, preserving messages and
+author dates) and the whole set re-generated with `scripts/make-patches.sh`
+(blocks tip `cc985ba9a`, block 12 committed as `12d10267b`).
+
+Verification:
+- Fresh `apply-all.sh` on a clean checkout at `17252c769`: **ZERO
+  whitespace warnings** (exit 0, clean log).
+- Applied tree byte-identical to the previous applied tree except the 8
+  whitespace lines + 1 EOF blank (all inert; no string-literal or
+  continuation content) — verified via tree-object diff.
+- `rdna-boosts-all.patch` (root convenience file) regenerated from the
+  clean range and re-checked (`git apply --check` on baseline): OK.  It
+  previously MISSED the block-12 kernel file `allreduce-hip.cu`.
+- Fork state: `~/llama.cpp` `rdna-boosts` = clean 12-commit branch (block
+  12 committed, tip `12d10267b`); old fork history preserved on
+  `old-rdna-boosts` (`155debcdc`).  Build/coherence re-run not needed:
+  tree equivalence proven at the git level (whitespace-only).
+
+---
+
 
 ## Where things stand
 
-- **Block 12 (hybrid all-reduce): DELIVERED** as `patches/12-hybrid-allreduce-hip.patch` (clean hybrid + RDNA4-only gate, WITHOUT the fused/pacing WIP). Clean-apply simulation VERIFIED (build + coherence + tg64 38.12 / tg512 41.08). Fork HEAD `155debcdc` (the gate commit), tree clean.
+- **Block 12 (hybrid all-reduce): DELIVERED** as `patches/12-hybrid-allreduce-hip.patch` (clean hybrid + RDNA4-only gate, WITHOUT the fused/pacing WIP). Clean-apply simulation VERIFIED (build + coherence + tg64 38.12 / tg512 41.08). The fork's `rdna-boosts` is now the whitespace-clean rebuilt branch, block 12 committed, tip `12d10267b` (see session 9.6); the historical fork HEAD `155debcdc` (the gate commit) is preserved on `old-rdna-boosts`.
 - **WIP experiments**: fused-stage + pacing archived at `archive/work/fused-stage-pacing/` (env-gated OFF by default; not part of the delivery).
 - **Server config**: `~/.llama-server-config.yaml` rocmstew1/2/3 now point at the hybrid build (`~/llama.cpp/build-rocm-hybrid`). Recommended deployment: 3-GPU (`HIP_VISIBLE_DEVICES=0,1,2`), hybrid default, UNPINNED (the pin is a regression).
 

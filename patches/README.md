@@ -29,6 +29,9 @@ git apply patches/12-hybrid-allreduce-hip.patch
 (`git am` for the 1-11 series — plain `git apply` of the concatenated series
 was observed to silently drop hunks; use `git am`.)
 
+The set is **whitespace-clean**: applying produces no git whitespace
+warnings (verified 2026-08-29 after the whitespace-clean regeneration).
+
 ## Block 12 notes
 
 - **RDNA4-only gate**: the internal all-reduce refuses to init on any

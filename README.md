@@ -16,6 +16,11 @@ and commits each block.
 - **Set:** 12 patches in `patches/` (`0001`-`0011` + `12-hybrid-allreduce-hip.patch`).
 - **Verified:** clean apply + full build + llama-cli same-seed coherence
   IDENTICAL to the fork build; tg64 38.12 / tg512 41.08 on the sim build.
+- **Whitespace-clean apply:** the regenerated set applies with **zero git
+  whitespace warnings** (`git am` 01-11, `git apply` 12; verified
+  2026-08-29 on a fresh checkout at `17252c769`). The applied tree is
+  byte-identical to the previous set except 8 inert whitespace lines + 1
+  EOF blank line.
 - **Deployment:** 3-GPU hybrid (`HIP_VISIBLE_DEVICES=0,1,2`, unpinned) gives
   depth-16384 decode 38.71 t/s (+21.8% vs 2-GPU). See
   [`patches/README.md`](patches/README.md) for block-12 env knobs and the

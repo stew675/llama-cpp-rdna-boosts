@@ -1,4 +1,4 @@
-From 16f68a092e9bbd4567bd9db29d39c2a84301fc39 Mon Sep 17 00:00:00 2001
+From f80f206ad418e686e9e0756e9f37193463894929 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 02/11] rdna-boosts: block 02: fused chunked gated-delta-net
@@ -865,7 +865,7 @@ index 000000000..52e711c8a
 +bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr);
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 new file mode 100644
-index 000000000..1ac210572
+index 000000000..29facd203
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 @@ -0,0 +1,995 @@
@@ -1492,7 +1492,7 @@ index 000000000..1ac210572
 +                    O[i] = gdn_mma(b, aq, O[i]);                          // O^T: m = v
 +                    p[i] = gdn_mma(pknf(i, ko), aq, p[i]);                // P^T: m = j
 +                }
-+                
++
 +            }
 +            // group the k loop: per 2 steps ask for the reads against the previous WMMAs
 +#pragma unroll
@@ -1512,7 +1512,7 @@ index 000000000..1ac210572
 +            for (int i = 0; i < GDN_BF16_NTV; ++i)
 +#pragma unroll
 +                for (int e = 0; e < 8; ++e) O[i][e] *= g;
-+            
++
 +        }
 +
 +        float mxU = 0.0f;
@@ -1642,7 +1642,7 @@ index 000000000..1ac210572
 +                    *(float4 *) (q2 + 4) = make_float4(O[i][4], O[i][5], O[i][6], O[i][7]);
 +                }
 +            }
-+            
++
 +        }
 +
 +        // ---- S' = e^{g_last} * S + V''^T @ K  (V'' carries the direct e^{g_last-g_t} decay) --
@@ -1699,7 +1699,7 @@ index 000000000..1ac210572
 +        // its U/O reads of s.S this chunk
 +        SWRITE();
 +        GDN_BAR();                                                   // (4)
-+        
++
 +    }
 +
 +    // ---- write the final state: state[v][k] = S[k][v] ---------------------------------------
@@ -1866,7 +1866,7 @@ index 000000000..1ac210572
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 new file mode 100644
-index 000000000..e9d831153
+index 000000000..910c99594
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 @@ -0,0 +1,1011 @@
@@ -2521,7 +2521,7 @@ index 000000000..e9d831153
 +                    O[i] = gdn_mma(b, aq, O[i]);                          // O^T: m = v
 +                    p[i] = gdn_mma(pknf(i, ko), aq, p[i]);                // P^T: m = j
 +                }
-+                
++
 +            }
 +            // group the k loop: per 2 steps ask for the reads against the previous WMMAs
 +#pragma unroll
@@ -2541,7 +2541,7 @@ index 000000000..e9d831153
 +            for (int i = 0; i < GDN_BF16_NTV; ++i)
 +#pragma unroll
 +                for (int e = 0; e < 8; ++e) O[i][e] *= g;
-+            
++
 +        }
 +
 +        float mxU = 0.0f;
@@ -2662,7 +2662,7 @@ index 000000000..e9d831153
 +                for (int i = 0; i < GDN_BF16_NTV; ++i)
 +                    GDN_STORE_ACC8_F32(op, (ntb + i) * 16, &O[i]);
 +            }
-+            
++
 +        }
 +
 +        // ---- S' = e^{g_last} * S + V''^T @ K  (V'' carries the direct e^{g_last-g_t} decay) --
@@ -2716,7 +2716,7 @@ index 000000000..e9d831153
 +        // its U/O reads of s.S this chunk
 +        SWRITE();
 +        GDN_BAR();                                                   // (4)
-+        
++
 +    }
 +
 +    // ---- write the final state: state[v][k] = S[k][v] ---------------------------------------

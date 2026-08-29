@@ -20,9 +20,12 @@ llama.cpp checkout at the fork point **`17252c769`**.
   back to RCCL elsewhere). The fused-stage/pacing experiments it spawned are
   archived, env-gated OFF, in `archive/work/fused-stage-pacing/`.
 
-The repo is NOT the fork: the fork (source of truth for the block commits +
-the block-12 working-tree delta) lives at `~/llama.cpp`, branch
-`rdna-boosts`, HEAD `155debcdc`.
+The repo is NOT the fork: the fork (source of truth for the block commits)
+lives at `~/llama.cpp`, branch `rdna-boosts` — rebuilt 2026-08-29 as the
+**whitespace-clean** 12-commit branch (block 12 committed, tip
+`12d10267b`; blocks 01-11 tip `cc985ba9a`). The historical fork state
+(block commits `2b7a135cb..f6f8f6778` + the archived WIP commits, tip
+`155debcdc`) is preserved on the `old-rdna-boosts` branch.
 
 ## Layout
 
@@ -59,6 +62,10 @@ the block-12 working-tree delta) lives at `~/llama.cpp`, branch
 - **The pin regressed** (session 7): `~/bin/high-power` (dpm=high +
   runtime-PM) costs tg -5-7% / pp -15-18% on RCCL/hybrid paths. Server runs
   UNPINNED, 3-GPU (`HIP_VISIBLE_DEVICES=0,1,2`), hybrid default.
+- **The set applies whitespace-clean**: `apply-all.sh` prints no git
+  whitespace warnings (the 8 inert trailing-whitespace lines + 1 EOF blank
+  line were removed at the source 2026-08-29 and the set regenerated;
+  trees are otherwise byte-identical — verified).
 - **Verified numbers (2026-08-29):** clean-apply build tg64 38.12 / tg512
   41.08; depth-16384 3-GPU hybrid 38.71 t/s (unpinned); 2-GPU (1,2) 31.79.
 - The one-sided AR wait (dev0/bus-06 dispatch-gap asymmetry, ~12.7 µs/call)
@@ -90,9 +97,11 @@ Diff the output against a known-good build (or against RCCL via
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `17252c769`,
-blocks tip `f6f8f6778`): `git format-patch` the block commits + the
-working-tree delta for the 12th. Then re-verify the clean-apply simulation
-(worktree at the fork point, apply-all, build, coherence) before committing.
+blocks tip `cc985ba9a`): `git format-patch` the block commits + the
+block-12 delta for the 12th (block 12 is committed as `12d10267b`; the
+script's `git diff <blocks-tip>` picks it up from the clean tree). Then
+re-verify the clean-apply simulation (worktree at the fork point,
+apply-all, build, coherence) before committing.
 
 ### Build the fork
 

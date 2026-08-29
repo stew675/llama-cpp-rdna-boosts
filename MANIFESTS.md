@@ -5,13 +5,16 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **12-patch set** against the fork point
-`17252c769`: blocks 01-11 (`patches/0001-…0011-…`, the format-patch of fork
-commits `2b7a135cb..f6f8f6778`) plus **block 12**
-(`patches/12-hybrid-allreduce-hip.patch`, the hybrid HIP all-reduce — a
-working-tree delta vs `f6f8f6778`, RDNA4-gated). Apply flow: `git am` for
-01-11 (plain `git apply` of the concatenated series SILENTLY DROPS HUNKS —
-verified 2026-08-29), `git apply` for the 12th; `scripts/apply-all.sh`
-automates it.
+`17252c769`: blocks 01-11 (`patches/0001-…0011-…`, format-patch of the
+fork's `rdna-boosts` block commits — the current whitespace-clean
+regeneration `3209e83b4..cc985ba9a`; the original fork hashes
+`2b7a135cb..f6f8f6778` are preserved on the `old-rdna-boosts` branch) plus
+**block 12** (`patches/12-hybrid-allreduce-hip.patch`, the hybrid HIP
+all-reduce — delta vs the block-11 tip, RDNA4-gated). Apply flow: `git am`
+for 01-11 (plain `git apply` of the concatenated series SILENTLY DROPS
+HUNKS — verified 2026-08-29), `git apply` for the 12th;
+`scripts/apply-all.sh` automates it. **The set is whitespace-clean** —
+applying produces zero git whitespace warnings (verified 2026-08-29).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -82,6 +85,24 @@ series directly — it silently drops hunks** (30 files / 2483 lines vs the
 correct 35 / 6094). The historical validation records below (14883/14883,
 GDN 46/46, etc.) are from the older 01-11 structure and remain the
 verification evidence for the block content, which is byte-unchanged.
+
+### Whitespace-clean regeneration (2026-08-29, follow-up)
+
+The previous patch files carried trailing-whitespace lines (8
+pure-whitespace blank lines in block 02's two bf16 GDN files + one
+blank-at-EOF line in block 12's `allreduce.cuh`), which made `git am` /
+`git apply` print whitespace warnings on every apply. Fixed at the source:
+the fork's `rdna-boosts` block commits were rebuilt in place (each
+commit's diff re-applied with `git apply --whitespace=fix`) and the whole
+12-patch set re-generated with `scripts/make-patches.sh` (block-12 tip
+`cc985ba9a`, block 12 now committed as `12d10267b`).
+
+Re-verified end-to-end 2026-08-29: `scripts/apply-all.sh` on a fresh
+checkout at `17252c769` runs with **ZERO whitespace warnings**; the
+applied tree is byte-identical to the previous applied tree except the 8
+whitespace lines and 1 EOF blank line (all inert — pure-whitespace blank
+lines, no string-literal or continuation content). No behavioral change:
+the validation records above still describe this set.
 
 
 ## Verification per block
