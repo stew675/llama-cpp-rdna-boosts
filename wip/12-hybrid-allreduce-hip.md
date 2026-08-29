@@ -261,3 +261,73 @@ internal path.
 
 - `GGML_CUDA_AR_SLEEP` (default 1): 1 = `__builtin_amdgcn_s_sleep(1)` poll;
   0 = old 16-iter dummy asm spin.
+
+---
+
+## Decode-path tuning exploration (session 4, 2026-08-29): n>=2 generalization + 3-GPU
+
+### The n>=2 generalization (now implemented, WIP)
+
+The chunked internal AR kernel was pairwise (n==2 only: init bailed, kernel
+had one `peer`).  The host machinery was already rank-general.  Generalized
+in `allreduce-hip.cu`:
+
+- **Contiguous host wire buffer**: `host_wire` = one mapped alloc of
+  `POOL * n_devices * buf_bytes`, indexed `(rank*POOL + slot) * BUF_ELEMS`
+  (was per-device `host_buf[i]`).  Arrival ring was already contiguous.
+- **Star gather kernel**: each rank writes its own wire slot, signals its own
+  arrival, spins for EVERY peer's token, then reads and accumulates every
+  peer's wire vector (n-1 additions, own contribution rounded through T_wire
+  for bit-identity across devices).  `GGML_CUDA_MAX_DEVICES`-sized register
+  array for peer vectors.
+- **CE path stays n==2** (copy_impl asserts); larger fanouts use the chunked
+  kernel (handles any size via chunking).  `GGML_CUDA_ALLREDUCE=internal`
+  with n>=3 is therefore correct but slow for big prefill tensors.
+- Init now accepts n in [2, GGML_CUDA_MAX_DEVICES]; the `GGML_ASSERT(n==2)`
+  in `ggml_cuda_ar_allreduce` and `ggml_backend_cuda_comm_allreduce_internal`
+  relaxed to n>=2.  `is_small` already had a 3-card tier (ne < 131072), so
+  the hybrid dispatch now routes 3-GPU decode tensors to internal.
+
+### CRITICAL BUG found & fixed (silent corruption)
+
+The n>=2 rewrite broke the phase-3 accumulate: the whole ELEMS_PER_VEC
+vector was summed into ONE accumulator and written to all vector lanes
+instead of per-element.  Result: each 4-float group replaced by its sum
+(cross-device CONSISTENT — the three GPUs agreed with each other, so the
+model didn't crash, it just produced wrong logits).  Token-level coherence
+check (llama-cli, same seed, temp 0) caught it: 2-GPU internal output
+diverged from RCCL and 3-GPU internal was garbage.  An isolated unit test
+(`wip/tools/ar_kernel_unit.cpp` — the kernel extracted from the .cu, n=2/3,
+F32/BF16 wire, verifies exact sums + cross-device bit-identity) reproduced
+it: got 1322.25 for expected 330.0.  Fixed by restructuring phase 3 to
+per-element accumulation with precomputed peer bases; unit test now PASSES
+all 4 (n, wire) combos; llama-cli outputs identical across 2-GPU internal,
+3-GPU internal, and 2-GPU RCCL.
+
+Lesson: benchmark speed (tg64) is NOT a correctness signal for the AR
+kernel — tg was unchanged by the corruption.  Coherence must be checked by
+output comparison or the unit test.  The unit test is now the gate.
+
+### 3-GPU results (the per-hop question)
+
+27B Q8_0, -n 64, r 2, internal path, all three cards (06/09/03):
+
+- **tg64 38.12 vs 33.21 (2-GPU) = +14.6% decode**; all 3 orderings
+  (0,1,2 / 2,0,1 / 1,2,0) give 37.9-38.4.
+- **Per-call AR cost 3-GPU ~35 us vs 2-GPU ~30 us** — only +5 us for the
+  extra peer.  NOT additive per hop.
+- **Wait structure: NOT per-hop chaining.**  Spin p50s by order:
+  (0,1,2)=06,09,03: dev1 24.7, dev2 24.0, dev0 4.8 (star on index 0);
+  (1,2,0)=09,03,06: dev1 21.9, dev0 6.2, dev2 6.6 (TWO devices late);
+  (2,0,1)=03,06,09: ladder 6.5/11.6/19.1.  The pattern is "one or two
+  devices arrive late, everyone waits for the slowest" — the same driver
+  dispatch-class wait as 2-GPU, not a per-hop accumulation.
+- **rocprof start-timestamps** (3-GPU): aligned per-call AR kernel starts
+  show agent-2 starting p50 +6.7 us after agent-1/3 (reduced but present
+  under tracing).  AR kernel DURATIONS: p50 16.4/22.0/25.2 us per agent
+  (spin included).
+- **NEW discovery — the base cost**: the no-spin AR kernel floor is
+  ~16-18 us/call (phase 1 + 3 host-staging + fences + launch), not
+  negligible: ~108 calls/token * ~18 us ≈ 2 ms/token even with perfect
+  sync.  This is a fresh tuning target (phase-1/3 costs, fence frequency,
+  write-combined host mapping).  Decomposing it is the next experiment.

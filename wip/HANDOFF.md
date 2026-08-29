@@ -29,7 +29,25 @@ HIP_VISIBLE_DEVICES=1,2 NCCL_PROXY_CPUSET=8,9,10,11,12,13,14,15 GGML_CUDA_DISABL
 | hybrid, pair 0,2 | 31.15-31.47 |
 | **hybrid, pair 1,2** | **32.34** (+2.8% vs 0,2) |
 
-Single-GPU all cards identical: 20.67/20.68/20.69. All PCIe 5.0 x4.
+No-depth (llama-bench tg64, r2): 2-GPU (1,2) 33.2; **3-GPU (any order)
+38.1** (+14.6% decode).  Single-GPU all cards identical: 20.67/20.68/20.69.
+All PCIe 5.0 x4.
+
+## Session 4 state (n>=2 generalization, 2026-08-29)
+
+- **Chunked internal AR now supports n in [2,8]** (star gather; contiguous
+  host_wire; CE path stays n==2).  New env knob carried: GGML_CUDA_AR_SLEEP.
+- **Fixed a silent-corruption bug in phase 3** (whole-vector accumulation)
+  that the n>=2 rewrite introduced — caught by llama-cli coherence check,
+  isolated by `wip/tools/ar_kernel_unit.cpp` (unit test of the extracted
+  kernel: n=2/3 x F32/BF16 wire, all PASS).  Coherence restored: 2-GPU
+  internal == 3-GPU internal == RCCL output.  tg was NEVER a correctness
+  signal for this bug.
+- **3-GPU answer to the per-hop question**: NOT per-hop.  Per-call AR cost
+  +5 us only (30 -> 35 us); the ~20-25 us wait is one/two devices arriving
+  late (driver dispatch class), not chaining.  tg64 3-GPU 38.1.
+- **NEW tuning target**: the no-spin AR kernel floor is ~16-18 us/call
+  (phase-1/3 host staging + fences).  Decompose next.
 
 ## Key findings (do not re-derive)
 
