@@ -331,3 +331,44 @@ output comparison or the unit test.  The unit test is now the gate.
   negligible: ~108 calls/token * ~18 us ≈ 2 ms/token even with perfect
   sync.  This is a fresh tuning target (phase-1/3 costs, fence frequency,
   write-combined host mapping).  Decomposing it is the next experiment.
+
+### Power-state investigation (session 5, 2026-08-29) — partially confirmed
+
+Hypothesis (user): the one-sided lag is micro power-state sleeps.  Runtime
+probe + pin, no reboot:
+
+- **Idle state (observed)**: all three R9700s PCIe-runtime-SUSPENDED,
+  sclk state `S` (0 MHz), mclk 96 MHz, 13-19 W package power.
+- **Pin applied** (`dpm_level=high` + `power/control=on`, all cards): lag
+  dropped dev1 24.9->18.0, dev2 22.2->16.9 us (dev0 4.4); idle power
+  42-52 W; mclk locked 1258 MHz.  ~7 us of the lag was power-state cost.
+- **COMPUTE power profile (index 5)**: crashes decode silently mid-run
+  (twice) — dead end on RDNA4 (and the user saw cards at ~half power /
+  130-140 W in that state; reverted to BOOTUP_DEFAULT, stable again).
+- **Manual sclk lock** (`manual` + pp_dpm_sclk write): accepted but the `S`
+  state still reports current (RDNA4 ignores the override); destabilized
+  the cards.  Dead end.
+- **During decode the cards run 2290-2350 MHz / 95-100% busy the whole
+  time** — no macro idle; the remaining lag is not clock-ramp at that
+  timescale.
+
+### Phase-1 decomposition (the 12-17 us remainder is DISPATCH, not power)
+
+Added kernel-entry clock64 markers (same-GPU counter, valid):
+
+- phase1(entry->signal) p50: dev0 4.5, dev1 4.6, dev2 4.6 us — SYMMETRIC.
+  (Prefill ne=81920: ~16 us on all three — bigger staging, still symmetric.)
+- spin p50: dev0 4.5, dev1 17.0, dev2 15.5 — one-sided wait persists.
+- Signal visibility is fast (isolated bench: 1.4-4.8 us).
+- => dev0's AR kernel STARTS ~10-12 us late relative to peers; the delay is
+  pre-kernel (driver dispatch), NOT the data path, NOT phase-1, NOT power
+  (cards at 2350 MHz during decode).  Cross-device clock64 deltas are
+  meaningless (per-GPU counters, arbitrary offsets) — measured, discarded.
+
+### Open: the final ~12 us
+
+If `high` doesn't fully disable the RDNA4 `S` state (we saw `S*` even
+pinned), the remaining dispatch delay could still be S-exit.  The decisive
+reboot-level test is `amdgpu.dpm=0` on the kernel cmdline.  If it stays,
+it's a KFD/ROCm dispatch behavior.  Stable metric for A/B now:
+`tg512` (llama-bench -n 512, r2) — 3-GPU pinned = 39.69 ± 0.41.

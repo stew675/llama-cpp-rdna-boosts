@@ -1,9 +1,9 @@
 diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
 new file mode 100644
-index 000000000..0c8f832d7
+index 000000000..44657502f
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/allreduce-hip.cu
-@@ -0,0 +1,1127 @@
+@@ -0,0 +1,1168 @@
 +#include "allreduce.cuh"
 +
 +#if defined(GGML_USE_HIP)
@@ -138,6 +138,7 @@ index 000000000..0c8f832d7
 +        int                         count,
 +        int                         token,
 +        int64_t *                   prof_spin,
++        int64_t *                   prof_start,  // WIP: clock64 at kernel entry (block 0); NULL disables
 +        bool                        use_sleep) {   // true: __builtin_amdgcn_s_sleep(1) poll; false: dummy asm spin
 +
 +    // Vector unit for the wire type, sized to the arch's widest single-instruction
@@ -154,6 +155,9 @@ index 000000000..0c8f832d7
 +    const int tid       = threadIdx.x;
 +    const int nt        = blockDim.x;
 +    const int bid       = blockIdx.x;
++    if (prof_start != nullptr && bid == 0 && tid == 0) {
++        prof_start[0] = (int64_t) clock64();
++    }
 +    const int gtid      = bid * nt + tid;
 +    const int gnt       = gridDim.x * nt;
 +    const int count_vec = count / ELEMS_PER_VEC;
@@ -381,6 +385,7 @@ index 000000000..0c8f832d7
 +    hipEvent_t               prof_t1[GGML_CUDA_AR_PROF_MAX];
 +    int64_t                  prof_ne[GGML_CUDA_AR_PROF_MAX];
 +    int64_t *                prof_spin[GGML_CUDA_MAX_DEVICES]; // dev mem: [PROF_MAX][2] clock64 (start,end)
++    int64_t *                prof_start[GGML_CUDA_MAX_DEVICES]; // dev mem: [PROF_MAX] clock64 at kernel entry
 +    size_t                   prof_n;
 +    // --- end WIP instrumentation -----------------------------------------
 +
@@ -503,8 +508,10 @@ index 000000000..0c8f832d7
 +        for (size_t i = 0; i < n_devices; ++i) {
 +            ggml_cuda_set_device(p->devices[i]);
 +            if (hipMalloc(reinterpret_cast<void **>(&p->prof_spin[i]),
-+                          GGML_CUDA_AR_PROF_MAX * 2 * sizeof(int64_t)) != hipSuccess) {
-+                GGML_LOG_ERROR("%s: prof_spin alloc failed for device %d\n", __func__, p->devices[i]);
++                          GGML_CUDA_AR_PROF_MAX * 2 * sizeof(int64_t)) != hipSuccess ||
++                hipMalloc(reinterpret_cast<void **>(&p->prof_start[i]),
++                          GGML_CUDA_AR_PROF_MAX * sizeof(int64_t)) != hipSuccess) {
++                GGML_LOG_ERROR("%s: prof alloc failed for device %d\n", __func__, p->devices[i]);
 +                ggml_cuda_ar_pipeline_free(p);
 +                return nullptr;
 +            }
@@ -686,12 +693,45 @@ index 000000000..0c8f832d7
 +                    sp_us.front(), pct(0.50), pct(0.90), pct(0.99), sp_us.back(), rate_khz);
 +            }
 +        }
++        // Phase-1 duration per device (kernel entry -> signal write), from the
++        // same-GPU clock64: spin_start - kernel_start.  Asymmetry here means
++        // the data path (stage writes + fence) is slower on one device; equal
++        // durations mean the arrival delay is pre-kernel (dispatch).
++        {
++            int rate_khz = 0;
++            ggml_cuda_set_device(p->devices[0]);
++            hipDeviceGetAttribute(&rate_khz, hipDeviceAttributeClockRate, p->devices[0]);
++            for (int dev = 0; dev < p->n_devices; ++dev) {
++                std::vector<int64_t> start(p->prof_n), spin(2 * p->prof_n);
++                ggml_cuda_set_device(p->devices[dev]);
++                hipMemcpy(start.data(), p->prof_start[dev], p->prof_n * sizeof(int64_t), hipMemcpyDeviceToHost);
++                hipMemcpy(spin.data(), p->prof_spin[dev], 2 * p->prof_n * sizeof(int64_t), hipMemcpyDeviceToHost);
++                std::vector<double> p1_us; p1_us.reserve(p->prof_n);
++                for (size_t i = 0; i < p->prof_n; ++i) {
++                    if (start[i] != 0 && spin[2*i] != 0 && spin[2*i] >= start[i]) {
++                        p1_us.push_back((double)(spin[2*i] - start[i]) * 1e3 / (double)rate_khz);
++                    }
++                }
++                if (!p1_us.empty()) {
++                    std::sort(p1_us.begin(), p1_us.end());
++                    auto pct = [&](double q) { return p1_us[(size_t)(q * (p1_us.size() - 1))]; };
++                    fprintf(stderr,
++                        "AR-PROFILE:   dev%d phase1(entry->signal): p25 %.1f p50 %.1f p75 %.1f "
++                        "(min %.1f max %.1f) us (clock %d kHz)\n",
++                        dev, pct(0.25), pct(0.50), pct(0.75), p1_us.front(), p1_us.back(), rate_khz);
++                }
++            }
++        }
 +    }
 +    // --- end WIP instrumentation -------------------------------------------
 +
 +    p->host_wire.free();
 +    for (int i = 0; i < p->n_devices; ++i) {
 +        p->host_large[i].free();
++        if (p->prof_start[i]) {
++            ggml_cuda_set_device(p->devices[i]);
++            hipFree(p->prof_start[i]);
++        }
 +        if (p->dev_tmp[i]) {
 +            ggml_cuda_set_device(p->devices[i]);
 +            hipFree(p->dev_tmp[i]);
@@ -1097,6 +1137,7 @@ index 000000000..0c8f832d7
 +                    static_cast<int>(chunk_elems), \
 +                    token, \
 +                    (prof_on) ? (p->prof_spin[i] + prof_idx * 2) : nullptr, \
++                    (prof_on) ? (p->prof_start[i] + prof_idx) : nullptr, \
 +                    p->use_sleep)
 +
 +                if (use_bf16) {

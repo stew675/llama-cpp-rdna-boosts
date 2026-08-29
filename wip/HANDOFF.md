@@ -48,6 +48,18 @@ All PCIe 5.0 x4.
   late (driver dispatch class), not chaining.  tg64 3-GPU 38.1.
 - **NEW tuning target**: the no-spin AR kernel floor is ~16-18 us/call
   (phase-1/3 host staging + fences).  Decompose next.
+- **Power-state verdict (session 5)**: real but partial.  Idle cards are
+  runtime-suspended at sclk S/0MHz/mclk 96MHz/13W.  Pinning (dpm=high +
+  runtime on) recovered ~7 us of the one-sided lag (25->18 us); cards run
+  2350MHz/99% busy through decode.  COMPUTE profile + manual sclk lock:
+  dead ends (crash / ignored).
+- **Phase-1 decomposition**: entry->signal is SYMMETRIC (4.5 us all
+  devices) => the remaining ~12 us one-sided wait is pre-kernel DISPATCH
+  (dev0's AR kernel starts late), not power, not data path.  Decisive
+  reboot test: `amdgpu.dpm=0` (S state persists even at high).  Stable
+  metric: tg512 = 39.69 ± 0.41 (3-GPU, pinned).
+- Server note: keep the pin (`~/bin/high-power` + runtime PM on) — ~7
+  us/call ≈ 2% decode, costs ~30 W/card idle.
 
 ## Key findings (do not re-derive)
 
