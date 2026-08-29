@@ -56,6 +56,35 @@ longer reproduces on their rig with the regenerated patches, no env-var
 workaround needed (the sequential fallback covers any residual
 machine-specific dispatch rejection).
 
+## Validation record (2026-08-28, ROCm 7.14, gfx1100) - gfx11 WMMA port + runtime dispatch fix
+
+Block 02 regenerated again: the bf16/WMMA chunked GDN kernel now has a
+RDNA3/RDNA3.5 (gfx11) first-gen WMMA path in addition to the RDNA4 (gfx12)
+path, and the dispatch was moved to a RUNTIME device-cc check. Two fixes
+beyond the earlier issue-#1 guard:
+
+1. **gfx11 port.** `gated_delta_net_chunked_bf16.cu` compiles for gfx11
+   (16 bf16/lane fragments; layouts probed on gfx1100, 256/256
+   reference-matmul validated: A/B = full row/col per lane, lanes 16-31
+   mirror; acc[lane][j] = C[2j + (lane>>4)][lane&15] interleaved rows).
+   gfx12 branches unchanged. GDN 46/46, greedy decode deterministic,
+   wikitext-2 PPL 6.7237 +/- 0.046 (vs 6.7295 fp32 chunked - near-lossless),
+   prefill +2-3% (pp2048 1026 vs 995 t/s; 35k 709.8 vs 697.2; 35k/ub2048
+   769.8 vs 750.7).
+2. **Runtime dispatch (corrects the earlier guard).** `RDNA3`/`RDNA4` are
+   DEVICE-PASS-only macros; the earlier compile-time `defined(RDNA4)` gate
+   on the HOST dispatch silently compiled the bf16 dispatch out on EVERY
+   build - including gfx1201, regressing the RDNA4 bf16 default to fp32
+   chunked. The dispatch now checks `GGML_CUDA_CC_IS_RDNA4/RDNA3` at
+   runtime. bf16 is the S_v == 128 default on RDNA3 AND RDNA4 (consistent
+   opt-OUT via `GGML_CUDA_GDN_CHUNKED_BF16=0`; near-lossless, not bit-exact).
+   Kernel definitions are not arch-gated (the host pass must see them to
+   emit the launch stubs); the per-arch #if sits inside each body.
+
+This supersedes the issue-#1 validation record below (the RDNA4-only guard
+it describes had the host-pass bug). Third intentional divergence of block
+02 from the fork's `chunked-gdn` branch.
+
 ## Validation record (2026-08-28, ROCm 7.14, gfx1100) - issue #1 build fix
 
 Block 02 regenerated again to carry the RDNA4-only guard for the bf16/WMMA
@@ -114,7 +143,7 @@ debugging the bf16 GDN kernel, deterministically fails `rms_norm_back` /
 | # | patch | files | deps |
 |---|-------|-------|------|
 | 01 | `01-adaptive-mtp.patch` | common/arg.cpp, common/common.{h,cpp}, common/speculative.cpp, common/speculative-adaptive.h, tools/server/server-context.cpp, src/models/delta-net-base.cpp, tests/test-speculative-adaptive.cpp, tests/test-arg-parser.cpp, tests/CMakeLists.txt | none |
-| 02 | `02-chunked-gdn.patch` | ggml/src/ggml-cuda/gated_delta_net.cu, gated_delta_net_chunked.{cu,cuh}, gated_delta_net_chunked_bf16.cu (RDNA4-only, guarded on the `RDNA4` macro - issue #1), tests/test-backend-ops.cpp | none |
+| 02 | `02-chunked-gdn.patch` | ggml/src/ggml-cuda/gated_delta_net.cu, gated_delta_net_chunked.{cu,cuh}, gated_delta_net_chunked_bf16.cu (bf16/WMMA path: RDNA4 gfx12 + RDNA3/RDNA3.5 gfx11 first-gen WMMA; runtime-cc dispatch, issue #1), tests/test-backend-ops.cpp | none |
 | 03 | `03-bf16-kv-cache.patch` | fattn-tile.{cu,cuh}, fattn.cu, common.cuh, rope.cu, ggml-cuda.cu (IMRoPE fuse), tests/test-backend-ops.cpp | none |
 | 04 | `04-wmma-flash-attn.patch` | fattn-mma-f16.cuh, mmq-vec-dot.cuh, mmq.cuh, fattn.cu, ggml-cuda.cu (WMMA dispatch), tests/test-backend-ops.cpp | none |
 | 05 | `05-bit-identical-decode-cpu.patch` | ggml/src/ggml-cpu/llamafile/sgemm.cpp | none |

@@ -47,7 +47,7 @@ below uses the current branch.
 | patch | what | size |
 |-------|------|------|
 | `01-adaptive-mtp.patch` | adaptive speculative draft depth for MTP (`--draft-mtp-adaptive`) | 5 commits |
-| `02-chunked-gdn.patch` | fused chunked gated-delta-net prefill kernel (fp32 + bf16/WMMA tensor-core as S_v=128 default; bf16/WMMA path gated on RDNA4 - fixes issue #1 build error on RDNA3/RDNA3.5; launch-rejection fallback + kkt barrier - fixes issue #2) | 13 commits + 2 consumer-side fixes |
+| `02-chunked-gdn.patch` | fused chunked gated-delta-net prefill kernel (fp32 + bf16/WMMA tensor-core as S_v=128 default on RDNA4 gfx12 AND RDNA3/3.5 gfx11; runtime-cc dispatch - fixes issue #1 build error and the host-pass gate regression; launch-rejection fallback + kkt barrier - fixes issue #2) | 13 commits + 3 consumer-side fixes |
 | `03-bf16-kv-cache.patch` | native-BF16 flash-attn tile kernel, BF16 KV cache, IMRoPE + set-rows fusion | 8 commits |
 | `04-wmma-flash-attn.patch` | RDNA4 WMMA flash-attention path; Q6_K mmq prefill tuning | 1 commit |
 | `05-bit-identical-decode-cpu.patch` | bit-identical CPU decode / speculative-verify batches | 1 commit |
