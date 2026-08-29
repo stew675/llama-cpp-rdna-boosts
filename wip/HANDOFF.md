@@ -104,8 +104,15 @@ rocprofv3 -d /tmp/rocprof-out -r -- <cmd>   # then query the sqlite kernels tabl
    host-side lockstep pacing (wait for peer's prev-1 AR event before
    enqueueing).  Both mimic rocprof's pacing; measure the stagger collapse
    vs the added overhead.
-4. Decisive reboot test: `amdgpu.dpm=0` (RDNA4 `S` state survives `high`;
-   if the remaining ~12 us collapses, S-exit was the whole story).
+4. Decisive reboot test: `amdgpu.dpm=0` — **DONE, FAILED (session 7)**: on
+   this kernel (7.1.10-200.fc44) + RDNA4 (gfx1201), amdgpu refuses to init
+   ALL three R9700s (1002:7551) with dpm=0 — only the iGPU (1002:13c0,
+   gfx1036) gets a drm/KFD node.  No drm card, no KFD node, no driver
+   binding for the discrete cards.  Option C is CLOSED: dpm=0 is
+   incompatible with RDNA4 SMU init.  Reverted via /etc/kernel/cmdline
+   (removed `amdgpu.dpm=0`; kept iommu=off, processor.max_cstate=2,
+   pcie_aspm=off, ppfeaturemask).  The `S`-state question stays open;
+   dpm=high pin remains the practical answer.
 5. Base-cost decomposition (phase-1 fence cost, write-combined host
    mapping, kernel blocks) — the ~16 us no-spin floor is ~2 ms/token at
    108 calls/token even with perfect sync.
