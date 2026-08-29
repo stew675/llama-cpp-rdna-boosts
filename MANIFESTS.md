@@ -205,7 +205,10 @@ position 8, just before block 09.
 The repo also carries lightweight tags `block/01-… block/11-…`, each pointing
 at a squashed commit whose diff-vs-parent is exactly that block's change (the
 commits are stacked in apply order, rooted at an orphan commit whose tree is
-the upstream baseline `fe235f434`). The tags track the CURRENT baseline
+the upstream baseline `d7bd3bfca` **patch footprint only** - just the files
+the patches touch, deliberately NOT a full llama.cpp snapshot, so the lineage
+stays ~2.5 MiB instead of dragging in every upstream source file and the
+`models/*.gguf` tokenizer test fixtures). The tags track the CURRENT baseline
 branch; they are force-moved whenever a new validated baseline is cut.
 
 **Tags are numbered by APPLY order** and so are the patch filenames and the

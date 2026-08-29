@@ -123,7 +123,9 @@ cmake --build build -j
 ### Git-native alternative: block tags
 
 The repo also carries `block/01-… block/11-…` tags - one squashed
-commit per block, stacked in apply order.
+commit per block, stacked in apply order. The lineage root is the upstream
+baseline's **patch footprint only** (the files the patches touch, not a full
+llama.cpp snapshot - keeps the tags ~2.5 MiB and the pushes small).
 Block numbers are the apply order everywhere (patch filenames, tag names,
 block labels in the git history): `01` applies first, `11` last. The fused
 core needs blocks 03+04 in the tree, so it sits at position 08. Each tag's

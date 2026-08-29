@@ -180,27 +180,45 @@ echo "== rdna-boosts-all.patch"
   git diff "$BASELINE" > "$REPO_DIR/rdna-boosts-all.patch" )
 
 # ---- block stacking tags (optional git-native path) ----
-# Build a side lineage in THIS repo: root commit = upstream baseline tree,
-# then one commit per block applied in manifest apply order. Each commit's
-# diff vs its parent is exactly that block's change, so cherry-picking a tag
-# applies just that block (with 3-way merge). Tags are numbered by APPLY
-# order: block 08 (fused core) is applied at position 8 and block 11 last - the number
-# encodes the sequence, unlike the patch filenames which are plan topic IDs.
+# Build a side lineage in THIS repo: root commit = the upstream baseline's PATCH
+# FOOTPRINT ONLY (the union of files the block patches touch), then one commit
+# per block applied in manifest apply order. Each commit's diff vs its parent is
+# exactly that block's change, so cherry-picking a tag applies just that block
+# (with 3-way merge). Tags are numbered by APPLY order: block 08 (fused core)
+# is applied at position 8 and block 11 last - the number encodes the sequence,
+# unlike the patch filenames which are plan topic IDs.
 # Tags are derived artifacts: force-moved on every regeneration.
+#
+# FOOTPRINT-ONLY: the lineage deliberately does NOT snapshot the whole
+# llama.cpp tree. A full-tree snapshot drags in every upstream source file and
+# the models/*.gguf tokenizer test fixtures (~160 MiB per tag tree, pushing
+# hundreds of MiB of unrelated blobs to the remote). Cherry-pick only needs the
+# diff between consecutive commits, so the baseline commit contains just the
+# files the patches touch; the tags stay small (~2.5 MiB) and remain fully
+# cherry-pickable onto a real checkout.
 echo "== block stacking tags"
 TAG_ORDER="01-adaptive-mtp 02-chunked-gdn 03-bf16-kv-cache 04-wmma-flash-attn 05-bit-identical-decode-cpu 06-host-buffer-revert 07-meta-device-wrapper-skip 08-fused-core 09-meta-headroom 10-k-quant-boosts 11-cuda-prefill-graph-skip"
 TAG_NAMES="block/01-adaptive-mtp block/02-chunked-gdn block/03-bf16-kv-cache block/04-wmma-flash-attn block/05-bit-identical-decode-cpu block/06-host-buffer-revert block/07-meta-device-wrapper-skip block/08-fused-core block/09-meta-headroom block/10-k-quant-boosts block/11-cuda-prefill-graph-skip"
+# patch footprint: the union of files all block patches touch (paths as in the
+# archive, one per line)
+FOOTPRINT="$TMP/footprint.txt"
+grep -h '^diff --git ' "$PATCHES"/*.patch | sed 's/^diff --git a\///; s/ b\/.*//' | sort -u > "$FOOTPRINT"
 git -C "$REPO_DIR" worktree add --detach "$TMP/tagwt" HEAD >/dev/null
 ( cd "$TMP/tagwt"
   git checkout -q --orphan rdna-tag-build
   git rm -rfq . >/dev/null
   git -C "$FORK" archive "$BASELINE" | tar -x
+  # prune to the patch footprint (preserve the worktree's .git pointer file)
+  find . -type f ! -name '.git' | sed 's|^\./||' | while read -r f; do
+      grep -qxF "$f" "$FOOTPRINT" || rm -f "$f"
+  done
+  find . -type d -empty ! -path './.git*' -delete 2>/dev/null
   git add -A -f   # force: upstream ships files that also match .gitignore (e.g. *.log)
   # fixed dates: the whole tag lineage is derived, so keep its commits
   # byte-deterministic across regenerations
   FIXDATE="$(git -C "$FORK" show -s --format='%aI' "$BASELINE")"
   export GIT_AUTHOR_DATE="$FIXDATE" GIT_COMMITTER_DATE="$FIXDATE"
-  git "${IDENT[@]}" commit -q -m "upstream llama.cpp baseline $BASELINE"
+  git "${IDENT[@]}" commit -q -m "upstream llama.cpp baseline $BASELINE (patch footprint only)"
   i=0
   for name in $TAG_ORDER; do
       i=$((i+1))
