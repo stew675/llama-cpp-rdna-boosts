@@ -85,10 +85,33 @@ prefill attention wins at hsk=256 (+34%) and hsk=320 (+36%) while hsk=512
 kernel). End-to-end gemma-4-12b head 240: pp512 neutral, pp2048 820.9 t/s
 (+3.3% vs the 128-cap default), pp4096 778.9 t/s (+6.9%), decode neutral.
 Strictly `GGML_CUDA_CC_IS_RDNA3_5`-gated: RDNA4 and RDNA3_0 keep the
-validated 576 cap, other targets 128 - a no-op on gfx1100/gfx1201, pending
-the maintainer's cross-arch confirmation before the branch merges into
-`main`. All 11 patches applied zero-fuzz to `d7bd3bfca`; full suite
-14889/14889, GDN 46/46 in all three dispatch configs.
+validated 576 cap, other targets 128 - a no-op on gfx1100/gfx1201. The
+branch merged into `main` 2026-08-29 after the cross-arch confirmation:
+gfx1100 independently validated in parallel on the branch (see the record
+below) and gfx1201 re-validated by integration test (14889/14889, GDN
+46/46, FLASH_ATTN_EXT 4568/4568, PPL 8.5995, perf within noise). All 11
+patches applied zero-fuzz to `d7bd3bfca`; full suite 14889/14889, GDN
+46/46 in all three dispatch configs on both gfx1151 and gfx1201.
+
+## Validation record (2026-08-29, ROCm 7.14, gfx1100) - parallel validation of the gfx1151-ports branch
+
+`gfx1100` (RDNA3_0) independently validated in parallel on the
+`gfx1151-ports` branch before it became `main`. The block-04 consumer-side
+fix is strictly `GGML_CUDA_CC_IS_RDNA3_5`-gated (320 cap for gfx115x only),
+so gfx1100 keeps the validated 576 cap and its dispatch is unchanged; the
+parallel run re-confirmed the existing gfx1100 records - the block 02 gfx11
+first-gen WMMA port (GDN 46/46 both configs, deterministic greedy decode,
+wikitext-2 PPL 6.7237 vs 6.7295 fp32, prefill +2-3%) and the block 04
+gfx1100 WMMA evidence (FLASH_ATTN_EXT 4568/4568 vs CPU ref; gemma-4-12b
+head 240 pp2048 2263-2270 vs 2226 tile +1.7%; >128-head harness sweep
+neutral +/-1% with no shape regressing >1%). All 11 patches applied
+zero-fuzz to `d7bd3bfca`; no behavioral change on gfx1100.
+
+**3-arch coverage of current `main` complete (2026-08-29):** gfx1100
+(RDNA3_0), gfx1151 (RDNA3_5) and gfx1201 (RDNA4) all validated on the same
+11-patch set; the two bf16/WMMA GDN kernels stay arch-segregated and the
+flash-attn WMMA cap is per-arch (576/320/576 for RDNA3_0/RDNA3_5/RDNA4,
+128 elsewhere).
 
 ## Validation record (2026-08-28, ROCm 7.14, gfx1201) - issue #2 fix
 
