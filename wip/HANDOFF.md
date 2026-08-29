@@ -1,5 +1,32 @@
 # SESSION HANDOFF — decode-path tuning (2026-08-29, post-compaction)
 
+## NEXT TASK (user request, 2026-08-29): review the repo + write AGENTS.md
+
+The user wants a FRESH context to: (1) review the ENTIRE repo
+(`~/llama-cpp-rdna-boosts/`), and (2) create an `AGENTS.md` at the repo root
+describing the repo's purpose, layout, workflows, and how to work in it.
+
+Key orientation for that task:
+- This repo = the PATCH/DELIVERY repo for the `stew675/llama.cpp` fork's
+  `rdna-boosts` branch (blocks 01-11 + the hybrid HIP all-reduce block 12).
+- `patches/` = the delivery patch set (0001-0011 + 12-hybrid-allreduce-hip.patch)
+  + README.md (apply instructions).  scripts/apply-all.sh = the verified apply
+  flow (git am for 1-11, git apply for the 12th); scripts/make-patches.sh =
+  regeneration.
+- `wip/` = the exploration docs (HANDOFF.md = this file; 12-hybrid-allreduce-hip.md;
+  tools/).  `work-archive/fused-stage-pacing/` = the closed experiments
+  (fused-stage + pacing), preserved for a future ROCm re-evaluation.
+- `benchmarks/` = the benchy methodology + v2-results; MANIFESTS.md/BASELINE.md
+  = the block manifests + baselines; GREEDY-PURITY.md = bit-identical decode.
+- The fork lives at `~/llama.cpp` (branch `rdna-boosts`, HEAD 155debcdc);
+  builds: `build-rocm-hybrid` (the hybrid, current); the server config at
+  `~/.llama-server-config.yaml` now points rocmstew1/2/3 at the hybrid build.
+- Verified numbers (2026-08-29): 3-GPU hybrid depth-16384 38.71 t/s; tg512
+  41.08; the clean-apply simulation passed (build + coherence + perf).
+
+---
+
+
 ## Session 9.5 — clean patch-set apply: VERIFIED (2026-08-29)
 
 Simulated the delivery patch set against a clean llama.cpp master
