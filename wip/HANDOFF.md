@@ -14,7 +14,7 @@ Key orientation for that task:
   flow (git am for 1-11, git apply for the 12th); scripts/make-patches.sh =
   regeneration.
 - `wip/` = the exploration docs (HANDOFF.md = this file; 12-hybrid-allreduce-hip.md;
-  tools/).  `work-archive/fused-stage-pacing/` = the closed experiments
+  tools/).  `archive/work/fused-stage-pacing/` = the closed experiments
   (fused-stage + pacing), preserved for a future ROCm re-evaluation.
 - `benchmarks/` = the benchy methodology + v2-results; MANIFESTS.md/BASELINE.md
   = the block manifests + baselines; GREEDY-PURITY.md = bit-identical decode.
@@ -52,7 +52,7 @@ Delivery artifacts: `patches/0001-0011` (blocks) + `patches/12-hybrid-allreduce-
 + `patches/README.md` (apply instructions).  The stale wip/12-hybrid-allreduce-hip.patch
 is superseded by patches/12-hybrid-allreduce-hip.patch.
 
-WIP experiments (fused-stage, pacing) archived at `work-archive/fused-stage-pacing/`
+WIP experiments (fused-stage, pacing) archived at `archive/work/fused-stage-pacing/`
 (env-gated OFF by default; not part of the delivery).
 
 ---
@@ -61,7 +61,7 @@ WIP experiments (fused-stage, pacing) archived at `work-archive/fused-stage-paci
 ## Where things stand
 
 - **Block 12 (hybrid all-reduce): DELIVERED** as `patches/12-hybrid-allreduce-hip.patch` (clean hybrid + RDNA4-only gate, WITHOUT the fused/pacing WIP). Clean-apply simulation VERIFIED (build + coherence + tg64 38.12 / tg512 41.08). Fork HEAD `155debcdc` (the gate commit), tree clean.
-- **WIP experiments**: fused-stage + pacing archived at `work-archive/fused-stage-pacing/` (env-gated OFF by default; not part of the delivery).
+- **WIP experiments**: fused-stage + pacing archived at `archive/work/fused-stage-pacing/` (env-gated OFF by default; not part of the delivery).
 - **Server config**: `~/.llama-server-config.yaml` rocmstew1/2/3 now point at the hybrid build (`~/llama.cpp/build-rocm-hybrid`). Recommended deployment: 3-GPU (`HIP_VISIBLE_DEVICES=0,1,2`), hybrid default, UNPINNED (the pin is a regression).
 
 ## Current server env (recommended, verified — superseded 2026-08-29 pm)

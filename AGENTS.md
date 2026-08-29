@@ -18,7 +18,7 @@ llama.cpp checkout at the fork point **`17252c769`**.
   all-reduce (custom internal AR for the small-tensor decode path +
   per-size hybrid dispatch vs RCCL), **RDNA4-only** (gfx1200/gfx1201; falls
   back to RCCL elsewhere). The fused-stage/pacing experiments it spawned are
-  archived, env-gated OFF, in `work-archive/fused-stage-pacing/`.
+  archived, env-gated OFF, in `archive/work/fused-stage-pacing/`.
 
 The repo is NOT the fork: the fork (source of truth for the block commits +
 the block-12 working-tree delta) lives at `~/llama.cpp`, branch
@@ -38,7 +38,8 @@ the block-12 working-tree delta) lives at `~/llama.cpp`, branch
 | `rdna-boosts-all.patch` | the entire 12-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs |
 | `wip/` | exploration docs, tuning tools, HANDOFF (session log) |
-| `work-archive/` | closed experiments, preserved for future re-evaluation |
+| `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
+| `archive/work/` | closed experiments, preserved for future re-evaluation |
 | `baseline/*` branches, `block/*` tags | **historical** pre-block-12 checkpoints — do not use for the current delivery |
 
 ## Critical facts (do not re-derive)
@@ -63,7 +64,7 @@ the block-12 working-tree delta) lives at `~/llama.cpp`, branch
 - The one-sided AR wait (dev0/bus-06 dispatch-gap asymmetry, ~12.7 µs/call)
   is a **platform-level CP/driver property**, not reachable from the AR
   kernel, graph tail, or host-side pacing — fusion/pacing are CLOSED
-  (`work-archive/fused-stage-pacing/`).
+  (`archive/work/fused-stage-pacing/`).
 
 ## Common tasks
 
@@ -111,7 +112,7 @@ cd ~/llama.cpp && BUILD_DIR=build-rocm-hybrid ~/bin/build-llama-rocm-714
 - Do not present old docs as current: MANIFESTS/BASELINE validation records
   are dated history; the current claims are the header sections + `patches/README.md`.
 - Do not add new WIP experiments to the delivery patch set — WIP stays in
-  `wip/` (or `work-archive/` once closed), env-gated OFF, excluded from
+  `wip/` (or `archive/work/` once closed), env-gated OFF, excluded from
   `patches/`.
 
 ## Editing the docs

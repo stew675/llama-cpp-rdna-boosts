@@ -39,15 +39,13 @@ and commits each block.
 │   └── make-patches.sh    # regenerates the set from the fork (~/llama.cpp)
 ├── benchmarks/            # benchy methodology + v1/v2 results + graphs (dated records)
 ├── wip/                   # exploration docs + tuning tools + HANDOFF (session log)
-└── work-archive/          # closed experiments (fused-stage + pacing), preserved
+└── archive/               # the rest: archive/work/ (closed experiments) + archive/docs/ (history)
 ```
 
-> **Historical note:** the `baseline/<sha>` branches and `block/01-…11` tags
-> are checkpoints of the OLD pre-block-12 structure (patch numbering 01-11
-> against older upstream ranges, `git apply` flow). They are kept as
-> known-good records for those upstream versions; the current delivery is
-> the flat `main` branch described here. Do not mix the old branches with
-> the current `patches/` files.
+> **History:** the `baseline/<sha>` branches, `block/01-…11` tags, and all
+> dated validation records belong to the old pre-block-12 structure and live
+> in `archive/docs/` (see also `archive/work/` for the closed experiments).
+> Do not mix them with the current `patches/` files.
 
 ## The 12 blocks
 

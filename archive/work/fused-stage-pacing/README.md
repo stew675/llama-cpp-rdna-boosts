@@ -75,7 +75,7 @@ that cannot be replicated deliberately.**
 - `patches/0002-*` — the pacing commit (GGML_CUDA_AR_PACE).
 - `allreduce-hip.cu.fused-snapshot` — the full fused+pacing state of
   allreduce-hip.cu (70 KB) for reference/re-application.
-- Session notes: `../../wip/HANDOFF.md` (sections "Fused-stage experiment" and
+- Session notes: `../../../wip/HANDOFF.md` (sections "Fused-stage experiment" and
   "Fused-stage + pacing: DEFINITIVE CONCLUSION").
 
 ## To re-enable (if a ROCm update changes the calculus)

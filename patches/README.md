@@ -42,7 +42,7 @@ was observed to silently drop hunks; use `git am`.)
   - `GGML_CUDA_AR_BF16_THRESHOLD` — F32->BF16 wire round-trip threshold
   - `GGML_CUDA_AR_COPY_THRESHOLD` / `GGML_CUDA_AR_COPY_CHUNK_BYTES` — CE path
   - WIP experiments (archived, env-gated OFF by default): `GGML_CUDA_AR_FUSED`,
-    `GGML_CUDA_AR_PACE` — see `../work-archive/fused-stage-pacing/README.md`
+    `GGML_CUDA_AR_PACE` — see `../archive/work/fused-stage-pacing/README.md`
 - Verified 2026-08-29 (3x R9700, ROCm 7.14, gfx1201): clean apply + full
   build + llama-cli same-seed coherence IDENTICAL + tg64 38.12 / tg512 41.08
   (matches the fork build).  Depth-16384 decode 38.71 t/s (3-GPU hybrid,

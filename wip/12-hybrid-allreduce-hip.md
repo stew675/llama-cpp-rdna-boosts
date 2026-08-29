@@ -7,7 +7,7 @@ clean-apply simulation passed (build + coherence + tg64 38.12 / tg512
 41.08). This file is the EXPLORATION writeup that produced it — historical
 detail, tuning roadmap, and env-knob semantics; see `patches/README.md` for
 the current apply instructions. The fused-stage + pacing experiments it
-spawned are archived (env-gated OFF) in `work-archive/fused-stage-pacing/`.
+spawned are archived (env-gated OFF) in `archive/work/fused-stage-pacing/`.
 
 The changes live on `~/llama.cpp` (`rdna-boosts` branch, committed as
 `dd66c07` `153f975` `6326757` `c9d8621` `6cc4900` + the RDNA4 gate
