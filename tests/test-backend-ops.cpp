@@ -10440,9 +10440,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Qwen3.6-27B decode shapes (n=1, mmvq path), Q6_K vs Q8_0:
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1})); // ffn
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // lm_head
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1})); // qkv
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1})); // ssm z
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1})); // kv proj
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1})); // ffn
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // lm_head
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1})); // qkv
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1})); // ssm z
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1})); // kv proj
+
+    // same shapes, Q4_K/Q5_K decode (n=1, mmvq) and prefill (mmq) rows:
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1})); // ffn
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1})); // lm_head
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1})); // qkv
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 6144, 1, 5120, {1, 1}, {1, 1})); // ssm z
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1})); // kv proj
+        for (int bs : {16, 128, 512}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, bs, 5120, {1, 1}, {1, 1})); // prefill
+        }
+    }
+
     // qwen3-30b-a3b
-    for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
-        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
+    for (int bs : {1, 4, 5, 6, 7, 8, 32, 64, 128, 256, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
@@ -10450,8 +10474,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
-        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
+    for (int bs : {1, 4, 5, 6, 7, 8, 32, 64, 128, 256, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 1792, bs, 2048));
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));

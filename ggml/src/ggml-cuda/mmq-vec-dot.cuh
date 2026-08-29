@@ -343,6 +343,17 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
         }
 
+        // Row scale pair (d, m) is invariant over the j0 loop; load it once per element.
+        float2 dmA_reg[ntx][tile_C::ne];
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int i = i0 + n*tile_A::I + tile_C::get_i(l);
+                dmA_reg[n][l] = __half22float2(x_dm[i*sram_stride + k0/QI8_1]);
+            }
+        }
+
 #pragma unroll
         for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
             tile_B B;
@@ -358,10 +369,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
-                    const int i = i0 + n*tile_A::I + tile_C::get_i(l);
-                    float2 dmA = __half22float2(x_dm[i*sram_stride + k0/QI8_1]);
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA.x*dsB.x*C.x[l];
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA.y*dsB.y;
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA_reg[n][l].x*dsB.x*C.x[l];
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA_reg[n][l].y*dsB.y;
                 }
             }
         }
