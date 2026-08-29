@@ -1,26 +1,18 @@
-From fba85d72b11f4f3a3ef5f2ff519a22adb36bda60 Mon Sep 17 00:00:00 2001
+From f8e16aa509f912a34893a78a084fca57d7e2c46f Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
-Date: Tue, 25 Aug 2026 06:05:37 -0500
-Subject: [PATCH 09/10] block 09: meta-buffer compute-container headroom for
- recurrent snapshot views
+Date: Sat, 29 Aug 2026 08:14:24 -0500
+Subject: [PATCH 09/11] rdna-boosts: block 09: meta-buffer compute-container
+ headroom for
 
-The compute containers hold view tensors of the buffer's static tensors that
-are created during graph allocation. Hybrid recurrent models with n_rs_seq
-snapshotting create ~2*(n_rs_seq+1) views per recurrent layer for the
-conv-state snapshot copies, which can exceed the previous 16x headroom and
-abort with 'not enough space in the context's memory pool'.
-
-Assisted-by: pi
-(cherry picked from commit f2a22a716a2090e4a6d92ac7a4e6085def73a0b3)
 ---
  ggml/src/ggml-backend-meta.cpp | 7 ++++++-
  1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index fe58ea3bb..a01b7ee93 100644
+index 3ec40fb1a..87667beb2 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -1696,7 +1696,12 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
+@@ -1712,7 +1712,12 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
  struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
      const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
  

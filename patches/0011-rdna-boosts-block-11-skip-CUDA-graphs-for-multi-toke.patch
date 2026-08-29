@@ -1,0 +1,41 @@
+From f6f8f67780d6d88c9d778ad1d6138ec8a27706d2 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sat, 29 Aug 2026 08:14:24 -0500
+Subject: [PATCH 11/11] rdna-boosts: block 11: skip CUDA graphs for multi-token
+ PRE-FILL
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index cc7841dc1..321cb930b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4857,6 +4857,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     if (!op_timing && graph->is_enabled()) {
+         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+         if (graph_compatible) {
++            // PRE-FILL graphs (the graph key node[0].ne[1] > 1) use varying ubatch
++            // sizes, so each is a separate graph key and CUDA-graph capture never
++            // amortizes: the per-call update_required probe + failed capture is pure
++            // overhead. Measured pp512 is ~6.7% faster with graphs OFF. Only decode
++            // (ne[1]==1, stable shape) benefits from graph replay. Skip the whole
++            // graph path (incl. the update_required probe) for multi-token graphs.
++            if (cgraph->n_nodes > 0 && cgraph->nodes[0]->ne[1] > 1) {
++                use_cuda_graph = false;
++            } else {
+             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+ 
+             if (!graph->warmup_complete) {
+@@ -4879,6 +4888,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+                     cuda_graph_update_required = graph->instance == nullptr;
+                 }
+             }
++            } // else: not prefill
+         }
+     }
+ #endif // USE_CUDA_GRAPH
+-- 
+2.55.0
+

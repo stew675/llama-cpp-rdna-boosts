@@ -1,4 +1,35 @@
-# SESSION HANDOFF — decode-path tuning (2026-08-29, pre-context-compaction)
+# SESSION HANDOFF — decode-path tuning (2026-08-29, post-compaction)
+
+## Session 9.5 — clean patch-set apply: VERIFIED (2026-08-29)
+
+Simulated the delivery patch set against a clean llama.cpp master
+(`17252c769` = the fork point) in a fresh worktree:
+
+1. `git am` blocks 1-11 (`git format-patch 17252c769..f6f8f6778`; plain
+   `git apply` of the concatenated series SILENTLY DROPPED HUNKS — 30 files
+   / 2483 lines vs the correct 35 files / 6094 lines — use `git am`).
+2. The 12th patch (regenerated from the CURRENT fork tree as the delta vs
+   f6f8f6778 — the previous wip patch's ggml-cuda.cu was STALE, missing
+   block 10's q8_1 fusions, which broke the 4B decode with a silent
+   generation-0 hang; the fresh 12th fixes it).
+3. Full build: clean.
+4. Coherence: 4B llama-cli same-seed output IDENTICAL to the fork build
+   (76.7 t/s).
+5. Performance holds: tg64 38.12 (fork 38.28), tg512 41.08 (fork 40.95-41.60).
+
+**RDNA4-only gate added** (block 12): the internal/hybrid all-reduce refuses
+to init unless every device is gfx1200/gfx1201 (falls back to RCCL with a
+warning).  Community RDNA3 verification pending.
+
+Delivery artifacts: `patches/0001-0011` (blocks) + `patches/12-hybrid-allreduce-hip.patch`
++ `patches/README.md` (apply instructions).  The stale wip/12-hybrid-allreduce-hip.patch
+is superseded by patches/12-hybrid-allreduce-hip.patch.
+
+WIP experiments (fused-stage, pacing) archived at `work-archive/fused-stage-pacing/`
+(env-gated OFF by default; not part of the delivery).
+
+---
+
 
 ## Where things stand
 
