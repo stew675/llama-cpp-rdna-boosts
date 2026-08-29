@@ -34,6 +34,45 @@ re-based for the `common_speculative_impl` n_max drift, blocks 02-12 are
 unchanged - see BASELINE.md. Older branches: `baseline/192067b72`,
 `baseline/d222767c7`, `baseline/758443071`)
 
+## Validation record (2026-08-28, ROCm 7.14, gfx1201) - gfx12/gfx11 segregation fix
+
+Block 02 regenerated again from the validated consumer application: the
+in-place dual-arch refactor of `gated_delta_net_chunked_bf16.cu` (the gfx11
+port, issue #1 follow-up) REGRESSED the validated gfx12 path - NaN/inf on
+the bf16 chunked GDN on gfx1201 (test-backend-ops GATED_DELTA_NET 39/46;
+every S_v=128 multi-token K=1 case failed, 100% rate). The report found
+four concrete divergences from the fork's validated RDNA4-only file
+(gdn_swrite state-write base column `kt*16+8*hi` vs `kt*16+hi`; a double
+`8*hi` shift at both GDN_STORE_ACC8_B16 call sites, kkt and scan; and the
+GDN_ROWO LDS k-half offset `16*hi` vs `4*hi`) plus a fifth divergence in
+the S@Q^T state term that could not be isolated from the refactor. Rather
+than ship a half-repaired 1100-line WMMA kernel, block 02 now properly
+SEGREGATES the two architectures:
+
+- `gated_delta_net_chunked_bf16.cu` is RESTORED to the fork's validated
+  RDNA4-only file (chunked-gdn tip `99bbd1b20`, 46/46 on gfx1201 per the
+  d222767c7 record), adapted only to return bool for the launch-rejection
+  dispatch (ggml_cuda_kernel_launch_try). The whole device section is
+  gated on the RDNA4 device-pass macro; non-RDNA4 passes compile no-op
+  stub kernels so the host launchers still link (issue #1 class).
+- the gfx11 (RDNA3/RDNA3.5) first-gen WMMA port lives on its OWN path in
+  the new `gated_delta_net_chunked_bf16_gfx11.cu`, gated on the RDNA3
+  device-pass macro with the same stub pattern.
+- the two architectures share NO kernel code and cannot cross-regress;
+  the runtime-cc dispatch in `gated_delta_net.cu` picks the kernel by
+  device cc (RDNA4 -> the restored gfx12 file, RDNA3 -> the gfx11 file).
+
+Re-validated on gfx1201 (R9700, ROCm 7.14, Wave32): GDN 46/46 in all three
+dispatch configs (default bf16 chunked / fp32 chunked via
+GGML_CUDA_GDN_CHUNKED_BF16=0 / sequential via GGML_CUDA_GDN_CHUNKED=0) and
+with CUDA graphs enabled; full test-backend-ops **14889/14889**;
+test-speculative-adaptive and test-arg-parser OK; wikitext-2 PPL 8.5995
++/- 0.13 on Qwen3.5-4B-Q8_0 (32 chunks x 2048; vs the 8.6017 bf16 record -
+near-lossless). 27B Q4_K_XL (the model-shaped GDN config, v_repeat=3)
+re-checked: coherent generation with a bounded reasoning budget, no
+fallback warnings in any config. gfx1100 cross-compile clean (both arch
+files, stubs on the other arch's device pass).
+
 ## Validation record (2026-08-28, ROCm 7.14, gfx1201) - issue #2 fix
 
 All 11 patches applied zero-fuzz to master at `fe235f434`; the applied tree
@@ -145,7 +184,7 @@ debugging the bf16 GDN kernel, deterministically fails `rms_norm_back` /
 | # | patch | files | deps |
 |---|-------|-------|------|
 | 01 | `01-adaptive-mtp.patch` | common/arg.cpp, common/common.{h,cpp}, common/speculative.cpp, common/speculative-adaptive.h, tools/server/server-context.cpp, src/models/delta-net-base.cpp, tests/test-speculative-adaptive.cpp, tests/test-arg-parser.cpp, tests/CMakeLists.txt | none |
-| 02 | `02-chunked-gdn.patch` | ggml/src/ggml-cuda/gated_delta_net.cu, gated_delta_net_chunked.{cu,cuh}, gated_delta_net_chunked_bf16.cu (bf16/WMMA path: RDNA4 gfx12 + RDNA3/RDNA3.5 gfx11 first-gen WMMA; runtime-cc dispatch, issue #1), tests/test-backend-ops.cpp | none |
+| 02 | `02-chunked-gdn.patch` | ggml/src/ggml-cuda/gated_delta_net.cu, gated_delta_net_chunked.{cu,cuh}, gated_delta_net_chunked_bf16.cu (RDNA4 gfx12: fork's validated RDNA4-only kernel restored verbatim, issue-#1 stub gate), gated_delta_net_chunked_bf16_gfx11.cu (RDNA3/RDNA3.5 gfx11 first-gen WMMA port on its own path; the two arch kernels share NO code), runtime-cc dispatch, tests/test-backend-ops.cpp | none |
 | 03 | `03-bf16-kv-cache.patch` | fattn-tile.{cu,cuh}, fattn.cu, common.cuh, rope.cu, ggml-cuda.cu (IMRoPE fuse), tests/test-backend-ops.cpp | none |
 | 04 | `04-wmma-flash-attn.patch` | fattn-mma-f16.cuh, mmq-vec-dot.cuh, mmq.cuh, fattn.cu, ggml-cuda.cu (WMMA dispatch), tests/test-backend-ops.cpp | none |
 | 05 | `05-bit-identical-decode-cpu.patch` | ggml/src/ggml-cpu/llamafile/sgemm.cpp | none |
