@@ -73,6 +73,23 @@ re-checked: coherent generation with a bounded reasoning budget, no
 fallback warnings in any config. gfx1100 cross-compile clean (both arch
 files, stubs on the other arch's device pass).
 
+## Validation record (2026-08-29, ROCm 7.14, gfx1151) - block 04 consumer-side fix, gfx1151-ports branch
+
+Block 04 (`04-wmma-flash-attn.patch`) absorbs the gfx1151-ports RDNA3.5
+WMMA flash-attn consumer-side fix: the gfx11 WMMA path is correct on gfx1151
+(FLASH_ATTN_EXT 4568/4568 vs CPU ref with the cap lifted) but the
+discrete-GPU 576 cap does not fit the unified-memory Strix Halo iGPU -
+prefill attention wins at hsk=256 (+34%) and hsk=320 (+36%) while hsk=512
+(-5.6%) and hsk=576 (-7.4%) regress, so RDNA3_5 defaults to a 320 cap
+(Gemma4 240-head, Mistral4 MLA 320; DeepSeek-MLA 576 keeps the tile
+kernel). End-to-end gemma-4-12b head 240: pp512 neutral, pp2048 820.9 t/s
+(+3.3% vs the 128-cap default), pp4096 778.9 t/s (+6.9%), decode neutral.
+Strictly `GGML_CUDA_CC_IS_RDNA3_5`-gated: RDNA4 and RDNA3_0 keep the
+validated 576 cap, other targets 128 - a no-op on gfx1100/gfx1201, pending
+the maintainer's cross-arch confirmation before the branch merges into
+`main`. All 11 patches applied zero-fuzz to `d7bd3bfca`; full suite
+14889/14889, GDN 46/46 in all three dispatch configs.
+
 ## Validation record (2026-08-28, ROCm 7.14, gfx1201) - issue #2 fix
 
 All 11 patches applied zero-fuzz to master at `fe235f434`; the applied tree
@@ -186,7 +203,7 @@ debugging the bf16 GDN kernel, deterministically fails `rms_norm_back` /
 | 01 | `01-adaptive-mtp.patch` | common/arg.cpp, common/common.{h,cpp}, common/speculative.cpp, common/speculative-adaptive.h, tools/server/server-context.cpp, src/models/delta-net-base.cpp, tests/test-speculative-adaptive.cpp, tests/test-arg-parser.cpp, tests/CMakeLists.txt | none |
 | 02 | `02-chunked-gdn.patch` | ggml/src/ggml-cuda/gated_delta_net.cu, gated_delta_net_chunked.{cu,cuh}, gated_delta_net_chunked_bf16.cu (RDNA4 gfx12: fork's validated RDNA4-only kernel restored verbatim, issue-#1 stub gate), gated_delta_net_chunked_bf16_gfx11.cu (RDNA3/RDNA3.5 gfx11 first-gen WMMA port on its own path; the two arch kernels share NO code), runtime-cc dispatch, tests/test-backend-ops.cpp | none |
 | 03 | `03-bf16-kv-cache.patch` | fattn-tile.{cu,cuh}, fattn.cu, common.cuh, rope.cu, ggml-cuda.cu (IMRoPE fuse), tests/test-backend-ops.cpp | none |
-| 04 | `04-wmma-flash-attn.patch` | fattn-mma-f16.cuh, mmq-vec-dot.cuh, mmq.cuh, fattn.cu, ggml-cuda.cu (WMMA dispatch), tests/test-backend-ops.cpp | none |
+| 04 | `04-wmma-flash-attn.patch` | fattn-mma-f16.cuh, mmq-vec-dot.cuh, mmq.cuh, fattn.cu, ggml-cuda.cu (WMMA dispatch), tests/test-backend-ops.cpp; consumer-side fix: RDNA3_5 wmma_max_head 320 cap (gfx1151-ports branch) | none |
 | 05 | `05-bit-identical-decode-cpu.patch` | ggml/src/ggml-cpu/llamafile/sgemm.cpp | none |
 | 06 | `06-host-buffer-revert.patch` | ggml/src/ggml-cuda/ggml-cuda.cu | none |
 | 07 | `07-meta-device-wrapper-skip.patch` | src/llama.cpp | none |

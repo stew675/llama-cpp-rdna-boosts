@@ -23,6 +23,11 @@
 #     `random_device` seeding in init_tensor_uniform; the fork's chunked-gdn
 #     carries the deterministic 12345 seed, so a fork-driven regeneration
 #     reverts it - re-apply the fix, see BASELINE.md)
+#   - block 04's RDNA3_5 (gfx1151) WMMA flash-attn 320-cap consumer-side
+#     fix (gfx1151-ports branch): block 04 is regenerated from fork commit
+#     beaf69fb6, which does not carry it - re-apply the fattn.cu
+#     wmma_max_head RDNA3_5 ternary + comment (see the MANIFESTS validation
+#     record for the exact change)
 #   - block 08's subtractive diff is computed against <branch>, so a full
 #     regeneration is only valid when <branch> descends from <baseline-sha>;
 #     for a post-192067b72 baseline the fork branches must be re-based first

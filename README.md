@@ -49,7 +49,7 @@ below uses the current branch.
 | `01-adaptive-mtp.patch` | adaptive speculative draft depth for MTP (`--draft-mtp-adaptive`) | 5 commits |
 | `02-chunked-gdn.patch` | fused chunked gated-delta-net prefill kernel (fp32 + bf16/WMMA tensor-core as S_v=128 default on RDNA4 gfx12 AND RDNA3/3.5 gfx11; the two arch kernels are fully SEGREGATED - gfx12 is the fork's validated RDNA4-only file restored verbatim, gfx11 is its own first-gen WMMA port file, no shared code; runtime-cc dispatch - fixes issue #1 build error, the host-pass gate regression, and the gfx12 NaN/inf regression from the in-place dual-arch refactor; launch-rejection fallback + kkt barrier - fixes issue #2) | 13 commits + 4 consumer-side fixes |
 | `03-bf16-kv-cache.patch` | native-BF16 flash-attn tile kernel, BF16 KV cache, IMRoPE + set-rows fusion | 8 commits |
-| `04-wmma-flash-attn.patch` | RDNA4 + RDNA3_0 WMMA flash-attention path (heads to 576, `GGML_CUDA_FA_WMMA_MAX_HEAD` override); Q6_K mmq prefill tuning | 1 commit |
+| `04-wmma-flash-attn.patch` | RDNA4 + RDNA3_0 WMMA flash-attention path (heads to 576, `GGML_CUDA_FA_WMMA_MAX_HEAD` override); Q6_K mmq prefill tuning; RDNA3_5 (gfx1151) heads to 320 consumer-side fix (gfx1151-ports branch) | 1 commit + 1 consumer-side fix |
 | `05-bit-identical-decode-cpu.patch` | bit-identical CPU decode / speculative-verify batches | 1 commit |
 | `06-host-buffer-revert.patch` | back out integrated-GPU host buffers on HIP (PR #24233) | 1 commit |
 | `07-meta-device-wrapper-skip.patch` | skip the Meta device wrapper with a single GPU | 1 commit |
