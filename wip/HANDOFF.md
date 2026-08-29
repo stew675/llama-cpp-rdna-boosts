@@ -88,6 +88,39 @@ HIP_VISIBLE_DEVICES=1,2 ~/llama-cpp-rdna-boosts/wip/tools/ar_signal_bench (build
 rocprofv3 -d /tmp/rocprof-out -r -- <cmd>   # then query the sqlite kernels table
 ```
 
+## Session 7 results (2026-08-29 pm) — PIN IS THE REGRESSION, kernel exonerated
+
+User's hunch validated: the `~/bin/high-power` pin (dpm=high + runtime-PM on)
+REGRESSES the RCCL/hybrid paths by tg -5-7% and pp -15-18%.  Session-5's
+"pin recovers ~7us of the AR wait" was an artifact / AR-only benefit that is
+outweighed end-to-end (pin helps the AR spin slightly, hurts the rest more).
+The kernel update 7.1.10-200 (installed today 13:27) is EXONERATED:
+identical numbers to 7.1.8-200 in every corner.
+
+A/B matrix, same depth-16384 tg240 protocol (Q8_0, bf16 KV, tensor split):
+
+| config (3-GPU) | tg | pp | notes |
+|---|---|---|---|
+| hybrid, UNPINNED | **39.95 ± 0.01** | 1963.5 | record; +23.5% vs 2-GPU |
+| internal, unpinned | 39.93 | 1588.0 | decode == hybrid (expected) |
+| nccl, unpinned | 36.57 | 1960.6 | internal beats RCCL +9.2% |
+| hybrid, pinned | 37.35 | 1668.2 | pin cost: -6.5% tg, -15% pp |
+| v2 binary RCCL, unpinned | 36.50 | 1956-1961 | residual -4.3% tg vs 08-27's 38.12 |
+
+2-GPU (1,2): hybrid unpinned **32.49** (reproduces the original 32.34; the
+30.84 pinned was the pin), nccl 30.34, internal 32.50.
+
+- Ladder-vs-standalone: no artifact (in-ladder cell@16384 = 36.49 vs
+  standalone 36.53).
+- RCCL tg residual -4.3% vs 08-27 while pp +11% better: unexplained, likely
+  cmdline drift (iommu=off/pcie_aspm=off added since); minor — internal AR
+  dominates anyway.  Links verified fine (x16@32GT/s, P2P 16.0 GB/s).
+- CONCLUSION: server must run UNPINNED (remove high-power from the config;
+  unpinned idle is also cheaper, 13-19W vs 44-52W).  Move to 3-GPU
+  (HIP_VISIBLE_DEVICES=0,1,2): depth-16384 decode 32.5 -> 39.95 (+23.5%).
+- Results: ~/ab-results/16384-{3gpu,2gpu12,v2repro}-unpinned/,
+  16384-v2ladder/ (+-newkernel/ backups).
+
 ## Next steps (in priority order)
 
 1. **3-GPU depth-16384 validation** (deployment win, no code): server with
