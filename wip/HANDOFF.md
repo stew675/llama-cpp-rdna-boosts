@@ -88,6 +88,26 @@ HIP_VISIBLE_DEVICES=1,2 ~/llama-cpp-rdna-boosts/wip/tools/ar_signal_bench (build
 rocprofv3 -d /tmp/rocprof-out -r -- <cmd>   # then query the sqlite kernels table
 ```
 
+## Baselines on 7.1.10-200 (the new reality), UNPINNED (2026-08-29 pm)
+
+Depth-16384 tg240 runs=5, Q8_0 bf16 KV, tensor split:
+
+| config | tg | pp |
+|---|---|---|
+| 3-GPU hybrid | **38.71 ± 0.08** | 1896.7 |
+| 3-GPU internal | 38.77 | 1539.7 |
+| 3-GPU nccl | 36.24 | 1889.2 |
+| 2-GPU (1,2) hybrid | **31.79 ± 0.02** | 1730.7 |
+| 2-GPU (1,2) internal | 31.75 | 1446.6 |
+| 2-GPU (1,2) nccl | 30.18 | 1731.7 |
+
+tg512 (no-depth, 3-GPU, llama-bench r2): 40.95 ± 1.01.
+
+3-GPU vs 2-GPU hybrid = +21.8%.  7.1.10-200 costs ~1-3% vs 7.1.8-200 when
+UNPINNED (uniform across all 6 arms; masked when pinned => clock-management
+mechanism).  Not worth fighting (pin costs more).  Server: 3-GPU,
+HIP_VISIBLE_DEVICES=0,1,2, no pin, hybrid default.
+
 ## Session 7 results (2026-08-29 pm) — PIN IS THE REGRESSION, kernel exonerated
 
 User's hunch validated: the `~/bin/high-power` pin (dpm=high + runtime-PM on)
