@@ -148,3 +148,78 @@ path is NOT on the hybrid critical path.
   baselines). Build: `~/llama.cpp/build-rocm-hybrid`.
 - Working tree: `~/llama.cpp` has the changes uncommitted; rebuild from there
   to continue tuning. Nothing here is in any `baseline/*` branch.
+
+---
+
+## Decode-path tuning exploration (2026-08-29, WIP session 2)
+
+Goal: decompose the per-call all-reduce cost at depth 16384 and find where
+decode headroom is.  All numbers 27B Q8_0, 2-GPU tensor split.
+
+### Instrumentation built (all WIP, env-gated or standalone)
+
+- **AR per-call profiler** (`GGML_CUDA_AR_PROFILE=1` in allreduce-hip.cu):
+  device-side events bracket every internal AR call; kernel-internal `clock64`
+  captures each device's arrival-spin; distribution printed at pipeline
+  teardown.  Cost when off: two pointer checks.
+- **Signal-path microbench** (`~/rccl-p2p-test/ar_signal_bench.cpp`): the
+  arrival-token round trip in isolation, per direction, any pair.
+- **rocprofv3** workflow (`rocprofv3 -d <dir> -r -- <cmd>`; results in a
+  sqlite db; `kernels` table has per-agent duration).
+
+### Established facts
+
+1. **Cards are identical**: single-GPU 27B decode 20.67/20.68/20.69 t/s on the
+   three R9700s.  All are PCIe 5.0 x4 (two bifurcated board slots + one M.2
+   riser; the ~14-16 GB/s P2P measured earlier is the x4 link ceiling, not the
+   fabric).
+2. **Graph work is balanced**: rocprof shows every kernel type replicated
+   across agents with equal call counts and durations (mul_mat_vec_q 4224
+   calls/408 ms each side; totals 1045.9 vs 1037.3 ms = 0.8%).
+3. **Signal round trip is fast**: isolated token visibility 1.4-4.8 us per
+   direction (asymmetry <= 3.4 us).  NOT the bottleneck.
+4. **A ~15-20 us one-sided wait per call remains** (dev1 waits for dev0 at
+   every AR barrier), stable across runs, ~108 calls/token -> ~2 ms/token ≈
+   6% of decode.  This is the main decode headroom.
+5. **The wait is NOT work imbalance, NOT the signal path, NOT host launch
+   order**: refuted by experiments below.  **rocprof tracing eliminates it**
+   (balanced AR kernel times under tracing) -> the wait lives in the
+   driver/runtime dispatch path, which instrumentation perturbs.
+
+### Experiments (all measured via the AR profiler, pair 0,2 unless noted)
+
+| experiment | result | verdict |
+|---|---|---|
+| `-ts` 0.45/0.55, 0.40/0.60 | worse (tg 30.8/29.1) | work is not size-skewed |
+| `-mg 1` | no change | not main-GPU role |
+| pair swap (1,0) vs (0,2) | balanced 4.3/4.3 vs 26 us | wait follows index assignment, same cards |
+| `GGML_CUDA_DISABLE_GRAPHS=1` | 21.6 vs 26.9 us | minor, not causal |
+| subgraph launch order flip | no change | not host launch order |
+| AR kernel launch order flip | no change | not AR enqueue order |
+| pool depth 2 -> 4 | no change | not host sync frequency |
+| rocprof tracing | wait disappears | driver dispatch path implicated |
+
+### Pairing is the practical win (verified at depth 16384, TG=240, runs 2)
+
+| pair (HIP) | physical cards | depth-16384 tg |
+|---|---|---|
+| 0,2 (current server) | 06 + 09 | 31.47 t/s |
+| **1,2** | **09 + 03** | **32.34 t/s (+2.8%)** |
+
+No-depth the effect is larger (33.4 vs 32.4).  Recommend the server move to
+`HIP_VISIBLE_DEVICES=1,2` (or 2,1 — same cards, both orders fine).
+
+### Open question / next steps
+
+- **Driver-level dispatch asymmetry**: the ~15-20 us/call wait is robust to
+  every llama.cpp-side ordering and disappears under rocprof.  Candidates:
+  KFD queue submission latency per device, amdgpu front-end pickup, or a
+  per-device runtime artifact.  Needs a driver-level probe (or rocprof of the
+  dispatch timestamps) to pin down; alternatively pursue the overlap approach
+  below.
+- **Overlap the spin with work**: the AR barrier serializes the compute
+  pipeline.  If the wait cannot be removed, hiding it (e.g., prefetching the
+  next layer's independent ops, or a split-stage/consume pool that lets
+  phase-1 of the next call start during the peer's spin) is the fallback.
+- **Tuning targets if the wait is fixed**: ~34 t/s at depth-16384 (from
+  31.15-32.34).

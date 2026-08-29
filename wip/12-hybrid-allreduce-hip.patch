@@ -1,9 +1,9 @@
 diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
 new file mode 100644
-index 000000000..eeb171795
+index 000000000..7e495a7dd
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/allreduce-hip.cu
-@@ -0,0 +1,948 @@
+@@ -0,0 +1,1082 @@
 +#include "allreduce.cuh"
 +
 +#if defined(GGML_USE_HIP)
@@ -12,9 +12,11 @@ index 000000000..eeb171795
 +#include "ggml-impl.h"
 +
 +#include <algorithm>
++#include <cinttypes>
 +#include <cstdlib>
 +#include <cstring>
 +#include <limits>
++#include <vector>
 +
 +// ---------------------------------------------------------------------------
 +// HIP AllReduce for tensor-parallel inference across two GPUs.
@@ -85,6 +87,10 @@ index 000000000..eeb171795
 +// slot so multiple SMs can pump PCIe stores in parallel.
 +static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
 +
++// WIP tuning instrumentation: max profiled calls (ring).  ~32 tokens of the
++// 27B at 2-5 ARs/layer/64 layers is plenty for a distribution.
++static constexpr size_t GGML_CUDA_AR_PROF_MAX = 4096;
++
 +// ---------------------------------------------------------------------------
 +// Chunked kernel AllReduce -- 2 GPUs, supports float, half, and bfloat16.
 +//
@@ -124,7 +130,8 @@ index 000000000..eeb171795
 +        int                         count,
 +        int *                       arrival_mine,
 +        int *                       arrival_other,
-+        int                         token) {
++        int                         token,
++        int64_t *                   prof_spin) {   // [2]: clock64 at spin start/end (block 0); NULL disables
 +
 +    // Vector unit for the wire type, sized to the arch's widest single-instruction
 +    // copy (16 B on Volta+/RDNA).  Each phase-1 iter writes one vector to host
@@ -162,11 +169,15 @@ index 000000000..eeb171795
 +
 +    // Phase 2: thread 0 of each block signals on its own arrival slot, then
 +    // spins for the matching slot from peer.  Per-block tokens mean blocks
-+    // proceed independently -- no inter-block barrier needed.
++    // proceed independently -- no inter-block barrier needed.  Block 0's
++    // spin window is recorded when profiling (clock64).
 +    if (tid == 0) {
 +        int       * my_slot    = arrival_mine  + bid * ARRIVAL_INTS;
 +        const int * other_slot = arrival_other + bid * ARRIVAL_INTS;
 +
++        if (prof_spin != nullptr && bid == 0) {
++            prof_spin[0] = (int64_t) clock64();
++        }
 +        ggml_cuda_ar_signal_set(my_slot, token);
 +        __threadfence_system(); // make our signal visible system-wide
 +
@@ -178,6 +189,9 @@ index 000000000..eeb171795
 +            for (int i = 0; i < 16; ++i) {
 +                asm volatile("" ::: "memory");
 +            }
++        }
++        if (prof_spin != nullptr && bid == 0) {
++            prof_spin[1] = (int64_t) clock64();
 +        }
 +    }
 +
@@ -316,6 +330,18 @@ index 000000000..eeb171795
 +    size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
 +    uint64_t call_count;
 +
++    // --- WIP tuning instrumentation (GGML_CUDA_AR_PROFILE=1) ------------
++    // Device-side per-call timing around each all-reduce; a distribution is
++    // printed at pipeline teardown.  Zero cost when disabled (two pointer
++    // checks per call).  Not for integration.
++    bool                     prof_enabled;
++    hipEvent_t               prof_t0[GGML_CUDA_AR_PROF_MAX];
++    hipEvent_t               prof_t1[GGML_CUDA_AR_PROF_MAX];
++    int64_t                  prof_ne[GGML_CUDA_AR_PROF_MAX];
++    int64_t *                prof_spin[GGML_CUDA_MAX_DEVICES]; // dev mem: [PROF_MAX][2] clock64 (start,end)
++    size_t                   prof_n;
++    // --- end WIP instrumentation -----------------------------------------
++
 +    // Per-device resources.
 +    ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
 +    ggml_cuda_ar_host_mapping host_large[GGML_CUDA_MAX_DEVICES]; // pinned staging (copy-engine)
@@ -427,6 +453,20 @@ index 000000000..eeb171795
 +    // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
 +    // byte threshold to opt out for small tensors.
 +    p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
++    p->prof_enabled     = ggml_cuda_ar_env_u64("GGML_CUDA_AR_PROFILE", 0) != 0;
++    if (p->prof_enabled) {
++        GGML_LOG_WARN("%s: per-call profiling enabled (GGML_CUDA_AR_PROFILE=1); "
++                      "this is WIP tuning instrumentation\n", __func__);
++        for (size_t i = 0; i < n_devices; ++i) {
++            ggml_cuda_set_device(p->devices[i]);
++            if (hipMalloc(reinterpret_cast<void **>(&p->prof_spin[i]),
++                          GGML_CUDA_AR_PROF_MAX * 2 * sizeof(int64_t)) != hipSuccess) {
++                GGML_LOG_ERROR("%s: prof_spin alloc failed for device %d\n", __func__, p->devices[i]);
++                ggml_cuda_ar_pipeline_free(p);
++                return nullptr;
++            }
++        }
++    }
 +    for (size_t i = 0; i < n_devices; ++i) {
 +        p->devices[i] = devices[i];
 +    }
@@ -546,6 +586,68 @@ index 000000000..eeb171795
 +        }
 +    }
 +
++    // --- WIP tuning instrumentation: report per-call distribution ---------
++    if (p->prof_enabled && p->prof_n > 0) {
++        ggml_cuda_set_device(p->devices[0]);
++        std::vector<double> us; us.reserve(p->prof_n);
++        double total_us = 0;
++        for (size_t i = 0; i < p->prof_n; ++i) {
++            float ms = 0;
++            hipEventElapsedTime(&ms, p->prof_t0[i], p->prof_t1[i]);
++            double d = (double) ms * 1e3;
++            us.push_back(d);
++            total_us += d;
++            hipEventDestroy(p->prof_t0[i]);
++            hipEventDestroy(p->prof_t1[i]);
++        }
++        std::sort(us.begin(), us.end());
++        auto pct = [&](double q) { return us[(size_t)(q * (us.size() - 1))]; };
++        fprintf(stderr, "AR-PROFILE: %zu calls, total %.1f ms, avg %.1f us/call | "
++                      "min %.1f p50 %.1f p90 %.1f p99 %.1f max %.1f us | "
++                      "ne range %" PRId64 "..%" PRId64 "\n",
++                      us.size(), total_us / 1e3, total_us / us.size(),
++                      us.front(), pct(0.50), pct(0.90), pct(0.99), us.back(),
++                      *std::min_element(p->prof_ne, p->prof_ne + p->prof_n),
++                      *std::max_element(p->prof_ne, p->prof_ne + p->prof_n));
++        // size histogram: count of calls per distinct ne (sorted)
++        std::vector<std::pair<int64_t, size_t>> hist;
++        for (size_t i = 0; i < p->prof_n; ++i) {
++            bool found = false;
++            for (auto & h : hist) { if (h.first == p->prof_ne[i]) { h.second++; found = true; break; } }
++            if (!found) hist.push_back({p->prof_ne[i], 1});
++        }
++        std::sort(hist.begin(), hist.end());
++        for (auto & h : hist) {
++            fprintf(stderr, "AR-PROFILE:   ne=%" PRId64 "  calls=%zu\n", h.first, h.second);
++        }
++        // Per-device spin (arrival busy-wait) stats: clock64 cycles -> us.
++        for (int dev = 0; dev < p->n_devices; ++dev) {
++            std::vector<int64_t> spin(2 * p->prof_n);
++            ggml_cuda_set_device(p->devices[dev]);
++            hipMemcpy(spin.data(), p->prof_spin[dev], 2 * p->prof_n * sizeof(int64_t), hipMemcpyDeviceToHost);
++            int rate_khz = 0;
++            hipDeviceGetAttribute(&rate_khz, hipDeviceAttributeClockRate, p->devices[dev]);
++            std::vector<double> sp_us; sp_us.reserve(p->prof_n);
++            double spin_total = 0; size_t n_spin = 0;
++            for (size_t i = 0; i < p->prof_n; ++i) {
++                if (spin[2*i] != 0 || spin[2*i+1] != 0) {  // kernel may not have run for late calls
++                    double d = (double)(spin[2*i+1] - spin[2*i]) * 1e3 / (double)rate_khz;
++                    sp_us.push_back(d); spin_total += d; n_spin++;
++                }
++            }
++            if (n_spin > 0) {
++                std::sort(sp_us.begin(), sp_us.end());
++                auto pct = [&](double q) { return sp_us[(size_t)(q * (sp_us.size() - 1))]; };
++                fprintf(stderr,
++                    "AR-PROFILE:   dev%d spin: %zu calls, total %.1f ms, avg %.2f us | "
++                    "min %.1f p50 %.1f p90 %.1f p99 %.1f max %.1f us (clock %d kHz)\n",
++                    dev, n_spin, spin_total/1e3, spin_total/n_spin,
++                    sp_us.front(), pct(0.50), pct(0.90), pct(0.99), sp_us.back(), rate_khz);
++            }
++        }
++    }
++    // --- end WIP instrumentation -------------------------------------------
++
 +    for (int i = 0; i < p->n_devices; ++i) {
 +        p->host_buf[i].free();
 +        p->host_large[i].free();
@@ -573,6 +675,15 @@ index 000000000..eeb171795
 +        if (p->streams[i]) {
 +            ggml_cuda_set_device(p->devices[i]);
 +            hipStreamDestroy(p->streams[i]);
++        }
++    }
++    if (p->prof_enabled) {
++        for (int i = 0; i < p->n_devices; ++i) {
++            if (p->prof_spin[i]) {
++                ggml_cuda_set_device(p->devices[i]);
++                hipFree(p->prof_spin[i]);
++                p->prof_spin[i] = nullptr;
++            }
 +        }
 +    }
 +    p->arrival.free();
@@ -770,6 +881,22 @@ index 000000000..eeb171795
 +    GGML_ASSERT(p->buf_bytes >= type_size);
 +    const size_t    nbytes      = (size_t) ne * type_size;
 +
++    // --- WIP tuning instrumentation: bracket the call on device 0's compute
++    // stream (the caller's stream; both paths' last work lands there).
++    ggml_backend_cuda_context * prof_ctx = static_cast<ggml_backend_cuda_context *>(backends[0]->context);
++    hipStream_t prof_stream = prof_ctx->stream();
++    const bool prof_on = p->prof_enabled && p->prof_n < GGML_CUDA_AR_PROF_MAX;
++    const size_t prof_idx = p->prof_n;
++    if (prof_on) {
++        ggml_cuda_set_device(p->devices[0]);
++        hipEventCreateWithFlags(&p->prof_t0[prof_idx], 0);
++        hipEventCreateWithFlags(&p->prof_t1[prof_idx], 0);
++        hipEventRecord(p->prof_t0[prof_idx], prof_stream);
++        p->prof_ne[prof_idx] = ne;
++        p->prof_n++;
++    }
++    // --- end WIP instrumentation ---
++
 +    bool compute_flag[GGML_CUDA_MAX_DEVICES] = {};
 +    for (int i = 0; i < n; ++i) {
 +        compute_flag[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
@@ -924,7 +1051,8 @@ index 000000000..eeb171795
 +                    static_cast<int>(chunk_elems), \
 +                    ggml_cuda_ar_arrival_ptr(p, slot, i), \
 +                    ggml_cuda_ar_arrival_ptr(p, slot, peer), \
-+                    token)
++                    token, \
++                    (prof_on) ? (p->prof_spin[i] + prof_idx * 2) : nullptr)
 +
 +                if (use_bf16) {
 +                    GGML_ASSERT(input_type == GGML_TYPE_F32);
@@ -947,6 +1075,12 @@ index 000000000..eeb171795
 +            }
 +        }
 +    }
++
++    // --- WIP tuning instrumentation: close the call bracket ---
++    if (prof_on) {
++        hipEventRecord(p->prof_t1[prof_idx], prof_stream);
++    }
++    // --- end WIP instrumentation ---
 +
 +    return ok;
 +}
