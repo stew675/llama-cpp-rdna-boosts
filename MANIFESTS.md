@@ -149,9 +149,9 @@ debugging the bf16 GDN kernel, deterministically fails `rms_norm_back` /
 | 05 | `05-bit-identical-decode-cpu.patch` | ggml/src/ggml-cpu/llamafile/sgemm.cpp | none |
 | 06 | `06-host-buffer-revert.patch` | ggml/src/ggml-cuda/ggml-cuda.cu | none |
 | 07 | `07-meta-device-wrapper-skip.patch` | src/llama.cpp | none |
-| 08 | `08-fused-core.patch` | mmvq.{cu,cuh}, ggml-cuda.cu (try_fuse), norm.{cu,cuh}, unary.{cu,cuh}, common.cuh, fattn.cu, fattn-tile.cuh | **blocks 03 and 04 MUST be applied first** (fattn-tile.cuh / fattn.cu territory) |
+| 08 | `08-fused-core.patch` | mmvq.{cu,cuh}, ggml-cuda.cu (try_fuse), norm.{cu,cuh}, unary.{cu,cuh}, common.cuh, fattn.cu, fattn-tile.cuh (re-based on regen block 04), mmvq.cu Q6_K nwarps RDNA3_0 | **blocks 03 and 04 MUST be applied first** (fattn-tile.cuh / fattn.cu territory) |
 | 09 | `09-meta-headroom.patch` | ggml/src/ggml-backend-meta.cpp | none (independent; apply last) |
-| 10 | `10-k-quant-boosts.patch` | ggml/src/ggml-cuda/{ggml-cuda.cu,mmq-vec-dot.cuh,mmvq.cu,vecdotq.cuh}, tests/test-backend-ops.cpp | none (apply last; omit for greedy purity) |
+| 10 | `10-k-quant-boosts.patch` | ggml/src/ggml-cuda/{ggml-cuda.cu,mmq-vec-dot.cuh,mmvq.cu,vecdotq.cuh}, tests/test-backend-ops.cpp; VDR_Q8_0_Q8_1_MMVQ=4 RDNA3_0 | none (apply last; omit for greedy purity) |
 | 11 | `11-cuda-prefill-graph-skip.patch` | ggml/src/ggml-cuda/ggml-cuda.cu | none (independent; apply last) |
 
 Block numbers are the apply order: `01` is the smallest number and applies
@@ -385,3 +385,28 @@ Key findings:
   only when pp <= ubatch (a single graph shape to probe).
 - **Decode (tg128) unchanged** at 24.55 t/s (graphs still help decode).
 - **No numeric drift:** generated tokens byte-identical to the no-graph path.
+
+## Validation record (2026-08-28, ROCm 7.14, gfx1100) - RDNA3_0 wins (blocks 04/08/10)
+
+Blocks 04, 08, 10 regenerated to absorb the rdna3-boosts RDNA3_0 (gfx1100)
+measurements. All three: applied-tree byte-identical to the validated
+consumer application; gfx1201 paths unchanged; RDNA3_5 (gfx115x) kept on the
+conservative settings pending verification on those GPUs.
+
+- **block 04 (R4)**: WMMA flash-attn heads >128 enabled on RDNA3_0 (576 cap,
+  same as RDNA4) + `GGML_CUDA_FA_WMMA_MAX_HEAD` env override. gfx1100:
+  FLASH_ATTN_EXT 4568/4568 vs CPU ref; gemma-4-12b head 240 pp2048 2263-2270
+  vs 2226 tile (+1.7%); perf-harness >128-head sweep neutral +/-1% except
+  hsk=256/nh=8/nb=256 +14.2%; no shape regresses >1%.
+- **block 08 (R5)**: mmvq Q6_K nwarps 2->8 on RDNA3_0. gfx1100: tg128 95.27
+  -> 96.40 (+1.1%), PPL 6.9615 == 6.9615, greedy byte-identical. The other
+  RDNA4-widened types (Q2_K/Q4_K/Q5_K/IQ4_XS at nwarps=8) regress -2..-7% on
+  gfx1100 and stay at 1 (original W7900 whitelist confirmed correct).
+- **block 10 (R3)**: VDR_Q8_0_Q8_1_MMVQ=4 on RDNA3_0 (was RDNA4-only,
+  "pending verification"). gfx1100: decode tg128 123.74 -> 133.34 (+7.8%);
+  wikitext-2 PPL 8.4401 == 8.4401 (12x4096); MUL_MAT vs CPU OK; greedy
+  byte-identical.
+- Methodology notes: llama-cli default sampler chain uses RNG even at -t 0
+  (Locally Typical sampler; random default seed) - determinism checks must
+  use `--top-k 1` (or a fixed --seed). PPL evals need a stable config
+  (`-c 4096`): at n_ctx=512 the estimate jitters +/-5% run-to-run.

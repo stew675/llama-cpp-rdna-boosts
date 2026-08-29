@@ -49,13 +49,13 @@ below uses the current branch.
 | `01-adaptive-mtp.patch` | adaptive speculative draft depth for MTP (`--draft-mtp-adaptive`) | 5 commits |
 | `02-chunked-gdn.patch` | fused chunked gated-delta-net prefill kernel (fp32 + bf16/WMMA tensor-core as S_v=128 default on RDNA4 gfx12 AND RDNA3/3.5 gfx11; runtime-cc dispatch - fixes issue #1 build error and the host-pass gate regression; launch-rejection fallback + kkt barrier - fixes issue #2) | 13 commits + 3 consumer-side fixes |
 | `03-bf16-kv-cache.patch` | native-BF16 flash-attn tile kernel, BF16 KV cache, IMRoPE + set-rows fusion | 8 commits |
-| `04-wmma-flash-attn.patch` | RDNA4 WMMA flash-attention path; Q6_K mmq prefill tuning | 1 commit |
+| `04-wmma-flash-attn.patch` | RDNA4 + RDNA3_0 WMMA flash-attention path (heads to 576, `GGML_CUDA_FA_WMMA_MAX_HEAD` override); Q6_K mmq prefill tuning | 1 commit |
 | `05-bit-identical-decode-cpu.patch` | bit-identical CPU decode / speculative-verify batches | 1 commit |
 | `06-host-buffer-revert.patch` | back out integrated-GPU host buffers on HIP (PR #24233) | 1 commit |
 | `07-meta-device-wrapper-skip.patch` | skip the Meta device wrapper with a single GPU | 1 commit |
-| `08-fused-core.patch` | fused quantized-matmul kernels + graph fusions (SSM/MoE), GPU bit-identical decode | 16 commits, 1 diff |
+| `08-fused-core.patch` | fused quantized-matmul kernels + graph fusions (SSM/MoE), GPU bit-identical decode, RDNA3_0 mmvq Q6_K nwarps 2->8 | 16 commits, 1 diff |
 | `09-meta-headroom.patch` | meta-buffer compute-container headroom | 1 commit |
-| `10-k-quant-boosts.patch` | k-quant + mmvq-parameter umbrella: Q6_K VDR=2 (ex-block 09) + Q4_K/Q5_K/Q8_0 VDR=4 mmvq decode, RDNA3_5 gfx1151 param table (ex-block 06), mmq scale-load hoist, RDNA4 MoE mmid whitelist | combined |
+| `10-k-quant-boosts.patch` | k-quant + mmvq-parameter umbrella: Q6_K VDR=2 (ex-block 09) + Q4_K/Q5_K/Q8_0 VDR=4 mmvq decode (RDNA4 + RDNA3_0), RDNA3_5 gfx1151 param table (ex-block 06), mmq scale-load hoist, RDNA4 MoE mmid whitelist | combined |
 | `11-cuda-prefill-graph-skip.patch` | skip CUDA graphs for multi-token PRE-FILL graphs (varying ubatch makes capture pure overhead); decode keeps graph replay | 1 commit |
 
 Blocks are listed in apply order; `08-fused-core` needs blocks 03+04 in the
