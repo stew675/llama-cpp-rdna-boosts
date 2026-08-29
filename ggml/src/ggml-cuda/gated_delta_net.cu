@@ -1,4 +1,5 @@
 #include "gated_delta_net.cuh"
+#include "gated_delta_net_chunked.cuh"
 #include "ggml-cuda/common.cuh"
 
 template <int S_v, bool KDA, bool keep_rs_t>
@@ -285,6 +286,65 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int K = ggml_get_op_params_i32(dst, 0);
     const bool keep_rs = K > 1;
+
+    // fused chunked prefill: more than one token per sequence, no snapshots, scalar gate, and
+    // no fused-state-cache cpy to honour -- the grid maps one block per (chunk, head, seq).
+    // Everything else (decode, MTP snapshots, KDA vector gates) stays on the sequential kernel.
+    // GGML_CUDA_GDN_CHUNKED=0 forces the sequential fallback (A/B perf comparison).
+    // The fused GDN->cpy (cache != nullptr) is honoured for K == 1: the chunked kernel writes
+    // its new state directly into the cache slot, so the cpy node can be skipped.
+    // The chunked ops report a synchronous launch rejection (ROCm: AQL dispatch refused, e.g. a
+    // code object carrying a hidden hostcall buffer on a platform without PCIe atomics ->
+    // hipErrorIllegalState, llama-cpp-rdna-boosts#2) and we recompute with the sequential
+    // kernel below instead of aborting -- a rejected launch has no side effects, so the
+    // fallback is bit-identical to running with GGML_CUDA_GDN_CHUNKED=0. An async fault inside
+    // a launched kernel is NOT caught here and still surfaces at the next sync point.
+    if ((cache == nullptr || K == 1) && !kda && K == 1 && n_tokens > 1 &&
+        (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
+        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
+        if (env == nullptr || strcmp(env, "0") != 0) {
+            // GGML_CUDA_GDN_CHUNKED_BF16=0 opts OUT of the bf16/WMMA tensor-core path; it is
+            // the DEFAULT for S_v == 128 on the HIP build (near-lossless: PPL +0.056%, KL
+            // 0.0036 on wikitext-2 vs the fp32 path; not bit-exact). Everything else keeps
+            // the fp32 chunked path.
+            float * state_d_ext = cache ? cache->data : nullptr;
+#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
+            // NOTE: RDNA3/RDNA4 are device-pass-only macros - never gate HOST code on them.
+            // Use the runtime device cc. The two bf16/WMMA kernels are fully segregated by
+            // architecture (no shared code, so they cannot cross-regress):
+            //   RDNA4 (gfx12) -> gated_delta_net_chunked_bf16.cu (the fork's validated
+            //     RDNA4-only kernel, restored verbatim after the in-place dual-arch refactor
+            //     regressed the gfx12 path - NaN/inf on the bf16 chunked GDN).
+            //   RDNA3 (gfx11) -> gated_delta_net_chunked_bf16_gfx11.cu (first-gen WMMA port).
+            const int cc_ = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            const bool bf16_rdna = GGML_CUDA_CC_IS_RDNA4(cc_) || GGML_CUDA_CC_IS_RDNA3(cc_);
+            const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
+            // bf16/WMMA is the S_v == 128 default on RDNA3 and RDNA4 (opt-OUT via
+            // GGML_CUDA_GDN_CHUNKED_BF16=0; near-lossless: PPL +0.056% on RDNA4, -0.09% on
+            // RDNA3, not bit-exact). Everything else keeps the fp32 chunked path.
+            const bool want_bf16 = bf16_rdna && S_v == 128 &&
+                (envb == nullptr || strcmp(envb, "0") != 0);
+            if (want_bf16) {
+                bool bf16_ok = false;
+                if (GGML_CUDA_CC_IS_RDNA4(cc_)) {
+                    bf16_ok = ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_d_ext);
+                } else {
+                    bf16_ok = ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ctx, dst, state_d_ext);
+                }
+                if (bf16_ok) {
+                    return;
+                }
+                GGML_LOG_WARN("%s: bf16 chunked GDN launch rejected by the driver; falling back to the sequential kernel (GGML_CUDA_GDN_CHUNKED=0 equivalent)\n", __func__);
+            } else
+#endif
+            {
+                if (ggml_cuda_op_gated_delta_net_chunked(ctx, dst, state_d_ext)) {
+                    return;
+                }
+                GGML_LOG_WARN("%s: fp32 chunked GDN launch rejected by the driver; falling back to the sequential kernel (GGML_CUDA_GDN_CHUNKED=0 equivalent)\n", __func__);
+            }
+        }
+    }
 
     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
     float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
