@@ -88,6 +88,47 @@ HIP_VISIBLE_DEVICES=1,2 ~/llama-cpp-rdna-boosts/wip/tools/ar_signal_bench (build
 rocprofv3 -d /tmp/rocprof-out -r -- <cmd>   # then query the sqlite kernels table
 ```
 
+## Item B — the rocprof mystery: RESOLVED (session 7/8, 2026-08-29)
+
+Workflow fixed: rocprofv3 SIGABRTs on 7.1.10 in the default rocpd writer —
+use `--kernel-trace --output-format csv` (works, exit 0).
+
+Diagnostic (rocprof trace of 3-GPU decode, 2432 AR calls, aligned by index):
+
+- dev0 (HIP 0 = bus 06 = rocprof Agent 2) is the late card: its AR kernel
+  starts +12.7 us (p50) late vs the other two (+0.5 us).
+- Decomposition: prev-kernel END +7.9 us late + AR-adjacent gap
+  (prev-end -> AR-start) +4.8 us.
+- The last pre-AR kernel is the SAME op (mul_mat_vec_q, 50.7-50.8 us) on
+  all agents; the full kernel census is SYMMETRIC (equal types/counts);
+  AR durations differ ONLY by the spin (dev0 13.3 us vs peers 27.0 us —
+  the AR absorbs the lateness and ends aligned).
+- Intra-step dispatch-gap sums: dev0 43.5 us vs 38.4/41.7 (p50).
+- => the wait is per-device kernel-to-kernel DISPATCH-gap asymmetry at the
+  KFD/CP level on bus 06 (~0.5 us/kernel x 9 + ~4.8 us AR-adjacent).  NOT
+  op composition, NOT the signal path, NOT the AR kernel (phase-1/3
+  symmetric).
+
+Why rocprof "fixes" it: its per-dispatch tracing overhead re-paces the
+host's enqueue stream (HANDOFF hypothesis 2, pacing, CONFIRMED) so the
+per-step gap accumulation never builds.  It's perturbation, not a fix (its
+overhead costs ~20% tg).
+
+Replication verdict: the asymmetry is CP-level dispatch latency; it cannot
+be fixed from the AR kernel.  The cross-stream AR variant cannot change CP
+dispatch latency (and session-1 already showed the event handshake costs
+more than it saves).  The only real fix would be fusing phase-1 staging
+(shard->wire write + arrival token) into the END of each device's
+subgraph graph, so peers stop spinning at dev0's graph end instead of
++12.7 us later — the HANDOFF's "split stage/consume" design, a deep
+integration (graph construction, ggml-backend-meta) worth ~2-3% decode;
+NOT attempted, documented as future work.
+
+Dead end re-checked: GGML_CUDA_DISABLE_GRAPHS=1 is a WASH for tg (tg512
+41.56 vs 41.60, tg64 41.26 vs 41.34) — no graphs change needed.  (An
+apparent +18% for graphs-off in an r1 run with AR_PROFILE=1 was an
+instrumentation artifact; re-measured clean.)
+
 ## Baselines on 7.1.10-200 (the new reality), UNPINNED (2026-08-29 pm)
 
 Depth-16384 tg240 runs=5, Q8_0 bf16 KV, tensor split:
