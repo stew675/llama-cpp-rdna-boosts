@@ -1,24 +1,34 @@
 # BASELINE - provenance and drift policy
 
-Branch: `main` points at the current checkpoint, currently
-`baseline/cc83d7b48` (current, recommended)
-Upstream range: `d7bd3bfca` .. `cc83d7b48` (4 upstream commits: SYCL/Vulkan/
-metal/mul_mat_id-test only - none touch the block files)
+Current state: `main` is the delivery branch carrying the **12-patch set**
+(blocks 01-11 + the hybrid all-reduce block 12) generated against the fork
+point **llama.cpp master `17252c769`**. The `baseline/<sha>` branches below
+are HISTORICAL checkpoints of the old pre-block-12 structure (patch
+numbering 01-11 against older upstream ranges, `git apply` flow); they
+remain as known-good records for those upstream versions.
 
-Older branches: `baseline/fe235f434` (the gfx12/gfx11 segregation baseline,
-validated on all three architectures - gfx1100, gfx1151, gfx1201),
-`baseline/192067b72` (same patch files as `d222767c7`,
-zero-fuzz-validated at `192067b72`; superseded by the block 01 re-base for
-the `n_max` drift), `baseline/d222767c7` (12-block set, validated against
-`d222767c7`) and `baseline/758443071` (the original set for the older
-upstream range; see "Older branches" below).
+> **Naming collision warning:** in the OLD records below, "block 12"
+> sometimes means the old *k-quant umbrella* (folded into what is now block
+> 10) and sometimes the *hybrid all-reduce* (the current block 12). In the
+> current delivery, block 12 = the hybrid all-reduce, period.
 
-## Baseline
+Older branches (historical): `baseline/fe235f434` (the gfx12/gfx11
+segregation baseline, validated on gfx1100, gfx1151, gfx1201),
+`baseline/192067b72` (same patch files as `d222767c7`, zero-fuzz-validated
+at `192067b72`), `baseline/d222767c7` (validated against `d222767c7`) and
+`baseline/758443071` (the original set for the older upstream range).
 
-All patches on this branch are generated against **llama.cpp upstream master
-at `d7bd3bfca`** (the gfx12/gfx11 segregation + gfx1151-ports unified set;
-blocks 01-11 as in `baseline/fe235f434`, validated on gfx1100, gfx1151 and
-gfx1201).
+## Baseline (current delivery)
+
+All 12 patches are generated against **llama.cpp upstream master at
+`17252c769`**: blocks 01-11 = the fork's `rdna-boosts` branch commits
+`2b7a135cb..f6f8f6778` (exported with `git format-patch`); block 12 = the
+fork's working-tree delta vs `f6f8f6778` over four files
+(`allreduce-hip.cu` new, `allreduce.cu`, `allreduce.cuh`, `ggml-cuda.cu`),
+including the RDNA4-only gate. `scripts/make-patches.sh` regenerates both.
+Verified 2026-08-29: clean apply (`git am` 01-11 + `git apply` 12) on a
+fresh checkout at `17252c769`, full build clean, llama-cli same-seed
+coherence IDENTICAL to the fork build, tg64 38.12 / tg512 41.08.
 
 ### Checkpoint cut (2026-08-29): master `cc83d7b48` - cross-architecture consolidation bookend
 
@@ -206,32 +216,41 @@ validation:
 
 ## Per-block provenance
 
-Blocks were re-generated from the validated application (one commit per
-block on the `rdna-boosts` branch of the consumer checkout at `d222767c7`),
-so each patch is exactly the block's net change against the new baseline.
-The original source commits on the fork branch `chunked-gdn` (parent
-`758443071`) remain:
+The CURRENT delivery patches (0001-0011) are the fork's `rdna-boosts` branch
+commits `2b7a135cb..f6f8f6778` exported with `git format-patch` (one commit
+per block, `17252c769` as the base); block 12 is the fork's working-tree
+delta vs `f6f8f6778` (four files, RDNA4-gated). The table below records the
+ORIGINAL source commits on the fork branch `chunked-gdn` (parent
+`758443071`) whose content the blocks carry — historical provenance, kept
+for the record:
 
-| patch | source commits on `chunked-gdn` (history order) |
+| patch | source commits (original lineage) |
 |-------|--------------------------------------------------|
-| `01-adaptive-mtp.patch` | fork branch `adaptive-mtp` (re-based on `fe235f434`): `c0f398ec5` `f3208c5c5` `0bbd7f3c2` `b5c99b890` `b26c775e1` - same 5-commit series as the old `chunked-gdn` lineage (`87ad1db26` `b56926039` `d0d7ff27e` `8d70e21f5` `0cf87e989`), re-based with the `common_speculative_impl` `n_max` constructor fix |
-| `02-chunked-gdn.patch` | `876ef1f0b` `5d2090e96` `b220647b1` `a4982afa2` `659f94987` `2a1e5c5a8` `1da07e19b` `77d51ee28` `abfa24265` `be46c7621` `3441b7d40` `246136122` `05cab3c41` |
-| `03-bf16-kv-cache.patch` | `5485e79e4` `b98265cfd` `07767a88a` `ef3673358` `b6bfa422e` `5e6072558` `bd5bf0ea3` `d33ce1adf` |
-| `04-wmma-flash-attn.patch` | `beaf69fb6` |
-| `05-bit-identical-decode-cpu.patch` | `89ac4ba1f` |
-| `08-fused-core.patch` | `14e5dd427` `d0e6119a7` `333e8f950` `c11752b18` `10e016df4` `85387ba3a` `8e1300159` `ac08b6d85` `a84112dcf` `9b4554626` `555e79ab2` `00f53040f` `ec09a818e` `bb64338f9` `4c0440841` `3d65d7979` |
-| `06-host-buffer-revert.patch` | `edb8d44c0` |
-| `07-meta-device-wrapper-skip.patch` | `32670eec8` |
-| `09-meta-headroom.patch` | `f2a22a71` (fork branch `rdna-boosts`, NOT on `chunked-gdn`) |
-| `10-k-quant-boosts.patch` | combined k-quant + mmvq-parameter umbrella: `cd35abd19` (Q6_K, ex-block 09) + `a7d092368`, `f1a072dcd` (Q4_K/Q5_K/Q8_0) + `5b320ed94` (RDNA3_5 table, ex-block 06, incl. the verify-batch hunk block 08 used to carry) - all fork branch `rdna-boosts`, NOT on `chunked-gdn`; the patch is regenerated from the consumer application, see `scripts/make-patches.sh` |
+| `0001-…-adaptive-MTP…` | fork branch `adaptive-mtp` (re-based): `c0f398ec5` `f3208c5c5` `0bbd7f3c2` `b5c99b890` `b26c775e1` — same 5-commit series as the old `chunked-gdn` lineage (`87ad1db26` `b56926039` `d0d7ff27e` `8d70e21f5` `0cf87e989`), re-based with the `common_speculative_impl` `n_max` constructor fix |
+| `0002-…-chunked-gdn…` | `876ef1f0b` `5d2090e96` `b220647b1` `a4982afa2` `659f94987` `2a1e5c5a8` `1da07e19b` `77d51ee28` `abfa24265` `be46c7621` `3441b7d40` `246136122` `05cab3c41` |
+| `0003-…-bf16-kv-cache…` | `5485e79e4` `b98265cfd` `07767a88a` `ef3673358` `b6bfa422e` `5e6072558` `bd5bf0ea3` `d33ce1adf` |
+| `0004-…-wmma-flash-attn…` | `beaf69fb6` (plus the gfx1151-ports RDNA3_5 consumer-side fix) |
+| `0005-…-bit-identical-decode-cpu…` | `89ac4ba1f` |
+| `0008-…-fused-core…` | `14e5dd427` `d0e6119a7` `333e8f950` `c11752b18` `10e016df4` `85387ba3a` `8e1300159` `ac08b6d85` `a84112dcf` `9b4554626` `555e79ab2` `00f53040f` `ec09a818e` `bb64338f9` `4c0440841` `3d65d7979` |
+| `0006-…-host-buffer-revert…` | `edb8d44c0` |
+| `0007-…-meta-device-wrapper-skip…` | `32670eec8` |
+| `0009-…-meta-headroom…` | `f2a22a71` (fork branch `rdna-boosts`, NOT on `chunked-gdn`) |
+| `0010-…-k-quant-boosts…` | combined k-quant + mmvq-parameter umbrella: `cd35abd19` (Q6_K, ex-block 09) + `a7d092368`, `f1a072dcd` (Q4_K/Q5_K/Q8_0) + `5b320ed94` (RDNA3_5 table, ex-block 06, incl. the verify-batch hunk block 08 used to carry) — all fork branch `rdna-boosts`, NOT on `chunked-gdn` |
+| `0011-…-prefill-graph-skip…` | the CUDA prefill-graph skip (fork `rdna-boosts` branch) |
+| `12-hybrid-allreduce-hip.patch` | WIP exploration (`wip/12-hybrid-allreduce-hip.md`); no source commit — the fork's working-tree delta vs `f6f8f6778` (allreduce-hip.cu + allreduce.cu + allreduce.cuh + ggml-cuda.cu), RDNA4-gated |
 
-> `08-fused-core.patch` additionally carries a local correctness fix on top of
+> `0008-…-fused-core…` additionally carries a local correctness fix on top of
 > the fork commits: the Q8_1 input cache now keys entries by `src1->data` in
 > addition to the view root, so the stack-allocated per-expert `src1_slice`
 > tensors of the mul_mat_id host-sort fallback never collide (equal token
 > counts produced identical keys, reusing the wrong expert's quantized
 > tokens; nondeterministic iq1_m MUL_MAT_ID failures on RDNA4).
-| `rdna-boosts-all.patch` (repo root) | regenerated from the consumer application at `fe235f434` (diff of the fresh-master checkout with all 10 blocks applied vs `fe235f434`); the block-01 content is the fork `adaptive-mtp` branch, the rest is the `758443071..chunked-gdn` + `f2a22a71` + `a7d092368` + `f1a072dcd` + `5b320ed94` content carried forward unchanged |
+
+`rdna-boosts-all.patch` (repo root) = the entire 12-patch net as ONE patch,
+regenerated from the verified clean-apply tree (fork point `17252c769` + all
+12 blocks applied), 37 files — including the hybrid all-reduce. It applies
+cleanly on the fork point alone; use it only when you do not need the
+per-block reviewability of `patches/`.
 
 ## Older branches
 

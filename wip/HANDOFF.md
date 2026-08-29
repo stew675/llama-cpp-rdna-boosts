@@ -60,23 +60,22 @@ WIP experiments (fused-stage, pacing) archived at `work-archive/fused-stage-paci
 
 ## Where things stand
 
-- **WIP block 12 (hybrid all-reduce)**: implemented, built (`build-rocm-hybrid`),
-  validated, preserved as WIP in `wip/12-hybrid-allreduce-hip.{md,patch}`.
-  NOT integrated into the apply chain. Commits: `dd66c07`, `153f975`.
-- **Working tree**: `~/llama.cpp` has 3 changed files, uncommitted:
-  `ggml/src/ggml-cuda/allreduce-hip.cu` (new: HIP port + env-gated profiler),
-  `allreduce.cu` (guard), `ggml-cuda.cu` (hybrid dispatch + is_small).
-- **User's server configs updated** to the recommended pairing
-  (`HIP_VISIBLE_DEVICES=1,2` = cards 09+03; or 2,1). No `NCCL_P2P_DISABLE`.
-  Default allreduce is now `hybrid` (Linux).
+- **Block 12 (hybrid all-reduce): DELIVERED** as `patches/12-hybrid-allreduce-hip.patch` (clean hybrid + RDNA4-only gate, WITHOUT the fused/pacing WIP). Clean-apply simulation VERIFIED (build + coherence + tg64 38.12 / tg512 41.08). Fork HEAD `155debcdc` (the gate commit), tree clean.
+- **WIP experiments**: fused-stage + pacing archived at `work-archive/fused-stage-pacing/` (env-gated OFF by default; not part of the delivery).
+- **Server config**: `~/.llama-server-config.yaml` rocmstew1/2/3 now point at the hybrid build (`~/llama.cpp/build-rocm-hybrid`). Recommended deployment: 3-GPU (`HIP_VISIBLE_DEVICES=0,1,2`), hybrid default, UNPINNED (the pin is a regression).
 
-## Current server env (recommended, verified)
+## Current server env (recommended, verified — superseded 2026-08-29 pm)
+
+The pre-session-7 recommendation (pair `1,2`, pin on) was REVERSED: the
+`~/bin/high-power` pin is a REGRESSION (tg -5-7%, pp -15-18% on RCCL/hybrid
+paths), and the deployment moved to 3-GPU unpinned. Current config:
 
 ```
-HIP_VISIBLE_DEVICES=1,2 NCCL_PROXY_CPUSET=8,9,10,11,12,13,14,15 GGML_CUDA_DISABLE_GRAPHS=0
+HIP_VISIBLE_DEVICES=0,1,2 GGML_CUDA_DISABLE_GRAPHS=0
 ```
-(no `NCCL_P2P_DISABLE=1` — hybrid handles the split). Optionally explicit:
-`GGML_CUDA_ALLREDUCE=hybrid`. Old values `nccl|internal|none` keep old semantics.
+(no pin, no `NCCL_P2P_DISABLE=1` — hybrid handles the split). Optionally
+explicit: `GGML_CUDA_ALLREDUCE=hybrid`. Old values `nccl|internal|none` keep
+old semantics.
 
 ## Verified numbers (27B Q8_0, depth 16384, 2 GPU)
 
@@ -117,7 +116,9 @@ All PCIe 5.0 x4.
   reboot test: `amdgpu.dpm=0` (S state persists even at high).  Stable
   metric: tg512 = 39.69 ± 0.41 (3-GPU, pinned).
 - Server note: keep the pin (`~/bin/high-power` + runtime PM on) — ~7
-  us/call ≈ 2% decode, costs ~30 W/card idle.
+  us/call ≈ 2% decode, costs ~30 W/card idle. **SUPERSEDED by session 7:
+  the pin is a net REGRESSION (tg -5-7%, pp -15-18% on RCCL/hybrid); the
+  server must run UNPINNED.**
 
 ## Key findings (do not re-derive)
 

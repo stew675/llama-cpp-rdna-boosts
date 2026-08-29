@@ -1,11 +1,17 @@
 # 12-hybrid-allreduce-hip — WIP
 
-**Status: WORK-IN-PROGRESS — NOT integrated.** This is the next block in the
-numbering (after 11-cuda-prefill-graph-skip) but lives in `wip/` precisely so
-it is *not* picked up by `scripts/apply-all.sh` and is *not* part of any
-`baseline/*` checkpoint. It is preserved here as the working base for
-continued tuning. The changes are applied to `~/llama.cpp` (rdna-boosts
-branch, working tree, uncommitted) and built as `build-rocm-hybrid`.
+**Status: DELIVERED as block 12 (2026-08-29).** The clean hybrid (without
+the fused/pacing experiments) is `patches/12-hybrid-allreduce-hip.patch`,
+RDNA4-gated (gfx1200/gfx1201; falls back to RCCL elsewhere), and the
+clean-apply simulation passed (build + coherence + tg64 38.12 / tg512
+41.08). This file is the EXPLORATION writeup that produced it — historical
+detail, tuning roadmap, and env-knob semantics; see `patches/README.md` for
+the current apply instructions. The fused-stage + pacing experiments it
+spawned are archived (env-gated OFF) in `work-archive/fused-stage-pacing/`.
+
+The changes live on `~/llama.cpp` (`rdna-boosts` branch, committed as
+`dd66c07` `153f975` `6326757` `c9d8621` `6cc4900` + the RDNA4 gate
+`155debcdc`) and build as `build-rocm-hybrid`.
 
 Date: 2026-08-29. Machine: `soar` (3x R9700 gfx1201, ROCm 7.14, 9950X3D).
 
@@ -34,20 +40,23 @@ host-staged AR pipeline (`allreduce.cu`) was designed for exactly this
 (low-latency decode), but was CUDA-only (`#if !defined(GGML_USE_HIP)` with
 stubs). This block ports it to HIP and adds a per-size hybrid dispatcher.
 
-## The patch (3 files, +1031/−36)
+## The patch (4 files, +1600/−37 in the delivered form)
 
 | file | change |
 |---|---|
-| `ggml/src/ggml-cuda/allreduce-hip.cu` | **new** (~950 lines). HIP-native port of the internal AR pipeline: chunked-kernel path (small tensors, single kernel stages via mapped pinned host + busy-waits on host-memory arrival tokens), copy-engine path (large tensors, D2H+H2D chunks + event handoff), 2-slot pool, cache-line-padded arrival ring, BF16 on-wire round-trip for F32. Native `hip*` APIs throughout; `__nanosleep` (absent in HIP) replaced with a bounded dummy spin; deliberately no system atomics (`__threadfence_system` + volatile only) |
+| `ggml/src/ggml-cuda/allreduce-hip.cu` | **new** (~1467 lines in the delivered patch). HIP-native port of the internal AR pipeline: chunked-kernel path (small tensors, single kernel stages via mapped pinned host + busy-waits on host-memory arrival tokens), copy-engine path (large tensors, D2H+H2D chunks + event handoff), 2-slot pool, cache-line-padded arrival ring, BF16 on-wire round-trip for F32, s_sleep poll (`GGML_CUDA_AR_SLEEP`, default 1). Native `hip*` APIs throughout; deliberately no system atomics (`__threadfence_system` + volatile only). **RDNA4-only gate**: the pipeline refuses to init unless every device is gfx1200/gfx1201 (`gcnArchName` check in `ggml_cuda_ar_pipeline_init`), falling back to RCCL with a warning |
 | `ggml/src/ggml-cuda/allreduce.cu` | guard `#else` → `#elif defined(GGML_USE_MUSA)`: HIP no longer compiles the stubs (the new file owns HIP); CUDA impl untouched |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | +104. `ggml_backend_cuda_comm_is_small()` (shared with the existing NCCL FP32/BF16 heuristic); inits return bool; new **hybrid** init (brings up BOTH RCCL comms and the internal pipeline); `comm_allreduce_tensor` routes small→internal, large→RCCL. New env value `GGML_CUDA_ALLREDUCE=hybrid`; **Linux default is now hybrid** (both CUDA and HIP builds — behavior change) |
+| `ggml/src/ggml-cuda/allreduce.cuh` | HIP-side declarations for the internal pipeline (n≥2 support) |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | +118. `ggml_backend_cuda_comm_is_small()` (shared with the existing NCCL FP32/BF16 heuristic); inits return bool; new **hybrid** init (brings up BOTH RCCL comms and the internal pipeline); `comm_allreduce_tensor` routes small→internal, large→RCCL. New env value `GGML_CUDA_ALLREDUCE=hybrid`; **Linux default is now hybrid** (both CUDA and HIP builds — behavior change) |
 
 Key design notes:
 
 - Small-tensor threshold = the existing NCCL heuristic (`ne < 32768` for ≤2
   backends, etc.) — decode all-reduces land under it, prefill above it.
-- Internal pipeline requires exactly 2 devices (`n_devices == 2`); 3-GPU
-  builds fall back to nccl-only (verified: 3-GPU unchanged, 9427/123.1).
+- The internal pipeline supports n in [2,8] (`n >= 2` generalization,
+  session 4: contiguous host_wire, star-gather kernel, per-device shards;
+  the copy-engine path stays n==2). The delivered RDNA4 gate applies to all
+  n.
 - Bit-equivalence: both GPUs round through the wire type (`T_wire`) before
   summing, so results are identical across devices.
 - The CE (copy-engine) path is slower than RCCL for large tensors on HIP

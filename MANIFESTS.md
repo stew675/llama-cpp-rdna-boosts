@@ -1,38 +1,44 @@
 # MANIFESTS - apply order and verification contract
 
 Squashed, standalone diff blocks of RDNA-specific performance and correctness
-work from the `chunked-gdn` branch of the
-[llama.cpp fork](https://github.com/stew675/llama.cpp), packaged for easy
-application to mainline llama.cpp.
+work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
+(`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
-The branch is 48 commits of RDNA work on top of upstream master
-(`758443071`). Those commits decompose into **10 functional blocks**: 9 clean
-standalone diffs and 1 "fused core" (16 mutually-entangled commits extracted as
-one combined diff, applied last). One follow-up fix was added later as
-**block 09** (`09-meta-headroom.patch`, meta-buffer compute-container
-headroom) and the k-quant kernel boosts landed as **block 10**
-(`10-k-quant-boosts.patch`, Q6_K VDR=2 + Q4_K/Q5_K/Q8_0 VDR=4 decode, mmq
-scale-load hoist, RDNA4 MoE mmid whitelist), and the CUDA prefill-graph
-skip landed as **block 11** (`11-cuda-prefill-graph-skip.patch`), so the
-full set is 11 patches in apply order. **Blocks 09 and 06 (old numbering) were retired**: block
-09's Q6_K VDR=2 decode work and block 06's gfx1151 (RDNA3_5) mmvq parameter
-table were folded into the k-quant umbrella so that all k-quant VDR/decode
-work and all mmvq parameter-table tuning lives in the one patch - excluding
-it restores 100% greedy-purity on ALL architectures (RDNA3, RDNA3_5,
-RDNA4), see the Greedy-purity note below. The numbering was compacted
-(2026-08-28): blocks run 01-10 with no gaps; block 11 (CUDA prefill-graph
-skip) was added on top the same day, so the set is 01-11.
+The **current delivery** is a **12-patch set** against the fork point
+`17252c769`: blocks 01-11 (`patches/0001-…0011-…`, the format-patch of fork
+commits `2b7a135cb..f6f8f6778`) plus **block 12**
+(`patches/12-hybrid-allreduce-hip.patch`, the hybrid HIP all-reduce — a
+working-tree delta vs `f6f8f6778`, RDNA4-gated). Apply flow: `git am` for
+01-11 (plain `git apply` of the concatenated series SILENTLY DROPS HUNKS —
+verified 2026-08-29), `git apply` for the 12th; `scripts/apply-all.sh`
+automates it.
+
+> **Naming collision warning:** in the OLD pre-delivery docs (the historical
+> records below, BASELINE.md, the `baseline/*` branches), "block 12"
+> sometimes means the old *k-quant umbrella* (now block 10) and sometimes
+> means the *hybrid all-reduce* (the current block 12). In THIS document
+> and the current delivery, block 12 = the hybrid all-reduce, period.
+
+History of the block structure: the work originated as 48 commits on the
+fork's `chunked-gdn` branch (upstream `758443071`), decomposed into
+functional blocks. Block numbering was compacted (2026-08-28): the k-quant
+umbrella absorbed retired blocks 09 and 06, the set ran 01-11, and block 12
+(hybrid all-reduce) was added as the delivery's final patch (2026-08-29).
+Blocks 09 and 06 (old numbering) are retired: their content (Q6_K VDR=2
+decode + the gfx1151 RDNA3_5 mmvq table) is folded into the k-quant umbrella
+(block 10) so all k-quant VDR/decode work and all mmvq parameter-table
+tuning lives in the one patch; excluding block 10 restores 100%
+greedy-purity on ALL architectures (see the Greedy-purity note below).
 
 This is the authoritative apply order and the verification contract for the
 patch set. It is written for humans AND LLM coding agents. Follow it exactly;
 do not skip blocks.
 
-Branch: `main` points at the current checkpoint, currently
-`baseline/cc83d7b48` (current, recommended)
-Upstream range: `d7bd3bfca` .. `cc83d7b48` (4 commits; block 01 was
-re-based for the `common_speculative_impl` n_max drift at the previous
-checkpoint; blocks 02-12 unchanged. Older branches: `baseline/192067b72`,
-`baseline/d222767c7`, `baseline/758443071`; see BASELINE.md)
+Current state: `main` is the delivery branch (flat history, 12-patch set
+against `17252c769`). The `baseline/<sha>` branches and `block/01-…11` tags
+are HISTORICAL checkpoints of the old pre-block-12 structure (older
+upstream ranges, `git apply` flow); do not use them for the current
+delivery — use `patches/` + `scripts/apply-all.sh`.
 
 ## Validation record (2026-08-28, ROCm 7.14, gfx1201) - gfx12/gfx11 segregation fix
 
@@ -219,55 +225,40 @@ debugging the bf16 GDN kernel, deterministically fails `rms_norm_back` /
 `cross_entropy_loss_back` on RDNA4). GDN results are unaffected. See
 `BASELINE.md` for the full diagnostic.
 
-## Apply order
+## Apply order (current delivery)
 
-| # | patch | files | deps |
-|---|-------|-------|------|
-| 01 | `01-adaptive-mtp.patch` | common/arg.cpp, common/common.{h,cpp}, common/speculative.cpp, common/speculative-adaptive.h, tools/server/server-context.cpp, src/models/delta-net-base.cpp, tests/test-speculative-adaptive.cpp, tests/test-arg-parser.cpp, tests/CMakeLists.txt | none |
-| 02 | `02-chunked-gdn.patch` | ggml/src/ggml-cuda/gated_delta_net.cu, gated_delta_net_chunked.{cu,cuh}, gated_delta_net_chunked_bf16.cu (RDNA4 gfx12: fork's validated RDNA4-only kernel restored verbatim, issue-#1 stub gate), gated_delta_net_chunked_bf16_gfx11.cu (RDNA3/RDNA3.5 gfx11 first-gen WMMA port on its own path; the two arch kernels share NO code), runtime-cc dispatch, tests/test-backend-ops.cpp | none |
-| 03 | `03-bf16-kv-cache.patch` | fattn-tile.{cu,cuh}, fattn.cu, common.cuh, rope.cu, ggml-cuda.cu (IMRoPE fuse), tests/test-backend-ops.cpp | none |
-| 04 | `04-wmma-flash-attn.patch` | fattn-mma-f16.cuh, mmq-vec-dot.cuh, mmq.cuh, fattn.cu, ggml-cuda.cu (WMMA dispatch), tests/test-backend-ops.cpp; consumer-side fix: RDNA3_5 wmma_max_head 320 cap (gfx1151-ports branch) | none |
-| 05 | `05-bit-identical-decode-cpu.patch` | ggml/src/ggml-cpu/llamafile/sgemm.cpp | none |
-| 06 | `06-host-buffer-revert.patch` | ggml/src/ggml-cuda/ggml-cuda.cu | none |
-| 07 | `07-meta-device-wrapper-skip.patch` | src/llama.cpp | none |
-| 08 | `08-fused-core.patch` | mmvq.{cu,cuh}, ggml-cuda.cu (try_fuse), norm.{cu,cuh}, unary.{cu,cuh}, common.cuh, fattn.cu, fattn-tile.cuh (re-based on regen block 04), mmvq.cu Q6_K nwarps RDNA3_0 | **blocks 03 and 04 MUST be applied first** (fattn-tile.cuh / fattn.cu territory) |
-| 09 | `09-meta-headroom.patch` | ggml/src/ggml-backend-meta.cpp | none (independent; apply last) |
-| 10 | `10-k-quant-boosts.patch` | ggml/src/ggml-cuda/{ggml-cuda.cu,mmq-vec-dot.cuh,mmvq.cu,vecdotq.cuh}, tests/test-backend-ops.cpp; VDR_Q8_0_Q8_1_MMVQ=4 RDNA3_0 | none (apply last; omit for greedy purity) |
-| 11 | `11-cuda-prefill-graph-skip.patch` | ggml/src/ggml-cuda/ggml-cuda.cu | none (independent; apply last) |
+| # | patch file | content | deps |
+|---|-----------|---------|------|
+| 01 | `0001-…-block-01-adaptive-MTP-draft-depth.patch` | adaptive MTP draft depth | none |
+| 02 | `0002-…-block-02-fused-chunked-gated-delta-net-p.patch` | fused chunked GDN prefill (bf16/WMMA; gfx12+gfx11 arch-segregated files, runtime-cc dispatch) | none |
+| 03 | `0003-…-block-03-BF16-KV-cache-and-native-BF16-f.patch` | BF16 KV cache + native-BF16 flash-attn | none |
+| 04 | `0004-…-block-04-RDNA4-WMMA-flash-attn-Q6_K-mmq-.patch` | WMMA flash-attn + Q6_K mmq prefill perf | none |
+| 05 | `0005-…-block-05-CPU-bit-identical-decode-verify.patch` | CPU bit-identical decode/verify batches | none |
+| 06 | `0006-…-block-06-host-buffer-revert-for-discrete.patch` | host-buffer revert for discrete GPUs | none |
+| 07 | `0007-…-block-07-meta-device-wrapper-skip.patch` | meta device-wrapper skip | none |
+| 08 | `0008-…-block-08-fused-core-prefill-kernels-and-.patch` | fused-core prefill kernels + GPU bit-identical results | **blocks 03 and 04 MUST be applied first** (fattn-tile.cuh / fattn.cu territory) |
+| 09 | `0009-…-block-09-meta-buffer-compute-container-h.patch` | meta-buffer compute-container headroom | none |
+| 10 | `0010-…-block-10-k-quant-boosts-Q4_K-Q5_K-Q6_K-Q.patch` | k-quant + mmvq-parameter umbrella (VDR kernels, RDNA3_5 table, MoE mmid) — the only decode-numerics patch | none (omit for greedy purity) |
+| 11 | `0011-…-block-11-skip-CUDA-graphs-for-multi-toke.patch` | skip CUDA graphs for multi-token prefill | none |
+| 12 | `12-hybrid-allreduce-hip.patch` | **hybrid HIP all-reduce** (internal AR for the small-tensor decode path + per-size hybrid dispatch vs RCCL; RDNA4-only gate: refuses to init off gfx1200/gfx1201, falls back to RCCL) | none (apply last) |
 
-Block numbers are the apply order: `01` is the smallest number and applies
-first, `11` last. All blocks are mutually independent except **block 08
-(fused core) requires blocks 03 and 04 in the tree** - so it is applied at
-position 8, just before block 09.
+Block numbers are the apply order: `01` applies first, `12` last. All blocks
+are mutually independent except **block 08 (fused core) requires blocks 03
+and 04 in the tree**. Apply 01-11 with `git am` (or `scripts/apply-all.sh`),
+then `git apply` the 12th — the concatenated-series `git apply` trick
+silently drops hunks.
 
-## Block stacking tags (git-native path)
+## Block stacking tags (HISTORICAL — pre-block-12 structure)
 
-The repo also carries lightweight tags `block/01-… block/11-…`, each pointing
-at a squashed commit whose diff-vs-parent is exactly that block's change (the
-commits are stacked in apply order, rooted at an orphan commit whose tree is
-the upstream baseline `d7bd3bfca` **patch footprint only** - just the files
-the patches touch, deliberately NOT a full llama.cpp snapshot, so the lineage
-stays ~2.5 MiB instead of dragging in every upstream source file and the
-`models/*.gguf` tokenizer test fixtures). The tags track the CURRENT baseline
-branch; they are force-moved whenever a new validated baseline is cut.
-
-**Tags are numbered by APPLY order** and so are the patch filenames and the
-block commit labels: `01` applies first, `11` last. The fused core needs
-blocks 03+04 in the tree, so it sits at position 08:
-
-| apply | tag | patch file |
-|-------|-----|-----------|
-| 1 | `block/01-adaptive-mtp` | `01-adaptive-mtp.patch` |
-| 2 | `block/02-chunked-gdn` | `02-chunked-gdn.patch` |
-| 3 | `block/03-bf16-kv-cache` | `03-bf16-kv-cache.patch` |
-| 4 | `block/04-wmma-flash-attn` | `04-wmma-flash-attn.patch` |
-| 5 | `block/05-bit-identical-decode-cpu` | `05-bit-identical-decode-cpu.patch` |
-| 6 | `block/06-host-buffer-revert` | `06-host-buffer-revert.patch` |
-| 7 | `block/07-meta-device-wrapper-skip` | `07-meta-device-wrapper-skip.patch` |
-| 8 | `block/08-fused-core` | `08-fused-core.patch` |
-| 9 | `block/09-meta-headroom` | `09-meta-headroom.patch` |
-| 10 | `block/10-k-quant-boosts` | `10-k-quant-boosts.patch` |
-| 11 | `block/11-cuda-prefill-graph-skip` | `11-cuda-prefill-graph-skip.patch` |
+The repo carries legacy lightweight tags `block/01-… block/11-…`, each
+pointing at a squashed commit whose diff-vs-parent is that block's change,
+rooted at an orphan commit whose tree is the OLD baseline `d7bd3bfca` **patch
+footprint only** (not a full llama.cpp snapshot, to keep the lineage small).
+They belong to the retired checkpoint structure and do NOT include block 12;
+`scripts/make-patches.sh` no longer regenerates them. If you want a
+git-native apply path for the current set, cherry-pick the patch commits
+from the fork (`~/llama.cpp`, `2b7a135cb..f6f8f6778` + the block-12
+working-tree delta) instead — or just use `scripts/apply-all.sh`.
 
 `block/09-meta-headroom` fixes the meta-buffer compute-container headroom
 (16x -> 128x) for hybrid recurrent models: the GDN/SSM conv-state snapshot
@@ -313,48 +304,29 @@ BASELINE.md); source commits on fork branch `rdna-boosts`: `cd35abd19`
 > folded here so the gfx1151 build is pure too; it is applied after every
 > numeric block (block 11 is a dispatch-only change), so `apply-all.sh`
 > needs only the one ORDER entry dropped.
-Consumer (git-native alternative to `git apply`):
+
+(Git-native alternative: cherry-pick the block commits from the fork
+`~/llama.cpp` (`2b7a135cb..f6f8f6778` for blocks 01-11; block 12 is the
+working-tree delta). The legacy `block/01-…11` tags are historical artifacts
+of the retired checkpoint structure — see the tags section above.)
+
+## Verified apply sequence (current delivery, 2026-08-29)
+
+On a fresh checkout of the fork point `17252c769`:
 
 ```
-git remote add rdna-boosts git@github.com:stew675/llama-cpp-rdna-boosts.git
-git fetch rdna-boosts --tags
-# on the llama.cpp checkout at the baseline, in apply order:
-git cherry-pick block/01-adaptive-mtp
-...
-git cherry-pick block/08-fused-core     # after blocks 03+04
-...
-git cherry-pick block/09-meta-headroom
-git cherry-pick block/10-k-quant-boosts   # omit for greedy purity
-git cherry-pick block/11-cuda-prefill-graph-skip
+git am patches/000[1-9]-*.patch patches/001[01]-*.patch   # blocks 01-11
+#      (or: scripts/apply-all.sh — same thing, plus the 12th and a commit each)
+git apply patches/12-hybrid-allreduce-hip.patch           # block 12
 ```
 
-Cherry-pick uses 3-way merge, so each block degrades gracefully when upstream
-master drifts past the recorded baseline. The tags are derived artifacts -
-`scripts/make-patches.sh` rebuilds the whole lineage and force-moves the tags
-deterministically (identical trees, messages and SHAs across runs). The patch
-files remain the primary, reviewable artifact.
-
-## Verified apply sequence (this branch)
-
-On a fresh checkout of `fe235f434`, the sequence
-
-```
-git apply patches/01-adaptive-mtp.patch
-git apply patches/02-chunked-gdn.patch
-git apply patches/03-bf16-kv-cache.patch
-git apply patches/04-wmma-flash-attn.patch
-git apply patches/05-bit-identical-decode-cpu.patch
-git apply patches/06-host-buffer-revert.patch
-git apply patches/07-meta-device-wrapper-skip.patch
-git apply patches/08-fused-core.patch
-git apply patches/09-meta-headroom.patch
-git apply patches/10-k-quant-boosts.patch   # omit for greedy purity
-git apply patches/11-cuda-prefill-graph-skip.patch
-```
-
-applies with zero fuzz and, after the block-02 test-harness fix, passes the
-full backend test suite (14883/14883). The patch set was validated exactly
-this way; see BASELINE.md for the byte-identity and validation details.
+Verified end-to-end 2026-08-29: clean apply, full build, llama-cli
+same-seed coherence IDENTICAL to the fork build, tg64 38.12 / tg512 41.08
+(matches the fork build). **Do not `git apply` the concatenated 01-11
+series directly — it silently drops hunks** (30 files / 2483 lines vs the
+correct 35 / 6094). The historical validation records below (14883/14883,
+GDN 46/46, etc.) are from the older 01-11 structure and remain the
+verification evidence for the block content, which is byte-unchanged.
 
 ## Verification per block
 
@@ -371,19 +343,25 @@ this way; see BASELINE.md for the byte-identity and validation details.
 | 09 | build + server `--split-mode tensor` + MTP draft smoke | loads/serves, no graph-alloc abort |
 | 10 | `./bin/test-backend-ops -b ROCm0` (MUL_MAT + MUL_MAT_ID q4_K/q5_K cases) + Q4_K/Q5_K/Q8_0 decode on gfx1201; RDNA3_5 table: Q8_0 decode on gfx1151 | 54/54 MUL_MAT, 76/76 MUL_MAT_ID OK |
 | 11 | build + prefill perf A/B on gfx1201 (pp128/256/512 vs longer) | decode unchanged; prefill +6-18% for single-ubatch (pp <= ~512), neutral (~0.1%) beyond |
+| 12 | llama-cli same-seed coherence (2- and 3-GPU) + depth-16384 decode A/B (hybrid vs nccl vs internal) | same-seed output IDENTICAL to RCCL; 3-GPU hybrid 38.71 t/s (unpinned) at depth-16384; tg64 38.12 / tg512 41.08 |
 
-Convenience: `rdna-boosts-all.patch` (repo root) is the entire net diff in
-one patch (applies cleanly on the baseline SHA alone; not a substitute for the
+Convenience: `rdna-boosts-all.patch` (repo root) is the entire 12-patch net
+as ONE patch (applies cleanly on `17252c769` alone; not a substitute for the
 per-block flow in `patches/` when you want reviewable increments).
 
 ## Failure handling (agent instruction)
 
 > Apply the patches in `patches/` in the order given in this file to a fresh
-> branch from the latest llama.cpp master tip. After each patch, run its
-> verification command. If a patch fails to apply, use `git apply -3`; if
-> 3-way fails, manually rebase the hunks against the current master and
-> continue. Do not skip blocks. The fused core (`08-...`) is applied at
-> position 8; blocks 09-11 go after it in order.
+> branch from the fork point `17252c769` (see `scripts/apply-all.sh` for the
+> automated flow). After each patch, run its verification command. Blocks
+> 01-11 apply with `git am`; if a patch fails, `git am -3` / `git apply -3`
+> (3-way merge against the baseline blobs), then manually rebase the hunks
+> against the current master and continue. Do not skip blocks. The fused
+> core (`0008-...`) is applied at position 8; blocks 09-11 go after it, then
+> the 12th (`12-hybrid-allreduce-hip.patch`, `git apply`). If more than one
+> block needs manual re-base hunks, regenerate the whole set from the fork
+> with `scripts/make-patches.sh` instead of hand-editing the committed
+> patches.
 
 ## Known notes
 

@@ -3,6 +3,13 @@
 The current, full benchmark suite. **v2 (2026-08-27)** is the complete
 gamut; the **v1** record (curl + `/completion`) is preserved for history.
 
+> **Freshness note:** these are the v1/v2 records of the 11-block era
+> (builds: master `fe235f434` vs `build-rdna-boosts` @ `a265041b1`). The
+> current delivery adds block 12 (hybrid all-reduce, RDNA4-gated) — its
+> numbers live in `patches/README.md` (tg64 38.12 / tg512 41.08 on the
+> clean-apply build; depth-16384 3-GPU hybrid 38.71 t/s unpinned) and the
+> benchy depth-16384 protocol in `wip/HANDOFF.md`.
+
 ## v2 — the current results (llama-benchy live-server suite)
 
 **[v2-results.md](v2-results.md)** is the canonical results document:

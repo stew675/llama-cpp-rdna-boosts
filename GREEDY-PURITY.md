@@ -1,7 +1,7 @@
 # Greedy purity, VDR, and the nature of the block 10 variance
 
 Status: **reference document**. Read this if you are shipping block 10
-(`10-k-quant-boosts.patch`) and care about bit-exact reproduction of greedy
+(`0010-rdna-boosts-block-10-k-quant-boosts-Q4_K-Q5_K-Q6_K-Q.patch`) and care about bit-exact reproduction of greedy
 decode vs a stock llama.cpp build. It explains *why* block 10 changes decode
 numerics, what that does and does not mean for correctness, and how to reason
 about the variance in practice.
@@ -204,7 +204,7 @@ bits match stock's arbitrary-but-pinned order.
 - **Within a single build:** greedy output is fully deterministic, with or
   without block 10. The variance only appears when comparing *different
   builds* (block 10 in vs out, flash-attn on vs off).
-- **Reproducing stock bits:** exclude `10-k-quant-boosts.patch` (it is
+- **Reproducing stock bits:** exclude `0010-rdna-boosts-block-10-k-quant-boosts-Q4_K-Q5_K-Q6_K-Q.patch` (it is
   applied last; one-line change in `scripts/apply-all.sh`). This restores
   every VDR constant and the RDNA3_5 table to stock values, so the reduction
   order matches upstream exactly, on RDNA3, RDNA3_5 and RDNA4 alike.
