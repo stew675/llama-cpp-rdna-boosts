@@ -1038,6 +1038,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
+    // Row base scales are invariant over the k01 and j0 loops; load them once.
+    // Each thread owns fixed elements of the C tile, so one value per element suffices.
+    float x_df_reg[ntx][tile_C::ne];
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+        for (int l = 0; l < tile_C::ne; ++l) {
+            const int i = i0 + n*tile_C::I + tile_C::get_i(l);
+            x_df_reg[n][l] = x_df[i*sram_stride];
+        }
+    }
+
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
         const int k0 = k00 + k01;
 
@@ -1045,6 +1057,28 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
             load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+        }
+
+        // Sub-scales for this k01 chunk; invariant over the j0 loop.
+        int8_t x_sc_reg[ntx][tile_C::ne];
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int i = i0 + n*tile_C::I + tile_C::get_i(l);
+                x_sc_reg[n][l] = ((const int8_t *) (x_sc + i*sram_stride + k00/16))[k01/4];
+            }
+        }
+
+        // Fold the sub-scale and the row base scale into one f32 per element;
+        // saves one int-multiply and one convert per element in the j0 loop.
+        float x_s2_reg[ntx][tile_C::ne];
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                x_s2_reg[n][l] = (float) x_sc_reg[n][l] * x_df_reg[n][l];
+            }
         }
 
 #pragma unroll
@@ -1062,9 +1096,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
-                    const int i = i0 + n*tile_C::I + tile_C::get_i(l);
-                    const int8_t * sc = (const int8_t *) (x_sc + i*sram_stride + k00/16);
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l] * sc[k01/4] * x_df[i*sram_stride] * dB;
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += (float) C.x[l] * x_s2_reg[n][l] * dB;
                 }
             }
         }

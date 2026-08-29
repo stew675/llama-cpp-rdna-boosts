@@ -71,6 +71,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <numeric>
 #include <array>
 #include <atomic>
 #include <charconv>
@@ -4012,6 +4013,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
+    // per-op timing instrumentation (env-gated, diagnostic only)
+    const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
+    std::vector<cudaEvent_t> op_ev0;
+    std::vector<cudaEvent_t> op_ev1;
+    std::vector<std::pair<const ggml_tensor *, int>> op_nodes;
+    if (op_timing) {
+        op_ev0.resize(cgraph->n_nodes);
+        op_ev1.resize(cgraph->n_nodes);
+        op_nodes.reserve(cgraph->n_nodes);
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+#ifdef GGML_USE_HIP
+            CUDA_CHECK(cudaEventCreateWithFlags(&op_ev0[i], hipEventDefault));
+            CUDA_CHECK(cudaEventCreateWithFlags(&op_ev1[i], hipEventDefault));
+#else
+            CUDA_CHECK(cudaEventCreateWithFlags(&op_ev0[i], cudaEventDefault));
+            CUDA_CHECK(cudaEventCreateWithFlags(&op_ev1[i], cudaEventDefault));
+#endif
+        }
+    }
+
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
 
@@ -4178,11 +4199,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                if (op_timing) {
+                    CUDA_CHECK(cudaEventRecord(op_ev0[i], cuda_ctx->stream()));
+                }
+
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (op_timing) {
+                    CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
+                    op_nodes.emplace_back(node, i);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4224,6 +4254,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
+    }
+
+    if (op_timing) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        static std::map<std::string, double> op_ms_total;
+        static std::map<std::string, int>    op_cnt_total;
+        std::map<std::string, double> op_ms;
+        std::map<std::string, int>    op_cnt;
+        for (const auto & [node, idx] : op_nodes) {
+            float ms = 0.0f;
+#ifdef GGML_USE_HIP
+            CUDA_CHECK(hipEventElapsedTime(&ms, (hipEvent_t) op_ev0[idx], (hipEvent_t) op_ev1[idx]));
+#else
+            CUDA_CHECK(cudaEventElapsedTime(&ms, op_ev0[idx], op_ev1[idx]));
+#endif
+            std::string key = ggml_op_name(node->op);
+            key += " ";
+            key += node->name;
+            if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && node->src[1] != nullptr) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), " [%lldx%lldx%lld]",
+                         (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1],
+                         (long long) node->src[1]->ne[1]);
+                key += buf;
+            }
+            op_ms[key] += ms;
+            op_cnt[key]++;
+            op_ms_total[key] += ms;
+            op_cnt_total[key]++;
+        }
+        std::vector<std::pair<std::string, double>> sorted(op_ms.begin(), op_ms.end());
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto & a, const auto & b) { return a.second > b.second; });
+        double total = 0.0;
+        for (const auto & [k, v] : sorted) {
+            total += v;
+        }
+        GGML_LOG_INFO("%s: op timing: total %.2f ms over %zu nodes:\n", __func__, total, op_nodes.size());
+        for (const auto & [k, v] : sorted) {
+            GGML_LOG_INFO("  %8.3f ms %5.1f%%  x%-4d %s\n", v, 100.0 * v / total, op_cnt[k], k.c_str());
+        }
+        GGML_LOG_INFO("%s: op timing cumulative: %.2f ms over %d nodes\n", __func__,
+                      std::accumulate(op_ms_total.begin(), op_ms_total.end(), 0.0,
+                                      [](double acc, const auto & p) { return acc + p.second; }),
+                      std::accumulate(op_cnt_total.begin(), op_cnt_total.end(), 0,
+                                      [](int acc, const auto & p) { return acc + p.second; }));
+        for (cudaEvent_t e : op_ev0) {
+            CUDA_CHECK(cudaEventDestroy(e));
+        }
+        for (cudaEvent_t e : op_ev1) {
+            CUDA_CHECK(cudaEventDestroy(e));
+        }
     }
 }
 

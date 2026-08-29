@@ -373,6 +373,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
@@ -512,8 +515,27 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD WMMA is always faster than the tile kernel if the full tile width of 16 can be utilized.
-    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 128) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
-        return BEST_FATTN_KERNEL_MMA_F16;
+    // RDNA4 WMMA has higher throughput than RDNA3; heads up to 576 (incl. the DKQ != DV shapes)
+    // are enabled by default there. RDNA3_0 (gfx1100-1103) verified 2026-08-28: FLASH_ATTN_EXT
+    // 4568/4568 vs CPU ref, gemma-4-12b head 240 pp2048 2263 vs 2226 (+1.7%), harness +14.2%
+    // at hsk=256/nh=8/nb=256, all other >128 shapes within +/-1% (neutral). RDNA3_5 (gfx115x)
+    // verified 2026-08-29 on gfx1151 (Strix Halo iGPU): FLASH_ATTN_EXT 4568/4568 vs CPU ref with
+    // the cap lifted; harness wins at hsk=256 (+34%) and hsk=320 (+36%) prefill, but hsk=512
+    // (-5.6%) and hsk=576 (-7.4%) regress, so the default cap is 320 (covers Gemma4 240-head,
+    // Mistral4 MLA 320; DeepSeek-MLA 576 keeps the tile kernel). End-to-end gemma-4-12b head 240
+    // pp2048 +3.6%, pp4096 +6.7%, decode neutral. Set GGML_CUDA_FA_WMMA_256=0 to force
+    // the WMMA path off for heads > 128 (e.g. to compare against the tile kernel), or
+    // GGML_CUDA_FA_WMMA_MAX_HEAD to override the cap.
+    const char * wmma_256_env = getenv("GGML_CUDA_FA_WMMA_256");
+    const bool wmma_256 = wmma_256_env == nullptr || std::atoi(wmma_256_env) != 0;
+    // GGML_CUDA_FA_WMMA_MAX_HEAD overrides the per-arch cap (experiment/escape hatch).
+    const char * wmma_max_env = getenv("GGML_CUDA_FA_WMMA_MAX_HEAD");
+    const int wmma_max_head = wmma_max_env ? std::atoi(wmma_max_env) : (wmma_256 && GGML_CUDA_CC_IS_RDNA4(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_0(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_5(cc) ? 320 : 128);
+    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
+        // The kernel instantiates logit_softcap only for heads 128/256/512.
+        if (logit_softcap == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
     }
 
     // If there are no tensor cores available, use the generic tile kernel:

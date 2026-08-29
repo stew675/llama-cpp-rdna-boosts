@@ -366,6 +366,10 @@ static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, in
 static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fallback, const int cc, const int64_t ne11) {
     int ret = std::min(ne11, int64_t(512));
     ret -= ret % 8;
+    const char * env = getenv("GGML_CUDA_MMQ_J_MAX");
+    if (env != nullptr) {
+        ret = std::min(ret, std::atoi(env));
+    }
     for (;ret > 0; ret -= 8) {
         if (ggml_cuda_mmq_get_config(type, ret, fallback, cc).type != GGML_TYPE_COUNT) {
             return ret;
