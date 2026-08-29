@@ -1,0 +1,90 @@
+From 58e6f3a2b11c5988090f523b98ad5ce2022fa2de Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sat, 29 Aug 2026 17:41:23 -0500
+Subject: [PATCH 2/2] =?UTF-8?q?wip:=20host-side=20lockstep=20pacing=20(GGM?=
+ =?UTF-8?q?L=5FCUDA=5FAR=5FPACE)=20=E2=80=94=20WASH,=20mechanism=20refuted?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- gate: before enqueueing call N on device i, busy-poll (hipEventQuery) every
+  peer's prev-slot end-of-AR event; initial events pre-recorded at init
+- coherent (llama-cli same-seed IDENTICAL)
+- 27B tg64 (r1, profiler on): decode AR 36.0us/call vs 36.2 baseline;
+  tg64 34.53 vs 34.45 — no change; spins unchanged (dev1 20.5 vs 15.3)
+- the gate is REDUNDANT with the AR's own barrier: the previous call's event
+  is long-completed by the time the current subgraph ends, and the stagger
+  is the subgraph-END difference (per-kernel CP dispatch gaps on dev0),
+  which no host-side gate can affect
+- the rocprof 'fix' is a per-dispatch GPU-side scheduling perturbation, not
+  a replicable mechanism; the dispatch-gap asymmetry is platform-level
+---
+ ggml/src/ggml-cuda/allreduce-hip.cu | 31 +++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
+index 2b3101a3c..184cdd7c6 100644
+--- a/ggml/src/ggml-cuda/allreduce-hip.cu
++++ b/ggml/src/ggml-cuda/allreduce-hip.cu
+@@ -469,6 +469,7 @@ struct ggml_cuda_ar_pipeline {
+     uint64_t call_count;
+     bool     use_sleep;      // GGML_CUDA_AR_SLEEP: s_sleep poll vs dummy spin (WIP)
+     bool     fused;          // GGML_CUDA_AR_FUSED: stage captured into subgraph graphs (WIP)
++    bool     pace;           // GGML_CUDA_AR_PACE: host-side lockstep -- poll peers' prev AR before enqueueing (WIP)
+     ggml_cuda_ar_stage_control * stage_control_dev[GGML_CUDA_MAX_DEVICES]; // per-device stage control (hipMalloc)
+     ggml_cuda_ar_stage_control stage_control_host;    // init values (one-time host copy)
+     nv_bfloat16 *             stage_scratch[GGML_CUDA_MAX_DEVICES]; // per-device BF16 convert scratch
+@@ -694,6 +695,11 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
+         GGML_LOG_WARN("%s: fused-stage mode enabled (GGML_CUDA_AR_FUSED=1); "
+                       "stage kernel is captured into subgraph graphs (WIP)\n", __func__);
+     }
++    p->pace             = ggml_cuda_ar_env_u64("GGML_CUDA_AR_PACE", 0) != 0;
++    if (p->pace) {
++        GGML_LOG_WARN("%s: host-side lockstep pacing enabled (GGML_CUDA_AR_PACE=1); "
++                      "poll peers' prev AR before enqueueing (WIP)\n", __func__);
++    }
+     p->prof_enabled     = ggml_cuda_ar_env_u64("GGML_CUDA_AR_PROFILE", 0) != 0;
+     if (p->prof_enabled) {
+         GGML_LOG_WARN("%s: per-call profiling enabled (GGML_CUDA_AR_PROFILE=1); "
+@@ -743,6 +749,13 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
+             }
+         }
+ 
++        // Pacing: pre-record every slot's end-of-AR event so the first calls'
++        // lockstep polls never spin on unrecorded events.
++        for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
++            CUDA_CHECK(hipEventRecord(p->ev_pool[i][s].ker, p->streams[i]));
++        }
++        CUDA_CHECK(hipStreamSynchronize(p->streams[i]));
++
+         if (hipEventCreateWithFlags(&p->host_large_read_done[i], hipEventDisableTiming) != hipSuccess) {
+             GGML_LOG_ERROR("%s: hipEventCreate for host_large_read_done failed for device %d\n",
+                            __func__, p->devices[i]);
+@@ -1347,6 +1360,24 @@ bool ggml_cuda_ar_allreduce(
+             const bool last_chunk = chunk_start + (int64_t) chunk_elems == ne;
+ 
+             for (int i = 0; i < n; ++i) {
++                // Host-side lockstep pacing: wait for EVERY peer's PREVIOUS
++                // call (prev slot) to complete before enqueueing this device's
++                // kernel.  Mirrors rocprof's pacing mechanism: the per-step
++                // dispatch-gap asymmetry (dev0 ends late) can only accumulate
++                // if the devices' step boundaries drift apart -- this gate
++                // re-aligns them every call.  Busy-poll (hipEventQuery), no
++                // OS sleep; instant when the peers are already done.
++                if (p->pace) {
++                    const int prev_slot = (slot + GGML_CUDA_AR_POOL_SIZE - 1) % GGML_CUDA_AR_POOL_SIZE;
++                    for (int j = 0; j < n; ++j) {
++                        if (j == i) continue;
++                        hipError_t e;
++                        do {
++                            e = hipEventQuery(p->ev_pool[j][prev_slot].ker);
++                        } while (e == hipErrorNotReady);
++                        GGML_ASSERT(e == hipSuccess);
++                    }
++                }
+                 ggml_cuda_set_device(p->devices[i]);
+                 auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+                 GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+-- 
+2.55.0
+
