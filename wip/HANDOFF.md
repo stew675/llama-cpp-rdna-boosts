@@ -90,19 +90,56 @@ rocprofv3 -d /tmp/rocprof-out -r -- <cmd>   # then query the sqlite kernels tabl
 
 ## Next steps (in priority order)
 
-1. **Driver-level probe**: from a rocprof kernel trace, measure submission-to-
-   start latency per device (kernels.start vs host enqueue) to name the
-   mechanism behind the ~20 us/call wait.
-2. **Overlap fallback** if unfixable from userspace: split stage/consume pool
-   so the next call's phase-1 starts during the peer's spin (or prefetch next
-   layer's independent ops while spinning).
-3. Leftover micro-tunings (kernel blocks, wire type, pipelining).  s_sleep
-   poll already adopted (wash vs dummy spin; env GGML_CUDA_AR_SLEEP=0 to
-   revert).  Q8 wire: NOT baseline (user policy: quality; no decode win, no
-   RCCL-path win) — only if pursuing RCCL-less internal-mode prefill, gated
-   GGML_CUDA_AR_WIRE=q8.
+1. **3-GPU depth-16384 validation** (deployment win, no code): server with
+   `HIP_VISIBLE_DEVICES=0,1,2` + benchy depth-16384.  No-depth already shows
+   3-GPU 39.7 vs 2-GPU 33.2 (+19%).
+2. **Subgraph-end diagnostic** (measure, no code): rocprof the per-step
+   end-times of the last pre-AR kernel per device.  If dev0's subgraph
+   consistently ends ~12 us later (non-split ops land on dev0 via
+   tensor_config/rotation in llama-model.cpp:788-830 and ggml-backend-meta),
+   the one-sided wait is a software-visible per-step stagger, not a driver
+   wall.  Look for split-state MIRRORED/PARTIAL axis placement.
+3. **rocprof-mimic experiments** (see below) — cross-stream AR variant
+   (pre-queue AR kernels on their own streams + subgraph-done events) or
+   host-side lockstep pacing (wait for peer's prev-1 AR event before
+   enqueueing).  Both mimic rocprof's pacing; measure the stagger collapse
+   vs the added overhead.
+4. Decisive reboot test: `amdgpu.dpm=0` (RDNA4 `S` state survives `high`;
+   if the remaining ~12 us collapses, S-exit was the whole story).
+5. Base-cost decomposition (phase-1 fence cost, write-combined host
+   mapping, kernel blocks) — the ~16 us no-spin floor is ~2 ms/token at
+   108 calls/token even with perfect sync.
 
 Prize if the dispatch wait is removed: ~34 t/s at depth-16384 (from 32.34).
+
+## rocprof-mimic investigation (session 6 idea, from the user)
+
+Question: rocprofv3 tracing makes the one-sided AR wait disappear (pair
+0,2: 26 us without, ~balanced with).  Can we mimic its mechanism in the
+custom all-reduce?
+
+Mechanism candidates (unresolved):
+1. keeps GPUs hot (power) — refuted as full explanation: power is only ~7 us.
+2. paces dispatches (per-dispatch completion waits -> devices advance in
+   lockstep -> no race window).
+3. perturbs per-step subgraph END times (AR kernel runs behind the
+   device's own subgraph on the same stream; if dev0's subgraph ends
+   ~12 us later each step — balanced totals hide a consistent offset from
+   non-split op placement — dev0's AR kernel starts late; rocprof's
+   overhead re-aligns step boundaries).
+
+Discriminate #3 first (pure measurement): rocprof per-step end-times of
+last pre-AR kernel per device.
+
+Mimic experiments:
+- Cross-stream AR variant: enqueue all AR kernels on p->streams BEFORE the
+  subgraphs finish, gated on subgraph-done events -> synchronized pickup.
+  Note: tried once before and rejected for tg latency overhead — revisit
+  with the stagger lens (event overhead vs the ~12 us it removes).
+- Host-side lockstep pacing (cheapest): before enqueueing AR call N on
+  dev0, wait for dev1's call N-1 AR completion event (event pool exists).
+  If a ~1-2 us host sync collapses the ~12 us stagger, pacing is the
+  mechanism.
 
 ## External cross-check (session 3)
 
