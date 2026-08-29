@@ -54,6 +54,9 @@ BLOCKS_SINGLE[05-bit-identical-decode-cpu.patch]="89ac4ba1f"
 BLOCKS_SINGLE[06-host-buffer-revert.patch]="edb8d44c0"
 BLOCKS_SINGLE[07-meta-device-wrapper-skip.patch]="32670eec8"
 BLOCKS_SINGLE[09-meta-headroom.patch]="f2a22a71"
+# block 11 (CUDA prefill-graph skip) is a single commit from the fork's
+# `rdna-boosts` branch (not on `chunked-gdn`), like block 09's f2a22a71.
+BLOCKS_SINGLE[11-cuda-prefill-graph-skip.patch]="fc7fd905b"
 # blocks 09, 06 and 12 (old numbering) were retired: block 09's Q6_K VDR=2
 # content, block 06's gfx1151 (RDNA3_5) mmvq parameter table and block 12's
 # k-quant work are now all in block 10 (the k-quant/mmvq umbrella) in the
@@ -170,7 +173,7 @@ fi
 echo "== rdna-boosts-all.patch"
 ( cd "$TMP/wt"
   git reset -q --hard "$BASELINE"
-  for p in $PRE_BLOCKS 08-fused-core.patch 09-meta-headroom.patch 10-k-quant-boosts.patch; do
+  for p in $PRE_BLOCKS 08-fused-core.patch 09-meta-headroom.patch 10-k-quant-boosts.patch 11-cuda-prefill-graph-skip.patch; do
       git apply "$PATCHES/$p"
   done
   git add -A
@@ -181,12 +184,12 @@ echo "== rdna-boosts-all.patch"
 # then one commit per block applied in manifest apply order. Each commit's
 # diff vs its parent is exactly that block's change, so cherry-picking a tag
 # applies just that block (with 3-way merge). Tags are numbered by APPLY
-# order: the fused core is applied last, so it is block/10 - the number
+# order: block 08 (fused core) is applied at position 8 and block 11 last - the number
 # encodes the sequence, unlike the patch filenames which are plan topic IDs.
 # Tags are derived artifacts: force-moved on every regeneration.
 echo "== block stacking tags"
-TAG_ORDER="01-adaptive-mtp 02-chunked-gdn 03-bf16-kv-cache 04-wmma-flash-attn 05-bit-identical-decode-cpu 06-host-buffer-revert 07-meta-device-wrapper-skip 08-fused-core 09-meta-headroom 10-k-quant-boosts"
-TAG_NAMES="block/01-adaptive-mtp block/02-chunked-gdn block/03-bf16-kv-cache block/04-wmma-flash-attn block/05-bit-identical-decode-cpu block/06-host-buffer-revert block/07-meta-device-wrapper-skip block/08-fused-core block/09-meta-headroom block/10-k-quant-boosts"
+TAG_ORDER="01-adaptive-mtp 02-chunked-gdn 03-bf16-kv-cache 04-wmma-flash-attn 05-bit-identical-decode-cpu 06-host-buffer-revert 07-meta-device-wrapper-skip 08-fused-core 09-meta-headroom 10-k-quant-boosts 11-cuda-prefill-graph-skip"
+TAG_NAMES="block/01-adaptive-mtp block/02-chunked-gdn block/03-bf16-kv-cache block/04-wmma-flash-attn block/05-bit-identical-decode-cpu block/06-host-buffer-revert block/07-meta-device-wrapper-skip block/08-fused-core block/09-meta-headroom block/10-k-quant-boosts block/11-cuda-prefill-graph-skip"
 git -C "$REPO_DIR" worktree add --detach "$TMP/tagwt" HEAD >/dev/null
 ( cd "$TMP/tagwt"
   git checkout -q --orphan rdna-tag-build

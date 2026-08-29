@@ -12,14 +12,16 @@ one combined diff, applied last). One follow-up fix was added later as
 **block 09** (`09-meta-headroom.patch`, meta-buffer compute-container
 headroom) and the k-quant kernel boosts landed as **block 10**
 (`10-k-quant-boosts.patch`, Q6_K VDR=2 + Q4_K/Q5_K/Q8_0 VDR=4 decode, mmq
-scale-load hoist, RDNA4 MoE mmid whitelist), so the full set is 10 patches
-in apply order. **Blocks 09 and 06 (old numbering) were retired**: block
+scale-load hoist, RDNA4 MoE mmid whitelist), and the CUDA prefill-graph
+skip landed as **block 11** (`11-cuda-prefill-graph-skip.patch`), so the
+full set is 11 patches in apply order. **Blocks 09 and 06 (old numbering) were retired**: block
 09's Q6_K VDR=2 decode work and block 06's gfx1151 (RDNA3_5) mmvq parameter
 table were folded into the k-quant umbrella so that all k-quant VDR/decode
 work and all mmvq parameter-table tuning lives in the one patch - excluding
 it restores 100% greedy-purity on ALL architectures (RDNA3, RDNA3_5,
 RDNA4), see the Greedy-purity note below. The numbering was compacted
-(2026-08-28): blocks run 01-10 with no gaps.
+(2026-08-28): blocks run 01-10 with no gaps; block 11 (CUDA prefill-graph
+skip) was added on top the same day, so the set is 01-11.
 
 This is the authoritative apply order and the verification contract for the
 patch set. It is written for humans AND LLM coding agents. Follow it exactly;
@@ -155,20 +157,20 @@ debugging the bf16 GDN kernel, deterministically fails `rms_norm_back` /
 | 11 | `11-cuda-prefill-graph-skip.patch` | ggml/src/ggml-cuda/ggml-cuda.cu | none (independent; apply last) |
 
 Block numbers are the apply order: `01` is the smallest number and applies
-first, `10` last. All blocks are mutually independent except **block 08
+first, `11` last. All blocks are mutually independent except **block 08
 (fused core) requires blocks 03 and 04 in the tree** - so it is applied at
 position 8, just before block 09.
 
 ## Block stacking tags (git-native path)
 
-The repo also carries lightweight tags `block/01-… block/10-…`, each pointing
+The repo also carries lightweight tags `block/01-… block/11-…`, each pointing
 at a squashed commit whose diff-vs-parent is exactly that block's change (the
 commits are stacked in apply order, rooted at an orphan commit whose tree is
 the upstream baseline `fe235f434`). The tags track the CURRENT baseline
 branch; they are force-moved whenever a new validated baseline is cut.
 
 **Tags are numbered by APPLY order** and so are the patch filenames and the
-block commit labels: `01` applies first, `10` last. The fused core needs
+block commit labels: `01` applies first, `11` last. The fused core needs
 blocks 03+04 in the tree, so it sits at position 08:
 
 | apply | tag | patch file |
@@ -226,8 +228,9 @@ BASELINE.md); source commits on fork branch `rdna-boosts`: `cd35abd19`
 > (prefill path untouched): 6.3162/6.3563 on wikitext-2, matching the
 > pre-block-10 records. Excluding this patch restores 100% greedy purity on
 > ALL architectures (RDNA3, RDNA3_5, RDNA4) - block 06's gfx1151 table was
-> folded here so the gfx1151 build is pure too; it is applied last, so
-> `apply-all.sh` needs only the one ORDER entry dropped.
+> folded here so the gfx1151 build is pure too; it is applied after every
+> numeric block (block 11 is a dispatch-only change), so `apply-all.sh`
+> needs only the one ORDER entry dropped.
 Consumer (git-native alternative to `git apply`):
 
 ```
@@ -297,7 +300,8 @@ per-block flow in `patches/` when you want reviewable increments).
 > branch from the latest llama.cpp master tip. After each patch, run its
 > verification command. If a patch fails to apply, use `git apply -3`; if
 > 3-way fails, manually rebase the hunks against the current master and
-> continue. Do not skip blocks. The fused core (`10-...`) goes last.
+> continue. Do not skip blocks. The fused core (`08-...`) is applied at
+> position 8; blocks 09-11 go after it in order.
 
 ## Known notes
 
