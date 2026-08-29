@@ -66,10 +66,22 @@ rocprofv3 -d /tmp/rocprof-out -r -- <cmd>   # then query the sqlite kernels tabl
 2. **Overlap fallback** if unfixable from userspace: split stage/consume pool
    so the next call's phase-1 starts during the peer's spin (or prefetch next
    layer's independent ops while spinning).
-3. Then the leftover micro-tunings from the doc roadmap: kernel blocks, spin
-   (amdgcn_sleep), wire type, pipelining.
+3. Leftover micro-tunings (kernel blocks, wire type, pipelining).  s_sleep
+   poll already adopted (wash vs dummy spin; env GGML_CUDA_AR_SLEEP=0 to
+   revert).  Q8 wire: NOT baseline (user policy: quality; no decode win, no
+   RCCL-path win) — only if pursuing RCCL-less internal-mode prefill, gated
+   GGML_CUDA_AR_WIRE=q8.
 
 Prize if the dispatch wait is removed: ~34 t/s at depth-16384 (from 32.34).
+
+## External cross-check (session 3)
+
+u/nasone32 (r/ROCm, 2026-08-29): dual 7900xtx behind chipset x4 — RCCL
+broken, ported internal AR to HIP (his fix = our block 12, validated),
+s_sleep(1) poll (adopted, wash), Q8 wire for internal prefill (+27% PP on
+bandwidth-starved x4 — only relevant for internal-mode large tensors, not
+our baseline; gated option if ever needed).  Details in
+`12-hybrid-allreduce-hip.md` §session 3.
 
 ## Files of record
 

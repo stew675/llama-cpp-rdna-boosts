@@ -223,3 +223,41 @@ No-depth the effect is larger (33.4 vs 32.4).  Recommend the server move to
   phase-1 of the next call start during the peer's spin) is the fallback.
 - **Tuning targets if the wait is fixed**: ~34 t/s at depth-16384 (from
   31.15-32.34).
+
+---
+
+## Decode-path tuning exploration (session 3, 2026-08-29): Redditor cross-check
+
+Source: u/nasone32 "dual 7900xtx - tensor parallel on limited PCIE x4"
+(ROCm sub, 17h) — same hardware class (2x RDNA3 behind x4), same problem
+(RCCL poor/broken on the x4 card, slow CPU-passing fallback).  Their fix =
+our block 12, independently: force internal AR, port the CUDA host-alloc
+calls to HIP (`hipHostAllocMapped/Portable` + `hipHostGetDevicePointer`),
+and use `__builtin_amdgcn_s_sleep(1)` instead of `__nanosleep(100)` in the
+poll loop.  PP 470/500 -> ~1100 tk/s (mirrors our internal-vs-SHM prefill
+gap).  Then Q8 wire: PP 1100 -> ~1400 tk/s (+27%) on the bandwidth-starved
+internal path.
+
+### What is genuinely new for us
+
+1. **s_sleep(1) poll** — we used a 16-iter dummy asm spin.  Tested here
+   (`GGML_CUDA_AR_SLEEP`, env-gated, default 1): tg64 33.14 vs 33.16,
+   spin p50 14.4 vs 14.7 us — a wash.  Kept as default (cleaner idiom,
+   less cacheline hammering, no regression).  Does NOT fix the dispatch
+   wait.
+2. **Q8 wire format** — our T_wire is BF16/F32.  Verdict for OUR topology:
+   no baseline benefit.  Decode transfers are 10 KB/call (0.6 us at x4) —
+   latency-bound, not bandwidth.  Default hybrid routes large prefill
+   tensors to RCCL, whose wire type we don't control.  Only applies to the
+   internal path handling large tensors (RCCL-broken machines, or a future
+   "drop RCCL" mode).  If ever pursued: gate as `GGML_CUDA_AR_WIRE=q8`
+   (default bf16), keep quality-neutral baseline; measure internal-mode
+   prefill gap first.  User policy: Q8 not for baseline (quality); ok as a
+   gated option IF it shows a real speedup.
+3. Their overlap struggles confirm our overlap-fallback is the hard open
+   problem (they had no success either).
+
+### New env knob (WIP)
+
+- `GGML_CUDA_AR_SLEEP` (default 1): 1 = `__builtin_amdgcn_s_sleep(1)` poll;
+  0 = old 16-iter dummy asm spin.
