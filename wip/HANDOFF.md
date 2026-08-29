@@ -264,6 +264,41 @@ known-good config), then ONE coherence + tg512 sanity check (expect ~41.6
 with the healthy baseline) before any further work.  All session-8 commits
 preserved; the fusion code is NOT in the tree.
 
+## Fused-stage + pacing: DEFINITIVE CONCLUSION (session 9, 2026-08-29)
+
+The last two levers for the ~12.7us dispatch wait were implemented, tested on
+the HEALTHY machine, and CLOSED:
+
+1. **Fused stage (v2 compute-kernel) — COHERENT but net-negative.**
+   - v4 SDMA variant is structurally dead: D2H hipMemcpyAsync nodes are NOT
+     captured into HIP graphs (16 kernel nodes, 0 memcpy nodes); the memcpys
+     execute once at hook time, copying uninitialized scratch.
+   - v2 (convert + GTT wire + writer fence + arrival in ONE captured kernel,
+     control-read at replay; 8-block reduce + all-block arrival slots):
+     bit-exact wire (STAGE w0=3f96 == REDUCE w0=3f96 per token), llama-cli
+     same-seed IDENTICAL.
+   - Perf (27B tg64): FUSED=1 30.87 vs FUSED=0 34.45.  Mechanism: the
+     one-sided wait PERSISTS (dev0 spin collapsed 3.5us; dev1/dev2 still
+     20-22us — the subgraph-END asymmetry, not the AR dispatch); the in-graph
+     GTT write + fence drains the graph's L2 and costs more than the phase-1
+     it replaces; the validation's volatile reads add ~4us/call.
+2. **Host-side lockstep pacing (GGML_CUDA_AR_PACE) — WASH.**
+   - Gate: busy-poll peers' prev-slot end-of-AR event before enqueueing.
+   - Decode AR 36.0 vs 36.2us/call; tg64 34.53 vs 34.45 — no change.
+   - The gate is REDUNDANT with the AR's own barrier (the previous call is
+     long done; the stagger is the subgraph-END difference).
+
+CONCLUSION: the dispatch-gap asymmetry (dev0/bus-06 per-kernel dispatch
+latency, Item B) is a platform-level CP/driver property.  It is NOT
+reachable from the application: not from the AR kernel, not from the graph
+tail (fusion), not from host-side pacing.  The rocprof "fix" is a
+per-dispatch GPU-side scheduling perturbation that cannot be replicated
+deliberately.  Decode stands at the measured baselines (3-GPU hybrid 38.71
+at depth-16384, tg512 41.6).  This thread is CLOSED with high confidence.
+
+State: GGML_CUDA_AR_FUSED (default 0) and GGML_CUDA_AR_PACE (default 0) are
+both env-gated WIP artifacts, coherent, no default-behavior change.
+
 ## rocprof-mimic investigation (session 6 idea, from the user)
 
 Question: rocprofv3 tracing makes the one-sided AR wait disappear (pair
