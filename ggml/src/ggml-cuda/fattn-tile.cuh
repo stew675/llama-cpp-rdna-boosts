@@ -1393,6 +1393,22 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
 
     constexpr size_t nbytes_shared = 0;
 
+    if (Q->ne[1] <= 8) {
+        // Speculative verify batches (n_q = n_draft+1 <= 8) must produce the same
+        // logits as decode (n_q = 1) for acceptance checks to be sound. The kernel
+        // config (nwarps, nbatch_fa) is selected from cols_per_block, so decode and
+        // verify must use the same cols_per_block here; use the n_q = 1 config.
+        // Larger batches (prefill) keep the tuned configs below.
+        constexpr int cols_per_block = ncols2 > 2 ? ncols2 : 2;
+        const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+        const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+        fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
+        launch_fattn<DV, cols_per_block/ncols2, ncols2>
+            (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+            need_f16_K, need_f16_V, false, warp_size);
+        return;
+    }
+
 #ifdef GGML_USE_HIP
     if constexpr (DKQ <= 128) {
         if (Q->ne[1] > 32/ncols2) {

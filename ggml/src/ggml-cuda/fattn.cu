@@ -531,7 +531,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // GGML_CUDA_FA_WMMA_MAX_HEAD overrides the per-arch cap (experiment/escape hatch).
     const char * wmma_max_env = getenv("GGML_CUDA_FA_WMMA_MAX_HEAD");
     const int wmma_max_head = wmma_max_env ? std::atoi(wmma_max_env) : (wmma_256 && GGML_CUDA_CC_IS_RDNA4(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_0(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_5(cc) ? 320 : 128);
-    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
+    // Speculative verify batches (n_q = n_draft+1 <= 8) must stay on the tile
+    // kernel: decode (n_q = 1) never uses WMMA (n_q*gqa_ratio_eff <= 8), so a
+    // WMMA verify batch would produce different logits than decode.
+    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8 && Q->ne[1] > 8) {
         // The kernel instantiates logit_softcap only for heads 128/256/512.
         if (logit_softcap == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512) {
             return BEST_FATTN_KERNEL_MMA_F16;
