@@ -1,9 +1,9 @@
 diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
 new file mode 100644
-index 000000000..44657502f
+index 000000000..4c4870cdf
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/allreduce-hip.cu
-@@ -0,0 +1,1168 @@
+@@ -0,0 +1,1467 @@
 +#include "allreduce.cuh"
 +
 +#if defined(GGML_USE_HIP)
@@ -12,10 +12,12 @@ index 000000000..44657502f
 +#include "ggml-impl.h"
 +
 +#include <algorithm>
++#include <atomic>
 +#include <cinttypes>
 +#include <cstdlib>
 +#include <cstring>
 +#include <limits>
++#include <type_traits>
 +#include <vector>
 +
 +// ---------------------------------------------------------------------------
@@ -77,6 +79,19 @@ index 000000000..44657502f
 +    return *(const volatile int *)p;
 +}
 +
++// Fused-stage control (WIP): per-call staging parameters shared between the
++// stage kernel (captured as the last node of each device's subgraph graph)
++// and the reduce kernel.  Written device-side by the last reduce of each AR
++// call (publishing the NEXT call's values); read via volatile so a partially
++// updated struct only ever fails the reduce's validation and falls back to
++// in-kernel staging.  Not for integration.
++struct ggml_cuda_ar_stage_control {
++    int slot;        // next call's pool slot
++    int token;       // next call's arrival token
++    int wire_bf16;   // 1: stage converts F32 -> BF16 wire
++    int input_f32;   // 1: stage input is F32
++};
++
 +// Byte spacing between adjacent arrival ints.  64 bytes (one cache line)
 +// ensures each GPU/block's arrival slot lives on its own line, preventing
 +// false-sharing stalls on the polling GPU.
@@ -126,6 +141,27 @@ index 000000000..44657502f
 +static constexpr int  GGML_CUDA_AR_POOL_SIZE = 2;
 +static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 1024 * 1024; // 1 MB
 +
++static constexpr size_t GGML_CUDA_AR_COPY_MAX_BYTES = 32 * 1024 * 1024; // 32 MB
++
++// AR wire size at which the copy-engine path takes over from the chunked-
++// kernel path.  Override via GGML_CUDA_AR_COPY_THRESHOLD.
++static constexpr size_t GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT = 1024 * 1024; // 1 MB
++// Per-call CE chunk-size heuristic: chunk_bytes = clamp(nbytes / 4, MIN, MAX).
++// The /4 keeps ~4 chunks in flight at any moment (good D2H/H2D overlap with
++// the peer); the clamps cover the cases where nbytes/4 is too small (per-
++// memcpy fixed cost dominates) or too large (chunk-level pipelining stalls).
++// Env var GGML_CUDA_AR_COPY_CHUNK_BYTES can override with a fixed value.
++static constexpr size_t GGML_CUDA_AR_COPY_CHUNK_BYTES_HEURISTIC_MIN = 512 * 1024;       // 512 KB
++static constexpr size_t GGML_CUDA_AR_COPY_CHUNK_BYTES_HEURISTIC_MAX = 2 * 1024 * 1024;  // 2 MB
++// Absolute floor that an env-var override is allowed to set; this caps the
++// per-slot copy-event array.  256 KB -> up to 128 chunks per 32 MB tensor.
++static constexpr size_t GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN = 256 * 1024;
++static constexpr int GGML_CUDA_AR_COPY_MAX_CHUNKS =
++    static_cast<int>((GGML_CUDA_AR_COPY_MAX_BYTES + GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN - 1) /
++                    GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN);
++
++
++
 +template <typename T_dst, typename T_wire>
 +static __global__ void ggml_cuda_ar_kernel(
 +        const T_dst  *              sendbuf,
@@ -139,7 +175,10 @@ index 000000000..44657502f
 +        int                         token,
 +        int64_t *                   prof_spin,
 +        int64_t *                   prof_start,  // WIP: clock64 at kernel entry (block 0); NULL disables
-+        bool                        use_sleep) {   // true: __builtin_amdgcn_s_sleep(1) poll; false: dummy asm spin
++        bool                        use_sleep,   // true: __builtin_amdgcn_s_sleep(1) poll; false: dummy asm spin
++        const int * __restrict__    stage_marker, // per (slot,rank) copy-done token (device mem); NULL disables
++        const ggml_cuda_ar_stage_control * __restrict__ control,  // fused-stage state; NULL disables fast path
++        bool                        write_next_control) {          // last chunk: publish control for the next call
 +
 +    // Vector unit for the wire type, sized to the arch's widest single-instruction
 +    // copy (16 B on Volta+/RDNA).  Each phase-1 iter writes one vector to host
@@ -163,8 +202,32 @@ index 000000000..44657502f
 +    const int count_vec = count / ELEMS_PER_VEC;
 +    const int tail      = count_vec * ELEMS_PER_VEC;
 +
++    // Fused-stage fast path: if the stage kernel (the captured graph's last
++    // node) already staged our shard + arrival token for this call, skip the
++    // in-kernel phase 1.  Validate the control's slot/token/types AND our own
++    // arrival so a stale, wrong-typed, or absent stage write falls back to
++    // in-kernel staging (correct data, no benefit).
++    constexpr bool input_is_f32 = std::is_same<T_dst, float>::value;
++    constexpr bool wire_is_bf16 = std::is_same<T_wire, nv_bfloat16>::value;
++    const int * my_arrival = arrival_base +
++        ((size_t)(slot * n_devices + rank) * GGML_CUDA_AR_KERNEL_BLOCKS + bid) * ARRIVAL_INTS;
++    // The control lives in DEVICE memory (only the one-time init values pass
++    // through the host), so volatile reads are fast AND coherent there; the
++    // arrival read is our own slot on the GTT ring, also stage-written and
++    // completed on this stream.  (Plain cached loads of GTT are NOT coherent
++    // -- L2 does not snoop host-mapped writes -- so they must stay volatile.)
++    bool stage_done = false;
++    if (control != nullptr) {
++        stage_done =
++            ggml_cuda_ar_signal_get(&control->slot)      == slot &&
++            ggml_cuda_ar_signal_get(&control->token)     == token &&
++            ggml_cuda_ar_signal_get(&control->wire_bf16) == (int) wire_is_bf16 &&
++            ggml_cuda_ar_signal_get(&control->input_f32) == (int) input_is_f32 &&
++            ggml_cuda_ar_signal_get(my_arrival)          == token;
++    }
++
 +    // Phase 1: cast sendbuf (T_dst) -> host_mine (T_wire) and store as vectors.
-+    {
++    if (!stage_done) {
 +        for (int i = gtid; i < count_vec; i += gnt) {
 +            const int off = i * ELEMS_PER_VEC;
 +            T_wire wire[ELEMS_PER_VEC];
@@ -195,8 +258,10 @@ index 000000000..44657502f
 +        if (prof_spin != nullptr && bid == 0) {
 +            prof_spin[0] = (int64_t) clock64();
 +        }
-+        ggml_cuda_ar_signal_set(my_slot, token);
-+        __threadfence_system(); // make our signal visible system-wide
++        if (!stage_done) {
++            ggml_cuda_ar_signal_set(my_slot, token);
++            __threadfence_system(); // make our signal visible system-wide
++        }
 +
 +        // Wait for EVERY peer's token for this call before reading its data.
 +        for (int j = 0; j < n_devices; ++j) {
@@ -220,6 +285,24 @@ index 000000000..44657502f
 +        }
 +        if (prof_spin != nullptr && bid == 0) {
 +            prof_spin[1] = (int64_t) clock64();
++        }
++
++        // Publish the stage control for the NEXT call (last chunk only).  The
++        // next subgraph's stage kernel (in-graph) reads these values; the next
++        // reduce validates them, so a torn/absent update is always safe.
++        if (write_next_control && bid == 0 && control != nullptr) {
++            ggml_cuda_ar_stage_control next;
++            next.slot      = (slot + 1) % GGML_CUDA_AR_POOL_SIZE;
++            next.token     = token + 1;
++            next.wire_bf16 = wire_is_bf16 ? 1 : 0;
++            next.input_f32 = input_is_f32 ? 1 : 0;
++            volatile ggml_cuda_ar_stage_control * ctl =
++                const_cast<volatile ggml_cuda_ar_stage_control *>(control);
++            ctl->slot      = next.slot;
++            ctl->token     = next.token;
++            ctl->wire_bf16 = next.wire_bf16;
++            ctl->input_f32 = next.input_f32;
++            __threadfence_system();
 +        }
 +    }
 +
@@ -250,8 +333,21 @@ index 000000000..44657502f
 +                own[k] = ggml_cuda_cast<T_wire>(sendbuf[off + k]);
 +            }
 +            T_wire peer[GGML_CUDA_MAX_DEVICES][ELEMS_PER_VEC];
-+            for (int p = 0; p < n_peers; ++p) {
-+                ggml_cuda_memcpy_1<sizeof(peer[0])>(peer[p], &host_peers[p][off]);
++            if (stage_done) {
++                // Fused path: the peer wire was written by SDMA memcpy NODES,
++                // which bypass the GPU L2 -- plain cached loads hit STALE
++                // lines from prior calls.  Volatile loads (glc) refetch from
++                // host memory, which is where the memcpy completed.
++                for (int p = 0; p < n_peers; ++p) {
++                    #pragma unroll
++                    for (int k = 0; k < ELEMS_PER_VEC; ++k) {
++                        peer[p][k] = *(const volatile T_wire *)&host_peers[p][off + k];
++                    }
++                }
++            } else {
++                for (int p = 0; p < n_peers; ++p) {
++                    ggml_cuda_memcpy_1<sizeof(peer[0])>(peer[p], &host_peers[p][off]);
++                }
 +            }
 +            #pragma unroll
 +            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
@@ -272,67 +368,70 @@ index 000000000..44657502f
 +    }
 +}
 +
-+// Combined load-convert-add kernel.  The peer's contribution arrives as T_src
-+// (which may be a lower-precision type than T_dst when the BF16 round-trip is
-+// active).  For bit-equivalence between the two GPUs, dst is first rounded
-+// through T_src's precision via ggml_cuda_cast -- peer already truncated its
-+// own value the same way before sending -- so both sides perform identical
-+// arithmetic.  When T_dst == T_src the round-trip cast is a no-op.
-+template <typename T_dst, typename T_src>
-+static __global__ void ggml_cuda_ar_add_kernel(
-+        T_dst       * __restrict__ dst,
-+        const T_src * __restrict__ src,
-+        int count) {
-+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-+    const int nt  = gridDim.x * blockDim.x;
-+    for (int i = tid; i < count; i += nt) {
-+        const T_src d_low = ggml_cuda_cast<T_src>(dst[i]);
-+        dst[i] = ggml_cuda_cast<T_dst>(
-+            ggml_cuda_cast<float>(d_low) + ggml_cuda_cast<float>(src[i]));
++// Fused-mode stage kernel (WIP): converts this device's shard (the subgraph's
++// last node output) to BF16 in a DEVICE scratch buffer and writes the copy-done
++// marker.  The actual host_wire + arrival writes are done by D2H memcpy NODES
++// (SDMA) captured right after this kernel -- memcpy completion IS the
++// host-visibility barrier, so no __threadfence_system() is needed here
++// (measured ~50 us in-graph on RDNA4, which killed the compute-kernel variant).
++// No GTT writes from compute kernels at all.
++// v2 control-based stage kernel: converts the shard, writes the wire (GTT),
++// fences (the writer fence is REQUIRED -- the peers' L2 sees only
++// system-fenced writes), then signals the arrival.  Reads the control at
++// replay so the baked graph params (slot/token) rotate per call.  This is the
++// only captured-node design that is coherent on this platform: D2H memcpy
++// nodes are NOT captured (executed once at hook time) and SDMA bypasses the
++// GPU L2, so the SDMA-based v4 variant cannot work.
++static __global__ void ggml_cuda_ar_stage_kernel(
++        const float * __restrict__ sendbuf,   // F32 shard (the subgraph tail)
++        nv_bfloat16 * __restrict__ host_wire_base, // device mapping of host_wire
++        int         *               arrival_base,  // device mapping of the arrival ring
++        const ggml_cuda_ar_stage_control * __restrict__ control,  // per-device stage state
++        int                         rank,
++        int                         n_devices,
++        int                         count) {
++
++    constexpr size_t BUF_ELEMS = GGML_CUDA_AR_MAX_BYTES / sizeof(nv_bfloat16);
++    constexpr int    ARRIVAL_INTS = (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
++
++    const int tid = threadIdx.x;
++    const int bid = blockIdx.x;
++    const int slot  = ggml_cuda_ar_signal_get(&control->slot);
++    const int token = ggml_cuda_ar_signal_get(&control->token);
++
++    nv_bfloat16 * wire = host_wire_base + (size_t)(rank * GGML_CUDA_AR_POOL_SIZE + slot) * BUF_ELEMS;
++
++    const int gtid = bid * blockDim.x + tid;
++    const int gnt  = gridDim.x * blockDim.x;
++    for (int i = gtid; i < count; i += gnt) {
++        wire[i] = ggml_cuda_cast<nv_bfloat16>(sendbuf[i]);
++    }
++    // Writer fence: make the GTT wire writes visible system-wide BEFORE the
++    // arrival is signalled.  (The peers' plain loads then see the data; the
++    // in-graph cost of this fence is the fusion's price -- measured ~50 us in
++    // the pre-wedge session, re-measured on the healthy machine below.)
++    __threadfence_system();
++    __syncthreads();
++    if (tid == 0 && bid == 0) {
++        // Signal EVERY block's arrival slot so the reduce can launch the full
++        // block grid (fast phase-3) with uniform stage_done -- not just block 0.
++        int * base = arrival_base +
++            ((size_t)(slot * n_devices + rank) * GGML_CUDA_AR_KERNEL_BLOCKS) * ARRIVAL_INTS;
++        for (int b = 0; b < GGML_CUDA_AR_KERNEL_BLOCKS; ++b) {
++            ggml_cuda_ar_signal_set(base + (size_t)b * ARRIVAL_INTS, token);
++        }
++        __threadfence_system();
 +    }
 +}
 +
-+// ---------------------------------------------------------------------------
-+// Pipeline structure
-+// ---------------------------------------------------------------------------
-+
-+// Number of slots in the event / arrival ring.  Two slots is sufficient:
-+// lockstep guarantees the two GPUs are at most one AR (or chunk) apart, so
-+// slot[N%2] is always safe to reuse -- peer has already consumed slot[N%2]
-+// from AR N-2 by the time we get to AR N.  acquire_slot's
-+// hipEventSynchronize on ev.ker for both devices makes that consumption
-+// explicit before we overwrite host_buf[slot] for the new AR.
-+
-+
-+// Copy-engine path: largest tensor accepted on this path; sets host_large /
-+// dev_tmp allocation size.
-+static constexpr size_t GGML_CUDA_AR_COPY_MAX_BYTES = 32 * 1024 * 1024; // 32 MB
-+
-+// AR wire size at which the copy-engine path takes over from the chunked-
-+// kernel path.  Override via GGML_CUDA_AR_COPY_THRESHOLD.
-+static constexpr size_t GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT = 1024 * 1024; // 1 MB
-+// Per-call CE chunk-size heuristic: chunk_bytes = clamp(nbytes / 4, MIN, MAX).
-+// The /4 keeps ~4 chunks in flight at any moment (good D2H/H2D overlap with
-+// the peer); the clamps cover the cases where nbytes/4 is too small (per-
-+// memcpy fixed cost dominates) or too large (chunk-level pipelining stalls).
-+// Env var GGML_CUDA_AR_COPY_CHUNK_BYTES can override with a fixed value.
-+static constexpr size_t GGML_CUDA_AR_COPY_CHUNK_BYTES_HEURISTIC_MIN = 512 * 1024;       // 512 KB
-+static constexpr size_t GGML_CUDA_AR_COPY_CHUNK_BYTES_HEURISTIC_MAX = 2 * 1024 * 1024;  // 2 MB
-+// Absolute floor that an env-var override is allowed to set; this caps the
-+// per-slot copy-event array.  256 KB -> up to 128 chunks per 32 MB tensor.
-+static constexpr size_t GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN = 256 * 1024;
-+static constexpr int GGML_CUDA_AR_COPY_MAX_CHUNKS =
-+    static_cast<int>((GGML_CUDA_AR_COPY_MAX_BYTES + GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN - 1) /
-+                    GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN);
-+
 +struct ggml_cuda_ar_event_slot {
 +    hipEvent_t app = nullptr;  // upstream computation complete
-+    hipEvent_t cpy[GGML_CUDA_AR_COPY_MAX_CHUNKS] = {};  // copy-engine D2H chunks complete
 +    hipEvent_t h2d = nullptr;  // copy-engine H2Ds complete (handoff AR stream -> compute stream)
-+    hipEvent_t ker = nullptr;  // AllReduce kernel complete
++    hipEvent_t ker = nullptr;  // AR-done on the compute stream (pool-wraparound)
++    hipEvent_t cpy[GGML_CUDA_AR_COPY_MAX_CHUNKS];  // per-chunk H2D done
 +};
 +
-+// Mapped pinned host allocation: hipHostMalloc + hipHostGetDevicePointer in
++// One allocation, host handle + device-mapped pointer, kept together in
 +// one place, with the host handle preserved for hipHostFree.  Used where the
 +// CPU never touches the buffer -- only the device reads/writes via the mapped
 +// device pointer.
@@ -375,6 +474,11 @@ index 000000000..44657502f
 +    size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
 +    uint64_t call_count;
 +    bool     use_sleep;      // GGML_CUDA_AR_SLEEP: s_sleep poll vs dummy spin (WIP)
++    bool     fused;          // GGML_CUDA_AR_FUSED: stage captured into subgraph graphs (WIP)
++    bool     pace;           // GGML_CUDA_AR_PACE: host-side lockstep -- poll peers' prev AR before enqueueing (WIP)
++    ggml_cuda_ar_stage_control * stage_control_dev[GGML_CUDA_MAX_DEVICES]; // per-device stage control (hipMalloc)
++    ggml_cuda_ar_stage_control stage_control_host;    // init values (one-time host copy)
++    nv_bfloat16 *             stage_scratch[GGML_CUDA_MAX_DEVICES]; // per-device BF16 convert scratch
 +
 +    // --- WIP tuning instrumentation (GGML_CUDA_AR_PROFILE=1) ------------
 +    // Device-side per-call timing around each all-reduce; a distribution is
@@ -415,6 +519,97 @@ index 000000000..44657502f
 +    // Use ggml_cuda_ar_arrival_ptr() to index.
 +    ggml_cuda_ar_host_mapping arrival;
 +};
++
++// Combined load-convert-add kernel.  The peer's contribution arrives as T_src
++// (which may be a lower-precision type than T_dst when the BF16 round-trip is
++// active).  For bit-equivalence between the two GPUs, dst is first rounded
++// through T_src's precision via ggml_cuda_cast -- peer already truncated its
++// own value the same way before sending -- so both sides perform identical
++// arithmetic.  When T_dst == T_src the round-trip cast is a no-op.
++template <typename T_dst, typename T_src>
++static __global__ void ggml_cuda_ar_add_kernel(
++        T_dst       * __restrict__ dst,
++        const T_src * __restrict__ src,
++        int count) {
++    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
++    const int nt  = gridDim.x * blockDim.x;
++    for (int i = tid; i < count; i += nt) {
++        const T_src d_low = ggml_cuda_cast<T_src>(dst[i]);
++        dst[i] = ggml_cuda_cast<T_dst>(
++            ggml_cuda_cast<float>(d_low) + ggml_cuda_cast<float>(src[i]));
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Pipeline structure
++// ---------------------------------------------------------------------------
++
++// Number of slots in the event / arrival ring.  Two slots is sufficient:
++// lockstep guarantees the two GPUs are at most one AR (or chunk) apart, so
++// slot[N%2] is always safe to reuse -- peer has already consumed slot[N%2]
++// from AR N-2 by the time we get to AR N.  acquire_slot's
++// hipEventSynchronize on ev.ker for both devices makes that consumption
++// explicit before we overwrite host_buf[slot] for the new AR.
++
++
++// Copy-engine path: largest tensor accepted on this path; sets host_large /
++// dev_tmp allocation size.
++
++// ---------------------------------------------------------------------------
++// WIP fused-stage hook table: the CUDA backend calls ggml_cuda_ar_stage_hook_run
++// during graph capture so the stage kernel becomes the captured graph's last
++// node.  The table is empty unless a pipeline was initialized in fused mode.
++// ---------------------------------------------------------------------------
++static ggml_cuda_ar_stage_fn  ggml_cuda_ar_stage_hook_fns[GGML_CUDA_MAX_DEVICES];
++static void *                 ggml_cuda_ar_stage_hook_data[GGML_CUDA_MAX_DEVICES];
++
++void ggml_cuda_ar_stage_hook_set(int device, ggml_cuda_ar_stage_fn fn, void * user_data) {
++    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
++    ggml_cuda_ar_stage_hook_fns[device]  = fn;
++    ggml_cuda_ar_stage_hook_data[device] = user_data;
++}
++
++void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
++                                 const float * data, int64_t count) {
++    ggml_cuda_ar_stage_fn fn = ggml_cuda_ar_stage_hook_fns[device];
++    if (fn == nullptr) {
++        return;
++    }
++    fn(device, stream, data, count, ggml_cuda_ar_stage_hook_data[device]);
++}
++
++// Hook callback: launch the stage kernel on the capturing stream.  The
++// launch is recorded as the graph's last node; its args (wire/arrival/control
++// addresses, rank, n) are stable across calls, and the per-call slot/token
++// come from the control buffer at run time.
++static void ggml_cuda_ar_stage_hook_fn(int device, cudaStream_t stream,
++                                       const float * data, int64_t count, void * user_data) {
++    auto * p = static_cast<ggml_cuda_ar_pipeline *>(user_data);
++    int rank = -1;
++    for (int i = 0; i < p->n_devices; ++i) {
++        if (p->devices[i] == device) { rank = i; break; }
++    }
++    if (rank < 0 || data == nullptr || count <= 0 ||
++        count > (int64_t)(GGML_CUDA_AR_MAX_BYTES / sizeof(float))) {
++        return;
++    }
++    const size_t input_nbytes = (size_t) count * sizeof(float);
++    const bool   wire_bf16    = p->bf16_threshold > 0 && input_nbytes >= p->bf16_threshold;
++    ggml_cuda_set_device(device);
++    // v2 stage: one captured kernel does convert + wire write + writer fence +
++    // arrival.  Reads the per-device control at replay for the rotating
++    // slot/token.  (The SDMA/memcpy-node v4 variant is NOT captured by HIP
++    // graphs on this platform and cannot work.)
++    ggml_cuda_ar_stage_kernel<<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>(
++        data,
++        reinterpret_cast<nv_bfloat16 *>(p->host_wire.dev),
++        reinterpret_cast<int *>(p->arrival.dev),
++        p->stage_control_dev[rank],
++        rank,
++        p->n_devices,
++        (int) count);
++    CUDA_CHECK(hipGetLastError());
++}
 +
 +// Base pointer for the (slot, rank) per-block token block.  The kernel adds
 +// blockIdx.x * (ARRIVAL_STRIDE/sizeof(int)) internally to land on its own slot.
@@ -484,6 +679,29 @@ index 000000000..44657502f
 +        return nullptr;
 +    }
 +
++    // RDNA4-only gate: the internal/hybrid all-reduce is verified ONLY on
++    // RDNA4 (gfx1200/gfx1201).  On any other architecture the pipeline is
++    // not created and the allreduce dispatch falls back to the default
++    // (RCCL) path, until community verification exists (e.g. RDNA3 pairs).
++    for (size_t i = 0; i < n_devices; ++i) {
++        hipDeviceProp_t prop;
++        ggml_cuda_set_device(devices[i]);
++        if (hipGetDeviceProperties(&prop, devices[i]) != hipSuccess) {
++            GGML_LOG_ERROR("%s: hipGetDeviceProperties failed for device %d; falling back\n",
++                           __func__, devices[i]);
++            return nullptr;
++        }
++        const char * arch = prop.gcnArchName;   // e.g. "gfx1201:xnack-"
++        const bool rdna4  = strncmp(arch, "gfx1200", 7) == 0 ||
++                            strncmp(arch, "gfx1201", 7) == 0;
++        if (!rdna4) {
++            GGML_LOG_WARN("%s: internal all-reduce is RDNA4-only (gfx1200/gfx1201); "
++                          "device %d reports %s -- falling back to the default path\n",
++                          __func__, devices[i], arch);
++            return nullptr;
++        }
++    }
++
 +    auto * p = new ggml_cuda_ar_pipeline{};
 +    p->n_devices        = n_devices;
 +    p->copy_bytes       = GGML_CUDA_AR_COPY_MAX_BYTES;
@@ -501,6 +719,16 @@ index 000000000..44657502f
 +    // byte threshold to opt out for small tensors.
 +    p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
 +    p->use_sleep        = ggml_cuda_ar_env_u64("GGML_CUDA_AR_SLEEP", 1) != 0;
++    p->fused            = ggml_cuda_ar_env_u64("GGML_CUDA_AR_FUSED", 0) != 0;
++    if (p->fused) {
++        GGML_LOG_WARN("%s: fused-stage mode enabled (GGML_CUDA_AR_FUSED=1); "
++                      "stage kernel is captured into subgraph graphs (WIP)\n", __func__);
++    }
++    p->pace             = ggml_cuda_ar_env_u64("GGML_CUDA_AR_PACE", 0) != 0;
++    if (p->pace) {
++        GGML_LOG_WARN("%s: host-side lockstep pacing enabled (GGML_CUDA_AR_PACE=1); "
++                      "poll peers' prev AR before enqueueing (WIP)\n", __func__);
++    }
 +    p->prof_enabled     = ggml_cuda_ar_env_u64("GGML_CUDA_AR_PROFILE", 0) != 0;
 +    if (p->prof_enabled) {
 +        GGML_LOG_WARN("%s: per-call profiling enabled (GGML_CUDA_AR_PROFILE=1); "
@@ -550,6 +778,13 @@ index 000000000..44657502f
 +            }
 +        }
 +
++        // Pacing: pre-record every slot's end-of-AR event so the first calls'
++        // lockstep polls never spin on unrecorded events.
++        for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
++            CUDA_CHECK(hipEventRecord(p->ev_pool[i][s].ker, p->streams[i]));
++        }
++        CUDA_CHECK(hipStreamSynchronize(p->streams[i]));
++
 +        if (hipEventCreateWithFlags(&p->host_large_read_done[i], hipEventDisableTiming) != hipSuccess) {
 +            GGML_LOG_ERROR("%s: hipEventCreate for host_large_read_done failed for device %d\n",
 +                           __func__, p->devices[i]);
@@ -592,6 +827,34 @@ index 000000000..44657502f
 +                       __func__, host_wire_total);
 +        ggml_cuda_ar_pipeline_free(p);
 +        return nullptr;
++    }
++
++    if (p->fused) {
++        // Stage control: device-mapped so the stage kernel (baked into graphs)
++        // and the reduce kernel share per-call slot/token/type state without
++        // host-side copies.  Initial values match the first acquire_slot
++        // (call_count 0 -> slot 0, token 1; F32 input, BF16 wire).
++        p->stage_control_host = { 0, 1, 1, 1 };
++        for (size_t i = 0; i < n_devices; ++i) {
++            ggml_cuda_set_device(p->devices[i]);
++            if (hipMalloc(reinterpret_cast<void **>(&p->stage_control_dev[i]),
++                          sizeof(ggml_cuda_ar_stage_control)) != hipSuccess ||
++                hipMalloc(reinterpret_cast<void **>(&p->stage_scratch[i]),
++                          GGML_CUDA_AR_MAX_BYTES / 2) != hipSuccess) {
++                GGML_LOG_ERROR("%s: alloc for stage state failed\n", __func__);
++                ggml_cuda_ar_pipeline_free(p);
++                return nullptr;
++            }
++            if (hipMemcpy(p->stage_control_dev[i], &p->stage_control_host,
++                          sizeof(ggml_cuda_ar_stage_control), hipMemcpyHostToDevice) != hipSuccess) {
++                GGML_LOG_ERROR("%s: failed to init stage control\n", __func__);
++                ggml_cuda_ar_pipeline_free(p);
++                return nullptr;
++            }
++        }
++        for (size_t i = 0; i < n_devices; ++i) {
++            ggml_cuda_ar_stage_hook_set(p->devices[i], ggml_cuda_ar_stage_hook_fn, p);
++        }
 +    }
 +
 +    // Copy-engine path: pinned host staging + device scratch, sized for the
@@ -725,6 +988,21 @@ index 000000000..44657502f
 +    }
 +    // --- end WIP instrumentation -------------------------------------------
 +
++    if (p->fused) {
++        for (int i = 0; i < p->n_devices; ++i) {
++            ggml_cuda_ar_stage_hook_set(p->devices[i], nullptr, nullptr);
++        }
++        for (int i = 0; i < p->n_devices; ++i) {
++            if (p->stage_control_dev[i]) {
++                ggml_cuda_set_device(p->devices[i]);
++                hipFree(p->stage_control_dev[i]);
++            }
++            if (p->stage_scratch[i]) {
++                ggml_cuda_set_device(p->devices[i]);
++                hipFree(p->stage_scratch[i]);
++            }
++        }
++    }
 +    p->host_wire.free();
 +    for (int i = 0; i < p->n_devices; ++i) {
 +        p->host_large[i].free();
@@ -1111,6 +1389,24 @@ index 000000000..44657502f
 +            const bool last_chunk = chunk_start + (int64_t) chunk_elems == ne;
 +
 +            for (int i = 0; i < n; ++i) {
++                // Host-side lockstep pacing: wait for EVERY peer's PREVIOUS
++                // call (prev slot) to complete before enqueueing this device's
++                // kernel.  Mirrors rocprof's pacing mechanism: the per-step
++                // dispatch-gap asymmetry (dev0 ends late) can only accumulate
++                // if the devices' step boundaries drift apart -- this gate
++                // re-aligns them every call.  Busy-poll (hipEventQuery), no
++                // OS sleep; instant when the peers are already done.
++                if (p->pace) {
++                    const int prev_slot = (slot + GGML_CUDA_AR_POOL_SIZE - 1) % GGML_CUDA_AR_POOL_SIZE;
++                    for (int j = 0; j < n; ++j) {
++                        if (j == i) continue;
++                        hipError_t e;
++                        do {
++                            e = hipEventQuery(p->ev_pool[j][prev_slot].ker);
++                        } while (e == hipErrorNotReady);
++                        GGML_ASSERT(e == hipSuccess);
++                    }
++                }
 +                ggml_cuda_set_device(p->devices[i]);
 +                auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
 +                GGML_ASSERT(cuda_ctx->device == p->devices[i]);
@@ -1138,7 +1434,10 @@ index 000000000..44657502f
 +                    token, \
 +                    (prof_on) ? (p->prof_spin[i] + prof_idx * 2) : nullptr, \
 +                    (prof_on) ? (p->prof_start[i] + prof_idx) : nullptr, \
-+                    p->use_sleep)
++                    p->use_sleep, \
++                    nullptr, \
++                    p->fused ? p->stage_control_dev[i] : nullptr, \
++                    last_chunk && p->fused)
 +
 +                if (use_bf16) {
 +                    GGML_ASSERT(input_type == GGML_TYPE_F32);
@@ -1173,7 +1472,7 @@ index 000000000..44657502f
 +
 +#endif // defined(GGML_USE_HIP)
 diff --git a/ggml/src/ggml-cuda/allreduce.cu b/ggml/src/ggml-cuda/allreduce.cu
-index d56129a22..4477b12bb 100644
+index d56129a22..a27a62936 100644
 --- a/ggml/src/ggml-cuda/allreduce.cu
 +++ b/ggml/src/ggml-cuda/allreduce.cu
 @@ -952,13 +952,14 @@ bool ggml_cuda_ar_allreduce(
@@ -1198,8 +1497,58 @@ index d56129a22..4477b12bb 100644
  ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
      return nullptr;
  }
+@@ -968,4 +969,19 @@ bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tens
+     return false;
+ }
+ 
++// WIP fused-stage hook: no-op on non-HIP builds (the internal AR is HIP-only).
++void ggml_cuda_ar_stage_hook_set(int device, ggml_cuda_ar_stage_fn fn, void * user_data) {
++    GGML_UNUSED(device);
++    GGML_UNUSED(fn);
++    GGML_UNUSED(user_data);
++}
++
++void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
++                                 const float * data, int64_t count) {
++    GGML_UNUSED(device);
++    GGML_UNUSED(stream);
++    GGML_UNUSED(data);
++    GGML_UNUSED(count);
++}
++
+ #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+diff --git a/ggml/src/ggml-cuda/allreduce.cuh b/ggml/src/ggml-cuda/allreduce.cuh
+index 0f2c9518d..63342ef19 100644
+--- a/ggml/src/ggml-cuda/allreduce.cuh
++++ b/ggml/src/ggml-cuda/allreduce.cuh
+@@ -27,3 +27,25 @@ bool ggml_cuda_ar_allreduce(
+     ggml_backend_t        * backends,
+     ggml_tensor           ** tensors);
+ 
++// ---------------------------------------------------------------------------
++// WIP fused-stage hook: the CUDA backend's graph-capture path calls
++// ggml_cuda_ar_stage_hook_run() right before cudaStreamEndCapture so the AR
++// stage kernel (shard -> wire + arrival token) becomes the captured graph's
++// LAST node.  With the stage inside the graph, the wire data + arrival token
++// are ready at each device's subgraph-end instead of after the separate AR
++// kernel's dispatch (which carries a per-device graph->kernel premium of up
++// to ~12 us on the late card).  The reduce kernel validates that the stage
++// actually ran and falls back to in-kernel staging otherwise, so prefill /
++// warmup / graphs-off are never broken.  Not for integration.
++typedef void (*ggml_cuda_ar_stage_fn)(int device, cudaStream_t stream,
++                                      const float * data, int64_t count,
++                                      void * user_data);
++
++// Register (or clear, fn==nullptr) the stage hook for `device`.
++void ggml_cuda_ar_stage_hook_set(int device, ggml_cuda_ar_stage_fn fn, void * user_data);
++
++// Called by the CUDA backend during graph capture.  No-op when no hook is
++// registered for `device` (the common case).
++void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
++                                 const float * data, int64_t count);
++
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 321cb930b..5ad7ea465 100644
+index 321cb930b..2e55b7e77 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1005,6 +1005,15 @@ struct ggml_backend_cuda_comm_context {
@@ -1395,4 +1744,23 @@ index 321cb930b..5ad7ea465 100644
 +    }
      return comm_ctx->try_allreduce(comm_ctx, tensors);
  }
+ 
+@@ -4735,6 +4781,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 graph->graph = nullptr;
+             }
+ 
++            // WIP fused-stage: capture the AR stage kernel as the graph's LAST
++            // node so each device's wire staging + arrival token are ready at
++            // subgraph-end instead of after the separate AR kernel's dispatch
++            // (which carries a per-device graph->kernel premium).  No-op when
++            // the internal AR pipeline isn't in fused mode.
++            if (cgraph->n_nodes > 0 && cgraph->nodes[cgraph->n_nodes-1] != nullptr) {
++                const ggml_tensor * last = cgraph->nodes[cgraph->n_nodes-1];
++                ggml_cuda_ar_stage_hook_run(cuda_ctx->device, cuda_ctx->stream(),
++                                            static_cast<const float *>(last->data),
++                                            ggml_nelements(last));
++            }
++
+             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+             graph_evaluated_or_captured = true; // CUDA graph has been captured
  
