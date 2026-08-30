@@ -27,6 +27,31 @@ lives at `~/llama.cpp`, branch `rdna-boosts` — rebuilt 2026-08-29 as the
 (block commits `2b7a135cb..f6f8f6778` + the archived WIP commits, tip
 `155debcdc`) is preserved on the `old-rdna-boosts` branch.
 
+## Pushing policy (MANDATORY — read before any `git push`)
+
+**Never push anything out of the `~/llama.cpp` fork checkout — never to
+upstream llama.cpp, and never to the personal fork unless the maintainer
+explicitly requests it.**
+
+- All deliverable changes live in THIS repo (`llama-cpp-rdna-boosts`) as
+  the `patches/` set.  That is the only thing that gets pushed (to this
+  repo's own `origin`, `github.com:stew675/llama-cpp-rdna-boosts`).
+- The `~/llama.cpp` checkout exists to host the block commits and to
+  apply/test the diff set locally.  Its `rdna-boosts` branch is
+  **disposable**: the sanctioned flow is to **delete the pre-patched
+  branch and re-apply our diff set** (`scripts/apply-all.sh` on a fresh
+  checkout at the fork point) — never to push the branch anywhere.
+- If the maintainer explicitly asks to push a fork sub-branch, the ONLY
+  permitted target is the personal fork
+  (`git@github.com:stew675/llama.cpp.git`, the `fork` remote).  NEVER
+  push to upstream `ggml-org/llama.cpp` (the `origin` remote in
+  `~/llama.cpp`) — a bare `git push` there would target upstream.
+- Confirm the exact branch name and intent with the maintainer before any
+  such push; if history rewrites are involved use `--force-with-lease`,
+  never a bare `--force`.
+- Repeated attempts to push directly to llama.cpp can result in an account
+  ban.  When in doubt: don't push, ask.
+
 ## Layout
 
 | path | what |
@@ -118,6 +143,10 @@ cd ~/llama.cpp && BUILD_DIR=build-rocm-hybrid ~/bin/build-llama-rocm-714
   regenerate from the fork (`scripts/make-patches.sh`) and re-verify.
 - Do not mix the historical `baseline/*` branches or `block/*` tags with the
   current `patches/` — they are different patch sets for different baselines.
+- Do not push anything from the `~/llama.cpp` checkout — the fork branch
+  is disposable and must be re-applied from the diff set, not pushed (see
+  the Pushing policy above).  The only permitted push target outside this
+  repo is the personal fork, and only on explicit maintainer request.
 - Do not present old docs as current: MANIFESTS/BASELINE validation records
   are dated history; the current claims are the header sections + `patches/README.md`.
 - Do not add new WIP experiments to the delivery patch set — WIP stays in
