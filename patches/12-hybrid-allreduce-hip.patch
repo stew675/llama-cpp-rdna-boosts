@@ -1644,10 +1644,10 @@ index 0f2c9518d..4985d969e 100644
 +void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
 +                                 const float * data, int64_t count);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 321cb930b..2f6304fd0 100644
+index e75b746c2..6965879fa 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -1005,6 +1005,15 @@ struct ggml_backend_cuda_comm_context {
+@@ -1006,6 +1006,15 @@ struct ggml_backend_cuda_comm_context {
      }
  };
  
@@ -1663,7 +1663,7 @@ index 321cb930b..2f6304fd0 100644
  #ifdef GGML_USE_NCCL
  // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
  // tensors (bandwidth-bound), then converts back to FP32.
-@@ -1027,7 +1036,7 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
+@@ -1028,7 +1037,7 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
  
      // For small tensors, simply reduce them as FP32.
      // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
@@ -1672,7 +1672,7 @@ index 321cb930b..2f6304fd0 100644
          for (size_t i = 0; i < n_backends; ++i) {
              if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                  ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-@@ -1089,7 +1098,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
+@@ -1090,7 +1099,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
      GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
  
      const size_t n_backends = comm_ctx->backends.size();
@@ -1681,7 +1681,7 @@ index 321cb930b..2f6304fd0 100644
      GGML_ASSERT(tensors[0] != nullptr);
  
      const int64_t   ne   = ggml_nelements(tensors[0]);
-@@ -1169,29 +1178,31 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
+@@ -1170,29 +1179,31 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
      ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
  }
  
@@ -1723,7 +1723,7 @@ index 321cb930b..2f6304fd0 100644
      }
  
      const size_t n = ret->dev_ids.size();
-@@ -1199,26 +1210,52 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
+@@ -1200,26 +1211,52 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
      ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
      if (rc == ncclSuccess) {
          ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
@@ -1785,7 +1785,7 @@ index 321cb930b..2f6304fd0 100644
  static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
      for (size_t i = 0; i < n_backends; i++) {
          if (!ggml_backend_is_cuda(backends[i])) {
-@@ -1234,37 +1271,55 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
+@@ -1235,37 +1272,55 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
      }
  
      const char * env = getenv("GGML_CUDA_ALLREDUCE");
@@ -1850,7 +1850,7 @@ index 321cb930b..2f6304fd0 100644
      return comm_ctx->try_allreduce(comm_ctx, tensors);
  }
  
-@@ -4735,6 +4790,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4745,6 +4800,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  graph->graph = nullptr;
              }
  

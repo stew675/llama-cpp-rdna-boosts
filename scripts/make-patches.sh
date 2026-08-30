@@ -5,24 +5,24 @@
 #   fork-path     path to the stew675/llama.cpp fork checkout (default:
 #                 ../llama.cpp relative to this repo)
 #   baseline-sha  the upstream baseline the patches are generated against
-#                 (default: 17252c769, see MANIFESTS.md)
+#                 (default: a7cc83bba, see MANIFESTS.md)
 #   blocks-tip    the fork commit carrying blocks 01-11 (default:
-#                 cc985ba9a, the whitespace-clean block-11 commit)
+#                 8fbf10e5b, the re-based block-11 commit)
 #
 # Blocks 01-11 are the fork commits baseline-sha..blocks-tip, exported with
 # `git format-patch` (the canonical, verified form).  Block 12 (the hybrid
 # HIP all-reduce + RDNA4 gate) is the fork's delta vs blocks-tip over the
 # four allreduce files (allreduce-hip.cu/allreduce.cu/allreduce.cuh/
 # ggml-cuda.cu).  Block 12 is committed on the fork branch (tip
-# 12d10267b) and `git diff <blocks-tip>` picks it up from the clean tree;
+# 4fa92f0ae) and `git diff <blocks-tip>` picks it up from the clean tree;
 # it also works if the block-12 changes are instead uncommitted in the
 # fork's working tree.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
-BASELINE="${2:-17252c769}"
-TIP="${3:-cc985ba9a}"
+BASELINE="${2:-a7cc83bba}"
+TIP="${3:-8fbf10e5b}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -d "$FORK/.git" ]; then

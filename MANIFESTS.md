@@ -5,9 +5,10 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **12-patch set** against the fork point
-`17252c769`: blocks 01-11 (`patches/0001-…0011-…`, format-patch of the
-fork's `rdna-boosts` block commits — the current whitespace-clean
-regeneration `3209e83b4..cc985ba9a`; the original fork hashes
+`a7cc83bba` (re-based 2026-08-30; previously `17252c769`): blocks 01-11
+(`patches/0001-…0011-…`, format-patch of the
+fork's `rdna-boosts` block commits — the re-based regeneration
+`4c0f30dec..8fbf10e5b`; the original fork hashes
 `2b7a135cb..f6f8f6778` are preserved on the `old-rdna-boosts` branch) plus
 **block 12** (`patches/12-hybrid-allreduce-hip.patch`, the hybrid HIP
 all-reduce — delta vs the block-11 tip, RDNA4-gated). Apply flow: `git am`
@@ -38,7 +39,7 @@ patch set. It is written for humans AND LLM coding agents. Follow it exactly;
 do not skip blocks.
 
 Current state: `main` is the delivery branch (flat history, 12-patch set
-against `17252c769`). The `baseline/<sha>` branches and `block/01-…11` tags
+against `a7cc83bba`). The `baseline/<sha>` branches and `block/01-…11` tags
 are HISTORICAL checkpoints of the old pre-block-12 structure (older
 upstream ranges, `git apply` flow); do not use them for the current
 delivery — use `patches/` + `scripts/apply-all.sh`.
@@ -68,7 +69,27 @@ then `git apply` the 12th — the concatenated-series `git apply` trick
 silently drops hunks.
 
 
-## Verified apply sequence (current delivery, 2026-08-29)
+## Verified apply sequence
+
+### Re-baseline to a7cc83bba (2026-08-30, current)
+
+Fork point moved from `17252c769` to upstream master `a7cc83bba` (24
+commits of drift; 6 touching ggml-cuda). The fork's `rdna-boosts` branch
+was rebuilt from the delivery patches on the new base and the set
+regenerated with `scripts/make-patches.sh` (base `a7cc83bba`, blocks tip
+`8fbf10e5b`, block 12 committed as `4fa92f0ae`). Blocks 01-07 and 09-12
+applied cleanly; the ONE conflict was block 08 vs upstream's SWIGLU_CLAMP
+(#27930, landed 2026-08-30): its `glu_limit` additions to the mm-fusion
+args structs (`common.cuh`) and `mmvq.cu` (decls, fusion-assign, the
+GLU-switch/result-write restructure, `fusion_local`) were merged alongside
+block 08's `dst_gate`/`conv_*`/`x_scale_channel_dst` work (verified: the
+merged files diff vs block-08's post-image blobs = exactly upstream's
+additions, nothing else). Verified end-to-end 2026-08-30: clean-apply sim
+on a fresh clone at `a7cc83bba` (zero conflicts, zero whitespace
+warnings), full build clean, llama-cli same-seed coherence IDENTICAL to
+the pre-re-base known-good build.
+
+### Baseline 17252c769 (2026-08-29, superseded)
 
 On a fresh checkout of the fork point `17252c769`:
 
@@ -179,14 +200,14 @@ run-to-run noise, no measurable impact from the bounded-spin fix.
 | 12 | llama-cli same-seed coherence (2- and 3-GPU) + depth-16384 decode A/B (hybrid vs nccl vs internal) | same-seed output IDENTICAL to RCCL; 3-GPU hybrid 38.71 t/s (unpinned) at depth-16384; tg64 38.12 / tg512 41.08 |
 
 Convenience: `rdna-boosts-all.patch` (repo root) is the entire 12-patch net
-as ONE patch (applies cleanly on `17252c769` alone; not a substitute for the
+as ONE patch (applies cleanly on `a7cc83bba` alone; not a substitute for the
 per-block flow in `patches/` when you want reviewable increments).
 
 
 ## Failure handling (agent instruction)
 
 > Apply the patches in `patches/` in the order given in this file to a fresh
-> branch from the fork point `17252c769` (see `scripts/apply-all.sh` for the
+> branch from the fork point `a7cc83bba` (see `scripts/apply-all.sh` for the
 > automated flow). After each patch, run its verification command. Blocks
 > 01-11 apply with `git am`; if a patch fails, `git am -3` / `git apply -3`
 > (3-way merge against the baseline blobs), then manually rebase the hunks
@@ -218,6 +239,15 @@ per-block flow in `patches/` when you want reviewable increments).
   fused mmvq kernel region, the `ggml-cuda.cu` try_fuse machinery, and the
   `fattn.cu` dispatch cluster. It is extracted as ONE combined diff on
   purpose. Do not try to split it.
+- **Block 08 vs upstream SWIGLU_CLAMP (2026-08-30 re-base):** upstream's
+  #27930 added `glu_limit` to the same mm-fusion regions block 08 rewrites
+  (`common.cuh` args structs; `mmvq.cu` decls / fusion-assign /
+  GLU-switch restructure / `fusion_local`). The re-base merged them side
+  by side; the SWIGLU_CLAMP case now lives inside block 08's restructured
+  switch on `result_val`. If a future re-base hits this again: keep
+  upstream's `glu_limit` lines, re-apply block 08's additions around
+  them, and verify with the post-image-blob diff (merged file minus
+  block-08 blob must equal exactly upstream's additions).
 - **Blocks 06 and 09 (old numbering) were retired**: their content folded into block 10 (the k-quant umbrella); numbering compacted to 01-10, then 01-11, then +12. Full history: `archive/docs/baseline-history.md`.
 - When upstream master moves past the fork point and more than one block needs manual re-base hunks, regenerate from the fork with `scripts/make-patches.sh` (see `BASELINE.md` drift policy).
 

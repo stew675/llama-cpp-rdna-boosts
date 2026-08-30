@@ -1,4 +1,4 @@
-From d0e3bd7e1375f4143dd20d74415e35682fc196e9 Mon Sep 17 00:00:00 2001
+From 4f39488aeb9e5d18ac2b9d76a1e0781a3c1024f3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 04/11] rdna-boosts: block 04: RDNA4 WMMA flash-attn + Q6_K mmq
@@ -121,7 +121,7 @@ index 6b8fb0243..1e5856e9e 100644
  
      // If there are no tensor cores available, use the generic tile kernel:
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 720ee8b7b..78dd445e5 100644
+index c1fa214ad..628fb9228 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -71,6 +71,7 @@
@@ -132,7 +132,7 @@ index 720ee8b7b..78dd445e5 100644
  #include <array>
  #include <atomic>
  #include <charconv>
-@@ -4012,6 +4013,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4022,6 +4023,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
      bool graph_evaluated_or_captured = false;
  
@@ -159,7 +159,7 @@ index 720ee8b7b..78dd445e5 100644
      // flag used to determine whether it is an integrated_gpu
      const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
  
-@@ -4178,12 +4199,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4188,12 +4209,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  GGML_UNUSED(integrated);
  #endif  // NDEBUG
  
@@ -181,7 +181,7 @@ index 720ee8b7b..78dd445e5 100644
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
                 }
-@@ -4225,6 +4255,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4235,6 +4265,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          graph_evaluated_or_captured = true;
  #endif  // USE_CUDA_GRAPH
      }
@@ -319,10 +319,10 @@ index c978b4421..0998f7bca 100644
          if (ggml_cuda_mmq_get_config(type, ret, fallback, cc).type != GGML_TYPE_COUNT) {
              return ret;
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 8ee581636..3760bed33 100644
+index 07f4e4ee4..4911ddf81 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -9230,6 +9230,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9297,6 +9297,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
@@ -336,7 +336,7 @@ index 8ee581636..3760bed33 100644
  #endif
  
      for (ggml_type type_a : all_types) {
-@@ -9984,7 +9991,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10051,7 +10058,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      for (float max_bias : { 0.0f, 8.0f }) {
                          if (!mask && max_bias > 0.0f) continue;
                          for (float logit_softcap : {0.0f, 10.0f}) {
@@ -346,7 +346,7 @@ index 8ee581636..3760bed33 100644
                              for (int nh : { 1, 4 }) {
                                  if (nh == 1 && hsk != 320 && hsk != 576) continue;
                                  for (int nr3 : { 1, 3, }) {
-@@ -10259,6 +10267,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10331,6 +10339,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
              GGML_TYPE_F32, {n_kv, 512, 64, 1}, false, {2, 1, 0, 3}));
      }
  

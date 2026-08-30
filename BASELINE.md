@@ -2,7 +2,8 @@
 
 Current state: `main` is the delivery branch carrying the **12-patch set**
 (blocks 01-11 + the hybrid all-reduce block 12) generated against the fork
-point **llama.cpp master `17252c769`**. The `baseline/<sha>` branches below
+point **llama.cpp master `a7cc83bba`** (re-based 2026-08-30 from
+`17252c769`). The `baseline/<sha>` branches below
 are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
@@ -22,18 +23,18 @@ at `192067b72`), `baseline/d222767c7` (validated against `d222767c7`) and
 
 
 All 12 patches are generated against **llama.cpp upstream master at
-`17252c769`**: blocks 01-11 = the fork's `rdna-boosts` block commits
-(originally `2b7a135cb..f6f8f6778`, preserved on `old-rdna-boosts`; the
-current whitespace-clean regeneration is `3209e83b4..cc985ba9a`, tip
-`12d10267b` with block 12 committed); block 12 = the hybrid HIP all-reduce
+`a7cc83bba`** (re-based 2026-08-30 from `17252c769`; dated record at the
+bottom of this file): blocks 01-11 = the fork's `rdna-boosts` block
+commits (originally `2b7a135cb..f6f8f6778`, preserved on
+`old-rdna-boosts`; the re-based regeneration is `4c0f30dec..8fbf10e5b`,
+block 12 committed as `4fa92f0ae`); block 12 = the hybrid HIP all-reduce
 delta over four files (`allreduce-hip.cu` new, `allreduce.cu`,
 `allreduce.cuh`, `ggml-cuda.cu`), including the RDNA4-only gate.
-`scripts/make-patches.sh` regenerates both. Verified 2026-08-29: clean
+`scripts/make-patches.sh` regenerates both. Verified 2026-08-30: clean
 apply (`git am` 01-11 + `git apply` 12) on a fresh checkout at
-`17252c769`, full build clean, llama-cli same-seed coherence IDENTICAL to
-the fork build, tg64 38.12 / tg512 41.08 — and the apply is
-**whitespace-free** (zero git warnings) after the whitespace-clean
-regeneration of 2026-08-29.
+`a7cc83bba`, full build clean, llama-cli same-seed coherence IDENTICAL to
+the pre-re-base known-good build, tg64 38.12 / tg512 41.08 — and the
+apply is **whitespace-free** (zero git warnings).
 
 ## Two fixes vs the fork
 
@@ -72,18 +73,18 @@ validation:
 ## Per-block provenance
 
 The CURRENT delivery patches (0001-0011) are the fork's `rdna-boosts` block
-commits exported with `git format-patch` (one commit per block,
-`17252c769` as the base) — originally `2b7a135cb..f6f8f6778`, currently
-the whitespace-clean regeneration `3209e83b4..cc985ba9a` (tip `12d10267b`
-with block 12 committed; the original fork history is preserved on
-`old-rdna-boosts`). Block 12 is the hybrid HIP all-reduce delta over four
+commits exported with `git format-patch` (one commit per block, the
+re-based set against `a7cc83bba`: `4c0f30dec..8fbf10e5b`; previously the
+whitespace-clean regeneration `3209e83b4..cc985ba9a` against
+`17252c769`; originally `2b7a135cb..f6f8f6778`; the original fork history
+is preserved on `old-rdna-boosts`). Block 12 is the hybrid HIP all-reduce delta over four
 files (RDNA4-gated). The ORIGINAL source commits on the fork branch
 `chunked-gdn` (the pre-consolidation lineage) and the old `baseline/*`-branch
 checkpoint history moved to `archive/docs/baseline-history.md`.
 
 ## Drift policy
 
-The patches are static against the fork point `17252c769`. If a patch fails
+The patches are static against the fork point `a7cc83bba`. If a patch fails
 to apply against a newer upstream master:
 
 1. Try `git am -3` / `git apply -3` (3-way merge against the baseline blobs).
@@ -92,9 +93,39 @@ to apply against a newer upstream master:
 3. Do NOT hand-edit the committed patches as the permanent fix: when more
    than one block needs manual re-base hunks, regenerate the whole set from
    the fork with `scripts/make-patches.sh` (which re-exports blocks 01-11
-   from `17252c769..<blocks-tip>` and the block-12 delta; defaults target
-the current clean blocks tip `cc985ba9a`), then re-verify the clean-apply
+   from `a7cc83bba..<blocks-tip>` and the block-12 delta; defaults target
+the current blocks tip `8fbf10e5b`), then re-verify the clean-apply
 simulation (fresh worktree at the new fork point, `scripts/apply-all.sh`,
 build, coherence) and update the fork point + verification numbers in
 `patches/README.md` and `README.md`.
+
+---
+
+## Re-baseline to a7cc83bba (2026-08-30, dated record)
+
+Upstream master moved 24 commits past the fork point `17252c769` (6 of
+them touching ggml-cuda). The fork's `rdna-boosts` branch was rebuilt from
+the delivery patches on the new base (blocks 01-07 and 09-12 applied
+cleanly; block 08 needed a manual merge) and the set regenerated with
+`scripts/make-patches.sh` (base `a7cc83bba`, blocks tip `8fbf10e5b`,
+block 12 committed as `4fa92f0ae`).
+
+The one real conflict: upstream's **SWIGLU_CLAMP (#27930)**, landed one
+day after the old fork point, added `glu_limit` plumbing to the same
+mm-fusion machinery block 08 rewrites (the `ggml_cuda_mm_fusion_args_*`
+structs in `common.cuh`; four regions of `mmvq.cu` — the `active_glu`
+decls, the fusion-assign block, the GLU-switch/result-write restructure,
+and the `fusion_local` copy). Resolution: upstream's `glu_limit`/
+`SWIGLU_CLAMP` additions were kept alongside block 08's fields, with the
+SWIGLU_CLAMP case relocated inside block 08's restructured switch
+(`result_val`). Verified by diffing the merged files against block 08's
+post-image blobs: the difference is exactly upstream's additions, nothing
+else.
+
+Verified end-to-end 2026-08-30: clean-apply sim on a fresh clone at
+`a7cc83bba` (`scripts/apply-all.sh`, zero conflicts + zero whitespace
+warnings), full build clean, llama-cli same-seed coherence IDENTICAL to
+the pre-re-base known-good build. tg64 38.12 / tg512 41.08 (sim build)
+unchanged — the re-base is code-identical to the 2026-08-29 set plus
+upstream's SWIGLU_CLAMP additions.
 

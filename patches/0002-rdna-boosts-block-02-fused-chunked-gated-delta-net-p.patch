@@ -1,4 +1,4 @@
-From a1f4af22f9861a98857b2e511e9a9320786cc4e0 Mon Sep 17 00:00:00 2001
+From e7826f9a836a262e7e57d1c33c03b0efc3908ec1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 02/11] rdna-boosts: block 02: fused chunked gated-delta-net
@@ -2883,7 +2883,7 @@ index 000000000..910c99594
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 \ No newline at end of file
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 4a7a06231..86d645bcb 100644
+index 996b88db2..e2c5b3636 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1471,14 +1471,64 @@ struct test_case {
@@ -2956,7 +2956,7 @@ index 4a7a06231..86d645bcb 100644
                  ud->ok = false;
              }
              return true;
-@@ -4357,6 +4407,24 @@ struct test_gated_delta_net : public test_case {
+@@ -4414,6 +4464,24 @@ struct test_gated_delta_net : public test_case {
          return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
      }
  
@@ -2981,7 +2981,7 @@ index 4a7a06231..86d645bcb 100644
      test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
              int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
              int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
-@@ -10082,6 +10150,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10154,6 +10222,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
@@ -3000,7 +3000,7 @@ index 4a7a06231..86d645bcb 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
-@@ -10527,6 +10607,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10599,6 +10679,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
  

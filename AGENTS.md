@@ -8,7 +8,7 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **12-patch set** that applies to a clean
-llama.cpp checkout at the fork point **`17252c769`**.
+llama.cpp checkout at the fork point **`a7cc83bba`** (re-based 2026-08-30; previously `17252c769`).
 
 - Blocks **01-11** (`patches/0001-…0011-…`): MTP draft depth, fused chunked
   GDN, BF16 KV, WMMA flash-attn, CPU bit-identical decode, host-buffer
@@ -21,9 +21,11 @@ llama.cpp checkout at the fork point **`17252c769`**.
   archived, env-gated OFF, in `archive/work/fused-stage-pacing/`.
 
 The repo is NOT the fork: the fork (source of truth for the block commits)
-lives at `~/llama.cpp`, branch `rdna-boosts` — rebuilt 2026-08-29 as the
-**whitespace-clean** 12-commit branch (block 12 committed, tip
-`12d10267b`; blocks 01-11 tip `cc985ba9a`). The historical fork state
+lives at `~/llama.cpp`, branch `rdna-boosts` — re-based 2026-08-30 onto
+upstream master `a7cc83bba` (12-commit branch; blocks tip `8fbf10e5b`,
+block 12 committed as `4fa92f0ae`; the 2026-08-29 whitespace-clean
+rebuild `12d10267b`/`cc985ba9a` against `17252c769` is superseded). The
+historical fork state
 (block commits `2b7a135cb..f6f8f6778` + the archived WIP commits, tip
 `155debcdc`) is preserved on the `old-rdna-boosts` branch.
 
@@ -104,7 +106,7 @@ explicitly requests it.**
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 17252c769
+git checkout a7cc83bba
 bash <this-repo>/scripts/apply-all.sh .     # creates branch rdna-boosts, 12 commits
 ```
 
@@ -121,9 +123,9 @@ Diff the output against a known-good build (or against RCCL via
 
 ### Regenerate the patches (after fork changes)
 
-`scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `17252c769`,
-blocks tip `cc985ba9a`): `git format-patch` the block commits + the
-block-12 delta for the 12th (block 12 is committed as `12d10267b`; the
+`scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `a7cc83bba`,
+blocks tip `8fbf10e5b`): `git format-patch` the block commits + the
+block-12 delta for the 12th (block 12 is committed as `4fa92f0ae`; the
 script's `git diff <blocks-tip>` picks it up from the clean tree). Then
 re-verify the clean-apply simulation (worktree at the fork point,
 apply-all, build, coherence) before committing.

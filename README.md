@@ -5,7 +5,7 @@ A delivery repo for a **12-patch set** of **RDNA3 / RDNA3.5 / RDNA4**
 **blocks 01-11** (MTP, GDN, BF16 KV,
 WMMA flash-attn, fused core, k-quant boosts, CUDA prefill-graph skip) plus
 **block 12** (the hybrid HIP all-reduce). The patches apply to a clean
-llama.cpp checkout at the recorded fork point `17252c769`.
+llama.cpp checkout at the recorded fork point `a7cc83bba` (re-based 2026-08-30; previously `17252c769`).
 
 `scripts/apply-all.sh` automates the apply: it creates a fresh `rdna-boosts`
 branch, applies blocks 01-11 with `git am` and block 12 with `git apply`,
@@ -44,17 +44,17 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
 (gfx1200/gfx1201) and falls back to RCCL elsewhere (see
 `patches/README.md` for the gate and env knobs).
 
-## Current state (2026-08-29)
+## Current state (2026-08-30)
 
-- **Fork point (baseline):** llama.cpp master at `17252c769`.
+- **Fork point (baseline):** llama.cpp master at `a7cc83bba` (re-based
+  2026-08-30 from `17252c769`; 24 commits of drift — see `MANIFESTS.md`
+  for the dated re-base record, incl. the block-08/SWIGLU_CLAMP merge).
 - **Set:** 12 patches in `patches/` (`0001`-`0011` + `12-hybrid-allreduce-hip.patch`).
 - **Verified:** clean apply + full build + llama-cli same-seed coherence
   IDENTICAL to the fork build; tg64 38.12 / tg512 41.08 on the sim build.
 - **Whitespace-clean apply:** the regenerated set applies with **zero git
-  whitespace warnings** (`git am` 01-11, `git apply` 12; verified
-  2026-08-29 on a fresh checkout at `17252c769`). The applied tree is
-  byte-identical to the previous set except 8 inert whitespace lines + 1
-  EOF blank line.
+  whitespace warnings** (`git am` 01-11, `git apply` 12; re-verified
+  2026-08-30 on a fresh checkout at `a7cc83bba`).
 - **Deployment:** 3-GPU hybrid (`HIP_VISIBLE_DEVICES=0,1,2`, unpinned) gives
   depth-16384 decode 38.71 t/s (+21.8% vs 2-GPU). See
   [`patches/README.md`](patches/README.md) for block-12 env knobs and the
@@ -119,7 +119,7 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
 # 1. fresh clone of llama.cpp, at the fork point
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-git checkout 17252c769        # the SHA recorded in patches/README.md
+git checkout a7cc83bba        # the SHA recorded in patches/README.md
 
 # 2. apply the set (automated; VERIFIED 2026-08-29)
 bash <path-to-this-repo>/scripts/apply-all.sh .
@@ -148,7 +148,7 @@ git add -A && git commit -m "rdna-boosts: block 12: hybrid HIP all-reduce"
 
 ## When upstream master moves
 
-The patches are static against `17252c769`. When upstream drifts and hunks
+The patches are static against `a7cc83bba`. When upstream drifts and hunks
 no longer apply, regenerate the whole set from the fork with
 `scripts/make-patches.sh` (needs the `~/llama.cpp` fork checkout, which
 carries the block commits + the block-12 working-tree delta), then update

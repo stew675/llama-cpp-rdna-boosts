@@ -1,7 +1,8 @@
 # rdna-boosts patch set (delivery)
 
-12 patches against the llama.cpp fork point `17252c769`
-("metal : add remaining fa-vec tunings for M4 Pro (#27915)"):
+12 patches against the llama.cpp fork point `a7cc83bba`
+("rpc: avoid serializing buffers from other servers (#26500)"; re-based
+2026-08-30 from `17252c769`):
 
 | patch | content |
 |---|---|
@@ -21,7 +22,7 @@
 ## Apply (fresh checkout at the fork point)
 
 ```bash
-git checkout 17252c769          # or: git apply each patch on a matching tree
+git checkout a7cc83bba          # or: git apply each patch on a matching tree
 git am patches/000[1-9]-*.patch patches/001[01]-*.patch
 git apply patches/12-hybrid-allreduce-hip.patch
 ```

@@ -1,4 +1,4 @@
-From c639ae3791ec4084f332704a3a61f35d98339b5c Mon Sep 17 00:00:00 2001
+From 446480772b1465464d20f9c7772997f405352708 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 10/11] rdna-boosts: block 10: k-quant-boosts -
@@ -13,10 +13,10 @@ Subject: [PATCH 10/11] rdna-boosts: block 10: k-quant-boosts -
  5 files changed, 325 insertions(+), 18 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index d57b6a120..cc7841dc1 100644
+index a1287b7da..b01fc29f1 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4845,13 +4845,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4855,13 +4855,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
  
@@ -70,7 +70,7 @@ index fd0414e8d..89708176c 100644
              }
          }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index a0b96d1e9..49be861a6 100644
+index 1f112a45d..268ce29a1 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -21,9 +21,9 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
@@ -152,7 +152,7 @@ index a0b96d1e9..49be861a6 100644
          if (ncols_dst == 1) {
              switch (type) {
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index 0f039c735..90b12aac1 100644
+index ec117c57d..0595b329c 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
 @@ -240,7 +240,16 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
@@ -312,7 +312,7 @@ index 0f039c735..90b12aac1 100644
  // contiguous v/x + u/y values
  static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
      const int * __restrict__ v, const int * __restrict__ u, const int8_t * __restrict__ sc,
-@@ -953,6 +1054,59 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+@@ -961,6 +1062,59 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
      return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
  }
  
@@ -372,7 +372,7 @@ index 0f039c735..90b12aac1 100644
  static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
      const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
  
-@@ -999,6 +1153,64 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
+@@ -1007,6 +1161,64 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
      return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
  }
  
@@ -437,7 +437,7 @@ index 0f039c735..90b12aac1 100644
  static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
      const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
  
-@@ -1025,6 +1237,41 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+@@ -1033,6 +1245,41 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
      return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
  }
  
@@ -480,10 +480,10 @@ index 0f039c735..90b12aac1 100644
  #define VDR_IQ2_XXS_Q8_1_MMQ  2
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 3760bed33..3fa203ee1 100644
+index 4911ddf81..f51fd2848 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10445,9 +10445,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10517,9 +10517,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -519,7 +519,7 @@ index 3760bed33..3fa203ee1 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -10455,8 +10479,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10527,8 +10551,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
