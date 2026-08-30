@@ -1,9 +1,9 @@
 diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
 new file mode 100644
-index 000000000..44217d583
+index 000000000..16238b32a
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/allreduce-hip.cu
-@@ -0,0 +1,1554 @@
+@@ -0,0 +1,1564 @@
 +#include "allreduce.cuh"
 +
 +#if defined(GGML_USE_HIP)
@@ -280,44 +280,54 @@ index 000000000..44217d583
 +
 +        // Wait for EVERY peer's token for this call before reading its data.
 +        bool timed_out = false;
++        uint32_t poll_cnt = 0;
++        const uint64_t wait_t0 = clock64();
 +        for (int j = 0; j < n_devices; ++j) {
 +            if (j == rank) continue;
 +            const int * other_slot = arrival_base +
 +                ((size_t)(slot * n_devices + j) * GGML_CUDA_AR_KERNEL_BLOCKS + bid) * ARRIVAL_INTS;
-+            const uint64_t wait_t0 = clock64();
-+            uint32_t poll_cnt = 0;
-+            while (ggml_cuda_ar_signal_get(other_slot) != token) {
-+                // HIP has no __nanosleep; default to the arch sleep instruction
-+                // (validated by the dual-7900xtx RCCL-fallback port: s_sleep(1) is
-+                // the RDNA3 polling idiom), fall back to a bounded dummy spin when
-+                // GGML_CUDA_AR_SLEEP=0.
-+                if (use_sleep) {
-+                    __builtin_amdgcn_s_sleep(1);
-+                } else {
-+                    #pragma unroll
-+                    for (int i = 0; i < 16; ++i) {
-+                        asm volatile("" ::: "memory");
++            // One conditional branch per poll: exit the poll loop on the
++            // peer's arrival, or on a decimation tick (bit test on the poll
++            // counter, every GGML_CUDA_AR_SPIN_CHECK_DIV polls) to re-check
++            // the spin budget.  A tick without a timeout keeps polling the
++            // SAME peer (outer loop); the arrival exits it.  (Merging the two
++            // checks keeps the hot inner loop to a single branch.)
++            while (true) {
++                while (true) {
++                    const bool arrived = ggml_cuda_ar_signal_get(other_slot) == token;
++                    const bool tick = (++poll_cnt & (GGML_CUDA_AR_SPIN_CHECK_DIV - 1)) == 0;
++                    if (arrived | tick) {
++                        break;
++                    }
++                    // HIP has no __nanosleep; default to the arch sleep
++                    // instruction (validated by the dual-7900xtx RCCL-fallback
++                    // port: s_sleep(1) is the RDNA3 polling idiom), fall back
++                    // to a bounded dummy spin when GGML_CUDA_AR_SLEEP=0.
++                    if (use_sleep) {
++                        __builtin_amdgcn_s_sleep(1);
++                    } else {
++                        #pragma unroll
++                        for (int i = 0; i < 16; ++i) {
++                            asm volatile("" ::: "memory");
++                        }
 +                    }
 +                }
-+                // Bounded wait: the peer's arrival can be lost on a PCIe
-+                // hiccup, and an unbounded spin here is what makes the compute
-+                // queue non-removable on RDNA4 (driver REMOVE_QUEUE fails in
-+                // MES -> MODE1 reset or whole-machine freeze).  Exceeding the
-+                // budget turns that into one dropped AR call.
-+                //
-+                // clock64() is a global-timer memory read (~30+ cycles), so
-+                // the budget check is decimated to one in
-+                // GGML_CUDA_AR_SPIN_CHECK_DIV polls (see the constant): on the
-+                // true fast path the arrival lands before the first check, so
-+                // the timer is never read; the check only engages for
-+                // genuinely slow launches, where a 512-poll granularity is
-+                // still negligible against the ms-scale budget.
-+                if ((++poll_cnt & (GGML_CUDA_AR_SPIN_CHECK_DIV - 1)) == 0 &&
-+                    spin_budget_cycles > 0 &&
++                if (ggml_cuda_ar_signal_get(other_slot) == token) {
++                    // Arrived normally; on to the next peer.
++                    break;
++                }
++                // Decimation tick without arrival: the peer's arrival can be
++                // lost on a PCIe hiccup, and an unbounded spin here is what
++                // makes the compute queue non-removable on RDNA4 (driver
++                // REMOVE_QUEUE fails in MES -> MODE1 reset or whole-machine
++                // freeze).  Exceeding the budget turns that into one dropped
++                // AR call.
++                if (spin_budget_cycles > 0 &&
 +                    (uint64_t) (clock64() - wait_t0) >= spin_budget_cycles) {
 +                    timed_out = true;
 +                    break;
 +                }
++                // Budget not expired: keep polling the same peer.
 +            }
 +            if (timed_out) break;
 +        }

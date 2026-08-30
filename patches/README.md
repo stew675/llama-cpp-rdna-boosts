@@ -69,9 +69,11 @@ warnings (verified 2026-08-29 after the whitespace-clean regeneration).
     re-syncs the devices with a butterfly AllReduce on the next call.
     The budget check is decimated to 1-in-512 polls (2x the measured
     typical spin count — p50 184 / p90 283 / p99 369 polls on 2x gfx1201
-    hybrid at depth-16384 — rounded up to a power of two), so the true
-    fast path never executes `clock64()` at all and the timeout overshoot
-    stays <0.1% of budget.
+    hybrid at depth-16384 — rounded up to a power of two), merged with
+    the arrival check into a single per-poll branch (a tick without a
+    timeout keeps polling the same peer), so the true fast path never
+    executes `clock64()` at all and the timeout overshoot stays <0.1% of
+    budget.
   - Re-verified 2026-08-30: clean-apply sim at `17252c769` (apply, full
     build, llama-cli same-seed coherence IDENTICAL); RCCL=OFF `ggml-hip`
     compiles; before/after perf on the default hybrid config (2x R9700,
