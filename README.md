@@ -1,7 +1,8 @@
 # llama-cpp-rdna-boosts
 
-A delivery repo for a **12-patch set** of ROCm-targeted feature enhancements
-and performance fixes for llama.cpp: **blocks 01-11** (MTP, GDN, BF16 KV,
+A delivery repo for a **12-patch set** of **RDNA3 / RDNA3.5 / RDNA4**
+(ROCm) feature enhancements and performance fixes for llama.cpp:
+**blocks 01-11** (MTP, GDN, BF16 KV,
 WMMA flash-attn, fused core, k-quant boosts, CUDA prefill-graph skip) plus
 **block 12** (the hybrid HIP all-reduce). The patches apply to a clean
 llama.cpp checkout at the recorded fork point `17252c769`.
@@ -9,6 +10,39 @@ llama.cpp checkout at the recorded fork point `17252c769`.
 `scripts/apply-all.sh` automates the apply: it creates a fresh `rdna-boosts`
 branch, applies blocks 01-11 with `git am` and block 12 with `git apply`,
 and commits each block.
+
+## Supported architectures
+
+The set targets the **RDNA3 / RDNA3.5 / RDNA4** GPU families:
+
+| family | arches | example parts |
+|--------|--------|---------------|
+| RDNA 3 | `gfx1100` | RX 7900 XTX/XT, RX 7800 XT, ... |
+| RDNA 3.5 | `gfx1150`/`gfx1151` | Strix Point / Strix Halo APUs |
+| RDNA 4 | `gfx1200`/`gfx1201` | RX 9060 XT; RX 9070 / 9070 XT |
+
+**RDNA4 (gfx120x) sees the most benefit** — the WMMA flash-attn path, the
+chunked-GDN kernel, the k-quant VDR boosts and block 12's internal
+all-reduce were all first built and validated there. As much of that work
+as possible is back-ported to the RDNA3/3.5 families instead of being
+gated off:
+
+- block 02's **chunked gated-delta-net** bf16/WMMA prefill ships as two
+  arch-segregated kernels: a dedicated first-gen WMMA port for gfx11
+  (`gated_delta_net_chunked_bf16_gfx11.cu`) next to the RDNA4 kernel;
+- block 04's **WMMA flash-attn** is *not* RDNA4-only despite the block
+  name — RDNA3.0 runs it with the same 576-head limit as RDNA4, RDNA3.5
+  with a tuned 320-head limit;
+- block 10 adds a **dedicated RDNA3.5 mmvq parameter table** (previously
+  folded into the RDNA2 fallback) on top of the RDNA4 k-quant boosts.
+
+Arch selection is **runtime** everywhere in the set (device `cc` /
+`gcnArchName`; there is no compile-time arch gating), so a multi-arch
+build such as `GPU_TARGETS="gfx1100;gfx1151;gfx1201"` yields one binary
+that picks the right path on whichever of these it runs on. The one
+genuine exception is **block 12** — its internal all-reduce is RDNA4-only
+(gfx1200/gfx1201) and falls back to RCCL elsewhere (see
+`patches/README.md` for the gate and env knobs).
 
 ## Current state (2026-08-29)
 
@@ -59,13 +93,13 @@ and commits each block.
 | `0001` | adaptive MTP draft depth (`--draft-mtp-adaptive`) |
 | `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA, arch-segregated gfx12/gfx11) |
 | `0003` | BF16 KV cache + native-BF16 flash-attn |
-| `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf |
+| `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf (WMMA path also runs on RDNA3.0/3.5, tuned head limits) |
 | `0005` | CPU bit-identical decode/verify batches |
 | `0006` | host-buffer revert for discrete GPUs |
 | `0007` | meta device-wrapper skip |
 | `0008` | fused-core prefill kernels + GPU bit-identical results (needs blocks 03+04) |
 | `0009` | meta-buffer compute-container headroom |
-| `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) |
+| `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions; adds a dedicated RDNA3.5 mmvq table) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL (decode keeps graph replay) |
 | `0012` | **hybrid HIP all-reduce** — custom internal AR for the small-tensor decode path, per-size hybrid dispatch vs RCCL, RDNA4-only gate |
 
