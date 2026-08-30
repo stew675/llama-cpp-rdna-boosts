@@ -50,6 +50,12 @@ warnings (verified 2026-08-29 after the whitespace-clean regeneration).
   build + llama-cli same-seed coherence IDENTICAL + tg64 38.12 / tg512 41.08
   (matches the fork build).  Depth-16384 decode 38.71 t/s (3-GPU hybrid,
   unpinned) with the server config `HIP_VISIBLE_DEVICES=0,1,2`.
+- **Compiler-warning clean** (2026-08-29 follow-up): ROCm 7.14 marks
+  `hipError_t` `[[nodiscard]]`, and the original HIP port left 27
+  unchecked HIP calls (all `-Wunused-value` in the ggml-hip build).  All
+  27 now go through `CUDA_CHECK` (upstream house style, incl. teardown);
+  three dead WIP items removed.  The ggml-hip build emits ZERO warnings
+  from this patch.
 
 ## Server config (the +22% deployment win)
 

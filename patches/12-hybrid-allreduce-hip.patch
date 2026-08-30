@@ -1,9 +1,9 @@
 diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
 new file mode 100644
-index 000000000..4c4870cdf
+index 000000000..790f3865b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/allreduce-hip.cu
-@@ -0,0 +1,1467 @@
+@@ -0,0 +1,1458 @@
 +#include "allreduce.cuh"
 +
 +#if defined(GGML_USE_HIP)
@@ -176,7 +176,6 @@ index 000000000..4c4870cdf
 +        int64_t *                   prof_spin,
 +        int64_t *                   prof_start,  // WIP: clock64 at kernel entry (block 0); NULL disables
 +        bool                        use_sleep,   // true: __builtin_amdgcn_s_sleep(1) poll; false: dummy asm spin
-+        const int * __restrict__    stage_marker, // per (slot,rank) copy-done token (device mem); NULL disables
 +        const ggml_cuda_ar_stage_control * __restrict__ control,  // fused-stage state; NULL disables fast path
 +        bool                        write_next_control) {          // last chunk: publish control for the next call
 +
@@ -448,7 +447,7 @@ index 000000000..4c4870cdf
 +        }
 +        rc = hipHostGetDevicePointer(reinterpret_cast<void **>(&dev), host, 0);
 +        if (rc != hipSuccess) {
-+            hipHostFree(host);
++            CUDA_CHECK(hipHostFree(host));
 +            host = nullptr;
 +            dev  = nullptr;
 +        }
@@ -457,7 +456,7 @@ index 000000000..4c4870cdf
 +
 +    void free() {
 +        if (host) {
-+            hipHostFree(host);
++            CUDA_CHECK(hipHostFree(host));
 +            host = nullptr;
 +            dev  = nullptr;
 +        }
@@ -516,7 +515,7 @@ index 000000000..4c4870cdf
 +
 +    // Arrival ring: ARRIVAL_STRIDE bytes between adjacent ints.  Mapped pinned
 +    // memory; CPU never reads/writes -- only the kernel and hipMemset.
-+    // Use ggml_cuda_ar_arrival_ptr() to index.
++    // Indexed by the kernels via ((slot*n + rank)*BLOCKS + bid) * ARRIVAL_INTS.
 +    ggml_cuda_ar_host_mapping arrival;
 +};
 +
@@ -593,8 +592,9 @@ index 000000000..4c4870cdf
 +        count > (int64_t)(GGML_CUDA_AR_MAX_BYTES / sizeof(float))) {
 +        return;
 +    }
-+    const size_t input_nbytes = (size_t) count * sizeof(float);
-+    const bool   wire_bf16    = p->bf16_threshold > 0 && input_nbytes >= p->bf16_threshold;
++    // The v2 stage path always uses a BF16 wire (the kernel converts F32 ->
++    // BF16 unconditionally); the bf16_threshold routing lives in the AR
++    // dispatcher, not here.
 +    ggml_cuda_set_device(device);
 +    // v2 stage: one captured kernel does convert + wire write + writer fence +
 +    // arrival.  Reads the per-device control at replay for the rotating
@@ -609,14 +609,6 @@ index 000000000..4c4870cdf
 +        p->n_devices,
 +        (int) count);
 +    CUDA_CHECK(hipGetLastError());
-+}
-+
-+// Base pointer for the (slot, rank) per-block token block.  The kernel adds
-+// blockIdx.x * (ARRIVAL_STRIDE/sizeof(int)) internally to land on its own slot.
-+static int * ggml_cuda_ar_arrival_ptr(const ggml_cuda_ar_pipeline * p, int slot, int rank) {
-+    const size_t offset = ((size_t)slot * p->n_devices + rank) *
-+                          GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
-+    return reinterpret_cast<int *>(p->arrival.dev + offset);
 +}
 +
 +static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) {
@@ -893,7 +885,7 @@ index 000000000..4c4870cdf
 +    for (int i = 0; i < p->n_devices; ++i) {
 +        if (p->streams[i]) {
 +            ggml_cuda_set_device(p->devices[i]);
-+            hipStreamSynchronize(p->streams[i]);
++            CUDA_CHECK(hipStreamSynchronize(p->streams[i]));
 +        }
 +    }
 +
@@ -904,12 +896,12 @@ index 000000000..4c4870cdf
 +        double total_us = 0;
 +        for (size_t i = 0; i < p->prof_n; ++i) {
 +            float ms = 0;
-+            hipEventElapsedTime(&ms, p->prof_t0[i], p->prof_t1[i]);
++            CUDA_CHECK(hipEventElapsedTime(&ms, p->prof_t0[i], p->prof_t1[i]));
 +            double d = (double) ms * 1e3;
 +            us.push_back(d);
 +            total_us += d;
-+            hipEventDestroy(p->prof_t0[i]);
-+            hipEventDestroy(p->prof_t1[i]);
++            CUDA_CHECK(hipEventDestroy(p->prof_t0[i]));
++            CUDA_CHECK(hipEventDestroy(p->prof_t1[i]));
 +        }
 +        std::sort(us.begin(), us.end());
 +        auto pct = [&](double q) { return us[(size_t)(q * (us.size() - 1))]; };
@@ -935,9 +927,9 @@ index 000000000..4c4870cdf
 +        for (int dev = 0; dev < p->n_devices; ++dev) {
 +            std::vector<int64_t> spin(2 * p->prof_n);
 +            ggml_cuda_set_device(p->devices[dev]);
-+            hipMemcpy(spin.data(), p->prof_spin[dev], 2 * p->prof_n * sizeof(int64_t), hipMemcpyDeviceToHost);
++            CUDA_CHECK(hipMemcpy(spin.data(), p->prof_spin[dev], 2 * p->prof_n * sizeof(int64_t), hipMemcpyDeviceToHost));
 +            int rate_khz = 0;
-+            hipDeviceGetAttribute(&rate_khz, hipDeviceAttributeClockRate, p->devices[dev]);
++            CUDA_CHECK(hipDeviceGetAttribute(&rate_khz, hipDeviceAttributeClockRate, p->devices[dev]));
 +            std::vector<double> sp_us; sp_us.reserve(p->prof_n);
 +            double spin_total = 0; size_t n_spin = 0;
 +            for (size_t i = 0; i < p->prof_n; ++i) {
@@ -963,12 +955,12 @@ index 000000000..4c4870cdf
 +        {
 +            int rate_khz = 0;
 +            ggml_cuda_set_device(p->devices[0]);
-+            hipDeviceGetAttribute(&rate_khz, hipDeviceAttributeClockRate, p->devices[0]);
++            CUDA_CHECK(hipDeviceGetAttribute(&rate_khz, hipDeviceAttributeClockRate, p->devices[0]));
 +            for (int dev = 0; dev < p->n_devices; ++dev) {
 +                std::vector<int64_t> start(p->prof_n), spin(2 * p->prof_n);
 +                ggml_cuda_set_device(p->devices[dev]);
-+                hipMemcpy(start.data(), p->prof_start[dev], p->prof_n * sizeof(int64_t), hipMemcpyDeviceToHost);
-+                hipMemcpy(spin.data(), p->prof_spin[dev], 2 * p->prof_n * sizeof(int64_t), hipMemcpyDeviceToHost);
++                CUDA_CHECK(hipMemcpy(start.data(), p->prof_start[dev], p->prof_n * sizeof(int64_t), hipMemcpyDeviceToHost));
++                CUDA_CHECK(hipMemcpy(spin.data(), p->prof_spin[dev], 2 * p->prof_n * sizeof(int64_t), hipMemcpyDeviceToHost));
 +                std::vector<double> p1_us; p1_us.reserve(p->prof_n);
 +                for (size_t i = 0; i < p->prof_n; ++i) {
 +                    if (start[i] != 0 && spin[2*i] != 0 && spin[2*i] >= start[i]) {
@@ -995,11 +987,11 @@ index 000000000..4c4870cdf
 +        for (int i = 0; i < p->n_devices; ++i) {
 +            if (p->stage_control_dev[i]) {
 +                ggml_cuda_set_device(p->devices[i]);
-+                hipFree(p->stage_control_dev[i]);
++                CUDA_CHECK(hipFree(p->stage_control_dev[i]));
 +            }
 +            if (p->stage_scratch[i]) {
 +                ggml_cuda_set_device(p->devices[i]);
-+                hipFree(p->stage_scratch[i]);
++                CUDA_CHECK(hipFree(p->stage_scratch[i]));
 +            }
 +        }
 +    }
@@ -1008,39 +1000,39 @@ index 000000000..4c4870cdf
 +        p->host_large[i].free();
 +        if (p->prof_start[i]) {
 +            ggml_cuda_set_device(p->devices[i]);
-+            hipFree(p->prof_start[i]);
++            CUDA_CHECK(hipFree(p->prof_start[i]));
 +        }
 +        if (p->dev_tmp[i]) {
 +            ggml_cuda_set_device(p->devices[i]);
-+            hipFree(p->dev_tmp[i]);
++            CUDA_CHECK(hipFree(p->dev_tmp[i]));
 +        }
 +        ggml_cuda_set_device(p->devices[i]);
 +        for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
-+            if (p->ev_pool[i][s].app) { hipEventDestroy(p->ev_pool[i][s].app); }
++            if (p->ev_pool[i][s].app) { CUDA_CHECK(hipEventDestroy(p->ev_pool[i][s].app)); }
 +            for (int c = 0; c < GGML_CUDA_AR_COPY_MAX_CHUNKS; ++c) {
-+                if (p->ev_pool[i][s].cpy[c]) { hipEventDestroy(p->ev_pool[i][s].cpy[c]); }
++                if (p->ev_pool[i][s].cpy[c]) { CUDA_CHECK(hipEventDestroy(p->ev_pool[i][s].cpy[c])); }
 +            }
-+            if (p->ev_pool[i][s].h2d) { hipEventDestroy(p->ev_pool[i][s].h2d); }
-+            if (p->ev_pool[i][s].ker) { hipEventDestroy(p->ev_pool[i][s].ker); }
++            if (p->ev_pool[i][s].h2d) { CUDA_CHECK(hipEventDestroy(p->ev_pool[i][s].h2d)); }
++            if (p->ev_pool[i][s].ker) { CUDA_CHECK(hipEventDestroy(p->ev_pool[i][s].ker)); }
 +        }
 +        if (p->host_large_read_done[i]) {
 +            ggml_cuda_set_device(p->devices[i]);
-+            hipEventDestroy(p->host_large_read_done[i]);
++            CUDA_CHECK(hipEventDestroy(p->host_large_read_done[i]));
 +        }
 +        if (p->dev_tmp_kernel_done[i]) {
 +            ggml_cuda_set_device(p->devices[i]);
-+            hipEventDestroy(p->dev_tmp_kernel_done[i]);
++            CUDA_CHECK(hipEventDestroy(p->dev_tmp_kernel_done[i]));
 +        }
 +        if (p->streams[i]) {
 +            ggml_cuda_set_device(p->devices[i]);
-+            hipStreamDestroy(p->streams[i]);
++            CUDA_CHECK(hipStreamDestroy(p->streams[i]));
 +        }
 +    }
 +    if (p->prof_enabled) {
 +        for (int i = 0; i < p->n_devices; ++i) {
 +            if (p->prof_spin[i]) {
 +                ggml_cuda_set_device(p->devices[i]);
-+                hipFree(p->prof_spin[i]);
++                CUDA_CHECK(hipFree(p->prof_spin[i]));
 +                p->prof_spin[i] = nullptr;
 +            }
 +        }
@@ -1248,9 +1240,9 @@ index 000000000..4c4870cdf
 +    const size_t prof_idx = p->prof_n;
 +    if (prof_on) {
 +        ggml_cuda_set_device(p->devices[0]);
-+        hipEventCreateWithFlags(&p->prof_t0[prof_idx], 0);
-+        hipEventCreateWithFlags(&p->prof_t1[prof_idx], 0);
-+        hipEventRecord(p->prof_t0[prof_idx], prof_stream);
++        CUDA_CHECK(hipEventCreateWithFlags(&p->prof_t0[prof_idx], 0));
++        CUDA_CHECK(hipEventCreateWithFlags(&p->prof_t1[prof_idx], 0));
++        CUDA_CHECK(hipEventRecord(p->prof_t0[prof_idx], prof_stream));
 +        p->prof_ne[prof_idx] = ne;
 +        p->prof_n++;
 +    }
@@ -1435,7 +1427,6 @@ index 000000000..4c4870cdf
 +                    (prof_on) ? (p->prof_spin[i] + prof_idx * 2) : nullptr, \
 +                    (prof_on) ? (p->prof_start[i] + prof_idx) : nullptr, \
 +                    p->use_sleep, \
-+                    nullptr, \
 +                    p->fused ? p->stage_control_dev[i] : nullptr, \
 +                    last_chunk && p->fused)
 +
@@ -1463,7 +1454,7 @@ index 000000000..4c4870cdf
 +
 +    // --- WIP tuning instrumentation: close the call bracket ---
 +    if (prof_on) {
-+        hipEventRecord(p->prof_t1[prof_idx], prof_stream);
++        CUDA_CHECK(hipEventRecord(p->prof_t1[prof_idx], prof_stream));
 +    }
 +    // --- end WIP instrumentation ---
 +

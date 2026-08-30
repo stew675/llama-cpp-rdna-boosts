@@ -104,6 +104,30 @@ whitespace lines and 1 EOF blank line (all inert — pure-whitespace blank
 lines, no string-literal or continuation content). No behavioral change:
 the validation records above still describe this set.
 
+### Block-12 compiler-warning cleanup (2026-08-29, follow-up)
+
+The HIP port's `allreduce-hip.cu` was the HIP build's ONLY source of
+compiler warnings.  ROCm 7.14 marks the entire `hipError_t` enum
+`[[nodiscard]]`, so every unchecked HIP call emitted `-Wunused-value`
+(27 sites / 54 warning lines in the ggml-hip build — every other file in
+the tree checks or `(void)`-casts each hip call).  Fixed at the source in
+the fork: all 27 sites wrapped in `CUDA_CHECK(...)` (upstream house
+style, including teardown frees/destroys, which the CUDA original leaves
+unchecked but HIP's nodiscard enum flags), plus three dead WIP items
+removed (unused `stage_marker` kernel parameter, unused `wire_bf16` local
+in the stage hook, uncalled `ggml_cuda_ar_arrival_ptr` helper).  The
+block-12 commit was amended in the fork (tip now `43e6ced06`) and the
+12-patch set re-generated with `scripts/make-patches.sh`.
+
+Re-verified 2026-08-29: full HIP build (ROCm 7.14, gfx1201) emits ZERO
+compiler warnings from the patch (the only remaining build warning is the
+build script's `-mllvm` link-time artifact — pre-existing, unrelated);
+`scripts/apply-all.sh` on a fresh checkout at `17252c769` applies with
+zero whitespace warnings and the applied tree is byte-identical to the
+fork tip; llama-cli same-seed coherence still IDENTICAL to RCCL (3-GPU);
+the `GGML_CUDA_AR_PROFILE=1` teardown path (where most of the new
+CUDA_CHECKs live) runs clean.
+
 
 ## Verification per block
 
