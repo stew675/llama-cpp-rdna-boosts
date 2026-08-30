@@ -1,9 +1,9 @@
 diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
 new file mode 100644
-index 000000000..abd084b27
+index 000000000..44217d583
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/allreduce-hip.cu
-@@ -0,0 +1,1537 @@
+@@ -0,0 +1,1554 @@
 +#include "allreduce.cuh"
 +
 +#if defined(GGML_USE_HIP)
@@ -146,6 +146,13 @@ index 000000000..abd084b27
 +// AR wire size at which the copy-engine path takes over from the chunked-
 +// kernel path.  Override via GGML_CUDA_AR_COPY_THRESHOLD.
 +static constexpr size_t GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT = 1024 * 1024; // 1 MB
++// Spin-budget check decimation: the kernel re-reads clock64() only every
++// this many polls.  512 = 2x the measured typical spin count (p50 ~184
++// polls, p90 ~283, p99 ~369 on 2x gfx1201 hybrid, depth-16384), rounded up
++// to the next power of two — so the true fast path (arrivals in tens of us)
++// never executes the clock64() check at all, and the timeout overshoot
++// (<= 512 polls, well under 0.1% of the 20 ms budget) is irrelevant.
++static constexpr uint32_t GGML_CUDA_AR_SPIN_CHECK_DIV = 512;
 +// Per-call CE chunk-size heuristic: chunk_bytes = clamp(nbytes / 4, MIN, MAX).
 +// The /4 keeps ~4 chunks in flight at any moment (good D2H/H2D overlap with
 +// the peer); the clamps cover the cases where nbytes/4 is too small (per-
@@ -278,6 +285,7 @@ index 000000000..abd084b27
 +            const int * other_slot = arrival_base +
 +                ((size_t)(slot * n_devices + j) * GGML_CUDA_AR_KERNEL_BLOCKS + bid) * ARRIVAL_INTS;
 +            const uint64_t wait_t0 = clock64();
++            uint32_t poll_cnt = 0;
 +            while (ggml_cuda_ar_signal_get(other_slot) != token) {
 +                // HIP has no __nanosleep; default to the arch sleep instruction
 +                // (validated by the dual-7900xtx RCCL-fallback port: s_sleep(1) is
@@ -296,7 +304,16 @@ index 000000000..abd084b27
 +                // queue non-removable on RDNA4 (driver REMOVE_QUEUE fails in
 +                // MES -> MODE1 reset or whole-machine freeze).  Exceeding the
 +                // budget turns that into one dropped AR call.
-+                if (spin_budget_cycles > 0 &&
++                //
++                // clock64() is a global-timer memory read (~30+ cycles), so
++                // the budget check is decimated to one in
++                // GGML_CUDA_AR_SPIN_CHECK_DIV polls (see the constant): on the
++                // true fast path the arrival lands before the first check, so
++                // the timer is never read; the check only engages for
++                // genuinely slow launches, where a 512-poll granularity is
++                // still negligible against the ms-scale budget.
++                if ((++poll_cnt & (GGML_CUDA_AR_SPIN_CHECK_DIV - 1)) == 0 &&
++                    spin_budget_cycles > 0 &&
 +                    (uint64_t) (clock64() - wait_t0) >= spin_budget_cycles) {
 +                    timed_out = true;
 +                    break;
