@@ -129,6 +129,38 @@ the `GGML_CUDA_AR_PROFILE=1` teardown path (where most of the new
 CUDA_CHECKs live) runs clean.
 
 
+### Community-report fix round (2026-08-30, issues #5 + #6)
+
+External report (tungel, 2x gfx1201) surfaced two block-12 bugs, fixed at
+source in the fork (`~/llama.cpp` rdna-boosts, tip `8a426cf79`) and the
+12-patch set regenerated with `scripts/make-patches.sh`:
+
+- **RCCL-less build failure (#5):** `comm_init_hybrid` referenced
+  `ggml_backend_cuda_comm_try_allreduce_nccl` (defined only under
+  `GGML_USE_NCCL`) unconditionally — `-DGGML_HIP_RCCL=OFF` builds failed
+  to compile.  The reference is now guarded; the no-NCCL flavor keeps the
+  internal-pipeline behavior (verified: RCCL=OFF `ggml-hip` builds).
+- **Unbounded in-kernel spin (#6):** the chunked AR kernel spun on peer
+  arrival with no exit condition; on RDNA (non-preemptible compute
+  kernels) a lost arrival wedges the queue -> MES `REMOVE_QUEUE` timeout
+  -> MODE1 reset -> `700/719` or whole-machine freeze.  The spin is now
+  bounded (`GGML_CUDA_AR_SPIN_TIMEOUT_MS`, default 20 ms, `0` = legacy);
+  on timeout the kernel sets a host-mapped poison flag, skips the reduce
+  and exits, and the host re-syncs the devices with a butterfly AllReduce
+  on the next call.
+
+Re-verified 2026-08-30: clean-apply sim at `17252c769` (apply, full
+build, llama-cli same-seed coherence IDENTICAL); RCCL=OFF `ggml-hip`
+compiles; before/after perf (default hybrid, 2x R9700, depth-16384):
+pp512 1622.7 -> 1609.1 t/s and tg128 32.63 -> 32.55 t/s — both within
+run-to-run noise, no measurable impact from the bounded-spin fix.
+
+> **Hash-drift note:** the 01-11 patch `From:` headers now carry the
+> current fork's commit hashes (e.g. block 01 = `142ab7846`); the earlier
+> records (tip `12d10267b` / `43e6ced06`) refer to the previous fork
+> build, which was rebuilt with identical content but new hashes.  The
+> diff bodies are unchanged.
+
 ## Verification per block
 
 | block | verify command | expected |

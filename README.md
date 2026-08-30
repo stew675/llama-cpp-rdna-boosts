@@ -101,7 +101,7 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
 | `0009` | meta-buffer compute-container headroom |
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions; adds a dedicated RDNA3.5 mmvq table) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL (decode keeps graph replay) |
-| `0012` | **hybrid HIP all-reduce** — custom internal AR for the small-tensor decode path, per-size hybrid dispatch vs RCCL, RDNA4-only gate |
+| `0012` | **hybrid HIP all-reduce** — custom internal AR for the small-tensor decode path, per-size hybrid dispatch vs RCCL, RDNA4-only gate (bounded in-kernel spin since 2026-08-30 fix round; builds without RCCL) |
 
 > **Greedy-purity note (read before shipping):** block 10 (`0010`) is the
 > only patch that changes decode numerics on ANY architecture — its VDR

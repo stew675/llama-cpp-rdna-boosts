@@ -1,9 +1,9 @@
 diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
 new file mode 100644
-index 000000000..790f3865b
+index 000000000..abd084b27
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/allreduce-hip.cu
-@@ -0,0 +1,1458 @@
+@@ -0,0 +1,1537 @@
 +#include "allreduce.cuh"
 +
 +#if defined(GGML_USE_HIP)
@@ -177,7 +177,9 @@ index 000000000..790f3865b
 +        int64_t *                   prof_start,  // WIP: clock64 at kernel entry (block 0); NULL disables
 +        bool                        use_sleep,   // true: __builtin_amdgcn_s_sleep(1) poll; false: dummy asm spin
 +        const ggml_cuda_ar_stage_control * __restrict__ control,  // fused-stage state; NULL disables fast path
-+        bool                        write_next_control) {          // last chunk: publish control for the next call
++        bool                        write_next_control,           // last chunk: publish control for the next call
++        int         *               poison_dev,                   // host-mapped flag; written on spin timeout; NULL disables
++        uint64_t                    spin_budget_cycles) {         // max clock64() cycles per peer wait; 0 = unbounded
 +
 +    // Vector unit for the wire type, sized to the arch's widest single-instruction
 +    // copy (16 B on Volta+/RDNA).  Each phase-1 iter writes one vector to host
@@ -245,11 +247,18 @@ index 000000000..790f3865b
 +    __threadfence_system();
 +    __syncthreads();
 +
++    // Set by thread 0 if its peer wait exceeds the budget; after the
++    // __syncthreads() below every thread sees it and the block skips phase 3
++    // (recvbuf keeps the local shard; the host detects the poison flag and
++    // re-syncs the devices with a butterfly AllReduce).
++    __shared__ int s_ar_timeout;
++
 +    // Phase 2: thread 0 of each block signals on its own arrival slot, then
 +    // spins for the matching slot from peer.  Per-block tokens mean blocks
 +    // proceed independently -- no inter-block barrier needed.  Block 0's
 +    // spin window is recorded when profiling (clock64).
 +    if (tid == 0) {
++        s_ar_timeout = 0;
 +        // Arrival slots are contiguous per rank: ((slot*n + rank)*BLOCKS + bid).
 +        const size_t arr_int = (size_t)(slot * n_devices + rank) * GGML_CUDA_AR_KERNEL_BLOCKS + bid;
 +        int * my_slot = arrival_base + arr_int * ARRIVAL_INTS;
@@ -263,10 +272,12 @@ index 000000000..790f3865b
 +        }
 +
 +        // Wait for EVERY peer's token for this call before reading its data.
++        bool timed_out = false;
 +        for (int j = 0; j < n_devices; ++j) {
 +            if (j == rank) continue;
 +            const int * other_slot = arrival_base +
 +                ((size_t)(slot * n_devices + j) * GGML_CUDA_AR_KERNEL_BLOCKS + bid) * ARRIVAL_INTS;
++            const uint64_t wait_t0 = clock64();
 +            while (ggml_cuda_ar_signal_get(other_slot) != token) {
 +                // HIP has no __nanosleep; default to the arch sleep instruction
 +                // (validated by the dual-7900xtx RCCL-fallback port: s_sleep(1) is
@@ -280,32 +291,62 @@ index 000000000..790f3865b
 +                        asm volatile("" ::: "memory");
 +                    }
 +                }
++                // Bounded wait: the peer's arrival can be lost on a PCIe
++                // hiccup, and an unbounded spin here is what makes the compute
++                // queue non-removable on RDNA4 (driver REMOVE_QUEUE fails in
++                // MES -> MODE1 reset or whole-machine freeze).  Exceeding the
++                // budget turns that into one dropped AR call.
++                if (spin_budget_cycles > 0 &&
++                    (uint64_t) (clock64() - wait_t0) >= spin_budget_cycles) {
++                    timed_out = true;
++                    break;
++                }
 +            }
-+        }
-+        if (prof_spin != nullptr && bid == 0) {
-+            prof_spin[1] = (int64_t) clock64();
++            if (timed_out) break;
 +        }
 +
-+        // Publish the stage control for the NEXT call (last chunk only).  The
-+        // next subgraph's stage kernel (in-graph) reads these values; the next
-+        // reduce validates them, so a torn/absent update is always safe.
-+        if (write_next_control && bid == 0 && control != nullptr) {
-+            ggml_cuda_ar_stage_control next;
-+            next.slot      = (slot + 1) % GGML_CUDA_AR_POOL_SIZE;
-+            next.token     = token + 1;
-+            next.wire_bf16 = wire_is_bf16 ? 1 : 0;
-+            next.input_f32 = input_is_f32 ? 1 : 0;
-+            volatile ggml_cuda_ar_stage_control * ctl =
-+                const_cast<volatile ggml_cuda_ar_stage_control *>(control);
-+            ctl->slot      = next.slot;
-+            ctl->token     = next.token;
-+            ctl->wire_bf16 = next.wire_bf16;
-+            ctl->input_f32 = next.input_f32;
-+            __threadfence_system();
++        if (timed_out) {
++            // Poison the host-mapped flag so the host re-syncs the devices
++            // with a butterfly AllReduce; skip the next-call control publish
++            // (it would be validated against a reduction that never ran).
++            s_ar_timeout = 1;
++            if (poison_dev != nullptr) {
++                __threadfence_system();
++                *(volatile int *)poison_dev = 1;
++            }
++        } else {
++            if (prof_spin != nullptr && bid == 0) {
++                prof_spin[1] = (int64_t) clock64();
++            }
++
++            // Publish the stage control for the NEXT call (last chunk only).  The
++            // next subgraph's stage kernel (in-graph) reads these values; the next
++            // reduce validates them, so a torn/absent update is always safe.
++            if (write_next_control && bid == 0 && control != nullptr) {
++                ggml_cuda_ar_stage_control next;
++                next.slot      = (slot + 1) % GGML_CUDA_AR_POOL_SIZE;
++                next.token     = token + 1;
++                next.wire_bf16 = wire_is_bf16 ? 1 : 0;
++                next.input_f32 = input_is_f32 ? 1 : 0;
++                volatile ggml_cuda_ar_stage_control * ctl =
++                    const_cast<volatile ggml_cuda_ar_stage_control *>(control);
++                ctl->slot      = next.slot;
++                ctl->token     = next.token;
++                ctl->wire_bf16 = next.wire_bf16;
++                ctl->input_f32 = next.input_f32;
++                __threadfence_system();
++            }
 +        }
 +    }
 +
 +    __syncthreads();
++
++    // Spin timeout: exit promptly without phase 3 so the queue stays
++    // removable by the driver; the tensor keeps the local shard and the host
++    // falls back to a butterfly AllReduce to re-sync the devices.
++    if (s_ar_timeout != 0) {
++        return;
++    }
 +
 +    // Acquire peer's host_other writes (this block's stripe of them).
 +    __threadfence_system();
@@ -517,6 +558,13 @@ index 000000000..790f3865b
 +    // memory; CPU never reads/writes -- only the kernel and hipMemset.
 +    // Indexed by the kernels via ((slot*n + rank)*BLOCKS + bid) * ARRIVAL_INTS.
 +    ggml_cuda_ar_host_mapping arrival;
++
++    // Bounded-spin poison flag: one host-mapped (pinned) int.  Written by the
++    // chunked kernel when a peer wait exceeds spin_timeout_ms; read/cleared by
++    // the host in ggml_cuda_ar_allreduce.  64 bytes = one cache line.
++    ggml_cuda_ar_host_mapping poison;
++    uint32_t spin_timeout_ms;       // GGML_CUDA_AR_SPIN_TIMEOUT_MS; 0 = unbounded (legacy)
++    uint64_t spin_budget_cycles;    // timeout converted to clock64() cycles
 +};
 +
 +// Combined load-convert-add kernel.  The peer's contribution arrives as T_src
@@ -809,6 +857,19 @@ index 000000000..790f3865b
 +        return nullptr;
 +    }
 +
++    // Bounded-spin timeout: the budget is expressed in clock64() cycles,
++    // assuming ~2 GHz so the real-time timeout is at or below the configured
++    // ms (a lower GPU clock only makes the budget longer, still far below
++    // the driver's queue fence timeout).  0 disables (legacy unbounded spin).
++    p->spin_timeout_ms    = (uint32_t) ggml_cuda_ar_env_u64("GGML_CUDA_AR_SPIN_TIMEOUT_MS", 20);
++    p->spin_budget_cycles = (uint64_t) p->spin_timeout_ms * 2000000ull;
++    if (p->poison.alloc(64) != hipSuccess) {
++        GGML_LOG_ERROR("%s: alloc for spin-timeout poison flag failed\n", __func__);
++        ggml_cuda_ar_pipeline_free(p);
++        return nullptr;
++    }
++    *(int *) p->poison.host = 0;
++
 +    // Per-device pinned staging buffers -- POOL_SIZE-deep ring so the chunked-
 +    // kernel can write the next slot's data while the peer is still reading
 +    // the previous slot's. Indexed by (slot * buf_bytes) at the call site.
@@ -1037,6 +1098,7 @@ index 000000000..790f3865b
 +            }
 +        }
 +    }
++    p->poison.free();
 +    p->arrival.free();
 +    delete p;
 +}
@@ -1215,6 +1277,21 @@ index 000000000..790f3865b
 +
 +    const int64_t ne = ggml_nelements(tensors[0]);
 +    GGML_ASSERT(ne > 0);
++
++    // Bounded-spin recovery: if a previous chunked kernel timed out waiting
++    // for its peer (arrival lost on a PCIe hiccup), the kernel set the
++    // host-mapped poison flag and left its tensor holding the local shard.
++    // Run this call through the meta-backend butterfly (self-contained, no
++    // two-sided protocol) to re-sync both devices; the chunked path resumes
++    // on the next call.
++    if (*(volatile int *) p->poison.host != 0) {
++        *(volatile int *) p->poison.host = 0;
++        GGML_LOG_WARN("internal AR: peer arrival not observed within %u ms "
++                      "(call %llu); falling back to butterfly AllReduce to "
++                      "re-sync devices\n",
++                      p->spin_timeout_ms, (unsigned long long) p->call_count);
++        return false;
++    }
 +
 +    const size_t   input_nbytes = ggml_nbytes(tensors[0]);
 +
@@ -1428,7 +1505,9 @@ index 000000000..790f3865b
 +                    (prof_on) ? (p->prof_start[i] + prof_idx) : nullptr, \
 +                    p->use_sleep, \
 +                    p->fused ? p->stage_control_dev[i] : nullptr, \
-+                    last_chunk && p->fused)
++                    last_chunk && p->fused, \
++                    reinterpret_cast<int *>(p->poison.dev), \
++                    p->spin_budget_cycles)
 +
 +                if (use_bf16) {
 +                    GGML_ASSERT(input_type == GGML_TYPE_F32);
@@ -1538,7 +1617,7 @@ index 0f2c9518d..4985d969e 100644
 +void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
 +                                 const float * data, int64_t count);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 321cb930b..2e55b7e77 100644
+index 321cb930b..2f6304fd0 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1005,6 +1005,15 @@ struct ggml_backend_cuda_comm_context {
@@ -1617,7 +1696,7 @@ index 321cb930b..2e55b7e77 100644
      }
  
      const size_t n = ret->dev_ids.size();
-@@ -1199,26 +1210,43 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
+@@ -1199,26 +1210,52 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
      ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
      if (rc == ncclSuccess) {
          ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
@@ -1649,6 +1728,7 @@ index 321cb930b..2e55b7e77 100644
 +static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * ret) {
 +    const bool has_nccl     = ggml_backend_cuda_comm_init_nccl(ret);
 +    const bool has_internal = ggml_backend_cuda_comm_init_internal(ret);
++#ifdef GGML_USE_NCCL
 +    if (has_nccl) {
 +        // Large tensors -> NCCL (P2P).  Small tensors are routed to the
 +        // internal pipeline by the dispatcher regardless of this pointer.
@@ -1658,6 +1738,14 @@ index 321cb930b..2e55b7e77 100644
 +        // as-is until comm_init_none is called by the caller).
 +        ret->try_allreduce = nullptr;
 +    }
++#else
++    // No NCCL/RCCL compiled in (has_nccl is always false); only the internal
++    // pipeline can serve AR.
++    (void) has_nccl;
++    if (!has_internal) {
++        ret->try_allreduce = nullptr;
++    }
++#endif
  }
  
 -// Top-level init.  Picks one of the three init paths based on
@@ -1670,7 +1758,7 @@ index 321cb930b..2e55b7e77 100644
  static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
      for (size_t i = 0; i < n_backends; i++) {
          if (!ggml_backend_is_cuda(backends[i])) {
-@@ -1234,37 +1262,55 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
+@@ -1234,37 +1271,55 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
      }
  
      const char * env = getenv("GGML_CUDA_ALLREDUCE");
@@ -1735,7 +1823,7 @@ index 321cb930b..2e55b7e77 100644
      return comm_ctx->try_allreduce(comm_ctx, tensors);
  }
  
-@@ -4735,6 +4781,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4735,6 +4790,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  graph->graph = nullptr;
              }
  
