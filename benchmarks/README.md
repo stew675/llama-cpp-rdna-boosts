@@ -10,6 +10,14 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 > clean-apply build; depth-16384 3-GPU hybrid 38.71 t/s unpinned) and the
 > benchy depth-16384 protocol in `wip/HANDOFF.md`.
 
+## Block 12 — hybrid all-reduce env matrix (2026-08-30)
+
+**[block12-hybrid-ar-matrix.md](block12-hybrid-ar-matrix.md)** — the
+`GGML_CUDA_ALLREDUCE` (hybrid / nccl / internal / none) x
+`NCCL_P2P_DISABLE` (0/1) matrix on 2x R9700 (gfx1201), ROCm 7.14, at
+depth-16384: hybrid wins prefill (1620 t/s), internal/none unchanged by
+P2P (as designed), RCCL legs lose ~6% with P2P disabled.
+
 ## v2 — the current results (llama-benchy live-server suite)
 
 **[v2-results.md](v2-results.md)** is the canonical results document:
