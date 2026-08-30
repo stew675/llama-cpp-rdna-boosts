@@ -1,0 +1,170 @@
+From df4411212c78a95d4ef33122ff63d5b244271aef Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 30 Aug 2026 17:05:49 -0500
+Subject: [PATCH 4/7] tests : cover qwen4exp PLE and the managed lazy path
+
+test-llama-archs: the qwen4exp fixture now emits the PLE keys (8 heads,
+2- and 3-gram, 1024 rows/head on the recurrent layer 0, head dim 32 so
+ple_head_dim * n_heads == n_embd) and the roundtrip leg reloads the file
+with a 256 KiB lazy buffer, so it runs the real managed reader end to end
+and asserts bit-exact logits against the user-path gather.
+
+test-lazy-reader: add an F32 case (non-quantized types have no to_float
+trait; the reader copies the rows) plus page-boundary rows.
+
+Assisted-by: Claude Sonnet
+---
+ src/llama-lazy-reader.cpp  | 10 ++++++++--
+ src/llama-lazy-reader.h    |  2 +-
+ tests/test-lazy-reader.cpp | 35 +++++++++++++++++++++++++++++++++++
+ tests/test-llama-archs.cpp | 31 +++++++++++++++++++++++++++++--
+ 4 files changed, 73 insertions(+), 5 deletions(-)
+
+diff --git a/src/llama-lazy-reader.cpp b/src/llama-lazy-reader.cpp
+index 3cf0f3dcc..f1973b63c 100644
+--- a/src/llama-lazy-reader.cpp
++++ b/src/llama-lazy-reader.cpp
+@@ -58,7 +58,7 @@ llama_lazy_reader::llama_lazy_reader(const config & cfg) :
+         GGML_ABORT("%s: invalid config (row_bytes=%zu, n_rows=%llu, row_nelems=%lld, budget=%zu)",
+                 __func__, row_bytes, (unsigned long long) n_rows, (long long) row_nelems, cfg.budget);
+     }
+-    if (to_float == nullptr) {
++    if (to_float == nullptr && cfg.type != GGML_TYPE_F32) {
+         GGML_ABORT("%s: type %s has no to_float dequantizer", __func__, ggml_type_name(cfg.type));
+     }
+     if (row_nelems % ggml_blck_size(cfg.type) != 0) {
+@@ -180,6 +180,12 @@ void llama_lazy_reader::gather(const int32_t * rows, size_t n, float * dst) {
+         const size_t off  = (row % rows_per_page) * row_bytes;
+         const int32_t slot = page_to_slot[page];
+         GGML_ASSERT(slot != -1);
+-        to_float(arena + (size_t) slot * page_size + off, dst + j * row_nelems, row_nelems);
++        float * dst_row = dst + j * row_nelems;
++        const uint8_t * src = arena + (size_t) slot * page_size + off;
++        if (to_float) {
++            to_float(src, dst_row, row_nelems);
++        } else {
++            std::memcpy(dst_row, src, row_bytes); // F32
++        }
+     }
+ }
+diff --git a/src/llama-lazy-reader.h b/src/llama-lazy-reader.h
+index ac7a86a4e..876b28d3a 100644
+--- a/src/llama-lazy-reader.h
++++ b/src/llama-lazy-reader.h
+@@ -65,7 +65,7 @@ private:
+     const size_t            data_offs;
+     const size_t            row_bytes;
+     const uint64_t          n_rows;
+-    const ggml_to_float_t   to_float;
++    const ggml_to_float_t   to_float;       // nullptr for F32 (plain copy)
+     const int64_t           row_nelems;
+     const size_t            page_size;
+     const size_t            n_pages;       // ceil(n_rows / rows_per_page)
+diff --git a/tests/test-lazy-reader.cpp b/tests/test-lazy-reader.cpp
+index f4fd3f599..f327a6757 100644
+--- a/tests/test-lazy-reader.cpp
++++ b/tests/test-lazy-reader.cpp
+@@ -234,6 +234,41 @@ int main() {
+             }
+         }
+ 
++        // case 5b: F32 rows (no to_float trait; the reader must copy them as-is)
++        {
++            const uint64_t n_f32_rows = 1000;
++            const int64_t  n_f32_elems = 64;
++            const size_t   f32_row_bytes = (size_t) n_f32_elems * sizeof(float); // 256
++            std::vector<uint8_t> f32_data((size_t) n_f32_rows * f32_row_bytes);
++            for (uint64_t i = 0; i < n_f32_rows; i++) {
++                for (int64_t d = 0; d < n_f32_elems; d++) {
++                    ((float *) (f32_data.data() + (size_t) i * f32_row_bytes))[d] = test_row_value(i, d);
++                }
++            }
++            char path[] = "/tmp/test-lazy-reader-f32-XXXXXX";
++            int f32_fd = mkstemp(path);
++            unlink(path);
++            test_assert(f32_fd >= 0, "mkstemp f32 failed");
++            size_t off = 0;
++            while (off < f32_data.size()) {
++                const ssize_t w = write(f32_fd, f32_data.data() + off, f32_data.size() - off);
++                test_assert(w > 0, "write f32 failed");
++                off += (size_t) w;
++            }
++            llama_lazy_reader reader(llama_lazy_reader::config{
++                dup(f32_fd), 0, f32_row_bytes, n_f32_rows, GGML_TYPE_F32, n_f32_elems,
++                /*budget*/ 4 * 4096}); // 16 rows/page, 256 pages total, 4 slots
++            std::vector<int32_t> rows = {0, 15, 16, 31, 32, 999, 500, 15, 999};
++            std::vector<float> got(rows.size() * (size_t) n_f32_elems);
++            reader.gather(rows.data(), rows.size(), got.data());
++            for (size_t j = 0; j < rows.size(); j++) {
++                const float * ref = (const float *) (f32_data.data() + (size_t) rows[j] * f32_row_bytes);
++                test_assert(std::memcmp(got.data() + j * n_f32_elems, ref, f32_row_bytes) == 0,
++                        "f32 gather != reference");
++            }
++            close(f32_fd);
++        }
++
+         // case 6: fd is owned -- closed on destruction
+         {
+             int dup_fd = dup(fd);
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index 35a3286e4..bf360f92b 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -254,6 +254,30 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
+         // without this the QSA layers fall back to dense and go uncovered
+         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
++
++        // PLE n-gram hash embeddings on layer 0 (recurrent in this fixture, as in
++        // the real model): 8 heads (2- and 3-gram), 1024 rows per head.
++        // ple_head_dim * n_heads must equal n_embd (the emb feeds ple_key, a
++        // {n_embd, hc_dim} mul-mat). The roundtrip leg of test_backends reloads
++        // the file with n_lazy_buf_size > 0, exercising the managed reader.
++        const uint32_t ple_ngram     = 3;                     // 2- and 3-gram heads
++        const uint32_t ple_per_ngram = 4;                     // heads per ngram size
++        const uint32_t ple_n_heads   = (ple_ngram - 1) * ple_per_ngram; // 8
++        const uint32_t ple_row_dim   = n_embd / ple_n_heads;  // 32
++        const uint32_t head_vocab    = 1024;                  // rows per head
++        std::vector<uint32_t> ple_offsets(ple_n_heads), ple_vocabs(ple_n_heads, head_vocab);
++        for (uint32_t h = 0; h < ple_n_heads; h++) {
++            ple_offsets[h] = h * head_vocab;
++        }
++        ms.add_kv(LLM_KV_PLE_LAYERS,            std::vector<uint32_t>({0}));
++        ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,        ple_ngram);
++        ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,   ple_per_ngram);
++        ms.add_kv(LLM_KV_PLE_CONV_KERNEL,       uint32_t(4));
++        ms.add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS, std::vector<uint64_t>({3, 5, 7}));
++        ms.add_kv(LLM_KV_PLE_HEAD_OFFSETS,      std::vector<uint64_t>(ple_offsets.begin(), ple_offsets.end()));
++        ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,  std::vector<uint64_t>(ple_vocabs.begin(), ple_vocabs.end()));
++        ms.add_kv(LLM_KV_PLE_EOS_TOKEN_ID,      uint32_t(0));     // < n_vocab (128), so the window reset is exercised
++        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, ple_row_dim);
+     }
+ 
+     // minimax-m3 keeps one indexer head per GQA head; the rest use a fixed 64 to match the fused
+@@ -347,10 +371,12 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
+ 
+ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
+         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
++        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
++        const size_t lazy_buf_size = 0) {
+     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
+     llama_model_params model_params = llama_model_default_params();
+     model_params.progress_callback = silent_model_load_progress;
++    model_params.n_lazy_buf_size = lazy_buf_size;
+     std::vector<ggml_backend_dev_t> devs_copy = devs;
+     devs_copy.push_back(nullptr);
+     model_params.devices = devs_copy.data();
+@@ -728,7 +754,8 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
+                         ms.save(file);
+                         rewind(file);
+ 
+-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode);
++                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode,
++                                arch == LLM_ARCH_QWEN4EXP ? 256 << 10 : 0);
+                         const std::vector<float> logits_roundtrip = get_logits(
+                             model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
+                         status_roundtrip = "\033[1;32mOK\033[0m";
+-- 
+2.55.0
+

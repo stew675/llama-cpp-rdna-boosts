@@ -1,0 +1,80 @@
+From f0604ffafbfd75b04faa4b7787c99048e77ae159 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 30 Aug 2026 17:20:54 -0500
+Subject: [PATCH 5/7] llama : keep the managed ngram range out of the load-time
+ prefetch
+
+TENSOR_SKIP dropped the PLE table out of the lazy-ranges bookkeeping, so
+init_mappings WILLNEED-prefetched its whole file range and the kernel
+faulted the 28.8 GB table into the process regardless of the managed
+budget (peak RSS 145 GiB vs 115 GiB on the real model).
+
+load_arch_tensors now records the range via lazy_read::add_range() in the
+managed branch, excluding it from the WILLNEED complement and marking it
+MADV_RANDOM, exactly like TENSOR_READ_LAZY does. Verified with smaps:
+ngram resident 26.8 GiB -> 0.00 GiB, logits still bit-identical to the
+mmap path.
+
+Assisted-by: Claude Sonnet
+---
+ src/llama-model-loader.cpp | 8 ++++++++
+ src/llama-model-loader.h   | 7 +++++++
+ src/models/qwen4exp.cpp    | 5 ++++-
+ 3 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 5f3310fa8..7893140ad 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1106,6 +1106,14 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
+     return true;
+ }
+ 
++void llama_model_loader::lazy_read::add_range(const std::string & name, const llama_tensor_weight & w) {
++    ranges[w.idx].emplace_back(w.offs, w.offs + ggml_nbytes(w.tensor));
++    tensors.insert(name);
++
++    LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) excluded from the load-time prefetch\n",
++            __func__, name.c_str(), ggml_nbytes(w.tensor)/1024/1024);
++}
++
+ struct ggml_tensor * llama_model_loader::create_tensor(
+         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
+         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index b9e9f6bc5..5439c1265 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -98,6 +98,13 @@ struct llama_model_loader {
+         // pass w to also record it, or nullptr to only ask
+         bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
+ 
++        // record the on-disk range of a tensor whose data is loaded on demand by
++        // other means (the managed lazy reader). Unlike add(), this does not
++        // consult the lazy mode or the tensor size: the range must be excluded
++        // from the load-time WILLNEED prefetch either way, or the kernel would
++        // fault the whole table in
++        void add_range(const std::string & name, const llama_tensor_weight & w);
++
+         bool any() const {
+             return !ranges.empty();
+         }
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index d08a292c8..1baa80815 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -173,7 +173,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+                 /*row_nelems*/ row_nelems,
+                 /*budget*/     ml.lazy.buf_size,
+             });
+-            // keep the ggml tensor for metadata/counts only; its data is never loaded
++            // keep the ggml tensor for metadata/counts only; its data is never loaded.
++            // the range must also stay out of the load-time WILLNEED prefetch (the
++            // kernel would fault the whole table in), so record it as a lazy range
++            ml.lazy.add_range(ple_name, *ple_w);
+             per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                                { hparams.ple_head_dim, ple_rows }, TENSOR_SKIP);
+         } else
+-- 
+2.55.0
+

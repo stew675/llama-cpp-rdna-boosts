@@ -1,0 +1,605 @@
+From 57a79413a8308c8a0c16432a319cca00731d5274 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 30 Aug 2026 16:54:24 -0500
+Subject: [PATCH 1/7] llama : add managed lazy reader for on-demand tensor
+ loading
+
+Standalone llama_lazy_reader: a fixed-size host arena caches pages of a
+lazy tensor (qwen4exp PLE n-gram table), read on demand with pread() and
+evicted with a second-chance clock LRU. Rows are dequantized with the
+same to_float the get_rows op uses, so numerics match the mmap path.
+
+tests/test-lazy-reader.cpp covers page-boundary math, eviction, the
+partial final page, single-slot budgets, page-size bumping, threaded
+gathers and fd ownership.
+
+Assisted-by: Claude Sonnet
+---
+ src/CMakeLists.txt         |   1 +
+ src/llama-lazy-reader.cpp  | 188 ++++++++++++++++++++++++++
+ src/llama-lazy-reader.h    |  81 ++++++++++++
+ tests/CMakeLists.txt       |   1 +
+ tests/test-lazy-reader.cpp | 264 +++++++++++++++++++++++++++++++++++++
+ 5 files changed, 535 insertions(+)
+ create mode 100644 src/llama-lazy-reader.cpp
+ create mode 100644 src/llama-lazy-reader.h
+ create mode 100644 tests/test-lazy-reader.cpp
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 8922dc12a..bf7f214cc 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -23,6 +23,7 @@ add_library(llama
+             llama-impl.cpp
+             llama-io.cpp
+             llama-kv-cache.cpp
++            llama-lazy-reader.cpp
+             llama-kv-cache-iswa.cpp
+             llama-kv-cache-dsa.cpp
+             llama-kv-cache-dsa-iswa.cpp
+diff --git a/src/llama-lazy-reader.cpp b/src/llama-lazy-reader.cpp
+new file mode 100644
+index 000000000..0b6f866f9
+--- /dev/null
++++ b/src/llama-lazy-reader.cpp
+@@ -0,0 +1,188 @@
++#include "llama-lazy-reader.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++
++#if defined(__unix__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__HAIKU__)
++#include <cerrno>
++#include <cstring>
++#include <unistd.h>
++#define LLAMA_LAZY_READER_HAS_PREAD 1
++#else
++#define LLAMA_LAZY_READER_HAS_PREAD 0
++#endif
++
++namespace {
++
++size_t lazy_page_size(size_t row_bytes, size_t cfg_page_size) {
++    if (cfg_page_size == 0) {
++        cfg_page_size = 4096;
++    }
++    if (cfg_page_size / row_bytes == 0) {
++        // a row does not fit in the requested page size: bump to a multiple of
++        // 4096 that holds a whole row
++        return ((row_bytes + 4095) / 4096) * 4096;
++    }
++    return cfg_page_size;
++}
++
++size_t lazy_rows_per_page(size_t page_size, size_t row_bytes) {
++    const size_t rpp = page_size / row_bytes;
++    return rpp > 0 ? rpp : 1;
++}
++
++size_t lazy_n_pages(uint64_t n_rows, size_t rows_per_page) {
++    return size_t((n_rows + rows_per_page - 1) / rows_per_page);
++}
++
++} // namespace
++
++llama_lazy_reader::llama_lazy_reader(const config & cfg) :
++    fd(cfg.fd),
++    data_offs(cfg.data_offs),
++    row_bytes(cfg.row_bytes),
++    n_rows(cfg.n_rows),
++    to_float(ggml_get_type_traits(cfg.type) ? ggml_get_type_traits(cfg.type)->to_float : nullptr),
++    row_nelems(cfg.row_nelems),
++    page_size(lazy_page_size(cfg.row_bytes, cfg.page_size)),
++    n_pages(lazy_n_pages(cfg.n_rows, lazy_rows_per_page(page_size, cfg.row_bytes))),
++    rows_per_page(lazy_rows_per_page(page_size, cfg.row_bytes)),
++    n_slots(cfg.budget / page_size > 0 ? cfg.budget / page_size : 1),
++    budget_bytes(n_slots * page_size),
++    page_to_slot(n_pages, -1),
++    slot_ref(n_slots, 0),
++    slot_page(n_slots, -1),
++    arena(nullptr) {
++    if (fd < 0) {
++        GGML_ABORT("%s: invalid fd", __func__);
++    }
++    if (row_bytes == 0 || n_rows == 0 || row_nelems <= 0 || cfg.budget == 0) {
++        GGML_ABORT("%s: invalid config (row_bytes=%zu, n_rows=%llu, row_nelems=%lld, budget=%zu)",
++                __func__, row_bytes, (unsigned long long) n_rows, (long long) row_nelems, cfg.budget);
++    }
++    if (to_float == nullptr) {
++        GGML_ABORT("%s: type %s has no to_float dequantizer", __func__, ggml_type_name(cfg.type));
++    }
++    if (row_nelems % ggml_blck_size(cfg.type) != 0) {
++        GGML_ABORT("%s: row_nelems %lld not a multiple of block size %lld",
++                __func__, (long long) row_nelems, (long long) ggml_blck_size(cfg.type));
++    }
++    if (n_slots > INT32_MAX) {
++        GGML_ABORT("%s: too many slots (%zu), page_to_slot is int32", __func__, n_slots);
++    }
++#if !LLAMA_LAZY_READER_HAS_PREAD
++    GGML_ABORT("%s: pread not available on this platform (managed lazy loading is POSIX-only for now)", __func__);
++#endif
++    arena = (uint8_t *) malloc(budget_bytes);
++    if (arena == nullptr) {
++        GGML_ABORT("%s: failed to allocate %zu bytes for the managed buffer", __func__, budget_bytes);
++    }
++}
++
++llama_lazy_reader::~llama_lazy_reader() {
++    free(arena);
++#if LLAMA_LAZY_READER_HAS_PREAD
++    close(fd);
++#else
++    GGML_UNUSED(fd);
++#endif
++}
++
++size_t llama_lazy_reader::evict_one() {
++    // second-chance clock: sweep slots, clear the ref bit on first pass, evict
++    // on the second
++    for (;;) {
++        const size_t slot = clock % n_slots;
++        clock++;
++        if (slot_ref[slot] == 0) {
++            if (slot_page[slot] != -1) {
++                page_to_slot[slot_page[slot]] = -1;
++            }
++            return slot;
++        }
++        slot_ref[slot] = 0;
++    }
++}
++
++void llama_lazy_reader::ensure_page(uint32_t page) {
++    GGML_ASSERT(page < n_pages);
++    int32_t slot = page_to_slot[page];
++    if (slot != -1) {
++        // already resident: refresh the clock bit
++        slot_ref[slot] = 1;
++        n_hits++;
++        return;
++    }
++    n_misses++;
++
++    slot = (int32_t) evict_one();
++    GGML_ASSERT(slot >= 0 && (size_t) slot < n_slots);
++
++    // clamp the read to the table extent: the last page is partial (the byte
++    // offset of the last page can exceed the table end, so compute the range
++    // from the row extent, not the byte offset)
++    const uint64_t row0 = (uint64_t) page * rows_per_page;
++    const uint64_t row1 = std::min(row0 + rows_per_page, n_rows);
++    const size_t off = data_offs + (size_t) row0 * row_bytes;
++    const size_t want = (size_t) (row1 - row0) * row_bytes; // <= page_size
++
++#if LLAMA_LAZY_READER_HAS_PREAD
++    uint8_t * dst = arena + (size_t) slot * page_size;
++    size_t got = 0;
++    while (got < want) {
++        const ssize_t r = pread(fd, dst + got, want - got, off + got);
++        if (r < 0) {
++            GGML_ABORT("%s: pread failed: %s", __func__, strerror(errno));
++        }
++        if (r == 0) {
++            GGML_ABORT("%s: unexpected EOF at offset %zu", __func__, off + got);
++        }
++        got += (size_t) r;
++    }
++#else
++    GGML_ABORT("%s: pread not available on this platform", __func__);
++#endif
++
++    page_to_slot[page] = slot;
++    slot_page[slot] = (int32_t) page;
++    slot_ref[slot] = 1;
++    n_bytes_read += want;
++}
++
++void llama_lazy_reader::gather(const int32_t * rows, size_t n, float * dst) {
++    std::lock_guard<std::mutex> lock(mtx);
++
++    // pass 1: make every distinct page resident. Sort + unique keeps the hit
++    // / miss counters per distinct page and avoids re-reading a page that a
++    // previous row of this ubatch already faulted in.
++    pages_scratch.clear();
++    pages_scratch.reserve(n);
++    for (size_t j = 0; j < n; j++) {
++        GGML_ASSERT(rows[j] >= 0 && (uint64_t) rows[j] < n_rows);
++        pages_scratch.push_back((uint32_t) (rows[j] / rows_per_page));
++    }
++    std::sort(pages_scratch.begin(), pages_scratch.end());
++    pages_scratch.erase(std::unique(pages_scratch.begin(), pages_scratch.end()), pages_scratch.end());
++    for (uint32_t page : pages_scratch) {
++        ensure_page(page);
++    }
++
++    // pass 2: dequantize. Normally all needed pages are resident and cannot
++    // be evicted because we still hold the lock (eviction only happens inside
++    // ensure_page). If the working set of this gather exceeds the budget, a
++    // page faulted in during pass 1 can be evicted by a later page of pass 1;
++    // re-fault it on demand here (identical thrash behavior to the kernel
++    // page cache, just bounded by our budget).
++    for (size_t j = 0; j < n; j++) {
++        const uint32_t row = (uint32_t) rows[j];
++        const size_t page = row / rows_per_page;
++        if (page_to_slot[page] == -1) {
++            ensure_page(page);
++        }
++        const size_t off  = (row % rows_per_page) * row_bytes;
++        const int32_t slot = page_to_slot[page];
++        GGML_ASSERT(slot != -1);
++        to_float(arena + (size_t) slot * page_size + off, dst + j * row_nelems, row_nelems);
++    }
++}
+diff --git a/src/llama-lazy-reader.h b/src/llama-lazy-reader.h
+new file mode 100644
+index 000000000..041b34b41
+--- /dev/null
++++ b/src/llama-lazy-reader.h
+@@ -0,0 +1,81 @@
++#pragma once
++
++#include "ggml.h"
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <mutex>
++#include <vector>
++
++// Managed on-demand reader for a single "lazy" tensor: rows live on disk in a
++// file, a fixed-size host arena caches a subset, and eviction is a clock LRU.
++// All access goes through gather(), which is internally synchronized so that
++// several llama_contexts sharing one model can call it concurrently.
++//
++// The cache stores the on-disk quantized bytes (not dequantized values), so
++// the arena holds N * row_bytes worth of rows for any supported type. Rows are
++// contiguous in the file: row i starts at data_offs + i * row_bytes (GGUF data
++// is tight-packed, no padding). Bookkeeping is page-granular: pages of
++// page_size bytes are the unit of I/O and eviction.
++class llama_lazy_reader {
++public:
++    struct config {
++        int          fd;         // owned fd (dup of the model file), closed in dtor
++        size_t       data_offs;  // absolute file offset of the tensor data
++        size_t       row_bytes;  // tight-packed on-disk bytes per row (NOT ggml_row_size: no padding)
++        uint64_t     n_rows;     // number of rows in the table
++        enum ggml_type type;     // source quantization (e.g. GGML_TYPE_Q8_0)
++        int64_t      row_nelems; // elements per row (ne[0])
++        size_t       budget;     // managed buffer size in bytes (> 0)
++        size_t       page_size = 4096;
++    };
++
++    llama_lazy_reader(const config & cfg);
++    ~llama_lazy_reader();
++
++    llama_lazy_reader(const llama_lazy_reader &) = delete;
++    llama_lazy_reader & operator=(const llama_lazy_reader &) = delete;
++
++    // Dequantize rows[] (n entries) into dst, laid out as dst[j*row_nelems + d].
++    // Loads missing pages with pread(), evicts with the clock LRU, all under
++    // one lock hold so no page can disappear mid-gather.
++    void gather(const int32_t * rows, size_t n, float * dst);
++
++    uint64_t n_pages_total() const { return n_pages; }
++    size_t   budget()         const { return budget_bytes; }
++
++    // counters
++    uint64_t hits()        const { return n_hits.load(); }
++    uint64_t misses()      const { return n_misses.load(); }
++    uint64_t bytes_read()  const { return n_bytes_read.load(); }
++
++private:
++    void ensure_page(uint32_t page);   // called with mtx held
++    size_t evict_one();                 // called with mtx held (clock scan)
++
++    // config
++    const int               fd;
++    const size_t            data_offs;
++    const size_t            row_bytes;
++    const uint64_t          n_rows;
++    const ggml_to_float_t   to_float;
++    const int64_t           row_nelems;
++    const size_t            page_size;
++    const size_t            n_pages;       // ceil(n_rows / rows_per_page)
++    const size_t            rows_per_page; // floor(page_size / row_bytes), >= 1
++    const size_t            n_slots;       // max(1, budget / page_size)
++    const size_t            budget_bytes;
++
++    // state (guarded by mtx)
++    std::mutex             mtx;
++    std::vector<int32_t>   page_to_slot;   // n_pages, -1 = not resident
++    std::vector<uint8_t>   slot_ref;       // n_slots, second-chance bit
++    std::vector<int32_t>   slot_page;      // n_slots, page id in the slot
++    std::vector<uint32_t>  pages_scratch;  // per-gather dedup buffer
++    uint8_t *              arena;          // n_slots * page_size
++    size_t                 clock = 0;
++
++    // stats
++    std::atomic<uint64_t>  n_hits{0}, n_misses{0}, n_bytes_read{0};
++};
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index fe3d14ffc..a910468cb 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -197,6 +197,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+     # llama_build_and_test(test-double-float.cpp) # SLOW
+ 
+     llama_build_and_test(test-llama-archs.cpp)
++    llama_build_and_test(test-lazy-reader.cpp)
+ 
+     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
+     file(MAKE_DIRECTORY "${MODEL_DIR}")
+diff --git a/tests/test-lazy-reader.cpp b/tests/test-lazy-reader.cpp
+new file mode 100644
+index 000000000..f4fd3f599
+--- /dev/null
++++ b/tests/test-lazy-reader.cpp
+@@ -0,0 +1,264 @@
++#include "../src/llama-lazy-reader.h"
++
++#include "ggml.h"
++
++#include <cinttypes>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <vector>
++
++#if defined(__unix__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__HAIKU__)
++#define TEST_HAS_POSIX 1
++#include <fcntl.h>
++#include <unistd.h>
++#else
++#define TEST_HAS_POSIX 0
++#endif
++
++// ---------------------------------------------------------------------------
++// tiny Q8_0 implementation (block = fp16 scale + 32 x int8), matching
++// ggml's quantize_row_q8_0_ref / dequantize_row_q8_0 byte for byte
++// ---------------------------------------------------------------------------
++
++struct block_q8_0_t {
++    ggml_fp16_t d;
++    int8_t      qs[32];
++};
++
++static void test_quantize_row_q8_0(const float * x, block_q8_0_t * y, int64_t k) {
++    GGML_ASSERT(k % 32 == 0);
++    for (int64_t i = 0; i < k / 32; i++) {
++        float amax = 0.0f;
++        for (int j = 0; j < 32; j++) {
++            amax = std::max(amax, std::fabs(x[i*32 + j]));
++        }
++        const float d = amax / 127.0f;
++        const float id = d ? 1.0f/d : 0.0f;
++        y[i].d = ggml_fp32_to_fp16(d);
++        for (int j = 0; j < 32; j++) {
++            y[i].qs[j] = (int8_t) std::round(x[i*32 + j] * id);
++        }
++    }
++}
++
++static void test_dequantize_row_q8_0(const block_q8_0_t * x, float * y, int64_t k) {
++    GGML_ASSERT(k % 32 == 0);
++    for (int64_t i = 0; i < k / 32; i++) {
++        const float d = ggml_fp16_to_fp32(x[i].d);
++        for (int j = 0; j < 32; j++) {
++            y[i*32 + j] = x[i].qs[j] * d;
++        }
++    }
++}
++
++static void test_assert(bool cond, const char * msg) {
++    if (!cond) {
++        throw std::runtime_error(std::string("assertion failed: ") + msg);
++    }
++}
++
++// row i element d: deterministic function of both, keeps Q8_0 lossy but stable
++static float test_row_value(uint64_t row, int64_t d) {
++    return 1.0f + 0.5f * std::sin(double(row) * 0.37 + double(d) * 0.11) +
++                 0.2f * std::cos(double(row) * 0.13 - double(d) * 0.07);
++}
++
++#if TEST_HAS_POSIX
++
++static int test_make_file(uint64_t n_rows, int64_t row_nelems, std::vector<uint8_t> & data) {
++    const size_t row_bytes = (size_t) row_nelems * ggml_type_size(GGML_TYPE_Q8_0) / ggml_blck_size(GGML_TYPE_Q8_0);
++    data.resize((size_t) n_rows * row_bytes);
++    std::vector<float> row(row_nelems);
++    std::vector<block_q8_0_t> blocks(row_nelems / 32);
++    for (uint64_t i = 0; i < n_rows; i++) {
++        for (int64_t d = 0; d < row_nelems; d++) {
++            row[d] = test_row_value(i, d);
++        }
++        test_quantize_row_q8_0(row.data(), blocks.data(), row_nelems);
++        std::memcpy(data.data() + (size_t) i * row_bytes, blocks.data(), row_bytes);
++    }
++
++    char path[] = "/tmp/test-lazy-reader-XXXXXX";
++    const int fd = mkstemp(path);
++    test_assert(fd >= 0, "mkstemp failed");
++    unlink(path); // removed on close
++    size_t off = 0;
++    while (off < data.size()) {
++        const ssize_t w = write(fd, data.data() + off, data.size() - off);
++        test_assert(w > 0, "write failed");
++        off += (size_t) w;
++    }
++    return fd;
++}
++
++static void test_check_gather(llama_lazy_reader & reader, const std::vector<uint8_t> & data,
++        const std::vector<int32_t> & rows, int64_t row_nelems) {
++    const size_t row_bytes = (size_t) row_nelems * ggml_type_size(GGML_TYPE_Q8_0) / ggml_blck_size(GGML_TYPE_Q8_0);
++    std::vector<float> got(rows.size() * (size_t) row_nelems);
++    std::vector<float> ref(rows.size() * (size_t) row_nelems);
++    reader.gather(rows.data(), rows.size(), got.data());
++    for (size_t j = 0; j < rows.size(); j++) {
++        test_dequantize_row_q8_0((const block_q8_0_t *) (data.data() + (size_t) rows[j] * row_bytes),
++                ref.data() + j * row_nelems, row_nelems);
++    }
++    test_assert(std::memcmp(got.data(), ref.data(), got.size() * sizeof(float)) == 0, "gather != reference decode");
++}
++
++int main() {
++    try {
++        const uint64_t n_rows = 10000;
++        const int64_t  row_nelems = 160; // Q8_0: 170 B/row, 24 rows/page
++        const size_t   row_bytes = (size_t) row_nelems * ggml_type_size(GGML_TYPE_Q8_0) / ggml_blck_size(GGML_TYPE_Q8_0);
++        const size_t   rows_per_page = 4096 / row_bytes;
++        const size_t   n_pages = (size_t) ((n_rows + rows_per_page - 1) / rows_per_page);
++        test_assert(row_bytes == 170, "row size");
++        test_assert(rows_per_page == 24, "rows per page");
++        test_assert(n_pages == 417, "page count");
++
++        std::vector<uint8_t> data;
++        int fd = test_make_file(n_rows, row_nelems, data);
++
++        // case 1: correctness -- page interior, page boundaries, final partial
++        // page, repeated rows in one call. Budget covers the whole table.
++        {
++            llama_lazy_reader reader(llama_lazy_reader::config{
++                dup(fd), 0, row_bytes, n_rows, GGML_TYPE_Q8_0, row_nelems,
++                /*budget*/ (n_pages + 1) * 4096});
++            test_assert(reader.n_pages_total() == n_pages, "n_pages_total");
++
++            const std::vector<int32_t> rows = {
++                0, 1, 23, 24, 25, 47, 48, /* page interiors */ 5,
++                9999,                      // last row (partial page)
++                9984,                      // first row of the last page
++                23, 24, 5,                 // repeats
++            };
++            test_check_gather(reader, data, rows, row_nelems);
++
++            // one pass over the whole table, then a second that must hit
++            std::vector<int32_t> all(n_rows);
++            for (uint64_t i = 0; i < n_rows; i++) {
++                all[i] = (int32_t) i;
++            }
++            test_check_gather(reader, data, all, row_nelems);
++            test_check_gather(reader, data, all, row_nelems);
++
++            test_assert(reader.misses() == n_pages, "one miss per page on cold table");
++            // gather 1 faulted pages {0,1,2,416} (4 hits on the first sweep), the
++            // second sweep hit all 417
++            test_assert(reader.hits() == n_pages + 4, "all hits on warm table");
++            test_assert(reader.bytes_read() == (size_t) n_rows * row_bytes,
++                    "bytes read == table size (partial page clamped)");
++        }
++
++        // case 2: eviction -- budget below the working set; sweep a sliding
++        // window repeatedly and verify every row still decodes correctly
++        {
++            llama_lazy_reader reader(llama_lazy_reader::config{
++                dup(fd), 0, row_bytes, n_rows, GGML_TYPE_Q8_0, row_nelems,
++                /*budget*/ 8 * 4096});
++            std::vector<int32_t> win(rows_per_page * 4); // 4 pages per sweep
++            for (uint64_t page0 = 0; page0 + 4 <= n_pages; page0 += 3) {
++                for (size_t k = 0; k < win.size(); k++) {
++                    win[k] = (int32_t) ((page0 + k / rows_per_page) * rows_per_page + k % rows_per_page);
++                }
++                test_check_gather(reader, data, win, row_nelems);
++            }
++            // verify a spread of rows again after the sweeps (re-faults)
++            std::vector<int32_t> spread;
++            for (uint64_t i = 0; i < n_rows; i += 97) {
++                spread.push_back((int32_t) i);
++            }
++            spread.push_back((int32_t) (n_rows - 1));
++            test_check_gather(reader, data, spread, row_nelems);
++            test_assert(reader.misses() > 0 && reader.hits() > 0, "eviction exercised both paths");
++        }
++
++        // case 3: budget below one page clamps to a single slot
++        {
++            llama_lazy_reader reader(llama_lazy_reader::config{
++                dup(fd), 0, row_bytes, n_rows, GGML_TYPE_Q8_0, row_nelems,
++                /*budget*/ 1000});
++            test_assert(reader.budget() == 4096, "budget clamps to one page");
++            test_check_gather(reader, data, {0, 23, 24, 9999}, row_nelems);
++            test_check_gather(reader, data, {0, 23, 24, 9999}, row_nelems); // thrash
++            test_check_gather(reader, data, {5, 9984, 1}, row_nelems);
++            test_assert(reader.misses() > 0, "single slot must miss");
++        }
++
++        // case 4: row_bytes > page_size bumps the page size
++        {
++            llama_lazy_reader reader(llama_lazy_reader::config{
++                dup(fd), 0, row_bytes, n_rows, GGML_TYPE_Q8_0, row_nelems,
++                /*budget*/ (n_pages + 1) * 4096,
++                /*page_size*/ 64});
++            test_assert(reader.n_pages_total() == n_pages, "page size bump keeps row mapping");
++            test_check_gather(reader, data, {0, 23, 24, 9999}, row_nelems);
++        }
++
++        // case 5: threaded -- results identical to serial under contention
++        {
++            llama_lazy_reader reader(llama_lazy_reader::config{
++                dup(fd), 0, row_bytes, n_rows, GGML_TYPE_Q8_0, row_nelems,
++                /*budget*/ 16 * 4096});
++            const int n_threads = 4;
++            const int per_thread = 500;
++            std::vector<std::vector<int32_t>> row_sets(n_threads);
++            for (int t = 0; t < n_threads; t++) {
++                row_sets[t].reserve(per_thread);
++                for (int k = 0; k < per_thread; k++) {
++                    row_sets[t].push_back((int32_t) ((t * 997 + k * 101) % n_rows));
++                }
++            }
++            std::vector<std::vector<float>> got(n_threads);
++            std::vector<std::thread> threads;
++            for (int t = 0; t < n_threads; t++) {
++                got[t].resize(per_thread * (size_t) row_nelems);
++                threads.emplace_back([&reader, &row_sets, &got, t]() {
++                    reader.gather(row_sets[t].data(), row_sets[t].size(), got[t].data());
++                });
++            }
++            for (auto & th : threads) {
++                th.join();
++            }
++            for (int t = 0; t < n_threads; t++) {
++                // serial reference on the same (warm) reader; must match
++                std::vector<float> ref(per_thread * (size_t) row_nelems);
++                reader.gather(row_sets[t].data(), row_sets[t].size(), ref.data());
++                test_assert(std::memcmp(got[t].data(), ref.data(), ref.size() * sizeof(float)) == 0,
++                        "threaded gather != serial gather");
++            }
++        }
++
++        // case 6: fd is owned -- closed on destruction
++        {
++            int dup_fd = dup(fd);
++            test_assert(dup_fd >= 0, "dup failed");
++            {
++                llama_lazy_reader reader(llama_lazy_reader::config{
++                    dup_fd, 0, row_bytes, n_rows, GGML_TYPE_Q8_0, row_nelems, 4096});
++            }
++            test_assert(fcntl(dup_fd, F_GETFD) == -1, "fd closed by destructor");
++        }
++
++        close(fd);
++        printf("test-lazy-reader: all tests passed\n");
++        return 0;
++    } catch (const std::exception & e) {
++        fprintf(stderr, "test-lazy-reader: %s\n", e.what());
++        return 1;
++    }
++}
++
++#else // !TEST_HAS_POSIX
++
++int main() {
++    printf("test-lazy-reader: skipped (POSIX only)\n");
++    return 0;
++}
++
++#endif
+-- 
+2.55.0
+

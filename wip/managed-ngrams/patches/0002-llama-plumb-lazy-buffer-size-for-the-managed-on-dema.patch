@@ -1,0 +1,138 @@
+From a8dc4462aa59ca439926cec974abb79f03ede1a8 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 30 Aug 2026 16:55:57 -0500
+Subject: [PATCH 2/7] llama : plumb --lazy-buffer-size for the managed
+ on-demand buffer
+
+Add n_lazy_buf_size to llama_model_params (0 = mmap-based lazy loading,
+the default), mirror it through the loader's lazy_read struct and the
+common CLI (-lzm-style --lazy-buffer-size N(K|M|G)).
+
+Assisted-by: Claude Sonnet
+---
+ common/arg.cpp           | 22 ++++++++++++++++++++++
+ common/common.cpp        |  1 +
+ common/common.h          |  2 ++
+ include/llama.h          |  4 ++++
+ src/llama-model-loader.h |  4 ++++
+ src/llama-model.cpp      |  1 +
+ src/llama.cpp            |  3 ++-
+ 7 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 79405b59e..2384e9bdf 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2741,6 +2741,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             else { throw std::invalid_argument("invalid value"); }
+         }
+     ).set_env("LLAMA_ARG_LAZY_MODE"));
++    add_opt(common_arg(
++        {"--lazy-buffer-size"}, "N(K|M|G)",
++        "managed buffer size in bytes for on-demand tensors, e.g. the qwen4exp PLE n-gram table (default: 0, mmap-based lazy loading)",
++        [](common_params & params, const std::string & value) {
++            size_t multiplier = 1;
++            std::string num = value;
++            if (!num.empty()) {
++                const char suffix = num.back();
++                switch (suffix) {
++                    case 'K': case 'k': multiplier = 1024;             num.pop_back(); break;
++                    case 'M': case 'm': multiplier = 1024 * 1024;       num.pop_back(); break;
++                    case 'G': case 'g': multiplier = 1024 * 1024 * 1024; num.pop_back(); break;
++                    default: break;
++                }
++            }
++            const uint64_t size = std::stoull(num) * multiplier;
++            if (size > (uint64_t) SIZE_MAX) {
++                throw std::invalid_argument("size too large");
++            }
++            params.lazy_buf_size = (size_t) size;
++        }
++    ).set_env("LLAMA_ARG_LAZY_BUF_SIZE"));
+     add_opt(common_arg(
+         {"--numa"}, "TYPE",
+         "attempt optimizations that help on some NUMA systems\n"
+diff --git a/common/common.cpp b/common/common.cpp
+index d162a3880..76108a179 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1689,6 +1689,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+     mparams.split_mode      = params.split_mode;
+     mparams.load_mode       = params.load_mode;
+     mparams.lazy_mode = params.lazy_mode;
++    mparams.n_lazy_buf_size = params.lazy_buf_size;
+     mparams.tensor_split    = params.tensor_split;
+     mparams.check_tensors   = params.check_tensors;
+     mparams.use_extra_bufts = !params.no_extra_bufts;
+diff --git a/common/common.h b/common/common.h
+index 4e9448bb1..47bf1fcbd 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -485,6 +485,8 @@ struct common_params {
+ 
+     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
+ 
++    size_t lazy_buf_size = 0; // managed buffer size in bytes for on-demand tensors; 0 = mmap-based lazy loading
++
+     common_cpu_params cpuparams;
+     common_cpu_params cpuparams_batch;
+ 
+diff --git a/include/llama.h b/include/llama.h
+index ef7a012c4..3805eb9ec 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -323,6 +323,10 @@ extern "C" {
+ 
+         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
+ 
++        size_t n_lazy_buf_size; // managed buffer size in bytes for on-demand tensors
++                               // (qwen4exp PLE n-gram table); 0 = mmap-based lazy
++                               // loading (default)
++
+         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
+         int32_t main_gpu;
+ 
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index 9e51d0ce7..b9e9f6bc5 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -90,6 +90,10 @@ struct llama_model_loader {
+         // set by the caller before the create_tensor() calls
+         enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
+ 
++        // managed buffer size in bytes for on-demand tensors; 0 = mmap-based lazy
++        // loading (set by the caller before the create_tensor() calls)
++        size_t buf_size = 0;
++
+         // decide whether this tensor is read lazily
+         // pass w to also record it, or nullptr to only ask
+         bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index e679b24e8..4ccfa8dde 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2687,6 +2687,7 @@ llama_model_params llama_model_default_params() {
+         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
+         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
+         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
++        /*.n_lazy_buf_size             =*/ 0,
+         /*.main_gpu                    =*/ 0,
+         /*.tensor_split                =*/ nullptr,
+         /*.progress_callback           =*/ nullptr,
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 633db658c..b82c21424 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -318,7 +318,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+ 
+-        ml.lazy.mode = params.lazy_mode;
++        ml.lazy.mode     = params.lazy_mode;
++        ml.lazy.buf_size = params.n_lazy_buf_size;
+ 
+         ml.print_info();
+         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
+-- 
+2.55.0
+

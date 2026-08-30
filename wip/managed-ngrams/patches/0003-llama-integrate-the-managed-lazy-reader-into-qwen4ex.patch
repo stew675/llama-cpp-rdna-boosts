@@ -1,0 +1,289 @@
+From 47bf1e342afa45fce74af407e78684b466818e85 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 30 Aug 2026 16:58:45 -0500
+Subject: [PATCH 3/7] llama : integrate the managed lazy reader into qwen4exp
+ PLE
+
+When --lazy-buffer-size > 0, load_arch_tensors creates a llama_lazy_reader
+over the per_layer_token_embd.weight file range and skips the tensor's data
+(TENSOR_SKIP). build_inp_ple then feeds an F32 graph input instead of a
+get_rows node, and llm_graph_input_ple::set_input dequantizes the hashed
+rows straight into it via lazy_reader->gather(). Layout matches the get_rows
+output, so build_ple is untouched.
+
+The mmap path stays the default (buf_size == 0). Also guards the loader
+user path (llama_model_init_from_user has no weights_map): require_weight
+calls become no-ops there and the PLE row count is derived from the head
+ranges, which lets test-llama-archs build PLE fixtures from KV only.
+
+Assisted-by: Claude Sonnet
+---
+ src/llama-lazy-reader.cpp  | 11 ++---
+ src/llama-lazy-reader.h    |  6 +++
+ src/llama-model-loader.cpp |  8 +++-
+ src/models/models.h        |  5 +++
+ src/models/qwen4exp.cpp    | 90 +++++++++++++++++++++++++++++++++++---
+ 5 files changed, 105 insertions(+), 15 deletions(-)
+
+diff --git a/src/llama-lazy-reader.cpp b/src/llama-lazy-reader.cpp
+index 0b6f866f9..3cf0f3dcc 100644
+--- a/src/llama-lazy-reader.cpp
++++ b/src/llama-lazy-reader.cpp
+@@ -4,13 +4,10 @@
+ #include <cstdio>
+ #include <cstdlib>
+ 
+-#if defined(__unix__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__HAIKU__)
++#if LLAMA_LAZY_READER_POSIX
+ #include <cerrno>
+ #include <cstring>
+ #include <unistd.h>
+-#define LLAMA_LAZY_READER_HAS_PREAD 1
+-#else
+-#define LLAMA_LAZY_READER_HAS_PREAD 0
+ #endif
+ 
+ namespace {
+@@ -71,7 +68,7 @@ llama_lazy_reader::llama_lazy_reader(const config & cfg) :
+     if (n_slots > INT32_MAX) {
+         GGML_ABORT("%s: too many slots (%zu), page_to_slot is int32", __func__, n_slots);
+     }
+-#if !LLAMA_LAZY_READER_HAS_PREAD
++#if !LLAMA_LAZY_READER_POSIX
+     GGML_ABORT("%s: pread not available on this platform (managed lazy loading is POSIX-only for now)", __func__);
+ #endif
+     arena = (uint8_t *) malloc(budget_bytes);
+@@ -82,7 +79,7 @@ llama_lazy_reader::llama_lazy_reader(const config & cfg) :
+ 
+ llama_lazy_reader::~llama_lazy_reader() {
+     free(arena);
+-#if LLAMA_LAZY_READER_HAS_PREAD
++#if LLAMA_LAZY_READER_POSIX
+     close(fd);
+ #else
+     GGML_UNUSED(fd);
+@@ -127,7 +124,7 @@ void llama_lazy_reader::ensure_page(uint32_t page) {
+     const size_t off = data_offs + (size_t) row0 * row_bytes;
+     const size_t want = (size_t) (row1 - row0) * row_bytes; // <= page_size
+ 
+-#if LLAMA_LAZY_READER_HAS_PREAD
++#if LLAMA_LAZY_READER_POSIX
+     uint8_t * dst = arena + (size_t) slot * page_size;
+     size_t got = 0;
+     while (got < want) {
+diff --git a/src/llama-lazy-reader.h b/src/llama-lazy-reader.h
+index 041b34b41..ac7a86a4e 100644
+--- a/src/llama-lazy-reader.h
++++ b/src/llama-lazy-reader.h
+@@ -8,6 +8,12 @@
+ #include <mutex>
+ #include <vector>
+ 
++#if defined(__unix__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__HAIKU__)
++#define LLAMA_LAZY_READER_POSIX 1
++#else
++#define LLAMA_LAZY_READER_POSIX 0
++#endif
++
+ // Managed on-demand reader for a single "lazy" tensor: rows live on disk in a
+ // file, a fixed-size host arena caches a subset, and eviction is a clock LRU.
+ // All access goes through gather(), which is internally synchronized so that
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 7663797ba..5f3310fa8 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1319,7 +1319,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         ggml_set_name(&t_meta, tn.str().c_str());
+ 
+         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+-        GGML_ASSERT(buft != nullptr);
++        if (buft == nullptr) { // e.g. TENSOR_SKIP
++            return nullptr;
++        }
+         ggml_context * ctx = ctx_for_buft(buft);
+         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
+         ggml_set_name(ret, tn.str().c_str());
+@@ -1332,8 +1334,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         return NULL;
+     }
+ 
+-    if (flags & TENSOR_READ_LAZY) {
++    if (flags & TENSOR_READ_LAZY && !files.empty()) {
+         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
++        // note: the user path (llama_model_init_from_user) has no files to lazy-read from, so the
++        //   tensor is created normally there and filled via set_tensor_data
+         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+     }
+ 
+diff --git a/src/models/models.h b/src/models/models.h
+index 9b87a40d5..0df6871c0 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -3,6 +3,7 @@
+ #include "llama-model.h"
+ #include "llama-graph.h"
+ #include "llama-model-loader.h"
++#include "llama-lazy-reader.h"
+ 
+ // note: almost all graphs require at least sqrtf, so include cmath globally
+ #include <cmath>
+@@ -2378,6 +2379,10 @@ struct llama_model_qwen4exp : public llama_model_base {
+     };
+ 
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
++
++    // non-null in managed mode: the PLE n-gram table is cached on demand in a
++    // fixed-size host buffer instead of being mmap'd
++    std::shared_ptr<llama_lazy_reader> lazy_reader;
+ };
+ 
+ struct llama_model_qwen35moe : public llama_model_base {
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index abf6a0502..d08a292c8 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -6,6 +6,10 @@
+ #include <algorithm>
+ #include <cinttypes>
+ 
++#if LLAMA_LAZY_READER_POSIX
++#include <unistd.h> // dup
++#endif
++
+ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
+     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+@@ -127,8 +131,22 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+     // flat [ple_head_dim, n_rows] gather target; n_rows is padded, so read it back
+     if (hparams.ple_n_heads > 0) {
+         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
+-        const auto & ple_w = ml.require_weight(ple_name.c_str());
+-        const int64_t ple_rows = ple_w.tensor->ne[1];
++        const llama_model_loader::llama_tensor_weight * ple_w = ml.get_weight(ple_name.c_str());
++        int64_t ple_rows = 0;
++        if (ple_w != nullptr) {
++            ple_rows = ple_w->tensor->ne[1];
++        } else if (!ml.files.empty()) {
++            throw std::runtime_error(format("missing tensor '%s'", ple_name.c_str()));
++        } else {
++            // user path (llama_model_init_from_user): no weights_map, derive the
++            // padded row count from the head ranges
++            uint64_t rows_needed = 0;
++            for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
++                rows_needed = std::max<uint64_t>(rows_needed,
++                        (uint64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
++            }
++            ple_rows = (int64_t) ((rows_needed + 31) / 32 * 32);
++        }
+ 
+         // sanity check
+         for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+@@ -136,8 +154,35 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+                 throw std::runtime_error(format("PLE head %u range exceeds the %" PRId64 " table rows", h, ple_rows));
+             }
+         }
+-        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
++
++#if LLAMA_LAZY_READER_POSIX
++        if (ml.lazy.buf_size > 0 && !ml.files.empty()) {
++            // managed path: cache the rows on demand in a fixed-size host buffer.
++            // the tensor itself is never materialized; the reader reads straight
++            // from the file with pread()
++            const int64_t row_nelems = ple_w->tensor->ne[0];
++            const size_t  row_bytes  = (size_t) row_nelems * ggml_type_size(ple_w->tensor->type)
++                                                    / ggml_blck_size(ple_w->tensor->type);
++            GGML_ASSERT(row_nelems % ggml_blck_size(ple_w->tensor->type) == 0);
++            lazy_reader = std::make_shared<llama_lazy_reader>(llama_lazy_reader::config{
++                /*fd*/         dup(ml.files[ple_w->idx]->file_id()),
++                /*data_offs*/  ple_w->offs,
++                /*row_bytes*/  row_bytes,
++                /*n_rows*/     (uint64_t) ple_rows,
++                /*type*/       ple_w->tensor->type,
++                /*row_nelems*/ row_nelems,
++                /*budget*/     ml.lazy.buf_size,
++            });
++            // keep the ggml tensor for metadata/counts only; its data is never loaded
++            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
++                                               { hparams.ple_head_dim, ple_rows }, TENSOR_SKIP);
++        } else
++#endif // LLAMA_LAZY_READER_POSIX
++        {
++            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
++                                               { hparams.ple_head_dim, ple_rows },
++                                               ml.files.empty() ? 0 : TENSOR_READ_LAZY);
++        }
+     }
+ 
+     for (int il = 0; il < n_layer; ++il) {
+@@ -973,10 +1018,14 @@ public:
+ 
+     bool can_reuse(const llm_graph_params & params) override {
+         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
++        if (pmodel.lazy_reader) {
++            return emb->ne[1] == params.ubatch.n_tokens;
++        }
+         return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+     }
+ 
+-    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
++    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens] (mmap path)
++    ggml_tensor * emb  = nullptr;   // F32 [ple_head_dim * n_heads, n_tokens] (managed path)
+ 
+     const llama_model_qwen4exp & pmodel;
+ 
+@@ -985,6 +1034,7 @@ public:
+ 
+     // scratch, reused across set_input() calls
+     std::vector<llama_token> prev;
++    std::vector<float> emb_scratch;
+ };
+ 
+ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -1047,7 +1097,22 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+         }
+     }
+ 
+-    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
++    if (pmodel.lazy_reader) {
++        // managed path: dequantize the needed rows straight into the graph input.
++        // gather() lays dst out as dst[(i*n_heads + h)*ple_head_dim + d], which is
++        // exactly the flat layout of emb ([ple_head_dim*n_heads, n_tokens])
++        emb_scratch.resize(idx.size() * pmodel.hparams.ple_head_dim);
++        pmodel.lazy_reader->gather(idx.data(), idx.size(), emb_scratch.data());
++        ggml_backend_tensor_set(emb, emb_scratch.data(), 0, emb_scratch.size()*sizeof(float));
++
++        if (debug) {
++            fprintf(stderr, "ple managed: %" PRId64 " tokens, cache hits=%" PRIu64 " misses=%" PRIu64 " bytes=%" PRIu64 "\n",
++                    n_tokens, pmodel.lazy_reader->hits(), pmodel.lazy_reader->misses(),
++                    pmodel.lazy_reader->bytes_read());
++        }
++    } else {
++        ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
++    }
+ }
+ 
+ // Read a conv history out of its own recurrent row and write the new tail back.
+@@ -1106,6 +1171,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+     auto ple_inp = std::make_unique<llm_graph_input_ple>(
+             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
+ 
++    const auto & pmodel = static_cast<const llama_model_qwen4exp &>(model);
++    if (pmodel.lazy_reader) {
++        // managed path: no gather node in the graph; set_input fills this tensor
++        // with the dequantized rows (the layout matches the get_rows output below)
++        ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
++                                          hparams.ple_head_dim * n_heads, n_tokens);
++        ggml_set_input(ple_inp->emb);
++        ggml_tensor * emb = ple_inp->emb;
++        res->add_input(std::move(ple_inp));
++        cb(emb, "ple_embd", -1);
++        return emb;
++    }
++
+     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+     ggml_set_input(ple_inp->rows);
+     ggml_tensor * rows = ple_inp->rows;
+-- 
+2.55.0
+

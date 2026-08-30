@@ -1,0 +1,107 @@
+From 3f27b0f38e3f4feeb36f74251488341e7489823a Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 30 Aug 2026 17:54:40 -0500
+Subject: [PATCH 7/7] ggml : handle host tensors in the meta-backend tensor
+ split
+
+The meta graph compute assumed every graph node lives in a meta buffer.
+Host tensors (views of a reshaped token embedding, PLE gathers, s_copy
+views) tripped ggml_backend_meta_buffer_simple_tensor, and
+ggml_backend_meta_get_split_state cast any buffer to a meta context.
+Exposed by the qwen4exp PLE fixture on the tensor-split (Meta) test leg:
+the FIXME guard only covered views of NONE-op leafs, missing views of
+computed host tensors.
+
+- the per-backend node loop passes host-buffer nodes through unchanged
+  (subsumes the old s_copy FIXME guard)
+- ggml_backend_meta_get_split_state returns the unsplit state for host
+  buffers
+
+Validated: full test-llama-archs on 3x Radeon AI PRO R9700 (608 configs
+OK, incl. the qwen4exp PLE managed roundtrip on every device and the
+Meta row-split) and CPU (128 configs OK); real-model GPU logits remain
+bit-identical to the mmap path.
+
+Also: print aggregate ngram-cache stats at model free with
+LLAMA_LAZY_READER_STATS=1.
+
+Assisted-by: Claude Sonnet
+---
+ ggml/src/ggml-backend-meta.cpp | 15 ++++++++++++---
+ src/models/models.h            | 20 ++++++++++++++++++++
+ 2 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 3ec40fb1a..c2f2708e3 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1168,6 +1168,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+ }
+ 
+ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
++    if (ggml_backend_buffer_is_host(tensor->buffer)) {
++        // host tensors are not part of the meta split (e.g. a reshaped token
++        // embedding or a PLE gather); treat them as unsplit
++        return {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
++    }
+     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+     return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
+ }
+@@ -2010,9 +2015,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+ 
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
+-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+-                    // FIXME s_copy_main is on the CPU and its view seems to be incorrectly added to the graph nodes.
+-                    // For regular usage this doesn't matter since it's a noop but trying to call ggml_backend_meta_buffer_simple_tensor results in a crash.
++                if (ggml_backend_buffer_is_host(node->buffer)) {
++                    // FIXME host tensors are not part of the meta split: passing them to
++                    // ggml_backend_meta_buffer_simple_tensor crashes. This covers views of
++                    // NONE-op leafs (e.g. s_copy_main) as well as views of computed host
++                    // tensors (e.g. a reshaped token embedding) and host op results (e.g.
++                    // the PLE get_rows); for regular usage these are noops in the split
++                    // graph, so keeping the original tensor is fine.
+                     bcj.nodes[i] = node;
+                     continue;
+                 }
+diff --git a/src/models/models.h b/src/models/models.h
+index 0df6871c0..1670521c4 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -7,6 +7,8 @@
+ 
+ // note: almost all graphs require at least sqrtf, so include cmath globally
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <map>
+ 
+ class llama_memory_hybrid_idx_context;
+@@ -2279,6 +2281,24 @@ struct llama_model_qwen35 : public llama_model_base {
+ struct llama_model_qwen4exp : public llama_model_base {
+     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
+ 
++    // env: LLAMA_LAZY_READER_STATS
++    ~llama_model_qwen4exp() override {
++        if (lazy_reader) {
++            static const bool stats = []() {
++                const char * env = getenv("LLAMA_LAZY_READER_STATS");
++                return env ? atoi(env) : 0;
++            }();
++            if (stats) {
++                fprintf(stderr, "%s: ngram cache: %llu hits, %llu misses, %llu bytes read, budget %zu bytes\n",
++                        __func__,
++                        (unsigned long long) lazy_reader->hits(),
++                        (unsigned long long) lazy_reader->misses(),
++                        (unsigned long long) lazy_reader->bytes_read(),
++                        lazy_reader->budget());
++            }
++        }
++    }
++
+     class llm_graph_input_qsa;
+ 
+     void load_arch_hparams(llama_model_loader & ml) override;
+-- 
+2.55.0
+
