@@ -62,9 +62,22 @@ N_BLOCKS=12
 echo "All $N_BLOCKS patches applied and committed on branch $BRANCH:"
 git log --oneline -$N_BLOCKS
 echo
-echo "Build (see patches/README.md for the full env-knob list):"
-echo "  cmake -B build -DGGML_HIP=ON -DGGML_HIP_RCCL=1 -DGPU_TARGETS=gfx1201 -DCMAKE_BUILD_TYPE=Release"
+echo "Build (uses your system ROCm install; see patches/README.md for the full env-knob list):"
+echo "  cmake -B build -DGGML_HIP=ON -DGGML_HIP_RCCL=1 -DGPU_TARGETS=\"${GPU_TARGETS:-gfx1100;gfx1151;gfx1201}\" -DCMAKE_BUILD_TYPE=Release"
 echo "  cmake --build build -j"
+echo
+echo "  GPU_TARGETS is read from the environment if set; the default builds for all three"
+echo "  RDNA families the set supports (one binary runs on any of them; trim to your GPU"
+echo "  for a faster build):"
+echo "    gfx1100  RDNA 3   (RX 7900 XTX/XT, RX 7800 XT, ...)"
+echo "    gfx1151  RDNA 3.5 (Strix Point / Strix Halo APUs)"
+echo "    gfx1201  RDNA 4   (RX 9070 XT / 9070; gfx1200 = RX 9060 XT)"
+echo "  All three compile with ROCm >= 6.3 (RDNA4 codegen officially from 6.4.x; this set"
+echo "  was verified on ROCm 7.14).  Keep GGML_HIP_RCCL=1: block 12's hybrid all-reduce"
+echo "  uses RCCL for the large-tensor path, and on non-RDNA4 (gfx1100/gfx1151) the"
+echo "  internal AR is gated off and everything falls back to RCCL."
+echo "  Optional (both ON by default upstream; keep for parity with the tuned reference build):"
+echo "    -DGGML_HIP_GRAPHS=ON -DGGML_NATIVE=1"
 echo
 echo "Verify:"
 echo "  ./build/bin/llama-cli -m <model> -ngl 99 -sm tensor -mg 0 -p \"The capital of France is\" -n 20 --seed 42 --temp 0 --single-turn"

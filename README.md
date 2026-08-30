@@ -92,8 +92,8 @@ bash <path-to-this-repo>/scripts/apply-all.sh .
 #    = git am patches/0001…0011  +  git apply patches/12-hybrid-allreduce-hip.patch
 #    (one commit per block on a fresh `rdna-boosts` branch)
 
-# 3. build + verify
-cmake -B build -DGGML_HIP=ON -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ -DCMAKE_BUILD_TYPE=Release
+# 3. build + verify (trim -DGPU_TARGETS to your GPU arch for a faster build)
+cmake -B build -DGGML_HIP=ON -DGGML_HIP_RCCL=1 -DGPU_TARGETS="gfx1100;gfx1151;gfx1201" -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 # coherence gate (same-seed output must match a known-good build):
 ./build/bin/llama-cli -m <model> -ngl 99 -sm tensor -mg 0 -p "The capital of France is" \
