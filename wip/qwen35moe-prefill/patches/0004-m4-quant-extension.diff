@@ -60,7 +60,7 @@ index 7fb440148..0e66f06fe 100644
  }
  
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index 0998f7bca..19697e828 100644
+index 0998f7bca..ec496e2bf 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
 @@ -1,6 +1,7 @@
@@ -270,19 +270,22 @@ index 0998f7bca..19697e828 100644
  void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
      const int    id    = ggml_cuda_get_device();
      const int    cc    = ggml_cuda_info().devices[id].cc;
-@@ -1491,6 +1565,19 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+@@ -1491,6 +1565,22 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
              continue;
          }
  
 +        // The fused gate+up kernel keeps two accumulators live (sum and
-+        // sum_gate). The Q6_K WMMA vec_dot path needs ~255 VGPR at J>=96
-+        // which kills occupancy, so cap it at 64. Q4_K/Q5_K share the
-+        // q8_1_q8_1_mma path whose J=32..80 variants spill (256 VGPR +
-+        // 100+ spills) but J=96..128 are clean; J=96 measured best.
-+        // Q3_K/Q8_0 have their own vec_dot paths, all clean at J=128.
++        // sum_gate). J_max_gate is per-type, measured on gfx1201 (RDNA4):
++        // - Q6_K (q6_K_q8_1_mma): ~255 VGPR at J>=96 kills occupancy -> 64
++        // - Q4_K/Q5_K (q8_1_q8_1_mma): J=32..80 spill (256 VGPR + 100+
++        //   spills), J>=96 clean; J=96 measured best -> 96
++        // - Q8_0 (q8_0_q8_1_mma): low register per accumulator; J=64
++        //   (163 VGPR) gives the best occupancy/compute balance -> 64
++        // - other types (Q3_K, IQ*): not measured, keep 128 default
 +        constexpr int J_max_gate =
 +            type == GGML_TYPE_Q6_K ? 64 :
-+            type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ? 96 : 128;
++            type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ? 96 :
++            type == GGML_TYPE_Q8_0 ? 64 : 128;
 +        if (has_gate && J > J_max_gate) {
 +            continue;
 +        }
@@ -290,7 +293,7 @@ index 0998f7bca..19697e828 100644
          if (mmq_get_nbytes_shared(config, cc) > smpbo) {
              continue;
          }
-@@ -1505,52 +1592,52 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+@@ -1505,52 +1595,52 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
  
      switch (J_best) {
          case   8:
@@ -359,7 +362,7 @@ index 0998f7bca..19697e828 100644
              break;
          default:
              fprintf(stderr, "J_best=%d\n", J_best);
-@@ -1559,20 +1646,23 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+@@ -1559,20 +1649,23 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
      }
  }
  
@@ -386,7 +389,7 @@ index 0998f7bca..19697e828 100644
  extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
  extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
  extern DECL_MMQ_CASE(GGML_TYPE_Q4_0);
-@@ -1602,6 +1692,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+@@ -1602,6 +1695,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
  // -------------------------------------------------------------------------------------------------------------------------
  
  void ggml_cuda_mul_mat_q(
