@@ -1,5 +1,24 @@
 # PLAN (c): decode path investigation (qwen35moe, 92 t/s)
 
+## Status: Phase 1 DONE (2026-08-30) -> decode-phase1-results.md
+
+The cost table is built and the hypotheses are resolved:
+- FA / GET_ROWS / GDN-AR are NOT the problem (FA 1%, AR 5%) - the earlier
+  anomalies were an op-timing blind-spot artifact (join-waits polluted the
+  main-stream event pairs; fused nodes were never timed).
+- Decode is LATENCY-BOUND: 923 kernels/token, 68% under 20 us. Weight
+  reads are ~2 GB/token (MoE 8/256) and only ~1/3 of the time is
+  bandwidth-bound (lm_head at 600 GB/s near peak).
+- The expert GEMMs are the top target: gate+up fused kernel 37 us @427
+  GB/s, down+shared-gate 53 us @166 GB/s (K=512 latency-bound).
+- Fusion machinery already worth 24%; gate+up and down+shared-gate+
+  residual fusions exist on the mmvq decode path.
+
+Phase 2 priorities (evidence-ranked): 1) one fused expert kernel per
+layer (plan-fused-moe.md work, ~1.2 ms decode + prefill win), 2) short-K
+mmvq config tuning for the expert shapes, 3) small-kernel-tail fusion
+(residual adds, ssm-state GET_ROWS into GDN, elementwise chains).
+
 ## Current facts (report.md section 6)
 
 - tg128 = 92.2-92.7 t/s (~10.8 ms/token), **flat with context depth** (92.4
