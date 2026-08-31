@@ -1,0 +1,170 @@
+# HANDOFF: qwen4exp session 2 - 2026-08-31 (before context compaction)
+
+Status: MAJOR WIN. The real CPU-burn root cause was found and fixed.
+Context ~600K, compacting. This doc supersedes qwen4exp-handoff-2026-08-31.md
+(update 1 and 2 are still valid history; update 3 below is the new headline).
+
+## TL;DR - what happened this session
+
+1. **The 16-thread CPU burn was NOT the ngram gather.** It was the QSA
+   indexer's top-2048-of-16384 partial sort running on the CPU backend.
+   FIXED by backporting upstream's HIP radix top-k kernel.
+2. **pp16384 went 784 -> 1307 t/s (ub512, +67%) and 1083 -> 1716 t/s
+   (ub2048, +58%).** CPU burn dropped 1260% -> 140% (16 cores -> 1.4).
+   Verified BIT-IDENTICAL via logitdump A/B (GPU radix vs CPU heap_select).
+3. The PLE batch cache (user-requested prototype) is implemented, verified
+   bit-exact on prefill + continuation batches, but performance-NEUTRAL
+   (1722.8 vs 1722.2). The ngram gather was never the bottleneck.
+4. **Depth scaling measured out to 65536**: pp16384 1734, pp32768 1381,
+   pp65536 995 (ub2048). VRAM at 65536 = 31.645/31.86 GiB per GPU (99.3%).
+   Model n_ctx_train = 262144, so 200K is within native range but needs
+   KV/offload strategy. GPU0 VRAM climbs ~1 GiB then plateaus over a run
+   (30.5 -> 31.65 GiB, stable after warmup) - normal graph/KV growth,
+   NOT a leak (checked over 240s, plateaued at 31.645 and stayed).
+
+## Current best numbers (all fixes, tensor split, 3x R9700)
+
+Env: GGML_CUDA_FA_WMMA_256=0 (WMMA FA hurts head_dim 256), -t 16,
+--split-mode tensor, HIP_VISIBLE_DEVICES=0,1,2, ub2048:
+
+| test | t/s |
+|---|---|
+| pp512 | 1492 |
+| pp2048 | 2028 |
+| pp4096 | 2031 |
+| pp8192 | 1935 |
+| pp16384 | 1716 |
+| pp32768 | 1381 |
+| pp65536 | 995 |
+| tg128 | 40.1 |
+
+Prefill target >1000 t/s at 16K: exceeded 1.7x. Depth curve still falls
+(attention + top-k + mask scale with n_kv); 200K needs work (see below).
+
+## THE FIX (this session's headline)
+
+**Root cause**: QSA sparse-attention indexer (12 layers, compress_ratio=4,
+indexer.top_k=2048) does top-2048-of-16384 per token. The CUDA TOP_K op was
+gated at `ne[0] <= 1024` without CUB, so the scheduler put it on CPU:
+264 TOP_K nodes at 16K, 16 OpenMP threads in `std::__heap_select`
+(gdb-verified: ggml_compute_forward_top_k -> __heap_select).
+
+**Fix (2 files, pure backport from upstream master)**:
+- `ggml/src/ggml-cuda/top-k.cu`: added upstream `top_k_radix_cuda` -
+  4-pass 8-bit radix-select, per-row histograms, for ncols > 1024 on HIP.
+  Our tree (rdna-boosts 4fa92f0ae) predates it.
+- `ggml/src/ggml-cuda/ggml-cuda.cu` supp(): TOP_K now returns true on HIP
+  for any ne[0] (matches master). ARGSORT stays <=1024 (bitonic-only on
+  HIP; the MoE router argsorts are small so they were already fine).
+- Added env A/B switch: `GGML_CUDA_TOP_K_CPU=1` forces the old CPU path.
+- Backup patch: wip/qwen35moe-prefill/patches/0006-qsa-topk-radix-gpu.patch
+
+**Correctness**: logitdump (same build, GPU radix vs CPU heap_select,
+32 tokens, seed 42) = byte-identical output. The radix kernel returns the
+same index SET in unsorted order; the consumer scatters into a mask so
+order does not matter. Also matches the reference worktree build.
+
+## PLE batch cache prototype (user-requested; NEUTRAL, keep/drop decision)
+
+Implemented the "one sorted batch gather per prefill" idea:
+- New hook: `llama_model::prepare_batch(batch, memory)` called once per
+  decode() before the ubatch loop (llama-model.h, llama-context.cpp).
+- qwen4exp override computes ALL PLE row indices for the whole logical
+  batch, gathers+dequantizes in sorted order (sequential mmap reads),
+  caches F32. Per-ubatch set_input just memcpys the slice - no gather,
+  no hash, no OpenMP spin in the hot path.
+- Eligibility: tokens present, single seq, contiguous positions; boundary
+  predecessors resolved from attn cells (seq_pos_token_le).
+- Verify env: LLAMA_PLE_CACHE_VERIFY=1 (recomputes per-ubatch and compares;
+  PASSED on prefill pos 0/512/1024/1536 AND continuation batches).
+- Disable env: LLAMA_PLE_CACHE_DISABLE=1.
+- Result: neutral at all depths (1722.8 vs 1722.2 at pp16384/ub2048)
+  because the gather was never the bottleneck. DECISION NEEDED: keep
+  (it removes per-ubatch gather, would matter if table were bigger or on
+  slower storage; adds ~200 lines + a virtual hook) or drop (lean tree).
+  My recommendation: drop unless a future config shows gather-bound
+  behavior; the top-k backport is the real win and is tiny.
+
+## Why the PLE cache would matter (answer to "when does it become useful")
+
+The ngram gather is per-token CONSTANT (16 rows/token, 90B each) - it does
+NOT scale with context depth. The things that DO scale with n_kv:
+- QSA indexer top-k (now GPU; still O(n_kv) per token per QSA layer)
+- KQ mask build (n_kv x n_tokens, CPU set_input per ubatch)
+- FLASH_ATTN over n_kv
+- get_prev_tokens (now O(log n) via PR #27992 index - DONE this session)
+
+So the PLE cache's usefulness is independent of depth: it only wins when
+the gather itself is slow (managed/lazy reader on slow storage, or huge
+table). At 200K the depth-scaled costs above dominate, NOT the gather.
+The path to 200K is: KV memory strategy + the depth-scaled ops, not the
+ngram table.
+
+## Depth scaling analysis for the 200K target
+
+- n_ctx_train = 262144 (native). 200K is within range.
+- VRAM at 65536: 99.3% full. The KV cache for 12 full-attn layers +
+  36 GDN/recurrent layers at 65K ctx is the pressure. Model weights use
+  ~78-80 GiB; total VRAM 97.8 GiB (3x 32.6).
+- pp t/s falloff: 1734 (16K) -> 995 (65K) = -43%. Per-token cost grows
+  ~linearly in n_kv from attention/mask/top-k.
+- 200K will need: KV cache quantization or offload strategy (BF16 KV was
+  already measured better than F16 on this model), possibly swa/sliding
+  window on some layers, and the depth-scaled op costs addressed.
+
+## Remaining work / next steps
+
+1. **200K context**: investigate KV memory at 65K->200K. Check the KV
+   buffer split (attn vs recurrent), consider -c 200000 --no-kv-offload
+   tradeoffs, KV quant types. Measure pp at 96K/128K to map the curve.
+2. **Decode 40 -> 50**: decode is memory-bandwidth bound (103.68 GiB
+   weights); result_output [2560x82774x1] = 0.6ms alone. Not top-k bound
+   (A/B confirmed 37.8 both ways). Candidate: expert MMQ width, speculative
+   decode, or KV-cache-aware decode batching.
+3. **Decide PLE cache**: keep or drop (see above).
+4. Consider raising GGML_CUDA_TOP_K env handling: the A/B switch is useful,
+   keep it; document GGML_CUDA_TOP_K_CPU=1 for regression testing.
+5. Strix Halo (RDNA3.5) validation of the fused MoE MMQ (RDNA4-gated) and
+   the radix top-k (should be arch-neutral, but verify) - parked.
+6. 2-GPU / model-deploy follow-ups from qwen35moe plan - parked.
+
+## Tree state (35 files modified, uncommitted by design)
+
+~/llama.cpp rdna-boosts @ 4fa92f0ae, working tree has:
+- block 11 revert (prefill CUDA graphs) - KEEP
+- ngram patches 0001-0007 - KEEP
+- MoE fusion work (mmq/mmvq) - KEEP
+- PR #27992 kv-cache prev-token index (applied + unit-tested, 0 mismatches;
+  flat at 16K, big win at 240K) - KEEP for the 200K target
+- **NEW this session**: top-k.cu radix backport + supp change +
+  GGML_CUDA_TOP_K_CPU env - KEEP
+- **NEW**: PLE batch cache prototype (prepare_batch hook + set_input cache
+  path + verify/disable envs) - DECISION NEEDED
+- NOT committed to ~/llama.cpp (needs user approval; boosts-repo wip/
+  commits are the norm)
+
+Backup patches in ~/llama-cpp-rdna-boosts/wip/qwen35moe-prefill/patches/:
+- 0005-kv-prev-tokens-index.patch (PR #27992)
+- 0006-qsa-topk-radix-gpu.patch (this session's fix)
+
+## Environment (unchanged, still valid)
+
+- Runtime PM fixed (power/control=on on 0000:{03,06,09}:00.0); re-apply
+  after reboot. journalctl "SMU is resuming" should be quiet.
+- /tmp is tmpfs - keep logitdump bins out of it (16GB each at 16K).
+- 3x R9700 need HIP_VISIBLE_DEVICES=0,1,2; NO HSA_OVERRIDE_GFX_VERSION.
+- llama-cli needs --single-turn; -b n_batch, -ub n_ubatch, -n 0 pure
+  prefill; logitdump --split-mode is INT (TENSOR=3).
+- Reference worktree /home/stew675/q4exp-ref (a7cc83bba+ngram) - keep.
+- Machine: Ryzen 9 9950X3D, 184GB RAM, ROCm 10.0.0.
+
+## Key refs
+
+- ggml/src/ggml-cuda/top-k.cu (radix kernel, the fix)
+- ggml/src/ggml-cuda/ggml-cuda.cu supp() TOP_K (HIP allowed)
+- src/models/qwen4exp.cpp: build_qsa_top_k (~525), llm_graph_input_ple
+  set_input (~1043), prepare_batch (~1305)
+- src/llama-model.h / llama-context.cpp: prepare_batch hook
+- src/llama-kv-cache.cpp:1829 get_prev_tokens (+ index from PR #27992)
+- PRs: #27992 (prev-token index), #27941 (qwen4exp fixes), #27977
+- upstream top-k.cu = source of the radix backport (master)
