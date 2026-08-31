@@ -107,3 +107,53 @@ than F16 (334). Hybrid all-reduce better than internal (387).
 - PR #27992 (get_prev_tokens index), #27941 (qwen4exp fixes), #27977
 - wip/qwen35moe-prefill/plan-qwen4exp.md (tracking doc; update status)
 - logs: /tmp/q4exp_final_state.log (best numbers), /tmp/q4exp_*.log
+
+## UPDATE 2 (PM session): CPU-burn root cause FOUND + prefill >1000 t/s
+
+### Root cause of the 90-95% CPU / 60% GPU observation
+NOT the PLE get_prev_tokens scan (now O(log n) via PR #27992 index,
+unit-tested 9480 lookups 0 failures; verify mode on the model: 0
+mismatches, index 0.18us vs scan 13.8us per call at 2K ctx - but at 16K
+ctx the scan is only ~110us/call, so A/B fast vs off is flat 683 vs 692;
+the PR's wins are at 240K ctx, not 16K). NOT mmap page faults (-lm none
+= same). 
+
+Real cause: PER-UBATCH HOST OVERHEAD. Every ubatch (512 tokens) re-runs:
+- graph scheduler + gallocr reserve (main thread; gdb caught it in
+  ggml_gallocr_reserve_n_impl)
+- a CPU split with 2 GET_ROWS: token_embd (644 MB) + per_layer_token_embd
+  (the 27.4 GB ngram table, CPU_Mapped lazy, in CPU RAM)
+- 16 OpenMP threads spin in kmp_flag_64 barriers waiting for the slowest
+  gather row (gdb: libomp barrier spin) - this is the visible CPU burn
+
+Cost is fixed per ubatch -> scales with ubatch COUNT. At 16K with ub512
+that's 32 ubatches, at ub2048 only 8. Evidence:
+- -t 1 vs -t 16: pp16384 255 vs 769 t/s (CPU-thread sensitive at depth),
+  but pp512 (1 ubatch) is thread-insensitive (1399 vs 1412)
+- ub 512/1024/2048 at pp16384: 799 -> 969 -> 1061 t/s (+33%)
+
+### THE FIX (config, no code): -ub 2048 -t 16
+Final locked numbers (tensor, r=3, env GGML_CUDA_FA_WMMA_256=0):
+- pp512 1472, pp2048 1576, pp4096 1459, pp8192 1283, pp16384 1091, tg128 39.9
+- PREFILL TARGET >1000 t/s at 16K: ACHIEVED (1091)
+- Reference (a7cc83bba+ngram) at ub2048: pp16384 771 -> our 1091 = +42%
+- tg ~40: unchanged, matches reference ~39; decode is per-token ubatches
+  regardless of -ub; result_output [2560x82774x1] = 0.6ms alone, likely
+  memory-bandwidth bound (103.68 GiB weights)
+
+### Tree state
+- PR #27992 applied + verified: src/llama-kv-cache.{cpp,h}, llama-kv-cells.h
+  backup: patches/0005-kv-prev-tokens-index.patch
+- Unit test tests/test-kv-prev-tokens.cpp (not in CMake; compile standalone:
+  g++ -std=c++17 -I src -I include -I ggml/include ... -> PASSED)
+- Recommend keeping the index (verified correct, negligible 16K cost,
+  2.7x win at 240K) but it is NOT the 16K unlock.
+
+### Next steps
+- Update llama-server/bench invocations to -ub 2048 (server: --ubatch-size 2048)
+- Decode ~40 -> 50 target: investigate per-token host overhead (25ms/token
+  wall vs 0.9ms GPU in last split) - graphs on decode are already active;
+  candidate: result_output LM head over 82K vocab, attention 16K KV per
+  token, GDN state; check if tg benefits from -ub 2048 at server level
+  (batch decode of parallel slots)
+- Remaining: 2-GPU deploy, Strix Halo validation (parked)
