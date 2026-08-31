@@ -142,15 +142,57 @@ checks `fusion->gate` and routes to the gate switch. The mmvq decode path
 - Optional: per-shape J rule (cap relative to ncols_max) to squeeze ub=512.
 - Server `--ubatch-size 2048` deployment test (Phase-3 validation item from
   plan-decode, still pending).
+- **Q8_0 on 2 GPUs with `--split-mode tensor`** (see below).
+
+## Q8_0 tensor-split testing (2 GPUs, `--split-mode tensor`)
+
+NOTE: tensor-mode splitting is `--split-mode tensor`, NOT `row`. Row-mode
+splitting is being phased out in llama.cpp; all the tensor-split work moved
+into `--split-mode tensor`, and that is the flag to use.
+
+The Q8_0 gguf is ~35 GiB (37801097504 bytes), so it does not fit a single
+32 GiB R9700 - it requires 2 GPUs with tensor splitting. This is not just a
+capacity workaround: MoE is one of the areas that scales POORLY under tensor
+split today (the expert GEMMs need cross-GPU partial-sum exchange per
+layer), so Q8_0 testing doubles as an opportunity to tune MoE for
+`--split-mode tensor` operation. This is a real research item, not a
+validation checkbox.
+
+Context that matters for this:
+
+1. **The fused gate+up MMQ kernel must be verified under tensor split**: the
+   dispatch currently gates on `ggml_cuda_should_use_mmq(src0->type, cc,
+   src1->ne[2], src0->ne[2])` and nothing else. Under tensor split, src0's
+   ne[2] (n_expert) is unchanged (experts are NOT split across devices - it
+   is the K/n_ff dims that split), so the fusion should still fire, but the
+   per-device src1 partial rows and the cross-GPU exchange for the GLU
+   output need a correctness check (logitdump on 2 GPUs vs 1-GPU Q6_K
+   reference is NOT directly comparable across quant types - compare fused
+   vs GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1 on the SAME 2-GPU setup).
+2. **Block 12 (hybrid HIP all-reduce, RDNA4-gated) is the relevant infra**:
+   the boosts branch's multi-GPU reduction path is what the expert
+   partial-sums flow through. The plan-decode notes flagged "3-GPU config
+   (hybrid all-reduce, block 12)" as a Phase-3 validation item; Q8_0 2-GPU
+   is the first real workload to exercise it for MoE prefill.
+3. **What to measure**: pp t/s on 2 GPUs (fused vs unfused), the per-layer
+   all-reduce cost in the op timing (look for the reduce nodes between the
+   gate/up and down), and whether the fused kernel reduces the exchange
+   count (it collapses gate+up into one launch, so at least one exchange
+   boundary disappears).
+4. **Environment**: `HIP_VISIBLE_DEVICES=0,1` (2 GPUs); the multi-GPU load
+   path fails under rocprof tracing (known), so use GGML_CUDA_OP_TIMING for
+   measurements. Do NOT set HSA_OVERRIDE_GFX_VERSION.
 
 ## Model paths / env for reference
 
-- moe: /llm/models/Qwen3.6/35B-A3B/Q6_K/Qwen3.6-35B-A3B-Q6_K.gguf
+- moe Q6_K: /llm/models/Qwen3.6/35B-A3B/Q6_K/Qwen3.6-35B-A3B-Q6_K.gguf
+- moe Q4_K_M: /llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+  (downloading 2026-08-31; ~6.5 GiB of expected ~8 GiB at last check)
+- moe Q5_K_M: /llm/models/Qwen3.6/35B-A3B/Q5_K_M/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf
+  (downloading 2026-08-31; ~2.7 GiB of expected ~4 GiB at last check)
+- moe Q8_0: /llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf
+  (~35 GiB, needs 2 GPUs with --split-mode tensor)
 - dense: /llm/models/Qwen3.6/27B/Q6_K/Qwen3.6-27B-Q6_K.gguf
-- Only Q6_K gguf exists in /llm/models/Qwen3.6/35B-A3B/ (also Q8_0,
-  Q8_K_XL dirs); for Q4_K/Q5_K models, need to download/quantize or use
-  test-backend-ops MUL_MAT_ID shapes directly (no model needed for
-  correctness, only for the t/s win).
 - logitdump2: /tmp/logitdump2 (built from /tmp/logitdump.cpp with
   mp.n_lazy_buf_size removed); needs LD_LIBRARY_PATH=~/llama.cpp/build-rocm/bin.
 - Op timing: `GGML_CUDA_OP_TIMING=1 llama-bench -p N -n 0 -ub N -r 1 -v`
