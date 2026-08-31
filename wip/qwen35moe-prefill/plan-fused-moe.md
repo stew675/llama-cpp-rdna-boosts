@@ -1,8 +1,31 @@
 # PLAN (b): fused MoE gate+up+GLU kernel for the routed experts
 
-Target: the `MUL_MAT_ID` block - 41-53% of qwen35moe prefill GPU time
-(report.md sections 2, 5). The same pattern exists in every MoE arch in the
-fork (qwen4exp, gpt-oss, glm4-moe, ...), so the work transfers.
+## Status: OPEN - the prefill fused-forward is NOT built (2026-08-30)
+
+What the decode investigation changed for this plan:
+
+1. **The decode half is already fused.** On the mmvq (decode) path the
+   gate+up runs as ONE fused mmid kernel (the merged `ffn_gate_up_exps`
+   tensor + GLU epilogue) and the down+shared-gate+residual as another
+   (`shexp_down_gate`). The `mul_mat_id_glu_ops` dead check in
+   `ggml_cuda_can_fuse` stays dead for Q6_K because the MMQ path has no
+   fused forward - which is exactly what this plan builds.
+2. **The routed-down decode latency was the mmvq K-split idling, not the
+   launch count** - fixed by patch 0002 (mmvq short-K item-split, +6-7%
+   decode, spec-decode purity preserved). That does NOT touch the prefill
+   MMQ path (n_tokens >= 6 goes to MMQ, not mmvq).
+3. **The Item 3 router->topk fusion was measured and REVERTED**
+   (item3-router-fusion-failed.md): serializing the expert dots into one
+   warp is ~17x slower than the mmvq. Do not fuse the router into topk.
+
+So the remaining work is exactly the original proposal, now with the
+prefill cost structure confirmed: at ub=2048 the `MUL_MAT_ID` block is
+41% of prefill (0.094 ms/tok), 120 mmid ops per step (gate+up merged =
+80 visible: 40 gate_up + 40 down), each with its own ids-sort and src1
+quantize. A fused gate+up (MMQ-style, one kernel, shared sort/quantize,
+GLU epilogue) plus optionally folding the down in saves the fixed costs.
+Expected: 15-25% of the mmid block ~ 6-10% of prefill at ub=2048; more
+at ub=512 where the fixed overheads dominate.
 
 ## Why there is room
 
