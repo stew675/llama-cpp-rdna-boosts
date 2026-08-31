@@ -168,3 +168,17 @@ Backup patches in ~/llama-cpp-rdna-boosts/wip/qwen35moe-prefill/patches/:
 - src/llama-kv-cache.cpp:1829 get_prev_tokens (+ index from PR #27992)
 - PRs: #27992 (prev-token index), #27941 (qwen4exp fixes), #27977
 - upstream top-k.cu = source of the radix backport (master)
+
+## UPDATE 4: PLE batch cache ARCHIVED and dropped (branch qwen4exp)
+
+- Decision: drop. Verified neutral at all depths (the ngram gather was never
+  the bottleneck; the QSA top-k -> GPU fix was). Kept the tree lean.
+- Forward patch archived: patches/0007-ple-batch-cache-archive.patch
+  (applies cleanly to the PLE-free tree; round-trip verified).
+- The managed-ngrams lazy_reader path (patches 0001-0007) is RETAINED.
+- Work now lives on branch `qwen4exp` in ~/llama.cpp (checkpoint 23f006087,
+  PLE-free d2548f9af). Build + pp16384 sanity re-verified: 1737 t/s.
+- Original question "when would the PLE cache become useful": only when the
+  gather itself is slow (bigger table, slower storage, or a gather-bound
+  config). It does NOT help with depth - the depth-scaled costs (QSA top-k
+  [now GPU], KQ mask build, attention) dominate at 200K, not the ngram table.

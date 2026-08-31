@@ -1,0 +1,350 @@
+diff --git b/src/llama-context.cpp a/src/llama-context.cpp
+index 7bd67cf33..67337687c 100644
+--- b/src/llama-context.cpp
++++ a/src/llama-context.cpp
+@@ -1723,6 +1723,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
+ 
++    // give the model a chance to precompute batch-level graph inputs (e.g. the PLE n-gram
++    // gather for qwen4exp) once for the whole batch instead of once per ubatch
++    // note: balloc->get_batch() is the sanitized batch with auto-generated pos/seq_id filled in
++    model.prepare_batch(balloc->get_batch(), memory.get());
++
+     // TODO: this clear of the buffer can easily be forgotten - need something better
+     // sync first so any in-flight async copies into embd_seq complete before it is freed
+     if (!embd_seq.empty()) {
+diff --git b/src/llama-model.h a/src/llama-model.h
+index d1dcb91ce..779295a12 100644
+--- b/src/llama-model.h
++++ a/src/llama-model.h
+@@ -763,6 +763,14 @@ struct llama_model {
+     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
+     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
+ 
++    // called once per decode() with the whole logical batch, before the ubatch loop
++    // default: no-op. models can use it to precompute batch-level graph inputs (e.g. the
++    // qwen4exp PLE n-gram gather) once instead of per ubatch
++    // memory: the persistent memory object (llama_memory_hybrid_idx for qwen4exp)
++    virtual void prepare_batch(const llama_batch & batch, const llama_memory_i * memory) const {
++        GGML_UNUSED(batch); GGML_UNUSED(memory);
++    }
++
+ protected:
+     llama_model_params params;
+ 
+diff --git b/src/models/models.h a/src/models/models.h
+index 1670521c4..93ea0ccdf 100644
+--- b/src/models/models.h
++++ a/src/models/models.h
+@@ -2400,9 +2400,22 @@ struct llama_model_qwen4exp : public llama_model_base {
+ 
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+ 
++    // batch-level PLE n-gram precompute: fill all rows of the whole logical batch in one
++    // sorted sequential pass over the mmap'd table, then each ubatch just slices the cache
++    // see llama_model_qwen4exp::prepare_batch() in qwen4exp.cpp
++    void prepare_batch(const llama_batch & batch, const llama_memory_i * memory) const override;
++
+     // non-null in managed mode: the PLE n-gram table is cached on demand in a
+     // fixed-size host buffer instead of being mmap'd
+     std::shared_ptr<llama_lazy_reader> lazy_reader;
++
++    // filled by prepare_batch(); consumed by llm_graph_input_ple::set_input()
++    mutable std::vector<float> ple_emb_full;    // F32 [ple_head_dim*n_heads, n_tokens_all]
++    mutable std::vector<int32_t> ple_rows_full; // I32 [ple_n_heads*n_tokens_all] indices (for verify)
++    mutable llama_pos    ple_cache_pos0 = 0;
++    mutable llama_seq_id ple_cache_seq  = 0;
++    mutable uint32_t     ple_cache_n_tokens = 0;
++    mutable bool ple_cache_valid = false;
+ };
+ 
+ struct llama_model_qwen35moe : public llama_model_base {
+diff --git b/src/models/qwen4exp.cpp a/src/models/qwen4exp.cpp
+index e10be9a2f..92070f01b 100644
+--- b/src/models/qwen4exp.cpp
++++ a/src/models/qwen4exp.cpp
+@@ -1021,6 +1021,13 @@ public:
+ 
+     bool can_reuse(const llm_graph_params & params) override {
+         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
++        // the graph is built against the cache only when the cache is active for this batch
++        if (use_cache != pmodel.ple_cache_valid) {
++            return false;
++        }
++        if (use_cache) {
++            return emb->ne[1] == (int64_t) params.ubatch.n_tokens;
++        }
+         if (pmodel.lazy_reader) {
+             return emb->ne[1] == (int64_t) params.ubatch.n_tokens;
+         }
+@@ -1028,7 +1035,9 @@ public:
+     }
+ 
+     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens] (mmap path)
+-    ggml_tensor * emb  = nullptr;   // F32 [ple_head_dim * n_heads, n_tokens] (managed path)
++    ggml_tensor * emb  = nullptr;   // F32 [ple_head_dim * n_heads, n_tokens] (managed/cache path)
++
++    bool use_cache = false;         // graph built against the batch-level PLE cache
+ 
+     const llama_model_qwen4exp & pmodel;
+ 
+@@ -1043,6 +1052,85 @@ public:
+ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+     const auto & hp = pmodel.hparams;
+ 
++    // batch-level cache: the whole logical batch's PLE rows were precomputed in one
++    // sorted sequential pass over the table (see llama_model_qwen4exp::prepare_batch).
++    // if this ubatch is a slice of that batch, just copy the slice - no gather at all.
++    if (pmodel.ple_cache_valid && ubatch->token && emb != nullptr && rows == nullptr) {
++        const llama_seq_id seq = ubatch->seq_id_unq[0];
++        const llama_pos pos0 = pmodel.ple_cache_pos0;
++        const int64_t n_tok = ubatch->n_tokens;
++        const int64_t n_heads = hp.ple_n_heads;
++        const int64_t head_dim = hp.ple_head_dim;
++
++        bool covers = ubatch->n_seqs_unq == 1 && seq == pmodel.ple_cache_seq &&
++                      ubatch->pos[0] >= pos0 &&
++                      (int64_t) (ubatch->pos[0] - pos0) + n_tok <= (int64_t) pmodel.ple_cache_n_tokens;
++        if (covers) {
++            const size_t off = (size_t) (ubatch->pos[0] - pos0) * n_heads * head_dim;
++            const size_t nbytes = (size_t) n_tok * n_heads * head_dim * sizeof(float);
++            ggml_backend_tensor_set(emb, pmodel.ple_emb_full.data() + off, 0, nbytes);
++
++            // verify: recompute the slice with the exact same hash+gather as the per-ubatch
++            // path and compare. only for debugging - never enabled in production.
++            static const bool verify = []() {
++                const char * env = getenv("LLAMA_PLE_CACHE_VERIFY");
++                return env && atoi(env) != 0;
++            }();
++            if (verify) {
++                // run the full per-ubatch computation below against a copy of the cache slice
++                std::vector<float> ref(nbytes / sizeof(float));
++                const int64_t n_prev = hp.ple_ngram_size - 1;
++                prev.clear();
++                prev.resize((size_t) n_tok * n_prev, LLAMA_TOKEN_NULL);
++                mctx->get_prev_tokens(*ubatch, n_prev, prev);
++                // rebuild the hash exactly like the fallback path (see below)
++                std::vector<int32_t> idx((size_t) n_heads * n_tok);
++                for (int64_t i = 0; i < n_tok; ++i) {
++                    std::vector<int64_t> ctx(hp.ple_ngram_size);
++                    ctx[0] = ubatch->token[i];
++                    bool cut = false;
++                    for (int64_t s = 1; s < hp.ple_ngram_size; ++s) {
++                        const llama_token t = cut ? LLAMA_TOKEN_NULL : prev[i*n_prev + (n_prev - s)];
++                        cut = cut || t < 0 || t == (llama_token) hp.ple_eos_token_id;
++                        ctx[s] = cut ? (int64_t) hp.ple_eos_token_id : t;
++                    }
++                    for (int64_t n = 2; n <= hp.ple_ngram_size; ++n) {
++                        uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
++                        for (int64_t j = 1; j < n; ++j) {
++                            mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
++                        }
++                        const int64_t base = (n - 2) * hp.ple_heads_per_ngram;
++                        for (int64_t g = 0; g < hp.ple_heads_per_ngram; ++g) {
++                            const int64_t h_i = base + g;
++                            idx[i * n_heads + h_i] =
++                                (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
++                        }
++                    }
++                }
++                // gather via the same source the fallback would use
++                if (pmodel.lazy_reader) {
++                    pmodel.lazy_reader->gather(idx.data(), idx.size(), ref.data());
++                } else {
++                    const ggml_tensor * tbl = pmodel.per_layer_tok_embd;
++                    const size_t row_size = ggml_row_size(tbl->type, head_dim);
++                    const auto * traits = ggml_get_type_traits(tbl->type);
++                    const ggml_to_float_t to_float = traits ? traits->to_float : nullptr;
++                    std::vector<float> tmp(head_dim);
++                    for (size_t k = 0; k < idx.size(); ++k) {
++                        to_float((const uint8_t *) tbl->data + (size_t) idx[k] * row_size, tmp.data(), head_dim);
++                        std::copy(tmp.begin(), tmp.end(), ref.begin() + k * head_dim);
++                    }
++                }
++                if (memcmp(ref.data(), pmodel.ple_emb_full.data() + off, nbytes) != 0) {
++                    fprintf(stderr, "PLE CACHE MISMATCH: pos=%d n_tok=%ld\n", (int) ubatch->pos[0], (long) n_tok);
++                } else {
++                    fprintf(stderr, "PLE CACHE OK: pos=%d n_tok=%ld\n", (int) ubatch->pos[0], (long) n_tok);
++                }
++            }
++            return;
++        }
++    }
++
+     // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
+     // stand in the image token id that the reference hashes, or EOS if the file has no such key
+     // gemma3n and gemma4 do the same with a hardcoded row 0 of per_layer_token_embd.
+@@ -1175,6 +1263,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
+ 
+     const auto & pmodel = static_cast<const llama_model_qwen4exp &>(model);
++    if (pmodel.ple_cache_valid) {
++        // batch-cache path: no gather node in the graph; set_input copies the ubatch's
++        // slice of the precomputed F32 rows (see llama_model_qwen4exp::prepare_batch)
++        ple_inp->use_cache = true;
++        ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
++                                          hparams.ple_head_dim * n_heads, n_tokens);
++        ggml_set_input(ple_inp->emb);
++        ggml_tensor * emb = ple_inp->emb;
++        res->add_input(std::move(ple_inp));
++        cb(emb, "ple_embd", -1);
++        return emb;
++    }
++
+     if (pmodel.lazy_reader) {
+         // managed path: no gather node in the graph; set_input fills this tensor
+         // with the dequantized rows (the layout matches the get_rows output below)
+@@ -1200,6 +1301,152 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+     return emb;
+ }
+ 
++// Compute the PLE n-gram rows for the whole logical batch in one pass and cache the
++// F32 result. The per-ubatch set_input() then just memcpy's its slice - no gather, no
++// hash, no OpenMP spin in the hot path. The table is read once per batch in sorted
++// row order (sequential mmap access) instead of N random-access gathers.
++//
++// Eligibility (otherwise the cache stays inactive and the per-ubatch path is used):
++//   - tokens present (no embd batch)
++//   - single sequence, positions contiguous starting at pos0 (typical prefill)
++//   - the first n_prev predecessors of the batch must be resolvable: either the batch
++//     starts the sequence (pos0 <= 0) or the cells exist in the attn cache
++void llama_model_qwen4exp::prepare_batch(const llama_batch & batch, const llama_memory_i * memory) const {
++    // reset the cache state unconditionally
++    ple_cache_valid = false;
++    ple_emb_full.clear();
++    ple_rows_full.clear();
++
++    static const bool disabled = []() {
++        const char * env = getenv("LLAMA_PLE_CACHE_DISABLE");
++        return env && atoi(env) != 0;
++    }();
++    if (disabled) {
++        return;
++    }
++
++    const auto & hp = hparams;
++    const int64_t n_heads = hp.ple_n_heads;
++    if (n_heads == 0) {
++        return;
++    }
++
++    if (batch.n_tokens < 2 || !batch.token) {
++        return;
++    }
++
++    // single seq, contiguous positions, starting from a position whose predecessors
++    // are either in this batch or already in the attn cache cells
++    const llama_seq_id seq = batch.seq_id[0][0];
++    const llama_pos pos0 = batch.pos[0];
++    for (int32_t i = 0; i < batch.n_tokens; ++i) {
++        if (batch.n_seq_id[i] != 1 || batch.seq_id[i][0] != seq || batch.pos[i] != pos0 + i) {
++            return;
++        }
++    }
++
++    // the whole batch must be a fresh prefill of the sequence, so that every predecessor
++    // (pos - n_prev ... pos - 1) is either within the batch or before the sequence start
++    // (reads as EOS). a batch that continues an existing sequence (pos0 > 0) needs the
++    // attn cache cells for its first tokens; resolve those from the memory object.
++    const auto * mem_hyb = static_cast<const llama_memory_hybrid_idx *>(memory);
++    const auto * kv_attn = mem_hyb ? mem_hyb->get_mem_attn() : nullptr;
++
++    const llama_token eos = hp.ple_eos_token_id;
++    const int64_t n_gram = hp.ple_ngram_size;
++    const int64_t per_gram = hp.ple_heads_per_ngram;
++    const int64_t head_dim = hp.ple_head_dim;
++
++    // resolve predecessor of (seq, p) from the batch if within, else from the attn cells
++    auto pred_of = [&](int64_t i, int64_t s) -> llama_token {
++        const llama_pos p = pos0 + i - s;
++        if (p >= pos0) {
++            return batch.token[i - s];
++        }
++        if (p < 0 || !kv_attn) {
++            return LLAMA_TOKEN_NULL;
++        }
++        // look up the newest cell at position <= p for this seq (the general scan does the
++        // same with its "below" fallback; contiguous batches have no M-RoPE gaps)
++        llama_token tok = LLAMA_TOKEN_NULL;
++        kv_attn->get_cells(seq).seq_pos_token_le(seq, p, &tok);
++        return tok;
++    };
++
++    std::vector<int32_t> idx((size_t) n_heads * batch.n_tokens);
++
++    for (int64_t i = 0; i < batch.n_tokens; ++i) {
++        // an EOS in the window resets everything at or before it; missing predecessor reads as EOS
++        // this is the exact same hash as llm_graph_input_ple::set_input()
++        std::vector<int64_t> ctx(n_gram);
++        ctx[0] = batch.token[i];
++        bool cut = false;
++        for (int64_t s = 1; s < n_gram; ++s) {
++            const llama_token t = cut ? LLAMA_TOKEN_NULL : pred_of(i, s);
++            cut = cut || t < 0 || t == eos;
++            ctx[s] = cut ? eos : t;
++        }
++        for (int64_t n = 2; n <= n_gram; ++n) {
++            uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
++            for (int64_t j = 1; j < n; ++j) {
++                mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
++            }
++            const int64_t base = (n - 2) * per_gram;
++            for (int64_t g = 0; g < per_gram; ++g) {
++                const int64_t h_i = base + g;
++                idx[i * n_heads + h_i] =
++                    (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
++            }
++        }
++    }
++
++    ple_rows_full = idx;
++
++    // gather+dequantize the rows in sorted order (sequential mmap reads) into the flat
++    // F32 layout [ple_head_dim*n_heads, n_tokens] that get_rows would produce
++    const ggml_tensor * tbl = per_layer_tok_embd;
++    const size_t row_size = ggml_row_size(tbl->type, head_dim);
++    const auto * traits = ggml_get_type_traits(tbl->type);
++    const ggml_to_float_t to_float = traits ? traits->to_float : nullptr;
++
++    const size_t n_rows = idx.size();
++    ple_emb_full.resize(n_rows * head_dim);
++
++    if (lazy_reader) {
++        // managed path: reuse the page-cached reader for the whole batch at once
++        lazy_reader->gather(idx.data(), idx.size(), ple_emb_full.data());
++    } else if (to_float && tbl->data) {
++        // mmap path: sort the (row, dst) pairs and read the table sequentially
++        std::vector<std::pair<int32_t, size_t>> order;
++        order.reserve(n_rows);
++        for (size_t k = 0; k < n_rows; ++k) {
++            order.emplace_back(idx[k], k * head_dim);
++        }
++        std::sort(order.begin(), order.end());
++
++        std::vector<float> tmp(head_dim);
++        size_t k = 0;
++        while (k < order.size()) {
++            const int32_t row = order[k].first;
++            to_float((const uint8_t *) tbl->data + (size_t) row * row_size, tmp.data(), head_dim);
++            while (k < order.size() && order[k].first == row) {
++                std::copy(tmp.begin(), tmp.end(), ple_emb_full.begin() + order[k].second);
++                ++k;
++            }
++        }
++    } else {
++        // cannot gather on host - leave the cache inactive
++        ple_emb_full.clear();
++        ple_rows_full.clear();
++        return;
++    }
++
++    ple_cache_pos0 = pos0;
++    ple_cache_seq  = seq;
++    ple_cache_n_tokens = batch.n_tokens;
++    ple_cache_valid = true;
++}
++
+ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
+         llm_graph_input_rs * inp,
+         ggml_tensor *        emb,
