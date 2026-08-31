@@ -227,3 +227,57 @@ willing to roll own kernels on HIP).
 Estimated impact at 64K if attention drops to ~5ms/layer: ubatch time
 ~2.06s -> ~0.3s (995 -> ~5000+ t/s) - but the node_56 barrier anomaly
 and remaining fixed costs must be re-measured before trusting that.
+
+## UPDATE 6: ACTION PLAN - two items to attend to (next session)
+
+Model support is ~1 week old - plenty of green-field optimization left.
+Two concrete work items, in priority order:
+
+### ITEM A (quick, do first): node_56 625ms barrier anomaly
+- Symptom: OP_TIMING shows MUL_MAT node_56 [2560x15x2048] at ~625ms, 95%
+  GPU, FLAT at 16K/32K/64K (also node_570 [2560x128x2048] ~180ms flat).
+  A 78 MFLOP matmul should be ~0.1ms. Suspect: graph-split/allreduce
+  barrier sync counted in the first op's window, or a per-split sync
+  serialization across the 3 GPUs (hybrid all-reduce, block 12).
+- How to check: GGML_SCHED_DEBUG=2 node->backend assignment + split
+  boundaries; compare GGML_CUDA_ALLREDUCE modes (1/2/3); OP_TIMING on
+  1-GPU vs 3-GPU to see if the 625ms is a cross-GPU sync artifact.
+- If it is sync overhead: reduce graph splits (fewer sync points), or
+  check the hybrid allreduce launch pattern for per-split stalls.
+- Impact: if real, ~625ms/ubatch at 16K = ~5% -> could be 5-15% total.
+
+### ITEM B (the 200K enabler, main project): sparse attention
+- build_attn_qsa (qwen4exp.cpp:668) masks scores but flash-attends over
+  ALL n_kv cells. FLASH_ATTN_EXT: 35.7ms@16K -> 158ms@64K (linear in
+  n_kv); ~36% of ubatch at 16K, ~92% at 64K. This is the ONLY remaining
+  linear-in-n_kv op (top-k is already GPU radix).
+- Goal: gather only the top-k K/V cells per token, flash-attend over
+  ~2048 cells instead of n_kv. Keeps attention ~constant at any depth.
+- Design options (to evaluate):
+  1. Custom ggml op: sparse flash-attn taking q, top-k indices, k/v
+     cache -> per-token gather of K/V, compute over gathered only.
+     Fattn infrastructure exists: ggml/src/ggml-cuda/fattn-*.cuh
+     (fattn-tile.cu is the tile-based FA). Would be a HIP/CUDA kernel
+     addition, new GGML_OP_* or a fused-node variant.
+  2. Graph-level: ggml_get_rows for a per-token gather needs a NEW 2D
+     gather op (get_rows is single-index-per-column; top-k differs per
+     token). Then dense flash-attn over [n_top_k, n_tokens] with a
+     trivial all-ones mask. Simpler kernel but two passes + the gather
+     memory traffic.
+  3. Fused indexer+attn: keep top-k indices from build_qsa_top_k and
+     feed directly into a sparse FA kernel that only loads selected KV
+     rows (no gather materialization). Most efficient, most work.
+- Correctness bar: bit-exact vs the mask path (the mask semantics:
+  -INFINITY except top-k rows = 0, plus the base kq_mask ADD). Must
+  preserve causality (positions > query masked) and the base mask.
+- Measure before/after: pp16384, pp65536, pp131072 if VRAM allows.
+- NOTE: verify the node_56 anomaly first (ITEM A) - if there's a hidden
+  fixed per-ubatch sync cost, it caps the sparse-attn win at 64K.
+
+### Model context (for both items)
+- qwen4exp = Qwen3.8-Flash-Next UD-Q4_K_XL, 48 layers, 12 full-attn
+  layers (3,7,...,47) + 36 GDN/recurrent. QSA indexer: head_count 4,
+  key_length 128, top_k 2048, compress_ratios [0,0,0,4,...].
+- n_ctx_train 262144; 200K target is native-range but attention scales
+  linearly -> sparse attention is REQUIRED for 200K prefill.
+- Best measured: pp16384 1716, pp65536 995 (ub2048, tensor, t16).
