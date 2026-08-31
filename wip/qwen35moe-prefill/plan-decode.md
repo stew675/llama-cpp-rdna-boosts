@@ -69,6 +69,61 @@ c. **-ngl sweep**: 10/20/30/40 layers on GPU vs CPU - the delta per group
 Deliverable: a cost table for decode (FA, GDN chain, experts, shared,
 lm-head) on the real graph path, not the no-graph path.
 
+## Handoff notes (2026-08-30 investigation session)
+
+Environment and tooling facts learned while gathering the data above, so the
+next session does not repeat them:
+
+### Profiler status on this box (ROCm 10.0.0-gfx1201)
+
+ALL of these fail; do not retry without a reason:
+- `rocprofv3 --kernel-trace` and `--sys-trace`: SIGABRT in the app during
+  model load (`ggml_backend_cuda_buffer_set_tensor` H2D copy; the actual
+  hipError message is swallowed by rocprofv3's output redirection).
+- `rocprof-sys-run --rocm=kernel`: heap corruption ("corrupted size vs.
+  prev_size") and abort.
+- `rocprof-attach` (needs `ROCP_TOOL_ATTACH=1` on the target): ptrace
+  injection kills the target with signal 6.
+- Crashed rocprofv3 runs ORPHAN their llama-bench child, which keeps the
+  model resident in VRAM (~18-29 GB/GPU) and makes the next run fail with
+  "failed to load model". Always check `ps`/`rocm-smi --showmeminfo vram`
+  and `pkill -9 -f "[l]lama-bench"` (bracket trick - plain `pkill -f
+  llama-bench` self-matches and kills the shell) before retrying.
+
+Working alternative: llama.cpp's own instrumentation (no tracer):
+- `GGML_CUDA_OP_TIMING=1` + `-v` (block 08): per-op CUDA-event timings per
+  graph eval. Needs `-v` (INFO logging is suppressed otherwise). Caveats:
+  it disables CUDA graphs, and fused/streamed nodes (the GDN fused kernel,
+  concurrent-event nodes) are skipped by the timing - treat its total as a
+  lower bound and its per-op shares as main-stream-only.
+- Env A/B switches available: `GGML_CUDA_GDN_CHUNKED`, `GGML_CUDA_GDN_CHUNKED_BF16`,
+  `GGML_CUDA_FA_WMMA_256`, `GGML_CUDA_DISABLE_GRAPHS`, `GGML_CUDA_FORCE_MMQ`.
+
+### llama-bench gotchas
+
+- `-b` sets `n_batch`, `-ub` sets `n_ubatch` (default 512). The prefill
+  ubatch is the physical per-eval batch; `-b` alone never changes it. All
+  the baseline numbers in `report.md` are at ub=512 unless stated.
+- Reproducible measurement pattern: `-r 2` (default warmup) for curves,
+  `-r 1 --no-warmup` for op timing.
+- Single-GPU profiling needs `HIP_VISIBLE_DEVICES=0`; the multi-GPU load
+  path (layer split) fails under tracing.
+
+### Model / build facts
+
+- Model: `/llm/models/Qwen3.6/35B-A3B/Q6_K/Qwen3.6-35B-A3B-Q6_K.gguf`
+  (27.29 GiB). Dense comparison: `/llm/models/Qwen3.6/27B/Q6_K/Qwen3.6-27B-Q6_K.gguf`.
+  Build: `~/llama.cpp/build-rocm/bin` (rdna-boosts `4fa92f0ae`).
+- Decode numbers to beat: tg128 = 92.2-92.7 t/s flat from KV=512 to
+  KV=16384; graphs worth ~2.5%; FA off -2%. No MTP in this build
+  (`n_rs_seq=0`), so the decode graph is the pure 40-layer trunk.
+- Code refs: GDN AR kernel + dispatch in
+  `ggml/src/ggml-cuda/gated_delta_net.cu` (block 02); conv-state read +
+  concat in `src/models/delta-net-base.cpp` `build_conv_state` (~500);
+  mmid vec path in `ggml/src/ggml-cuda/mmq.cu` / `mmvq.cuh`; fused-MoE
+  dead check `ggml_cuda_can_fuse` ~3175 in `ggml-cuda.cu`; `-ot` tensor
+  override in `common/arg.cpp`.
+
 ## Phase 2 - attack the winner (1-3 d)
 
 Depending on Phase 1:
