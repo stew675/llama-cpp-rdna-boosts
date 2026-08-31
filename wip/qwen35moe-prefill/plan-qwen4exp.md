@@ -1,6 +1,28 @@
 # PLAN: qwen4exp (Qwen3.8-Flash-Next) performance investigation
 
-Status: ACTIVE (2026-08-31) - ENV ROOT CAUSE FOUND, see qwen4exp-handoff-2026-08-31.md
+Status: ACTIVE (2026-08-31) - PREFILL TARGET >1000 t/s ACHIEVED, see qwen4exp-handoff-2026-08-31.md
+
+## 0.7 CPU-burn root cause + prefill fix (2026-08-31, PM session)
+
+- The host-CPU burn (16 OpenMP cores at ~95%, GPU ~60%) is NOT the PLE
+  get_prev_tokens scan (that is now O(log n) via PR #27992 index, applied
+  + unit-tested, 0 mismatches) and NOT mmap page faults (-lm none equal).
+- Root cause: per-ubatch host overhead. Every ubatch re-runs the graph
+  scheduler + gallocr reserve + CPU-side GET_ROWS split (token_embd
+  644 MB + per_layer_token_embd 27.4 GB ngram table in CPU RAM,
+  CPU_Mapped lazy). 16 OpenMP threads spin in kmp barriers waiting for
+  the slowest gather row. Cost is fixed per ubatch, so it scales with
+  the NUMBER of ubatches: at 16K/ub512 that is 32 x, at ub2048 only 8 x.
+- Evidence: -t 1 vs -t 16 = 255 vs 769 t/s at pp16384 (CPU-thread
+  sensitive) but pp512 single-ubatch is thread-insensitive (1399/1412).
+  ub512 -> ub1024 -> ub2048 at pp16384: 799 -> 969 -> 1061 t/s (+33%).
+- FIX (config, no code): -ub 2048 (or 4096; plateau). New best full
+  curve at -ub 2048 -t 16 (tensor, r=3): pp512 1469, pp2048 1569,
+  pp4096 1447, pp8192 1288, pp16384 1083, tg128 40.0. PREFILL TARGET
+  >1000 t/s at 16K ACHIEVED (1083). tg still ~40 (GPU/host per-token
+  bound; op timing shows result_output [2560x82774x1] = 0.6 ms alone).
+- Note: llama-bench -ub affects prefill batching only; decode is
+  single-token ubatches regardless, so tg unaffected by -ub.
 
 ## 0.6 Environment root cause (2026-08-31, mid-session)
 
