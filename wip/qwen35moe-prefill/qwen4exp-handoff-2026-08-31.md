@@ -157,3 +157,60 @@ Final locked numbers (tensor, r=3, env GGML_CUDA_FA_WMMA_256=0):
   token, GDN state; check if tg benefits from -ub 2048 at server level
   (batch decode of parallel slots)
 - Remaining: 2-GPU deploy, Strix Halo validation (parked)
+
+## UPDATE 3 (PM session): REAL CPU-burn root cause = QSA indexer top-k on CPU. FIXED.
+
+### The real bottleneck (not the ngram gather!)
+- 16 OpenMP threads at ~95% were in `ggml_compute_forward_top_k` +
+  `std::__heap_select` (gdb-verified). The QSA sparse-attention indexer does
+  top-2048-of-16384 (indexer.top_k=2048, per token, per QSA layer) and this
+  landed on the CPU backend because CUDA TOP_K support is gated at
+  `ne[0] <= 1024` without CUB. At 16K: 264 TOP_K nodes on CPU.
+- The ngram gather was NOT the burn: PLE batch cache (prototype below) is
+  bit-exact and removes the per-ubatch gather, but CPU% unchanged (1260%)
+  and pp16384 flat (1722.8 vs 1722.2 with cache off).
+
+### The fix (backport from upstream master)
+- ggml/src/ggml-cuda/top-k.cu: upstream HIP radix top-k kernel
+  (`top_k_radix_cuda`, 4-pass 8-bit radix select with per-row histograms)
+  for ncols > 1024. Pure backport; our tree predates it.
+- ggml/src/ggml-cuda/ggml-cuda.cu supp: TOP_K now allowed on HIP for any
+  ne[0] (master does the same: `#if defined(GGML_USE_HIP) || CUB`).
+- Env A/B switch GGML_CUDA_TOP_K_CPU=1 forces the old CPU path.
+- VERIFIED BIT-IDENTICAL: logitdump (same build, GPU radix vs CPU heap_select,
+  32 tokens, seed 42) - byte-identical output. The radix kernel returns the
+  same index SET (unsorted order is fine; the consumer scatters into a mask).
+- Also verified against the earlier reference worktree build.
+
+### Measured (tensor, ub512 unless noted, WMMA off, t16)
+| test | top-k CPU | top-k GPU (radix) | gain |
+|------|-----------|-------------------|------|
+| pp2048  | 1209 | 1441 | +19% |
+| pp8192  | 908  | 1419 | +56% |
+| pp16384 | 784  | 1307 | +67% |
+| pp16384 @ub2048 | - | 1716-1723 | |
+| tg128   | 37.8 | 37.8 | 0 (decode is bandwidth-bound) |
+- CPU burn at pp16384/ub2048: 1260% -> 140% (16 cores -> 1.4).
+
+### Best full curve (all fixes, ub2048, r=3)
+pp512 1492, pp2048 2028, pp4096 2031, pp8192 1935, pp16384 1716, tg128 40.1.
+That is 2.6x the session-start 655 and 2.5x the 570-620 reference at 16K.
+PREFILL TARGET >1000 t/s: MASSIVELY EXCEEDED (1716).
+
+### Tree state additions (on top of prior working tree)
+- top-k.cu radix backport + supp change + GGML_CUDA_TOP_K_CPU A/B env
+  backup: patches/0006-qsa-topk-radix-gpu.patch
+- PLE batch-level cache prototype (prepare_batch hook + llm_graph_input_ple
+  cache path + LLAMA_PLE_CACHE_VERIFY / LLAMA_PLE_CACHE_DISABLE envs):
+  verified bit-exact on prefill AND continuation batches; performance-
+  neutral now that top-k is on GPU. Keep or drop: it removes the per-ubatch
+  ngram gather from the graph and would matter if the table were bigger or
+  the gather were offloaded; currently adds code for no measured win.
+
+### Next steps
+- Decide keep/drop PLE cache (currently neutral; top-k was the win).
+- Decode 37.8 -> 50: decode is memory-bandwidth bound (103.68 GiB weights),
+  result_output [2560x82774x1] alone ~0.6ms; investigate expert MMQ width
+  or KV/cache reuse; not top-k-bound.
+- Run logitdump at 16K to confirm bit-exactness at depth (done at 4K).
+- Strix Halo validation, 2-GPU deploy remain parked.

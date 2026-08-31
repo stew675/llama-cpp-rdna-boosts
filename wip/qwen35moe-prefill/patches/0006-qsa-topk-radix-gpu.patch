@@ -1,0 +1,347 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 6965879fa..a5ae69a34 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3431,8 +3431,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 0;
+     }
+ 
++    // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
++    static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
++
++    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
++
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++
+     // rms_norm + norm-weight MUL whose output feeds an mmvq matmul: fold the
+     // Q8_1 quantize into the norm kernel and pre-fill the matmul quantize
+     // cache. Consumes only the norm+MUL pair; the matmul dispatch that follows
+@@ -4056,6 +4062,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fused_node_count  = 3;
+                 break;
+             }
++
++            // Prefill MMQ path: the mmvq/mmvf fused kernels only handle decode
++            // (n_tokens <= MMVQ_MAX_BATCH_SIZE) or F32/F16 src0. For the batched
++            // quantized case the gate+up+GLU triple runs as separate ops; fuse it
++            // into one MMQ kernel that reads both weight streams and applies the
++            // GLU epilogue. The J tile-width caps in mul_mat_q_switch_J are tuned
++            // on RDNA4 (gfx1201); on other arches (e.g. Strix Halo, RDNA3.5) the
++            // fused kernel is disabled until validated there.
++            if (op == GGML_OP_MUL_MAT_ID && ids != nullptr && !disable_moe_mmq && GGML_CUDA_CC_IS_RDNA4(cc) &&
++                    ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
++                ggml_cuda_mm_fusion_args_host fusion_data{};
++                fusion_data.gate      = gate->src[0];
++                fusion_data.glu_op    = ggml_get_glu_op(glu);
++                fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
++
++                ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
++                fused_mul_mat_vec = true;
++                fused_node_count  = 3;
++                break;
++            }
+         }
+     }
+ 
+@@ -4589,7 +4615,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+     const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
+     std::vector<cudaEvent_t> op_ev0;
+     std::vector<cudaEvent_t> op_ev1;
+-    std::vector<std::pair<const ggml_tensor *, int>> op_nodes;
++    std::vector<std::tuple<const ggml_tensor *, int, bool>> op_nodes;
+     if (op_timing) {
+         op_ev0.resize(cgraph->n_nodes);
+         op_ev1.resize(cgraph->n_nodes);
+@@ -4742,9 +4768,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++                if (op_timing) {
++                    // bracket the fusion dispatch: a matching try_fuse launches its own
++                    // fused kernel and the per-node events below are skipped
++                    CUDA_CHECK(cudaEventRecord(op_ev0[i], cuda_ctx->stream()));
++                }
++
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
++                    if (op_timing) {
++                        CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
++                        op_nodes.emplace_back(node, i, true);
++                    }
+ #ifdef GGML_CUDA_DEBUG
+                     const int last_fused = i + nodes_to_skip;
+                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
+@@ -4754,6 +4790,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     i += nodes_to_skip;
+                     continue;
+                 }
++
+ #ifndef NDEBUG
+                 // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
+                 // node's output on the host-visible buffer, which the compute path
+@@ -4783,7 +4820,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+                 if (op_timing) {
+                     CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
+-                    op_nodes.emplace_back(node, i);
++                    op_nodes.emplace_back(node, i, false);
+                 }
+ 
+                 if (!is_concurrent_event_active) {
+@@ -4846,14 +4883,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+         static std::map<std::string, int>    op_cnt_total;
+         std::map<std::string, double> op_ms;
+         std::map<std::string, int>    op_cnt;
+-        for (const auto & [node, idx] : op_nodes) {
++        for (const auto & [node, idx, fused] : op_nodes) {
+             float ms = 0.0f;
+ #ifdef GGML_USE_HIP
+             CUDA_CHECK(hipEventElapsedTime(&ms, (hipEvent_t) op_ev0[idx], (hipEvent_t) op_ev1[idx]));
+ #else
+             CUDA_CHECK(cudaEventElapsedTime(&ms, op_ev0[idx], op_ev1[idx]));
+ #endif
+-            std::string key = ggml_op_name(node->op);
++            std::string key = fused ? "FUSED " : "";
++            key += ggml_op_name(node->op);
+             key += " ";
+             key += node->name;
+             if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && node->src[1] != nullptr) {
+@@ -4934,15 +4972,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     if (!op_timing && graph->is_enabled()) {
+         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+         if (graph_compatible) {
+-            // PRE-FILL graphs (the graph key node[0].ne[1] > 1) use varying ubatch
+-            // sizes, so each is a separate graph key and CUDA-graph capture never
+-            // amortizes: the per-call update_required probe + failed capture is pure
+-            // overhead. Measured pp512 is ~6.7% faster with graphs OFF. Only decode
+-            // (ne[1]==1, stable shape) benefits from graph replay. Skip the whole
+-            // graph path (incl. the update_required probe) for multi-token graphs.
+-            if (cgraph->n_nodes > 0 && cgraph->nodes[0]->ne[1] > 1) {
+-                use_cuda_graph = false;
+-            } else {
+             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+ 
+             if (!graph->warmup_complete) {
+@@ -4965,7 +4994,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+                     cuda_graph_update_required = graph->instance == nullptr;
+                 }
+             }
+-            } // else: not prefill
+         }
+     }
+ #endif // USE_CUDA_GRAPH
+@@ -5944,6 +5972,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_SUM:
+             return ggml_is_contiguous_rows(op->src[0]);
+         case GGML_OP_TOP_K:
++#if defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
++            // env switch for A/B: force the CPU top-k path (bit-exact reference)
++            if (getenv("GGML_CUDA_TOP_K_CPU") != nullptr) {
++                return op->src[0]->ne[0] <= 1024;
++            }
++            return true;
++#else
++            return op->src[0]->ne[0] <= 1024;
++#endif // defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
+         case GGML_OP_ARGSORT:
+ #ifndef GGML_CUDA_USE_CUB
+             return op->src[0]->ne[0] <= 1024;
+diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
+index 9681cd293..c7a0c8317 100644
+--- a/ggml/src/ggml-cuda/top-k.cu
++++ b/ggml/src/ggml-cuda/top-k.cu
+@@ -48,6 +48,168 @@ static int next_power_of_2(int x) {
+ 
+ #endif                            // CUB_TOP_K_AVAILABLE
+ 
++#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
++
++static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
++    const uint32_t bits = __float_as_uint(value);
++    const uint32_t mask = (uint32_t) (-(int32_t) (bits >> 31)) | 0x80000000U;
++    return bits ^ mask;
++}
++
++struct top_k_radix_state {
++    uint32_t prefix;
++    uint32_t prefix_mask;
++    int rank;
++    int greater_count;
++    int equal_count;
++};
++
++static __global__ void top_k_radix_init(top_k_radix_state * states, int nrows, int k) {
++    const int row = blockIdx.x * blockDim.x + threadIdx.x;
++    if (row < nrows) {
++        states[row] = {0, 0, k, 0, 0};
++    }
++}
++
++template<int BLOCK_SIZE, int RADIX_BITS>
++static __global__ void top_k_radix_histogram(
++        const float * __restrict__ src,
++        const top_k_radix_state * __restrict__ states,
++        int * __restrict__ block_histograms,
++        int ncols,
++        int blocks_per_row,
++        int shift) {
++    constexpr int NBINS = 1 << RADIX_BITS;
++
++    const int row = blockIdx.x / blocks_per_row;
++    const int row_block = blockIdx.x % blocks_per_row;
++    const int tid = threadIdx.x;
++    const float * row_src = src + (size_t) row * ncols;
++    __shared__ int histogram[NBINS];
++
++    histogram[tid] = 0;
++    __syncthreads();
++
++    const top_k_radix_state state = states[row];
++    for (int col = row_block * BLOCK_SIZE + tid;
++         col < ncols;
++         col += blocks_per_row * BLOCK_SIZE) {
++        const uint32_t key = top_k_float_to_ordered(row_src[col]);
++        if ((key & state.prefix_mask) == state.prefix) {
++            atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
++        }
++    }
++    __syncthreads();
++
++    const size_t histogram_offset =
++        ((size_t) row * blocks_per_row + row_block) * NBINS;
++    block_histograms[histogram_offset + tid] = histogram[tid];
++}
++
++template<int BLOCK_SIZE, int RADIX_BITS>
++static __global__ void top_k_radix_select(
++        const int * __restrict__ block_histograms,
++        top_k_radix_state * __restrict__ states,
++        int blocks_per_row,
++        int shift) {
++    constexpr int NBINS = 1 << RADIX_BITS;
++
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++    __shared__ int histogram[NBINS];
++
++    int count = 0;
++    for (int row_block = 0; row_block < blocks_per_row; ++row_block) {
++        const size_t offset = ((size_t) row * blocks_per_row + row_block) * NBINS;
++        count += block_histograms[offset + tid];
++    }
++    histogram[tid] = count;
++    __syncthreads();
++
++    if (tid == 0) {
++        top_k_radix_state state = states[row];
++        int bin = NBINS - 1;
++        while (bin > 0 && histogram[bin] < state.rank) {
++            state.rank -= histogram[bin--];
++        }
++        state.prefix |= (uint32_t) bin << shift;
++        state.prefix_mask |= (uint32_t) (NBINS - 1) << shift;
++        states[row] = state;
++    }
++}
++
++static __global__ void top_k_radix_reset_counters(top_k_radix_state * states, int nrows) {
++    const int row = blockIdx.x * blockDim.x + threadIdx.x;
++    if (row < nrows) {
++        states[row].greater_count = 0;
++        states[row].equal_count = 0;
++    }
++}
++
++template<int BLOCK_SIZE>
++static __global__ void top_k_radix_gather(
++        const float * __restrict__ src,
++        int * __restrict__ dst,
++        top_k_radix_state * __restrict__ states,
++        int ncols,
++        int k,
++        int blocks_per_row) {
++    const int row = blockIdx.x / blocks_per_row;
++    const int row_block = blockIdx.x % blocks_per_row;
++    const int tid = threadIdx.x;
++    const float * row_src = src + (size_t) row * ncols;
++    int * row_dst = dst + (size_t) row * k;
++    top_k_radix_state * state = &states[row];
++
++    for (int col = row_block * BLOCK_SIZE + tid;
++         col < ncols;
++         col += blocks_per_row * BLOCK_SIZE) {
++        const uint32_t key = top_k_float_to_ordered(row_src[col]);
++        if (key > state->prefix) {
++            const int pos = atomicAdd(&state->greater_count, 1);
++            row_dst[pos] = col;
++        } else if (key == state->prefix) {
++            const int pos = atomicAdd(&state->equal_count, 1);
++            if (pos < state->rank) {
++                row_dst[k - state->rank + pos] = col;
++            }
++        }
++    }
++}
++
++static void top_k_radix_cuda(
++        ggml_cuda_pool & pool,
++        const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
++    constexpr int BLOCK_SIZE = 256;
++    constexpr int RADIX_BITS = 8;
++    constexpr int NBINS = 1 << RADIX_BITS;
++    const int blocks_per_row = std::min((ncols + 1023) / 1024, 64);
++
++    ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool, nrows);
++    ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
++    top_k_radix_state * states = states_alloc.get();
++    int * histograms = histograms_alloc.get();
++
++    top_k_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows, k);
++
++    const dim3 row_grid(blocks_per_row * nrows);
++    for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
++        top_k_radix_histogram<BLOCK_SIZE, RADIX_BITS>
++            <<<row_grid, BLOCK_SIZE, 0, stream>>>(
++                src, states, histograms, ncols, blocks_per_row, shift);
++        top_k_radix_select<BLOCK_SIZE, RADIX_BITS>
++            <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
++    }
++
++    top_k_radix_reset_counters
++        <<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows);
++    top_k_radix_gather<BLOCK_SIZE>
++        <<<row_grid, BLOCK_SIZE, 0, stream>>>(
++            src, dst, states, ncols, k, blocks_per_row);
++}
++
++#endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
++
+ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0   = dst->src[0];
+     const float *       src0_d = (const float *) src0->data;
+@@ -96,10 +258,18 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+         dst_d  += k     * iter_nrows;
+     }
+ #else                             // GGML_CUDA_USE_CUB
+-    ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
+-    int *                     tmp_dst = temp_dst_alloc.get();
+-    argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
+-    CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
+-                                 cudaMemcpyDeviceToDevice, stream));
++#if defined(GGML_USE_HIP)
++    if (ncols > 1024) {
++        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
++    } else {
++#endif // defined(GGML_USE_HIP)
++        ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
++        int *                     tmp_dst = temp_dst_alloc.get();
++        argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
++        CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
++                                     cudaMemcpyDeviceToDevice, stream));
++#if defined(GGML_USE_HIP)
++    }
++#endif // defined(GGML_USE_HIP)
+ #endif
+ }
