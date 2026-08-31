@@ -1,0 +1,68 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 6965879fa..d18da0db3 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4589,7 +4589,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+     const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
+     std::vector<cudaEvent_t> op_ev0;
+     std::vector<cudaEvent_t> op_ev1;
+-    std::vector<std::pair<const ggml_tensor *, int>> op_nodes;
++    std::vector<std::tuple<const ggml_tensor *, int, bool>> op_nodes;
+     if (op_timing) {
+         op_ev0.resize(cgraph->n_nodes);
+         op_ev1.resize(cgraph->n_nodes);
+@@ -4742,9 +4742,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++                if (op_timing) {
++                    // bracket the fusion dispatch: a matching try_fuse launches its own
++                    // fused kernel and the per-node events below are skipped
++                    CUDA_CHECK(cudaEventRecord(op_ev0[i], cuda_ctx->stream()));
++                }
++
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
++                    if (op_timing) {
++                        CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
++                        op_nodes.emplace_back(node, i, true);
++                    }
+ #ifdef GGML_CUDA_DEBUG
+                     const int last_fused = i + nodes_to_skip;
+                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
+@@ -4754,6 +4764,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     i += nodes_to_skip;
+                     continue;
+                 }
++
+ #ifndef NDEBUG
+                 // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
+                 // node's output on the host-visible buffer, which the compute path
+@@ -4783,7 +4794,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+                 if (op_timing) {
+                     CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
+-                    op_nodes.emplace_back(node, i);
++                    op_nodes.emplace_back(node, i, false);
+                 }
+ 
+                 if (!is_concurrent_event_active) {
+@@ -4846,14 +4857,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+         static std::map<std::string, int>    op_cnt_total;
+         std::map<std::string, double> op_ms;
+         std::map<std::string, int>    op_cnt;
+-        for (const auto & [node, idx] : op_nodes) {
++        for (const auto & [node, idx, fused] : op_nodes) {
+             float ms = 0.0f;
+ #ifdef GGML_USE_HIP
+             CUDA_CHECK(hipEventElapsedTime(&ms, (hipEvent_t) op_ev0[idx], (hipEvent_t) op_ev1[idx]));
+ #else
+             CUDA_CHECK(cudaEventElapsedTime(&ms, op_ev0[idx], op_ev1[idx]));
+ #endif
+-            std::string key = ggml_op_name(node->op);
++            std::string key = fused ? "FUSED " : "";
++            key += ggml_op_name(node->op);
+             key += " ";
+             key += node->name;
+             if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && node->src[1] != nullptr) {
