@@ -182,3 +182,48 @@ Backup patches in ~/llama-cpp-rdna-boosts/wip/qwen35moe-prefill/patches/:
   gather itself is slow (bigger table, slower storage, or a gather-bound
   config). It does NOT help with depth - the depth-scaled costs (QSA top-k
   [now GPU], KQ mask build, attention) dominate at 200K, not the ngram table.
+
+## UPDATE 5: prefill tuning - where we are, what remains (analysis)
+
+**State (PLE-free, GPU radix top-k, branch qwen4exp @ d2548f9af):**
+pp512 1492 | pp2048 2028 | pp4096 2031 | pp8192 1935 | pp16384 1716 |
+pp32768 1381 | pp65536 995 | tg128 40.1. CPU burn at 16K = 140% (was 1260%).
+
+**What was already captured (all the big CPU-side wins):**
+- QSA top-k -> GPU radix (0.5-0.7 ms/node, was the 16-core burn)
+- ub2048 amortization, prefill CUDA-graph revert, WMMA FA off, MoE fusion,
+  managed-ngrams, PR #27992 (O(log n) prev tokens)
+- Verified: GET_ROWS (ngram gather) is FLAT with depth (2.8ms both 16K/64K)
+
+**The remaining depth-scaler: FLASH_ATTN over the FULL KV cache.**
+build_attn_qsa (qwen4exp.cpp:668) builds a full [n_kv, n_batch] KQ mask
+(-INFINITY, then unmasks the 2048 top-k rows via set_rows) and runs
+ggml_flash_attn_ext(q, k, v, kq_mask) over ALL n_kv cells. The top-k
+selection only zeroes scores - the kernel still touches every cell.
+OP_TIMING: FLASH_ATTN_EXT 35.7ms @ 16K -> 158ms @ 64K (4.4x per 4x ctx,
+linear in n_kv). At 64K that is ~92% of per-ubatch time; at 16K ~36%.
+The mask FILL/SET_ROWS ops themselves are small (fused, <1.5ms).
+
+**Anomaly to re-check**: MUL_MAT node_56 [2560x15x2048] shows 625ms flat
+across depths with OP_TIMING (95% GPU) - a 78 MFLOP matmul cannot take
+625ms; likely a graph-split/allreduce barrier sync point counted inside
+the first op's window. Not a depth scaler, but worth a look later.
+
+**The 200K-enabling fix (next big prefill project): sparse attention.**
+QSA already computes top-2048 of n_kv per token - but the attention step
+ignores that and reads all n_kv. A sparse path that gathers only the
+top-k K/V cells (per-token gather, then flash-attend over 2048 cells
+instead of n_kv) would:
+- 16K: 35.7ms -> ~4-5ms per layer
+- 64K: 158ms -> ~5ms (attention goes from 92% to ~5% of ubatch time)
+- 200K: attention stays constant ~5ms instead of 12.5x the 16K cost
+This is THE change that makes 200K prefill workable (attention is the
+only remaining linear-in-n_kv op besides the top-k itself, which is
+already GPU).
+ggml has NO 2D/per-token gather op (get_rows is single-index-per-column)
+and no sparse flash-attn - a custom op/kernel is required (user is
+willing to roll own kernels on HIP).
+
+Estimated impact at 64K if attention drops to ~5ms/layer: ubatch time
+~2.06s -> ~0.3s (995 -> ~5000+ t/s) - but the node_56 barrier anomaly
+and remaining fixed costs must be re-measured before trusting that.
