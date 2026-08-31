@@ -1,31 +1,38 @@
 # PLAN (b): fused MoE gate+up+GLU kernel for the routed experts
 
-## Status: OPEN - the prefill fused-forward is NOT built (2026-08-30)
+## Status: Milestone 1 (graph verification) DONE (2026-08-31)
 
-What the decode investigation changed for this plan:
+Verified against the real prefill graph (pp16384, ub=2048, op timing dump):
 
-1. **The decode half is already fused.** On the mmvq (decode) path the
-   gate+up runs as ONE fused mmid kernel (the merged `ffn_gate_up_exps`
-   tensor + GLU epilogue) and the down+shared-gate+residual as another
-   (`shexp_down_gate`). The `mul_mat_id_glu_ops` dead check in
-   `ggml_cuda_can_fuse` stays dead for Q6_K because the MMQ path has no
-   fused forward - which is exactly what this plan builds.
-2. **The routed-down decode latency was the mmvq K-split idling, not the
-   launch count** - fixed by patch 0002 (mmvq short-K item-split, +6-7%
-   decode, spec-decode purity preserved). That does NOT touch the prefill
-   MMQ path (n_tokens >= 6 goes to MMQ, not mmvq).
-3. **The Item 3 router->topk fusion was measured and REVERTED**
-   (item3-router-fusion-failed.md): serializing the expert dots into one
-   warp is ~17x slower than the mmvq. Do not fuse the router into topk.
-
-So the remaining work is exactly the original proposal, now with the
-prefill cost structure confirmed: at ub=2048 the `MUL_MAT_ID` block is
-41% of prefill (0.094 ms/tok), 120 mmid ops per step (gate+up merged =
-80 visible: 40 gate_up + 40 down), each with its own ids-sort and src1
-quantize. A fused gate+up (MMQ-style, one kernel, shared sort/quantize,
-GLU epilogue) plus optionally folding the down in saves the fixed costs.
-Expected: 15-25% of the mmid block ~ 6-10% of prefill at ub=2048; more
-at ub=512 where the fixed overheads dominate.
+1. **Separate tensors, separate path**: the GGUF has separate
+   `ffn_gate_exps`/`ffn_up_exps` (no `ffn_gate_up_exps` merged tensor), so
+   `create_tensor_gate_up_exps` falls back and `build_moe_ffn` takes the
+   separate path: `MUL_MAT_ID(gate)` + `MUL_MAT_ID(up)` + `SWIGLU_SPLIT`
+   per layer. Node order is gate-first in the cgraph (the decode dump shows
+   the FUSED triple anchored at `ffn_moe_gate`), matching the
+   `mul_mat_id_glu_ops` = {MUL_MAT_ID, MUL_MAT_ID, GLU} assumption.
+2. **Shapes**: gate/up weights [K=2048, n_ff=512, n_expert=256] Q6_K
+   (note: K=2048 = n_embd, NOT 2560 as this plan originally said); both
+   share src1=`cur` and src2=`selected_experts`. `ggml_cuda_should_fuse_mul_mat`
+   passes (same type/shape/stride, same src1/src2, swiglu not swapped).
+3. **Weights-scale MUL is separate**: `ffn_moe_weighted` (expert probs x
+   down output) is applied AFTER the GLU/down, so the fused kernel does not
+   touch it. Confirmed in build_moe_ffn.
+4. **qwen4exp**: same build_moe_ffn hook (same call args, same fallback).
+5. **Dispatch gap confirmed**: try_fuse's {op, op, GLU} branch only
+   dispatches `mul_mat_vec_q`/`mul_mat_vec_f` (mmvq: ne[1]<=8, or F32/F16
+   src0). Prefill (ne=2048, Q6_K) falls through to 3 separate ops. This is
+   the gap the fused MMQ kernel fills.
+6. **Win estimate REVISED DOWN (measured, not modeled)**: at ub=2048 the
+   deepest eval (485.8 ms) shows gate 12.8% + up 13.3% + down 13.9% =
+   ~40% mmid block, but SWIGLU_SPLIT itself is only 1.54% (7.5 ms) and the
+   gate/up round-trip traffic is ~2.3% of eval. The MMQ kernels are
+   compute/bandwidth-bound, NOT launch/sort-bound (first gate op 5.9 ms =
+   cold, later ones 2.2-2.8 ms: overhead is once per eval, not per op).
+   Realistic fused win: ~2-3% at ub=2048 (eliminate the GLU pass + gate
+   round-trip + shared sort/quantize), more at ub=512 where the fixed
+   costs are proportionally larger. The plan's original 6-10% was too
+   optimistic; do not oversell the prototype result.
 
 ## Why there is room
 
