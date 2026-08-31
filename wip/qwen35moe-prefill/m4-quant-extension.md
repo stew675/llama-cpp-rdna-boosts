@@ -10,7 +10,7 @@ from patch 0003). Measured on Qwen3.6-35B-A3B:
 | **Q4_K** | **3803 vs 3539 (+7.5%)** | **5705 vs 5400 (+5.6%)** | 4949 vs 4666 (+6.1%) |
 | **Q5_K** | **3536 vs 3284 (+7.7%)** | **5467 vs 5206 (+5.0%)** | 4817 vs 4566 (+5.5%) |
 | **Q6_K** | +14-16% (prior) | +6.3% (prior) | +5.8% (prior) |
-| Q8_0 | untested single-GPU (needs 2 GPUs, --split-mode tensor) | | |
+| Q8_0 | **+8.4% pp512, +8.1% pp2048** (2-GPU tensor split; see q8-tensor-split-result.md) | +8.1% | +7.0% |
 | IQ4_XS | **-3.9% (REJECTED, excluded)** | neutral | neutral |
 
 All enabled types: bit-exact (536M logits, 0 diff), decode unchanged
@@ -88,6 +88,5 @@ vs bench (358ms) agree within noise.
 
 ## Remaining
 
-- Q8_0 2-GPU tensor-split validation (needs --split-mode tensor per
-  handoff; model is 35 GiB > 32 GiB single GPU)
 - M5: qwen4exp cross-validation
+- True-Q3_K_M (no hidden IQ quants) validation - download in progress
