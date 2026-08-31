@@ -44,3 +44,12 @@ Made the decode cost table in decode-phase1-results.md possible (FUSED
 MUL_MAT_ID gate+up 37 us, down+shared-gate 53 us, etc.). No behavioral
 change: the patch only adds event records when `GGML_CUDA_OP_TIMING` is
 set.
+
+## Patch 0002: mmvq short-K item-split (Phase 2 item 1)
+
+See `0002-mmvq-short-k-item-split.md`. Working-tree change in
+`ggml/src/ggml-cuda/mmvq.cu`. Decode +6-7% on qwen35moe (routed down
+kernel 53.2 -> 37.7 us); test-backend-ops 2065/2065 pass; prefill flat.
+The gate+up/down one-kernel merge (plan-fused-moe) remains a follow-up -
+the decode data showed the down's latency is the K-split idling, which the
+item-split fixes more cheaply than a cooperative-launch merge.
