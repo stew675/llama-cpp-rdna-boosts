@@ -1,6 +1,33 @@
 # PLAN (b): fused MoE gate+up+GLU kernel for the routed experts
 
-## Status: Milestone 1 (graph verification) DONE (2026-08-31)
+## Status: Milestones 1-3 DONE, Milestone 4 in progress (2026-08-31)
+
+Built, measured, committed (patch 0003, boosts `72605d1`): the prefill
+{MUL_MAT_ID(gate), MUL_MAT_ID(up), GLU} triple now runs as ONE MMQ kernel
+reading both weight streams + GLU epilogue in registers. Q6_K only.
+
+Results (J<=64 cap): pp512 ub=512 +14-16%, pp2048 ub=2048 +6.3%, pp16384
++5.8%, pp32768 +4.9% - depth-flat, beats the milestone-1 ~3% revision.
+Bit-exact (536M floats 0 diff), full test-backend-ops passes, decode
+unchanged (98 t/s, mmvq owns it). Full detail: fused-moe-mmq-result.md,
+milestone4-handoff.md.
+
+Key implementation facts (complete recipe in milestone4-handoff.md):
+has_gate template on mul_mat_q_process_tile/mul_mat_q; J<=64 cap for the
+fused kernel (doubled accumulator + WMMA tiles spill at J=128: 256 VGPR +
+14 spills); gate switch in mmq.cu routes on fusion->gate; try_fuse MMQ arm
+with GGML_CUDA_DISABLE_MOE_MMQ_FUSION opt-out; DECL_MMQ_CASE_GATE +
+generator MMQ_GATE_TYPES list.
+
+## Remaining
+
+- M4 (next): enable Q4_K, Q5_K, Q8_0 - 3 steps per type (gate switch case,
+  DECL in the instance file + generator list, bit-exact + bench validation).
+- M5: qwen4exp cross-validation; server --ubatch-size 2048 deployment test.
+
+## Historical record
+
+### Milestone 1 (graph verification, boosts `9f05cf8`)
 
 Verified against the real prefill graph (pp16384, ub=2048, op timing dump):
 
@@ -23,16 +50,12 @@ Verified against the real prefill graph (pp16384, ub=2048, op timing dump):
    dispatches `mul_mat_vec_q`/`mul_mat_vec_f` (mmvq: ne[1]<=8, or F32/F16
    src0). Prefill (ne=2048, Q6_K) falls through to 3 separate ops. This is
    the gap the fused MMQ kernel fills.
-6. **Win estimate REVISED DOWN (measured, not modeled)**: at ub=2048 the
-   deepest eval (485.8 ms) shows gate 12.8% + up 13.3% + down 13.9% =
-   ~40% mmid block, but SWIGLU_SPLIT itself is only 1.54% (7.5 ms) and the
-   gate/up round-trip traffic is ~2.3% of eval. The MMQ kernels are
-   compute/bandwidth-bound, NOT launch/sort-bound (first gate op 5.9 ms =
-   cold, later ones 2.2-2.8 ms: overhead is once per eval, not per op).
-   Realistic fused win: ~2-3% at ub=2048 (eliminate the GLU pass + gate
-   round-trip + shared sort/quantize), more at ub=512 where the fixed
-   costs are proportionally larger. The plan's original 6-10% was too
-   optimistic; do not oversell the prototype result.
+6. **Win estimate REVISED DOWN then UP**: milestone-1 measured SWIGLU_SPLIT
+   at only 1.54% and the round-trip ~2.3%, so the plan predicted ~2-3%.
+   The actual fused kernel measured 6-16% because the win is the fused
+   kernel's tile behavior at small J (J<=64 cap avoids the J=128 register
+   spill) plus eliminating the GLU pass/round-trip, not just the shared
+   sort/quantize/launch.
 
 ## Why there is room
 
