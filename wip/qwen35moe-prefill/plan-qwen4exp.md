@@ -1,8 +1,43 @@
 # PLAN: qwen4exp (Qwen3.8-Flash-Next) performance investigation
 
-Status: PLANNING (2026-08-31). Goals, hypotheses, and the execution order
-for the qwen4exp work. This file is the tracking doc; milestones get
-checked off here as work proceeds.
+Status: ACTIVE (2026-08-31) - ENV ROOT CAUSE FOUND, see qwen4exp-handoff-2026-08-31.md
+
+## 0.6 Environment root cause (2026-08-31, mid-session)
+
+- The 604->364 swing on the same binary was GPU runtime power-management
+  cycling (527 SMU resume cycles/day; all 3 R9700s suspend/resuming every
+  1-5 min). FIXED: echo on > .../power/control for 0000:{03,06,09}:00.0.
+- /tmp is tmpfs and held 74 GB of stale logitdump .bin files; freed to
+  0.3 GB -> free RAM 8 -> 81 GB. Both fixes together: pp16384 460->655
+  t/s (beats the 570-620 reference), pp512 975, tg128 39.5.
+- NEW bottleneck: host CPU (90-95% vs ~60% GPU). Per-ubatch PLE
+  predecessor lookup llama_kv_cache::get_prev_tokens() scans all KV cells
+  - O(n_kv) per ubatch. PR #27992 (kv-cache (seq,pos) cell index, O(log n))
+  is the fix; open upstream. Related #27941, #27977.
+- The 570-620 reference and the >600 claim are now reproduced/beaten with
+  the clean env. The "regression" was environmental + block-11 + missing
+  ngram patch, not a code regression in the MoE fusion work.
+
+## 0.5 Historical context (user-provided, KEY for the regression hunt)
+
+- GOOD: >600 t/s prefill, ~39 t/s gen observed on **tip of master +
+  managed-ngrams patch** (the managed-ngrams work measured 570-620 tok/s
+  at 16K on that same combination; mmap-lazy and managed paths were
+  bit-identical and equal-speed THERE).
+- BAD: ~350 t/s prefill, ~21 t/s gen observed on **rdna-boosts branch
+  WITHOUT the managed-ngrams patch**.
+- Two variables differ between GOOD and BAD: (1) the base (master vs
+  rdna-boosts with blocks 08-12 + MoE fusion work) and (2) the ngram
+  patch. This refines H1: the regression is in the rdna-boosts base and/
+  or its interaction with the ngram path, NOT a config artifact.
+- On master the ngram path (mmap-lazy vs managed) was performance-
+  invisible; on rdna-boosts this must be RE-VERIFIED before assuming the
+  ngram patch is neutral. Block 11 (skip graphs for multi-token prefill)
+  and block 08 (fused-core prefill) are the prime suspects for a base-
+  level regression on THIS model; the fused gate+up MMQ (Q4_K cap 96,
+  512 experts, n_ff_exp maybe != 512) is untested on qwen4exp.
+- Target: rdna-boosts + all MoE work + managed-ngrams -> >1000 t/s
+  prefill, ~50 t/s gen at ~16K context.
 
 ## 0. Model facts (verified, from provenance + runtime)
 
@@ -41,10 +76,13 @@ checked off here as work proceeds.
 
 ## 2. Working assumptions / hypotheses (to test, not to trust)
 
-- H1: the 600->350 regression is a CONFIG difference, not a code
-  regression. First test may have used different ubatch/context/split
-  settings, or ran before the managed-ngrams work, or on a different
-  base. Reproduce both configs before touching code.
+- H1 (REVISED per user history): the 600->350 regression is in the
+  rdna-boosts base (blocks 08-12) and/or the missing ngram patch, NOT a
+  config artifact. GOOD = master+ngram-patch, BAD = rdna-boosts w/o
+  patch. Prime suspects: block 11 (skip graphs on multi-token prefill),
+  block 08 (fused-core prefill), fused gate+up MMQ on Q4_K/512 experts.
+  Decompose: (a) A/B fusion env toggle on rdna-boosts, (b) compare ngram
+  path behavior with/without the patch on rdna-boosts.
 - H2: the ngram gather (host-side per-ubatch hash + CPU ggml_get_rows on
   IQ4_NL) is a serialization point in the graph. The managed-ngrams
   numbers (570-620 tok/s FLAT across budgets) suggest it was NOT the
