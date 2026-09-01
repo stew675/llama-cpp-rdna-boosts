@@ -64,6 +64,10 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
   server config.
 - **RDNA4-only gate:** block 12 refuses to init off gfx1200/gfx1201 and
   falls back to RCCL (community RDNA3 verification pending).
+- **Block-12 AR_PROFILE fix (2026-09-01, PR #8):** AR-profile `devices[]`
+  init order fixed — `GGML_CUDA_AR_PROFILE=1` no longer faults GPU 1
+  under MTP (pre-fix reproduced on 3x R9700; post-fix clean, profiler
+  dumps on every device).  Regenerated into the set; coherence unchanged.
 
 ## Layout
 

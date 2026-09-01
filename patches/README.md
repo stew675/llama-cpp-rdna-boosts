@@ -93,6 +93,19 @@ re-verified 2026-09-01 on the `0eadefebd` re-base).
   27 now go through `CUDA_CHECK` (upstream house style, incl. teardown);
   three dead WIP items removed.  The ggml-hip build emits ZERO warnings
   from this patch.
+- **AR_PROFILE devices[] init fix** (2026-09-01, PR #8, integrated):
+  `ggml_cuda_ar_pipeline_init` now copies the caller's `devices[]` into
+  the pipeline BEFORE the per-device profiler hipMallocs.  With
+  `GGML_CUDA_AR_PROFILE=1` the buffers were allocated while `devices[]`
+  was still zero-filled, so every prof buffer landed on GPU 0 and MTP's
+  second pipeline init (draft context) faulted GPU 1 (gfx1201).  A/B on
+  3x R9700 (2-GPU, internal AR, MTP n-max 3, `-c 32768`): pre-fix
+  reproduced the fault (`Memory Fault Error ... GPU index: 1, kernel:
+  ggml_cuda_ar_kernel<float, __hip_bfloat16>`); post-fix runs clean with
+  teardown dumps on dev0 AND dev1 in both pipelines, same-seed coherence
+  IDENTICAL to the pre-fix golden.  Default serving (profiler off) is
+  unaffected.  Do not ship `AR_PROFILE=1` as a daily env — this only
+  makes the debug flag safe.
 
 ## Server config (the +22% deployment win)
 

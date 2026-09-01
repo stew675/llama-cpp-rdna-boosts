@@ -7,22 +7,22 @@
 #   baseline-sha  the upstream baseline the patches are generated against
 #                 (default: 0eadefebd, see MANIFESTS.md)
 #   blocks-tip    the fork commit carrying blocks 01-11 (default:
-#                 d7bdd0a91, the re-based block-11 commit)
+#                 43f5ab71d, the block-11 commit)
 #
 # Blocks 01-11 are the fork commits baseline-sha..blocks-tip, exported with
 # `git format-patch` (the canonical, verified form).  Block 12 (the hybrid
 # HIP all-reduce + RDNA4 gate) is the fork's delta vs blocks-tip over the
 # four allreduce files (allreduce-hip.cu/allreduce.cu/allreduce.cuh/
 # ggml-cuda.cu).  Block 12 is committed on the fork branch (tip
-# 4fa92f0ae) and `git diff <blocks-tip>` picks it up from the clean tree;
+# 93e8b09bb) and `git diff <blocks-tip>` picks it up from the clean tree;
 # it also works if the block-12 changes are instead uncommitted in the
-# fork's working tree. (Current fork: block 12 committed as ce9182473.)
+# fork's working tree. (Current fork: block 12 committed as 93e8b09bb.)
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
 BASELINE="${2:-0eadefebd}"
-TIP="${3:-d7bdd0a91}"
+TIP="${3:-43f5ab71d}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then

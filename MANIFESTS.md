@@ -8,7 +8,7 @@ The **current delivery** is a **12-patch set** against the fork point
 `0eadefebd` (re-based 2026-09-01; previously `a7cc83bba`): blocks 01-11
 (`patches/0001-…0011-…`, format-patch of the
 fork's `rdna-boosts` block commits — the re-based regeneration
-`217e33ba4..d7bdd0a91`; the original fork hashes
+`b25bc8a9c..43f5ab71d` (block 12 committed as `93e8b09bb`); the original fork hashes
 `2b7a135cb..f6f8f6778` are preserved on the `old-rdna-boosts` branch, the
 2026-08-30 `a7cc83bba`-based rebuild on `rdna-boosts-a7cc83bba`) plus
 **block 12** (`patches/12-hybrid-allreduce-hip.patch`, the hybrid HIP
@@ -96,6 +96,38 @@ llama-cli same-seed coherence IDENTICAL to the pre-re-base known-good
 build, tg64 38.12 / tg512 41.08 unchanged (code-identical content;
 re-measured 2026-09-01: sim 36.87±4.83 / 40.72±1.02, prs 37.92±4.67 /
 40.90±0.86 — within noise).
+
+### AR_PROFILE devices[] init fix + fork re-sync (2026-09-01)
+
+- **Fix (PR #8, integrated into block 12 + the fork):** in
+  `allreduce-hip.cu`, `p->devices[]` is now filled from the caller list
+  BEFORE the per-device profiler hipMallocs.  Under
+  `GGML_CUDA_AR_PROFILE=1` the buffers were previously allocated while
+  `devices[]` was still zero-filled, so every buffer landed on GPU 0 and
+  MTP's second pipeline init (draft context) faulted/hung GPU 1
+  (gfx1201).  A/B on 3x R9700 (2-GPU, internal AR, MTP n-max 3,
+  `-c 32768`, AR_PROFILE=1): pre-fix reproduced — GPU-1 memory fault in
+  `ggml_cuda_ar_kernel` (exit 134); post-fix runs clean with teardown
+  profiler dumps on dev0 AND dev1 in both pipelines; llama-cli same-seed
+  coherence IDENTICAL to the pre-fix golden (default serving, profiler
+  off, is byte-for-byte unchanged).
+- **Fork re-sync:** the fork's `rdna-boosts` was rebuilt as a clean
+  12-commit branch directly on `0eadefebd` (block 01 `b25bc8a9c` .. block
+  11 `43f5ab71d`, block 12 `93e8b09bb`).  The previous fork rebuild had
+  picked up upstream master's `kleidiai` docs commit `518b76236` as a
+  13th base commit; that upstream commit is NOT part of the block set
+  (it remains in upstream `origin/master`) and was dropped from the
+  branch.
+- **Set regenerated:** `scripts/make-patches.sh` (base `0eadefebd`,
+  blocks tip `43f5ab71d`) re-exported blocks 01-11 (content-identical to
+  the previous delivery — only the `From <sha>` headers moved) + the
+  block-12 delta (with the AR_PROFILE fix); `rdna-boosts-all.patch`
+  regenerated as `git diff 0eadefebd..93e8b09bb`.
+- **Re-verified 2026-09-01:** clean-apply sim on a fresh clone at
+  `0eadefebd` — `scripts/apply-all.sh` applied all 12 blocks with ZERO
+  whitespace warnings and the applied tree is byte-identical to the fork
+  tip (`d42fc80…`); the fork tree was fully built (ROCm 7.14 gfx1201,
+  clean) and coherence-tested as part of the A/B above.
 
 ### Re-baseline to a7cc83bba (2026-08-30, superseded)
 

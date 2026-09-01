@@ -26,8 +26,8 @@ All 12 patches are generated against **llama.cpp upstream master at
 `0eadefebd`** (re-based 2026-09-01 from `a7cc83bba`; dated records at the
 bottom of this file): blocks 01-11 = the fork's `rdna-boosts` block
 commits (originally `2b7a135cb..f6f8f6778`, preserved on
-`old-rdna-boosts`; the re-based regeneration is `217e33ba4..d7bdd0a91`,
-block 12 committed as `ce9182473`; the `a7cc83bba`-based rebuild is
+`old-rdna-boosts`; the current 12-commit branch is `b25bc8a9c..43f5ab71d`
+with block 12 committed as `93e8b09bb`; the `a7cc83bba`-based rebuild is
 preserved on `rdna-boosts-a7cc83bba`); block 12 = the hybrid HIP all-reduce
 delta over four files (`allreduce-hip.cu` new, `allreduce.cu`,
 `allreduce.cuh`, `ggml-cuda.cu`), including the RDNA4-only gate.
@@ -210,4 +210,28 @@ per the drift policy step 3:
 - **Tooling fix:** `scripts/make-patches.sh`'s checkout check now
   accepts git worktrees (`[ ! -e "$FORK/.git" ]` instead of `-d`),
   which is how the fork rebuild is hosted.
+
+## AR_PROFILE devices[] init fix + fork re-sync (2026-09-01)
+
+- **Fix:** block 12's `allreduce-hip.cu` now fills `p->devices[]` from the
+  caller list before the per-device profiler hipMallocs (PR #8).  With
+  `GGML_CUDA_AR_PROFILE=1` the buffers were allocated while `devices[]`
+  was still zero-filled, so all landed on GPU 0 and MTP's second pipeline
+  (draft context) faulted/hung GPU 1 on gfx1201.  Pre-fix A/B reproduced
+  the fault on 3x R9700 (2-GPU, internal AR, MTP n-max 3, `-c 32768`);
+  post-fix runs clean with profiler teardown dumps on every device;
+  coherence IDENTICAL to the pre-fix golden.  Integrated into the fork's
+  block-12 commit and regenerated into
+  `patches/12-hybrid-allreduce-hip.patch` + `rdna-boosts-all.patch`.
+- **Fork re-sync:** the fork branch was rebuilt as a 12-commit branch
+  directly on `0eadefebd` (block 01 `b25bc8a9c` .. block 11 `43f5ab71d`,
+  block 12 `93e8b09bb`), dropping the upstream `kleidiai` docs commit
+  `518b76236` that had crept into the previous rebuild (upstream-only;
+  remains in `origin/master`).  The delivery contract is unchanged: 12
+  blocks applied to a fresh checkout at `0eadefebd`.
+- **Re-verified 2026-09-01:** clean-apply sim (`apply-all.sh` on a fresh
+  clone at `0eadefebd`): zero whitespace warnings, applied tree
+  byte-identical to the fork tip (`d42fc80…`).  Fork build clean (ROCm
+  7.14 gfx1201, `cmake --build build-rocm --config Release -j 16 --
+  VERBOSE=1`) + coherence + the A/B above.
 

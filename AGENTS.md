@@ -8,7 +8,7 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **12-patch set** that applies to a clean
-llama.cpp checkout at the fork point **`a7cc83bba`** (re-based 2026-08-30; previously `17252c769`).
+llama.cpp checkout at the fork point **`0eadefebd`** (re-based 2026-09-01; previously `a7cc83bba`).
 
 - Blocks **01-11** (`patches/0001-…0011-…`): MTP draft depth, fused chunked
   GDN, BF16 KV, WMMA flash-attn, CPU bit-identical decode, host-buffer
@@ -22,8 +22,8 @@ llama.cpp checkout at the fork point **`a7cc83bba`** (re-based 2026-08-30; previ
 
 The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts` — re-based 2026-09-01 onto
-upstream master `0eadefebd` (12-commit branch; blocks tip `d7bdd0a91`,
-block 12 committed as `ce9182473`; the 2026-08-30 `a7cc83bba`-based
+upstream master `0eadefebd` (12-commit branch; blocks tip `43f5ab71d`,
+block 12 committed as `93e8b09bb`; the 2026-08-30 `a7cc83bba`-based
 rebuild — tip `4fa92f0ae` — is superseded and preserved on the
 `rdna-boosts-a7cc83bba` branch; the 2026-08-29 whitespace-clean
 rebuild `12d10267b`/`cc985ba9a` against `17252c769` is also superseded). The
@@ -95,6 +95,14 @@ explicitly requests it.**
   whitespace warnings (the 8 inert trailing-whitespace lines + 1 EOF blank
   line were removed at the source 2026-08-29 and the set regenerated;
   trees are otherwise byte-identical — verified).
+- **Block-12 AR_PROFILE init fix (2026-09-01, PR #8, integrated):**
+  `devices[]` is filled from the caller list before the profiler
+  hipMallocs — with `GGML_CUDA_AR_PROFILE=1` the buffers were allocated
+  while the array was still zero-filled, so every buffer landed on GPU 0
+  and MTP's second pipeline (draft context) faulted GPU 1 (gfx1201).
+  Pre-fix reproduced (GPU-1 memory fault in `ggml_cuda_ar_kernel`);
+  post-fix runs clean with teardown dumps on every device; default
+  serving is byte-for-byte unchanged.
 - **Verified numbers (2026-09-01 re-base, unchanged):** clean-apply build
   tg64 38.12 / tg512 41.08; depth-16384 3-GPU hybrid 38.71 t/s
   (unpinned); 2-GPU (1,2) 31.79.
@@ -127,8 +135,8 @@ Diff the output against a known-good build (or against RCCL via
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `0eadefebd`,
-blocks tip `d7bdd0a91`): `git format-patch` the block commits + the
-block-12 delta for the 12th (block 12 is committed as `ce9182473`; the
+blocks tip `43f5ab71d`): `git format-patch` the block commits + the
+block-12 delta for the 12th (block 12 is committed as `93e8b09bb`; the
 script's `git diff <blocks-tip>` picks it up from the clean tree). Then
 re-verify the clean-apply simulation (worktree at the fork point,
 apply-all, build, coherence) before committing.

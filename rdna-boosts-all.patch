@@ -462,10 +462,10 @@ index 99b7d5afa..73e582acd 100644
  
 diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
 new file mode 100644
-index 000000000..16238b32a
+index 000000000..e46b4ab8c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/allreduce-hip.cu
-@@ -0,0 +1,1564 @@
+@@ -0,0 +1,1567 @@
 +#include "allreduce.cuh"
 +
 +#if defined(GGML_USE_HIP)
@@ -1258,6 +1258,12 @@ index 000000000..16238b32a
 +        GGML_LOG_WARN("%s: host-side lockstep pacing enabled (GGML_CUDA_AR_PACE=1); "
 +                      "poll peers' prev AR before enqueueing (WIP)\n", __func__);
 +    }
++    // devices[] must be filled before any per-device hipMalloc.  Profile
++    // alloc used p->devices[] while it was still zero, so every buffer
++    // landed on GPU 0 and MTP's second pipeline hung GPU 1 (gfx1201).
++    for (size_t i = 0; i < n_devices; ++i) {
++        p->devices[i] = devices[i];
++    }
 +    p->prof_enabled     = ggml_cuda_ar_env_u64("GGML_CUDA_AR_PROFILE", 0) != 0;
 +    if (p->prof_enabled) {
 +        GGML_LOG_WARN("%s: per-call profiling enabled (GGML_CUDA_AR_PROFILE=1); "
@@ -1273,9 +1279,6 @@ index 000000000..16238b32a
 +                return nullptr;
 +            }
 +        }
-+    }
-+    for (size_t i = 0; i < n_devices; ++i) {
-+        p->devices[i] = devices[i];
 +    }
 +
 +    // Per-device streams and event pools.
