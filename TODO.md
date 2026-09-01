@@ -3,6 +3,47 @@
 Cross-project tracker so important state survives context compaction.
 Each entry: status, why it matters, what "done" looks like, where the work lives.
 
+## Priority (next session)
+
+### [HIGHEST PRIORITY] qwen35moe MoE + multi-GPU decode hang (Q5_K/Q6_K)
+- Symptom: llama-bench 2-GPU tensor-split decode of qwen35moe hangs
+  (GPUs busy-wait one-at-a-time at 100%, no output, timeout-kill only).
+  Q3_K_M/Q4_K_M work (62 t/s); Q5_K_M/Q6_K hang. 1-GPU works (75 t/s).
+  Dense 27B Q8_0 2-GPU works. 3-GPU also hangs (same as 2-GPU).
+- Bisect (2026-09-01, 5 worktrees built + tested): hangs at EVERY point -
+  old verified base a7cc83bba (blocks 01-12), pre-41ef91f7c, pre-f8dbcd618
+  (pre-#27466), current upstream 0eadefebd, and the rdna-boosts fork tip.
+  NOT a regression from the 22 upstream commits. NOT PR #27466. NOT block
+  13 (reproduced on pristine upstream with NO boosts patches).
+- Why it was never seen: qwen35moe was only ever validated SINGLE-GPU
+  (wip README: "single Radeon AI PRO R9700"). The historical 2-GPU decode
+  numbers (31.79->38.71 t/s) in patches/README were the DENSE Qwen3.8-27B
+  Q8_0, not qwen35moe. The MUL_MAT_ID MoE path on multi-GPU split was
+  never exercised for qwen35moe.
+- Suspects to check next session (none verified yet):
+  1. MUL_MAT_ID MoE mmvq/MMQ kernel on multi-GPU: the ids-gather + expert
+     dispatch with tensor-split layers - maybe an expert row split across
+     GPUs that each GPU expects locally (the ids tensor is per-token
+     global expert ids; layer split means each GPU has the same experts?
+     no - tensor split = layer split, so experts are duplicated per GPU,
+     should be fine... verify with OP_TIMING where it sticks).
+  2. RCCL/allreduce on the MoE decode shapes (Q5_K/Q6_K specific sizes)
+     vs the Q3_K/Q4_K ones - try GGML_CUDA_ALLREDUCE=none to bisect.
+  3. The mmvq mmid_max_batch table differences Q5_K/Q6_K vs Q3_K/Q4_K
+     (VDR_Q6_K_Q8_1_MMVQ=2, VDR_Q4_K=4) interacting with multi-GPU.
+  4. Test the Q8_0 qwen35moe (user: "Q8_0 needs 2 GPUs to run") - does
+     it hang too? Q8_0 is in the block-13 fused list AND has its own
+     mmvq table entry.
+- Tooling ready: /tmp worktrees were cleaned; rebuild points: commit
+  5d4a3be26 (pre-27466) and 41ef91f7c~1 (pre-MOE-fusion) tested already.
+  Use GGML_CUDA_OP_TIMING=1 -v to find where decode sticks (it printed
+  nothing on the hang - the first decode graph is where it stops).
+- Related but DIFFERENT (do not conflate): PR #27466 comment (BoneHorror)
+  - Qwen3.8-Flash-Next degenerates to "//////" on ROCm after the radix
+  TOP_K commit (qwen4exp indexer TOP_K over >1024 cells). Our qwen4exp
+  radix top-k is a SEPARATE implementation, validated, and does NOT have
+  this bug. See wip/qwen4exp/.
+
 ## Active (in progress now)
 
 ### [IN-PROGRESS] Block 13: MoE WIP -> official patch (qwen4exp split-out)
@@ -72,23 +113,6 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
   7900XTX. Ask for help in the blocks repo (issue or a 7900XTX-owner
   thread); the gate makes the fallback safe (RCCL) so a volunteer can test
   with `GGML_CUDA_ALLREDUCE=internal` and report the matrix.
-
-### [OPEN] qwen35moe MoE + multi-GPU decode hang (Q5_K/Q6_K)
-- Symptom: llama-bench 2-GPU tensor-split decode of qwen35moe hangs
-  (GPUs busy-wait, no output). Q3_K_M/Q4_K_M work (62 t/s); Q5_K_M/Q6_K
-  hang. 1-GPU works (75 t/s). Dense 27B Q8_0 2-GPU works.
-- Bisect result (2026-09-01): hangs at EVERY point - old verified base
-  a7cc83bba (blocks 01-12), pre-41ef91f7c, pre-f8dbcd618, current upstream
-  0eadefebd. NOT a regression from the 22 upstream commits, NOT #27466,
-  NOT block 13. qwen35moe was only ever validated SINGLE-GPU (wip README:
-  "single Radeon AI PRO R9700"; the historical 2-GPU decode numbers were
-  the dense Qwen3.8-27B Q8_0). It is a never-validated configuration.
-- Related but different: PR #27466 comment (BoneHorror) - Qwen3.8-Flash-
-  Next degenerates to "//////" on ROCm after the radix TOP_K commit
-  (qwen4exp indexer TOP_K over >1024 cells). Our qwen4exp radix top-k is a
-  SEPARATE implementation, validated, and does NOT have this bug.
-- "Done": find the MoE-multi-GPU kernel hang (likely the mmvq MUL_MAT_ID
-  split or RCCL reduce on Q5_K/Q6_K shapes), fix, validate 2-GPU decode.
 
 ### [OPEN] Multi-token MUL_MAT_ID mmvq `x_scale_channel_dst` fusion
 - What: the `ffn_moe_weighted = moe_down * topk_weights` MUL fold (block 08's
