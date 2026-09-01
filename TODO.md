@@ -70,6 +70,16 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
   Follow the 0004 recipe (3 steps per type: gate switch case, instance file +
   generator, validation).
 
+### [OPEN] Port block 13 (fused MoE MMQ) to Strix Halo + 7900XTX
+- The fused gate+up+GLU MMQ arm is gated to `GGML_CUDA_CC_IS_RDNA4(cc)`
+  (tuned J tile-width caps on gfx1201). Port = validate the fused kernel's
+  tile caps + bit-exactness on gfx1151 (Strix Halo, RDNA3.5) and gfx1100
+  (7900XTX, RDNA3), then relax the gate per-arch. Follow the 0004 validation
+  recipe per arch (bit-exact + bench). Note: Strix Halo also matters for the
+  unified-memory decode work (bandwidth-bound). See
+  `wip/qwen35moe-prefill/true-q3-rdna4-gating-2gpu.md` for the RDNA4-gating
+  history.
+
 ### [OPEN] Decode push (tg128 40.1, memory-bandwidth bound)
 - Parked after ITEM B. mmvq short-K item-split (block 13) is part of it
   (+6-7% decode on qwen35moe already measured). 2-GPU deploy + Strix Halo
