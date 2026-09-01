@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply the full rdna-boosts patch set (blocks 01-11 + the hybrid block 12)
+# Apply the full rdna-boosts patch set (blocks 01-11 + hybrid block 12 + MTP GDN prefix 13)
 # to a clean llama.cpp checkout at the recorded baseline.
 #
 # Usage: ./apply-all.sh [llama.cpp-checkout] [rdna-boosts-repo]
@@ -12,6 +12,7 @@
 # hunks -- verified 2026-08-29), one commit each with the block subject.
 # Block 12 (the hybrid HIP all-reduce) is applied with `git apply` and
 # committed as "rdna-boosts: block 12: hybrid HIP all-reduce".
+# Block 13 (MTP chunked-GDN prefix + sequential snapshot tail) is the same.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,6 +31,7 @@ BLOCKS="0001-rdna-boosts-block-01-adaptive-MTP-draft-depth.patch \
 0010-rdna-boosts-block-10-k-quant-boosts-Q4_K-Q5_K-Q6_K-Q.patch \
 0011-rdna-boosts-block-11-skip-CUDA-graphs-for-multi-toke.patch"
 BLOCK12="12-hybrid-allreduce-hip.patch"
+BLOCK13="13-mtp-gdn-chunked-prefix.patch"
 
 cd "$LLAMA"
 
@@ -57,8 +59,14 @@ git add -A
 git commit -q -m "rdna-boosts: block 12: hybrid HIP all-reduce (RDNA4-gated)"
 echo "   committed"
 
+echo "== $BLOCK13"
+git apply "$PATCHES/$BLOCK13"
+git add -A
+git commit -q -m "rdna-boosts: block 13: MTP chunked GDN prefix + sequential snapshot tail"
+echo "   committed"
+
 echo
-N_BLOCKS=12
+N_BLOCKS=13
 echo "All $N_BLOCKS patches applied and committed on branch $BRANCH:"
 git log --oneline -$N_BLOCKS
 echo

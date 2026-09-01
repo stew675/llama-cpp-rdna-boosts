@@ -1,6 +1,6 @@
 # rdna-boosts patch set (delivery)
 
-12 patches against the llama.cpp fork point `a7cc83bba`
+13 patches against the llama.cpp fork point `a7cc83bba`
 ("rpc: avoid serializing buffers from other servers (#26500)"; re-based
 2026-08-30 from `17252c769`):
 
@@ -18,6 +18,7 @@
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** — the custom internal AR; hybrid dispatch; RDNA4-only gate |
+| `0013` | **MTP chunked GDN prefix** — chunked WMMA on `n_tokens-K`, sequential only on last K snapshots |
 
 ## Apply (fresh checkout at the fork point)
 
@@ -25,6 +26,7 @@
 git checkout a7cc83bba          # or: git apply each patch on a matching tree
 git am patches/000[1-9]-*.patch patches/001[01]-*.patch
 git apply patches/12-hybrid-allreduce-hip.patch
+git apply patches/13-mtp-gdn-chunked-prefix.patch
 ```
 
 (`git am` for the 1-11 series — plain `git apply` of the concatenated series
@@ -32,6 +34,17 @@ was observed to silently drop hunks; use `git am`.)
 
 The set is **whitespace-clean**: applying produces no git whitespace
 warnings (verified 2026-08-29 after the whitespace-clean regeneration).
+
+## Block 13 notes
+
+MTP `K > 1` used to skip block 02's chunked GDN (snapshots). Long
+single-sequence prefill now runs chunked WMMA on the prefix (`n_tokens-K`)
+and sequential GDN only on the last K tokens so slots `0..K-1` stay
+correct. Fused-cache graphs (`cache != nullptr`) are included. `n_seqs > 1`
+stays fully sequential. Opt out: `GGML_CUDA_GDN_CHUNKED=0`.
+
+Not bit-identical vs sequential (same as block 02 bf16 chunked: near-lossless,
+not exact). Lab numbers: `benchmarks/2026-08-31-mtp-gdn-chunked-prefix.md`.
 
 ## Block 12 notes
 
