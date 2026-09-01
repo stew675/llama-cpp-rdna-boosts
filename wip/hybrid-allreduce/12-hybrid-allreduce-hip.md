@@ -1,7 +1,7 @@
 # 12-hybrid-allreduce-hip — WIP
 
 **Status: DELIVERED as block 12 (2026-08-29).** The clean hybrid (without
-the fused/pacing experiments) is `patches/12-hybrid-allreduce-hip.patch`,
+the fused/pacing experiments) is `patches/0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch`,
 RDNA4-gated (gfx1200/gfx1201; falls back to RCCL elsewhere), and the
 clean-apply simulation passed (build + coherence + tg64 38.12 / tg512
 41.08). This file is the EXPLORATION writeup that produced it — historical
@@ -149,7 +149,7 @@ path is NOT on the hybrid critical path.
 
 ## Preservation
 
-- Patch: `wip/12-hybrid-allreduce-hip.patch` (applies cleanly on top of the
+- Patch: `patches/0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch` (applies cleanly on top of the
   11-block tree, verified with `git apply --check` against `~/llama.cpp`
   HEAD = `f6f8f6778`).
 - Raw results: `~/ab-results/16384/armH.json`, `armH-nccl.json`,

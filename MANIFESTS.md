@@ -4,20 +4,19 @@ Squashed, standalone diff blocks of RDNA-specific performance and correctness
 work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
-The **current delivery** is a **12-patch set** against the fork point
-`0eadefebd` (re-based 2026-09-01; previously `a7cc83bba`): blocks 01-11
-(`patches/0001-…0011-…`, format-patch of the
+The **current delivery** is a **13-patch set** against the fork point
+`0eadefebd` (re-based 2026-09-01; previously `a7cc83bba`): blocks 01-13
+(`patches/0001-…0013-…`, format-patch of the
 fork's `rdna-boosts` block commits — the re-based regeneration
-`b25bc8a9c..43084332f` (block 12 committed as `7d5d3f77b`); the original fork hashes
+`b25bc8a9c..a14257996` (blocks 12/13 committed as `7d5d3f77b`/`a14257996`); the original fork hashes
 `2b7a135cb..f6f8f6778` are preserved on the `old-rdna-boosts` branch, the
-2026-08-30 `a7cc83bba`-based rebuild on `rdna-boosts-a7cc83bba`) plus
-**block 12** (`patches/12-hybrid-allreduce-hip.patch`, the hybrid HIP
-all-reduce — delta vs the block-11 tip, RDNA4-gated). Apply flow: `git am`
-for 01-11 (plain `git apply` of the concatenated series SILENTLY DROPS
-HUNKS — verified 2026-08-29), `git apply` for the 12th;
+2026-08-30 `a7cc83bba`-based rebuild on `rdna-boosts-a7cc83bba`). Apply flow: `git am`
+for the whole 01-13 series (plain `git apply` of the concatenated series
+SILENTLY DROPS HUNKS — verified 2026-08-29);
 `scripts/apply-all.sh` automates it. **The set is whitespace-clean** —
 applying produces zero git whitespace warnings (verified 2026-08-29,
-re-verified 2026-09-01 on the `0eadefebd` re-base).
+re-verified 2026-09-01 on the `0eadefebd` re-base, re-verified with block
+13 on the 13-patch series 2026-09-01).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -62,12 +61,13 @@ delivery — use `patches/` + `scripts/apply-all.sh`.
 | 09 | `0009-…-block-09-meta-buffer-compute-container-h.patch` | meta-buffer compute-container headroom | none |
 | 10 | `0010-…-block-10-k-quant-boosts-Q4_K-Q5_K-Q6_K-Q.patch` | k-quant + mmvq-parameter umbrella (VDR kernels, RDNA3_5 table, MoE mmid) — the only decode-numerics patch | none (omit for greedy purity) |
 | 11 | `0011-…-block-11-skip-CUDA-graphs-for-multi-toke.patch` | skip CUDA graphs for multi-token prefill | none |
-| 12 | `12-hybrid-allreduce-hip.patch` | **hybrid HIP all-reduce** (internal AR for the small-tensor decode path + per-size hybrid dispatch vs RCCL; RDNA4-only gate: refuses to init off gfx1200/gfx1201, falls back to RCCL) | none (apply last) |
+| 12 | `0012-…-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch` | **hybrid HIP all-reduce** (internal AR for the small-tensor decode path + per-size hybrid dispatch vs RCCL; RDNA4-only gate: refuses to init off gfx1200/gfx1201, falls back to RCCL) | none (apply last) |
+| 13 | `0013-…-block-13-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** (prefill fused expert MMQ, RDNA4, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K + decode item-split, re-based on the upstream has_fusion mmvq path) | none (apply last) |
 
-Block numbers are the apply order: `01` applies first, `12` last. All blocks
+Block numbers are the apply order: `01` applies first, `13` last. All blocks
 are mutually independent except **block 08 (fused core) requires blocks 03
-and 04 in the tree**. Apply 01-11 with `git am` (or `scripts/apply-all.sh`),
-then `git apply` the 12th — the concatenated-series `git apply` trick
+and 04 in the tree**. Apply the whole 01-13 series with `git am` (or
+`scripts/apply-all.sh`) — the concatenated-series `git apply` trick
 silently drops hunks.
 
 
@@ -199,17 +199,19 @@ block, auto-3way). The verified applied state is tagged
 On a fresh checkout of the fork point `17252c769`:
 
 ```
-git am patches/000[1-9]-*.patch patches/001[01]-*.patch   # blocks 01-11
-#      (or: scripts/apply-all.sh — same thing, plus the 12th and a commit each)
-git apply patches/12-hybrid-allreduce-hip.patch           # block 12
+git am patches/000[1-9]-*.patch patches/001[0-3]-*.patch   # blocks 01-13
+#      (or: scripts/apply-all.sh — same thing, one commit each)
 ```
 
 Verified end-to-end 2026-08-29: clean apply, full build, llama-cli
 same-seed coherence IDENTICAL to the fork build, tg64 38.12 / tg512 41.08
-(matches the fork build). **Do not `git apply` the concatenated 01-11
-series directly — it silently drops hunks** (30 files / 2483 lines vs the
-correct 35 / 6094). The historical validation records below (14883/14883,
-GDN 46/46, etc.) are from the older 01-11 structure and remain the
+(matches the fork build). Re-verified 2026-09-01 with block 13 on the
+13-patch series: clean apply, applied tree byte-identical to the fork tip.
+**Do not `git apply` the concatenated 01-13 series directly — it silently
+drops hunks** (30 files / 2483 lines vs the correct 35 / 6094 for the old
+12-set; the same caveat applies). The historical validation records below
+(14883/14883, GDN 46/46, etc.) are from the older 01-11 structure and
+remain the
 verification evidence for the block content, which is byte-unchanged.
 
 ### Whitespace-clean regeneration (2026-08-29, follow-up)
@@ -318,7 +320,7 @@ per-block flow in `patches/` when you want reviewable increments).
 > (3-way merge against the baseline blobs), then manually rebase the hunks
 > against the current master and continue. Do not skip blocks. The fused
 > core (`0008-...`) is applied at position 8; blocks 09-11 go after it, then
-> the 12th (`12-hybrid-allreduce-hip.patch`, `git apply`). If more than one
+> blocks 12-13 (hybrid AR, fused MoE). If more than one
 > block needs manual re-base hunks, regenerate the whole set from the fork
 > with `scripts/make-patches.sh` instead of hand-editing the committed
 > patches.

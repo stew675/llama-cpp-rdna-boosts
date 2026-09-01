@@ -73,9 +73,9 @@ validation:
 
 ## Per-block provenance
 
-The CURRENT delivery patches (0001-0011) are the fork's `rdna-boosts` block
+The CURRENT delivery patches (0001-0013) are the fork's `rdna-boosts` block
 commits exported with `git format-patch` (one commit per block, the
-re-based set against `0eadefebd`: `217e33ba4..d7bdd0a91`; previously the
+re-based set against `0eadefebd`: `b25bc8a9c..a14257996`; previously the
 re-based regeneration `4c0f30dec..8fbf10e5b` against `a7cc83bba`; the
 whitespace-clean regeneration `3209e83b4..cc985ba9a` against
 `17252c769`; originally `2b7a135cb..f6f8f6778`; the original fork history
@@ -222,12 +222,13 @@ per the drift policy step 3:
   post-fix runs clean with profiler teardown dumps on every device;
   coherence IDENTICAL to the pre-fix golden.  Integrated into the fork's
   block-12 commit and regenerated into
-  `patches/12-hybrid-allreduce-hip.patch` + `rdna-boosts-all.patch`.
+  `patches/0012-…-hybrid-HIP-all-reduce-RDNA4-gat.patch` + `rdna-boosts-all.patch`.
 - **Fork re-sync:** the fork branch was rebuilt as a 12-commit branch
   directly on `0eadefebd` (block 01 `b25bc8a9c` .. block 11 `43f5ab71d`,
-  block 12 `93e8b09bb`), dropping the upstream `kleidiai` docs commit
+  block 12 `7d5d3f77b`, block 13 `a14257996`), dropping the upstream
+  `kleidiai` docs commit
   `518b76236` that had crept into the previous rebuild (upstream-only;
-  remains in `origin/master`).  The delivery contract is unchanged: 12
+  remains in `origin/master`).  The delivery contract is unchanged: 13
   blocks applied to a fresh checkout at `0eadefebd`.
 - **Re-verified 2026-09-01:** clean-apply sim (`apply-all.sh` on a fresh
   clone at `0eadefebd`): zero whitespace warnings, applied tree

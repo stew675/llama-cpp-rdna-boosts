@@ -13,8 +13,11 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
   verified 12-set must stay untouched; MoE is a distinct feature; item-split needs
   re-base against the 0eadefebd tree anyway (fusion in mul_mat_vec_q_moe); the
   MoE work is still maturing (M4/M5 open) so it must not pollute release blocks.
-- Also: rename block 12 to the 000N convention
-  (`12-hybrid-allreduce-hip.patch` -> `0012-rdna-boosts-block-12-*.patch`).
+- DONE (2026-09-01): block 12 renamed to the 000N convention
+  (`0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch`);
+  block 13 committed on the fork (`a14257996`), 13-patch series regenerated
+  and verified (clean git am apply, applied tree byte-identical to fork
+  tip, zero whitespace warnings).
 - Re-base already done in ~/llama.cpp working tree (uncommitted):
   - mmvq.cu: item-split merged with has_fusion (tmp_gate accumulation, launcher
     dispatches rpb 2/4/8 x has_fusion true/false).

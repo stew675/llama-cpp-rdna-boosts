@@ -8,10 +8,10 @@ describing the repo's purpose, layout, workflows, and how to work in it.
 
 Key orientation for that task:
 - This repo = the PATCH/DELIVERY repo for the `stew675/llama.cpp` fork's
-  `rdna-boosts` branch (blocks 01-11 + the hybrid HIP all-reduce block 12).
-- `patches/` = the delivery patch set (0001-0011 + 12-hybrid-allreduce-hip.patch)
+  `rdna-boosts` branch (blocks 01-13).
+- `patches/` = the delivery patch set (0001-0013)
   + README.md (apply instructions).  scripts/apply-all.sh = the verified apply
-  flow (git am for 1-11, git apply for the 12th); scripts/make-patches.sh =
+  flow (git am for the whole 01-13 series); scripts/make-patches.sh =
   regeneration.
 - `wip/` = the exploration docs (HANDOFF.md = this file; 12-hybrid-allreduce-hip.md;
   tools/).  `archive/work/fused-stage-pacing/` = the closed experiments
@@ -50,9 +50,9 @@ Simulated the delivery patch set against a clean llama.cpp master
 to init unless every device is gfx1200/gfx1201 (falls back to RCCL with a
 warning).  Community RDNA3 verification pending.
 
-Delivery artifacts: `patches/0001-0011` (blocks) + `patches/12-hybrid-allreduce-hip.patch`
-+ `patches/README.md` (apply instructions).  The stale wip/12-hybrid-allreduce-hip.patch
-is superseded by patches/12-hybrid-allreduce-hip.patch.
+Delivery artifacts: `patches/0001-0011` (blocks) + `patches/0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch`
++ `patches/README.md` (apply instructions).  The stale patches/0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch
+is superseded by patches/0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch.
 
 WIP experiments (fused-stage, pacing) archived at `archive/work/fused-stage-pacing/`
 (env-gated OFF by default; not part of the delivery).
@@ -89,7 +89,7 @@ Verification:
 
 ## Where things stand
 
-- **Block 12 (hybrid all-reduce): DELIVERED** as `patches/12-hybrid-allreduce-hip.patch` (clean hybrid + RDNA4-only gate, WITHOUT the fused/pacing WIP). Clean-apply simulation VERIFIED (build + coherence + tg64 38.12 / tg512 41.08). The fork's `rdna-boosts` is now the whitespace-clean rebuilt branch, block 12 committed, tip `12d10267b` (see session 9.6); the historical fork HEAD `155debcdc` (the gate commit) is preserved on `old-rdna-boosts`.
+- **Block 12 (hybrid all-reduce): DELIVERED** as `patches/0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch` (clean hybrid + RDNA4-only gate, WITHOUT the fused/pacing WIP). Clean-apply simulation VERIFIED (build + coherence + tg64 38.12 / tg512 41.08). The fork's `rdna-boosts` is now the whitespace-clean rebuilt branch, block 12 committed, tip `12d10267b` (see session 9.6); the historical fork HEAD `155debcdc` (the gate commit) is preserved on `old-rdna-boosts`.
 - **WIP experiments**: fused-stage + pacing archived at `archive/work/fused-stage-pacing/` (env-gated OFF by default; not part of the delivery).
 - **Server config**: `~/.llama-server-config.yaml` rocmstew1/2/3 now point at the hybrid build (`~/llama.cpp/build-rocm-hybrid`). Recommended deployment: 3-GPU (`HIP_VISIBLE_DEVICES=0,1,2`), hybrid default, UNPINNED (the pin is a regression).
 
@@ -428,7 +428,7 @@ our baseline; gated option if ever needed).  Details in
 ## Files of record
 
 - `wip/12-hybrid-allreduce-hip.md` — full exploration writeup + tuning roadmap
-- `wip/12-hybrid-allreduce-hip.patch` — the llama.cpp delta (incl. profiler)
+- `patches/0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch` — the llama.cpp delta (incl. profiler)
 - `wip/tools/` — standalone benchs (ar_signal_bench, rccl_ar_bench, probes)
 - `~/ab-results/16384/` — benchy JSONs (armA/B/C old build, armH* new build)
 - `~/llama.cpp/build-rocm-hybrid/` — current build with the patch + profiler

@@ -1,6 +1,6 @@
 # rdna-boosts patch set (delivery)
 
-12 patches against the llama.cpp fork point `0eadefebd`
+13 patches against the llama.cpp fork point `0eadefebd`
 ("qwen4exp: support recurrent state rollback (#28123)"; re-based
 2026-09-01 from `a7cc83bba`):
 
@@ -17,22 +17,23 @@
 | `0009` | meta-buffer compute-container headroom |
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
-| `0012` | **hybrid HIP all-reduce (block 12)** — the custom internal AR; hybrid dispatch; RDNA4-only gate |
+| `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate |
+| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; see block 13 notes below |
 
 ## Apply (fresh checkout at the fork point)
 
 ```bash
 git checkout 0eadefebd          # or: git apply each patch on a matching tree
-git am patches/000[1-9]-*.patch patches/001[01]-*.patch
-git apply patches/12-hybrid-allreduce-hip.patch
+git am patches/000[1-9]-*.patch patches/001[0-3]-*.patch
 ```
 
-(`git am` for the 1-11 series — plain `git apply` of the concatenated series
-was observed to silently drop hunks; use `git am`.)
+(`git am` for the whole 13-patch series - plain `git apply` of the
+concatenated series was observed to silently drop hunks; use `git am`.)
 
 The set is **whitespace-clean**: applying produces no git whitespace
 warnings (verified 2026-08-29 after the whitespace-clean regeneration,
-re-verified 2026-09-01 on the `0eadefebd` re-base).
+re-verified 2026-09-01 on the `0eadefebd` re-base, re-verified 2026-09-01
+with block 13 on the 13-patch series).
 
 ## Block 12 notes
 
@@ -122,6 +123,49 @@ re-verified 2026-09-01 on the `0eadefebd` re-base).
   to sequential; non-MTP coherence unchanged.  Not bit-identical vs
   sequential in general (same class as the bf16 chunked: near-lossless).
   Lab numbers: `benchmarks/2026-08-31-mtp-gdn-chunked-prefix.md`.
+
+## Block 13 notes
+
+**Fused MoE gate+up+GLU MMQ (prefill) + mmvq short-K item-split (decode).**
+
+- **Prefill fused expert MMQ** (block 13, the `mul_mat_id_glu_ops` pattern):
+  the {MUL_MAT_ID(gate), MUL_MAT_ID(up), GLU} triple runs as ONE MMQ kernel
+  reading both weight streams with a GLU epilogue in registers.  Types
+  instantiated: Q3_K/Q4_K/Q5_K/Q8_0/Q6_K (M4 quant extension).  Env opt-out:
+  `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1`.
+  Validated (1-GPU qwen35moe Q6_K/Q4_K_M, the verified config): prefill
+  pp16384 Q6_K +5.1% (3344 vs 3181), Q4_K_M +3.6% (3488 vs 3367); fused
+  path fires as `FUSED MUL_MAT_ID ffn_moe_down-*` on all layers.
+- **Decode item-split** (mmvq `mul_mat_vec_q`/`mul_mat_vec_q_moe`): the
+  K-split loop leaves most thread groups idle on short-K MoE GEMMs (down
+  K=512 -> 2 K-blocks); the item-split loop spreads (row, kblock) items
+  over the groups and scales rows_per_block (rpb 2/4/8) to fill them.
+  Re-based on top of the upstream `has_fusion` mmvq path (41ef91f7c),
+  which landed in the 0eadefebd re-base - the launcher now dispatches on
+  rpb x has_fusion.  Validated: decode tg128 97.28 vs 92.15 pristine
+  (+5.6%, 1-GPU Q6_K).
+- **Two correctness gates** on the try_fuse arms (the 0eadefebd merge
+  admitted cases the kernels cannot express; both required for the
+  multi-token tests upstream added):
+  1. The `x_scale_channel_dst` fold (MoE down x topk weights) is
+     restricted to single-token MUL_MAT_ID: the kernel epilogue applies
+     ONE scale per expert (`x_scale[channel_dst]`), which is correct only
+     when all batch tokens share one expert weight.  Multi-token topk
+     weights are per (expert, token), so those fall back to the separate
+     MUL op (bit-exact, matching the pre-re-base behavior).  Upstream's
+     gate change (`dst->ne[2] > get_mmvq_mmid_max_batch(...)`) admitted
+     multi-token, which the n=1-only kernel cannot express.  Real
+     multi-token support (index x_scale by (expert, token)) is tracked in
+     TODO.md.
+  2. The fused MoE MMQ arm is gated to the instantiated type list
+     (Q3_K/Q4_K/Q5_K/Q8_0/Q6_K): `ggml_cuda_should_use_mmq` returns true
+     for q4_0/q4_1/q5_0/IQ/MXFP4/NVFP4 on RDNA4, which would abort in
+     `ggml_cuda_mul_mat_q_switch_type_gate`.  MXFP4/NVFP4 support tracked
+     in TODO.md.
+- Same-seed coherence IDENTICAL (fusion on vs off), test-backend-ops
+  2/2 OK.  Known non-issue: qwen35moe Q5_K/Q6_K multi-GPU decode hangs at
+  EVERY tested commit (including the old a7cc83bba base) - qwen35moe was
+  only ever validated single-GPU; see TODO.md.
 
 ## Server config (the +22% deployment win)
 

@@ -1,0 +1,1011 @@
+From a14257996a5f65db05a94ebb8d3491588cf3186e Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 1 Sep 2026 06:50:35 -0500
+Subject: [PATCH 13/13] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
+ short-K item-split
+
+Fused MoE prefill MMQ kernel (gate+up+GLU triple as one MMQ kernel,
+RDNA4-gated, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode mmvq item-split
+((row, kblock) items across thread groups, rpb dispatch 2/4/8) merged
+with the upstream has_fusion mmvq path.
+
+Two correctness gates on the try_fuse arms (the fresh 0eadefebd merge
+admitted cases the kernels cannot express):
+- x_scale_channel_dst fold restricted to single-token MUL_MAT_ID
+  (multi-token topk weights are per (expert, token); falls back to the
+  separate MUL op, matching the pre-re-base behavior)
+- fused MoE MMQ arm gated to the instantiated type list (the other
+  mmq_supported types aborted in switch_type_gate)
+
+Includes the GGML_CUDA_OP_TIMING fusion brackets (FUSED op visibility).
+
+Validated on 1-GPU qwen35moe (the verified config): prefill pp16384
+Q6_K +5.1%, Q4_K_M +3.6%; decode tg128 +5.6% (97.28 vs 92.15 pristine);
+same-seed coherence IDENTICAL; test-backend-ops 2/2 OK.
+
+Assisted-by: Claude Sonnet
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu               |  54 ++-
+ ggml/src/ggml-cuda/mmq.cu                     |  46 ++-
+ ggml/src/ggml-cuda/mmq.cuh                    | 165 ++++++++--
+ ggml/src/ggml-cuda/mmvq.cu                    | 308 +++++++++---------
+ .../template-instances/generate_cu_files.py   |  14 +
+ .../template-instances/mmq-instance-q3_k.cu   |   1 +
+ 6 files changed, 402 insertions(+), 186 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 24a65620b..72ed8b3d1 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3432,8 +3432,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 0;
+     }
+ 
++    // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
++    static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
++
++    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
++
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++
+     // rms_norm + norm-weight MUL whose output feeds an mmvq matmul: fold the
+     // Q8_1 quantize into the norm kernel and pre-fill the matmul quantize
+     // cache. Consumes only the norm+MUL pair; the matmul dispatch that follows
+@@ -4057,6 +4063,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fused_node_count  = 3;
+                 break;
+             }
++
++            // Prefill MMQ path: the mmvq/mmvf fused kernels only handle decode
++            // (n_tokens <= MMVQ_MAX_BATCH_SIZE) or F32/F16 src0. For the batched
++            // quantized case the gate+up+GLU triple runs as separate ops; fuse it
++            // into one MMQ kernel that reads both weight streams and applies the
++            // GLU epilogue. The J tile-width caps in mul_mat_q_switch_J are tuned
++            // on RDNA4 (gfx1201); on other arches (e.g. Strix Halo, RDNA3.5) the
++            // fused kernel is disabled until validated there.
++            const bool moe_mmq_type = src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q4_K ||
++                                      src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q8_0 ||
++                                      src0->type == GGML_TYPE_Q6_K;
++            if (op == GGML_OP_MUL_MAT_ID && ids != nullptr && !disable_moe_mmq && GGML_CUDA_CC_IS_RDNA4(cc) && moe_mmq_type &&
++                    ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
++                ggml_cuda_mm_fusion_args_host fusion_data{};
++                fusion_data.gate      = gate->src[0];
++                fusion_data.glu_op    = ggml_get_glu_op(glu);
++                fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
++
++                ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
++                fused_mul_mat_vec = true;
++                fused_node_count  = 3;
++                break;
++            }
+         }
+     }
+ 
+@@ -4193,7 +4222,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         ggml_tensor * mul_node = cgraph->nodes[i + 1];
+ 
+         const int out_nodes[] = { i + 1 };
+-        if (mul_node->op == GGML_OP_MUL &&
++        // The x_scale_channel_dst kernel path scales by a per-token vector of
++        // mm_node->ne[1] values, so the fusion is single-token (decode) only;
++        // multi-token keeps the separate MUL op.
++        if (mm_node->ne[2] == 1 && mul_node->op == GGML_OP_MUL &&
+                 mul_node->src[0] == mm_node &&
+                 (mm_node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                 (mul_node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+@@ -4590,7 +4622,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+     const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
+     std::vector<cudaEvent_t> op_ev0;
+     std::vector<cudaEvent_t> op_ev1;
+-    std::vector<std::pair<const ggml_tensor *, int>> op_nodes;
++    std::vector<std::tuple<const ggml_tensor *, int, bool>> op_nodes;
+     if (op_timing) {
+         op_ev0.resize(cgraph->n_nodes);
+         op_ev1.resize(cgraph->n_nodes);
+@@ -4743,9 +4775,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++                if (op_timing) {
++                    // bracket the fusion dispatch: a matching try_fuse launches its own
++                    // fused kernel and the per-node events below are skipped
++                    CUDA_CHECK(cudaEventRecord(op_ev0[i], cuda_ctx->stream()));
++                }
++
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
++                    if (op_timing) {
++                        CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
++                        op_nodes.emplace_back(node, i, true);
++                    }
+ #ifdef GGML_CUDA_DEBUG
+                     const int last_fused = i + nodes_to_skip;
+                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
+@@ -4755,6 +4797,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     i += nodes_to_skip;
+                     continue;
+                 }
++
+ #ifndef NDEBUG
+                 // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
+                 // node's output on the host-visible buffer, which the compute path
+@@ -4784,7 +4827,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+                 if (op_timing) {
+                     CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
+-                    op_nodes.emplace_back(node, i);
++                    op_nodes.emplace_back(node, i, false);
+                 }
+ 
+                 if (!is_concurrent_event_active) {
+@@ -4847,14 +4890,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+         static std::map<std::string, int>    op_cnt_total;
+         std::map<std::string, double> op_ms;
+         std::map<std::string, int>    op_cnt;
+-        for (const auto & [node, idx] : op_nodes) {
++        for (const auto & [node, idx, fused] : op_nodes) {
+             float ms = 0.0f;
+ #ifdef GGML_USE_HIP
+             CUDA_CHECK(hipEventElapsedTime(&ms, (hipEvent_t) op_ev0[idx], (hipEvent_t) op_ev1[idx]));
+ #else
+             CUDA_CHECK(cudaEventElapsedTime(&ms, op_ev0[idx], op_ev1[idx]));
+ #endif
+-            std::string key = ggml_op_name(node->op);
++            std::string key = fused ? "FUSED " : "";
++            key += ggml_op_name(node->op);
+             key += " ";
+             key += node->name;
+             if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && node->src[1] != nullptr) {
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 7fb440148..bf9c6c265 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -82,8 +82,36 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
+     }
+ }
+ 
++// Fused gate+up+GLU dispatch (the mul_mat_id_glu_ops pattern). The fused
++// kernel is only instantiated for the types listed here; other types fall back
++// to the 3-op sequence via the try_fuse gate.
++static void ggml_cuda_mul_mat_q_switch_type_gate(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
++    switch (args.type_x) {
++        case GGML_TYPE_Q3_K:
++            mul_mat_q_case<GGML_TYPE_Q3_K, true>(ctx, args, stream);
++            break;
++        case GGML_TYPE_Q4_K:
++            mul_mat_q_case<GGML_TYPE_Q4_K, true>(ctx, args, stream);
++            break;
++        case GGML_TYPE_Q5_K:
++            mul_mat_q_case<GGML_TYPE_Q5_K, true>(ctx, args, stream);
++            break;
++        case GGML_TYPE_Q8_0:
++            mul_mat_q_case<GGML_TYPE_Q8_0, true>(ctx, args, stream);
++            break;
++        case GGML_TYPE_Q6_K:
++            mul_mat_q_case<GGML_TYPE_Q6_K, true>(ctx, args, stream);
++            break;
++        default:
++            fprintf(stderr, "gate type = %d\n", (int) args.type_x);
++            GGML_ABORT("fatal error: fused gate MMQ not implemented for this type");
++            break;
++    }
++}
++
+ void ggml_cuda_mul_mat_q(
+-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
++        const ggml_cuda_mm_fusion_args_host * fusion) {
+     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+@@ -253,6 +281,22 @@ void ggml_cuda_mul_mat_q(
+         ne03, ne13, s03, s13, s3,
+         ne12};
+ 
++    if (fusion && fusion->gate) {
++        // fused gate+up: the gate weights share the up weights' shape, strides
++        // and ids mapping (verified in ggml_cuda_should_fuse_mul_mat), so only
++        // the base pointer differs. The kernel reads both streams with the same
++        // offset math and applies the GLU epilogue.
++        GGML_ASSERT(fusion->gate->type == src0->type);
++        GGML_ASSERT(fusion->gate->nb[1] == src0->nb[1] && fusion->gate->nb[2] == src0->nb[2] && fusion->gate->nb[3] == src0->nb[3]);
++        GGML_ASSERT(fusion->gate->ne[0] == src0->ne[0] && fusion->gate->ne[1] == src0->ne[1] && fusion->gate->ne[2] == src0->ne[2]);
++        mmq_args args_gate = args;
++        args_gate.x_gate   = (const char *) fusion->gate->data;
++        args_gate.glu_op   = fusion->glu_op;
++        args_gate.glu_limit = fusion->glu_limit;
++        ggml_cuda_mul_mat_q_switch_type_gate(ctx, args_gate, stream);
++        return;
++    }
++
+     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 0998f7bca..9bf613237 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "common.cuh"
++#include "unary.cuh"
+ 
+ #include <climits>
+ #include <cstdint>
+@@ -874,13 +875,14 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
+ 
+ // ---------------------------------------------------------------------------------------------
+ 
+-template <ggml_type type, int J, bool fallback, bool fixup>
++template <ggml_type type, int J, bool fallback, bool fixup, bool has_gate = false>
+ static __device__ __forceinline__ void mul_mat_q_process_tile(
+         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
+         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+         const float * __restrict__ y_scale,
+         const int stride_row_x, const int ncols_y, const int stride_col_dst,
+-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
++        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
++        const char * __restrict__ x_gate = nullptr, const ggml_glu_op glu_op = GGML_GLU_OP_COUNT, const float glu_limit = 0.0f) {
+ 
+     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
+     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+@@ -905,6 +907,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+     constexpr int blocks_per_iter = ITER_K / qk;
+ 
+     float sum[J*I / (nwarps*warp_size)] = {0.0f};
++    float sum_gate[J*I / (nwarps*warp_size)] = {0.0f};
+ 
+     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+ 
+@@ -943,6 +946,69 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+         __syncthreads();
+     }
+ 
++    if constexpr (has_gate) {
++        // fused gate+up: second weight stream, same activations. The gate
++        // accumulation order per K-block is identical to the unfused gate
++        // run, so the GLU result is bit-identical to the separate path.
++        for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
++            load_tiles(x_gate, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
++            {
++                const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
++#pragma unroll
++                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
++                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
++
++                    tile_y[l] = by0[l];
++                }
++            }
++
++            __syncthreads();
++
++            vec_dot(tile_x, tile_y, sum_gate, 0);
++
++            __syncthreads();
++
++            {
++                const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
++#pragma unroll
++                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
++                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
++
++                    tile_y[l] = by0[l];
++                }
++            }
++
++            __syncthreads();
++
++            vec_dot(tile_x, tile_y, sum_gate, MMQ_TILE_NE_K);
++
++            __syncthreads();
++        }
++
++        // GLU epilogue: out = glu(gate, up), elementwise per thread-owned slot.
++#pragma unroll
++        for (int l = 0; l < J*I / (nwarps*warp_size); ++l) {
++            const float gate_val = sum_gate[l];
++            switch (glu_op) {
++                case GGML_GLU_OP_SWIGLU:
++                    sum[l] = ggml_cuda_op_silu_single(gate_val) * sum[l];
++                    break;
++                case GGML_GLU_OP_GEGLU:
++                    sum[l] = ggml_cuda_op_gelu_single(gate_val) * sum[l];
++                    break;
++                case GGML_GLU_OP_SWIGLU_OAI:
++                    sum[l] = ggml_cuda_op_swiglu_oai_single(gate_val, sum[l]);
++                    break;
++                case GGML_GLU_OP_SWIGLU_CLAMP:
++                    sum[l] = ggml_cuda_op_swiglu_clamp_single(gate_val, sum[l], glu_limit);
++                    break;
++                default:
++                    sum[l] = sum[l] * gate_val;
++                    break;
++            }
++        }
++    }
++
+     if (fixup) {
+         write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J);
+     } else {
+@@ -953,7 +1019,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+ 
+ // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
+ 
+-template <ggml_type type, int J, bool fallback>
++template <ggml_type type, int J, bool fallback, bool has_gate = false>
+ __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
+ static __global__ void mul_mat_q(
+         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
+@@ -962,7 +1028,8 @@ static __global__ void mul_mat_q(
+         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+-        const uint3 ntx) {
++        const uint3 ntx,
++        const char * __restrict__ x_gate = nullptr, const ggml_glu_op glu_op = GGML_GLU_OP_COUNT, const float glu_limit = 0.0f) {
+ 
+     // Skip unused template specializations for faster compilation:
+     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
+@@ -1056,10 +1123,11 @@ static __global__ void mul_mat_q(
+         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+ 
+         constexpr bool fixup = false;
+-        mul_mat_q_process_tile<type, J, fallback, fixup>
++        mul_mat_q_process_tile<type, J, fallback, fixup, has_gate>
+             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+              stride_row_x, ncols_y, stride_col_dst,
+-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
++             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
++             x_gate, glu_op, glu_limit);
+         return;
+     }
+ 
+@@ -1159,8 +1227,7 @@ static __global__ void mul_mat_q(
+         kbc -= fastmodulo(kbc, blocks_per_ne00);
+ 
+         kb0_start = 0;
+-        kb0_stop  = min(blocks_per_ne00.z, uint32_t(kbc_stop - kbc));
+-    }
++        kb0_stop  = min(blocks_per_ne00.z, uint32_t(kbc_stop - kbc));    }
+ 
+     if (kbc >= kbc_stop) {
+         return;
+@@ -1385,6 +1452,11 @@ struct mmq_args {
+     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
+     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
+     int64_t ncols_max;
++    // Fused gate+up: second weight stream (same shape/strides as x) + GLU epilogue.
++    // When x_gate != nullptr the kernel computes both dots and writes glu(x_gate_dot, x_dot).
++    const char * x_gate = nullptr;
++    ggml_glu_op glu_op = GGML_GLU_OP_COUNT;
++    float glu_limit = 0.0f;
+ };
+ 
+ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
+@@ -1394,7 +1466,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
+     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
+ }
+ 
+-template <ggml_type type, int J, bool fallback>
++template <ggml_type type, int J, bool fallback, bool has_gate = false>
+ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+     const int id = ggml_cuda_get_device();
+     const int cc = ggml_cuda_info().devices[id].cc;
+@@ -1408,8 +1480,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+ 
+     const dim3 block_dims(warp_size, nwarps, 1);
+ 
+-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false>), nbytes_shared);
+-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
++    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, has_gate>), nbytes_shared);
++    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, has_gate>), nbytes_shared);
+ 
+     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
+     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
+@@ -1429,15 +1501,17 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
+ 
+     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
+-        mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
++        mul_mat_q<type, J, fallback, has_gate><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
+              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-             ntx_fd);
++             ntx_fd, has_gate ? args.x_gate : nullptr, args.glu_op, args.glu_limit);
+         return;
+     }
+ 
++    GGML_ASSERT(!has_gate); // gate fusion is only implemented for the non-stream-k path
++
+     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
+     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
+     const int ntiles_dst = ntx * nty * ntzw;
+@@ -1476,7 +1550,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+          ntx_fd);
+ }
+ 
+-template <ggml_type type, bool fallback>
++template <ggml_type type, bool fallback, bool has_gate = false>
+ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+     const int    id    = ggml_cuda_get_device();
+     const int    cc    = ggml_cuda_info().devices[id].cc;
+@@ -1491,6 +1565,25 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+             continue;
+         }
+ 
++        // The fused gate+up kernel keeps two accumulators live (sum and
++        // sum_gate). J_max_gate is per-type, measured on gfx1201 (RDNA4):
++        // - Q6_K (q6_K_q8_1_mma): ~255 VGPR at J>=96 kills occupancy -> 64
++        // - Q4_K/Q5_K (q8_1_q8_1_mma): J=32..80 spill (256 VGPR + 100+
++        //   spills), J>=96 clean; J=96 measured best -> 96
++        // - Q8_0/Q3_K (q8_0_q8_1_mma / q3_K_q8_1_mma): low register per
++        //   accumulator; J=64 gives the best occupancy/compute balance -> 64
++        // Only applied on RDNA4: the vec_dot paths and register allocation
++        // differ on other arches, so leave the tile width uncapped there
++        // until validated (e.g. Strix Halo is RDNA3.5, gfx1151).
++        const int J_max_gate = GGML_CUDA_CC_IS_RDNA4(cc)
++            ? (type == GGML_TYPE_Q6_K ? 64 :
++               type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ? 96 :
++               type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q3_K ? 64 : 128)
++            : 128;
++        if (has_gate && J > J_max_gate) {
++            continue;
++        }
++
+         if (mmq_get_nbytes_shared(config, cc) > smpbo) {
+             continue;
+         }
+@@ -1505,52 +1598,52 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+ 
+     switch (J_best) {
+         case   8:
+-            launch_mul_mat_q<type,   8, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,   8, fallback, has_gate>(ctx, args, stream);
+             break;
+         case  16:
+-            launch_mul_mat_q<type,  16, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  16, fallback, has_gate>(ctx, args, stream);
+             break;
+         case  24:
+-            launch_mul_mat_q<type,  24, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  24, fallback, has_gate>(ctx, args, stream);
+             break;
+         case  32:
+-            launch_mul_mat_q<type,  32, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  32, fallback, has_gate>(ctx, args, stream);
+             break;
+         case  40:
+-            launch_mul_mat_q<type,  40, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  40, fallback, has_gate>(ctx, args, stream);
+             break;
+         case  48:
+-            launch_mul_mat_q<type,  48, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  48, fallback, has_gate>(ctx, args, stream);
+             break;
+         case  56:
+-            launch_mul_mat_q<type,  56, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  56, fallback, has_gate>(ctx, args, stream);
+             break;
+         case  64:
+-            launch_mul_mat_q<type,  64, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  64, fallback, has_gate>(ctx, args, stream);
+             break;
+         case  72:
+-            launch_mul_mat_q<type,  72, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  72, fallback, has_gate>(ctx, args, stream);
+             break;
+         case  80:
+-            launch_mul_mat_q<type,  80, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  80, fallback, has_gate>(ctx, args, stream);
+             break;
+         case  88:
+-            launch_mul_mat_q<type,  88, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  88, fallback, has_gate>(ctx, args, stream);
+             break;
+         case  96:
+-            launch_mul_mat_q<type,  96, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type,  96, fallback, has_gate>(ctx, args, stream);
+             break;
+         case 104:
+-            launch_mul_mat_q<type, 104, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type, 104, fallback, has_gate>(ctx, args, stream);
+             break;
+         case 112:
+-            launch_mul_mat_q<type, 112, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type, 112, fallback, has_gate>(ctx, args, stream);
+             break;
+         case 120:
+-            launch_mul_mat_q<type, 120, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type, 120, fallback, has_gate>(ctx, args, stream);
+             break;
+         case 128:
+-            launch_mul_mat_q<type, 128, fallback>(ctx, args, stream);
++            launch_mul_mat_q<type, 128, fallback, has_gate>(ctx, args, stream);
+             break;
+         default:
+             fprintf(stderr, "J_best=%d\n", J_best);
+@@ -1559,20 +1652,23 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+     }
+ }
+ 
+-template <ggml_type type>
++template <ggml_type type, bool has_gate = false>
+ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
+     if (args.nrows_x % 128 == 0) {
+         constexpr bool fallback = false;
+-        mul_mat_q_switch_J<type, fallback>(ctx, args, stream);
++        mul_mat_q_switch_J<type, fallback, has_gate>(ctx, args, stream);
+     } else {
+         constexpr bool fallback = true;
+-        mul_mat_q_switch_J<type, fallback>(ctx, args, stream);
++        mul_mat_q_switch_J<type, fallback, has_gate>(ctx, args, stream);
+     }
+ }
+ 
+ #define DECL_MMQ_CASE(type)                                                        \
+     template void mul_mat_q_case<type>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
+ 
++#define DECL_MMQ_CASE_GATE(type)                                                   \
++    template void mul_mat_q_case<type, true>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
++
+ extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
+ extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
+ extern DECL_MMQ_CASE(GGML_TYPE_Q4_0);
+@@ -1602,6 +1698,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+ // -------------------------------------------------------------------------------------------------------------------------
+ 
+ void ggml_cuda_mul_mat_q(
+-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
++        const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+ 
+ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 32d9b78e6..390606f69 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -608,7 +608,6 @@ static __global__ void mul_mat_vec_q(
+     const     int tid = warp_size*threadIdx.y + threadIdx.x;
+     const     int row0 = rows_per_cuda_block*blockIdx.x;
+     const     int blocks_per_row_x = ncols_x / qk;
+-    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+ 
+     const uint32_t channel_dst = blockIdx.y;
+ 
+@@ -716,40 +715,54 @@ static __global__ void mul_mat_vec_q(
+     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+ 
+-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+-        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
++    // split (token, row, kblock) items across the thread groups: the plain K-split
++    // loop leaves most groups idle on short-K decode GEMMs (MoE down K=512, router
++    // K=2048, qkv K=8192), wasting ~3/4 of the issue slots on RDNA4
++    const int n_items  = ncols_dst * rows_per_cuda_block * blocks_per_row_x;
++    const int n_groups = nwarps * warp_size / (qi/vdr);
++    const int kqs      = vdr * (tid % (qi/vdr)); // x block quant index when casting the quants to int
++    for (int it = tid / (qi/vdr); it < n_items; it += n_groups) {
++        const int j   = it / (rows_per_cuda_block * blocks_per_row_x);
++        const int rem = it % (rows_per_cuda_block * blocks_per_row_x);
++        const int i   = rem / blocks_per_row_x;
++        const int kbx = rem % blocks_per_row_x;
+ 
+-        // x block quant index when casting the quants to int
+-        const int kqs = vdr * (tid % (qi/vdr));
++        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+ 
+-#pragma unroll
+-        for (int j = 0; j < ncols_dst; ++j) {
+-#pragma unroll
+-            for (int i = 0; i < rows_per_cuda_block; ++i) {
+-                tmp[j][i] += vec_dot_q_cuda(
+-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+-                if constexpr (has_fusion) {
+-                    if (use_gate) {
+-                        tmp_gate[j][i] += vec_dot_q_cuda(
+-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+-                    }
+-                }
++        tmp[j][i] += vec_dot_q_cuda(
++            vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
++        if constexpr (has_fusion) {
++            if (use_gate) {
++                tmp_gate[j][i] += vec_dot_q_cuda(
++                    vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+             }
+         }
+     }
+ 
+-    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+-    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
++    // cross-warp combine: each warp reduces its own lanes first (deterministic
++    // tree), then one value per warp is summed serially by warp 0. The shared
++    // footprint no longer scales with ncols_dst x rows_per_block, which lets the
++    // short-K rows_per_block override fill the thread groups at any batch size.
++    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block];
++    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block];
+ 
+-    if (threadIdx.y > 0) {
++    {
+ #pragma unroll
+         for (int j = 0; j < ncols_dst; ++j) {
+ #pragma unroll
+             for (int i = 0; i < rows_per_cuda_block; ++i) {
+-                tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
++                tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+                 if constexpr (has_fusion) {
+                     if (use_gate) {
+-                        tmp_shared_gate[threadIdx.y-1][j][i][threadIdx.x] = tmp_gate[j][i];
++                        tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
++                    }
++                }
++                if (threadIdx.y > 0) {
++                    tmp_shared[threadIdx.y-1][j][i] = tmp[j][i];
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
++                            tmp_shared_gate[threadIdx.y-1][j][i] = tmp_gate[j][i];
++                        }
+                     }
+                 }
+             }
+@@ -769,19 +782,13 @@ static __global__ void mul_mat_vec_q(
+         for (int i = 0; i < rows_per_cuda_block; ++i) {
+ #pragma unroll
+             for (int l = 0; l < nwarps-1; ++l) {
+-                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
++                tmp[j][i] += tmp_shared[l][j][i];
+                 if constexpr (has_fusion) {
+                     if (use_gate) {
+-                        tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
++                        tmp_gate[j][i] += tmp_shared_gate[l][j][i];
+                     }
+                 }
+             }
+-            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+-            if constexpr (has_fusion) {
+-                if (use_gate) {
+-                    tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
+-                }
+-            }
+ 
+             float result_val = 0.0f;
+             if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+@@ -902,7 +909,6 @@ static __global__ void mul_mat_vec_q_moe(
+     const uint32_t token_idx   = threadIdx.y;
+     const int      row0        = c_rows_per_block*blockIdx.x;
+     const int      blocks_per_row_x = ncols_x / qk;
+-    constexpr int  blocks_per_iter  = vdr * warp_size / qi;
+ 
+     const uint32_t channel_dst = blockIdx.y;
+ 
+@@ -921,17 +927,19 @@ static __global__ void mul_mat_vec_q_moe(
+     float tmp[c_rows_per_block] = {0.0f};
+     float tmp_gate[c_rows_per_block] = {0.0f};
+ 
+-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
++    // split (row, kblock) items across the 8 thread groups: the K-split loop
++    // leaves most groups idle on short-K MoE GEMMs (down K=512 -> 2 K-blocks)
++    const int n_items  = c_rows_per_block * blocks_per_row_x;
++    const int n_groups = warp_size / (qi/vdr);
++    const int kqs      = vdr * (threadIdx.x % (qi/vdr));
++    for (int it = threadIdx.x / (qi/vdr); it < n_items; it += n_groups) {
++        const int i   = it / blocks_per_row_x;
++        const int kbx = it % blocks_per_row_x;
+         const int kby = kbx * (qk/QK8_1);
+-        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+-
+-#pragma unroll
+-        for (int i = 0; i < c_rows_per_block; ++i) {
+-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+-            if constexpr (has_fusion) {
+-                if (use_gate) {
+-                    tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+-                }
++        tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
++        if constexpr (has_fusion) {
++            if (use_gate) {
++                tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+             }
+         }
+     }
+@@ -1056,8 +1064,15 @@ static void mul_mat_vec_q_moe_launch(
+         const uint32_t ncols_dst, const uint32_t ids_stride,
+         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
+ 
+-    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
+-    const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
++    // rows_per_block scaled for short-K expert GEMMs: the item-split loop in
++    // mul_mat_vec_q_moe spreads (row, kblock) items over the 8 thread groups,
++    // so pick rows_per_block to fill them (e.g. the down K=512 -> rpb=4).
++    const int blocks_per_row_x = ncols_x / ggml_cuda_type_traits<type>::qk;
++    int rpb = 2;
++    if (blocks_per_row_x > 0 && blocks_per_row_x < 8) {
++        rpb = std::min((8 + blocks_per_row_x - 1) / blocks_per_row_x, 8);
++    }
++    const int64_t nblocks_rows = (nrows_x + rpb - 1) / rpb;
+     const dim3 block_nums(nblocks_rows, nchannels_dst);
+     const dim3 block_dims(warp_size, ncols_dst);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+@@ -1065,18 +1080,27 @@ static void mul_mat_vec_q_moe_launch(
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+ 
+-    if (has_fusion) {
+-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
+-            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+-            stride_row_x, stride_col_y, stride_col_dst,
+-            stride_channel_x, stride_channel_y, stride_channel_dst,
+-            ncols_dst, ids_stride);
+-    } else {
+-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false>, launch_params,
++    const auto launch = [&](auto rpb_c, auto fusion_c) {
++        constexpr int  RPB   = decltype(rpb_c)::value;
++        constexpr bool CFUSE = decltype(fusion_c)::value;
++        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, RPB, CFUSE>, launch_params,
+             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+             stride_row_x, stride_col_y, stride_col_dst,
+             stride_channel_x, stride_channel_y, stride_channel_dst,
+             ncols_dst, ids_stride);
++    };
++    const auto launch_rpb = [&](auto rpb_c) {
++        if (has_fusion) {
++            launch(rpb_c, std::true_type{});
++        } else {
++            launch(rpb_c, std::false_type{});
++        }
++    };
++    switch (rpb) {
++        case 2:  launch_rpb(std::integral_constant<int, 2>{});  break;
++        case 4:  launch_rpb(std::integral_constant<int, 4>{});  break;
++        case 8:  launch_rpb(std::integral_constant<int, 8>{});  break;
++        default: launch_rpb(std::integral_constant<int, 2>{});  break;
+     }
+ }
+ 
+@@ -1181,110 +1205,102 @@ static void mul_mat_vec_q_switch_ncols_dst(
+     }
+ 
+     switch (ncols_dst) {
+-        case 1: {
+-            // static, else MSVC lambda capture breaks the constexpr uses below
+-            static constexpr int c_ncols_dst = 1;
+-
+-            // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
+-            const auto launch = [&](auto small_k_tag, auto halve_iters_tag) {
+-                constexpr bool c_small_k = decltype(small_k_tag)::value;
+-                // Types the table does not promote would compile a second, identical kernel.
+-                constexpr bool c_promoted =
+-                    calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, true) !=
+-                    calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, false);
+-
+-                constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
+-
+-                // Small-K MoE projections (e.g. the 8-expert down MMID, K=512): a
+-                // single 544 B row per block underutilizes the memory system on RDNA
+-                // (microbench: ~163 -> ~170 GB/s). Process 2 rows per block.
+-                const int blocks_per_row_x = ncols_x / ggml_cuda_type_traits<type>::qk;
+-                const bool use_rpb_moe = has_ids && ncols_dst == 1 && blocks_per_row_x <= 16;
+-
+-                if (use_rpb_moe) {
+-                    const int rpb = 2;
+-                    const dim3 block_nums((nrows_x + rpb - 1) / rpb, nchannels_dst, nsamples_dst);
+-                    const dim3 block_dims(warp_size, calc_nwarps(type, c_ncols_dst, table_id), 1);
+-                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, c_halve_iters, rpb>(
+-                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+-                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+-                        stride_sample_x, stride_sample_y, stride_sample_dst, block_nums, block_dims, 0, ids_stride,
+-                        stream);
+-                } else {
+-                    const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
+-                                                                                nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
+-                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters>(
++        case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: {
++            // dispatch per ncols with a compile-time tag
++            const auto dispatch = [&](auto ncols_tag) {
++                constexpr int c_ncols_dst = decltype(ncols_tag)::value;
++
++                // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
++                const auto launch = [&](auto small_k_tag, auto halve_iters_tag, auto rpb_tag) {
++                    constexpr bool c_small_k = decltype(small_k_tag)::value;
++                    // Types the table does not promote would compile a second, identical kernel.
++                    constexpr bool c_promoted =
++                        calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, true) !=
++                        calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, false);
++
++                    constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
++                    constexpr int  c_rpb         = decltype(rpb_tag)::value;
++
++                    // rows_per_block > 0 (the short-K RDNA override) computes the grid
++                    // from rpb directly; 0 keeps the table config via calc_launch_params.
++                    std::pair<dim3, dim3> dims;
++                    if constexpr (c_rpb > 0) {
++                        dims = { dim3((nrows_x + c_rpb - 1) / c_rpb, nchannels_dst, nsamples_dst),
++                                 dim3(warp_size, calc_nwarps(type, c_ncols_dst, table_id), 1) };
++                    } else {
++                        dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
++                                                        nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
++                    }
++                    mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, c_rpb>(
+                         vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                         channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                         stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
+                         stream);
++                };
++
++                // rows_per_block override for short-K GEMMs: the item-split loop in
++                // mul_mat_vec_q spreads (row, kblock) items over the thread groups, so
++                // pick rows_per_block to fill them on RDNA (the table returns rpb=1
++                // there). The MoE down (K=512) and router (K=2048) previously left
++                // ~3/4 of the issue slots idle on RDNA4.
++                //
++                // The j (token) offset of the item index is j*rpb*blocks; choose rpb
++                // so that rpb*blocks is a multiple of the group count. That kills the
++                // j-dependence and keeps the per-row chunk->group mapping identical
++                // for every ncols_dst - the speculative verify batch (ncols 2..8)
++                // must stay per-row bit-identical to single-token decode
++                // (GREEDY-PURITY.md section 6, invariant 2).
++                if (table_id >= MMVQ_PARAMETERS_RDNA2) {
++                    const int blocks_per_row_x = ncols_x / ggml_cuda_type_traits<type>::qk;
++                    const int qi_type = ggml_cuda_type_traits<type>::qi;
++                    const int n_groups = qi_type > 0
++                        ? calc_nwarps(type, c_ncols_dst, table_id) * warp_size * get_vdr_mmvq(type) / qi_type
++                        : 0;
++                    int rpb = 1;
++                    if (blocks_per_row_x > 0 && n_groups > 0 && blocks_per_row_x < n_groups) {
++                        // fill the groups (ceil) and kill the j-dependence (n_groups/gcd)
++                        int fill = (n_groups + blocks_per_row_x - 1) / blocks_per_row_x;
++                        int a = blocks_per_row_x, b = n_groups;
++                        while (b) {
++                            int t = a % b; a = b; b = t;
++                        }
++                        int inv = n_groups / a;
++                        rpb = std::max(fill, inv);
++                        int p = 1;
++                        while (p < rpb) {
++                            p <<= 1;
++                        }
++                        rpb = std::min(p, 16);
++                    }
++                    switch (rpb) {
++                        case 1:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 1>{});  break;
++                        case 2:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 2>{});  break;
++                        case 4:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 4>{});  break;
++                        case 8:  launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 8>{});  break;
++                        case 16: launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 16>{}); break;
++                        default: GGML_ABORT("unreachable"); break;
++                    }
++                } else if (should_use_small_k(c_ncols_dst)) {
++                    launch(std::true_type{},  std::false_type{}, std::integral_constant<int, 0>{});
++                } else if (should_halve_iters()) {
++                    launch(std::false_type{}, std::true_type{}, std::integral_constant<int, 0>{});
++                } else {
++                    launch(std::false_type{}, std::false_type{}, std::integral_constant<int, 0>{});
+                 }
+             };
+ 
+-            if (should_use_small_k(c_ncols_dst)) {
+-                launch(std::true_type{},  std::false_type{});
+-            } else if (should_halve_iters()) {
+-                launch(std::false_type{}, std::true_type{});
+-            } else {
+-                launch(std::false_type{}, std::false_type{});
++            switch (ncols_dst) {
++                case 1: dispatch(std::integral_constant<int, 1>{}); break;
++                case 2: dispatch(std::integral_constant<int, 2>{}); break;
++                case 3: dispatch(std::integral_constant<int, 3>{}); break;
++                case 4: dispatch(std::integral_constant<int, 4>{}); break;
++                case 5: dispatch(std::integral_constant<int, 5>{}); break;
++                case 6: dispatch(std::integral_constant<int, 6>{}); break;
++                case 7: dispatch(std::integral_constant<int, 7>{}); break;
++                case 8: dispatch(std::integral_constant<int, 8>{}); break;
++                default: GGML_ABORT("fatal error"); break;
+             }
+         } break;
+-        case 2: {
+-            constexpr int c_ncols_dst = 2;
+-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+-                 dims.first, dims.second, 0, ids_stride, stream);
+-        } break;
+-        case 3: {
+-            constexpr int c_ncols_dst = 3;
+-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+-                 dims.first, dims.second, 0, ids_stride, stream);
+-        } break;
+-        case 4: {
+-            constexpr int c_ncols_dst = 4;
+-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+-                 dims.first, dims.second, 0, ids_stride, stream);
+-        } break;
+-        case 5: {
+-            constexpr int c_ncols_dst = 5;
+-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+-                 dims.first, dims.second, 0, ids_stride, stream);
+-        } break;
+-        case 6: {
+-            constexpr int c_ncols_dst = 6;
+-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+-                 dims.first, dims.second, 0, ids_stride, stream);
+-        } break;
+-        case 7: {
+-            constexpr int c_ncols_dst = 7;
+-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+-                 dims.first, dims.second, 0, ids_stride, stream);
+-        } break;
+-        case 8: {
+-            constexpr int c_ncols_dst = 8;
+-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+-            mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+-                 channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+-                 dims.first, dims.second, 0, ids_stride, stream);
+-        } break;
+         default:
+             GGML_ABORT("fatal error");
+             break;
+diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+index d7cd27167..92db7c201 100755
+--- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
++++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+@@ -50,6 +50,16 @@ SOURCE_MMQ = """// This file has been autogenerated by generate_cu_files.py, do
+ DECL_MMQ_CASE({type});
+ """
+ 
++# fused gate+up+GLU MMQ kernel: enabled types (Q6_K first, extend as validated)
++MMQ_GATE_TYPES = ["GGML_TYPE_Q3_K", "GGML_TYPE_Q4_K", "GGML_TYPE_Q5_K", "GGML_TYPE_Q8_0", "GGML_TYPE_Q6_K"]
++
++SOURCE_MMQ_GATE = """// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../mmq.cuh"
++
++DECL_MMQ_CASE_GATE({type});
++"""
++
+ SOURCE_MMF = """// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+ 
+ #include "../mmf.cuh"
+@@ -106,6 +116,10 @@ for type in TYPES_MMQ:
+     with open(f"mmq-instance-{get_short_name(type)}.cu", "w") as f:
+         f.write(SOURCE_MMQ.format(type=type))
+ 
++for type in MMQ_GATE_TYPES:
++    with open(f"mmq-instance-{get_short_name(type)}.cu", "a") as f:
++        f.write(SOURCE_MMQ_GATE.format(type=type))
++
+ for type in range(1, 17):
+     with open(f"mmf-instance-ncols_{type}.cu", "w") as f:
+         f.write(SOURCE_MMF.format(type=type))
+diff --git a/ggml/src/ggml-cuda/template-instances/mmq-instance-q3_k.cu b/ggml/src/ggml-cuda/template-instances/mmq-instance-q3_k.cu
+index ffb6213af..9e89727a9 100644
+--- a/ggml/src/ggml-cuda/template-instances/mmq-instance-q3_k.cu
++++ b/ggml/src/ggml-cuda/template-instances/mmq-instance-q3_k.cu
+@@ -3,3 +3,4 @@
+ #include "../mmq.cuh"
+ 
+ DECL_MMQ_CASE(GGML_TYPE_Q3_K);
++DECL_MMQ_CASE_GATE(GGML_TYPE_Q3_K);
+-- 
+2.55.0
+

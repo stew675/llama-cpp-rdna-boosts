@@ -14,7 +14,7 @@ llama.cpp checkout at the fork point **`0eadefebd`** (re-based 2026-09-01; previ
   GDN, BF16 KV, WMMA flash-attn, CPU bit-identical decode, host-buffer
   revert, meta wrapper skip, fused core, meta headroom, k-quant boosts,
   CUDA prefill-graph skip.
-- Block **12** (`patches/12-hybrid-allreduce-hip.patch`): the hybrid HIP
+- Block **12** (`patches/0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch`): the hybrid HIP
   all-reduce (custom internal AR for the small-tensor decode path +
   per-size hybrid dispatch vs RCCL), **RDNA4-only** (gfx1200/gfx1201; falls
   back to RCCL elsewhere). The fused-stage/pacing experiments it spawned are
