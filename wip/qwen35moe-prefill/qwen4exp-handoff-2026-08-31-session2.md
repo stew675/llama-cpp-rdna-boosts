@@ -473,3 +473,72 @@ New op GGML_OP_FLASH_ATTN_QSA + fused sparse-FA kernel:
 ### Debug envs (kept in tree deliberately)
 - LLAMA_QSA_SPARSE_FA=1: enable sparse path (default off)
 - GGML_CUDA_QSA_IDENTITY=1: idx = 0..n_top_k-1 (dense-equivalent validation)
+
+## UPDATE 11: QSA kernel optimized (tiled + all-heads-per-block) - 12-56% over dense
+
+### Diagnosis chain (how we got here)
+1. First tiled kernel was 30-40% GPU util and only parity with dense.
+2. OP_TIMING (with -v, GGML_CUDA_OP_TIMING=1): FLASH_ATTN_QSA = 18.3ms =
+   53-55% of the layer at pp8192/ub2048. Per-GPU traffic = 12 heads x
+   2048 tok x 2051 cells x 1KB = 50.4 GB/layer -> 2.75 TB/s ~= L2 ceiling.
+   CONCLUSION: the kernel was L2-BANDWIDTH bound because each block handled
+   ONE head and all 12 heads re-gathered the SAME K/V cells (idx is
+   per-token, shared across heads; gqa 12:1).
+3. User observation (important diagnostic): runs that were SLOWER pinned
+   GPUs at 100% (OP_TIMING event instrumentation serializes the pipeline
+   = busy-wait, not useful work); the 1750 t/s runs sat at 35% = useful
+   latency-bound work. More GPU% is NOT the goal; more work in flight is.
+
+### Kernel changes (all committed, qwen4exp @ 554691a72)
+1. Tile the top-k loop: 32-cell tiles, one online-softmax update per tile
+   (was per-cell). The serial KQ_max/KQ_sum/VKQ dependency chain per cell
+   is the fundamental latency source; tiling amortizes it 32x.
+2. 8-lane lane-groups (NTHREADS_KQ=8): 4 cells in flight per warp step,
+   cheap 3-shuffle reduces, Q replicated per lane strided like vec kernel.
+3. ALL-HEADS-PER-BLOCK (the L2 fix): block = (32, ne02) threads = 1 token
+   column x all q-heads; warp w = head w. All heads read the same idx and
+   K/V cells -> L1 shared lines -> 1 L2 fetch per cell instead of 12.
+   grid = (n_tps, 1, n_stream). FLASH_ATTN_QSA: 18.3 -> 16.0 ms at pp8192.
+4. Fixed OOB idx read exposed when removing the w!=0 branch (clamp
+   cell_c index with c < tile_len).
+5. vgpr: D=256 F16 77, BF16 105 (was 225 with full VKQ unroll - dropped
+   the VKQ c-loop unroll, kept score-loop unroll).
+
+### Measured (sparse vs dense, ub2048, tensor, t16, GGML_CUDA_FA_WMMA_256=0)
+| depth | dense | sparse | delta |
+|-------|-------|--------|-------|
+| pp2048 | 2028 | 1857 | -8% (n_kv<=width, near-dense case) |
+| pp8192 | 1935 | 1880 | -3% |
+| pp16384 | 1716 | 1836 | +7% |
+| pp32768 | 1381 | 1718 | +24% |
+| pp65536 | 995 | 1549 | +56% |
+Attention is now depth-constant (2051 cells at any n_kv); residual
+falloff = indexer/top-k/mask ops. Correctness: logitdump A/B max diff
+6.50 / top-1 84% (envelope: tile-vs-WMMA 7.28/84.8%), no NaN.
+
+### Where the remaining ~35% GPU goes (next optimization target)
+After the L2 fix the kernel is NOT L2-bound anymore (4.2 GB/layer ->
+262 GB/s, way under L2 bw). It is LATENCY bound on the per-warp serial
+score->softmax->VKQ chain: ~3.5% of compute peak (51.6 GFLOP/layer at
+3.2 TFLOP/s vs ~90+ TFLOP/s FP16 peak). The 12 warps/block all walk
+the same cell sequence but independently; the next lever is either:
+a) stage K/V tiles in shared memory (tile-FA style) so the 12 heads
+   read from LDS instead of L1/L2, amortizing latency across heads;
+b) software-pipeline the score pass (prefetch next tile's K while
+   current softmax runs);
+c) process 2 columns/block (grid.x halved, more warps to hide latency).
+Expected ceiling if latency fully hidden: ~3x current (~5000+ t/s at 16K).
+
+### Model-family note (user question: does this map to other models?)
+YES - the op is model-agnostic. Same indexer->top-k->set_rows-mask
+pattern exists in: deepseek4.cpp (LID attn), deepseek32.cpp (DSA),
+glm-dsa.cpp (GLM-5 DSA), dots3note.cpp, dflash.cpp, minimax-m3.cpp,
+eagle3.cpp. GGML_OP_FLASH_ATTN_QSA takes exactly the inputs they
+already produce (q, k, v, per-token top-k idx, base mask). Only the
+graph wiring in build_attn_qsa is qwen4exp-specific. Strong upstream
+story: sparse attention is a general primitive.
+
+### Tree state
+qwen4exp @ 554691a72 (committed, clean). Debug envs kept:
+LLAMA_QSA_SPARSE_FA=1 (enable), GGML_CUDA_QSA_IDENTITY=1 (validation).
+The FADBG/CPU_REF/QSA_DEBUG instrumentation was removed earlier.
