@@ -5,28 +5,24 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
 
 ## Priority (next session)
 
-### [NEXT TASK] Multi-token MUL_MAT_ID mmvq `x_scale_channel_dst` fusion
+### [DONE 2026-09-02] Multi-token MUL_MAT_ID mmvq `x_scale_channel_dst` fusion
 - What: the `ffn_moe_weighted = moe_down * topk_weights` MUL fold (block 08's
   arm in ggml-cuda.cu try_fuse) only supports SINGLE-token decode (n=1). The
   kernel epilogue applies `x_scale[channel_dst]` = one scalar per expert, which
   is correct only when all batch tokens share one expert weight. Multi-token
-  topk weights are per-(expert, token) (shape [1, n_used, n_tokens]), which the
-  kernel cannot express (assert: `nelements(x_scale) == dst->ne[1]`).
-- Why it surfaced NOW: upstream 0eadefebd changed the mmvq gate from
-  `dst->ne[2] != 1` (single-token only) to `dst->ne[2] > get_mmvq_mmid_max_batch(...)`
-  (admits multi-token), so the block-08 arm now fires for n>1 and the kernel
-  assert aborts. Old tree never hit it (old gate blocked n>1).
-- Interim fix APPLIED (in the block-13 tree): gate the arm with
-  `mm_node->ne[2] == 1` - restores old verified semantics (multi-token keeps the
-  separate MUL op, bit-exact). test-backend-ops green.
-- "Done": extend both kernels to index x_scale by (expert, token) and remove
-  the gate; validate bit-exactness + perf on spec-dec verify batches (n=2..8).
-  Real feature work, NOT a trivial gate removal.
-- Where: `ggml-cuda.cu` try_fuse (block-08 arm) + the mmvq kernel epilogue in
-  `mmvq.cu` (`mul_mat_vec_q` / `mul_mat_vec_q_moe` x_scale handling).
-- Note: this is the block-08 arm, NOT the block-13 fused-gate MMQ (that one is
-  the prefill path). Verify the arm is still the mmvq single-token fold and
-  that multi-token spec-dec verify batches (n=2..8) are the target.
+  topk weights are per-(expert, token) (shape [1, n_used, n_tokens]).
+- Why it surfaced: upstream 0eadefebd changed the mmvq gate to admit
+  multi-token, so the block-08 arm fired for n>1 and the launcher assert
+  aborted. Interim fix was gating to mm_node->ne[2] == 1 (bit-exact fallback).
+- FIXED (fork 9db2fcbdc, committed): try_fuse gate removed + weights shape
+  checked; `mul_mat_vec_q_moe` now applies `x_scale[channel_dst +
+  token_idx*nchannels_dst]` (per-(expert, token)); moe launcher routes
+  x_scale_channel_dst into has_fusion and passes nchannels_dst; launcher
+  assert relaxed to nelements == ne1*ne2. test-backend-ops sweep extended
+  with the block-13 fused types Q8_0/Q6_K/Q5_K/Q3_K/IQ2_XS (bs 1/4/512).
+- Validated: 16222/16222 test-backend-ops pass (multi-token n=4 goes through
+  the moe kernel, bit-exact vs CPU ref); real qwen35moe -ub 4 (multi-token
+  prefill) runs clean; single-token decode unchanged (tg128 82.8-83.2).
 
 ### [OPEN] File upstream llama.cpp issue: unaligned-width split-load on ROCm
 - The block-13 load fix (below) works around an UPSTREAM bug: H2D 2D copies
@@ -108,25 +104,6 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
   7900XTX. Ask for help in the blocks repo (issue or a 7900XTX-owner
   thread); the gate makes the fallback safe (RCCL) so a volunteer can test
   with `GGML_CUDA_ALLREDUCE=internal` and report the matrix.
-
-### [OPEN] Multi-token MUL_MAT_ID mmvq `x_scale_channel_dst` fusion
-- What: the `ffn_moe_weighted = moe_down * topk_weights` MUL fold (block 08's
-  arm in ggml-cuda.cu try_fuse) only supports SINGLE-token decode (n=1). The
-  kernel epilogue applies `x_scale[channel_dst]` = one scalar per expert, which
-  is correct only when all batch tokens share one expert weight. Multi-token
-  topk weights are per-(expert, token) (shape [1, n_used, n_tokens]), which the
-  kernel cannot express (assert: `nelements(x_scale) == dst->ne[1]`).
-- Why it surfaced NOW: upstream 0eadefebd changed the mmvq gate from
-  `dst->ne[2] != 1` (single-token only) to `dst->ne[2] > get_mmvq_mmid_max_batch(...)`
-  (admits multi-token), so the block-08 arm now fires for n>1 and the kernel
-  assert aborts. Old tree never hit it (old gate blocked n>1).
-- Interim fix APPLIED (in the block-13 working tree): gate the arm with
-  `mm_node->ne[2] == 1` - restores old verified semantics (multi-token keeps the
-  separate MUL op, bit-exact). test-backend-ops green.
-- "Done" would be: extend both kernels to index x_scale by (expert, token) and
-  remove the gate; validate bit-exactness + perf on spec-dec verify batches
-  (n=2..8). Real feature work, NOT a trivial gate removal.
-- MOVED to Priority (next task) 2026-09-01.
 
 ### [OPEN] MXFP4 (and NVFP4) fused gate+up+GLU MMQ (block 13)
 - What: the fused MoE MMQ kernel (`ggml_cuda_mul_mat_q_switch_type_gate`) is

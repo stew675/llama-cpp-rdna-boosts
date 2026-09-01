@@ -144,19 +144,20 @@ with block 13 on the 13-patch series).
   which landed in the 0eadefebd re-base - the launcher now dispatches on
   rpb x has_fusion.  Validated: decode tg128 97.28 vs 92.15 pristine
   (+5.6%, 1-GPU Q6_K).
-- **Two correctness gates** on the try_fuse arms (the 0eadefebd merge
-  admitted cases the kernels cannot express; both required for the
-  multi-token tests upstream added):
-  1. The `x_scale_channel_dst` fold (MoE down x topk weights) is
-     restricted to single-token MUL_MAT_ID: the kernel epilogue applies
-     ONE scale per expert (`x_scale[channel_dst]`), which is correct only
-     when all batch tokens share one expert weight.  Multi-token topk
-     weights are per (expert, token), so those fall back to the separate
-     MUL op (bit-exact, matching the pre-re-base behavior).  Upstream's
-     gate change (`dst->ne[2] > get_mmvq_mmid_max_batch(...)`) admitted
-     multi-token, which the n=1-only kernel cannot express.  Real
-     multi-token support (index x_scale by (expert, token)) is tracked in
-     TODO.md.
+- **Correctness gates** on the try_fuse arms (the 0eadefebd merge
+  admitted cases the kernels could not express):
+  1. The `x_scale_channel_dst` fold (MoE down x topk weights) now
+     supports multi-token MUL_MAT_ID (2026-09-02): the `mul_mat_vec_q_moe`
+     epilogue applies `x_scale[channel_dst + token_idx*nchannels_dst]`, one
+     scalar per (expert, token), matching the topk-weights layout
+     [1, n_expert_used, n_tokens].  try_fuse gates on the weights shape
+     (`weights->ne[2] == mm_node->ne[2]`); the launcher assert allows
+     nelements == ne1*ne2.  Spec-dec verify batches n=2..8 (up to
+     `get_mmvq_mmid_max_batch`) now fuse instead of the separate MUL.
+     Validated: test-backend-ops 16222/16222 (multi-token n=4 exercises
+     the moe kernel, bit-exact vs CPU ref; sweep extended with
+     Q8_0/Q6_K/Q5_K/Q3_K/IQ2_XS); single-token decode unchanged
+     (tg128 82.8-83.2).
   2. The fused MoE MMQ arm is gated to the instantiated type list
      (Q3_K/Q4_K/Q5_K/Q8_0/Q6_K): `ggml_cuda_should_use_mmq` returns true
      for q4_0/q4_1/q5_0/IQ/MXFP4/NVFP4 on RDNA4, which would abort in
