@@ -163,9 +163,21 @@ with block 13 on the 13-patch series).
      `ggml_cuda_mul_mat_q_switch_type_gate`.  MXFP4/NVFP4 support tracked
      in TODO.md.
 - Same-seed coherence IDENTICAL (fusion on vs off), test-backend-ops
-  2/2 OK.  Known non-issue: qwen35moe Q5_K/Q6_K multi-GPU decode hangs at
-  EVERY tested commit (including the old a7cc83bba base) - qwen35moe was
-  only ever validated single-GPU; see TODO.md.
+  2/2 OK.
+- 2026-09-01 (block-13 amendment): fixed the ROCm multi-GPU split-load
+  pathology this block's qwen35moe validation exposed.  H2D 2D copies
+  with a width not multiple of 4 (Q6_K/Q3_K quant blocks are 210/110
+  bytes) take ~1000x longer on ROCm (~2300ms vs ~10ms per tensor), so
+  Q5_K/Q6_K 2-GPU tensor-split loads took ~3min and looked like hangs
+  (the earlier "hangs at EVERY commit" finding was a misdiagnosis -
+  every build was just slow-loading).  `set_tensor_2d` now stages
+  through device memory with an aligned width + unaligned D2D gather
+  (byte-identical, memcmp 0).  Q6_K/Q3_K 2-GPU load now <15s, pp512
+  ~4200-4500 t/s and tg32 ~66-82 t/s matching the pre-regression docs
+  numbers; Q8_0 unchanged.  The slow-load is present in pristine
+  upstream 0eadefebd too (upstream bug, worth filing); the fix ships
+  here because the feature it unblocks (qwen35moe 2-GPU MoE) is
+  block-13's.
 
 ## Server config (the +22% deployment win)
 

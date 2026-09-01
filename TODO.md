@@ -29,15 +29,18 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
   sessions simply waited out the ~3min load. The "hangs at EVERY point"
   bisect result from 09-01 was WRONG: it used timeouts shorter than the
   slow load, so every build "hung".
-- **Fix options (next session):**
-  1. BEST: fix the unaligned 2D copy. Options: (a) pad width to 4 in the
-     loader's set_tensor_2d path (needs the split logic to use 4-aligned
-     granularity), (b) in ggml_backend_meta_buffer_set_tensor, copy each
-     row with aligned chunks, (c) change get_split_granularity for Q6_K/
-     Q3_K so the per-device row copy width is 4-aligned (e.g. lcm to 256
-     already is... verify why width ends up 210).
-  2. File upstream issue: llama.cpp split-load with unaligned quant blocks
-     (Q6_K/Q3_K) is 200x slower than Q8_0 on ROCm 7.14/gfx1201.
+- **FIXED (2026-09-01):** committed into block 13 (fork 834a8d3ff,
+  amended block-13 commit; the fix belongs with the block whose feature
+  exposes it).  `ggml_backend_cuda_buffer_set_tensor_2d` now stages
+  unaligned-width H2D copies through device memory: aligned-width H2D +
+  unaligned D2D gather (both fast).  Verified: standalone memcmp 0;
+  Q6_K/Q3_K 2-GPU load <15s (was ~3min); pp512 ~4200-4500, tg32
+  ~66-82 matching docs-era numbers; Q8_0 unchanged; 13-patch set
+  regenerated + fresh-apply verified byte-identical at 0eadefebd.
+- **Upstream (open):** file llama.cpp issue - split-load 2D H2D copies
+  with width not multiple of 4 (Q6_K/Q3_K quant blocks) are ~1000x
+  slower on ROCm.  Present in pristine 0eadefebd.  The fix could be
+  contributed upstream once the local validation settles.
 - Test harness: run llama-bench with `-ub 512 -p 512 -n 0` and a LONG
   timeout (>= 480s) or `--no-warmup`. Quick probe: measure the copy time in
   the load (or just time how long `load_tensors:` -> first pp row takes).

@@ -1,43 +1,56 @@
-From a14257996a5f65db05a94ebb8d3491588cf3186e Mon Sep 17 00:00:00 2001
+From 834a8d3ff68e3aeeb8f96aefa7e3ab88c283e47b Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 06:50:35 -0500
 Subject: [PATCH 13/13] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
  short-K item-split
 
-Fused MoE prefill MMQ kernel (gate+up+GLU triple as one MMQ kernel,
-RDNA4-gated, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode mmvq item-split
-((row, kblock) items across thread groups, rpb dispatch 2/4/8) merged
-with the upstream has_fusion mmvq path.
-
-Two correctness gates on the try_fuse arms (the fresh 0eadefebd merge
-admitted cases the kernels cannot express):
-- x_scale_channel_dst fold restricted to single-token MUL_MAT_ID
-  (multi-token topk weights are per (expert, token); falls back to the
-  separate MUL op, matching the pre-re-base behavior)
-- fused MoE MMQ arm gated to the instantiated type list (the other
-  mmq_supported types aborted in switch_type_gate)
-
-Includes the GGML_CUDA_OP_TIMING fusion brackets (FUSED op visibility).
-
-Validated on 1-GPU qwen35moe (the verified config): prefill pp16384
-Q6_K +5.1%, Q4_K_M +3.6%; decode tg128 +5.6% (97.28 vs 92.15 pristine);
-same-seed coherence IDENTICAL; test-backend-ops 2/2 OK.
-
-Assisted-by: Claude Sonnet
+Also fixes the ROCm multi-GPU split-load pathology exposed by the MoE
+block's qwen35moe validation: H2D 2D copies with a width not multiple of
+4 (Q6_K/Q3_K quant blocks are 210/110 bytes) take ~1000x longer on ROCm
+(~2300ms vs ~10ms per tensor), making Q5_K/Q6_K 2-GPU tensor-split loads
+look like hangs (~3min vs ~20s). set_tensor_2d now stages through device
+memory with an aligned width + unaligned D2D gather; verified byte-
+identical (memcmp 0), Q6_K/Q3_K 2-GPU load <15s, pp512 ~4500 t/s and
+tg32 ~82 t/s matching the pre-regression docs numbers, Q8_0 unchanged.
 ---
- ggml/src/ggml-cuda/ggml-cuda.cu               |  54 ++-
+ ggml/src/ggml-cuda/ggml-cuda.cu               |  72 +++-
  ggml/src/ggml-cuda/mmq.cu                     |  46 ++-
  ggml/src/ggml-cuda/mmq.cuh                    | 165 ++++++++--
  ggml/src/ggml-cuda/mmvq.cu                    | 308 +++++++++---------
  .../template-instances/generate_cu_files.py   |  14 +
  .../template-instances/mmq-instance-q3_k.cu   |   1 +
- 6 files changed, 402 insertions(+), 186 deletions(-)
+ 6 files changed, 420 insertions(+), 186 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 24a65620b..72ed8b3d1 100644
+index 24a65620b..614881ff8 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3432,8 +3432,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -814,6 +814,24 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
++    if (size % 4 != 0 && stride_data % 4 == 0) {
++        // H2D 2D copies with a width not multiple of 4 take a pathologically slow
++        // path on ROCm (measured ~1000x slower: Q6_K/Q3_K quant blocks are 210/110
++        // bytes). Stage through device memory with an aligned width, then gather
++        // with an unaligned-width D2D copy (both fast). The source rows are
++        // 4-aligned (stride_data % 4 == 0), so the staging copy reads at most 3
++        // padding bytes past each row, staying inside the mapped source region.
++        const size_t width_aligned = (size + 3) & ~(size_t) 3;
++        char * tmp = nullptr;
++        CUDA_CHECK(cudaMalloc(&tmp, width_aligned * n_copies));
++        CUDA_CHECK(cudaMemcpy2DAsync(tmp, width_aligned, data, stride_data, width_aligned, n_copies,
++                cudaMemcpyHostToDevice, cudaStreamPerThread));
++        CUDA_CHECK(cudaMemcpy2DAsync((char *) tensor->data + offset, stride_tensor, tmp, width_aligned,
++                size, n_copies, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
++        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++        CUDA_CHECK(cudaFree(tmp));
++        return;
++    }
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+@@ -3432,8 +3450,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 0;
      }
  
@@ -52,7 +65,7 @@ index 24a65620b..72ed8b3d1 100644
      // rms_norm + norm-weight MUL whose output feeds an mmvq matmul: fold the
      // Q8_1 quantize into the norm kernel and pre-fill the matmul quantize
      // cache. Consumes only the norm+MUL pair; the matmul dispatch that follows
-@@ -4057,6 +4063,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4057,6 +4081,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  fused_node_count  = 3;
                  break;
              }
@@ -82,7 +95,7 @@ index 24a65620b..72ed8b3d1 100644
          }
      }
  
-@@ -4193,7 +4222,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4193,7 +4240,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          ggml_tensor * mul_node = cgraph->nodes[i + 1];
  
          const int out_nodes[] = { i + 1 };
@@ -94,7 +107,7 @@ index 24a65620b..72ed8b3d1 100644
                  mul_node->src[0] == mm_node &&
                  (mm_node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
                  (mul_node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
-@@ -4590,7 +4622,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4590,7 +4640,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
      const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
      std::vector<cudaEvent_t> op_ev0;
      std::vector<cudaEvent_t> op_ev1;
@@ -103,7 +116,7 @@ index 24a65620b..72ed8b3d1 100644
      if (op_timing) {
          op_ev0.resize(cgraph->n_nodes);
          op_ev1.resize(cgraph->n_nodes);
-@@ -4743,9 +4775,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4743,9 +4793,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue;
                  }
  
@@ -123,7 +136,7 @@ index 24a65620b..72ed8b3d1 100644
  #ifdef GGML_CUDA_DEBUG
                      const int last_fused = i + nodes_to_skip;
                      GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
-@@ -4755,6 +4797,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4755,6 +4815,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      i += nodes_to_skip;
                      continue;
                  }
@@ -131,7 +144,7 @@ index 24a65620b..72ed8b3d1 100644
  #ifndef NDEBUG
                  // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                  // node's output on the host-visible buffer, which the compute path
-@@ -4784,7 +4827,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4784,7 +4845,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
                  if (op_timing) {
                      CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
@@ -140,7 +153,7 @@ index 24a65620b..72ed8b3d1 100644
                  }
  
                  if (!is_concurrent_event_active) {
-@@ -4847,14 +4890,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4847,14 +4908,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          static std::map<std::string, int>    op_cnt_total;
          std::map<std::string, double> op_ms;
          std::map<std::string, int>    op_cnt;
