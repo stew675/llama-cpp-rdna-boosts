@@ -542,3 +542,46 @@ story: sparse attention is a general primitive.
 qwen4exp @ 554691a72 (committed, clean). Debug envs kept:
 LLAMA_QSA_SPARSE_FA=1 (enable), GGML_CUDA_QSA_IDENTITY=1 (validation).
 The FADBG/CPU_REF/QSA_DEBUG instrumentation was removed earlier.
+
+## UPDATE 12: 64K op breakdown + indexer head-sum fusion attempt (REVERTED)
+
+### Findings at depth (GGML_CUDA_OP_TIMING, per QSA layer per ubatch)
+| op | 16K | 32K | 64K | scales with |
+|---|---|---|---|---|
+| FLASH_ATTN_QSA | 14.4 | 11.5 | 11.9 | CONSTANT (ITEM B WIN) |
+| SUM_ROWS (indexer) | 3.6 | 7.2 | 12.7 | n_kv |
+| CONT permuted x3 | 2.6 | 5.0 | 10.6 | n_kv |
+| TOP_K | 2.3 | 3.8 | 7.2 | n_kv |
+| indexer mm | 0.8 | 1.6 | 3.1 | n_kv |
+ITEM B's core goal is ACHIEVED: attention is depth-constant (11.9ms at 64K
+vs dense's 158ms). The remaining depth falloff is the INDEXER pipeline
+(SUM_ROWS + CONT + TOP_K + indexer mm), which the dense path pays too.
+
+### Indexer head-sum fusion (new GGML_OP_INDEXER_HEAD_SUM) - REVERTED
+Built a fused relu + sum-over-heads kernel to replace the
+relu -> cont(permute) -> sum_rows chain (which materializes a 536MB
+[n_head, n_blocks, n_tps] tensor at 64K just to add 4 values per cell).
+- Op: kernel verified bit-correct on its input (host ref == dst on all
+  3 devices, mirrored split).
+- Model-level: fused-vs-dense max diff 6.50/85.5% top1 == old-chain-vs-dense
+  6.50/84.0% (both inside the tile-vs-wmma envelope 7.28/84.8%).
+- BUT: PERF REGRESSED (pp16384 1812 vs 1836, pp65536 1463 vs 1549).
+  The op itself is faster (2.56ms vs SUM_ROWS 3.6 + CONT 2.6) but removing
+  the CONT node changed the graph split/fusion pattern enough to lose more
+  than it gained. REVERTED completely (tree clean at 554691a72).
+
+### Key lesson
+On this model, graph-node-count changes (even beneficial-looking fusions)
+can perturb the splitter/fuser and cost more than the op saves. Always
+measure END-TO-END, not op timing (op timing is graphs-off/inflated).
+The relu+permute+cont+sum_rows chain is a candidate ONLY if the split
+handler for the fused op can replicate the exact split state of the old
+chain (it could not be made to, in this attempt).
+
+### Current state
+- Tree: qwen4exp @ 554691a72 (committed, clean) = tiled + all-heads-per-block
+  sparse QSA kernel. Sparse-vs-dense at 16K: +6% (1796 vs 1694, re-measured
+  this session; absolute numbers drift ~2% with system state/temps).
+- 32K +24%, 64K +56% (from UPDATE 11, measured on fresh boot).
+- Debug envs retained: LLAMA_QSA_SPARSE_FA=1, GGML_CUDA_QSA_IDENTITY=1.
+- No new commits this session (the fusion was reverted).
