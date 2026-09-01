@@ -58,3 +58,31 @@ the current fork keeps all block 01-13 work + ITEM B in one tree.
   fattn-qsa.cu; re-verify the logitdump envelope + depth curve after each
   change. See `wip/qwen4exp/plan-qwen4exp.md` + session-2 handoff.
 - TODO.md: ITEM B remains [IN-PROGRESS] under Active.
+
+## POSTSCRIPT (same session): the pp16384 "1700-2000 t/s" question
+
+The docs-era numbers (pp2048 2028, pp16384 1716, pp65536 995) were
+measured 2026-08-31 on a WARM machine. Re-measuring on 2026-09-02 (same
+old binary 554691a72, same model, same 3-GPU tensor-split cmd) initially
+gave 599-900 t/s, which looked like a regression. It is NOT:
+
+- **Old and new binaries are op-for-op identical**: per-op timing of
+  every MUL_MAT/GET_ROWS/etc matches to ~0.001 ms (node_62 0.251 vs
+  0.248, node_34 0.537 vs 0.537, ...). The re-apply changed nothing in
+  the dense path.
+- **node_56 [2560x15x2048] = 0.215-0.247 ms steady-state** in both
+  (the 626ms/27ms figures in op timing are the one-time hipBLAS JIT
+  (ITEM A) + warmup evals only).
+- **The gap is thermal/clock warmup**: consecutive pp16384 runs on the
+  old binary climbed 1210 -> 1244 -> 1366 -> 1448 -> 1494 -> 1538 ->
+  1563 -> 1577 -> 1591, asymptoting toward the docs 1716 as GPUs warmed
+  to ~60-61C. The GPUs run `manual` DPM (tune_r9700.sh: -70mV UV, 250W
+  cap), sclk S:0MHz -> 500 -> 2350; cold silicon boosts lower and ramps
+  slower per ubatch burst.
+- **The user's nvtop stop-start observation** (80% spikes + idle gaps)
+  is the manual-mode clock ramp between ubatch bursts, not a code issue.
+  Docs-era "steady 35-40%" was the same machine on a warmer, longer run.
+
+Rule for future qwen4exp benches: WARM UP FIRST (2-3 pp runs) before
+recording; report temps alongside numbers; do not compare cold-run
+numbers to the 08-31 warm-run docs values.
