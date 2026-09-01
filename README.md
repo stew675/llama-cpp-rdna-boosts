@@ -184,7 +184,9 @@ for per-block verification and `BASELINE.md` for provenance.
 This work is becoming a community effort and I'd like to offer special thanks to the
 following users for the assistance in finding issues and offering solutions!
 
+- https://github.com/1337hero
 - https://github.com/bakon11
+- https://github.com/briansp2020
 - https://github.com/eoprede
 - https://github.com/tungel
 
