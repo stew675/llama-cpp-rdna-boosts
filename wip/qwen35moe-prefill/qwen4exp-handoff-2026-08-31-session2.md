@@ -405,3 +405,71 @@ Everything committed; no uncommitted work anywhere.
 - ggml/src/ggml-backend-meta.cpp: split handler
 - src/models/qwen4exp.cpp: build_attn_qsa uses new op (env toggle A/B)
 - verify: logitdump A/B sparse vs mask; bench pp16384/65536
+
+## UPDATE 10: ITEM B IMPLEMENTED - sparse FA kernel works, correctness VERIFIED, perf = latency-bound (30-40% GPU)
+
+### What was built (uncommitted working tree on qwen4exp branch)
+New op GGML_OP_FLASH_ATTN_QSA + fused sparse-FA kernel:
+- ggml/include/ggml.h: op enum GGML_OP_FLASH_ATTN_QSA + constructor decls
+- ggml/src/ggml.c: constructor ggml_flash_attn_qsa(q,k,v,idx,mask,scale,softcap)
+  + set_prec/get_prec; op name/desc tables (GGML_OP_COUNT 101->102)
+- ggml/src/ggml-cuda/fattn-qsa.cu (315 lines): vec-style kernel D=64/128/256,
+  F16/BF16 K/V; each block = 4 warps, each warp = 1 token column, walks the
+  token's n_top_k cells: score = dot(Q,K[cell])*scale + mask[cell], online
+  softmax, VKQ += V[cell]*exp(score-max)
+- ggml/src/ggml-cuda/fattn-qsa.cuh: decls only
+- ggml-cuda.cu: dispatch + supported + include
+- ggml-backend-meta.cpp: handle_flash_attn_qsa split (q axis2, kv axis2,
+  idx/mask MIRRORED, result axis1 - mirrors flash_attn_ext)
+- ggml-backend.cpp: allow skip + alloc-size may-expand
+- ggml-rpc.h: op count static assert 101->102
+- src/models/qwen4exp.cpp build_attn_qsa: LLAMA_QSA_SPARSE_FA=1 env gate
+  (default dense mask path); sparse branch does the same view/permute as
+  build_attn_mha internally, calls ggml_flash_attn_qsa, reshape_2d, undoes
+  self_v_rot. Debug envs: GGML_CUDA_QSA_IDENTITY (idx=0..n_top_k-1).
+
+### CORRECTNESS: VERIFIED (two independent checks)
+1. Op-level: GGML_CUDA_QSA_CPU_REF debug computed a host-side reference from
+   the raw Q/K/V/mask/idx tensors (dot in F32, mask add, softmax, V gather);
+   kernel output matched it to ~1e-5 at every checked (layer, head, token).
+2. End-to-end: logitdump A/B (seed 42, 256 tok, tensor split) dense-vs-sparse
+   = max logit diff 7.45, top-1 agreement 84%. CONTROL: llama.cpp's own
+   tile-vs-WMMA FA kernels on the IDENTICAL graph give max diff 7.28, top-1
+   84.8%. So the sparse path is INSIDE llama.cpp's own kernel-variance
+   envelope. The 7.4 spread is the model's 36 recurrent GDN layers amplifying
+   ANY FA rounding difference, not a bug in the sparse kernel. Final answers
+   are coherent and identical in content ("Paris").
+
+### PERF: latency-bound, 30-40% GPU utilization - THE OPPORTUNITY
+- pp16384/ub2048: sparse 1663 t/s vs dense 1716 t/s (parity, no win yet)
+- pp2048 (n_kv=2048=width, near-dense): 1664 vs 2028
+- User observed all GPUs at 30-40% compute while nearly matching dense.
+  Conclusion: sparse does ~1/3 the work of dense (2051 vs 16384 cells) at
+  ~1/3 the GPU util -> if utilization closes, expect ~3x over dense at 16K
+  and more at depth (2051 cells is CONSTANT, dense grows with n_kv).
+- Bottleneck hypothesis: per-warp serial loop over 2051 cells with a
+  dependency chain (KQ_max/softmax update per cell); 1 warp per column
+  (32 lanes on 256-dim dot = only 8 elems/lane); gather pattern on K/V
+  (idx indirection) prevents coalescing/prefetch; no cross-warp softmax
+  combine. 30-40% util = latency-bound on the serial cell loop + gathers.
+
+### Next steps (in priority order)
+1. OPTIMIZE the kernel - this is now the whole ballgame:
+   a. Split the cell loop across warps with the existing
+      flash_attn_combine_results-style partial (max,sum) merge, or
+   b. Two-pass: pass 1 dot all cells into shared (parallel), pass 2
+      softmax + V gather; breaks the serial dependency chain.
+   c. Prefetch K/V for cell i+1 while computing i (double-buffer).
+   d. Larger ncols per block (more tokens per block, reuse Q loads).
+   Measure GGML_CUDA_OP_TIMING per node (didn't print for QSA - check
+   op_timing path includes new op; the grep found 0 "op timing" lines,
+   may need GGML_LOG_LEVEL or it prints on stderr).
+2. Re-verify after optimization: logitdump A/B stays inside the tile-vs-wmma
+   envelope (max diff ~7.3, top-1 ~85% vs baseline control), then measure
+   pp16384/65536/131072.
+3. Commit: this is a working-tree-only change on qwen4exp; snapshot once
+   perf is confirmed.
+
+### Debug envs (kept in tree deliberately)
+- LLAMA_QSA_SPARSE_FA=1: enable sparse path (default off)
+- GGML_CUDA_QSA_IDENTITY=1: idx = 0..n_top_k-1 (dense-equivalent validation)
