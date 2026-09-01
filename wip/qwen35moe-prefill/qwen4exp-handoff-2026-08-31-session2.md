@@ -281,3 +281,39 @@ Two concrete work items, in priority order:
 - n_ctx_train 262144; 200K target is native-range but attention scales
   linearly -> sparse attention is REQUIRED for 200K prefill.
 - Best measured: pp16384 1716, pp65536 995 (ub2048, tensor, t16).
+
+## UPDATE 7: ITEM A RESOLVED - the slow-node anomaly is one-time hipBLAS init
+
+### Symptom recap
+- node_56 (blk.0.ssm_alpha [2560x15] F32 -> hipBLAS): 630ms FIRST eval only
+- node_570 (blk.3.indexer.k_proj [2560x128] BF16 -> hipBLAS): 180ms, looked
+  like every eval, 92% of one graph split
+
+### Root cause (GEMMTIMING instrumentation on the cublasGemmEx call)
+- k_proj BF16 GEMM: first call per DEVICE = 174-189ms (3 GPUs = 3 slow
+  prints), every subsequent identical call = 0.02ms. This is one-time
+  hipBLAS/rocBLAS BF16-kernel setup/JIT for the [2560x128]x[2560xN] shape.
+- ssm_alpha F32 GEMM: 630ms on first process eval only (same one-time cost).
+- MMDISPATCH confirmed: indexer k_proj (type 30 = BF16) and ssm_alpha (F32)
+  go through ggml_cuda_mul_mat_cublas fallback. Never MMQ (should_use_mmq
+  requires quantized src0; BF16/F32 are excluded).
+- ALLREDUCE mode (hybrid/internal/none) does not change the anomaly.
+- NOT disk: weights are resident BF16/F32, tiny, and the cost never repeats
+  after the first call per device.
+
+### Why the op-timing made it look per-eval
+The event bracket in GGML_CUDA_OP_TIMING wraps the whole compute_forward
+including (a) the 3 GPUs' first-call init and (b) waiting for hc_mixed
+(dependency). At pp256 the bracket (184ms) coincidentally matched the eval
+wall time (1031 t/s = 248ms/eval), reinforcing the false "real cost" read.
+
+### Steady-state truth
+k_proj: 0.02ms x 12 indexer layers = negligible. ssm_alpha: F32 0.02ms x 48.
+The BF16 indexer is NOT a depth problem. FLASH_ATTN over full KV remains
+the only linear-in-n_kv cost (35.7ms@16K -> 158ms@64K, ~92% at 64K).
+
+### Takeaway for ITEM B (sparse attention project)
+The indexer side is cheap and correct (BF16, GPU top-k 0.5-0.7ms). The
+sparse-FA kernel only needs to fix the dense attention pass over n_kv.
+Instrumentation (GEMMTIMING/MMDISPATCH/MMQTIMING/SLOWNODE) was removed;
+tree clean at d2548f9af on branch qwen4exp.
