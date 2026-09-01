@@ -363,3 +363,45 @@ Everything committed; no uncommitted work anywhere.
    /sys/bus/pci/devices/0000:{03,06,09}:00.0/power/control
 3. Start ITEM B: sparse attention. Measure pp16384/65536 before/after;
    verify bit-exactness vs the mask path at 16K (logitdump A/B works).
+
+## UPDATE 9: ITEM B DESIGN - fused sparse flash-attention op
+
+### Multi-GPU split (verified via GGML_META_DEBUG=1 at pp256/ub256)
+- Q [256, n_tps, 24, n_stream] split by q-head: 12/12/0 (GPU2: 0 heads)
+- K/V [256, n_kv, 2, n_stream] split by kv-head: 1/1/0 (each active GPU has 1
+  kv-head with the FULL n_kv positions; no cross-GPU softmax combine)
+- top_k, mask: MIRRORED (full copy per GPU; indices valid everywhere)
+- FLASH_ATTN_EXT result split by head: 12/12/0
+- KV cache type: F16 (default cache_type_k/v); prefill uses the TILE kernel
+  (WMMA off, D=256, no MFMA on RDNA4 -> vec needs Q->ne[1]==1)
+
+### Cost model (per layer, both active GPUs, ub2048)
+- dense: 412 GFLOP@16K / 1649 GFLOP@64K -> 35.7ms / 158ms (~5-11 TFLOP/s eff)
+- sparse (n_top_k=2051): 52 GFLOP CONSTANT at any depth -> est 5-8ms/layer
+- 64K win: 158ms -> ~6ms/layer (26x); attention becomes depth-constant
+
+### Design: new op GGML_OP_FLASH_ATTN_QSA (fused, no materialized gather)
+- src0 q   [256, n_tps, 24, n_stream] F32 (FA permuted layout)
+- src1 k   [256, n_kv, 2, n_stream]   F16 cache view
+- src2 v   [256, n_kv, 2, n_stream]   F16 cache view
+- src3 idx [n_top_k, n_tps, 1, n_stream] I32 (top_k from build_qsa_top_k)
+- src4 mask [n_kv, n_tps, 1, n_stream] F16 (base kq_mask, gathered in-kernel)
+- params: scale (+ softcap if model uses it)
+- dst [256, 24, n_tps, n_stream] (same as FA result)
+- kernel: vec-style D=256; per (stream, head, token block): for i in 0..n_top_k:
+  cell=idx[i,j,s]; score=dot(Q[j],K[cell])*scale+mask[cell,j,s]; online softmax;
+  VKQ += V[cell]*exp(score-max). Reads only 2051 cells/token.
+- split handler: mirror handle_flash_attn_ext (q axis2, kv axis2, idx/mask
+  mirrored, result axis1)
+- correctness: exp(-inf)=0 so gathered+mask == mask path mathematically; FP
+  accumulation order differs (top_k order vs cell order) -> expect logitdump
+  max-diff ~1e-5 relative, same class as vec-vs-tile FA diff. VERIFY + report.
+
+### Files to touch
+- ggml/include/ggml.h: op enum + constructor decl
+- ggml/src/ggml.c: constructor + name/desc/params tables
+- ggml/src/ggml-cuda/fattn-qsa.cuh: kernel (vec-style)
+- ggml/src/ggml-cuda/ggml-cuda.cu: dispatch + supported + alloc size
+- ggml/src/ggml-backend-meta.cpp: split handler
+- src/models/qwen4exp.cpp: build_attn_qsa uses new op (env toggle A/B)
+- verify: logitdump A/B sparse vs mask; bench pp16384/65536
