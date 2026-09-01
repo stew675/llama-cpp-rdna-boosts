@@ -206,7 +206,7 @@ index 000000000..ab9f98818
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index d34d1c9c5..8232190e9 100644
+index 851a47b9a..864b91b96 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,7 @@
@@ -225,7 +225,7 @@ index d34d1c9c5..8232190e9 100644
      {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
      {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
      {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
-@@ -1397,8 +1399,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1357,8 +1359,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      std::vector<int>                i_last;
      std::vector<std::vector<float>> chain_h;
  
@@ -242,7 +242,7 @@ index d34d1c9c5..8232190e9 100644
          , params(params.draft)
      {
          auto * ctx_tgt = this->params.ctx_tgt;
-@@ -1410,6 +1418,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1370,6 +1378,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  "MTP input row width must match the target h_nextn width");
          n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
  
@@ -254,7 +254,7 @@ index d34d1c9c5..8232190e9 100644
          SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
          SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
          SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
-@@ -1457,6 +1470,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1417,6 +1430,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
          chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
  
@@ -264,7 +264,7 @@ index d34d1c9c5..8232190e9 100644
          if (chain_heads) {
              this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
  
-@@ -1467,6 +1483,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1427,6 +1443,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
          this->n_max = this->params.n_max;
  
@@ -293,7 +293,7 @@ index d34d1c9c5..8232190e9 100644
          pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
  
          i_last.assign(n_seq, -1);
-@@ -1503,6 +1541,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1463,6 +1501,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              return;
          }
  
@@ -306,7 +306,7 @@ index d34d1c9c5..8232190e9 100644
          auto * ctx_dft = this->params.ctx_dft;
          const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
  
-@@ -1655,6 +1699,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1615,6 +1659,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              drafting[seq_id] = true;
              common_sampler_reset(smpls[seq_id].get());
  
@@ -320,7 +320,7 @@ index d34d1c9c5..8232190e9 100644
              common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
              std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
  
-@@ -1731,7 +1782,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1691,7 +1742,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
  
                  result.push_back(id);
  
@@ -329,7 +329,7 @@ index d34d1c9c5..8232190e9 100644
                      drafting[seq_id] = false;
                      n_drafting--;
                      continue;
-@@ -1778,17 +1829,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1738,17 +1789,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  continue;
              }
  
@@ -364,7 +364,7 @@ index d34d1c9c5..8232190e9 100644
          const int32_t n_rows = verify_h_rows[seq_id];
          if (n_rows <= 0) {
              return;
-@@ -2283,6 +2349,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
+@@ -2243,6 +2309,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
          case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
          case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
          case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
@@ -372,7 +372,7 @@ index d34d1c9c5..8232190e9 100644
          case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
          case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
          case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
-@@ -2374,6 +2441,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
+@@ -2334,6 +2401,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
              case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
              case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
@@ -380,7 +380,7 @@ index d34d1c9c5..8232190e9 100644
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
              case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                  n_max = std::max(n_max, std::max(0, spec->draft.n_max));
-@@ -2560,7 +2628,10 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2520,7 +2588,10 @@ common_speculative_init_result::common_speculative_init_result(
      const bool has_draft = params.speculative.has_dft();
      const bool spec_mtp = std::find(params.speculative.types.begin(),
                                      params.speculative.types.end(),
@@ -392,7 +392,7 @@ index d34d1c9c5..8232190e9 100644
  
      auto mparams = common_model_params_to_llama(params);
      auto cparams = common_context_params_to_llama(params);
-@@ -2652,7 +2723,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2612,7 +2683,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
@@ -401,7 +401,7 @@ index d34d1c9c5..8232190e9 100644
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -2665,6 +2736,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2625,6 +2696,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
@@ -409,7 +409,7 @@ index d34d1c9c5..8232190e9 100644
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
      }
-@@ -2684,7 +2756,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2644,7 +2716,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
@@ -2278,10 +2278,10 @@ index e5ccd1fea..63d7e40b5 100644
      float glu_limit = 0.0f;
  };
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index 7f4cfd551..780b7aa63 100644
+index 387e70fa1..3e76c6275 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-@@ -158,19 +158,19 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
+@@ -159,19 +159,19 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
      GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 2,  32, 128, 128, 128, 1, true);
      GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32, 128, 128, 128, 1, true);
      GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 1, true);
@@ -2308,7 +2308,7 @@ index 7f4cfd551..780b7aa63 100644
      GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 128, 2,  32, 160, 128, 128, 1, true);
  
      return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
-@@ -1687,7 +1687,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1712,7 +1712,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  }
              }
          }
@@ -2319,7 +2319,7 @@ index 7f4cfd551..780b7aa63 100644
              __syncthreads();
          }
      }
-@@ -1759,7 +1761,7 @@ static __global__ void flash_attn_ext_f16(
+@@ -1784,7 +1786,7 @@ static __global__ void flash_attn_ext_f16(
  #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
  
  #if defined(AMD_WMMA_AVAILABLE)
@@ -2328,7 +2328,7 @@ index 7f4cfd551..780b7aa63 100644
          NO_DEVICE_CODE;
          return;
      }
-@@ -1839,6 +1841,11 @@ static __global__ void flash_attn_ext_f16(
+@@ -1864,6 +1866,11 @@ static __global__ void flash_attn_ext_f16(
                   ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
          }
  
@@ -6313,7 +6313,7 @@ index 000000000..910c99594
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a6fc655c4..6965879fa 100644
+index 31f5aeeac..24a65620b 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -71,6 +71,7 @@
@@ -6669,7 +6669,7 @@ index a6fc655c4..6965879fa 100644
  static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm,
                                                      const ggml_tensor * mul,
                                                      const ggml_tensor * rope) {
-@@ -3287,6 +3433,40 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3288,6 +3434,40 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      ggml_tensor * node = cgraph->nodes[i];
  
@@ -6710,7 +6710,7 @@ index a6fc655c4..6965879fa 100644
      // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
      if (node->op == GGML_OP_GATED_DELTA_NET) {
          ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
-@@ -3472,6 +3652,72 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3473,6 +3653,72 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      bool fused_mul_mat_vec = false;
      int  fused_node_count  = 0;
  
@@ -6783,7 +6783,7 @@ index a6fc655c4..6965879fa 100644
      auto get_mul_mat_scale = [](const ggml_tensor * scale_node, const ggml_tensor * mm_node) -> const ggml_tensor * {
          const bool scale_lhs_mm = scale_node->src[0] == mm_node;
          const bool scale_rhs_mm = scale_node->src[1] == mm_node;
-@@ -3817,6 +4063,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3818,6 +4064,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  
@@ -6818,7 +6818,7 @@ index a6fc655c4..6965879fa 100644
      fused_mul_mat_vec = false;
      fused_node_count  = 0;
  
-@@ -3908,28 +4182,216 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3909,28 +4183,216 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  
@@ -7042,7 +7042,7 @@ index a6fc655c4..6965879fa 100644
                  continue;
              }
              bias_tensor = bias_node->src[1];
-@@ -3953,14 +4415,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3954,14 +4416,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
              ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
              fused_mul_mat_vec = true;
@@ -7059,7 +7059,7 @@ index a6fc655c4..6965879fa 100644
              break;
          }
      }
-@@ -3989,6 +4451,96 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3990,6 +4452,96 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 1;
      }
  
@@ -7156,7 +7156,7 @@ index a6fc655c4..6965879fa 100644
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
          ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
          return 2;
-@@ -4002,7 +4554,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4003,7 +4555,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
@@ -7176,7 +7176,7 @@ index a6fc655c4..6965879fa 100644
          return 1;
      }
  
-@@ -4022,6 +4585,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4023,6 +4586,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
      bool graph_evaluated_or_captured = false;
  
@@ -7203,7 +7203,7 @@ index a6fc655c4..6965879fa 100644
      // flag used to determine whether it is an integrated_gpu
      const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
  
-@@ -4188,12 +4771,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4189,12 +4772,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  GGML_UNUSED(integrated);
  #endif  // NDEBUG
  
@@ -7225,7 +7225,7 @@ index a6fc655c4..6965879fa 100644
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
                 }
-@@ -4208,6 +4800,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4209,6 +4801,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  graph->graph = nullptr;
              }
  
@@ -7244,7 +7244,7 @@ index a6fc655c4..6965879fa 100644
              CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
              graph_evaluated_or_captured = true; // CUDA graph has been captured
  
-@@ -4235,6 +4839,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4236,6 +4840,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          graph_evaluated_or_captured = true;
  #endif  // USE_CUDA_GRAPH
      }
@@ -7303,7 +7303,7 @@ index a6fc655c4..6965879fa 100644
  }
  
  #ifdef USE_CUDA_GRAPH
-@@ -4259,19 +4915,34 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4260,19 +4916,34 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_set_device(cuda_ctx->device);
  
@@ -7339,7 +7339,7 @@ index a6fc655c4..6965879fa 100644
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
  
              if (!graph->warmup_complete) {
-@@ -4294,6 +4965,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4295,6 +4966,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      cuda_graph_update_required = graph->instance == nullptr;
                  }
              }
@@ -7457,7 +7457,7 @@ index c978b4421..0998f7bca 100644
          if (ggml_cuda_mmq_get_config(type, ret, fallback, cc).type != GGML_TYPE_COUNT) {
              return ret;
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 79f7a3f6f..268ce29a1 100644
+index 2be2f2491..32d9b78e6 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -21,9 +21,9 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
@@ -7759,7 +7759,7 @@ index 79f7a3f6f..268ce29a1 100644
      }
      if constexpr (type != GGML_TYPE_NVFP4) {
          GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
-@@ -851,7 +933,7 @@ static std::pair<dim3, dim3> calc_launch_params(
+@@ -932,7 +1014,7 @@ static std::pair<dim3, dim3> calc_launch_params(
      return {block_nums, block_dims};
  }
  
@@ -7768,7 +7768,7 @@ index 79f7a3f6f..268ce29a1 100644
  static void mul_mat_vec_q_switch_fusion(
          const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
          const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
-@@ -862,11 +944,12 @@ static void mul_mat_vec_q_switch_fusion(
+@@ -943,11 +1025,12 @@ static void mul_mat_vec_q_switch_fusion(
          const uint32_t ids_stride, cudaStream_t stream) {
  
      const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
@@ -7783,7 +7783,7 @@ index 79f7a3f6f..268ce29a1 100644
                   vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                   channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                   sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-@@ -877,7 +960,7 @@ static void mul_mat_vec_q_switch_fusion(
+@@ -958,7 +1041,7 @@ static void mul_mat_vec_q_switch_fusion(
      GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
  
      const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
@@ -7792,7 +7792,7 @@ index 79f7a3f6f..268ce29a1 100644
          vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
          channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
          sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-@@ -1020,13 +1103,30 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1112,13 +1195,30 @@ static void mul_mat_vec_q_switch_ncols_dst(
  
                  constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
  
@@ -7830,8 +7830,8 @@ index 79f7a3f6f..268ce29a1 100644
              };
  
              if (should_use_small_k(c_ncols_dst)) {
-@@ -1283,8 +1383,8 @@ void ggml_cuda_mul_mat_vec_q(
-         GGML_ASSERT( !ids || dst->ne[2] == 1);
+@@ -1376,8 +1476,8 @@ void ggml_cuda_mul_mat_vec_q(
+         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
          GGML_ASSERT(  ids || dst->ne[1] == 1);
          // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
 -        // non-negligible for some models such as gpt-oss-20b
@@ -7841,7 +7841,7 @@ index 79f7a3f6f..268ce29a1 100644
  
          if (fusion->x_bias) {
              GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
-@@ -1305,9 +1405,23 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1398,9 +1498,23 @@ void ggml_cuda_mul_mat_vec_q(
          if (fusion->x_scale) {
              GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
              GGML_ASSERT(ggml_is_contiguous(fusion->x_scale));
@@ -7866,7 +7866,7 @@ index 79f7a3f6f..268ce29a1 100644
          if (fusion->gate_scale) {
              GGML_ASSERT(fusion->gate_scale->type == GGML_TYPE_F32);
              GGML_ASSERT(ggml_is_contiguous(fusion->gate_scale));
-@@ -1316,6 +1430,10 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1409,6 +1523,10 @@ void ggml_cuda_mul_mat_vec_q(
          }
          fusion_local.glu_op = fusion->glu_op;
          fusion_local.glu_limit = fusion->glu_limit;
@@ -7877,7 +7877,7 @@ index 79f7a3f6f..268ce29a1 100644
      }
  
      // If src0 is a temporary compute buffer, clear any potential padding.
-@@ -1330,12 +1448,22 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1423,12 +1541,22 @@ void ggml_cuda_mul_mat_vec_q(
      }
  
      const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -7906,7 +7906,7 @@ index 79f7a3f6f..268ce29a1 100644
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1361,12 +1489,466 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1454,12 +1582,466 @@ void ggml_cuda_mul_mat_vec_q(
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
      mul_mat_vec_q_switch_type(
@@ -9381,7 +9381,7 @@ index e0907631a..84f1ed986 100644
      assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
      assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 996b88db2..f51fd2848 100644
+index d61b37928..174744495 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1471,14 +1471,64 @@ struct test_case {
@@ -9479,7 +9479,7 @@ index 996b88db2..f51fd2848 100644
      test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
              int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
              int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
-@@ -9229,6 +9297,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9310,6 +9378,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
@@ -9493,7 +9493,7 @@ index 996b88db2..f51fd2848 100644
  #endif
  
      for (ggml_type type_a : all_types) {
-@@ -9971,8 +10046,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10080,8 +10155,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -9504,7 +9504,7 @@ index 996b88db2..f51fd2848 100644
              if (hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
              if (hsk == 192 && (hsv != 128 && hsv != 192)) continue;
              if (hsk == 576 && hsv != 512) continue; // DeepSeek MLA
-@@ -9983,7 +10058,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10092,7 +10167,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      for (float max_bias : { 0.0f, 8.0f }) {
                          if (!mask && max_bias > 0.0f) continue;
                          for (float logit_softcap : {0.0f, 10.0f}) {
@@ -9514,7 +9514,7 @@ index 996b88db2..f51fd2848 100644
                              for (int nh : { 1, 4 }) {
                                  if (nh == 1 && hsk != 320 && hsk != 576) continue;
                                  for (int nr3 : { 1, 3, }) {
-@@ -10001,7 +10077,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10110,7 +10186,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                  for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
                                                      if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
                                                      for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
@@ -9525,7 +9525,7 @@ index 996b88db2..f51fd2848 100644
                                                          // DeepSeek MLA: the V cache is a sub-view of the K cache
                                                          const bool v_is_view_of_k = hsk == 576;
                                                          test_cases.emplace_back(new test_flash_attn_ext(
-@@ -10154,6 +10232,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10275,6 +10353,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
@@ -9544,7 +9544,7 @@ index 996b88db2..f51fd2848 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
-@@ -10249,6 +10339,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10370,6 +10460,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
              GGML_TYPE_F32, {n_kv, 512, 64, 1}, false, {2, 1, 0, 3}));
      }
  
@@ -9575,7 +9575,7 @@ index 996b88db2..f51fd2848 100644
      // Conv2d: K=CRS=NPQ=4096 matmul performance
      uint32_t                        iwh_idx  = 0;
      uint32_t                        kwh_idx  = 1;
-@@ -10403,9 +10517,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10524,9 +10638,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -9611,7 +9611,7 @@ index 996b88db2..f51fd2848 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -10413,8 +10551,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10534,8 +10672,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -9622,7 +9622,7 @@ index 996b88db2..f51fd2848 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 1792, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));
-@@ -10599,6 +10737,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10724,6 +10862,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
  

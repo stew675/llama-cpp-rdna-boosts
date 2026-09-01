@@ -2,8 +2,8 @@
 
 Current state: `main` is the delivery branch carrying the **12-patch set**
 (blocks 01-11 + the hybrid all-reduce block 12) generated against the fork
-point **llama.cpp master `a7cc83bba`** (re-based 2026-08-30 from
-`17252c769`). The `baseline/<sha>` branches below
+point **llama.cpp master `0eadefebd`** (re-based 2026-09-01 from
+`a7cc83bba`). The `baseline/<sha>` branches below
 are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
@@ -23,16 +23,17 @@ at `192067b72`), `baseline/d222767c7` (validated against `d222767c7`) and
 
 
 All 12 patches are generated against **llama.cpp upstream master at
-`a7cc83bba`** (re-based 2026-08-30 from `17252c769`; dated record at the
+`0eadefebd`** (re-based 2026-09-01 from `a7cc83bba`; dated records at the
 bottom of this file): blocks 01-11 = the fork's `rdna-boosts` block
 commits (originally `2b7a135cb..f6f8f6778`, preserved on
-`old-rdna-boosts`; the re-based regeneration is `4c0f30dec..8fbf10e5b`,
-block 12 committed as `4fa92f0ae`); block 12 = the hybrid HIP all-reduce
+`old-rdna-boosts`; the re-based regeneration is `217e33ba4..d7bdd0a91`,
+block 12 committed as `ce9182473`; the `a7cc83bba`-based rebuild is
+preserved on `rdna-boosts-a7cc83bba`); block 12 = the hybrid HIP all-reduce
 delta over four files (`allreduce-hip.cu` new, `allreduce.cu`,
 `allreduce.cuh`, `ggml-cuda.cu`), including the RDNA4-only gate.
-`scripts/make-patches.sh` regenerates both. Verified 2026-08-30: clean
+`scripts/make-patches.sh` regenerates both. Verified 2026-09-01: clean
 apply (`git am` 01-11 + `git apply` 12) on a fresh checkout at
-`a7cc83bba`, full build clean, llama-cli same-seed coherence IDENTICAL to
+`0eadefebd`, full build clean, llama-cli same-seed coherence IDENTICAL to
 the pre-re-base known-good build, tg64 38.12 / tg512 41.08 — and the
 apply is **whitespace-free** (zero git warnings).
 
@@ -74,7 +75,8 @@ validation:
 
 The CURRENT delivery patches (0001-0011) are the fork's `rdna-boosts` block
 commits exported with `git format-patch` (one commit per block, the
-re-based set against `a7cc83bba`: `4c0f30dec..8fbf10e5b`; previously the
+re-based set against `0eadefebd`: `217e33ba4..d7bdd0a91`; previously the
+re-based regeneration `4c0f30dec..8fbf10e5b` against `a7cc83bba`; the
 whitespace-clean regeneration `3209e83b4..cc985ba9a` against
 `17252c769`; originally `2b7a135cb..f6f8f6778`; the original fork history
 is preserved on `old-rdna-boosts`). Block 12 is the hybrid HIP all-reduce delta over four
@@ -84,7 +86,7 @@ checkpoint history moved to `archive/docs/baseline-history.md`.
 
 ## Drift policy
 
-The patches are static against the fork point `a7cc83bba`. If a patch fails
+The patches are static against the fork point `0eadefebd`. If a patch fails
 to apply against a newer upstream master:
 
 1. Try `git am -3` / `git apply -3` (3-way merge against the baseline blobs).
@@ -93,8 +95,8 @@ to apply against a newer upstream master:
 3. Do NOT hand-edit the committed patches as the permanent fix: when more
    than one block needs manual re-base hunks, regenerate the whole set from
    the fork with `scripts/make-patches.sh` (which re-exports blocks 01-11
-   from `a7cc83bba..<blocks-tip>` and the block-12 delta; defaults target
-the current blocks tip `8fbf10e5b`), then re-verify the clean-apply
+   from `0eadefebd..<blocks-tip>` and the block-12 delta; defaults target
+the current blocks tip `d7bdd0a91`), then re-verify the clean-apply
 simulation (fresh worktree at the new fork point, `scripts/apply-all.sh`,
 build, coherence) and update the fork point + verification numbers in
 `patches/README.md` and `README.md`.
@@ -169,4 +171,43 @@ branch of the `~/prs/llama.cpp` clone (upstream `0eadefebd` + 12 blocks,
 tag `rdna-boosts-0eadefebd`). If a future drift event ever needs the fork
 point moved, follow the regeneration path above (`scripts/make-patches.sh`
 with base `0eadefebd`, blocks tip `9c2463ff8`/`221b0c804` in that clone).
+
+---
+
+## Re-baseline to 0eadefebd (2026-09-01, dated record)
+
+**Maintainer decision (same day): move the fork point to `0eadefebd`** —
+`scripts/apply-all.sh` must apply cleanly against a fresh upstream
+checkout, and with the old base's patch context it does not (block 08
+fails with plain `git am`; only `git am -3` works). The record above's
+"keep static" recommendation is superseded. Full re-baseline performed
+per the drift policy step 3:
+
+- **Fork rebuild:** `~/llama.cpp`'s `rdna-boosts` was deleted and
+  rebuilt on `0eadefebd` (worktree; blocks 01-07 + 09-12 `git am`
+  clean, block 08 `git am -3` auto-3way, block 12 `git apply` +
+  commit). New commits: blocks `217e33ba4..d7bdd0a91`, block 12
+  `ce9182473`. The rebuilt tree is **byte-identical** to the verified
+  2026-09-01 cross-version apply above. The old `a7cc83bba`-based fork
+  state (tip `4fa92f0ae`) is preserved on the `rdna-boosts-a7cc83bba`
+  branch.
+- **Set regenerated:** `scripts/make-patches.sh` (base `0eadefebd`,
+  blocks tip `d7bdd0a91`) re-exported blocks 01-11 + the block-12
+  delta; `rdna-boosts-all.patch` regenerated as
+  `git diff 0eadefebd..ce9182473`. Folding upstream's changes into the
+  patch context means the regenerated block 08 now applies with plain
+  `git am` — **`apply-all.sh` is clean again on fresh master**.
+- **Re-verified 2026-09-01:** clean-apply sim on a fresh clone at
+  `0eadefebd` (`scripts/apply-all.sh`: **zero conflicts, zero
+  whitespace warnings**; sim tree byte-identical to the fork tip), full
+  build clean (ROCm 7.14 gfx1201, RCCL+graphs+native), llama-cli
+  same-seed coherence IDENTICAL to the pre-re-base known-good build,
+  tg64 38.12 / tg512 41.08 (numbers unchanged — code-identical
+  content). Re-measured 2026-09-01 on the sim build (27B Q8_0,
+  3-GPU tensor, r2): tg64 36.87 ± 4.83 / tg512 40.72 ± 1.02 — matches
+  the documented numbers within noise (prs build: 37.92 ± 4.67 /
+  40.90 ± 0.86).
+- **Tooling fix:** `scripts/make-patches.sh`'s checkout check now
+  accepts git worktrees (`[ ! -e "$FORK/.git" ]` instead of `-d`),
+  which is how the fork rebuild is hosted.
 

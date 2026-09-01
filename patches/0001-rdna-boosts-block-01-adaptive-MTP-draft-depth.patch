@@ -1,4 +1,4 @@
-From 4c0f30dec750d1cd987f579f2d2d6ddbaeca60b0 Mon Sep 17 00:00:00 2001
+From 217e33ba4ff12b28025cd3f8b63c8eba1506eb14 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 01/11] rdna-boosts: block 01: adaptive MTP draft depth
@@ -226,7 +226,7 @@ index 000000000..ab9f98818
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index d34d1c9c5..8232190e9 100644
+index 851a47b9a..864b91b96 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,7 @@
@@ -245,7 +245,7 @@ index d34d1c9c5..8232190e9 100644
      {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
      {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
      {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
-@@ -1397,8 +1399,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1357,8 +1359,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      std::vector<int>                i_last;
      std::vector<std::vector<float>> chain_h;
  
@@ -262,7 +262,7 @@ index d34d1c9c5..8232190e9 100644
          , params(params.draft)
      {
          auto * ctx_tgt = this->params.ctx_tgt;
-@@ -1410,6 +1418,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1370,6 +1378,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  "MTP input row width must match the target h_nextn width");
          n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
  
@@ -274,7 +274,7 @@ index d34d1c9c5..8232190e9 100644
          SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
          SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
          SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
-@@ -1457,6 +1470,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1417,6 +1430,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
          chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
  
@@ -284,7 +284,7 @@ index d34d1c9c5..8232190e9 100644
          if (chain_heads) {
              this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
  
-@@ -1467,6 +1483,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1427,6 +1443,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
          this->n_max = this->params.n_max;
  
@@ -313,7 +313,7 @@ index d34d1c9c5..8232190e9 100644
          pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
  
          i_last.assign(n_seq, -1);
-@@ -1503,6 +1541,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1463,6 +1501,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              return;
          }
  
@@ -326,7 +326,7 @@ index d34d1c9c5..8232190e9 100644
          auto * ctx_dft = this->params.ctx_dft;
          const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
  
-@@ -1655,6 +1699,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1615,6 +1659,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              drafting[seq_id] = true;
              common_sampler_reset(smpls[seq_id].get());
  
@@ -340,7 +340,7 @@ index d34d1c9c5..8232190e9 100644
              common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
              std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
  
-@@ -1731,7 +1782,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1691,7 +1742,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
  
                  result.push_back(id);
  
@@ -349,7 +349,7 @@ index d34d1c9c5..8232190e9 100644
                      drafting[seq_id] = false;
                      n_drafting--;
                      continue;
-@@ -1778,17 +1829,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1738,17 +1789,32 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  continue;
              }
  
@@ -384,7 +384,7 @@ index d34d1c9c5..8232190e9 100644
          const int32_t n_rows = verify_h_rows[seq_id];
          if (n_rows <= 0) {
              return;
-@@ -2283,6 +2349,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
+@@ -2243,6 +2309,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
          case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
          case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
          case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
@@ -392,7 +392,7 @@ index d34d1c9c5..8232190e9 100644
          case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
          case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
          case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
-@@ -2374,6 +2441,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
+@@ -2334,6 +2401,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
              case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
              case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
@@ -400,7 +400,7 @@ index d34d1c9c5..8232190e9 100644
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
              case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                  n_max = std::max(n_max, std::max(0, spec->draft.n_max));
-@@ -2560,7 +2628,10 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2520,7 +2588,10 @@ common_speculative_init_result::common_speculative_init_result(
      const bool has_draft = params.speculative.has_dft();
      const bool spec_mtp = std::find(params.speculative.types.begin(),
                                      params.speculative.types.end(),
@@ -412,7 +412,7 @@ index d34d1c9c5..8232190e9 100644
  
      auto mparams = common_model_params_to_llama(params);
      auto cparams = common_context_params_to_llama(params);
-@@ -2652,7 +2723,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2612,7 +2683,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
@@ -421,7 +421,7 @@ index d34d1c9c5..8232190e9 100644
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -2665,6 +2736,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2625,6 +2696,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
@@ -429,7 +429,7 @@ index d34d1c9c5..8232190e9 100644
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
      }
-@@ -2684,7 +2756,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2644,7 +2716,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {

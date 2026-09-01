@@ -1,8 +1,8 @@
 # rdna-boosts patch set (delivery)
 
-12 patches against the llama.cpp fork point `a7cc83bba`
-("rpc: avoid serializing buffers from other servers (#26500)"; re-based
-2026-08-30 from `17252c769`):
+12 patches against the llama.cpp fork point `0eadefebd`
+("qwen4exp: support recurrent state rollback (#28123)"; re-based
+2026-09-01 from `a7cc83bba`):
 
 | patch | content |
 |---|---|
@@ -22,7 +22,7 @@
 ## Apply (fresh checkout at the fork point)
 
 ```bash
-git checkout a7cc83bba          # or: git apply each patch on a matching tree
+git checkout 0eadefebd          # or: git apply each patch on a matching tree
 git am patches/000[1-9]-*.patch patches/001[01]-*.patch
 git apply patches/12-hybrid-allreduce-hip.patch
 ```
@@ -31,7 +31,8 @@ git apply patches/12-hybrid-allreduce-hip.patch
 was observed to silently drop hunks; use `git am`.)
 
 The set is **whitespace-clean**: applying produces no git whitespace
-warnings (verified 2026-08-29 after the whitespace-clean regeneration).
+warnings (verified 2026-08-29 after the whitespace-clean regeneration,
+re-verified 2026-09-01 on the `0eadefebd` re-base).
 
 ## Block 12 notes
 
@@ -51,10 +52,12 @@ warnings (verified 2026-08-29 after the whitespace-clean regeneration).
     re-syncs the devices via a butterfly AllReduce on the next call
   - WIP experiments (archived, env-gated OFF by default): `GGML_CUDA_AR_FUSED`,
     `GGML_CUDA_AR_PACE` — see `../archive/work/fused-stage-pacing/README.md`
-- Verified 2026-08-29 (3x R9700, ROCm 7.14, gfx1201): clean apply + full
-  build + llama-cli same-seed coherence IDENTICAL + tg64 38.12 / tg512 41.08
-  (matches the fork build).  Depth-16384 decode 38.71 t/s (3-GPU hybrid,
-  unpinned) with the server config `HIP_VISIBLE_DEVICES=0,1,2`.
+- Verified 2026-09-01 re-base (3x R9700, ROCm 7.14, gfx1201): clean apply
+  on a fresh checkout at `0eadefebd` + full build + llama-cli same-seed
+  coherence IDENTICAL + tg64 38.12 / tg512 41.08 (sim build; numbers
+  unchanged — the re-base is code-identical to the 2026-08-30 set).
+  Depth-16384 decode 38.71 t/s (3-GPU hybrid, unpinned) with the server
+  config `HIP_VISIBLE_DEVICES=0,1,2`.
 - **Community-report fix round (2026-08-30, issues #5 + #6, reporter
   tungel):** two block-12 fixes integrated into the fork and regenerated
   into this set:

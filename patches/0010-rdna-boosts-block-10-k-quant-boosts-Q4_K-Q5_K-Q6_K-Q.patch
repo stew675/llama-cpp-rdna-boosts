@@ -1,4 +1,4 @@
-From 446480772b1465464d20f9c7772997f405352708 Mon Sep 17 00:00:00 2001
+From ee9f4be803079c192581f2c11ef3a0d4adec5337 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 10/11] rdna-boosts: block 10: k-quant-boosts -
@@ -13,10 +13,10 @@ Subject: [PATCH 10/11] rdna-boosts: block 10: k-quant-boosts -
  5 files changed, 325 insertions(+), 18 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a1287b7da..b01fc29f1 100644
+index 9cc20c427..c21c06045 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4855,13 +4855,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4856,13 +4856,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
  
@@ -70,7 +70,7 @@ index fd0414e8d..89708176c 100644
              }
          }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 1f112a45d..268ce29a1 100644
+index 3802b3887..32d9b78e6 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -21,9 +21,9 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
@@ -480,10 +480,10 @@ index ec117c57d..0595b329c 100644
  #define VDR_IQ2_XXS_Q8_1_MMQ  2
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 4911ddf81..f51fd2848 100644
+index c65007d6f..174744495 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10517,9 +10517,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10638,9 +10638,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -519,7 +519,7 @@ index 4911ddf81..f51fd2848 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -10527,8 +10551,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10648,8 +10672,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  

@@ -5,9 +5,9 @@
 #   fork-path     path to the stew675/llama.cpp fork checkout (default:
 #                 ../llama.cpp relative to this repo)
 #   baseline-sha  the upstream baseline the patches are generated against
-#                 (default: a7cc83bba, see MANIFESTS.md)
+#                 (default: 0eadefebd, see MANIFESTS.md)
 #   blocks-tip    the fork commit carrying blocks 01-11 (default:
-#                 8fbf10e5b, the re-based block-11 commit)
+#                 d7bdd0a91, the re-based block-11 commit)
 #
 # Blocks 01-11 are the fork commits baseline-sha..blocks-tip, exported with
 # `git format-patch` (the canonical, verified form).  Block 12 (the hybrid
@@ -16,16 +16,16 @@
 # ggml-cuda.cu).  Block 12 is committed on the fork branch (tip
 # 4fa92f0ae) and `git diff <blocks-tip>` picks it up from the clean tree;
 # it also works if the block-12 changes are instead uncommitted in the
-# fork's working tree.
+# fork's working tree. (Current fork: block 12 committed as ce9182473.)
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
-BASELINE="${2:-a7cc83bba}"
-TIP="${3:-8fbf10e5b}"
+BASELINE="${2:-0eadefebd}"
+TIP="${3:-d7bdd0a91}"
 PATCHES="$REPO_DIR/patches"
 
-if [ ! -d "$FORK/.git" ]; then
+if [ ! -e "$FORK/.git" ]; then
     echo "ERROR: $FORK is not a git checkout" >&2; exit 1
 fi
 

@@ -5,17 +5,19 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **12-patch set** against the fork point
-`a7cc83bba` (re-based 2026-08-30; previously `17252c769`): blocks 01-11
+`0eadefebd` (re-based 2026-09-01; previously `a7cc83bba`): blocks 01-11
 (`patches/0001-…0011-…`, format-patch of the
 fork's `rdna-boosts` block commits — the re-based regeneration
-`4c0f30dec..8fbf10e5b`; the original fork hashes
-`2b7a135cb..f6f8f6778` are preserved on the `old-rdna-boosts` branch) plus
+`217e33ba4..d7bdd0a91`; the original fork hashes
+`2b7a135cb..f6f8f6778` are preserved on the `old-rdna-boosts` branch, the
+2026-08-30 `a7cc83bba`-based rebuild on `rdna-boosts-a7cc83bba`) plus
 **block 12** (`patches/12-hybrid-allreduce-hip.patch`, the hybrid HIP
 all-reduce — delta vs the block-11 tip, RDNA4-gated). Apply flow: `git am`
 for 01-11 (plain `git apply` of the concatenated series SILENTLY DROPS
 HUNKS — verified 2026-08-29), `git apply` for the 12th;
 `scripts/apply-all.sh` automates it. **The set is whitespace-clean** —
-applying produces zero git whitespace warnings (verified 2026-08-29).
+applying produces zero git whitespace warnings (verified 2026-08-29,
+re-verified 2026-09-01 on the `0eadefebd` re-base).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -39,7 +41,7 @@ patch set. It is written for humans AND LLM coding agents. Follow it exactly;
 do not skip blocks.
 
 Current state: `main` is the delivery branch (flat history, 12-patch set
-against `a7cc83bba`). The `baseline/<sha>` branches and `block/01-…11` tags
+against `0eadefebd`). The `baseline/<sha>` branches and `block/01-…11` tags
 are HISTORICAL checkpoints of the old pre-block-12 structure (older
 upstream ranges, `git apply` flow); do not use them for the current
 delivery — use `patches/` + `scripts/apply-all.sh`.
@@ -71,7 +73,31 @@ silently drops hunks.
 
 ## Verified apply sequence
 
-### Re-baseline to a7cc83bba (2026-08-30, current)
+### Re-baseline to 0eadefebd (2026-09-01, current)
+
+Fork point moved from `a7cc83bba` to upstream master `0eadefebd` (22
+commits of drift; 3 touching ggml-cuda — XOR-swizzle fattn #25635, radix
+TOP_K #27466, MOE-fusion #27621). The fork's `rdna-boosts` branch was
+rebuilt from the delivery patches on the new base (worktree at
+`0eadefebd`; blocks 01-07 + 09-12 applied cleanly, block 08 via
+`git am -3` auto-3way; the tree is byte-identical to the verified
+2026-09-01 cross-version apply below) and the set regenerated with
+`scripts/make-patches.sh` (base `0eadefebd`, blocks tip `d7bdd0a91`,
+block 12 committed as `ce9182473`; the old `a7cc83bba`-based fork state
+is preserved on the `rdna-boosts-a7cc83bba` branch). Regenerating from
+the new base folds upstream's changes into the patch context, so
+**`scripts/apply-all.sh` now applies all 12 blocks with plain `git am` —
+zero conflicts, zero whitespace warnings** on a fresh checkout at
+`0eadefebd` (the 2026-09-01 apply below needed `git am -3` for block 08
+only because the set then still carried the old base's context). Verified
+end-to-end 2026-09-01: clean-apply sim on a fresh clone at `0eadefebd`
+(sim tree byte-identical to the fork tip `ce9182473`), full build clean,
+llama-cli same-seed coherence IDENTICAL to the pre-re-base known-good
+build, tg64 38.12 / tg512 41.08 unchanged (code-identical content;
+re-measured 2026-09-01: sim 36.87±4.83 / 40.72±1.02, prs 37.92±4.67 /
+40.90±0.86 — within noise).
+
+### Re-baseline to a7cc83bba (2026-08-30, superseded)
 
 Fork point moved from `17252c769` to upstream master `a7cc83bba` (24
 commits of drift; 6 touching ggml-cuda). The fork's `rdna-boosts` branch
@@ -217,14 +243,14 @@ run-to-run noise, no measurable impact from the bounded-spin fix.
 | 12 | llama-cli same-seed coherence (2- and 3-GPU) + depth-16384 decode A/B (hybrid vs nccl vs internal) | same-seed output IDENTICAL to RCCL; 3-GPU hybrid 38.71 t/s (unpinned) at depth-16384; tg64 38.12 / tg512 41.08 |
 
 Convenience: `rdna-boosts-all.patch` (repo root) is the entire 12-patch net
-as ONE patch (applies cleanly on `a7cc83bba` alone; not a substitute for the
+as ONE patch (applies cleanly on `0eadefebd` alone; not a substitute for the
 per-block flow in `patches/` when you want reviewable increments).
 
 
 ## Failure handling (agent instruction)
 
 > Apply the patches in `patches/` in the order given in this file to a fresh
-> branch from the fork point `a7cc83bba` (see `scripts/apply-all.sh` for the
+> branch from the fork point `0eadefebd` (see `scripts/apply-all.sh` for the
 > automated flow). After each patch, run its verification command. Blocks
 > 01-11 apply with `git am`; if a patch fails, `git am -3` / `git apply -3`
 > (3-way merge against the baseline blobs), then manually rebase the hunks

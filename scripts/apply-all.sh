@@ -7,7 +7,7 @@
 #   rdna-boosts-repo     path to THIS repo (default: parent of scripts/)
 #
 # Requires a clean llama.cpp working tree checked out at the baseline SHA
-# recorded in MANIFESTS.md (currently a7cc83bba).  Blocks 01-11 are applied
+# recorded in MANIFESTS.md (currently 0eadefebd).  Blocks 01-11 are applied
 # with `git am` (plain `git apply` of the concatenated series silently drops
 # hunks -- verified 2026-08-29), one commit each with the block subject.
 # Block 12 (the hybrid HIP all-reduce) is applied with `git apply` and

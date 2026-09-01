@@ -21,10 +21,12 @@ llama.cpp checkout at the fork point **`a7cc83bba`** (re-based 2026-08-30; previ
   archived, env-gated OFF, in `archive/work/fused-stage-pacing/`.
 
 The repo is NOT the fork: the fork (source of truth for the block commits)
-lives at `~/llama.cpp`, branch `rdna-boosts` — re-based 2026-08-30 onto
-upstream master `a7cc83bba` (12-commit branch; blocks tip `8fbf10e5b`,
-block 12 committed as `4fa92f0ae`; the 2026-08-29 whitespace-clean
-rebuild `12d10267b`/`cc985ba9a` against `17252c769` is superseded). The
+lives at `~/llama.cpp`, branch `rdna-boosts` — re-based 2026-09-01 onto
+upstream master `0eadefebd` (12-commit branch; blocks tip `d7bdd0a91`,
+block 12 committed as `ce9182473`; the 2026-08-30 `a7cc83bba`-based
+rebuild — tip `4fa92f0ae` — is superseded and preserved on the
+`rdna-boosts-a7cc83bba` branch; the 2026-08-29 whitespace-clean
+rebuild `12d10267b`/`cc985ba9a` against `17252c769` is also superseded). The
 historical fork state
 (block commits `2b7a135cb..f6f8f6778` + the archived WIP commits, tip
 `155debcdc`) is preserved on the `old-rdna-boosts` branch.
@@ -93,8 +95,9 @@ explicitly requests it.**
   whitespace warnings (the 8 inert trailing-whitespace lines + 1 EOF blank
   line were removed at the source 2026-08-29 and the set regenerated;
   trees are otherwise byte-identical — verified).
-- **Verified numbers (2026-08-29):** clean-apply build tg64 38.12 / tg512
-  41.08; depth-16384 3-GPU hybrid 38.71 t/s (unpinned); 2-GPU (1,2) 31.79.
+- **Verified numbers (2026-09-01 re-base, unchanged):** clean-apply build
+  tg64 38.12 / tg512 41.08; depth-16384 3-GPU hybrid 38.71 t/s
+  (unpinned); 2-GPU (1,2) 31.79.
 - The one-sided AR wait (dev0/bus-06 dispatch-gap asymmetry, ~12.7 µs/call)
   is a **platform-level CP/driver property**, not reachable from the AR
   kernel, graph tail, or host-side pacing — fusion/pacing are CLOSED
@@ -106,7 +109,7 @@ explicitly requests it.**
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout a7cc83bba
+git checkout 0eadefebd
 bash <this-repo>/scripts/apply-all.sh .     # creates branch rdna-boosts, 12 commits
 ```
 
@@ -123,9 +126,9 @@ Diff the output against a known-good build (or against RCCL via
 
 ### Regenerate the patches (after fork changes)
 
-`scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `a7cc83bba`,
-blocks tip `8fbf10e5b`): `git format-patch` the block commits + the
-block-12 delta for the 12th (block 12 is committed as `4fa92f0ae`; the
+`scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `0eadefebd`,
+blocks tip `d7bdd0a91`): `git format-patch` the block commits + the
+block-12 delta for the 12th (block 12 is committed as `ce9182473`; the
 script's `git diff <blocks-tip>` picks it up from the clean tree). Then
 re-verify the clean-apply simulation (worktree at the fork point,
 apply-all, build, coherence) before committing.
