@@ -68,6 +68,11 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
   init order fixed — `GGML_CUDA_AR_PROFILE=1` no longer faults GPU 1
   under MTP (pre-fix reproduced on 3x R9700; post-fix clean, profiler
   dumps on every device).  Regenerated into the set; coherence unchanged.
+- **Block-02 MTP chunked-GDN prefix (2026-09-01, PR #9):** block 02 now
+  runs its chunked WMMA GDN on long single-sequence MTP prefills (prefix
+  `n_tokens-K` + sequential K-tail) — +7.5% prefill at ~5.5k prompt,
+  +7.7% at ~38k on 3x R9700, 64-token same-seed output token-identical
+  to sequential.  Opt out: `GGML_CUDA_GDN_CHUNKED=0`.
 
 ## Layout
 

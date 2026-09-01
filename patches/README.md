@@ -7,7 +7,7 @@
 | patch | content |
 |---|---|
 | `0001` | adaptive MTP draft depth |
-| `0002` | fused chunked gated-delta-net prefill kernel |
+| `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) |
 | `0003` | BF16 KV cache + native-BF16 flash-attn |
 | `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf |
 | `0005` | CPU bit-identical decode/verify batches |
@@ -106,6 +106,22 @@ re-verified 2026-09-01 on the `0eadefebd` re-base).
   IDENTICAL to the pre-fix golden.  Default serving (profiler off) is
   unaffected.  Do not ship `AR_PROFILE=1` as a daily env — this only
   makes the debug flag safe.
+- **MTP chunked-GDN prefix folded into block 02** (2026-09-01, PR #9,
+  integrated): block 02's chunked WMMA GDN used to launch only for
+  `K == 1` (no MTP snapshots) — with MTP n-max 3 (`K=4`) every prefill
+  ubatch stayed on the sequential kernel.  Long single-sequence MTP
+  prefills (`K > 1`, `n_seqs == 1`, `n_tokens > K+64`) now run the
+  chunked GDN on the prefix (`n_tokens - K`) and sequential GDN only on
+  the last K tokens so slots `0..K-1` stay correct (fused-cache graphs
+  included; `n_seqs > 1` stays fully sequential).  The chunked ops take
+  an `n_tokens_limit` parameter.  Opt out: `GGML_CUDA_GDN_CHUNKED=0`
+  (also `GGML_CUDA_GDN_CHUNKED_BF16=0`).  Verified 2026-09-01 on 3x
+  R9700 (2-GPU, internal AR, Qwen3.8-27B Q8, ubatch 1024, MTP n-max 3):
+  path fire `n=1024 K=4 prefix=1020`; prefill tok/s +7.5% (~5.5k prompt)
+  / +7.7% (~38k) vs sequential; 64-token same-seed output token-identical
+  to sequential; non-MTP coherence unchanged.  Not bit-identical vs
+  sequential in general (same class as the bf16 chunked: near-lossless).
+  Lab numbers: `benchmarks/2026-08-31-mtp-gdn-chunked-prefix.md`.
 
 ## Server config (the +22% deployment win)
 

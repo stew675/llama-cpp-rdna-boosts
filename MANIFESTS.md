@@ -8,7 +8,7 @@ The **current delivery** is a **12-patch set** against the fork point
 `0eadefebd` (re-based 2026-09-01; previously `a7cc83bba`): blocks 01-11
 (`patches/0001-…0011-…`, format-patch of the
 fork's `rdna-boosts` block commits — the re-based regeneration
-`b25bc8a9c..43f5ab71d` (block 12 committed as `93e8b09bb`); the original fork hashes
+`b25bc8a9c..43084332f` (block 12 committed as `7d5d3f77b`); the original fork hashes
 `2b7a135cb..f6f8f6778` are preserved on the `old-rdna-boosts` branch, the
 2026-08-30 `a7cc83bba`-based rebuild on `rdna-boosts-a7cc83bba`) plus
 **block 12** (`patches/12-hybrid-allreduce-hip.patch`, the hybrid HIP
@@ -52,7 +52,7 @@ delivery — use `patches/` + `scripts/apply-all.sh`.
 | # | patch file | content | deps |
 |---|-----------|---------|------|
 | 01 | `0001-…-block-01-adaptive-MTP-draft-depth.patch` | adaptive MTP draft depth | none |
-| 02 | `0002-…-block-02-fused-chunked-gated-delta-net-p.patch` | fused chunked GDN prefill (bf16/WMMA; gfx12+gfx11 arch-segregated files, runtime-cc dispatch) | none |
+| 02 | `0002-…-block-02-fused-chunked-gated-delta-net-p.patch` | fused chunked GDN prefill (bf16/WMMA; gfx12+gfx11 arch-segregated files, runtime-cc dispatch; MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | none |
 | 03 | `0003-…-block-03-BF16-KV-cache-and-native-BF16-f.patch` | BF16 KV cache + native-BF16 flash-attn | none |
 | 04 | `0004-…-block-04-RDNA4-WMMA-flash-attn-Q6_K-mmq-.patch` | WMMA flash-attn + Q6_K mmq prefill perf | none |
 | 05 | `0005-…-block-05-CPU-bit-identical-decode-verify.patch` | CPU bit-identical decode/verify batches | none |
@@ -128,6 +128,36 @@ re-measured 2026-09-01: sim 36.87±4.83 / 40.72±1.02, prs 37.92±4.67 /
   whitespace warnings and the applied tree is byte-identical to the fork
   tip (`d42fc80…`); the fork tree was fully built (ROCm 7.14 gfx1201,
   clean) and coherence-tested as part of the A/B above.
+
+### MTP chunked-GDN prefix folded into block 02 (2026-09-01, PR #9)
+
+- **Change (PR #9, integrated into block 02 — NOT a new block):** block
+  02's chunked WMMA GDN only launched for `K == 1` (no MTP snapshots);
+  with MTP n-max 3 (`K=4`) every prefill ubatch stayed on the sequential
+  kernel (rocprof ~4k wrap: sequential GDN at 10.45%).  The dispatch now
+  runs, for long single-sequence prefills (`!kda && K > 1 && n_seqs == 1
+  && n_tokens > K+64`), the chunked GDN on the prefix (`n_tokens - K`)
+  and sequential GDN only on the last K tokens so slots `0..K-1` stay
+  correct (fused-cache graphs included; `n_seqs > 1` stays fully
+  sequential).  The chunked ops gained an `n_tokens_limit` parameter
+  (`gated_delta_net_chunked{.cu,.cuh,_bf16.cu,_bf16_gfx11.cu}`).
+  Opt out: `GGML_CUDA_GDN_CHUNKED=0`.  Because the change is confined to
+  block-02 files, it was folded into the block-02 commit (fixup +
+  autosquash; blocks 03-12 replayed cleanly, tree unchanged).
+- **Verified 2026-09-01 (3x R9700 gfx1201, ROCm 7.14, 2-GPU 0,1,
+  internal AR, Qwen3.8-27B Q8, ubatch 1024, MTP n-max 3):** path fire
+  confirmed (`MTP chunked GDN prefix n=1024 K=4 prefix=1020`); prefill
+  tok/s: ~5.5k prompt 1406.5 -> 1511.4 (+7.5%), ~38k 1303.0 -> 1403.1
+  (+7.7%); 64-token same-seed output token-IDENTICAL vs sequential (only
+  the timing line differed).  Non-MTP serving unchanged (coherence
+  IDENTICAL to the pre-change golden).  Full clean build passes.  PR's
+  lab numbers (up to +8.1% at 40k, GSM8K 19/50 vs 18/50):
+  `benchmarks/2026-08-31-mtp-gdn-chunked-prefix.md`.
+- **Set regenerated:** blocks 01, 03-11 content-identical (only `From
+  <sha>` headers moved); block 02 = old block 02 + the PR #9 hunks;
+  `rdna-boosts-all.patch` regenerated.  Clean-apply sim re-verified on a
+  fresh clone at `0eadefebd` (zero whitespace warnings, applied tree
+  byte-identical to the fork tip `b90eb525e`).
 
 ### Re-baseline to a7cc83bba (2026-08-30, superseded)
 

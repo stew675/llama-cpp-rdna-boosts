@@ -3451,7 +3451,7 @@ index ab7a3b297..9931fbe7d 100644
              need_f16_K = true;
              need_f16_V = true;
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a724..2b7abfd47 100644
+index 1b431a724..f9da81722 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,4 +1,5 @@
@@ -3460,7 +3460,7 @@ index 1b431a724..2b7abfd47 100644
  #include "ggml-cuda/common.cuh"
  
  template <int S_v, bool KDA, bool keep_rs_t>
-@@ -286,6 +287,65 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -286,6 +287,114 @@ static void ggml_cuda_op_gated_delta_net_impl(
      const int K = ggml_get_op_params_i32(dst, 0);
      const bool keep_rs = K > 1;
  
@@ -3523,12 +3523,61 @@ index 1b431a724..2b7abfd47 100644
 +        }
 +    }
 +
++    // MTP (K > 1) needs snapshot slots, so the K==1 fused-cache chunked path
++    // cannot cover it. Long single-sequence prefill: chunked GDN on the prefix
++    // (n_tokens - K), sequential GDN only on the last K tokens so slots 0..K-1
++    // stay correct. n_seqs > 1 stays fully sequential — the chunked n_tokens
++    // override is also the sequence stride. Opt out with GGML_CUDA_GDN_CHUNKED=0.
++    if (!kda && K > 1 && n_seqs == 1 && n_tokens > (int64_t) K + 64 &&
++        (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
++        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
++        if (env == nullptr || strcmp(env, "0") != 0) {
++            const int64_t n_prefix = n_tokens - K;
++            ggml_cuda_pool_alloc<float> prefix_state(ctx.pool(), (size_t) H * S_v * S_v * n_seqs);
++            bool prefix_ok = false;
++#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
++            const int cc_p = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++            const bool bf16_rdna_p = GGML_CUDA_CC_IS_RDNA4(cc_p) || GGML_CUDA_CC_IS_RDNA3(cc_p);
++            const char * envb_p = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
++            const bool want_bf16_p = bf16_rdna_p && S_v == 128 &&
++                (envb_p == nullptr || strcmp(envb_p, "0") != 0);
++            if (want_bf16_p) {
++                if (GGML_CUDA_CC_IS_RDNA4(cc_p)) {
++                    prefix_ok = ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, prefix_state.get(), n_prefix);
++                } else {
++                    prefix_ok = ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ctx, dst, prefix_state.get(), n_prefix);
++                }
++            } else
++#endif
++            {
++                prefix_ok = ggml_cuda_op_gated_delta_net_chunked(ctx, dst, prefix_state.get(), n_prefix);
++            }
++            if (prefix_ok) {
++                static bool logged_prefix = false;
++                if (!logged_prefix) {
++                    GGML_LOG_INFO("%s: MTP chunked GDN prefix n=%ld K=%d prefix=%ld\n",
++                                  __func__, (long) n_tokens, K, (long) n_prefix);
++                    logged_prefix = true;
++                }
++                float * state_d = cache ? cache->data : (dst_d + S_v * H * n_tokens * n_seqs);
++                const int64_t state_slot_stride = cache ? cache->slot_stride : (S_v * S_v * H * n_seqs);
++                launch_gated_delta_net<false, true>(
++                    q_d + n_prefix * sq2, k_d + n_prefix * sq2, v_d + n_prefix * sv2,
++                    g_d + n_prefix * sb2, b_d + n_prefix * sb2, prefix_state.get(),
++                    dst_d + n_prefix * S_v * H, state_d,
++                    S_v, H, K, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                return;
++            }
++        }
++    }
++
      // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
      float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
      int64_t state_slot_stride = S_v * S_v * H * n_seqs;
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked.cu
 new file mode 100644
-index 000000000..235522647
+index 000000000..542675440
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked.cu
 @@ -0,0 +1,702 @@
@@ -4167,7 +4216,7 @@ index 000000000..235522647
 +    }
 +}
 +
-+bool ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext) {
++bool ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext, int64_t n_tokens_limit) {
 +    ggml_tensor * src_q     = dst->src[0];
 +    ggml_tensor * src_k     = dst->src[1];
 +    ggml_tensor * src_v     = dst->src[2];
@@ -4185,7 +4234,7 @@ index 000000000..235522647
 +
 +    const int64_t S_v      = nev0;
 +    const int64_t H        = nev1;
-+    const int64_t n_tokens = nev2;
++    const int64_t n_tokens = (n_tokens_limit > 0 && n_tokens_limit < nev2) ? n_tokens_limit : nev2;
 +    const int64_t n_seqs   = nev3;
 +
 +    GGML_ASSERT(neq1 == nek1);
@@ -4236,10 +4285,10 @@ index 000000000..235522647
 +}
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh b/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
 new file mode 100644
-index 000000000..52e711c8a
+index 000000000..993fa47de
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,58 @@
 +// Fused chunked kernel for GGML_OP_GATED_DELTA_NET prefill (n_tokens > 1, K == 1, non-KDA).
 +//
 +// The chunked recurrence is sequential in the state, so it runs as TWO launches (see the .cu):
@@ -4281,7 +4330,9 @@ index 000000000..52e711c8a
 +// Both chunked ops return true when their kernels were accepted for launch (or skipped by a
 +// GDN_DBG_* env hook) and false when a launch was rejected; the dispatcher then falls back
 +// to the sequential gated_delta_net kernel.
-+bool ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr);
++// n_tokens_limit > 0: process only the first n_tokens_limit tokens (MTP prefix).
++// Safe only when n_seqs == 1 — n_tokens is also the sequence stride.
++bool ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr, int64_t n_tokens_limit = 0);
 +
 +// bf16/WMMA tensor-core variant (S_v == 128 only; near-lossless: PPL +0.056% / KL 0.0036 on
 +// wikitext-2 vs the fp32 path). DEFAULT for S_v == 128 on the HIP build (opt out with
@@ -4292,13 +4343,13 @@ index 000000000..52e711c8a
 +//     kernel, restored verbatim (chunked-gdn tip 99bbd1b20, 46/46 on gfx1201).
 +//   gated_delta_net_chunked_bf16_gfx11.cu - gfx11 (RDNA3/RDNA3.5): the first-gen WMMA port
 +//     (16 bf16/lane, validated on gfx1100), on its own path.
-+bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr);
++bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr, int64_t n_tokens_limit = 0);
 +
 +// gfx11 (RDNA3/RDNA3.5) first-gen WMMA variant - same contract as the gfx12 entry above.
-+bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr);
++bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr, int64_t n_tokens_limit = 0);
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 new file mode 100644
-index 000000000..29facd203
+index 000000000..6285a67db
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
 @@ -0,0 +1,995 @@
@@ -5206,7 +5257,7 @@ index 000000000..29facd203
 +        neqk1_magic, rq3_magic, scale, state_seq_stride, dbg);
 +}
 +
-+bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext) {
++bool ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext, int64_t n_tokens_limit) {
 +    ggml_tensor * src_q     = dst->src[0];
 +    ggml_tensor * src_k     = dst->src[1];
 +    ggml_tensor * src_v     = dst->src[2];
@@ -5223,7 +5274,7 @@ index 000000000..29facd203
 +
 +    const int64_t S_v      = nev0;
 +    const int64_t H        = nev1;
-+    const int64_t n_tokens = nev2;
++    const int64_t n_tokens = (n_tokens_limit > 0 && n_tokens_limit < nev2) ? n_tokens_limit : nev2;
 +    const int64_t n_seqs   = nev3;
 +
 +    GGML_ASSERT(neq1 == nek1);
@@ -5299,7 +5350,7 @@ index 000000000..29facd203
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 new file mode 100644
-index 000000000..910c99594
+index 000000000..41d16bc0c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 @@ -0,0 +1,1011 @@
@@ -6223,7 +6274,7 @@ index 000000000..910c99594
 +        neqk1_magic, rq3_magic, scale, state_seq_stride, dbg);
 +}
 +
-+bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext) {
++bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext, int64_t n_tokens_limit) {
 +    ggml_tensor * src_q     = dst->src[0];
 +    ggml_tensor * src_k     = dst->src[1];
 +    ggml_tensor * src_v     = dst->src[2];
@@ -6240,7 +6291,7 @@ index 000000000..910c99594
 +
 +    const int64_t S_v      = nev0;
 +    const int64_t H        = nev1;
-+    const int64_t n_tokens = nev2;
++    const int64_t n_tokens = (n_tokens_limit > 0 && n_tokens_limit < nev2) ? n_tokens_limit : nev2;
 +    const int64_t n_seqs   = nev3;
 +
 +    GGML_ASSERT(neq1 == nek1);

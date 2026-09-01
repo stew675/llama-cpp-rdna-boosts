@@ -26,8 +26,8 @@ All 12 patches are generated against **llama.cpp upstream master at
 `0eadefebd`** (re-based 2026-09-01 from `a7cc83bba`; dated records at the
 bottom of this file): blocks 01-11 = the fork's `rdna-boosts` block
 commits (originally `2b7a135cb..f6f8f6778`, preserved on
-`old-rdna-boosts`; the current 12-commit branch is `b25bc8a9c..43f5ab71d`
-with block 12 committed as `93e8b09bb`; the `a7cc83bba`-based rebuild is
+`old-rdna-boosts`; the current 12-commit branch is `b25bc8a9c..43084332f`
+with block 12 committed as `7d5d3f77b`; the `a7cc83bba`-based rebuild is
 preserved on `rdna-boosts-a7cc83bba`); block 12 = the hybrid HIP all-reduce
 delta over four files (`allreduce-hip.cu` new, `allreduce.cu`,
 `allreduce.cuh`, `ggml-cuda.cu`), including the RDNA4-only gate.
@@ -234,4 +234,21 @@ per the drift policy step 3:
   byte-identical to the fork tip (`d42fc80…`).  Fork build clean (ROCm
   7.14 gfx1201, `cmake --build build-rocm --config Release -j 16 --
   VERBOSE=1`) + coherence + the A/B above.
+
+## MTP chunked-GDN prefix folded into block 02 (2026-09-01, PR #9)
+
+- **Change:** block 02 now also runs its chunked WMMA GDN on long
+  single-sequence MTP prefills (`K > 1`): chunked on the prefix
+  (`n_tokens - K`), sequential GDN only on the last K snapshot slots
+  (PR #9; folded into the block-02 commit, NOT a new patch block).  The
+  chunked ops take an `n_tokens_limit`; opt out `GGML_CUDA_GDN_CHUNKED=0`.
+- **Verified 2026-09-01 (3x R9700, 2-GPU, internal AR, Qwen3.8-27B Q8,
+  ubatch 1024, MTP n-max 3):** path fire `n=1024 K=4 prefix=1020`;
+  prefill +7.5% (~5.5k) / +7.7% (~38k) vs sequential; 64-token
+  same-seed output token-identical; non-MTP coherence unchanged.
+- **Fork state:** block 02 amended (`cbc219af4`), blocks 03-12 replayed
+  unchanged; blocks tip `43084332f`, block 12 `7d5d3f77b`.  Set
+  regenerated (blocks 01, 03-11 content-identical; 0002 = old 0002 +
+  PR #9 hunks); clean-apply sim re-verified (applied tree byte-identical
+  to the fork tip `b90eb525e`).  Full clean build passes.
 
