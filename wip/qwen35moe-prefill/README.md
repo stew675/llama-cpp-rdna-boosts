@@ -30,6 +30,14 @@ base (`4fa92f0ae`), single Radeon AI PRO R9700 (gfx1201).
 
 ## Quick reproduction
 
+> **BENCHMARK CONFIGS:** every number in this project's docs was produced
+> with a specific GPU-pinning + split-mode + ubatch command. See
+> [`bench-config.md`](bench-config.md) for the canonical command lines and
+> the regression-check recipe. Short version: 1-GPU runs MUST prefix
+> `HIP_VISIBLE_DEVICES=0` (otherwise llama.cpp layer-splits across all 3
+> R9700s and decode drops ~97 -> ~81 t/s); 2-GPU runs must state
+> `--split-mode tensor`.
+
 ```sh
 # baseline (ub=512)
 llama-bench -m <Qwen3.6-35B-A3B-Q6_K.gguf> -ngl 99 -p 16384 -r 2

@@ -34,7 +34,7 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
 
 ## Active (in progress now)
 
-### [IN-PROGRESS] Block 13: MoE WIP -> official patch (qwen4exp split-out)
+### [DONE 2026-09-02] Block 13: MoE WIP -> official patch (qwen4exp split-out)
 - Goal: promote the non-qwen4exp MoE work (mmvq item-split + fused gate+up+GLU MMQ
   + M4 quant extension) into the main 12-patch set as a new `0013-*` block.
   qwen4exp work moves OUT to `wip/qwen4exp/`.
@@ -72,13 +72,16 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
   - Decode tg128: +5.6% (97.28 vs 92.15 pristine) - item-split + fused gate
   - Fused path fires: FUSED MUL_MAT_ID ffn_moe_down-* on all layers
 - The 2 fixes vs the verified 0004 patch (both in ggml-cuda.cu):
-  1. x_scale_channel_dst arm gated to mm_node->ne[2] == 1 (multi-token falls
-     back to separate MUL - restores old verified behavior; upstream 0eadefebd
-     gate change admits multi-token which the n=1-only kernel can't express).
+  1. x_scale_channel_dst arm: was gated to mm_node->ne[2] == 1, now fully
+     multi-token (fork 9db2fcbdc, folded into block 13 - see Priority
+     section).
   2. fused MoE MMQ arm gated to the instantiated type list (Q3_K/Q4_K/Q5_K/
-     Q8_0/Q6_K) - q4_0/q4_1/q5_0/IQ/MXFP4 were aborting
-     (GGML_ABORT "fused gate MMQ not implemented").
-  Both are correctness fixes required for the multi-token tests upstream added.
+     Q8_0/Q6_K) - q4_0/q4_1/q5_0/IQ/MXFP4/NVFP4 abort in
+     `switch_type_gate` (GGML_ABORT "fused gate MMQ not implemented").
+     THE GATE IS SHIPPED (correctness fix, part of block 13). The only
+     REMAINING block-13-related item is extending the fused kernel to
+     MXFP4/NVFP4/etc. so the gate can be relaxed - tracked as
+     [OPEN] MXFP4 below.
 
 ### [IN-PROGRESS] ITEM B - sparse QSA flash attention (qwen4exp branch)
 - Op + kernel committed on `~/prs/llama.cpp` qwen4exp branch @ `554691a72`
@@ -105,14 +108,18 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
   thread); the gate makes the fallback safe (RCCL) so a volunteer can test
   with `GGML_CUDA_ALLREDUCE=internal` and report the matrix.
 
-### [OPEN] MXFP4 (and NVFP4) fused gate+up+GLU MMQ (block 13)
+### [OPEN] MXFP4 (and NVFP4) fused gate+up+GLU MMQ (block 13) - LAST block-13 item
+- Status: the ONLY remaining block-13-related work (block 13 itself is
+  DONE/closed above). The correctness gate (type list Q3_K/Q4_K/Q5_K/
+  Q8_0/Q6_K) is shipped; this is the feature extension that lets the gate
+  be relaxed.
 - What: the fused MoE MMQ kernel (`ggml_cuda_mul_mat_q_switch_type_gate`) is
   instantiated for Q3_K/Q4_K/Q5_K/Q8_0/Q6_K only. MXFP4/NVFP4 and the other
   mmq_supported types (Q4_0/Q4_1/Q5_0/IQ*/...) fall back to the 3-op sequence.
 - Why: `ggml_cuda_should_use_mmq` returns true for these on RDNA4, so the fused
   arm WOULD fire for them, but the gate switch aborts
-  (`GGML_ABORT("fused gate MMQ not implemented")`). Interim fix in the block-13
-  working tree: arm gated on the exact instantiated type list. MXFP4 is the
+  (`GGML_ABORT("fused gate MMQ not implemented")`). The arm is gated on the
+  exact instantiated type list (`moe_mmq_type` in try_fuse). MXFP4 is the
   interesting one for future MoE models (deepseek-style native MXFP4 experts).
 - "Done": add MXFP4 (+ maybe NVFP4/Q4_0-class) cases to switch_type_gate with
   DECL_MMQ_CASE_GATE instances + generator list + bit-exact + bench validation.

@@ -179,6 +179,11 @@ with block 13 on the 13-patch series).
   upstream 0eadefebd too (upstream bug, worth filing); the fix ships
   here because the feature it unblocks (qwen35moe 2-GPU MoE) is
   block-13's.
+- **Benchmark configs (2026-09-02):** all 1-GPU numbers in this project's
+docs require `HIP_VISIBLE_DEVICES=0`; without it llama.cpp layer-splits
+across all 3 R9700s and decode drops ~97 -> ~81 t/s (a harness artifact,
+NOT a regression - verified 2026-09-02). Canonical command lines + the
+baseline table live in `wip/qwen35moe-prefill/bench-config.md`.
 
 ## Server config (the +22% deployment win)
 
