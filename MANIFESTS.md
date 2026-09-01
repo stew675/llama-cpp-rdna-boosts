@@ -89,6 +89,23 @@ on a fresh clone at `a7cc83bba` (zero conflicts, zero whitespace
 warnings), full build clean, llama-cli same-seed coherence IDENTICAL to
 the pre-re-base known-good build.
 
+### Cross-version apply at 0eadefebd (2026-09-01, record)
+
+Upstream master moved 22 commits past the fork point; 3 touched
+ggml-cuda (XOR-swizzle fattn #25635, radix TOP_K #27466, MOE-fusion
+#27621). The 12-patch set was applied to a fresh clone at `0eadefebd`
+(branch `rdna-boosts`): blocks 01-07 + 09-12 clean (`git am` / `git
+apply`); the ONE conflict was block 08, resolved by `git am -3` 3-way
+merge (auto-resolved, zero manual hunks). Full-tree zero-drift check:
+`fork-tip → HEAD` = exactly the 51-file upstream delta, all diffs
+content-identical vs the fork delivery tip `4fa92f0ae`. Build clean
+(ROCm 7.14 gfx1201) and same-seed coherence hybrid == RCCL (3-GPU).
+Fork point unchanged at `a7cc83bba` per the drift policy (regeneration
+triggered only when >1 block needs manual re-base hunks; here: one
+block, auto-3way). The verified applied state is tagged
+`rdna-boosts-0eadefebd` in the ~/prs/llama.cpp clone. Full record:
+`BASELINE.md`.
+
 ### Baseline 17252c769 (2026-08-29, superseded)
 
 On a fresh checkout of the fork point `17252c769`:

@@ -129,3 +129,44 @@ the pre-re-base known-good build. tg64 38.12 / tg512 41.08 (sim build)
 unchanged — the re-base is code-identical to the 2026-08-29 set plus
 upstream's SWIGLU_CLAMP additions.
 
+---
+
+## Cross-version apply to 0eadefebd (2026-09-01, dated record)
+
+Upstream master moved **22 commits** past the fork point `a7cc83bba`; only
+**3 touched ggml-cuda** — `e4b9af007` (XOR-swizzle flash-attn K/V smem
+fp16 tiles, #25635), `f8dbcd618` (ROCm radix TOP_K for long rows,
+#27466), `41ef91f7c` (MOE fusion extended to specdec, #27621) — all in
+block 08 / block 10 territory. Applied the 12-patch set to a fresh clone
+checked out at `0eadefebd` (branch `rdna-boosts`):
+
+- Blocks 01-07, 09-11: `git am` clean. Block 12: `git apply` clean.
+- Block 08 (fused core): the ONE conflict — `git am -3` 3-way merge
+after fetching the fork's blobs (the clone lacked the patch's index
+blobs); **auto-resolved, zero manual hunks**. Verified per the
+post-image-blob protocol: the two merged files (`ggml-cuda.cu`,
+`mmvq.cu`) diff vs block 08's post-image blobs = exactly upstream's
+additions (content-identical after stripping index/hunk headers).
+
+**Full-tree zero-drift check:** `fork-tip → HEAD` differs from
+`a7cc83bba → 0eadefebd` in exactly the same **51 files**, and all 51
+diffs are content-identical — the applied tree is byte-faithful to the
+fork delivery tip `4fa92f0ae` (blocks tip `8fbf10e5b` + block 12
+`4fa92f0ae`) plus exactly the upstream drift.
+
+**Verified end-to-end 2026-09-01:** full build clean (ROCm 7.14 gfx1201,
+`GGML_HIP_RCCL=1`, graphs+native; zero patch-related compiler warnings);
+llama-cli same-seed coherence **IDENTICAL between hybrid and RCCL**
+(3-GPU tensor split, `GGML_CUDA_ALLREDUCE=nccl` comparison) — the
+coherence gate passes on the new master.
+
+**Fork point decision:** the delivery set **remains static against
+`a7cc83bba`** — per the drift policy, regeneration / formal re-baseline
+is triggered only when *more than one* block needs manual re-base hunks;
+here only block 08 needed a 3-way merge and it auto-resolved with zero
+drift. The verified applied state is preserved on the `rdna-boosts`
+branch of the `~/prs/llama.cpp` clone (upstream `0eadefebd` + 12 blocks,
+tag `rdna-boosts-0eadefebd`). If a future drift event ever needs the fork
+point moved, follow the regeneration path above (`scripts/make-patches.sh`
+with base `0eadefebd`, blocks tip `9c2463ff8`/`221b0c804` in that clone).
+
