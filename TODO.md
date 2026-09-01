@@ -6,43 +6,48 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
 ## Priority (next session)
 
 ### [HIGHEST PRIORITY] qwen35moe MoE + multi-GPU decode hang (Q5_K/Q6_K)
-- Symptom: llama-bench 2-GPU tensor-split decode of qwen35moe hangs
-  (GPUs busy-wait one-at-a-time at 100%, no output, timeout-kill only).
-  Q3_K_M/Q4_K_M work (62 t/s); Q5_K_M/Q6_K hang. 1-GPU works (75 t/s).
-  Dense 27B Q8_0 2-GPU works. 3-GPU also hangs (same as 2-GPU).
-- Bisect (2026-09-01, 5 worktrees built + tested): hangs at EVERY point -
-  old verified base a7cc83bba (blocks 01-12), pre-41ef91f7c, pre-f8dbcd618
-  (pre-#27466), current upstream 0eadefebd, and the rdna-boosts fork tip.
-  NOT a regression from the 22 upstream commits. NOT PR #27466. NOT block
-  13 (reproduced on pristine upstream with NO boosts patches).
-- Why it was never seen: qwen35moe was only ever validated SINGLE-GPU
-  (wip README: "single Radeon AI PRO R9700"). The historical 2-GPU decode
-  numbers (31.79->38.71 t/s) in patches/README were the DENSE Qwen3.8-27B
-  Q8_0, not qwen35moe. The MUL_MAT_ID MoE path on multi-GPU split was
-  never exercised for qwen35moe.
-- Suspects to check next session (none verified yet):
-  1. MUL_MAT_ID MoE mmvq/MMQ kernel on multi-GPU: the ids-gather + expert
-     dispatch with tensor-split layers - maybe an expert row split across
-     GPUs that each GPU expects locally (the ids tensor is per-token
-     global expert ids; layer split means each GPU has the same experts?
-     no - tensor split = layer split, so experts are duplicated per GPU,
-     should be fine... verify with OP_TIMING where it sticks).
-  2. RCCL/allreduce on the MoE decode shapes (Q5_K/Q6_K specific sizes)
-     vs the Q3_K/Q4_K ones - try GGML_CUDA_ALLREDUCE=none to bisect.
-  3. The mmvq mmid_max_batch table differences Q5_K/Q6_K vs Q3_K/Q4_K
-     (VDR_Q6_K_Q8_1_MMVQ=2, VDR_Q4_K=4) interacting with multi-GPU.
-  4. Test the Q8_0 qwen35moe (user: "Q8_0 needs 2 GPUs to run") - does
-     it hang too? Q8_0 is in the block-13 fused list AND has its own
-     mmvq table entry.
-- Tooling ready: /tmp worktrees were cleaned; rebuild points: commit
-  5d4a3be26 (pre-27466) and 41ef91f7c~1 (pre-MOE-fusion) tested already.
-  Use GGML_CUDA_OP_TIMING=1 -v to find where decode sticks (it printed
-  nothing on the hang - the first decode graph is where it stops).
+- **ROOT CAUSE FOUND (2026-09-01 afternoon):** NOT a hang at all. It is a
+  **pathologically slow weight-load** on 2-GPU tensor split for quants whose
+  block size is NOT a multiple of 4 (Q6_K=210B, Q3_K=110B). The split-buffer
+  upload issues `cudaMemcpy2DAsync` (H2D) with width = one quant block;
+  width%4 != 0 makes the copy ~2000ms instead of ~10ms (verified with a
+  standalone hipMemcpy2DAsync repro: width=210 -> 2328ms, width=272 -> 0ms,
+  same height/stride). The load takes ~3 min instead of ~20 s, so llama-bench
+  with default timeouts appears to "hang" (GPU oscillating 0<->100% while
+  loading hops between devices). AFTER the slow load completes, prefill AND
+  decode both work fine.
+- **Reproduction proof:** the docs-era build (a7cc83bba + blocks + ITEM B,
+  ~/prs/llama.cpp/build-rocm @ 554691a72) completes Q6_K 2-GPU with a 480s
+  timeout: pp512 = 4526-4575 t/s, tg32 = 82 t/s - matching the 08-31 docs
+  numbers (4538/97.5) exactly. The current fork (0eadefebd + blocks 01-13)
+  also completes: pp512 4370, tg32 82. **PRISTINE upstream 0eadefebd
+  (zero patches) also exhibits the same slow load** - this is an UPSTREAM
+  bug, NOT block 13, NOT block 12, NOT the 22-commit range (verified by
+  building pristine 0eadefebd with the same /opt/rocm-7.14-gfx1201
+  toolchain: same GPU[1]@100% load-phase stall).
+- Why the docs (08-31) were believed to work: they DID work - the earlier
+  sessions simply waited out the ~3min load. The "hangs at EVERY point"
+  bisect result from 09-01 was WRONG: it used timeouts shorter than the
+  slow load, so every build "hung".
+- **Fix options (next session):**
+  1. BEST: fix the unaligned 2D copy. Options: (a) pad width to 4 in the
+     loader's set_tensor_2d path (needs the split logic to use 4-aligned
+     granularity), (b) in ggml_backend_meta_buffer_set_tensor, copy each
+     row with aligned chunks, (c) change get_split_granularity for Q6_K/
+     Q3_K so the per-device row copy width is 4-aligned (e.g. lcm to 256
+     already is... verify why width ends up 210).
+  2. File upstream issue: llama.cpp split-load with unaligned quant blocks
+     (Q6_K/Q3_K) is 200x slower than Q8_0 on ROCm 7.14/gfx1201.
+- Test harness: run llama-bench with `-ub 512 -p 512 -n 0` and a LONG
+  timeout (>= 480s) or `--no-warmup`. Quick probe: measure the copy time in
+  the load (or just time how long `load_tensors:` -> first pp row takes).
 - Related but DIFFERENT (do not conflate): PR #27466 comment (BoneHorror)
   - Qwen3.8-Flash-Next degenerates to "//////" on ROCm after the radix
   TOP_K commit (qwen4exp indexer TOP_K over >1024 cells). Our qwen4exp
   radix top-k is a SEPARATE implementation, validated, and does NOT have
   this bug. See wip/qwen4exp/.
+- Quant block sizes: Q3_K=110, Q4_K=144, Q5_K=180, Q6_K=210, Q8_0=32,
+  IQ4_XS=36. Hang iff block size % 4 != 0 (Q3_K/Q6_K).
 
 ## Active (in progress now)
 
