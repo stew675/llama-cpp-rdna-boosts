@@ -52,6 +52,21 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
 
 ## Flagged follow-ups (not started)
 
+### [OPEN] Port + validate block 12 (hybrid HIP all-reduce) on dual 7900XTX
+- What: block 12's internal AR is hard-gated to RDNA4 (`gfx1200`/`gfx1201`
+  only, `strncmp` on gcnArchName in allreduce-hip.cu; refuses to init
+  elsewhere and falls back to RCCL). 7900XTX = gfx1100 (RDNA3), which
+  upstream RCCL supports but whose peer-to-peer / queue-preemption behavior
+  the internal AR's in-kernel spin + hybrid dispatch were never validated
+  against (the spin timeout work, PR #8, was tuned on 2x gfx1201).
+- Work: relax the arch gate for gfx1100, validate the hybrid dispatch
+  matrix (internal vs nccl vs none) + the bounded-spin path on a 2x7900XTX
+  box, confirm no MES REMOVE_QUEUE/MODE1-reset regressions at depth-16384.
+- **Needs community assistance**: the author has NO machine with dual
+  7900XTX. Ask for help in the blocks repo (issue or a 7900XTX-owner
+  thread); the gate makes the fallback safe (RCCL) so a volunteer can test
+  with `GGML_CUDA_ALLREDUCE=internal` and report the matrix.
+
 ### [OPEN] qwen35moe MoE + multi-GPU decode hang (Q5_K/Q6_K)
 - Symptom: llama-bench 2-GPU tensor-split decode of qwen35moe hangs
   (GPUs busy-wait, no output). Q3_K_M/Q4_K_M work (62 t/s); Q5_K_M/Q6_K
