@@ -5,10 +5,16 @@ flash-attention via the new `GGML_OP_FLASH_ATTN_QSA` op, validated on
 3x Radeon AI PRO R9700 (gfx1201).
 
 **Source of truth (the code):** the `qwen4exp` branch of
-`~/prs/llama.cpp` (the protected pre-re-base fork). ITEM B is committed
-there as `554691a72` (op + tiled all-heads-per-block kernel). This
-directory holds the planning docs, handoffs and WIP patches that
-survive context compaction; the full history is in the handoffs.
+`~/llama.cpp` (re-applied 2026-09-02 onto the 0eadefebd re-base +
+blocks 01-13, tip `0ff151bda`). ITEM B is committed there as the
+re-apply commit `0ff151bda` (cherry-pick of the protected
+`~/prs/llama.cpp` qwen4exp branch commits `e2d2a1f1c` op + `554691a72`
+kernel-opt; 1 conflict resolved: ggml-backend.cpp kept the upstream
+MUL_MAT alloc-expand case alongside the new FLASH_ATTN_QSA case). The
+old pre-re-base branch still lives at `~/prs/llama.cpp` `qwen4exp` @
+`554691a72` (protected, for reference/backup only). This directory
+holds the planning docs, handoffs and WIP patches that survive context
+compaction; the full history is in the handoffs.
 
 **Not part of the delivery patch set:** qwen4exp is a *model-architecture*
 work stream, separate from the MoE work shipped as block 13. It stays WIP
@@ -39,11 +45,12 @@ here until ITEM B's latency work + packaging are done.
 
 ## Where things live
 
-- Code: `~/prs/llama.cpp` branch `qwen4exp` (checkpoints `d2548f9af`
-  base, `e2d2a1f1c` op, `554691a72` kernel-opt).
+- Code (ACTIVE): `~/llama.cpp` branch `qwen4exp` @ `0ff151bda` (re-applied
+  onto 0eadefebd + blocks 01-13, 2026-09-02). The `rdna-boosts` branch
+  carries blocks 01-13 and does NOT include ITEM B; `qwen4exp` is
+  rdna-boosts + ITEM B.
+- Code (protected reference): `~/prs/llama.cpp` branch `qwen4exp`
+  (checkpoints `d2548f9af` base, `e2d2a1f1c` op, `554691a72` kernel-opt).
 - Env toggles: `LLAMA_QSA_SPARSE_FA=1` (enable sparse),
   `GGML_CUDA_QSA_IDENTITY=1` (validation), `GGML_CUDA_OP_TIMING=1`
   (op timing, needs `-v`, disables CUDA graphs).
-- The fork's `rdna-boosts` branch carries blocks 01-13 (delivery set)
-  and does NOT include ITEM B; the merge-back happens after ITEM B
-  latency work lands.
