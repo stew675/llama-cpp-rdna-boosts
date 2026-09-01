@@ -25,10 +25,14 @@ here until ITEM B's latency work + packaging are done.
 | File | What |
 |---|---|
 | `plan-qwen4exp.md` | The plan: sparse attention design, depth-constant prefill goal, kernel structure |
+| `handover-2026-09-02.md` | **CURRENT handover: repo/branch layout, ITEM B status, bench config, captured diffs, next work. READ THIS FIRST.** |
+| `handoff-2026-09-02-rebase-reapply.md` | ITEM B re-apply onto the 0eadefebd re-base (conflict + verification) |
 | `qwen4exp-handoff-2026-08-31.md` | Session 1 handoff: ITEM A, op design, validation methodology |
 | `qwen4exp-handoff-2026-08-31-session2.md` | Session 2 handoff: kernel optimization passes, L2 fix, head-sum fusion (reverted), measured curve |
-| `patches/0005-kv-prev-tokens-index.*` | WIP: KV prev-tokens index (earlier qwen4exp infra) |
-| `patches/0006-qsa-topk-radix-gpu.patch` | WIP: GPU radix top-k for the indexer (validated, separate from upstream PR #27466's implementation) |
+| `patches/0008-item-b-qsa-sparse-flash-attn.patch` | **ITEM B (the active op/kernel) - full diff, applies clean to rdna-boosts** |
+| `patches/0005-kv-prev-tokens-index.patch` | WIP: KV prev-tokens index query side (seq_pos map is already upstream via #27991) |
+| `patches/test-kv-prev-tokens.cpp` | Unit test for 0005 (compile standalone) |
+| `patches/0006-qsa-topk-radix-gpu.patch` | HISTORICAL ONLY: radix top-k, superseded by upstream #27466 |
 | `patches/0007-ple-batch-cache-archive.patch` | WIP: PLE batch cache (archived neutral) |
 
 ## ITEM B status (from handoff UPDATE 12)
@@ -48,9 +52,11 @@ here until ITEM B's latency work + packaging are done.
 - Code (ACTIVE): `~/llama.cpp` branch `qwen4exp` @ `0ff151bda` (re-applied
   onto 0eadefebd + blocks 01-13, 2026-09-02). The `rdna-boosts` branch
   carries blocks 01-13 and does NOT include ITEM B; `qwen4exp` is
-  rdna-boosts + ITEM B.
+  rdna-boosts + ITEM B. **Work ONLY on `qwen4exp`; never pollute
+  `rdna-boosts`.**
 - Code (protected reference): `~/prs/llama.cpp` branch `qwen4exp`
   (checkpoints `d2548f9af` base, `e2d2a1f1c` op, `554691a72` kernel-opt).
+  Same binary is op-for-op identical to the current fork on the dense path.
 - Env toggles: `LLAMA_QSA_SPARSE_FA=1` (enable sparse),
   `GGML_CUDA_QSA_IDENTITY=1` (validation), `GGML_CUDA_OP_TIMING=1`
   (op timing, needs `-v`, disables CUDA graphs).
