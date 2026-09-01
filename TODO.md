@@ -27,6 +27,20 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
   12, extend make-patches.sh + apply-all.sh, update patches/README.md +
   MANIFESTS.md + README.md, regenerate rdna-boosts-all.patch, verify apply on
   fresh checkout at 0eadefebd, then move qwen4exp to wip/qwen4exp/.
+- VALIDATION DONE (2026-09-01, 1-GPU qwen35moe = the verified config):
+  - test-backend-ops: 2/2 backends OK (after 2 fixes below)
+  - Coherence: fusion on/off same-seed greedy output IDENTICAL
+  - Prefill pp16384: Q6_K +5.1% (3344 vs 3181), Q4_K_M +3.6% (3488 vs 3367)
+  - Decode tg128: +5.6% (97.28 vs 92.15 pristine) - item-split + fused gate
+  - Fused path fires: FUSED MUL_MAT_ID ffn_moe_down-* on all layers
+- The 2 fixes vs the verified 0004 patch (both in ggml-cuda.cu):
+  1. x_scale_channel_dst arm gated to mm_node->ne[2] == 1 (multi-token falls
+     back to separate MUL - restores old verified behavior; upstream 0eadefebd
+     gate change admits multi-token which the n=1-only kernel can't express).
+  2. fused MoE MMQ arm gated to the instantiated type list (Q3_K/Q4_K/Q5_K/
+     Q8_0/Q6_K) - q4_0/q4_1/q5_0/IQ/MXFP4 were aborting
+     (GGML_ABORT "fused gate MMQ not implemented").
+  Both are correctness fixes required for the multi-token tests upstream added.
 
 ### [IN-PROGRESS] ITEM B - sparse QSA flash attention (qwen4exp branch)
 - Op + kernel committed on `~/prs/llama.cpp` qwen4exp branch @ `554691a72`
@@ -37,6 +51,23 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
 - Move to `wip/qwen4exp/` as part of the block-13 split-out (above).
 
 ## Flagged follow-ups (not started)
+
+### [OPEN] qwen35moe MoE + multi-GPU decode hang (Q5_K/Q6_K)
+- Symptom: llama-bench 2-GPU tensor-split decode of qwen35moe hangs
+  (GPUs busy-wait, no output). Q3_K_M/Q4_K_M work (62 t/s); Q5_K_M/Q6_K
+  hang. 1-GPU works (75 t/s). Dense 27B Q8_0 2-GPU works.
+- Bisect result (2026-09-01): hangs at EVERY point - old verified base
+  a7cc83bba (blocks 01-12), pre-41ef91f7c, pre-f8dbcd618, current upstream
+  0eadefebd. NOT a regression from the 22 upstream commits, NOT #27466,
+  NOT block 13. qwen35moe was only ever validated SINGLE-GPU (wip README:
+  "single Radeon AI PRO R9700"; the historical 2-GPU decode numbers were
+  the dense Qwen3.8-27B Q8_0). It is a never-validated configuration.
+- Related but different: PR #27466 comment (BoneHorror) - Qwen3.8-Flash-
+  Next degenerates to "//////" on ROCm after the radix TOP_K commit
+  (qwen4exp indexer TOP_K over >1024 cells). Our qwen4exp radix top-k is a
+  SEPARATE implementation, validated, and does NOT have this bug.
+- "Done": find the MoE-multi-GPU kernel hang (likely the mmvq MUL_MAT_ID
+  split or RCCL reduce on Q5_K/Q6_K shapes), fix, validate 2-GPU decode.
 
 ### [OPEN] Multi-token MUL_MAT_ID mmvq `x_scale_channel_dst` fusion
 - What: the `ffn_moe_weighted = moe_down * topk_weights` MUL fold (block 08's
