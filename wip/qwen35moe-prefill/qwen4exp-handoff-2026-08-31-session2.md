@@ -317,3 +317,49 @@ The indexer side is cheap and correct (BF16, GPU top-k 0.5-0.7ms). The
 sparse-FA kernel only needs to fix the dense attention pass over n_kv.
 Instrumentation (GEMMTIMING/MMDISPATCH/MMQTIMING/SLOWNODE) was removed;
 tree clean at d2548f9af on branch qwen4exp.
+
+## UPDATE 8 (pre-ITEM-B COMPACTION HANDOFF): where we stand
+
+### Git state (both repos clean, safe to resume after compaction)
+- ~/llama.cpp branch `qwen4exp` @ d2548f9af (clean tree):
+  - 23f006087 = full working-tree snapshot checkpoint (all session work)
+  - d2548f9af = PLE cache dropped, instrumentation removed
+  - Contains: block-11 revert, ngram patches 0001-0007, MoE fusion,
+    PR #27992 prev-token index, HIP radix top-k backport, LLAMA_UBATCH_TIMING
+- boosts repo wip/qwen35moe-prefill/ @ f003b6f:
+  - handoff doc (this file) with full history
+  - patches/: 0005-kv-prev-tokens-index.patch, 0006-qsa-topk-radix-gpu.patch,
+    0007-ple-batch-cache-archive.patch
+  - plan-qwen4exp.md, plan-decode.md, plan-fused-moe.md
+
+### Measured state (best config, ub2048, tensor, t16, WMMA off)
+pp512 1492 | pp2048 2028 | pp4096 2031 | pp8192 1935 | pp16384 1716 |
+pp32768 1381 | pp65536 995 | tg128 40.1. CPU burn 16K: 140%.
+Everything committed; no uncommitted work anywhere.
+
+### ITEM B (next): sparse attention for 200K - the full design context
+- The only linear-in-n_kv cost left: FLASH_ATTN_EXT over the ENTIRE KV
+  cache in build_attn_qsa (qwen4exp.cpp:668-740). Top-k (2048) only masks
+  scores; the FA kernel still touches all n_kv cells.
+  35.7ms@16K -> 158ms@64K (4.4x per 4x ctx); ~36% of ubatch at 16K, ~92%
+  at 64K. At 200K it would be 12.5x the 16K cost -> prefill unusable.
+- The indexer side is cheap and correct: GPU radix top-k 0.5-0.7ms/node,
+  BF16 k_proj 0.02ms steady (one-time hipBLAS init only). ITEM A closed.
+- Goal: per-token gather of the top-k K/V cells, attend over ~2048 cells
+  instead of n_kv. Keeps attention constant at any depth.
+- ggml has NO 2D/per-token gather op and NO sparse flash-attn. fattn infra:
+  ggml/src/ggml-cuda/fattn-*.cuh (fattn-tile.cu is the tile FA). Design
+  options (from UPDATE 6): (1) custom sparse-FA kernel taking top-k idx,
+  (2) new 2D gather op + dense FA over [n_top_k, n_tokens], (3) fused
+  indexer+attn. Correctness bar: bit-exact vs the mask path (semantics:
+  -INFINITY except top-k rows=0, plus base kq_mask ADD; preserve causality).
+- The model: qwen4exp = Qwen3.8-Flash-Next UD-Q4_K_XL, 48 layers, 12
+  full-attn layers (3,7,...,47), 36 GDN/recurrent. n_ctx_train 262144.
+  QSA hparams: head_count 4, key_length 128, top_k 2048, ratios [0,0,0,4,..].
+
+### How to resume (after compaction)
+1. Re-read this file (UPDATE 6 = action plan, UPDATE 7 = ITEM A closure).
+2. Re-apply runtime PM fix if rebooted: echo on | sudo tee
+   /sys/bus/pci/devices/0000:{03,06,09}:00.0/power/control
+3. Start ITEM B: sparse attention. Measure pp16384/65536 before/after;
+   verify bit-exactness vs the mask path at 16K (logitdump A/B works).
