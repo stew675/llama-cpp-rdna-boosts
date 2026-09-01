@@ -178,6 +178,17 @@ expected to stay fork-local. Block 12's internal all-reduce is gated to
 RDNA4 pending community verification on RDNA3 pairs. See `MANIFESTS.md`
 for per-block verification and `BASELINE.md` for provenance.
 
+
+## Community Acknowledgements
+
+This work is becoming a community effort and I'd like to offer special thanks to the
+following users for the assistance in finding issues and offering solutions!
+
+- https://github.com/bakon11
+- https://github.com/tungel
+
+I, and everyone else who benefits from this work, really appreciate you!
+
 ## License
 
 Same as llama.cpp (MIT).
