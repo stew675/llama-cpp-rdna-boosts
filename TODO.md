@@ -30,6 +30,9 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
   12, extend make-patches.sh + apply-all.sh, update patches/README.md +
   MANIFESTS.md + README.md, regenerate rdna-boosts-all.patch, verify apply on
   fresh checkout at 0eadefebd, then move qwen4exp to wip/qwen4exp/.
+- DONE (2026-09-01): block 13 released (fork a14257996, 13-patch set
+  regenerated + verified, docs updated, all.patch regenerated); qwen4exp
+  moved to `wip/qwen4exp/` (plan + handoffs + patches 0005-0007).
 - VALIDATION DONE (2026-09-01, 1-GPU qwen35moe = the verified config):
   - test-backend-ops: 2/2 backends OK (after 2 fixes below)
   - Coherence: fusion on/off same-seed greedy output IDENTICAL
