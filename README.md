@@ -185,6 +185,7 @@ This work is becoming a community effort and I'd like to offer special thanks to
 following users for the assistance in finding issues and offering solutions!
 
 - https://github.com/bakon11
+- https://github.com/eoprede
 - https://github.com/tungel
 
 I, and everyone else who benefits from this work, really appreciate you!
