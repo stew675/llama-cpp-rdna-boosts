@@ -5,52 +5,36 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
 
 ## Priority (next session)
 
-### [HIGHEST PRIORITY] qwen35moe MoE + multi-GPU decode hang (Q5_K/Q6_K)
-- **ROOT CAUSE FOUND (2026-09-01 afternoon):** NOT a hang at all. It is a
-  **pathologically slow weight-load** on 2-GPU tensor split for quants whose
-  block size is NOT a multiple of 4 (Q6_K=210B, Q3_K=110B). The split-buffer
-  upload issues `cudaMemcpy2DAsync` (H2D) with width = one quant block;
-  width%4 != 0 makes the copy ~2000ms instead of ~10ms (verified with a
-  standalone hipMemcpy2DAsync repro: width=210 -> 2328ms, width=272 -> 0ms,
-  same height/stride). The load takes ~3 min instead of ~20 s, so llama-bench
-  with default timeouts appears to "hang" (GPU oscillating 0<->100% while
-  loading hops between devices). AFTER the slow load completes, prefill AND
-  decode both work fine.
-- **Reproduction proof:** the docs-era build (a7cc83bba + blocks + ITEM B,
-  ~/prs/llama.cpp/build-rocm @ 554691a72) completes Q6_K 2-GPU with a 480s
-  timeout: pp512 = 4526-4575 t/s, tg32 = 82 t/s - matching the 08-31 docs
-  numbers (4538/97.5) exactly. The current fork (0eadefebd + blocks 01-13)
-  also completes: pp512 4370, tg32 82. **PRISTINE upstream 0eadefebd
-  (zero patches) also exhibits the same slow load** - this is an UPSTREAM
-  bug, NOT block 13, NOT block 12, NOT the 22-commit range (verified by
-  building pristine 0eadefebd with the same /opt/rocm-7.14-gfx1201
-  toolchain: same GPU[1]@100% load-phase stall).
-- Why the docs (08-31) were believed to work: they DID work - the earlier
-  sessions simply waited out the ~3min load. The "hangs at EVERY point"
-  bisect result from 09-01 was WRONG: it used timeouts shorter than the
-  slow load, so every build "hung".
-- **FIXED (2026-09-01):** committed into block 13 (fork 834a8d3ff,
-  amended block-13 commit; the fix belongs with the block whose feature
-  exposes it).  `ggml_backend_cuda_buffer_set_tensor_2d` now stages
-  unaligned-width H2D copies through device memory: aligned-width H2D +
-  unaligned D2D gather (both fast).  Verified: standalone memcmp 0;
-  Q6_K/Q3_K 2-GPU load <15s (was ~3min); pp512 ~4200-4500, tg32
-  ~66-82 matching docs-era numbers; Q8_0 unchanged; 13-patch set
-  regenerated + fresh-apply verified byte-identical at 0eadefebd.
-- **Upstream (open):** file llama.cpp issue - split-load 2D H2D copies
-  with width not multiple of 4 (Q6_K/Q3_K quant blocks) are ~1000x
-  slower on ROCm.  Present in pristine 0eadefebd.  The fix could be
-  contributed upstream once the local validation settles.
-- Test harness: run llama-bench with `-ub 512 -p 512 -n 0` and a LONG
-  timeout (>= 480s) or `--no-warmup`. Quick probe: measure the copy time in
-  the load (or just time how long `load_tensors:` -> first pp row takes).
-- Related but DIFFERENT (do not conflate): PR #27466 comment (BoneHorror)
-  - Qwen3.8-Flash-Next degenerates to "//////" on ROCm after the radix
-  TOP_K commit (qwen4exp indexer TOP_K over >1024 cells). Our qwen4exp
-  radix top-k is a SEPARATE implementation, validated, and does NOT have
-  this bug. See wip/qwen4exp/.
-- Quant block sizes: Q3_K=110, Q4_K=144, Q5_K=180, Q6_K=210, Q8_0=32,
-  IQ4_XS=36. Hang iff block size % 4 != 0 (Q3_K/Q6_K).
+### [NEXT TASK] Multi-token MUL_MAT_ID mmvq `x_scale_channel_dst` fusion
+- What: the `ffn_moe_weighted = moe_down * topk_weights` MUL fold (block 08's
+  arm in ggml-cuda.cu try_fuse) only supports SINGLE-token decode (n=1). The
+  kernel epilogue applies `x_scale[channel_dst]` = one scalar per expert, which
+  is correct only when all batch tokens share one expert weight. Multi-token
+  topk weights are per-(expert, token) (shape [1, n_used, n_tokens]), which the
+  kernel cannot express (assert: `nelements(x_scale) == dst->ne[1]`).
+- Why it surfaced NOW: upstream 0eadefebd changed the mmvq gate from
+  `dst->ne[2] != 1` (single-token only) to `dst->ne[2] > get_mmvq_mmid_max_batch(...)`
+  (admits multi-token), so the block-08 arm now fires for n>1 and the kernel
+  assert aborts. Old tree never hit it (old gate blocked n>1).
+- Interim fix APPLIED (in the block-13 tree): gate the arm with
+  `mm_node->ne[2] == 1` - restores old verified semantics (multi-token keeps the
+  separate MUL op, bit-exact). test-backend-ops green.
+- "Done": extend both kernels to index x_scale by (expert, token) and remove
+  the gate; validate bit-exactness + perf on spec-dec verify batches (n=2..8).
+  Real feature work, NOT a trivial gate removal.
+- Where: `ggml-cuda.cu` try_fuse (block-08 arm) + the mmvq kernel epilogue in
+  `mmvq.cu` (`mul_mat_vec_q` / `mul_mat_vec_q_moe` x_scale handling).
+- Note: this is the block-08 arm, NOT the block-13 fused-gate MMQ (that one is
+  the prefill path). Verify the arm is still the mmvq single-token fold and
+  that multi-token spec-dec verify batches (n=2..8) are the target.
+
+### [OPEN] File upstream llama.cpp issue: unaligned-width split-load on ROCm
+- The block-13 load fix (below) works around an UPSTREAM bug: H2D 2D copies
+  with width not multiple of 4 (Q6_K/Q3_K quant blocks = 210/110B) are
+  ~1000x slower on ROCm (present in pristine 0eadefebd). Fix is local in
+  `set_tensor_2d` (staging via aligned H2D + unaligned D2D). Candidate to
+  contribute upstream once local validation settles; needs a minimal repro
+  (standalone hipMemcpy2DAsync: width 210 -> 2300ms, width 212 -> 0ms).
 
 ## Active (in progress now)
 
@@ -82,6 +66,9 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
 - DONE (2026-09-01): block 13 released (fork a14257996, 13-patch set
   regenerated + verified, docs updated, all.patch regenerated); qwen4exp
   moved to `wip/qwen4exp/` (plan + handoffs + patches 0005-0007).
+- DONE (2026-09-01): block-13 commit amended with the unaligned-width
+  split-load fix (fork 834a8d3ff), 13-patch set + all.patch regenerated,
+  fresh-apply re-verified byte-identical, both repos pushed.
 - VALIDATION DONE (2026-09-01, 1-GPU qwen35moe = the verified config):
   - test-backend-ops: 2/2 backends OK (after 2 fixes below)
   - Coherence: fusion on/off same-seed greedy output IDENTICAL
@@ -139,6 +126,7 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
 - "Done" would be: extend both kernels to index x_scale by (expert, token) and
   remove the gate; validate bit-exactness + perf on spec-dec verify batches
   (n=2..8). Real feature work, NOT a trivial gate removal.
+- MOVED to Priority (next task) 2026-09-01.
 
 ### [OPEN] MXFP4 (and NVFP4) fused gate+up+GLU MMQ (block 13)
 - What: the fused MoE MMQ kernel (`ggml_cuda_mul_mat_q_switch_type_gate`) is
@@ -170,6 +158,18 @@ Each entry: status, why it matters, what "done" looks like, where the work lives
   back-port still parked.
 
 ## Closed / archived
+- qwen35moe MoE + multi-GPU "hang" (Q5_K/Q6_K): RESOLVED + FIXED. Root cause:
+  pathologically slow 2-GPU tensor-split weight load for quants with block
+  size % 4 != 0 (Q6_K=210B, Q3_K=110B) - H2D 2D copies with unaligned width
+  take ~2300ms vs ~10ms on ROCm; the ~3min load looked like a hang. UPSTREAM
+  bug (present in pristine 0eadefebd); the earlier "hangs at EVERY point"
+  bisect was wrong (timeouts < slow load). Fixed in block 13 (fork
+  834a8d3ff, amended): `set_tensor_2d` stages via aligned H2D + unaligned
+  D2D. Verified: Q6_K/Q3_K 2-GPU load <15s, pp512 ~4200-4500 / tg32
+  ~66-82 (matches docs-era 4526/82); Q8_0 unchanged; fresh-apply of the
+  13-patch set byte-identical. Pushed to stew675/llama.cpp rdna-boosts +
+  delivery repo main. See `wip/qwen35moe-prefill/handoff-2026-09-01-
+  session4.md` for the full investigation.
 - ITEM A (node_56/node_570 one-time hipBLAS JIT): RESOLVED.
 - Indexer head-sum fusion (GGML_OP_INDEXER_HEAD_SUM): REVERTED - bit-correct but
   end-to-end regressed (graph splitter perturbation). Lesson: measure
