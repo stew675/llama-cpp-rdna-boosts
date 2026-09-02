@@ -617,3 +617,24 @@ REMAINING LEVERS (evidence-ranked, all with real cycle costs):
   attn/ffn body elementwise chains (generic fusion pass work).
 - Cycle-time: run benches/gates FOREGROUND with timeout (returns on early
   exit AND early failure); -r 3 for decisive bench means.
+
+## FINAL STATE (context-compaction checkpoint, end of decode session 5)
+
+- llama.cpp qwen4exp branch @ bd25e63eb, WORKING TREE CLEAN, NOT pushed
+  (user's fork policy: commit ok, no push).
+- Boosts repo main @ 295b6c7, clean, PUSHED. Handover file = this doc.
+- Decode: tg128 ~44.7-44.8 t/s = +14.5% vs unfused 39.79 (22.3 ms/token).
+  pp512 ~1500 unchanged (prefill untouched by construction - all decode
+  changes are gated to nt == 1 via LLAMA_FUSED_HC_MIX / _HC_COMBINE envs,
+  default on).
+- Correctness: every change verified byte-identical vs
+  /home/ld_decode_ref.bin (16 nt=1 positions). The prefill gate
+  /home/ld1024_noflag.bin is unaffected by construction.
+- Patch blocks 0009-0014 in wip/qwen4exp/patches/ (0009 + 0010 = the two
+  ops; 0011-0014 = kernel geometry / silu-quant merge / rms-gamma fold /
+  F32 inject fold). Apply chain 0009..0014 verified sequentially on
+  6a4e2c766.
+- The kernel-count wall (per-kernel ~8-16us queueing on the saturated
+  3-GPU decode) means only kernel-count-reducing changes win; next levers
+  are batch decode (M > 1) or the decode-expert mmvq config or body-op
+  fusion - all listed in the session-5b section above.
