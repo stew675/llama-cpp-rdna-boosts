@@ -638,3 +638,56 @@ REMAINING LEVERS (evidence-ranked, all with real cycle costs):
   3-GPU decode) means only kernel-count-reducing changes win; next levers
   are batch decode (M > 1) or the decode-expert mmvq config or body-op
   fusion - all listed in the session-5b section above.
+
+## UPDATE (decode session 6): 4-kernel mix + M=1 GEMM floor model + router scoping
+
+- COMMIT af3640f67 (on bd25e63eb), patch 0015 preserved + apply-verified.
+  hc_mix internals 6 -> 4 kernels/call: (1) the xn Q8_1 quantize became the
+  phase-3 of the rms+gamma kernel (one 1024-thread block per stream
+  quantizes its own 80 q8_1 groups with the quantize_q8_1 warp pattern -
+  amax/127 roundf, sum - no redundant work, byte-identical y_xn); (2) the
+  F32 inject mmvf-replica rows merged into the collapse dispatch (grid =
+  n_embd/256 collapse blocks + hc inject blocks, blockIdx branch, both
+  paths unchanged). Decode logitdump byte-identical; tg128 45.57 then
+  45.56 (two -r 3 runs) vs 44.70-44.81 pre-merge = +2% (reproduced, above
+  noise). Campaign total vs the 39.79 -r 3 unfused ref = +14.5% (39.15 ->
+  45.56 = +16.4%).
+- COST MODEL (micro-probes, settles the queueing-vs-work question):
+  chained-graph probe (64 sequential M=1 GEMMs in ONE graph, decode-like):
+  17.8 us/GEMM back-to-back vs 26.5 us with per-call graph dispatch.
+  Isolated per-op loop times are HOST-DISPATCH-INFLATED (~+9-15us/call);
+  the decode replays the whole token graph, so per-kernel = true GPU time.
+  ALL M=1 mmvq GEMMs pay a ~15-20us kernel floor in-chain regardless of
+  weight size (0.74MB router ~= 16.6MB dense); decode = ~440 GEMM-class
+  evals + ~1400 small evals per device per token; wall = sum of small
+  kernel times. The hc mix dots (down [10240x320] + up [320x10240], Q8_0)
+  are at this floor (~17/19us) and are BIT-EXACT-LOCKED (rpb=1/rpb=16
+  replication = the reference's own dispatch); the expert mmid kernels run
+  ~250-460 GB/s (near-tuned); the mix internals are now minimal (4
+  kernels: rms_quant, down, up_silu, collapse_inject - the 2 GEMMs are
+  irreducible, the auxiliaries merged).
+- ROUTER FUSION SCOPING (the next big lever, NOT yet done): the ffn
+  routing = per layer logits mmvq [2560x512] M=1 (~12-15us, 25 GB/s =
+  floor-dominated) + FUSED SOFT_MAX (~4us) + CPU argsort (0 GPU ARGSORT
+  instances in the decode profile - the topk selection runs host-side,
+  feeding the MUL_MAT_ID ids) + weights via the mmid fusion args. ~48x3
+  mirrored chains/token ~25-30us each. The tree HAS a topk_moe fusion
+  (topk-moe.cu + ggml_cuda_topk_moe_fusion in ggml-cuda.cu) that fuses
+  logits-mm + softmax + argsort + get_rows into ONE kernel, but it matches
+  SOFTMAX->RESHAPE->ARGSORT->VIEW->GET_ROWS (deepseek/llama4 order) and
+  build_moe_ffn's groupless softmax path builds softmax->argsort->reshape
+  (reshape AFTER, on probs) -> the qwen4exp graph does NOT match. Making
+  it match = a shared-builder reorder (affects all archs using
+  build_moe_ffn) or a qwen4exp-local path; the fused kernel = new numerics
+  -> decode-only gate + NEW decode reference + coherence re-verify. Value
+  ~+4-6% (kills ~2-3 GPU evals + the per-layer CPU round-trip x 48x3).
+- HEAD MIX (il=-1, no inject, once/token) still runs the UNFUSED chain
+  (~9 evals, ~90us, 0.4%) - the fused branch requires w_inject != nullptr.
+  Fusing it = nullable-w_inject op contract (dst [n_embd] when null) -
+  clean + small, but only ~0.3% value.
+- OTHER REMAINING: GDN state GET_ROWS/CPY folding (~5% est, invasive);
+  decode expert mmvq config (small - experts near-tuned); batch decode
+  (server, doesn't move tg128).
+- TOOLS: /tmp/m1_probe (M=1 mmvq shape floor probe, 200 iters),
+  /tmp/chain_probe (chained vs per-call dispatch discriminator) - both
+  compile with --offload-arch=gfx1201 against build-rocm libs.
