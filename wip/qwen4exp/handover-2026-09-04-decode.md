@@ -1002,3 +1002,65 @@ device's segment; then inspect the mmvq dispatch/geometry at ncols_dst=1,
 ne12=2 with the per-device K-segments (or the allreduce of the
 [2560,1,2] tensor). The single-seq decode gate (logitdump byte-identical
 vs /home/ld_decode_ref.bin) is unaffected - the (1,2) path is new.
+
+## UPDATE (debug session 10): MULTI-SEQ SEQ>=1 CORRUPTION FIXED - root cause + fix
+
+ROOT CAUSE (found after the ssm_out MM localization): the GDN z-gated norm
+fusion `unary_gated_q8_1_op_kernel` (ggml/src/ggml-cuda/unary.cu) computes
+sigmoid(z) x rms_norm_out and writes the Q8_1 quantized product into the
+q8_1 arena for the downstream ssm_out mmvq (which finds it via the cache).
+The kernel wrote the FLAT element layout (ib = i/32); the mmvq reads the
+PADDED PER-ROW layout of quantize_row_q8_1_cuda (each row of ne00=1920
+occupies GGML_PAD(1920, 512)/32 = 64 blocks). At n_seqs >= 2, channel c is
+read at block c*64, but the fusion wrote channel c at c*60 (flat) - so seq
+0 (blocks 0-59) was correct and every seq >= 1 read the previous channel's
+tail + garbage from the first token. ne12==1 (single-seq) never showed it
+(the layouts coincide); the (2,2) prefill never fused (ncols_dst==1
+required). Exactly the (1,2) geometry that failed throughout the campaign.
+
+THE FIX (llama.cpp 9ed77c905, patch 0017): pass the matmul's ne00
+(row_len = mm->src[1]->ne[0]) to the kernel and write
+ib = (i/row_len)*GGML_PAD(row_len,512)/32 + (i%row_len)/32. 12 insertions,
+3 deletions in unary.cu. The mmvq dot never reads the pad blocks, so they
+may stay unwritten.
+
+VERIFICATION:
+- Coherence (bseq_val): K=2 same prompt = seq0 == seq1 == 198 42750 367;
+  K=2 "Quantum" + "The answer" = 198.../369... both == their K=1 runs; K=3
+  (3 prompts) all match; unequal-length prompts (6+ tokens, K=2) both match
+  their K=1 runs token-for-token.
+- Single-seq gate: logitdump A/B clean-131935dce vs fixed (same -n 16
+  --seed 1234 stream) = BYTE-IDENTICAL. (The earlier "differs from
+  ld_decode_ref.bin" was a wrong-prompt artifact; the ref's token stream is
+  undocumented but the fix provably cannot change the ne12==1 numerics.)
+- Throughput (bseq, pp 20, 30 steps): K=1 ~45 t/s; K=8 62.8 ms/step; K=16
+  114.1; K=32 137.8; K=64 32.85 + 33.19 ms/step (two runs) = 1948/1928 tok/s
+  AGGREGATE. The session-8 prize (K=64 ~1819) is now CORRECT + slightly
+  faster. K<=64 fits the 3x32GB; K=128 OOMs.
+
+STATE: llama.cpp @ 9ed77c905 (clean, committed, not pushed; = 131935dce +
+the one-file fix). All debug instrumentation removed. Boost main @ b1fa398
+(patch 0017 + .md + this record). The batch-decode path (K-seq lockstep,
+llama-parallel, llama-server --parallel) is now USABLE.
+
+DEBUG NOTES FOR FUTURE SESSIONS (what the fix taught):
+1. The q8_1 quantize arena has TWO writers with DIFFERENT layout
+   conventions: quantize_row_q8_1_cuda (padded per-row) and the fusion
+   kernels that pre-quantize (unary-gated-q8_1 in unary.cu, and check the
+   norm.cu rms-q81 fusion for the same issue). Any cache key sharing between
+   them requires the padded layout.
+2. The fusion fires only at ncols_dst==1 (decode) with the src1 = the
+   product via no-op reshapes - the RESHAPE can change ne[0] (e.g. the
+   [128, 15, 1, 2] z-gated product viewed as [1920, 1, 2] for the matmul),
+   so the kernel must use the MATMUL's ne00, not the product's ne[0].
+3. seq0-correct + seqN-garbage + first-token + deterministic = almost always
+   a per-channel indexing bug at n_seqs > 1, not a state-read bug (the
+   s_copy/state reads were verified correct early; the real bug was one
+   kernel's flat-vs-padded layout 10 layers of instrumentation later).
+
+NEXT (unchanged from before, now unblocked): GDN state fold (~1.5-3%
+single-seq); llama-server --parallel validation of the K-seq decode; older
+threads (prefill pp8192, ML-Kernel/gpudh review, v_shifted probe, splitter
+F32, meta import gates, meta_tp_test multi-device sync). The K=64 batch
+path is ready for a serving-style benchmark (per-seq latency 32.85 ms/token
+at K=64 vs 21.9 single-seq - the standard batch tradeoff).
