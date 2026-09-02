@@ -1,0 +1,402 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index b5320fbcf..32a96674e 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2698,26 +2698,29 @@ extern "C" {
+             struct ggml_tensor  * comb);
+ 
+     // hc_mix: fused hyper-connection mixer (qwen4exp / Flash-Next decode).
+-    // x [n_embd, hc, n_tokens] F32 (the raw hc residual) -> dst [n_embd +
+-    // hc_dim, n_tokens] whose head is mixed [n_embd, n_tokens] and whose tail
+-    // is xn = rms(x) * w_norm [hc_dim, n_tokens] (the model views both out of
+-    // the one tensor; the inject MUL_MAT consumes the xn view). The op runs
+-    // the grouped RMSNorm over each stream (eps in op_params), the gamma
+-    // scale, the two Q8_0 LoRA products with silu/sigmoid gating, and the
+-    // stream collapse:
+-    //   xn    = rms(x) * w_norm
+-    //   lo    = silu(w_down^T xn / hc)
+-    //   gate  = sigmoid(w_up^T lo)
+-    //   mixed = (1/hc) * sum_c xn * gate
++    // x [n_embd, hc, n_tokens] F32 (the raw hc residual) -> dst [n_embd + hc,
++    // n_tokens] whose head is mixed [n_embd, n_tokens] and whose tail is the
++    // inject scatter [hc, n_tokens] (the model views both out of the one
++    // tensor; the combine consumes the inject view). The op runs the grouped
++    // RMSNorm over each stream (eps in op_params), the gamma scale (w_norm),
++    // the two Q8_0 LoRA products with silu/sigmoid gating, the stream
++    // collapse, and the F32 inject product:
++    //   xn     = rms(x) * w_norm
++    //   lo     = silu(w_down^T xn / hc)
++    //   gate   = sigmoid(w_up^T lo)
++    //   mixed  = (1/hc) * sum_c xn * gate
++    //   inject = w_inject^T xn
+     // Bit-exactness: the CUDA kernels mirror the unfused ops (rms_norm_f32,
+-    // the gamma MUL rounding, and the mmvq Q8_0 accumulation at M = 1), so xn
+-    // and mixed are byte-identical to the RMS + MUL + fused-chain outputs.
++    // the gamma MUL rounding, the mmvq Q8_0 accumulation at M = 1, and the
++    // mmvf float2-pair FMA accumulation for the F32 inject), so mixed and
++    // inject are byte-identical to the unfused chain outputs.
+     GGML_API struct ggml_tensor * ggml_hc_mix(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * x,
+             struct ggml_tensor  * w_norm,
+             struct ggml_tensor  * w_down,
+             struct ggml_tensor  * w_up,
++            struct ggml_tensor  * w_inject,
+             int64_t               hc,
+             float                 eps);
+ 
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index a1db5c085..06be7247d 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1069,12 +1069,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+                 // the hc weights and the per-token tensors are mirrored per
+                 // device (verified on the qwen4exp decode graph); each device
+                 // runs the full op and produces its own local copy. The output
+-                // carries both mixed and the persisted xn (the inject MUL_MAT
+-                // views the tail), all mirrored.
++                // carries both mixed and the inject scatter (the combine views
++                // the tail), all mirrored.
+                 GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                 GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                 GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                 GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++                GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                 split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+             } break;
+             case GGML_OP_HC_COMBINE: {
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 1ae62f92e..17e48bea7 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -3041,11 +3041,11 @@ struct ggml_cplan ggml_graph_plan(
+                     } break;
+                 case GGML_OP_HC_MIX:
+                     {
+-                        // per-token scratch: lo [hc_lr] + gate [hc_dim]
++                        // per-token scratch: xn [hc_dim] + lo [hc_lr] + gate [hc_dim]
+                         const int64_t hc      = ggml_get_op_params_i32(node, 0);
+                         const int64_t hc_lr   = node->src[2]->ne[1];
+                         const int64_t hc_dim  = node->src[0]->ne[0] * hc;
+-                        const int64_t per_thread = hc_lr + hc_dim;
++                        const int64_t per_thread = 2*hc_dim + hc_lr;
+                         cur = per_thread * sizeof(float) * n_tasks;
+                     } break;
+                 case GGML_OP_COUNT:
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 99cbad860..527ed5a27 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12175,16 +12175,18 @@ void ggml_compute_forward_lightning_indexer(
+ static void ggml_compute_forward_hc_mix_f32(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+-    const ggml_tensor * x       = dst->src[0];
+-    const ggml_tensor * w_norm  = dst->src[1];
+-    const ggml_tensor * w_down  = dst->src[2];
+-    const ggml_tensor * w_up    = dst->src[3];
+-
+-    GGML_ASSERT(x->type      == GGML_TYPE_F32);
+-    GGML_ASSERT(w_norm->type == GGML_TYPE_F32);
+-    GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0);
+-    GGML_ASSERT(w_up->type   == GGML_TYPE_Q8_0);
+-    GGML_ASSERT(dst->type    == GGML_TYPE_F32);
++    const ggml_tensor * x         = dst->src[0];
++    const ggml_tensor * w_norm    = dst->src[1];
++    const ggml_tensor * w_down    = dst->src[2];
++    const ggml_tensor * w_up      = dst->src[3];
++    const ggml_tensor * w_inject  = dst->src[4];
++
++    GGML_ASSERT(x->type        == GGML_TYPE_F32);
++    GGML_ASSERT(w_norm->type   == GGML_TYPE_F32);
++    GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0);
++    GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
++    GGML_ASSERT(w_inject->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type      == GGML_TYPE_F32);
+ 
+     const int64_t hc       = ggml_get_op_params_i32(dst, 0);
+     const float   eps      = ggml_get_op_params_f32(dst, 1);
+@@ -12198,6 +12200,7 @@ static void ggml_compute_forward_hc_mix_f32(
+     GGML_ASSERT(w_norm->ne[0] == hc_dim);
+     GGML_ASSERT(w_down->ne[0] == hc_dim);
+     GGML_ASSERT(w_up->ne[0] == hc_lr && w_up->ne[1] == hc_dim);
++    GGML_ASSERT(w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc);
+ 
+     const int ith = params->ith;
+     const int nth = params->nth;
+@@ -12206,17 +12209,16 @@ static void ggml_compute_forward_hc_mix_f32(
+     const int64_t ir0 = dr * ith;
+     const int64_t ir1 = MIN(ir0 + dr, n_tokens);
+ 
+-    // scratch for the current token: lo [hc_lr], gate [hc_dim]; xn lives in
+-    // the dst tail [n_embd .. n_embd + hc_dim)
+-    float * lo   = (float *) params->wdata + ith*(hc_lr + hc_dim);
++    // scratch for the current token: xn [hc_dim], lo [hc_lr], gate [hc_dim]
++    float * xn   = (float *) params->wdata + ith*(2*hc_dim + hc_lr);
++    float * lo   = xn + hc_dim;
+     float * gate = lo + hc_lr;
+ 
+     const float inv_hc = 1.0f / (float) hc;
+ 
+     for (int64_t it = ir0; it < ir1; ++it) {
+         const float * x_t = (const float *) x->data + it*hc_dim;
+-        float * dst_t     = (float *) dst->data + it*(n_embd + hc_dim);
+-        float * xn        = dst_t + n_embd;
++        float * dst_t     = (float *) dst->data + it*(n_embd + hc);
+ 
+         // grouped rms over each stream, then the gamma scale (the reference
+         // rounds rms(x) per element before the gamma MUL)
+@@ -12283,6 +12285,16 @@ static void ggml_compute_forward_hc_mix_f32(
+             }
+             dst_t[j] = sum * inv_hc;
+         }
++
++        // inject = w_inject^T xn into the dst tail [hc]
++        const float * wi = (const float *) w_inject->data;
++        for (int64_t r = 0; r < hc; ++r) {
++            float sum = 0.0f;
++            for (int64_t k = 0; k < hc_dim; ++k) {
++                sum += wi[(int64_t) r*hc_dim + k] * xn[k];
++            }
++            dst_t[n_embd + r] = sum;
++        }
+     }
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index b0a26992d..c3e13fa7b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6067,7 +6067,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_HC_MIX:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_Q8_0 && op->src[3]->type == GGML_TYPE_Q8_0 &&
+-                op->type == GGML_TYPE_F32;
++                op->src[4]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+         case GGML_OP_HC_COMBINE:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+index 9b4216ddc..9c8102e9e 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cu
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -91,6 +91,45 @@ static __global__ void hc_mix_down_dots(
+     }
+ }
+ 
++// F32 inject product: inject[r] = sum_k w_inject[k, r] * xn[k], replicating the
++// mul_mat_vec_f numerics for the F32 inject MUL_MAT: float2 pairs, per-thread
++// acc += v*u over col2 in the tid-stride order, block of 256 threads (the
++// dispatch's block_size for K = hc_dim), warp_reduce then the zero-padded
++// warp-sums butterfly. 4 blocks (one per inject row) x 256 threads.
++static __global__ void hc_mix_inject_f32(
++        const float * xn, const float * w_inject, float * dst,
++        const int ncols2) {
++    const int r   = blockIdx.x;
++    const int tid = threadIdx.x;
++
++    const float2 * x2 = (const float2 *) xn;
++    const float2 * w2 = (const float2 *) (w_inject + (int64_t) r*2*ncols2);
++
++    float sumf = 0.0f;
++    for (int col2 = tid; col2 < ncols2; col2 += blockDim.x) {
++        const float2 tmpx = x2[col2];
++        const float2 tmpw = w2[col2];
++        sumf += tmpx.x*tmpw.x;
++        sumf += tmpx.y*tmpw.y;
++    }
++
++    sumf = warp_reduce_sum<32>(sumf);
++    __shared__ float buf[32];
++    if (tid < 32) {
++        buf[tid] = 0.0f;
++    }
++    __syncthreads();
++    buf[tid/32] = sumf;
++    __syncthreads();
++    if (tid < 32) {
++        sumf = buf[tid];
++        sumf = warp_reduce_sum<32>(sumf);
++        if (tid == 0) {
++            dst[r] = sumf;
++        }
++    }
++}
++
+ // silu(lo/hc) and Q8_1 quantize of the low-rank vector, then the Q8_0 matrix-
+ // vector product w^T v (the "up" dot). The quantize kernel is merged into the
+ // dot kernel: every block quantizes all of v in its prologue (the writes are
+@@ -188,16 +227,18 @@ static __global__ void hc_mix_collapse(
+ }
+ 
+ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+-    const ggml_tensor * x       = dst->src[0];
+-    const ggml_tensor * w_norm  = dst->src[1];
+-    const ggml_tensor * w_down  = dst->src[2];
+-    const ggml_tensor * w_up    = dst->src[3];
+-
+-    GGML_ASSERT(x->type      == GGML_TYPE_F32);
+-    GGML_ASSERT(w_norm->type == GGML_TYPE_F32);
+-    GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0);
+-    GGML_ASSERT(w_up->type   == GGML_TYPE_Q8_0);
+-    GGML_ASSERT(dst->type    == GGML_TYPE_F32);
++    const ggml_tensor * x         = dst->src[0];
++    const ggml_tensor * w_norm    = dst->src[1];
++    const ggml_tensor * w_down    = dst->src[2];
++    const ggml_tensor * w_up      = dst->src[3];
++    const ggml_tensor * w_inject  = dst->src[4];
++
++    GGML_ASSERT(x->type        == GGML_TYPE_F32);
++    GGML_ASSERT(w_norm->type   == GGML_TYPE_F32);
++    GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0);
++    GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
++    GGML_ASSERT(w_inject->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type      == GGML_TYPE_F32);
+ 
+     const int   hc  = ggml_get_op_params_i32(dst, 0);
+     const float eps = ggml_get_op_params_f32(dst, 1);
+@@ -207,7 +248,6 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int64_t hc_dim   = n_embd * hc;
+     const int64_t n_tokens = x->ne[2];
+     const int64_t hc_lr    = w_down->ne[1];
+-    const int64_t dst_stride = n_embd + hc_dim;
+ 
+     GGML_ASSERT(n_tokens == 1);             // decode-only fused op
+     GGML_ASSERT(hc_dim % 32 == 0 && hc_lr % 32 == 0);
+@@ -215,12 +255,13 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     GGML_ASSERT(x->nb[2] == hc_dim*sizeof(float));  // streams contiguous
+     GGML_ASSERT(w_norm->ne[0] == hc_dim);
+     GGML_ASSERT(w_up->ne[0] == hc_lr && w_up->ne[1] == hc_dim);
+-    GGML_ASSERT(dst->ne[0] == dst_stride);
++    GGML_ASSERT(w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc);
++    GGML_ASSERT(dst->ne[0] == n_embd + hc);
+ 
+     const float * x_d   = (const float *) x->data;
+     const float * wn_d  = (const float *) w_norm->data;
+     float * dst_d       = (float *) dst->data;
+-    float * xn          = dst_d + n_embd;   // the persisted xn tail
++    float * inject      = dst_d + n_embd;   // the inject tail
+ 
+     cudaStream_t stream = ctx.stream();
+ 
+@@ -229,11 +270,13 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ 
+     ggml_cuda_pool & pool = ctx.pool();
+ 
++    ggml_cuda_pool_alloc<float>      xn_alloc(pool, hc_dim);
+     ggml_cuda_pool_alloc<block_q8_1> y_xn_alloc(pool, blocks_down);
+     ggml_cuda_pool_alloc<float>      lo_alloc(pool, hc_lr);
+     ggml_cuda_pool_alloc<block_q8_1> y_v_alloc(pool, blocks_up);
+     ggml_cuda_pool_alloc<float>      gate_alloc(pool, hc_dim);
+ 
++    float      * xn   = xn_alloc.get();
+     block_q8_1 * y_xn = y_xn_alloc.get();
+     float      * lo   = lo_alloc.get();
+     block_q8_1 * y_v  = y_v_alloc.get();
+@@ -262,7 +305,7 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int rpb_down = calc_rpb(blocks_down);
+     const int rpb_up   = calc_rpb(blocks_up);
+ 
+-    // xn = rms(x) * w_norm into the dst tail: one 1024-thread block per stream
++    // xn = rms(x) * w_norm: one 1024-thread block per stream (grid hc)
+     {
+         const dim3 block_nums(hc);
+         const dim3 block_dims(1024);
+@@ -289,6 +332,15 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+                 y_xn, blocks_down);
+     }
+ 
++    // inject = w_inject^T xn (F32, mmvf numerics) into the dst tail
++    {
++        const dim3 block_nums(hc);
++        const dim3 block_dims(256);
++        const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
++        ggml_cuda_kernel_launch(hc_mix_inject_f32, launch_params,
++                xn, (const float *) w_inject->data, inject, (int) (hc_dim / 2));
++    }
++
+     // gate_raw = w_up^T v: 10240 rows x 320 dots (short K -> rpb override);
+     // the v = silu(lo/hc) Q8_1 quantize is the kernel prologue
+     {
+@@ -375,7 +427,8 @@ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     GGML_ASSERT(block_out->ne[0] == n_embd);
+     GGML_ASSERT(inject->ne[0] == hc);
+     GGML_ASSERT(residual->nb[1] == n_embd*sizeof(float));  // contiguous rows
+-    GGML_ASSERT(inject->nb[1]   == hc*sizeof(float));
++    // inject may be a view into the mix output (nb[1] = the mix dst stride);
++    // at nt == 1 only nb[0] is used, so no contiguity check on nb[1]
+ 
+     cudaStream_t stream = ctx.stream();
+ 
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index df4602cc9..28d75401e 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6628,12 +6628,14 @@ struct ggml_tensor * ggml_hc_mix(
+         struct ggml_tensor  * w_norm,
+         struct ggml_tensor  * w_down,
+         struct ggml_tensor  * w_up,
++        struct ggml_tensor  * w_inject,
+         int64_t               hc,
+         float                 eps) {
+-    GGML_ASSERT(x->type      == GGML_TYPE_F32);
+-    GGML_ASSERT(w_norm->type == GGML_TYPE_F32);
+-    GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0);
+-    GGML_ASSERT(w_up->type   == GGML_TYPE_Q8_0);
++    GGML_ASSERT(x->type        == GGML_TYPE_F32);
++    GGML_ASSERT(w_norm->type   == GGML_TYPE_F32);
++    GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0);
++    GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
++    GGML_ASSERT(w_inject->type == GGML_TYPE_F32);
+     GGML_ASSERT(hc > 0);
+ 
+     const int64_t n_embd    = x->ne[0];
+@@ -6644,9 +6646,10 @@ struct ggml_tensor * ggml_hc_mix(
+     GGML_ASSERT(w_norm->ne[0] == hc_dim);
+     GGML_ASSERT(w_down->ne[0] == hc_dim);
+     GGML_ASSERT(w_up->ne[1] == hc_dim && w_up->ne[0] == w_down->ne[1]);
++    GGML_ASSERT(w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc);
+     GGML_ASSERT(x->ne[3] == 1);
+ 
+-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd + hc_dim, n_tokens);
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd + hc, n_tokens);
+ 
+     ggml_set_op_params_i32(result, 0, (int32_t) hc);
+     ggml_set_op_params_f32(result, 1, eps);
+@@ -6656,6 +6659,7 @@ struct ggml_tensor * ggml_hc_mix(
+     result->src[1] = w_norm;
+     result->src[2] = w_down;
+     result->src[3] = w_up;
++    result->src[4] = w_inject;
+ 
+     return result;
+ }
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 502f39788..e8dc0bb31 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -235,19 +235,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+     // unfused chain so its numerics (mmq vs mmvq accumulation) are untouched.
+     // The head call (il = -1) has no inject weight and stays unfused.
+     if (nt == 1 && cparams.fused_hc_mix && w_inject != nullptr) {
+-        ggml_tensor * dst_t = ggml_hc_mix(ctx0, x, w_norm, w_down, w_up,
++        ggml_tensor * dst_t = ggml_hc_mix(ctx0, x, w_norm, w_down, w_up, w_inject,
+                 hc, hparams.f_norm_rms_eps);
+-        // mixed = the head of dst [n_embd]; xn = the tail [hc_dim] (the graph
+-        // keeps the inject MUL_MAT so it consumes the same xn as the unfused
+-        // chain - the F32 inject path is left untouched)
++        // mixed = the head of dst [n_embd]; inject = the tail [hc]
+         ggml_tensor * mixed = ggml_view_2d(ctx0, dst_t, n_embd, nt,
+-                ggml_row_size(GGML_TYPE_F32, n_embd + hc_dim), 0);
++                ggml_row_size(GGML_TYPE_F32, n_embd + hc), 0);
+         cb(mixed, "hc_mixed", il);
+         if (inject) {
+-            ggml_tensor * xn = ggml_view_2d(ctx0, dst_t, hc_dim, nt,
+-                    ggml_row_size(GGML_TYPE_F32, n_embd + hc_dim), ggml_row_size(GGML_TYPE_F32, n_embd));
+-            cb(xn, "hc_norm", il);
+-            *inject = build_lora_mm(w_inject, xn);
++            *inject = ggml_view_2d(ctx0, dst_t, hc, nt,
++                    ggml_row_size(GGML_TYPE_F32, n_embd + hc), ggml_row_size(GGML_TYPE_F32, n_embd));
+             cb(*inject, "hc_inject", il);
+         }
+         return mixed;
