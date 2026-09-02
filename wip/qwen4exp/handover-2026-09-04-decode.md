@@ -452,10 +452,49 @@ clean regression test (the same bar the tree's ssm_gate_beta fusion met).
 Further speed (if wanted) = fewer sub-kernel launches via a grid-synced
 mega-kernel, a separate ~1-3% opportunity.
 
-STATE: llama.cpp tree has the fused hc_mix change UNCOMMITTED (ask before
-committing). Debug scaffolding removed from hc-mix.cu (env-gated dump code
+STATE: llama.cpp qwen4exp branch COMMITTED at bbd976ceb (fused hc_mix op),
+NOT pushed (user's fork policy: commit ok, no push). Working tree clean.
+Boost repo main @ 94a3474: patch preserved as
+wip/qwen4exp/patches/0009-hc-mix-fused-decode-op.patch (+ 0009-*.md), apply-
+verified clean on parent 9dff5cc4f. Debug scaffolding removed from hc-mix.cu (env-gated dump code
 deleted; /tmp/hcchk.cpp + /tmp/hcmix_1_*.bin + /home/ld_decode_*.bin kept for
 reference). Prefill gate /home/ld1024_noflag.bin unaffected by construction.
 NEXT: commit + (optionally) extend the fuser to hc_combine chains; the
 handover's original item 1 (fuse the norm into the mix too, dropping the
 RMS+MUL nodes when inject is absent) would save 2 more dispatches/mix.
+
+## UPDATE 2026-09-04 (decode session 3, final): commit + patch block done
+
+- llama.cpp qwen4exp @ bbd976ceb, clean. Fused hc_mix op is DEFAULT ON;
+  toggle LLAMA_FUSED_HC_MIX=0 (env, read at ctx init). tg128 fused 41.11
+  vs unfused 39.15 (+5.0%). Decode logitdump A/B bit-identical.
+- Boost repo main @ 94a3474: wip/qwen4exp/patches/0009-*.patch + .md.
+- DECODE-GATE PROCEDURE (rerun after ANY decode-affecting change):
+  1. /tmp/logitdump_d -m <model> -o /home/ld_decode_check.bin -p <prompt>
+     -ub 1 -ngl 99 --split-mode 3   (env: HIP_VISIBLE_DEVICES=0,1,2
+     GGML_CUDA_FA_WMMA_256=0 LLAMA_QSA_SPARSE_FA=1 GGML_CUDA_ALLREDUCE=none;
+     add LLAMA_FUSED_HC_MIX=1)
+  2. compare byte-for-byte vs /home/ld_decode_ref.bin (unfused reference,
+     still valid - the unfused path is unchanged).
+  PREFILL gate (unchanged by construction): /home/ld1024_noflag.bin with
+  the plain logitdump (n_batch 512).
+- NEXT STEPS (ranked for the next session):
+  1. Fuse the hc_combine residual chains (2x/layer; SCALE+SIGMOID+SCALE+
+     REPEAT+MUL+ADD) - original plan item 5, another ~96 chains x ~4-5
+     nodes. The mix op itself is done; combine is the remaining hc
+     elementwise soup.
+  2. mmvq short-K decode config for the routed experts (config-only; small
+     prize here: experts are ~3% of decode nodes).
+  3. Optionally drop the RMS+MUL nodes when inject is absent (head call
+     only, il=-1 - negligible; the norm must stay for layer mixes because
+     inject consumes xn).
+  4. Older open threads (pre-decode): v_shifted probe, splitter-to-F32,
+     shuffle-to-smem, ggml-backend-meta import gates, multi-device sync in
+     meta_tp_test; ML-Kernel patch + gpudh review vs TP-V1; thread 1
+     prefill (pp8192 ~2000 t/s target).
+- TOOLS on /tmp (survive reboot only): logitdump_d (has -ub flag for nt=1
+  decode dumps), hcchk.cpp micro harness (runs the real unfused chain on
+  captured fused inputs; needs /tmp/hcmix_<call>_*.bin dumps which are no
+  longer produced by the committed kernel - re-add the env dump if needed).
+  Reference dumps on /home: ld_decode_ref.bin (decode), ld1024_noflag.bin
+  (prefill), ld_decode_final.bin (fused, == ref).
