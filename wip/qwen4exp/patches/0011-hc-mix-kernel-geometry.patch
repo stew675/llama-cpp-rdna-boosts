@@ -1,0 +1,79 @@
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+index 86dd80cf9..32dd14956 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cu
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -71,25 +71,23 @@ static __global__ void hc_mix_row_dot(
+ }
+ 
+ // silu(lo/hc) and Q8_1 quantize of the low-rank vector. One block of 32
+-// threads (one warp) loops over the Q8_1 blocks; each block's 32 lanes are the
+-// 32 consecutive values, so the warp reduction matches quantize_q8_1.
++// threads per Q8_1 block; the warp reduction matches quantize_q8_1.
+ static __global__ void hc_mix_silu_quant(
+         const float * lo, block_q8_1 * y,
+         const int n_blocks, const float inv_hc) {
++    const int ib = blockIdx.x;
+     const int lane = threadIdx.x;
+-    for (int ib = 0; ib < n_blocks; ++ib) {
+-        const int col = ib*32 + lane;
+-        const float v = col < 320 ? ggml_cuda_op_silu_single(lo[col] * inv_hc) : 0.0f;
+-        float amax = fabsf(v);
+-        float sum  = v;
+-        amax = warp_reduce_max<32>(amax);
+-        sum  = warp_reduce_sum<32>(sum);
+-        const float  d = amax / 127.0f;
+-        const int8_t q = amax == 0.0f ? 0 : (int8_t) roundf(v / d);
+-        y[ib].qs[lane] = q;
+-        if (lane == 0) {
+-            y[ib].ds = make_half2(d, sum);
+-        }
++    const int col = ib*32 + lane;
++    const float v = ggml_cuda_op_silu_single(lo[col] * inv_hc);
++    float amax = fabsf(v);
++    float sum  = v;
++    amax = warp_reduce_max<32>(amax);
++    sum  = warp_reduce_sum<32>(sum);
++    const float  d = amax / 127.0f;
++    const int8_t q = amax == 0.0f ? 0 : (int8_t) roundf(v / d);
++    y[ib].qs[lane] = q;
++    if (lane == 0) {
++        y[ib].ds = make_half2(d, sum);
+     }
+ }
+ 
+@@ -98,12 +96,12 @@ static __global__ void hc_mix_silu_quant(
+ // the standalone op). The products are stored to an array before summing so the
+ // compiler cannot contract them into FMAs: the reference rounds each xn*gate
+ // product (a separate MUL op) and then adds the rounded values. One thread per
+-// output element; the adds follow the graph order (left-to-right ADD chain),
+-// then SCALE.
++// output element in (256)-thread blocks so the stream reads coalesce; the adds
++// follow the graph order (left-to-right ADD chain), then SCALE.
+ static __global__ void hc_mix_collapse(
+         const float * xn, const float * gate_raw, float * dst,
+         const int n_embd, const int hc, const float inv_hc) {
+-    const int j = blockIdx.x;
++    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+     if (j >= n_embd) {
+         return;
+     }
+@@ -205,7 +203,7 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ 
+     // v = silu(lo/hc), then Q8_1
+     {
+-        const dim3 block_nums(1);
++        const dim3 block_nums(blocks_up);
+         const dim3 block_dims(32);
+         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+         ggml_cuda_kernel_launch(hc_mix_silu_quant, launch_params,
+@@ -229,8 +227,8 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ 
+     // mixed = (1/hc) * sum_c xn * sigmoid(gate)
+     {
+-        const dim3 block_nums(n_embd);
+-        const dim3 block_dims(1);
++        const dim3 block_nums((n_embd + 255) / 256);
++        const dim3 block_dims(256);
+         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+         ggml_cuda_kernel_launch(hc_mix_collapse, launch_params,
+                 xn_d, gate, dst_d, n_embd, hc, 1.0f / (float) hc);

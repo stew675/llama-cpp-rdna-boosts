@@ -545,3 +545,47 @@ NEXT STEPS (ranked):
    for a serving workload.
 4. Older threads (pre-decode items + ML-Kernel/gpudh review + thread-1
    prefill pp8192) unchanged.
+
+## UPDATE 2026-09-04 (decode session 5): mix internals + rms fold - decode 44.81 (+14.5%)
+
+Work on top of 6a4e2c766 (3 commits: b7635f6df, b5f7fd598, 50ae9d134;
+patch blocks 0011-0013, apply-chain verified on 6a4e2c766):
+1. Collapse kernel threading (1-thread blocks -> (256)-thread coalesced
+   blocks) + silu_quant per-block grid: 43.05 -> 43.91.
+2. silu+Q8_1 quantize merged into the up-dot kernel prologue (5 -> 4
+   kernels per mix). The xn-quantize-into-down merge was tried and
+   REVERTED: 320 blocks re-streaming xn (40KB) from L2 = 12.8MB/call,
+   down stage 43 -> 80us. Internal per-call timing (env HC_MIX_TIMING,
+   removed after use): quant ~16, down ~27, up ~35, coll ~10 = ~90us
+   under decode contention - every kernel pays ~8-16us of queueing, so
+   kernel COUNT is the lever.
+3. RMSNorm+gamma folded INTO the fused op (new contract: x + w_norm
+   inputs; dst [n_embd + hc_dim] with mixed at the head and xn persisted
+   at the tail; model views both; the F32 inject MUL_MAT consumes the xn
+   view UNTOUCHED). rms replication = 1024-thread block_reduce clone of
+   rms_norm_f32 + separate gamma rounding - BIT-EXACT (gate passed first
+   shot). 43.91 -> 44.81 @ -r 3.
+- Definitive same-session A/B @ -r 3: FUSED 44.81 vs UNFUSED 39.79 =
+  +14.5% (22.3 vs 25.1 ms/token). pp512 unchanged ~1500.
+- Correctness: decode logitdump byte-identical vs /home/ld_decode_ref.bin
+  after EVERY change (ld_decode_mixopt/upmerge/final2/xntail dumps all ==).
+- Cycle-time lesson: run benches/gates in the FOREGROUND with a generous
+  timeout (returns on early completion AND early failure); backgrounding +
+  sleep-polling wastes minutes per cycle. -r 3 tightens the bench mean.
+- BENCH NOISE: tg128 std +/-2.2-2.7 t/s = +/-5%: single -r 1/-r 2 runs
+  cannot resolve sub-2% changes; use -r 3 and/or A/B pairs.
+
+REMAINING LEVERS (evidence-ranked, all with real cycle costs):
+1. Fold the F32 inject MUL_MAT into the mix op: the inject weights are F32
+   in the GGUF, so the reference = the mmvf kernel (float2-pair FMA
+   accumulation, block reduce) - replicable (~+4%) but a fresh exactness
+   chase. The Q8_0 assumption in the original design was wrong (hc_inject
+   is F32, NOT Q8_0).
+2. Decode expert mmvq config (down [K=640 Q5_1-ish], gate/up [K=2560] at
+   M=1): ~24% of decode in the expert cluster; the RDNA4 tables were swept
+   on qwen35 shapes, not qwen4exp's. Config = compile-time constexpr ->
+   rebuild per variant + re-gate (numeric perturbation) + bench.
+3. Cooperative single-kernel mix: IMPOSSIBLE bit-exactly - the up phase
+   needs 640 blocks (rpb16) > cooperative residency.
+4. GDN state GET_ROWS/cpy + body elementwise soup: invasive.
+5. Server-level batch decode (M>1 kernels): untried config lever.

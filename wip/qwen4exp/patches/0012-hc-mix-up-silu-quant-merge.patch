@@ -1,0 +1,171 @@
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+index 32dd14956..dbc0379fd 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cu
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -70,24 +70,73 @@ static __global__ void hc_mix_row_dot(
+     }
+ }
+ 
+-// silu(lo/hc) and Q8_1 quantize of the low-rank vector. One block of 32
+-// threads per Q8_1 block; the warp reduction matches quantize_q8_1.
+-static __global__ void hc_mix_silu_quant(
+-        const float * lo, block_q8_1 * y,
+-        const int n_blocks, const float inv_hc) {
+-    const int ib = blockIdx.x;
++// silu(lo/hc) and Q8_1 quantize of the low-rank vector, then the Q8_0 matrix-
++// vector product w^T v (the "up" dot). The quantize kernel is merged into the
++// dot kernel: every block quantizes all of v in its prologue (the writes are
++// identical across blocks, so the global y buffer stays valid) and then dots,
++// so the op runs one fewer kernel. The per-kblock reduction mirrors
++// quantize_q8_1 (one warp over 32 consecutive values) and silu mirrors the
++// standalone op, so the values are bit-identical to the unfused chain.
++template <int nwarps, int RPB>
++static __global__ void hc_mix_up_silu_dot(
++        const float * lo, const block_q8_0 * w, block_q8_1 * y,
++        float * dst, const int nrows, const int blocks_per_row,
++        const float inv_hc) {
+     const int lane = threadIdx.x;
+-    const int col = ib*32 + lane;
+-    const float v = ggml_cuda_op_silu_single(lo[col] * inv_hc);
+-    float amax = fabsf(v);
+-    float sum  = v;
+-    amax = warp_reduce_max<32>(amax);
+-    sum  = warp_reduce_sum<32>(sum);
+-    const float  d = amax / 127.0f;
+-    const int8_t q = amax == 0.0f ? 0 : (int8_t) roundf(v / d);
+-    y[ib].qs[lane] = q;
+-    if (lane == 0) {
+-        y[ib].ds = make_half2(d, sum);
++    // prologue: v = silu(lo/hc) quantized to Q8_1, warps split the kblocks
++    for (int kb = threadIdx.y; kb < blocks_per_row; kb += nwarps) {
++        const int col = kb*32 + lane;
++        const float x = ggml_cuda_op_silu_single(lo[col] * inv_hc);
++        float amax = fabsf(x);
++        float sum  = x;
++        amax = warp_reduce_max<32>(amax);
++        sum  = warp_reduce_sum<32>(sum);
++        const float  d = amax / 127.0f;
++        const int8_t q = amax == 0.0f ? 0 : (int8_t) roundf(x / d);
++        y[kb].qs[lane] = q;
++        if (lane == 0) {
++            y[kb].ds = make_half2(d, sum);
++        }
++    }
++    __syncthreads();
++
++    // the dot body below is hc_mix_row_dot<8, RPB> unchanged
++    const int row0 = RPB*blockIdx.x;
++    constexpr int qi  = QI8_0;             // 8
++    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
++    const int tid      = 32*threadIdx.y + threadIdx.x;
++    const int n_groups = nwarps*32 / (qi/vdr);
++    const int n_items  = RPB * blocks_per_row;
++
++    float tmp[RPB] = {0.0f};
++    const int kqs = vdr * (tid % (qi/vdr));
++    for (int it = tid / (qi/vdr); it < n_items; it += n_groups) {
++        const int i   = it / blocks_per_row;
++        const int kbx = it % blocks_per_row;
++        if (row0 + i < nrows) {
++            tmp[i] += vec_dot_q8_0_q8_1(w + (int64_t) (row0 + i) * blocks_per_row, &y[kbx], kbx, kqs);
++        }
++    }
++
++    __shared__ float tmp_shared[nwarps > 1 ? nwarps-1 : 1][RPB];
++    for (int i = 0; i < RPB; ++i) {
++        tmp[i] = warp_reduce_sum<32>(tmp[i]);
++        if (threadIdx.y > 0) {
++            tmp_shared[threadIdx.y-1][i] = tmp[i];
++        }
++    }
++    __syncthreads();
++    if (threadIdx.y > 0) {
++        return;
++    }
++    for (int i = 0; i < RPB; ++i) {
++#pragma unroll
++        for (int l = 0; l < nwarps-1; ++l) {
++            tmp[i] += tmp_shared[l][i];
++        }
++        if (threadIdx.x == 0 && row0 + i < nrows) {
++            dst[row0 + i] = tmp[i];
++        }
+     }
+ }
+ 
+@@ -161,10 +210,6 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     block_q8_1 * y_v  = y_v_alloc.get();
+     float      * gate = gate_alloc.get();
+ 
+-    // xn -> Q8_1 (same kernel + semantics as the mmvq quantize path)
+-    quantize_row_q8_1_cuda(xn_d, nullptr, y_xn, GGML_TYPE_Q8_0,
+-            hc_dim, hc_dim, 0, 0, hc_dim, 1, 1, 1, stream);
+-
+     // rows-per-block as the mmvq dispatch chooses: 1 when the K-blocks fill the
+     // thread groups, or the short-K override (RDNA2+) that packs RPB rows per
+     // block so the item loop is bit-identical to the unfused path.
+@@ -188,39 +233,34 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int rpb_down = calc_rpb(blocks_down);
+     const int rpb_up   = calc_rpb(blocks_up);
+ 
++    // xn -> Q8_1 (same kernel + semantics as the mmvq quantize path)
++    quantize_row_q8_1_cuda(xn_d, nullptr, y_xn, GGML_TYPE_Q8_0,
++            hc_dim, hc_dim, 0, 0, hc_dim, 1, 1, 1, stream);
++
+     // lo_raw = w_down^T xn: 320 rows x 10240 dots
+-    {
+-        const dim3 block_nums((hc_lr + rpb_down - 1) / rpb_down);
+-        const dim3 block_dims(32, 8);
+-        const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+-        if (rpb_down == 1) {
+-            ggml_cuda_kernel_launch(hc_mix_row_dot<8, 1>, launch_params,
+-                    (const block_q8_0 *) w_down->data, y_xn, lo, hc_lr, blocks_down);
+-        } else {
+-            GGML_ABORT("hc_mix: unexpected down rpb %d\n", rpb_down);
+-        }
++    if (rpb_down != 1) {
++        GGML_ABORT("hc_mix: unexpected down rpb %d\n", rpb_down);
+     }
+-
+-    // v = silu(lo/hc), then Q8_1
+     {
+-        const dim3 block_nums(blocks_up);
+-        const dim3 block_dims(32);
++        const dim3 block_nums(hc_lr);
++        const dim3 block_dims(32, 8);
+         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+-        ggml_cuda_kernel_launch(hc_mix_silu_quant, launch_params,
+-                lo, y_v, blocks_up, 1.0f / (float) hc);
++        ggml_cuda_kernel_launch(hc_mix_row_dot<8, 1>, launch_params,
++                (const block_q8_0 *) w_down->data, y_xn, lo, hc_lr, blocks_down);
+     }
+ 
+-    // gate_raw = w_up^T v: 10240 rows x 320 dots (short K -> rpb override)
++    // gate_raw = w_up^T v: 10240 rows x 320 dots (short K -> rpb override);
++    // the v = silu(lo/hc) Q8_1 quantize is the kernel prologue
+     {
+         const dim3 block_nums((hc_dim + rpb_up - 1) / rpb_up);
+         const dim3 block_dims(32, 8);
+         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+         switch (rpb_up) {
+-            case 1:  ggml_cuda_kernel_launch(hc_mix_row_dot<8, 1>,  launch_params, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up); break;
+-            case 2:  ggml_cuda_kernel_launch(hc_mix_row_dot<8, 2>,  launch_params, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up); break;
+-            case 4:  ggml_cuda_kernel_launch(hc_mix_row_dot<8, 4>,  launch_params, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up); break;
+-            case 8:  ggml_cuda_kernel_launch(hc_mix_row_dot<8, 8>,  launch_params, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up); break;
+-            case 16: ggml_cuda_kernel_launch(hc_mix_row_dot<8, 16>, launch_params, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up); break;
++            case 1:  ggml_cuda_kernel_launch(hc_mix_up_silu_dot<8, 1>,  launch_params, lo, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up, 1.0f / (float) hc); break;
++            case 2:  ggml_cuda_kernel_launch(hc_mix_up_silu_dot<8, 2>,  launch_params, lo, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up, 1.0f / (float) hc); break;
++            case 4:  ggml_cuda_kernel_launch(hc_mix_up_silu_dot<8, 4>,  launch_params, lo, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up, 1.0f / (float) hc); break;
++            case 8:  ggml_cuda_kernel_launch(hc_mix_up_silu_dot<8, 8>,  launch_params, lo, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up, 1.0f / (float) hc); break;
++            case 16: ggml_cuda_kernel_launch(hc_mix_up_silu_dot<8, 16>, launch_params, lo, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up, 1.0f / (float) hc); break;
+             default: GGML_ABORT("hc_mix: unexpected up rpb %d\n", rpb_up); break;
+         }
+     }
+@@ -233,7 +273,6 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+         ggml_cuda_kernel_launch(hc_mix_collapse, launch_params,
+                 xn_d, gate, dst_d, n_embd, hc, 1.0f / (float) hc);
+     }
+-
+ }
+ 
+ // Fused hyper-connection residual combine for qwen4exp decode (nt == 1).
