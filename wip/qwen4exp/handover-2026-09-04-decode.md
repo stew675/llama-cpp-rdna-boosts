@@ -691,3 +691,42 @@ REMAINING LEVERS (evidence-ranked, all with real cycle costs):
 - TOOLS: /tmp/m1_probe (M=1 mmvq shape floor probe, 200 iters),
   /tmp/chain_probe (chained vs per-call dispatch discriminator) - both
   compile with --offload-arch=gfx1201 against build-rocm libs.
+
+## UPDATE (decode session 6b): head mix fused + scoping corrections + honesty check
+
+- COMMIT 1f05646fd (on af3640f67), patch 0016 preserved + apply-verified.
+  The head hc_mix call (il=-1, no inject) is now fused too: the op accepts
+  w_inject == NULL (dst [n_embd], no inject blocks, meta splitter allows
+  the null src's UNKNOWN axis). ALL 97 mix calls/token (96 layer + head)
+  use the fused op; decode logitdump byte-identical; tg128 ~45.6 (flat -
+  the head runs once/token; the change completes coverage).
+- SCOPING CORRECTION: the ffn-moe ROUTER IS ALREADY FUSED by the tree's
+  topk_moe pass (SOFTMAX->RESHAPE->ARGSORT->VIEW->GET_ROWS -> one
+  dispatch labeled "FUSED SOFT_MAX"; the logits MUL_MAT stays separate
+  because ggml_cuda_op_topk_moe takes the logits VALUES, not x+W). 0
+  standalone ARGSORT instances in the decode profile = the selection runs
+  inside the fused kernel, NOT on the CPU (the session-6 handover note's
+  CPU-argsort theory was wrong). The session-6 "router fusion" lever is
+  DEAD: the routing = logits mm (M=1 floor) + fused topk_moe = minimal.
+- HONESTY CHECK on the 4-kernel merge (+2%): the 45.56/45.57 post-merge
+  runs vs the 44.70/44.81 pre-merge runs are DIFFERENT SESSIONS; with the
+  +/-2.2 t/s run noise the delta (0.81 t/s) is ~0.45 sigma combined - NOT
+  decisive. The mechanism (-2 kernel launches x 95 calls/device/token) is
+  sound and the change is bit-exact + simpler, so it stays, but treat the
+  +2% as provisional. A decisive same-session A/B needs a rebuild of the
+  parent commit (~20 min) if the number matters.
+- REMAINING (corrected ranking): (1) the M=1 mmvq kernel floor ~15-20us
+  per GEMM x ~440 GEMM evals/device/token ~ 55% of the wall - the deep
+  lever (occupancy analysis: the hc down runs 320 blocks only on 96 CUs =
+  ~1/3 occupancy; the up 640 = ~2/3; the rpb=2 dense shapes leave ~2/3 of
+  threads at ~0.6 kblocks/thread - the M=1 kernels are geometry-bound, not
+  BW-bound, but the geometry is the maintainers' tuned mmvq tables and any
+  change = new reference); (2) GDN state-gather fold (GET_ROWS ~87/device
+  ~10us each + CPY ~36/device - foldable half ~1.5-3%, invasive);
+  (3) batch decode at the server (M>1 - converts the M=1 floor into
+  amortized kernels; config-only, does not move tg128).
+- STATE: llama.cpp qwen4exp @ 1f05646fd clean (commits bd25e63eb ->
+  af3640f67 -> 1f05646fd this session, none pushed); decode tg128 ~45.6
+  (+16.5% vs the 39.15 original, +14.6% vs the 39.79 -r 3 unfused ref);
+  all bit-exact vs /home/ld_decode_ref.bin. Boost main @ 24ced14 (patches
+  0015 + 0016 + this note). Tools: /tmp/m1_probe, /tmp/chain_probe.
