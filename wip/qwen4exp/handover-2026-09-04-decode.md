@@ -358,3 +358,37 @@ fusing 96 of them saves ~800-900 kernels/token. The 13% fusion baseline
 says per-kernel marginal cost ~5-9us -> potential mid-single-digit to
 ~10% decode. MUST verify with the fusion-on A/B (39.29) and logitdump
 before believing any number.
+
+## UPDATE 2026-09-04 (decode session 2): coherence verification + gate reset
+
+OUTPUT COHERENCE VERIFIED (logitdump A/B, current clean-tree build):
+- DETERMINISM: two identical GPU runs (57-token prompt, 3-GPU tensor, ngl
+  99) -> BIT-IDENTICAL dumps. No races/nondeterminism in the decode kernels.
+- CPU REFERENCE: same stream on CPU (-ngl 0) -> GPU logits agree within F32
+  accumulation-order noise (mean abs diff 0.17 on ~15-magnitude logits, ~1%);
+  every top-1 disagreement on the prompt run is a tight race (top-2 margins
+  0.01-0.42, rival logit within the CPU-GPU diff); top-5 overlap 5/5. The
+  model produces well-formed coherent logits.
+- STALE-BASELINE FINDING: /home/ld1024_base.bin (09-01 23:03, 1024 x 248320)
+  does NOT match ANY reproducible current config. Matrix: flag-on vs flag-off
+  (pos0 bit-equal, error accumulates later: mean 0.069); QSA-env on vs off
+  (pos0 differs 1.6: layer-0 QSA numerics); every combo differs from the base
+  at pos 0 (0.8-1.5). The base was built from an unreproducible tree state
+  (the 09-01 session's work-in-progress .so). The ~0.1 mean diffs are F32
+  order drift between build generations, NOT a coherence break. RETIRED as a
+  bit-exact gate.
+- BUILD-FLAG FINDING: the CMAKE_HIP_FLAGS=-mllvm
+  --amdgpu-unroll-threshold-local=600 flag (in the cache since 09-02 04:50)
+  IS numerically perturbing (pos0 bit-equal but later positions drift ~0.07
+  mean vs the noflag build - the recurrent state amplifies the accumulation
+  order change) despite being speed-neutral. REMOVED from the cache + build
+  (restored to the 09-01-era flags). Current libggml-hip.so = 09-04 noflag
+  clean-tree build.
+- NEW GATE: /home/ld1024_noflag.bin = the current noflag clean build's dump
+  (-n 1024, seed 1234, GGML_CUDA_FA_WMMA_256=0 LLAMA_QSA_SPARSE_FA=1
+  GGML_CUDA_ALLREDUCE=none, 3-GPU tensor, ngl 99). CANONICAL REFERENCE for
+  the hc_mix work: any change must reproduce it bit-exactly.
+- logitdump caveat: GGML_CUDA_ALLREDUCE=none is REQUIRED (the NCCL comm-init
+  thread segfaults in hipFuncGetAttributes with the logitdump link line on
+  3-GPU tensor; llama-bench is unaffected - do not chase this, it is a
+  tool-link artifact).
