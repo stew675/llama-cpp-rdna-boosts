@@ -915,3 +915,66 @@ bsched (the geometry map; the I/K/L/M modes), the single-op tests
 STATE: llama.cpp clean @ 131935dce (the QSA assert fix = the multi-seq
 unlock, still the only committed change this campaign). The batch-decode
 prize (K=64 = 1819 t/s aggregate) still gated behind this bug.
+
+## UPDATE (debug session 9b): seq>=1 corruption localized to the (1,2) layer-0 ssm_out MM
+
+CLEAN REPRODUCER (tree @ 131935dce, clean): /tmp/bseq_val -p "Quantum" x2:
+K=1 ref = 198 42750 367; K=2 seq 0 = 198 42750 367 (IDENTICAL to K=1), seq 1
+= 6132 49197 49197 (garbage). "Quantum" = 2 BPE tokens -> the PREFILL = a
+(2,2) eval = CORRECT (28079 28079); the DECODES = (1,2) evals = seq 1
+corrupt from the FIRST decode token. The (1,2) geometry (n_seq_tokens=1,
+n_seqs=2) is the ONLY failing case: (1,1), (2,2), (16,2) all correct. The
+"decode-only" appearance is simply that decodes are the only (1,2) evals.
+
+RELIABLE MID-GRAPH LOCALIZATION (in-compute reads of the per-device cgraph
+nodes, reverse-order + per-buffer dedup to beat ggml-alloc aliasing, CORRECT
+read offsets - the earlier scans read both "halves" from slot 0 and were
+false positives):
+- hc_init (the repeat), hc_norm-0 (the rms output xn), the conv inputs,
+  q/k_conv_predelta, gate/beta, z-0, the z-gated norm (node_75/76): ALL
+  SYMMETRIC at the (1,2) decode (sdiff ~1e-7).
+- linear_attn_out-0 (the layer-0 ssm_out MUL_MAT result, [2560,1,2]):
+  ASYMMETRIC (sdiff -25.6 on 2560-elem halves).
+- Conclusion: the corruption = the layer-0 GDN's FINAL projection (the
+  ssm_out MUL_MAT [2560,6144] x [6144,1,2]) or its post-op handling. The
+  fused AND unfused GDN paths both corrupt (the shared piece = the out-MM).
+  NCCL and the fallback allreduce BOTH corrupt (not the reduction path).
+
+ISOLATION TESTS (all CORRECT on a single device - /tmp/rms_test,
+/tmp/repeat_test, /tmp/mm2b, /tmp/mm12): the repeat [2560,1,2]->[2560,4,2],
+the rms [2560,4,2], the M=2 F32/Q8_0 MM, and the [K,1,2] (ncols=1 x 2
+channels) Q8_0 MM at [10240,320] AND [6144,2560] - all give identical
+per-channel outputs. The bug is NOT in any individual op; it is in the
+Meta-TP 3-device execution of the (1,2) layer-0 GDN out-MM (the ssm_out
+weight = axis-0 split {640x3,640x3,768x3}-style per the SPLIT_STATE log;
+the src1 = [6144,1,2] = ncols=1 x 2 channels). Suspects: the meta's
+mul_mat split-state handling or the per-device mmvq config at the
+ncols=1 x 2-channel src1 with the multi-segment weight.
+
+META-READBACK PITFALLS (documented for the next session):
+1. ggml_backend_tensor_get on meta compute-buffer tensors post-eval =
+   unreliable (the stc_compute double-buffer can return the stale
+   container). Only in-compute reads of the per-device cgraph nodes are
+   trustworthy.
+2. Per-subgraph node buffers ALIAS (ggml-alloc reuse). Read in REVERSE
+   node order, keeping one read per data pointer (the last writer = the
+   true value).
+3. Partial reads must use the CORRECT offsets: get(buf, 0, nr*4) then
+   get(buf+nr, half*4, nr*4) - NOT get(buf, 0, 2*nr*4) (that reads slot
+   0 twice).
+4. ggml-backend-meta.cpp:2276 GGML_ASSERT(i_start == cgraph->n_nodes)
+   fires when a graph's tail = host-view nodes (the s_copy_main FIXME at
+   meta:2030); the scheduler eval callback triggers it too - do not use
+   llama_context_params.cb_eval with this Meta backend.
+
+NEXT SESSION (the remaining steps):
+1. Dump the per-device ssm_out MM partials at the (1,2) decode (pre-
+   allreduce) and compare against the (2,2): find which device's segment
+   is wrong. The ssm_out weight split segments {640/640/768} vs the src1
+   [6144,1,2] channels = the geometry to inspect in ggml-backend-meta.cpp
+   handle_mul_mat + the mmvq dispatch for ncols_dst=1, nchannels=2.
+2. Compare the meta mul_mat split-state at [K,1,2] vs [K,2,2] src1.
+3. If the meta mul_mat handling is the bug, a targeted fix there would
+   ALSO fix the llama-server --parallel path (the same machinery).
+STATE: llama.cpp clean @ 131935dce. All instrumentation removed. The prize
+(K=64 = 1819 t/s aggregate) still gated behind this bug.
