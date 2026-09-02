@@ -793,3 +793,58 @@ in the hybrid-memory decode path, unreachable until the assert fix).
 Suspected: the GDN recurrent-state gather (build_rs) or the QSA cell read
 for seq > 0 at the decode position. The batch-decode throughput finding
 stands but the path is NOT usable until this is debugged.
+
+## DEBUG PLAN (next session): multi-seq decode corrupts seq >= 1
+
+FACTS (verified): llama.cpp @ 131935dce (clean, committed, not pushed; the
+QSA assert-relaxation commit). Multi-seq builds + runs; K=2 coherence:
+seq 0 = bit-identical to its K=1 run, seq 1 = garbage from the FIRST
+decoded token (repeating-token degenerate = broken recurrent state).
+K=2 PREFILL final logits = CORRECT for both seqs (argmax 561 561, matching
+K=1) -> the prefill path (incl. per-seq state writes) is correct; the bug
+is in the DECODE STEP's per-seq state/cache READ for seq >= 1. Corrupts
+with equal or unequal prompt lengths (not a same-position artifact).
+
+SUSPECT AREAS (in order):
+1. build_rs (src/llama-graph.cpp:3407): the recurrent-state gather. It
+   reads states via get_state_rows(ctx0, states, s_copy_main) where
+   s_copy_main = the per-ubatch state ROW indices built by the hybrid
+   memory (inp->s_copy_main). Hypothesis: the s_copy_main rows for seq
+   >= 1 at the decode position index the wrong cache row (an off-by-seq
+   in the row math for the decode ubatch vs the prefill ubatch).
+2. The KV cache cell assignment for seq >= 1 at the decode position (the
+   QSA cell_blk / the gather rows in llama-kv-cache.cpp's get_rows for
+   the decode; the llama-memory-hybrid-idx.cpp per-seq slot math).
+3. The hc residual / per-token machinery (less likely - the hc ops are
+   per-token and seq 0 works).
+
+DIAGNOSTIC TOOLS:
+- /tmp/bseq (throughput: K-seq lockstep, same prompt; reports ms/step)
+- /tmp/bseq_val (coherence: per-seq prompts, dumps PREFILL argmax per
+  seq + the decoded token streams; compile with hipcc
+  --offload-arch=gfx1201 -I include -I ggml/include ... -lllama)
+- Both take -m MODEL -p PROMPT... -n N -c CTX -ngl 99 --split-mode 3;
+  run with env HIP_VISIBLE_DEVICES=0,1,2 GGML_CUDA_FA_WMMA_256=0
+  LLAMA_QSA_SPARSE_FA=1. Model load ~3 min; foreground with timeout.
+- The K=1 single-seq decode gate (logitdump A/B vs /home/ld_decode_ref.bin)
+  must stay byte-identical after ANY fix (the single-seq path is the
+  committed reference).
+
+NEXT STEPS for the debug:
+1. Dump s_copy_main (and the GDN state cache rows) for a K=2 decode step:
+   verify seq 1's row indices point at the correct (seq, pos) state.
+   Add an env-gated print in build_rs or the memory's row builder, or
+   compare the gathered state tensor values for seq 0 vs seq 1 (both
+   prefilled with the SAME prompt -> the seq-1 state should equal the
+   seq-0 state at the same position - the first divergence localizes the
+   read).
+2. If the GDN state read is right, check the QSA KV gather (the attention
+   over seq 1's own KV cells) the same way.
+3. Bisect by layer if needed: corrupt-or-not as a function of how many
+   layers run (the first divergent layer's component = the bug).
+
+PERF CONTEXT (the prize behind this bug): K=64 lockstep decode = 1819
+tok/s aggregate (0.55 ms/token-equiv vs the 21.9 ms single-seq = 40x);
+the K=16-32 mmvq plateau -> K=64 mmq sweet spot; K<=64 fits the 3x32GB.
+The QSA assert fix (131935dce) is required for any of this and is a real
+unlock for llama-server --parallel on this model.
