@@ -757,3 +757,39 @@ The M=1 GEMM floor investigation, concluded with measurements:
    lever) or a from-scratch persistent/pipelined M=1 kernel (major
    project) can beat it. ALL experiment hacks reverted; tree clean at
    1f05646fd (the rebuild = the gated source).
+
+## UPDATE (decode session 8): BATCH DECODE - measured, unblocked, then found broken
+
+KERNEL-LEVEL (batch_probe): M-token mmvq/mmq per-token cost collapses at
+M >= 16 (the mmq path): hc-down [10240x320] 23.9us/token at M=1 ->
+2.69 at M=16 -> 0.89 at M=64; dense 28.3 -> 2.49 -> 0.82. The M=1 GEMM
+floor amortizes 10-25x. (The mmvq ncols 2-8 path at M=2-8 barely helps.)
+
+MODEL-LEVEL BLOCKER #1 (FIXED, commit 131935dce): the QSA indexer_top_k
+builder asserted additive->ne[2] == score->ne[2], which compares the kq
+mask's size-1 dim [n_kv, n_tps, 1, n_stream] against score->ne[2] =
+n_stream - it only passes at n_stream == 1, so ANY n_seq_max > 1 context
+crashed at graph build on the first QSA layer (llama-parallel and
+llama-server --parallel hit the same assert). The kernel already reads the
+additive as 3D (the size-1 dim is a no-op stride), so the fix = a builder
+assert relaxation (accept ne[2] == 1 && ne[3] == n_stream). Single-seq
+decode logitdump byte-identical. MULTI-SEQ DECODE NOW BUILDS + RUNS.
+
+MODEL-LEVEL MEASUREMENT (bseq harness, /tmp/bseq): K-seq lockstep decode
+(one token per seq per step), 3 GPUs, same prompt: K=1 21.9ms/step,
+K=2 32.3, K=4 42.4, K=8 67.0, K=16 122.7, K=32 158.0, K=64 35.2 ms/step.
+K=64 = 1819 tok/s AGGREGATE (0.55ms/token-equiv, ~40x the single-seq
+45.6). The K=16-32 plateau = the mmvq ncols path; K=64 = where the mmq
+tiles fill. K=128 OOMs (the per-seq recurrent state; K <= 64 on 3x32GB).
+
+MODEL-LEVEL BLOCKER #2 (FOUND, NOT FIXED): multi-seq decode CORRUPTS
+seq >= 1. bseq_val coherence (K=2, per-seq prompts vs the K=1 runs):
+seq 0 = IDENTICAL to its K=1 run, seq 1 = degenerate garbage (repeating
+tokens - the classic broken-recurrent-state signature). Localized: the
+K=2 PREFILL final logits = correct for BOTH seqs (561 561, matching K=1);
+the corruption starts at the FIRST DECODE STEP of seq 1 -> the decode
+step's per-seq state/cache READ is wrong for seq >= 1 (a pre-existing bug
+in the hybrid-memory decode path, unreachable until the assert fix).
+Suspected: the GDN recurrent-state gather (build_rs) or the QSA cell read
+for seq > 0 at the decode position. The batch-decode throughput finding
+stands but the path is NOT usable until this is debugged.
