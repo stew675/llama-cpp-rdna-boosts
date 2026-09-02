@@ -173,3 +173,75 @@ E. **Batch/decode parallelism at the server level**: -ub 2048 on parallel
    bandwidth floor.
 4. Then pick between levers A (fused gate+up+down mmvq), B (mmvq decode
    config), C (small-kernel tail), D (Q5_1->better down quant at load).
+
+## UPDATE 2026-09-04 (decode session 1): first measurements
+
+Bench: 3x R9700 tensor, ngl 99, ub 2048, t 16, -p 512 -n 128 -r 2, env
+GGML_CUDA_FA_WMMA_256=0 LLAMA_QSA_SPARSE_FA=1 (graphs ON unless noted).
+
+NEW NUMBERS (all consistent):
+- tg128 = 39.29 +/- 2.34 t/s (25.45 ms/token), graphs ON.
+- tg64 graphs OFF (GGML_CUDA_DISABLE_GRAPHS=1) = 38.11 -> graphs worth ~3%.
+- tg1500 = 38.80-39.17 (n-insensitive).
+- pp64 = 245-247 (for reference only).
+
+DECISIVE GPU-UTILIZATION MEASUREMENT (rocm-smi during tg1500):
+- All 3 GPUs at 97-98% busy THROUGHOUT decode. REFUTES the cross-device
+  sync-tax / fragment-boundary-wait hypothesis (the per-layer x per-device
+  fragment structure of the Meta-TP wrapper costs little; the fragments
+  overlap and the GPUs stay saturated).
+- Decode time = kernel execution time. Levers must reduce kernel WORK or
+  kernel COUNT, not syncs.
+
+CONFIG BLOCKS:
+- 2-GPU ngl 99: GGML_ASSERT(meta_buf_ctx->bufs[i]) in the tensor-split
+  allocator (103.7 GiB file > 63.7 GiB usable) - the 3-GPU fit is marginal
+  (Meta()/CPU_Mapped buffers ~26.9 + 27.4 GiB, lazy mmap; the rest of the
+  file is page-cache resident only).
+- 1-GPU ngl 99: model load fails (generic "failed to load model"; no detail
+  even with --verbose). So no clean 1-vs-3-GPU same-weights decode A/B on
+  this model. The split-tax question is MOOT anyway: GPUs are 97% busy, so
+  a 1-GPU config cannot beat the current per-GPU efficiency by removing
+  waits (it would only remove ~3% graph value and lose 3x parallelism).
+
+OP-PROFILE FINDINGS (GGML_CUDA_OP_TIMING=1 + --verbose; CRITICAL: llama-
+bench silently swallows all logs unless --verbose - llama_log_set(null) -
+this is why the earlier op-timing runs printed nothing):
+- Decode = ~3400+ graph nodes/token evaluated as ~85-144 fragment evals
+  (per-layer x per-device Meta-TP splits), ~2301 decode-only eval blocks.
+- The main-stream op-event spans sum to ~41.5 ms/token over 3 GPUs (~55%
+  of the real 3x25.45=76 ms kernel time) -> the instrumentation only sees
+  the MAIN stream; the hc 4-stream + concurrent-event + AR-stage work
+  (side streams) is invisible (their main-stream event pairs fire at
+  dispatch). ~45% of decode kernel time is unmeasured by this tooling.
+- Composition of the VISIBLE (main-stream) ~55%: expert GEMMs ~50%
+  (MUL_MAT 31.7 + FUSED MUL_MAT 7.0 + MUL_MAT_ID 6.2 + FUSED MUL_MAT_ID
+  5.4), elementwise ~43% (ADD 9.6 SCALE 7.8 MUL 6.2 UNARY 5.4 FUSED UNARY
+  3.5 CONT 2.9 RMS_NORM 2.3 GET_ROWS 2.1 REPEAT 2.0 CPY 0.8), lm_head
+  result_output [2560x82774x1] = 0.596 ms real single biggest kernel
+  (2.3%), attention/QSA ~4% (SOFT_MAX 2.1 + QSA ~1 + ROPE 0.4).
+- Per-kernel avg ~7-8 us (3400+ kernels in 25.45 ms): latency-bound kernel
+  soup at ~3.7x the sibling model's 923 kernels/token. Same qualitative
+  conclusion as qwen35 phase-1 (latency-bound, fusion is the lever),
+  amplified by the delta-net/hc/QSA machinery's many small ops.
+
+DIRECTION (evidence-ranked for qwen4exp decode):
+1. FEWER KERNELS via fusion of the small-op chains (the node count is the
+   problem: 3400 x ~7 us kernels). qwen35 phase-1 measured the fusion
+   machinery worth 24% of decode there. Candidates: the hc per-layer
+   chains (hc_inject/hc_combine/hc_gate + norms + scales), the GDN state
+   GET_ROWS/cpy, residual folds into the expert epilogues, RMS_NORM+q8_1.
+   The hc side-stream work (~45% invisible) is the least-understood chunk.
+2. mmvq decode expert config tuning (short-K: down K=640 Q5_1 @ low GB/s,
+   gate/up K=1280 Q4_K at M=1) - config-only, bit-identical requirement.
+3. Fused per-layer expert kernel (gate+up+down) on the mmvq decode path.
+4. Batch decode at the server (multiple slots) - converts the tiny-M=1
+   kernels into M>1 kernels (the only config lever that needs no kernel
+   surgery); llama-bench tg is single-sequence.
+NEXT SESSION FIRST STEPS:
+- Count the decode graph's per-class node totals STATICALLY (llama-graph
+  dump or the op-timing "nodes over N" per class) to size the fusion prize
+  precisely before touching code.
+- Inspect the hc decode path (the ~45% invisible side-stream work): which
+  ops run on the 4 hc streams per token and how many.
+- Then pick lever 1 vs 2 vs 3 for the first patch.
