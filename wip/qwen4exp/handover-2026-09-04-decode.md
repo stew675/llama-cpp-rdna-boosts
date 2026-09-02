@@ -730,3 +730,30 @@ REMAINING LEVERS (evidence-ranked, all with real cycle costs):
   (+16.5% vs the 39.15 original, +14.6% vs the 39.79 -r 3 unfused ref);
   all bit-exact vs /home/ld_decode_ref.bin. Boost main @ 24ced14 (patches
   0015 + 0016 + this note). Tools: /tmp/m1_probe, /tmp/chain_probe.
+
+## UPDATE (decode session 7): Item 1 (M=1 mmvq floor) - MEASURED TO A DEAD END
+
+The M=1 GEMM floor investigation, concluded with measurements:
+1. FLOOR DECOMPOSITION (in-chain probes, /tmp/floor_probe): the per-GEMM
+   cost is NOT a universal launch floor - ADD [2560] = 1.15us, GET_ROWS =
+   0.37us, RMS_NORM [2560] = 6.6us (its reduce structure), M=1 mmvq GEMMs
+   = 8-19us for 0.18-3.7MB weights (the fixed ~7-8us + block-execution).
+   The big GEMMs ([2560,6144] 17.7MB = 36.7us = 455 GB/s) are BW-bound and
+   fine. The SMALL GEMMs (0.2-4MB: hc dots, K/V, router, shexp) are
+   floor-dominated at ~8-19us.
+2. rpb SWEEP (env override GGML_CUDA_MMVQ_RPB over {1,2,4,8,16}, rebuilt
+   once): the DEFAULT per-shape formula (RDNA2+ override in mmvq.cu) wins
+   or ties nearly every shape; only ~6-11% single-shape wins for Q4_K
+   router rpb=4 and Q5_1 shexp rpb=2 (~0.3-1% decode total). The geometry
+   IS the qwen35-era tuned optimum.
+3. vdr TEST: VDR_Q8_0_Q8_1_MMVQ 4 -> 8 (rebuild): NO change (18.2 vs 18.8
+   hc-down; the register/ILP structure is saturated). The RDNA4 comment
+   already records 4 as the measured choice.
+4. CONCLUSION: the M=1 mmvq floor ~8-19us per small GEMM is the kernel's
+   structural latency at M=1 (block lifetime x waves: the K=10240 hc-down
+   is rpb=1-forced - its 320 kblocks/row fill the 128 groups 2.5x and the
+   row CANNOT split across blocks bit-exactly; rpb 2/4/8/16 all measured
+   WORSE). Only M>1 batching (amortizes the floor across tokens - server
+   lever) or a from-scratch persistent/pipelined M=1 kernel (major
+   project) can beat it. ALL experiment hacks reverted; tree clean at
+   1f05646fd (the rebuild = the gated source).
