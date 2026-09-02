@@ -1,0 +1,675 @@
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index 2c2624bfa..38f3866cb 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -8,10 +8,10 @@ extern "C" {
+ 
+ #define RPC_PROTO_MAJOR_VERSION    6
+ #define RPC_PROTO_MINOR_VERSION    0
+-#define RPC_PROTO_PATCH_VERSION    1
++#define RPC_PROTO_PATCH_VERSION    2
+ 
+ #ifdef  __cplusplus
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+ #endif
+ 
+ #define GGML_RPC_MAX_SERVERS       16
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index e66131d68..69b62ffd8 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -576,6 +576,7 @@ extern "C" {
+         GGML_OP_DSV4_HC_POST,
+         GGML_OP_FLASH_ATTN_QSA,
+         GGML_OP_INDEXER_TOPK,
++        GGML_OP_HC_MIX,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2695,6 +2696,20 @@ extern "C" {
+             struct ggml_tensor  * post,
+             struct ggml_tensor  * comb);
+ 
++    // hc_mix: fused hyper-connection mixer tail (qwen4exp / Flash-Next decode).
++    // xn [hc*hc_embd, n_tokens] F32 (rms-normed + gamma-scaled input) -> mixed [n_embd, n_tokens]
++    //   lo   = silu(w_down^T xn / hc)
++    //   gate = sigmoid(w_up^T lo)
++    //   mixed = (1/hc) * sum_c xn * gate  (collapse of the hc streams)
++    // hc goes in op_params. Bit-exactness: the CUDA kernel mirrors the mmvq
++    // Q8_0 accumulation the unfused chain uses at M=1.
++    GGML_API struct ggml_tensor * ggml_hc_mix(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * xn,
++            struct ggml_tensor  * w_down,
++            struct ggml_tensor  * w_up,
++            int64_t               hc);
++
+     // custom operators
+ 
+     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 8090435b2..0209764a2 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1065,6 +1065,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             case GGML_OP_DSV4_HC_POST: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
++            case GGML_OP_HC_MIX: {
++                // the mix weights and the normed input are mirrored per device
++                // (verified on the qwen4exp decode graph); each device runs the
++                // full op and produces its own local mixed copy.
++                GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++                GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++                GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
++            } break;
+             case GGML_OP_UNARY: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+             } break;
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 87a329f26..f540f52af 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2101,6 +2101,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_dsv4_hc_post(params, tensor);
+             } break;
++        case GGML_OP_HC_MIX:
++            {
++                ggml_compute_forward_hc_mix(params, tensor);
++            } break;
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2284,6 +2288,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_DSV4_HC_COMB:
+         case GGML_OP_DSV4_HC_PRE:
+         case GGML_OP_DSV4_HC_POST:
++        case GGML_OP_HC_MIX:
+             {
+                 n_tasks = n_threads;
+             } break;
+@@ -3029,6 +3034,14 @@ struct ggml_cplan ggml_graph_plan(
+                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+                         cur = per_thread * sizeof(float) * n_tasks;
+                     } break;
++                case GGML_OP_HC_MIX:
++                    {
++                        // per-token scratch: lo [hc_lr] + gate [hc_dim]
++                        const int64_t hc_lr  = node->src[1]->ne[1];
++                        const int64_t hc_dim = node->src[0]->ne[0];
++                        const int64_t per_thread = hc_lr + hc_dim;
++                        cur = per_thread * sizeof(float) * n_tasks;
++                    } break;
+                 case GGML_OP_COUNT:
+                     {
+                         GGML_ABORT("fatal error");
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 266261c5e..9ba0eb563 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -3,6 +3,7 @@
+ #include "ggml-cpu.h"
+ #include "ggml-impl.h"
+ #include "binary-ops.h"
++#include "quants.h"
+ #include "simd-gemm.h"
+ #include "ggml.h"
+ #include "unary-ops.h"
+@@ -12162,3 +12163,120 @@ void ggml_compute_forward_lightning_indexer(
+         }
+     }
+ }
++
++// ggml_compute_forward_hc_mix
++
++// Fused hyper-connection mixer tail: two Q8_0 matrix-vector products with
++// silu/sigmoid gating plus the stream collapse. xn is the rms-normed and
++// gamma-scaled input (the graph keeps those nodes for the inject MUL_MAT).
++// Reference for the unfused chain; used only on the CPU backend (the GPU
++// fused kernel must match the GPU unfused chain, not this function).
++static void ggml_compute_forward_hc_mix_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * xn      = dst->src[0];
++    const ggml_tensor * w_down  = dst->src[1];
++    const ggml_tensor * w_up    = dst->src[2];
++
++    GGML_ASSERT(xn->type     == GGML_TYPE_F32);
++    GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0);
++    GGML_ASSERT(w_up->type   == GGML_TYPE_Q8_0);
++    GGML_ASSERT(dst->type    == GGML_TYPE_F32);
++
++    const int64_t hc       = ggml_get_op_params_i32(dst, 0);
++    const int64_t hc_dim   = xn->ne[0];
++    const int64_t n_tokens = xn->ne[1];
++    const int64_t n_embd   = hc_dim / hc;
++    const int64_t hc_lr    = w_down->ne[1];
++
++    GGML_ASSERT(hc_lr % QK8_0 == 0 && hc_dim % QK8_0 == 0);
++    GGML_ASSERT(w_down->ne[0] == hc_dim);
++    GGML_ASSERT(w_up->ne[0]   == hc_lr  && w_up->ne[1] == hc_dim);
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int64_t dr  = (n_tokens + nth - 1) / nth;
++    const int64_t ir0 = dr * ith;
++    const int64_t ir1 = MIN(ir0 + dr, n_tokens);
++
++    // scratch for the current token: lo [hc_lr], gate [hc_dim]
++    float * lo   = (float *) params->wdata + ith*(hc_lr + hc_dim);
++    float * gate = lo + hc_lr;
++
++    const float inv_hc = 1.0f / (float) hc;
++
++    for (int64_t it = ir0; it < ir1; ++it) {
++        const float * xn_t = (const float *) xn->data + it*hc_dim;
++
++        // lo = w_down^T xn  (Q8_0 blocks, f32 accumulate)
++        const block_q8_0 * wd = (const block_q8_0 *) w_down->data;
++        for (int64_t j = 0; j < hc_lr; ++j) {
++            const block_q8_0 * wd_j = wd + j*(hc_dim/QK8_0);
++            float sum = 0.0f;
++            for (int64_t b = 0; b < hc_dim/QK8_0; ++b) {
++                const float d = GGML_FP16_TO_FP32(wd_j[b].d);
++                const int8_t * q = wd_j[b].qs;
++                const float * xb = xn_t + b*QK8_0;
++                float acc = 0.0f;
++                for (int64_t k = 0; k < QK8_0; ++k) {
++                    acc += q[k] * xb[k];
++                }
++                sum += d * acc;
++            }
++            lo[j] = sum;
++        }
++
++        // silu(lo / hc)
++        for (int64_t j = 0; j < hc_lr; ++j) {
++            const float v = lo[j] * inv_hc;
++            lo[j] = v / (1.0f + expf(-v));
++        }
++
++        // gate = sigmoid(w_up^T lo)
++        const block_q8_0 * wu = (const block_q8_0 *) w_up->data;
++        for (int64_t r = 0; r < hc_dim; ++r) {
++            const block_q8_0 * wu_r = wu + r*(hc_lr/QK8_0);
++            float sum = 0.0f;
++            for (int64_t b = 0; b < hc_lr/QK8_0; ++b) {
++                const float d = GGML_FP16_TO_FP32(wu_r[b].d);
++                const int8_t * q = wu_r[b].qs;
++                const float * lb = lo + b*QK8_0;
++                float acc = 0.0f;
++                for (int64_t k = 0; k < QK8_0; ++k) {
++                    acc += q[k] * lb[k];
++                }
++                sum += d * acc;
++            }
++            gate[r] = 1.0f / (1.0f + expf(-sum));
++        }
++
++        // collapse the gated streams to the mean
++        float * dst_t = (float *) dst->data + it*n_embd;
++        for (int64_t j = 0; j < n_embd; ++j) {
++            float sum = 0.0f;
++            for (int64_t c = 0; c < hc; ++c) {
++                sum += xn_t[c*n_embd + j] * gate[c*n_embd + j];
++            }
++            dst_t[j] = sum * inv_hc;
++        }
++    }
++}
++
++
++void ggml_compute_forward_hc_mix(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
++
++    switch (dst->src[0]->type) {
++        case GGML_TYPE_F32:
++            {
++                ggml_compute_forward_hc_mix_f32(params, dst);
++            } break;
++        default:
++            {
++                GGML_ABORT("fatal error");
++            } break;
++    }
++}
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 4c1642a67..f13148a05 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -109,6 +109,7 @@ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * p
+ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_hc_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index d9cd3939f..7bb949e7a 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -62,6 +62,7 @@
+ #include "ggml-cuda/gla.cuh"
+ #include "ggml-cuda/gated_delta_net.cuh"
+ #include "ggml-cuda/dsv4-hc.cuh"
++#include "ggml-cuda/hc-mix.cuh"
+ #include "ggml-cuda/set.cuh"
+ #include "ggml-cuda/set-rows.cuh"
+ #include "ggml-cuda/pad_reflect_1d.cuh"
+@@ -2481,6 +2482,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_DSV4_HC_POST:
+             ggml_cuda_op_dsv4_hc_post(ctx, dst);
+             break;
++        case GGML_OP_HC_MIX:
++            ggml_cuda_op_hc_mix(ctx, dst);
++            break;
+         case GGML_OP_RWKV_WKV7:
+             ggml_cuda_op_rwkv_wkv7(ctx, dst);
+             break;
+@@ -6057,6 +6061,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                 op->type == GGML_TYPE_F32;
++        case GGML_OP_HC_MIX:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_Q8_0 &&
++                op->src[2]->type == GGML_TYPE_Q8_0 && op->type == GGML_TYPE_F32;
+         case GGML_OP_FLASH_ATTN_EXT:
+             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+         case GGML_OP_FLASH_ATTN_QSA:
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+new file mode 100644
+index 000000000..202e1d7e1
+--- /dev/null
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -0,0 +1,239 @@
++// Fused hyper-connection mixer tail for qwen4exp decode (nt == 1).
++//
++// Replaces the unfused decode chain (SCALE, SILU, MUL_MAT up, SIGMOID, MUL,
++// collapse ADD/SCALE) with one op dispatch. The numerics replicate the unfused
++// chain bit for bit:
++//   lo_raw = w_down^T xn                       (mmvq Q8_0 dot, M = 1)
++//   v      = silu(lo_raw / hc)                 (SCALE then SILU)
++//   gate   = sigmoid(w_up^T v)                 (mmvq Q8_0 dot, M = 1)
++//   mixed  = (1/hc) * sum_c xn * gate          (collapse of the hc streams)
++// The xn -> Q8_1 quantization mirrors quantize_row_q8_1_cuda, and the per-row
++// dots replicate mul_mat_vec_q<Q8_0, 1> (block (32, 8), rpb = 1) so the sums
++// are bit-identical to the unfused mmvq path.
++
++#include "hc-mix.cuh"
++
++#include "quantize.cuh"
++#include "unary.cuh"
++#include "vecdotq.cuh"
++
++
++// One Q8_0 matrix-vector product against a pre-quantized Q8_1 input. Grid:
++// (ceil(nrows / RPB), 1), block: (32, nwarps), RPB rows per block. This is a
++// faithful clone of mul_mat_vec_q (ncols_dst = 1): the (row, kblock) items are
++// split across the (32, nwarps) threads and reduced with a per-warp butterfly
++// followed by a serial add of the warp results. RPB must match the dispatch's
++// rows-per-block (1 for K >= the group count, or the short-K override for
++// small K) so the sums are bit-identical to the unfused mmvq path.
++template <int nwarps, int RPB>
++static __global__ void hc_mix_row_dot(
++        const block_q8_0 * w, const block_q8_1 * y, float * dst,
++        const int nrows, const int blocks_per_row) {
++    const int row0 = RPB*blockIdx.x;
++    constexpr int qi  = QI8_0;             // 8
++    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
++    const int tid      = 32*threadIdx.y + threadIdx.x;
++    const int n_groups = nwarps*32 / (qi/vdr);
++    const int n_items  = RPB * blocks_per_row;
++
++    float tmp[RPB] = {0.0f};
++    const int kqs = vdr * (tid % (qi/vdr));
++    for (int it = tid / (qi/vdr); it < n_items; it += n_groups) {
++        const int i   = it / blocks_per_row;
++        const int kbx = it % blocks_per_row;
++        if (row0 + i < nrows) {
++            // the vec_dot reads the Q8_1 block from the pointer argument as-is
++            // and offsets only the weight by kbx, so pass the per-kblock y pointer
++            tmp[i] += vec_dot_q8_0_q8_1(w + (int64_t) (row0 + i) * blocks_per_row, &y[kbx], kbx, kqs);
++        }
++    }
++
++    __shared__ float tmp_shared[nwarps > 1 ? nwarps-1 : 1][RPB];
++    for (int i = 0; i < RPB; ++i) {
++        tmp[i] = warp_reduce_sum<32>(tmp[i]);
++        if (threadIdx.y > 0) {
++            tmp_shared[threadIdx.y-1][i] = tmp[i];
++        }
++    }
++    __syncthreads();
++    if (threadIdx.y > 0) {
++        return;
++    }
++    for (int i = 0; i < RPB; ++i) {
++#pragma unroll
++        for (int l = 0; l < nwarps-1; ++l) {
++            tmp[i] += tmp_shared[l][i];
++        }
++        if (threadIdx.x == 0 && row0 + i < nrows) {
++            dst[row0 + i] = tmp[i];
++        }
++    }
++}
++
++// silu(lo/hc) and Q8_1 quantize of the low-rank vector. One block of 32
++// threads (one warp) loops over the Q8_1 blocks; each block's 32 lanes are the
++// 32 consecutive values, so the warp reduction matches quantize_q8_1.
++static __global__ void hc_mix_silu_quant(
++        const float * lo, block_q8_1 * y,
++        const int n_blocks, const float inv_hc) {
++    const int lane = threadIdx.x;
++    for (int ib = 0; ib < n_blocks; ++ib) {
++        const int col = ib*32 + lane;
++        const float v = col < 320 ? ggml_cuda_op_silu_single(lo[col] * inv_hc) : 0.0f;
++        float amax = fabsf(v);
++        float sum  = v;
++        amax = warp_reduce_max<32>(amax);
++        sum  = warp_reduce_sum<32>(sum);
++        const float  d = amax / 127.0f;
++        const int8_t q = amax == 0.0f ? 0 : (int8_t) roundf(v / d);
++        y[ib].qs[lane] = q;
++        if (lane == 0) {
++            y[ib].ds = make_half2(d, sum);
++        }
++    }
++}
++
++// Collapse the gated streams to their mean: mixed[j] = (1/hc) * sum_c xn*c*gate.
++// gate holds the raw up projection; sigmoid is applied inline (same formula as
++// the standalone op). The products are stored to an array before summing so the
++// compiler cannot contract them into FMAs: the reference rounds each xn*gate
++// product (a separate MUL op) and then adds the rounded values. One thread per
++// output element; the adds follow the graph order (left-to-right ADD chain),
++// then SCALE.
++static __global__ void hc_mix_collapse(
++        const float * xn, const float * gate_raw, float * dst,
++        const int n_embd, const int hc, const float inv_hc) {
++    const int j = blockIdx.x;
++    if (j >= n_embd) {
++        return;
++    }
++    float pp[8];
++    for (int c = 0; c < hc; ++c) {
++        const float g = 1.0f / (1.0f + expf(-gate_raw[c*n_embd + j]));
++        pp[c] = xn[c*n_embd + j] * g;
++    }
++    float sum = pp[0];
++    for (int c = 1; c < hc; ++c) {
++        sum = sum + pp[c];
++    }
++    dst[j] = sum * inv_hc;
++}
++
++void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * xn     = dst->src[0];
++    const ggml_tensor * w_down = dst->src[1];
++    const ggml_tensor * w_up   = dst->src[2];
++
++    GGML_ASSERT(xn->type     == GGML_TYPE_F32);
++    GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0);
++    GGML_ASSERT(w_up->type   == GGML_TYPE_Q8_0);
++    GGML_ASSERT(dst->type    == GGML_TYPE_F32);
++
++    const int hc = ggml_get_op_params_i32(dst, 0);
++    GGML_ASSERT(hc > 0 && hc <= 8);
++
++    const int64_t hc_dim   = xn->ne[0];
++    const int64_t n_tokens = xn->ne[1];
++    const int64_t n_embd   = hc_dim / hc;
++    const int64_t hc_lr    = w_down->ne[1];
++
++    GGML_ASSERT(n_tokens == 1);             // decode-only fused op
++    GGML_ASSERT(hc_dim % 32 == 0 && hc_lr % 32 == 0);
++    GGML_ASSERT(xn->nb[1] == hc_dim*sizeof(float)); // contiguous
++    GGML_ASSERT(w_down->ne[1] == hc_lr && w_up->ne[0] == hc_lr && w_up->ne[1] == hc_dim);
++
++
++    const float * xn_d = (const float *) xn->data;
++    float * dst_d      = (float *) dst->data;
++
++    cudaStream_t stream = ctx.stream();
++
++    const int blocks_down = hc_dim / 32; // xn Q8_1 blocks for the down dots
++    const int blocks_up   = hc_lr  / 32; // v  Q8_1 blocks for the up dots
++
++    ggml_cuda_pool & pool = ctx.pool();
++
++    ggml_cuda_pool_alloc<block_q8_1> y_xn_alloc(pool, blocks_down);
++    ggml_cuda_pool_alloc<float>      lo_alloc(pool, hc_lr);
++    ggml_cuda_pool_alloc<block_q8_1> y_v_alloc(pool, blocks_up);
++    ggml_cuda_pool_alloc<float>      gate_alloc(pool, hc_dim);
++
++    block_q8_1 * y_xn = y_xn_alloc.get();
++    float      * lo   = lo_alloc.get();
++    block_q8_1 * y_v  = y_v_alloc.get();
++    float      * gate = gate_alloc.get();
++
++    // xn -> Q8_1 (same kernel + semantics as the mmvq quantize path)
++    quantize_row_q8_1_cuda(xn_d, nullptr, y_xn, GGML_TYPE_Q8_0,
++            hc_dim, hc_dim, 0, 0, hc_dim, 1, 1, 1, stream);
++
++    // rows-per-block as the mmvq dispatch chooses: 1 when the K-blocks fill the
++    // thread groups, or the short-K override (RDNA2+) that packs RPB rows per
++    // block so the item loop is bit-identical to the unfused path.
++    constexpr int warp_size = 32;
++    constexpr int qi  = QI8_0;
++    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
++    const auto calc_rpb = [&](int blocks_per_row) {
++        const int n_groups = 8 * warp_size * vdr / qi;   // nwarps = 8
++        int rpb = 1;
++        if (blocks_per_row > 0 && blocks_per_row < n_groups) {
++            int fill = (n_groups + blocks_per_row - 1) / blocks_per_row;
++            int a = blocks_per_row, b = n_groups;
++            while (b) { int t = a % b; a = b; b = t; }
++            rpb = std::max(fill, n_groups / a);
++            int pp = 1;
++            while (pp < rpb) { pp <<= 1; }
++            rpb = std::min(pp, 16);
++        }
++        return rpb;
++    };
++    const int rpb_down = calc_rpb(blocks_down);
++    const int rpb_up   = calc_rpb(blocks_up);
++
++    // lo_raw = w_down^T xn: 320 rows x 10240 dots
++    {
++        const dim3 block_nums((hc_lr + rpb_down - 1) / rpb_down);
++        const dim3 block_dims(32, 8);
++        const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
++        if (rpb_down == 1) {
++            ggml_cuda_kernel_launch(hc_mix_row_dot<8, 1>, launch_params,
++                    (const block_q8_0 *) w_down->data, y_xn, lo, hc_lr, blocks_down);
++        } else {
++            GGML_ABORT("hc_mix: unexpected down rpb %d\n", rpb_down);
++        }
++    }
++
++    // v = silu(lo/hc), then Q8_1
++    {
++        const dim3 block_nums(1);
++        const dim3 block_dims(32);
++        const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
++        ggml_cuda_kernel_launch(hc_mix_silu_quant, launch_params,
++                lo, y_v, blocks_up, 1.0f / (float) hc);
++    }
++
++    // gate_raw = w_up^T v: 10240 rows x 320 dots (short K -> rpb override)
++    {
++        const dim3 block_nums((hc_dim + rpb_up - 1) / rpb_up);
++        const dim3 block_dims(32, 8);
++        const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
++        switch (rpb_up) {
++            case 1:  ggml_cuda_kernel_launch(hc_mix_row_dot<8, 1>,  launch_params, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up); break;
++            case 2:  ggml_cuda_kernel_launch(hc_mix_row_dot<8, 2>,  launch_params, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up); break;
++            case 4:  ggml_cuda_kernel_launch(hc_mix_row_dot<8, 4>,  launch_params, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up); break;
++            case 8:  ggml_cuda_kernel_launch(hc_mix_row_dot<8, 8>,  launch_params, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up); break;
++            case 16: ggml_cuda_kernel_launch(hc_mix_row_dot<8, 16>, launch_params, (const block_q8_0 *) w_up->data, y_v, gate, hc_dim, blocks_up); break;
++            default: GGML_ABORT("hc_mix: unexpected up rpb %d\n", rpb_up); break;
++        }
++    }
++
++    // mixed = (1/hc) * sum_c xn * sigmoid(gate)
++    {
++        const dim3 block_nums(n_embd);
++        const dim3 block_dims(1);
++        const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
++        ggml_cuda_kernel_launch(hc_mix_collapse, launch_params,
++                xn_d, gate, dst_d, n_embd, hc, 1.0f / (float) hc);
++    }
++
++}
+diff --git a/ggml/src/ggml-cuda/hc-mix.cuh b/ggml/src/ggml-cuda/hc-mix.cuh
+new file mode 100644
+index 000000000..e7c3ed40f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/hc-mix.cuh
+@@ -0,0 +1,4 @@
++#include "common.cuh"
++#include "ggml.h"
++
++void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 72ad31512..ecafc3175 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1085,6 +1085,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "DSV4_HC_POST",
+     "FLASH_ATTN_QSA",
+     "INDEXER_TOPK",
++    "HC_MIX",
+ 
+     "UNARY",
+ 
+@@ -1102,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1201,6 +1202,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "dsv4_hc_pre(x, weights)",
+     "dsv4_hc_post(x, residual, post, comb)",
+     "flash_attn_qsa(q, k, v, idx, mask)",
++    "indexer_topk(q, k, weights, mask)",
++    "hc_mix(x, w_norm, w_down, w_up)",
+ 
+     "unary(x)",
+ 
+@@ -1218,7 +1221,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6615,6 +6618,39 @@ struct ggml_tensor * ggml_dsv4_hc_post(
+     return result;
+ }
+ 
++// ggml_hc_mix
++
++struct ggml_tensor * ggml_hc_mix(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * xn,
++        struct ggml_tensor  * w_down,
++        struct ggml_tensor  * w_up,
++        int64_t               hc) {
++    GGML_ASSERT(xn->type == GGML_TYPE_F32);
++    GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0);
++    GGML_ASSERT(w_up->type == GGML_TYPE_Q8_0);
++    GGML_ASSERT(hc > 0);
++
++    const int64_t hc_dim   = xn->ne[0];
++    const int64_t n_tokens = xn->ne[1];
++
++    GGML_ASSERT(hc_dim % hc == 0);
++    GGML_ASSERT(w_down->ne[0] == hc_dim);
++    GGML_ASSERT(w_up->ne[1] == hc_dim && w_up->ne[0] == w_down->ne[1]);
++    GGML_ASSERT(xn->ne[2] == 1 && xn->ne[3] == 1);
++
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim / hc, n_tokens);
++
++    ggml_set_op_params_i32(result, 0, (int32_t) hc);
++
++    result->op     = GGML_OP_HC_MIX;
++    result->src[0] = xn;
++    result->src[1] = w_down;
++    result->src[2] = w_up;
++
++    return result;
++}
++
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ struct ggml_hash_set ggml_hash_set_new(size_t size) {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index a920c4231..3ea84686f 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -241,6 +241,15 @@ llama_context::llama_context(
+     cparams.fused_dsv4_hc_post = true;
+     cparams.auto_fhc           = true;
+ 
++    cparams.fused_hc_mix = true;
++    {
++        const char * LLAMA_FUSED_HC_MIX = getenv("LLAMA_FUSED_HC_MIX");
++        if (LLAMA_FUSED_HC_MIX) {
++            cparams.fused_hc_mix = atoi(LLAMA_FUSED_HC_MIX) != 0;
++            LLAMA_LOG_INFO("%s: fused hc_mix = %d (env)\n", __func__, cparams.fused_hc_mix);
++        }
++    }
++
+     // with causal attention, the batch size is limited by the context size
+     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 574ce9592..1c4f14023 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -48,6 +48,7 @@ struct llama_cparams {
+     bool fused_dsv4_hc_comb;
+     bool fused_dsv4_hc_post;
+     bool auto_fhc;
++    bool fused_hc_mix;       // use the fused hyper-connection mixer (qwen4exp decode)
+     bool no_perf;
+     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
+     bool op_offload;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index d13ade31d..255b5f461 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -235,6 +235,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+     xn = ggml_mul(ctx0, xn, w_norm);
+     cb(xn, "hc_norm", il);
+ 
++    // decode (nt == 1): fuse everything after the norm into one dispatch. The
++    // prefill path keeps the unfused chain so its numerics (mmq vs mmvq
++    // accumulation) are untouched; xn above still feeds the inject MUL_MAT.
++    if (nt == 1 && cparams.fused_hc_mix) {
++        ggml_tensor * mixed = ggml_hc_mix(ctx0, xn, w_down, w_up, hc);
++        cb(mixed, "hc_mixed", il);
++        if (inject) {
++            *inject = build_lora_mm(w_inject, xn);
++            cb(*inject, "hc_inject", il);
++        }
++        return mixed;
++    }
++
+     ggml_tensor * lo = build_lora_mm(w_down, xn);
+     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
+     ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
