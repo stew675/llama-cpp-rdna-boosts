@@ -589,3 +589,31 @@ REMAINING LEVERS (evidence-ranked, all with real cycle costs):
    needs 640 blocks (rpb16) > cooperative residency.
 4. GDN state GET_ROWS/cpy + body elementwise soup: invasive.
 5. Server-level batch decode (M>1 kernels): untried config lever.
+
+## UPDATE 2026-09-04 (decode session 5b): F32 inject fold + THE KERNEL-COUNT WALL
+
+- The inject weights are F32 in the GGUF (NOT Q8_0 - the original design
+  assumption was wrong). The op now computes inject internally with an mmvf
+  replica (float2 pairs, acc += v*u, 256-thread blocks, zero-padded warp
+  butterfly) - BIT-EXACT first try; the dst tail carries inject and the
+  combine consumes the view directly (no MUL_MAT node). Commit bd25e63eb,
+  patch 0014 (chain 0013+0014 verified on 50ae9d134). Boost @ 9b4d0f2.
+- PERF: tg128 44.70 vs 44.81 - FLAT. The inject was already ONE kernel;
+  folding it = 5+1 graph kernels -> 6 internal = zero count change.
+  LESSON (the decode kernel-count wall): every kernel pays ~8-16us of
+  queueing on the saturated 3-GPU decode, so ONLY kernel-count-REDUCING
+  changes win (rms+mul fold -2, silu-quant merge -1: the +14.5%) and
+  kernel-count-preserving moves are noise (+/-2.2 t/s std). Remaining
+  reductions require touching the BODY ops (attn/ffn chains, experts) or
+  batching M > 1.
+- CURRENT STATE: llama.cpp @ bd25e63eb (clean); decode tg128 ~44.7-44.8
+  (+14.5% vs the 39.79 unfused @ -r 3); all changes bit-exact vs
+  /home/ld_decode_ref.bin. Patch blocks 0009-0014 preserved.
+- NEXT (kernel-count-reducing only): (1) batch decode at the server
+  (M > 1 kernels - the config lever with no kernel surgery); (2) the
+  decode expert mmvq config (down [K=640], gate/up [K=2560] at M=1 - the
+  expert cluster is ~24% of decode time but only ~3% of nodes; config is
+  compile-time constexpr -> rebuild + re-gate per variant); (3) the
+  attn/ffn body elementwise chains (generic fusion pass work).
+- Cycle-time: run benches/gates FOREGROUND with timeout (returns on early
+  exit AND early failure); -r 3 for decisive bench means.
