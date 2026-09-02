@@ -1,0 +1,207 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 32a96674e..6212ab50a 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2709,7 +2709,7 @@ extern "C" {
+     //   lo     = silu(w_down^T xn / hc)
+     //   gate   = sigmoid(w_up^T lo)
+     //   mixed  = (1/hc) * sum_c xn * gate
+-    //   inject = w_inject^T xn
++    //   inject = w_inject^T xn (w_inject may be null: no tail, no inject)
+     // Bit-exactness: the CUDA kernels mirror the unfused ops (rms_norm_f32,
+     // the gamma MUL rounding, the mmvq Q8_0 accumulation at M = 1, and the
+     // mmvf float2-pair FMA accumulation for the F32 inject), so mixed and
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 06be7247d..7a7022f43 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1070,12 +1070,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+                 // device (verified on the qwen4exp decode graph); each device
+                 // runs the full op and produces its own local copy. The output
+                 // carries both mixed and the inject scatter (the combine views
+-                // the tail), all mirrored.
++                // the tail), all mirrored. src[4] (w_inject) is null at the
++                // head call (il = -1), which the splitter marks UNKNOWN.
+                 GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                 GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                 GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                 GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+-                GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++                GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+                 split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+             } break;
+             case GGML_OP_HC_COMBINE: {
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 527ed5a27..fd87bc0dc 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12185,7 +12185,7 @@ static void ggml_compute_forward_hc_mix_f32(
+     GGML_ASSERT(w_norm->type   == GGML_TYPE_F32);
+     GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0);
+     GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
+-    GGML_ASSERT(w_inject->type == GGML_TYPE_F32);
++    GGML_ASSERT(w_inject == nullptr || w_inject->type == GGML_TYPE_F32);
+     GGML_ASSERT(dst->type      == GGML_TYPE_F32);
+ 
+     const int64_t hc       = ggml_get_op_params_i32(dst, 0);
+@@ -12200,7 +12200,7 @@ static void ggml_compute_forward_hc_mix_f32(
+     GGML_ASSERT(w_norm->ne[0] == hc_dim);
+     GGML_ASSERT(w_down->ne[0] == hc_dim);
+     GGML_ASSERT(w_up->ne[0] == hc_lr && w_up->ne[1] == hc_dim);
+-    GGML_ASSERT(w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc);
++    GGML_ASSERT(w_inject == nullptr || (w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc));
+ 
+     const int ith = params->ith;
+     const int nth = params->nth;
+@@ -12286,14 +12286,16 @@ static void ggml_compute_forward_hc_mix_f32(
+             dst_t[j] = sum * inv_hc;
+         }
+ 
+-        // inject = w_inject^T xn into the dst tail [hc]
+-        const float * wi = (const float *) w_inject->data;
+-        for (int64_t r = 0; r < hc; ++r) {
+-            float sum = 0.0f;
+-            for (int64_t k = 0; k < hc_dim; ++k) {
+-                sum += wi[(int64_t) r*hc_dim + k] * xn[k];
++        // inject = w_inject^T xn into the dst tail [hc] (none at the head)
++        if (w_inject) {
++            const float * wi = (const float *) w_inject->data;
++            for (int64_t r = 0; r < hc; ++r) {
++                float sum = 0.0f;
++                for (int64_t k = 0; k < hc_dim; ++k) {
++                    sum += wi[(int64_t) r*hc_dim + k] * xn[k];
++                }
++                dst_t[n_embd + r] = sum;
+             }
+-            dst_t[n_embd + r] = sum;
+         }
+     }
+ }
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c3e13fa7b..a67bbc8b1 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6067,7 +6067,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_HC_MIX:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_Q8_0 && op->src[3]->type == GGML_TYPE_Q8_0 &&
+-                op->src[4]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
++                (op->src[4] == nullptr || op->src[4]->type == GGML_TYPE_F32) &&
++                op->type == GGML_TYPE_F32;
+         case GGML_OP_HC_COMBINE:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+index 9e6c05180..0bb78a877 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cu
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -258,7 +258,7 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     GGML_ASSERT(w_norm->type   == GGML_TYPE_F32);
+     GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0);
+     GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
+-    GGML_ASSERT(w_inject->type == GGML_TYPE_F32);
++    GGML_ASSERT(w_inject == nullptr || w_inject->type == GGML_TYPE_F32);
+     GGML_ASSERT(dst->type      == GGML_TYPE_F32);
+ 
+     const int   hc  = ggml_get_op_params_i32(dst, 0);
+@@ -276,13 +276,13 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     GGML_ASSERT(x->nb[2] == hc_dim*sizeof(float));  // streams contiguous
+     GGML_ASSERT(w_norm->ne[0] == hc_dim);
+     GGML_ASSERT(w_up->ne[0] == hc_lr && w_up->ne[1] == hc_dim);
+-    GGML_ASSERT(w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc);
+-    GGML_ASSERT(dst->ne[0] == n_embd + hc);
++    GGML_ASSERT(w_inject == nullptr || (w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc));
++    GGML_ASSERT(dst->ne[0] == n_embd + (w_inject ? hc : 0));
+ 
+     const float * x_d   = (const float *) x->data;
+     const float * wn_d  = (const float *) w_norm->data;
+     float * dst_d       = (float *) dst->data;
+-    float * inject      = dst_d + n_embd;   // the inject tail
++    float * inject      = w_inject ? dst_d + n_embd : nullptr;  // the inject tail
+ 
+     cudaStream_t stream = ctx.stream();
+ 
+@@ -369,13 +369,14 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     // collapse blocks (n_embd/256) and the hc inject rows share the grid
+     {
+         const int n_collapse_blocks = (int) ((n_embd + 255) / 256);
+-        const dim3 block_nums(n_collapse_blocks + hc);
++        const int n_inject_blocks   = w_inject ? hc : 0;
++        const dim3 block_nums(n_collapse_blocks + n_inject_blocks);
+         const dim3 block_dims(256);
+         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+         ggml_cuda_kernel_launch(hc_mix_collapse_inject, launch_params,
+                 xn, gate, dst_d, n_embd, hc, 1.0f / (float) hc,
+-                (const float *) w_inject->data, inject, (int) (hc_dim / 2),
+-                n_collapse_blocks);
++                w_inject ? (const float *) w_inject->data : nullptr, inject,
++                (int) (hc_dim / 2), n_collapse_blocks);
+     }
+ }
+ 
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 28d75401e..ac1be65fa 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6635,7 +6635,7 @@ struct ggml_tensor * ggml_hc_mix(
+     GGML_ASSERT(w_norm->type   == GGML_TYPE_F32);
+     GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0);
+     GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
+-    GGML_ASSERT(w_inject->type == GGML_TYPE_F32);
++    GGML_ASSERT(w_inject == NULL || w_inject->type == GGML_TYPE_F32);
+     GGML_ASSERT(hc > 0);
+ 
+     const int64_t n_embd    = x->ne[0];
+@@ -6646,10 +6646,12 @@ struct ggml_tensor * ggml_hc_mix(
+     GGML_ASSERT(w_norm->ne[0] == hc_dim);
+     GGML_ASSERT(w_down->ne[0] == hc_dim);
+     GGML_ASSERT(w_up->ne[1] == hc_dim && w_up->ne[0] == w_down->ne[1]);
+-    GGML_ASSERT(w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc);
++    GGML_ASSERT(w_inject == NULL || (w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc));
+     GGML_ASSERT(x->ne[3] == 1);
+ 
+-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd + hc, n_tokens);
++    // w_inject == NULL (the head call): no inject tail in the output
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
++            n_embd + (w_inject ? hc : 0), n_tokens);
+ 
+     ggml_set_op_params_i32(result, 0, (int32_t) hc);
+     ggml_set_op_params_f32(result, 1, eps);
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index e8dc0bb31..0e1cd5b23 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -233,18 +233,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+     // the inject product - into one dispatch; the model views the mixed and
+     // inject outputs out of the one result. The prefill path keeps the
+     // unfused chain so its numerics (mmq vs mmvq accumulation) are untouched.
+-    // The head call (il = -1) has no inject weight and stays unfused.
+-    if (nt == 1 && cparams.fused_hc_mix && w_inject != nullptr) {
++    if (nt == 1 && cparams.fused_hc_mix) {
++        // w_inject == nullptr only for the head call (il = -1): no tail
+         ggml_tensor * dst_t = ggml_hc_mix(ctx0, x, w_norm, w_down, w_up, w_inject,
+                 hc, hparams.f_norm_rms_eps);
+-        // mixed = the head of dst [n_embd]; inject = the tail [hc]
+-        ggml_tensor * mixed = ggml_view_2d(ctx0, dst_t, n_embd, nt,
+-                ggml_row_size(GGML_TYPE_F32, n_embd + hc), 0);
++        const int64_t out_n = n_embd + (w_inject ? hc : 0);
++        ggml_tensor * mixed;
++        if (w_inject) {
++            // mixed = the head of dst [n_embd]; inject = the tail [hc]
++            mixed = ggml_view_2d(ctx0, dst_t, n_embd, nt,
++                    ggml_row_size(GGML_TYPE_F32, out_n), 0);
++        } else {
++            mixed = dst_t;
++        }
+         cb(mixed, "hc_mixed", il);
+-        if (inject) {
++        if (inject && w_inject) {
+             *inject = ggml_view_2d(ctx0, dst_t, hc, nt,
+-                    ggml_row_size(GGML_TYPE_F32, n_embd + hc), ggml_row_size(GGML_TYPE_F32, n_embd));
++                    ggml_row_size(GGML_TYPE_F32, out_n), ggml_row_size(GGML_TYPE_F32, n_embd));
+             cb(*inject, "hc_inject", il);
++        } else if (inject) {
++            *inject = nullptr;
+         }
+         return mixed;
+     }
