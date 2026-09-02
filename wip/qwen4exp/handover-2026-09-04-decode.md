@@ -392,3 +392,70 @@ OUTPUT COHERENCE VERIFIED (logitdump A/B, current clean-tree build):
   thread segfaults in hipFuncGetAttributes with the logitdump link line on
   3-GPU tensor; llama-bench is unaffected - do not chase this, it is a
   tool-link artifact).
+
+## UPDATE 2026-09-04 (decode session 3): FUSED HC_MIX OP LANDED (bit-exact, +5% decode)
+
+IMPLEMENTED (llama.cpp qwen4exp branch, all files on top of the coherence-session state):
+- New GGML op GGML_OP_HC_MIX: fuses the qwen4exp hyper-connection mix tail
+  (down LoRA mm, scale 1/hc, silu, up LoRA mm, sigmoid, gate mul, stream
+  collapse) into ONE op dispatch. Inputs: xn [hc_dim, 1] F32 (rms+gamma kept
+  as graph nodes - the inject MUL_MAT consumes the same xn), w_down
+  [10240,320] Q8_0, w_up [320,10240] Q8_0; output mixed [2560, 1]. hc in
+  op_params.
+- Activation: DECODE ONLY (nt == 1 && cparams.fused_hc_mix). Prefill (nt>1)
+  keeps the unfused chain, so all prefill-path gates stay valid BY
+  CONSTRUCTION. CPU reference impl included (ops.cpp) for -ngl 0 decode;
+  toggled by LLAMA_FUSED_HC_MIX=0 env (default on, read in llama-context).
+- Meta-TP wrapper: GGML_OP_HC_MIX = MIRRORED (all hc tensors verified
+  mirrored on the decode graph); each device runs the full op.
+- Touch points: ggml.h (enum+builder), ggml.c (names/symbols + builder),
+  ggml-cpu (ops.cpp ref + dispatch + wdata), ggml-cuda (hc-mix.cu/.cuh new +
+  dispatch + supports_op), ggml-backend-meta.cpp (split case), llama-cparams.h
+  + llama-context.cpp (flag + env), qwen4exp.cpp (build_hc_mix branch).
+  GGML_OP_COUNT 103->104 (+ggml-rpc.h patch bump). Also FIXED a pre-existing
+  off-by-one in GGML_OP_SYMBOL (INDEXER_TOPK had no symbol entry).
+
+BIT-EXACTNESS (the interesting part - THREE bugs found by micro A/B):
+1. vec_dot_q8_0_q8_1 takes the y (Q8_1) block POINTER as-is; kbx only offsets
+   the weight. Passing the y base instead of &y[kbx] gave mean diff ~2.4.
+2. The mmvq dispatch uses a ROWS-PER-BLOCK OVERRIDE on RDNA2+ for short-K
+   GEMMs (K=320 -> rpb=16) that changes the per-row accumulation tree. The
+   down (K=10240, rpb=1) matched a plain per-row replica; the up (K=320)
+   needed the exact rpb=16 clone of mul_mat_vec_q (item loop + per-warp
+   butterfly + serial warp adds).
+3. The collapse must round each xn*gate product BEFORE adding (the reference
+   runs separate MUL and ADD ops); sum += x*g inline lets the compiler
+   contract to an FMA -> ~30% of elements off by 1 ulp. Store products to an
+   array first.
+Debug method: env-gated (HC_MIX_DUMP) dump of the fused op's inputs/stages +
+a micro-harness (/tmp/hcchk.cpp) that runs the REAL unfused chain ops on the
+GPU with the captured data and compares stage by stage. Proven: lo, gate_raw
+and mixed are byte-identical vs the unfused decode chain; the FULL decode
+logitdump A/B (16 nt=1 positions, all 97 fused calls/token) is BIT-IDENTICAL
+vs the unfused reference (/home/ld_decode_ref.bin; run with -ub 1).
+
+SPEED (same build, llama-bench tg128, 3-GPU tensor, ngl 99, ub 2048):
+- fused (default):   41.11 +/- 2.39 t/s  (24.3 ms/token)
+- unfused (=0):      39.15 +/- 2.39 t/s  (25.5 ms/token)
+- GAIN +5.0%. First decode win on qwen4exp (historical ceiling ~40.1).
+
+ANSWER TO "is bit-exactness costing speed?": no measurable cost. The
+reference ordering constraints replicated are (a) the mmvq rpb=16 short-K
+config = the tree's own tuned-fast path, and (b) rounding order in the
+collapse, which is trivial work dominated by the 4 identical sigmoid expf's.
+The +5% comes from removing ~97 fused nodes x ~9-11 dispatches of scheduler +
+meta-wrapper + launch overhead; the fused op's 5 sub-kernels (q8_1 quantize,
+down dots, silu+quantize, up dots, collapse) are dictated by the sequential
+data dependency, not the ordering. Bit-exactness bought: the fused path can
+be DEFAULT-ON with zero semantic risk and the logitdump decode A/B stays a
+clean regression test (the same bar the tree's ssm_gate_beta fusion met).
+Further speed (if wanted) = fewer sub-kernel launches via a grid-synced
+mega-kernel, a separate ~1-3% opportunity.
+
+STATE: llama.cpp tree has the fused hc_mix change UNCOMMITTED (ask before
+committing). Debug scaffolding removed from hc-mix.cu (env-gated dump code
+deleted; /tmp/hcchk.cpp + /tmp/hcmix_1_*.bin + /home/ld_decode_*.bin kept for
+reference). Prefill gate /home/ld1024_noflag.bin unaffected by construction.
+NEXT: commit + (optionally) extend the fuser to hc_combine chains; the
+handover's original item 1 (fuse the norm into the mix too, dropping the
+RMS+MUL nodes when inject is absent) would save 2 more dispatches/mix.
