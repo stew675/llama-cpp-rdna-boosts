@@ -5,18 +5,19 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **13-patch set** against the fork point
-`0eadefebd` (re-based 2026-09-01; previously `a7cc83bba`): blocks 01-13
+`9cffdcc80` (re-based 2026-09-02 from `0eadefebd`): blocks 01-13
 (`patches/0001-…0013-…`, format-patch of the
 fork's `rdna-boosts` block commits — the re-based regeneration
-`b25bc8a9c..482837e5a` (blocks 12/13 committed as `7d5d3f77b`/`482837e5a`); the original fork hashes
-`2b7a135cb..f6f8f6778` are preserved on the `old-rdna-boosts` branch, the
-2026-08-30 `a7cc83bba`-based rebuild on `rdna-boosts-a7cc83bba`). Apply flow: `git am`
+`04122bfb5..92f09e80a` against `9cffdcc80`; the previous
+`0eadefebd`-based regeneration `b25bc8a9c..482837e5a` is superseded
+and preserved on the fork's history/remotes). Apply flow: `git am`
 for the whole 01-13 series (plain `git apply` of the concatenated series
 SILENTLY DROPS HUNKS — verified 2026-08-29);
 `scripts/apply-all.sh` automates it. **The set is whitespace-clean** —
 applying produces zero git whitespace warnings (verified 2026-08-29,
 re-verified 2026-09-01 on the `0eadefebd` re-base, re-verified with block
-13 on the 13-patch series 2026-09-01).
+13 on the 13-patch series 2026-09-01, re-verified on the `9cffdcc80`
+re-base 2026-09-02).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -39,8 +40,8 @@ This is the authoritative apply order and the verification contract for the
 patch set. It is written for humans AND LLM coding agents. Follow it exactly;
 do not skip blocks.
 
-Current state: `main` is the delivery branch (flat history, 12-patch set
-against `0eadefebd`). The `baseline/<sha>` branches and `block/01-…11` tags
+Current state: `main` is the delivery branch (flat history, 13-patch set
+against `9cffdcc80`). The `baseline/<sha>` branches and `block/01-…11` tags
 are HISTORICAL checkpoints of the old pre-block-12 structure (older
 upstream ranges, `git apply` flow); do not use them for the current
 delivery — use `patches/` + `scripts/apply-all.sh`.
@@ -73,7 +74,51 @@ silently drops hunks.
 
 ## Verified apply sequence
 
-### Re-baseline to 0eadefebd (2026-09-01, current)
+### Re-baseline to 9cffdcc80 (2026-09-02, current)
+
+Upstream master moved **42 commits** past the fork point `0eadefebd`; 3
+touching ggml-cuda — `3d3d7c818` (unused-var removals, #28235),
+`8e93a9773` (sparse-fa for DSV4/GLM, #27970: a 4th `use_sparse` bool on
+`launch_fattn`, fattn-tile/fattn-common edits) and `3466812d1` (fused MoE
+weighted-expert reduction, #25952: a new arm in `ggml_cuda_try_fuse`) —
+plus common/server arg churn (`e750b887a`). The fork's `rdna-boosts`
+branch was rebuilt from the delivery patches on the new base
+(`~/llama.cpp`, blocks `04122bfb5..92f09e80a`; plain `git am`, with the
+failed hunks resolved by hand per the BASELINE drift policy — no
+fork-blob 3-way crutches, matching what a fresh puller experiences) and
+the set regenerated with `scripts/make-patches.sh` (base `9cffdcc80`,
+blocks tip `92f09e80a`). Three blocks needed manual re-base hunks:
+
+1. **Block 03 vs #27970:** 6 fattn-tile.cuh call sites + the
+   `launch_fattn_tile_switch_ncols2` template line (type_KV threading);
+   merged as `need_f16_K, need_f16_V, false, false, warp_size` on each
+   `launch_fattn` call (upstream's `stream_k`/`use_sparse` stay false).
+2. **Block 08 vs #25952:** the rms_norm->mmvq quantize-fold arm now sits
+   after upstream's `GGML_OP_MUL` MoE-reduction arm in
+   `ggml_cuda_try_fuse`.  Also folded into the block-08 commit: the
+   block-08 spec-verify `launch_fattn` call site in fattn-tile.cuh still
+   passed the pre-#27970 3-bool arg list — the `warp_size` int bound
+   into the new `use_sparse` bool slot (compiles; `use_sparse=true`;
+   runtime `GGML_ASSERT(n_kv_max > 0)` in fattn-common.cuh).  Fixed to
+   the 4-bool form; caught by the coherence gate (crash), not the build.
+3. **Block 13 vs #25952:** `disable_moe_mmq` opt-out static + `const int
+   cc` decls at the top of `ggml_cuda_try_fuse` restored after
+   upstream's inserted arm.
+
+Regenerating from the new base folds upstream's changes into the patch
+context, so **`scripts/apply-all.sh` applies all 13 blocks with plain
+`git am` — zero conflicts, zero whitespace warnings** on a fresh checkout
+at `9cffdcc80`. Re-verified end-to-end 2026-09-02: clean-apply sim
+(fresh worktree at `9cffdcc80`, applied tree byte-identical to the fork
+tip `92f09e80a`), full build clean (ROCm 7.14 gfx1201, RCCL+graphs+
+native, zero errors; build note: `EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS="`
+is required with CMake >= 4.3 — the build script's bare `-mllvm`
+swallows the HIP-test-injected `--cuda-host-only`), llama-cli same-seed
+coherence **IDENTICAL between hybrid and RCCL** (3-GPU tensor split,
+Qwen3.5-4B Q8_0). Numbers unchanged (content-identical plus upstream's
+additions).
+
+### Re-baseline to 0eadefebd (2026-09-01)
 
 Fork point moved from `a7cc83bba` to upstream master `0eadefebd` (22
 commits of drift; 3 touching ggml-cuda — XOR-swizzle fattn #25635, radix

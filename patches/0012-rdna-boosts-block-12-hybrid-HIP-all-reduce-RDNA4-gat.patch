@@ -1,4 +1,4 @@
-From 7d5d3f77b52f0048a0fd7a2c73f78d8396284022 Mon Sep 17 00:00:00 2001
+From ee75bb17dabcdd53138f53d487c1f437f5da5a5e Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 03:54:07 -0500
 Subject: [PATCH 12/13] rdna-boosts: block 12: hybrid HIP all-reduce
@@ -1661,10 +1661,10 @@ index 0f2c9518d..4985d969e 100644
 +void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
 +                                 const float * data, int64_t count);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 8b45d941b..24a65620b 100644
+index 08c9cf0c2..42dab06e2 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -1006,6 +1006,15 @@ struct ggml_backend_cuda_comm_context {
+@@ -1007,6 +1007,15 @@ struct ggml_backend_cuda_comm_context {
      }
  };
  
@@ -1680,7 +1680,7 @@ index 8b45d941b..24a65620b 100644
  #ifdef GGML_USE_NCCL
  // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
  // tensors (bandwidth-bound), then converts back to FP32.
-@@ -1028,7 +1037,7 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
+@@ -1029,7 +1038,7 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
  
      // For small tensors, simply reduce them as FP32.
      // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
@@ -1689,7 +1689,7 @@ index 8b45d941b..24a65620b 100644
          for (size_t i = 0; i < n_backends; ++i) {
              if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                  ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-@@ -1090,7 +1099,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
+@@ -1091,7 +1100,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
      GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
  
      const size_t n_backends = comm_ctx->backends.size();
@@ -1698,7 +1698,7 @@ index 8b45d941b..24a65620b 100644
      GGML_ASSERT(tensors[0] != nullptr);
  
      const int64_t   ne   = ggml_nelements(tensors[0]);
-@@ -1170,29 +1179,31 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
+@@ -1171,29 +1180,31 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
      ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
  }
  
@@ -1740,7 +1740,7 @@ index 8b45d941b..24a65620b 100644
      }
  
      const size_t n = ret->dev_ids.size();
-@@ -1200,26 +1211,52 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
+@@ -1201,26 +1212,52 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
      ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
      if (rc == ncclSuccess) {
          ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
@@ -1802,7 +1802,7 @@ index 8b45d941b..24a65620b 100644
  static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
      for (size_t i = 0; i < n_backends; i++) {
          if (!ggml_backend_is_cuda(backends[i])) {
-@@ -1235,37 +1272,55 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
+@@ -1236,37 +1273,55 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
      }
  
      const char * env = getenv("GGML_CUDA_ALLREDUCE");
@@ -1867,7 +1867,7 @@ index 8b45d941b..24a65620b 100644
      return comm_ctx->try_allreduce(comm_ctx, tensors);
  }
  
-@@ -4746,6 +4801,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4903,6 +4958,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  graph->graph = nullptr;
              }
  

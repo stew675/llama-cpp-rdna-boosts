@@ -7,8 +7,8 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
 A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
-(`rdna-boosts` branch) as a **12-patch set** that applies to a clean
-llama.cpp checkout at the fork point **`0eadefebd`** (re-based 2026-09-01; previously `a7cc83bba`).
+(`rdna-boosts` branch) as a **13-patch set** that applies to a clean
+llama.cpp checkout at the fork point **`9cffdcc80`** (re-based 2026-09-02 from `0eadefebd`).
 
 - Blocks **01-11** (`patches/0001-…0011-…`): MTP draft depth, fused chunked
   GDN, BF16 KV, WMMA flash-attn, CPU bit-identical decode, host-buffer
@@ -19,17 +19,19 @@ llama.cpp checkout at the fork point **`0eadefebd`** (re-based 2026-09-01; previ
   per-size hybrid dispatch vs RCCL), **RDNA4-only** (gfx1200/gfx1201; falls
   back to RCCL elsewhere). The fused-stage/pacing experiments it spawned are
   archived, env-gated OFF, in `archive/work/fused-stage-pacing/`.
+- Block **13** (`patches/0013-…-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch`): fused MoE gate+up+GLU MMQ (prefill)
+  + mmvq short-K item-split (decode); see the block-13 notes in `patches/README.md`.
 
 The repo is NOT the fork: the fork (source of truth for the block commits)
-lives at `~/llama.cpp`, branch `rdna-boosts` — re-based 2026-09-01 onto
-upstream master `0eadefebd` (12-commit branch; blocks tip `43084332f`,
-block 12 committed as `7d5d3f77b`; the 2026-08-30 `a7cc83bba`-based
-rebuild — tip `4fa92f0ae` — is superseded and preserved on the
-`rdna-boosts-a7cc83bba` branch; the 2026-08-29 whitespace-clean
-rebuild `12d10267b`/`cc985ba9a` against `17252c769` is also superseded). The
-historical fork state
-(block commits `2b7a135cb..f6f8f6778` + the archived WIP commits, tip
-`155debcdc`) is preserved on the `old-rdna-boosts` branch.
+lives at `~/llama.cpp`, branch `rdna-boosts` — rebuilt 2026-09-02 onto
+upstream master `9cffdcc80` from the delivery patches (13-commit branch;
+blocks `04122bfb5..92f09e80a`). That checkout is disposable and is
+re-created from `patches/` + `scripts/apply-all.sh` whenever it needs
+rebuilding (fresh clone at the fork point + apply). Older fork states are
+preserved on the `stew675/llama.cpp` fork remote (`rdna-boosts` =
+previous tip `482837e5a` on `0eadefebd`; `rdna-boosts-orig`, …) and in
+older local reference clones — never rely on them for the current
+delivery.
 
 ## Pushing policy (MANDATORY — read before any `git push`)
 
@@ -64,20 +66,22 @@ explicitly requests it.**
 | `MANIFESTS.md` | apply order, per-block verification, validation history |
 | `BASELINE.md` | fork point, patch provenance, drift policy |
 | `GREEDY-PURITY.md` | block-10 decode-variance analysis (read before shipping) |
-| `patches/` | **the delivery set** (0001-0011 + 12-hybrid) + apply README |
-| `scripts/apply-all.sh` | the verified apply flow (git am 1-11, git apply 12) |
+| `patches/` | **the delivery set** (0001-0013) + apply README |
+| `scripts/apply-all.sh` | the verified apply flow (git am for blocks 01-13) |
 | `scripts/make-patches.sh` | regenerates the set from the fork |
-| `rdna-boosts-all.patch` | the entire 12-patch net as ONE patch (fork point only) |
+| `rdna-boosts-all.patch` | the entire 13-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs |
-| `wip/` | exploration docs, tuning tools, HANDOFF (session log) |
+| `wip/` | exploration docs, tuning tools, session handoffs — **NOT part of the delivery** (see the WIP rule below) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
 | `archive/work/` | closed experiments, preserved for future re-evaluation |
 | `baseline/*` branches, `block/*` tags | **historical** pre-block-12 checkpoints — do not use for the current delivery |
 
 ## Critical facts (do not re-derive)
 
-- **Apply method:** blocks 01-11 with **`git am`**, block 12 with `git apply`.
-  Plain `git apply` of the concatenated 01-11 series **silently drops
+- **Apply method:** all 13 blocks with **`git am`** (each block is a
+  committed fork commit, exported with `git format-patch`; block 12 is a
+  regular commit like the rest, no special `git apply` step).
+  Plain `git apply` of the concatenated series **silently drops
   hunks** (30 files/2483 lines vs the correct 35/6094 — verified
   2026-08-29). `scripts/apply-all.sh` is the tested path.
 - **Naming collision:** in OLD docs ("block 12" in BASELINE.md's historical
@@ -92,9 +96,8 @@ explicitly requests it.**
   runtime-PM) costs tg -5-7% / pp -15-18% on RCCL/hybrid paths. Server runs
   UNPINNED, 3-GPU (`HIP_VISIBLE_DEVICES=0,1,2`), hybrid default.
 - **The set applies whitespace-clean**: `apply-all.sh` prints no git
-  whitespace warnings (the 8 inert trailing-whitespace lines + 1 EOF blank
-  line were removed at the source 2026-08-29 and the set regenerated;
-  trees are otherwise byte-identical — verified).
+  whitespace warnings (re-verified 2026-09-01 on `0eadefebd` and
+  2026-09-02 on the `9cffdcc80` re-base).
 - **Block 02 (0002) now also carries the MTP chunked-prefix dispatch
   (PR #9, 2026-09-01):** long single-sequence MTP prefills (`K > 1`,
   `n_seqs == 1`, `n_tokens > K+64`) run the chunked WMMA GDN on the
@@ -112,13 +115,23 @@ explicitly requests it.**
   Pre-fix reproduced (GPU-1 memory fault in `ggml_cuda_ar_kernel`);
   post-fix runs clean with teardown dumps on every device; default
   serving is byte-for-byte unchanged.
-- **Verified numbers (2026-09-01 re-base, unchanged):** clean-apply build
+- **Verified numbers (2026-09-02 re-base, unchanged):** clean-apply build
   tg64 38.12 / tg512 41.08; depth-16384 3-GPU hybrid 38.71 t/s
-  (unpinned); 2-GPU (1,2) 31.79.
+  (unpinned); 2-GPU (1,2) 31.79.  The re-base is content-identical plus
+  upstream's additions (42 commits, 2026-09-02) — numbers carry over.
 - The one-sided AR wait (dev0/bus-06 dispatch-gap asymmetry, ~12.7 µs/call)
   is a **platform-level CP/driver property**, not reachable from the AR
   kernel, graph tail, or host-side pacing — fusion/pacing are CLOSED
   (`archive/work/fused-stage-pacing/`).
+- **WIP rule (MANDATORY):** everything under `wip/` — including the loose
+  patch/diff files in `wip/qwen4exp/patches/`,
+  `wip/qwen35moe-prefill/patches/`, `wip/hybrid-allreduce/` and
+  `wip/managed-ngrams/patches/` — is **experimental work, NOT part of the
+  delivery**. Never apply any `wip/` item to the `~/llama.cpp` fork or any
+  llama.cpp checkout, never fold `wip/` content into `patches/`, and never
+  present `wip/` results as delivery claims, **unless the user explicitly
+  asks you to work with a specific `wip/` item**. They are kept for future
+  re-evaluation only.
 
 ## Common tasks
 
@@ -126,8 +139,8 @@ explicitly requests it.**
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 0eadefebd
-bash <this-repo>/scripts/apply-all.sh .     # creates branch rdna-boosts, 12 commits
+git checkout 9cffdcc80
+bash <this-repo>/scripts/apply-all.sh .     # creates branch rdna-boosts, 13 commits
 ```
 
 ### Verify (the coherence gate — mandatory after any change)
@@ -143,24 +156,30 @@ Diff the output against a known-good build (or against RCCL via
 
 ### Regenerate the patches (after fork changes)
 
-`scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `0eadefebd`,
-blocks tip `43084332f`): `git format-patch` the block commits + the
-block-12 delta for the 12th (block 12 is committed as `7d5d3f77b`; the
-script's `git diff <blocks-tip>` picks it up from the clean tree). Then
+`scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9cffdcc80`,
+blocks tip `92f09e80a`): `git format-patch` the block commits (all 13
+blocks are committed fork commits; `git diff <base>..<tip>` yields
+`rdna-boosts-all.patch`). Then
 re-verify the clean-apply simulation (worktree at the fork point,
 apply-all, build, coherence) before committing.
 
 ### Build the fork
 
 ```bash
-cd ~/llama.cpp && BUILD_DIR=build-rocm-hybrid ~/bin/build-llama-rocm-714
+cd ~/llama.cpp && BUILD_DIR=build-rocm-hybrid EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714
 # fast loop: cmake --build build-rocm-hybrid --target llama-cli llama-bench -j 16
 # runtime libs: LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib
 ```
 
+The `EXTRA_CMAKE_FLAGS` override is required with CMake >= 4.3: the build
+script hardcodes a bare `-DCMAKE_HIP_FLAGS="-mllvm"` (leftover of the
+commented `-mllvm --amdgpu-unroll-threshold-local=600`), and CMake's HIP
+compiler test now injects `--cuda-host-only` directly after it — the bare
+`-mllvm` swallows it into LLVM option parsing and the configure aborts.
+
 ## What NOT to do
 
-- Do not `git apply` the concatenated 01-11 series (drops hunks).
+- Do not `git apply` the concatenated 01-13 series (drops hunks).
 - Do not hand-edit the committed patches as a permanent drift fix —
   regenerate from the fork (`scripts/make-patches.sh`) and re-verify.
 - Do not mix the historical `baseline/*` branches or `block/*` tags with the
@@ -174,6 +193,10 @@ cd ~/llama.cpp && BUILD_DIR=build-rocm-hybrid ~/bin/build-llama-rocm-714
 - Do not add new WIP experiments to the delivery patch set — WIP stays in
   `wip/` (or `archive/work/` once closed), env-gated OFF, excluded from
   `patches/`.
+- **Never apply anything from `wip/`** (loose patches/diffs, experiment
+trees, tools) to the fork or a llama.cpp checkout, and never fold `wip/`
+content into the delivery — **unless the user explicitly asks for that
+specific `wip/` item** (see the WIP rule under Critical facts).
 
 ## Editing the docs
 

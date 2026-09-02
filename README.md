@@ -7,7 +7,7 @@ WMMA flash-attn, fused core, k-quant boosts, CUDA prefill-graph skip),
 **block 12** (the hybrid HIP all-reduce) and
 **block 13** (fused MoE gate+up+GLU MMQ + mmvq short-K item-split).
 The patches apply to a clean
-llama.cpp checkout at the recorded fork point `0eadefebd` (re-based 2026-09-01; previously `a7cc83bba`).
+llama.cpp checkout at the recorded fork point `9cffdcc80` (re-based 2026-09-02 from `0eadefebd`).
 
 `scripts/apply-all.sh` automates the apply: it creates a fresh `rdna-boosts`
 branch and applies blocks 01-13 with `git am`, one commit each.
@@ -45,22 +45,23 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
 (gfx1200/gfx1201) and falls back to RCCL elsewhere (see
 `patches/README.md` for the gate and env knobs).
 
-## Current state (2026-09-01)
+## Current state (2026-09-02)
 
-- **Fork point (baseline):** llama.cpp master at `0eadefebd` (re-based
-  2026-09-01 from `a7cc83bba`; 22 commits of drift — see `MANIFESTS.md`
-  for the dated re-base record, incl. the block-08 3-way merge vs
-  upstream's #25635/#27466/#27621 CUDA changes).
+- **Fork point (baseline):** llama.cpp master at `9cffdcc80` (re-based
+  2026-09-02 from `0eadefebd`; 42 commits of drift — see `MANIFESTS.md`
+  for the dated re-base record, incl. the block 03/08/13 manual merges
+  vs upstream's #27970 (sparse-fa) and #25952 (fused MoE expert
+  reduction)).
 - **Set:** 13 patches in `patches/` (`0001`-`0013`).
 - **Verified:** clean apply + full build + llama-cli same-seed coherence
-  IDENTICAL to the fork build; tg64 38.12 / tg512 41.08 on the sim build
-  (2026-09-01 re-base; numbers unchanged — the re-base is code-identical
-  to the 2026-08-30 set). Block 13 re-verified 2026-09-01: clean apply,
-  applied tree byte-identical to the fork tip; 1-GPU qwen35moe prefill
-  +5.1% (Q6_K) / +3.6% (Q4_K_M), decode +5.6%, coherence IDENTICAL.
+  IDENTICAL (hybrid vs RCCL, 3-GPU) on the rebuilt fork; the clean-apply
+  sim at `9cffdcc80` applies with zero conflicts/whitespace warnings and
+  its tree is byte-identical to the fork tip (`92f09e80a`). tg64 38.12 /
+  tg512 41.08 and the block-13 numbers are unchanged — the re-base is
+  content-identical plus upstream's additions.
 - **Whitespace-clean apply:** the regenerated set applies with **zero git
-  whitespace warnings** (`git am` 01-13; re-verified
-  2026-09-01 on a fresh checkout at `0eadefebd`).
+  whitespace warnings** (`git am` 01-13; re-verified 2026-09-02 on a
+  fresh checkout at `9cffdcc80`).
 - **Deployment:** 3-GPU hybrid (`HIP_VISIBLE_DEVICES=0,1,2`, unpinned) gives
   depth-16384 decode 38.71 t/s (+21.8% vs 2-GPU). See
   [`patches/README.md`](patches/README.md) for block-12 env knobs and the
@@ -85,11 +86,11 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
 ├── MANIFESTS.md           # apply order, per-block verification, validation history
 ├── BASELINE.md            # fork point, patch provenance, drift policy
 ├── GREEDY-PURITY.md       # block 10 decode-variance analysis (read before shipping)
-├── rdna-boosts-all.patch  # convenience: the entire 12-patch net as ONE patch
+├── rdna-boosts-all.patch  # convenience: the entire 13-patch net as ONE patch
 ├── patches/               # the delivery set: 0001-0013
 │   └── README.md          # apply instructions + block-12 env knobs + server config
 ├── scripts/
-│   ├── apply-all.sh       # the verified apply flow (git am 1-11, git apply 12)
+│   ├── apply-all.sh       # the verified apply flow (git am for blocks 01-13)
 │   └── make-patches.sh    # regenerates the set from the fork (~/llama.cpp)
 ├── benchmarks/            # benchy methodology + v1/v2 results + graphs (dated records)
 ├── wip/                   # exploration docs + tuning tools + HANDOFF (session log)
@@ -101,7 +102,7 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
 > in `archive/docs/` (see also `archive/work/` for the closed experiments).
 > Do not mix them with the current `patches/` files.
 
-## The 12 blocks
+## The 13 blocks
 
 | patch | what |
 |-------|------|
@@ -135,9 +136,9 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
 # 1. fresh clone of llama.cpp, at the fork point
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-git checkout 0eadefebd        # the SHA recorded in patches/README.md
+git checkout 9cffdcc80        # the SHA recorded in patches/README.md
 
-# 2. apply the set (automated; VERIFIED 2026-08-29, re-verified 2026-09-01)
+# 2. apply the set (automated; VERIFIED 2026-08-29, re-verified 2026-09-01 and 2026-09-02)
 bash <path-to-this-repo>/scripts/apply-all.sh .
 #    = git am patches/0001…0013  (one commit per block on a fresh `rdna-boosts` branch)
 
@@ -162,13 +163,13 @@ git add -A && git commit -m "rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + 
 
 ## When upstream master moves
 
-The patches are static against `0eadefebd`. When upstream drifts and hunks
+The patches are static against `9cffdcc80`. When upstream drifts and hunks
 no longer apply, regenerate the whole set from the fork with
 `scripts/make-patches.sh` (needs the `~/llama.cpp` fork checkout, which
-carries the block commits + the block-12 working-tree delta), then update
+carries the block commits), then update
 `patches/README.md` and this README with the new fork point. The old
 `baseline/<sha>`-branch-per-upstream-range workflow was retired when the
-delivery moved to the flat 12-patch set on `main`.
+delivery moved to the flat 13-patch set on `main`.
 
 ## Upstreaming
 

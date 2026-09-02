@@ -1,4 +1,4 @@
-From 43084332f7e8007d23ff9f2d9537d7c3a871511e Mon Sep 17 00:00:00 2001
+From da42e25de6ac50e1aa9f2dd49619ed2868ecedf5 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 11/13] rdna-boosts: block 11: skip CUDA graphs for multi-token
@@ -9,10 +9,10 @@ Subject: [PATCH 11/13] rdna-boosts: block 11: skip CUDA graphs for multi-token
  1 file changed, 10 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index c21c06045..8b45d941b 100644
+index 1c8858997..08c9cf0c2 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4868,6 +4868,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -5025,6 +5025,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      if (!op_timing && graph->is_enabled()) {
          const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
          if (graph_compatible) {
@@ -28,7 +28,7 @@ index c21c06045..8b45d941b 100644
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
  
              if (!graph->warmup_complete) {
-@@ -4890,6 +4899,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -5047,6 +5056,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      cuda_graph_update_required = graph->instance == nullptr;
                  }
              }

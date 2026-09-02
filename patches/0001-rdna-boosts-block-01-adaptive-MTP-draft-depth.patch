@@ -1,4 +1,4 @@
-From b25bc8a9c9877d29c793d44d2ab62709aa52037a Mon Sep 17 00:00:00 2001
+From 04122bfb516b45174fff04409e66274ed282fdea Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 01/13] rdna-boosts: block 01: adaptive MTP draft depth
@@ -19,7 +19,7 @@ Subject: [PATCH 01/13] rdna-boosts: block 01: adaptive MTP draft depth
  create mode 100644 tests/test-speculative-adaptive.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 79405b59e..f141c5981 100644
+index 2669cacd6..5461b9acb 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -363,9 +363,8 @@ common_models_handler common_models_handler_init(const common_params & params, l
@@ -34,7 +34,7 @@ index 79405b59e..f141c5981 100644
  
      const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                             params.speculative.types.end(),
-@@ -1303,6 +1302,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
+@@ -1308,6 +1307,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
              common_params_print_completion(ctx_arg);
              exit(0);
          }
@@ -42,7 +42,7 @@ index 79405b59e..f141c5981 100644
          params.lr.init();
      } catch (const std::invalid_argument & ex) {
          fprintf(stderr, "%s\n", ex.what());
-@@ -4186,6 +4186,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4196,6 +4196,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_RATES"));
  
@@ -72,7 +72,7 @@ index d162a3880..577a43c7f 100644
      return mparams;
  }
 diff --git a/common/common.h b/common/common.h
-index 4e9448bb1..f161b08c1 100644
+index 63d0badd0..5f3e2ed8b 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -169,18 +169,19 @@ enum common_params_sampling_config : uint64_t {
@@ -461,7 +461,7 @@ index ad6612647..30b5f50f1 100644
              const int64_t s_slot = K - t;
  
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index fe3d14ffc..33c511bd3 100644
+index c46377c76..43bdc89df 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -289,6 +289,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
@@ -723,7 +723,7 @@ index 000000000..ea959f223
 +    return 0;
 +}
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index f5477356d..64477c231 100644
+index f78cfb36d..59cc062e0 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1019,7 +1019,10 @@ private:

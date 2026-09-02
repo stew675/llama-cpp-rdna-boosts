@@ -1,8 +1,8 @@
 # rdna-boosts patch set (delivery)
 
-13 patches against the llama.cpp fork point `0eadefebd`
-("qwen4exp: support recurrent state rollback (#28123)"; re-based
-2026-09-01 from `a7cc83bba`):
+13 patches against the llama.cpp fork point `9cffdcc80`
+("server : accept data: URLs for input_video and input_audio (#27735)";
+re-based 2026-09-02 from `0eadefebd`):
 
 | patch | content |
 |---|---|
@@ -23,7 +23,7 @@
 ## Apply (fresh checkout at the fork point)
 
 ```bash
-git checkout 0eadefebd          # or: git apply each patch on a matching tree
+git checkout 9cffdcc80          # or: git apply each patch on a matching tree
 git am patches/000[1-9]-*.patch patches/001[0-3]-*.patch
 ```
 
@@ -33,7 +33,63 @@ concatenated series was observed to silently drop hunks; use `git am`.)
 The set is **whitespace-clean**: applying produces no git whitespace
 warnings (verified 2026-08-29 after the whitespace-clean regeneration,
 re-verified 2026-09-01 on the `0eadefebd` re-base, re-verified 2026-09-01
-with block 13 on the 13-patch series).
+with block 13 on the 13-patch series, re-verified 2026-09-02 on the
+`9cffdcc80` re-base).
+
+## 2026-09-02 re-base to 9cffdcc80 (current)
+
+Upstream master moved **42 commits** past the fork point `0eadefebd`; the
+ggml-cuda-touching ones were `3d3d7c818` (unused-var removals in
+`mmq.cuh`/`mmq-vec-dot.cuh`, #28235), `8e93a9773` (**sparse-fa for
+DSV4/GLM**, #27970 — fattn-tile/fattn-common territory) and `3466812d1`
+(**fused MoE weighted-expert reduction**, #25952 — `ggml_cuda_try_fuse`
+territory), plus common/server arg churn (`e750b887a`).  The fork was
+rebuilt on the new base (`~/llama.cpp` rdna-boosts = `9cffdcc80` +
+blocks `04122bfb5..92f09e80a`) and the set regenerated with
+`scripts/make-patches.sh` (base `9cffdcc80`, blocks tip `92f09e80a`);
+regenerating from the new base folds upstream's changes into the patch
+context, so `scripts/apply-all.sh` is clean again on fresh master.
+
+Three blocks needed manual re-base hunks during the rebuild:
+
+1. **Block 03 vs #27970 (sparse-fa):** upstream added a 4th bool
+   (`use_sparse`) to `launch_fattn`'s arg list and updated the fattn-tile
+   call sites; block 03 rewrites the same sites (type_KV template
+   threading + runtime `need_f16_K`/`need_f16_V`).  Merged: each site
+   passes `need_f16_K, need_f16_V, false, false, warp_size` (upstream's
+   `stream_k`/`use_sparse` slots stay `false`); the
+   `launch_fattn_tile_switch_ncols2` template gained `type_KV`.
+2. **Block 08 vs #25952 (MoE expert reduction):** upstream inserted its
+   `GGML_OP_MUL` weighted-reduction arm into `ggml_cuda_try_fuse` right
+   after `node = cgraph->nodes[i]`; block 08's rms_norm->mmvq
+   quantize-fold arm now sits after it (arms are mutually exclusive on
+   `node->op`, order-independent).  Also folded into the block-08 commit:
+   the block-08-added spec-verify `launch_fattn` call site in
+   fattn-tile.cuh still used the pre-#27970 3-bool arg list, which binds
+   the `warp_size` int into the new `use_sparse` bool slot (compiles;
+   `use_sparse=true`) and aborts at runtime
+   (`GGML_ASSERT(n_kv_max > 0)` in fattn-common.cuh).  Fixed to the
+   4-bool form.
+3. **Block 13 vs #25952:** the block's `disable_moe_mmq` opt-out static +
+   `const int cc` decls at the top of `ggml_cuda_try_fuse` were rejected
+   (context shifted by upstream's inserted arm); restored after the MoE
+   arm.
+
+Re-verified 2026-09-02: clean-apply sim on a fresh checkout at
+`9cffdcc80` (`scripts/apply-all.sh`: **zero conflicts, zero whitespace
+warnings**; applied tree byte-identical to the fork tip `92f09e80a`),
+full build clean (ROCm 7.14 gfx1201, RCCL+graphs+native, zero
+errors), llama-cli same-seed coherence **IDENTICAL between hybrid and
+RCCL** (3-GPU tensor split, Qwen3.5-4B Q8_0).  Numbers are unchanged
+from the 2026-09-01 records — the re-base is content-identical plus
+upstream's additions.
+
+> **Build-environment note:** `~/bin/build-llama-rocm-714` hardcodes
+> `-DCMAKE_HIP_FLAGS="-mllvm"` (a leftover of the commented
+> `-mllvm --amdgpu-unroll-threshold-local=600`).  With CMake >= 4.3 the
+> HIP compiler test appends `--cuda-host-only` right after it, and the
+> bare `-mllvm` swallows it into LLVM option parsing (configure fails).
+> Build with `EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS="` to override.
 
 ## Block 12 notes
 

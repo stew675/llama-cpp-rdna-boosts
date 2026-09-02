@@ -1,4 +1,4 @@
-From 567bd9a5c4e42f4df25218ff1d7a5c2eb14feaf0 Mon Sep 17 00:00:00 2001
+From 750f3996805497440a24d62e17943eebe8334cc8 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 10/13] rdna-boosts: block 10: k-quant-boosts -
@@ -13,10 +13,10 @@ Subject: [PATCH 10/13] rdna-boosts: block 10: k-quant-boosts -
  5 files changed, 325 insertions(+), 18 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 9cc20c427..c21c06045 100644
+index 3039af18c..1c8858997 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4856,13 +4856,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -5013,13 +5013,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
  
@@ -35,10 +35,10 @@ index 9cc20c427..c21c06045 100644
          if (graph_compatible) {
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 diff --git a/ggml/src/ggml-cuda/mmq-vec-dot.cuh b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
-index fd0414e8d..89708176c 100644
+index 0620c12e5..0e99f7b97 100644
 --- a/ggml/src/ggml-cuda/mmq-vec-dot.cuh
 +++ b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
-@@ -343,6 +343,17 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -340,6 +340,17 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
          }
  
@@ -56,7 +56,7 @@ index fd0414e8d..89708176c 100644
  #pragma unroll
          for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
              tile_B B;
-@@ -358,10 +369,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -355,10 +366,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
  
  #pragma unroll
                  for (int l = 0; l < tile_C::ne; ++l) {
@@ -480,10 +480,10 @@ index ec117c57d..0595b329c 100644
  #define VDR_IQ2_XXS_Q8_1_MMQ  2
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index c65007d6f..174744495 100644
+index 1737bb0ef..79923fb8e 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10638,9 +10638,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10765,9 +10765,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -519,7 +519,7 @@ index c65007d6f..174744495 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -10648,8 +10672,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10775,8 +10799,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
