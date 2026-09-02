@@ -848,3 +848,70 @@ tok/s aggregate (0.55 ms/token-equiv vs the 21.9 ms single-seq = 40x);
 the K=16-32 mmvq plateau -> K=64 mmq sweet spot; K<=64 fits the 3x32GB.
 The QSA assert fix (131935dce) is required for any of this and is a real
 unlock for llama-server --parallel on this model.
+
+## UPDATE (debug session 9): multi-seq seq>=1 corruption - narrowed to the (1,2) decode step
+
+REPRODUCER (clean): /tmp/bseq_val with a 1-TOKEN prompt, K=2 (both seqs =
+"Quantum"): PREFILL argmax = 28079 28079 (CORRECT for both seqs - the (1,2)
+geometry works at the prefill); the FIRST DECODE step = SEQ 0: 198 ... vs
+SEQ 1: 6132 ... = seq 1 CORRUPT from the first decoded token. Same-prompt
+K=2: seq 0 = bit-identical to the K=1 run (the 16-position reference still
+holds); seq 1 = garbage. (A /tmp/bsched harness config aborts at the meta
+split assert - harness artifact, use bseq_val.)
+
+EXCLUSIONS (tested, each still corrupts seq 1):
+- LLAMA_FUSED_HC_MIX=0 + LLAMA_FUSED_HC_COMBINE=0 (the hc = unfused at nt=2
+  anyway; the fused ops are nt==1-only).
+- LLAMA_FUSED_GDN=0 (the unfused AR path - the fused op is not the bug).
+- LLAMA_QSA_SPARSE_FA=0 (the dense-mask path - not the sparse-FA kernel).
+- The recurrent-state row reads: s_copy/s_copy_main for the failing decode
+  = IDENTICAL to the working single-seq configs (both read cell 1 for seq 1).
+- The hc_init REPEAT + the RMS_NORM at [2560,4,2] = both CORRECT in
+  isolation on a single device, and the repeat = verified correct in the
+  model run (via an in-compute read of the per-device graph node).
+
+GEOMETRY MAP (measured, P2 = "Quantum computing is", one-position-at-a-time):
+- (n_seq_tokens=1, n_seqs=1): correct. (2,2): correct. (16,2): correct.
+- (1,2): seq 0 correct, seq 1 corrupt - at the PREFILL of a fresh prompt the
+  (1,2) eval is CORRECT (28079 28079); the corruption appears at the (1,2)
+  DECODE step (pos >= 1, i.e. once the per-seq state/KV from a prior step
+  must be read). The bug = the decode step's per-seq READS or a
+  decode-specific kernel path at n_seqs=2, NOT the raw (1,2) geometry.
+
+META-BACKEND FRAGILITIES DISCOVERED (ggml-backend-meta.cpp, this tree's
+custom Meta-TP wrapper - all relevant to the debug):
+1. The tensor READBACK via ggml_backend_tensor_get on meta compute-buffer
+   tensors is UNRELIABLE: the meta double-buffers its per-device simple
+   tensors (stc_compute[0]/[1], flipped at graph rebuild + init_tensor) and
+   the post-eval get reads stc_compute[stc_compute_index], which can be the
+   STALE container. Mid-graph value dumps from llama-context.cpp are
+   garbage; only in-compute reads of the per-device cgraph nodes (right
+   after their subgraph computes) are trustworthy.
+2. The per-subgraph node buffers ALIAS (ggml-alloc reuses them within a
+   graph: the rms output buffer = reused by the up-MM, etc.), so post-
+   subgraph reads of early nodes return later nodes' data.
+3. GGML_ASSERT(i_start == cgraph->n_nodes) at meta:2276 fires for graphs
+   whose tail = host-view nodes (the s_copy_main FIXME at meta:2030) - seen
+   with the scheduler eval callback and some harness configs (bsched).
+
+NEXT STEPS (the remaining suspects, in order):
+1. The QSA KV per-seq reads at the decode (layers 3,7,...,47): at the
+   decode, the attention reads the seq's OWN cells (cell_blk/blk_cells/
+   bias staged host-side per eval in llama_memory_hybrid_idx.cpp
+   set_input_qsa). The prefill at (1,2) = correct (the KV writes + reads
+   within the same eval = fine); the decode (reading cells from the prior
+   eval) = seq 1 corrupt. Compare the set_input_qsa cell lists at the
+   decode for seq 0 vs seq 1 (they must point at each seq's OWN pos-0 cell).
+2. The GDN decode per-seq path at n_seqs=2 (the conv/state machinery):
+   the s_copy rows = correct, but the conv state CONCAT or the per-seq
+   conv/AR layout at n_seq_tokens=1 x n_seqs=2 may still be off.
+3. The llama_kv_cache get_prev_tokens / the PLE n-gram rows at the decode
+   (the PLE fires at layer 1; its rows = hashed from the KV ext.tok per
+   seq - a wrong ext.tok read for seq 1 would corrupt from layer 1).
+
+TOOLS: bseq_val (the clean reproducer; -p PROMPT -p PROMPT ... for K seqs),
+bsched (the geometry map; the I/K/L/M modes), the single-op tests
+(/tmp/rms_test, /tmp/repeat_test). All compile against build-rocm libs.
+STATE: llama.cpp clean @ 131935dce (the QSA assert fix = the multi-seq
+unlock, still the only committed change this campaign). The batch-decode
+prize (K=64 = 1819 t/s aggregate) still gated behind this bug.
