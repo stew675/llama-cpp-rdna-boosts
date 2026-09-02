@@ -299,3 +299,62 @@ single custom op (see how FUSED GATED_DELTA_NET was done in
 ggml-cuda/gated_delta_net.cu for the pattern). The M=1 MV dot (10240-long
 Q8_0 x F32 vector) at full BW ~1.8MB/2us is the easy part; the 4-stream
 collapse math must match bit-for-bit (the logitdump gate).
+
+## UPDATE 2026-09-04 (decode session 1, final): fusion A/B + hc_mix implementation plan
+
+FUSION VALUE A/B (measured): GGML_CUDA_DISABLE_FUSION=1 tg128 = 34.19 +/-
+1.63 vs 39.29 fused -> the existing fusion machinery is worth ~13% of decode.
+The remaining unfused soup (~1712 elementwise nodes) is ~3x the already-
+fused amount -> more fusion is the validated decode lever.
+
+HC_STRUCTURE REFINEMENT (source): the 4-stream (hc=4) width affects ONLY the
+residual res_hc [2560,4,nt] + the mix/combine wrappers. The attention/ffn/
+GDN bodies run on the COLLAPSED 1x-wide mixed [2560,nt] (build_hc_mix
+returns the stream-mean). Per layer: 2x build_hc_mix + 2x build_hc_combine
+= 96 mixes + 96 combines per token. Per mix: RMS[2560x4] -> MUL(w_norm) ->
+LoRA-down MUL_MAT [10240x320 Q8_0, M=1, ~3.4MB read] -> SCALE 1/hc -> SILU
+-> LoRA-up MUL_MAT [320x10240] -> SIGMOID -> MUL -> collapse (cont + 3 ADD)
+-> SCALE 1/hc + inject MUL_MAT [10240x4]. Weight reads: 192 LoRA + ~96
+inject GEMMs/token = ~650MB -> ~0.34ms at 3-GPU aggregate BW (1.3% of
+token; NOT the issue). The issue is the ~8-10 tiny kernels per mix x 96 =
+~700-900 kernels/token with GEMM-broken chains the elementwise fusion pass
+cannot merge (RMS...MUL chains are broken by the LoRA MUL_MATs; the
+collapse cont+3xADD+SCALE sits after the SIGMOID/MUL).
+
+IMPLEMENTATION PLAN (fused HC_MIX op, GDN-style - for the next session):
+1. New GGML op GGML_OP_HC_MIX (ggml.c compute_forward: reference = the
+   exact build_hc_mix op sequence, kept only for the CPU path), 5 inputs:
+   x [n_embd,hc,nt] F32, w_norm [hc_dim] F32, w_down [hc_dim,hc_lr] Q8_0,
+   w_up [hc_lr,hc_dim] Q8_0, w_inject [hc_dim,hc] Q8_0 (nullable), scale
+   = 1/hc as op param. ONE output problem: the model needs BOTH mixed
+   [n_embd,nt] (body input) AND inject [hc,nt] (combine input). Options:
+   (a) HC_MIX writes mixed; keep inject as a separate MUL_MAT node (it is
+   one tiny kernel; the big prize is the 8-node mix chain -> 1); (b) two
+   ops. RECOMMEND (a): fuses RMS+MUL+down+SCALE+SILU+up+SIGMOID+MUL+
+   collapse+SCALE (10 nodes -> 1), leaves the inject MUL_MAT as-is.
+2. HIP kernel (new file ggml/src/ggml-cuda/hc-mix.cu, pattern after
+   gated_delta_net.cu): grid over nt; per token: read x[2560x4], RMS each
+   2560-row stream (bit-exact vs ggml_rms_norm: same eps, same reduce
+   order - check ggml_cuda_rms_norm's reduction), x w_norm (converter
+   folded gamma = 1+w), then the two Q8_0 matrix-vector products
+   (dequant+dot, mirror the mmvq/mul_mat_vec_q8_0 numerics: per-block
+   scale, fp32 accumulate in the same order), silu/sigmoid, gate-mul,
+   collapse = (sum of the 4 streams)/hc into mixed[2560].
+3. The M=1 Q8_0 MV at 3.4MB/lora: launch enough warps to stream the
+   weight at ~full BW; the 320-col x 10240-row down product = 320 dots of
+   10240 - grid (nwarps x 320), each warp a row-dot.
+4. Model-side: replace the build_hc_mix body with the single ggml_hc_mix
+   node (keep build_hc_combine unchanged). The bit-exact gate = logitdump
+   A/B vs the baseline /home/ld1024_base.bin (current build, fusion on).
+5. Second patch (later): extend the elementwise chain-fuser with a
+   REPEAT_4D + MUL + ADD broadcast pattern to eat the 2x/layer combine
+   residual chains (SCALE+SIGMOID+SCALE over [hc] + REPEAT+MUL+ADD over
+   [n_embd,hc] -> 1 kernel), ~96 chains x 4-5 nodes.
+6. Third (config-only, low-risk, parked): mmvq short-K decode config for
+   the routed experts (small prize: 3% of nodes here, unlike qwen35).
+
+Expected prize: the 10-node mix chains are ~25-35% of the decode graph;
+fusing 96 of them saves ~800-900 kernels/token. The 13% fusion baseline
+says per-kernel marginal cost ~5-9us -> potential mid-single-digit to
+~10% decode. MUST verify with the fusion-on A/B (39.29) and logitdump
+before believing any number.
