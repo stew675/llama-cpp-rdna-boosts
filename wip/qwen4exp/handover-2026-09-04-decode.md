@@ -978,3 +978,27 @@ NEXT SESSION (the remaining steps):
    ALSO fix the llama-server --parallel path (the same machinery).
 STATE: llama.cpp clean @ 131935dce. All instrumentation removed. The prize
 (K=64 = 1819 t/s aggregate) still gated behind this bug.
+
+## UPDATE (debug session 9c): the (1,2) ssm_out MM split geometry
+
+SPLIT-STATE of the layer-0 ssm_out MUL_MAT (GGML_META_DEBUG):
+- weight blk.0.ssm_out.weight = NONE, axis 0, segments {640x3, 640x3, 768x3}.
+- src1 final_output-0 = RESHAPE of the node_76 mul output, axis 0, segments
+  {1920x1, 1920x1, 2304x1} (6144 = K split across the 3 devices).
+- output linear_attn_out-0 = MUL_MAT, MIRRORED (assume_sync=true) /
+  PARTIAL (assume_sync=false) - both srcs are axis-0 splits, so the MM =
+  the handle_mul_mat "both axis-0 -> MIRRORED/PARTIAL" case: each device
+  dots ITS K-segment (1920-ish x [K_j,1,2]) and the allreduce sums them.
+- The (1,2) src1 = [6144, 1, 2] = ncols_dst=1 x ne12=2 (the batch/seq
+  dim); the (2,2) = [6144, 2, 2] = ncols_dst=2 x ne12=2. The (1,1) =
+  [6144, 1, 1]. The (1,2) = the ONLY ncols_dst=1 x batch=2 combination.
+- Per-device isolated tests of [K,1,2] mmvq at [10240,320] and [6144,2560]
+  = correct; the bug appears only in the 3-device K-segment + batch-2
+  combination (or the allreduce of the [2560,1,2] partial).
+
+NEXT: dump the three per-device linear_attn_out partials at the (1,2)
+decode (before the allreduce) and compare channel-0 vs channel-1 of each
+device's segment; then inspect the mmvq dispatch/geometry at ncols_dst=1,
+ne12=2 with the per-device K-segments (or the allreduce of the
+[2560,1,2] tensor). The single-seq decode gate (logitdump byte-identical
+vs /home/ld_decode_ref.bin) is unaffected - the (1,2) path is new.
