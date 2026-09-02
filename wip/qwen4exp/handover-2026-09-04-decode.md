@@ -245,3 +245,57 @@ NEXT SESSION FIRST STEPS:
 - Inspect the hc decode path (the ~45% invisible side-stream work): which
   ops run on the 4 hc streams per token and how many.
 - Then pick lever 1 vs 2 vs 3 for the first patch.
+
+## UPDATE 2026-09-04 (decode session 1, continued): the hc machinery is the decode tax
+
+STATIC PER-TOKEN NODE INVENTORY (decode-only op-profile counts /27 evals,
+counts exact - the timing distortion does not affect them):
+- ~2800 graph nodes/token across 3 GPUs; avg ~9-26 us/node, GPUs 97% busy.
+- Elementwise-class 1712/tok (61%): ADD 429, SCALE 356, MUL 264, UNARY 246,
+  CONT 131, REPEAT 86, RMS_NORM 88, GET_ROWS 75, CPY 37.
+- Dense MUL_MAT 486/tok (17%) - the hc LoRA/inject GEMMs are ~4-6 per layer
+  (w_down [10240x320], w_up [320x10240], w_inject [10240x4] at M=1, each
+  reading ~1-2 MB Q8_0) + shared-expert dense + qkv + conv...
+- FUSED (already-merged chains) 553/tok (20%).
+- Routed-expert MUL_MAT_ID only 96/tok (3%) incl. the fused gate.
+- Per delta-net layer the graph has ~50-70 nodes.
+
+SOURCE-LEVEL FINDING (src/models/qwen4exp.cpp): EVERY layer is wrapped in
+2x build_hc_mix + 2x build_hc_combine (the 4-stream hybrid residual, hc=4):
+- build_hc_mix (2x/layer, ~14 nodes each): RMS_NORM -> reshape -> MUL
+  (hc_norm) -> LoRA-MM down [10240x320] -> SCALE 1/hc -> SILU -> LoRA-MM up
+  [320x10240] -> SIGMOID -> MUL -> reshape -> cont+3xADD+SCALE (hc_mixed
+  stream-collapse) + (inject) LoRA-MM [10240x4].
+- build_hc_combine (2x/layer): SCALE+SIGMOID+SCALE -> reshape x2 -> REPEAT_4D
+  -> MUL -> ADD residual (partly pre-fused: FUSED ADD hc_combine in profile).
+- The mix/combine chains are broken by the LoRA GEMMs, so the existing
+  elementwise fusion pass can only partially merge them (that is why 61% of
+  nodes remain unfused elementwise).
+
+WHY qwen4exp decode (25.45 ms/tok, ~2800 nodes) is 2.4x the sibling qwen35
+(10.8 ms/tok, ~923 nodes): the hc 4-stream machinery adds ~40+ tiny
+4-stream-wide elementwise nodes + 4-6 tiny M=1 LoRA/inject GEMMs per layer
+(~48 layers x 2 wraps). qwen35 (no hc) was expert-GEMM-dominated (33%);
+qwen4exp decode is hc-elementwise-dominated (61% of nodes).
+
+CONVERGED TARGET LIST (next patches, evidence-ranked):
+1. ONE fused hc_mix kernel per call (like the FUSED GATED_DELTA_NET op that
+   already exists for the recurrent block): RMS + 2 tiny LoRA MV (M=1) +
+   silu/sigmoid + gate-mul + 4-stream collapse in a single dispatch.
+   Saves ~10-12 nodes x ~96 calls/token (~1000 nodes, ~36% of the graph).
+   The M=1 LoRA GEMMs become full-BW weight streams inside the kernel.
+2. Fuse the second hc_mix (ffn side) the same way (identical shape).
+3. Check whether hc_mix(attn) + attention + hc_mix(ffn) could share the
+   collapse (the reference arch's stream reuse) - architecture-level, risky.
+4. mmvq short-K decode config for the routed experts (config-only, low risk)
+   - smaller prize here (3% of nodes) than the qwen35 model (33%): the
+   decode's expert GEMMs are NOT the qwen4exp bottleneck.
+5. hc_combine residual-chain fusion (already partially fused).
+
+NOTE for the next session: build_hc_mix is called with hc_attn_* and
+hc_ffn_* tensors - a fused op would need a new GGML op + HIP kernel + the
+fused-dispatch machinery, or a graph-level rewrite of build_hc_mix into a
+single custom op (see how FUSED GATED_DELTA_NET was done in
+ggml-cuda/gated_delta_net.cu for the pattern). The M=1 MV dot (10240-long
+Q8_0 x F32 vector) at full BW ~1.8MB/2us is the easy part; the 4-stream
+collapse math must match bit-for-bit (the logitdump gate).
