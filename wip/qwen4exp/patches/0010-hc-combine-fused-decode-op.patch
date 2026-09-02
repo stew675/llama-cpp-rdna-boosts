@@ -1,0 +1,428 @@
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index 38f3866cb..d561e9e37 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -8,10 +8,10 @@ extern "C" {
+ 
+ #define RPC_PROTO_MAJOR_VERSION    6
+ #define RPC_PROTO_MINOR_VERSION    0
+-#define RPC_PROTO_PATCH_VERSION    2
++#define RPC_PROTO_PATCH_VERSION    3
+ 
+ #ifdef  __cplusplus
+-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
++static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+ #endif
+ 
+ #define GGML_RPC_MAX_SERVERS       16
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 69b62ffd8..6f468a55b 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -577,6 +577,7 @@ extern "C" {
+         GGML_OP_FLASH_ATTN_QSA,
+         GGML_OP_INDEXER_TOPK,
+         GGML_OP_HC_MIX,
++        GGML_OP_HC_COMBINE,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2710,6 +2711,21 @@ extern "C" {
+             struct ggml_tensor  * w_up,
+             int64_t               hc);
+ 
++    // hc_combine: fused hyper-connection residual combine (qwen4exp /
++    // Flash-Next decode). residual [n_embd, hc, n_tokens] -> same shape:
++    //   w[c] = 2 * sigmoid(inject[c] / hc)          (per stream)
++    //   out[r, c] = residual[r, c] + block_out[r] * w[c]
++    // which is the SCALE+SIGMOID+SCALE+REPEAT+MUL+ADD chain of
++    // build_hc_combine. The kernel keeps each op's rounding (separate MUL
++    // and ADD results, no FMA contraction) so decode stays bit-exact vs the
++    // unfused chain.
++    GGML_API struct ggml_tensor * ggml_hc_combine(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * residual,
++            struct ggml_tensor  * block_out,
++            struct ggml_tensor  * inject,
++            int64_t               hc);
++
+     // custom operators
+ 
+     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 0209764a2..af893ed90 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1065,10 +1065,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             case GGML_OP_DSV4_HC_POST: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
+-            case GGML_OP_HC_MIX: {
+-                // the mix weights and the normed input are mirrored per device
+-                // (verified on the qwen4exp decode graph); each device runs the
+-                // full op and produces its own local mixed copy.
++            case GGML_OP_HC_MIX:
++            case GGML_OP_HC_COMBINE: {
++                // the hc weights and the per-token tensors are mirrored per
++                // device (verified on the qwen4exp decode graph); each device
++                // runs the full op and produces its own local copy.
+                 GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                 GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                 GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index f540f52af..b433f42f9 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2105,6 +2105,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_hc_mix(params, tensor);
+             } break;
++        case GGML_OP_HC_COMBINE:
++            {
++                ggml_compute_forward_hc_combine(params, tensor);
++            } break;
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2289,6 +2293,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_DSV4_HC_PRE:
+         case GGML_OP_DSV4_HC_POST:
+         case GGML_OP_HC_MIX:
++        case GGML_OP_HC_COMBINE:
+             {
+                 n_tasks = n_threads;
+             } break;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 9ba0eb563..18584f2a3 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12280,3 +12280,70 @@ void ggml_compute_forward_hc_mix(
+             } break;
+     }
+ }
++
++// ggml_compute_forward_hc_combine
++
++// Fused hyper-connection residual combine: out[r, c] = residual[r, c] +
++// block_out[r] * w[c] with w[c] = 2*sigmoid(inject[c]/hc). Reference for the
++// unfused build_hc_combine chain (SCALE, SIGMOID, SCALE, REPEAT, MUL, ADD);
++// used only on the CPU backend.
++static void ggml_compute_forward_hc_combine_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * residual   = dst->src[0];
++    const ggml_tensor * block_out  = dst->src[1];
++    const ggml_tensor * inject     = dst->src[2];
++
++    GGML_ASSERT(residual->type  == GGML_TYPE_F32);
++    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
++    GGML_ASSERT(inject->type    == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type       == GGML_TYPE_F32);
++
++    const int64_t hc       = ggml_get_op_params_i32(dst, 0);
++    const int64_t n_embd   = residual->ne[0];
++    const int64_t n_tokens = residual->ne[2];
++    const int64_t bo_str   = block_out->ne[1];
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int64_t n_elem = n_embd * hc * n_tokens;
++    const int64_t dr     = (n_elem + nth - 1) / nth;
++    const int64_t ir0    = dr * ith;
++    const int64_t ir1    = MIN(ir0 + dr, n_elem);
++
++    const float inv_hc = 1.0f / (float) hc;
++
++    const float * residual_d = (const float *) residual->data;
++    const float * block_d    = (const float *) block_out->data;
++    const float * inject_d   = (const float *) inject->data;
++    float       * dst_d      = (float *) dst->data;
++
++    for (int64_t i = ir0; i < ir1; ++i) {
++        const int64_t r = i % n_embd;
++        const int64_t c = (i / n_embd) % hc;
++        const int64_t t = i / (n_embd * hc);
++        // 2*sigmoid(inject/hc): the 1/hc and 2.0 scales are exact in f32
++        const float w = 2.0f / (1.0f + expf(-inject_d[c + t*hc] * inv_hc));
++        const float b = block_d[r + t*bo_str] * w;
++        dst_d[i] = residual_d[i] + b;
++    }
++}
++
++
++void ggml_compute_forward_hc_combine(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
++
++    switch (dst->src[0]->type) {
++        case GGML_TYPE_F32:
++            {
++                ggml_compute_forward_hc_combine_f32(params, dst);
++            } break;
++        default:
++            {
++                GGML_ABORT("fatal error");
++            } break;
++    }
++}
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index f13148a05..510e19e18 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -110,6 +110,7 @@ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params
+ void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_hc_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_hc_combine(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7bb949e7a..3177b3465 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2485,6 +2485,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_HC_MIX:
+             ggml_cuda_op_hc_mix(ctx, dst);
+             break;
++        case GGML_OP_HC_COMBINE:
++            ggml_cuda_op_hc_combine(ctx, dst);
++            break;
+         case GGML_OP_RWKV_WKV7:
+             ggml_cuda_op_rwkv_wkv7(ctx, dst);
+             break;
+@@ -6064,6 +6067,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_HC_MIX:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_Q8_0 &&
+                 op->src[2]->type == GGML_TYPE_Q8_0 && op->type == GGML_TYPE_F32;
++        case GGML_OP_HC_COMBINE:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+         case GGML_OP_FLASH_ATTN_EXT:
+             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+         case GGML_OP_FLASH_ATTN_QSA:
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+index 202e1d7e1..86dd80cf9 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cu
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -237,3 +237,76 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     }
+ 
+ }
++
++// Fused hyper-connection residual combine for qwen4exp decode (nt == 1).
++// out[r, c] = residual[r, c] + block_out[r] * w[c], with
++// w[c] = 2 * sigmoid(inject[c] / hc) (the SCALE+SIGMOID+SCALE chain of
++// build_hc_combine; the 1/hc and 2.0 scalars are exact in f32 so only the
++// sigmoid rounds). The product block_out[r]*w[c] and the residual add keep
++// their own roundings because the reference runs separate MUL and ADD ops:
++// the products go to an array first so the compiler cannot contract them
++// into FMAs. One thread per row handles the hc columns, mirroring the
++// collapse kernel; w is computed once per block into smem.
++static __global__ void hc_combine_kernel(
++        const float * residual, const float * block_out, const float * inject,
++        float * dst, const int n_embd, const int hc, const int n_tokens) {
++    const float inv_hc = 1.0f / (float) hc;
++
++    __shared__ float w_s[8];
++    if (threadIdx.x < hc) {
++        const float s = inject[threadIdx.x] * inv_hc;
++        w_s[threadIdx.x] = (1.0f / (1.0f + expf(-s))) * 2.0f;
++    }
++    __syncthreads();
++
++    for (int t = 0; t < n_tokens; ++t) {
++        const int r = blockIdx.x*blockDim.x + threadIdx.x;
++        if (r >= n_embd) {
++            return;
++        }
++        const float * res = residual + (int64_t) t*n_embd*hc + r;
++        const float   bo  = block_out[(int64_t) t*n_embd + r];
++        float       * dt  = dst + (int64_t) t*n_embd*hc + r;
++        float pp[8];
++        for (int c = 0; c < hc; ++c) {
++            pp[c] = bo * w_s[c];
++        }
++        for (int c = 0; c < hc; ++c) {
++            dt[c*n_embd] = res[c*n_embd] + pp[c];
++        }
++    }
++}
++
++void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * residual  = dst->src[0];
++    const ggml_tensor * block_out = dst->src[1];
++    const ggml_tensor * inject    = dst->src[2];
++
++    GGML_ASSERT(residual->type  == GGML_TYPE_F32);
++    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
++    GGML_ASSERT(inject->type    == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type       == GGML_TYPE_F32);
++
++    const int hc = ggml_get_op_params_i32(dst, 0);
++    GGML_ASSERT(hc > 0 && hc <= 8);
++
++    const int64_t n_embd   = residual->ne[0];
++    const int64_t n_tokens = residual->ne[2];
++
++    GGML_ASSERT(n_tokens == 1);                 // decode-only fused op
++    GGML_ASSERT(residual->ne[1] == hc);
++    GGML_ASSERT(block_out->ne[0] == n_embd);
++    GGML_ASSERT(inject->ne[0] == hc);
++    GGML_ASSERT(residual->nb[1] == n_embd*sizeof(float));  // contiguous rows
++    GGML_ASSERT(inject->nb[1]   == hc*sizeof(float));
++
++    cudaStream_t stream = ctx.stream();
++
++    const dim3 block_nums((n_embd + 255) / 256);
++    const dim3 block_dims(256);
++    const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
++    ggml_cuda_kernel_launch(hc_combine_kernel, launch_params,
++            (const float *) residual->data, (const float *) block_out->data,
++            (const float *) inject->data, (float *) dst->data,
++            (int) n_embd, hc, (int) n_tokens);
++}
+diff --git a/ggml/src/ggml-cuda/hc-mix.cuh b/ggml/src/ggml-cuda/hc-mix.cuh
+index e7c3ed40f..166350138 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cuh
++++ b/ggml/src/ggml-cuda/hc-mix.cuh
+@@ -2,3 +2,4 @@
+ #include "ggml.h"
+ 
+ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index ecafc3175..d4b2dba6e 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1086,6 +1086,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "FLASH_ATTN_QSA",
+     "INDEXER_TOPK",
+     "HC_MIX",
++    "HC_COMBINE",
+ 
+     "UNARY",
+ 
+@@ -1103,7 +1104,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1204,6 +1205,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "flash_attn_qsa(q, k, v, idx, mask)",
+     "indexer_topk(q, k, weights, mask)",
+     "hc_mix(x, w_norm, w_down, w_up)",
++    "hc_combine(residual, x, inject)",
+ 
+     "unary(x)",
+ 
+@@ -1221,7 +1223,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6651,6 +6653,41 @@ struct ggml_tensor * ggml_hc_mix(
+     return result;
+ }
+ 
++// ggml_hc_combine
++
++struct ggml_tensor * ggml_hc_combine(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * residual,
++        struct ggml_tensor  * block_out,
++        struct ggml_tensor  * inject,
++        int64_t               hc) {
++    GGML_ASSERT(residual->type == GGML_TYPE_F32);
++    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
++    GGML_ASSERT(inject->type == GGML_TYPE_F32);
++    GGML_ASSERT(hc > 0);
++
++    const int64_t n_embd   = residual->ne[0];
++    const int64_t n_tokens = residual->ne[2];
++
++    GGML_ASSERT(residual->ne[1] == hc);
++    GGML_ASSERT(block_out->ne[0] == n_embd);
++    GGML_ASSERT(block_out->ne[1] == n_tokens || block_out->ne[1] == 1);
++    GGML_ASSERT(inject->ne[0] == hc);
++    GGML_ASSERT(inject->ne[1] == n_tokens || inject->ne[1] == 1);
++    GGML_ASSERT(residual->ne[3] == 1);
++
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
++
++    ggml_set_op_params_i32(result, 0, (int32_t) hc);
++
++    result->op     = GGML_OP_HC_COMBINE;
++    result->src[0] = residual;
++    result->src[1] = block_out;
++    result->src[2] = inject;
++
++    return result;
++}
++
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ struct ggml_hash_set ggml_hash_set_new(size_t size) {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 3ea84686f..e83ec7299 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -250,6 +250,15 @@ llama_context::llama_context(
+         }
+     }
+ 
++    cparams.fused_hc_combine = true;
++    {
++        const char * LLAMA_FUSED_HC_COMBINE = getenv("LLAMA_FUSED_HC_COMBINE");
++        if (LLAMA_FUSED_HC_COMBINE) {
++            cparams.fused_hc_combine = atoi(LLAMA_FUSED_HC_COMBINE) != 0;
++            LLAMA_LOG_INFO("%s: fused hc_combine = %d (env)\n", __func__, cparams.fused_hc_combine);
++        }
++    }
++
+     // with causal attention, the batch size is limited by the context size
+     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 1c4f14023..515b82630 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -49,6 +49,7 @@ struct llama_cparams {
+     bool fused_dsv4_hc_post;
+     bool auto_fhc;
+     bool fused_hc_mix;       // use the fused hyper-connection mixer (qwen4exp decode)
++    bool fused_hc_combine;   // use the fused hyper-connection combine (qwen4exp decode)
+     bool no_perf;
+     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
+     bool op_offload;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 255b5f461..f7eac4405 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -285,6 +285,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+     const int64_t hc = hparams.dsv4_hc_mult;
+     const int64_t nt = residual->ne[2];
+ 
++    // decode (nt == 1): fuse the whole residual combine into one dispatch.
++    // The prefill path keeps the unfused chain (its mmq-era numerics are
++    // irrelevant here - combine is elementwise - but the chain must stay
++    // identical for the prefill gates).
++    if (nt == 1 && cparams.fused_hc_combine) {
++        ggml_tensor * cur = ggml_hc_combine(ctx0, residual, block_out, inject, hc);
++        cb(cur, "hc_combine", il);
++        return cur;
++    }
++
+     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
+     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+     w = ggml_scale(ctx0, w, 2.0f);

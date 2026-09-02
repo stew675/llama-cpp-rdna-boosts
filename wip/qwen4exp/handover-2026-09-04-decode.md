@@ -498,3 +498,50 @@ RMS+MUL nodes when inject is absent) would save 2 more dispatches/mix.
   longer produced by the committed kernel - re-add the env dump if needed).
   Reference dumps on /home: ld_decode_ref.bin (decode), ld1024_noflag.bin
   (prefill), ld_decode_final.bin (fused, == ref).
+
+## UPDATE 2026-09-04 (decode session 4): FUSED HC_COMBINE OP LANDED (bit-exact, +4.5% on top of hc_mix)
+
+IMPLEMENTED (llama.cpp qwen4exp branch, on top of bbd976ceb):
+- New GGML op GGML_OP_HC_COMBINE (count 104 -> 105, rpc patch 2 -> 3):
+  fuses the build_hc_combine tail (SCALE inject 1/hc, SIGMOID, SCALE 2,
+  REPEAT of block_out over the hc streams, MUL, ADD residual) into ONE
+  dispatch at nt == 1. 96 calls/token (2 per layer x 48). Decode-only;
+  prefill keeps the unfused chain. Toggle LLAMA_FUSED_HC_COMBINE=0
+  (default on). Touch points mirror the hc_mix op exactly (ggml.h/.c,
+  ggml-cpu ops+dispatch, hc-mix.cu kernel, ggml-cuda.cu dispatch +
+  supports_op, ggml-backend-meta MIRRORED, cparams + context env,
+  qwen4exp.cpp build_hc_combine branch).
+- Kernel: one thread per row, w[c] (hc <= 8) computed once per block into
+  smem. The 1/hc + 2.0 scales are EXACT in f32, so the only value rounding
+  is the sigmoid (inline formula == unary op). Products stored to an array
+  before the residual add -> no FMA contraction (same trap as the mix
+  collapse). BIT-EXACT ON THE FIRST SHOT: decode logitdump A/B identical
+  (16 nt=1 positions, all 96 combines/token) vs /home/ld_decode_ref.bin.
+- SPEED (same build, tg128, 3-GPU tensor): both fused 43.05 +/- 2.57 vs
+  combine-off (mix on) 41.19 +/- 2.40 -> COMBINE GAIN +4.5%. Progression:
+  39.15 (unfused) -> 41.19 (hc_mix) -> 43.05 (mix+combine) = +10% total
+  (23.2 ms/token). pp512 unchanged (1492-1500 both runs; decode-only
+  construction). NOTE: pp512 now reads ~1500, NOT the 1248.54 recorded in
+  session 1 (flag-on build) - discrepancy is pre-fusion/pre-flag-era, NOT
+  this change (both runs of this session agree); re-verify pp on the
+  noflag build if the prefill thread resumes.
+- llama.cpp @ 6a4e2c766 (committed, not pushed). Working tree clean.
+  Boost repo: patch 0010-hc-combine-fused-decode-op.patch + .md, apply-
+  verified clean on parent bbd976ceb.
+- Reference dumps: /home/ld_decode_combine.bin (fused mix+combine, == ref).
+
+NEXT STEPS (ranked):
+1. The remaining per-layer hc soup after mix+combine fusion (from the
+   session-4 op-profile tail): per layer still ~ RMS_NORM + MUL (hc_norm,
+   xn for the fused mix/inject) + the inject MUL_MAT [10240x4] + the
+   ffn/attn body ops. Dropping the RMS+MUL nodes requires folding the norm
+   into the mix op when inject is absent (head only) OR merging the norm
+   into the inject MUL_MAT path - small prize (2 nodes x 97 calls).
+   The bigger remaining items per the visible tail: the ffn/attn body
+   elementwise nodes + the QSA/GDN machinery (see the old small-kernel-
+   tail lever list).
+2. mmvq short-K decode config for the routed experts (config-only).
+3. Server-level batch decode (M>1 kernels) - the biggest untried lever
+   for a serving workload.
+4. Older threads (pre-decode items + ML-Kernel/gpudh review + thread-1
+   prefill pp8192) unchanged.
