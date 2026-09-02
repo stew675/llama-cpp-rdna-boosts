@@ -1,0 +1,204 @@
+diff --git a/ggml/src/ggml-cuda/hc-mix.cu b/ggml/src/ggml-cuda/hc-mix.cu
+index 9c8102e9e..9e6c05180 100644
+--- a/ggml/src/ggml-cuda/hc-mix.cu
++++ b/ggml/src/ggml-cuda/hc-mix.cu
+@@ -23,11 +23,17 @@
+ // (blockDim 1024, warp shuffles then one final warp pass over the 32 warp
+ // sums) and the gamma multiply keeps the rms output's separate rounding, so
+ // xn is bit-identical to the unfused RMS + MUL chain.
+-static __global__ void hc_mix_rms_gamma(
+-        const float * x, const float * w_norm, float * xn,
++// grouped RMSNorm + gamma (the xn stream) with the Q8_1 quantize of xn merged
++// in: one block per stream computes xn then quantizes its own q8_1 groups (the
++// quantize pattern mirrors quantize_q8_1: one warp per 32-value group, amax
++// reduction, d = amax/127, roundf(x/d), sum), so the op runs one fewer kernel.
++// n_embd must be divisible by 32.
++static __global__ void hc_mix_rms_gamma_quant(
++        const float * x, const float * w_norm, float * xn, block_q8_1 * y,
+         const int n_embd, const float eps) {
+     const int c   = blockIdx.x;
+     const int tid = threadIdx.x;
++    const int lane = tid & 31;
+     const float * xs = x + (int64_t) c*n_embd;
+ 
+     float tmp = 0.0f;
+@@ -44,6 +50,23 @@ static __global__ void hc_mix_rms_gamma(
+         const float r = scale * xs[col];
+         xo[col] = r * w_norm[(int64_t) c*n_embd + col];
+     }
++
++    // quantize this stream's q8_1 groups (n_embd/32 groups, one warp each)
++    __syncthreads();
++    const int n_groups = n_embd / 32;
++    for (int g = tid / 32; g < n_groups; g += blockDim.x / 32) {
++        const float xv = xo[g*32 + lane];
++        float amax = fabsf(xv);
++        float sum  = xv;
++        amax = warp_reduce_max<32>(amax);
++        sum  = warp_reduce_sum<32>(sum);
++        const float  d = amax / 127.0f;
++        const int8_t q = amax == 0.0f ? 0 : (int8_t) roundf(xv / d);
++        y[(int64_t) c*n_groups + g].qs[lane] = q;
++        if (lane == 0) {
++            y[(int64_t) c*n_groups + g].ds = make_half2(d, sum);
++        }
++    }
+ }
+ 
+ // One Q8_0 matrix-vector product against the pre-quantized Q8_1 input, rpb =
+@@ -91,45 +114,6 @@ static __global__ void hc_mix_down_dots(
+     }
+ }
+ 
+-// F32 inject product: inject[r] = sum_k w_inject[k, r] * xn[k], replicating the
+-// mul_mat_vec_f numerics for the F32 inject MUL_MAT: float2 pairs, per-thread
+-// acc += v*u over col2 in the tid-stride order, block of 256 threads (the
+-// dispatch's block_size for K = hc_dim), warp_reduce then the zero-padded
+-// warp-sums butterfly. 4 blocks (one per inject row) x 256 threads.
+-static __global__ void hc_mix_inject_f32(
+-        const float * xn, const float * w_inject, float * dst,
+-        const int ncols2) {
+-    const int r   = blockIdx.x;
+-    const int tid = threadIdx.x;
+-
+-    const float2 * x2 = (const float2 *) xn;
+-    const float2 * w2 = (const float2 *) (w_inject + (int64_t) r*2*ncols2);
+-
+-    float sumf = 0.0f;
+-    for (int col2 = tid; col2 < ncols2; col2 += blockDim.x) {
+-        const float2 tmpx = x2[col2];
+-        const float2 tmpw = w2[col2];
+-        sumf += tmpx.x*tmpw.x;
+-        sumf += tmpx.y*tmpw.y;
+-    }
+-
+-    sumf = warp_reduce_sum<32>(sumf);
+-    __shared__ float buf[32];
+-    if (tid < 32) {
+-        buf[tid] = 0.0f;
+-    }
+-    __syncthreads();
+-    buf[tid/32] = sumf;
+-    __syncthreads();
+-    if (tid < 32) {
+-        sumf = buf[tid];
+-        sumf = warp_reduce_sum<32>(sumf);
+-        if (tid == 0) {
+-            dst[r] = sumf;
+-        }
+-    }
+-}
+-
+ // silu(lo/hc) and Q8_1 quantize of the low-rank vector, then the Q8_0 matrix-
+ // vector product w^T v (the "up" dot). The quantize kernel is merged into the
+ // dot kernel: every block quantizes all of v in its prologue (the writes are
+@@ -207,9 +191,46 @@ static __global__ void hc_mix_up_silu_dot(
+ // product (a separate MUL op) and then adds the rounded values. One thread per
+ // output element in (256)-thread blocks so the stream reads coalesce; the adds
+ // follow the graph order (left-to-right ADD chain), then SCALE.
+-static __global__ void hc_mix_collapse(
++// collapse + F32 inject merged into one dispatch: grid = collapse blocks
++// (n_embd/256) + hc inject blocks. Each path is unchanged from its separate
++// kernel (the collapse products are stored before summing - no FMA - and the
++// inject replicates the mmvf float2 accumulation), so the op runs one fewer
++// kernel per call.
++static __global__ void hc_mix_collapse_inject(
+         const float * xn, const float * gate_raw, float * dst,
+-        const int n_embd, const int hc, const float inv_hc) {
++        const int n_embd, const int hc, const float inv_hc,
++        const float * w_inject, float * inject, const int ncols2,
++        const int n_collapse_blocks) {
++    if (blockIdx.x >= n_collapse_blocks) {
++        // inject rows: one 256-thread block per inject row (mmvf numerics)
++        const int r   = blockIdx.x - n_collapse_blocks;
++        const int tid = threadIdx.x;
++        const float2 * x2 = (const float2 *) xn;
++        const float2 * w2 = (const float2 *) (w_inject + (int64_t) r*2*ncols2);
++        float sumf = 0.0f;
++        for (int col2 = tid; col2 < ncols2; col2 += blockDim.x) {
++            const float2 tmpx = x2[col2];
++            const float2 tmpw = w2[col2];
++            sumf += tmpx.x*tmpw.x;
++            sumf += tmpx.y*tmpw.y;
++        }
++        sumf = warp_reduce_sum<32>(sumf);
++        __shared__ float buf[32];
++        if (tid < 32) {
++            buf[tid] = 0.0f;
++        }
++        __syncthreads();
++        buf[tid/32] = sumf;
++        __syncthreads();
++        if (tid < 32) {
++            sumf = buf[tid];
++            sumf = warp_reduce_sum<32>(sumf);
++            if (tid == 0) {
++                inject[r] = sumf;
++            }
++        }
++        return;
++    }
+     const int j = blockIdx.x*blockDim.x + threadIdx.x;
+     if (j >= n_embd) {
+         return;
+@@ -305,19 +326,15 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int rpb_down = calc_rpb(blocks_down);
+     const int rpb_up   = calc_rpb(blocks_up);
+ 
+-    // xn = rms(x) * w_norm: one 1024-thread block per stream (grid hc)
++    // xn = rms(x) * w_norm with the xn Q8_1 quantize merged in (grid hc x 1024)
+     {
+         const dim3 block_nums(hc);
+         const dim3 block_dims(1024);
+         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+-        ggml_cuda_kernel_launch(hc_mix_rms_gamma, launch_params,
+-                x_d, wn_d, xn, (int) n_embd, eps);
++        ggml_cuda_kernel_launch(hc_mix_rms_gamma_quant, launch_params,
++                x_d, wn_d, xn, y_xn, (int) n_embd, eps);
+     }
+ 
+-    // xn -> Q8_1 (same kernel + semantics as the mmvq quantize path)
+-    quantize_row_q8_1_cuda(xn, nullptr, y_xn, GGML_TYPE_Q8_0,
+-            hc_dim, hc_dim, 0, 0, hc_dim, 1, 1, 1, stream);
+-
+     // lo_raw = w_down^T xn: 320 rows x 10240 dots (rpb is always 1 here)
+     if (rpb_down != 1) {
+         GGML_ABORT("hc_mix: unexpected down rpb %d\n", rpb_down);
+@@ -332,15 +349,6 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+                 y_xn, blocks_down);
+     }
+ 
+-    // inject = w_inject^T xn (F32, mmvf numerics) into the dst tail
+-    {
+-        const dim3 block_nums(hc);
+-        const dim3 block_dims(256);
+-        const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+-        ggml_cuda_kernel_launch(hc_mix_inject_f32, launch_params,
+-                xn, (const float *) w_inject->data, inject, (int) (hc_dim / 2));
+-    }
+-
+     // gate_raw = w_up^T v: 10240 rows x 320 dots (short K -> rpb override);
+     // the v = silu(lo/hc) Q8_1 quantize is the kernel prologue
+     {
+@@ -357,13 +365,17 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+         }
+     }
+ 
+-    // mixed = (1/hc) * sum_c xn * sigmoid(gate) at the head of dst
++    // mixed at the dst head + inject at the dst tail in one dispatch: the
++    // collapse blocks (n_embd/256) and the hc inject rows share the grid
+     {
+-        const dim3 block_nums((n_embd + 255) / 256);
++        const int n_collapse_blocks = (int) ((n_embd + 255) / 256);
++        const dim3 block_nums(n_collapse_blocks + hc);
+         const dim3 block_dims(256);
+         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+-        ggml_cuda_kernel_launch(hc_mix_collapse, launch_params,
+-                xn, gate, dst_d, n_embd, hc, 1.0f / (float) hc);
++        ggml_cuda_kernel_launch(hc_mix_collapse_inject, launch_params,
++                xn, gate, dst_d, n_embd, hc, 1.0f / (float) hc,
++                (const float *) w_inject->data, inject, (int) (hc_dim / 2),
++                n_collapse_blocks);
+     }
+ }
+ 
