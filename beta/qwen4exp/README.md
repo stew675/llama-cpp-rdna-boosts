@@ -5,13 +5,6 @@ support work on top of the rdna-boosts core. Status: between WIP and
 Release - the content below is the verified, gated baseline; new work in
 this area starts from these two patches.
 
-## **NOTE**
-
-Qwen Sparse Attention decode scaling was broken (single-CU serial
-attention, decode decaying with context); FIXED 2026-09-03 - see the
-"QSA decode fix" bullet below. The sparse path (default when FA is on)
-now matches the dense path at short context and beats it past ~8K real KV.
-
 ## Contents
 
 Two squashed patch files. They apply IN ORDER on the rdna-boosts core
