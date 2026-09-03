@@ -324,3 +324,46 @@ REMAINING fusion map (from the post-fix op profile, per 48-layer decode):
   real KV; threads/ctx/checkpoints ruled out earlier; sampler + per-token
   slot bookkeeping = the suspects). NEVER HUNTED - the biggest remaining
   single lever toward 50 t/s server-side.
+
+---
+
+## UPDATE 2026-09-03 (host-overhead hunt): the server gap is NOT the decode
+
+llama.cpp commits d9b1ef288 (moe fusion) + 7c7d9eeff (phase instrumentation).
+All measurements on the 3x R9700 tensor-split, user config, bf16 KV.
+
+FINDINGS (each verified by measurement):
+1. The sampler chain is FREE: bseq_pp + the exact server chain (top_k 20,
+   top_p .95, min_p .001, greedy) = 20.33 ms/step = plain bseq. The server's
+   own DEBUG_TIMINGS agree: t_sampl = 0.107 ms, t_post = 0.108-0.148 ms,
+   t_pre = 0.036 ms.
+2. ctx size (102400 vs small) and threads (8 vs 16) = no effect at the
+   bseq level. The prompt CONTENT (cyclic vs real HTML) = no effect (19.6
+   both). llama-cli == llama-server (cli wraps cli_server).
+3. llama-bench tg128 (21.9 ms/tok at KV 0-128) is NOT comparable: it never
+   reaches the steady graph; bseq at the same regime = 20.0.
+4. THE DECODE IS AT PARITY: llama_context::decode in the SERVER = 20.05
+   ms/step steady (last-150 avg, 3000-token run) + sched sync 0.121 =
+   20.16 ms/token - vs bseq 19.6-20.1 at the same real KV. The graph-reuse
+   machinery works (1991/2000 reused; the 12 rebuilds/token-run amortize
+   to nothing). The decode-side fusion + QSA work has reached the floor.
+5. THE REMAINING ~1.0 ms/token (tg 21.15 vs decode 20.16) = the llama-server
+   update_slots LOOP overhead: pre 0.036 + post 0.148 + sampl 0.147 = 0.33
+   measured + ~0.67 ms/token of untimed queue/event-loop churn (the
+   NEXT_RESPONSE task round-trip + the update_slots wakeups + metrics).
+
+PATH TO 50 t/s (20.0 ms/token): the decode is already ~20.0 at low KV
+(19.6-19.9). Options: (a) reduce the server loop overhead - the ~0.67 ms
+untimed churn per token (single-slot fast path / fewer queue round-trips;
+the llama-server hot loop = invasive-ish, upstream-adjacent); (b) squeeze
+the decode below 20 via the remaining small fusions (ffn tail ~0.2-0.4 ms,
+GDN state ops ~0.3 ms) - only meaningful if the loop overhead also drops.
+The mmvq decode-expert config (item a) was measured dead in the decode
+campaign (session 7).
+
+INSTRUMENTATION: LLAMA_DECODE_PHASE_DEBUG=1 prints decode phases
+(balloc_init/mem_update/mctx_ready/ubatch_compute_done/sched_sync) per
+decode from llama-context.cpp; DEBUG_TIMINGS in server-context.cpp (the
+t_pre/t_decode/t_post/t_sampl 5s averages) is compile-time - enable the
+define + rebuild llama-server to use it. Both were reverted to zero-cost.
+Tools: /tmp/bseq_pf = bseq_pp with BSEQ_PROMPT_FILE= real-prompt prefill.
