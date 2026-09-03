@@ -5,6 +5,12 @@ support work on top of the rdna-boosts core. Status: between WIP and
 Release - the content below is the verified, gated baseline; new work in
 this area starts from these two patches.
 
+## **NOTE**
+
+Qwen Sparse Attention is currently broken for scaling at the moment.
+If you are trying this beta work out please use LLAMA_QSA_SPARSE_FA=0
+to disable the QSA path until I get this issue sorted
+
 ## Contents
 
 Two squashed patch files. They apply IN ORDER on the rdna-boosts core
