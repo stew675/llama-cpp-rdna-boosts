@@ -182,3 +182,51 @@ crossover vs dense. Also grab the ppN numbers to confirm prefill parity.
 - PARKED this session: "is MTP (block 01 adaptive draft depth) enabled on the
   qwen4exp paths?" - dropped mid-check; qwen4exp has no graph_mtp and the GGUF
   scan was not completed (no mtp tensors seen in a quick grep of shards 2-4).
+
+---
+
+## RESOLVED 2026-09-03 (session addendum): the sparse decode regression is fixed
+
+Three kernel commits on ~/llama.cpp qwen4exp (behind the two beta-patch
+commits; apply in order, all coherent + gates green):
+
+1. 419370021: stage V in smem for the BF16 QSA FA path. The BF16 branch
+   never wrote V_smem; the VKQ pass re-read every cell's V from L2 once per
+   head-warp. Mirrors the F16/Q8_0 gather. -1.4 ms/step at low ctx, -6 ms at
+   depth (bit-neutral by construction; verified).
+2. ffb9c56f4: slice the QSA top-k walk across gridDim.y at decode. Decode
+   launched ONE block for the whole top-k list = one CU; now slices of 256
+   cells per block with per-slice online softmax + the existing
+   flash_attn_combine_results fixup (exact copy of the dense FA's KV-slice
+   pattern). Bit-identical to the single-block path (verified 0.0 logit
+   delta vs GGML_CUDA_QSA_SLICES=1). Only engages when tokens x streams
+   under-use the GPU (prefill untouched).
+3. 340f4621a: shrink the decode slices to 64 cells (33 blocks at the 2051
+   budget) - dense parity at low ctx, lead past ~8K.
+
+Measured (bseq_pp, bf16 KV, tensor split, steady-state ms/step):
+  real KV    dense    sparse(before)   sparse(after)
+    512       20.2        23.5             20.2
+   2048       20.5        31.9             20.6
+   8192       21.3        32.5             21.1
+  32768       24.3        34.9             23.3
+
+The root-cause note above (2051-cell budget not sparse below ~2K) still
+stands as the architectural reason the OLD kernel decayed; the decay was
+per-cell cost (V re-reads) plus single-CU serialization, both now fixed.
+Debug envs added: GGML_CUDA_QSA_DEBUG (launch geometry), GGML_CUDA_QSA_SLICES
+(override slice count).
+
+Server (user config, ctx 102400, bf16 KV, HTML prompt, temp 0):
+  before: 38.4 t/s start, decaying to 29.2 by 1500 gen (tg_3s), avg ~34.
+  after:  43.2 (warmup) -> 47.5-48, flat ~46.5-47 through 4000 gen, avg
+  46.7. No decay. (Dense server was 46 start -> 43 by 12K; sparse now
+  equals dense at low ctx and beats it at every depth past ~8K real KV.)
+
+REMAINING to 50 t/s server-side (~1.9 ms/step): the decode floor is ~19.5
+ms of MoE/GDN/elementwise + launch tail (bench sparse at short ctx = 20.2
+ms = 49.5 t/s); the server adds ~0.8 ms host overhead (not threads, not
+ctx size, not checkpoint flags). Ranked levers (decode-campaign evidence):
+mmvq decode-expert config (down K=640), kernel-count-reducing fusions,
+server host overhead hunt. The QSA path itself is at parity and no longer
+the constraint.
