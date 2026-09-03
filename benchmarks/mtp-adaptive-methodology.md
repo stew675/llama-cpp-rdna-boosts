@@ -123,6 +123,25 @@ internally-consistent numerics (0.49) and upstream — the draft-vs-verify
 numerics relationship is not depressing acceptance. Fix summary and the
 mechanism in `patches/README.md` (block 13 notes, 2026-09-04).
 
+### MoE multi-GPU — Qwen3.6-35B-A3B-UD Q8_0, tensor split (new baselines, 2026-09-04)
+
+First-ever MoE 2- and 3-GPU rows (no prior baseline existed). Model has the
+nextn/MTP head. Env conventions as `run_sweep.py`: `NCCL_PROXY_CPUSET=8..15`,
+`NCCL_P2P_DISABLE=1`, `GGML_CUDA_DISABLE_GRAPHS=0`, tensor split. Fixed
+13-block build (delivery tip `8f2838d1`). llama-bench: `-t 16 -r 2 -ub 2048
+-p 512 -n 128`; Protocol A MTP: temp 0, seed 42, ctx 32768, bf16 KV,
+predict 512.
+
+| config | tg128 f16 | tg128 bf16 | pp512 f16 | pp512 bf16 | plain (proto A) | draft-mtp | draft acceptance |
+|---|---|---|---|---|---|---|---|
+| 2-GPU (0,2) | 97.63 | 97.50 | 4603 | 5009 | 91.2 | 125.1 | 0.542 |
+| 3-GPU (0,1,2) | 103.17 | 102.91 | 4770 | 4764 | 96.6 | 124.6 | 0.529 |
+
+MoE decode scales weakly across GPUs at batch 1 (expert compute per token;
+tensor split cannot share experts) — 2-GPU ~= 1-GPU Q6_K (~98), 3-GPU ~103.
+MTP accelerates at both splits (+37% 2-GPU, +29% 3-GPU) with acceptance
+~0.53 — the hybrid-AR + MTP combination is healthy on multi-GPU.
+
 ### MoE single-token decode anchors (MTP-free, for reference)
 
 Canonical commands in `wip/qwen35moe-prefill/bench-config.md`. Recorded
@@ -142,3 +161,6 @@ baseline (2026-09-02, fork tip) vs fixed 13-block (2026-09-04):
    at draft depth 3 with fusion ON vs `GGML_CUDA_DISABLE_FUSION=1` and
    compare acceptance (must match within noise; a 0-acceptance split = the
    fused multi-token path diverged again).
+4. MoE multi-GPU MTP (2-GPU 0,2 and 3-GPU 0,1,2, Q8_0-UD): draft-mtp vs
+   plain Protocol A rows — acceptance ~0.53 and MTP >= plain at both
+   splits (baselines in the MoE multi-GPU table above).
