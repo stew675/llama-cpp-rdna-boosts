@@ -597,3 +597,33 @@ This supersedes the earlier v0-v4 ladder as the policy DESIGN: the prior
 supplies the resident tier, the split boundary supplies the dynamic tier,
 and neither needs a live heatmap/decay/cadence machinery unless the
 measurement shows the resident set must drift within a session.
+
+---
+
+## PHASE 0 MEASUREMENT COMPLETE (2026-09-04): routing profile results
+
+See wip/qwen4exp/PHASE0_ROUTING.md for the full data.  Summary:
+
+- Instrumentation (env LLAMA_ROUTE_DUMP, scratch-only) validated and used to
+  capture per-layer top-10 expert routing for 3 workloads x 600 tokens + one
+  2000-token run, all at real KV on the 3x R9700.
+- THE HEADLINE: Qwen3.8-Flash-Next-UD routing is NOT heavy-tailed.  2000 decode
+  tokens touch 355-487 of 512 experts per layer (layer 0: 487); windows drift
+  with no settling core.  The GPT-OSS-120B evidence (15-20%/80%) does not
+  transfer.  Likely cause: load-balancing aux loss in training.
+- Even ORACLE resident sets need S>=320 (62% of experts) for <0.25 miss/layer/
+  token.  Prompt and workload priors are 3-6x worse than oracle (routing drifts
+  with content: the HTML spec routes differently from the generated code).
+- Reactive LRU floors at the one-shot-tail arrival rate (~0.2-0.5 miss/layer/
+  token) regardless of S.
+- Q8_0-feasible resident budget S ~ 240-260/layer -> ~0.5 miss/layer/token ->
+  ~115 MB/token H2D = 2.3 ms serialized, ~6 GB/s sustained -> potentially
+  hidden inside the ~20 ms decode IF per-miss copies (0.1 ms each) never stall
+  a layer.  That stall question is now the ONLY real unknown.
+- The 80/20 resident+dynamic premise (Amendment 3) is retracted on this model:
+  a fixed resident tier does not beat pure adaptive LRU at feasible S.  The
+  useful design = LARGE adaptive cache + async H2D cold fill, no static plant.
+- Next: (b) prototype the decode-stall question (async slot fill of the
+  current step's cold experts in the harness) to settle feasibility before any
+  loader/graph work; (a) re-verify on a real Q8_0 file when one exists; (c)
+  re-derive the quality/perf trade (Q8_0 at ~95% Q4_K_XL speed, not 1.7-2.1x).
