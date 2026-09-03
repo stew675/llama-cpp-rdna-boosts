@@ -552,3 +552,48 @@ work then = whatever the measurement says is the minimum.
 The educated guess is cheap and load-bearing: an expert set planted from
 the prompt's own routing requires no heatmap, no decay constants, no
 cadence - it is a per-request byproduct of work the decode does anyway.
+
+---
+
+## AMENDMENT 3 (pre-compaction): the two-tier slot partition (the actual design)
+
+Fully clarified design goal: RANK the experts by importance, then PARTITION
+the slot space: ~80% = the resident core (the high-importance experts,
+planted from the prior), ~20% = the dynamic swap tier (on-the-fly
+admission). This bounds the problem: no attempt to dynamically manage all
+of VRAM - derive a good tuned guess for the resident core and leave a small
+managed margin for drift.
+
+Concrete shape:
+- dst_hot per device = [K_seg x out x S] where S = resident_S + dynamic_S
+  (e.g. 80/20). ONE tensor, ONE mmid path, fixed shapes (replay-safe) -
+  the partition is purely a policy distinction over which experts occupy
+  which slots.
+- RESIDENT tier (slots 0..resident_S-1): the ranked core. Ranked by the
+  prompt-routing prior (per-request) and/or the workload sidecar. Refreshed
+  only when the prior is re-derived (per request / session boundary) -
+  effectively static during a generation. Swap traffic ~ zero.
+- DYNAMIC tier (slots resident_S..S-1): admit-on-miss LRU (SLRU-lite) at
+  the split boundary. Absorbs the tail + the working-set drift. Bounded
+  churn: at a ~90%+ resident-hit rate only a few percent of steps miss,
+  each miss = one ~5 MB H2D (gate_up + down) into a dynamic slot.
+- The ranking quality decides the resident hit rate; the dynamic tier
+  covers the residual. The Phase-0 measurement = the coverage curve (which
+  S_resident reaches 90/95/99% routing-mass coverage per layer) + the
+  drift rate (how much the dynamic tier must absorb). The "tuned guess" =
+  S_resident + the membership list per layer, and the tuning is a sidecar
+  parameter, not code.
+- Eviction within the dynamic tier: recency-first with a frequency guard
+  (an expert seen twice in the dynamic window promotes toward the resident
+  side at the next re-rank; a one-touch expert never displaces a resident).
+  The resident tier is only re-ranked between requests.
+- Why 80/20 works: the heavy tail means the resident core does most of the
+  work; the dynamic margin exists so a mis-ranked or drifting workload
+  still runs at full speed instead of thrashing. The ratio is a tunable
+  (fit-driven: resident_S from the coverage curve, dynamic_S from the
+  measured miss budget x the H2D latency).
+
+This supersedes the earlier v0-v4 ladder as the policy DESIGN: the prior
+supplies the resident tier, the split boundary supplies the dynamic tier,
+and neither needs a live heatmap/decay/cadence machinery unless the
+measurement shows the resident set must drift within a session.
