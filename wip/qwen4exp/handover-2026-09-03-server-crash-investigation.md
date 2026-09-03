@@ -122,3 +122,41 @@ llama-server --model <UD-Q4_K_XL> --alias Qwen3.8-Flash-Next-Q4_K_XL \
 - The prefill thread (pp8192), ML-Kernel/gpudh review vs TP-V1, v_shifted
   probe, splitter->F32, meta import gates, multi-device sync in
   meta_tp_test, GDN state fold (decode ~1.5-3%).
+
+## UPDATE 2026-09-03 (session): baseline re-established - the COLD-CACHE HUMP
+
+STATE: llama.cpp qwen4exp @ 236002e4a, clean, build current (incremental
+make only relinked the server/cli tools; core libs already at HEAD). No
+stale llama processes; GPUs 0-2 clean (~60 MiB used). Manual DPM applied
+(tune_r9700.sh current config = -85 mV / 265 W, was -70 mV / 250 W in the
+decode-era notes). Machine idle (load ~1.6, firefox only).
+
+THE HUMP (NEW LESSON - do not get caught again): on this model (104 GiB,
+lazily mmapped, ~27 GiB/device in CPU-mapped host buffers), a fresh perf
+run with a cold page cache pays DISK page-ins on the first evals, and the
+hit is per-eval and DETERMINISTIC (tight error bars do NOT mean the number
+is right). Measured on 2026-09-03 with ~28 GB of the file still on disk:
+- pp512 = 351.33 +- 0.36 t/s, tg128 = 41.38 +- 1.76 t/s (both misleadingly
+  tight) = the cold-cache artifact, NOT a regression.
+- After warming the 4 shards into the page cache (dd read, ~19 s; added
+  ~28 GB to Cached): pp512 = 1552.58 +- 7.53, pp2048 = 2002.93 +- 5.92,
+  pp8192 = 2023.55 +- 1.01, tg128 = 45.73 +- 2.18 (one load, -r 3).
+BASELINE VERDICT: tg128 45.73 ~= the 45.56-45.63 pre-rebase decode ref and
+pp512 1552 ~= the ~1500 ref -> the decode/perf work survived the rebase.
+pp8192 at 2024 = the thread-1 prefill target (~2000) is intact. (The
+1248.54 pp512 recorded in decode-session-1 was the flag-on build era; the
+noflag build measures ~1500-1550.)
+
+GATE FOR ANY FUTURE PERF RUN: warm the model file first (dd/cat the 4
+shards to /dev/null) or treat the first bench as warmup. This almost
+certainly explains the "slowness" half of the original llama-server report:
+a fresh server process on a cold cache degrades exactly like that.
+
+NEXT: the llama-server work - the bench-vs-server disjoint. First
+discriminator planned: llama-bench at -c 16384 / -c 102400 (bf16 KV to
+match the server) vs the server's own numbers, to separate a context-length
+tax in the model/memory path from a server-specific (threads/pinning/
+mlock/NCCL/checkpoint) effect. The handover's own base-config numbers hint
+at a ctx tax already: ~38.8 t/s at ctx 16K vs ~22 t/s at ctx 102400 on the
+server; if llama-bench shows the same ctx dependence, the "disjoint" is the
+KV-length-proportional decode cost, common to both tools.
