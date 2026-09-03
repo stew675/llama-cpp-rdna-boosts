@@ -8,8 +8,9 @@ The **current delivery** is a **13-patch set** against the fork point
 `9cffdcc80` (re-based 2026-09-02 from `0eadefebd`): blocks 01-13
 (`patches/0001-…0013-…`, format-patch of the
 fork's `rdna-boosts` block commits — the re-based regeneration
-`04122bfb5..92f09e80a` against `9cffdcc80`; the previous
-`0eadefebd`-based regeneration `b25bc8a9c..482837e5a` is superseded
+`04122bfb5..8f2838d1` against `9cffdcc80`; block 13 was amended
+2026-09-04 with two MTP regression fixes, see the dated record below; the
+previous `0eadefebd`-based regeneration `b25bc8a9c..482837e5a` is superseded
 and preserved on the fork's history/remotes). Apply flow: `git am`
 for the whole 01-13 series (plain `git apply` of the concatenated series
 SILENTLY DROPS HUNKS — verified 2026-08-29);
@@ -17,7 +18,7 @@ SILENTLY DROPS HUNKS — verified 2026-08-29);
 applying produces zero git whitespace warnings (verified 2026-08-29,
 re-verified 2026-09-01 on the `0eadefebd` re-base, re-verified with block
 13 on the 13-patch series 2026-09-01, re-verified on the `9cffdcc80`
-re-base 2026-09-02).
+re-base 2026-09-02, re-verified after the 2026-09-04 block-13 amendment).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -74,7 +75,7 @@ silently drops hunks.
 
 ## Verified apply sequence
 
-### Re-baseline to 9cffdcc80 (2026-09-02, current)
+### Re-baseline to 9cffdcc80 (2026-09-02)
 
 Upstream master moved **42 commits** past the fork point `0eadefebd`; 3
 touching ggml-cuda — `3d3d7c818` (unused-var removals, #28235),
@@ -117,6 +118,40 @@ swallows the HIP-test-injected `--cuda-host-only`), llama-cli same-seed
 coherence **IDENTICAL between hybrid and RCCL** (3-GPU tensor split,
 Qwen3.5-4B Q8_0). Numbers unchanged (content-identical plus upstream's
 additions).
+
+### Block-13 MTP regression fixes (2026-09-04, current)
+
+Block 13 (the fork's block-13 commit, amended in place) now carries two
+regression fixes found by the adaptive-MTP investigation of 2026-09-04:
+
+1. **Dense MTP/verify decode collapse** (`mmvq.cu`): the block-13 mmvq
+   item-split kernel + RDNA rows_per_block override is register-bound at
+   multi-token decode batches (ncols 2..8 = the speculative verify step;
+   `tmp[ncols_dst][rpb]` fan-out).  Fix: re-add the pre-block-13 K-split
+   kernel as `mul_mat_vec_q_ksplit` and dispatch ncols 2..8 + long-K
+   (K >= 4096) ncols==1 rows to it.  Dense qwen35 27B Q4_K_XL adaptive-MTP
+   18.3 -> 27.5 t/s (output bit-identical to the 12-block build); plain
+   decode 29.0 -> 30.1 (+3.1-3.7% at d0/d16384/d65536).
+2. **MoE MTP verify-numerics collapse** (`ggml-cuda.cu` try_fuse arm): the
+   block-08 rms_norm->mmvq Q8_1 quantize-cache fold corrupts multi-token
+   MUL_MAT_ID (the moe kernel consumes the cached Q8_1 y wrongly), so MoE
+   verify-batch logits diverge from single-token decode and MTP draft
+   acceptance collapses to 0/1527 (draft-mtp 53 vs plain 90 t/s on
+   qwen35moe-A3B Q4_K_M-UD; upstream accelerates +51%).  Fix: gate the
+   fold to single-token MMID (ne[2]==1) and plain MUL_MAT consumers.
+   MoE acceptance restored to 0.51 (== fully-unfused 0.49 == upstream
+   0.49), draft-mtp 119-129 t/s vs upstream ~110-113; MoE plain decode
+   and the single-token fusion gains unchanged; dense unaffected.
+
+Re-verified end-to-end 2026-09-04 after the amendment: set regenerated
+from the fork (`scripts/make-patches.sh`, base `9cffdcc80`, blocks tip
+`8f2838d1`), clean-apply sim at `9cffdcc80` (git am clean, zero
+whitespace warnings, applied tree byte-identical to the fork tip),
+build clean, dense same-seed coherence identical, MoE MTP sanity on the
+sim build (acceptance 0.54, 128 t/s).  The adaptive-MTP baseline gate +
+numbers now live in `benchmarks/mtp-adaptive-methodology.md` (the
+decode-only suites cannot see MTP regressions — verify batches ncols 2..13
+and the draft context are never exercised there).
 
 ### Re-baseline to 0eadefebd (2026-09-01)
 
@@ -350,9 +385,10 @@ run-to-run noise, no measurable impact from the bounded-spin fix.
 | 10 | `./bin/test-backend-ops -b ROCm0` (MUL_MAT + MUL_MAT_ID q4_K/q5_K cases) + Q4_K/Q5_K/Q8_0 decode on gfx1201; RDNA3_5 table: Q8_0 decode on gfx1151 | 54/54 MUL_MAT, 76/76 MUL_MAT_ID OK |
 | 11 | build + prefill perf A/B on gfx1201 (pp128/256/512 vs longer) | decode unchanged; prefill +6-18% for single-ubatch (pp <= ~512), neutral (~0.1%) beyond |
 | 12 | llama-cli same-seed coherence (2- and 3-GPU) + depth-16384 decode A/B (hybrid vs nccl vs internal) | same-seed output IDENTICAL to RCCL; 3-GPU hybrid 38.71 t/s (unpinned) at depth-16384; tg64 38.12 / tg512 41.08 |
+| 13 | `test-backend-ops` MUL_MAT_ID_FUSION sweep (bs 1/4/512; 16222/16222) + MoE decode perf; **MTP regression gate** — `benchmarks/mtp-adaptive-methodology.md` protocol A on the dense Q4_K_XL-UD and MoE Q4_K_M-UD (seed-42: draft acceptance > ~0.45, draft-mtp >= plain at depth 3) | fused types pass; Q6_K tg128 >= 97.6; dense mtp 27.5 / plain 30.1; MoE acceptance 0.51, draft-mtp 126 t/s |
 
-Convenience: `rdna-boosts-all.patch` (repo root) is the entire 12-patch net
-as ONE patch (applies cleanly on `0eadefebd` alone; not a substitute for the
+Convenience: `rdna-boosts-all.patch` (repo root) is the entire 13-patch net
+as ONE patch (applies cleanly on `9cffdcc80` alone; not a substitute for the
 per-block flow in `patches/` when you want reviewable increments).
 
 

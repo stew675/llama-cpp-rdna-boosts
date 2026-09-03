@@ -26,10 +26,13 @@ All 13 patches are generated against **llama.cpp upstream master at
 `9cffdcc80`** (re-based 2026-09-02 from `0eadefebd`; dated records at the
 bottom of this file): blocks 01-13 = the fork's `rdna-boosts` block
 commits (the current 13-commit branch on `9cffdcc80` is
-`04122bfb5..92f09e80a`; the previous `0eadefebd`-based
+`04122bfb5..8f2838d1`; block 13 amended 2026-09-04 with two MTP
+regression fixes — see `MANIFESTS.md` / `patches/README.md` block-13
+notes; the previous `0eadefebd`-based
 regeneration `b25bc8a9c..482837e5a` is superseded and preserved on the
 fork remote's history).
-`scripts/make-patches.sh` regenerates both. Verified 2026-09-02: clean
+`scripts/make-patches.sh` regenerates both. Verified 2026-09-02 and
+re-verified 2026-09-04 after the block-13 amendment: clean
 apply (`git am` 01-13) on a fresh checkout at
 `9cffdcc80`, full build clean, llama-cli same-seed coherence IDENTICAL
 (hybrid vs RCCL) — and the
@@ -73,7 +76,8 @@ validation:
 
 The CURRENT delivery patches (0001-0013) are the fork's `rdna-boosts` block
 commits exported with `git format-patch` (one commit per block, the
-re-based set against `9cffdcc80`: `04122bfb5..92f09e80a`; previously the
+re-based set against `9cffdcc80`: `04122bfb5..8f2838d1`, block 13
+amended 2026-09-04 with the two MTP regression fixes; previously the
 re-based set against `0eadefebd`: `b25bc8a9c..a14257996`;
 re-based regeneration `4c0f30dec..8fbf10e5b` against `a7cc83bba`; the
 whitespace-clean regeneration `3209e83b4..cc985ba9a` against
@@ -97,7 +101,7 @@ to apply against a newer upstream master:
    than one block needs manual re-base hunks, regenerate the whole set from
    the fork with `scripts/make-patches.sh` (re-exports blocks 01-13 from
    `9cffdcc80..<blocks-tip>`; defaults target
-the current blocks tip `92f09e80a`), then re-verify the clean-apply
+the current blocks tip `8f2838d1`), then re-verify the clean-apply
 simulation (fresh worktree at the new fork point, `scripts/apply-all.sh`,
 build, coherence) and update the fork point + verification numbers in
 `patches/README.md` and `README.md`.

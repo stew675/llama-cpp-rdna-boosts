@@ -2,7 +2,9 @@
 
 13 patches against the llama.cpp fork point `9cffdcc80`
 ("server : accept data: URLs for input_video and input_audio (#27735)";
-re-based 2026-09-02 from `0eadefebd`):
+re-based 2026-09-02 from `0eadefebd`; block 13 amended 2026-09-04 with
+two MTP regression fixes — see the block-13 notes below and
+`../benchmarks/mtp-adaptive-methodology.md` for the MTP baseline gate):
 
 | patch | content |
 |---|---|
@@ -18,7 +20,7 @@ re-based 2026-09-02 from `0eadefebd`):
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate |
-| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; see block 13 notes below |
+| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-04 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); see block 13 notes below |
 
 ## Apply (fresh checkout at the fork point)
 
@@ -34,7 +36,7 @@ The set is **whitespace-clean**: applying produces no git whitespace
 warnings (verified 2026-08-29 after the whitespace-clean regeneration,
 re-verified 2026-09-01 on the `0eadefebd` re-base, re-verified 2026-09-01
 with block 13 on the 13-patch series, re-verified 2026-09-02 on the
-`9cffdcc80` re-base).
+`9cffdcc80` re-base, re-verified 2026-09-04 after the block-13 amendment).
 
 ## 2026-09-02 re-base to 9cffdcc80 (current)
 

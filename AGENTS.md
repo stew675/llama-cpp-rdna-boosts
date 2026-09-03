@@ -21,11 +21,18 @@ llama.cpp checkout at the fork point **`9cffdcc80`** (re-based 2026-09-02 from `
   archived, env-gated OFF, in `archive/work/fused-stage-pacing/`.
 - Block **13** (`patches/0013-…-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch`): fused MoE gate+up+GLU MMQ (prefill)
   + mmvq short-K item-split (decode); see the block-13 notes in `patches/README.md`.
+  Amended 2026-09-04 with two regression fixes folded into the block: (1) the
+  mmvq item-split/rpb kernel collapse of multi-token decode batches (ncols 2..8,
+  the speculative verify step — dense MTP 18.3 -> 27.5 t/s, ksplit dispatch);
+  (2) the rms_norm->mmvq Q8_1-cache fold corrupting multi-token MUL_MAT_ID
+  (MoE MTP acceptance 0 -> 0.51, draft-mtp 53 -> 126 t/s, fold gated to
+  single-token MMID).  Details + numbers: `patches/README.md` block-13 notes.
 
 The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts` — rebuilt 2026-09-02 onto
-upstream master `9cffdcc80` from the delivery patches (13-commit branch;
-blocks `04122bfb5..92f09e80a`). That checkout is disposable and is
+upstream master `9cffdcc80` from the delivery patches, block 13 amended
+2026-09-04 with the two MTP regression fixes (13-commit branch;
+blocks `04122bfb5..8f2838d1`). That checkout is disposable and is
 re-created from `patches/` + `scripts/apply-all.sh` whenever it needs
 rebuilding (fresh clone at the fork point + apply). Older fork states are
 preserved on the `stew675/llama.cpp` fork remote (`rdna-boosts` =
@@ -70,7 +77,7 @@ explicitly requests it.**
 | `scripts/apply-all.sh` | the verified apply flow (git am for blocks 01-13) |
 | `scripts/make-patches.sh` | regenerates the set from the fork |
 | `rdna-boosts-all.patch` | the entire 13-patch net as ONE patch (fork point only) |
-| `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs |
+| `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `wip/` | exploration docs, tuning tools, session handoffs — **NOT part of the delivery** (see the WIP rule below) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
 | `archive/work/` | closed experiments, preserved for future re-evaluation |
@@ -119,6 +126,22 @@ explicitly requests it.**
   tg64 38.12 / tg512 41.08; depth-16384 3-GPU hybrid 38.71 t/s
   (unpinned); 2-GPU (1,2) 31.79.  The re-base is content-identical plus
   upstream's additions (42 commits, 2026-09-02) — numbers carry over.
+- **Block-13 MTP regression fixes (2026-09-04, folded into block 13):**
+  (1) dense adaptive-MTP collapse — the block-13 mmvq item-split/rpb kernel
+  is register-bound at multi-token decode batches (ncols 2..8 = the spec
+  verify step); fixed by re-adding the pre-block-13 K-split kernel as
+  `mul_mat_vec_q_ksplit` for ncols 2..8 + long-K (K >= 4096) ncols==1 rows
+  (dense MTP 18.3 -> 27.5, plain 29.0 -> 30.1, output bit-identical to the
+  12-block build).  (2) MoE MTP collapse — the block-08 rms_norm->mmvq Q8_1
+  quantize-cache fold corrupts multi-token MUL_MAT_ID (moe kernel consumes
+  the cached y wrongly), so MoE verify logits diverge from single-token
+  decode and MTP acceptance collapses to 0; the fold is now gated to
+  single-token MMID + plain MUL_MAT consumers (MoE acceptance 0 -> 0.51,
+  draft-mtp 53 -> 126 t/s vs upstream ~113).  MoE MTP had no baseline data
+  — that is why it slipped; the MTP gate now lives in
+  `benchmarks/mtp-adaptive-methodology.md`.  Verify decode changes with
+  Protocol A there (acceptance must stay > ~0.45, MTP >= plain at depth 3)
+  before relying on llama-bench numbers.
 - The one-sided AR wait (dev0/bus-06 dispatch-gap asymmetry, ~12.7 µs/call)
   is a **platform-level CP/driver property**, not reachable from the AR
   kernel, graph tail, or host-side pacing — fusion/pacing are CLOSED
@@ -157,7 +180,7 @@ Diff the output against a known-good build (or against RCCL via
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9cffdcc80`,
-blocks tip `92f09e80a`): `git format-patch` the block commits (all 13
+blocks tip `8f2838d1`): `git format-patch` the block commits (all 13
 blocks are committed fork commits; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`). Then
 re-verify the clean-apply simulation (worktree at the fork point,

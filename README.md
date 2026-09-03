@@ -5,7 +5,9 @@ A delivery repo for a **13-patch set** of **RDNA3 / RDNA3.5 / RDNA4**
 **blocks 01-11** (MTP, GDN, BF16 KV,
 WMMA flash-attn, fused core, k-quant boosts, CUDA prefill-graph skip),
 **block 12** (the hybrid HIP all-reduce) and
-**block 13** (fused MoE gate+up+GLU MMQ + mmvq short-K item-split).
+**block 13** (fused MoE gate+up+GLU MMQ + mmvq short-K item-split;
+amended 2026-09-04 with two MTP regression fixes — see
+[Current state](#current-state)).
 The patches apply to a clean
 llama.cpp checkout at the recorded fork point `9cffdcc80` (re-based 2026-09-02 from `0eadefebd`).
 
@@ -45,8 +47,28 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
 (gfx1200/gfx1201) and falls back to RCCL elsewhere (see
 `patches/README.md` for the gate and env knobs).
 
-## Current state (2026-09-02)
+## Current state (2026-09-04)
 
+- **Block-13 MTP regression fixes (2026-09-04, folded into block 13):**
+  (1) dense adaptive-MTP collapse (18.3 -> 27.5 t/s) — the mmvq
+  item-split/rpb kernel is register-bound at multi-token decode batches
+  (ncols 2..8 = the speculative verify step); fixed with a re-added
+  pre-block-13 K-split kernel (`mul_mat_vec_q_ksplit`) for those batches
+  and long-K single-token rows (plain decode 29.0 -> 30.1, output
+  bit-identical to the 12-block build).  (2) MoE adaptive-MTP collapse
+  (draft acceptance 0/1527, 53 t/s vs plain 90) — the block-08
+  rms_norm->mmvq Q8_1 quantize-cache fold corrupts multi-token MUL_MAT_ID,
+  so verify logits diverge from single-token decode; the fold is now gated
+  to single-token MMID + plain MUL_MAT consumers (acceptance 0 -> 0.51,
+  MTP 126 t/s vs upstream ~113).  MoE MTP had no baseline data, which is
+  why it slipped.  Details + verification: `patches/README.md` block-13
+  notes.  The adaptive-MTP baseline gate and expectations now live in
+  [`benchmarks/mtp-adaptive-methodology.md`](benchmarks/mtp-adaptive-methodology.md)
+  — run Protocol A there before shipping decode/fusion changes.
+- **Fork tip:** the fork block-13 commit was amended 2026-09-04 (current
+  blocks `04122bfb5..8f2838d1`); the clean-apply sim at `9cffdcc80`
+  applies with zero conflicts/whitespace warnings and its tree is
+  byte-identical to the fork tip.
 - **Fork point (baseline):** llama.cpp master at `9cffdcc80` (re-based
   2026-09-02 from `0eadefebd`; 42 commits of drift — see `MANIFESTS.md`
   for the dated re-base record, incl. the block 03/08/13 manual merges
@@ -56,7 +78,7 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
 - **Verified:** clean apply + full build + llama-cli same-seed coherence
   IDENTICAL (hybrid vs RCCL, 3-GPU) on the rebuilt fork; the clean-apply
   sim at `9cffdcc80` applies with zero conflicts/whitespace warnings and
-  its tree is byte-identical to the fork tip (`92f09e80a`). tg64 38.12 /
+  its tree is byte-identical to the fork tip (`8f2838d1`). tg64 38.12 /
   tg512 41.08 and the block-13 numbers are unchanged — the re-base is
   content-identical plus upstream's additions.
 - **Whitespace-clean apply:** the regenerated set applies with **zero git
