@@ -1,6 +1,6 @@
 # Adaptive MTP baseline methodology & validation records
 
-Why this file exists: on 2026-09-04, a regression in the delivery's decode
+Why this file exists: on 2026-09-02, a regression in the delivery's decode
 kernels collapsed **adaptive MTP / draft-mtp on MoE models** (and cost ~33%
 on dense MTP). It went unnoticed for weeks because no validation gate
 exercised MTP end-to-end: the llama-benchy decode suites (see
@@ -9,7 +9,7 @@ never made it into a dated baseline. This file is the MTP-specific gate:
 protocols, canonical commands, expected numbers (dense + MoE), and the
 acceptance/verification rules that would have caught the regression.
 
-Status: 2026-09-04 — gate defined; dense + MoE baselines recorded (pre- and
+Status: 2026-09-02 — gate defined; dense + MoE baselines recorded (pre- and
 post-fix). All runs on 3x R9700 (gfx1201), ROCm 7.14
 (`/opt/rocm-7.14-gfx1201`), fork build flags as in
 `wip/qwen35moe-prefill/bench-config.md`; 1-GPU runs pin `HIP_VISIBLE_DEVICES=0`
@@ -27,7 +27,7 @@ MTP adds two decode shapes that plain decode never produces:
 llama-bench tg decodes 1 token/step regardless of `-b`, so it only covers
 the ncols==1 path. Kernel or fusion bugs confined to ncols 2..13 (or to the
 draft context) are invisible to llama-bench/benchy and to single-token
-same-seed coherence. The 2026-09-04 regression is the worked example: the
+same-seed coherence. The 2026-09-02 regression is the worked example: the
 block-08 rms_norm->mmvq Q8_1 quantize-cache fold corrupted multi-token
 MUL_MAT_ID, so MoE verify logits diverged from single-token decode and MTP
 draft acceptance collapsed to 0/1527 (draft-mtp ~53 t/s vs plain ~90, where
@@ -55,7 +55,7 @@ HIP_VISIBLE_DEVICES=0 GGML_CUDA_DISABLE_GRAPHS=0 <build>/bin/llama-cli \
 Run the same with `--spec-type none` and compare. Gate rules:
 1. **Acceptance**: with `--log-verbosity 4`, the `draft acceptance` /
    `acc per pos` lines must show a healthy rate on prose (>= ~0.45 at pos 1
-   for these models; the 2026-09-04 regression showed 0.000). A collapse to
+   for these models; the 2026-09-02 regression showed 0.000). A collapse to
    0.0 = verify/logit numerics divergence (draft-vs-verify mismatch), not a
    tuning issue.
 2. **MTP must not lose to plain decode on the same build**: `draft-mtp`
@@ -78,7 +78,7 @@ R=reasoning, K=verbatim recall, P=prose, C=code; server = 2-GPU tensor
 split `HIP_VISIBLE_DEVICES=0,2`, Q8_0 27B dense, f16 KV, ctx 262144).
 Run passes 1 and 2, repeat >= 2, and compare against the baselines below.
 The dense expectations table was recorded 2026-08-23 (rdna-boosts era
-`e0aa19e25`) and re-verified 2026-09-04 on the fixed 13-block build —
+`e0aa19e25`) and re-verified 2026-09-02 on the fixed 13-block build —
 see the results table.
 
 ## Baselines
@@ -87,7 +87,7 @@ see the results table.
 
 Predicted tokens/s (predicted_per_second). C0 = plain decode.
 
-| config | workload | 2026-08-23 perf-era | 2026-09-04 fixed 13-block | base (upstream) C0 |
+| config | workload | 2026-08-23 perf-era | 2026-09-02 fixed 13-block | base (upstream) C0 |
 |---|---|---|---|---|
 | C0 | R | - | 31.8 | 30.0 |
 | C0 | K | - | 31.6 | 29.9 |
@@ -109,21 +109,21 @@ build: R 1.67x, K 4.7x, P 1.87x, C 2.5x — MTP is a strong accelerant.
 ### MoE — Qwen3.6-35B-A3B (qwen35moe, nextn MTP head)
 
 1-GPU UD Q4_K_M (has the nextn head), seed 42, temp 0, draft depth 3
-(default n_max). There was NO pre-2026-09-04 MoE MTP baseline — that is why
+(default n_max). There was NO pre-2026-09-02 MoE MTP baseline — that is why
 the regression was not caught (the MoE decode suites are MTP-free).
 
 | build | plain (none) | draft-mtp | draft acceptance | verdict |
 |---|---|---|---|---|
 | upstream 9cffdcc80 | 75.0 | 113.4 | 0.49 | MTP accelerates +51% |
 | shipped 13-block (pre-fix) | 88.6 | 53.2 | 0.000 (0/1527) | MTP collapses (bug) |
-| fixed 13-block (2026-09-04) | 89.5 | 125.8 | 0.51 | MTP accelerates +41% |
+| fixed 13-block (2026-09-02) | 89.5 | 125.8 | 0.51 | MTP accelerates +41% |
 
 MoE verdict: post-fix MTP acceptance (0.51) equals the fully-unfused
 internally-consistent numerics (0.49) and upstream — the draft-vs-verify
 numerics relationship is not depressing acceptance. Fix summary and the
-mechanism in `patches/README.md` (block 13 notes, 2026-09-04).
+mechanism in `patches/README.md` (block 13 notes, 2026-09-02).
 
-### MoE multi-GPU — Qwen3.6-35B-A3B-UD Q8_0, tensor split (new baselines, 2026-09-04)
+### MoE multi-GPU — Qwen3.6-35B-A3B-UD Q8_0, tensor split (new baselines, 2026-09-02)
 
 First-ever MoE 2- and 3-GPU rows (no prior baseline existed). Model has the
 nextn/MTP head. Env conventions as `run_sweep.py`: `NCCL_PROXY_CPUSET=8..15`,
@@ -145,7 +145,7 @@ MTP accelerates at both splits (+37% 2-GPU, +29% 3-GPU) with acceptance
 ### MoE single-token decode anchors (MTP-free, for reference)
 
 Canonical commands in `wip/qwen35moe-prefill/bench-config.md`. Recorded
-baseline (2026-09-02, fork tip) vs fixed 13-block (2026-09-04):
+baseline (2026-09-02, fork tip) vs fixed 13-block (2026-09-02):
 
 | test | baseline | fixed 13-block |
 |---|---|---|

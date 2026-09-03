@@ -6,7 +6,7 @@ A delivery repo for a **13-patch set** of **RDNA3 / RDNA3.5 / RDNA4**
 WMMA flash-attn, fused core, k-quant boosts, CUDA prefill-graph skip),
 **block 12** (the hybrid HIP all-reduce) and
 **block 13** (fused MoE gate+up+GLU MMQ + mmvq short-K item-split;
-amended 2026-09-04 with two MTP regression fixes — see
+amended 2026-09-02 with two MTP regression fixes — see
 [Current state](#current-state)).
 The patches apply to a clean
 llama.cpp checkout at the recorded fork point `9cffdcc80` (re-based 2026-09-02 from `0eadefebd`).
@@ -47,9 +47,9 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
 (gfx1200/gfx1201) and falls back to RCCL elsewhere (see
 `patches/README.md` for the gate and env knobs).
 
-## Current state (2026-09-04)
+## Current state (2026-09-02)
 
-- **Block-13 MTP regression fixes (2026-09-04, folded into block 13):**
+- **Block-13 MTP regression fixes (2026-09-02, folded into block 13):**
   (1) dense adaptive-MTP collapse (18.3 -> 27.5 t/s) — the mmvq
   item-split/rpb kernel is register-bound at multi-token decode batches
   (ncols 2..8 = the speculative verify step); fixed with a re-added
@@ -65,7 +65,7 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
   notes.  The adaptive-MTP baseline gate and expectations now live in
   [`benchmarks/mtp-adaptive-methodology.md`](benchmarks/mtp-adaptive-methodology.md)
   — run Protocol A there before shipping decode/fusion changes.
-- **Fork tip:** the fork block-13 commit was amended 2026-09-04 (current
+- **Fork tip:** the fork block-13 commit was amended 2026-09-02 (current
   blocks `04122bfb5..8f2838d1`); the clean-apply sim at `9cffdcc80`
   applies with zero conflicts/whitespace warnings and its tree is
   byte-identical to the fork tip.
@@ -142,15 +142,22 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
 | `0012` | **hybrid HIP all-reduce** — custom internal AR for the small-tensor decode path, per-size hybrid dispatch vs RCCL, RDNA4-only gate (bounded in-kernel spin since 2026-08-30 fix round; builds without RCCL) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** — prefill fused expert MMQ (RDNA4, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K, env opt-out `GGML_CUDA_DISABLE_MOE_MMQ_FUSION`) + decode item-split (rpb 2/4/8) merged with the upstream has_fusion mmvq path |
 
-> **Greedy-purity note (read before shipping):** block 10 (`0010`) is the
-> only patch that changes decode numerics on ANY architecture — its VDR
-> kernels reorder the fp32 reduction. Compute outputs are not bit-identical
-> to a build without it (max logit diff 0.184 vs 0.203 for flash-attn
-> on/off; greedy streams are deterministic within a build but can flip
-> across configs). This is a different rounding path, not a correctness
-> change. If you require 100% greedy purity across builds, do not install
-> `0010-…k-quant-boosts…patch` — it is one line to drop from
-> `scripts/apply-all.sh`. Full discussion: [`GREEDY-PURITY.md`](GREEDY-PURITY.md).
+> **Greedy-purity note (read before shipping):** on the K-split decode
+> paths, block 10 (`0010`) is the only patch that changes decode numerics on
+> ANY architecture — its VDR kernels reorder the fp32 reduction. Compute
+> outputs are not bit-identical to a build without it (max logit diff 0.184
+> vs 0.203 for flash-attn on/off; greedy streams are deterministic within a
+> build but can flip across configs). This is a different rounding path, not
+> a correctness change. If you require 100% greedy purity across builds, do
+> not install `0010-…k-quant-boosts…patch` — it is one line to drop from
+> `scripts/apply-all.sh`. Full discussion:
+> [`GREEDY-PURITY.md`](GREEDY-PURITY.md). **Block-13 caveat (2026-09-02):**
+> block 13 rewrites the small-batch mmvq decode kernel and is a second
+> decode-numerics source on the rows that run it (short-K K<4096 ncols==1
+> rows, MoE projections; ncols 2..8 and long-K rows were restored to the
+> pre-block-13 K-split kernel by the 2026-09-02 fix). Excluding block 10 no
+> longer reproduces stock bits exactly on those rows — see
+> GREEDY-PURITY.md §9.
 
 ## Consumer workflow
 

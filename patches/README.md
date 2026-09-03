@@ -2,7 +2,7 @@
 
 13 patches against the llama.cpp fork point `9cffdcc80`
 ("server : accept data: URLs for input_video and input_audio (#27735)";
-re-based 2026-09-02 from `0eadefebd`; block 13 amended 2026-09-04 with
+re-based 2026-09-02 from `0eadefebd`; block 13 amended 2026-09-02 with
 two MTP regression fixes — see the block-13 notes below and
 `../benchmarks/mtp-adaptive-methodology.md` for the MTP baseline gate):
 
@@ -20,7 +20,7 @@ two MTP regression fixes — see the block-13 notes below and
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate |
-| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-04 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); see block 13 notes below |
+| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); see block 13 notes below |
 
 ## Apply (fresh checkout at the fork point)
 
@@ -36,7 +36,7 @@ The set is **whitespace-clean**: applying produces no git whitespace
 warnings (verified 2026-08-29 after the whitespace-clean regeneration,
 re-verified 2026-09-01 on the `0eadefebd` re-base, re-verified 2026-09-01
 with block 13 on the 13-patch series, re-verified 2026-09-02 on the
-`9cffdcc80` re-base, re-verified 2026-09-04 after the block-13 amendment).
+`9cffdcc80` re-base, re-verified 2026-09-02 after the block-13 amendment).
 
 ## 2026-09-02 re-base to 9cffdcc80 (current)
 
@@ -242,7 +242,7 @@ docs require `HIP_VISIBLE_DEVICES=0`; without it llama.cpp layer-splits
 across all 3 R9700s and decode drops ~97 -> ~81 t/s (a harness artifact,
 NOT a regression - verified 2026-09-02). Canonical command lines + the
 baseline table live in `wip/qwen35moe-prefill/bench-config.md`.
-- **MTP/verify decode regression fix (2026-09-04):** the decode item-split
+- **MTP/verify decode regression fix (2026-09-02):** the decode item-split
   kernel + RDNA rows_per_block override collapsed multi-token decode
   batches (ncols 2..8 = the speculative/MTP verify step) on DENSE models,
   and cost ~4% on long-K (K >= 4096) single-token decode.  The per-thread
@@ -261,7 +261,7 @@ baseline table live in `wip/qwen35moe-prefill/bench-config.md`.
   unchanged (Q6_K tg128 98.3, recorded baseline 97.59).  The 12-block-era
   build (no block 13) shows the same collapse (16.6 t/s), i.e. this was
   inherent to block 13, not a re-base artifact.
-- **MoE MTP verify-numerics regression fix (2026-09-04, second fix):** with
+- **MoE MTP verify-numerics regression fix (2026-09-02, second fix):** with
   the first fix in, MoE MTP was still far below plain decode (draft-mtp 53
   vs none 90 t/s on qwen35moe-A3B Q4_K_M-UD) while upstream accelerates
   (+51%).  Root cause: the block-08 rms_norm->mmvq Q8_1 quantize-cache

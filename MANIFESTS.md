@@ -9,7 +9,7 @@ The **current delivery** is a **13-patch set** against the fork point
 (`patches/0001-…0013-…`, format-patch of the
 fork's `rdna-boosts` block commits — the re-based regeneration
 `04122bfb5..8f2838d1` against `9cffdcc80`; block 13 was amended
-2026-09-04 with two MTP regression fixes, see the dated record below; the
+2026-09-02 with two MTP regression fixes, see the dated record below; the
 previous `0eadefebd`-based regeneration `b25bc8a9c..482837e5a` is superseded
 and preserved on the fork's history/remotes). Apply flow: `git am`
 for the whole 01-13 series (plain `git apply` of the concatenated series
@@ -18,7 +18,7 @@ SILENTLY DROPS HUNKS — verified 2026-08-29);
 applying produces zero git whitespace warnings (verified 2026-08-29,
 re-verified 2026-09-01 on the `0eadefebd` re-base, re-verified with block
 13 on the 13-patch series 2026-09-01, re-verified on the `9cffdcc80`
-re-base 2026-09-02, re-verified after the 2026-09-04 block-13 amendment).
+re-base 2026-09-02, re-verified after the 2026-09-02 block-13 amendment).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -35,7 +35,9 @@ Blocks 09 and 06 (old numbering) are retired: their content (Q6_K VDR=2
 decode + the gfx1151 RDNA3_5 mmvq table) is folded into the k-quant umbrella
 (block 10) so all k-quant VDR/decode work and all mmvq parameter-table
 tuning lives in the one patch; excluding block 10 restores 100%
-greedy-purity on ALL architectures (see the Greedy-purity note below).
+greedy-purity on ALL architectures on the K-split decode paths (12-block-era
+claim; with block 13 installed, its rewritten short-K mmvq rows also deviate
+from stock — see `GREEDY-PURITY.md` §9).
 
 This is the authoritative apply order and the verification contract for the
 patch set. It is written for humans AND LLM coding agents. Follow it exactly;
@@ -119,10 +121,10 @@ coherence **IDENTICAL between hybrid and RCCL** (3-GPU tensor split,
 Qwen3.5-4B Q8_0). Numbers unchanged (content-identical plus upstream's
 additions).
 
-### Block-13 MTP regression fixes (2026-09-04, current)
+### Block-13 MTP regression fixes (2026-09-02, current)
 
 Block 13 (the fork's block-13 commit, amended in place) now carries two
-regression fixes found by the adaptive-MTP investigation of 2026-09-04:
+regression fixes found by the adaptive-MTP investigation of 2026-09-02:
 
 1. **Dense MTP/verify decode collapse** (`mmvq.cu`): the block-13 mmvq
    item-split kernel + RDNA rows_per_block override is register-bound at
@@ -143,7 +145,7 @@ regression fixes found by the adaptive-MTP investigation of 2026-09-04:
    0.49), draft-mtp 119-129 t/s vs upstream ~110-113; MoE plain decode
    and the single-token fusion gains unchanged; dense unaffected.
 
-Re-verified end-to-end 2026-09-04 after the amendment: set regenerated
+Re-verified end-to-end 2026-09-02 after the amendment: set regenerated
 from the fork (`scripts/make-patches.sh`, base `9cffdcc80`, blocks tip
 `8f2838d1`), clean-apply sim at `9cffdcc80` (git am clean, zero
 whitespace warnings, applied tree byte-identical to the fork tip),

@@ -4,7 +4,10 @@ Status: **reference document**. Read this if you are shipping block 10
 (`0010-rdna-boosts-block-10-k-quant-boosts-Q4_K-Q5_K-Q6_K-Q.patch`) and care about bit-exact reproduction of greedy
 decode vs a stock llama.cpp build. It explains *why* block 10 changes decode
 numerics, what that does and does not mean for correctness, and how to reason
-about the variance in practice.
+about the variance in practice. Sections 1-8 were written for the 12-block
+set; block 13 adds a second decode-numerics source on its rewritten mmvq
+rows — see **§9 (2026-09-02 addendum)** before relying on the
+"block 10 is the single patch" claims.
 
 ## 1. The one-sentence version
 
@@ -16,8 +19,9 @@ that was chosen first and that everything else reproduces.
 
 ## 2. What block 10 changes
 
-Block 10 is the single patch in the set that alters decode numerics. It does
-so through two mechanisms, both in the mmvq decode path:
+Block 10 is the single patch in the set that alters decode numerics on the
+K-split decode paths (superseded for block-13-installed sets — see §9). It
+does so through two mechanisms, both in the mmvq decode path:
 
 | mechanism | change | effect |
 |-----------|--------|--------|
@@ -216,3 +220,42 @@ bits match stock's arbitrary-but-pinned order.
   *distributions* (PPL, benchmark scores, sampling quality), not individual
   greedy tokens — individual tokens are expected to differ in near-ties, in
   exactly the same way they differ between flash-attn on and off.
+
+## 9. Block 13 changes decode numerics on its rewritten mmvq rows (addendum, 2026-09-02)
+
+Sections 1-8 were written for the 12-block set. Block 13 (`0013`, amended
+2026-09-02 with the two MTP regression fixes) adds a second source of
+decode-numerics change, so the "block 10 is the single patch" statements in
+§2 and the §8 stock-reproduction guidance are **superseded for any set that
+includes block 13**:
+
+1. **What block 13 rewrote.** Block 13 replaced the §3 K-split loop in the
+   small-batch decode kernel `mul_mat_vec_q` with an item-split over
+   (token, row, kblock) plus an RDNA `rows_per_block` override. On the rows
+   that run it, the item-split feeds *different partial sums* into the §3
+   cross-thread tree — the same class of fp32 reordering as block 10's VDR,
+   and the same same-seed consequence: greedy streams are deterministic
+   within a build but can flip vs stock (observed: 13-block vs 12-block
+   outputs diverged on near-ties).
+2. **What the 2026-09-02 ksplit fix restored.** ncols 2..8 (the speculative
+   verify batch) and ncols==1 rows with K >= 4096 now dispatch to the
+   pre-block-13 K-split kernel (`mul_mat_vec_q_ksplit`), restoring the §3
+   reduction structure on those rows — dense-model decode is again
+   byte-identical to the 12-block build (verified: dense qwen35 same-seed
+   outputs match). The remaining block-13 kernel surface is ncols==1 rows
+   with K < 4096 (MoE down/router and other short-K projections on RDNA2+
+   tables); those rows still carry block-13 variance vs stock.
+3. **MoE multi-token decode.** The second 2026-09-02 fix gates the
+   block-08 rms_norm->mmvq Q8_1 quantize-cache fold off multi-token
+   MUL_MAT_ID (it corrupted the cached y on that path — MTP acceptance
+   0/1527). Batched MoE decode now follows the unfused path, restoring
+   verify==decode consistency (acceptance 0.51). Separately, MoE
+   single-token decode carries fusion-ordering drift (fused vs unfused
+   differ on near-ties; deterministic within a build; accepted trade-off).
+4. **Practical consequence.** Reproducing stock bits with block 13
+   installed is not a one-line drop like block 10: the K<4096 ncols==1
+   mmvq rows run block 13's item-split kernel (no env switch; the ksplit
+   dispatch condition in `mul_mat_vec_q_switch_ncols_dst` is the gate).
+   Dense long-K decode (the common case) is back to block-10-only variance;
+   MoE/short-K decode carries block-13 variance. Full-set greedy output
+   remains fully deterministic within a single build.
