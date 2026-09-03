@@ -230,3 +230,54 @@ ctx size, not checkpoint flags). Ranked levers (decode-campaign evidence):
 mmvq decode-expert config (down K=640), kernel-count-reducing fusions,
 server host overhead hunt. The QSA path itself is at parity and no longer
 the constraint.
+
+---
+
+## PRE-COMPACTION NOTES 2026-09-03 (session end)
+
+### Git state
+- llama.cpp qwen4exp tip = 6c820fd79 (4 new commits above the 2 beta
+  commits: 419370021 V-smem, ffb9c56f4 slicing, 340f4621a 64-cell slices,
+  6c820fd79 trailing-newline cleanup). Flattened history, NOT pushed.
+  Beta patches regenerate to this tip tree-identically (committed to the
+  boost repo as c60c548; user pushed).
+- The 3 kernel fixes + cleanup live ONLY on the llama.cpp qwen4exp branch
+  and in the beta patch - nothing pushed to qwen4exp-src (the canonical
+  repo at /home/stew675/qwen4exp.cpp) yet; the user pushes.
+
+### Reproduce commands (the canonical real-KV decode harness)
+- /tmp/bseq_pp.cpp (+ binary): prefill P tokens cyclically, then decode
+  single-token steps at real KV = P. Usage:
+  `bseq_pp -m <model> -pp 512,2048,8192,32768 -n 24 -ngl 99 --split-mode 3 -kv bf16`
+  (-kv bf16 matters: bf16 is the production path; -c N overrides ctx).
+  Steady state = steps 3..N-1 (steps 0-2 are graph warmup).
+  Rebuild: g++ -std=c++17 -O2 -I include -I ggml/include /tmp/bseq_pp.cpp
+  -L build-rocm/bin -lllama -Wl,-rpath,<abs build-rocm/bin> -o /tmp/bseq_pp
+  (link against build-rocm/bin/libllama.so; rebuild when the API changes).
+- Env debug toggles in fattn-qsa.cu: GGML_CUDA_QSA_DEBUG (prints launch
+  geometry per QSA op), GGML_CUDA_QSA_SLICES=N (override slice count),
+  GGML_CUDA_QSA_IDENTITY=1 (idx = sequential, dense-equivalent ordering).
+- Dense comparison: LLAMA_QSA_SPARSE_FA=0. Always warm the page cache
+  first and leave the GPUs idle (a leftover server holds 31 GiB/GPU and
+  any harness then OOMs at model load).
+
+### Gate nuance: "The answer" baseline is STALE on this tree
+- The recorded reference stream "The answer" = 369 9542 11 694... does
+  NOT reproduce on the current tree under ANY kernel state - the pristine
+  pre-change fattn-qsa.cu also yields 369 9542 13 198 760 4087...
+  (prompt documented as drift-prone: 11 = ' ', 13 = newline at step 3).
+- The reliable single-seq gates = "Quantum" (198 42750 367 367 318
+  210452 13 29144) and "What is the capital of France?" (271 760 6511
+  314 9338 369 2972 57590 ...) - both pass bit-exact. Sliced vs
+  single-block numerics verified identical (0.0 logit delta over a 4-token
+  dump at /tmp/ld_sliced.bin vs /tmp/ld_unsliced.bin).
+
+### Where the session stopped (next steps for 50 t/s server-side)
+- Server at ~46.5-48 t/s flat (21.4 ms/step avg 46.7 over 4000 gen; was
+  38.4 -> 29.2 decaying). Bench at short ctx = 20.2 ms (49.5 t/s).
+- Remaining to 50 t/s server: decode floor ~19.5 ms (MoE/GDN/elementwise
+  + launch tail) + ~0.8 ms server host overhead. Ruled out: threads
+  (8 vs 16 identical), ctx size (102400 vs 600 identical), checkpoint
+  flags (on/off identical). Ranked levers: (1) decode-expert MMVQ config
+  (down K=640 @ ~166 GB/s), (2) kernel-count-reducing fusions, (3) server
+  host overhead (sampler cost / per-token slot bookkeeping).
