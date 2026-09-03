@@ -240,6 +240,25 @@ docs require `HIP_VISIBLE_DEVICES=0`; without it llama.cpp layer-splits
 across all 3 R9700s and decode drops ~97 -> ~81 t/s (a harness artifact,
 NOT a regression - verified 2026-09-02). Canonical command lines + the
 baseline table live in `wip/qwen35moe-prefill/bench-config.md`.
+- **MTP/verify decode regression fix (2026-09-04):** the decode item-split
+  kernel + RDNA rows_per_block override collapsed multi-token decode
+  batches (ncols 2..8 = the speculative/MTP verify step) on DENSE models,
+  and cost ~4% on long-K (K >= 4096) single-token decode.  The per-thread
+  accumulator fan-out `tmp[ncols_dst][rpb]` (e.g. a 4-token verify x
+  rpb<=16 = up to 64 registers/thread) is register-bound; dense models hit
+  it because their verify batch goes through the plain `mul_mat_vec_q`
+  (MoE batches use `mul_mat_vec_q_moe`, which was unaffected).  Fix:
+  re-added the pre-block-13 K-split kernel as `mul_mat_vec_q_ksplit` and
+  dispatch decode batches ncols 2..8 to it; at ncols==1, rows with K >=
+  4096 (dense qkv/FFN projections, any quant type) also use ksplit while
+  short-K MoE rows (K < 4096) keep the item-split/rpb path.  Verified
+  (1x R9700 gfx1201, seed-42 protocol): dense qwen35 27B Q4_K_XL
+  adaptive-MTP 18.3 -> 27.5 t/s with output bit-identical to the 12-block
+  build, plain decode 29.0 -> 30.1 (+3.1-3.7% at d0/d16384/d65536);
+  qwen35moe A3B adaptive-MTP 36.3 -> 55.8 t/s with single-token decode
+  unchanged (Q6_K tg128 98.3, recorded baseline 97.59).  The 12-block-era
+  build (no block 13) shows the same collapse (16.6 t/s), i.e. this was
+  inherent to block 13, not a re-base artifact.
 
 ## Server config (the +22% deployment win)
 
