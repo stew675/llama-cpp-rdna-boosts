@@ -10,7 +10,7 @@ this area starts from these two patches.
 Two squashed patch files. They apply IN ORDER on the rdna-boosts core
 = upstream master `9cffdcc80` + blocks 01-13 (tip commit `8f2838d1c`,
 verified 2026-09-03). Applied together they reproduce the `qwen4exp`
-branch tip `6c820fd79` tree-identically (checked with `git diff --exit-code`).
+branch tip `d9b1ef288` tree-identically (checked with `git diff --exit-code`).
 
 ### 1. `managed-ngrams.patch`
 The managed lazy-reader work (the 0001-0007 set, squashed to one patch):
@@ -43,6 +43,14 @@ the 2 rebase fixes + the 3 crash/coherence fixes, squashed):
   combine kernel, 64-cell slices. Numerics bit-identical to the
   single-block path; sparse decode now at dense parity short-context and
   faster past ~8K real KV (see the validation section);
+- MoE weighted-reduction fusion unblocked on the Meta-TP path: the expert
+  aggregation (weighted MUL + per-expert views + the add chain) now fuses
+  into one kernel on ALL layers (was 2/48). The Meta backend gained a
+  graph_optimize that registers the alloc deps against the scheduler's
+  allocator (shared structural matcher in
+  ggml/src/ggml-moe-weighted-reduction.h), so the gallocr keeps the
+  experts input alive and the CUDA-side memory check passes. Decode
+  -0.27 ms/step at real KV 2048; fused == unfused logits bit-identical;
 - re-allows `LLAMA_SPLIT_MODE_TENSOR` for qwen4exp; CPU INDEXER_TOPK
   reference, hc_mix type gate, lazy-reader F32 path.
 
@@ -55,7 +63,10 @@ git apply qwen4exp-support.patch
 ```
 
 Requires ROCm gfx1201 (RDNA4) for the CUDA/HIP kernels. Both patches
-apply clean with `git apply --check` on the stated base.
+apply clean with `git apply --check` on the stated base. NOTE: the local
+qwen4exp branch tip (7c7d9eeff) carries one extra env-gated diagnostic
+commit (LLAMA_DECODE_PHASE_DEBUG timers in llama-context.cpp) that is
+INTENTIONALLY excluded from this patch - debug scaffolding, not promotable.
 
 ## Validation status (the gates this baseline holds)
 
