@@ -1,0 +1,157 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 13d4c2410..273662d68 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1394,6 +1394,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+         const int64_t t_b0 = ggml_time_us();
+ 
++        // scratch: clear route capture before the REAL build (reserve builds fire the cb too)
++        route_topk.clear();
++        route_topw.clear();
++
+         gf = model.build_graph(gparams);
+ 
+         ph("build_graph", ggml_time_us() - t_b0);
+@@ -1677,6 +1681,18 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+ 
+ int llama_context::decode(const llama_batch & batch_inp) {
+     static const bool dec_dbg = getenv("LLAMA_DECODE_PHASE_DEBUG") != nullptr;
++    static const bool route_dump = getenv("LLAMA_ROUTE_DUMP") != nullptr;
++    if (route_dump && !route_dump_f) {
++        const char * path = getenv("LLAMA_ROUTE_DUMP");
++        if (strcmp(path, "-") == 0) {
++            route_dump_f = stdout;
++        } else {
++            route_dump_f = fopen(path, "w");
++        }
++        if (!route_dump_f) {
++            fprintf(stderr, "%s: cannot open %s for routing dump\n", __func__, path);
++        }
++    }
+     auto dph = [&](const char * tag, int64_t t0) {
+         if (dec_dbg) fprintf(stderr, "[dphase] %s %.3f ms\n", tag, (ggml_time_us() - t0) / 1000.0);
+     };
+@@ -2023,6 +2039,68 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+         n_outputs_prev += n_outputs;
+         n_tokens_prev  += ubatch.n_tokens;
++
++        // scratch (env LLAMA_ROUTE_DUMP): dump the routing of this ubatch
++        // route_topk/route_topw hold the tensors of the graph that just ran
++        if (route_dump_f) {
++            ggml_backend_sched_synchronize(sched.get());
++
++            fprintf(route_dump_f, "U %d %d %zu\n", route_dump_step, ubatch.n_tokens, route_topk.size());
++
++            // read back ids + weights for every captured layer
++            // note: selected_experts = argsort output view [n_eu, n_tokens]; its
++            // parent (view_src) is the full argsort [n_expert, n_tokens] -> read
++            // the parent and take the first n_eu rows of each token column
++            for (size_t il = 0; il < route_topk.size(); ++il) {
++                auto * t_ids = route_topk[il];
++                auto * t_wts = route_topw[il];
++                if (!t_ids || !t_wts) {
++                    if (getenv("LLAMA_ROUTE_DEBUG")) fprintf(stderr, "[route] il=%zu skip: t_ids=%p t_wts=%p\n", il, (void*) t_ids, (void*) t_wts);
++                    continue;
++                }
++                const int64_t n_eu  = t_ids->ne[0];
++                const int64_t n_tok = t_ids->ne[1];
++                if (n_eu <= 0 || n_tok <= 0 || n_eu > 4096 || n_tok > 65536) {
++                    if (getenv("LLAMA_ROUTE_DEBUG")) fprintf(stderr, "[route] il=%zu skip2 n_eu=%lld n_tok=%lld\n", il, (long long) n_eu, (long long) n_tok);
++                    continue;
++                }
++
++                const ggml_tensor * t_parent = t_ids->view_src ? t_ids->view_src : t_ids;
++                const int64_t n_par = t_parent->ne[0];
++                if (t_parent->buffer == nullptr || t_parent->data == nullptr || n_par < n_eu) {
++                    if (getenv("LLAMA_ROUTE_DEBUG")) fprintf(stderr, "[route] il=%zu skip3 buf=%p data=%p n_par=%lld\n", il, (void*) t_parent->buffer, (void*) t_parent->data, (long long) n_par);
++                    continue;
++                }
++
++                // ids: read the full contiguous argsort parent, then pick the
++                // first n_eu entries per token (column-major: token j at j*n_par)
++                std::vector<int32_t> ids_parent(n_par * n_tok);
++                std::vector<float>   wts(n_eu * n_tok);
++                ggml_backend_t backend_par = ggml_backend_sched_get_tensor_backend(sched.get(), (ggml_tensor *) t_parent);
++                ggml_backend_t backend_wts = ggml_backend_sched_get_tensor_backend(sched.get(), t_wts);
++                if (backend_par) {
++                    ggml_backend_tensor_get_async(backend_par, t_parent, ids_parent.data(), 0, ids_parent.size()*sizeof(int32_t));
++                    ggml_backend_synchronize(backend_par);
++                }
++                if (backend_wts) {
++                    ggml_backend_tensor_get_async(backend_wts, t_wts, wts.data(), 0, wts.size()*sizeof(float));
++                    ggml_backend_synchronize(backend_wts);
++                }
++
++                fprintf(route_dump_f, "R %d %d %lld %lld", route_dump_step, ubatch.n_tokens, (long long) il, (long long) n_eu);
++                fprintf(route_dump_f, " # par_ne0=%lld par_ne1=%lld par_cont=%d wtype=%d", (long long) n_par, (long long) n_tok, (int) ggml_is_contiguous(t_parent), (int) t_wts->type);
++                for (int64_t j = 0; j < n_tok; ++j) {
++                    for (int64_t i = 0; i < n_eu; ++i) {
++                        fprintf(route_dump_f, " %d", ids_parent[j*n_par + i]);
++                    }
++                }
++                for (size_t i = 0; i < wts.size(); ++i) {
++                    fprintf(route_dump_f, " %.6g", wts[i]);
++                }
++                fprintf(route_dump_f, "\n");
++            }
++            route_dump_step++;
++        }
+     } while (mctx->next());
+ 
+     // set to total number of outputs in the batch, for use in llama_get_logits_ith
+@@ -2563,6 +2641,7 @@ ggml_status llama_context::graph_compute(
+ }
+ 
+ llm_graph_cb llama_context::graph_get_cb() const {
++    static const bool route_dump = getenv("LLAMA_ROUTE_DUMP") != nullptr;
+     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+         if (il >= 0) {
+             ggml_format_name(cur, "%s-%d", name, il);
+@@ -2570,6 +2649,28 @@ llm_graph_cb llama_context::graph_get_cb() const {
+             ggml_set_name(cur, name);
+         }
+ 
++        // scratch: capture the per-layer moe routing tensors of the REAL compute graph
++        // (the cb fires during reserve builds too - process_ubatch clears before the real build)
++        if (route_dump && il >= 0 && ubatch.n_tokens > 0) {
++            if (strcmp(name, "ffn_moe_topk") == 0) {
++                if (route_topk.size() <= (size_t) il) {
++                    route_topk.resize(il + 1);
++                }
++                route_topk[il] = cur;
++                // keep the argsort parent alive until the end of the graph, else its
++                // buffer is reused by later layers before we can read it back
++                if (cur->view_src) {
++                    ggml_set_output(cur->view_src);
++                }
++            } else if (strcmp(name, "ffn_moe_weights") == 0) {
++                if (route_topw.size() <= (size_t) il) {
++                    route_topw.resize(il + 1);
++                }
++                route_topw[il] = cur;
++                ggml_set_output(cur);
++            }
++        }
++
+         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
+         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
+         // FIXME: fix in ggml_backend_sched
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa8b..bfa9ac2b9 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -391,4 +391,12 @@ private:
+     mutable int32_t n_eval   = 0; // number of eval calls
+ 
+     mutable int32_t n_reused = 0; // number of times the previous graph was reused
++
++    // scratch (env LLAMA_ROUTE_DUMP): per-layer expert routing capture
++    // topk tensors captured at graph build; values read after each ubatch compute
++    mutable std::vector<ggml_tensor *> route_topk;   // [layer] ffn_moe_topk ids tensor
++    mutable std::vector<ggml_tensor *> route_topw;   // [layer] ffn_moe_weights tensor
++    FILE * route_dump_f   = nullptr; // dump file (opened lazily in decode)
++    int    route_dump_step = 0;      // per-ubatch counter
+ };
++
