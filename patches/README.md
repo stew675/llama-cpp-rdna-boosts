@@ -259,6 +259,23 @@ baseline table live in `wip/qwen35moe-prefill/bench-config.md`.
   unchanged (Q6_K tg128 98.3, recorded baseline 97.59).  The 12-block-era
   build (no block 13) shows the same collapse (16.6 t/s), i.e. this was
   inherent to block 13, not a re-base artifact.
+- **MoE MTP verify-numerics regression fix (2026-09-04, second fix):** with
+  the first fix in, MoE MTP was still far below plain decode (draft-mtp 53
+  vs none 90 t/s on qwen35moe-A3B Q4_K_M-UD) while upstream accelerates
+  (+51%).  Root cause: the block-08 rms_norm->mmvq Q8_1 quantize-cache
+  fold (try_fuse arm) corrupts multi-token MUL_MAT_ID - the moe-kernel
+  path consumes the cached Q8_1 y incorrectly, so verify-batch logits
+  diverge from single-token decode and MTP draft acceptance collapses to
+  0/1527.  MoE MTP was never baseline-tested (no MTP data existed for
+  qwen35moe), so nothing caught it.  Fix: gate the fold to single-token
+  MMID (ne[2]==1) and plain MUL_MAT consumers; multi-token MMID decodes
+  unfused (same numerics as the unfused path).  Verified: MoE A3B
+  draft-mtp acceptance restored to 0.51 (== fully-unfused 0.49 ==
+  upstream 0.49; the residual fusion-ordering drift does not depress
+  acceptance), rate 119-129 t/s vs upstream ~110-113; plain decode and
+  single-token fusion gains unchanged (none 89-95, Q6_K tg128 98.8);
+  dense unaffected (mtp 27.2-27.5 / none 30.1).  The MTP gate protocol +
+  baselines now live in `benchmarks/mtp-adaptive-methodology.md`.
 
 ## Server config (the +22% deployment win)
 

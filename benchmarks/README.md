@@ -3,6 +3,13 @@
 The current, full benchmark suite. **v2 (2026-08-27)** is the complete
 gamut; the **v1** record (curl + `/completion`) is preserved for history.
 
+> **MTP gate (2026-09-04):** adaptive/draft MTP is NOT covered by these
+> decode suites (llama-bench/benchy decode 1 token/step and never touch
+> the speculative verify batch or draft context). MTP regressions slip
+> through them (worked example: the 2026-09-04 block-13/block-08 MoE MTP
+> collapse, 0/1527 draft acceptance). The MTP protocol, baselines and
+> acceptance gate live in [mtp-adaptive-methodology.md](mtp-adaptive-methodology.md).
+>
 > **Freshness note:** these are the v1/v2 records of the 11-block era
 > (builds: master `fe235f434` vs `build-rdna-boosts` @ `a265041b1`). The
 > current delivery adds block 12 (hybrid all-reduce, RDNA4-gated) — its
