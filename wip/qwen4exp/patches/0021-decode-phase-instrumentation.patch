@@ -1,0 +1,138 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4f01ce0e9..13d4c2410 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -729,12 +729,16 @@ void llama_context::sched_reserve() {
+ }
+ 
+ void llama_context::synchronize() {
++    static const bool dec_dbg = getenv("LLAMA_DECODE_PHASE_DEBUG") != nullptr;
+     if (!sched) {
+         return;
+     }
++    const int64_t s0 = ggml_time_us();
+ 
+     ggml_backend_sched_synchronize(sched.get());
+ 
++    if (dec_dbg) fprintf(stderr, "[dphase] sched_sync %.3f ms\n", (ggml_time_us() - s0) / 1000.0);
++
+     // FIXME: if multiple single tokens are evaluated without a synchronization,
+     // the stats will be added to the prompt evaluation stats
+     // this should only happen when using batch size 1 to evaluate a batch
+@@ -1358,10 +1362,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     auto * res = gf_res_prev.get();
+     auto * gf  = res->get_gf();
+ 
++    static const bool ph_dbg = getenv("LLAMA_DECODE_PHASE_DEBUG") != nullptr;
++    auto ph = [&](const char * tag, double us) {
++        if (ph_dbg) fprintf(stderr, "[phase] %s %.3f ms\n", tag, us / 1000.0);
++    };
++    const int64_t t_p0 = ggml_time_us();
++
+     // the new graph parameters
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
++    ph("gparams", ggml_time_us() - t_p0);
+ 
++    const int64_t t_p1 = ggml_time_us();
+     if (!graph_reuse_disable && res->can_reuse(gparams)) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+@@ -1373,17 +1385,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         }
+ 
+         n_reused++;
++        ph("can_reuse-true", ggml_time_us() - t_p1);
+     } else {
+         res->reset();
+ 
+         ggml_backend_sched_reset(sched.get());
+         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+ 
+-        //const auto t_start_us = ggml_time_us();
++        const int64_t t_b0 = ggml_time_us();
+ 
+         gf = model.build_graph(gparams);
+ 
+-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
++        ph("build_graph", ggml_time_us() - t_b0);
+ 
+         if (!gf) {
+             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+@@ -1396,19 +1409,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             ret = GGML_STATUS_ALLOC_FAILED;
+             return nullptr;
+         }
++        ph("alloc_graph", ggml_time_us() - t_b0 - 0);
++        ph("build+alloc", ggml_time_us() - t_b0);
+     }
+ 
+     // set the input data for the input tensors
+     {
+-        //const auto t_start_us = ggml_time_us();
++        const int64_t t_p2 = ggml_time_us();
+ 
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+         res->set_inputs(&ubatch);
+ 
+-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
++        ph("set_inputs", ggml_time_us() - t_p2);
+     }
+ 
++    const int64_t t_p3 = ggml_time_us();
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
++    ph("compute_submit", ggml_time_us() - t_p3);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+         ret = status;
+@@ -1659,6 +1676,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+ }
+ 
+ int llama_context::decode(const llama_batch & batch_inp) {
++    static const bool dec_dbg = getenv("LLAMA_DECODE_PHASE_DEBUG") != nullptr;
++    auto dph = [&](const char * tag, int64_t t0) {
++        if (dec_dbg) fprintf(stderr, "[dphase] %s %.3f ms\n", tag, (ggml_time_us() - t0) / 1000.0);
++    };
++    const int64_t d0 = ggml_time_us();
+     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
+     // so accept either present rather than requiring exactly one.
+     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+@@ -1719,10 +1741,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         }
+     }
+ 
++    dph("balloc_init", d0);
+     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+         return -1;
+     }
++    dph("balloc_init_done", d0);
+ 
+     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+     const uint32_t n_outputs_all = balloc->get_n_outputs();
+@@ -1759,7 +1783,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     bool did_optimize = false;
+ 
+     // handle any pending shifts/copies
++    dph("pre_mem_update", d0);
+     memory_update(false);
++    dph("mem_update", d0);
+ 
+     llama_memory_context_ptr mctx;
+ 
+@@ -1806,6 +1832,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         break;
+     }
+ 
++    dph("mctx_ready", d0);
+     // reserve output buffer
+     if (output_reserve(n_outputs_all) < n_outputs_all) {
+         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
+@@ -1843,6 +1870,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+ 
++        dph("ubatch_compute_done", d0);
+         if (!res) {
+             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
+             llama_pos pos_min[LLAMA_MAX_SEQ];
