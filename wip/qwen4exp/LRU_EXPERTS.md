@@ -403,3 +403,112 @@ Phase 5 - POLISH + PATCH:
    [K x out x S+1] + slot-id form needs no kernel change.
 4. Then Phase 1 (loader placement) with S=512 full-residency as the
    plumbing gate.
+
+---
+
+## AMENDMENT 2026-09-03 (pre-compaction exploration): policy design + a corrected architecture
+
+### A. Answers to the shaping questions
+
+1. "Is there always a resident core set of experts?" - YES, the evidence is
+   consistent: llama.cpp issue #20757 measured GPT-OSS-120B (128 experts/
+   layer, top-4): ~15-20% of the experts handle ~80% of the tokens; with a
+   two-tier SLRU GPU-slot cache it reached ~98-100% hit rate after ~160
+   warm-up tokens, 0.5-1 tok/s (pure CPU) -> 12-14 tok/s (cached) on an
+   8 GB card. The heavy tail (many barely-touched experts) is real and is
+   why the cache works. Whether Qwen3.8-Flash-Next has the same skew and
+   temporal locality is an empirical question - see the "measure first"
+   caveat: "Not All Models Suit Expert Offloading" (arXiv:2505.16056)
+   shows models differ sharply in temporal routing locality.
+
+2. "How many are always resident?" - that IS the Phase-0 measurement. The
+   right framing = per-layer S such that the expected routing weight mass
+   covered >= target (e.g. 95-99%), read off the measured cumulative
+   coverage curve. The 15-20%/80% rule-of-thumb says the core is small;
+   S = 32-64 of 512 (6-12%) is a sane first guess to validate.
+
+3. "What is the best eviction heuristic?" - the literature (CNRS/ENS-Lyon,
+   "Cache Management for MoE LLMs", arXiv:2509.02408) formalizes expert
+   caching as layered paging and shows recency-based (LRU-like) policies
+   are near-optimal; layer-aware variants beat plain LRU on real traces.
+   The #20757 PoC used SLRU (segmented LRU: a small probation segment +
+   a protected segment - frequency promotes entries out of probation).
+   Admission matters as much as eviction: never admit the rarely-used tail
+   (cache pollution). NOTE: "REAP" as a cache acronym does not exist - the
+   arXiv REAP (2510.13999, Cerebras) is a one-shot expert-PRUNING saliency
+   (router weight x activation norm) that prunes ~50% of experts
+   near-losslessly on 20B-1T SMoEs. The user's "REAP" intuition maps to
+   the SLRU/recency-frequency + admission-gate family, and pruning is a
+   separate (complementary) lever: an offline pruned core + the cache.
+   Routing-model papers also show a "consecutive tokens pattern"
+   (arXiv:2512.16473) = the temporal locality the cache exploits.
+
+4. Prediction (the Adaptive-MTP echo): the routing of step N+1 is
+   predictable from the recent history (the consecutive-token overlap).
+   Two uses: (a) the admission/promotion policy can prefetch the predicted
+   next-step experts into slots between steps; (b) the same trend-watching
+   machinery (the tree's block-01 adaptive MTP) is a template for a
+   "routing trend predictor" that keeps the slot set one step ahead.
+   This is a LATER refinement; plain reactive caching (admit-on-miss at
+   the split boundary) already gets ~98-100% hits per #20757.
+
+### B. CORRECTION to section 5 (the streaming "impossibility")
+
+Section 5 claimed a pure GPU-streaming design is impossible because the
+routing is unknown before the step. That is wrong for the n-cpu-moe-style
+graph: the CURRENT tree (upstream master's scheduler, ggml-backend.cpp
+~1700-1800, ggml_backend_sched_compute_splits) already, when a MoE weight
+tensor is HOST-resident, (a) splits the graph at the mmid, (b) reads the
+ids tensor back host-side at the split boundary, (c) computes the used-
+expert bitset, and (d) H2D-copies ONLY the used expert slices into a
+full-size mirrored GPU tensor before the mmid runs. Per-pass, no
+persistence. This machinery makes Option B (GPU streaming) viable as the
+BASE: replace the per-pass full-copy with a persistent SLOT cache (the
+dst_hot [K x out x S+1] tensor + the id->slot LUT). The hit/miss decision
+happens host-side at the SAME split boundary where the ids are already
+read back; a miss = evict + H2D the expert into a slot (or copy straight
+through); a hit = the mmid reads the slot. Compute NEVER leaves the GPU.
+
+Revised architecture preference:
+- Option B (GPU streaming, upstream-sched-based) becomes the v1 target:
+  persistent per-device slot buffers + per-step LUT; the sched's split
+  boundary = the natural home of the cache bookkeeping + the copies. The
+  CPU-cold path (Option A) becomes a fallback only if the H2D misses
+  cannot stay under budget.
+- CRITICAL OPEN QUESTION this raises: CUDA-graph replay. The qwen4exp
+  decode today = clean shape-stable replay. The split-boundary host syncs
+  (ids readback + copies) break single-launch replay; the upstream
+  n-cpu-moe path predates/bypasses the capture. Phase 1/2 must establish
+  what the graph-execution mode becomes with host-resident experts (per-
+  split capture? the meta wrapper's own copy machinery?) and what that
+  costs vs today's replay. The Meta-TP wrapper never runs the upstream
+  sched split logic for host weights (whole graph = one meta split) - the
+  meta needs its own host->device expert handling, which today does NOT
+  exist (all weights are Meta() resident). This is the largest new
+  subsystem in the plan.
+
+### C. Policy layer, revised (v1 -> v4)
+
+- v0/v1: static plant (bring-up gate; S = e.g. 32).
+- v1.5: ADMIT-ON-MISS (SLRU-lite): slots start empty; a miss at the split
+  boundary copies the expert into a probation slot; repeat use promotes it
+  into the protected segment; the tail never enters unless used twice.
+  No heatmap, no cadence, ~30 lines at the split boundary. This is the
+  #20757-style steady state (~98-100% hits after ~160 tokens) and is
+  probably the shipping policy for v1.
+- v2: OFFLINE CALIBRATION (a profile run writes the per-layer top-S +
+  the coverage curve; applied at load as the initial plant) - shortens the
+  warm-up, still no live machinery.
+- v3: live decay-heatmap + cadence re-rank for the protected segment
+  (only if the traces show the working set drifts over a session).
+- v4: prediction/prefetch of the next step's set (the MTP-style trend
+  watcher), if the miss rate needs it.
+
+### D. Updated open questions
+- The meta wrapper's host-expert handling + the replay-mode question (B).
+- The routing skew + locality OF Qwen3.8-Flash-Next specifically (Phase
+  0; the 2505.16056 caveat).
+- Whether the fused gate_up [1280,2560,512] slice copy (3.3 MB/expert) +
+  the down (1.6 MB) per miss fits the step budget at the measured miss
+  rate (budget ~1-3 misses x ~5 MB per step at ~50 GB/s = 0.1-0.3 ms).
+- The sentinel-slot + mmvq detail (unchanged from the main doc).
