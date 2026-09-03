@@ -215,3 +215,20 @@ user config uses both-bf16; the "The answer" short-prompt multi-seq drift
 kept in /tmp: server_test.sh (base-config server smoke + timings),
 srv_* probes, tdec.cpp (token-id decode helper). Cores 04:43/04:46/05:41/
 05:47 all = bug 1; coredumpctl may still hold them.
+
+## UPDATE 2026-09-03 (session 3): QSA sparse FA is now the default
+
+llama.cpp qwen4exp @ 5cbef4c4d (patch 0020). Contract now: the QSA sparse
+flash-attention path is the DEFAULT when flash attention is enabled;
+LLAMA_QSA_SPARSE_FA=0 selects the dense masked FA path; -fa off uses the
+manual (non-FA) attention path (the sparse branch is gated on
+cparams.flash_attn). Env semantics flipped (was: unset = dense). The sparse op
+now appears in every FA-on qwen4exp graph, so a CPU reference for
+GGML_OP_FLASH_ATTN_QSA was added (ops.cpp) for -ngl 0 / CPU graph builds.
+Verified: no-env llama-bench tg128 45.75 / pp512 1538.3 = the old env=1
+numbers; bseq_val no-env streams == the known-good refs; env=0 dense still
+coherent; -ngl 0 CPU decode gives the same stream as GPU; test-llama-archs
+qwen4exp green (GPU 9.35e-14, CPU 0.00); user's full config at ctx 102400
+39.4 t/s coherent with no env needed. NOTE: SPLIT_MODE_TENSOR + -fa off is a
+pre-existing documented constraint (tensor split requires FA); FA-off works
+with layer split.
