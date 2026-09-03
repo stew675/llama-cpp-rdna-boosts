@@ -512,3 +512,43 @@ Revised architecture preference:
   the down (1.6 MB) per miss fits the step budget at the measured miss
   rate (budget ~1-3 misses x ~5 MB per step at ~50 GB/s = 0.1-0.3 ms).
 - The sentinel-slot + mmvq detail (unchanged from the main doc).
+
+---
+
+## AMENDMENT 2 (pre-compaction): the resident-set PRIOR is the deliverable
+
+Clarification from the user: the goal is not a REAP-style policy for its
+own sake - it is a GOOD EDUCATED GUESS of which experts should stay
+resident, refined cheaply. The live-LRU machinery is only worth building
+if the guess needs continuous correction.
+
+Sources of the prior, in order of increasing machinery (the plan should
+start at the top and only descend as measurement demands):
+1. PROMPT-ROUTING PRIOR: the prefill's own router decisions are the
+   strongest free signal. For a server slot the generation follows the
+   prompt: the expert set the prompt exercised (weighted by token count
+   and recency) is a direct estimate of the generation's working set.
+   Implemented as: during the prefill (which runs with the full expert
+   tensor host-resident anyway), accumulate per-layer usage; at the first
+   decode step, plant the top-S from that accumulation into the slots.
+   Zero extra inference cost, no offline step, self-calibrating per
+   request. This alone may make v3 (live re-ranking) unnecessary for
+   session-stable workloads.
+2. WORKLOAD PRIOR: the same measurement, aggregated across many sessions
+   of the target use case (the HTML/car + reasoning + coding traces),
+   stored as a per-model sidecar (per-layer top-S + the coverage curve).
+   Applied at model load. For a single-purpose server this is stable.
+3. LOCALITY PRIOR (reactive): admit-on-miss at the split boundary (the
+   SLRU-lite of amendment 1.5) - reality corrects the guess for drift.
+4. TREND PRIOR (predictive): only if measurements show the working set
+   drifts within a session faster than the cadence can follow.
+
+The Phase-0 measurement therefore answers TWO questions with one profile:
+(a) what IS the resident core (size + membership) for the target
+workloads, and (b) how stable is it across sessions/prompts (does the
+prompt prior alone suffice, or is reactive correction needed). The policy
+work then = whatever the measurement says is the minimum.
+
+The educated guess is cheap and load-bearing: an expert set planted from
+the prompt's own routing requires no heatmap, no decay constants, no
+cadence - it is a per-request byproduct of work the decode does anyway.
