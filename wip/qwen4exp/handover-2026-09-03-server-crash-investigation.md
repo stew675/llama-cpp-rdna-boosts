@@ -160,3 +160,58 @@ mlock/NCCL/checkpoint) effect. The handover's own base-config numbers hint
 at a ctx tax already: ~38.8 t/s at ctx 16K vs ~22 t/s at ctx 102400 on the
 server; if llama-bench shows the same ctx dependence, the "disjoint" is the
 KV-length-proportional decode cost, common to both tools.
+
+## UPDATE 2026-09-03 (session 2): TWO ROOT-CAUSED BUGS FIXED - the crash and the garbage
+
+llama.cpp qwen4exp now @ 1f5d431f7 (a61a7d4b9 + 1f5d431f7 on 236002e4a), not
+pushed. Patches 0018 + 0019 + .md in wip/qwen4exp/patches/. Both fixes
+verified end-to-end with the user's FULL config at ctx 102400 (mlock +
+cache-ram + ctx-checkpoints 64 + reasoning-budget + cpu pinning +
+NCCL_PROXY_CPUSET): loads, listens, REASONS COHERENTLY, 39.3 t/s decode.
+
+BUG 1 (0018, ggml-backend-meta.cpp): the server crash - no-backtrace SIGSEGV
+in ggml_backend_meta_graph_compute on the FIRST completion, base config too
+(the user's 04:43/04:46 cores = the same crash, same address +0x654b2).
+Trigger: the server sets a scheduler eval callback (progress) -> the meta
+backend receives ggml_graph_view slices (uid 0) -> rebuilds subgraphs every
+eval. On an arena reset the per-device cgraph_main entries were re-allocated
+only for [0, n_subgraphs); a later graph with fewer subgraphs than a
+historical max reused the dangling entries [n_subgraphs, max_subgraphs)
+without re-allocating (instrumented: dangling=1, zeroed struct). Fix: allocate
+ALL [0, max_subgraphs) on every arena reset (within the existing budget).
+
+BUG 2 (0019, ggml-cuda/fattn-qsa.cu): bf16 KV + LLAMA_QSA_SPARSE_FA=1 =
+GARBAGE decode (model emits "/" x n at any temperature, any prompt; raw and
+templated). f16+sparse and bf16+dense are both coherent. The BF16 branch of
+flash_attn_qsa never staged the per-cell mask M_smem (only the F16/Q8_0
+gather did) but its score pass reads it - uninitialized smem corrupted every
+attention score. The branch was dead code until true bf16 KV landed (bf16 was
+previously silently downgraded to f16, so no gate ever exercised it). Fix:
+stage M_smem in the BF16 gather too. NOTE: the user's env does not set
+LLAMA_QSA_SPARSE_FA (default dense = coherent anyway); with 0019 both paths
+are correct - sparse is the faster qwen4exp path, enable it.
+
+THE BENCH-VS-SERVER DISJOINT (resolved): llama-bench tg128 measures an EMPTY
+context at n_ctx = n_prompt + n_gen = 128 (n_prompt=0 for the tg test!), so
+21.9 ms/token there was never representative of serving. Real decode:
+server/bseq at any ctx capacity 128..102400 with a short real KV = 26.6 ms
+(bseq) / 25.6 ms (server) - flat across capacity (bseq -c 128/640/16384/
+102400 all 26.62 ms/step). The handover's "~22 t/s at ctx 102400" was a
+cold-cache/first-touch artifact (see the hump lesson) - remeasured warm:
+39.0 t/s at ctx 102400, ~39.4 at ctx 16K, matching bseq. The server's "extra
+~2.6 GB/GPU" vs bseq at ctx 102400 = the larger ubatch-2048 prefill compute
+buffer, harmless. No ctx-length decode tax exists.
+
+GATE STATE: llama-bench pp512 1537.6-1537.9 / tg128 45.69-45.73 (unchanged);
+bseq_val K=2 streams identical to the known-good references (198 42750 367...
+369 9542 11...). f16-path numerics untouched by construction (both fixes are
+in allocation-only / bf16-only code). VRAM at ctx 102400 ~30.9-31.1 GiB/GPU
+(97-98%) - tight but works.
+
+OPEN (noted, not chased): mixed K/V types (k=bf16/v=f16) crash at model init
+with a meta split-state assert (ggml-backend-meta.cpp:537) - edge case, the
+user config uses both-bf16; the "The answer" short-prompt multi-seq drift
+(unchanged backlog); the prefill thread; ML-Kernel/gpudh review. Test tools
+kept in /tmp: server_test.sh (base-config server smoke + timings),
+srv_* probes, tdec.cpp (token-id decode helper). Cores 04:43/04:46/05:41/
+05:47 all = bug 1; coredumpctl may still hold them.

@@ -1,0 +1,17 @@
+diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
+index 60b250ac0..a23334164 100644
+--- a/ggml/src/ggml-cuda/fattn-qsa.cu
++++ b/ggml/src/ggml-cuda/fattn-qsa.cu
+@@ -312,6 +312,12 @@ static __global__ void flash_attn_qsa(
+                     const int cell_g = identity ? tile0 + cell : idx[tile0 + cell];
+                     K_smem[cell][off] = ((const nv_bfloat162 *) (K + (int64_t) cell_g*nb11))[off];
+                 }
++                // the per-cell mask must be staged here too - the score pass
++                // reads M_smem for every K/V type, but only the F16/Q8_0
++                // gather wrote it (uninitialized smem otherwise)
++                if (flat < tile_len) {
++                    M_smem[flat] = maskh[identity ? tile0 + flat : idx[tile0 + flat]];
++                }
+             }
+             __syncthreads();
+ 
