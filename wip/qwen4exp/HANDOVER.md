@@ -281,3 +281,46 @@ the constraint.
   flags (on/off identical). Ranked levers: (1) decode-expert MMVQ config
   (down K=640 @ ~166 GB/s), (2) kernel-count-reducing fusions, (3) server
   host overhead (sampler cost / per-token slot bookkeeping).
+
+---
+
+## UPDATE 2026-09-04 (fusion session): MoE weighted-reduction fusion unblocked on Meta
+
+llama.cpp qwen4exp commit d9b1ef288 (on 6c820fd79), NOT pushed:
+- PROBLEM: the decode's expert aggregation (weighted MUL + 10 views + 9
+  ADDs/layer) only fused for 2/48 layers on the tensor-split decode. The
+  CUDA fusion pass (ggml_cuda_try_fuse -> moe_weighted_reduction) refuses
+  to fuse when dst may alias the experts input; the alloc deps that prevent
+  the aliasing are registered by the CUDA backend's graph_optimize, which
+  NEVER runs for graphs owned by the Meta-TP wrapper (meta had
+  .graph_optimize = nullptr, and the scheduler allocates the whole graph
+  into Meta buffers before the wrapper dispatches the per-device subgraphs).
+- FIX: moved the structural matcher (struct + ggml_match_moe_weighted_reduction)
+  from ggml-cuda.cu into a portable header
+  ggml/src/ggml-moe-weighted-reduction.h (pure ggml types; ggml_can_fuse_subgraph
+  is in ggml-impl.h = base lib), added ggml_backend_meta_graph_optimize to
+  ggml-backend-meta.cpp registering the same alloc deps against the
+  scheduler's allocator, and wired .graph_optimize into ggml_backend_meta_i.
+  Result: 429/429 fusion fires (all 48 layers x every fragment).
+- VERIFICATION: fused-vs-unfused decode logitdump (GGML_CUDA_DISABLE_FUSION=1
+  A/B, same prompt) BIT-IDENTICAL; "Quantum" gate passes; pp512 1557 (no
+  prefill regression from the extra alloc deps).
+- PERF: bseq_pp real-KV 2048 steady state 20.60 -> 20.33 ms/step (-0.27 ms).
+  Server (user config): 46.7 -> 47.4 t/s flat (21.08 ms/tok). Still ~1.1 ms
+  from 50 t/s server-side.
+- Debug env kept: GGML_CUDA_MWR_DEBUG=1 logs "MWR FUSED <name>" per fusion.
+
+REMAINING fusion map (from the post-fix op profile, per 48-layer decode):
+- ffn tail per layer: shared_expert_gate MM + UNARY sigmoid + MUL + ADD
+  (4 kernels; 3 tiny tails foldable into the hc_combine op contract - the
+  combine consumes ffn_out; passing moe_out/shexp_down/shared_gate instead
+  would save ~144 kernels, est ~0.2-0.5 ms; moderately invasive: combine
+  src contract 3->5, CPU ref, meta mirror).
+- GDN state ops (GET_ROWS/CPY per recr layer) est ~0.3-0.6 ms, invasive.
+- mmvq decode-expert config (item a of the user plan): MEASURED DEAD END
+  in the decode campaign (session 7: default rpb formula wins/tie every
+  shape; only ~0.3-1% single-shape wins; VDR 4->8 no change).
+- Server host overhead ~0.8 ms/step (server 21.08 vs bseq 20.33 at equal
+  real KV; threads/ctx/checkpoints ruled out earlier; sampler + per-token
+  slot bookkeeping = the suspects). NEVER HUNTED - the biggest remaining
+  single lever toward 50 t/s server-side.
