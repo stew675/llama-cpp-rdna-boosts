@@ -367,3 +367,27 @@ decode from llama-context.cpp; DEBUG_TIMINGS in server-context.cpp (the
 t_pre/t_decode/t_post/t_sampl 5s averages) is compile-time - enable the
 define + rebuild llama-server to use it. Both were reverted to zero-cost.
 Tools: /tmp/bseq_pf = bseq_pp with BSEQ_PROMPT_FILE= real-prompt prefill.
+
+---
+
+## NEW WORKSTREAM 2026-09-03: LRU / tiered expert weights (LRU_EXPERTS.md)
+
+Design doc: wip/qwen4exp/LRU_EXPERTS.md. Goal: run qwen4exp Q8_0 (~142 GiB
+projected vs 97.8 GiB VRAM) with per-layer hot expert slots on the GPUs +
+the rest host-resident, loading on demand. Based on upstream PR 26563
+(expert caching, never merged) - reviewed, its failure modes mapped onto
+the rdna-boosts tree (Meta-TP split, lazy reader, mmvq decode, CUDA-graph
+replay). Key conclusions: (1) pure LRU streaming is impossible (the router
+runs inside the decode graph - the needed experts are unknown before the
+step); the base = PR-style dual path (hot GPU slots + always-available
+host tensor, cold computed on the CPU with the LRU refresh on cadence);
+(2) all graph shapes must stay fixed per step (replay) - only the slot
+CONTENT + LUT change (H2D); (3) no bit-exact reference exists for Q8_0
+all-GPU - gates = determinism at a fixed cache state + coherence + content
+quality; (4) model facts measured: Q4_K_XL = 103.69 GiB, routed experts
+~74 GiB (71%), down [640,2560,512] Q5_1 = 600 MiB/layer, fused gate_up
+[1280,2560,512] Q4_K ~943 MiB/layer; Q8_0 expert = ~4.9 MB/(layer,expert);
+(5) phased plan: measure the routing profile first (hit-rate-vs-S curves
+decide S and the CPU cold budget), then loader placement (S=512 full
+residency as a plumbing gate), then the dual-path decode graph, then the
+live LRU policy. Suggested first steps + open questions in the doc.
