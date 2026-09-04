@@ -391,3 +391,32 @@ quality; (4) model facts measured: Q4_K_XL = 103.69 GiB, routed experts
 decide S and the CPU cold budget), then loader placement (S=512 full
 residency as a plumbing gate), then the dual-path decode graph, then the
 live LRU policy. Suggested first steps + open questions in the doc.
+
+---
+
+## 2026-09-04: tiered-expert feasibility exploration - handover for a fresh session
+
+Full writeup: wip/qwen4exp/HANDOVER-2026-09-04-tiering.md.  Short version:
+
+- Model geometry (measured): Q4_K_XL = 103.69 GiB.  Routed experts 71.73 GiB
+  (3.13 MB per layer-expert), PLE n-gram 26.82 GiB (managed independently),
+  TRUE dense only 5.13 GiB.  So "dense on GPU" is tiny; experts dominate.
+- Decided: routing is NOT heavy-tailed (355-487/512 experts/layer over 2000
+  tokens) but per-100-token windows are small (100-190) - a GPU expert cache
+  at S=200-266 covers 85-95% of selections.  Full-GPU decode ~20 ms/token;
+  full-CPU ~397 ms/token (KV-independent).  PCIe ~14 GB/s.
+- RETRACTED this session: "all experts on CPU = 5 ms/token" was an L3-cache
+  microbenchmark artifact.  The no-movement dense-GPU/all-experts-CPU split
+  is NOT viable at 20 ms/token; M=1 CPU expert cost is hundreds of ms.
+- Proposed next experiment (user): 2 GPUs, dense ~9 GB + ~40 GB experts
+  (S=266/layer) + ~14 GB KV on GPU; ~32-37 GB experts host-side.  Test if the
+  LFRU shuffling policy keeps decode GPU-bound.
+- Must measure before deciding: (M1) TRUE DRAM-cold M=1 CPU expert cost -
+  THE critical unknown; (M2) whether CPU cold work overlaps the GPU decode or
+  sits on the per-layer critical path; (M3) n-cpu-moe is the wrong mechanism
+  (per-pass H2D + crashes on Meta-TP) - need a persistent GPU slot cache +
+  in-place CPU cold compute; (M4) policy sweep at S=266 on real traces; (M5)
+  bus traffic reality at 14 GB/s with async-spread migrations.
+- Pitfall to never repeat: any CPU timing claim must defeat the 96 MB L3
+  cache (loop the same tensor and you get fantasy numbers) and be checked
+  against the 397 ms full-CPU anchor.
