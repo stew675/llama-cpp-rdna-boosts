@@ -3,24 +3,24 @@
 Stable baseline for the next stage of **qwen4exp** (Qwen3.8-Flash-Next)
 support work on top of the rdna-boosts core. Status: between WIP and
 Release - the content below is the verified, gated baseline; new work in
-this area starts from these two patches.
+this area starts from these three patches.
 
 ## Contents
 
-Two squashed patch files. They apply IN ORDER on the rdna-boosts core
+Three squashed patch files. They apply IN ORDER on the rdna-boosts core
 = upstream master `8b4b3558f` + blocks 01-13 (re-based/regenerated
 2026-09-04 from the previous `9cffdcc80`-based `8f2838d1c` set).
-Applied together they reproduce the `qwen4exp` branch tip `7faaf00fd`
+Applied together they reproduce the `qwen4exp` branch tip `9ce0d1da1`
 tree-identically (checked with `git diff --exit-code`).
 
-The 2026-09-04 re-base re-applied both patches onto the current master
-(39 commits of upstream drift past the old base) and resolved the one
-conflict it surfaced: upstream's qwen4exp attention used the dense
+The 2026-09-04 re-base re-applied the first two patches onto the current
+master (39 commits of upstream drift past the old base) and resolved the
+one conflict it surfaced: upstream's qwen4exp attention used the dense
 masked-FA path (`build_attn_mha`) where the beta patch installs the QSA
 sparse-FA default (`LLAMA_QSA_SPARSE_FA=0` opt-out).  Resolution kept
 the beta side — the dense fallback call in the patch is identical to
 upstream's current call, so nothing was lost.  Full build clean (ROCm
-7.14 gfx1201) after the merge.
+7.14 gfx1201) after the merge; patch 3 (MTP) added on top 2026-09-04.
 
 ### 1. `managed-ngrams.patch`
 The managed lazy-reader work (the 0001-0007 set, squashed to one patch):
@@ -64,24 +64,51 @@ the 2 rebase fixes + the 3 crash/coherence fixes, squashed):
 - re-allows `LLAMA_SPLIT_MODE_TENSOR` for qwen4exp; CPU INDEXER_TOPK
   reference, hc_mix type gate, lazy-reader F32 path.
 
+### 3. `mtp-draft-support.patch` (2026-09-04)
+
+The NextN/MTP draft head for Qwen3.8-Flash-Next (`--spec-type
+
+draft-mtp` + the unsloth `mtp-*.gguf`), following the upstream draft
+PRs ggml-org/llama.cpp#27836/#28243 but implemented on the beta tree:
+
+- head-only MTP exports load (trunk tensors optional via `mtp_only`,
+  trailing block under `ml.load_mtp`); trunk exports the wide residual
+  as h_nextn for the speculative driver;
+- the head folds the next token's embedding into the wide
+  hyper-connection residual (eh_proj = fc_embedding + fc_hidden fused),
+  runs one trunk-shaped block (dense attention + MoE wrapped in
+  hyper-connections) and collapses with its own hc_head_* mixer before
+  reusing the trunk's LM head.  Dense is the model-faithful choice: the
+  GGUF gives blk.48 compress_ratio 0 (its indexer tensors are dead
+  weight), so sparse-in-the-head would degrade drafts; the head still
+  rides the fused decode ops (GGML_OP_HC_MIX/HC_COMBINE at nt==1);
+- verified 2026-09-04 (3x R9700, IQ4_XS target + Q4_K_M head): loads,
+  generates; draft acceptance 0.469 (69/147), mean accepted length 2.38;
+  decode +34% vs plain at 8K ctx (57.4 vs 42.8 t/s).
+
+When upstream merges #27836/#28243, drop this patch (and the `-md`/spec
+flags stay as-is).
+
 ## Apply
 
 ```
 git checkout <master>            # fresh llama.cpp master pull
 bash <delivery>/scripts/apply-all.sh .   # master + rdna-boosts blocks 01-13 (git am)
 git apply managed-ngrams.patch
-# (optionally commit the lazy-reader work here; the support patch's
-#  pre-image is the managed-ngrams state either way)
+# (optionally commit the lazy-reader work here; the later patches'
+#  pre-images are the earlier patches' state either way)
 git apply qwen4exp-support.patch
+git apply mtp-draft-support.patch
 ```
 
-Requires ROCm gfx1201 (RDNA4) for the CUDA/HIP kernels. Both patches
-apply clean with plain `git apply` on that base (re-verified 2026-09-04
-on master `8b4b3558f` + blocks 01-13: applied tree byte-identical to the
-branch tip). If master drifts further, `git apply --3way` (or a manual
-resolve on the qwen4exp.cpp attention path) is the fallback — the patch
-pre-images now match the current master-based files, so drift has to
-overlap the patched regions again before conflicts return.
+Requires ROCm gfx1201 (RDNA4) for the CUDA/HIP kernels. All three
+patches apply clean with plain `git apply` on that base (re-verified
+2026-09-04 on master `8b4b3558f` + blocks 01-13: applied tree
+byte-identical to the branch tip). If master drifts further,
+`git apply --3way` (or a manual resolve on the qwen4exp.cpp attention
+path) is the fallback — the patch pre-images now match the current
+master-based files, so drift has to overlap the patched regions again
+before conflicts return.
 
 ## Validation status (the gates this baseline holds)
 
