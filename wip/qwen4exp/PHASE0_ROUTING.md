@@ -109,3 +109,39 @@ roughly S = 240-260 of 512 (47-51% of experts resident).
 Data files: /tmp/prof/route_html600.txt, route_code600.txt, route_math600.txt,
 route_html2000.txt.  Tools: /tmp/route_analysis.py, /tmp/cache_sim.py,
 /tmp/policy_sim.py, /tmp/route_merge.py.
+
+---
+
+## FEASIBILITY SUPPLEMENT (2026-09-04): dense-on-GPU / experts-on-CPU split
+
+Clarified design (user): GPU does the DENSE work (heavy, serial, every token),
+CPU does the ROUTED EXPERTS (light, parallel, spillable).  Measured on the
+9950X3D + R9700s, Q4_K_XL:
+
+- CPU M=1 mmid at the TRUE qwen4exp shapes (test-backend-ops):
+  gate_up [K=2560, out=1280, 10-of-512] Q4_K = 55.7 us/layer @ 1.18 TFLOPS
+  down    [K=2560, out=640,  10-of-512] Q5_1 = 48.2 us/layer @ 680 GFLOPS
+  => all 10 experts of one layer ~= 104 us; ALL 48 layers ~= 5 ms/token worst case
+- full-CPU decode = 397 ms/token and KV-INDEPENDENT (64 vs 512 KV identical)
+  => the dense work (attention/GDN/norms, sequential + recurrent state) is
+     ~392 ms of it.  The experts are only ~5 ms even 100% on the CPU.
+- => the CPU is FAST at expert mmid but SLOW at dense.  The split direction is
+     unambiguous: dense belongs on the GPU, experts can spill to the CPU.
+
+2-GPU Q4_K_XL frame (50 GB weights + 14 GB KV, model 111.3 GB):
+- dense 34.3 GB always on GPU; expert budget 15.7 GB -> S = 104..208 of 512/layer
+- cold experts on CPU: static S=104 (59% cold) = 2.9 ms CPU; LFRU S=104 (25%) = 1.2 ms
+- both hide under the GPU's dense-bound ~20 ms/token => ~50 t/s either way
+- llama.cpp TODAY at 50 GB (layer-granular: 27 whole layers on CPU incl. dense)
+  = ~232 ms/token = 4.3 t/s.  The tiered split is an ~11x win over that.
+
+Policy verdict for THIS frame: static expert split (dense + top-S by profile on
+GPU) == LFRU in token rate; the movement policy adds only bus traffic here.
+The movement policy becomes load-bearing when the CPU expert budget tightens
+(Q8_0: ~4.9 MB/experts, smaller S, 5 ms worst-case CPU vs a smaller GPU budget).
+
+Implementation note: llama.cpp's existing --n-cpu-moe path (dense GPU + expert
+tensors host-resident) is the WRONG mechanism for this - it H2D-copies the used
+experts to the GPU every pass (~1.5 GB/token at 14 GB/s PCIe = ~105 ms/token).
+The design here computes cold experts ON THE CPU IN PLACE (only the tiny
+[2560] result crosses) - that is the novel part and is what makes the split win.
