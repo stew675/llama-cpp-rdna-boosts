@@ -8,9 +8,19 @@ this area starts from these two patches.
 ## Contents
 
 Two squashed patch files. They apply IN ORDER on the rdna-boosts core
-= upstream master `9cffdcc80` + blocks 01-13 (tip commit `8f2838d1c`,
-verified 2026-09-03). Applied together they reproduce the `qwen4exp`
-branch tip `d9b1ef288` tree-identically (checked with `git diff --exit-code`).
+= upstream master `8b4b3558f` + blocks 01-13 (re-based/regenerated
+2026-09-04 from the previous `9cffdcc80`-based `8f2838d1c` set).
+Applied together they reproduce the `qwen4exp` branch tip `7faaf00fd`
+tree-identically (checked with `git diff --exit-code`).
+
+The 2026-09-04 re-base re-applied both patches onto the current master
+(39 commits of upstream drift past the old base) and resolved the one
+conflict it surfaced: upstream's qwen4exp attention used the dense
+masked-FA path (`build_attn_mha`) where the beta patch installs the QSA
+sparse-FA default (`LLAMA_QSA_SPARSE_FA=0` opt-out).  Resolution kept
+the beta side — the dense fallback call in the patch is identical to
+upstream's current call, so nothing was lost.  Full build clean (ROCm
+7.14 gfx1201) after the merge.
 
 ### 1. `managed-ngrams.patch`
 The managed lazy-reader work (the 0001-0007 set, squashed to one patch):
@@ -57,16 +67,21 @@ the 2 rebase fixes + the 3 crash/coherence fixes, squashed):
 ## Apply
 
 ```
-git checkout 8f2838d1c          # master 9cffdcc80 + rdna-boosts blocks 01-13
+git checkout <master>            # fresh llama.cpp master pull
+bash <delivery>/scripts/apply-all.sh .   # master + rdna-boosts blocks 01-13 (git am)
 git apply managed-ngrams.patch
+# (optionally commit the lazy-reader work here; the support patch's
+#  pre-image is the managed-ngrams state either way)
 git apply qwen4exp-support.patch
 ```
 
 Requires ROCm gfx1201 (RDNA4) for the CUDA/HIP kernels. Both patches
-apply clean with `git apply --check` on the stated base. NOTE: the local
-qwen4exp branch tip (7c7d9eeff) carries one extra env-gated diagnostic
-commit (LLAMA_DECODE_PHASE_DEBUG timers in llama-context.cpp) that is
-INTENTIONALLY excluded from this patch - debug scaffolding, not promotable.
+apply clean with plain `git apply` on that base (re-verified 2026-09-04
+on master `8b4b3558f` + blocks 01-13: applied tree byte-identical to the
+branch tip). If master drifts further, `git apply --3way` (or a manual
+resolve on the qwen4exp.cpp attention path) is the fallback — the patch
+pre-images now match the current master-based files, so drift has to
+overlap the patched regions again before conflicts return.
 
 ## Validation status (the gates this baseline holds)
 

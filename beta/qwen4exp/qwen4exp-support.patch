@@ -265,7 +265,7 @@ index bb5ea33b3..a3c378cc4 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index ffe20b9d0..dd3bc6ec3 100644
+index 6862128e6..1ebb53073 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -958,6 +958,12 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
@@ -281,8 +281,8 @@ index ffe20b9d0..dd3bc6ec3 100644
      if (allow) {
          for (int i = 0; i < GGML_MAX_SRC; i++) {
              const struct ggml_tensor * src = tensor->src[i];
-@@ -2115,6 +2121,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
- bool ggml_backend_op_alloc_size_may_expand(enum ggml_op op) {
+@@ -2112,6 +2118,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
+ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
      switch (op) {
          case GGML_OP_FLASH_ATTN_EXT:
 +        case GGML_OP_FLASH_ATTN_QSA:
@@ -1494,7 +1494,7 @@ index 000000000..0a2059477
 +void ggml_cuda_flash_attn_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +bool ggml_cuda_flash_attn_qsa_supported(int device, const ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 302a3c997..6a7bae14d 100644
+index 934a75d4e..1012564d5 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -1521,7 +1521,7 @@ index 302a3c997..6a7bae14d 100644
  #include "ggml-cuda/set.cuh"
  #include "ggml-cuda/set-rows.cuh"
  #include "ggml-cuda/pad_reflect_1d.cuh"
-@@ -2450,6 +2454,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2525,6 +2529,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_FLASH_ATTN_EXT:
              ggml_cuda_flash_attn_ext(ctx, dst);
              break;
@@ -1534,7 +1534,7 @@ index 302a3c997..6a7bae14d 100644
          case GGML_OP_CROSS_ENTROPY_LOSS:
              ggml_cuda_cross_entropy_loss(ctx, dst);
              break;
-@@ -2474,6 +2484,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2549,6 +2559,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_DSV4_HC_POST:
              ggml_cuda_op_dsv4_hc_post(ctx, dst);
              break;
@@ -1547,7 +1547,7 @@ index 302a3c997..6a7bae14d 100644
          case GGML_OP_RWKV_WKV7:
              ggml_cuda_op_rwkv_wkv7(ctx, dst);
              break;
-@@ -3191,151 +3207,6 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+@@ -3266,151 +3282,6 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
      return is_ok;
  }
  
@@ -1699,7 +1699,7 @@ index 302a3c997..6a7bae14d 100644
  static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                 int                                       node_idx,
                                 std::initializer_list<enum ggml_op>       ops,
-@@ -3603,10 +3474,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3678,10 +3549,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      ggml_tensor * node = cgraph->nodes[i];
  
      if (node->op == GGML_OP_MUL) {
@@ -1714,7 +1714,7 @@ index 302a3c997..6a7bae14d 100644
                  ggml_cuda_op_moe_weighted_reduction(
                      *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                  return match.node_count - 1;
-@@ -5246,8 +5119,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5321,8 +5194,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  continue;
              }
  
@@ -1725,7 +1725,7 @@ index 302a3c997..6a7bae14d 100644
                  continue;
              }
  
-@@ -6233,8 +6106,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6310,8 +6183,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
@@ -2706,10 +2706,10 @@ index 000000000..c90460a45
 +    return true;
 +}
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 8dc094508..2de437b08 100644
+index 6257cdbe5..2f8c08c81 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -1083,6 +1083,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1084,6 +1084,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "DSV4_HC_COMB",
      "DSV4_HC_PRE",
      "DSV4_HC_POST",
@@ -2720,7 +2720,7 @@ index 8dc094508..2de437b08 100644
  
      "UNARY",
  
-@@ -1100,7 +1104,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1101,7 +1105,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "GLU",
  };
  
@@ -2729,7 +2729,7 @@ index 8dc094508..2de437b08 100644
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1198,6 +1202,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1199,6 +1203,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "dsv4_hc_comb(mixes, scale, base)",
      "dsv4_hc_pre(x, weights)",
      "dsv4_hc_post(x, residual, post, comb)",
@@ -2740,7 +2740,7 @@ index 8dc094508..2de437b08 100644
  
      "unary(x)",
  
-@@ -1215,7 +1223,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1216,7 +1224,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "glu(x)",
  };
  
@@ -2749,7 +2749,7 @@ index 8dc094508..2de437b08 100644
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -5531,6 +5539,102 @@ void ggml_flash_attn_ext_add_sinks(
+@@ -5532,6 +5540,102 @@ void ggml_flash_attn_ext_add_sinks(
      a->src[4] = sinks;
  }
  
@@ -2852,7 +2852,7 @@ index 8dc094508..2de437b08 100644
  // ggml_flash_attn_back
  
  struct ggml_tensor * ggml_flash_attn_back(
-@@ -6528,6 +6632,87 @@ struct ggml_tensor * ggml_dsv4_hc_post(
+@@ -6529,6 +6633,87 @@ struct ggml_tensor * ggml_dsv4_hc_post(
      return result;
  }
  
@@ -2941,10 +2941,10 @@ index 8dc094508..2de437b08 100644
  
  struct ggml_hash_set ggml_hash_set_new(size_t size) {
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index 446de4ae2..274f41584 100644
+index d06be641a..15929c837 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
-@@ -1145,7 +1145,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+@@ -1148,7 +1148,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
          case LLM_ARCH_BAILINGMOE3:
          case LLM_ARCH_KIMI_K3:
          case LLM_ARCH_QWEN3TTS:
@@ -2953,7 +2953,7 @@ index 446de4ae2..274f41584 100644
          default:
              return true;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index f286bd1da..4f01ce0e9 100644
+index c1ef12f56..7b2f9b3d5 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -241,6 +241,24 @@ llama_context::llama_context(
@@ -3023,7 +3023,7 @@ index 3cf0f3dcc..bdf1365f3 100644
      }
  }
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index d98d538ab..6c2a3fbf4 100644
+index decbef42a..c05f40a15 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -5,6 +5,7 @@
@@ -3123,10 +3123,13 @@ index d98d538ab..6c2a3fbf4 100644
      cb(top_k, "indexer_top_k", il);
  
      return top_k;
-@@ -778,7 +811,41 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -778,10 +811,41 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
      ggml_tensor * k = mctx_cur->get_k(ctx0, il);
      ggml_tensor * v = mctx_cur->get_v(ctx0, il);
  
+-    // TODO: enable sparse attention when we are ready
+-    // ref: https://github.com/ggml-org/llama.cpp/pull/27970
+-    //ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
 -    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
 +    // The fused sparse kernel (attend only the indexer-selected top-k cells)
 +    // is the DEFAULT flash-attention path; LLAMA_QSA_SPARSE_FA=0 keeps the

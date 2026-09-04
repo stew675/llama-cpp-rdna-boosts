@@ -105,7 +105,7 @@ index ef7a012c4..3805eb9ec 100644
          int32_t main_gpu;
  
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 8922dc12a..bf7f214cc 100644
+index 221e14f7f..57d1ca865 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
 @@ -23,6 +23,7 @@ add_library(llama
@@ -401,7 +401,7 @@ index 000000000..ac7a86a4e
 +    std::atomic<uint64_t>  n_hits{0}, n_misses{0}, n_bytes_read{0};
 +};
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 7663797ba..98e0e9de5 100644
+index 91bb5e7cc..e5c56aea1 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -1106,6 +1106,14 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
@@ -491,10 +491,10 @@ index 9e51d0ce7..bc60f759b 100644
              return !ranges.empty();
          }
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index bfce09de0..b9c45b124 100644
+index b837e2765..0b23563fe 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -2689,6 +2689,7 @@ llama_model_params llama_model_default_params() {
+@@ -2748,6 +2748,7 @@ llama_model_params llama_model_default_params() {
          /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
          /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
          /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
@@ -502,7 +502,7 @@ index bfce09de0..b9c45b124 100644
          /*.main_gpu                    =*/ 0,
          /*.tensor_split                =*/ nullptr,
          /*.progress_callback           =*/ nullptr,
-@@ -3135,7 +3136,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
+@@ -3196,7 +3197,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
      TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
      TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
      TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
@@ -513,10 +513,10 @@ index bfce09de0..b9c45b124 100644
  ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
      GGML_ASSERT(ml != nullptr);
 diff --git a/src/llama-model.h b/src/llama-model.h
-index ee6bb5ac3..b4efff5fc 100644
+index 4c4a30e01..606c66472 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -789,6 +789,7 @@ struct llama_model_base : public llama_model {
+@@ -790,6 +790,7 @@ struct llama_model_base : public llama_model {
      const int TENSOR_SKIP_IF_VIRTUAL;
      const int TENSOR_ALLOW_RESHAPE;
      const int TENSOR_READ_LAZY;
@@ -525,10 +525,10 @@ index ee6bb5ac3..b4efff5fc 100644
      explicit llama_model_base(const llama_model_params & params);
      virtual ~llama_model_base() = default;
 diff --git a/src/llama.cpp b/src/llama.cpp
-index 5760c23a8..bbc6a3f0f 100644
+index 7e7eacbab..64bae7da6 100644
 --- a/src/llama.cpp
 +++ b/src/llama.cpp
-@@ -328,7 +328,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+@@ -329,7 +329,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
          llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
              params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
  
@@ -539,7 +539,7 @@ index 5760c23a8..bbc6a3f0f 100644
          ml.print_info();
          std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
 diff --git a/src/models/models.h b/src/models/models.h
-index 9b87a40d5..1670521c4 100644
+index 93a6b3494..9d8494605 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
 @@ -3,9 +3,12 @@
@@ -555,7 +555,7 @@ index 9b87a40d5..1670521c4 100644
  #include <map>
  
  class llama_memory_hybrid_idx_context;
-@@ -2278,6 +2281,24 @@ struct llama_model_qwen35 : public llama_model_base {
+@@ -2341,6 +2344,24 @@ struct llama_model_qwen35 : public llama_model_base {
  struct llama_model_qwen4exp : public llama_model_base {
      llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
  
@@ -580,7 +580,7 @@ index 9b87a40d5..1670521c4 100644
      class llm_graph_input_qsa;
  
      void load_arch_hparams(llama_model_loader & ml) override;
-@@ -2378,6 +2399,10 @@ struct llama_model_qwen4exp : public llama_model_base {
+@@ -2441,6 +2462,10 @@ struct llama_model_qwen4exp : public llama_model_base {
      };
  
      std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -592,7 +592,7 @@ index 9b87a40d5..1670521c4 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8f0e47b1f..d98d538ab 100644
+index 1484c9b07..decbef42a 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -6,6 +6,10 @@
@@ -656,7 +656,7 @@ index 8f0e47b1f..d98d538ab 100644
      }
  
      for (int il = 0; il < n_layer; ++il) {
-@@ -1031,10 +1065,14 @@ public:
+@@ -1034,10 +1068,14 @@ public:
  
      bool can_reuse(const llm_graph_params & params) override {
          mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
@@ -672,7 +672,7 @@ index 8f0e47b1f..d98d538ab 100644
  
      const llama_model_qwen4exp & pmodel;
  
-@@ -1043,6 +1081,7 @@ public:
+@@ -1046,6 +1084,7 @@ public:
  
      // scratch, reused across set_input() calls
      std::vector<llama_token> prev;
@@ -680,7 +680,7 @@ index 8f0e47b1f..d98d538ab 100644
  };
  
  void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
-@@ -1105,7 +1144,22 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -1108,7 +1147,22 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
          }
      }
  
@@ -704,7 +704,7 @@ index 8f0e47b1f..d98d538ab 100644
  }
  
  // Read a conv history out of its own recurrent row and write the new tail back.
-@@ -1172,6 +1226,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+@@ -1175,6 +1229,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
      auto ple_inp = std::make_unique<llm_graph_input_ple>(
              static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
  
@@ -1007,10 +1007,10 @@ index 000000000..f4fd3f599
 +
 +#endif
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index b2ea245ab..f7bea5942 100644
+index 0f3d1c79a..e6eca77cc 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
-@@ -371,10 +371,12 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
+@@ -389,10 +389,12 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
  
  static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
          struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
@@ -1024,7 +1024,7 @@ index b2ea245ab..f7bea5942 100644
      std::vector<ggml_backend_dev_t> devs_copy = devs;
      devs_copy.push_back(nullptr);
      model_params.devices = devs_copy.data();
-@@ -763,7 +765,8 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
+@@ -782,7 +784,8 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                          ms.save(file);
                          rewind(file);
  
