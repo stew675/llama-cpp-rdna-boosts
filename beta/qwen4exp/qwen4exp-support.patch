@@ -844,10 +844,10 @@ index 4c1642a67..259f418a4 100644
  void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
 new file mode 100644
-index 000000000..63398ca6c
+index 000000000..d61e96a68
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/fattn-qsa.cu
-@@ -0,0 +1,617 @@
+@@ -0,0 +1,638 @@
 +#include "common.cuh"
 +#include "fattn-qsa.cuh"
 +#include "fattn-common.cuh"
@@ -865,8 +865,10 @@ index 000000000..63398ca6c
 +//   mask [n_kv, n_tps, 1, n_stream] F16
 +//   dst  [n_embd_head_v, n_head_q, n_tps, n_stream] F32
 +//
-+// Each block handles ONE token column for ALL q-heads of a stream (one
-+// warp per head).  All heads read the same idx list and the same K/V cells
++// Each block handles ONE token column for up to QSA_MAX_HEADS q-heads of a
++// stream (one warp per head); a layer with more heads is split into one
++// launch per QSA_MAX_HEADS-head group, each re-gathering the shared K/V
++// cells from L2.  All heads read the same idx list and the same K/V cells
 +// (gqa: same kv-head), so the gathers hit the same L1 lines and the L2
 +// fetch is shared - the dense tile FA reads each K/V cell once for all
 +// heads, this kernel must too or the 12x re-gather saturates L2.
@@ -878,8 +880,14 @@ index 000000000..63398ca6c
 +// tile.  This is the same structure as the vec FA kernel and breaks the
 +// per-cell serial dependency chain.
 +
++// One warp per head; a block covers up to this many heads.  The launch
++// bounds and the per-warp KQ_w smem staging are sized for it, and the host
++// chunks larger head counts into one launch per group (see
++// ggml_cuda_flash_attn_qsa_case below).
++static constexpr int QSA_MAX_HEADS = 16;
++
 +static constexpr __device__ int ggml_cuda_fattn_qsa_get_nthreads_device() {
-+    return 16*WARP_SIZE; // 1 warp per head; up to 16 heads per block
++    return QSA_MAX_HEADS*WARP_SIZE;
 +}
 +
 +template<int D, ggml_type type_KV, bool use_logit_softcap> // D == head size
@@ -898,6 +906,7 @@ index 000000000..63398ca6c
 +        const float scale,
 +        const float logit_softcap,
 +        const bool   identity,
++        const int    head_base,
 +        const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
 +                            const int32_t nb01, const int32_t nb02, const int32_t nb03,
 +        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
@@ -920,6 +929,7 @@ index 000000000..63398ca6c
 +
 +    if constexpr (use_logit_softcap) {
 +        GGML_UNUSED_VARS(Q, K, V, idx, mask, dst, parts, meta, n_slices, n_slice_cells, scale, logit_softcap,
++            head_base,
 +            ne00, ne01, ne02, ne03, nb01, nb02, nb03,
 +            ne10, ne11, ne12, ne13, nb11, nb12, nb13,
 +            nb21, nb22, nb23, ne30, ne31, ne33, nb31, nb33,
@@ -928,19 +938,21 @@ index 000000000..63398ca6c
 +        return;
 +    }
 +
-+    // One block per (column, top-k slice, stream); warp w = head w.
-+    // With n_slices == 1 the block walks the whole top-k list and writes the
-+    // final result; sliced, each block walks its slice of the list and writes
-+    // an unnormalized partial plus (max, sum) that a combine kernel merges.
++    // One block per (column, top-k slice, stream, head chunk); warp w works
++    // on head head_base + w.  Layers with more than QSA_MAX_HEADS heads are
++    // chunked by the host into one launch per group.  With n_slices == 1 the
++    // block walks the whole top-k list and writes the final result; sliced,
++    // each block walks its slice of the list and writes an unnormalized
++    // partial plus (max, sum) that a combine kernel merges.
 +    const int col = blockIdx.x;
 +    const int tid = threadIdx.x;
 +    const int slice = blockIdx.y;
 +
 +    const int sequence = blockIdx.z;
-+    const int head     = threadIdx.y;
++    const int head     = head_base + threadIdx.y;
 +    const int gqa_ratio = ne02 / ne12;
 +
-+    if (col >= int(ne01.z)) {
++    if (col >= int(ne01.z) || head >= ne02) {
 +        return;
 +    }
 +
@@ -954,10 +966,11 @@ index 000000000..63398ca6c
 +    const int k0   = slice*n_slice_cells;
 +    const int k1   = min(ne40, k0 + n_slice_cells);
 +
-+    // Per-warp tile exp weights, staged in shared:
-+    constexpr int NHEADS_MAX = 16; // launch bounds: 16 warps max
-+    __shared__ float KQ_w[NHEADS_MAX][WARP_SIZE];
-+    float * KQ_warp = KQ_w[head];
++    // Per-warp tile exp weights, staged in shared.  Indexed by the local
++    // warp id, not the chunked global head, to stay within the block's
++    // QSA_MAX_HEADS rows.
++    __shared__ float KQ_w[QSA_MAX_HEADS][WARP_SIZE];
++    float * KQ_warp = KQ_w[threadIdx.y];
 +
 +    // K tile staged in shared memory. All heads read the same cells (gqa),
 +    // so one cooperative gather per tile serves the whole block instead of
@@ -1278,7 +1291,7 @@ index 000000000..63398ca6c
 +    }
 +#else
 +    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, idx_ptr, mask_ptr, dst_ptr, parts_ptr, meta_ptr, n_slices, n_slice_cells,
-+        scale, logit_softcap, identity,
++        scale, logit_softcap, identity, head_base,
 +        ne00, ne01, ne02, ne03, nb01, nb02, nb03,
 +        ne10, ne11, ne12, ne13, nb11, nb12, nb13,
 +        nb21, nb22, nb23, ne30, ne31, ne33, nb31, nb33,
@@ -1339,56 +1352,64 @@ index 000000000..63398ca6c
 +    }
 +
 +    const dim3 blocks_num(Q->ne[1], n_slices, Q->ne[3]);
-+    const dim3 block_dim(WARP_SIZE, Q->ne[2], 1);
 +
 +    static const bool qsa_debug = []() {
 +        const char * env = getenv("GGML_CUDA_QSA_DEBUG");
 +        return env != nullptr;
 +    }();
 +    if (qsa_debug) {
-+        fprintf(stderr, "QSA_DEBUG dev %d layer-D%d kv %d n_kv=%d n_top_k=%d n_tps=%d n_stream=%d n_head=%d gqa=%d slices=%d block=(%d,%d,%d) grid=(%d,%d,%d)\n",
++        fprintf(stderr, "QSA_DEBUG dev %d layer-D%d kv %d n_kv=%d n_top_k=%d n_tps=%d n_stream=%d n_head=%d gqa=%d slices=%d head_groups=%d grid=(%d,%d,%d)\n",
 +                ctx.device, D, (int) K->type, (int) K->ne[1], (int) n_top_k,
 +                (int) Q->ne[1], (int) Q->ne[3], (int) Q->ne[2],
 +                (int) (Q->ne[2] / std::max(1, (int) K->ne[2])),
 +                n_slices,
-+                block_dim.x, block_dim.y, block_dim.z, blocks_num.x, blocks_num.y, blocks_num.z);
++                (int) ((Q->ne[2] + QSA_MAX_HEADS - 1) / QSA_MAX_HEADS),
++                blocks_num.x, blocks_num.y, blocks_num.z);
 +    }
 +
 +    const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 +
-+    ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, 0, main_stream);
-+    if (logit_softcap == 0.0f) {
-+        constexpr bool use_logit_softcap = false;
-+        ggml_cuda_kernel_launch(flash_attn_qsa<D, type_KV, use_logit_softcap>, launch_params,
-+            (const char *) Q->data,
-+            (const char *) K->data,
-+            (const char *) V->data,
-+            (const int  *) idx->data,
-+            (const char *) mask->data,
-+            (float *) dst->data,
-+            dst_data, meta.ptr, n_slices, n_slice_cells,
-+            scale, logit_softcap, identity,
-+            Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-+            K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3],
-+            V->nb[1], V->nb[2], V->nb[3],
-+            mask->ne[0], mask->ne[1], mask->ne[3], mask->nb[1], mask->nb[3],
-+            idx->ne[0], idx->ne[1], idx->ne[3], idx->nb[1], idx->nb[3]);
-+    } else {
-+        constexpr bool use_logit_softcap = true;
-+        ggml_cuda_kernel_launch(flash_attn_qsa<D, type_KV, use_logit_softcap>, launch_params,
-+            (const char *) Q->data,
-+            (const char *) K->data,
-+            (const char *) V->data,
-+            (const int  *) idx->data,
-+            (const char *) mask->data,
-+            (float *) dst->data,
-+            dst_data, meta.ptr, n_slices, n_slice_cells,
-+            scale, logit_softcap, identity,
-+            Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-+            K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3],
-+            V->nb[1], V->nb[2], V->nb[3],
-+            mask->ne[0], mask->ne[1], mask->ne[3], mask->nb[1], mask->nb[3],
-+            idx->ne[0], idx->ne[1], idx->ne[3], idx->nb[1], idx->nb[3]);
++    // Chunk the heads: one block covers QSA_MAX_HEADS of them (one warp per
++    // head; launch bounds and KQ_w smem are sized for that).  Each extra
++    // launch re-walks the same top-k list and re-gathers the K/V tiles from
++    // L2, writing a disjoint head range.
++    const int n_head_q = (int) Q->ne[2];
++    for (int head_base = 0; head_base < n_head_q; head_base += QSA_MAX_HEADS) {
++        const dim3 block_dim(WARP_SIZE, std::min(QSA_MAX_HEADS, n_head_q - head_base), 1);
++        const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, main_stream);
++        if (logit_softcap == 0.0f) {
++            constexpr bool use_logit_softcap = false;
++            ggml_cuda_kernel_launch(flash_attn_qsa<D, type_KV, use_logit_softcap>, launch_params,
++                (const char *) Q->data,
++                (const char *) K->data,
++                (const char *) V->data,
++                (const int  *) idx->data,
++                (const char *) mask->data,
++                (float *) dst->data,
++                dst_data, meta.ptr, n_slices, n_slice_cells,
++                scale, logit_softcap, identity, head_base,
++                Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
++                K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3],
++                V->nb[1], V->nb[2], V->nb[3],
++                mask->ne[0], mask->ne[1], mask->ne[3], mask->nb[1], mask->nb[3],
++                idx->ne[0], idx->ne[1], idx->ne[3], idx->nb[1], idx->nb[3]);
++        } else {
++            constexpr bool use_logit_softcap = true;
++            ggml_cuda_kernel_launch(flash_attn_qsa<D, type_KV, use_logit_softcap>, launch_params,
++                (const char *) Q->data,
++                (const char *) K->data,
++                (const char *) V->data,
++                (const int  *) idx->data,
++                (const char *) mask->data,
++                (float *) dst->data,
++                dst_data, meta.ptr, n_slices, n_slice_cells,
++                scale, logit_softcap, identity, head_base,
++                Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
++                K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3],
++                V->nb[1], V->nb[2], V->nb[3],
++                mask->ne[0], mask->ne[1], mask->ne[3], mask->nb[1], mask->nb[3],
++                idx->ne[0], idx->ne[1], idx->ne[3], idx->nb[1], idx->nb[3]);
++        }
 +    }
 +
 +    if (n_slices > 1) {

@@ -61,6 +61,16 @@ the 2 rebase fixes + the 3 crash/coherence fixes, squashed):
   ggml/src/ggml-moe-weighted-reduction.h), so the gallocr keeps the
   experts input alive and the CUDA-side memory check passes. Decode
   -0.27 ms/step at real KV 2048; fused == unfused logits bit-identical;
+- QSA LAYER-SPLIT CRASH FIX (2026-09-04): heads chunked across launches.
+  The kernel is launch-bounded to 16 warps (one per head) but the dispatch
+  put ALL Q-heads of a layer in blockDim.y, so a 24-head QSA layer in
+  layer-split mode (each GPU runs whole layers) launched a 768-thread
+  block and HIP rejected it ("unspecified launch failure", GGML_ABORT).
+  Tensor split hid the bug: 24 heads / 3 GPUs = 8 per device.  Fix: one
+  launch per QSA_MAX_HEADS (16) head group, `head_base` kernel arg,
+  `KQ_w` indexed by the local warp id; blockDim.y capped at 16.  Layer
+  split now runs: pp10240 1000 t/s / tg128 34.6 t/s (vs tensor 1345/47.5),
+  at parity with the dense masked-FA fallback in layer mode;
 - re-allows `LLAMA_SPLIT_MODE_TENSOR` for qwen4exp; CPU INDEXER_TOPK
   reference, hc_mix type gate, lazy-reader F32 path.
 
