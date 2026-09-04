@@ -2,9 +2,11 @@
 
 13 patches against the llama.cpp fork point `9cffdcc80`
 ("server : accept data: URLs for input_video and input_audio (#27735)";
-re-based 2026-09-02 from `0eadefebd`; block 13 amended 2026-09-02 with
-two MTP regression fixes — see the block-13 notes below and
-`../benchmarks/mtp-adaptive-methodology.md` for the MTP baseline gate):
+re-based 2026-09-02 from `0eadefebd`; block 12 amended 2026-09-04 with
+the runtime NCCL-failure fallback (issue #13, see the block-12 notes
+below); block 13 amended 2026-09-02 with two MTP regression fixes — see
+the block-13 notes below and `../benchmarks/mtp-adaptive-methodology.md`
+for the MTP baseline gate):
 
 | patch | content |
 |---|---|
@@ -19,7 +21,7 @@ two MTP regression fixes — see the block-13 notes below and
 | `0009` | meta-buffer compute-container headroom |
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
-| `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate |
+| `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); see block 13 notes below |
 
 ## Apply (fresh checkout at the fork point)
@@ -146,6 +148,37 @@ upstream's additions.
     (rdna-boosts tip `8a426cf79`); commit hashes in the 01-11 patch
     headers drift from the earlier records (the fork was rebuilt; diff
     content is unchanged).
+- **Community-report fix round (2026-09-04, issue #13, reporter
+  tungel):** runtime NCCL/RCCL failures are no longer fatal.  RCCL >=
+  2.30.4 can refuse kernel dispatch on the first collective
+  (`hipErrorIllegalState`: "the operation cannot be performed in the
+  present state") when a GPU sits behind a PCIe root port without
+  32/64-bit AtomicOp completer support (e.g. PCH/Z390), even though
+  `ncclCommInitAll` succeeds (see ROCm/ROCm#6520) — the process used to
+  abort at the first prefill AllReduce (`NCCL_CHECK` -> `GGML_ABORT`)
+  although the internal host-staged pipeline was up and stable.  Fix
+  (folded into the block-12 commit): on the first NCCL runtime failure
+  the comm layer clears the sticky HIP errors the failed dispatch left
+  on each AR device (else the fallback aborts on the next CUDA_CHECK),
+  warns once with a pointer at the known cause + the
+  `dmesg | grep -i atomic` check, permanently stops using NCCL for the
+  rest of the run (comm state is unknown), and re-routes AllReduce to
+  the internal pipeline when available, otherwise to the meta backend's
+  butterfly; the failing call itself returns false so the butterfly
+  handles it.  `ncclCommDestroy` at teardown is also no longer fatal.
+  No behavior change on healthy setups — the fallback only triggers
+  when NCCL itself fails.
+  - Re-verified 2026-09-04: set regenerated from the fork (rdna-boosts
+    tip `b830050bf`), clean-apply sim at `9cffdcc80` (git am clean,
+    zero whitespace warnings, applied tree byte-identical to the fork
+    tip), full build clean (ROCm 7.14 gfx1201, RCCL+graphs+native),
+    llama-cli same-seed coherence IDENTICAL pre vs post fix (27B Q8_0,
+    3-GPU tensor split), perf unregressed at depth-16384 hybrid:
+    2-GPU (1,2) tg128 32.48 -> 32.40, 3-GPU (0,1,2) tg128 39.33 ->
+    39.31 (both within noise; pp512 within run-to-run spread).  The
+    failing-call correctness relies on dispatch-time refusal leaving
+    the buffers pristine (nothing executed); the Protocol-A gate on the
+    reporter's rig closes the residual partial-execution caveat.
 - **Compiler-warning clean** (2026-08-29 follow-up): ROCm 7.14 marks
   `hipError_t` `[[nodiscard]]`, and the original HIP port left 27
   unchecked HIP calls (all `-Wunused-value` in the ggml-hip build).  All

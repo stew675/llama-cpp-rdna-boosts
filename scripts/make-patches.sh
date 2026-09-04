@@ -5,9 +5,9 @@
 #   fork-path     path to the stew675/llama.cpp fork checkout (default:
 #                 ../llama.cpp relative to this repo)
 #   baseline-sha  the upstream baseline the patches are generated against
-#                 (default: 0eadefebd, see MANIFESTS.md)
+#                 (default: 9cffdcc80, see MANIFESTS.md)
 #   blocks-tip    the fork commit carrying all 13 blocks (default:
-#                 482837e5a, the block-13 commit)
+#                 b830050bf, the block-13 commit)
 #
 # All 13 blocks are the fork commits baseline-sha..blocks-tip, exported with
 # `git format-patch` (the canonical, verified form; applies with `git am`).
@@ -19,8 +19,8 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
-BASELINE="${2:-0eadefebd}"
-TIP="${3:-482837e5a}"
+BASELINE="${2:-9cffdcc80}"
+TIP="${3:-b830050bf}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then

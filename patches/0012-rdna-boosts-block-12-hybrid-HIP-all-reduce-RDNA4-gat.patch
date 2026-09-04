@@ -1,15 +1,35 @@
-From ee75bb17dabcdd53138f53d487c1f437f5da5a5e Mon Sep 17 00:00:00 2001
+From b6f85d3998e01cccc0234fdd89c49ba9db1343a2 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 03:54:07 -0500
 Subject: [PATCH 12/13] rdna-boosts: block 12: hybrid HIP all-reduce
  (RDNA4-gated)
 
+Amended 2026-09-04 (stew675/llama-cpp-rdna-boosts issue #13, reporter
+tungel): runtime NCCL/RCCL failures are no longer fatal.  RCCL >= 2.30.4
+can refuse kernel dispatch on the first collective (hipErrorIllegalState:
+"the operation cannot be performed in the present state") when a GPU sits
+behind a PCIe root port without 32/64-bit AtomicOp completer support
+(e.g. PCH/Z390), even though ncclCommInitAll succeeds (see ROCm/ROCm#6520).
+Previously the process aborted at the first prefill AllReduce
+(NCCL_CHECK -> GGML_ABORT) although the internal host-staged pipeline was
+up and stable.
+
+On the first NCCL failure the comm layer now: clears the sticky HIP errors
+the failed dispatch left on each AR device (else the fallback aborts on the
+next CUDA_CHECK), warns once with the known cause + `dmesg | grep -i
+atomic` check, permanently stops using NCCL for the rest of the run (comm
+state is unknown), and re-routes AllReduce to the internal host-staged
+pipeline when available, otherwise to the meta backend's butterfly.  The
+failing call itself returns false, so the butterfly handles it.
+ncclCommDestroy at teardown is also no longer fatal (comm state unknown
+after a failed collective).  No behavior change on healthy setups; the
+fallback only triggers when NCCL itself fails.
 ---
  ggml/src/ggml-cuda/allreduce-hip.cu | 1567 +++++++++++++++++++++++++++
  ggml/src/ggml-cuda/allreduce.cu     |   30 +-
  ggml/src/ggml-cuda/allreduce.cuh    |   21 +
- ggml/src/ggml-cuda/ggml-cuda.cu     |  127 ++-
- 4 files changed, 1708 insertions(+), 37 deletions(-)
+ ggml/src/ggml-cuda/ggml-cuda.cu     |  216 +++-
+ 4 files changed, 1790 insertions(+), 44 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/allreduce-hip.cu
 
 diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
@@ -1661,10 +1681,37 @@ index 0f2c9518d..4985d969e 100644
 +void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
 +                                 const float * data, int64_t count);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 08c9cf0c2..42dab06e2 100644
+index 08c9cf0c2..cada2dd57 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -1007,6 +1007,15 @@ struct ggml_backend_cuda_comm_context {
+@@ -993,6 +993,14 @@ struct ggml_backend_cuda_comm_context {
+ 
+     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
+ 
++    // Set if NCCL fails at runtime (e.g. RCCL refusing kernel dispatch on a
++    // root port without AtomicOp completer support; see ROCm/ROCm#6520).
++    // Once set, NCCL is never retried: AllReduce falls back to the internal
++    // pipeline (if available) or the meta backend's butterfly.  Always
++    // defined (stays false) so the dispatcher needs no #ifdef in
++    // non-NCCL builds.
++    bool                        nccl_failed = false;
++
+ #ifdef GGML_USE_NCCL
+     std::vector<ncclComm_t>     comms;
+ #endif // GGML_USE_NCCL
+@@ -1000,14 +1008,61 @@ struct ggml_backend_cuda_comm_context {
+     ~ggml_backend_cuda_comm_context() {
+ #ifdef GGML_USE_NCCL
+         for (ncclComm_t comm : comms) {
+-            NCCL_CHECK(ncclCommDestroy(comm));
++            // Not fatal: after a runtime NCCL failure the comm state is
++            // unknown and destroy may report it.
++            if (ncclCommDestroy(comm) != ncclSuccess) {
++                GGML_LOG_WARN("failed to destroy NCCL comm (state unknown?)\n");
++            }
+         }
+ #endif // GGML_USE_NCCL
+         ggml_cuda_ar_pipeline_free(ar_pipeline);
      }
  };
  
@@ -1678,10 +1725,57 @@ index 08c9cf0c2..42dab06e2 100644
 +}
 +
  #ifdef GGML_USE_NCCL
++static bool ggml_backend_cuda_comm_try_allreduce_internal(ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors);
++
++// NCCL failed at runtime.  The communicators are in an unknown state, so
++// never retry them: clear the sticky HIP errors the failed dispatch left on
++// each AR device, re-route subsequent AllReduce to the internal pipeline
++// when it is available, and warn once.  The call that failed returns false,
++// so the meta backend's butterfly handles that one.
++//
++// Known trigger: RCCL >= 2.30.4 refuses to dispatch its generic kernels
++// (hipErrorIllegalState: "the operation cannot be performed in the present
++// state") when the upstream PCIe root port lacks 32/64-bit AtomicOp
++// completer support, e.g. a GPU behind a chipset/PCH root port.  Init
++// (ncclCommInitAll) succeeds, so this only surfaces on the first collective.
++// No NCCL_* env var helps (the refusal happens at kernel dispatch, before
++// any transport is used).  Verify: `dmesg | grep -i atomic`; see
++// ROCm/ROCm#6520.
++static void ggml_backend_cuda_comm_nccl_failed(ggml_backend_cuda_comm_context * comm_ctx, const char * err) {
++    if (comm_ctx->nccl_failed) {
++        return;
++    }
++    comm_ctx->nccl_failed = true;
++    for (const auto & backend : comm_ctx->backends) {
++        ggml_cuda_set_device(((ggml_backend_cuda_context *) backend->context)->device);
++        (void) cudaGetLastError(); // clear the sticky error from the failed dispatch
++    }
++    if (comm_ctx->ar_pipeline != nullptr) {
++        comm_ctx->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
++    }
++    GGML_LOG_WARN("NCCL AllReduce failed (%s) - not retrying NCCL, falling back to %s for the rest of this run. "
++                  "If the error is hipErrorIllegalState, the PCIe root port most likely lacks AtomicOp completer "
++                  "support (check: dmesg | grep -i atomic; see ROCm/ROCm#6520). Run with NCCL_DEBUG=INFO for details.\n",
++                  err, comm_ctx->ar_pipeline != nullptr ? "the internal AllReduce pipeline" : "butterfly AllReduce");
++}
++
  // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
  // tensors (bandwidth-bound), then converts back to FP32.
-@@ -1029,7 +1038,7 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
+ static bool ggml_backend_cuda_comm_allreduce_nccl(
+@@ -1027,9 +1082,19 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
+         GGML_ASSERT(ggml_is_contiguously_allocated(tensors[i]));
+     }
  
++    // A failure here is terminal for NCCL but not for the run: see
++    // ggml_backend_cuda_comm_nccl_failed().
++    const auto nccl_try = [&](ncclResult_t rc) {
++        if (rc != ncclSuccess) {
++            ggml_backend_cuda_comm_nccl_failed(comm_ctx, ncclGetErrorString(rc));
++            return false;
++        }
++        return true;
++    };
++
      // For small tensors, simply reduce them as FP32.
      // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
 -    if ((n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144)) {
@@ -1689,7 +1783,51 @@ index 08c9cf0c2..42dab06e2 100644
          for (size_t i = 0; i < n_backends; ++i) {
              if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                  ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-@@ -1091,7 +1100,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
+@@ -1037,12 +1102,18 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
+                 CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
+             }
+         }
+-        NCCL_CHECK(ncclGroupStart());
++        if (!nccl_try(ncclGroupStart())) {
++            return false;
++        }
+         for (size_t i = 0; i < n_backends; ++i) {
+             ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+-            NCCL_CHECK(ncclAllReduce(tensors[i]->data, tensors[i]->data, ne, ncclFloat, ncclSum, comm_ctx->comms[i], cuda_ctx->stream()));
++            if (!nccl_try(ncclAllReduce(tensors[i]->data, tensors[i]->data, ne, ncclFloat, ncclSum, comm_ctx->comms[i], cuda_ctx->stream()))) {
++                return false;
++            }
++        }
++        if (!nccl_try(ncclGroupEnd())) {
++            return false;
+         }
+-        NCCL_CHECK(ncclGroupEnd());
+         return true;
+     }
+ 
+@@ -1065,12 +1136,18 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
+         CUDA_CHECK(cudaGetLastError());
+     }
+ 
+-    NCCL_CHECK(ncclGroupStart());
++    if (!nccl_try(ncclGroupStart())) {
++        return false;
++    }
+     for (size_t i = 0; i < n_backends; ++i) {
+         ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+-        NCCL_CHECK(ncclAllReduce(tmp[i].get(), tmp[i].get(), ne, ncclBfloat16, ncclSum, comm_ctx->comms[i], cuda_ctx->stream()));
++        if (!nccl_try(ncclAllReduce(tmp[i].get(), tmp[i].get(), ne, ncclBfloat16, ncclSum, comm_ctx->comms[i], cuda_ctx->stream()))) {
++            return false;
++        }
++    }
++    if (!nccl_try(ncclGroupEnd())) {
++        return false;
+     }
+-    NCCL_CHECK(ncclGroupEnd());
+ 
+     for (size_t i = 0; i < n_backends; ++i) {
+         ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+@@ -1091,7 +1168,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
      GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
  
      const size_t n_backends = comm_ctx->backends.size();
@@ -1698,7 +1836,7 @@ index 08c9cf0c2..42dab06e2 100644
      GGML_ASSERT(tensors[0] != nullptr);
  
      const int64_t   ne   = ggml_nelements(tensors[0]);
-@@ -1171,29 +1180,31 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
+@@ -1171,29 +1248,31 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
      ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
  }
  
@@ -1740,7 +1878,7 @@ index 08c9cf0c2..42dab06e2 100644
      }
  
      const size_t n = ret->dev_ids.size();
-@@ -1201,26 +1212,52 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
+@@ -1201,26 +1280,52 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
      ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
      if (rc == ncclSuccess) {
          ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
@@ -1802,7 +1940,7 @@ index 08c9cf0c2..42dab06e2 100644
  static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
      for (size_t i = 0; i < n_backends; i++) {
          if (!ggml_backend_is_cuda(backends[i])) {
-@@ -1236,37 +1273,55 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
+@@ -1236,37 +1341,62 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
      }
  
      const char * env = getenv("GGML_CUDA_ALLREDUCE");
@@ -1861,13 +1999,20 @@ index 08c9cf0c2..42dab06e2 100644
      auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
 +    const int64_t ne = ggml_nelements(tensors[0]);
 +    const size_t n_backends = comm_ctx->backends.size();
++    if (comm_ctx->nccl_failed) {
++        // NCCL is dead for this run: use the internal pipeline for all sizes
++        // it can serve, otherwise let the butterfly handle this call.
++        return comm_ctx->ar_pipeline != nullptr
++               ? ggml_backend_cuda_comm_try_allreduce_internal(comm_ctx, tensors)
++               : false;
++    }
 +    if (comm_ctx->ar_pipeline != nullptr && ggml_backend_cuda_comm_is_small(ne, n_backends)) {
 +        return ggml_backend_cuda_comm_try_allreduce_internal(comm_ctx, tensors);
 +    }
      return comm_ctx->try_allreduce(comm_ctx, tensors);
  }
  
-@@ -4903,6 +4958,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4903,6 +5033,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  graph->graph = nullptr;
              }
  

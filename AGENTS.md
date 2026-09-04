@@ -19,6 +19,11 @@ llama.cpp checkout at the fork point **`9cffdcc80`** (re-based 2026-09-02 from `
   per-size hybrid dispatch vs RCCL), **RDNA4-only** (gfx1200/gfx1201; falls
   back to RCCL elsewhere). The fused-stage/pacing experiments it spawned are
   archived, env-gated OFF, in `archive/work/fused-stage-pacing/`.
+  Amended 2026-09-04 with the runtime NCCL-failure fallback (issue #13):
+  on the first NCCL runtime failure the comm layer clears the sticky HIP
+  errors, warns once, stops using NCCL for the rest of the run and
+  re-routes AllReduce to the internal pipeline (or meta-butterfly) — see
+  the block-12 notes in `patches/README.md`.
 - Block **13** (`patches/0013-…-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch`): fused MoE gate+up+GLU MMQ (prefill)
   + mmvq short-K item-split (decode); see the block-13 notes in `patches/README.md`.
   Amended 2026-09-02 with two regression fixes folded into the block: (1) the
@@ -30,9 +35,10 @@ llama.cpp checkout at the fork point **`9cffdcc80`** (re-based 2026-09-02 from `
 
 The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts` — rebuilt 2026-09-02 onto
-upstream master `9cffdcc80` from the delivery patches, block 13 amended
-2026-09-02 with the two MTP regression fixes (13-commit branch;
-blocks `04122bfb5..8f2838d1`). That checkout is disposable and is
+upstream master `9cffdcc80` from the delivery patches, block 12 amended
+2026-09-04 with the runtime NCCL-failure fallback (issue #13) and block
+13 amended 2026-09-02 with the two MTP regression fixes (13-commit
+branch; blocks `04122bfb5..b830050bf`). That checkout is disposable and is
 re-created from `patches/` + `scripts/apply-all.sh` whenever it needs
 rebuilding (fresh clone at the fork point + apply). Older fork states are
 preserved on the `stew675/llama.cpp` fork remote (`rdna-boosts` =
@@ -103,8 +109,9 @@ explicitly requests it.**
   runtime-PM) costs tg -5-7% / pp -15-18% on RCCL/hybrid paths. Server runs
   UNPINNED, 3-GPU (`HIP_VISIBLE_DEVICES=0,1,2`), hybrid default.
 - **The set applies whitespace-clean**: `apply-all.sh` prints no git
-  whitespace warnings (re-verified 2026-09-01 on `0eadefebd` and
-  2026-09-02 on the `9cffdcc80` re-base).
+  whitespace warnings (re-verified 2026-09-01 on `0eadefebd`,
+  2026-09-02 on the `9cffdcc80` re-base, and 2026-09-04 after the
+  block-12 amendment).
 - **Block 02 (0002) now also carries the MTP chunked-prefix dispatch
   (PR #9, 2026-09-01):** long single-sequence MTP prefills (`K > 1`,
   `n_seqs == 1`, `n_tokens > K+64`) run the chunked WMMA GDN on the
@@ -122,6 +129,21 @@ explicitly requests it.**
   Pre-fix reproduced (GPU-1 memory fault in `ggml_cuda_ar_kernel`);
   post-fix runs clean with teardown dumps on every device; default
   serving is byte-for-byte unchanged.
+- **Block-12 runtime NCCL-failure fallback (2026-09-04, issue #13,
+  folded into block 12):** RCCL >= 2.30.4 can refuse kernel dispatch at
+  the first collective (`hipErrorIllegalState`) when a GPU sits behind a
+  PCIe root port without AtomicOp completer support (e.g. PCH/Z390;
+  `ncclCommInitAll` succeeds — see ROCm/ROCm#6520), which used to abort
+  the run at the first prefill AllReduce.  On the first NCCL runtime
+  failure the comm layer now clears the sticky HIP errors on each AR
+  device, warns once (`dmesg | grep -i atomic` check), permanently stops
+  using NCCL, and re-routes AllReduce to the internal pipeline (or the
+  meta backend's butterfly when no pipeline); the failing call returns
+  false so the butterfly handles it; `ncclCommDestroy` at teardown is
+  non-fatal.  No behavior change on healthy setups.  Re-verified
+  2026-09-04: clean-apply sim + build + same-seed coherence IDENTICAL
+  pre vs post fix (27B Q8_0, 3-GPU); depth-16384 tg unregressed (2-GPU
+  32.48 -> 32.40, 3-GPU 39.33 -> 39.31).
 - **Verified numbers (2026-09-02 re-base, unchanged):** clean-apply build
   tg64 38.12 / tg512 41.08; depth-16384 3-GPU hybrid 38.71 t/s
   (unpinned); 2-GPU (1,2) 31.79.  The re-base is content-identical plus
@@ -180,7 +202,7 @@ Diff the output against a known-good build (or against RCCL via
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9cffdcc80`,
-blocks tip `8f2838d1`): `git format-patch` the block commits (all 13
+blocks tip `b830050bf`): `git format-patch` the block commits (all 13
 blocks are committed fork commits; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`). Then
 re-verify the clean-apply simulation (worktree at the fork point,

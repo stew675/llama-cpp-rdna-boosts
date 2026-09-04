@@ -4,7 +4,8 @@ A delivery repo for a **13-patch set** of **RDNA3 / RDNA3.5 / RDNA4**
 (ROCm) feature enhancements and performance fixes for llama.cpp:
 **blocks 01-11** (MTP, GDN, BF16 KV,
 WMMA flash-attn, fused core, k-quant boosts, CUDA prefill-graph skip),
-**block 12** (the hybrid HIP all-reduce) and
+**block 12** (the hybrid HIP all-reduce; amended 2026-09-04 with a
+runtime NCCL-failure fallback — see [Current state](#current-state)) and
 **block 13** (fused MoE gate+up+GLU MMQ + mmvq short-K item-split;
 amended 2026-09-02 with two MTP regression fixes — see
 [Current state](#current-state)).
@@ -65,10 +66,12 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
   notes.  The adaptive-MTP baseline gate and expectations now live in
   [`benchmarks/mtp-adaptive-methodology.md`](benchmarks/mtp-adaptive-methodology.md)
   — run Protocol A there before shipping decode/fusion changes.
-- **Fork tip:** the fork block-13 commit was amended 2026-09-02 (current
-  blocks `04122bfb5..8f2838d1`); the clean-apply sim at `9cffdcc80`
-  applies with zero conflicts/whitespace warnings and its tree is
-  byte-identical to the fork tip.
+- **Fork tip:** the fork block-12 commit was amended 2026-09-04 with the
+  runtime NCCL-failure fallback (issue #13) and block 13 on 2026-09-02
+  with the two MTP regression fixes (current blocks `04122bfb5..b830050bf`);
+  the clean-apply sim at `9cffdcc80` applies with zero
+  conflicts/whitespace warnings and its tree is byte-identical to the
+  fork tip.
 - **Fork point (baseline):** llama.cpp master at `9cffdcc80` (re-based
   2026-09-02 from `0eadefebd`; 42 commits of drift — see `MANIFESTS.md`
   for the dated re-base record, incl. the block 03/08/13 manual merges
@@ -78,18 +81,30 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
 - **Verified:** clean apply + full build + llama-cli same-seed coherence
   IDENTICAL (hybrid vs RCCL, 3-GPU) on the rebuilt fork; the clean-apply
   sim at `9cffdcc80` applies with zero conflicts/whitespace warnings and
-  its tree is byte-identical to the fork tip (`8f2838d1`). tg64 38.12 /
+  its tree is byte-identical to the fork tip (`b830050bf`). tg64 38.12 /
   tg512 41.08 and the block-13 numbers are unchanged — the re-base is
   content-identical plus upstream's additions.
 - **Whitespace-clean apply:** the regenerated set applies with **zero git
   whitespace warnings** (`git am` 01-13; re-verified 2026-09-02 on a
-  fresh checkout at `9cffdcc80`).
+  fresh checkout at `9cffdcc80`, re-verified 2026-09-04 after the
+  block-12 amendment).
 - **Deployment:** 3-GPU hybrid (`HIP_VISIBLE_DEVICES=0,1,2`, unpinned) gives
   depth-16384 decode 38.71 t/s (+21.8% vs 2-GPU). See
   [`patches/README.md`](patches/README.md) for block-12 env knobs and the
   server config.
 - **RDNA4-only gate:** block 12 refuses to init off gfx1200/gfx1201 and
   falls back to RCCL (community RDNA3 verification pending).
+- **Runtime NCCL-failure fallback (2026-09-04, issue #13):** block 12 no
+  longer aborts when NCCL/RCCL fails at runtime — on the first failure it
+  clears the sticky HIP errors on each AR device, warns once, stops using
+  NCCL for the rest of the run and re-routes AllReduce to the internal
+  pipeline (or the meta backend's butterfly).  This covers RCCL >= 2.30.4
+  refusing kernel dispatch on a PCIe root port without AtomicOp completer
+  support (e.g. PCH/Z390; `ncclCommInitAll` succeeds — see
+  ROCm/ROCm#6520).  Folded into the block-12 commit; re-verified
+  2026-09-04 (clean-apply sim, build, same-seed coherence IDENTICAL pre
+  vs post fix on 27B Q8_0, depth-16384 tg unregressed: 2-GPU 32.48 ->
+  32.40, 3-GPU 39.33 -> 39.31).
 - **Block-12 AR_PROFILE fix (2026-09-01, PR #8):** AR-profile `devices[]`
   init order fixed — `GGML_CUDA_AR_PROFILE=1` no longer faults GPU 1
   under MTP (pre-fix reproduced on 3x R9700; post-fix clean, profiler

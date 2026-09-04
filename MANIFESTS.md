@@ -8,17 +8,20 @@ The **current delivery** is a **13-patch set** against the fork point
 `9cffdcc80` (re-based 2026-09-02 from `0eadefebd`): blocks 01-13
 (`patches/0001-…0013-…`, format-patch of the
 fork's `rdna-boosts` block commits — the re-based regeneration
-`04122bfb5..8f2838d1` against `9cffdcc80`; block 13 was amended
-2026-09-02 with two MTP regression fixes, see the dated record below; the
-previous `0eadefebd`-based regeneration `b25bc8a9c..482837e5a` is superseded
-and preserved on the fork's history/remotes). Apply flow: `git am`
+`04122bfb5..b830050bf` against `9cffdcc80`; block 12 was amended
+2026-09-04 with the runtime NCCL-failure fallback (issue #13) and block
+13 was amended 2026-09-02 with two MTP regression fixes, see the dated
+records below; the previous `0eadefebd`-based regeneration
+`b25bc8a9c..482837e5a` is superseded and preserved on the fork's
+history/remotes). Apply flow: `git am`
 for the whole 01-13 series (plain `git apply` of the concatenated series
 SILENTLY DROPS HUNKS — verified 2026-08-29);
 `scripts/apply-all.sh` automates it. **The set is whitespace-clean** —
 applying produces zero git whitespace warnings (verified 2026-08-29,
 re-verified 2026-09-01 on the `0eadefebd` re-base, re-verified with block
 13 on the 13-patch series 2026-09-01, re-verified on the `9cffdcc80`
-re-base 2026-09-02, re-verified after the 2026-09-02 block-13 amendment).
+re-base 2026-09-02, re-verified after the 2026-09-02 block-13 amendment,
+re-verified after the 2026-09-04 block-12 amendment).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -154,6 +157,37 @@ sim build (acceptance 0.54, 128 t/s).  The adaptive-MTP baseline gate +
 numbers now live in `benchmarks/mtp-adaptive-methodology.md` (the
 decode-only suites cannot see MTP regressions — verify batches ncols 2..13
 and the draft context are never exercised there).
+
+### Runtime NCCL-failure fallback (2026-09-04, issue #13, current)
+
+Community issue #13 (reporter tungel — same reporter as the #5/#6 fix
+round): on a topology where RCCL >= 2.30.4 cannot dispatch its kernels,
+`ncclCommInitAll` succeeds but the first collective aborts
+(`hipErrorIllegalState` when a GPU sits behind a PCIe root port without
+32/64-bit AtomicOp completer support — e.g. PCH/Z390; see
+ROCm/ROCm#6520), and the process died at the first prefill AllReduce
+(`NCCL_CHECK` -> `GGML_ABORT`) even though the internal host-staged
+pipeline was up and stable.  Folded into the block-12 commit: on the
+first NCCL runtime failure the comm layer clears the sticky HIP errors
+on each AR device (else the fallback aborts on the next CUDA_CHECK),
+warns once with a pointer at the known cause + the
+`dmesg | grep -i atomic` check, permanently stops using NCCL (comm
+state is unknown), re-routes subsequent AllReduce to the internal
+pipeline (or the meta backend's butterfly when no pipeline is
+available), and the failing call itself returns false so the butterfly
+handles it; `ncclCommDestroy` at teardown is non-fatal too.  No behavior
+change on healthy setups — the fallback only triggers when NCCL itself
+fails.
+
+Re-verified end-to-end 2026-09-04: set regenerated from the fork
+(`scripts/make-patches.sh`, base `9cffdcc80`, blocks tip `b830050bf`),
+clean-apply sim at `9cffdcc80` (git am clean, zero whitespace warnings,
+applied tree byte-identical to the fork tip), full build clean (ROCm
+7.14 gfx1201, RCCL+graphs+native), llama-cli same-seed coherence
+IDENTICAL pre vs post fix (27B Q8_0, 3-GPU tensor split), and perf
+unregressed at depth-16384 hybrid: 2-GPU (1,2) tg128 32.48 -> 32.40,
+3-GPU (0,1,2) tg128 39.33 -> 39.31 (both within noise; pp512 within
+run-to-run spread).
 
 ### Re-baseline to 0eadefebd (2026-09-01)
 
