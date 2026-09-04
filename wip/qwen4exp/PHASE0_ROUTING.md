@@ -145,3 +145,21 @@ tensors host-resident) is the WRONG mechanism for this - it H2D-copies the used
 experts to the GPU every pass (~1.5 GB/token at 14 GB/s PCIe = ~105 ms/token).
 The design here computes cold experts ON THE CPU IN PLACE (only the tiny
 [2560] result crosses) - that is the novel part and is what makes the split win.
+
+## CORRECTION (2026-09-04): the no-movement split is NOT viable - retraction
+
+The prior supplement's "all experts on CPU = ~5 ms" was WRONG: the
+test-backend-ops mmid number (1.2 TFLOPS) looped one 18 MB tensor 18k times and
+ran from the 9950X3D's 96 MB V-cache, not DRAM.  Real M=1 decode streams from
+DRAM and is ~5x worse than stream-bound (full-CPU decode = 397 ms/token for
+7 GB/token = ~18 GB/s effective, not 90).
+
+Corrected conclusion: the "dense-on-GPU / all-experts-on-CPU, no movement"
+split does NOT hit 20 ms/token.  The M=1 CPU expert cost (dequant + strided
+K-major reads of ~1.5 GB/token of expert weights) is hundreds of ms, not 5.
+
+The viable design is the ORIGINAL tiered one: dense (5.1 GiB) + S hot experts
+per layer on the GPU, cold tail on the CPU, slow LFRU swaps.  Per-window
+working sets (100-190 distinct experts/layer per 100 tokens) mean S=200-256
+covers 85-95% of selections from GPU memory; only the tail spills.  This is
+where the measured data points, not to a static dense/experts split.
