@@ -5,11 +5,21 @@ Forward-looking: open items + current active experiments; closed work is a
 one-line bullet (details live in AGENTS.md, patches/README.md, MANIFESTS.md,
 `beta/qwen4exp/README.md`, `wip/` handovers, `benchmarks/`). Current
 delivery = the 13-patch set against fork point `9cffdcc80` (blocks 01-13).
-Reality pass: 2026-09-05.
+Reality pass: 2026-09-06.
 
 ## Current active
 
-### Validate beta qwen4exp on Strix Halo (gfx1151) — env prep pending
+### Strix Halo (gfx1151): prefill-gap follow-ons after WS4 (WS3 #2/#3)
+- WS4 (prefill hyperconn fusions, DEFAULT ON + bit-exact) is DONE,
+  gated, and routed (see the 2026-09-06 Closed bullets). What remains
+  on the Strix leg: re-derive the post-fusion A-vs-B depth-0 pp gap
+  (fusion-on A vs the community B build, same ladder), then WS3 #2
+  (dense shortcut below the selection width in A's `build_layer_attn`;
+  fires only while n_kv <= indexer_top_k + ratio - 1, where dense ==
+  sparse by construction) and WS3 #3 (routed-compact MoE mmq for
+  i-quants, RDNA4-gated), with gfx1201 validation via the normal
+  delivery flow. WS6 re-base NOT indicated.
+### Validate beta qwen4exp on Strix Halo (gfx1151) — DONE for WS4; beta set runs on gfx1151
 - Block 13's Strix leg is DONE (2026-09-05): the fused MoE gate+up+GLU
   MMQ (RDNA4-gated fused arm) was ungated for RDNA3_5 / gfx1151,
   validated (pp2048 +5.3%, pp16384 +4.6%, coherence IDENTICAL, decode
@@ -18,11 +28,13 @@ Reality pass: 2026-09-05.
   clean-apply sim + full build + coherence re-verified on the Strix
   box). Record:
   `benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
-- Remaining here: validate `beta/qwen4exp` (the three patches,
-  currently documented as "Requires ROCm gfx1201") on Strix Halo.
-  Environment prep is pending (per the maintainer, 2026-09-05) — the
-  beta base (master `8b4b3558f` + blocks 01-13 incl. the fold) is
-  already built in `~/llama.cpp/build-rocm` on this machine.
+- The beta/qwen4exp set now RUNS and is gated on Strix Halo: patches
+  1-3 are the code base every Strix pp/decode number in this campaign
+  was measured on (~/llama.cpp `qwen4exp` = beta base + block 13
+  fold), and patch 4 (WS4) was validated + gated there 2026-09-06 (see
+  the Closed bullet). The old "Requires ROCm gfx1201" README note is
+  dropped (see `beta/qwen4exp/README.md`); remaining Strix work is the
+  prefill-gap follow-on section above.
 - Standing gate before shipping any decode/fusion change:
   `benchmarks/mtp-adaptive-methodology.md` (MTP baseline + acceptance).
 - Where: `beta/qwen4exp/README.md` (gates + carried-forward open items).
@@ -76,6 +88,24 @@ Reality pass: 2026-09-05.
 
 ## Closed (one-liners; details in the dated docs)
 
+- 2026-09-06 WS4 Strix Halo (gfx1151) gates PASSED on the final
+  qwen4exp build (branch tip 248e47704 = beta base + the WS4 commit):
+  prefill hyperconn fusions DEFAULT ON vs `GGML_CUDA_DISABLE_HC_FUSION=1`
+  (same build, clean warm-clock r3) — depth-0 pp +5.2-8.8% across
+  pp512..16384 (pp2048 349.5 vs 321.2; pp16384 527.8 vs 490.5), depth
+  12k/32k pp rows keep +4-6% (pp2048 @d12288 321.8 vs 308.6; @d32768
+  311.4 vs 297.5), tg@depth flat (decode untouched: 22.04 vs 22.12
+  @12k; 20.10 vs 20.01 @32k), memory stable −r3 through 32k, llama-cli
+  same-seed text on == off. Routed: `beta/qwen4exp/ws4-hc-prefill-fusions.patch`
+  (4th beta patch; clean `git apply` at the beta base → applied tree
+  byte-identical to `248e47704`). Record:
+  `benchmarks/2026-09-06-strix-halo-gfx1151-ws4-hc-fusion-gates.md`.
+- 2026-09-06 Real determinism root cause FIXED (folded into the same
+  qwen4exp commit/patch): the indexer top-k atomicAdd gather scrambled
+  the QSA list ORDER run-to-run (>1 block/row) — replaced with an
+  ascending-column count/scan/write (fresh-process harness + llama-cli
+  now bit-identical). Also ported halo-box `aad5adb08` kv-cache
+  stale-cell zeroing (cross-request cell reuse).
 - 2026-09-01 Block 13 released as the 13th delivery patch (fork
   a14257996): fused MoE gate+up+GLU MMQ + mmvq item-split; qwen4exp MoE
   work split out of the delivery.

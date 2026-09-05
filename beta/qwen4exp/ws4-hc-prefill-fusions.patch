@@ -1,0 +1,1217 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 30af31ec5..44b2a4aab 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -65,6 +65,7 @@
+ #include "ggml-cuda/gated_delta_net.cuh"
+ #include "ggml-cuda/dsv4-hc.cuh"
+ #include "ggml-cuda/hc-mix.cuh"
++#include "ggml-cuda/hyperconn.cuh"
+ #include "ggml-cuda/set.cuh"
+ #include "ggml-cuda/set-rows.cuh"
+ #include "ggml-cuda/pad_reflect_1d.cuh"
+@@ -3534,6 +3535,75 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+ }
+ 
+ // try and fuse nodes and return the number of nodes to skip
++static int ggml_cuda_match_hc_mix(const ggml_cgraph * cgraph, const int i, ggml_cuda_hc_mix_args & args, enum ggml_op * ops) {
++    const ggml_tensor * node = cgraph->nodes[i];
++    if (!(node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID && node->type == GGML_TYPE_F32 &&
++        i + 5 < cgraph->n_nodes &&
++        cgraph->nodes[i + 1]->op == GGML_OP_MUL && cgraph->nodes[i + 2]->op == GGML_OP_RESHAPE &&
++        cgraph->nodes[i + 3]->op == GGML_OP_VIEW && cgraph->nodes[i + 4]->op == GGML_OP_CONT)) {
++        return 0;
++    }
++    const ggml_tensor * gate  = node->src[0];
++    const ggml_tensor * mul   = cgraph->nodes[i + 1];
++    const ggml_tensor * view0 = cgraph->nodes[i + 3];
++    const ggml_tensor * cont  = cgraph->nodes[i + 4];
++    const ggml_tensor * xn    = mul->src[0] == node ? mul->src[1] : mul->src[0];
++
++    const int64_t n_embd   = cont->ne[0];
++    const int64_t n_tokens = cont->ne[1];
++    const int64_t hc_dim   = mul->ne[0];
++    const int     hc       = n_embd > 0 ? (int) (hc_dim / n_embd) : 0;
++    const size_t  row_size = hc_dim * sizeof(float);
++
++    auto stream_view_ok = [&](const ggml_tensor * v, int c) {
++        return v->op == GGML_OP_VIEW && v->view_src == mul && v->type == GGML_TYPE_F32 &&
++            v->view_offs == (size_t) c * n_embd * sizeof(float) &&
++            v->ne[0] == n_embd && v->ne[1] == n_tokens && v->ne[2] == 1 && v->ne[3] == 1 &&
++            v->nb[0] == sizeof(float) && v->nb[1] == row_size;
++    };
++
++    bool ok = (mul->src[0] == node || mul->src[1] == node) && xn != node &&
++        mul->type == GGML_TYPE_F32 && xn->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32 &&
++        ggml_is_contiguous(xn) && ggml_is_contiguous(gate) && ggml_are_same_shape(xn, gate) &&
++        ggml_are_same_shape(mul, xn) && ggml_are_same_shape(mul, node) &&
++        mul->ne[2] == 1 && mul->ne[3] == 1 && ggml_nrows(mul) == n_tokens &&
++        hc >= 2 && hc <= 16 && hc_dim == (int64_t) hc * n_embd &&
++        cgraph->nodes[i + 2]->view_src == mul && cont->src[0] == view0 && stream_view_ok(view0, 0) &&
++        cont->type == GGML_TYPE_F32 && ggml_is_contiguous(cont) && cont->ne[2] == 1 && cont->ne[3] == 1;
++
++    const int n_ops = ok ? 5 + 2 * (hc - 1) + 1 : 0;
++    ok = ok && i + n_ops <= cgraph->n_nodes;
++    if (!ok) {
++        return 0;
++    }
++
++    ops[0] = GGML_OP_UNARY; ops[1] = GGML_OP_MUL; ops[2] = GGML_OP_RESHAPE; ops[3] = GGML_OP_VIEW; ops[4] = GGML_OP_CONT;
++    const ggml_tensor * prev = cont;
++    for (int c = 1; ok && c < hc; ++c) {
++        const ggml_tensor * v   = cgraph->nodes[i + 5 + 2 * (c - 1)];
++        const ggml_tensor * add = cgraph->nodes[i + 6 + 2 * (c - 1)];
++        ok = stream_view_ok(v, c) && add->op == GGML_OP_ADD && add->type == GGML_TYPE_F32 &&
++            add->src[0] == prev && add->src[1] == v && ggml_are_same_shape(add, cont);
++        ops[5 + 2 * (c - 1)] = GGML_OP_VIEW;
++        ops[6 + 2 * (c - 1)] = GGML_OP_ADD;
++        prev = add;
++    }
++    ggml_tensor * scale = cgraph->nodes[i + n_ops - 1];
++    ops[n_ops - 1] = GGML_OP_SCALE;
++    ok = ok && scale->op == GGML_OP_SCALE && scale->src[0] == prev && scale->type == GGML_TYPE_F32 &&
++        ggml_is_contiguous(scale) && ggml_are_same_shape(scale, cont);
++    if (!ok) {
++        return 0;
++    }
++
++    args.xn    = xn;
++    args.gate  = gate;
++    args.dst   = scale;
++    args.hc    = hc;
++    args.scale = ggml_get_op_params_f32(scale, 0);
++    args.bias  = ggml_get_op_params_f32(scale, 1);
++    return n_ops;
++}
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+@@ -3544,10 +3614,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
+     static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
+ 
++    // prefill hyper-connection (qwen4exp) elementwise-chain fusions (ported from
++    // halo-box/strix-llama.cpp): opt-out for A/B and regression testing
++    static bool disable_hc_fusion = getenv("GGML_CUDA_DISABLE_HC_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_HC_FUSION"));
++
+     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++
+     if (node->op == GGML_OP_MUL) {
+         ggml_moe_weighted_reduction_match match;
+         static const bool mwr_dbg2 = getenv("GGML_CUDA_MWR_DEBUG") != nullptr;
+@@ -4721,6 +4796,212 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 1;
+     }
+ 
++    // prefill hyper-connection fusions (DEFAULT ON). Bit-exact vs the unfused chain, verified on the
++    // deterministic substrate with a llama_decode harness (pp + 40 greedy steps, logits hashed per
++    // step: fused == unfused bit for bit at 6..1400-token prompts). FIXED 2026-09-06: the comb
++    // matcher unwrapped the block_out REPEAT to its input, whose buffer the allocator had reused
++    // (e.g. for hc_inject) because the standalone REPEAT ran before the fused window - the kernel
++    // then read inject's data as block_out. It now reads the live REPEAT output (mul operand).
++    // Opt-outs: GGML_CUDA_DISABLE_HC_FUSION=1 (all), GGML_CUDA_DISABLE_HC_MIX=1 / GGML_CUDA_DISABLE_HC_COMB=1.
++    static const bool hc_optin  = !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_FUSION") || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_FUSION")));
++    static const bool hc_mix_on  = hc_optin && !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_MIX")  || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_MIX")));
++    static const bool hc_comb_on = hc_optin && !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_COMB") || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_COMB")));
++    if (hc_mix_on) {
++    // qwen4exp hyper-connection stream mix:
++    //     sigmoid(gate) -> mul(xn, .) -> reshape -> view(stream 0) -> cont -> (view(stream c) -> add) x (hc-1) -> scale
++    // one kernel reads xn/gate once and writes the [n_embd, T] mean of the gated streams
++    {
++        ggml_cuda_hc_mix_args args;
++        enum ggml_op ops[5 + 2 * 15 + 1];
++        int n_ops = ggml_cuda_match_hc_mix(cgraph, i, args, ops);
++        if (n_ops > 0 && args.dst->ne[1] == 1) {
++            n_ops = 0; // Decode preserves bit-identical routing. Prefill uses the fused reduction.
++        }
++        if (n_ops > 0) {
++            int node_idxs[5 + 2 * 15 + 1];
++            for (int j = 0; j < n_ops; ++j) {
++                node_idxs[j] = i + j;
++            }
++            const int out_nodes[] = { i + n_ops - 1 };
++            if (ggml_can_fuse_subgraph_ext(cgraph, node_idxs, n_ops, ops, out_nodes, 1)) {
++                ggml_cuda_op_hc_mix_reduce(*cuda_ctx, args);
++                return n_ops - 1;
++            }
++        }
++    }
++    }
++    if (hc_comb_on) {
++    // qwen4exp hyper-connection combine + next grouped rms norm (A-chain):
++    //   scale(inject) -> sigmoid -> scale -> [view w] -> mul(block_out x w) -> add(residual)
++    //     -> [view] -> rms_norm -> [view] -> mul(xn, gamma)
++    // A's graph has no REPEAT node: block_out is already [n_embd, 1, T] and the mul broadcasts.
++    // One kernel (block per stream+token) writes out_res = the add ([n_embd, hc, T]) and
++    // out_xn = the gamma mul ([n_embd*hc, T]); the two share one row-major layout.
++    if (node->op == GGML_OP_SCALE && node->type == GGML_TYPE_F32 && i + 3 < cgraph->n_nodes &&
++        cgraph->nodes[i + 1]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SIGMOID &&
++        cgraph->nodes[i + 1]->src[0] == node &&
++        cgraph->nodes[i + 2]->op == GGML_OP_SCALE && cgraph->nodes[i + 2]->src[0] == cgraph->nodes[i + 1]) {
++        const ggml_tensor * scale1 = node;
++        const ggml_tensor * scale2 = cgraph->nodes[i + 2];
++        const ggml_tensor * inject = scale1->src[0];
++        const auto root_of = [](const ggml_tensor * t) -> const ggml_tensor * {
++            while (t != nullptr && t->view_src != nullptr) {
++                t = t->view_src;
++            }
++            return t;
++        };
++
++        const int limit = std::min(cgraph->n_nodes, i + 24);
++        int k = i + 3;
++        while (k < limit && ggml_cuda_is_view_or_noop(cgraph->nodes[k]) && !ggml_is_empty(cgraph->nodes[k])) {
++            ++k;
++        }
++        if (k + 1 < limit && cgraph->nodes[k]->op == GGML_OP_MUL) {
++            const ggml_tensor * mul = cgraph->nodes[k];
++            int m = k + 1;
++            while (m < limit && ggml_cuda_is_view_or_noop(cgraph->nodes[m]) && !ggml_is_empty(cgraph->nodes[m])) {
++                ++m;
++            }
++            if (m < limit && cgraph->nodes[m]->op == GGML_OP_ADD) {
++                const ggml_tensor * add = cgraph->nodes[m];
++                int q = m + 1;
++                while (q < limit && ggml_cuda_is_view_or_noop(cgraph->nodes[q]) && !ggml_is_empty(cgraph->nodes[q])) {
++                    ++q;
++                }
++                if (q < limit && cgraph->nodes[q]->op == GGML_OP_RMS_NORM) {
++                    const ggml_tensor * rms = cgraph->nodes[q];
++                    int g = q + 1;
++                    while (g < limit && ggml_cuda_is_view_or_noop(cgraph->nodes[g]) && !ggml_is_empty(cgraph->nodes[g])) {
++                        ++g;
++                    }
++                    if (g < limit && cgraph->nodes[g]->op == GGML_OP_MUL) {
++                        const ggml_tensor * mulg = cgraph->nodes[g];
++                        const int64_t n_embd = add->ne[0];
++                        const int64_t hc     = add->ne[1];
++                        const int64_t n_tok  = add->ne[2];
++                        const int64_t hc_dim = n_embd * hc;
++
++                        const ggml_tensor * w = nullptr;
++                        const ggml_tensor * b = nullptr;
++                        for (int s = 0; s < 2; ++s) {
++                            const ggml_tensor * src = s == 0 ? mul->src[0] : mul->src[1];
++                            if (src == nullptr) { continue; }
++                            if (root_of(src) == (const ggml_tensor *) scale2) {
++                                w = src;
++                            } else {
++                                b = src;
++                            }
++                        }
++                        // block_out reaches the mul either as a REPEAT output ([n_embd, hc, T], copies of
++                        // the broadcast base) or directly ([n_embd, 1, T]-style, ggml broadcast). Pass the
++                        // mul's actual operand: it is consumed inside the fused window, so its buffer is
++                        // live there. NEVER unwrap to the repeat INPUT - the standalone REPEAT may run
++                        // before the window (its input then dies and the allocator reuses the buffer,
++                        // e.g. for hc_inject), leaving the fused kernel reading the wrong data.
++                        const ggml_tensor * bo = b;
++                        // if bo is itself a REPEAT op's output, that op must have run already (producer
++                        // index < i); a repeat inside the window cannot be materialized by this fusion
++                        if (bo != nullptr && bo->op == GGML_OP_REPEAT) {
++                            bool producer_before = false;
++                            for (int j = 0; j < i && !producer_before; ++j) {
++                                producer_before = cgraph->nodes[j] == bo;
++                            }
++                            if (!producer_before) {
++                                bo = nullptr;
++                            }
++                        }
++                        const ggml_tensor * res = add->src[0] == mul ? add->src[1] : add->src[0];
++                        // the rms output may reach the gamma MUL through a reshape view: identify the
++                        // operand whose root is rms and take the other side as gamma
++                        const ggml_tensor * gamma = nullptr;
++                        if (root_of(mulg->src[0]) == (const ggml_tensor *) rms) {
++                            gamma = mulg->src[1];
++                        } else if (root_of(mulg->src[1]) == (const ggml_tensor *) rms) {
++                            gamma = mulg->src[0];
++                        }
++
++                        const bool w_ok = w != nullptr && w->type == GGML_TYPE_F32 && w->ne[0] == 1 && w->ne[1] == hc &&
++                            ggml_nelements(w) == hc * n_tok && ggml_is_contiguous(w);
++                        // the mul operand has either hc stacked copies (a REPEAT output, rows of n_embd
++                        // per (c, t)) or a single copy broadcast over c (rows of n_embd per token)
++                        const bool bo_hc = bo != nullptr && ggml_nelements(bo) == n_embd * hc * n_tok;
++                        const bool b_ok = bo != nullptr && bo->type == GGML_TYPE_F32 && bo->ne[0] == n_embd &&
++                            ggml_is_contiguous(bo) &&
++                            (bo_hc || ggml_nelements(bo) == n_embd * n_tok);
++                        const bool ok_a = add->ne[3] == 1 && n_tok >= 1 && n_tok <= 65535 &&
++                            inject->type == GGML_TYPE_F32 && ggml_is_contiguous(inject) &&
++                            ggml_nelements(inject) == hc * n_tok && ggml_nrows(inject) == n_tok &&
++                            ggml_are_same_shape(scale1, inject) && ggml_are_same_shape(scale2, inject);
++                        const bool ok_b = (add->src[0] == mul || add->src[1] == mul) && res != nullptr && res != mul &&
++                            root_of((ggml_tensor *) rms->src[0]) == (const ggml_tensor *) add && rms->src[0] != nullptr;
++                        const bool ok_c = mul->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && res->type == GGML_TYPE_F32 &&
++                            rms->type == GGML_TYPE_F32 && mulg->type == GGML_TYPE_F32 && gamma != nullptr && gamma->type == GGML_TYPE_F32;
++                        const bool ok_d = ggml_are_same_shape(mul, add) && ggml_are_same_shape(res, add) && ggml_are_same_shape(rms, add);
++                        const bool ok_e = ggml_is_contiguous(res) && ggml_is_contiguous(add) && ggml_is_contiguous(rms) &&
++                            ggml_is_contiguous(mulg) && ggml_is_contiguous(gamma);
++                        const bool ok_f = gamma->ne[0] == hc_dim && ggml_nelements(gamma) == hc_dim && mulg->ne[0] == hc_dim &&
++                            mulg->ne[1] == n_tok && mulg->ne[2] == 1 && mulg->ne[3] == 1 &&
++                            ggml_nelements(mulg) == hc_dim * n_tok && w_ok && b_ok;
++                        const bool ok = ok_a && ok_b && ok_c && ok_d && ok_e && ok_f;
++                        if (ok) {
++                            ggml_cuda_hc_combine_norm_args args;
++                            args.inject    = inject;
++                            args.residual  = res;
++                            args.block_out = bo;
++                            args.block_out_hc = bo_hc;
++                            args.gamma     = gamma;
++                            args.out_res   = (ggml_tensor *) add;
++                            args.out_xn    = (ggml_tensor *) mulg;
++                            args.s1        = ggml_get_op_params_f32(scale1, 0);
++                            args.b1        = ggml_get_op_params_f32(scale1, 1);
++                            args.s2        = ggml_get_op_params_f32(scale2, 0);
++                            args.b2        = ggml_get_op_params_f32(scale2, 1);
++                            memcpy(&args.eps, rms->op_params, sizeof(float));
++
++                            // every block reads block_out and inject and writes its own stream of both outputs:
++                            // the outputs must not overlap those, and the residual may only alias out_res in place
++                            auto overlap = [](const ggml_tensor * p, const ggml_tensor * q) {
++                                const uintptr_t p0 = (uintptr_t) p->data, p1 = p0 + ggml_backend_buft_get_alloc_size(p->buffer->buft, p);
++                                const uintptr_t q0 = (uintptr_t) q->data, q1 = q0 + ggml_backend_buft_get_alloc_size(q->buffer->buft, q);
++                                return p0 < q1 && q0 < p1;
++                            };
++                            const bool res_inplace = res->data == add->data && ggml_are_same_layout(res, add);
++                            // the kernel reads bo (block_out = the repeat input), inject, gamma and (via add)
++                            // res; it writes add and mulg. All checks must use bo, NOT the repeat output.
++                            bool alias_ok = !overlap(add, bo) && !overlap(add, inject) && (res_inplace || !overlap(add, res)) &&
++                                !overlap(mulg, bo) && !overlap(mulg, inject) && !overlap(mulg, res) && !overlap(mulg, add) &&
++                                !overlap(add, gamma) && !overlap(mulg, gamma);
++                            // outputs overlapping the inputs (typically xn reusing the block_out buffer, which dies
++                            // at the combine): single-block variant that reads everything before it writes
++                            if (!alias_ok && n_tok == 1 && hc <= 4) {
++                                args.single_block = true;
++                                alias_ok = true;
++                            }
++
++                            int          idxs[32];
++                            enum ggml_op ops[32];
++                            int          count = 0;
++                            for (int kk = i; kk <= g; ++kk) {
++                                idxs[count] = kk;
++                                ops[count]  = cgraph->nodes[kk]->op;
++                                ++count;
++                            }
++                            const int out_nodes[] = { m, g };
++                            const bool supp = ggml_cuda_hc_combine_norm_supported(args, ggml_cuda_info().devices[cuda_ctx->device].warp_size);
++                            const bool canf = ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2);
++                            if (alias_ok && supp && canf) {
++                                ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
++                                return g - i;
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
+@@ -4961,7 +5242,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+                 GGML_ASSERT(ok);
+-
+                 if (op_timing) {
+                     CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
+                     op_nodes.emplace_back(node, i, false);
+diff --git a/ggml/src/ggml-cuda/hyperconn.cu b/ggml/src/ggml-cuda/hyperconn.cu
+new file mode 100644
+index 000000000..21db01dee
+--- /dev/null
++++ b/ggml/src/ggml-cuda/hyperconn.cu
+@@ -0,0 +1,375 @@
++#include "hyperconn.cuh"
++#include "ggml-backend-impl.h"
++
++// Explicitly rounded mul/add: keeps the fused kernels from being contracted into FMAs so that
++// the results match the separate MUL and ADD kernels of the unfused graph bit for bit.
++#if defined(__HIP_PLATFORM_AMD__)
++static __device__ __forceinline__ float hc_mul_rn(const float a, const float b) {
++    float result;
++    asm("v_mul_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
++    return result;
++}
++
++static __device__ __forceinline__ float hc_add_rn(const float a, const float b) {
++    float result;
++    asm("v_add_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
++    return result;
++}
++#else
++static __device__ __forceinline__ float hc_mul_rn(const float a, const float b) {
++    return __fmul_rn(a, b);
++}
++
++static __device__ __forceinline__ float hc_add_rn(const float a, const float b) {
++    return __fadd_rn(a, b);
++}
++#endif
++
++// same expression as op_sigmoid in unary.cu
++static __device__ __forceinline__ float hc_sigmoid(const float x) {
++    return 1.0f / (1.0f + expf(-x));
++}
++
++// mixed[e,t] = scale * ( ((xn*sig)[0] + (xn*sig)[1]) + ... ) + bias, streams summed in order 0..hc-1
++static __global__ void hc_mix_reduce_f32(
++        const float * __restrict__ xn, const float * __restrict__ gate, float * __restrict__ dst,
++        const int64_t n_embd, const int64_t n_tokens, const int hc, const float scale, const float bias) {
++    const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (index >= n_embd * n_tokens) {
++        return;
++    }
++
++    const int64_t t = index / n_embd;
++    const int64_t e = index - t * n_embd;
++    const int64_t hc_dim = n_embd * hc;
++    const int64_t base = t * hc_dim + e;
++
++    float acc = hc_mul_rn(xn[base], hc_sigmoid(gate[base]));
++    for (int c = 1; c < hc; ++c) {
++        const int64_t i = base + int64_t(c) * n_embd;
++        acc = hc_add_rn(acc, hc_mul_rn(xn[i], hc_sigmoid(gate[i])));
++    }
++
++    // identical expression to scale_f32 in scale.cu (RN: x*scale+bias, no fma)
++    dst[index] = hc_add_rn(hc_mul_rn(scale, acc), bias);
++}
++
++// out[e,c,t] = residual[e,c,t] + block_out[e,t] * ( s2 * sigmoid(s1 * inject[c,t] + b1) + b2 )
++static __global__ void hc_combine_f32(
++        const float * __restrict__ residual, const float * __restrict__ block_out, const float * __restrict__ inject,
++        float * __restrict__ dst, const int64_t n_embd, const int hc, const int64_t n_tokens,
++        const float s1, const float b1, const float s2, const float b2) {
++    const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
++    const int64_t hc_dim = n_embd * hc;
++    if (index >= hc_dim * n_tokens) {
++        return;
++    }
++
++    const int64_t t   = index / hc_dim;
++    const int64_t rem = index - t * hc_dim;
++    const int64_t c   = rem / n_embd;
++    const int64_t e   = rem - c * n_embd;
++
++    // identical expressions to scale_f32 (scale.cu) and op_sigmoid (unary.cu)
++    const float x1 = hc_add_rn(hc_mul_rn(s1, inject[t * hc + c]), b1);
++    const float x2 = hc_sigmoid(x1);
++    const float w  = hc_add_rn(hc_mul_rn(s2, x2), b2);
++
++    const float m = hc_mul_rn(block_out[t * n_embd + e], w);
++    dst[index] = hc_add_rn(residual[index], m);
++}
++
++static bool hc_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    const char * a0 = (const char *) a->data;
++    const char * a1 = a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
++    const char * b0 = (const char *) b->data;
++    const char * b1 = b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
++    return a0 < b1 && b0 < a1;
++}
++
++void ggml_cuda_op_hc_mix_reduce(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_mix_args & args) {
++    const ggml_tensor * xn   = args.xn;
++    const ggml_tensor * gate = args.gate;
++    ggml_tensor *       dst  = args.dst;
++
++    GGML_ASSERT(xn->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(xn) && ggml_is_contiguous(gate) && ggml_is_contiguous(dst));
++    GGML_ASSERT(args.hc > 0);
++
++    const int64_t n_embd   = dst->ne[0];
++    const int64_t n_tokens = ggml_nrows(dst);
++    GGML_ASSERT(xn->ne[0] == n_embd * args.hc && ggml_nrows(xn) == n_tokens);
++    GGML_ASSERT(ggml_are_same_shape(xn, gate));
++
++    // The graph allocator may reuse the buffer of the (elided) sigmoid/mul intermediates, which can
++    // coincide with the gate matmul output. Every thread reads hc strided elements, so an aliased
++    // output has to be staged -- unless (single token) the output lands on a whole stream of the
++    // aliased input: element e of the output then overwrites element e of that stream, which only
++    // the same thread reads (after it has finished reading).
++    auto stream_aligned_alias = [&](const ggml_tensor * in) {
++        if (!hc_ranges_overlap(dst, in)) {
++            return true;
++        }
++        if (n_tokens != 1) {
++            return false;
++        }
++        const ptrdiff_t off = (const char *) dst->data - (const char *) in->data;
++        return off >= 0 && off % (n_embd * (ptrdiff_t) sizeof(float)) == 0 &&
++            off + (ptrdiff_t) ggml_nbytes(dst) <= (ptrdiff_t) ggml_nbytes(in);
++    };
++    const bool stage = !stream_aligned_alias(xn) || !stream_aligned_alias(gate);
++
++    ggml_cuda_pool_alloc<float> staged(ctx.pool());
++    float * out = stage ? staged.alloc(n_embd * n_tokens) : (float *) dst->data;
++
++    const int64_t n_items = n_embd * n_tokens;
++    const int     threads = 256;
++    const int     blocks  = (int) ((n_items + threads - 1) / threads);
++    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
++    ggml_cuda_kernel_launch(hc_mix_reduce_f32, launch_params,
++        (const float *) xn->data, (const float *) gate->data, out, n_embd, n_tokens, args.hc, args.scale, args.bias);
++
++    if (stage) {
++        CUDA_CHECK(cudaMemcpyAsync(dst->data, out, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
++    }
++}
++
++void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_combine_args & args) {
++    const ggml_tensor * residual  = args.residual;
++    const ggml_tensor * block_out = args.block_out;
++    const ggml_tensor * inject    = args.inject;
++    ggml_tensor *       dst       = args.dst;
++
++    GGML_ASSERT(residual->type == GGML_TYPE_F32 && block_out->type == GGML_TYPE_F32 &&
++                inject->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(residual) && ggml_is_contiguous(block_out) &&
++                ggml_is_contiguous(inject) && ggml_is_contiguous(dst));
++
++    const int64_t n_embd   = dst->ne[0];
++    const int64_t hc       = dst->ne[1];
++    const int64_t n_tokens = dst->ne[2] * dst->ne[3];
++    GGML_ASSERT(ggml_are_same_shape(residual, dst));
++    GGML_ASSERT(ggml_nelements(block_out) == n_embd * n_tokens);
++    GGML_ASSERT(ggml_nelements(inject) == hc * n_tokens);
++
++    // residual may be the in-place source of the add (same address, same layout): each thread then
++    // reads and writes its own element only. Any other overlap needs staging.
++    const bool residual_inplace = residual->data == dst->data && ggml_are_same_layout(residual, dst);
++    const bool stage = (!residual_inplace && hc_ranges_overlap(dst, residual)) ||
++                       hc_ranges_overlap(dst, block_out) || hc_ranges_overlap(dst, inject);
++
++    ggml_cuda_pool_alloc<float> staged(ctx.pool());
++    float * out = stage ? staged.alloc(ggml_nelements(dst)) : (float *) dst->data;
++
++    const int64_t n_items = ggml_nelements(dst);
++    const int     threads = 256;
++    const int     blocks  = (int) ((n_items + threads - 1) / threads);
++    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
++    ggml_cuda_kernel_launch(hc_combine_f32, launch_params,
++        (const float *) residual->data, (const float *) block_out->data, (const float *) inject->data, out,
++        n_embd, (int) hc, n_tokens, args.s1, args.b1, args.s2, args.b2);
++
++    if (stage) {
++        CUDA_CHECK(cudaMemcpyAsync(dst->data, out, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, ctx.stream()));
++    }
++}
++
++// ---------------------------------------------------------------------------------------------------------
++// combine + grouped rms norm, one token: block per stream, 1024 threads (the rms_norm_f32<1024> layout)
++//   w        = s2 * sigmoid(s1 * inject[c] + b1) + b2
++//   res[e,c] = residual[e,c] + block_out[e] * w
++//   xn[e,c]  = rms_norm(res[:,c]) * gamma[e,c]
++
++#define HC_CN_BLOCK   1024
++#define HC_CN_MAX_EMB 3072
++
++static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
++        const float * __restrict__ inject, const float * __restrict__ residual,
++        const float * __restrict__ block_out, const float * __restrict__ gamma,
++        float * __restrict__ out_res, float * __restrict__ out_xn,
++        const int n_embd, const bool bo_hc,
++        const float s1, const float b1, const float s2, const float b2, const float eps) {
++    __shared__ float s_sum[32];
++
++    const int c   = blockIdx.x;   // stream
++    const int t   = blockIdx.y;   // token
++    const int hc  = gridDim.x;
++    const int tid = threadIdx.x;
++
++    // identical expressions to scale_f32 / op_sigmoid / scale_f32
++    const float x1 = hc_add_rn(hc_mul_rn(s1, inject[(int64_t) t * hc + c]), b1);
++    const float x2 = hc_sigmoid(x1);
++    const float w  = hc_add_rn(hc_mul_rn(s2, x2), b2);
++
++    const int64_t row = (int64_t) t * hc + c;
++    const float * res = residual + row * n_embd;
++    float *       dst = out_res  + row * n_embd;
++    block_out += (bo_hc ? row : (int64_t) t) * n_embd;
++    float xs[3];
++    float tmp = 0.0f;
++#pragma unroll
++    for (int k = 0; k < 3; ++k) {
++        const int col = tid + k * HC_CN_BLOCK;
++        xs[k] = 0.0f;
++        if (col < n_embd) {
++            const float m  = hc_mul_rn(block_out[col], w);
++            const float xi = hc_add_rn(res[col], m);
++            dst[col] = xi;
++            xs[k]    = xi;
++            tmp += xi * xi;
++        }
++    }
++
++    tmp = block_reduce<block_reduce_method::SUM, HC_CN_BLOCK>(tmp, s_sum);
++
++    const float mean  = tmp / n_embd;
++    const float scale = rsqrtf(mean + eps);
++
++    const float * g  = gamma  + (int64_t) c * n_embd;
++    float *       xn = out_xn + row * n_embd;
++#pragma unroll
++    for (int k = 0; k < 3; ++k) {
++        const int col = tid + k * HC_CN_BLOCK;
++        if (col < n_embd) {
++            xn[col] = hc_mul_rn(hc_mul_rn(scale, xs[k]), g[col]);
++        }
++    }
++}
++
++// Same computation for one token with all streams in a single block, streams processed one after the other
++// with exactly the per-stream expressions and block reduction above. Every input element is loaded into
++// registers before the first store, so the outputs may alias any of the inputs (the graph allocator reuses
++// the block_out buffer for xn when block_out dies at the combine).
++#define HC_CN_SINGLE_MAX_HC 4
++
++static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_single_f32(
++        const float * inject, const float * residual, const float * block_out, const float * __restrict__ gamma,
++        float * out_res, float * out_xn,
++        const int n_embd, const int hc, const bool bo_hc,
++        const float s1, const float b1, const float s2, const float b2, const float eps) {
++    __shared__ float s_sum[HC_CN_SINGLE_MAX_HC][32];
++
++    const int t       = blockIdx.x;   // token
++    const int tid     = threadIdx.x;
++    const int warp_id = tid / WARP_SIZE;
++    const int lane_id = tid % WARP_SIZE;
++
++    // 1. every input element of the token into registers
++    float w[HC_CN_SINGLE_MAX_HC];
++#pragma unroll
++    for (int c = 0; c < HC_CN_SINGLE_MAX_HC; ++c) {
++        w[c] = 0.0f;
++        if (c < hc) {
++            // identical expressions to scale_f32 / op_sigmoid / scale_f32
++            const float x1 = s1 * inject[(int64_t) t * hc + c] + b1;
++            const float x2 = hc_sigmoid(x1);
++            w[c] = s2 * x2 + b2;
++        }
++    }
++
++    const int64_t bo_row_base = bo_hc ? (int64_t) t * hc : (int64_t) t;
++    float xs[HC_CN_SINGLE_MAX_HC][3];
++    float tmp[HC_CN_SINGLE_MAX_HC];
++#pragma unroll
++    for (int c = 0; c < HC_CN_SINGLE_MAX_HC; ++c) {
++        tmp[c] = 0.0f;
++    }
++#pragma unroll
++    for (int k = 0; k < 3; ++k) {
++        const int col = tid + k * HC_CN_BLOCK;
++#pragma unroll
++        for (int c = 0; c < HC_CN_SINGLE_MAX_HC; ++c) {
++            xs[c][k] = 0.0f;
++            if (c < hc && col < n_embd) {
++                // single-copy block_out broadcasts over c: its row is t regardless of the stream
++                const int64_t bo_off = (bo_row_base + (bo_hc ? (int64_t) c : 0)) * n_embd + col;
++                const float m  = hc_mul_rn(block_out[bo_off], w[c]);
++                const float xi = hc_add_rn(residual[((int64_t) t * hc + c) * n_embd + col], m);
++                xs[c][k] = xi;
++                tmp[c] += xi * xi;
++            }
++        }
++    }
++    __syncthreads(); // all loads of the block have completed before the first store
++
++    // 2. per-stream block sums, same reduction tree as block_reduce<SUM, 1024> for each stream
++#pragma unroll
++    for (int c = 0; c < HC_CN_SINGLE_MAX_HC; ++c) {
++        tmp[c] = warp_reduce_sum(tmp[c]);
++    }
++    if (lane_id == 0) {
++#pragma unroll
++        for (int c = 0; c < HC_CN_SINGLE_MAX_HC; ++c) {
++            s_sum[c][warp_id] = tmp[c];
++        }
++    }
++    __syncthreads();
++#pragma unroll
++    for (int c = 0; c < HC_CN_SINGLE_MAX_HC; ++c) {
++        tmp[c] = lane_id < HC_CN_BLOCK / WARP_SIZE ? s_sum[c][lane_id] : 0.0f;
++        tmp[c] = warp_reduce_sum(tmp[c]);
++    }
++
++    // 3. stores
++#pragma unroll
++    for (int c = 0; c < HC_CN_SINGLE_MAX_HC; ++c) {
++        if (c < hc) {
++            const float mean  = tmp[c] / n_embd;
++            const float scale = rsqrtf(mean + eps);
++            const int64_t row = (int64_t) t * hc + c;
++            float *       dst = out_res + row * n_embd;
++            float *       xn  = out_xn  + row * n_embd;
++            const float * g   = gamma   + (int64_t) c * n_embd;
++#pragma unroll
++            for (int k = 0; k < 3; ++k) {
++                const int col = tid + k * HC_CN_BLOCK;
++                if (col < n_embd) {
++                    dst[col] = xs[c][k];
++                    xn[col]  = hc_mul_rn(hc_mul_rn(scale, xs[c][k]), g[col]);
++                }
++            }
++        }
++    }
++}
++
++bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & a, const int warp_size) {
++    const int64_t n_embd = a.out_res->ne[0];
++    const int64_t hc     = a.out_res->ne[1];
++    return warp_size == 32 && n_embd >= 1024 && n_embd <= HC_CN_MAX_EMB && hc >= 1 && hc <= 16 &&
++        ggml_nelements(a.gamma) == n_embd * hc;
++}
++
++void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_combine_norm_args & a) {
++    const int64_t n_embd   = a.out_res->ne[0];
++    const int64_t hc       = a.out_res->ne[1];
++    const int64_t n_tokens = a.out_res->ne[2] * a.out_res->ne[3];
++
++    GGML_ASSERT(a.out_res->ne[3] == 1);
++    // out_xn is the gamma-MUL result: [n_embd*hc, T] (2D), out_res is [n_embd, hc, T] (3D);
++    // both are contiguous F32 with one shared row-major layout, so the kernel addresses them
++    // identically via row = (t*hc + c).
++    GGML_ASSERT(a.out_xn->type == GGML_TYPE_F32 && ggml_is_contiguous(a.out_xn));
++    GGML_ASSERT(ggml_nelements(a.out_xn) == ggml_nelements(a.out_res));
++    GGML_ASSERT(a.out_xn->ne[0] == n_embd * hc);
++    GGML_ASSERT(ggml_are_same_shape(a.out_res, a.residual));
++    GGML_ASSERT(ggml_nelements(a.block_out) == n_embd * n_tokens || ggml_nelements(a.block_out) == n_embd * hc * n_tokens);
++    GGML_ASSERT(ggml_nelements(a.gamma) == n_embd * hc && ggml_nelements(a.inject) == hc * n_tokens);
++
++    if (a.single_block) {
++        GGML_ASSERT(hc <= HC_CN_SINGLE_MAX_HC);
++        const ggml_cuda_kernel_launch_params launch_params(dim3((int) n_tokens, 1, 1), HC_CN_BLOCK, 0, ctx.stream());
++        ggml_cuda_kernel_launch(hc_combine_norm_single_f32, launch_params,
++            (const float *) a.inject->data, (const float *) a.residual->data,
++            (const float *) a.block_out->data, (const float *) a.gamma->data,
++            (float *) a.out_res->data, (float *) a.out_xn->data,
++            (int) n_embd, (int) hc, a.block_out_hc, a.s1, a.b1, a.s2, a.b2, a.eps);
++        return;
++    }
++
++    const ggml_cuda_kernel_launch_params launch_params(dim3((int) hc, (int) n_tokens, 1), HC_CN_BLOCK, 0, ctx.stream());
++    ggml_cuda_kernel_launch(hc_combine_norm_f32, launch_params,
++        (const float *) a.inject->data, (const float *) a.residual->data,
++        (const float *) a.block_out->data, (const float *) a.gamma->data,
++        (float *) a.out_res->data, (float *) a.out_xn->data,
++        (int) n_embd, a.block_out_hc, a.s1, a.b1, a.s2, a.b2, a.eps);
++}
+diff --git a/ggml/src/ggml-cuda/hyperconn.cuh b/ggml/src/ggml-cuda/hyperconn.cuh
+new file mode 100644
+index 000000000..2a8782a28
+--- /dev/null
++++ b/ggml/src/ggml-cuda/hyperconn.cuh
+@@ -0,0 +1,56 @@
++#pragma once
++
++#include "common.cuh"
++
++// Fused hyper-connection (DeepSeek-V4 / qwen4exp style) decode helpers.
++//
++// hc_mix_reduce:  mixed[e,t] = scale * sum_c ( xn[c*n_embd + e, t] * sigmoid(gate[c*n_embd + e, t]) ) + bias
++//   replaces: UNARY(SIGMOID) -> MUL -> RESHAPE -> VIEW -> CONT -> (VIEW -> ADD) x (hc-1) -> SCALE
++//
++// hc_combine:     out[e,c,t] = residual[e,c,t] + block_out[e,t] * ( s2 * sigmoid(s1 * inject[c,t] + b1) + b2 )
++//   replaces: SCALE -> UNARY(SIGMOID) -> SCALE -> RESHAPE* -> REPEAT -> MUL -> ADD
++//
++// Both replay the unfused rounding sequence exactly (separate mul and add roundings), so results are
++// bit-identical to the individual kernels.
++
++struct ggml_cuda_hc_mix_args {
++    const ggml_tensor * xn;     // [hc*n_embd, T] F32 contiguous
++    const ggml_tensor * gate;   // [hc*n_embd, T] F32 contiguous (pre-sigmoid)
++    ggml_tensor *       dst;    // [n_embd, T]   F32 contiguous
++    int                 hc;
++    float               scale;
++    float               bias;
++};
++
++struct ggml_cuda_hc_combine_args {
++    const ggml_tensor * residual;   // [n_embd, hc, T] F32 contiguous
++    const ggml_tensor * block_out;  // [n_embd, T]     F32 contiguous (or a reshape of it)
++    const ggml_tensor * inject;     // [hc, T]         F32 contiguous (pre-scale/sigmoid)
++    ggml_tensor *       dst;        // [n_embd, hc, T] F32 contiguous
++    float               s1, b1;     // first SCALE
++    float               s2, b2;     // second SCALE
++};
++
++void ggml_cuda_op_hc_mix_reduce(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_mix_args & args);
++void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_combine_args & args);
++
++// Hyper-connection combine followed by the grouped RMS norm of the next hc_mix (block per stream and token):
++//   w[c]     = s2 * sigmoid(s1 * inject[c] + b1) + b2
++//   res[e,c] = residual[e,c] + block_out[e] * w[c]        -> out_res (the layer residual)
++//   xn[e,c]  = rms_norm(res[:,c]) * gamma[e,c]            -> out_xn  (next hc_norm)
++// The norm replays rms_norm_f32<1024, true> (one block of 1024 threads per stream).
++struct ggml_cuda_hc_combine_norm_args {
++    const ggml_tensor * inject;     // [hc, T]  F32 contiguous (pre-scale/sigmoid)
++    const ggml_tensor * residual;   // [n_embd, hc, T] F32 contiguous
++    const ggml_tensor * block_out;  // [n_embd, T]-style or [n_embd, hc, T] (REPEAT output) F32 contiguous
++    const ggml_tensor * gamma;      // [n_embd, hc] F32 contiguous
++    ggml_tensor *       out_res;    // [n_embd, hc, T]
++    ggml_tensor *       out_xn;     // [n_embd, hc, T]
++    float               s1, b1, s2, b2;
++    float               eps;
++    bool                single_block = false; // alias-proof variant: one block per token, all inputs read before any store (hc <= 4)
++    bool                block_out_hc = false; // block_out carries hc stacked copies ([n_embd,hc,T]); else rows of n_embd per token
++};
++
++bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & args, int warp_size);
++void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_combine_norm_args & args);
+diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
+index 62854dda5..b15af7104 100644
+--- a/ggml/src/ggml-cuda/indexer-topk.cu
++++ b/ggml/src/ggml-cuda/indexer-topk.cu
+@@ -133,44 +133,144 @@ static __global__ void indexer_topk_radix_select(
+     }
+ }
+ 
+-static __global__ void indexer_topk_radix_reset_counters(indexer_topk_radix_state * states, int nrows) {
+-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (row < nrows) {
+-        states[row].greater_count = 0;
+-        states[row].equal_count = 0;
++// ---------------------------------------------------------------------------
++// deterministic gather.  the old implementation placed the selected cells with
++// atomicAdd counters, so with more than one block per row the output LIST ORDER
++// (and, at the rank boundary, which tied cells made it) varied run to run.  the
++// QSA kernel's online softmax is order-sensitive at the ulp level, and this
++// model's f16-state recurrences amplify that into llama-cli-visible
++// nondeterminism.  Instead, cells are written in ascending column order:
++// per (row, block-of-256-cols) counts, an exclusive prefix scan over the
++// blocks, then a deterministic per-thread placement (warp ballot + block scan).
++
++template<typename kv_t>
++static __global__ void indexer_topk_count(
++        const float * __restrict__ score,
++        const int   * __restrict__ cell_blk,
++        const kv_t  * __restrict__ additive,
++        const indexer_topk_radix_state * __restrict__ states,
++        int * __restrict__ g_cnt, int * __restrict__ e_cnt,
++        int ncols, int n_tps, int n_blocks, int n_kv,
++        int blocks_per_row) {
++    constexpr int BLOCK_SIZE = 256;
++    const int row = blockIdx.x / blocks_per_row;
++    const int b   = blockIdx.x % blocks_per_row;
++    const int tid = threadIdx.x;
++    const int t = row % n_tps;
++    const int s = row / n_tps;
++    const int col = b*BLOCK_SIZE + tid;
++
++    int g = 0, e = 0;
++    if (col < ncols) {
++        const uint32_t key = indexer_topk_float_to_ordered(
++                indexer_topk_value(score, cell_blk, additive, col, t, s, n_blocks, n_tps, n_kv));
++        g = (key >  states[row].prefix) ? 1 : 0;
++        e = (key == states[row].prefix) ? 1 : 0;
++    }
++    __shared__ int sg[BLOCK_SIZE], se[BLOCK_SIZE];
++    sg[tid] = g;
++    se[tid] = e;
++    for (int off = BLOCK_SIZE/2; off > 0; off >>= 1) {
++        __syncthreads();
++        if (tid < off) { sg[tid] += sg[tid + off]; se[tid] += se[tid + off]; }
++    }
++    __syncthreads();
++    if (tid == 0) {
++        g_cnt[row*blocks_per_row + b] = sg[0];
++        e_cnt[row*blocks_per_row + b] = se[0];
++    }
++}
++
++static __global__ void indexer_topk_base_scan(
++        const int * __restrict__ g_cnt, const int * __restrict__ e_cnt,
++        int * __restrict__ g_base, int * __restrict__ e_base,
++        int nrows, int blocks_per_row) {
++    constexpr int BLOCK_SIZE = 256;
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++    __shared__ int sg[BLOCK_SIZE], se[BLOCK_SIZE];
++    __shared__ int scg, sce;
++    if (tid == 0) { scg = 0; sce = 0; }
++    __syncthreads();
++    for (int chunk = 0; chunk*BLOCK_SIZE < blocks_per_row; ++chunk) {
++        const int i = chunk*BLOCK_SIZE + tid;
++        const int own_g = (i < blocks_per_row) ? g_cnt[row*blocks_per_row + i] : 0;
++        const int own_e = (i < blocks_per_row) ? e_cnt[row*blocks_per_row + i] : 0;
++        sg[tid] = own_g;
++        se[tid] = own_e;
++        // Hillis-Steele inclusive scan in shared
++        for (int off = 1; off < BLOCK_SIZE; off <<= 1) {
++            __syncthreads();
++            const int vg = (tid >= off) ? sg[tid - off] : 0;
++            const int ve = (tid >= off) ? se[tid - off] : 0;
++            __syncthreads();
++            if (tid >= off) { sg[tid] += vg; se[tid] += ve; }
++        }
++        __syncthreads();
++        if (i < blocks_per_row) {
++            // exclusive prefix = inclusive minus this element's own count, plus the carry
++            g_base[row*blocks_per_row + i] = sg[tid] - own_g + scg;
++            e_base[row*blocks_per_row + i] = se[tid] - own_e + sce;
++        }
++        __syncthreads();
++        if (tid == 0) {
++            scg += sg[BLOCK_SIZE - 1];
++            sce += se[BLOCK_SIZE - 1];
++        }
++        __syncthreads();
+     }
+ }
+ 
+-template<int BLOCK_SIZE, typename kv_t>
+-static __global__ void indexer_topk_radix_gather(
++template<typename kv_t>
++static __global__ void indexer_topk_deterministic_write(
+         const float * __restrict__ score,
+         const int   * __restrict__ cell_blk,
+         const kv_t  * __restrict__ additive,
++        const indexer_topk_radix_state * __restrict__ states,
++        const int * __restrict__ g_base, const int * __restrict__ e_base,
+         int * __restrict__ dst,
+-        indexer_topk_radix_state * __restrict__ states,
+         int ncols, int n_tps, int n_blocks, int n_kv, int k,
+         int blocks_per_row) {
++    constexpr int BLOCK_SIZE = 256;
+     const int row = blockIdx.x / blocks_per_row;
+-    const int row_block = blockIdx.x % blocks_per_row;
++    const int b   = blockIdx.x % blocks_per_row;
+     const int tid = threadIdx.x;
+     const int t = row % n_tps;
+     const int s = row / n_tps;
+-    int * row_dst = dst + (size_t) row * k;
+-    indexer_topk_radix_state * state = &states[row];
++    const int col = b*BLOCK_SIZE + tid;
+ 
+-    for (int col = row_block * BLOCK_SIZE + tid;
+-         col < ncols;
+-         col += blocks_per_row * BLOCK_SIZE) {
++    int g = 0, e = 0;
++    if (col < ncols) {
+         const uint32_t key = indexer_topk_float_to_ordered(
+                 indexer_topk_value(score, cell_blk, additive, col, t, s, n_blocks, n_tps, n_kv));
+-        if (key > state->prefix) {
+-            const int pos = atomicAdd(&state->greater_count, 1);
+-            row_dst[pos] = col;
+-        } else if (key == state->prefix) {
+-            const int pos = atomicAdd(&state->equal_count, 1);
+-            if (pos < state->rank) {
+-                row_dst[k - state->rank + pos] = col;
+-            }
++        g = (key >  states[row].prefix) ? 1 : 0;
++        e = (key == states[row].prefix) ? 1 : 0;
++    }
++    // inclusive prefix over the whole block in shared: gives each selected cell a
++    // deterministic position (thread order = ascending column order within the block)
++    __shared__ int sg[BLOCK_SIZE], se[BLOCK_SIZE];
++    sg[tid] = g;
++    se[tid] = e;
++    for (int off = 1; off < BLOCK_SIZE; off <<= 1) {
++        __syncthreads();
++        const int vg = (tid >= off) ? sg[tid - off] : 0;
++        const int ve = (tid >= off) ? se[tid - off] : 0;
++        __syncthreads();
++        if (tid >= off) { sg[tid] += vg; se[tid] += ve; }
++    }
++    __syncthreads();
++
++    int * row_dst = dst + (size_t) row*k;
++    const int g_base_b = g_base[row*blocks_per_row + b];
++    const int e_base_b = e_base[row*blocks_per_row + b];
++    if (g) {
++        // exclusive position within this block's greater cells = inclusive - 1
++        row_dst[g_base_b + sg[tid] - 1] = col;
++    } else if (e) {
++        const int pos = se[tid] - 1;   // exclusive position within this block's equal cells
++        const int rank = states[row].rank;
++        if (e_base_b + pos < rank) {
++            row_dst[k - rank + e_base_b + pos] = col;
+         }
+     }
+ }
+@@ -203,12 +303,28 @@ static void indexer_topk_radix_cuda(
+             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
+     }
+ 
+-    indexer_topk_radix_reset_counters
+-        <<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows);
+-    indexer_topk_radix_gather<BLOCK_SIZE, kv_t>
+-        <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+-            score, cell_blk, additive, dst, states,
+-            ncols, n_tps, n_blocks, n_kv, k, blocks_per_row);
++    // deterministic gather: ascending column order, no atomics (see kernels above)
++    if (k <= 0 || nrows == 0) {
++        return;
++    }
++    const int cbpr = (ncols + BLOCK_SIZE - 1) / BLOCK_SIZE;   // count/write blocks per row
++    ggml_cuda_pool_alloc<int> gc_alloc(pool, (size_t) nrows * cbpr);
++    ggml_cuda_pool_alloc<int> ec_alloc(pool, (size_t) nrows * cbpr);
++    ggml_cuda_pool_alloc<int> gb_alloc(pool, (size_t) nrows * cbpr);
++    ggml_cuda_pool_alloc<int> eb_alloc(pool, (size_t) nrows * cbpr);
++    int * g_cnt  = gc_alloc.get();
++    int * e_cnt  = ec_alloc.get();
++    int * g_base = gb_alloc.get();
++    int * e_base = eb_alloc.get();
++
++    indexer_topk_count<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
++            score, cell_blk, additive, states, g_cnt, e_cnt,
++            ncols, n_tps, n_blocks, n_kv, cbpr);
++    indexer_topk_base_scan<<<nrows, BLOCK_SIZE, 0, stream>>>(
++            g_cnt, e_cnt, g_base, e_base, nrows, cbpr);
++    indexer_topk_deterministic_write<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
++            score, cell_blk, additive, states, g_base, e_base, dst,
++            ncols, n_tps, n_blocks, n_kv, k, cbpr);
+ }
+ 
+ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index a342ee119..328c84da9 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -99,6 +99,11 @@ llama_kv_cache::llama_kv_cache(
+ 
+     GGML_ASSERT(kv_size % n_pad == 0);
+ 
++    if (other) {
++        // our rows go stale exactly when the owner frees a cell: let it zero them with its own
++        other->sharers.push_back(this);
++    }
++
+     const uint32_t n_layer = hparams.n_layer_all;
+ 
+     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
+@@ -367,6 +372,15 @@ llama_kv_cache::llama_kv_cache(
+ }
+ 
+ void llama_kv_cache::clear(bool data) {
++    if (!other) {
++        // every cell becomes free: wipe the rows that were ever written (the sharers' rows too,
++        // their own clear() may not run, and a buffer clear below only covers our buffers)
++        rows_hw_init();
++        for (uint32_t s = 0; s < n_stream; ++s) {
++            zero_rows(s, 0, rows_hw[s]);
++            rows_hw[s] = 0;
++        }
++    }
+     for (uint32_t s = 0; s < n_stream; ++s) {
+         v_cells[s].reset();
+         v_heads[s] = 0;
+@@ -402,6 +416,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+ 
+         uint32_t new_head = cells.size();
+ 
++        std::vector<uint32_t> freed;
++
+         for (uint32_t i = 0; i < cells.size(); ++i) {
+             if (!cells.pos_in(i, p0, p1)) {
+                 continue;
+@@ -411,9 +427,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+                 if (new_head == cells.size()) {
+                     new_head = i;
+                 }
++
++                freed.push_back(i);
+             }
+         }
+ 
++        zero_idxs(seq_to_stream[seq_id], freed);
++
+         // If we freed up a slot, set head to it so searching can start there.
+         if (new_head != cells.size() && new_head < head) {
+             head = new_head;
+@@ -426,6 +446,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+ 
+             uint32_t new_head = cells.size();
+ 
++            std::vector<uint32_t> freed;
++
+             for (uint32_t i = 0; i < cells.size(); ++i) {
+                 if (!cells.pos_in(i, p0, p1)) {
+                     continue;
+@@ -436,8 +458,12 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+                 if (new_head == cells.size()) {
+                     new_head = i;
+                 }
++
++                freed.push_back(i);
+             }
+ 
++            zero_idxs(s, freed);
++
+             // If we freed up a slot, set head to it so searching can start there.
+             if (new_head != cells.size() && new_head < head) {
+                 head = new_head;
+@@ -553,14 +579,20 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+ 
+     uint32_t new_head = cells.size();
+ 
++    std::vector<uint32_t> freed;
++
+     for (uint32_t i = 0; i < cells.size(); ++i) {
+         if (cells.seq_keep(i, seq_id)) {
+             if (new_head == cells.size()) {
+                 new_head = i;
+             }
++
++            freed.push_back(i);
+         }
+     }
+ 
++    zero_idxs(seq_to_stream[seq_id], freed);
++
+     // If we freed up a slot, set head to it so searching can start there.
+     if (new_head != cells.size() && new_head < head) {
+         head = new_head;
+@@ -840,6 +872,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
+ 
+             LLAMA_LOG_DEBUG("%s: copying KV buffer: stream %d to stream %d\n", __func__, ssrc, sdst);
+ 
++            // the whole stream is copied, rows above the source high-water mark included
++            rows_hw_init();
++            rows_hw[sdst] = rows_hw[ssrc];
++
+             assert(ssrc != sdst);
+ 
+             for (uint32_t il = 0; il < layers.size(); ++il) {
+@@ -1183,6 +1219,15 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
+ 
+         head = sinfo.idxs[s].back() + 1;
+     }
++
++    // rows at or above the highest used cell are zero (buffer clear at construction, zero_rows
++    // on every free); remember the written extent so clear() only wipes what it has to
++    rows_hw_init();
++    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
++        const uint32_t strm = sinfo.strm[s];
++
++        rows_hw[strm] = std::max(rows_hw[strm], v_cells[strm].used_max_p1());
++    }
+ }
+ 
+ bool llama_kv_cache::get_can_shift() const {
+@@ -1315,6 +1360,74 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
+             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+ }
+ 
++llama_kv_cache::~llama_kv_cache() {
++    if (other) {
++        auto & v = other->sharers;
++        v.erase(std::remove(v.begin(), v.end(), this), v.end());
++    }
++    for (auto * c : sharers) {
++        c->other = nullptr;
++    }
++}
++
++void llama_kv_cache::rows_hw_init() {
++    if (rows_hw.size() != n_stream) {
++        rows_hw.assign(n_stream, 0);
++    }
++}
++
++void llama_kv_cache::zero_rows(uint32_t strm, uint32_t r0, uint32_t r1) {
++    r1 = std::min(r1, get_size());
++
++    if (r0 >= r1) {
++        return;
++    }
++
++    const auto zero = [strm, r0, r1](const llama_kv_cache * c) {
++        for (const auto & layer : c->layers) {
++            // V stored column-major (no flash attention) has no contiguous rows to wipe; that
++            // path does not go through the WMMA accumulate the zeroing is for
++            for (ggml_tensor * t : { layer.k, c->v_trans ? nullptr : layer.v }) {
++                if (!t || !t->buffer) {
++                    continue;
++                }
++
++                const size_t offset = (size_t) strm*t->nb[2] + (size_t) r0*t->nb[1];
++                const size_t size   = (size_t) (r1 - r0)*t->nb[1];
++
++                if (offset + size > ggml_nbytes(t)) {
++                    continue;
++                }
++
++                // a host memset on UMA, a fill command elsewhere; never a graph node, so graph
++                // reuse cannot replay it with stale offsets
++                ggml_backend_tensor_memset(t, 0, offset, size);
++            }
++        }
++    };
++
++    zero(this);
++
++    for (const auto * c : sharers) {
++        zero(c);
++    }
++}
++
++void llama_kv_cache::zero_idxs(uint32_t strm, const std::vector<uint32_t> & idxs) {
++    // coalesce runs of consecutive cells into one memset each
++    size_t i = 0;
++    while (i < idxs.size()) {
++        size_t j = i;
++        while (j + 1 < idxs.size() && idxs[j + 1] == idxs[j] + 1) {
++            ++j;
++        }
++
++        zero_rows(strm, idxs[i], idxs[j] + 1);
++
++        i = j + 1;
++    }
++}
++
+ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+     GGML_UNUSED(sinfo);
+ 
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index c4d8699de..53b896b2e 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -116,7 +116,7 @@ public:
+         // a model can hold more than one cache, so the tensor names have to stay unique
+                  const char *   name_tag = "");
+ 
+-    ~llama_kv_cache() = default;
++    ~llama_kv_cache() override;
+ 
+     //
+     // llama_memory_i
+@@ -189,6 +189,14 @@ public:
+     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+ 
++    // zero the K rows (and the V rows when V is stored row-major) [r0, r1) of stream strm in
++    // every layer, including the layers of the caches that mirror these cells (sharers).
++    // Called for every cell that becomes free, so a masked-out cell never holds stale content:
++    // on gfx11 WMMA, P*V with P == +0.0 is not exact for V != +0.0, so the FA output would
++    // otherwise depend on whatever the masked-out cells last held.
++    void zero_rows(uint32_t strm, uint32_t r0, uint32_t r1);
++    void zero_idxs(uint32_t strm, const std::vector<uint32_t> & idxs);   // ascending cell indices
++
+     // store k_cur and v_cur in the cache based on the provided head location
+     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
+     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+@@ -295,6 +303,14 @@ private:
+     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
+     std::vector<uint32_t> v_heads;
+ 
++    // one past the highest cell row ever written, per stream. Rows above it are still zero
++    // from the buffer clear at construction, so clear() only has to wipe [0, rows_hw).
++    std::vector<uint32_t> rows_hw;
++    void rows_hw_init();
++
++    // caches that mirror our cells (see `other`): their rows go stale exactly when ours do
++    std::vector<llama_kv_cache *> sharers;
++
+     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
+     llama_kv_cache * other;
+ 

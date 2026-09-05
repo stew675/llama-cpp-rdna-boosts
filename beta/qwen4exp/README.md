@@ -161,18 +161,28 @@ git apply managed-ngrams.patch
 #  pre-images are the earlier patches' state either way)
 git apply qwen4exp-support.patch
 git apply mtp-draft-support.patch
+git apply ws4-hc-prefill-fusions.patch
 ```
 
-Requires ROCm gfx1201 (RDNA4) for the CUDA/HIP kernels. All three
-patches apply clean with plain `git apply` on that base (re-verified
-2026-09-04 on master `8b4b3558f` + blocks 01-13: applied tree
-byte-identical to the branch tip). If master drifts further,
-`git apply --3way` (or a manual resolve on the qwen4exp.cpp attention
-path) is the fallback — the patch pre-images now match the current
-master-based files, so drift has to overlap the patched regions again
-before conflicts return.
+All four patches apply clean with plain `git apply` on that base
+(patch 4 re-verified 2026-09-06: applied tree byte-identical to the
+qwen4exp branch tip `248e47704`; patches 1-3 re-verified 2026-09-04 on
+the same base). If master drifts further, `git apply --3way` (or a
+manual resolve on the qwen4exp.cpp attention path) is the fallback —
+the patch pre-images now match the current master-based files, so drift
+has to overlap the patched regions again before conflicts return.
 
 ## Validation status (the gates this baseline holds)
+
+- WS4 gates on Strix Halo (RDNA3.5 / gfx1151, Ryzen AI MAX+ 395,
+  Qwen3.8-Flash-Next UD IQ4_XS 87.24 GiB, non-MTP), 2026-09-06: patch 4
+  (fusions DEFAULT ON) vs `GGML_CUDA_DISABLE_HC_FUSION=1` on the same
+  build — clean warm-clock r3 depth-0 ladder +5.2-8.8% (pp512..16384),
+  pp rows keep +4-6% at depth 12k/32k, tg@depth flat (decode
+  untouched), memory stable −r3 through 32k, llama-cli same-seed text
+  identical on == off (logit-level bit-exactness proven in-session).
+  Record: `benchmarks/2026-09-06-strix-halo-gfx1151-ws4-hc-fusion-gates.md`.
+  (The gfx1201/RDNA4 records for patches 1-3 are the bullets below.)
 
 - llama-bench (3x R9700 tensor, ngl 99, ub 2048, warm page cache):
   tg128 45.7 t/s, pp512 1538, pp8192 2024 - matches the pre-rebase refs.
