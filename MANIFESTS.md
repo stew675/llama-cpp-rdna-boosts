@@ -21,7 +21,8 @@ applying produces zero git whitespace warnings (verified 2026-08-29,
 re-verified 2026-09-01 on the `0eadefebd` re-base, re-verified with block
 13 on the 13-patch series 2026-09-01, re-verified on the `9cffdcc80`
 re-base 2026-09-02, re-verified after the 2026-09-02 block-13 amendment,
-re-verified after the 2026-09-04 block-12 amendment).
+re-verified after the 2026-09-04 block-12 amendment, re-verified after
+the 2026-09-05 block-13 RDNA3_5 gate relaxation).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -69,7 +70,7 @@ delivery — use `patches/` + `scripts/apply-all.sh`.
 | 10 | `0010-…-block-10-k-quant-boosts-Q4_K-Q5_K-Q6_K-Q.patch` | k-quant + mmvq-parameter umbrella (VDR kernels, RDNA3_5 table, MoE mmid) — the only decode-numerics patch | none (omit for greedy purity) |
 | 11 | `0011-…-block-11-skip-CUDA-graphs-for-multi-toke.patch` | skip CUDA graphs for multi-token prefill | none |
 | 12 | `0012-…-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch` | **hybrid HIP all-reduce** (internal AR for the small-tensor decode path + per-size hybrid dispatch vs RCCL; RDNA4-only gate: refuses to init off gfx1200/gfx1201, falls back to RCCL) | none (apply last) |
-| 13 | `0013-…-block-13-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** (prefill fused expert MMQ, RDNA4, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K + decode item-split, re-based on the upstream has_fusion mmvq path; multi-token mmvq x_scale_channel_dst fusion for MoE down x topk-weights, spec-dec verify batches n=2..8; ROCm unaligned-width split-load fix for Q6_K/Q3_K 2-GPU) | none (apply last) |
+| 13 | `0013-…-block-13-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** (prefill fused expert MMQ, RDNA4 + RDNA3.5 (gfx1151 validated 2026-09-05), Q3_K/Q4_K/Q5_K/Q8_0/Q6_K + decode item-split, re-based on the upstream has_fusion mmvq path; multi-token mmvq x_scale_channel_dst fusion for MoE down x topk-weights, spec-dec verify batches n=2..8; ROCm unaligned-width split-load fix for Q6_K/Q3_K 2-GPU) | none (apply last) |
 
 Block numbers are the apply order: `01` applies first, `13` last. All blocks
 are mutually independent except **block 08 (fused core) requires blocks 03
@@ -188,6 +189,44 @@ IDENTICAL pre vs post fix (27B Q8_0, 3-GPU tensor split), and perf
 unregressed at depth-16384 hybrid: 2-GPU (1,2) tg128 32.48 -> 32.40,
 3-GPU (0,1,2) tg128 39.33 -> 39.31 (both within noise; pp512 within
 run-to-run spread).
+
+### Strix Halo (RDNA3_5, gfx1151) fused-MoE-MMQ validation (2026-09-05, current)
+
+Block 13's fused MoE gate+up+GLU MMQ prefill arm (`ggml-cuda.cu`
+try_fuse) and its `J_max_gate` tile-width caps (`mmq.cuh`) were
+RDNA4-only — "disabled until validated on other arches".  Validated on
+Strix Halo (Ryzen AI MAX+ 395 / Radeon 8060S, ROCm 7.14, gfx1151, 16C /
+123 GB) with Qwen3.6-35B-A3B True-Q3_K_M (Q3_K is in the fused type
+list), `-ub 2048 -t 16`, llama-bench `-r 8`:
+
+- gate relaxed to RDNA4 + RDNA3_5, RDNA4-tuned caps applied on both;
+  fusion confirmed firing (one-time log during the session);
+- same-seed coherence IDENTICAL fused-on vs off (20 tok, seed 42);
+- prefill gains match RDNA4: pp2048 1590.7 -> 1674-1676 (+5.3%),
+  pp16384 1360-1361 -> 1423-1425 (+4.6%), pp512 ~948 -> ~1094 (+14%,
+  noisy single-ubatch row); decode unchanged (tg128 71.5);
+- caps transfer: uncapping J (128) on gfx1151 regressed pp2048 1674 ->
+  1111 (±166, unstable) and pp16384 1423 -> 1334 (register pressure),
+  i.e. no per-arch port tuning needed for the fused MMQ;
+- methodology notes: on this APU the first llama-bench test after
+  process start runs at a cold GPU clock (pp2048 read 1275±166 when
+  first) — a short pp512 warmup test first restores stability
+  (1674±3).
+
+RDNA3_0 (gfx1100, 7900XTX-class) is still excluded from the fused arm
+until validated there (hardware is the community-member parallel task).
+
+The set was regenerated 2026-09-05 from a canonical fork rebuilt at
+`9cffdcc80` (`scripts/make-patches.sh`, base `9cffdcc80`, blocks tip
+`ace0a5d54`), and the clean-apply sim was re-verified end-to-end on the
+Strix machine itself: git am clean, zero whitespace warnings, applied
+tree byte-identical to the canonical fork tip, full build clean (ROCm
+7.14 gfx1151, RCCL+graphs+native, `-mllvm --amdgpu-unroll-threshold-
+local=600`), sim same-seed coherence identical, sim pp2048 1676.3 /
+pp16384 1424.6 (fused) vs 1590.7 / 1361.4 (unfused) — the regenerated
+set reproduces the validated gains.  `rdna-boosts-all.patch`
+regenerated (applies cleanly at `9cffdcc80`).  Full session record:
+`benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
 
 ### Re-baseline to 0eadefebd (2026-09-01)
 

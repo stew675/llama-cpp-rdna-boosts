@@ -31,16 +31,25 @@ llama.cpp checkout at the fork point **`9cffdcc80`** (re-based 2026-09-02 from `
   the speculative verify step — dense MTP 18.3 -> 27.5 t/s, ksplit dispatch);
   (2) the rms_norm->mmvq Q8_1-cache fold corrupting multi-token MUL_MAT_ID
   (MoE MTP acceptance 0 -> 0.51, draft-mtp 53 -> 126 t/s, fold gated to
-  single-token MMID).  Details + numbers: `patches/README.md` block-13 notes.
+  single-token MMID).  Amended 2026-09-05 with the RDNA3_5 (Strix Halo,
+  gfx1151) gate relaxation: the fused gate+up+GLU MMQ arm + its
+  `J_max_gate` tile caps were RDNA4-only; validated on a Ryzen AI MAX+ 395
+  (Qwen3.6-35B-A3B True-Q3_K_M, ub 2048) — pp2048 1590 -> 1674 (+5.3%),
+  pp16384 1360 -> 1423 (+4.6%), coherence IDENTICAL, decode unchanged;
+  the RDNA4-tuned J caps transfer (uncapping regresses).  RDNA3_0
+  (gfx1100) still excluded until validated there.  Details + numbers:
+  `patches/README.md` block-13 notes and
+  `benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
 
 The repo is NOT the fork: the fork (source of truth for the block commits)
-lives at `~/llama.cpp`, branch `rdna-boosts` — rebuilt 2026-09-02 onto
-upstream master `9cffdcc80` from the delivery patches, block 12 amended
-2026-09-04 with the runtime NCCL-failure fallback (issue #13) and block
-13 amended 2026-09-02 with the two MTP regression fixes (13-commit
-branch; blocks `04122bfb5..b830050bf`). That checkout is disposable and is
-re-created from `patches/` + `scripts/apply-all.sh` whenever it needs
-rebuilding (fresh clone at the fork point + apply). Older fork states are
+lives at `~/llama.cpp`, branch `rdna-boosts` — currently a master
+`8b4b3558f` re-apply (2026-09-04/05: blocks `4c0493980..4c7e2267b`, block
+13 amended 2026-09-05 with the RDNA3_5/Strix Halo fused-MoE-MMQ fold;
+block 12 carries the 2026-09-04 runtime NCCL-failure fallback, issue
+#13). The canonical `9cffdcc80` fork used for `make-patches.sh`
+regeneration is disposable and is re-created from `patches/` +
+`scripts/apply-all.sh` whenever it needs rebuilding (fresh clone at the
+fork point + apply). Older fork states are
 preserved on the `stew675/llama.cpp` fork remote (`rdna-boosts` =
 previous tip `482837e5a` on `0eadefebd`; `rdna-boosts-orig`, …) and in
 older local reference clones — never rely on them for the current
@@ -110,8 +119,9 @@ explicitly requests it.**
   UNPINNED, 3-GPU (`HIP_VISIBLE_DEVICES=0,1,2`), hybrid default.
 - **The set applies whitespace-clean**: `apply-all.sh` prints no git
   whitespace warnings (re-verified 2026-09-01 on `0eadefebd`,
-  2026-09-02 on the `9cffdcc80` re-base, and 2026-09-04 after the
-  block-12 amendment).
+  2026-09-02 on the `9cffdcc80` re-base, 2026-09-04 after the
+  block-12 amendment, and 2026-09-05 after the block-13 RDNA3_5 gate
+  relaxation).
 - **Block 02 (0002) now also carries the MTP chunked-prefix dispatch
   (PR #9, 2026-09-01):** long single-sequence MTP prefills (`K > 1`,
   `n_seqs == 1`, `n_tokens > K+64`) run the chunked WMMA GDN on the
@@ -202,7 +212,7 @@ Diff the output against a known-good build (or against RCCL via
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9cffdcc80`,
-blocks tip `b830050bf`): `git format-patch` the block commits (all 13
+blocks tip `ace0a5d54`): `git format-patch` the block commits (all 13
 blocks are committed fork commits; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`). Then
 re-verify the clean-apply simulation (worktree at the fork point,

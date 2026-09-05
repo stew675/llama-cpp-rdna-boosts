@@ -9,19 +9,23 @@ Reality pass: 2026-09-05.
 
 ## Current active
 
-### Port block 13 to Strix Halo (gfx1151) + validate beta qwen4exp there
-- Block 13 (fused MoE gate+up+GLU MMQ, RDNA4-gated fused arm + decode
-  item-split/ksplit) is done on gfx1201 (R9700). The next active task:
-  port + validate on Strix Halo (gfx1151) — tile caps + bit-exactness,
-  then relax the per-arch gate. Follow the 0004 validation recipe per
-  arch (same-seed coherence IDENTICAL + bench records). RDNA3/gfx1100
-  validation is still pending as well (see the parallel 7900XTX item).
-- `beta/qwen4exp`: the gfx1201/RDNA4 work is essentially done and ships as
-  three patches (`managed-ngrams`, `qwen4exp-support`,
-  `mtp-draft-support`). Validate the same set on Strix Halo.
+### Validate beta qwen4exp on Strix Halo (gfx1151) — env prep pending
+- Block 13's Strix leg is DONE (2026-09-05): the fused MoE gate+up+GLU
+  MMQ (RDNA4-gated fused arm) was ungated for RDNA3_5 / gfx1151,
+  validated (pp2048 +5.3%, pp16384 +4.6%, coherence IDENTICAL, decode
+  unchanged; RDNA4-tuned J caps transfer — an uncap probe regressed),
+  and folded into patch `0013` (delivery regenerated at `9cffdcc80`,
+  clean-apply sim + full build + coherence re-verified on the Strix
+  box). Record:
+  `benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
+- Remaining here: validate `beta/qwen4exp` (the three patches,
+  currently documented as "Requires ROCm gfx1201") on Strix Halo.
+  Environment prep is pending (per the maintainer, 2026-09-05) — the
+  beta base (master `8b4b3558f` + blocks 01-13 incl. the fold) is
+  already built in `~/llama.cpp/build-rocm` on this machine.
 - Standing gate before shipping any decode/fusion change:
   `benchmarks/mtp-adaptive-methodology.md` (MTP baseline + acceptance).
-- Where: `~/llama.cpp` fork (rdna-boosts) + `beta/qwen4exp/README.md`.
+- Where: `beta/qwen4exp/README.md` (gates + carried-forward open items).
 
 ### Parallel (community member): dual 7900XTX (RDNA3, gfx1100)
 - Block-12 (hybrid HIP all-reduce) validation on RDNA3 pairs is ongoing
@@ -29,7 +33,8 @@ Reality pass: 2026-09-05.
   matrix (internal vs nccl vs none) + bounded-spin path at depth-16384.
   The block-12 gate stays RDNA4-only until verified, then the arch check
   is removed. Volunteer test env: `GGML_CUDA_ALLREDUCE=internal`.
-- Can double as the RDNA3/gfx1100 leg of the block-13 validation above.
+- Also the RDNA3.0/gfx1100 leg for block 13's fused MoE MMQ (excluded
+  until validated there) — the same box can double for it.
 - Where: `patches/0012` + the block-12 notes in `patches/README.md`.
 
 ## Open follow-ups
@@ -100,6 +105,14 @@ Reality pass: 2026-09-05.
   bandwidth saturation). ~20% speedup + near-100% utilization were won,
   but attention was not the dominant cost. Remaining decode levers are
   tracked in `beta/qwen4exp/README.md`.
+- 2026-09-05 Block 13 fused MoE MMQ ungated for RDNA3_5 (Strix Halo /
+  gfx1151) and folded into patch `0013`: validated on Ryzen AI MAX+ 395
+  (Qwen3.6-35B-A3B True-Q3_K_M, ub 2048) — pp2048 +5.3% (1590 -> 1674),
+  pp16384 +4.6% (1360 -> 1423), decode unchanged, coherence IDENTICAL;
+  RDNA4 J caps transfer (uncap probe regressed 1674 -> 1111). Delivery
+  regenerated at `9cffdcc80`; clean-apply sim + full build + coherence
+  re-verified on the Strix box. Record:
+  `benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
 - 2026-09-05 Expert-tiering experiment dropped (see Parked).
 - Older resolved items (block-12 fused-stage/pacing closure, ITEM A JIT,
   indexer head-sum revert, qwen35moe dense-GQA N/A, ...) are recorded in

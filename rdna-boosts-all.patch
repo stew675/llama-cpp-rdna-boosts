@@ -6367,7 +6367,7 @@ index 000000000..41d16bc0c
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index f4af82688..7af14fbf6 100644
+index f4af82688..2d28ddd43 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -72,6 +72,7 @@
@@ -7007,7 +7007,7 @@ index f4af82688..7af14fbf6 100644
      auto get_mul_mat_scale = [](const ggml_tensor * scale_node, const ggml_tensor * mm_node) -> const ggml_tensor * {
          const bool scale_lhs_mm = scale_node->src[0] == mm_node;
          const bool scale_rhs_mm = scale_node->src[1] == mm_node;
-@@ -3968,6 +4320,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3968,6 +4320,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  fused_node_count  = 3;
                  break;
              }
@@ -7017,12 +7017,16 @@ index f4af82688..7af14fbf6 100644
 +            // quantized case the gate+up+GLU triple runs as separate ops; fuse it
 +            // into one MMQ kernel that reads both weight streams and applies the
 +            // GLU epilogue. The J tile-width caps in mul_mat_q_switch_J are tuned
-+            // on RDNA4 (gfx1201); on other arches (e.g. Strix Halo, RDNA3.5) the
-+            // fused kernel is disabled until validated there.
++            // on RDNA4 (gfx1201). RDNA3_5 (Strix Halo, gfx1151) was added after
++            // validation 2026-09-05: coherence IDENTICAL fused-on vs off, prefill
++            // gains match RDNA4 (pp2048 +5.3%, pp16384 +4.6% on Qwen3.6-35B-A3B
++            // Q3_K_M ub 2048), and the RDNA4-tuned J caps transfer (uncapping
++            // regressed pp2048 1674->1111 / pp16384 1423->1334).
 +            const bool moe_mmq_type = src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_Q4_K ||
 +                                      src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q8_0 ||
 +                                      src0->type == GGML_TYPE_Q6_K;
-+            if (op == GGML_OP_MUL_MAT_ID && ids != nullptr && !disable_moe_mmq && GGML_CUDA_CC_IS_RDNA4(cc) && moe_mmq_type &&
++            if (op == GGML_OP_MUL_MAT_ID && ids != nullptr && !disable_moe_mmq &&
++                    (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) && moe_mmq_type &&
 +                    ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
 +                ggml_cuda_mm_fusion_args_host fusion_data{};
 +                fusion_data.gate      = gate->src[0];
@@ -7037,7 +7041,7 @@ index f4af82688..7af14fbf6 100644
          }
      }
  
-@@ -3975,6 +4350,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3975,6 +4354,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  
@@ -7072,7 +7076,7 @@ index f4af82688..7af14fbf6 100644
      fused_mul_mat_vec = false;
      fused_node_count  = 0;
  
-@@ -4066,28 +4469,218 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4066,28 +4473,218 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  
@@ -7298,7 +7302,7 @@ index f4af82688..7af14fbf6 100644
                  continue;
              }
              bias_tensor = bias_node->src[1];
-@@ -4111,14 +4704,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4111,14 +4708,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
              ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
              fused_mul_mat_vec = true;
@@ -7315,7 +7319,7 @@ index f4af82688..7af14fbf6 100644
              break;
          }
      }
-@@ -4147,6 +4740,96 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4147,6 +4744,96 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 1;
      }
  
@@ -7412,7 +7416,7 @@ index f4af82688..7af14fbf6 100644
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
          ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
          return 2;
-@@ -4160,7 +4843,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4160,7 +4847,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
@@ -7432,7 +7436,7 @@ index f4af82688..7af14fbf6 100644
          return 1;
      }
  
-@@ -4180,6 +4874,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4180,6 +4878,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
      bool graph_evaluated_or_captured = false;
  
@@ -7459,7 +7463,7 @@ index f4af82688..7af14fbf6 100644
      // flag used to determine whether it is an integrated_gpu
      const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
  
-@@ -4317,9 +5031,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4317,9 +5035,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue;
                  }
  
@@ -7479,7 +7483,7 @@ index f4af82688..7af14fbf6 100644
  #ifdef GGML_CUDA_DEBUG
                      const int last_fused = i + nodes_to_skip;
                      GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
-@@ -4329,6 +5053,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4329,6 +5057,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      i += nodes_to_skip;
                      continue;
                  }
@@ -7487,7 +7491,7 @@ index f4af82688..7af14fbf6 100644
  #ifndef NDEBUG
                  // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                  // node's output on the host-visible buffer, which the compute path
-@@ -4346,12 +5071,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4346,12 +5075,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  GGML_UNUSED(integrated);
  #endif  // NDEBUG
  
@@ -7509,7 +7513,7 @@ index f4af82688..7af14fbf6 100644
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
                 }
-@@ -4366,6 +5100,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4366,6 +5104,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  graph->graph = nullptr;
              }
  
@@ -7528,7 +7532,7 @@ index f4af82688..7af14fbf6 100644
              CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
              graph_evaluated_or_captured = true; // CUDA graph has been captured
  
-@@ -4393,6 +5139,59 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4393,6 +5143,59 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          graph_evaluated_or_captured = true;
  #endif  // USE_CUDA_GRAPH
      }
@@ -7588,7 +7592,7 @@ index f4af82688..7af14fbf6 100644
  }
  
  #ifdef USE_CUDA_GRAPH
-@@ -4417,19 +5216,34 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4417,19 +5220,34 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_set_device(cuda_ctx->device);
  
@@ -7624,7 +7628,7 @@ index f4af82688..7af14fbf6 100644
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
  
              if (!graph->warmup_complete) {
-@@ -4452,6 +5266,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4452,6 +5270,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      cuda_graph_update_required = graph->instance == nullptr;
                  }
              }
@@ -7792,7 +7796,7 @@ index 7fb440148..bf9c6c265 100644
  }
  
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index b4a747720..dd46b8038 100644
+index b4a747720..35e375598 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
 @@ -1,6 +1,7 @@
@@ -8013,7 +8017,7 @@ index b4a747720..dd46b8038 100644
  void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
      const int    id    = ggml_cuda_get_device();
      const int    cc    = ggml_cuda_info().devices[id].cc;
-@@ -1482,6 +1560,25 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+@@ -1482,6 +1560,27 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
              continue;
          }
  
@@ -8024,10 +8028,12 @@ index b4a747720..dd46b8038 100644
 +        //   spills), J>=96 clean; J=96 measured best -> 96
 +        // - Q8_0/Q3_K (q8_0_q8_1_mma / q3_K_q8_1_mma): low register per
 +        //   accumulator; J=64 gives the best occupancy/compute balance -> 64
-+        // Only applied on RDNA4: the vec_dot paths and register allocation
-+        // differ on other arches, so leave the tile width uncapped there
-+        // until validated (e.g. Strix Halo is RDNA3.5, gfx1151).
-+        const int J_max_gate = GGML_CUDA_CC_IS_RDNA4(cc)
++        // Only applied on RDNA4/RDNA3_5 (Strix Halo validation 2026-09-05):
++        // the vec_dot paths and register allocation differ on other arches, so
++        // leave the tile width uncapped there until validated.  On gfx1151 the
++        // RDNA4-tuned caps were verified to transfer: uncapping (J=128) regressed
++        // pp2048 ~1673->1111 and pp16384 ~1423->1334 (register pressure).
++        const int J_max_gate = (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc))
 +            ? (type == GGML_TYPE_Q6_K ? 64 :
 +               type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ? 96 :
 +               type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q3_K ? 64 : 128)
@@ -8039,7 +8045,7 @@ index b4a747720..dd46b8038 100644
          if (mmq_get_nbytes_shared(config, cc) > smpbo) {
              continue;
          }
-@@ -1496,52 +1593,52 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+@@ -1496,52 +1595,52 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
  
      switch (J_best) {
          case   8:
@@ -8108,7 +8114,7 @@ index b4a747720..dd46b8038 100644
              break;
          default:
              fprintf(stderr, "J_best=%d\n", J_best);
-@@ -1550,20 +1647,23 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+@@ -1550,20 +1649,23 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
      }
  }
  
@@ -8135,7 +8141,7 @@ index b4a747720..dd46b8038 100644
  extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
  extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
  extern DECL_MMQ_CASE(GGML_TYPE_Q4_0);
-@@ -1593,6 +1693,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+@@ -1593,6 +1695,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
  // -------------------------------------------------------------------------------------------------------------------------
  
  void ggml_cuda_mul_mat_q(

@@ -7,7 +7,8 @@ WMMA flash-attn, fused core, k-quant boosts, CUDA prefill-graph skip),
 **block 12** (the hybrid HIP all-reduce; amended 2026-09-04 with a
 runtime NCCL-failure fallback — see [Current state](#current-state)) and
 **block 13** (fused MoE gate+up+GLU MMQ + mmvq short-K item-split;
-amended 2026-09-02 with two MTP regression fixes — see
+amended 2026-09-02 with two MTP regression fixes and 2026-09-05 with
+the RDNA3.5 (Strix Halo, gfx1151) fused-MoE-MMQ gate relaxation — see
 [Current state](#current-state)).
 The patches apply to a clean
 llama.cpp checkout at the recorded fork point `9cffdcc80` (re-based 2026-09-02 from `0eadefebd`).
@@ -46,10 +47,25 @@ build such as `GPU_TARGETS="gfx1100;gfx1151;gfx1201"` yields one binary
 that picks the right path on whichever of these it runs on. The one
 genuine exception is **block 12** — its internal all-reduce is RDNA4-only
 (gfx1200/gfx1201) and falls back to RCCL elsewhere (see
-`patches/README.md` for the gate and env knobs).
+`patches/README.md` for the gate and env knobs). Block 13's fused
+MoE MMQ additionally excludes RDNA3.0 (gfx1100) until validated there —
+RDNA3.5 (Strix Halo) was validated 2026-09-05 (see
+[Current state](#current-state)).
 
-## Current state (2026-09-02)
+## Current state (2026-09-05)
 
+- **Block-13 RDNA3.5 gate relaxation (2026-09-05, folded into block 13):**
+  the fused MoE gate+up+GLU MMQ prefill arm + its `J_max_gate` tile
+  caps were RDNA4-only; validated on Strix Halo (Ryzen AI MAX+ 395 /
+  Radeon 8060S, gfx1151, ROCm 7.14) with Qwen3.6-35B-A3B True-Q3_K_M
+  (ub 2048): same-seed coherence IDENTICAL fused-on vs off, prefill
+  gains match RDNA4 (pp2048 +5.3% 1590 -> 1674, pp16384 +4.6% 1360 ->
+  1423), decode unchanged (tg128 71.5). The RDNA4-tuned J caps
+  transfer (uncapping regressed pp2048 1674 -> 1111 / pp16384 1423 ->
+  1334). Set regenerated from a canonical fork rebuilt at `9cffdcc80`
+  (13 am-commits, block-13 tip `ace0a5d54`); clean-apply sim verified.
+  Full record:
+  [`benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`](benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md).
 - **Block-13 MTP regression fixes (2026-09-02, folded into block 13):**
   (1) dense adaptive-MTP collapse (18.3 -> 27.5 t/s) — the mmvq
   item-split/rpb kernel is register-bound at multi-token decode batches
@@ -67,11 +83,13 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
   [`benchmarks/mtp-adaptive-methodology.md`](benchmarks/mtp-adaptive-methodology.md)
   — run Protocol A there before shipping decode/fusion changes.
 - **Fork tip:** the fork block-12 commit was amended 2026-09-04 with the
-  runtime NCCL-failure fallback (issue #13) and block 13 on 2026-09-02
-  with the two MTP regression fixes (current blocks `04122bfb5..b830050bf`);
-  the clean-apply sim at `9cffdcc80` applies with zero
-  conflicts/whitespace warnings and its tree is byte-identical to the
-  fork tip.
+  runtime NCCL-failure fallback (issue #13); block 13 was amended
+  2026-09-02 with the two MTP regression fixes and 2026-09-05 with the
+  RDNA3.5/Strix Halo fused-MoE-MMQ gate relaxation (the set was
+  regenerated 2026-09-05 from a canonical fork rebuilt at `9cffdcc80`;
+  block-13 tip `ace0a5d54`); the clean-apply sim at `9cffdcc80` applies
+  with zero conflicts/whitespace warnings and its tree is byte-identical
+  to the fork tip.
 - **Fork point (baseline):** llama.cpp master at `9cffdcc80` (re-based
   2026-09-02 from `0eadefebd`; 42 commits of drift — see `MANIFESTS.md`
   for the dated re-base record, incl. the block 03/08/13 manual merges
@@ -81,13 +99,14 @@ genuine exception is **block 12** — its internal all-reduce is RDNA4-only
 - **Verified:** clean apply + full build + llama-cli same-seed coherence
   IDENTICAL (hybrid vs RCCL, 3-GPU) on the rebuilt fork; the clean-apply
   sim at `9cffdcc80` applies with zero conflicts/whitespace warnings and
-  its tree is byte-identical to the fork tip (`b830050bf`). tg64 38.12 /
+  its tree is byte-identical to the fork tip (`ace0a5d54`). tg64 38.12 /
   tg512 41.08 and the block-13 numbers are unchanged — the re-base is
   content-identical plus upstream's additions.
 - **Whitespace-clean apply:** the regenerated set applies with **zero git
   whitespace warnings** (`git am` 01-13; re-verified 2026-09-02 on a
   fresh checkout at `9cffdcc80`, re-verified 2026-09-04 after the
-  block-12 amendment).
+  block-12 amendment, re-verified 2026-09-05 after the block-13 RDNA3.5
+  gate relaxation).
 - **Deployment:** 3-GPU hybrid (`HIP_VISIBLE_DEVICES=0,1,2`, unpinned) gives
   depth-16384 decode 38.71 t/s (+21.8% vs 2-GPU). See
   [`patches/README.md`](patches/README.md) for block-12 env knobs and the
