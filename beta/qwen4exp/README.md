@@ -86,6 +86,13 @@ the 2 rebase fixes + the 3 crash/coherence fixes, squashed):
 - fused decode ops `GGML_OP_HC_MIX` / `GGML_OP_HC_COMBINE` (+ kernel
   geometry, rms/gamma fold, F32 inject fold, head-call fusion) - the
   +14.5% decode campaign,
+- Q8_0 inject support in the fused hc_mix op (2026-09-04): the AesSedai
+  Q4_K_M GGUFs quantize `hc_*_inject` to Q8_0, which the F32-only fused
+  mixer rejected with a GGML_ASSERT at context init. The inject rows now
+  ride the `hc_mix_down_dots` grid (mmvq, same accumulation as the down
+  rows); the F32 mmvf tail stays for F32 inject; the CPU reference op
+  mirrors the q8_0 lo dots; `fused_ok` and the CUDA `supports_op` gate
+  accept F32/Q8_0 inject.
 - multi-seq decode: QSA 4D-mask assert fix + unary-q8_1 layout fix
   (unlocks K-seq decode),
 - fixes found during the server bring-up: meta tensor-split cgraph
