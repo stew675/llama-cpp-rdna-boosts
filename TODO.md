@@ -33,8 +33,10 @@ Reality pass: 2026-09-05.
   matrix (internal vs nccl vs none) + bounded-spin path at depth-16384.
   The block-12 gate stays RDNA4-only until verified, then the arch check
   is removed. Volunteer test env: `GGML_CUDA_ALLREDUCE=internal`.
-- Also the RDNA3.0/gfx1100 leg for block 13's fused MoE MMQ (excluded
-  until validated there) — the same box can double for it.
+- The block-13 RDNA3.0/gfx1100 leg is DONE (2026-09-05, single-GPU 7900
+  XTX validation — see the Closed bullet); what remains here is block 12
+  only. The single-GPU result means block 12 stays N/A on this box (no
+  all-reduce path) — still tracked for the dual-7900XTX parallel task.
 - Where: `patches/0012` + the block-12 notes in `patches/README.md`.
 
 ## Open follow-ups
@@ -113,6 +115,19 @@ Reality pass: 2026-09-05.
   regenerated at `9cffdcc80`; clean-apply sim + full build + coherence
   re-verified on the Strix box. Record:
   `benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
+- 2026-09-05 Block 13 fused MoE MMQ ungated for RDNA3_0 (gfx1100 / RX
+  7900 XTX) and folded into patch `0013` (canonical rebuild tip
+  `8c2ace510`): validated on this single-GPU 7900XTX box (Qwen3.6-35B-A3B
+  True-Q3_K_M, ub 2048, `HIP_VISIBLE_DEVICES=0`) — fusion fires,
+  coherence IDENTICAL fused-on vs off, pp2048 +9.4% (5405 vs 4939),
+  pp16384 +7.8% (4487 vs 4162), decode unchanged (tg128 130.3); RDNA4 J
+  caps transfer (uncap probe regressed 5405 -> 4819, below the 3-op
+  fallback; Q3_K@96 also lost to 64). Delivery regenerated at
+  `9cffdcc80` (0001-0012 header-only churn); clean-apply sim + full
+  build + coherence + perf re-verified on this box. Single GPU => block
+  12 stays N/A here; the dual-7900XTX block-12 leg remains the parallel
+  task. Record:
+  `benchmarks/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
 - 2026-09-05 Expert-tiering experiment dropped (see Parked).
 - Older resolved items (block-12 fused-stage/pacing closure, ITEM A JIT,
   indexer head-sum revert, qwen35moe dense-GQA N/A, ...) are recorded in

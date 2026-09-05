@@ -36,20 +36,29 @@ llama.cpp checkout at the fork point **`9cffdcc80`** (re-based 2026-09-02 from `
   `J_max_gate` tile caps were RDNA4-only; validated on a Ryzen AI MAX+ 395
   (Qwen3.6-35B-A3B True-Q3_K_M, ub 2048) — pp2048 1590 -> 1674 (+5.3%),
   pp16384 1360 -> 1423 (+4.6%), coherence IDENTICAL, decode unchanged;
-  the RDNA4-tuned J caps transfer (uncapping regresses).  RDNA3_0
-  (gfx1100) still excluded until validated there.  Details + numbers:
+  the RDNA4-tuned J caps transfer (uncapping regresses).  Amended again
+  2026-09-05 with the RDNA3_0 (gfx1100) gate relaxation: validated on a
+  single RX 7900 XTX (Qwen3.6-35B-A3B True-Q3_K_M, ub 2048, 1-GPU
+  pinned) — fusion fires, coherence IDENTICAL fused-on vs off, pp2048
+  4939 -> 5405 (+9.4%), pp16384 4162 -> 4487 (+7.8%), decode unchanged
+  (tg128 130.3); the RDNA4-tuned J caps transfer there too (uncapping
+  regressed below the 3-op fallback; a Q3_K@96 probe also lost to the
+  cap 64).  Details + numbers:
   `patches/README.md` block-13 notes and
-  `benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
+  `benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md` +
+  `benchmarks/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
 
 The repo is NOT the fork: the fork (source of truth for the block commits)
-lives at `~/llama.cpp`, branch `rdna-boosts` — currently a master
-`8b4b3558f` re-apply (2026-09-04/05: blocks `4c0493980..4c7e2267b`, block
-13 amended 2026-09-05 with the RDNA3_5/Strix Halo fused-MoE-MMQ fold;
-block 12 carries the 2026-09-04 runtime NCCL-failure fallback, issue
-#13). The canonical `9cffdcc80` fork used for `make-patches.sh`
+lives at `~/llama.cpp`, branch `rdna-boosts` — currently upstream master
+synced to `6a1a922d2` with the 13 block commits re-applied on top
+(2026-09-05 state: block-13 commit `a8d0e5edc`, amended 2026-09-05 with
+the RDNA3_5/Strix Halo + RDNA3_0/gfx1100 fused-MoE-MMQ folds; block 12
+carries the 2026-09-04 runtime NCCL-failure fallback, issue #13). The
+canonical `9cffdcc80` fork used for `make-patches.sh`
 regeneration is disposable and is re-created from `patches/` +
 `scripts/apply-all.sh` whenever it needs rebuilding (fresh clone at the
-fork point + apply). Older fork states are
+fork point + apply) — the last regeneration's block-13 tip is
+`8c2ace510`. Older fork states are
 preserved on the `stew675/llama.cpp` fork remote (`rdna-boosts` =
 previous tip `482837e5a` on `0eadefebd`; `rdna-boosts-orig`, …) and in
 older local reference clones — never rely on them for the current
@@ -121,7 +130,7 @@ explicitly requests it.**
   whitespace warnings (re-verified 2026-09-01 on `0eadefebd`,
   2026-09-02 on the `9cffdcc80` re-base, 2026-09-04 after the
   block-12 amendment, and 2026-09-05 after the block-13 RDNA3_5 gate
-  relaxation).
+  relaxation, and again 2026-09-05 after the RDNA3_0/gfx1100 fold).
 - **Block 02 (0002) now also carries the MTP chunked-prefix dispatch
   (PR #9, 2026-09-01):** long single-sequence MTP prefills (`K > 1`,
   `n_seqs == 1`, `n_tokens > K+64`) run the chunked WMMA GDN on the
@@ -212,9 +221,15 @@ Diff the output against a known-good build (or against RCCL via
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9cffdcc80`,
-blocks tip `ace0a5d54`): `git format-patch` the block commits (all 13
+blocks tip `8c2ace510`): `git format-patch` the block commits (all 13
 blocks are committed fork commits; `git diff <base>..<tip>` yields
-`rdna-boosts-all.patch`). Then
+`rdna-boosts-all.patch`).  NOTE on the current fork topology: `~/llama.cpp`
+`rdna-boosts` is synced past the fork point (upstream master `6a1a922d2`
++ the 13 blocks re-applied, block-13 tip `a8d0e5edc`), so a raw
+`9cffdcc80..HEAD` range there spans 46 upstream commits — the patches
+must be generated from a canonical fork rebuilt AT `9cffdcc80`
+(`scripts/apply-all.sh` of the current delivery, then re-apply the block-13
+amendment: last regeneration tip `8c2ace510`).  Then
 re-verify the clean-apply simulation (worktree at the fork point,
 apply-all, build, coherence) before committing.
 

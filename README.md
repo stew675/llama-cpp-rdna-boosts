@@ -8,7 +8,8 @@ WMMA flash-attn, fused core, k-quant boosts, CUDA prefill-graph skip),
 runtime NCCL-failure fallback — see [Current state](#current-state)) and
 **block 13** (fused MoE gate+up+GLU MMQ + mmvq short-K item-split;
 amended 2026-09-02 with two MTP regression fixes and 2026-09-05 with
-the RDNA3.5 (Strix Halo, gfx1151) fused-MoE-MMQ gate relaxation — see
+the RDNA3.5 (Strix Halo, gfx1151) + RDNA3.0 (gfx1100) fused-MoE-MMQ
+gate relaxations — see
 [Current state](#current-state)).
 The patches apply to a clean
 llama.cpp checkout at the recorded fork point `9cffdcc80` (re-based 2026-09-02 from `0eadefebd`).
@@ -47,13 +48,27 @@ build such as `GPU_TARGETS="gfx1100;gfx1151;gfx1201"` yields one binary
 that picks the right path on whichever of these it runs on. The one
 genuine exception is **block 12** — its internal all-reduce is RDNA4-only
 (gfx1200/gfx1201) and falls back to RCCL elsewhere (see
-`patches/README.md` for the gate and env knobs). Block 13's fused
-MoE MMQ additionally excludes RDNA3.0 (gfx1100) until validated there —
-RDNA3.5 (Strix Halo) was validated 2026-09-05 (see
+`patches/README.md` for the gate and env knobs).  Block 13's fused
+MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
+2026-09-05, gfx1100 validated 2026-09-05 — see
 [Current state](#current-state)).
 
 ## Current state (2026-09-05)
 
+- **Block-13 RDNA3.0 gate relaxation (2026-09-05, folded into block 13):**
+  the fused MoE gate+up+GLU MMQ prefill arm + its `J_max_gate` tile
+  caps are now also on RDNA3_0 (gfx1100), validated on a single RX
+  7900 XTX (ROCm 7.14) with Qwen3.6-35B-A3B True-Q3_K_M (ub 2048,
+  1-GPU pinned): fusion fires, same-seed coherence IDENTICAL fused-on
+  vs off, prefill gains pp2048 +9.4% (5405 vs 4939), pp16384 +7.8%
+  (4487 vs 4162), decode unchanged (tg128 130.3 vs 130.4).  The
+  RDNA4-tuned J caps transfer (uncapping regressed pp2048 5405 -> 4819
+  / pp16384 4487 -> 4070, below the 3-op fallback; a Q3_K@96 probe
+  also lost to the cap 64).  Set regenerated from a canonical fork
+  rebuilt at `9cffdcc80` (13 am-commits, block-13 tip `8c2ace510`);
+  clean-apply sim verified (zero whitespace warnings, applied tree
+  byte-identical to the fork tip).  Full record:
+  [`benchmarks/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`](benchmarks/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md).
 - **Block-13 RDNA3.5 gate relaxation (2026-09-05, folded into block 13):**
   the fused MoE gate+up+GLU MMQ prefill arm + its `J_max_gate` tile
   caps were RDNA4-only; validated on Strix Halo (Ryzen AI MAX+ 395 /
@@ -62,9 +77,7 @@ RDNA3.5 (Strix Halo) was validated 2026-09-05 (see
   gains match RDNA4 (pp2048 +5.3% 1590 -> 1674, pp16384 +4.6% 1360 ->
   1423), decode unchanged (tg128 71.5). The RDNA4-tuned J caps
   transfer (uncapping regressed pp2048 1674 -> 1111 / pp16384 1423 ->
-  1334). Set regenerated from a canonical fork rebuilt at `9cffdcc80`
-  (13 am-commits, block-13 tip `ace0a5d54`); clean-apply sim verified.
-  Full record:
+  1334).  Full record:
   [`benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`](benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md).
 - **Block-13 MTP regression fixes (2026-09-02, folded into block 13):**
   (1) dense adaptive-MTP collapse (18.3 -> 27.5 t/s) — the mmvq
@@ -85,11 +98,12 @@ RDNA3.5 (Strix Halo) was validated 2026-09-05 (see
 - **Fork tip:** the fork block-12 commit was amended 2026-09-04 with the
   runtime NCCL-failure fallback (issue #13); block 13 was amended
   2026-09-02 with the two MTP regression fixes and 2026-09-05 with the
-  RDNA3.5/Strix Halo fused-MoE-MMQ gate relaxation (the set was
-  regenerated 2026-09-05 from a canonical fork rebuilt at `9cffdcc80`;
-  block-13 tip `ace0a5d54`); the clean-apply sim at `9cffdcc80` applies
-  with zero conflicts/whitespace warnings and its tree is byte-identical
-  to the fork tip.
+  RDNA3.5 (Strix Halo) then RDNA3.0 (gfx1100) fused-MoE-MMQ gate
+  relaxations.  The set was regenerated 2026-09-05 from a canonical
+  fork rebuilt at `9cffdcc80` (13 am-commits, block-13 tip
+  `8c2ace510`); the clean-apply sim at `9cffdcc80` applies with zero
+  conflicts/whitespace warnings and its tree is byte-identical to the
+  fork tip.
 - **Fork point (baseline):** llama.cpp master at `9cffdcc80` (re-based
   2026-09-02 from `0eadefebd`; 42 commits of drift — see `MANIFESTS.md`
   for the dated re-base record, incl. the block 03/08/13 manual merges
@@ -99,14 +113,16 @@ RDNA3.5 (Strix Halo) was validated 2026-09-05 (see
 - **Verified:** clean apply + full build + llama-cli same-seed coherence
   IDENTICAL (hybrid vs RCCL, 3-GPU) on the rebuilt fork; the clean-apply
   sim at `9cffdcc80` applies with zero conflicts/whitespace warnings and
-  its tree is byte-identical to the fork tip (`ace0a5d54`). tg64 38.12 /
-  tg512 41.08 and the block-13 numbers are unchanged — the re-base is
-  content-identical plus upstream's additions.
+  its tree is byte-identical to the fork tip (`8c2ace510`; 2026-09-05
+  regeneration incl. the gfx1100 fold was re-verified on the RX 7900
+  XTX box — sim build coherence identical + perf reproduced). tg64
+  38.12 / tg512 41.08 and the block-13 numbers are unchanged — the
+  re-base is content-identical plus upstream's additions.
 - **Whitespace-clean apply:** the regenerated set applies with **zero git
   whitespace warnings** (`git am` 01-13; re-verified 2026-09-02 on a
   fresh checkout at `9cffdcc80`, re-verified 2026-09-04 after the
   block-12 amendment, re-verified 2026-09-05 after the block-13 RDNA3.5
-  gate relaxation).
+  gate relaxation and again after the RDNA3.0/gfx1100 fold).
 - **Deployment:** 3-GPU hybrid (`HIP_VISIBLE_DEVICES=0,1,2`, unpinned) gives
   depth-16384 decode 38.71 t/s (+21.8% vs 2-GPU). See
   [`patches/README.md`](patches/README.md) for block-12 env knobs and the
@@ -174,7 +190,7 @@ RDNA3.5 (Strix Halo) was validated 2026-09-05 (see
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions; adds a dedicated RDNA3.5 mmvq table) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL (decode keeps graph replay) |
 | `0012` | **hybrid HIP all-reduce** — custom internal AR for the small-tensor decode path, per-size hybrid dispatch vs RCCL, RDNA4-only gate (bounded in-kernel spin since 2026-08-30 fix round; builds without RCCL) |
-| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** — prefill fused expert MMQ (RDNA4, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K, env opt-out `GGML_CUDA_DISABLE_MOE_MMQ_FUSION`) + decode item-split (rpb 2/4/8) merged with the upstream has_fusion mmvq path |
+| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** — prefill fused expert MMQ (RDNA4 + RDNA3_5 + RDNA3_0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K, env opt-out `GGML_CUDA_DISABLE_MOE_MMQ_FUSION`) + decode item-split (rpb 2/4/8) merged with the upstream has_fusion mmvq path |
 
 > **Greedy-purity note (read before shipping):** on the K-split decode
 > paths, block 10 (`0010`) is the only patch that changes decode numerics on

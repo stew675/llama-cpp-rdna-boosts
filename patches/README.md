@@ -5,10 +5,13 @@
 re-based 2026-09-02 from `0eadefebd`; block 12 amended 2026-09-04 with
 the runtime NCCL-failure fallback (issue #13, see the block-12 notes
 below); block 13 amended 2026-09-02 with two MTP regression fixes and
-2026-09-05 with the RDNA3.5 (Strix Halo, gfx1151) fused-MoE-MMQ gate
-relaxation — see the block-13 notes below, the MTP baseline gate in
-`../benchmarks/mtp-adaptive-methodology.md`, and the Strix record in
-`../benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`):
+2026-09-05 with the RDNA3.5 (Strix Halo, gfx1151) + RDNA3.0 (gfx1100)
+fused-MoE-MMQ gate relaxations — see the block-13 notes below, the MTP
+baseline gate in
+`../benchmarks/mtp-adaptive-methodology.md`, the Strix record in
+`../benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`, and
+the gfx1100 record in
+`../benchmarks/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`):
 
 | patch | content |
 |---|---|
@@ -24,7 +27,7 @@ relaxation — see the block-13 notes below, the MTP baseline gate in
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
-| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes); see block 13 notes below |
+| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below |
 
 ## Apply (fresh checkout at the fork point)
 
@@ -41,7 +44,8 @@ warnings (verified 2026-08-29 after the whitespace-clean regeneration,
 re-verified 2026-09-01 on the `0eadefebd` re-base, re-verified 2026-09-01
 with block 13 on the 13-patch series, re-verified 2026-09-02 on the
 `9cffdcc80` re-base, re-verified 2026-09-02 after the block-13 amendment,
-re-verified 2026-09-05 after the block-13 RDNA3_5 gate relaxation).
+re-verified 2026-09-05 after the block-13 RDNA3_5 gate relaxation,
+re-verified 2026-09-05 after the RDNA3_0/gfx1100 fold).
 
 ## 2026-09-02 re-base to 9cffdcc80 (current)
 
@@ -326,9 +330,25 @@ baseline table live in `wip/qwen35moe-prefill/bench-config.md`.
   pp2048 1590 -> 1674 (+5.3%), pp16384 1360 -> 1423 (+4.6%), pp512
   ~+14% (noisy, single ubatch); decode unchanged (tg128 71.5).  The
   caps transfer: uncapping J (128) on gfx1151 regressed pp2048 1674 ->
-  1111 and pp16384 1423 -> 1334 (register pressure).  RDNA3_0 (gfx1100)
-  still excluded until validated there.  Full record:
+  1111 and pp16384 1423 -> 1334 (register pressure).  Full record:
   `../benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
+- **RDNA3_0 (gfx1100, RX 7900 XTX) validation (2026-09-05, folded into
+  block 13):** the remaining excluded arch is now ungated — the same
+  try_fuse arm + `J_max_gate` caps apply on RDNA3_0 (gfx1100) too.
+  Validated on a single RX 7900 XTX (ROCm 7.14, gfx1100, 1-GPU pinned
+  with `HIP_VISIBLE_DEVICES=0` to exclude the box's HIP-visible
+  gfx1036 iGPU) with Qwen3.6-35B-A3B True-Q3_K_M, ub 2048: fusion
+  fires (one-time session log), same-seed coherence IDENTICAL fused-on
+  vs off (and the ungated 3-op fallback output is byte-identical to
+  the pre-ungate build), gains pp2048 4939 -> 5405 (+9.4%), pp16384
+  4162 -> 4487 (+7.8%), pp512 ~+20% (noisy), decode unchanged (tg128
+  130.3 vs 130.4).  The RDNA4-tuned J caps transfer: uncapping (J=128)
+  on gfx1100 regressed pp2048 5405 -> 4819 and pp16384 4487 -> 4070
+  (below the 3-op fallback), and a Q3_K@96 probe (5094/4251) also lost
+  to the cap 64 — no per-arch port tuning needed.  Block 12 stays N/A
+  here (single GPU); the dual-7900XTX block-12 leg remains a separate
+  parallel task.  Full record:
+  `../benchmarks/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
 
 ## Server config (the +22% deployment win)
 
