@@ -1,162 +1,115 @@
 # rdna-boosts TODO / follow-up tracker
 
 Cross-project tracker so important state survives context compaction.
-Each entry: status, why it matters, what "done" looks like, where the work lives.
+Forward-looking: open items + current active experiments; closed work is a
+one-line bullet (details live in AGENTS.md, patches/README.md, MANIFESTS.md,
+`beta/qwen4exp/README.md`, `wip/` handovers, `benchmarks/`). Current
+delivery = the 13-patch set against fork point `9cffdcc80` (blocks 01-13).
+Reality pass: 2026-09-05.
 
-## Priority (next session)
+## Current active
 
-### [DONE 2026-09-02] Multi-token MUL_MAT_ID mmvq `x_scale_channel_dst` fusion
-- What: the `ffn_moe_weighted = moe_down * topk_weights` MUL fold (block 08's
-  arm in ggml-cuda.cu try_fuse) only supports SINGLE-token decode (n=1). The
-  kernel epilogue applies `x_scale[channel_dst]` = one scalar per expert, which
-  is correct only when all batch tokens share one expert weight. Multi-token
-  topk weights are per-(expert, token) (shape [1, n_used, n_tokens]).
-- Why it surfaced: upstream 0eadefebd changed the mmvq gate to admit
-  multi-token, so the block-08 arm fired for n>1 and the launcher assert
-  aborted. Interim fix was gating to mm_node->ne[2] == 1 (bit-exact fallback).
-- FIXED (fork 9db2fcbdc, committed): try_fuse gate removed + weights shape
-  checked; `mul_mat_vec_q_moe` now applies `x_scale[channel_dst +
-  token_idx*nchannels_dst]` (per-(expert, token)); moe launcher routes
-  x_scale_channel_dst into has_fusion and passes nchannels_dst; launcher
-  assert relaxed to nelements == ne1*ne2. test-backend-ops sweep extended
-  with the block-13 fused types Q8_0/Q6_K/Q5_K/Q3_K/IQ2_XS (bs 1/4/512).
-- Validated: 16222/16222 test-backend-ops pass (multi-token n=4 goes through
-  the moe kernel, bit-exact vs CPU ref); real qwen35moe -ub 4 (multi-token
-  prefill) runs clean; single-token decode unchanged (tg128 82.8-83.2).
+### Port block 13 to Strix Halo (gfx1151) + validate beta qwen4exp there
+- Block 13 (fused MoE gate+up+GLU MMQ, RDNA4-gated fused arm + decode
+  item-split/ksplit) is done on gfx1201 (R9700). The next active task:
+  port + validate on Strix Halo (gfx1151) — tile caps + bit-exactness,
+  then relax the per-arch gate. Follow the 0004 validation recipe per
+  arch (same-seed coherence IDENTICAL + bench records). RDNA3/gfx1100
+  validation is still pending as well (see the parallel 7900XTX item).
+- `beta/qwen4exp`: the gfx1201/RDNA4 work is essentially done and ships as
+  three patches (`managed-ngrams`, `qwen4exp-support`,
+  `mtp-draft-support`). Validate the same set on Strix Halo.
+- Standing gate before shipping any decode/fusion change:
+  `benchmarks/mtp-adaptive-methodology.md` (MTP baseline + acceptance).
+- Where: `~/llama.cpp` fork (rdna-boosts) + `beta/qwen4exp/README.md`.
 
-### [OPEN] File upstream llama.cpp issue: unaligned-width split-load on ROCm
-- The block-13 load fix (below) works around an UPSTREAM bug: H2D 2D copies
-  with width not multiple of 4 (Q6_K/Q3_K quant blocks = 210/110B) are
-  ~1000x slower on ROCm (present in pristine 0eadefebd). Fix is local in
-  `set_tensor_2d` (staging via aligned H2D + unaligned D2D). Candidate to
-  contribute upstream once local validation settles; needs a minimal repro
-  (standalone hipMemcpy2DAsync: width 210 -> 2300ms, width 212 -> 0ms).
+### Parallel (community member): dual 7900XTX (RDNA3, gfx1100)
+- Block-12 (hybrid HIP all-reduce) validation on RDNA3 pairs is ongoing
+  with a community member on their dual-7900XTX box: hybrid-dispatch
+  matrix (internal vs nccl vs none) + bounded-spin path at depth-16384.
+  The block-12 gate stays RDNA4-only until verified, then the arch check
+  is removed. Volunteer test env: `GGML_CUDA_ALLREDUCE=internal`.
+- Can double as the RDNA3/gfx1100 leg of the block-13 validation above.
+- Where: `patches/0012` + the block-12 notes in `patches/README.md`.
 
-## Active (in progress now)
+## Open follow-ups
 
-### [DONE 2026-09-02] Block 13: MoE WIP -> official patch (qwen4exp split-out)
-- Goal: promote the non-qwen4exp MoE work (mmvq item-split + fused gate+up+GLU MMQ
-  + M4 quant extension) into the main 12-patch set as a new `0013-*` block.
-  qwen4exp work moves OUT to `wip/qwen4exp/`.
-- Decision (2026-09-01): NEW 13th block, NOT folded into 04/08/10. Reasons:
-  verified 12-set must stay untouched; MoE is a distinct feature; item-split needs
-  re-base against the 0eadefebd tree anyway (fusion in mul_mat_vec_q_moe); the
-  MoE work is still maturing (M4/M5 open) so it must not pollute release blocks.
-- DONE (2026-09-01): block 12 renamed to the 000N convention
-  (`0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch`);
-  block 13 committed on the fork (`a14257996`), 13-patch series regenerated
-  and verified (clean git am apply, applied tree byte-identical to fork
-  tip, zero whitespace warnings).
-- Re-base already done in ~/llama.cpp working tree (uncommitted):
-  - mmvq.cu: item-split merged with has_fusion (tmp_gate accumulation, launcher
-    dispatches rpb 2/4/8 x has_fusion true/false).
-  - 0004 consolidated (fused MoE MMQ + dispatch + M4 types + op-timing) applied
-    as one patch; the separate 0003-fused-moe + 0003-dispatch patches are
-    SUPERSEDED by 0004 (it contains both + the RDNA4 gate refinement).
-  - test-backend-ops: 2/2 backends OK after fixes (see two fixes below).
-- Remaining: build llama-cli/bench, verify decode +6-7% and prefill +5-16%
-  (qwen35moe), verify same-seed coherence IDENTICAL, commit on fork after block
-  12, extend make-patches.sh + apply-all.sh, update patches/README.md +
-  MANIFESTS.md + README.md, regenerate rdna-boosts-all.patch, verify apply on
-  fresh checkout at 0eadefebd, then move qwen4exp to wip/qwen4exp/.
-- DONE (2026-09-01): block 13 released (fork a14257996, 13-patch set
-  regenerated + verified, docs updated, all.patch regenerated); qwen4exp
-  moved to `wip/qwen4exp/` (plan + handoffs + patches 0005-0007).
-- DONE (2026-09-01): block-13 commit amended with the unaligned-width
-  split-load fix (fork 834a8d3ff), 13-patch set + all.patch regenerated,
-  fresh-apply re-verified byte-identical, both repos pushed.
-- VALIDATION DONE (2026-09-01, 1-GPU qwen35moe = the verified config):
-  - test-backend-ops: 2/2 backends OK (after 2 fixes below)
-  - Coherence: fusion on/off same-seed greedy output IDENTICAL
-  - Prefill pp16384: Q6_K +5.1% (3344 vs 3181), Q4_K_M +3.6% (3488 vs 3367)
-  - Decode tg128: +5.6% (97.28 vs 92.15 pristine) - item-split + fused gate
-  - Fused path fires: FUSED MUL_MAT_ID ffn_moe_down-* on all layers
-- The 2 fixes vs the verified 0004 patch (both in ggml-cuda.cu):
-  1. x_scale_channel_dst arm: was gated to mm_node->ne[2] == 1, now fully
-     multi-token (fork 9db2fcbdc, folded into block 13 - see Priority
-     section).
-  2. fused MoE MMQ arm gated to the instantiated type list (Q3_K/Q4_K/Q5_K/
-     Q8_0/Q6_K) - q4_0/q4_1/q5_0/IQ/MXFP4/NVFP4 abort in
-     `switch_type_gate` (GGML_ABORT "fused gate MMQ not implemented").
-     THE GATE IS SHIPPED (correctness fix, part of block 13). The only
-     REMAINING block-13-related item is extending the fused kernel to
-     MXFP4/NVFP4/etc. so the gate can be relaxed - tracked as
-     [OPEN] MXFP4 below.
+### Upstream monitor: ROCm unaligned-width split-load (Q6_K/Q3_K 2-GPU)
+- Upstream bug: H2D 2D copies whose width is not a multiple of 4 (Q6_K
+  quant block = 210 B, Q3_K = 110 B) are ~1000x slower on ROCm. Fixed
+  locally in block 13 (`set_tensor_2d`: aligned-H2D + unaligned-D2D
+  staging). No PR planned — upstream is busy with its own qwen4exp work;
+  the follow-up is to watch whether they fix it themselves. If they do,
+  it will surface as a rebase conflict and resolve naturally. Re-check at
+  each re-base.
+- "Done": upstream ships the fix (or the local fix gets upstreamed).
 
-### [IN-PROGRESS] ITEM B - sparse QSA flash attention (qwen4exp branch)
-- Op + kernel committed on `~/prs/llama.cpp` qwen4exp branch @ `554691a72`
-  (tiled + all-heads-per-block). Depth-constant attention: 11.9ms @64K vs dense
-  158ms. +6% @16K, +24% @32K, +56% @64K over dense.
-- Remaining: latency optimization (~35% GPU, per-warp serial chain, ~3x
-  headroom), package as boosts patches, final commits, handoff UPDATE 12+.
-- Move to `wip/qwen4exp/` as part of the block-13 split-out (above).
+### MXFP4 (and NVFP4) fused gate+up+GLU MMQ — LAST block-13 item
+- The fused MoE MMQ kernel (`ggml_cuda_mul_mat_q_switch_type_gate`) is
+  instantiated for Q3_K/Q4_K/Q5_K/Q8_0/Q6_K only; MXFP4/NVFP4 (and
+  Q4_0/Q4_1/Q5_0/IQ*/...) would abort if `ggml_cuda_should_use_mmq`
+  admits them, so the try_fuse arm is gated on the instantiated type list.
+- Why it matters: MXFP4 is the interesting type for future MoE models
+  (deepseek-style native MXFP4 experts) and would let the gate be
+  relaxed. Tracked from the block-13 notes in `patches/README.md`.
+- "Done": add MXFP4 (+ maybe NVFP4/Q4_0-class) switch cases + instance
+  files + generators, then bit-exact + bench validation per the 0004
+  recipe.
 
-## Flagged follow-ups (not started)
+## Parked
 
-### [OPEN] Port + validate block 12 (hybrid HIP all-reduce) on dual 7900XTX
-- What: block 12's internal AR is hard-gated to RDNA4 (`gfx1200`/`gfx1201`
-  only, `strncmp` on gcnArchName in allreduce-hip.cu; refuses to init
-  elsewhere and falls back to RCCL). 7900XTX = gfx1100 (RDNA3), which
-  upstream RCCL supports but whose peer-to-peer / queue-preemption behavior
-  the internal AR's in-kernel spin + hybrid dispatch were never validated
-  against (the spin timeout work, PR #8, was tuned on 2x gfx1201).
-- Work: relax the arch gate for gfx1100, validate the hybrid dispatch
-  matrix (internal vs nccl vs none) + the bounded-spin path on a 2x7900XTX
-  box, confirm no MES REMOVE_QUEUE/MODE1-reset regressions at depth-16384.
-- **Needs community assistance**: the author has NO machine with dual
-  7900XTX. Ask for help in the blocks repo (issue or a 7900XTX-owner
-  thread); the gate makes the fallback safe (RCCL) so a volunteer can test
-  with `GGML_CUDA_ALLREDUCE=internal` and report the matrix.
+### LFRU host->GPU slow hot-weight migration
+- Survivor of the expert-tiering experiment, which was DROPPED
+  (2026-09-05): investigation showed most of its aims are already covered
+  by current llama.cpp options. The one idea left: an LFRU-style very
+  slow migration of hot weights from host to GPU (persistent GPU slot
+  cache + CPU-computed cold tail). NOT active now; may become active soon.
+- Design notes: `wip/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`,
+  `HANDOVER-2026-09-04-tiering.md` (wip = experimental, not delivery).
 
-### [OPEN] MXFP4 (and NVFP4) fused gate+up+GLU MMQ (block 13) - LAST block-13 item
-- Status: the ONLY remaining block-13-related work (block 13 itself is
-  DONE/closed above). The correctness gate (type list Q3_K/Q4_K/Q5_K/
-  Q8_0/Q6_K) is shipped; this is the feature extension that lets the gate
-  be relaxed.
-- What: the fused MoE MMQ kernel (`ggml_cuda_mul_mat_q_switch_type_gate`) is
-  instantiated for Q3_K/Q4_K/Q5_K/Q8_0/Q6_K only. MXFP4/NVFP4 and the other
-  mmq_supported types (Q4_0/Q4_1/Q5_0/IQ*/...) fall back to the 3-op sequence.
-- Why: `ggml_cuda_should_use_mmq` returns true for these on RDNA4, so the fused
-  arm WOULD fire for them, but the gate switch aborts
-  (`GGML_ABORT("fused gate MMQ not implemented")`). The arm is gated on the
-  exact instantiated type list (`moe_mmq_type` in try_fuse). MXFP4 is the
-  interesting one for future MoE models (deepseek-style native MXFP4 experts).
-- "Done": add MXFP4 (+ maybe NVFP4/Q4_0-class) cases to switch_type_gate with
-  DECL_MMQ_CASE_GATE instances + generator list + bit-exact + bench validation.
-  Follow the 0004 recipe (3 steps per type: gate switch case, instance file +
-  generator, validation).
+## Closed (one-liners; details in the dated docs)
 
-### [OPEN] Port block 13 (fused MoE MMQ) to Strix Halo + 7900XTX
-- The fused gate+up+GLU MMQ arm is gated to `GGML_CUDA_CC_IS_RDNA4(cc)`
-  (tuned J tile-width caps on gfx1201). Port = validate the fused kernel's
-  tile caps + bit-exactness on gfx1151 (Strix Halo, RDNA3.5) and gfx1100
-  (7900XTX, RDNA3), then relax the gate per-arch. Follow the 0004 validation
-  recipe per arch (bit-exact + bench). Note: Strix Halo also matters for the
-  unified-memory decode work (bandwidth-bound). See
-  `wip/qwen35moe-prefill/true-q3-rdna4-gating-2gpu.md` for the RDNA4-gating
-  history.
+- 2026-09-01 Block 13 released as the 13th delivery patch (fork
+  a14257996): fused MoE gate+up+GLU MMQ + mmvq item-split; qwen4exp MoE
+  work split out of the delivery.
+- 2026-09-02 Multi-token MUL_MAT_ID `x_scale_channel_dst` fusion (fork
+  9db2fcbdc, folded into block 13): per-(expert, token) x_scale;
+  test-backend-ops 16222/16222.
+- 2026-09-01 ROCm unaligned-width split-load fix in block 13 (fork
+  834a8d3ff): Q6_K/Q3_K 2-GPU load <15 s (the old ~3 min "hang" was this).
+- 2026-09-02 Delivery re-based to upstream `9cffdcc80` (+42 upstream
+  commits; 3 manual block re-base hunks; clean apply).
+- 2026-09-02 Block 13 amended with the two MTP regression fixes: mmvq
+  ksplit dispatch for verify batches (dense MTP 18.3 -> 27.5 t/s) and the
+  rms_norm-fold gated to single-token MMID (MoE MTP acceptance 0 -> 0.51,
+  119-129 t/s).
+- 2026-09-04 Block 12 amended with the runtime NCCL-failure fallback
+  (issue #13): on first NCCL runtime failure clear the sticky HIP errors,
+  warn once, stop using NCCL, route AllReduce to internal/butterfly. No
+  behavior change on healthy setups.
+- 2026-09-03 qwen4exp WIP promoted to `beta/qwen4exp/` (QSA sparse FA is
+  the default FA path); QSA decode regression fixed (V smem staging +
+  top-k slicing + 64-cell slices; server flat ~46.5-48 t/s).
+- 2026-09-04 beta/qwen4exp re-based onto master `8b4b3558f` + blocks
+  01-13; patch 3 added (NextN/MTP draft head, `--spec-type draft-mtp`);
+  layer-split crash fixed (head-grouped launches); AesSedai
+  Qwen3.8-Flash-Next supported. qwen4exp gfx1201/RDNA4 work done.
+- 2026-09-05 ITEM B (QSA sparse FA latency push) + the decode push:
+  CLOSED at ~48 t/s @ ~95% GPU occupancy. Early probing suggested ~3x
+  headroom; it never materialized (register pressure, CU occupancy, VRAM
+  bandwidth saturation). ~20% speedup + near-100% utilization were won,
+  but attention was not the dominant cost. Remaining decode levers are
+  tracked in `beta/qwen4exp/README.md`.
+- 2026-09-05 Expert-tiering experiment dropped (see Parked).
+- Older resolved items (block-12 fused-stage/pacing closure, ITEM A JIT,
+  indexer head-sum revert, qwen35moe dense-GQA N/A, ...) are recorded in
+  `archive/docs` + `archive/work`; not tracked here.
 
-### [OPEN] Decode push (tg128 40.1, memory-bandwidth bound)
-- Parked after ITEM B. mmvq short-K item-split (block 13) is part of it
-  (+6-7% decode on qwen35moe already measured). 2-GPU deploy + Strix Halo
-  back-port still parked.
+## Where the current lists live
 
-## Closed / archived
-- qwen35moe MoE + multi-GPU "hang" (Q5_K/Q6_K): RESOLVED + FIXED. Root cause:
-  pathologically slow 2-GPU tensor-split weight load for quants with block
-  size % 4 != 0 (Q6_K=210B, Q3_K=110B) - H2D 2D copies with unaligned width
-  take ~2300ms vs ~10ms on ROCm; the ~3min load looked like a hang. UPSTREAM
-  bug (present in pristine 0eadefebd); the earlier "hangs at EVERY point"
-  bisect was wrong (timeouts < slow load). Fixed in block 13 (fork
-  834a8d3ff, amended): `set_tensor_2d` stages via aligned H2D + unaligned
-  D2D. Verified: Q6_K/Q3_K 2-GPU load <15s, pp512 ~4200-4500 / tg32
-  ~66-82 (matches docs-era 4526/82); Q8_0 unchanged; fresh-apply of the
-  13-patch set byte-identical. Pushed to stew675/llama.cpp rdna-boosts +
-  delivery repo main. See `wip/qwen35moe-prefill/handoff-2026-09-01-
-  session4.md` for the full investigation.
-- ITEM A (node_56/node_570 one-time hipBLAS JIT): RESOLVED.
-- Indexer head-sum fusion (GGML_OP_INDEXER_HEAD_SUM): REVERTED - bit-correct but
-  end-to-end regressed (graph splitter perturbation). Lesson: measure
-  end-to-end, not op timing, on qwen4exp.
-- qwen35moe: dense GQA (no indexer) - QSA op NOT applicable (model change, not
-  inference change).
+- qwen4exp carried-forward open items: `beta/qwen4exp/README.md` ("Open
+  items (carried forward from WIP)") — the authoritative list for the
+  beta tree.
+- Delivery verification contract + dated records: `MANIFESTS.md`,
+  `patches/README.md`, AGENTS.md headers.
+- Benchmarks + gates: `benchmarks/` (`mtp-adaptive-methodology.md` etc.).
