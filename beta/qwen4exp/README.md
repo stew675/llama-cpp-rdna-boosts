@@ -5,6 +5,51 @@ support work on top of the rdna-boosts core. Status: between WIP and
 Release - the content below is the verified, gated baseline; new work in
 this area starts from these three patches.
 
+## Suggested llama-server start command
+
+```
+HIP_VISIBLE_DEVICES=0,1,2 GGML_CUDA_FA_WMMA_256=0 \
+./build-rocm/bin/llama-server \
+--fit off \
+--top-k 20 \
+--port 8033 \
+--threads 8 \
+--parallel 1 \
+--top-p 0.95 \
+--n-cpu-moe 0 \
+--n-cpu-ffn 0 \
+--min-p 0.001 \
+--verbosity 3 \
+--host 0.0.0.0 \
+--lazy-mode off \
+--predict 98304 \
+--no-kv-unified \
+--threads-http 4 \
+--load-mode mlock \
+--cache-ram 16384 \
+--ctx-size 204800 \
+--flash-attn auto \
+--temperature 0.9 \
+--batch-size 2048 \
+--cache-idle-slots \
+--ubatch-size 2048 \
+--n-gpu-layers all \
+--cache-type-k bf16 \
+--cache-type-v bf16 \
+--split-mode tensor \
+--reasoning-preserve \
+--ctx-checkpoints 64 \
+--repeat-penalty 1.0 \
+--spec-type draft-mtp \
+--presence-penalty 0.0 \
+--reasoning-budget 65536 \
+--checkpoint-min-step 4096 \
+--alias Qwen3.8-Flash-Next-Q4_K_XL \
+--chat-template-kwargs {"reasoning_effort":"low"} \
+--spec-draft-model /models/Qwen3.8/Flash-Next/IQ4_XS//mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf \
+--model /models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
+```
+
 ## Contents
 
 Three squashed patch files. They apply IN ORDER on the rdna-boosts core
