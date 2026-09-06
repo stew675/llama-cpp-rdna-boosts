@@ -102,8 +102,9 @@ Progression of pp2048 across the session: 703.5 (mwr) -> 725.4 (split_j/config).
    I>=nwarps*16 mma invariant from the defect likely applies there too. ALSO the gfx11 scan's
    NW16 retune (376f02aa0) needs gfx1100/1101 launch-fitness checks (~106K VGPRs/CU required
    - the old 8-warp config fits 64K; revert the constants + mapping there if not).
-5. Re-verify the full patch series from-scratch when the next fork commit lands (currently 20
-   patches through 376f02aa0, delivery verified tip 20c17c1).
+5. Re-verify the full patch series from-scratch when the next fork commit lands (series = 21
+   numbered patches on da67bcb88, delivery tip 5e9b091, reproduced f5ac11903 0-diff 2026-09-13;
+   the managed-reader 2-patch split was squashed into 01 and 02 regenerated - see the README table).
 
 ## Env toggles / knobs
 
