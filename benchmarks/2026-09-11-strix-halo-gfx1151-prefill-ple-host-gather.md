@@ -2,7 +2,7 @@
 
 Date: 2026-09-11. Follows the investigation record (2026-09-10-prefill-rootcause-investigation).
 This closes item 1 of the plan: A's CPU input-embedding cost is root-caused and fixed at the
-model level (commit `32680d937`, on `a18e24f97`).
+model level (commit `8b62ac25a`, on `b31940a5e`).
 
 ## Root cause (measured, not hypothesized)
 
@@ -29,7 +29,7 @@ batching every distinct page into one madvise(MADV_WILLNEED) sweep (B's pattern:
 ~0.2 ms each become parallel disk reads). Byte-identical output verified (cli same seed/prompt,
 host-gather vs LLAMA_QSA_PLE_HOSTGATHER=0). B has exactly this behavior for host tables.
 
-## Same-session depth-0 results (r3, A=32680d937 vs B c7af5c6c2)
+## Same-session depth-0 results (r3, A=8b62ac25a vs B c7af5c6c2)
 
 | row | A before | A now | B | A/B now | A/B before |
 |---|---|---|---|---|---|

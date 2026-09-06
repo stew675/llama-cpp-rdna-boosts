@@ -11,7 +11,7 @@ Reality pass: 2026-09-10.
 
 ### Strix Halo (gfx1151): prefill-gap follow-ons after WS4 (WS3 #2/#3)
 - WS3 #2 (QSA dense-shortcut below the selection width) DONE + DEFAULT
-  ON (2026-09-10, A commits `fcfb0a522` ggml fix + `1682d32a9` flip;
+  ON (2026-09-10, A commits `a2f2a6ceb` ggml fix + `250e48e97` flip;
   beta patches 6-7): the llama-bench multi-ubatch artifact was
   ROOT-CAUSED (llama-bench's sync-free decode pipeline x ggml-gallocr's
   single-layout alloc-fallback doing an unconditional full-device sync on
@@ -28,7 +28,7 @@ Reality pass: 2026-09-10.
   ON (B parity). Record:
   `benchmarks/2026-09-10-strix-halo-gfx1151-ws3-shortcut-fix.md`.
 - WS3 #3 (routed-compact MoE mmq for the i-quants) DONE (2026-09-08, A
-  commit `a1121cf2d`, DEFAULT ON): port of B's
+  commit `1da01fa67`, DEFAULT ON): port of B's
   mul_mat_q_routed_compact + per-expert J selection
   (mmq_rdna3_5_id_get_J, 16/48/64/128 by rows-per-expert, gfx1151-tuned)
   into A's mmq path; RDNA3.5-only gate (B parity; gfx1201 stays off until

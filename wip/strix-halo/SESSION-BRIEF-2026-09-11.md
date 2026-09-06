@@ -3,27 +3,34 @@
 CONTINUE from this file + ~/make-strix-halo-faster.md + wip/strix-halo/notes-ws1-survey.md + the
 dated records. ACTIVE GOAL (maintainer): equal/surpass the community repo (B, halo-box
 `~/strix-llama.cpp` c7af5c6c2, untouched ~1% reference) for PREFILL and TG at EVERY data point.
-The immediate task is the PREFILL root-cause + fix investigation — read
-`benchmarks/2026-09-10-strix-halo-gfx1151-prefill-rootcause-investigation.md` FIRST.
+The immediate task is the remaining PREFILL kernel-delta fixes (root cause of the 2.7 s PLE
+gather is FIXED - see `benchmarks/2026-09-11-strix-halo-gfx1151-prefill-ple-host-gather.md`
++ the "PREFILL" section below).
 
 ## Commits / tree state (all clean, nothing pushed)
 
-- ~/llama.cpp (qwen4exp) tip `a18e24f97` (on `1682d32a9`, on `a1121cf2d`...): the weighted-down
-  decode fusion port (WS3 #4). Build current. Instrumentation from the pp2048 hunt was REVERTED
-  (tree clean); re-add env-gated prints if re-measuring (GGML_SCHED_BOUNDARY in
-  ggml_backend_sched_compute_splits, GGML_UB_TIMING around process_ubatch in llama-context.cpp).
-- ~/llama-cpp-rdna-boosts (delivery): patches 1-8 staged as a COLLECTION (squash later);
-  records/TODO/briefs updated. ~/strix-llama.cpp untouched. NO pushes (AGENTS: never from
-  ~/llama.cpp; gfx1201 validation deferred until ALL Strix work is done; ggml fix NOT an
-  upstream candidate now).
+- ~/llama.cpp (qwen4exp) tip `3cb9168be` (on `8b62ac25a` host-gather, on `b31940a5e`
+  weighted-down, on `250e48e97` shortcut-DEFAULT-ON, on `a2f2a6ceb` ggml fix, on `1da01fa67`
+  mmq...). Fork history rewritten 2026-09-11: the shortcut opt-in + flip were SQUASHED into
+  `250e48e97` (no opt-in commit exists anymore; old-hash map in the beta README). Build
+  current. Instrumentation from the pp2048 hunt was REVERTED (tree clean); re-add env-gated
+  prints if re-measuring (GGML_SCHED_BOUNDARY in ggml_backend_sched_compute_splits,
+  GGML_UB_TIMING around process_ubatch in llama-context.cpp).
+- ~/llama-cpp-rdna-boosts (delivery): NINE patches in beta/qwen4exp, staged as a COLLECTION
+  (squash later). Patch hygiene: managed reader batched-fetch (3cb9168be) FOLDED into patch 1
+  (managed-ngrams); the shortcut opt-in+flip SQUASHED in the fork so patch 7 = its canonical
+  diff; the full nine-patch series applies from scratch at the base and reproduces the fork
+  tip byte-identically. records/TODO/briefs updated. ~/strix-llama.cpp untouched. NO pushes
+  (AGENTS: never from ~/llama.cpp; gfx1201 validation deferred until ALL Strix work is done;
+  ggml fix NOT an upstream candidate now).
 
 ## What is DONE (2026-09-10 sessions)
 
-1. WS3 #2 artifact FIXED at the ggml level (`fcfb0a522`): sched alloc-fallback syncs only when a
+1. WS3 #2 artifact FIXED at the ggml level (`a2f2a6ceb`): sched alloc-fallback syncs only when a
    buffer must actually grow (`ggml_gallocr_reserve_n_probe`). LLAMA_QSA_DENSE_SHORTCUT DEFAULT
-   ON (`1682d32a9`; =0 restores the pre-flip path). Records: 2026-09-08-rootcause,
+   ON (`250e48e97`; =0 restores the pre-flip path). Records: 2026-09-08-rootcause,
    2026-09-10-shortcut-fix.
-2. WS3 #4 weighted-down fusion ported (`a18e24f97`, patch 8): decode MoE tail (mmid+mul+views+
+2. WS3 #4 weighted-down fusion ported (`b31940a5e`, patch 8): decode MoE tail (mmid+mul+views+
    adds) -> one kernel; fires (rocprof), text-neutral, tg@d12288 +1.3%, tg@0 ~flat, pp unchanged.
    DECODE-only (single-token shape gate) - does NOT touch prefill.
 3. A-vs-B gap re-derived on the new default (2026-09-10-ab-gap-default-on): depth-0 pp gaps
@@ -36,7 +43,7 @@ The immediate task is the PREFILL root-cause + fix investigation — read
 
 DONE: A's PLE n-gram table (28.8 GB IQ4_NL, input-layer = CPU-pinned) was gathered by a
 single-threaded CPU get_rows whose random 4 KB mmap pages fault one at a time (~120-170 us/row;
-2.7 s per 2048-token ubatch). FIX (commit 32680d937, patch 9, DEFAULT ON,
+2.7 s per 2048-token ubatch). FIX (commit 8b62ac25a, patch 9, DEFAULT ON,
 LLAMA_QSA_PLE_HOSTGATHER=0 restores the old path, byte-identical text): port of B's host-gather
 - F32 graph input + set_input dequant (same to_float) after one madvise(MADV_WILLNEED) page
 sweep; no CPU graph split. Same-session depth-0 r3 A vs B: pp16384 626 vs 600 (A WINS), pp8192
