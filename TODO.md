@@ -88,6 +88,24 @@ Reality pass: 2026-09-10.
 
 ## Open follow-ups
 
+### Strix: MoE topk-moe fusion is numerics-divergent for qwen4exp (quality-gate decision)
+- FINDING (2026-09-06, record `benchmarks/2026-09-06-strix-halo-gfx1151-launch-overhead-topk.md`):
+  A's MoE routing full-512 argsort per token (94 x 0.264ms = 25ms/capture ~0.5% wall) is the
+  launch ledger's biggest TIME item. The CUDA topk-moe fusion that would replace it with a
+  partial top-10 (B's path, 96 x 0.022ms) is byte-identical in both trees but A's newer
+  ggml_cuda_check_fusion_memory_ranges CORRECTLY refuses: the gallocr aliases the fused output
+  (ffn_moe_weights_norm) into the dead ffn_moe_logits buffer -> multi-block read/write race at
+  2048 rows. Pinning the logits (ggml_set_output) unlocks it (-26ms/capture, ~188MB held).
+- NUMERICS FORK: the fused topk is NOT transparent for qwen4exp - top1 logit 18.424 (A unfused)
+  -> 18.690 (A fused); B = 18.086. All three diverge. The kernel's internal softmax/top-k/weights
+  differ from the plain ggml chain at 0.27 logit scale (behavioral, not ulp). Adoption needs a
+  quality gate (CPU reference + PPL/KL) to establish which routing behavior is correct. NOT
+  adopted; pin experiment reverted; tree clean at 376f02aa0.
+- Open leads: (a) quality-gate the fused topk and adopt if it validates (~0.5% + B-alignment);
+  (b) the +800 scale_f32/unary_op launch excess = hc elementwise fusion-window differences
+  (A's repeat-absorb window [repeat,mul,add,rms,mulg] vs B's possibly-wider window) - not yet
+  root-caused; (c) GDN +72 launches (2-kernel split) cosmetic post-NW16.
+
 ### Upstream monitor: ROCm unaligned-width split-load (Q6_K/Q3_K 2-GPU)
 - Upstream bug: H2D 2D copies whose width is not a multiple of 4 (Q6_K
   quant block = 210 B, Q3_K = 110 B) are ~1000x slower on ROCm. Fixed
