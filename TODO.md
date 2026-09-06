@@ -15,11 +15,11 @@ Reality pass: 2026-09-06.
   tg128@0 +4.2% (24.53 vs 23.54), pp512-2048@0 +3-5%, llama-cli crossing
   prefill neutral (p5000 259.9 vs 258.8), depth gates untouched; numerics
   below the width == A's existing LLAMA_QSA_SPARSE_FA=0 dense path
-  (text-identical). OPEN: llama-bench-only multi-ubatch artifact — pp4096+
-  @0 rows slower with the shortcut on (pp16384 334 vs 525) though rocprof
-  shows equal-or-smaller GPU work and llama-cli/server shows no penalty:
-  host-side graph-lifecycle cost when one ctx mixes store-only + scoring
-  ubatches (root cause NOT found). Default OFF pending adjudication; B
+  (text-identical). llama-bench-only multi-ubatch artifact ROOT-CAUSED
+  2026-09-08 (llama-bench's sync-free decode pipeline x ggml-gallocr
+  single-layout alloc-fallback full sync; real serving syncs per decode
+  and is immune): see `benchmarks/2026-09-08-strix-halo-gfx1151-ws3-
+  shortcut-artifact-rootcause.md`. Default OFF pending adjudication; B
   defaults ON. Record + numbers:
   `benchmarks/2026-09-06-strix-halo-gfx1151-post-fusion-gap.md` (WS3 #2
   section).
@@ -39,13 +39,20 @@ Reality pass: 2026-09-06.
   GGML_CUDA_DISABLE_MMQ_ROUTED=1 (compact only; J selection stays). Record:
   `benchmarks/2026-09-08-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
 - Remaining on the Strix prefill leg: (a) WS3 #2 llama-bench artifact
-  (root cause NOT found — llama.cpp graph-lifecycle expert needed; the
-  dense-shortcut stays opt-in default OFF pending adjudication); (b) the
-  per-ubatch routing/reduction tail (B's weighted-expert-sum/concat
-  graph fusions; A's tail unfused outside WS4 hyperconn coverage) — not
-  yet requested; (c) RDNA4/gfx1201 validation of the WS3 #3 gate via the
-  delivery flow when a gfx1201 box is available. tg@0 decode gap (24.2 vs
-  26.0) is the later generation phase. WS6 re-base NOT indicated.
+  ROOT-CAUSED (2026-09-08): llama-bench's sync-free decode pipeline x
+  ggml-gallocr's single-layout alloc-fallback full-device-sync, triggered
+  by the dense<->sparse graph alternation (every fallback drains the
+  ~3 s GPU queue). Real serving syncs per decode -> immune (p5000
+  neutral). No fix shipped; the dense-shortcut stays opt-in default OFF
+  pending maintainer choice of {keep opt-in, ggml multi-layout gallocr
+  cache (real fix, core-ggml), default ON + accept bench artifact}. Full
+  evidence: `benchmarks/2026-09-08-strix-halo-gfx1151-ws3-shortcut-
+  artifact-rootcause.md`; (b) the per-ubatch routing/reduction tail (B's
+  weighted-expert-sum/concat graph fusions; A's tail unfused outside WS4
+  hyperconn coverage) — not yet requested; (c) RDNA4/gfx1201 validation
+  of the WS3 #3 gate via the delivery flow when a gfx1201 box is
+  available. tg@0 decode gap (24.2 vs 26.0) is the later generation
+  phase. WS6 re-base NOT indicated.
 ### Validate beta qwen4exp on Strix Halo (gfx1151) — DONE for WS4; beta set runs on gfx1151
 - Block 13's Strix leg is DONE (2026-09-05): the fused MoE gate+up+GLU
   MMQ (RDNA4-gated fused arm) was ungated for RDNA3_5 / gfx1151,

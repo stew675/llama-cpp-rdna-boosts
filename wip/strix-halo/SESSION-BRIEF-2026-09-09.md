@@ -54,16 +54,27 @@ first.
 
 ## OPEN items
 
-1. **WS3 #2 llama-bench-only multi-ubatch artifact** (unchanged, still open):
-   dense-shortcut default OFF. pp4096+@0 llama-bench rows slower with the
-   shortcut on (host-side; identical-or-smaller rocprof kernels; llama-cli/
-   server crossing prefill neutral 259.9 vs 258.8). Root cause NOT found —
-   needs a llama.cpp graph-lifecycle deep-dive (llama_memory_clear /
-   llm_graph_input can_reuse / graph-arena reallocation around the store-only
-   qsa_k_inp input mixing with scoring ubatches). Options: fix + flip default
-   ON (+ rerun WS4-style gates), or adjudicate, or keep opt-in. Maintainer
-   decision needed with the evidence in the post-fusion-gap record's WS3 #2
-   section.
+1. **WS3 #2 llama-bench artifact — ROOT CAUSE FOUND (2026-09-08), no code
+   shipped; maintainer adjudication needed on defaulting the shortcut ON:**
+   the artifact is llama-bench's sync-free multi-decode pipeline (test_prompt
+   decodes n_batch chunks with no llama_synchronize between, deep GPU queue)
+   colliding with ggml-gallocr's SINGLE stored layout: any graph whose node
+   count/sizes changed vs the last-reserved layout (ggml_gallocr_needs_realloc)
+   forces ggml_backend_sched_alloc_splits' fallback = FULL device sync (drains
+   the whole ~3 s queue) + re-reserve. With the shortcut ON, the dense ubatch
+   (7273 nodes) alternates with sparse ubatches (7773, sizes growing with n_kv)
+   -> a fallback sync EVERY ubatch of EVERY rep (8 syncs/2 passes, 2.8-3.5 s
+   each, measured via env-gated instrumentation) -> decode serializes and every
+   rep stays at pass-1 speed. OFF reaches a stable max layout by pass 2 -> zero
+   pass-2 fallbacks -> pipelined -> fast. Real serving syncs after every
+   llama_decode (common.cpp), so its fallback syncs are ~free -> immune
+   (validated: p5000 neutral). Structure-stable fix (dense-masked kernel, keep
+   top-k chain) removes the flip but loses the tg@0 win entirely (SF0 tg == OFF)
+   and ~1/4 of the pp2048 win (same-session pp2048@0: OFF 325.2, SF0 338.8,
+   true shortcut 343.6). Fix options: (a) keep opt-in default OFF; (b) ggml
+   multi-layout gallocr cache (real fix, core-ggml, own session); (c) default
+   ON + accept the bench artifact (real serving neutral-or-better). Full record:
+   benchmarks/2026-09-08-strix-halo-gfx1151-ws3-shortcut-artifact-rootcause.md.
 2. **Remaining prefill gap** (from the 2026-09-08 record): pp512-4096 still
    ~1.5-2x B, now dominated by (a) the per-ubatch elementwise/routing/
    reduction tail (B's weighted-expert-sum/concat graph fusions
