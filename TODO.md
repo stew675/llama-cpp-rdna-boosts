@@ -88,7 +88,30 @@ Reality pass: 2026-09-10.
 
 ## Open follow-ups
 
-### Strix: MoE topk-moe fusion is numerics-divergent for qwen4exp (quality-gate decision)
+### Strix: REMAINING code-changing items (2026-09-13 consolidated list; all PREFILL - decode is closed)
+- (a) MoE topk-moe fusion adoption (~0.5%, prefill): replaces the full-512 argsort
+  (25ms/capture) with the fused partial top-10. NUMERICS FORK - fused topk moves top1 logit
+  18.424 -> 18.690 (B 18.086); needs a CPU-reference + PPL/KL quality gate before any
+  adoption; ~188MB arena cost if adopted. Detail in launch-overhead-topk record.
+- (b) ssm_alpha+ssm_beta single-walk fusion (~0.3-0.6%, prefill): [2560x48]x2 MMs on the
+  shared hc_mixed (36/48 recurrent layers); stacked-rocblas M96 measured 1.43x, NOT
+  bit-identical (~3e-7, user-accepted "essentially correct"). Blocked by graph expansion
+  order (alpha-MM@52/beta-MM@58 non-adjacent). Routes: load-time stacked weights (~0.3%) or
+  qwen4exp graph restructure + custom single-walk kernel (~0.6%). Design in cijk-dense-gemm.
+- (c) launch-ledger remainder (small-pp prefill): +38 scale_f32/eval + rms_norm<256,true>
+  count diff + deep fusion-surface diffs after the scale-unary fix; likely sub-0.2%, partly
+  architectural (A fuses MORE scale_unary-sigmoid than B; B has gated-silu A lacks). Root-
+  cause-only value.
+- (d) mmq accumulator-overflow latent defect (I < nwarps*16) - report upstream (correctness
+  hygiene, no perf value).
+- (e) gfx1100/gfx1201 deferred validation: the gdn NW16 retune (376f02aa0, patch 20/21) needs
+  launch-fitness on gfx1100 (~106K VGPRs/CU vs possibly 64K classic -> revert to NW8
+  constants if it fails); split_j/config + quantize-chunk + fattn row also re-check on other
+  arches. Small code change ONLY if hardware testing fails.
+- NOT worth pursuing: decode fq-inline-quantize port (wash-to-negative - A already launches
+  fewer kernels/step and sits at wall parity); GDN +72 launches (cosmetic).
+
+
 - FINDING (2026-09-06, record `benchmarks/2026-09-06-strix-halo-gfx1151-launch-overhead-topk.md`):
   A's MoE routing full-512 argsort per token (94 x 0.264ms = 25ms/capture ~0.5% wall) is the
   launch ledger's biggest TIME item. The CUDA topk-moe fusion that would replace it with a
