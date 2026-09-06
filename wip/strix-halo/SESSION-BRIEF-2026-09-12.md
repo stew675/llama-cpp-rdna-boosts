@@ -6,11 +6,13 @@ CURRENT STATE after split_j (6d457634e) + gfx1151-gated quantize chunk (0a3a2b49
 repeat-anchored hc_combine absorb (b987877d7): SAME-SESSION pairs pp2048 762.9/773.1 (0.987x,
 was 0.952), pp4096 0.996x, pp16384 ~1.20x, pp512/pp1024 AT PARITY, tg parity. Kernel deltas:
 op_repeat 384->8/pass, hc_combine_norm 372/0.547s -> 376/0.445s (narrow-bo). 17 delivery
-patches, series verified -> tip b987877d7. REMAINING open deltas (see the 2026-09-13 record):
+patches, series verified -> tip b987877d7. REMAINING prefill deltas per 4 pp2048 decodes (+79ms/pass total): flash_attn +94ms (A 11.7 vs B 9.75ms/call, smem 33792 vs 51328), quantize <true>+swiglu +72ms (A fires 376+376 vs B 188+188 calls - B merges gated rows into its swiglu quantize), GDN scan+kkt +46ms (A 2 kernels vs B 1 tiled), Cijk grid256 +45ms (+10%/call), k_get_rows +15ms, launches +612/pass. ALREADY A-faster: hc_combine_norm (0.445 vs 0.468), rms_norm, mul_mat_q parity. Generality: split_j + quantize chunk = arch-level gfx1151 gated (any model); hc fusions/repeat-absorb/QSA/PLE/mmid/mwr = qwen4exp-only, pattern-dormant elsewhere. (see the 2026-09-13 record)
 Cijk grid256 bucket +21%/call (rocblas shapes), flash +20%/call (A 11.65 vs B 9.75ms, smem
 33792 vs 51328), scatter/swiglu quantize 2x-call structure, GDN-vs-tiled diff small, plus
 depth-12k/32k re-derivation and decode followup. MACHINE DRIFT: ~2.5% on B itself between
 sessions (773->754) - always judge A/B by same-session pairs, never absolutes across sessions.
+Delivery 17 patches verified -> b987877d7 (tip); records: 2026-09-12 (mmq defect), 2026-09-13
+(quantize chunk + repeat-absorb + remaining-gap ledger + generality).
 
 ## Tree state (both clean, nothing pushed)
 
