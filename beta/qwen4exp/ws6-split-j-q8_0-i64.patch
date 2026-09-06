@@ -1,0 +1,100 @@
+diff --git a/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh b/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh
+index 180b2d937..8ec1794e2 100644
+--- a/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh
+@@ -79,15 +79,15 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_Q8_0, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_Q8_0, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_Q8_0, 256, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+-    CASE(GGML_TYPE_Q8_0, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
++    CASE(GGML_TYPE_Q8_0, 128, 2,  64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
+     CASE(GGML_TYPE_Q8_0, 128, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_Q8_0, 128, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+-    CASE(GGML_TYPE_Q8_0, 256, 2, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_Q8_0, 128, 2,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_Q8_0, 256, 2, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_Q8_0, 256, 2, 128,  80, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_Q8_0, 256, 2, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+     CASE(GGML_TYPE_Q8_0, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+-    CASE(GGML_TYPE_Q8_0, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
++    CASE(GGML_TYPE_Q8_0, 256, 2,  64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, false);
+ 
+ // ---------------------------------------------------------------------------------------------
+ 
+diff --git a/ggml/src/ggml-cuda/mmq-vec-dot.cuh b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
+index 0e99f7b97..a2f27c80d 100644
+--- a/ggml/src/ggml-cuda/mmq-vec-dot.cuh
++++ b/ggml/src/ggml-cuda/mmq-vec-dot.cuh
+@@ -151,8 +151,18 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
+     constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
+     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
++    constexpr int nwarps        = ggml_cuda_mmq_get_nthreads(type, J, fallback) / ggml_cuda_get_physical_warp_size();
++    // halo-box: J/2 row split for Q8_0 J=128 at I=64/256thr (4 row-warps x 2 j-groups) so each warp
++    // covers rows within I and only J/2 columns -> the per-thread sum[] stays in bounds. Inert for the
++    // upstream geometries (I == nwarps*16 -> split_j false).
++    constexpr int  I        = ggml_cuda_mmq_get_I(type, J, fallback);
++    constexpr bool split_j  = type == GGML_TYPE_Q8_0 && J == 128 && !fallback && I == 64 && nwarps == 8;
++    constexpr int  j_group  = split_j ? J/2 : J;
+ 
+-    y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
++    const int warp_i = split_j ? threadIdx.y % 4 : threadIdx.y;
++    const int warp_j = split_j ? threadIdx.y / 4 : 0;
++
++    y += (warp_j*j_group + (warp_i % ntx)*tile_C::J) * MMQ_TILE_Y_K;
+ 
+     const int   * x_qs = (const int   *) x;
+     const float * x_df = (const float *) x_qs + 2*MMQ_TILE_NE_K;
+@@ -160,7 +170,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
+     const float * y_df = (const float *) y;
+     const half2 * y_ds = (const half2 *) y;
+ 
+-    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
++    const int i0 = (warp_i / ntx) * rows_per_warp;
+ 
+     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+         const int k0 = k00 + k01;
+@@ -172,7 +182,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
+         }
+ 
+ #pragma unroll
+-        for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
++        for (int j0 = 0; j0 < j_group; j0 += ntx*tile_C::J) {
+             tile_B B;
+             load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+ 
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 8b12f53c3..7b2fd263c 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -486,20 +486,27 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
+     typedef tile<16,  8, int> tile_C;
+ #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+ 
++    constexpr int warp_size     = ggml_cuda_get_physical_warp_size();
++    constexpr int nwarps        = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
++    constexpr int I             = ggml_cuda_mmq_get_I(type, J, fallback);
+     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
+     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
++    constexpr bool split_j      = type == GGML_TYPE_Q8_0 && J == 128 && !fallback && I == 64 && nwarps == 8;
++    constexpr int j_group       = split_j ? J/2 : J;
+ 
+-    const int i0 = (threadIdx.y / ntx) * (ntx*tile_C::I);
++    const int warp_i = split_j ? threadIdx.y % 4 : threadIdx.y;
++    const int warp_j = split_j ? threadIdx.y / 4 : 0;
++    const int i0 = (warp_i / ntx) * (ntx*tile_C::I);
+ 
+     const bool y_scale_used = y_scale != nullptr;
+ 
+ #pragma unroll
+-    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
++    for (int j0 = 0; j0 < j_group; j0 += ntx*tile_C::J) {
+ #pragma unroll
+         for (int n = 0; n < ntx; ++n) {
+ #pragma unroll
+             for (int l = 0; l < tile_C::ne; ++l) {
+-                const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
++                const int j = warp_j*j_group + j0 + (warp_i % ntx)*tile_C::J + tile_C::get_j(l);
+ 
+                 if (j > j_max) {
+                     continue;

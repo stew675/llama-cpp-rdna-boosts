@@ -49,13 +49,17 @@ catastrophic divergence, NOT rounding.
    baked into the kernel instantiation (that is why arch_vgpr_count changed 232<->72 between
    builds - the per-thread accumulator array is float sum[J*I/(nwarps*32)]).
 
-## Status
+## Status -> FIXED (commit 6d457634e)
 
-- Config change REVERTED; tree clean at f33ffaca7; fingerprint restored bit-identical.
-- NOT shipped. A's upstream I=128/256thr config stays (correct).
-- The latent defect (A mul_mat_q J=128 @ 32 accums/thread wrong; J=48 @ I=64 racy) is the real
-  find: fixing it unlocks a validated occupancy/register win worth ~+10% prefill (703 -> 777 t/s
-  class at pp2048) WITHOUT the numerics corruption.
+B's split_j (J/2 row split) was ported into A's Q8_0 mma vec_dot + write_back (compile-time
+gated to type==Q8_0 && J==128 && !fallback && I==64 && nwarps==8; inert for upstream
+yeometries) and B's three Q8_0 config rows were adopted (Q8_0 block now byte-identical to B).
+Correctness: logitcmp deterministic + BIT-IDENTICAL to the pre-change reference; cli text
+byte-identical. Real result (not the fake +10%): vgprs 232 -> 136, mul_mat_q ~812 -> ~730us,
+depth-0 same-session A/B t/s: pp512 634/643, pp1024 698/729, pp2048 725/775 (0.936x),
+pp4096 716/733 (0.976x), pp8192 693/678 (1.02x A), pp16384 689/601 (1.148x A - was 1.04x),
+tg128 25.91/25.94 parity. The big long-prompt win (pp16384 +10%) plus mid-row closure to
+0.94-0.99x; remaining depth-0 deficits are the fixed per-ubatch costs (pp1024-4096).
 
 ## Root cause CONFIRMED at the source (mma vec-dot accumulator-array overflow)
 

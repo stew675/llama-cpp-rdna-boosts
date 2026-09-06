@@ -1,0 +1,59 @@
+diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cu b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
+index 11ec58497..554c114b0 100644
+--- a/ggml/src/ggml-cuda/moe-weighted-reduction.cu
++++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
+@@ -6,22 +6,37 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
+                                                   float * __restrict__ dst,
+                                                   const int64_t n_embd,
+                                                   const int     n_expert_used) {
+-    const int64_t token = blockIdx.x;
+-    const int64_t col   = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+-    if (col >= n_embd) {
++    const int64_t n_embd4 = n_embd / 4;
++    const int64_t token   = blockIdx.x;
++    const int64_t i4      = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
++    if (i4 >= n_embd4) {
+         return;
+     }
+ 
+-    const uint64_t first_row   = (uint64_t) token * n_expert_used;
++    const int64_t col       = i4 * 4;
++    const uint64_t first_row = (uint64_t) token * n_expert_used;
+     const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
+-    float          sum         = (experts[first_row * n_embd + col] * first_scale) * weights[first_row];
++    float4 sum;
++    {
++        const float4 e = *reinterpret_cast<const float4 *>(experts + first_row * n_embd + col);
++        const float  w = weights[first_row];
++        sum.x = (e.x * first_scale) * w;
++        sum.y = (e.y * first_scale) * w;
++        sum.z = (e.z * first_scale) * w;
++        sum.w = (e.w * first_scale) * w;
++    }
+ 
+     for (int expert = 1; expert < n_expert_used; ++expert) {
+         const uint64_t row   = first_row + expert;
+         const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+-        sum += (experts[row * n_embd + col] * scale) * weights[row];
++        const float4  e     = *reinterpret_cast<const float4 *>(experts + row * n_embd + col);
++        const float   w     = weights[row];
++        sum.x += (e.x * scale) * w;
++        sum.y += (e.y * scale) * w;
++        sum.z += (e.z * scale) * w;
++        sum.w += (e.w * scale) * w;
+     }
+-    dst[token * n_embd + col] = sum;
++    reinterpret_cast<float4 *>(dst + token * n_embd + col)[0] = sum;
+ }
+ 
+ static void launch_moe_weighted_reduction(const float * experts,
+@@ -33,7 +48,8 @@ static void launch_moe_weighted_reduction(const float * experts,
+                                           int           n_expert_used,
+                                           cudaStream_t  stream) {
+     constexpr int threads = 256;
+-    const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
++    const int64_t n_embd4 = n_embd / 4;
++    const dim3 blocks(n_tokens, (n_embd4 + threads - 1) / threads, 1);
+     moe_weighted_reduction_f32
+         <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+ }
