@@ -1,0 +1,36 @@
+diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
+index 41d16bc0c..944110792 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
+@@ -67,11 +67,14 @@
+ #define GDN_BF16_KP  132                // LDS row pitch of the [.][KD] buffers, in shorts
+ #define GDN_BF16_AP  68                 // LDS row pitch of the [.][BT] buffers, in shorts
+ #define GDN_BF16_WP  GDN_BF16_AP
+-#define GDN_BF16_NW  8                  // waves per scan workgroup
++#define GDN_BF16_NW  16                 // waves per scan workgroup (512 thr: 1 block/CU at 61KB LDS,
++                                        //   4 warps/SIMD for latency hiding; needs >= ~106K VGPRs/CU -
++                                        //   gfx1151 (196608) fits; re-validate gfx1100/gfx1101 launch
++                                        //   fitness, else revert to 8 with the 2x2 mapping)
+ #define GDN_BF16_NTHR (GDN_BF16_NW * 32)
+-#define GDN_BF16_NTV 2                  // n tiles per wave in the scan's main / V' / O loops
+-#define GDN_BF16_SKT 2                  // state k-tiles per wave (2x2 over the 8x4 grid)
+-#define GDN_BF16_SVT 2
++#define GDN_BF16_NTV 1                  // n tiles per wave in the scan's main / V' / O loops
++#define GDN_BF16_SKT 2                  // state k-tiles per wave (2x1 over the 8x4 grid)
++#define GDN_BF16_SVT 1
+ #define GDN_BF16_NST (GDN_BF16_SKT * GDN_BF16_SVT)
+ #define GDN_BF16_KKT_NW 4               // waves per kkt workgroup
+ #define GDN_BF16_KKT_NTHR (GDN_BF16_KKT_NW * 32)
+@@ -481,9 +484,9 @@ gdn_bf16_scan_cuda(
+     const int64_t iq3 = fastdiv((uint32_t) nq, rq3_magic);
+     const int64_t state_seq_base = (int64_t) nq * state_seq_stride + (int64_t) h * GDN_BF16_VD * GDN_BF16_KD;
+ 
+-    // wave tile mapping: [BT][BV] = 4x4 tile grid, 2 tiles/wave; state 2x2 over the 8x4 grid
+-    const int mt  = w >> 1, ntb = (w & 1) * 2;
+-    const int kt0 = (w >> 1) * 2, vt0 = (w & 1) * 2;
++    // wave tile mapping: [BT][BV] = 4x4 tile grid, 1 tile/wave (16 warps); state 2x1 over the 8x4 grid
++    const int mt  = w >> 2, ntb = (w & 3);
++    const int kt0 = (w >> 2) * 2, vt0 = (w & 3);
+ 
+     // ---- the state accumulator: C[m=k-dim][n=v], transposed so the writeback to s.S is
+     // ---- four packed 8-short stores instead of 32 scalar ds_store_b16 -----------------------
