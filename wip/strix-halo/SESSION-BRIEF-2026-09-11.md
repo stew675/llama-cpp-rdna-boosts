@@ -1,113 +1,77 @@
-# Strix Halo session brief — 2026-09-10 end state (handoff for the next session)
+# Strix Halo session brief — handoff after 2026-09-10 (compact me; run the NEXT SESSION prompt)
 
-CONTINUE from this file + ~/make-strix-halo-faster.md + wip/strix-halo/notes-ws1-survey.md +
-the dated records. The PRIMARY task (WS3 #2 llama-bench artifact → ggml-level fix → shortcut
-default ON) is COMPLETE this session. Read `benchmarks/2026-09-10-strix-halo-gfx1151-ws3-shortcut-fix.md`
-for the full evidence. Remaining items are in the ledger at the bottom.
+CONTINUE from this file + ~/make-strix-halo-faster.md + wip/strix-halo/notes-ws1-survey.md + the
+dated records. ACTIVE GOAL (maintainer): equal/surpass the community repo (B, halo-box
+`~/strix-llama.cpp` c7af5c6c2, untouched ~1% reference) for PREFILL and TG at EVERY data point.
+The immediate task is the PREFILL root-cause + fix investigation — read
+`benchmarks/2026-09-10-strix-halo-gfx1151-prefill-rootcause-investigation.md` FIRST.
 
-## Commits / tree state (all clean, verified)
+## Commits / tree state (all clean, nothing pushed)
 
-- ~/llama.cpp (qwen4exp) tip `1682d32a9`, clean, build current (= tip content):
-  - `248e47704` (patch 4) WS4 fusions DEFAULT ON → `151798ed2` WS3#2 shortcut opt-in
-    (superseded) → `a1121cf2d` (patch 5) WS3#3 routed-compact MoE MMQ DEFAULT ON → NEW:
-  - `fcfb0a522` (patch 6): ggml-level fix — `ggml_gallocr_reserve_n_probe()` +
-    sched alloc-fallback syncs only when a buffer must actually GROW (ggml-alloc.c/.h,
-    ggml-backend.cpp; +57/-11). Numerics-inert.
-  - `1682d32a9` (patch 7): `LLAMA_QSA_DENSE_SHORTCUT` DEFAULT ON (opt-OUT via =0; B parity).
-    NOTE: the tree default is no longer the byte-identical "known-good" sparse-selection
-    numerics below the 2051-cell width — the default is now the dense-below-width regime
-    (= LLAMA_QSA_SPARSE_FA=0 text-identical; =0 env restores the old known-good default).
-- ~/llama-cpp-rdna-boosts (delivery): patches 6-7 staged in beta/qwen4exp/
-  (`ggml-sched-fallback-sync.patch`, `ws3-shortcut-default-on.patch`; clean-apply verified at
-  a1121cf2d, byte-identical to 1682d32a9). TODO reality pass 2026-09-10.
-- ~/strix-llama.cpp (B) `c7af5c6c2` untouched (~1% stable reference). No pushes anywhere.
+- ~/llama.cpp (qwen4exp) tip `a18e24f97` (on `1682d32a9`, on `a1121cf2d`...): the weighted-down
+  decode fusion port (WS3 #4). Build current. Instrumentation from the pp2048 hunt was REVERTED
+  (tree clean); re-add env-gated prints if re-measuring (GGML_SCHED_BOUNDARY in
+  ggml_backend_sched_compute_splits, GGML_UB_TIMING around process_ubatch in llama-context.cpp).
+- ~/llama-cpp-rdna-boosts (delivery): patches 1-8 staged as a COLLECTION (squash later);
+  records/TODO/briefs updated. ~/strix-llama.cpp untouched. NO pushes (AGENTS: never from
+  ~/llama.cpp; gfx1201 validation deferred until ALL Strix work is done; ggml fix NOT an
+  upstream candidate now).
 
-## What is DONE (this session — the WS3 #2 artifact, root-cause → fix → flip)
+## What is DONE (2026-09-10 sessions)
 
-1. Root cause (prior session) confirmed + FIXED at the ggml level (Option 2): the sched
-   alloc-fallback did an unconditional full-device sync when the graph layout differed from
-   gallocr's single stored layout. llama-bench pipelines async decodes (no sync between
-   2048-token chunks), so each fallback drained the whole ~3 s GPU queue; the dense ubatch
-   (7273 nodes, 16 CPU-assigned nodes) vs sparse ubatches (7773, 20 CPU nodes) alternation
-   flipped the layout EVERY ubatch of EVERY rep → 8 × ~3 s syncs over 2 passes at pp8192.
-2. Fix: buffers are grow-only, so a reserve that FITS only re-points tensors — safe without a
-   sync (the graph's compute is ordered after the previous graph's on the backend streams; the
-   layout-reuse path already does this every decode). Sync ONLY on real growth (free+realloc
-   moves addresses an in-flight graph may still use). New `ggml_gallocr_reserve_n_probe()`
-   computes+stores the layout without touching buffers and reports growth; `no_alloc` reserve
-   no longer frees buffers. Also removed `backend_ids_changed` from the sync condition (its
-   positional node-backend comparison fires on every dense/sparse flip due to the ~16-20
-   CPU-assigned mask-view/indexer-chain nodes, but backend-id changes without growth are also
-   just re-pointing). NOTE: the brief's original design-B premise ("same-size tensors hash to
-   stable addresses across reserves") is FALSE in this code (the per-graph hash is reset every
-   reserve; addresses come from the free-list by allocation sequence) — the correct argument is
-   the ordering one above. Instrumented: ZERO fallback syncs in the steady state (was 8).
-3. Gate evidence (same-session r3, ON vs =0): depth-0 ladder ON >= OFF at every size — pp16384
-   574.1 vs 566.8 (+1.3%), pp8192 544.0 vs 535.0 (+1.7%), pp4096 487.9 vs 473.0 (+3.2%),
-   pp2048 399.7 vs 382.7 (+4.4%), pp1024 418.6 vs 407.6 (+2.7%), pp512 407.7 vs 401.3 (+1.6%),
-   tg128@0 25.25 vs 24.23 (+4.2%); artifact rows pp4096/8192/16384 were -17/-29/-36% pre-fix.
-   Depth flat through 32k (pp2048@d12288 329.3 vs 330.4; tg 22.09 vs 22.12; @d32768 334.0 vs
-   333.1; tg 20.11 vs 20.13).
-4. Coherence/determinism: OFF-path 7-tok text == stored known-good (cli-restore.txt); ON 7-tok
-   == LLAMA_QSA_SPARSE_FA=0 dense reference; ON p5000 (multi-ubatch, exercises the new no-sync
-   re-pointing) run twice byte-identical; ON-vs-OFF divergence below the width = the documented
-   pre-existing dense-vs-sparse kernel signature (matches the pre-fix p5000 on/off pattern).
-5. DECISION (maintainer rule "default to fastest and coherent"): `LLAMA_QSA_DENSE_SHORTCUT`
-   DEFAULT ON. =0 restores the selection path.
+1. WS3 #2 artifact FIXED at the ggml level (`fcfb0a522`): sched alloc-fallback syncs only when a
+   buffer must actually grow (`ggml_gallocr_reserve_n_probe`). LLAMA_QSA_DENSE_SHORTCUT DEFAULT
+   ON (`1682d32a9`; =0 restores the pre-flip path). Records: 2026-09-08-rootcause,
+   2026-09-10-shortcut-fix.
+2. WS3 #4 weighted-down fusion ported (`a18e24f97`, patch 8): decode MoE tail (mmid+mul+views+
+   adds) -> one kernel; fires (rocprof), text-neutral, tg@d12288 +1.3%, tg@0 ~flat, pp unchanged.
+   DECODE-only (single-token shape gate) - does NOT touch prefill.
+3. A-vs-B gap re-derived on the new default (2026-09-10-ab-gap-default-on): depth-0 pp gaps
+   1.58/1.76/1.93/1.39/1.25/1.04x (pp512..16384), tg@0 A ~25.0-25.3 vs B 25.96; depth-12k pp
+   1.17-1.55x + tg A wins; depth-32k A wins everything. B@depth must use llama-bench -r 1 (B's
+   cub argsort aborts under -r3 state-restore at depth). Same-box B runs 10-30% below the
+   community PR table (use same-box B).
 
-## NEXT SESSION (in order — all lower priority than done items; nothing urgent queued)
+## THE PREFILL INVESTIGATION (the active task — see the record for full data)
 
-1. (MAINTAINER DECISIONS, 2026-09-10 — recorded so they do not resurface): patches 6-7 stay as a
-   staged COLLECTION in beta/qwen4exp/ (likely to be SQUASHED together with earlier patches
-   later; no per-patch routing ceremony needed now). The ggml fix (patch 6) is NOT an upstream
-   candidate at this moment (maybe another day). gfx1201 / multi-GPU validation is DEFERRED
-   until ALL Strix Halo work is done (less churn) — do not schedule it per-change.
-2. ACTIVE CAMPAIGN (maintainer direction 2026-09-10): equal/surpass the community repo (B) for
-   PREFILL and TG at EVERY data point (depths 0/12k/32k x pp512..16384 + tg128). PROGRESS:
-   - Gap matrix re-derived on the shortcut-default build (2026-09-10-ab-gap-default-on record):
-     depth-0 pp gaps 1.58/1.76/1.93/1.39/1.25/1.04x (pp512..16384; worst pp2048 = a ~1.2 us/token
-     unfused-tail cost), tg128@0 A 25.07 vs B 25.96 (-3.5%); depth-12k pp 1.17-1.55x, tg A wins;
-     depth-32k A wins everything. B@depth must be measured -r 1 (its cub argsort aborts under
-     llama-bench's -r3 state-restore at depth; A unaffected). Same-box B runs 10-30% below the
-     community PR table - use same-box B.
-   - WS3 #4 weighted-down fusion PORTED (commit a18e24f97, beta patch 8, record
-     2026-09-10-weighted-down-fusion): decode MoE tail -> one kernel (B parity). Fires (rocprof),
-     text-neutral, tg128@d12288 +1.3% (22.50 vs 22.22), tg@0 ~flat, pp unchanged. NOT the tg@0
-     gap source: A's decode profile is thousands of small mul_mat_vec_q/ksplit launches per
-     token - NEXT DECODE LEVER = per-op decode kernel-mix comparison A-vs-B. The prefill
-     shallow-row gap is the unfused elementwise/routing tail (WS1 attribution), still the main
-     prefill target (see the gap record's scoped weighted-down/prefill notes).
-3. (If requested) the MoE routing/reduction tail: B's ggml_cuda_op_weighted_expert_sum +
-   ggml_cuda_mul_mat_id_weighted_rdna3_5 (IQ4_NL down-proj fused with the n_used=10 weighted
-   sum) graph fusions into A's ggml-cuda.cu — the biggest remaining pp512-4096 gap component
-   after WS3 #3. Verify the A graph pattern matches B's before porting.
-4. WS6 re-base NOT indicated.
+Findings: (a) A's pp2048 llama-bench decode = split0 CPU `model.input_embed` (PLE get_rows) 4
+nodes = 2700 ms + split1 GPU 7201 nodes; llama-cli identical flags = 494.8 t/s (no 2.7 s) ->
+the llama-bench single-ubatch rows are inflated by a REAL A-side ingest defect (B is fast in
+both bench and cli); (b) even on the real path A pp2048 = 494.8 (cold) vs B 653 = 1.32x;
+(c) rocprof GPU-busy A 2.94 s vs B 2.41 s per decode -> real kernel deltas ~0.5 s/pass: concat
+(A generic 0.41 s vs B transposed 0.13 s), swiglu-input quantize (B fuses it, A doesn't), Q8_0
+gate/up mmq +13% on same calls, A-only mm_ids_helper<10> (0.31 s), host submit; near-parity on
+the routed-compact expert mmq + rocBLAS + hc fusions.
+
+NEXT SESSION IN ORDER:
+1. ROOT-CAUSE + FIX the CPU input_embed 2.7 s: confirm llama-cli honors --load-mode; find why
+   llama-bench's decode routes the PLE embedding to a CPU split; profile the CPU get_rows
+   (suspects: host-mmap PLE row path / managed-reader locking / non-optimal CPU IQ4_NL
+   get_rows / random-vs-text token ids); diff A vs B qwen4exp PLE placement + input-embedding
+   build + host per-ubatch submit (~0.25 s B). Expect most of the pp512/1024/2048 delta to
+   vanish (A warm GPU+host pp2048 ~620-700 t/s vs B 771 if the embed is fixed).
+2. PORT B's transposed concat + swiglu-input quantize kernels (WS4-recipe coherence then
+   same-session A/B).
+3. Q8_0 gate/up mmq feed delta (+13% on the largest kernel, same call counts).
+4. Re-establish the WARM real-path (llama-cli after a warmup decode) low-depth ladder A vs B.
+5. Re-derive the full matrix on the new default; update records + TODO + this brief.
 
 ## Carried-forward open items (full ledger)
 
-- beta/qwen4exp README "Open items" (gfx1201 3xR9700 box / delivery flow): "The answer"
-  3-token K=2 multi-seq decode drift at step 3; mixed K/V cache types crash; FA-off +
-  tensor-split unsupported; decode levers (batch decode M>1, decode-expert mmvq sweep, GDN
-  state fold ~1.5-3%, body-op elementwise fusion); prefill thread (pp8192 ~2024); ML-Kernel/
-  gpudh review items (3x R9700 env: GGML_CUDA_FA_WMMA_256=0, sparse FA default).
-- Strix (this box): tg@0 decode gap (A 24.2-25.25 now vs B 26.0 — some closed by the
-  shortcut tg win) + MTP = the later generation phase
-  (benchmarks/mtp-adaptive-methodology.md is the standing decode/fusion gate when re-enabled).
-- Delivery/upstream monitors: ROCm unaligned-width split-load (Q6_K/Q3_K 2-GPU; local
-  block-13 fix; re-check at each re-base); MXFP4/NVFP4 fused gate+up+GLU MMQ = LAST block-13
-  item (add switch cases + instance files + generators, bit-exact + bench per the 0004 recipe).
-- Parallel (community member): dual-7900XTX (RDNA3) block-12 hybrid all-reduce validation on
-  their box (block-12 gate stays RDNA4-only until verified; GGML_CUDA_ALLREDUCE=internal).
-- Parked: LFRU host->GPU slow hot-weight migration (wip/qwen4exp/LRU_EXPERTS.md etc.).
+- Beta/qwen4exp README "Open items" (gfx1201 3xR9700 box): "The answer" 3-token K=2 multi-seq
+  drift; mixed K/V cache crash; FA-off + tensor-split unsupported; decode levers (batch decode
+  M>1, decode-expert mmvq sweep, GDN fold ~1.5-3%, body-op elementwise fusion); prefill thread
+  (pp8192 ~2024); ML-Kernel/gpudh review items.
+- Strix decode: tg@0 gap A ~25.0-25.3 vs B 25.96 (the real lever = per-op decode kernel-mix
+  profile A vs B — A decode is thousands of small mmvq launches/token); MTP deferred
+  (mtp-adaptive-methodology.md is the standing decode gate when re-enabled).
+- Delivery/upstream monitors: ROCm unaligned split-load (re-check at each re-base); MXFP4 fused
+  MoE MMQ (last block-13 item). Parallel: dual-7900XTX block-12 (community member). Parked:
+  LFRU host->GPU migration.
+- Envs: GGML_CUDA_DISABLE_HC_FUSION, LLAMA_QSA_DENSE_SHORTCUT (=0 pre-flip path), GGML_CUDA_
+  DISABLE_MMQ_ROUTED, GGML_CUDA_DISABLE_WEIGHTED_DOWN (patch 8 opt-out), LLAMA_QSA_SPARSE_FA=0.
 
-## Hygiene + envs
-
-No parallel benches; warm page cache (dd the 3 shards); long pp first (warm clock); verify
-non-empty llama output in loops (spaced runs); depths 0/12k/32k only; ~116 GB VRAM / ~419 GB
-disk; one server (port 8033); records benchmarks/YYYY-MM-DD-strix-halo-*.md; scratch in
-wip/strix-halo/ + /tmp/gateA/. Env toggles: GGML_CUDA_DISABLE_HC_FUSION (WS4 off),
-LLAMA_QSA_DENSE_SHORTCUT (=0 = pre-flip selection path / known-good; unset/=1 = dense shortcut
-DEFAULT), GGML_CUDA_DISABLE_MMQ_ROUTED (WS3 #3 compact off; J stays), LLAMA_QSA_SPARSE_FA=0
-(dense masked FA). Fix code locations: ggml_gallocr_reserve_n_probe (ggml-alloc.c ~970),
-no_alloc-preserves-buffers in reserve_n_impl (~930), sched fallback (ggml-backend.cpp ~1644).
-New raw evidence: /tmp/gateA/fix-{on,off,matrix,depth,d32768,default-spot}*.log + fix-coh-*.txt.
+Hygiene: no parallel benches; warm page cache (dd 3 shards); long pp first (warm clock);
+verify non-empty output in loops; depths 0/12k/32k; ~116 GB VRAM / ~419 GB disk; one server
+(port 8033); dated records benchmarks/YYYY-MM-DD-strix-halo-*.md; scratch /tmp/gateA/ + /tmp/prof/
+(rocprofv3 --kernel-trace -d /tmp/prof -o NAME -- <app>; summarize with /tmp/rocprof-sum.py).
