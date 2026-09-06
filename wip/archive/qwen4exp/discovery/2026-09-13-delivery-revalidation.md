@@ -61,3 +61,26 @@ machine-local ladder (r3, warm cache, A/B interleaved) shows A >= B everywhere:
 
 Machine-state note: A pp2048 measured 2136 in the earlier stage-1 single-shot vs 2335 in
 this ladder = ~9% cross-session swing; same-session A/B is the only valid comparison.
+
+## Qwen3.6-27B Q8_0 (DENSE) same-session ladder A vs B — small dense-pp deficit found
+
+The dense model diverges from the MoE results: A trails B by a consistent ~1.3-1.7% on
+prefill but leads decode by +5.1%. Bracketed at pp2048 (A spread 0.2%) -> real, not drift.
+
+| row | A (Big-13) | B (strix) | A/B |
+|---|---|---|---|
+| pp512 | 464.1 | 472.2 | 0.983 |
+| pp1024 | 458.2 | 467.4 | 0.981 |
+| pp2048 | 450.8 | 456.9 | 0.987 (bracket: A 450.8 +/- 0.2%) |
+| pp4096 | 442.9 | 448.3 | 0.988 |
+| pp8192 | 428.7 | 430.8 | 0.995 |
+| tg128 | 7.89 | 7.51 | 1.051 |
+
+Hypothesis: the recent work was MoE-heavy (routed mmq, swiglu, split_j, pair, weighted-down)
+so the dense-pp paths (dense Q8_0 mmq, GDN chunked, flash, elementwise) were only partially
+tuned vs B. OPEN: profile dense pp2048 per-op A vs B to locate the ~1.3% (candidates: dense
+mul_mat_q per-call, GDN scan, elementwise/launch structure); decide whether to chase before
+the GFX1201 phase or defer. NOTE: much of the qwen4exp-support patch is MoE/qwen4exp-gated
+and likely INERT on this dense model (only sched-sync + the generic scale-unary window could
+fire) - a blocks-only-vs-blocks+support A/B on this model would isolate whether the gap is
+in the top-level blocks themselves.
