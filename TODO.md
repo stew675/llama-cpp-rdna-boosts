@@ -9,6 +9,18 @@ Reality pass: 2026-09-05.
 
 ## Current active
 
+### gfx1201 (RDNA4) port of the gfx1151-gated Halo campaign items — ACTIVE (final qwen4exp stretch)
+- The sched-gate fix (fork `c63f7f2a0`, delivery `d6eb551`) is CLOSED on BOTH arches
+  (2026-09-06): gfx1201 clean-box tensor-split A/B 3/3 no-hang 2130-2156 t/s (pre-reboot
+  flake = degraded box; no bisect, no gate change); gfx1151 same-session parity vs the
+  pre-fix campaign build + pure-gate byte-identity (627506c1c vs c63f7f2a0).
+- The remaining gfx1151-gated campaign content (routed-compact MoE MMQ, quantize chunk,
+  split_j/config rows, per-file RDNA3_5 rows) is INERT on gfx1201 today and needs RDNA4
+  port + per-arch tuning + validation, plus the model-level beta ladder + cross-arch
+  coherence, then a lighter RDNA3 (gfx1100) env-opt-in follow-up.
+- LIVE WORKLOG / implementation plan: `wip/qwen4exp/gfx1201-porting.md` (phases 0-5 +
+  dated entries).  Track items there; this TODO entry is the pointer.
+
 ### Strix Halo (gfx1151): prefill-gap follow-ons after WS4 (WS3 #2/#3)
 - WS3 #2 (QSA dense-shortcut below the selection width) DONE + DEFAULT
   ON (2026-09-05, A commits `a2f2a6ceb` ggml fix + `250e48e97` flip;
@@ -42,12 +54,14 @@ Reality pass: 2026-09-05.
   pp8192 1.37->1.26x, pp16384 1.14->1.06x. Env opt-out:
   GGML_CUDA_DISABLE_MMQ_ROUTED=1 (compact only; J selection stays). Record:
   `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
-- Remaining on the Strix prefill leg: (a) gfx1201/RDNA4 validation of
-  the ggml fix (patch 6) + WS3 #3 gate (patch 5) via the delivery flow
-  when a gfx1201 box is available (multi-GPU/pipeline-parallel not
-  exercisable here; the no-sync ordering argument holds per-device but
-  should be re-checked there); the ggml fix is also a candidate upstream
-  PR at the maintainer's discretion (core-ggml, arch-agnostic); (b) the
+- Remaining on the Strix prefill leg: (a) ~~gfx1201/RDNA4 validation of the ggml fix
+  (patch 6)~~ DONE 2026-09-06 on gfx1201 (multi-GPU, the sched-gate fix restores the full
+  sync there) AND gfx1151 (single-device parity + pure-gate byte-identity — see the
+  gfx1201-porting worklog 2026-09-06 entry); the ggml fix is prepared as an upstream PR
+  candidate (`beta/qwen4exp/UPSTREAM-PR-ggml-sched-probe.{md,patch}`) — filing is the
+  maintainer's call after a clean-upstream build + coherence check; ~~WS3 #3 gate
+  (patch 5) via the delivery flow~~ MOVED to `wip/qwen4exp/gfx1201-porting.md` Phase 1.1
+  (RDNA4 enablement + own J sweep — caps do not transfer); (b) the
   per-ubatch routing/reduction tail (B's weighted-expert-sum/concat
   graph fusions; A's tail unfused outside WS4 hyperconn coverage) — not
   yet requested; (c) re-derive the A-vs-B gap on the new default (B
@@ -107,7 +121,9 @@ Reality pass: 2026-09-05.
 - (e) gfx1100/gfx1201 deferred validation: the gdn NW16 retune (376f02aa0, patch 20/21) needs
   launch-fitness on gfx1100 (~106K VGPRs/CU vs possibly 64K classic -> revert to NW8
   constants if it fails); split_j/config + quantize-chunk + fattn row also re-check on other
-  arches. Small code change ONLY if hardware testing fails.
+  arches. Small code change ONLY if hardware testing fails.  MOVED to
+  `wip/qwen4exp/gfx1201-porting.md` (Phase 1 = gfx1201 RDNA4 port/tune; Phase 4 = gfx1100
+  env opt-in + fingon campaign).
 - NOT worth pursuing: decode fq-inline-quantize port (wash-to-negative - A already launches
   fewer kernels/step and sits at wall parity); GDN +72 launches (cosmetic).
 
@@ -132,6 +148,16 @@ Reality pass: 2026-09-05.
   fusion-surface diffs (architecture).
 - Open leads: (a) quality-gate the fused topk and adopt if it validates (~0.5% + B-alignment);
   (c) GDN +72 launches (2-kernel split) cosmetic post-NW16.
+
+### RDNA3 (gfx1100) qwen4exp opt-in ungating — design open (maintainer 2026-09-06)
+- The gfx1100 box (fingon) is a single 24 GiB GPU — the 87 GiB IQ4_XS model cannot load
+  there; validation is light, on small models (Qwen3.6-35B-A3B class).  Working plan: an
+  env-level opt-in that un-gates the gfx1151 work for gfx1100/RDNA3 (community members with
+  RDNA3 capacity opt in; default = llama.cpp's slower plain qwen4exp support).  Safety
+  audit of what may be un-gated (validated on gfx1100: block-13 fused MoE MMQ + QSA decode;
+  needs gfx1100 checks: GDN NW16 scan launch fitness ~106K VGPRs, split_j/config,
+  quantize chunk, routed compact, hc hyperconn + PLE/weighted-down) + the short fingon
+  campaign are Phase 4 of `wip/qwen4exp/gfx1201-porting.md`.
 
 ### Upstream monitor: ROCm unaligned-width split-load (Q6_K/Q3_K 2-GPU)
 - Upstream bug: H2D 2D copies whose width is not a multiple of 4 (Q6_K
@@ -167,6 +193,20 @@ Reality pass: 2026-09-05.
   `HANDOVER-2026-09-04-tiering.md` (wip = experimental, not delivery).
 
 ## Closed (one-liners; details in the dated docs)
+
+- 2026-09-06 sched-gate fix (fork `c63f7f2a0`, delivery `d6eb551`) validated on BOTH
+  arches: gfx1201 clean-box tensor-split A/B 3/3 no-hang pp8192 ub2048 at 2130-2156 t/s
+  (pre-reboot pass-once-then-flake = degraded-box artifact; no bisect, no gate change),
+  decode tg128 49.1; gfx1151 same-session parity vs the pre-fix campaign build (±0.6%
+  all rows, campaign anchors reproduced) + pure-gate pair (627506c1c ungated vs
+  `c63f7f2a0` gated) same-seed text BYTE-IDENTICAL + perf parity — the gate is inert at
+  1 async device.  Coherence note: delivery qwen4exp text vs pre-re-base builds differs by
+  upstream GDN-norm fix `5fdfa6282` (in the `465e49b9c` re-base), NOT the gate.  Records:
+  `beta/qwen4exp/README.md` (2026-09-06 bullet), `beta/qwen4exp/HALO_HANDOFF.md`,
+  `wip/qwen4exp/gfx1201-porting.md`.
+- 2026-09-06 IQ3_XXS / IQ4_XS shard-1 "truncation" = non-issue: shard 1 is a
+  metadata-only 10.9 MB first shard (n_tensors=0); on-disk sizes match the HF tree
+  byte-for-byte; no re-download.
 
 - 2026-09-06 WS4 Strix Halo (gfx1151) gates PASSED on the final
   qwen4exp build (branch tip 248e47704 = beta base + the WS4 commit):
