@@ -44,3 +44,20 @@ conflicted over the amended blocks). Regenerated as `diff(full-amended-blocks st
   from aborted runs must be checked (`pkill llama-cli`/`llama-bench`) before GPU runs.
 - Recorded in `wip/archive/qwen4exp/` (post-2026-09-13 dated records live there per the
   archive convention).
+
+## Qwen3.6-35B-A3B Q8_0 same-session ladder A vs B (follow-up)
+
+The web page's community numbers were measured on a faster machine; on THIS box the
+machine-local ladder (r3, warm cache, A/B interleaved) shows A >= B everywhere:
+
+| row | A (Big-13) | B (strix) | A/B |
+|---|---|---|---|
+| pp512 | 1911.4 | 1824.6 | 1.048 |
+| pp1024 | 2222.3 | 2143.7 | 1.037 |
+| pp2048 | 2335.4 | 2306.9 | 1.012 (bracket: A 2335.4 ± 0.2%, B 2306.9) |
+| pp4096 | 2281.6 | 2274.4 | 1.003 |
+| pp8192 | 2176.6 | 2125.8 | 1.024 |
+| tg128 | 52.4 | 51.6 | 1.016 |
+
+Machine-state note: A pp2048 measured 2136 in the earlier stage-1 single-shot vs 2335 in
+this ladder = ~9% cross-session swing; same-session A/B is the only valid comparison.
