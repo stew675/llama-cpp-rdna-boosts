@@ -1,18 +1,114 @@
+diff --git a/src/models/models.h b/src/models/models.h
+index 4299546ab..1e234b4fe 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2363,6 +2363,7 @@ struct llama_model_qwen4exp : public llama_model_base {
+     }
+ 
+     class llm_graph_input_qsa;
++    class llm_graph_input_qsa_k;
+ 
+     void load_arch_hparams(llama_model_loader & ml) override;
+     void load_arch_tensors(llama_model_loader & ml) override;
+@@ -2413,7 +2414,16 @@ struct llama_model_qwen4exp : public llama_model_base {
+         // so the layers sharing a ratio share one input set
+         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+ 
++        // store-only input for the dense shortcut (below the selection width the indexer keys
++        // are still cached so scoring can start seamlessly when the context passes the budget)
++        llm_graph_input_qsa_k * qsa_k_inp = nullptr;
++
+         // QSA: token indices this layer's queries may attend to, or nullptr for dense
++        void build_qsa_store_k(
++  const llama_memory_hybrid_idx_context * mctx_hyb,
++                    ggml_tensor * cur,
++                            int   il);
++
+         ggml_tensor * build_qsa_top_k(
+   const llama_memory_hybrid_idx_context * mctx_hyb,
+                     ggml_tensor * cur,
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index ff9bd8dbd..9537a2609 100644
+index c70228e1e..9537a2609 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -1215,16 +1215,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
-         const int64_t r     = hparams.dsv4_compress_ratios[il];
-         const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
-         const int64_t width = (int64_t) hparams.indexer_top_k + r - 1;
--        // LLAMA_QSA_DENSE_SHORTCUT: opt-in dense shortcut below the selection width.
--        // Default OFF on A pending a llama-bench-only multi-ubatch artifact (pp4096+@0 rows
--        // run slower in llama-bench with the shortcut on, while llama-cli/llama-server
--        // prefill is neutral-or-faster and tg@0/pp512-2048 are +3-5%): the deep-row host
--        // cost needs a llama.cpp graph-lifecycle root cause before a default flip. B
--        // (halo-box) defaults this ON; the env name matches B for cross-testing. =0 forces
--        // the selection path (the known-good numerics) either way.
+@@ -831,6 +831,56 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
+     return ggml_mul(ctx0, normalized, gated);
+ }
+ 
++// store-only subset of the QSA layout inputs: the dense shortcut below the selection width still
++// caches this ubatch's raw indexer keys (build_input_k_idxs + cpy_k), so scoring can start
++// seamlessly once the context passes top_k + ratio - 1
++class llama_model_qwen4exp::llm_graph_input_qsa_k : public llm_graph_input_i {
++public:
++    llm_graph_input_qsa_k(const llama_memory_hybrid_idx_context * mctx) : mctx(mctx) {}
++    virtual ~llm_graph_input_qsa_k() = default;
++
++    void set_input(const llama_ubatch * ubatch) override {
++        mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
++    }
++
++    bool can_reuse(const llm_graph_params & params) override {
++        mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
++
++        const auto * idx = mctx->get_idx();
++        if (idx == nullptr) {
++            return false;
++        }
++
++        return k_idxs->ne[0] == params.ubatch.n_tokens;
++    }
++
++    ggml_tensor * k_idxs = nullptr;   // I32 [n_tokens]
++
++    const llama_memory_hybrid_idx_context * mctx;
++};
++
++void llama_model_qwen4exp::graph::build_qsa_store_k(
++        const llama_memory_hybrid_idx_context * mctx_hyb,
++        ggml_tensor *                           cur,
++        int                                     il) {
++    const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
++
++    const int64_t idx_dim = hparams.indexer_head_size;
++
++    if (qsa_k_inp == nullptr) {
++        auto inp = std::make_unique<llm_graph_input_qsa_k>(mctx_hyb);
++        inp->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
++        qsa_k_inp = inp.get();
++        res->add_input(std::move(inp));
++    }
++
++    ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
++    k_raw = ggml_reshape_3d(ctx0, k_raw, idx_dim, 1, n_tokens);
++    cb(k_raw, "indexer_k_raw", il);
++
++    ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, qsa_k_inp->k_idxs, il));
++}
++
+ // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
+ // one mean-pooled indexer key scores each block; set_input resolves the cache layout
+ class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
+@@ -1152,10 +1202,41 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+     const int64_t n_embd_head = hparams.n_embd_head_v();
+     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+ 
+-    // indexer reads the same block input as q/k/v; no cache or no ratio means dense
+-    const bool qsa = mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+-
+-    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il) : nullptr;
++    // indexer reads the same block input as q/k/v; no context (the MTP draft attends dense,
++    // see build_layer_attn's caller in graph_mtp), no cache, or no ratio means dense
++    const bool qsa = mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
++
++    ggml_tensor * top_k = nullptr;
++    if (qsa) {
++        // The selection keeps min(n_kv, top_k + ratio - 1) cells. While the cache holds no more
++        // cells than that, every cell is selected and the top-k mask is a no-op on the causal
++        // mask, so attend dense (same result) and only store this ubatch's indexer keys for
++        // when the context grows past the budget. Mirrors the reference "seqlen <= topk" path.
++        const int64_t r     = hparams.dsv4_compress_ratios[il];
++        const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
++        const int64_t width = (int64_t) hparams.indexer_top_k + r - 1;
 +        // LLAMA_QSA_DENSE_SHORTCUT: dense shortcut below the selection width, DEFAULT ON (B parity;
 +        // the env name matches B for cross-testing). It was opt-in default OFF while a llama-bench-
 +        // only multi-ubatch artifact (pp4096+@0 rows slower with the shortcut on) lacked a root
@@ -25,10 +121,16 @@ index ff9bd8dbd..9537a2609 100644
 +        // LLAMA_QSA_SPARSE_FA=0 masked-dense path (the difference from the selection default is the
 +        // known dense-vs-sparse kernel signature, an env-selectable regime). =0 forces the selection
 +        // path (the pre-flip known-good numerics) either way.
-         static const bool shortcut = [] {
-             const char * env = getenv("LLAMA_QSA_DENSE_SHORTCUT");
--            return env != nullptr && atoi(env) != 0;
++        static const bool shortcut = [] {
++            const char * env = getenv("LLAMA_QSA_DENSE_SHORTCUT");
 +            return env == nullptr || atoi(env) != 0;
-         }();
-         if (shortcut && n_kv <= width) {
-             build_qsa_store_k(mctx_hyb, cur, il);
++        }();
++        if (shortcut && n_kv <= width) {
++            build_qsa_store_k(mctx_hyb, cur, il);
++        } else {
++            top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il);
++        }
++    }
+ 
+     // Qwen3Next uses a single Q projection that outputs query + gate
+     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]

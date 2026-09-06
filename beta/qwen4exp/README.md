@@ -63,12 +63,14 @@ WS3 #2 artifact fix (`fcfb0a522`) + the shortcut default flip
 `a18e24f97`; patch 9 (ws5-ple-host-gather) adds `32680d937`. The managed
 reader's batched cold-page fetch (`b004e9744`) is folded INTO patch 1
 (`managed-ngrams.patch`), so patch 1 carries the reader at its final
-state and patch 2 no longer touches `llama-lazy-reader.*`.
+state and patch 2 no longer touches `llama-lazy-reader.*`. The shortcut feature
+ships in its FINAL form in patch 7 (the superseded opt-in commit
+`151798ed2` is folded into `1682d32a9`'s default-ON flip, so patch 7
+introduces the dense shortcut already default-ON).
 
-Each patch is validated to clean-apply at its own parent state (the
-series is a staged collection to be squashed onto the base later; it is
-not expected to apply from-scratch in one pass because patch 1-2 carry
-post-apply drift by design).
+The full nine-patch series applies from scratch with plain `git apply`
+on the rdna-boosts core base and reproduces the qwen4exp branch tip
+`b004e9744` byte-identically (re-verified 2026-09-11 after the folds).
 
 The 2026-09-04 re-base re-applied the first two patches onto the current
 master (39 commits of upstream drift past the old base) and resolved the
@@ -227,10 +229,13 @@ NOTE: core-ggml, arch-agnostic; multi-GPU / pipeline-parallel not
 exercised here (ordering argument holds per-device) — candidate for an
 upstream PR at the maintainer's discretion.
 
-### 7. `ws3-shortcut-default-on.patch` (2026-09-10)
+### 7. `ws3-shortcut-default-on.patch` (2026-09-10, refolded 2026-09-11)
 
-qwen4exp QSA dense shortcut (commit `1682d32a9`) DEFAULT ON (B
-parity), enabled by patch 6: while `n_kv <= indexer_top_k + ratio - 1`
+qwen4exp QSA dense shortcut DEFAULT ON (B parity), shipped in its FINAL
+form: the superseded opt-in commit `151798ed2` (skipped from the
+series) is folded into the default-ON flip `1682d32a9`, so this patch
+introduces the feature already default-ON instead of flipping code the
+series never added. Enabled by patch 6: while `n_kv <= indexer_top_k + ratio - 1`
 (= 2051 here) the QSA layers attend dense (`build_attn`) + store-only
 indexer keys; past the budget the indexer scoring + sparse kernel run
 exactly as before. The llama-bench artifact that kept it opt-in is
@@ -242,6 +247,37 @@ env name matches B for cross-testing. Numerics below the width = the
 `LLAMA_QSA_SPARSE_FA=0` masked-dense path (text-identical); the
 dense-vs-sparse kernel signature difference vs the selection default
 is the documented env-selectable regime.
+
+### 8. `ws3-weighted-down-fusion.patch` (2026-09-10)
+
+Decode MoE weighted-down fusion (commit `a18e24f97`): collapses
+`mul_mat_id -> mul(weights) -> 10 views -> 9 adds` (21 nodes) into one
+kernel with the weights in the GEMM epilogue (rn mul / rn add).
+Shape-fingerprinted (w [640,2560,512] IQ4_NL/Q8_0, ids 10, dst 2560 =
+single token => decode-only). Text fused ==
+`GGML_CUDA_DISABLE_WEIGHTED_DOWN=1`; tg128@d12288 +1.3%, tg@0 ~flat,
+depth-0 pp unchanged. Record:
+`benchmarks/2026-09-10-strix-halo-gfx1151-weighted-down-fusion.md`.
+
+### 9. `ws5-ple-host-gather.patch` (2026-09-11)
+
+Prefill root-cause fix (commit `32680d937`): the PLE n-gram table
+(`per_layer_token_embd`, 28.8 GB IQ4_NL, input-layer = CPU-pinned) was
+gathered by a single-threaded CPU `get_rows` whose random 4 KB mmap
+pages faulted one at a time (~120-170 us each; 2.7 s per 2048-token
+ubatch = 16 heads x 2048 rows). When the table buffer is host (and no
+managed lazy reader), `build_inp_ple` now feeds an F32 graph input and
+`set_input` dequantizes the rows (same to_float as the CPU get_rows)
+after batching every distinct page into one `madvise(MADV_WILLNEED)`
+sweep - no CPU graph split, no serial page faults. DEFAULT ON;
+`LLAMA_QSA_PLE_HOSTGATHER=0` restores the old graph path
+(byte-identical text verified). Same-session depth-0 r3 vs B: pp16384
+626 vs 600 (A WINS), pp8192 637 vs 679, pp4096 646 vs 734, pp2048 655
+vs 776 (was 400/1.93x), pp1024 643 vs 731, pp512 591 vs 645, tg128
+25.95 vs 26.01 (parity). Records:
+`benchmarks/2026-09-11-strix-halo-gfx1151-prefill-ple-host-gather.md`
+(+ the managed-path follow-up `...-managed-ple-batched-fetch.md`, which
+is folded into patch 1).
 
 ## Apply
 
@@ -257,16 +293,19 @@ git apply ws4-hc-prefill-fusions.patch
 git apply ws3-routed-moe-mmq.patch
 git apply ggml-sched-fallback-sync.patch
 git apply ws3-shortcut-default-on.patch
+git apply ws3-weighted-down-fusion.patch
+git apply ws5-ple-host-gather.patch
 ```
 
-All seven patches apply clean with plain `git apply` on that base
-(patch 4 re-verified 2026-09-06: applied tree byte-identical to the
-qwen4exp branch tip `248e47704`; patch 5 re-verified 2026-09-08:
-applied on `248e47704` tree-identical to the qwen4exp branch tip
-`a1121cf2d`'s mmq.cuh, i.e. exactly the WS3 #3 delta; patches 6-7
-re-verified 2026-09-10 on `a1121cf2d`: applied tree byte-identical to
-the qwen4exp branch tip `1682d32a9`; patches 1-3 re-verified
-2026-09-04 on the same base). If master drifts further,
+All nine patches apply clean with plain `git apply` from scratch on
+that base (re-verified 2026-09-11: applied tree byte-identical to the
+qwen4exp branch tip `b004e9744`). Per-patch verifications that
+predate the folds: patch 4 re-verified 2026-09-06 (byte-identical to
+`248e47704`); patch 5 re-verified 2026-09-08 (applied on `248e47704`
+tree-identical to `a1121cf2d`'s mmq.cuh, i.e. exactly the WS3 #3
+delta); patches 6-7 re-verified 2026-09-10 on `a1121cf2d` (applied
+tree byte-identical to `1682d32a9`); patches 1-3 re-verified
+2026-09-04 on the same base. If master drifts further,
 `git apply --3way` (or a manual resolve on the qwen4exp.cpp attention
 path) is the fallback — the patch pre-images now match the current
 master-based files, so drift has to overlap the patched regions again
