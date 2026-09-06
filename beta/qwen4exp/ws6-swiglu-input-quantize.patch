@@ -1,0 +1,226 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 6849f2fad..e3740f1ca 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3738,6 +3738,44 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    // swiglu -> mul_mat_q: fold silu(gate)*up into the mmq activation quantize (the qwen4exp
++    // MoE down feed; the GLU output is never materialized). mmq only engages at prefill, so
++    // the decode MoE tails keep their own fusions.
++    if (node->op == GGML_OP_GLU && i + 1 < cgraph->n_nodes && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && node->src[1]) {
++        ggml_tensor * next = cgraph->nodes[i + 1];
++        const bool has_ids = next->op == GGML_OP_MUL_MAT_ID;
++        if (has_ids || next->op == GGML_OP_MUL_MAT) {
++            const ggml_tensor * weights = next->src[0];
++            const ggml_tensor * ids = has_ids ? next->src[2] : nullptr;
++            const ggml_tensor * gate = node->src[0];
++            const ggml_tensor * up = node->src[1];
++            const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
++            const int64_t mmq_cols = has_ids ? node->ne[2] : node->ne[1];
++            const int64_t n_experts = has_ids ? weights->ne[2] : 0;
++            const bool bad_padding_clear = ggml_backend_buffer_get_usage(weights->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
++                ggml_nbytes(weights) != ggml_backend_buffer_get_alloc_size(weights->buffer, weights) && weights->view_src;
++
++            const bool target_qwen36 = node->ne[0] == 512 && next->ne[0] == 2048 &&
++                (!has_ids || (gate->ne[1] == 8 && weights->ne[2] == 256));
++            const bool target_qwen4exp = node->ne[0] == 640 && next->ne[0] == 2560 &&
++                (!has_ids || (gate->ne[1] == 10 && weights->ne[2] == 512));
++            const bool target_shape = target_qwen36 || target_qwen4exp;
++            const bool weight_type_ok = weights->type == GGML_TYPE_Q8_0 ||
++                (target_qwen4exp && weights->type == GGML_TYPE_IQ4_NL);
++            const bool shape_ok = target_shape && next->src[1] == node && gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 &&
++                node->type == GGML_TYPE_F32 && next->type == GGML_TYPE_F32 && weight_type_ok &&
++                ggml_are_same_shape(gate, up) && ggml_are_same_shape(gate, node) && gate->nb[0] == sizeof(float) && up->nb[0] == sizeof(float) &&
++                gate->ne[3] == 1 && (has_ids ? gate->ne[1] == ids->ne[0] && gate->ne[2] == ids->ne[1] : gate->ne[2] == 1);
++            const bool use_mmq = shape_ok && !bad_padding_clear && GGML_CUDA_CC_IS_RDNA3_5(cc) &&
++                ggml_cuda_should_use_mmq(weights->type, cc, mmq_cols, n_experts);
++
++            if (use_mmq && ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, next->op }, { i + 1 })) {
++                ggml_cuda_mul_mat_q_swiglu(*cuda_ctx, weights, ids, next, node);
++                return 1;
++            }
++        }
++    }
++
+     //topk-moe
+     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
+             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index bf9c6c265..1ae7fe805 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -111,7 +111,7 @@ static void ggml_cuda_mul_mat_q_switch_type_gate(ggml_backend_cuda_context & ctx
+ 
+ void ggml_cuda_mul_mat_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+-        const ggml_cuda_mm_fusion_args_host * fusion) {
++        const ggml_cuda_mm_fusion_args_host * fusion, const ggml_tensor * swiglu) {
+     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+@@ -130,6 +130,14 @@ void ggml_cuda_mul_mat_q(
+     GGML_ASSERT(        nb0        == ts_dst);
+     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
+ 
++    const ggml_tensor * gate = swiglu ? swiglu->src[0] : nullptr;
++    const ggml_tensor * up   = swiglu ? swiglu->src[1] : nullptr;
++    if (swiglu) {
++        GGML_ASSERT(src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_IQ4_NL);
++        GGML_ASSERT(gate && up && gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32);
++        GGML_ASSERT(ggml_are_same_shape(gate, up) && ggml_are_same_shape(gate, src1));
++    }
++
+     const char  * src0_d = (const char  *) src0->data;
+     const float * src1_d = (const float *) src1->data;
+     float       *  dst_d = (float       *)  dst->data;
+@@ -180,6 +188,12 @@ void ggml_cuda_mul_mat_q(
+                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                                         ne11, ne12, ne13, stream);
+ 
++            } else if (swiglu) {
++                quantize_mmq_q8_1_swiglu_cuda(
++                    (const float *) gate->data, (const float *) up->data, nullptr, src1_q8_1.get(), src0->type,
++                    ne10, ne10_padded, ne11 * ne12 * ne13, /*logical_n1=*/1,
++                    gate->nb[1] / sizeof(float), gate->nb[1] / sizeof(float),
++                    up->nb[1] / sizeof(float), up->nb[1] / sizeof(float), stream);
+             } else {
+                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                                        ne11, ne12, ne13, stream);
+@@ -257,6 +271,12 @@ void ggml_cuda_mul_mat_q(
+                 quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
+                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+             }
++        } else if (swiglu) {
++            quantize_mmq_q8_1_swiglu_cuda(
++                (const float *) gate->data, (const float *) up->data, ids_src1.get(), src1_q8_1.get(), src0->type,
++                ne10, ne10_padded, ne11_flat, n_expert_used,
++                gate->nb[1] / sizeof(float), gate->nb[2] / sizeof(float),
++                up->nb[1] / sizeof(float), up->nb[2] / sizeof(float), stream);
+         } else if (dedup_bcast) {
+             quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
+                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
+@@ -300,6 +320,11 @@ void ggml_cuda_mul_mat_q(
+     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+ }
+ 
++void ggml_cuda_mul_mat_q_swiglu(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * swiglu) {
++    ggml_cuda_mul_mat_q(ctx, src0, swiglu, ids, dst, nullptr, swiglu);
++}
++
+ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+ #ifdef GGML_CUDA_FORCE_CUBLAS
+     return false;
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index d1f47b050..8b12f53c3 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1921,6 +1921,9 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+ 
+ void ggml_cuda_mul_mat_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+-        const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
++        const ggml_cuda_mm_fusion_args_host * fusion = nullptr, const ggml_tensor * swiglu = nullptr);
++
++void ggml_cuda_mul_mat_q_swiglu(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * swiglu);
+ 
+ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+diff --git a/ggml/src/ggml-cuda/quantize.cu b/ggml/src/ggml-cuda/quantize.cu
+index bcc772395..0a97cf2ed 100644
+--- a/ggml/src/ggml-cuda/quantize.cu
++++ b/ggml/src/ggml-cuda/quantize.cu
+@@ -602,6 +602,75 @@ void quantize_mmq_q8_1_cuda(
+     }
+ }
+ 
++static __global__ void quantize_mmq_q8_1_swiglu(
++        const float * __restrict__ gate, const float * __restrict__ up, const int32_t * __restrict__ ids,
++        void * __restrict__ vy, const int64_t ne00, const int64_t ne0, const int ne1, const int logical_n1,
++        const int64_t gate_s1, const int64_t gate_st, const int64_t up_s1, const int64_t up_st) {
++    const int64_t i0 = ((int64_t) blockDim.x * blockIdx.y + threadIdx.x) * 4;
++    if (i0 >= ne0) {
++        return;
++    }
++
++    const int64_t logical_row = ids ? ids[blockIdx.x] : blockIdx.x;
++    const int64_t slot = logical_row % logical_n1;
++    const int64_t token = logical_row / logical_n1;
++    const int64_t gate_base = token * gate_st + slot * gate_s1;
++    const int64_t up_base = token * up_st + slot * up_s1;
++
++    ggml_cuda_pdl_sync();
++    float values[4];
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        if (i0 + i < ne00) {
++            volatile float value = ggml_cuda_op_silu_single(gate[gate_base + i0 + i]) * up[up_base + i0 + i];
++            values[i] = value;
++        } else {
++            values[i] = 0.0f;
++        }
++    }
++    const float4 xi = make_float4(values[0], values[1], values[2], values[3]);
++
++    float amax = fabsf(xi.x);
++    amax = fmaxf(amax, fabsf(xi.y));
++    amax = fmaxf(amax, fabsf(xi.z));
++    amax = fmaxf(amax, fabsf(xi.w));
++#pragma unroll
++    for (int offset = 4; offset > 0; offset >>= 1) {
++        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
++    }
++
++    const float d_inv = amax == 0.0f ? 0.0f : 127.0f / amax;
++    char4 q;
++    q.x = roundf(xi.x * d_inv);
++    q.y = roundf(xi.y * d_inv);
++    q.z = roundf(xi.z * d_inv);
++    q.w = roundf(xi.w * d_inv);
++    const float d = amax == 0.0f ? 0.0f : 1.0f / d_inv;
++
++    block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
++    const int64_t k_block = i0 / QK8_1_MMQ;
++    const int64_t iqs = i0 % QK8_1_MMQ;
++    const int64_t ib = k_block * ne1 + blockIdx.x;
++    ((char4 *) y[ib].qs)[iqs / 4] = q;
++    if (iqs % 32 == 0) {
++        y[ib].d4[iqs / 32] = d;
++    }
++}
++
++void quantize_mmq_q8_1_swiglu_cuda(
++        const float * gate, const float * up, const int32_t * ids, void * vy, const ggml_type type_src0,
++        const int64_t ne00, const int64_t ne0, const int64_t ne1, const int logical_n1,
++        const int64_t gate_s1, const int64_t gate_st, const int64_t up_s1, const int64_t up_st, cudaStream_t stream) {
++    GGML_ASSERT(mmq_get_q8_1_ds_layout(type_src0) == MMQ_Q8_1_DS_LAYOUT_D4);
++    GGML_ASSERT(ne00 % 4 == 0);
++    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
++    const int64_t block_num_y = (ne0 + 4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4 * CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
++    const dim3 num_blocks(ne1, block_num_y, 1);
++    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
++    quantize_mmq_q8_1_swiglu<<<num_blocks, block_size, 0, stream>>>(
++        gate, up, ids, vy, ne00, ne0, ne1, logical_n1, gate_s1, gate_st, up_s1, up_st);
++}
++
+ // scatter=true reuses the quant kernel: grid over tokens, ids = inverse map (token slot -> compact row)
+ void quantize_scatter_mmq_q8_1_cuda(
+         const float * x, const int32_t * ids_src1_inv, void * vy, const ggml_type type_src0,
+diff --git a/ggml/src/ggml-cuda/quantize.cuh b/ggml/src/ggml-cuda/quantize.cuh
+index 5f08dcbfe..a4a0b7010 100644
+--- a/ggml/src/ggml-cuda/quantize.cuh
++++ b/ggml/src/ggml-cuda/quantize.cuh
+@@ -26,6 +26,11 @@ void quantize_mmq_q8_1_cuda(
+         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+ 
++void quantize_mmq_q8_1_swiglu_cuda(
++        const float * gate, const float * up, const int32_t * ids, void * vy, ggml_type type_src0,
++        int64_t ne00, int64_t ne0, int64_t ne1, int logical_n1,
++        int64_t gate_s1, int64_t gate_st, int64_t up_s1, int64_t up_st, cudaStream_t stream);
++
+ void quantize_mmq_fp4_cuda(const float *   x,
+                              const int32_t * ids,
+                              void *          vy,

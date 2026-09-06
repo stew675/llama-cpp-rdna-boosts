@@ -52,7 +52,7 @@ HIP_VISIBLE_DEVICES=0,1,2 GGML_CUDA_FA_WMMA_256=0 \
 
 ## Contents
 
-Nine squashed patch files. They apply IN ORDER on the rdna-boosts core
+Twelve squashed patch files. They apply IN ORDER on the rdna-boosts core
 = upstream master `8b4b3558f` + blocks 01-13 (re-based/regenerated
 2026-09-04 from the previous `9cffdcc80`-based `8f2838d1c` set).
 Applied together (patches 1-4) they reproduce the `qwen4exp` branch tip
@@ -61,7 +61,9 @@ Applied together (patches 1-4) they reproduce the `qwen4exp` branch tip
 WS3 #2 artifact fix (`a2f2a6ceb`) + the QSA dense shortcut (squashed
 commit `250e48e97`, DEFAULT ON) on top; patch 8 (ws3-weighted-down-
 fusion) adds `b31940a5e`; patch 9 (ws5-ple-host-gather) adds
-`8b62ac25a`. The managed reader's batched cold-page fetch (`3cb9168be`)
+`8b62ac25a`; patches 10-12 (ws6 shared-path, 2026-09-11) add the LLAMA_QSA_OFF gate
+(`2f8864cc8`), the transposed-src1 concat port (`2bd516bab`) and the fused swiglu-input
+quantize port (`7a6a2e97b`). The managed reader's batched cold-page fetch (`3cb9168be`)
 is folded INTO patch 1 (`managed-ngrams.patch`), so patch 1 carries the
 reader at its final state and patch 2 no longer touches
 `llama-lazy-reader.*`.
