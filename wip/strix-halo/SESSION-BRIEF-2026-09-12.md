@@ -67,24 +67,29 @@ Progression of pp2048 across the session: 703.5 (mwr) -> 725.4 (split_j/config).
 
 ## NEXT (in order)
 
-1. Close pp1024-4096 (0.94-0.99x; pp2048 worst at 0.936). These are the fixed per-ubatch
-   costs. RE-DERIVE with a fresh same-session rocprof pair at pp2048 (A now vs B now - the
-   pre-fix deltas are stale; mul_mat_q is now at parity). Candidates from the stale profile:
-   quantize_mmq_q8_1 family (A ~0.71s vs B ~0.45s per 4-decode capture, +52% per call on
-   identical 1768+376 counts - still unexplained), k_bin_bcast/hc elementwise (+186ms capture),
-   flash_attn_ext (+86ms), Cijk (+55ms), moe_weighted_reduction now fixed, mm_ids fixed. Also
-   host per-ubatch submit + launches.
-2. Then re-derive depth-12k (was 1.17-1.55x behind pre-PLE-fix; check now) and depth-32k (was
-   A ahead) at -r 1 for B (B aborts under -r3 depth machinery), depth-0 pp16384 margin, and
-   the full pp512-16384 ladder + tg128 fresh.
-3. DECODE followup afterwards: tg128 parity now (25.91 vs 25.94); the decode work item is the
-   per-op kernel-mix + mmvq launch-bound profile at tg@0; B's decode advantage was historically
-   small and mostly closed by the PLE/shortcut fixes.
-4. gfx1201 (RDNA4) deferred validation - NOTE: gfx1201 uses mmq-config-rdna4.cuh (untouched);
-   the I>=nwarps*16 mma invariant from the defect likely applies there too - when the gfx1201
-   box arrives, check whether the split_j/1x1x0 config-validity reasoning transfers and
-   whether the rdna4 table has any I<nwarps*16 rows. Also consider reporting the latent
-   accumulator-overflow defect upstream (it needs a config-validity guard or split support).
+1. DECODE followup (the active item): depth-0 tg is at/near parity historically (25.91 vs
+   25.94 pre-GDN; this session's depth runs show A's tg AHEAD: 23.13 vs 22.02 @d12288, 20.94
+   vs 18.56 @d32768). The work item = per-op kernel-mix A-vs-B at tg@0 (single-token decode:
+   mmvq/mul_mat_vec_q, weighted_rdna3_5, hc_mix/hc_combine fused decode ops, the gathered
+   blk.47 tail) + the mmvq launch-bound profile. Note decode = n_tokens==1, so the prefill
+   work (GDN chunked, topk, Cijk) is all off-path. The recent same-session captures (Acijk/
+   Bcijk db files) already contain tg-side kernels if a pp2048+tg capture is needed - a fresh
+   -p 512 -n 128 -r 3 capture pair is the standard tg@0 profile. B's decode advantage was
+   historically small and mostly closed by the PLE/shortcut fixes; verify there is anything
+   left before deep-diving.
+2. TODO follow-ups (documented in TODO.md + the dated records, parked by design):
+   (a) MoE topk-moe fusion numerics fork - quality-gate the fused kernel (CPU ref + PPL/KL)
+       vs A's unfused chain (18.424 vs 18.690; B 18.086); adopt ~0.5% if it validates;
+   (b) ssm_alpha+ssm_beta single-walk fusion (graph restructure or loader-stacked weights,
+       ~0.3-0.6%, design in the cijk record);
+   (c) the +800 scale_f32/unary_op launch excess = hc elementwise fusion-window differences;
+   (d) mmq latent accumulator-overflow defect report upstream (I < nwarps*16 configs).
+3. gfx1201 (RDNA4) deferred validation - gfx1201 uses mmq-config-rdna4.cuh (untouched); the
+   I>=nwarps*16 mma invariant from the defect likely applies there too. ALSO the gfx11 scan's
+   NW16 retune (376f02aa0) needs gfx1100/1101 launch-fitness checks (~106K VGPRs/CU required
+   - the old 8-warp config fits 64K; revert the constants + mapping there if not).
+4. Re-verify the full patch series from-scratch when the next fork commit lands (currently 20
+   patches through 376f02aa0, delivery verified tip 20c17c1).
 
 ## Env toggles / knobs
 
