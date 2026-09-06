@@ -297,46 +297,31 @@ is folded into patch 1).
 
 ## Apply
 
-The qwen4exp series = 21 numbered patches applying IN ORDER on the base
-`da67bcb88` (rdna-boosts master + blocks 01-13, i.e. after
-`scripts/apply-all.sh`). Verified from scratch 2026-09-13: plain `git apply`
-of 01..21 in order on `da67bcb88` reproduces the qwen4exp fork tip
-`f5ac11903` byte-identically (0 diff lines).
+The qwen4exp delivery = **ONE patch** `qwen4exp-support.patch`, applying AFTER the 13
+top-level blocks on the fork base `8b4b3558f` (upstream master + rdna-boosts blocks
+0001-0013; 0002/0004/0008/0013 amended 2026-09-13 to absorb the model-neutral Strix kernel
+work). Verified from scratch 2026-09-13: plain `git apply` of blocks 0001..0013 (amended
+set) + `qwen4exp-support.patch` on `8b4b3558f` reproduces the qwen4exp fork tip `f5ac11903`
+byte-identically (0 diff lines).
 
 ```
-git checkout da67bcb88        # master + blocks 01-13 (or apply-all.sh on master)
-for p in 0{1..9}*.patch 1*.patch 2*.patch; do git apply $p; done   # 01..21 in order
+git checkout 8b4b3558f
+for p in patches/0001-*.patch ... patches/0013-*.patch; do git apply $p; done   # 13 blocks
+git apply beta/qwen4exp/qwen4exp-support.patch
 ```
 
-| # | patch | fork commit |
-|---|---|---|
-| 01 | managed-ngrams | 9a9ef9fd1 + 3cb9168be (merged; the managed-reader incl. the batched cold-page fetch refinement + the F32 fallback that qwen4exp-support carried in the lazy-reader file) |
-| 02 | qwen4exp-support | db92de3d3 (regenerated minus its lazy-reader hunks - those live in 01's cumulative lazy-reader delta) |
-| 03 | mtp-draft-support | dca0526a8 |
-| 04 | ws4-hc-prefill-fusions | 248e47704 |
-| 05 | ws3-routed-moe-mmq | 1da01fa67 |
-| 06 | ggml-sched-fallback-sync | a2f2a6ceb |
-| 07 | ws3-shortcut-default-on | 250e48e97 |
-| 08 | ws3-weighted-down-fusion | b31940a5e |
-| 09 | ws5-ple-host-gather | 8b62ac25a |
-| 10 | ws6-llama-qsa-off | 2f8864cc8 |
-| 11 | ws6-concat-transposed | 2bd516bab |
-| 12 | ws6-swiglu-input-quantize | 7a6a2e97b |
-| 13 | ws6-mmid-512x10 | 304114ba7 |
-| 14 | ws6-mwr-float4 | f33ffaca7 |
-| 15 | ws6-split-j-q8_0-i64 | 6d457634e |
-| 16 | ws6-quantize-chunk-q8-1-gfx1151 | 0a3a2b498 |
-| 17 | ws6-repeat-absorb-hc-combine | b987877d7 |
-| 18 | ws6-fattn-rdna-row-qinreg | e7eecb369 |
-| 19 | ws6-mmq-mul-mat-q-pair | 6a80b695c |
-| 20 | ws6-gdn-scan-nw16 | 376f02aa0 |
-| 21 | ws6-scale-unary | f5ac11903 |
+What the support patch contains (all qwen4exp/QSA-specific; the model-neutral MoE mmq /
+fattn / gdn / scale-unary kernel work now lives in the amended top-level blocks 0002/0004/
+0008/0013):
+- managed-reader base (lazy IO) + qwen4exp model support (QSA sparse FA, hc-mix, indexer)
+- mtp-draft support, WS4 hyperconn prefill fusions
+- sched-fallback-sync core-ggml fix (QSA-adjacent; upstream-PR candidate) + QSA
+  dense-shortcut (DEFAULT ON) + LLAMA_QSA_OFF gate
+- PLE host gather + weighted-down & mul_mat_q_pair try_fuse windows (their ggml-cuda.cu
+  context depends on the beta windows - why they could not fold top-level)
+- concat-transposed, mmid-512x10, repeat-absorb hc-combine absorb
 
-Patches 04-21 are 1:1 with their fork commits. Patches sharing files
-(ggml-cuda.cu: 04/08/12/17/19/21; qwen4exp.cpp: 02/07/09/10/17; mmq.cuh:
-05/12/15/19) are DISTINCT bit-identity-gated feature stages - kept separate
-on purpose for per-stage traceability and isolated numerics gates. If master
-drifts, `git apply --3way` is the fallback on the drifted hunks.
+Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.md`.
 
 ## Validation status (the gates this baseline holds)
 

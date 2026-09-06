@@ -1,62 +1,67 @@
-# qwen4exp WIP (Qwen3.8-Flash-Next, sparse attention / ITEM B)
+# qwen4exp delivery archive — 2026-09-13 restructuring
 
-Exploratory work on the **qwen4exp** (Qwen3.8-Flash-Next) path: sparse
-flash-attention via the new `GGML_OP_FLASH_ATTN_QSA` op, validated on
-3x Radeon AI PRO R9700 (gfx1201).
+Post-campaign archive after the patch-hygiene pass. The active delivery is:
 
-**Source of truth (the code):** the `qwen4exp` branch of
-`~/llama.cpp` (re-applied 2026-09-02 onto the 0eadefebd re-base +
-blocks 01-13, tip `0ff151bda`). ITEM B is committed there as the
-re-apply commit `0ff151bda` (cherry-pick of the protected
-`~/prs/llama.cpp` qwen4exp branch commits `e2d2a1f1c` op + `554691a72`
-kernel-opt; 1 conflict resolved: ggml-backend.cpp kept the upstream
-MUL_MAT alloc-expand case alongside the new FLASH_ATTN_QSA case). The
-old pre-re-base branch still lives at `~/prs/llama.cpp` `qwen4exp` @
-`554691a72` (protected, for reference/backup only). This directory
-holds the planning docs, handoffs and WIP patches that survive context
-compaction; the full history is in the handoffs.
+- `patches/` 0001-0013 (13 top-level blocks on upstream master; **0002/0004/0008/0013
+  amended 2026-09-13** to absorb the model-neutral Strix kernel work)
+- `beta/qwen4exp/qwen4exp-support.patch` (**ONE patch** — all qwen4exp-specific content)
 
-**Not part of the delivery patch set:** qwen4exp is a *model-architecture*
-work stream, separate from the MoE work shipped as block 13. It stays WIP
-here until ITEM B's latency work + packaging are done.
+**Verification (2026-09-13):** fresh worktree at `8b4b3558f` (the fork's master/block base)
++ blocks 0001..0013 (amended set) + `qwen4exp-support.patch`, plain `git apply` in order,
+reproduces the qwen4exp fork tip `f5ac11903` **byte-identically (0 diff lines)**. The fork
+(`~/llama.cpp` qwen4exp branch) keeps the full 22-commit history as the authoritative record.
 
-## Contents
+## Patch-history trail
 
-| File | What |
-|---|---|
-| `plan-qwen4exp.md` | The plan: sparse attention design, depth-constant prefill goal, kernel structure |
-| `handover-2026-09-02.md` | **CURRENT handover: repo/branch layout, ITEM B status, bench config, captured diffs, next work. READ THIS FIRST.** |
-| `handoff-2026-09-02-rebase-reapply.md` | ITEM B re-apply onto the 0eadefebd re-base (conflict + verification) |
-| `qwen4exp-handoff-2026-08-31.md` | Session 1 handoff: ITEM A, op design, validation methodology |
-| `qwen4exp-handoff-2026-08-31-session2.md` | Session 2 handoff: kernel optimization passes, L2 fix, head-sum fusion (reverted), measured curve |
-| `patches/0008-item-b-qsa-sparse-flash-attn.patch` | **ITEM B (the active op/kernel) - full diff, applies clean to rdna-boosts** |
-| `patches/0005-kv-prev-tokens-index.patch` | WIP: KV prev-tokens index query side (seq_pos map is already upstream via #27991) |
-| `patches/test-kv-prev-tokens.cpp` | Unit test for 0005 (compile standalone) |
-| `patches/0006-qsa-topk-radix-gpu.patch` | HISTORICAL ONLY: radix top-k, superseded by upstream #27466 |
-| `patches/0007-ple-batch-cache-archive.patch` | WIP: PLE batch cache (archived neutral) |
+### Fork chain (ground truth, `~/llama.cpp` qwen4exp branch)
 
-## ITEM B status (from handoff UPDATE 12)
+Base `8b4b3558f` (master) → 13 rdna-boosts block commits (b01 `ed5231b09` … b13
+`da67bcb88`) → 22 qwen4exp commits (e1 `9a9ef9fd1` … e22 `f5ac11903`).
 
-- **Committed:** `554691a72` on the qwen4exp branch — sparse QSA op +
-  tiled kernel + all-heads-per-block L2 fix.
-- **Depth-constant attention:** FLASH_ATTN_QSA 11.9 ms @64K vs dense
-  158 ms. Sparse vs dense: +6% @16K, +24% @32K, +56% @64K.
-- **Correctness:** inside llama.cpp's own kernel-variance envelope
-  (max diff 6.50 / top-1 84% vs the tile-vs-wmma control 7.28 / 84.8%).
-- **Remaining:** latency optimization (~35% GPU, per-warp serial chain,
-  ~3x headroom); packaging; handoff UPDATE 12+; fold back into
-  `rdna-boosts` afterwards.
+### Old delivery (superseded, archived in `patches-21-series-2026-09-13/`)
 
-## Where things live
+21 numbered patches applying on `da67bcb88` = one per fork commit (squashed e1+e10's
+lazy-reader split). Original files archived here.
 
-- Code (ACTIVE): `~/llama.cpp` branch `qwen4exp` @ `0ff151bda` (re-applied
-  onto 0eadefebd + blocks 01-13, 2026-09-02). The `rdna-boosts` branch
-  carries blocks 01-13 and does NOT include ITEM B; `qwen4exp` is
-  rdna-boosts + ITEM B. **Work ONLY on `qwen4exp`; never pollute
-  `rdna-boosts`.**
-- Code (protected reference): `~/prs/llama.cpp` branch `qwen4exp`
-  (checkpoints `d2548f9af` base, `e2d2a1f1c` op, `554691a72` kernel-opt).
-  Same binary is op-for-op identical to the current fork on the dense path.
-- Env toggles: `LLAMA_QSA_SPARSE_FA=1` (enable sparse),
-  `GGML_CUDA_QSA_IDENTITY=1` (validation), `GGML_CUDA_OP_TIMING=1`
-  (op timing, needs `-v`, disables CUDA graphs).
+### New delivery (2026-09-13 folds)
+
+Each piece folds into the *last* block owning its files (a fold's hunks need the file's
+final block state — hence `mmvq.cu`/`ggml-cuda.cu` folds land in 0013, not 0008):
+
+| fold piece (fork commit) | file deltas | absorbed by |
+|---|---|---|
+| gdn NW16 scan retune (376f02aa0) | gated_delta_net_chunked_bf16_gfx11.cu | **0002** |
+| fattn RDNA WMMA row (e7eecb369) | fattn-mma-f16.cuh | **0004** |
+| scale-unary fused kernel (f5ac11903) | unary.cu, unary.cuh | **0008** |
+| scale-unary try_fuse window (f5ac11903) | ggml-cuda.cu | **0013** |
+| routed-compact MoE mmq (1da01fa67) | mmq.cuh | **0013** |
+| swiglu-input quantize (7a6a2e97b) | mmq.cu/cuh, quantize.cu/cuh, ggml-cuda.cu | **0013** |
+| mwr float4 (f33ffaca7) | moe-weighted-reduction.cu | **0013** |
+| split_j + Q8_0 rows (6d457634e) | mmq-config-rdna3-5.cuh, mmq-vec-dot.cuh, mmq.cuh | **0013** |
+| quantize chunk (0a3a2b498) | mmq.cu, quantize.cu/cuh | **0013** |
+| mul_mat_q_pair kernel (6a80b695c) | mmq.cu/cuh | **0013** |
+| weighted-down mmvq kernel (b31940a5e) | mmvq.cu/cuh | **0013** |
+
+**Stayed in beta** (`qwen4exp-support.patch`): everything qwen4exp/QSA-specific —
+managed-reader base, qwen4exp support, mtp-draft, WS4 hc fusions, sched-fallback-sync
+(core ggml; QSA-adjacent, upstream-PR candidate), QSA shortcut, **weighted-down + pair
+try_fuse windows** (their ggml-cuda.cu context depends on beta-support windows), PLE,
+QSA_OFF gate, concat-transposed, mmid-512x10, repeat-absorb, mmvq glue.
+
+### Why 0013 and not 0008 for mmvq/ggml-cuda pieces
+
+Block ownership of a file determines where its later deltas can fold: `mmvq.cu` is owned by
+0008 *and* 0010 *and* 0013; `ggml-cuda.cu` by 0003/0006/0008/0011/0013. A folded delta's
+pre-image must equal the file's state at the fold point, which is only guaranteed at the
+**last** owning block. The scale-unary kernel itself (unary.cu/cuh, 0008-owned only) folded
+into 0008 while its try_fuse window (ggml-cuda.cu) went to 0013.
+
+## Directory map
+
+- `patches-21-series-2026-09-13/` — the pre-fold 21-patch numbered series (one per fork
+  commit; the intermediate stage before folding), archived verbatim.
+- `discovery/` — the dated Strix Halo investigation records + older session briefs moved
+  out of `benchmarks/` and `wip/strix-halo/` (kept: methodology/gate docs in `benchmarks/`,
+  the current `wip/strix-halo/SESSION-BRIEF-2026-09-12.md`, `TODO.md`).
+- Active follow-ups live in `TODO.md` (topk quality gate, ssm-pair, launch-ledger remainder,
+  mmq upstream report, gfx1100/1200 validation).
