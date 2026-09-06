@@ -52,7 +52,7 @@ HIP_VISIBLE_DEVICES=0,1,2 GGML_CUDA_FA_WMMA_256=0 \
 
 ## Contents
 
-Seventeen squashed patch files. They apply IN ORDER on the rdna-boosts core
+Eighteen squashed patch files. They apply IN ORDER on the rdna-boosts core
 = upstream master `8b4b3558f` + blocks 01-13 (re-based/regenerated
 2026-09-04 from the previous `9cffdcc80`-based `8f2838d1c` set).
 Applied together (patches 1-4) they reproduce the `qwen4exp` branch tip
@@ -68,7 +68,7 @@ moe_weighted_reduction (`f33ffaca7`), the split_j J/2 row split enabling B's Q8_
 config rows (`6d457634e` - see the latent-defect record) and the gfx1151-gated 2-slice chunk
 merge for the mmq q8_1 feed quantize (`0a3a2b498` - see the 2026-09-13 quantize-chunk record;
 n_chunks is a runtime arg from mmq.cu's cc, gated to gfx1151, byte-identical elsewhere) and the
-repeat-anchored hc_combine+norm fusion absorb (`b987877d7` - qwen4exp pins block_out/inject +
+fattn RDNA WMMA config row: B's Q_in_reg=false halo row for (256,256,64) (`e7eecb369` - flash_attn 11.7->9.54ms/call, pp2048 0.987->0.992x, pp4096/1024/512 now AHEAD; Q_in_reg=true was the 20% - see the 2026-09-06 flash-rdna record) and the repeat-anchored hc_combine+norm fusion absorb (`b987877d7` - qwen4exp pins block_out/inject +
 pre-expands the scale chain, the scheduler absorbs the standalone per-layer block_out REPEAT
 reading the narrow base; repeats 384->8/pass, pp2048 0.936x->0.987x vs B - see the same record). The managed reader's batched cold-page fetch (`3cb9168be`)
 is folded INTO patch 1 (`managed-ngrams.patch`), so patch 1 carries the
