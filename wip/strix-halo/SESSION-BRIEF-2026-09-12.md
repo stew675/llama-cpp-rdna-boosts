@@ -67,16 +67,15 @@ Progression of pp2048 across the session: 703.5 (mwr) -> 725.4 (split_j/config).
 
 ## NEXT (in order)
 
-1. DECODE followup (the active item): depth-0 tg is at/near parity historically (25.91 vs
-   25.94 pre-GDN; this session's depth runs show A's tg AHEAD: 23.13 vs 22.02 @d12288, 20.94
-   vs 18.56 @d32768). The work item = per-op kernel-mix A-vs-B at tg@0 (single-token decode:
-   mmvq/mul_mat_vec_q, weighted_rdna3_5, hc_mix/hc_combine fused decode ops, the gathered
-   blk.47 tail) + the mmvq launch-bound profile. Note decode = n_tokens==1, so the prefill
-   work (GDN chunked, topk, Cijk) is all off-path. The recent same-session captures (Acijk/
-   Bcijk db files) already contain tg-side kernels if a pp2048+tg capture is needed - a fresh
-   -p 512 -n 128 -r 3 capture pair is the standard tg@0 profile. B's decode advantage was
-   historically small and mostly closed by the PLE/shortcut fixes; verify there is anything
-   left before deep-diving.
+1. DECODE followup CLOSED (2026-09-06 session, record decode-verification): same-session
+   tg@0 = parity (A 25.97 vs B 26.00 r3; 0.999), at-depth tg AHEAD (23.13 vs 22.02 @d12288,
+   20.94 vs 18.56 @d32768). Per-op kernel mix (fresh rocprof pair /tmp/prof/tg-{A,B}.db):
+   A 266894 kernels vs B 305680 (A ~300 FEWER/step, less launch-bound; GPU-busy +1.7% nets to
+   wall parity); per-call A faster on the big families (iq4_nl_weighted 0.92x, gdn 0.97x,
+   k_get_rows 0.79-0.95x), slower only on sub-0.2%/step tiny ones (ssm_conv 1.17x, rms count
+   diff). Decode split is structurally different per tree (A = fused hc kernels + standalone
+   quantize 244/step; B = fq-inline-quantize mmvq 293/step) netting to the same wall. The old
+   TODO note 'tg@0 decode gap 24.2 vs 26.0' was pre-PLE/shortcut-era, now moot.
 2. TODO follow-ups (documented in TODO.md + the dated records, parked by design):
    (a) MoE topk-moe fusion numerics fork - quality-gate the fused kernel (CPU ref + PPL/KL)
        vs A's unfused chain (18.424 vs 18.690; B 18.086); adopt ~0.5% if it validates;
