@@ -1,0 +1,229 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 44b2a4aab..6849f2fad 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3622,6 +3622,51 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    // qwen4exp IQ4_NL/Q8_0 routed down projection followed by the 10-expert weighted sum (ported
++    // from halo-box/strix-llama.cpp): compute all selected experts for one output row in a wave and
++    // apply their routing weights immediately, avoiding the [n_embd, n_used] intermediate and its
++    // separate reduction launch. Hard opt-out (A/B, regression testing). Single-token only
++    // (n_tokens == 1, gate in ggml_cuda_mul_mat_id_weighted_rdna3_5_ok).
++    static const bool disable_weighted_down = getenv("GGML_CUDA_DISABLE_WEIGHTED_DOWN") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_WEIGHTED_DOWN"));
++    if (!disable_weighted_down && node->op == GGML_OP_MUL_MAT_ID && i + 20 < cgraph->n_nodes &&
++            cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
++        constexpr int n_used = 10;
++        constexpr int n_ops  = 2 + n_used + (n_used - 1);
++        ggml_tensor * mul = cgraph->nodes[i + 1];
++        const ggml_tensor * experts = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
++        const ggml_tensor * weights = experts == mul->src[0] ? mul->src[1] : mul->src[0];
++        const int output_idx = i + n_ops - 1;
++        ggml_tensor * output = cgraph->nodes[output_idx];
++        bool valid = experts == node && node->ne[1] == n_used &&
++            ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(experts, weights, output);
++
++        for (int j = 0; valid && j < n_used; ++j) {
++            const ggml_tensor * view = cgraph->nodes[i + 2 + j];
++            valid = view->op == GGML_OP_VIEW && view->src[0] == mul &&
++                view->ne[0] == mul->ne[0] && view->ne[1] == mul->ne[2] && view->ne[2] == 1 && view->ne[3] == 1 &&
++                view->nb[0] == sizeof(float) && view->nb[1] == mul->nb[2] && view->view_offs == size_t(j) * mul->nb[1];
++        }
++        const int add_start = i + 2 + n_used;
++        if (valid) {
++            const ggml_tensor * first = cgraph->nodes[add_start];
++            valid = first->op == GGML_OP_ADD && first->src[0] == cgraph->nodes[i + 2] && first->src[1] == cgraph->nodes[i + 3];
++        }
++        for (int j = 2; valid && j < n_used; ++j) {
++            const ggml_tensor * add = cgraph->nodes[add_start + j - 1];
++            valid = add->op == GGML_OP_ADD && add->src[0] == cgraph->nodes[add_start + j - 2] && add->src[1] == cgraph->nodes[i + 2 + j];
++        }
++        if (valid) {
++            std::vector<ggml_op> ops = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL };
++            ops.insert(ops.end(), n_used, GGML_OP_VIEW);
++            ops.insert(ops.end(), n_used - 1, GGML_OP_ADD);
++            const int out_nodes[] = { output_idx };
++            if (ggml_can_fuse_subgraph(cgraph, i, n_ops, ops.data(), out_nodes, 1) &&
++                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1)) {
++                ggml_cuda_mul_mat_id_weighted_rdna3_5(*cuda_ctx, experts, weights, output);
++                return n_ops - 1;
++            }
++        }
++    }
+ 
+     if (node->op == GGML_OP_MUL) {
+         ggml_moe_weighted_reduction_match match;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 2e16630a7..7e72ec6da 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -2510,3 +2510,152 @@ void ggml_cuda_op_mul_mat_vec_q(
+ 
+     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+ }
++
++// qwen4exp IQ4_NL/Q8_0 routed down projection fused with the 10-expert weighted sum (ported from
++// halo-box/strix-llama.cpp, ggml_cuda_mul_mat_id_weighted_rdna3_5): compute all selected experts
++// for one output row in a wave and apply their routing weights immediately, avoiding the
++// [n_embd, n_used] intermediate and its separate reduction launch. Single-token (n_tokens == 1)
++// only - gated by the _ok() shape checks. RDNA3.5 only (B parity).
++#if defined(__HIP_PLATFORM_AMD__)
++static __device__ __forceinline__ float mmvq_hc_mul_rn(const float a, const float b) {
++    float result;
++    asm("v_mul_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
++    return result;
++}
++
++static __device__ __forceinline__ float mmvq_hc_add_rn(const float a, const float b) {
++    float result;
++    asm("v_add_f32_e32 %0, %1, %2" : "=v"(result) : "v"(a), "v"(b));
++    return result;
++}
++#else
++static __device__ __forceinline__ float mmvq_hc_mul_rn(const float a, const float b) { return __fmul_rn(a, b); }
++static __device__ __forceinline__ float mmvq_hc_add_rn(const float a, const float b) { return __fadd_rn(a, b); }
++#endif
++
++template <int n_expert_used>
++__launch_bounds__(32, 8)
++static __global__ void mul_mat_id_iq4_nl_weighted_rdna3_5(
++        const void * vx_ptr, const block_q8_1 * y, const int32_t * ids, const float * weights, float * dst,
++        const int nrows, const int blocks_per_row, const int stride_row_x, const int stride_channel_x,
++        const int stride_y) {
++    constexpr int qi        = ggml_cuda_type_traits<GGML_TYPE_IQ4_NL>::qi;
++    constexpr int vdr       = VDR_Q4_0_Q8_1_MMVQ;
++    constexpr int warp_size = 32;
++    constexpr int blocks_per_iter = vdr * warp_size / qi;
++
++    const int lane = threadIdx.x;
++    const int row  = blockIdx.x;
++    if (row >= nrows) {
++        return;
++    }
++
++    float result = 0.0f;
++#pragma unroll
++    for (int ex = 0; ex < n_expert_used; ++ex) {
++        const int channel = ids[ex];
++        const int x_off = channel * stride_channel_x + row * stride_row_x;
++        float sum = 0.0f;
++        for (int kbx = lane / (qi/vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
++            const int kqs = vdr * (lane % (qi/vdr));
++            sum += vec_dot_iq4_nl_q8_1(vx_ptr, y + ex * stride_y + kbx, x_off + kbx, kqs);
++        }
++        sum = warp_reduce_sum<warp_size>(sum);
++        const float term = mmvq_hc_mul_rn(sum, weights[ex]);
++        result = ex == 0 ? term : mmvq_hc_add_rn(result, term);
++    }
++
++    if (lane == 0) {
++        dst[row] = result;
++    }
++}
++
++template <int n_expert_used>
++__launch_bounds__(32, 8)
++static __global__ void mul_mat_id_q8_0_weighted_rdna3_5(
++        const void * vx_ptr, const block_q8_1 * y, const int32_t * ids, const float * weights, float * dst,
++        const int nrows, const int blocks_per_row, const int stride_row_x, const int stride_channel_x,
++        const int stride_y) {
++    constexpr int qi        = QI8_0;
++    constexpr int vdr       = VDR_Q8_0_Q8_1_MMVQ;
++    constexpr int warp_size = 32;
++    constexpr int blocks_per_iter = vdr * warp_size / qi;
++
++    const int lane = threadIdx.x;
++    const int row  = blockIdx.x;
++    if (row >= nrows) {
++        return;
++    }
++
++    float result = 0.0f;
++#pragma unroll
++    for (int ex = 0; ex < n_expert_used; ++ex) {
++        const int channel = ids[ex];
++        const int x_off = channel * stride_channel_x + row * stride_row_x;
++        float sum = 0.0f;
++        for (int kbx = lane / (qi/vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
++            const int kqs = vdr * (lane % (qi/vdr));
++            sum += vec_dot_q8_0_q8_1(vx_ptr, y + ex * stride_y + kbx, x_off + kbx, kqs);
++        }
++        sum = warp_reduce_sum<warp_size>(sum);
++        const float term = mmvq_hc_mul_rn(sum, weights[ex]);
++        result = ex == 0 ? term : mmvq_hc_add_rn(result, term);
++    }
++
++    if (lane == 0) {
++        dst[row] = result;
++    }
++}
++
++bool ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(
++        const ggml_tensor * experts, const ggml_tensor * weights, const ggml_tensor * dst) {
++    if (experts->op != GGML_OP_MUL_MAT_ID ||
++            (experts->src[0]->type != GGML_TYPE_IQ4_NL && experts->src[0]->type != GGML_TYPE_Q8_0) ||
++            experts->src[1]->type != GGML_TYPE_F32 || experts->src[2]->type != GGML_TYPE_I32 ||
++            experts->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    const ggml_tensor * w   = experts->src[0];
++    const ggml_tensor * y   = experts->src[1];
++    const ggml_tensor * ids = experts->src[2];
++    const int64_t n_used = ids->ne[0];
++    return GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
++        n_used == 10 && w->ne[0] == 640 && w->ne[1] == 2560 && w->ne[2] == 512 && w->ne[3] == 1 &&
++        y->ne[0] == 640 && ggml_nelements(y) == 640 * n_used && ggml_is_contiguous(y) &&
++        ggml_nelements(ids) == n_used && ggml_is_contiguous(ids) &&
++        weights->ne[0] == 1 && weights->ne[1] == n_used && ggml_nelements(weights) == n_used && ggml_is_contiguous(weights) &&
++        ggml_nelements(experts) == 2560 * n_used && ggml_is_contiguous(experts) &&
++        ggml_nelements(dst) == 2560 && ggml_is_contiguous(dst);
++}
++
++void ggml_cuda_mul_mat_id_weighted_rdna3_5(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst) {
++    GGML_ASSERT(ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(experts, weights, dst));
++    const ggml_tensor * w   = experts->src[0];
++    const ggml_tensor * y   = experts->src[1];
++    const ggml_tensor * ids = experts->src[2];
++    constexpr int n_used = 10;
++    constexpr int ncols  = 640;
++    constexpr int nrows  = 2560;
++    constexpr int nblocks = ncols / QK8_1;
++
++    ggml_cuda_pool_alloc<block_q8_1> y_q8(ctx.pool(), n_used * nblocks);
++    quantize_row_q8_1_cuda(
++        (const float *) y->data, nullptr, y_q8.get(), w->type,
++        ncols,
++        y->nb[1] / sizeof(float), y->nb[2] / sizeof(float), y->nb[3] / sizeof(float),
++        y->ne[0], y->ne[1], y->ne[2], y->ne[3], ctx.stream());
++
++    const ggml_cuda_kernel_launch_params params(nrows, 32, 0, ctx.stream());
++    if (w->type == GGML_TYPE_IQ4_NL) {
++        ggml_cuda_kernel_launch(mul_mat_id_iq4_nl_weighted_rdna3_5<n_used>, params,
++            w->data, y_q8.get(), (const int32_t *) ids->data, (const float *) weights->data, (float *) dst->data,
++            nrows, nblocks, (int) (w->nb[1] / ggml_type_size(w->type)),
++            (int) (w->nb[2] / ggml_type_size(w->type)), nblocks);
++    } else {
++        ggml_cuda_kernel_launch(mul_mat_id_q8_0_weighted_rdna3_5<n_used>, params,
++            w->data, y_q8.get(), (const int32_t *) ids->data, (const float *) weights->data, (float *) dst->data,
++            nrows, nblocks, (int) (w->nb[1] / ggml_type_size(w->type)),
++            (int) (w->nb[2] / ggml_type_size(w->type)), nblocks);
++    }
++}
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index 1b8ea460d..4140f681a 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -39,3 +39,11 @@ void ggml_cuda_op_shexp_down_gate(
+     const ggml_tensor * w_gate, const ggml_tensor * x_gate,
+     const ggml_tensor * moe_out, const ggml_tensor * ffn_residual,
+     ggml_tensor * dst);
++
++// qwen4exp IQ4_NL/Q8_0 routed down projection fused with the 10-expert weighted sum (RDNA3.5,
++// single-token): ggml_cuda_mul_mat_id_weighted_rdna3_5_ok returns whether the graph pattern's
++// experts/weights/dst match the specialized kernel's shape fingerprint.
++bool ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(const ggml_tensor * experts, const ggml_tensor * weights, const ggml_tensor * dst);
++void ggml_cuda_mul_mat_id_weighted_rdna3_5(
++    ggml_backend_cuda_context & ctx,
++    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
