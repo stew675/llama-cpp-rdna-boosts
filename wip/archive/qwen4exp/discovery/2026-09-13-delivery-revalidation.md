@@ -103,3 +103,22 @@ Close option (defer): re-block A's Q8_0 J=128 tile toward B's 192-vgpr register 
 B's inner loop into A's mmq.cuh) ~1.3-1.5% dense-pp; needs bit-identity re-gate (mma order
 may shift). Data: /tmp/prof/q9{A,B}.db_results.db, /tmp/q9{A,B}-*.log, /tmp/d27*.log,
 /tmp/q36*.log.
+
+## Gemma4-26B-A4B Q8_0 (DIFFERENT architecture) same-session ladder A vs B
+
+Softmax-attention MoE (no GDN/QSA family) - the cross-architecture check. A wins every pp
+row; decode parity.
+
+| row | A (Big-13) | B (strix) | A/B |
+|---|---|---|---|
+| pp512 | 1921.0 | 1836.6 | 1.046 |
+| pp1024 | 2165.4 | 2090.0 | 1.036 |
+| pp2048 | 2101.1 | 2044.2 | 1.028 (bracket: A 2101.1 +/- 0.5%) |
+| pp4096 | 1899.9 | 1829.8 | 1.038 |
+| pp8192 | 1695.1 | 1622.0 | 1.045 |
+| tg128 | 44.39 | 44.75 | 0.992 (parity, within spread) |
+
+Read: the all-Q8_0 MoE paths A tuned hardest (routed-compact expert mmq, pair, split_j +
+config) carry over to a foreign architecture - the +2% dense-Q8_0-mmq kernel-body deficit
+seen on the dense 27B is diluted under the expert work where A leads. MoE + standard
+attention = A's strongest regime.
