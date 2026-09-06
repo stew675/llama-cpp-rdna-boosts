@@ -67,7 +67,22 @@ Progression of pp2048 across the session: 703.5 (mwr) -> 725.4 (split_j/config).
 
 ## NEXT (in order)
 
-1. DECODE followup CLOSED (2026-09-06 session, record decode-verification): same-session
+1. HC-ELEMENTWISE LAUNCH LEDGER item (c) ROOT-CAUSED + FIXED (fork f5ac11903, patch 21
+   ws6-scale-unary, record scale-unary-fusion): A's tree lacked the scale->unary (silu/
+   sigmoid) peek-ahead fusion B's dispatcher carries (no upstream model has qwen4exp's hc
+   low-rank gate silu(x/hc), so the try_fuse refactor dropped it). Ported ggml_cuda_op_
+   scale_unary + a 2-node window AFTER the big hc windows. Numerics: dst=op(scale*x+bias),
+   same expression -> logitcmp BIT-IDENTICAL (on and off). NO memory-ranges gate: kernel is
+   purely elementwise, in-place-safe (census: general check fails all 190 silu pairs - their
+   scale is in-place on the wide lo input; base-aligned whole-buffer reuse). Counts pp2048:
+   scale_f32 526->336, unary silu 192->2, scale_unary silu 190 + sigmoid 188 fire; kernels
+   7755->7565. Same-session: pp2048 +0.34%, pp512 +0.42% (fixed per-ubatch cost, biggest at
+   small pp). Opt-out GGML_CUDA_SCALE_UNARY=0. Remaining on this axis: +38 scale_f32 + deep
+   fusion-surface diffs (A fuses MORE scale_unary sigmoid 188 vs B 2; B's gated-silu 94 vs
+   A 0) - architecture, not window gaps. Then depth-0 all four rows at/above B (pp512 1.013-
+   1.026x, pp1024 1.014-1.024x, pp2048 1.002-1.006x, pp4096 1.009-1.018x same-session
+   ladders), depth-12k/32k ahead (pp 1.21x/2.08x), decode parity/ahead.
+2. DECODE followup CLOSED (2026-09-06 session, record decode-verification): same-session
    tg@0 = parity (A 25.97 vs B 26.00 r3; 0.999), at-depth tg AHEAD (23.13 vs 22.02 @d12288,
    20.94 vs 18.56 @d32768). Per-op kernel mix (fresh rocprof pair /tmp/prof/tg-{A,B}.db):
    A 266894 kernels vs B 305680 (A ~300 FEWER/step, less launch-bound; GPU-busy +1.7% nets to
@@ -76,18 +91,18 @@ Progression of pp2048 across the session: 703.5 (mwr) -> 725.4 (split_j/config).
    diff). Decode split is structurally different per tree (A = fused hc kernels + standalone
    quantize 244/step; B = fq-inline-quantize mmvq 293/step) netting to the same wall. The old
    TODO note 'tg@0 decode gap 24.2 vs 26.0' was pre-PLE/shortcut-era, now moot.
-2. TODO follow-ups (documented in TODO.md + the dated records, parked by design):
+3. TODO follow-ups (documented in TODO.md + the dated records, parked by design):
    (a) MoE topk-moe fusion numerics fork - quality-gate the fused kernel (CPU ref + PPL/KL)
        vs A's unfused chain (18.424 vs 18.690; B 18.086); adopt ~0.5% if it validates;
    (b) ssm_alpha+ssm_beta single-walk fusion (graph restructure or loader-stacked weights,
        ~0.3-0.6%, design in the cijk record);
    (c) the +800 scale_f32/unary_op launch excess = hc elementwise fusion-window differences;
    (d) mmq latent accumulator-overflow defect report upstream (I < nwarps*16 configs).
-3. gfx1201 (RDNA4) deferred validation - gfx1201 uses mmq-config-rdna4.cuh (untouched); the
+4. gfx1201 (RDNA4) deferred validation - gfx1201 uses mmq-config-rdna4.cuh (untouched); the
    I>=nwarps*16 mma invariant from the defect likely applies there too. ALSO the gfx11 scan's
    NW16 retune (376f02aa0) needs gfx1100/1101 launch-fitness checks (~106K VGPRs/CU required
    - the old 8-warp config fits 64K; revert the constants + mapping there if not).
-4. Re-verify the full patch series from-scratch when the next fork commit lands (currently 20
+5. Re-verify the full patch series from-scratch when the next fork commit lands (currently 20
    patches through 376f02aa0, delivery verified tip 20c17c1).
 
 ## Env toggles / knobs

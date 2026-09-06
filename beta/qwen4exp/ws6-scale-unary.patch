@@ -1,0 +1,111 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 066a10f70..0294a2c1f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5302,6 +5302,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 2;
+     }
+ 
++    // scale -> silu/sigmoid unary (qwen4exp hyper-connection low-rank gate,
++    // e.g. silu(x / hc) in build_hc_mix's prefill path): apply the activation
++    // while scaling - one kernel instead of scale_f32 + unary (halo-box port
++    // ggml_cuda_op_scale_unary). Placed last so the larger hc windows
++    // (scale->sigmoid->scale->mul->add->rms... chains) match first; only
++    // standalone scale->unary pairs reach here. Numerically identical
++    // (same per-element expression). Opt-out: GGML_CUDA_SCALE_UNARY=0.
++    static const bool disable_scale_unary = getenv("GGML_CUDA_SCALE_UNARY") != nullptr && std::atoi(getenv("GGML_CUDA_SCALE_UNARY")) == 0;
++    if (!disable_scale_unary && node->op == GGML_OP_SCALE && node->type == GGML_TYPE_F32 && i + 1 < cgraph->n_nodes) {
++        const ggml_tensor * next = cgraph->nodes[i + 1];
++        if (next->op == GGML_OP_UNARY && next->type == GGML_TYPE_F32 && next->src[0] == node &&
++                node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0]) &&
++                (ggml_get_unary_op(next) == GGML_UNARY_OP_SILU || ggml_get_unary_op(next) == GGML_UNARY_OP_SIGMOID) &&
++                ggml_can_fuse(cgraph, i, (const enum ggml_op[]) { GGML_OP_SCALE, GGML_OP_UNARY }, 2)) {
++            // No ggml_cuda_check_fusion_memory_ranges gate here: the fused kernel is
++            // PURELY ELEMENTWISE (dst[i] = op(scale*x[i] + bias)), so even when the
++            // unary dst aliases the scale's src (in-place scale: the allocator reuses
++            // the src buffer for the unary dst) the kernel is in-place-safe - each
++            // thread reads only its own index. Whole-buffer allocator reuse means an
++            // overlap is base-aligned (dst == src), never shifted. (The sigmoid arm
++            // of this window passes the general check; the silu pairs below, whose
++            // scale runs in-place on its 10K-wide input, need this relaxation - the
++            // census showed mem_ok=0 for all 190 of them.)
++            ggml_cuda_op_scale_unary(*cuda_ctx, node, cgraph->nodes[i + 1]);
++            return 1;
++        }
++    }
++
+     return 0;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index cca013ea7..55914e7a3 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -827,3 +827,54 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
+         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
+     }
+ }
++
++/* fused scale + unary (qwen4exp hc low-rank gate, silu(x/hc) etc.)
++ * halo-box/strix-llama.cpp port: when a SCALE node feeds a SILU/SIGMOID unary,
++ * apply the activation while scaling - one kernel, one memory pass, no
++ * intermediate. Numerically identical to the two separate kernels
++ * (dst = op(scale*x + bias), same per-element expression and order).
++ */
++
++template <float (*op)(float)>
++static __global__ void scale_unary_kernel(const float * x, float * dst, const float scale, const float bias, const int k) {
++    ggml_cuda_pdl_lc();
++    const int i = blockDim.x*blockIdx.x + threadIdx.x;
++
++    if (i >= k) {
++        return;
++    }
++
++    ggml_cuda_pdl_sync();
++    dst[i] = op(scale * x[i] + bias);
++}
++
++template <float (*op)(float)>
++static void scale_unary_cuda(const float * x, float * dst, const float scale, const float bias, const int k, cudaStream_t stream) {
++    const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
++    ggml_cuda_kernel_launch(scale_unary_kernel<op>, launch_params, x, dst, scale, bias, k);
++}
++
++void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node) {
++    const ggml_tensor * src = scale_node->src[0];
++    cudaStream_t stream = ctx.stream();
++
++    GGML_ASSERT(src->type == GGML_TYPE_F32 && scale_node->type == GGML_TYPE_F32 && unary_node->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(unary_node));
++    GGML_ASSERT(unary_node->src[0] == scale_node);
++
++    const float scale = ggml_get_op_params_f32(scale_node, 0);
++    const float bias  = ggml_get_op_params_f32(scale_node, 1);
++    const int   k     = ggml_nelements(src);
++
++    switch (ggml_get_unary_op(unary_node)) {
++        case GGML_UNARY_OP_SILU:
++            scale_unary_cuda<op_silu>((const float *) src->data, (float *) unary_node->data, scale, bias, k, stream);
++            break;
++        case GGML_UNARY_OP_SIGMOID:
++            scale_unary_cuda<op_sigmoid>((const float *) src->data, (float *) unary_node->data, scale, bias, k, stream);
++            break;
++        default:
++            GGML_ABORT("unsupported unary op for fused scale+unary");
++    }
++}
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index 6b56041f6..2a8c2e20c 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -43,6 +43,8 @@ void ggml_cuda_op_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node);
++
+ void ggml_cuda_op_hardsigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_exp(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

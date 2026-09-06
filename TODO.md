@@ -101,10 +101,14 @@ Reality pass: 2026-09-10.
   differ from the plain ggml chain at 0.27 logit scale (behavioral, not ulp). Adoption needs a
   quality gate (CPU reference + PPL/KL) to establish which routing behavior is correct. NOT
   adopted; pin experiment reverted; tree clean at 376f02aa0.
+- (b) CLOSED 2026-09-06 (fork f5ac11903, patch 21, record scale-unary-fusion): the +380
+  unary-silu launch excess = A's missing scale->unary fusion (no upstream model has qwen4exp's
+  hc gate silu(x/hc), so the try_fuse refactor dropped B's peek-ahead). ggml_cuda_op_scale_unary
+  ported + 2-node window after the big hc windows; BIT-IDENTICAL (elementwise, in-place-safe,
+  no mem gate); pp2048 +0.34%, pp512 +0.42%; kernels 7755->7565. Remaining: +38 scale_f32 +
+  fusion-surface diffs (architecture).
 - Open leads: (a) quality-gate the fused topk and adopt if it validates (~0.5% + B-alignment);
-  (b) the +800 scale_f32/unary_op launch excess = hc elementwise fusion-window differences
-  (A's repeat-absorb window [repeat,mul,add,rms,mulg] vs B's possibly-wider window) - not yet
-  root-caused; (c) GDN +72 launches (2-kernel split) cosmetic post-NW16.
+  (c) GDN +72 launches (2-kernel split) cosmetic post-NW16.
 
 ### Upstream monitor: ROCm unaligned-width split-load (Q6_K/Q3_K 2-GPU)
 - Upstream bug: H2D 2D copies whose width is not a multiple of 4 (Q6_K
