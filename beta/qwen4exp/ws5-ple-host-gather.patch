@@ -1,0 +1,109 @@
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 9537a2609..88c793f21 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -6,6 +6,9 @@
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cstdlib>
++#if defined(__linux__) || defined(__APPLE__)
++#include <sys/mman.h>
++#endif
+ 
+ #if LLAMA_LAZY_READER_POSIX
+ #include <unistd.h> // dup
+@@ -1499,14 +1502,14 @@ public:
+ 
+     bool can_reuse(const llm_graph_params & params) override {
+         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
+-        if (pmodel.lazy_reader) {
++        if (emb != nullptr) {
+             return emb->ne[1] == params.ubatch.n_tokens;
+         }
+         return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+     }
+ 
+-    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens] (mmap path)
+-    ggml_tensor * emb  = nullptr;   // F32 [ple_head_dim * n_heads, n_tokens] (managed path)
++    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens] (device-table path: graph get_rows)
++    ggml_tensor * emb  = nullptr;   // F32 [ple_head_dim * n_heads, n_tokens] (host-table path: set_input gathers)
+ 
+     const llama_model_qwen4exp & pmodel;
+ 
+@@ -1591,6 +1594,50 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+                     n_tokens, pmodel.lazy_reader->hits(), pmodel.lazy_reader->misses(),
+                     pmodel.lazy_reader->bytes_read());
+         }
++    } else if (emb != nullptr) {
++        // host-resident table (memory-mapped or in RAM): gather it here, exactly as the
++        // CPU get_rows would (same to_float dequant), so that no CPU get_rows node cuts
++        // the graph into GPU/CPU/GPU splits with a launch + sync per ubatch. The mmap
++        // pages are random-access, so queue every distinct page with one WILLNEED batch
++        // instead of taking the faults one after another (~0.2 ms each from NVMe).
++        const ggml_tensor * tab = pmodel.per_layer_tok_embd;
++        const size_t  row_size = ggml_row_size(tab->type, tab->ne[0]);
++        const int64_t dim      = tab->ne[0];
++        GGML_ASSERT(dim == hp.ple_head_dim);
++        GGML_ASSERT(tab->data != nullptr);
++
++        const auto * traits = ggml_get_type_traits(tab->type);
++
++#if defined(__linux__) || defined(__APPLE__)
++        {
++            const long page = sysconf(_SC_PAGESIZE);
++            if (page > 0) {
++                const uintptr_t base = (uintptr_t) tab->data;
++                const uintptr_t mask = ~((uintptr_t) page - 1);
++                uintptr_t prev_page = 0;
++                for (const int32_t r : idx) {
++                    const uintptr_t a0 = (base + (size_t) r * row_size) & mask;
++                    const uintptr_t a1 = base + (size_t) r * row_size + row_size;
++                    if (a0 != prev_page) {
++                        madvise((void *) a0, a1 - a0, MADV_WILLNEED);
++                        prev_page = a0;
++                    }
++                }
++            }
++        }
++#endif
++
++        emb_scratch.resize(idx.size() * (size_t) dim);
++        for (size_t k = 0; k < idx.size(); ++k) {
++            const char * src = (const char *) tab->data + (size_t) idx[k] * row_size;
++            float *      dst = emb_scratch.data() + k * (size_t) dim;
++            if (tab->type == GGML_TYPE_F32) {
++                memcpy(dst, src, dim * sizeof(float));
++            } else {
++                traits->to_float(src, dst, dim);
++            }
++        }
++        ggml_backend_tensor_set(emb, emb_scratch.data(), 0, emb_scratch.size()*sizeof(float));
+     } else {
+         ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+     }
+@@ -1673,6 +1720,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+         return emb;
+     }
+ 
++    // A host-resident table (memory-mapped or loaded into RAM) is gathered on the host in
++    // set_input too: a get_rows node on the CPU backend would cut the graph into three splits
++    // (GPU, CPU, GPU) and, for a big random-access mmap, fault one 4 KB page at a time from
++    // disk (the input-layer tables stay CPU-pinned). Only a device-resident table is gathered
++    // by a graph get_rows node. LLAMA_QSA_PLE_HOSTGATHER=0 restores the graph get_rows path.
++    const char * env_hg = getenv("LLAMA_QSA_PLE_HOSTGATHER");
++    const bool host_gather = model.per_layer_tok_embd && model.per_layer_tok_embd->buffer &&
++        ggml_backend_buffer_is_host(model.per_layer_tok_embd->buffer) &&
++        (env_hg == nullptr || env_hg[0] != '0');
++    if (host_gather) {
++        ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
++                                          hparams.ple_head_dim * n_heads, n_tokens);
++        ggml_set_input(ple_inp->emb);
++        ggml_tensor * emb = ple_inp->emb;
++        res->add_input(std::move(ple_inp));
++        cb(emb, "ple_embd", -1);
++        return emb;
++    }
++
+     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+     ggml_set_input(ple_inp->rows);
+     ggml_tensor * rows = ple_inp->rows;
