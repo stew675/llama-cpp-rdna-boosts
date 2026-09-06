@@ -389,6 +389,55 @@ Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.m
   (the first evals otherwise pay disk page-ins - a deterministic but
   fake ~4x prefill slowdown).
 
+- SCHED-GATE FIX validated 2026-09-06 (fork `c63f7f2a0`, delivery
+  `d6eb551`, squashed onto the consolidated beta): the no-sync sched
+  re-reserve probe (patch-6 lineage) is gated to SINGLE-DEVICE
+  schedulers — `ggml_backend_sched_alloc_splits` counts non-CPU
+  (async-capable) devices and restores the full cross-backend sync
+  when `>1` (a GPU + CPU backend keeps the fast path).  Root cause:
+  on >1 device a re-reserve re-points tensor addresses while the
+  previous ubatch's kernels are still in flight on other GPUs →
+  cross-GPU race (in-kernel spin / `quantize_q8_1`+`k_get_rows`
+  faults) at multi-ubatch prefill — reproduced on 3x R9700 gfx1201
+  (pp2048 fine, ≥2 ubatches hang), absent on the single-GPU topology
+  the campaign validated.
+  - gfx1201 (soar) clean-box tensor-split A/B (post-reboot, IQ4_XS
+    Qwen3.8-Flash-Next, pp8192 ub2048 r3-ish): FIXED build 3/3
+    no-hang at 2130-2156 t/s (pre-reboot best 2071; the pre-reboot
+    pass-once-then-flake ~5x did NOT reproduce on the clean box →
+    degraded-box artifact; NO bisect, NO gate change); decode tg128
+    49.1 t/s.  Pre-re-base control build (old master + old blocks +
+    old beta): no-hang at ~445 t/s pp8192 — consistent with the
+    expected fixed≫old prefill gap (the campaign's whole point); the
+    handover's old-build ~1792 pre-reboot figure is attributed to the
+    degraded box state.  Handoff: `beta/qwen4exp/HALO_HANDOFF.md`.
+  - gfx1151 (halo, Strix Halo / RDNA3.5, single 8060S): gated
+    delivery vs the pre-fix campaign build (content == fork tip
+    `f5ac11903`, ungated probe), same-session A/B, campaign protocol
+    (`-ngl 99 -t 15 -r 3 -b 2048 -ub 2048 -fa on -ctk f16 -ctv f16
+    --load-mode none`, IQ4_XS): PARITY within drift — depth-0 pp512
+    653.8/652.6, pp2048 777.7/777.4-781.9, pp4096 737.8/734.9-741.6,
+    tg128 25.80/25.94; depth d12288 pp2048 637.7/640.4, tg
+    23.05/23.20 — the single-device fast path and campaign numbers
+    are preserved.  Pure-gate pair on the delivery tree (627506c1c
+    ungated vs `c63f7f2a0` gated — identical except the gate):
+    same-seed llama-cli text BYTE-IDENTICAL + perf parity (pp512
+    657.95/655.99, pp2048 776.77/775.56, tg 25.78/25.79): the gate is
+    inert at 1 async device, by construction and empirically.
+  - COHERENCE-SEMANTICS NOTE (maintainer-confirmed): the canonical
+    reference for this fork is the gfx1151-generated output (the
+    gfx1201 port targets it once complete), which may differ from base
+    CPU llama.cpp output due to accumulation ordering.  The re-based
+    delivery's Flash-Next text differs from the pre-re-base campaign-
+    era builds — root cause: upstream `5fdfa6282` (GDN q/k
+    normalization `ggml_l2_norm` → `build_gdn_l2_norm` rsqrt / eps-
+    in-root, FLA reference semantics) landed in the `465e49b9c`
+    re-base range and changed `src/models/qwen4exp.cpp`; NOT the
+    gate, NOT the 13-block/beta content (the other re-base-range
+    kernel commit `73a43d1f6` mmid/mmf syncwarp fixes are empty on
+    HIP).  Validated: old-base (`d4c8e66ae`) qwen4exp.cpp calls
+    `ggml_l2_norm`; current calls `build_gdn_l2_norm`.
+
 ## Open items (carried forward from WIP)
 
 - "The answer" 3-token K=2 multi-seq decode drift at step 3 (single-seq
