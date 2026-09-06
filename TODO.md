@@ -23,11 +23,29 @@ Reality pass: 2026-09-06.
   defaults ON. Record + numbers:
   `benchmarks/2026-09-06-strix-halo-gfx1151-post-fusion-gap.md` (WS3 #2
   section).
-- Remaining: WS3 #3 (routed-compact MoE mmq for i-quants, RDNA4-gated —
-  now the main shallow-row gap component per the WS1 attribution) with
-  gfx1201 validation via the delivery flow; resolve or adjudicate the
-  WS3 #2 llama-bench artifact (llama.cpp graph-lifecycle expert needed).
-  WS6 re-base NOT indicated.
+- WS3 #3 (routed-compact MoE mmq for the i-quants) DONE (2026-09-08, A
+  commit `a1121cf2d`, DEFAULT ON): port of B's
+  mul_mat_q_routed_compact + per-expert J selection
+  (mmq_rdna3_5_id_get_J, 16/48/64/128 by rows-per-expert, gfx1151-tuned)
+  into A's mmq path; RDNA3.5-only gate (B parity; gfx1201 stays off until
+  the delivery flow's gfx1201 box validates). Bit-exact by construction
+  (same process_tile) + text-verified (7-tok and 4572-tok pp + 40 decode
+  identical on/off/known-good); rocprof confirms compact fires on the IQ
+  expert GEMMs (IQ3_S J64 x184, IQ4_NL J64 x86, IQ4_XS, Q8_0 J48 @
+  pp2048). Same-session: compact adds +2.4-5.3% over plain-at-same-J on
+  every depth-0 row, tg flat, pp@d12288 +1.8%; A-vs-B gap moved pp512
+  2.05->1.61x, pp1024 2.04->1.78x, pp2048 2.21->2.01x, pp4096 1.68->1.53x,
+  pp8192 1.37->1.26x, pp16384 1.14->1.06x. Env opt-out:
+  GGML_CUDA_DISABLE_MMQ_ROUTED=1 (compact only; J selection stays). Record:
+  `benchmarks/2026-09-08-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
+- Remaining on the Strix prefill leg: (a) WS3 #2 llama-bench artifact
+  (root cause NOT found — llama.cpp graph-lifecycle expert needed; the
+  dense-shortcut stays opt-in default OFF pending adjudication); (b) the
+  per-ubatch routing/reduction tail (B's weighted-expert-sum/concat
+  graph fusions; A's tail unfused outside WS4 hyperconn coverage) — not
+  yet requested; (c) RDNA4/gfx1201 validation of the WS3 #3 gate via the
+  delivery flow when a gfx1201 box is available. tg@0 decode gap (24.2 vs
+  26.0) is the later generation phase. WS6 re-base NOT indicated.
 ### Validate beta qwen4exp on Strix Halo (gfx1151) — DONE for WS4; beta set runs on gfx1151
 - Block 13's Strix leg is DONE (2026-09-05): the fused MoE gate+up+GLU
   MMQ (RDNA4-gated fused arm) was ungated for RDNA3_5 / gfx1151,
