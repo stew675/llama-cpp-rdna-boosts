@@ -1,5 +1,5 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 5461b9acb..23a044368 100644
+index 59550fe8b..d187410ce 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2746,6 +2746,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -446,7 +446,7 @@ index 87667beb2..a3c378cc4 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 6862128e6..fcc3edd51 100644
+index 6862128e6..f2a15b25f 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -958,6 +958,12 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
@@ -462,26 +462,37 @@ index 6862128e6..fcc3edd51 100644
      if (allow) {
          for (int i = 0; i < GGML_MAX_SRC; i++) {
              const struct ggml_tensor * src = tensor->src[i];
-@@ -1635,13 +1641,28 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -1635,13 +1641,41 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
              }
          }
  
 -        // the re-allocation may cause the split inputs to be moved to a different address
 -        // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
--        for (int i = 0; i < sched->n_backends; i++) {
--            ggml_backend_synchronize(sched->backends[i]);
--        }
 +        // Reserve the graph and check whether this requires growing (reallocating) one of the buffers.
 +        // The buffers are grow-only, so when the graph fits within the already-reserved space (e.g.
-+        // alternating dense/sparse ubatches of the same prompt), the reserve only recomputes the tensor
-+        // layout and re-points the tensors of this graph: since the compute of this graph is ordered
-+        // after the compute of any previous graph on the backend streams, no device synchronization is
-+        // required in that case. Only when a buffer must actually be grown is a full synchronization
-+        // needed, because the re-allocation moves the addresses of tensors that an in-flight graph may
-+        // still be using.
++        // alternating dense/sparse ubatches of the same prompt) the reserve only recomputes the tensor
++        // layout and re-points the tensors of this graph.  Skipping the synchronization is only safe
++        // when a single device stream fully orders the compute: the probe/no-sync path is validated
++        // for single-GPU inference (gfx1151 / gfx1100).  With more than one device (tensor/layer
++        // split) a previous graph's kernels may still be in flight on other devices when the
++        // re-point happens, which races cross-device (in-kernel spin / memory faults at multi-ubatch
++        // prefill, reproduced on 3x R9700 gfx1201) - so the multi-device path keeps the full
++        // synchronization (upstream behavior).  Count the non-CPU (async-capable) devices rather than
++        // the raw backend count, so a single GPU plus a CPU backend keeps the fast path.
++        int n_async_devices = 0;
+         for (int i = 0; i < sched->n_backends; i++) {
+-            ggml_backend_synchronize(sched->backends[i]);
++            const enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(ggml_backend_get_device(sched->backends[i]));
++            if (dev_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
++                n_async_devices++;
++            }
+         }
++        // Only when a buffer must actually be grown is a full synchronization needed regardless,
++        // because the re-allocation moves the addresses of tensors that an in-flight graph may still
++        // be using.
 +        const bool buffers_grown = ggml_gallocr_reserve_n_probe(
 +                sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
-+        if (buffers_grown) {
++        if (buffers_grown || n_async_devices > 1) {
 +            // the re-allocation may cause the split inputs to be moved to a different address
 +            // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
 +            for (int i = 0; i < sched->n_backends; i++) {
@@ -497,7 +508,7 @@ index 6862128e6..fcc3edd51 100644
          if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
              GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              return false;
-@@ -2112,6 +2133,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
+@@ -2112,6 +2146,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
  bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
      switch (op) {
          case GGML_OP_FLASH_ATTN_EXT:
@@ -3961,7 +3972,7 @@ index 000000000..a7b3c338d
 +void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +bool ggml_cuda_indexer_top_k_supported(int device, const ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/mmid.cu b/ggml/src/ggml-cuda/mmid.cu
-index ed0851dcf..a13c5e4e6 100644
+index 0b222e63a..11602e9d4 100644
 --- a/ggml/src/ggml-cuda/mmid.cu
 +++ b/ggml/src/ggml-cuda/mmid.cu
 @@ -19,6 +19,59 @@ struct mm_ids_helper_store {
@@ -4024,7 +4035,7 @@ index ed0851dcf..a13c5e4e6 100644
  // the generic path passes 0, which needs no padding since it never groups lanes by token
  template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
  template <>      struct mm_ids_pow2<1> { static constexpr int value = 1; };
-@@ -151,6 +204,12 @@ static void launch_mm_ids_helper(
+@@ -152,6 +205,12 @@ static void launch_mm_ids_helper(
  void ggml_cuda_launch_mm_ids_helper(
          const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
          const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
@@ -4508,10 +4519,10 @@ index 221e14f7f..57d1ca865 100644
              llama-kv-cache-dsa.cpp
              llama-kv-cache-dsa-iswa.cpp
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index d06be641a..bbcc6bccd 100644
+index 15f651919..5799d3122 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
-@@ -577,6 +577,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+@@ -578,6 +578,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
      { LLM_TENSOR_NEXTN_HNORM,                            "blk.%d.nextn.hnorm" },
      { LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,                 "blk.%d.nextn.shared_head_head" },
      { LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,                 "blk.%d.nextn.shared_head_norm" },
@@ -4521,7 +4532,7 @@ index d06be641a..bbcc6bccd 100644
      { LLM_TENSOR_ATTN_SUB_NORM,                          "blk.%d.attn_sub_norm" },
      { LLM_TENSOR_FFN_SUB_NORM,                           "blk.%d.ffn_sub_norm" },
      { LLM_TENSOR_DEC_OUTPUT_NORM,                        "dec.output_norm" },
-@@ -966,6 +969,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+@@ -967,6 +970,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
      {LLM_TENSOR_NEXTN_HNORM,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
      {LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
      {LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
@@ -4531,7 +4542,7 @@ index d06be641a..bbcc6bccd 100644
      // Nemotron 3 Super
      // latent projections feed ggml_mul_mat, the buft probe must use MUL_MAT to keep them on GPU
      {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
-@@ -1148,7 +1154,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+@@ -1149,7 +1155,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
          case LLM_ARCH_BAILINGMOE3:
          case LLM_ARCH_KIMI_K3:
          case LLM_ARCH_QWEN3TTS:
@@ -4540,10 +4551,10 @@ index d06be641a..bbcc6bccd 100644
          default:
              return true;
 diff --git a/src/llama-arch.h b/src/llama-arch.h
-index 62dfa5d81..b4b3c0fb9 100644
+index f1d173a57..01e2bbe1d 100644
 --- a/src/llama-arch.h
 +++ b/src/llama-arch.h
-@@ -689,6 +689,11 @@ enum llm_tensor {
+@@ -690,6 +690,11 @@ enum llm_tensor {
      LLM_TENSOR_NEXTN_HNORM,
      LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
      LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
@@ -5373,10 +5384,10 @@ index 9e51d0ce7..bc60f759b 100644
              return !ranges.empty();
          }
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index b837e2765..362443c49 100644
+index ffedf89e6..891b4805c 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -2495,7 +2495,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2497,7 +2497,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                  const bool mtp_on_hybrid_qwen =
                      params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                      (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
@@ -5385,7 +5396,7 @@ index b837e2765..362443c49 100644
  
                  const bool mtp_on_hybrid_nemotron =
                      params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
-@@ -2748,6 +2748,7 @@ llama_model_params llama_model_default_params() {
+@@ -2750,6 +2750,7 @@ llama_model_params llama_model_default_params() {
          /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
          /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
          /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
@@ -5393,7 +5404,7 @@ index b837e2765..362443c49 100644
          /*.main_gpu                    =*/ 0,
          /*.tensor_split                =*/ nullptr,
          /*.progress_callback           =*/ nullptr,
-@@ -3196,7 +3197,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
+@@ -3199,7 +3200,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
      TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
      TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
      TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
@@ -5442,7 +5453,7 @@ index 7e7eacbab..64bae7da6 100644
          ml.print_info();
          std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
 diff --git a/src/models/models.h b/src/models/models.h
-index 93a6b3494..1e234b4fe 100644
+index 87195fddd..75b9b3493 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
 @@ -3,9 +3,12 @@
@@ -5458,7 +5469,7 @@ index 93a6b3494..1e234b4fe 100644
  #include <map>
  
  class llama_memory_hybrid_idx_context;
-@@ -2341,14 +2344,38 @@ struct llama_model_qwen35 : public llama_model_base {
+@@ -2348,14 +2351,38 @@ struct llama_model_qwen35 : public llama_model_base {
  struct llama_model_qwen4exp : public llama_model_base {
      llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
  
@@ -5498,7 +5509,7 @@ index 93a6b3494..1e234b4fe 100644
          // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
          ggml_tensor * build_hc_mix(
                      ggml_tensor * x,
-@@ -2387,7 +2414,16 @@ struct llama_model_qwen4exp : public llama_model_base {
+@@ -2394,7 +2421,16 @@ struct llama_model_qwen4exp : public llama_model_base {
          // so the layers sharing a ratio share one input set
          std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
  
@@ -5515,7 +5526,7 @@ index 93a6b3494..1e234b4fe 100644
          ggml_tensor * build_qsa_top_k(
    const llama_memory_hybrid_idx_context * mctx_hyb,
                      ggml_tensor * cur,
-@@ -2440,7 +2476,17 @@ struct llama_model_qwen4exp : public llama_model_base {
+@@ -2447,7 +2483,17 @@ struct llama_model_qwen4exp : public llama_model_base {
          const llama_model & model;
      };
  
@@ -5534,7 +5545,7 @@ index 93a6b3494..1e234b4fe 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 1484c9b07..807505804 100644
+index 8ace95f73..5568c925d 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -5,6 +5,14 @@
@@ -6259,7 +6270,7 @@ index 1484c9b07..807505804 100644
      cb(cur, "kqv_out", il);
  
      // the rotation is its own inverse, so undo it on the value side of the output
-@@ -768,10 +1221,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -768,10 +1221,50 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      const int64_t n_embd_head = hparams.n_embd_head_v();
      GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
  
@@ -6289,12 +6300,15 @@ index 1484c9b07..807505804 100644
 +        // LLAMA_QSA_DENSE_SHORTCUT: dense shortcut below the selection width, DEFAULT ON (B parity;
 +        // the env name matches B for cross-testing). It was opt-in default OFF while a llama-bench-
 +        // only multi-ubatch artifact (pp4096+@0 rows slower with the shortcut on) lacked a root
-+        // cause. Root-caused 2026-09-05: llama-bench's sync-free decode pipeline x ggml-gallocr's
++        // cause. Root-caused 2026-09-08/09: llama-bench's sync-free decode pipeline x ggml-gallocr's
 +        // single-layout alloc-fallback doing an unconditional full-device sync on every dense/sparse
-+        // topology flip; fixed at the ggml level (ggml_gallocr_reserve_n_probe - the fallback only
-+        // syncs when a buffer must actually grow, ggml-backend.cpp / ggml-alloc.c) - with the fix
-+        // the depth-0 ladder is faster with the shortcut at every size and depth rows are flat
-+        // (record: wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-shortcut-fix.md). Numerics below the width == the
++        // topology flip (record: benchmarks/2026-09-10-*-shortcut-fix.md).  NOTE (2026-09-06): the
++        // follow-up that removed that sync (ggml_gallocr_reserve_n_probe - sync only when a buffer
++        // must grow) was UNSAFE across backends and has been reverted: a re-reserve re-points tensor
++        // addresses while the previous ubatch's kernels may still be in flight on other GPUs
++        // (cross-GPU race -> in-kernel spin / memory faults at multi-ubatch prefill, reproduced on
++        // 3x R9700 gfx1201).  The per-flip full-device sync is back (upstream behavior) and the
++        // shortcut stays DEFAULT ON on top of it.  Numerics below the width == the
 +        // LLAMA_QSA_SPARSE_FA=0 masked-dense path (the difference from the selection default is the
 +        // known dense-vs-sparse kernel signature, an env-selectable regime). =0 forces the selection
 +        // path (the pre-flip known-good numerics) either way.
@@ -6311,7 +6325,7 @@ index 1484c9b07..807505804 100644
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -1034,10 +1524,14 @@ public:
+@@ -1035,10 +1528,14 @@ public:
  
      bool can_reuse(const llm_graph_params & params) override {
          mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
@@ -6327,7 +6341,7 @@ index 1484c9b07..807505804 100644
  
      const llama_model_qwen4exp & pmodel;
  
-@@ -1046,6 +1540,7 @@ public:
+@@ -1047,6 +1544,7 @@ public:
  
      // scratch, reused across set_input() calls
      std::vector<llama_token> prev;
@@ -6335,7 +6349,7 @@ index 1484c9b07..807505804 100644
  };
  
  void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
-@@ -1108,7 +1603,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -1109,7 +1607,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
          }
      }
  
@@ -6403,7 +6417,7 @@ index 1484c9b07..807505804 100644
  }
  
  // Read a conv history out of its own recurrent row and write the new tail back.
-@@ -1175,6 +1729,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+@@ -1176,6 +1733,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
      auto ple_inp = std::make_unique<llm_graph_input_ple>(
              static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
  
@@ -6725,7 +6739,7 @@ index 000000000..f4fd3f599
 +
 +#endif
 diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index 0f3d1c79a..e6eca77cc 100644
+index dbed9846f..11d1b00f9 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
 @@ -389,10 +389,12 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
