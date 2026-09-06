@@ -1,14 +1,20 @@
-# Strix Halo session brief — handoff after 2026-09-12 (compact me; run the NEXT SESSION prompt)
+# Strix Halo session brief — handoff after 2026-09-13 (compact me; run the NEXT SESSION prompt)
 
 ACTIVE GOAL: equal/surpass B (community halo-box `~/strix-llama.cpp` c7af5c6c2, untouched,
 ~1% stable reference) at EVERY data point (depths 0/12k/32k x pp512..16384 + tg128). Depth-0
-CURRENT STATE after the mmq split_j fix: A wins pp16384 (+15%) and pp8192 (+2%); pp512-4096
-lag 1-6%; tg parity. The remaining depth-0 gap is the fixed per-ubatch costs (quantize
-family, elementwise/hc, flash, launch). Decode followup + depth-12k/32k re-derivation remain.
+CURRENT STATE after split_j (6d457634e) + the gfx1151-gated quantize chunk merge (0a3a2b498):
+pp16384 +17%, pp8192 +3.5%, pp4096 0.991, pp1024/512 0.977, pp2048 0.952 (worst), tg parity.
+Remaining open deltas (see the 2026-09-13 record): k_bin_bcast repeat structure (~45ms/pass;
+A's per-layer hc_combine b-broadcast at qwen4exp.cpp:470 fires once per layer in prefill
+because the fused-hc_combine gate is nt==1-only; B avoids it - graph restructure needed,
+RISKY vs the pp16384 win), hc_combine_norm +22%/call, Cijk grid256 bucket +21%/call, flash
++20%/call, scatter/swiglu quantize 2x-call structure. Decode followup + depth-12k/32k
+re-derivation remain.
 
 ## Tree state (both clean, nothing pushed)
 
-- ~/llama.cpp (qwen4exp) tip `6d457634e`. Post-squash chain (bottom->top): 1da01fa67 (WS3#3
+- ~/llama.cpp (qwen4exp) tip `0a3a2b498` (was 6d457634e) - the split_j commit chain is
+  unchanged through 6d457634e; 0a3a2b498 adds the gated quantize chunk merge. Post-squash chain (bottom->top): 1da01fa67 (WS3#3
   routed mmq) -> a2f2a6ceb (ggml sched-fallback-sync) -> 250e48e97 (QSA shortcut DEFAULT ON;
   history was SQUASHED 2026-09-11 - opt-in commit no longer exists) -> b31940a5e (weighted-down
   decode) -> 8b62ac25a (PLE host-gather prefill fix) -> 3cb9168be (managed-reader batched
@@ -16,9 +22,9 @@ family, elementwise/hc, flash, launch). Decode followup + depth-12k/32k re-deriv
   (fused swiglu-input quantize) -> 304114ba7 (mm_ids_helper_512_10) -> f33ffaca7 (float4
   moe_weighted_reduction) -> 6d457634e (split_j + B's Q8_0 config rows). Backup branch
   fork-squash-backup-b004e9744 + old-hash map in the beta README for pre-rewrite references.
-- ~/llama-cpp-rdna-boosts (delivery) tip `e095cb8`: FIFTEEN patches (beta/qwen4exp), full
-  series verified to apply from-scratch at da67bcb88 and reproduce fork tip 6d457634e
-  byte-identically. ~/strix-llama.cpp untouched. NO pushes ever from ~/llama.cpp; gfx1201
+- ~/llama-cpp-rdna-boosts (delivery) tip `4e8f8c9`: SIXTEEN patches (beta/qwen4exp:
+  ws6-quantize-chunk-q8-1-gfx1151 added), full series verified to apply from-scratch at
+  da67bcb88 and reproduce fork tip 0a3a2b498 byte-identically. ~/strix-llama.cpp untouched. NO pushes ever from ~/llama.cpp; gfx1201
   validation deferred until ALL Strix work is done.
 
 ## THE 2026-09-12 FIND (record: benchmarks/2026-09-12-strix-halo-gfx1151-mmq-j128-latent-defect.md)
