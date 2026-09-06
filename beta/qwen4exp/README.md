@@ -52,14 +52,23 @@ HIP_VISIBLE_DEVICES=0,1,2 GGML_CUDA_FA_WMMA_256=0 \
 
 ## Contents
 
-Seven squashed patch files. They apply IN ORDER on the rdna-boosts core
+Nine squashed patch files. They apply IN ORDER on the rdna-boosts core
 = upstream master `8b4b3558f` + blocks 01-13 (re-based/regenerated
 2026-09-04 from the previous `9cffdcc80`-based `8f2838d1c` set).
 Applied together (patches 1-4) they reproduce the `qwen4exp` branch tip
 `248e47704` tree-identically; patch 5 (ws3-routed-moe-mmq) adds the
 2026-09-08 WS3 #3 commit `a1121cf2d`; patches 6-7 add the 2026-09-10
 WS3 #2 artifact fix (`fcfb0a522`) + the shortcut default flip
-(`1682d32a9`) on top.
+(`1682d32a9`) on top; patch 8 (ws3-weighted-down-fusion) adds
+`a18e24f97`; patch 9 (ws5-ple-host-gather) adds `32680d937`. The managed
+reader's batched cold-page fetch (`b004e9744`) is folded INTO patch 1
+(`managed-ngrams.patch`), so patch 1 carries the reader at its final
+state and patch 2 no longer touches `llama-lazy-reader.*`.
+
+Each patch is validated to clean-apply at its own parent state (the
+series is a staged collection to be squashed onto the base later; it is
+not expected to apply from-scratch in one pass because patch 1-2 carry
+post-apply drift by design).
 
 The 2026-09-04 re-base re-applied the first two patches onto the current
 master (39 commits of upstream drift past the old base) and resolved the
@@ -71,10 +80,20 @@ upstream's current call, so nothing was lost.  Full build clean (ROCm
 7.14 gfx1201) after the merge; patch 3 (MTP) added on top 2026-09-04.
 
 ### 1. `managed-ngrams.patch`
-The managed lazy-reader work (the 0001-0007 set, squashed to one patch):
+The managed lazy-reader work (the 0001-0007 set, squashed to one patch,
+updated 2026-09-11 to fold in `b004e9744` so the reader ships at its
+final state):
 - new lazy reader (`llama-lazy-reader.cpp/.h`, `--lazy-buffer-size N`,
   pread row reads, meta/CPU_Mapped placement) with managed n-gram (PLE)
   row loading,
+- F32-table handling in the reader (memcpy path when the type has no
+  dequantizer; previously its own hunks in `qwen4exp-support.patch`),
+- batched cold-page fetch (2026-09-11): coalesced `posix_fadvise`
+  (WILLNEED) sweep + a parallel pread pool into a per-gather buffer with
+  serial arena write-back, so a large cold prefill no longer stalls one
+  4 KB pread at a time; `LLAMA_LAZY_IO_THREADS` sets the pool width
+  (default 4). 10G managed-buffer test: parity with the host-gather path
+  at every pp row (+/-0.5%), text byte-identical,
 - `n_lazy_buf_size` plumbing through `llama_model_params`/loader,
 - test-lazy-reader + arch-test roundtrip coverage,
 - the PLE n-gram load block + models.h entries.
