@@ -10,15 +10,24 @@ Reality pass: 2026-09-06.
 ## Current active
 
 ### Strix Halo (gfx1151): prefill-gap follow-ons after WS4 (WS3 #2/#3)
-- WS4 (prefill hyperconn fusions, DEFAULT ON + bit-exact) is DONE,
-  gated, and routed (see the 2026-09-06 Closed bullets). What remains
-  on the Strix leg: re-derive the post-fusion A-vs-B depth-0 pp gap
-  (fusion-on A vs the community B build, same ladder), then WS3 #2
-  (dense shortcut below the selection width in A's `build_layer_attn`;
-  fires only while n_kv <= indexer_top_k + ratio - 1, where dense ==
-  sparse by construction) and WS3 #3 (routed-compact MoE mmq for
-  i-quants, RDNA4-gated), with gfx1201 validation via the normal
-  delivery flow. WS6 re-base NOT indicated.
+- WS3 #2 (QSA dense-shortcut below the selection width) IMPLEMENTED and
+  characterized (2026-09-06, A commit `151798ed2`, OPT-IN default OFF):
+  tg128@0 +4.2% (24.53 vs 23.54), pp512-2048@0 +3-5%, llama-cli crossing
+  prefill neutral (p5000 259.9 vs 258.8), depth gates untouched; numerics
+  below the width == A's existing LLAMA_QSA_SPARSE_FA=0 dense path
+  (text-identical). OPEN: llama-bench-only multi-ubatch artifact — pp4096+
+  @0 rows slower with the shortcut on (pp16384 334 vs 525) though rocprof
+  shows equal-or-smaller GPU work and llama-cli/server shows no penalty:
+  host-side graph-lifecycle cost when one ctx mixes store-only + scoring
+  ubatches (root cause NOT found). Default OFF pending adjudication; B
+  defaults ON. Record + numbers:
+  `benchmarks/2026-09-06-strix-halo-gfx1151-post-fusion-gap.md` (WS3 #2
+  section).
+- Remaining: WS3 #3 (routed-compact MoE mmq for i-quants, RDNA4-gated —
+  now the main shallow-row gap component per the WS1 attribution) with
+  gfx1201 validation via the delivery flow; resolve or adjudicate the
+  WS3 #2 llama-bench artifact (llama.cpp graph-lifecycle expert needed).
+  WS6 re-base NOT indicated.
 ### Validate beta qwen4exp on Strix Halo (gfx1151) — DONE for WS4; beta set runs on gfx1151
 - Block 13's Strix leg is DONE (2026-09-05): the fused MoE gate+up+GLU
   MMQ (RDNA4-gated fused arm) was ungated for RDNA3_5 / gfx1151,
