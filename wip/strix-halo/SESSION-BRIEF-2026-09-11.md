@@ -32,29 +32,27 @@ The immediate task is the PREFILL root-cause + fix investigation — read
    cub argsort aborts under -r3 state-restore at depth). Same-box B runs 10-30% below the
    community PR table (use same-box B).
 
-## THE PREFILL INVESTIGATION (the active task — see the record for full data)
+## THE PREFILL INVESTIGATION — ROOT CAUSE FIXED 2026-09-11 (see the 2026-09-11 record + ws5 patch)
 
-Findings: (a) A's pp2048 llama-bench decode = split0 CPU `model.input_embed` (PLE get_rows) 4
-nodes = 2700 ms + split1 GPU 7201 nodes; llama-cli identical flags = 494.8 t/s (no 2.7 s) ->
-the llama-bench single-ubatch rows are inflated by a REAL A-side ingest defect (B is fast in
-both bench and cli); (b) even on the real path A pp2048 = 494.8 (cold) vs B 653 = 1.32x;
-(c) rocprof GPU-busy A 2.94 s vs B 2.41 s per decode -> real kernel deltas ~0.5 s/pass: concat
-(A generic 0.41 s vs B transposed 0.13 s), swiglu-input quantize (B fuses it, A doesn't), Q8_0
-gate/up mmq +13% on same calls, A-only mm_ids_helper<10> (0.31 s), host submit; near-parity on
-the routed-compact expert mmq + rocBLAS + hc fusions.
+DONE: A's PLE n-gram table (28.8 GB IQ4_NL, input-layer = CPU-pinned) was gathered by a
+single-threaded CPU get_rows whose random 4 KB mmap pages fault one at a time (~120-170 us/row;
+2.7 s per 2048-token ubatch). FIX (commit 32680d937, patch 9, DEFAULT ON,
+LLAMA_QSA_PLE_HOSTGATHER=0 restores the old path, byte-identical text): port of B's host-gather
+- F32 graph input + set_input dequant (same to_float) after one madvise(MADV_WILLNEED) page
+sweep; no CPU graph split. Same-session depth-0 r3 A vs B: pp16384 626 vs 600 (A WINS), pp8192
+637 vs 679, pp4096 646 vs 734, pp2048 655 vs 776 (was 400/1.93x), pp1024 643 vs 731, pp512 591
+vs 645 (was 409), tg128 25.95 vs 26.01 (parity; was -3.5%).
 
-NEXT SESSION IN ORDER:
-1. ROOT-CAUSE + FIX the CPU input_embed 2.7 s: confirm llama-cli honors --load-mode; find why
-   llama-bench's decode routes the PLE embedding to a CPU split; profile the CPU get_rows
-   (suspects: host-mmap PLE row path / managed-reader locking / non-optimal CPU IQ4_NL
-   get_rows / random-vs-text token ids); diff A vs B qwen4exp PLE placement + input-embedding
-   build + host per-ubatch submit (~0.25 s B). Expect most of the pp512/1024/2048 delta to
-   vanish (A warm GPU+host pp2048 ~620-700 t/s vs B 771 if the embed is fixed).
-2. PORT B's transposed concat + swiglu-input quantize kernels (WS4-recipe coherence then
-   same-session A/B).
-3. Q8_0 gate/up mmq feed delta (+13% on the largest kernel, same call counts).
-4. Re-establish the WARM real-path (llama-cli after a warmup decode) low-depth ladder A vs B.
-5. Re-derive the full matrix on the new default; update records + TODO + this brief.
+REMAINING pp gaps (0.84-0.92x pp512-2048, 0.94x pp8192; pp16384 + tg at/above B): ~0.5 s/pass
+GPU kernel deltas + host per-ubatch. NEXT IN ORDER:
+1. PORT B's transposed concat (A concat_non_cont 0.41 s vs B concat_transposed_src1_dim0 0.13 s
+   per pp2048 pass - 3x).
+2. PORT B's fused swiglu-input quantize (quantize_mmq_q8_1_swiglu; A quantize 0.50 s/1608 vs
+   B 0.29 s/1326 + fused 0.105 s).
+3. Q8_0 gate/up mmq J128 feed delta (A 1.56 s vs B 1.38 s on the same 1182 calls).
+4. A-only mm_ids_helper<10> 423 calls/0.31 s; re-measure host submit now the CPU split is gone.
+5. Re-derive the full matrix on the new default (incl. depth 12k/32k pp - the gather fix is per
+   ubatch so it helps there too; B@depth at -r 1). Update records + TODO + this brief.
 
 ## Carried-forward open items (full ledger)
 
