@@ -52,7 +52,7 @@ HIP_VISIBLE_DEVICES=0,1,2 GGML_CUDA_FA_WMMA_256=0 \
 
 ## Contents
 
-Sixteen squashed patch files. They apply IN ORDER on the rdna-boosts core
+Seventeen squashed patch files. They apply IN ORDER on the rdna-boosts core
 = upstream master `8b4b3558f` + blocks 01-13 (re-based/regenerated
 2026-09-04 from the previous `9cffdcc80`-based `8f2838d1c` set).
 Applied together (patches 1-4) they reproduce the `qwen4exp` branch tip
@@ -67,7 +67,10 @@ the mm_ids_helper_512_10 single-block routing helper (`304114ba7`), the float4-v
 moe_weighted_reduction (`f33ffaca7`), the split_j J/2 row split enabling B's Q8_0 I=64
 config rows (`6d457634e` - see the latent-defect record) and the gfx1151-gated 2-slice chunk
 merge for the mmq q8_1 feed quantize (`0a3a2b498` - see the 2026-09-13 quantize-chunk record;
-n_chunks is a runtime arg from mmq.cu's cc, gated to gfx1151, byte-identical elsewhere). The managed reader's batched cold-page fetch (`3cb9168be`)
+n_chunks is a runtime arg from mmq.cu's cc, gated to gfx1151, byte-identical elsewhere) and the
+repeat-anchored hc_combine+norm fusion absorb (`b987877d7` - qwen4exp pins block_out/inject +
+pre-expands the scale chain, the scheduler absorbs the standalone per-layer block_out REPEAT
+reading the narrow base; repeats 384->8/pass, pp2048 0.936x->0.987x vs B - see the same record). The managed reader's batched cold-page fetch (`3cb9168be`)
 is folded INTO patch 1 (`managed-ngrams.patch`), so patch 1 carries the
 reader at its final state and patch 2 no longer touches
 `llama-lazy-reader.*`.
