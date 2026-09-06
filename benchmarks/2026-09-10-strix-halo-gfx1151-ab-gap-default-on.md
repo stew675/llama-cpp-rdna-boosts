@@ -68,8 +68,30 @@ comparison needs r3). A is unaffected (deterministic count/scan indexer, no cub 
 ## Next attack (shallow-row per-token tail)
 
 Per the ledger, the largest remaining component at pp512-4096@0 is the MoE routing/reduction
-tail: port B's `ggml_cuda_op_weighted_expert_sum` / `ggml_cuda_mul_mat_id_weighted_rdna3_5`
-(IQ4_NL down-proj fused with the n_used=10 weighted sum) graph fusions into A's ggml-cuda.cu,
-then re-measure pp512-2048@0. Verify A's graph pattern matches B's before porting. A secondary
-target for tg@0: A 25.07 vs B 25.96 (+3.5% — some of this closed already by the shortcut tg win;
-decode levers tracked in beta/qwen4exp README).
+tail. SCOPED this session (2026-09-10) — port B's weighted-down fusion into A, then re-measure
+pp512-2048@0. The port is mechanically clean:
+- A's graph ALREADY emits B's fusion pattern: `build_moe_ffn` (A src/llama-graph.cpp ~2252)
+  emits `down = mul_mat_id(...)` [n_embd x n_used=10 x n_tokens] -> `ggml_mul(weights)` ->
+  10 VIEWs -> 9 ADDs (weight_after_ffn: `weight_before_ffn = (arch == LLM_ARCH_LLAMA4)` is
+  false for qwen4exp). No A graph change needed.
+- A has the fusion infra: `ggml_can_fuse_subgraph` + `ggml_cuda_check_fusion_memory_ranges`
+  (ggml-cuda.cu ~3222-3321).
+- B's pieces to port: `mul_mat_id_{iq4_nl,q8_0}_weighted_rdna3_5` kernels + `_ok()` + dispatch
+  (B ggml/src/ggml-cuda/mmvq.cu ~2945-3065, declared in mmvq.cuh:46-47) and the CUDA fusion
+  matcher (B ggml/src/ggml-cuda/ggml-cuda.cu ~4055-4095, env `GGML_CUDA_DISABLE_WEIGHTED_DOWN`):
+  matches mul_mat_id + MUL + 10 VIEW + 9 ADD with n_used=10, contiguous, memory-range check;
+  the kernel computes all selected experts for one output row in a wave and applies routing
+  weights in the GEMM epilogue (avoids the [n_embd, 10, n_tokens] intermediate + the separate
+  reduction launches).
+- OPEN QUESTION for the port session: B's weighted kernels cover IQ4_NL + Q8_0 only. This
+  model's expert down-proj type mix per layer must be enumerated (rocprof said IQ3_S/IQ4_NL-
+  heavy) to know the coverage; if IQ3_S layers exist they are NOT fused in B either, so the port
+  reproduces B's behavior 1:1 and the measurement decides whether extending to IQ3_S is worth
+  a follow-up.
+- Validation: fused == unfused coherence (same-seed text, deterministic substrate), then
+  same-session pp512-2048@0 A-vs-B. This kernel is NOT bit-exact by construction (weights
+  applied in the GEMM epilogue with rn rounding vs the graph's separate mul/add) — verify
+  fused-vs-unfused output equality per the WS4 recipe before perf.
+
+A secondary target for tg@0: A 25.07 vs B 25.96 (+3.5% — some of this closed already by the
+shortcut tg win; decode levers tracked in beta/qwen4exp README).
