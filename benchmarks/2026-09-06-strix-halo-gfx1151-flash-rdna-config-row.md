@@ -57,7 +57,27 @@ quantize swiglu/<*,true> 2x-call structure (+72ms/4dec), GDN scan+kkt (+46ms), C
 bucket (+45ms), k_get_rows + launches. Raw: /tmp/prof/Aflashprobe{,2}_results.db (probe1
 results = committed build; probe2 = Q_in_reg experiment).
 
-## Negative result: scheduler-level gate+up pair merge (B's mul_mat_q_pair) breaks A's numerics
+## RESOLVED (commit 6a80b695c): B's mul_mat_q_pair ported - scatter deduped per layer
+
+Follow-up session: the earlier "negative result" misdiagnosed the cause. The kernel-stream
+diff (ref vs pair variants, pp2048-r1) showed the merge is numerically TRANSPARENT for all 47
+main layers; the ENTIRE logitcmp divergence was ONE site - blk.47, the gathered single-token
+last layer (mmq_cols=1). The first port dropped B's `!use_mmvq` exclusion: B only pairs when
+the single-node path would use mmq, and blk.47 (cols=1, mmvq territory) must keep its decode
+path (weighted_rdna3_5/mmvq). Adding B's ncols_dst<=MMVQ_MAX_BATCH_SIZE + mmvq_mmid_max_batch
+exclusion -> BIT-IDENTICAL. (The earlier "2x-single dispatch diverges" observation was the same
+blk.47 hijack: the 2x-single test still enabled the DENSE merge which caught blk.47's shexp
+pair - my isolation matrix was confounded; the clean split proved dispatch+merge both correct.)
+
+LANDED (6a80b695c): mmq.cu ggml_cuda_mul_mat_q_pair (ids dedup-scatter + dense branches, A's
+gfx1151 q8_1 chunking, per-weight fallback/J_max), mmq.cuh decl, try_fuse matcher (same
+src1/ids, same shapes, both mmq, equal ds layout, non-fp4, !use_mmvq). Per 4 pp2048 decodes:
+scatter 376->188, dense quantize 4792->4604, mm_ids_helper 564->376, kernels 15905->15341,
+capture total 9.980->9.751s (-229ms). Same-session depth-0 A/B: pp2048 775.8/773.9 (1.002x A,
+was 0.992), pp4096 1.018x, pp1024 1.014x, pp512 1.013x - ALL FOUR rows at/above B. Series now
+19 patches (ws6-mmq-mul-mat-q-pair), verified from-scratch -> 6a80b695c.
+
+## (superseded) Negative result: scheduler-level gate+up pair merge (B's mul_mat_q_pair) breaks A's numerics
 
 Gap #2 of the ledger re-derived precisely: quantize_mmq_q8_1<*,true> (dedup-scatter feed) A 376
 calls/0.125s vs B 188/0.061s (identical grids 262144x3) = +64ms/4dec. SWIGLU was actually AT

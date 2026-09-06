@@ -1,0 +1,222 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 94a0f59ff..066a10f70 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3668,6 +3668,45 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    // two consecutive MUL_MAT(_ID) nodes sharing src1/ids (qwen4exp sparse-MoE gate+up pair,
++    // shared-expert up+gate pair): merge into one shared activation quantize + one mm_ids_helper
++    // (halo-box port ggml_cuda_mul_mat_q_pair). Only the mmq q8_1-feed path (prefill): both types
++    // mmq-eligible for these cols/experts, identical weight/dst shapes, equal ds layout, same
++    // src1 (and ids). The per-node dedup scatter quantize used to run 2x/layer on identical
++    // rows (grid 262144x3); the pair runs it once and both muls read the same q8_1 buffer.
++    static const bool pair_off        = getenv("GGML_PAIR_OFF") != nullptr;
++    static const bool disable_pair_dense = getenv("GGML_PAIR_DENSE_OFF") != nullptr;
++    if (!pair_off && (node->op == GGML_OP_MUL_MAT_ID || (node->op == GGML_OP_MUL_MAT && !disable_pair_dense)) && i + 1 < cgraph->n_nodes) {
++        ggml_tensor * next = cgraph->nodes[i + 1];
++        const ggml_tensor * src0 = node->src[0];
++        const ggml_tensor * src0_next = next->src[0];
++        const bool has_ids = node->op == GGML_OP_MUL_MAT_ID;
++        const bool valid_sources = next->op == node->op && src0 && src0_next && node->src[1] && next->src[1] &&
++            (!has_ids || (node->src[2] && next->src[2]));
++        const bool shared_inputs = valid_sources && node->src[1] == next->src[1] &&
++            (!has_ids || node->src[2] == next->src[2]);
++        const int64_t mmq_cols = shared_inputs ? (has_ids ? node->src[1]->ne[2] : node->src[1]->ne[1]) : 0;
++        const int64_t n_experts = shared_inputs && has_ids ? src0->ne[2] : 0;
++        const bool use_mmq = shared_inputs && node->src[1]->type == GGML_TYPE_F32 &&
++            node->type == GGML_TYPE_F32 && next->type == GGML_TYPE_F32 &&
++            src0->type != GGML_TYPE_NVFP4 && src0->type != GGML_TYPE_MXFP4 &&
++            src0_next->type != GGML_TYPE_NVFP4 && src0_next->type != GGML_TYPE_MXFP4 &&
++            ggml_are_same_shape(src0, src0_next) && ggml_are_same_shape(node, next) &&
++            ggml_cuda_should_use_mmq(src0->type, cc, mmq_cols, n_experts) &&
++            ggml_cuda_should_use_mmq(src0_next->type, cc, mmq_cols, n_experts) &&
++            mmq_get_q8_1_ds_layout(src0->type) == mmq_get_q8_1_ds_layout(src0_next->type);
++        // single-token/gathered (mmvq territory, e.g. the blk.47 gather in prefill) must keep the
++        // per-node decode path: the merged mmq kernels would change numerics there (B's !use_mmvq).
++        const int64_t ncols_dst = has_ids ? node->ne[2] : node->ne[1];
++        const bool use_mmvq = ncols_dst <= MMVQ_MAX_BATCH_SIZE &&
++            (!has_ids || ncols_dst <= get_mmvq_mmid_max_batch(src0->type, cc) ||
++                         ncols_dst <= get_mmvq_mmid_max_batch(src0_next->type, cc));
++        if (use_mmq && !use_mmvq) {
++            ggml_cuda_mul_mat_q_pair(*cuda_ctx, node, next);
++            return 1;
++        }
++    }
++
+     if (node->op == GGML_OP_MUL) {
+         ggml_moe_weighted_reduction_match match;
+         static const bool mwr_dbg2 = getenv("GGML_CUDA_MWR_DEBUG") != nullptr;
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 9915f88d0..247af03a7 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -109,6 +109,155 @@ static void ggml_cuda_mul_mat_q_switch_type_gate(ggml_backend_cuda_context & ctx
+     }
+ }
+ 
++// halo-box merge: two consecutive MUL_MAT(_ID) nodes sharing src1 (and ids) - the qwen4exp
++// sparse-MoE gate+up pair and the shared-expert gate+up pair - share ONE activation quantize
++// (and ONE mm_ids_helper for the ids case). The dedup-scatter quantize of the shared broadcast
++// activation rows used to launch once per node (2x identical per-layer scatter launches); here
++// it runs once and both muls read the same q8_1 buffer. Dispatch condition in ggml_cuda_try_fuse
++// guarantees: both muls mmq-eligible, same op (MUL_MAT_ID/MUL_MAT), same src1/ids, same weight
++// and dst shapes, equal q8_1 ds layouts, non-native-fp4 types. Numerics: the merged mm_ids_helper
++// and quantize kernels compute exactly the same values as the per-node launches (same inputs),
++// and each mul runs its own unmodified mmq kernel - so results are bit-identical.
++void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1) {
++    GGML_ASSERT(dst0->src[1] == dst1->src[1]);
++    GGML_ASSERT(dst0->src[2] == dst1->src[2]);
++
++    const ggml_tensor * src0s[] = { dst0->src[0], dst1->src[0] };
++    ggml_tensor * dsts[] = { dst0, dst1 };
++    const ggml_tensor * src1 = dst0->src[1];
++    const ggml_tensor * ids = dst0->src[2];
++    const ggml_tensor * src0 = src0s[0];
++
++    GGML_ASSERT(src1->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst0->type == GGML_TYPE_F32 && dst1->type == GGML_TYPE_F32);
++    GGML_ASSERT(mmq_get_q8_1_ds_layout(src0->type) == mmq_get_q8_1_ds_layout(src0s[1]->type));
++
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    cudaStream_t stream = ctx.stream();
++    // gfx1151: chunk the q8_1 mmq-feed quantize (see quantize.cuh)
++    const int q8_1_chunks = ggml_cuda_quantize_mmq_q8_1_n_chunks(cc);
++
++    const int64_t ne10 = src1->ne[0];
++    const int64_t ne11 = src1->ne[1];
++    const int64_t ne12 = src1->ne[2];
++    const int64_t ne13 = src1->ne[3];
++    const int64_t ts_src1 = ggml_type_size(src1->type);
++    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
++    const float * src1_d = (const float *) src1->data;
++
++    if (ids == nullptr) {
++        // dense pair (e.g. shared-expert up+gate): one quantize of the shared activation
++        size_t nbytes_src1_q8_1 = ne13*ne12*ne11*ne10_padded * sizeof(block_q8_1_mmq) / QK8_1_MMQ;
++        for (int i = 0; i < 2; ++i) {
++            const ggml_tensor * src0_i = src0s[i];
++            GGML_ASSERT(dsts[i]->src[1] == src1);
++            GGML_ASSERT(src0_i->ne[0] == ne10);
++            const bool fallback = src0_i->ne[1] % 128 != 0;
++            nbytes_src1_q8_1 = std::max(nbytes_src1_q8_1,
++                ne13*ne12*ne11*ne10_padded * sizeof(block_q8_1_mmq) / QK8_1_MMQ +
++                ggml_cuda_mmq_get_J_max(src0_i->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq));
++        }
++        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
++        const int64_t s11 = src1->nb[1] / ts_src1;
++        const int64_t s12 = src1->nb[2] / ts_src1;
++        const int64_t s13 = src1->nb[3] / ts_src1;
++        quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
++                               ne10_padded, ne11, ne12, ne13, q8_1_chunks, stream);
++        CUDA_CHECK(cudaGetLastError());
++        const int64_t s12_q = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
++        const int64_t s13_q = ne12 * s12_q;
++        for (int i = 0; i < 2; ++i) {
++            const ggml_tensor * src0_i = src0s[i];
++            ggml_tensor * dst_i = dsts[i];
++            const size_t ts_src0 = ggml_type_size(src0_i->type);
++            const int64_t s01 = src0_i->nb[1] / ts_src0;
++            const int64_t s02 = src0_i->nb[2] / ts_src0;
++            const int64_t s03 = src0_i->nb[3] / ts_src0;
++            const int64_t s1 = dst_i->nb[1] / sizeof(float);
++            const int64_t s2 = dst_i->nb[2] / sizeof(float);
++            const int64_t s3 = dst_i->nb[3] / sizeof(float);
++            const mmq_args args = {
++                (const char *) src0_i->data, src0_i->type, (const int *) src1_q8_1.get(), nullptr, nullptr, (float *) dst_i->data,
++                nullptr,
++                src0_i->ne[0], src0_i->ne[1], dst_i->ne[1], s01, ne11, s1,
++                src0_i->ne[2], ne12, s02, s12_q, s2,
++                src0_i->ne[3], ne13, s03, s13_q, s3,
++                dst_i->ne[1]};
++            ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
++        }
++        return;
++    }
++
++    // MUL_MAT_ID pair (sparse-MoE gate+up): one mm_ids_helper + one dedup-scatter quantize
++    GGML_ASSERT(ne13 == 1);
++    GGML_ASSERT(src1->nb[2] % src1->nb[1] == 0);
++    GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
++    GGML_ASSERT(src0s[0]->ne[2] == src0s[1]->ne[2]);
++
++    // ISOLATION HOOK: run the two muls through the ORIGINAL single-node path (no merge)
++    if (getenv("GGML_PAIR_2X") != nullptr) {
++        ggml_cuda_mul_mat_q(ctx, dst0->src[0], dst0->src[1], dst0->src[2], dst0, nullptr, nullptr);
++        ggml_cuda_mul_mat_q(ctx, dst1->src[0], dst1->src[1], dst1->src[2], dst1, nullptr, nullptr);
++        return;
++    }
++
++    const int64_t n_expert_used = ids->ne[0];
++    const int64_t ne_get_rows = ne12*n_expert_used;
++    GGML_ASSERT(ne11 == 1 && n_expert_used > 1);
++    const bool dedup_bcast = true;
++
++    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
++    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
++    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), src0s[0]->ne[2] + 1);
++    {
++        const int si1  = ids->nb[1] / ggml_element_size(ids);
++        const int sis1 = src1->nb[2] / src1->nb[1];
++        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
++            src0s[0]->ne[2], ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1_mmq) / QK8_1_MMQ;
++    for (int i = 0; i < 2; ++i) {
++        const ggml_tensor * src0_i = src0s[i];
++        const bool fallback = src0_i->ne[1] % 128 != 0;
++        nbytes_src1_q8_1 = std::max(nbytes_src1_q8_1,
++            ne12*n_expert_used*ne10_padded * sizeof(block_q8_1_mmq) / QK8_1_MMQ +
++            ggml_cuda_mmq_get_J_max(src0_i->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq));
++    }
++    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
++    {
++        const int64_t s11 = src1->nb[1] / ts_src1;
++        const int64_t s12 = src1->nb[2] / ts_src1;
++        const int64_t s13 = src1->nb[3] / ts_src1;
++        quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
++                                /*stride_token=*/s12, ne10_padded, ne12, ne_get_rows, n_expert_used, q8_1_chunks, stream);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    const int64_t s12_q = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
++    const int64_t s13_q = ne12*s12_q;
++    for (int i = 0; i < 2; ++i) {
++        const ggml_tensor * src0_i = src0s[i];
++        ggml_tensor * dst_i = dsts[i];
++        const size_t ts_src0 = ggml_type_size(src0_i->type);
++        const int64_t s01 = src0_i->nb[1] / ts_src0;
++        const int64_t s02 = src0_i->nb[2] / ts_src0;
++        const int64_t s03 = src0_i->nb[3] / ts_src0;
++        const int64_t s1 = dst_i->nb[1] / sizeof(float);
++        const int64_t s2 = dst_i->nb[2] / sizeof(float);
++        const int64_t s3 = dst_i->nb[3] / sizeof(float);
++        const mmq_args args = {
++            (const char *) src0_i->data, src0_i->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), (float *) dst_i->data,
++            nullptr,
++            src0_i->ne[0], src0_i->ne[1], ne_get_rows, s01, ne_get_rows, s1,
++            src0_i->ne[2], src0_i->ne[2], s02, s12_q, s2,
++            src0_i->ne[3], ne13, s03, s13_q, s3,
++            ne12};
++        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
++    }
++}
++
+ void ggml_cuda_mul_mat_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+         const ggml_cuda_mm_fusion_args_host * fusion, const ggml_tensor * swiglu) {
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 7b2fd263c..801f990d2 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1933,4 +1933,7 @@ void ggml_cuda_mul_mat_q(
+ void ggml_cuda_mul_mat_q_swiglu(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * swiglu);
+ 
++void ggml_cuda_mul_mat_q_pair(
++        ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1);
++
+ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
