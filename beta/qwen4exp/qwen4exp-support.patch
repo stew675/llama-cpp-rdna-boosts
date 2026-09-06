@@ -1176,19 +1176,6 @@ index 6df89013c..408cbce3d 100644
      if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
          const T * src0_d = (const T *) src0->data;
          const T * src1_d = (const T *) src1->data;
-diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index 9c07e56a1..e099943e2 100644
---- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-+++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-@@ -159,7 +159,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
-     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 2,  32, 128, 128, 128, 1, true);
-     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32, 128, 128, 128, 1, true);
-     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 1, true);
--    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 2,  32, 128, 128,  32, 1, true);
-+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 1,  32, 128,  64,  64, 1, false); // B's halo row (Q_in_reg=false: Q smem staging beats 256-vgpr pressure)
- 
-     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 256, 2,  64,  96,  16,  16, 1, true);
-     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 256, 2,  64,  96,  16,  16, 1, true);
 diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
 new file mode 100644
 index 000000000..d61e96a68
@@ -1861,42 +1848,6 @@ index 000000000..0a2059477
 +
 +void ggml_cuda_flash_attn_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +bool ggml_cuda_flash_attn_qsa_supported(int device, const ggml_tensor * dst);
-diff --git a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
-index 41d16bc0c..944110792 100644
---- a/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
-+++ b/ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
-@@ -67,11 +67,14 @@
- #define GDN_BF16_KP  132                // LDS row pitch of the [.][KD] buffers, in shorts
- #define GDN_BF16_AP  68                 // LDS row pitch of the [.][BT] buffers, in shorts
- #define GDN_BF16_WP  GDN_BF16_AP
--#define GDN_BF16_NW  8                  // waves per scan workgroup
-+#define GDN_BF16_NW  16                 // waves per scan workgroup (512 thr: 1 block/CU at 61KB LDS,
-+                                        //   4 warps/SIMD for latency hiding; needs >= ~106K VGPRs/CU -
-+                                        //   gfx1151 (196608) fits; re-validate gfx1100/gfx1101 launch
-+                                        //   fitness, else revert to 8 with the 2x2 mapping)
- #define GDN_BF16_NTHR (GDN_BF16_NW * 32)
--#define GDN_BF16_NTV 2                  // n tiles per wave in the scan's main / V' / O loops
--#define GDN_BF16_SKT 2                  // state k-tiles per wave (2x2 over the 8x4 grid)
--#define GDN_BF16_SVT 2
-+#define GDN_BF16_NTV 1                  // n tiles per wave in the scan's main / V' / O loops
-+#define GDN_BF16_SKT 2                  // state k-tiles per wave (2x1 over the 8x4 grid)
-+#define GDN_BF16_SVT 1
- #define GDN_BF16_NST (GDN_BF16_SKT * GDN_BF16_SVT)
- #define GDN_BF16_KKT_NW 4               // waves per kkt workgroup
- #define GDN_BF16_KKT_NTHR (GDN_BF16_KKT_NW * 32)
-@@ -481,9 +484,9 @@ gdn_bf16_scan_cuda(
-     const int64_t iq3 = fastdiv((uint32_t) nq, rq3_magic);
-     const int64_t state_seq_base = (int64_t) nq * state_seq_stride + (int64_t) h * GDN_BF16_VD * GDN_BF16_KD;
- 
--    // wave tile mapping: [BT][BV] = 4x4 tile grid, 2 tiles/wave; state 2x2 over the 8x4 grid
--    const int mt  = w >> 1, ntb = (w & 1) * 2;
--    const int kt0 = (w >> 1) * 2, vt0 = (w & 1) * 2;
-+    // wave tile mapping: [BT][BV] = 4x4 tile grid, 1 tile/wave (16 warps); state 2x1 over the 8x4 grid
-+    const int mt  = w >> 2, ntb = (w & 3);
-+    const int kt0 = (w >> 2) * 2, vt0 = (w & 3);
- 
-     // ---- the state accumulator: C[m=k-dim][n=v], transposed so the writeback to s.S is
-     // ---- four packed 8-short stores instead of 32 scalar ds_store_b16 -----------------------
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index f96e67bb4..0294a2c1f 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
@@ -4087,7 +4038,7 @@ index ed0851dcf..a13c5e4e6 100644
          case  2:
              launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
 diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
-index 0aecddf66..55914e7a3 100644
+index e2ca61df6..55914e7a3 100644
 --- a/ggml/src/ggml-cuda/unary.cu
 +++ b/ggml/src/ggml-cuda/unary.cu
 @@ -282,7 +282,8 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst,
@@ -4128,74 +4079,6 @@ index 0aecddf66..55914e7a3 100644
  }
  
  void ggml_cuda_op_unary_mul_q8_1(ggml_backend_cuda_context & ctx,
-@@ -818,3 +827,54 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
-         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
-     }
- }
-+
-+/* fused scale + unary (qwen4exp hc low-rank gate, silu(x/hc) etc.)
-+ * halo-box/strix-llama.cpp port: when a SCALE node feeds a SILU/SIGMOID unary,
-+ * apply the activation while scaling - one kernel, one memory pass, no
-+ * intermediate. Numerically identical to the two separate kernels
-+ * (dst = op(scale*x + bias), same per-element expression and order).
-+ */
-+
-+template <float (*op)(float)>
-+static __global__ void scale_unary_kernel(const float * x, float * dst, const float scale, const float bias, const int k) {
-+    ggml_cuda_pdl_lc();
-+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
-+
-+    if (i >= k) {
-+        return;
-+    }
-+
-+    ggml_cuda_pdl_sync();
-+    dst[i] = op(scale * x[i] + bias);
-+}
-+
-+template <float (*op)(float)>
-+static void scale_unary_cuda(const float * x, float * dst, const float scale, const float bias, const int k, cudaStream_t stream) {
-+    const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
-+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
-+    ggml_cuda_kernel_launch(scale_unary_kernel<op>, launch_params, x, dst, scale, bias, k);
-+}
-+
-+void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node) {
-+    const ggml_tensor * src = scale_node->src[0];
-+    cudaStream_t stream = ctx.stream();
-+
-+    GGML_ASSERT(src->type == GGML_TYPE_F32 && scale_node->type == GGML_TYPE_F32 && unary_node->type == GGML_TYPE_F32);
-+    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(unary_node));
-+    GGML_ASSERT(unary_node->src[0] == scale_node);
-+
-+    const float scale = ggml_get_op_params_f32(scale_node, 0);
-+    const float bias  = ggml_get_op_params_f32(scale_node, 1);
-+    const int   k     = ggml_nelements(src);
-+
-+    switch (ggml_get_unary_op(unary_node)) {
-+        case GGML_UNARY_OP_SILU:
-+            scale_unary_cuda<op_silu>((const float *) src->data, (float *) unary_node->data, scale, bias, k, stream);
-+            break;
-+        case GGML_UNARY_OP_SIGMOID:
-+            scale_unary_cuda<op_sigmoid>((const float *) src->data, (float *) unary_node->data, scale, bias, k, stream);
-+            break;
-+        default:
-+            GGML_ABORT("unsupported unary op for fused scale+unary");
-+    }
-+}
-diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
-index 6b56041f6..2a8c2e20c 100644
---- a/ggml/src/ggml-cuda/unary.cuh
-+++ b/ggml/src/ggml-cuda/unary.cuh
-@@ -43,6 +43,8 @@ void ggml_cuda_op_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
- 
- void ggml_cuda_op_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
- 
-+void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node);
-+
- void ggml_cuda_op_hardsigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
- 
- void ggml_cuda_op_exp(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-moe-weighted-reduction.h b/ggml/src/ggml-moe-weighted-reduction.h
 new file mode 100644
 index 000000000..c90460a45
