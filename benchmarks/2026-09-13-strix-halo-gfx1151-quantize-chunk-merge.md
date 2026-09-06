@@ -69,6 +69,35 @@ element math unchanged); cli text byte-identical. quantize_mmq_q8_1<*,false> 0.6
 4. swiglu/scatter quantize A fires 2x calls (376 vs 188): graph-level (B merges has_gate work
    into fewer quantize passes).
 
+## Repeat-bcast investigation (2026-09-13 cont.): hc_combine prefill fusion REVERTED - net-negative
+
+The per-layer repeat (A 96/pass at grid 1280x4 ~0.47ms = the build_hc_combine b-broadcast of
+block_out (n_embd,1,nt) -> (n_embd,hc,nt)) looked removable: ggml's k_bin_bcast indexes src0
+with RAW dst indices (no mod) - only src1 broadcasts - so the repeat is NOT redundant; the
+real lever is the fused GGML_OP_HC_COMBINE op (hc-mix.cu hc_combine_kernel), which was
+decode-only (nt==1 assert + inject read at t=0 only), while the op builder (ggml.c) and CPU
+ref (ops.cpp) were already token-general with bit-exact RN math.
+
+Attempted: (1) generalized hc_combine_kernel to nt>1 (blockIdx.y = token, per-token w_s,
+stride-based block_out indexing - layout note: prefill block_out is a view with nb[1]=n_embd*4
+regardless of ne[1]); (2) lifted the nt==1 gate in build_hc_combine. Result: logitcmp
+BIT-IDENTICAL (the fused kernel IS numerically exact), repeat gone (384->8) BUT net WORSE:
++372 rms_norm_f32<1024,false> AND +368 k_bin_bcast<op_mul> appeared (+0.63s) - the custom
+GGML_OP_HC_COMBINE node broke the scheduler's pattern fusion at ggml-cuda.cu ~4919, which
+matches the STANDARD chain scale(sigmoid)->scale->repeat->mul->add->rms->mul(gamma) and
+consumes the repeat into ONE hc_combine_norm_f32 dispatch (its bo/GGML_OP_REPEAT handling at
+~4985). With the chain replaced by the custom op the following rms_norm+gamma unglued into
+separate rms_norm_f32<1024> + op_mul kernels. REVERTED (tree back at 0a3a2b498).
+
+KEY UNRESOLVED: A fires BOTH ~93 hc_combine_norm_f32/pass (2/layer - the codebase fusion IS
+active at prefill, n_tok>=1 allowed) AND ~96 op_repeat/pass (2/layer). Only ~half the
+combines fuse; need a per-pass op census (single-pass graph walk) to see which combine
+instances the fusion misses and why (node-order contiguity? bo/repeat edge cases? PLE or
+layer-boundary combines). B: 94 hc_combine_norm_f32 but only 12 repeats/4pass -> B's graph
+never emits the wide block_out repeat (B keeps block_out hc-wide or its fusion consumes every
+combine). A's hc_combine_norm_f32 is also +22%/call slower than B's (1.48 vs 1.21ms med) on
+identical counts. Both remain open.
+
 ## gfx1151 gate / deferred validation ledger
 
 - CHUNKED QUANTIZE: gated to gfx1151 ONLY (cc == GGML_CUDA_CC_RDNA3_5+1). gfx1150 (Strix
