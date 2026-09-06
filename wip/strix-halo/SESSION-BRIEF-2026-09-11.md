@@ -57,23 +57,22 @@ for the full evidence. Remaining items are in the ledger at the bottom.
 
 ## NEXT SESSION (in order — all lower priority than done items; nothing urgent queued)
 
-1. (Maintainer call) Route patches 6-7 into the delivery/beta flow formally (they are staged +
-   verified; nothing pushed) and decide whether the ggml fix should become an UPSTREAM PR
-   candidate (core-ggml, arch-agnostic; llama.cpp would benefit generally — any
-   shape-alternating pipelined workload). If upstreaming: needs its own clean branch/PR flow
-   per AGENTS (never push from ~/llama.cpp).
-2. gfx1201/RDNA4 validation via the delivery flow when a box is available: (a) patch 6 on
-   multi-GPU/pipeline-parallel (the no-sync ordering argument holds per-device — buffers are
-   device-private and each device's splits are stream-ordered — but verify), (b) patch 5's
-   RDNA3.5 gate stays OFF on RDNA4 until then, (c) patches 6-7 overall on the gfx1201 box.
+1. (MAINTAINER DECISIONS, 2026-09-10 — recorded so they do not resurface): patches 6-7 stay as a
+   staged COLLECTION in beta/qwen4exp/ (likely to be SQUASHED together with earlier patches
+   later; no per-patch routing ceremony needed now). The ggml fix (patch 6) is NOT an upstream
+   candidate at this moment (maybe another day). gfx1201 / multi-GPU validation is DEFERRED
+   until ALL Strix Halo work is done (less churn) — do not schedule it per-change.
+2. ACTIVE CAMPAIGN (maintainer direction 2026-09-10): equal/surpass the community repo (B) for
+   PREFILL and TG at EVERY data point (depths 0/12k/32k x pp512..16384 + tg128). First step:
+   re-derive the A-vs-B gap matrix on the NEW default (A shortcut ON = dense-below-width like B,
+   so depth-0 rows now compare regime-matched); then attack the largest remaining component per
+   the WS1 attribution (A's per-ubatch elementwise/norm/cpy + MoE routing/reduction tail vs B's
+   fused hc_* + weighted-expert-sum/concat graph ops; decode TG@0 vs B ~26 t/s).
 3. (If requested) the MoE routing/reduction tail: B's ggml_cuda_op_weighted_expert_sum +
    ggml_cuda_mul_mat_id_weighted_rdna3_5 (IQ4_NL down-proj fused with the n_used=10 weighted
    sum) graph fusions into A's ggml-cuda.cu — the biggest remaining pp512-4096 gap component
    after WS3 #3. Verify the A graph pattern matches B's before porting.
-4. Re-derive the A-vs-B gap on the NEW default (regime note: A's default is now dense-below-
-   width like B; depth-0 rows should compare more fairly — B's deep-row advantage is its dense
-   attention at depth, A's QSA sparse is the at-depth win, unchanged). WS6 re-base NOT
-   indicated.
+4. WS6 re-base NOT indicated.
 
 ## Carried-forward open items (full ledger)
 
