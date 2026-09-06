@@ -272,6 +272,19 @@ following users for the assistance in finding issues and offering solutions!
 
 I, and everyone else who benefits from this work, really appreciate you!
 
+## Inspirational Works
+
+While most of the work in this repository are original works of my own, there are
+some significant portions, most notably around the prefill tuning, inspired by the
+excellent work performed by the community of: https://github.com/halo-box/strix-llama.cpp
+
+Thank you to all the maintainers of the Strix Halo Llama.cpp project
+
+Of course none of this would be possible without the baseline that all of this rests
+on, and that is the huge community over at https://github.com/ggml-org/llama.cpp
+
+Many thanks to the llama.cpp team
+
 ## License
 
 Same as llama.cpp (MIT).
