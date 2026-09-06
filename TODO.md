@@ -4,14 +4,14 @@ Cross-project tracker so important state survives context compaction.
 Forward-looking: open items + current active experiments; closed work is a
 one-line bullet (details live in AGENTS.md, patches/README.md, MANIFESTS.md,
 `beta/qwen4exp/README.md`, `wip/` handovers, `benchmarks/`). Current
-delivery = the 13-patch set against fork point `9cffdcc80` (blocks 01-13).
-Reality pass: 2026-09-10.
+delivery = the 13-patch set against fork point `465e49b9c` (blocks 01-13).
+Reality pass: 2026-09-05.
 
 ## Current active
 
 ### Strix Halo (gfx1151): prefill-gap follow-ons after WS4 (WS3 #2/#3)
 - WS3 #2 (QSA dense-shortcut below the selection width) DONE + DEFAULT
-  ON (2026-09-10, A commits `a2f2a6ceb` ggml fix + `250e48e97` flip;
+  ON (2026-09-05, A commits `a2f2a6ceb` ggml fix + `250e48e97` flip;
   beta patches 6-7): the llama-bench multi-ubatch artifact was
   ROOT-CAUSED (llama-bench's sync-free decode pipeline x ggml-gallocr's
   single-layout alloc-fallback doing an unconditional full-device sync on
@@ -26,8 +26,8 @@ Reality pass: 2026-09-10.
   reference, multi-ubatch deterministic. `LLAMA_QSA_DENSE_SHORTCUT` =
   0 forces the pre-flip selection path (known-good numerics); unset/=1 =
   ON (B parity). Record:
-  `benchmarks/2026-09-10-strix-halo-gfx1151-ws3-shortcut-fix.md`.
-- WS3 #3 (routed-compact MoE mmq for the i-quants) DONE (2026-09-08, A
+  `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-shortcut-fix.md`.
+- WS3 #3 (routed-compact MoE mmq for the i-quants) DONE (2026-09-05, A
   commit `1da01fa67`, DEFAULT ON): port of B's
   mul_mat_q_routed_compact + per-expert J selection
   (mmq_rdna3_5_id_get_J, 16/48/64/128 by rows-per-expert, gfx1151-tuned)
@@ -41,7 +41,7 @@ Reality pass: 2026-09-10.
   2.05->1.61x, pp1024 2.04->1.78x, pp2048 2.21->2.01x, pp4096 1.68->1.53x,
   pp8192 1.37->1.26x, pp16384 1.14->1.06x. Env opt-out:
   GGML_CUDA_DISABLE_MMQ_ROUTED=1 (compact only; J selection stays). Record:
-  `benchmarks/2026-09-08-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
+  `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
 - Remaining on the Strix prefill leg: (a) gfx1201/RDNA4 validation of
   the ggml fix (patch 6) + WS3 #3 gate (patch 5) via the delivery flow
   when a gfx1201 box is available (multi-GPU/pipeline-parallel not
@@ -62,7 +62,7 @@ Reality pass: 2026-09-10.
   and folded into patch `0013` (delivery regenerated at `9cffdcc80`,
   clean-apply sim + full build + coherence re-verified on the Strix
   box). Record:
-  `benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
+  `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
 - The beta/qwen4exp set now RUNS and is gated on Strix Halo: patches
   1-3 are the code base every Strix pp/decode number in this campaign
   was measured on (~/llama.cpp `qwen4exp` = beta base + block 13
@@ -88,7 +88,7 @@ Reality pass: 2026-09-10.
 
 ## Open follow-ups
 
-### Strix: REMAINING code-changing items (2026-09-13 consolidated list; all PREFILL - decode is closed)
+### Strix: REMAINING code-changing items (2026-09-06 consolidated list; all PREFILL - decode is closed)
 - (a) MoE topk-moe fusion adoption (~0.5%, prefill): replaces the full-512 argsort
   (25ms/capture) with the fused partial top-10. NUMERICS FORK - fused topk moves top1 logit
   18.424 -> 18.690 (B 18.086); needs a CPU-reference + PPL/KL quality gate before any
@@ -112,7 +112,7 @@ Reality pass: 2026-09-10.
   fewer kernels/step and sits at wall parity); GDN +72 launches (cosmetic).
 
 
-- FINDING (2026-09-06, record `benchmarks/2026-09-06-strix-halo-gfx1151-launch-overhead-topk.md`):
+- FINDING (2026-09-06, record `wip/archive/qwen4exp/discovery/2026-09-06-strix-halo-gfx1151-launch-overhead-topk.md`):
   A's MoE routing full-512 argsort per token (94 x 0.264ms = 25ms/capture ~0.5% wall) is the
   launch ledger's biggest TIME item. The CUDA topk-moe fusion that would replace it with a
   partial top-10 (B's path, 96 x 0.022ms) is byte-identical in both trees but A's newer
@@ -179,7 +179,7 @@ Reality pass: 2026-09-10.
   same-seed text on == off. Routed: `beta/qwen4exp/ws4-hc-prefill-fusions.patch`
   (4th beta patch; clean `git apply` at the beta base → applied tree
   byte-identical to `248e47704`). Record:
-  `benchmarks/2026-09-06-strix-halo-gfx1151-ws4-hc-fusion-gates.md`.
+  `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws4-hc-fusion-gates.md`.
 - 2026-09-06 Real determinism root cause FIXED (folded into the same
   qwen4exp commit/patch): the indexer top-k atomicAdd gather scrambled
   the QSA list ORDER run-to-run (>1 block/row) — replaced with an
@@ -224,7 +224,7 @@ Reality pass: 2026-09-10.
   RDNA4 J caps transfer (uncap probe regressed 1674 -> 1111). Delivery
   regenerated at `9cffdcc80`; clean-apply sim + full build + coherence
   re-verified on the Strix box. Record:
-  `benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
+  `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
 - 2026-09-05 Block 13 fused MoE MMQ ungated for RDNA3_0 (gfx1100 / RX
   7900 XTX) and folded into patch `0013` (canonical rebuild tip
   `8c2ace510`): validated on this single-GPU 7900XTX box (Qwen3.6-35B-A3B
@@ -237,7 +237,7 @@ Reality pass: 2026-09-10.
   build + coherence + perf re-verified on this box. Single GPU => block
   12 stays N/A here; the dual-7900XTX block-12 leg remains the parallel
   task. Record:
-  `benchmarks/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
+  `wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
 - 2026-09-05 Expert-tiering experiment dropped (see Parked).
 - Older resolved items (block-12 fused-stage/pacing closure, ITEM A JIT,
   indexer head-sum revert, qwen35moe dense-GQA N/A, ...) are recorded in

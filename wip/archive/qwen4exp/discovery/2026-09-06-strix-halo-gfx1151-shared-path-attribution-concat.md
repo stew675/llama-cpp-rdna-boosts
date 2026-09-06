@@ -1,8 +1,8 @@
 # Strix Halo (RDNA3.5 / gfx1151) — remaining pp gap attributed to the shared path; concat + swiglu-quantize ports landed
 
-Date: 2026-09-11. Commits: `2f8864cc8` (LLAMA_QSA_OFF gate) + `2bd516bab` (concat port) +
+Date: 2026-09-06. Commits: `2f8864cc8` (LLAMA_QSA_OFF gate) + `2bd516bab` (concat port) +
 `7a6a2e97b` (fused swiglu-input quantize) on `3cb9168be`. Follows the prefill fix records
-(2026-09-11-*-ple-host-gather, -*-managed-ple-batched-fetch).
+(2026-09-06-*-ple-host-gather, -*-managed-ple-batched-fetch).
 
 ## Finding: both A and B run the SAME QSA architecture; the remaining gap is the shared path
 

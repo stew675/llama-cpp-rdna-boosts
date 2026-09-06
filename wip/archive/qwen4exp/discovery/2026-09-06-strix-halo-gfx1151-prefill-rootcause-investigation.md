@@ -1,4 +1,4 @@
-# Strix Halo (RDNA3.5 / gfx1151) — prefill root-cause investigation (2026-09-10)
+# Strix Halo (RDNA3.5 / gfx1151) — prefill root-cause investigation (2026-09-05)
 
 Question (user framing): A and B run the SAME model on the SAME GPU; the tokens must be ingested
 and processed either way. At low depths (single-ubatch pp512-4096) A is far behind B in

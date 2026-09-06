@@ -1,6 +1,6 @@
 # Strix Halo (RDNA3.5 / gfx1151) — WS4 prefill hyperconn-fusion gates (final build)
 
-Date: 2026-09-06 (run from the 2026-09-07 session handoff)
+Date: 2026-09-05 (run from the 2026-09-05 session handoff)
 Machine: Ryzen AI MAX+ 395 w/ Radeon 8060S (Strix Halo APU), 16 C / 123 GB
 unified, single gfx1151 (rocm-smi carve-out 2 GiB; model runs from unified
 memory).  ROCm `/opt/rocm-7.14-gfx1151` (build toolchain AND runtime).
@@ -117,9 +117,9 @@ session's logit-level bit-exact + determinism proof on this build.
   (`ws4-hc-prefill-fusions.patch`) applied after the three existing patches
   (apply order verified on the beta base; see `beta/qwen4exp/README.md`).
   NEVER push from `~/llama.cpp`.
-- Follow-ons (same 2026-09-06 session / 2026-09-07): re-derive the
+- Follow-ons (same 2026-09-06 session / 2026-09-05): re-derive the
   remaining A-vs-B depth-0 pp gap post-fusion (fusion ON vs the community
   build) and WS3 #2 (dense shortcut below the selection width in
   `build_layer_attn`) / WS3 #3 (routed-compact MoE mmq for i-quants,
-  RDNA4-gated) — see `benchmarks/2026-09-06-strix-halo-gfx1151-post-fusion-gap.md`.
+  RDNA4-gated) — see `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-post-fusion-gap.md`.
   WS6 re-base still NOT indicated.

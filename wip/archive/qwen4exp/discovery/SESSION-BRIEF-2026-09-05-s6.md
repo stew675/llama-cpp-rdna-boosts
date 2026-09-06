@@ -1,4 +1,4 @@
-# Strix Halo session brief — handoff after 2026-09-11 (compact me; run the NEXT SESSION prompt)
+# Strix Halo session brief s6 (2026-09-05) — end state / handoff (compact me; run the NEXT SESSION prompt)
 
 ACTIVE GOAL (maintainer): equal/surpass the community repo (B, halo-box `~/strix-llama.cpp`
 c7af5c6c2, untouched ~1% reference) for PREFILL and TG at EVERY data point. CURRENT FOCUS:
@@ -9,7 +9,7 @@ below), keep QSA on, verify the depth lead; decode followup afterwards.
 
 - ~/llama.cpp (qwen4exp branch) tip `7a6a2e97b`. Chain: 248e47704 (WS4) -> 1da01fa67 (WS3#3
   routed mmq) -> a2f2a6ceb (ggml sched-fallback-sync fix) -> 250e48e97 (shortcut DEFAULT ON;
-  the opt-in commit was SQUASHED into this on 2026-09-11 - no opt-in commit exists) ->
+  the opt-in commit was SQUASHED into this on 2026-09-06 - no opt-in commit exists) ->
   b31940a5e (weighted-down decode fusion) -> 8b62ac25a (PLE host-gather prefill fix) ->
   3cb9168be (managed reader batched fetch) -> 2f8864cc8 (LLAMA_QSA_OFF gate knob) ->
   2bd516bab (transposed concat port) -> 7a6a2e97b (fused swiglu-input quantize port). Build
@@ -22,7 +22,7 @@ below), keep QSA on, verify the depth lead; decode followup afterwards.
   NO pushes (AGENTS: never from ~/llama.cpp; gfx1201 validation deferred until ALL Strix work
   is done; ggml fix NOT an upstream candidate now).
 
-## Prefill investigation — COMPLETE + root cause FIXED (records 2026-09-10/11)
+## Prefill investigation — COMPLETE + root cause FIXED (records 2026-09-05/11)
 
 1. The llama-bench shallow-row inflation was A's PLE n-gram table (28.8 GB IQ4_NL,
    input-layer = CPU-pinned) gathered by a single-threaded CPU get_rows faulting one 4 KB mmap
@@ -75,7 +75,7 @@ NEXT (in order):
   K/V cache crash; FA-off + tensor-split unsupported; decode levers; ML-Kernel/gpudh review.
 - Delivery/upstream monitors: ROCm unaligned split-load; MXFP4 fused MoE MMQ; dual-7900XTX
   block-12; LFRU parked. MTP deferred (mtp-adaptive-methodology.md).
-- Hygiene note: dated archive records (2026-09-06..09-10) reference pre-rewrite fork hashes -
+- Hygiene note: dated archive records (2026-09-05..09-06) reference pre-rewrite fork hashes -
   resolvable via fork-squash-backup-b004e9744 + the beta README map; do not "fix" them.
 
 Hygiene/protocol: llama-bench -ngl 99 -t 15 -r 3 -b 2048 -ub 2048 -fa on -ctk f16 -ctv f16

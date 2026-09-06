@@ -1,38 +1,38 @@
 # rdna-boosts patch set (delivery)
 
-13 patches against the llama.cpp fork point `9cffdcc80`
-("server : accept data: URLs for input_video and input_audio (#27735)";
-re-based 2026-09-02 from `0eadefebd`; block 12 amended 2026-09-04 with
+13 patches against the llama.cpp fork point `465e49b9c`
+("convert : add --fuse-qkv flag ... (#22780)"; re-based 2026-09-06 from
+`9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`; block 12 amended 2026-09-04 with
 the runtime NCCL-failure fallback (issue #13, see the block-12 notes
 below); block 13 amended 2026-09-02 with two MTP regression fixes and
 2026-09-05 with the RDNA3.5 (Strix Halo, gfx1151) + RDNA3.0 (gfx1100)
 fused-MoE-MMQ gate relaxations — see the block-13 notes below, the MTP
 baseline gate in
 `../benchmarks/mtp-adaptive-methodology.md`, the Strix record in
-`../benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`, and
+`../wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`, and
 the gfx1100 record in
-`../benchmarks/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`):
+`../wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`):
 
 | patch | content |
 |---|---|
 | `0001` | adaptive MTP draft depth |
-| `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | **amended 2026-09-13 with the gfx11 NW16 scan retune** (gated_delta_net_chunked_bf16_gfx11.cu, fork 376f02aa0).
+| `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | **amended 2026-09-06 with the gfx11 NW16 scan retune** (gated_delta_net_chunked_bf16_gfx11.cu, fork 376f02aa0).
 | `0003` | BF16 KV cache + native-BF16 flash-attn |
-| `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf | **amended 2026-09-13 with the RDNA WMMA (256,256,64) config row** (fattn-mma-f16.cuh, fork e7eecb369).
+| `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf | **amended 2026-09-06 with the RDNA WMMA (256,256,64) config row** (fattn-mma-f16.cuh, fork e7eecb369).
 | `0005` | CPU bit-identical decode/verify batches |
 | `0006` | host-buffer revert for discrete GPUs |
 | `0007` | meta device-wrapper skip |
-| `0008` | fused-core prefill kernels + GPU bit-identical results | **amended 2026-09-13 with the scale+unary fused kernel** (unary.cu/cuh, fork f5ac11903).
+| `0008` | fused-core prefill kernels + GPU bit-identical results | **amended 2026-09-06 with the scale+unary fused kernel** (unary.cu/cuh, fork f5ac11903).
 | `0009` | meta-buffer compute-container headroom |
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
-| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-13 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md.
+| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md.
 
 ## Apply (fresh checkout at the fork point)
 
 ```bash
-git checkout 9cffdcc80          # or: git apply each patch on a matching tree
+git checkout 465e49b9c         # or: git apply each patch on a matching tree
 git am patches/000[1-9]-*.patch patches/001[0-3]-*.patch
 ```
 
@@ -45,9 +45,41 @@ re-verified 2026-09-01 on the `0eadefebd` re-base, re-verified 2026-09-01
 with block 13 on the 13-patch series, re-verified 2026-09-02 on the
 `9cffdcc80` re-base, re-verified 2026-09-02 after the block-13 amendment,
 re-verified 2026-09-05 after the block-13 RDNA3_5 gate relaxation,
-re-verified 2026-09-05 after the RDNA3_0/gfx1100 fold).
+re-verified 2026-09-05 after the RDNA3_0/gfx1100 fold, re-verified
+2026-09-06 on the `465e49b9c` re-base).
 
-## 2026-09-02 re-base to 9cffdcc80 (current)
+## 2026-09-06 re-base to 465e49b9c (current)
+
+Upstream master moved **18 commits** past the fold-verified base
+`8b4b3558f` (57 past the old delivery fork point `9cffdcc80`).  The
+`~/llama.cpp` fork was rebuilt from `patches/` with
+`scripts/apply-all.sh` on the fresh master tip: 13/13 `git am` clean,
+**zero conflicts, zero whitespace warnings** (the ggml-cuda-touching
+upstream commits were `73a43d1f6` (**mmid/mmf race fixes**, #28475) and
+`5fdfa6282` (**GDN l2-norm fix**, #28068 — model-layer only); both
+landed in disjoint hunks and needed no manual merges).  Applied-tree
+check: on all 112 files upstream touched between the bases, the per-file
+deltas equal old-fork + upstream-drift exactly; the 14 remaining
+differing files are precisely the 2026-09-06 Strix fold delta the old
+pre-fold fork lacks.
+
+Set regenerated with `scripts/make-patches.sh` (base `465e49b9c`,
+blocks tip `c261553a1`; canonical am-commits `45bf4d291..c261553a1`)
+and `rdna-boosts-all.patch` refreshed (45 files; the previous copy was
+stale at 41, pre-fold).  Two prerequisites fixed along the way: (1) the
+fold (0044cfe) had stripped the format-patch mail headers from
+0002/0004/0008/0013 — restored from the pre-fold originals (canonical
+subjects/dates, 0013 body) so the set is `git am`-able again; (2) the
+re-base record of the 0013 block-13 message trailer re-dated to the
+fold's true date.
+
+Re-verified 2026-09-06: clean-apply sim on a fresh checkout at
+`465e49b9c` (`scripts/apply-all.sh`: **zero conflicts, zero whitespace
+warnings**; applied tree byte-identical to the fork tip `c261553a1`).
+Content is unchanged from the 2026-09-02/09-05 records — the re-base
+folds upstream's additions into the patch context only.
+
+## 2026-09-02 re-base to 9cffdcc80
 
 Upstream master moved **42 commits** past the fork point `0eadefebd`; the
 ggml-cuda-touching ones were `3d3d7c818` (unused-var removals in
@@ -331,7 +363,7 @@ baseline table live in `wip/qwen35moe-prefill/bench-config.md`.
   ~+14% (noisy, single ubatch); decode unchanged (tg128 71.5).  The
   caps transfer: uncapping J (128) on gfx1151 regressed pp2048 1674 ->
   1111 and pp16384 1423 -> 1334 (register pressure).  Full record:
-  `../benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
+  `../wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
 - **RDNA3_0 (gfx1100, RX 7900 XTX) validation (2026-09-05, folded into
   block 13):** the remaining excluded arch is now ungated — the same
   try_fuse arm + `J_max_gate` caps apply on RDNA3_0 (gfx1100) too.
@@ -348,7 +380,7 @@ baseline table live in `wip/qwen35moe-prefill/bench-config.md`.
   to the cap 64 — no per-arch port tuning needed.  Block 12 stays N/A
   here (single GPU); the dual-7900XTX block-12 leg remains a separate
   parallel task.  Full record:
-  `../benchmarks/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
+  `../wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
 
 ## Server config (the +22% deployment win)
 

@@ -1,6 +1,6 @@
 # Strix Halo (gfx1151) — LATENT mmq DEFECT discovered: A's mul_mat_q J=128 kernel computes wrong results at 32 accumulators/thread
 
-Date: 2026-09-11/12 (session continues the shared-path campaign). Tip: f33ffaca7 (clean). This
+Date: 2026-09-06/12 (session continues the shared-path campaign). Tip: f33ffaca7 (clean). This
 record documents a bug hunt triggered by adopting halo-box B's retuned RDNA3.5 mmq config
 (I=64 rows/block for the Q8_0 J=128 rows) that superficially looked like a +10% prefill win.
 

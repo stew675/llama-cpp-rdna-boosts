@@ -1,12 +1,12 @@
 # Strix Halo (RDNA3.5 / gfx1151) — pp2048 deficit: llama-bench inflation vs the real path
 
-SUPERSEDED IN FRAMING by `2026-09-10-strix-halo-gfx1151-prefill-rootcause-investigation.md`
+SUPERSEDED IN FRAMING by `2026-09-06-strix-halo-gfx1151-prefill-rootcause-investigation.md`
 (the measurements stand; the conclusion is corrected: the llama-bench-only CPU input-embedding
 cost is a REAL A-side ingest-path defect to fix, not a protocol excuse — B's embedding path is
 fast in both bench and cli).
 
-Date: 2026-09-10 session. Follow-up to the equal/surpass-B gap re-derivation
-(`2026-09-10-strix-halo-gfx1151-ab-gap-default-on.md`), which showed the depth-0 shallow-row
+Date: 2026-09-05 session. Follow-up to the equal/surpass-B gap re-derivation
+(`2026-09-05-strix-halo-gfx1151-ab-gap-default-on.md`), which showed the depth-0 shallow-row
 llama-bench gaps (pp512-4096, worst pp2048 1.93x). This record splits that deficit into what is
 real (serving path) vs what llama-bench inflates, and pins the remaining real components.
 

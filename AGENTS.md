@@ -8,7 +8,7 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **13-patch set** that applies to a clean
-llama.cpp checkout at the fork point **`9cffdcc80`** (re-based 2026-09-02 from `0eadefebd`).
+llama.cpp checkout at the fork point **`465e49b9c`** (re-based 2026-09-06 from `9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`).
 
 - Blocks **01-11** (`patches/0001-…0011-…`): MTP draft depth, fused chunked
   GDN, BF16 KV, WMMA flash-attn, CPU bit-identical decode, host-buffer
@@ -45,20 +45,22 @@ llama.cpp checkout at the fork point **`9cffdcc80`** (re-based 2026-09-02 from `
   regressed below the 3-op fallback; a Q3_K@96 probe also lost to the
   cap 64).  Details + numbers:
   `patches/README.md` block-13 notes and
-  `benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md` +
-  `benchmarks/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
+  `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md` +
+  `wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
 
 The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts` — currently upstream master
-synced to `6a1a922d2` with the 13 block commits re-applied on top
-(2026-09-05 state: block-13 commit `a8d0e5edc`, amended 2026-09-05 with
-the RDNA3_5/Strix Halo + RDNA3_0/gfx1100 fused-MoE-MMQ folds; block 12
-carries the 2026-09-04 runtime NCCL-failure fallback, issue #13). The
-canonical `9cffdcc80` fork used for `make-patches.sh`
+synced to `465e49b9c` (2026-09-06 re-base) with the 13 block commits
+re-applied on top (block-13 tip `c261553a1`; block 12 carries the
+2026-09-04 runtime NCCL-failure fallback, issue #13; block 13 amended
+2026-09-02 with two MTP regression fixes, 2026-09-05 with the
+RDNA3_5/Strix Halo + RDNA3_0/gfx1100 fused-MoE-MMQ folds and 2026-09-06
+with the model-neutral Strix MoE mmq folds). The
+canonical `465e49b9c` fork used for `make-patches.sh`
 regeneration is disposable and is re-created from `patches/` +
 `scripts/apply-all.sh` whenever it needs rebuilding (fresh clone at the
 fork point + apply) — the last regeneration's block-13 tip is
-`8c2ace510`. Older fork states are
+`c261553a1`. Older fork states are
 preserved on the `stew675/llama.cpp` fork remote (`rdna-boosts` =
 previous tip `482837e5a` on `0eadefebd`; `rdna-boosts-orig`, …) and in
 older local reference clones — never rely on them for the current
@@ -130,7 +132,8 @@ explicitly requests it.**
   whitespace warnings (re-verified 2026-09-01 on `0eadefebd`,
   2026-09-02 on the `9cffdcc80` re-base, 2026-09-04 after the
   block-12 amendment, and 2026-09-05 after the block-13 RDNA3_5 gate
-  relaxation, and again 2026-09-05 after the RDNA3_0/gfx1100 fold).
+  relaxation, and again 2026-09-05 after the RDNA3_0/gfx1100 fold,
+  and again 2026-09-06 on the `465e49b9c` re-base).
 - **Block 02 (0002) now also carries the MTP chunked-prefix dispatch
   (PR #9, 2026-09-01):** long single-sequence MTP prefills (`K > 1`,
   `n_seqs == 1`, `n_tokens > K+64`) run the chunked WMMA GDN on the
@@ -203,7 +206,7 @@ explicitly requests it.**
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 9cffdcc80
+git checkout 465e49b9c
 bash <this-repo>/scripts/apply-all.sh .     # creates branch rdna-boosts, 13 commits
 ```
 
@@ -220,16 +223,17 @@ Diff the output against a known-good build (or against RCCL via
 
 ### Regenerate the patches (after fork changes)
 
-`scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9cffdcc80`,
-blocks tip `8c2ace510`): `git format-patch` the block commits (all 13
+`scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `465e49b9c`,
+blocks tip `c261553a1`): `git format-patch` the block commits (all 13
 blocks are committed fork commits; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the current fork topology: `~/llama.cpp`
-`rdna-boosts` is synced past the fork point (upstream master `6a1a922d2`
-+ the 13 blocks re-applied, block-13 tip `a8d0e5edc`), so a raw
-`9cffdcc80..HEAD` range there spans 46 upstream commits — the patches
-must be generated from a canonical fork rebuilt AT `9cffdcc80`
-(`scripts/apply-all.sh` of the current delivery, then re-apply the block-13
-amendment: last regeneration tip `8c2ace510`).  Then
+`rdna-boosts` is synced AT the fork point (upstream master `465e49b9c`
++ the 13 blocks re-applied, block-13 tip `c261553a1`), so a raw
+`465e49b9c..HEAD` range there is exactly the 13 block commits — but the
+fork branch is disposable, so the patches
+must still be generated from a canonical fork rebuilt AT `465e49b9c`
+(`scripts/apply-all.sh` of the current delivery; last regeneration tip
+`c261553a1`).  Then
 re-verify the clean-apply simulation (worktree at the fork point,
 apply-all, build, coherence) before committing.
 

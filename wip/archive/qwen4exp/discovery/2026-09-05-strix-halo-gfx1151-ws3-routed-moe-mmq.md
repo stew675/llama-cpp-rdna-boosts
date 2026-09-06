@@ -1,6 +1,6 @@
 # Strix Halo (RDNA3.5 / gfx1151) — WS3 #3: routed-compact MoE MMQ for the i-quants
 
-Date: 2026-09-08 session (handoff from SESSION-BRIEF-2026-09-08.md). Machine/build/model/protocol
+Date: 2026-09-05 session (handoff from SESSION-BRIEF-2026-09-05-s3.md). Machine/build/model/protocol
 identical to the 2026-09-06 records (same APU, same warm page cache, canonical
 `~/bin/build-llama-rocm-714` build of ~/llama.cpp `qwen4exp`, llama-bench `-ngl 99 -t 15 -r 3
 -b 2048 -ub 2048 -fa on -ctk f16 -ctv f16 --load-mode none`, prompts DESCENDING in one process

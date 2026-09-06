@@ -57,7 +57,7 @@ Eighteen squashed patch files. They apply IN ORDER on the rdna-boosts core
 2026-09-04 from the previous `9cffdcc80`-based `8f2838d1c` set).
 Applied together (patches 1-4) they reproduce the `qwen4exp` branch tip
 `248e47704` tree-identically; patch 5 (ws3-routed-moe-mmq) adds the
-2026-09-08 WS3 #3 commit `1da01fa67`; patches 6-7 add the 2026-09-10
+2026-09-05 WS3 #3 commit `1da01fa67`; patches 6-7 add the 2026-09-05
 WS3 #2 artifact fix (`a2f2a6ceb`) + the QSA dense shortcut (squashed
 commit `250e48e97`, DEFAULT ON) on top; patch 8 (ws3-weighted-down-
 fusion) adds `b31940a5e`; patch 9 (ws5-ple-host-gather) adds
@@ -66,7 +66,7 @@ transposed-src1 concat port (`2bd516bab`), the fused swiglu-input quantize port 
 the mm_ids_helper_512_10 single-block routing helper (`304114ba7`), the float4-vectorized
 moe_weighted_reduction (`f33ffaca7`), the split_j J/2 row split enabling B's Q8_0 I=64
 config rows (`6d457634e` - see the latent-defect record) and the gfx1151-gated 2-slice chunk
-merge for the mmq q8_1 feed quantize (`0a3a2b498` - see the 2026-09-13 quantize-chunk record;
+merge for the mmq q8_1 feed quantize (`0a3a2b498` - see the 2026-09-06 quantize-chunk record;
 n_chunks is a runtime arg from mmq.cu's cc, gated to gfx1151, byte-identical elsewhere) and the
 fattn RDNA WMMA config row: B's Q_in_reg=false halo row for (256,256,64) (`e7eecb369` - flash_attn 11.7->9.54ms/call, pp2048 0.987->0.992x, pp4096/1024/512 now AHEAD; Q_in_reg=true was the 20% - see the 2026-09-06 flash-rdna record) and the repeat-anchored hc_combine+norm fusion absorb (`b987877d7` - qwen4exp pins block_out/inject +
 pre-expands the scale chain, the scheduler absorbs the standalone per-layer block_out REPEAT
@@ -75,7 +75,7 @@ is folded INTO patch 1 (`managed-ngrams.patch`), so patch 1 carries the
 reader at its final state and patch 2 no longer touches
 `llama-lazy-reader.*`.
 
-The fork history was rewritten 2026-09-11: the shortcut opt-in commit
+The fork history was rewritten 2026-09-06: the shortcut opt-in commit
 and its default-ON flip were SQUASHED into one commit `250e48e97` (the
 opt-in was a discovery artifact that never shipped), so patch 7 is that
 squashed commit's canonical diff and the series carries no opt-in-then-
@@ -86,7 +86,7 @@ chain: `a1121cf2d`->`1da01fa67`, `fcfb0a522`->`a2f2a6ceb`, `1682d32a9`->
 
 The full nine-patch series applies from scratch with plain `git apply`
 on the rdna-boosts core base and reproduces the qwen4exp branch tip
-`3cb9168be` byte-identically (re-verified 2026-09-11 after the folds).
+`3cb9168be` byte-identically (re-verified 2026-09-06 after the folds).
 
 The 2026-09-04 re-base re-applied the first two patches onto the current
 master (39 commits of upstream drift past the old base) and resolved the
@@ -99,14 +99,14 @@ upstream's current call, so nothing was lost.  Full build clean (ROCm
 
 ### 1. `managed-ngrams.patch`
 The managed lazy-reader work (the 0001-0007 set, squashed to one patch,
-updated 2026-09-11 to fold in `3cb9168be` so the reader ships at its
+updated 2026-09-06 to fold in `3cb9168be` so the reader ships at its
 final state):
 - new lazy reader (`llama-lazy-reader.cpp/.h`, `--lazy-buffer-size N`,
   pread row reads, meta/CPU_Mapped placement) with managed n-gram (PLE)
   row loading,
 - F32-table handling in the reader (memcpy path when the type has no
   dequantizer; previously its own hunks in `qwen4exp-support.patch`),
-- batched cold-page fetch (2026-09-11): coalesced `posix_fadvise`
+- batched cold-page fetch (2026-09-06): coalesced `posix_fadvise`
   (WILLNEED) sweep + a parallel pread pool into a per-gather buffer with
   serial arena write-back, so a large cold prefill no longer stalls one
   4 KB pread at a time; `LLAMA_LAZY_IO_THREADS` sets the pool width
@@ -202,10 +202,10 @@ bit-identical, deterministic indexer top-k gather, kv-cache stale-cell
 zeroing). Bit-exact same-seed llama-cli text on == off; depth-0 pp
 +5.2-8.8% (pp512..16384), pp@depth 12k/32k +4-6%, tg@depth flat,
 memory stable −r3 through 32k. Record:
-`benchmarks/2026-09-06-strix-halo-gfx1151-ws4-hc-fusion-gates.md`.
+`wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws4-hc-fusion-gates.md`.
 Opt-out: `GGML_CUDA_DISABLE_HC_FUSION=1`.
 
-### 5. `ws3-routed-moe-mmq.patch` (2026-09-08)
+### 5. `ws3-routed-moe-mmq.patch` (2026-09-05)
 
 Port of halo-box's RDNA3.5 routed-compact MoE MMQ for the i-quants
 (commit `1da01fa67`, DEFAULT ON): `mul_mat_q_routed_compact` (one
@@ -217,12 +217,12 @@ and verified; depth-0 pp +2.4-5.3% (compact vs plain at the same J),
 tg flat, no depth regression; A-vs-B gap moved pp16384 1.14->1.06x,
 pp8192 1.37->1.26x, pp4096 1.68->1.53x, pp2048 2.21->2.01x, pp1024
 2.04->1.78x, pp512 2.05->1.61x. Record:
-`benchmarks/2026-09-08-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
+`wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
 Opt-out: `GGML_CUDA_DISABLE_MMQ_ROUTED=1` (compact dispatch only).
 Gate: RDNA3_5 only (B parity); gfx1201 enablement deferred to the
 delivery flow's gfx1201 box.
 
-### 6. `ggml-sched-fallback-sync.patch` (2026-09-10)
+### 6. `ggml-sched-fallback-sync.patch` (2026-09-05)
 
 Core-ggml fix (commit `a2f2a6ceb`): the scheduler alloc-fallback
 (`ggml_backend_sched_alloc_splits`) now only does the full device
@@ -240,12 +240,12 @@ sync drained the whole ~3 s GPU queue — the dense/sparse ubatch
 alternation hit one EVERY ubatch of EVERY rep; now zero syncs in the
 steady state). No numerics change; OFF-path and real serving (syncs
 per decode) unaffected. Record:
-`benchmarks/2026-09-10-strix-halo-gfx1151-ws3-shortcut-fix.md`.
+`wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-shortcut-fix.md`.
 NOTE: core-ggml, arch-agnostic; multi-GPU / pipeline-parallel not
 exercised here (ordering argument holds per-device) — candidate for an
 upstream PR at the maintainer's discretion.
 
-### 7. `ws3-shortcut-default-on.patch` (2026-09-10; squashed 2026-09-11)
+### 7. `ws3-shortcut-default-on.patch` (2026-09-05; squashed 2026-09-06)
 
 qwen4exp QSA dense shortcut DEFAULT ON (B parity), commit `250e48e97`:
 the opt-in state and the default-ON flip were squashed into this one
@@ -264,7 +264,7 @@ env name matches B for cross-testing. Numerics below the width = the
 dense-vs-sparse kernel signature difference vs the selection default
 is the documented env-selectable regime.
 
-### 8. `ws3-weighted-down-fusion.patch` (2026-09-10)
+### 8. `ws3-weighted-down-fusion.patch` (2026-09-05)
 
 Decode MoE weighted-down fusion (commit `b31940a5e`): collapses
 `mul_mat_id -> mul(weights) -> 10 views -> 9 adds` (21 nodes) into one
@@ -273,9 +273,9 @@ Shape-fingerprinted (w [640,2560,512] IQ4_NL/Q8_0, ids 10, dst 2560 =
 single token => decode-only). Text fused ==
 `GGML_CUDA_DISABLE_WEIGHTED_DOWN=1`; tg128@d12288 +1.3%, tg@0 ~flat,
 depth-0 pp unchanged. Record:
-`benchmarks/2026-09-10-strix-halo-gfx1151-weighted-down-fusion.md`.
+`wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-weighted-down-fusion.md`.
 
-### 9. `ws5-ple-host-gather.patch` (2026-09-11)
+### 9. `ws5-ple-host-gather.patch` (2026-09-06)
 
 Prefill root-cause fix (commit `8b62ac25a`): the PLE n-gram table
 (`per_layer_token_embd`, 28.8 GB IQ4_NL, input-layer = CPU-pinned) was
@@ -291,21 +291,23 @@ sweep - no CPU graph split, no serial page faults. DEFAULT ON;
 626 vs 600 (A WINS), pp8192 637 vs 679, pp4096 646 vs 734, pp2048 655
 vs 776 (was 400/1.93x), pp1024 643 vs 731, pp512 591 vs 645, tg128
 25.95 vs 26.01 (parity). Records:
-`benchmarks/2026-09-11-strix-halo-gfx1151-prefill-ple-host-gather.md`
+`wip/archive/qwen4exp/discovery/2026-09-06-strix-halo-gfx1151-prefill-ple-host-gather.md`
 (+ the managed-path follow-up `...-managed-ple-batched-fetch.md`, which
 is folded into patch 1).
 
 ## Apply
 
 The qwen4exp delivery = **ONE patch** `qwen4exp-support.patch`, applying AFTER the 13
-top-level blocks on the fork base `8b4b3558f` (upstream master + rdna-boosts blocks
-0001-0013; 0002/0004/0008/0013 amended 2026-09-13 to absorb the model-neutral Strix kernel
-work). Verified from scratch 2026-09-13: plain `git apply` of blocks 0001..0013 (amended
-set) + `qwen4exp-support.patch` on `8b4b3558f` reproduces the qwen4exp fork tip `f5ac11903`
-byte-identically (0 diff lines).
+top-level blocks on the fork base `465e49b9c` (upstream master + rdna-boosts blocks
+0001-0013; 0002/0004/0008/0013 amended 2026-09-06 to absorb the model-neutral Strix kernel
+work). Verified from scratch on the 2026-09-06 re-base: `scripts/apply-all.sh` of the
+13 blocks at `465e49b9c` + `git apply --3way` of `qwen4exp-support.patch` (46 files, 12
+new / 34 modified, zero conflicts) — the resulting tree is the rebuilt `~/llama.cpp`
+`qwen4exp` branch (fork tip `627506c1c`). (The earlier `8b4b3558f`-base from-scratch
+verification reproduced the qwen4exp fork tip `f5ac11903` byte-identically.)
 
 ```
-git checkout 8b4b3558f
+git checkout 465e49b9c
 for p in patches/0001-*.patch ... patches/0013-*.patch; do git apply $p; done   # 13 blocks
 git apply beta/qwen4exp/qwen4exp-support.patch
 ```
@@ -326,7 +328,7 @@ Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.m
 ## Validation status (the gates this baseline holds)
 
 - WS3 #2 artifact fix + shortcut default ON gates on Strix Halo (gfx1151),
-  2026-09-10: patches 6-7 (ggml sched-fallback sync + shortcut default
+  2026-09-05: patches 6-7 (ggml sched-fallback sync + shortcut default
   ON) — same-session warm-clock r3, shortcut ON vs `=0`: depth-0 ladder
   ON >= OFF at every size (pp16384 574.1 vs 566.8, pp8192 544.0 vs 535.0,
   pp4096 487.9 vs 473.0, pp2048 399.7 vs 382.7, pp1024/512 +1.6-2.7%,
@@ -338,11 +340,11 @@ Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.m
   below the width == `LLAMA_QSA_SPARSE_FA=0` dense reference (text-
   identical); multi-ubatch p5000 shortcut-ON run twice byte-identical
   (deterministic under the new no-sync re-pointing). Record:
-  `benchmarks/2026-09-10-strix-halo-gfx1151-ws3-shortcut-fix.md`.
+  `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-shortcut-fix.md`.
   NOTE: gfx1201/multi-GPU validation of patch 6 still pending (see the
   patch-6 note).
 
-- WS3 #3 gates on Strix Halo (RDNA3.5 / gfx1151), 2026-09-08: patch 5
+- WS3 #3 gates on Strix Halo (RDNA3.5 / gfx1151), 2026-09-05: patch 5
   (routed-compact MoE MMQ for the i-quants, RDNA3.5-gated DEFAULT ON,
   `GGML_CUDA_DISABLE_MMQ_ROUTED=1` opt-out) vs the plain path at the
   same J on one build — clean warm-clock r3 depth-0 ladder +2.4-5.3%
@@ -352,7 +354,7 @@ Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.m
   (same session, B ~1% stable): pp512 2.05->1.61x, pp1024 2.04->1.78x,
   pp2048 2.21->2.01x, pp4096 1.68->1.53x, pp8192 1.37->1.26x, pp16384
   1.14->1.06x. Record:
-  `benchmarks/2026-09-08-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
+  `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
   NOTE: RDNA4/gfx1201 enablement for patch 5 is still gated OFF — it
   needs the gfx1201 box in the delivery flow before it can be claimed
   there (the mmq.cuh compact kernel + J tables are RDNA3.5-tuned).
@@ -364,7 +366,7 @@ Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.m
   pp rows keep +4-6% at depth 12k/32k, tg@depth flat (decode
   untouched), memory stable −r3 through 32k, llama-cli same-seed text
   identical on == off (logit-level bit-exactness proven in-session).
-  Record: `benchmarks/2026-09-06-strix-halo-gfx1151-ws4-hc-fusion-gates.md`.
+  Record: `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws4-hc-fusion-gates.md`.
   (The gfx1201/RDNA4 records for patches 1-3 are the bullets below.)
 
 - llama-bench (3x R9700 tensor, ngl 99, ub 2048, warm page cache):

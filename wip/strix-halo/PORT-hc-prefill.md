@@ -70,7 +70,7 @@ answer + numerics analysis in notes-ws1-survey.md. Plan file:
    pp2048@0 ~348 -> +10-18% and more at pp512/1024 (launch-count win).
    Watch tg@0 and at-depth tg (decode must not regress - fusion is
    prefill-only by the ne[1]==1 guard, so expect no change).
-7. RECORD: dated bench file benchmarks/2026-09-05-strix-halo-*.md + notes
+7. RECORD: dated bench file wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-*.md + notes
    update; DELIVERY ROUTING per AGENTS (qwen4exp tree change -> beta
    patch or block amendment; NEVER push from ~/llama.cpp).
 

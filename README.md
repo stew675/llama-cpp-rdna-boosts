@@ -12,7 +12,7 @@ the RDNA3.5 (Strix Halo, gfx1151) + RDNA3.0 (gfx1100) fused-MoE-MMQ
 gate relaxations — see
 [Current state](#current-state)).
 The patches apply to a clean
-llama.cpp checkout at the recorded fork point `9cffdcc80` (re-based 2026-09-02 from `0eadefebd`).
+llama.cpp checkout at the recorded fork point `465e49b9c` (re-based 2026-09-06 from `9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`).
 
 `scripts/apply-all.sh` automates the apply: it creates a fresh `rdna-boosts`
 branch and applies blocks 01-13 with `git am`, one commit each.
@@ -53,8 +53,34 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 2026-09-05, gfx1100 validated 2026-09-05 — see
 [Current state](#current-state)).
 
-## Current state (2026-09-05)
+## Current state (2026-09-06)
 
+- **Re-baseline to upstream master `465e49b9c` (2026-09-06):** fork point
+  moved from `9cffdcc80` to the current master tip (18 upstream commits
+  past the fold-verified base `8b4b3558f`, 57 past the old fork point;
+  the ggml-cuda-touching ones — `73a43d1f6` mmid/mmf race fixes #28475,
+  `5fdfa6282` GDN l2-norm fix #28068 — merged in disjoint hunks, zero
+  conflicts).  The `~/llama.cpp` `rdna-boosts` fork was rebuilt from
+  `patches/` via `scripts/apply-all.sh` (13/13 `git am` clean, zero
+  whitespace warnings; per-file content check on all 112
+  upstream-touched files passed) and the set regenerated with
+  `scripts/make-patches.sh` (base `465e49b9c`, canonical am-commits
+  `45bf4d291..c261553a1`).  Two prerequisites: the 0044cfe fold had
+  stripped the format-patch mail headers from 0002/0004/0008/0013 —
+  restored from the pre-fold originals (delivery commit 0610b75) — and
+  the block-13 message's fold-amendment trailer was re-dated to the
+  fold's true date (tip amended `b4b760eb8` -> `c261553a1`).
+  `rdna-boosts-all.patch` refreshed (45 files; was stale at 41,
+  pre-fold).  Clean-apply sim at `465e49b9c` re-verified 2026-09-06
+  (applied tree byte-identical to the fork tip).  The `qwen4exp` fork
+  branch was rebuilt on the new base + the consolidated beta support
+  patch (see `beta/qwen4exp/README.md`).
+- **Campaign date re-stamp (2026-09-06):** the gfx1151/qwen4exp campaign
+  docs had run a week ahead of the real calendar; every
+  `wip/`/`beta/`/archive date (filenames + text) was collapsed onto the
+  real git dates (2026-09-05/06) and the moved records' stale
+  `benchmarks/2026-09-*` references were repointed at
+  `wip/archive/qwen4exp/discovery/`.
 - **Block-13 RDNA3.0 gate relaxation (2026-09-05, folded into block 13):**
   the fused MoE gate+up+GLU MMQ prefill arm + its `J_max_gate` tile
   caps are now also on RDNA3_0 (gfx1100), validated on a single RX
@@ -68,7 +94,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
   rebuilt at `9cffdcc80` (13 am-commits, block-13 tip `8c2ace510`);
   clean-apply sim verified (zero whitespace warnings, applied tree
   byte-identical to the fork tip).  Full record:
-  [`benchmarks/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`](benchmarks/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md).
+  [`wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`](wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md).
 - **Block-13 RDNA3.5 gate relaxation (2026-09-05, folded into block 13):**
   the fused MoE gate+up+GLU MMQ prefill arm + its `J_max_gate` tile
   caps were RDNA4-only; validated on Strix Halo (Ryzen AI MAX+ 395 /
@@ -78,7 +104,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
   1423), decode unchanged (tg128 71.5). The RDNA4-tuned J caps
   transfer (uncapping regressed pp2048 1674 -> 1111 / pp16384 1423 ->
   1334).  Full record:
-  [`benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`](benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md).
+  [`wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`](wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md).
 - **Block-13 MTP regression fixes (2026-09-02, folded into block 13):**
   (1) dense adaptive-MTP collapse (18.3 -> 27.5 t/s) — the mmvq
   item-split/rpb kernel is register-bound at multi-token decode batches
@@ -97,32 +123,35 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
   — run Protocol A there before shipping decode/fusion changes.
 - **Fork tip:** the fork block-12 commit was amended 2026-09-04 with the
   runtime NCCL-failure fallback (issue #13); block 13 was amended
-  2026-09-02 with the two MTP regression fixes and 2026-09-05 with the
+  2026-09-02 with the two MTP regression fixes, 2026-09-05 with the
   RDNA3.5 (Strix Halo) then RDNA3.0 (gfx1100) fused-MoE-MMQ gate
-  relaxations.  The set was regenerated 2026-09-05 from a canonical
-  fork rebuilt at `9cffdcc80` (13 am-commits, block-13 tip
-  `8c2ace510`); the clean-apply sim at `9cffdcc80` applies with zero
+  relaxations and 2026-09-06 with the model-neutral Strix MoE mmq
+  folds.  The set was regenerated 2026-09-06 from a canonical fork
+  rebuilt at `465e49b9c` (13 am-commits, block-13 tip
+  `c261553a1`); the clean-apply sim at `465e49b9c` applies with zero
   conflicts/whitespace warnings and its tree is byte-identical to the
   fork tip.
-- **Fork point (baseline):** llama.cpp master at `9cffdcc80` (re-based
-  2026-09-02 from `0eadefebd`; 42 commits of drift — see `MANIFESTS.md`
-  for the dated re-base record, incl. the block 03/08/13 manual merges
-  vs upstream's #27970 (sparse-fa) and #25952 (fused MoE expert
-  reduction)).
+- **Fork point (baseline):** llama.cpp master at `465e49b9c` (re-based
+  2026-09-06 from `9cffdcc80`, itself re-based 2026-09-02 from
+  `0eadefebd`; 57 commits of drift from the old fork point — see
+  `patches/README.md` for the dated re-base record, incl. the 2026-09-02
+  manual merges vs upstream's #27970 (sparse-fa) and #25952 (fused MoE
+  expert reduction)).
 - **Set:** 13 patches in `patches/` (`0001`-`0013`).
 - **Verified:** clean apply + full build + llama-cli same-seed coherence
   IDENTICAL (hybrid vs RCCL, 3-GPU) on the rebuilt fork; the clean-apply
-  sim at `9cffdcc80` applies with zero conflicts/whitespace warnings and
-  its tree is byte-identical to the fork tip (`8c2ace510`; 2026-09-05
-  regeneration incl. the gfx1100 fold was re-verified on the RX 7900
-  XTX box — sim build coherence identical + perf reproduced). tg64
+  sim at `465e49b9c` applies with zero conflicts/whitespace warnings and
+  its tree is byte-identical to the fork tip (`c261553a1`; 2026-09-06
+  regeneration — earlier regenerations were re-verified on the RX 7900
+  XTX box with sim build coherence identical + perf reproduced). tg64
   38.12 / tg512 41.08 and the block-13 numbers are unchanged — the
   re-base is content-identical plus upstream's additions.
 - **Whitespace-clean apply:** the regenerated set applies with **zero git
   whitespace warnings** (`git am` 01-13; re-verified 2026-09-02 on a
   fresh checkout at `9cffdcc80`, re-verified 2026-09-04 after the
   block-12 amendment, re-verified 2026-09-05 after the block-13 RDNA3.5
-  gate relaxation and again after the RDNA3.0/gfx1100 fold).
+  gate relaxation and again after the RDNA3.0/gfx1100 fold,
+  re-verified 2026-09-06 on the `465e49b9c` re-base).
 - **Deployment:** 3-GPU hybrid (`HIP_VISIBLE_DEVICES=0,1,2`, unpinned) gives
   depth-16384 decode 38.71 t/s (+21.8% vs 2-GPU). See
   [`patches/README.md`](patches/README.md) for block-12 env knobs and the
@@ -215,9 +244,9 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 # 1. fresh clone of llama.cpp, at the fork point
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-git checkout 9cffdcc80        # the SHA recorded in patches/README.md
+git checkout 465e49b9c        # the SHA recorded in patches/README.md
 
-# 2. apply the set (automated; VERIFIED 2026-08-29, re-verified 2026-09-01 and 2026-09-02)
+# 2. apply the set (automated; VERIFIED 2026-08-29, re-verified 2026-09-01/02/05 and 2026-09-06)
 bash <path-to-this-repo>/scripts/apply-all.sh .
 #    = git am patches/0001…0013  (one commit per block on a fresh `rdna-boosts` branch)
 
@@ -242,7 +271,7 @@ git add -A && git commit -m "rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + 
 
 ## When upstream master moves
 
-The patches are static against `9cffdcc80`. When upstream drifts and hunks
+The patches are static against `465e49b9c`. When upstream drifts and hunks
 no longer apply, regenerate the whole set from the fork with
 `scripts/make-patches.sh` (needs the `~/llama.cpp` fork checkout, which
 carries the block commits), then update

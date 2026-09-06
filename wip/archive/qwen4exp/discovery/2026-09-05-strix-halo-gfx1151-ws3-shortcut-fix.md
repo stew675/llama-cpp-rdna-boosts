@@ -1,8 +1,8 @@
 # Strix Halo (RDNA3.5 / gfx1151) — WS3 #2 artifact FIX at the ggml level + shortcut default ON
 
-Date: 2026-09-10 session (task: the maintainer's Option 2 from the root-cause record
-`benchmarks/2026-09-08-strix-halo-gfx1151-ws3-shortcut-artifact-rootcause.md` + SESSION-BRIEF-2026-09-10).
-Environment: same machine/build/model as the 2026-09-08/09 records (qwen4exp, IQ4_XS UD
+Date: 2026-09-05 session (task: the maintainer's Option 2 from the root-cause record
+`wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-shortcut-artifact-rootcause.md` + SESSION-BRIEF-2026-09-05-s5).
+Environment: same machine/build/model as the 2026-09-05 records (qwen4exp, IQ4_XS UD
 Qwen3.8-Flash-Next), llama-bench `-ngl 99 -t 15 -r 3 -b 2048 -ub 2048 -fa on -ctk f16 -ctv f16
 --load-mode none`, warm page cache, prompts descending in one process (pp16384 first), r3
 same-session A/B. A commits: `fcfb0a522` (ggml fix) + `1682d32a9` (default flip) on `a1121cf2d`.

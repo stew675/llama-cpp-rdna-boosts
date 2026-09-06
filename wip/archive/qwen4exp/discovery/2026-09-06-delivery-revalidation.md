@@ -1,4 +1,4 @@
-# Delivery revalidation — 2026-09-13 (pre-GFX1201 gate)
+# Delivery revalidation — 2026-09-06 (pre-GFX1201 gate)
 
 Final consumer-flow revalidation of the restructured delivery before the GFX1201 port work.
 Passed all stages; caught and fixed one delivery defect (below).
@@ -42,7 +42,7 @@ conflicted over the amended blocks). Regenerated as `diff(full-amended-blocks st
   work supersedes it.
 - Revalidation method note: llama-cli needs `--single-turn` AND `</dev/null`; stray processes
   from aborted runs must be checked (`pkill llama-cli`/`llama-bench`) before GPU runs.
-- Recorded in `wip/archive/qwen4exp/` (post-2026-09-13 dated records live there per the
+- Recorded in `wip/archive/qwen4exp/` (post-2026-09-06 dated records live there per the
   archive convention).
 
 ## Qwen3.6-35B-A3B Q8_0 same-session ladder A vs B (follow-up)

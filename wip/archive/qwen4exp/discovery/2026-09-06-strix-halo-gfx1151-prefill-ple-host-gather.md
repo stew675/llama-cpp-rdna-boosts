@@ -1,6 +1,6 @@
 # Strix Halo (RDNA3.5 / gfx1151) — prefill ROOT CAUSE FOUND + FIXED: the PLE gather ran as a CPU graph get_rows over a 28.8 GB mmap
 
-Date: 2026-09-11. Follows the investigation record (2026-09-10-prefill-rootcause-investigation).
+Date: 2026-09-06. Follows the investigation record (2026-09-05-prefill-rootcause-investigation).
 This closes item 1 of the plan: A's CPU input-embedding cost is root-caused and fixed at the
 model level (commit `8b62ac25a`, on `b31940a5e`).
 

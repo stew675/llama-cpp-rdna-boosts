@@ -1,6 +1,6 @@
 # Strix Halo (RDNA3.5 / gfx1151) — managed PLE reader: batched cold-page fetch (A + B), 10G test
 
-Date: 2026-09-11. Follow-up to the PLE host-gather fix (2026-09-11-prefill-ple-host-gather).
+Date: 2026-09-06. Follow-up to the PLE host-gather fix (2026-09-06-prefill-ple-host-gather).
 Commit `3cb9168be` (on `8b62ac25a`). DELIVERY: folded into `beta/qwen4exp/managed-ngrams.patch`
 (no standalone patch - the reader is one feature; `qwen4exp-support.patch` dropped its now-
 redundant reader hunks). The user asked whether the fetch logic behind the host-gather

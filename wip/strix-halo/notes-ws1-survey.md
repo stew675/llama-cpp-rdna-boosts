@@ -291,7 +291,7 @@ NEXT SESSION PRIORITIES (in order):
    clean warm-clock r3 pp ladder (depth 0 + 12k/32k) default vs disabled,
    decode tg@depth regression check, memory-stability ladder (no crash at
    -r3 through 32k, mirroring B's crash investigation), full-commit perf.
-4. Dated bench record benchmarks/2026-09-05-strix-halo-*.md + delivery
+4. Dated bench record wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-*.md + delivery
    routing (qwen4exp beta patch / block-13-type amendment) + TODO.md update.
 5. THEN the broader gap: rerun the depth-0 ladder (expect ~+6-7% from the
    fusion) and re-derive the remaining A-vs-B gap at pp512..16k; WS3 #2

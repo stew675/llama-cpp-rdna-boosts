@@ -1,6 +1,6 @@
 # Strix Halo (RDNA3.5 / gfx1151) — post-fusion A-vs-B depth-0 pp gap (WS4 done)
 
-Date: 2026-09-06 (run from the 2026-09-07 session handoff)
+Date: 2026-09-05 (run from the 2026-09-05 session handoff)
 Machine/build/model/protocol: identical to
 `2026-09-06-strix-halo-gfx1151-ws4-hc-fusion-gates.md` — same session,
 same warm page cache, same ladder command. A = `~/llama.cpp` `qwen4exp`

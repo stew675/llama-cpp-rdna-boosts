@@ -112,12 +112,12 @@ index c70228e1e..9537a2609 100644
 +        // LLAMA_QSA_DENSE_SHORTCUT: dense shortcut below the selection width, DEFAULT ON (B parity;
 +        // the env name matches B for cross-testing). It was opt-in default OFF while a llama-bench-
 +        // only multi-ubatch artifact (pp4096+@0 rows slower with the shortcut on) lacked a root
-+        // cause. Root-caused 2026-09-08/09: llama-bench's sync-free decode pipeline x ggml-gallocr's
++        // cause. Root-caused 2026-09-05: llama-bench's sync-free decode pipeline x ggml-gallocr's
 +        // single-layout alloc-fallback doing an unconditional full-device sync on every dense/sparse
 +        // topology flip; fixed at the ggml level (ggml_gallocr_reserve_n_probe - the fallback only
 +        // syncs when a buffer must actually grow, ggml-backend.cpp / ggml-alloc.c) - with the fix
 +        // the depth-0 ladder is faster with the shortcut at every size and depth rows are flat
-+        // (record: benchmarks/2026-09-10-*-shortcut-fix.md). Numerics below the width == the
++        // (record: wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-shortcut-fix.md). Numerics below the width == the
 +        // LLAMA_QSA_SPARSE_FA=0 masked-dense path (the difference from the selection default is the
 +        // known dense-vs-sparse kernel signature, an env-selectable regime). =0 forces the selection
 +        // path (the pre-flip known-good numerics) either way.

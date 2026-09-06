@@ -1,4 +1,4 @@
-# Strix Halo session brief — 2026-09-06 end state (handoff for the next session)
+# Strix Halo session brief s2 (2026-09-05) — end state / handoff for the next session
 
 CONTINUE from this file + the plan (~/make-strix-halo-faster.md) + the evidence
 trail (wip/strix-halo/notes-ws1-survey.md). Read all three first.
@@ -60,7 +60,7 @@ trail (wip/strix-halo/notes-ws1-survey.md). Read all three first.
    - depth 12k/32k pp rows + tg@depth regression (must not regress; fusion is
      prefill-only via the ne[1]==1 guard but verify);
    - memory-stability ladder (-r3 through 32k, no crash/leak).
-2. Dated bench record benchmarks/2026-09-06-strix-halo-*.md (mirror the
+2. Dated bench record wip/archive/qwen4exp/discovery/2026-09-06-strix-halo-*.md (mirror the
    block-13 record format) + delivery routing per AGENTS (qwen4exp tree change ->
    beta/qwen4exp patch amendment or new patch; NEVER push from ~/llama.cpp);
    update TODO.md.

@@ -1,14 +1,27 @@
-From 941ef1859fefb04f9701b9578c1cbf33bc073f43 Mon Sep 17 00:00:00 2001
+From 75a06c310b2175f5f14c1ed72b4f2beebe561c58 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
-Subject: rdna-boosts: block 08: fused-core prefill kernels and GPU bit-identical
+Subject: [PATCH 08/13] rdna-boosts: block 08: fused-core prefill kernels and
+ GPU bit-identical
 
 ---
+ ggml/src/ggml-cuda/common.cuh     |  87 ++++
+ ggml/src/ggml-cuda/fattn-tile.cuh |  16 +
+ ggml/src/ggml-cuda/fattn.cu       |   5 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu   | 527 ++++++++++++++++++++++-
+ ggml/src/ggml-cuda/mmvq.cu        | 670 +++++++++++++++++++++++++++---
+ ggml/src/ggml-cuda/mmvq.cuh       |  23 +
+ ggml/src/ggml-cuda/norm.cu        | 215 ++++++++++
+ ggml/src/ggml-cuda/norm.cuh       |   7 +
+ ggml/src/ggml-cuda/unary.cu       | 150 +++++++
+ ggml/src/ggml-cuda/unary.cuh      |   6 +
+ 10 files changed, 1638 insertions(+), 68 deletions(-)
+
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index e1ac915eb..abb6e4ceb 100644
+index 603c27d69..fcfb6488b 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1535,6 +1535,74 @@ struct ggml_backend_cuda_context {
+@@ -1541,6 +1541,74 @@ struct ggml_backend_cuda_context {
          name(GGML_CUDA_NAME + std::to_string(device)) {
      }
  
@@ -83,7 +96,7 @@ index e1ac915eb..abb6e4ceb 100644
      ggml_cuda_stream_context concurrent_stream_context;
  
      ~ggml_backend_cuda_context();
-@@ -1592,6 +1660,20 @@ struct ggml_cuda_mm_fusion_args_host {
+@@ -1598,6 +1666,20 @@ struct ggml_cuda_mm_fusion_args_host {
      const ggml_tensor * gate_bias = nullptr;
      const ggml_tensor * x_scale = nullptr;
      const ggml_tensor * gate_scale = nullptr;
@@ -104,7 +117,7 @@ index e1ac915eb..abb6e4ceb 100644
      ggml_glu_op glu_op;
      float glu_limit = 0.0f;
  };
-@@ -1601,6 +1683,11 @@ struct ggml_cuda_mm_fusion_args_device {
+@@ -1607,6 +1689,11 @@ struct ggml_cuda_mm_fusion_args_device {
      const void * gate_bias = nullptr;
      const void * x_scale = nullptr;
      const void * gate_scale = nullptr;
@@ -2103,3 +2116,6 @@ index 04f3af644..2a8c2e20c 100644
  void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
  
  __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
+-- 
+2.55.0
+

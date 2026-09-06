@@ -1,6 +1,6 @@
 # Strix Halo (gfx1151) — flash_attn 20% gap = RDNA WMMA config row; B's Q_in_reg=false row adopted
 
-Date: 2026-09-06 session (continuing the prefill ledger from the 09-13 record). Tip: e7eecb369 (clean).
+Date: 2026-09-06 session (continuing the prefill ledger from the 09-06 record). Tip: e7eecb369 (clean).
 
 ## Gap (#1 in the prefill ledger): flash_attn_ext_f16 A 11.70 vs B 9.75ms/call
 

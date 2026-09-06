@@ -100,7 +100,7 @@ coherence identical; sim perf reproduces the working-tree numbers
   coherence IDENTICAL, pp2048 +9.4% / pp16384 +7.8%, decode unchanged,
   RDNA4 J caps transfer) and folded into the same patch `0013`
   (canonical rebuild tip `8c2ace510`).  Record:
-  `benchmarks/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
+  `wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
 - RDNA3_0 (gfx1100, 7900XTX-class) is still excluded from the fused arm
   until validated there — that leg runs in parallel with a community
   member (dual-7900XTX box).

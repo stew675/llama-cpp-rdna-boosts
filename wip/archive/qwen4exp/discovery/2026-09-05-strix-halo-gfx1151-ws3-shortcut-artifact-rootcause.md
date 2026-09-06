@@ -1,7 +1,7 @@
 # Strix Halo (RDNA3.5 / gfx1151) — WS3 #2 llama-bench artifact: ROOT CAUSE FOUND
 
-Date: 2026-09-08 session. Investigation of the OPEN item from SESSION-BRIEF-2026-09-08 /
-benchmarks/2026-09-06-strix-halo-gfx1151-post-fusion-gap.md (WS3 #2 section): with the QSA
+Date: 2026-09-05 session. Investigation of the OPEN item from SESSION-BRIEF-2026-09-05-s3 /
+wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-post-fusion-gap.md (WS3 #2 section): with the QSA
 dense-shortcut ON (LLAMA_QSA_DENSE_SHORTCUT=1, A commit 151798ed2), llama-bench depth-0
 pp4096/8192/16384 rows ran slower than the shortcut-OFF config (-17/-29/-36%) although rocprof
 showed identical-or-smaller GPU kernel profiles and llama-cli/llama-server crossing prefills were

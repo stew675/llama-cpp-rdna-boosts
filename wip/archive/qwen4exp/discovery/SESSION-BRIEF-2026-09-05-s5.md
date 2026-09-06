@@ -1,4 +1,4 @@
-# Strix Halo session brief — 2026-09-09 end state (handoff for the next session)
+# Strix Halo session brief s5 (2026-09-05) — end state / handoff for the next session
 
 CONTINUE from this file + ~/make-strix-halo-faster.md + wip/strix-halo/notes-ws1-survey.md +
 the dated records listed below. Read all first. The PRIMARY next-session task is the WS3 #2
@@ -21,21 +21,21 @@ This brief also carries the full ledger of unfinished work so nothing is lost ac
     was REVERTED; the tree is byte-clean at a1121cf2d. Re-add the same prints to re-measure.
 - ~/llama-cpp-rdna-boosts (delivery) tip `e96da5c`, clean. beta/qwen4exp = FIVE patches
   (managed-ngrams, qwen4exp-support, mtp-draft-support, ws4-hc-prefill-fusions,
-  ws3-routed-moe-mmq). TODO.md reality pass carried to 2026-09-09.
+  ws3-routed-moe-mmq). TODO.md reality pass carried to 2026-09-05.
 - ~/strix-llama.cpp (B, halo-box) `c7af5c6c2`, untouched. B is a ~1% stable bench reference.
 
 ## Records (this campaign, most recent first)
 
-- `benchmarks/2026-09-08-strix-halo-gfx1151-ws3-shortcut-artifact-rootcause.md` — ROOT CAUSE of
+- `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-shortcut-artifact-rootcause.md` — ROOT CAUSE of
   the WS3 #2 llama-bench artifact + same-session tradeoff numbers (the fix task's evidence base).
-- `benchmarks/2026-09-08-strix-halo-gfx1151-ws3-routed-moe-mmq.md` — WS3 #3 gates + A-vs-B gap.
-- `benchmarks/2026-09-06-strix-halo-gfx1151-post-fusion-gap.md` — post-WS4 gap + WS3 #2 section.
-- `benchmarks/2026-09-06-strix-halo-gfx1151-ws4-hc-fusion-gates.md` — WS4 gates.
-- `benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md` (+ the gfx1100 twin) — block 13.
+- `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-routed-moe-mmq.md` — WS3 #3 gates + A-vs-B gap.
+- `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-post-fusion-gap.md` — post-WS4 gap + WS3 #2 section.
+- `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws4-hc-fusion-gates.md` — WS4 gates.
+- `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md` (+ the gfx1100 twin) — block 13.
 
 ## What is DONE
 
-1. **WS3 #3 (routed-compact MoE MMQ) — DONE, DEFAULT ON, routed as patch 5** (09-08 record):
+1. **WS3 #3 (routed-compact MoE MMQ) — DONE, DEFAULT ON, routed as patch 5** (09-05 record):
    A-vs-B gap moved pp16384 1.14->1.06x, pp8192 1.37->1.26x, pp4096 1.68->1.53x, pp2048
    2.21->2.01x, pp1024 2.04->1.78x, pp512 2.05->1.61x; bit-exact by construction + text-verified;
    depth gates clean; RDNA3.5-only gate (B parity) — RDNA4 stays OFF pending the gfx1201 box.

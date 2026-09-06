@@ -1,4 +1,4 @@
-# Strix Halo session brief — 2026-09-07 end state (handoff for the next session)
+# Strix Halo session brief s3 (2026-09-05) — end state / handoff for the next session
 
 CONTINUE from this file + the plan (~/make-strix-halo-faster.md) + the
 evidence trail (wip/strix-halo/notes-ws1-survey.md) + the two 2026-09-06
@@ -19,23 +19,23 @@ benchmark records (below). Read all of those first.
     verified == committed tree.
 - ~/llama-cpp-rdna-boosts (delivery), tip `dff3a9a` (this session's
   records + WS3 #2 writeup). beta/qwen4exp = FOUR patches now.
-  benchmarks/2026-09-06-strix-halo-gfx1151-ws4-hc-fusion-gates.md and
+  wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws4-hc-fusion-gates.md and
   ...-post-fusion-gap.md carry this session's numbers. TODO.md updated
   (reality pass 2026-09-06).
 - ~/strix-llama.cpp (B, community): `c7af5c6c2`, untouched, build current.
   B has NO sparse-QSA kernel; its dense-shortcut env LLAMA_QSA_DENSE_SHORTCUT
   defaults ON (A's does NOT — see the env note below).
 
-## What is DONE (2026-09-07 session)
+## What is DONE (2026-09-05 session)
 
 1. **WS4 gates PASSED on the final build** (record:
-   benchmarks/2026-09-06-strix-halo-gfx1151-ws4-hc-fusion-gates.md):
+   wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws4-hc-fusion-gates.md):
    - depth-0 warm-clock r3, fusion default vs GGML_CUDA_DISABLE_HC_FUSION=1:
      +7.6/+7.4/+7.8/+8.8/+6.9/+5.2% at pp16384/8192/4096/2048/1024/512;
    - depth 12k/32k pp rows keep +4-6%; tg@depth flat (decode untouched);
    - memory stable -r3 through 32k; llama-cli same-seed text on == off.
 2. **Post-fusion A-vs-B depth-0 gap re-derived** (record:
-   benchmarks/2026-09-06-strix-halo-gfx1151-post-fusion-gap.md), A
+   wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-post-fusion-gap.md), A
    (fusion ON) vs B (c7af5c6c2), same-session warm-clock r3:
    pp512 2.05x, 1024 2.04x, 2048 2.21x, 4096 1.68x, 8192 1.37x, 16384 1.14x.
    B reproduces its WS1 numbers (~1%); the fusion moved the long rows

@@ -1,7 +1,8 @@
-From 544bc2fc91d0ab2cb3ae42af950d4ae1240a1404 Mon Sep 17 00:00:00 2001
+From c261553a1e3bd5ff16cc278d23e8f32efe75406d Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 06:50:35 -0500
-Subject: rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq short-K item-split
+Subject: [PATCH 13/13] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
+ short-K item-split
 
 - fused MoE gate+up+GLU MMQ (prefill) on RDNA4, gated to the instantiated
   type list (Q3_K/Q4_K/Q5_K/Q8_0/Q6_K)
@@ -37,12 +38,26 @@ Subject: rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq short-K item-sp
   (gfx1100) fused-MoE-MMQ gate relaxations - see patches/README.md block-13
   notes and the dated benchmark records.
 
-- Amended 2026-09-13 with the model-neutral Strix MoE mmq folds (routed mmq,
+- Amended 2026-09-06 with the model-neutral Strix MoE mmq folds (routed mmq,
   swiglu-input quantize, mwr float4, split_j/Q8_0 rows, quantize chunk,
   mul_mat_q_pair, weighted-down mmvq, scale-unary window) - see
   patches/README.md and wip/archive/qwen4exp/README.md.
-
 ---
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 154 +++-
+ ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh     |   6 +-
+ ggml/src/ggml-cuda/mmq-vec-dot.cuh            |  16 +-
+ ggml/src/ggml-cuda/mmq.cu                     | 228 +++++-
+ ggml/src/ggml-cuda/mmq.cuh                    | 409 +++++++++-
+ ggml/src/ggml-cuda/mmvq.cu                    | 721 ++++++++++++++++--
+ ggml/src/ggml-cuda/mmvq.cuh                   |   8 +
+ ggml/src/ggml-cuda/moe-weighted-reduction.cu  |  32 +-
+ ggml/src/ggml-cuda/quantize.cu                | 221 ++++--
+ ggml/src/ggml-cuda/quantize.cuh               |  26 +-
+ .../template-instances/generate_cu_files.py   |  14 +
+ .../template-instances/mmq-instance-q3_k.cu   |   1 +
+ tests/test-backend-ops.cpp                    |   2 +-
+ 13 files changed, 1634 insertions(+), 204 deletions(-)
+
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index 5d144245f..f96e67bb4 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
@@ -2599,10 +2614,10 @@ index ffb6213af..9e89727a9 100644
  DECL_MMQ_CASE(GGML_TYPE_Q3_K);
 +DECL_MMQ_CASE_GATE(GGML_TYPE_Q3_K);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 8f888f168..6a48a0044 100644
+index 567e4a092..1db7a9e08 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -9841,7 +9841,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9933,7 +9933,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      }
  
      for (int bs : {1, 4, 512}) {
@@ -2611,3 +2626,6 @@ index 8f888f168..6a48a0044 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  // test with mul after (ffn_moe_weighted)
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1, true));
+-- 
+2.55.0
+

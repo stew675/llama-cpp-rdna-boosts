@@ -1,8 +1,8 @@
 # Strix Halo (RDNA3.5 / gfx1151) — weighted-down fusion port (decode MoE tail)
 
-Date: 2026-09-10 session (continuation of the equal/surpass-B campaign). A commit `a18e24f97`
+Date: 2026-09-05 session (continuation of the equal/surpass-B campaign). A commit `a18e24f97`
 on `1682d32a9`; beta patch 8 (`ws3-weighted-down-fusion.patch`). Environment: same as the
-2026-09-10 records (IQ4_XS UD Qwen3.8-Flash-Next, llama-bench `-ngl 99 -t 15 -b 2048 -ub 2048
+2026-09-05 records (IQ4_XS UD Qwen3.8-Flash-Next, llama-bench `-ngl 99 -t 15 -b 2048 -ub 2048
 -fa on -ctk f16 -ctv f16 --load-mode none`).
 
 ## What and why
@@ -41,4 +41,4 @@ on this box (decode is host-launch/attention-bound, not the down-tail); it is NO
 the remaining tg@0 gap (A ~25.0 vs B ~25.96). A's decode profile is dominated by thousands of
 small `mul_mat_vec_q`/ksplit launches per token — the next decode lever is a kernel-mix
 comparison A-vs-B (per-op decode profile), not this tail. The prefill shallow-row gap (depth-0
-pp2048 1.93x) is a separate per-token cost (see the 2026-09-10 gap record).
+pp2048 1.93x) is a separate per-token cost (see the 2026-09-05 gap record).

@@ -5,15 +5,17 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **13-patch set** against the fork point
-`9cffdcc80` (re-based 2026-09-02 from `0eadefebd`): blocks 01-13
+`465e49b9c` (re-based 2026-09-06 from `9cffdcc80`, itself re-based
+2026-09-02 from `0eadefebd`): blocks 01-13
 (`patches/0001-…0013-…`, format-patch of the
-fork's `rdna-boosts` block commits — the re-based regeneration
-`04122bfb5..b830050bf` against `9cffdcc80`; block 12 was amended
-2026-09-04 with the runtime NCCL-failure fallback (issue #13) and block
-13 was amended 2026-09-02 with two MTP regression fixes, see the dated
-records below; the previous `0eadefebd`-based regeneration
-`b25bc8a9c..482837e5a` is superseded and preserved on the fork's
-history/remotes). Apply flow: `git am`
+fork's `rdna-boosts` block commits — the re-baselined regeneration
+`45bf4d291..c261553a1` against `465e49b9c`; block 12 was amended
+2026-09-04 with the runtime NCCL-failure fallback (issue #13), block
+13 was amended 2026-09-02 with two MTP regression fixes, 2026-09-05
+with the RDNA3.5/RDNA3.0 gate relaxations and 2026-09-06 with the
+model-neutral Strix MoE mmq folds — see the dated records below; the
+previous `9cffdcc80`-based regeneration `04122bfb5..b830050bf` is
+superseded and preserved on the fork's history/remotes). Apply flow: `git am`
 for the whole 01-13 series (plain `git apply` of the concatenated series
 SILENTLY DROPS HUNKS — verified 2026-08-29);
 `scripts/apply-all.sh` automates it. **The set is whitespace-clean** —
@@ -23,7 +25,8 @@ re-verified 2026-09-01 on the `0eadefebd` re-base, re-verified with block
 re-base 2026-09-02, re-verified after the 2026-09-02 block-13 amendment,
 re-verified after the 2026-09-04 block-12 amendment, re-verified after
 the 2026-09-05 block-13 RDNA3_5 gate relaxation, re-verified after the
-2026-09-05 RDNA3_0/gfx1100 fold).
+2026-09-05 RDNA3_0/gfx1100 fold, re-verified on the `465e49b9c` re-base
+2026-09-06).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -49,7 +52,7 @@ patch set. It is written for humans AND LLM coding agents. Follow it exactly;
 do not skip blocks.
 
 Current state: `main` is the delivery branch (flat history, 13-patch set
-against `9cffdcc80`). The `baseline/<sha>` branches and `block/01-…11` tags
+against `465e49b9c`). The `baseline/<sha>` branches and `block/01-…11` tags
 are HISTORICAL checkpoints of the old pre-block-12 structure (older
 upstream ranges, `git apply` flow); do not use them for the current
 delivery — use `patches/` + `scripts/apply-all.sh`.
@@ -81,6 +84,30 @@ silently drops hunks.
 
 
 ## Verified apply sequence
+
+### Re-baseline to 465e49b9c (2026-09-06)
+
+Upstream master moved **18 commits** past the fold-verified base
+`8b4b3558f` (57 past the old delivery fork point `9cffdcc80`).  The
+`~/llama.cpp` fork was rebuilt from `patches/` via `scripts/apply-all.sh`
+on the fresh master tip — 13/13 `git am` clean, **zero conflicts, zero
+whitespace warnings**: the ggml-cuda-touching upstream commits
+(`73a43d1f6` mmid/mmf race fixes #28475, `5fdfa6282` GDN l2-norm fix
+#28068 — model-layer only) landed in disjoint hunks; no manual merges
+needed.  Per-file content check on all 112 upstream-touched files:
+deltas == old-fork + upstream drift exactly; the 14 extra differing
+files are the 2026-09-06 Strix fold delta.  Set regenerated
+(`scripts/make-patches.sh`, base `465e49b9c`, blocks tip `c261553a1`,
+am-commits `45bf4d291..c261553a1`) + `rdna-boosts-all.patch` refreshed
+(45 files; was stale at 41).  Prerequisites: restored the format-patch
+mail headers the 0044cfe fold had stripped from 0002/0004/0008/0013
+(commit 0610b75), and re-dated the block-13 message's fold-amendment
+trailer to the fold's true date (block-13 tip amended `b4b760eb8` ->
+`c261553a1`).  Clean-apply sim at `465e49b9c` re-verified 2026-09-06
+(zero conflicts/whitespace warnings; applied tree byte-identical to the
+fork tip).  The `qwen4exp` fork branch was rebuilt on the new base
+(`465e49b9c` + blocks + the consolidated beta support patch — see
+`beta/qwen4exp/README.md`).
 
 ### Re-baseline to 9cffdcc80 (2026-09-02)
 
@@ -227,7 +254,7 @@ local=600`), sim same-seed coherence identical, sim pp2048 1676.3 /
 pp16384 1424.6 (fused) vs 1590.7 / 1361.4 (unfused) — the regenerated
 set reproduces the validated gains.  `rdna-boosts-all.patch`
 regenerated (applies cleanly at `9cffdcc80`).  Full session record:
-`benchmarks/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
+`wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
 
 ### RX 7900 XTX (RDNA3_0, gfx1100) fused-MoE-MMQ validation (2026-09-05, current)
 
@@ -268,7 +295,7 @@ gfx1100, RCCL+graphs+native), sim same-seed coherence identical, sim
 pp2048 5394.2 / pp16384 4481.6 (fused) vs 4938.7 / 4161.7 (3-op) — the
 regenerated set reproduces the validated gains.  `rdna-boosts-all.patch`
 regenerated (applies cleanly at `9cffdcc80`).  Full session record:
-`benchmarks/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
+`wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
 
 ### Re-baseline to 0eadefebd (2026-09-01)
 

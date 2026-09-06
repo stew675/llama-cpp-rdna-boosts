@@ -1,9 +1,22 @@
-From 67ee990c94a3535e9bdd66660e702222d465264f Mon Sep 17 00:00:00 2001
+From cd39aa848229e8dc1dd47330e179e79ca45e55f0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
-Subject: rdna-boosts: block 02: fused chunked gated-delta-net prefill kernel
+Subject: [PATCH 02/13] rdna-boosts: block 02: fused chunked gated-delta-net
+ prefill kernel
 
 ---
+ ggml/src/ggml-cuda/gated_delta_net.cu         |  109 ++
+ ggml/src/ggml-cuda/gated_delta_net_chunked.cu |  702 ++++++++++++
+ .../src/ggml-cuda/gated_delta_net_chunked.cuh |   58 +
+ .../ggml-cuda/gated_delta_net_chunked_bf16.cu |  995 ++++++++++++++++
+ .../gated_delta_net_chunked_bf16_gfx11.cu     | 1014 +++++++++++++++++
+ tests/test-backend-ops.cpp                    |   97 +-
+ 6 files changed, 2970 insertions(+), 5 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cu
+ create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
+ create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
+ create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
+
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
 index 1b431a724..f9da81722 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
@@ -2924,7 +2937,7 @@ index 000000000..944110792
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 \ No newline at end of file
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 2cf9d9caf..da7842aa0 100644
+index c93e41b2e..d41d4bc21 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1499,14 +1499,64 @@ struct test_case {
@@ -3022,7 +3035,7 @@ index 2cf9d9caf..da7842aa0 100644
      test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
              int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
              int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
-@@ -10514,6 +10582,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10606,6 +10674,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
@@ -3041,7 +3054,7 @@ index 2cf9d9caf..da7842aa0 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
-@@ -10976,6 +11056,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11077,6 +11157,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
  
@@ -3055,3 +3068,6 @@ index 2cf9d9caf..da7842aa0 100644
      // lightning_indexer
      for (int kv : { 256, 4096, 65536 }) {
          for (int bs : { 1, 512, 2048 }) {
+-- 
+2.55.0
+

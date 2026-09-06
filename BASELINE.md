@@ -2,8 +2,8 @@
 
 Current state: `main` is the delivery branch carrying the **13-patch set**
 (blocks 01-13) generated against the fork
-point **llama.cpp master `9cffdcc80`** (re-based 2026-09-02 from
-`0eadefebd`). The `baseline/<sha>` branches below
+point **llama.cpp master `465e49b9c`** (re-based 2026-09-06 from
+`9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`). The `baseline/<sha>` branches below
 are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
@@ -23,20 +23,24 @@ at `192067b72`), `baseline/d222767c7` (validated against `d222767c7`) and
 
 
 All 13 patches are generated against **llama.cpp upstream master at
-`9cffdcc80`** (re-based 2026-09-02 from `0eadefebd`; dated records at the
+`465e49b9c`** (re-based 2026-09-06 from `9cffdcc80`, itself re-based
+2026-09-02 from `0eadefebd`; dated records at the
 bottom of this file): blocks 01-13 = the fork's `rdna-boosts` block
-commits (the current 13-commit branch on `9cffdcc80` is
-`04122bfb5..b830050bf`; block 12 amended 2026-09-04 with the runtime
-NCCL-failure fallback (issue #13) and block 13 amended 2026-09-02 with
-two MTP regression fixes — see `MANIFESTS.md` / `patches/README.md`
-block-12/13 notes; the previous `0eadefebd`-based
-regeneration `b25bc8a9c..482837e5a` is superseded and preserved on the
+commits (the current 13-commit branch on `465e49b9c` is
+`45bf4d291..c261553a1`; block 12 amended 2026-09-04 with the runtime
+NCCL-failure fallback (issue #13), block 13 amended 2026-09-02 with
+two MTP regression fixes, 2026-09-05 with the RDNA3.5/RDNA3.0 gate
+relaxations and 2026-09-06 with the model-neutral Strix MoE mmq folds
+— see `MANIFESTS.md` / `patches/README.md`
+block-12/13 notes; the previous `9cffdcc80`-based
+regeneration `04122bfb5..b830050bf` is superseded and preserved on the
 fork remote's history).
 `scripts/make-patches.sh` regenerates both. Verified 2026-09-02 and
-re-verified 2026-09-02 after the block-13 amendment and 2026-09-04
-after the block-12 amendment: clean
+re-verified 2026-09-02 after the block-13 amendment, 2026-09-04
+after the block-12 amendment and 2026-09-06 on the `465e49b9c` re-base:
+clean
 apply (`git am` 01-13) on a fresh checkout at
-`9cffdcc80`, full build clean, llama-cli same-seed coherence IDENTICAL
+`465e49b9c`, full build clean, llama-cli same-seed coherence IDENTICAL
 (hybrid vs RCCL) — and the
 apply is **whitespace-free** (zero git warnings).
 
@@ -91,7 +95,7 @@ checkpoint history moved to `archive/docs/baseline-history.md`.
 
 ## Drift policy
 
-The patches are static against the fork point `9cffdcc80`. If a patch fails
+The patches are static against the fork point `465e49b9c`. If a patch fails
 to apply against a newer upstream master:
 
 1. Try `git am -3` / `git apply -3` (3-way merge against the baseline blobs).
@@ -102,8 +106,8 @@ to apply against a newer upstream master:
 3. Do NOT hand-edit the committed patches as the permanent fix: when more
    than one block needs manual re-base hunks, regenerate the whole set from
    the fork with `scripts/make-patches.sh` (re-exports blocks 01-13 from
-   `9cffdcc80..<blocks-tip>`; defaults target
-the current blocks tip `b830050bf`), then re-verify the clean-apply
+   `465e49b9c..<blocks-tip>`; defaults target
+the current blocks tip `c261553a1`), then re-verify the clean-apply
 simulation (fresh worktree at the new fork point, `scripts/apply-all.sh`,
 build, coherence) and update the fork point + verification numbers in
 `patches/README.md` and `README.md`.
@@ -312,3 +316,34 @@ llama-cli same-seed coherence **IDENTICAL between hybrid and RCCL**
 additions. The previous `0eadefebd`-based fork state (tip `482837e5a`)
 remains on the `stew675/llama.cpp` fork remote (`rdna-boosts`); older
 reference checkpoints are preserved in `~/prs/llama.cpp`.
+
+## Re-baseline to 465e49b9c (2026-09-06, dated record)
+
+Upstream master moved **18 commits** past the fold-verified base
+`8b4b3558f` (57 past the old delivery fork point `9cffdcc80`; the
+ggml-cuda-touching ones were `73a43d1f6` mmid/mmf race fixes #28475 and
+`5fdfa6282` GDN l2-norm fix #28068).  The `~/llama.cpp` fork
+(`rdna-boosts`) was rebuilt from `patches/` via `scripts/apply-all.sh`
+on the fresh master tip: 13/13 `git am` clean, **zero conflicts, zero
+whitespace warnings** — both upstream ggml-cuda commits landed in
+disjoint hunks; no manual merges.  Applied-tree content check on all 112
+upstream-touched files passed (deltas == old-fork + upstream drift); the
+14 extra differing files are exactly the 2026-09-06 Strix fold delta.
+Set regenerated with `scripts/make-patches.sh` (base `465e49b9c`, blocks
+tip `c261553a1`; canonical am-commits `45bf4d291..c261553a1`);
+`rdna-boosts-all.patch` refreshed (45 files — the previous copy was
+stale at 41, pre-fold).  Two prerequisites: restored the format-patch
+mail headers the 0044cfe fold had stripped from `0002/0004/0008/0013`
+(delivery commit 0610b75) and re-dated the block-13 message's
+fold-amendment trailer to the fold's true date (block-13 tip amended
+`b4b760eb8` -> `c261553a1`).  Re-verified 2026-09-06: clean-apply sim on
+a fresh checkout at `465e49b9c` (zero conflicts/whitespace warnings;
+applied tree byte-identical to the fork tip `c261553a1`).  The
+`qwen4exp` fork branch was rebuilt on the new base (`465e49b9c` + blocks
++ the consolidated `beta/qwen4exp/qwen4exp-support.patch`, clean 3-way,
+46 files, zero conflicts — fork tip `627506c1c`).  Campaign date
+re-stamp: the gfx1151 campaign docs had run a week ahead of the real
+calendar; all `wip/`/`beta/`/archive dates were collapsed onto the real
+git dates (2026-09-05/06) and the moved benchmark records'
+`benchmarks/2026-09-*` references repointed at
+`wip/archive/qwen4exp/discovery/`.

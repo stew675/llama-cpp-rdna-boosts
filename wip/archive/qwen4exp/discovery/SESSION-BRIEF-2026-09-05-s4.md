@@ -1,4 +1,4 @@
-# Strix Halo session brief — 2026-09-08 end state (handoff for the next session)
+# Strix Halo session brief s4 (2026-09-05) — end state / handoff for the next session
 
 CONTINUE from this file + the plan (~/make-strix-halo-faster.md) + the evidence
 trail (wip/strix-halo/notes-ws1-survey.md) + the dated records (below). Read all
@@ -20,10 +20,10 @@ first.
   ws4-hc-prefill-fusions, ws3-routed-moe-mmq). README updated. TODO.md updated.
 - ~/strix-llama.cpp (B) `c7af5c6c2` untouched. B is a ~1% stable bench reference.
 
-## What is DONE (2026-09-08 session)
+## What is DONE (2026-09-05 session)
 
 1. **WS3 #3 (routed-compact MoE MMQ for the i-quants) DONE, DEFAULT ON**
-   (record: benchmarks/2026-09-08-strix-halo-gfx1151-ws3-routed-moe-mmq.md):
+   (record: wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-routed-moe-mmq.md):
    - port of B's mul_mat_q_routed_compact (one descriptor per real (expert,
      J-tile) pair; build_mmq_routed_descriptors single block/thread per expert)
      + per-expert J selection (mmq_rdna3_5_id_get_J 16/48/64/128 by
@@ -54,7 +54,7 @@ first.
 
 ## OPEN items
 
-1. **WS3 #2 llama-bench artifact — ROOT CAUSE FOUND (2026-09-08), no code
+1. **WS3 #2 llama-bench artifact — ROOT CAUSE FOUND (2026-09-05), no code
    shipped; maintainer adjudication needed on defaulting the shortcut ON:**
    the artifact is llama-bench's sync-free multi-decode pipeline (test_prompt
    decodes n_batch chunks with no llama_synchronize between, deep GPU queue)
@@ -74,8 +74,8 @@ first.
    true shortcut 343.6). Fix options: (a) keep opt-in default OFF; (b) ggml
    multi-layout gallocr cache (real fix, core-ggml, own session); (c) default
    ON + accept the bench artifact (real serving neutral-or-better). Full record:
-   benchmarks/2026-09-08-strix-halo-gfx1151-ws3-shortcut-artifact-rootcause.md.
-2. **Remaining prefill gap** (from the 2026-09-08 record): pp512-4096 still
+   wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-shortcut-artifact-rootcause.md.
+2. **Remaining prefill gap** (from the 2026-09-05 record): pp512-4096 still
    ~1.5-2x B, now dominated by (a) the per-ubatch elementwise/routing/
    reduction tail (B's weighted-expert-sum/concat graph fusions
    ggml_cuda_op_weighted_expert_sum + ggml_cuda_mul_mat_id_weighted_rdna3_5

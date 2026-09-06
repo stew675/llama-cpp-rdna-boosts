@@ -96,7 +96,7 @@ per 4 pp2048 decodes: op_repeat 384->8 (0.182->0.004s), hc_combine_norm 372/0.54
 pre-absorb), pp4096 0.996x, pp16384 1.20x, pp512/pp1024 at parity. NOTE: machine-level drift
 between sessions reached ~2.5% on B itself (773->754) - always judge by same-session pairs.
 
-## Repeat-bcast investigation (2026-09-13 cont.): hc_combine prefill fusion REVERTED - net-negative
+## Repeat-bcast investigation (2026-09-06 cont.): hc_combine prefill fusion REVERTED - net-negative
 
 The per-layer repeat (A 96/pass at grid 1280x4 ~0.47ms = the build_hc_combine b-broadcast of
 block_out (n_embd,1,nt) -> (n_embd,hc,nt)) looked removable: ggml's k_bin_bcast indexes src0

@@ -1,6 +1,6 @@
 # Strix Halo (RDNA3.5 / gfx1151) — A-vs-B gap re-derived on the WS3 #2 default-ON build
 
-Date: 2026-09-10 session (continuation). Purpose: equal/surpass the community repo (B) for
+Date: 2026-09-05 session (continuation). Purpose: equal/surpass the community repo (B) for
 PREFILL and TG at EVERY data point (depths 0/12k/32k x pp512..16384 + tg128). This record is the
 new baseline after the WS3 #2 ggml fix + `LLAMA_QSA_DENSE_SHORTCUT` default ON (A `1682d32a9`):
 A's default now runs dense-below-width attention like B, so depth-0 rows compare regime-matched.
@@ -68,7 +68,7 @@ comparison needs r3). A is unaffected (deterministic count/scan indexer, no cub 
 ## Next attack (shallow-row per-token tail)
 
 Per the ledger, the largest remaining component at pp512-4096@0 is the MoE routing/reduction
-tail. SCOPED this session (2026-09-10) — port B's weighted-down fusion into A, then re-measure
+tail. SCOPED this session (2026-09-05) — port B's weighted-down fusion into A, then re-measure
 pp512-2048@0. The port is mechanically clean:
 - A's graph ALREADY emits B's fusion pattern: `build_moe_ffn` (A src/llama-graph.cpp ~2252)
   emits `down = mul_mat_id(...)` [n_embd x n_used=10 x n_tokens] -> `ggml_mul(weights)` ->
