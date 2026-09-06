@@ -52,12 +52,14 @@ HIP_VISIBLE_DEVICES=0,1,2 GGML_CUDA_FA_WMMA_256=0 \
 
 ## Contents
 
-Five squashed patch files. They apply IN ORDER on the rdna-boosts core
+Seven squashed patch files. They apply IN ORDER on the rdna-boosts core
 = upstream master `8b4b3558f` + blocks 01-13 (re-based/regenerated
 2026-09-04 from the previous `9cffdcc80`-based `8f2838d1c` set).
 Applied together (patches 1-4) they reproduce the `qwen4exp` branch tip
 `248e47704` tree-identically; patch 5 (ws3-routed-moe-mmq) adds the
-2026-09-08 WS3 #3 commit `a1121cf2d` on top.
+2026-09-08 WS3 #3 commit `a1121cf2d`; patches 6-7 add the 2026-09-10
+WS3 #2 artifact fix (`fcfb0a522`) + the shortcut default flip
+(`1682d32a9`) on top.
 
 The 2026-09-04 re-base re-applied the first two patches onto the current
 master (39 commits of upstream drift past the old base) and resolved the
@@ -183,6 +185,45 @@ Opt-out: `GGML_CUDA_DISABLE_MMQ_ROUTED=1` (compact dispatch only).
 Gate: RDNA3_5 only (B parity); gfx1201 enablement deferred to the
 delivery flow's gfx1201 box.
 
+### 6. `ggml-sched-fallback-sync.patch` (2026-09-10)
+
+Core-ggml fix (commit `fcfb0a522`): the scheduler alloc-fallback
+(`ggml_backend_sched_alloc_splits`) now only does the full device
+synchronize when the re-reserve must actually GROW a buffer.
+`ggml_gallocr_reserve_n_probe()` computes+stores the graph layout
+without touching the existing buffers (the `no_alloc` path no longer
+frees them) and reports growth; the fallback syncs + re-reserves only
+then. Rationale: gallocr buffers are grow-only, so a reserve that fits
+only re-points the new graph's tensors — safe without a sync because
+the graph's compute is ordered after the previous graph's on the
+backend stream(s); only a free+realloc moves addresses an in-flight
+graph may still use. Fixes the llama-bench multi-ubatch artifact
+(llama-bench pipelines async decodes without syncing; every fallback
+sync drained the whole ~3 s GPU queue — the dense/sparse ubatch
+alternation hit one EVERY ubatch of EVERY rep; now zero syncs in the
+steady state). No numerics change; OFF-path and real serving (syncs
+per decode) unaffected. Record:
+`benchmarks/2026-09-10-strix-halo-gfx1151-ws3-shortcut-fix.md`.
+NOTE: core-ggml, arch-agnostic; multi-GPU / pipeline-parallel not
+exercised here (ordering argument holds per-device) — candidate for an
+upstream PR at the maintainer's discretion.
+
+### 7. `ws3-shortcut-default-on.patch` (2026-09-10)
+
+qwen4exp QSA dense shortcut (commit `1682d32a9`) DEFAULT ON (B
+parity), enabled by patch 6: while `n_kv <= indexer_top_k + ratio - 1`
+(= 2051 here) the QSA layers attend dense (`build_attn`) + store-only
+indexer keys; past the budget the indexer scoring + sparse kernel run
+exactly as before. The llama-bench artifact that kept it opt-in is
+root-caused and fixed at the ggml level (patch 6), so the depth-0
+ladder is now faster with the shortcut at every size and depth rows
+are flat. `LLAMA_QSA_DENSE_SHORTCUT` is now an opt-OUT (=0 forces the
+pre-flip selection path / known-good numerics); unset or =1 = ON. The
+env name matches B for cross-testing. Numerics below the width = the
+`LLAMA_QSA_SPARSE_FA=0` masked-dense path (text-identical); the
+dense-vs-sparse kernel signature difference vs the selection default
+is the documented env-selectable regime.
+
 ## Apply
 
 ```
@@ -195,20 +236,41 @@ git apply qwen4exp-support.patch
 git apply mtp-draft-support.patch
 git apply ws4-hc-prefill-fusions.patch
 git apply ws3-routed-moe-mmq.patch
+git apply ggml-sched-fallback-sync.patch
+git apply ws3-shortcut-default-on.patch
 ```
 
-All five patches apply clean with plain `git apply` on that base
+All seven patches apply clean with plain `git apply` on that base
 (patch 4 re-verified 2026-09-06: applied tree byte-identical to the
 qwen4exp branch tip `248e47704`; patch 5 re-verified 2026-09-08:
 applied on `248e47704` tree-identical to the qwen4exp branch tip
-`a1121cf2d`'s mmq.cuh, i.e. exactly the WS3 #3 delta; patches 1-3
-re-verified 2026-09-04 on the same base). If master drifts further,
+`a1121cf2d`'s mmq.cuh, i.e. exactly the WS3 #3 delta; patches 6-7
+re-verified 2026-09-10 on `a1121cf2d`: applied tree byte-identical to
+the qwen4exp branch tip `1682d32a9`; patches 1-3 re-verified
+2026-09-04 on the same base). If master drifts further,
 `git apply --3way` (or a manual resolve on the qwen4exp.cpp attention
 path) is the fallback — the patch pre-images now match the current
 master-based files, so drift has to overlap the patched regions again
 before conflicts return.
 
 ## Validation status (the gates this baseline holds)
+
+- WS3 #2 artifact fix + shortcut default ON gates on Strix Halo (gfx1151),
+  2026-09-10: patches 6-7 (ggml sched-fallback sync + shortcut default
+  ON) — same-session warm-clock r3, shortcut ON vs `=0`: depth-0 ladder
+  ON >= OFF at every size (pp16384 574.1 vs 566.8, pp8192 544.0 vs 535.0,
+  pp4096 487.9 vs 473.0, pp2048 399.7 vs 382.7, pp1024/512 +1.6-2.7%,
+  tg128@0 25.25 vs 24.23); the artifact rows pp4096/8192/16384@0 (were
+  -17/-29/-36% with the shortcut on) are now +1.3-3.2%. Depth rows flat
+  through 32k (pp2048@d12288/d32768, tg@d12288/d32768). Sync pattern:
+  zero alloc-fallback syncs in the steady state (was 8 × ~3 s over 2
+  passes). Coherence: default OFF-path == known-good; shortcut numerics
+  below the width == `LLAMA_QSA_SPARSE_FA=0` dense reference (text-
+  identical); multi-ubatch p5000 shortcut-ON run twice byte-identical
+  (deterministic under the new no-sync re-pointing). Record:
+  `benchmarks/2026-09-10-strix-halo-gfx1151-ws3-shortcut-fix.md`.
+  NOTE: gfx1201/multi-GPU validation of patch 6 still pending (see the
+  patch-6 note).
 
 - WS3 #3 gates on Strix Halo (RDNA3.5 / gfx1151), 2026-09-08: patch 5
   (routed-compact MoE MMQ for the i-quants, RDNA3.5-gated DEFAULT ON,

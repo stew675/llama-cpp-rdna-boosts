@@ -5,24 +5,28 @@ Forward-looking: open items + current active experiments; closed work is a
 one-line bullet (details live in AGENTS.md, patches/README.md, MANIFESTS.md,
 `beta/qwen4exp/README.md`, `wip/` handovers, `benchmarks/`). Current
 delivery = the 13-patch set against fork point `9cffdcc80` (blocks 01-13).
-Reality pass: 2026-09-06.
+Reality pass: 2026-09-10.
 
 ## Current active
 
 ### Strix Halo (gfx1151): prefill-gap follow-ons after WS4 (WS3 #2/#3)
-- WS3 #2 (QSA dense-shortcut below the selection width) IMPLEMENTED and
-  characterized (2026-09-06, A commit `151798ed2`, OPT-IN default OFF):
-  tg128@0 +4.2% (24.53 vs 23.54), pp512-2048@0 +3-5%, llama-cli crossing
-  prefill neutral (p5000 259.9 vs 258.8), depth gates untouched; numerics
-  below the width == A's existing LLAMA_QSA_SPARSE_FA=0 dense path
-  (text-identical). llama-bench-only multi-ubatch artifact ROOT-CAUSED
-  2026-09-08 (llama-bench's sync-free decode pipeline x ggml-gallocr
-  single-layout alloc-fallback full sync; real serving syncs per decode
-  and is immune): see `benchmarks/2026-09-08-strix-halo-gfx1151-ws3-
-  shortcut-artifact-rootcause.md`. Default OFF pending adjudication; B
-  defaults ON. Record + numbers:
-  `benchmarks/2026-09-06-strix-halo-gfx1151-post-fusion-gap.md` (WS3 #2
-  section).
+- WS3 #2 (QSA dense-shortcut below the selection width) DONE + DEFAULT
+  ON (2026-09-10, A commits `fcfb0a522` ggml fix + `1682d32a9` flip;
+  beta patches 6-7): the llama-bench multi-ubatch artifact was
+  ROOT-CAUSED (llama-bench's sync-free decode pipeline x ggml-gallocr's
+  single-layout alloc-fallback doing an unconditional full-device sync on
+  every dense/sparse topology flip — drains the whole ~3 s GPU queue)
+  and FIXED at the ggml level: `ggml_gallocr_reserve_n_probe()` lets the
+  sched fallback sync only when a buffer must actually GROW (buffers are
+  grow-only; a fitting reserve just re-points tensors, stream-ordered,
+  no sync needed). Same-session r3: depth-0 ON >= OFF at every size
+  (was -17/-29/-36% at pp4096/8192/16384; now +1.3-3.2%), tg128@0 25.25
+  vs 24.23 (+4.2%), depth 12k/32k rows flat, zero fallback syncs in the
+  steady state; OFF-path == known-good text, ON == SPARSE_FA=0 dense
+  reference, multi-ubatch deterministic. `LLAMA_QSA_DENSE_SHORTCUT` =
+  0 forces the pre-flip selection path (known-good numerics); unset/=1 =
+  ON (B parity). Record:
+  `benchmarks/2026-09-10-strix-halo-gfx1151-ws3-shortcut-fix.md`.
 - WS3 #3 (routed-compact MoE mmq for the i-quants) DONE (2026-09-08, A
   commit `a1121cf2d`, DEFAULT ON): port of B's
   mul_mat_q_routed_compact + per-expert J selection
@@ -38,20 +42,17 @@ Reality pass: 2026-09-06.
   pp8192 1.37->1.26x, pp16384 1.14->1.06x. Env opt-out:
   GGML_CUDA_DISABLE_MMQ_ROUTED=1 (compact only; J selection stays). Record:
   `benchmarks/2026-09-08-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
-- Remaining on the Strix prefill leg: (a) WS3 #2 llama-bench artifact
-  ROOT-CAUSED (2026-09-08): llama-bench's sync-free decode pipeline x
-  ggml-gallocr's single-layout alloc-fallback full-device-sync, triggered
-  by the dense<->sparse graph alternation (every fallback drains the
-  ~3 s GPU queue). Real serving syncs per decode -> immune (p5000
-  neutral). No fix shipped; the dense-shortcut stays opt-in default OFF
-  pending maintainer choice of {keep opt-in, ggml multi-layout gallocr
-  cache (real fix, core-ggml), default ON + accept bench artifact}. Full
-  evidence: `benchmarks/2026-09-08-strix-halo-gfx1151-ws3-shortcut-
-  artifact-rootcause.md`; (b) the per-ubatch routing/reduction tail (B's
-  weighted-expert-sum/concat graph fusions; A's tail unfused outside WS4
-  hyperconn coverage) — not yet requested; (c) RDNA4/gfx1201 validation
-  of the WS3 #3 gate via the delivery flow when a gfx1201 box is
-  available. tg@0 decode gap (24.2 vs 26.0) is the later generation
+- Remaining on the Strix prefill leg: (a) gfx1201/RDNA4 validation of
+  the ggml fix (patch 6) + WS3 #3 gate (patch 5) via the delivery flow
+  when a gfx1201 box is available (multi-GPU/pipeline-parallel not
+  exercisable here; the no-sync ordering argument holds per-device but
+  should be re-checked there); the ggml fix is also a candidate upstream
+  PR at the maintainer's discretion (core-ggml, arch-agnostic); (b) the
+  per-ubatch routing/reduction tail (B's weighted-expert-sum/concat
+  graph fusions; A's tail unfused outside WS4 hyperconn coverage) — not
+  yet requested; (c) re-derive the A-vs-B gap on the new default (B
+  already defaults the shortcut ON, so depth-0 rows are now regime-)
+  matched). tg@0 decode gap (24.2 vs 26.0) is the later generation
   phase. WS6 re-base NOT indicated.
 ### Validate beta qwen4exp on Strix Halo (gfx1151) — DONE for WS4; beta set runs on gfx1151
 - Block 13's Strix leg is DONE (2026-09-05): the fused MoE gate+up+GLU
