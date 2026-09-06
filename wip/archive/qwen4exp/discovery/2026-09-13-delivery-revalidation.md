@@ -84,3 +84,22 @@ the GFX1201 phase or defer. NOTE: much of the qwen4exp-support patch is MoE/qwen
 and likely INERT on this dense model (only sched-sync + the generic scale-unary window could
 fire) - a blocks-only-vs-blocks+support A/B on this model would isolate whether the gap is
 in the top-level blocks themselves.
+
+## Dense-pp isolation (Qwen3.5-9B Q8_0 profile + 27B/9B ladders)
+
+Location: the dense Q8_0 J=128 mmq (`mul_mat_q<8,128,false>`, 400 calls/eval, 4-7.6ms each =
+~75% of dense-pp time). A is +2.7%/call (2034 vs 1980ms/eval at pp2048) with IDENTICAL grid
+geometry and identical split_j config (both trees run the type-Q8_0/J128/I64/nwarps8 split
+variant). Register profile: A 136 vgpr vs B 192 vgpr (256 thr, sgpr 128 both) - B's kernel
+uses deeper register blocking (more ILP, less traffic); A's leaner kernel loses ~2% on this
+workload. Everything else ~parity or A-faster (GDN NW16 scan 91.7 vs B tiled 118.8ms = -27ms;
+flash, quantize, elementwise ~parity; rope/rms parity).
+
+Signature: A WINS tiny pp (128/256: +2.7/+1.6% - fewer fixed kernels/launches) and pp4096
+(multi-ubatch, scheduling artifacts), loses 512-2048 (-0.9..-1.4%). NOT a fixed per-eval
+overhead; it is the per-token dense-mmq cost being ~2% higher mid-range.
+
+Close option (defer): re-block A's Q8_0 J=128 tile toward B's 192-vgpr register profile (port
+B's inner loop into A's mmq.cuh) ~1.3-1.5% dense-pp; needs bit-identity re-gate (mma order
+may shift). Data: /tmp/prof/q9{A,B}.db_results.db, /tmp/q9{A,B}-*.log, /tmp/d27*.log,
+/tmp/q36*.log.
