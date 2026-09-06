@@ -63,11 +63,20 @@ for the full evidence. Remaining items are in the ledger at the bottom.
    candidate at this moment (maybe another day). gfx1201 / multi-GPU validation is DEFERRED
    until ALL Strix Halo work is done (less churn) — do not schedule it per-change.
 2. ACTIVE CAMPAIGN (maintainer direction 2026-09-10): equal/surpass the community repo (B) for
-   PREFILL and TG at EVERY data point (depths 0/12k/32k x pp512..16384 + tg128). First step:
-   re-derive the A-vs-B gap matrix on the NEW default (A shortcut ON = dense-below-width like B,
-   so depth-0 rows now compare regime-matched); then attack the largest remaining component per
-   the WS1 attribution (A's per-ubatch elementwise/norm/cpy + MoE routing/reduction tail vs B's
-   fused hc_* + weighted-expert-sum/concat graph ops; decode TG@0 vs B ~26 t/s).
+   PREFILL and TG at EVERY data point (depths 0/12k/32k x pp512..16384 + tg128). PROGRESS:
+   - Gap matrix re-derived on the shortcut-default build (2026-09-10-ab-gap-default-on record):
+     depth-0 pp gaps 1.58/1.76/1.93/1.39/1.25/1.04x (pp512..16384; worst pp2048 = a ~1.2 us/token
+     unfused-tail cost), tg128@0 A 25.07 vs B 25.96 (-3.5%); depth-12k pp 1.17-1.55x, tg A wins;
+     depth-32k A wins everything. B@depth must be measured -r 1 (its cub argsort aborts under
+     llama-bench's -r3 state-restore at depth; A unaffected). Same-box B runs 10-30% below the
+     community PR table - use same-box B.
+   - WS3 #4 weighted-down fusion PORTED (commit a18e24f97, beta patch 8, record
+     2026-09-10-weighted-down-fusion): decode MoE tail -> one kernel (B parity). Fires (rocprof),
+     text-neutral, tg128@d12288 +1.3% (22.50 vs 22.22), tg@0 ~flat, pp unchanged. NOT the tg@0
+     gap source: A's decode profile is thousands of small mul_mat_vec_q/ksplit launches per
+     token - NEXT DECODE LEVER = per-op decode kernel-mix comparison A-vs-B. The prefill
+     shallow-row gap is the unfused elementwise/routing tail (WS1 attribution), still the main
+     prefill target (see the gap record's scoped weighted-down/prefill notes).
 3. (If requested) the MoE routing/reduction tail: B's ggml_cuda_op_weighted_expert_sum +
    ggml_cuda_mul_mat_id_weighted_rdna3_5 (IQ4_NL down-proj fused with the n_used=10 weighted
    sum) graph fusions into A's ggml-cuda.cu — the biggest remaining pp512-4096 gap component
