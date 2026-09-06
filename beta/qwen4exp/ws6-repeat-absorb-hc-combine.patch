@@ -1,0 +1,193 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index e3740f1ca..94a0f59ff 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4914,6 +4914,156 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     }
+     }
+     if (hc_comb_on) {
++    // halo-box merge (repeat-anchored combine+norm fusion): the model pre-expands block_out/w so
++    // the combine run is scale -> sigmoid -> scale -> [reshape] -> repeat -> mul -> add, with the
++    // hc-wide block_out REPEAT between the scale chain and the mul. A scale-anchored window would
++    // have to include the [n_embd,1,T] reshape view, whose external (non-constant) view_src fails
++    // the fuse check, so anchor the window AT the repeat: [repeat, mul, add, rms, (view,) mul(gamma)].
++    // The SCALE/SIGMOID/SCALE nodes dispatch standalone (tiny) and their op params feed the kernel.
++    // The kernel broadcasts the NARROW base (block_out_hc=false), so the ~80MB materialization never
++    // dispatches. Safe to read the base at the window: the model pins block_out as a graph output
++    // (GGML_TENSOR_FLAG_OUTPUT), keeping its buffer alive (a standalone repeat would let the allocator
++    // reuse it - the 2026-09-06 class of bug).
++    if (node->op == GGML_OP_REPEAT && node->type == GGML_TYPE_F32 && i + 1 < cgraph->n_nodes) {
++        const ggml_tensor * rep = node;
++        const int64_t n_embd = rep->ne[0];
++        const int64_t hc     = rep->ne[1];
++        const int64_t n_tok  = rep->ne[2];
++        const auto root_of = [](const ggml_tensor * t) -> const ggml_tensor * {
++            while (t != nullptr && t->view_src != nullptr) {
++                t = t->view_src;
++            }
++            return t;
++        };
++        if (n_embd > 0 && hc >= 2 && hc <= 8 && n_tok >= 1 && rep->ne[3] == 1) {
++            const ggml_tensor * base = rep->src[0];
++            const ggml_tensor * base_root = base;
++            while (base_root != nullptr && base_root->view_src != nullptr) {
++                base_root = base_root->view_src;
++            }
++            if (base_root != nullptr && base_root->type == GGML_TYPE_F32 &&
++                    (base_root->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++                const int limit = std::min(cgraph->n_nodes, i + 24);
++                // the consuming mul, then the chain: add(residual, mul) -> rms -> (view) -> mul(gamma)
++                int k = i + 1;
++                while (k < limit && !(cgraph->nodes[k]->op == GGML_OP_MUL &&
++                        (cgraph->nodes[k]->src[0] == rep || cgraph->nodes[k]->src[1] == rep))) {
++                    ++k;
++                }
++                if (k + 1 < limit && cgraph->nodes[k]->op == GGML_OP_MUL) {
++                    const ggml_tensor * mul = cgraph->nodes[k];
++                    int m = k + 1;
++                    while (m < limit && ggml_cuda_is_view_or_noop(cgraph->nodes[m]) && !ggml_is_empty(cgraph->nodes[m])) {
++                        ++m;
++                    }
++                    if (m < limit && cgraph->nodes[m]->op == GGML_OP_ADD) {
++                        const ggml_tensor * add = cgraph->nodes[m];
++                        int q = m + 1;
++                        while (q < limit && ggml_cuda_is_view_or_noop(cgraph->nodes[q]) && !ggml_is_empty(cgraph->nodes[q])) {
++                            ++q;
++                        }
++                        if (q < limit && cgraph->nodes[q]->op == GGML_OP_RMS_NORM) {
++                            const ggml_tensor * rms = cgraph->nodes[q];
++                            int g = q + 1;
++                            while (g < limit && ggml_cuda_is_view_or_noop(cgraph->nodes[g]) && !ggml_is_empty(cgraph->nodes[g])) {
++                                ++g;
++                            }
++                            if (g < limit && cgraph->nodes[g]->op == GGML_OP_MUL) {
++                                const ggml_tensor * mulg = cgraph->nodes[g];
++                                const int64_t hc_dim = n_embd * hc;
++                                // the other mul operand roots at the inject scale chain
++                                const ggml_tensor * w = nullptr;
++                                for (int s2i = 0; s2i < 2; ++s2i) {
++                                    const ggml_tensor * src = s2i == 0 ? mul->src[0] : mul->src[1];
++                                    if (src != nullptr && src != rep && root_of(src) != root_of(rep)) {
++                                        w = src;
++                                    }
++                                }
++                                const ggml_tensor * scale2 = w != nullptr ? root_of(w) : nullptr;
++                                // chain: scale1(inject) -> sigmoid -> scale2  (scale2 is the w root)
++                                const ggml_tensor * sigm  = scale2 != nullptr ? scale2->src[0] : nullptr;
++                                const ggml_tensor * scale1 = sigm   != nullptr ? sigm->src[0]   : nullptr;
++                                const ggml_tensor * inject = scale1 != nullptr ? scale1->src[0] : nullptr;
++                                const ggml_tensor * res = add->src[0] == mul ? add->src[1] : add->src[0];
++                                const ggml_tensor * gamma = nullptr;
++                                if (root_of(mulg->src[0]) == (const ggml_tensor *) rms) {
++                                    gamma = mulg->src[1];
++                                } else if (root_of(mulg->src[1]) == (const ggml_tensor *) rms) {
++                                    gamma = mulg->src[0];
++                                }
++                                const bool w_ok = w != nullptr && scale2 != nullptr && scale1 != nullptr && sigm != nullptr &&
++                                    scale2->op == GGML_OP_SCALE && scale1->op == GGML_OP_SCALE &&
++                                    sigm->op == GGML_OP_UNARY && ggml_get_unary_op(sigm) == GGML_UNARY_OP_SIGMOID &&
++                                    sigm->src[0] == scale1 && scale1->src[0] == inject &&
++                                    w->type == GGML_TYPE_F32 && w->ne[0] == 1 && w->ne[1] == hc &&
++                                    ggml_nelements(w) == hc * n_tok && ggml_is_contiguous(w);
++                                const bool b_ok = base_root->ne[0] == n_embd && ggml_is_contiguous(base_root) &&
++                                    ggml_nelements(base_root) == n_embd * n_tok;
++                                const bool ok_a = add->ne[3] == 1 && n_tok <= 65535 &&
++                                    inject != nullptr && inject->type == GGML_TYPE_F32 &&
++                                    ggml_is_contiguous(inject) && ggml_nelements(inject) == hc * n_tok;
++                                const bool ok_b = (add->src[0] == mul || add->src[1] == mul) && res != nullptr && res != mul &&
++                                    root_of((ggml_tensor *) rms->src[0]) == (const ggml_tensor *) add && rms->src[0] != nullptr;
++                                const bool ok_c = mul->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && res->type == GGML_TYPE_F32 &&
++                                    rms->type == GGML_TYPE_F32 && mulg->type == GGML_TYPE_F32 && gamma != nullptr && gamma->type == GGML_TYPE_F32;
++                                const bool ok_d = ggml_are_same_shape(mul, add) && ggml_are_same_shape(res, add) && ggml_are_same_shape(rms, add);
++                                const bool ok_e = ggml_is_contiguous(res) && ggml_is_contiguous(add) && ggml_is_contiguous(rms) &&
++                                    ggml_is_contiguous(mulg) && ggml_is_contiguous(gamma);
++                                const bool ok_f = gamma->ne[0] == hc_dim && ggml_nelements(gamma) == hc_dim && mulg->ne[0] == hc_dim &&
++                                    mulg->ne[1] == n_tok && mulg->ne[2] == 1 && mulg->ne[3] == 1 &&
++                                    ggml_nelements(mulg) == hc_dim * n_tok && w_ok && b_ok;
++                                const bool ok = ok_a && ok_b && ok_c && ok_d && ok_e && ok_f;
++                                if (ok) {
++                                    ggml_cuda_hc_combine_norm_args args;
++                                    args.inject       = inject;
++                                    args.residual     = res;
++                                    args.block_out    = base_root;
++                                    args.block_out_hc = false;
++                                    args.gamma        = gamma;
++                                    args.out_res      = (ggml_tensor *) add;
++                                    args.out_xn       = (ggml_tensor *) mulg;
++                                    args.s1           = ggml_get_op_params_f32(scale1, 0);
++                                    args.b1           = ggml_get_op_params_f32(scale1, 1);
++                                    args.s2           = ggml_get_op_params_f32(scale2, 0);
++                                    args.b2           = ggml_get_op_params_f32(scale2, 1);
++                                    memcpy(&args.eps, rms->op_params, sizeof(float));
++                                    auto overlap = [](const ggml_tensor * p, const ggml_tensor * q) {
++                                        const uintptr_t p0 = (uintptr_t) p->data, p1 = p0 + ggml_backend_buft_get_alloc_size(p->buffer->buft, p);
++                                        const uintptr_t q0 = (uintptr_t) q->data, q1 = q0 + ggml_backend_buft_get_alloc_size(q->buffer->buft, q);
++                                        return p0 < q1 && q0 < p1;
++                                    };
++                                    const bool res_inplace = res->data == add->data && ggml_are_same_layout(res, add);
++                                    bool alias_ok = !overlap(add, base_root) && !overlap(add, inject) && (res_inplace || !overlap(add, res)) &&
++                                        !overlap(mulg, base_root) && !overlap(mulg, inject) && !overlap(mulg, res) && !overlap(mulg, add) &&
++                                        !overlap(add, gamma) && !overlap(mulg, gamma);
++                                    if (!alias_ok && n_tok == 1 && hc <= 4) {
++                                        args.single_block = true;
++                                        alias_ok = true;
++                                    }
++                                    int          idxs[32];
++                                    enum ggml_op ops[32];
++                                    int          count = 0;
++                                    for (int kk = i; kk <= g; ++kk) {
++                                        idxs[count] = kk;
++                                        ops[count]  = cgraph->nodes[kk]->op;
++                                        ++count;
++                                    }
++                                    const int out_nodes[] = { m, g };
++                                    const bool supp = ggml_cuda_hc_combine_norm_supported(args, ggml_cuda_info().devices[cuda_ctx->device].warp_size);
++                                    const bool canf = ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2);
++                                    if (alias_ok && supp && canf) {
++                                        ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
++                                        return g - i;
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
+     // qwen4exp hyper-connection combine + next grouped rms norm (A-chain):
+     //   scale(inject) -> sigmoid -> scale -> [view w] -> mul(block_out x w) -> add(residual)
+     //     -> [view] -> rms_norm -> [view] -> mul(xn, gamma)
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 9b5fc782d..807505804 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -461,11 +461,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+         return cur;
+     }
+ 
++    // block_out and inject die at this combine; keep their buffers from being handed to the
++    // next grouped norm output (the backend fuses combine + norm into one kernel whose blocks
++    // all read block_out/inject while writing their own stream of the norm output, so the two
++    // must not alias). Ported from the halo-box reference: with the buffers pinned, the fused
++    // kernel can read the NARROW block_out base directly (block_out_hc=false) and the standalone
++    // hc-wide REPEAT materialization (a ~80MB tensor per combine at pp2048) is absorbed into the
++    // fusion window instead of dispatching.
++    ggml_set_output(block_out);
++    ggml_set_output(inject);
++
+     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
+     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+     w = ggml_scale(ctx0, w, 2.0f);
+     w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
+ 
++    // Emit the block output first and the scatter-weight chain right after it, so that
++    // scale -> sigmoid -> scale -> repeat -> mul -> add is one contiguous node run that
++    // backends can fuse into a single kernel.
++    ggml_build_forward_expand(gf, block_out);
++    ggml_build_forward_expand(gf, w);
++
+     ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
+     b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
+ 

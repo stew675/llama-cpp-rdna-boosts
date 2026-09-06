@@ -69,6 +69,33 @@ element math unchanged); cli text byte-identical. quantize_mmq_q8_1<*,false> 0.6
 4. swiglu/scatter quantize A fires 2x calls (376 vs 188): graph-level (B merges has_gate work
    into fewer quantize passes).
 
+## Repeat-bcast FIXED (commit b987877d7): absorb the block_out REPEAT into hc_combine_norm
+
+Census (first-schedule walk): every pass has 94 combine chains and ALL structurally match the
+hc_combine_norm fusion pattern (k=MUL, m=ADD, q=RMS, g=MUL); ~93 fuse - yet 96 standalone
+op_repeat kernels ALSO fire (2/layer). The repeats are NOT unfused combines: the graph expands
+them BEFORE the fusion window (repeat node index < the scale chain). The fusion deliberately
+does not absorb them: (a) reading the repeat INPUT after a standalone dispatch is the
+allocator-reuse hazard of the 2026-09-06 fix; (b) a scale-anchored window that included the
+in-list repeat must also include the [n_embd,1,T] reshape view, whose external view_src
+(block_out, non-constant) fails ggml_can_fuse_subgraph_ext. B avoids the materialization
+entirely: its model ggml_set_output's block_out/inject (pins the buffers alive) and
+pre-expands block_out + the w scale chain so scale->sigmoid->scale->reshape->repeat->mul->add
+is contiguous, and its fusion absorbs the repeat reading the NARROW base (block_out_hc=false).
+
+Fix (ported, both halves): qwen4exp build_hc_combine pins + pre-expands (B's exact lines); a
+new repeat-ANCHORED fusion entry in ggml-cuda.cu absorbs [repeat, mul, add, rms, mulg] into
+hc_combine_norm_f32 with bo = the pinned narrow base (the scale/sigmoid/scale dispatch
+standalone, tiny). Old scale-anchored entry kept for unpinned/old-order graphs (byte-identical
+fallback). TRAP: scale1 = scale2->src[0]->src[0] (sigmoid between the two scales); the base
+pin check must unwrap the reshape view to block_out (views don't carry the OUTPUT flag).
+Correctness: logitcmp deterministic + BIT-IDENTICAL; cli text byte-identical. Kernel deltas
+per 4 pp2048 decodes: op_repeat 384->8 (0.182->0.004s), hc_combine_norm 372/0.547s ->
+376/0.445s (narrow-bo reads; now FASTER per call than B's 0.468s), capture total 10.250 ->
+9.980s. Same-session A/B t/s: pp2048 762.9/773.1 (0.987x, was 0.936/725.4 pre-chunk +
+pre-absorb), pp4096 0.996x, pp16384 1.20x, pp512/pp1024 at parity. NOTE: machine-level drift
+between sessions reached ~2.5% on B itself (773->754) - always judge by same-session pairs.
+
 ## Repeat-bcast investigation (2026-09-13 cont.): hc_combine prefill fusion REVERTED - net-negative
 
 The per-layer repeat (A 96/pass at grid 1280x4 ~0.47ms = the build_hc_combine b-broadcast of
