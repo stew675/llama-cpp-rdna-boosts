@@ -1,0 +1,21 @@
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 88c793f21..9b5fc782d 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1206,8 +1206,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+ 
+     // indexer reads the same block input as q/k/v; no context (the MTP draft attends dense,
+-    // see build_layer_attn's caller in graph_mtp), no cache, or no ratio means dense
+-    const bool qsa = mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
++    // see build_layer_attn's caller in graph_mtp), no cache, or no ratio means dense.
++    // LLAMA_QSA_OFF=1 forces the dense no-indexer regime everywhere (a plain-dense reference:
++    // no indexer store, scoring or sparse selection at any layer) - a gate knob, default OFF.
++    static const bool qsa_off = [] {
++        const char * env = getenv("LLAMA_QSA_OFF");
++        return env != nullptr && std::atoi(env) != 0;
++    }();
++    const bool qsa = !qsa_off && mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+ 
+     ggml_tensor * top_k = nullptr;
+     if (qsa) {
