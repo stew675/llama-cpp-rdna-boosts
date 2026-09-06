@@ -112,7 +112,7 @@ index 9d8494605..4299546ab 100644
  
      // non-null in managed mode: the PLE n-gram table is cached on demand in a
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index c05f40a15..d96635fab 100644
+index 8df60d33b..c70228e1e 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -28,7 +28,26 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
@@ -315,7 +315,7 @@ index c05f40a15..d96635fab 100644
      return std::make_unique<graph>(*this, params);
  }
  
-@@ -474,7 +534,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -476,7 +536,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
              cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
          }
  
@@ -328,7 +328,7 @@ index c05f40a15..d96635fab 100644
              // everything below is per token, so drop the rows that produce no output
              cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
              inject = ggml_get_rows(ctx0, inject, inp_out_ids);
-@@ -502,6 +566,24 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -504,6 +568,24 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
          cb(res_hc, "l_last", il);
      }
  
@@ -353,7 +353,7 @@ index c05f40a15..d96635fab 100644
      // the final mixer is the output norm: there is no separate one
      ggml_tensor * cur = build_hc_mix(res_hc,
              model.hc_head_norm, model.hc_head_down, model.hc_head_up,
-@@ -517,6 +599,208 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -519,6 +601,208 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
      ggml_build_forward_expand(gf, cur);
  }
  

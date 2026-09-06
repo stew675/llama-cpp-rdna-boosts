@@ -297,35 +297,46 @@ is folded into patch 1).
 
 ## Apply
 
+The qwen4exp series = 21 numbered patches applying IN ORDER on the base
+`da67bcb88` (rdna-boosts master + blocks 01-13, i.e. after
+`scripts/apply-all.sh`). Verified from scratch 2026-09-13: plain `git apply`
+of 01..21 in order on `da67bcb88` reproduces the qwen4exp fork tip
+`f5ac11903` byte-identically (0 diff lines).
+
 ```
-git checkout <master>            # fresh llama.cpp master pull
-bash <delivery>/scripts/apply-all.sh .   # master + rdna-boosts blocks 01-13 (git am)
-git apply managed-ngrams.patch
-# (optionally commit the lazy-reader work here; the later patches'
-#  pre-images are the earlier patches' state either way)
-git apply qwen4exp-support.patch
-git apply mtp-draft-support.patch
-git apply ws4-hc-prefill-fusions.patch
-git apply ws3-routed-moe-mmq.patch
-git apply ggml-sched-fallback-sync.patch
-git apply ws3-shortcut-default-on.patch
-git apply ws3-weighted-down-fusion.patch
-git apply ws5-ple-host-gather.patch
+git checkout da67bcb88        # master + blocks 01-13 (or apply-all.sh on master)
+for p in 0{1..9}*.patch 1*.patch 2*.patch; do git apply $p; done   # 01..21 in order
 ```
 
-All nine patches apply clean with plain `git apply` from scratch on
-that base (re-verified 2026-09-11: applied tree byte-identical to the
-qwen4exp branch tip `3cb9168be`). Per-patch verifications that
-predate the folds: patch 4 re-verified 2026-09-06 (byte-identical to
-`248e47704`); patch 5 re-verified 2026-09-08 (applied on `248e47704`
-tree-identical to `1da01fa67`'s mmq.cuh, i.e. exactly the WS3 #3
-delta); patches 6-7 re-verified 2026-09-10 on `1da01fa67` (applied
-tree byte-identical to `250e48e97`); patches 1-3 re-verified
-2026-09-04 on the same base. If master drifts further,
-`git apply --3way` (or a manual resolve on the qwen4exp.cpp attention
-path) is the fallback — the patch pre-images now match the current
-master-based files, so drift has to overlap the patched regions again
-before conflicts return.
+| # | patch | fork commit |
+|---|---|---|
+| 01 | managed-ngrams | 9a9ef9fd1 + 3cb9168be (merged; the managed-reader incl. the batched cold-page fetch refinement + the F32 fallback that qwen4exp-support carried in the lazy-reader file) |
+| 02 | qwen4exp-support | db92de3d3 (regenerated minus its lazy-reader hunks - those live in 01's cumulative lazy-reader delta) |
+| 03 | mtp-draft-support | dca0526a8 |
+| 04 | ws4-hc-prefill-fusions | 248e47704 |
+| 05 | ws3-routed-moe-mmq | 1da01fa67 |
+| 06 | ggml-sched-fallback-sync | a2f2a6ceb |
+| 07 | ws3-shortcut-default-on | 250e48e97 |
+| 08 | ws3-weighted-down-fusion | b31940a5e |
+| 09 | ws5-ple-host-gather | 8b62ac25a |
+| 10 | ws6-llama-qsa-off | 2f8864cc8 |
+| 11 | ws6-concat-transposed | 2bd516bab |
+| 12 | ws6-swiglu-input-quantize | 7a6a2e97b |
+| 13 | ws6-mmid-512x10 | 304114ba7 |
+| 14 | ws6-mwr-float4 | f33ffaca7 |
+| 15 | ws6-split-j-q8_0-i64 | 6d457634e |
+| 16 | ws6-quantize-chunk-q8-1-gfx1151 | 0a3a2b498 |
+| 17 | ws6-repeat-absorb-hc-combine | b987877d7 |
+| 18 | ws6-fattn-rdna-row-qinreg | e7eecb369 |
+| 19 | ws6-mmq-mul-mat-q-pair | 6a80b695c |
+| 20 | ws6-gdn-scan-nw16 | 376f02aa0 |
+| 21 | ws6-scale-unary | f5ac11903 |
+
+Patches 04-21 are 1:1 with their fork commits. Patches sharing files
+(ggml-cuda.cu: 04/08/12/17/19/21; qwen4exp.cpp: 02/07/09/10/17; mmq.cuh:
+05/12/15/19) are DISTINCT bit-identity-gated feature stages - kept separate
+on purpose for per-stage traceability and isolated numerics gates. If master
+drifts, `git apply --3way` is the fallback on the drifted hunks.
 
 ## Validation status (the gates this baseline holds)
 
