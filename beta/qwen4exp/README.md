@@ -3,7 +3,7 @@
 Stable baseline for the next stage of **qwen4exp** (Qwen3.8-Flash-Next)
 support work on top of the rdna-boosts core. Status: between WIP and
 Release - the content below is the verified, gated baseline; new work in
-this area starts from these three patches.
+this area starts from these five patches.
 
 ## Suggested llama-server start command
 
@@ -52,11 +52,12 @@ HIP_VISIBLE_DEVICES=0,1,2 GGML_CUDA_FA_WMMA_256=0 \
 
 ## Contents
 
-Three squashed patch files. They apply IN ORDER on the rdna-boosts core
+Five squashed patch files. They apply IN ORDER on the rdna-boosts core
 = upstream master `8b4b3558f` + blocks 01-13 (re-based/regenerated
 2026-09-04 from the previous `9cffdcc80`-based `8f2838d1c` set).
-Applied together they reproduce the `qwen4exp` branch tip `9ce0d1da1`
-tree-identically (checked with `git diff --exit-code`).
+Applied together (patches 1-4) they reproduce the `qwen4exp` branch tip
+`248e47704` tree-identically; patch 5 (ws3-routed-moe-mmq) adds the
+2026-09-08 WS3 #3 commit `a1121cf2d` on top.
 
 The 2026-09-04 re-base re-applied the first two patches onto the current
 master (39 commits of upstream drift past the old base) and resolved the
@@ -151,6 +152,37 @@ PRs ggml-org/llama.cpp#27836/#28243 but implemented on the beta tree:
 When upstream merges #27836/#28243, drop this patch (and the `-md`/spec
 flags stay as-is).
 
+### 4. `ws4-hc-prefill-fusions.patch` (2026-09-06)
+
+Port of halo-box's prefill hyperconn fusions into A's prefill graph
+(commit `248e47704`, DEFAULT ON): GGML_OP_DSV4_HC_COMB/PRE/POST fused
+kernels (hc_combine_norm / hc_mix_reduce) that merge ONLY the
+elementwise/norm/add chains around the hyperconn combine (LoRA GEMMs
+stay separate mms — accumulation order untouched, fused == unfused
+bit-identical, deterministic indexer top-k gather, kv-cache stale-cell
+zeroing). Bit-exact same-seed llama-cli text on == off; depth-0 pp
++5.2-8.8% (pp512..16384), pp@depth 12k/32k +4-6%, tg@depth flat,
+memory stable −r3 through 32k. Record:
+`benchmarks/2026-09-06-strix-halo-gfx1151-ws4-hc-fusion-gates.md`.
+Opt-out: `GGML_CUDA_DISABLE_HC_FUSION=1`.
+
+### 5. `ws3-routed-moe-mmq.patch` (2026-09-08)
+
+Port of halo-box's RDNA3.5 routed-compact MoE MMQ for the i-quants
+(commit `a1121cf2d`, DEFAULT ON): `mul_mat_q_routed_compact` (one
+descriptor per real (expert, J-tile) pair instead of the mostly-empty
+(x-tile, expert) block grid) + per-expert J selection
+(`mmq_rdna3_5_id_get_J`, 16/48/64/128 by rows-per-expert, gfx1151-
+tuned). Bit-identical by construction (same `mul_mat_q_process_tile`)
+and verified; depth-0 pp +2.4-5.3% (compact vs plain at the same J),
+tg flat, no depth regression; A-vs-B gap moved pp16384 1.14->1.06x,
+pp8192 1.37->1.26x, pp4096 1.68->1.53x, pp2048 2.21->2.01x, pp1024
+2.04->1.78x, pp512 2.05->1.61x. Record:
+`benchmarks/2026-09-08-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
+Opt-out: `GGML_CUDA_DISABLE_MMQ_ROUTED=1` (compact dispatch only).
+Gate: RDNA3_5 only (B parity); gfx1201 enablement deferred to the
+delivery flow's gfx1201 box.
+
 ## Apply
 
 ```
@@ -162,17 +194,36 @@ git apply managed-ngrams.patch
 git apply qwen4exp-support.patch
 git apply mtp-draft-support.patch
 git apply ws4-hc-prefill-fusions.patch
+git apply ws3-routed-moe-mmq.patch
 ```
 
-All four patches apply clean with plain `git apply` on that base
+All five patches apply clean with plain `git apply` on that base
 (patch 4 re-verified 2026-09-06: applied tree byte-identical to the
-qwen4exp branch tip `248e47704`; patches 1-3 re-verified 2026-09-04 on
-the same base). If master drifts further, `git apply --3way` (or a
-manual resolve on the qwen4exp.cpp attention path) is the fallback —
-the patch pre-images now match the current master-based files, so drift
-has to overlap the patched regions again before conflicts return.
+qwen4exp branch tip `248e47704`; patch 5 re-verified 2026-09-08:
+applied on `248e47704` tree-identical to the qwen4exp branch tip
+`a1121cf2d`'s mmq.cuh, i.e. exactly the WS3 #3 delta; patches 1-3
+re-verified 2026-09-04 on the same base). If master drifts further,
+`git apply --3way` (or a manual resolve on the qwen4exp.cpp attention
+path) is the fallback — the patch pre-images now match the current
+master-based files, so drift has to overlap the patched regions again
+before conflicts return.
 
 ## Validation status (the gates this baseline holds)
+
+- WS3 #3 gates on Strix Halo (RDNA3.5 / gfx1151), 2026-09-08: patch 5
+  (routed-compact MoE MMQ for the i-quants, RDNA3.5-gated DEFAULT ON,
+  `GGML_CUDA_DISABLE_MMQ_ROUTED=1` opt-out) vs the plain path at the
+  same J on one build — clean warm-clock r3 depth-0 ladder +2.4-5.3%
+  (pp512..16384), tg@0 flat, pp@d12288 +1.8% (no depth regression),
+  bit-exact by construction + llama-cli text verified (7-tok and
+  4572-tok pp + 40 decode identical on/off/known-good). A-vs-B gap
+  (same session, B ~1% stable): pp512 2.05->1.61x, pp1024 2.04->1.78x,
+  pp2048 2.21->2.01x, pp4096 1.68->1.53x, pp8192 1.37->1.26x, pp16384
+  1.14->1.06x. Record:
+  `benchmarks/2026-09-08-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
+  NOTE: RDNA4/gfx1201 enablement for patch 5 is still gated OFF — it
+  needs the gfx1201 box in the delivery flow before it can be claimed
+  there (the mmq.cuh compact kernel + J tables are RDNA3.5-tuned).
 
 - WS4 gates on Strix Halo (RDNA3.5 / gfx1151, Ryzen AI MAX+ 395,
   Qwen3.8-Flash-Next UD IQ4_XS 87.24 GiB, non-MTP), 2026-09-06: patch 4
