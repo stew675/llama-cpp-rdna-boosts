@@ -756,4 +756,14 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   rows to move up (fusion gain transfers; f16 load now supported) and the dense-vs-QSA gap to
   narrow.
 
+### 2026-09-07 (cont.) — HALO FUSED A/B LANDED (gfx1151): fusion transfers, gap to dense -2.3% @32K
+- Record: `wip/archive/qwen4exp/discovery/2026-09-07-halo-gfx1151-fused-AB.md`.  Fused build
+  (c07e70e6f) on halo, f16 config, interleaved r2: parity BYTE-IDENTICAL ON vs OFF; regime
+  d12K per-op 23.0 -> QFUSED 24.04 (+4.5%), d32K 20.9 -> 22.88 (+9.4%); dense 24.87/23.42 -> the
+  dense-vs-QSA decode gap collapsed from -11.9% (per-op) to -2.3% @32K (-7.8% -> -3.4% @12K).
+  QSA decode is now within a whisker of dense on Strix at 32K; crossover plausibly 64-96K there.
+- [3] derived block-vector cache is now the clear next unit on both arches (removes the re-pool
+  read + pool/norm/rope; spec above is fully resolved).  gfx1201 re-baseline with the f16-capable
+  tip owed but expected flat (bf16 unchanged).
+
 <!-- keep the newest entry below this marker -->
