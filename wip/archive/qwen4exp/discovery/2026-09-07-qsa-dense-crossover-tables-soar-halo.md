@@ -28,6 +28,8 @@ the derived cache recovers +11% at 131K (the O(depth) score rescan it eliminates
 
 | depth | pp2048 qsa | pp2048 dense | pp delta | tg64 qsa | tg64 dense | tg delta |
 |---|---|---:|---:|---:|---:|---:|---:|
+| 16K  | 603 | 527 | **+14%**  | 24.11 | 24.48 | **-1.5%** |
+| 24K  | 607 | 478 | **+27%**  | 23.81 | 23.85 | **-0.2%** |
 | 32K  | 593 | 424 | **+40%**  | 23.56 | 23.27 | **+1.2%** |
 | 49K  | 564 | 336 | **+68%**  | 23.07 | 22.18 | **+4.0%** |
 | 64K  | 540 | 266 | **+103%** | 22.59 | 21.20 | **+6.6%** |
@@ -39,10 +41,15 @@ the derived cache recovers +11% at 131K (the O(depth) score rescan it eliminates
   decode ALWAYS (qsa trails a flat ~7-8% at every depth 8K-160K).**  Simple, deterministic.
   The old "dense wins prefill at 30K" record is obsolete (predates the QSA prefill
   improvements; also a non-comparable whole-prompt llama-cli banner).
-- **Halo: QSA for prefill always (grows to +169%); QSA for decode above ~40K context** - the
-  decode crossover sits between 32K (+1.2%) and 49K (+4.0%), and the lead grows to +11.3%
-  @96K.  Halo is the outlier because 1 GPU has no mirror/dispatch/AR penalty - the sparse
-  FA's read savings surface on the wall.
+- **Halo: QSA for prefill always (already +14% @16K, grows to +169%); QSA for decode above
+  ~26K context** (CORRECTED: the decode crossover is between 24K, where dense leads by a
+  hair -0.2%, and 32K where qsa leads +1.2% - i.e. ~24-28K, NOT ~40K as first stated; at
+  32K qsa is already ahead, so the cross is below it).  The qsa decode lead then grows
+  +4.0% @49K, +6.6% @64K, +11.3% @96K.  Halo is the outlier because 1 GPU has no
+  mirror/dispatch/AR penalty - the sparse FA's read savings surface on the wall.
+  NOTE: this bf16/current-build halo table flips the old f16-era regime data (dense led
+  +7.8% @12K / +11.9% @32K per-op era; +2.3% @32K fused-f16): both the KV type and the
+  newer build (fused score + derived cache + round2 topk) moved the halo picture.
 - Why Soar decode never crosses: the 3-GPU decode is MoE-mmv-bound + ~30% per-kernel
   dispatch floor (~3.16us x ~1900 kernels/token - GPU-side, graphs can't remove it), so the
   attention share is too small for QSA's FA savings to overcome the indexer overhead.  The
