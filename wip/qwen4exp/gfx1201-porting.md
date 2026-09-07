@@ -130,10 +130,19 @@ and A/B is same-session on/off (or vs the pre-port build).
       transfer) — the wider-row geometry wins on RDNA4.  Fallback J=128 row (rdna3-5
       nthreads128/I64 vs rdna4 nthreads256/I128) left as-is (fallback rarely fires here;
       needs nrows_x%128 != 0).
-- [ ] **1.4 mmq accumulator-overflow latent-defect audit on the RDNA4 table** (TODO 3d; the
-      `I < nwarps*16` mma sum[] overflow — "likely applies [to rdna4.cuh] too" per the brief):
-      audit every row in `mmq-config-rdna4.cuh` for `I >= nwarps*16`; feed the upstream defect
-      report (no perf value, correctness hygiene).
+- [x] **1.4 mmq accumulator-overflow latent-defect audit on the RDNA4 table** (TODO 3d;
+      the `I < nwarps*16` mma sum[] overflow): audit every row in `mmq-config-rdna4.cuh`
+      for `I >= nwarps*16`; feed the upstream defect report (no perf value, correctness
+      hygiene).
+      DONE 2026-09-06: **rdna4.cuh is CLEAN** — no row violates `I < nwarps*16`
+      (warp=32 → I < nthreads/2); every row sits exactly at the boundary.  Same for
+      rdna2/rdna3 (243-260 rows each).  The ONLY violator across the arch tables is the
+      rdna3-5 Q8_0 J=128 I=64 non-fallback row — deliberate + guarded by the split_j
+      machinery in BOTH the accumulator (mmq-vec-dot.cuh) and write-back (mmq.cuh) arms.
+      Upstream report content: state the invariant (config rows must keep
+      I >= nwarps*16, warp-32 RDNA) + recommend a static_assert in the CASE macro;
+      rdna3-5's single violator is handled in-tree.  CDNA tables need their own warp-64
+      audit if included in the report scope.
 - [ ] **1.5 GDN gfx12 chunked kernel — post-consolidation re-validation**: gfx1201 uses the
       gfx12 kernel in `gated_delta_net.cu` (NOT the gfx11 first-gen-WMMA file the campaign
       retuned).  The 0002 chunked-prefix dispatch was validated on 3x R9700 **pre-re-base**;
@@ -306,5 +315,14 @@ validation too):
 - Method note (maintainer): bench runs already pass --load-mode none (lm column = none;
   eager host read, no mmap lazy page-in); added explicit '-lzm off' guidance to
   bench-run.sh so lazy mode is never a variable in any run.
+
+### 2026-09-06 (session cont.) — PHASE 1.4 DONE: rdna4 mmq table is clean (no sum[] overflow rows)
+- Programmatic audit of every CASE row in rdna2/rdna3/rdna3-5/rdna4 (warp=32): invariant
+  I >= nwarps*16  <=>  I >= nthreads/2.  rdna4: 260/260 rows at or above the boundary —
+  no defect (the TODO-3d "likely applies too" suspicion is resolved negative).  rdna2/rdna3
+  clean.  rdna3-5's single violator (Q8_0 J128 I64 nt256) = the deliberate split_j row,
+  guarded in both arms.
+- Upstream defect report (5.4): document the invariant + propose a CASE-macro static_assert;
+  note CDNA needs a warp-64 variant if included.
 
 <!-- keep the newest entry below this marker -->
