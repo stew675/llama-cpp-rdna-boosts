@@ -107,11 +107,17 @@ and A/B is same-session on/off (or vs the pre-port build).
       at J32 behind — the gfx1151 bands transfer for the reachable bands (16/48/64); the
       >64-rpe band is unreachable at ub2048 on this 512-expert model, J=128 kept.  Record:
       `wip/archive/qwen4exp/discovery/2026-09-06-gfx1201-rdna4-routed-moe-mmq.md`.
-- [ ] **1.2 Quantize mmq-q8_1 chunk** (`ggml_cuda_quantize_mmq_q8_1_n_chunks`,
+- [x] **1.2 Quantize mmq-q8_1 chunk** (`ggml_cuda_quantize_mmq_q8_1_n_chunks`,
       `quantize.cuh:26-27`, hard gate `cc == RDNA3_5 + 1` → n_chunks=2; gfx1201 = 1).
-      Plan: measure the gfx1201 launch-bound vs occupancy tradeoff for the 262144-row q8_1
-      feed (the unchunked 512-float-slice launch); set the RDNA4 chunk count from data.
-      Validation: same-session chunked vs unchunked on the affected rows + coherence.
+      DONE 2026-09-06 (fork `90ea7e22e`): **flat on RDNA4 — keep n_chunks=1**.
+      Env-gated probe (2x chunk on gfx1201), same-session r3 brackets: pp8192 2482.4 /
+      2487.4 / 2462.0 (+0.2% over OFF mid), pp16384 2414.8 / 2408.9 / 2385.4 (ON sits on
+      the drift line), pp2048 noisy but ON==OFF2.  gfx1201's block dispatcher does not
+      share gfx1151's small-block dispatch bottleneck (where the 2x chunk measured ~1.5x
+      per call), so halving the quantize block count does not pay.  Bonus code-quality
+      fix folded into the same commit: `cc == GGML_CUDA_CC_RDNA3_5 + 1` (fragile — only
+      equals gfx1151 because 0x1150+1 == 0x1151) → `GGML_CUDA_CC_IS_GFX1151(cc)` exact-cc
+      macro in `common.cuh` (OFFSET_AMD + 0x1151, decoupled from the family base).
 - [ ] **1.3 split_j Q8_0 mma specialization + B-parity Q8_0 config rows** (`mmq-vec-dot.cuh`
       `#elif defined(RDNA3_5)`; `mmq-config-rdna3_5.cuh` vs untouched `mmq-config-rdna4.cuh`).
       Plan: benchmark RDNA4's native I=128/192-vgpr profile vs a split_j I=64 port; adopt only
@@ -272,5 +278,15 @@ validation too):
 - Record: `wip/archive/qwen4exp/discovery/2026-09-06-gfx1201-rdna4-routed-moe-mmq.md`.
 - Note: the Phase-0 table numbers (18:56) ran cooler/colder-cache than the 19:30+ bracket
   (pp2048 2149 vs bracket OFF-mid 2452) — later same-session brackets are the A/B truth.
+
+### 2026-09-06 (session cont.) — PHASE 1.2 DONE: quantize chunk flat on RDNA4 (keep 1); exact-SKU helper
+- Env-gated 2x-chunk probe on gfx1201 → same-session r3 brackets at pp8192/pp16384/pp2048:
+  FLAT (ON within ±1% of the OFF drift line at every row).  gfx1201's block dispatcher
+  does not share gfx1151's small-block dispatch bottleneck (the 2x chunk was ~1.5x per
+  call there) → RDNA4 keeps n_chunks=1; decision recorded in the code comment.
+- Review fix folded in (maintainer): `cc == GGML_CUDA_CC_RDNA3_5 + 1` was assuming the
+  family-base + 1 == gfx1151 (true only via AMD's contiguous gfx numbering) → new
+  `GGML_CUDA_CC_IS_GFX1151(cc)` exact-cc macro in common.cuh
+  (`cc == OFFSET_AMD + 0x1151`), no comment bloat.  Fork `90ea7e22e`.
 
 <!-- keep the newest entry below this marker -->
