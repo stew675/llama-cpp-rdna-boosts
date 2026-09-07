@@ -17,8 +17,9 @@ authoritative live tracker for that work; `TODO.md` + `beta/qwen4exp/README.md` 
 | fingon | 192.168.50.102 | single RX 7900 XTX gfx1100 (RDNA3.0), 24 GiB + 30 GiB RAM | the RDNA3 follow-up (light validation; small models only) |
 
 Fork: `~/llama.cpp` branch `qwen4exp` = master `465e49b9c` + blocks 01-13 (`c261553a1`) +
-consolidated beta + sched-gate fix → **tip `c63f7f2a0`**.  Delivery repo (this repo):
-13 patches + `beta/qwen4exp/qwen4exp-support.patch`, delivery tip local `f7c7a35`.
+consolidated beta + sched-gate fix → tip `c63f7f2a0`, then Phase-1 ports on top (1.1 →
+`76411193a`).  Delivery repo (this repo): 13 patches +
+`beta/qwen4exp/qwen4exp-support.patch`, delivery tip local `f7c7a35`.
 Halo's gfx1151 builds of the same content: `/tmp/val-master/build` (pre-fix campaign build,
 content == `f5ac11903`) and `~/llama-delivery/build-gated` (gated `c63f7f2a0`) — both
 verified this session; see `beta/qwen4exp/HALO_HANDOFF.md`.
@@ -94,15 +95,18 @@ gfx1100**; expect RDNA4 needs its own sweep, not a copy.  All items bit-exact-by
 where the kernel reuses the same tile math → coherence check is about perf-path correctness,
 and A/B is same-session on/off (or vs the pre-port build).
 
-- [ ] **1.1 Routed-compact MoE MMQ** (beta patch 5 / `mul_mat_q_routed_compact` +
+- [x] **1.1 Routed-compact MoE MMQ** (beta patch 5 / `mul_mat_q_routed_compact` +
       `mmq_rdna3_5_id_get_J` per-expert J tables, `ggml/src/ggml-cuda/mmq.cuh:1677/1758/1767`,
       gate `GGML_CUDA_CC_IS_RDNA3_5`).
-      Plan: RDNA4 enablement + own J sweep over the i-quants (IQ3_S/IQ4_NL/IQ4_XS/Q8_0 rows-
-      per-expert ranges; probe uncapped J first, bracket to the winner like the campaign's
-      uncap-probe methodology); opt-out stays `GGML_CUDA_DISABLE_MMQ_ROUTED=1`.
-      Validation: same-session compact vs plain-at-same-J depth-0 ladder + coherence;
-      rocprof that compact fires on the IQ expert GEMMs.  Record ref:
-      `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
+      DONE 2026-09-06 (fork `76411193a`): arch gate relaxed to RDNA3_5 || RDNA4
+      (`mmq_routed_compact_arch_ok`); env-gated probe A/B first, probe stripped, final
+      commit = the gate flip.  Results (soar, IQ4_XS, ub2048 tensor bf16, r3 bracket):
+      prefill +4-8% (pp512 +8.2 / pp2048 +5.7 / pp8192 +5.0 / pp16384 +5.0), tg128 ~0;
+      846 compact launches/pp2048-ub; same-seed text byte-identical compact vs plain at
+      pp40 + pp~2000.  J sweep at 40-rpe: J48 == J64 (tie), J128 marginally behind, plain
+      at J32 behind — the gfx1151 bands transfer for the reachable bands (16/48/64); the
+      >64-rpe band is unreachable at ub2048 on this 512-expert model, J=128 kept.  Record:
+      `wip/archive/qwen4exp/discovery/2026-09-06-gfx1201-rdna4-routed-moe-mmq.md`.
 - [ ] **1.2 Quantize mmq-q8_1 chunk** (`ggml_cuda_quantize_mmq_q8_1_n_chunks`,
       `quantize.cuh:26-27`, hard gate `cc == RDNA3_5 + 1` → n_chunks=2; gfx1201 = 1).
       Plan: measure the gfx1201 launch-bound vs occupancy tradeoff for the 262144-row q8_1
@@ -254,5 +258,19 @@ validation too):
   starting gap to bisect per-op after Phase 1.  Config note: maintainer's preferred bench
   config = `-sm tensor` + BF16 KV (daily driver); Q8_0 secondary; f16 = campaign continuity
   only.
+
+### 2026-09-06 (session cont.) — PHASE 1.1 DONE: routed-compact MoE MMQ enabled on RDNA4
+- Method: env-gated probe (`GGML_CUDA_MMQ_ROUTED_RDNA4` + J override + fire-print) →
+  same-session OFF/ON/OFF r3 ladder + J sweep at pp2048 + coherence pairs → probe stripped
+  → fork commit `76411193a` (arch test = RDNA3_5 || RDNA4).
+- Result: prefill +4-8% (bigger at short prompts), tg128 unchanged, same-seed text
+  byte-identical compact vs plain (pp40 + pp~2000).  846 compact launches per pp2048
+  ubatch (IQ experts J=64 @ 40 rpe; Q8_0/Q6_K rows J=48).
+- J transfer: gfx1151 bands hold on RDNA4 — J48 == J64 at 40 rpe, J128 (I=256) marginally
+  behind, plain-at-J32 clearly behind.  >64-rpe band not reachable at ub2048 on this
+  model (keeps J=128).  No RDNA4-specific table needed for the reachable bands.
+- Record: `wip/archive/qwen4exp/discovery/2026-09-06-gfx1201-rdna4-routed-moe-mmq.md`.
+- Note: the Phase-0 table numbers (18:56) ran cooler/colder-cache than the 19:30+ bracket
+  (pp2048 2149 vs bracket OFF-mid 2452) — later same-session brackets are the A/B truth.
 
 <!-- keep the newest entry below this marker -->
