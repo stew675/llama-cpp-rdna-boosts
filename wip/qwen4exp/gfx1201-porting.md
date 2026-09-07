@@ -645,4 +645,62 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
     protocol + the gfx1201 depth ladder after each; halo A/B of the fused build is owed
     before any gating/adoption decision.
 
+
+### 2026-09-07 (cont.) — [2] META-SPLIT STUDY: "cheap row-split flip" is NOT expressible; [3] spec tightened
+- Studied the meta backend split machinery (ggml-backend-meta.cpp calculate_split_state: handle_generic/
+  per_row/mul_mat/flash_attn_qsa) + dumped the LIVE decode graph split states (GGML_META_DEBUG=1,
+  llama-cli -c 16384 -ctk bf16, fused ON; log /tmp/meta-debug4.log).  Ground truth:
+  * The whole QSA indexer domain is MIRRORED by tensor allocation: cache_idx_k/v_lNN (raw indexer
+    keys), INDEXER_SCORE, INDEXER_TOPK all MIRRORED; the indexer key store is a MIRRORED SET_ROWS;
+    the indexer q/k proj + norm weights are statically replicated (MIRRORED, no srcs).
+  * The DENSE KV (cache_k_lNN) is SPLIT (axis 2); FLASH_ATTN_QSA runs split on the split KV + the
+    MIRRORED topk/mask (handle_flash_attn_qsa mixes them - the precedent for mixed ops).
+  * Splits are a property of ALLOCATED TENSORS, propagated down-op; mirrored srcs FORCE a mirrored
+    op (handle_per_row/generic return the src split; no op may create a split output from mirrored
+    srcs).  => A "row-split INDEXER_SCORE" is NOT a meta-side declaration flip: the indexer cache
+    itself must be physically SHARDED (like the dense KV) for the score to read only 1/3, plus the
+    host-built blk_cells/blk_pos/bias inputs must carry matching row splits, plus the SET_ROWS store
+    (today a mirrored broadcast) must become a sharded write (mirrored->split resplit scatter), plus
+    the score shards need an allgather into the (global) topk.  That is llama-kv-cache allocation +
+    memory-layer + meta + state-io surgery = DAYS, NOT the cheap flip the handoff assumed, and it is
+    gfx1201-ONLY (halo is single-GPU: no mirror tax at all).
+  * Expected [2] payoff re-estimate from the fusion data: the residual fused build is LAUNCH-bound,
+    not read-bound (pool fusion with the SAME read gained +2.4; score fusion +0.3): @32K the read
+    tax is maybe ~1 t/s, growing at 64K+ where the raw read doubles per device.  Dense FA reads its
+    1/3 KV shard; mirrored INDEXER_SCORE reads the full raw cache on each device.
+- RECOMMENDATION (deviating from the [2]-then-[3] order, on this finding): skip standalone [2]; do
+  [3] (derived block-vector cache) FIRST, allocated MIRRORED like the raw cache.  [3] halves the
+  read on EVERY device (derived 4.2MB @32K vs raw 8.4MB) AND removes the per-token pool/norm/rope
+  compute AND is the only lever that helps halo (single GPU).  A later [2]-style split of the
+  DERIVED cache (once [3] proves out) would additionally cut the mirror 3x - keep that as the
+  follow-on, not the prerequisite.
+- NEW FINDING for the halo A/B (owed): the fused INDEXER_SCORE/POOL builders assert K type
+  F32/BF16 and the gather is bf16-shift-only (indexer-score.cu ld_val).  Halo runs -ctk f16 -> f16
+  cells -> the fused op ABORTS there; QSA decode on halo has only ever run the per-op chain (f16
+  handled by get_rows).  The halo fused A/B requires an f16 gather path in the fused kernels
+  (f16->f32 upcast is exact, so byte-parity holds; small change).
+- [3] spec tightened with the live memory-layer reading (llama-memory-hybrid-idx.cpp set_input_qsa):
+  * Grouping is HOST-side, per step, and only FULL blocks (all r slots of one seq-set present,
+    grp_slots==slots_full) are EVER pooled; incomplete cells are attended per-cell via the spare
+    "dead block" (dead_bid, 1e9 bias + mask).  So the derived cache only ever needs FULL blocks -
+    which is exactly what the score uses - and the dead/tail handling stays on the raw path.
+  * Single-seq decode is append-only: full blocks are contiguous from 0 and stay full; block b is
+    valid iff cells rb..rb+r-1 exist.  => derived validity = a host watermark n_derived (contiguous
+    from 0), maintained on the append path; ANY seq mutation (rm/cp/keep/add/div/state io) drops the
+    watermark to 0 (the decode op then pools raw for all blocks for one step, then the fill
+    backfills as tokens append).  Fill = ONE graph op after the raw store that backfills full blocks
+    in (n_derived, n_full] (steady decode: <=1 block/step, reads 4 cells + W + pos, writes 128 f32;
+    the first decode after a long prefill backfills ~n_kv/r blocks = one raw-pooling pass, the same
+    cost today's EVERY step pays - acceptable one-time).
+  * Decode op v2: for b < min(n_derived,n_blocks) read the derived row (f32, pre-normed+
+    pre-roped) and dot; else pool raw exactly as today (dead/spare + not-yet-full rows).  Values
+    identical by construction (same arithmetic at fill, same pos/weights).  Byte-toggle = the gate.
+  * Home: a per-layer F32 [idx_dim x n_blocks_max x n_stream] buffer in llama_memory_hybrid_idx,
+    allotted mirrored like mem_idx's K; lifecycle = watermark only (no llama_kv_cache cell/seq
+    bookkeeping needed since blocks are positional under the decode gate).
+  * Expected payoff: raw read 8.4 -> derived 4.2MB/layer @32K (both arches; on gfx1201 each device
+    reads its own mirror so the same 2x) + zero pool/norm/rope per token; the gain grows with
+    context (context-proportional waste); enables the flat sparse decode + per-arch crossover
+    measurements the maintainer wants.
+
 <!-- keep the newest entry below this marker -->
