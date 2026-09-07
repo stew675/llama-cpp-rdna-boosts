@@ -766,4 +766,30 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   read + pool/norm/rope; spec above is fully resolved).  gfx1201 re-baseline with the f16-capable
   tip owed but expected flat (bf16 unchanged).
 
+### 2026-09-07 (cont.) — [3] IMPLEMENTED + MEASURED: correct, provably active, but FLAT on gfx1201 <=64K
+- Full [3] landed on the fork: `328ddfa4e` (derived cache) + `6703ad09f` (guard fix + capped fill).
+  Same-binary parity holds across per-op == fused == fused+derived (byte-identical text).
+- DEBUG-COUNTER LESSON (maintainer's question was right): the FIRST flat results were the fused
+  baseline - pool_create early-returned on `dsv4_compress_ratios[0]==0` (layer 0 has no QSA) so no
+  pool ever existed and the derived path silently fell back.  Fix: scan the filter_idx layers for
+  any ratio>0.  The path is now PROVABLY active: GGML_CUDA_QSA_INDEXER_CACHE=2 (probe mode, kept
+  env-gated) passes the pool to the score WITHOUT the fill -> output diverges (garbage rows read) =>
+  the pool read + limit plumbing genuinely execute; cache=1 stays byte-identical to fused.
+- gfx1201 3x R9700 interleaved (pool real, fill grid capped to 512 + grid-stride):
+  d32768 fused 42.53/42.37 vs derived 42.39/42.43; d65536 38.82/38.83 vs 38.78/38.80: FLAT.
+  CONCLUSION: the decode at <=64K on this box is LAUNCH/LATENCY-bound (the per-layer kernel chain:
+  store + q-side + fill + score + topk + FA, x12 layers, mirrored x3) - intra-kernel work removal
+  (the pool/norm/rope the derived cache eliminates) does not show even when provably executed.
+  The score kernel was never the binding cost; the ~3.1 t/s fused residual is launch structure.
+- REPRODUCIBILITY FLAG: the absolute same-seed per-op text drifted across build states of
+  "identical" sources this session (312 chars from the guard-fix-era binary vs 238/240 from clean
+  rebuilds of 328ddfa4e+c07e70e6f) - agrees for ~39 tokens then ulp-diverges.  Same-binary toggles
+  are deterministic and the parity gates hold; cross-build coherence comparisons need a pinned
+  binary.  Worth an investigation before any adoption claim relies on absolute text.
+- Open: the read-halving thesis can only show where reads bind - Strix Halo (single GPU,
+  bandwidth-limited) and 128K+ depths.  Halo transfer staged (bundle to ~/llama-delivery branch
+  qwen4exp-fused at c07e70e6f); needs the 6703ad09f delta + a fused-vs-derived A/B there.
+  Remaining structural lever on gfx1201: fewer kernels/layer (the launch-chain), not less work
+  per kernel - the fused mega-op direction or accepting the fused build.
+
 <!-- keep the newest entry below this marker -->
