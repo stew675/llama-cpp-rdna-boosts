@@ -983,4 +983,20 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
 - Kept: the round2 path halves the chain + cuts cell scans 5->3 (may matter at depth); it is
   parity-neutral and wall-neutral at 32K.  Bins for the A/B: /tmp/bins-radix (old), /tmp/bins-r2.
 
+### 2026-09-07 (cont.) — CROSSOVER TABLES COMPLETE (Soar + Halo, pp2048/tg64, bf16): QSA wins prefill on both; dense wins decode on Soar, QSA wins decode on Halo past ~40K
+- Record: wip/archive/qwen4exp/discovery/2026-09-07-qsa-dense-crossover-tables-soar-halo.md.
+- Soar (3x gfx1201): prefill qsa wins from ~8K (+4%) monotonically to +181% @160K
+  (dense pp collapses 2140->429 as its full-KV FA reads grow; qsa pp degrades slowly).
+  Decode: dense wins a FLAT ~7-8% at every depth 8K-160K (qsa+cache1); without cache1 the
+  fused decode diverges (-17.5% @131K).  The old 'dense wins prefill at 30K' record is
+  obsolete (predates the QSA prefill improvements).
+- Halo (1x gfx1151, bf16): prefill qsa wins (+40% @32K -> +169% @96K); DECODE qsa wins past
+  ~40K (+1.2% @32K, +4% @49K, +6.6% @64K, +11.3% @96K - the lead grows with depth).
+- POLICY (maintainer decision): Soar = QSA always for prefill, dense always for decode -
+  simple, deterministic, no crossover machinery needed.  Halo = the outlier (QSA for both,
+  decode crossover ~40K); its per-arch entry can key off depth.
+- Deep-context measurement enablers: llama-bench works to 160K+ on Soar (32GB GPUs,
+  GGML_CUDA_FA_WMMA_256=0 for deep ctx); the derived cache [3] is vindicated at depth
+  (+11% fused decode @131K, was flat <=64K because the O(depth) score rescans overlap).
+
 <!-- keep the newest entry below this marker -->
