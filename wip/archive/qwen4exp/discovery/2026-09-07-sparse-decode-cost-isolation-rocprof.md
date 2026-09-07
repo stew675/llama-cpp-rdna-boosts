@@ -15,22 +15,28 @@ the last ~6000 dispatches = one decode token (fused window wall 23.4ms == 42.7 t
 | rope_multi (float) calls | 62 | 18 | the indexer q-side/k-side per-token ropes |
 | k_get_rows bf16 gather + extra norms/Cijk mms + copies | ~1 ms/layer-set | ~0 | the small-kernel auxiliary chain |
 
-## Reading (why sparse decode still loses ~2.5 ms/token at 32K despite the FA win)
+## Reading (CORRECTED after the maintainer challenged the topk figure)
 
-- The block-sparse FA is genuinely cheaper at depth (30K: ~8x per call) - the read-cap
-  premise delivers.  The FA is NOT the tax; it is the sparse WIN.
-- The tax is the SELECTION + machinery: the topk is O(n_kv) per layer per token (a
-  radix-select over the whole 32K-element score vector - the step block-sparse was
-  supposed to avoid), plus the per-layer small-kernel chain (q-side rope/norm/mms,
-  gathers, copies).  At 32K these sum to roughly the FA's saving + ~2.5 ms.
-- Structural model: dense attention per token ~= a·n_kv (tiled FA reads).  Sparse ~=
-  b·n_kv (topk select, b << a, ~30x cheaper per element) + c·2051 (small FA) + fixed
-  machinery.  Sparse wins when (a-b)·n_kv clears the fixed machinery - the measured
-  32K crossover says that is past 64K (consistent with dense staying ahead to 64K on
-  gfx1201 and the fused rows closing on halo).
-- The two levers that remain: (1) the topk's O(n_kv) select (any cheaper top-2051-of-32K
-  structure), (2) the per-layer small-kernel chain count.  The FA and the pool->score
-  stack are done.
+- The whole topk pipeline (init+histogram+select+count+write+scan, all 12 layers) is
+  ~0.5 ms/token wall (per-call 1.5-7 us; its decode grids are small: histogram over the
+  ~8K block scores, count/write over the ~90K cell expansion).  NOT 4-6 ms - that figure
+  was wrong (conflated window artifacts + the whole aux chain).
+- The block-sparse FA at 30K is ~0.16 ms/device/token vs dense's ~1.2 ms (flash_attn_tile
+  ~242 us/call vs qsa ~30 us/call) - the FA is the sparse WIN.
+- THE REAL FINDING - device-level accounting of the 1-token windows:
+    fused: wall 23.4 ms/token, per-device busy ~16.1 ms  -> ~66-70% util, ~2000 disp/dev
+    dense: wall 21.1 ms/token, per-device busy ~18.5 ms  -> ~88% util,   ~1613 disp/dev
+  The sparse path does LESS GPU work (16.1 vs 18.5 ms busy) yet is slower: it wastes
+  ~4.5 ms/token MORE in inter-kernel gaps.  Its per-layer structure is a long chain of
+  small DEPENDENT kernels (store -> q-side -> score -> 6-stage radix topk -> sparse FA),
+  each stage serialized (launch latency + syncs + mirrored-op cross-device waits), vs
+  dense's few fat fused kernels (one tiled FA + the mms) at ~88% util.
+- Conclusion: the sparse decode deficit is NOT any kernel's work (all small; the FA
+  wins) - it is the CHAIN LENGTH + dependency gaps: ~2000 dependent small kernels/token
+  at ~66% utilization.  This explains why [1]/[2]/[3] (which cut per-kernel work) moved
+  nothing: they optimized busy time; the cost is the serialization between kernels.
+- The lever that remains: FEWER, FATTER, less-serial kernels per layer (fuse the store /
+  q-side / score / topk / FA per-layer chain toward one kernel), and/or better overlap.
 
 ## Method caveats
 - rocprof aggregates mix per-device rows (mirrored ops x3); absolute per-name sums need

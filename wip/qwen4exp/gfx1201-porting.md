@@ -807,8 +807,14 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   * Remaining levers: (1) the topk's O(n_kv) select, (2) the per-layer kernel count.  FA and the
     pool->score stack are done.  Fused prefill is also ~10% slower than dense (machinery
     amortized over the ubatch: 1313 vs 1449 t/s pp on the 30K prompt).
-- Next candidates for the maintainer: quantify the topk's share precisely (its radix works over
-  the full n_kv score vector - is the top-k width cap ~2051 but the SELECT still scans 32K?); a
-  halo fused-vs-derived/dense A/B is still owed but [3] is parked so only fused-vs-dense matters.
+- CORRECTION (maintainer challenge): the topk is ~0.5 ms/token (all stages), NOT 4-6 ms - that
+  figure was wrong.  The deeper device-level finding: the fused decode does LESS GPU busy work
+  than dense (16.1 vs 18.5 ms/device/token at 30K) but wastes ~4.5 ms/token more in inter-kernel
+  gaps (~66% vs ~88% utilization; ~2000 vs ~1613 dependent small dispatches/token).  The deficit
+  is the per-layer kernel CHAIN serialization, not any kernel's work - which is why the fusion
+  increments (busy-time cuts) moved nothing.  Lever = fewer/fatter/less-serial kernels per layer.
+  See the corrected discovery record.
+- Next candidates: the per-layer mega-op (store+q-side+score+topk+FA toward one kernel); halo
+  fused-vs-dense A/B owed (only fused-vs-dense matters now, [3] parked).
 
 <!-- keep the newest entry below this marker -->
