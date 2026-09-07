@@ -744,11 +744,16 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   ON vs OFF; fused decode +4.3% (41.5 -> 43.3 t/s) at ~4K context - validates the f16 path.
   Prior bf16 parity/benches stand (e1e5a474b).
 - Halo (gfx1151) fused A/B now unblocked: fork range c63f7f2a0..c07e70e6f bundled and fetched
-  into halo ~/llama-delivery (branch qwen4exp-fused), build-fused configuring with the build-gated
-  flags (gfx1151, Release); build launched detached on halo (~/tmp/halo-fused-cmake.log,
-  HALO_FUSED_BUILD_DONE sentinel).  When done: same-seed parity toggle + the dense-vs-QSA regime
-  protocol re-run against the FUSED build (halo anchors: dense 25.8/24.8/23.4 vs per-op QSA
-  25.8/23.0/20.9 at d0/12K/32K, f16) - expect the QSA rows to move up (fusion gain transfers;
-  f16 load now supported) and the dense-vs-QSA gap to narrow.
+  into halo ~/llama-delivery.  NOTE the first build attempt compiled the WRONG source: the bundle
+  fetch refspec failed (`refs/heads/qwen4exp` not in the bundle) and the script's `||` fallback
+  never triggered (piped to tail), so cmake built the still-checked-out c63f7f2a0 (per-op).  Killed
+  that A/B, fetched the bundle by hash (`git fetch <bundle> HEAD` -> FETCH_HEAD = c07e70e6f,
+  verified), and rebuilt: branch qwen4exp-fused @ c07e70e6f, build-fused with the build-gated flags
+  (gfx1151, Release).  A/B watcher armed on HALO_FUSED_BUILD2_DONE (log /tmp/halo-fused-cmake2.log,
+  outer /tmp/halo-fused-build2-outer.log; stale logs cleared).  When done (~25 min build + ~40 min
+  A/B): same-seed parity toggle + the dense-vs-QSA regime protocol against the FUSED build (halo
+  anchors: dense 25.8/24.8/23.4 vs per-op QSA 25.8/23.0/20.9 at d0/12K/32K, f16) - expect the QSA
+  rows to move up (fusion gain transfers; f16 load now supported) and the dense-vs-QSA gap to
+  narrow.
 
 <!-- keep the newest entry below this marker -->
