@@ -958,4 +958,29 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   r cells' worth into hist1's buckets) and/or the block-uniform mode (8K values not 32K)
   once the 2-round select is in.
 
+### 2026-09-07 (cont.) — two-round 16-bit topk select BUILT (fork 4ff65247c): parity-verified byte-identical, wall-FLAT at 32K
+- Implementation: decode/small-row path (nrows <= 8; prefill keeps the 8-bit radix - per-row
+  2^16-int bins would blow the pool at nrows=2048).  topk chain 11 -> 8 dependent kernels
+  (memset + 2x(hist16+select16) + the shared count/scan/write); two 16-bit rounds resolve the
+  full 32-bit boundary exactly; select16 re-zeroes bins for the next round (one memset/op).
+- Verification: same-seed output byte-identical to the radix build (2-build A/B, 24 tokens,
+  187-char reply identical, only the box-drift banner differs).  llama-bench d32768 interleaved:
+  radix 40.20 vs round2 40.18 t/s - FLAT.
+- SESSION CONCLUSION (accumulated evidence): on gfx1201 3-GPU at 32K, the fused decode wall is
+  insensitive to EVERY targeted internal cut of the sparse machinery - topk launch cuts (flat),
+  score busy via [3] cache=1, verified 136->58us (flat), wider radix (regressed), topk chain
+  steps 12->8 (flat).  Only WHOLESALE chain removal (DECODE_SKIP -> plain dense build_attn)
+  moves the wall: ~0.15-0.46ms/layer, ~ +2-5% total.  The sparse machinery's ~2ms busy/token is
+  largely OVERLAPPED in the idle-rich pipeline (both configs ~53% GPU util at 32K); the
+  per-layer residue the skip exposes (~0.15ms) ~= the busy difference between the sparse path
+  and dense-attend.  WHY the component cuts don't sum to the skip's gain is unresolved - the
+  wall's response is attached to the whole-path swap, not its parts (possible: the qsa path's
+  kernel count vs dense build_attn's, or an interaction with the 3-GPU mirrored structure).
+- STRATEGIC READING: at 32K on this box the dense-vs-QSA decode race is a second-order effect
+  on a ~53%-utilized pipeline; the big lever may be pipeline utilization itself (why is DENSE
+  only 53%? AR sync cadence / layer serialization / host pipeline on 3-GPU async decode), not
+  the sparse machinery.  QSA's payoff stays depth-gated (the FA win grows past ~64K).
+- Kept: the round2 path halves the chain + cuts cell scans 5->3 (may matter at depth); it is
+  parity-neutral and wall-neutral at 32K.  Bins for the A/B: /tmp/bins-radix (old), /tmp/bins-r2.
+
 <!-- keep the newest entry below this marker -->
