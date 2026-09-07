@@ -143,13 +143,17 @@ and A/B is same-session on/off (or vs the pre-port build).
       I >= nwarps*16, warp-32 RDNA) + recommend a static_assert in the CASE macro;
       rdna3-5's single violator is handled in-tree.  CDNA tables need their own warp-64
       audit if included in the report scope.
-- [ ] **1.5 GDN gfx12 chunked kernel — post-consolidation re-validation**: gfx1201 uses the
+- [x] **1.5 GDN gfx12 chunked kernel — post-consolidation re-validation**: gfx1201 uses the
       gfx12 kernel in `gated_delta_net.cu` (NOT the gfx11 first-gen-WMMA file the campaign
       retuned).  The 0002 chunked-prefix dispatch was validated on 3x R9700 **pre-re-base**;
       re-run the chunked-prefix A/B (`GGML_CUDA_GDN_CHUNKED=0` opt-out) on the current
       delivery + MTP/depth rows per `benchmarks/mtp-adaptive-methodology.md`.
-      (The gfx11 NW16 scan retune itself only needs gfx1100/1101 launch-fitness checks — see
-      Phase 4; it does not reach gfx1201.)
+      DONE 2026-09-06 (no code change): pp8192 **+8.1%** (2484 vs 2298), pp16384 **+8.0%**
+      (2400 vs 2222) on the current delivery (3-GPU tensor, bf16, r3, bracketed); depth
+      pp2048@d12288 **+6.6%** (2035 vs 1908, r1); tg@d12288 unchanged (42.7 both) — decode
+      GDN is sequential regardless, so the MTP acceptance gate is unaffected by construction
+      (and the chunked path is bit-exact: long-prefill same-seed text BYTE-IDENTICAL ON vs
+      OFF).  MTP decode-side acceptance remains covered by Phase 2.3.
 - [ ] **1.6 Per-file RDNA3_5 config-row audit** (fattn / mmf / concat / mmvq / mmid / vecdotq
       RDNA3_5 references): classify each as (a) RDNA3_5-only row (leave; RDNA4 has its own
       pre-campaign rows) vs (b) a "generality" finding that should carry to RDNA4 (e.g. the
@@ -324,5 +328,13 @@ validation too):
   guarded in both arms.
 - Upstream defect report (5.4): document the invariant + propose a CASE-macro static_assert;
   note CDNA needs a warp-64 variant if included.
+
+### 2026-09-06 (session cont.) — PHASE 1.5 DONE: GDN gfx12 chunked re-validated on the current delivery
+- A/B (bracketed r3, 3-GPU tensor, bf16): pp8192 +8.1%, pp16384 +8.0% chunked vs
+  GGML_CUDA_GDN_CHUNKED=0 — matches the pre-re-base +7.5/+7.7% finding; the 0002
+  chunked-prefix dispatch survived the re-base + consolidated beta + sched-gate intact.
+- Depth leg: pp2048@d12288 +6.6%; tg@d12288 unchanged.  Bit-exactness: long-prefill
+  same-seed text byte-identical ON vs OFF.  No code change; MTP acceptance gate
+  unaffected by construction (decode sequential both ways) + covered in Phase 2.3.
 
 <!-- keep the newest entry below this marker -->
