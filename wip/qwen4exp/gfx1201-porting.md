@@ -185,8 +185,12 @@ session) made the ggml layer safe multi-GPU; now validate the model level end-to
 
 - [ ] **2.0** Phase-2 relax-probes (from the 1.6 audit; env-gated, adopt-only-if-wins):
       swiglu→mmq fusion (3808) = DONE 2026-09-06: does NOT transfer (slight loss, keep
-      RDNA3_5-only, see the 2.0.1 entry below); weighted decode expert-sum (mmvq.cu:2622),
-      mmid 512_10 (mmid.cu:209), concat tile_y 16 = pending.
+      RDNA3_5-only, see the 2.0.1 entry below); weighted decode expert-sum (mmvq.cu:2622)
+      = DONE: does NOT fire on the IQ4_XS subject (0 fusions at tg; its down tensors aren't
+      the Q8_0/IQ4_NL routed pattern) — RDNA4 relax UNTESTED, needs a Q8_0-down decode
+      model; mmid 512_10 (mmid.cu:209) = DONE: **WINS, LANDED** (fork `b298cbe7f`, +4.1%
+      pp2048 / +2.6% pp512 tight-window); concat tile_y 16 = DONE: flat (+0.4/+0.2%,
+      noise) — keep 8.  Phase 2.0 COMPLETE.
 
 - [ ] **2.1** Depth-0 ladder + tg (tensor AND layer split) on the fixed build, IQ4_XS + MTP
       draft (Q4_K_M mtp model), same-session toggles where they exist: `LLAMA_QSA_OFF=1`,
@@ -378,5 +382,21 @@ validation too):
   round-trip) does not transfer — gfx1201's separate swiglu path wins.  Decision: keep the
   fusion RDNA3_5-only (reverted; tree clean at `90ea7e22e`).  Fused-vs-unfused
   bit-exactness means this does NOT affect the Phase-3 cross-arch convergence target.
+
+### 2026-09-06 (session cont.) — PHASE 2.0 COMPLETE: relax-probes (mmid-512 WINS +4.1%)
+- 2.0.2 weighted decode expert-sum (mmvq.cu:2622): env-gated relax + fire check → ZERO
+  fusions at tg on the IQ4_XS model (down tensors are not the Q8_0/IQ4_NL routed pattern;
+  only the dense PREFILL down-feed is Q8_0 — that is the swiglu site, 2.0.1).  RDNA4 relax
+  remains UNTESTED; the fusion targets Q8_0/IQ4_NL-down decode models (Q3_K-A3B class —
+  fingon/Phase 4 subject).  Reverted.
+- 2.0.3 mm_ids_helper_512_10: env-gated probe showed +4.5-5.2% (fast window) → flip to
+  unconditional RDNA3_5||RDNA4 → tight-window interleaved A/B confirms **+4.1% pp2048 /
+  +2.6% pp512** vs generic (DISABLE_MMID_512 toggle); text byte-identical.  LANDED fork
+  `b298cbe7f`.  (Surprise: a 'small helper' was worth 15x my estimate — the 512-block
+  one-warp generic path is a real RDNA4 bottleneck too.)
+- 2.0.4 concat_transposed tile_y 16 (RDNA4 probe): pp2048 +0.4% / pp512 +0.2% — flat;
+  keep tile_y=8.  Reverted.
+- Machine-drift note: box swings +-5-7% across 20-40 min windows this session (a rebuild
+  + coherence runs shift it); interleaved brackets (toGGLE-based) are the only sound A/B.
 
 <!-- keep the newest entry below this marker -->
