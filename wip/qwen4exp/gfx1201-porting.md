@@ -702,7 +702,35 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
     reads its own mirror so the same 2x) + zero pool/norm/rope per token; the gain grows with
     context (context-proportional waste); enables the flat sparse decode + per-arch crossover
     measurements the maintainer wants.
-
+- [3] DESIGN RESOLVED (2026-09-07, two open questions closed against the live code):
+  * GRAPH CACHING: llama.cpp reuses ONE decode graph across consecutive steps (same shape), so a
+    fill op can NOT be conditionally omitted per step - it must exist in every graph and act on
+    per-step HOST data, exactly like the raw SET_ROWS store (whose per-step write index comes from
+    a host leaf - cache_idx_k SET_ROWS srcs = {indexer_k_raw view, host leaf, cache}).  The fill
+    op's target = a per-step host leaf "fill range" (from=n_derived, to=n_full_this_step; fills
+    [from,to) -> steady decode fills 0-1 blocks; the first decode after a long prefill backfills
+    up to n_kv/r blocks as a one-time pass).  Fill kernel reads the completing block's r raw cells
+    via the SAME blk_cells row + W + blk_pos + eps + r and writes the normed+roped vector into the
+    derived buffer - replicate the pool/norm/rope arithmetic byte-exactly (the INDEXER_SCORE
+    pass-1..3 code is the template).
+  * INVALIDATION = the watermark, no memset needed: derived rows are only trusted for
+    b < min(watermark, n_blocks) (watermark passed to the score op as a host leaf, per stream);
+    stale rows above it are never read.  ANY seq mutation (rm/cp/keep/add/div/state io, host
+    side) drops the watermark(s) to 0 -> the next step re-pools raw for one step then rebuilds as
+    tokens append.  The decode score op pools RAW for b >= watermark (dead/spare + not-yet-full
+    rows, exactly as today) and reads the derived f32 row + dots for b < watermark.  The
+    watermark lives in llama_memory_hybrid_idx host state per (layer via ratio group, stream);
+    set_input_qsa (already host-side, O(n_kv), knows n_full per stream) is the natural place to
+    update it + emit the host leaves.
+  * BUFFER HOME: per-layer F32 [idx_dim x n_blocks_max x n_stream] tensors created + allocated
+    exactly like llama_kv_cache's K (per-layer dev ctx, ggml_backend_alloc_ctx_tensors_from_buft,
+    buffer_clear) - a small per-layer tensor array in llama_memory_hybrid_idx (NOT a second
+    llama_kv_cache: cells are blocks not tokens, and the watermark model replaces cell/seq
+    bookkeeping).  n_blocks_max = ceil(kv_size/r).
+  * FILL TRIGGER: single-seq decode stores 1 token/step; n_full advances by (n_kv_used%r == 0 ? 1 : 0)
+    host-side from the ubatch positions; the fill range leaf = (n_derived, n_full].  Prefill steps
+    (n_tokens>1) store many tokens -> the same range logic bulk-fills (or the first decode
+    backfills).  Decode-path only to start (env-gated like the rest); prefill stays raw.
 
 ### 2026-09-07 (cont.) — fused INDEXER ops now accept F16 caches (fork `c07e70e6f`)
 - The fused INDEXER_POOL/SCORE gather was bf16-shift/F32-only and the ggml builders asserted
