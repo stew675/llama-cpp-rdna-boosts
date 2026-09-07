@@ -999,4 +999,22 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   GGML_CUDA_FA_WMMA_256=0 for deep ctx); the derived cache [3] is vindicated at depth
   (+11% fused decode @131K, was flat <=64K because the O(depth) score rescans overlap).
 
+### 2026-09-07 (cont.) — DELIVERY PACKAGED + VERIFIED: arch-gated policy shipped; support patch regenerated to the tip
+- Fork 6e4778ed8 (qwen4exp): arch-gated dense-vs-QSA decode policy (gfx1151 crossover ~26K,
+  other arches dense-decode-always; env LLAMA_QSA_DENSE_DECODE_UNTIL override; device
+  description carries '(gfxNNNN)' for AMD).  Verified on gfx1201: default decode byte-
+  identical to LLAMA_QSA_OFF, tg4K 46.3 vs 46.6.
+- beta/qwen4exp/qwen4exp-support.patch REGENERATED: git diff c261553a1..6e4778ed8 (55 files,
+  8809 lines) - the old patch only reached b298cbe7f; the missing 9 commits were the whole
+  QSA decode campaign (skip probe, fused pool/score, f16 caches, derived cache, init fold,
+  round2 topk, the policy).  The RDNA4 tuning commits (mmq/quantize/mmid) WERE already in
+  the old patch (through b298cbe7f).
+- CLEAN-APPLY VERIFICATION (the maintainer's ask): fresh worktree at 465e49b9c +
+  scripts/apply-all.sh (13 blocks) + git apply --3way of the new support patch == fork tip
+  6e4778ed8 with ZERO diff lines.
+- upstream/ directory created: UPSTREAM-PR-ggml-sched-probe.{patch,md} moved out of
+  beta/qwen4exp/ (they were superseded by the README restructure) + upstream/README.md
+  explaining these are copies already inside the patch sets, kept separate as PR starting
+  points; not additional deliverables.
+
 <!-- keep the newest entry below this marker -->

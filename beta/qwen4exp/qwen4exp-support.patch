@@ -81,7 +81,7 @@ index a7926a21a..7d09e7202 100644
  // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
  GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
-index cbfe40013..d561e9e37 100644
+index cbfe40013..0cedf41cd 100644
 --- a/ggml/include/ggml-rpc.h
 +++ b/ggml/include/ggml-rpc.h
 @@ -8,10 +8,10 @@ extern "C" {
@@ -89,30 +89,33 @@ index cbfe40013..d561e9e37 100644
  #define RPC_PROTO_MAJOR_VERSION    6
  #define RPC_PROTO_MINOR_VERSION    0
 -#define RPC_PROTO_PATCH_VERSION    0
-+#define RPC_PROTO_PATCH_VERSION    3
++#define RPC_PROTO_PATCH_VERSION    6
  
  #ifdef  __cplusplus
 -static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
-+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
++static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
  #endif
  
  #define GGML_RPC_MAX_SERVERS       16
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index b88b7e54a..2e49aceb1 100644
+index b88b7e54a..6628016dc 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -574,6 +574,10 @@ extern "C" {
+@@ -574,6 +574,13 @@ extern "C" {
          GGML_OP_DSV4_HC_COMB,
          GGML_OP_DSV4_HC_PRE,
          GGML_OP_DSV4_HC_POST,
 +        GGML_OP_FLASH_ATTN_QSA,
 +        GGML_OP_INDEXER_TOPK,
++        GGML_OP_INDEXER_POOL,
++        GGML_OP_INDEXER_SCORE,
++        GGML_OP_INDEXER_FILL,
 +        GGML_OP_HC_MIX,
 +        GGML_OP_HC_COMBINE,
  
          GGML_OP_UNARY,
  
-@@ -2463,6 +2467,38 @@ extern "C" {
+@@ -2463,6 +2470,117 @@ extern "C" {
              struct ggml_tensor * a,
              struct ggml_tensor * sinks);
  
@@ -148,10 +151,89 @@ index b88b7e54a..2e49aceb1 100644
 +            struct ggml_tensor  * additive,
 +            int                   k);
 +
++    // Fused indexer block-pool + rms-norm (qwen4exp QSA): replaces the per-op chain
++    // get_rows(blk_cells) -> r-slice sum -> scale(1/r) -> rms_norm for the per-token
++    // decode indexer path.  src0 = raw indexer cache [idx_dim, n_kv, n_stream],
++    // src1 = blk_cells [r*n_blocks, n_stream], src2 = rms-norm weights [idx_dim];
++    // dst = [idx_dim, n_blocks*n_stream, 1], byte-identical to the per-op chain.
++    GGML_API struct ggml_tensor * ggml_indexer_pool(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * k,
++            struct ggml_tensor  * blk_cells,
++            struct ggml_tensor  * w,
++            int                   r,
++            float                 eps);
++
++    // Fused indexer block pool -> norm -> rope -> score (qwen4exp QSA decode): ONE op
++    // replaces the per-token chain get_rows -> pool -> scale -> rms_norm -> rope_multi
++    // -> score mul_mat -> relu -> head-sum -> bias add.  src0 = raw indexer cache view
++    // [idx_dim, n_kv, n_stream], src1 = blk_cells [r*n_blocks, n_stream],
++    // src2 = blk_pos [4*n_blocks*n_stream], src3 = rotated/normed indexer query
++    // [idx_dim, n_idx_h*n_tps, n_stream], src4 = norm weights [idx_dim],
++    // src5 = per-block bias [n_blocks, n_tps, n_stream]; the remaining args replicate
++    // the ggml rope call's parameters.  dst = [n_blocks, n_tps, n_stream],
++    // byte-identical to the per-op chain's post-bias score.
++    GGML_API struct ggml_tensor * ggml_indexer_score(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * k,
++            struct ggml_tensor  * blk_cells,
++            struct ggml_tensor  * blk_pos,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * w,
++            struct ggml_tensor  * bias,
++            int                   r,
++            float                 eps,
++            int                   n_dims,
++            const int           * sections,
++            int                   mode,
++            int                   n_ctx_orig,
++            float                 freq_base,
++            float                 freq_scale,
++            float                 ext_factor,
++            float                 attn_factor,
++            float                 beta_fast,
++            float                 beta_slow,
++            // derived-cache path (optional, pass NULL for both): src6 = the incremental
++            // block-vector pool view [idx_dim, n_blocks, n_stream] (rows < the limit
++            // hold pre-normed+rotated vectors and are dotted directly instead of being
++            // pooled from the raw cache), src7 = I32 [2*n_stream] host range leaf with
++            // the per-stream derived limit in rows [n_stream, 2*n_stream).
++            struct ggml_tensor  * pool,
++            struct ggml_tensor  * rng);
++
++    // Incremental derived-cache fill (qwen4exp QSA decode waste fix): ONE op computes the
++    // pooled + rms-normed + ROTATED vector of the blocks in the per-step range [from, lim)
++    // (src5 = I32 [2*n_stream] host leaf, from in rows [0, n_stream), lim in
++    // [n_stream, 2*n_stream)) and writes them into the pool view `dst` (src6).  The kernel
++    // replicates ggml_indexer_score's pool/norm/rope F32 arithmetic byte-exactly, so a pool
++    // row equals what the score would pool from the raw cache - the byte-toggle contract.
++    // src0 = raw indexer cache view, src1 = blk_cells, src2 = blk_pos, src3 = norm weights,
++    // src4 = the range leaf; the rope parameters follow ggml_indexer_score.
++    GGML_API struct ggml_tensor * ggml_indexer_fill(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * k,
++            struct ggml_tensor  * blk_cells,
++            struct ggml_tensor  * blk_pos,
++            struct ggml_tensor  * w,
++            struct ggml_tensor  * rng,
++            struct ggml_tensor  * pool,
++            int                   r,
++            float                 eps,
++            int                   n_dims,
++            const int           * sections,
++            int                   mode,
++            int                   n_ctx_orig,
++            float                 freq_base,
++            float                 freq_scale,
++            float                 ext_factor,
++            float                 attn_factor,
++            float                 beta_fast,
++            float                 beta_slow);
++
      // TODO: needs to be adapted to ggml_flash_attn_ext
      GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,
-@@ -2667,6 +2703,48 @@ extern "C" {
+@@ -2667,6 +2785,48 @@ extern "C" {
              struct ggml_tensor  * post,
              struct ggml_tensor  * comb);
  
@@ -271,7 +353,7 @@ index a71838eaf..cda6dd695 100644
  
  bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 87667beb2..a3c378cc4 100644
+index 87667beb2..a70fbdb68 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
 @@ -4,6 +4,7 @@
@@ -304,7 +386,7 @@ index 87667beb2..a3c378cc4 100644
      auto handle_lightning_indexer = [&](
              const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
          for (size_t i = 0; i < 4; i++) {
-@@ -1012,6 +1028,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1012,6 +1028,44 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              case GGML_OP_FLASH_ATTN_EXT: {
                  split_state = handle_flash_attn_ext(src_ss);
              } break;
@@ -318,10 +400,38 @@ index 87667beb2..a3c378cc4 100644
 +                GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 +                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
 +            } break;
++            case GGML_OP_INDEXER_POOL: {
++                // like INDEXER_TOPK: mirrored indexer-cache view + cell map + norm weights
++                GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++                GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++                GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
++            } break;
++            case GGML_OP_INDEXER_SCORE: {
++                // like INDEXER_TOPK: mirrored indexer cache view + cell map + positions +
++                // query + norm weights + bias (each device holds full mirrored copies);
++                // the optional derived-cache pool view + range leaf are mirrored too
++                for (int i = 0; i < GGML_MAX_SRC; ++i) {
++                    if (tensor->src[i] != nullptr) {
++                        GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++                    }
++                }
++                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
++            } break;
++            case GGML_OP_INDEXER_FILL: {
++                // mirrored like INDEXER_POOL: raw cache view + cell map + positions + norm
++                // weights + the host range leaf + the pool buffer it writes
++                for (int i = 0; i < GGML_MAX_SRC; ++i) {
++                    if (tensor->src[i] != nullptr) {
++                        GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++                    }
++                }
++                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
++            } break;
              case GGML_OP_FLASH_ATTN_BACK: {
                  split_state = handle_generic(src_ss, /*scalar_only =*/ true);
              } break;
-@@ -1040,6 +1066,29 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1040,6 +1094,29 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
              case GGML_OP_DSV4_HC_POST: {
                  split_state = handle_generic(src_ss, /*scalar_only =*/ true);
              } break;
@@ -351,7 +461,7 @@ index 87667beb2..a3c378cc4 100644
              case GGML_OP_UNARY: {
                  split_state = handle_generic(src_ss, /*scalar_only =*/ false);
              } break;
-@@ -1168,6 +1217,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -1168,6 +1245,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
  }
  
  static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
@@ -363,7 +473,7 @@ index 87667beb2..a3c378cc4 100644
      ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
      return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
  }
-@@ -1966,6 +2020,43 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
+@@ -1966,6 +2048,43 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
      }
  }
  
@@ -407,7 +517,7 @@ index 87667beb2..a3c378cc4 100644
  static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
      GGML_ASSERT(cgraph->grads == nullptr);
      const size_t n_backends = ggml_backend_meta_n_backends(backend);
-@@ -2015,9 +2106,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2015,9 +2134,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
  
              for (int i = 0; i < cgraph->n_nodes; i++) {
                  ggml_tensor * node = cgraph->nodes[i];
@@ -424,7 +534,7 @@ index 87667beb2..a3c378cc4 100644
                      bcj.nodes[i] = node;
                      continue;
                  }
-@@ -2256,7 +2351,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2256,7 +2379,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
              backend_ctx->ctx.reset(ggml_init(params));
              for (size_t j = 0; j < n_backends; j++) {
                  auto & bcj = backend_ctx->backend_configs[j];
@@ -436,7 +546,7 @@ index 87667beb2..a3c378cc4 100644
                      bcj.cgraphs[i].cgraph_main = ggml_new_graph_custom(backend_ctx->ctx.get(), cgraph->n_nodes, /*grads =*/ false);
                  }
              }
-@@ -2485,7 +2583,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
+@@ -2485,7 +2611,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
      /* .graph_compute           = */ ggml_backend_meta_graph_compute,
      /* .event_record            = */ nullptr,
      /* .event_wait              = */ nullptr,
@@ -446,10 +556,10 @@ index 87667beb2..a3c378cc4 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 6862128e6..f2a15b25f 100644
+index 6862128e6..e368a118b 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -958,6 +958,12 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+@@ -958,6 +958,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
      // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
      allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
  
@@ -459,10 +569,15 @@ index 6862128e6..f2a15b25f 100644
 +    // skip INDEXER_TOPK since the cell map / mask tensors are too small to choose a backend based on them
 +    allow = allow && tensor->op != GGML_OP_INDEXER_TOPK;
 +
++    // skip INDEXER_POOL the same way (indexer cache view + cell map drive the placement)
++    allow = allow && tensor->op != GGML_OP_INDEXER_POOL;
++    allow = allow && tensor->op != GGML_OP_INDEXER_SCORE;
++    allow = allow && tensor->op != GGML_OP_INDEXER_FILL;
++
      if (allow) {
          for (int i = 0; i < GGML_MAX_SRC; i++) {
              const struct ggml_tensor * src = tensor->src[i];
-@@ -1635,13 +1641,41 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -1635,13 +1646,41 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
              }
          }
  
@@ -508,7 +623,7 @@ index 6862128e6..f2a15b25f 100644
          if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
              GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
              return false;
-@@ -2112,6 +2146,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
+@@ -2112,6 +2151,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
  bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
      switch (op) {
          case GGML_OP_FLASH_ATTN_EXT:
@@ -1872,7 +1987,7 @@ index 000000000..0a2059477
 +void ggml_cuda_flash_attn_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +bool ggml_cuda_flash_attn_qsa_supported(int device, const ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index f96e67bb4..0294a2c1f 100644
+index f96e67bb4..1f8cc12eb 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -1882,16 +1997,18 @@ index f96e67bb4..0294a2c1f 100644
  #include "ggml-backend-impl.h"
  
  #include "ggml-cuda/allreduce.cuh"
-@@ -25,6 +26,8 @@
+@@ -25,6 +26,10 @@
  #include "ggml-cuda/diagmask.cuh"
  #include "ggml-cuda/diag.cuh"
  #include "ggml-cuda/fattn.cuh"
 +#include "ggml-cuda/fattn-qsa.cuh"
 +#include "ggml-cuda/indexer-topk.cuh"
++#include "ggml-cuda/indexer-pool.cuh"
++#include "ggml-cuda/indexer-score.cuh"
  #include "ggml-cuda/fwht.cuh"
  #include "ggml-cuda/getrows.cuh"
  #include "ggml-cuda/im2col.cuh"
-@@ -61,6 +64,8 @@
+@@ -61,6 +66,8 @@
  #include "ggml-cuda/gla.cuh"
  #include "ggml-cuda/gated_delta_net.cuh"
  #include "ggml-cuda/dsv4-hc.cuh"
@@ -1900,7 +2017,7 @@ index f96e67bb4..0294a2c1f 100644
  #include "ggml-cuda/set.cuh"
  #include "ggml-cuda/set-rows.cuh"
  #include "ggml-cuda/pad_reflect_1d.cuh"
-@@ -2525,6 +2530,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2525,6 +2532,21 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_FLASH_ATTN_EXT:
              ggml_cuda_flash_attn_ext(ctx, dst);
              break;
@@ -1910,10 +2027,19 @@ index f96e67bb4..0294a2c1f 100644
 +        case GGML_OP_INDEXER_TOPK:
 +            ggml_cuda_indexer_top_k(ctx, dst);
 +            break;
++        case GGML_OP_INDEXER_POOL:
++            ggml_cuda_indexer_pool(ctx, dst);
++            break;
++        case GGML_OP_INDEXER_SCORE:
++            ggml_cuda_indexer_score(ctx, dst);
++            break;
++        case GGML_OP_INDEXER_FILL:
++            ggml_cuda_indexer_fill(ctx, dst);
++            break;
          case GGML_OP_CROSS_ENTROPY_LOSS:
              ggml_cuda_cross_entropy_loss(ctx, dst);
              break;
-@@ -2549,6 +2560,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2549,6 +2571,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_DSV4_HC_POST:
              ggml_cuda_op_dsv4_hc_post(ctx, dst);
              break;
@@ -1926,7 +2052,7 @@ index f96e67bb4..0294a2c1f 100644
          case GGML_OP_RWKV_WKV7:
              ggml_cuda_op_rwkv_wkv7(ctx, dst);
              break;
-@@ -3266,151 +3283,6 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+@@ -3266,151 +3294,6 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
      return is_ok;
  }
  
@@ -2078,7 +2204,7 @@ index f96e67bb4..0294a2c1f 100644
  static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                 int                                       node_idx,
                                 std::initializer_list<enum ggml_op>       ops,
-@@ -3663,6 +3535,75 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -3663,6 +3546,75 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
  }
  
  // try and fuse nodes and return the number of nodes to skip
@@ -2154,7 +2280,7 @@ index f96e67bb4..0294a2c1f 100644
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-@@ -3673,15 +3614,106 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3673,15 +3625,106 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
      static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
  
@@ -2263,7 +2389,7 @@ index f96e67bb4..0294a2c1f 100644
                  ggml_cuda_op_moe_weighted_reduction(
                      *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                  return match.node_count - 1;
-@@ -4886,6 +4918,362 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4886,6 +4929,362 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 1;
      }
  
@@ -2626,7 +2752,7 @@ index f96e67bb4..0294a2c1f 100644
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-@@ -5154,7 +5542,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5154,7 +5553,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                  }
                  GGML_ASSERT(ok);
@@ -2634,7 +2760,7 @@ index f96e67bb4..0294a2c1f 100644
                  if (op_timing) {
                      CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
                      op_nodes.emplace_back(node, i, false);
-@@ -5395,8 +5782,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5395,8 +5793,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  continue;
              }
  
@@ -2645,7 +2771,22 @@ index f96e67bb4..0294a2c1f 100644
                  continue;
              }
  
-@@ -6384,8 +6771,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5695,6 +6093,14 @@ static std::string ggml_cuda_device_description(int device) {
+         description += " (dev p" + std::to_string(info.devices[device].physical_device) +
+                        "/v" + std::to_string(info.devices[device].virtual_index) + ")";
+     }
++    // expose the AMD gfx id in the description: host-side (model-layer) code keys per-arch
++    // policies (e.g. the qwen4exp QSA dense-vs-sparse decode crossover) off the device string
++    const int cc = info.devices[device].cc;
++    if (cc >= GGML_CUDA_CC_OFFSET_AMD) {
++        char buf[16];
++        snprintf(buf, sizeof(buf), " (gfx%x)", cc & 0xffff);
++        description += buf;
++    }
+     return description;
+ }
+ 
+@@ -6384,8 +6790,26 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
@@ -2663,6 +2804,12 @@ index f96e67bb4..0294a2c1f 100644
 +            return ggml_cuda_flash_attn_qsa_supported(dev_ctx->device, op);
 +        case GGML_OP_INDEXER_TOPK:
 +            return ggml_cuda_indexer_top_k_supported(dev_ctx->device, op);
++        case GGML_OP_INDEXER_POOL:
++            return ggml_cuda_indexer_pool_supported(dev_ctx->device, op);
++        case GGML_OP_INDEXER_SCORE:
++            return ggml_cuda_indexer_score_supported(dev_ctx->device, op);
++        case GGML_OP_INDEXER_FILL:
++            return ggml_cuda_indexer_fill_supported(dev_ctx->device, op);
          case GGML_OP_CROSS_ENTROPY_LOSS:
          case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
          case GGML_OP_OPT_STEP_ADAMW:
@@ -3588,12 +3735,772 @@ index 000000000..2a8782a28
 +
 +bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & args, int warp_size);
 +void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cuda_hc_combine_norm_args & args);
+diff --git a/ggml/src/ggml-cuda/indexer-pool.cu b/ggml/src/ggml-cuda/indexer-pool.cu
+new file mode 100644
+index 000000000..7f83e3962
+--- /dev/null
++++ b/ggml/src/ggml-cuda/indexer-pool.cu
+@@ -0,0 +1,158 @@
++// Fused indexer block-pool + rms-norm for the qwen4exp QSA sparse-attention path.
++//
++// Replaces the per-op chain
++//     members  = get_rows(K, blk_cells)
++//     pooled   = (sum over the r block members in order) * (1/r)
++//     pooled   = rms_norm(pooled, W, eps)      (rows = merged (block, stream))
++// with ONE kernel that replicates the per-op F32 arithmetic EXACTLY, so the output
++// is byte-identical to the per-op chain (same gather addresses, same sequential
++// per-element add order, same scalar scale, same 256/1024-thread rms_norm reduction
++// order as ggml-cuda/norm.cu rms_norm_f32).  Numerics parity is the contract: the
++// decode graph's downstream top-k selection is sensitive to last-ulp score changes.
++//
++// src0 = K   : raw indexer cache [idx_dim, n_kv, n_stream] F32/BF16/F16 (view of the cache)
++// src1 = BLK : block->cell index map [r*n_blocks, n_stream] I32 (blk_cells)
++// src2 = W   : rms-norm weights [idx_dim] F32 (index_k_norm)
++// op_params  : 0 = r (i32, block size in cells), 1 = eps (f32)
++// dst        : pooled + rms-normed per-block keys [idx_dim, n_blocks*n_stream, 1] F32
++//              row r0 = b + s*n_blocks (block b of stream s), matching the reshape
++//              the per-op path feeds to rms_norm.
++
++#include "indexer-pool.cuh"
++#include "common.cuh"
++
++// cache element ktype: 0 = F32, 1 = BF16 (ggml bits<<16 upcast), 2 = F16 (exact half->f32)
++static __device__ __forceinline__ float indexer_pool_ld_val(const void * p, const int ktype) {
++    if (ktype == 1) {
++        // ggml bf16 -> f32 is an exact `bits << 16` (ggml_bf16_to_fp32)
++        return __uint_as_float(((uint32_t) *(const uint16_t *) p) << 16);
++    }
++    if (ktype == 2) {
++        // f16 -> f32 is exact (bijection); matches get_rows' native half upcast
++        return __half2float(*(const __half *) p);
++    }
++    return *(const float *) p;
++}
++
++static __device__ __forceinline__ float indexer_pool_norm_col(
++        const char * K, const int * blk_row, const int c, const int idx_dim,
++        const int r, const float rinv, const int64_t nb0K, const int64_t nb1K, const int ktype) {
++    // per-element block-mean pool: sequential F32 adds over the r members in cell order
++    // (members are F32 after the gather's half->f32 upcast in the per-op path)
++    float acc = 0.0f;
++    const char * Kcol = K + (int64_t) c * nb0K;
++    for (int i = 0; i < r; ++i) {
++        acc += indexer_pool_ld_val(Kcol + (int64_t) blk_row[i] * nb1K, ktype);
++    }
++    return acc * rinv;
++}
++
++template <int BLOCK_SIZE>
++static __global__ void indexer_pool_kernel(
++        const char * __restrict__ K,
++        const int   * __restrict__ BLK,
++        const float * __restrict__ W,
++        float * __restrict__ dst,
++        const int    idx_dim,
++        const int    r,
++        const float  rinv,
++        const float  eps,
++        const int    n_blocks,
++        const int    n_stream,
++        const int64_t nb0K,   // K element stride (bytes: 2 half / 4 f32)
++        const int64_t nb1K,   // K cell stride (bytes)
++        const int64_t nb2K,   // K stream stride (bytes)
++        const int64_t nb1B,   // BLK stream stride (bytes)
++        const int    ktype) {
++    const int r0 = blockIdx.x;             // merged (block, stream) row index
++    const int s  = r0 / n_blocks;          // stream
++    const int b  = r0 - s*n_blocks;        // block
++    const int tid = threadIdx.x;
++
++    const char * Ks    = K  + (int64_t) s*nb2K;
++    const int  * blk_row = (const int *) ((const char *) BLK + (int64_t) s*nb1B) + (int64_t) r*b;
++
++    extern __shared__ float smem[];
++    float * pooled = smem;                         // pooled[c], c in [0, idx_dim)
++    float * s_vals = smem + idx_dim;               // block_reduce warp leaders
++
++    // pass 1: pool each column this thread owns (same strided walk as rms_norm_f32)
++    float tmp = 0.0f;
++    for (int c = tid; c < idx_dim; c += BLOCK_SIZE) {
++        const float pv = indexer_pool_norm_col(Ks, blk_row, c, idx_dim, r, rinv, nb0K, nb1K, ktype);
++        pooled[c] = pv;
++        tmp += pv * pv;
++    }
++    __syncthreads();
++
++    const float mean  = block_reduce<block_reduce_method::SUM, BLOCK_SIZE>(tmp, s_vals) / (float) idx_dim;
++    const float scale = rsqrtf(mean + eps);
++
++    // pass 2: write dst = scale * pooled * W  (mul order as rms_norm_f32's do_multiply)
++    for (int c = tid; c < idx_dim; c += BLOCK_SIZE) {
++        dst[(int64_t) r0 * idx_dim + c] = scale * pooled[c] * W[c];
++    }
++}
++
++static void ggml_cuda_indexer_pool_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * K   = dst->src[0];
++    const ggml_tensor * BLK = dst->src[1];
++    const ggml_tensor * W   = dst->src[2];
++
++    const int   r    = ggml_get_op_params_i32(dst, 0);
++    const float eps  = ggml_get_op_params_f32(dst, 1);
++    const int   idx_dim = (int) K->ne[0];
++    const int   n_kv   = (int) K->ne[1];
++    const int   n_stream = (int) K->ne[2];
++
++    const int64_t n_cells = BLK->ne[0];           // r*n_blocks
++    GGML_ASSERT(n_cells % r == 0);
++    const int n_blocks = (int) (n_cells / r);
++    GGML_ASSERT(n_blocks > 0);
++    const int ktype = K->type == GGML_TYPE_F32 ? 0 : (K->type == GGML_TYPE_BF16 ? 1 : 2);
++    GGML_ASSERT((K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_F16) && W->type == GGML_TYPE_F32);
++    GGML_ASSERT(W->ne[0] == idx_dim);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++
++    // mirror rms_norm_f32_cuda's dispatch: ncols < 1024 -> 256-thread block
++    const int block_size = idx_dim < 1024 ? 256 : 1024;
++
++    // K strides: the raw cache view [idx_dim, n_kv, n_stream]
++    // (cell stride nb[1], stream stride nb[2]); BLK [r*n_blocks, n_stream]
++    const int64_t nb1K = K->nb[1];
++    const int64_t nb2K = K->nb[2];
++    const int64_t nb1B = BLK->nb[1];
++
++    float * dst_data = (float *) dst->data;
++    const float rinv = 1.0f / (float) r;
++    const int64_t nb0K = K->nb[0];   // 2 (bf16/f16) or 4 (f32)
++
++    cudaStream_t stream = ctx.stream();
++    const dim3 blocks_num(n_blocks * n_stream);
++    const size_t smem = (idx_dim + 32) * sizeof(float);   // pooled + warp-leader slots
++
++    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, dim3(block_size, 1, 1), smem, stream};
++    if (block_size == 1024) {
++        ggml_cuda_kernel_launch(indexer_pool_kernel<1024>, launch_params,
++            (const char *) K->data, (const int *) BLK->data, (const float *) W->data, dst_data,
++            idx_dim, r, rinv, eps, n_blocks, n_stream, nb0K, nb1K, nb2K, nb1B, ktype);
++    } else {
++        ggml_cuda_kernel_launch(indexer_pool_kernel<256>, launch_params,
++            (const char *) K->data, (const int *) BLK->data, (const float *) W->data, dst_data,
++            idx_dim, r, rinv, eps, n_blocks, n_stream, nb0K, nb1K, nb2K, nb1B, ktype);
++    }
++}
++
++void ggml_cuda_indexer_pool(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    ggml_cuda_indexer_pool_impl(ctx, dst);
++}
++
++bool ggml_cuda_indexer_pool_supported(int device, const ggml_tensor * dst) {
++    GGML_ASSERT(dst->op == GGML_OP_INDEXER_POOL);
++    GGML_UNUSED(device);
++    const ggml_tensor * K   = dst->src[0];
++    const ggml_tensor * BLK = dst->src[1];
++    const ggml_tensor * W   = dst->src[2];
++    return (K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_F16) && BLK->type == GGML_TYPE_I32 &&
++           W->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
++}
+diff --git a/ggml/src/ggml-cuda/indexer-pool.cuh b/ggml/src/ggml-cuda/indexer-pool.cuh
+new file mode 100644
+index 000000000..59d83be2b
+--- /dev/null
++++ b/ggml/src/ggml-cuda/indexer-pool.cuh
+@@ -0,0 +1,7 @@
++#pragma once
++
++#include "common.cuh"
++
++// Fused indexer block-pool + rms-norm (see indexer-pool.cu for the arithmetic contract).
++void ggml_cuda_indexer_pool(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++bool ggml_cuda_indexer_pool_supported(int device, const ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/indexer-score.cu b/ggml/src/ggml-cuda/indexer-score.cu
+new file mode 100644
+index 000000000..0e27247f5
+--- /dev/null
++++ b/ggml/src/ggml-cuda/indexer-score.cu
+@@ -0,0 +1,561 @@
++// Fused indexer block-pool -> rms-norm -> rope -> score for the qwen4exp QSA
++// sparse-attention decode path (ONE kernel replaces ~12 per-op kernels/layer).
++//
++// Replaces the per-op chain, replicating its F32 arithmetic EXACTLY so the output
++// (the per-block score vector consumed by ggml_indexer_top_k) is byte-identical:
++//   members  = get_rows(K, blk_cells)                       (half->f32 upcast gather)
++//   pooled   = (sum over r block members in order) * (1/r)
++//   normed   = rms_norm(pooled, W, eps)                     (256-thread block reduce)
++//   rot      = rope_multi(normed, blk_pos, ...)             (IMROPE half-pair rotate)
++//   dot[b][h] = sum_d rot[d][b]*q[d][h]                     (mmvf F32 vec kernel order)
++//   score[b]  = bias[b] + sum_h relu(dot[b][h])             (head sum in h order)
++//
++// src0 = K    raw indexer cache [idx_dim, n_kv, n_stream] F32/BF16/F16 (view of the cache)
++// src1 = BLK  block->cell map [r*n_blocks, n_stream] I32 (blk_cells)
++// src2 = POS  mrope positions [4*n_blocks*n_stream] I32 (blk_pos, [k][row] stride)
++// src3 = Q    rotated/normed indexer query [idx_dim, n_idx_h*n_tps, n_stream] F32
++// src4 = W    rms-norm weights [idx_dim] F32 (index_k_norm)
++// src5 = B    per-block bias [n_blocks, n_tps, n_stream] F32 (applied when blk_bias)
++// op_params : 0=r(i32) 1=n_dims(i32) 2=mode(i32) 3=n_ctx_orig(i32)
++//             4=freq_base(f32) 5=freq_scale(f32) 6=ext_factor(f32) 7=attn_factor(f32)
++//             8=beta_fast(f32) 9=beta_slow(f32) 10..13=sections(i32 x4) 14=eps(f32)
++// dst      : [n_blocks, n_tps, n_stream] F32 (per-op path's post-bias score)
++//            row r0 = b + s*n_blocks.
++
++#include "indexer-score.cuh"
++#include "common.cuh"
++#include <algorithm>
++
++// --- rope math copied verbatim from ggml-cuda/rope.cu (rope_yarn) so the cos/sin
++// --- values are bit-identical to the per-op ggml rope kernel ---------------------
++static __device__ float indexer_score_rope_yarn_ramp(const float low, const float high, const int i0) {
++    const float y = (i0 / 2 - low) / max(0.001f, high - low);
++    return 1.0f - min(1.0f, max(0.0f, y));
++}
++
++static __device__ void indexer_score_rope_yarn(
++        const float theta_extrap, const float freq_scale, const float corr_v0, const float corr_v1,
++        const int64_t i0, const float ext_factor, const float mscale,
++        float & cos_theta, float & sin_theta) {
++    float theta_interp = freq_scale * theta_extrap;
++    float theta = theta_interp;
++    if (ext_factor != 0.0f) {
++        const float ramp_mix = indexer_score_rope_yarn_ramp(corr_v0, corr_v1, i0) * ext_factor;
++        theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
++    }
++    cos_theta = cosf(theta) * mscale;
++    sin_theta = sinf(theta) * mscale;
++}
++
++// --- pool + norm device helpers (identical to indexer-pool.cu) --------------------
++// cache element ktype: 0 = F32, 1 = BF16 (ggml bits<<16 upcast), 2 = F16 (exact half->f32)
++static __device__ __forceinline__ float indexer_score_ld_val(const void * p, const int ktype) {
++    if (ktype == 1) {
++        return __uint_as_float(((uint32_t) *(const uint16_t *) p) << 16);
++    }
++    if (ktype == 2) {
++        // f16 -> f32 is exact (bijection); matches get_rows' native half upcast
++        return __half2float(*(const __half *) p);
++    }
++    return *(const float *) p;
++}
++
++static __device__ __forceinline__ float indexer_score_norm_col(
++        const char * K, const int * blk_row, const int c, const int idx_dim,
++        const int r, const float rinv, const int64_t nb0K, const int64_t nb1K, const int ktype) {
++    float acc = 0.0f;
++    const char * Kcol = K + (int64_t) c * nb0K;
++    for (int i = 0; i < r; ++i) {
++        acc += indexer_score_ld_val(Kcol + (int64_t) blk_row[i] * nb1K, ktype);
++    }
++    return acc * rinv;
++}
++
++static constexpr int IDX_SCORE_BLOCK = 256;   // rms_norm geometry for ncols < 1024
++static constexpr int IDX_SCORE_WARP  = 32;    // wave32 (RDNA): mmvf's F32 vec reduce width
++
++static __global__ void indexer_score_kernel(
++        const char   * __restrict__ K,       // raw cache [idx_dim, n_kv, n_stream]
++        const int    * __restrict__ BLK,     // blk_cells [r*n_blocks, n_stream]
++        const int32_t* __restrict__ POS,     // blk_pos [4*nrows]
++        const float  * __restrict__ Q,       // q_rot [idx_dim, n_idx_h*n_tps, n_stream]
++        const float  * __restrict__ W,       // norm weights [idx_dim]
++        const float  * __restrict__ B,       // per-block bias [n_blocks, n_tps, n_stream]
++        float        * __restrict__ dst,     // [n_blocks, n_tps, n_stream]
++        const int    idx_dim,                // 128
++        const int    r,
++        const float  rinv,
++        const int    n_blocks,               // blocks per stream
++        const int    n_stream,
++        const int    nrows,                  // n_blocks*n_stream
++        const int    n_idx_h,                // query heads (<= 8)
++        const int    n_dims,                 // rope n_dims (n_rot)
++        const int    is_imrope,              // mode == GGML_ROPE_TYPE_IMROPE
++        const int    sect_v0, const int sect_v1, const int sect_v2, const int sect_v3,
++        const int64_t nb0K, const int64_t nb1K, const int64_t nb2K, const int64_t nb1B,
++        const char  * __restrict__ P,      // derived pool [idx_dim, n_blocks, n_stream] (nullable)
++        const int   * __restrict__ LIM,    // derived limit leaf [2*n_stream] (nullable)
++        const int64_t nb0P, const int64_t nb1P, const int64_t nb2P,
++        const int    ktype,
++        const float  eps,
++        const float  freq_scale, const float ext_factor, const float attn_factor,
++        const float  theta_scale, const float corr_v0, const float corr_v1) {
++    const int r0    = blockIdx.x;            // merged (block, stream) row
++    const int s     = r0 / n_blocks;
++    const int b     = r0 - s * n_blocks;
++    const int tid   = threadIdx.x;
++
++    const char  * Ks = K + (int64_t) s * nb2K;
++    const int   * blk_row = (const int *) ((const char *) BLK + (int64_t) s * nb1B) + (int64_t) r * b;
++    const int32_t p0 = POS[r0];
++    const int32_t p1 = POS[r0 + nrows];
++    const int32_t p2 = POS[r0 + 2 * nrows];
++    const int32_t p3 = POS[r0 + 3 * nrows];
++
++    extern __shared__ float smem[];
++    float * vec = smem;                            // pooled then normed/rotated [idx_dim]
++    float * s_vals = smem + idx_dim;               // block_reduce warp leaders
++    float * w1     = smem + idx_dim + 32;          // dot warp-1 totals bridge [n_idx_h]
++
++    // --- derived rows: rows below the per-stream limit read the precomputed pool vector
++    // --- (already pooled + normed + rotated by the fill op); rows at/above it run the
++    // --- raw pool -> norm -> rope passes (dead/spare + not-yet-filled rows, as before) --
++    const bool derived_row = P != nullptr && b < LIM[n_stream + s];
++    if (derived_row) {
++        // idx_dim (128) < BLOCK (256): threads [0, idx_dim) load one element each
++        if (tid < idx_dim) {
++            vec[tid] = *(const float *) (P + (int64_t) s * nb2P + (int64_t) b * nb1P + (int64_t) tid * nb0P);
++        }
++    } else {
++        // --- pass 1: pool columns (increment-1 arithmetic, strided like rms_norm_f32) ---
++        float tmp = 0.0f;
++        for (int c = tid; c < idx_dim; c += IDX_SCORE_BLOCK) {
++            const float pv = indexer_score_norm_col(Ks, blk_row, c, idx_dim, r, rinv, nb0K, nb1K, ktype);
++            vec[c] = pv;
++            tmp += pv * pv;
++        }
++        __syncthreads();
++
++        const float mean  = block_reduce<block_reduce_method::SUM, IDX_SCORE_BLOCK>(tmp, s_vals) / (float) idx_dim;
++        const float scale = rsqrtf(mean + eps);
++
++        // --- pass 2: normed[c] = scale * pooled[c] * W[c] (rms_norm_f32 mul order) -----
++        for (int c = tid; c < idx_dim; c += IDX_SCORE_BLOCK) {
++            vec[c] = scale * vec[c] * W[c];
++        }
++        __syncthreads();
++
++        // --- pass 3: rope the first n_dims channels (half-pair (j, j+n_dims/2)) --------
++        const int n_pairs = n_dims / 2;
++        if (tid < n_pairs) {
++            const int sect_dims = sect_v0 + sect_v1 + sect_v2 + sect_v3;
++            const int sector    = tid % sect_dims;    // iw/2 = j = tid (n_offs = 0)
++            const int iw        = 2 * tid;
++
++            float theta_base;
++            if (is_imrope) {
++                if (sector % 3 == 1 && sector < 3 * sect_v1) {                       // h
++                    theta_base = (float) p1 * powf(theta_scale, iw / 2.0f);
++                } else if (sector % 3 == 2 && sector < 3 * sect_v2) {                // w
++                    theta_base = (float) p2 * powf(theta_scale, iw / 2.0f);
++                } else if (sector % 3 == 0 && sector < 3 * sect_v0) {                // t
++                    theta_base = (float) p0 * powf(theta_scale, iw / 2.0f);
++                } else {
++                    theta_base = (float) p3 * powf(theta_scale, iw / 2.0f);
++                }
++            } else {
++                if (sector < sect_v0) {
++                    theta_base = (float) p0 * powf(theta_scale, iw / 2.0f);
++                } else if (sector < sect_v0 + sect_v1) {
++                    theta_base = (float) p1 * powf(theta_scale, iw / 2.0f);
++                } else if (sector < sect_v0 + sect_v1 + sect_v2) {
++                    theta_base = (float) p2 * powf(theta_scale, iw / 2.0f);
++                } else {
++                    theta_base = (float) p3 * powf(theta_scale, iw / 2.0f);
++                }
++            }
++
++            float cos_theta;
++            float sin_theta;
++            indexer_score_rope_yarn(theta_base, freq_scale, corr_v0, corr_v1, iw, ext_factor, attn_factor,
++                                    cos_theta, sin_theta);
++
++            const float x0 = vec[tid];
++            const float x1 = vec[tid + n_pairs];
++            vec[tid]                = x0 * cos_theta - x1 * sin_theta;
++            vec[tid + n_pairs]      = x0 * sin_theta + x1 * cos_theta;
++        }
++        __syncthreads();
++    }
++    // the derived row fill is visible to every thread of the block before the dot pass
++    __syncthreads();
++
++    // --- pass 4: per-block dot vs each query head (mmvf F32 vec kernel order) -------
++    // mmvf for ne00 == 128 on wave32: block of 64 threads, lane t owns float2 (2t,2t+1)
++    // of the src0 row, accumulating `acc += v*u` twice; then per-warp xor-tree reduce
++    // and the two 32-lane warp totals added.  Replicate exactly (idx_dim == 128).
++    float psum[8] = {0.0f};
++    if (tid < 64) {
++        // scalar loads (values identical to mmvf's float2 path; no alignment constraint)
++        const float xa = vec[2 * tid];
++        const float xb = vec[2 * tid + 1];
++        for (int h = 0; h < n_idx_h; ++h) {
++            const int64_t qo = (int64_t) h * idx_dim + 2 * tid;
++            float acc = 0.0f;
++            acc += xa * Q[qo];
++            acc += xb * Q[qo + 1];
++            psum[h] = acc;
++        }
++    }
++    __syncthreads();
++
++    // per-warp xor-tree reduce over the 32 lanes holding partials (warps 0 and 1)
++    if (tid < 64) {
++        const int wid = tid / IDX_SCORE_WARP;
++        for (int h = 0; h < n_idx_h; ++h) {
++            float v = psum[h];
++#pragma unroll
++            for (int off = IDX_SCORE_WARP / 2; off > 0; off >>= 1) {
++                v += __shfl_xor_sync(0xffffffff, v, off, IDX_SCORE_WARP);
++            }
++            if (tid % IDX_SCORE_WARP == 0) {
++                if (wid == 1) {
++                    w1[h] = v;                 // warp-1 total -> smem bridge
++                } else {
++                    psum[h] = v;               // warp-0 total stays in lane 0
++                }
++            }
++        }
++    }
++    __syncthreads();
++
++    // --- epilogue on thread 0: total = w0 + w1, relu, head sum in h order, + bias ---
++    if (tid == 0) {
++        float acc = 0.0f;
++        for (int h = 0; h < n_idx_h; ++h) {
++            const float dot = psum[h] + w1[h];
++            const float rv  = fmaxf(dot, 0.0f);
++            acc = (h == 0) ? rv : acc + rv;
++        }
++        acc += B[r0];
++        dst[r0] = acc;
++    }
++}
++
++static void ggml_cuda_indexer_score_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * K   = dst->src[0];
++    const ggml_tensor * BLK = dst->src[1];
++    const ggml_tensor * POS = dst->src[2];
++    const ggml_tensor * Q   = dst->src[3];
++    const ggml_tensor * W   = dst->src[4];
++    const ggml_tensor * B   = dst->src[5];
++
++    const int   r     = ggml_get_op_params_i32(dst, 0);
++    const int   n_dims  = ggml_get_op_params_i32(dst, 1);
++    const int   mode    = ggml_get_op_params_i32(dst, 2);
++    const int   n_ctx_orig = ggml_get_op_params_i32(dst, 3);
++    float freq_base;   memcpy(&freq_base,   (int32_t *) dst->op_params +  4, sizeof(float));
++    float freq_scale;  memcpy(&freq_scale,  (int32_t *) dst->op_params +  5, sizeof(float));
++    float ext_factor;  memcpy(&ext_factor,  (int32_t *) dst->op_params +  6, sizeof(float));
++    float attn_factor; memcpy(&attn_factor, (int32_t *) dst->op_params +  7, sizeof(float));
++    float beta_fast;   memcpy(&beta_fast,   (int32_t *) dst->op_params +  8, sizeof(float));
++    float beta_slow;   memcpy(&beta_slow,   (int32_t *) dst->op_params +  9, sizeof(float));
++    const int sect_v[4] = {
++        ggml_get_op_params_i32(dst, 10),
++        ggml_get_op_params_i32(dst, 11),
++        ggml_get_op_params_i32(dst, 12),
++        ggml_get_op_params_i32(dst, 13),
++    };
++    const float eps = ggml_get_op_params_f32(dst, 14);
++
++    const int idx_dim  = (int) K->ne[0];
++    const int n_kv     = (int) K->ne[1];
++    const int n_stream = (int) K->ne[2];
++    const int n_idx_h  = (int) Q->ne[1];
++
++    GGML_ASSERT(idx_dim == 128);                       // dot geometry assumes 64 float2 pairs
++    GGML_ASSERT(idx_dim < 1024);                       // 256-thread norm block
++    GGML_ASSERT(r > 0);
++    GGML_ASSERT(n_dims <= idx_dim && n_dims % 2 == 0);
++    GGML_ASSERT(B->ne[0] == dst->ne[0]);
++    GGML_ASSERT(mode == GGML_ROPE_TYPE_IMROPE);        // fused path targets the IMROPE model
++    GGML_ASSERT(n_idx_h <= 8);                         // the mmvf F32 oracle's bound
++
++    const int64_t n_cells = BLK->ne[0];
++    GGML_ASSERT(n_cells % r == 0);
++    const int n_blocks = (int) (n_cells / r);
++    GGML_ASSERT(n_blocks == dst->ne[0]);
++    const int nrows = n_blocks * n_stream;
++
++    const int ktype = K->type == GGML_TYPE_F32 ? 0 : (K->type == GGML_TYPE_BF16 ? 1 : 2);
++    GGML_ASSERT((K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_F16) && BLK->type == GGML_TYPE_I32 &&
++                POS->type == GGML_TYPE_I32 && Q->type == GGML_TYPE_F32 && W->type == GGML_TYPE_F32);
++
++    const float theta_scale = powf(freq_base, -2.0f / n_dims);
++    float corr_v[2];
++    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_v);
++
++    // optional derived-cache path: src6 = pool view, src7 = per-stream limit leaf
++    const ggml_tensor * P = dst->src[6];
++    const ggml_tensor * LIM = dst->src[7];
++    if (P != nullptr) {
++        GGML_ASSERT(LIM != nullptr && LIM->type == GGML_TYPE_I32);
++        GGML_ASSERT(P->type == GGML_TYPE_F32);
++        GGML_ASSERT(P->ne[0] == idx_dim && P->ne[1] == n_blocks && P->ne[2] == n_stream);
++        GGML_ASSERT(LIM->ne[0] == 2 * n_stream);
++    }
++
++    cudaStream_t stream = ctx.stream();
++    const dim3 blocks_num(nrows);
++    const size_t smem = (idx_dim + 32 + 32) * sizeof(float);
++    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, dim3(IDX_SCORE_BLOCK, 1, 1), smem, stream};
++    ggml_cuda_kernel_launch(indexer_score_kernel, launch_params,
++        (const char *) K->data, (const int *) BLK->data, (const int32_t *) POS->data,
++        (const float *) Q->data, (const float *) W->data, (const float *) B->data,
++        (float *) dst->data,
++        idx_dim, r, 1.0f / (float) r, n_blocks, n_stream, nrows, n_idx_h, n_dims,
++        mode == GGML_ROPE_TYPE_IMROPE ? 1 : 0,
++        sect_v[0], sect_v[1], sect_v[2], sect_v[3],
++        K->nb[0], K->nb[1], K->nb[2], BLK->nb[1],
++        P != nullptr ? (const char *) P->data : nullptr,
++        P != nullptr ? (const int *) LIM->data : nullptr,
++        P != nullptr ? P->nb[0] : 4, P != nullptr ? P->nb[1] : (int64_t) idx_dim * 4,
++        P != nullptr ? P->nb[2] : 0,
++        ktype, eps, freq_scale, ext_factor, attn_factor, theta_scale, corr_v[0], corr_v[1]);
++}
++
++void ggml_cuda_indexer_score(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    ggml_cuda_indexer_score_impl(ctx, dst);
++}
++
++bool ggml_cuda_indexer_score_supported(int device, const ggml_tensor * dst) {
++    GGML_ASSERT(dst->op == GGML_OP_INDEXER_SCORE);
++    GGML_UNUSED(device);
++    const ggml_tensor * K = dst->src[0];
++    const ggml_tensor * BLK = dst->src[1];
++    const ggml_tensor * POS = dst->src[2];
++    const ggml_tensor * Q = dst->src[3];
++    const ggml_tensor * W = dst->src[4];
++    const ggml_tensor * B = dst->src[5];
++    if (!((K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_F16) && BLK->type == GGML_TYPE_I32 &&
++           POS->type == GGML_TYPE_I32 && Q->type == GGML_TYPE_F32 && W->type == GGML_TYPE_F32 &&
++           B->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32)) {
++        return false;
++    }
++    if (dst->src[6] != nullptr) {
++        const ggml_tensor * P = dst->src[6];
++        const ggml_tensor * LIM = dst->src[7];
++        if (LIM == nullptr || LIM->type != GGML_TYPE_I32 || P->type != GGML_TYPE_F32) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// --------------------------------------------------------------------------------
++// Derived-cache fill: pool + norm + rope ONE kernel over the per-step range of full
++// blocks [from_s, lim_s) and write the normed+rotated vectors into the pool rows.
++// The arithmetic replicates the score kernel's raw pass 1-3 byte-exactly, so a pool
++// row equals what the score would compute from the raw cache (the toggle contract).
++// --------------------------------------------------------------------------------
++
++static __global__ void indexer_fill_kernel(
++        const char   * __restrict__ K,       // raw cache [idx_dim, n_kv, n_stream]
++        const int    * __restrict__ BLK,     // blk_cells [r*n_blocks, n_stream]
++        const int32_t* __restrict__ POS,     // blk_pos [4*nrows]
++        const float  * __restrict__ W,       // norm weights [idx_dim]
++        const int    * __restrict__ RNG,     // range leaf [2*n_stream]: from in [0,ns), lim in [ns,2ns)
++        float        * __restrict__ dst,     // pool view [idx_dim, n_blocks, n_stream]
++        const int    idx_dim,
++        const int    r,
++        const float  rinv,
++        const float  eps,
++        const int    n_blocks,
++        const int    n_stream,
++        const int    nrows,
++        const int    n_dims,
++        const int    is_imrope,
++        const int    sect_v0, const int sect_v1, const int sect_v2, const int sect_v3,
++        const int64_t nb0K, const int64_t nb1K, const int64_t nb2K, const int64_t nb1B,
++        const int64_t nb0D, const int64_t nb1D, const int64_t nb2D,
++        const int    ktype,
++        const float  freq_scale, const float ext_factor, const float attn_factor,
++        const float  theta_scale, const float corr_v0, const float corr_v1) {
++    const int tid = threadIdx.x;
++
++    // grid-stride over the merged (block, stream) rows: the launch grid is capped (see the
++    // impl), so a steady-state decode step (0-1 rows in the range) pays a tiny grid, while a
++    // post-prefill backfill (up to n_kv/r rows) strides through the range in a few iterations
++    for (int r0 = blockIdx.x; r0 < nrows; r0 += gridDim.x) {
++        const int s   = r0 / n_blocks;
++        const int b   = r0 - s * n_blocks;
++
++        const int from = RNG[s];
++        const int lim  = RNG[n_stream + s];
++        if (b < from || b >= lim) {
++            continue;                        // not part of this step's completed range
++        }
++
++    const char  * Ks = K + (int64_t) s * nb2K;
++    const int   * blk_row = (const int *) ((const char *) BLK + (int64_t) s * nb1B) + (int64_t) r * b;
++    const int32_t p0 = POS[r0];
++    const int32_t p1 = POS[r0 + nrows];
++    const int32_t p2 = POS[r0 + 2 * nrows];
++    const int32_t p3 = POS[r0 + 3 * nrows];
++
++    extern __shared__ float smem[];
++    float * vec = smem;                            // pooled then normed/rotated [idx_dim]
++    float * s_vals = smem + idx_dim;               // block_reduce warp leaders
++
++    // pass 1: pool columns (score kernel's raw pass, same strided walk + reduction)
++    float tmp = 0.0f;
++    for (int c = tid; c < idx_dim; c += IDX_SCORE_BLOCK) {
++        const float pv = indexer_score_norm_col(Ks, blk_row, c, idx_dim, r, rinv, nb0K, nb1K, ktype);
++        vec[c] = pv;
++        tmp += pv * pv;
++    }
++    __syncthreads();
++
++    const float mean  = block_reduce<block_reduce_method::SUM, IDX_SCORE_BLOCK>(tmp, s_vals) / (float) idx_dim;
++    const float scale = rsqrtf(mean + eps);
++
++    // pass 2: normed[c] = scale * pooled[c] * W[c]
++    for (int c = tid; c < idx_dim; c += IDX_SCORE_BLOCK) {
++        vec[c] = scale * vec[c] * W[c];
++    }
++    __syncthreads();
++
++    // pass 3: rope the first n_dims channels (score kernel's pass 3, verbatim)
++    const int n_pairs = n_dims / 2;
++    if (tid < n_pairs) {
++        const int sect_dims = sect_v0 + sect_v1 + sect_v2 + sect_v3;
++        const int sector    = tid % sect_dims;
++        const int iw        = 2 * tid;
++
++        float theta_base;
++        if (is_imrope) {
++            if (sector % 3 == 1 && sector < 3 * sect_v1) {                       // h
++                theta_base = (float) p1 * powf(theta_scale, iw / 2.0f);
++            } else if (sector % 3 == 2 && sector < 3 * sect_v2) {                // w
++                theta_base = (float) p2 * powf(theta_scale, iw / 2.0f);
++            } else if (sector % 3 == 0 && sector < 3 * sect_v0) {                // t
++                theta_base = (float) p0 * powf(theta_scale, iw / 2.0f);
++            } else {
++                theta_base = (float) p3 * powf(theta_scale, iw / 2.0f);
++            }
++        } else {
++            if (sector < sect_v0) {
++                theta_base = (float) p0 * powf(theta_scale, iw / 2.0f);
++            } else if (sector < sect_v0 + sect_v1) {
++                theta_base = (float) p1 * powf(theta_scale, iw / 2.0f);
++            } else if (sector < sect_v0 + sect_v1 + sect_v2) {
++                theta_base = (float) p2 * powf(theta_scale, iw / 2.0f);
++            } else {
++                theta_base = (float) p3 * powf(theta_scale, iw / 2.0f);
++            }
++        }
++
++        float cos_theta;
++        float sin_theta;
++        indexer_score_rope_yarn(theta_base, freq_scale, corr_v0, corr_v1, iw, ext_factor, attn_factor,
++                                cos_theta, sin_theta);
++
++        const float x0 = vec[tid];
++        const float x1 = vec[tid + n_pairs];
++        vec[tid]                = x0 * cos_theta - x1 * sin_theta;
++        vec[tid + n_pairs]      = x0 * sin_theta + x1 * cos_theta;
++    }
++    __syncthreads();
++
++    // write the normed+rotated row into the pool buffer (view strides from the caller)
++    float * prow = (float *) ((char *) dst + (int64_t) s * nb2D + (int64_t) b * nb1D);
++    for (int c = tid; c < idx_dim; c += IDX_SCORE_BLOCK) {
++        *(float *) ((char *) prow + (int64_t) c * nb0D) = vec[c];
++    }
++    // the next grid-stride iteration reuses the shared vec: make the writes visible first
++    __syncthreads();
++    }   // end grid-stride loop
++}
++
++static void ggml_cuda_indexer_fill_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * K   = dst->src[0];
++    const ggml_tensor * BLK = dst->src[1];
++    const ggml_tensor * POS = dst->src[2];
++    const ggml_tensor * W   = dst->src[3];
++    const ggml_tensor * RNG = dst->src[4];
++
++    const int   r     = ggml_get_op_params_i32(dst, 0);
++    const int   n_dims  = ggml_get_op_params_i32(dst, 1);
++    const int   mode    = ggml_get_op_params_i32(dst, 2);
++    const int   n_ctx_orig = ggml_get_op_params_i32(dst, 3);
++    float freq_base;   memcpy(&freq_base,   (int32_t *) dst->op_params +  4, sizeof(float));
++    float freq_scale;  memcpy(&freq_scale,  (int32_t *) dst->op_params +  5, sizeof(float));
++    float ext_factor;  memcpy(&ext_factor,  (int32_t *) dst->op_params +  6, sizeof(float));
++    float attn_factor; memcpy(&attn_factor, (int32_t *) dst->op_params +  7, sizeof(float));
++    float beta_fast;   memcpy(&beta_fast,   (int32_t *) dst->op_params +  8, sizeof(float));
++    float beta_slow;   memcpy(&beta_slow,   (int32_t *) dst->op_params +  9, sizeof(float));
++    const int sect_v[4] = {
++        ggml_get_op_params_i32(dst, 10),
++        ggml_get_op_params_i32(dst, 11),
++        ggml_get_op_params_i32(dst, 12),
++        ggml_get_op_params_i32(dst, 13),
++    };
++    const float eps = ggml_get_op_params_f32(dst, 14);
++
++    const int idx_dim  = (int) K->ne[0];
++    const int n_stream = (int) K->ne[2];
++
++    GGML_ASSERT(idx_dim < 1024);                       // 256-thread norm block
++    GGML_ASSERT(r > 0);
++    GGML_ASSERT(n_dims <= idx_dim && n_dims % 2 == 0);
++    GGML_ASSERT(mode == GGML_ROPE_TYPE_IMROPE);        // fused rope path targets the IMROPE model
++    GGML_ASSERT(RNG->type == GGML_TYPE_I32 && RNG->ne[0] == 2 * n_stream);
++
++    const int64_t n_cells = BLK->ne[0];
++    GGML_ASSERT(n_cells % r == 0);
++    const int n_blocks = (int) (n_cells / r);
++    GGML_ASSERT(n_blocks == dst->ne[1]);
++    const int nrows = n_blocks * n_stream;
++
++    const int ktype = K->type == GGML_TYPE_F32 ? 0 : (K->type == GGML_TYPE_BF16 ? 1 : 2);
++    GGML_ASSERT((K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_F16) &&
++                BLK->type == GGML_TYPE_I32 && POS->type == GGML_TYPE_I32 && W->type == GGML_TYPE_F32);
++
++    const float theta_scale = powf(freq_base, -2.0f / n_dims);
++    float corr_v[2];
++    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_v);
++
++    cudaStream_t stream = ctx.stream();
++    // cap the fill grid: steady decode completes <=1 block per step, so the launch must be cheap;
++    // a post-prefill backfill strides through the whole range with the same capped grid
++    const int grid = std::min(nrows, 512);
++    const dim3 blocks_num(grid);
++    const size_t smem = (idx_dim + 32) * sizeof(float);
++    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, dim3(IDX_SCORE_BLOCK, 1, 1), smem, stream};
++    ggml_cuda_kernel_launch(indexer_fill_kernel, launch_params,
++        (const char *) K->data, (const int *) BLK->data, (const int32_t *) POS->data,
++        (const float *) W->data, (const int *) RNG->data, (float *) dst->data,
++        idx_dim, r, 1.0f / (float) r, eps, n_blocks, n_stream, nrows, n_dims,
++        mode == GGML_ROPE_TYPE_IMROPE ? 1 : 0,
++        sect_v[0], sect_v[1], sect_v[2], sect_v[3],
++        K->nb[0], K->nb[1], K->nb[2], BLK->nb[1],
++        dst->nb[0], dst->nb[1], dst->nb[2],
++        ktype, freq_scale, ext_factor, attn_factor, theta_scale, corr_v[0], corr_v[1]);
++}
++
++void ggml_cuda_indexer_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    ggml_cuda_indexer_fill_impl(ctx, dst);
++}
++
++bool ggml_cuda_indexer_fill_supported(int device, const ggml_tensor * dst) {
++    GGML_ASSERT(dst->op == GGML_OP_INDEXER_FILL);
++    GGML_UNUSED(device);
++    const ggml_tensor * K   = dst->src[0];
++    const ggml_tensor * BLK = dst->src[1];
++    const ggml_tensor * POS = dst->src[2];
++    const ggml_tensor * W   = dst->src[3];
++    const ggml_tensor * RNG = dst->src[4];
++    return (K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_F16) && BLK->type == GGML_TYPE_I32 &&
++           POS->type == GGML_TYPE_I32 && W->type == GGML_TYPE_F32 && RNG->type == GGML_TYPE_I32 &&
++           dst->type == GGML_TYPE_F32;
++}
+diff --git a/ggml/src/ggml-cuda/indexer-score.cuh b/ggml/src/ggml-cuda/indexer-score.cuh
+new file mode 100644
+index 000000000..6bb680f8e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/indexer-score.cuh
+@@ -0,0 +1,10 @@
++#pragma once
++
++#include "ggml.h"
++#include "ggml-backend-impl.h"
++#include "ggml-cuda/common.cuh"
++
++void ggml_cuda_indexer_score(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++bool ggml_cuda_indexer_score_supported(int device, const ggml_tensor * dst);
++void ggml_cuda_indexer_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++bool ggml_cuda_indexer_fill_supported(int device, const ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
 new file mode 100644
-index 000000000..b15af7104
+index 000000000..93323641b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/indexer-topk.cu
-@@ -0,0 +1,376 @@
+@@ -0,0 +1,545 @@
 +#include "indexer-topk.cuh"
 +#include "common.cuh"
 +
@@ -3633,13 +4540,6 @@ index 000000000..b15af7104
 +    int equal_count;
 +};
 +
-+static __global__ void indexer_topk_radix_init(indexer_topk_radix_state * states, int nrows, int k) {
-+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-+    if (row < nrows) {
-+        states[row] = {0, 0, k, 0, 0};
-+    }
-+}
-+
 +// value(c) for row r: score[cell_blk(c, s), t, s] + additive(c, t, s)
 +template<typename kv_t>
 +static __device__ __forceinline__ float indexer_topk_value(
@@ -3662,7 +4562,8 @@ index 000000000..b15af7104
 +        int * __restrict__ block_histograms,
 +        int ncols, int n_tps, int n_blocks, int n_kv,
 +        int blocks_per_row,
-+        int shift) {
++        int shift,
++        int first) {
 +    constexpr int NBINS = 1 << RADIX_BITS;
 +
 +    const int row = blockIdx.x / blocks_per_row;
@@ -3677,13 +4578,20 @@ index 000000000..b15af7104
 +    }
 +    __syncthreads();
 +
-+    const indexer_topk_radix_state state = states[row];
++    // the first pass (first != 0) has no prefix yet: the state write is folded into the
++    // pass-1 select, so pass-1 histogramming must not read the (uninitialized) state
++    uint32_t prefix = 0, prefix_mask = 0;
++    if (first == 0) {
++        const indexer_topk_radix_state state = states[row];
++        prefix = state.prefix;
++        prefix_mask = state.prefix_mask;
++    }
 +    for (int col = row_block * BLOCK_SIZE + tid;
 +         col < ncols;
 +         col += blocks_per_row * BLOCK_SIZE) {
 +        const uint32_t key = indexer_topk_float_to_ordered(
 +                indexer_topk_value(score, cell_blk, additive, col, t, s, n_blocks, n_tps, n_kv));
-+        if ((key & state.prefix_mask) == state.prefix) {
++        if ((key & prefix_mask) == prefix) {
 +            atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
 +        }
 +    }
@@ -3691,7 +4599,9 @@ index 000000000..b15af7104
 +
 +    const size_t histogram_offset =
 +        ((size_t) row * blocks_per_row + row_block) * NBINS;
-+    block_histograms[histogram_offset + tid] = histogram[tid];
++    for (int i = tid; i < NBINS; i += BLOCK_SIZE) {
++        block_histograms[histogram_offset + i] = histogram[i];
++    }
 +}
 +
 +template<int BLOCK_SIZE, int RADIX_BITS>
@@ -3699,7 +4609,9 @@ index 000000000..b15af7104
 +        const int * __restrict__ block_histograms,
 +        indexer_topk_radix_state * __restrict__ states,
 +        int blocks_per_row,
-+        int shift) {
++        int shift,
++        int first,
++        int k) {
 +    constexpr int NBINS = 1 << RADIX_BITS;
 +
 +    const int row = blockIdx.x;
@@ -3718,7 +4630,10 @@ index 000000000..b15af7104
 +    __syncthreads();
 +
 +    if (tid == 0) {
-+        indexer_topk_radix_state state = states[row];
++        // the first pass writes the state fresh (rank starts at k): the radix_init
++        // launch this replaces is gone, and pass-1 histogramming never reads it
++        indexer_topk_radix_state state = first ?
++            indexer_topk_radix_state{0, 0, k, 0, 0} : states[row];
 +        int bin = NBINS - 1;
 +        while (bin > 0 && histogram[bin] < state.rank) {
 +            state.rank -= histogram[bin--];
@@ -3871,35 +4786,17 @@ index 000000000..b15af7104
 +    }
 +}
 +
++// deterministic gather (shared by the radix and the two-round select paths): the
++// states' prefix (full 32-bit boundary key) + rank decide, per cell, whether it is
++// greater (placed first, ascending) or equal-boundary (rank of them placed last).
 +template<typename kv_t>
-+static void indexer_topk_radix_cuda(
++static void indexer_topk_gather_cuda(
 +        ggml_cuda_pool & pool,
 +        const float * score, const int * cell_blk, const kv_t * additive,
-+        int * dst, int ncols, int nrows, int n_tps, int n_blocks, int n_kv, int k,
++        int * dst, const indexer_topk_radix_state * states,
++        int ncols, int nrows, int n_tps, int n_blocks, int n_kv, int k,
 +        cudaStream_t stream) {
 +    constexpr int BLOCK_SIZE = 256;
-+    constexpr int RADIX_BITS = 8;
-+    constexpr int NBINS = 1 << RADIX_BITS;
-+    const int blocks_per_row = std::min((ncols + 1023) / 1024, 8);
-+
-+    ggml_cuda_pool_alloc<indexer_topk_radix_state> states_alloc(pool, nrows);
-+    ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
-+    indexer_topk_radix_state * states = states_alloc.get();
-+    int * histograms = histograms_alloc.get();
-+
-+    indexer_topk_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows, k);
-+
-+    const dim3 row_grid(blocks_per_row * nrows);
-+    for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
-+        indexer_topk_radix_histogram<BLOCK_SIZE, RADIX_BITS, kv_t>
-+            <<<row_grid, BLOCK_SIZE, 0, stream>>>(
-+                score, cell_blk, additive, states, histograms,
-+                ncols, n_tps, n_blocks, n_kv, blocks_per_row, shift);
-+        indexer_topk_radix_select<BLOCK_SIZE, RADIX_BITS>
-+            <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
-+    }
-+
-+    // deterministic gather: ascending column order, no atomics (see kernels above)
 +    if (k <= 0 || nrows == 0) {
 +        return;
 +    }
@@ -3921,6 +4818,170 @@ index 000000000..b15af7104
 +    indexer_topk_deterministic_write<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
 +            score, cell_blk, additive, states, g_base, e_base, dst,
 +            ncols, n_tps, n_blocks, n_kv, k, cbpr);
++}
++
++template<typename kv_t>
++static void indexer_topk_radix_cuda(
++        ggml_cuda_pool & pool,
++        const float * score, const int * cell_blk, const kv_t * additive,
++        int * dst, int ncols, int nrows, int n_tps, int n_blocks, int n_kv, int k,
++        cudaStream_t stream) {
++    constexpr int BLOCK_SIZE = 256;
++    const int blocks_per_row = std::min((ncols + 1023) / 1024, 8);
++
++    // NBINS = largest radix pass (8 bits): block_histograms is sized for it
++    ggml_cuda_pool_alloc<indexer_topk_radix_state> states_alloc(pool, nrows);
++    ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * (1 << 8));
++    indexer_topk_radix_state * states = states_alloc.get();
++    int * histograms = histograms_alloc.get();
++
++    // radix select over the full 32-bit ordered key.  Wider passes (12-bit first pass)
++    // regressed ~2.8%: the 16x histogram smem/global traffic per block swamped the saved
++    // launches, so the passes stay 8-bit.  The init launch is folded into the pass-1 select
++    // (first=1): the pass-1 histogram must not read the state.
++    const dim3 row_grid(blocks_per_row * nrows);
++    for (int shift = 32 - 8, p = 0; shift >= 0; shift -= 8, ++p) {
++        indexer_topk_radix_histogram<BLOCK_SIZE, 8, kv_t>
++            <<<row_grid, BLOCK_SIZE, 0, stream>>>(
++                score, cell_blk, additive, states, histograms,
++                ncols, n_tps, n_blocks, n_kv, blocks_per_row, shift, p == 0 ? 1 : 0);
++        indexer_topk_radix_select<BLOCK_SIZE, 8>
++            <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift, p == 0 ? 1 : 0, k);
++    }
++
++    indexer_topk_gather_cuda(pool, score, cell_blk, additive, dst, states,
++            ncols, nrows, n_tps, n_blocks, n_kv, k, stream);
++}
++
++// ---------------------------------------------------------------------------
++// two-round 16-bit selection (small-nrows path: decode/speculative-verify).
++//
++// The decode's per-layer chain is latency-bound: the topk's 11 dependent kernels
++// (init + 4x(hist+select) + count + scan + write) sit serially on the critical
++// path.  Resolve the full 32-bit boundary prefix with ONE wide top-16 histogram
++// round and ONE low-16 round over the boundary bucket instead: hist -> select ->
++// hist -> select, then the shared deterministic gather.  Per-row bins are 2^16
++// ints in the pool (zeroed by one memset; the round-1 select re-zeroes them for
++// round 2 on its way out, and the round-2 select for the next op).  The emitted
++// cell list is identical to the radix path (same prefix, rank and tie rule).
++// ---------------------------------------------------------------------------
++
++template<typename kv_t>
++static __global__ void indexer_topk_hist16(
++        const float * __restrict__ score,
++        const int   * __restrict__ cell_blk,
++        const kv_t  * __restrict__ additive,
++        const indexer_topk_radix_state * __restrict__ states,
++        int * __restrict__ bins,               // [nrows][65536], zeroed before launch
++        int ncols, int n_tps, int n_blocks, int n_kv,
++        int blocks_per_row,
++        int first16) {                         // 1: top half; 0: low half of the bucket
++    constexpr int BLOCK_SIZE = 256;
++    const int row = blockIdx.x / blocks_per_row;
++    const int rb  = blockIdx.x % blocks_per_row;
++    const int tid = threadIdx.x;
++    const int t = row % n_tps;
++    const int s = row / n_tps;
++    int * row_bins = bins + (size_t) row * 65536;
++    const uint32_t hi_filter = first16 ? 0 : (states[row].prefix >> 16);
++    for (int col = rb * BLOCK_SIZE + tid;
++         col < ncols;
++         col += blocks_per_row * BLOCK_SIZE) {
++        const uint32_t key = indexer_topk_float_to_ordered(
++                indexer_topk_value(score, cell_blk, additive, col, t, s, n_blocks, n_tps, n_kv));
++        if (first16) {
++            atomicAdd(&row_bins[key >> 16], 1);
++        } else if ((key >> 16) == hi_filter) {
++            atomicAdd(&row_bins[key & 0xFFFF], 1);
++        }
++    }
++}
++
++// mode 0 (round 1): bins hold the top-16 histogram.  Finds the boundary bucket and the
++// cells still needed within it, writes states.prefix = B1 << 16 (the round-2 filter)
++// and states.rank, then zeroes the bins for round 2.
++// mode 1 (round 2): bins hold the low-16 histogram of the boundary bucket.  Finds the
++// exact boundary bin, writes the full 32-bit prefix and the final rank, then zeroes.
++static __global__ void indexer_topk_select16(
++        int * __restrict__ bins,
++        indexer_topk_radix_state * __restrict__ states,
++        int nrows, int k, int mode) {
++    constexpr int BLOCK_SIZE = 256;
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++    int * const rb = bins + (size_t) row * 65536;
++    int * const chunk = rb + tid * 256;
++    __shared__ int chunk_sum[BLOCK_SIZE];
++
++    // per-thread sum of its contiguous 256-bin chunk (bins kept for the walk below)
++    int sum = 0;
++    for (int j = 0; j < 256; ++j) {
++        sum += chunk[j];
++    }
++    chunk_sum[tid] = sum;
++    __syncthreads();
++
++    if (tid == 0) {
++        int need = mode == 0 ? k : states[row].rank;
++        int cum = 0;
++        int c = BLOCK_SIZE - 1;
++        while (c >= 0 && cum + chunk_sum[c] < need) {
++            cum += chunk_sum[c];
++            --c;
++        }
++        const int * bc = rb + c * 256;
++        int b = 255;
++        while (b >= 0 && cum + bc[b] < need) {
++            cum += bc[b];
++            --b;
++        }
++        indexer_topk_radix_state st = states[row];
++        if (mode == 0) {
++            st.prefix = (uint32_t) (c * 256 + b) << 16;
++        } else {
++            st.prefix = (st.prefix & 0xFFFF0000u) | (uint32_t) (c * 256 + b);
++        }
++        st.rank = need - cum;
++        states[row] = st;
++    }
++    __syncthreads();
++
++    // leave the bins zeroed for the next round / the next op (no second memset)
++    for (int j = 0; j < 256; ++j) {
++        chunk[j] = 0;
++    }
++}
++
++template<typename kv_t>
++static void indexer_topk_round2_cuda(
++        ggml_cuda_pool & pool,
++        const float * score, const int * cell_blk, const kv_t * additive,
++        int * dst, int ncols, int nrows, int n_tps, int n_blocks, int n_kv, int k,
++        cudaStream_t stream) {
++    constexpr int BLOCK_SIZE = 256;
++    const int blocks_per_row = std::min((ncols + 1023) / 1024, 8);
++
++    ggml_cuda_pool_alloc<indexer_topk_radix_state> states_alloc(pool, nrows);
++    ggml_cuda_pool_alloc<int> bins_alloc(pool, (size_t) nrows * 65536);
++    indexer_topk_radix_state * states = states_alloc.get();
++    int * bins = bins_alloc.get();
++
++    GGML_ASSERT(cudaMemsetAsync(bins, 0, (size_t) nrows * 65536 * sizeof(int), stream) == cudaSuccess);
++
++    const dim3 hgrid(blocks_per_row * nrows);
++    // round 1: top 16 bits -> boundary bucket B1 (states.prefix = B1 << 16, rank = need)
++    indexer_topk_hist16<kv_t><<<hgrid, BLOCK_SIZE, 0, stream>>>(
++            score, cell_blk, additive, states, bins,
++            ncols, n_tps, n_blocks, n_kv, blocks_per_row, 1);
++    indexer_topk_select16<<<nrows, BLOCK_SIZE, 0, stream>>>(bins, states, nrows, k, 0);
++    // round 2: low 16 bits of the B1 bucket -> exact boundary key + final rank
++    indexer_topk_hist16<kv_t><<<hgrid, BLOCK_SIZE, 0, stream>>>(
++            score, cell_blk, additive, states, bins,
++            ncols, n_tps, n_blocks, n_kv, blocks_per_row, 0);
++    indexer_topk_select16<<<nrows, BLOCK_SIZE, 0, stream>>>(bins, states, nrows, k, 1);
++
++    indexer_topk_gather_cuda(pool, score, cell_blk, additive, dst, states,
++            ncols, nrows, n_tps, n_blocks, n_kv, k, stream);
 +}
 +
 +void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -3949,12 +5010,27 @@ index 000000000..b15af7104
 +    const int k        = dst->ne[0];
 +    ggml_cuda_pool & pool = ctx.pool();
 +
++    // the two-round select needs per-row 2^16-int bins (256 KB/row); gate it to the
++    // small-nrows decode / speculative-verify cases (nrows <= 8 -> <= 2 MB) and keep the
++    // 8-bit radix for large-batch prefill where per-row bins would blow the pool up.
++    const bool use_round2 = nrows > 0 && nrows <= 8;
++
 +    if (additive->type == GGML_TYPE_F16) {
-+        indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const half *) additive->data,
-+                dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++        if (use_round2) {
++            indexer_topk_round2_cuda(pool, score_d, cell_blk_d, (const half *) additive->data,
++                    dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++        } else {
++            indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const half *) additive->data,
++                    dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++        }
 +    } else {
-+        indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const float *) additive->data,
-+                dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++        if (use_round2) {
++            indexer_topk_round2_cuda(pool, score_d, cell_blk_d, (const float *) additive->data,
++                    dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++        } else {
++            indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const float *) additive->data,
++                    dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++        }
 +    }
 +}
 +
@@ -4377,50 +5453,62 @@ index 000000000..c90460a45
 +    return true;
 +}
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 6257cdbe5..b81baf960 100644
+index 6257cdbe5..0d27e5adf 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -1084,6 +1084,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1084,6 +1084,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "DSV4_HC_COMB",
      "DSV4_HC_PRE",
      "DSV4_HC_POST",
 +    "FLASH_ATTN_QSA",
 +    "INDEXER_TOPK",
++    "INDEXER_POOL",
++    "INDEXER_SCORE",
 +    "HC_MIX",
 +    "HC_COMBINE",
  
      "UNARY",
  
-@@ -1101,7 +1105,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+@@ -1101,7 +1107,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
      "GLU",
  };
  
 -static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
-+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
++static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1199,6 +1203,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1155,6 +1161,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "diag_mask_zero(x)",
+     "soft_max(x)",
+     "soft_max_back(x)",
++    "indexer_score(k, blk, pos, q, w, bias)",
+     "rope(x)",
+     "rope_back(x)",
+     "clamp(x)",
+@@ -1199,6 +1206,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "dsv4_hc_comb(mixes, scale, base)",
      "dsv4_hc_pre(x, weights)",
      "dsv4_hc_post(x, residual, post, comb)",
 +    "flash_attn_qsa(q, k, v, idx, mask)",
 +    "indexer_topk(q, k, weights, mask)",
++    "indexer_pool(k, blk_cells, w)",
++    "indexer_fill(k, blk, pos, w, rng, pool)",
 +    "hc_mix(x, w_norm, w_down, w_up)",
 +    "hc_combine(residual, x, inject)",
  
      "unary(x)",
  
-@@ -1216,7 +1224,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+@@ -1216,7 +1229,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "glu(x)",
  };
  
 -static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
-+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
++static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT != 108");
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -5532,6 +5540,102 @@ void ggml_flash_attn_ext_add_sinks(
+@@ -5532,6 +5545,283 @@ void ggml_flash_attn_ext_add_sinks(
      a->src[4] = sinks;
  }
  
@@ -4520,10 +5608,191 @@ index 6257cdbe5..b81baf960 100644
 +    return result;
 +}
 +
++// ggml_indexer_pool
++
++struct ggml_tensor * ggml_indexer_pool(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * blk_cells,
++        struct ggml_tensor  * w,
++        int                   r,
++        float                 eps) {
++    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_F16);
++    GGML_ASSERT(blk_cells->type == GGML_TYPE_I32);
++    GGML_ASSERT(w->type        == GGML_TYPE_F32);
++    GGML_ASSERT(blk_cells->ne[0] % r == 0);
++    GGML_ASSERT(k->ne[0] == w->ne[0]);
++
++    const int64_t n_blocks = blk_cells->ne[0] / r;
++
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k->ne[0], n_blocks * k->ne[2], 1);
++
++    result->op     = GGML_OP_INDEXER_POOL;
++    result->src[0] = k;
++    result->src[1] = blk_cells;
++    result->src[2] = w;
++    ggml_set_op_params_i32(result, 0, r);
++    ggml_set_op_params_f32(result, 1, eps);
++
++    return result;
++}
++
++// ggml_indexer_score
++
++struct ggml_tensor * ggml_indexer_score(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * blk_cells,
++        struct ggml_tensor  * blk_pos,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * w,
++        struct ggml_tensor  * bias,
++        int                   r,
++        float                 eps,
++        int                   n_dims,
++        const int           * sections,
++        int                   mode,
++        int                   n_ctx_orig,
++        float                 freq_base,
++        float                 freq_scale,
++        float                 ext_factor,
++        float                 attn_factor,
++        float                 beta_fast,
++        float                 beta_slow,
++        struct ggml_tensor  * pool,
++        struct ggml_tensor  * rng) {
++    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_F16);
++    GGML_ASSERT(blk_cells->type == GGML_TYPE_I32);
++    GGML_ASSERT(blk_pos->type  == GGML_TYPE_I32);
++    GGML_ASSERT(q->type        == GGML_TYPE_F32);
++    GGML_ASSERT(w->type        == GGML_TYPE_F32);
++    GGML_ASSERT(bias->type     == GGML_TYPE_F32);
++    GGML_ASSERT(blk_cells->ne[0] % r == 0);
++    GGML_ASSERT(k->ne[0] == w->ne[0]);
++    GGML_ASSERT(q->ne[0] == k->ne[0]);
++    GGML_ASSERT(n_dims <= k->ne[0] && n_dims % 2 == 0);
++    GGML_ASSERT(mode == GGML_ROPE_TYPE_IMROPE);   // the fused kernel's rope path
++    GGML_ASSERT(blk_pos->ne[0] == 4 * (blk_cells->ne[0] / r) * k->ne[2]);
++    GGML_ASSERT(bias->ne[0] == blk_cells->ne[0] / r);
++    GGML_ASSERT(q->ne[1] <= 8);                   // mmvf F32 oracle bound
++    GGML_ASSERT(q->ne[2] == k->ne[2]);
++    // derived-cache path: both or neither; the pool must match the block geometry and the
++    // range leaf must carry 2*n_stream per-stream limits
++    GGML_ASSERT((pool == NULL) == (rng == NULL));
++    if (pool != NULL) {
++        GGML_ASSERT(pool->type == GGML_TYPE_F32);
++        GGML_ASSERT(pool->ne[0] == k->ne[0] && pool->ne[1] == blk_cells->ne[0] / r && pool->ne[2] == k->ne[2]);
++        GGML_ASSERT(rng->type == GGML_TYPE_I32 && rng->ne[0] == 2 * k->ne[2]);
++    }
++
++    const int64_t n_blocks = blk_cells->ne[0] / r;
++
++    // the fused path is decode-only (n_tokens == 1 -> n_tps == 1); ne[1] is the token-per-stream count
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, 1, k->ne[2]);
++
++    result->op     = GGML_OP_INDEXER_SCORE;
++    result->src[0] = k;
++    result->src[1] = blk_cells;
++    result->src[2] = blk_pos;
++    result->src[3] = q;
++    result->src[4] = w;
++    result->src[5] = bias;
++    if (pool != NULL) {
++        result->src[6] = pool;
++        result->src[7] = rng;
++    }
++    ggml_set_op_params_i32(result, 0, r);
++    ggml_set_op_params_i32(result, 1, n_dims);
++    ggml_set_op_params_i32(result, 2, mode);
++    ggml_set_op_params_i32(result, 3, n_ctx_orig);
++    ggml_set_op_params_f32(result,  4, freq_base);
++    ggml_set_op_params_f32(result,  5, freq_scale);
++    ggml_set_op_params_f32(result,  6, ext_factor);
++    ggml_set_op_params_f32(result,  7, attn_factor);
++    ggml_set_op_params_f32(result,  8, beta_fast);
++    ggml_set_op_params_f32(result,  9, beta_slow);
++    ggml_set_op_params_i32(result, 10, sections[0]);
++    ggml_set_op_params_i32(result, 11, sections[1]);
++    ggml_set_op_params_i32(result, 12, sections[2]);
++    ggml_set_op_params_i32(result, 13, sections[3]);
++    ggml_set_op_params_f32(result, 14, eps);
++
++    return result;
++}
++
++// ggml_indexer_fill
++
++struct ggml_tensor * ggml_indexer_fill(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * blk_cells,
++        struct ggml_tensor  * blk_pos,
++        struct ggml_tensor  * w,
++        struct ggml_tensor  * rng,
++        struct ggml_tensor  * pool,
++        int                   r,
++        float                 eps,
++        int                   n_dims,
++        const int           * sections,
++        int                   mode,
++        int                   n_ctx_orig,
++        float                 freq_base,
++        float                 freq_scale,
++        float                 ext_factor,
++        float                 attn_factor,
++        float                 beta_fast,
++        float                 beta_slow) {
++    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_F16);
++    GGML_ASSERT(blk_cells->type == GGML_TYPE_I32);
++    GGML_ASSERT(blk_pos->type  == GGML_TYPE_I32);
++    GGML_ASSERT(w->type        == GGML_TYPE_F32);
++    GGML_ASSERT(rng->type      == GGML_TYPE_I32);
++    GGML_ASSERT(pool->type     == GGML_TYPE_F32);
++    GGML_ASSERT(blk_cells->ne[0] % r == 0);
++    GGML_ASSERT(k->ne[0] == w->ne[0]);
++    GGML_ASSERT(n_dims <= k->ne[0] && n_dims % 2 == 0);
++    GGML_ASSERT(mode == GGML_ROPE_TYPE_IMROPE);   // the fused kernel's rope path
++    GGML_ASSERT(blk_pos->ne[0] == 4 * (blk_cells->ne[0] / r) * k->ne[2]);
++    GGML_ASSERT(rng->ne[0] == 2 * k->ne[2]);      // [from_s..., lim_s...]
++    GGML_ASSERT(pool->ne[0] == k->ne[0] && pool->ne[2] == k->ne[2]);
++    GGML_ASSERT(pool->ne[1] == blk_cells->ne[0] / r);
++
++    const int64_t n_blocks = blk_cells->ne[0] / r;
++
++    // write through a view of the caller's pool buffer (the derived-cache rows)
++    struct ggml_tensor * result = ggml_view_tensor(ctx, pool);
++    ggml_format_name(result, "%s (indexer_fill)", pool->name);
++
++    result->op     = GGML_OP_INDEXER_FILL;
++    result->src[0] = k;
++    result->src[1] = blk_cells;
++    result->src[2] = blk_pos;
++    result->src[3] = w;
++    result->src[4] = rng;
++    result->src[5] = pool;
++    ggml_set_op_params_i32(result, 0, r);
++    ggml_set_op_params_i32(result, 1, n_dims);
++    ggml_set_op_params_i32(result, 2, mode);
++    ggml_set_op_params_i32(result, 3, n_ctx_orig);
++    ggml_set_op_params_f32(result,  4, freq_base);
++    ggml_set_op_params_f32(result,  5, freq_scale);
++    ggml_set_op_params_f32(result,  6, ext_factor);
++    ggml_set_op_params_f32(result,  7, attn_factor);
++    ggml_set_op_params_f32(result,  8, beta_fast);
++    ggml_set_op_params_f32(result,  9, beta_slow);
++    ggml_set_op_params_i32(result, 10, sections[0]);
++    ggml_set_op_params_i32(result, 11, sections[1]);
++    ggml_set_op_params_i32(result, 12, sections[2]);
++    ggml_set_op_params_i32(result, 13, sections[3]);
++    ggml_set_op_params_f32(result, 14, eps);
++
++    return result;
++}
++
  // ggml_flash_attn_back
  
  struct ggml_tensor * ggml_flash_attn_back(
-@@ -6529,6 +6633,87 @@ struct ggml_tensor * ggml_dsv4_hc_post(
+@@ -6529,6 +6819,87 @@ struct ggml_tensor * ggml_dsv4_hc_post(
      return result;
  }
  
@@ -5413,6 +6682,371 @@ index 000000000..bff603a21
 +    // stats
 +    std::atomic<uint64_t>  n_hits{0}, n_misses{0}, n_bytes_read{0};
 +};
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index 93b468784..2f5f64ea6 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -61,7 +61,146 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+             kv_size, n_seq_max, n_pad, n_swa, swa_type,
+             nullptr, filter_idx, nullptr, nullptr, "idx_");
+-    }()) {}
++    }()) {
++    // incremental block-vector cache (env-gated, default OFF; decode waste fix)
++    const char * env_cache = getenv("GGML_CUDA_QSA_INDEXER_CACHE");
++    derived_enabled = env_cache != nullptr && std::atoi(env_cache) != 0;
++
++    if (mem_idx) {
++        pool_create(model, filter_idx);
++    }
++}
++
++void llama_memory_hybrid_idx::pool_create(
++        const llama_model & model,
++        const layer_filter_cb & filter_idx) {
++    const llama_hparams & hparams = model.hparams;
++
++    if (hparams.indexer_head_size == 0) {
++        // no QSA geometry (should not happen when the indexer cache exists)
++        return;
++    }
++
++    // guard on ANY indexer layer carrying a ratio: the QSA ratio starts above layer 0
++    bool any_ratio = false;
++    for (uint32_t il = 0; il < hparams.n_layer_all && !any_ratio; ++il) {
++        if (filter_idx && filter_idx(il) && hparams.dsv4_compress_ratios[il] > 0) {
++            any_ratio = true;
++        }
++    }
++    if (!any_ratio) {
++        return;
++    }
++
++    const uint32_t idx_dim  = hparams.indexer_head_size;
++    const uint32_t kv_size  = mem_idx->get_size();
++    const uint32_t n_stream = mem_idx->get_n_stream();
++    const uint32_t n_layer  = hparams.n_layer_all;
++
++    struct ggml_backend_buft_comparator {
++        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
++            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
++        }
++    };
++    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
++
++    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
++        auto it = ctx_map.find(buft);
++        if (it == ctx_map.end()) {
++            ggml_init_params params = {
++                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
++                /*.mem_buffer =*/ NULL,
++                /*.no_alloc   =*/ true,
++            };
++            ggml_context * ctx = ggml_init(params);
++            if (ctx == nullptr) {
++                throw std::runtime_error("failed to create ggml context for the derived indexer cache");
++            }
++            ctx_map.emplace(buft, ggml_context_ptr(ctx));
++            return ctx;
++        }
++        return it->second.get();
++    };
++
++    for (uint32_t il = 0; il < n_layer; ++il) {
++        if (!filter_idx || !filter_idx(il)) {
++            continue;
++        }
++
++        const uint32_t ratio = hparams.dsv4_compress_ratios[il];
++        if (ratio == 0) {
++            continue;
++        }
++
++        ggml_backend_dev_t dev = model.dev_layer((int) il);
++        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
++        ggml_context * ctx = ctx_for_buft(buft);
++
++        const uint32_t n_blocks = (kv_size + ratio - 1)/ratio;
++        ggml_tensor * pool = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, idx_dim, n_blocks, n_stream);
++        ggml_format_name(pool, "cache_idx_pool_l%u", il);
++
++        pool_layers.push_back({ il, ratio, pool });
++    }
++
++    // allocate the per-buft contexts and clear the buffers (no NaNs in the padding)
++    for (auto & [buft, ctx] : ctx_map) {
++        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
++        if (!buf) {
++            throw std::runtime_error("failed to allocate buffer for the derived indexer cache");
++        }
++        ggml_backend_buffer_clear(buf, 0);
++        pool_ctxs.push_back(std::move(ctx));
++        pool_bufs.emplace_back(buf);
++    }
++
++    // one watermark per (pool layer, stream); layers sharing a ratio share the cell occupancy so
++    // their watermarks advance together (qsa_derived_limits writes the whole ratio group)
++    pool_wm.assign(pool_layers.size() * n_stream, 0);
++
++    LLAMA_LOG_INFO("%s: derived indexer cache (pool) = %zu layers x %u dims x %u streams, %s\n", __func__,
++            pool_layers.size(), idx_dim, n_stream, derived_enabled ? "ENABLED" : "disabled");
++}
++
++void llama_memory_hybrid_idx::pool_invalidate_all() {
++    // rows above the watermark are never read, so dropping it to zero IS the invalidation
++    std::fill(pool_wm.begin(), pool_wm.end(), 0);
++}
++
++ggml_tensor * llama_memory_hybrid_idx::get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks) const {
++    for (const auto & pl : pool_layers) {
++        if ((int32_t) pl.il == il) {
++            GGML_ASSERT(n_blocks <= pl.pool->ne[1]);
++            return ggml_view_3d(ctx, pl.pool,
++                    pl.pool->ne[0], n_blocks, pl.pool->ne[2],
++                    pl.pool->nb[1], pl.pool->nb[2], 0);
++        }
++    }
++    return nullptr;
++}
++
++void llama_memory_hybrid_idx::qsa_derived_limits(
++        int32_t * dst_fill_from, int32_t * dst_limit, int n_stream, uint32_t ratio,
++        const uint32_t * n_bid, bool advance) const {
++    // the indexer cells are shared across the layers, so n_bid per stream is the same for every
++    // pool layer of this ratio group; write + advance the whole group's watermarks together
++    for (size_t i = 0; i < pool_layers.size(); ++i) {
++        if (pool_layers[i].ratio != ratio) {
++            continue;
++        }
++        for (int s = 0; s < n_stream; ++s) {
++            // without advance the fill op does not run, so the score must not read the pool
++            const uint32_t lim = advance ? n_bid[s] : 0;  // full blocks this step (host grouping)
++            const uint32_t from = advance ? pool_wm[i*n_stream + s] : 0;
++            dst_fill_from[s] = (int32_t) std::min(from, lim);
++            dst_limit[s]     = (int32_t) lim;
++            if (advance) {
++                // the fill op of this step writes [from, lim), so the watermark follows to lim
++                pool_wm[i*n_stream + s] = lim;
++            }
++        }
++    }
++}
+ 
+ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
+@@ -142,6 +281,9 @@ void llama_memory_hybrid_idx::clear(bool data) {
+     if (mem_idx) {
+         mem_idx->clear(data);
+     }
++
++    // the derived vectors derive from the raw cells, so any cache mutation invalidates them
++    pool_invalidate_all();
+ }
+ 
+ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -154,6 +296,9 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
+         mem_idx->seq_rm(seq_id, p0, p1);
+     }
+ 
++    // the raw cells of the removed range are gone, so the derived rows over them are stale
++    pool_invalidate_all();
++
+     return get_mem_attn()->seq_rm(seq_id, p0, p1);
+ }
+ 
+@@ -163,6 +308,8 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
+     if (mem_idx) {
+         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+     }
++
++    pool_invalidate_all();
+ }
+ 
+ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
+@@ -171,6 +318,8 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
+     if (mem_idx) {
+         mem_idx->seq_keep(seq_id);
+     }
++
++    pool_invalidate_all();
+ }
+ 
+ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+@@ -179,6 +328,8 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
+     if (mem_idx) {
+         mem_idx->seq_add(seq_id, p0, p1, shift);
+     }
++
++    pool_invalidate_all();
+ }
+ 
+ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+@@ -187,6 +338,8 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
+     if (mem_idx) {
+         mem_idx->seq_div(seq_id, p0, p1, d);
+     }
++
++    pool_invalidate_all();
+ }
+ 
+ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_breakdown() const {
+@@ -260,6 +413,8 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
+     if (mem_idx) {
+         mem_idx->seq_rm(seq_id, -1, -1);
+     }
++
++    pool_invalidate_all();
+ }
+ 
+ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
+@@ -273,7 +428,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
+         ggml_tensor * bias,
+         const llama_ubatch * ubatch,
+         uint32_t ratio,
+-        bool blk_bias) const {
++        bool blk_bias,
++        int32_t * dst_derived_from,
++        int32_t * dst_derived_lim) const {
+     GGML_ASSERT(ratio > 0);
+     GGML_ASSERT(get_mem_idx() != nullptr);
+ 
+@@ -302,6 +459,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
+     //       is the per-cell scan rather than these allocations, so hoisting them buys nothing
+     std::vector<int32_t>  blk_of(n_kv);
+     std::vector<int32_t>  cell_grp(n_kv);
++    std::vector<uint32_t> n_bid_s(n_ns);
+     std::vector<int32_t>  grp_head(n_blocks);
+     std::vector<int32_t>  grp_next;
+     std::vector<int32_t>  grp_first;
+@@ -468,6 +626,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
+         }
+ 
+         GGML_ASSERT(n_bid <= n_blocks);
++        n_bid_s[s] = (uint32_t) n_bid;
+ 
+         for (int32_t b = 0; b < n_bid; ++b) {
+             int32_t sec_pos[4] = { bid_idx[b], bid_idx[b], bid_idx[b], bid_idx[b] };
+@@ -582,6 +741,14 @@ void llama_memory_hybrid_idx::set_input_qsa(
+             }
+         }
+     }
++
++    // decode-only derived-cache limits: on the single-token append path the fill op of this step
++    // writes [wm, n_bid) into the pool rows, so emit the range leaves and advance the watermarks.
++    // Any other step emits an empty range (the score then pools raw, as without the derived cache).
++    if (dst_derived_from != nullptr && dst_derived_lim != nullptr) {
++        const bool advance = derived_enabled && ubatch->n_tokens == 1;
++        qsa_derived_limits(dst_derived_from, dst_derived_lim, (int) n_ns, ratio, n_bid_s.data(), advance);
++    }
+ }
+ 
+ //
+@@ -672,8 +839,17 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
+         ggml_tensor * bias,
+         const llama_ubatch * ubatch,
+         uint32_t ratio,
+-        bool blk_bias) const {
++        bool blk_bias,
++        int32_t * dst_derived_from,
++        int32_t * dst_derived_lim) const {
++    GGML_ASSERT(mem != nullptr);
++
++    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias,
++                       dst_derived_from, dst_derived_lim);
++}
++
++ggml_tensor * llama_memory_hybrid_idx_context::get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks) const {
+     GGML_ASSERT(mem != nullptr);
+ 
+-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
++    return mem->get_pool(ctx, il, n_blocks);
+ }
+diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
+index 705189e7e..4b30994d1 100644
+--- a/src/llama-memory-hybrid-idx.h
++++ b/src/llama-memory-hybrid-idx.h
+@@ -75,6 +75,17 @@ public:
+ 
+     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
+ 
++    // incremental block-vector cache access: the F32 pool tensor of indexer layer `il`
++    // (nullptr when the model has no indexer); view [idx_dim x n_blocks x n_stream],
++    // n_blocks = ceil(n_kv/ratio), rows [0, watermark) valid
++    ggml_tensor * get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks) const;
++
++    // fill the per-step derived-cache host leaves: fill range [from, to) with the score limit == to.
++    // n_bid = count of full blocks per stream (from set_input_qsa's grouping).  Called by the const
++    // set_input_qsa on the decode append path (advance = the derived path is live this step).
++    void qsa_derived_limits(int32_t * dst_fill_from, int32_t * dst_limit, int n_stream, uint32_t ratio,
++                            const uint32_t * n_bid, bool advance) const;
++
+     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
+     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
+     //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
+@@ -85,7 +96,9 @@ public:
+     // the caller then adds the attention mask, the only part of the bias that varies within a block
+     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+-                       bool blk_bias) const;
++                       bool blk_bias,
++                       int32_t * dst_derived_from = nullptr,
++                       int32_t * dst_derived_lim  = nullptr) const;
+ 
+ private:
+     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
+@@ -97,6 +110,37 @@ private:
+     llama_hparams hparams_idx;
+ 
+     const std::unique_ptr<llama_kv_cache> mem_idx;
++
++    //
++    // incremental block-vector cache ("derived cache", qwen4exp QSA decode waste fix)
++    //
++    // One F32 [indexer_head_size x ceil(kv_size/ratio) x n_stream] tensor per indexer layer
++    // holding the pooled + rms-normed + ROTATED vector of each FULL block, computed once when
++    // the block completes instead of re-pooling the raw cache every decode token.  Lifecycle =
++    // a per-layer host watermark: rows [0, watermark) are valid; any sequence mutation drops the
++    // watermarks (the rows are never read above the watermark, so nothing needs memsetting).
++    // The graph ops (fill + the derived score path) receive the range via per-step host leaves;
++    // set_input_qsa fills them and advances the watermarks (decode-only, env-gated).
++    struct llama_mem_pool_layer {
++        uint32_t il;                  // model layer id (dense-attention, indexer-carrying)
++        uint32_t ratio;               // compress ratio of this layer (blocks = ceil(kv_size/ratio))
++        ggml_tensor * pool = nullptr; // F32 [idx_dim, n_blocks, n_stream]
++    };
++
++    // per-layer derived tensors + the contexts/buffers owning their memory
++    std::vector<llama_mem_pool_layer> pool_layers;
++    std::vector<ggml_context_ptr>      pool_ctxs;
++    std::vector<ggml_backend_buffer_ptr> pool_bufs;
++
++    // watermark per pool layer (rows [0, wm) are valid); decode advances it, seq ops drop it
++    // mutable: set_input_qsa (const) advances it on the decode append path
++    mutable std::vector<uint32_t> pool_wm;
++
++    // the derived path is decode-only + env-gated (GGML_CUDA_QSA_INDEXER_CACHE)
++    bool derived_enabled = false;
++
++    void pool_invalidate_all();
++    void pool_create(const llama_model & model, const layer_filter_cb & filter_idx);
+ };
+ 
+ class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
+@@ -143,7 +187,13 @@ public:
+ 
+     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+-                       bool blk_bias) const;
++                       bool blk_bias,
++                       int32_t * dst_derived_from = nullptr,
++                       int32_t * dst_derived_lim  = nullptr) const;
++
++    // F32 derived-cache view of indexer layer `il` ([idx_dim x n_blocks x n_stream]); nullptr
++    // when the model carries no indexer or the layer is not a pool layer
++    ggml_tensor * get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks) const;
+ 
+ private:
+     const llama_memory_hybrid_idx * mem = nullptr;
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
 index 91bb5e7cc..e5c56aea1 100644
 --- a/src/llama-model-loader.cpp
@@ -5665,7 +7299,7 @@ index 87195fddd..75b9b3493 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8ace95f73..5568c925d 100644
+index 8ace95f73..4267fb6f7 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -5,6 +5,14 @@
@@ -5882,16 +7516,16 @@ index 8ace95f73..5568c925d 100644
 +        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
 +        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
 +        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
++
++        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
++        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
++        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, flags);
++        layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, flags);
  
 -        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
 -        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, 0);
 -        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, 0);
 -        layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, 0);
-+        layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
-+        layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
-+        layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, flags);
-+        layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, flags);
-+
 +        if (il < n_layer) {
 +            continue;
 +        }
@@ -6311,8 +7945,235 @@ index 8ace95f73..5568c925d 100644
  // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
  // one mean-pooled indexer key scores each block; set_input resolves the cache layout
  class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
-@@ -648,26 +1080,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -478,7 +910,13 @@ public:
+ 
+     void set_input(const llama_ubatch * ubatch) override {
+         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
++        if (rng != nullptr) {
++            // derived-cache decode: emit the per-step fill range [from, lim) into the leaf
++            int32_t * d = (int32_t *) rng->data;
++            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, d, d + 1);
++        } else {
++            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
++        }
      }
+ 
+     bool can_reuse(const llm_graph_params & params) override {
+@@ -514,6 +952,7 @@ public:
+     ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
+     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
+     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
++    ggml_tensor * rng       = nullptr;   // I32 [2*n_stream] derived-cache range leaf (decode only)
+ 
+     const llama_memory_hybrid_idx_context * mctx;
+     const uint32_t ratio;
+@@ -539,7 +978,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     GGML_ASSERT(r > 0);
+ 
+     const int64_t n_blocks = (n_kv + r - 1)/r;
+-
+     // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
+     const int64_t n_stream = mctx_hyb->get_n_stream();
+     GGML_ASSERT(n_tokens % n_stream == 0);
+@@ -553,6 +991,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
+         cparams.causal_attn && !hparams.use_alibi;
+ 
++    // env gates (per-process, read once): fused INDEXER ops + the incremental derived cache
++    static const bool idx_score_fused = [] {
++        const char * env = getenv("GGML_CUDA_QSA_INDEXER_SCORE");
++        return env != nullptr && std::atoi(env) != 0;
++    }();
++    static const bool idx_pool_fused = [] {
++        const char * env = getenv("GGML_CUDA_QSA_INDEXER_POOL");
++        return env != nullptr && std::atoi(env) != 0;
++    }();
++    static const bool idx_cache = [] {
++        const char * env = getenv("GGML_CUDA_QSA_INDEXER_CACHE");
++        return env != nullptr && std::atoi(env) != 0;
++    }();
++
+     // nothing above depends on the layer, so the layers sharing a ratio share one input set
+     llm_graph_input_qsa * inp = nullptr;
+ 
+@@ -567,11 +1019,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
+         qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
++        if (idx_cache && n_stream == 1) {
++            // per-step derived fill range leaf: [from_s, lim_s] (one stream in decode)
++            qsa->rng = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 2);
++        }
+ 
+         ggml_set_input(qsa->cell_blk);
+         ggml_set_input(qsa->blk_cells);
+         ggml_set_input(qsa->blk_pos);
+         ggml_set_input(qsa->bias);
++        if (qsa->rng != nullptr) {
++            ggml_set_input(qsa->rng);
++        }
+ 
+         inp = qsa.get();
+         res->add_input(std::move(qsa));
+@@ -589,33 +1048,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
+     k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
+ 
+-    // gathers per stream: blk_cells row s indexes stream s's own cells
+-    ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
+-    members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
+-
+-    // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
+-    ggml_tensor * pooled = nullptr;
+-    for (int64_t i = 0; i < r; ++i) {
+-        ggml_tensor * slice = ggml_cont(ctx0,
+-                ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
+-                        members->nb[2], members->nb[3], i*members->nb[1]));
+-        pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
+-    }
+-    pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
+-    cb(pooled, "indexer_k_pooled", il);
+-
+-    // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
+-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
+-    pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+-
+-    // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
+-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
+-    pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
+-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+-            ext_factor, attn_factor, beta_fast, beta_slow);
+-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+-    cb(pooled, "indexer_k", il);
+-
++    // query side: project + norm + rotate (shared by the fused and per-op paths)
+     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
+     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
+     q = build_norm(q, model.layers[il].index_q_norm, nullptr, LLM_NORM_RMS, il);
+@@ -624,50 +1057,118 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+             ext_factor, attn_factor, beta_fast, beta_slow);
+     cb(q, "indexer_q", il);
+ 
+-    // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
+-    // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
+-    ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
+-            ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
+-    score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+-    score = ggml_relu(ctx0, score);
+-
+-    // the heads sit side by side on ne[1] and there are only a few of them
+-    ggml_tensor * summed = nullptr;
+-    for (int64_t h = 0; h < n_idx_h; ++h) {
+-        ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
+-                score->nb[2], score->nb[3], h*score->nb[1]);
+-        summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+-    }
++    ggml_tensor * score = nullptr;
++    if (idx_score_fused && n_tokens == 1 && blk_bias && n_idx_h <= 8 &&
++            rope_type == GGML_ROPE_TYPE_IMROPE) {
++        // FUSED PROBE (env-gated, GGML_CUDA_QSA_INDEXER_SCORE=1): ONE kernel replaces the
++        // per-token decode chain gather + r-slice pool + scale + rms_norm + rope_multi +
++        // score mul_mat + relu + head-sum + bias (~12 kernels/layer) with the fused
++        // INDEXER_SCORE op.  The kernel replicates the per-op F32 arithmetic byte-
++        // identically (same gather addresses, add order, 256-thread rms_norm reduction,
++        // IMROPE half-pair rope, mmvf F32 vec-dot order) - see ggml-cuda/indexer-score.cu.
++        ggml_tensor * score_pool = nullptr;   // derived-cache pool view (fill dst), if used
++        if (idx_cache && inp->rng != nullptr) {
++            // DERIVED-CACHE PROBE (env-gated, GGML_CUDA_QSA_INDEXER_CACHE=1, on top of the fused
++            // score): a fill op first writes the completed blocks' pooled+normed+ROTATED vectors
++            // into the memory-layer pool (rows [from, lim) of this step's range leaf), then the
++            // score op reads the pool rows for blocks below the limit instead of re-pooling the
++            // raw cache - the same F32 arithmetic at fill time, so the score is byte-identical.
++            ggml_tensor * pool_v = mctx_hyb->get_pool(ctx0, il, (uint32_t) n_blocks);
++            if (pool_v != nullptr) {
++                // idx_cache == 2 is a DEBUG PROBE: pass the pool to the score (lim = n_bid)
++                // WITHOUT building the fill - if the output diverges, the score genuinely reads
++                // the (unfilled) pool rows; if it stays identical, the derived read is a no-op.
++                if (idx_cache != 2) {
++                    score_pool = ggml_indexer_fill(ctx0, k_all, inp->blk_cells, inp->blk_pos,
++                            model.layers[il].index_k_norm, inp->rng, pool_v,
++                            (int) r, hparams.f_norm_rms_eps,
++                            (int) n_rot, sections, (int) rope_type, (int) n_ctx_orig,
++                            freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
++                    cb(score_pool, "indexer_fill", il);
++                } else {
++                    // probe-2: the score reads pool_v directly, rows are garbage (never filled)
++                    score_pool = pool_v;
++                }
++            }
++        }
++        // pass the fill's dst (a view of the pool buffer) so the score reads the rows the fill
++        // just wrote: the graph orders the score after the fill through the src dependency
++        score = ggml_indexer_score(ctx0, k_all, inp->blk_cells, inp->blk_pos,
++                ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream),
++                model.layers[il].index_k_norm, inp->bias,
++                (int) r, hparams.f_norm_rms_eps,
++                (int) n_rot, sections, (int) rope_type, (int) n_ctx_orig,
++                freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow,
++                score_pool, score_pool != nullptr ? inp->rng : nullptr);
++    } else {
++        // gathers per stream: blk_cells row s indexes stream s's own cells
++        ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
++        members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
++
++        ggml_tensor * pooled = nullptr;
++        if (idx_pool_fused && n_tokens == 1) {
++            pooled = ggml_indexer_pool(ctx0, k_all, inp->blk_cells,
++                    model.layers[il].index_k_norm, (int) r, hparams.f_norm_rms_eps);
++            pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
++        } else {
++            // mean over the block members; r is small, so summing slices beats a transpose plus sum_rows
++            for (int64_t i = 0; i < r; ++i) {
++                ggml_tensor * slice = ggml_cont(ctx0,
++                        ggml_view_3d(ctx0, members, idx_dim, n_blocks, n_stream,
++                                members->nb[2], members->nb[3], i*members->nb[1]));
++                pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
++            }
++            pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
++            // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
++            pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
++            pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
++            pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
++        }
++        cb(pooled, "indexer_k_pooled", il);
++
++        // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
++        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
++        pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
++                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
++                ext_factor, attn_factor, beta_fast, beta_slow);
++        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
++        cb(pooled, "indexer_k", il);
++
++        // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
++        // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
++        score = ggml_mul_mat(ctx0, pooled,
++                ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
++        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
++        score = ggml_relu(ctx0, score);
++
++        // the heads sit side by side on ne[1] and there are only a few of them
++        ggml_tensor * summed = nullptr;
++        for (int64_t h = 0; h < n_idx_h; ++h) {
++            ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
++                    score->nb[2], score->nb[3], h*score->nb[1]);
++            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
++        }
+ 
+-    score = summed;
+-    cb(score, "indexer_score", il);
++        score = summed;
+ 
+-    // one value per block, so it is cheaper to bias here than after the cells are expanded
+-    if (blk_bias) {
+-        score = ggml_add(ctx0, score, inp->bias);
++        // one value per block, so it is cheaper to bias here than after the cells are expanded
++        if (blk_bias) {
++            score = ggml_add(ctx0, score, inp->bias);
++        }
+     }
++    cb(score, "indexer_score", il);
  
      // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
 -    ggml_tensor * expanded = ggml_get_rows(ctx0,
@@ -6344,7 +8205,7 @@ index 8ace95f73..5568c925d 100644
      cb(top_k, "indexer_top_k", il);
  
      return top_k;
-@@ -744,10 +1166,41 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -744,10 +1245,41 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
      ggml_tensor * k = mctx_cur->get_k(ctx0, il);
      ggml_tensor * v = mctx_cur->get_v(ctx0, il);
  
@@ -6390,7 +8251,7 @@ index 8ace95f73..5568c925d 100644
      cb(cur, "kqv_out", il);
  
      // the rotation is its own inverse, so undo it on the value side of the output
-@@ -768,10 +1221,50 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -768,10 +1300,110 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      const int64_t n_embd_head = hparams.n_embd_head_v();
      GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
  
@@ -6436,7 +8297,67 @@ index 8ace95f73..5568c925d 100644
 +            const char * env = getenv("LLAMA_QSA_DENSE_SHORTCUT");
 +            return env == nullptr || atoi(env) != 0;
 +        }();
++        // ARCH POLICY (2026-09-07 crossover tables, pp2048/tg64 bf16 KV, discovery record):
++        // decode uses the plain dense attend while n_kv < the per-arch crossover depth and
++        // QSA (sparse) at/above it.  Measured: gfx1151 (Strix Halo, 1 GPU) - dense wins below
++        // ~26K, QSA above (lead grows to +11% @96K); gfx1201 (3x R9700) - dense wins at every
++        // measured depth (8K-160K, flat ~8%), so it never switches.  PREFILL is untouched
++        // (QSA always: it wins prefill from ~8K up on both arches).  The indexer keys are
++        // stored as the width-shortcut does, so the sparse path takes over seamlessly above
++        // the depth.  LLAMA_QSA_DENSE_DECODE_UNTIL overrides the threshold in tokens (0
++        // disables the gate = QSA decode always, for A/B).
++        static const int64_t qsa_dense_decode_until = []() -> int64_t {
++            const char * env = getenv("LLAMA_QSA_DENSE_DECODE_UNTIL");
++            if (env != nullptr && env[0] != '\0') {
++                char * end = nullptr;
++                const long long v = std::strtoll(env, &end, 10);
++                if (end != env && v >= 0) {
++                    int64_t mult = 1;
++                    switch (*end) {
++                        case 'K': case 'k': mult = 1024;        break;
++                        case 'M': case 'm': mult = 1024*1024;   break;
++                        case 'G': case 'g': mult = 1024*1024*1024; break;
++                        default: break;
++                    }
++                    return (int64_t) v * mult;
++                }
++            }
++            // default: sniff the first ACCEL device's gfx id (the CUDA device description
++            // now carries "(gfxNNNN)" for AMD parts)
++            int gfx = -1;
++            for (int i = 0; i < ggml_backend_dev_count(); ++i) {
++                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
++                    continue;
++                }
++                const char * desc = ggml_backend_dev_description(dev);
++                if (desc != nullptr) {
++                    const char * p = strstr(desc, "gfx");
++                    if (p != nullptr) {
++                        gfx = (int) strtol(p + 3, nullptr, 16);
++                    }
++                }
++                break;   // homogeneous GPU set in practice
++            }
++            return gfx == 0x1151 ? 26000 : ((int64_t) 1 << 62);  // gfx1151 crossover ~26K; else dense always
++        }();
++        // PROBE (env-gated, remove after measurement): GGML_CUDA_QSA_DECODE_SKIP=N skips the
++        // QSA selection on every (N+1)-th sparse layer during single-token decode (the layer
++        // runs the dense attend + indexer-store path; cache stays consistent for the kept
++        // layers).  Quantifies the per-layer cost of the indexer build stack (the gfx1201
++        // sparse-decode depth gap - see the 2026-09-07 root-cause record).
++        static const int qsa_decode_skip = [] {
++            const char * env = getenv("GGML_CUDA_QSA_DECODE_SKIP");
++            return env == nullptr ? 0 : std::atoi(env);
++        }();
++        static int qsa_decode_seen = 0;  // decode-graph layer counter (graph is captured once)
++        const bool do_skip = n_tokens == 1 && qsa_decode_skip != 0 && ((qsa_decode_seen++ & qsa_decode_skip) != 0);
 +        if (shortcut && n_kv <= width) {
++            build_qsa_store_k(mctx_hyb, cur, il);
++        } else if (qsa_dense_decode_until > 0 && n_tokens == 1 && n_kv < qsa_dense_decode_until) {
++            // arch policy gate: dense decode below the crossover depth (store keys only)
++            build_qsa_store_k(mctx_hyb, cur, il);
++        } else if (do_skip) {
 +            build_qsa_store_k(mctx_hyb, cur, il);
 +        } else {
 +            top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il);
@@ -6445,7 +8366,7 @@ index 8ace95f73..5568c925d 100644
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -1035,10 +1528,14 @@ public:
+@@ -1035,10 +1667,14 @@ public:
  
      bool can_reuse(const llm_graph_params & params) override {
          mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
@@ -6461,7 +8382,7 @@ index 8ace95f73..5568c925d 100644
  
      const llama_model_qwen4exp & pmodel;
  
-@@ -1047,6 +1544,7 @@ public:
+@@ -1047,6 +1683,7 @@ public:
  
      // scratch, reused across set_input() calls
      std::vector<llama_token> prev;
@@ -6469,7 +8390,7 @@ index 8ace95f73..5568c925d 100644
  };
  
  void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
-@@ -1109,7 +1607,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -1109,7 +1746,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
          }
      }
  
@@ -6537,7 +8458,7 @@ index 8ace95f73..5568c925d 100644
  }
  
  // Read a conv history out of its own recurrent row and write the new tail back.
-@@ -1176,6 +1733,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+@@ -1176,6 +1872,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
      auto ple_inp = std::make_unique<llm_graph_input_ple>(
              static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
  

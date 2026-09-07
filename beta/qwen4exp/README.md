@@ -300,11 +300,13 @@ is folded into patch 1).
 The qwen4exp delivery = **ONE patch** `qwen4exp-support.patch`, applying AFTER the 13
 top-level blocks on the fork base `465e49b9c` (upstream master + rdna-boosts blocks
 0001-0013; 0002/0004/0008/0013 amended 2026-09-06 to absorb the model-neutral Strix kernel
-work). Verified from scratch on the 2026-09-06 re-base: `scripts/apply-all.sh` of the
-13 blocks at `465e49b9c` + `git apply --3way` of `qwen4exp-support.patch` (46 files, 12
-new / 34 modified, zero conflicts) — the resulting tree is the rebuilt `~/llama.cpp`
-`qwen4exp` branch (fork tip `627506c1c`). (The earlier `8b4b3558f`-base from-scratch
-verification reproduced the qwen4exp fork tip `f5ac11903` byte-identically.)
+work). Verified from scratch on the 2026-09-06 re-base + again 2026-09-07 at the new tip:
+`scripts/apply-all.sh` of the 13 blocks at `465e49b9c` + `git apply --3way` of
+`qwen4exp-support.patch` (55 files) — the resulting tree is the rebuilt `~/llama.cpp`
+`qwen4exp` branch (fork tip `6e4778ed8`, 2026-09-07).  The patch = `git diff
+c261553a1..6e4778ed8` (13-block tip to the qwen4exp tip) and carries the fork's full
+qwen4exp delta including the RDNA4 tuning commits (mmq RDNA4-enable, exact-SKU gfx1151
+quantize predicate, mmid-512x10 helper) that sit on the branch.
 
 ```
 git checkout 465e49b9c
@@ -312,16 +314,27 @@ for p in patches/0001-*.patch ... patches/0013-*.patch; do git apply $p; done   
 git apply beta/qwen4exp/qwen4exp-support.patch
 ```
 
-What the support patch contains (all qwen4exp/QSA-specific; the model-neutral MoE mmq /
-fattn / gdn / scale-unary kernel work now lives in the amended top-level blocks 0002/0004/
+What the support patch contains (qwen4exp/QSA-specific; the model-neutral MoE mmq /
+fattn / gdn / scale-unary kernel work lives in the amended top-level blocks 0002/0004/
 0008/0013):
 - managed-reader base (lazy IO) + qwen4exp model support (QSA sparse FA, hc-mix, indexer)
 - mtp-draft support, WS4 hyperconn prefill fusions
-- sched-fallback-sync core-ggml fix (QSA-adjacent; upstream-PR candidate) + QSA
-  dense-shortcut (DEFAULT ON) + LLAMA_QSA_OFF gate
+- sched-fallback-sync core-ggml fix (QSA-adjacent; upstream-PR candidate, copy in
+  `upstream/UPSTREAM-PR-ggml-sched-probe.patch`) + QSA dense-shortcut (DEFAULT ON) +
+  LLAMA_QSA_OFF gate
 - PLE host gather + weighted-down & mul_mat_q_pair try_fuse windows (their ggml-cuda.cu
   context depends on the beta windows - why they could not fold top-level)
 - concat-transposed, mmid-512x10, repeat-absorb hc-combine absorb
+- **2026-09-07 QSA decode campaign**: fused INDEXER_POOL/SCORE ops (the per-token decode
+  indexer chain as one kernel), QSA_DECODE_SKIP probe (measurement tool), f16 indexer
+  caches, incremental derived block-vector cache (INDEXER_FILL + pool srcs on
+  INDEXER_SCORE; env `GGML_CUDA_QSA_INDEXER_CACHE=1`), topk radix-init fold + two-round
+  16-bit topk select (decode/small-row path), CUDA device-description gfx-id exposure
+- **ARCH POLICY (2026-09-07 crossover tables)**: decode uses the dense attend below a
+  per-arch depth and QSA above; prefill is always QSA.  Defaults keyed off the first
+  ACCEL device's gfx id (gfx1151: ~26K crossover; other arches: dense decode always);
+  env `LLAMA_QSA_DENSE_DECODE_UNTIL` overrides (0 = gate off = QSA decode always).  Full
+  tables: `wip/archive/qwen4exp/discovery/2026-09-07-qsa-dense-crossover-tables-soar-halo.md`
 
 Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.md`.
 
