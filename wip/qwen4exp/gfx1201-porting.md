@@ -183,6 +183,11 @@ fusions, repeat-absorb, mmid/mwr ports, managed-ngrams, MTP draft head) was gfx1
 gfx1201 has only pre-re-base records (QSA decode fix etc.).  The sched-gate fix (this
 session) made the ggml layer safe multi-GPU; now validate the model level end-to-end.
 
+- [ ] **2.0** Phase-2 relax-probes (from the 1.6 audit; env-gated, adopt-only-if-wins):
+      swiglu→mmq fusion (3808) = DONE 2026-09-06: does NOT transfer (slight loss, keep
+      RDNA3_5-only, see the 2.0.1 entry below); weighted decode expert-sum (mmvq.cu:2622),
+      mmid 512_10 (mmid.cu:209), concat tile_y 16 = pending.
+
 - [ ] **2.1** Depth-0 ladder + tg (tensor AND layer split) on the fixed build, IQ4_XS + MTP
       draft (Q4_K_M mtp model), same-session toggles where they exist: `LLAMA_QSA_OFF=1`,
       `GGML_CUDA_DISABLE_HC_FUSION=1`, `GGML_CUDA_DISABLE_WEIGHTED_DOWN=1`,
@@ -363,5 +368,15 @@ validation too):
   (QSA, hc) fire on RDNA4 already.
 - PHASE 1 COMPLETE: 1.1 landed (fork `76411193a`, +4-8% prefill), 1.2 landed (refactor,
   `90ea7e22e`; chunk flat), 1.3/1.4/1.5/1.6 = decisions/validations/audit (no code).
+
+### 2026-09-06 (session cont.) — PHASE 2.0.1 DONE: swiglu→mmq fusion does NOT transfer to RDNA4
+- Probe (env-gated `GGML_CUDA_SWIGLU_MMQ_RDNA4`, ggml-cuda.cu:3808) on gfx1201: fires
+  282x/pp2048 (Q8_0 weights, dense down-feed, 640/2560/512/10 qwen4exp shape); same-seed
+  text BYTE-IDENTICAL fused vs unfused (bit-exact by construction, verified); but perf =
+  consistent -1.1..-1.6% at every pp row (2824.7->2788.9 @pp2048, 2430->2392 @pp16384,
+  sigma < 0.5% both sides), tg unchanged.  gfx1151's win (skip the GLU-intermediate
+  round-trip) does not transfer — gfx1201's separate swiglu path wins.  Decision: keep the
+  fusion RDNA3_5-only (reverted; tree clean at `90ea7e22e`).  Fused-vs-unfused
+  bit-exactness means this does NOT affect the Phase-3 cross-arch convergence target.
 
 <!-- keep the newest entry below this marker -->
