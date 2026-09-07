@@ -547,4 +547,24 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   skip, meta mirrored split, dispatch, RPC bump); CPU fallback deferred (op is
   decode-gated GPU-only until adoption).
 
+
+### 2026-09-07 (cont.) — increment-2 scoping: score-side fusion needs its own design unit
+- After INDEXER_POOL, the per-layer decode chain is ~13 kernels: rope(pooled, over
+  n_blocks) + q mm/norm/rope + score mm + relu + head-sum(cont+3 adds) + bias + topk
+  (store mm + cpy + pool + topk kept).  The scaled kernels (rope + score mm read/write
+  the whole [128 x n_blocks] pooled tensor) are the 8K->32K fall-off driver.
+- BLOCKER for fusing through the score mm: the F32 mul_mat dispatch is shape-dependent
+  (mmvf/mmf/mmvq/mmq/cublas decision tree, ggml-cuda.cu:2007-2030) - a fused dot kernel
+  must replicate the exact accumulation order of whichever fires, per-arch.  The
+  elementwise tail (relu + hsum + bias) is parity-safe to fuse (~4-5 tiny kernels/layer,
+  ~1 t/s) but small.  The pooled-key rope needs an mrope (sections) port for full fusion.
+- Recommend next unit (fresh session): pick ONE of - (a) full INDEXER_SCORE op absorbing
+  mm+relu+hsum+bias with the mmf/mmvq order replicated for the F32 small-batch case then
+  byte-toggle; (b) precompute pooled+normed+ROTATED keys in the store path (incremental
+  side cache) to kill the per-token rope+pool reads; (c) env-gated mrope-port rope fusion.
+  Each needs its own parity toggle + halo A/B.
+- Increment 1 state: fork `fde1f2def` (env-gated OFF), +6.0% @32K / +9.6% @64K decode,
+  byte-identical; NOT yet folded into the beta patch (waits for the full fusion to
+  adopt + strip the gate).
+
 <!-- keep the newest entry below this marker -->
