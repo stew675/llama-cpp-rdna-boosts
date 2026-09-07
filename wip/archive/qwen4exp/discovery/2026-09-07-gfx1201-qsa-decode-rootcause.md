@@ -87,5 +87,43 @@ depth), keeping the prefill wins + the FA-read savings that matter at 128K+ cont
 First implementation target: A as an env-gated probe (adopt-only-if-wins pattern), then
 coherence + Protocol A gates.
 
+## 6. Probe result (GGML_CUDA_QSA_DECODE_SKIP, landed fork e6b7ae6f0, env off)
+
+Skipping every (N+1)-th SPARSE layer (dense attend + indexer store instead of the full
+selection build) at d32768 tg128, tensor bf16, interleaved:
+
+| sparse layers kept | tg128 @d32K |
+|---|---|
+| all (skip=0) | 39.7 |
+| half (skip=1) | 42.6 |
+| quarter (skip=3) | 44.1 |
+| none (dense; QSA_OFF) | 47.5 |
+
+→ the indexer build cost is ~per-layer additive: ~7.8 t/s total @32K spread uniformly
+over the sparse layers (NOT one dominating op, NOT purely context-scaled).  Fusion
+ceiling: sparse decode ≈ dense parity at depth.  Earlier probe runs that 'skipped odd
+layers' and measured ~47 immediately were a mistake: the odd layers are the ratio=0
+DENSE layers, so skip=1/3 had removed all sparse layers (pure-dense = the 47.0 control).
+The counter-based probe (sparse layers only) gives the true gradient above.
+
+## 7. Fusion design (next implementation - env-gated probe pattern)
+
+New fused op replacing the per-layer decode chain pool->score (~11 ggml ops/layer:
+get_rows + r-slice pooling adds + scale + rms_norm + rope_multi + index_q mm + q norm +
+q rope + score mm + relu + head-sum adds + bias) with ONE kernel per layer:
+per-block thread-groups read the r raw cache cells -> mean pool -> rms-norm (layer
+index_k_norm) -> rope-rotate (mrope with the block position; replicate the ggml rope
+kernel math exactly for B-parity) -> dot vs the projected/normed/rotated q -> relu +
+head-sum -> + bias -> per-block score vector.  Keep ggml_indexer_top_k (already fused)
+as the next op.  Decode layers/layer count then ~5-6 ops (score + topk + the q-side
+projections + FA) vs ~17.  Mask-side (build_attn_qsa fill/set_rows/add) may be droppable
+at decode entirely IF decode's causal mask is uniformly-visible for selected cells
+(selected cells are all <= the current position) - verify before relying on it.
+Expected @32K: recover most of the ~7.8 t/s -> sparse decode ~45-47 at depth, with the
+sparse FA read-savings intact for 128K+ contexts where the dense FA becomes read-bound.
+Cross-arch: same fused kernel on gfx1151 (halo) - measure both; the op is arch-neutral
+so it likely needs no gating (B-parity = byte-identical scores vs the per-op chain on
+both arches).
+
 Raw logs: `wip/qwen4exp/gfx1201/runs/` (2.1 toggles, d2K-d64K fall-off interleaves,
 qsa-isolation runs).
