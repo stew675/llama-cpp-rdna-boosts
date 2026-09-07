@@ -875,4 +875,37 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   ubatch 2048, not decode) - clean decode slicing needs the qsa/tile-kernel-count method
   (last 640 qsa/device = 64 tg tokens at ~10 qsa/token).
 
+### 2026-09-07 (cont.) — CLEAN 32K PROFILE (kernel-count-sliced decode phase): THE SCORE KERNEL IS THE #1 COST
+- Method: d32 llama-bench traces (tg64 @ d32768, box @11:57, fused 33.88 / dense 37.55 t/s).
+  Decode phase = last ~73 tokens (64 measured + warmup), sliced from the trace end by the
+  qsa/tile count (520 kernels = 73 tokens x ~7.1 FA calls/device/token).  Per-token results
+  (per device): fused 2136 disp / 15.6ms busy / 29.5ms wall; dense 1920 / 14.0 / 26.6.
+  BOTH ~53% GPU-utilized (the earlier 88%-dense claim was window-divisor error; llama-bench
+  async decode idles ~47% on this 3-GPU box even for dense).
+- Per-token selection+attend side (busy):
+    indexer_score_kernel: 1.43ms  (136us/call x 10.5)   <- THE TARGET (was thought ~0.1ms)
+    indexer_topk total:    0.57ms (hist 0.30 + select 0.19 + rest 0.08)
+    flash_attn_qsa:        0.13ms (7 x 18us)
+    fused side total:      2.13ms  vs  dense flash_attn_tile 0.66ms (7 x 94us)
+    => +1.47ms/token, which CLOSES the measured total busy delta (+1.6ms).  The whole fused
+    deficit is the score+topk machinery vs the FA swap; the score alone is 2.5x the topk.
+- Score kernel scaling: 27us/call @4.3K (n_blocks~1075) -> 136us @32K (~8000 blocks): ~linear.
+- Why the score is slow (kernel anatomy): 1 block per score-row (grid = n_blocks), 256 threads
+  for a 128-dim job, ~5 syncthreads-serialized passes with thin active thread counts per pass
+  (128 pool / 32 rope / 64 dot / 1 epilogue), and the rope pass runs 32 POWF per row for
+  values that are per-model constants x a position scalar.  Throughput-bound on the per-row
+  barrier-chain latency at maxed occupancy.
+- Previous turn's direction (topk = the lever) was WRONG: launch-count cuts on the topk were
+  flat because the topk (0.57ms) is not the dominant cost; the score (1.43ms) is.
+- This reopens the parked [3] derived-cache: its premise (completed rows' pooled+normed+roped
+  vectors are invariant; only ~1 new block/step changes) is exactly the right lever for the
+  score's cost - yet [3] measured FLAT on the same 32K bench.  Contradiction (cutting 1.43ms
+  should show ~3%) -> either [3]'s derived read path does not cut the score busy as designed,
+  or the score busy is not fully on the critical path.  NEXT EXPERIMENT (in progress): re-run
+  cache=1 vs cache=0 under rocprof at 32K and compare the score kernel's per-call busy.
+- Fix directions if [3]-read-path is broken: (a) kill the per-row powf (precompute the
+  freq^j table once per launch; the yarn corr is per-pair constant too) - the rope pass is
+  the fat barrier stage; (b) verify the derived-row path actually skips passes 1-3 with the
+  pool rows (it should: rows below LIM read 128 floats and jump to the dot).
+
 <!-- keep the newest entry below this marker -->
