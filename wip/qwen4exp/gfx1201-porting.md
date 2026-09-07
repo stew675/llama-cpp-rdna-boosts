@@ -493,4 +493,25 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
 `...-2026-09-06-gfx1201-qsa-depth.md`.  Tensor-vs-layer A/B (tensor wins 1.31-1.47×) in
 `runs/p1-splitAB-*`.
 
+
+### 2026-09-07 (cont.) — QSA-DECODE DEPTH ROOT-CAUSE FOUND (maintainer deep-dive)
+- Fall-off (tg128, interleaved r1, tensor bf16): dense beats sparse decode from ~2K ctx
+  (d2K +11%, d8K +13%, d32K +20%, d64K +29%); sparse falls -31% d0->64K vs dense -11%.
+  Prefill inverts (sparse +14.5% @32K / +48% @64K — batched path amortizes).
+- Isolation @d32768: sparse-FA == masked-dense-FA with the same top-k build (39.4 vs
+  38.1) → the attention kernel is NOT the cost; QSA_OFF dense 47.5 → the ~9 t/s gap = the
+  per-token top-k build + mask stack.  Slicing already helps the sparse kernel ~22%
+  (QSA_SLICES=1 → 32.4 vs default 39.4).
+- Op census: ~15 ggml ops/layer/token above the width (index_k mm → cpy_k → get_rows(all
+  raw keys) → r-slice pooling → norm → rope → index_q → score mm → relu → sum → top-k →
+  mask fill(-INF) → set_rows → add → FA) vs dense ~1-2.  Every token RE-POOLS the whole
+  raw-only indexer cache; prefill amortizes, n_tps=1 decode does not.  Fixed per-layer
+  launch stack dominates (d2K already -11% at the width boundary); n_kv-scaled component
+  is secondary.  lightning-indexer (fused score kernel) is NVIDIA-WMMA-only.
+- Fix directions (record: `2026-09-07-gfx1201-qsa-decode-rootcause.md`): A) fuse the
+  decode indexer path into ~1 HIP kernel/layer (the real fix — restores flat fall-off);
+  B) fold the per-layer [n_kv] mask into the sparse kernel; C) RDNA4 sparse-FA decode
+  geometry (inherit the dense decode tuning); D) store-side fusion (minor).  A+B expected
+  to recover most of the ~9 t/s @d32K.  GO/NO-GO with the maintainer before implementing A.
+
 <!-- keep the newest entry below this marker -->
