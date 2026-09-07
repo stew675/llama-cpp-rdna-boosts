@@ -192,11 +192,20 @@ session) made the ggml layer safe multi-GPU; now validate the model level end-to
       pp2048 / +2.6% pp512 tight-window); concat tile_y 16 = DONE: flat (+0.4/+0.2%,
       noise) — keep 8.  Phase 2.0 COMPLETE.
 
-- [ ] **2.1** Depth-0 ladder + tg (tensor AND layer split) on the fixed build, IQ4_XS + MTP
+- [x] **2.1** Depth-0 ladder + tg (tensor AND layer split) on the fixed build, IQ4_XS + MTP
       draft (Q4_K_M mtp model), same-session toggles where they exist: `LLAMA_QSA_OFF=1`,
       `GGML_CUDA_DISABLE_HC_FUSION=1`, `GGML_CUDA_DISABLE_WEIGHTED_DOWN=1`,
       `GGML_CUDA_DISABLE_MMID_512=1`, `LLAMA_QSA_DENSE_SHORTCUT=0`.  Record ON-vs-OFF deltas
       (expect the gfx1151-validated fusion gains to reproduce — the kernels are model-level).
+      DONE 2026-09-06 — toggle deltas (tensor, bf16; window-matched controls): default
+      anchor pp512 1929 / pp2048 2973 / pp8192 2619 / pp16384 2528 / tg128 50.6.  QSA_OFF:
+      prefill crossover >16K ctx (dense slightly ahead ≤16K, sparse +14.5% @32K, +48%
+      @64K); sparse DECODE loses at depth (dense +20% @32K / +29% @64K, flat at d0) → new
+      gfx1201 QSA-decode tuning package (OPEN, see the 2.1 entry + QSA-depth discovery
+      record).  DENSE_SHORTCUT=0: -15.5% pp2048.  HC_FUSION=1: -15.8% pp2048 / -14.3%
+      pp8192 (gfx1151 gains reproduce).  MMID_512=1: -4.1% (2.0.3).  WEIGHTED_DOWN=1:
+      no-op control ✓.  Layer-split anchor: pp2048 2238 / pp16384 1710 / tg128 37.2.
+      QSA depth interleaves double as partial 2.2 depth rows.
 - [ ] **2.2** Depth rows (12k/32k, r1) + memory stability −r3 through 32k.
 - [ ] **2.3** Decode leg: tg128/512, MTP acceptance per `benchmarks/mtp-adaptive-methodology.md`
       (acceptance must stay > ~0.45, MTP >= plain at depth 3), server smoke (user config,
@@ -398,5 +407,27 @@ validation too):
   keep tile_y=8.  Reverted.
 - Machine-drift note: box swings +-5-7% across 20-40 min windows this session (a rebuild
   + coherence runs shift it); interleaved brackets (toGGLE-based) are the only sound A/B.
+
+### 2026-09-06 (session cont.) — PHASE 2.1 depth-aware QSA toggle finding (needs a gfx1201 tuning package)
+- Depth-0 toggle A/B (tensor, bf16, r3): DENSE_SHORTCUT=0 regresses pp2048 -15.5% (the
+  shortcut's top-k-selection-avoidance is worth it at short ctx); MMID_512 disable -4.1%
+  (2.0.3); WEIGHTED_DOWN toggle = no-op (never fires on IQ4_XS); tg depth-0 ~flat for all.
+- QSA_OFF depth ladder (interleaved r1, tensor bf16):
+  | row | sparse (default) | dense (QSA_OFF) | note |
+  | pp2048 ctx16k (depth-0) | ~2528-2973 | ~+6.6% pp16384 | dense slightly ahead |
+  | pp2048 @ d32768 | 1971 | 1720 | SPARSE +14.5% |
+  | pp2048 @ d65536 | 1702 | 1141 | SPARSE +48% |
+  | tg128 @ d32768 | 39.7 | 47.5 | DENSE +19.6% |
+  | tg128 @ d65536 | 35.1 | 45.3 | DENSE +29% |
+  → QSA default-ON is CORRECT on gfx1201 (dense prefill craters at 32K+); the prefill
+  crossover sits between ~16K and ~32K context.  BUT sparse DECODE loses at depth (dense
+  +20..29% at 32-64K; flat at d0) — the gfx1151 QSA decode tuning does NOT transfer; the
+  gfx1201 sparse decode path (indexer scoring + sparse-FA decode kernels per token) needs
+  its own tuning package (maintainer: "we got good gains on gfx1151 by tuning it there").
+  OPEN: new work item (gfx1201 QSA decode tuning or a depth-regime decision) — parked for
+  a Phase-5-style package; record `wip/archive/qwen4exp/discovery/2026-09-06-gfx1201-qsa-depth.md`.
+- 2.1 toggle matrix otherwise: default-anchor ladder (tensor bf16 r3) pp512 1929 / pp1024
+  2607 / pp2048 2973 / pp4096 2718 / pp8192 2619 / pp16384 2528 / tg128 50.6 (with 1.1 +
+  mmid wins vs Phase-0: pp2048 +38%, pp16384 +14%).
 
 <!-- keep the newest entry below this marker -->
