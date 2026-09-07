@@ -908,4 +908,24 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   the fat barrier stage; (b) verify the derived-row path actually skips passes 1-3 with the
   pool rows (it should: rows below LIM read 128 floats and jump to the dot).
 
+### 2026-09-07 (cont.) — cache=1 experiment: score busy cut VERIFIED but wall FLAT -> the decode wall is CHAIN-LATENCY-bound, not busy-bound
+- cache=1 (derived [3]) at d32768 under rocprof: indexer_fill fires 1/layer/decode-step
+  (768/device = 10.5 x 73 tokens); decode score per-call DROPS 136 -> 58us (busy 1.43 ->
+  0.61ms/token, -0.8ms).  Yet llama-bench wall is flat (the original [3] A/B 42.39 vs 42.53).
+- INTERPRETATION: the fused decode wall is NOT busy-bound.  Both fused and dense idle ~47%
+  of the wall (53% util, 3-GPU async decode with AR syncs).  The sparse chain adds ~14
+  DEPENDENT kernels/layer to the critical path (score -> 11-stage topk -> qsa FA), each
+  serialized at ~10-13us dispatch+latency -> ~150-200us of chain latency/layer x 10.5
+  layers ~= the ~2ms deficit.  cache=1's busy cut just converts busy into idle (the chain
+  structure is unchanged) -> wall flat.  This explains every prior result: launch cuts flat
+  (1 off a 14-long chain), wider radix regressed (per-kernel latency up), score busy cut
+  flat (chain unchanged).  Total busy (15.6 vs 14.0) rises by the sparse work, but the WALL
+  is set by the critical-path chain structure, and busy fills whatever it allows.
+- NEXT DECISIVE EXPERIMENT: measure the per-layer chain latency directly with the existing
+  GGML_CUDA_QSA_DECODE_SKIP=N probe on the CURRENT fused build (skip the whole sparse
+  chain on every Nth layer -> dense attend): if the wall drops ~150-200us per skipped
+  layer, chain-latency is confirmed as the wall driver and the mega-op must FUSE the
+  score+topk+FA chain into few kernels (the only structure that removes dependent edges).
+  The true mega-op target is the ~14 dependent kernels/layer -> ~2-3, NOT busy or launches.
+
 <!-- keep the newest entry below this marker -->
