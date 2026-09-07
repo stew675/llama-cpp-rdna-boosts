@@ -225,10 +225,23 @@ session) made the ggml layer safe multi-GPU; now validate the model level end-to
       0 faults/hangs → the pre-re-base QSA decode fix holds on the re-based build.
       Note: raw /completion prose without the chat wrapper stops at 1 token on this model
       (argmax = stop) — wrap `<|im_start|>…<|im_end|>\nassistant` for server gens.
-- [ ] **2.4** Multi-GPU-specific: hybrid-AR + RCCL toggles (`GGML_CUDA_ALLREDUCE=nccl` /
+- [x] **2.4** Multi-GPU-specific: hybrid-AR + RCCL toggles (`GGML_CUDA_ALLREDUCE=nccl` /
       default hybrid / issue-13 fallback), the tensor-split + MTP-verify path, ubatch-2048
       multi-chunk prefill determinism (the sched-gate's original failure mode — confirm the
       fixed build is deterministic run-to-run, same-seed, tensor split).
+      DONE 2026-09-07 — 4000-token prompt (2+ ub2048 chunks) × -c 32768, seed 42 temp 0,
+      3-GPU tensor bf16: hybrid 3/3 runs byte-IDENTICAL (sched-gate fix holds — no
+      multi-chunk nondeterminism); RCCL 2/2 byte-identical (also internally deterministic);
+      hybrid-vs-nccl deterministic-but-DIFFERENT mid-reasoning (AR op-order numerics drift —
+      internal-pipeline vs RCCL-tree summation; same family as the cross-arch + fusion-order
+      drift the MoE methodology accepts; the dense 27B identity gate (2026-09-04) does not
+      transfer to the topk-10 MoE at long prefill).  Open with the maintainer: require MoE
+      hybrid-vs-nccl byte-identity or accept as a numerics regime.  Issue-13 fallback:
+      not triggerable on this healthy box (covered by the block-12 amendment validation on
+      the 27B).  Tensor-split + MTP-verify path: exercised by the 2.3 Protocol A run.
+      Side-finding: llama-cli with the DEFAULT small ctx (4096) + a near-ctx prompt aborts
+      at `ggml-backend-meta.cpp:1758 GGML_ASSERT(bufs.back() != nullptr)` on 3-GPU tensor
+      (meta-buffer alloc edge; -c >= prompt len avoids it; llama-bench unaffected).
 - [ ] **2.5** Regression check for the gfx1201 fallback paths: with the RDNA3_5 kernels
       inert, confirm the mmq.cuh/mmq-config refactors did not perturb the RDNA4 id-MMQ path
       (this is implicitly covered by 2.1 vs the pre-port numbers; call it out explicitly).
