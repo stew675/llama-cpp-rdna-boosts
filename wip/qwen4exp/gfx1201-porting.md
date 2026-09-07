@@ -703,4 +703,24 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
     context (context-proportional waste); enables the flat sparse decode + per-arch crossover
     measurements the maintainer wants.
 
+
+### 2026-09-07 (cont.) — fused INDEXER ops now accept F16 caches (fork `c07e70e6f`)
+- The fused INDEXER_POOL/SCORE gather was bf16-shift/F32-only and the ggml builders asserted
+  F32/BF16, so with an f16 indexer cache (-ctk f16 = the STRIX-HALO config) the fused decode
+  path ABORTED at graph build - QSA decode on halo has only ever run the per-op chain.  Added a
+  3-way ktype (F32/BF16/F16) to the pool gather in both kernels + the builder/supported type
+  checks.  Parity is safe by construction: ggml GET_ROWS always outputs F32 (the per-op chain's
+  pooling arithmetic runs F32 regardless of the cache type - the type only affects the gather's
+  half->f32 upcast, and f16->f32 is an exact bijection matching get_rows' native half load).
+- gfx1201 3-GPU same-seed toggle under an f16 cache (default ctk): generated text BYTE-IDENTICAL
+  ON vs OFF; fused decode +4.3% (41.5 -> 43.3 t/s) at ~4K context - validates the f16 path.
+  Prior bf16 parity/benches stand (e1e5a474b).
+- Halo (gfx1151) fused A/B now unblocked: fork range c63f7f2a0..c07e70e6f bundled and fetched
+  into halo ~/llama-delivery (branch qwen4exp-fused), build-fused configuring with the build-gated
+  flags (gfx1151, Release); build launched detached on halo (~/tmp/halo-fused-cmake.log,
+  HALO_FUSED_BUILD_DONE sentinel).  When done: same-seed parity toggle + the dense-vs-QSA regime
+  protocol re-run against the FUSED build (halo anchors: dense 25.8/24.8/23.4 vs per-op QSA
+  25.8/23.0/20.9 at d0/12K/32K, f16) - expect the QSA rows to move up (fusion gain transfers;
+  f16 load now supported) and the dense-vs-QSA gap to narrow.
+
 <!-- keep the newest entry below this marker -->
