@@ -928,4 +928,34 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   score+topk+FA chain into few kernels (the only structure that removes dependent edges).
   The true mega-op target is the ~14 dependent kernels/layer -> ~2-3, NOT busy or launches.
 
+### 2026-09-07 (cont.) — DECODE_SKIP marginal CONFIRMS chain-latency-bound; the mega-op = shorten the per-layer dependent chain
+- GGML_CUDA_QSA_DECODE_SKIP at d32768 (interleaved, box ~40.3 t/s baseline):
+    skip0 (none):      40.33 t/s (24.8ms wall)
+    skip1 (every 2nd): 41.65 t/s (24.0ms)   ~5.25 skipped layers -> ~0.15ms/layer freed
+    skip2 (every 3rd): 41.70 t/s (24.0ms)
+    skip3 (every 4th): 42.41 t/s (23.6ms)   ~2.6 skipped -> ~0.46ms/layer freed
+  Removing the sparse chain from a fraction of the ~10.5 sparse layers frees wall at
+  ~0.15-0.46ms/skipped layer (non-linear: freeing whole chains compounds).  Matches the
+  ~150-200us/layer dependent-chain latency estimate (14 kernels: score 1 + topk 11 +
+  qsa+combine 2, each ~10-13us serialized on the critical path).
+- CONCLUSION (the whole session's arc): the fused decode deficit vs dense at 32K is the
+  CRITICAL-PATH LENGTH of the per-layer sparse chain, in an idle-bound pipeline (53% util).
+  Launch-count shaving (flat), score-busy cuts via [3] (flat), and wider radix (regressed)
+  all follow: none shorten the dependent chain.  The mega-op must REPLACE the chain
+  structure, not optimize its parts.
+- MEGA-OP DESIGN (next build): replace the topk's 11-kernel exact-radix + deterministic
+  gather (init, 4x(hist+select), count, scan, write = ~11 dependent steps ~= 120-145us)
+  with a 2-round select over the full 32-bit key: hist1 (cells -> 2^16 GLOBAL bins,
+  1 launch) + sel1 (single block scans 64K bins, 1) + hist2 (re-scan cells in the boundary
+  bin's top-16 range -> low-16 bins) + sel2 + emit (filter exact prefix, deterministic
+  ascending order) ~= 5 dependent kernels ~= 60us.  Chain 14 -> ~8 kernels/layer; est
+  -0.5 to -0.9ms/token wall (+2-4%) IF the busy stays off the wall (skip experiment says
+  the wall is chain-bound, so per-kernel busy may rise within limits - the 12-bit smem
+  regression warns to keep histogram passes global-bucket cheap).
+  Parity rule: 2x16-bit rounds resolve the full 32-bit key exactly; the emit must produce
+  the same deterministic ascending-column cell list.
+- Alternative/compounding: fuse the score's tail into hist1 (score blocks atomicAdd their
+  r cells' worth into hist1's buckets) and/or the block-uniform mode (8K values not 32K)
+  once the 2-round select is in.
+
 <!-- keep the newest entry below this marker -->
