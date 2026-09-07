@@ -595,4 +595,54 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   the re-pool read); (b) sparse-FA decode geometry vs dense; (c) accept at ~90% parity
   and fold.  Halo (gfx1151) A/B + adoption/fold still pending (maintainer call).
 
+
+### 2026-09-07 (cont.) — the WASTE fix: design + scoping (next unit after INDEXER_SCORE)
+- Halo regime data landed (`wip/archive/qwen4exp/discovery/2026-09-07-halo-gfx1151-dense-vs-qsa-regime.md`):
+  dense beats QSA at EVERY tested depth on Strix too (d0 ~flat 25.8; d12K 24.8 vs 23.0;
+  d32K 23.4 vs 20.9) and QSA falls ~2x faster (25.8->20.9 = -19% vs dense -9% over 0->32K).
+  The per-token indexer waste is ARCH-UNIVERSAL and context-proportional - the fix is the
+  same on both boxes; crossover depths differ (Strix sooner - its dense already falls -9%
+  @32K vs gfx1201's ~-1%).  Re-measure this protocol against the fused build next.
+- The remaining waste decomposes into THREE pieces (the fix stack):
+  [1 DONE] kernel-count: INDEXER_POOL + INDEXER_SCORE (12-15 ops/layer -> 1); residual
+  build ~3.1 t/s @32K on gfx1201 (skip probe).
+  [2 gfx1201-only, CHEAPEST] the fused INDEXER ops are declared MIRRORED in
+  ggml-backend-meta.cpp -> on 3-GPU tensor split EVERY GPU re-reads the full raw cache
+  (8.4MB/layer @32K each = 25MB aggregate) while dense FA reads its KV shard only
+  (~5.6MB/GPU).  Score rows are per-block deterministic -> the score op can be ROW-SPLIT
+  across devices (each computes its 1/3 of blocks from its own cache mirror, identical
+  values) + the meta backend's existing split->mirrored allgather feeds topk (the per-op
+  mm did exactly this pre-fusion).  Expected: ~3x read cut on the indexer, worth ~1.5-3
+  t/s @32K on the 3-GPU box.  Needs a meta-backend split-state study (how MUL_MAT's
+  row-split + allgather is expressed for a custom op) - a gfx1201-only measurement step.
+  NOTE: INDEXER_POOL mirrored may also have masked part of increment-1's gain.
+  [3 the asymptotic fix, both arches] kill the re-pool entirely: maintain the
+  pooled+normed+ROTATED block vectors incrementally.  A completed block's vector is
+  invariant (pool over its r members -> rms_norm(W) -> rope at the block position), so it
+  can be computed ONCE at store time and gathered at decode.  Removes the context-
+  proportional read + pool/norm/rope compute from the decode path -> sparse decode
+  becomes weight-bound + capped-FA reads (the 2051-cell cap) like dense, and the true
+  per-arch crossovers become measurable.
+- [3] design (spec for the next session):
+  * Home: a per-layer buffer in llama_memory_hybrid_idx next to the raw indexer cache
+    (mem_idx), sized n_blocks_max = ceil(kv_size/r) x idx_dim x ns F32; the raw cache stays
+    untouched (still needed for prefill re-pool + the tail partial block + evictions).
+  * Lifecycle: mirror mem_idx's slot/seq ops on block granularity (block b covers cells
+    rb..rb+r-1); seq_rm/cp/keep/add/div + state io + clear must rewrite/expire block rows;
+    the partial block at sequence boundaries is handled by the existing raw path (decode
+    pools only the <=1 unfinished tail block on the fly from raw).
+  * Fill: a store-side op/kernel, scheduled when a block completes (graph-side: after
+    cpy_k when (pos%r) == r-1; prefill ubatch stores complete several blocks per step),
+    replicating INDEXER_SCORE's pool/norm/rope arithmetic EXACTLY (the byte-toggle gate).
+  * Read: INDEXER_SCORE v2 takes the derived cache view (+ raw only for the tail block)
+    and runs dot+relu+headsum+bias (+ the tail-block pool) - no pool/norm/rope over
+    completed blocks; same per-block values by construction (same arithmetic at store).
+  * Parity: fused ON == per-op chain ON byte-toggle must still pass (values are
+    deterministic per block -> stored == recomputed).
+  * Payoff estimate: read halves vs raw (n_blocks*128*4B = half of n_kv*128*2B @ r=4) +
+    no norm/rope compute; the gain grows with context (the waste is context-proportional).
+  * Order of work: [2] first (cheap, gfx1201 measurement), then [3]; re-run the halo
+    protocol + the gfx1201 depth ladder after each; halo A/B of the fused build is owed
+    before any gating/adoption decision.
+
 <!-- keep the newest entry below this marker -->
