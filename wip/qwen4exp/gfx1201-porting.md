@@ -567,4 +567,32 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   byte-identical; NOT yet folded into the beta patch (waits for the full fusion to
   adopt + strip the gate).
 
+
+### 2026-09-07 — QSA-DECODE FIX increment 2 LANDED: fused INDEXER_SCORE (fork `e1e5a474b`)
+- New GGML_OP_INDEXER_SCORE replaces the ENTIRE per-token decode chain get_rows + pool +
+  scale + rms_norm + rope_multi + score mm + relu + head-sum + bias (~12 kernels/layer)
+  with ONE kernel, env-gated (`GGML_CUDA_QSA_INDEXER_SCORE=1`, decode n_tokens==1,
+  blk_bias, n_idx_h<=8, IMROPE).  Subsumes increment 1 (INDEXER_POOL stays in the tree,
+  its graph call replaced when SCORE is on).  Parity contract met byte-identically:
+  increment-1 pool/norm geometry, the IMROPE half-pair rope (rope.cu theta_scale =
+  powf(freq_base,-2/n_dims), sections [11,11,10,0] interleave, n_rot=64 of idx_dim=128,
+  cos/sin math verbatim) and the mmvf F32 vec-dot order (wave32: lane float2 partials,
+  per-warp xor tree, w0+w1) - same-seed decode text BYTE-IDENTICAL ON vs OFF (first try).
+- gfx1201 (3x R9700, IQ4_XS, tensor bf16, interleaved): @d32768 39.4 -> 42.4 (+7.6% vs
+  per-op); @d65536 35.0 -> 38.9 (+11.1%).  In-window dense refs: 47.4 @32K / 48.0 @d0
+  (dense IS ~flat: -1.2% over 0->32K; the earlier -11% d0->64K ladder was a pre-fusion
+  window).  Fused-path marginal (skip probe, same window): ALL 42.4 / HALF 43.95 /
+  QUARTER 44.8 -> the fused build costs ~3.1 t/s @32K (vs 7.8 t/s per-op: the two
+  increments removed ~60% of the sparse build cost).  Residual vs dense ~4.8-5 t/s =
+  the store mm + cpy_k + q-side (mm/norm/rope) + topk launches (~6 kernels/layer) +
+  the sparse-FA path, NOT the pool->score stack (now 1 kernel).
+- Model geometry captured (IDXDBG probe): idx_dim=128, n_idx_h=4, n_rot=64, rope_type 40
+  (IMROPE), n_ctx_orig 262144, freq_base 1e7, freq_scale/attn_factor 1, ext 0,
+  sections [11,11,10,0], rms eps 1e-6, ratio layers r=4 from layer 3.
+- Next levers for the ~4.8 t/s residual (in order of value): (a) fold the q-side/store/
+  topk remaining launches via a fused per-layer op or side-cache reuse (option b of the
+  worklog increment-2 note: incremental pooled+normed+ROTATED cache at store time kills
+  the re-pool read); (b) sparse-FA decode geometry vs dense; (c) accept at ~90% parity
+  and fold.  Halo (gfx1151) A/B + adoption/fold still pending (maintainer call).
+
 <!-- keep the newest entry below this marker -->
