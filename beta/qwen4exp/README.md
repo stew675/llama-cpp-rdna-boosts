@@ -440,6 +440,31 @@ Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.m
 
 ## Open items (carried forward from WIP)
 
+- **gfx1201 QSA-decode tuning (OPEN work package, 2026-09-06/07 — see
+  `wip/qwen4exp/gfx1201-porting.md` Phase 2.1 + the discovery record
+  `wip/archive/qwen4exp/discovery/2026-09-06-gfx1201-qsa-depth.md`):** sparse decode
+  (QSA default ON) LOSES to the dense reference at depth on gfx1201 — dense +20% @32K /
+  +29% @64K decode, flat at d0; prefill sparse wins +14.5% @32K / +48% @64K (crossover
+  between 16-32K ctx).  Maintainer direction (2026-09-07): QSA was developed and showed
+  strong gains on gfx1201 historically; the dense-path surpassing it at depth is
+  unexpected and points at gfx1201-side inefficiencies in the sparse decode path
+  (indexer store/scoring + sparse-FA decode), NOT at QSA's premise (flat depth fall-off).
+  Work: measure the sparse-vs-dense depth fall-off curves precisely, find what makes
+  dense fall slower (which dense-path enhancements came out of the gfx1151 work), carry
+  them into the QSA path for gfx1201, and tune the sparse decode kernels.  In progress.
+- **MoE hybrid-vs-nccl byte-identity (open decision, 2026-09-07):** at multi-chunk
+  ub2048 prefill on the topk-10 MoE (Qwen3.8-Flash-Next IQ4_XS, 3-GPU tensor) the two AR
+  backends are each internally deterministic (hybrid 3/3, RCCL 2/2 byte-identical
+  run-to-run) but deterministic-but-DIFFERENT vs each other (AR op-order numerics drift
+  flips a greedy token mid-reasoning).  The dense 27B identity gate (block-12 amendment
+  validation) does not transfer to the topk-10 MoE at long prefill.  Decide: require
+  byte-identity (needs shared AR op-order) or accept as a numerics regime (like
+  fusion-ordering drift on MoE).
+- **Meta-buffer alloc assert (upstream-report candidate, 2026-09-07):** llama-cli at its
+  default 4096 ctx with a near-ctx prompt aborts at
+  `ggml-backend-meta.cpp:1758 GGML_ASSERT(bufs.back() != nullptr)` on 3-GPU tensor
+  (meta-buffer alloc edge; `-c >= prompt length` avoids it; llama-bench unaffected).
+
 - "The answer" 3-token K=2 multi-seq decode drift at step 3 (single-seq
   untouched; numeric divergence of the short-odd-prompt batch path).
 - Mixed K/V cache types (k=bf16/v=f16) crash at model init
