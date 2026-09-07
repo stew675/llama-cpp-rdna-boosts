@@ -514,4 +514,20 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   geometry (inherit the dense decode tuning); D) store-side fusion (minor).  A+B expected
   to recover most of the ~9 t/s @d32K.  GO/NO-GO with the maintainer before implementing A.
 
+
+### 2026-09-07 (cont.) — QSA-DECODE FIX: probe landed + fusion design ready (fork `e6b7ae6f0`)
+- Env-gated layer-skip probe (GGML_CUDA_QSA_DECODE_SKIP, sparse-layers-only counter, default
+  off) @d32768 tg128 tensor bf16: all-sparse 39.7 / half-sparse 42.6 / quarter-sparse 44.1 /
+  dense 47.5 → the indexer build cost is ~per-layer additive, ~7.8 t/s total @32K (NOT one
+  dominating op).  Fusion ceiling = sparse decode ≈ dense at depth.  (The first probe run
+  that skipped odd layers and measured ~47 was a measurement mistake — odd layers are the
+  ratio=0 DENSE layers, so it had removed ALL sparse layers.)
+- Mask side: verified the build_attn_qsa fill(-INF)+set_rows+add assembly is NOT in the
+  executed graph on the default sparse path (only the masked-dense fallback consumes it) —
+  already free; not a fix target.
+- NEXT: the fused per-layer score op (pool+norm+mrope+score in one kernel, mrope math
+  replicated byte-identically from the ggml rope kernel; keep ggml_indexer_top_k; env-gated
+  probe → adopt; then cross-arch halo check for gating decisions).  Detailed design in
+  `2026-09-07-gfx1201-qsa-decode-rootcause.md` §7.  Expected @32K: most of the ~7.8 t/s.
+
 <!-- keep the newest entry below this marker -->
