@@ -50,23 +50,40 @@ verified this session; see `beta/qwen4exp/HALO_HANDOFF.md`.
 
 ## PHASE 0 — gfx1201 harness + pre-port baseline (first)
 
-- [ ] **0.1** Write the soar bench/coherence runner (reuse `/tmp/ab-run.sh` pattern; keep it
+- [x] **0.1** Write the soar bench/coherence runner (reuse `/tmp/ab-run.sh` pattern; keep it
       under `wip/qwen4exp/gfx1201/` so it survives reboots): VRAM-plateau load detection,
       hang detection (one-GPU-100% + host-100%), pkill bracket pattern, logs to a dated dir.
-- [ ] **0.2** Full pre-port baseline table on the fixed build (r3, same-session where a toggle
-      exists; UNPINNED; warm page cache; prompts descending in one process):
-      depth-0 pp512/1024/2048/4096/8192/16384 + tg128; depth spot pp2048@d12288 (r1) +
-      tg128@d12288; IQ4_XS model, `-ngl 99 -t 15 -r 3 -b 2048 -ub 2048 -fa on -ctk f16
-      -ctv f16 --load-mode none` (tensor split; add layer split rows for the record).
-- [ ] **0.3** Coherence fingerprint of the gfx1201 fixed build vs the **gfx1151 canonical**
-      (halo `~/llama-delivery/build-gated`): same-seed llama-cli text must match TODAY (no
-      arch-gated kernel differences are numerics-relevant yet — all campaign kernels are
-      RDNA3_5-inert on gfx1201, so both run the same RDNA4/neutral code paths... verify this
-      claim: if the gfx1151 delivery build executes the RDNA3_5 kernels and gfx1201 does not,
-      outputs may already differ where those kernels are numerics-transparent-by-construction
-      (same process_tile etc.) — the fingerprint run decides).  Logitcmp 838-token family if
-      harness available on both boxes.
-- [ ] **0.4** Record the baseline in this worklog + `benchmarks/` (dated record).
+      → `wip/qwen4exp/gfx1201/bench-run.sh` (watcher + timeout 900 + bracket pkill + dated
+      log dir under `runs/`).
+- [x] **0.2** Full pre-port baseline table on the fixed build — DONE 2026-09-06 (soar, 3x
+      R9700 gfx1201, IQ4_XS Qwen3.8-Flash-Next, `-ngl 99 -t 15 -r 3 -b 2048 -ub 2048
+      -fa on --load-mode none`, prompts descending in one process, UNPINNED, tensor split
+      [maintainer's preferred mode]; BF16 KV primary [maintainer's daily config], Q8_0
+      secondary, F16 for campaign continuity).  Depth-0 t/s:
+      | row | f16 | bf16 | q8_0 |
+      |---|---|---|---|
+      | pp16384 | 2274.27 | 2211.17 | 2230.66 |
+      | pp8192 | 2264.79 | 2225.29 | 2258.26 |
+      | pp4096 | 2174.07 | 2197.99 | 2247.06 |
+      | pp2048 | 2026.21 | 2149.14 | 2268.76 |
+      | pp1024 | 1797.52 | 1894.74 | 1969.22 |
+      | pp512 | 1434.21 | 1489.75 | 1527.39 |
+      | tg128 | 50.07 | 50.04 | 48.75 |
+      Depth spot (bf16, r1): pp2048@d12288 **1765.65**, tg128@d12288 **42.34**.
+      Continuity vs pre-re-base gfx1201 record (q8_0: pp512 1538 / pp8192 2024 / tg128
+      45.7): pp512 1527 ✓, tg128 48.75 ✓, **pp8192 2024 → 2258 (+11.5%)** — the
+      model-level campaign gains (QSA shortcut default + fusions) now show on gfx1201.
+      Note: prefill rises with prompt length (pp512 1434 → pp16384 2274) — QSA sparse +
+      multi-ubatch pipelining.  Raw logs: `wip/qwen4exp/gfx1201/runs/p0-*.log`.
+- [x] **0.3** Coherence fingerprint gfx1201 vs gfx1151 canonical — DONE 2026-09-06 (bf16 KV,
+      same-seed llama-cli, both fixed build c63f7f2a0): **TEXTS DIVERGE** — same opening
+      reasoning tokens, then mid-trace divergence; final differs (gfx1151 "Paris" vs gfx1201
+      "Could complete sentence.").  The cross-arch convergence the port must deliver is NOT
+      yet satisfied at the pre-port state — this is the Phase-3 baseline gap (per-op
+      bisect of which arch-gated path first diverges once Phase-1 ports land).  Logs:
+      `wip/qwen4exp/gfx1201/runs/coh-*` + halo `/tmp/halo-ab/coh-bf16-halo.txt`.
+- [x] **0.4** Record the baseline — this worklog entry + raw logs under
+      `wip/qwen4exp/gfx1201/runs/` (2026-09-06).
 
 ## PHASE 1 — Kernel/config ports (RDNA3_5-gated → RDNA4 enable + tune + validate)
 
@@ -224,5 +241,18 @@ validation too):
 - Baseline anchor (this file, above) captured.  Phase 0 TODO list open.
 - IQ3_XXS/IQ4_XS shard-1 "truncation" resolved as non-issue (metadata-only 10.9 MB first
   shard; upstream sizes match byte-for-byte).
+
+### 2026-09-06 (session cont.) — PHASE 0 COMPLETE: harness + pre-port baseline on gfx1201
+- Harness: `wip/qwen4exp/gfx1201/bench-run.sh` (watcher + hang-safe timeout + dated logs).
+- Baseline (fixed build `c63f7f2a0`, 3x R9700 gfx1201, IQ4_XS, tensor split, UNPINNED):
+  depth-0 ladder at f16/bf16/q8_0 KV + depth spot — see Phase 0 table above.  Highlights:
+  bf16 KV pp512 1489.75 / pp2048 2149.14 / pp8192 2225.29 / pp16384 2211.17, tg128 50.04;
+  q8_0 pp8192 2258.26 (vs 2024 pre-re-base, +11.5%); pp2048@d12288 1765.65 (bf16).
+- Coherence fingerprint (0.3): gfx1201 vs gfx1151 canonical at bf16 KV, same build — TEXT
+  DIVERGES mid-reasoning (gfx1151 "Paris" vs gfx1201 "Could complete sentence.").  The
+  cross-arch convergence goal is NOT met at the pre-port state → Phase 3 has a concrete
+  starting gap to bisect per-op after Phase 1.  Config note: maintainer's preferred bench
+  config = `-sm tensor` + BF16 KV (daily driver); Q8_0 secondary; f16 = campaign continuity
+  only.
 
 <!-- keep the newest entry below this marker -->
