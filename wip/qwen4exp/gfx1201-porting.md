@@ -430,4 +430,39 @@ validation too):
   2607 / pp2048 2973 / pp4096 2718 / pp8192 2619 / pp16384 2528 / tg128 50.6 (with 1.1 +
   mmid wins vs Phase-0: pp2048 +38%, pp16384 +14%).
 
+
+## SESSION-END HANDOFF 2026-09-06 (for the next session — read the worklog from the top for full context)
+State: fork `~/llama.cpp` qwen4exp = master `465e49b9c` + blocks 01-13 (`c261553a1`) +
+consolidated beta + sched-gate (`c63f7f2a0`) + Phase-1/2 kernel ports: 1.1 routed-compact
+MoE MMQ on RDNA4 (`76411193a`), exact-SKU gfx1151 macro + quantize-chunk flat
+(`90ea7e22e`), 2.0.3 mmid_512_10 helper on RDNA4 (`b298cbe7f`, +4.1% pp2048). Clean
+worktree. Delivery local tip `b28fb31` (unpushed; never push from `~/llama.cpp`).
+
+Phase 0/1/2.0/2.1 DONE (details + numbers above); **next = Phase 2.2-2.4**: 2.2 depth rows
+(32K/64K r1 already done via the QSA interleaves; add memory stability -r3 through 32K +
+default depth ladder); 2.3 decode leg (tg128/512 at depth, MTP acceptance per
+`benchmarks/mtp-adaptive-methodology.md` with `/models/Qwen3.8/Flash-Next/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf`,
+server smoke); 2.4 multi-GPU determinism (same-seed run-to-run, tensor split, ub2048 — the
+sched-gate's original failure mode), AR toggles (hybrid default / `GGML_CUDA_ALLREDUCE=nccl` /
+issue-13 fallback).
+
+**OPEN work package (confirm direction with the maintainer before implementing):** gfx1201
+QSA-decode tuning (sparse decode loses at depth on RDNA4: dense +20% @32K / +29% @64K;
+flat at d0; gfx1151's tuning doesn't transfer — indexer store/scoring + sparse-FA decode
+kernels) OR a depth-regime default decision. Record:
+`wip/archive/qwen4exp/discovery/2026-09-06-gfx1201-qsa-depth.md`.  Also untested: 2.0.2
+weighted decode expert-sum RDNA4 relax (needs a Q8_0/IQ4_NL-down decode model, e.g. a
+Q3_K-A3B-class subject).
+
+Protocol reminder: model `/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf`;
+`llama-bench -fa on -sm tensor -ngl 99 -t 15 -r 3 -b 2048 -ub 2048 -ctk bf16 -ctv bf16
+--load-mode none`; env `LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib HIP_VISIBLE_DEVICES=0,1,2
+RCCL_BUFFSIZE=16777216`; UNPINNED; harness `wip/qwen4exp/gfx1201/bench-run.sh`; box drifts
++-5-7% across 20-40-min windows → toggle-interleaved brackets only. Coherence oracle =
+gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm fix
+`5fdfa6282`). Discovery records:
+`wip/archive/qwen4exp/discovery/2026-09-06-gfx1201-rdna4-routed-moe-mmq.md` +
+`...-2026-09-06-gfx1201-qsa-depth.md`.  Tensor-vs-layer A/B (tensor wins 1.31-1.47×) in
+`runs/p1-splitAB-*`.
+
 <!-- keep the newest entry below this marker -->
