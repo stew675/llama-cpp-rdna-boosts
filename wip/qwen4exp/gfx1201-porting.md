@@ -206,10 +206,25 @@ session) made the ggml layer safe multi-GPU; now validate the model level end-to
       pp8192 (gfx1151 gains reproduce).  MMID_512=1: -4.1% (2.0.3).  WEIGHTED_DOWN=1:
       no-op control ✓.  Layer-split anchor: pp2048 2238 / pp16384 1710 / tg128 37.2.
       QSA depth interleaves double as partial 2.2 depth rows.
-- [ ] **2.2** Depth rows (12k/32k, r1) + memory stability −r3 through 32k.
-- [ ] **2.3** Decode leg: tg128/512, MTP acceptance per `benchmarks/mtp-adaptive-methodology.md`
+- [x] **2.2** Depth rows (12k/32k, r1) + memory stability −r3 through 32k.
+      DONE 2026-09-07 — default tensor bf16 current-state ladder (1.1+mmid in):
+      pp2048/tg128 @d8192 2246/43.8, @d12288 2198/43.0 (+24.5% pp vs Phase-0 pre-1.1 1765.7),
+      @d32768 2038.3±34/39.38±0.37 **-r3 memory-stable** (no OOM/drift across reps;
+      matches the 2.1 d32768 r1 1971/39.7 within window), @d65536 1702/35.1 (2.1 r1).
+      Smooth degradation, no cliff: pp 2246→2198→2038→1702, tg 43.8→43.0→39.4→35.1.
+- [x] **2.3** Decode leg: tg128/512, MTP acceptance per `benchmarks/mtp-adaptive-methodology.md`
       (acceptance must stay > ~0.45, MTP >= plain at depth 3), server smoke (user config,
       flat decode through 4k gen — the gfx1201 QSA decode fix pre-dates the re-base).
+      DONE 2026-09-07 — tg512: 52.2±0.9 @d0 (r3) / 44.2 @d12288.  Protocol A (IQ4_XS main +
+      IQ4_XS/mtp Q4_K_M draft, seed 42 temp 0, prose): plain 49.9 → draft-mtp 53.1 t/s
+      (+6.4%), acceptance profile per-pos (0.606, 0.317, 0.154) — pos-1 0.606 > the 0.45
+      bar, mean len 2.08, NO 0-collapse → draft-vs-verify numerics consistent (512-expert
+      Flash-Next draws shorter drafts than the 128-expert A3B's 0.51/2.9, hence the modest
+      +6.4%).  Server smoke (3-GPU tensor, bf16, hybrid default): 4096-token greedy gen at
+      flat 48.8-49.0 t/s sustained (tg_3s 45.6 at the deepest point), graphs reused,
+      0 faults/hangs → the pre-re-base QSA decode fix holds on the re-based build.
+      Note: raw /completion prose without the chat wrapper stops at 1 token on this model
+      (argmax = stop) — wrap `<|im_start|>…<|im_end|>\nassistant` for server gens.
 - [ ] **2.4** Multi-GPU-specific: hybrid-AR + RCCL toggles (`GGML_CUDA_ALLREDUCE=nccl` /
       default hybrid / issue-13 fallback), the tensor-split + MTP-verify path, ubatch-2048
       multi-chunk prefill determinism (the sched-gate's original failure mode — confirm the
