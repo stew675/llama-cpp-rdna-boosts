@@ -817,4 +817,29 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
 - Next candidates: the per-layer mega-op (store+q-side+score+topk+FA toward one kernel); halo
   fused-vs-dense A/B owed (only fused-vs-dense matters now, [3] parked).
 
+### 2026-09-07 (cont.) — MEGA-OP phase opens; CRITICAL: the old decode profiles were the PER-OP path, not fused
+- ARTIFACT FOUND: llama-cli decode token #1 (the first generated token after prefill) runs the PER-OP
+  indexer chain; tokens #2+ run the fused INDEXER_SCORE.  n=1 runs (all the 2026-09-07 rocprof
+  profiles) therefore captured PER-OP decode - the 23.4ms/66-70% util/+375-kernel numbers described
+  the per-op path, NOT fused.  Verified: rocprof shows indexer_score_kernel fires for -n 3 (72 kerns
+  = 12 layers x 6 tok) but not -n 1; per-token clusters in n=8 runs: token#1 per-op, #2-8 fused.
+  Root cause not yet chased (graph-reuse/params subtlety) - steady-state decode (llama-bench, real
+  serving) IS fused, so llama-bench remains the measurement vehicle; llama-cli n must be >= 3.
+- TRUE FUSED steady-state numbers (llama-bench tg64 d32768 profiles, /tmp/prof/d32, box @11:57):
+    fused 33.88 t/s (29.5ms/token): 2629 disp/device/token, busy ~18.3ms, util ~62%
+    dense 37.55 t/s (26.6ms/token): 2412 disp/device/token, busy ~16.7ms, util ~63%
+    deficit ~2.9ms/token = +217 disp (x3.6us gap ~ +0.8ms) + ~+1.6ms busy + noise.
+  Sparse machinery/device/token = 159 launches (indexer_score 13.1 + topk init 13.1/hist 52.7/
+  select 52.9/count 13.3/scan 13.3/write 13.3) ~= 12 launches/QSA layer x ~13.1 layers.
+  The whole topk pipeline ~= 63us busy + 12 x 3.6us gap per layer ~= 1.0-1.4ms/token combined.
+- CUDA graphs: decode DOES replay graphs (ids reused every token); GGML_CUDA_DISABLE_GRAPHS=1 costs
+  only ~2% (31.1 vs 31.7 t/s) -> the ~3.6us/kernel gap is GPU-side dispatch turnaround inside graph
+  replay: a hard per-kernel floor.  Kernel-count reduction is the only lever on the gap.
+- MEGA-OP increment 1 (in progress): INDEXER_TOPK launch cut 11 -> ~7/layer (fold radix_init into
+  pass-1 select; 4x 8-bit radix passes -> 3x (12+10+10 bits, shifts 20/10/0, smem 16KB/4KB/4KB)).
+  Then q-side norm+rope fold into INDEXER_SCORE (-2/layer); then the score+topk-pass1 fusion.
+  Parity rule: the topk cell LIST must be identical (tie order = ascending column) - the qsa kernel
+  consumes the cells; any list change breaks the same-seed toggle contract.
+- First-decode-token anomaly note for llama-bench users: llama-bench decode is steady-state fused.
+
 <!-- keep the newest entry below this marker -->
