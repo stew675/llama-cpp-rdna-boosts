@@ -154,11 +154,27 @@ and A/B is same-session on/off (or vs the pre-port build).
       GDN is sequential regardless, so the MTP acceptance gate is unaffected by construction
       (and the chunked path is bit-exact: long-prefill same-seed text BYTE-IDENTICAL ON vs
       OFF).  MTP decode-side acceptance remains covered by Phase 2.3.
-- [ ] **1.6 Per-file RDNA3_5 config-row audit** (fattn / mmf / concat / mmvq / mmid / vecdotq
+- [x] **1.6 Per-file RDNA3_5 config-row audit** (fattn / mmf / concat / mmvq / mmid / vecdotq
       RDNA3_5 references): classify each as (a) RDNA3_5-only row (leave; RDNA4 has its own
-      pre-campaign rows) vs (b) a "generality" finding that should carry to RDNA4 (e.g. the
-      flash (256,256,64) Q_in_reg register-pressure finding — check whether the RDNA4 flash
-      row set shares the geometry).  List the carry candidates + validate each.
+      pre-campaign rows) vs (b) a "generality" finding that should carry to RDNA4.
+      DONE 2026-09-06 (classification; per-item relax/validate deferred to Phase 2):
+      (a) leave (RDNA4 has its own rows): fattn.cu:666 `wmma_max_head` (RDNA4 576 already,
+      its own cap); vecdotq.cuh:247 `VDR_Q8_0_Q8_1_MMVQ` (RDNA4 already VDR=4, measured);
+      mmq.cu:587 IQ2_XS/IQ2_S mmq-vs-hipblas rule (RDNA3_5 always-mmq; others ne11<=128 =
+      upstream; inert for IQ4 workloads); ggml-cuda.cu:4399 moe_mmq fused gate+up+GLU
+      K-quant path (ALREADY RDNA4 — block 13, caps tuned on gfx1201).
+      (b) carry candidates — RDNA3_5-gated TODAY on gfx1201, need a relax-probe + A/B
+      (mostly Phase 2 scope): concat.cu `concat_transposed_tile_y` 16-vs-8 (memory-bound;
+      likely small given 1.2's dispatcher finding); ggml-cuda.cu:3808 swiglu fused MMQ for
+      IQ4_NL/Q8_0 gate+up (qwen4exp 640/2560 shape; the K-quant sibling 4399 is already
+      RDNA4); mmid.cu:209 `mm_ids_helper_512_10` (our 512/10 shape runs the generic path on
+      gfx1201); mmvq.cu:2622 weighted decode expert-sum
+      (`mul_mat_id_iq4_nl/q8_0_weighted_rdna3_5`, 640/2560/512/10) — gfx1201 = UNFUSED
+      decode weighted-sum today.
+      → Phase-2 DEPENDENCY: the 2.1/2.3 toggles for MMID_512 / WEIGHTED_DOWN / the
+      IQ4-NL-swglu + weighted-sum paths only measure the OFF-state on gfx1201 unless the
+      gates are relaxed first (Phase 2.0 relax-probes, env-gated, before the 2.1 ladder).
+      Arch-agnostic model fusions (QSA, hc hyperconn — opt-out-only) DO fire on RDNA4.
 
 ## PHASE 2 — Consolidated-beta model-level validation on gfx1201 (same-session ladder)
 
@@ -336,5 +352,16 @@ validation too):
 - Depth leg: pp2048@d12288 +6.6%; tg@d12288 unchanged.  Bit-exactness: long-prefill
   same-seed text byte-identical ON vs OFF.  No code change; MTP acceptance gate
   unaffected by construction (decode sequential both ways) + covered in Phase 2.3.
+
+### 2026-09-06 (session cont.) — PHASE 1.6 DONE: per-file RDNA3_5 row audit (classification)
+- (a) leave: fattn wmma_max_head (RDNA4 576 own), vecdotq VDR (RDNA4 4 own), mmq.cu:587
+  IQ2 rule (inert for IQ4), ggml-cuda.cu:4399 K-quant moe_mmq (already RDNA4, block 13).
+- (b) carry candidates (RDNA3_5-gated today on gfx1201): concat tile_y 16, swiglu fused
+  MMQ IQ4_NL/Q8_0 (3808), mm_ids_helper_512_10 (mmid.cu:209), weighted decode expert-sum
+  (mmvq.cu:2622).  DEPENDENCY for Phase 2: those Phase-2 toggles measure only the OFF
+  state on gfx1201 until env-gated relax-probes land (Phase 2.0).  Arch-agnostic fusions
+  (QSA, hc) fire on RDNA4 already.
+- PHASE 1 COMPLETE: 1.1 landed (fork `76411193a`, +4-8% prefill), 1.2 landed (refactor,
+  `90ea7e22e`; chunk flat), 1.3/1.4/1.5/1.6 = decisions/validations/audit (no code).
 
 <!-- keep the newest entry below this marker -->
