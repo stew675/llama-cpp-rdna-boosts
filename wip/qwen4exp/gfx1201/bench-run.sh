@@ -17,6 +17,8 @@ export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib
 export HIP_VISIBLE_DEVICES=0,1,2
 export RCCL_BUFFSIZE=16777216
 
+# callers: pass --load-mode none -lzm off explicitly in every bench invocation (lazy page-in
+# must not be a variable; lm=none is already the campaign default, -lzm off is belt-and-braces)
 # watcher: sample VRAM used (GPU 0-2), GPU use, bench pid CPU, every 3 s
 ( for i in $(seq 1 200); do
     ts=$(date +%s)

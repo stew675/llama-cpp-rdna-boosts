@@ -118,13 +118,18 @@ and A/B is same-session on/off (or vs the pre-port build).
       fix folded into the same commit: `cc == GGML_CUDA_CC_RDNA3_5 + 1` (fragile — only
       equals gfx1151 because 0x1150+1 == 0x1151) → `GGML_CUDA_CC_IS_GFX1151(cc)` exact-cc
       macro in `common.cuh` (OFFSET_AMD + 0x1151, decoupled from the family base).
-- [ ] **1.3 split_j Q8_0 mma specialization + B-parity Q8_0 config rows** (`mmq-vec-dot.cuh`
-      `#elif defined(RDNA3_5)`; `mmq-config-rdna3_5.cuh` vs untouched `mmq-config-rdna4.cuh`).
-      Plan: benchmark RDNA4's native I=128/192-vgpr profile vs a split_j I=64 port; adopt only
-      if it wins (the gfx1151 win came with a vgpr 232→136 change — RDNA4's profile differs);
-      else document the decision in the worklog.
-      Validation: same-session + logitcmp; note the campaign TRAP (the `!use_mmvq` exclusion
-      is required or single-token decode diverges — re-check when porting the geometry).
+- [x] **1.3 split_j Q8_0 mma specialization + B-parity Q8_0 config rows** (`mmq-vec-dot.cuh`
+      split_j constexpr; `mmq-config-rdna3-5.cuh` vs `mmq-config-rdna4.cuh`).
+      DONE 2026-09-06: **keep RDNA4's native I=128 — do NOT port the I=64 split_j
+      geometry**.  Scope probe (env J-log, then removed): dense Q8_0 J=128 is the dominant
+      Q8_0 shape (2838/2862 launches at pp2048, 22704 at pp16384; MoE Q8_0 J=48 negligible)
+      — the question was load-bearing.  A/B on the RDNA4 Q8_0 J=128 row (I 128 native vs
+      64 split): pp16384 FLAT (2383.5 vs 2394/2379), pp8192 -0.5% (2449 vs 2459/2462),
+      pp2048 -2..-3% (2607 vs 2658/2698; tight σ on both sides).  gfx1201's register file
+      handles the I=128 profile without the gfx1151 spilling (232->136-vgpr win does NOT
+      transfer) — the wider-row geometry wins on RDNA4.  Fallback J=128 row (rdna3-5
+      nthreads128/I64 vs rdna4 nthreads256/I128) left as-is (fallback rarely fires here;
+      needs nrows_x%128 != 0).
 - [ ] **1.4 mmq accumulator-overflow latent-defect audit on the RDNA4 table** (TODO 3d; the
       `I < nwarps*16` mma sum[] overflow — "likely applies [to rdna4.cuh] too" per the brief):
       audit every row in `mmq-config-rdna4.cuh` for `I >= nwarps*16`; feed the upstream defect
@@ -288,5 +293,18 @@ validation too):
   family-base + 1 == gfx1151 (true only via AMD's contiguous gfx numbering) → new
   `GGML_CUDA_CC_IS_GFX1151(cc)` exact-cc macro in common.cuh
   (`cc == OFFSET_AMD + 0x1151`), no comment bloat.  Fork `90ea7e22e`.
+
+### 2026-09-06 (session cont.) — PHASE 1.3 DONE: split_j Q8_0 geometry does NOT transfer to RDNA4
+- Scope probe first (env J-log, removed after): dense Q8_0 mmq runs J=128 (2838/2862 Q8_0
+  launches at pp2048; 22704 at pp16384) — MoE Q8_0 (J=48) negligible.  So the Q8_0 J=128
+  config-row question is the real content of 1.3.
+- A/B of the RDNA4 Q8_0 J=128 non-fallback row: I=128 native vs I=64 split_j (the
+  gfx1151-winning geometry, vgpr 232->136 there).  gfx1201: pp16384 FLAT, pp8192 -0.5%,
+  pp2048 -2..-3% (tight σ both sides; interleaved).  gfx1201 handles the I=128 profile
+  without gfx1151's spilling → wider rows win → KEEP I=128.  Cross-arch lesson confirmed
+  again: per-arch config rows do not transfer.
+- Method note (maintainer): bench runs already pass --load-mode none (lm column = none;
+  eager host read, no mmap lazy page-in); added explicit '-lzm off' guidance to
+  bench-run.sh so lazy mode is never a variable in any run.
 
 <!-- keep the newest entry below this marker -->
