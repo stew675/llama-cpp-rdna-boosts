@@ -1017,4 +1017,27 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   explaining these are copies already inside the patch sets, kept separate as PR starting
   points; not additional deliverables.
 
+### 2026-09-07 (cont.) — DELIVERY CLEANUP (fork 8994dd490 + 1ff824bff): investigative code archived; fused+cache1 are the DEFAULT decode path
+- ARCHIVED from the fork (patches + README in wip/archive/qwen4exp/patches/2026-09-07-
+  investigative-drops/): the QSA_DECODE_SKIP probe, the fused INDEXER_POOL op (op enum/
+  name/builder/dispatch/meta-mirror removed; GGML_OP_COUNT 108->107, RPC version 6->7),
+  and the topk init-fold + two-round select (the topk is back to the pre-fold 8-bit radix
+  with init, state at 6703ad09f).
+- DEFAULTS FLIPPED ON (the maintainer's full-fidelity requirement): GGML_CUDA_QSA_INDEXER_
+  SCORE and GGML_CUDA_QSA_INDEXER_CACHE now default ON (=0 disables for A/B), so plain
+  llama-bench/llama-server runs reproduce the 2026-09-07 crossover tables with no env.
+- VERIFIED on gfx1201 (same-seed llama-cli, 4.3K depth, banner-stripped):
+  * default decode (Soar policy = dense) byte-identical to LLAMA_QSA_OFF
+  * QSA decode (LLAMA_QSA_DENSE_DECODE_UNTIL=0) with the default-on fused+cache1 path
+    byte-identical to the per-op reference (GGML_CUDA_QSA_INDEXER_SCORE=0 CACHE=0)
+  * the round2-vs-prefold topk A/B WITH cache1 @32K: 37.69 vs 37.69 t/s - perfectly flat
+    (the earlier 39.4-vs-41.5 reading was box drift), confirming the topk reverts archive
+    cleanly with zero perf effect
+- Clean-apply verification re-run at the new tip: 465e49b9c + 13 blocks + the regenerated
+  qwen4exp-support.patch == fork tip 1ff824bff (0 diff lines).
+- Re-baseline on the cleaned build (Soar): default tg 44.5 @32K / 39.0 @131K (dense),
+  pp2048 2004 @32K / 1340 @131K (QSA prefill) - matches the tables within box drift.
+- NOTE: the archived backup branch is ~/llama.cpp qwen4exp-backup-20260907-precampaign-
+  cleanup (tip 6e4778ed8, the pre-cleanup state incl. the round2 topk).
+
 <!-- keep the newest entry below this marker -->

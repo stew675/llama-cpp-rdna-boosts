@@ -1,0 +1,45 @@
+From e6b7ae6f0ddeb646383afb220da36bc77991a519 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Mon, 7 Sep 2026 04:39:15 -0500
+Subject: [PATCH] qwen4exp: PROBE env-gated QSA_DECODE_SKIP layer-skip
+ (measurement tool, default off)
+
+GGML_CUDA_QSA_DECODE_SKIP=N runs the dense attend + indexer-store path on every
+(N+1)-th sparse layer during single-token decode (cache stays consistent).
+Quantifies the per-layer cost of the indexer build stack behind the gfx1201
+sparse-decode depth gap (2026-09-07 root-cause record).  d32768 tg128 tensor
+bf16: skip=0 39.7, skip=1 (half) 42.6, skip=3 (quarter) 44.1, dense 47.5 ->
+per-layer-additive ~7.8 t/s total @32K; fusion ceiling = dense parity at depth.
+---
+ src/models/qwen4exp.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 5568c925d..54fd6848b 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1259,8 +1259,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+             const char * env = getenv("LLAMA_QSA_DENSE_SHORTCUT");
+             return env == nullptr || atoi(env) != 0;
+         }();
++        // PROBE (env-gated, remove after measurement): GGML_CUDA_QSA_DECODE_SKIP=N skips the
++        // QSA selection on every (N+1)-th sparse layer during single-token decode (the layer
++        // runs the dense attend + indexer-store path; cache stays consistent for the kept
++        // layers).  Quantifies the per-layer cost of the indexer build stack (the gfx1201
++        // sparse-decode depth gap - see the 2026-09-07 root-cause record).
++        static const int qsa_decode_skip = [] {
++            const char * env = getenv("GGML_CUDA_QSA_DECODE_SKIP");
++            return env == nullptr ? 0 : std::atoi(env);
++        }();
++        static int qsa_decode_seen = 0;  // decode-graph layer counter (graph is captured once)
++        const bool do_skip = n_tokens == 1 && qsa_decode_skip != 0 && ((qsa_decode_seen++ & qsa_decode_skip) != 0);
+         if (shortcut && n_kv <= width) {
+             build_qsa_store_k(mctx_hyb, cur, il);
++        } else if (do_skip) {
++            build_qsa_store_k(mctx_hyb, cur, il);
+         } else {
+             top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il);
+         }
+-- 
+2.55.0
+

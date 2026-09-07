@@ -303,10 +303,16 @@ top-level blocks on the fork base `465e49b9c` (upstream master + rdna-boosts blo
 work). Verified from scratch on the 2026-09-06 re-base + again 2026-09-07 at the new tip:
 `scripts/apply-all.sh` of the 13 blocks at `465e49b9c` + `git apply --3way` of
 `qwen4exp-support.patch` (55 files) — the resulting tree is the rebuilt `~/llama.cpp`
-`qwen4exp` branch (fork tip `6e4778ed8`, 2026-09-07).  The patch = `git diff
-c261553a1..6e4778ed8` (13-block tip to the qwen4exp tip) and carries the fork's full
+`qwen4exp` branch (fork tip `1ff824bff`, 2026-09-07).  The patch = `git diff
+c261553a1..1ff824bff` (13-block tip to the qwen4exp tip) and carries the fork's full
 qwen4exp delta including the RDNA4 tuning commits (mmq RDNA4-enable, exact-SKU gfx1151
-quantize predicate, mmid-512x10 helper) that sit on the branch.
+quantize predicate, mmid-512x10 helper) that sit on the branch.  The 2026-09-07
+investigative code (QSA_DECODE_SKIP probe, fused INDEXER_POOL op, the topk init-fold +
+two-round select) is NOT in the patch - archived in
+`wip/archive/qwen4exp/patches/2026-09-07-investigative-drops/`.  The fused INDEXER_SCORE
+op + the derived cache are the DEFAULT decode path (env `GGML_CUDA_QSA_INDEXER_SCORE` /
+`GGML_CUDA_QSA_INDEXER_CACHE` default ON, `=0` disables for A/B), so a plain
+llama-bench/llama-server run reproduces the 2026-09-07 crossover tables with no env.
 
 ```
 git checkout 465e49b9c

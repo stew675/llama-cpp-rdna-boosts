@@ -1,0 +1,263 @@
+From 4ff65247cd230d4a222a7751067d6b9784103d5d Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Mon, 7 Sep 2026 16:03:52 -0500
+Subject: [PATCH] qwen4exp/ggml: two-round 16-bit topk select (decode/small-row
+ path) - parity-verified, wall-flat at 32K
+
+Replaces the topk's 11 dependent kernels (init + 4x(hist+select) + count + scan +
+write) with 8 (memset + 2x(hist16 + select16) + count + scan + write) for nrows <= 8
+(decode/spec-verify; prefill keeps the 8-bit radix - per-row 2^16-int bins would blow
+the pool at nrows=2048).  Two 16-bit rounds resolve the full 32-bit boundary key
+exactly; select16 re-zeroes the bins for the next round/op (one memset per op).
+
+Measured: same-seed output byte-identical to the radix build (2-build A/B, 24 tokens);
+llama-bench d32768 interleaved radix 40.20 vs r2 40.18 t/s - FLAT.  Consistent with the
+session's finding: the fused decode wall is not sensitive to the topk's internal chain
+length or busy at 32K (score-busy cuts and launch cuts are also flat); only wholesale
+chain removal (the GGML_CUDA_QSA_DECODE_SKIP probe) moves the wall (~0.15ms/layer).  The
+round2 path still halves the chain steps and cuts the cell scans (5 -> 3 full passes),
+which may surface at deeper contexts where the topk busy grows.
+---
+ ggml/src/ggml-cuda/indexer-topk.cu | 208 +++++++++++++++++++++++++----
+ 1 file changed, 184 insertions(+), 24 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
+index e2dbc3425..93323641b 100644
+--- a/ggml/src/ggml-cuda/indexer-topk.cu
++++ b/ggml/src/ggml-cuda/indexer-topk.cu
+@@ -283,6 +283,40 @@ static __global__ void indexer_topk_deterministic_write(
+     }
+ }
+ 
++// deterministic gather (shared by the radix and the two-round select paths): the
++// states' prefix (full 32-bit boundary key) + rank decide, per cell, whether it is
++// greater (placed first, ascending) or equal-boundary (rank of them placed last).
++template<typename kv_t>
++static void indexer_topk_gather_cuda(
++        ggml_cuda_pool & pool,
++        const float * score, const int * cell_blk, const kv_t * additive,
++        int * dst, const indexer_topk_radix_state * states,
++        int ncols, int nrows, int n_tps, int n_blocks, int n_kv, int k,
++        cudaStream_t stream) {
++    constexpr int BLOCK_SIZE = 256;
++    if (k <= 0 || nrows == 0) {
++        return;
++    }
++    const int cbpr = (ncols + BLOCK_SIZE - 1) / BLOCK_SIZE;   // count/write blocks per row
++    ggml_cuda_pool_alloc<int> gc_alloc(pool, (size_t) nrows * cbpr);
++    ggml_cuda_pool_alloc<int> ec_alloc(pool, (size_t) nrows * cbpr);
++    ggml_cuda_pool_alloc<int> gb_alloc(pool, (size_t) nrows * cbpr);
++    ggml_cuda_pool_alloc<int> eb_alloc(pool, (size_t) nrows * cbpr);
++    int * g_cnt  = gc_alloc.get();
++    int * e_cnt  = ec_alloc.get();
++    int * g_base = gb_alloc.get();
++    int * e_base = eb_alloc.get();
++
++    indexer_topk_count<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
++            score, cell_blk, additive, states, g_cnt, e_cnt,
++            ncols, n_tps, n_blocks, n_kv, cbpr);
++    indexer_topk_base_scan<<<nrows, BLOCK_SIZE, 0, stream>>>(
++            g_cnt, e_cnt, g_base, e_base, nrows, cbpr);
++    indexer_topk_deterministic_write<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
++            score, cell_blk, additive, states, g_base, e_base, dst,
++            ncols, n_tps, n_blocks, n_kv, k, cbpr);
++}
++
+ template<typename kv_t>
+ static void indexer_topk_radix_cuda(
+         ggml_cuda_pool & pool,
+@@ -312,28 +346,139 @@ static void indexer_topk_radix_cuda(
+             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift, p == 0 ? 1 : 0, k);
+     }
+ 
+-    // deterministic gather: ascending column order, no atomics (see kernels above)
+-    if (k <= 0 || nrows == 0) {
+-        return;
++    indexer_topk_gather_cuda(pool, score, cell_blk, additive, dst, states,
++            ncols, nrows, n_tps, n_blocks, n_kv, k, stream);
++}
++
++// ---------------------------------------------------------------------------
++// two-round 16-bit selection (small-nrows path: decode/speculative-verify).
++//
++// The decode's per-layer chain is latency-bound: the topk's 11 dependent kernels
++// (init + 4x(hist+select) + count + scan + write) sit serially on the critical
++// path.  Resolve the full 32-bit boundary prefix with ONE wide top-16 histogram
++// round and ONE low-16 round over the boundary bucket instead: hist -> select ->
++// hist -> select, then the shared deterministic gather.  Per-row bins are 2^16
++// ints in the pool (zeroed by one memset; the round-1 select re-zeroes them for
++// round 2 on its way out, and the round-2 select for the next op).  The emitted
++// cell list is identical to the radix path (same prefix, rank and tie rule).
++// ---------------------------------------------------------------------------
++
++template<typename kv_t>
++static __global__ void indexer_topk_hist16(
++        const float * __restrict__ score,
++        const int   * __restrict__ cell_blk,
++        const kv_t  * __restrict__ additive,
++        const indexer_topk_radix_state * __restrict__ states,
++        int * __restrict__ bins,               // [nrows][65536], zeroed before launch
++        int ncols, int n_tps, int n_blocks, int n_kv,
++        int blocks_per_row,
++        int first16) {                         // 1: top half; 0: low half of the bucket
++    constexpr int BLOCK_SIZE = 256;
++    const int row = blockIdx.x / blocks_per_row;
++    const int rb  = blockIdx.x % blocks_per_row;
++    const int tid = threadIdx.x;
++    const int t = row % n_tps;
++    const int s = row / n_tps;
++    int * row_bins = bins + (size_t) row * 65536;
++    const uint32_t hi_filter = first16 ? 0 : (states[row].prefix >> 16);
++    for (int col = rb * BLOCK_SIZE + tid;
++         col < ncols;
++         col += blocks_per_row * BLOCK_SIZE) {
++        const uint32_t key = indexer_topk_float_to_ordered(
++                indexer_topk_value(score, cell_blk, additive, col, t, s, n_blocks, n_tps, n_kv));
++        if (first16) {
++            atomicAdd(&row_bins[key >> 16], 1);
++        } else if ((key >> 16) == hi_filter) {
++            atomicAdd(&row_bins[key & 0xFFFF], 1);
++        }
+     }
+-    const int cbpr = (ncols + BLOCK_SIZE - 1) / BLOCK_SIZE;   // count/write blocks per row
+-    ggml_cuda_pool_alloc<int> gc_alloc(pool, (size_t) nrows * cbpr);
+-    ggml_cuda_pool_alloc<int> ec_alloc(pool, (size_t) nrows * cbpr);
+-    ggml_cuda_pool_alloc<int> gb_alloc(pool, (size_t) nrows * cbpr);
+-    ggml_cuda_pool_alloc<int> eb_alloc(pool, (size_t) nrows * cbpr);
+-    int * g_cnt  = gc_alloc.get();
+-    int * e_cnt  = ec_alloc.get();
+-    int * g_base = gb_alloc.get();
+-    int * e_base = eb_alloc.get();
++}
+ 
+-    indexer_topk_count<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
+-            score, cell_blk, additive, states, g_cnt, e_cnt,
+-            ncols, n_tps, n_blocks, n_kv, cbpr);
+-    indexer_topk_base_scan<<<nrows, BLOCK_SIZE, 0, stream>>>(
+-            g_cnt, e_cnt, g_base, e_base, nrows, cbpr);
+-    indexer_topk_deterministic_write<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
+-            score, cell_blk, additive, states, g_base, e_base, dst,
+-            ncols, n_tps, n_blocks, n_kv, k, cbpr);
++// mode 0 (round 1): bins hold the top-16 histogram.  Finds the boundary bucket and the
++// cells still needed within it, writes states.prefix = B1 << 16 (the round-2 filter)
++// and states.rank, then zeroes the bins for round 2.
++// mode 1 (round 2): bins hold the low-16 histogram of the boundary bucket.  Finds the
++// exact boundary bin, writes the full 32-bit prefix and the final rank, then zeroes.
++static __global__ void indexer_topk_select16(
++        int * __restrict__ bins,
++        indexer_topk_radix_state * __restrict__ states,
++        int nrows, int k, int mode) {
++    constexpr int BLOCK_SIZE = 256;
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++    int * const rb = bins + (size_t) row * 65536;
++    int * const chunk = rb + tid * 256;
++    __shared__ int chunk_sum[BLOCK_SIZE];
++
++    // per-thread sum of its contiguous 256-bin chunk (bins kept for the walk below)
++    int sum = 0;
++    for (int j = 0; j < 256; ++j) {
++        sum += chunk[j];
++    }
++    chunk_sum[tid] = sum;
++    __syncthreads();
++
++    if (tid == 0) {
++        int need = mode == 0 ? k : states[row].rank;
++        int cum = 0;
++        int c = BLOCK_SIZE - 1;
++        while (c >= 0 && cum + chunk_sum[c] < need) {
++            cum += chunk_sum[c];
++            --c;
++        }
++        const int * bc = rb + c * 256;
++        int b = 255;
++        while (b >= 0 && cum + bc[b] < need) {
++            cum += bc[b];
++            --b;
++        }
++        indexer_topk_radix_state st = states[row];
++        if (mode == 0) {
++            st.prefix = (uint32_t) (c * 256 + b) << 16;
++        } else {
++            st.prefix = (st.prefix & 0xFFFF0000u) | (uint32_t) (c * 256 + b);
++        }
++        st.rank = need - cum;
++        states[row] = st;
++    }
++    __syncthreads();
++
++    // leave the bins zeroed for the next round / the next op (no second memset)
++    for (int j = 0; j < 256; ++j) {
++        chunk[j] = 0;
++    }
++}
++
++template<typename kv_t>
++static void indexer_topk_round2_cuda(
++        ggml_cuda_pool & pool,
++        const float * score, const int * cell_blk, const kv_t * additive,
++        int * dst, int ncols, int nrows, int n_tps, int n_blocks, int n_kv, int k,
++        cudaStream_t stream) {
++    constexpr int BLOCK_SIZE = 256;
++    const int blocks_per_row = std::min((ncols + 1023) / 1024, 8);
++
++    ggml_cuda_pool_alloc<indexer_topk_radix_state> states_alloc(pool, nrows);
++    ggml_cuda_pool_alloc<int> bins_alloc(pool, (size_t) nrows * 65536);
++    indexer_topk_radix_state * states = states_alloc.get();
++    int * bins = bins_alloc.get();
++
++    GGML_ASSERT(cudaMemsetAsync(bins, 0, (size_t) nrows * 65536 * sizeof(int), stream) == cudaSuccess);
++
++    const dim3 hgrid(blocks_per_row * nrows);
++    // round 1: top 16 bits -> boundary bucket B1 (states.prefix = B1 << 16, rank = need)
++    indexer_topk_hist16<kv_t><<<hgrid, BLOCK_SIZE, 0, stream>>>(
++            score, cell_blk, additive, states, bins,
++            ncols, n_tps, n_blocks, n_kv, blocks_per_row, 1);
++    indexer_topk_select16<<<nrows, BLOCK_SIZE, 0, stream>>>(bins, states, nrows, k, 0);
++    // round 2: low 16 bits of the B1 bucket -> exact boundary key + final rank
++    indexer_topk_hist16<kv_t><<<hgrid, BLOCK_SIZE, 0, stream>>>(
++            score, cell_blk, additive, states, bins,
++            ncols, n_tps, n_blocks, n_kv, blocks_per_row, 0);
++    indexer_topk_select16<<<nrows, BLOCK_SIZE, 0, stream>>>(bins, states, nrows, k, 1);
++
++    indexer_topk_gather_cuda(pool, score, cell_blk, additive, dst, states,
++            ncols, nrows, n_tps, n_blocks, n_kv, k, stream);
+ }
+ 
+ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -362,12 +507,27 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     const int k        = dst->ne[0];
+     ggml_cuda_pool & pool = ctx.pool();
+ 
++    // the two-round select needs per-row 2^16-int bins (256 KB/row); gate it to the
++    // small-nrows decode / speculative-verify cases (nrows <= 8 -> <= 2 MB) and keep the
++    // 8-bit radix for large-batch prefill where per-row bins would blow the pool up.
++    const bool use_round2 = nrows > 0 && nrows <= 8;
++
+     if (additive->type == GGML_TYPE_F16) {
+-        indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const half *) additive->data,
+-                dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++        if (use_round2) {
++            indexer_topk_round2_cuda(pool, score_d, cell_blk_d, (const half *) additive->data,
++                    dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++        } else {
++            indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const half *) additive->data,
++                    dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++        }
+     } else {
+-        indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const float *) additive->data,
+-                dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++        if (use_round2) {
++            indexer_topk_round2_cuda(pool, score_d, cell_blk_d, (const float *) additive->data,
++                    dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++        } else {
++            indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const float *) additive->data,
++                    dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++        }
+     }
+ }
+ 
+-- 
+2.55.0
+

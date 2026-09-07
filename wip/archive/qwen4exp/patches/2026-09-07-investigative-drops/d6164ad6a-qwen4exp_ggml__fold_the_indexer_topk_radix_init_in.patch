@@ -1,0 +1,144 @@
+From d6164ad6ada482269b81614a7681bb7865b7a910 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Mon, 7 Sep 2026 14:20:47 -0500
+Subject: [PATCH] qwen4exp/ggml: fold the indexer topk radix_init into the
+ pass-1 select; measured launch-cut deltas
+
+- init-fold: 4x8-bit passes unchanged, no init launch (11 -> 10 launches/topk op).
+  Same-seed output byte-identical to the pre-fold build (2-build A/B, 32 tokens).
+  llama-bench d32768 interleaved: 40.28 vs 40.27 t/s - flat (the ~13 saved
+  launches/token ~ +0.2% sits at the box noise floor).
+- 12+10+10-bit 3-pass radix (12-bit first pass) REGRESSED -2.8% (39.06 vs 40.21):
+  the 16x histogram smem-clear + global write-out per block costs more busy than
+  the 2 saved launches save - at this kernel scale busy > launch count, so the
+  decode's sparse-machinery lever is busy reduction (e.g. a block-uniform topk
+  over n_blocks instead of cells), not launch shaving.
+---
+ ggml/src/ggml-cuda/indexer-topk.cu | 55 +++++++++++++++++-------------
+ 1 file changed, 32 insertions(+), 23 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
+index b15af7104..e2dbc3425 100644
+--- a/ggml/src/ggml-cuda/indexer-topk.cu
++++ b/ggml/src/ggml-cuda/indexer-topk.cu
+@@ -37,13 +37,6 @@ struct indexer_topk_radix_state {
+     int equal_count;
+ };
+ 
+-static __global__ void indexer_topk_radix_init(indexer_topk_radix_state * states, int nrows, int k) {
+-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+-    if (row < nrows) {
+-        states[row] = {0, 0, k, 0, 0};
+-    }
+-}
+-
+ // value(c) for row r: score[cell_blk(c, s), t, s] + additive(c, t, s)
+ template<typename kv_t>
+ static __device__ __forceinline__ float indexer_topk_value(
+@@ -66,7 +59,8 @@ static __global__ void indexer_topk_radix_histogram(
+         int * __restrict__ block_histograms,
+         int ncols, int n_tps, int n_blocks, int n_kv,
+         int blocks_per_row,
+-        int shift) {
++        int shift,
++        int first) {
+     constexpr int NBINS = 1 << RADIX_BITS;
+ 
+     const int row = blockIdx.x / blocks_per_row;
+@@ -81,13 +75,20 @@ static __global__ void indexer_topk_radix_histogram(
+     }
+     __syncthreads();
+ 
+-    const indexer_topk_radix_state state = states[row];
++    // the first pass (first != 0) has no prefix yet: the state write is folded into the
++    // pass-1 select, so pass-1 histogramming must not read the (uninitialized) state
++    uint32_t prefix = 0, prefix_mask = 0;
++    if (first == 0) {
++        const indexer_topk_radix_state state = states[row];
++        prefix = state.prefix;
++        prefix_mask = state.prefix_mask;
++    }
+     for (int col = row_block * BLOCK_SIZE + tid;
+          col < ncols;
+          col += blocks_per_row * BLOCK_SIZE) {
+         const uint32_t key = indexer_topk_float_to_ordered(
+                 indexer_topk_value(score, cell_blk, additive, col, t, s, n_blocks, n_tps, n_kv));
+-        if ((key & state.prefix_mask) == state.prefix) {
++        if ((key & prefix_mask) == prefix) {
+             atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
+         }
+     }
+@@ -95,7 +96,9 @@ static __global__ void indexer_topk_radix_histogram(
+ 
+     const size_t histogram_offset =
+         ((size_t) row * blocks_per_row + row_block) * NBINS;
+-    block_histograms[histogram_offset + tid] = histogram[tid];
++    for (int i = tid; i < NBINS; i += BLOCK_SIZE) {
++        block_histograms[histogram_offset + i] = histogram[i];
++    }
+ }
+ 
+ template<int BLOCK_SIZE, int RADIX_BITS>
+@@ -103,7 +106,9 @@ static __global__ void indexer_topk_radix_select(
+         const int * __restrict__ block_histograms,
+         indexer_topk_radix_state * __restrict__ states,
+         int blocks_per_row,
+-        int shift) {
++        int shift,
++        int first,
++        int k) {
+     constexpr int NBINS = 1 << RADIX_BITS;
+ 
+     const int row = blockIdx.x;
+@@ -122,7 +127,10 @@ static __global__ void indexer_topk_radix_select(
+     __syncthreads();
+ 
+     if (tid == 0) {
+-        indexer_topk_radix_state state = states[row];
++        // the first pass writes the state fresh (rank starts at k): the radix_init
++        // launch this replaces is gone, and pass-1 histogramming never reads it
++        indexer_topk_radix_state state = first ?
++            indexer_topk_radix_state{0, 0, k, 0, 0} : states[row];
+         int bin = NBINS - 1;
+         while (bin > 0 && histogram[bin] < state.rank) {
+             state.rank -= histogram[bin--];
+@@ -282,25 +290,26 @@ static void indexer_topk_radix_cuda(
+         int * dst, int ncols, int nrows, int n_tps, int n_blocks, int n_kv, int k,
+         cudaStream_t stream) {
+     constexpr int BLOCK_SIZE = 256;
+-    constexpr int RADIX_BITS = 8;
+-    constexpr int NBINS = 1 << RADIX_BITS;
+     const int blocks_per_row = std::min((ncols + 1023) / 1024, 8);
+ 
++    // NBINS = largest radix pass (8 bits): block_histograms is sized for it
+     ggml_cuda_pool_alloc<indexer_topk_radix_state> states_alloc(pool, nrows);
+-    ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
++    ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * (1 << 8));
+     indexer_topk_radix_state * states = states_alloc.get();
+     int * histograms = histograms_alloc.get();
+ 
+-    indexer_topk_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows, k);
+-
++    // radix select over the full 32-bit ordered key.  Wider passes (12-bit first pass)
++    // regressed ~2.8%: the 16x histogram smem/global traffic per block swamped the saved
++    // launches, so the passes stay 8-bit.  The init launch is folded into the pass-1 select
++    // (first=1): the pass-1 histogram must not read the state.
+     const dim3 row_grid(blocks_per_row * nrows);
+-    for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+-        indexer_topk_radix_histogram<BLOCK_SIZE, RADIX_BITS, kv_t>
++    for (int shift = 32 - 8, p = 0; shift >= 0; shift -= 8, ++p) {
++        indexer_topk_radix_histogram<BLOCK_SIZE, 8, kv_t>
+             <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+                 score, cell_blk, additive, states, histograms,
+-                ncols, n_tps, n_blocks, n_kv, blocks_per_row, shift);
+-        indexer_topk_radix_select<BLOCK_SIZE, RADIX_BITS>
+-            <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
++                ncols, n_tps, n_blocks, n_kv, blocks_per_row, shift, p == 0 ? 1 : 0);
++        indexer_topk_radix_select<BLOCK_SIZE, 8>
++            <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift, p == 0 ? 1 : 0, k);
+     }
+ 
+     // deterministic gather: ascending column order, no atomics (see kernels above)
+-- 
+2.55.0
+
