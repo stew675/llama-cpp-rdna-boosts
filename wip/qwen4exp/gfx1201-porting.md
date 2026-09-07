@@ -792,4 +792,23 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   Remaining structural lever on gfx1201: fewer kernels/layer (the launch-chain), not less work
   per kernel - the fused mega-op direction or accepting the fused build.
 
+### 2026-09-07 (cont.) — [3] PARKED (maintainer); rocprof cost isolation: the sparse tax is the topk + chain, NOT the FA
+- [3] (derived block-vector cache, fork 328ddfa4e + 6703ad09f) parked as a wash: provably active
+  + byte-correct but flat at <=64K on gfx1201 (launch-bound decode).  Keep env-gated OFF; the
+  guard fix + capped fill stay.  Record: `wip/archive/qwen4exp/discovery/2026-09-07-sparse-decode-cost-isolation-rocprof.md`.
+- rocprof decode-token windows (1-token @ ~30K, fused vs dense, 3x R9700 bf16):
+  * The block-sparse FA is ~8x CHEAPER per call at 30K (30us vs 242us) - the read-cap premise
+    delivers; the FA is the sparse WIN, not the tax.
+  * The tax = the topk (O(n_kv) radix-select over the whole 32K score vector per layer per token,
+    the step block-sparse was supposed to avoid) + the per-layer small-kernel chain (indexer
+    q-side/k-side ropes + norms + gathers + copies, ~1-2ms/token) + extra inter-device copies.
+  * Model: dense ~ a*n_kv (tiled FA); sparse ~ b*n_kv (topk, b<<a) + c*2051 (FA) + fixed
+    machinery; sparse wins past the measured crossover (>64K on gfx1201; halo sooner).
+  * Remaining levers: (1) the topk's O(n_kv) select, (2) the per-layer kernel count.  FA and the
+    pool->score stack are done.  Fused prefill is also ~10% slower than dense (machinery
+    amortized over the ubatch: 1313 vs 1449 t/s pp on the 30K prompt).
+- Next candidates for the maintainer: quantify the topk's share precisely (its radix works over
+  the full n_kv score vector - is the top-k width cap ~2051 but the SELECT still scans 32K?); a
+  halo fused-vs-derived/dense A/B is still owed but [3] is parked so only fused-vs-dense matters.
+
 <!-- keep the newest entry below this marker -->
