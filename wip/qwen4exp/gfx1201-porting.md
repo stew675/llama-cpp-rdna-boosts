@@ -530,4 +530,21 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   probe → adopt; then cross-arch halo check for gating decisions).  Detailed design in
   `2026-09-07-gfx1201-qsa-decode-rootcause.md` §7.  Expected @32K: most of the ~7.8 t/s.
 
+
+### 2026-09-07 (cont.) — QSA-DECODE FIX increment 1 LANDED: fused INDEXER_POOL (fork `fde1f2def`)
+- New GGML_OP_INDEXER_POOL replaces the decode per-op chain get_rows + r-slice pool +
+  scale + rms_norm (~10 kernels/layer) with ONE kernel, env-gated
+  (`GGML_CUDA_QSA_INDEXER_POOL=1`, decode n_tokens==1 only, default OFF until the
+  score-side fusion lands).  Parity contract met: bf16→f32 gather (ggml bits<<16),
+  sequential member adds, 1/r scale, 256/1024-thread rms_norm reduction order —
+  same-seed decode text BYTE-IDENTICAL ON vs OFF.
+- gfx1201 (3x R9700, IQ4_XS, tensor bf16, interleaved r1): decode @d32768 39.7 → 42.1
+  (+6.0%), @d65536 35.5 → 38.9 (+9.6%).  Dense still 47.5@32K → the remaining ~13
+  kernels/layer (rope + q-side + score + relu/headsum + topk) = increment 2.
+- Ground truth established: indexer cache mirrors `-ctk` type (BF16 here; idx_dim=128,
+  r=4, n_stream=1); get_rows UPCASTS the bf16 keys to F32 (the per-op pooling is F32).
+- Plumbing mirrored from INDEXER_TOPK (enum/name/symbol, builders, backend-choice
+  skip, meta mirrored split, dispatch, RPC bump); CPU fallback deferred (op is
+  decode-gated GPU-only until adoption).
+
 <!-- keep the newest entry below this marker -->
