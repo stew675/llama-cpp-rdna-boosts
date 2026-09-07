@@ -842,4 +842,37 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   consumes the cells; any list change breaks the same-seed toggle contract.
 - First-decode-token anomaly note for llama-bench users: llama-bench decode is steady-state fused.
 
+### 2026-09-07 (cont.) — mega-op increment 1 MEASURED: launch-count reduction is at/below the noise floor; busy reduction is the lever
+- Fork commit d6164ad6a: INDEXER_TOPK radix_init folded into the pass-1 select (11 -> 10
+  launches/op; 13 launches/token saved).  Two-build same-seed A/B (32 tokens): output
+  byte-IDENTICAL (the topk is int-exact; text diff = only the t/s banner).  Kept as a
+  harmless cleanup.
+- MEASUREMENT LESSON (interleaved llama-bench d32768 tg64, staged old/new binaries in
+  /tmp/bins-old /tmp/bins-new with the bench launcher + lib set):
+  * 12+10+10-bit 3-pass radix (12-bit first pass): REGRESSED -2.8% (39.06 vs 40.21 t/s).
+    The 16x histogram smem-clear + global write-out per block (4096 bins vs 256) costs
+    more busy than the 2 saved launches save.
+  * init-fold only (per-pass work unchanged, -1 launch): FLAT (40.27 vs 40.28 t/s) - the
+    ~0.2% expected saving sits at the box noise floor (+/-0.3% between runs).
+  => At this kernel scale, per-launch BUSY dominates launch COUNT (~4:1): removing a launch
+     is invisible; adding work to remove launches loses.  The sparse-machinery lever is
+     busy reduction, not launch shaving.
+- NEXT LEVER (designed, not yet built): the decode topk does ~6 full cell scans/layer
+  (4 radix passes + count + write = ~192K value evals over n_kv=32K cells, all re-gathered
+  via cell_blk) where at decode additive == 0 (single query, causal mask all-open -> every
+  cell of a block shares score[block(c)]) so the selection is EXACTLY a top-k over the 8K
+  BLOCK scores (r=4 cells each).  A block-granular topk path (flag from the builder when
+  n_tps==1 && blk_bias, cells uniform) scans n_blocks instead of n_kv: ~4x less topk busy.
+  Estimated +1-1.5% (the topk decode busy ~0.6-0.8ms/token of the 2.9ms fused-vs-dense
+  deficit; per-launch floors keep the launch/gap part intact).  Parity rule: identical cell
+  list (ascending (block, cell) order; the qsa kernel consumes the cells).
+- STILL OPEN: why llama-cli decode token #1 takes the per-op path (graphs rebuild every
+  token - rising CUDA graph ids 2939+ per token - so it is NOT graph reuse; the branch
+  condition is static).  Not chased to root cause; llama-bench + llama-server steady state
+  are fused, which is what matters.  n>=3 for llama-cli profiling.
+- d32 llama-bench traces are contaminated by prefill ubatches (flash_attn_ext_f16 x432 =
+  16 prefill ubatches x ~9 attn layers; the per-call qsa ~1978us there = PREFILL qsa at
+  ubatch 2048, not decode) - clean decode slicing needs the qsa/tile-kernel-count method
+  (last 640 qsa/device = 64 tg tokens at ~10 qsa/token).
+
 <!-- keep the newest entry below this marker -->
