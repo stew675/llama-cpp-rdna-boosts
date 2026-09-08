@@ -5,7 +5,8 @@
 > (`patches/0014-rdna-boosts-block-14-qwen4exp-support.patch`), re-based
 > from this beta copy onto the `050dde50c` delivery core (fork point
 > moved 2026-09-07; canonical am-commits `90a816a68..3bebffd6b`, block 14
-> amended 2026-09-07 with the QSA quantized-KV decode gate — see the
+> amended 2026-09-07 with the QSA quantized-KV decode gate + the
+> derived-cache pool gate — see the
 > record below).  This
 > file stays as the validation record + promotion source (the squashed
 > fork delta `c261553a1..dd4301fb4` against the OLD `465e49b9c`-based
@@ -389,6 +390,28 @@ Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.m
   acceptance 0.75-0.79; the BF16 fused fill/score path is unregressed
   (forced-sparse acceptance 0.82).  Clean-apply sim tree-identical to
   the fork tip.
+- Derived-cache pool gate (2026-09-07, same amendment, same delivery
+  block): the F32 block-vector pool backing the derived decode cache was
+  allocated for every qwen4exp context but is only ever written/read by
+  the fused `INDEXER_FILL` -> `INDEXER_SCORE` path — which additionally
+  needs unquantized indexer keys (the gate above) and the memory-layer
+  derived cache engaged (`GGML_CUDA_QSA_INDEXER_CACHE` explicitly set;
+  otherwise `qsa_derived_limits` emits an empty fill range each step and
+  the pool is dead weight ridden by a no-op fill launch per decode).
+  `llama_memory_hybrid_idx::pool_create` now skips the allocation
+  unless both hold (new info log: `derived indexer cache pool skipped
+  (...)`); with no pool, `get_pool()` returns nullptr and `build_qsa_top_k`
+  runs the fused score pooling the raw cache — same F32 arithmetic,
+  byte-identical output, no dead buffer (≈103 MiB at the reported
+  70144-token ctx, 12 layers x 128 dims x 1 stream).  Validated on
+  Strix Halo (gfx1151, build-rocm): a llama-log probe shows the pool
+  allocated+ENABLED only for float keys + env set (bf16 + env=1) and
+  skipped for bf16/q8_0 defaults and q8_0 + env=1; BF16 forced-sparse
+  same-seed decode (120 tokens, QSA selection active) is byte-identical
+  default (pool absent) vs `GGML_CUDA_QSA_INDEXER_CACHE=1` (pool
+  present, derived engaged); the q8_0 runme config and the full KV-type
+  matrix re-run clean with zero assert/error lines (acceptance
+  0.75-0.79, unchanged); clean-apply sim tree-identical to the fork tip.
 
 - WS3 #2 artifact fix + shortcut default ON gates on Strix Halo (gfx1151),
   2026-09-05: patches 6-7 (ggml sched-fallback sync + shortcut default

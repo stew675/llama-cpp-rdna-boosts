@@ -15,7 +15,7 @@ fork's `rdna-boosts` block commits — the re-baselined regeneration
 with the RDNA3.5/RDNA3.0 gate relaxations and 2026-09-06 with the
 model-neutral Strix MoE mmq folds, block 14 (qwen4exp support) was
 promoted from `beta/qwen4exp` 2026-09-07 and amended 2026-09-07 with
-the QSA quantized-KV decode gate (see the dated records
+the QSA quantized-KV decode gate + the derived-cache pool gate (see the dated records
 below; the previous `465e49b9c`-based regeneration
 `45bf4d291..c261553a1` is superseded and preserved on the fork's
 history/remotes). Apply flow: `git am`
@@ -32,7 +32,7 @@ the 2026-09-05 block-13 RDNA3_5 gate relaxation, re-verified after the
 2026-09-06, re-verified on the `050dde50c` re-base + block 14
 2026-09-07, re-verified 2026-09-07 after the block-08 PR-15
 view-guard amendment, re-verified 2026-09-07 after the block-14
-QSA quantized-KV gate amendment).
+QSA quantized-KV gate + derived-cache pool gate amendment).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -92,7 +92,7 @@ silently drops hunks.
 
 ## Verified apply sequence
 
-### Block-14 QSA quantized-KV decode gate (2026-09-07, current)
+### Block-14 QSA quantized-KV decode gate + derived-cache pool gate (2026-09-07, current)
 
 Report: Qwen3.8-Flash-Next Q4_K_XL llama-server (ctx 70000,
 `--cache-type-k/v q8_0`, spec-draft q8_0, draft-mtp) aborts at
@@ -113,9 +113,30 @@ matrix f32/f16/bf16/q8_0/q4_0/q4_1/iq4_nl/q5_0/q5_1 start + generate
 with zero errors (acceptance 0.75-0.79); BF16 forced-sparse fused
 fill/score unregressed (acceptance 0.82).  Set regenerated
 (`scripts/make-patches.sh`, base `050dde50c`, blocks tip
-`60aa4173d`); clean-apply sim re-verified 2026-09-07: 14/14 `git am`
+`bfcc4be99`); clean-apply sim re-verified 2026-09-07: 14/14 `git am`
 clean, zero whitespace warnings, applied tree byte-identical to the
 fork tip.
+
+Second half of the same amendment: the F32 block-vector pool backing
+the derived decode cache was allocated for every qwen4exp context but
+is only ever written/read by the fused `INDEXER_FILL` ->
+`INDEXER_SCORE` path, which additionally requires float indexer keys
+(the gate above) and the memory-layer derived cache engaged
+(`GGML_CUDA_QSA_INDEXER_CACHE` explicitly set; otherwise
+`qsa_derived_limits` emits an empty fill range each step and the pool
+is dead weight, ridden by a no-op fill launch per decode step).
+`llama_memory_hybrid_idx::pool_create` now skips the allocation
+unless both hold (new info log `derived indexer cache pool skipped
+(...)`); with no pool `get_pool()` returns nullptr and `build_qsa_top_k`
+runs the fused score pooling the raw cache — same F32 arithmetic,
+byte-identical output, no dead buffer (~103 MiB at the reported
+70144-token ctx = 12 layers x 128 dims x 1 stream).  Validated on
+Strix Halo (gfx1151): llama-log probe shows the pool allocated only
+for float keys + env set; BF16 forced-sparse same-seed decode is
+byte-identical with the pool absent (default) vs present + derived
+engaged (`GGML_CUDA_QSA_INDEXER_CACHE=1`); q8_0 runme config + full
+KV-type matrix re-run clean (zero errors, acceptance unchanged);
+clean-apply sim tree-identical to the fork tip.
 
 ### Re-baseline to 050dde50c + block 14 (2026-09-07, current)
 

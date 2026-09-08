@@ -60,12 +60,15 @@ from `465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, re-based
 The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts` — currently the 14 block
 commits on master `050dde50c` (2026-09-07 re-base; the current local
-re-application is `7e81a21a7..60aa4173d`, block-14 tip `60aa4173d`;
+re-application is `7e81a21a7..bfcc4be99`, block-14 tip `bfcc4be99`;
 block 12 carries the
 2026-09-04 runtime NCCL-failure fallback, issue #13; block 13 amended
 2026-09-02/09-05/09-06 as above; block 14 added 2026-09-07 and amended
-2026-09-07 with the QSA quantized-KV decode gate (quantized
-indexer-key caches no longer abort the fused decode path — see the
+2026-09-07 with the QSA quantized-KV decode gate + the derived-cache
+pool gate (quantized
+indexer-key caches no longer abort the fused decode path, and the
+F32 derived-cache pool is allocated only when the fused path can
+actually use it — see the
 block-14 notes in `patches/README.md`); block 08
 amended 2026-09-07 with the PR #15 mul_mat+add through-view shape
 guard). The
@@ -73,7 +76,7 @@ canonical `050dde50c` fork used for `make-patches.sh`
 regeneration is disposable and is re-created from `patches/` +
 `scripts/apply-all.sh` whenever it needs rebuilding (fresh clone at the
 fork point + apply) — the last regeneration's block-14 tip is
-`60aa4173d`. Older fork states are
+`bfcc4be99`. Older fork states are
 preserved on the `stew675/llama.cpp` fork remote (`rdna-boosts` =
 previous tip `482837e5a` on `0eadefebd`; `rdna-boosts-orig`, …) and in
 older local reference clones — never rely on them for the current
@@ -239,16 +242,16 @@ Diff the output against a known-good build (or against RCCL via
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `050dde50c`,
-blocks tip `60aa4173d`): `git format-patch` the block commits (all 14
+blocks tip `bfcc4be99`): `git format-patch` the block commits (all 14
 blocks are committed fork commits; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the current fork topology: `~/llama.cpp`
 `rdna-boosts` is synced AT the fork point (upstream master `050dde50c`
-+ the 14 blocks re-applied, block-14 tip `60aa4173d`), so a raw
++ the 14 blocks re-applied, block-14 tip `bfcc4be99`), so a raw
 `050dde50c..HEAD` range there is exactly the 14 block commits — but the
 fork branch is disposable, so the patches
 must still be generated from a canonical fork rebuilt AT `050dde50c`
 (`scripts/apply-all.sh` of the current delivery; last regeneration tip
-`60aa4173d`).  Then
+`bfcc4be99`).  Then
 re-verify the clean-apply simulation (worktree at the fork point,
 apply-all, build, coherence) before committing.
 
