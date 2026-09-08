@@ -13,7 +13,10 @@ baseline gate in
 `../wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`, and
 the gfx1100 record in
 `../wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`; block 14
-amended 2026-09-07 with the QSA quantized-KV decode gate — see the block-14 notes):
+amended 2026-09-07 with the QSA quantized-KV decode gate — see the block-14 notes; block 13
+amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19); block 14
+amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18) — see the
+2026-09-08 fixes section and the block-13/14 notes below):
 
 | patch | content |
 |---|---|
@@ -29,8 +32,8 @@ amended 2026-09-07 with the QSA quantized-KV decode gate — see the block-14 no
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
-| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md.
-| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) |
+| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)** — see the block-13 notes below.
+| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. |
 
 ## Apply (fresh checkout at the fork point)
 
@@ -52,7 +55,7 @@ re-verified 2026-09-05 after the RDNA3_0/gfx1100 fold, re-verified
 2026-09-06 on the `465e49b9c` re-base, re-verified 2026-09-07 on the
 `050dde50c` re-base with the 14-patch set).
 
-## 2026-09-07 re-base to 050dde50c + block 14 (current)
+## 2026-09-07 re-base to 050dde50c + block 14
 
 Upstream master moved **22 commits** past `465e49b9c` (the 2026-09-07
 master tip `050dde50c`).  The `~/llama.cpp` fork was rebuilt from
@@ -78,6 +81,52 @@ See the block-14 notes below.  Re-base detail:
   blocks).  Set regenerated with `scripts/make-patches.sh` (base
   `050dde50c`, blocks tip `3bebffd6b`) and `rdna-boosts-all.patch`
   refreshed (87 files).
+
+## 2026-09-08 fixes: MUL_MAT_ID pair-fusion layout gate + MWR remainder (current)
+
+Two genuine bugs in the amended blocks 13/14 were reported by
+`briansp2020` (production single-R9700 deployment of the 14-block set,
+ROCm 10): a hard `ggml_abort` in the block-13/14 MUL_MAT_ID pair
+fusion (issue #18) and a silent wrong-output path in the block-13
+`moe_weighted_reduction` float4 rewrite (issue #19).  Both are folded
+into the blocks as amendments and the set regenerated (fork am-commits
+now `861fb47b6..3529b3497`):
+
+- **Issue #18 — MUL_MAT_ID pair-fusion gate (block 14).**  Block 13's
+  `ggml_cuda_mul_mat_q_pair` MUL_MAT_ID arm implements the standard
+  sparse-MoE activation layout (`src1 = [n_embd, 1, n_tokens]`, >1
+  routed expert) and asserts exactly that (`ne11 == 1 && n_expert_used > 1`,
+  `mmq.cu`).  Block 14's try_fuse dispatcher checked only that the two
+  nodes share `src1`/`ids` and are mmq-eligible — any MUL_MAT_ID pair
+  whose `src1->ne[1] > 1` (e.g. the non-broadcast per-expert-gathered
+  activation layout in `test-backend-ops` MUL_MAT_VEC_FUSION) or whose
+  routing is top-1 (`ids->ne[0] == 1`) satisfied the gate and then
+  aborted the process at the callee assert.  The gate now requires the
+  callee's layout preconditions (`node->src[1]->ne[1] == 1 &&
+  node->src[2]->ne[0] > 1`), so such pairs fall back to the per-node
+  path.  qwen4exp sparse-MoE pairs (standard layout, 10 routed experts)
+  are unaffected and still fuse.
+- **Issue #19 — `moe_weighted_reduction` float4 remainder (block 13).**
+  The 2026-09-06 mwr-float4 fold (f33ffaca7) indexed the kernel and the
+  launcher in quads with floor division (`n_embd / 4`) and no remainder
+  handling: for `n_embd % 4 != 0` the last 1-3 columns of every output
+  row were never written (silent wrong values — `MOE_WEIGHTED_REDUCTION`
+  with `n_embd = 63` failed both cases).  The vectorized kernel is also
+  only alignment-safe when every expert row starts 16B-aligned, i.e.
+  `n_embd % 4 == 0`.  The kernel is now split into the float4 quad
+  variant (launched when `n_embd % 4 == 0`; byte-unchanged aligned path)
+  and the upstream scalar bounds-checked kernel (any `n_embd`).
+- Validated on the local 3x R9700 (gfx1201, ROCm 7.14):
+  `test-backend-ops -b ROCm0` full suite **16590/16590** with the fusion
+  active (the reporter's exact single-GPU gate; CPU reference for every
+  op), MUL_MAT_VEC_FUSION group 1265/1265 and MOE_WEIGHTED_REDUCTION
+  6/6; same-seed llama-cli streams on Qwen3.8-Flash-Next (IQ4_XS,
+  3-GPU tensor) and on the dense Qwen3.8-27B (single GPU) are
+  byte-identical default vs `GGML_PAIR_OFF=1` / `GGML_PAIR_DENSE_OFF=1`,
+  and the prefill A/B shows the pair fusion still active (Flash-Next
+  pp2048 2780.8 vs 2756.7, pp8192 2675.7 vs 2647.1, `GGML_PAIR_OFF=1`
+  controls).  Clean-apply sim re-verified: 14/14 `git am`, zero
+  whitespace warnings, applied tree == fork tip.
 - Re-verified 2026-09-07: clean-apply sim on a fresh checkout at
   `050dde50c` (`scripts/apply-all.sh`: **zero conflicts, zero whitespace
   warnings**, applied tree byte-identical to the fork tip `3bebffd6b`);
@@ -152,6 +201,26 @@ amended blocks 02/04/08/13):
   runs clean at q8_0, and the BF16 fused fill/score path is unregressed
   (forced-sparse acceptance 0.82).  Record:
   `beta/qwen4exp/README.md`.
+- **MUL_MAT_ID pair-fusion layout gate (2026-09-08, folded into block
+  14, issue #18):** the gate+up MUL_MAT_ID pair dispatch routes into
+  block 13's `ggml_cuda_mul_mat_q_pair`, whose MUL_MAT_ID arm
+  implements the standard sparse-MoE activation layout (`src1 =
+  [n_embd, 1, n_tokens]`, >1 routed expert) and asserts exactly that
+  (`ne11 == 1 && n_expert_used > 1`).  The dispatcher checked only that
+  the two nodes share `src1`/`ids` and are mmq-eligible, so any
+  MUL_MAT_ID pair in another layout (e.g. the non-broadcast
+  per-expert-gathered activation `src1 = [k, n_used, m]` from
+  `test-backend-ops` MUL_MAT_VEC_FUSION, or top-1 routing with
+  `ids->ne[0] == 1`) satisfied the gate and aborted the whole process at
+  the callee assert.  The gate now requires the callee's layout
+  preconditions (`node->src[1]->ne[1] == 1 && node->src[2]->ne[0] > 1`)
+  so those pairs fall back to the per-node path.  The qwen4exp
+  sparse-MoE pair (standard layout, 10 routed experts) is unaffected
+  and still fuses.  Verified (3x R9700 gfx1201): MUL_MAT_VEC_FUSION
+  1265/1265 (no abort), full test-backend-ops 16590/16590 with the
+  fusion active; Flash-Next same-seed text byte-identical default vs
+  `GGML_PAIR_OFF=1` and the prefill A/B still shows the pair active
+  (pp2048 2780.8 vs 2756.7, pp8192 2675.7 vs 2647.1).
 
 Validation is recorded in `beta/qwen4exp/README.md` (the halo/soar
 campaigns on the old base) plus the 2026-09-07 delivery checks above;
@@ -490,6 +559,19 @@ baseline table live in `wip/qwen35moe-prefill/bench-config.md`.
   here (single GPU); the dual-7900XTX block-12 leg remains a separate
   parallel task.  Full record:
   `../wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
+- **moe_weighted_reduction float4 remainder fix (2026-09-08, folded into
+  block 13, issue #19):** the 2026-09-06 mwr-float4 fold (f33ffaca7)
+  rewrote the kernel and launcher to index in quads with floor division
+  (`n_embd / 4`) and no remainder handling, silently leaving the last
+  `n_embd % 4` columns of every output row unwritten for `n_embd % 4 != 0`
+  (wrong results, not a crash — `MOE_WEIGHTED_REDUCTION` with `n_embd = 63`
+  failed both cases, ERR ~0.09-0.13).  A vectorized kernel is only valid
+  when every expert row starts 16B-aligned, i.e. `n_embd % 4 == 0`; the
+  kernel is therefore split into the float4 quad variant (launched when
+  `n_embd % 4 == 0`, byte-unchanged aligned path — real models have
+  `n_embd % 4 == 0`) and the upstream scalar bounds-checked kernel for
+  the remainder.  Verified (3x R9700 gfx1201): MOE_WEIGHTED_REDUCTION
+  6/6, full test-backend-ops 16590/16590.
 
 ## Server config (the +22% deployment win)
 

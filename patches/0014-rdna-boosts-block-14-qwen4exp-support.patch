@@ -1,4 +1,4 @@
-From 60aa4173d68a9593d6f45cc63b73603dcda557c2 Mon Sep 17 00:00:00 2001
+From 3529b34971aaa3f8a1d779bf7ca688b7a91e16f0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/14] rdna-boosts: block 14: qwen4exp support
@@ -52,7 +52,7 @@ beta/qwen4exp/README.md.
  ggml/src/ggml-cuda/concat.cu           |  73 ++
  ggml/src/ggml-cuda/fattn-qsa.cu        | 638 ++++++++++++++++
  ggml/src/ggml-cuda/fattn-qsa.cuh       |  22 +
- ggml/src/ggml-cuda/ggml-cuda.cu        | 719 ++++++++++++++----
+ ggml/src/ggml-cuda/ggml-cuda.cu        | 726 +++++++++++++++----
  ggml/src/ggml-cuda/hc-mix.cu           | 462 ++++++++++++
  ggml/src/ggml-cuda/hc-mix.cuh          |   5 +
  ggml/src/ggml-cuda/hyperconn.cu        | 375 ++++++++++
@@ -89,7 +89,7 @@ beta/qwen4exp/README.md.
  tests/CMakeLists.txt                   |   1 +
  tests/test-lazy-reader.cpp             | 264 +++++++
  tests/test-llama-archs.cpp             |   7 +-
- 53 files changed, 6658 insertions(+), 326 deletions(-)
+ 53 files changed, 6665 insertions(+), 326 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
@@ -2078,7 +2078,7 @@ index 000000000..0a2059477
 +void ggml_cuda_flash_attn_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +bool ggml_cuda_flash_attn_qsa_supported(int device, const ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 89d8e60c6..e9083d2fe 100644
+index 89d8e60c6..966910ae1 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -2368,7 +2368,7 @@ index 89d8e60c6..e9083d2fe 100644
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-@@ -3674,15 +3623,106 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3674,15 +3623,113 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
      static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
  
@@ -2442,7 +2442,14 @@ index 89d8e60c6..e9083d2fe 100644
 +        const bool valid_sources = next->op == node->op && src0 && src0_next && node->src[1] && next->src[1] &&
 +            (!has_ids || (node->src[2] && next->src[2]));
 +        const bool shared_inputs = valid_sources && node->src[1] == next->src[1] &&
-+            (!has_ids || node->src[2] == next->src[2]);
++            // The MUL_MAT_ID arm of ggml_cuda_mul_mat_q_pair assumes the standard sparse-MoE
++            // activation layout (src1 = [n_embd, 1, n_tokens]) with more than one routed
++            // expert, and asserts ne11 == 1 && n_expert_used > 1. Require those preconditions
++            // here too, so MUL_MAT_ID pairs in other layouts (e.g. a per-expert gathered
++            // activation, src1->ne[1] > 1, or top-1 routing, ids->ne[0] == 1) fall back to
++            // the per-node path instead of aborting.
++            (!has_ids || (node->src[2] == next->src[2] &&
++                          node->src[1]->ne[1] == 1 && node->src[2]->ne[0] > 1));
 +        const int64_t mmq_cols = shared_inputs ? (has_ids ? node->src[1]->ne[2] : node->src[1]->ne[1]) : 0;
 +        const int64_t n_experts = shared_inputs && has_ids ? src0->ne[2] : 0;
 +        const bool use_mmq = shared_inputs && node->src[1]->type == GGML_TYPE_F32 &&
@@ -2477,7 +2484,7 @@ index 89d8e60c6..e9083d2fe 100644
                  ggml_cuda_op_moe_weighted_reduction(
                      *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                  return match.node_count - 1;
-@@ -4906,6 +4946,362 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4906,6 +4953,362 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 1;
      }
  
@@ -2840,7 +2847,7 @@ index 89d8e60c6..e9083d2fe 100644
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-@@ -5174,7 +5570,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5174,7 +5577,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                  }
                  GGML_ASSERT(ok);
@@ -2848,7 +2855,7 @@ index 89d8e60c6..e9083d2fe 100644
                  if (op_timing) {
                      CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
                      op_nodes.emplace_back(node, i, false);
-@@ -5415,8 +5810,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5415,8 +5817,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  continue;
              }
  
@@ -2859,7 +2866,7 @@ index 89d8e60c6..e9083d2fe 100644
                  continue;
              }
  
-@@ -5715,6 +6110,14 @@ static std::string ggml_cuda_device_description(int device) {
+@@ -5715,6 +6117,14 @@ static std::string ggml_cuda_device_description(int device) {
          description += " (dev p" + std::to_string(info.devices[device].physical_device) +
                         "/v" + std::to_string(info.devices[device].virtual_index) + ")";
      }
@@ -2874,7 +2881,7 @@ index 89d8e60c6..e9083d2fe 100644
      return description;
  }
  
-@@ -6404,8 +6807,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6404,8 +6814,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;

@@ -1,4 +1,4 @@
-From b94d5bf81654c232df1086c12fbe746720f36574 Mon Sep 17 00:00:00 2001
+From 45deaac0dcc57835030ce85b17cb8e73454c4c69 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 06:50:35 -0500
 Subject: [PATCH 13/14] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -50,13 +50,13 @@ Subject: [PATCH 13/14] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
  ggml/src/ggml-cuda/mmq.cuh                    | 409 +++++++++-
  ggml/src/ggml-cuda/mmvq.cu                    | 721 ++++++++++++++++--
  ggml/src/ggml-cuda/mmvq.cuh                   |   8 +
- ggml/src/ggml-cuda/moe-weighted-reduction.cu  |  32 +-
+ ggml/src/ggml-cuda/moe-weighted-reduction.cu  |  58 +-
  ggml/src/ggml-cuda/quantize.cu                | 221 ++++--
  ggml/src/ggml-cuda/quantize.cuh               |  26 +-
  .../template-instances/generate_cu_files.py   |  14 +
  .../template-instances/mmq-instance-q3_k.cu   |   1 +
  tests/test-backend-ops.cpp                    |   2 +-
- 13 files changed, 1634 insertions(+), 204 deletions(-)
+ 13 files changed, 1665 insertions(+), 199 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index 5dc9e7a51..89d8e60c6 100644
@@ -2162,28 +2162,33 @@ index 1b8ea460d..4140f681a 100644
 +    ggml_backend_cuda_context & ctx,
 +    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cu b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
-index 11ec58497..554c114b0 100644
+index 11ec58497..a3f462271 100644
 --- a/ggml/src/ggml-cuda/moe-weighted-reduction.cu
 +++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
-@@ -6,22 +6,37 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
-                                                   float * __restrict__ dst,
-                                                   const int64_t n_embd,
-                                                   const int     n_expert_used) {
--    const int64_t token = blockIdx.x;
--    const int64_t col   = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
--    if (col >= n_embd) {
+@@ -1,5 +1,50 @@
+ #include "moe-weighted-reduction.cuh"
+ 
++// float4 quad variant: only valid when every expert row starts 16B-aligned, i.e. when
++// n_embd % 4 == 0 (checked by the launcher). Real models have n_embd % 4 == 0, so the
++// aligned path below covers them unchanged; the scalar kernel is the fallback for
++// n_embd % 4 != 0, where a vectorized kernel could neither cover the trailing 1-3
++// columns nor assume per-row alignment.
++static __global__ void moe_weighted_reduction_f32_vec4(const float * __restrict__ experts,
++                                                       const float * __restrict__ expert_scale,
++                                                       const float * __restrict__ weights,
++                                                       float * __restrict__ dst,
++                                                       const int64_t n_embd,
++                                                       const int     n_expert_used) {
 +    const int64_t n_embd4 = n_embd / 4;
 +    const int64_t token   = blockIdx.x;
 +    const int64_t i4      = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
 +    if (i4 >= n_embd4) {
-         return;
-     }
- 
--    const uint64_t first_row   = (uint64_t) token * n_expert_used;
-+    const int64_t col       = i4 * 4;
++        return;
++    }
++
++    const int64_t col        = i4 * 4;
 +    const uint64_t first_row = (uint64_t) token * n_expert_used;
-     const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
--    float          sum         = (experts[first_row * n_embd + col] * first_scale) * weights[first_row];
++    const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
 +    float4 sum;
 +    {
 +        const float4 e = *reinterpret_cast<const float4 *>(experts + first_row * n_embd + col);
@@ -2193,33 +2198,44 @@ index 11ec58497..554c114b0 100644
 +        sum.z = (e.z * first_scale) * w;
 +        sum.w = (e.w * first_scale) * w;
 +    }
- 
-     for (int expert = 1; expert < n_expert_used; ++expert) {
-         const uint64_t row   = first_row + expert;
-         const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
--        sum += (experts[row * n_embd + col] * scale) * weights[row];
++
++    for (int expert = 1; expert < n_expert_used; ++expert) {
++        const uint64_t row   = first_row + expert;
++        const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
 +        const float4  e     = *reinterpret_cast<const float4 *>(experts + row * n_embd + col);
 +        const float   w     = weights[row];
 +        sum.x += (e.x * scale) * w;
 +        sum.y += (e.y * scale) * w;
 +        sum.z += (e.z * scale) * w;
 +        sum.w += (e.w * scale) * w;
-     }
--    dst[token * n_embd + col] = sum;
++    }
 +    reinterpret_cast<float4 *>(dst + token * n_embd + col)[0] = sum;
- }
- 
- static void launch_moe_weighted_reduction(const float * experts,
-@@ -33,7 +48,8 @@ static void launch_moe_weighted_reduction(const float * experts,
++}
++
++// scalar kernel, bounds-checked per column (upstream body): correct for any n_embd.
+ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ experts,
+                                                   const float * __restrict__ expert_scale,
+                                                   const float * __restrict__ weights,
+@@ -33,9 +78,16 @@ static void launch_moe_weighted_reduction(const float * experts,
                                            int           n_expert_used,
                                            cudaStream_t  stream) {
      constexpr int threads = 256;
 -    const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
-+    const int64_t n_embd4 = n_embd / 4;
-+    const dim3 blocks(n_tokens, (n_embd4 + threads - 1) / threads, 1);
-     moe_weighted_reduction_f32
-         <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+-    moe_weighted_reduction_f32
+-        <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++    if (n_embd % 4 == 0) {
++        const int64_t n_embd4 = n_embd / 4;
++        const dim3 blocks(n_tokens, (n_embd4 + threads - 1) / threads, 1);
++        moe_weighted_reduction_f32_vec4
++            <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++    } else {
++        const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
++        moe_weighted_reduction_f32
++            <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++    }
  }
+ 
+ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
 diff --git a/ggml/src/ggml-cuda/quantize.cu b/ggml/src/ggml-cuda/quantize.cu
 index bcc772395..ca043b6cf 100644
 --- a/ggml/src/ggml-cuda/quantize.cu

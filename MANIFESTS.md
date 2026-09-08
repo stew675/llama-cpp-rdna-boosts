@@ -8,14 +8,18 @@ The **current delivery** is a **14-patch set** against the fork point
 `050dde50c` (re-based 2026-09-07 from `465e49b9c`, itself re-based
 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`):
 blocks 01-14 (`patches/0001-…0014-…`, format-patch of the
-fork's `rdna-boosts` block commits — the re-baselined regeneration
-`90a816a68..3bebffd6b` against `050dde50c`; block 12 was amended
+fork's `rdna-boosts` block commits — the current regeneration
+`861fb47b6..3529b3497` against `050dde50c`; block 12 was amended
 2026-09-04 with the runtime NCCL-failure fallback (issue #13), block
 13 was amended 2026-09-02 with two MTP regression fixes, 2026-09-05
 with the RDNA3.5/RDNA3.0 gate relaxations and 2026-09-06 with the
-model-neutral Strix MoE mmq folds, block 14 (qwen4exp support) was
+model-neutral Strix MoE mmq folds and 2026-09-08 with the
+moe_weighted_reduction float4 remainder fix (issue #19, reported by
+briansp2020), block 14 (qwen4exp support) was
 promoted from `beta/qwen4exp` 2026-09-07 and amended 2026-09-07 with
-the QSA quantized-KV decode gate (see the dated records
+the QSA quantized-KV decode gate and 2026-09-08 with the MUL_MAT_ID
+pair-fusion layout gate (issue #18, reported by briansp2020) (see the
+dated records
 below; the previous `465e49b9c`-based regeneration
 `45bf4d291..c261553a1` is superseded and preserved on the fork's
 history/remotes). Apply flow: `git am`
@@ -32,7 +36,9 @@ the 2026-09-05 block-13 RDNA3_5 gate relaxation, re-verified after the
 2026-09-06, re-verified on the `050dde50c` re-base + block 14
 2026-09-07, re-verified 2026-09-07 after the block-08 PR-15
 view-guard amendment, re-verified 2026-09-07 after the block-14
-QSA quantized-KV gate amendment).
+QSA quantized-KV gate amendment, re-verified 2026-09-08 after the
+block-13/14 issue-18/19 amendments (14/14 `git am`, zero whitespace
+warnings, applied tree == fork tip `3529b3497`)).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"

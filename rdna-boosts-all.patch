@@ -8322,7 +8322,7 @@ index 000000000..944110792
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 0e6601f03..e9083d2fe 100644
+index 0e6601f03..966910ae1 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -9115,7 +9115,7 @@ index 0e6601f03..e9083d2fe 100644
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-@@ -3432,13 +3620,109 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3432,13 +3620,116 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 0;
      }
  
@@ -9192,7 +9192,14 @@ index 0e6601f03..e9083d2fe 100644
 +        const bool valid_sources = next->op == node->op && src0 && src0_next && node->src[1] && next->src[1] &&
 +            (!has_ids || (node->src[2] && next->src[2]));
 +        const bool shared_inputs = valid_sources && node->src[1] == next->src[1] &&
-+            (!has_ids || node->src[2] == next->src[2]);
++            // The MUL_MAT_ID arm of ggml_cuda_mul_mat_q_pair assumes the standard sparse-MoE
++            // activation layout (src1 = [n_embd, 1, n_tokens]) with more than one routed
++            // expert, and asserts ne11 == 1 && n_expert_used > 1. Require those preconditions
++            // here too, so MUL_MAT_ID pairs in other layouts (e.g. a per-expert gathered
++            // activation, src1->ne[1] > 1, or top-1 routing, ids->ne[0] == 1) fall back to
++            // the per-node path instead of aborting.
++            (!has_ids || (node->src[2] == next->src[2] &&
++                          node->src[1]->ne[1] == 1 && node->src[2]->ne[0] > 1));
 +        const int64_t mmq_cols = shared_inputs ? (has_ids ? node->src[1]->ne[2] : node->src[1]->ne[1]) : 0;
 +        const int64_t n_experts = shared_inputs && has_ids ? src0->ne[2] : 0;
 +        const bool use_mmq = shared_inputs && node->src[1]->type == GGML_TYPE_F32 &&
@@ -9227,7 +9234,7 @@ index 0e6601f03..e9083d2fe 100644
                  ggml_cuda_op_moe_weighted_reduction(
                      *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                  return match.node_count - 1;
-@@ -3446,6 +3730,48 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3446,6 +3737,48 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -9276,7 +9283,7 @@ index 0e6601f03..e9083d2fe 100644
      // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
      if (node->op == GGML_OP_GATED_DELTA_NET) {
          ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
-@@ -3460,6 +3786,44 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3460,6 +3793,44 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -9321,7 +9328,7 @@ index 0e6601f03..e9083d2fe 100644
      //topk-moe
      if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
              cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
-@@ -3631,6 +3995,72 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3631,6 +4002,72 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      bool fused_mul_mat_vec = false;
      int  fused_node_count  = 0;
  
@@ -9394,7 +9401,7 @@ index 0e6601f03..e9083d2fe 100644
      auto get_mul_mat_scale = [](const ggml_tensor * scale_node, const ggml_tensor * mm_node) -> const ggml_tensor * {
          const bool scale_lhs_mm = scale_node->src[0] == mm_node;
          const bool scale_rhs_mm = scale_node->src[1] == mm_node;
-@@ -3969,6 +4399,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3969,6 +4406,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  fused_node_count  = 3;
                  break;
              }
@@ -9432,7 +9439,7 @@ index 0e6601f03..e9083d2fe 100644
          }
      }
  
-@@ -3976,6 +4437,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3976,6 +4444,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  
@@ -9467,7 +9474,7 @@ index 0e6601f03..e9083d2fe 100644
      fused_mul_mat_vec = false;
      fused_node_count  = 0;
  
-@@ -4067,28 +4556,237 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4067,28 +4563,237 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  
@@ -9712,7 +9719,7 @@ index 0e6601f03..e9083d2fe 100644
                  continue;
              }
              bias_tensor = bias_node->src[1];
-@@ -4112,14 +4810,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4112,14 +4817,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
              ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
              fused_mul_mat_vec = true;
@@ -9729,7 +9736,7 @@ index 0e6601f03..e9083d2fe 100644
              break;
          }
      }
-@@ -4148,6 +4846,96 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4148,6 +4853,96 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 1;
      }
  
@@ -9826,7 +9833,7 @@ index 0e6601f03..e9083d2fe 100644
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
          ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
          return 2;
-@@ -4158,10 +4946,377 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4158,10 +4953,377 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 1;
      }
  
@@ -10205,7 +10212,7 @@ index 0e6601f03..e9083d2fe 100644
          return 1;
      }
  
-@@ -4175,12 +5330,60 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4175,12 +5337,60 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 2;
      }
  
@@ -10266,7 +10273,7 @@ index 0e6601f03..e9083d2fe 100644
      // flag used to determine whether it is an integrated_gpu
      const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
  
-@@ -4318,9 +5521,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4318,9 +5528,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue;
                  }
  
@@ -10286,7 +10293,7 @@ index 0e6601f03..e9083d2fe 100644
  #ifdef GGML_CUDA_DEBUG
                      const int last_fused = i + nodes_to_skip;
                      GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
-@@ -4330,6 +5543,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4330,6 +5550,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      i += nodes_to_skip;
                      continue;
                  }
@@ -10294,7 +10301,7 @@ index 0e6601f03..e9083d2fe 100644
  #ifndef NDEBUG
                  // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                  // node's output on the host-visible buffer, which the compute path
-@@ -4347,11 +5561,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4347,11 +5568,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  GGML_UNUSED(integrated);
  #endif  // NDEBUG
  
@@ -10314,7 +10321,7 @@ index 0e6601f03..e9083d2fe 100644
  
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
-@@ -4367,6 +5589,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4367,6 +5596,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  graph->graph = nullptr;
              }
  
@@ -10333,7 +10340,7 @@ index 0e6601f03..e9083d2fe 100644
              CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
              graph_evaluated_or_captured = true; // CUDA graph has been captured
  
-@@ -4394,6 +5628,59 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4394,6 +5635,59 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          graph_evaluated_or_captured = true;
  #endif  // USE_CUDA_GRAPH
      }
@@ -10393,7 +10400,7 @@ index 0e6601f03..e9083d2fe 100644
  }
  
  #ifdef USE_CUDA_GRAPH
-@@ -4418,19 +5705,34 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4418,19 +5712,34 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_set_device(cuda_ctx->device);
  
@@ -10429,7 +10436,7 @@ index 0e6601f03..e9083d2fe 100644
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
  
              if (!graph->warmup_complete) {
-@@ -4453,6 +5755,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4453,6 +5762,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      cuda_graph_update_required = graph->instance == nullptr;
                  }
              }
@@ -10437,7 +10444,7 @@ index 0e6601f03..e9083d2fe 100644
          }
      }
  #endif // USE_CUDA_GRAPH
-@@ -4507,8 +5810,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -4507,8 +5817,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  continue;
              }
  
@@ -10448,7 +10455,7 @@ index 0e6601f03..e9083d2fe 100644
                  continue;
              }
  
-@@ -4807,6 +6110,14 @@ static std::string ggml_cuda_device_description(int device) {
+@@ -4807,6 +6117,14 @@ static std::string ggml_cuda_device_description(int device) {
          description += " (dev p" + std::to_string(info.devices[device].physical_device) +
                         "/v" + std::to_string(info.devices[device].virtual_index) + ")";
      }
@@ -10463,7 +10470,7 @@ index 0e6601f03..e9083d2fe 100644
      return description;
  }
  
-@@ -5496,8 +6807,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5496,8 +6814,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
@@ -15294,28 +15301,33 @@ index 5605bf7a4..4140f681a 100644
 +    ggml_backend_cuda_context & ctx,
 +    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cu b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
-index 11ec58497..554c114b0 100644
+index 11ec58497..a3f462271 100644
 --- a/ggml/src/ggml-cuda/moe-weighted-reduction.cu
 +++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
-@@ -6,22 +6,37 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
-                                                   float * __restrict__ dst,
-                                                   const int64_t n_embd,
-                                                   const int     n_expert_used) {
--    const int64_t token = blockIdx.x;
--    const int64_t col   = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
--    if (col >= n_embd) {
+@@ -1,5 +1,50 @@
+ #include "moe-weighted-reduction.cuh"
+ 
++// float4 quad variant: only valid when every expert row starts 16B-aligned, i.e. when
++// n_embd % 4 == 0 (checked by the launcher). Real models have n_embd % 4 == 0, so the
++// aligned path below covers them unchanged; the scalar kernel is the fallback for
++// n_embd % 4 != 0, where a vectorized kernel could neither cover the trailing 1-3
++// columns nor assume per-row alignment.
++static __global__ void moe_weighted_reduction_f32_vec4(const float * __restrict__ experts,
++                                                       const float * __restrict__ expert_scale,
++                                                       const float * __restrict__ weights,
++                                                       float * __restrict__ dst,
++                                                       const int64_t n_embd,
++                                                       const int     n_expert_used) {
 +    const int64_t n_embd4 = n_embd / 4;
 +    const int64_t token   = blockIdx.x;
 +    const int64_t i4      = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
 +    if (i4 >= n_embd4) {
-         return;
-     }
- 
--    const uint64_t first_row   = (uint64_t) token * n_expert_used;
-+    const int64_t col       = i4 * 4;
++        return;
++    }
++
++    const int64_t col        = i4 * 4;
 +    const uint64_t first_row = (uint64_t) token * n_expert_used;
-     const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
--    float          sum         = (experts[first_row * n_embd + col] * first_scale) * weights[first_row];
++    const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
 +    float4 sum;
 +    {
 +        const float4 e = *reinterpret_cast<const float4 *>(experts + first_row * n_embd + col);
@@ -15325,33 +15337,44 @@ index 11ec58497..554c114b0 100644
 +        sum.z = (e.z * first_scale) * w;
 +        sum.w = (e.w * first_scale) * w;
 +    }
- 
-     for (int expert = 1; expert < n_expert_used; ++expert) {
-         const uint64_t row   = first_row + expert;
-         const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
--        sum += (experts[row * n_embd + col] * scale) * weights[row];
++
++    for (int expert = 1; expert < n_expert_used; ++expert) {
++        const uint64_t row   = first_row + expert;
++        const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
 +        const float4  e     = *reinterpret_cast<const float4 *>(experts + row * n_embd + col);
 +        const float   w     = weights[row];
 +        sum.x += (e.x * scale) * w;
 +        sum.y += (e.y * scale) * w;
 +        sum.z += (e.z * scale) * w;
 +        sum.w += (e.w * scale) * w;
-     }
--    dst[token * n_embd + col] = sum;
++    }
 +    reinterpret_cast<float4 *>(dst + token * n_embd + col)[0] = sum;
- }
- 
- static void launch_moe_weighted_reduction(const float * experts,
-@@ -33,7 +48,8 @@ static void launch_moe_weighted_reduction(const float * experts,
++}
++
++// scalar kernel, bounds-checked per column (upstream body): correct for any n_embd.
+ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ experts,
+                                                   const float * __restrict__ expert_scale,
+                                                   const float * __restrict__ weights,
+@@ -33,9 +78,16 @@ static void launch_moe_weighted_reduction(const float * experts,
                                            int           n_expert_used,
                                            cudaStream_t  stream) {
      constexpr int threads = 256;
 -    const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
-+    const int64_t n_embd4 = n_embd / 4;
-+    const dim3 blocks(n_tokens, (n_embd4 + threads - 1) / threads, 1);
-     moe_weighted_reduction_f32
-         <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+-    moe_weighted_reduction_f32
+-        <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++    if (n_embd % 4 == 0) {
++        const int64_t n_embd4 = n_embd / 4;
++        const dim3 blocks(n_tokens, (n_embd4 + threads - 1) / threads, 1);
++        moe_weighted_reduction_f32_vec4
++            <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++    } else {
++        const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
++        moe_weighted_reduction_f32
++            <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
++    }
  }
+ 
+ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
 index c3758cd50..4bf198077 100644
 --- a/ggml/src/ggml-cuda/norm.cu
