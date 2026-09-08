@@ -23,7 +23,7 @@ the gfx1100 record in
 | `0005` | CPU bit-identical decode/verify batches |
 | `0006` | host-buffer revert for discrete GPUs |
 | `0007` | meta device-wrapper skip |
-| `0008` | fused-core prefill kernels + GPU bit-identical results | **amended 2026-09-06 with the scale+unary fused kernel** (unary.cu/cuh, fork f5ac11903).
+| `0008` | fused-core prefill kernels + GPU bit-identical results | **amended 2026-09-06 with the scale+unary fused kernel** (unary.cu/cuh, fork f5ac11903). | **amended 2026-09-07 with the mul_mat+add through-view shape guard (PR #15, DanoPTT)** — see the 2026-09-07 re-base section.
 | `0009` | meta-buffer compute-container headroom |
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
@@ -73,19 +73,37 @@ See the block-14 notes below.  Re-base detail:
   --3way`; **one manual conflict** in `ggml-cuda/common.cuh` — upstream's
   gfx90c GCN-APU arch macros vs the block's exact-SKU
   `GGML_CUDA_CC_IS_GFX1151` predicate; resolved keeping both.
-- Canonical am-commits on the new base: `90a816a68..83a6f5103` (14
+- Canonical am-commits on the new base: `90a816a68..3bebffd6b` (14
   blocks).  Set regenerated with `scripts/make-patches.sh` (base
-  `050dde50c`, blocks tip `83a6f5103`) and `rdna-boosts-all.patch`
+  `050dde50c`, blocks tip `3bebffd6b`) and `rdna-boosts-all.patch`
   refreshed (87 files).
 - Re-verified 2026-09-07: clean-apply sim on a fresh checkout at
   `050dde50c` (`scripts/apply-all.sh`: **zero conflicts, zero whitespace
-  warnings**, applied tree byte-identical to the fork tip `83a6f5103`);
+  warnings**, applied tree byte-identical to the fork tip `3bebffd6b`);
   full build clean (ROCm 7.14 gfx1201, RCCL+graphs+native);
   test-backend-ops 6759/6759 (MUL_MAT / MUL_MAT_ID / FLASH_ATTN_EXT);
   test-llama-archs 617 OK / 0 fail incl. qwen4exp (GPU 9.21e-14, CPU
   0.00); dense 27B Q8_0 same-seed coherence byte-identical to the
   13-block build; qwen4exp IQ4_XS coherence on 3x R9700 — see the
   block-14 notes.
+- **Block-08 amendment (2026-09-07, PR #15, reporter/author DanoPTT):**
+  the mul_mat+bias fusion through a view node could hand the mmvq/mmvf
+  kernels a destination whose shape the guards never checked (a reshape
+  moves tokens between dimensions: matmul `ne=[n,1,2]` feeding an add
+  `ne=[n,2,1]` on a two-sequence batch) — `GGML_ASSERT(ids ||
+  dst->ne[1] == 1)` abort (on Windows surfacing as `0xc0000409`).  The
+  guard now requires the through-view destination to satisfy the
+  kernels' own shape constraint (`bias_node->ne[1]==1` plain,
+  `ne[2]==1` MUL_MAT_ID) before fusing; the single-sequence case is
+  unaffected.  Folded into the block-08 commit (delivery convention);
+  set regenerated (base `050dde50c`, blocks tip `3bebffd6b`).  Author
+  validation: single R9700 (gfx1201), 18 interleaved A/B runs,
+  production since 2026-09-07; the multi-GPU coherence gate + the
+  2-sequence parallel smoke were run here (3x R9700 gfx1201) — dense
+  27B Q8_0 same-seed byte-identical pre vs post fix, 3-GPU hybrid ==
+  RCCL IDENTICAL, test-backend-ops 6759/6759, parallel 2-slot
+  llama-server decode clean on both the dense 27B and qwen4exp IQ4_XS
+  (no asserts).
 
 ## Block 14 notes
 

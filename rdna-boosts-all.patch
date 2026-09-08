@@ -8322,7 +8322,7 @@ index 000000000..944110792
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 \ No newline at end of file
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 0e6601f03..bad2b924b 100644
+index 0e6601f03..e9083d2fe 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -9467,7 +9467,7 @@ index 0e6601f03..bad2b924b 100644
      fused_mul_mat_vec = false;
      fused_node_count  = 0;
  
-@@ -4067,28 +4556,218 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4067,28 +4556,237 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  
@@ -9675,6 +9675,25 @@ index 0e6601f03..bad2b924b 100644
 +
 +        // the add reads the matmul output directly, or through the view
 +        ggml_tensor * mm_or_view = has_view ? cgraph->nodes[i + 1] : mm_node;
++
++        // The mmvq/mmvf fusion kernels are told to write into bias_node, but the
++        // shape checks below (and ggml_cuda_should_fuse_mul_mat_vec_*) look at
++        // mm_node.  Without a view those are the same tensor, so the guard is
++        // sound.  With one they are not: a reshape can move the tokens between
++        // dimensions, so a matmul that looks like a single-column GEMV
++        // (ne = [n,1,2]) can be paired with an add whose destination is
++        // ne = [n,2,1].  The kernels index the destination by ne[1]/ne[2] and
++        // assert on exactly this (mmvq.cu: GGML_ASSERT(ids || dst->ne[1] == 1)).
++        // Require the destination to satisfy the same constraint the kernels
++        // assert before fusing through a view.  The single-sequence case is
++        // unaffected.  (PR #15 / DanoPTT.)
++        if (has_view) {
++            const ggml_tensor * ids_node = mm_node->src[2];
++            if (( ids_node && bias_node->ne[2] != 1) ||
++                (!ids_node && bias_node->ne[1] != 1)) {
++                continue;
++            }
++        }
  
          ggml_tensor * bias_tensor = nullptr;
          if (bias_op == GGML_OP_ADD) {
@@ -9693,7 +9712,7 @@ index 0e6601f03..bad2b924b 100644
                  continue;
              }
              bias_tensor = bias_node->src[1];
-@@ -4112,14 +4791,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4112,14 +4810,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
              ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
              fused_mul_mat_vec = true;
@@ -9710,7 +9729,7 @@ index 0e6601f03..bad2b924b 100644
              break;
          }
      }
-@@ -4148,6 +4827,96 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4148,6 +4846,96 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 1;
      }
  
@@ -9807,7 +9826,7 @@ index 0e6601f03..bad2b924b 100644
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
          ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
          return 2;
-@@ -4158,10 +4927,377 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4158,10 +4946,377 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 1;
      }
  
@@ -10186,7 +10205,7 @@ index 0e6601f03..bad2b924b 100644
          return 1;
      }
  
-@@ -4175,12 +5311,60 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4175,12 +5330,60 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 2;
      }
  
@@ -10247,7 +10266,7 @@ index 0e6601f03..bad2b924b 100644
      // flag used to determine whether it is an integrated_gpu
      const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
  
-@@ -4318,9 +5502,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4318,9 +5521,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue;
                  }
  
@@ -10267,7 +10286,7 @@ index 0e6601f03..bad2b924b 100644
  #ifdef GGML_CUDA_DEBUG
                      const int last_fused = i + nodes_to_skip;
                      GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
-@@ -4330,6 +5524,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4330,6 +5543,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      i += nodes_to_skip;
                      continue;
                  }
@@ -10275,7 +10294,7 @@ index 0e6601f03..bad2b924b 100644
  #ifndef NDEBUG
                  // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                  // node's output on the host-visible buffer, which the compute path
-@@ -4347,11 +5542,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4347,11 +5561,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  GGML_UNUSED(integrated);
  #endif  // NDEBUG
  
@@ -10295,7 +10314,7 @@ index 0e6601f03..bad2b924b 100644
  
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
-@@ -4367,6 +5570,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4367,6 +5589,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  graph->graph = nullptr;
              }
  
@@ -10314,7 +10333,7 @@ index 0e6601f03..bad2b924b 100644
              CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
              graph_evaluated_or_captured = true; // CUDA graph has been captured
  
-@@ -4394,6 +5609,59 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4394,6 +5628,59 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          graph_evaluated_or_captured = true;
  #endif  // USE_CUDA_GRAPH
      }
@@ -10374,7 +10393,7 @@ index 0e6601f03..bad2b924b 100644
  }
  
  #ifdef USE_CUDA_GRAPH
-@@ -4418,19 +5686,34 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4418,19 +5705,34 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_set_device(cuda_ctx->device);
  
@@ -10410,7 +10429,7 @@ index 0e6601f03..bad2b924b 100644
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
  
              if (!graph->warmup_complete) {
-@@ -4453,6 +5736,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4453,6 +5755,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      cuda_graph_update_required = graph->instance == nullptr;
                  }
              }
@@ -10418,7 +10437,7 @@ index 0e6601f03..bad2b924b 100644
          }
      }
  #endif // USE_CUDA_GRAPH
-@@ -4507,8 +5791,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -4507,8 +5810,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  continue;
              }
  
@@ -10429,7 +10448,7 @@ index 0e6601f03..bad2b924b 100644
                  continue;
              }
  
-@@ -4807,6 +6091,14 @@ static std::string ggml_cuda_device_description(int device) {
+@@ -4807,6 +6110,14 @@ static std::string ggml_cuda_device_description(int device) {
          description += " (dev p" + std::to_string(info.devices[device].physical_device) +
                         "/v" + std::to_string(info.devices[device].virtual_index) + ")";
      }
@@ -10444,7 +10463,7 @@ index 0e6601f03..bad2b924b 100644
      return description;
  }
  
-@@ -5496,8 +6788,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5496,8 +6807,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;

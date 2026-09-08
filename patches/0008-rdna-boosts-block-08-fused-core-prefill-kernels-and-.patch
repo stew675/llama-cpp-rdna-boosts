@@ -1,21 +1,34 @@
-From 8bc5bef5c8980c08d587db9a02ce215d87c206e4 Mon Sep 17 00:00:00 2001
+From 4bb39ab02b52f5626227c94767dbfa7fab8383f7 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 08/14] rdna-boosts: block 08: fused-core prefill kernels and
  GPU bit-identical
 
+AMENDED 2026-09-07 (PR #15, reporter DanoPTT): the mul_mat+bias fusion
+evaluates ggml_cuda_should_fuse_mul_mat_vec_* on the matmul node but
+passes bias_node to the kernel as the destination.  Without a view
+between them those are the same tensor, so the guard is sound.  Block
+08's "fuse mul_mat + add through a view node" lets a reshape sit
+between the two, and a reshape can move tokens across dimensions: with
+two sequences in one batch the matmul is ne = [5120,1,2] -- a
+single-column GEMV as far as the guard is concerned -- while the add it
+feeds is ne = [5120,2,1].  The kernels index the destination by ne[1]/
+ne[2] and assert on exactly that (mmvq.cu: GGML_ASSERT(ids ||
+dst->ne[1] == 1)).  Require the destination to satisfy the same
+constraint the kernels assert before fusing through a view.  The
+single-sequence case is unaffected.
 ---
  ggml/src/ggml-cuda/common.cuh     |  87 ++++
  ggml/src/ggml-cuda/fattn-tile.cuh |  16 +
  ggml/src/ggml-cuda/fattn.cu       |   5 +-
- ggml/src/ggml-cuda/ggml-cuda.cu   | 527 ++++++++++++++++++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu   | 546 +++++++++++++++++++++++-
  ggml/src/ggml-cuda/mmvq.cu        | 670 +++++++++++++++++++++++++++---
  ggml/src/ggml-cuda/mmvq.cuh       |  23 +
  ggml/src/ggml-cuda/norm.cu        | 215 ++++++++++
  ggml/src/ggml-cuda/norm.cuh       |   7 +
  ggml/src/ggml-cuda/unary.cu       | 150 +++++++
  ggml/src/ggml-cuda/unary.cuh      |   6 +
- 10 files changed, 1638 insertions(+), 68 deletions(-)
+ 10 files changed, 1657 insertions(+), 68 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
 index 2e5d27bb8..6b43f8d05 100644
@@ -173,7 +186,7 @@ index 3036829bb..5097310cf 100644
          if (logit_softcap == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512) {
              return BEST_FATTN_KERNEL_MMA_F16;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index fd0da76a6..361a2b6eb 100644
+index fd0da76a6..2d823466d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -712,6 +712,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
@@ -433,7 +446,7 @@ index fd0da76a6..361a2b6eb 100644
      fused_mul_mat_vec = false;
      fused_node_count  = 0;
  
-@@ -4073,28 +4286,216 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4073,28 +4286,235 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  
@@ -639,6 +652,25 @@ index fd0da76a6..361a2b6eb 100644
 +
 +        // the add reads the matmul output directly, or through the view
 +        ggml_tensor * mm_or_view = has_view ? cgraph->nodes[i + 1] : mm_node;
++
++        // The mmvq/mmvf fusion kernels are told to write into bias_node, but the
++        // shape checks below (and ggml_cuda_should_fuse_mul_mat_vec_*) look at
++        // mm_node.  Without a view those are the same tensor, so the guard is
++        // sound.  With one they are not: a reshape can move the tokens between
++        // dimensions, so a matmul that looks like a single-column GEMV
++        // (ne = [n,1,2]) can be paired with an add whose destination is
++        // ne = [n,2,1].  The kernels index the destination by ne[1]/ne[2] and
++        // assert on exactly this (mmvq.cu: GGML_ASSERT(ids || dst->ne[1] == 1)).
++        // Require the destination to satisfy the same constraint the kernels
++        // assert before fusing through a view.  The single-sequence case is
++        // unaffected.  (PR #15 / DanoPTT.)
++        if (has_view) {
++            const ggml_tensor * ids_node = mm_node->src[2];
++            if (( ids_node && bias_node->ne[2] != 1) ||
++                (!ids_node && bias_node->ne[1] != 1)) {
++                continue;
++            }
++        }
  
          ggml_tensor * bias_tensor = nullptr;
          if (bias_op == GGML_OP_ADD) {
@@ -657,7 +689,7 @@ index fd0da76a6..361a2b6eb 100644
                  continue;
              }
              bias_tensor = bias_node->src[1];
-@@ -4118,14 +4519,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4118,14 +4538,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
              ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
              fused_mul_mat_vec = true;
@@ -674,7 +706,7 @@ index fd0da76a6..361a2b6eb 100644
              break;
          }
      }
-@@ -4154,6 +4555,96 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4154,6 +4574,96 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 1;
      }
  
@@ -771,7 +803,7 @@ index fd0da76a6..361a2b6eb 100644
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
          ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
          return 2;
-@@ -4167,7 +4658,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4167,7 +4677,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
@@ -791,7 +823,7 @@ index fd0da76a6..361a2b6eb 100644
          return 1;
      }
  
-@@ -4505,6 +5007,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4505,6 +5026,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_set_device(cuda_ctx->device);
  

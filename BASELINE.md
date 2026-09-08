@@ -29,7 +29,7 @@ All 14 patches are generated against **llama.cpp upstream master at
 2026-09-02 from `0eadefebd`; dated records at the
 bottom of this file): blocks 01-14 = the fork's `rdna-boosts` block
 commits (the current 14-commit branch on `050dde50c` is
-`90a816a68..83a6f5103`; block 12 amended 2026-09-04 with the runtime
+`90a816a68..3bebffd6b`; block 12 amended 2026-09-04 with the runtime
 NCCL-failure fallback (issue #13), block 13 amended 2026-09-02 with
 two MTP regression fixes, 2026-09-05 with the RDNA3.5/RDNA3.0 gate
 relaxations and 2026-09-06 with the model-neutral Strix MoE mmq folds,
@@ -86,7 +86,7 @@ validation:
 The CURRENT delivery patches (0001-0014) are the fork's `rdna-boosts` block
 commits exported with `git format-patch` (one commit per block; the
 current 14-block set against `050dde50c`:
-`90a816a68..83a6f5103`, block 14 = the qwen4exp-support delta promoted
+`90a816a68..3bebffd6b`, block 14 = the qwen4exp-support delta promoted
 from `beta/qwen4exp`, re-based 2026-09-07; previously the
 re-based set against `465e49b9c`: `45bf4d291..c261553a1`, against
 `9cffdcc80`: `04122bfb5..8f2838d1`, block 13
@@ -371,14 +371,23 @@ Then **block 14 (qwen4exp support) was promoted from
 **one manual conflict** in `ggml-cuda/common.cuh` (upstream's gfx90c
 GCN-APU arch macros vs the block's exact-SKU
 `GGML_CUDA_CC_IS_GFX1151` predicate; both kept).  Canonical am-commits
-on the new base: `90a816a68..83a6f5103` (block-14 tip `83a6f5103`).
+on the new base: `90a816a68..3bebffd6b` (block-14 tip `3bebffd6b`).
 Set regenerated with `scripts/make-patches.sh` (base `050dde50c`, blocks
-tip `83a6f5103`); `rdna-boosts-all.patch` refreshed (87 files).
+tip `3bebffd6b`); `rdna-boosts-all.patch` refreshed (87 files).
 Re-verified 2026-09-07: clean-apply sim on a fresh checkout at
 `050dde50c` (`scripts/apply-all.sh` 14/14 `git am`, zero conflicts /
 whitespace warnings; applied tree byte-identical to the fork tip
-`83a6f5103`), full build clean (ROCm 7.14 gfx1201, RCCL+graphs+native),
+`3bebffd6b`), full build clean (ROCm 7.14 gfx1201, RCCL+graphs+native),
 test-backend-ops 6759/6759 (MUL_MAT / MUL_MAT_ID / FLASH_ATTN_EXT),
 test-llama-archs 617 OK / 0 fail incl. qwen4exp (GPU 9.21e-14 / CPU
 0.00), llama-cli same-seed coherence (3x R9700 gfx1201; dense 27B Q8_0
 and qwen4exp IQ4_XS — numbers in `patches/README.md` block-14 notes).
+Block 08 was amended same-day with the **PR #15** mul_mat+add
+through-view shape guard (community report + fix, DanoPTT — single-seq
+fusion untouched; author-validated on their single R9700, deployed to
+production 2026-09-07): the fix was folded into the block-08 commit
+and the set regenerated again (fork tip moved to `3bebffd6b`);
+clean-apply sim re-verified (tree byte-identical), full build clean,
+test-backend-ops 6759/6759, dense 27B same-seed byte-identical pre vs
+post fix, 3-GPU hybrid == RCCL IDENTICAL, parallel 2-slot llama-server
+decode clean on the dense 27B and qwen4exp IQ4_XS (no asserts).

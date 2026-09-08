@@ -59,6 +59,18 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 
 ## Current state (2026-09-07)
 
+- **Block-08 amendment — PR #15 integrated (2026-09-07):** community
+  report + fix by DanoPTT (single R9700, production since 2026-09-07):
+  block 08's mul_mat+bias fusion through a view node handed the
+  mmvq/mmvf kernels a destination whose shape the guards never checked
+  (a reshape moves tokens between dimensions on multi-sequence
+  batches) → `GGML_ASSERT(ids || dst->ne[1] == 1)` abort.  Fix folded
+  into the block-08 commit (delivery convention): require the
+  through-view destination to satisfy the kernels' shape constraint
+  before fusing.  Fork tip moved `3bebffd6b`; set regenerated;
+  verified here (3x R9700): clean-apply sim tree-identical, build
+  clean, test-backend-ops 6759/6759, dense same-seed byte-identical
+  pre vs post fix, 3-GPU hybrid == RCCL, parallel 2-slot decode clean.
 - **Re-baseline to upstream master `050dde50c` + block 14 (2026-09-07):**
   fork point moved from `465e49b9c` to the current master tip (22
   upstream commits; the ggml-cuda-touching ones — `b74f590ea` f16 FA
@@ -73,7 +85,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
   one manual `common.cuh` conflict — upstream gfx90c APU macros kept
   alongside the block's `GGML_CUDA_CC_IS_GFX1151`).  Set regenerated
   with `scripts/make-patches.sh` (base `050dde50c`, canonical
-  am-commits `90a816a68..83a6f5103`, 14 blocks) and
+  am-commits `90a816a68..3bebffd6b`, 14 blocks) and
   `rdna-boosts-all.patch` refreshed (87 files).  Clean-apply sim at
   `050dde50c` re-verified 2026-09-07 (applied tree byte-identical to
   the fork tip).  Full record:
@@ -237,7 +249,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 | `0005` | CPU bit-identical decode/verify batches |
 | `0006` | host-buffer revert for discrete GPUs |
 | `0007` | meta device-wrapper skip |
-| `0008` | fused-core prefill kernels + GPU bit-identical results (needs blocks 03+04) |
+| `0008` | fused-core prefill kernels + GPU bit-identical results (needs blocks 03+04; amended 2026-09-07 with the mul_mat+add through-view shape guard, PR #15) |
 | `0009` | meta-buffer compute-container headroom |
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions; adds a dedicated RDNA3.5 mmvq table) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL (decode keeps graph replay) |
@@ -322,6 +334,7 @@ following users for the assistance in finding issues and offering solutions!
 - https://github.com/briansp2020
 - https://github.com/eoprede
 - https://github.com/tungel
+- https://github.com/DanoPTT  (block-08 mul_mat+add through-view shape guard, PR #15)
 
 I, and everyone else who benefits from this work, really appreciate you!
 

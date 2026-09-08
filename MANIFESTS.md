@@ -9,7 +9,7 @@ The **current delivery** is a **14-patch set** against the fork point
 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`):
 blocks 01-14 (`patches/0001-…0014-…`, format-patch of the
 fork's `rdna-boosts` block commits — the re-baselined regeneration
-`90a816a68..83a6f5103` against `050dde50c`; block 12 was amended
+`90a816a68..3bebffd6b` against `050dde50c`; block 12 was amended
 2026-09-04 with the runtime NCCL-failure fallback (issue #13), block
 13 was amended 2026-09-02 with two MTP regression fixes, 2026-09-05
 with the RDNA3.5/RDNA3.0 gate relaxations and 2026-09-06 with the
@@ -29,7 +29,8 @@ re-verified after the 2026-09-04 block-12 amendment, re-verified after
 the 2026-09-05 block-13 RDNA3_5 gate relaxation, re-verified after the
 2026-09-05 RDNA3_0/gfx1100 fold, re-verified on the `465e49b9c` re-base
 2026-09-06, re-verified on the `050dde50c` re-base + block 14
-2026-09-07).
+2026-09-07, re-verified 2026-09-07 after the block-08 PR-15
+view-guard amendment).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -72,7 +73,7 @@ delivery — use `patches/` + `scripts/apply-all.sh`.
 | 05 | `0005-…-block-05-CPU-bit-identical-decode-verify.patch` | CPU bit-identical decode/verify batches | none |
 | 06 | `0006-…-block-06-host-buffer-revert-for-discrete.patch` | host-buffer revert for discrete GPUs | none |
 | 07 | `0007-…-block-07-meta-device-wrapper-skip.patch` | meta device-wrapper skip | none |
-| 08 | `0008-…-block-08-fused-core-prefill-kernels-and-.patch` | fused-core prefill kernels + GPU bit-identical results | **blocks 03 and 04 MUST be applied first** (fattn-tile.cuh / fattn.cu territory) |
+| 08 | `0008-…-block-08-fused-core-prefill-kernels-and-.patch` | fused-core prefill kernels + GPU bit-identical results | **blocks 03 and 04 MUST be applied first** (fattn-tile.cuh / fattn.cu territory); amended 2026-09-07 with the mul_mat+add through-view shape guard (PR #15) |
 | 09 | `0009-…-block-09-meta-buffer-compute-container-h.patch` | meta-buffer compute-container headroom | none |
 | 10 | `0010-…-block-10-k-quant-boosts-Q4_K-Q5_K-Q6_K-Q.patch` | k-quant + mmvq-parameter umbrella (VDR kernels, RDNA3_5 table, MoE mmid) — the only decode-numerics patch | none (omit for greedy purity) |
 | 11 | `0011-…-block-11-skip-CUDA-graphs-for-multi-toke.patch` | skip CUDA graphs for multi-token prefill | none |
@@ -100,17 +101,23 @@ cases vs upstream's new LEAKY_RELU perf cases; both kept) and **block 14
 --3way` of the squashed fork delta `c261553a1..dd4301fb4`; one manual
 conflict in `ggml-cuda/common.cuh` — upstream's gfx90c GCN-APU arch
 macros kept alongside the block's exact-SKU `GGML_CUDA_CC_IS_GFX1151`
-predicate).  Canonical am-commits on the new base: `90a816a68..83a6f5103`.
+predicate).  Canonical am-commits on the new base: `90a816a68..3bebffd6b`.
 Set regenerated with `scripts/make-patches.sh` (base `050dde50c`, blocks
-tip `83a6f5103`); `rdna-boosts-all.patch` refreshed (87 files).
+tip `3bebffd6b`); `rdna-boosts-all.patch` refreshed (87 files).
 Re-verified 2026-09-07: clean-apply sim on a fresh checkout at
 `050dde50c` (**zero conflicts, zero whitespace warnings**, applied tree
-byte-identical to the fork tip `83a6f5103`), full build clean (ROCm 7.14
+byte-identical to the fork tip `3bebffd6b`), full build clean (ROCm 7.14
 gfx1201, RCCL+graphs+native), test-backend-ops 6759/6759 (MUL_MAT /
 MUL_MAT_ID / FLASH_ATTN_EXT), test-llama-archs 617 OK / 0 fail incl.
 qwen4exp (GPU 9.21e-14 / CPU 0.00), dense + qwen4exp llama-cli same-seed
 coherence (3x R9700) — numbers in the block-14 notes of
-`patches/README.md`.
+`patches/README.md`.  Same-session block-08 amendment (PR #15,
+DanoPTT): the mul_mat+add through-view fusion guard folded into block
+08 (delivery commit, see `patches/README.md`); clean-apply sim
+re-verified, build clean, test-backend-ops 6759/6759, dense 27B Q8_0
+same-seed byte-identical pre vs post fix, 3-GPU hybrid == RCCL
+IDENTICAL, parallel 2-slot llama-server decode clean (dense 27B +
+qwen4exp IQ4_XS).
 ### Re-baseline to 465e49b9c (2026-09-06)
 
 Upstream master moved **18 commits** past the fold-verified base

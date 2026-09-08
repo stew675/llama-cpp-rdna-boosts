@@ -4,7 +4,7 @@
 > `qwen4exp-support.patch` is now **block 14** of the delivery set
 > (`patches/0014-rdna-boosts-block-14-qwen4exp-support.patch`), re-based
 > from this beta copy onto the `050dde50c` delivery core (fork point
-> moved 2026-09-07; canonical am-commits `90a816a68..83a6f5103`).  This
+> moved 2026-09-07; canonical am-commits `90a816a68..3bebffd6b`).  This
 > file stays as the validation record + promotion source (the squashed
 > fork delta `c261553a1..dd4301fb4` against the OLD `465e49b9c`-based
 > core).  Re-base conflicts resolved during promotion: one hunk in
