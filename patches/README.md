@@ -18,7 +18,8 @@ amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #
 amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18) — see the
 2026-09-08 fixes section and the block-13/14 notes below; block 14
 amended 2026-09-08 with the compiler-warning cleanup (Vulkan/clang-16 + ROCm
-host builds) — see the block-14 notes below):
+host builds) and 2026-09-08 with the qwen4exp tensor-split backend gate
+(HIP-only) — see the block-14 notes below):
 
 | patch | content |
 |---|---|
@@ -35,7 +36,7 @@ host builds) — see the block-14 notes below):
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)** — see the block-13 notes below.
-| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. |
+| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. |
 
 ## Apply (fresh checkout at the fork point)
 
@@ -249,6 +250,23 @@ amended blocks 02/04/08/13):
   behavior change in default configs; verified warning-free with the
   exact build flags (4 TUs) and by full Vulkan + ROCm gfx1201 builds
   of the re-applied sim tree.
+- **qwen4exp tensor-split backend gate (2026-09-08, folded into block
+  14):** block 14 removed upstream's `case LLM_ARCH_QWEN4EXP: // TODO:
+  fix test-llama-archs` from `llm_arch_supports_sm_tensor`, enabling
+  qwen4exp tensor split on every backend.  It is validated on ROCm/HIP
+  only (3x R9700, NMSE 9.87e-14 vs CPU); on backends that cannot run
+  the fused QSA/HC/WS4 ops on-device (Vulkan, Metal, SYCL; NVIDIA CUDA
+  untested) the CPU-fallback subgraphs leave the meta splitter unable
+  to reconcile mirrored-vs-split operand states and it aborts at graph
+  reserve (`ggml-backend-meta.cpp` `handle_generic`, e.g. the qwen4exp
+  gated-attention `MUL` on Vulkan — `test-llama-archs` died at the
+  qwen4exp Meta row).  The enablement is now `#ifdef GGML_USE_HIP`,
+  restoring upstream's clean "not implemented" error / arch-test SKIP
+  on all other builds.  Verified: Vulkan — full test-llama-archs sweep
+  completes RC=0 (457 rows, statuses identical to upstream
+  `050dde50c`; qwen4exp Meta SKIP like upstream; single-device still
+  OK 9.01e-08, roundtrip OK), llama-cli qwen4exp `-sm tensor` fails
+  with the upstream message; HIP — qwen4exp Meta still OK 9.87e-14.
 
 Validation is recorded in `beta/qwen4exp/README.md` (the halo/soar
 campaigns on the old base) plus the 2026-09-07 delivery checks above;

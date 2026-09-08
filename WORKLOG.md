@@ -10,6 +10,28 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Block-14 amendment (2nd) — qwen4exp tensor-split backend gate
+  (2026-09-08):** follow-up to the Vulkan validation sweep: block 14
+  had removed upstream's `case LLM_ARCH_QWEN4EXP: // TODO: fix
+  test-llama-archs` from `llm_arch_supports_sm_tensor`, enabling
+  qwen4exp tensor split for every backend.  That is validated on
+  ROCm/HIP only (3x R9700, NMSE 9.87e-14 vs CPU); on backends that
+  cannot run the fused QSA/HC/WS4 ops on-device (Vulkan, Metal, SYCL;
+  NVIDIA CUDA untested) the CPU-fallback subgraphs leave the meta
+  splitter unable to reconcile mirrored-vs-split operand states and it
+  aborts at graph reserve (`ggml-backend-meta.cpp` `handle_generic`,
+  e.g. the qwen4exp gated-attention `MUL` on Vulkan — `test-llama-archs`
+  died at the qwen4exp Meta row).  The enablement is now `#ifdef
+  GGML_USE_HIP`, restoring upstream's clean "not implemented" error /
+  arch-test SKIP on all other builds.  Verified: Vulkan — full
+  test-llama-archs sweep completes RC=0 (457 rows, statuses identical
+  to upstream 050dde50c, qwen4exp Meta SKIP like upstream), qwen4exp
+  single-device still OK (9.01e-08, roundtrip OK), llama-cli
+  qwen4exp `-sm tensor` fails with the upstream message; HIP —
+  qwen4exp Meta still OK 9.87e-14 (validated path unchanged).  Canonical
+  fork rebuilt at `050dde50c`; block-14 tip `13719e3ca` →
+  `2f1dc384b`; set regenerated; clean-apply sim re-verified (14/14
+  `git am`, zero whitespace warnings, applied tree == fork tip).
 - **Block-14 amendment — compiler-warning cleanup (2026-09-08):** the
   block-14 sources warned under the `build-llama-vulkan` (system clang
   16.2.1, `-Wall -Wextra`) and `build-llama-rocm-714` (ROCm clang)

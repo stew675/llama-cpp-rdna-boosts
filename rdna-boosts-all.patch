@@ -17299,7 +17299,7 @@ index 221e14f7f..57d1ca865 100644
              llama-kv-cache-dsa.cpp
              llama-kv-cache-dsa-iswa.cpp
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index 15f651919..5799d3122 100644
+index 15f651919..f08df1643 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
 @@ -578,6 +578,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
@@ -17322,14 +17322,28 @@ index 15f651919..5799d3122 100644
      // Nemotron 3 Super
      // latent projections feed ggml_mul_mat, the buft probe must use MUL_MAT to keep them on GPU
      {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
-@@ -1149,7 +1155,6 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+@@ -1149,8 +1155,20 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
          case LLM_ARCH_BAILINGMOE3:
          case LLM_ARCH_KIMI_K3:
          case LLM_ARCH_QWEN3TTS:
 -        case LLM_ARCH_QWEN4EXP:   // TODO: fix test-llama-archs
              return false;
++        case LLM_ARCH_QWEN4EXP:
++            // qwen4exp (Flash-Next) tensor split runs the fused QSA/HC/WS4
++            // ops through the meta backend and is validated on ROCm/HIP only
++            // (3x R9700, byte-identical to CPU).  On backends that cannot run
++            // those fused ops on-device (Vulkan, Metal, SYCL, CPU) the graph
++            // portions fall back to CPU and the meta splitter cannot reconcile
++            // the mirrored-vs-split operand states (abort at graph reserve), and
++            // CUDA (NVIDIA) is untested, so keep upstream's unsupported there.
++#ifdef GGML_USE_HIP
++            return true;
++#else
++            return false;   // TODO: validate NVIDIA CUDA tensor split, then allow GGML_USE_CUDA too
++#endif
          default:
              return true;
+     }
 diff --git a/src/llama-arch.h b/src/llama-arch.h
 index f1d173a57..01e2bbe1d 100644
 --- a/src/llama-arch.h
