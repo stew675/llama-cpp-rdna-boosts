@@ -1043,7 +1043,7 @@ index 40e50c5c9..942503d3b 100644
          case GGML_OP_MUL_MAT_ID:
          case GGML_OP_CUMSUM:
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 87a329f26..23749f3d6 100644
+index 87a329f26..204c6f6d8 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -2026,6 +2026,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
@@ -1057,7 +1057,7 @@ index 87a329f26..23749f3d6 100644
          case GGML_OP_FLASH_ATTN_BACK:
              {
                  int32_t t = ggml_get_op_params_i32(tensor, 0);
-@@ -2101,6 +2105,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+@@ -2101,6 +2105,26 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
              {
                  ggml_compute_forward_dsv4_hc_post(params, tensor);
              } break;
@@ -1073,10 +1073,18 @@ index 87a329f26..23749f3d6 100644
 +            {
 +                ggml_compute_forward_indexer_topk(params, tensor);
 +            } break;
++        case GGML_OP_INDEXER_SCORE:
++        case GGML_OP_INDEXER_FILL:
++            {
++                // GPU-only fused indexer ops (no CPU forward): the CPU plan
++                // phase above already aborts on them ("op not implemented")
++                // before compute is ever reached.
++                GGML_ABORT("fatal error");
++            }
          case GGML_OP_MAP_CUSTOM1:
              {
                  ggml_compute_forward_map_custom1(params, tensor);
-@@ -2284,6 +2300,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2284,6 +2308,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_DSV4_HC_COMB:
          case GGML_OP_DSV4_HC_PRE:
          case GGML_OP_DSV4_HC_POST:
@@ -1086,7 +1094,7 @@ index 87a329f26..23749f3d6 100644
              {
                  n_tasks = n_threads;
              } break;
-@@ -2423,6 +2442,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2423,6 +2450,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_TOP_K:
          case GGML_OP_FLASH_ATTN_EXT:
          case GGML_OP_FLASH_ATTN_BACK:
@@ -1094,7 +1102,7 @@ index 87a329f26..23749f3d6 100644
          case GGML_OP_SSM_CONV:
          case GGML_OP_SSM_SCAN:
          case GGML_OP_LIGHTNING_INDEXER:
-@@ -3029,6 +3049,15 @@ struct ggml_cplan ggml_graph_plan(
+@@ -3029,6 +3057,15 @@ struct ggml_cplan ggml_graph_plan(
                          const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
                          cur = per_thread * sizeof(float) * n_tasks;
                      } break;
@@ -1131,7 +1139,7 @@ index 99b7d5afa..73e582acd 100644
  #endif
  
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 266261c5e..363e81f5b 100644
+index 266261c5e..cd4122a7d 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -3,6 +3,7 @@
@@ -1458,7 +1466,7 @@ index 266261c5e..363e81f5b 100644
 +        default:
 +            {
 +                GGML_ABORT("fatal error");
-+            } break;
++            }
 +    }
 +}
 +
@@ -1525,7 +1533,7 @@ index 266261c5e..363e81f5b 100644
 +        default:
 +            {
 +                GGML_ABORT("fatal error");
-+            } break;
++            }
 +    }
 +}
 +
@@ -16869,7 +16877,7 @@ index 000000000..c90460a45
 +    return true;
 +}
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 6257cdbe5..ec8579514 100644
+index 6257cdbe5..7f2a4fdb4 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1084,6 +1084,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -16922,7 +16930,7 @@ index 6257cdbe5..ec8579514 100644
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -5532,6 +5543,254 @@ void ggml_flash_attn_ext_add_sinks(
+@@ -5532,6 +5543,252 @@ void ggml_flash_attn_ext_add_sinks(
      a->src[4] = sinks;
  }
  
@@ -17142,8 +17150,6 @@ index 6257cdbe5..ec8579514 100644
 +    GGML_ASSERT(pool->ne[0] == k->ne[0] && pool->ne[2] == k->ne[2]);
 +    GGML_ASSERT(pool->ne[1] == blk_cells->ne[0] / r);
 +
-+    const int64_t n_blocks = blk_cells->ne[0] / r;
-+
 +    // write through a view of the caller's pool buffer (the derived-cache rows)
 +    struct ggml_tensor * result = ggml_view_tensor(ctx, pool);
 +    ggml_format_name(result, "%s (indexer_fill)", pool->name);
@@ -17177,7 +17183,7 @@ index 6257cdbe5..ec8579514 100644
  // ggml_flash_attn_back
  
  struct ggml_tensor * ggml_flash_attn_back(
-@@ -6529,6 +6788,87 @@ struct ggml_tensor * ggml_dsv4_hc_post(
+@@ -6529,6 +6786,87 @@ struct ggml_tensor * ggml_dsv4_hc_post(
      return result;
  }
  
@@ -18757,7 +18763,7 @@ index 87195fddd..75b9b3493 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8ace95f73..39359f30f 100644
+index 8ace95f73..4a7cd0c81 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -5,6 +5,14 @@
@@ -19434,7 +19440,7 @@ index 8ace95f73..39359f30f 100644
      // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
      const int64_t n_stream = mctx_hyb->get_n_stream();
      GGML_ASSERT(n_tokens % n_stream == 0);
-@@ -553,6 +991,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -553,6 +991,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
          cparams.causal_attn && !hparams.use_alibi;
  
@@ -19446,15 +19452,16 @@ index 8ace95f73..39359f30f 100644
 +        const char * env = getenv("GGML_CUDA_QSA_INDEXER_SCORE");
 +        return env == nullptr || std::atoi(env) != 0;
 +    }();
-+    static const bool idx_cache = [] {
++    static const int idx_cache = [] {
++        // 0 = off, 1 = on (default), 2 = probe-2 (pool passed to the score WITHOUT the fill)
 +        const char * env = getenv("GGML_CUDA_QSA_INDEXER_CACHE");
-+        return env == nullptr || std::atoi(env) != 0;
++        return env == nullptr ? 1 : std::atoi(env);
 +    }();
 +
      // nothing above depends on the layer, so the layers sharing a ratio share one input set
      llm_graph_input_qsa * inp = nullptr;
  
-@@ -567,11 +1018,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -567,11 +1019,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
          qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
          qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
@@ -19473,7 +19480,7 @@ index 8ace95f73..39359f30f 100644
  
          inp = qsa.get();
          res->add_input(std::move(qsa));
-@@ -589,33 +1047,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -589,33 +1048,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
      k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
  
@@ -19508,7 +19515,7 @@ index 8ace95f73..39359f30f 100644
      ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
      q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
      q = build_norm(q, model.layers[il].index_q_norm, nullptr, LLM_NORM_RMS, il);
-@@ -624,50 +1056,123 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -624,50 +1057,123 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
              ext_factor, attn_factor, beta_fast, beta_slow);
      cb(q, "indexer_q", il);
  
@@ -19667,7 +19674,7 @@ index 8ace95f73..39359f30f 100644
      cb(top_k, "indexer_top_k", il);
  
      return top_k;
-@@ -744,10 +1249,41 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -744,10 +1250,41 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
      ggml_tensor * k = mctx_cur->get_k(ctx0, il);
      ggml_tensor * v = mctx_cur->get_v(ctx0, il);
  
@@ -19713,7 +19720,7 @@ index 8ace95f73..39359f30f 100644
      cb(cur, "kqv_out", il);
  
      // the rotation is its own inverse, so undo it on the value side of the output
-@@ -768,10 +1304,100 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -768,10 +1305,100 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      const int64_t n_embd_head = hparams.n_embd_head_v();
      GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
  
@@ -19789,7 +19796,7 @@ index 8ace95f73..39359f30f 100644
 +            // default: sniff the first ACCEL device's gfx id (the CUDA device description
 +            // now carries "(gfxNNNN)" for AMD parts)
 +            int gfx = -1;
-+            for (int i = 0; i < ggml_backend_dev_count(); ++i) {
++            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
 +                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
 +                const enum ggml_backend_dev_type ty = ggml_backend_dev_type(dev);
 +                if (ty == GGML_BACKEND_DEVICE_TYPE_CPU || ty == GGML_BACKEND_DEVICE_TYPE_META) {
@@ -19818,7 +19825,7 @@ index 8ace95f73..39359f30f 100644
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -1035,10 +1661,14 @@ public:
+@@ -1035,10 +1662,14 @@ public:
  
      bool can_reuse(const llm_graph_params & params) override {
          mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
@@ -19834,7 +19841,7 @@ index 8ace95f73..39359f30f 100644
  
      const llama_model_qwen4exp & pmodel;
  
-@@ -1047,6 +1677,7 @@ public:
+@@ -1047,6 +1678,7 @@ public:
  
      // scratch, reused across set_input() calls
      std::vector<llama_token> prev;
@@ -19842,7 +19849,7 @@ index 8ace95f73..39359f30f 100644
  };
  
  void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
-@@ -1109,7 +1740,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -1109,7 +1741,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
          }
      }
  
@@ -19910,7 +19917,7 @@ index 8ace95f73..39359f30f 100644
  }
  
  // Read a conv history out of its own recurrent row and write the new tail back.
-@@ -1176,6 +1866,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+@@ -1176,6 +1867,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
      auto ple_inp = std::make_unique<llm_graph_input_ple>(
              static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
  

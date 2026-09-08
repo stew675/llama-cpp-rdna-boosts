@@ -63,7 +63,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 
 The current delivery is a **14-patch set** for llama.cpp at the fork
 point `050dde50c` (blocks 01-14 in `patches/`, applied with `git am` via
-`scripts/apply-all.sh`; current block-14 tip `3529b3497`, regenerated
+`scripts/apply-all.sh`; current block-14 tip `13719e3ca`, regenerated
 2026-09-08).  The set applies **whitespace-clean** and each block is
 build- and coherence-verified — see [`MANIFESTS.md`](MANIFESTS.md) (apply
 order + verification contract), [`patches/README.md`](patches/README.md)
@@ -75,6 +75,11 @@ integrations, re-baselines, regenerations) are tracked as dated entries
 — newest first — in **[`WORKLOG.md`](WORKLOG.md)**; the current-state
 summary below is deliberately short and does not repeat them.
 
+- **Latest entry (2026-09-08):** block-14 compiler-warning cleanup
+  (Vulkan/clang-16 + ROCm host builds — unused local, exhaustive-switch
+  labels for the GPU-only `INDEXER_SCORE`/`INDEXER_FILL` ops, two
+  unreachable `break`s, `idx_cache` 0/1/2 tri-state restored, `size_t`
+  loop counter; no runtime change).
 - **Latest entries (2026-09-08, issues #18/#19 — reported by
   `briansp2020`):** block-14 MUL_MAT_ID pair-fusion layout gate
   (non-standard MUL_MAT_ID pairs no longer abort; qwen4exp sparse-MoE

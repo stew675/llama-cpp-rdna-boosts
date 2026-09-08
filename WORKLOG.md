@@ -10,6 +10,37 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Block-14 amendment — compiler-warning cleanup (2026-09-08):** the
+  block-14 sources warned under the `build-llama-vulkan` (system clang
+  16.2.1, `-Wall -Wextra`) and `build-llama-rocm-714` (ROCm clang)
+  host builds.  Five warnings, all from block-14 code, fixed and
+  folded into the block-14 commit:
+  - `ggml.c` — unused `n_blocks` local in the `ggml_indexer_fill`
+    builder (removed).
+  - `ggml-cpu.c` — `-Wswitch`: the exhaustive CPU compute-forward
+    switch had no case labels for the new `GGML_OP_INDEXER_SCORE` /
+    `GGML_OP_INDEXER_FILL` ops (GPU-only fused ops; the CPU plan
+    phase already aborts on them as "op not implemented" before
+    compute, so the case is an unreachable `GGML_ABORT`, mirroring
+    `GGML_OP_COUNT`).
+  - `ggml-cpu/ops.cpp` — two `-Wunreachable-code-break` warnings: the
+    `break` after the noreturn `GGML_ABORT("fatal error")` in the
+    `HC_MIX`/`HC_COMBINE` CPU type dispatchers' default cases
+    (dropped, matching upstream convention).
+  - `qwen4exp.cpp` — `idx_cache` was narrowed to `bool`, making the
+    documented `GGML_CUDA_QSA_INDEXER_CACHE=2` debug probe
+    (`idx_cache != 2`) tautologically true (`-Wtautological-constant-
+    out-of-range-compare`); restored to an `int` with the 0/1/2
+    tri-state so probe-2 (pool read without the fill) is reachable
+    again.  `-Wsign-compare` in the gfx-id sniff loop (`size_t`
+    counter vs `ggml_backend_dev_count()`).
+  No generated-code or runtime-behavior change in default configs.
+  Verified: the four TUs compile warning-free with the exact
+  build-vulkan flags; full Vulkan + ROCm 7.14 (gfx1201) builds clean
+  on the re-applied sim tree.  Canonical fork rebuilt at `050dde50c`;
+  block-14 tip moved `3529b3497` → `13719e3ca`; set regenerated
+  (14/14 `git am`, zero whitespace warnings, applied tree
+  byte-identical to the fork tip); `rdna-boosts-all.patch` refreshed.
 - **Block-14 amendment — MUL_MAT_ID pair-fusion layout gate (2026-09-08,
   issue #18):** community report + detailed root-cause analysis by
   `briansp2020` (production single-R9700 deployment of the 14-block

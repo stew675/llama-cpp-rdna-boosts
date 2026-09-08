@@ -16,7 +16,9 @@ the gfx1100 record in
 amended 2026-09-07 with the QSA quantized-KV decode gate — see the block-14 notes; block 13
 amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19); block 14
 amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18) — see the
-2026-09-08 fixes section and the block-13/14 notes below):
+2026-09-08 fixes section and the block-13/14 notes below; block 14
+amended 2026-09-08 with the compiler-warning cleanup (Vulkan/clang-16 + ROCm
+host builds) — see the block-14 notes below):
 
 | patch | content |
 |---|---|
@@ -33,7 +35,7 @@ amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18) — s
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)** — see the block-13 notes below.
-| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. |
+| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. |
 
 ## Apply (fresh checkout at the fork point)
 
@@ -56,7 +58,8 @@ with block 13 on the 13-patch series, re-verified 2026-09-02 on the
 re-verified 2026-09-05 after the block-13 RDNA3_5 gate relaxation,
 re-verified 2026-09-05 after the RDNA3_0/gfx1100 fold, re-verified
 2026-09-06 on the `465e49b9c` re-base, re-verified 2026-09-07 on the
-`050dde50c` re-base with the 14-patch set).
+`050dde50c` re-base with the 14-patch set, re-verified 2026-09-08 after
+the block-14 warning-cleanup amendment).
 
 ## 2026-09-07 re-base to 050dde50c + block 14
 
@@ -224,6 +227,28 @@ amended blocks 02/04/08/13):
   fusion active; Flash-Next same-seed text byte-identical default vs
   `GGML_PAIR_OFF=1` and the prefill A/B still shows the pair active
   (pp2048 2780.8 vs 2756.7, pp8192 2675.7 vs 2647.1).
+- **Compiler-warning cleanup (2026-09-08, folded into block 14):** the
+  block-14 sources warned under the Vulkan host build (system clang
+  16.2.1) and the ROCm 7.14 build.  (1) `ggml.c`: unused `n_blocks`
+  local in the `ggml_indexer_fill` builder.  (2) `ggml-cpu.c`
+  `-Wswitch`: the CPU compute-forward switch is exhaustive over
+  `GGML_OP_*` and had no labels for the new `GGML_OP_INDEXER_SCORE` /
+  `GGML_OP_INDEXER_FILL` (GPU-only fused ops with no CPU forward; the
+  CPU plan phase already aborts on them as "op not implemented" before
+  compute, so the labels are an unreachable `GGML_ABORT`, mirroring
+  `GGML_OP_COUNT`).  (3) `ggml-cpu/ops.cpp`: unreachable `break` after
+  the noreturn `GGML_ABORT("fatal error")` in the `HC_MIX`/`HC_COMBINE`
+  CPU type dispatchers' default cases (dropped, matching the upstream
+  convention).  (4) `qwen4exp.cpp`: `idx_cache` had been narrowed to
+  `bool`, which made the documented `GGML_CUDA_QSA_INDEXER_CACHE=2`
+  debug probe (`idx_cache != 2`) tautological (`-Wtautological-
+  constant-out-of-range-compare`); restored to an `int` 0/1/2
+  tri-state so probe-2 (score reads the pool WITHOUT the fill) is
+  reachable again.  (5) `qwen4exp.cpp`: `-Wsign-compare` in the
+  gfx-id sniff loop (now `size_t`).  No generated-code or runtime-
+  behavior change in default configs; verified warning-free with the
+  exact build flags (4 TUs) and by full Vulkan + ROCm gfx1201 builds
+  of the re-applied sim tree.
 
 Validation is recorded in `beta/qwen4exp/README.md` (the halo/soar
 campaigns on the old base) plus the 2026-09-07 delivery checks above;
