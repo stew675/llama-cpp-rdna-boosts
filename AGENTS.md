@@ -299,3 +299,8 @@ historical records are kept, and the CURRENT state is stated in the header
 sections (`patches/README.md`, `README.md`, the top of MANIFESTS/BASELINE).
 When you change the delivery, update those headers; never edit the dated
 validation records in place — add a new dated record instead.
+Delivery-affecting changes (block amendments, community-fix integrations,
+re-baselines, regenerations) get a dated entry at the top of `WORKLOG.md`
+(newest first), and the README `Current state` section stays a lean summary
+that points there rather than accumulating the record itself.  Session/dev
+handovers belong under `wip/` or `archive/docs/`, not at the repo top level.
