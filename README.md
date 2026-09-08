@@ -15,7 +15,10 @@ float4 remainder fix (issue #19) — see
 **block 14** (qwen4exp / Qwen3.8-Flash-Next support, promoted from
 `beta/qwen4exp` — QSA sparse FA + indexer, HC fused decode ops, managed
 lazy reader, MTP draft-head, per-arch dense/QSA decode policy; amended
-2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18); see
+2026-09-07 with the QSA quantized-KV decode gate + the derived-cache
+pool gate and 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate
+(issue #18), the compiler-warning cleanup and the qwen4exp tensor-split
+HIP gate; see
 [Current state](#current-state)).
 The patches apply to a clean
 llama.cpp checkout at the recorded fork point `050dde50c` (re-based 2026-09-07 from `465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`).
@@ -63,7 +66,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 
 The current delivery is a **14-patch set** for llama.cpp at the fork
 point `050dde50c` (blocks 01-14 in `patches/`, applied with `git am` via
-`scripts/apply-all.sh`; current block-14 tip `2f1dc384b`, regenerated
+`scripts/apply-all.sh`; current block-14 tip `72f0ee944`, regenerated
 2026-09-08).  The set applies **whitespace-clean** and each block is
 build- and coherence-verified — see [`MANIFESTS.md`](MANIFESTS.md) (apply
 order + verification contract), [`patches/README.md`](patches/README.md)
@@ -75,15 +78,16 @@ integrations, re-baselines, regenerations) are tracked as dated entries
 — newest first — in **[`WORKLOG.md`](WORKLOG.md)**; the current-state
 summary below is deliberately short and does not repeat them.
 
-- **Latest entry (2026-09-08):** block-14 compiler-warning cleanup
-  (Vulkan/clang-16 + ROCm host builds — unused local, exhaustive-switch
-  labels for the GPU-only `INDEXER_SCORE`/`INDEXER_FILL` ops, two
-  unreachable `break`s, `idx_cache` 0/1/2 tri-state restored, `size_t`
-  loop counter; no runtime change) **+ qwen4exp tensor-split backend
-  gate** (the block-14 enablement of qwen4exp tensor split is now
-  `#ifdef GGML_USE_HIP` — validated on ROCm only; other backends keep
-  upstream's clean "not implemented" / arch-test SKIP instead of the
-  meta-splitter abort found on Vulkan).
+- **Latest entry (2026-09-08):** two-lineage reconciliation — the local
+  2026-09-07 QSA quantized-KV decode gate + derived-cache pool gate
+  regen (tip `bfcc4be99`) was merged with the pushed 2026-09-08 lineage
+  (issue #18 MUL_MAT_ID pair-fusion layout gate, issue #19
+  moe_weighted_reduction float4 remainder, block-14 compiler-warning
+  cleanup, qwen4exp tensor-split HIP gate; tip `2f1dc384b`) that had
+  been authored from a clone without it.  Blocks 13/14 now carry all of
+  it; canonical fork rebuilt at `050dde50c` (`7df708e66..72f0ee944`),
+  set regenerated, clean-apply sim re-verified 2026-09-08 (14/14 `git
+  am`, zero whitespace warnings, applied tree == fork tip `72f0ee944`).
 
 ## Layout
 

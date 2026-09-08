@@ -10,6 +10,21 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Two-lineage reconciliation (2026-09-08):** the 2026-09-07 local
+  delivery (`9850143`: block-14 **derived-cache pool gate**, regen at
+  fork tip `bfcc4be99`) had never been pushed; the 2026-09-08 lineage on
+  `origin/main` (issue #18 MUL_MAT_ID pair-fusion layout gate + issue
+  #19 moe_weighted_reduction float4 remainder, both folded into blocks
+  13/14; the block-14 compiler-warning cleanup; the qwen4exp
+  tensor-split HIP gate — regen tip `2f1dc384b`) had been authored from
+  a clone without it.  The two block-13/14 regens touched disjoint
+  source hunks, so blocks 13/14 now carry all of it: QSA quantized-KV
+  decode gate, derived-cache pool gate, the issue-18/19 fixes, the
+  warning cleanup and the tensor-split backend gate.  Canonical fork
+  rebuilt at `050dde50c` (am-commits `7df708e66..72f0ee944`, block-14
+  tip `72f0ee944`); set regenerated with `scripts/make-patches.sh`;
+  clean-apply sim re-verified 2026-09-08 (14/14 strict `git am`, zero
+  whitespace warnings, applied tree == fork tip `72f0ee944`).
 - **Block-14 amendment (2nd) — qwen4exp tensor-split backend gate
   (2026-09-08):** follow-up to the Vulkan validation sweep: block 14
   had removed upstream's `case LLM_ARCH_QWEN4EXP: // TODO: fix

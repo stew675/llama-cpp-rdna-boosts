@@ -13,7 +13,8 @@ baseline gate in
 `../wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`, and
 the gfx1100 record in
 `../wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`; block 14
-amended 2026-09-07 with the QSA quantized-KV decode gate — see the block-14 notes; block 13
+amended 2026-09-07 with the QSA quantized-KV decode gate + the
+derived-cache pool gate — see the block-14 notes; block 13
 amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19); block 14
 amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18) — see the
 2026-09-08 fixes section and the block-13/14 notes below; block 14
@@ -36,7 +37,7 @@ host builds) and 2026-09-08 with the qwen4exp tensor-split backend gate
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)** — see the block-13 notes below.
-| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. |
+| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-07 with the derived-cache pool gate** (the F32 block-vector pool is now allocated only when the derived cache is enabled *and* the indexer keys are unquantized — no more dead ~100 MiB buffer + no-op fill launches otherwise) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. |
 
 ## Apply (fresh checkout at the fork point)
 
@@ -208,6 +209,25 @@ amended blocks 02/04/08/13):
   runs clean at q8_0, and the BF16 fused fill/score path is unregressed
   (forced-sparse acceptance 0.82).  Record:
   `beta/qwen4exp/README.md`.
+- **Derived-cache pool gate (2026-09-07, same amendment):** the F32
+  block-vector pool (12 layers x 128 dims x 1 stream ≈ 100+ MiB at a
+  70k ctx, 103 MiB at the reported 70144) was allocated for EVERY qwen4exp
+  context, but the pool is only ever written/read by the fused
+  `INDEXER_FILL` -> `INDEXER_SCORE` path: it needs unquantized indexer
+  keys (the gate above) AND the memory-layer derived cache engaged
+  (`GGML_CUDA_QSA_INDEXER_CACHE` set; otherwise `qsa_derived_limits`
+  emits an empty fill range every step and the pool is dead weight
+  ridden by a no-op fill launch per decode step).  `pool_create` now
+  skips the allocation unless both hold (logged as `derived indexer
+  cache pool skipped (...)`); `get_pool()` returns nullptr and the fused
+  score falls back to pooling the raw cache — the same F32 arithmetic,
+  byte-identical output, minus the dead buffer.  Validated on Strix Halo
+  (gfx1151): pool probe shows allocated+ENABLED only for float keys +
+  env set, skipped for bf16/q8_0 defaults and q8_0 + env; BF16
+  forced-sparse same-seed decode byte-identical with the pool absent
+  (default) vs present + derived engaged (`GGML_CUDA_QSA_INDEXER_CACHE=1`);
+  q8_0 runme config + the full KV-type matrix re-run clean (zero
+  errors, acceptance unchanged); clean-apply sim tree-identical.
 - **MUL_MAT_ID pair-fusion layout gate (2026-09-08, folded into block
   14, issue #18):** the gate+up MUL_MAT_ID pair dispatch routes into
   block 13's `ggml_cuda_mul_mat_q_pair`, whose MUL_MAT_ID arm

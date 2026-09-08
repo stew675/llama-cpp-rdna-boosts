@@ -1,4 +1,4 @@
-From 2f1dc384be3be7797e93bc766fedb962da3b962e Mon Sep 17 00:00:00 2001
+From 72f0ee9444bb7997d5e7751fbb6ab6ddd7c832fb Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/14] rdna-boosts: block 14: qwen4exp support
@@ -100,7 +100,7 @@ SKIP) instead of crashing.
  src/llama-kv-cache.h                   |  18 +-
  src/llama-lazy-reader.cpp              | 330 +++++++++
  src/llama-lazy-reader.h                |  91 +++
- src/llama-memory-hybrid-idx.cpp        | 184 ++++-
+ src/llama-memory-hybrid-idx.cpp        | 202 +++++-
  src/llama-memory-hybrid-idx.h          |  54 +-
  src/llama-model-loader.cpp             |  22 +-
  src/llama-model-loader.h               |  12 +
@@ -112,7 +112,7 @@ SKIP) instead of crashing.
  tests/CMakeLists.txt                   |   1 +
  tests/test-lazy-reader.cpp             | 264 +++++++
  tests/test-llama-archs.cpp             |   7 +-
- 53 files changed, 6685 insertions(+), 326 deletions(-)
+ 53 files changed, 6703 insertions(+), 326 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
@@ -6442,10 +6442,10 @@ index 000000000..bff603a21
 +    std::atomic<uint64_t>  n_hits{0}, n_misses{0}, n_bytes_read{0};
 +};
 diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
-index 93b468784..2f5f64ea6 100644
+index 93b468784..b5dad83bd 100644
 --- a/src/llama-memory-hybrid-idx.cpp
 +++ b/src/llama-memory-hybrid-idx.cpp
-@@ -61,7 +61,146 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+@@ -61,7 +61,164 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
              model, hparams_idx, type_k, type_v, v_trans, offload, unified,
              kv_size, n_seq_max, n_pad, n_swa, swa_type,
              nullptr, filter_idx, nullptr, nullptr, "idx_");
@@ -6467,6 +6467,24 @@ index 93b468784..2f5f64ea6 100644
 +
 +    if (hparams.indexer_head_size == 0) {
 +        // no QSA geometry (should not happen when the indexer cache exists)
++        return;
++    }
++
++    // the pool backs the fused INDEXER_FILL -> INDEXER_SCORE derived decode path only, and
++    // only when that path can actually run:
++    //  - the fused ops read the raw indexer keys natively (F32/BF16/F16 only - quantized
++    //    indexer-key caches, e.g. --cache-type-k q8_0, always take the per-op chain), and
++    //  - the memory-layer derived cache is engaged (GGML_CUDA_QSA_INDEXER_CACHE=1/2):
++    //    otherwise qsa_derived_limits emits an empty fill range every step and the pool is
++    //    never written or read (each decode step would launch an empty fill for nothing).
++    // Skip the allocation otherwise - get_pool() then returns nullptr and build_qsa_top_k
++    // runs the fused score with no pool (pools the raw cache: the same F32 arithmetic and
++    // byte-identical output, minus the dead buffer) or the per-op chain for quantized keys.
++    if (!derived_enabled || (mem_idx->type_k() != GGML_TYPE_F32 &&
++                             mem_idx->type_k() != GGML_TYPE_BF16 &&
++                             mem_idx->type_k() != GGML_TYPE_F16)) {
++        LLAMA_LOG_INFO("%s: derived indexer cache pool skipped (%s keys, derived cache %s)\n", __func__,
++                ggml_type_name(mem_idx->type_k()), derived_enabled ? "enabled" : "disabled");
 +        return;
 +    }
 +
@@ -6593,7 +6611,7 @@ index 93b468784..2f5f64ea6 100644
  
  llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
      // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
-@@ -142,6 +281,9 @@ void llama_memory_hybrid_idx::clear(bool data) {
+@@ -142,6 +299,9 @@ void llama_memory_hybrid_idx::clear(bool data) {
      if (mem_idx) {
          mem_idx->clear(data);
      }
@@ -6603,7 +6621,7 @@ index 93b468784..2f5f64ea6 100644
  }
  
  bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-@@ -154,6 +296,9 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
+@@ -154,6 +314,9 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
          mem_idx->seq_rm(seq_id, p0, p1);
      }
  
@@ -6613,7 +6631,7 @@ index 93b468784..2f5f64ea6 100644
      return get_mem_attn()->seq_rm(seq_id, p0, p1);
  }
  
-@@ -163,6 +308,8 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
+@@ -163,6 +326,8 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
      if (mem_idx) {
          mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
      }
@@ -6622,7 +6640,7 @@ index 93b468784..2f5f64ea6 100644
  }
  
  void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
-@@ -171,6 +318,8 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
+@@ -171,6 +336,8 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
      if (mem_idx) {
          mem_idx->seq_keep(seq_id);
      }
@@ -6631,7 +6649,7 @@ index 93b468784..2f5f64ea6 100644
  }
  
  void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
-@@ -179,6 +328,8 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
+@@ -179,6 +346,8 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
      if (mem_idx) {
          mem_idx->seq_add(seq_id, p0, p1, shift);
      }
@@ -6640,7 +6658,7 @@ index 93b468784..2f5f64ea6 100644
  }
  
  void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
-@@ -187,6 +338,8 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
+@@ -187,6 +356,8 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
      if (mem_idx) {
          mem_idx->seq_div(seq_id, p0, p1, d);
      }
@@ -6649,7 +6667,7 @@ index 93b468784..2f5f64ea6 100644
  }
  
  std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_breakdown() const {
-@@ -260,6 +413,8 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
+@@ -260,6 +431,8 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
      if (mem_idx) {
          mem_idx->seq_rm(seq_id, -1, -1);
      }
@@ -6658,7 +6676,7 @@ index 93b468784..2f5f64ea6 100644
  }
  
  llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
-@@ -273,7 +428,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -273,7 +446,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
          ggml_tensor * bias,
          const llama_ubatch * ubatch,
          uint32_t ratio,
@@ -6669,7 +6687,7 @@ index 93b468784..2f5f64ea6 100644
      GGML_ASSERT(ratio > 0);
      GGML_ASSERT(get_mem_idx() != nullptr);
  
-@@ -302,6 +459,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -302,6 +477,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
      //       is the per-cell scan rather than these allocations, so hoisting them buys nothing
      std::vector<int32_t>  blk_of(n_kv);
      std::vector<int32_t>  cell_grp(n_kv);
@@ -6677,7 +6695,7 @@ index 93b468784..2f5f64ea6 100644
      std::vector<int32_t>  grp_head(n_blocks);
      std::vector<int32_t>  grp_next;
      std::vector<int32_t>  grp_first;
-@@ -468,6 +626,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -468,6 +644,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
          }
  
          GGML_ASSERT(n_bid <= n_blocks);
@@ -6685,7 +6703,7 @@ index 93b468784..2f5f64ea6 100644
  
          for (int32_t b = 0; b < n_bid; ++b) {
              int32_t sec_pos[4] = { bid_idx[b], bid_idx[b], bid_idx[b], bid_idx[b] };
-@@ -582,6 +741,14 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -582,6 +759,14 @@ void llama_memory_hybrid_idx::set_input_qsa(
              }
          }
      }
@@ -6700,7 +6718,7 @@ index 93b468784..2f5f64ea6 100644
  }
  
  //
-@@ -672,8 +839,17 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
+@@ -672,8 +857,17 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
          ggml_tensor * bias,
          const llama_ubatch * ubatch,
          uint32_t ratio,
