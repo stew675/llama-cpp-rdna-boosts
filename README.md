@@ -84,19 +84,6 @@ summary below is deliberately short and does not repeat them.
   `#ifdef GGML_USE_HIP` — validated on ROCm only; other backends keep
   upstream's clean "not implemented" / arch-test SKIP instead of the
   meta-splitter abort found on Vulkan).
-- **Latest entries (2026-09-08, issues #18/#19 — reported by
-  `briansp2020`):** block-14 MUL_MAT_ID pair-fusion layout gate
-  (non-standard MUL_MAT_ID pairs no longer abort; qwen4exp sparse-MoE
-  pairs still fuse) and the block-13 `moe_weighted_reduction` float4
-  remainder fix (`n_embd % 4 != 0` silent wrong output).  Verified:
-  `test-backend-ops -b ROCm0` 16590/16590, same-seed streams
-  byte-identical, prefill A/B shows the fusion still active.
-- **Deployment:** 3-GPU hybrid (`HIP_VISIBLE_DEVICES=0,1,2`, unpinned)
-  depth-16384 decode 38.71 t/s (+21.8% vs 2-GPU); block-12 env knobs +
-  server config in [`patches/README.md`](patches/README.md).
-- **Community fixes integrated:** see the dated WORKLOG entries for
-  PR #15 (DanoPTT), issues #18/#19 (briansp2020) and issue #13
-  (NCCL-failure fallback).
 
 ## Layout
 
