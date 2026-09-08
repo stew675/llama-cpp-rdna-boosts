@@ -59,6 +59,15 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 
 ## Current state (2026-09-07)
 
+- **Block-14 amendment — QSA quantized-KV decode gate (2026-09-07):** a
+  quantized KV cache type (e.g. `--cache-type-k q8_0`) aborted qwen4exp
+  context init (`GGML_ASSERT` in `ggml_indexer_fill`: the fused decode
+  indexer ops read raw cache rows in F32/BF16/F16 only, but the indexer
+  sub-cache shares the main `--cache-type-k`).  `build_qsa_top_k` now
+  falls back to the per-op chain for quantized indexer keys.  Validated
+  on Strix Halo across the full KV-type matrix f32/f16/bf16/q8_0/
+  q4_0/q4_1/iq4_nl/q5_0/q5_1 (start + generate, zero errors; BF16 fused
+  path unregressed).  Fork tip moved `60aa4173d`; set regenerated.
 - **Block-08 amendment — PR #15 integrated (2026-09-07):** community
   report + fix by DanoPTT (single R9700, production since 2026-09-07):
   block 08's mul_mat+bias fusion through a view node handed the

@@ -14,7 +14,8 @@ fork's `rdna-boosts` block commits — the re-baselined regeneration
 13 was amended 2026-09-02 with two MTP regression fixes, 2026-09-05
 with the RDNA3.5/RDNA3.0 gate relaxations and 2026-09-06 with the
 model-neutral Strix MoE mmq folds, block 14 (qwen4exp support) was
-promoted from `beta/qwen4exp` 2026-09-07 — see the dated records
+promoted from `beta/qwen4exp` 2026-09-07 and amended 2026-09-07 with
+the QSA quantized-KV decode gate (see the dated records
 below; the previous `465e49b9c`-based regeneration
 `45bf4d291..c261553a1` is superseded and preserved on the fork's
 history/remotes). Apply flow: `git am`
@@ -30,7 +31,8 @@ the 2026-09-05 block-13 RDNA3_5 gate relaxation, re-verified after the
 2026-09-05 RDNA3_0/gfx1100 fold, re-verified on the `465e49b9c` re-base
 2026-09-06, re-verified on the `050dde50c` re-base + block 14
 2026-09-07, re-verified 2026-09-07 after the block-08 PR-15
-view-guard amendment).
+view-guard amendment, re-verified 2026-09-07 after the block-14
+QSA quantized-KV gate amendment).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -89,6 +91,31 @@ silently drops hunks.
 
 
 ## Verified apply sequence
+
+### Block-14 QSA quantized-KV decode gate (2026-09-07, current)
+
+Report: Qwen3.8-Flash-Next Q4_K_XL llama-server (ctx 70000,
+`--cache-type-k/v q8_0`, spec-draft q8_0, draft-mtp) aborts at
+`llama_context` init — `GGML_ASSERT(k->type == F32/BF16/F16)` at
+`ggml.c:5747` in `ggml_indexer_fill`, from `build_qsa_top_k` via the
+`sched_reserve` graph probes; BF16 KV unaffected.  Root cause: the
+qwen4exp indexer sub-cache is created with the same `--cache-type-k`
+as the main KV cache, and the fused decode `INDEXER_SCORE`/
+`INDEXER_FILL` ops (constructors + kernels) read the raw cache rows in
+F32/BF16/F16 only.  Fix (folded into the block-14 commit):
+`build_qsa_top_k` gates the fused decode path on an unquantized
+indexer key type; quantized keys (q8_0/q4_0/q4_1/iq4_nl/q5_0/q5_1 K
+caches) fall back to the per-op chain (get_rows dequantizes on
+gather).  The BF16/f32 fused decode path is unchanged.  Validated on
+Strix Halo (gfx1151): reported q8_0 config loads + generates
+(acceptance 0.81); forced-sparse q8_0 decode runs clean; full KV-type
+matrix f32/f16/bf16/q8_0/q4_0/q4_1/iq4_nl/q5_0/q5_1 start + generate
+with zero errors (acceptance 0.75-0.79); BF16 forced-sparse fused
+fill/score unregressed (acceptance 0.82).  Set regenerated
+(`scripts/make-patches.sh`, base `050dde50c`, blocks tip
+`60aa4173d`); clean-apply sim re-verified 2026-09-07: 14/14 `git am`
+clean, zero whitespace warnings, applied tree byte-identical to the
+fork tip.
 
 ### Re-baseline to 050dde50c + block 14 (2026-09-07, current)
 

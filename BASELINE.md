@@ -34,6 +34,7 @@ NCCL-failure fallback (issue #13), block 13 amended 2026-09-02 with
 two MTP regression fixes, 2026-09-05 with the RDNA3.5/RDNA3.0 gate
 relaxations and 2026-09-06 with the model-neutral Strix MoE mmq folds,
 block 14 (qwen4exp support) promoted from `beta/qwen4exp` 2026-09-07
+and amended 2026-09-07 with the QSA quantized-KV decode gate
 — see `MANIFESTS.md` / `patches/README.md`
 block-12/13/14 notes; the previous `465e49b9c`-based
 regeneration `45bf4d291..c261553a1` is superseded and preserved on the
@@ -41,7 +42,8 @@ fork remote's history).
 `scripts/make-patches.sh` regenerates both. Verified 2026-09-02 and
 re-verified 2026-09-02 after the block-13 amendment, 2026-09-04
 after the block-12 amendment, 2026-09-06 on the `465e49b9c` re-base
-and 2026-09-07 on the `050dde50c` re-base + block 14: clean
+and 2026-09-07 on the `050dde50c` re-base + block 14, and 2026-09-07
+after the block-14 QSA quantized-KV gate amendment: clean
 apply (`git am` 01-14) on a fresh checkout at
 `050dde50c`, full build clean, llama-cli same-seed coherence IDENTICAL
 (hybrid vs RCCL) — and the

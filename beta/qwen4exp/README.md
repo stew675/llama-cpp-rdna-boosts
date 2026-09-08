@@ -4,7 +4,9 @@
 > `qwen4exp-support.patch` is now **block 14** of the delivery set
 > (`patches/0014-rdna-boosts-block-14-qwen4exp-support.patch`), re-based
 > from this beta copy onto the `050dde50c` delivery core (fork point
-> moved 2026-09-07; canonical am-commits `90a816a68..3bebffd6b`).  This
+> moved 2026-09-07; canonical am-commits `90a816a68..3bebffd6b`, block 14
+> amended 2026-09-07 with the QSA quantized-KV decode gate — see the
+> record below).  This
 > file stays as the validation record + promotion source (the squashed
 > fork delta `c261553a1..dd4301fb4` against the OLD `465e49b9c`-based
 > core).  Re-base conflicts resolved during promotion: one hunk in
@@ -363,6 +365,30 @@ fattn / gdn / scale-unary kernel work lives in the amended top-level blocks 0002
 Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.md`.
 
 ## Validation status (the gates this baseline holds)
+
+- QSA quantized-KV decode gate (2026-09-07, folded into the delivery's
+  block 14): quantized KV cache types crashed at context init.  Report:
+  Qwen3.8-Flash-Next Q4_K_XL server run (ctx 70000, `--cache-type-k/v
+  q8_0`, spec-draft q8_0, draft-mtp) aborts during `llama_context`
+  construction with `GGML_ASSERT(k->type == GGML_TYPE_F32 || BF16 || F16)`
+  at `ggml.c:5747` in `ggml_indexer_fill`, reached from
+  `build_qsa_top_k` through the `sched_reserve` graph probes; BF16 KV is
+  fine.  Root cause: the indexer sub-cache is created with the SAME
+  `--cache-type-k` as the main KV cache (`llama-memory-hybrid-idx`), so a
+  quantized K type hands the fused decode `INDEXER_SCORE`/`INDEXER_FILL`
+  ops (constructors + kernels support F32/BF16/F16 raw-cache reads only)
+  a quantized key tensor.  Fix: `build_qsa_top_k` gates the fused decode
+  path on an unquantized indexer key type and falls back to the per-op
+  chain (whose `get_rows` dequantizes any cache type on gather).
+  Validated on Strix Halo (gfx1151, build-rocm): the reported q8_0
+  config loads + generates (MTP acceptance 0.81); forced-sparse QSA
+  decode at q8_0 (the formerly-crashing deep path, `LLAMA_QSA_DENSE_SHORTCUT=0`
+  + `LLAMA_QSA_DENSE_DECODE_UNTIL=0`) runs clean; the full KV-type
+  matrix f32/f16/bf16/q8_0/q4_0/q4_1/iq4_nl/q5_0/q5_1 (main cache,
+  draft q8_0) all start + generate with zero assert/error lines and
+  acceptance 0.75-0.79; the BF16 fused fill/score path is unregressed
+  (forced-sparse acceptance 0.82).  Clean-apply sim tree-identical to
+  the fork tip.
 
 - WS3 #2 artifact fix + shortcut default ON gates on Strix Halo (gfx1151),
   2026-09-05: patches 6-7 (ggml sched-fallback sync + shortcut default

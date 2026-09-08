@@ -12,7 +12,8 @@ baseline gate in
 `../benchmarks/mtp-adaptive-methodology.md`, the Strix record in
 `../wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`, and
 the gfx1100 record in
-`../wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`):
+`../wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`; block 14
+amended 2026-09-07 with the QSA quantized-KV decode gate — see the block-14 notes):
 
 | patch | content |
 |---|---|
@@ -29,7 +30,7 @@ the gfx1100 record in
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md.
-| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below |
+| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) |
 
 ## Apply (fresh checkout at the fork point)
 
@@ -132,6 +133,25 @@ amended blocks 02/04/08/13):
   per-arch dense/QSA decode policy (`LLAMA_QSA_DENSE_DECODE_UNTIL`;
   gfx1151 default 65536).
 - Env gate: `LLAMA_QSA_OFF=1` disables the QSA decode path.
+- **QSA quantized-KV decode gate (2026-09-07, folded into block 14):**
+  the fused `INDEXER_SCORE`/`INDEXER_FILL` ops (and their CUDA kernels' load
+  dispatch) support raw indexer keys in F32/BF16/F16 only — the op
+  constructors assert exactly that.  But the indexer sub-cache is created
+  with the *same* `--cache-type-k` as the main KV cache, so `q8_0` (and any
+  other quantized K type) handed the fused decode path a quantized key
+  tensor and aborted with `GGML_ASSERT(k->type == F32/BF16/F16)` at context
+  init (`ggml_indexer_fill`, graph-build probe in `sched_reserve`).
+  `build_qsa_top_k` now gates the fused decode path on an unquantized
+  indexer key type and falls back to the per-op chain (whose `get_rows`
+  dequantizes any cache type on gather) — the BF16/f32 fused path is
+  byte-identical (same code when the gate passes).  Validated on Strix
+  Halo (gfx1151): the reported q8_0 server config (incl. MTP draft
+  q8_0) loads and generates (acceptance 0.80), the full KV-type matrix
+  f32/f16/bf16/q8_0/q4_0/q4_1/iq4_nl/q5_0/q5_1 all start + generate with
+  zero errors, forced-sparse QSA decode (the formerly-crashing deep path)
+  runs clean at q8_0, and the BF16 fused fill/score path is unregressed
+  (forced-sparse acceptance 0.82).  Record:
+  `beta/qwen4exp/README.md`.
 
 Validation is recorded in `beta/qwen4exp/README.md` (the halo/soar
 campaigns on the old base) plus the 2026-09-07 delivery checks above;
