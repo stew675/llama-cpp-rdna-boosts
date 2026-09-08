@@ -10,7 +10,45 @@ for the full record; per-block technical notes live in
 
 ---
 
-- **Two-lineage reconciliation (2026-09-08):** the 2026-09-07 local
+- **Block-14 amendment (3rd on 2026-09-08) — quantized-KV tensor-split
+  gate:** the `q4_1`-family KV cache types (`q4_1`, `q5_0`, `q5_1`,
+  `iq4_nl`) aborted during the first graph reserve under multi-GPU
+  `SPLIT_MODE_TENSOR` on gfx1201 (3x R9700) —
+  `ggml-backend-meta.cpp:538 GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN)`
+  — on both dense qwen35 (Qwen3.6-27B) and qwen4exp (Flash-Next), with
+  `f32/f16/bf16/q8_0/q4_0` KV and layer split passing.  Root cause is
+  **upstream**: reproduced on pristine vanilla llama.cpp at the fork
+  point `050dde50c` (identical assert, non-qwen4exp Qwen3.5-4B; also at
+  1 GPU, since upstream wraps even a single device in the Meta backend)
+  and still unfixed on current upstream master.  Tensor split forces
+  flash attention, whose CUDA/HIP kernels read the quantized K/V cache
+  natively only for `q4_0`/`q8_0` (plus the float types); for the
+  q4_1-family types the attention subgraph is externalized into
+  op-NONE graph leaves (MIRRORED split state) which collide with the
+  AXIS-0 elementwise gate branch of the qwen35/qwen4exp gated attention
+  at the `attn_gated` `MUL` — the meta splitter cannot reconcile
+  MIRRORED x AXIS-0.  Fix: a context-creation gate in
+  `llama_init_from_model` (`llama-context.cpp`, block-14-owned in the
+  set) that rejects K/V types outside FA's native set with a clear
+  error when the Meta device is actually in use (tensor split over
+  >= 2 GPUs; the fork's single-GPU "tensor" mode skips the Meta wrapper
+  and is untouched — upstream, whose 1-GPU mode also wraps Meta, gets
+  the clean error too).  Validated 2026-09-08 on gfx1201 (3x R9700,
+  ROCm 7.14): KV-type matrix on dense 27B Q8_0 + Flash-Next IQ4_XS
+  (3-GPU tensor) — `f32/f16/bf16/q8_0/q4_0` generate;
+  `q4_1/q5_0/q5_1/iq4_nl` and `k=q4_1 v=bf16` / `k=bf16 v=q4_1` fail
+  cleanly (zero asserts, actionable message); layer split + q4_1
+  Flash-Next 25.9 t/s (unchanged); qwen4exp derived-cache pool-gate
+  byte identity holds (tokens identical with the pool skipped vs
+  `GGML_CUDA_QSA_INDEXER_CACHE=1`); dense-27B same-seed coherence A/B
+  (gate stripped vs applied on the same tree) byte-identical;
+  test-llama-archs qwen4exp all OK (NMSE 1.01e-13).  Canonical fork
+  rebuilt at `050dde50c` (am-commits `d65a96084..ce641322e`, block-14
+  tip `ce641322e`); set regenerated with `scripts/make-patches.sh`;
+  clean-apply sim re-verified 2026-09-08 (14/14 strict `git am`, zero
+  whitespace warnings, applied tree == fork tip `ce641322e`, full build
+  clean, coherence byte-identical to the validation tree).
+ the 2026-09-07 local
   delivery (`9850143`: block-14 **derived-cache pool gate**, regen at
   fork tip `bfcc4be99`) had never been pushed; the 2026-09-08 lineage on
   `origin/main` (issue #18 MUL_MAT_ID pair-fusion layout gate + issue

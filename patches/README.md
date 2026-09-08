@@ -19,8 +19,11 @@ amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #
 amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18) — see the
 2026-09-08 fixes section and the block-13/14 notes below; block 14
 amended 2026-09-08 with the compiler-warning cleanup (Vulkan/clang-16 + ROCm
-host builds) and 2026-09-08 with the qwen4exp tensor-split backend gate
-(HIP-only) — see the block-14 notes below):
+host builds), 2026-09-08 with the qwen4exp tensor-split backend gate
+(HIP-only) and 2026-09-08 with the quantized-KV tensor-split gate
+(`q4_1`-family KV cache types aborting under multi-GPU `SPLIT_MODE_TENSOR`;
+an upstream bug — vanilla `050dde50c` reproduced it too) — see the block-14
+notes below):
 
 | patch | content |
 |---|---|
@@ -37,7 +40,7 @@ host builds) and 2026-09-08 with the qwen4exp tensor-split backend gate
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)** — see the block-13 notes below.
-| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-07 with the derived-cache pool gate** (the F32 block-vector pool is now allocated only when the derived cache is enabled *and* the indexer keys are unquantized — no more dead ~100 MiB buffer + no-op fill launches otherwise) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. |
+| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-07 with the derived-cache pool gate** (the F32 block-vector pool is now allocated only when the derived cache is enabled *and* the indexer keys are unquantized — no more dead ~100 MiB buffer + no-op fill launches otherwise) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. | **amended 2026-09-08 with the quantized-KV tensor-split gate** — `q4_1`-family KV cache types (`q4_1`/`q5_0`/`q5_1`/`iq4_nl`) abort at graph reserve under multi-GPU `SPLIT_MODE_TENSOR` (upstream bug, also on vanilla `050dde50c`); now rejected at context creation with a clear error when the Meta device is in use — see the block-14 notes below. |
 
 ## Apply (fresh checkout at the fork point)
 
@@ -287,6 +290,38 @@ amended blocks 02/04/08/13):
   `050dde50c`; qwen4exp Meta SKIP like upstream; single-device still
   OK 9.01e-08, roundtrip OK), llama-cli qwen4exp `-sm tensor` fails
   with the upstream message; HIP — qwen4exp Meta still OK 9.87e-14.
+
+- **Quantized-KV tensor-split gate (2026-09-08, folded into block 14):**
+  `q4_1`-family KV cache types (`q4_1`, `q5_0`, `q5_1`, `iq4_nl`) hard-
+  aborted during the first graph reserve under multi-GPU
+  `SPLIT_MODE_TENSOR` — `ggml-backend-meta.cpp` `handle_generic`
+  `GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN)` — on both
+  dense qwen35 (Qwen3.6-27B) and qwen4exp (Flash-Next) on gfx1201
+  (3x R9700).  **Upstream bug, not fork-specific**: reproduced on
+  pristine vanilla llama.cpp at `050dde50c` (same assert, non-qwen4exp
+  model; also at 1 GPU because upstream wraps even a single device in
+  the Meta backend) and unfixed on current upstream master.  Mechanism:
+  tensor split forces flash attention, whose CUDA/HIP kernels read the
+  quantized K/V cache natively only for `q4_0`/`q8_0` (plus the float
+  types).  For the q4_1 family the graph cannot express a splittable
+  attention, the sched's graph-copy machinery turns the attention I/O
+  into op-NONE graph-external leaves (split state MIRRORED), and the
+  resulting MIRRORED `attn_pregate` collides with the AXIS-0 elementwise
+  gate branch of the qwen35/qwen4exp gated attention (`attn_gated =
+  attn_pregate * sigmoid(gate)`).  Fix: a context-creation gate in
+  `llama_init_from_model` rejects K/V types outside FA's native set
+  (quantized and not `q4_0`/`q8_0`) with an actionable error when the
+  Meta device is actually in use (tensor split over >= 2 GPUs).  The
+  fork's single-GPU "tensor" mode skips the Meta wrapper (block 07) and
+  keeps working; layer split and `f32/f16/bf16/q8_0/q4_0` KV are
+  unaffected.  Validated 2026-09-08 on gfx1201 (3x R9700, ROCm 7.14):
+  KV-type matrix on dense 27B Q8_0 + Flash-Next IQ4_XS (3-GPU tensor) —
+  `f32/f16/bf16/q8_0/q4_0` generate, the four failing types + mixed
+  `k=q4_1 v=bf16` / `k=bf16 v=q4_1` fail cleanly (zero asserts); layer
+  split + q4_1 Flash-Next 25.9 t/s (unchanged); qwen4exp derived-cache
+  pool-gate byte identity holds; dense-27B same-seed coherence A/B
+  (gate stripped vs applied) byte-identical; test-llama-archs qwen4exp
+  all OK (NMSE 1.01e-13).
 
 Validation is recorded in `beta/qwen4exp/README.md` (the halo/soar
 campaigns on the old base) plus the 2026-09-07 delivery checks above;
