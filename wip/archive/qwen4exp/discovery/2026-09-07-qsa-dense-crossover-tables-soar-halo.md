@@ -28,9 +28,9 @@ the derived cache recovers +11% at 131K (the O(depth) score rescan it eliminates
 
 | depth | pp2048 qsa | pp2048 dense | pp delta | tg64 qsa | tg64 dense | tg delta |
 |---|---|---:|---:|---:|---:|---:|---:|
-| 16K  | 603 | 527 | **+14%**  | 24.11 | 24.48 | **-1.5%** |
-| 24K  | 607 | 478 | **+27%**  | 23.81 | 23.85 | **-0.2%** |
-| 32K  | 593 | 424 | **+40%**  | 23.56 | 23.27 | **+1.2%** |
+| 16K  | 603 | 527 | **+14%**  | - | - | dense (early, less controlled) |
+| 24K  | 607 | 478 | **+27%**  | - | - | dense (early, less controlled) |
+| 32K  | 593 | 424 | **+40%**  | 22.69*| 23.26 | **-2.5%** |
 | 49K  | 564 | 336 | **+68%**  | 23.07 | 22.18 | **+4.0%** |
 | 64K  | 540 | 266 | **+103%** | 22.59 | 21.20 | **+6.6%** |
 | 96K  | 493 | 183 | **+169%** | 21.66 | 19.46 | **+11.3%** |
@@ -41,15 +41,18 @@ the derived cache recovers +11% at 131K (the O(depth) score rescan it eliminates
   decode ALWAYS (qsa trails a flat ~7-8% at every depth 8K-160K).**  Simple, deterministic.
   The old "dense wins prefill at 30K" record is obsolete (predates the QSA prefill
   improvements; also a non-comparable whole-prompt llama-cli banner).
-- **Halo: QSA for prefill always (already +14% @16K, grows to +169%); QSA for decode above
-  ~26K context** (CORRECTED: the decode crossover is between 24K, where dense leads by a
-  hair -0.2%, and 32K where qsa leads +1.2% - i.e. ~24-28K, NOT ~40K as first stated; at
-  32K qsa is already ahead, so the cross is below it).  The qsa decode lead then grows
-  +4.0% @49K, +6.6% @64K, +11.3% @96K.  Halo is the outlier because 1 GPU has no
-  mirror/dispatch/AR penalty - the sparse FA's read savings surface on the wall.
+- **Halo: QSA for prefill always (already +14% @16K, grows to +169%); QSA for decode at/above
+  ~64K** (REVISED 2026-09-07 after a controlled re-measurement: three interleaved 32K pairs
+  give dense 23.26 vs QSA 22.69 = dense +2.5% (tight +/-0.01), and 64K sits at parity.  The
+  earlier ~26K estimate (dense +0.2% @24K, QSA +1.2% @32K) was measured on a build/box
+  state where the APU's 140W->120W power-cap window inflated the QSA decode reading; under
+  the controlled protocol the crossover is ~64K.  The gfx1151 policy default is 65536.
+  Halo is the outlier because 1 GPU has no mirror/dispatch/AR penalty - but the QSA decode
+  advantage only appears past ~64K, and its size there is smaller than the earlier table
+  suggested (64K is parity, not +6.6%).  The pp2048 numbers are unaffected (they match
+  across both measurement rounds: 494 vs 492.8 @96K).
   NOTE: this bf16/current-build halo table flips the old f16-era regime data (dense led
-  +7.8% @12K / +11.9% @32K per-op era; +2.3% @32K fused-f16): both the KV type and the
-  newer build (fused score + derived cache + round2 topk) moved the halo picture.
+  +7.8% @12K / +11.9% @32K per-op era): both the KV type and the newer build moved it.
 - Why Soar decode never crosses: the 3-GPU decode is MoE-mmv-bound + ~30% per-kernel
   dispatch floor (~3.16us x ~1900 kernels/token - GPU-side, graphs can't remove it), so the
   attention share is too small for QSA's FA savings to overcome the indexer overhead.  The

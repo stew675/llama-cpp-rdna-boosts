@@ -6901,7 +6901,7 @@ index 87195fddd..75b9b3493 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8ace95f73..273aac341 100644
+index 8ace95f73..6f5564449 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -5,6 +5,14 @@
@@ -7848,7 +7848,7 @@ index 8ace95f73..273aac341 100644
      cb(cur, "kqv_out", il);
  
      // the rotation is its own inverse, so undo it on the value side of the output
-@@ -768,10 +1295,97 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -768,10 +1295,100 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      const int64_t n_embd_head = hparams.n_embd_head_v();
      GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
  
@@ -7897,7 +7897,9 @@ index 8ace95f73..273aac341 100644
 +        // ARCH POLICY (2026-09-07 crossover tables, pp2048/tg64 bf16 KV, discovery record):
 +        // decode uses the plain dense attend while n_kv < the per-arch crossover depth and
 +        // QSA (sparse) at/above it.  Measured: gfx1151 (Strix Halo, 1 GPU) - dense wins below
-+        // ~26K, QSA above (lead grows to +11% @96K); gfx1201 (3x R9700) - dense wins at every
++        // ~64K (32K A/B: dense +2.5%, three pairs, 2026-09-07), QSA at/above (the
++        // earlier +6.6% @64K table reading sits at parity under a controlled power
++        // protocol); the threshold is set at 64K; gfx1201 (3x R9700) - dense wins at every
 +        // measured depth (8K-160K, flat ~8%), so it never switches.  PREFILL is untouched
 +        // (QSA always: it wins prefill from ~8K up on both arches).  The indexer keys are
 +        // stored as the width-shortcut does, so the sparse path takes over seamlessly above
@@ -7924,8 +7926,9 @@ index 8ace95f73..273aac341 100644
 +            int gfx = -1;
 +            for (int i = 0; i < ggml_backend_dev_count(); ++i) {
 +                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-+                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-+                    continue;
++                const enum ggml_backend_dev_type ty = ggml_backend_dev_type(dev);
++                if (ty == GGML_BACKEND_DEVICE_TYPE_CPU || ty == GGML_BACKEND_DEVICE_TYPE_META) {
++                    continue;   // GPU / IGPU / ACCEL all qualify (IGPU = integrated parts)
 +                }
 +                const char * desc = ggml_backend_dev_description(dev);
 +                if (desc != nullptr) {
@@ -7936,7 +7939,7 @@ index 8ace95f73..273aac341 100644
 +                }
 +                break;   // homogeneous GPU set in practice
 +            }
-+            return gfx == 0x1151 ? 26000 : ((int64_t) 1 << 62);  // gfx1151 crossover ~26K; else dense always
++            return gfx == 0x1151 ? 65536 : ((int64_t) 1 << 62);  // gfx1151 crossover ~64K; else dense always
 +        }();
 +        if (shortcut && n_kv <= width) {
 +            build_qsa_store_k(mctx_hyb, cur, il);
@@ -7950,7 +7953,7 @@ index 8ace95f73..273aac341 100644
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -1035,10 +1649,14 @@ public:
+@@ -1035,10 +1652,14 @@ public:
  
      bool can_reuse(const llm_graph_params & params) override {
          mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
@@ -7966,7 +7969,7 @@ index 8ace95f73..273aac341 100644
  
      const llama_model_qwen4exp & pmodel;
  
-@@ -1047,6 +1665,7 @@ public:
+@@ -1047,6 +1668,7 @@ public:
  
      // scratch, reused across set_input() calls
      std::vector<llama_token> prev;
@@ -7974,7 +7977,7 @@ index 8ace95f73..273aac341 100644
  };
  
  void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
-@@ -1109,7 +1728,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -1109,7 +1731,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
          }
      }
  
@@ -8042,7 +8045,7 @@ index 8ace95f73..273aac341 100644
  }
  
  // Read a conv history out of its own recurrent row and write the new tail back.
-@@ -1176,6 +1854,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+@@ -1176,6 +1857,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
      auto ple_inp = std::make_unique<llm_graph_input_ple>(
              static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
  

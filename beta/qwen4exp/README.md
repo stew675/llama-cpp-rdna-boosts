@@ -338,7 +338,8 @@ fattn / gdn / scale-unary kernel work lives in the amended top-level blocks 0002
   16-bit topk select (decode/small-row path), CUDA device-description gfx-id exposure
 - **ARCH POLICY (2026-09-07 crossover tables)**: decode uses the dense attend below a
   per-arch depth and QSA above; prefill is always QSA.  Defaults keyed off the first
-  ACCEL device's gfx id (gfx1151: ~26K crossover; other arches: dense decode always);
+  ACCEL device's gfx id (gfx1151: 64K crossover - dense below, QSA at/above; other arches:
+  dense decode always);
   env `LLAMA_QSA_DENSE_DECODE_UNTIL` overrides (0 = gate off = QSA decode always).  Full
   tables: `wip/archive/qwen4exp/discovery/2026-09-07-qsa-dense-crossover-tables-soar-halo.md`
 
