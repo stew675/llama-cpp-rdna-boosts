@@ -118,7 +118,7 @@ explicitly requests it.**
 | `BASELINE.md` | fork point, patch provenance, drift policy |
 | `GREEDY-PURITY.md` | block-10 decode-variance analysis (read before shipping) |
 | `patches/` | **the delivery set** (0001-0014) + apply README |
-| `scripts/apply-all.sh` | the verified apply flow (git am for blocks 01-14) |
+| `scripts/apply-all.sh` | the verified apply flow (`git am` blocks 01-14, automatic `git am -3` fallback on a drifted base) |
 | `scripts/make-patches.sh` | regenerates the set from the fork |
 | `rdna-boosts-all.patch` | the entire 14-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |

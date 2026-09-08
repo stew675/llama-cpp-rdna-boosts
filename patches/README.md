@@ -43,7 +43,10 @@ git am patches/000[1-9]-*.patch patches/001[0-4]-*.patch
 ```
 
 (`git am` for the whole 14-patch series - plain `git apply` of the
-concatenated series was observed to silently drop hunks; use `git am`.)
+concatenated series was observed to silently drop hunks; use `git am`.
+`scripts/apply-all.sh` runs a strict `git am` first and, if that fails
+on a drifted base, aborts and retries the series with `git am -3`,
+warning that merged hunks may differ from the canonical tree.)
 
 The set is **whitespace-clean**: applying produces no git whitespace
 warnings (verified 2026-08-29 after the whitespace-clean regeneration,

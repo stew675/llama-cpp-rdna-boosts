@@ -102,7 +102,7 @@ summary below is deliberately short and does not repeat them.
 ├── patches/               # the delivery set: 0001-0014
 │   └── README.md          # apply instructions + block-12 env knobs + server config
 ├── scripts/
-│   ├── apply-all.sh       # the verified apply flow (git am for blocks 01-14)
+│   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift)
 │   └── make-patches.sh    # regenerates the set from the fork (~/llama.cpp)
 ├── benchmarks/            # benchy methodology + v1/v2 results + graphs (dated records)
 ├── wip/                   # exploration docs + tuning tools + HANDOFF (session log)

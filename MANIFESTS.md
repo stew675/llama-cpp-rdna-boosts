@@ -25,7 +25,10 @@ below; the previous `465e49b9c`-based regeneration
 history/remotes). Apply flow: `git am`
 for the whole 01-14 series (plain `git apply` of the concatenated series
 SILENTLY DROPS HUNKS — verified 2026-08-29);
-`scripts/apply-all.sh` automates it. **The set is whitespace-clean** —
+`scripts/apply-all.sh` automates it (strict `git am`, with an automatic
+`git am -3` 3-way-merge retry if a drifted base fails the strict apply;
+merged applies print a warning to verify against the canonical tree).
+**The set is whitespace-clean** —
 applying produces zero git whitespace warnings (verified 2026-08-29,
 re-verified 2026-09-01 on the `0eadefebd` re-base, re-verified with block
 13 on the 13-patch series 2026-09-01, re-verified on the `9cffdcc80`

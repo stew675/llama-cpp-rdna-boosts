@@ -10,6 +10,11 @@
 # recorded in MANIFESTS.md (currently 050dde50c).  All 14 blocks are applied
 # with `git am` (plain `git apply` of the concatenated series silently drops
 # hunks -- verified 2026-08-29), one commit each with the block subject.
+# If the strict apply ever fails (e.g. applying onto a close-but-drifted
+# base), the whole series is retried with `git am -3` (3-way merge against
+# the blob ids recorded in the format-patch output); true conflicts still
+# stop for manual resolution.  At the recorded baseline the strict path is
+# exact and the -3 fallback never engages.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,12 +38,28 @@ if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
 fi
 git checkout -q -b "$BRANCH"
 
-# Blocks 01-14: git am (commits each with the original subject).
-git am "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-4]-*.patch
+# Blocks 01-14: git am (commits each with the original subject).  Strict
+# first: on the recorded baseline this is exact (tree == canonical fork tip by
+# construction).  On failure, abort (returns the branch to the baseline) and
+# retry the whole series with `git am -3`, warning loudly that merged hunks
+# may differ from the canonical tree.
+APPLIED_WITH_3WAY=0
+if ! git am "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-4]-*.patch; then
+    echo "strict 'git am' failed at this base; aborting and retrying the series with 'git am -3' (3-way merge)" >&2
+    git am --abort >/dev/null 2>&1 || true
+    git am -3 "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-4]-*.patch
+    APPLIED_WITH_3WAY=1
+fi
 
 echo
 N_BLOCKS=14
-echo "All $N_BLOCKS patches applied and committed on branch $BRANCH:"
+if [ "$APPLIED_WITH_3WAY" -eq 1 ]; then
+    echo "WARNING: applied with 'git am -3' (hunks merged against the recorded blob ids)."
+    echo "If this checkout was not at the recorded baseline, diff the applied tree against"
+    echo "the canonical fork tip before building."
+else
+    echo "All $N_BLOCKS patches applied cleanly (strict git am) and committed on branch $BRANCH:"
+fi
 git log --oneline -$N_BLOCKS
 echo
 echo "Build (uses your system ROCm install; see patches/README.md for the full env-knob list):"
