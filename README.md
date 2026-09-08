@@ -1,21 +1,25 @@
 # llama-cpp-rdna-boosts
 
-A delivery repo for a **13-patch set** of **RDNA3 / RDNA3.5 / RDNA4**
+A delivery repo for a **14-patch set** of **RDNA3 / RDNA3.5 / RDNA4**
 (ROCm) feature enhancements and performance fixes for llama.cpp:
 **blocks 01-11** (MTP, GDN, BF16 KV,
 WMMA flash-attn, fused core, k-quant boosts, CUDA prefill-graph skip),
 **block 12** (the hybrid HIP all-reduce; amended 2026-09-04 with a
-runtime NCCL-failure fallback — see [Current state](#current-state)) and
+runtime NCCL-failure fallback — see [Current state](#current-state)),
 **block 13** (fused MoE gate+up+GLU MMQ + mmvq short-K item-split;
 amended 2026-09-02 with two MTP regression fixes and 2026-09-05 with
 the RDNA3.5 (Strix Halo, gfx1151) + RDNA3.0 (gfx1100) fused-MoE-MMQ
 gate relaxations — see
+[Current state](#current-state)) and
+**block 14** (qwen4exp / Qwen3.8-Flash-Next support, promoted from
+`beta/qwen4exp` — QSA sparse FA + indexer, HC fused decode ops, managed
+lazy reader, MTP draft-head, per-arch dense/QSA decode policy; see
 [Current state](#current-state)).
 The patches apply to a clean
-llama.cpp checkout at the recorded fork point `465e49b9c` (re-based 2026-09-06 from `9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`).
+llama.cpp checkout at the recorded fork point `050dde50c` (re-based 2026-09-07 from `465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`).
 
 `scripts/apply-all.sh` automates the apply: it creates a fresh `rdna-boosts`
-branch and applies blocks 01-13 with `git am`, one commit each.
+branch and applies blocks 01-14 with `git am`, one commit each.
 
 ## Supported architectures
 
@@ -53,8 +57,27 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 2026-09-05, gfx1100 validated 2026-09-05 — see
 [Current state](#current-state)).
 
-## Current state (2026-09-06)
+## Current state (2026-09-07)
 
+- **Re-baseline to upstream master `050dde50c` + block 14 (2026-09-07):**
+  fork point moved from `465e49b9c` to the current master tip (22
+  upstream commits; the ggml-cuda-touching ones — `b74f590ea` f16 FA
+  divergent-barrier fix #27870, `73ab7599b` branchless Q4_K/Q5_K mmvq
+  unpack #26705, `473599738` gfx90c HIP support #26454 — merged in
+  disjoint hunks).  The `~/llama.cpp` `rdna-boosts` fork was rebuilt
+  from `patches/` via `scripts/apply-all.sh` (13/13 `git am` clean at
+  `050dde50c` after one manual block-04 conflict in
+  `tests/test-backend-ops.cpp` — upstream LEAKY_RELU perf cases kept
+  alongside block 04's) and **block 14 (qwen4exp support) was promoted
+  from `beta/qwen4exp`** (fork delta `c261553a1..dd4301fb4`, re-based;
+  one manual `common.cuh` conflict — upstream gfx90c APU macros kept
+  alongside the block's `GGML_CUDA_CC_IS_GFX1151`).  Set regenerated
+  with `scripts/make-patches.sh` (base `050dde50c`, canonical
+  am-commits `90a816a68..83a6f5103`, 14 blocks) and
+  `rdna-boosts-all.patch` refreshed (87 files).  Clean-apply sim at
+  `050dde50c` re-verified 2026-09-07 (applied tree byte-identical to
+  the fork tip).  Full record:
+  [`patches/README.md`](patches/README.md).
 - **Re-baseline to upstream master `465e49b9c` (2026-09-06):** fork point
   moved from `9cffdcc80` to the current master tip (18 upstream commits
   past the fold-verified base `8b4b3558f`, 57 past the old fork point;
@@ -137,7 +160,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
   `patches/README.md` for the dated re-base record, incl. the 2026-09-02
   manual merges vs upstream's #27970 (sparse-fa) and #25952 (fused MoE
   expert reduction)).
-- **Set:** 13 patches in `patches/` (`0001`-`0013`).
+- **Set:** 14 patches in `patches/` (`0001`-`0014`).
 - **Verified:** clean apply + full build + llama-cli same-seed coherence
   IDENTICAL (hybrid vs RCCL, 3-GPU) on the rebuilt fork; the clean-apply
   sim at `465e49b9c` applies with zero conflicts/whitespace warnings and
@@ -187,11 +210,11 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── MANIFESTS.md           # apply order, per-block verification, validation history
 ├── BASELINE.md            # fork point, patch provenance, drift policy
 ├── GREEDY-PURITY.md       # block 10 decode-variance analysis (read before shipping)
-├── rdna-boosts-all.patch  # convenience: the entire 13-patch net as ONE patch
-├── patches/               # the delivery set: 0001-0013
+├── rdna-boosts-all.patch  # convenience: the entire 14-patch net as ONE patch
+├── patches/               # the delivery set: 0001-0014
 │   └── README.md          # apply instructions + block-12 env knobs + server config
 ├── scripts/
-│   ├── apply-all.sh       # the verified apply flow (git am for blocks 01-13)
+│   ├── apply-all.sh       # the verified apply flow (git am for blocks 01-14)
 │   └── make-patches.sh    # regenerates the set from the fork (~/llama.cpp)
 ├── benchmarks/            # benchy methodology + v1/v2 results + graphs (dated records)
 ├── wip/                   # exploration docs + tuning tools + HANDOFF (session log)
@@ -203,7 +226,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 > in `archive/docs/` (see also `archive/work/` for the closed experiments).
 > Do not mix them with the current `patches/` files.
 
-## The 13 blocks
+## The 14 blocks
 
 | patch | what |
 |-------|------|
@@ -220,6 +243,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 | `0011` | skip CUDA graphs for multi-token PRE-FILL (decode keeps graph replay) |
 | `0012` | **hybrid HIP all-reduce** — custom internal AR for the small-tensor decode path, per-size hybrid dispatch vs RCCL, RDNA4-only gate (bounded in-kernel spin since 2026-08-30 fix round; builds without RCCL) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** — prefill fused expert MMQ (RDNA4 + RDNA3_5 + RDNA3_0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K, env opt-out `GGML_CUDA_DISABLE_MOE_MMQ_FUSION`) + decode item-split (rpb 2/4/8) merged with the upstream has_fusion mmvq path |
+| `0014` | **qwen4exp / Qwen3.8-Flash-Next support** — QSA sparse FA (default) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy (promoted from `beta/qwen4exp`; see `patches/README.md` block-14 notes) |
 
 > **Greedy-purity note (read before shipping):** on the K-split decode
 > paths, block 10 (`0010`) is the only patch that changes decode numerics on
@@ -244,11 +268,11 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 # 1. fresh clone of llama.cpp, at the fork point
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-git checkout 465e49b9c        # the SHA recorded in patches/README.md
+git checkout 050dde50c        # the SHA recorded in patches/README.md
 
-# 2. apply the set (automated; VERIFIED 2026-08-29, re-verified 2026-09-01/02/05 and 2026-09-06)
+# 2. apply the set (automated; VERIFIED 2026-08-29, re-verified 2026-09-01/02/05/06 and 2026-09-07)
 bash <path-to-this-repo>/scripts/apply-all.sh .
-#    = git am patches/0001…0013  (one commit per block on a fresh `rdna-boosts` branch)
+#    = git am patches/0001…0014  (one commit per block on a fresh `rdna-boosts` branch)
 
 # 3. build + verify (trim -DGPU_TARGETS to your GPU arch for a faster build)
 cmake -B build -DGGML_HIP=ON -DGGML_HIP_RCCL=1 -DGPU_TARGETS="gfx1100;gfx1151;gfx1201" -DCMAKE_BUILD_TYPE=Release
@@ -265,13 +289,13 @@ cmake --build build -j
 ### Manual equivalent
 
 ```bash
-git am patches/000[1-9]-*.patch patches/001[0-3]-*.patch   # blocks 01-13
-git add -A && git commit -m "rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq short-K item-split"
+git am patches/000[1-9]-*.patch patches/001[0-4]-*.patch   # blocks 01-14
+git add -A && git commit -m "rdna-boosts: block 14: qwen4exp support"
 ```
 
 ## When upstream master moves
 
-The patches are static against `465e49b9c`. When upstream drifts and hunks
+The patches are static against `050dde50c`. When upstream drifts and hunks
 no longer apply, regenerate the whole set from the fork with
 `scripts/make-patches.sh` (needs the `~/llama.cpp` fork checkout, which
 carries the block commits), then update

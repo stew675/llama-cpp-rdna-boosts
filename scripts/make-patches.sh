@@ -5,23 +5,23 @@
 #   fork-path     path to the stew675/llama.cpp fork checkout (default:
 #                 ../llama.cpp relative to this repo)
 #   baseline-sha  the upstream baseline the patches are generated against
-#                 (default: 465e49b9c, see MANIFESTS.md)
-#   blocks-tip    the fork commit carrying all 13 blocks (default:
-#                 c261553a1, the block-13 commit of the 2026-09-06 canonical
-#                 rebuild at 465e49b9c)
+#                 (default: 050dde50c, see MANIFESTS.md)
+#   blocks-tip    the fork commit carrying all 14 blocks (default:
+#                 83a6f5103, the block-14 commit of the 2026-09-07
+#                 canonical rebuild at 050dde50c)
 #
-# All 13 blocks are the fork commits baseline-sha..blocks-tip, exported with
+# All 14 blocks are the fork commits baseline-sha..blocks-tip, exported with
 # `git format-patch` (the canonical, verified form; applies with `git am`).
 # Every block is a committed fork commit - including block 12 (the hybrid
 # HIP all-reduce), which was previously a working-tree delta.  Blocks 01-11
-# keep their original subjects; 12 and 13 keep theirs too, so the 000N file
-# naming is uniform across the set.
+# keep their original subjects; 12, 13 and 14 keep theirs too, so the 000N
+# file naming is uniform across the set.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
-BASELINE="${2:-465e49b9c}"
-TIP="${3:-c261553a1}"
+BASELINE="${2:-050dde50c}"
+TIP="${3:-83a6f5103}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then
@@ -32,12 +32,12 @@ cd "$FORK"
 git rev-parse --verify "$BASELINE" >/dev/null 2>&1 || { echo "ERROR: baseline $BASELINE not found in $FORK" >&2; exit 1; }
 git rev-parse --verify "$TIP" >/dev/null 2>&1 || { echo "ERROR: blocks tip $TIP not found in $FORK" >&2; exit 1; }
 
-rm -f "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-3]-*.patch
+rm -f "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-4]-*.patch
 
-# Blocks 01-13: format-patch (keeps the original subjects; applies with git am).
+# Blocks 01-14: format-patch (keeps the original subjects; applies with git am).
 git format-patch "$BASELINE".."$TIP" -o "$PATCHES" >/dev/null
 
 echo "Regenerated $PATCHES:"
-ls "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-3]-*.patch | wc -l
-echo "patches (13 blocks).  Verify with scripts/apply-all.sh on a"
+ls "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-4]-*.patch | wc -l
+echo "patches (14 blocks).  Verify with scripts/apply-all.sh on a"
 echo "fresh checkout at $BASELINE."

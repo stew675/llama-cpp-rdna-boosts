@@ -4,19 +4,21 @@ Squashed, standalone diff blocks of RDNA-specific performance and correctness
 work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
-The **current delivery** is a **13-patch set** against the fork point
-`465e49b9c` (re-based 2026-09-06 from `9cffdcc80`, itself re-based
-2026-09-02 from `0eadefebd`): blocks 01-13
-(`patches/0001-…0013-…`, format-patch of the
+The **current delivery** is a **14-patch set** against the fork point
+`050dde50c` (re-based 2026-09-07 from `465e49b9c`, itself re-based
+2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`):
+blocks 01-14 (`patches/0001-…0014-…`, format-patch of the
 fork's `rdna-boosts` block commits — the re-baselined regeneration
-`45bf4d291..c261553a1` against `465e49b9c`; block 12 was amended
+`90a816a68..83a6f5103` against `050dde50c`; block 12 was amended
 2026-09-04 with the runtime NCCL-failure fallback (issue #13), block
 13 was amended 2026-09-02 with two MTP regression fixes, 2026-09-05
 with the RDNA3.5/RDNA3.0 gate relaxations and 2026-09-06 with the
-model-neutral Strix MoE mmq folds — see the dated records below; the
-previous `9cffdcc80`-based regeneration `04122bfb5..b830050bf` is
-superseded and preserved on the fork's history/remotes). Apply flow: `git am`
-for the whole 01-13 series (plain `git apply` of the concatenated series
+model-neutral Strix MoE mmq folds, block 14 (qwen4exp support) was
+promoted from `beta/qwen4exp` 2026-09-07 — see the dated records
+below; the previous `465e49b9c`-based regeneration
+`45bf4d291..c261553a1` is superseded and preserved on the fork's
+history/remotes). Apply flow: `git am`
+for the whole 01-14 series (plain `git apply` of the concatenated series
 SILENTLY DROPS HUNKS — verified 2026-08-29);
 `scripts/apply-all.sh` automates it. **The set is whitespace-clean** —
 applying produces zero git whitespace warnings (verified 2026-08-29,
@@ -26,7 +28,8 @@ re-base 2026-09-02, re-verified after the 2026-09-02 block-13 amendment,
 re-verified after the 2026-09-04 block-12 amendment, re-verified after
 the 2026-09-05 block-13 RDNA3_5 gate relaxation, re-verified after the
 2026-09-05 RDNA3_0/gfx1100 fold, re-verified on the `465e49b9c` re-base
-2026-09-06).
+2026-09-06, re-verified on the `050dde50c` re-base + block 14
+2026-09-07).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -51,8 +54,8 @@ This is the authoritative apply order and the verification contract for the
 patch set. It is written for humans AND LLM coding agents. Follow it exactly;
 do not skip blocks.
 
-Current state: `main` is the delivery branch (flat history, 13-patch set
-against `465e49b9c`). The `baseline/<sha>` branches and `block/01-…11` tags
+Current state: `main` is the delivery branch (flat history, 14-patch set
+against `050dde50c`). The `baseline/<sha>` branches and `block/01-…11` tags
 are HISTORICAL checkpoints of the old pre-block-12 structure (older
 upstream ranges, `git apply` flow); do not use them for the current
 delivery — use `patches/` + `scripts/apply-all.sh`.
@@ -75,16 +78,39 @@ delivery — use `patches/` + `scripts/apply-all.sh`.
 | 11 | `0011-…-block-11-skip-CUDA-graphs-for-multi-toke.patch` | skip CUDA graphs for multi-token prefill | none |
 | 12 | `0012-…-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch` | **hybrid HIP all-reduce** (internal AR for the small-tensor decode path + per-size hybrid dispatch vs RCCL; RDNA4-only gate: refuses to init off gfx1200/gfx1201, falls back to RCCL) | none (apply last) |
 | 13 | `0013-…-block-13-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** (prefill fused expert MMQ, RDNA4 + RDNA3.5 + RDNA3.0 (gfx1151 validated 2026-09-05, gfx1100 validated 2026-09-05), Q3_K/Q4_K/Q5_K/Q8_0/Q6_K + decode item-split, re-based on the upstream has_fusion mmvq path; multi-token mmvq x_scale_channel_dst fusion for MoE down x topk-weights, spec-dec verify batches n=2..8; ROCm unaligned-width split-load fix for Q6_K/Q3_K 2-GPU) | none (apply last) |
+| 14 | `0014-…-block-14-qwen4exp-support.patch` | **qwen4exp / Qwen3.8-Flash-Next support** (promoted from `beta/qwen4exp`, re-based): QSA sparse FA (default) + fused indexer top-k/score, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader + PLE n-gram loading, MTP draft-head, WS4 hyperconn prefill fusions, sched alloc-fallback sync fix, QSA dense shortcut + per-arch dense/QSA decode policy | none (apply last) |
 
-Block numbers are the apply order: `01` applies first, `13` last. All blocks
+Block numbers are the apply order: `01` applies first, `14` last. All blocks
 are mutually independent except **block 08 (fused core) requires blocks 03
-and 04 in the tree**. Apply the whole 01-13 series with `git am` (or
+and 04 in the tree**. Apply the whole 01-14 series with `git am` (or
 `scripts/apply-all.sh`) — the concatenated-series `git apply` trick
 silently drops hunks.
 
 
 ## Verified apply sequence
 
+### Re-baseline to 050dde50c + block 14 (2026-09-07, current)
+
+Upstream master moved **22 commits** past `465e49b9c` (the 2026-09-07
+master tip `050dde50c`).  The `~/llama.cpp` fork was rebuilt on the new
+base via `scripts/apply-all.sh` (blocks 01-13 `git am -3`: 12 auto-merged,
+one manual conflict in `tests/test-backend-ops.cpp` — block 04's perf
+cases vs upstream's new LEAKY_RELU perf cases; both kept) and **block 14
+(qwen4exp support) was promoted from `beta/qwen4exp`** (`git apply
+--3way` of the squashed fork delta `c261553a1..dd4301fb4`; one manual
+conflict in `ggml-cuda/common.cuh` — upstream's gfx90c GCN-APU arch
+macros kept alongside the block's exact-SKU `GGML_CUDA_CC_IS_GFX1151`
+predicate).  Canonical am-commits on the new base: `90a816a68..83a6f5103`.
+Set regenerated with `scripts/make-patches.sh` (base `050dde50c`, blocks
+tip `83a6f5103`); `rdna-boosts-all.patch` refreshed (87 files).
+Re-verified 2026-09-07: clean-apply sim on a fresh checkout at
+`050dde50c` (**zero conflicts, zero whitespace warnings**, applied tree
+byte-identical to the fork tip `83a6f5103`), full build clean (ROCm 7.14
+gfx1201, RCCL+graphs+native), test-backend-ops 6759/6759 (MUL_MAT /
+MUL_MAT_ID / FLASH_ATTN_EXT), test-llama-archs 617 OK / 0 fail incl.
+qwen4exp (GPU 9.21e-14 / CPU 0.00), dense + qwen4exp llama-cli same-seed
+coherence (3x R9700) — numbers in the block-14 notes of
+`patches/README.md`.
 ### Re-baseline to 465e49b9c (2026-09-06)
 
 Upstream master moved **18 commits** past the fold-verified base
@@ -530,9 +556,10 @@ run-to-run noise, no measurable impact from the bounded-spin fix.
 | 11 | build + prefill perf A/B on gfx1201 (pp128/256/512 vs longer) | decode unchanged; prefill +6-18% for single-ubatch (pp <= ~512), neutral (~0.1%) beyond |
 | 12 | llama-cli same-seed coherence (2- and 3-GPU) + depth-16384 decode A/B (hybrid vs nccl vs internal) | same-seed output IDENTICAL to RCCL; 3-GPU hybrid 38.71 t/s (unpinned) at depth-16384; tg64 38.12 / tg512 41.08 |
 | 13 | `test-backend-ops` MUL_MAT_ID_FUSION sweep (bs 1/4/512; 16222/16222) + MoE decode perf; **MTP regression gate** — `benchmarks/mtp-adaptive-methodology.md` protocol A on the dense Q4_K_XL-UD and MoE Q4_K_M-UD (seed-42: draft acceptance > ~0.45, draft-mtp >= plain at depth 3) | fused types pass; Q6_K tg128 >= 97.6; dense mtp 27.5 / plain 30.1; MoE acceptance 0.51, draft-mtp 126 t/s |
+| 14 | test-llama-archs qwen4exp rows + llama-cli same-seed coherence on the Flash-Next GGUFs (3-GPU gfx1201 IQ4_XS) + dense 27B coherence (block-14-off paths: `LLAMA_QSA_OFF=1` / `GGML_CUDA_DISABLE_HC_FUSION=1` A/B) | arch matrix OK (GPU ~9e-14, CPU 0.00); qwen4exp output byte-identical to the pre-promotion fork; dense unchanged |
 
-Convenience: `rdna-boosts-all.patch` (repo root) is the entire 13-patch net
-as ONE patch (applies cleanly on `9cffdcc80` alone; not a substitute for the
+Convenience: `rdna-boosts-all.patch` (repo root) is the entire 14-patch net
+as ONE patch (applies cleanly on `050dde50c` alone; not a substitute for the
 per-block flow in `patches/` when you want reviewable increments).
 
 

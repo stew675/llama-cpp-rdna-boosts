@@ -1,7 +1,7 @@
-From 184b0b81401a3de306c9fdeb6ab1ca70a36210d8 Mon Sep 17 00:00:00 2001
+From a3459c7a5198609135c6f1808a0b21b6423069bb Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
-Subject: [PATCH 10/13] rdna-boosts: block 10: k-quant-boosts -
+Subject: [PATCH 10/14] rdna-boosts: block 10: k-quant-boosts -
  Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR
 
 ---
@@ -13,10 +13,10 @@ Subject: [PATCH 10/13] rdna-boosts: block 10: k-quant-boosts -
  5 files changed, 325 insertions(+), 18 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 1667a25b4..eba0a2415 100644
+index 361a2b6eb..ed172bb66 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -5013,13 +5013,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -5014,13 +5014,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
  
@@ -70,10 +70,10 @@ index 0620c12e5..0e99f7b97 100644
              }
          }
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 4e93ce730..85df38d76 100644
+index 93bc4ac08..e873fe080 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -21,9 +21,9 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
+@@ -50,9 +50,9 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
          case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
          case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
          case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
@@ -86,7 +86,7 @@ index 4e93ce730..85df38d76 100644
          case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
          case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
          case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
-@@ -70,6 +70,7 @@ enum mmvq_parameter_table_id {
+@@ -99,6 +99,7 @@ enum mmvq_parameter_table_id {
      MMVQ_PARAMETERS_GCN,
      MMVQ_PARAMETERS_RDNA2,
      MMVQ_PARAMETERS_RDNA3_0,
@@ -94,7 +94,7 @@ index 4e93ce730..85df38d76 100644
      MMVQ_PARAMETERS_RDNA4,
      MMVQ_PARAMETERS_GB10
  };
-@@ -79,7 +80,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+@@ -108,7 +109,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
      return MMVQ_PARAMETERS_RDNA4;
  #elif defined(RDNA3_0)
      return MMVQ_PARAMETERS_RDNA3_0;
@@ -105,7 +105,7 @@ index 4e93ce730..85df38d76 100644
      return MMVQ_PARAMETERS_RDNA2;
  #elif defined(GCN) || defined(CDNA)
      return MMVQ_PARAMETERS_GCN;
-@@ -99,7 +102,10 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+@@ -128,7 +131,10 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
      if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
          return MMVQ_PARAMETERS_RDNA3_0;
      }
@@ -117,7 +117,7 @@ index 4e93ce730..85df38d76 100644
          return MMVQ_PARAMETERS_RDNA2;
      }
      if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
-@@ -242,7 +248,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+@@ -271,7 +277,7 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
          case GGML_TYPE_Q3_K:    return 4;
          case GGML_TYPE_Q4_0:    return 7;
          case GGML_TYPE_Q4_1:    return 7;
@@ -126,7 +126,7 @@ index 4e93ce730..85df38d76 100644
          case GGML_TYPE_Q5_0:    return 7;
          case GGML_TYPE_Q5_1:    return 7;
          case GGML_TYPE_Q5_K:    return 5;
-@@ -491,6 +497,24 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+@@ -518,6 +524,24 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
          }
          return 1;
      }
@@ -152,7 +152,7 @@ index 4e93ce730..85df38d76 100644
          if (ncols_dst == 1) {
              switch (type) {
 diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
-index ec117c57d..0595b329c 100644
+index f2a6f2009..d42feb23b 100644
 --- a/ggml/src/ggml-cuda/vecdotq.cuh
 +++ b/ggml/src/ggml-cuda/vecdotq.cuh
 @@ -240,7 +240,16 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
@@ -312,7 +312,7 @@ index ec117c57d..0595b329c 100644
  // contiguous v/x + u/y values
  static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
      const int * __restrict__ v, const int * __restrict__ u, const int8_t * __restrict__ sc,
-@@ -961,6 +1062,59 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+@@ -965,6 +1066,59 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
      return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
  }
  
@@ -372,7 +372,7 @@ index ec117c57d..0595b329c 100644
  static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
      const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
  
-@@ -1007,6 +1161,64 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
+@@ -1016,6 +1170,64 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
      return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
  }
  
@@ -437,7 +437,7 @@ index ec117c57d..0595b329c 100644
  static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
      const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
  
-@@ -1033,6 +1245,41 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+@@ -1042,6 +1254,41 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
      return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
  }
  
@@ -480,10 +480,10 @@ index ec117c57d..0595b329c 100644
  #define VDR_IQ2_XXS_Q8_1_MMQ  2
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 5b92abf88..567e4a092 100644
+index f8882ca2a..c93a0f20e 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10985,9 +10985,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11128,9 +11128,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -519,7 +519,7 @@ index 5b92abf88..567e4a092 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -10995,8 +11019,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11138,8 +11162,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  

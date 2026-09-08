@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply the full rdna-boosts patch set (blocks 01-13)
+# Apply the full rdna-boosts patch set (blocks 01-14)
 # to a clean llama.cpp checkout at the recorded baseline.
 #
 # Usage: ./apply-all.sh [llama.cpp-checkout] [rdna-boosts-repo]
@@ -7,7 +7,7 @@
 #   rdna-boosts-repo     path to THIS repo (default: parent of scripts/)
 #
 # Requires a clean llama.cpp working tree checked out at the baseline SHA
-# recorded in MANIFESTS.md (currently 9cffdcc80).  All 13 blocks are applied
+# recorded in MANIFESTS.md (currently 050dde50c).  All 14 blocks are applied
 # with `git am` (plain `git apply` of the concatenated series silently drops
 # hunks -- verified 2026-08-29), one commit each with the block subject.
 set -euo pipefail
@@ -33,11 +33,11 @@ if git rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
 fi
 git checkout -q -b "$BRANCH"
 
-# Blocks 01-13: git am (commits each with the original subject).
-git am "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-3]-*.patch
+# Blocks 01-14: git am (commits each with the original subject).
+git am "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-4]-*.patch
 
 echo
-N_BLOCKS=13
+N_BLOCKS=14
 echo "All $N_BLOCKS patches applied and committed on branch $BRANCH:"
 git log --oneline -$N_BLOCKS
 echo

@@ -7,8 +7,10 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
 A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
-(`rdna-boosts` branch) as a **13-patch set** that applies to a clean
-llama.cpp checkout at the fork point **`465e49b9c`** (re-based 2026-09-06 from `9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`).
+(`rdna-boosts` branch) as a **14-patch set** that applies to a clean
+llama.cpp checkout at the fork point **`050dde50c`** (re-based 2026-09-07
+from `465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, re-based
+2026-09-02 from `0eadefebd`).
 
 - Blocks **01-11** (`patches/0001-…0011-…`): MTP draft depth, fused chunked
   GDN, BF16 KV, WMMA flash-attn, CPU bit-identical decode, host-buffer
@@ -47,20 +49,25 @@ llama.cpp checkout at the fork point **`465e49b9c`** (re-based 2026-09-06 from `
   `patches/README.md` block-13 notes and
   `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md` +
   `wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
+- Block **14** (`patches/0014-rdna-boosts-block-14-qwen4exp-support.patch`):
+  qwen4exp / Qwen3.8-Flash-Next support, promoted from `beta/qwen4exp`
+  2026-09-07 — QSA sparse FA (default) + fused indexer top-k/score,
+  HC_MIX/HC_COMBINE fused decode ops, managed lazy reader + PLE n-gram
+  loading, MTP draft-head, WS4 hyperconn prefill fusions, per-arch
+  dense/QSA decode policy; see the block-14 notes in `patches/README.md`
+  and the beta validation record in `beta/qwen4exp/README.md`.
 
 The repo is NOT the fork: the fork (source of truth for the block commits)
-lives at `~/llama.cpp`, branch `rdna-boosts` — currently upstream master
-synced to `465e49b9c` (2026-09-06 re-base) with the 13 block commits
-re-applied on top (block-13 tip `c261553a1`; block 12 carries the
+lives at `~/llama.cpp`, branch `rdna-boosts` — currently the 14 block
+commits on master `050dde50c` (2026-09-07 re-base; canonical am-commits
+`90a816a68..83a6f5103`, block-14 tip `83a6f5103`; block 12 carries the
 2026-09-04 runtime NCCL-failure fallback, issue #13; block 13 amended
-2026-09-02 with two MTP regression fixes, 2026-09-05 with the
-RDNA3_5/Strix Halo + RDNA3_0/gfx1100 fused-MoE-MMQ folds and 2026-09-06
-with the model-neutral Strix MoE mmq folds). The
-canonical `465e49b9c` fork used for `make-patches.sh`
+2026-09-02/09-05/09-06 as above; block 14 added 2026-09-07). The
+canonical `050dde50c` fork used for `make-patches.sh`
 regeneration is disposable and is re-created from `patches/` +
 `scripts/apply-all.sh` whenever it needs rebuilding (fresh clone at the
-fork point + apply) — the last regeneration's block-13 tip is
-`c261553a1`. Older fork states are
+fork point + apply) — the last regeneration's block-14 tip is
+`83a6f5103`. Older fork states are
 preserved on the `stew675/llama.cpp` fork remote (`rdna-boosts` =
 previous tip `482837e5a` on `0eadefebd`; `rdna-boosts-orig`, …) and in
 older local reference clones — never rely on them for the current
@@ -99,19 +106,20 @@ explicitly requests it.**
 | `MANIFESTS.md` | apply order, per-block verification, validation history |
 | `BASELINE.md` | fork point, patch provenance, drift policy |
 | `GREEDY-PURITY.md` | block-10 decode-variance analysis (read before shipping) |
-| `patches/` | **the delivery set** (0001-0013) + apply README |
-| `scripts/apply-all.sh` | the verified apply flow (git am for blocks 01-13) |
+| `patches/` | **the delivery set** (0001-0014) + apply README |
+| `scripts/apply-all.sh` | the verified apply flow (git am for blocks 01-14) |
 | `scripts/make-patches.sh` | regenerates the set from the fork |
-| `rdna-boosts-all.patch` | the entire 13-patch net as ONE patch (fork point only) |
+| `rdna-boosts-all.patch` | the entire 14-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `wip/` | exploration docs, tuning tools, session handoffs — **NOT part of the delivery** (see the WIP rule below) |
+| `beta/` | **promoted-from-WIP staging** (e.g. `beta/qwen4exp/` = qwen4exp support + its validation record; `qwen4exp-support.patch` promoted into the delivery as block 14 — see the WIP rule below) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
 | `archive/work/` | closed experiments, preserved for future re-evaluation |
 | `baseline/*` branches, `block/*` tags | **historical** pre-block-12 checkpoints — do not use for the current delivery |
 
 ## Critical facts (do not re-derive)
 
-- **Apply method:** all 13 blocks with **`git am`** (each block is a
+- **Apply method:** all 14 blocks with **`git am`** (each block is a
   committed fork commit, exported with `git format-patch`; block 12 is a
   regular commit like the rest, no special `git apply` step).
   Plain `git apply` of the concatenated series **silently drops
@@ -133,7 +141,8 @@ explicitly requests it.**
   2026-09-02 on the `9cffdcc80` re-base, 2026-09-04 after the
   block-12 amendment, and 2026-09-05 after the block-13 RDNA3_5 gate
   relaxation, and again 2026-09-05 after the RDNA3_0/gfx1100 fold,
-  and again 2026-09-06 on the `465e49b9c` re-base).
+  and again 2026-09-06 on the `465e49b9c` re-base, and again 2026-09-07
+  on the `050dde50c` re-base + block 14).
 - **Block 02 (0002) now also carries the MTP chunked-prefix dispatch
   (PR #9, 2026-09-01):** long single-sequence MTP prefills (`K > 1`,
   `n_seqs == 1`, `n_tokens > K+64`) run the chunked WMMA GDN on the
@@ -206,8 +215,8 @@ explicitly requests it.**
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 465e49b9c
-bash <this-repo>/scripts/apply-all.sh .     # creates branch rdna-boosts, 13 commits
+git checkout 050dde50c
+bash <this-repo>/scripts/apply-all.sh .     # creates branch rdna-boosts, 14 commits
 ```
 
 ### Verify (the coherence gate — mandatory after any change)
@@ -223,17 +232,17 @@ Diff the output against a known-good build (or against RCCL via
 
 ### Regenerate the patches (after fork changes)
 
-`scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `465e49b9c`,
-blocks tip `c261553a1`): `git format-patch` the block commits (all 13
+`scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `050dde50c`,
+blocks tip `83a6f5103`): `git format-patch` the block commits (all 14
 blocks are committed fork commits; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the current fork topology: `~/llama.cpp`
-`rdna-boosts` is synced AT the fork point (upstream master `465e49b9c`
-+ the 13 blocks re-applied, block-13 tip `c261553a1`), so a raw
-`465e49b9c..HEAD` range there is exactly the 13 block commits — but the
+`rdna-boosts` is synced AT the fork point (upstream master `050dde50c`
++ the 14 blocks re-applied, block-14 tip `83a6f5103`), so a raw
+`050dde50c..HEAD` range there is exactly the 14 block commits — but the
 fork branch is disposable, so the patches
-must still be generated from a canonical fork rebuilt AT `465e49b9c`
+must still be generated from a canonical fork rebuilt AT `050dde50c`
 (`scripts/apply-all.sh` of the current delivery; last regeneration tip
-`c261553a1`).  Then
+`83a6f5103`).  Then
 re-verify the clean-apply simulation (worktree at the fork point,
 apply-all, build, coherence) before committing.
 

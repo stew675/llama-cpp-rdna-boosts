@@ -1,9 +1,10 @@
 # rdna-boosts patch set (delivery)
 
-13 patches against the llama.cpp fork point `465e49b9c`
-("convert : add --fuse-qkv flag ... (#22780)"; re-based 2026-09-06 from
-`9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`; block 12 amended 2026-09-04 with
-the runtime NCCL-failure fallback (issue #13, see the block-12 notes
+14 patches against the llama.cpp fork point `050dde50c`
+("hexagon: add RELU and LEAKY_RELU ops (#28585)"; re-based 2026-09-07 from
+`465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02
+from `0eadefebd`; block 12 amended 2026-09-04 with the runtime
+NCCL-failure fallback (issue #13, see the block-12 notes
 below); block 13 amended 2026-09-02 with two MTP regression fixes and
 2026-09-05 with the RDNA3.5 (Strix Halo, gfx1151) + RDNA3.0 (gfx1100)
 fused-MoE-MMQ gate relaxations — see the block-13 notes below, the MTP
@@ -28,15 +29,16 @@ the gfx1100 record in
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md.
+| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below |
 
 ## Apply (fresh checkout at the fork point)
 
 ```bash
-git checkout 465e49b9c         # or: git apply each patch on a matching tree
-git am patches/000[1-9]-*.patch patches/001[0-3]-*.patch
+git checkout 050dde50c         # or: git apply each patch on a matching tree
+git am patches/000[1-9]-*.patch patches/001[0-4]-*.patch
 ```
 
-(`git am` for the whole 13-patch series - plain `git apply` of the
+(`git am` for the whole 14-patch series - plain `git apply` of the
 concatenated series was observed to silently drop hunks; use `git am`.)
 
 The set is **whitespace-clean**: applying produces no git whitespace
@@ -46,9 +48,78 @@ with block 13 on the 13-patch series, re-verified 2026-09-02 on the
 `9cffdcc80` re-base, re-verified 2026-09-02 after the block-13 amendment,
 re-verified 2026-09-05 after the block-13 RDNA3_5 gate relaxation,
 re-verified 2026-09-05 after the RDNA3_0/gfx1100 fold, re-verified
-2026-09-06 on the `465e49b9c` re-base).
+2026-09-06 on the `465e49b9c` re-base, re-verified 2026-09-07 on the
+`050dde50c` re-base with the 14-patch set).
 
-## 2026-09-06 re-base to 465e49b9c (current)
+## 2026-09-07 re-base to 050dde50c + block 14 (current)
+
+Upstream master moved **22 commits** past `465e49b9c` (the 2026-09-07
+master tip `050dde50c`).  The `~/llama.cpp` fork was rebuilt from
+`patches/` with `scripts/apply-all.sh` on the fresh master tip, then
+**block 14** (qwen4exp support, promoted from `beta/qwen4exp`) was added.
+See the block-14 notes below.  Re-base detail:
+
+- Blocks 01-13: `git am -3` — 12/13 applied with auto-merge; **one manual
+  conflict** in `tests/test-backend-ops.cpp` (block 04's perf cases vs
+  upstream's new LEAKY_RELU perf cases inserted at the same spot — both
+  kept).  The upstream ggml-cuda-touching commits in the drift were
+  `b74f590ea` (divergent-barrier fix in f16 flash attention, #27870),
+  `73ab7599b` (branchless Q4_K/Q5_K unpack + L2 prefetch mmvq, #26705)
+  and `473599738` (gfx90c HIP support, #26454); all merged in disjoint
+  regions (upstream's branchless-unpack wrappers and prefetch helpers
+  verified byte-identical in the merged tree next to the block k-quant
+  VDR/item-split additions).
+- Block 14 (qwen4exp): applied from the beta patch with `git apply
+  --3way`; **one manual conflict** in `ggml-cuda/common.cuh` — upstream's
+  gfx90c GCN-APU arch macros vs the block's exact-SKU
+  `GGML_CUDA_CC_IS_GFX1151` predicate; resolved keeping both.
+- Canonical am-commits on the new base: `90a816a68..83a6f5103` (14
+  blocks).  Set regenerated with `scripts/make-patches.sh` (base
+  `050dde50c`, blocks tip `83a6f5103`) and `rdna-boosts-all.patch`
+  refreshed (87 files).
+- Re-verified 2026-09-07: clean-apply sim on a fresh checkout at
+  `050dde50c` (`scripts/apply-all.sh`: **zero conflicts, zero whitespace
+  warnings**, applied tree byte-identical to the fork tip `83a6f5103`);
+  full build clean (ROCm 7.14 gfx1201, RCCL+graphs+native);
+  test-backend-ops 6759/6759 (MUL_MAT / MUL_MAT_ID / FLASH_ATTN_EXT);
+  test-llama-archs 617 OK / 0 fail incl. qwen4exp (GPU 9.21e-14, CPU
+  0.00); dense 27B Q8_0 same-seed coherence byte-identical to the
+  13-block build; qwen4exp IQ4_XS coherence on 3x R9700 — see the
+  block-14 notes.
+
+## Block 14 notes
+
+**Qwen3.8-Flash-Next (qwen4exp) support** — promoted from
+`beta/qwen4exp/qwen4exp-support.patch` (the squashed fork delta
+`c261553a1..dd4301fb4`) and re-based onto the `050dde50c` core.  The
+patch is qwen4exp-specific (the model-neutral kernel work lives in the
+amended blocks 02/04/08/13):
+
+- QSA layers: fused indexer top-k (`GGML_OP_INDEXER_TOPK`, radix),
+  sparse flash attention (`GGML_OP_FLASH_ATTN_QSA`) — the default FA
+  path (`LLAMA_QSA_SPARSE_FA=0` keeps dense; `-fa off` manual); CPU
+  reference for the sparse op.
+- Fused decode ops `GGML_OP_HC_MIX` / `GGML_OP_HC_COMBINE` (+ kernel
+  geometry, rms/gamma fold, F32/Q8_0 inject fold, head-call fusion) and
+  the fused `INDEXER_POOL`/`INDEXER_SCORE` decode ops with the
+  incremental derived block-vector cache (`GGML_CUDA_QSA_INDEXER_CACHE`
+  default ON, `=0` disables).
+- Managed lazy reader (`llama-lazy-reader.cpp/.h`, `--lazy-buffer-size
+  N`, `LLAMA_LAZY_IO_THREADS`) with PLE n-gram row loading + batched
+  cold-page fetch.
+- MTP draft-head support for the Flash-Next GGUFs (`--spec-type
+  draft-mtp`), WS4 hyperconn prefill fusions (`GGML_CUDA_DISABLE_HC_FUSION=1`
+  opt-out), the ggml sched alloc-fallback sync fix, the QSA dense
+  shortcut (DEFAULT ON; `LLAMA_QSA_DENSE_SHORTCUT=0` opt-out) and the
+  per-arch dense/QSA decode policy (`LLAMA_QSA_DENSE_DECODE_UNTIL`;
+  gfx1151 default 65536).
+- Env gate: `LLAMA_QSA_OFF=1` disables the QSA decode path.
+
+Validation is recorded in `beta/qwen4exp/README.md` (the halo/soar
+campaigns on the old base) plus the 2026-09-07 delivery checks above;
+re-base conflict resolution detail in the 2026-09-07 re-base section.
+
+## 2026-09-06 re-base to 465e49b9c
 
 Upstream master moved **18 commits** past the fold-verified base
 `8b4b3558f` (57 past the old delivery fork point `9cffdcc80`).  The

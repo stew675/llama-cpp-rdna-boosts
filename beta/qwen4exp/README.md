@@ -1,5 +1,22 @@
 # qwen4exp - BETA (promoted from WIP)
 
+> **STATUS (2026-09-07): PROMOTED to the delivery.**
+> `qwen4exp-support.patch` is now **block 14** of the delivery set
+> (`patches/0014-rdna-boosts-block-14-qwen4exp-support.patch`), re-based
+> from this beta copy onto the `050dde50c` delivery core (fork point
+> moved 2026-09-07; canonical am-commits `90a816a68..83a6f5103`).  This
+> file stays as the validation record + promotion source (the squashed
+> fork delta `c261553a1..dd4301fb4` against the OLD `465e49b9c`-based
+> core).  Re-base conflicts resolved during promotion: one hunk in
+> `ggml-cuda/common.cuh` (upstream gfx90c GCN-APU arch macros vs the
+> exact-SKU `GGML_CUDA_CC_IS_GFX1151` predicate — both kept).  Delivery
+> checks 2026-09-07: clean-apply sim tree-identical to the fork tip,
+> build clean, test-backend-ops 6759/6759, test-llama-archs 617 OK / 0
+> fail incl. qwen4exp, dense 27B + qwen4exp IQ4_XS (3x R9700) same-seed
+> coherence byte-identical to the pre-promotion builds, hybrid == RCCL
+> identical.  See `patches/README.md` (block-14 notes + the 2026-09-07
+> re-base section).
+
 Stable baseline for the next stage of **qwen4exp** (Qwen3.8-Flash-Next)
 support work on top of the rdna-boosts core. Status: between WIP and
 Release - the content below is the verified, gated baseline; new work in
