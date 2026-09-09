@@ -31,7 +31,9 @@ All 14 patches are generated against **llama.cpp upstream master at
 2026-09-02 from `0eadefebd`; dated records at the
 bottom of this file): blocks 01-14 = the fork's `rdna-boosts` block
 commits (the current 14-commit branch on `9113cc188` is
-`f84549d23..78e67a3d8`; block 06 now carries only the host-buffer
+`7c4d9c4e0..0f2b7a4e1`; block 01 refreshed 2026-09-09 to the llama.cpp PR
+#27210 review head `d236d41a2` — see the WORKLOG entry; block 06 now
+carries only the host-buffer
 rationale marker — upstream #28604 reverted #24233 on 2026-09-08,
 matching its end state; block 12 amended 2026-09-04 with the runtime
 NCCL-failure fallback (issue #13), block 13 amended 2026-09-02 with
@@ -58,7 +60,13 @@ warnings, applied tree == fork tip `78e67a3d8`) on a fresh `9113cc188`
 checkout, full ROCm build clean, llama-cli same-seed coherence IDENTICAL
 to the `72f0ee944` build on gfx1151 (tensor/layer x f16/q8_0/bf16 KV,
 depth 16384), dense MTP adaptive gate green (acceptance 0.833; draft-mtp
-20.3 vs plain 7.9 t/s).
+20.3 vs plain 7.9 t/s).  Re-verified 2026-09-09 after the block-01
+refresh to the PR #27210 review head: strict clean apply (14/14 `git
+am`, zero whitespace warnings, applied tree == fork tip `0f2b7a4e1`)
+on a fresh `9113cc188` checkout, rebuilt unit tests
+(`test-arg-parser`, `test-speculative-adaptive`) pass, llama-cli
+same-seed coherence IDENTICAL to the known-good `050ec89ce` build on
+gfx1201.
 
 ## Two fixes vs the fork
 
@@ -99,7 +107,9 @@ validation:
 The CURRENT delivery patches (0001-0014) are the fork's `rdna-boosts` block
 commits exported with `git format-patch` (one commit per block; the
 current 14-block set against `9113cc188`:
-`f84549d23..78e67a3d8`, block 14 = the qwen4exp-support delta promoted
+`7c4d9c4e0..0f2b7a4e1` (block 01 refreshed 2026-09-09 to the llama.cpp
+PR #27210 review head `d236d41a2`, squash — see the WORKLOG entry), block
+14 = the qwen4exp-support delta promoted
 from `beta/qwen4exp`; re-based 2026-09-08 from the `050dde50c` set
 `90a816a68..3bebffd6b` (block 06 reduced to a marker — see the WORKLOG
 re-base entry); previously the
@@ -129,7 +139,7 @@ to apply against a newer upstream master:
    than one block needs manual re-base hunks, regenerate the whole set from
    the fork with `scripts/make-patches.sh` (re-exports blocks 01-14 from
    `9113cc188..<blocks-tip>`; defaults target
-the current blocks tip `78e67a3d8`), then re-verify the clean-apply
+the current blocks tip `0f2b7a4e1`), then re-verify the clean-apply
 simulation (fresh worktree at the new fork point, `scripts/apply-all.sh`,
 build, coherence) and update the fork point + verification numbers in
 `patches/README.md` and `README.md`.

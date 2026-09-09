@@ -1,4 +1,4 @@
-From 78e67a3d801a4aa9b28ee3189291edcf59b1af80 Mon Sep 17 00:00:00 2001
+From 0f2b7a4e14c207b3d1d2aca73721df39cc9fb604 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/14] rdna-boosts: block 14: qwen4exp support
@@ -129,10 +129,10 @@ SKIP) instead of crashing.
  create mode 100644 tests/test-lazy-reader.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 8d86877b4..65303637a 100644
+index 663d76ad4..90ffd4cd8 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2752,6 +2752,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -2750,6 +2750,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              else { throw std::invalid_argument("invalid value"); }
          }
      ).set_env("LLAMA_ARG_LAZY_MODE"));
@@ -162,7 +162,7 @@ index 8d86877b4..65303637a 100644
          {"--numa"}, "TYPE",
          "attempt optimizations that help on some NUMA systems\n"
 diff --git a/common/common.cpp b/common/common.cpp
-index 577a43c7f..0d993dd2d 100644
+index a2c447225..72d8e65c6 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1689,6 +1689,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
@@ -174,10 +174,10 @@ index 577a43c7f..0d993dd2d 100644
      mparams.check_tensors   = params.check_tensors;
      mparams.use_extra_bufts = !params.no_extra_bufts;
 diff --git a/common/common.h b/common/common.h
-index 5f3e2ed8b..103ffdc23 100644
+index c2801d81e..3b751e381 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -491,6 +491,8 @@ struct common_params {
+@@ -495,6 +495,8 @@ struct common_params {
  
      enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
  

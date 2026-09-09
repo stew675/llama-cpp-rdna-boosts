@@ -10,6 +10,49 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Block-01 refresh (2026-09-09) — adaptive MTP draft depth updated to the
+  llama.cpp PR #27210 review head (fork block-01 commit `7c4d9c4e0`,
+  block-14 tip `0f2b7a4e1`, 14 commits on `9113cc188`).**  Block 01 was cut
+  from PR #27210 (author: stew675) at its `0994374fd` state; the PR then
+  advanced through a maintainer review round (`8408cdabf` comment fixes +
+  `d236d41a2`, the review-response changeset).  The block is now refreshed
+  to the PR head `d236d41a2`, still delivered as **one squashed patch
+  block** (`git diff 9113cc188..d236d41a2` = 15 files, 519+/35-, applied
+  as the single block-01 commit; blocks 02-14 re-based on top untouched).
+  Review-round content now in block 01: `common_params_speculative::
+  has_mtp()` helper (arg.cpp/common.cpp/server-context.cpp/init result
+  refactored through it); a new `accept_partial()` virtual +
+  `common_speculative_accept_partial()` so a partial acceptance the
+  context could not apply (checkpoint-restore path in tools/server and
+  examples/speculative-simple) is reported once and the following replay
+  round cannot feed stale draft counts to the adaptive controller
+  (non-adaptive accept path unchanged); the adaptive depth reset moves
+  ahead of the empty-prompt early return in `begin()`; `
+  --spec-draft-n-min-adaptive` rejects values < 1 and is documented
+  (docs/speculative.md, tools CLI/server READMEs); the invalid-range
+  check is `GGML_ABORT` -> `std::runtime_error`; draft-mtp +
+  draft-mtp-adaptive together are rejected (shared ctx_dft); the delta-
+  net conv-state snapshot-bound rationale comment; stale "defaults to 2"
+  test comment fixed (default is 3) + value-0 rejection case.
+  Regeneration mechanics: canonical fork rebuilt at `9113cc188` from the
+  previous set (am-tip `050ec89ce`), block 01 replaced in place by the
+  squashed PR-head changeset, blocks 02-14 `git rebase --onto` (clean,
+  no conflicts — blocks 02-13 touch no block-01 file, block 14's
+  common/arg/common.h hunks are disjoint).  Tree verification: old-tip..
+  new-tip delta is exactly the review changeset (13 files, 129+/70-, ==
+  `0994374fd..d236d41a2`), every other file byte-identical; regenerated
+  0002-0013 patch bodies byte-identical to the previous delivery, 0014
+  refreshed only in index lines/hunk offsets for the 3 common files;
+  regenerated 0001 diff body byte-identical to the PR head changeset.
+  Verification (local 3x R9700, gfx1201, ROCm 7.14): clean-apply sim at
+  `9113cc188` strict 14/14 `git am`, zero whitespace warnings, applied
+  tree == fork tip; rebuilt `test-arg-parser` + `test-speculative-
+  adaptive` pass; plain-decode same-seed coherence (seed 42/temp 0,
+  Qwen3.5-4B-Q8_0) token-IDENTICAL to the known-good `050ec89ce` build.
+  The refresh touches no GPU kernels and no non-speculative host decode
+  path — all changes live in the MTP-typed/adaptive code, the option
+  parser and comments/docs.
+
 - **Re-base (2026-09-08) — delivery moved to upstream master `9113cc188`
   (block-14 tip `78e67a3d8`).**  Upstream moved 14 commits past the
   `050dde50c` fork point (server checkpoint eviction, Kimi-K3 recurrent

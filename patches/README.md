@@ -29,11 +29,14 @@ host builds), 2026-09-08 with the qwen4exp tensor-split backend gate
 (HIP-only) and 2026-09-08 with the quantized-KV tensor-split gate
 (`q4_1`-family KV cache types aborting under multi-GPU `SPLIT_MODE_TENSOR`;
 an upstream bug — vanilla `050dde50c` reproduced it too) — see the block-14
-notes below):
+notes below); block 01 refreshed 2026-09-09 to the llama.cpp PR #27210
+review head `d236d41a2` (still one squashed block; blocks 02-14
+content-identical on the regeneration — see the 2026-09-09 block-01
+refresh section below):
 
 | patch | content |
 |---|---|
-| `0001` | adaptive MTP draft depth |
+| `0001` | adaptive MTP draft depth | **refreshed 2026-09-09 to the upstream PR #27210 review head** (`d236d41a2`; review-round feedback-handling, option validation + docs) — see the 2026-09-09 block-01 refresh section below.
 | `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | **amended 2026-09-06 with the gfx11 NW16 scan retune** (gated_delta_net_chunked_bf16_gfx11.cu, fork 376f02aa0).
 | `0003` | BF16 KV cache + native-BF16 flash-attn |
 | `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf | **amended 2026-09-06 with the RDNA WMMA (256,256,64) config row** (fattn-mma-f16.cuh, fork e7eecb369).
@@ -70,7 +73,61 @@ re-verified 2026-09-05 after the block-13 RDNA3_5 gate relaxation,
 re-verified 2026-09-05 after the RDNA3_0/gfx1100 fold, re-verified
 2026-09-06 on the `465e49b9c` re-base, re-verified 2026-09-07 on the
 `050dde50c` re-base with the 14-patch set, re-verified 2026-09-08 after
-the block-14 warning-cleanup amendment).
+the block-14 warning-cleanup amendment), re-verified 2026-09-09 after the
+block-01 refresh (strict 14/14 `git am`, zero whitespace warnings, applied
+tree == fork tip `0f2b7a4e1`).
+
+## 2026-09-09 block-01 refresh: adaptive MTP updated to the PR #27210 review head (current)
+
+Block 01 (adaptive MTP draft depth) was cut from llama.cpp PR #27210
+(author: stew675) at its `0994374fd` state; the PR then advanced through a
+maintainer review round.  Block 01 is now refreshed to the PR head
+`d236d41a2` (github.com/ggml-org/llama.cpp/pull/27210,
+issuecomment-5582088497), delivered as one squashed block as before
+(`git diff 9113cc188..d236d41a2`, 15 files 519+/35-).  Review-round content:
+
+- `common_params_speculative::has_mtp()` helper; the MTP-type checks in
+  arg.cpp (download plan), common.cpp (`load_mtp`), server-context.cpp and
+  the init result are refactored through it.
+- `accept_partial()` virtual + `common_speculative_accept_partial()`: a
+  partial acceptance the context could not apply (checkpoint-restore path
+  in tools/server and examples/speculative-simple) is reported once with
+  the true accept count; the checkpoint-replay round that follows has
+  `n_last` reset and no longer feeds stale draft counts to the adaptive
+  controller.  The non-adaptive accept path is unchanged.
+- The adaptive depth reset in `begin()` moves ahead of the empty-prompt
+  early return, so the controller restarts from the floor on every new
+  generation (even empty prompts).
+- `--spec-draft-n-min-adaptive` rejects values < 1; registration order /
+  example coverage normalized; `--spec-draft-n-min` in adaptive mode
+  warns that it is unused.  Docs: docs/speculative.md, tools/cli/README.md,
+  tools/server/README.md (type list + option).
+- Invalid adaptive range: `GGML_ABORT` -> `std::runtime_error`.
+- draft-mtp + draft-mtp-adaptive together are rejected (they would share
+  one ctx_dft and both run process() on every batch).
+- src/models/delta-net-base.cpp: conv-state snapshot-bound rationale
+  comment (speculative verify batches start with the seq's last committed
+  token; the fused GDN op relies on the same bound).
+- tests/test-arg-parser.cpp: stale "defaults to 2" comment fixed (the
+  default is 3) + a value-0 rejection case.
+- common/speculative-adaptive.h header comment rewritten (per-depth
+  constants referenced instead of enumerated).
+
+Regeneration mechanics: canonical fork rebuilt at `9113cc188` from the
+previous set, block 01 replaced in place by the squashed PR-head changeset,
+blocks 02-14 re-based on top (`git rebase --onto`, clean — blocks 02-13
+touch no block-01 file, block 14's common/arg.cpp/common.cpp/common.h
+hunks are disjoint).  Verified: old-tip..new-tip delta is exactly the
+review changeset (13 files 129+/70-, == `0994374fd..d236d41a2`), all
+other files byte-identical; regenerated 0002-0013 patch bodies
+byte-identical to the previous delivery (0014 refreshed only in index
+lines / hunk offsets for the 3 common files); 0001's diff body
+byte-identical to the PR head changeset.  Clean-apply sim at `9113cc188`:
+strict 14/14 `git am`, zero whitespace warnings, applied tree == fork tip
+`0f2b7a4e1`.  Rebuilt unit tests `test-arg-parser` + `test-speculative-
+adaptive` pass; plain-decode same-seed coherence (3x R9700 gfx1201,
+ROCm 7.14) token-IDENTICAL to the known-good `050ec89ce` build.  The
+refresh touches no GPU kernels and no non-speculative host decode path.
 
 ## 2026-09-07 re-base to 050dde50c + block 14
 
@@ -99,7 +156,7 @@ See the block-14 notes below.  Re-base detail:
   `050dde50c`, blocks tip `3bebffd6b`) and `rdna-boosts-all.patch`
   refreshed (87 files).
 
-## 2026-09-08 fixes: MUL_MAT_ID pair-fusion layout gate + MWR remainder (current)
+## 2026-09-08 fixes: MUL_MAT_ID pair-fusion layout gate + MWR remainder
 
 Two genuine bugs in the amended blocks 13/14 were reported by
 `briansp2020` (production single-R9700 deployment of the 14-block set,

@@ -10,7 +10,10 @@ The **current delivery** is a **14-patch set** against upstream master
 re-based 2026-09-02 from `0eadefebd`):
 blocks 01-14 (`patches/0001-…0014-…`, format-patch of the
 fork's `rdna-boosts` block commits — the current regeneration
-`f84549d23..78e67a3d8` on `9113cc188`; the 2026-09-08 re-base reduced
+`7c4d9c4e0..0f2b7a4e1` on `9113cc188` (block 01 refreshed 2026-09-09 to
+the llama.cpp PR #27210 review head `d236d41a2` — see the dated records
+below; the previous regeneration `f84549d23..78e67a3d8` is superseded
+and preserved on the fork's history/remotes); the 2026-09-08 re-base reduced
 block 06 to its host-buffer rationale marker (upstream itself reverted
 #24233 in #28604 on 2026-09-08 — end state identical) and merged block
 14's quantized-KV tensor-split gate additively with upstream #28390's
@@ -66,7 +69,10 @@ tree == fork tip `72f0ee944`)), re-verified 2026-09-08 after the
 block-14 quantized-KV tensor-split gate amendment (14/14 `git am`,
 zero whitespace warnings, applied tree == fork tip `ce641322e`)),
 re-verified 2026-09-08 on the `9113cc188` re-base (14/14 `git am`,
-zero whitespace warnings, applied tree == fork tip `78e67a3d8`)).
+zero whitespace warnings, applied tree == fork tip `78e67a3d8`)),
+re-verified 2026-09-09 after the block-01 refresh to the PR #27210
+review head (14/14 `git am`, zero whitespace warnings, applied tree ==
+fork tip `0f2b7a4e1`)).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -102,7 +108,7 @@ delivery — use `patches/` + `scripts/apply-all.sh`.
 
 | # | patch file | content | deps |
 |---|-----------|---------|------|
-| 01 | `0001-…-block-01-adaptive-MTP-draft-depth.patch` | adaptive MTP draft depth | none |
+| 01 | `0001-…-block-01-adaptive-MTP-draft-depth.patch` | adaptive MTP draft depth (refreshed 2026-09-09 to the PR #27210 review head `d236d41a2`, still one squashed block) | none |
 | 02 | `0002-…-block-02-fused-chunked-gated-delta-net-p.patch` | fused chunked GDN prefill (bf16/WMMA; gfx12+gfx11 arch-segregated files, runtime-cc dispatch; MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | none |
 | 03 | `0003-…-block-03-BF16-KV-cache-and-native-BF16-f.patch` | BF16 KV cache + native-BF16 flash-attn | none |
 | 04 | `0004-…-block-04-RDNA4-WMMA-flash-attn-Q6_K-mmq-.patch` | WMMA flash-attn + Q6_K mmq prefill perf | none |
@@ -125,6 +131,42 @@ silently drops hunks.
 
 
 ## Verified apply sequence
+
+### Block-01 refresh to the PR #27210 review head (2026-09-09, current)
+
+Block 01 was cut from llama.cpp PR #27210 (author: stew675) at its
+`0994374fd` state; the PR advanced through a maintainer review round and
+block 01 is refreshed to the PR head `d236d41a2` (github.com/ggml-org/
+llama.cpp/pull/27210 issuecomment-5582088497), delivered as one squashed
+block (`git diff 9113cc188..d236d41a2`, 15 files 519+/35-).  Review-round
+changes: `has_mtp()` helper + MTP-type checks refactored through it;
+`accept_partial()`/`common_speculative_accept_partial()` so checkpoint-
+restore replay rounds cannot feed stale accept counts to the adaptive
+controller (server + speculative-simple wired); adaptive depth reset
+moves ahead of the empty-prompt early return; `--spec-draft-n-min-
+adaptive` rejects values < 1 + docs (speculative.md, CLI/server READMEs);
+invalid-range `GGML_ABORT` -> `std::runtime_error`; draft-mtp +
+draft-mtp-adaptive together rejected; delta-net conv-state comment.
+Regeneration: canonical fork rebuilt at `9113cc188`, block 01 replaced
+by the squashed PR-head changeset, blocks 02-14 re-based on top (clean;
+02-13 touch no block-01 file, block 14's common-file hunks disjoint).
+Verification (2026-09-09, local 3x R9700 gfx1201, ROCm 7.14):
+
+- Tree checks: old-tip..new-tip delta == exactly the review changeset
+  (13 files 129+/70-, == `0994374fd..d236d41a2`), every other file
+  byte-identical; regenerated 0002-0013 patch bodies byte-identical to
+  the previous delivery (0014: index lines / hunk offsets only); 0001
+  diff body byte-identical to the PR head changeset.
+- Clean-apply sim: worktree at `9113cc188`, strict 14/14 `git am`, zero
+  whitespace warnings, applied tree == fork tip `0f2b7a4e1`.
+- Rebuilt unit tests pass: `./bin/test-arg-parser` (option validation /
+  defaults incl. the new value-0 rejection) and
+  `./bin/test-speculative-adaptive`.
+- Plain-decode same-seed coherence: `llama-cli -p "The capital of France
+  is" -n 20 --seed 42 --temp 0` output token-IDENTICAL to the known-good
+  `050ec89ce` build (only the cosmetic spinner, build hash and run-to-run
+  timings differ).  The refresh touches no GPU kernels and no
+  non-speculative host decode path.
 
 ### Block-14 QSA quantized-KV decode gate + derived-cache pool gate (2026-09-07, dated record — superseded by the 2026-09-08 `9113cc188` re-base)
 

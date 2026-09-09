@@ -68,8 +68,9 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 
 The current delivery is a **14-patch set** for llama.cpp at the fork
 point `9113cc188` (blocks 01-14 in `patches/`, applied with `git am` via
-`scripts/apply-all.sh`; current block-14 tip `78e67a3d8`, re-based +
-regenerated 2026-09-08).  The set applies **whitespace-clean** and each block is
+`scripts/apply-all.sh`; block-14 tip `0f2b7a4e1`, block 01 refreshed
+2026-09-09 to the llama.cpp PR #27210 review head — regenerated
+2026-09-09).  The set applies **whitespace-clean** and each block is
 build- and coherence-verified — see [`MANIFESTS.md`](MANIFESTS.md) (apply
 order + verification contract), [`patches/README.md`](patches/README.md)
 (per-block notes, env knobs, server config) and
@@ -80,7 +81,22 @@ integrations, re-baselines, regenerations) are tracked as dated entries
 — newest first — in **[`WORKLOG.md`](WORKLOG.md)**; the current-state
 summary below is deliberately short and does not repeat them.
 
-- **Latest entry (2026-09-08): re-base onto master `9113cc188`.**
+- **Latest entry (2026-09-09): block-01 refresh to the PR #27210 review
+  head.**  Block 01 (adaptive MTP draft depth) was cut from llama.cpp PR
+  #27210 (author: stew675) at its `0994374fd` state; the PR advanced
+  through a maintainer review round and the block is refreshed to the PR
+  head `d236d41a2`, still one squashed patch.  The review changeset adds
+  the `accept_partial()` feedback path (checkpoint-restore rounds can no
+  longer feed stale accept counts to the adaptive controller),
+  `has_mtp()` refactor, adaptive-depth reset before the empty-prompt
+  early return, `--spec-draft-n-min-adaptive` value validation + docs,
+  and dual-MTP-type rejection.  Blocks 02-14 content-identical.
+  Verification: clean-apply sim strict 14/14 `git am`, zero whitespace
+  warnings, applied tree == fork tip `0f2b7a4e1`; unit tests pass;
+  plain-decode same-seed coherence token-IDENTICAL to the known-good
+  `050ec89ce` build.  Full record in [`WORKLOG.md`](WORKLOG.md).
+
+- **2026-09-08 (previous): re-base onto master `9113cc188`.**
   The fork was 14 commits behind upstream; upstream had itself reverted
   #24233 in #28604 on 2026-09-08, matching block 06's end state, so the
   re-base reduced block 06 to a host-buffer rationale marker (kept for

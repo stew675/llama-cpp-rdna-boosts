@@ -59,9 +59,11 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
 
 The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts` — currently the 14 block
-commits on master `9113cc188` (2026-09-08 re-base; the current
-canonical regeneration is `f84549d23..78e67a3d8`, block-14 tip
-`78e67a3d8`; on the re-base block 06 was reduced to a host-buffer
+commits on master `9113cc188` (2026-09-08 re-base; block 01 refreshed
+2026-09-09 to the upstream PR #27210 review head `d236d41a2`, still one
+squashed block; the current canonical regeneration is `7c4d9c4e0..
+0f2b7a4e1`, block-14 tip `0f2b7a4e1`; on the re-base block 06 was
+reduced to a host-buffer
 rationale marker — upstream itself reverted #24233 in #28604 on
 2026-09-08, matching its end state, so the functional delta is now
 upstream (see the WORKLOG re-base entry); block 12 carries the
@@ -88,7 +90,8 @@ canonical `9113cc188` fork used for `make-patches.sh`
 regeneration is disposable and is re-created from `patches/` +
 `scripts/apply-all.sh` whenever it needs rebuilding (fresh clone at the
 fork point + apply) — the last regeneration's block-14 tip is
-`78e67a3d8`. Older fork states are
+`0f2b7a4e1` (block-01 commit `7c4d9c4e0`, refreshed 2026-09-09 to the
+PR #27210 review head). Older fork states are
 preserved on the `stew675/llama.cpp` fork remote (`rdna-boosts` =
 previous tip `482837e5a` on `0eadefebd`; `rdna-boosts-orig`, …) and in
 older local reference clones — never rely on them for the current
@@ -254,16 +257,17 @@ Diff the output against a known-good build (or against RCCL via
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `78e67a3d8`): `git format-patch` the block commits (all 14
+blocks tip `0f2b7a4e1`): `git format-patch` the block commits (all 14
 blocks are committed fork commits; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the current fork topology: `~/llama.cpp`
 `rdna-boosts` is synced AT the fork point (upstream master `9113cc188`
-+ the 14 blocks re-applied, block-14 tip `78e67a3d8`), so a raw
++ the 14 blocks re-applied, block-01 commit `7c4d9c4e0`, block-14 tip
+`0f2b7a4e1`), so a raw
 `9113cc188..HEAD` range there is exactly the 14 block commits — but the
 fork branch is disposable, so the patches
 must still be generated from a canonical fork rebuilt AT `9113cc188`
 (`scripts/apply-all.sh` of the current delivery; last regeneration tip
-`78e67a3d8`).  Then
+`0f2b7a4e1`, block-01 refreshed 2026-09-09 to the PR #27210 review head).  Then
 re-verify the clean-apply simulation (worktree at the fork point,
 apply-all, build, coherence) before committing.
 
