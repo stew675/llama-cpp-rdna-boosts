@@ -10,6 +10,33 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Block-14 amendment (2026-09-09) — freed-cell KV-zeroing gated to gfx1151
+  (fork block-01 commit `7c4d9c4e0`, block-14 tip `27485f1ca`, 14 commits on
+  `9113cc188`; previous tip `0f2b7a4e1` superseded).**  Block 14's
+  `seq_rm`/`seq_keep`/`clear` row zeroing (freed KV cells kept at +0.0 as a
+  masked-column guard for the gfx1151/Strix-Halo WMMA f16 `x+(-0.0)`
+  inexactness, ported from the strix lineage commit aad5adb08f) is now
+  **enabled only when a KV-cache buffer device description carries `gfx1151`**
+  (env `LLAMA_KV_ZERO_FREED=0/1` overrides the auto detection).  Everywhere
+  else the pre-block-14 behavior is restored: evicting a resident KV sequence
+  is pure host cell bookkeeping again.  Reason: without the gate, freeing an
+  N-token sequence issued ~48×N per-cell 512-byte memsets (ggml's
+  meta/multi-buffer memset decomposes one per-layer zeroing call into one
+  synced `cudaMemsetAsync` per cell across the GPU head-split sub-buffers,
+  each ~30-60 µs), so replacing a ~13k-token KV stalled ~18-24 s before the
+  new prefill began on multi-GPU RDNA4 (3x R9700 gfx1201; reproduced on a
+  plain dense 4B model too — model-agnostic).  Verified: on gfx1201 the
+  A/B stall is gone (identical workload 24.5 s -> ~6 s) and the zeroing-off
+  determinism gate passes (16 + 8 identical greedy requests, per-position
+  top-8 logprobs float64-compared — the same gate that found the leak on
+  gfx11); on the gfx1151 Halo box the gate enables
+  ("freed-cell KV row zeroing enabled (gfx1151)") and the 16-run control is
+  unchanged.  Regenerated `patches/0014` only (blocks 01-13 patch bodies
+  byte-identical); clean-apply sim at `9113cc188` strict 14/14 `git am`,
+  zero whitespace warnings, applied tree == fork tip `27485f1ca`.
+  Follow-up (open): develop a performant gfx1151 flash-attn kernel-side fix
+  so the host-side zeroing can be removed entirely.
+
 - **Block-01 refresh (2026-09-09) — adaptive MTP draft depth updated to the
   llama.cpp PR #27210 review head (fork block-01 commit `7c4d9c4e0`,
   block-14 tip `0f2b7a4e1`, 14 commits on `9113cc188`).**  Block 01 was cut

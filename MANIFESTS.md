@@ -10,9 +10,10 @@ The **current delivery** is a **14-patch set** against upstream master
 re-based 2026-09-02 from `0eadefebd`):
 blocks 01-14 (`patches/0001-…0014-…`, format-patch of the
 fork's `rdna-boosts` block commits — the current regeneration
-`7c4d9c4e0..0f2b7a4e1` on `9113cc188` (block 01 refreshed 2026-09-09 to
-the llama.cpp PR #27210 review head `d236d41a2` — see the dated records
-below; the previous regeneration `f84549d23..78e67a3d8` is superseded
+`7c4d9c4e0..27485f1ca` on `9113cc188` (block 01 refreshed 2026-09-09 to
+the llama.cpp PR #27210 review head `d236d41a2`; block 14 amended
+2026-09-09 with the gfx1151-only freed-cell KV-row-zeroing gate — see
+the dated records below; the previous regeneration `f84549d23..78e67a3d8` is superseded
 and preserved on the fork's history/remotes); the 2026-09-08 re-base reduced
 block 06 to its host-buffer rationale marker (upstream itself reverted
 #24233 in #28604 on 2026-09-08 — end state identical) and merged block
@@ -72,7 +73,9 @@ re-verified 2026-09-08 on the `9113cc188` re-base (14/14 `git am`,
 zero whitespace warnings, applied tree == fork tip `78e67a3d8`)),
 re-verified 2026-09-09 after the block-01 refresh to the PR #27210
 review head (14/14 `git am`, zero whitespace warnings, applied tree ==
-fork tip `0f2b7a4e1`)).
+fork tip `0f2b7a4e1`)), re-verified 2026-09-09 after the block-14
+gfx1151-zeroing-gate amendment (14/14 `git am`, zero whitespace warnings,
+applied tree == fork tip `27485f1ca`)).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -131,6 +134,30 @@ silently drops hunks.
 
 
 ## Verified apply sequence
+
+### Block-14 freed-cell KV-row-zeroing gfx1151 gate (2026-09-09, current)
+
+Block 14 amended with the gfx1151-only gate for its seq_rm/seq_keep/clear
+row zeroing (the strix-lineage masked-column guard for the gfx1151 WMMA
+f16 `x+(-0.0)` inexactness).  `zero_rows` now no-ops unless
+`llama_kv_cache::zero_freed` is set: env `LLAMA_KV_ZERO_FREED=0/1`
+overrides; otherwise the constructor enables it iff any KV buffer device
+description carries `gfx1151`.
+
+- Motivation: on multi-GPU (RDNA4/RDNA3 discrete, tensor split) the
+  per-layer freed-cell zeroing memsets decompose through ggml's
+  meta/multi-buffer memset into ~48xN per-cell 512-byte synced memsets
+  (~30-60 µs each) — a ~13k-token KV replacement stalled ~18-24 s before
+  the next prefill (model-agnostic; reproduced on qwen4exp and a plain
+  dense 4B on 3x R9700 gfx1201).  The gate restores pre-block-14
+  behavior off gfx1151.
+- Verification (gfx1201, 3x R9700, ROCm 7.14): identical A/B workload
+  24.5 s -> ~6 s; zeroing-off determinism gate (16 + 8 identical greedy
+  requests, per-position top-8 logprobs float64-compared) clean.
+- gfx1151 (Strix Halo box): gate logs "freed-cell KV row zeroing enabled
+  (gfx1151)"; 16-run control unchanged.
+- Clean-apply sim at `9113cc188`: strict 14/14 `git am`, zero whitespace
+  warnings, applied tree == fork tip `27485f1ca`.
 
 ### Block-01 refresh to the PR #27210 review head (2026-09-09, current)
 

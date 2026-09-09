@@ -32,7 +32,11 @@ an upstream bug — vanilla `050dde50c` reproduced it too) — see the block-14
 notes below); block 01 refreshed 2026-09-09 to the llama.cpp PR #27210
 review head `d236d41a2` (still one squashed block; blocks 02-14
 content-identical on the regeneration — see the 2026-09-09 block-01
-refresh section below):
+refresh section below); block 14 amended 2026-09-09 with the
+freed-cell KV-row-zeroing gfx1151 gate (the seq_rm/seq_keep/clear row
+zeroing from the strix lineage aad5adb08f now enables only on gfx1151
+devices; env `LLAMA_KV_ZERO_FREED=0/1` overrides — see the 2026-09-09
+block-14 amendment section below):
 
 | patch | content |
 |---|---|
@@ -49,7 +53,7 @@ refresh section below):
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)** — see the block-13 notes below.
-| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-07 with the derived-cache pool gate** (the F32 block-vector pool is now allocated only when the derived cache is enabled *and* the indexer keys are unquantized — no more dead ~100 MiB buffer + no-op fill launches otherwise) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. | **amended 2026-09-08 with the quantized-KV tensor-split gate** — `q4_1`-family KV cache types (`q4_1`/`q5_0`/`q5_1`/`iq4_nl`) abort at graph reserve under multi-GPU `SPLIT_MODE_TENSOR` (upstream bug, also on vanilla `050dde50c`); now rejected at context creation with a clear error when the Meta device is in use — see the block-14 notes below. |
+| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-07 with the derived-cache pool gate** (the F32 block-vector pool is now allocated only when the derived cache is enabled *and* the indexer keys are unquantized — no more dead ~100 MiB buffer + no-op fill launches otherwise) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. | **amended 2026-09-08 with the quantized-KV tensor-split gate** — `q4_1`-family KV cache types (`q4_1`/`q5_0`/`q5_1`/`iq4_nl`) abort at graph reserve under multi-GPU `SPLIT_MODE_TENSOR` (upstream bug, also on vanilla `050dde50c`); now rejected at context creation with a clear error when the Meta device is in use — see the block-14 notes below. | **amended 2026-09-09 with the gfx1151-only freed-cell KV-zeroing gate** — the seq_rm/seq_keep/clear row zeroing (strix-port aad5adb08f masked-column guard for the gfx1151 WMMA f16 `x+(-0.0)` inexactness) now enables only when a KV buffer device is gfx1151 (env `LLAMA_KV_ZERO_FREED` overrides); everywhere else pre-block-14 behavior (no per-free GPU memsets) is restored — see the 2026-09-09 block-14 amendment section below. |
 
 ## Apply (fresh checkout at the fork point)
 
@@ -75,7 +79,57 @@ re-verified 2026-09-05 after the RDNA3_0/gfx1100 fold, re-verified
 `050dde50c` re-base with the 14-patch set, re-verified 2026-09-08 after
 the block-14 warning-cleanup amendment), re-verified 2026-09-09 after the
 block-01 refresh (strict 14/14 `git am`, zero whitespace warnings, applied
-tree == fork tip `0f2b7a4e1`).
+tree == fork tip `0f2b7a4e1`), re-verified 2026-09-09 after the block-14
+gfx1151-zeroing-gate amendment (strict 14/14 `git am`, zero whitespace
+warnings, applied tree == fork tip `27485f1ca`).
+
+## 2026-09-09 block-14 amendment: freed-cell KV-row zeroing gated to gfx1151 (current)
+
+Block 14's `seq_rm`/`seq_keep`/`clear` row zeroing (freed KV cells kept at
++0.0 so masked WMMA flash-attention columns never accumulate stale V) is
+now gated to the **gfx1151 device family only**.
+
+Background: the zeroing was ported from the strix lineage (commit
+aad5adb08f, "kv-cache: zero freed cells so masked-out rows never carry
+stale K/V") as a correctness/determinism guard: on gfx11 (RDNA3) WMMA,
+f16 `x + (-0.0)` is not exact, so a fully masked flash-attention column
+still leaks the sign of whatever V the cell last held — request outputs
+can depend on what the previous request left in the cache.  It was
+implemented host-side (per-free memsets) rather than in the shader to
+avoid a measured 8-18% dense-prefill cost on gfx1151 from the shader
+fix's mere presence in `flash_attn_cm1.comp`.
+
+Problem found 2026-09-09: the zeroing lives in the model-agnostic
+`llama_kv_cache::seq_rm` path, and on **multi-GPU** setups the per-layer
+zeroing memsets decompose through ggml's meta/multi-buffer memset into
+~48xN per-cell 512-byte memsets, each a synced `cudaMemsetAsync`
+(~30-60 µs) — replacing a ~13k-token KV sequence stalled ~18-24 s before
+the next prefill began.  Reproduced on qwen4exp AND a plain dense 4B
+(3x R9700 gfx1201, tensor split): ~634k memsets / ~18 s for a 13k-token
+eviction.  Single-GPU and the Vulkan-UMA path never hit it (coalesced
+host memsets), which is why it went unnoticed on Strix Halo.
+
+Fix: `zero_rows`/`zero_idxs` consult a new `llama_kv_cache::zero_freed`
+member, set in the constructor: env `LLAMA_KV_ZERO_FREED=0/1` overrides;
+otherwise enabled iff any KV buffer device description carries `gfx1151`
+(the same host-side gfx-id mechanism the qwen4exp dense-vs-QSA decode
+policy keys off; the HIP device description exposes `(gfx%x)`).  Everywhere
+else the caches behave as before block 14 (no freed-cell GPU work).
+
+Verified:
+- gfx1201 (3x R9700, ROCm 7.14): A/B stall gone — identical workload
+  24.5 s -> ~6 s; zeroing-off determinism gate passes (16 + 8 identical
+greedy requests, per-position top-8 logprobs float64-compared, 0
+differing) — the same gate that exposed the leak on gfx11.
+- gfx1151 (Strix Halo box): boot log "freed-cell KV row zeroing enabled
+(gfx1151)"; 16-run control unchanged.
+- Clean-apply sim at `9113cc188`: strict 14/14 `git am`, zero whitespace
+warnings, applied tree == fork tip `27485f1ca`.
+
+Open follow-up: the host-side mechanism itself remains clumsy; develop a
+performant gfx1151 flash-attn kernel-side exactness fix so the zeroing
+can be removed entirely (the 8-18% shader-cost figure from aad5adb08f
+should be re-measured on the Halo box first).
 
 ## 2026-09-09 block-01 refresh: adaptive MTP updated to the PR #27210 review head (current)
 

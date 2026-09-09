@@ -68,8 +68,9 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 
 The current delivery is a **14-patch set** for llama.cpp at the fork
 point `9113cc188` (blocks 01-14 in `patches/`, applied with `git am` via
-`scripts/apply-all.sh`; block-14 tip `0f2b7a4e1`, block 01 refreshed
-2026-09-09 to the llama.cpp PR #27210 review head — regenerated
+`scripts/apply-all.sh`; block-14 tip `27485f1ca`, block 01 refreshed
+2026-09-09 to the llama.cpp PR #27210 review head and block 14 amended
+2026-09-09 with the gfx1151-only freed-cell KV-zeroing gate — regenerated
 2026-09-09).  The set applies **whitespace-clean** and each block is
 build- and coherence-verified — see [`MANIFESTS.md`](MANIFESTS.md) (apply
 order + verification contract), [`patches/README.md`](patches/README.md)
@@ -81,7 +82,20 @@ integrations, re-baselines, regenerations) are tracked as dated entries
 — newest first — in **[`WORKLOG.md`](WORKLOG.md)**; the current-state
 summary below is deliberately short and does not repeat them.
 
-- **Latest entry (2026-09-09): block-01 refresh to the PR #27210 review
+- **Latest entry (2026-09-09): block-14 gfx1151-only freed-cell
+  KV-zeroing gate (regeneration `7c4d9c4e0..27485f1ca`).**  Block 14's
+  seq_rm row zeroing (the strix-lineage masked-column guard for the
+  gfx1151 WMMA f16 `x+(-0.0)` inexactness) now enables only on gfx1151
+  devices (env `LLAMA_KV_ZERO_FREED` overrides).  Off gfx1151 the
+  pre-block-14 behavior is restored: replacing a resident multi-GPU KV
+  sequence no longer issues ~48xN synced per-cell memsets — the ~18-24 s
+  pre-prefill stall on 3x R9700 gfx1201 (qwen4exp and plain dense 4B) is
+  gone (identical workload 24.5 s -> ~6 s), and the zeroing-off
+  determinism gate is clean.  gfx1151 (Halo box) keeps the zeroing
+  enabled; 16-run control unchanged.  Full record in
+  [`WORKLOG.md`](WORKLOG.md).
+
+- **2026-09-09 (previous): block-01 refresh to the PR #27210 review
   head.**  Block 01 (adaptive MTP draft depth) was cut from llama.cpp PR
   #27210 (author: stew675) at its `0994374fd` state; the PR advanced
   through a maintainer review round and the block is refreshed to the PR

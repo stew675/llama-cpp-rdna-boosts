@@ -7,10 +7,13 @@
 #   baseline-sha  the upstream baseline the patches are generated against
 #                 (default: 9113cc188, see MANIFESTS.md)
 #   blocks-tip    the fork commit carrying all 14 blocks (default:
-#                 78e67a3d8, the block-14 commit of the 2026-09-08
-#                 re-base onto master 9113cc188; block 06 carries only
-#                 the host-buffer rationale marker (upstream #28604 now
-#                 matches its end state) -- see MANIFESTS.md)
+#                 27485f1ca, the block-14 commit of the 2026-09-09
+#                 regeneration onto master 9113cc188 (block 01 refreshed
+#                 to the PR #27210 review head d236d41a2; block 14
+#                 amended with the gfx1151-only freed-cell KV-zeroing
+#                 gate); block 06 carries only the host-buffer rationale
+#                 marker (upstream #28604 now matches its end state) --
+#                 see MANIFESTS.md)
 #
 # All 14 blocks are the fork commits baseline-sha..blocks-tip, exported with
 # `git format-patch` (the canonical, verified form; applies with `git am`).
@@ -23,7 +26,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
 BASELINE="${2:-9113cc188}"
-TIP="${3:-78e67a3d8}"
+TIP="${3:-27485f1ca}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then
