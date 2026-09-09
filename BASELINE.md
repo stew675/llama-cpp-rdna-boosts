@@ -31,9 +31,10 @@ All 14 patches are generated against **llama.cpp upstream master at
 2026-09-02 from `0eadefebd`; dated records at the
 bottom of this file): blocks 01-14 = the fork's `rdna-boosts` block
 commits (the current 14-commit branch on `9113cc188` is
-`7c4d9c4e0..27485f1ca`; block 01 refreshed 2026-09-09 to the llama.cpp PR
-#27210 review head `d236d41a2` and block 14 amended 2026-09-09 with the
-gfx1151-only freed-cell KV-row-zeroing gate — see the WORKLOG entries; block 06 now
+block 01 `7c4d9c4e0`..block 14 `ff2b35f49`; block 01 refreshed 2026-09-09 to the llama.cpp PR
+#27210 review head `d236d41a2` and block 14 amended 2026-09-10 with the
+kernel-side masked-V fixes — the 2026-09-09 gfx1151-only freed-cell
+KV-row-zeroing host gate it replaces is removed — see the WORKLOG entries; block 06 now
 carries only the host-buffer
 rationale marker — upstream #28604 reverted #24233 on 2026-09-08,
 matching its end state; block 12 amended 2026-09-04 with the runtime
@@ -71,7 +72,13 @@ gfx1201.  Re-verified 2026-09-09 after the block-14 gfx1151-zeroing-gate
 amendment: strict clean apply (14/14 `git am`, zero whitespace warnings,
 applied tree == fork tip `27485f1ca`) on a fresh `9113cc188` checkout;
 content built + validated on gfx1201 (stall A/B + zeroing-off determinism
-gate) and the gate enable path on the gfx1151 Halo box.
+gate) and the gate enable path on the gfx1151 Halo box.  Re-verified
+2026-09-10 after the block-14 kernel-side masked-V amendment (host
+freed-cell zeroing removed): strict clean apply (14/14 `git am`, zero
+whitespace warnings, applied tree == fork tip `ff2b35f49`) on a fresh
+`9113cc188` checkout; rebuilt ROCm tree passes the 16/16 determinism
+gate on the gfx1151 Halo box (all supported KV types, both backends —
+see the WORKLOG 2026-09-10 entry).
 
 ## Two fixes vs the fork
 
@@ -112,11 +119,10 @@ validation:
 The CURRENT delivery patches (0001-0014) are the fork's `rdna-boosts` block
 commits exported with `git format-patch` (one commit per block; the
 current 14-block set against `9113cc188`:
-`7c4d9c4e0..27485f1ca` (block 01 refreshed 2026-09-09 to the llama.cpp
-PR #27210 review head `d236d41a2`, squash — see the WORKLOG entry; block
-14 amended 2026-09-09 with the gfx1151-only freed-cell KV-row-zeroing
-gate), block
-14 = the qwen4exp-support delta promoted
+blocks 01-13 = the `7c4d9c4e0`-based series (block 01 refreshed 2026-09-09 to the llama.cpp
+PR #27210 review head `d236d41a2`, squash — see the WORKLOG entry) with
+block 14 amended 2026-09-10 (kernel-side masked-V fixes replace the
+freed-cell host zeroing; tip `ff2b35f49`; block 14 = the qwen4exp-support delta promoted
 from `beta/qwen4exp`; re-based 2026-09-08 from the `050dde50c` set
 `90a816a68..3bebffd6b` (block 06 reduced to a marker — see the WORKLOG
 re-base entry); previously the
@@ -146,7 +152,8 @@ to apply against a newer upstream master:
    than one block needs manual re-base hunks, regenerate the whole set from
    the fork with `scripts/make-patches.sh` (re-exports blocks 01-14 from
    `9113cc188..<blocks-tip>`; defaults target
-the current blocks tip `27485f1ca`), then re-verify the clean-apply
+the current blocks tip `27485f1ca` — the 2026-09-10 regeneration
+was run against tip `ff2b35f49`), then re-verify the clean-apply
 simulation (fresh worktree at the new fork point, `scripts/apply-all.sh`,
 build, coherence) and update the fork point + verification numbers in
 `patches/README.md` and `README.md`.

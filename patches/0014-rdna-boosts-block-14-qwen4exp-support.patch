@@ -1,4 +1,4 @@
-From 27485f1ca81617061d69786b447e46175d7df548 Mon Sep 17 00:00:00 2001
+From ff2b35f49adc52e747d2967c2bea77b5cabcfea1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/14] rdna-boosts: block 14: qwen4exp support
@@ -59,78 +59,100 @@ qwen4exp gated-attention MUL on Vulkan), and NVIDIA CUDA is untested,
 so those builds keep upstream's unsupported (clean error / arch-test
 SKIP) instead of crashing.
 
-    Amended 2026-09-09 with the freed-cell KV-zeroing arch gate.  The seq_rm/seq_keep/
-    clear row zeroing that keeps freed KV cells at +0.0 (masked-column leak guard for
-    the gfx1151/Strix-Halo WMMA f16 x+(-0.0) inexactness) is now gated to the gfx1151
-    device family: enabled only when a KV-cache buffer device description carries
-    gfx1151 (same host-side gfx-id mechanism the QSA dense-vs-sparse policy keys off);
-    env LLAMA_KV_ZERO_FREED=0/1 overrides the auto detection.  Everywhere else the
-    pre-block-14 behavior is restored: evicting a resident KV sequence is pure host
-    cell bookkeeping again.  Without the gate, freeing an N-token sequence issued
-    ~48xN per-cell 512-byte memsets (ggml's meta/multi-buffer memset decomposes one
-    per-layer zeroing call into one synced memsetAsync per cell across the GPU
-    head-split sub-buffers), so replacing a ~13k-token KV stalled ~18-24 s before the
-    new prefill on multi-GPU RDNA4.  Verified on gfx1201 (3x R9700): same-seed/A-B
-    stall gone (24.5 s -> ~6 s for the identical workload), determinism gate (16 + 8
-    identical greedy requests, per-position top-8 logprobs float64-compared) passes
-    with the zeroing off; re-verified on the gfx1151 Halo box that the gate enables
-    there ("freed-cell KV row zeroing enabled (gfx1151)") and the 16-run control is
-    unchanged.
+Amended 2026-09-10: freed-cell KV handling moved from host-side zeroing
+to kernel-side masked-V elimination, and the earlier host zeroing
+(seq_rm/seq_keep/clear per-free memsets, 2026-09-09 fold of the strix
+aad5adb08f port) is REMOVED.  The llama-kv-cache files are back to the
+upstream state (no zero_freed/rows_hw/sharers wiring; evicting a KV
+sequence is pure host cell bookkeeping again on every backend).  In its
+place block 14 now carries the three kernel fixes that make freed-cell
+content unreadable in masked flash attention, so the host workaround is
+unnecessary:
+
+- HIP fattn-tile.cuh: in the packed-bf16 PV path, zero the per-warp V
+  register copies of rows whose P is exactly +0.0 across the warp's
+  columns (the fully-masked rows) before the bf16 dot.
+- HIP fattn-mma-f16.cuh: after each V-tile slice is staged in shared
+  memory, zero the rows the mask tile marks blocked (-inf) for every
+  query column of the block; one extra uniform barrier on the masked
+  path (ncols2 > 1 || mask_h) only; compile-time excluded for the
+  V_is_K_view and NVIDIA swizzled (swz_V) paths.
+- Vulkan flash_attn_cm1.comp: never read V of fully masked columns
+  (per-column liveness -> V of dead columns stays +0.0); flash_attn.comp
+  scalar path likewise skips the V load for dead columns.
+
+All three are unconditional in their kernel paths (no arch/env gating):
+they are correctness fixes for any masked flash-attention column whose
+cell is stale/freed (batch serving, KV eviction), active by default on
+every device.  They were root-caused and validated on the Strix Halo
+box (single gfx1151): 16/16 identical-request determinism gates pass on
+both ROCm and Vulkan with the host zeroing disabled, bit-identical
+across every KV cache type each backend's FA supports (ROCm
+f16/bf16/q8_0/q4_0; Vulkan also q4_1/q5_0/q5_1/iq4_nl), with
+test-backend-ops FLASH_ATTN_EXT vs CPU 4591/4591 (ROCm) and 7822/7822
+(Vulkan) and no measurable decode/prefill regression (tg128 within
+0.05% at depth-16384; pp within single-run drift).  Full record:
+wip/strix-halo/kvzero/RECORD-2026-09-09.md and
+wip/kv-sign-leak/HANDOVER-2026-09-09-mma-f16.md in the delivery repo.
+The 2026-09-09 amendment text below is retained as history only; the
+freed-cell zeroing gate it describes no longer exists in the block.
 ---
- common/arg.cpp                         |  22 +
- common/common.cpp                      |   1 +
- common/common.h                        |   2 +
- ggml/include/ggml-alloc.h              |  13 +
- ggml/include/ggml-rpc.h                |   4 +-
- ggml/include/ggml.h                    | 153 ++++
- ggml/src/ggml-alloc.c                  |  28 +-
- ggml/src/ggml-backend-meta.cpp         | 129 +++-
- ggml/src/ggml-backend.cpp              |  47 +-
- ggml/src/ggml-cpu/ggml-cpu.c           |  37 +
- ggml/src/ggml-cpu/ops.cpp              | 460 ++++++++++++
- ggml/src/ggml-cpu/ops.h                |   4 +
- ggml/src/ggml-cuda/common.cuh          |   1 +
- ggml/src/ggml-cuda/concat.cu           |  73 ++
- ggml/src/ggml-cuda/fattn-qsa.cu        | 638 ++++++++++++++++
- ggml/src/ggml-cuda/fattn-qsa.cuh       |  22 +
- ggml/src/ggml-cuda/ggml-cuda.cu        | 726 +++++++++++++++----
- ggml/src/ggml-cuda/hc-mix.cu           | 462 ++++++++++++
- ggml/src/ggml-cuda/hc-mix.cuh          |   5 +
- ggml/src/ggml-cuda/hyperconn.cu        | 375 ++++++++++
- ggml/src/ggml-cuda/hyperconn.cuh       |  56 ++
- ggml/src/ggml-cuda/indexer-score.cu    | 561 ++++++++++++++
- ggml/src/ggml-cuda/indexer-score.cuh   |  10 +
- ggml/src/ggml-cuda/indexer-topk.cu     | 376 ++++++++++
- ggml/src/ggml-cuda/indexer-topk.cuh    |   7 +
- ggml/src/ggml-cuda/mmid.cu             |  63 ++
- ggml/src/ggml-cuda/mmq.cuh             |  28 +-
- ggml/src/ggml-cuda/quantize.cuh        |  13 +-
- ggml/src/ggml-cuda/unary.cu            |  15 +-
- ggml/src/ggml-moe-weighted-reduction.h | 160 ++++
- ggml/src/ggml.c                        | 342 ++++++++-
- include/llama.h                        |   4 +
- src/CMakeLists.txt                     |   1 +
- src/llama-arch.cpp                     |  20 +-
- src/llama-arch.h                       |   5 +
- src/llama-context.cpp                  |  49 +-
- src/llama-cparams.h                    |   2 +
- src/llama-kv-cache.cpp                 | 146 ++++
- src/llama-kv-cache.h                   |  24 +-
- src/llama-lazy-reader.cpp              | 330 +++++++++
- src/llama-lazy-reader.h                |  91 +++
- src/llama-memory-hybrid-idx.cpp        | 202 +++++-
- src/llama-memory-hybrid-idx.h          |  54 +-
- src/llama-model-loader.cpp             |  22 +-
- src/llama-model-loader.h               |  12 +
- src/llama-model.cpp                    |   6 +-
- src/llama-model.h                      |   6 +
- src/llama.cpp                          |   3 +-
- src/models/models.h                    |  48 +-
- src/models/qwen4exp.cpp                | 967 +++++++++++++++++++++----
- tests/CMakeLists.txt                   |   1 +
- tests/test-lazy-reader.cpp             | 264 +++++++
- tests/test-llama-archs.cpp             |   7 +-
- 53 files changed, 6771 insertions(+), 326 deletions(-)
+ common/arg.cpp                                |  22 +
+ common/common.cpp                             |   1 +
+ common/common.h                               |   2 +
+ ggml/include/ggml-alloc.h                     |  13 +
+ ggml/include/ggml-rpc.h                       |   4 +-
+ ggml/include/ggml.h                           | 153 +++
+ ggml/src/ggml-alloc.c                         |  28 +-
+ ggml/src/ggml-backend-meta.cpp                | 129 ++-
+ ggml/src/ggml-backend.cpp                     |  47 +-
+ ggml/src/ggml-cpu/ggml-cpu.c                  |  37 +
+ ggml/src/ggml-cpu/ops.cpp                     | 460 +++++++++
+ ggml/src/ggml-cpu/ops.h                       |   4 +
+ ggml/src/ggml-cuda/common.cuh                 |   1 +
+ ggml/src/ggml-cuda/concat.cu                  |  73 ++
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh          |  30 +
+ ggml/src/ggml-cuda/fattn-qsa.cu               | 638 ++++++++++++
+ ggml/src/ggml-cuda/fattn-qsa.cuh              |  22 +
+ ggml/src/ggml-cuda/fattn-tile.cuh             |  27 +
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 726 ++++++++++---
+ ggml/src/ggml-cuda/hc-mix.cu                  | 462 +++++++++
+ ggml/src/ggml-cuda/hc-mix.cuh                 |   5 +
+ ggml/src/ggml-cuda/hyperconn.cu               | 375 +++++++
+ ggml/src/ggml-cuda/hyperconn.cuh              |  56 +
+ ggml/src/ggml-cuda/indexer-score.cu           | 561 ++++++++++
+ ggml/src/ggml-cuda/indexer-score.cuh          |  10 +
+ ggml/src/ggml-cuda/indexer-topk.cu            | 376 +++++++
+ ggml/src/ggml-cuda/indexer-topk.cuh           |   7 +
+ ggml/src/ggml-cuda/mmid.cu                    |  63 ++
+ ggml/src/ggml-cuda/mmq.cuh                    |  28 +-
+ ggml/src/ggml-cuda/quantize.cuh               |  13 +-
+ ggml/src/ggml-cuda/unary.cu                   |  15 +-
+ ggml/src/ggml-moe-weighted-reduction.h        | 160 +++
+ .../vulkan-shaders/flash_attn.comp            |  29 +-
+ .../vulkan-shaders/flash_attn_cm1.comp        |  47 +-
+ ggml/src/ggml.c                               | 342 ++++++-
+ include/llama.h                               |   4 +
+ src/CMakeLists.txt                            |   1 +
+ src/llama-arch.cpp                            |  20 +-
+ src/llama-arch.h                              |   5 +
+ src/llama-context.cpp                         |  49 +-
+ src/llama-cparams.h                           |   2 +
+ src/llama-lazy-reader.cpp                     | 330 ++++++
+ src/llama-lazy-reader.h                       |  91 ++
+ src/llama-memory-hybrid-idx.cpp               | 202 +++-
+ src/llama-memory-hybrid-idx.h                 |  54 +-
+ src/llama-model-loader.cpp                    |  22 +-
+ src/llama-model-loader.h                      |  12 +
+ src/llama-model.cpp                           |   6 +-
+ src/llama-model.h                             |   6 +
+ src/llama.cpp                                 |   3 +-
+ src/models/models.h                           |  48 +-
+ src/models/qwen4exp.cpp                       | 967 +++++++++++++++---
+ tests/CMakeLists.txt                          |   1 +
+ tests/test-lazy-reader.cpp                    | 264 +++++
+ tests/test-llama-archs.cpp                    |   7 +-
+ 55 files changed, 6729 insertions(+), 331 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
@@ -1454,6 +1476,47 @@ index 6df89013c..408cbce3d 100644
      if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
          const T * src0_d = (const T *) src0->data;
          const T * src1_d = (const T *) src1->data;
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 14e196af7..8428b01f7 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -1006,6 +1006,36 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+                     cp_async_wait_all();
+                 }
+                 __syncthreads();
++
++                // gfx11 signed-zero leak: a KV row that is masked (P == +0.0) for every query
++                // column of this block still feeds its V to the WMMA, where the masked cell's
++                // x + (-0.0) products are accumulated inexactly on gfx11 and leak the cell's
++                // (possibly stale/freed) content into the output. Never let such a row's V
++                // reach the multiply: zero it after it is staged, using the mask tile that is
++                // already in shared memory. Only the plain (non-swizzled) layout is handled;
++                // the swizzled layout is NVIDIA-only where the hardware does not exhibit the
++                // leak. V_is_K_view (MLA) reuses K data as V and needs the K tile zeroed
++                // instead - not implemented here (RDNA caps route those heads to the tile kernel).
++                if constexpr (!V_is_K_view && !swz_V) {
++                    if (ncols2 > 1 || mask_h) { // tile_mask is valid iff the mask-add ran
++                        const int tid = threadIdx.y * warp_size + threadIdx.x;
++#pragma unroll
++                        for (int i = tid; i < nbatch_fa; i += nwarps*warp_size) {
++                            bool dead = true;
++#pragma unroll
++                            for (int j = 0; j < ncols1; ++j) {
++                                dead = dead && (__half2float(tile_mask[j*(nbatch_fa + 8) + i]) <= -1e30f);
++                            }
++                            if (dead) {
++                                half2 * const row = tile_V + i*stride_tile_V;
++                                for (int k = 0; k < i0_diff/2; ++k) {
++                                    row[k] = make_half2(0.0f, 0.0f);
++                                }
++                            }
++                        }
++                        __syncthreads();
++                    }
++                }
+             }
+         }
+         const half2 * tile_V_i = !V_is_K_view || i0_stop > 2*nbatch_K2 ? tile_V : tile_V + i0_start/2;
 diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
 new file mode 100644
 index 000000000..d61e96a68
@@ -2126,6 +2189,44 @@ index 000000000..0a2059477
 +
 +void ggml_cuda_flash_attn_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +bool ggml_cuda_flash_attn_qsa_supported(int device, const ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index a8918c668..23ce9a1c4 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -900,6 +900,33 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+                     }
+                 }
+ 
++                // Masked KV rows have P == +0.0 for every query column this warp
++                // accumulates. On gfx11 the packed v_dot2_f32_bf16 PV instruction
++                // accumulates +0.0 x V inexactly, leaking the content of a masked
++                // (e.g. freed) KV cell into VKQ. Zero this warp's own V register
++                // copies for those rows so the products are +0.0 x +0.0; other
++                // warps' columns keep their own (live) V copies.
++                bool row_dead0 = true;
++                bool row_dead1 = true;
++#pragma unroll
++                for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
++                    const nv_bfloat162 p = KQ_k[jc_VKQ_0];
++                    if (__bfloat162float(p.x) != 0.0f) { row_dead0 = false; }
++                    if (__bfloat162float(p.y) != 0.0f) { row_dead1 = false; }
++                }
++                if (row_dead0) {
++#pragma unroll
++                    for (int i0 = 0; i0 < (DVp/2)/warp_size; ++i0) {
++                        V_k0[i0] = ggml_cuda_cast<nv_bfloat162>(make_float2(0.0f, 0.0f));
++                    }
++                }
++                if (row_dead1) {
++#pragma unroll
++                    for (int i0 = 0; i0 < (DVp/2)/warp_size; ++i0) {
++                        V_k1[i0] = ggml_cuda_cast<nv_bfloat162>(make_float2(0.0f, 0.0f));
++                    }
++                }
++
+ #pragma unroll
+                 for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+                     const nv_bfloat162 v_perm0 = ggml_cuda_bf16_perm_ll(V_k0[i0/warp_size], V_k1[i0/warp_size]);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index 4b4951a73..54fed1796 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
@@ -5248,6 +5349,168 @@ index 000000000..c90460a45
 +    match.node_count   = node_count;
 +    return true;
 +}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
+index 0c1b6d067..3437c6e38 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
+@@ -512,9 +512,26 @@ void main() {
+             }
+ 
+             FLOAT_TYPE Pf[rows_per_thread];
++            bool any_live = false;   // any row of this thread that attends to column c
++            bool any_mask = false;   // any row masked out at column c (P == +0.0)
+             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                 Pf[r] = FLOAT_TYPE(exp(float(Sf[r][c]) - Mf[r]));
+                 Lf[r] += Pf[r];
++                if (Pf[r] != FLOAT_TYPE(0.0)) {
++                    any_live = true;
++                } else {
++                    any_mask = true;
++                }
++            }
++
++            // Masked cells (P == +0.0) must not read V at all: on some targets
++            // (e.g. gfx1151 f16 WMMA / matrix units) accumulating +-0.0 products
++            // is inexact, so a fully masked column would leak the sign of whatever
++            // V the cell last held (e.g. a freed KV cell) into the output. A fully
++            // masked column contributes exactly +0.0, so it can be skipped outright;
++            // partially masked columns skip the masked rows below.
++            if (!any_live) {
++                continue;
+             }
+ 
+             [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
+@@ -529,8 +546,16 @@ void main() {
+                 } else {
+                     Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * v_stride / 4 + d * D_split + d_tid]);
+                 }
+-                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+-                    Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
++                if (any_mask) {
++                    [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
++                        if (Pf[r] != FLOAT_TYPE(0.0)) {
++                            Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
++                        }
++                    }
++                } else {
++                    [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
++                        Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
++                    }
+                 }
+             }
+         }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+index 057ed739a..3100e61b9 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+@@ -62,6 +62,11 @@ shared O_TYPEV4 pvsh[MatBc * osh_stride];
+ 
+ shared ACC_TYPE slope[Br];
+ 
++// Per-column liveness for the current KV tile: col_live[c] is set when at least one
++// real query row has a nonzero softmax weight (P) for KV column c of this tile. A
++// column with no live row is fully masked and must never read V (see below).
++shared uint32_t col_live[Bc];
++
+ void main() {
+ #ifdef NEEDS_INIT_IQ_SHMEM
+     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
+@@ -157,6 +162,10 @@ void main() {
+             mask_cache[idx] = f16vec4(0);
+         }
+ 
++        if (tid < Bc) {
++            col_live[tid] = 0;
++        }
++
+         if (MASK_ENABLE) {
+             if (USE_MASK_OPT && mask_opt_idx != j / 16) {
+                 mask_opt_idx = j / 16;
+@@ -389,6 +398,9 @@ void main() {
+                     const FLOAT_TYPEV4 Pf = FLOAT_TYPEV4(exp(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec));
+                     [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
+                         Lf[r + vec_idx] += Pf[vec_idx];
++                        if (i * Br + row + vec_idx < N && float(Pf[vec_idx]) != 0.0f) {
++                            col_live[col] = 1;
++                        }
+                     }
+                     Psh[col * psh_stride + row / 4] = Pf;
+                 }
+@@ -396,12 +408,14 @@ void main() {
+         }
+ 
+         if (SHMEM_STAGING != 0) {
++            // col_live is written by the Pf loop above; make it visible before zeroing
++            barrier();
+             [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV_pad / 4; idx += gl_WorkGroupSize.x) {
+                 uint32_t d = (idx + tid) % (HSV_pad / 4);
+                 uint32_t c = (idx + tid) / (HSV_pad / 4);
+                 if (idx + gl_WorkGroupSize.x <= Bc * HSV_pad / 4 || c < Bc) {
+                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
+-                    if ((!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4)) {
++                    if (col_live[c] != 0 && (!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4)) {
+ #if !defined(BFLOAT16)
+                         if (USE_DECODE_V) {
+                             uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE_V + 4 * d;
+@@ -421,6 +435,27 @@ void main() {
+         }
+         barrier();
+ 
++        // A tile that applied a mask can contain fully masked columns (no live query
++        // row, col_live == 0). Those columns must not read V (see the stage_v comment).
++        // The test is workgroup-uniform and only runs for tiles that may have masked
++        // cells, so fully-live tiles keep the direct path untouched.
++        bool tile_has_dead = false;
++        if (MASK_ENABLE && (!USE_MASK_OPT || (mask_opt_bits != MASK_OPT_ALL_ZERO && mask_opt_bits != MASK_OPT_ALL_NEG_INF))) {
++            if (tid < Bc && col_live[tid] == 0) {
++                tile_has_dead = true;
++            }
++            tile_has_dead = subgroupOr(tile_has_dead);
++            barrier();
++            if (gl_SubgroupInvocationID == 0) {
++                tmpsh[gl_SubgroupID] = tile_has_dead ? 1.0f : 0.0f;
++            }
++            barrier();
++            tile_has_dead = false;
++            [[unroll]] for (uint s = 0; s < gl_NumSubgroups; ++s) {
++                tile_has_dead = tile_has_dead || (tmpsh[s] != 0.0f);
++            }
++        }
++
+         const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
+ 
+         // Each subgroup handles HSV/4 columns
+@@ -441,7 +476,11 @@ void main() {
+             if (SHMEM_STAGING == 0) {
+             // For quants we always preload via kvsh. For f16/bf16 we only preload when
+             // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
+-            const bool stage_v = USE_DECODE_V || KV_bounds_check;
++            // A fully masked column (col_live[c] == 0) must never read V: masked cells
++            // would accumulate +-0.0 x V inexactly on gfx11 f16 WMMA and leak the sign
++            // of whatever V the cell last held. Such columns are staged through kvsh
++            // with their V zeroed instead of being loaded direct.
++            const bool stage_v = USE_DECODE_V || KV_bounds_check || tile_has_dead;
+             if (stage_v) {
+                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
+                     const uint idx = i * gl_WorkGroupSize.x + tid;
+@@ -455,7 +494,7 @@ void main() {
+                     const uint ib = coord / BLOCK_SIZE_V;
+                     const uint iqs = coord % BLOCK_SIZE_V;
+ 
+-                    if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
++                    if (col_live[row] != 0 && (!KV_bounds_check || (v_row < KV && v_col < HSV))) {
+ #if !defined(BFLOAT16)
+                         if (USE_DECODE_V) {
+                             kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
+@@ -479,7 +518,7 @@ void main() {
+                     coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
+ 
+                     if (SHMEM_STAGING == 0) {
+-                    if (!USE_DECODE_V && !KV_bounds_check) {
++                    if (!USE_DECODE_V && !KV_bounds_check && !tile_has_dead) {
+                         // F16/BF16 values can be loaded directly from global memory
+                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
+                         const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 index 5ef03e190..7ee2c06d8 100644
 --- a/ggml/src/ggml.c
@@ -5819,302 +6082,6 @@ index b592de18c..08a1a264f 100644
      bool no_perf;
      bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
      bool op_offload;
-diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index a342ee119..5fb321ad4 100644
---- a/src/llama-kv-cache.cpp
-+++ b/src/llama-kv-cache.cpp
-@@ -99,6 +99,11 @@ llama_kv_cache::llama_kv_cache(
- 
-     GGML_ASSERT(kv_size % n_pad == 0);
- 
-+    if (other) {
-+        // our rows go stale exactly when the owner frees a cell: let it zero them with its own
-+        other->sharers.push_back(this);
-+    }
-+
-     const uint32_t n_layer = hparams.n_layer_all;
- 
-     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
-@@ -294,6 +299,33 @@ llama_kv_cache::llama_kv_cache(
-         ctxs_bufs.emplace_back(std::move(ctx), buf);
-     }
- 
-+    {
-+        // The freed-cell row zeroing exists because gfx1151 (Strix Halo) WMMA flash attention
-+        // accumulates masked columns inexactly in f16 (x + (-0.0) is not exact), so a freed cell
-+        // that is only ever read masked still leaks the sign of its last V into the output. Other
-+        // targets (RDNA3 discrete, RDNA4) do not need it: gated to the gfx1151 device family,
-+        // env LLAMA_KV_ZERO_FREED (0/1) overrides. See the 2026-09-09 block-14 amendment notes.
-+        const char * env_zero = getenv("LLAMA_KV_ZERO_FREED");
-+        if (env_zero) {
-+            zero_freed = std::atoi(env_zero) != 0;
-+        } else {
-+            zero_freed = false;
-+            for (const auto & [buft, _] : ctx_map) {
-+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-+                if (!dev) {
-+                    continue;
-+                }
-+                const char * desc = ggml_backend_dev_description(dev);
-+                if (desc && strstr(desc, "gfx1151") != nullptr) {
-+                    zero_freed = true;
-+                    break;
-+                }
-+            }
-+        }
-+
-+        LLAMA_LOG_INFO("%s: freed-cell KV row zeroing %s\n", __func__, zero_freed ? "enabled (gfx1151)" : "disabled");
-+    }
-+
-     {
-         const size_t memory_size_k = size_k_bytes();
-         const size_t memory_size_v = size_v_bytes();
-@@ -367,6 +399,15 @@ llama_kv_cache::llama_kv_cache(
- }
- 
- void llama_kv_cache::clear(bool data) {
-+    if (!other) {
-+        // every cell becomes free: wipe the rows that were ever written (the sharers' rows too,
-+        // their own clear() may not run, and a buffer clear below only covers our buffers)
-+        rows_hw_init();
-+        for (uint32_t s = 0; s < n_stream; ++s) {
-+            zero_rows(s, 0, rows_hw[s]);
-+            rows_hw[s] = 0;
-+        }
-+    }
-     for (uint32_t s = 0; s < n_stream; ++s) {
-         v_cells[s].reset();
-         v_heads[s] = 0;
-@@ -402,6 +443,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
- 
-         uint32_t new_head = cells.size();
- 
-+        std::vector<uint32_t> freed;
-+
-         for (uint32_t i = 0; i < cells.size(); ++i) {
-             if (!cells.pos_in(i, p0, p1)) {
-                 continue;
-@@ -411,9 +454,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-                 if (new_head == cells.size()) {
-                     new_head = i;
-                 }
-+
-+                freed.push_back(i);
-             }
-         }
- 
-+        zero_idxs(seq_to_stream[seq_id], freed);
-+
-         // If we freed up a slot, set head to it so searching can start there.
-         if (new_head != cells.size() && new_head < head) {
-             head = new_head;
-@@ -426,6 +473,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
- 
-             uint32_t new_head = cells.size();
- 
-+            std::vector<uint32_t> freed;
-+
-             for (uint32_t i = 0; i < cells.size(); ++i) {
-                 if (!cells.pos_in(i, p0, p1)) {
-                     continue;
-@@ -436,8 +485,12 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-                 if (new_head == cells.size()) {
-                     new_head = i;
-                 }
-+
-+                freed.push_back(i);
-             }
- 
-+            zero_idxs(s, freed);
-+
-             // If we freed up a slot, set head to it so searching can start there.
-             if (new_head != cells.size() && new_head < head) {
-                 head = new_head;
-@@ -553,14 +606,20 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
- 
-     uint32_t new_head = cells.size();
- 
-+    std::vector<uint32_t> freed;
-+
-     for (uint32_t i = 0; i < cells.size(); ++i) {
-         if (cells.seq_keep(i, seq_id)) {
-             if (new_head == cells.size()) {
-                 new_head = i;
-             }
-+
-+            freed.push_back(i);
-         }
-     }
- 
-+    zero_idxs(seq_to_stream[seq_id], freed);
-+
-     // If we freed up a slot, set head to it so searching can start there.
-     if (new_head != cells.size() && new_head < head) {
-         head = new_head;
-@@ -840,6 +899,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
- 
-             LLAMA_LOG_DEBUG("%s: copying KV buffer: stream %d to stream %d\n", __func__, ssrc, sdst);
- 
-+            // the whole stream is copied, rows above the source high-water mark included
-+            rows_hw_init();
-+            rows_hw[sdst] = rows_hw[ssrc];
-+
-             assert(ssrc != sdst);
- 
-             for (uint32_t il = 0; il < layers.size(); ++il) {
-@@ -1183,6 +1246,15 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
- 
-         head = sinfo.idxs[s].back() + 1;
-     }
-+
-+    // rows at or above the highest used cell are zero (buffer clear at construction, zero_rows
-+    // on every free); remember the written extent so clear() only wipes what it has to
-+    rows_hw_init();
-+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-+        const uint32_t strm = sinfo.strm[s];
-+
-+        rows_hw[strm] = std::max(rows_hw[strm], v_cells[strm].used_max_p1());
-+    }
- }
- 
- bool llama_kv_cache::get_can_shift() const {
-@@ -1315,6 +1387,80 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
-             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
- }
- 
-+llama_kv_cache::~llama_kv_cache() {
-+    if (other) {
-+        auto & v = other->sharers;
-+        v.erase(std::remove(v.begin(), v.end(), this), v.end());
-+    }
-+    for (auto * c : sharers) {
-+        c->other = nullptr;
-+    }
-+}
-+
-+void llama_kv_cache::rows_hw_init() {
-+    if (rows_hw.size() != n_stream) {
-+        rows_hw.assign(n_stream, 0);
-+    }
-+}
-+
-+void llama_kv_cache::zero_rows(uint32_t strm, uint32_t r0, uint32_t r1) {
-+    // gfx1151-only: see the zero_freed member note. Keeps freed KV cells at +0.0 where the
-+    // Strix-Halo WMMA flash attention needs masked columns to contribute exactly zero.
-+    if (!zero_freed) {
-+        return;
-+    }
-+
-+    r1 = std::min(r1, get_size());
-+
-+    if (r0 >= r1) {
-+        return;
-+    }
-+
-+    const auto zero = [strm, r0, r1](const llama_kv_cache * c) {
-+        for (const auto & layer : c->layers) {
-+            // V stored column-major (no flash attention) has no contiguous rows to wipe; that
-+            // path does not go through the WMMA accumulate the zeroing is for
-+            for (ggml_tensor * t : { layer.k, c->v_trans ? nullptr : layer.v }) {
-+                if (!t || !t->buffer) {
-+                    continue;
-+                }
-+
-+                const size_t offset = (size_t) strm*t->nb[2] + (size_t) r0*t->nb[1];
-+                const size_t size   = (size_t) (r1 - r0)*t->nb[1];
-+
-+                if (offset + size > ggml_nbytes(t)) {
-+                    continue;
-+                }
-+
-+                // a host memset on UMA, a fill command elsewhere; never a graph node, so graph
-+                // reuse cannot replay it with stale offsets
-+                ggml_backend_tensor_memset(t, 0, offset, size);
-+            }
-+        }
-+    };
-+
-+    zero(this);
-+
-+    for (const auto * c : sharers) {
-+        zero(c);
-+    }
-+}
-+
-+void llama_kv_cache::zero_idxs(uint32_t strm, const std::vector<uint32_t> & idxs) {
-+    // coalesce runs of consecutive cells into one memset each
-+    size_t i = 0;
-+    while (i < idxs.size()) {
-+        size_t j = i;
-+        while (j + 1 < idxs.size() && idxs[j + 1] == idxs[j] + 1) {
-+            ++j;
-+        }
-+
-+        zero_rows(strm, idxs[i], idxs[j] + 1);
-+
-+        i = j + 1;
-+    }
-+}
-+
- ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
-     GGML_UNUSED(sinfo);
- 
-diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index c4d8699de..162598ae4 100644
---- a/src/llama-kv-cache.h
-+++ b/src/llama-kv-cache.h
-@@ -116,7 +116,7 @@ public:
-         // a model can hold more than one cache, so the tensor names have to stay unique
-                  const char *   name_tag = "");
- 
--    ~llama_kv_cache() = default;
-+    ~llama_kv_cache() override;
- 
-     //
-     // llama_memory_i
-@@ -189,6 +189,14 @@ public:
-     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
- 
-+    // zero the K rows (and the V rows when V is stored row-major) [r0, r1) of stream strm in
-+    // every layer, including the layers of the caches that mirror these cells (sharers).
-+    // Called for every cell that becomes free, so a masked-out cell never holds stale content:
-+    // on gfx11 WMMA, P*V with P == +0.0 is not exact for V != +0.0, so the FA output would
-+    // otherwise depend on whatever the masked-out cells last held.
-+    void zero_rows(uint32_t strm, uint32_t r0, uint32_t r1);
-+    void zero_idxs(uint32_t strm, const std::vector<uint32_t> & idxs);   // ascending cell indices
-+
-     // store k_cur and v_cur in the cache based on the provided head location
-     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
-     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
-@@ -261,6 +269,12 @@ private:
- 
-     bool v_trans = true;  // the value tensor is transposed
- 
-+    // block-14 seq_rm/clear row zeroing: keep freed KV cells at +0.0 so masked WMMA
-+    // flash-attention columns never accumulate stale V (gfx1151/Strix-Halo f16 +(-0.0)
-+    // inexactness). Gated to the gfx1151 device family only; env LLAMA_KV_ZERO_FREED
-+    // (0/1) overrides the auto detection. See the 2026-09-09 block-14 amendment notes.
-+    bool zero_freed = false;
-+
-     const uint32_t n_seq_max = 1;
-     const uint32_t n_stream  = 1;
- 
-@@ -295,6 +309,14 @@ private:
-     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
-     std::vector<uint32_t> v_heads;
- 
-+    // one past the highest cell row ever written, per stream. Rows above it are still zero
-+    // from the buffer clear at construction, so clear() only has to wipe [0, rows_hw).
-+    std::vector<uint32_t> rows_hw;
-+    void rows_hw_init();
-+
-+    // caches that mirror our cells (see `other`): their rows go stale exactly when ours do
-+    std::vector<llama_kv_cache *> sharers;
-+
-     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
-     llama_kv_cache * other;
- 
 diff --git a/src/llama-lazy-reader.cpp b/src/llama-lazy-reader.cpp
 new file mode 100644
 index 000000000..6faba335b

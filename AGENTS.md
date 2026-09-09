@@ -54,14 +54,17 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   2026-09-07 — QSA sparse FA (default) + fused indexer top-k/score,
   HC_MIX/HC_COMBINE fused decode ops, managed lazy reader + PLE n-gram
   loading, MTP draft-head, WS4 hyperconn prefill fusions, per-arch
-  dense/QSA decode policy; **amended 2026-09-09 with the gfx1151-only
-  freed-cell KV-row-zeroing gate** (the seq_rm row zeroing from the strix
-  lineage aad5adb08f — masked-column guard for the gfx1151 WMMA f16
-  `x+(-0.0)` inexactness — now enables only on gfx1151 devices; env
-  `LLAMA_KV_ZERO_FREED=0/1` overrides; off gfx1151 it no longer issues
-  ~48xN synced per-cell memsets on KV eviction, fixing the ~18-24 s
-  multi-GPU pre-prefill stall — see the 2026-09-09 block-14 amendment
-  section in `patches/README.md`); see the block-14 notes in
+  dense/QSA decode policy; **amended 2026-09-10 with the kernel-side
+  masked-V fixes, and the 2026-09-09 gfx1151-only freed-cell host
+  zeroing it replaces is REMOVED** (`llama-kv-cache.{cpp,h}` back to the
+  upstream state; no `zero_freed`/env `LLAMA_KV_ZERO_FREED`/per-free GPU
+  memsets).  In its place block 14 carries three unconditional kernel
+  fixes that keep masked (freed/stale) flash-attention cells at exactly
+  +0.0 on every device: HIP `fattn-tile.cuh` (packed-bf16 PV), HIP
+  `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles), Vulkan
+  `flash_attn_cm1.comp` + `flash_attn.comp` (dead columns never read V) —
+  see the 2026-09-10 block-14 amendment section in
+  `patches/README.md`); see the block-14 notes in
   `patches/README.md`
   and the beta validation record in `beta/qwen4exp/README.md`.
 
@@ -69,9 +72,9 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts` — currently the 14 block
 commits on master `9113cc188` (2026-09-08 re-base; block 01 refreshed
 2026-09-09 to the upstream PR #27210 review head `d236d41a2`, still one
-squashed block; block 14 amended 2026-09-09 with the gfx1151-only
-freed-cell KV-row-zeroing gate; the current canonical regeneration is `7c4d9c4e0..
-27485f1ca`, block-14 tip `27485f1ca`; on the re-base block 06 was
+squashed block; block 14 amended 2026-09-10 with the kernel-side
+masked-V fixes — the 2026-09-09 gfx1151-only freed-cell host zeroing is
+removed; block-14 tip `ff2b35f49` on the local regeneration; on the re-base block 06 was
 reduced to a host-buffer
 rationale marker — upstream itself reverted #24233 in #28604 on
 2026-09-08, matching its end state, so the functional delta is now
@@ -98,10 +101,11 @@ guard). The
 canonical `9113cc188` fork used for `make-patches.sh`
 regeneration is disposable and is re-created from `patches/` +
 `scripts/apply-all.sh` whenever it needs rebuilding (fresh clone at the
-fork point + apply) — the last regeneration's block-14 tip is
-`27485f1ca` (block-01 commit `7c4d9c4e0`, refreshed 2026-09-09 to the
-PR #27210 review head; block 14 amended 2026-09-09 with the gfx1151-only
-freed-cell KV-zeroing gate). Older fork states are
+fork point + apply) — the last regeneration (2026-09-10) updated
+block 14 only, tip `ff2b35f49` (amended with the kernel-side masked-V
+fixes; the 2026-09-09 gfx1151-only freed-cell KV-zeroing gate is
+removed); blocks 01-13 patch files are byte-identical to the previous
+full regeneration `7c4d9c4e0..27485f1ca`. Older fork states are
 preserved on the `stew675/llama.cpp` fork remote (`rdna-boosts` =
 previous tip `482837e5a` on `0eadefebd`; `rdna-boosts-orig`, …) and in
 older local reference clones — never rely on them for the current
@@ -267,19 +271,21 @@ Diff the output against a known-good build (or against RCCL via
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `27485f1ca`): `git format-patch` the block commits (all 14
+blocks tip `ff2b35f49`): `git format-patch` the block commits (all 14
 blocks are committed fork commits; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the current fork topology: `~/llama.cpp`
 `rdna-boosts` is synced AT the fork point (upstream master `9113cc188`
-+ the 14 blocks re-applied, block-01 commit `7c4d9c4e0`, block-14 tip
-`27485f1ca`), so a raw
++ the 14 blocks re-applied, block-14 tip
+`ff2b35f49` after the 2026-09-10 amendment; the previous full
+regeneration was `7c4d9c4e0..27485f1ca`), so a raw
 `9113cc188..HEAD` range there is exactly the 14 block commits — but the
 fork branch is disposable, so the patches
 must still be generated from a canonical fork rebuilt AT `9113cc188`
-(`scripts/apply-all.sh` of the current delivery; last regeneration tip
-`27485f1ca`, block-01 refreshed 2026-09-09 to the PR #27210 review head,
-block 14 amended 2026-09-09 with the gfx1151-only freed-cell KV-zeroing
-gate).  Then
+(`scripts/apply-all.sh` of the current delivery; the last regeneration,
+2026-09-10, updated block 14 only to tip
+`ff2b35f49` — block-01/13 content untouched, block 14 amended
+2026-09-10 with the kernel-side masked-V fixes, replacing the
+2026-09-09 gfx1151-only freed-cell KV-zeroing gate).  Then
 re-verify the clean-apply simulation (worktree at the fork point,
 apply-all, build, coherence) before committing.
 

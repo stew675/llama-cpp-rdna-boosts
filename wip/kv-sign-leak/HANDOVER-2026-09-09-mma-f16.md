@@ -1,82 +1,79 @@
-# Handover — gfx1151 masked-column KV sign leak: kernel fixes landed, remaining validation
+# Handover — gfx1151 masked-column KV sign leak: kernel fixes + quantized coverage + coherence done
 
-Updated 2026-09-09 evening. Full session record (protocols, numbers, gotchas):
-`~/llama-cpp-rdna-boosts/wip/strix-halo/kvzero/RECORD-2026-09-09.md`.
-Patches: `wip/kv-sign-leak/0001-*.patch` (Vulkan), `0002-*.patch` (HIP TILE bf16),
+Updated 2026-09-09 evening. Full record:
+`~/llama-cpp-rdna-boosts/wip/strix-halo/kvzero/RECORD-2026-09-09.md` (298 lines:
+protocols, matrices, mechanism note, gotchas). Patches:
+`wip/kv-sign-leak/0001-*.patch` (Vulkan), `0002-*.patch` (HIP TILE bf16),
 `0003-*.patch` (HIP MMA_F16).
 
-## Status: kernel-side stale-proofing is COMPLETE on ROCm and Vulkan
+## State: the fix work is COMPLETE and validated on both backends
 
-Three commits on `~/llama.cpp` branch `rdna-boosts` (fork tip `150108fcf` + these):
+Three commits on `~/llama.cpp` `rdna-boosts` (fork tip `150108fcf`): `d37f107e0`
+(Vulkan cm1/scalar), `e9777d5fe` (HIP TILE bf16), `d514fd891` (HIP MMA_F16).
+All kernel-side stale-proofing of masked/freed KV cells. Working tree CLEAN.
 
-| commit | kernel | fix |
-|---|---|---|
-| `d37f107e0` | Vulkan `flash_attn_cm1.comp` + `flash_attn.comp` | never read V of fully masked columns |
-| `e9777d5fe` | HIP `fattn-tile.cuh` packed native-BF16 PV | zero per-warp V registers of masked KV rows |
-| `d514fd891` | HIP `fattn-mma-f16.cuh` WMMA prefill (f16+bf16) | zero staged V tile rows whose mask row is blocked for every block query column |
+**Coverage matrix** (see RECORD for detail): every KV type that reaches FA on
+either backend is 16/16-gate PASS with `LLAMA_KV_ZERO_FREED=0`, and zeroing
+ON == OFF bit-identical over 2064 cells/run where both were run:
+- ROCm (F16/BF16/Q8_0/Q4_0 FA-supported; others supports_op=0 -> non-FA, safe):
+  f16 PASS+ON==OFF, bf16 PASS+ON==OFF, q8_0 PASS+ON==OFF, q4_0 PASS+ON==OFF,
+  q5_0 PASS zeroing-off.
+- Vulkan (ALL quant types FA-supported): f16 PASS+ON==OFF, bf16/q8_0/q4_0/q5_0/
+  q4_1/q5_1/iq4_nl PASS zeroing-off (q8_0/q4_0 also ON==OFF).
 
-Validated on gfx1151/ROCm + RADV (Vulkan), all against pre-fix `.so` A/Bs:
-- probe clean across f16/bf16 × GQA/MHA × hs 128/256 × nvalid sweep (incl. the
-  non-monotonic leaky boundaries 1265/1275/1279);
-- fully-live, zeroed-tail and orig-clean configs BIT-IDENTICAL to pre-fix;
-  orig-leak configs now differ (leak removed);
-- partial-column diag unchanged (f16 clean; bf16 ~2.8e-14 documented live-V
-  artifact, out of freed-cell scope);
-- 16/16 determinism gates PASS with `LLAMA_KV_ZERO_FREED=0` on f16 AND bf16 KV;
-  zeroing ON ≡ OFF bit-identical over all 2064 gate cells on both;
-- llama-bench pp512/pp2048/tg128 within +0.2% (noise).
+**Coherence**: test-backend-ops FLASH_ATTN_EXT vs CPU full matrix — ROCm0
+4591/4591, Vulkan0 7822/7822 passed. CPU same-seed end-to-end: 51/64 greedy
+tokens identical, divergence only at a near-tie (expected non-FA-vs-FA).
+Depth-16384 llama-bench decode (fixed vs pre-fix .so): tg128 within 0.05% both
+KV types; pp16384 within single-run drift.
 
-**Mechanism note (surprising):** on HIP MMA the leak is NOT a plain row-level
-"P=+0 × V≠0" effect. Triangular causal masks are EXACT in orig (even with
-nonzero V in fully-dead rows); the leak fires under column-uniform masks and is
-non-monotonic in geometry + K-tail content at some boundaries. The empirical
-criterion (never feed a fully-dead row's V to the mma) removes every observed
-signature and is behavior-neutral where orig was exact. Details in RECORD.
+## Next session task: the delivery proposal (the ONLY remaining item)
 
-## Next session tasks (remaining before delivery proposal)
+Goal: remove or re-gate the gfx1151-only host-side `zero_freed` workaround
+(`llama_kv_cache::zero_rows`, auto-enable scans device descriptions for
+"gfx1151", env `LLAMA_KV_ZERO_FREED` override) in the delivery repo
+`~/llama-cpp-rdna-boosts` as a **block-14 amendment** (per AGENTS.md: regenerate
+the block-14 patch from the `~/llama.cpp` fork commit, update `patches/README.md`
+block-14 notes + WORKLOG + MANIFESTS headers; never edit the delivery directly).
 
-1. **Quantized KV cache types** — probe coverage on both backends:
-   `q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl`. HIP converts them to f16 in the FA
-   launcher (`need_f16_K/V` — verify); Vulkan reads natively
-   (`USE_DECODE_K/V`). Host zeroing's "+0.0 invariant" only holds for these by
-   layout luck. Extend `fattn-probe.cpp` to take a quant type (it currently
-   does f16/bf16 only); run the same garbage-tail A/B. If leaks appear, the fix
-   pattern is identical (they funnel into the same V staging paths).
-2. **CPU coherence sweep** — repo gate: same-seed llama-cli GPU vs CPU for a
-   short prompt; FLASH_ATTN_EXT vs CPU NMSE if feasible. Confirm the three
-   commits don't move outputs on exact paths (they shouldn't: bit-identical A/B
-   already shown vs pre-fix on live/zeroed content).
-3. **Depth-16384 decode perf** methodology
-   (`benchmarks/mtp-adaptive-methodology.md`) on the final builds — the
-   pp-level llama-bench checks passed, but the repo's decode gate is at depth
-   16384. Decode paths (VEC/TILE) are untouched except the bf16-TILE V-register
-   fix; expect no movement; verify anyway.
-4. **Delivery proposal** (only after 1-3): remove or re-gate `zero_freed` in
-   `src/llama-kv-cache.cpp` (block 14 amendment in `~/llama-cpp-rdna-boosts`,
-   regenerate the block-14 patch per AGENTS.md, re-run clean-apply + coherence).
-   NOTE: the block-14 auto-gate keys off the device description containing
-   "gfx1151", which never matches the Vulkan device string ("AMD Radeon 8060S
-   Graphics (RADV STRIX_HALO)") — flag this in the proposal. Decide scope: the
-   fixes are per-backend/per-type; zeroing removal needs all covered paths
-   stale-proof (hence task 1).
+Proposal sketch (decide before implementing):
+1. The kernel fixes live only in `~/llama.cpp` (3 commits). The delivery repo
+   ships `patches/` — decide whether this work should be (a) folded into the
+   block-14 amendment as the zeroing's replacement, or (b) delivered separately.
+   NOTE the AGENTS.md "what NOT to do": WIP stays out of patches until the
+   maintainer says so — the user drives this decision.
+2. Re-gate alternative: keep `zero_freed` code but disable the auto-enable
+   (default OFF) since kernels no longer read freed cells — cheaper, reversible,
+   preserves the belt-and-suspenders for any path not yet covered. Kernel
+   evidence is per-backend/type (matrix above); Vulkan device-description gate
+   never matched ("AMD Radeon 8060S Graphics (RADV STRIX_HALO)" has no
+   "gfx1151") — that mismatch means Vulkan runs NEVER had host zeroing, yet the
+   fixed shaders make it unnecessary anyway.
+3. If removal: delete `zero_rows`/`zero_idxs` wiring + the ctor gate + the env
+   override in `src/llama-kv-cache.{cpp,h}` of the fork commit; re-validate with
+   the 16/16 gates (zeroing env should become a no-op or disappear) and the
+   depth-2048/16384 methodology on the delivery box before regenerating.
+4. Regenerate block 14 from the fork per `scripts/make-patches.sh` workflow,
+   re-run the clean-apply simulation, coherence gate, build, then commit to the
+   delivery repo with a dated WORKLOG entry. This step happens on the delivery
+   machine (3-GPU R9700, RCCL/hybrid) or halo depending on where the user wants
+   it validated — ask.
 
 ## Repo state & gotchas (read before rebuilding)
 
-- `~/llama.cpp` working tree CLEAN at `d514fd891`; build dirs
-  `build-rocm` (HIP) and `build-vulkan` carry the committed .so's. Do not
-  rebuild Vulkan from a git-reverted tree (mtime-based shader gen silently
-  skips regeneration — `touch` the .comp files and md5-verify the .so; the
-  real file is `build-vulkan/bin/libggml-vulkan.so.0.23.0`).
-- Probe/dump/diag binaries: `wip/strix-halo/kvzero/fattn-probe-rocm`,
-  `fattn-dump-rocm`, `fattn-diag-rocm` (dlopen a libggml-hip.so given as argv;
-  runtime `LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$HOME/llama.cpp/build-rocm/bin`).
-- Reference pre-fix baselines kept: `/tmp/libggml-hip-orig2.so` (pre-MMA-fix =
-  at e9777d5fe), `/tmp/libggml-hip-fixed.so` (= d514fd891). Vulkan orig:
-  `/tmp/libggml-vulkan-orig.so`.
+- `~/llama.cpp` clean at `d514fd891`; build dirs carry the committed .so's.
+  Reference baselines: `/tmp/libggml-hip-orig2.so` (= e9777d5fe, pre-MMA-fix),
+  `/tmp/libggml-hip-fixed.so` (d514fd891), `/tmp/libggml-vulkan-orig.so`.
+  Do not rebuild Vulkan from a git-reverted tree (mtime shader-gen staleness);
+  real file is `build-vulkan/bin/libggml-vulkan.so.0.23.0`.
+- Probe/dump/diag binaries in `wip/strix-halo/kvzero/`; fattn-probe.cpp now
+  accepts q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl but raw-tensor quantized FA **crashes**
+  (in-place f16 conversion scratch is laid out for llama.cpp's buffer topology,
+  not the probe arena) — see RECORD. Quantized coverage is done via llama-server
+  gates (production path) — use run-gate.sh + the ON/OFF cell diff snippet.
+- Runtime: `LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$HOME/llama.cpp/build-rocm/bin`;
+  Vulkan: `GGML_VK_VISIBLE_DEVICES=0 LD_LIBRARY_PATH=$HOME/llama.cpp/build-vulkan/bin`.
+- Gate cleanup: run-gate.sh kills its server on exit; verify no strays with
+  `ps aux | grep llama-server` between gates. llama-cli is interactive-hanging on
+  this box — use llama-server /completion for end-to-end checks.
 - Rebuild HIP fast: `cmake --build build-rocm --target ggml-hip -j 16`.
-- Server gates: `run-gate.sh <bin-dir> <model> <label> [--cache-type-{k,v} ...]`
-  with `LLAMA_KV_ZERO_FREED=0/1` exported; 16 requests × 129 tokens; per-cell
-  top-8 logprobs at full JSON precision. Zeroing-ON vs OFF diff: compare the
-  `runs/<label>/gate129/runNN.json` snapshots pairwise.
-- No parallel benches; verify hardware determinism across fresh instances before
-  trusting cross-run A/Bs.

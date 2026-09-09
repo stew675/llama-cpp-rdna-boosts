@@ -10,6 +10,51 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Block-14 amendment (2026-09-10) — freed-cell KV handling moved from the
+  host-side zeroing to kernel-side masked-V elimination; the gfx1151-only
+  `zero_freed` host zeroing (2026-09-09 amendment) is REMOVED (block-14 tip
+  `ff2b35f49` on `9113cc188`, regenerated 2026-09-10; blocks 01-13 patch
+  files byte-identical).**  `src/llama-kv-cache.{cpp,h}` are back to the
+  upstream state — no `zero_freed`/`rows_hw`/`sharers` wiring, no env
+  `LLAMA_KV_ZERO_FREED`, no per-free GPU memsets; evicting a resident KV
+  sequence is pure host cell bookkeeping again on every device.  In its
+  place block 14 now carries the three **kernel-side** fixes that make the
+  content of fully-masked (freed/stale) flash-attention cells unreadable,
+  so the host workaround is unnecessary:
+  - HIP `fattn-tile.cuh` (packed-bf16 PV path): zero the per-warp V
+    register copies of rows whose P is +0.0 across the warp's columns
+    before the bf16 dot.
+  - HIP `fattn-mma-f16.cuh`: after each V-tile slice is staged in shared
+    memory, zero the rows the mask tile marks blocked (-inf) for every
+    query column of the block; one extra uniform barrier, masked path
+    (`ncols2 > 1 || mask_h`) only; compile-time excluded for the
+    `V_is_K_view` and NVIDIA-swizzled (`swz_V`) paths.
+  - Vulkan `flash_attn_cm1.comp` + `flash_attn.comp` scalar path: never
+    read V of fully masked columns (dead columns keep V = +0.0).
+  All three are unconditional in their kernel paths (no arch/env gating) —
+  generic correctness fixes for masked/freed FA cells (batch serving, KV
+  eviction) active by default on every device.  Root cause (Strix Halo,
+  gfx1151): WMMA f16 `x + (-0.0)` is inexact, so a masked column leaked
+  the sign of whatever V its cell last held; the fix guarantees masked
+  cells contribute exactly +0.0 at the multiply.  Validation on the
+  gfx1151 box (ROCm 7.14-gfx1151 + Vulkan RADV), host zeroing disabled:
+  16/16 identical-request determinism gates PASS on every KV cache type
+  each backend's FA supports — ROCm f16/bf16/q8_0/q4_0 (plus ON==OFF
+  bit-identical over 2064 cells/run), Vulkan also q4_1/q5_0/q5_1/iq4_nl;
+  `test-backend-ops` FLASH_ATTN_EXT vs CPU 4591/4591 (ROCm) and
+  7822/7822 (Vulkan); CPU same-seed greedy 51/64 tokens identical,
+  divergence only at a near-tie (CPU non-FA vs GPU FA numerics);
+  depth-16384 llama-bench decode tg128 within 0.05% of pre-fix, pp within
+  single-run drift.  Full record:
+  `wip/strix-halo/kvzero/RECORD-2026-09-09.md` +
+  `wip/kv-sign-leak/HANDOVER-2026-09-09-mma-f16.md`.  Delivery:
+  regenerated `patches/0014` only (blocks 01-13 patch bodies
+  byte-identical) + `rdna-boosts-all.patch`; clean-apply sim at
+  `9113cc188` strict 14/14 `git am`, zero whitespace warnings, applied
+  tree == fork tip `ff2b35f49`; final-tree rebuild (delta vs the
+  validated kernel-fix tree = the llama-kv-cache revert only) passes the
+  16/16 gate and no longer logs the freed-cell zeroing.
+
 - **Block-14 amendment (2026-09-09) — freed-cell KV-zeroing gated to gfx1151
   (fork block-01 commit `7c4d9c4e0`, block-14 tip `27485f1ca`, 14 commits on
   `9113cc188`; previous tip `0f2b7a4e1` superseded).**  Block 14's

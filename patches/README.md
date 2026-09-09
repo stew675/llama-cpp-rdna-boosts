@@ -32,11 +32,14 @@ an upstream bug — vanilla `050dde50c` reproduced it too) — see the block-14
 notes below); block 01 refreshed 2026-09-09 to the llama.cpp PR #27210
 review head `d236d41a2` (still one squashed block; blocks 02-14
 content-identical on the regeneration — see the 2026-09-09 block-01
-refresh section below); block 14 amended 2026-09-09 with the
-freed-cell KV-row-zeroing gfx1151 gate (the seq_rm/seq_keep/clear row
-zeroing from the strix lineage aad5adb08f now enables only on gfx1151
-devices; env `LLAMA_KV_ZERO_FREED=0/1` overrides — see the 2026-09-09
-block-14 amendment section below):
+refresh section below); block 14 amended 2026-09-10 with the
+kernel-side masked-V fixes for freed flash-attention cells: the
+host-side `zero_freed` row zeroing (added 2026-09-09, gfx1151-only) is
+REMOVED — `llama-kv-cache.{cpp,h}` are back to the upstream state — and
+block 14 now carries the unconditional HIP `fattn-tile.cuh` (packed-bf16
+PV) + HIP `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles) +
+Vulkan `flash_attn_cm1.comp`/`flash_attn.comp` (dead columns never read
+V) fixes instead (see the 2026-09-10 block-14 amendment section below):
 
 | patch | content |
 |---|---|
@@ -53,7 +56,7 @@ block-14 amendment section below):
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)** — see the block-13 notes below.
-| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-07 with the derived-cache pool gate** (the F32 block-vector pool is now allocated only when the derived cache is enabled *and* the indexer keys are unquantized — no more dead ~100 MiB buffer + no-op fill launches otherwise) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. | **amended 2026-09-08 with the quantized-KV tensor-split gate** — `q4_1`-family KV cache types (`q4_1`/`q5_0`/`q5_1`/`iq4_nl`) abort at graph reserve under multi-GPU `SPLIT_MODE_TENSOR` (upstream bug, also on vanilla `050dde50c`); now rejected at context creation with a clear error when the Meta device is in use — see the block-14 notes below. | **amended 2026-09-09 with the gfx1151-only freed-cell KV-zeroing gate** — the seq_rm/seq_keep/clear row zeroing (strix-port aad5adb08f masked-column guard for the gfx1151 WMMA f16 `x+(-0.0)` inexactness) now enables only when a KV buffer device is gfx1151 (env `LLAMA_KV_ZERO_FREED` overrides); everywhere else pre-block-14 behavior (no per-free GPU memsets) is restored — see the 2026-09-09 block-14 amendment section below. |
+| `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-07 with the derived-cache pool gate** (the F32 block-vector pool is now allocated only when the derived cache is enabled *and* the indexer keys are unquantized — no more dead ~100 MiB buffer + no-op fill launches otherwise) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. | **amended 2026-09-08 with the quantized-KV tensor-split gate** — `q4_1`-family KV cache types (`q4_1`/`q5_0`/`q5_1`/`iq4_nl`) abort at graph reserve under multi-GPU `SPLIT_MODE_TENSOR` (upstream bug, also on vanilla `050dde50c`); now rejected at context creation with a clear error when the Meta device is in use — see the block-14 notes below. | **amended 2026-09-09 with the gfx1151-only freed-cell KV-zeroing gate** — the seq_rm/seq_keep/clear row zeroing (strix-port aad5adb08f masked-column guard for the gfx1151 WMMA f16 `x+(-0.0)` inexactness) now enables only when a KV buffer device is gfx1151 (env `LLAMA_KV_ZERO_FREED` overrides); everywhere else pre-block-14 behavior (no per-free GPU memsets) is restored — see the 2026-09-09 block-14 amendment section below. | **amended 2026-09-10 with the kernel-side masked-V fixes; the 2026-09-09 host zeroing is removed** — `llama-kv-cache.{cpp,h}` revert to the upstream state (no `zero_freed`/env/GPU memsets) and block 14 instead carries the unconditional HIP `fattn-tile.cuh` (packed-bf16 PV) + `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles) and Vulkan `flash_attn_cm1.comp` + `flash_attn.comp` (dead columns never read V) fixes, active by default on every device — see the 2026-09-10 block-14 amendment section below. |
 
 ## Apply (fresh checkout at the fork point)
 
@@ -81,12 +84,74 @@ the block-14 warning-cleanup amendment), re-verified 2026-09-09 after the
 block-01 refresh (strict 14/14 `git am`, zero whitespace warnings, applied
 tree == fork tip `0f2b7a4e1`), re-verified 2026-09-09 after the block-14
 gfx1151-zeroing-gate amendment (strict 14/14 `git am`, zero whitespace
-warnings, applied tree == fork tip `27485f1ca`).
+warnings, applied tree == fork tip `27485f1ca`), re-verified 2026-09-10
+after the block-14 kernel-side masked-V amendment (strict 14/14 `git am`,
+zero whitespace warnings, applied tree == fork tip `ff2b35f49`; blocks
+01-13 patch bodies byte-identical to the previous regeneration).
 
-## 2026-09-09 block-14 amendment: freed-cell KV-row zeroing gated to gfx1151 (current)
+## 2026-09-10 block-14 amendment: kernel-side masked-V fixes replace the host zeroing (current)
+
+Freed/stale flash-attention cells are now handled **in the kernels**, and
+block 14 no longer touches `llama-kv-cache.{cpp,h}` at all (both files
+are byte-identical to the upstream state at the fork point).  The
+host-side `zero_freed` row zeroing added 2026-09-09 is **removed** — no
+member, no env `LLAMA_KV_ZERO_FREED`, no per-free GPU memsets — and the
+three kernel fixes below are folded into block 14 instead.  All three
+are **unconditional in their kernel paths** (no arch/env gating): they
+are generic correctness fixes for any masked column whose cell is
+stale/freed (batch serving, KV eviction), active by default on every
+device:
+
+- HIP `fattn-tile.cuh` (packed-bf16 PV path): zero the per-warp V
+  register copies of rows whose P is +0.0 across the warp's columns
+  (fully-masked rows) before the bf16 dot.
+- HIP `fattn-mma-f16.cuh`: after each V-tile slice is staged in shared
+  memory, zero the rows the mask tile marks blocked (-inf) for every
+  query column of the block; one extra uniform barrier, masked path
+  (`ncols2 > 1 || mask_h`) only; compile-time excluded for the
+  `V_is_K_view` and NVIDIA-swizzled (`swz_V`) paths.
+- Vulkan `flash_attn_cm1.comp` (per-column liveness: dead columns keep V
+  at +0.0) + the `flash_attn.comp` scalar path (skip the V load for dead
+  columns).
+
+Background: the root cause was a gfx1151/Strix-Halo WMMA f16
+`x + (-0.0)` inexactness — a fully masked column still accumulated the
+sign of whatever V its cell last held, so request outputs could depend
+on what the previous request left in the cache.  The 2026-09-09
+amendment guarded it host-side with per-free memsets gated to gfx1151;
+this amendment eliminates the leak at the source (masked V is never fed
+to the WMMA multiply) and the host workaround is gone entirely.
+
+Validated on the Strix Halo box (single gfx1151, ROCm
+7.14-gfx1151 + Vulkan RADV) with the host zeroing disabled (during
+development the env `LLAMA_KV_ZERO_FREED=0` gate was used; the env is
+gone in block 14):
+- 16/16 identical-request determinism gates (per-position top-8 logprobs
+  float64-compared) PASS on every KV type each backend's FA supports:
+  ROCm f16/bf16/q8_0/q4_0 (zeroing ON==OFF bit-identical over 2064
+  cells/run where both were run), Vulkan also q4_1/q5_0/q5_1/iq4_nl.
+- `test-backend-ops` FLASH_ATTN_EXT vs CPU: 4591/4591 (ROCm0),
+  7822/7822 (Vulkan0).
+- CPU same-seed greedy: 51/64 tokens identical, divergence only at a
+  near-tie (CPU non-FA vs GPU FA numerics; no coherence concern).
+- Depth-16384 llama-bench decode: tg128 within 0.05% of the pre-fix
+  build (f16 and bf16 KV); pp16384 within single-run drift.
+- Clean-apply sim at `9113cc188`: strict 14/14 `git am`, zero
+  whitespace warnings, applied tree == fork tip `ff2b35f49`.
+
+Full record (protocols, leak matrix, per-kernel mechanism notes):
+`../wip/strix-halo/kvzero/RECORD-2026-09-09.md` and the handover
+`../wip/kv-sign-leak/HANDOVER-2026-09-09-mma-f16.md`.
+
+## 2026-09-09 block-14 amendment: freed-cell KV-row zeroing gated to gfx1151 (superseded 2026-09-10)
+
+**This section describes the 2026-09-09 amendment only; the host zeroing
+it documents was REMOVED by the 2026-09-10 kernel-side fix above —
+`llama-kv-cache.{cpp,h}` are back to the upstream state and block 14 no
+longer contains any of it.  Kept as the historical record.**
 
 Block 14's `seq_rm`/`seq_keep`/`clear` row zeroing (freed KV cells kept at
-+0.0 so masked WMMA flash-attention columns never accumulate stale V) is
++0.0 so masked WMMA flash-attention columns never accumulate stale V) was
 now gated to the **gfx1151 device family only**.
 
 Background: the zeroing was ported from the strix lineage (commit

@@ -10,10 +10,13 @@ The **current delivery** is a **14-patch set** against upstream master
 re-based 2026-09-02 from `0eadefebd`):
 blocks 01-14 (`patches/0001-…0014-…`, format-patch of the
 fork's `rdna-boosts` block commits — the current regeneration
-`7c4d9c4e0..27485f1ca` on `9113cc188` (block 01 refreshed 2026-09-09 to
+on `9113cc188` (block 01 refreshed 2026-09-09 to
 the llama.cpp PR #27210 review head `d236d41a2`; block 14 amended
-2026-09-09 with the gfx1151-only freed-cell KV-row-zeroing gate — see
-the dated records below; the previous regeneration `f84549d23..78e67a3d8` is superseded
+2026-09-10 with the kernel-side masked-V fixes — the 2026-09-09
+gfx1151-only freed-cell KV host zeroing it replaces is removed, see
+the dated records below; regenerated block-14 tip `ff2b35f49`, blocks
+01-13 patch bodies byte-identical to the `7c4d9c4e0..27485f1ca`
+regeneration; the previous regeneration `f84549d23..78e67a3d8` is superseded
 and preserved on the fork's history/remotes); the 2026-09-08 re-base reduced
 block 06 to its host-buffer rationale marker (upstream itself reverted
 #24233 in #28604 on 2026-09-08 — end state identical) and merged block
@@ -75,7 +78,10 @@ re-verified 2026-09-09 after the block-01 refresh to the PR #27210
 review head (14/14 `git am`, zero whitespace warnings, applied tree ==
 fork tip `0f2b7a4e1`)), re-verified 2026-09-09 after the block-14
 gfx1151-zeroing-gate amendment (14/14 `git am`, zero whitespace warnings,
-applied tree == fork tip `27485f1ca`)).
+applied tree == fork tip `27485f1ca`)), re-verified 2026-09-10 after the
+block-14 kernel-side masked-V amendment (14/14 `git am`, zero whitespace
+warnings, applied tree == fork tip `ff2b35f49`; blocks 01-13 patch bodies
+byte-identical)).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -135,7 +141,50 @@ silently drops hunks.
 
 ## Verified apply sequence
 
-### Block-14 freed-cell KV-row-zeroing gfx1151 gate (2026-09-09, current)
+### Block-14 kernel-side masked-V fixes, freed-cell host zeroing removed (2026-09-10, current)
+
+Block 14's freed-cell handling moved from the host-side `zero_freed` row
+zeroing (2026-09-09) to **kernel-side masked-V elimination**;
+`src/llama-kv-cache.{cpp,h}` are byte-identical to the upstream state
+(no `zero_freed` member, no env `LLAMA_KV_ZERO_FREED`, no per-free GPU
+memsets).  Block 14 instead carries the three unconditional kernel fixes
+that keep masked (freed/stale) flash-attention cells at exactly +0.0:
+
+- HIP `fattn-tile.cuh` packed-bf16 PV path: zero the per-warp V register
+  copies of fully-masked (P == +0.0) rows before the bf16 dot.
+- HIP `fattn-mma-f16.cuh`: zero the rows the mask tile marks blocked in
+  the staged shared V tiles (masked path `ncols2 > 1 || mask_h` only;
+  `V_is_K_view`/`swz_V` compile-time excluded).
+- Vulkan `flash_attn_cm1.comp` (per-column liveness: dead columns keep V
+  at +0.0) + `flash_attn.comp` scalar path (skip the V load for dead
+  columns).
+
+Motivation: the 2026-09-09 host zeroing was the workaround for a
+gfx1151/Strix-Halo WMMA f16 `x+(-0.0)` inexactness (masked columns leaked
+the sign of whatever V their cell last held); masking V in the kernels
+removes the leak at the source on every device, so the host workaround
+(and its multi-GPU per-cell-memset stall) is gone entirely.
+
+Verification (Strix Halo gfx1151 box, ROCm 7.14-gfx1151 + Vulkan RADV,
+host zeroing disabled):
+- 16/16 identical-request determinism gates PASS on every KV type each
+  backend's FA supports — ROCm f16/bf16/q8_0/q4_0 (zeroing ON==OFF
+  bit-identical over 2064 cells/run), Vulkan also q4_1/q5_0/q5_1/iq4_nl.
+- `test-backend-ops` FLASH_ATTN_EXT vs CPU: 4591/4591 (ROCm0),
+  7822/7822 (Vulkan0).
+- Depth-16384 decode tg128 within 0.05% of pre-fix; CPU same-seed greedy
+  51/64 tokens identical (divergence at a near-tie only).
+- Clean-apply sim at `9113cc188`: strict 14/14 `git am`, zero whitespace
+  warnings, applied tree == fork tip `ff2b35f49`.
+
+Full record: `wip/strix-halo/kvzero/RECORD-2026-09-09.md` +
+`wip/kv-sign-leak/HANDOVER-2026-09-09-mma-f16.md`.
+
+### Block-14 freed-cell KV-row-zeroing gfx1151 gate (2026-09-09, superseded 2026-09-10)
+
+*Superseded by the 2026-09-10 kernel-side masked-V amendment above — the
+host `zero_rows`/`zero_freed` mechanism no longer exists in block 14.
+Kept as the historical record.*
 
 Block 14 amended with the gfx1151-only gate for its seq_rm/seq_keep/clear
 row zeroing (the strix-lineage masked-column guard for the gfx1151 WMMA

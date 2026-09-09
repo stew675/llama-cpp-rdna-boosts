@@ -68,10 +68,11 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 
 The current delivery is a **14-patch set** for llama.cpp at the fork
 point `9113cc188` (blocks 01-14 in `patches/`, applied with `git am` via
-`scripts/apply-all.sh`; block-14 tip `27485f1ca`, block 01 refreshed
+`scripts/apply-all.sh`; block-14 tip `ff2b35f49`, block 01 refreshed
 2026-09-09 to the llama.cpp PR #27210 review head and block 14 amended
-2026-09-09 with the gfx1151-only freed-cell KV-zeroing gate — regenerated
-2026-09-09).  The set applies **whitespace-clean** and each block is
+2026-09-10 with the kernel-side masked-V fixes (the gfx1151-only
+freed-cell host zeroing added 2026-09-09 is removed) — regenerated
+2026-09-10).  The set applies **whitespace-clean** and each block is
 build- and coherence-verified — see [`MANIFESTS.md`](MANIFESTS.md) (apply
 order + verification contract), [`patches/README.md`](patches/README.md)
 (per-block notes, env knobs, server config) and
@@ -82,7 +83,23 @@ integrations, re-baselines, regenerations) are tracked as dated entries
 — newest first — in **[`WORKLOG.md`](WORKLOG.md)**; the current-state
 summary below is deliberately short and does not repeat them.
 
-- **Latest entry (2026-09-09): block-14 gfx1151-only freed-cell
+- **Latest entry (2026-09-10): block-14 freed-cell KV handling moved to
+  kernel-side masked-V elimination (regeneration tip `ff2b35f49`).**  The
+  host-side `zero_freed` row zeroing (gfx1151-only, added 2026-09-09) is
+  REMOVED — `src/llama-kv-cache.{cpp,h}` are back to the upstream state.
+  In its place block 14 carries three unconditional kernel fixes that make
+  masked (freed/stale) flash-attention cells contribute exactly +0.0:
+  HIP `fattn-tile.cuh` (packed-bf16 PV), HIP `fattn-mma-f16.cuh`
+  (masked-V rows in staged shared tiles), Vulkan `flash_attn_cm1.comp` /
+  `flash_attn.comp` (dead columns never read V).  Validated on the Strix
+  Halo gfx1151 box with the host zeroing disabled: 16/16 determinism
+  gates PASS on every KV type each backend's FA supports (ROCm
+  f16/bf16/q8_0/q4_0; Vulkan also q4_1/q5_0/q5_1/iq4_nl), zeroing
+  ON==OFF bit-identical, test-backend-ops vs CPU 4591/4591 (ROCm) +
+  7822/7822 (Vulkan), no measurable decode/prefill regression.  Full
+  record in [`WORKLOG.md`](WORKLOG.md).
+
+- **2026-09-09 (previous): block-14 gfx1151-only freed-cell
   KV-zeroing gate (regeneration `7c4d9c4e0..27485f1ca`).**  Block 14's
   seq_rm row zeroing (the strix-lineage masked-column guard for the
   gfx1151 WMMA f16 `x+(-0.0)` inexactness) now enables only on gfx1151
@@ -92,7 +109,8 @@ summary below is deliberately short and does not repeat them.
   pre-prefill stall on 3x R9700 gfx1201 (qwen4exp and plain dense 4B) is
   gone (identical workload 24.5 s -> ~6 s), and the zeroing-off
   determinism gate is clean.  gfx1151 (Halo box) keeps the zeroing
-  enabled; 16-run control unchanged.  Full record in
+  enabled; 16-run control unchanged.  **Superseded 2026-09-10** by the
+  kernel-side fix (see above).  Full record in
   [`WORKLOG.md`](WORKLOG.md).
 
 - **2026-09-09 (previous): block-01 refresh to the PR #27210 review
