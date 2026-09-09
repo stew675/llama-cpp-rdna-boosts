@@ -99,65 +99,6 @@ summary below is deliberately short and does not repeat them.
   7822/7822 (Vulkan), no measurable decode/prefill regression.  Full
   record in [`WORKLOG.md`](WORKLOG.md).
 
-- **2026-09-09 (previous): block-14 gfx1151-only freed-cell
-  KV-zeroing gate (regeneration `7c4d9c4e0..27485f1ca`).**  Block 14's
-  seq_rm row zeroing (the strix-lineage masked-column guard for the
-  gfx1151 WMMA f16 `x+(-0.0)` inexactness) now enables only on gfx1151
-  devices (env `LLAMA_KV_ZERO_FREED` overrides).  Off gfx1151 the
-  pre-block-14 behavior is restored: replacing a resident multi-GPU KV
-  sequence no longer issues ~48xN synced per-cell memsets — the ~18-24 s
-  pre-prefill stall on 3x R9700 gfx1201 (qwen4exp and plain dense 4B) is
-  gone (identical workload 24.5 s -> ~6 s), and the zeroing-off
-  determinism gate is clean.  gfx1151 (Halo box) keeps the zeroing
-  enabled; 16-run control unchanged.  **Superseded 2026-09-10** by the
-  kernel-side fix (see above).  Full record in
-  [`WORKLOG.md`](WORKLOG.md).
-
-- **2026-09-09 (previous): block-01 refresh to the PR #27210 review
-  head.**  Block 01 (adaptive MTP draft depth) was cut from llama.cpp PR
-  #27210 (author: stew675) at its `0994374fd` state; the PR advanced
-  through a maintainer review round and the block is refreshed to the PR
-  head `d236d41a2`, still one squashed patch.  The review changeset adds
-  the `accept_partial()` feedback path (checkpoint-restore rounds can no
-  longer feed stale accept counts to the adaptive controller),
-  `has_mtp()` refactor, adaptive-depth reset before the empty-prompt
-  early return, `--spec-draft-n-min-adaptive` value validation + docs,
-  and dual-MTP-type rejection.  Blocks 02-14 content-identical.
-  Verification: clean-apply sim strict 14/14 `git am`, zero whitespace
-  warnings, applied tree == fork tip `0f2b7a4e1`; unit tests pass;
-  plain-decode same-seed coherence token-IDENTICAL to the known-good
-  `050ec89ce` build.  Full record in [`WORKLOG.md`](WORKLOG.md).
-
-- **2026-09-08 (previous): re-base onto master `9113cc188`.**
-  The fork was 14 commits behind upstream; upstream had itself reverted
-  #24233 in #28604 on 2026-09-08, matching block 06's end state, so the
-  re-base reduced block 06 to a host-buffer rationale marker (kept for
-  numbering/history) and merged block 14's quantized-KV tensor-split gate
-  additively with upstream #28390's single-device `SPLIT_MODE_TENSOR`
-  warn.  Blocks 01-05 + 07-13 are content-identical to the previous
-  delivery.  Clean-apply sim: strict 14/14 `git am`, zero whitespace
-  warnings, applied tree == fork tip `78e67a3d8`.  Verified on the Strix
-  box (gfx1151, ROCm 7.14): plain-decode same-seed coherence IDENTICAL to
-  the `72f0ee944` build across tensor/layer, f16/q8_0/bf16 KV and depth
-  16384; MTP adaptive gate acceptance 0.833 with draft-mtp 20.3 t/s vs
-  plain 7.9 t/s.  Full record in [`WORKLOG.md`](WORKLOG.md).
-
-- **2026-09-08 (previous):** block-14 quantized-KV tensor-split gate
-  — `q4_1`-family KV cache types (`q4_1/q5_0/q5_1/iq4_nl`) aborted at
-graph reserve under multi-GPU `SPLIT_MODE_TENSOR` on dense qwen35 and
-qwen4exp.  Root cause is an **upstream bug** (reproduced on pristine
-vanilla llama.cpp at the fork point `050dde50c`, unfixed on current
-master): tensor split forces flash attention, whose kernels read the
-quantized K/V natively only for `q4_0`/`q8_0`; the q4_1-family attention
-subgraph becomes MIRRORED graph-external leaves that collide with the
-AXIS-0 gate branch of the qwen35 gated attention.  The amendment rejects
-those KV types at context creation with a clear error when the Meta
-device is in use (layer split, single-GPU and `q8_0/q4_0`/float types
-are unaffected).  Canonical fork rebuilt at `050dde50c`
-(`d65a96084..ce641322e`), set regenerated, clean-apply sim re-verified
-2026-09-08 (14/14 `git am`, zero whitespace warnings, applied tree ==
-fork tip `ce641322e`).  Full record in
-[`WORKLOG.md`](WORKLOG.md).
 
 ## Layout
 
