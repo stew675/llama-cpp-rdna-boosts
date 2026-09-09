@@ -1,31 +1,41 @@
-From b75dafbf2a895524c8f5d4c1d38ad48420ead03a Mon Sep 17 00:00:00 2001
+From c437b4fa321178de7e2b9b6e1e8261d38647ccf6 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 06/14] rdna-boosts: block 06: host-buffer revert for discrete
  GPUs
 
+On the 050dde50c baseline this block reverted PR #24233 (restore
+prop.integrated on HIP builds): integrated=true enables the CUDA host-buffer
+path (zero-copy UMA weights) on APUs, which corrupts full-model results under
+async execution on this box (PPL 5.9243 -> 8.51+ without HIP_LAUNCH_BLOCKING).
+
+Re-based 2026-09-08 onto master 9113cc188: upstream itself reverted #24233 in
+#28604 (2026-09-08), making forced-integrated-false the upstream default.  The
+functional delta of this block is therefore now upstream; the block is retained
+so the fork keeps its 14-block structure and carries only the rationale marker
+comment above the (now unconditional) integrated = false line, guarding against
+re-landing prop.integrated without re-testing this box.
 ---
- ggml/src/ggml-cuda/ggml-cuda.cu | 7 ++++++-
- 1 file changed, 6 insertions(+), 1 deletion(-)
+ ggml/src/ggml-cuda/ggml-cuda.cu | 6 ++++++
+ 1 file changed, 6 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index f44368893..fd0da76a6 100644
+index 7fecdb2d4..6dd925267 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -306,7 +306,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
+@@ -305,6 +305,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
+ 
          info.default_tensor_split[id] = total_vram;
          total_vram += device_vram;
- #if defined(GGML_USE_HIP)
--        info.devices[id].integrated = prop.integrated;
-+        // Fork divergence from PR #24233: integrated=true enables the CUDA
-+        // host-buffer path (zero-copy UMA weights) on APUs, which corrupts
-+        // full-model results under async execution on this box (PPL 5.9243
-+        // -> 8.51+ without HIP_LAUNCH_BLOCKING). The back-out restores
-+        // async-safe operation at no decode/prefill cost.
-+        info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
- #else
++        // Fork divergence from PR #24233 (restored prop.integrated on HIP builds): the CUDA
++        // host-buffer path (zero-copy UMA weights) it enables on APUs corrupts full-model
++        // results under async execution on this box (PPL 5.9243 -> 8.51+ without
++        // HIP_LAUNCH_BLOCKING).  Upstream reverted #24233 in #28604 (2026-09-08), making
++        // forced-integrated-false the upstream default again; this marker guards against
++        // re-landing prop.integrated without re-testing that box.
          info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
- #endif
+         info.devices[id].nsm        = prop.multiProcessorCount;
+         info.devices[id].smpb       = prop.sharedMemPerBlock;
 -- 
 2.55.0
 

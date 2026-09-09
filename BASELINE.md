@@ -2,8 +2,9 @@
 
 Current state: `main` is the delivery branch carrying the **14-patch set**
 (blocks 01-14) generated against the fork
-point **llama.cpp master `050dde50c`** (re-based 2026-09-07 from
-`465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, itself re-based
+point **llama.cpp master `9113cc188`** (re-based 2026-09-08 from
+`050dde50c`, itself re-based 2026-09-07 from `465e49b9c`, itself
+re-based 2026-09-06 from `9cffdcc80`, itself re-based
 2026-09-02 from `0eadefebd`). The `baseline/<sha>` branches below
 are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
@@ -24,12 +25,15 @@ at `192067b72`), `baseline/d222767c7` (validated against `d222767c7`) and
 
 
 All 14 patches are generated against **llama.cpp upstream master at
-`050dde50c`** (re-based 2026-09-07 from `465e49b9c`, itself re-based
+`9113cc188`** (re-based 2026-09-08 from `050dde50c`, itself re-based
+2026-09-07 from `465e49b9c`, itself re-based
 2026-09-06 from `9cffdcc80`, itself re-based
 2026-09-02 from `0eadefebd`; dated records at the
 bottom of this file): blocks 01-14 = the fork's `rdna-boosts` block
-commits (the current 14-commit branch on `050dde50c` is
-`90a816a68..3bebffd6b`; block 12 amended 2026-09-04 with the runtime
+commits (the current 14-commit branch on `9113cc188` is
+`f84549d23..78e67a3d8`; block 06 now carries only the host-buffer
+rationale marker — upstream #28604 reverted #24233 on 2026-09-08,
+matching its end state; block 12 amended 2026-09-04 with the runtime
 NCCL-failure fallback (issue #13), block 13 amended 2026-09-02 with
 two MTP regression fixes, 2026-09-05 with the RDNA3.5/RDNA3.0 gate
 relaxations and 2026-09-06 with the model-neutral Strix MoE mmq folds,
@@ -48,7 +52,13 @@ after the block-14 QSA quantized-KV gate + pool gate amendment: clean
 apply (`git am` 01-14) on a fresh checkout at
 `050dde50c`, full build clean, llama-cli same-seed coherence IDENTICAL
 (hybrid vs RCCL) — and the
-apply is **whitespace-free** (zero git warnings).
+apply is **whitespace-free** (zero git warnings).  Re-verified 2026-09-08
+on the `9113cc188` re-base: strict clean apply (14/14 `git am`, zero
+warnings, applied tree == fork tip `78e67a3d8`) on a fresh `9113cc188`
+checkout, full ROCm build clean, llama-cli same-seed coherence IDENTICAL
+to the `72f0ee944` build on gfx1151 (tensor/layer x f16/q8_0/bf16 KV,
+depth 16384), dense MTP adaptive gate green (acceptance 0.833; draft-mtp
+20.3 vs plain 7.9 t/s).
 
 ## Two fixes vs the fork
 
@@ -88,9 +98,11 @@ validation:
 
 The CURRENT delivery patches (0001-0014) are the fork's `rdna-boosts` block
 commits exported with `git format-patch` (one commit per block; the
-current 14-block set against `050dde50c`:
-`90a816a68..3bebffd6b`, block 14 = the qwen4exp-support delta promoted
-from `beta/qwen4exp`, re-based 2026-09-07; previously the
+current 14-block set against `9113cc188`:
+`f84549d23..78e67a3d8`, block 14 = the qwen4exp-support delta promoted
+from `beta/qwen4exp`; re-based 2026-09-08 from the `050dde50c` set
+`90a816a68..3bebffd6b` (block 06 reduced to a marker — see the WORKLOG
+re-base entry); previously the
 re-based set against `465e49b9c`: `45bf4d291..c261553a1`, against
 `9cffdcc80`: `04122bfb5..8f2838d1`, block 13
 amended 2026-09-02 with the two MTP regression fixes; previously the
@@ -105,7 +117,7 @@ checkpoint history moved to `archive/docs/baseline-history.md`.
 
 ## Drift policy
 
-The patches are static against the fork point `465e49b9c`. If a patch fails
+The patches are static against the fork point `9113cc188`. If a patch fails
 to apply against a newer upstream master:
 
 1. Try `git am -3` / `git apply -3` (3-way merge against the baseline blobs).
@@ -115,9 +127,9 @@ to apply against a newer upstream master:
    master and continue.
 3. Do NOT hand-edit the committed patches as the permanent fix: when more
    than one block needs manual re-base hunks, regenerate the whole set from
-   the fork with `scripts/make-patches.sh` (re-exports blocks 01-13 from
-   `465e49b9c..<blocks-tip>`; defaults target
-the current blocks tip `c261553a1`), then re-verify the clean-apply
+   the fork with `scripts/make-patches.sh` (re-exports blocks 01-14 from
+   `9113cc188..<blocks-tip>`; defaults target
+the current blocks tip `78e67a3d8`), then re-verify the clean-apply
 simulation (fresh worktree at the new fork point, `scripts/apply-all.sh`,
 build, coherence) and update the fork point + verification numbers in
 `patches/README.md` and `README.md`.

@@ -5,15 +5,12 @@
 #   fork-path     path to the stew675/llama.cpp fork checkout (default:
 #                 ../llama.cpp relative to this repo)
 #   baseline-sha  the upstream baseline the patches are generated against
-#                 (default: 050dde50c, see MANIFESTS.md)
+#                 (default: 9113cc188, see MANIFESTS.md)
 #   blocks-tip    the fork commit carrying all 14 blocks (default:
-#                 72f0ee944, the block-14 commit of the 2026-09-08
-#                 canonical re-application at 050dde50c; block 14
-#                 amended 2026-09-07 with the QSA quantized-KV decode
-#                 gate + the derived-cache pool gate and 2026-09-08
-#                 with the issue-18 MUL_MAT_ID pair-fusion layout gate,
-#                 the compiler-warning cleanup and the tensor-split
-#                 HIP gate)
+#                 78e67a3d8, the block-14 commit of the 2026-09-08
+#                 re-base onto master 9113cc188; block 06 carries only
+#                 the host-buffer rationale marker (upstream #28604 now
+#                 matches its end state) -- see MANIFESTS.md)
 #
 # All 14 blocks are the fork commits baseline-sha..blocks-tip, exported with
 # `git format-patch` (the canonical, verified form; applies with `git am`).
@@ -25,8 +22,8 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
-BASELINE="${2:-050dde50c}"
-TIP="${3:-72f0ee944}"
+BASELINE="${2:-9113cc188}"
+TIP="${3:-78e67a3d8}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then

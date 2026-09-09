@@ -1,9 +1,15 @@
 # rdna-boosts patch set (delivery)
 
-14 patches against the llama.cpp fork point `050dde50c`
-("hexagon: add RELU and LEAKY_RELU ops (#28585)"; re-based 2026-09-07 from
-`465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02
-from `0eadefebd`; block 12 amended 2026-09-04 with the runtime
+14 patches against llama.cpp master `9113cc188`
+("ggml : fix msvc+clang ggml_vld1q_u32 (#28284)"; re-based 2026-09-08 from
+`050dde50c` ("hexagon: add RELU and LEAKY_RELU ops (#28585)"), itself
+re-based 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
+re-based 2026-09-02 from `0eadefebd`; on the 2026-09-08 re-base block 06's
+functional delta was dropped — upstream itself reverted #24233 in #28604 the
+same day, matching its end state — and the block now carries only the
+host-buffer rationale marker comment (see the block-06 note below); block 14's
+quantized-KV tensor-split gate merged additively with upstream #28390's
+single-device `SPLIT_MODE_TENSOR` warn; block 12 amended 2026-09-04 with the runtime
 NCCL-failure fallback (issue #13, see the block-12 notes
 below); block 13 amended 2026-09-02 with two MTP regression fixes and
 2026-09-05 with the RDNA3.5 (Strix Halo, gfx1151) + RDNA3.0 (gfx1100)
@@ -45,7 +51,7 @@ notes below):
 ## Apply (fresh checkout at the fork point)
 
 ```bash
-git checkout 050dde50c         # or: git apply each patch on a matching tree
+git checkout 9113cc188         # or: git apply each patch on a matching tree
 git am patches/000[1-9]-*.patch patches/001[0-4]-*.patch
 ```
 

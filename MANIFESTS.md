@@ -4,12 +4,20 @@ Squashed, standalone diff blocks of RDNA-specific performance and correctness
 work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
-The **current delivery** is a **14-patch set** against the fork point
-`050dde50c` (re-based 2026-09-07 from `465e49b9c`, itself re-based
-2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`):
+The **current delivery** is a **14-patch set** against upstream master
+`9113cc188` (re-based 2026-09-08 from `050dde50c`, itself re-based
+2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
+re-based 2026-09-02 from `0eadefebd`):
 blocks 01-14 (`patches/0001-…0014-…`, format-patch of the
 fork's `rdna-boosts` block commits — the current regeneration
-`d65a96084..ce641322e` against `050dde50c`; block 12 was amended
+`f84549d23..78e67a3d8` on `9113cc188`; the 2026-09-08 re-base reduced
+block 06 to its host-buffer rationale marker (upstream itself reverted
+#24233 in #28604 on 2026-09-08 — end state identical) and merged block
+14's quantized-KV tensor-split gate additively with upstream #28390's
+single-device `SPLIT_MODE_TENSOR` warn in `llama-context.cpp`; blocks
+01-05 + 07-13 are content-identical to the previous `050dde50c`-based
+delivery, whose regeneration `d65a96084..ce641322e` is superseded and
+preserved on the fork's history/remotes); block 12 was amended
 2026-09-04 with the runtime NCCL-failure fallback (issue #13), block
 13 was amended 2026-09-02 with two MTP regression fixes, 2026-09-05
 with the RDNA3.5/RDNA3.0 gate relaxations and 2026-09-06 with the
@@ -56,7 +64,9 @@ reconciliation (local derived-cache pool gate merged onto the
 `2f1dc384b` lineage; 14/14 `git am`, zero whitespace warnings, applied
 tree == fork tip `72f0ee944`)), re-verified 2026-09-08 after the
 block-14 quantized-KV tensor-split gate amendment (14/14 `git am`,
-zero whitespace warnings, applied tree == fork tip `ce641322e`)).
+zero whitespace warnings, applied tree == fork tip `ce641322e`)),
+re-verified 2026-09-08 on the `9113cc188` re-base (14/14 `git am`,
+zero whitespace warnings, applied tree == fork tip `78e67a3d8`)).
 
 > **Naming collision warning:** in the OLD pre-delivery docs (the historical
 > records below, BASELINE.md, the `baseline/*` branches), "block 12"
@@ -116,7 +126,7 @@ silently drops hunks.
 
 ## Verified apply sequence
 
-### Block-14 QSA quantized-KV decode gate + derived-cache pool gate (2026-09-07, current)
+### Block-14 QSA quantized-KV decode gate + derived-cache pool gate (2026-09-07, dated record — superseded by the 2026-09-08 `9113cc188` re-base)
 
 Report: Qwen3.8-Flash-Next Q4_K_XL llama-server (ctx 70000,
 `--cache-type-k/v q8_0`, spec-draft q8_0, draft-mtp) aborts at
@@ -162,7 +172,7 @@ engaged (`GGML_CUDA_QSA_INDEXER_CACHE=1`); q8_0 runme config + full
 KV-type matrix re-run clean (zero errors, acceptance unchanged);
 clean-apply sim tree-identical to the fork tip.
 
-### Re-baseline to 050dde50c + block 14 (2026-09-07, current)
+### Re-baseline to 050dde50c + block 14 (2026-09-07, dated record — superseded by the 2026-09-08 `9113cc188` re-base)
 
 Upstream master moved **22 commits** past `465e49b9c` (the 2026-09-07
 master tip `050dde50c`).  The `~/llama.cpp` fork was rebuilt on the new
@@ -638,7 +648,7 @@ run-to-run noise, no measurable impact from the bounded-spin fix.
 | 14 | test-llama-archs qwen4exp rows + llama-cli same-seed coherence on the Flash-Next GGUFs (3-GPU gfx1201 IQ4_XS) + dense 27B coherence (block-14-off paths: `LLAMA_QSA_OFF=1` / `GGML_CUDA_DISABLE_HC_FUSION=1` A/B) | arch matrix OK (GPU ~9e-14, CPU 0.00); qwen4exp output byte-identical to the pre-promotion fork; dense unchanged |
 
 Convenience: `rdna-boosts-all.patch` (repo root) is the entire 14-patch net
-as ONE patch (applies cleanly on `050dde50c` alone; not a substitute for the
+as ONE patch (applies cleanly on `9113cc188` alone; not a substitute for the
 per-block flow in `patches/` when you want reviewable increments).
 
 

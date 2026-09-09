@@ -1,4 +1,4 @@
-From d65a960847a1b7e169795df3745c6fe1bf3173c6 Mon Sep 17 00:00:00 2001
+From f84549d2392bd8c627bf377751e3b5c2671ae367 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 01/14] rdna-boosts: block 01: adaptive MTP draft depth
@@ -19,7 +19,7 @@ Subject: [PATCH 01/14] rdna-boosts: block 01: adaptive MTP draft depth
  create mode 100644 tests/test-speculative-adaptive.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 015196ca1..59550fe8b 100644
+index 74241f931..8d86877b4 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -363,9 +363,8 @@ common_models_handler common_models_handler_init(const common_params & params, l
@@ -34,7 +34,7 @@ index 015196ca1..59550fe8b 100644
  
      const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                             params.speculative.types.end(),
-@@ -1308,6 +1307,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
+@@ -1314,6 +1313,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
              common_params_print_completion(ctx_arg);
              exit(0);
          }
@@ -42,7 +42,7 @@ index 015196ca1..59550fe8b 100644
          params.lr.init();
      } catch (const std::invalid_argument & ex) {
          fprintf(stderr, "%s\n", ex.what());
-@@ -4204,6 +4204,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4210,6 +4210,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_RATES"));
  
@@ -226,7 +226,7 @@ index 000000000..ab9f98818
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 851a47b9a..864b91b96 100644
+index 2db381d58..b3c987255 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,7 @@
@@ -400,7 +400,7 @@ index 851a47b9a..864b91b96 100644
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
              case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                  n_max = std::max(n_max, std::max(0, spec->draft.n_max));
-@@ -2520,7 +2588,10 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2531,7 +2599,10 @@ common_speculative_init_result::common_speculative_init_result(
      const bool has_draft = params.speculative.has_dft();
      const bool spec_mtp = std::find(params.speculative.types.begin(),
                                      params.speculative.types.end(),
@@ -412,7 +412,7 @@ index 851a47b9a..864b91b96 100644
  
      auto mparams = common_model_params_to_llama(params);
      auto cparams = common_context_params_to_llama(params);
-@@ -2612,7 +2683,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2623,7 +2694,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
@@ -421,7 +421,7 @@ index 851a47b9a..864b91b96 100644
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -2625,6 +2696,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2636,6 +2707,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
@@ -429,7 +429,7 @@ index 851a47b9a..864b91b96 100644
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
      }
-@@ -2644,7 +2716,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2655,7 +2727,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
@@ -461,10 +461,10 @@ index ad6612647..30b5f50f1 100644
              const int64_t s_slot = K - t;
  
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index c46377c76..43bdc89df 100644
+index 5531c4ce3..83a14fee9 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -289,6 +289,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
+@@ -298,6 +298,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
  set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
  
  llama_build_and_test(test-arg-parser.cpp)
@@ -723,7 +723,7 @@ index 000000000..ea959f223
 +    return 0;
 +}
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index f78cfb36d..59cc062e0 100644
+index fe068d3e9..46a2a0362 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1019,7 +1019,10 @@ private:

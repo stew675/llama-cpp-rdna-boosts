@@ -23,7 +23,7 @@ multi-GPU `SPLIT_MODE_TENSOR` abort for `q4_1`-family KV cache types —
 see
 [Current state](#current-state)).
 The patches apply to a clean
-llama.cpp checkout at the recorded fork point `050dde50c` (re-based 2026-09-07 from `465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`).
+llama.cpp checkout at the recorded fork point `9113cc188` (re-based 2026-09-08 from `050dde50c`, itself re-based 2026-09-07 from `465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`).
 
 `scripts/apply-all.sh` automates the apply: it creates a fresh `rdna-boosts`
 branch and applies blocks 01-14 with `git am`, one commit each.
@@ -67,9 +67,9 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ## Current state
 
 The current delivery is a **14-patch set** for llama.cpp at the fork
-point `050dde50c` (blocks 01-14 in `patches/`, applied with `git am` via
-`scripts/apply-all.sh`; current block-14 tip `ce641322e`, regenerated
-2026-09-08).  The set applies **whitespace-clean** and each block is
+point `9113cc188` (blocks 01-14 in `patches/`, applied with `git am` via
+`scripts/apply-all.sh`; current block-14 tip `78e67a3d8`, re-based +
+regenerated 2026-09-08).  The set applies **whitespace-clean** and each block is
 build- and coherence-verified — see [`MANIFESTS.md`](MANIFESTS.md) (apply
 order + verification contract), [`patches/README.md`](patches/README.md)
 (per-block notes, env knobs, server config) and
@@ -80,7 +80,21 @@ integrations, re-baselines, regenerations) are tracked as dated entries
 — newest first — in **[`WORKLOG.md`](WORKLOG.md)**; the current-state
 summary below is deliberately short and does not repeat them.
 
-- **Latest entry (2026-09-08):** block-14 quantized-KV tensor-split gate
+- **Latest entry (2026-09-08): re-base onto master `9113cc188`.**
+  The fork was 14 commits behind upstream; upstream had itself reverted
+  #24233 in #28604 on 2026-09-08, matching block 06's end state, so the
+  re-base reduced block 06 to a host-buffer rationale marker (kept for
+  numbering/history) and merged block 14's quantized-KV tensor-split gate
+  additively with upstream #28390's single-device `SPLIT_MODE_TENSOR`
+  warn.  Blocks 01-05 + 07-13 are content-identical to the previous
+  delivery.  Clean-apply sim: strict 14/14 `git am`, zero whitespace
+  warnings, applied tree == fork tip `78e67a3d8`.  Verified on the Strix
+  box (gfx1151, ROCm 7.14): plain-decode same-seed coherence IDENTICAL to
+  the `72f0ee944` build across tensor/layer, f16/q8_0/bf16 KV and depth
+  16384; MTP adaptive gate acceptance 0.833 with draft-mtp 20.3 t/s vs
+  plain 7.9 t/s.  Full record in [`WORKLOG.md`](WORKLOG.md).
+
+- **2026-09-08 (previous):** block-14 quantized-KV tensor-split gate
   — `q4_1`-family KV cache types (`q4_1/q5_0/q5_1/iq4_nl`) aborted at
 graph reserve under multi-GPU `SPLIT_MODE_TENSOR` on dense qwen35 and
 qwen4exp.  Root cause is an **upstream bug** (reproduced on pristine
@@ -164,9 +178,9 @@ fork tip `ce641322e`).  Full record in
 # 1. fresh clone of llama.cpp, at the fork point
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-git checkout 050dde50c        # the SHA recorded in patches/README.md
+git checkout 9113cc188        # the SHA recorded in patches/README.md
 
-# 2. apply the set (automated; VERIFIED 2026-08-29, re-verified 2026-09-01/02/05/06 and 2026-09-07)
+# 2. apply the set (automated; VERIFIED 2026-08-29, re-verified 2026-09-01/02/05/06/07 and 2026-09-08)
 bash <path-to-this-repo>/scripts/apply-all.sh .
 #    = git am patches/0001…0014  (one commit per block on a fresh `rdna-boosts` branch)
 
@@ -191,7 +205,7 @@ git add -A && git commit -m "rdna-boosts: block 14: qwen4exp support"
 
 ## When upstream master moves
 
-The patches are static against `050dde50c`. When upstream drifts and hunks
+The patches are static against `9113cc188`. When upstream drifts and hunks
 no longer apply, regenerate the whole set from the fork with
 `scripts/make-patches.sh` (needs the `~/llama.cpp` fork checkout, which
 carries the block commits), then update

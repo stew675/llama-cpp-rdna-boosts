@@ -10,6 +10,40 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Re-base (2026-09-08) — delivery moved to upstream master `9113cc188`
+  (block-14 tip `78e67a3d8`).**  Upstream moved 14 commits past the
+  `050dde50c` fork point (server checkpoint eviction, Kimi-K3 recurrent
+  rollback, chat-parser split, ggml_prec spec, metal/vulkan/opencl fixes,
+  spec single-device meta-wrapper handling #28390, and — decisive for this
+  re-base — `d4389a4dd`/PR #28604 which **reverted #24233**, the very
+  change block 06 diverged from).  An `apply-all.sh` run against the fresh
+  master tip failed at block 06 in a way even `git am -3` cannot fix: the
+  upstream revert deleted block 06's pre-image, so the block's change is a
+  no-op on the new base (nothing left for the patch to do).  Resolution:
+  block 06 was reduced to a host-buffer **rationale marker** commit (6
+  comment lines above the now-unconditional `integrated = false` in
+  `ggml-cuda.cu`), keeping the 14-block structure and all downstream block
+  numbers intact; block 14's quantized-KV tensor-split gate merged
+  **additively** with #28390's single-device `SPLIT_MODE_TENSOR` warn in
+  `src/llama-context.cpp` (both kept, in sequence; #28390's code comment
+  shows the same single-device-no-meta-wrapper intent as block 07, so no
+  semantic collision).  Content verification against the previous delivery
+  (re-applied at `050dde50c`): blocks 01-05 and 07-13 are byte-identical;
+  block 06 differs as designed; block 14 differs only in the
+  llama-context.cpp resolution region.  Regenerated at `9113cc188`
+  (`f84549d23..78e67a3d8`) and clean-apply re-verified (strict 14/14
+  `git am`, zero whitespace warnings, applied tree == fork tip
+  `78e67a3d8`).  Coherence verified on the Strix box (gfx1151, ROCm 7.14):
+  llama-cli same-seed output IDENTICAL to the canonical `72f0ee944` build
+  (tensor + layer split x f16/q8_0/bf16 KV, and a long-prompt run at depth
+  16384), clean runtime diagnostics, and the dense adaptive-MTP gate green
+  on the new build (draft acceptance 0.833 at acc/pos 0.944/0.833/0.722;
+  draft-mtp 20.3 t/s vs plain 7.9 t/s on the same prose prompt; MTP
+  same-seed byte-identical old-vs-new).  The previous `050dde50c`-based
+  regeneration (`d65a96084..ce641322e`) is superseded; the pre-re-base fork
+  chain is preserved at `backup-rdna-boosts-bfcc4be99` and the known-good
+  `72f0ee944` binary under `/tmp/rdna-ref-bin/` (session-local).
+
 - **Block-14 amendment (3rd on 2026-09-08) — quantized-KV tensor-split
   gate:** the `q4_1`-family KV cache types (`q4_1`, `q5_0`, `q5_1`,
   `iq4_nl`) aborted during the first graph reserve under multi-GPU

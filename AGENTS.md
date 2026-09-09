@@ -8,9 +8,9 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **14-patch set** that applies to a clean
-llama.cpp checkout at the fork point **`050dde50c`** (re-based 2026-09-07
-from `465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, re-based
-2026-09-02 from `0eadefebd`).
+llama.cpp checkout at the fork point **`9113cc188`** (re-based 2026-09-08
+from `050dde50c`, itself re-based 2026-09-07 from `465e49b9c`, itself
+re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
 
 - Blocks **01-11** (`patches/0001-…0011-…`): MTP draft depth, fused chunked
   GDN, BF16 KV, WMMA flash-attn, CPU bit-identical decode, host-buffer
@@ -59,9 +59,12 @@ from `465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, re-based
 
 The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts` — currently the 14 block
-commits on master `050dde50c` (2026-09-07 re-base; the current
-canonical regeneration is `7df708e66..72f0ee944`, block-14 tip
-`72f0ee944`; block 12 carries the
+commits on master `9113cc188` (2026-09-08 re-base; the current
+canonical regeneration is `f84549d23..78e67a3d8`, block-14 tip
+`78e67a3d8`; on the re-base block 06 was reduced to a host-buffer
+rationale marker — upstream itself reverted #24233 in #28604 on
+2026-09-08, matching its end state, so the functional delta is now
+upstream (see the WORKLOG re-base entry); block 12 carries the
 2026-09-04 runtime NCCL-failure fallback, issue #13; block 13 amended
 2026-09-02/09-05/09-06 as above and 2026-09-08 with the
 moe_weighted_reduction float4 remainder fix (issue #19, reported by
@@ -81,11 +84,11 @@ keep upstream's clean "not implemented" error / arch-test SKIP instead
 of the meta-splitter abort found on Vulkan); block 08
 amended 2026-09-07 with the PR #15 mul_mat+add through-view shape
 guard). The
-canonical `050dde50c` fork used for `make-patches.sh`
+canonical `9113cc188` fork used for `make-patches.sh`
 regeneration is disposable and is re-created from `patches/` +
 `scripts/apply-all.sh` whenever it needs rebuilding (fresh clone at the
 fork point + apply) — the last regeneration's block-14 tip is
-`72f0ee944`. Older fork states are
+`78e67a3d8`. Older fork states are
 preserved on the `stew675/llama.cpp` fork remote (`rdna-boosts` =
 previous tip `482837e5a` on `0eadefebd`; `rdna-boosts-orig`, …) and in
 older local reference clones — never rely on them for the current
@@ -233,7 +236,7 @@ explicitly requests it.**
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 050dde50c
+git checkout 9113cc188
 bash <this-repo>/scripts/apply-all.sh .     # creates branch rdna-boosts, 14 commits
 ```
 
@@ -250,17 +253,17 @@ Diff the output against a known-good build (or against RCCL via
 
 ### Regenerate the patches (after fork changes)
 
-`scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `050dde50c`,
-blocks tip `72f0ee944`): `git format-patch` the block commits (all 14
+`scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
+blocks tip `78e67a3d8`): `git format-patch` the block commits (all 14
 blocks are committed fork commits; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the current fork topology: `~/llama.cpp`
-`rdna-boosts` is synced AT the fork point (upstream master `050dde50c`
-+ the 14 blocks re-applied, block-14 tip `72f0ee944`), so a raw
-`050dde50c..HEAD` range there is exactly the 14 block commits — but the
+`rdna-boosts` is synced AT the fork point (upstream master `9113cc188`
++ the 14 blocks re-applied, block-14 tip `78e67a3d8`), so a raw
+`9113cc188..HEAD` range there is exactly the 14 block commits — but the
 fork branch is disposable, so the patches
-must still be generated from a canonical fork rebuilt AT `050dde50c`
+must still be generated from a canonical fork rebuilt AT `9113cc188`
 (`scripts/apply-all.sh` of the current delivery; last regeneration tip
-`72f0ee944`).  Then
+`78e67a3d8`).  Then
 re-verify the clean-apply simulation (worktree at the fork point,
 apply-all, build, coherence) before committing.
 
