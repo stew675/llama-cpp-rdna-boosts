@@ -1,0 +1,72 @@
+From d514fd891b5ffa2a0c9e3102aa855a0779e128b1 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Wed, 9 Sep 2026 13:21:14 -0500
+Subject: [PATCH] hip: fa mma: zero V of fully masked KV rows after staging
+
+The MMA_F16 WMMA prefill kernel (f16 and bf16 KV) leaks fully masked KV
+rows into the output on gfx11: such rows have P == +0.0 in every fragment
+element of the block, but their V still reaches the WMMA and the masked
+cell's products accumulate inexactly (the signed-zero artifact seen on the
+TILE/Vulkan paths), so stale/freed KV content perturbs prefills whose KV
+extent covers cells beyond the live range. After each V tile slice is
+staged in shared memory, zero the rows that the mask tile marks blocked
+(-inf) for every one of the block's query columns. The pass and its extra
+barrier are gated to the masked path (a mask tile is only in shared when
+masking ran) and compile-time excluded for the V_is_K_view and swizzled
+layouts (the swizzled layout is NVIDIA-only, where the hardware is exact).
+
+Validated on gfx1151 (ROCm): probe clean across f16/bf16 x GQA/MHA x
+hs 128/256 x the geometry sweep (incl. nvalid 1025..1279); fully-live,
+zeroed-tail and orig-clean configs bit-identical to the pre-fix build;
+garbage-tail and orig-leak configs now differ (leak removed); 16/16
+determinism gates PASS with LLAMA_KV_ZERO_FREED=0 for f16 and bf16 KV,
+and zeroing ON vs OFF is bit-identical over all 2064 gate cells on both;
+llama-bench pp512/pp2048/tg128 within +0.2% (noise).
+---
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh | 30 ++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 14e196af7..8428b01f7 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -1006,6 +1006,36 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+                     cp_async_wait_all();
+                 }
+                 __syncthreads();
++
++                // gfx11 signed-zero leak: a KV row that is masked (P == +0.0) for every query
++                // column of this block still feeds its V to the WMMA, where the masked cell's
++                // x + (-0.0) products are accumulated inexactly on gfx11 and leak the cell's
++                // (possibly stale/freed) content into the output. Never let such a row's V
++                // reach the multiply: zero it after it is staged, using the mask tile that is
++                // already in shared memory. Only the plain (non-swizzled) layout is handled;
++                // the swizzled layout is NVIDIA-only where the hardware does not exhibit the
++                // leak. V_is_K_view (MLA) reuses K data as V and needs the K tile zeroed
++                // instead - not implemented here (RDNA caps route those heads to the tile kernel).
++                if constexpr (!V_is_K_view && !swz_V) {
++                    if (ncols2 > 1 || mask_h) { // tile_mask is valid iff the mask-add ran
++                        const int tid = threadIdx.y * warp_size + threadIdx.x;
++#pragma unroll
++                        for (int i = tid; i < nbatch_fa; i += nwarps*warp_size) {
++                            bool dead = true;
++#pragma unroll
++                            for (int j = 0; j < ncols1; ++j) {
++                                dead = dead && (__half2float(tile_mask[j*(nbatch_fa + 8) + i]) <= -1e30f);
++                            }
++                            if (dead) {
++                                half2 * const row = tile_V + i*stride_tile_V;
++                                for (int k = 0; k < i0_diff/2; ++k) {
++                                    row[k] = make_half2(0.0f, 0.0f);
++                                }
++                            }
++                        }
++                        __syncthreads();
++                    }
++                }
+             }
+         }
+         const half2 * tile_V_i = !V_is_K_view || i0_stop > 2*nbatch_K2 ? tile_V : tile_V + i0_start/2;
+-- 
+2.55.0
+
