@@ -1,8 +1,55 @@
 # HANDOVER + IMPLEMENTATION PLAN — qwen4exp (Qwen3.8-Flash-Next) QSA memory reduction
 
-Date: 2026-09-10 · Session: VRAM investigation + keys-only indexer + ubatch study
+Date: 2026-09-10 · Sessions: VRAM investigation + keys-only indexer + ubatch study, then the L2
+score-chain cut, then L1 step 1 (derived per-block bias)
 Status: **WIP — nothing here is part of the delivery.** `wip/` items must not be folded into
 `patches/` without the maintainer's explicit go-ahead and the block-14 amendment protocol.
+
+> ## NEXT SESSION — do these first, in order
+>
+> **1. Resolve the open MTP question before doing anything else.** L1 step 1 (derived per-block
+> bias) is implemented, committed here as `patches/0002-derived-qsa-block-bias.patch`, and gives
+> **4050.60 MiB/GPU at ub 2048** (from 4450.40) with byte-identical plain coherence — but the
+> adaptive-MTP probe drifts (acceptance 0.64583 → 0.61616, output text still byte-identical) and
+> it is **not understood**. It is specific to the *prefill* geometry (derive for n_tokens ≤ 16 and
+> it is clean: 62/96). Run the discriminating experiment written up in
+> **`L1-step1-derived-block-bias-findings.md` §3 "The next experiment"**: keep the original
+> `[n_blocks, n_tps]` F32 bias tensor allocated *and consumed* (`ggml_add(score, bias)` with the
+> tensor filled with **zeros** — adding `+0.0f` first is value-preserving for the three bias
+> constants and the mask values) while the top-k still derives the real bias from
+> `blk_idx`/`blk_tail`. Acceptance back to 62/96 ⇒ the cause is graph structure / buffer layout
+> (next: audit for host-buffer aliasing/liveness with `tools/peak-ledger.py` and
+> `/tmp/ggml-alloc.instrumented.c` — this allocator already has a known `n_views` underflow for
+> `cpy`-into-a-view). Still 61/99 ⇒ the cause is in the values (next: dump `blk_idx`/`blk_tail`
+> **on device** inside `ggml_cuda_indexer_top_k` and compare against the host expectation).
+> Do not package step 1 until this is closed.
+>
+> **2. Then step 2 — the derived visibility / mask (−800 MiB, target ~3250 MiB at ub 2048).** Use
+> the *corrected* design in the findings' §4, not the original §2–§4 of
+> `L1-visibility-bias-derivation.md`: `!is_pos_2d()` cannot gate anything (IMROPE models always
+> report `n_pos = 4`), and the visibility must carry the per-token `seq_has` test and the 2-D tie
+> rule. Workable form: the memory layer's rank in the mask's own total order (pos, ext.y, ext.x)
+> plus a sequence bitmask, with a compact `[width, n_tps]` mask feeding both the top-k and the FA
+> (which makes both `M_smem` staging sites in `fattn-qsa.cu` index-free).
+>
+> **3. Build/patch workflow.** `~/llama.cpp` already carries the L2 patch *and* step 1 in the
+> working tree (deliberately uncommitted — `make-patches.sh` treats the fork tip as canonical;
+> never commit these on the branch). To regenerate patch 0002 after edits: scratch
+> `git worktree add --detach /tmp/base HEAD` → `git apply` patch 0001 → commit → copy the 8 touched
+> files over it → `git diff`. Rebuild: `export PATH=/opt/rocm-7.14-gfx1201/bin:$PATH` then
+> `cmake --build build-rocm --target llama-cli llama-bench -j 16`; binaries land in
+> `build-rocm/bin/` (copy that directory to `/tmp/bin-<tag>` for the tools).
+>
+> **4. Validation bar for every change:** the plain same-seed A/B (`tools/ab-coherence.sh`) **and**
+> the MTP probe (`tools/mtp-ab.sh` — the sensitive one: it sees ulp-level drift that argmax text
+> hides; two identical builds must print identical acceptance). Buffer sizes come from
+> `tools/bufsize.sh` (`llama-cli -v | grep 'compute buffer size'`), never from llama-bench.
+>
+> **5. Volatile artifacts (present now, rebuildable otherwise):** `/tmp/bin-{pristine,l2,l1,keysonly,l0base}`,
+> `/tmp/prompt40k.txt` (40k words), `/tmp/prompt3k.txt` (2045 words), `/tmp/ppl6k.txt`,
+> `/tmp/small-prompt.txt`, `/tmp/ggml-alloc.instrumented.c` (+ `.orig`) for the peak ledger.
+> Patch 0002's exact generated content lives in its file; re-verify it applies on the L2 base
+> before trusting the working tree.
 
 > **2026-09-10 update (later session): the L2 lever is implemented and validated.** See
 > **`L2-score-chain-findings.md`** — QSA score-chain memory: 6690.40 → **4450.40 MiB/GPU** at
