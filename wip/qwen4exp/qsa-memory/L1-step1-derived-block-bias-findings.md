@@ -105,7 +105,7 @@ the meta-backend mirrored-src case for the new src count. Expected after that: *
 ub 2048** (ub 1024 ~2100) — the campaign's BEST outcome: ub2048 speed below ub1024's memory.
 Validate with the same `GGML_QSA_DERIVED_VIS` A/B (text must stay byte-identical) + `tools/bufsize.sh`.
 
-## 2c. Step 3 — the flash-attention switch (support landed; the prune measured, then blocked)
+## 2c. Step 3 — the flash-attention switch (support landed; the prune measured, then blocked — **LANDED, see §2d**)
 
 `GGML_OP_FLASH_ATTN_QSA` now takes two optional srcs 5/6 (`cell_vis`, `q_vis`; `ggml.h` + the
 `ggml.c` ctor, which also accepts a **null** mask when they are present). Both `M_smem` staging
@@ -276,3 +276,62 @@ campaign's BEST outcome; ub1024 would land near 2100).
   same derived path + removed instrumentation), `/tmp/bin-l2`, `/tmp/bin-pristine`.
 - The step-1 lever is *landed in the WIP tree* with a documented, arithmetically-exact basis; the
   remaining campaign milestone is step 2 above (mask, −800 MiB).
+
+## 2d. The prune LANDED — 3251.39 MiB/GPU (session 2)
+
+**Result.** The mask is gone: `Meta() compute buffer size = 3251.39 MiB`, `ROCm_Host compute buffer
+size = 63.69 MiB` (from 4051.39 / 863.69). The *same* 800 MiB leaves the per-GPU compute buffer
+**and** the shared host buffer, so the flip is worth **3 x 800 MiB of VRAM + 800 MiB of host RAM**.
+ub1024: 2074.55 -> **1675.33**; ub512: 1188.56 -> **889.54**. The O(n_kv x n_tps) host mask build
+per prefill ubatch is gone with it.
+
+**Root cause of the "null-buffer probe chain" — and its correction.** The block was **not** in the
+meta/sched backend. Two *input-fill* call sites assumed a buffer that the prune deliberately leaves
+unallocated; each aborted at its callee's `GGML_ASSERT(ggml_backend_buffer_is_host(...))`:
+
+1. `llm_graph_input_mem_hybrid::set_input` (llama-graph.cpp) called
+   `llama_kv_cache::set_input_kq_mask(inp_attn->self_kq_mask, ...)` unguarded. Backtrace:
+   `ggml_backend_buffer_is_host <- llama_kv_cache::set_input_kq_mask <-
+   llm_graph_input_mem_hybrid::set_input <- llm_graph_result::set_inputs <-
+   llama_context::process_ubatch`. Fixed with the guard its siblings already use
+   (`if (self_kq_mask && self_kq_mask->buffer)`, as in `llm_graph_input_attn_kv::set_input`).
+2. `llm_graph_input_qsa::set_input` (qwen4exp.cpp) called
+   `llama_memory_hybrid_idx::set_input_qsa(cell_blk, ...)` unguarded. The K-store-only policies
+   (decode + short context) build no top-k node, so `cell_blk`/`blk_cells`/`blk_pos` are left
+   unallocated — and `set_input_qsa` dereferences `cell_blk->data` unconditionally. Only reachable
+   with `LLAMA_QSA_SPARSE_FA=0`, which is why the first validation round missed it. Fixed with an
+   early return when `cell_blk == nullptr || cell_blk->buffer == nullptr`.
+
+The earlier "an unreachable tensor is not a valid state in this backend" conclusion was an artifact
+of *where* the assert surfaced: `ggml_backend_buffer_get_type`'s assert (ggml-backend.cpp:209) was
+reached from `ggml_backend_buffer_is_host`, called by the *input plumbing* above — not by the meta
+or sched code. No meta/sched/allocator change is needed, every diagnostic has been removed, and
+`ggml/src/ggml-backend.cpp` is back to the upstream state. The `get_usage`/`get_type` "tolerances"
+explored in session 1 are **not** in the patch. (Method note: the decisive tool was a `backtrace()`
+print in `ggml_backend_buffer_get_type` — the assert's own file:line and the thread dump were both
+misleading because the aborting worker thread's dump was not in the log.)
+
+**Gate hardening.** The sparse-FA flag is now a shared helper, `qwen4exp_qsa_sparse(cparams)`, used
+by both the FA branch and the prune predicate so they cannot disagree: with `LLAMA_QSA_SPARSE_FA=0`
+the dense `build_attn_mha` reads the mask and must keep it.
+
+**Validation (final binary, 3x R9700, ctx 204800, ub 2048, q8_0 KV).**
+
+| check | result |
+|---|---|
+| same-seed text A/B, sparse FA, derived (V=1) vs mask (V=0) | **byte-identical** — 3k and 40k prompts, one binary |
+| same-seed text A/B, dense FA (`LLAMA_QSA_SPARSE_FA=0`) | **byte-identical** V=0 vs V=1; both complete |
+| MTP probe (Protocol A) | 0.61616 in both modes (unchanged; gate >= 0.45) |
+| llama-bench ub2048 (r=3) | pp20480 2509.63 +/- 4.06 (pre-flip 2488.36 +/- 4.99, **+0.9%**); tg256 50.66 +/- 1.38 (pre-flip 50.63 +/- 1.40) |
+| reserve | 3251.39 / 63.69 (ub2048); 1675.33 / 33.64 (ub1024); 889.54 / 18.61 (ub512) |
+
+With the mask deleted, identical same-seed text *is* the proof of the FA's derived path: there is no
+mask left to read. Sparse and dense legitimately produce different text (different FA kernels give a
+different fp accumulation order), and each is internally consistent across the derived/mask A/B.
+
+**Patch state.** `patches/0002-derived-qsa-block-bias.patch` (10 files, +552/-79 over 0001) now
+carries the whole L1 state — steps 1-3 + the prune + both guards;
+`patches/0003-prune-mask-flip-NOT-APPLIED.patch` is **deleted** (folded in).
+
+**Next lever.** The score chain's own peak (the ~700 MiB concat in L2; see
+`L2-score-chain-findings.md` §6) and the host-side top-k build.

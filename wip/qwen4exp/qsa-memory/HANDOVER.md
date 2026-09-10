@@ -7,16 +7,19 @@ Status: **WIP — nothing here is part of the delivery.** `wip/` items must not 
 
 > ## NEXT SESSION — do these first, in order
 >
-> **0. IMMEDIATE TASK — secure the QSA visibility flip (−3.2 GiB of box VRAM / host RAM): read
-> `L1-flip-handover.md`.** The flip that deletes the 800 MiB kq-mask tensor is written as
-> `patches/0003-prune-mask-flip-NOT-APPLIED.patch` (applies cleanly on the current tree), it
-> compiles, and its win is **measured**: 4051.39 → **3251.39 MiB/GPU** and 863.69 → **63.69 MiB**
-> host (the same 800 MiB drops out of the per-GPU compute buffer *and* the host buffer). It is not
-> applied because the run then aborts on `GGML_ASSERT(buffer)` in a backend helper — a chain of
-> unguarded `tensor->buffer` probes that a *created-but-never-consumed* tensor (the mask) trips.
-> That file carries the one-run reproduce command, the audit list of probe sites, the recommended
-> plan (name the tensor first, with the exact print), the traps, and the patch-regeneration recipe.
-> This is the highest-value remaining item in the campaign.
+> **0. DONE (session 2) — the QSA visibility flip is LANDED and validated.** The 800 MiB kq mask
+> is gone: reserve **3251.39 MiB/GPU + 63.69 MiB host** at ctx 204800/ub 2048 (from 4051.39 /
+> 863.69) — the same 800 MiB leaves both the compute and the host buffer; ub1024 1675.33, ub512
+> 889.54. That is ub2048 at less memory than pristine ub1024 while keeping ub2048 speed (pp20480
+> +0.9%, tg unchanged), and the host mask build is gone. Coherence byte-identical (derived vs mask,
+> 3k + 40k), the dense fallback is clean in both modes, MTP 0.61616 unchanged.
+> The block turned out to be two unguarded *input-fill* call sites
+> (`llm_graph_input_mem_hybrid::set_input` -> `set_input_kq_mask`;
+> `llm_graph_input_qsa::set_input` -> `set_input_qsa`) — **not** the meta/sched probes the previous
+> session suspected; no engine change was needed. Full story, numbers and method note:
+> `L1-step1-derived-block-bias-findings.md` §2d. Folded into
+> `patches/0002-derived-qsa-block-bias.patch` (10 files); `0003` is deleted.
+> **Next lever: the score chain's ~700 MiB concat peak (L2 findings §6) + the host-side top-k build.**
 >
 > **1. The MTP question from the previous session is RESOLVED — read §3 of
 > `L1-step1-derived-block-bias-findings.md` before touching it again.** A four-mode experiment on
