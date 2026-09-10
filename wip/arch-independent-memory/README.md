@@ -66,7 +66,7 @@ So the mask is what makes the ub2048-vs-1024 memory gap so brutal on *every* arc
 
 ## 3. ggml-alloc: two issues worth eliminating (shared code, all archs)
 
-### 3a. A reshaped-view parent is never reused in place (a real, silent memory loss)
+### 3a. A reshaped-view parent is never reused in place (transient - measured NOT to move the peak)
 
 Evidence (L2a): `ggml_relu` applied *after* a `ggml_reshape_4d` in the qwen4exp top-k cost the
 **whole parent twice**: reserve 6690.40 -> 5490.40 MiB (**-1200 MB = 2 x the 600 MB parent**) just by
@@ -79,13 +79,18 @@ of children and views" pass (`ggml/src/ggml-alloc.c` ~L657: `p_hn->n_children ==
 parent->data`). A view whose `data` is still NULL at planning time cannot satisfy that, so the
 parent stays separate from the child.
 
-- **How systemic is it?** The instrumented allocator's probe ("not reusing parent ... (reshaped) ...
-  is external") fires **1296 times across 1072 distinct parents** in the 27B prefill graph - the names
-  are the rope / K-cache half-splits (`Kcur-*`, `z-*`, `cache_r_l*`, `Qcur*`). Do **not** read that as
-  1296 x size: the losses are per-layer and only a few coexist, so the cost is set by the biggest ones
-  live at the same time. Quantifying it is the first tooling step of the next session: print the
-  parent's size (and accumulate the total) in that message - a one-line change to the instrumented
-  allocator (`/tmp/ggml-alloc.instrumented.c` ~L629) plus one rebuild.
+- **How systemic is it, and does it cost reserve? (measured with the L0c counter)** The
+  "not reusing parent ... is external" branch was extended to count the *true* missed through-view
+  reuses (view source allocator-owned, last use, same layout, aliasing view):
+  - **27B** prefill graph: 1296 "external" events (336 with "(reshaped)" in the tensor name), of which
+    **816 are true missed reuses**, *potential* total 14.9 GiB - and **none of them is live at the peak
+    record**, i.e. the reserve would not shrink by a single MiB (the losses are per-layer transients,
+    <= 48 MiB each; the peak is the 800 MB mask);
+  - **4B**: 648 events -> 408 true misses, 4.7 GiB potential, also **0 live at the peak**.
+  => **3a is a correctness/generality fix, not a reserve win for dense models.** It *did* win 1200 MB on
+  qwen4exp (L2a) precisely because there the reshaped-parent chain was itself the peak setter.
+  Re-check both numbers after any allocator change with `../qwen4exp/qsa-memory/tools/view-reuse-ledger.py` (L0c build:
+  `/tmp/bin-l0c`; counter source `/tmp/ggml-alloc.instrumented.c`).
 - **Model-author rule (mechanical, zero-risk):** apply elementwise/unary ops *before* the reshape,
   never after. Audit target for other archs: any `reshape*` followed by relu/gelu/silu/add(scale) on
   a large tensor.
@@ -127,21 +132,21 @@ share** separately - the mask is the only term that is both huge and arch-indepe
 
 ## 5. Open items / next session, in order
 
-1. **ggml-alloc (3a + 3b).** Confirm 3b with `AT_PRINTF` on a minimal repro, then fix: through-view
-   parent reuse (3a) and/or the `n_views` accounting (3b). Validate against the §3b acceptance
-   criteria. This is shared code: a win for every arch.
-2. **Dense-model work.** The 27B is at `/llm/models/Qwen3.8/27B/Q8_0/Qwen3.8-27B-Q8_0.gguf` (MTP
-   heads inline - no `-md` needed for the MTP gate) and the 4B control at `~/Qwen3.5-4B-Q8_0.gguf`;
-   their reserve numbers are in §1. Do: (a) quantify the reshape-parent loss (§3a tooling step) -
-   total and biggest live overlap for the 27B; (b) use the mask share to decide whether the
-   derived-mask facility (§2.2) is worth building - and if so write the design brief, not the code. The Qwen3.8-27B Q8 used in earlier sessions is **no longer on disk**
-   (`/models` holds only the Flash-Next set); re-run `model-sweep.sh` + the ledger once available -
-   and use it to decide whether the derived-mask facility (§2.2) is worth building.
-3. **qwen4exp, still open:** the score chain's ~700 MB concat peak and the host-side top-k build
+1. **The mask - the main lever, and the actual peak setter** (measured: 800 MB of the 27B's 1920 MB
+   buffer *at the peak record*, with nothing else above 96 MB). The 27B's mask is the easiest kind to
+   derive (`n_swa = 0`, no alibi -> only causality + sequence membership). Write the design brief for a
+   generic derived-mask facility (which mask variants are derivable, per-backend support including the
+   packed-mask fallback, and how to gate it) plus the smaller device-side-fill variant (§2.1) - do
+   not start coding the facility without the brief.
+2. **ggml-alloc 3b (the leak)** - this one *did* move the reserve (4450 -> 6441 MiB on qwen4exp), so it
+   is the allocator item worth fixing. Prove the mechanism with `AT_PRINTF` on a minimal repro, fix the
+   `n_views` accounting, and validate against the acceptance criteria in §3b.
+3. **ggml-alloc 3a (through-view reuse)** - correctness/generality only: measured **zero** reserve win
+   on the 27B/4B (§3a). Do it if it is cheap and provably safe (no numerics change); do not spend a
+   session on it for dense models.
+4. **qwen4exp, still open:** the score chain's ~700 MB concat peak and the host-side top-k build
    (`../qwen4exp/qsa-memory/L1-step1-derived-block-bias-findings.md` §2d).
-4. **Latent, ~30 min:** `llm_graph_input_attn_k::set_input` (`src/llama-graph.cpp` ~L509) has the
-   same unguarded `set_input_kq_mask` shape that blocked the prune; today it is unreachable, but it
-   is the same trap (§2d of the L1 findings).
-5. **Packaging decision (maintainer):** the L1 mask prune (10 files, +552/-79) and the keys-only
-   indexer patch are validated but still WIP - decide whether either becomes a delivery block
-   (regeneration via `scripts/make-patches.sh`, dated validation record, clean-apply simulation).
+5. **Latent, ~30 min:** `llm_graph_input_attn_k::set_input` (`src/llama-graph.cpp` ~L509) has the same
+   unguarded `set_input_kq_mask` shape that blocked the prune.
+6. **Packaging decision (maintainer):** whether the L1 mask prune (10 files, +552/-79) and the
+   keys-only indexer patch become a delivery block, or stay WIP.
