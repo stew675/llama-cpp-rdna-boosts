@@ -19,7 +19,11 @@ Status: **WIP — nothing here is part of the delivery.** `wip/` items must not 
 > session suspected; no engine change was needed. Full story, numbers and method note:
 > `L1-step1-derived-block-bias-findings.md` §2d. Folded into
 > `patches/0002-derived-qsa-block-bias.patch` (10 files); `0003` is deleted.
-> **Next lever: the score chain's ~700 MiB concat peak (L2 findings §6) + the host-side top-k build.**
+> **Next lever (qwen4exp): the score chain's ~700 MiB concat peak (L2 findings §6) + the host-side top-k build.**
+> **Broader next steps (arch-independent): see `../../arch-independent-memory/README.md`** — the kq mask
+> costs twice (compute + host, 800 MiB each at ub2048; ~61% of a dense model's reservation), and two
+> shared-code `ggml-alloc` issues (reshaped-parent reuse loss, `n_views` accounting) are documented
+> there with the evidence, repro recipes and acceptance criteria.
 >
 > **1. The MTP question from the previous session is RESOLVED — read §3 of
 > `L1-step1-derived-block-bias-findings.md` before touching it again.** A four-mode experiment on
