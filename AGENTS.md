@@ -150,7 +150,8 @@ explicitly requests it.**
 | `rdna-boosts-all.patch` | the entire 14-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `wip/` | exploration docs, tuning tools, session handoffs — **NOT part of the delivery** (see the WIP rule below) |
-| `beta/` | **promoted-from-WIP staging** (e.g. `beta/qwen4exp/` = qwen4exp support + its validation record; `qwen4exp-support.patch` promoted into the delivery as block 14 — see the WIP rule below) |
+| `beta/` | **promoted-from-WIP staging** (e.g. `beta/qwen4exp/` = qwen4exp support + its validation record; `qwen4exp-support.patch` promoted into the delivery as block 14).  `beta/block-15-campaign-wins/` is where the memory campaign's validated wins are collected and gated for the **Block 0015** beta patch — see the WIP rule below |
+| `upstream/` | **upstream-PR candidates** — self-contained changes that could be filed against unadulterated `ggml-org/llama.cpp` master, each with a `UPSTREAM-PR-*.md` note + `.patch` (see its README for the double-apply caution and the status table) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
 | `archive/work/` | closed experiments, preserved for future re-evaluation |
 | `baseline/*` branches, `block/*` tags | **historical** pre-block-12 checkpoints — do not use for the current delivery |
@@ -246,6 +247,15 @@ explicitly requests it.**
   present `wip/` results as delivery claims, **unless the user explicitly
   asks you to work with a specific `wip/` item**. They are kept for future
   re-evaluation only.
+- **Promotion rule (the sanctioned way out of `wip/`):** a campaign's
+  *validated* wins are collected under `beta/` (for the memory campaign:
+  `beta/block-15-campaign-wins/`), each win gets an environment kill-switch so
+  it can be A/B tested and bisected, the **combination** is re-validated (the
+  individual validations do not carry over), and only then is a new delivery
+  block cut — for this campaign **Block 0015** — with the maintainer's
+  go-ahead after a ~4–5 day beta window.  Anything that is also applicable to
+  unadulterated upstream `ggml-org/llama.cpp` gets a copy under `upstream/`
+  (as `UPSTREAM-PR-<slug>.md` + `.patch`) so it can be filed as a PR.
 
 ## Common tasks
 
