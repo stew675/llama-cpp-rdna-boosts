@@ -111,6 +111,31 @@ rebuilt at `9113cc188`), beta-staged in `beta/block-15-campaign-wins/`.**
   Re-check after the next `git fetch` before filing the `upstream/`
   candidates.
 
+  **Upstream candidates A1/A2 prepared on a pristine master worktree
+  (2026-09-10):** the `upstream/` backlog is now empty (four candidates,
+  each with its own `.md` evidence):
+  - **A1 `UPSTREAM-PR-kv-cache-keys-only`** (win W3): verified on
+    unadulterated master `9cf3bf256` (CPU build, the real 3-shard qwen4exp
+    IQ4_XS GGUF) -- the upstream indexer KV buffer is **72.00 MiB at ctx
+    8192 (K 24.00 + V 48.00)** and drops to **24.00 MiB (K only)** with the
+    patch; same-seed text byte-identical; `test-alloc` all PASSED,
+    `test-batch-alloc` 0 failures.  The shape is worth noting: the store
+    overrides the *key* head to the indexer size (128) but inherits the
+    model's *value* head (256), so the dead V is twice the K it never
+    accompanies.  Method note: the first upstream A/B was measured with
+    `git apply -3` (which stages), so `git checkout -- .` did not revert it
+    and both runs measured the patched tree; the `git reset --hard` re-run
+    is the real unpatched number above.
+  - **A2 `UPSTREAM-PR-attn-k-null-mask-guard`** (part of win W2): verified
+    on master -- applies clean, compiles, byte-identical same-seed text;
+    recorded in its notes as **hardening, not a live fix** (every upstream
+    construction site builds a mask, and `can_reuse_kq_mask` itself
+    dereferences it, so the guarded branch is unreachable upstream today).
+    It is what the sibling `attn_kv` class already does and the prerequisite
+    for a future null-mask feature.
+  Both patches were apply-checked on pristine master (individually and
+  together: 4 files, +18/-7); the master worktrees were reset afterwards.
+
 - **Block-14 amendment (2026-09-10) — freed-cell KV handling moved from the
   host-side zeroing to kernel-side masked-V elimination; the gfx1151-only
   `zero_freed` host zeroing (2026-09-09 amendment) is REMOVED (block-14 tip

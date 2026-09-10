@@ -19,6 +19,13 @@ would double-apply the hunks.  Treat each as:
 |---|---|---|---|---|
 | `UPSTREAM-PR-ggml-sched-probe.patch` + `.md` | a debug probe for the ggml backend scheduler (per-op fallback / sync tracking), core-ggml only | inside `beta/qwen4exp/qwen4exp-support.patch` (the sched-fallback-sync hunk) | prepared, not filed; re-verified 2026-09-10 to still apply clean to current master (`9cf3bf256`) |
 | `UPSTREAM-PR-ggml-alloc-unused-view.patch` + `.md` | ggml-alloc: release view sources whose views are never consumed (a real leak; repro included) | **now in Block 15** (`patches/0015-…`, win W4); A/B via `../beta/block-15-campaign-wins/ab/w4-revert.patch` | prepared 2026-09-10, applies clean to `9cf3bf256`, repro + `test-alloc`/`test-batch-alloc` verified **on master**; upstream-drop check 2026-09-10: still absent upstream; not filed |
+| `UPSTREAM-PR-kv-cache-keys-only.patch` + `.md` | llama: keys-only KV caches -- `llama_kv_cache` gains `v_enabled` (no V tensor, no V-side op); the qwen4exp indexer store passes `false` (its V is dead: the indexer scores keys) | **now in Block 15** (`patches/0015-…`, win W3) | prepared 2026-09-10; verified on **master** (`9cf3bf256`, CPU): applies clean, compiles, indexer KV **72.00 → 24.00 MiB** at ctx 8192 (K 24 / V 48 → K 24 / no V), same-seed text byte-identical, `test-alloc`/`test-batch-alloc` 0 failures; not filed |
+| `UPSTREAM-PR-attn-k-null-mask-guard.patch` + `.md` | llama: `llm_graph_input_attn_k` tolerates an absent kq mask (guard the fill like the sibling `attn_kv` class does; let `can_reuse_impl` accept a null mask) | **now in Block 15** (`patches/0015-…`, part of win W2) | prepared 2026-09-10; verified on **master** (`9cf3bf256`, CPU): applies clean, compiles, same-seed text byte-identical; **hardening only** -- no reachable null-mask path on master today (every construction site builds a mask); not filed |
+
+When filing, re-create the branch from upstream master and re-run the file's own Validation section —
+do not blindly apply the copy, and never apply one of these on top of the full delivery (that would
+double-apply the hunks).
+
 
 When filing, re-create the branch from upstream master and re-run the file's own Validation section —
 do not blindly apply the copy, and never apply one of these on top of the full delivery (that would
@@ -27,9 +34,7 @@ double-apply the hunks).
 If a hunk here is ever accepted upstream, it should be dropped from the delivery patch
 set on the next regeneration (the delivery then carries only the fork-local remainder).
 
-**Backlog (not yet written up — see `../beta/block-15-campaign-wins/HANDOVER.md` §4, items A1/A2):**
-the keys-only QSA indexer cache (dead V buffer removal; upstream has the same waste — the fork patch
-applies to master with 0 failed hunks / 1 fuzz) and the `llm_graph_input_attn_k::set_input` null-mask
-guard (a latent crash: the class's own `can_reuse_impl()` already accepts a null mask while the fill is
-unguarded).  Both are in Block 15 today and move here once their standalone patches are rebuilt against
-master.
+**Backlog:** empty — all four candidates (the sched probe, the allocator view-release, the keys-only
+indexer cache, and the `attn_k` null-mask guard) are written up above, each with its own `.md`
+evidence and an explicit "what was not validated" section.  Re-run that section on the PR branch
+before filing; a hunk accepted upstream is dropped from the delivery at the next regeneration.

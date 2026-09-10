@@ -45,8 +45,9 @@ Reality pass: 2026-09-10 (block 15 cut).
   `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch` remain as the pre-merge
   record; the per-win patches/plans under `wip/arch-independent-memory/` + `wip/qwen4exp/qsa-memory/` are
   the designs (V3-DERIVED-KQ-MASK-PLAN.md, V4-NATIVE-Q8-KV-PLAN.md, DERIVED-MASK-DESIGN.md).
-- Upstream PR candidates (maintainer's backlog): `upstream/README.md` - the allocator fix (W4) and the
-  `attn_k` null-mask guard (A2) are prepared, plus the keys-only dead-V removal (A1) and the sched probe.
+- Upstream PR candidates: `upstream/README.md` - **the backlog is empty: all four are written up**
+  (the allocator view-release probe, the sched probe, the keys-only indexer cache A1, and the `attn_k`
+  null-mask guard A2), each with its own `.md` evidence verified on pristine master `9cf3bf256`.
 
 ### gfx1201 (RDNA4) port of the gfx1151-gated Halo campaign items — ACTIVE (final qwen4exp stretch)
 - The sched-gate fix (fork `c63f7f2a0`, delivery `d6eb551`) is CLOSED on BOTH arches

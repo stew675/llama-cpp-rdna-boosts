@@ -1,0 +1,28 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 5855393ef..d495f874a 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -504,7 +504,12 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+ void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
+     mctx->set_input_k_idxs(self_k_idxs, ubatch);
+ 
+-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
++    // the mask may be absent (a graph that stores K without attending to it); the tensor is then
++    // left unallocated by the allocator, so asking the cache to fill it would dereference a null
++    // buffer.  The sibling class llm_graph_input_attn_kv guards the same call.
++    if (self_kq_mask && self_kq_mask->buffer) {
++        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
++    }
+ }
+ 
+ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
+@@ -518,7 +523,8 @@ bool llm_graph_input_attn_k::can_reuse_impl(const llm_graph_params & params) {
+ 
+     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+ 
+-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
++    // can_reuse_kq_mask() dereferences the mask, so an absent one cannot be checked here
++    res &= self_kq_mask == nullptr || can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+ 
+     return res;
+ }

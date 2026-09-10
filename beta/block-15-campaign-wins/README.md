@@ -125,16 +125,20 @@ the cache-level ones).
    (`patches/0015`) *and* stays staged in `upstream/UPSTREAM-PR-ggml-alloc-unused-view.{md,patch}`;
    the upstream-drop check on 2026-09-10 (against `9cf3bf256`, GitHub
    unreachable from this host) confirmed it is still absent upstream, so
-   nothing is dropped at this regeneration.
-2. **Split the generic part of W2 out?** — **RESOLVED: yes, it should be split
-   out when filing.**  The `llm_graph_input_attn_k::set_input` null-mask guard
-   stays in Block 15 (the delivery must carry it until upstream takes it) and
-   is **not yet** extracted into a standalone `upstream/` candidate — that is
-   Stage A / item A2 in `HANDOVER.md` §4 (independent of the block; extract
-   the hunk, rebuild it against `origin/master` until `git apply --check` is
-   clean, and add the notes + `upstream/README.md` row).  The upstream-drop
-   check on 2026-09-10 confirmed upstream still calls `set_input_kq_mask`
-   unguarded while its own `can_reuse_impl()` accepts a null mask.
+   nothing is dropped at this regeneration.  **A1 is also staged now**:
+   `upstream/UPSTREAM-PR-kv-cache-keys-only.{md,patch}` (verified on master:
+   the upstream indexer cache really does allocate the dead V — 72.00 MiB
+   at ctx 8192, K 24 + **V 48**, with the patch 24.00 MiB and byte-identical
+   output).
+2. **Split the generic part of W2 out?** — **RESOLVED: yes, and it is staged.**
+   `upstream/UPSTREAM-PR-attn-k-null-mask-guard.{md,patch}` (verified on
+   master: applies clean, compiles, byte-identical same-seed text).  Stated
+   honestly in its notes as **hardening, not a live fix**: every upstream
+   construction site builds a mask (and `can_reuse_kq_mask` itself
+   dereferences it), so the guarded branch is unreachable upstream today —
+   it is what the sibling `attn_kv` class already does, and it is the
+   prerequisite for any future null-mask graph (the fork's V3 derived mask is
+   the only one that exists).  It stays in Block 15 until upstream takes it.
 3. **Block 15 scope.** — **RESOLVED: W1–W4 + V3 + V4 are all IN Block 15**
    (D5 revised earlier: the block waits for V3/V4 rather than following
    them).  V2 (the 1-bit packed mask fallback) was never needed and is not
