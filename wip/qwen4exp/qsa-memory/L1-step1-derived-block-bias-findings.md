@@ -302,6 +302,13 @@ unallocated; each aborted at its callee's `GGML_ASSERT(ggml_backend_buffer_is_ho
    with `LLAMA_QSA_SPARSE_FA=0`, which is why the first validation round missed it. Fixed with an
    early return when `cell_blk == nullptr || cell_blk->buffer == nullptr`.
 
+3. *(added 2026-09-10)* `llm_graph_input_attn_k::set_input` (llama-graph.cpp, the SWA/ISWA input
+   class) had the same unguarded shape as #1, while its own `can_reuse_impl()` already accepts a null
+   mask (`self_kq_mask == nullptr || can_reuse_kq_mask(...)`) - so it was an inconsistency rather than
+   a crash found in the wild. Guarded the same way; it is a no-op for every model that has a mask
+   (validated byte-identical on the 4B / 27B / qwen4exp). Folded into `patches/0002` (now 10 files,
+   +557/-80 over the L2 patch).
+
 The earlier "an unreachable tensor is not a valid state in this backend" conclusion was an artifact
 of *where* the assert surfaced: `ggml_backend_buffer_get_type`'s assert (ggml-backend.cpp:209) was
 reached from `ggml_backend_buffer_is_host`, called by the *input plumbing* above — not by the meta

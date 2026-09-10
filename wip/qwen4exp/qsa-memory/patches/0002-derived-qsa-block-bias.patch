@@ -567,7 +567,7 @@ index 7ee2c06d8..1474b23fa 100644
  
      return result;
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 5855393ef..be9c81694 100644
+index 5855393ef..8d9758fed 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -496,7 +496,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -581,7 +581,20 @@ index 5855393ef..be9c81694 100644
  
      return res;
  }
-@@ -518,7 +520,7 @@ bool llm_graph_input_attn_k::can_reuse_impl(const llm_graph_params & params) {
+@@ -504,7 +506,11 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+ void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
+     mctx->set_input_k_idxs(self_k_idxs, ubatch);
+ 
+-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
++    // the mask is left unallocated when the graph does not attend to the cached K/V - see
++    // llm_graph_input_attn_kv::set_input; can_reuse_impl() below already accepts a null mask
++    if (self_kq_mask && self_kq_mask->buffer) {
++        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
++    }
+ }
+ 
+ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
+@@ -518,7 +524,7 @@ bool llm_graph_input_attn_k::can_reuse_impl(const llm_graph_params & params) {
  
      res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
  
@@ -590,7 +603,7 @@ index 5855393ef..be9c81694 100644
  
      return res;
  }
-@@ -1090,7 +1092,12 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+@@ -1090,7 +1096,12 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
      mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
      mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
  

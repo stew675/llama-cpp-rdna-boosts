@@ -202,7 +202,9 @@ share** separately - the mask is the only term that is both huge and arch-indepe
    session on it for dense models.
 4. **qwen4exp, still open:** the score chain's ~700 MB concat peak and the host-side top-k build
    (`../qwen4exp/qsa-memory/L1-step1-derived-block-bias-findings.md` §2d).
-5. **Latent, ~30 min:** `llm_graph_input_attn_k::set_input` (`src/llama-graph.cpp` ~L509) has the same
-   unguarded `set_input_kq_mask` shape that blocked the prune.
+5. ~~**Latent guard in `llm_graph_input_attn_k::set_input`**~~ **DONE 2026-09-10** - the last
+   unguarded `set_input_kq_mask` site (its own `can_reuse_impl()` already accepted a null mask);
+   folded into the qwen4exp L1 patch (`0002`, now 10 files, +557/-80) and validated byte-identical on
+   the 4B / 27B / qwen4exp. All other classes either guard it or genuinely require the mask.
 6. **Packaging decision (maintainer):** whether the L1 mask prune (10 files, +552/-79) and the
    keys-only indexer patch become a delivery block, or stay WIP.
