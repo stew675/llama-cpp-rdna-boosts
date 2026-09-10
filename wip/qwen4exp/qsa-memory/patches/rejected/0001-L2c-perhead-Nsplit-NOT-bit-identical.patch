@@ -1,0 +1,65 @@
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 4a7cd0c81..8c18638de 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1141,21 +1141,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+ 
+         // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
+         // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
+-        score = ggml_mul_mat(ctx0, pooled,
+-                ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
+-        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+-        score = ggml_relu(ctx0, score);
+-
+-        // the heads sit side by side on ne[1] and there are only a few of them
+-        ggml_tensor * summed = nullptr;
+-        for (int64_t h = 0; h < n_idx_h; ++h) {
+-            ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
+-                    score->nb[2], score->nb[3], h*score->nb[1]);
+-            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
++        ggml_tensor * q3 = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream);
++
++        // (L2c) score one head at a time when the F32 score is large.  the single mul_mat
++        // materializes the whole [n_blocks, n_idx_h*n_tps, n_stream] score (1600 MB at ctx 204800 /
++        // ub 2048) that only the head-sum then collapses to [n_blocks, n_tps].  the heads occupy
++        // disjoint columns of q (ne[1] = h*n_tps + t), and the reduction is over idx_dim only, so
++        // splitting q into per-head views gives the same per-element dot products, and summing the
++        // relu'd heads in the same h order gives the same head-sum.  only one head's score and the
++        // running sum coexist: 2 x 400 MB instead of 1600 + 400 MB.  small scores (decode, MTP
++        // verify, short prefills) keep the original single-pass chain so their graphs are unchanged.
++        const int64_t score_bytes = n_blocks * n_idx_h * n_tps * n_stream * 4;
++        if (score_bytes <= 128*1024*1024) {
++            score = ggml_mul_mat(ctx0, pooled, q3);
++            // (L2a) relu BEFORE the 4-D reshape: relu is elementwise so this is bit-identical, but
++            // it makes the relu's parent the mul_mat result instead of a reshape view. the allocator
++            // cannot reuse a view parent in place (a view's data is NULL at planning time, so it is
++            // treated as external), which otherwise keeps the [n_blocks, n_idx_h, n_tps] F32 result
++            // and its relu alive simultaneously (2 x 1600 MB at ctx 204800 / ub 2048).
++            score = ggml_relu(ctx0, score);
++            score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
++
++            // the heads sit side by side on ne[1] and there are only a few of them
++            ggml_tensor * summed = nullptr;
++            for (int64_t h = 0; h < n_idx_h; ++h) {
++                ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
++                        score->nb[2], score->nb[3], h*score->nb[1]);
++                summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
++            }
++            score = summed;
++        } else {
++            ggml_tensor * summed = nullptr;
++            for (int64_t h = 0; h < n_idx_h; ++h) {
++                ggml_tensor * q_h = ggml_view_3d(ctx0, q3, idx_dim, n_tps, n_stream,
++                        q3->nb[1], q3->nb[2], h*n_tps*q3->nb[1]);
++                ggml_tensor * sc = ggml_mul_mat(ctx0, pooled, q_h);   // [n_blocks, n_tps, n_stream]
++                sc = ggml_relu(ctx0, sc);
++                summed = summed ? ggml_add(ctx0, summed, sc) : sc;
++            }
++            score = summed;
+         }
+ 
+-        score = summed;
+-
+         // one value per block, so it is cheaper to bias here than after the cells are expanded
+         if (blk_bias) {
+             score = ggml_add(ctx0, score, inp->bias);

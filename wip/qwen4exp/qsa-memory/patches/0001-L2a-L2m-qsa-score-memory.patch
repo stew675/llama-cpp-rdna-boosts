@@ -1,0 +1,74 @@
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 4a7cd0c81..606af11fb 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1141,20 +1141,56 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+ 
+         // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
+         // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
+-        score = ggml_mul_mat(ctx0, pooled,
+-                ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
+-        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+-        score = ggml_relu(ctx0, score);
+-
+-        // the heads sit side by side on ne[1] and there are only a few of them
+-        ggml_tensor * summed = nullptr;
+-        for (int64_t h = 0; h < n_idx_h; ++h) {
+-            ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
+-                    score->nb[2], score->nb[3], h*score->nb[1]);
+-            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+-        }
++        ggml_tensor * q3 = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream);
++
++        // (L2c-probe) M-chunked score: n_blocks is an independent output (M) dimension of the
++        // matmul (the reduction is over idx_dim only), so slicing it should leave the per-element
++        // arithmetic untouched.  slices are assembled with ggml_concat (a produced tensor frees
++        // normally, unlike cpy into a view of an allocator-owned tensor, which leaks).
++        const int64_t score_bytes = n_blocks * n_idx_h * n_tps * n_stream * 4;
++        if (score_bytes <= 128*1024*1024) {
++            score = ggml_mul_mat(ctx0, pooled, q3);
++            // (L2a) relu BEFORE the 4-D reshape: relu is elementwise so this is bit-identical, but
++            // it makes the relu's parent the mul_mat result instead of a reshape view. the allocator
++            // cannot reuse a view parent in place (a view's data is NULL at planning time, so it is
++            // treated as external), which otherwise keeps the [n_blocks, n_idx_h, n_tps] F32 result
++            // and its relu alive simultaneously (2 x 1600 MB at ctx 204800 / ub 2048).
++            score = ggml_relu(ctx0, score);
++            score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
++
++            // the heads sit side by side on ne[1] and there are only a few of them
++            ggml_tensor * summed = nullptr;
++            for (int64_t h = 0; h < n_idx_h; ++h) {
++                ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
++                        score->nb[2], score->nb[3], h*score->nb[1]);
++                summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
++            }
+ 
+-        score = summed;
++            score = summed;
++        } else {
++            const int64_t chunk = std::max<int64_t>(4096, (n_blocks + 15)/16);
++            ggml_tensor * acc = nullptr;
++            for (int64_t b0 = 0; b0 < n_blocks; b0 += chunk) {
++                const int64_t cb = std::min<int64_t>(chunk, n_blocks - b0);
++
++                ggml_tensor * pooled_c = ggml_view_3d(ctx0, pooled, idx_dim, cb, n_stream,
++                        pooled->nb[1], pooled->nb[2], b0*pooled->nb[1]);
++
++                ggml_tensor * sc = ggml_mul_mat(ctx0, pooled_c, q3);
++                sc = ggml_relu(ctx0, sc);
++                sc = ggml_reshape_4d(ctx0, sc, cb, n_idx_h, n_tps, n_stream);
++
++                ggml_tensor * summed = nullptr;
++                for (int64_t h = 0; h < n_idx_h; ++h) {
++                    ggml_tensor * slice = ggml_view_3d(ctx0, sc, cb, n_tps, n_stream,
++                            sc->nb[2], sc->nb[3], h*sc->nb[1]);
++                    summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
++                }
++
++                acc = acc ? ggml_concat(ctx0, acc, summed, 0) : summed;
++            }
++            score = acc;
++        }
+ 
+         // one value per block, so it is cheaper to bias here than after the cells are expanded
+         if (blk_bias) {

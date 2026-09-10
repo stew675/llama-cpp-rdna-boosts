@@ -1,0 +1,30 @@
+QSA memory campaign — ubatch/perf comparison, 2026-09-10
+ctx 204800, --cache-type-k/v q8_0, --flash-attn auto, 3-GPU tensor split (HIP_VISIBLE_DEVICES=0,1,2)
+bench:  llama-bench -p 20480 -n 256 -r 3 -b 2048 -ub <U> -ctk q8_0 -ctv q8_0 -fa on -ngl 99 -sm tensor
+buffer: load-only llama-cli -v (sched_reserve "compute buffer size" line)
+
+config                        compute/GPU   box total   host buf    pp20480 t/s     tg256 t/s
+pristine  ub 2048               6690.40 MiB   19.6 GiB   1262.70 MiB  2461.25 ± 6.08   50.60 ± 1.36
+pristine  ub 1024               3346.50 MiB    9.8 GiB    632.65 MiB  2200.85 ± 1.46   50.70 ± 1.39
+pristine  ub  512               1724.56 MiB    5.1 GiB    317.63 MiB  (not benched)     -
+L2        ub 2048               4450.40 MiB   13.0 GiB   1262.70 MiB  2479.23 ± 1.16   50.70 ± 1.39
+L2        ub 1024               2274.35 MiB    6.7 GiB    632.65 MiB  2208.34 ± 1.33   50.67 ± 1.40
+L2        ub  512               1188.56 MiB    3.5 GiB    317.63 MiB  (not benched)     -
+
+"L2" = wip/qwen4exp/qsa-memory/patches/0001-L2a-L2m-qsa-score-memory.patch
+       (= relu-before-reshape + block-chunked score assembly, both bit-identical)
+
+Deltas
+  L2 vs pristine, ub 2048 : -2240.00 MiB/GPU (-6.7 GiB box), pp 2461.25 -> 2479.23 (no regression)
+  L2 vs pristine, ub 1024 : -1072.15 MiB/GPU (-3.1 GiB box), pp 2200.85 -> 2208.34 (no regression)
+  L2 ub 2048 vs pristine ub 1024 : +1103.90 MiB for +12.6% pp
+
+Campaign criteria (maintainer)
+  fail      : speed < ub1024 while memory > ub1024            -> not the case (speed is above ub1024)
+  win       : ub2048 speed for less memory than ub2048        -> achieved (-2240 MiB)
+  best      : ub2048 speed with <= ub1024 memory (3346.5 MiB) -> needs another -1103.9 MiB
+  next lever: derive the per-block bias (-400) and the kq_mask visibility (-800) in-kernel
+              => ~3250 MiB at ub 2048
+
+Coherence (same seed 42 / temp 0 / 40k-token prompt, -n 24): IDENTICAL vs pristine
+(the per-block chunking engages above ~16k tokens, so the 40k prompt spans many chunk boundaries)

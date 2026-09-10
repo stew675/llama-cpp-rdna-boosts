@@ -4,6 +4,16 @@ Date: 2026-09-10 · Session: VRAM investigation + keys-only indexer + ubatch stu
 Status: **WIP — nothing here is part of the delivery.** `wip/` items must not be folded into
 `patches/` without the maintainer's explicit go-ahead and the block-14 amendment protocol.
 
+> **2026-09-10 update (later session): the L2 lever is implemented and validated.** See
+> **`L2-score-chain-findings.md`** — QSA score-chain memory: 6690.40 → **4450.40 MiB/GPU** at
+> ctx 204800/ub 2048 (ub1024: 3346.50 → 2274.35), byte-identical output, no pp/tg regression.
+> Its §1–§6 supersede §5.1–5.3 below and add the measured peak ledger, the ub comparison table
+> now used as the campaign yardstick, and the corrected priority order (note: removing the
+> `attn_inp_kq_mask` input saves nothing on its own — the QSA flash-attention kernel consumes it
+> too, so the visibility must be derived in *both* the top-k and the FA kernel). Next lever:
+> derive the per-block bias (−400 MiB, top-k only) and the mask visibility (−800 MiB) in-kernel,
+> landing ub2048 at ~3250 MiB — below ub1024's memory at ub2048's speed.
+
 ---
 
 ## 0. Read-me-first / how to use this file
