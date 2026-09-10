@@ -219,3 +219,60 @@ oracle on every model in the matrix.
 * Never let the derived form reach a mask *consumer* other than the FA op (§2.6 gating).
 * The diagnostic (`LLAMA_KQ_MASK_DERIVED_VERIFY`) and the `GGML_QSA_DERIVED_BIAS=2|3` modes must be
   **stripped** before the patch is packaged.
+
+---
+
+## 4. Phase 2 progress (2026-09-10)
+
+**Done: phase 2a — the op + a real CPU reference** (`patches/0003-phase-2a-engine-derived-kq-mask-op-and-cpu-reference.patch`,
+3 files, +69/-4, applies on top of W1+W2+the phase-1 diagnostic; fork tree, coherence **byte-identical**
+vs the pre-phase-2 build with the slice inert):
+
+* `ggml.h` + `ggml.c`: `ggml_flash_attn_ext_add_kq_derived(a, cell_pos, tok_lo, tok_hi)` → `src[5..7]`,
+  with the shape asserts (`cell_pos->ne[0] == K->ne[1]`, `tok_lo/hi->ne[0] == Q->ne[1]`).
+* `ggml-cpu/ops.cpp`: the derived form is **implemented, not aborted** — helper
+  `kq_derived_mask_value()` in both FA compute paths (`_one_chunk` at the `mv` read, `tiled` at the
+  `mask32` fill + a NULL-mask-tolerant `mp_row`).  That makes the CPU the reference oracle for
+  `test-backend-ops FLASH_ATTN_EXT`, so the CUDA kernel can be validated without a full model run.
+
+**Next: phase 2b — the CUDA MMA kernel.**  Touch-point map measured in
+`ggml/src/ggml-cuda/fattn-mma-f16.cuh` (2173 lines):
+
+1. define `struct kq_derived_t { const int * cell_pos; const int * tok_lo; const int * tok_hi; };`
+   and add a **runtime** branch at the top of `flash_attn_ext_f16_load_mask` (L480) that fills
+   `tile_mask[j_sram*(nbatch_fa+8) + i]` from `k_VKQ_0 + i` (the cell) and `j_vram` (the row) as
+   `p >= tok_lo[j_vram] && p <= tok_hi[j_vram] ? half(0.0f) : half(-INFINITY)`, then `return;`
+   (it must precede the `if constexpr (use_cp_async)` chain — the derived path cannot use cp_async).
+   Its signature tail is `const int32_t * const __restrict__ indices) {` (1 occurrence).
+2. widen the gate `if (ncols2 > 1 || mask_h) {` to `|| derived.cell_pos != nullptr` at **six** sites:
+   L635, L735, L797, L983, L1020 (has a trailing comment) and L1339.
+3. add `, derived` to the three `flash_attn_ext_f16_load_mask<...>` call sites: L636 (`..., indices);`),
+   L984 (`..., nullptr);` preceded by `k_VKQ_0 + nbatch_fa`) and L1341 (`..., nullptr);` preceded by
+   `kb0*nbatch_fa`).
+4. `flash_attn_ext_f16_iter` (L569): + param, and `, derived` at its **four** call sites
+   (L1353, L1362, L1373, L1382).
+5. `flash_attn_ext_f16_process_tile` (L1188): + param, `, derived` at its **three** call sites
+   (L1932, L1937, L1984) — all inside the single kernel `flash_attn_ext_f16` (L1798, `__global__`),
+   which gains the three `const int *` kernel params and builds the struct at the top of its body.
+   There is no separate fixup kernel (the fixup work is the `is_fixup` template arm inside it).
+6. host side: the launch is generic —
+   `launch_fattn<DV, ncols1, ncols2>(ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, use_sparse, warp_size_host)`
+   at L2102 inside `ggml_cuda_flash_attn_ext_mma_f16_case` (in this .cuh), and `launch_fattn` lives in
+   `fattn-common.cuh` and builds the argument list from `dst`.  **The one remaining unknown:** whether
+   `launch_fattn` is shared with the vec/tile kernels — if it is, either the extra args go to all of
+   them or the mma path needs its own launch tail.  Check this first; it decides how the three
+   pointers reach the kernel.
+7. `fattn.cu`: `ggml_cuda_get_best_fattn_kernel` (L491) must use
+   `has_mask = mask != nullptr || dst->src[5] != nullptr` in the **policy** tests (`gqa_opt_applies`
+   L514, `if (mask && mask->ne[2] != 1)` L588) while keeping `mask` for the reads, and
+   `ggml_cuda_flash_attn_ext_supported` (L752) must return false for a derived op unless the best
+   kernel is `BEST_FATTN_KERNEL_MMA_F16`.
+
+**Then phase 2c**: the graph plumbing + the probe + the enable (plan §2.2, §2.6, §2.7), then the
+validation bar of §2.8.  Order matters: 2b can be validated on its own with
+`test-backend-ops -o FLASH_ATTN_EXT` on CPU + ROCm0 (add a derived case), which is far cheaper than
+the end-to-end runs, and only then does 2c flip the feature on for real graphs.
+
+**State after this session**: fork tree = W1 + W2 + the phase-1 diagnostic + the phase-2a engine
+(14 modified files), builds clean, coherence byte-identical, feature still inert (no caller).  The
+delivery repo holds the three separable patches under `wip/arch-independent-memory/patches/`.

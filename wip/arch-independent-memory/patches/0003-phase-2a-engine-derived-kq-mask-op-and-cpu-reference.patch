@@ -1,0 +1,137 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 091d40f6e..8b9ebb315 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2518,6 +2518,17 @@ extern "C" {
+             struct ggml_tensor * a,
+             struct ggml_tensor * sinks);
+ 
++    // kq mask derived from compact state: when cell_pos/tok_lo/tok_hi are given, the mask tensor
++    // may be NULL and each cell's value is derived in the kernel as
++    //     cell_pos[cell] >= tok_lo[token] && cell_pos[cell] <= tok_hi[token]  ->  0.0f, else -INF
++    // with cell_pos == INT32_MIN marking a cell that is always dropped (empty or foreign).
++    // cell_pos is I32[n_kv], tok_lo/tok_hi are I32[n_tps] - the same row order the mask would use.
++    GGML_API void ggml_flash_attn_ext_add_kq_derived(
++            struct ggml_tensor * a,
++            struct ggml_tensor * cell_pos,
++            struct ggml_tensor * tok_lo,
++            struct ggml_tensor * tok_hi);
++
+     // qwen4exp QSA sparse attention: attend only over the cells that the
+     // indexer's top-k names, instead of the whole KV cache.  The mask is the
+     // base kq_mask and is gathered in-kernel at the idx positions.
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 1f903107f..da3f411cd 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8612,6 +8612,21 @@ void ggml_compute_forward_top_k(
+     }
+ }
+ 
++// V3 derived kq mask (see ggml_flash_attn_ext_add_kq_derived): the mask tensor is absent and each
++// cell's value is derived from the cell's position and the token's visibility window.  Reference
++// semantics - the packed mask holds exactly these values.
++static inline float kq_derived_mask_value(
++        const struct ggml_tensor * cell_pos,
++        const struct ggml_tensor * tok_lo,
++        const struct ggml_tensor * tok_hi,
++        int64_t cell, int64_t tok) {
++    const int32_t p  = ((const int32_t *) cell_pos->data)[cell];
++    const int32_t lo = ((const int32_t *) tok_lo  ->data)[tok];
++    const int32_t hi = ((const int32_t *) tok_hi  ->data)[tok];
++
++    return p >= lo && p <= hi ? 0.0f : -INFINITY;
++}
++
+ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+         const ggml_compute_params * params,
+         ggml_tensor * dst,
+@@ -8626,6 +8641,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+     const ggml_tensor * mask  = dst->src[3];
+     const ggml_tensor * sinks = dst->src[4];
+ 
++    const ggml_tensor * cell_pos = dst->src[5];
++    const ggml_tensor * tok_lo   = dst->src[6];
++    const ggml_tensor * tok_hi   = dst->src[7];
++
+     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+     GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+@@ -8737,7 +8756,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+         // ref: https://arxiv.org/pdf/2112.05682.pdf
+ 
+         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
++            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) :
++                    (cell_pos ? slope*kq_derived_mask_value(cell_pos, tok_lo, tok_hi, ic, iq1) : 0.0f);
+             if (mv == -INFINITY) {
+                 continue;
+             }
+@@ -8860,6 +8880,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+     const ggml_tensor * mask  = dst->src[3];
+     const ggml_tensor * sinks = dst->src[4];
+ 
++    const ggml_tensor * cell_pos = dst->src[5];
++    const ggml_tensor * tok_lo   = dst->src[6];
++    const ggml_tensor * tok_hi   = dst->src[7];
++
+     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+     GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+@@ -8997,12 +9021,14 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+             const int kv_tile = (int)std::min((int64_t)KV_TILE_SZ, nek1 - ic);
+ 
+             // skip the tile entirely if all the masks are -inf
+-            if (mask) {
++            if (mask || cell_pos) {
+                 bool can_skip = true;
+                 for (int tq = 0; tq < tile_rows; tq++) {
+-                    const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
++                    const ggml_fp16_t * mp_row = mask ? (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+                     for (int tk = 0; tk < kv_tile; tk++) {
+-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
++                        mask32[tq * KV_TILE_SZ + tk] = mp_row
++                            ? slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk])
++                            : slope * kq_derived_mask_value(cell_pos, tok_lo, tok_hi, ic + tk, iq1 + tq);
+                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
+                             can_skip = false;
+                         }
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 1474b23fa..5f6d2fb85 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5578,6 +5578,34 @@ void ggml_flash_attn_ext_set_n_kv_max(
+     ggml_set_op_params_i32(a, 4, n_kv_max);
+ }
+ 
++// V3: kq mask derived from compact per-cell/per-token state (see ggml.h)
++void ggml_flash_attn_ext_add_kq_derived(
++        struct ggml_tensor * a,
++        struct ggml_tensor * cell_pos,
++        struct ggml_tensor * tok_lo,
++        struct ggml_tensor * tok_hi) {
++    if (!cell_pos) {
++        a->src[5] = NULL;
++        a->src[6] = NULL;
++        a->src[7] = NULL;
++        return;
++    }
++
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    GGML_ASSERT(a->src[5] == NULL);
++    GGML_ASSERT(tok_lo != NULL && tok_hi != NULL);
++    GGML_ASSERT(cell_pos->type == GGML_TYPE_I32 && tok_lo->type == GGML_TYPE_I32 && tok_hi->type == GGML_TYPE_I32);
++    GGML_ASSERT(ggml_is_contiguous(cell_pos) && ggml_is_contiguous(tok_lo) && ggml_is_contiguous(tok_hi));
++    // cell_pos indexes the K rows (the cache cells), tok_lo/tok_hi the mask rows (the query tokens)
++    GGML_ASSERT(cell_pos->ne[0] == a->src[1]->ne[1]);
++    GGML_ASSERT(tok_lo->ne[0]   == a->src[0]->ne[1]);
++    GGML_ASSERT(tok_hi->ne[0]   == a->src[0]->ne[1]);
++
++    a->src[5] = cell_pos;
++    a->src[6] = tok_lo;
++    a->src[7] = tok_hi;
++}
++
+ void ggml_flash_attn_ext_add_sinks(
+         struct ggml_tensor * a,
+         struct ggml_tensor * sinks) {
