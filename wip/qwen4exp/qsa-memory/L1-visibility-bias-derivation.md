@@ -139,9 +139,18 @@ derivation replaces only the prefill graph's `add(score, bias)` + the blk_bias t
 
 ## 7. Session state / where to pick up (2026-09-10 end of session)
 
-Tree: `~/llama.cpp` = rdna-boosts `e2380eb67` **plus the L2 patch applied in the working tree**
-(`../patches/0001-L2a-L2m-qsa-score-memory.patch`, uncommitted on purpose — `make-patches.sh`
-treats the fork's tip as canonical, so do not commit experiments on the branch). Rebuild with
+**STEP 1 IS IMPLEMENTED — see `L1-step1-derived-block-bias-findings.md`** (results, the measured
+4050.60 MiB at ub2048, the env gate `GGML_QSA_DERIVED_BIAS`, the corrected step-2 design, and an
+**open MTP-acceptance question that must be resolved before packaging**). The notes below are the
+original pre-implementation plan; §2-§4 of the design need the two corrections listed in the
+findings' §4 (`!is_pos_2d()` cannot be used as a gate, and step 2's visibility must carry the
+per-token `seq_has` test plus the 2-D tie rule).
+
+Tree: `~/llama.cpp` = rdna-boosts `e2380eb67` **plus the L2 patch and the step-1 patch applied in
+the working tree** (`../patches/0001-...L2a-L2m...` and `../patches/0002-derived-qsa-block-bias.patch`,
+uncommitted on purpose — `make-patches.sh` treats the fork's tip as canonical). To rebuild the L1
+patch after edits: scratch worktree at HEAD, `git apply` the L2 patch, commit, copy the 8 touched
+files over it, `git diff`. Rebuild with
 `cmake --build build-rocm --target llama-cli llama-bench -j 16` after
 `export PATH=/opt/rocm-7.14-gfx1201/bin:$PATH`.
 

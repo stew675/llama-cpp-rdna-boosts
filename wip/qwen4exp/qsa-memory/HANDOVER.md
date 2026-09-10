@@ -15,6 +15,10 @@ Status: **WIP — nothing here is part of the delivery.** `wip/` items must not 
 > landing ub2048 at ~3250 MiB — below ub1024's memory at ub2048's speed. The design for that
 > lever, its exact predicates, gating, work items and the ordered implementation steps are in
 > **`L1-visibility-bias-derivation.md`** (its §7 has the session state and where to pick up).
+> Step 1 (the per-block bias, −400 MiB/GPU) is implemented and measured at 4050.60 MiB/GPU at
+> ub 2048 with byte-identical plain coherence — see **`L1-step1-derived-block-bias-findings.md`**,
+> which also carries the open MTP-acceptance question (0.646 → 0.616, identical text) that must
+> be resolved before this is packaged, and the corrected step-2 (mask) design.
 
 ---
 
