@@ -1,8 +1,9 @@
-# L1 step 1 — derived per-block bias: results + an open MTP numerics question
+# L1 step 1 — derived per-block bias: results + the MTP-acceptance question
 
 Status: **implemented & measured (2026-09-10).** Patch:
-`patches/0002-derived-qsa-block-bias.patch` (271+/44−, 8 files, applies cleanly on the L2 base).
-Env gate: `GGML_QSA_DERIVED_BIAS=0` restores the uploaded tensor (A/B + validation).
+`patches/0002-derived-qsa-block-bias.patch` (314+/44−, 8 files, applies cleanly on the L2 base).
+Env gate: `GGML_QSA_DERIVED_BIAS` = 0 (uploaded tensor) | 1 (derived, default) | 2, 3 (diagnostics).
+The diagnostics are scaffolding for §3 and must be stripped if/when this is packaged.
 
 ## 1. What it does
 
@@ -64,94 +65,97 @@ tensor formula — including the `seq_has` term — for **every (block, token) p
 batch at n_tokens ≤ 4096: 2180 calls, **0 mismatches**. The compact state is exactly the tensor's
 content.
 
-## 3. OPEN: the MTP acceptance drifts (generated text still identical)
+## 3. The MTP-acceptance drift — RESOLVED as a buffer-layout effect, not arithmetic
 
-The one thing that does *not* reproduce is the adaptive-MTP probe
-(`benchmarks/mtp-adaptive-methodology.md` Protocol A / the `draft-mtp` path). Same commands
-(3k prompt, `-n 96 --seed 42 --temp 0 -c 32768 -b/-ub 2048`, draft
-`mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf`, `--spec-type draft-mtp`, `--verbosity 4`):
+The adaptive-MTP probe (`benchmarks/mtp-adaptive-methodology.md` Protocol A; `tools/mtp-ab.sh`)
+does not reproduce: acceptance 0.64583 (62/96) → 0.61616 (61/99) on the derived path, with
+**byte-identical generated text** in every configuration. Four configurations of the *same binary*
+isolate it:
 
-| build | draft acceptance | accepted/generated | acc per pos | #draft calls |
+| `GGML_QSA_DERIVED_BIAS` | bias tensor in graph | derived in kernel | acceptance | acc/pos |
 |---|---|---|---|---|
-| pristine | 0.64583 | 62 / 96 | (0.844, 0.625, 0.469) | 32 |
-| L2 only | 0.64583 | 62 / 96 | (0.844, 0.625, 0.469) | 32 |
-| L2 + derived (full) | **0.61616** | 61 / 99 | (0.818, 0.606, 0.424) | 33 |
-| L2 + derived, prefill only (`MAX=16`) | **0.61616** | 61 / 99 | (0.818, 0.606, 0.424) | 33 |
-| L2 + derived, verify only (`MIN=17`) | 0.64583 | 62 / 96 | (0.844, 0.625, 0.469) | 32 |
+| 0 | 400 MiB, real values | no | 62/96, **0.64583** | (0.844, 0.625, 0.469) |
+| 1 (default) | absent | yes | 61/99, **0.61616** | (0.818, 0.606, 0.424) |
+| 2 | 400 MiB, **all zeros** | yes | 62/96, **0.64583** | (0.844, 0.625, 0.469) |
+| 3 | 1 broadcast element, zero | yes | 61/99, **0.61616** | (0.818, 0.606, 0.424) |
 
-**The generated text is byte-identical in every case** (both runs emit the same 96 target tokens,
-stop at the same `n_tokens = 2269`, and produce the same 2174-token prompt eval). Only the
-*draft/acceptance* pattern moves. The derived path is MTP-clean for the verify geometry and drifts
-only for the prefill geometry. L2 itself is MTP-clean, so this is **specific to this change**, not
-a systemic property of QSA graph restructuring.
+Read off that table:
 
-Ruled out so far:
+- **The derived arithmetic is exactly neutral.** Mode 2 runs the *derived* top-k (identical kernel,
+  identical `blk_idx`/`blk_tail`) and reproduces the tensor path bit-for-bit in the metric that is
+  sensitive to ulps — while the only difference is that the graph also carries a *zero* bias
+  tensor. Zeros cannot change an add, so the derived path's values are not the cause. This matches
+  the arithmetic argument (same two IEEE adds, same order) and the 0/2180 host-side state check.
+- **The `add` node and the node count are irrelevant.** Mode 3 keeps the node (the add is in-place,
+  so it costs nothing: mode 3's reserve equals mode 1's 4050.60 MiB) and still drifts.
+- **What moves the result is the presence of the 400 MiB host input**, i.e. a *buffer layout* /
+  *buffer size* change, with no semantic content at all: mode 2 vs mode 3 differ only in the size
+  of a tensor that holds zeros. The effect is deterministic (2 configurations with the tensor →
+  62/96 twice; 2 without → 61/99 twice) and reproducible, so it is not a free-running race.
 
-- **Not the bias values.** The state check above (0/2180), plus the arithmetic identity of the two
-  adds. The plain paths are text-identical across three different geometries.
-- **Not CUDA graph capture.** `GGML_CUDA_DISABLE_GRAPHS=1` gives the same drift (0.61616 vs
-  0.64583) on both sides.
-- **Not a different context sizing.** Both contexts keep `n_ctx = 32768` in both runs; the 192 MiB
-  extra free memory is just this change's own savings (2 contexts × 64 MiB compute + 64 MiB host).
-- **Not the meta-backend graph split count.** `sched_reserve: graph splits = 2` in both.
+Interpretation: the graph's numerical result depends on *unrelated allocation sizes* somewhere in
+the multi-GPU path — a pre-existing property of the engine (the L2 patch is MTP-clean, so it is not
+"any layout change"; the 400 MiB host input with its per-device mirrored copy is a specific
+trigger). Candidates, in order of plausibility: a copy/AR/kernel path that branches on pointer
+alignment (a different vector width changes the summation order → ulp), or an allocator
+liveness/aliasing defect (this allocator demonstrably has one: the `cpy`-into-view `n_views`
+underflow found while doing L2). **Not diagnosed further; it is the same class of question as the
+`archive/work/` AR work and is not a blocker for the memory campaign** — the derived path is
+arithmetically exact, output text is identical in all modes, and 0.61616 is far above the repo's
+MTP gate (≥ ~0.45 with MTP still faster than plain decode).
 
-Working hypothesis (unproven): the ulp is *not* in the indexer values but in how the surrounding
-multi-GPU graph is cut. Removing one `ggml_add` node (and swapping a 400 MiB host input for two
-tiny ones) changes the tensor/node order and the buffer layout, and the meta-backend splitter /
-AllReduce grouping for the indexer's `mul_mat` (reduction over `idx_dim`) is shape- and
-structure-sensitive; a different grouping rounds differently. That is argmax-invisible (identical
-text) but the MTP head's argmax over near-ties is sensitive, so one draft token flips and the
-acceptance pattern moves.
-
-### The next experiment (cheap, decisive)
-
-Discriminate "layout/structure ⇒ ulp" from "values" by restoring the old *layout* with the derived
-*values*: in the derived path, additionally create the `bias` tensor at its original shape and
-consume it as `score = ggml_add(score, inp->bias)` with `set_input_qsa` filling it with **zeros**
-(adding `+0.0f` first is value-preserving for the three bias constants `-inf`, `0.0f`, `1e9f`
-and for the mask values, since none of them is `-0.0f`), while the top-k still derives the real
-bias from `blk_idx`/`blk_tail`. If the MTP numbers return to 62/96 the cause is the graph
-structure/buffer layout (and the follow-up is the peak-ledger/`ggml-alloc` liveness audit, since a
-host-buffer aliasing bug would look exactly like this: host-side state correct, device-side
-different). If they stay at 61/99, the cause is in the values after all, and the next step is a
-device-side dump of `blk_idx`/`blk_tail` inside `ggml_cuda_indexer_top_k` compared against the
-host-computed expectation.
-
-Until then the honest classification is: **memory win real, plain coherence byte-identical,
-MTP acceptance 0.646 → 0.616 with identical output text** — which passes the documented gate
-(acceptance ≫ 0.45, MTP still accelerates) but is an *unexplained* numerics change and must not be
-packaged into the delivery before it is understood.
+If it is ever chased, the cheapest next probes are: (a) the same four-mode table with
+`GGML_CUDA_ALLREDUCE=nccl` and with the meta butterfly (does the trigger follow the AR backend?),
+(b) the same table on a pristine tree *without* L2 (does the L2 concat participate?), (c) the
+instrumented `ggml-alloc` peak ledger at the prefill ubatch with mode 1 vs mode 2 (look for two
+live tensors sharing a host-buffer range, and for any tensor whose offset differs between the
+modes beyond the bias slot itself).
 
 ## 4. Consequences for step 2 (the mask / derived visibility)
 
-The design in `L1-visibility-bias-derivation.md` §2–§3 needs two corrections found here:
+The design in `L1-visibility-bias-derivation.md` §2–§4 needs three corrections found here:
 
-1. `!is_pos_2d()` **cannot** be used as a gate (always true for IMROPE). The visibility must be
-   derived in a way that is exact for both plain text and mrope images.
+1. `!is_pos_2d()` **cannot** be used as a gate (always true for IMROPE). Nothing may be gated on it.
 2. The mask's predicate is `!empty && seq_has(cell, token_seq) && !(pos_c > pos_q) &&
    !(pos_c == pos_q && ext_c.is_2d_gt(qx, qy))` (llama-kv-cache.cpp `set_input_kq_mask_impl`). The
-   per-*token* `seq_has` cannot be dropped here (it is exactly what step 1 relied on the mask for),
-   and the 2-D tie rule needs the ext values.
+   per-token `seq_has` cannot be dropped here (it is exactly what step 1 relied on the mask for),
+   and the 2-D tie rule must be reproduced.
+3. Because of §3, step 2 must not be judged by the MTP probe alone.
 
-The workable compact form is the memory layer's **rank in the mask's own total order** (pos, then
-ext.y, then ext.x — the existing validated comparator) plus a sequence bitmask:
+Simpler exact encoding than that doc, and the one to implement — **two I32 arrays, one comparison
+pair, no bitmask ops**:
 
-- `cell_rank [n_kv, n_stream]` I32: rank in that order, `-1` for an empty cell.
-- `q_rank [n_tps, n_stream]` I32: the query's rank (the existing ranked branch already computes it
-  by binary search; the sort must then run on every ubatch — the removed mask build is
-  O(n_kv × n_tps) host work, so an O(n_kv log n_kv) sort is a large net win).
-- `cell_seq [n_kv, n_stream]` I32 (`seq_get_all` bitmask) and `tok_seq [n_tps, n_stream]` I32.
-- visibility = `rank >= 0 && rank <= q_rank && (cell_seq & (1u << tok_seq)) != 0`.
+- `cell_key [n_kv, n_stream]` I32: for each cell `c` of the stream's cell array, `-1` unless the
+  cell is non-empty *and* `seq_has(c, seq_of_stream)`; otherwise its **rank among the stream's own
+  qualifying cells** in the existing (pos, ext.y, ext.x) order.
+- `q_rank [n_tps, n_stream]` I32: the query's rank in that same filtered sequence (the number of
+  qualifying cells ordered before it — the existing `ranked` branch already locates it by binary
+  search, just on the filtered list).
+- visibility `vis = (cell_key >= 0) && (cell_key <= q_rank)`; values `0.0f` / `-INFINITY`, and the
+  top-k must keep the exact add order `(score + bias) + vis + additive`.
 
-That is 4 compact srcs; with step 1's blk_idx/blk_tail, score and cell_blk the op reaches 8 srcs
-(GGML_MAX_SRC = 10). The FA side keeps the cheap trick from the design: pass a **compact mask**
-`[width, n_tps, 1, n_stream]` (built by a new op from `top_k` + those arrays) so that both
-`M_smem` staging sites in `fattn-qsa.cu` collapse to `maskh[tile0 + flat]` (the `idx` indirection
-disappears). Expected: 4050.60 → ~3250 MiB/GPU, i.e. ub2048 speed below ub1024 memory.
+Why this is enough: filtering by sequence and re-ranking *within* the query's sequence makes the
+single `<=` comparison correct for every case — a foreign-sequence cell is `-1` (excluded by
+`>= 0`), a same-sequence cell of another subsequence that interleaves in cell order is impossible
+by construction, and a future cell has a rank above `q_rank`. `-1` needs the `>= 0` test, so it is
+two comparisons and an AND; both are per-(cell,token) in the top-k kernel (cheap, no tensor), and
+the FA's compact mask is built from the same two arrays.
 
-Given §3, step 2 must be validated with **both** the plain same-seed A/B *and* the MTP probe, and
-the step-2 work should start by resolving (or at least bounding) the §3 question, because a
-400 MiB state change and an 800 MiB state change will be far harder to reason about together.
+Consumers, both of which must switch together (neither alone saves anything):
+
+- **top-k**: two more optional srcs (`cell_key`, `q_rank`) — srcs become score, cell_blk, additive,
+  blk_idx, blk_tail, cell_key, q_rank = 7 ≤ GGML_MAX_SRC (10).
+- **FA**: `fattn-qsa.cu` reads the mask at *selected* cells only, so pass a **compact mask**
+  `[width, n_tps, 1, n_stream]` F16 (~8 MiB instead of 800 MiB) for which row index == slot, and
+  both `M_smem` staging sites collapse to `maskh[tile0 + flat]` (the `idx` indirection disappears).
+  Building that tensor needs a gather of `cell_key` by `top_k` plus the compare — either a small new
+  op `ggml_indexer_mask(top_k, cell_key, q_rank)` (~120 lines: ggml.c + CUDA kernel + CPU ref) or a
+  chain of existing ops (`ggml_get_rows` on a `[1, n_kv]` view of `cell_key`, then a compare/shift
+  that maps `{true,false} → {0.0f,-INFINITY}`); the chain avoids new kernel code and its
+  intermediates are small (`width × n_tps × n_stream` I32 ≈ 16 MiB), so try it first.
+
+Expected: 4050.60 → ~3250 MiB/GPU at ub 2048, i.e. ub2048 speed below ub1024's memory (the
+campaign's BEST outcome; ub1024 would land near 2100).
 
 ## 5. Files touched by the patch
 
@@ -162,5 +166,15 @@ the step-2 work should start by resolving (or at least bounding) the §3 questio
 | `ggml/src/ggml-cpu/ops.cpp` | CPU reference handles the derived bias + a `nullptr` additive |
 | `ggml/src/ggml-backend-meta.cpp` | INDEXER_TOPK: assert *every* non-null src is mirrored (was hard-coded 0..2) |
 | `ggml/src/ggml-cuda/indexer-topk.cu` | `indexer_topk_extra` threaded through the 3 kernels + launcher; host reads srcs 3–6; support check |
-| `src/llama-memory-hybrid-idx.{h,cpp}` | `set_input_qsa` takes `blk_idx`/`blk_tail`; fills them instead of the tensor when asked |
-| `src/models/qwen4exp.cpp` | `qwen4exp_derived_bias_enabled()` gate, compact inputs, `ggml_add` dropped on that path, top-k call |
+| `src/llama-memory-hybrid-idx.{h,cpp}` | `set_input_qsa` takes `blk_idx`/`blk_tail`; fills them instead of the tensor when asked (and zero-fills the tensor in the diagnostic modes) |
+| `src/models/qwen4exp.cpp` | `qwen4exp_derived_bias_mode()` gate, compact inputs, `ggml_add` dropped on that path, top-k call |
+
+## 6. State at the end of this session
+
+- `~/llama.cpp` working tree = rdna-boosts `e2380eb67` + the L2 patch + this patch (uncommitted by
+  design; `make-patches.sh` treats the fork tip as canonical). Rebuild:
+  `export PATH=/opt/rocm-7.14-gfx1201/bin:$PATH && cmake --build build-rocm --target llama-cli llama-bench -j 16`.
+- Binaries: `/tmp/bin-l1d` (this patch, all four modes), `/tmp/bin-l1` (the earlier build with the
+  same derived path + removed instrumentation), `/tmp/bin-l2`, `/tmp/bin-pristine`.
+- The step-1 lever is *landed in the WIP tree* with a documented, arithmetically-exact basis; the
+  remaining campaign milestone is step 2 above (mask, −800 MiB).

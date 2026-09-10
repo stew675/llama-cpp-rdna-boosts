@@ -7,49 +7,51 @@ Status: **WIP — nothing here is part of the delivery.** `wip/` items must not 
 
 > ## NEXT SESSION — do these first, in order
 >
-> **1. Resolve the open MTP question before doing anything else.** L1 step 1 (derived per-block
-> bias) is implemented, committed here as `patches/0002-derived-qsa-block-bias.patch`, and gives
-> **4050.60 MiB/GPU at ub 2048** (from 4450.40) with byte-identical plain coherence — but the
-> adaptive-MTP probe drifts (acceptance 0.64583 → 0.61616, output text still byte-identical) and
-> it is **not understood**. It is specific to the *prefill* geometry (derive for n_tokens ≤ 16 and
-> it is clean: 62/96). Run the discriminating experiment written up in
-> **`L1-step1-derived-block-bias-findings.md` §3 "The next experiment"**: keep the original
-> `[n_blocks, n_tps]` F32 bias tensor allocated *and consumed* (`ggml_add(score, bias)` with the
-> tensor filled with **zeros** — adding `+0.0f` first is value-preserving for the three bias
-> constants and the mask values) while the top-k still derives the real bias from
-> `blk_idx`/`blk_tail`. Acceptance back to 62/96 ⇒ the cause is graph structure / buffer layout
-> (next: audit for host-buffer aliasing/liveness with `tools/peak-ledger.py` and
-> `/tmp/ggml-alloc.instrumented.c` — this allocator already has a known `n_views` underflow for
-> `cpy`-into-a-view). Still 61/99 ⇒ the cause is in the values (next: dump `blk_idx`/`blk_tail`
-> **on device** inside `ggml_cuda_indexer_top_k` and compare against the host expectation).
-> Do not package step 1 until this is closed.
+> **1. The MTP question from the previous session is RESOLVED — read §3 of
+> `L1-step1-derived-block-bias-findings.md` before touching it again.** A four-mode experiment on
+> the same binary proved the derived path's arithmetic is *exactly* neutral (derived in-kernel +
+> a **zero-filled** 400 MiB bias tensor kept in the graph = the tensor path's 62/96, while the
+> derived path with no bias tensor = 61/99). The `add` node and the node count are irrelevant
+> (a 1-element broadcast zero keeps the node, costs nothing, and still gives 61/99). What moves the
+> result is the *presence of the 400 MiB host input* — i.e. an unrelated buffer-layout/size change
+> with no semantic content, deterministically. So: arithmetically exact, output text identical,
+> acceptance 0.616 ≫ the repo's ≥ 0.45 MTP gate; the remaining question is an engine-level
+> layout-sensitivity (pre-existing, not introduced by this patch) with candidate causes and three
+> cheap next probes listed in §3. Do **not** re-litigate step 1; treat the engine question as a
+> separate hunt.
 >
-> **2. Then step 2 — the derived visibility / mask (−800 MiB, target ~3250 MiB at ub 2048).** Use
-> the *corrected* design in the findings' §4, not the original §2–§4 of
-> `L1-visibility-bias-derivation.md`: `!is_pos_2d()` cannot gate anything (IMROPE models always
-> report `n_pos = 4`), and the visibility must carry the per-token `seq_has` test and the 2-D tie
-> rule. Workable form: the memory layer's rank in the mask's own total order (pos, ext.y, ext.x)
-> plus a sequence bitmask, with a compact `[width, n_tps]` mask feeding both the top-k and the FA
-> (which makes both `M_smem` staging sites in `fattn-qsa.cu` index-free).
+> **2. The campaign's remaining milestone is step 2 — the derived visibility / compact mask
+> (−800 MiB, target ~3250 MiB at ub 2048 = ub2048 speed below ub1024 memory).** Use the corrected
+> encoding in §4 of the findings (two I32 arrays `cell_key`/`q_rank`, `vis = (cell_key >= 0) &&
+> (cell_key <= q_rank)`), *not* the original §2–§4 of `L1-visibility-bias-derivation.md`:
+> `!is_pos_2d()` cannot gate anything (IMROPE always reports `n_pos = 4`), the per-token `seq_has`
+> test must be kept, and the 2-D tie rule is handled by ranking in the mask's own (pos, ext.y,
+> ext.x) order. Both consumers — the top-k (2 extra optional srcs) and the FA (a compact
+> `[width, n_tps, 1, n_stream]` mask, ~8 MiB) — must switch together; neither alone saves anything.
+> Try a chain of existing ops (`ggml_get_rows` + compare) for the compact mask before writing a new
+> `ggml_indexer_mask` op.
 >
-> **3. Build/patch workflow.** `~/llama.cpp` already carries the L2 patch *and* step 1 in the
-> working tree (deliberately uncommitted — `make-patches.sh` treats the fork tip as canonical;
-> never commit these on the branch). To regenerate patch 0002 after edits: scratch
+> **3. Build/patch workflow.** `~/llama.cpp` already carries the L2 patch *and* step 1 (with the
+> `GGML_QSA_DERIVED_BIAS` = 0/1/2/3 diagnostic modes; strip modes 2/3 before packaging) in the
+> working tree — deliberately uncommitted, because `make-patches.sh` treats the fork tip as
+> canonical; never commit these on the branch. To regenerate patch 0002 after edits: scratch
 > `git worktree add --detach /tmp/base HEAD` → `git apply` patch 0001 → commit → copy the 8 touched
-> files over it → `git diff`. Rebuild: `export PATH=/opt/rocm-7.14-gfx1201/bin:$PATH` then
+> files over it → `git diff` (and `git worktree remove --force` + `git worktree prune` after).
+> Rebuild: `export PATH=/opt/rocm-7.14-gfx1201/bin:$PATH` then
 > `cmake --build build-rocm --target llama-cli llama-bench -j 16`; binaries land in
 > `build-rocm/bin/` (copy that directory to `/tmp/bin-<tag>` for the tools).
 >
 > **4. Validation bar for every change:** the plain same-seed A/B (`tools/ab-coherence.sh`) **and**
-> the MTP probe (`tools/mtp-ab.sh` — the sensitive one: it sees ulp-level drift that argmax text
-> hides; two identical builds must print identical acceptance). Buffer sizes come from
-> `tools/bufsize.sh` (`llama-cli -v | grep 'compute buffer size'`), never from llama-bench.
+> the MTP probe (`tools/mtp-ab.sh`). Buffer sizes come from `tools/bufsize.sh`
+> (`llama-cli -v | grep 'compute buffer size'`), never from llama-bench. For step 2 also verify the
+> compact mask directly against the gathered `kq_mask` values (a temporary host-side check like the
+> 0/2180 bias-state check in §2 is the cheapest form).
 >
-> **5. Volatile artifacts (present now, rebuildable otherwise):** `/tmp/bin-{pristine,l2,l1,keysonly,l0base}`,
+> **5. Volatile artifacts (present now, rebuildable otherwise):** `/tmp/bin-{pristine,l2,l1,l1d,keysonly,l0base}`,
 > `/tmp/prompt40k.txt` (40k words), `/tmp/prompt3k.txt` (2045 words), `/tmp/ppl6k.txt`,
-> `/tmp/small-prompt.txt`, `/tmp/ggml-alloc.instrumented.c` (+ `.orig`) for the peak ledger.
-> Patch 0002's exact generated content lives in its file; re-verify it applies on the L2 base
-> before trusting the working tree.
+> `/tmp/small-prompt.txt`, `/tmp/diag-mode{0,1,2,3}.log` (the four-mode MTP evidence),
+> `/tmp/ggml-alloc.instrumented.c` (+ `.orig`) for the peak ledger. Patch 0002's exact generated
+> content lives in its file; re-verify it applies on the L2 base before trusting the working tree.
 
 > **2026-09-10 update (later session): the L2 lever is implemented and validated.** See
 > **`L2-score-chain-findings.md`** — QSA score-chain memory: 6690.40 → **4450.40 MiB/GPU** at
