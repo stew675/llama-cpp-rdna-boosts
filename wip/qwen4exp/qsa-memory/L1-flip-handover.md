@@ -61,13 +61,13 @@ export PATH=/opt/rocm-7.14-gfx1201/bin:$PATH
 cmake --build build-rocm --target llama-cli llama-bench -j 16
 rm -rf /tmp/bin-l1g && cp -r build-rocm/bin /tmp/bin-l1g
 export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib HIP_VISIBLE_DEVICES=0,1,2 GGML_CUDA_FA_WMMA_256=0
-M=/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4-XS-00001-of-00003.gguf
+M=/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
 GGML_QSA_DERIVED_VIS=1 /tmp/bin-l1g/llama-cli -m $M -f /tmp/prompt3k.txt -n 24 --seed 42 --temp 0 \
   --single-turn --no-display-prompt -c 204800 -b 2048 -ub 2048 -ctk q8_0 -ctv q8_0 -fa auto \
   -ngl 99 -sm tensor -mg 0
 ```
-(The real model path is `/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf`
-— double-check the exact name with `ls /models/Qwen3.8/Flash-Next/IQ4_XS/`.)
+(That directory also holds the MTP draft `mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf` used by
+`tools/mtp-ab.sh`, and an `mmproj-BF16.gguf` the QSA tests never load.)
 
 The reserve line prints **3251.39 MiB** first, so the failure is at *compute* time, not allocation:
 `GGML_ASSERT(buffer) failed` inside `ggml_backend_buffer_get_usage` (the assert is the first
