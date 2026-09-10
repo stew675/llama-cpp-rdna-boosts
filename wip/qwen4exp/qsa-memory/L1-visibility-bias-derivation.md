@@ -136,3 +136,40 @@ derivation replaces only the prefill graph's `add(score, bias)` + the blk_bias t
   values are.
 - Expected gain: 800 MiB (mask) + 400 MiB (bias) → **~3250 MiB/GPU at ub 2048**, plus the
   per-ubatch host build/upload removal (a depth-scaling prefill win).
+
+## 7. Session state / where to pick up (2026-09-10 end of session)
+
+Tree: `~/llama.cpp` = rdna-boosts `e2380eb67` **plus the L2 patch applied in the working tree**
+(`../patches/0001-L2a-L2m-qsa-score-memory.patch`, uncommitted on purpose — `make-patches.sh`
+treats the fork's tip as canonical, so do not commit experiments on the branch). Rebuild with
+`cmake --build build-rocm --target llama-cli llama-bench -j 16` after
+`export PATH=/opt/rocm-7.14-gfx1201/bin:$PATH`.
+
+Builds (volatile, `/tmp`): `bin-pristine` (no patch), `bin-l2a`, `bin-l2` (= l2a+l2m),
+`bin-l0base` (pristine + `GGML_ALLOCATOR_DEBUG`). Re-measure any of them with
+`tools/bufsize.sh`, `tools/ub-sweep.sh`, `tools/ab-coherence.sh`, `tools/peak-ledger.py` (the
+last one needs the instrumented build; the instrumentation patch is described in
+`L2-score-chain-findings.md` §1 — `ggml-alloc.c` `GGML_ALLOCATOR_DEBUG` + `AT_PRINTF`, array bumped,
+O(N²) sort dropped, and a >1 GiB record filter).
+
+Suggested order for the implementation (smallest self-contained piece first, each verified before
+the next):
+
+1. **Bias only** (−400 MiB, no new op, no FA change): add optional srcs `blk_idx`
+   `[n_blocks, n_stream]` I32 and `blk_tail` `[n_tps, n_stream]` I32 to `ggml_indexer_top_k`; in
+   `indexer_topk_value` add `if (blk_idx) sc += bias(b, t, s)`. Build both arrays in
+   `set_input_qsa` (it already computes `n_bid`, `bid_idx`, `have_dead`/`dead_bid` and `seq_has`;
+   encode invalid → `-1`, tail/dead → `INT32_MAX`, and `blk_tail[t] = ((q+1)/r)*r`), add the fields
+   to `llm_graph_input_qsa`, and drop the graph's `ggml_add(score, inp->bias)` on that path.
+   Expected 4450 → ~4050 MiB. Verify with the 40k same-seed A/B (must be byte-identical) plus a
+   direct comparison of the derived `bias_val` against the uploaded `dst_bias` values for a few
+   tokens/blocks (dump both for one layer at a probe depth).
+2. **Mask** (−800 MiB): the `ggml_indexer_mask` op, the two `fattn-qsa.cu` staging lines →
+   `maskh[tile0 + flat]`, the top-k's in-kernel `vis_val` from `cell_pos`/`q_pos`, and the
+   `cell_pos` build in `set_input_qsa`. Same A/B plus a mask-equivalence dump
+   (`indexer_mask` output vs `kq_mask` gathered at the top-k slots).
+3. Re-measure the reserve (`tools/bufsize.sh`) and the ub sweep; update
+   `L2-score-chain-findings.md` §6 and this file with the achieved numbers.
+
+The next lever after that is the chunked top-k (removes the ~700 MiB concat peak and the 400 MiB
+final score; the radix-select tie order must be reproduced exactly — see `L2-...findings.md` §6).
