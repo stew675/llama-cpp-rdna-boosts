@@ -152,6 +152,17 @@ count. Consequence: 12 × 400 MiB `indexer_score-*` stayed live (reserve went *u
 `concat` produces a real tensor that frees normally (peak ~2× the final score while the chain
 assembles).
 
+**Re-tested 2026-09-10, after the upstream allocator leak was fixed.** With
+`patches/0001-ggml-alloc-release-unused-view-sources.patch` (see
+`../../arch-independent-memory/README.md` §3b) the leak itself is gone, so a `cpy`-into-view
+assembly is *legal* again - and a gated A/B (`GGML_QSA_SCORE_CPY=1`, one binary, qwen4exp, ctx 204800,
+ub 2048) shows it is still far worse: **compute reserve 7407.31 MiB vs 3251.39 MiB** for the concat
+chain. So the `ggml_concat` choice was not merely a workaround for the leak - it is the cheaper
+assembly for this graph (the chunk destinations and the copies they need cost far more than the two
+concat accumulators, 672 MB). The gate was removed again after measuring; the residual ~672 MB stays
+and its known removal route is the chunked top-k running merge, which would have to reproduce the
+radix-select tie order (hard).
+
 Worth noting as a general ggml-alloc hazard: **`cpy` into a view of a gallocr-allocated tensor is
 only safe when that tensor is externally owned** (which is why the KV-cache writes are fine).
 
