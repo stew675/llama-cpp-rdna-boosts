@@ -4,21 +4,26 @@ For beta testers with a machine that can build the Block-15 tree.  Purpose: conf
 memory wins on *your* models and hardware, and — if something looks wrong — isolate it to a single win
 without rebuilding five times.  Every win except W4 is switchable by environment variable.
 
-> **Status: template.**  The W1–W3 rows are final (those wins are validated).  The V3 rows are now
-> provisional until those land; a session that stages Block 15 must finalise the names/defaults here and
-> in `patches/README.md` **before** the beta window opens.
+> **Status: final for the gates that are already validated (W1–W4, V3, V4).**  V3 is **on by default**
+> (`LLAMA_KQ_MASK_DERIVED`), V4 is **opt-in** (`GGML_CUDA_FA_KV_NATIVE=1`, default off - a ~1.7 %
+> prefill cost for a large memory win).  A session that stages Block 15 only has to re-check these
+> rows against the merged build (and mirror them in `patches/README.md`) **before** the beta window
+> opens.
 
 ## 0. What Block 15 promises
 
-With everything **on**: the generated text (same seed, `--temp 0`) is **byte-identical** to the previous
-build, the buffers are smaller, and throughput does not drop.  Sizes at ctx 204800 / ub 2048 /
+With everything **on** (including the opt-in V4, i.e. `GGML_CUDA_FA_KV_NATIVE=1`): the generated text
+(same seed, `--temp 0`) is **byte-identical** to the previous build, the buffers are smaller, and
+throughput does not drop.  With the **defaults** (V4 off) the buffers are the "V3" column below.  Sizes at ctx 204800 / ub 2048 /
 `-ctk q8_0 -ctv q8_0`, per GPU:
 
 | model | before Block 15 | with Block 15 |
 |---|---|---|
 | Qwen3.8-Flash-Next IQ4_XS (qwen4exp) | 6690.40 MiB compute + 1262.70 host | **3251.39 + 63.69** (W1+W2) |
-| Qwen3.8-27B-Q8_0 (dense) | 1920.33 + 880.34 | ~1120 + ~80 (V3), ~290 (V3+V4) |
-| Qwen3.5-4B-Q8_0 (dense) | 1800.33 + 840.34 | ~1000 + ~40 (V3), ~170 (V3+V4) |
+| Qwen3.8-27B-Q8_0 (dense, Meta) | 1920.33 + 880.34 | **1121.13 + 81.13** (V3) / **489.13 + 81.13** (V3+V4) |
+| Qwen3.5-4B-Q8_0 (dense) | 1800.33 + 840.34 | **1001.13 + 41.13** (V3) / **257.13 + 41.13** (V3+V4) |
+| gemma-4-E4B-it-Q8_0 (ISWA) | 1887.35 + 935.37 | **1078.17 + 126.19** (V3) / **452.17 + 126.19** (V3+V4) |
+| gemma-4-31B-it-qat-Q4_K_XL (ISWA) | 2753.35 + 897.36 | **1942.18 + 86.18** (V3) / **718.18 + 86.18** (V3+V4) |
 
 ## 1. The gates
 
@@ -32,8 +37,8 @@ dense masked flash-attention path (the packed mask is then kept automatically).
 | `GGML_QSA_DERIVED_VIS` | `1` | W2 — the derived visibility (the packed `n_kv × n_tps` mask comes back) | **+800 MiB** compute **and +800 MiB host** |
 | `LLAMA_QSA_SPARSE_FA` | `1` | the fused sparse QSA flash-attn (dense masked fallback) | slower prefill; the mask is required and kept |
 | `LLAMA_QSA_KEYS_ONLY` | `1` | W3 — the keys-only QSA indexer cache (V buffer allocated again) | **+638 MiB** indexer KV |
+| `GGML_CUDA_FA_KV_NATIVE` | `0` (**opt-in**) | V4 — dequantize q8_0 K/V while staging the FA tiles, so the F16 staging scratch (~800 MiB/GPU at ctx 204800) and its per-ubatch conversion pass are gone.  Measured −744 MiB/GPU (4B), −632 MiB (27B), −1224 MiB (gemma-4-31B) at ctx 204800/ub 2048, more at ub 1024/512; coherence byte-identical, MTP acceptance unchanged.  Cost: **prefill −1.7 %, decode ±0.1 %** — that is why it is off by default.  Only q8_0 K/V; other types keep the old path | **−744 MiB** compute (4B), **−632 MiB** (27B) when set to `1`; nothing else changes |
 | `LLAMA_KQ_MASK_DERIVED` | `1` | V3 — the derived kq mask (dense + SWA prefill; the mask is not materialized).  Now ON: measured −799 MiB compute **and −799 MiB host** (4B/27B), −809/−811 on the gemmas; prefill −1.1 %, decode −0.7 %, MTP acceptance unchanged.  Auto-disables itself where it cannot apply (decode, small batches, non-MMA kernel, non-CUDA backend, alibi, M-RoPE 2-D, multi-sequence) — so a run that shows no change may simply not have qualified | **−800 MiB** compute **and −800 MiB host** when set to `0` |
-| *V4 gate (name TBD)* | `1`, or `0` if V4 regressed | V4 — native quantized K/V in the MMA FA path (the F16 staging scratch returns) | **+832 MiB** (q8_0 KV, exactly ctx-linear) |
 | **W4** | always on | — | it is a bug fix, not a policy.  To A/B it: `git apply ab/w4-revert.patch`, rebuild |
 
 ## 2. The three measurements per model

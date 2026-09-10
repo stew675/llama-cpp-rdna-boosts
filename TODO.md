@@ -33,16 +33,23 @@ Reality pass: 2026-09-10.
   gemma-4-31B, scaling as `n_kv x n_tps x 2 B` (ub 1024 −399, ub 512 −199); generated text
   **byte-identical** derived vs packed on the 4B/27B/gemma-4-E4B (3k and 40k prompts); 27B MTP
   acceptance **identical 0.76744**; qwen4exp unchanged (probe reports the derived path is unused
-  there).  Cost: prefill −1.1 % (pp20480/ub 2048, interleaved 5x), decode −0.7 %.  **V4 is the only
-  remaining campaign item.**
-- **Critical path: V4 only (V3 is DONE).**
-  V4 = native quantized K/V in the FA path (**-832 MiB/GPU**, exactly ctx-linear): dequantize into the
-  shared K/V tiles instead of staging an F16 copy of the whole cache.  Ships on-by-default only if
-  prefill throughput does not regress, else **opt-in default-off** for people who need the memory (D9).
-  **Both the MMA and the TILE loaders are in scope** — TILE (the verify-batch kernel) may be what the
-  reservation is actually sized for; the first measurement decides.  Full map:
-  `beta/block-15-campaign-wins/HANDOVER.md` §3.2.  Ladder + measurements:
-  `wip/arch-independent-memory/DERIVED-MASK-DESIGN.md`.
+  there).  Cost: prefill −1.1 % (pp20480/ub 2048, interleaved 5x), decode −0.7 %.
+- **V4 is DONE 2026-09-10 and is OPT-IN (default off).**
+  V4 = native q8_0 K/V in the FA path: dequantize while staging the shared K/V tiles (MMA **and** TILE),
+  so the whole-cache F16 staging scratch and its per-ubatch conversion pass are gone.  **Measured**
+  (ctx 204800 / ub 2048 / q8_0): compute **−744 MiB/GPU** on the 4B (1001.13 → 257.13), **−632 MiB**
+  (Meta) on the 27B (1121.13 → 489.13), **−1224 MiB** on gemma-4-31B, more at ub 1024/512 (4B −772/−786);
+  qwen4exp control unchanged; generated text byte-identical on 4B/27B/gemma-4-E4B/gemma-4-31B/qwen4exp
+  (incl. 40k prompts and the TILE ub-8 path); 27B MTP acceptance **identical 0.76744** (the ulp-sensitive
+  probe).  Cost: prefill **−1.7 %** (both models, interleaved 3x), decode ±0.1 %, TILE-path prefill
+  neutral.  Per the maintainer's rule of 2026-09-10 (a sub-2 % loss with a memory win and no cheap way to
+  close it) it ships **opt-in: `GGML_CUDA_FA_KV_NATIVE=1`**.  Record:
+  `wip/arch-independent-memory/V4-NATIVE-Q8-KV-PLAN.md`; patch
+  `wip/arch-independent-memory/patches/0006-v4-native-q8-kv.patch`.
+- **Critical path: Block 15 merge + cut (all six wins are DONE).**
+  Merge W1-W4 + V3 + V4, strip the V3 oracle, gate everything, re-validate the combination (defaults
+  first, then `GGML_CUDA_FA_KV_NATIVE=1`), cut the single 15th block and stage it in `beta/`.
+  `beta/block-15-campaign-wins/HANDOVER.md` §5 is the step list, §8 the next-session prompt.
 - **Block 15 waits for V3+V4** (maintainer 2026-09-10): exactly ONE block, no Block 16.  W1-W4 + V3 + V4 get
   merged, each gated with an env kill-switch, re-validated **as a combination** (individual validations do
   not carry over), then staged in `beta/` for a ~4-5 day beta window before promotion into `patches/0015-…`.
