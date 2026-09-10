@@ -21,15 +21,23 @@ Status: **WIP — nothing here is part of the delivery.** `wip/` items must not 
 > separate hunt.
 >
 > **2. The campaign's remaining milestone is step 2 — the derived visibility / compact mask
-> (−800 MiB, target ~3250 MiB at ub 2048 = ub2048 speed below ub1024 memory).** Use the corrected
-> encoding in §4 of the findings (two I32 arrays `cell_key`/`q_rank`, `vis = (cell_key >= 0) &&
-> (cell_key <= q_rank)`), *not* the original §2–§4 of `L1-visibility-bias-derivation.md`:
-> `!is_pos_2d()` cannot gate anything (IMROPE always reports `n_pos = 4`), the per-token `seq_has`
-> test must be kept, and the 2-D tie rule is handled by ranking in the mask's own (pos, ext.y,
-> ext.x) order. Both consumers — the top-k (2 extra optional srcs) and the FA (a compact
-> `[width, n_tps, 1, n_stream]` mask, ~8 MiB) — must switch together; neither alone saves anything.
-> Try a chain of existing ops (`ggml_get_rows` + compare) for the compact mask before writing a new
-> `ggml_indexer_mask` op.
+> (−800 MiB, target ~3250 MiB at ub 2048 = ub2048 speed below ub1024 memory).**
+> **PROGRESS (2026-09-10, later session): the state half is DONE and validated** — see §2b of
+> `L1-step1-derived-block-bias-findings.md`. `set_input_qsa` now fills `cell_vis [n_kv, n_stream]`
+> and `q_vis [n_tps, n_stream]` I32 (the cell's compaction key, −1 for empty/foreign; the query's
+> key), the top-k already consumes them via the optional srcs added in step 1, and generated text is
+> **byte-identical** with `GGML_QSA_DERIVED_VIS=1` vs `=0` on the 3k and 40k prompts (reserve
+> 4050.60 → 4051.39 MiB, +0.79 MiB for the two arrays). The mask is still allocated because the FA
+> reads it, so the remaining work is exactly the **FA switch** (no new op needed — `fattn-qsa.cu`
+> already has `idx[]`, the token and the stream, so both `M_smem` sites compute
+> `(cell_vis[g] >= 0 && cell_vis[g] <= q_vis_t) ? 0.0f : -INFINITY` inline), plus allowing
+> `kq_mask == nullptr` on the op so the 800 MiB tensor is pruned. §2b has the site list, the
+> plumbing (ggml.h/ggml.c ctor, launcher, cuh, CPU ref at ops.cpp ~9366/9373/9494, meta-backend
+> src asserts) and the expected numbers.
+>
+> The original design notes (superseded): use the corrected encoding, *not* §2–§4 of
+> `L1-visibility-bias-derivation.md` — `!is_pos_2d()` cannot gate anything (IMROPE always reports
+> `n_pos = 4`) and the per-token `seq_has` test must be kept (folded into the −1 key above).
 >
 > **3. Build/patch workflow.** `~/llama.cpp` already carries the L2 patch *and* step 1 (with the
 > `GGML_QSA_DERIVED_BIAS` = 0/1/2/3 diagnostic modes; strip modes 2/3 before packaging) in the

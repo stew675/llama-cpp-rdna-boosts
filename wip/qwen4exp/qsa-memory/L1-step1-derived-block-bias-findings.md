@@ -65,6 +65,46 @@ tensor formula — including the `seq_has` term — for **every (block, token) p
 batch at n_tokens ≤ 4096: 2180 calls, **0 mismatches**. The compact state is exactly the tensor's
 content.
 
+## 2b. Step 2 (derived visibility) — state landed and validated (this session)
+
+The mask predicate has the same shape as the per-cell bias the memory layer **already** computes, so
+step 2 needed **no new op and no compact-mask tensor**. `set_input_qsa` now also fills
+
+- `cell_vis [n_kv, n_stream]` I32 — a cell's compaction key: the cell's position, or its rank in
+the mrope order when `ranked`, and `-1` when the cell is empty or belongs to another sequence;
+- `q_vis [n_tps, n_stream]` I32 — the query token's key (`q`, the same value the per-cell bias
+  already compares against).
+
+Visibility is `0 <= cell_vis[cell] <= q_vis[token]` — the predicate `set_input_kq_mask_impl`
+materializes (`!empty && seq_has && !future`, with the mrope 2-D order handled by ranking), which is
+why the values are identical by construction. The top-k already accepted these as optional srcs 3/4
+from step 1 (`extra.cell_pos`/`extra.q_pos`), so the graph now passes them and the kernel derives
+the visibility. Gate: `GGML_QSA_DERIVED_VIS=0` keeps the mask as the additive (A/B).
+
+**Validated**: generated text byte-identical with `GGML_QSA_DERIVED_VIS=1` vs `=0` on the 3k prompt
+and the 40k prompt (seed 42, temp 0, ctx 204800, ub 2048) — i.e. identical top-k selections.
+Reserve: 4050.60 → **4051.39 MiB/GPU** (+0.79 MiB = the two arrays, 800 KB + 8 KB), host 863.69.
+The mask is *still* allocated because the FA reads it, so this step alone saves nothing (as the L2
+findings predicted) — it is the prerequisite for the −800 MiB.
+
+**Remaining work for the −800 MiB — the FA switch, also needing no new op.** `fattn-qsa.cu` already
+has the selected slot indices `idx[]` for the tile it is staging, so both `M_smem` sites can compute
+the value inline instead of gathering it from the mask (the query token and stream are already in
+scope there):
+
+| site | now | instead |
+|---|---|---|
+| `fattn-qsa.cu` ~L214 (F16/Q8_0 gather) | `M_smem[flat] = maskh[identity ? tile0 + flat : idx[tile0 + flat]];` | `const int g = identity ? tile0 + flat : idx[tile0 + flat];` then `M_smem[flat] = (cell_vis[g] >= 0 && cell_vis[g] <= q_vis_t) ? 0.0f : -INFINITY;` |
+| `fattn-qsa.cu` ~L362 (bf16 gather) | same | same |
+
+Concretely: add `cell_vis`/`q_vis` as optional srcs of `GGML_OP_FLASH_ATTN_QSA` (`ggml.h` + the
+`ggml.c` ctor), thread them through the host entry/launcher and `fattn-qsa.cuh`, allow
+`kq_mask == nullptr` when they are set (then the graph passes them and stops building the mask, so
+the 800 MiB tensor is pruned), and update the CPU reference (`ggml-cpu/ops.cpp` ~9366/9373/9494) plus
+the meta-backend mirrored-src case for the new src count. Expected after that: **~3250 MiB/GPU at
+ub 2048** (ub 1024 ~2100) — the campaign's BEST outcome: ub2048 speed below ub1024's memory.
+Validate with the same `GGML_QSA_DERIVED_VIS` A/B (text must stay byte-identical) + `tools/bufsize.sh`.
+
 ## 3. The MTP-acceptance drift — RESOLVED as a buffer-layout effect, not arithmetic
 
 The adaptive-MTP probe (`benchmarks/mtp-adaptive-methodology.md` Protocol A; `tools/mtp-ab.sh`)
@@ -166,8 +206,8 @@ campaign's BEST outcome; ub1024 would land near 2100).
 | `ggml/src/ggml-cpu/ops.cpp` | CPU reference handles the derived bias + a `nullptr` additive |
 | `ggml/src/ggml-backend-meta.cpp` | INDEXER_TOPK: assert *every* non-null src is mirrored (was hard-coded 0..2) |
 | `ggml/src/ggml-cuda/indexer-topk.cu` | `indexer_topk_extra` threaded through the 3 kernels + launcher; host reads srcs 3–6; support check |
-| `src/llama-memory-hybrid-idx.{h,cpp}` | `set_input_qsa` takes `blk_idx`/`blk_tail`; fills them instead of the tensor when asked (and zero-fills the tensor in the diagnostic modes) |
-| `src/models/qwen4exp.cpp` | `qwen4exp_derived_bias_mode()` gate, compact inputs, `ggml_add` dropped on that path, top-k call |
+| `src/llama-memory-hybrid-idx.{h,cpp}` | `set_input_qsa` takes `blk_idx`/`blk_tail` **and `cell_vis`/`q_vis`**; fills them instead of the tensor/mask when asked (and zero-fills the tensor in the diagnostic modes) |
+| `src/models/qwen4exp.cpp` | `qwen4exp_derived_bias_mode()` + `qwen4exp_derived_vis_enabled()` gates, compact inputs, `ggml_add` dropped on that path, top-k call |
 
 ## 6. State at the end of this session
 

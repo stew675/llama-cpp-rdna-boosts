@@ -367,19 +367,21 @@ index 7ee2c06d8..9a93ccc25 100644
  
      return result;
 diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
-index b5dad83bd..5b6b9812a 100644
+index b5dad83bd..8d6a39af7 100644
 --- a/src/llama-memory-hybrid-idx.cpp
 +++ b/src/llama-memory-hybrid-idx.cpp
-@@ -444,6 +444,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -444,6 +444,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
          ggml_tensor * blk_cells,
          ggml_tensor * blk_pos,
          ggml_tensor * bias,
 +        ggml_tensor * blk_idx,
 +        ggml_tensor * blk_tail,
++        ggml_tensor * cell_vis,
++        ggml_tensor * q_vis,
          const llama_ubatch * ubatch,
          uint32_t ratio,
          bool blk_bias,
-@@ -466,7 +468,29 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -466,7 +470,40 @@ void llama_memory_hybrid_idx::set_input_qsa(
      int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
      int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
      int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
@@ -387,6 +389,8 @@ index b5dad83bd..5b6b9812a 100644
 +    float   * dst_bias      = bias     != nullptr ? (float   *) bias->data     : nullptr;
 +    int32_t * dst_blk_idx   = blk_idx  != nullptr ? (int32_t *) blk_idx->data  : nullptr;
 +    int32_t * dst_blk_tail  = blk_tail != nullptr ? (int32_t *) blk_tail->data : nullptr;
++    int32_t * dst_cell_vis  = cell_vis != nullptr ? (int32_t *) cell_vis->data : nullptr;
++    int32_t * dst_q_vis     = q_vis    != nullptr ? (int32_t *) q_vis->data    : nullptr;
 +
 +    // exactly one form of the per-block bias is asked for: the uploaded tensor, or the compact
 +    // pair the top-k derives it from.  Both is the diagnostic placeholder mode
@@ -395,6 +399,10 @@ index b5dad83bd..5b6b9812a 100644
 +    GGML_ASSERT((dst_blk_idx != nullptr) == (dst_blk_tail != nullptr));
 +    GGML_ASSERT(dst_blk_idx == nullptr || blk_bias);
 +    GGML_ASSERT(dst_bias    != nullptr || dst_blk_idx != nullptr);
++
++    // the derived visibility travels with blk_bias (it is the per-cell half of the same bias)
++    GGML_ASSERT((dst_cell_vis != nullptr) == (dst_q_vis != nullptr));
++    GGML_ASSERT(dst_cell_vis == nullptr || blk_bias);
 +
 +    const bool placeholder_bias = dst_bias != nullptr && dst_blk_idx != nullptr;
 +
@@ -407,10 +415,36 @@ index b5dad83bd..5b6b9812a 100644
 +        GGML_ASSERT(blk_idx->type  == GGML_TYPE_I32 && blk_idx->ne[0]  == n_blocks && blk_idx->ne[1]  == n_ns);
 +        GGML_ASSERT(blk_tail->type == GGML_TYPE_I32 && blk_tail->ne[0] == n_tps    && blk_tail->ne[1] == n_ns);
 +    }
++
++    if (dst_cell_vis != nullptr) {
++        GGML_ASSERT(cell_vis->type == GGML_TYPE_I32 && cell_vis->ne[0] == n_kv && cell_vis->ne[1] == n_ns);
++        GGML_ASSERT(q_vis->type    == GGML_TYPE_I32 && q_vis->ne[0]    == n_tps && q_vis->ne[1]    == n_ns);
++    }
  
      // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
      // from zero, so the bucket alone would pool two sequences into one block
-@@ -684,6 +708,21 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -625,6 +662,20 @@ void llama_memory_hybrid_idx::set_input_qsa(
+             group_cells();
+         }
+ 
++        // the per-cell half of the visibility as state: the compaction key of every cell of
++        // this stream's cache, -1 for a cell that is empty or owned by another sequence.
++        // a query token with key q_vis sees exactly the cells with 0 <= key <= q_vis, which is
++        // set_input_kq_mask_impl's predicate without its causal part - the same comparison the
++        // per-cell bias above already makes (idx = ranked ? rank[j] : pos_get(j) against q).
++        if (dst_cell_vis != nullptr) {
++            int32_t * cur_cell_vis = dst_cell_vis + s*n_kv;
++
++            for (int64_t j = 0; j < n_kv; ++j) {
++                cur_cell_vis[j] = cells.is_empty(j) || !cells.seq_has((uint32_t) j, seq_of_stream)
++                        ? -1 : (int32_t) (ranked ? rank[j] : cells.pos_get(j));
++            }
++        }
++
+         GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
+ 
+         int32_t n_bid = 0;
+@@ -684,6 +735,21 @@ void llama_memory_hybrid_idx::set_input_qsa(
              cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
          }
  
@@ -432,9 +466,14 @@ index b5dad83bd..5b6b9812a 100644
          for (int64_t ii = 0; ii < n_tps; ++ii) {
              const int64_t      i      = s*n_tps + ii;
              const llama_seq_id seq_id = ubatch->seq_id[i][0];
-@@ -717,6 +756,13 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -716,7 +782,18 @@ void llama_memory_hybrid_idx::set_input_qsa(
+             // the tail is an incomplete block and is always visible, as in the reference
              const int64_t tail_start = (q + 1)/r*r;
  
++            if (dst_q_vis != nullptr) {
++                dst_q_vis[s*n_tps + ii] = (int32_t) q;
++            }
++
              if (blk_bias) {
 +                if (dst_blk_tail != nullptr) {
 +                    // compact form: the tail start is the only per-token part of the block bias
@@ -446,29 +485,33 @@ index b5dad83bd..5b6b9812a 100644
                  // a block sits wholly inside or outside the tail, so one value covers it
                  // the caller adds the attention mask, which drops empty, foreign and future cells
                  float * cur_blk_bias = dst_bias + i*n_blocks;
-@@ -855,6 +901,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
+@@ -855,6 +932,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
          ggml_tensor * blk_cells,
          ggml_tensor * blk_pos,
          ggml_tensor * bias,
 +        ggml_tensor * blk_idx,
 +        ggml_tensor * blk_tail,
++        ggml_tensor * cell_vis,
++        ggml_tensor * q_vis,
          const llama_ubatch * ubatch,
          uint32_t ratio,
          bool blk_bias,
-@@ -862,7 +910,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
+@@ -862,8 +943,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
          int32_t * dst_derived_lim) const {
      GGML_ASSERT(mem != nullptr);
  
 -    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias,
-+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_idx, blk_tail, ubatch, ratio, blk_bias,
-                        dst_derived_from, dst_derived_lim);
+-                       dst_derived_from, dst_derived_lim);
++    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_idx, blk_tail, cell_vis, q_vis,
++                       ubatch, ratio, blk_bias, dst_derived_from, dst_derived_lim);
  }
  
+ ggml_tensor * llama_memory_hybrid_idx_context::get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks) const {
 diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
-index 4b30994d1..8f1ce1b5c 100644
+index 4b30994d1..c5ce4bd51 100644
 --- a/src/llama-memory-hybrid-idx.h
 +++ b/src/llama-memory-hybrid-idx.h
-@@ -94,8 +94,18 @@ public:
+@@ -94,8 +94,19 @@ public:
      //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
      // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
      // the caller then adds the attention mask, the only part of the bias that varies within a block
@@ -484,25 +527,27 @@ index 4b30994d1..8f1ce1b5c 100644
      void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
 -                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
 +                       ggml_tensor * bias, ggml_tensor * blk_idx, ggml_tensor * blk_tail,
++                       ggml_tensor * cell_vis, ggml_tensor * q_vis,
 +                       const llama_ubatch * ubatch, uint32_t ratio,
                         bool blk_bias,
                         int32_t * dst_derived_from = nullptr,
                         int32_t * dst_derived_lim  = nullptr) const;
-@@ -186,7 +196,8 @@ public:
+@@ -186,7 +197,9 @@ public:
      uint32_t get_n_stream() const;
  
      void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
 -                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
 +                       ggml_tensor * bias, ggml_tensor * blk_idx, ggml_tensor * blk_tail,
++                       ggml_tensor * cell_vis, ggml_tensor * q_vis,
 +                       const llama_ubatch * ubatch, uint32_t ratio,
                         bool blk_bias,
                         int32_t * dst_derived_from = nullptr,
                         int32_t * dst_derived_lim  = nullptr) const;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 606af11fb..9d360dd29 100644
+index 606af11fb..1a6ec1e13 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -902,10 +902,29 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
+@@ -902,10 +902,42 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
  
  // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
  // one mean-pooled indexer key scores each block; set_input resolves the cache layout
@@ -525,28 +570,41 @@ index 606af11fb..9d360dd29 100644
 +    return mode;
 +}
 +
++// The per-cell half of the same bias (the attention mask) is derived from two compact keys as
++// well: cell_vis is a cell's compaction key (-1 for an empty or foreign cell) and q_vis is the
++// query's key, and a cell is visible iff 0 <= cell_vis <= q_vis.  GGML_QSA_DERIVED_VIS=0 keeps
++// the uploaded mask as the additive for A/B.  The mask tensor stays allocated until the flash
++// attention derives the same value, so this is a drop-in equivalent on its own.
++static bool qwen4exp_derived_vis_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("GGML_QSA_DERIVED_VIS");
++        return env == nullptr || std::atoi(env) != 0;
++    }();
++    return enabled;
++}
++
  class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
  public:
 -    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
 -        mctx(mctx), ratio(ratio), blk_bias(blk_bias) {}
-+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool derived_bias, bool zero_bias, bool tiny_bias) :
-+        mctx(mctx), ratio(ratio), blk_bias(blk_bias), derived_bias(derived_bias), zero_bias(zero_bias), tiny_bias(tiny_bias) {}
++    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool derived_bias, bool zero_bias, bool tiny_bias, bool derived_vis) :
++        mctx(mctx), ratio(ratio), blk_bias(blk_bias), derived_bias(derived_bias), zero_bias(zero_bias), tiny_bias(tiny_bias), derived_vis(derived_vis) {}
      virtual ~llm_graph_input_qsa() = default;
  
      void set_input(const llama_ubatch * ubatch) override {
-@@ -913,9 +932,9 @@ public:
+@@ -913,9 +945,9 @@ public:
          if (rng != nullptr) {
              // derived-cache decode: emit the per-step fill range [from, lim) into the leaf
              int32_t * d = (int32_t *) rng->data;
 -            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, d, d + 1);
-+            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_idx, blk_tail, ubatch, ratio, blk_bias, d, d + 1);
++            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_idx, blk_tail, cell_vis, q_vis, ubatch, ratio, blk_bias, d, d + 1);
          } else {
 -            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
-+            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_idx, blk_tail, ubatch, ratio, blk_bias);
++            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_idx, blk_tail, cell_vis, q_vis, ubatch, ratio, blk_bias);
          }
      }
  
-@@ -935,13 +954,33 @@ public:
+@@ -935,13 +967,41 @@ public:
  
          res &= params.ubatch.n_tokens % n_stream == 0;
  
@@ -555,9 +613,11 @@ index 606af11fb..9d360dd29 100644
 +        const bool want_derived = dbias_mode != 0 && blk_bias && params.ubatch.n_tokens > 1;
 +        const bool want_zero    = dbias_mode == 2 && blk_bias && params.ubatch.n_tokens > 1;
 +        const bool want_tiny    = dbias_mode == 3 && blk_bias && params.ubatch.n_tokens > 1;
++        const bool want_vis     = want_derived && qwen4exp_derived_vis_enabled();
 +        res &= derived_bias == want_derived;
 +        res &= zero_bias    == want_zero;
 +        res &= tiny_bias    == want_tiny;
++        res &= derived_vis  == want_vis;
 +
          res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
          res &= cell_blk->ne[0]  == n_kv;
@@ -572,6 +632,12 @@ index 606af11fb..9d360dd29 100644
 +            res &= blk_tail->ne[0] == params.ubatch.n_tokens/n_stream;
 +            res &= blk_tail->ne[1] == n_stream;
 +        }
++        if (derived_vis) {
++            res &= cell_vis->ne[0] == n_kv;
++            res &= cell_vis->ne[1] == n_stream;
++            res &= q_vis->ne[0]    == params.ubatch.n_tokens/n_stream;
++            res &= q_vis->ne[1]    == n_stream;
++        }
 +        if (!derived_bias || zero_bias) {
 +            res &= bias->ne[0] == (blk_bias ? n_blocks : n_kv);
 +            res &= bias->ne[1] == params.ubatch.n_tokens/n_stream;
@@ -582,7 +648,7 @@ index 606af11fb..9d360dd29 100644
  
          return res;
      }
-@@ -954,11 +993,26 @@ public:
+@@ -954,11 +1014,34 @@ public:
      ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
      ggml_tensor * rng       = nullptr;   // I32 [2*n_stream] derived-cache range leaf (decode only)
  
@@ -590,6 +656,11 @@ index 606af11fb..9d360dd29 100644
 +    // it in-kernel from this compact pair (4 bytes per block instead of n_tokens/n_stream)
 +    ggml_tensor * blk_idx   = nullptr;   // I32 [n_blocks, n_stream]
 +    ggml_tensor * blk_tail  = nullptr;   // I32 [n_tokens/n_stream, n_stream]
++
++    // derived_vis: the per-cell half (the attention mask) is not uploaded either - a cell carries
++    // a compaction key and a token a query key, and the cell is visible iff 0 <= cell_vis <= q_vis
++    ggml_tensor * cell_vis  = nullptr;   // I32 [n_kv, n_stream]
++    ggml_tensor * q_vis     = nullptr;   // I32 [n_tokens/n_stream, n_stream]
 +
      const llama_memory_hybrid_idx_context * mctx;
      const uint32_t ratio;
@@ -606,10 +677,13 @@ index 606af11fb..9d360dd29 100644
 +    // 2 = the real [n_blocks, n_tps, n_stream] shape (400 MiB), 3 = one broadcast element
 +    const bool zero_bias;
 +    const bool tiny_bias;
++
++    // ... and the per-cell half is derived from the visibility keys
++    const bool derived_vis;
  };
  
  ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
-@@ -991,6 +1045,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -991,6 +1074,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
          cparams.causal_attn && !hparams.use_alibi;
  
@@ -632,16 +706,19 @@ index 606af11fb..9d360dd29 100644
 +    // mode 3 is the same but with a single broadcast element (does the node alone carry the effect?)
 +    const bool zero_bias    = derived_bias && dbias_mode == 2;
 +    const bool tiny_bias    = derived_bias && dbias_mode == 3;
++    // the per-cell half of the same bias (the attention mask) is derived from the visibility
++    // keys too; the mask tensor stays until the flash attention reads the keys as well
++    const bool derived_vis  = derived_bias && qwen4exp_derived_vis_enabled();
 +
      // env gates (per-process, read once): the fused INDEXER_SCORE op + the incremental derived
      // cache are the DEFAULT decode path (parity-verified byte-identical to the per-op chain);
      // =0 disables them for A/B.  The derived cache is what makes the QSA decode hold up at
-@@ -1012,13 +1086,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1012,13 +1118,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      if (it != qsa_inps.end()) {
          inp = it->second;
      } else {
 -        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
-+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, derived_bias, zero_bias, tiny_bias);
++        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, derived_bias, zero_bias, tiny_bias, derived_vis);
  
          qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
          qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
@@ -652,6 +729,10 @@ index 606af11fb..9d360dd29 100644
 +            qsa->blk_idx  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_blocks, n_stream);
 +            qsa->blk_tail = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tps,    n_stream);
 +        }
++        if (derived_vis) {
++            qsa->cell_vis = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv,  n_stream);
++            qsa->q_vis    = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tps, n_stream);
++        }
 +        if (!derived_bias || zero_bias) {
 +            qsa->bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 +        } else if (tiny_bias) {
@@ -660,7 +741,7 @@ index 606af11fb..9d360dd29 100644
          if (idx_cache && n_stream == 1) {
              // per-step derived fill range leaf: [from_s, lim_s] (one stream in decode)
              qsa->rng = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 2);
-@@ -1027,7 +1109,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1027,7 +1145,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          ggml_set_input(qsa->cell_blk);
          ggml_set_input(qsa->blk_cells);
          ggml_set_input(qsa->blk_pos);
@@ -669,13 +750,17 @@ index 606af11fb..9d360dd29 100644
 +            ggml_set_input(qsa->blk_idx);
 +            ggml_set_input(qsa->blk_tail);
 +        }
++        if (derived_vis) {
++            ggml_set_input(qsa->cell_vis);
++            ggml_set_input(qsa->q_vis);
++        }
 +        if (!derived_bias || zero_bias || tiny_bias) {
 +            ggml_set_input(qsa->bias);
 +        }
          if (qsa->rng != nullptr) {
              ggml_set_input(qsa->rng);
          }
-@@ -1193,7 +1281,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1193,7 +1321,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          }
  
          // one value per block, so it is cheaper to bias here than after the cells are expanded
@@ -685,7 +770,7 @@ index 606af11fb..9d360dd29 100644
              score = ggml_add(ctx0, score, inp->bias);
          }
      }
-@@ -1209,7 +1298,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1209,7 +1338,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      // kernel reads it as [n_kv, n_tps, n_stream] and no per-layer copy is needed
      ggml_tensor * additive = blk_bias ? kq_mask : inp->bias;
  
@@ -693,7 +778,8 @@ index 606af11fb..9d360dd29 100644
 +    // compact per-block bias state (derived path); the derived *visibility* (cell_pos/q_pos)
 +    // is a later step, so src3/src4 stay null for now
 +    ggml_tensor * top_k = ggml_indexer_top_k(ctx0, score, inp->cell_blk, additive,
-+            nullptr, nullptr,
++            derived_vis ? inp->cell_vis : nullptr,
++            derived_vis ? inp->q_vis    : nullptr,
 +            derived_bias ? inp->blk_idx  : nullptr,
 +            derived_bias ? inp->blk_tail : nullptr,
 +            (int) width);
