@@ -46,10 +46,23 @@ Reality pass: 2026-09-10.
   close it) it ships **opt-in: `GGML_CUDA_FA_KV_NATIVE=1`**.  Record:
   `wip/arch-independent-memory/V4-NATIVE-Q8-KV-PLAN.md`; patch
   `wip/arch-independent-memory/patches/0006-v4-native-q8-kv.patch`.
+- **bf16 (maintainer's preferred KV type) - measured, not implemented: the next memory lever.**
+  The MMA prefill path still stages an F16 copy of the whole bf16 cache (`need_f16_K/V` is unconditional
+  for `BEST_FATTN_KERNEL_MMA_F16`); TILE (verify/decode) and VEC already read bf16 natively (measured:
+  ub 8 bf16 = f16 = 5.47 MiB, no scratch).  Measured cost of that scratch in the peak: **~712 MiB/GPU at
+  ctx 204800 / ub 2048** (4B: +40.00 at 32768, +424.00 at 131072, +552.00 at 163840 - exactly
+  `ctx x 4 KiB - 88 MiB`).  It is the *easier* case than q8_0: bf16->f16 is size/layout-preserving, so
+  the cp_async pipeline can be kept by converting the staged shared tile in place - likely free, so it can
+  probably ship **on by default**.  Plan: `beta/block-15-campaign-wins/HANDOVER.md` §3.4.  Belongs in
+  Block 15 if it lands before the cut.  (The bf16 *cache* itself is 2 B/element, ~1.9x q8_0 - that part is
+  the format choice and is not reducible.)
 - **Critical path: Block 15 merge + cut (all six wins are DONE).**
   Merge W1-W4 + V3 + V4, strip the V3 oracle, gate everything, re-validate the combination (defaults
   first, then `GGML_CUDA_FA_KV_NATIVE=1`), cut the single 15th block and stage it in `beta/`.
   `beta/block-15-campaign-wins/HANDOVER.md` §5 is the step list, §8 the next-session prompt.
+  **Fork state:** `rdna-boosts` pristine at `e2380eb67`; the 22-file campaign tree is committed on the work
+  branch **`wip/block15-campaign-wins` = `b26ae06f0`** and mirrored as a delta patch in
+  `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch`.
 - **Block 15 waits for V3+V4** (maintainer 2026-09-10): exactly ONE block, no Block 16.  W1-W4 + V3 + V4 get
   merged, each gated with an env kill-switch, re-validated **as a combination** (individual validations do
   not carry over), then staged in `beta/` for a ~4-5 day beta window before promotion into `patches/0015-…`.

@@ -237,6 +237,50 @@ the other quantized KV types (each is the same chunk decoder with a different bl
 Block 15 = **W1 + W2 + W3 + W4 + V2-or-V3 + V4** as one patch (D5), merged, gated, combined-validated,
 cut, and staged in `beta/` to open the ~4–5 day beta window.  See §5.
 
+### 3.4 The next memory lever: bf16-native MMA K/V (measured 2026-09-10, NOT implemented)
+
+The maintainer's preferred KV type is **bf16**, and it is the one case V4 does *not* cover: the TILE and
+VEC paths already read bf16 natively, but the MMA prefill path still stages an F16 copy of the whole
+cache (`need_f16_K/V = true` unconditionally for `BEST_FATTN_KERNEL_MMA_F16`).  Measured on the 4B
+(`-ctk/-ctv bf16`, ub 2048, 1 GPU):
+
+| ctx | f16 (no scratch) | bf16 | Δ | K+V F16 scratch for one layer = ctx x 4 KiB |
+|---|---|---|---|---|
+| 32768 | 256.20 | 296.20 | **+40.00** | 128 |
+| 131072 | 256.58 | 680.58 | **+424.00** | 512 |
+| 163840 | 256.70 | 808.70 | **+552.00** | 640 |
+| 204800 | ~256.5 | ~968 (extrapolated) | **~+712** | 800 |
+
+The relation is exact and linear: **bf16 costs `scratch - 88 MiB` in the peak** (the allocator overlaps
+88 MiB of the scratch with other live tensors), so at ctx 204800 / ub 2048 a bf16 user pays ~712 MiB/GPU
+that V4 already removes for q8_0.  At ub 8 (TILE) bf16 and f16 are both 5.47 MiB - the verify/decode side
+needs nothing.  V3's mask win (-799 compute / -799 host) already applies to bf16 too (the mask is F16
+whatever the KV type is).
+
+**Why this is the *easier* case than q8_0** (and the recommended follow-up):
+
+1. bf16 -> f16 is **size- and layout-preserving**: a 16-byte staged chunk is 8 bf16 elements -> 8 f16
+   elements, same 16 bytes.  So the **cp_async pipeline can be kept**: copy the raw bf16 row into the
+   shared tile exactly like the F16 path (same chunks, same swizzle, same `tile_K`/`tile_V` layout), then
+   convert the tile **in place** element-wise (`__float2half(__bfloat162float(x))`) with one extra
+   `__syncthreads()` before the wmma fragment loads.  No byte unpacking, no block indices, no lost
+   latency hiding - so unlike the q8_0 arm this should measure ~free and could ship **on by default**.
+2. It also removes the per-ubatch global conversion pass (which for bf16 reads the whole cache and writes
+   the same amount again - 800 MiB + 800 MiB per layer per ubatch at ctx 204800), so it may be a *win*.
+3. Bit-exactness is straightforward: bf16 -> f32 is exact and f32 -> f16 rounds once, which is what the
+   launcher's `ggml_get_to_fp16_cuda(GGML_TYPE_BF16)` does.
+4. Touches only what V4 already touches: the shared predicate (`add BF16`), `launch_fattn`'s conversion
+   skip, the MMA loader branch (the `fattn_kv_q8_t` struct generalises to a `{type, ptr, stride}` tag),
+   plus a device-side in-place conversion loop.  Validate with the same protocol (reserve matrix,
+   same-seed coherence, the ulp-sensitive MTP gate, interleaved pp20480/tg256).
+
+**Honest caveat**: this removes the *staging*, not the cache.  A bf16 KV cache is 2 B/element, ~1.9x the
+q8_0 cache (27B at ctx 204800: ~54 GB bf16 vs ~28.5 GB q8_0 across 3 GPUs), and no amount of V4 work
+changes that - the compute-buffer scratch is ~712 MiB of it, the rest is the format choice.
+
+**Block numbering**: if it lands before the Block-15 cut it belongs in Block 15 (same `GGML_CUDA_FA_KV_NATIVE`
+gate, one more arm); afterwards the "exactly one new block" rule needs a maintainer decision.
+
 ## 4. Stage A — the two extra upstream candidates (D6, independent of everything above)
 
 Do these in any session; they do not block Block 15 and Block 15 does not depend on them.  Both follow
@@ -295,12 +339,22 @@ notes (inconsistency + crash path + how the fork found it while pruning masks).
 
 ## 6. State inventory
 
-**Fork** `~/llama.cpp`, branch `rdna-boosts` at `e2380eb67` (= fork point `9113cc188` + blocks 01–14),
-working tree = **22 modified files = W1 + W2 (incl. the `attn_k` guard) + block-15 phase 1 + V3 phases
-2a/2b/2c + V4 (opt-in)**, deliberately uncommitted.  V3 is *complete and on by default* and V4 is
-*complete and opt-in* here; W3 is not applied.  Never commit those files except as the Block-15 commit;
-never push from that checkout.  `build-rocm/` is current with this tree and was used for all V3 and V4
-validation (2026-09-10).
+**Fork** `~/llama.cpp`: `rdna-boosts` is **pristine at `e2380eb67`** (= fork point `9113cc188` + blocks
+01–14, the canonical base for the block-15 cut).  The 22-file campaign tree (= W1 + W2 (incl. the
+`attn_k` guard) + block-15 phase 1 + V3 phases 2a/2b/2c + V4, all validated 2026-09-10) is **committed on
+the work branch `wip/block15-campaign-wins` = `b26ae06f0`** (working tree clean, branch checked out) and,
+as a second copy, as a single delta patch
+`wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch` (3453 lines, applies
+cleanly to `e2380eb67`, 22 files +1871/−210 - `git apply` it in a fresh worktree if the branch is ever
+lost).  V3 is *on by default* and V4 is *opt-in* in that tree; W3 is not applied.  **Resume with**
+`git checkout rdna-boosts && git merge --squash wip/block15-campaign-wins && git apply -3 <W3> <W4>` then
+build/validate and commit the single block-15 commit - or simply keep working on the work branch and cut
+the block commit from it.  Never push from that checkout.  `build-rocm/` was current with the work-branch
+tree and was used for all V3 and V4 validation (2026-09-10).
+
+**Snapshots**: the work branch above; the whole-tree delta patch
+`wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch`; per-increment patches
+below.
 
 **Campaign patches** (all `git apply --check` clean, in this order over a clean `9113cc188`):
 W1 `wip/qwen4exp/qsa-memory/patches/0001-L2a-L2m-qsa-score-memory.patch`,
@@ -361,9 +415,12 @@ beta/block-15-campaign-wins/BETA-TESTING.md (the beta gate checklist).  For V3/V
 wip/arch-independent-memory/V3-DERIVED-KQ-MASK-PLAN.md section 4 and
 wip/arch-independent-memory/V4-NATIVE-Q8-KV-PLAN.md.
 
-STATE: the fork tree (~/llama.cpp, branch rdna-boosts at e2380eb67, blocks 01-14) has 22 uncommitted
-files = W1 + W2 + V3 (phases 1/2a/2b/2c) + V4, builds clean, and was validated on 2026-09-10.  W3 and W4
-are separate patches (wip/) that still have to be merged in.  V3 is on by default
+STATE: ~/llama.cpp has `rdna-boosts` pristine at e2380eb67 (blocks 01-14) and the 22-file campaign tree
+(W1 + W2 + V3 phases 1/2a/2b/2c + V4, validated 2026-09-10) committed on the work branch
+`wip/block15-campaign-wins` (= b26ae06f0, checked out, clean); a whole-tree delta patch also exists at
+wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch.  Resume with
+`git checkout rdna-boosts && git merge --squash wip/block15-campaign-wins` (then apply W3 + W4).  W3 and
+W4 are separate patches (wip/) that still have to be merged in.  V3 is on by default
 (LLAMA_KQ_MASK_DERIVED=0 disables it); V4 is OPT-IN (GGML_CUDA_FA_KV_NATIVE=1 enables it, default off).
 Patch snapshots live in wip/arch-independent-memory/patches/ (0001 W4 alloc, 0002 the V3 phase-1
 diagnostic - NEVER ship it, 0003/0004/0005 V3, 0006 V4), wip/qwen4exp/qsa-memory/patches/ (W1, W2) and
@@ -384,7 +441,10 @@ DO, in this order (HANDOVER section 5 has the detail):
    9113cc188 + build + coherence.
 4. Stage beta/block-15-campaign-wins/block-15-campaign-wins.patch + the promotion record (beta start date,
    gate table with defaults, validation results) and run the upstream-drop check (HANDOVER section 5.6).
-5. Report: the gate table with defaults, the measured before/after reserves and throughput, what was not
+5. OPTIONAL, if the maintainer wants it before the cut: extend the V4 gate to bf16 (HANDOVER section 3.4
+   - the MMA staging scratch costs a bf16 user ~712 MiB/GPU at ctx 204800 and the in-place conversion
+   should keep the cp_async pipeline, so it can likely ship on by default).
+6. Report: the gate table with defaults, the measured before/after reserves and throughput, what was not
    validated, and the updated state.
 
 DO NOT: push anything from ~/llama.cpp, fold wip/ content into patches/ beyond this agreed Block 15, or
@@ -408,3 +468,7 @@ None blocking.  Everything V3/V4 raised is either answered or explicitly deferre
    phase-1 oracle only has to be re-run if the predicate is extended.
 5. **Block 15 packaging detail**: V4 is opt-in, so the beta gate table must present it as "default off,
    `GGML_CUDA_FA_KV_NATIVE=1` to enable" and the combined validation must cover both positions (§5.3).
+6. **bf16 (the maintainer's preferred KV type)**: measured, not implemented - the MMA staging scratch
+   costs a bf16 user ~712 MiB/GPU at ctx 204800 / ub 2048 and is the recommended next lever (§3.4).  It is
+   the *easier* case than q8_0 (in-place conversion keeps the cp_async pipeline, so it can likely ship on
+   by default) and it belongs in Block 15 if it lands before the cut.
