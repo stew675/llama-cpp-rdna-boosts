@@ -1,0 +1,48 @@
+We need answer user: "Write a bash script that backs up a directory to a dated tarball, keeps the last 7 backups, and logs to syslog. Explain each step."
+
+Need produce final with script and explanation. Need likely include robust bash script. Need consider requirements: backup directory to dated tarball, keep last 7 backups, log to syslog. Could use logger. Need explain each step.
+
+Need maybe include variables, set -euo pipefail, source dir, backup dir, date, tar czf, retention using ls -1t or find, logger. Need ensure only delete matching pattern. Need maybe use flock to prevent concurrent runs. Need maybe log success/failure. Need mention install cron. Need maybe handle spaces. Need maybe use tar --exclude? Not necessary.
+
+Let's craft final: script /usr/local/bin/backup-dir.sh.
+
+Potential script:
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE_DIR="/path/to/backup"
+BACKUP_DIR="/var/backups/myapp"
+PREFIX="myapp"
+KEEP=7
+LOG_TAG="backup-dir"
+
+mkdir -p "$BACKUP_DIR"
+timestamp="$(date +%Y%m%d-%H%M%S)"
+archive="$BACKUP_DIR/${PREFIX}-${timestamp}.tar.gz"
+
+logger -t "$LOG_TAG" "Starting backup of $SOURCE_DIR to $archive"
+
+if tar -czf "$archive" -C "$(dirname "$SOURCE_DIR")" "$(basename "$SOURCE_DIR")"; then
+  logger -t "$LOG_TAG" "Backup completed: $archive ($(du -h "$archive" | cut -f1))"
+else
+  rc=$?
+  logger -t "$LOG_TAG" "Backup failed for $SOURCE_DIR (exit $rc)"
+  exit "$rc"
+fi
+
+# retention: keep newest KEEP archives matching prefix
+mapfile -t old_backups < <(ls -1t "$BACKUP_DIR/${PREFIX}-"*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)))
+for old in "${old_backups[@]}"; do
+  if rm -f -- "$old"; then
+    logger -t "$LOG_TAG" "Removed old backup: $old"
+  else
+    logger -t "$LOG_TAG" "Failed to remove old backup: $old"
+  fi
+done
+
+But with set -e, if ls no matches? mapfile from process substitution with 2>/dev/null; if no files, empty. But glob no match? ls receives literal pattern? Actually ls -1t "$BACKUP_DIR/${PREFIX}-"*.tar.gz: if no match, bash passes pattern to ls, ls errors suppressed, mapfile empty. OK. But if KEEP=7, tail -n +8. Need ensure if fewer than 7, no deletion.
+
+Potential issue: set -u and old_backups empty: for old in "${old_backups[@]}" with empty array in bash 4.4+ OK? In older bash, unbound variable error. Could use ${old_backups[@]+"${old_backups[@]}"}. Or avoid mapfile? Use find? Better robust:
+shopt -s nullglob
+old_backups=("$BACKUP_DIR/${PREFIX}-"*.tar.gz)
+# sort by mtime? Need newest

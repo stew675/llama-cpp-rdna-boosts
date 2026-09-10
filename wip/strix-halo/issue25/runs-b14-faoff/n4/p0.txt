@@ -1,0 +1,24 @@
+We need answer user: "Explain in detail how a hash map works internally, including collision handling, load factor, and resizing. Then write a complete implementation in Python."
+
+Need produce final with detailed explanation and complete Python implementation. Need likely include open addressing vs chaining. User asks hash map internally, collision handling, load factor, resizing. Then complete implementation in Python. We can choose one implementation. Need be thorough. Could implement using separate chaining with linked list or arrays? Complete implementation in Python. Need maybe include tests? "complete implementation" likely class HashMap with get, put, delete, contains, keys, values, items, len, iter, resize. Need explain.
+
+Need decide implementation. Python dict uses open addressing with perturb, but for educational implementation separate chaining is simpler and robust. But question includes collision handling, load factor, resizing. Could explain both and implement separate chaining. Or implement open addressing? Complete implementation in Python maybe more interesting with open addressing? Need ensure correctness. Let's think.
+
+If implement separate chaining:
+- internal table: list of buckets, each bucket maybe list of (key, value) or custom Node.
+- hash: use built-in hash(key) & mask for power-of-two capacity. Need handle unhashable? raise TypeError.
+- load factor = size / capacity. Resize when load factor > threshold (e.g. 0.75) or maybe when size > capacity * load_factor. Also shrink when load factor < 0.25? Optional.
+- Collision handling: chaining: append to bucket list. Lookup scans bucket.
+- Resizing: allocate new table double capacity, rehash all entries.
+- Need support key equality, not identity. Use == and hash. Need handle 0/False? Use sentinel for missing.
+- Need delete: find in bucket, remove. Could leave tombstones? Chaining no tombstones.
+- Need maintain order? Not necessary. But Python dict preserves insertion order; not required. Could preserve? Harder with chaining. Not needed.
+- Need complete: __setitem__, __getitem__, __delitem__, __contains__, __len__, __iter__, __repr__, update, pop, get, clear, keys, values, items. Maybe enough.
+- Need ensure hash collisions: use hash(key) % capacity. For power of two, & (capacity-1). But if capacity not power of two? We can keep power of two. Initial capacity maybe 8.
+- Need handle negative hash: Python hash can be negative; & mask works for power of two? In Python, negative & mask yields non-negative modulo power of two? Yes because two's complement infinite? e.g. -1 & 7 = 7. Equivalent to modulo 2^n. Good.
+- Need handle hash randomization? built-in.
+- Need maybe use custom Node class for O(1) delete? List remove scans anyway. Node with next maybe. But list of pairs simpler. However if many collisions, list operations O(n). Node linked list also O(n). Could use list for simplicity.
+- Need avoid aliasing? Store key/value references.
+- Need handle updating existing key: find first equal key in bucket, update value.
+- Need handle key with hash collision but equal? Use ==.
+- Need handle key that is unhashable: hash(key) raises TypeError.

@@ -1,0 +1,27 @@
+We need answer user: "Explain in detail how a hash map works internally, including collision handling, load factor, and resizing. Then write a complete implementation in Python."
+
+Need produce final with detailed explanation and complete Python implementation. Need likely include open addressing vs chaining. User asks hash map internally, collision handling, load factor, resizing. Then complete implementation in Python. We can choose one implementation. Need be thorough. Could implement using separate chaining with linked list or arrays? Complete implementation in Python. Need maybe include tests? "complete implementation" likely class HashMap with get, put, delete, contains, keys, values, items, len, iter, resize. Need explain.
+
+Need decide implementation. Python dict uses open addressing with perturb, but for educational implementation separate chaining is simpler and robust. But question includes collision handling, load factor, resizing. Could explain both and implement separate chaining. Or implement open addressing? Complete implementation in Python maybe more interesting with open addressing? Need include collision handling: chaining and open addressing. For implementation, choose separate chaining because easier to delete and resize. But maybe "hash map" internal in many languages uses chaining? Java HashMap uses chaining then tree. Python dict uses open addressing. We can explain general and implement one. Need ensure code correct.
+
+Let's design Python HashMap with separate chaining.
+
+Class _Node: key, value, next.
+Class HashMap:
+- __init__(self, capacity=16, load_factor=0.75)
+- _capacity, _load_factor, _size, _buckets list of None or Node.
+- _hash(key): use built-in hash(key) & mask? Need handle negative. Python hash can be negative. Use hash(key) % self._capacity. But if capacity changes, rehash. Need require keys hashable and comparable? For equality use ==.
+- _find_bucket_index(key): idx = self._hash(key) % self._capacity; traverse.
+- get(key, default=None): traverse; if found return value else default.
+- __contains__(key)
+- put(key, value): if key exists update; else insert; if size > capacity * load_factor resize. Need careful: if updating no size increment. Could check load factor after insertion.
+- delete(key): remove node; return value or raise KeyError. Need maintain prev.
+- resize(new_capacity=None): if None double capacity. Reinsert all nodes. Need preserve order? Not necessary. Could use list of items.
+- keys(), values(), items() return list or iterator? Complete maybe return list for simplicity, but can implement iterators. Could provide __iter__ yields keys.
+- __len__, __repr__.
+- Maybe __eq__? Not necessary but can.
+- Need handle capacity minimum.
+
+Potential issue: load factor threshold: if self._size / self._capacity > self._load_factor: resize. For capacity 16, load factor 0.75 threshold 12. If size 13 resize. Good.
+
+Need ensure hash function stable across capacity. Use built-in hash. But for custom keys, hash may be arbitrary. Need maybe use _hash = hash(key) % capacity. If capacity power of two, can use & (capacity-1) for speed. But if capacity not power of two, modulo. We can keep capacity power of two and resize double. Initial capacity maybe

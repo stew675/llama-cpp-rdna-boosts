@@ -1,0 +1,55 @@
+We need answer user: "Explain in detail how a hash map works internally, including collision handling, load factor, and resizing. Then write a complete implementation in Python."
+
+Need produce final with detailed explanation and complete Python implementation. Need likely include open addressing vs chaining. User asks hash map internally, collision handling, load factor, resizing. Then complete implementation in Python. We can choose one implementation. Need be thorough. Could implement using separate chaining with linked list or arrays? Complete implementation in Python. Need maybe include tests? "complete implementation" likely class HashMap with get, put, delete, contains, keys, values, items, len, iter, resize. Need explain.
+
+Need decide implementation. Python dict uses open addressing with perturb, but for educational implementation separate chaining is simpler and robust. But question includes collision handling, load factor, resizing. Could explain both and implement separate chaining. Or implement open addressing? Complete implementation in Python maybe more interesting with open addressing? Need include collision handling: chaining and open addressing. For implementation, choose separate chaining because easier to delete and resize. But maybe "hash map" internal in many languages uses chaining or open addressing. We can explain both, then implement separate chaining. Need ensure code correct.
+
+Let's design Python HashMap:
+
+class HashMap:
+    def __init__(self, capacity=16, load_factor=0.75):
+        self._capacity = capacity
+        self._load_factor = load_factor
+        self._size = 0
+        self._buckets = [[] for _ in range(capacity)]
+
+    def _hash(self, key):
+        # use built-in hash, ensure int nonnegative
+        return hash(key) % self._capacity
+
+    def _find_bucket(self, key):
+        bucket = self._buckets[hash(key) % self._capacity]
+        for i, (k, v) in enumerate(bucket):
+            if k == key:
+                return i
+        return -1
+
+    def __setitem__(self, key, value):
+        if key is None? hash(None) works. But unhashable raises TypeError.
+        idx = self._hash(key)
+        bucket = self._buckets[idx]
+        for i, (k, v) in enumerate(bucket):
+            if k == key:
+                bucket[i] = (key, value)
+                return
+        bucket.append((key, value))
+        self._size += 1
+        if self._size / self._capacity > self._load_factor:
+            self._resize(self._capacity * 2)
+
+    def __getitem__(self, key):
+        idx = self._hash(key)
+        for k, v in self._buckets[idx]:
+            if k == key:
+                return v
+        raise KeyError(key)
+
+    def __delitem__(self, key):
+        idx = self._hash(key)
+        bucket = self._buckets[idx]
+        for i, (k, v) in enumerate(bucket):
+            if k == key:
+                del bucket[i]
+                self._size -= 1
+                # optional shrink if size < capacity * load_factor / 4? Could implement shrink to avoid memory. But resizing includes grow and maybe shrink. Need careful.
+                if self._capacity > 16 and self._size / self._capacity

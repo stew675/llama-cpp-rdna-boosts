@@ -1,0 +1,20 @@
+We need answer user: "Explain in detail how a hash map works internally, including collision handling, load factor, and resizing. Then write a complete implementation in Python."
+
+Need produce final with detailed explanation and complete Python implementation. Need likely include open addressing vs chaining. User asks hash map internally, collision handling, load factor, resizing. Then complete implementation in Python. We can choose one implementation. Need be thorough. Could implement using separate chaining with linked list or arrays? Complete implementation in Python. Need maybe include tests? "complete implementation" likely class HashMap with get, put, delete, contains, keys, values, items, len, iter, resize. Need explain.
+
+Need decide implementation. Python dict uses open addressing with perturb, but for educational implementation separate chaining is simpler and robust. But question includes collision handling, load factor, resizing. Could explain both and implement separate chaining. Or implement open addressing? Complete implementation in Python maybe more interesting with open addressing? Need include collision handling: chaining and open addressing. For implementation, choose separate chaining because easier to delete and resize. But maybe "hash map" internal in many languages uses chaining or open addressing. We can explain both, then implement separate chaining. Need ensure code correct.
+
+Let's design Python HashMap.
+
+Requirements:
+- Hash keys: use built-in hash(key) and modulo table size. Need handle unhashable? Could raise TypeError.
+- Equality: use ==.
+- Store entries in buckets. Each bucket list of [key, value] pairs.
+- Load factor: len / capacity. Resize when load factor > threshold (e.g., 0.75) after insertion. Also maybe shrink when load factor < 0.25 after deletion? Optional. Could implement shrink to avoid memory waste. Need careful with rehashing.
+- Resizing: allocate new table with new capacity (double or half), reinsert all entries. Need avoid recursion if put triggers resize. Use internal _put_no_resize.
+- Methods: __setitem__, __getitem__, __delitem__, __contains__, get, pop, popitem, clear, keys, values, items, __len__, __iter__, __repr__.
+- Need maybe support default? Not necessary.
+- Need ensure hash stability: store hash? In Python, hash can be randomized but stable per object during lifetime? For ints stable. For strings randomized per process but stable. We can compute hash each time. Could store hash to speed? But if key mutable? Hashable keys should not change hash. Could store hash in entry to avoid recomputing during resize. But if key's hash changes? Not expected. Simpler compute.
+- Need handle negative modulo: hash(key) % capacity works in Python.
+- Need capacity power of two? Could use power of two and bitmask for speed. But modulo fine. If using power of two, resize double. Need initial capacity maybe 16. Load factor threshold 0.75. If capacity power of two, index = hash & mask. But Python hash can be negative; & mask works for two's complement? In Python, negative & mask yields nonnegative modulo power of two. Good. But if using arbitrary capacity, modulo. For simplicity, use power of two and mask. Need ensure capacity at least 1. Initial 16.
+- Resizing: if len > capacity * load_factor: resize

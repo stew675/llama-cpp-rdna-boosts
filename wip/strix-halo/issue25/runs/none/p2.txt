@@ -1,0 +1,15 @@
+We need answer user: "Compare TCP and QUIC for a video streaming service. Cover head-of-line blocking, connection migration, and congestion control. Recommend one and justify it."
+
+Need produce final. Need think thoroughly. Need likely compare TCP vs QUIC for video streaming. Cover HOL blocking: TCP single stream HOL blocking across all data; QUIC multiplexes streams over UDP, per-stream HOL blocking only, no cross-stream HOL. For video streaming: DASH/HLS segments, multiple quality levels, adaptive bitrate, maybe multiple streams (video/audio/subtitles), request/response. TCP can suffer if one segment lost, all queued behind; but with careful single stream or HTTP/1.1? HTTP/2 over TCP still HOL at TCP layer. QUIC better.
+
+Connection migration: TCP connection identified by 4-tuple (IP, port); mobile network changes IP breaks connection, requires reconnect, re-handshake, rekey, possible rebuffer. QUIC connection ID independent of 4-tuple, supports migration across Wi-Fi/cellular, NAT rebinding, seamless handoff, lower rebuffering.
+
+Congestion control: TCP has many algorithms (Reno, CUBIC, BBR, etc.) in kernel, mature, but per-connection, limited visibility, often CUBIC default, can be aggressive, not app-specific. QUIC congestion control in user space, pluggable, can use BBR, Copa, etc., per-stream? Actually QUIC CC is per-connection but can be customized, faster iteration, can integrate with video ABR, pacing, loss recovery. QUIC has built-in loss recovery, ACKs, retransmission, no TCP stack limitations. For video, can tune CC to latency/buffering, use BBR for throughput, maybe Copa for fairness. TCP can also use BBR if kernel supports, but less flexible.
+
+Recommend one: QUIC for video streaming service, especially mobile/adaptive streaming. Justify: eliminates cross-stream HOL, connection migration reduces rebuffering on network changes, flexible CC in user space can optimize for video QoE. Caveats: UDP may be blocked/throttled, need fallback to TCP, ecosystem, server complexity, security (QUIC TLS 1.3 built-in), 0-RTT considerations. If service targets constrained networks where UDP blocked, keep TCP fallback. But recommend QUIC as primary.
+
+Need maybe mention video streaming specifics: DASH/HLS, segment sizes, ABR, multiple representations, low latency. TCP with HTTP/2: HOL blocking can delay next segment if previous lost; QUIC streams allow independent segment delivery. For live low-latency, QUIC better. For VOD, still benefits.
+
+Need maybe compare table. Need final with recommendation. Ensure not too long but detailed. Could include "if you must choose one: QUIC". Need maybe mention TCP's advantages: ubiquity, mature, simpler, good for simple VOD, but QUIC wins.
+
+Let's craft final: intro, table, sections, recommendation. Include nuance: QUIC's HOL blocking is per-stream; if you put all video in one stream, still HOL within that stream, but can split segments/streams. TCP's HOL is at packet level for entire connection; a lost packet stalls all streams. QUIC connection migration: connection ID, path validation, 0-RTT? Actually migration

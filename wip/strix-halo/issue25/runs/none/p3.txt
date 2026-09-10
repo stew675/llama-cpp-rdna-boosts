@@ -1,0 +1,22 @@
+We need answer user: "Implement an LRU cache in Rust with O(1) get and put. Explain the data structure choices and show tests."
+
+Need produce final with Rust code, explanation, tests. Need likely include HashMap and doubly linked list. In Rust, can implement with std::collections::HashMap and custom doubly linked list using indices or pointers? Need O(1). Options:
+1. HashMap<K, NodeIndex> + Vec<Node> where Node has key, value, prev, next, maybe dummy head/tail. But if using Vec, removing middle O(1) if we have indices, but inserting at front requires shifting if Vec. Could use intrusive linked list with Box nodes and HashMap<K, *mut Node<K,V>>? Raw pointers unsafe. Or use HashMap<K, usize> and a custom doubly linked list with nodes allocated in a pool? Need O(1) put/get.
+
+Simplest safe Rust: use std::collections::HashMap and a custom doubly linked list implemented with `VecDeque`? No, moving arbitrary node to front O(n) unless using linked list.
+
+Could use `HashMap<K, Node<K,V>>` where Node contains prev/next as Option<NonNull<Node>>? unsafe. Or use `linked_list` crate? But likely want std only.
+
+Alternative: Use `HashMap<K, (u64, V)>` with timestamps and lazy eviction? get O(1) average, put O(1) average but eviction may be O(n) if not careful. Not true O(1) worst-case.
+
+Need implement LRU with O(1) get and put. In Rust safe? We can implement doubly linked list using `Vec` of nodes and indices, but insertion at front O(1) if we maintain a free list? Let's think.
+
+We need support:
+- get(key): if exists, move node to front (most recent), return value.
+- put(key, value): if exists update value and move to front; else if capacity full evict least recent (tail), insert new at front.
+
+Data structure: HashMap<K, usize> mapping key to node index. A doubly linked list of nodes. If nodes stored in `Vec<Node>` and we insert at front by pushing to front? Vec doesn't have O(1) push_front. Could store list in a circular linked list with fixed capacity? If capacity known at construction, allocate `Vec<Node>` of length capacity, use indices 0..capacity-1 as slots. Maintain free list of available slots. Then insert at front O(1) by taking a free slot, linking. Evict tail O(1). Move to front O(1). This is safe and O(1) worst-case (assuming HashMap O(1) average). Capacity fixed. This is nice.
+
+But if capacity can be 0? handle.
+
+Implement generic `LruCache<K, V>` where K: Eq + Hash, V: Clone? get returns Option<&V>? If we need mutable? Could return Option<&V>. But moving node to front while returning reference to value: borrow checker issue if get mutates self and returns &V. We can implement `get(&mut self, key) -> Option<&V>`? In Rust, cannot return reference to self while also mutating? Actually method `fn get(&mut self, key: &K) ->
