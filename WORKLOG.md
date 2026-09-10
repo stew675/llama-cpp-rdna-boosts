@@ -10,6 +10,24 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Container CI: the 15-patch set packaged as ROCm containers (2026-09-10).**
+  Added `.github/workflows/docker-ghcr.yml` + `.devops/rdna-rocm.Dockerfile`
+  (adapted from upstream's `.devops/rocm.Dockerfile`) to build and publish
+  `full`/`light`/`server` images to GHCR for ROCm 7.2 (`7.2.4-complete`),
+  7.14 (`7.14.1-full`) and 10.0 (`10.0.0-full`).  The workflow downloads
+  upstream at the fork point `9113cc188` as a tarball, `git init`s the tree,
+  applies `patches/0001..0015` with strict `git am` (base + 15 commits), then
+  builds for `gfx1100;gfx1151;gfx1200;gfx1201` with `-DGGML_HIP_RCCL=ON`.
+  Distribution infra only -- **no patch/block content changed.**  Verified
+  2026-09-10: two full runs green (all three jobs, ~80-92 min each); tags
+  `rocm-{7.2,7.14,10.0}` (= `server-*`), `light-*`, `full-*` (+ immutable
+  `-9113cc188` variants; `latest` = ROCm 10.0 server) published public at
+  `ghcr.io/mrdrmccoy/llama-cpp-rdna-boosts`; a local podman build of the same
+  Dockerfile produced working `light`/`server` containers (the binaries report
+  build 16 / commit `ee93ba5`) with `librccl.so.1` linked.  Registry
+  `buildcache-*` tags (mode=max) carry the layer cache; `provenance: false`
+  keeps each single-arch tag a plain image manifest.  See `CONTAINERS.md`.
+
 - **V5 native bf16 K/V folded into Block 15 (opt-in, same switch as V4) — D12 closed
   (2026-09-10).**  The bf16 lever is implemented, validated and packaged as a **dated
   amendment to block 15** (`patches/0015`, canonical tip `f5ab5350b` on `9113cc188`;

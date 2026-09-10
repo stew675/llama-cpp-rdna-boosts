@@ -57,8 +57,12 @@ If the package is private, authenticate first:
 - `workflow_dispatch` — pick the ROCm release lines (`7.2 7.14 10.0` by
   default) and whether to push; unchecking push runs a build-only
   validation.
-- push to `main` (and the `ci/docker-ghcr` development branch).
+- push to `main`.
 - weekly `schedule` (the images are expensive, so no per-push rebuild).
+
+To run it on a feature branch before merging, temporarily add that branch to
+`on.push.branches` (or merge first and use `workflow_dispatch`, which GitHub
+only exposes once the workflow is on the default branch).
 
 The fork point is the `FORK_POINT` env var in the workflow; bump it (and the
 patch set) together when the delivery is re-based.
