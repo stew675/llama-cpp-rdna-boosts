@@ -38,6 +38,10 @@ PROMPTS = [
     "A farmer has 17 sheep. All but 9 run away. Then he buys twice as many as remain. How many sheep does he have? Show your reasoning step by step, then write the same logic as a TypeScript function.",
 ]
 
+if os.environ.get("PROMPT_FILE"):
+    with open(os.environ["PROMPT_FILE"]) as _f:
+        PROMPTS = [_f.read()]
+
 ARMS = {
     "none": ["--spec-type", "none"],
     "n1": ["--spec-type", "draft-mtp", "--spec-draft-n-max", "1"],

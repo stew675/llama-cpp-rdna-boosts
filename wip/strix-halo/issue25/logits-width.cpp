@@ -56,6 +56,16 @@ int main(int argc, char ** argv) {
         const int W = widths[wi];
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = 2048; cp.n_batch = ubatch; cp.n_ubatch = ubatch; cp.n_seq_max = 1;
+        // Replicate the MTP verify-batch recurrent-state snapshot count:
+        // common sets n_rs_seq = draft.n_max, so a W-token batch with n_max=W-1
+        // uses n_rs_seq = W-1 (K = n_rs_seq+1).  RS=zero forces plain decode;
+        // RS=<n> pins a fixed n_rs_seq.
+        {
+            const char * rs = getenv("RS");
+            cp.n_rs_seq = (rs == nullptr) ? 0u
+                        : (strcmp(rs, "from_w") == 0) ? (uint32_t) (W - 1)
+                        : (uint32_t) atoi(rs);
+        }
         const char * fa = getenv("FA");
         cp.flash_attn_type = (fa && (!strcmp(fa, "0") || !strcmp(fa, "off"))) ? LLAMA_FLASH_ATTN_TYPE_DISABLED
                             : (fa && (!strcmp(fa, "1") || !strcmp(fa, "on"))) ? LLAMA_FLASH_ATTN_TYPE_ENABLED
@@ -87,7 +97,7 @@ int main(int argc, char ** argv) {
             rows[wi].push_back(std::vector<float>(l, l + nv));
             rownum[wi].push_back(j);
         }
-        printf("W=%d captured %d rows\n", W, W);
+        printf("W=%d n_rs_seq=%u captured %d rows\n", W, cp.n_rs_seq, W);
         llama_batch_free(b);
         llama_free(ctx);
     }
