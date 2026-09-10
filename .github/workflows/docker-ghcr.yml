@@ -1,0 +1,210 @@
+# Build llama.cpp with the rdna-boosts patch set applied and publish ROCm
+# container images to GHCR.
+#
+# Pipeline:
+#   1. shallow-download upstream llama.cpp at the recorded fork point
+#      (codeload tarball by SHA -- no full history),
+#   2. `git init` + base commit, then apply patches/0001..0015 with
+#      scripts/apply-all.sh (strict `git am`),
+#   3. build the full / light / server images from .devops/rdna-rocm.Dockerfile
+#      against ROCm 7.2 (complete base), 7.14 and 10.0 (full base),
+#   4. push to ghcr.io/<owner>/<repo>.
+#
+# Reference: upstream llama.cpp's .github/workflows/docker.yml and
+# .devops/rocm.Dockerfile.
+
+name: Build and publish ROCm containers (GHCR)
+
+on:
+  workflow_dispatch:
+    inputs:
+      rocm_versions:
+        description: "Space-separated ROCm release lines to build"
+        required: true
+        default: "7.2 7.14 10.0"
+        type: string
+      push:
+        description: "Push the built images to GHCR (uncheck for build-only validation)"
+        required: true
+        default: true
+        type: boolean
+  push:
+    branches:
+      - main
+      - ci/docker-ghcr
+  schedule:
+    # Weekly rebuild: the images are expensive, no need for per-push builds.
+    - cron: "23 5 * * 0"
+
+concurrency:
+  group: docker-ghcr-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  FORK_POINT: 9113cc188
+  UPSTREAM_TARBALL: https://codeload.github.com/ggml-org/llama.cpp/tar.gz
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  prepare:
+    name: Resolve build matrix
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - name: Build matrix from requested ROCm versions
+        id: m
+        shell: bash
+        env:
+          REQUESTED: ${{ github.event.inputs.rocm_versions || '7.2 7.14 10.0' }}
+        run: |
+          set -euo pipefail
+          items='[]'
+          for v in $REQUESTED; do
+            case "$v" in
+              7.2)  full="7.2.4";  suffix="complete" ;;
+              7.14) full="7.14.1"; suffix="full" ;;
+              10.0) full="10.0.0"; suffix="full" ;;
+              *) echo "unsupported ROCm release line: $v" >&2; exit 1 ;;
+            esac
+            items="$(jq -c --arg v "$v" --arg f "$full" --arg s "$suffix" \
+              '. + [{rocm:$v, rocm_version:$f, rocm_suffix:$s}]' <<<"$items")"
+          done
+          echo "matrix=$(jq -c . <<<"$items")" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ROCm ${{ matrix.rocm }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Check out delivery repo (patches + Dockerfile)
+        uses: actions/checkout@v4
+
+      - name: Clone upstream at the fork point and apply the rdna-boosts set
+        run: |
+          set -euo pipefail
+          git config --global user.email "ci@rdna-boosts.invalid"
+          git config --global user.name "rdna-boosts CI"
+          src="$GITHUB_WORKSPACE/llama-src"
+          mkdir -p "$src"
+          curl -fsSL -o /tmp/llama.tar.gz "${UPSTREAM_TARBALL}/${FORK_POINT}"
+          tar -xzf /tmp/llama.tar.gz -C "$src" --strip-components=1
+          cd "$src"
+          git init -q .
+          git add -A
+          git commit -q -m "llama.cpp ${FORK_POINT} (base)"
+          bash "$GITHUB_WORKSPACE/scripts/apply-all.sh" .
+          # base commit + 15 block commits
+          test "$(git rev-list --count HEAD)" -eq 16
+          git log --oneline -15
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image names and tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/${GITHUB_REPOSITORY#*/}"
+          v="${{ matrix.rocm }}"
+          fp="${FORK_POINT}"
+          {
+            echo "image=$image"
+            echo "full=${image}:full-rocm-${v},${image}:full-rocm-${v}-${fp}"
+            echo "light=${image}:light-rocm-${v},${image}:light-rocm-${v}-${fp}"
+            echo "cache=${image}:buildcache-rocm-${v}"
+          } >> "$GITHUB_OUTPUT"
+          server="${image}:server-rocm-${v},${image}:server-rocm-${v}-${fp},${image}:rocm-${v}"
+          if [ "$v" = "10.0" ]; then
+            server="${server},${image}:latest"
+          fi
+          echo "server=$server" >> "$GITHUB_OUTPUT"
+
+      - name: Get build date
+        id: date
+        run: echo "value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push full image
+        uses: docker/build-push-action@v6
+        with:
+          context: llama-src
+          file: .devops/rdna-rocm.Dockerfile
+          target: full
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+          tags: ${{ steps.tags.outputs.full }}
+          build-args: |
+            ROCM_VERSION=${{ matrix.rocm_version }}
+            AMDGPU_VERSION=${{ matrix.rocm_version }}
+            ROCM_IMAGE_SUFFIX=${{ matrix.rocm_suffix }}
+            BUILD_DATE=${{ steps.date.outputs.value }}
+            APP_VERSION=${{ env.FORK_POINT }}
+            APP_REVISION=${{ env.FORK_POINT }}
+          cache-from: type=registry,ref=${{ steps.tags.outputs.cache }}
+          cache-to: type=registry,ref=${{ steps.tags.outputs.cache }},mode=max
+
+      - name: Build and push light image
+        uses: docker/build-push-action@v6
+        with:
+          context: llama-src
+          file: .devops/rdna-rocm.Dockerfile
+          target: light
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+          tags: ${{ steps.tags.outputs.light }}
+          build-args: |
+            ROCM_VERSION=${{ matrix.rocm_version }}
+            AMDGPU_VERSION=${{ matrix.rocm_version }}
+            ROCM_IMAGE_SUFFIX=${{ matrix.rocm_suffix }}
+            BUILD_DATE=${{ steps.date.outputs.value }}
+            APP_VERSION=${{ env.FORK_POINT }}
+            APP_REVISION=${{ env.FORK_POINT }}
+          cache-from: type=registry,ref=${{ steps.tags.outputs.cache }}
+          cache-to: type=registry,ref=${{ steps.tags.outputs.cache }},mode=max
+
+      - name: Build and push server image
+        uses: docker/build-push-action@v6
+        with:
+          context: llama-src
+          file: .devops/rdna-rocm.Dockerfile
+          target: server
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+          tags: ${{ steps.tags.outputs.server }}
+          build-args: |
+            ROCM_VERSION=${{ matrix.rocm_version }}
+            AMDGPU_VERSION=${{ matrix.rocm_version }}
+            ROCM_IMAGE_SUFFIX=${{ matrix.rocm_suffix }}
+            BUILD_DATE=${{ steps.date.outputs.value }}
+            APP_VERSION=${{ env.FORK_POINT }}
+            APP_REVISION=${{ env.FORK_POINT }}
+          cache-from: type=registry,ref=${{ steps.tags.outputs.cache }}
+          cache-to: type=registry,ref=${{ steps.tags.outputs.cache }},mode=max
