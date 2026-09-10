@@ -80,7 +80,7 @@ Verify: applying it must leave `ggml/src/ggml-alloc.c` byte-identical to upstrea
 `ab/w4-revert.patch` was generated with `git diff -R` and verified: apply W4 → 1 file/+35 → apply the
 revert → 0 modified files.
 
-## 3. The critical path — V3 first, then V4
+## 3. The critical path — V4 only (V3 is DONE)
 
 Both are specced in `wip/arch-independent-memory/DERIVED-MASK-DESIGN.md` (§2 options, §3 consumers, §5
 the facility shape, §6 cost/benefit, §7 the qwen4exp L1 worked example).  Both must be **on by default
