@@ -11,14 +11,29 @@ beta window (~4–5 days) **opens now**; promotion into the delivery set is
 already done in the sense that the patch is in `patches/` and applies with
 the rest (`scripts/apply-all.sh`, strict 15/15 `git am`) — the window is
 for tester feedback before the block is declared stable and this README is
-turned into the final promotion record.  All six wins are on by default
-except **V4, which is opt-in** (`GGML_CUDA_FA_KV_NATIVE=1`; see the gate
-table below) — the policy exception the maintainer approved on 2026-09-10
-(a sub-2 % prefill loss with a large memory win and no cheap fix ships as
-an enable switch rather than a kill-switch).
+turned into the final promotion record.  All seven wins are on by default
+except **V4 and V5, which are opt-in through the same switch**
+(`GGML_CUDA_FA_KV_NATIVE=1`; see the gate table below) — the policy
+exception the maintainer approved on 2026-09-10 (a sub-2 % prefill loss
+with a large memory win and no cheap fix ships as an enable switch rather
+than a kill-switch), and the explicit instruction for the bf16 item
+("treat it similarly to V4 ... gated by the same environment variable").
 
-**Beta start: 2026-09-10.**  Canonical tip `09a137566` on a fork rebuilt at
-`9113cc188` (the reference `~/llama.cpp` checkout had drifted two upstream
+**Amendment (2026-09-10): V5 native bf16 K/V.**  Folded into the block the
+same day it was designed: a bf16 K/V cache no longer needs the F16 staging
+scratch, so with the switch on it costs exactly what an f16 cache costs
+(4B 968.86 → **256.86** MiB/GPU at ub 2048, 27B 1072.86 → **488.86**,
+gemma-4-E4B 1062.89 → **404.89**, gemma-4-31B 2068.89 → **716.89**;
+ub 1024/512 win 756/778 on the 4B and 746 on the 27B; qwen4exp unchanged)
+for 0.2–2.4 % prefill depending on prompt length, decode untouched.  The
+amendment touched `patches/0015` only (`0001`–`0014` stayed byte-identical)
+and was re-validated end to end from the delivered patches — see the V5
+amendment section in `../../patches/README.md` and §3.4/§9 of
+`../../wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`.
+
+**Beta start: 2026-09-10.**  Canonical tip `f5ab5350b` (the block-15 commit,
+amended in place with V5; the original cut was `09a137566`) on a fork
+rebuilt at `9113cc188` (the reference `~/llama.cpp` checkout had drifted two upstream
 master commits past the fork point at cut time; always regenerate from a
 canonical fork rebuilt at the fork point — see `../../BASELINE.md`).
 The result: **3.44 GiB/GPU + 1.2 GiB host** reclaimed on qwen4exp at ctx
@@ -67,6 +82,7 @@ why the combination pass exists.)
 |---|---|---|---|
 | **V3** | derived kq mask for the plain attention path: stop materialising the `n_kv × n_tps` F16 mask and its host mirror; derive visibility in the FA prefill/MMA kernel from compact per-cell state (packed mask kept for decode, small batches and every unsupported case).  **DONE 2026-09-10 (phases 1+2a+2b+2c), ON BY DEFAULT** — the predicate is proven bit-exact on the host (incl. SWA and non-causal), the op + a CPU reference + the CUDA MMA derived path are validated standalone (6/6 derived `test-backend-ops` cases on CPU, 3/3 on ROCm0, 5104/5104 FA suite), and the graph plumbing/probe shipped as `patches/0005-*`.  The packed mask is still created in every graph — it simply ends up with no consumer on the derived path, so the allocator leaves it unallocated and the existing fill guards skip the fill (no consumer can ever be mis-served) | **−799 MiB/GPU VRAM − 799 MiB host** measured (4B 1800.33→1001.13 compute + 840.34→41.13 host; 27B 1920.33→1121.13 + 880.34→81.13; gemma-4-E4B ISWA −809/−809; gemma-4-31B −811/−811; scaling exactly `n_kv × n_tps × 2 B`).  Cost: prefill −1.1 % (pp20480/ub 2048), decode −0.7 %; MTP acceptance identical (0.76744); qwen4exp unchanged | **`wip/arch-independent-memory/V3-DERIVED-KQ-MASK-PLAN.md`** (verified predicate + spec + §4.3-§4.5 record); `DERIVED-MASK-DESIGN.md` §2–§5 + §7; `HANDOVER.md` §3.1 |
 | **V4** | native q8_0 K/V in the FA path (MMA **and** TILE loaders): dequantize into the shared K/V tiles instead of staging a F16 copy of the whole cache.  **DONE 2026-09-10, OPT-IN** (`GGML_CUDA_FA_KV_NATIVE=1`, default off - a sub-2 % prefill loss with a large memory win and no cheap way to close it, per the maintainer's rule).  The staged values are bit-identical to the F16 conversion (`dequantize_block_q8_0_f16` computes a single F16 rounding of the exact `int8 × half` product); decode/verify unaffected | **−744 MiB/GPU** (4B 1001.13→257.13) / **−632 MiB** (27B Meta 1121.13→489.13) / −1224 (gemma-4-31B) at ctx 204800 ub 2048, more at ub 1024/512; cost prefill −1.7 %, decode ±0.1 % | **`wip/arch-independent-memory/V4-NATIVE-Q8-KV-PLAN.md`** (mechanism + design + implementation table + reserve matrix + validation + the on-by-default follow-up); `HANDOVER.md` §3.2 |
+| **V5** | **native bf16 K/V in the MMA FA kernel** (convert each 16-byte staged chunk in registers — bf16 and f16 tiles have the same byte layout — instead of copying from the whole-cache F16 staging scratch; the per-operand staging source is one shared type code `FATTN_KV_NATIVE_{NONE,Q8_0,BF16}`, subsuming V4's flags) | `wip/arch-independent-memory/patches/0007-v5-native-bf16-kv.patch` (4 files, +171 net, base = block 15) | compute 4B 968.86 → **256.86** (ub 1024 884.82 → 128.82, ub 512 842.80 → 64.80), 27B Meta 1072.86 → **488.86** (ub 512 868.80 → 122.80), gemma-4-E4B 1062.89 → **404.89**, gemma-4-31B 2068.89 → **716.89** MiB/GPU; qwen4exp unchanged; TILE/verify (ub 8) unchanged at 8.09; coherence byte-identical (on vs off vs f16, all models, short + 3k/40k prompts); MTP identical (27B 0.82716, qwen4exp 0.44262); **OPT-IN** through V4's `GGML_CUDA_FA_KV_NATIVE` — cost prefill −0.2 % (pp2048) / +0.3 % (8192) / −1.06 % (20480) / −2.36 % (40960) on the 4B and −0.76 % on the 27B, decode ±0.1 % | `BF16-NATIVE-KV-PLAN.md` §9; `test-backend-ops` FLASH_ATTN_EXT 7859/7859 (2704 bf16 + 365 q8_0 cases green in both arm states) |
 | **V2** | *fallback for V3 only*: 1-bit packed mask (bit-exact by construction, no per-cell state) if V3 phase 3.1 proves too invasive | −750 MiB/GPU − 750 MiB host | same, §4 (V2) |
 
 Not in Block 15 at all: **3a** (through-view reuse — measured **zero** reserve win on the 27B/4B) and
@@ -75,8 +91,10 @@ everything in `archive/work/`.
 ## 2. Gate audit
 
 Policy: every win is **on by default**; a tester must be able to switch each one off individually.
-**Exception, decided 2026-09-10: V4 ships opt-in (default off)** - it trades ~1.7 % prefill for a large
-memory win and the gap could not be closed cheaply; the gate is documented in the table below.
+**Exception, decided 2026-09-10: V4 and V5 ship opt-in (default off, one shared switch)** - V4 trades
+~1.7 % prefill for a large memory win, V5 0.2-2.4 % (growing with prompt length) for a bf16 cache costing
+exactly what an f16 one does; in both cases the gap could not be closed cheaply.  The gate is documented
+in the table below.
 
 | win | gate today | needed |
 |---|---|---|
@@ -85,7 +103,7 @@ memory win and the gap could not be closed cheaply; the gate is documented in th
 | W3 | none | add `LLAMA_QSA_KEYS_ONLY=0` → keep the (dead) V buffer (default 1). |
 | W4 | none — **decided 2026-09-10: it is a bug fix, not a policy** | **no gate.**  A/B with the ready-made revert: `git apply ab/w4-revert.patch` (verified round trip: W4 → +35 lines → revert → pristine) or `git apply -R ../../upstream/UPSTREAM-PR-ggml-alloc-unused-view.patch`; rebuild and re-run `../../wip/arch-independent-memory/repro/ggml-alloc-unused-view.c` (56.00 MiB again = the bug is back). |
 | V3 | **DONE (2026-09-10)** | `LLAMA_KQ_MASK_DERIVED` (default 1; 0 = always the packed mask) + the backend/cache capability check (the feature turns itself off where it cannot be correct). |
-| V4 | **DONE (2026-09-10), OPT-IN** | `GGML_CUDA_FA_KV_NATIVE` (**default 0**; `1` = dequantize q8_0 K/V while staging the FA tiles and skip the F16 staging scratch).  Unlike the other wins this one is an *enable* switch, not a kill-switch: the maintainer's rule of 2026-09-10 is that a sub-2 % loss with a large memory win and no cheap way to close the gap ships opt-in (`V4-NATIVE-Q8-KV-PLAN.md` §5).  The A/B is the same variable: unset/0 = the F16 staging path, 1 = native. |
+| V4 + V5 | **DONE (2026-09-10), OPT-IN (one shared switch)** | `GGML_CUDA_FA_KV_NATIVE` (**default 0**; `1` = dequantize q8_0 K/V *and* convert bf16 K/V while staging the FA tiles, skipping the F16 staging scratch for that operand — a model has one KV type, so the two arms never compete).  Unlike the other wins this one is an *enable* switch, not a kill-switch: the maintainer's rule of 2026-09-10 is that a sub-2 % loss with a large memory win and no cheap way to close the gap ships opt-in (`V4-NATIVE-Q8-KV-PLAN.md` §5).  The A/B is the same variable: unset/0 = the F16 staging path, 1 = native. |
 
 Gate names follow the existing convention (`GGML_QSA_*` for the graph-level knobs, `LLAMA_QSA_*` for
 the cache-level ones).
@@ -162,6 +180,20 @@ qwen4exp, ctx 204800, `-ctk/-ctv q8_0`, 3× R9700, per GPU:
 | + W1+W2 | **3251.39** | **63.69** | 1675.33 | 33.64 |
 | + W3 | (W3 does not change the compute buffer; it shrinks the indexer KV cache 956.26 → **318.76** MiB/GPU) | | | |
 | + V3 + V4 (block 15, defaults / V4 on) | 3251.39 / 3251.39 (qwen4exp is not affected by V3/V4) | | | |
+
+bf16 KV (V5), ctx 204800, per GPU (arm off → on):
+
+| model | ub2048 | ub1024 | ub512 |
+|---|---|---|---|
+| Qwen3.5-4B-Q8_0 (1 GPU) | 968.86 → **256.86** | 884.82 → **128.82** | 842.80 → **64.80** |
+| Qwen3.8-27B-Q8_0 (3-GPU Meta) | 1072.86 → **488.86** | — | 868.80 → **122.80** |
+| gemma-4-E4B-it (1 GPU, ISWA) | 1062.89 → **404.89** | — | — |
+| gemma-4-31B-it (3-GPU, ISWA) | 2068.89 → **716.89** | — | — |
+| qwen4exp (3-GPU) | 3298.81 → 3298.81 (no-op) | — | — |
+
+With V5 on, a bf16 cache reserves exactly what an f16 cache does (f16: 4B 256.86, 27B 488.86,
+gemma-4-E4B 404.89, gemma-4-31B 716.89 — re-measured in the same session), so the switch removes
+bf16's memory penalty without imposing its own.
 
 Dense controls (no qwen4exp involved; block 15 measured with V3 on): Qwen3.5-4B-Q8_0
 **1001.13/41.13** (V4 on: 257.13) and Qwen3.8-27B-Q8_0 **1121.13/81.13** (V4 on: 489.13) at ub2048

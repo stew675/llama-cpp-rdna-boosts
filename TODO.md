@@ -26,13 +26,29 @@ Reality pass: 2026-09-10 (block 15 cut).
   `patches/README.md` (2026-09-10 block-15 section), `WORKLOG.md`.
 - **Beta window open** (2026-09-10, ~4-5 days): tester material is `beta/block-15-campaign-wins/BETA-TESTING.md`.
   Promotion = declaring it stable; feedback that needs a change becomes a dated amendment to block 15.
-- **NEXT UP (D12): bf16-native MMA K/V - PLAN READY, not implemented.**
-  `wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md` is the executable plan (measured before-state in
-  the delivered tree: 4B ub 2048 256.86 -> 968.86 MiB (+712), ub 1024 +756, ub 512 +778, 27B ub 2048
-  +584, ub 512 +746, ub 8 unchanged, V4 does not cover bf16; mechanism + exact code map; design: keep
-  the F16 fragments, cp_async the raw bf16 bytes, convert the tile in place; validation protocol;
-  three-way ship rule - expectation on by default).  Scope fixed by D10 (no pure-bf16 rework).  Folds
-  into Block 15 as a dated amendment.
+- **DONE (2026-09-10, D12 closed): V5 native bf16 K/V, folded into Block 15 as a dated amendment.**
+  bf16 was the last KV type paying the F16 staging scratch in prefill; the MMA loader now converts each
+  16-byte staged chunk in registers (bit-identical to the launcher's own conversion), behind the **same
+  `GGML_CUDA_FA_KV_NATIVE` switch as V4 (default 0, opt-in)**.  With it enabled a bf16 cache costs
+  exactly an f16 one: 4B ub 2048 968.86 -> **256.86** MiB/GPU (ub 1024 884.82 -> 128.82, ub 512
+  842.80 -> 64.80), 27B 1072.86 -> **488.86**, gemma-4-E4B 1062.89 -> **404.89**, gemma-4-31B
+  2068.89 -> **716.89**; qwen4exp unchanged (its FA path never staged bf16); TILE/verify unaffected.
+  Opt-in because dropping the scratch costs 0.2-2.4 % prefill (growing with the prompt) and the
+  maintainer's instruction for this item was explicitly "treat it similarly to V4, gated by the same
+  environment variable".  Design + full measurements: `wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`
+  (section 9) and the V5 amendment section in `patches/README.md`.  Scope was fixed by D10 (no
+  pure-bf16 rework).
+- **Follow-up (would make V5 free): the loss is not the conversion — native bf16 staging measures within
+  0.2 % of an f16 cache — it is the removed F16 scratch, which is a *dense, normalised* copy of the cache
+  view (for a 4-KV-head model `nb[1]` is 4x the row size: the GQA heads are interleaved), while the
+  native path re-reads that interleaved view on every staging pass.  Options: (a) restrict the arm to
+  layouts where `nb[1] == ne[0]*2` (single-KV-head models — a 1-line predicate change, then free there),
+  (b) make the native staging read densely, or (c) make the KV cache itself non-interleaved (a
+  llama.cpp-wide change).  None is needed for the current opt-in delivery.
+- **Cleanup candidate (block-15 wart, pre-existing): `src/llama-kv-cache.h:274` warns
+  `-Wunused-private-field` for `v_enabled` on a full build** (the field *is* used, in
+  `llama-kv-cache.cpp:232`; clang's per-TU analysis is what fires).  A `[[maybe_unused]]` one-liner
+  silences it — left alone here to keep the V5 amendment scoped to the FA kernels.
 - **Documented, NOT fixed (pre-existing): mixed K/V types fall off the GPU attention path.**  Any mixed
   pair (`bf16`+`q8_0`, `f16`+`q8_0`) gives `graph splits = 18`, a ~1.5 GiB host compute buffer and
   pp2048 7924 -> 640-1049 t/s on the 4B.  Same-type K/V is the practical choice; fixing it needs the FA
@@ -45,7 +61,7 @@ Reality pass: 2026-09-10 (block 15 cut).
   than the 3 devices (one device gets a zero-extent share); it works on 1 GPU, on 2 GPUs and on 3 GPUs with
   `-sm layer`.  Every other model is unaffected.  A future block (or an upstream report) should make the
   splitter tolerate a zero-extent device share.  See `patches/README.md`.
-- **Fork/canonical state**: the working checkout's `rdna-boosts` (block 15 = `8ee104f33`) sits on a master
+- **Fork/canonical state**: the working checkout's `rdna-boosts` (block 15 + V5 = `c3f58165b`) sits on a master
   two commits newer than the fork point, so it must NOT be used for regeneration (it exports `f3f1a8f27`
   + `304665fe7` as patches 0001/0002).  The canonical 15-block chain is the local branch
   `block15-canonical` (`09a137566`, rebuilt at `9113cc188`); `make-patches.sh` default tip = `09a137566`.

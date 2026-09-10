@@ -31,7 +31,7 @@ All 15 patches are generated against **llama.cpp upstream master at
 2026-09-02 from `0eadefebd`; dated records at the
 bottom of this file): blocks 01-15 = the fork's `rdna-boosts` block
 commits on `9113cc188` (block 15, the attention-memory campaign wins, is
-the canonical-fork tip `09a137566`; the reference `~/llama.cpp`
+the canonical-fork tip `f5ab5350b` (the block-15 commit, amended 2026-09-10 with V5 native bf16 K/V; the pre-amendment cut was `09a137566`); the reference `~/llama.cpp`
 `rdna-boosts` branch is *disposable* and had at cut time drifted two
 upstream master commits past the fork point — `f3f1a8f27` (iGPU lazy-
 load default) and `304665fe7` (SYCL IQ-type-for-MoE), both dated after
@@ -39,7 +39,7 @@ load default) and `304665fe7` (SYCL IQ-type-for-MoE), both dated after
 wrongly export those two upstream commits as patches 0001/0002.
 **Always regenerate from a canonical fork rebuilt at `9113cc188` via
 `scripts/apply-all.sh`** (that is what `make-patches.sh`'s default tip
-`09a137566` refers to, kept alive by the fork checkout's local branch
+`f5ab5350b` refers to, kept alive by the fork checkout's local branch
 `block15-canonical`).  The two commits' content is 106 lines in 3 files
 (`ggml/src/ggml-sycl/mmvq.cpp`, `ggml/src/ggml-sycl/vecdotq.hpp`,
 `src/llama-model.cpp`) and is deliberately **not** in the delivery — it

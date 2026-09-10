@@ -7,9 +7,10 @@
 #   baseline-sha  the upstream baseline the patches are generated against
 #                 (default: 9113cc188, see MANIFESTS.md)
 #   blocks-tip    the fork commit carrying all 15 blocks (default:
-#                 09a137566, the block-15 commit of the CANONICAL fork
-#                 rebuilt at 9113cc188 via scripts/apply-all.sh; the
-#                 branch `block15-canonical` keeps this chain alive in the
+#                 f5ab5350b, the block-15 commit of the CANONICAL fork
+#                 rebuilt at 9113cc188 via scripts/apply-all.sh and amended
+#                 2026-09-10 with V5 native bf16 K/V; the branch
+#                 `block15-canonical` keeps this chain alive in the
 #                 reference checkout).  The block-15 tip of the *working*
 #                 fork checkout (~/llama.cpp rdna-boosts) is a different
 #                 SHA, because that branch was rebased onto a master that
@@ -28,7 +29,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
 BASELINE="${2:-9113cc188}"
-TIP="${3:-09a137566}"
+TIP="${3:-f5ab5350be1ece7bfe7b77c52ba536c592d453ca}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then

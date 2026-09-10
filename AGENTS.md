@@ -73,12 +73,15 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), **W3** keys-only QSA
   indexer cache (`LLAMA_QSA_KEYS_ONLY`), **W4** ggml-alloc unused-view
   release (no gate), **V3** derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by
-  default) and **V4** native q8_0 K/V in the FA kernels
-  (`GGML_CUDA_FA_KV_NATIVE`, **opt-in, default 0**).  Cut 2026-09-10 (tip
-  `09a137566` on the canonical fork rebuilt at `9113cc188`); ~3.4 GiB/GPU
+  default), **V4** native q8_0 K/V and **V5** native bf16 K/V in the FA
+  kernels (both behind the same `GGML_CUDA_FA_KV_NATIVE`, **opt-in,
+  default 0**).  Cut 2026-09-10 and **amended 2026-09-10 with V5** (tip
+  `f5ab5350b` on the canonical fork rebuilt at `9113cc188`); ~3.4 GiB/GPU
   + ~1.2 GiB host on qwen4exp and ~800 MiB/GPU + 800 MiB host on dense
-  models, byte-identical output, ~1.3 % prefill / ~0.3 % decode cost;
-  beta window open.  See the 2026-09-10 block-15 section in
+  models (a bf16 KV cache saves a further 712/584/658/1352 MiB with V5
+  enabled), byte-identical output, ~1.3 % prefill / ~0.3 % decode cost
+  (V4 ~1.7 %, V5 0.2-2.4 % depending on prompt length, V5 measured
+  against the scratch it removes); beta window open.  See the 2026-09-10 block-15 section in
   `patches/README.md`, `beta/block-15-campaign-wins/README.md` and the
   `WORKLOG.md` entry.
 
@@ -90,8 +93,9 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is the local branch **`block15-canonical`** (tip `09a137566`, built
-by applying the delivery patches with `scripts/apply-all.sh` at `9113cc188`),
+chain is the local branch **`block15-canonical`** (tip `f5ab5350b`, built
+by applying the delivery patches with `scripts/apply-all.sh` at `9113cc188`
+and amended 2026-09-10 with V5),
 which is what `scripts/make-patches.sh`'s default tip refers to; always
 regenerate from a canonical fork rebuilt at the fork point.
 
@@ -127,11 +131,13 @@ guard). The
 canonical `9113cc188` fork used for `make-patches.sh`
 regeneration is disposable and is re-created from `patches/` +
 `scripts/apply-all.sh` whenever it needs rebuilding (fresh clone at the
-fork point + apply) — the last regeneration (2026-09-10, block 15) applied
-strict 15/15 `git am` and produced tip `09a137566`; blocks 01-14 patch
-bodies are byte-identical to the previous regeneration apart from the
-`From <sha>` line and the `[PATCH NN/15]` series count (the canonical fork
-is rebuilt, so its commit SHAs differ).  Older fork states are
+fork point + apply) — the last regeneration (2026-09-10, block 15, and its
+same-day V5 amendment) applied strict 15/15 `git am` and produced tip
+`f5ab5350b`; the amendment touched `0015` only, so `0001`-`0014` kept
+their `From <sha>` lines (the canonical branch was amended in place, not
+rebuilt); the original cut's `0001`-`0014` were byte-identical to the
+previous regeneration apart from the `From <sha>` line and the
+`[PATCH NN/15]` series count (that rebuild changed the canonical SHAs).  Older fork states are
 preserved on the `stew675/llama.cpp` fork remote (`rdna-boosts` =
 previous tip `482837e5a` on `0eadefebd`; `rdna-boosts-orig`, …) and in
 older local reference clones — never rely on them for the current
@@ -290,9 +296,13 @@ explicitly requests it.**
   A/B with `beta/block-15-campaign-wins/ab/w4-revert.patch`), **V3** derived
   kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default — the packed mask is still
   created in every graph and simply loses its consumer, so the allocator
-  leaves it unallocated) and **V4** native q8_0 K/V in the FA kernels
-  (`GGML_CUDA_FA_KV_NATIVE`, **opt-in, default 0**: it costs ~1.7 %
-  prefill — the lost `cp_async` pipeline — for −744/−632 MiB/GPU).  Two
+  leaves it unallocated), **V4** native q8_0 K/V and **V5** native bf16
+  K/V in the FA kernels (both behind `GGML_CUDA_FA_KV_NATIVE`, **opt-in,
+  default 0**: V4 costs ~1.7 % prefill — the lost `cp_async` pipeline —
+  for −744/−632 MiB/GPU, V5 0.2–2.4 % for a bf16 cache to cost exactly
+  what an f16 one does; the per-operand staging source is one shared type
+  code `FATTN_KV_NATIVE_{NONE,Q8_0,BF16}`, so the launcher, the alloc-size
+  query and the kernels cannot disagree).  Two
   validation facts to protect: same-seed output is **byte-identical**
   across every gate combination on every model, and the adaptive-MTP gate
   is unchanged (27B 0.76744, qwen4exp 0.44262 = the block-14 baseline).

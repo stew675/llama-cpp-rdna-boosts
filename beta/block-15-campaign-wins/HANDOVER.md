@@ -45,7 +45,7 @@
 | D8 | **Beta tester material: yes** — `BETA-TESTING.md` in this directory (one-page A/B checklist: gate table, the three measurements, the report template, what not to report). |
 | D9 | **V4 ship rule (three-way)**: no prefill-throughput regression → on by default; regression → ship it **opt-in (default off)** for people who need the last 832 MiB, with the trade-off documented; if even that is impractical → future work.  **Applied 2026-09-10**: the q8_0 arm measured −1.7 % prefill, so it ships **opt-in** (`GGML_CUDA_FA_KV_NATIVE=1`); and the maintainer's refinement of D9 is that **a sub-2 % loss with a memory win and no cheap way to close the gap ships opt-in anyway** (do not grind for the last percent). |
 | D11 | **gemma-4-E4B 3-GPU tensor-split abort (2026-09-10): document only, do NOT fix.**  The pre-existing meta-splitter abort found during the Block-15 combination pass (`n_head_kv = 2` is fewer than the 3 devices, so one device gets a zero-extent KV share) stays a documented limitation.  Rationale: it is a small model and running it in 3-GPU tensor-split mode is an unlikely configuration; it runs on 1 GPU, on 2 GPUs and on 3 GPUs with `-sm layer`.  See `../../patches/README.md` (block-15 section). |
-| D12 | **bf16-native MMA K/V is the one essential follow-up (2026-09-10)** — the maintainer's priority after this session.  It folds into **Block 15 as a dated amendment** (D5/D10), not a new block.  Full executable plan: `../../wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md` (measured before-state, mechanism + code map, design, validation protocol, ship rule, risks); the copy-paste prompt is §8 below. |
+| D12 | **bf16-native MMA K/V is the one essential follow-up (2026-09-10) — CLOSED the same day: shipped as V5**, a dated amendment to Block 15 (D5/D10), not a new block.  The maintainer's instruction when the measurement said it costs ~1 % prefill: *"treat it similarly to V4, and include it in the Patch 15 block, and have it gated by the same environment variable that V4 does"* — so V5 lives behind `GGML_CUDA_FA_KV_NATIVE` (default 0).  Plan + outcome: `../../wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md` (the plan, then **§9 the outcome**); the delivered record is the V5 amendment section in `../../patches/README.md`. |
 | D10 | **bf16 (2026-09-10): no pure-bf16 rework.**  llama.cpp is predicated on F16 as the always-available default, so the fork keeps the F16 compute path; bf16 K/V work must remove the *staging* (convert in place, keeping the F16 fragments and the cp_async pipeline), **not** re-instantiate the kernels natively.  A pure-bf16 fork is explicitly out of scope for now.  See §3.4. |
 
 ## 1. Where the campaign stands
@@ -258,7 +258,16 @@ the other quantized KV types (each is the same chunk decoder with a different bl
 Block 15 = **W1 + W2 + W3 + W4 + V2-or-V3 + V4** as one patch (D5), merged, gated, combined-validated,
 cut, and staged in `beta/` to open the ~4–5 day beta window.  See §5.
 
-### 3.4 The next memory lever: bf16-native MMA K/V — **PLAN READY** (`../../wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`)
+### 3.4 The next memory lever: bf16-native MMA K/V — **DONE: shipped as V5** (`../../wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md` §9)
+
+> **Status: implemented, validated and folded into Block 15 on 2026-09-10** (the
+> amendment touched `patches/0015` only; canonical tip `f5ab5350b`).  A bf16 KV
+> cache with `GGML_CUDA_FA_KV_NATIVE=1` now costs exactly what an f16 cache costs
+> (4B 968.86 → **256.86** MiB/GPU at ub 2048, 27B 1072.86 → **488.86**,
+> gemma-4-E4B 1062.89 → **404.89**, gemma-4-31B 2068.89 → **716.89**), with
+> byte-identical output and MTP, for 0.2-2.4 % prefill (growing with the prompt)
+> and no decode cost — hence opt-in through V4's switch, as instructed.  The
+> exploratory text below is kept as the pre-implementation record.
 
 > **Status: the executable plan is written** (D12).  It supersedes the exploratory text below with a
 > measured before-state, the exact code map, the design, the validation protocol and the ship rule.
@@ -324,10 +333,11 @@ was "+WMMA prefill speed" for "+one ctx-linear F16 scratch", and V4-bf16 is the 
 Coupling worth knowing: V3's derived mask needs the MMA kernel, and (for bf16) the MMA kernel needs the
 staging - so today a bf16 user can have **either** the mask win (WMMA on: 808.70 MiB at ctx 163840 /
 ub 2048, no mask, staging) **or** native bf16 prefill (WMMA off via `GGML_CUDA_FA_WMMA_256=0`: 896.06,
-mask back, no staging), but not both.  V4-bf16 gives both (~257 MiB, activations only).
+mask back, no staging), but not both.  The bf16 arm (**V5**, shipped 2026-09-10) gives both (256.86 MiB on the 4B at ub 2048,
+i.e. activations only).
 
-**Block numbering**: if it lands before the Block-15 cut it belongs in Block 15 (same `GGML_CUDA_FA_KV_NATIVE`
-gate, one more arm); afterwards the "exactly one new block" rule needs a maintainer decision.
+**Block numbering**: it landed in Block 15 as planned (same `GGML_CUDA_FA_KV_NATIVE` gate, one more arm)
+— **V5, amended 2026-09-10**, see §3.4.  The "exactly one new block" rule was never strained.
 
 ## 4. Stage A — the two extra upstream candidates (D6, independent of everything above)
 
@@ -354,7 +364,7 @@ sibling classes all use `if (self_kq_mask && self_kq_mask->buffer)`.  Extract ju
 (`patches/0002-derived-qsa-block-bias.patch`), verify `git apply --check` on `origin/master`, write the
 notes (inconsistency + crash path + how the fork found it while pruning masks).
 
-## 5. Stage B — Block 15 (V3 and V4 have landed)
+## 5. Stage B — Block 15 (V3 and V4 have landed)  [executed 2026-09-10; V5 added the same day, see §3.4]
 
 1. **Merge** W1–W4 + V3 + V4 into one tree.  W1+W2+V3+V4 are already on the fork tree (22 files,
    uncommitted); W3 overlaps W2 in `src/llama-memory-hybrid-idx.cpp`; W4 is a separate 2-file patch
@@ -450,7 +460,14 @@ verify `git apply --check` on a fresh base.
   8037–8039.
 * Keep the delivery-repo tree clean between sessions; commit with clear messages.
 
-## 8. Next-session prompt (copy-paste — the bf16 follow-up, D12)
+## 8. Next-session prompt (copy-paste — the bf16 follow-up, D12) — **CONSUMED 2026-09-10**
+
+> This prompt was executed on 2026-09-10 and produced V5; it is kept as the record of
+> what was asked.  The measurement outcome and the ship decision are in §3.4 above and
+> in the V5 amendment section of `../../patches/README.md`.  One difference from the
+> prompt: it proposed a *separate* `GGML_CUDA_FA_KV_BF16` gate defaulting to 1; the
+> maintainer's follow-up instruction was to reuse **V4's `GGML_CUDA_FA_KV_NATIVE`**
+> switch instead (and keep it opt-in, default 0), which is what shipped.
 
 ```
 Implement bf16-native K/V in the MMA flash-attention path (the last campaign follow-up) in

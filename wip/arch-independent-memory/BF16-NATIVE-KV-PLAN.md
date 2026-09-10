@@ -1,9 +1,10 @@
 # BF16-native MMA K/V — implementation plan (block-15 amendment candidate)
 
-**Status: PLANNED, not implemented.**  Measured 2026-09-10 in the *delivered block-15 tree* (the numbers
-below are the "before" the next session will see).  This file is the primary input for the bf16 session;
-`beta/block-15-campaign-wins/HANDOVER.md` §3.4 is the short pointer and §8 carries the copy-paste
-prompt.
+**Status: IMPLEMENTED, VALIDATED and SHIPPED as the 2026-09-10 V5 amendment to block 15 — OPT-IN
+through V4's `GGML_CUDA_FA_KV_NATIVE` switch (default 0).  See §9 for the outcome, the measured cost
+and why the ship rule landed on opt-in (the maintainer's explicit instruction for this item).**  The
+sections below are the plan as written before implementation; §9 supersedes its expectation.  Measured
+2026-09-10 in the *delivered block-15 tree* (the "before" numbers).
 
 **Goal:** make the MMA (prefill) flash-attention path read a **bf16** K/V cache natively, so that a bf16
 KV user pays no F16 staging scratch and no per-ubatch conversion pass — the same win V4 gave q8_0, but
@@ -218,9 +219,9 @@ at a time, and check for stray llama processes before measuring.
 
 ## 8. Deliverable state the next session starts from
 
-* fork `~/llama.cpp`: `rdna-boosts` = `8ee104f33` (block 15 on a master 2 commits past the fork point —
-  **never regenerate from it**); the canonical chain is the local branch **`block15-canonical`** =
-  `09a137566` (rebuilt at `9113cc188`); clean tree.
+* fork `~/llama.cpp`: `rdna-boosts` = `c3f58165b` (**block 15 amended in place with V5**, on a master 2
+  commits past the fork point — **never regenerate from it**); the canonical chain is the local branch
+  **`block15-canonical`** = `f5ab5350b` (rebuilt at `9113cc188`, same content); clean tree.
 * delivery repo: `patches/` = 15 patches (block 15 = the campaign wins), `upstream/` = 4 candidates,
   `beta/block-15-campaign-wins/` = the beta record; working tree clean.
 * build: `export PATH=/opt/rocm-7.14-gfx1201/bin:$PATH && cmake --build build-rocm --target
@@ -229,3 +230,61 @@ at a time, and check for stray llama processes before measuring.
 * probes used for the tables above: `/tmp/b15kv.sh <tag> <4b|27b> <ub> <ctk> <ctv>` (reserve with
   arbitrary KV types, no `GGML_CUDA_FA_WMMA_256` override) and `/tmp/b15bench.sh` (interleaved
   llama-bench A/B, with `/tmp/b15parse.py` as the CSV parser).
+
+---
+
+## 9. Outcome (2026-09-10): implemented, validated, shipped opt-in as the V5 amendment
+
+**What landed** (the amendment to `patches/0015`, canonical fork tip `f5ab5350b` on the `9113cc188`
+fork point; four files, +171 net lines; `wip/arch-independent-memory/patches/0007-v5-native-bf16-kv.patch`
+is the snapshot):
+
+* `ggml_cuda_fattn_kv_bf16_supported(t)` (same shape as V4's predicate) and a shared
+  `fattn_kv_native_type()` helper; the per-operand source is one type code
+  (`fattn_kv_native_t{FATTN_KV_NATIVE_NONE,Q8_0,BF16}`, replacing V4's `use_q8_K/use_q8_V` flags), so the
+  launcher, `ggml_cuda_flash_attn_ext_get_alloc_size` and both kernels ask the same thing.
+* `flash_attn_ext_f16_load_tile_bf16<...>()`: the F16 element-wise loader with a register conversion per
+  16-byte chunk (`__float22half2_rn(ggml_cuda_cast<float2>(tmp_bf[l]))`, chunk = 8 elements = 4 `bf162`),
+  dispatched from the shared loader ahead of the F16/`cp_async` paths.  The staged values are
+  **bit-identical** to `ggml_get_to_fp16_cuda(GGML_TYPE_BF16)` (both are a single bf16 -> f32 -> f16
+  round-to-nearest), which is why the same-seed text is unchanged.
+* TILE/VEC untouched (they read bf16 natively already); the TILE arm's `get_alloc_size` already reported
+  `need_f16 = false` for bf16.
+* Deviations from §3 as written: the plan proposed a `cp_async` path that copies the raw bf16 bytes and
+  converts the tile in place after `cp_async_wait_all()`.  That is unnecessary on HIP (where this arm is
+  enabled at all): `cp_async_available()` is NVIDIA-only, so `nstages` is always 0 there and the MMA
+  loader always takes the element-wise path.  The implementation therefore converts during the
+  element-wise staging (the q8_0 arm's shape), which is simpler and needs no extra barriers.
+
+**Result** (ctx 204800, arm on vs off, all measured on 3x R9700):
+
+| model | ub 2048 | ub 1024 | ub 512 |
+|---|---|---|---|
+| 4B (1 GPU) | 968.86 -> **256.86** | 884.82 -> **128.82** | 842.80 -> **64.80** |
+| 27B (3-GPU Meta) | 1072.86 -> **488.86** | -- | 868.80 -> **122.80** |
+| gemma-4-E4B (1 GPU, ISWA) | 1062.89 -> **404.89** | -- | -- |
+| gemma-4-31B (3-GPU, ISWA) | 2068.89 -> **716.89** | -- | -- |
+| qwen4exp (3-GPU) | 3298.81 -> 3298.81 (no-op) | -- | -- |
+
+i.e. with the arm on a bf16 cache costs exactly what an f16 cache costs.  Coherence is
+byte-identical (arm on vs off vs f16) on every model at short and 3k/40k prompts; MTP unchanged
+(27B 0.82716, qwen4exp 0.44262); `test-backend-ops` FLASH_ATTN_EXT 7859/7859 (ROCm0 + CPU), with the
+2704 bf16 cases and 365 q8_0 cases green in both arm states.
+
+**Cost — and why the ship rule landed on opt-in.**  Interleaved same-binary A/B (arm off -> on, bf16
+KV): 4B pp2048 **-0.22 %**, pp8192 **+0.27 %**, pp20480 **-1.06 %**, pp40960 **-2.36 %**; 27B pp20480
+**-0.76 %**; decode within **0.1 %**.  The measurement that matters: native bf16 staging is within
+**0.17 %** of an *f16* cache (also scratch-free), so the conversion and the bf16 source are free — the
+entire cost is the loss of the F16 scratch, which turns out to be a **dense, normalised copy** of the
+cache view: for a 4-KV-head model `nb[1]` is 2048 B for a 512 B row (the GQA heads are interleaved), and
+the FA nodes then stage from that dense copy, whereas the native path re-reads the interleaved view on
+every staging pass (hence the penalty grows with the prompt length / number of passes).  Per the
+maintainer's instruction for this item ("treat it similarly to V4, and include it in the Patch 15 block,
+and have it gated by the same environment variable that V4 does") it ships behind
+`GGML_CUDA_FA_KV_NATIVE` with **default 0** — opt-in, exactly like V4, and consistent with D9's
+sub-2 %-loss rule.  Note the arm is a strict win *relative to an f16 cache*: same memory, same speed
+(within 0.2 %), same output — it removes bf16's memory penalty without imposing any.
+
+**Follow-ups recorded in `TODO.md`:** (a) restrict the arm to `nb[1] == ne[0]*2` layouts (single-KV-head
+models) where the staging is dense and the arm would be free; (b) read the native staging densely, or
+(c) make the KV cache non-interleaved — (b)/(c) are bigger than V4+V5 and not worth it for an opt-in win.

@@ -74,7 +74,8 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 
 The current delivery is a **15-patch set** for llama.cpp at the fork
 point `9113cc188` (blocks 01-15 in `patches/`, applied with `git am` via
-`scripts/apply-all.sh`; block-15 tip `09a137566` on the canonical fork
+`scripts/apply-all.sh`; block-15 tip `f5ab5350b` on the canonical fork
+(amended 2026-09-10 with V5 native bf16 K/V)
 rebuilt at the fork point, cut 2026-09-10).  The set applies
 **whitespace-clean** (strict `git am`, no 3-way fallback) and each block
 is build- and coherence-verified — see [`MANIFESTS.md`](MANIFESTS.md)
@@ -88,7 +89,8 @@ integrations, re-baselines, regenerations) are tracked as dated entries
 summary below is deliberately short and does not repeat them.
 
 - **Latest entry (2026-09-10): block 15 cut — the attention-memory
-  campaign wins (tip `09a137566` on `9113cc188`).**  Six validated wins
+  campaign wins (tip `f5ab5350b` on `9113cc188`; amended 2026-09-10 with
+  V5 native bf16 K/V).**  Seven validated wins
   in one block, each with an environment A/B gate (V4 is opt-in):
   **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived
   QSA per-block bias + visibility + the input-fill null guards
@@ -96,29 +98,39 @@ summary below is deliberately short and does not repeat them.
   QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), **W4** ggml-alloc
   unused-view release (no gate; revert patch in
   `beta/block-15-campaign-wins/ab/`), **V3** derived kq mask
-  (`LLAMA_KQ_MASK_DERIVED`, on by default) and **V4** native q8_0 K/V
-  in the FA kernels (`GGML_CUDA_FA_KV_NATIVE`, **default off**).
+  (`LLAMA_KQ_MASK_DERIVED`, on by default), **V4** native q8_0 K/V and
+  **V5** native bf16 K/V in the FA kernels (both behind the same
+  `GGML_CUDA_FA_KV_NATIVE`, **default off**).
   Measured at ctx 204800 / q8_0 KV: qwen4exp ub 2048 compute
   6690.40 → **3251.39** MiB/GPU and host 1262.70 → **63.69** MiB, plus
   the indexer KV 956.26 → 318.76 MiB/GPU; dense models −799 MiB/GPU +
   −799 MiB host (4B 1800.33 → 1001.13, 27B 1920.33 → 1121.13), and a
-  further −744/−632 MiB/GPU with V4 enabled.  Same-seed generated text
+  further −744/−632 MiB/GPU with V4 enabled.  With V5 enabled a bf16 KV
+  cache costs exactly an f16 one: 4B 968.86 → **256.86** MiB/GPU
+  (27B 1072.86 → **488.86**, gemma-4-E4B 1062.89 → **404.89**,
+  gemma-4-31B 2068.89 → **716.89**).  Same-seed generated text
   byte-identical on 4B / 27B / gemma-4-E4B (ISWA) / gemma-4-31B (ISWA)
   / qwen4exp across every gate combination; MTP acceptance unchanged
   (27B 0.76744, qwen4exp 0.44262); prefill cost ~1.3 % (V3) and ~1.7-1.9 %
-  more (V4), decode within noise.  Full record in
+  more (V4), and −0.2 % (pp2048) to −2.4 % (pp40960) for V5, decode
+  within noise.  Full record in
   [`WORKLOG.md`](WORKLOG.md) and
   [`beta/block-15-campaign-wins/README.md`](beta/block-15-campaign-wins/README.md).
 
-- **Next up (2026-09-10, D12): bf16-native MMA K/V** — the one essential follow-up.  A bf16 KV
-  cache still pays the whole F16 staging scratch in prefill (**4B +712 MiB** at ctx 204800 / ub 2048;
-  27B +584; more at smaller ub; verify/TILE unaffected, and V4 does not cover bf16).  The executable
-  plan (measured before-state, code map, design, validation, ship rule) is
+- **D12 closed (2026-09-10): V5 native bf16 K/V**, folded into block 15 the same
+  day.  A bf16 KV cache no longer pays the whole F16 staging scratch in prefill
+  (was **+712 MiB** on the 4B at ctx 204800 / ub 2048, +584 on the 27B, +1352 on
+  gemma-4-31B); with `GGML_CUDA_FA_KV_NATIVE=1` it costs exactly what an f16 cache
+  costs, with byte-identical output.  It ships **opt-in through the same switch as
+  V4** because dropping the scratch costs ~1-2.4 % prefill (growing with the
+  prompt: the conversion itself is free, but the launcher's F16 copy is a dense
+  normalised copy of the interleaved cache view).  Design + measurements:
   [`wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`](wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md);
-  it folds into Block 15 as a dated amendment.  Two pre-existing issues are **documented, not fixed**:
-  mixed K/V cache types (`bf16`+`q8_0`, `f16`+`q8_0`) fall off the GPU attention path (~⅓ of decode,
-  ~88-92 % of prefill lost), and `gemma-4-E4B-it` on 3 GPUs with `-sm tensor` aborts in the meta
-  splitter (maintainer's call: document only).
+  what would make it free is recorded in [`TODO.md`](TODO.md).  Two pre-existing
+  issues remain **documented, not fixed**: mixed K/V cache types (`bf16`+`q8_0`,
+  `f16`+`q8_0`) fall off the GPU attention path (~⅓ of decode, ~88-92 % of prefill
+  lost) — same-type K/V is the practical choice — and `gemma-4-E4B-it` on 3 GPUs
+  with `-sm tensor` aborts in the meta splitter (maintainer's call: document only).
 
 - **Previous entry (2026-09-10): block-14 freed-cell KV handling moved to
   kernel-side masked-V elimination (regeneration tip `ff2b35f49`).**  The

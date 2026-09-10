@@ -10,6 +10,49 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **V5 native bf16 K/V folded into Block 15 (opt-in, same switch as V4) — D12 closed
+  (2026-09-10).**  The bf16 lever is implemented, validated and packaged as a **dated
+  amendment to block 15** (`patches/0015`, canonical tip `f5ab5350b` on `9113cc188`;
+  the amendment touched `0015` only — `0001`-`0014` stayed byte-identical).  A bf16
+  KV cache no longer needs the F16 staging scratch: bf16 and f16 tiles have the same
+  byte layout, so the MMA loader converts each 16-byte staged chunk in registers
+  (`__float22half2_rn(ggml_cuda_cast<float2>(bf16x2))`, bit-identical to the
+  launcher's `ggml_get_to_fp16_cuda(GGML_TYPE_BF16)`) instead of copying from the
+  scratch, and the scratch sizing + whole-cache conversion pass are skipped for that
+  operand.  The per-operand staging source is now one shared type code
+  (`fattn_kv_native_t{FATTN_KV_NATIVE_NONE,Q8_0,BF16}`, subsuming V4's flags), so the
+  launcher, `get_alloc_size` and the kernels cannot disagree.  Scope per D10: the F16
+  fragments/`cp_async` design is untouched (no bf16 WMMA fragments).
+  **Measured (ctx 204800, bf16 KV, arm on vs off):** 4B ub 2048 968.86 -> **256.86**
+  MiB/GPU (== the f16 cache; ub 1024 884.82 -> 128.82, ub 512 842.80 -> 64.80), 27B
+  1072.86 -> **488.86** (ub 512 868.80 -> 122.80), gemma-4-E4B 1062.89 -> **404.89**,
+  gemma-4-31B 2068.89 -> **716.89**; qwen4exp unchanged (f16 == bf16 == on/off there,
+  its FA path never staged bf16) and its q8_0 control reproduced 3251.39/63.69
+  exactly, confirming the refactor left V4 alone; ub 8 (TILE/verify) 8.09 either way.
+  **Cost** (interleaved same-binary A/B, off -> on, bf16): 4B -0.22 % (pp2048),
+  +0.27 % (8192), -1.06 % (20480), -2.36 % (40960); 27B -0.76 % (20480); decode
+  within 0.1 %.  The conversion itself is free (native bf16 staging is within 0.17 %
+  of an *f16* cache) — the loss is the removed scratch, which is a dense, normalised
+  copy of the cache view (the GQA heads are interleaved: `nb[1]` is 2048 B for a
+  512 B row on the 4B), while the native path re-reads the interleaved view on every
+  staging pass.  **Decision: opt-in via `GGML_CUDA_FA_KV_NATIVE` (default 0), i.e.
+  the maintainer's explicit instruction for this item ("treat it similarly to V4 ...
+  gated by the same environment variable"), consistent with D9.**
+  **Gates:** same-seed text byte-identical (arm on vs off vs f16) on 4B, 27B,
+  gemma-4-E4B (ISWA) and gemma-4-31B (ISWA), short + 3k/40k prompts, with V3's
+  derived mask active (wins additive: -799.2 derived mask, -712.0 bf16 scratch on
+  the 4B); MTP 27B 0.82716 and qwen4exp 0.44262 identical on/off (q8_0 references
+  0.76744/0.44262 unchanged); `test-backend-ops` FLASH_ATTN_EXT 7859/7859 ROCm0+CPU,
+  with the 2704 bf16 K/V cases (all head sizes incl. the 576/512 MLA
+  `v_is_view_of_k` layout) and 365 q8_0 cases green in both arm states, identical case
+  lists.  Re-validated end to end **from the delivered patches**: fresh worktree at
+  `9113cc188` -> `apply-all.sh` strict 15/15 `git am`, tree identical to `f5ab5350b`,
+  build, reserves/coherence/MTP/op-suite all reproduced.  One pre-existing
+  unrelated full-build warning recorded in `TODO.md`
+  (`llama-kv-cache.h:274` `-Wunused-private-field` for W3's `v_enabled`).
+  Records: the V5 amendment section in `patches/README.md`, the outcome section in
+  `wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`, the block-15 beta record.
+
 - **bf16-native MMA K/V planned as the next essential follow-up (D12); two pre-existing findings
   recorded (2026-09-10).**  With Block 15 cut, the maintainer picked the bf16 lever as the one
   follow-up.  The executable plan is **`wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`**:

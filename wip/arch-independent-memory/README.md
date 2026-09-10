@@ -11,8 +11,10 @@ Nothing here is in the delivery patch set yet; the qwen4exp-specific work lives 
 `V3-DERIVED-KQ-MASK-PLAN.md` (the derived kq mask: plan, implementation and §4 validation record -
 **shipped on by default** in the fork tree) and `V4-NATIVE-Q8-KV-PLAN.md` (native q8_0 K/V in the FA
 kernels: the F16 staging scratch removal - **shipped opt-in**, `GGML_CUDA_FA_KV_NATIVE=1`, because of a
-~1.7 % prefill cost).  The patch snapshots are in `patches/` (0001 W4, 0002 the V3 phase-1 *diagnostic* -
-never ship it, 0003/0004/0005 V3, 0006 V4).
+~1.7 % prefill cost) plus `BF16-NATIVE-KV-PLAN.md` (the same trick for a **bf16** cache - V5, shipped
+2026-09-10 as a dated block-15 amendment, opt-in through the same `GGML_CUDA_FA_KV_NATIVE` switch; §9 is
+the outcome record).  The patch snapshots are in `patches/` (0001 W4, 0002 the V3 phase-1 *diagnostic* -
+never ship it, 0003/0004/0005 V3, 0006 V4, 0007 V5).
 Everything below was measured on 3x R9700 (gfx1201), ctx 204800, `-ctk/-ctv q8_0`, `-sm tensor -mg 0`,
 one GPU job at a time.
 

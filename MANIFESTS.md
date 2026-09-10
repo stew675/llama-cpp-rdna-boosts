@@ -12,7 +12,8 @@ blocks 01-15 (`patches/0001-…0015-…`, format-patch of the
 fork's `rdna-boosts` block commits — the current regeneration
 on `9113cc188` (block 15 — the attention-memory campaign wins —
 was cut 2026-09-10 from the **canonical fork rebuilt at `9113cc188`**,
-tip `09a137566`, because the reference `~/llama.cpp` checkout had drifted
+then **amended 2026-09-10 with V5 native bf16 K/V**, canonical tip
+`f5ab5350b` (the pre-amendment cut was `09a137566`), because the reference `~/llama.cpp` checkout had drifted
 two upstream master commits past the fork point (`f3f1a8f27`, `304665fe7`
 — SYCL + iGPU-only code) and a `format-patch` there would have exported
 those as patches 0001/0002; blocks 01-14 patch bodies are byte-identical
@@ -138,7 +139,7 @@ delivery — use `patches/` + `scripts/apply-all.sh`.
 | 12 | `0012-…-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch` | **hybrid HIP all-reduce** (internal AR for the small-tensor decode path + per-size hybrid dispatch vs RCCL; RDNA4-only gate: refuses to init off gfx1200/gfx1201, falls back to RCCL) | none (apply last) |
 | 13 | `0013-…-block-13-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** (prefill fused expert MMQ, RDNA4 + RDNA3.5 + RDNA3.0 (gfx1151 validated 2026-09-05, gfx1100 validated 2026-09-05), Q3_K/Q4_K/Q5_K/Q8_0/Q6_K + decode item-split, re-based on the upstream has_fusion mmvq path; multi-token mmvq x_scale_channel_dst fusion for MoE down x topk-weights, spec-dec verify batches n=2..8; ROCm unaligned-width split-load fix for Q6_K/Q3_K 2-GPU) | none (apply last) |
 | 14 | `0014-…-block-14-qwen4exp-support.patch` | **qwen4exp / Qwen3.8-Flash-Next support** (promoted from `beta/qwen4exp`, re-based): QSA sparse FA (default) + fused indexer top-k/score, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader + PLE n-gram loading, MTP draft-head, WS4 hyperconn prefill fusions, sched alloc-fallback sync fix, QSA dense shortcut + per-arch dense/QSA decode policy | none (apply last) |
-| 15 | `0015-…-block-15-campaign-memory-wins.patch` | **attention-memory wins (block 15)**: W1 QSA score-chain memory (`GGML_QSA_SCORE_MEM`), W2 derived QSA per-block bias + visibility + input-fill null guards (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), W3 keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), W4 ggml-alloc unused-view release (no gate), V3 derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default), V4 native q8_0 K/V in the FA kernels (`GGML_CUDA_FA_KV_NATIVE`, **opt-in, default 0**) — ~3.4 GiB/GPU + ~1.2 GiB host on qwen4exp, ~800 MiB/GPU + 800 MiB host on dense models, byte-identical output | none (apply last) |
+| 15 | `0015-…-block-15-campaign-memory-wins.patch` | **attention-memory wins (block 15)**: W1 QSA score-chain memory (`GGML_QSA_SCORE_MEM`), W2 derived QSA per-block bias + visibility + input-fill null guards (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), W3 keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), W4 ggml-alloc unused-view release (no gate), V3 derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default), V4 native q8_0 K/V and V5 native bf16 K/V in the FA kernels (both behind the same `GGML_CUDA_FA_KV_NATIVE`, **opt-in, default 0**) — ~3.4 GiB/GPU + ~1.2 GiB host on qwen4exp, ~800 MiB/GPU + ~800 MiB host on dense models plus 712/584/658/1352 MiB more for a bf16 cache, byte-identical output | none (apply last) |
 
 Block numbers are the apply order: `01` applies first, `15` last. All blocks
 are mutually independent except **block 08 (fused core) requires blocks 03
@@ -162,12 +163,16 @@ Apply + regeneration verification:
 
 - fresh worktree at `9113cc188` -> `scripts/apply-all.sh` -> **strict
   15/15 `git am`**, zero whitespace warnings; the applied tree is
-  identical to the canonical block-15 tip `09a137566`.
+  identical to the canonical block-15 tip `f5ab5350b` (the V5 amendment
+  re-ran this after the amend: same strict 15/15, tree identical, tip
+  re-verified from the delivered `0015`).
 - the delivered `0001`-`0014` files are byte-identical to the previous
   regeneration except the `From <sha>` line and the `[PATCH NN/15]`
   series count (verified hunk by hunk); `0015` is new.
-- `rdna-boosts-all.patch` refreshed = `git diff 9113cc188..09a137566`
-  (98 files).
+- `rdna-boosts-all.patch` refreshed = `git diff 9113cc188..f5ab5350b`
+  (98 files; the V5 amendment added 171 net lines to `0015` only —
+  `0001`-`0014` stayed byte-identical because the canonical branch was
+  amended in place, so their `From <sha>` lines did not change).
 
 Combination validation (3x R9700/RDNA4; individually-validated wins do
 NOT carry over, so this was re-run on the merged tree and then again on
@@ -197,6 +202,21 @@ the tree built from the delivered patches):
 - **prefill cost** (interleaved same-binary A/B, pp20480/ub 2048): V3
   -1.28 % (4B) / +0.28 % (27B); V4 a further -1.85 % (4B) / -1.72 %
   (27B); decode within noise.
+- **V5 amendment (added 2026-09-10, re-validated end to end from the
+  delivered patches)**: with a **bf16** KV cache and
+  `GGML_CUDA_FA_KV_NATIVE=1` the F16 staging scratch is gone, so the
+  reserve equals an f16 cache's -- 4B ub 2048 968.86 -> **256.86**
+  MiB/GPU (ub 1024 884.82 -> 128.82, ub 512 842.80 -> 64.80), 27B
+  1072.86 -> **488.86** (ub 512 868.80 -> 122.80), gemma-4-E4B
+  1062.89 -> **404.89**, gemma-4-31B 2068.89 -> **716.89**; qwen4exp
+  unchanged (f16 == bf16 == arm on/off), TILE/verify (ub 8) 8.09 either
+  way; same-seed text byte-identical (on vs off vs f16, all models,
+  short + 3k/40k prompts), MTP unchanged (27B 0.82716, qwen4exp 0.44262),
+  `test-backend-ops` FLASH_ATTN_EXT 7859/7859 with the 2704 bf16 and 365
+  q8_0 cases green in both arm states; cost bf16 prefill -0.22 % (pp2048),
+  +0.27 % (8192), -1.06 % (20480), -2.36 % (40960) on the 4B and -0.76 %
+  (20480) on the 27B, decode within 0.1 % -- hence opt-in through V4's
+  switch (maintainer's instruction for the item).
 
 Known pre-existing issue (reproduces on block 14, NOT a block-15
 regression): `gemma-4-E4B-it` on 3 GPUs with `-sm tensor` aborts in the
