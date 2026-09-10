@@ -75,13 +75,19 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   release (no gate), **V3** derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by
   default), **V4** native q8_0 K/V and **V5** native bf16 K/V in the FA
   kernels (both behind the same `GGML_CUDA_FA_KV_NATIVE`, **opt-in,
-  default 0**).  Cut 2026-09-10 and **amended 2026-09-10 with V5** (tip
-  `f5ab5350b` on the canonical fork rebuilt at `9113cc188`); ~3.4 GiB/GPU
+  default 0**).  Cut 2026-09-10 and **amended twice on 2026-09-10: V5,
+  then the RDNA3_5/gfx1151 fix** (canonical tip `377f8e790`; the gfx1151
+  amendment enables V3 on a HIP iGPU -- the probe had rejected
+  `GGML_BACKEND_DEVICE_TYPE_IGPU` -- and requires a single KV stream in
+  `kq_mask_derivable()` so `n_seq_max > 1` contexts no longer abort in
+  `ggml_flash_attn_ext_add_kq_derived`); ~3.4 GiB/GPU
   + ~1.2 GiB host on qwen4exp and ~800 MiB/GPU + 800 MiB host on dense
   models (a bf16 KV cache saves a further 712/584/658/1352 MiB with V5
   enabled), byte-identical output, ~1.3 % prefill / ~0.3 % decode cost
   (V4 ~1.7 %, V5 0.2-2.4 % depending on prompt length, V5 measured
-  against the scratch it removes); beta window open.  See the 2026-09-10 block-15 section in
+  against the scratch it removes; on **gfx1151** the arms are *cheaper*/win
+  -- V4 +2.6 % at pp20480, V5 0.4-0.9 %); beta window open.  See the
+  2026-09-10 block-15 section in
   `patches/README.md`, `beta/block-15-campaign-wins/README.md` and the
   `WORKLOG.md` entry.
 
@@ -95,7 +101,9 @@ IQ-type-for-MoE, both dated after `9113cc188`), so
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
 chain is the local branch **`block15-canonical`** (tip `f5ab5350b`, built
 by applying the delivery patches with `scripts/apply-all.sh` at `9113cc188`
-and amended 2026-09-10 with V5),
+and amended 2026-09-10 with V5; the RDNA3_5 pass re-cut the same chain in
+this checkout as `377f8e790` -- the `0001`-`0014` bodies are unchanged,
+only the `From <sha>`/series-count lines differ between rebuilds),
 which is what `scripts/make-patches.sh`'s default tip refers to; always
 regenerate from a canonical fork rebuilt at the fork point.
 
@@ -306,6 +314,10 @@ explicitly requests it.**
   validation facts to protect: same-seed output is **byte-identical**
   across every gate combination on every model, and the adaptive-MTP gate
   is unchanged (27B 0.76744, qwen4exp 0.44262 = the block-14 baseline).
+  RDNA3_5 (gfx1151) validated 2026-09-10: V3 now engages on a HIP iGPU and
+  `kq_mask_derivable()` requires a single KV stream so a multi-slot context
+  keeps the packed mask instead of aborting; the same-seed and MTP gates
+  hold there, and V4 is *faster* at depth (+2.6 % pp20480, decode flat).
   Anything that touches the kq mask must still be validated on an **SWA**
   model (gemma-4-E4B / -31B).  Known pre-existing issue: gemma-4-E4B-it on
   3 GPUs with `-sm tensor` aborts in the meta splitter (2 KV heads < 3

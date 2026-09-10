@@ -19043,7 +19043,7 @@ index f1d173a57..01e2bbe1d 100644
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_FC,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 21501574a..631693f91 100644
+index 21501574a..57ff5c8db 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -36,6 +36,18 @@ struct llm_fused_op_probe {
@@ -19065,7 +19065,7 @@ index 21501574a..631693f91 100644
  };
  
  static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
-@@ -80,6 +92,62 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+@@ -80,6 +92,69 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
      /*.n_tokens_per_seq =*/ 1,
  };
  
@@ -19082,9 +19082,15 @@ index 21501574a..631693f91 100644
 +};
 +
 +// the derived kq mask is implemented by the CUDA/HIP backend only - any other backend that accepts
-+// the flash attention op would silently ignore the derived sources
++// the flash attention op would silently ignore the derived sources.  An iGPU (APU) is still the
++// CUDA/HIP backend, so it implements the derived path too (the MMA kernel is the same one).
 +static bool ggml_backend_dev_is_cuda(ggml_backend_dev_t dev) {
-+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
++    if (dev == nullptr) {
++        return false;
++    }
++
++    const auto type = ggml_backend_dev_type(dev);
++    if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
 +        return false;
 +    }
 +
@@ -19117,6 +19123,7 @@ index 21501574a..631693f91 100644
 +
 +    switch (ggml_backend_dev_type(dev)) {
 +        case GGML_BACKEND_DEVICE_TYPE_GPU:
++        case GGML_BACKEND_DEVICE_TYPE_IGPU:
 +            return ggml_backend_dev_is_cuda(dev);
 +        case GGML_BACKEND_DEVICE_TYPE_META:
 +            return ggml_backend_cuda_family_available();
@@ -19128,7 +19135,7 @@ index 21501574a..631693f91 100644
  llama_context::llama_context(
          const llama_model & model,
                llama_context_params params) :
-@@ -152,7 +220,7 @@ llama_context::llama_context(
+@@ -152,7 +227,7 @@ llama_context::llama_context(
          cparams.ctx_other = params.ctx_other;
      }
  
@@ -19137,7 +19144,7 @@ index 21501574a..631693f91 100644
          if (model.tok_embd == nullptr || model.output == nullptr) {
              if (params.ctx_other == nullptr) {
                  throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
-@@ -229,6 +297,19 @@ llama_context::llama_context(
+@@ -229,6 +304,19 @@ llama_context::llama_context(
      cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
      cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
  
@@ -19157,7 +19164,7 @@ index 21501574a..631693f91 100644
      cparams.fused_gdn_ar = true;
      cparams.fused_gdn_ch = true;
      cparams.auto_fgdn    = false;
-@@ -241,6 +322,24 @@ llama_context::llama_context(
+@@ -241,6 +329,24 @@ llama_context::llama_context(
      cparams.fused_dsv4_hc_post = true;
      cparams.auto_fhc           = true;
  
@@ -19182,7 +19189,7 @@ index 21501574a..631693f91 100644
      // with causal attention, the batch size is limited by the context size
      cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
  
-@@ -509,19 +608,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -509,19 +615,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
              return;
          }
  
@@ -19208,7 +19215,7 @@ index 21501574a..631693f91 100644
              GGML_ASSERT(node.il >= 0);
  
              ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
-@@ -541,6 +644,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -541,6 +651,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                  device_mismatch = true;
                  break;
              }
@@ -19238,7 +19245,7 @@ index 21501574a..631693f91 100644
          }
  
          if (device_mismatch) {
-@@ -557,6 +683,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -557,6 +690,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
          cparams.auto_fa = false;
      }
  
@@ -19252,7 +19259,7 @@ index 21501574a..631693f91 100644
      if (cparams.auto_fgdn) {
          LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", func);
          resolve(llm_fused_op_gdn_ar_probe, cparams.fused_gdn_ar);
-@@ -3692,6 +3825,35 @@ llama_context * llama_init_from_model(
+@@ -3692,6 +3832,35 @@ llama_context * llama_init_from_model(
          if (model->get_split_state_ud.n_devices == 1) {
              LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
          }
@@ -19795,7 +19802,7 @@ index cc4110639..2002f63b2 100644
              llm_graph_input_attn_kv * inp,
              ggml_tensor * wo,
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index a342ee119..09fa3ea6d 100644
+index a342ee119..574294e51 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -79,8 +79,9 @@ llama_kv_cache::llama_kv_cache(
@@ -19819,7 +19826,7 @@ index a342ee119..09fa3ea6d 100644
  
          ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
          ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
-@@ -1785,6 +1786,169 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+@@ -1785,6 +1786,178 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
      //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
  }
  
@@ -19846,6 +19853,15 @@ index a342ee119..09fa3ea6d 100644
 +bool llama_kv_cache::kq_mask_derivable(const llama_ubatch & ubatch) const {
 +    // alibi writes a distance into the mask, that is a value, not a predicate
 +    if (hparams.use_alibi) {
++        return false;
++    }
++
++    // a single KV stream too: build_attn_mha derives the attention stream count from the KV tensor
++    // (k->ne[3] == the cache's n_stream), so a multi-stream cache (n_seq_max > 1 without kv_unified)
++    // cannot use the derived form even when the ubatch holds a single sequence.  Without this the
++    // derived tok_lo is built for one stream while Q is reshaped for n_seq_max streams and the
++    // shape assert in ggml_flash_attn_ext_add_kq_derived fires at context creation.
++    if (n_stream != 1) {
 +        return false;
 +    }
 +
@@ -19989,7 +20005,7 @@ index a342ee119..09fa3ea6d 100644
  void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
      const int64_t n_tokens = ubatch->n_tokens;
  
-@@ -2798,6 +2962,16 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
+@@ -2798,6 +2971,16 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
      kv->set_input_kq_mask(dst, ubatch, causal_attn);
  }
  

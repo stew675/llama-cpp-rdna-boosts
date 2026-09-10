@@ -74,8 +74,8 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 
 The current delivery is a **15-patch set** for llama.cpp at the fork
 point `9113cc188` (blocks 01-15 in `patches/`, applied with `git am` via
-`scripts/apply-all.sh`; block-15 tip `f5ab5350b` on the canonical fork
-(amended 2026-09-10 with V5 native bf16 K/V)
+`scripts/apply-all.sh`; block-15 tip `377f8e790` on the canonical fork
+(amended 2026-09-10 with V5 native bf16 K/V and the RDNA3_5/gfx1151 V3 fix)
 rebuilt at the fork point, cut 2026-09-10).  The set applies
 **whitespace-clean** (strict `git am`, no 3-way fallback) and each block
 is build- and coherence-verified — see [`MANIFESTS.md`](MANIFESTS.md)
@@ -89,8 +89,8 @@ integrations, re-baselines, regenerations) are tracked as dated entries
 summary below is deliberately short and does not repeat them.
 
 - **Latest entry (2026-09-10): block 15 cut — the attention-memory
-  campaign wins (tip `f5ab5350b` on `9113cc188`; amended 2026-09-10 with
-  V5 native bf16 K/V).**  Seven validated wins
+  campaign wins (tip `377f8e790` on `9113cc188`; amended 2026-09-10 with
+  V5 native bf16 K/V and the RDNA3_5/gfx1151 V3 fix).**  Seven validated wins
   in one block, each with an environment A/B gate (V4 is opt-in):
   **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived
   QSA per-block bias + visibility + the input-fill null guards
@@ -113,7 +113,12 @@ summary below is deliberately short and does not repeat them.
   / qwen4exp across every gate combination; MTP acceptance unchanged
   (27B 0.76744, qwen4exp 0.44262); prefill cost ~1.3 % (V3) and ~1.7-1.9 %
   more (V4), and −0.2 % (pp2048) to −2.4 % (pp40960) for V5, decode
-  within noise.  Full record in
+  within noise.  RDNA3_5 (gfx1151) validated 2026-09-10: the block-14
+  masked-V fixes and V3/V4/V5 are clean there, V3 is now enabled on the
+  HIP iGPU and a multi-slot context keeps the packed mask, the reserves
+  and Flash-Next W deltas match RDNA4 exactly, and the opt-in arms are
+  cheaper than on RDNA4 (V4 **+2.6 %** at pp20480, V5 −0.4…−0.9 %).
+  Full record in
   [`WORKLOG.md`](WORKLOG.md) and
   [`beta/block-15-campaign-wins/README.md`](beta/block-15-campaign-wins/README.md).
 

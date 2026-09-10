@@ -218,6 +218,25 @@ the tree built from the delivered patches):
   (20480) on the 27B, decode within 0.1 % -- hence opt-in through V4's
   switch (maintainer's instruction for the item).
 
+- **RDNA3_5 / gfx1151 validation (2026-09-10, single Strix Halo, ROCm
+  7.14, amendment to `0015`, canonical tip `377f8e790`)**: the block-14
+  masked-V fixes and V3/V4/V5 are effective on the iGPU.  Two V3
+  regressions were found and fixed: the derived-mask probe rejected
+  `GGML_BACKEND_DEVICE_TYPE_IGPU` (so V3 was silently off and its
+  ~800 MiB win lost), and `n_seq_max > 1` aborted context creation in
+  `ggml_flash_attn_ext_add_kq_derived` (derived stream count vs
+  `k->ne[3]`).  After the amendment V3 enables and the reserves reproduce
+  the RDNA4 numbers exactly (4B V3 −799.20 compute / −799.21 host, V5 bf16
+  968.86 → 256.86, V4 q8_0 1001.13 → 257.13; 27B 488.86 / 1072.86→488.86 /
+  1121.13→489.13; Flash-Next W on 3251.39/63.69, indexer 318.76).
+  14 ROCm + 7 Vulkan gate runs PASS 16/16, V3/arm byte-identical over
+  2064-cell pairs, probes clean (ROCm bf16 34/34, f16 36/36; Vulkan
+  36/36), FLASH_ATTN_EXT 4596/4596 ROCm0 + 7859/7859 CPU, MTP identical.
+  Arm cost is *lower* than RDNA4 (V5 −0.4…−0.9 %, V4 **+2.6 %** at
+  pp20480, decode ±0.1 %); V3 ~−3.2 % pp20480.  Clean-apply sim strict
+  15/15 `git am`, applied tree == amended canonical.  Full matrix in
+  `wip/strix-halo/GATE-2026-09-10-block15-rdna35.md`.
+
 Known pre-existing issue (reproduces on block 14, NOT a block-15
 regression): `gemma-4-E4B-it` on 3 GPUs with `-sm tensor` aborts in the
 meta splitter (`ggml-backend-meta.cpp:1177`) because `n_head_kv = 2` is

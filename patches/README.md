@@ -60,7 +60,7 @@ ggml-alloc unused-view release -- see the 2026-09-10 block-15 section below):
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)** — see the block-13 notes below.
 | `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-07 with the derived-cache pool gate** (the F32 block-vector pool is now allocated only when the derived cache is enabled *and* the indexer keys are unquantized — no more dead ~100 MiB buffer + no-op fill launches otherwise) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. | **amended 2026-09-08 with the quantized-KV tensor-split gate** — `q4_1`-family KV cache types (`q4_1`/`q5_0`/`q5_1`/`iq4_nl`) abort at graph reserve under multi-GPU `SPLIT_MODE_TENSOR` (upstream bug, also on vanilla `050dde50c`); now rejected at context creation with a clear error when the Meta device is in use — see the block-14 notes below. | **amended 2026-09-09 with the gfx1151-only freed-cell KV-zeroing gate** — the seq_rm/seq_keep/clear row zeroing (strix-port aad5adb08f masked-column guard for the gfx1151 WMMA f16 `x+(-0.0)` inexactness) now enables only when a KV buffer device is gfx1151 (env `LLAMA_KV_ZERO_FREED` overrides); everywhere else pre-block-14 behavior (no per-free GPU memsets) is restored — see the 2026-09-09 block-14 amendment section below. | **amended 2026-09-10 with the kernel-side masked-V fixes; the 2026-09-09 host zeroing is removed** — `llama-kv-cache.{cpp,h}` revert to the upstream state (no `zero_freed`/env/GPU memsets) and block 14 instead carries the unconditional HIP `fattn-tile.cuh` (packed-bf16 PV) + `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles) and Vulkan `flash_attn_cm1.comp` + `flash_attn.comp` (dead columns never read V) fixes, active by default on every device — see the 2026-09-10 block-14 amendment section below. |
-| `0015` | **attention-memory wins (block 15)** - the RDNA memory campaign squashed into one block: W1 QSA score-chain memory (`GGML_QSA_SCORE_MEM`), W2 derived QSA per-block bias + derived visibility + the input-fill null guards (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), W3 keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), W4 ggml-alloc unused-view release (no gate), V3 derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default), V4 native q8_0 K/V in the FA kernels and V5 native bf16 K/V in the MMA FA kernel (both behind the same `GGML_CUDA_FA_KV_NATIVE`, **default 0 = opt-in**; V5 amended 2026-09-10); ~3.4 GiB/GPU + ~1.2 GiB host reclaimed on qwen4exp, ~800 MiB/GPU + 800 MiB host on dense models, byte-identical output at a ~1.3 % prefill / ~0.3 % decode cost (V4 a further ~1.7-1.9 % prefill, opt-in) -- see the 2026-09-10 block-15 section above. |
+| `0015` | **attention-memory wins (block 15)** - the RDNA memory campaign squashed into one block: W1 QSA score-chain memory (`GGML_QSA_SCORE_MEM`), W2 derived QSA per-block bias + derived visibility + the input-fill null guards (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), W3 keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), W4 ggml-alloc unused-view release (no gate), V3 derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default; **RDNA3_5/iGPU + multi-stream fix amended 2026-09-10**), V4 native q8_0 K/V in the FA kernels and V5 native bf16 K/V in the MMA FA kernel (both behind the same `GGML_CUDA_FA_KV_NATIVE`, **default 0 = opt-in**; V5 amended 2026-09-10); ~3.4 GiB/GPU + ~1.2 GiB host reclaimed on qwen4exp, ~800 MiB/GPU + 800 MiB host on dense models, byte-identical output at a ~1.3 % prefill / ~0.3 % decode cost (V4 a further ~1.7-1.9 % prefill, opt-in) -- see the 2026-09-10 block-15 section above. |
 
 ## Apply (fresh checkout at the fork point)
 
@@ -243,6 +243,62 @@ cache view (or to normalise the view once), which is a bigger change than
 V4/V5; alternatively restricting the arm to layouts where `nb[1] ==
 ne[0]*2` (single-KV-head models) would make it free there -- both recorded
 in `../TODO.md`.
+
+### 2026-09-10 RDNA3_5 (gfx1151) validation — V3 iGPU enablement + multi-stream guard (amendment to `0015`)
+
+The first single-device iGPU run of the block-15 set (Strix Halo, Radeon
+8060S, ROCm 7.14, VMM no) validated the flash-attention staging work on
+gfx1151 and found **two V3 (derived kq mask) regressions**, both fixed by a
+dated amendment that touched `patches/0015` only (`0001`-`0014` stayed
+byte-identical; canonical tip `377f8e790`):
+
+- **V3 was silently disabled on a HIP iGPU.**  The derived-mask probe
+  rejected `GGML_BACKEND_DEVICE_TYPE_IGPU` as "only implemented by the
+  CUDA/HIP backend", so the whole ~800 MiB compute + ~800 MiB host win was
+  lost on the APU.  `ggml_backend_dev_is_cuda()` / the
+  `ggml_backend_dev_implements_kq_derived()` switch now accept `IGPU` (the
+  ROCm/CUDA reg name is still required).
+- **`n_seq_max > 1` aborted context creation.**  `build_attn_mha` derives
+  the attention stream count from the KV tensor (`k->ne[3]` == the cache's
+  `n_stream` == `n_seq_max`), but `kq_mask_derivable()` only checked
+  `ubatch.n_seqs_unq`, so a `--parallel 4` server built a single-stream
+  derived input against a 4-stream Q reshape and aborted in
+  `ggml_flash_attn_ext_add_kq_derived`
+  (`GGML_ASSERT(tok_lo->ne[0] == a->src[0]->ne[1])`).
+  `kq_mask_derivable()` now rejects `n_stream != 1`; a multi-slot context
+  keeps the packed mask (no abort) and a single-stream context keeps the
+  win.  Discrete GPUs report `..._GPU` and normally run `n_stream == 1`, so
+  RDNA4 behavior is unchanged.
+
+After the amendment V3 enables on gfx1151 and reproduces the RDNA4
+numbers exactly: 4B ctx 204800/ub 2048 **V3 −799.20 MiB compute / −799.21
+host**, **V5 bf16 968.86 → 256.86**, **V4 q8_0 1001.13 → 257.13**; 27B f16
+488.86, bf16 1072.86 → 488.86, q8_0 1121.13 → 489.13; MoE Q3_K_M and the
+Flash-Next qwen4exp W1/W2/W3 deltas also match exactly (W on 3251.39/63.69,
+indexer 318.76; W off 6690.40/1262.70, indexer 956.26).
+
+Correctness: 14 ROCm gate runs (V3 on/off × f16/bf16/bf16+V5/q8_0+V4/q4_0
+off+on/control) and 7 Vulkan gate runs all **PASS 16/16**; V3 on vs off is
+byte-identical over 7 configs × 2064 gate cells, as are bf16 arm on vs off
+(V5), q8_0 arm on vs off (V4) and q4_0 arm on vs off.  The isolated
+masked-column probes are clean in both arm states and on both backends
+(ROCm bf16 34/34, ROCm f16 36/36, Vulkan bf16/f16 36/36); the only diag
+failures are the documented deterministic live-cell bf16 artifact
+(≤1.1e-13, arm-independent).  The block-14 HIP TILE/MMA and Vulkan
+cm1/scalar masked-V fixes are therefore effective on gfx1151 and V4/V5 do
+not reintroduce a masked-cell leak.  `test-backend-ops` FLASH_ATTN_EXT
+passes on ROCm0 (4596/4596, `GGML_CUDA_FA_ALL_QUANTS=OFF`; 5 derived cases
+OK) and CPU (7859/7859); MTP acceptance is identical V3 on/off and arm
+off/on (27B 0.79762, Flash-Next draft 0.52727).
+
+**Arm-cost answer on this arch:** V5 costs −0.4…−0.9 % prefill (RDNA4
+−0.2…−2.4 %) and V4 is **+2.6 % at pp20480** (RDNA4 −1.7 %), decode within
+0.1 % — the large MALL absorbs the interleaved-view re-reads that cost
+RDNA4, so the opt-in arms are closer to free (q8_0 is a depth win) while
+returning the same RAM.  V3 costs ~−3.2 % pp20480 (RDNA4 −1.3 %) for its
+−799 MiB.  Full matrix, build config, gate/probe tables and the block-13
+re-check (~0 % isolated delta on this build, no regression) are in
+`../wip/strix-halo/GATE-2026-09-10-block15-rdna35.md`.
 
 ## 2026-09-10 block-14 amendment: kernel-side masked-V fixes replace the host zeroing (superseded by block 15)
 

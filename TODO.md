@@ -10,8 +10,32 @@ Reality pass: 2026-09-10 (block 15 cut).
 ## Current active
 
 ### Memory campaign -> Block 0015 (derived kq mask + FA scratch + QSA wins) - DONE / CUT 2026-09-10
+- **DONE (2026-09-10): RDNA3_5 (gfx1151) validation pass + block-15 amendment.**  First
+  single-device iGPU run of the delivery (Strix Halo, ROCm 7.14).  Block-14 masked-V fixes +
+  V3/V4/V5 exercised with a BF16 KV cache in both arm states; the block-14 fixes are clean on
+  gfx1151 and V4/V5 do not reintroduce a masked-cell leak.  Two V3 regressions were found and
+  fixed as a dated amendment to `patches/0015` (**amended canonical tip `377f8e790`**, other 14
+  patches byte-identical; clean-apply strict 15/15, applied tree `6f5d23b5`): (1) the derived
+  probe rejected `GGML_BACKEND_DEVICE_TYPE_IGPU`, silently disabling V3 on the iGPU;
+  (2) `n_seq_max > 1` aborted in `ggml_flash_attn_ext_add_kq_derived` (`kq_mask_derivable()`
+  now rejects `n_stream != 1`).  After the fix the reserves reproduce RDNA4 exactly (4B V3
+  -799.20/-799.21, V5 bf16 968.86->256.86, V4 q8_0 1001.13->257.13; Flash-Next 3251.39/63.69
+  indexer 318.76), 14 ROCm + 7 Vulkan gates PASS 16/16, probes clean, MTP identical.  V4 is
+  *faster* on gfx1151 at depth (+2.6 % pp20480) and V5 costs 0.4-0.9 % vs RDNA4 0.2-2.4 %.
+  Record: `wip/strix-halo/GATE-2026-09-10-block15-rdna35.md`.
+- **Follow-up (RDNA3_5, low priority): V3 prefill cost is arch-dependent.**  gfx1151 measured
+  -3.2 % at pp20480 (4B, q8_0) vs the RDNA4 4B reference -1.3 %, decode flat.  Still a large
+  net win (-799 MiB compute + -799 MiB host) and on by default; if an iGPU tuning pass ever
+  runs, the derived MMA kernel's `J`/occupancy on gfx1151 is the place to look.
+- **Follow-up (block 13, RDNA3_5): the isolated fused-MoE delta is now ~0 on Strix Halo.**
+  With the 2026-09-06 model-neutral folds in the tree, `GGML_CUDA_DISABLE_MOE_MMQ_FUSION` on vs
+  off measured pp2048 +0.4 %/pp16384 +0.2 % (was +5.3 %/+4.6 % on the 2026-09-05 build);
+  absolute prefill is ~10-13 % higher and the fusion still fires, so this is the folds
+  capturing the same work, not a regression.  Re-check whether the gate+up+GLU arm still has a
+  unique win before any future tuning.
 - **Block 15 is CUT and in the delivery**: `patches/0015-rdna-boosts-block-15-campaign-memory-wins.patch`
-  (canonical tip `09a137566`, rebuilt at `9113cc188`; 15 patches total, strict 15/15 `git am`).  Six wins,
+  (canonical tip `377f8e790`, including the 2026-09-10 V5 and RDNA3_5 amendments; 15 patches total,
+  strict 15/15 `git am`).  Six wins,
   each with an env A/B gate (V4 is opt-in): W1 QSA score-chain (`GGML_QSA_SCORE_MEM`), W2 derived QSA bias
   + visibility + the input-fill null guards (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), W3 keys-only
   indexer cache (`LLAMA_QSA_KEYS_ONLY`), W4 ggml-alloc unused-view release (no gate; `ab/w4-revert.patch`),
