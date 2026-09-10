@@ -4,10 +4,34 @@ Cross-project tracker so important state survives context compaction.
 Forward-looking: open items + current active experiments; closed work is a
 one-line bullet (details live in AGENTS.md, patches/README.md, MANIFESTS.md,
 `beta/qwen4exp/README.md`, `wip/` handovers, `benchmarks/`). Current
-delivery = the 13-patch set against fork point `465e49b9c` (blocks 01-13).
-Reality pass: 2026-09-05.
+delivery = the 14-patch set against fork point `9113cc188` (blocks 01-14).
+Reality pass: 2026-09-10.
 
 ## Current active
+
+### Memory campaign -> beta Block 0015 (derived kq mask + FA scratch + the qwen4exp wins) — ACTIVE
+- **Four wins validated** (2026-09-10), all still under `wip/`:
+  W1 L2 score-chain memory (qwen4exp ub2048 compute 6690.40 -> 4450.40 MiB/GPU),
+  W2 L1 derived QSA bias + derived visibility + **mask prune** (-> **3251.39 MiB compute + 63.69 MiB host**;
+  host mask build gone; MTP 0.61616),
+  W3 keys-only QSA indexer cache (indexer KV 956.25 -> 318.75 MiB, box -1.9 GiB),
+  W4 ggml-alloc unused-view release (repro 56.00 -> 16.00 MiB; **upstream-applicable, applies clean to
+  master `9cf3bf256`**).
+- **Critical path: V3, then V4.**
+  V3 = derived kq mask for the dense models (**-800 MiB/GPU VRAM + -800 MiB host** at ctx 204800 / ub 2048;
+  phase 3.1 causal/occupancy/sequence in the prefill+MMA path with the packed mask kept for decode and
+  unsupported cases, **phase 3.2 SWA coverage — both in Block 15**; V2 1-bit packed mask is the fallback).
+  V4 = native quantized K/V in the MMA FA path (**-832 MiB/GPU**, exactly ctx-linear; ships on-by-default
+  only if prefill throughput does not regress, else **opt-in default-off** for people who need the memory).
+  Spec: `wip/arch-independent-memory/DERIVED-MASK-DESIGN.md` (brief + measurements + V1-V4 ladder).
+- **Block 15 waits for V3+V4** (maintainer 2026-09-10): exactly ONE block, no Block 16.  W1-W4 + V3 + V4 get
+  merged, each gated with an env kill-switch, re-validated **as a combination** (individual validations do
+  not carry over), then staged in `beta/` for a ~4-5 day beta window before promotion into `patches/0015-…`.
+- LIVE PLAN + STATE: `beta/block-15-campaign-wins/HANDOVER.md` (maintainer decisions, V3/V4 implementation
+  plans with exact source locations, merge/gate/validate/cut steps, state inventory, next-session prompt).
+  Beta A/B checklist: `BETA-TESTING.md`;  W4 A/B revert: `ab/w4-revert.patch`.
+  Upstream PR candidates (maintainer's backlog): `upstream/` — the allocator fix is ready; next are the
+  keys-only dead-V removal and the `attn_k` null-mask guard.
 
 ### gfx1201 (RDNA4) port of the gfx1151-gated Halo campaign items — ACTIVE (final qwen4exp stretch)
 - The sched-gate fix (fork `c63f7f2a0`, delivery `d6eb551`) is CLOSED on BOTH arches
@@ -291,3 +315,5 @@ Reality pass: 2026-09-05.
 - Delivery verification contract + dated records: `MANIFESTS.md`,
   `patches/README.md`, AGENTS.md headers.
 - Benchmarks + gates: `benchmarks/` (`mtp-adaptive-methodology.md` etc.).
+- Memory campaign (wins, V3/V4 plans, Block-0015 staging): `beta/block-15-campaign-wins/HANDOVER.md`
+  + `README.md` + `BETA-TESTING.md`; upstream PR candidates: `upstream/README.md`.
