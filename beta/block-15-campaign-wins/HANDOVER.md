@@ -25,7 +25,8 @@
 | D6 | Prepare the two extra upstream candidates (keys-only dead-V removal, `attn_k` null-mask guard) in the `upstream/` style (§4). |
 | D7 | **V3 includes phase 3.2 (SWA coverage)** — wider coverage is required precisely so that *other* models do not regress; the mask work must not leave SWA models on a different (or unvalidated) path. |
 | D8 | **Beta tester material: yes** — `BETA-TESTING.md` in this directory (one-page A/B checklist: gate table, the three measurements, the report template, what not to report). |
-| D9 | **V4 ship rule (three-way)**: no prefill-throughput regression → on by default; regression → ship it **opt-in (default off)** for people who need the last 832 MiB, with the trade-off documented; if even that is impractical → future work. |
+| D9 | **V4 ship rule (three-way)**: no prefill-throughput regression → on by default; regression → ship it **opt-in (default off)** for people who need the last 832 MiB, with the trade-off documented; if even that is impractical → future work.  **Applied 2026-09-10**: the q8_0 arm measured −1.7 % prefill, so it ships **opt-in** (`GGML_CUDA_FA_KV_NATIVE=1`); and the maintainer's refinement of D9 is that **a sub-2 % loss with a memory win and no cheap way to close the gap ships opt-in anyway** (do not grind for the last percent). |
+| D10 | **bf16 (2026-09-10): no pure-bf16 rework.**  llama.cpp is predicated on F16 as the always-available default, so the fork keeps the F16 compute path; bf16 K/V work must remove the *staging* (convert in place, keeping the F16 fragments and the cp_async pipeline), **not** re-instantiate the kernels natively.  A pure-bf16 fork is explicitly out of scope for now.  See §3.4. |
 
 ## 1. Where the campaign stands
 
@@ -257,7 +258,8 @@ that V4 already removes for q8_0.  At ub 8 (TILE) bf16 and f16 are both 5.47 MiB
 needs nothing.  V3's mask win (-799 compute / -799 host) already applies to bf16 too (the mask is F16
 whatever the KV type is).
 
-**Why this is the *easier* case than q8_0** (and the recommended follow-up):
+**Why this is the *easier* case than q8_0** (and the recommended follow-up - **scope fixed by D10**: keep
+the F16 fragment path, remove only the staging):
 
 1. bf16 -> f16 is **size- and layout-preserving**: a 16-byte staged chunk is 8 bf16 elements -> 8 f16
    elements, same 16 bytes.  So the **cp_async pipeline can be kept**: copy the raw bf16 row into the
@@ -457,9 +459,12 @@ DO, in this order (HANDOVER section 5 has the detail):
    9113cc188 + build + coherence.
 4. Stage beta/block-15-campaign-wins/block-15-campaign-wins.patch + the promotion record (beta start date,
    gate table with defaults, validation results) and run the upstream-drop check (HANDOVER section 5.6).
-5. OPTIONAL, if the maintainer wants it before the cut: extend the V4 gate to bf16 (HANDOVER section 3.4
-   - the MMA staging scratch costs a bf16 user ~712 MiB/GPU at ctx 204800 and the in-place conversion
-   should keep the cp_async pipeline, so it can likely ship on by default).
+5. OPTIONAL (maintainer's call, and it can equally be a later session): extend the V4 gate to bf16, as
+   HANDOVER section 3.4 specifies under D10 - keep the F16 fragments, cp_async the raw bf16 row into the
+   shared tile, convert in place (bit-identical values), so the ~712 MiB/GPU staging scratch at ctx
+   204800 disappears with the pipeline intact (likely free, so it can ship on by default; the bf16 cache
+   itself, 2 B/element, is the format choice and is not reducible).  Do NOT rebuild the WMMA kernels with
+   bf16 fragments.
 6. Report: the gate table with defaults, the measured before/after reserves and throughput, what was not
    validated, and the updated state.
 
