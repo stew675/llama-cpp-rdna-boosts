@@ -17,6 +17,13 @@ Reality pass: 2026-09-10.
   W3 keys-only QSA indexer cache (indexer KV 956.25 -> 318.75 MiB, box -1.9 GiB),
   W4 ggml-alloc unused-view release (repro 56.00 -> 16.00 MiB; **upstream-applicable, applies clean to
   master `9cf3bf256`**).
+- **V3 phase 1 DONE (2026-09-10)**: the derived predicate (`cell_pos >= lo && cell_pos <= hi`, with
+  the SWA floor + a M-RoPE degeneracy guard) is **proven bit-exact on the host** against the packed
+  fill on the 27B dense prefill (n_tps=2048, 21 ubatches), gemma-4-E4B **ISWA both caches
+  (n_swa=512)**, the **non-causal** and **F32** paths, and small verify batches -- every record
+  `mismatches: core=0 ext=0`.  Phase 2 (the MMA kernel + graph plumbing + the backend-capability
+  probe) is specced in `wip/arch-independent-memory/V3-DERIVED-KQ-MASK-PLAN.md` (oracle:
+  `wip/arch-independent-memory/patches/0002-DIAGNOSTIC-...patch`, logs in `.../logs/`).
 - **Critical path: V3, then V4.**
   V3 = derived kq mask for the dense models (**-800 MiB/GPU VRAM + -800 MiB host** at ctx 204800 / ub 2048;
   phase 3.1 causal/occupancy/sequence in the prefill+MMA path with the packed mask kept for decode and

@@ -1,0 +1,226 @@
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index a342ee119..82f9db325 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1741,6 +1741,212 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
+     }
+ }
+ 
++// ============================================================================================
++// [diagnostic] V3 - derived kq mask predicate verification
++//
++// V3 stops uploading the packed [n_kv, n_tps, 1, n_stream] F16 kq mask and lets the flash
++// attention kernel derive each cell's value from compact per-cell state.  The predicate it has
++// to reproduce is exactly set_input_kq_mask_impl above.  Reduced to per-cell + per-token data:
++//
++//   per cell j, as seen from the stream of the token's sequence:
++//     cell_pos[j] = INT32_MIN    when the cell is empty or belongs to another sequence
++//                 = pos_get(j)   otherwise
++//   per token row (s, ii):
++//     hi = p1 (causal) or INT32_MAX (non-causal)
++//     lo = 0, or the SWA window floor, or (SWA_FULL span) min(that, seq_pos_min[seq])
++//     visible_core = cell_pos[j] >= lo && cell_pos[j] <= hi
++//   plus, for 2-D (M-RoPE) batches at equal positions, the ext clause
++//     visible_ext  = visible_core && !(p0 == p1 && cell_ext.is_2d_gt(p1_x, p1_y))
++//
++// This routine recomputes the mask from both forms and compares all three cell-by-cell.  It is
++// the host-side proof that the derived form is value-identical *before* any kernel work: every
++// differing pair is a case the kernel would get wrong.  "core" is what a first implementation
++// derives; "ext" additionally carries the M-RoPE clause and must match always (0 mismatches).
++//
++// Gate: LLAMA_KQ_MASK_DERIVED_VERIFY=1 (diagnostic; not part of the eventual patch)
++// ============================================================================================
++static bool kq_mask_derived_verify_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("LLAMA_KQ_MASK_DERIVED_VERIFY");
++        return env != nullptr && std::atoi(env) != 0;
++    }();
++    return enabled;
++}
++
++template<typename T>
++static void verify_derived_kq_mask_impl(const args_set_input_kq_mask & args, const T * data, bool causal_attn) {
++    const auto & ubatch = args.ubatch;
++    const auto & hparams = args.hparams;
++
++    if (hparams.use_alibi) {
++        LLAMA_LOG_WARN("%s: skip (alibi writes distances, a value, not a predicate)\n", __func__);
++        return;
++    }
++
++    const auto & v_cells       = args.v_cells;
++    const auto & seq_to_stream = args.seq_to_stream;
++
++    const uint32_t       n_swa    = args.n_swa;
++    const llama_swa_type swa_type = args.swa_type;
++
++    const int64_t n_kv     = args.n_kv;
++    const int64_t n_stream = args.n_stream;
++    const int64_t n_tps    = args.n_tps;
++
++    const bool is_2d = ubatch->is_pos_2d();
++
++    // the mask fill only enters the SWA branch when the cache has a window; the effective
++    // causal flag and the SWA_ONLY rule are already applied by the caller
++    const bool swa = swa_type != LLAMA_SWA_TYPE_NONE;
++
++    llama_pos seq_pos_min[LLAMA_MAX_SEQ];
++    std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
++
++    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
++        const llama_seq_id seq_id = ubatch->seq_id[i][0];
++
++        seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
++    }
++
++    int64_t n_mm_core = 0; // core predicate (no ext clause) vs the packed mask
++    int64_t n_mm_ext  = 0; // full predicate (with the ext clause) vs the packed mask
++    int64_t n_pairs   = 0; // total (cell, token) pairs checked
++    int64_t n_2d_pair = 0; // pairs where the ext clause actually drops a cell
++
++    int64_t n_2d_cells = 0;
++    for (uint32_t s = 0; s < n_stream; ++s) {
++        for (uint32_t ii = 0; ii < n_tps; ++ii) {
++            const uint32_t i = s*n_tps + ii;
++            const llama_seq_id seq_id = ubatch->seq_id[i][0];
++            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
++
++            if (is_2d) {
++                for (uint32_t j = 0; j < n_kv; ++j) {
++                    if (!cells.is_empty(j)) {
++                        const auto & e = cells.ext_get(j);
++                        if (e.x != e.y || e.x != cells.pos_get(j)) {
++                            n_2d_cells++;
++                        }
++                    }
++                }
++                break; // count once
++            }
++        }
++        if (is_2d) {
++            break;
++        }
++    }
++
++    for (uint32_t s = 0; s < n_stream; ++s) {
++        for (uint32_t ii = 0; ii < n_tps; ++ii) {
++            const uint32_t i = s*n_tps + ii;
++
++            const llama_seq_id seq_id = ubatch->seq_id[i][0];
++
++            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
++
++            const llama_pos p1 = ubatch->pos[i];
++            const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
++            const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
++
++            // the per-token visibility window, derived from the same inputs the fill uses
++            llama_pos lo = 0;
++            const llama_pos hi = causal_attn ? p1 : INT32_MAX;
++
++            if (swa) {
++                switch (swa_type) {
++                    case LLAMA_SWA_TYPE_STANDARD:
++                        lo = p1 - (llama_pos) n_swa + 1;
++                        break;
++                    case LLAMA_SWA_TYPE_CHUNKED:
++                        lo = (p1 / (llama_pos) n_swa) * (llama_pos) n_swa;
++                        break;
++                    default:
++                        lo = 0;
++                        break;
++                }
++
++                // LLAMA_NON_CAUSAL_TYPE_SWA_FULL: a cell at or after the batch's first position of
++                // this sequence is kept even outside the window.  that is a union of two ranges, so
++                // the window floor can simply be lowered to seq_pos_min
++                if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL) {
++                    lo = std::min(lo, seq_pos_min[seq_id]);
++                }
++            }
++
++            if (lo < 0) {
++                lo = 0;
++            }
++
++            for (uint32_t jj = 0; jj < n_kv; ++jj) {
++                const uint32_t j = jj;
++
++                const bool own = !cells.is_empty(j) && cells.seq_has(j, seq_id);
++
++                const llama_pos p0 = own ? cells.pos_get(j) : INT32_MIN;
++
++                const bool vis_core = p0 >= lo && p0 <= hi;
++
++                bool vis_ext = vis_core;
++                if (vis_core && is_2d && p0 == p1) {
++                    if (cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
++                        vis_ext = false;
++                        n_2d_pair++;
++                    }
++                }
++
++                const float got = llama_cast<float>(data[(int64_t) i*n_kv + j]);
++                const bool got_vis = got > -INFINITY/2;
++
++                n_pairs++;
++                if (vis_core != got_vis) {
++                    if (n_mm_core < 8) {
++                        LLAMA_LOG_ERROR("%s: core mismatch tok=%u/%u cell=%u seq=%d p0=%d p1=%d "
++                                "lo=%d hi=%d own=%d derived=%d mask=%d\n",
++                                __func__, s, ii, j, (int) seq_id, (int) p0, (int) p1,
++                                (int) lo, (int) hi, (int) own, (int) vis_core, (int) got_vis);
++                    }
++                    n_mm_core++;
++                }
++                if (vis_ext != got_vis) {
++                    if (n_mm_ext < 8) {
++                        LLAMA_LOG_ERROR("%s: EXT mismatch tok=%u/%u cell=%u seq=%d p0=%d p1=%d p1x=%d p1y=%d "
++                                "lo=%d hi=%d own=%d derived=%d mask=%d\n",
++                                __func__, s, ii, j, (int) seq_id, (int) p0, (int) p1, (int) p1_x, (int) p1_y,
++                                (int) lo, (int) hi, (int) own, (int) vis_ext, (int) got_vis);
++                    }
++                    n_mm_ext++;
++                }
++            }
++        }
++    }
++
++    LLAMA_LOG_INFO("%s: n_kv=%d n_tps=%d n_stream=%d causal=%d swa=%d(swa_type=%d n_swa=%u) is_2d=%d "
++            "| pairs=%lld mismatches: core=%lld ext=%lld | 2d: cells=%lld dropped_pairs=%lld\n",
++            __func__, (int) n_kv, (int) n_tps, (int) n_stream, (int) causal_attn,
++            (int) swa, (int) swa_type, n_swa, (int) is_2d,
++            (long long) n_pairs, (long long) n_mm_core, (long long) n_mm_ext,
++            (long long) n_2d_cells, (long long) n_2d_pair);
++
++    if (n_mm_ext != 0) {
++        GGML_ABORT("%s: the derived predicate (with the M-RoPE ext clause) does not reproduce the "
++                "packed kq mask: %lld of %lld pairs differ\n",
++                __func__, (long long) n_mm_ext, (long long) n_pairs);
++    }
++}
++
++static void verify_derived_kq_mask(const args_set_input_kq_mask & args, const void * data, bool is_f16, bool causal_attn) {
++    if (!kq_mask_derived_verify_enabled()) {
++        return;
++    }
++
++    if (is_f16) {
++        verify_derived_kq_mask_impl<ggml_fp16_t>(args, (const ggml_fp16_t *) data, causal_attn);
++    } else {
++        verify_derived_kq_mask_impl<float>(args, (const float *) data, causal_attn);
++    }
++}
++
+ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+     const uint32_t n_tokens = ubatch->n_tokens;
+ 
+@@ -1780,6 +1986,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+     }
+ 
++    verify_derived_kq_mask(args, dst->data, dst->type == GGML_TYPE_F16, causal_attn);
++
+     //const int64_t t_end = ggml_time_us();
+ 
+     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);

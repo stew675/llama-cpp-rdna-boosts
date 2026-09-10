@@ -30,7 +30,7 @@ its own, not together.
 
 | id | what | expected effect (dense models, ctx 204800, ub 2048, q8_0 KV) | spec |
 |---|---|---|---|
-| **V3** | derived kq mask for the plain attention path: stop materialising the `n_kv × n_tps` F16 mask and its host mirror; derive visibility in the FA prefill/MMA kernel from compact per-cell state (packed mask kept for decode and every unsupported case) | **−800 MiB/GPU VRAM − 800 MiB host** (27B 1920.33 → ~1120 compute, 4B 1800.33 → ~1000) | `wip/arch-independent-memory/DERIVED-MASK-DESIGN.md` §2–§5 + §7; plan in `HANDOVER.md` §3.1 |
+| **V3** | derived kq mask for the plain attention path: stop materialising the `n_kv × n_tps` F16 mask and its host mirror; derive visibility in the FA prefill/MMA kernel from compact per-cell state (packed mask kept for decode, small batches and every unsupported case).  **Phase 1 DONE 2026-09-10: the predicate is proven bit-exact on the host** (incl. the SWA and non-causal paths) | **−800 MiB/GPU VRAM − 800 MiB host** (27B 1920.33 → ~1120 compute, 4B 1800.33 → ~1000) | **`wip/arch-independent-memory/V3-DERIVED-KQ-MASK-PLAN.md`** (verified predicate + phase-2 spec); `DERIVED-MASK-DESIGN.md` §2–§5 + §7; `HANDOVER.md` §3.1 |
 | **V4** | native quantized K/V in the MMA FA path: dequantize into the shared K/V tiles instead of staging an F16 copy of the whole cache in a global scratch | **−832 MiB/GPU**, exactly ctx-linear | same, §1.3 + §4 (V4); plan in `HANDOVER.md` §3.2 |
 | **V2** | *fallback for V3 only*: 1-bit packed mask (bit-exact by construction, no per-cell state) if V3 phase 3.1 proves too invasive | −750 MiB/GPU − 750 MiB host | same, §4 (V2) |
 

@@ -84,13 +84,31 @@ plus perf tuning.
 
 ### 3.1 V3 — derived kq mask (the mask's 800 MiB + 800 MiB host)
 
+> **PHASE 1 IS DONE (2026-09-10): the predicate is proven bit-exact on the host.**  A diagnostic
+> (env `LLAMA_KQ_MASK_DERIVED_VERIFY=1`) recomputes the mask from the derived form and compares it
+> cell-by-cell with the packed fill; every record is `mismatches: core=0 ext=0` on: the 27B dense
+> prefill (21 ubatches, `n_tps=2048`, `n_kv` 2304 -> 39680), **gemma-4-E4B ISWA (both the base and
+> the SWA cache, `n_swa=512`)**, the **non-causal** SWA path (`--attention non-causal` via
+> llama-embedding), the **F32** mask (`-fa 0`), and small verify batches.  See
+> `../../wip/arch-independent-memory/V3-DERIVED-KQ-MASK-PLAN.md` (the spec) +
+> `wip/arch-independent-memory/patches/0002-DIAGNOSTIC-verify-derived-kq-mask-predicate.patch`
+> (the oracle) + `wip/arch-independent-memory/logs/`.  Two findings refine the plan below:
+> **`qwen35` is IMROPE, so `is_pos_2d()` is true for text** (the M-RoPE clause is live but provably
+> a no-op for degenerate positions -> a degeneracy guard is the fallback), and **every SWA variant
+> reduces to a per-token visibility floor `lo`** (`STANDARD`: `p1-n_swa+1`; `CHUNKED`: the chunk
+> start; `SWA_FULL`: `min(lo, seq_pos_min)`), so 3.2 costs nothing beyond that host-side floor.
+
 **Scope it in phases; phase 3.1 alone captures the whole memory win for the dense text models.**
 
-* **3.1 (the win)** — derive in the **prefill / MMA** path (`n_tps > 1`) for the plain cache
-  (`llm_graph_input_attn_kv`, `llm_graph_input_attn_k`): predicates *cell occupied*, *cell belongs to
-  the token's sequence*, *causal (`cell_pos <= token_pos`)*.  Keep the **packed mask for decode**
-  (`n_tps == 1`, where it costs ~n_kv × 2 B = 400 KiB, i.e. nothing) and for every unsupported case.
-  That is the case that sets the reserve, so the win is complete without touching the decode path.
+* **3.1 (the win)** — derive in the **prefill / MMA** path for the plain cache
+  (`llm_graph_input_attn_kv`, `llm_graph_input_attn_k`, and the four standard ISWA/hybrid-iswa
+  variants): predicates *cell occupied*, *cell belongs to the token's sequence*, *causal
+  (`cell_pos <= tok_hi`)*, *the SWA floor (`cell_pos >= tok_lo`)*.  Keep the **packed mask for
+  decode** (`n_tps == 1`, where it costs ~n_kv × 2 B = 400 KiB, i.e. nothing), for **`n_tps <= 8`**
+  (small verify batches, where the launcher may pick the vec/tile kernel and the mask is tiny
+  anyway), and for every unsupported case — so the kernel change is confined to the MMA path
+  (`fattn-mma-f16.cuh`) and the vec/tile kernels are untouched.  Prefill is what sets the reserve,
+  so the win is complete without touching the decode path.
 * **3.2 (SWA coverage — IN SCOPE for Block 15, D7)** — add **SWA as a position bound**
   (`llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)`, a pure function of the two positions plus
   `n_swa`/`swa_type`; remember the `LLAMA_NON_CAUSAL_TYPE_SWA_FULL` in-span exception, which needs the
@@ -135,7 +153,14 @@ the mask; per token the existing `attn_inp_pos` I32 input plus a sequence-id arr
 5. **guard every input-fill call site** with `if (tensor && tensor->buffer)` — an input the graph does
    not consume is simply not allocated by the gallocr (the L1 lesson again);
 6. gate: `LLAMA_KQ_MASK_DERIVED` (default 1 once validated; 0 = always packed) plus the capability
-   check; extend `test-backend-ops` with a derived-form FLASH_ATTN_EXT case.
+   check; extend `test-backend-ops` with a derived-form FLASH_ATTN_EXT case;
+7. **gate the feature on the *backend*, not on the graph**: the mask-vs-derived decision cannot know
+   which backend will run the FA node, so use the repo's fused-op probe (`resolve_fused_ops`) and
+   make `ggml_cuda_flash_attn_ext_supported()` reject a derived op unless the selected kernel is
+   `BEST_FATTN_KERNEL_MMA_F16`.  Keep the mask's *policy* meaning in
+   `ggml_cuda_get_best_fattn_kernel` (`gqa_opt_applies` requires a mask and the AMD-WMMA arm depends
+   on it) or kernel selection changes silently — use `has_mask = mask || dst->src[5]` for the policy
+   tests and `mask` only for the reads.  Details in the plan file section 2.2-2.3.
 
 **Validation** (the L1 protocol, verbatim): one binary that flips the gate, same-seed generated text
 **byte-identical** on 4B + 27B at a short and a long prompt, decode + prefill + MTP; the reserve matrix;
