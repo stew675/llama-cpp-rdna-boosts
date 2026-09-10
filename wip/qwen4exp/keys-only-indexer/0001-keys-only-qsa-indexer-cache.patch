@@ -1,0 +1,62 @@
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index a342ee119..cd2794145 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -79,8 +79,9 @@ llama_kv_cache::llama_kv_cache(
+     const layer_filter_cb & filter,
+     const  layer_reuse_cb & reuse,
+     const  layer_share_cb & share,
+-             const char *   name_tag) :
+-    model(model), hparams(hparams), v_trans(v_trans),
++             const char *   name_tag,
++                     bool   v_enabled) :
++    model(model), hparams(hparams), v_trans(v_trans), v_enabled(v_enabled),
+     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+     other(static_cast<llama_kv_cache *>(mem_other)),
+     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
+@@ -228,7 +229,7 @@ llama_kv_cache::llama_kv_cache(
+         }
+ 
+         const bool has_k = true;
+-        const bool has_v = !is_mla;
++        const bool has_v = !is_mla && v_enabled;
+ 
+         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index c4d8699de..a62ef75af 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -114,7 +114,10 @@ public:
+         const  layer_reuse_cb & reuse,
+         const  layer_share_cb & share,
+         // a model can hold more than one cache, so the tensor names have to stay unique
+-                 const char *   name_tag = "");
++                 const char *   name_tag = "",
++        // set to false for keys-only caches (e.g. the qwen4exp QSA indexer store):
++        // no V tensor is allocated, and no V-side op may be issued against the cache
++                         bool   v_enabled = true);
+ 
+     ~llama_kv_cache() = default;
+ 
+@@ -260,6 +263,7 @@ private:
+     };
+ 
+     bool v_trans = true;  // the value tensor is transposed
++    bool v_enabled = true; // keys-only caches (v_enabled = false) allocate no V tensor
+ 
+     const uint32_t n_seq_max = 1;
+     const uint32_t n_stream  = 1;
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index b5dad83bd..1a37b5a7c 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -60,7 +60,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+         return new llama_kv_cache(
+             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+             kv_size, n_seq_max, n_pad, n_swa, swa_type,
+-            nullptr, filter_idx, nullptr, nullptr, "idx_");
++            nullptr, filter_idx, nullptr, nullptr, "idx_", /* v_enabled */ false);
+     }()) {
+     // incremental block-vector cache (env-gated, default OFF; decode waste fix)
+     const char * env_cache = getenv("GGML_CUDA_QSA_INDEXER_CACHE");
