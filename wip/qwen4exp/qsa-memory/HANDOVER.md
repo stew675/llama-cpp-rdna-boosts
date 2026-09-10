@@ -25,19 +25,24 @@ Status: **WIP — nothing here is part of the delivery.** `wip/` items must not 
 > **PROGRESS (2026-09-10, later session): the state half is DONE and validated** — see §2b of
 > `L1-step1-derived-block-bias-findings.md`. `set_input_qsa` now fills `cell_vis [n_kv, n_stream]`
 > and `q_vis [n_tps, n_stream]` I32 (the cell's compaction key, −1 for empty/foreign; the query's
-> key), the top-k already consumes them via the optional srcs added in step 1, and generated text is
+> key), the top-k consumes them via the optional srcs added in step 1, and generated text is
 > **byte-identical** with `GGML_QSA_DERIVED_VIS=1` vs `=0` on the 3k and 40k prompts (reserve
-> 4050.60 → 4051.39 MiB, +0.79 MiB for the two arrays). The mask is still allocated because the FA
-> reads it, so the remaining work is exactly the **FA switch** (no new op needed — `fattn-qsa.cu`
-> already has `idx[]`, the token and the stream, so both `M_smem` sites compute
-> `(cell_vis[g] >= 0 && cell_vis[g] <= q_vis_t) ? 0.0f : -INFINITY` inline), plus allowing
-> `kq_mask == nullptr` on the op so the 800 MiB tensor is pruned. §2b has the site list, the
-> plumbing (ggml.h/ggml.c ctor, launcher, cuh, CPU ref at ops.cpp ~9366/9373/9494, meta-backend
-> src asserts) and the expected numbers.
+> 4050.60 → 4051.39 MiB, +0.79 MiB for the two arrays).
 >
-> The original design notes (superseded): use the corrected encoding, *not* §2–§4 of
+> **Validated (2026-09-10, later still): steps 3 is DONE too — see §2c.** The FA now derives the
+> visibility from the same keys (optional srcs 5/6 of `GGML_OP_FLASH_ATTN_QSA`, one inline helper at
+> both `M_smem` sites, text byte-identical on the 3k + 40k prompts). **The −800 MiB prune was
+> implemented and measured: 4051.39 → 3251.39 MiB/GPU (host 863.69 → 63.69)** — but it aborts at
+> compute time with `GGML_ASSERT(buffer)` in `ggml_backend_buffer_get_usage` because the mask stays
+> *created* while becoming unreachable, so the gallocr never allocates it. §2c has the exact fix for
+> the next session: never call `inp->get_kq_mask()` on the derived path (compute a graph-level
+> `want_derived_vis` from the model-level `blk_bias` predicate and thread it to the top-k call site +
+> `build_attn_qsa`, so `blk_bias` no longer needs the mask's shape). That single change realizes the
+> measured −800 MiB; nothing else is missing.
+>
+> The original step-2 design notes (superseded): use the corrected encoding, *not* §2–§4 of
 > `L1-visibility-bias-derivation.md` — `!is_pos_2d()` cannot gate anything (IMROPE always reports
-> `n_pos = 4`) and the per-token `seq_has` test must be kept (folded into the −1 key above).
+> `n_pos = 4`) and the per-token `seq_has` test must be kept (folded into the −1 key of §2b).
 >
 > **3. Build/patch workflow.** `~/llama.cpp` already carries the L2 patch *and* step 1 (with the
 > `GGML_QSA_DERIVED_BIAS` = 0/1/2/3 diagnostic modes; strip modes 2/3 before packaging) in the
