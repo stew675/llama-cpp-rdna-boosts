@@ -98,6 +98,18 @@ plus perf tuning.
 > reduces to a per-token visibility floor `lo`** (`STANDARD`: `p1-n_swa+1`; `CHUNKED`: the chunk
 > start; `SWA_FULL`: `min(lo, seq_pos_min)`), so 3.2 costs nothing beyond that host-side floor.
 
+> **PHASE 2a+2b ARE DONE (2026-09-10).**  The engine half (the `ggml_flash_attn_ext_add_kq_derived`
+> op + a real CPU reference) and the CUDA half (the shared `fattn_kernel_t` now carries the three
+> derived pointers, the MMA mask loader derives 0/-INFINITY per cell, `has_mask` keeps the
+> kernel-selection policy identical, and `supports_op` rejects a derived op unless the best kernel is
+> the MMA one) are implemented, and 2b is **validated on its own**: six new derived
+> `test-backend-ops FLASH_ATTN_EXT` cases pass 6/6 on CPU and 3/3 on ROCm0 (the other three pick the
+> VEC/TILE kernel and are correctly rejected), the whole FLASH_ATTN_EXT suite is 5104/5104 on ROCm0,
+> and the fork tree's coherence is byte-identical with the code in place but no caller yet.  Patches
+> `wip/arch-independent-memory/patches/0003-*` (engine) and `0004-*` (MMA kernel); details and the
+> remaining work in `V3-DERIVED-KQ-MASK-PLAN.md` §4.  What is left is **phase 2c** — the graph
+> plumbing, the backend probe/gate and the end-to-end validation bar (items 1-7 below).
+
 **Scope it in phases; phase 3.1 alone captures the whole memory win for the dense text models.**
 
 * **3.1 (the win)** — derive in the **prefill / MMA** path for the plain cache
