@@ -43,7 +43,23 @@ Per-1024-ubatch compute delta: 560 MiB, of which 400 is the mask. Peak live set 
 
 Scaling law: `mask_bytes = n_kv * n_tps * 2 (F16) * 2 (mirror)`, with `n_tps = ubatch / n_stream`.
 So the mask is what makes the ub2048-vs-1024 memory gap so brutal on *every* arch (500 MiB per
-1024 ubatch of compute-buffer delta on the 4B, of which 400 is the mask).
+1024 ubatch of compute-buffer delta on the 4B, of which 400 is the mask). Verified exactly at three
+contexts with the new `tools/mask-scaling.sh` (`+57344` ctx -> `+2 x 224` MiB compute, `+224` MiB host
+= 4.096 KiB per ctx token per copy, where 4.096 KiB = `n_ubatch * 2 B`).
+
+**There is a second, undocumented ctx-linear consumer of the same size.** With a *quantized* KV cache
+the CUDA/HIP FA path materializes an F16 conversion of the whole K and V inside the compute buffer
+(`ggml_cuda_flash_attn_ext_get_alloc_size()` / `..._get_f16_extra_data()`,
+`ggml/src/ggml-cuda/fattn.cu:694`, `fattn-common.cuh`) - one transient per attention layer, measured
+**832 MiB** at ctx 204800 / ub 2048 / q8_0 (L0d instrumentation: `x16 832.00 MB node_* [Meta()]`),
+and **absent** with `-ctk/-ctv f16` (compute reserve 1800.33 -> 1056.06 MiB). The F16 KV cache that
+would avoid it costs +1031 MiB of cache (1185 -> 2216), so q8_0 + scratch still wins by 287 MiB - but
+the scratch is real. Net: at this shape the compute buffer's ctx-linear part is mask (4.096 KiB/ctx
+token) + FA scratch (4.06 KiB/token) = **8.0 MiB per 1k context tokens**, against the 27B's 11.7 MiB/1k
+KV - i.e. **the real VRAM cost of context is ~1.7x what the KV cache suggests** (and ~1.4x for the
+4B). Also note the arena high-water legitimately exceeds the ledger's live-tensor sum: the arena is
+sized by `ggml_backend_buft_get_alloc_size()` (the *request*), while the ledger prints
+`ggml_nbytes()`. Full design brief for reclaiming both: `DERIVED-MASK-DESIGN.md`.
 
 ## 2. Three ways to reclaim it, in increasing difficulty (all arch-independent)
 
@@ -58,7 +74,9 @@ So the mask is what makes the ub2048-vs-1024 memory gap so brutal on *every* arc
    positions; it must keep the **packed mask as the fallback** for the CPU backend, non-FA
    attention paths, and any mask variant it cannot derive. That means touching the shared graph
    input classes plus each FA backend - a design project, not a patch, but the payoff is ~1.6 GiB
-   per GPU at ub2048 on any large-context model.
+   per GPU at ub2048 on any large-context model. **Design brief written: `DERIVED-MASK-DESIGN.md`**
+   (derivability taxonomy, per-backend inventory, the V1/V2/V3/V4 ladder with measured cost/benefit,
+   the L1 worked example, acceptance criteria).
 3. **Derive the consumers instead of the mask** (the L2/L1 pattern): replace an uploaded dense
    tensor with compact index arrays and derive in-kernel (per-block bias: 400 MiB), chunk a giant
    N-dim intermediate and `concat` (L2m: 1040 MiB), or order a unary op before a reshape (L2a:
@@ -126,18 +144,20 @@ clean; the qwen4exp L1 numbers (3251.39 MiB/GPU at ub2048) unchanged or better.
 | `../qwen4exp/qsa-memory/tools/l0a-scheddump.sh` (`BIN=... MODEL=...`) + `tools/peak-ledger.py` | peak live-tensor ledger and attribution (needs a `GGML_ALLOCATOR_DEBUG` build; `/tmp/bin-l0base` is one) |
 | `tools/ub-sweep.sh <bin> [ub...]` | pp20480/tg256 performance per ub (llama-bench, r=3) |
 | `tools/ab-coherence.sh`, `tools/mtp-ab.sh <tag>` | the correctness gates (same-seed text A/B; adaptive-MTP acceptance) |
+| `../qwen4exp/qsa-memory/tools/mask-scaling.sh <bin> <model> <ub> <ctx...>` | the kq mask's cost vs context (isolates the only term linear in n_ctx) |
+| `../qwen4exp/qsa-memory/tools/view-reuse-ledger.py <sched.log...>` | the missed through-view reuse counter (3a) per model |
 
 Rule of thumb for reading the numbers: report **compute buffer**, **host buffer**, and the **mask's
 share** separately - the mask is the only term that is both huge and arch-independent.
 
 ## 5. Open items / next session, in order
 
-1. **The mask - the main lever, and the actual peak setter** (measured: 800 MB of the 27B's 1920 MB
-   buffer *at the peak record*, with nothing else above 96 MB). The 27B's mask is the easiest kind to
-   derive (`n_swa = 0`, no alibi -> only causality + sequence membership). Write the design brief for a
-   generic derived-mask facility (which mask variants are derivable, per-backend support including the
-   packed-mask fallback, and how to gate it) plus the smaller device-side-fill variant (§2.1) - do
-   not start coding the facility without the brief.
+1. ~~**The mask - design brief**~~ **DONE 2026-09-10 -> `DERIVED-MASK-DESIGN.md`** (which corrects
+   the accounting: the compute buffer's other 832 MiB is the FA F16 K/V conversion scratch, not the
+   mask - see §1). Next: implement **V3 (derived mask), HIP/CUDA-only, gated**, starting from the
+   single-sequence prefill case (`cell_pos <= token_pos`), using the L1 patch as the template; **V2**
+   (1-bit packed mask) is the semantics-free alternative; **V4** (native quantized K/V in the MMA FA
+   path) is an independent, equal-sized win that also removes a per-ubatch conversion.
 2. **ggml-alloc 3b (the leak)** - this one *did* move the reserve (4450 -> 6441 MiB on qwen4exp), so it
    is the allocator item worth fixing. Prove the mechanism with `AT_PRINTF` on a minimal repro, fix the
    `n_views` accounting, and validate against the acceptance criteria in §3b.

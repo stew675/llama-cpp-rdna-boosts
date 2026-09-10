@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # L0a: dump the prefill/decode graph nodes with sizes (GGML_SCHED_DEBUG=2) at the
 # production shape (ctx 204800, ub 2048, q8_0 KV, 3-GPU tensor split).
+# Env: BIN, MODEL, CTX (default 204800), UB (default 2048), GGML_SCHED_DEBUG.
 # Usage: l0a-scheddump.sh <outdir>
 set -euo pipefail
 
@@ -36,7 +37,7 @@ timeout 1200 "$BIN" \
   -m "$MODEL" \
   -f "$OUT/prompt.txt" \
   -ngl all -sm tensor -mg 0 \
-  -c 204800 -b 2048 -ub 2048 \
+  -c "${CTX:-204800}" -b 2048 -ub "${UB:-2048}" \
   -fa auto \
   -ctk q8_0 -ctv q8_0 \
   -n 1 --seed 42 --temp 0 --no-display-prompt --single-turn \
