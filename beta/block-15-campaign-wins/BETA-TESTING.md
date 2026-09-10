@@ -4,11 +4,13 @@ For beta testers with a machine that can build the Block-15 tree.  Purpose: conf
 memory wins on *your* models and hardware, and — if something looks wrong — isolate it to a single win
 without rebuilding five times.  Every win except W4 is switchable by environment variable.
 
-> **Status: final for the gates that are already validated (W1–W4, V3, V4).**  V3 is **on by default**
-> (`LLAMA_KQ_MASK_DERIVED`), V4 is **opt-in** (`GGML_CUDA_FA_KV_NATIVE=1`, default off - a ~1.7 %
-> prefill cost for a large memory win).  A session that stages Block 15 only has to re-check these
-> rows against the merged build (and mirror them in `patches/README.md`) **before** the beta window
-> opens.
+> **Status: OPEN — the beta window started 2026-09-10.**  Block 15 is cut and in the delivery
+> (`patches/0015-…`), and every row below was re-checked **as a combination** on the tree built from the
+> delivered patches (fresh worktree at `9113cc188`, strict 15/15 `git am`, fresh build): reserves,
+> byte-identical coherence on all five models, the MTP gate, and the op suites all reproduce.
+> V3 is **on by default** (`LLAMA_KQ_MASK_DERIVED`), V4 is **opt-in** (`GGML_CUDA_FA_KV_NATIVE=1`,
+> default off — a ~1.7 % prefill cost for a large memory win).  What testers should do is reproduce the
+> two measurements in §2 on their own hardware/models and report through the template in §3.
 
 ## 0. What Block 15 promises
 

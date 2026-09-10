@@ -1,6 +1,6 @@
 # rdna-boosts patch set (delivery)
 
-14 patches against llama.cpp master `9113cc188`
+15 patches against llama.cpp master `9113cc188`
 ("ggml : fix msvc+clang ggml_vld1q_u32 (#28284)"; re-based 2026-09-08 from
 `050dde50c` ("hexagon: add RELU and LEAKY_RELU ops (#28585)"), itself
 re-based 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
@@ -39,7 +39,10 @@ REMOVED — `llama-kv-cache.{cpp,h}` are back to the upstream state — and
 block 14 now carries the unconditional HIP `fattn-tile.cuh` (packed-bf16
 PV) + HIP `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles) +
 Vulkan `flash_attn_cm1.comp`/`flash_attn.comp` (dead columns never read
-V) fixes instead (see the 2026-09-10 block-14 amendment section below):
+V) fixes instead (see the 2026-09-10 block-14 amendment section below); **block 15
+cut 2026-09-10** adds the attention-memory campaign wins (derived kq mask,
+opt-in native q8_0 FA K/V, QSA score/bias/indexer-cache pruning, the
+ggml-alloc unused-view release -- see the 2026-09-10 block-15 section below):
 
 | patch | content |
 |---|---|
@@ -57,15 +60,16 @@ V) fixes instead (see the 2026-09-10 block-14 amendment section below):
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)** — see the block-13 notes below.
 | `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-07 with the derived-cache pool gate** (the F32 block-vector pool is now allocated only when the derived cache is enabled *and* the indexer keys are unquantized — no more dead ~100 MiB buffer + no-op fill launches otherwise) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. | **amended 2026-09-08 with the quantized-KV tensor-split gate** — `q4_1`-family KV cache types (`q4_1`/`q5_0`/`q5_1`/`iq4_nl`) abort at graph reserve under multi-GPU `SPLIT_MODE_TENSOR` (upstream bug, also on vanilla `050dde50c`); now rejected at context creation with a clear error when the Meta device is in use — see the block-14 notes below. | **amended 2026-09-09 with the gfx1151-only freed-cell KV-zeroing gate** — the seq_rm/seq_keep/clear row zeroing (strix-port aad5adb08f masked-column guard for the gfx1151 WMMA f16 `x+(-0.0)` inexactness) now enables only when a KV buffer device is gfx1151 (env `LLAMA_KV_ZERO_FREED` overrides); everywhere else pre-block-14 behavior (no per-free GPU memsets) is restored — see the 2026-09-09 block-14 amendment section below. | **amended 2026-09-10 with the kernel-side masked-V fixes; the 2026-09-09 host zeroing is removed** — `llama-kv-cache.{cpp,h}` revert to the upstream state (no `zero_freed`/env/GPU memsets) and block 14 instead carries the unconditional HIP `fattn-tile.cuh` (packed-bf16 PV) + `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles) and Vulkan `flash_attn_cm1.comp` + `flash_attn.comp` (dead columns never read V) fixes, active by default on every device — see the 2026-09-10 block-14 amendment section below. |
+| `0015` | **attention-memory wins (block 15)** - the RDNA memory campaign squashed into one block: W1 QSA score-chain memory (`GGML_QSA_SCORE_MEM`), W2 derived QSA per-block bias + derived visibility + the input-fill null guards (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), W3 keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), W4 ggml-alloc unused-view release (no gate), V3 derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default) and V4 native q8_0 K/V in the FA kernels (`GGML_CUDA_FA_KV_NATIVE`, **default 0 = opt-in**); ~3.4 GiB/GPU + ~1.2 GiB host reclaimed on qwen4exp, ~800 MiB/GPU + 800 MiB host on dense models, byte-identical output at a ~1.3 % prefill / ~0.3 % decode cost (V4 a further ~1.7-1.9 % prefill, opt-in) -- see the 2026-09-10 block-15 section above. |
 
 ## Apply (fresh checkout at the fork point)
 
 ```bash
 git checkout 9113cc188         # or: git apply each patch on a matching tree
-git am patches/000[1-9]-*.patch patches/001[0-4]-*.patch
+git am patches/000[1-9]-*.patch patches/001[0-5]-*.patch
 ```
 
-(`git am` for the whole 14-patch series - plain `git apply` of the
+(`git am` for the whole 15-patch series - plain `git apply` of the
 concatenated series was observed to silently drop hunks; use `git am`.
 `scripts/apply-all.sh` runs a strict `git am` first and, if that fails
 on a drifted base, aborts and retries the series with `git am -3`,
@@ -87,9 +91,67 @@ gfx1151-zeroing-gate amendment (strict 14/14 `git am`, zero whitespace
 warnings, applied tree == fork tip `27485f1ca`), re-verified 2026-09-10
 after the block-14 kernel-side masked-V amendment (strict 14/14 `git am`,
 zero whitespace warnings, applied tree == fork tip `ff2b35f49`; blocks
-01-13 patch bodies byte-identical to the previous regeneration).
+01-13 patch bodies byte-identical to the previous regeneration), and
+re-verified 2026-09-10 for the 15-patch set (strict 15/15 `git am` at
+`9113cc188`, zero whitespace warnings, applied tree == canonical block-15
+tip `09a137566`; blocks 01-14 patch bodies byte-identical to the previous
+regeneration apart from the `From <sha>` line and the `[PATCH NN/15]`
+series count, since the canonical fork is rebuilt at the fork point -- see
+the 2026-09-10 block-15 section below).
 
-## 2026-09-10 block-14 amendment: kernel-side masked-V fixes replace the host zeroing (current)
+## 2026-09-10 block-15 cut: the attention-memory campaign wins (current)
+
+**Block 15 (`0015`) is the RDNA memory campaign squashed into one block.**
+It removes compute-buffer VRAM and host buffer from the attention paths
+without changing a single generated token: same-seed output is
+byte-identical across every gate combination on every model tested.  Six
+wins, each with an environment A/B gate:
+
+| win | what | gate (default) | at ctx 204800, q8_0 KV, ub 2048 |
+|---|---|---|---|
+| **W1** | QSA indexer score chain: relu before the 4-D reshape (elementwise, bit-identical, but it stops the allocator holding the mul_mat result and its relu together) + `n_blocks`-chunked assembly with `ggml_concat` above a size threshold | `GGML_QSA_SCORE_MEM` (1) | qwen4exp 6690.40 -> 4450.40 MiB/GPU |
+| **W2** | derived QSA per-block bias + derived visibility: the `n_blocks x n_tps` F32 bias and the additive kq mask are not materialised; the fused top-k/FA kernels derive both in-kernel from compact per-cell state.  Carries the input-fill null guards (a tensor the graph never consumes is left unallocated, so every fill site must tolerate `buffer == nullptr`) and the `llm_graph_input_attn_k` null-mask guard | `GGML_QSA_DERIVED_BIAS` (1), `GGML_QSA_DERIVED_VIS` (1), `LLAMA_QSA_SPARSE_FA` (sparse) | qwen4exp 4450.40 -> **3251.39** MiB/GPU, host 1262.70 -> **63.69** MiB |
+| **W3** | keys-only QSA indexer cache: the indexer scores blocks of keys and never reads a stored value, so its cache is created with no V tensor | `LLAMA_QSA_KEYS_ONLY` (1) | indexer KV 956.26 -> **318.76** MiB/GPU (replicated per GPU) |
+| **W4** | ggml-alloc: release view sources whose views are never consumed (the counting pass bumps `view_src->n_views` for every view node, but the free pass only decrements when the view is released -- an unconsumed view is never released, so the inflated count blocks the view source's release and reuse) | none -- a bug fix; A/B with `../beta/block-15-campaign-wins/ab/w4-revert.patch` | 4B 1800.33 -> 1001.13 MiB/GPU, host 840.34 -> 41.13 (V3); repro 56.00 -> 16.00 MiB |
+| **V3** | derived kq mask for the plain attention path: the packed `n_kv x n_tps` F16 mask and its host mirror are not materialised; the MMA FA kernel derives each cell's visibility from compact per-cell state (`ggml_flash_attn_ext_add_kq_derived` -> `src[5..7]`).  The packed tensor is still created in every graph and simply ends up with no consumer (allocator leaves it unallocated, fill guards skip it), so no model list is needed and no consumer can be mis-served.  Gates itself off for alibi, multi-sequence, verify-sized batches, non-MMA backends and live M-RoPE ext clauses | `LLAMA_KQ_MASK_DERIVED` (1; `0` forces the packed mask) | 4B 1800.33 -> **1001.13**, 27B 1920.33 -> **1121.13** MiB/GPU; host -799.21 MiB; gemma-4-E4B (ISWA) -809.18, gemma-4-31B (ISWA) -811.17 |
+| **V4** | native q8_0 K/V in the FA kernels: dequantise each 16-byte staged chunk while the shared K/V tiles load (8 elements = a quarter q8_0 block; every MMA/TILE batch is a multiple of 8 elements, so a chunk never straddles a block) instead of staging an F16 copy of the whole cache; the staged values are bit-identical to `dequantize_block_q8_0_f16` | `GGML_CUDA_FA_KV_NATIVE` (**0 = off**, opt-in) | 4B -> **257.13**, 27B -> **489.13**, gemma-4-31B -1224 MiB/GPU; qwen4exp unchanged |
+
+The wins **compose additively** (qwen4exp ub 2048: pristine 6690.40 -> W1 only 4450.40 -> W2 only 5491.39 -> W1+W2 3251.39; both gates off reproduces 6690.40/1262.70 exactly).
+
+**Cost**: V3 measures -1.28 % prefill (4B, pp20480/ub 2048, interleaved
+same-binary A/B) and +0.28 % on the 27B, decode -0.3 %/-0.15 %; V4 costs a
+further -1.85 % (4B) / -1.72 % (27B) prefill because a quantized source
+cannot use `cp_async` (the dequant ALU itself is free -- a 2-byte-access
+optimisation pass changed nothing), which is why **V4 ships opt-in** with
+decode untouched.
+
+**Validation (2026-09-10, 3x R9700/RDNA4)**: reserves verified on 4B (1
+GPU), 27B (3-GPU Meta), gemma-4-E4B (1 GPU), gemma-4-31B (3-GPU) and
+qwen4exp (3-GPU) at ub 2048/1024/512 with V4 off and on; same-seed text
+byte-identical on all five models across every gate combination at short
+and 40k prompts; MTP acceptance unchanged (27B `draft-mtp` 0.76744 (66/86,
+mean 3.28) in all four gate combinations, qwen4exp draft 0.44262 (54/122)
+in all six -- equal to the block-14 baseline, and MTP stays +26 % over
+plain decode); FLASH_ATTN_EXT (ROCm0 both V4 gates + CPU, including the
+six derived cases), VIEW/CONT/CPY/DUP/CONCAT, `test-alloc`,
+`test-batch-alloc` all pass; the W4 revert restores `ggml-alloc.c`
+byte-identically.  The whole 15-patch set was then **re-validated from the
+delivered patches**: a fresh worktree at `9113cc188`, `apply-all.sh` (15/15
+strict `git am`), fresh build, same reserves, same byte-identical
+coherence, same MTP numbers, same op suites.  Full records:
+`../beta/block-15-campaign-wins/README.md` (gate table + report template),
+`../WORKLOG.md`, and the per-win designs under
+`../wip/arch-independent-memory/` and `../wip/qwen4exp/qsa-memory/`.
+
+**Known pre-existing issue found while validating (NOT introduced by block
+15, reproduces on block 14):** `gemma-4-E4B-it` on **3 GPUs with `-sm
+tensor`** aborts in the meta splitter (`ggml-backend-meta.cpp:1177`) on a
+FLASH_ATTN_EXT node whose K source has zero extent on one buffer, because
+`n_head_kv = 2` is fewer than the number of devices.  It runs on 1 GPU, on
+2 GPUs, and on 3 GPUs with `-sm layer`; no other model is affected.  Out of
+scope for this block (the delivery's other models are unaffected).
+
+## 2026-09-10 block-14 amendment: kernel-side masked-V fixes replace the host zeroing (superseded by block 15)
 
 Freed/stale flash-attention cells are now handled **in the kernels**, and
 block 14 no longer touches `llama-kv-cache.{cpp,h}` at all (both files

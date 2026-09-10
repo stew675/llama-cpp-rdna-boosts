@@ -1,5 +1,23 @@
 # Block 0015 handover — campaign wins → beta delivery (+ upstream candidates)
 
+> **STATUS 2026-09-10 (end of the cut session): DONE — Block 15 is CUT and
+> in the delivery.**  `patches/0015-rdna-boosts-block-15-campaign-memory-wins.patch`
+> (canonical tip `09a137566` on a fork rebuilt at `9113cc188`), 15 patches
+> total, `scripts/apply-all.sh` applies them with strict 15/15 `git am`,
+> `rdna-boosts-all.patch` refreshed.  The combination validation is complete
+> (reserve matrix, byte-identical coherence on all five models, the MTP gate,
+> the op suites) on both the merged tree and the tree built from the delivered
+> patches — see `README.md` in this directory and the 2026-09-10 entry in
+> `../../WORKLOG.md`.  The campaign's critical path is empty.  What remains is
+> the **beta window** (~4–5 days of tester feedback) and, after it, either a
+> dated amendment (if feedback needs one) or nothing.  The one open follow-up
+> is the **bf16 lever** (§3.4: measured, not implemented — it would fold into
+> block 15 as an amendment, per D10); the two unfixed items are the V3 −1.1 %
+> prefill cost (§9.1, accepted) and the **pre-existing** gemma-4-E4B 3-GPU
+> tensor-split abort found during the combination pass (documented in
+> `../../patches/README.md` and `README.md`; not a block-15 regression).
+> This document is now the historical record of how the block was built.
+
 **Rewritten 2026-09-10 (evening) after the maintainer's decisions.**  Read in this order:
 
 1. this file (decisions, the critical path, the plan, the state),

@@ -4,73 +4,49 @@ Cross-project tracker so important state survives context compaction.
 Forward-looking: open items + current active experiments; closed work is a
 one-line bullet (details live in AGENTS.md, patches/README.md, MANIFESTS.md,
 `beta/qwen4exp/README.md`, `wip/` handovers, `benchmarks/`). Current
-delivery = the 14-patch set against fork point `9113cc188` (blocks 01-14).
-Reality pass: 2026-09-10.
+delivery = the 15-patch set against fork point `9113cc188` (blocks 01-15).
+Reality pass: 2026-09-10 (block 15 cut).
 
 ## Current active
 
-### Memory campaign -> beta Block 0015 (derived kq mask + FA scratch + the qwen4exp wins) — ACTIVE
-- **Four wins validated** (2026-09-10), all still under `wip/`:
-  W1 L2 score-chain memory (qwen4exp ub2048 compute 6690.40 -> 4450.40 MiB/GPU),
-  W2 L1 derived QSA bias + derived visibility + **mask prune** (-> **3251.39 MiB compute + 63.69 MiB host**;
-  host mask build gone; MTP 0.61616),
-  W3 keys-only QSA indexer cache (indexer KV 956.25 -> 318.75 MiB, box -1.9 GiB),
-  W4 ggml-alloc unused-view release (repro 56.00 -> 16.00 MiB; **upstream-applicable, applies clean to
-  master `9cf3bf256`**).
-- **V3 DONE (2026-09-10, phases 1+2a+2b+2c), ON BY DEFAULT**: the derived predicate (`cell_pos >= lo &&
-  cell_pos <= hi`, with the SWA floor + a M-RoPE degeneracy guard) is **proven bit-exact on the host**
-  against the packed fill on the 27B dense prefill, gemma-4-E4B **ISWA both caches**, the **non-causal**
-  and **F32** paths and small verify batches — every record `mismatches: core=0 ext=0`.  The engine (the
-  `ggml_flash_attn_ext_add_kq_derived` op + a *real* CPU reference, so `test-backend-ops` is an
-  oracle), the CUDA MMA derived path (threaded through the shared `fattn_kernel_t`), the graph plumbing
-  and the backend probe all landed as `wip/arch-independent-memory/patches/0002-DIAGNOSTIC` (oracle),
-  `0003` (engine), `0004` (MMA kernel) and `0005` (plumbing/probe/enable).  Key safety property: the
-  packed mask is still created in every graph and simply ends up with no consumer on the derived path,
-  so the allocator leaves it unallocated and the existing fill guards skip the fill — **no mask
-  consumer can ever be mis-served** and no model allowlist is needed.  **Measured** (ctx 204800 /
-  ub 2048 / q8_0, one binary flipping the gate): compute **−799.20 MiB/GPU** and host **−799.21 MiB**
-  on the 4B and the 27B (3-GPU Meta), **−809/−809** gemma-4-E4B (ISWA, both masks), **−811/−811**
-  gemma-4-31B, scaling as `n_kv x n_tps x 2 B` (ub 1024 −399, ub 512 −199); generated text
-  **byte-identical** derived vs packed on the 4B/27B/gemma-4-E4B (3k and 40k prompts); 27B MTP
-  acceptance **identical 0.76744**; qwen4exp unchanged (probe reports the derived path is unused
-  there).  Cost: prefill −1.1 % (pp20480/ub 2048, interleaved 5x), decode −0.7 %.
-- **V4 is DONE 2026-09-10 and is OPT-IN (default off).**
-  V4 = native q8_0 K/V in the FA path: dequantize while staging the shared K/V tiles (MMA **and** TILE),
-  so the whole-cache F16 staging scratch and its per-ubatch conversion pass are gone.  **Measured**
-  (ctx 204800 / ub 2048 / q8_0): compute **−744 MiB/GPU** on the 4B (1001.13 → 257.13), **−632 MiB**
-  (Meta) on the 27B (1121.13 → 489.13), **−1224 MiB** on gemma-4-31B, more at ub 1024/512 (4B −772/−786);
-  qwen4exp control unchanged; generated text byte-identical on 4B/27B/gemma-4-E4B/gemma-4-31B/qwen4exp
-  (incl. 40k prompts and the TILE ub-8 path); 27B MTP acceptance **identical 0.76744** (the ulp-sensitive
-  probe).  Cost: prefill **−1.7 %** (both models, interleaved 3x), decode ±0.1 %, TILE-path prefill
-  neutral.  Per the maintainer's rule of 2026-09-10 (a sub-2 % loss with a memory win and no cheap way to
-  close it) it ships **opt-in: `GGML_CUDA_FA_KV_NATIVE=1`**.  Record:
-  `wip/arch-independent-memory/V4-NATIVE-Q8-KV-PLAN.md`; patch
-  `wip/arch-independent-memory/patches/0006-v4-native-q8-kv.patch`.
-- **bf16 (maintainer's preferred KV type) - measured, not implemented: the next memory lever.**
-  The MMA prefill path still stages an F16 copy of the whole bf16 cache (`need_f16_K/V` is unconditional
-  for `BEST_FATTN_KERNEL_MMA_F16`); TILE (verify/decode) and VEC already read bf16 natively (measured:
-  ub 8 bf16 = f16 = 5.47 MiB, no scratch).  Measured cost of that scratch in the peak: **~712 MiB/GPU at
-  ctx 204800 / ub 2048** (4B: +40.00 at 32768, +424.00 at 131072, +552.00 at 163840 - exactly
-  `ctx x 4 KiB - 88 MiB`).  It is the *easier* case than q8_0: bf16->f16 is size/layout-preserving, so
-  the cp_async pipeline can be kept by converting the staged shared tile in place - likely free, so it can
-  probably ship **on by default**.  Plan: `beta/block-15-campaign-wins/HANDOVER.md` §3.4.  Belongs in
-  Block 15 if it lands before the cut.  (The bf16 *cache* itself is 2 B/element, ~1.9x q8_0 - that part is
-  the format choice and is not reducible.)
-- **Critical path: Block 15 merge + cut (all six wins are DONE).**
-  Merge W1-W4 + V3 + V4, strip the V3 oracle, gate everything, re-validate the combination (defaults
-  first, then `GGML_CUDA_FA_KV_NATIVE=1`), cut the single 15th block and stage it in `beta/`.
-  `beta/block-15-campaign-wins/HANDOVER.md` §5 is the step list, §8 the next-session prompt.
-  **Fork state:** `rdna-boosts` pristine at `e2380eb67`; the 22-file campaign tree is committed on the work
-  branch **`wip/block15-campaign-wins` = `b26ae06f0`** and mirrored as a delta patch in
-  `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch`.
-- **Block 15 waits for V3+V4** (maintainer 2026-09-10): exactly ONE block, no Block 16.  W1-W4 + V3 + V4 get
-  merged, each gated with an env kill-switch, re-validated **as a combination** (individual validations do
-  not carry over), then staged in `beta/` for a ~4-5 day beta window before promotion into `patches/0015-…`.
-- LIVE PLAN + STATE: `beta/block-15-campaign-wins/HANDOVER.md` (maintainer decisions, V3/V4 implementation
-  plans with exact source locations, merge/gate/validate/cut steps, state inventory, next-session prompt).
-  Beta A/B checklist: `BETA-TESTING.md`;  W4 A/B revert: `ab/w4-revert.patch`.
-  Upstream PR candidates (maintainer's backlog): `upstream/` — the allocator fix is ready; next are the
-  keys-only dead-V removal and the `attn_k` null-mask guard.
+### Memory campaign -> Block 0015 (derived kq mask + FA scratch + QSA wins) - DONE / CUT 2026-09-10
+- **Block 15 is CUT and in the delivery**: `patches/0015-rdna-boosts-block-15-campaign-memory-wins.patch`
+  (canonical tip `09a137566`, rebuilt at `9113cc188`; 15 patches total, strict 15/15 `git am`).  Six wins,
+  each with an env A/B gate (V4 is opt-in): W1 QSA score-chain (`GGML_QSA_SCORE_MEM`), W2 derived QSA bias
+  + visibility + the input-fill null guards (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), W3 keys-only
+  indexer cache (`LLAMA_QSA_KEYS_ONLY`), W4 ggml-alloc unused-view release (no gate; `ab/w4-revert.patch`),
+  V3 derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default), V4 native q8_0 FA K/V
+  (`GGML_CUDA_FA_KV_NATIVE`, default 0).
+- **Measured** (ctx 204800 / q8_0 / ub 2048): qwen4exp compute 6690.40 -> **3251.39** MiB/GPU + host
+  1262.70 -> **63.69** MiB, indexer KV 956.26 -> **318.76** MiB/GPU; dense models -799 MiB/GPU + -799 MiB
+  host (V4 a further -744 (4B) / -632 (27B)); byte-identical same-seed output on all five models across
+  every gate combination; MTP unchanged (27B 0.76744, qwen4exp 0.44262); ~1.3 % prefill / ~0.3 % decode
+  (V4 ~1.7-1.9 % more, hence opt-in).  Combination-validated on the merged tree AND on the tree built from
+  the delivered patches (fresh worktree + build).  Records: `beta/block-15-campaign-wins/README.md`,
+  `patches/README.md` (2026-09-10 block-15 section), `WORKLOG.md`.
+- **Beta window open** (2026-09-10, ~4-5 days): tester material is `beta/block-15-campaign-wins/BETA-TESTING.md`.
+  Promotion = declaring it stable; feedback that needs a change becomes a dated amendment to block 15.
+- **Open follow-up: bf16 (maintainer's preferred KV type) - measured, NOT implemented.**  The MMA prefill
+  path still stages an F16 copy of the whole bf16 cache (~**712 MiB/GPU** at ctx 204800 / ub 2048); TILE
+  (verify/decode) and VEC already read bf16 natively.  The fix keeps the F16 fragments and the cp_async
+  pipeline and converts the staged tile in place (bit-identical), so it is likely free and could ship on by
+  default.  Scope fixed by D10 (no pure-bf16 rework; keep the f16 compute path).  Plan:
+  `beta/block-15-campaign-wins/HANDOVER.md` section 3.4.  It would fold into Block 15 as a dated amendment.
+- **Found, documented, NOT fixed** (pre-existing - reproduces on block 14): gemma-4-E4B-it on 3 GPUs with
+  `-sm tensor` aborts in the meta splitter (`ggml-backend-meta.cpp:1177`) because its 2 KV heads are fewer
+  than the 3 devices (one device gets a zero-extent share); it works on 1 GPU, on 2 GPUs and on 3 GPUs with
+  `-sm layer`.  Every other model is unaffected.  A future block (or an upstream report) should make the
+  splitter tolerate a zero-extent device share.  See `patches/README.md`.
+- **Fork/canonical state**: the working checkout's `rdna-boosts` (block 15 = `8ee104f33`) sits on a master
+  two commits newer than the fork point, so it must NOT be used for regeneration (it exports `f3f1a8f27`
+  + `304665fe7` as patches 0001/0002).  The canonical 15-block chain is the local branch
+  `block15-canonical` (`09a137566`, rebuilt at `9113cc188`); `make-patches.sh` default tip = `09a137566`.
+- Superseded/still-useful artifacts: the work branch `wip/block15-campaign-wins` (`b26ae06f0`) and
+  `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch` remain as the pre-merge
+  record; the per-win patches/plans under `wip/arch-independent-memory/` + `wip/qwen4exp/qsa-memory/` are
+  the designs (V3-DERIVED-KQ-MASK-PLAN.md, V4-NATIVE-Q8-KV-PLAN.md, DERIVED-MASK-DESIGN.md).
+- Upstream PR candidates (maintainer's backlog): `upstream/README.md` - the allocator fix (W4) and the
+  `attn_k` null-mask guard (A2) are prepared, plus the keys-only dead-V removal (A1) and the sched probe.
 
 ### gfx1201 (RDNA4) port of the gfx1151-gated Halo campaign items — ACTIVE (final qwen4exp stretch)
 - The sched-gate fix (fork `c63f7f2a0`, delivery `d6eb551`) is CLOSED on BOTH arches

@@ -1,25 +1,56 @@
-# beta Block 0015 — campaign wins (staging)
+# beta Block 0015 — campaign wins (beta record)
 
 > **Start here: [`HANDOVER.md`](HANDOVER.md)** — the plan, the maintainer decisions of
 > 2026-09-10, the merge/gate/validate/cut steps, the state inventory and the open questions.
 > This file is the reference: inventory, gate audit, validation protocol, reference numbers.
 
-**Status: STAGING — not built yet (2026-09-10).**  This directory is the collection point for the
-memory campaign's validated wins on their way to becoming a single **Block 0015** patch: all wins on
-by default, each with an environment-variable kill-switch so beta testers can A/B (and bisect) any
-issue during the beta window (~4–5 days).  **V3 is DONE (2026-09-10, on by default, −799 MiB/GPU and
-−799 MiB host measured); the critical path is now V4 only** (§1b, and §3.2 of `HANDOVER.md` for the V4
-map).  Block 15 waits for V4, so the beta window does not open until it lands.  Only after that window
-does Block 15 get promoted into the
-delivery set (`patches/0015-rdna-boosts-block-15-<slug>.patch`, `scripts/apply-all.sh` 14 → 15,
-`scripts/make-patches.sh` tip, `MANIFESTS.md`/`README.md` headers, a `WORKLOG.md` entry, and this
-README turned into the promotion record).
+**Status: BETA — cut and staged (2026-09-10).**  The campaign is complete and
+Block 15 is now the 15th delivery patch: `patches/0015-rdna-boosts-block-15-campaign-memory-wins.patch`
+(this directory's `block-15-campaign-wins.patch` is the same file).  The
+beta window (~4–5 days) **opens now**; promotion into the delivery set is
+already done in the sense that the patch is in `patches/` and applies with
+the rest (`scripts/apply-all.sh`, strict 15/15 `git am`) — the window is
+for tester feedback before the block is declared stable and this README is
+turned into the final promotion record.  All six wins are on by default
+except **V4, which is opt-in** (`GGML_CUDA_FA_KV_NATIVE=1`; see the gate
+table below) — the policy exception the maintainer approved on 2026-09-10
+(a sub-2 % prefill loss with a large memory win and no cheap fix ships as
+an enable switch rather than a kill-switch).
 
-Promotion is the campaign's end-gate; nothing gets promoted before it is (a) merged with the other
-wins, (b) fully gated, and (c) re-validated **as a combination** — every item below was validated on
-its own, not together.
+**Beta start: 2026-09-10.**  Canonical tip `09a137566` on a fork rebuilt at
+`9113cc188` (the reference `~/llama.cpp` checkout had drifted two upstream
+master commits past the fork point at cut time; always regenerate from a
+canonical fork rebuilt at the fork point — see `../../BASELINE.md`).
+The result: **3.44 GiB/GPU + 1.2 GiB host** reclaimed on qwen4exp at ctx
+204800 / ub 2048 / q8_0 KV (6690.40 → 3251.39 MiB/GPU compute, 1262.70 →
+63.69 MiB host, indexer KV 956.26 → 318.76 MiB/GPU), **800 MiB/GPU + 800
+MiB host** on every dense model, and a further **744/632 MiB/GPU** with
+V4 enabled — with byte-identical same-seed output, unchanged MTP
+acceptance and a ~1.3 % prefill / ~0.3 % decode default cost.
 
-## 1. Inventory (all validated, all currently in `wip/`)
+**Validation as a combination** (the important part: the per-win records do
+not carry over) was completed on 2026-09-10 both on the merged work tree and
+again on the tree built from the **delivered patches** (fresh worktree at
+`9113cc188`, `apply-all.sh`, strict 15/15 `git am`, fresh build):
+
+| check | result |
+|---|---|
+| reserve matrix, 5 models × ub 2048/1024/512 × V4 off/on | every number reproduces the per-win records; the wins compose additively (qwen4exp: pristine 6690.40 → W1 4450.40 → W1+W2 **3251.39**; W2 alone 5491.39; both W gates off = 6690.40/1262.70 exactly) |
+| same-seed coherence, gates flipped | **byte-identical** on 4B, 27B, gemma-4-E4B (ISWA), gemma-4-31B (ISWA) and qwen4exp — 4 configs each (V3×V4), 7 for qwen4exp (W1/W2/W3/V3/V4) — at a short and a 40k-token prompt |
+| adaptive-MTP gate | 27B 0.76744 (66/86, mean 3.28) **identical in all four gate combinations**; qwen4exp 0.44262 (54/122) identical in all six and equal to the block-14 baseline; MTP +26 % over plain decode |
+| op suites | `FLASH_ATTN_EXT` on ROCm0 (both V4 gates) + CPU (incl. the six derived cases), VIEW/CONT/CPY/DUP/CONCAT, `test-alloc`, `test-batch-alloc`: all pass; W4 repro 56.00 → 16.00 MiB and the revert restores `ggml-alloc.c` byte-identically |
+| prefill cost (interleaved same-binary A/B, pp20480/ub 2048) | V3 −1.28 % (4B) / +0.28 % (27B); V4 a further −1.85 % (4B) / −1.72 % (27B); decode within noise |
+| clean-apply simulation | fresh worktree at `9113cc188` + `scripts/apply-all.sh` (15/15 strict) + fresh gfx1201 build: reserves, coherence, MTP and op suites all reproduced |
+
+**Found during the combination pass and documented, not fixed** (out of
+scope; reproduces on block 14): `gemma-4-E4B-it` on 3 GPUs with `-sm
+tensor` aborts in the meta splitter because its 2 KV heads are fewer than
+the 3 devices.  It works on 1 GPU, on 2 GPUs and on 3 GPUs with `-sm
+layer`; every other model is unaffected.  (Also caught and fixed before
+the cut: the W3 gate was initially wired with inverted polarity — that is
+why the combination pass exists.)
+
+## 1. Inventory (all validated, all now in `patches/0015`)
 
 | # | win | source | measured effect | validated on |
 |---|---|---|---|---|
@@ -30,7 +61,7 @@ its own, not together.
 | V3 | **derived kq mask** (the packed `n_kv × n_tps` F16 mask and its host mirror are no longer materialised; the MMA FA kernel derives visibility from compact per-cell state) | `wip/arch-independent-memory/patches/0003` (engine: op + CPU reference) + `0004` (CUDA MMA kernel) + `0005` (graph plumbing + backend probe + enable) | compute **−799.20 MiB/GPU** and host **−799.21 MiB** at ctx 204800/ub 2048 (4B 1800.33 → 1001.13 / 840.34 → 41.13; 27B 1920.33 → 1121.13 / 880.34 → 81.13; gemma-4-E4B ISWA −809/−809; gemma-4-31B −811/−811; scaling exactly `n_kv × n_tps × 2 B`); coherence byte-identical incl. both SWA gemmas and 40k prompts; MTP identical (0.76744); **ON BY DEFAULT** (`LLAMA_KQ_MASK_DERIVED=0` forces the packed mask); cost prefill −1.1 %, decode −0.7 % | 4B/27B/gemma-4-E4B/gemma-4-31B/qwen4exp + `test-backend-ops` FLASH_ATTN_EXT (6 derived cases on CPU, 3 on ROCm0, full suite) + the phase-1 host oracle |
 | V4 | **native q8_0 K/V in the FA kernels** (dequantize while staging the shared tiles; the whole-cache F16 staging scratch and its per-ubatch conversion pass are gone for q8_0) | `wip/arch-independent-memory/patches/0006-v4-native-q8-kv.patch` (6 files, +357/−47, base = W1+W2+V3) | compute **−744 MiB/GPU on the 4B** (1001.13 → 257.13) and **−632 MiB on the 27B** (Meta 1121.13 → 489.13) at ctx 204800/ub 2048, more at smaller ub (4B ub 1024 −772, ub 512 −786; gemma-4-31B −1224); qwen4exp control unchanged; coherence byte-identical (4B/27B/both gemmas/qwen4exp, incl. 40k prompts and the TILE ub-8 path); MTP acceptance identical (0.76744); **OPT-IN** (`GGML_CUDA_FA_KV_NATIVE=1`, default off) - cost prefill −1.7 %, decode ±0.1 % | same matrix + `test-backend-ops` FLASH_ATTN_EXT with both gates |
 
-### 1b. In Block 15 — V3 and V4 are both DONE (the only remaining step is the merge + cut)
+### 1b. Block 15 is CUT (2026-09-10) — the wins are in `patches/0015`
 
 | id | what | expected effect (dense models, ctx 204800, ub 2048, q8_0 KV) | spec |
 |---|---|---|---|
@@ -59,7 +90,7 @@ memory win and the gap could not be closed cheaply; the gate is documented in th
 Gate names follow the existing convention (`GGML_QSA_*` for the graph-level knobs, `LLAMA_QSA_*` for
 the cache-level ones).
 
-## 3. Integration work before the patch can be cut
+## 3. Integration work (DONE 2026-09-10)
 
 1. **Merge the wins into one tree.**  They were validated individually; W2 and W3 overlap in
    `src/models/qwen4exp.cpp` and `src/llama-memory-hybrid-idx.cpp`, and W1 is W2's base — so the
@@ -88,23 +119,32 @@ the cache-level ones).
   `test-alloc`, `test-batch-alloc`.
 * **No reserve growth** across repeated graph builds (the W4 acceptance criterion).
 
-## 5. Open questions for the maintainer
+## 5. Open questions for the maintainer — ALL RESOLVED 2026-09-10
 
-1. **W4 in two places?**  Recommended: keep it in Block 15 *and* in `upstream/` — the delivery must
-   carry the fix until upstream takes it; if upstream merges it, Block 15 drops it at the next
-   regeneration (the rule already stated in `upstream/README.md`).  Alternative: keep it out of Block
-   15 and ship it only as an upstream PR.
-2. **Split the generic part of W2 out?**  W2 carries one upstream-generic fix — the
-   `llm_graph_input_attn_k::set_input` null-mask guard (a latent crash in upstream code: its own
-   `can_reuse_impl()` already accepts a null mask).  Worth a separate tiny PR in `upstream/`?
-3. **Block 15 scope.**  Recommended: freeze Block 15 on W1–W4 (all validated now) and let V2/V3/V4
-   (the derived-mask facility, the 1-bit mask, native quantized K/V in the MMA FA path) land as Block
-   16 or later additions.  Confirm — otherwise the beta window starts much later.
-4. **Beta tester material.**  Want a one-page A/B checklist here (env-var matrix, what to report:
-   coherence divergence, reserve numbers, perf deltas) to hand to testers?
-5. **Naming.**  `beta/block-15-campaign-wins/` + `block-15-campaign-wins.patch`, promoting to
-   `patches/0015-rdna-boosts-block-15-campaign-wins.patch` — confirm the slug, or pick another
-   (e.g. `memory-wins`).
+1. **W4 in two places?** — **RESOLVED: both.**  W4 ships in Block 15
+   (`patches/0015`) *and* stays staged in `upstream/UPSTREAM-PR-ggml-alloc-unused-view.{md,patch}`;
+   the upstream-drop check on 2026-09-10 (against `9cf3bf256`, GitHub
+   unreachable from this host) confirmed it is still absent upstream, so
+   nothing is dropped at this regeneration.
+2. **Split the generic part of W2 out?** — **RESOLVED: yes, it should be split
+   out when filing.**  The `llm_graph_input_attn_k::set_input` null-mask guard
+   stays in Block 15 (the delivery must carry it until upstream takes it) and
+   is **not yet** extracted into a standalone `upstream/` candidate — that is
+   Stage A / item A2 in `HANDOVER.md` §4 (independent of the block; extract
+   the hunk, rebuild it against `origin/master` until `git apply --check` is
+   clean, and add the notes + `upstream/README.md` row).  The upstream-drop
+   check on 2026-09-10 confirmed upstream still calls `set_input_kq_mask`
+   unguarded while its own `can_reuse_impl()` accepts a null mask.
+3. **Block 15 scope.** — **RESOLVED: W1–W4 + V3 + V4 are all IN Block 15**
+   (D5 revised earlier: the block waits for V3/V4 rather than following
+   them).  V2 (the 1-bit packed mask fallback) was never needed and is not
+   in the block; the derived-mask facility shipped as V3.
+4. **Beta tester material.** — **RESOLVED: yes**, `BETA-TESTING.md` in this
+   directory (gate table, the three measurements, the report template).
+5. **Naming.** — **RESOLVED:** the slug is `campaign-memory-wins` →
+   `patches/0015-rdna-boosts-block-15-campaign-memory-wins.patch`
+   (this directory keeps the `block-15-campaign-wins` name it was created
+   with).
 
 ## 6. Reference numbers to protect (do not regress)
 
@@ -114,9 +154,13 @@ qwen4exp, ctx 204800, `-ctk/-ctv q8_0`, 3× R9700, per GPU:
 |---|---|---|---|---|
 | pristine (14 blocks) | 6690.40 | 1262.70 | 3346.50 | ~ |
 | + W1 | 4450.40 | 1262.70 | 2274.35 | ~ |
-| + W2 | **3251.39** | **63.69** | 1675.33 | 33.64 |
-| + W3 | (W3 does not change the compute buffer; it shrinks the indexer KV cache, i.e. the "context" column) | | | |
+| W2 alone (W1 off) | 5491.39 | 63.69 | (not measured) | |
+| + W1+W2 | **3251.39** | **63.69** | 1675.33 | 33.64 |
+| + W3 | (W3 does not change the compute buffer; it shrinks the indexer KV cache 956.26 → **318.76** MiB/GPU) | | | |
+| + V3 + V4 (block 15, defaults / V4 on) | 3251.39 / 3251.39 (qwen4exp is not affected by V3/V4) | | | |
 
-Dense controls (no qwen4exp involved): Qwen3.5-4B-Q8_0 1800.33/840.34 and Qwen3.8-27B-Q8_0
-1920.33/880.34 at ub2048 — Block 15 must leave these unchanged (W1–W3 do not touch them; W4 leaves
-them unchanged as well).
+Dense controls (no qwen4exp involved; block 15 measured with V3 on): Qwen3.5-4B-Q8_0
+**1001.13/41.13** (V4 on: 257.13) and Qwen3.8-27B-Q8_0 **1121.13/81.13** (V4 on: 489.13) at ub2048
+(the pre-block-15 values 1800.33/840.34 and 1920.33/880.34 are the V3-off states).  Block 15 must
+leave the V3-off numbers unchanged and the V3-on numbers as above — both were re-measured from the
+delivered patches on 2026-09-10.

@@ -1,7 +1,7 @@
 # BASELINE - provenance and drift policy
 
-Current state: `main` is the delivery branch carrying the **14-patch set**
-(blocks 01-14) generated against the fork
+Current state: `main` is the delivery branch carrying the **15-patch set**
+(blocks 01-15) generated against the fork
 point **llama.cpp master `9113cc188`** (re-based 2026-09-08 from
 `050dde50c`, itself re-based 2026-09-07 from `465e49b9c`, itself
 re-based 2026-09-06 from `9cffdcc80`, itself re-based
@@ -24,14 +24,27 @@ at `192067b72`), `baseline/d222767c7` (validated against `d222767c7`) and
 ## Baseline (current delivery)
 
 
-All 14 patches are generated against **llama.cpp upstream master at
+All 15 patches are generated against **llama.cpp upstream master at
 `9113cc188`** (re-based 2026-09-08 from `050dde50c`, itself re-based
 2026-09-07 from `465e49b9c`, itself re-based
 2026-09-06 from `9cffdcc80`, itself re-based
 2026-09-02 from `0eadefebd`; dated records at the
-bottom of this file): blocks 01-14 = the fork's `rdna-boosts` block
-commits (the current 14-commit branch on `9113cc188` is
-block 01 `7c4d9c4e0`..block 14 `ff2b35f49`; block 01 refreshed 2026-09-09 to the llama.cpp PR
+bottom of this file): blocks 01-15 = the fork's `rdna-boosts` block
+commits on `9113cc188` (block 15, the attention-memory campaign wins, is
+the canonical-fork tip `09a137566`; the reference `~/llama.cpp`
+`rdna-boosts` branch is *disposable* and had at cut time drifted two
+upstream master commits past the fork point — `f3f1a8f27` (iGPU lazy-
+load default) and `304665fe7` (SYCL IQ-type-for-MoE), both dated after
+`9113cc188` — so `format-patch 9113cc188..<that branch's tip>` would
+wrongly export those two upstream commits as patches 0001/0002.
+**Always regenerate from a canonical fork rebuilt at `9113cc188` via
+`scripts/apply-all.sh`** (that is what `make-patches.sh`'s default tip
+`09a137566` refers to, kept alive by the fork checkout's local branch
+`block15-canonical`).  The two commits' content is 106 lines in 3 files
+(`ggml/src/ggml-sycl/mmvq.cpp`, `ggml/src/ggml-sycl/vecdotq.hpp`,
+`src/llama-model.cpp`) and is deliberately **not** in the delivery — it
+is upstream code past the recorded fork point; it does not touch any
+validated path; block 01 refreshed 2026-09-09 to the llama.cpp PR
 #27210 review head `d236d41a2` and block 14 amended 2026-09-10 with the
 kernel-side masked-V fixes — the 2026-09-09 gfx1151-only freed-cell
 KV-row-zeroing host gate it replaces is removed — see the WORKLOG entries; block 06 now
@@ -53,7 +66,7 @@ re-verified 2026-09-02 after the block-13 amendment, 2026-09-04
 after the block-12 amendment, 2026-09-06 on the `465e49b9c` re-base
 and 2026-09-07 on the `050dde50c` re-base + block 14, and 2026-09-07
 after the block-14 QSA quantized-KV gate + pool gate amendment: clean
-apply (`git am` 01-14) on a fresh checkout at
+apply (`git am` 01-15) on a fresh checkout at
 `050dde50c`, full build clean, llama-cli same-seed coherence IDENTICAL
 (hybrid vs RCCL) — and the
 apply is **whitespace-free** (zero git warnings).  Re-verified 2026-09-08
@@ -150,7 +163,7 @@ to apply against a newer upstream master:
    master and continue.
 3. Do NOT hand-edit the committed patches as the permanent fix: when more
    than one block needs manual re-base hunks, regenerate the whole set from
-   the fork with `scripts/make-patches.sh` (re-exports blocks 01-14 from
+   the fork with `scripts/make-patches.sh` (re-exports blocks 01-15 from
    `9113cc188..<blocks-tip>`; defaults target
 the current blocks tip `27485f1ca` — the 2026-09-10 regeneration
 was run against tip `ff2b35f49`), then re-verify the clean-apply

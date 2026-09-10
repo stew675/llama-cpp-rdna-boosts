@@ -1,7 +1,7 @@
 # WORKLOG — dated delivery records
 
 Reverse-chronological log of every delivery-affecting change to the
-**rdna-boosts 14-patch set** (block amendments, community-fix
+**rdna-boosts 15-patch set** (block amendments, community-fix
 integrations, re-baselines, regeneration + clean-apply re-verifications).
 Newest entry first.  The README's
 [Current state](README.md) section is a lean summary and points here
@@ -9,6 +9,107 @@ for the full record; per-block technical notes live in
 `patches/README.md`, the verification contract in `MANIFESTS.md`.
 
 ---
+
+- **Block 15 cut (2026-09-10) — the attention-memory campaign wins;
+the set is now 15 patches (block-15 tip `09a137566` on the canonical fork
+rebuilt at `9113cc188`), beta-staged in `beta/block-15-campaign-wins/`.**
+  The campaign (`wip/arch-independent-memory/`, `wip/qwen4exp/qsa-memory/`)
+  was merged into one block by replaying the validated work-branch tree
+  onto block 14, then re-validated **as a combination** (the per-win
+  records did not carry over on their own).  Six wins, each with an
+  environment A/B gate; **V4 is opt-in** (an *enable* switch) per the
+  maintainer's rule of 2026-09-10 (a sub-2 % loss with a large memory win
+  and no cheap fix ships opt-in):
+
+  | win | mechanism | gate (default) | measured (ctx 204800, q8_0 KV, ub 2048) |
+  |---|---|---|---|
+  | W1 | QSA score chain: relu before the 4-D reshape + `n_blocks`-chunked `ggml_concat` assembly | `GGML_QSA_SCORE_MEM` (1) | qwen4exp 6690.40 -> 4450.40 MiB/GPU (ub1024 3346.50 -> 2274.35) |
+  | W2 | derived QSA per-block bias + derived visibility; bias/mask no longer materialised; input-fill null guards (incl. the `llm_graph_input_attn_k` one) | `GGML_QSA_DERIVED_BIAS` (1), `GGML_QSA_DERIVED_VIS` (1), `LLAMA_QSA_SPARSE_FA` (sparse) | qwen4exp 4450.40 -> **3251.39** MiB/GPU, host 1262.70 -> **63.69** MiB |
+  | W3 | keys-only QSA indexer cache (`v_enabled` in `llama_kv_cache`; no V tensor, no V-side op) | `LLAMA_QSA_KEYS_ONLY` (1) | indexer KV 956.26 -> **318.76** MiB/GPU |
+  | W4 | ggml-alloc releases view sources whose views are never consumed (the uncounted-view leak) | none — a bug fix; `beta/block-15-campaign-wins/ab/w4-revert.patch` | repro 56.00 -> 16.00 MiB; no reserve change on any model |
+  | V3 | derived kq mask: `GGML_OP_FLASH_ATTN_EXT` src[5..7] carry compact per-cell state and the MMA FA kernel derives visibility in-kernel; the packed mask tensor is still built in every graph and simply loses its consumer (so no model allowlist and no mis-served consumer) | `LLAMA_KQ_MASK_DERIVED` (1; `0` = packed) | 4B 1800.33 -> **1001.13**, 27B 1920.33 -> **1121.13** MiB/GPU; host -799.21; gemma-4-E4B/-31B (ISWA) -809.18/-811.17; scales as `n_kv x n_tps x 2 B` |
+  | V4 | native q8_0 K/V in the FA kernels: dequantise during the shared-tile staging (16-byte chunk = 8 elements = a quarter q8_0 block) instead of staging a whole-cache F16 copy | `GGML_CUDA_FA_KV_NATIVE` (**default 0 = opt-in**) | 4B -> **257.13**, 27B -> **489.13**, gemma-4-31B -1224 MiB/GPU; qwen4exp unchanged |
+
+  **The wins compose additively** — qwen4exp ub 2048: pristine 6690.40 ->
+  W1 only 4450.40 -> W2 only 5491.39 -> W1+W2 3251.39 (W1 -2240, W2
+  -1199, W3 -637.5/GPU, V3 -799, V4 -744/-632); both W gates off
+  reproduces the pristine 6690.40/1262.70 exactly.  **Cost**: V3 -1.28 %
+  prefill (4B pp20480/ub 2048, interleaved same-binary A/B) / +0.28 %
+  (27B), decode -0.32 %/-0.15 %; V4 a further -1.85 % (4B) / -1.72 %
+  (27B) prefill — the loss is the lost `cp_async` pipeline (a quantized
+  source cannot be copied asynchronously; a 2-byte-access pass changed
+  nothing), decode within noise, hence opt-in.
+
+  **Combination validation (all on the merged tree, and then re-run from
+  the delivered patches — see below):** reserve matrix on 4B (1 GPU), 27B
+  (3-GPU Meta), gemma-4-E4B (1 GPU), gemma-4-31B (3-GPU) and qwen4exp
+  (3-GPU) at ub 2048/1024/512 x V4 off/on — every number matches the
+  per-win records; same-seed generated text **byte-identical** on all
+  five models across every gate combination (V3 x V4 on the dense
+  models; W1/W2/W3/V3/V4 — 7 configurations — on qwen4exp) at a short and
+  a 40k-token prompt; adaptive-MTP gate **unchanged** (27B inline draft
+  0.76744 (66/86, mean 3.28) in all four gate combinations; qwen4exp
+  draft 0.44262 (54/122) in all six, **equal to the block-14 baseline**,
+  and MTP stays +26 % over plain decode at ctx 32768); `test-backend-ops`
+  FLASH_ATTN_EXT on ROCm0 (both V4 gates) and CPU, the six derived FA
+  cases, VIEW/CONT/CPY/DUP/CONCAT, `test-alloc`, `test-batch-alloc`; the
+  W4 revert restores `ggml-alloc.c` byte-identically to block 14.
+
+  **Two things worth recording.**  (1) Re-validation caught a real wiring
+  bug before the cut: the W3 gate was passed to `v_enabled` with the
+  wrong polarity, so the indexer cache stayed keys-only-disabled (956.26
+  MiB) while `LLAMA_QSA_KEYS_ONLY=0` enabled it — fixed and re-verified
+  (`956.26 -> 318.76` on the default, `956.26` with the gate off).  This
+  is exactly what the combination pass is for.  (2) A **pre-existing**
+  bug was found (it reproduces on block 14=HEAD, so it is not a block-15
+  regression): `gemma-4-E4B-it` on **3 GPUs with `-sm tensor`** aborts in
+  the meta splitter (`ggml-backend-meta.cpp:1177`) on a FLASH_ATTN_EXT
+  node whose K source has zero extent on one buffer, because `n_head_kv =
+  2` is fewer than the device count (2 heads / 3 devices leaves one
+  device with nothing).  It runs on 1 GPU, on 2 GPUs and on 3 GPUs with
+  `-sm layer`; the 27B (4 KV heads) and gemma-4-31B (4/16) are
+  unaffected.  Diagnosed by instrumenting the failing assert to print the
+  op/tensor/split geometry (temporary change, reverted).  Left unfixed —
+  out of scope for this block — and documented in `patches/README.md`.
+
+  **Regeneration and delivery mechanics.**  The reference fork checkout
+  (`~/llama.cpp`, branch `rdna-boosts`) had been rebased onto a master
+  that is **two commits newer than the recorded fork point** (`f3f1a8f27`
+  iGPU lazy-load default + `304665fe7` SYCL IQ-type-for-MoE, both
+  2026-09-08/09, i.e. after `9113cc188`), so `format-patch
+  9113cc188..tip` there would have exported those two upstream commits as
+  patches 0001/0002 — a latent trap for any future regeneration.  The
+  patches were therefore regenerated from a **canonical fork rebuilt at
+  `9113cc188`** via `scripts/apply-all.sh` (strict 15/15 `git am`, zero
+  whitespace warnings), and the resulting tree was verified identical to
+  the validated tree except for the 3 files of those two upstream commits
+  (`ggml-sycl` x2, `src/llama-model.cpp` — outside the validated paths).
+  The delivered `0001`-`0014` files were kept byte-for-byte (the
+  regenerated ones differ only in the `From <sha>` line and the
+  `[PATCH NN/15]` series count, verified content-identical hunk by hunk);
+  `0015-rdna-boosts-block-15-campaign-memory-wins.patch` is new.
+  `make-patches.sh`'s default tip is now `09a137566`, the canonical
+  block-15 commit (the local branch `block15-canonical` in the fork
+  checkout keeps that chain alive).  `rdna-boosts-all.patch` = `git diff
+  9113cc188..09a137566` (98 files).
+
+  **Clean-apply simulation (the delivered artifact, end to end):** fresh
+  worktree at `9113cc188` -> `scripts/apply-all.sh` (15/15 strict
+  `git am`) -> fresh `gfx1201` Release build -> reserves (4B 1001.13 /
+  257.13, 27B 1121.13 / 489.13, qwen4exp 3251.39 with the indexer KV at
+  318.76), byte-identical coherence on 4B/27B/gemma-4-E4B/qwen4exp with
+  every gate flipped, MTP 0.76744 / 0.44262, and the op suites — all
+  green.
+
+  **Upstream-drop check (2026-09-10):** GitHub was unreachable from this
+  host (SSH key denied), so the check ran against the recorded upstream
+  base `9cf3bf256`: the `ggml-alloc` unused-view release (W4), the
+  keys-only indexer cache (W3) and the `llm_graph_input_attn_k`
+  null-mask guard are all **still absent upstream** (the first two apply
+  cleanly, the guard's call site is still unguarded while its own
+  `can_reuse_impl` accepts a null mask), so Block 15 keeps every hunk.
+  Re-check after the next `git fetch` before filing the `upstream/`
+  candidates.
 
 - **Block-14 amendment (2026-09-10) — freed-cell KV handling moved from the
   host-side zeroing to kernel-side masked-V elimination; the gfx1151-only
