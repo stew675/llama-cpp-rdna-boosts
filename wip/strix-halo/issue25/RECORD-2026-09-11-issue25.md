@@ -7,9 +7,11 @@ with the MTP draft length (verify batch width) on the 14-block set".
 Not gfx1201-only.  Also: **not** caused by the 2026-09-08/09 adaptive-MTP
 refresh, and **not** block 13/14.  The reporter's stated mechanism (ncols 3
 vs ncols 5 verify logits differ) does **not** hold on gfx1151: verify batches
-are bit-identical across widths.  What *is* broken on gfx1151 is the fork's
-**decode (n_q=1) == verify (n_q>=2)** bit-identity, which the current block
-chain does not deliver (the older `rdna-boosts-orig` chain did).
+are bit-identical across widths.  Separately, the fork's decode (n_q=1) ==
+verify (n_q>=2) bit-identity — which the `rdna-boosts-orig` chain achieved — is
+**not** delivered by the current block chain on gfx1151, and block 13 re-breaks
+it for pure attention; but that gap does **not** drive the reporter's text
+split (the `orig` chain has the gap at 0 and still splits).
 
 ## 1. Environment
 
@@ -87,6 +89,7 @@ reporter's verify-width claim.  Row 0, P=256, f16 KV, FA auto:
 | b13 | 0.156145 | 0.000000 | 1.016227 | 0.000000 |
 | b14 | 0.156145 | 0.000000 | 1.016227 | 0.000000 |
 | b15 | 0.156145 | 0.000000 | 1.016227 | 0.000000 |
+| prebit (`orig~6`, before the 6 bit-identity commits) | 0.638450 | 0.134084 | 0.942767 | 1.086807 |
 | orig (bit-identity chain) | **0.000000** | 0.000000 | **0.000000** | 0.000000 |
 
 (Gemma4-12B = `/llm/models/Gemma4/12B/Q8_0/gemma-4-12b-it-Q8_0.gguf`, pure
@@ -110,31 +113,40 @@ Findings:
    not bit-neutral for the n_q=1 endpoint on this arch — this contradicts the
    "output bit-identical to the 12-block build" note in AGENTS/GREEDY-PURITY
    for that case.
-4. **The fork's `origin/rdna-boosts-orig` chain (2026-08-16) achieved
-   W1 == W3 == W5 == 0 on both models.**  The current block chain (rebuilt at
-   `9113cc188`) does not, for either the pure-attention or the hybrid model.
-   That is a re-base / block-reorganisation gap in the delivery, not an
-   upstream-only property.
-5. **But W1==W3 alone does not make the text match**: `orig` has
-   W1==W3==W5==0 and *still* splits n2 vs n4.  So the n-max-2 vs n-max-4 text
-   split has a second, spec-loop-side cause (draft/verify interplay or
-   recurrent-state snapshot handling) that is independent of the target
-   forward.  The same is true of the `none` vs `n2` gap: MTP decode is not a
-   faithful gate for the plain greedy stream even when the forward is
-   width-consistent.
+4. **The fork's bit-identity commits really did fix both gaps on their base.**
+   The commit just before them (`prebit` = `orig~6`, `4a4da30ef`) has
+   Qwen3.8 W1-W3 = 0.638 / W3-W5 = 0.134 and Gemma4 0.943 / 1.087; the orig tip
+   has all four at 0.000000.  So the 2026-08-15/16 series
+   (`8cdf1ab08`, `93510434f`, `b2655d381`, `d152888fc`, `10b83d6b2`,
+   `6cdf5aff9`) is a real, effective fix, not a no-op.
+5. **The current block chain kept the verify-width half of the fix but lost the
+   decode-vs-verify half.**  W3-W5 is 0.000000 everywhere in b12-b15 (upstream
+   0.1445/1.0868), so the verify fix survived.  W1-W3 regressed back to a gap:
+   0.156 on Qwen3.8-27B (already at b12; upstream 0.1445) and 1.016 on
+   Gemma4-12B (block 13 specifically: b12 = 0.000000 -> b13 = 1.016227).  So
+   decode==verify was genuinely fixed and then re-broken by the re-base /
+   block reorganisation, and block 13 re-breaks the pure-attention case.
+6. **But W1==W3 does not fix the reported text split.**  `orig` has
+   W1==W3==W5==0 and *still* splits n2 vs n4 (deterministic: n2 `a01114ae`,
+   n4 `de5bdc9d`, reproduced twice).  And the split is present in
+   `prebit`, upstream, and every current build.  So the n-max-2 vs n-max-4
+   text split is **not** caused by either target-forward logit gap; it has a
+   separate spec/draft-side cause (the MTP draft context is a second forward
+   that this probe does not cover), and it was never fixed by the fork.
 
 ## 5. Interpretation
 
 - The reporter's observation is real and worse on gfx1151 (5/5 vs 3/5).
-- Their inference from GREEDY-PURITY §9 ("n-max 2 and n-max 4 would produce the
-  same stream") does not follow: §9 is about block-13 vs block-12 *kernel*
-  variance, and it does not claim decode == verify across n_q.
-- Two distinct defects are visible on gfx1151 and both deserve their own issue:
-  1. **decode != verify** target logits (0.16 hybrid / 1.02 pure-attention) in
-     the current chain; the old `rdna-boosts-orig` chain had this at 0.0.
-     Block 13 is a confirmed contributor for the pure-attention case.
-  2. a **spec-loop** width dependence that survives even a bit-consistent
-     forward (orig still splits n2 vs n4).
+- **Two independent defects, do not conflate them:**
+  1. a **target-forward** width property: decode (n_q=1) vs verify (n_q>=2)
+     (0.16 hybrid / 1.02 pure-attention in the current chain).  This was fixed
+     by the fork in the `orig` era and re-broken by the current chain (block 13
+     for pure attention).  It is a genuine greedy-purity regression worth its
+     own issue — but it is **not** what the reporter is seeing.
+  2. a **spec/draft-side** width dependence that produces the n-max-2 vs
+     n-max-4 *text* split.  It is present in upstream, in `prebit`, in `orig`
+     (with a perfectly width-consistent target forward) and in the current
+     chain, so the fork neither introduced nor ever fixed it.
 - Open: whether these also hold on gfx1201 (not available here).  The
   reporter's own 14-block gfx1201 n2/n4 split is consistent with (1) or (2).
 
@@ -148,4 +160,4 @@ Findings:
   `$ROCM/lib/llvm/bin/clang++ -O2 -std=c++17 -I <tree>/include -I <tree>/ggml/include logits-width.cpp -o /tmp/lw -L <tree>/build/bin -lllama -lggml -lggml-base -Wl,-rpath,<tree>/build/bin`
 - Runs under `wip/strix-halo/issue25/runs-*` (server logs, per-prompt text and
   `n_probs` dumps, `hashes.txt`).
-- Scratch builds: `/home/stew675/ll25/{upstream,b12,b13,b14,mtpold,mtpnew,orig}`.
+- Scratch builds: `/home/stew675/ll25/{upstream,prebit,b12,b13,b14,mtpold,mtpnew,orig}`.
