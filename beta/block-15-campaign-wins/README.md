@@ -7,7 +7,8 @@
 **Status: STAGING — not built yet (2026-09-10).**  This directory is the collection point for the
 memory campaign's validated wins on their way to becoming a single **Block 0015** patch: all wins on
 by default, each with an environment-variable kill-switch so beta testers can A/B (and bisect) any
-issue during the beta window (~4–5 days).  Only after that window does Block 15 get promoted into the
+issue during the beta window (~4–5 days).  **The critical path is now V3 and V4** (§1b) — Block 15 waits
+for them, so the beta window does not open until they land.  Only after that window does Block 15 get promoted into the
 delivery set (`patches/0015-rdna-boosts-block-15-<slug>.patch`, `scripts/apply-all.sh` 14 → 15,
 `scripts/make-patches.sh` tip, `MANIFESTS.md`/`README.md` headers, a `WORKLOG.md` entry, and this
 README turned into the promotion record).
@@ -25,9 +26,16 @@ its own, not together.
 | W3 | **keys-only QSA indexer cache** (the indexer V buffer is dead: keys-only scoring) | `wip/qwen4exp/keys-only-indexer/0001-keys-only-qsa-indexer-cache.patch` (3 files, 62 lines) | indexer KV 956.25 → 318.75 MiB; box total 88.58 → 86.70 GiB (V was triplicated); perf parity; validation matrix (bf16/f32 ctx, parallel 2, unified, prompt-cache/checkpoint round-trips, MTP 0.741, f16 byte-identical) | qwen4exp |
 | W4 | **ggml-alloc: release unused view sources** (3b) | `upstream/UPSTREAM-PR-ggml-alloc-unused-view.patch` (+35 lines, `ggml/src/ggml-alloc.c`; upstream-applicable, clean on `9cf3bf256`) | repro 56.00 → 16.00 MiB; removes the leak that forced W1's concat assembly; no change on current models (latent trap) | master: repro + `test-alloc` + `test-batch-alloc`; fork: coherence byte-identical on 4B/27B/qwen4exp, reserves and MTP unchanged, `test-backend-ops` VIEW/CONT/CPY/DUP/CONCAT OK |
 
-Not in Block 15: 3a (through-view reuse — measured **zero** reserve win on the 27B/4B), the V2/V3/V4
-items in `wip/arch-independent-memory/DERIVED-MASK-DESIGN.md` (future work), and everything in
-`archive/work/`.
+### 1b. Planned in Block 15 — the critical path (Block 15 waits for these)
+
+| id | what | expected effect (dense models, ctx 204800, ub 2048, q8_0 KV) | spec |
+|---|---|---|---|
+| **V3** | derived kq mask for the plain attention path: stop materialising the `n_kv × n_tps` F16 mask and its host mirror; derive visibility in the FA prefill/MMA kernel from compact per-cell state (packed mask kept for decode and every unsupported case) | **−800 MiB/GPU VRAM − 800 MiB host** (27B 1920.33 → ~1120 compute, 4B 1800.33 → ~1000) | `wip/arch-independent-memory/DERIVED-MASK-DESIGN.md` §2–§5 + §7; plan in `HANDOVER.md` §3.1 |
+| **V4** | native quantized K/V in the MMA FA path: dequantize into the shared K/V tiles instead of staging an F16 copy of the whole cache in a global scratch | **−832 MiB/GPU**, exactly ctx-linear | same, §1.3 + §4 (V4); plan in `HANDOVER.md` §3.2 |
+| **V2** | *fallback for V3 only*: 1-bit packed mask (bit-exact by construction, no per-cell state) if V3 phase 3.1 proves too invasive | −750 MiB/GPU − 750 MiB host | same, §4 (V2) |
+
+Not in Block 15 at all: **3a** (through-view reuse — measured **zero** reserve win on the 27B/4B) and
+everything in `archive/work/`.
 
 ## 2. Gate audit
 
@@ -38,7 +46,9 @@ Policy: every win is **on by default**; a tester must be able to switch each one
 | W1 | none: the reshape order is unconditional and the chunking is a size threshold (`score_bytes > 128 MB`) | add `GGML_QSA_SCORE_MEM=0` → both off (default 1).  Keep the threshold as the internal policy, not as the A/B knob. |
 | W2 | `GGML_QSA_DERIVED_BIAS` (0 = tensor path, 1 = derived, default), `GGML_QSA_DERIVED_VIS` (0/1, default 1), `LLAMA_QSA_SPARSE_FA` (dense masked-FA fallback) | keep as-is, but **strip the `GGML_QSA_DERIVED_BIAS=2|3` diagnostic modes** before promotion. Document the interaction: with `LLAMA_QSA_SPARSE_FA=0` the packed mask must be kept (the gate already encodes this via the shared `qwen4exp_qsa_sparse()` predicate). |
 | W3 | none | add `LLAMA_QSA_KEYS_ONLY=0` → keep the (dead) V buffer (default 1). |
-| W4 | none (deliberately — it is a correctness fix bound for upstream, and an env gate there would be a liability) | no gate.  Document how to A/B it instead: `/tmp/bin-l3b` (with) vs `/tmp/bin-l1` (without), or revert the single hunk. |
+| W4 | none — **decided 2026-09-10: it is a bug fix, not a policy** | **no gate.**  A/B with the ready-made revert: `git apply ab/w4-revert.patch` (verified round trip: W4 → +35 lines → revert → pristine) or `git apply -R ../../upstream/UPSTREAM-PR-ggml-alloc-unused-view.patch`; rebuild and re-run `../../wip/arch-independent-memory/repro/ggml-alloc-unused-view.c` (56.00 MiB again = the bug is back). |
+| V3 (planned) | — | `LLAMA_KQ_MASK_DERIVED` (default 1; 0 = always the packed mask) + the backend/cache capability check. |
+| V4 (planned) | — | one kill-switch (e.g. `GGML_CUDA_FA_STAGE_QUANT_KV=0` = the global F16 scratch path). |
 
 Gate names follow the existing convention (`GGML_QSA_*` for the graph-level knobs, `LLAMA_QSA_*` for
 the cache-level ones).
