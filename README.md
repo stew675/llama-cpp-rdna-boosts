@@ -110,6 +110,16 @@ summary below is deliberately short and does not repeat them.
   [`WORKLOG.md`](WORKLOG.md) and
   [`beta/block-15-campaign-wins/README.md`](beta/block-15-campaign-wins/README.md).
 
+- **Next up (2026-09-10, D12): bf16-native MMA K/V** — the one essential follow-up.  A bf16 KV
+  cache still pays the whole F16 staging scratch in prefill (**4B +712 MiB** at ctx 204800 / ub 2048;
+  27B +584; more at smaller ub; verify/TILE unaffected, and V4 does not cover bf16).  The executable
+  plan (measured before-state, code map, design, validation, ship rule) is
+  [`wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`](wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md);
+  it folds into Block 15 as a dated amendment.  Two pre-existing issues are **documented, not fixed**:
+  mixed K/V cache types (`bf16`+`q8_0`, `f16`+`q8_0`) fall off the GPU attention path (~⅓ of decode,
+  ~88-92 % of prefill lost), and `gemma-4-E4B-it` on 3 GPUs with `-sm tensor` aborts in the meta
+  splitter (maintainer's call: document only).
+
 - **Previous entry (2026-09-10): block-14 freed-cell KV handling moved to
   kernel-side masked-V elimination (regeneration tip `ff2b35f49`).**  The
   host-side `zero_freed` row zeroing (gfx1151-only, added 2026-09-09) is

@@ -10,6 +10,27 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **bf16-native MMA K/V planned as the next essential follow-up (D12); two pre-existing findings
+  recorded (2026-09-10).**  With Block 15 cut, the maintainer picked the bf16 lever as the one
+  follow-up.  The executable plan is **`wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`**:
+  measured before-state in the *delivered* tree, the mechanism with exact call sites, the design
+  (keep the F16 fragments, `cp_async` the raw bf16 bytes into the same shared offsets — a 16-byte
+  chunk is 8 elements either way — then convert the tile in place), the validation protocol and a
+  three-way ship rule (expectation: **on by default**, unlike V4, because the `cp_async` pipeline is
+  kept).  Also `HANDOVER.md` D11/D12 and the §8 prompt.
+  **Before-state (ctx 204800, V3 on, f16 = reference):** 4B (1 GPU) ub 2048 256.86 -> **968.86**
+  (+712.00), ub 1024 +756.00, ub 512 +778.00; 27B (3-GPU Meta) ub 2048 488.86 -> **1072.86** (+584.00),
+  ub 512 +746.00; ub 8 (TILE/verify) **identical** at 8.09 MiB; `GGML_CUDA_FA_KV_NATIVE=1` (V4) changes
+  no bf16 row (it is q8_0-only).
+  **Finding 1 (pre-existing, documented not fixed): mixed K/V types fall off the GPU attention path.**
+  Any mixed pair (`bf16`+`q8_0`, `f16`+`q8_0`, either direction) reserves `graph splits = 18` (vs 2),
+  moves ~1.5 GiB into the host compute buffer and loses the FA scratch; 4B pp2048/tg128: `q8_0/q8_0`
+  7924.47/98.94, `bf16/q8_0` 640.25/61.57, `q8_0/bf16` 1048.66/68.54, `f16/q8_0` 852.57/54.39.  So
+  "bf16 keys + q8_0 values" is not usable today; same-type K/V is the practical choice.  Fixing it
+  needs the FA kernels to accept a mixed `(type_K, type_V)` pair — larger than V3/V4, out of scope.
+  **Finding 2 (pre-existing): gemma-4-E4B-it + 3-GPU `-sm tensor`** aborts in the meta splitter
+  (`n_head_kv = 2` < 3 devices); maintainer's call (D11): **document only, do not fix** — small model,
+  unlikely configuration; it runs on 1/2 GPUs and with `-sm layer`.
 - **Block 15 cut (2026-09-10) — the attention-memory campaign wins;
 the set is now 15 patches (block-15 tip `09a137566` on the canonical fork
 rebuilt at `9113cc188`), beta-staged in `beta/block-15-campaign-wins/`.**

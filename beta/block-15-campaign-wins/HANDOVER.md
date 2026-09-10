@@ -44,6 +44,8 @@
 | D7 | **V3 includes phase 3.2 (SWA coverage)** — wider coverage is required precisely so that *other* models do not regress; the mask work must not leave SWA models on a different (or unvalidated) path. |
 | D8 | **Beta tester material: yes** — `BETA-TESTING.md` in this directory (one-page A/B checklist: gate table, the three measurements, the report template, what not to report). |
 | D9 | **V4 ship rule (three-way)**: no prefill-throughput regression → on by default; regression → ship it **opt-in (default off)** for people who need the last 832 MiB, with the trade-off documented; if even that is impractical → future work.  **Applied 2026-09-10**: the q8_0 arm measured −1.7 % prefill, so it ships **opt-in** (`GGML_CUDA_FA_KV_NATIVE=1`); and the maintainer's refinement of D9 is that **a sub-2 % loss with a memory win and no cheap way to close the gap ships opt-in anyway** (do not grind for the last percent). |
+| D11 | **gemma-4-E4B 3-GPU tensor-split abort (2026-09-10): document only, do NOT fix.**  The pre-existing meta-splitter abort found during the Block-15 combination pass (`n_head_kv = 2` is fewer than the 3 devices, so one device gets a zero-extent KV share) stays a documented limitation.  Rationale: it is a small model and running it in 3-GPU tensor-split mode is an unlikely configuration; it runs on 1 GPU, on 2 GPUs and on 3 GPUs with `-sm layer`.  See `../../patches/README.md` (block-15 section). |
+| D12 | **bf16-native MMA K/V is the one essential follow-up (2026-09-10)** — the maintainer's priority after this session.  It folds into **Block 15 as a dated amendment** (D5/D10), not a new block.  Full executable plan: `../../wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md` (measured before-state, mechanism + code map, design, validation protocol, ship rule, risks); the copy-paste prompt is §8 below. |
 | D10 | **bf16 (2026-09-10): no pure-bf16 rework.**  llama.cpp is predicated on F16 as the always-available default, so the fork keeps the F16 compute path; bf16 K/V work must remove the *staging* (convert in place, keeping the F16 fragments and the cp_async pipeline), **not** re-instantiate the kernels natively.  A pure-bf16 fork is explicitly out of scope for now.  See §3.4. |
 
 ## 1. Where the campaign stands
@@ -256,7 +258,17 @@ the other quantized KV types (each is the same chunk decoder with a different bl
 Block 15 = **W1 + W2 + W3 + W4 + V2-or-V3 + V4** as one patch (D5), merged, gated, combined-validated,
 cut, and staged in `beta/` to open the ~4–5 day beta window.  See §5.
 
-### 3.4 The next memory lever: bf16-native MMA K/V (measured 2026-09-10, NOT implemented)
+### 3.4 The next memory lever: bf16-native MMA K/V — **PLAN READY** (`../../wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`)
+
+> **Status: the executable plan is written** (D12).  It supersedes the exploratory text below with a
+> measured before-state, the exact code map, the design, the validation protocol and the ship rule.
+> Numbers below were measured in the *pre-block-15* tree; the plan file carries the **delivered
+> block-15** matrix (4B ub 2048 256.86 → 968.86 MiB = +712; ub 1024 +756; ub 512 +778; 27B ub 2048
+> +584; ub 512 +746; ub 8 unchanged; V4 does not change any bf16 row).  Two extra facts the plan
+> records: the bf16 arm should ship **on by default** (it keeps the cp_async pipeline), and **mixed
+> K/V types are broken independently of bf16** (`-ctk bf16 -ctv q8_0` falls off the GPU attention
+> path: graph splits 18 vs 2, pp2048 7924 → 640 t/s) — so the practical choices are same-type K/V.
+
 
 The maintainer's preferred KV type is **bf16**, and it is the one case V4 does *not* cover: the TILE and
 VEC paths already read bf16 natively, but the MMA prefill path still stages an F16 copy of the whole
@@ -438,56 +450,56 @@ verify `git apply --check` on a fresh base.
   8037–8039.
 * Keep the delivery-repo tree clean between sessions; commit with clear messages.
 
-## 8. Next-session prompt (copy-paste)
+## 8. Next-session prompt (copy-paste — the bf16 follow-up, D12)
 
 ```
-Continue the RDNA memory campaign in /home/stew675/llama-cpp-rdna-boosts (read AGENTS.md first - its rules
-override everything here).  ALL CAMPAIGN WINS ARE DONE (W1, W2, W3, W4, V3, V4) - this session is the
-BLOCK 15 MERGE + CUT, per beta/block-15-campaign-wins/HANDOVER.md section 5.
+Implement bf16-native K/V in the MMA flash-attention path (the last campaign follow-up) in
+/home/stew675/llama-cpp-rdna-boosts (read AGENTS.md first - its rules override everything here).
 
-READ FIRST: beta/block-15-campaign-wins/HANDOVER.md (sections 1, 5, 6, 7 and 9), then
-beta/block-15-campaign-wins/README.md (inventory, gate audit, validation protocol) and
-beta/block-15-campaign-wins/BETA-TESTING.md (the beta gate checklist).  For V3/V4 detail:
-wip/arch-independent-memory/V3-DERIVED-KQ-MASK-PLAN.md section 4 and
-wip/arch-independent-memory/V4-NATIVE-Q8-KV-PLAN.md.
+READ FIRST: wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md (the full plan: the measured before-state,
+the mechanism with exact call sites, the design, the code map, the validation protocol, the ship rule and
+the risks), then beta/block-15-campaign-wins/HANDOVER.md section 3.4 (the scope decision D10) and
+wip/arch-independent-memory/V4-NATIVE-Q8-KV-PLAN.md (V4 is the template this follows - its implementation
+table is the shape to copy).
 
-STATE: ~/llama.cpp has `rdna-boosts` pristine at e2380eb67 (blocks 01-14) and the 22-file campaign tree
-(W1 + W2 + V3 phases 1/2a/2b/2c + V4, validated 2026-09-10) committed on the work branch
-`wip/block15-campaign-wins` (= b26ae06f0, checked out, clean); a whole-tree delta patch also exists at
-wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch.  Resume with
-`git checkout rdna-boosts && git merge --squash wip/block15-campaign-wins` (then apply W3 + W4).  W3 and
-W4 are separate patches (wip/) that still have to be merged in.  V3 is on by default
-(LLAMA_KQ_MASK_DERIVED=0 disables it); V4 is OPT-IN (GGML_CUDA_FA_KV_NATIVE=1 enables it, default off).
-Patch snapshots live in wip/arch-independent-memory/patches/ (0001 W4 alloc, 0002 the V3 phase-1
-diagnostic - NEVER ship it, 0003/0004/0005 V3, 0006 V4), wip/qwen4exp/qsa-memory/patches/ (W1, W2) and
-wip/qwen4exp/keys-only-indexer/ (W3).
+GOAL: a bf16 KV cache must pay no F16 staging scratch and no per-ubatch conversion pass in prefill,
+with the cp_async pipeline kept.  Measured today (delivered block-15 tree, ctx 204800, f16 reference):
+4B ub 2048 256.86 -> 968.86 MiB (+712), ub 1024 +756, ub 512 +778; 27B ub 2048 +584, ub 512 +746;
+ub 8 (TILE) identical.  Target: bf16 == f16 at every row.
 
-DO, in this order (HANDOVER section 5 has the detail):
-1. Merge W3 and W4 into the fork tree (git add -A + git apply -3 on conflicts, never patch -F3), strip the
-   V3 oracle (LLAMA_KQ_MASK_DERIVED_VERIFY / the 0002-DIAGNOSTIC patch) and any GGML_QSA_DERIVED_BIAS=2|3
-   diagnostic, then build.
-2. Re-validate the COMBINED tree: the reserve matrix (ctx 204800, ub 2048/1024/512, q8_0) with the
-   defaults (V4 off) and with GGML_CUDA_FA_KV_NATIVE=1, on 4B + 27B + gemma-4-E4B/31B + qwen4exp;
-   same-seed coherence byte-identical on every model with the gates flipped (4B, 27B, both gemmas,
-   qwen4exp) at a short and a long prompt; the MTP gate (acceptance >= ~0.45 and unchanged) with V4 off
-   and on; the W1xW2xW3 gate combinations; test-backend-ops FLASH_ATTN_EXT on ROCm0/CPU.
-3. Cut the block: a single 15th block commit on the fork (never pushed), scripts/make-patches.sh (verify
-   blocks 01-14 come out byte-identical), scripts/apply-all.sh 14 -> 15, MANIFESTS.md / README.md /
-   WORKLOG.md / BASELINE.md, rdna-boosts-all.patch, then a clean-apply simulation in a fresh worktree at
-   9113cc188 + build + coherence.
-4. Stage beta/block-15-campaign-wins/block-15-campaign-wins.patch + the promotion record (beta start date,
-   gate table with defaults, validation results) and run the upstream-drop check (HANDOVER section 5.6).
-5. OPTIONAL (maintainer's call, and it can equally be a later session): extend the V4 gate to bf16, as
-   HANDOVER section 3.4 specifies under D10 - keep the F16 fragments, cp_async the raw bf16 row into the
-   shared tile, convert in place (bit-identical values), so the ~712 MiB/GPU staging scratch at ctx
-   204800 disappears with the pipeline intact (likely free, so it can ship on by default; the bf16 cache
-   itself, 2 B/element, is the format choice and is not reducible).  Do NOT rebuild the WMMA kernels with
-   bf16 fragments.
-6. Report: the gate table with defaults, the measured before/after reserves and throughput, what was not
-   validated, and the updated state.
+PLAN (detail and code map in the plan file):
+1. add a native-bf16 predicate + env gate GGML_CUDA_FA_KV_BF16 (default 1) next to V4's
+   ggml_cuda_fattn_kv_native_supported in fattn-common.cuh, and generalise V4's kv tag;
+2. skip the whole-cache F16 conversion for a native-bf16 operand in launch_fattn and size f16_extra with
+   the effective need flags; make fattn.cu's get_alloc_size ask the same predicates (the existing
+   GGML_ASSERT(f16_extra.K != 0) is the tripwire if they disagree);
+3. in fattn-mma-f16.cuh: element-wise path converts bf16->f16 while loading; cp_async path copies the raw
+   bf16 bytes to the same shared offsets (a 16-byte chunk is 8 elements either way) and converts the
+   tile in place after cp_async_wait_all() + __syncthreads() (a linear pass is enough: the swizzles
+   permute whole 16-byte units);
+4. TILE/VEC need nothing (block 03 already reads bf16 natively).
 
-DO NOT: push anything from ~/llama.cpp, fold wip/ content into patches/ beyond this agreed Block 15, or
-touch archive/work/.
+VALIDATE (all five, on the delivered tree; keep the tree buildable and snapshot the diff as its own
+patch before moving on): the reserve matrix (4B 1-GPU, 27B 3-GPU, gemma-4-E4B 1-GPU ISWA,
+gemma-4-31B, qwen4exp control; ub 2048/1024/512; gate off/on; f16 reference) - expect bf16 == f16;
+byte-identical same-seed coherence (bf16 vs f16 vs gate off, short + 40k prompts); the MTP gate
+(27B 0.76744 and qwen4exp 0.44262 unchanged); test-backend-ops FLASH_ATTN_EXT on ROCm0 + CPU; and an
+interleaved same-binary prefill/decode A/B (pp20480 ub 2048 + tg256, 4B and 27B) to decide the default
+per the plan's three-way ship rule (expectation: on by default, since the cp_async pipeline is kept).
+
+Then: fold the result into the delivery as a dated block-15 amendment (patches/0015 regenerated from a
+CANONICAL fork rebuilt at 9113cc188 via scripts/apply-all.sh - never from the working checkout's
+rdna-boosts tip, which sits two upstream commits past the fork point), update patches/README.md +
+WORKLOG.md + the beta record, re-run the clean-apply simulation, and stage the beta patch copy.  If the
+measurement says opt-in instead, say so up front - do not ship a regression on by default.
+
+ALSO RECORD (do not fix): mixed K/V types (bf16+q8_0, f16+q8_0, ...) fall off the GPU attention path
+today - graph splits 18 vs 2, ~1.5 GiB host buffer, pp2048 7924 -> 640-1049 t/s.  It is pre-existing,
+out of scope for this work, and already documented in the plan file section 6.
+
+DO NOT: rebuild the WMMA kernels with bf16 fragments (D10); push anything from ~/llama.cpp; fold wip/
+content into patches/ beyond this agreed work; or touch archive/work/.  Keep 3 GPUs sequential, one job
+at a time, and check for stray llama processes before measuring.
 ```
 
 ## 9. Open questions

@@ -26,12 +26,20 @@ Reality pass: 2026-09-10 (block 15 cut).
   `patches/README.md` (2026-09-10 block-15 section), `WORKLOG.md`.
 - **Beta window open** (2026-09-10, ~4-5 days): tester material is `beta/block-15-campaign-wins/BETA-TESTING.md`.
   Promotion = declaring it stable; feedback that needs a change becomes a dated amendment to block 15.
-- **Open follow-up: bf16 (maintainer's preferred KV type) - measured, NOT implemented.**  The MMA prefill
-  path still stages an F16 copy of the whole bf16 cache (~**712 MiB/GPU** at ctx 204800 / ub 2048); TILE
-  (verify/decode) and VEC already read bf16 natively.  The fix keeps the F16 fragments and the cp_async
-  pipeline and converts the staged tile in place (bit-identical), so it is likely free and could ship on by
-  default.  Scope fixed by D10 (no pure-bf16 rework; keep the f16 compute path).  Plan:
-  `beta/block-15-campaign-wins/HANDOVER.md` section 3.4.  It would fold into Block 15 as a dated amendment.
+- **NEXT UP (D12): bf16-native MMA K/V - PLAN READY, not implemented.**
+  `wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md` is the executable plan (measured before-state in
+  the delivered tree: 4B ub 2048 256.86 -> 968.86 MiB (+712), ub 1024 +756, ub 512 +778, 27B ub 2048
+  +584, ub 512 +746, ub 8 unchanged, V4 does not cover bf16; mechanism + exact code map; design: keep
+  the F16 fragments, cp_async the raw bf16 bytes, convert the tile in place; validation protocol;
+  three-way ship rule - expectation on by default).  Scope fixed by D10 (no pure-bf16 rework).  Folds
+  into Block 15 as a dated amendment.
+- **Documented, NOT fixed (pre-existing): mixed K/V types fall off the GPU attention path.**  Any mixed
+  pair (`bf16`+`q8_0`, `f16`+`q8_0`) gives `graph splits = 18`, a ~1.5 GiB host compute buffer and
+  pp2048 7924 -> 640-1049 t/s on the 4B.  Same-type K/V is the practical choice; fixing it needs the FA
+  kernels to accept a mixed `(type_K, type_V)` pair (bigger than V3/V4) - out of scope, see the plan's
+  section 6.
+- **gemma-4-E4B-it + 3-GPU `-sm tensor`: documented only (D11).**  Pre-existing meta-splitter abort
+  (2 KV heads < 3 devices); works on 1/2 GPUs and with `-sm layer`; maintainer's call: no fix.
 - **Found, documented, NOT fixed** (pre-existing - reproduces on block 14): gemma-4-E4B-it on 3 GPUs with
   `-sm tensor` aborts in the meta splitter (`ggml-backend-meta.cpp:1177`) because its 2 KV heads are fewer
   than the 3 devices (one device gets a zero-extent share); it works on 1 GPU, on 2 GPUs and on 3 GPUs with

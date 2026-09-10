@@ -150,6 +150,23 @@ FLASH_ATTN_EXT node whose K source has zero extent on one buffer, because
 `n_head_kv = 2` is fewer than the number of devices.  It runs on 1 GPU, on
 2 GPUs, and on 3 GPUs with `-sm layer`; no other model is affected.  Out of
 scope for this block (the delivery's other models are unaffected).
+**Maintainer's decision 2026-09-10 (D11): documented only, not fixed** -- it is a small model and a
+3-GPU tensor split is an unlikely configuration for it.
+
+**Also found and documented, not fixed (pre-existing): mixed K/V cache types fall off the GPU attention
+path.**  Any pair with different types (`-ctk bf16 -ctv q8_0`, `-ctk f16 -ctv q8_0`, either direction)
+reserves `graph splits = 18` instead of 2, moves ~1.5 GiB into the host compute buffer (the packed mask
+plus CPU-side tensors) and loses the FA scratch -- i.e. the attention runs on the CPU.  Measured on the
+4B (pp2048/tg128, 1 GPU): `q8_0/q8_0` 7924.47/98.94, `bf16/q8_0` 640.25/61.57, `q8_0/bf16`
+1048.66/68.54, `f16/q8_0` 852.57/54.39.  So a "bf16 keys + q8_0 values" cache is **not** usable today;
+same-type K/V is the practical choice.  Fixing it means teaching the FA kernels a mixed `(type_K,
+type_V)` pair -- a larger change than V3/V4, so it stays out of scope.
+
+**Next up (the one essential follow-up, D12): bf16-native MMA K/V** -- a bf16 cache still pays the whole
+F16 staging scratch in prefill (measured in this tree: 4B ub 2048 256.86 -> 968.86 MiB, +712; 27B ub
+2048 +584; more at smaller ub; verify/TILE unaffected).  The executable plan (measured before-state,
+code map, design, validation, ship rule) is `../wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`;
+the result folds into Block 15 as a dated amendment.
 
 ## 2026-09-10 block-14 amendment: kernel-side masked-V fixes replace the host zeroing (superseded by block 15)
 
