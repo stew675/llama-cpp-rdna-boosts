@@ -5,7 +5,14 @@ score-chain cut, then L1 step 1 (derived per-block bias)
 Status: **WIP — nothing here is part of the delivery.** `wip/` items must not be folded into
 `patches/` without the maintainer's explicit go-ahead and the block-14 amendment protocol.
 
-> ## NEXT SESSION — do these first, in order
+> ## SUPERSEDED 2026-09-10 — see `../../../beta/block-15-campaign-wins/HANDOVER.md`
+>
+> The campaign reached its end-gate: the validated wins (this directory's L2 + L1 patches, the
+> keys-only indexer patch, and the ggml-alloc unused-view fix) are being staged as **beta Block
+> 0015** (`beta/block-15-campaign-wins/`, plan + handover).  Upstream-applicable items live in
+> `upstream/`.  The item list below is kept as history of how the mask prune was reached.
+>
+> ## (history) NEXT SESSION — do these first, in order
 >
 > **0. DONE (session 2) — the QSA visibility flip is LANDED and validated.** The 800 MiB kq mask
 > is gone: reserve **3251.39 MiB/GPU + 63.69 MiB host** at ctx 204800/ub 2048 (from 4051.39 /

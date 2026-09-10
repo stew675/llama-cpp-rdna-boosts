@@ -1,6 +1,9 @@
 # Arch-independent memory findings (from the qwen4exp QSA campaign)
 
 Scope: what generalizes **beyond** Qwen3.8-Flash-Next, with the measured evidence for each item.
+**The campaign now has an end-gate:** the validated wins are staged for **Block 0015** in
+`../../beta/block-15-campaign-wins/` (plan + `HANDOVER.md`), and anything applicable to
+unadulterated upstream master is copied to `../../upstream/` as a PR candidate.
 Nothing here is in the delivery patch set yet; the qwen4exp-specific work lives in
 `../qwen4exp/qsa-memory/` (`L1-step1-derived-block-bias-findings.md`, `L2-score-chain-findings.md`).
 Everything below was measured on 3x R9700 (gfx1201), ctx 204800, `-ctk/-ctv q8_0`, `-sm tensor -mg 0`,

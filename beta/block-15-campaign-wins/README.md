@@ -1,5 +1,9 @@
 # beta Block 0015 — campaign wins (staging)
 
+> **Start here: [`HANDOVER.md`](HANDOVER.md)** — the plan, the maintainer decisions of
+> 2026-09-10, the merge/gate/validate/cut steps, the state inventory and the open questions.
+> This file is the reference: inventory, gate audit, validation protocol, reference numbers.
+
 **Status: STAGING — not built yet (2026-09-10).**  This directory is the collection point for the
 memory campaign's validated wins on their way to becoming a single **Block 0015** patch: all wins on
 by default, each with an environment-variable kill-switch so beta testers can A/B (and bisect) any
