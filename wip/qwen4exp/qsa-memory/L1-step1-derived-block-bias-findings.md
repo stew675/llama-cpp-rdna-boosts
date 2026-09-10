@@ -333,5 +333,19 @@ different fp accumulation order), and each is internally consistent across the d
 carries the whole L1 state — steps 1-3 + the prune + both guards;
 `patches/0003-prune-mask-flip-NOT-APPLIED.patch` is **deleted** (folded in).
 
+**The full ubatch table (compute buffer / GPU, MiB | pp20480 t/s | tg256 t/s).** Pristine = the
+upstream fork point; every point is ~half the memory and slightly faster after the prune:
+
+| ub | pristine | + L2 | + steps 1-3 | **+ prune (final)** | pp20480 final (pre-flip) | tg256 final |
+|---|---|---|---|---|---|---|
+| 2048 | 6690.40 | 4450.40 | 4051.39 | **3251.39** | 2515.35 +/- 5.30 (2488.36 +/- 4.99) | 50.64 +/- 1.37 |
+| 1024 | 3346.50 | 2274.35 | 2074.55 | **1675.33** | 2235.03 +/- 2.88 (2209.80 +/- 3.56) | 50.68 +/- 1.42 |
+| 512 | 1724.56 | 1188.56 | - | **889.54** | 1712.85 +/- 0.54 (1692.50 +/- 1.80) | 50.67 +/- 1.40 |
+
+Host buffer: 63.69 / 33.64 / 18.61 MiB. Pristine references: ub2048 2461 t/s, ub1024 2201 t/s,
+ub512 1691 t/s (all at ub2048's 6690/3347/1725 MiB). **Verdict: BEST** - ub2048 now needs less
+memory than *pristine ub1024* (3251.39 vs 3346.50) while being faster than pristine ub2048
+(2515 vs 2461), and the prune lifts every ub point by ~1%.
+
 **Next lever.** The score chain's own peak (the ~700 MiB concat in L2; see
 `L2-score-chain-findings.md` §6) and the host-side top-k build.
