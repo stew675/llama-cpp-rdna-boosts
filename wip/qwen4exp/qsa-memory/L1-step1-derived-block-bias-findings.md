@@ -124,27 +124,41 @@ MiB/GPU**, exactly the campaign's BEST target (ub2048 at *less* memory than pris
 MiB, with ub2048 speed; ub1024 would land near 1475). It also removes the O(n_kv × n_tps) host mask
 build from every prefill ubatch.
 
-**Blocker (why the prune is reverted for now):** the run aborts at compute time with
-`ggml-backend.cpp:205 GGML_ASSERT(buffer)` from `ggml_backend_buffer_get_usage`. The cause is
-structural: the mask tensor stays *created* (it is the attn input object's cached tensor, and
-`can_reuse_kq_mask` reads its `ne[]`) but becomes *unreachable*, so the gallocr never allocates it
-and it has a null buffer. `llm_graph_input_attn_kv::set_input` already guards that case
-(`if (self_kq_mask && self_kq_mask->buffer)`), but other paths query a buffer without a null check —
-`ggml_backend_meta_get_split_state` dereferences `tensor->buffer` immediately
-(`ggml_backend_meta_buffer_n_bufs(tensor->buffer)`, `tensor->buffer->context`), and
-`ggml_backend_sched`'s split-input copy loop calls `ggml_backend_buffer_get_usage(input->buffer)`
-(`ggml-backend.cpp:1730`).
+**Blocker (two attempts, both reverted).** The prune is not a 2-line flip: leaving the mask
+*created but unreachable* is invalid in this backend, and removing its creation trip-wires a chain
+of unguarded null-buffer probes.
 
-**The fix for the next session:** do not *create* the mask at all on the derived path, i.e. never
-call `inp->get_kq_mask()` in the prefill graph — then no tensor with a null buffer exists. The
-blocker for that is ordering: `build_qsa_top_k` derives `blk_bias` from the mask's shape, and the
-call site (`qwen4exp.cpp` ~L1571) evaluates `inp->get_kq_mask()` before that. For qwen4exp the
-`blk_bias` predicate is model-level and constant (causal, no alibi, no SWA, 4-D mask), so compute a
-single `want_derived_vis` at the graph-build entry from
-`qwen4exp_derived_bias_mode() != 0 && qwen4exp_derived_vis_enabled() && ubatch.n_tokens > 1 &&
-cparams.causal_attn && !hparams.use_alibi && n_swa == 0`, thread it to the top-k call site and
-`build_attn_qsa`, and make `blk_bias` accept the mask-less case. Alternatively keep the mask
-allocated (and eat the 800 MiB) — the state changes are already correct either way.
+- **Attempt 1** (mask still created by `build_attn_qsa`, only passed to nothing): aborts with
+  `ggml-backend.cpp GGML_ASSERT(buffer)` inside `ggml_backend_buffer_get_usage`, called from the
+  sched's split-input copy loop (`ggml-backend.cpp:1730`).
+- **Attempt 2** (the proper fix: `qwen4exp_want_derived_vis(cparams, hparams, n_tokens)` — the same
+  predicate `blk_bias` computes from the mask's shape, without the mask — threaded into the top-k
+  call site and `build_attn_qsa`, which then never call `inp->get_kq_mask()`; the dense
+  `kq_mask_all` chain skipped; the attn input's `can_reuse` null-guarded; the FA launch and `maskh`
+  made null-safe): **the reserve is still 3251.39 MiB/GPU with a 63.69 MiB host buffer**, i.e. the
+  mask really is gone and the −800 MiB is confirmed — but the run then aborts on a *second*
+  unguarded probe, `GGML_ASSERT(buffer)` in **`ggml_backend_buffer_get_type`**
+  (`ggml-backend.cpp:211`). Tolerating `get_usage(nullptr)` (returning COMPUTE, semantically right:
+  weights are always allocated) only moved the failure to the next probe.
+
+The probes that touch a tensor buffer without a null check, in the meta/sched path:
+`ggml-backend.cpp:1730` (`get_usage`), `ggml-backend-meta.cpp:856` (`get_type` inside
+`calculate_split_state`), `ggml-backend-meta.cpp:1249` and `2138`/`2275`/`2314`
+(`ggml_backend_buffer_is_host`). So *some* tensor with a null buffer survives into the meta
+split/assign phase: a tensor that is created but never consumed, hence never allocated — expected
+for an input nothing reads, which the meta backend does not tolerate.
+
+**Next step for that (small, decisive):** name it. Put a `backtrace()`/`backtrace_symbols_fd` (or a
+`GGML_ABORT` under gdb) in the `GGML_ASSERT(buffer)` of `ggml_backend_buffer_get_usage` /
+`get_type`, or instrument `ggml_backend_meta_get_split_state` to print `tensor->name`/`tensor->op`
+before its buffer deref, and run the derived path once. Then either (a) give that tensor a buffer
+(allocate/consume it) or (b) guard the probes — a null buffer simply means "not a weight, not yet
+allocated", so returning COMPUTE/skipping is safe for all of them. The derived-path plumbing itself
+needs no further work: it is written, compiles, and produces the measured 3251.39 MiB.
+
+**Kept from attempt 2** (harmless, and needed for the flip): `fattn-qsa.cu` now tolerates a null
+mask in the kernel (`maskh` guard) and in both launch argument lists, and the `qsa_sparse` /
+`cell_vis` lookup block sits slightly earlier in `build_attn_qsa` than before.
 
 ## 3. The MTP-acceptance drift — RESOLVED as a buffer-layout effect, not arithmetic
 
