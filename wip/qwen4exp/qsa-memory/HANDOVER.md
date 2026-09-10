@@ -7,6 +7,17 @@ Status: **WIP — nothing here is part of the delivery.** `wip/` items must not 
 
 > ## NEXT SESSION — do these first, in order
 >
+> **0. IMMEDIATE TASK — secure the QSA visibility flip (−3.2 GiB of box VRAM / host RAM): read
+> `L1-flip-handover.md`.** The flip that deletes the 800 MiB kq-mask tensor is written as
+> `patches/0003-prune-mask-flip-NOT-APPLIED.patch` (applies cleanly on the current tree), it
+> compiles, and its win is **measured**: 4051.39 → **3251.39 MiB/GPU** and 863.69 → **63.69 MiB**
+> host (the same 800 MiB drops out of the per-GPU compute buffer *and* the host buffer). It is not
+> applied because the run then aborts on `GGML_ASSERT(buffer)` in a backend helper — a chain of
+> unguarded `tensor->buffer` probes that a *created-but-never-consumed* tensor (the mask) trips.
+> That file carries the one-run reproduce command, the audit list of probe sites, the recommended
+> plan (name the tensor first, with the exact print), the traps, and the patch-regeneration recipe.
+> This is the highest-value remaining item in the campaign.
+>
 > **1. The MTP question from the previous session is RESOLVED — read §3 of
 > `L1-step1-derived-block-bias-findings.md` before touching it again.** A four-mode experiment on
 > the same binary proved the derived path's arithmetic is *exactly* neutral (derived in-kernel +
