@@ -23,6 +23,9 @@
 | D4 | Merging and validating the wins **as a combined set** is a full session of work and the campaign's centrepiece. |
 | D5 | **Exactly one block: Block 0015.  No Block 16.**  Later campaign wins are amended into Block 15 as dated amendments (the block-13/14 practice).  **REVISED:** Block 15 waits until **V3 and V4 land** — they are included in the block from the start, not amended in later. |
 | D6 | Prepare the two extra upstream candidates (keys-only dead-V removal, `attn_k` null-mask guard) in the `upstream/` style (§4). |
+| D7 | **V3 includes phase 3.2 (SWA coverage)** — wider coverage is required precisely so that *other* models do not regress; the mask work must not leave SWA models on a different (or unvalidated) path. |
+| D8 | **Beta tester material: yes** — `BETA-TESTING.md` in this directory (one-page A/B checklist: gate table, the three measurements, the report template, what not to report). |
+| D9 | **V4 ship rule (three-way)**: no prefill-throughput regression → on by default; regression → ship it **opt-in (default off)** for people who need the last 832 MiB, with the trade-off documented; if even that is impractical → future work. |
 
 ## 1. Where the campaign stands
 
@@ -39,7 +42,7 @@
 
 | id | what | expected effect (dense models, ctx 204800, ub 2048, q8_0 KV) |
 |---|---|---|
-| **V3** | derived kq mask for the plain (non-QSA) attention path: stop materialising the `n_kv × n_tps` F16 mask and its host mirror, derive visibility in the FA kernel from compact per-cell state | **−800 MiB/GPU VRAM − 800 MiB host** (27B: 1920.33 → ~1120 MiB compute; 4B: 1800.33 → ~1000) |
+| **V3** | derived kq mask for the plain (non-QSA) attention path: stop materialising the `n_kv × n_tps` F16 mask and its host mirror, derive visibility in the FA kernel from compact per-cell state; **phases 3.1 + 3.2 are both in scope — 3.2 adds SWA as a position bound so sliding-window models are covered too (D7)** | **−800 MiB/GPU VRAM − 800 MiB host** (27B: 1920.33 → ~1120 MiB compute; 4B: 1800.33 → ~1000) |
 | **V4** | native quantized K/V in the MMA flash-attn path: dequantize into the shared K/V tiles instead of staging an F16 copy of the whole cache in a global scratch | **−832 MiB/GPU at ub2048, exactly ctx-linear** (the `ggml_cuda_flash_attn_ext_get_f16_extra_data` scratch) |
 
 **Not pursued**: 3a (through-view reuse — measured **zero** reserve win on the 27B/4B; the brief records
@@ -88,9 +91,17 @@ plus perf tuning.
   the token's sequence*, *causal (`cell_pos <= token_pos`)*.  Keep the **packed mask for decode**
   (`n_tps == 1`, where it costs ~n_kv × 2 B = 400 KiB, i.e. nothing) and for every unsupported case.
   That is the case that sets the reserve, so the win is complete without touching the decode path.
-* **3.2 (coverage)** — add **SWA as a position bound** (`is_masked_swa(n_swa, swa_type, p0, p1)`, a pure
-  function of the two positions + a constant) so sliding-window models get the win too; most modern
-  models are SWA, so this matters for reach even though the 27B/4B are `n_swa = 0`.
+* **3.2 (SWA coverage — IN SCOPE for Block 15, D7)** — add **SWA as a position bound**
+  (`llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)`, a pure function of the two positions plus
+  `n_swa`/`swa_type`; remember the `LLAMA_NON_CAUSAL_TYPE_SWA_FULL` in-span exception, which needs the
+  per-sequence minimum batch position) so sliding-window models get the win too.  Rationale: most modern
+  models are SWA, and leaving them on a different path is exactly how a regression slips through.
+  **Validation models are available locally** (checked 2026-09-10 by the GGUF metadata key):
+  `sliding_window` present in `/llm/models/Gemma4/E4B-IT/gemma-4-E4B-it-Q8_0.gguf` (small, and there is
+  an `…-MTP.gguf` variant for the MTP gate) and
+  `/llm/models/Gemma4/31B-QAT/Q4_K_XL/gemma-4-31B-it-qat-Q4_K_XL.gguf`; **absent** in Qwen3.5-4B,
+  Qwen3.8-27B and Qwen3.6-35B-A3B (the non-SWA controls).  Note that an SWA model builds **two** masks
+  (`self_kq_mask` + `self_kq_mask_swa`, i.e. two derivable sets), which 3.2 must handle.
 * **3.3 (optional)** — M-RoPE causality (`p0 == p1 && p0_ext.is_2d_gt(p1_x, p1_y)`) needs the per-cell
   2-D ext positions published as well.  **Alibi stays on the packed mask** (it is a value, not a
   predicate).
@@ -146,12 +157,13 @@ natively), and the tile loaders to adapt are `flash_attn_ext_f16_load_K`/`load_V
 `fattn-mma-f16.cuh`.  Then no scratch is allocated at all *and* the per-ubatch global conversion pass
 disappears.
 
-**Risks / ship gate**: the global conversion is amortized across all heads and query blocks, while
-in-tile dequantization repeats work per tile — so the memory win may cost throughput.  Measure
-pp20480 at ub 2048/1024 against the pre-V4 build; **if it regresses, V4 does not ship in Block 15** (it
-becomes documented future work).  Bit-identity is expected (same dequantization, same F16 operand
-values) but must be proven by A/B, and the decode path is unaffected (it uses the vec kernel, which
-needs no scratch).
+**Risks / ship rule (D9)**: the global conversion is amortized across all heads and query blocks, while
+in-tile dequantization repeats work per tile — so the memory win may cost throughput.  Measure pp20480
+at ub 2048/1024 against the pre-V4 build and apply the three-way rule: no regression → **on by default**;
+regression → **ship opt-in, default off** (for people who need the last 832 MiB), documented in
+`patches/README.md` and the beta gate table; impractical even as opt-in → future work.  Bit-identity is
+expected (same dequantization, same F16 operand values) but must be proven by A/B, and the decode path is
+unaffected (it uses the vec kernel, which needs no scratch).
 
 ### 3.3 Then, and only then, Block 15
 
@@ -245,6 +257,8 @@ verify `git apply --check` on a fresh base.
   (the timing footer always differs).
 * Memory numbers come from `bufsize.sh` / `model-sweep.sh` / `mask-scaling.sh`, never llama-bench.
 * Anything that can move buffer layout must pass the adaptive-MTP gate (`tools/mtp-ab.sh`, ≥ ~0.45).
+* **Anything that touches the kq mask must be validated on an SWA model as well as a non-SWA one** (D7) —
+  `gemma-4-E4B-it-Q8_0.gguf` is the cheap SWA target, Qwen3.5-4B/27B are the controls.
 * Check for stray `llama-cli`/`llama-bench` processes before measuring; `llama-slot-prox` owns ports
   8037–8039.
 * Keep the delivery-repo tree clean between sessions; commit with clear messages.
@@ -264,8 +278,14 @@ cache (cell occupied + sequence membership + causal), keep the packed mask for d
 unsupported case, gate it with LLAMA_KQ_MASK_DERIVED (default on), and prove byte-identical same-seed
 output on Qwen3.5-4B-Q8_0 and Qwen3.8-27B-Q8_0 at a short and a long prompt, plus the reserve matrix
 (expect -800 MiB/GPU compute and -800 MiB host at ctx 204800 / ub 2048), the MTP gate, bench parity and
-test-backend-ops FLASH_ATTN_EXT.  Then 3.2 (SWA coverage) and V4 (HANDOVER section 3.2) - V4 ships only
-if it does not regress prefill throughput.
+test-backend-ops FLASH_ATTN_EXT.  Phase 3.2 (SWA as a position bound) is IN SCOPE for Block 15 too, and
+must be validated on an SWA model - use /llm/models/Gemma4/E4B-IT/gemma-4-E4B-it-Q8_0.gguf (and its
+-MTP variant for the MTP gate) alongside the non-SWA controls.  Then V4 (HANDOVER section 3.2), which
+ships on-by-default only if it does not cost prefill throughput, otherwise opt-in default-off (D9).
+
+When every win is in place, merge W1-W4 + V3 + V4, gate them, re-validate as a combined set
+(beta/block-15-campaign-wins/README.md sections 4 and 6), finalise BETA-TESTING.md's gate table, and cut
+Block 15 - exactly one block, no Block 16.
 
 If V3 3.1 turns out to be more invasive than expected, say so early and fall back to V2 (1-bit packed
 mask, DERIVED-MASK-DESIGN.md section 4) - do not build both.
@@ -276,9 +296,8 @@ throughput, what was not validated, and the updated state in HANDOVER.md.
 
 ## 9. Open questions
 
-1. **V3 coverage for Block 15**: phase 3.1 only (dense text models, `n_swa = 0`), or also 3.2 (SWA —
-   cheap and it widens coverage to most modern models)?  M-RoPE (3.3) is optional; alibi stays packed.
-2. **Beta tester material**: do you want a one-page A/B checklist (env-var matrix + what to report) in
-   this directory before the beta window opens?
-3. **V4 trade-off**: confirm the ship rule — V4 goes into Block 15 only if the memory win does not cost
-   prefill throughput; otherwise it is documented as future work.
+None outstanding — the maintainer answered all three on 2026-09-10: V3 includes 3.2 (D7), the beta
+checklist exists (`BETA-TESTING.md`, D8), and V4 follows the three-way ship rule (D9).  Two things are
+decided *at implementation time* rather than now: the exact V4 gate name and its default (measurement
+decides on/opt-in), and whether V3 phase 3.3 (M-RoPE) is cheap enough to include — alibi stays on the
+packed mask either way.
