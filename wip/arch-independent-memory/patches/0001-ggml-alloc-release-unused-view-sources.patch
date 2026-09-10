@@ -1,0 +1,46 @@
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index cda6dd695..095086125 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -760,6 +760,41 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
+         }
+     }
+ 
++    // a view node that is never used as a source keeps its view source's n_views count elevated
++    // forever: the free pass below only decrements that count when the view itself is released, which
++    // never happens for a node with no consumers (e.g. a ggml_cpy expanded into the graph purely for
++    // its side effect - the "copy into a view of preallocated memory" idiom). The inflated count
++    // blocks both the view source's release and its in-place reuse, so the buffer grows by the size of
++    // every such view source. Fold those contributions in here, while the child counts are final.
++    // Graph outputs are exempt: they are never freed and may alias the view source, which must stay
++    // allocated for the application to read it.
++    for (int i = 0; i < graph->n_nodes; i++) {
++        struct ggml_tensor * node = graph->nodes[i];
++
++        if (!ggml_impl_is_view(node) || node->op == GGML_OP_NONE) {
++            continue;
++        }
++        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
++            continue;
++        }
++
++        struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
++        if (hn->n_children != 0) {
++            continue;
++        }
++
++        struct ggml_tensor * view_src = node->view_src;
++        struct hash_node * view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
++        view_src_hn->n_views -= 1;
++
++        AT_PRINTF("unused view %s: view_src %s: %d children, %d views\n",
++            node->name, view_src->name, view_src_hn->n_children, view_src_hn->n_views);
++
++        if (view_src_hn->n_views == 0 && view_src_hn->n_children == 0 && view_src_hn->allocated) {
++            ggml_gallocr_free_node(galloc, view_src);
++        }
++    }
++
+     // allocate tensors
+     for (int i = 0; i < graph->n_nodes; i++) {
+         struct ggml_tensor * node = graph->nodes[i];

@@ -114,27 +114,62 @@ parent stays separate from the child.
   a large tensor.
 - **General fix:** let the allocator reuse through a reshaped parent when the layouts allow.
 
-### 3b. `n_views` accounting for a `ggml_cpy` into a view (suspected leak)
+### 3b. `n_views` accounting for a `ggml_cpy` into a view - **mechanism proven, fix written (WIP)**
 
-Evidence: 12 x 400 MB `indexer_score-*` leaves were never freed; the qwen4exp reserve crept
-4450 -> **6441 MiB** until the graph was changed to assemble with `ggml_concat` instead of copying
-into a view (`ggml_cpy`-into-view is the trap). The workaround is in `L2-score-chain-findings.md`.
+**Root cause (proven 2026-09-10).** The counting pass increments `view_src->n_views` for *every* view
+**node** in the graph (`ggml/src/ggml-alloc.c` ~L737-741), but the free pass only decrements it inside
+the block that runs when the view node *itself is released* (~L805-812) - and a view node with **no
+consumers** is never released. A `ggml_cpy` expanded into the graph purely for its side effect (the
+"copy into a view of preallocated memory" idiom) is exactly such a node, so its view source's count
+stays inflated forever, which blocks **both** the release and the in-place reuse
+(`p_hn->n_views == 0`) of the view source. The space is never reused, so the buffer grows by the size
+of every such view source - which is the qwen4exp L2 observation (12 x 400 MB `indexer_score-*`
+never freed, reserve creeping 4450 -> 6441 MiB).
 
-Code: the two passes count different things - **increment by view-node existence**
-(`ggml-alloc.c` ~L737-741: for every node `ggml_impl_is_view(node) && node->op != GGML_OP_NONE` ->
-`view_src->n_views += 1`), **decrement by use as a src** (~L805-812, in the free pass, only for a
-parent that is itself a view and has lost its last child). `n_views` is a plain `int`, so a
-mismatch makes it negative, and both the free check (`n_views == 0`) and the reuse check
-(`n_views == 1`) then fail forever.
+**Repro** (`repro/ggml-alloc-unused-view.c`, 12 layers x 4 MiB, one graph): the idiom gives a
+**56.00 MiB** arena vs **16.00 MiB** for the identical graph with the copies consumed (control), and
+with `GGML_ALLOCATOR_DEBUG` the free pass shows 1 free vs 13 and `view_src ...: 4 views` never
+returning to 0. With the fix both variants are 16.00 MiB.
 
-**Status: symptom measured and reproducible, mechanism as yet unconfirmed.** The next session should
-prove it with the allocator's own tracing - `AT_PRINTF` prints exactly `parent %s: %d children,
-%d views, allocated: %d` (enabled via `GGML_ALLOCATOR_DEBUG` in `ggml-alloc.c`) - on a *minimal*
-repro (`ggml_cpy` into a view of a big allocator-owned tensor, repeated), then fix the accounting.
+**Fix** (`patches/0001-ggml-alloc-release-unused-view-sources.patch`, +40 lines): after the counting
+pass, fold the view contribution of every view node that has **no consumers** and is not a graph
+output (outputs are never freed and may alias the view source, which must stay allocated for the
+application to read it):
 
-**Acceptance criteria for any fix here:** repeated graph builds must not grow the reserve; coherence
-byte-identical on the 4B / 27B / qwen4exp matrix; `test-backend-ops` + `test-alloc`/`test-batch-alloc`
-clean; the qwen4exp L1 numbers (3251.39 MiB/GPU at ub2048) unchanged or better.
+```c
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (!ggml_impl_is_view(node) || node->op == GGML_OP_NONE) continue;
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT)              continue;
+        if (ggml_gallocr_hash_get(galloc, node)->n_children != 0) continue;
+        ... view_src_hn->n_views -= 1; free the view source if it reaches 0/0 ...
+    }
+```
+
+It is sound because such a node is a dependency of nothing; the *views used as a source* (e.g. the
+cpy's destination view) keep their own contributions, so the source still cannot be reused before the
+last operation that touches it has run. Any node with `n_children == 0` has had all its consumers
+processed by the time the loop reaches it (topological order), so the fold cannot race the free pass.
+
+**Acceptance (all passed, build `/tmp/bin-l3b` vs the pre-fix `/tmp/bin-l1`):**
+
+| check | result |
+|---|---|
+| repro: idiom vs control | 56.00 -> **16.00 MiB** = control |
+| same-seed coherence (4B / 27B / qwen4exp) | **byte-identical** (only llama-cli's timing footer differs) |
+| reserve 4B / 27B @ ub2048 | 1800.33 / 840.34 and 1920.33 / 880.34 - **unchanged** |
+| qwen4exp reserve ub2048 / ub1024 | 3251.39 / 63.69 and 1675.33 / 33.64 - **unchanged** |
+| adaptive MTP acceptance | **0.61616** in both builds (gate >= 0.45) |
+| `test-alloc`, `test-batch-alloc` | PASSED / 0 failures |
+| `test-backend-ops -o {VIEW,CONT,CPY,DUP,CONCAT}` (CPU, ROCm0) | all OK |
+
+**Value:** the current graph builders do not use the idiom (hence the unchanged numbers), so this is
+a **latent trap** fix - it is upstream-shared code, it removes a real leak for any graph that does use
+it, and it un-blocks the `ggml_cpy`-into-view assembly that the L2 work had to abandon in favour of
+`ggml_concat` (bit-exactness of the concat path keeps it the recommended choice anyway).
+
+**Not in the delivery**: kept as a WIP patch (like everything under `wip/`), to be packaged only on
+request. The fork tree is left in the 10-file L1 state.
 
 ## 4. Measurement tooling (all model-agnostic)
 
@@ -158,9 +193,10 @@ share** separately - the mask is the only term that is both huge and arch-indepe
    single-sequence prefill case (`cell_pos <= token_pos`), using the L1 patch as the template; **V2**
    (1-bit packed mask) is the semantics-free alternative; **V4** (native quantized K/V in the MMA FA
    path) is an independent, equal-sized win that also removes a per-ubatch conversion.
-2. **ggml-alloc 3b (the leak)** - this one *did* move the reserve (4450 -> 6441 MiB on qwen4exp), so it
-   is the allocator item worth fixing. Prove the mechanism with `AT_PRINTF` on a minimal repro, fix the
-   `n_views` accounting, and validate against the acceptance criteria in §3b.
+2. ~~**ggml-alloc 3b (the leak)**~~ **DONE 2026-09-10 - mechanism proven, fix written + validated**
+   (`patches/0001-ggml-alloc-release-unused-view-sources.patch`, +40 lines, all acceptance criteria
+   passed; see §3b). Not folded into the delivery (WIP rule); the fork tree stays the 10-file L1
+   state. Remaining option: propose it upstream - it is shared code and fixes a real leak.
 3. **ggml-alloc 3a (through-view reuse)** - correctness/generality only: measured **zero** reserve win
    on the 27B/4B (§3a). Do it if it is cheap and provably safe (no numerics change); do not spend a
    session on it for dense models.
