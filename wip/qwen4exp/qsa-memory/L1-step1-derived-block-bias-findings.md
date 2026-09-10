@@ -105,6 +105,47 @@ the meta-backend mirrored-src case for the new src count. Expected after that: *
 ub 2048** (ub 1024 ~2100) — the campaign's BEST outcome: ub2048 speed below ub1024's memory.
 Validate with the same `GGML_QSA_DERIVED_VIS` A/B (text must stay byte-identical) + `tools/bufsize.sh`.
 
+## 2c. Step 3 — the flash-attention switch (support landed; the prune measured, then blocked)
+
+`GGML_OP_FLASH_ATTN_QSA` now takes two optional srcs 5/6 (`cell_vis`, `q_vis`; `ggml.h` + the
+`ggml.c` ctor, which also accepts a **null** mask when they are present). Both `M_smem` staging
+sites in `fattn-qsa.cu` (~L214 F16/Q8_0 gather and ~L362 bf16) now call one inline helper
+(`qsa_cell_mask`) that returns `__float2half(0.0f)` / `__float2half(-INFINITY)` from
+`cell_vis[g] in [0, q_vis[token]]` when the keys are present, else the gathered mask — the mask's
+two fp16 constants exactly. The CPU reference aborts with a clear message on the derived form
+(CUDA-only), and the meta backend accepts a null src slot (`SPLIT_AXIS_UNKNOWN`).
+
+**Validated (mask still present):** generated text byte-identical with `GGML_QSA_DERIVED_VIS=1` vs
+`=0` on the 3k and 40k prompts; reserve unchanged at 4051.39 MiB/GPU.
+
+**The −800 MiB prune works at the reserve level and was measured**: passing no mask (to the top-k
+*and* the FA) gives **3251.39 MiB/GPU, host 63.69 MiB** (from 4051.39 / 863.69) — i.e. **−799.21
+MiB/GPU**, exactly the campaign's BEST target (ub2048 at *less* memory than pristine ub1024's 3347
+MiB, with ub2048 speed; ub1024 would land near 1475). It also removes the O(n_kv × n_tps) host mask
+build from every prefill ubatch.
+
+**Blocker (why the prune is reverted for now):** the run aborts at compute time with
+`ggml-backend.cpp:205 GGML_ASSERT(buffer)` from `ggml_backend_buffer_get_usage`. The cause is
+structural: the mask tensor stays *created* (it is the attn input object's cached tensor, and
+`can_reuse_kq_mask` reads its `ne[]`) but becomes *unreachable*, so the gallocr never allocates it
+and it has a null buffer. `llm_graph_input_attn_kv::set_input` already guards that case
+(`if (self_kq_mask && self_kq_mask->buffer)`), but other paths query a buffer without a null check —
+`ggml_backend_meta_get_split_state` dereferences `tensor->buffer` immediately
+(`ggml_backend_meta_buffer_n_bufs(tensor->buffer)`, `tensor->buffer->context`), and
+`ggml_backend_sched`'s split-input copy loop calls `ggml_backend_buffer_get_usage(input->buffer)`
+(`ggml-backend.cpp:1730`).
+
+**The fix for the next session:** do not *create* the mask at all on the derived path, i.e. never
+call `inp->get_kq_mask()` in the prefill graph — then no tensor with a null buffer exists. The
+blocker for that is ordering: `build_qsa_top_k` derives `blk_bias` from the mask's shape, and the
+call site (`qwen4exp.cpp` ~L1571) evaluates `inp->get_kq_mask()` before that. For qwen4exp the
+`blk_bias` predicate is model-level and constant (causal, no alibi, no SWA, 4-D mask), so compute a
+single `want_derived_vis` at the graph-build entry from
+`qwen4exp_derived_bias_mode() != 0 && qwen4exp_derived_vis_enabled() && ubatch.n_tokens > 1 &&
+cparams.causal_attn && !hparams.use_alibi && n_swa == 0`, thread it to the top-k call site and
+`build_attn_qsa`, and make `blk_bias` accept the mask-less case. Alternatively keep the mask
+allocated (and eat the 800 MiB) — the state changes are already correct either way.
+
 ## 3. The MTP-acceptance drift — RESOLVED as a buffer-layout effect, not arithmetic
 
 The adaptive-MTP probe (`benchmarks/mtp-adaptive-methodology.md` Protocol A; `tools/mtp-ab.sh`)
@@ -201,11 +242,14 @@ campaign's BEST outcome; ub1024 would land near 2100).
 
 | file | change |
 |---|---|
-| `ggml/include/ggml.h` | `ggml_indexer_top_k` signature: +`cell_pos`, `q_pos`, `blk_idx`, `blk_tail` (nullable) with the documented semantics |
+| `ggml/include/ggml.h` | `ggml_indexer_top_k` signature: +`cell_pos`, `q_pos`, `blk_idx`, `blk_tail` (nullable) with the documented semantics; `ggml_flash_attn_qsa`: +`cell_vis`, `q_vis` (nullable) |
 | `ggml/src/ggml.c` | constructor: optional-src asserts, store srcs 3–6 |
 | `ggml/src/ggml-cpu/ops.cpp` | CPU reference handles the derived bias + a `nullptr` additive |
 | `ggml/src/ggml-backend-meta.cpp` | INDEXER_TOPK: assert *every* non-null src is mirrored (was hard-coded 0..2) |
 | `ggml/src/ggml-cuda/indexer-topk.cu` | `indexer_topk_extra` threaded through the 3 kernels + launcher; host reads srcs 3–6; support check |
+| `ggml/src/ggml-cuda/fattn-qsa.cu/.cuh` | optional `cell_vis`/`q_vis` srcs; both `M_smem` sites derive via `qsa_cell_mask` |
+| `ggml/src/ggml-cpu/ops.cpp` | INDEXER_TOPK reference (derived bias + visibility, nullable additive); FLASH_ATTN_QSA reference aborts on the derived form (CUDA-only) |
+| `ggml/src/ggml-backend-meta.cpp` | INDEXER_TOPK: every non-null src mirrored; FLASH_ATTN_QSA: srcs 4–6 mirrored or UNKNOWN (null mask) |
 | `src/llama-memory-hybrid-idx.{h,cpp}` | `set_input_qsa` takes `blk_idx`/`blk_tail` **and `cell_vis`/`q_vis`**; fills them instead of the tensor/mask when asked (and zero-fills the tensor in the diagnostic modes) |
 | `src/models/qwen4exp.cpp` | `qwen4exp_derived_bias_mode()` + `qwen4exp_derived_vis_enabled()` gates, compact inputs, `ggml_add` dropped on that path, top-k call |
 

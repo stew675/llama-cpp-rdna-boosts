@@ -1,8 +1,19 @@
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 1a8e68103..d251e1f97 100644
+index 1a8e68103..091d40f6e 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -2541,13 +2541,27 @@ extern "C" {
+@@ -2529,7 +2529,9 @@ extern "C" {
+             struct ggml_tensor  * idx,
+             struct ggml_tensor  * mask,
+             float                 scale,
+-            float                 logit_softcap);
++            float                 logit_softcap,
++            struct ggml_tensor  * cell_vis,
++            struct ggml_tensor  * q_vis);
+ 
+     GGML_API void ggml_flash_attn_qsa_set_prec(
+             struct ggml_tensor * a,
+@@ -2541,13 +2543,27 @@ extern "C" {
      // fused expand + mask + top-k for the indexer: value[c] = score[cell_blk[c]] + additive[c]
      // src0: block scores [n_blocks, n_tps, n_stream] F32
      // src1: cell -> block map [n_kv, n_stream] I32
@@ -32,10 +43,24 @@ index 1a8e68103..d251e1f97 100644
  
      // Fused indexer block-pool + rms-norm (qwen4exp QSA): replaces the per-op chain
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index a39b4f6ca..6896a1f74 100644
+index a39b4f6ca..5ad0a5027 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -1032,10 +1032,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+@@ -795,7 +795,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+     // K/V by kv-head, result by head); idx and mask are mirrored.
+     auto handle_flash_attn_qsa = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+         GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+-        GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++        // src4 (mask) plus the optional derived-visibility keys are replicated when present; a
++        // null src slot (the mask on the derived path) carries no split state
++        for (size_t i = 4; i < 7; i++) {
++            GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
++                    src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
++        }
+ 
+         GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
+         const bool kv_split = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+@@ -1032,10 +1037,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                  split_state = handle_flash_attn_qsa(src_ss);
              } break;
              case GGML_OP_INDEXER_TOPK: {
@@ -54,10 +79,23 @@ index a39b4f6ca..6896a1f74 100644
              } break;
              case GGML_OP_INDEXER_SCORE: {
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index cd4122a7d..54d1ef797 100644
+index cd4122a7d..1f903107f 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -12556,10 +12556,14 @@ static void ggml_compute_forward_indexer_topk_impl(
+@@ -9379,6 +9379,12 @@ static void ggml_compute_forward_flash_attn_qsa_f32(
+     const ggml_tensor * idx  = dst->src[3];
+     const ggml_tensor * mask = dst->src[4];
+ 
++    // the derived-visibility form (cell_vis/q_vis, src5/src6) carries no mask tensor; the CUDA
++    // kernel computes the per-cell value inline.  This reference does not implement it.
++    if (dst->src[5] != nullptr) {
++        GGML_ABORT("flash_attn_qsa: the derived cell visibility requires the CUDA backend");
++    }
++
+     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+     GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+@@ -12556,10 +12562,14 @@ static void ggml_compute_forward_indexer_topk_impl(
      const ggml_tensor * score    = dst->src[0];
      const ggml_tensor * cell_blk = dst->src[1];
      const ggml_tensor * additive = dst->src[2];
@@ -73,7 +111,7 @@ index cd4122a7d..54d1ef797 100644
      GGML_ASSERT(dst->type      == GGML_TYPE_I32);
  
      const int k = ggml_get_op_params_i32(dst, 0);
-@@ -12579,8 +12583,29 @@ static void ggml_compute_forward_indexer_topk_impl(
+@@ -12579,8 +12589,29 @@ static void ggml_compute_forward_indexer_topk_impl(
      const int64_t s0 = 0;
      GGML_UNUSED(s0);
      const auto cell_value = [&](int64_t c, int64_t row) -> float {
@@ -105,6 +143,91 @@ index cd4122a7d..54d1ef797 100644
          if (additive->type == GGML_TYPE_F32) {
              const float * add_d = (const float *) additive->data;
              return sc + add_d[c + row*n_kv];
+diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
+index d61e96a68..e5c0e6201 100644
+--- a/ggml/src/ggml-cuda/fattn-qsa.cu
++++ b/ggml/src/ggml-cuda/fattn-qsa.cu
+@@ -48,6 +48,10 @@ static __global__ void flash_attn_qsa(
+         const char * V_ptr,
+         const int  * idx_ptr,
+         const char * mask_ptr,
++        const int  * cell_vis_ptr,
++        const int  * q_vis_ptr,
++        const int    nb_cv1,
++        const int    nb_qv1,
+         float      * dst_ptr,
+         float      * parts_ptr,
+         float2     * meta_ptr,
+@@ -112,6 +116,20 @@ static __global__ void flash_attn_qsa(
+     idx += col*ne40 + sequence*ne40*ne41; // [n_top_k, n_tps, 1, n_stream]
+     const half * maskh = (const half *) (mask + nb33*(sequence % ne33) + nb31*col);
+ 
++    // the per-cell visibility: derived from the compact keys when they are present (cell_vis is
++    // the cell's compaction key, -1 for an empty or foreign cell; q_vis is the query's key), else
++    // gathered from the mask.  Same values, and the same fp16 constants the mask holds.
++    const int * cell_vis = cell_vis_ptr != nullptr ? cell_vis_ptr + sequence*nb_cv1 : nullptr;
++    const int   q_vis_r  = q_vis_ptr    != nullptr ? q_vis_ptr[col + sequence*nb_qv1] : 0;
++
++    auto qsa_cell_mask = [&](int cell_g) -> half {
++        if (cell_vis != nullptr) {
++            const int cv = cell_vis[cell_g];
++            return cv >= 0 && cv <= q_vis_r ? __float2half(0.0f) : __float2half(-INFINITY);
++        }
++        return maskh[cell_g];
++    };
++
+     const int row  = (sequence*int(ne01.z) + col)*ne02 + head;
+     const int k0   = slice*n_slice_cells;
+     const int k1   = min(ne40, k0 + n_slice_cells);
+@@ -211,7 +229,7 @@ static __global__ void flash_attn_qsa(
+                     }
+                 }
+                 if (flat < tile_len) {
+-                    M_smem[flat] = maskh[identity ? tile0 + flat : idx[tile0 + flat]];
++                    M_smem[flat] = qsa_cell_mask(identity ? tile0 + flat : idx[tile0 + flat]);
+                 }
+             }
+             __syncthreads();
+@@ -359,7 +377,7 @@ static __global__ void flash_attn_qsa(
+                 // reads M_smem for every K/V type, but only the F16/Q8_0
+                 // gather wrote it (uninitialized smem otherwise)
+                 if (flat < tile_len) {
+-                    M_smem[flat] = maskh[identity ? tile0 + flat : idx[tile0 + flat]];
++                    M_smem[flat] = qsa_cell_mask(identity ? tile0 + flat : idx[tile0 + flat]);
+                 }
+             }
+             __syncthreads();
+@@ -457,6 +475,8 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
+     const ggml_tensor * V   = dst->src[2];
+     const ggml_tensor * idx = dst->src[3];
+     const ggml_tensor * mask = dst->src[4];
++    const ggml_tensor * cell_vis = dst->src[5];
++    const ggml_tensor * q_vis    = dst->src[6]; // 
+ 
+     cudaStream_t main_stream = ctx.stream();
+ 
+@@ -535,6 +555,10 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
+                 (const char *) V->data,
+                 (const int  *) idx->data,
+                 (const char *) mask->data,
++                cell_vis != nullptr ? (const int *) cell_vis->data : nullptr,
++                q_vis    != nullptr ? (const int *) q_vis->data    : nullptr,
++                cell_vis != nullptr ? (int) (cell_vis->nb[1]/sizeof(int)) : 0,
++                q_vis    != nullptr ? (int) (q_vis->nb[1]/sizeof(int))    : 0,
+                 (float *) dst->data,
+                 dst_data, meta.ptr, n_slices, n_slice_cells,
+                 scale, logit_softcap, identity, head_base,
+@@ -551,6 +575,10 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
+                 (const char *) V->data,
+                 (const int  *) idx->data,
+                 (const char *) mask->data,
++                cell_vis != nullptr ? (const int *) cell_vis->data : nullptr,
++                q_vis    != nullptr ? (const int *) q_vis->data    : nullptr,
++                cell_vis != nullptr ? (int) (cell_vis->nb[1]/sizeof(int)) : 0,
++                q_vis    != nullptr ? (int) (q_vis->nb[1]/sizeof(int))    : 0,
+                 (float *) dst->data,
+                 dst_data, meta.ptr, n_slices, n_slice_cells,
+                 scale, logit_softcap, identity, head_base,
 diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
 index b15af7104..1b9e63516 100644
 --- a/ggml/src/ggml-cuda/indexer-topk.cu
@@ -300,10 +423,60 @@ index b15af7104..1b9e63516 100644
          dst->type == GGML_TYPE_I32;
  }
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 7ee2c06d8..9a93ccc25 100644
+index 7ee2c06d8..1474b23fa 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -5664,27 +5664,55 @@ struct ggml_tensor * ggml_indexer_top_k(
+@@ -5606,7 +5606,9 @@ struct ggml_tensor * ggml_flash_attn_qsa(
+         struct ggml_tensor  * idx,
+         struct ggml_tensor  * mask,
+         float                 scale,
+-        float                 logit_softcap) {
++        float                 logit_softcap,
++        struct ggml_tensor  * cell_vis,
++        struct ggml_tensor  * q_vis) {
+     GGML_ASSERT(ggml_can_mul_mat(k, q));
+ 
+     GGML_ASSERT(q->ne[3] == k->ne[3]);
+@@ -5616,11 +5618,24 @@ struct ggml_tensor * ggml_flash_attn_qsa(
+     GGML_ASSERT(idx->ne[1] == q->ne[1]);   // n_tps
+     GGML_ASSERT(idx->ne[3] == q->ne[3]);   // n_stream
+ 
+-    GGML_ASSERT(mask->type == GGML_TYPE_F16);
+-    GGML_ASSERT(ggml_is_contiguous(mask));
+-    GGML_ASSERT(mask->ne[0] == k->ne[1]);  // n_kv
+-    GGML_ASSERT(mask->ne[1] == q->ne[1]);
+-    GGML_ASSERT(mask->ne[3] == q->ne[3]);
++    // the mask is optional: when the compact visibility keys are given, the kernel derives the
++    // per-cell value from them instead (cell_vis[cell] in [0, q_vis[token]] means visible)
++    GGML_ASSERT(mask != NULL || (cell_vis != NULL && q_vis != NULL));
++
++    if (mask != NULL) {
++        GGML_ASSERT(mask->type == GGML_TYPE_F16);
++        GGML_ASSERT(ggml_is_contiguous(mask));
++        GGML_ASSERT(mask->ne[0] == k->ne[1]);  // n_kv
++        GGML_ASSERT(mask->ne[1] == q->ne[1]);
++        GGML_ASSERT(mask->ne[3] == q->ne[3]);
++    }
++
++    if (cell_vis != NULL) {
++        GGML_ASSERT(q_vis != NULL);
++        GGML_ASSERT(cell_vis->type == GGML_TYPE_I32 && q_vis->type == GGML_TYPE_I32);
++        GGML_ASSERT(cell_vis->ne[0] == k->ne[1] && cell_vis->ne[1] == q->ne[3]);
++        GGML_ASSERT(q_vis->ne[0]    == q->ne[1] && q_vis->ne[1]    == q->ne[3]);
++    }
+ 
+     // permute(0, 2, 1, 3)
+     int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+@@ -5635,6 +5650,8 @@ struct ggml_tensor * ggml_flash_attn_qsa(
+     result->src[2] = v;
+     result->src[3] = idx;
+     result->src[4] = mask;
++    result->src[5] = cell_vis;
++    result->src[6] = q_vis;
+ 
+     return result;
+ }
+@@ -5664,27 +5681,55 @@ struct ggml_tensor * ggml_indexer_top_k(
          struct ggml_tensor  * score,
          struct ggml_tensor  * cell_blk,
          struct ggml_tensor  * additive,
@@ -544,7 +717,7 @@ index 4b30994d1..c5ce4bd51 100644
                         int32_t * dst_derived_from = nullptr,
                         int32_t * dst_derived_lim  = nullptr) const;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 606af11fb..1a6ec1e13 100644
+index 606af11fb..d16c0fb2d 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -902,10 +902,42 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
@@ -786,3 +959,35 @@ index 606af11fb..1a6ec1e13 100644
      cb(top_k, "indexer_top_k", il);
  
      return top_k;
+@@ -1296,6 +1432,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+     }();
+     const bool qsa_sparse = qsa_sparse_env && cparams.flash_attn;
+ 
++    // the derived visibility keys live in this layer's QSA graph input set (null on the tensor
++    // path, where the kernel keeps gathering the mask); the mask src stays until the prunable form
++    ggml_tensor * qsa_cell_vis = nullptr;
++    ggml_tensor * qsa_q_vis    = nullptr;
++    {
++        const auto it_qsa = qsa_inps.find((uint32_t) hparams.dsv4_compress_ratios[il]);
++
++        if (it_qsa != qsa_inps.end()) {
++            qsa_cell_vis = it_qsa->second->cell_vis;
++            qsa_q_vis    = it_qsa->second->q_vis;
++        }
++    }
++
+     ggml_tensor * cur;
+ 
+     if (qsa_sparse) {
+@@ -1307,7 +1456,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+         k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+         v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+ 
+-        cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f);
++        // the mask stays as src4: dropping it (the -800 MiB prune) leaves a null-buffer tensor
++        // on the split/compute path and aborts in ggml_backend_buffer_get_usage - see findings 2c
++        cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f,
++                qsa_cell_vis, qsa_q_vis);
+         ggml_flash_attn_qsa_set_prec(cur, GGML_PREC_F32);
+         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+         cb(cur, "kqv_out", il);
