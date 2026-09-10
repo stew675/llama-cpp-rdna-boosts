@@ -35,13 +35,14 @@ Reality pass: 2026-09-10.
   acceptance **identical 0.76744**; qwen4exp unchanged (probe reports the derived path is unused
   there).  Cost: prefill −1.1 % (pp20480/ub 2048, interleaved 5x), decode −0.7 %.  **V4 is the only
   remaining campaign item.**
-- **Critical path: V3, then V4.**
-  V3 = derived kq mask for the dense models (**-800 MiB/GPU VRAM + -800 MiB host** at ctx 204800 / ub 2048;
-  phase 3.1 causal/occupancy/sequence in the prefill+MMA path with the packed mask kept for decode and
-  unsupported cases, **phase 3.2 SWA coverage — both in Block 15**; V2 1-bit packed mask is the fallback).
-  V4 = native quantized K/V in the MMA FA path (**-832 MiB/GPU**, exactly ctx-linear; ships on-by-default
-  only if prefill throughput does not regress, else **opt-in default-off** for people who need the memory).
-  Spec: `wip/arch-independent-memory/DERIVED-MASK-DESIGN.md` (brief + measurements + V1-V4 ladder).
+- **Critical path: V4 only (V3 is DONE).**
+  V4 = native quantized K/V in the FA path (**-832 MiB/GPU**, exactly ctx-linear): dequantize into the
+  shared K/V tiles instead of staging an F16 copy of the whole cache.  Ships on-by-default only if
+  prefill throughput does not regress, else **opt-in default-off** for people who need the memory (D9).
+  **Both the MMA and the TILE loaders are in scope** — TILE (the verify-batch kernel) may be what the
+  reservation is actually sized for; the first measurement decides.  Full map:
+  `beta/block-15-campaign-wins/HANDOVER.md` §3.2.  Ladder + measurements:
+  `wip/arch-independent-memory/DERIVED-MASK-DESIGN.md`.
 - **Block 15 waits for V3+V4** (maintainer 2026-09-10): exactly ONE block, no Block 16.  W1-W4 + V3 + V4 get
   merged, each gated with an env kill-switch, re-validated **as a combination** (individual validations do
   not carry over), then staged in `beta/` for a ~4-5 day beta window before promotion into `patches/0015-…`.

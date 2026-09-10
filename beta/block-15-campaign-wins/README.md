@@ -7,8 +7,10 @@
 **Status: STAGING — not built yet (2026-09-10).**  This directory is the collection point for the
 memory campaign's validated wins on their way to becoming a single **Block 0015** patch: all wins on
 by default, each with an environment-variable kill-switch so beta testers can A/B (and bisect) any
-issue during the beta window (~4–5 days).  **The critical path is now V3 and V4** (§1b) — Block 15 waits
-for them, so the beta window does not open until they land.  Only after that window does Block 15 get promoted into the
+issue during the beta window (~4–5 days).  **V3 is DONE (2026-09-10, on by default, −799 MiB/GPU and
+−799 MiB host measured); the critical path is now V4 only** (§1b, and §3.2 of `HANDOVER.md` for the V4
+map).  Block 15 waits for V4, so the beta window does not open until it lands.  Only after that window
+does Block 15 get promoted into the
 delivery set (`patches/0015-rdna-boosts-block-15-<slug>.patch`, `scripts/apply-all.sh` 14 → 15,
 `scripts/make-patches.sh` tip, `MANIFESTS.md`/`README.md` headers, a `WORKLOG.md` entry, and this
 README turned into the promotion record).

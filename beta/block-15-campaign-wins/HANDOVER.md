@@ -38,12 +38,21 @@
 | **W3** | keys-only QSA indexer cache (the indexer V buffer is never read) | `wip/qwen4exp/keys-only-indexer/0001-keys-only-qsa-indexer-cache.patch` (3 files, 62 lines) | indexer KV 956.25 → **318.75 MiB**; box 88.58 → **86.70 GiB**; perf parity; broad validation matrix |
 | **W4** | ggml-alloc: release view sources whose views are never consumed (the 3b leak) | `wip/arch-independent-memory/patches/0001-ggml-alloc-release-unused-view-sources.patch` (+35, `ggml-alloc.c`); PR copy in `upstream/` | repro 56.00 → **16.00 MiB**; no change on current models (latent trap); **upstream-applicable, clean on master `9cf3bf256`** |
 
+**V3 is done** (2026-09-10, phases 1+2a+2b+2c) and is the fifth validated win - on by default in the
+fork tree, `LLAMA_KQ_MASK_DERIVED=0` forces the packed mask.  Measured: compute **−799.20 MiB/GPU** and
+host **−799.21 MiB** on the 4B (1800.33 → 1001.13 / 840.34 → 41.13) and the 27B (1920.33 → 1121.13 /
+880.34 → 81.13), **−809.18/−809.18** on gemma-4-E4B (ISWA, both masks) and **−811.17/−811.18** on
+gemma-4-31B, scaling exactly as `n_kv × n_tps × 2 B`; generated text **byte-identical** on the 4B/27B/
+gemma-4-E4B (3k and 40k prompts), 27B MTP acceptance identical (0.76744), qwen4exp unchanged; cost
+prefill −1.1 %, decode −0.7 %.  Record: `../../wip/arch-independent-memory/V3-DERIVED-KQ-MASK-PLAN.md`
+§4.3-§4.5.
+
 **Still to do before Block 15 can be cut** (the critical path, §3):
 
 | id | what | expected effect (dense models, ctx 204800, ub 2048, q8_0 KV) |
 |---|---|---|
-| **V3** | derived kq mask for the plain (non-QSA) attention path: stop materialising the `n_kv × n_tps` F16 mask and its host mirror, derive visibility in the FA kernel from compact per-cell state; **phases 3.1 + 3.2 are both in scope — 3.2 adds SWA as a position bound so sliding-window models are covered too (D7)** | **−800 MiB/GPU VRAM − 800 MiB host** (27B: 1920.33 → ~1120 MiB compute; 4B: 1800.33 → ~1000) |
-| **V4** | native quantized K/V in the MMA flash-attn path: dequantize into the shared K/V tiles instead of staging an F16 copy of the whole cache in a global scratch | **−832 MiB/GPU at ub2048, exactly ctx-linear** (the `ggml_cuda_flash_attn_ext_get_f16_extra_data` scratch) |
+| **V3** | derived kq mask for the plain (non-QSA) attention path - **DONE 2026-09-10**, see above | **−799 MiB/GPU VRAM − 799 MiB host** measured |
+| **V4** | native quantized K/V in the FA path: dequantize into the shared K/V tiles instead of staging an F16 copy of the whole cache in a global scratch.  **Both the MMA loader and the TILE loaders must be fixed** (see §3.2: TILE, not MMA, may be what the reservation is sized for) | **−832 MiB/GPU at ub2048, exactly ctx-linear** (the `ggml_cuda_flash_attn_ext_get_f16_extra_data` scratch) |
 
 **Not pursued**: 3a (through-view reuse — measured **zero** reserve win on the 27B/4B; the brief records
 it as a correctness/generality item only), V2 (1-bit packed mask — the *fallback plan* for V3, see
@@ -191,26 +200,76 @@ the mask; per token the existing `attn_inp_pos` I32 input plus a sequence-id arr
 
 ### 3.2 V4 — remove the FA F16 K/V staging scratch (the second 832 MiB)
 
-**Where it comes from**: `ggml_cuda_flash_attn_ext_get_f16_extra_data` (`ggml/src/ggml-cuda/fattn-common.cuh`)
-appends an F16 copy of K and V after the FA op's own dst whenever the selected kernel needs F16 K/V
-(`need_f16_K/V` in `ggml_cuda_flash_attn_ext_get_alloc_size`, `ggml/src/ggml-cuda/fattn.cu:694`); with a
-quantized KV cache the MMA path (which prefill selects) always needs them.  Measured: `x16 832.00 MB`
-for the 4B at ctx 204800 / ub 2048, **0** with `-ctk/-ctv f16`, exactly ctx-linear.
+**Mechanism (measured in the source, 2026-09-10):**
 
-**Approach**: dequantize **into the shared K/V tiles during staging** (the kernel already stages
-`tile_K`/`tile_V` as `half`) instead of converting the whole cache into a global scratch — the type
-handlers already exist in the vec path (`ggml/src/ggml-cuda/fattn-vec.cuh` handles quantized K/V
-natively), and the tile loaders to adapt are `flash_attn_ext_f16_load_K`/`load_V` in
-`fattn-mma-f16.cuh`.  Then no scratch is allocated at all *and* the per-ubatch global conversion pass
-disappears.
+1. `ggml_cuda_flash_attn_ext_get_alloc_size` (`ggml/src/ggml-cuda/fattn.cu:694`) computes
+   `need_f16_K/V` **per selected kernel** and returns `ggml_nbytes(dst)` plus that scratch — the scratch
+   is appended to the FA node's *own* allocation, so it lives in the compute buffer and is sized by the
+   reserve graph.
+2. `ggml_cuda_flash_attn_ext_get_f16_extra_data` (`ggml/src/ggml-cuda/fattn-common.cuh:56`) lays out
+   `{K, V, end}`: pad to 128 B, `+= ggml_nelements(K)*2`, `+= ggml_nelements(V)*2` (V shares K's region
+   when V is a view of K).
+3. `launch_fattn` (`fattn-common.cuh:976`) is shared by the MMA, TILE and VEC kernels.  When the flags
+   are set it runs `ggml_get_to_fp16_cuda(type)` (contiguous) or `ggml_get_to_fp16_nc_cuda` (strided)
+   **over the whole cache, every call**, then rewrites `K_data`/`V_data` and `nb11..nb23` to the F16
+   layout.  So the price is memory *and* a full-cache conversion pass per ubatch.
+4. The MMA staging is `flash_attn_ext_f16_load_tile` (`fattn-mma-f16.cuh:368`): a `half2` loader with
+   `cp_async` where available, taking `const half2 * KV` and a `stride_KV` in half2 units.  K is staged
+   at 692 / 1029 / 1385 and V at 672 / 1045, plus the fixup and `use_sparse` arms.
 
-**Risks / ship rule (D9)**: the global conversion is amortized across all heads and query blocks, while
-in-tile dequantization repeats work per tile — so the memory win may cost throughput.  Measure pp20480
-at ub 2048/1024 against the pre-V4 build and apply the three-way rule: no regression → **on by default**;
-regression → **ship opt-in, default off** (for people who need the last 832 MiB), documented in
-`patches/README.md` and the beta gate table; impractical even as opt-in → future work.  Bit-identity is
-expected (same dequantization, same F16 operand values) but must be proven by A/B, and the decode path is
-unaffected (it uses the vec kernel, which needs no scratch).
+**Scoping correction (this section as it stood was too optimistic): V4 has to cover TILE as well as MMA.**
+
+* `need_f16_K/V` is true for **TILE** too (`use_bf16 ? false : K->type != GGML_TYPE_F16`), for every
+  quantized KV type.  TILE is what the 2..8-token *verify* batches select (the RDNA4 WMMA arm requires
+  `Q->ne[1] > 8`, and VEC is picked only for `ne[1] <= 2` with quantized KV), and the reserve takes the
+  max over several reserved shapes (`sched_reserve` reserves the prefill shape → MMA, the n_seqs shape,
+  the MTP/verify shapes).  So removing the scratch from MMA alone would *not* shrink the reservation.
+* **VEC is already scratch-free** for quantized KV (`need = type == GGML_TYPE_F32` only) — that is why
+  q8_0 decode (`n_tps == 1`) never paid for it.  No VEC change is needed for the delivered config.
+
+**First experiment (cheap and decisive — do this before writing any kernel code):** measure the reserve
+with q8_0 KV at `-ub 8` (all attention shapes then select VEC/TILE) against `-ub 2048` (MMA).  If the
+~832 MiB is present in both, both kernels need the fix and TILE is the *blocking* one (it dominates the
+reserve); the deltas also give the exact size to reconcile against
+`ggml_nelements(K)*2 + ggml_nelements(V)*2` per layer.  `tools/bufsize.sh` prints exactly this
+(remember: it sets `GGML_CUDA_FA_WMMA_256=0`, drop it if that changes the selected kernel).
+
+**Implementation sketch:**
+
+1. The kernels are templated on `DKQ`/`DV`/`ncols`, *not* on the KV type — the scratch exists precisely
+   to keep the type out of the kernel.  Adding dequant-on-stage means a runtime type switch in the
+   loader (preferred: one new branch, no template explosion; the per-type block layout is
+   `ggml_blck_size(type)` / `ggml_type_size(type)`, e.g. q8_0 = 32 elements + F16 scale = 34 B/block, so
+   a `DKQ`-wide row is `DKQ/32` blocks).
+2. **Consequence to accept up front: `cp_async` is impossible for a quantized K/V source** (the data has
+   to be transformed), the 16-byte granularity assumptions of the current loader no longer hold, and the
+   staged `tile_KV` (half2) has to be written by hand.  This is where the throughput risk lives.
+3. Scope the first increment to **q8_0** (the delivered configuration) and leave `need_f16_K/V` true for
+   every other type — then nothing changes for them.  Only then consider the other types
+   (`ggml_cuda_fattn_kv_type_supported` / `GGML_CUDA_FA_ALL_QUANTS` gate which exist: q4_0, q4_1, q5_0,
+   q5_1, iq4_nl, mxfp4, bf16, ...).
+4. Exclude `use_sparse` (NVIDIA-only, its own loader arm) from the first increment: keep the scratch
+   there.
+5. Preserve the V3 semantics exactly: the staged tile must contain the same values as the packed path
+   for `i >= nbatch_fa` / out-of-bounds cells (see `flash_attn_ext_f16_load_mask`'s convention and the
+   dead-column detector), and the loaders keep the same `i`/`k` thread mapping so the shared-memory
+   layout stays identical.
+6. Bonus win: the per-ubatch global conversion pass disappears as well (`n_kv x n_head_kv x DKQ`
+   elements per layer per ubatch).
+
+**Validation (D9 three-way ship rule):** same-seed text **byte-identical** with the gate flipped inside
+one binary (4B, 27B, gemma-4-E4B as the SWA/ISWA case, qwen4exp as the control); the reserve matrix
+(expect **-832 MiB/GPU** at ctx 204800 / ub 2048 with q8_0, and exactly 0 with `-ctk/-ctv f16`); the
+adaptive-MTP gate `>= 0.45` and unchanged; bench parity **interleaved** (pp20480 at ub 2048 and 1024,
+tg256, 5 passes — the run-to-run noise is ~0.5 %, so a single pass proves nothing); `test-backend-ops
+FLASH_ATTN_EXT` on CPU + ROCm0 (the CPU reference is the oracle).  Then: no regression → **on by
+default**; regression → **opt-in, default off**, documented in the beta gate table; impractical even as
+opt-in → future work.
+
+**Why this is the riskiest item of the campaign:** it touches the hottest kernel in the fork (the WMMA
+FA staging), it gives up `cp_async` for quantized KV, and the win is *only* memory.  If the first
+increment (MMA or TILE, q8_0) shows more than a low-single-digit prefill cost, take the D9 opt-in route
+instead of grinding out per-type variants — Block 15 does not depend on V4 shipping on-by-default.
 
 ### 3.3 Then, and only then, Block 15
 
@@ -244,14 +303,18 @@ notes (inconsistency + crash path + how the fork found it while pruning masks).
 
 ## 5. Stage B — Block 15 (after V3/V4 land)
 
-1. **Merge** W1–W4 + V3 (+V4) into one tree.  W1+W2 are already on the fork tree (10 files,
-   uncommitted); W3 overlaps W2 in `src/llama-memory-hybrid-idx.cpp`; V3/V4 bring their own files.  Use
+1. **Merge** W1–W4 + V3 (+V4) into one tree.  W1+W2+V3 are already on the fork tree (21 files,
+   uncommitted); W3 overlaps W2 in `src/llama-memory-hybrid-idx.cpp`; W4 is a separate 2-file patch
+   (`wip/arch-independent-memory/patches/0001-*`) that also applies to upstream master.  Use
    `git add -A` + `git apply -3` (never `patch -F3`) and resolve conflicts by hand; the fork tree is the
-   authority for W1+W2.
+   authority for W1+W2+V3.
 2. **Gate everything** (D3 + the V3/V4 gates): `GGML_QSA_SCORE_MEM` (W1), `GGML_QSA_DERIVED_BIAS` /
    `GGML_QSA_DERIVED_VIS` / `LLAMA_QSA_SPARSE_FA` (W2, with the `2|3` diagnostics **stripped**),
-   `LLAMA_QSA_KEYS_ONLY` (W3), `LLAMA_KQ_MASK_DERIVED` (V3), the V4 switch.  W4 has no knob (§2).
-   Document every gate + default in `patches/README.md` and the beta README.
+   `LLAMA_QSA_KEYS_ONLY` (W3), `LLAMA_KQ_MASK_DERIVED` (V3, default 1, validated 2026-09-10), the V4
+   switch.  W4 has no knob (§2).  The V3 diagnostic (`LLAMA_KQ_MASK_DERIVED_VERIFY`) and
+   `GGML_QSA_DERIVED_BIAS=2|3` must be **stripped** from the patches (both live only in the
+   `0002-DIAGNOSTIC`-style snapshots, never in the delivery).  Document every gate + default in
+   `patches/README.md` and the beta README.
 3. **Combined validation**: `README.md` §4 protocol + the interaction cases listed in the old handover
    notes (W3+W2 on the same cache; W1×W2 in all four gate combinations; `LLAMA_QSA_SPARSE_FA=0` with
    W3; V3 with V4 on/off; the dense models 4B/27B for V3/V4, qwen4exp for W1–W3).
@@ -269,14 +332,20 @@ notes (inconsistency + crash path + how the fork found it while pruning masks).
 ## 6. State inventory
 
 **Fork** `~/llama.cpp`, branch `rdna-boosts` at `e2380eb67` (= fork point `9113cc188` + blocks 01–14),
-working tree = **10 modified files = W1 + W2 (incl. the `attn_k` guard)**, deliberately uncommitted.
-W3/V3/V4 are not applied.  Never commit those 10 files except as the Block-15 commit; never push from
-that checkout.
+working tree = **21 modified files = W1 + W2 (incl. the `attn_k` guard) + block-15 phase 1 + V3 phases
+2a/2b/2c**, deliberately uncommitted.  V3 is *complete and on by default* here; W3 and V4 are not
+applied.  Never commit those files except as the Block-15 commit; never push from that checkout.
+`build-rocm/{llama-cli,llama-bench,test-backend-ops}` are current with this tree and were used for the
+whole V3 validation (2026-09-10).
 
-**Campaign patches**: W1 `wip/qwen4exp/qsa-memory/patches/0001-…`, W2 `…/0002-derived-qsa-block-bias.patch`
-(regenerated 2026-09-10, 10 files, +557/−80, `git apply --check` clean on a fresh W1 base), W3
+**Campaign patches** (all `git apply --check` clean, in this order over a clean `9113cc188`):
+W1 `wip/qwen4exp/qsa-memory/patches/0001-L2a-L2m-qsa-score-memory.patch`,
+W2 `…/0002-derived-qsa-block-bias.patch` (10 files, +557/−80), W3
 `wip/qwen4exp/keys-only-indexer/0001-…`, W4 `wip/arch-independent-memory/patches/0001-…` + its PR copy
-`upstream/UPSTREAM-PR-ggml-alloc-unused-view.patch`; the A/B revert `ab/w4-revert.patch`.
+`upstream/UPSTREAM-PR-ggml-alloc-unused-view.patch` (the A/B revert is `ab/w4-revert.patch`), V3
+`wip/arch-independent-memory/patches/0002-DIAGNOSTIC-…` (the phase-1 oracle, **diagnostic only - never
+in the delivery**), `0003-…` (engine: op + CPU reference), `0004-…` (CUDA MMA kernel), `0005-…` (graph
+plumbing + probe + enable).  W3 and W4 are the only campaign pieces not yet on the fork tree.
 
 **Volatile helpers** (rebuild; `/tmp` may be wiped): `/tmp/bin-pristine` (14 blocks), `/tmp/bin-l2` (W1),
 `/tmp/bin-l1` (W1+W2 pre-guard), `/tmp/bin-l1guarded` (= the current tree), `/tmp/bin-l3b` (tree + W4),
@@ -288,8 +357,11 @@ that checkout.
 `wip/arch-independent-memory/repro/ggml-alloc-unused-view.c`.
 
 **Rebuild**: `export PATH=/opt/rocm-7.14-gfx1201/bin:$PATH && cmake --build build-rocm --target
-llama-cli llama-bench -j 16`; run with `LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib
-HIP_VISIBLE_DEVICES=0,1,2 GGML_CUDA_FA_WMMA_256=0`.
+llama-cli llama-bench test-backend-ops -j 16`; run with `LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib
+HIP_VISIBLE_DEVICES=0,1,2`.  **Do not add `GGML_CUDA_FA_WMMA_256=0` when V3/V4 behaviour matters** - it
+caps WMMA at head 128 and therefore turns V3 off for the 256-wide-head models (the tools under
+`wip/qwen4exp/qsa-memory/tools/` set it; drop it there).  Model paths, the V3 numbers and the V3 launch
+recipe are in `wip/arch-independent-memory/V3-DERIVED-KQ-MASK-PLAN.md` §4.4.
 
 **Patch regeneration recipe** (worktree trick): worktree at `HEAD` → apply the base patch → commit →
 copy the modified files from `~/llama.cpp` into the worktree → `git diff` → remove the worktree →
@@ -313,38 +385,71 @@ verify `git apply --check` on a fresh base.
 ## 8. Next-session prompt (copy-paste)
 
 ```
-Continue in /home/stew675/llama-cpp-rdna-boosts (read AGENTS.md first; its rules override this).
-Start with beta/block-15-campaign-wins/HANDOVER.md - it holds the maintainer's decisions (W4 = option C,
-a revert patch for A/B; Block 15 includes V3 and V4 and waits for them; kill-switches approved for W1
-and W3; exactly one block, no Block 16), the critical path, the state inventory and the open questions.
+Continue the RDNA memory campaign in /home/stew675/llama-cpp-rdna-boosts (read AGENTS.md first - its rules
+override everything here).  This session is V4: remove the flash-attention F16 K/V staging scratch
+(~832 MiB/GPU at ctx 204800 / ub 2048 with -ctk/-ctv q8_0).  It is the LAST campaign item before Block 15.
 
-The work now is V3, per HANDOVER section 3.1, using wip/arch-independent-memory/DERIVED-MASK-DESIGN.md
-as the spec and wip/qwen4exp/qsa-memory/patches/0002-derived-qsa-block-bias.patch as the worked example
-of the derived form.  Phase 3.1 = derive the mask in the prefill/MMA flash-attn path for the plain
-cache (cell occupied + sequence membership + causal), keep the packed mask for decode and every
-unsupported case, gate it with LLAMA_KQ_MASK_DERIVED (default on), and prove byte-identical same-seed
-output on Qwen3.5-4B-Q8_0 and Qwen3.8-27B-Q8_0 at a short and a long prompt, plus the reserve matrix
-(expect -800 MiB/GPU compute and -800 MiB host at ctx 204800 / ub 2048), the MTP gate, bench parity and
-test-backend-ops FLASH_ATTN_EXT.  Phase 3.2 (SWA as a position bound) is IN SCOPE for Block 15 too, and
-must be validated on an SWA model - use /llm/models/Gemma4/E4B-IT/gemma-4-E4B-it-Q8_0.gguf (and its
--MTP variant for the MTP gate) alongside the non-SWA controls.  Then V4 (HANDOVER section 3.2), which
-ships on-by-default only if it does not cost prefill throughput, otherwise opt-in default-off (D9).
+READ FIRST: beta/block-15-campaign-wins/HANDOVER.md section 3.2 - it is a full V4 map written 2026-09-10
+(the mechanism with exact call sites, the scoping correction, the implementation sketch, the validation
+and the ship rule).  Then wip/arch-independent-memory/V3-DERIVED-KQ-MASK-PLAN.md section 4.4 for the V3
+numbers/launch recipe and beta/block-15-campaign-wins/BETA-TESTING.md for the gate table.
 
-When every win is in place, merge W1-W4 + V3 + V4, gate them, re-validate as a combined set
-(beta/block-15-campaign-wins/README.md sections 4 and 6), finalise BETA-TESTING.md's gate table, and cut
-Block 15 - exactly one block, no Block 16.
+STATE: V3 is DONE and on by default (patches .../arch-independent-memory/patches/0003, 0004, 0005; the
+fork tree has 21 modified files = W1+W2+V3 phases 1/2a/2b/2c, uncommitted by design, builds clean).
+Measured -799 MiB/GPU + -799 MiB host on the 4B/27B, -809/-811 on the gemmas, byte-identical output,
+MTP acceptance unchanged.  Only V4 is left.  Rebuild: export PATH=/opt/rocm-7.14-gfx1201/bin:$PATH &&
+cmake --build build-rocm --target llama-cli llama-bench test-backend-ops -j 16; run with
+LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib.  DO NOT set GGML_CUDA_FA_WMMA_256=0 when V3/V4 matters.
 
-If V3 3.1 turns out to be more invasive than expected, say so early and fall back to V2 (1-bit packed
-mask, DERIVED-MASK-DESIGN.md section 4) - do not build both.
+DO, in this order:
+1. THE FIRST MEASUREMENT, before any code (section 3.2 says why it decides the scope): reserve sizes with
+   q8_0 KV at -ub 8 vs -ub 2048, and with -ctk/-ctv f16 as the control, at ctx 204800 on the 4B (and the
+   27B if it is quick).  Reconcile the scratch against ggml_nelements(K)*2 + ggml_nelements(V)*2.  If the
+   ~832 MiB also shows up at -ub 8, TILE is the blocking kernel for the reservation and must be fixed
+   together with MMA (the verify batches select TILE; VEC is already scratch-free for quantized KV).
+   Tools: wip/qwen4exp/qsa-memory/tools/bufsize.sh (drop its GGML_CUDA_FA_WMMA_256=0).
+2. Implement dequant-on-stage for q8_0 ONLY, keep need_f16_K/V true for every other type, keep use_sparse
+   out.  Touch points: ggml_cuda_flash_attn_ext_get_alloc_size (fattn.cu:694), launch_fattn
+   (fattn-common.cuh:976 - the to_fp16 conversions), the MMA loader flash_attn_ext_f16_load_tile
+   (fattn-mma-f16.cuh:368, K at 692/1029/1385, V at 672/1045) and the TILE loaders if step 1 says they are
+   in the reservation.  cp_async is impossible for a quantized source - measure what that costs instead of
+   assuming.
+3. Validate with the D9 three-way rule: same-seed text byte-identical with the gate flipped in ONE binary
+   (4B, 27B, gemma-4-E4B as the SWA case, qwen4exp as the control); the reserve matrix (expect -832 MiB
+   with q8_0, exactly 0 with f16); MTP acceptance >= 0.45 and unchanged; INTERLEAVED bench parity
+   (pp20480 ub 2048/1024, tg256, 5 passes - single-pass noise is ~0.5 %); test-backend-ops FLASH_ATTN_EXT
+   on CPU + ROCm0.  No prefill regression -> on by default; some regression -> opt-in default-off; bad
+   enough to be useless as opt-in -> document and stop (3.2 says so explicitly).
+4. Snapshot each finished slice as its own patch (.../arch-independent-memory/patches/0006-*.patch) with
+   the documented worktree recipe (base = W1+W2+diag+2a+2b+2c+... - see section 6), never commit on the
+   fork branch, never push.  If the budget runs out, STOP at a buildable checkpoint, confirm coherence is
+   unchanged, snapshot, and update HANDOVER section 3.2 + section 9.
 
-Report at the end: what landed, the gate table with defaults, the measured before/after reserves and
-throughput, what was not validated, and the updated state in HANDOVER.md.
+DO NOT: cut Block 15 before V4 is decided (it is the next session's job or the one after), touch
+archive/work/, or present wip results as delivery claims.
+
+REPORT: what landed (with the reserve numbers before/after and the coherence evidence), the gate name +
+default and its measured justification, what was not exercised and why, and the updated fork-tree /
+snapshot state.
 ```
 
 ## 9. Open questions
 
-None outstanding — the maintainer answered all three on 2026-09-10: V3 includes 3.2 (D7), the beta
-checklist exists (`BETA-TESTING.md`, D8), and V4 follows the three-way ship rule (D9).  Two things are
-decided *at implementation time* rather than now: the exact V4 gate name and its default (measurement
-decides on/opt-in), and whether V3 phase 3.3 (M-RoPE) is cheap enough to include — alibi stays on the
-packed mask either way.
+V4 is the only remaining item and it carries two questions that the first measurement answers (do not
+decide them by reasoning):
+
+1. **Which kernel drives the reserved scratch?** If the ~832 MiB is present at `-ub 8` too, TILE is the
+   blocking kernel and V4 cannot shrink the reserve without fixing TILE as well as MMA (section 3.2).
+2. **What is V4's default?** On unless it costs prefill throughput; opt-in default-off otherwise; and
+   *which* KV types it covers (q8_0 first, the rest only if the first increment is cheap) - the
+   three-way rule (D9) decides.
+
+One V3 question is left open deliberately: the source of the measured **-1.1 % prefill** (kernel
+registers from the derived branch in `flash_attn_ext_f16_load_mask` vs the smaller reserved buffer
+changing the graph's buffer layout - the mask bytes themselves account for ~1 ms of ~3 s).  It is
+documented, not a blocker, and V4 rewrites that same loader anyway.
+
+Everything else is answered: W4 = option C (a revert patch for A/B), V3 includes 3.2 (D7), the beta
+checklist exists (`BETA-TESTING.md`, D8), V4 follows the three-way ship rule (D9), and V3 phase 3.3
+(M-RoPE) is **not** included - the degeneracy guard is the delivered behaviour, and the phase-1 oracle
+only has to be re-run if the predicate is ever extended.
