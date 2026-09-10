@@ -278,6 +278,22 @@ whatever the KV type is).
 q8_0 cache (27B at ctx 204800: ~54 GB bf16 vs ~28.5 GB q8_0 across 3 GPUs), and no amount of V4 work
 changes that - the compute-buffer scratch is ~712 MiB of it, the rest is the format choice.
 
+**Where this gap comes from (so it does not look like a BF16 regression)**: block 03 ("BF16 KV cache and
+native-BF16 flash-attn") implemented native BF16 for the **tile** kernel (`v_dot2_f32_bf16` packed dot,
+bf16 PV pairing, bf16 tiles/registers), the **vec** kernel and bf16 RoPE/set_rows - `fattn-mma-f16.cuh`
+has **zero** bf16 references to this day, and block 03's own `fattn.cu` hunk added the `use_bf16` arm only
+to `BEST_FATTN_KERNEL_TILE`, deliberately leaving `BEST_FATTN_KERNEL_MMA_F16: need_f16_K = true`.  Before
+block 04 the AMD WMMA arm was capped at head <= 128, so the 256-wide-head models (4B, 27B, gemma-4)
+prefilled on the tile kernel and consumed bf16 natively - no staging.  **Block 04 (RDNA4 WMMA) extended
+WMMA to head 576 (RDNA4/RDNA3_0) / 320 (RDNA3_5), which is what moved those models' prefill onto the
+F16-operand WMMA kernel** and made the whole-cache F16 staging appear for bf16.  So the trade introduced
+was "+WMMA prefill speed" for "+one ctx-linear F16 scratch", and V4-bf16 is the way to keep both.
+
+Coupling worth knowing: V3's derived mask needs the MMA kernel, and (for bf16) the MMA kernel needs the
+staging - so today a bf16 user can have **either** the mask win (WMMA on: 808.70 MiB at ctx 163840 /
+ub 2048, no mask, staging) **or** native bf16 prefill (WMMA off via `GGML_CUDA_FA_WMMA_256=0`: 896.06,
+mask back, no staging), but not both.  V4-bf16 gives both (~257 MiB, activations only).
+
 **Block numbering**: if it lands before the Block-15 cut it belongs in Block 15 (same `GGML_CUDA_FA_KV_NATIVE`
 gate, one more arm); afterwards the "exactly one new block" rule needs a maintainer decision.
 
