@@ -1,9 +1,16 @@
-# RDNA3_5 (gfx1151) validation of the 15-block delivery — raw record (2026-09-10)
+# RDNA3_5 (gfx1151) validation of the 14-block delivery + the beta block-15 patch — raw record (2026-09-10)
 
 > Raw session record.  The delivery-facing summary/folds live in
-> `patches/README.md` (block-15 notes, "RDNA3_5 (gfx1151) validation"
-> subsection), `MANIFESTS.md`, `WORKLOG.md`, `beta/block-15-campaign-wins/`.
-> This file is the complete matrix; it is NOT part of the delivery set.
+> `patches/README.md` (block-14 notes; a short block-15 pointer), `MANIFESTS.md`,
+> `WORKLOG.md`, `beta/block-15-campaign-wins/`.  This file is the complete
+> matrix; it is NOT part of the delivery set.
+>
+> **Note (2026-09-10, after the session):** block 15 was un-promoted from
+> `patches/` by the maintainer — it was never meant to be a delivery patch
+> yet.  All references below to `patches/0015` / a "15-patch set" describe
+> the state during the pass; the amended block-15 patch now lives only in
+> `beta/block-15-campaign-wins/block-15-campaign-wins.patch` and is applied
+> manually on top of the 14-block delivery.
 
 ## Environment / state
 

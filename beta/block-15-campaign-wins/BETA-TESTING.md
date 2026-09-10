@@ -4,9 +4,9 @@ For beta testers with a machine that can build the Block-15 tree.  Purpose: conf
 memory wins on *your* models and hardware, and — if something looks wrong — isolate it to a single win
 without rebuilding five times.  Every win except W4 is switchable by environment variable.
 
-> **Status: OPEN — the beta window started 2026-09-10.**  Block 15 is cut and in the delivery
-> (`patches/0015-…`), and every row below was re-checked **as a combination** on the tree built from the
-> delivered patches (fresh worktree at `9113cc188`, strict 15/15 `git am`, fresh build): reserves,
+> **Status: OPEN — the beta window started 2026-09-10.**  Block 15 is **staged in this directory**
+> (`block-15-campaign-wins.patch`), **NOT in the delivery** (the delivery is the 14-block set), and every row below was re-checked **as a combination** on the tree built from the
+> beta patch on top of the delivered 14-block set (fresh worktree at `9113cc188`, strict 14/14 `git am` + the beta patch, fresh build): reserves,
 > byte-identical coherence on all five models, the MTP gate, and the op suites all reproduce.
 > V3 is **on by default** (`LLAMA_KQ_MASK_DERIVED`), V4 and V5 are **opt-in through one switch**
 (`GGML_CUDA_FA_KV_NATIVE=1`, V4 for q8_0 K/V, V5 for bf16 K/V — see the amendment note in `README.md`),

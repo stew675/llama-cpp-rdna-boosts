@@ -1,6 +1,6 @@
 # llama-cpp-rdna-boosts
 
-A delivery repo for a **15-patch set** of **RDNA3 / RDNA3.5 / RDNA4**
+A delivery repo for a **14-patch set** of **RDNA3 / RDNA3.5 / RDNA4**
 (ROCm) feature enhancements and performance fixes for llama.cpp:
 **blocks 01-11** (MTP, GDN, BF16 KV,
 WMMA flash-attn, fused core, k-quant boosts, CUDA prefill-graph skip),
@@ -22,17 +22,16 @@ HIP gate and the quantized-KV tensor-split gate (an upstream
 multi-GPU `SPLIT_MODE_TENSOR` abort for `q4_1`-family KV cache types —
 see
 [Current state](#current-state)) and
-**block 15** (attention-memory wins, cut 2026-09-10 — a derived kq mask
-(V3), opt-in native q8_0 K/V in the flash-attention kernels (V4), QSA
-score-chain/bias/indexer-cache pruning (W1-W3) and the ggml-alloc
-unused-view release (W4); ~3.4 GiB/GPU + ~1.2 GiB host reclaimed on
-qwen4exp and ~800 MiB/GPU + 800 MiB host on every dense model at ctx
-204800 — see [Current state](#current-state)).
+**block 15** (attention-memory wins — a derived kq mask (V3), opt-in
+native q8_0/bf16 K/V (V4/V5), QSA score-chain/bias/indexer-cache pruning
+(W1-W3) and the ggml-alloc unused-view release (W4)) is **NOT part of the
+delivery yet** — it is staged in `beta/block-15-campaign-wins/` and applied
+manually on top of the 14-block tree, pending the maintainer's go-ahead.
 The patches apply to a clean
 llama.cpp checkout at the recorded fork point `9113cc188` (re-based 2026-09-08 from `050dde50c`, itself re-based 2026-09-07 from `465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`).
 
 `scripts/apply-all.sh` automates the apply: it creates a fresh `rdna-boosts`
-branch and applies blocks 01-15 with `git am`, one commit each.
+branch and applies blocks 01-14 with `git am`, one commit each.
 
 ## Supported architectures
 
@@ -72,11 +71,12 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 
 ## Current state
 
-The current delivery is a **15-patch set** for llama.cpp at the fork
-point `9113cc188` (blocks 01-15 in `patches/`, applied with `git am` via
-`scripts/apply-all.sh`; block-15 tip `377f8e790` on the canonical fork
-(amended 2026-09-10 with V5 native bf16 K/V and the RDNA3_5/gfx1151 V3 fix)
-rebuilt at the fork point, cut 2026-09-10).  The set applies
+The current delivery is a **14-patch set** for llama.cpp at the fork
+point `9113cc188` (blocks 01-14 in `patches/`, applied with `git am` via
+`scripts/apply-all.sh`; canonical 14-block tip `ff2b35f49` rebuilt at the
+fork point).  **Block 15 (the attention-memory campaign) is staged in
+`beta/block-15-campaign-wins/` and is not delivered yet** -- the notes
+below are the beta record.  The set applies
 **whitespace-clean** (strict `git am`, no 3-way fallback) and each block
 is build- and coherence-verified — see [`MANIFESTS.md`](MANIFESTS.md)
 (apply order + verification contract), [`patches/README.md`](patches/README.md)
@@ -88,9 +88,10 @@ integrations, re-baselines, regenerations) are tracked as dated entries
 — newest first — in **[`WORKLOG.md`](WORKLOG.md)**; the current-state
 summary below is deliberately short and does not repeat them.
 
-- **Latest entry (2026-09-10): block 15 cut — the attention-memory
-  campaign wins (tip `377f8e790` on `9113cc188`; amended 2026-09-10 with
-  V5 native bf16 K/V and the RDNA3_5/gfx1151 V3 fix).**  Seven validated wins
+- **Latest entry (2026-09-10): block 15 (attention-memory campaign) is
+  STAGED in `beta/block-15-campaign-wins/`, NOT part of the 14-patch
+  delivery** (beta patch tip `377f8e790`; V5 native bf16 K/V and the
+  RDNA3_5/gfx1151 V3 fix amended in).  Seven validated wins
   in one block, each with an environment A/B gate (V4 is opt-in):
   **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived
   QSA per-block bias + visibility + the input-fill null guards
@@ -163,8 +164,8 @@ summary below is deliberately short and does not repeat them.
 ├── BASELINE.md            # fork point, patch provenance, drift policy
 ├── GREEDY-PURITY.md       # block 10 decode-variance analysis (read before shipping)
 ├── WORKLOG.md             # dated delivery records (newest first; README points here)
-├── rdna-boosts-all.patch  # convenience: the entire 15-patch net as ONE patch
-├── patches/               # the delivery set: 0001-0015
+├── rdna-boosts-all.patch  # convenience: the entire 14-patch net as ONE patch
+├── patches/               # the delivery set: 0001-0014
 │   └── README.md          # apply instructions + block-12 env knobs + server config
 ├── scripts/
 │   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift)
@@ -181,7 +182,7 @@ summary below is deliberately short and does not repeat them.
 > in `archive/docs/` (see also `archive/work/` for the closed experiments).
 > Do not mix them with the current `patches/` files.
 
-## The 15 blocks
+## The 14 blocks
 
 | patch | what |
 |-------|------|
@@ -199,7 +200,11 @@ summary below is deliberately short and does not repeat them.
 | `0012` | **hybrid HIP all-reduce** — custom internal AR for the small-tensor decode path, per-size hybrid dispatch vs RCCL, RDNA4-only gate (bounded in-kernel spin since 2026-08-30 fix round; builds without RCCL) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** — prefill fused expert MMQ (RDNA4 + RDNA3_5 + RDNA3_0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K, env opt-out `GGML_CUDA_DISABLE_MOE_MMQ_FUSION`) + decode item-split (rpb 2/4/8) merged with the upstream has_fusion mmvq path |
 | `0014` | **qwen4exp / Qwen3.8-Flash-Next support** — QSA sparse FA (default) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy (promoted from `beta/qwen4exp`; see `patches/README.md` block-14 notes) |
-| `0015` | **attention-memory wins (block 15)** — derived kq mask (V3, on by default), opt-in native q8_0 K/V in the FA kernels (V4, `GGML_CUDA_FA_KV_NATIVE`, default off), QSA score-chain/bias/visibility/indexer-cache pruning (W1-W3) and the ggml-alloc unused-view release (W4); ~3.4 GiB/GPU + ~1.2 GiB host reclaimed on qwen4exp, ~800 MiB/GPU + 800 MiB host on dense models; byte-identical output, ~1.3 % prefill / ~0.3 % decode cost (beta-staged in `beta/block-15-campaign-wins/`; see `patches/README.md` block-15 notes) |
+
+> **Block 15 (attention-memory wins: V3 derived kq mask, V4/V5 native
+> q8_0/bf16 K/V, W1-W4) is NOT part of this delivery — it is staged in
+> `beta/block-15-campaign-wins/` and applied manually on top of the
+> 14-block tree, pending the maintainer's go-ahead.**
 
 > **Greedy-purity note (read before shipping):** on the K-split decode
 > paths, block 10 (`0010`) is the only patch that changes decode numerics on
@@ -228,7 +233,7 @@ git checkout 9113cc188        # the SHA recorded in patches/README.md
 
 # 2. apply the set (automated; VERIFIED 2026-08-29, re-verified 2026-09-01/02/05/06/07 and 2026-09-08)
 bash <path-to-this-repo>/scripts/apply-all.sh .
-#    = git am patches/0001…0015  (one commit per block on a fresh `rdna-boosts` branch)
+#    = git am patches/0001…0014  (one commit per block on a fresh `rdna-boosts` branch)
 
 # 3. build + verify (trim -DGPU_TARGETS to your GPU arch for a faster build)
 cmake -B build -DGGML_HIP=ON -DGGML_HIP_RCCL=1 -DGPU_TARGETS="gfx1100;gfx1151;gfx1201" -DCMAKE_BUILD_TYPE=Release
@@ -245,8 +250,8 @@ cmake --build build -j
 ### Manual equivalent
 
 ```bash
-git am patches/000[1-9]-*.patch patches/001[0-5]-*.patch   # blocks 01-15
-git add -A && git commit -m "rdna-boosts: block 15: campaign memory wins"
+git am patches/000[1-9]-*.patch patches/001[0-4]-*.patch   # blocks 01-14
+git add -A && git commit -m "rdna-boosts: block 14: qwen4exp support"
 ```
 
 ## When upstream master moves

@@ -1,7 +1,7 @@
 # WORKLOG — dated delivery records
 
 Reverse-chronological log of every delivery-affecting change to the
-**rdna-boosts 15-patch set** (block amendments, community-fix
+**rdna-boosts 14-patch set** (block amendments, community-fix
 integrations, re-baselines, regeneration + clean-apply re-verifications).
 Newest entry first.  The README's
 [Current state](README.md) section is a lean summary and points here
@@ -10,13 +10,28 @@ for the full record; per-block technical notes live in
 
 ---
 
-- **RDNA3_5 (gfx1151) validation of the 15-block set; V3 iGPU enablement + multi-stream
-  guard folded into `0015` (2026-09-10, single Strix Halo, ROCm 7.14).**  The first
+- **Block 15 un-promoted from the delivery — it belongs only in `beta/block-15-campaign-wins/`
+  (2026-09-10).**  Block 15 was promoted into `patches/0015` by mistake; the maintainer never
+  approved cutting it as a delivery patch.  The delivery is a **14-patch set** again
+  (`patches/0001`-`0014`, canonical tip `ff2b35f49`), `scripts/apply-all.sh` and
+  `scripts/make-patches.sh` are back to 14 blocks, `rdna-boosts-all.patch` is the 14-block net,
+  and the docs/headers no longer present Block 15 as delivered.  The block-15 work (including
+  the 2026-09-10 V5 and RDNA3_5/gfx1151 amendments) continues to live only in
+  `beta/block-15-campaign-wins/block-15-campaign-wins.patch` and is applied manually on top of
+  the 14-block tree, pending the maintainer's promotion go-ahead.  The `0001`-`0014` bodies are
+  unchanged from the promoted set; only the `From <sha>` line and the `[PATCH NN/15]` →
+  `[PATCH NN/14]` series count differ.  Clean-apply sim: fresh worktree at `9113cc188` +
+  `apply-all.sh` → strict 14/14 `git am`, zero whitespace warnings, applied tree `6ce36849` ==
+  the canonical 14-block tree.  (The dated entries below that say "cut" / "15-patch" record the
+  promotion as it happened; this entry reverses it.)
+
+- **RDNA3_5 (gfx1151) validation of the 14-block delivery + the beta block-15 patch; V3 iGPU enablement + multi-stream
+  guard folded into the beta block-15 patch (2026-09-10, single Strix Halo, ROCm 7.14).**  The first
   single-device iGPU run of the delivery (Radeon 8060S, `VMM: no`, 1 device).  Block-14
   masked-V fixes, V3 derived mask, V4 native q8_0 and V5 native bf16 were exercised with
   a BF16 KV cache in both arm states, per the sign-leak campaign matrix.  Two V3
-  regressions found and fixed as a dated amendment to `patches/0015` (other 14 patches
-  untouched; amended canonical tip `377f8e790`):
+  regressions found and fixed as a dated amendment to the **beta** block-15 patch (the delivery
+  stays 14 patches; beta patch tip `377f8e790`):
   1. the derived-mask probe rejected `GGML_BACKEND_DEVICE_TYPE_IGPU`, so V3 was silently
      disabled on the HIP iGPU and its ~800 MiB compute + ~800 MiB host win was lost;
      `ggml_backend_dev_is_cuda()` / `ggml_backend_dev_implements_kq_derived()` now accept

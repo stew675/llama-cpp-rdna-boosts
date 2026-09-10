@@ -4,14 +4,13 @@
 > 2026-09-10, the merge/gate/validate/cut steps, the state inventory and the open questions.
 > This file is the reference: inventory, gate audit, validation protocol, reference numbers.
 
-**Status: BETA — cut and staged (2026-09-10).**  The campaign is complete and
-Block 15 is now the 15th delivery patch: `patches/0015-rdna-boosts-block-15-campaign-memory-wins.patch`
-(this directory's `block-15-campaign-wins.patch` is the same file).  The
-beta window (~4–5 days) **opens now**; promotion into the delivery set is
-already done in the sense that the patch is in `patches/` and applies with
-the rest (`scripts/apply-all.sh`, strict 15/15 `git am`) — the window is
-for tester feedback before the block is declared stable and this README is
-turned into the final promotion record.  All seven wins are on by default
+**Status: BETA — staged, NOT promoted (2026-09-10).**  The campaign is
+complete and the block-15 patch lives **only in this directory**
+(`block-15-campaign-wins.patch`); it is **not part of the delivery**
+(`patches/` is the 14-block set) and is applied manually on top of the
+14-block tree.  The beta window (~4–5 days) is open for tester feedback;
+promotion into the delivery set requires the maintainer's go-ahead (at
+which point `scripts/apply-all.sh` becomes a 15-block flow).  All seven wins are on by default
 except **V4 and V5, which are opt-in through the same switch**
 (`GGML_CUDA_FA_KV_NATIVE=1`; see the gate table below) — the policy
 exception the maintainer approved on 2026-09-10 (a sub-2 % prefill loss
@@ -26,16 +25,16 @@ scratch, so with the switch on it costs exactly what an f16 cache costs
 gemma-4-E4B 1062.89 → **404.89**, gemma-4-31B 2068.89 → **716.89**;
 ub 1024/512 win 756/778 on the 4B and 746 on the 27B; qwen4exp unchanged)
 for 0.2–2.4 % prefill depending on prompt length, decode untouched.  The
-amendment touched `patches/0015` only (`0001`–`0014` stayed byte-identical)
-and was re-validated end to end from the delivered patches — see the V5
-amendment section in `../../patches/README.md` and §3.4/§9 of
+amendment touched only this directory's `block-15-campaign-wins.patch`
+and was re-validated end to end — see §3.4/§9 of
 `../../wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`.
 
-**Beta start: 2026-09-10.**  Canonical tip `f5ab5350b` (the block-15 commit,
-amended in place with V5; the original cut was `09a137566`) on a fork
-rebuilt at `9113cc188` (the reference `~/llama.cpp` checkout had drifted two upstream
-master commits past the fork point at cut time; always regenerate from a
-canonical fork rebuilt at the fork point — see `../../BASELINE.md`).
+**Beta start: 2026-09-10.**  The beta patch tip is `377f8e790` (block 15,
+amended with V5 and the RDNA3_5/gfx1151 V3 fix; the original cut was
+`09a137566`, then `f5ab5350b`).  It applies on top of the 14-block
+delivery built at the fork point `9113cc188` (always regenerate the
+delivery from a canonical fork rebuilt at the fork point — see
+`../../BASELINE.md`).
 The result: **3.44 GiB/GPU + 1.2 GiB host** reclaimed on qwen4exp at ctx
 204800 / ub 2048 / q8_0 KV (6690.40 → 3251.39 MiB/GPU compute, 1262.70 →
 63.69 MiB host, indexer KV 956.26 → 318.76 MiB/GPU), **800 MiB/GPU + 800
@@ -45,8 +44,8 @@ acceptance and a ~1.3 % prefill / ~0.3 % decode default cost.
 
 **Validation as a combination** (the important part: the per-win records do
 not carry over) was completed on 2026-09-10 both on the merged work tree and
-again on the tree built from the **delivered patches** (fresh worktree at
-`9113cc188`, `apply-all.sh`, strict 15/15 `git am`, fresh build):
+again on the tree built from the **beta patch on top of the delivered 14-block set** (fresh worktree at
+`9113cc188`, `apply-all.sh` (14/14) + the beta patch, fresh build):
 
 | check | result |
 |---|---|
@@ -55,7 +54,7 @@ again on the tree built from the **delivered patches** (fresh worktree at
 | adaptive-MTP gate | 27B 0.76744 (66/86, mean 3.28) **identical in all four gate combinations**; qwen4exp 0.44262 (54/122) identical in all six and equal to the block-14 baseline; MTP +26 % over plain decode |
 | op suites | `FLASH_ATTN_EXT` on ROCm0 (both V4 gates) + CPU (incl. the six derived cases), VIEW/CONT/CPY/DUP/CONCAT, `test-alloc`, `test-batch-alloc`: all pass; W4 repro 56.00 → 16.00 MiB and the revert restores `ggml-alloc.c` byte-identically |
 | prefill cost (interleaved same-binary A/B, pp20480/ub 2048) | V3 −1.28 % (4B) / +0.28 % (27B); V4 a further −1.85 % (4B) / −1.72 % (27B); decode within noise |
-| clean-apply simulation | fresh worktree at `9113cc188` + `scripts/apply-all.sh` (15/15 strict) + fresh gfx1201 build: reserves, coherence, MTP and op suites all reproduced |
+| clean-apply simulation | fresh worktree at `9113cc188` + `scripts/apply-all.sh` (14/14 strict) + the beta patch + fresh gfx1201 build: reserves, coherence, MTP and op suites all reproduced |
 | **RDNA3_5 (gfx1151) pass** (2026-09-10, single Strix Halo, ROCm 7.14; amendment to `0015`, tip `377f8e790`) | two V3 regressions found and fixed — the derived probe rejected `GGML_BACKEND_DEVICE_TYPE_IGPU` (V3 silently off) and `n_seq_max > 1` aborted in `ggml_flash_attn_ext_add_kq_derived` (`kq_mask_derivable()` now rejects `n_stream != 1`; `IGPU` accepted).  After the fix the reserves reproduce the RDNA4 numbers exactly (4B V3 −799.20 compute/−799.21 host, V5 bf16 968.86→256.86, V4 q8_0 1001.13→257.13; 27B 488.86 / 1072.86→488.86 / 1121.13→489.13; Flash-Next W on 3251.39/63.69, indexer 318.76); 14 ROCm + 7 Vulkan gates PASS 16/16, V3/arm byte-identical over 2064-cell pairs, probes clean in both arms on both backends, FLASH_ATTN_EXT 4596/4596 ROCm0 + 7859/7859 CPU, MTP identical (27B 0.79762, Flash-Next draft 0.52727); `--parallel 4` serving restored.  Arm cost lower than RDNA4: V5 −0.4…−0.9 %, V4 **+2.6 %** at pp20480, decode ±0.1 %.  Raw record `../../wip/strix-halo/GATE-2026-09-10-block15-rdna35.md`. |
 
 **Found during the combination pass and documented, not fixed** (out of
@@ -66,7 +65,7 @@ layer`; every other model is unaffected.  (Also caught and fixed before
 the cut: the W3 gate was initially wired with inverted polarity — that is
 why the combination pass exists.)
 
-## 1. Inventory (all validated, all now in `patches/0015`)
+## 1. Inventory (all validated, all now in `block-15-campaign-wins.patch`)
 
 | # | win | source | measured effect | validated on |
 |---|---|---|---|---|
@@ -77,7 +76,7 @@ why the combination pass exists.)
 | V3 | **derived kq mask** (the packed `n_kv × n_tps` F16 mask and its host mirror are no longer materialised; the MMA FA kernel derives visibility from compact per-cell state) | `wip/arch-independent-memory/patches/0003` (engine: op + CPU reference) + `0004` (CUDA MMA kernel) + `0005` (graph plumbing + backend probe + enable) | compute **−799.20 MiB/GPU** and host **−799.21 MiB** at ctx 204800/ub 2048 (4B 1800.33 → 1001.13 / 840.34 → 41.13; 27B 1920.33 → 1121.13 / 880.34 → 81.13; gemma-4-E4B ISWA −809/−809; gemma-4-31B −811/−811; scaling exactly `n_kv × n_tps × 2 B`); coherence byte-identical incl. both SWA gemmas and 40k prompts; MTP identical (0.76744); **ON BY DEFAULT** (`LLAMA_KQ_MASK_DERIVED=0` forces the packed mask); cost prefill −1.1 %, decode −0.7 % | 4B/27B/gemma-4-E4B/gemma-4-31B/qwen4exp + `test-backend-ops` FLASH_ATTN_EXT (6 derived cases on CPU, 3 on ROCm0, full suite) + the phase-1 host oracle |
 | V4 | **native q8_0 K/V in the FA kernels** (dequantize while staging the shared tiles; the whole-cache F16 staging scratch and its per-ubatch conversion pass are gone for q8_0) | `wip/arch-independent-memory/patches/0006-v4-native-q8-kv.patch` (6 files, +357/−47, base = W1+W2+V3) | compute **−744 MiB/GPU on the 4B** (1001.13 → 257.13) and **−632 MiB on the 27B** (Meta 1121.13 → 489.13) at ctx 204800/ub 2048, more at smaller ub (4B ub 1024 −772, ub 512 −786; gemma-4-31B −1224); qwen4exp control unchanged; coherence byte-identical (4B/27B/both gemmas/qwen4exp, incl. 40k prompts and the TILE ub-8 path); MTP acceptance identical (0.76744); **OPT-IN** (`GGML_CUDA_FA_KV_NATIVE=1`, default off) - cost prefill −1.7 %, decode ±0.1 % | same matrix + `test-backend-ops` FLASH_ATTN_EXT with both gates |
 
-### 1b. Block 15 is CUT (2026-09-10) — the wins are in `patches/0015`
+### 1b. Block 15 is CUT (2026-09-10) — the wins are in `block-15-campaign-wins.patch`
 
 | id | what | expected effect (dense models, ctx 204800, ub 2048, q8_0 KV) | spec |
 |---|---|---|---|
@@ -141,7 +140,7 @@ the cache-level ones).
 ## 5. Open questions for the maintainer — ALL RESOLVED 2026-09-10
 
 1. **W4 in two places?** — **RESOLVED: both.**  W4 ships in Block 15
-   (`patches/0015`) *and* stays staged in `upstream/UPSTREAM-PR-ggml-alloc-unused-view.{md,patch}`;
+   (`block-15-campaign-wins.patch`) *and* stays staged in `upstream/UPSTREAM-PR-ggml-alloc-unused-view.{md,patch}`;
    the upstream-drop check on 2026-09-10 (against `9cf3bf256`, GitHub
    unreachable from this host) confirmed it is still absent upstream, so
    nothing is dropped at this regeneration.  **A1 is also staged now**:
@@ -165,7 +164,7 @@ the cache-level ones).
 4. **Beta tester material.** — **RESOLVED: yes**, `BETA-TESTING.md` in this
    directory (gate table, the three measurements, the report template).
 5. **Naming.** — **RESOLVED:** the slug is `campaign-memory-wins` →
-   `patches/0015-rdna-boosts-block-15-campaign-memory-wins.patch`
+   `block-15-campaign-wins.patch`
    (this directory keeps the `block-15-campaign-wins` name it was created
    with).
 
@@ -200,4 +199,4 @@ Dense controls (no qwen4exp involved; block 15 measured with V3 on): Qwen3.5-4B-
 **1001.13/41.13** (V4 on: 257.13) and Qwen3.8-27B-Q8_0 **1121.13/81.13** (V4 on: 489.13) at ub2048
 (the pre-block-15 values 1800.33/840.34 and 1920.33/880.34 are the V3-off states).  Block 15 must
 leave the V3-off numbers unchanged and the V3-on numbers as above — both were re-measured from the
-delivered patches on 2026-09-10.
+the beta patch on top of the 14-block tree on 2026-09-10.

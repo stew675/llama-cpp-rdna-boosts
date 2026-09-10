@@ -1,9 +1,9 @@
 # Block 0015 handover — campaign wins → beta delivery (+ upstream candidates)
 
 > **STATUS 2026-09-10 (end of the cut session): DONE — Block 15 is CUT and
-> in the delivery.**  `patches/0015-rdna-boosts-block-15-campaign-memory-wins.patch`
+> in the delivery.**  `block-15-campaign-wins.patch`
 > (canonical tip `09a137566` on a fork rebuilt at `9113cc188`), 15 patches
-> total, `scripts/apply-all.sh` applies them with strict 15/15 `git am`,
+> total, `scripts/apply-all.sh` applies the 14-block delivery with strict 14/14 `git am` (the beta block-15 patch is applied on top),
 > `rdna-boosts-all.patch` refreshed.  The combination validation is complete
 > (reserve matrix, byte-identical coherence on all five models, the MTP gate,
 > the op suites) on both the merged tree and the tree built from the delivered
@@ -44,7 +44,7 @@
 | D7 | **V3 includes phase 3.2 (SWA coverage)** — wider coverage is required precisely so that *other* models do not regress; the mask work must not leave SWA models on a different (or unvalidated) path. |
 | D8 | **Beta tester material: yes** — `BETA-TESTING.md` in this directory (one-page A/B checklist: gate table, the three measurements, the report template, what not to report). |
 | D9 | **V4 ship rule (three-way)**: no prefill-throughput regression → on by default; regression → ship it **opt-in (default off)** for people who need the last 832 MiB, with the trade-off documented; if even that is impractical → future work.  **Applied 2026-09-10**: the q8_0 arm measured −1.7 % prefill, so it ships **opt-in** (`GGML_CUDA_FA_KV_NATIVE=1`); and the maintainer's refinement of D9 is that **a sub-2 % loss with a memory win and no cheap way to close the gap ships opt-in anyway** (do not grind for the last percent). |
-| D11 | **gemma-4-E4B 3-GPU tensor-split abort (2026-09-10): document only, do NOT fix.**  The pre-existing meta-splitter abort found during the Block-15 combination pass (`n_head_kv = 2` is fewer than the 3 devices, so one device gets a zero-extent KV share) stays a documented limitation.  Rationale: it is a small model and running it in 3-GPU tensor-split mode is an unlikely configuration; it runs on 1 GPU, on 2 GPUs and on 3 GPUs with `-sm layer`.  See `../../patches/README.md` (block-15 section). |
+| D11 | **gemma-4-E4B 3-GPU tensor-split abort (2026-09-10): document only, do NOT fix.**  The pre-existing meta-splitter abort found during the Block-15 combination pass (`n_head_kv = 2` is fewer than the 3 devices, so one device gets a zero-extent KV share) stays a documented limitation.  Rationale: it is a small model and running it in 3-GPU tensor-split mode is an unlikely configuration; it runs on 1 GPU, on 2 GPUs and on 3 GPUs with `-sm layer`.  See `README.md` (this directory). |
 | D12 | **bf16-native MMA K/V is the one essential follow-up (2026-09-10) — CLOSED the same day: shipped as V5**, a dated amendment to Block 15 (D5/D10), not a new block.  The maintainer's instruction when the measurement said it costs ~1 % prefill: *"treat it similarly to V4, and include it in the Patch 15 block, and have it gated by the same environment variable that V4 does"* — so V5 lives behind `GGML_CUDA_FA_KV_NATIVE` (default 0).  Plan + outcome: `../../wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md` (the plan, then **§9 the outcome**); the delivered record is the V5 amendment section in `../../patches/README.md`. |
 | D10 | **bf16 (2026-09-10): no pure-bf16 rework.**  llama.cpp is predicated on F16 as the always-available default, so the fork keeps the F16 compute path; bf16 K/V work must remove the *staging* (convert in place, keeping the F16 fragments and the cp_async pipeline), **not** re-instantiate the kernels natively.  A pure-bf16 fork is explicitly out of scope for now.  See §3.4. |
 
@@ -261,7 +261,7 @@ cut, and staged in `beta/` to open the ~4–5 day beta window.  See §5.
 ### 3.4 The next memory lever: bf16-native MMA K/V — **DONE: shipped as V5** (`../../wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md` §9)
 
 > **Status: implemented, validated and folded into Block 15 on 2026-09-10** (the
-> amendment touched `patches/0015` only; canonical tip `f5ab5350b`).  A bf16 KV
+> amendment touched `block-15-campaign-wins.patch` only; canonical tip `f5ab5350b`).  A bf16 KV
 > cache with `GGML_CUDA_FA_KV_NATIVE=1` now costs exactly what an f16 cache costs
 > (4B 968.86 → **256.86** MiB/GPU at ub 2048, 27B 1072.86 → **488.86**,
 > gemma-4-E4B 1062.89 → **404.89**, gemma-4-31B 2068.89 → **716.89**), with
@@ -392,7 +392,7 @@ notes (inconsistency + crash path + how the fork found it while pruning masks).
    in `README.md` (beta start date, gate table, validation results).  Beta window ~4–5 days.
 6. **Upstream-drop check** before shipping: if upstream merged W4 (or another `upstream/` entry), drop
    that hunk from Block 15 and note it in WORKLOG.
-7. **Promotion** (after the window): `patches/0015-…`, `apply-all.sh`, `make-patches.sh` tip,
+7. **Promotion** (after the window): promote `block-15-campaign-wins.patch` to `patches/0015-…`, bump `apply-all.sh`/`make-patches.sh` to 15 blocks,
    `MANIFESTS.md`/`README.md`, WORKLOG, beta README marked PROMOTED.  Campaign closed.
 
 ## 6. State inventory
@@ -504,7 +504,7 @@ byte-identical same-seed coherence (bf16 vs f16 vs gate off, short + 40k prompts
 interleaved same-binary prefill/decode A/B (pp20480 ub 2048 + tg256, 4B and 27B) to decide the default
 per the plan's three-way ship rule (expectation: on by default, since the cp_async pipeline is kept).
 
-Then: fold the result into the delivery as a dated block-15 amendment (patches/0015 regenerated from a
+Then: fold the result into the delivery as a dated block-15 amendment (the beta patch regenerated from a
 CANONICAL fork rebuilt at 9113cc188 via scripts/apply-all.sh - never from the working checkout's
 rdna-boosts tip, which sits two upstream commits past the fork point), update patches/README.md +
 WORKLOG.md + the beta record, re-run the clean-apply simulation, and stage the beta patch copy.  If the
