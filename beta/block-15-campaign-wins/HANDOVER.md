@@ -98,17 +98,27 @@ plus perf tuning.
 > reduces to a per-token visibility floor `lo`** (`STANDARD`: `p1-n_swa+1`; `CHUNKED`: the chunk
 > start; `SWA_FULL`: `min(lo, seq_pos_min)`), so 3.2 costs nothing beyond that host-side floor.
 
-> **PHASE 2a+2b ARE DONE (2026-09-10).**  The engine half (the `ggml_flash_attn_ext_add_kq_derived`
-> op + a real CPU reference) and the CUDA half (the shared `fattn_kernel_t` now carries the three
-> derived pointers, the MMA mask loader derives 0/-INFINITY per cell, `has_mask` keeps the
-> kernel-selection policy identical, and `supports_op` rejects a derived op unless the best kernel is
-> the MMA one) are implemented, and 2b is **validated on its own**: six new derived
-> `test-backend-ops FLASH_ATTN_EXT` cases pass 6/6 on CPU and 3/3 on ROCm0 (the other three pick the
-> VEC/TILE kernel and are correctly rejected), the whole FLASH_ATTN_EXT suite is 5104/5104 on ROCm0,
-> and the fork tree's coherence is byte-identical with the code in place but no caller yet.  Patches
-> `wip/arch-independent-memory/patches/0003-*` (engine) and `0004-*` (MMA kernel); details and the
-> remaining work in `V3-DERIVED-KQ-MASK-PLAN.md` §4.  What is left is **phase 2c** — the graph
-> plumbing, the backend probe/gate and the end-to-end validation bar (items 1-7 below).
+> **PHASE 2C IS DONE (2026-09-10) — V3 IS COMPLETE AND ON BY DEFAULT.**  The graph plumbing (a new
+> `llm_graph_input_kq_derived`, `build_attn_inp_kq_mask` as a context method with an `allow_derived`
+> flag, the substitution in `build_attn_mha`), the backend probe (`LLM_FUSED_OP_FLASH_ATTN_DERIVED`,
+> requiring a CUDA/HIP-or-Meta GPU device and that the probe graph really contains the derived node)
+> and the `LLAMA_KQ_MASK_DERIVED` gate landed as `patches/0005-*` (6 files, +487/-45).  The key design
+> decision: **the packed mask tensor is still created in every graph** - it just ends up with no
+> consumer on the derived path, so the gallocr leaves it unallocated and the two existing
+> `buffer != nullptr` fill guards skip the per-ubatch fill.  Any other consumer (deepseek4's bias
+> concat, minimax-m3's msa_kqm, qwen4exp's indexer) therefore keeps the mask materialized
+> automatically - there is no model-level allowlist to keep in sync and no way to mis-serve a
+> consumer.  Measured (ctx 204800 / ub 2048 / q8_0, one binary flipping the gate): **-799.20 MiB/GPU
+> and -799.21 MiB host** on the 4B and the 27B (3-GPU Meta), **-809/-809** on gemma-4-E4B (ISWA, both
+> masks), **-811/-811** on gemma-4-31B, scaling exactly as `n_kv x n_tps x 2 B` (ub 1024 -399/-399,
+> ub 512 -199/-199); coherence **byte-identical** on the 4B/27B/gemma-4-E4B (3k and 40k prompts); the
+> 27B MTP acceptance **identical at 0.76744**; qwen4exp unchanged (its probe correctly reports the
+> derived path is not used there).  Cost: prefill **-1.1 %** (pp20480/ub 2048, interleaved 5x) and
+> decode -0.7 % - the reserve is 799 MiB smaller, so against the delivered ub 1024 baseline the
+> derived ub 2048 is equal speed for 300 MiB less per GPU.  One crash was found and fixed
+> (`params.mctx` is the *memory* context - hybrid for most models in this fork - so the reuse check
+> must `dynamic_cast`, not `static_cast`).  Full record + the not-exercised list:
+> `V3-DERIVED-KQ-MASK-PLAN.md` §4.3-§4.5.
 
 **Scope it in phases; phase 3.1 alone captures the whole memory win for the dense text models.**
 

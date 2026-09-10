@@ -17,20 +17,24 @@ Reality pass: 2026-09-10.
   W3 keys-only QSA indexer cache (indexer KV 956.25 -> 318.75 MiB, box -1.9 GiB),
   W4 ggml-alloc unused-view release (repro 56.00 -> 16.00 MiB; **upstream-applicable, applies clean to
   master `9cf3bf256`**).
-- **V3 phases 1+2a+2b DONE (2026-09-10)**: the derived predicate (`cell_pos >= lo && cell_pos <= hi`,
-  with the SWA floor + a M-RoPE degeneracy guard) is **proven bit-exact on the host** against the
-  packed fill on the 27B dense prefill (n_tps=2048, 21 ubatches), gemma-4-E4B **ISWA both caches
-  (n_swa=512)**, the **non-causal** and **F32** paths, and small verify batches -- every record
-  `mismatches: core=0 ext=0`.  The engine (the `ggml_flash_attn_ext_add_kq_derived` op + a *real* CPU
-  reference, so `test-backend-ops` is an oracle) and the CUDA MMA derived path (threaded through the
-  shared `fattn_kernel_t`; `has_mask` keeps kernel selection identical; `supports_op` rejects a
-  derived op unless the best kernel is MMA) are implemented and **validated on their own**: 6/6
-  derived `FLASH_ATTN_EXT` cases on CPU, 3/3 on ROCm0, 5104/5104 on the whole FA suite on ROCm0, tree
-  coherence byte-identical with the code in place but no caller yet.  **Remaining: phase 2c** (the
-  graph plumbing + the backend probe + the end-to-end validation bar).  Spec + progress:
-  `wip/arch-independent-memory/V3-DERIVED-KQ-MASK-PLAN.md` §4 (oracle:
-  `wip/arch-independent-memory/patches/0002-DIAGNOSTIC-...patch`; patches `0003-*` engine, `0004-*`
-  MMA kernel; logs in `.../logs/`).
+- **V3 DONE (2026-09-10, phases 1+2a+2b+2c), ON BY DEFAULT**: the derived predicate (`cell_pos >= lo &&
+  cell_pos <= hi`, with the SWA floor + a M-RoPE degeneracy guard) is **proven bit-exact on the host**
+  against the packed fill on the 27B dense prefill, gemma-4-E4B **ISWA both caches**, the **non-causal**
+  and **F32** paths and small verify batches — every record `mismatches: core=0 ext=0`.  The engine (the
+  `ggml_flash_attn_ext_add_kq_derived` op + a *real* CPU reference, so `test-backend-ops` is an
+  oracle), the CUDA MMA derived path (threaded through the shared `fattn_kernel_t`), the graph plumbing
+  and the backend probe all landed as `wip/arch-independent-memory/patches/0002-DIAGNOSTIC` (oracle),
+  `0003` (engine), `0004` (MMA kernel) and `0005` (plumbing/probe/enable).  Key safety property: the
+  packed mask is still created in every graph and simply ends up with no consumer on the derived path,
+  so the allocator leaves it unallocated and the existing fill guards skip the fill — **no mask
+  consumer can ever be mis-served** and no model allowlist is needed.  **Measured** (ctx 204800 /
+  ub 2048 / q8_0, one binary flipping the gate): compute **−799.20 MiB/GPU** and host **−799.21 MiB**
+  on the 4B and the 27B (3-GPU Meta), **−809/−809** gemma-4-E4B (ISWA, both masks), **−811/−811**
+  gemma-4-31B, scaling as `n_kv x n_tps x 2 B` (ub 1024 −399, ub 512 −199); generated text
+  **byte-identical** derived vs packed on the 4B/27B/gemma-4-E4B (3k and 40k prompts); 27B MTP
+  acceptance **identical 0.76744**; qwen4exp unchanged (probe reports the derived path is unused
+  there).  Cost: prefill −1.1 % (pp20480/ub 2048, interleaved 5x), decode −0.7 %.  **V4 is the only
+  remaining campaign item.**
 - **Critical path: V3, then V4.**
   V3 = derived kq mask for the dense models (**-800 MiB/GPU VRAM + -800 MiB host** at ctx 204800 / ub 2048;
   phase 3.1 causal/occupancy/sequence in the prefill+MMA path with the packed mask kept for decode and

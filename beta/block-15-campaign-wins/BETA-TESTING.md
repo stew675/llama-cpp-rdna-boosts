@@ -4,7 +4,7 @@ For beta testers with a machine that can build the Block-15 tree.  Purpose: conf
 memory wins on *your* models and hardware, and — if something looks wrong — isolate it to a single win
 without rebuilding five times.  Every win except W4 is switchable by environment variable.
 
-> **Status: template.**  The W1–W3 rows are final (those wins are validated).  The V3/V4 rows are
+> **Status: template.**  The W1–W3 rows are final (those wins are validated).  The V3 rows are now
 > provisional until those land; a session that stages Block 15 must finalise the names/defaults here and
 > in `patches/README.md` **before** the beta window opens.
 
@@ -32,7 +32,7 @@ dense masked flash-attention path (the packed mask is then kept automatically).
 | `GGML_QSA_DERIVED_VIS` | `1` | W2 — the derived visibility (the packed `n_kv × n_tps` mask comes back) | **+800 MiB** compute **and +800 MiB host** |
 | `LLAMA_QSA_SPARSE_FA` | `1` | the fused sparse QSA flash-attn (dense masked fallback) | slower prefill; the mask is required and kept |
 | `LLAMA_QSA_KEYS_ONLY` | `1` | W3 — the keys-only QSA indexer cache (V buffer allocated again) | **+638 MiB** indexer KV |
-| `LLAMA_KQ_MASK_DERIVED` | `1` | V3 — the derived kq mask for dense models | **+800 MiB** compute **and +800 MiB host** |
+| `LLAMA_KQ_MASK_DERIVED` | `1` | V3 — the derived kq mask (dense + SWA prefill; the mask is not materialized).  Now ON: measured −799 MiB compute **and −799 MiB host** (4B/27B), −809/−811 on the gemmas; prefill −1.1 %, decode −0.7 %, MTP acceptance unchanged.  Auto-disables itself where it cannot apply (decode, small batches, non-MMA kernel, non-CUDA backend, alibi, M-RoPE 2-D, multi-sequence) — so a run that shows no change may simply not have qualified | **−800 MiB** compute **and −800 MiB host** when set to `0` |
 | *V4 gate (name TBD)* | `1`, or `0` if V4 regressed | V4 — native quantized K/V in the MMA FA path (the F16 staging scratch returns) | **+832 MiB** (q8_0 KV, exactly ctx-linear) |
 | **W4** | always on | — | it is a bug fix, not a policy.  To A/B it: `git apply ab/w4-revert.patch`, rebuild |
 
@@ -40,7 +40,11 @@ dense masked flash-attention path (the packed mask is then kept automatically).
 
 ```bash
 # environment used for every run
-export HIP_VISIBLE_DEVICES=0,1,2 LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib GGML_CUDA_FA_WMMA_256=0
+# NOTE: do NOT set GGML_CUDA_FA_WMMA_256=0 here - that caps the WMMA path at head 128 and for a
+# 256-wide head (4B, 27B, ...) it also disables V3 (the derived op needs the MMA kernel), which then
+# looks like "the gate does nothing".  The campaign tools under wip/qwen4exp/qsa-memory/tools/ were
+# written with =0 for other reasons; drop it when testing V3.
+export HIP_VISIBLE_DEVICES=0,1,2 LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib
 
 # (1) coherence: same seed, temp 0, and compare ONLY the generated text
 ./build/bin/llama-cli -m MODEL -ngl 99 -sm tensor -mg 0 -p "The capital of France is" -n 24 \

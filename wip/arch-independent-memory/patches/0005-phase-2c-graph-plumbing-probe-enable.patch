@@ -1,0 +1,849 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 505901964..631693f91 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -36,6 +36,18 @@ struct llm_fused_op_probe {
+     llm_fused_op op;
+     const char * name;
+     uint32_t n_tokens_per_seq;
++
++    // number of sequences to reserve the probe graph with (0 = the context's n_seq_max)
++    uint32_t n_seqs = 0;
++
++    // the fused node has to land on a GPU device (used by features that only make sense on a GPU)
++    bool require_gpu = false;
++
++    // ... and specifically on a backend that implements the derived kq mask (CUDA/HIP)
++    bool require_kq_derived = false;
++
++    // the probe graph has to actually contain the fused op - otherwise nothing was verified
++    bool require_observed = false;
+ };
+ 
+ static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
+@@ -80,6 +92,62 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+     /*.n_tokens_per_seq =*/ 1,
+ };
+ 
++// V3: the derived kq mask only changes the flash attention prefill path (the packed mask stays for
++// decode and small batches), so the probe is a prefill-shaped single sequence
++static const llm_fused_op_probe llm_fused_op_kq_derived_probe = {
++    /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN_DERIVED,
++    /*.name             =*/ "derived kq mask flash attention",
++    /*.n_tokens_per_seq =*/ 64,
++    /*.n_seqs           =*/ 1,
++    /*.require_gpu      =*/ true,
++    /*.require_kq_derived =*/ true,
++    /*.require_observed =*/ true,
++};
++
++// the derived kq mask is implemented by the CUDA/HIP backend only - any other backend that accepts
++// the flash attention op would silently ignore the derived sources
++static bool ggml_backend_dev_is_cuda(ggml_backend_dev_t dev) {
++    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
++        return false;
++    }
++
++    const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
++
++    return name != nullptr && (strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0);
++}
++
++// true when this build exposes the CUDA/HIP backend at all
++static bool ggml_backend_cuda_family_available() {
++    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
++        const char * name = ggml_backend_reg_name(ggml_backend_reg_get(i));
++
++        if (name != nullptr && (strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0)) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
++// the derived kq mask is only implemented by the CUDA/HIP backend.  A "meta" device (the
++// tensor-parallel wrapper used for multi-GPU tensor split) does not expose its sub-devices here, but
++// its supports_op forwards to all of them - which is exactly how the probed node ended up on it - so
++// accepting it is only safe while this build has the CUDA/HIP backend that the check above enforces.
++static bool ggml_backend_dev_implements_kq_derived(ggml_backend_dev_t dev) {
++    if (dev == nullptr) {
++        return false;
++    }
++
++    switch (ggml_backend_dev_type(dev)) {
++        case GGML_BACKEND_DEVICE_TYPE_GPU:
++            return ggml_backend_dev_is_cuda(dev);
++        case GGML_BACKEND_DEVICE_TYPE_META:
++            return ggml_backend_cuda_family_available();
++        default:
++            return false;
++    }
++}
++
+ llama_context::llama_context(
+         const llama_model & model,
+               llama_context_params params) :
+@@ -229,6 +297,19 @@ llama_context::llama_context(
+     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+ 
++    cparams.kq_mask_derived = true;
++    cparams.auto_kq_mask_derived = true;
++    {
++        const char * LLAMA_KQ_MASK_DERIVED = getenv("LLAMA_KQ_MASK_DERIVED");
++        if (LLAMA_KQ_MASK_DERIVED) {
++            // only an explicit 0 forces the packed mask - the probe below stays in charge of whether
++            // the backend can actually run the derived form
++            cparams.kq_mask_derived = atoi(LLAMA_KQ_MASK_DERIVED) != 0;
++            cparams.auto_kq_mask_derived = cparams.kq_mask_derived;
++            LLAMA_LOG_INFO("%s: derived kq mask = %d (env)\n", __func__, cparams.kq_mask_derived);
++        }
++    }
++
+     cparams.fused_gdn_ar = true;
+     cparams.fused_gdn_ch = true;
+     cparams.auto_fgdn    = false;
+@@ -527,19 +608,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+             return;
+         }
+ 
+-        const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs;
++        const uint32_t n_seqs_probe    = probe.n_seqs > 0 ? probe.n_seqs : n_seqs;
++        const uint32_t n_tokens_probe  = probe.n_tokens_per_seq*n_seqs_probe;
+ 
+-        auto * gf = graph_reserve(n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
++        auto * gf = graph_reserve(n_tokens_probe, n_seqs_probe, n_tokens_probe, mctx, true);
+         if (!gf) {
+             throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
+         }
+ 
+         bool device_mismatch = false;
++        bool observed = false;
+         for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
+             if (node.op != probe.op) {
+                 continue;
+             }
+ 
++            observed = true;
++
+             GGML_ASSERT(node.il >= 0);
+ 
+             ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
+@@ -559,6 +644,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+                 device_mismatch = true;
+                 break;
+             }
++
++            const auto device_fused_type = ggml_backend_dev_type(device_fused);
++
++            if (probe.require_gpu && device_fused_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
++                    device_fused_type != GGML_BACKEND_DEVICE_TYPE_IGPU &&
++                    device_fused_type != GGML_BACKEND_DEVICE_TYPE_META) {
++                LLAMA_LOG_WARN("%s: %s is not supported on a CPU device\n", func, probe.name);
++                device_mismatch = true;
++                break;
++            }
++
++            if (probe.require_kq_derived && !ggml_backend_dev_implements_kq_derived(device_fused)) {
++                LLAMA_LOG_WARN("%s: %s is assigned to %s, but it is only implemented by the CUDA/HIP backend\n",
++                        func, probe.name,
++                        device_fused ? ggml_backend_dev_name(device_fused) : "none");
++                device_mismatch = true;
++                break;
++            }
++        }
++
++        if (!observed && probe.require_observed) {
++            LLAMA_LOG_WARN("%s: %s was not used in the probe graph, set to disabled\n", func, probe.name);
++            device_mismatch = true;
+         }
+ 
+         if (device_mismatch) {
+@@ -575,6 +683,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+         cparams.auto_fa = false;
+     }
+ 
++    // note: after the flash attention probe, so that cparams.flash_attn is already resolved
++    if (cparams.auto_kq_mask_derived) {
++        LLAMA_LOG_INFO("%s: resolving derived kq mask support:\n", func);
++        resolve(llm_fused_op_kq_derived_probe, cparams.kq_mask_derived);
++        cparams.auto_kq_mask_derived = false;
++    }
++
+     if (cparams.auto_fgdn) {
+         LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", func);
+         resolve(llm_fused_op_gdn_ar_probe, cparams.fused_gdn_ar);
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 08a1a264f..8b76f2ea5 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -39,6 +39,8 @@ struct llama_cparams {
+     bool offload_kqv;
+     bool flash_attn;
+     bool auto_fa;
++    bool kq_mask_derived;      // V3: derive the kq mask in the FA kernel instead of materializing it
++    bool auto_kq_mask_derived; // the derived kq mask still has to be confirmed by the backend probe
+     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
+     bool fused_gdn_ch;       // use fused gated delta net (chunked)
+     bool auto_fgdn;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 8d9758fed..adb3bd69f 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -26,11 +26,17 @@
+ 
+ // dedup helpers
+ 
+-static ggml_tensor * build_attn_inp_kq_mask(
+-        ggml_context * ctx,
++// V3 derived kq mask: the MMA flash attention kernel (the only writer of the derived cells) requires
++// the KV length to be a multiple of FATTN_KQ_STRIDE - see ggml/src/ggml-cuda/fattn-common.cuh.  On any
++// other length the derived op would have no kernel and the scheduler would move the whole flash
++// attention node to the CPU, so those batches keep the packed mask.
++static constexpr int64_t LLM_KQ_MASK_DERIVED_KV_STRIDE = 256;
++
++ggml_tensor * llm_graph_context::build_attn_inp_kq_mask(
+         const llama_kv_cache_context * mctx,
+         const llama_ubatch & ubatch,
+-        const llama_cparams & cparams) {
++        const llama_cparams & cparams,
++        bool allow_derived) const {
+     const auto n_kv     = mctx->get_n_kv();
+     const auto n_tokens = ubatch.n_tokens;
+     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+@@ -38,9 +44,76 @@ static ggml_tensor * build_attn_inp_kq_mask(
+     // flash attention requires an f16 mask
+     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+ 
+-    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
+-    ggml_set_input(res);
+-    ggml_set_name(res, "attn_inp_kq_mask");
++    ggml_tensor * kq_mask = ggml_new_tensor_4d(ctx0, type, n_kv, n_tokens/n_stream, 1, n_stream);
++    ggml_set_input(kq_mask);
++    ggml_set_name(kq_mask, "attn_inp_kq_mask");
++
++    // V3 derived kq mask: register the compact per-cell state that the flash attention kernel can use
++    // instead of this mask.  The mask itself is still created and still filled whenever anything else
++    // consumes it - only when it ends up with no consumer at all does the allocator leave it
++    // unallocated (no VRAM, no host copy, no per-ubatch fill).
++    if (allow_derived && cparams.kq_mask_derived && cparams.flash_attn &&
++            n_stream == 1 && n_kv % LLM_KQ_MASK_DERIVED_KV_STRIDE == 0 && mctx->kq_mask_derivable(ubatch)) {
++        auto inp = std::make_unique<llm_graph_input_kq_derived>(hparams, cparams, mctx);
++
++        inp->cell_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
++        inp->tok_lo   = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tokens/n_stream, n_stream);
++        inp->tok_hi   = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tokens/n_stream, n_stream);
++
++        ggml_set_input(inp->cell_pos);
++        ggml_set_input(inp->tok_lo);
++        ggml_set_input(inp->tok_hi);
++
++        ggml_set_name(inp->cell_pos, "attn_inp_kq_cell_pos");
++        ggml_set_name(inp->tok_lo,   "attn_inp_kq_tok_lo");
++        ggml_set_name(inp->tok_hi,   "attn_inp_kq_tok_hi");
++
++        kq_derived[kq_mask] = { inp->cell_pos, inp->tok_lo, inp->tok_hi };
++
++        res->add_input(std::move(inp));
++    }
++
++    return kq_mask;
++}
++
++void llm_graph_input_kq_derived::set_input(const llama_ubatch * ubatch) {
++    // any of the three tensors can be left unallocated when the flash attention node that would read
++    // them is not part of the graph (an input the graph never consumes is never allocated) - the
++    // same guard the packed mask fill uses
++    if (!cell_pos || !cell_pos->buffer || !tok_lo || !tok_lo->buffer || !tok_hi || !tok_hi->buffer) {
++        return;
++    }
++
++    mctx->set_input_kq_derived(cell_pos, tok_lo, tok_hi, ubatch, cparams.causal_attn);
++}
++
++bool llm_graph_input_kq_derived::can_reuse(const llm_graph_params & params) {
++    // params.mctx is the *memory* context of the graph, which for many models wraps the attention
++    // cache (llama_memory_hybrid_context) instead of being the kv cache context this input was built
++    // from, so it must not be reinterpreted blindly.  When it is not a kv cache context, simply
++    // reject the reuse - the derived form only exists for prefill-shaped batches, where graphs are
++    // rebuilt on every ubatch anyway.
++    const auto * mctx_cur = dynamic_cast<const llama_kv_cache_context *>(params.mctx);
++
++    if (mctx_cur == nullptr) {
++        return false;
++    }
++
++    mctx = mctx_cur;
++
++    const auto n_tokens = params.ubatch.n_tokens;
++    const auto n_stream = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
++
++    bool res = true;
++
++    res &= cell_pos != nullptr && cell_pos->ne[0] == (int64_t) mctx->get_n_kv();
++    res &= n_stream == 1 && cell_pos->ne[1] == n_stream;
++    res &= tok_lo != nullptr && tok_hi != nullptr;
++    res &= n_tokens%n_stream == 0 && tok_lo->ne[0] == n_tokens/n_stream && tok_hi->ne[0] == n_tokens/n_stream;
++
++    // the derived form has to stay applicable for the new batch - the same predicate that decided
++    // to create it in the first place (the L1 lesson: reuse and creation must not disagree)
++    res &= params.cparams.kq_mask_derived && mctx->kq_mask_derivable(params.ubatch);
+ 
+     return res;
+ }
+@@ -2640,9 +2713,26 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+         }
+ 
++        // V3: the mask may have a derived form registered by build_attn_inp_kq_mask - in that case
++        // flash attention derives the visibility itself and the packed mask is not read at all.  The
++        // mask tensor is still in the graph, so any other consumer keeps it materialized.
++        llm_graph_kq_derived kq_derived_cur;
++
++        const auto it = kq_derived.find(kq_mask);
++        if (it != kq_derived.end()) {
++            kq_derived_cur = it->second;
++            kq_mask = nullptr;
++        }
++
+         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+-        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
++
++        if (kq_derived_cur.cell_pos) {
++            ggml_flash_attn_ext_add_kq_derived(cur, kq_derived_cur.cell_pos, kq_derived_cur.tok_lo, kq_derived_cur.tok_hi);
++            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN_DERIVED, cur, il});
++        } else {
++            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
++        }
+ 
+         ggml_flash_attn_ext_add_sinks(cur, sinks);
+         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+@@ -2814,12 +2904,8 @@ ggml_tensor * llm_graph_context::build_attn(
+     return cur;
+ }
+ 
+-static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
+-           ggml_context * ctx0,
+-     const llama_ubatch & ubatch,
+-    const llama_hparams & hparams,
+-    const llama_cparams & cparams,
+-    const llama_kv_cache_context * mctx_cur) {
++std::unique_ptr<llm_graph_input_attn_kv> llm_graph_context::build_attn_inp_kv_impl(
++    const llama_kv_cache_context * mctx_cur) const {
+ 
+     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
+ 
+@@ -2829,7 +2915,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
+         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
+         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
+ 
+-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
++        inp->self_kq_mask = build_attn_inp_kq_mask(mctx_cur, ubatch, cparams, true);
+         inp->self_kq_mask_cnv = inp->self_kq_mask;
+     }
+ 
+@@ -2842,7 +2928,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
+ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
+     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
+ 
+-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
++    auto inp = build_attn_inp_kv_impl(mctx_cur);
+ 
+     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+ }
+@@ -2922,12 +3008,8 @@ ggml_tensor * llm_graph_context::build_attn(
+     return cur;
+ }
+ 
+-static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
+-           ggml_context * ctx0,
+-     const llama_ubatch & ubatch,
+-    const llama_hparams & hparams,
+-    const llama_cparams & cparams,
+-    const llama_kv_cache_context * mctx_cur) {
++std::unique_ptr<llm_graph_input_attn_k> llm_graph_context::build_attn_inp_k_impl(
++    const llama_kv_cache_context * mctx_cur) const {
+ 
+     auto inp = std::make_unique<llm_graph_input_attn_k>(hparams, cparams, mctx_cur);
+ 
+@@ -2936,7 +3018,7 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
+ 
+         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
+ 
+-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
++        inp->self_kq_mask = build_attn_inp_kq_mask(mctx_cur, ubatch, cparams, true);
+         inp->self_kq_mask_cnv = inp->self_kq_mask;
+     }
+ 
+@@ -2946,7 +3028,7 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
+ llm_graph_input_attn_k * llm_graph_context::build_attn_inp_k() const {
+     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
+ 
+-    auto inp = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
++    auto inp = build_attn_inp_k_impl(mctx_cur);
+ 
+     return (llm_graph_input_attn_k *) res->add_input(std::move(inp));
+ }
+@@ -3298,19 +3380,15 @@ ggml_tensor * llm_graph_context::build_attn(
+     return cur;
+ }
+ 
+-static std::unique_ptr<llm_graph_input_attn_k_dsa> build_attn_inp_k_dsa_impl(
+-           ggml_context * ctx0,
+-     const llama_ubatch & ubatch,
+-    const llama_hparams & hparams,
+-    const llama_cparams & cparams,
+-    const llama_kv_cache_dsa_context * mctx_cur) {
++std::unique_ptr<llm_graph_input_attn_k_dsa> llm_graph_context::build_attn_inp_k_dsa_impl(
++    const llama_kv_cache_dsa_context * mctx_cur) const {
+ 
+     auto inp = std::make_unique<llm_graph_input_attn_k_dsa>(hparams, cparams, mctx_cur);
+ 
+     {
+         inp->self_k_idxs_mla = mctx_cur->get_mla()->build_input_k_idxs(ctx0, ubatch);
+ 
+-        inp->self_kq_mask_mla = build_attn_inp_kq_mask(ctx0, mctx_cur->get_mla(), ubatch, cparams);
++        inp->self_kq_mask_mla = build_attn_inp_kq_mask(mctx_cur->get_mla(), ubatch, cparams, false);
+         inp->self_kq_mask_mla_cnv = inp->self_kq_mask_mla;
+     }
+ 
+@@ -3321,7 +3399,7 @@ static std::unique_ptr<llm_graph_input_attn_k_dsa> build_attn_inp_k_dsa_impl(
+         auto cparams_copy = cparams;
+         cparams_copy.flash_attn = cparams.fused_lid;
+ 
+-        inp->self_kq_mask_lid = build_attn_inp_kq_mask(ctx0, mctx_cur->get_lid(), ubatch, cparams_copy);
++        inp->self_kq_mask_lid = build_attn_inp_kq_mask(mctx_cur->get_lid(), ubatch, cparams_copy, false);
+         inp->self_kq_mask_lid_cnv = inp->self_kq_mask_lid;
+ 
+         inp->self_k_rot_lid = mctx_cur->get_lid()->build_input_k_rot(ctx0);
+@@ -3333,7 +3411,7 @@ static std::unique_ptr<llm_graph_input_attn_k_dsa> build_attn_inp_k_dsa_impl(
+ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
+     const auto * mctx_cur = static_cast<const llama_kv_cache_dsa_context *>(mctx);
+ 
+-    auto inp = build_attn_inp_k_dsa_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
++    auto inp = build_attn_inp_k_dsa_impl(mctx_cur);
+ 
+     return (llm_graph_input_attn_k_dsa *) res->add_input(std::move(inp));
+ }
+@@ -3341,14 +3419,14 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
+ llm_graph_input_attn_k_dsa_iswa * llm_graph_context::build_attn_inp_k_dsa_iswa() const {
+     const auto * mctx_cur = static_cast<const llama_kv_cache_dsa_iswa_context *>(mctx);
+ 
+-    auto inp_dsa = build_attn_inp_k_dsa_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_dsa());
++    auto inp_dsa = build_attn_inp_k_dsa_impl(mctx_cur->get_dsa());
+ 
+     // build_attn_inp_k_impl rejects SWA caches, so construct the input directly
+     auto inp_swa = std::make_unique<llm_graph_input_attn_k>(hparams, cparams, mctx_cur->get_swa());
+ 
+     inp_swa->self_k_idxs = mctx_cur->get_swa()->build_input_k_idxs(ctx0, ubatch);
+ 
+-    inp_swa->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur->get_swa(), ubatch, cparams);
++    inp_swa->self_kq_mask = build_attn_inp_kq_mask(mctx_cur->get_swa(), ubatch, cparams, true);
+     inp_swa->self_kq_mask_cnv = inp_swa->self_kq_mask;
+ 
+     auto inp = std::make_unique<llm_graph_input_attn_k_dsa_iswa>(std::move(inp_dsa), std::move(inp_swa), mctx_cur);
+@@ -3370,7 +3448,7 @@ llm_graph_input_attn_kv_msa * llm_graph_context::build_attn_inp_kv_msa(bool msa_
+         inp->self_k_idxs = mctx_base->build_input_k_idxs(ctx0, ubatch);
+         inp->self_v_idxs = mctx_base->build_input_v_idxs(ctx0, ubatch);
+ 
+-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_base, ubatch, cparams);
++        inp->self_kq_mask = build_attn_inp_kq_mask(mctx_base, ubatch, cparams, false);
+         inp->self_kq_mask_cnv = inp->self_kq_mask;
+     }
+ 
+@@ -3396,7 +3474,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
+         inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);
+         inp->self_v_idxs = mctx_cur->get_base()->build_input_v_idxs(ctx0, ubatch);
+ 
+-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur->get_base(), ubatch, cparams);
++        inp->self_kq_mask = build_attn_inp_kq_mask(mctx_cur->get_base(), ubatch, cparams, true);
+         inp->self_kq_mask_cnv = inp->self_kq_mask;
+     }
+ 
+@@ -3406,7 +3484,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
+         inp->self_k_idxs_swa = mctx_cur->get_swa()->build_input_k_idxs(ctx0, ubatch);
+         inp->self_v_idxs_swa = mctx_cur->get_swa()->build_input_v_idxs(ctx0, ubatch);
+ 
+-        inp->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, mctx_cur->get_swa(), ubatch, cparams);
++        inp->self_kq_mask_swa = build_attn_inp_kq_mask(mctx_cur->get_swa(), ubatch, cparams, true);
+         inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;
+     }
+ 
+@@ -3427,7 +3505,7 @@ llm_graph_input_attn_k_iswa * llm_graph_context::build_attn_inp_k_iswa() const {
+     {
+         inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);
+ 
+-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur->get_base(), ubatch, cparams);
++        inp->self_kq_mask = build_attn_inp_kq_mask(mctx_cur->get_base(), ubatch, cparams, true);
+         inp->self_kq_mask_cnv = inp->self_kq_mask;
+     }
+ 
+@@ -3436,7 +3514,7 @@ llm_graph_input_attn_k_iswa * llm_graph_context::build_attn_inp_k_iswa() const {
+ 
+         inp->self_k_idxs_swa = mctx_cur->get_swa()->build_input_k_idxs(ctx0, ubatch);
+ 
+-        inp->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, mctx_cur->get_swa(), ubatch, cparams);
++        inp->self_kq_mask_swa = build_attn_inp_kq_mask(mctx_cur->get_swa(), ubatch, cparams, true);
+         inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;
+     }
+ 
+@@ -3598,7 +3676,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
+     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
+ 
+     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
+-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
++    auto inp_attn = build_attn_inp_kv_impl(mctx_cur->get_attn());
+ 
+     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
+ 
+@@ -3609,7 +3687,7 @@ llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const
+     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
+ 
+     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
+-    auto inp_attn = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
++    auto inp_attn = build_attn_inp_k_impl(mctx_cur->get_attn());
+ 
+     auto inp = std::make_unique<llm_graph_input_mem_hybrid_k>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
+ 
+@@ -3630,7 +3708,7 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
+         inp_attn->self_k_idxs = attn_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);
+         inp_attn->self_v_idxs = attn_ctx->get_base()->build_input_v_idxs(ctx0, ubatch);
+ 
+-        inp_attn->self_kq_mask = build_attn_inp_kq_mask(ctx0, attn_ctx->get_base(), ubatch, cparams);
++        inp_attn->self_kq_mask = build_attn_inp_kq_mask(attn_ctx->get_base(), ubatch, cparams, true);
+         inp_attn->self_kq_mask_cnv = inp_attn->self_kq_mask;
+     }
+ 
+@@ -3638,7 +3716,7 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
+         inp_attn->self_k_idxs_swa = attn_ctx->get_swa()->build_input_k_idxs(ctx0, ubatch);
+         inp_attn->self_v_idxs_swa = attn_ctx->get_swa()->build_input_v_idxs(ctx0, ubatch);
+ 
+-        inp_attn->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams);
++        inp_attn->self_kq_mask_swa = build_attn_inp_kq_mask(attn_ctx->get_swa(), ubatch, cparams, true);
+         inp_attn->self_kq_mask_swa_cnv = inp_attn->self_kq_mask_swa;
+     }
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index cc4110639..2002f63b2 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -43,6 +43,7 @@ enum llm_graph_type {
+ 
+ enum llm_fused_op {
+     LLM_FUSED_OP_FLASH_ATTN,
++    LLM_FUSED_OP_FLASH_ATTN_DERIVED, // V3: flash attention fed by the derived kq mask (no packed mask)
+     LLM_FUSED_OP_GDN_AR,
+     LLM_FUSED_OP_GDN_CH,
+     LLM_FUSED_OP_LIGHTNING_INDEXER,
+@@ -394,6 +395,39 @@ public:
+     const llama_kv_cache_context * mctx;
+ };
+ 
++// V3 derived kq mask: the compact per-cell state that can replace the packed
++// [n_kv, n_tps, 1, n_stream] kq mask.  flash attention derives each cell's visibility from
++// cell_pos[j] vs [tok_lo[i], tok_hi[i]] instead of loading the mask from memory.
++//
++// the packed mask tensor is still created by the graph builder (so every consumer keeps working
++// unchanged) - it simply ends up without consumers when the derived form is used, and the gallocr
++// then leaves it unallocated (no VRAM, no host copy, no per-ubatch fill).
++class llm_graph_input_kq_derived : public llm_graph_input_i {
++public:
++    llm_graph_input_kq_derived(
++            const llama_hparams & hparams,
++            const llama_cparams & cparams,
++            const llama_kv_cache_context * mctx) :
++        hparams(hparams),
++        cparams(cparams),
++        mctx(mctx) {
++    }
++    ~llm_graph_input_kq_derived() = default;
++
++    void set_input(const llama_ubatch * ubatch) override;
++
++    bool can_reuse(const llm_graph_params & params) override;
++
++    ggml_tensor * cell_pos = nullptr; // I32 [n_kv, n_stream]
++    ggml_tensor * tok_lo   = nullptr; // I32 [n_tps, n_stream]
++    ggml_tensor * tok_hi   = nullptr; // I32 [n_tps, n_stream]
++
++    const llama_hparams hparams;
++    const llama_cparams cparams;
++
++    const llama_kv_cache_context * mctx;
++};
++
+ class llm_graph_input_attn_k_dsa : public llm_graph_input_i {
+ public:
+     llm_graph_input_attn_k_dsa(
+@@ -981,6 +1015,13 @@ struct llm_graph_qkv {
+     ggml_tensor * v; // [n_embd_head, n_head_kv, n_tokens]
+ };
+ 
++// V3: the compact inputs that replace a packed kq mask in the flash attention op
++struct llm_graph_kq_derived {
++    ggml_tensor * cell_pos = nullptr;
++    ggml_tensor * tok_lo   = nullptr;
++    ggml_tensor * tok_hi   = nullptr;
++};
++
+ struct llm_graph_context {
+     const llm_arch arch;
+ 
+@@ -1033,6 +1074,12 @@ struct llm_graph_context {
+ 
+     llm_graph_result * res;
+ 
++    // V3 derived kq mask: the masks that may be replaced by their derived form, keyed by the mask
++    // tensor. build_attn_mha() consumes the entry (if any) when it builds the flash attention node,
++    // so any other consumer of the mask keeps working and simply forces the packed mask to be
++    // materialized by the allocator (it has a consumer, hence it is allocated and filled).
++    mutable std::map<const ggml_tensor *, llm_graph_kq_derived> kq_derived;
++
+     ggml_context * ctx0 = nullptr;
+     ggml_cgraph  * gf   = nullptr;
+ 
+@@ -1207,6 +1254,19 @@ struct llm_graph_context {
+ 
+     llm_graph_input_attn_kv * build_attn_inp_kv() const;
+ 
++    std::unique_ptr<llm_graph_input_attn_kv>  build_attn_inp_kv_impl     (const llama_kv_cache_context *     mctx) const;
++    std::unique_ptr<llm_graph_input_attn_k>   build_attn_inp_k_impl      (const llama_kv_cache_context *     mctx) const;
++    std::unique_ptr<llm_graph_input_attn_k_dsa> build_attn_inp_k_dsa_impl(const llama_kv_cache_dsa_context * mctx) const;
++
++    // V3: build the kq mask for the given cache context. when the derived form is possible
++    // (allow_derived and every runtime gate passes) a compact state input is added to the graph and
++    // registered in kq_derived, keyed by the returned mask tensor
++    ggml_tensor * build_attn_inp_kq_mask(
++            const llama_kv_cache_context * mctx,
++            const llama_ubatch & ubatch,
++            const llama_cparams & cparams,
++            bool allow_derived) const;
++
+     ggml_tensor * build_attn(
+             llm_graph_input_attn_kv * inp,
+             ggml_tensor * wo,
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 82f9db325..96ff4bb24 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1993,6 +1993,169 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+ }
+ 
++// V3 derived kq mask ==========================================================================
++//
++// The packed mask costs n_kv x n_tps F16 per GPU *and* the same in host memory, and it is rewritten
++// on every ubatch.  The derived form replaces it with two tiny per-token bounds and one per-cell
++// position, and lets the flash attention kernel compute the same visibility on the fly:
++//
++//   visible(cell j, token i)  <=>  cell_pos[j] >= tok_lo[i] && cell_pos[j] <= tok_hi[i]
++//
++// cell_pos is INT32_MIN for a cell that is empty or belongs to another sequence (which is exactly
++// what "not visible" needs: INT32_MIN fails the >= lo test for every lo >= 0), and otherwise the
++// cell's position.  tok_hi is the causal bound (or INT32_MAX when not causal) and tok_lo is the
++// visibility floor: 0, or the sliding-window floor, or (for LLAMA_NON_CAUSAL_TYPE_SWA_FULL) the
++// minimum batch position of the sequence.
++//
++// The predicate below is the *only* shape the phase-1 host oracle
++// (LLAMA_KQ_MASK_DERIVED_VERIFY, see the diagnostic above) proved value-identical against the
++// packed fill, so it deliberately stays narrow: one sequence, one stream, prefill-sized batches,
++// no alibi, no 2-D (M-RoPE) positions with a live ext clause.  Everything else keeps the packed
++// mask.  Note that this is not a correctness escape hatch - the host oracle has to be re-run on
++// every model when this predicate is extended.
++bool llama_kv_cache::kq_mask_derivable(const llama_ubatch & ubatch) const {
++    // alibi writes a distance into the mask, that is a value, not a predicate
++    if (hparams.use_alibi) {
++        return false;
++    }
++
++    // single sequence, single stream:
++    //  - a single sequence means every cell is either "own" or "foreign", which is what the
++    //    INT32_MIN sentinel encodes (no per-sequence bitset is needed)
++    //  - a single unique sequence also makes the ubatch's stream count 1, whatever kv_unified says
++    if (ubatch.n_seqs_unq != 1) {
++        return false;
++    }
++
++    // prefill-shaped batches only: below this the packed mask is a few hundred KiB, the launcher may
++    // pick the vec/tile kernels and decode has to stay on the packed path
++    if (ubatch.n_tokens <= 8) {
++        return false;
++    }
++
++    // M-RoPE: the derived form carries no 2-D ext clause, so it is only usable while the positions
++    // are degenerate (x == y == pos).  qwen35 is IMROPE, so this is hit even for text input.
++    if (ubatch.is_pos_2d()) {
++        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++            const llama_pos p = ubatch.pos[i];
++
++            if (p != ubatch.pos[i + ubatch.n_tokens    ] ||
++                p != ubatch.pos[i + 2*ubatch.n_tokens]) {
++                return false;
++            }
++        }
++
++        const auto & cells = v_cells.at(seq_to_stream[ubatch.seq_id[0][0]]);
++
++        for (uint32_t j = 0; j < cells.size(); ++j) {
++            if (cells.is_empty(j) || !cells.seq_has(j, ubatch.seq_id[0][0])) {
++                continue;
++            }
++
++            const auto & e = cells.ext_get(j);
++
++            if (e.x != e.y || e.x != cells.pos_get(j)) {
++                return false;
++            }
++        }
++    }
++
++    return true;
++}
++
++void llama_kv_cache::set_input_kq_derived(
++        ggml_tensor * cell_pos, ggml_tensor * tok_lo, ggml_tensor * tok_hi,
++        const llama_ubatch * ubatch, bool causal_attn) const {
++    GGML_ASSERT(ggml_backend_buffer_is_host(cell_pos->buffer));
++    GGML_ASSERT(ggml_backend_buffer_is_host(tok_lo->buffer));
++    GGML_ASSERT(ggml_backend_buffer_is_host(tok_hi->buffer));
++
++    const int64_t n_kv     = cell_pos->ne[0];
++    const int64_t n_stream = cell_pos->ne[1];
++    const int64_t n_tps    = tok_lo->ne[0];
++
++    GGML_ASSERT(tok_hi->ne[0] == n_tps && tok_lo->ne[1] == n_stream && tok_hi->ne[1] == n_stream);
++    GGML_ASSERT(n_tps*n_stream == (int64_t) ubatch->n_tokens);
++
++    // the derived form is only created for the shape kq_mask_derivable() accepts; the asserts above
++    // and here keep the fill aligned with the packed fill in set_input_kq_mask
++    GGML_ASSERT(n_stream == 1);
++    GGML_ASSERT(ubatch->n_seqs_unq == 1);
++
++    // see llama_non_causal_type - same adjustment as set_input_kq_mask
++    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
++        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
++    }
++
++    // the min position in the batch for each sequence
++    llama_pos seq_pos_min[LLAMA_MAX_SEQ];
++    std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
++
++    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
++        const llama_seq_id seq_id = ubatch->seq_id[i][0];
++
++        seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
++    }
++
++    const bool swa = swa_type != LLAMA_SWA_TYPE_NONE;
++    const bool swa_full = !causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL;
++
++    int32_t * cell_pos_data = (int32_t *) cell_pos->data;
++    int32_t * tok_lo_data   = (int32_t *) tok_lo->data;
++    int32_t * tok_hi_data   = (int32_t *) tok_hi->data;
++
++    // per-cell positions (INT32_MIN = never visible)
++    {
++        const llama_seq_id seq_id = ubatch->seq_id[0][0];
++
++        const auto & cells = v_cells.at(seq_to_stream[seq_id]);
++
++        for (int64_t j = 0; j < n_kv; ++j) {
++            const bool own = !cells.is_empty(j) && cells.seq_has(j, seq_id);
++
++            cell_pos_data[j] = own ? (int32_t) cells.pos_get(j) : INT32_MIN;
++        }
++    }
++
++    // per-token visibility window
++    for (int64_t ii = 0; ii < n_tps; ++ii) {
++        const llama_seq_id seq_id = ubatch->seq_id[ii][0];
++
++        const llama_pos p1   = ubatch->pos[ii];
++        const llama_pos hi   = causal_attn ? p1 : INT32_MAX;
++
++              llama_pos lo   = 0;
++
++        if (swa) {
++            switch (swa_type) {
++                case LLAMA_SWA_TYPE_STANDARD:
++                    lo = p1 - (llama_pos) n_swa + 1;
++                    break;
++                case LLAMA_SWA_TYPE_CHUNKED:
++                    lo = (p1/(llama_pos) n_swa)*(llama_pos) n_swa;
++                    break;
++                default:
++                    lo = 0;
++                    break;
++            }
++
++            // LLAMA_NON_CAUSAL_TYPE_SWA_FULL keeps every cell at or after the batch's first position
++            // of this sequence, i.e. a union of two ranges - the floor lowers to seq_pos_min
++            if (swa_full) {
++                lo = std::min(lo, seq_pos_min[seq_id]);
++            }
++        }
++
++        if (lo < 0) {
++            lo = 0;
++        }
++
++        tok_lo_data[ii] = (int32_t) lo;
++        tok_hi_data[ii] = (int32_t) hi;
++    }
++}
++// ==============================================================================================
++
+ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+     const int64_t n_tokens = ubatch->n_tokens;
+ 
+@@ -3006,6 +3169,16 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
+     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+ }
+ 
++bool llama_kv_cache_context::kq_mask_derivable(const llama_ubatch & ubatch) const {
++    return kv->kq_mask_derivable(ubatch);
++}
++
++void llama_kv_cache_context::set_input_kq_derived(
++        ggml_tensor * cell_pos, ggml_tensor * tok_lo, ggml_tensor * tok_hi,
++        const llama_ubatch * ubatch, bool causal_attn) const {
++    kv->set_input_kq_derived(cell_pos, tok_lo, tok_hi, ubatch, causal_attn);
++}
++
+ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+     kv->set_input_pos_bucket(dst, ubatch);
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index c4d8699de..6531d082e 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -229,6 +229,14 @@ public:
+     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+ 
++    // V3 derived kq mask: true when the packed mask for this batch can be replaced by the compact
++    // per-cell state (see set_input_kq_derived).  The predicate is exactly the shape the phase-1
++    // host oracle proved bit-exact against the packed fill - extend it only with new coverage.
++    bool kq_mask_derivable(const llama_ubatch & ubatch) const;
++    void set_input_kq_derived(
++            ggml_tensor * cell_pos, ggml_tensor * tok_lo, ggml_tensor * tok_hi,
++            const llama_ubatch * ubatch, bool causal_attn) const;
++
+     void set_input_k_rot(ggml_tensor * dst) const;
+     void set_input_v_rot(ggml_tensor * dst) const;
+ 
+@@ -423,6 +431,12 @@ public:
+     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+ 
++    // V3 derived kq mask - see llama_kv_cache::kq_mask_derivable
++    bool kq_mask_derivable(const llama_ubatch & ubatch) const;
++    void set_input_kq_derived(
++            ggml_tensor * cell_pos, ggml_tensor * tok_lo, ggml_tensor * tok_hi,
++            const llama_ubatch * ubatch, bool causal_attn) const;
++
+     void set_input_k_rot(ggml_tensor * dst) const;
+     void set_input_v_rot(ggml_tensor * dst) const;
+ 

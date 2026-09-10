@@ -1,10 +1,10 @@
 # V3 — derived kq mask: verified predicate + implementation plan
 
 **Status (2026-09-10).**  *Phase 1 (the predicate) is DONE and proven bit-exact on the host.*
-*Phase 2a (the op + a CPU reference) and phase 2b (the CUDA MMA kernel) are DONE and validated on
-their own — see §4.1/§4.2.*  Phase 2c (the graph plumbing, the backend probe and the end-to-end
-validation) is all that is left; §2.2/§2.6/§2.7 are the spec for it, §4.3 the checklist.  Everything
-in §1–§3 is measured, not derived.
+*Phases 2a (the op + a CPU reference), 2b (the CUDA MMA kernel) and 2c (the graph plumbing, the backend
+probe and the enable) are DONE and validated — see §4.1-§4.4.  V3 is complete: the feature is on by
+default (`LLAMA_KQ_MASK_DERIVED=0` forces the packed mask) and measured at -799 MiB/GPU plus
+-799 MiB host on the dense and SWA models.  Everything in §1–§4 is measured, not derived.
 
 Read order: this file → `DERIVED-MASK-DESIGN.md` (the general brief) →
 `../../beta/block-15-campaign-wins/HANDOVER.md` §3.1 (the campaign plan).
@@ -284,31 +284,108 @@ Validation of 2b **on its own**, before any graph change:
 | coherence, 4B, one binary, derived code in place but no caller | **byte-identical** to the pre-phase-2 build |
 | the phase-1 host oracle, re-run | 7/7 records `mismatches: core=0 ext=0` |
 
-### 4.3 Next — the remaining work (phase 2c)
+### 4.3 Done — phase 2c: graph plumbing + backend probe + enable (2026-09-10)
 
-The graph plumbing + the probe + the enable, per §2.2, §2.6, §2.7: the new
-`llm_graph_input_kq_derived`; `build_attn_inp_kq_mask` gaining `allow_derived` and returning a 1-byte
-handle recorded in a `llm_graph_context` map; `build_attn_mha` turning the handle into
-`mask = nullptr` + `ggml_flash_attn_ext_add_kq_derived(...)`; `allow_derived = true` only at the six
-standard sites (L2832, L2939, L3351, L3409, L3439, L3641 — never the DSA/MSA/DSV4/MLA/LID ones);
-`llama_kv_cache_context::kq_mask_derivable(...)` + `set_input_kq_derived(...)`; the fused-op probe
-(`LLM_FUSED_OP_FLASH_ATTN_DERIVED`, requiring a GPU device) + `cparams.kq_mask_derived` +
-`LLAMA_KQ_MASK_DERIVED` (default 1).  Then the §2.8 validation bar (byte-identical text on 4B / 27B /
-gemma-4-E4B / qwen4exp; the reserve matrix, expect -800/-800 MiB; `tools/mtp-ab.sh` >= 0.45; bench
-parity).
+`patches/0005-phase-2c-graph-plumbing-probe-enable.patch` (6 files, +487/-45; `git apply --check` CLEAN
+on the W1+W2+diag+2a+2b base): `src/llama-cparams.h`, `src/llama-graph.h`, `src/llama-graph.cpp`,
+`src/llama-kv-cache.h`, `src/llama-kv-cache.cpp`, `src/llama-context.cpp`.
 
-### 4.4 Not exercised yet (goes on the phase-2c validation matrix)
+**The one design change from §2.6, and it is a safety win: the packed mask tensor is still created.**
 
-* the `oob_check` arm of the derived branch: reachable only where `ncols2 == 1`, which has **no device
-  code at all on AMD** (`AMD_WMMA_AVAILABLE` requires `ncols2 != 1`), so it is NVIDIA-only — the
-  formula mirrors the packed convention so it stays correct if it ever runs there;
-* `use_sparse` + derived: mutually exclusive by construction (the host will never enable derived for
-  the DSV4/DSV3.2 shapes that select the sparse kernels) — the sparse branch is untouched;
-* `n_stream > 1`, the M-RoPE 2-D clause *firing*, `SWA_FULL`/`CHUNKED` (no model here), alibi
-  (deliberately excluded), empty/foreign cells from cross-sequence reuse, prompt-cache/checkpoint
-  restore — all fallback/extension cases for the graph level.
+`build_attn_inp_kq_mask` (now a `llm_graph_context` method, `allow_derived` flag) still creates the
+`[n_kv, n_tps, 1, n_stream]` mask exactly as before, *and* registers the compact state in
+`llm_graph_context::kq_derived` (keyed by that mask tensor) with a new `llm_graph_input_kq_derived`
+input object (cell_pos I32, tok_lo/tok_hi I32) added to the graph result.  `build_attn_mha` looks the
+mask up: when it has an entry, the FA node is built with `mask = nullptr` plus
+`ggml_flash_attn_ext_add_kq_derived()` and the fused node is registered as
+`LLM_FUSED_OP_FLASH_ATTN_DERIVED`.
 
-**State after this session**: fork tree = W1 + W2 + the phase-1 diagnostic + phase-2a + phase-2b
-(17 modified files), builds clean, coherence byte-identical, feature still inert (no graph caller).
-Four separable patches under `patches/` (0002 the phase-1 oracle, 0003 phase-2a, 0004 phase-2b; 0001 is
-the W4 ggml-alloc fix).
+The mask tensor therefore has *no consumer* on the derived path, and the gallocr leaves it
+unallocated - which is the entire memory win (no VRAM, no host copy) - while the already existing
+`if (tensor->buffer)` guards in the two mask fills skip the per-ubatch fill on their own.
+
+The consequence is that **no mask consumer can ever be mis-served**: deepseek4's bias `ggml_concat`,
+minimax-m3's `msa_kqm`, qwen4exp's indexer, any future model - if anything else reads the mask, the
+mask is materialized and filled as before, and the FA node still gets the (value-identical) derived
+form.  There is no model-level allowlist to keep in sync; `allow_derived` only decides *where* the
+attempt is made, and the phase-1 oracle decides *whether* the batch qualifies.
+
+The gates, all of which must hold:
+
+| level | gate |
+|---|---|
+| context | `cparams.kq_mask_derived` (`LLAMA_KQ_MASK_DERIVED` env, default 1; only an explicit 0 forces the packed mask) |
+| graph | `allow_derived` at the mask-build site, `cparams.flash_attn`, `n_stream == 1`, `n_kv % 256 == 0` (must match `FATTN_KQ_STRIDE`, or the derived op would have no kernel and the node would move to the CPU) |
+| batch | `llama_kv_cache::kq_mask_derivable`: no alibi, `n_seqs_unq == 1`, `n_tokens > 8`, and for 2-D batches every token position and every own cell degenerate (`x == y == pos`) - where the M-RoPE ext clause is a proven no-op |
+| backend | the new `LLM_FUSED_OP_FLASH_ATTN_DERIVED` probe (`resolve_fused_ops`): a 64-token *single-sequence* probe graph must contain the derived node, on the layer's own device, which must be a GPU/IGPU/META device that implements the derived form (`ggml_backend_dev_implements_kq_derived`: CUDA/ROCm registry name; a META device is accepted because its `supports_op` forwards to its sub-devices, which is how it got the node) - and `ggml_cuda_flash_attn_ext_supported` still rejects the op unless the best kernel is `BEST_FATTN_KERNEL_MMA_F16` |
+
+**Crash found and fixed during validation** (only reproducible under `llama-bench`, which keeps
+`n_tokens` constant so the reuse check actually reaches the new input): `params.mctx` is the *memory*
+context, and in this fork most models (including the 4B) run on `llama_memory_hybrid`, so
+`static_cast<const llama_kv_cache_context *>` on it is a type pun and `llm_graph_input_kq_derived::
+can_reuse` dereferenced a garbage `kv`.  The existing inputs get away with it because the hybrid
+input class does its own mask check via `mctx->get_attn()`.  Fixed with `dynamic_cast` + reject the
+reuse when it is not a kv cache context (reuse is harmless to lose: the derived form only exists for
+prefill-shaped batches, where `n_kv` changes on every ubatch anyway).
+
+**Kernel-selection coupling**: the derived op needs the MMA kernel, and on RDNA4 with a 256-wide head
+that kernel needs the WMMA-256 path (`GGML_CUDA_FA_WMMA_256` unset/default; `=0` caps WMMA at head
+128).  Measured: with `GGML_CUDA_FA_WMMA_256=0` the probe correctly reports "assigned to device CPU"
+and disables the feature; with the default env it is enabled on the 4B, the 27B and both gemmas.
+The many campaign commands that set `=0` therefore do **not** exercise the derived path.
+
+### 4.4 Validation record (2026-09-10, ctx 204800, ub 2048, `-ctk/-ctv q8_0`, one binary flipping `LLAMA_KQ_MASK_DERIVED`)
+
+Reserve matrix (compute buffer per GPU / `ROCm_Host`):
+
+| model | packed | derived | delta |
+|---|---|---|---|
+| Qwen3.5-4B-Q8_0, 1 GPU | 1800.33 / 840.34 MiB | **1001.13 / 41.13** | **-799.20 / -799.21** |
+| Qwen3.8-27B-Q8_0, 3 GPU (Meta) | 1920.33 / 880.34 | **1121.13 / 81.13** | **-799.20 / -799.21** |
+| gemma-4-E4B-it-Q8_0 (ISWA), 1 GPU | 1887.35 / 935.37 | **1078.17 / 126.19** | **-809.18 / -809.18** |
+| gemma-4-31B-qat-Q4_K_XL (ISWA), 2 GPU | 2753.35 / 897.36 | **1942.18 / 86.18** | **-811.17 / -811.18** |
+| qwen4exp (QSA) - regression control | 3251.39 / 63.69 | 3251.39 / 63.69 | **0** (probe: "not used in the probe graph") |
+
+The ISWA models shed **both** masks (base ~800 MiB + SWA ~9-11 MiB).  ubatch scaling on the 4B is
+exactly `n_kv x n_tps x 2 B` per copy: ub 2048 -799.20/-799.21, ub 1024 -399.21/-399.21,
+ub 512 -199.21/-199.21.
+
+| check | result |
+|---|---|
+| same-seed generated text, derived vs packed, **identical binary** | **byte-identical** on the 4B (3k prompt), the 27B (40k prompt, 3-GPU Meta), gemma-4-E4B (3k **and** 40k prompt, ISWA) |
+| phase-1 host oracle re-run with the new plumbing | 6/6 records `mismatches: core=0 ext=0` |
+| MTP gate (`--spec-type draft-mtp`, 27B, ctx 32768, 3-GPU, draft depth 3) | acceptance **0.76744 (66/86, mean len 3.28) identical** on both gates - no layout drift; prompt 1123.6 -> 1229.2 t/s, generation 78.8 -> 78.3 t/s |
+| bench parity, 4B pp20480 at ub 2048 (interleaved 5x) | packed 6040.6 t/s vs derived 5973.1 t/s = **-1.1 %** |
+| bench parity, 4B tg256 | 99.14 -> 98.48 t/s = -0.7 % (ub 1024: pp +0.2 %, tg -0.2 %) |
+| negative control | every number above is an A/B inside one binary with `LLAMA_KQ_MASK_DERIVED=0` |
+
+**The -1 % prefill is real and consistent** (both gates have <0.5 % spread over 5 interleaved runs) but
+it cannot be the mask traffic: the derived staging reads 4 B/cell instead of 2 B/cell, which is
+~840 MB of extra reads over a pp20480 prefill, i.e. ~1 ms of ~3 s.  The remaining candidates are the
+kernel's register/occupancy change from the runtime branch in `flash_attn_ext_f16_load_mask` and the
+compute-buffer layout change (the reserve is 85 MiB smaller at bench ctx), the same class of effect
+that produced the MTP probe drift.  Not investigated further: the win is 799 MiB/GPU + 799 MiB host,
+and against the delivered ub 1024 baseline the derived ub 2048 is **equal speed for 300 MiB less per
+GPU**.
+
+### 4.5 Not exercised (each is a fallback or a straight extension)
+
+* prompt-cache / state (checkpoint) save+restore with the derived path active - the derived inputs are
+  not part of the KV state, but an end-to-end round trip was not run;
+* `--parallel > 1` / multi-sequence batches (`kq_mask_derivable` rejects them, so the packed mask is
+  used - expected to be a no-op, not measured);
+* the non-causal paths (`llama-embedding --attention non-causal`, `SWA_ONLY`): covered by the phase-1
+  oracle, but not re-validated end to end with the derived path active;
+* `SWA_FULL` / `CHUNKED` (no model here), the M-RoPE 2-D clause *firing* (the guard rejects it), alibi
+  (excluded by the predicate);
+* every non-CUDA/HIP backend (rejected by the probe - and that is the intent: Vulkan/Metal would
+  silently ignore the derived sources), CPU-only runs (rejected), and NVIDIA CUDA (untested; the
+  sparse-mask path is unreachable there with a null mask, but no NVIDIA hardware was available);
+* `GGML_CUDA_FA_WMMA_256=0` (the derived path is then unavailable for head > 128 - by design, see
+  §4.3);
+* the root cause of the -1 % prefill delta (see §4.4).
+
+**State after this session**: fork tree = W1 + W2 + block-15 phase 1 + 2a + 2b + 2c = 21 modified
+files, builds clean, feature **on by default** and validated.  Five separable patches under
+`patches/` (0002 the phase-1 oracle, 0003 phase-2a, 0004 phase-2b, 0005 phase-2c; 0001 is the W4
+ggml-alloc fix).
