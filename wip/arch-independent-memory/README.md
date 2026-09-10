@@ -24,8 +24,22 @@ Dense control, Qwen3.5-4B-Q8_0 (`tools/model-sweep.sh`, load only, no QSA anywhe
 
 Peak live set at ub2048 (from the instrumented-allocator ledger): `attn_inp_kq_mask` 800.0 MB +
 `Qcur_full` 64 MB + `FLASH_ATTN` 32 MB + `MUL_MAT` 32 MB + `ffn_out` 20 MB = 948 MB live against a
-1800 MB buffer. **The mask alone is ~1.6 GiB of the 2.64 GiB (compute + host) = ~61%** of what a
+1800 MB buffer (The buffer high-water is cumulative across allocation records, so it exceeds any single record's live sum - read the mask's share from the two reserve numbers above, not from this sum.). **The mask alone is ~1.6 GiB of the 2.64 GiB (compute + host) = ~61%** of what a
 dense model reserves at this shape.
+
+Dense control #2, **Qwen3.8-27B-Q8_0** (`/llm/models/Qwen3.8/27B/Q8_0/Qwen3.8-27B-Q8_0.gguf`,
+`n_swa = 0` so a single mask, same flags, weights 8678 MiB/GPU). Note: this GGUF carries its **MTP
+heads inline**, so `--spec-type draft-mtp` runs on the model alone - no separate `-md` draft file
+(unlike qwen4exp, whose draft head is `mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf`).
+
+| ub | compute buffer | host buffer | mask share |
+|---|---|---|---|
+| 2048 | 1920.33 MiB | 880.34 MiB | **800 MB = 42% of compute, ~57% of compute+host** |
+| 1024 | 1360.30 MiB | 440.30 MiB | ~400 MB |
+| 512 | 1080.28 MiB | 220.28 MiB | ~200 MB |
+
+Per-1024-ubatch compute delta: 560 MiB, of which 400 is the mask. Peak live set at ub2048: mask
+800 MB + `Qcur_full` 96 + `FLASH_ATTN` 48 + `MUL_MAT` 48 + `ffn_out` 40.
 
 Scaling law: `mask_bytes = n_kv * n_tps * 2 (F16) * 2 (mirror)`, with `n_tps = ubatch / n_stream`.
 So the mask is what makes the ub2048-vs-1024 memory gap so brutal on *every* arch (500 MiB per
@@ -65,6 +79,13 @@ of children and views" pass (`ggml/src/ggml-alloc.c` ~L657: `p_hn->n_children ==
 parent->data`). A view whose `data` is still NULL at planning time cannot satisfy that, so the
 parent stays separate from the child.
 
+- **How systemic is it?** The instrumented allocator's probe ("not reusing parent ... (reshaped) ...
+  is external") fires **1296 times across 1072 distinct parents** in the 27B prefill graph - the names
+  are the rope / K-cache half-splits (`Kcur-*`, `z-*`, `cache_r_l*`, `Qcur*`). Do **not** read that as
+  1296 x size: the losses are per-layer and only a few coexist, so the cost is set by the biggest ones
+  live at the same time. Quantifying it is the first tooling step of the next session: print the
+  parent's size (and accumulate the total) in that message - a one-line change to the instrumented
+  allocator (`/tmp/ggml-alloc.instrumented.c` ~L629) plus one rebuild.
 - **Model-author rule (mechanical, zero-risk):** apply elementwise/unary ops *before* the reshape,
   never after. Audit target for other archs: any `reshape*` followed by relu/gelu/silu/add(scale) on
   a large tensor.
@@ -109,7 +130,11 @@ share** separately - the mask is the only term that is both huge and arch-indepe
 1. **ggml-alloc (3a + 3b).** Confirm 3b with `AT_PRINTF` on a minimal repro, then fix: through-view
    parent reuse (3a) and/or the `n_views` accounting (3b). Validate against the §3b acceptance
    criteria. This is shared code: a win for every arch.
-2. **A dense model ledger.** The Qwen3.8-27B Q8 used in earlier sessions is **no longer on disk**
+2. **Dense-model work.** The 27B is at `/llm/models/Qwen3.8/27B/Q8_0/Qwen3.8-27B-Q8_0.gguf` (MTP
+   heads inline - no `-md` needed for the MTP gate) and the 4B control at `~/Qwen3.5-4B-Q8_0.gguf`;
+   their reserve numbers are in §1. Do: (a) quantify the reshape-parent loss (§3a tooling step) -
+   total and biggest live overlap for the 27B; (b) use the mask share to decide whether the
+   derived-mask facility (§2.2) is worth building - and if so write the design brief, not the code. The Qwen3.8-27B Q8 used in earlier sessions is **no longer on disk**
    (`/models` holds only the Flash-Next set); re-run `model-sweep.sh` + the ledger once available -
    and use it to decide whether the derived-mask facility (§2.2) is worth building.
 3. **qwen4exp, still open:** the score chain's ~700 MB concat peak and the host-side top-k build
