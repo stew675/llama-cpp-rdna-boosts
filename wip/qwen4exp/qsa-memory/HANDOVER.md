@@ -12,7 +12,9 @@ Status: **WIP — nothing here is part of the delivery.** `wip/` items must not 
 > `attn_inp_kq_mask` input saves nothing on its own — the QSA flash-attention kernel consumes it
 > too, so the visibility must be derived in *both* the top-k and the FA kernel). Next lever:
 > derive the per-block bias (−400 MiB, top-k only) and the mask visibility (−800 MiB) in-kernel,
-> landing ub2048 at ~3250 MiB — below ub1024's memory at ub2048's speed.
+> landing ub2048 at ~3250 MiB — below ub1024's memory at ub2048's speed. The design for that
+> lever, its exact predicates, gating, work items and the ordered implementation steps are in
+> **`L1-visibility-bias-derivation.md`** (its §7 has the session state and where to pick up).
 
 ---
 
