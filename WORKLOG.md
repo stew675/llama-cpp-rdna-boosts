@@ -10,6 +10,37 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Block 00 (structural and architecture fixes) added; the set is now 15 patches and the masked-V
+  freed-cell fixes are re-homed (2026-09-10).**  A new first block, `patches/0000`, holds baseline-level
+  fixes every later block builds on:
+  1. **FA small-batch KV-split width invariance (issue #25).**  `launch_fattn`'s non-stream-K
+     `parallel_blocks` heuristic keys off `ntiles_dst`, which is a function of `Q->ne[1]`, so
+     single-token decode (`n_q = 1`) and speculative verify batches (`n_q = 3`, `5`, …) chose different
+     KV splits, fed different partial sums into the online-softmax/PV combine and produced different
+     logits; greedy near-ties then flipped, so MTP `--spec-draft-n-max 2` and `4` streamed apart.  The
+     heuristic now evaluates `ntiles_dst` as if `n_q == 1` for every `n_q <= 8` (prefill unchanged).
+  2. **Vulkan masked-V / freed-cell fixes** (`flash_attn_cm1.comp`, `flash_attn.comp`): dead columns
+     never read V.  These are baseline shaders, so they belong in the structural block.
+  The **HIP** masked-V fixes do **not** belong in block 00: the `fattn-tile.cuh` half uses the native
+  bf16 PV staging (`V_k0`/`KQ_k`/`nv_bfloat162`) that **block 03** introduces, and the
+  `fattn-mma-f16.cuh` half fixes the same class of leak on that path — so, per the maintainer, both HIP
+  halves were **moved into block 03** (the earliest block that exercises the leaking code).  Block 14 no
+  longer carries any masked-V/freed-cell hunk.  The net tree is unchanged from the previous regeneration
+  (`26690e4d9`).  The block-15 attention-memory campaign is unaffected and remains staged in
+  `beta/block-15-campaign-wins/`.
+  Layout: `0000` = block 00, `0001`–`0014` = the old blocks 01–14 (renumbered by
+  `git format-patch --start-number 0`, so the file prefix still equals the block number; the subjects
+  read `[PATCH 00/14]`…`[PATCH 14/14]`).  Canonical fork rebuilt at `9113cc188`, tip **`505637d6e`**;
+  `scripts/apply-all.sh` and `scripts/make-patches.sh` updated (15 blocks, `0000` included);
+  `rdna-boosts-all.patch` regenerated.
+  Validation (3× gfx1201, ROCm 7.14): clean-apply sim → strict **15/15 `git am`, zero whitespace
+  warnings**, applied tree `26690e4d9` == canonical; issue #25 → `--spec-draft-n-max 2 == 4` on 2-GPU
+  p0/p2/p3 and 3-GPU p0, `draft-mtp-adaptive` == both; plain decode (`--spec-type none`) byte-identical
+  to the pre-block-00 canonical on 2-GPU and 1-GPU; MTP acceptance gate holds (dense 0.479, MoE 0.669,
+  MTP >> plain both).  A `structural-fixes` branch (block 00 + blocks 01–14, based directly on
+  `9113cc188` = the fork's master) was pushed to the personal fork for the gfx1151 investigation; the
+  upstream-PR candidate `upstream/UPSTREAM-PR-fa-kv-split-width.{patch,md}` was filed under `upstream/`.
+
 - **Block 15 un-promoted from the delivery — it belongs only in `beta/block-15-campaign-wins/`
   (2026-09-10).**  Block 15 was promoted into `patches/0015` by mistake; the maintainer never
   approved cutting it as a delivery patch.  The delivery is a **14-patch set** again

@@ -1,4 +1,4 @@
-From ff2b35f49adc52e747d2967c2bea77b5cabcfea1 Mon Sep 17 00:00:00 2001
+From 505637d6e7d1d11eed2135267bfb2d3118dfbe86 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/14] rdna-boosts: block 14: qwen4exp support
@@ -97,62 +97,58 @@ wip/kv-sign-leak/HANDOVER-2026-09-09-mma-f16.md in the delivery repo.
 The 2026-09-09 amendment text below is retained as history only; the
 freed-cell zeroing gate it describes no longer exists in the block.
 ---
- common/arg.cpp                                |  22 +
- common/common.cpp                             |   1 +
- common/common.h                               |   2 +
- ggml/include/ggml-alloc.h                     |  13 +
- ggml/include/ggml-rpc.h                       |   4 +-
- ggml/include/ggml.h                           | 153 +++
- ggml/src/ggml-alloc.c                         |  28 +-
- ggml/src/ggml-backend-meta.cpp                | 129 ++-
- ggml/src/ggml-backend.cpp                     |  47 +-
- ggml/src/ggml-cpu/ggml-cpu.c                  |  37 +
- ggml/src/ggml-cpu/ops.cpp                     | 460 +++++++++
- ggml/src/ggml-cpu/ops.h                       |   4 +
- ggml/src/ggml-cuda/common.cuh                 |   1 +
- ggml/src/ggml-cuda/concat.cu                  |  73 ++
- ggml/src/ggml-cuda/fattn-mma-f16.cuh          |  30 +
- ggml/src/ggml-cuda/fattn-qsa.cu               | 638 ++++++++++++
- ggml/src/ggml-cuda/fattn-qsa.cuh              |  22 +
- ggml/src/ggml-cuda/fattn-tile.cuh             |  27 +
- ggml/src/ggml-cuda/ggml-cuda.cu               | 726 ++++++++++---
- ggml/src/ggml-cuda/hc-mix.cu                  | 462 +++++++++
- ggml/src/ggml-cuda/hc-mix.cuh                 |   5 +
- ggml/src/ggml-cuda/hyperconn.cu               | 375 +++++++
- ggml/src/ggml-cuda/hyperconn.cuh              |  56 +
- ggml/src/ggml-cuda/indexer-score.cu           | 561 ++++++++++
- ggml/src/ggml-cuda/indexer-score.cuh          |  10 +
- ggml/src/ggml-cuda/indexer-topk.cu            | 376 +++++++
- ggml/src/ggml-cuda/indexer-topk.cuh           |   7 +
- ggml/src/ggml-cuda/mmid.cu                    |  63 ++
- ggml/src/ggml-cuda/mmq.cuh                    |  28 +-
- ggml/src/ggml-cuda/quantize.cuh               |  13 +-
- ggml/src/ggml-cuda/unary.cu                   |  15 +-
- ggml/src/ggml-moe-weighted-reduction.h        | 160 +++
- .../vulkan-shaders/flash_attn.comp            |  29 +-
- .../vulkan-shaders/flash_attn_cm1.comp        |  47 +-
- ggml/src/ggml.c                               | 342 ++++++-
- include/llama.h                               |   4 +
- src/CMakeLists.txt                            |   1 +
- src/llama-arch.cpp                            |  20 +-
- src/llama-arch.h                              |   5 +
- src/llama-context.cpp                         |  49 +-
- src/llama-cparams.h                           |   2 +
- src/llama-lazy-reader.cpp                     | 330 ++++++
- src/llama-lazy-reader.h                       |  91 ++
- src/llama-memory-hybrid-idx.cpp               | 202 +++-
- src/llama-memory-hybrid-idx.h                 |  54 +-
- src/llama-model-loader.cpp                    |  22 +-
- src/llama-model-loader.h                      |  12 +
- src/llama-model.cpp                           |   6 +-
- src/llama-model.h                             |   6 +
- src/llama.cpp                                 |   3 +-
- src/models/models.h                           |  48 +-
- src/models/qwen4exp.cpp                       | 967 +++++++++++++++---
- tests/CMakeLists.txt                          |   1 +
- tests/test-lazy-reader.cpp                    | 264 +++++
- tests/test-llama-archs.cpp                    |   7 +-
- 55 files changed, 6729 insertions(+), 331 deletions(-)
+ common/arg.cpp                         |  22 +
+ common/common.cpp                      |   1 +
+ common/common.h                        |   2 +
+ ggml/include/ggml-alloc.h              |  13 +
+ ggml/include/ggml-rpc.h                |   4 +-
+ ggml/include/ggml.h                    | 153 ++++
+ ggml/src/ggml-alloc.c                  |  28 +-
+ ggml/src/ggml-backend-meta.cpp         | 129 +++-
+ ggml/src/ggml-backend.cpp              |  47 +-
+ ggml/src/ggml-cpu/ggml-cpu.c           |  37 +
+ ggml/src/ggml-cpu/ops.cpp              | 460 ++++++++++++
+ ggml/src/ggml-cpu/ops.h                |   4 +
+ ggml/src/ggml-cuda/common.cuh          |   1 +
+ ggml/src/ggml-cuda/concat.cu           |  73 ++
+ ggml/src/ggml-cuda/fattn-qsa.cu        | 638 ++++++++++++++++
+ ggml/src/ggml-cuda/fattn-qsa.cuh       |  22 +
+ ggml/src/ggml-cuda/ggml-cuda.cu        | 726 +++++++++++++++----
+ ggml/src/ggml-cuda/hc-mix.cu           | 462 ++++++++++++
+ ggml/src/ggml-cuda/hc-mix.cuh          |   5 +
+ ggml/src/ggml-cuda/hyperconn.cu        | 375 ++++++++++
+ ggml/src/ggml-cuda/hyperconn.cuh       |  56 ++
+ ggml/src/ggml-cuda/indexer-score.cu    | 561 ++++++++++++++
+ ggml/src/ggml-cuda/indexer-score.cuh   |  10 +
+ ggml/src/ggml-cuda/indexer-topk.cu     | 376 ++++++++++
+ ggml/src/ggml-cuda/indexer-topk.cuh    |   7 +
+ ggml/src/ggml-cuda/mmid.cu             |  63 ++
+ ggml/src/ggml-cuda/mmq.cuh             |  28 +-
+ ggml/src/ggml-cuda/quantize.cuh        |  13 +-
+ ggml/src/ggml-cuda/unary.cu            |  15 +-
+ ggml/src/ggml-moe-weighted-reduction.h | 160 ++++
+ ggml/src/ggml.c                        | 342 ++++++++-
+ include/llama.h                        |   4 +
+ src/CMakeLists.txt                     |   1 +
+ src/llama-arch.cpp                     |  20 +-
+ src/llama-arch.h                       |   5 +
+ src/llama-context.cpp                  |  49 +-
+ src/llama-cparams.h                    |   2 +
+ src/llama-lazy-reader.cpp              | 330 +++++++++
+ src/llama-lazy-reader.h                |  91 +++
+ src/llama-memory-hybrid-idx.cpp        | 202 +++++-
+ src/llama-memory-hybrid-idx.h          |  54 +-
+ src/llama-model-loader.cpp             |  22 +-
+ src/llama-model-loader.h               |  12 +
+ src/llama-model.cpp                    |   6 +-
+ src/llama-model.h                      |   6 +
+ src/llama.cpp                          |   3 +-
+ src/models/models.h                    |  48 +-
+ src/models/qwen4exp.cpp                | 967 +++++++++++++++++++++----
+ tests/CMakeLists.txt                   |   1 +
+ tests/test-lazy-reader.cpp             | 264 +++++++
+ tests/test-llama-archs.cpp             |   7 +-
+ 51 files changed, 6602 insertions(+), 325 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
@@ -1476,47 +1472,6 @@ index 6df89013c..408cbce3d 100644
      if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
          const T * src0_d = (const T *) src0->data;
          const T * src1_d = (const T *) src1->data;
-diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index 14e196af7..8428b01f7 100644
---- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-+++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-@@ -1006,6 +1006,36 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
-                     cp_async_wait_all();
-                 }
-                 __syncthreads();
-+
-+                // gfx11 signed-zero leak: a KV row that is masked (P == +0.0) for every query
-+                // column of this block still feeds its V to the WMMA, where the masked cell's
-+                // x + (-0.0) products are accumulated inexactly on gfx11 and leak the cell's
-+                // (possibly stale/freed) content into the output. Never let such a row's V
-+                // reach the multiply: zero it after it is staged, using the mask tile that is
-+                // already in shared memory. Only the plain (non-swizzled) layout is handled;
-+                // the swizzled layout is NVIDIA-only where the hardware does not exhibit the
-+                // leak. V_is_K_view (MLA) reuses K data as V and needs the K tile zeroed
-+                // instead - not implemented here (RDNA caps route those heads to the tile kernel).
-+                if constexpr (!V_is_K_view && !swz_V) {
-+                    if (ncols2 > 1 || mask_h) { // tile_mask is valid iff the mask-add ran
-+                        const int tid = threadIdx.y * warp_size + threadIdx.x;
-+#pragma unroll
-+                        for (int i = tid; i < nbatch_fa; i += nwarps*warp_size) {
-+                            bool dead = true;
-+#pragma unroll
-+                            for (int j = 0; j < ncols1; ++j) {
-+                                dead = dead && (__half2float(tile_mask[j*(nbatch_fa + 8) + i]) <= -1e30f);
-+                            }
-+                            if (dead) {
-+                                half2 * const row = tile_V + i*stride_tile_V;
-+                                for (int k = 0; k < i0_diff/2; ++k) {
-+                                    row[k] = make_half2(0.0f, 0.0f);
-+                                }
-+                            }
-+                        }
-+                        __syncthreads();
-+                    }
-+                }
-             }
-         }
-         const half2 * tile_V_i = !V_is_K_view || i0_stop > 2*nbatch_K2 ? tile_V : tile_V + i0_start/2;
 diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
 new file mode 100644
 index 000000000..d61e96a68
@@ -2189,44 +2144,6 @@ index 000000000..0a2059477
 +
 +void ggml_cuda_flash_attn_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +bool ggml_cuda_flash_attn_qsa_supported(int device, const ggml_tensor * dst);
-diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
-index a8918c668..23ce9a1c4 100644
---- a/ggml/src/ggml-cuda/fattn-tile.cuh
-+++ b/ggml/src/ggml-cuda/fattn-tile.cuh
-@@ -900,6 +900,33 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
-                     }
-                 }
- 
-+                // Masked KV rows have P == +0.0 for every query column this warp
-+                // accumulates. On gfx11 the packed v_dot2_f32_bf16 PV instruction
-+                // accumulates +0.0 x V inexactly, leaking the content of a masked
-+                // (e.g. freed) KV cell into VKQ. Zero this warp's own V register
-+                // copies for those rows so the products are +0.0 x +0.0; other
-+                // warps' columns keep their own (live) V copies.
-+                bool row_dead0 = true;
-+                bool row_dead1 = true;
-+#pragma unroll
-+                for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
-+                    const nv_bfloat162 p = KQ_k[jc_VKQ_0];
-+                    if (__bfloat162float(p.x) != 0.0f) { row_dead0 = false; }
-+                    if (__bfloat162float(p.y) != 0.0f) { row_dead1 = false; }
-+                }
-+                if (row_dead0) {
-+#pragma unroll
-+                    for (int i0 = 0; i0 < (DVp/2)/warp_size; ++i0) {
-+                        V_k0[i0] = ggml_cuda_cast<nv_bfloat162>(make_float2(0.0f, 0.0f));
-+                    }
-+                }
-+                if (row_dead1) {
-+#pragma unroll
-+                    for (int i0 = 0; i0 < (DVp/2)/warp_size; ++i0) {
-+                        V_k1[i0] = ggml_cuda_cast<nv_bfloat162>(make_float2(0.0f, 0.0f));
-+                    }
-+                }
-+
- #pragma unroll
-                 for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
-                     const nv_bfloat162 v_perm0 = ggml_cuda_bf16_perm_ll(V_k0[i0/warp_size], V_k1[i0/warp_size]);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index 4b4951a73..54fed1796 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
@@ -5349,168 +5266,6 @@ index 000000000..c90460a45
 +    match.node_count   = node_count;
 +    return true;
 +}
-diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
-index 0c1b6d067..3437c6e38 100644
---- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
-+++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
-@@ -512,9 +512,26 @@ void main() {
-             }
- 
-             FLOAT_TYPE Pf[rows_per_thread];
-+            bool any_live = false;   // any row of this thread that attends to column c
-+            bool any_mask = false;   // any row masked out at column c (P == +0.0)
-             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                 Pf[r] = FLOAT_TYPE(exp(float(Sf[r][c]) - Mf[r]));
-                 Lf[r] += Pf[r];
-+                if (Pf[r] != FLOAT_TYPE(0.0)) {
-+                    any_live = true;
-+                } else {
-+                    any_mask = true;
-+                }
-+            }
-+
-+            // Masked cells (P == +0.0) must not read V at all: on some targets
-+            // (e.g. gfx1151 f16 WMMA / matrix units) accumulating +-0.0 products
-+            // is inexact, so a fully masked column would leak the sign of whatever
-+            // V the cell last held (e.g. a freed KV cell) into the output. A fully
-+            // masked column contributes exactly +0.0, so it can be skipped outright;
-+            // partially masked columns skip the masked rows below.
-+            if (!any_live) {
-+                continue;
-             }
- 
-             [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-@@ -529,8 +546,16 @@ void main() {
-                 } else {
-                     Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * v_stride / 4 + d * D_split + d_tid]);
-                 }
--                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
--                    Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
-+                if (any_mask) {
-+                    [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-+                        if (Pf[r] != FLOAT_TYPE(0.0)) {
-+                            Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
-+                        }
-+                    }
-+                } else {
-+                    [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-+                        Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
-+                    }
-                 }
-             }
-         }
-diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
-index 057ed739a..3100e61b9 100644
---- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
-+++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
-@@ -62,6 +62,11 @@ shared O_TYPEV4 pvsh[MatBc * osh_stride];
- 
- shared ACC_TYPE slope[Br];
- 
-+// Per-column liveness for the current KV tile: col_live[c] is set when at least one
-+// real query row has a nonzero softmax weight (P) for KV column c of this tile. A
-+// column with no live row is fully masked and must never read V (see below).
-+shared uint32_t col_live[Bc];
-+
- void main() {
- #ifdef NEEDS_INIT_IQ_SHMEM
-     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
-@@ -157,6 +162,10 @@ void main() {
-             mask_cache[idx] = f16vec4(0);
-         }
- 
-+        if (tid < Bc) {
-+            col_live[tid] = 0;
-+        }
-+
-         if (MASK_ENABLE) {
-             if (USE_MASK_OPT && mask_opt_idx != j / 16) {
-                 mask_opt_idx = j / 16;
-@@ -389,6 +398,9 @@ void main() {
-                     const FLOAT_TYPEV4 Pf = FLOAT_TYPEV4(exp(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec));
-                     [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
-                         Lf[r + vec_idx] += Pf[vec_idx];
-+                        if (i * Br + row + vec_idx < N && float(Pf[vec_idx]) != 0.0f) {
-+                            col_live[col] = 1;
-+                        }
-                     }
-                     Psh[col * psh_stride + row / 4] = Pf;
-                 }
-@@ -396,12 +408,14 @@ void main() {
-         }
- 
-         if (SHMEM_STAGING != 0) {
-+            // col_live is written by the Pf loop above; make it visible before zeroing
-+            barrier();
-             [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV_pad / 4; idx += gl_WorkGroupSize.x) {
-                 uint32_t d = (idx + tid) % (HSV_pad / 4);
-                 uint32_t c = (idx + tid) / (HSV_pad / 4);
-                 if (idx + gl_WorkGroupSize.x <= Bc * HSV_pad / 4 || c < Bc) {
-                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
--                    if ((!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4)) {
-+                    if (col_live[c] != 0 && (!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4)) {
- #if !defined(BFLOAT16)
-                         if (USE_DECODE_V) {
-                             uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE_V + 4 * d;
-@@ -421,6 +435,27 @@ void main() {
-         }
-         barrier();
- 
-+        // A tile that applied a mask can contain fully masked columns (no live query
-+        // row, col_live == 0). Those columns must not read V (see the stage_v comment).
-+        // The test is workgroup-uniform and only runs for tiles that may have masked
-+        // cells, so fully-live tiles keep the direct path untouched.
-+        bool tile_has_dead = false;
-+        if (MASK_ENABLE && (!USE_MASK_OPT || (mask_opt_bits != MASK_OPT_ALL_ZERO && mask_opt_bits != MASK_OPT_ALL_NEG_INF))) {
-+            if (tid < Bc && col_live[tid] == 0) {
-+                tile_has_dead = true;
-+            }
-+            tile_has_dead = subgroupOr(tile_has_dead);
-+            barrier();
-+            if (gl_SubgroupInvocationID == 0) {
-+                tmpsh[gl_SubgroupID] = tile_has_dead ? 1.0f : 0.0f;
-+            }
-+            barrier();
-+            tile_has_dead = false;
-+            [[unroll]] for (uint s = 0; s < gl_NumSubgroups; ++s) {
-+                tile_has_dead = tile_has_dead || (tmpsh[s] != 0.0f);
-+            }
-+        }
-+
-         const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
- 
-         // Each subgroup handles HSV/4 columns
-@@ -441,7 +476,11 @@ void main() {
-             if (SHMEM_STAGING == 0) {
-             // For quants we always preload via kvsh. For f16/bf16 we only preload when
-             // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
--            const bool stage_v = USE_DECODE_V || KV_bounds_check;
-+            // A fully masked column (col_live[c] == 0) must never read V: masked cells
-+            // would accumulate +-0.0 x V inexactly on gfx11 f16 WMMA and leak the sign
-+            // of whatever V the cell last held. Such columns are staged through kvsh
-+            // with their V zeroed instead of being loaded direct.
-+            const bool stage_v = USE_DECODE_V || KV_bounds_check || tile_has_dead;
-             if (stage_v) {
-                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
-                     const uint idx = i * gl_WorkGroupSize.x + tid;
-@@ -455,7 +494,7 @@ void main() {
-                     const uint ib = coord / BLOCK_SIZE_V;
-                     const uint iqs = coord % BLOCK_SIZE_V;
- 
--                    if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
-+                    if (col_live[row] != 0 && (!KV_bounds_check || (v_row < KV && v_col < HSV))) {
- #if !defined(BFLOAT16)
-                         if (USE_DECODE_V) {
-                             kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
-@@ -479,7 +518,7 @@ void main() {
-                     coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
- 
-                     if (SHMEM_STAGING == 0) {
--                    if (!USE_DECODE_V && !KV_bounds_check) {
-+                    if (!USE_DECODE_V && !KV_bounds_check && !tile_has_dead) {
-                         // F16/BF16 values can be loaded directly from global memory
-                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
-                         const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 index 5ef03e190..7ee2c06d8 100644
 --- a/ggml/src/ggml.c

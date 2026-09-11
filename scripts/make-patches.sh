@@ -6,21 +6,23 @@
 #                 ../llama.cpp relative to this repo)
 #   baseline-sha  the upstream baseline the patches are generated against
 #                 (default: 9113cc188, see MANIFESTS.md)
-#   blocks-tip    the fork commit carrying all 14 blocks (default:
-#                 ff2b35f49, the block-14 commit of the CANONICAL fork
-#                 rebuilt at 9113cc188.  The block-15 (attention-memory
-#                 campaign) work is NOT part of the delivery; it is staged
-#                 in beta/block-15-campaign-wins/ and applied manually.
-#                 The block-14 tip of the *working* fork checkout
-#                 (~/llama.cpp rdna-boosts) is a different SHA, because
-#                 that branch is a local rebuild -- do not use it for
+#   blocks-tip    the fork commit carrying block 00 + all 14 feature
+#                 blocks (default: 505637d6e, the block-14 commit of the
+#                 CANONICAL fork rebuilt at 9113cc188).  The block-15
+#                 (attention-memory campaign) work is NOT part of the
+#                 delivery; it is staged in beta/block-15-campaign-wins/
+#                 and applied manually.  The block-14 tip of the *working*
+#                 fork checkout (~/llama.cpp rdna-boosts) is a different SHA,
+#                 because that branch is a local rebuild -- do not use it for
 #                 regeneration unless it was rebuilt at the fork point.
 #                 See MANIFESTS.md.)
 #
-# All 14 blocks are the fork commits baseline-sha..blocks-tip, exported with
-# `git format-patch` (the canonical, verified form; applies with `git am`).
-# Every block is a committed fork commit - including block 12 (the hybrid
-# HIP all-reduce), which was previously a working-tree delta.  Blocks 01-11
+# All 15 blocks are the fork commits baseline-sha..blocks-tip, exported with
+# `git format-patch --start-number 0` (the canonical, verified form; applies
+# with `git am`).  Block 00 is the structural/architecture-fix commit that
+# sits directly on the baseline; the feature blocks 01-14 follow.  Every
+# block is a committed fork commit - including block 12 (the hybrid HIP
+# all-reduce), which was previously a working-tree delta.  Blocks 01-11
 # keep their original subjects; 12, 13 and 14 keep theirs too, so the
 # 000N file naming is uniform across the set.
 set -euo pipefail
@@ -28,7 +30,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
 BASELINE="${2:-9113cc188}"
-TIP="${3:-ff2b35f49}"
+TIP="${3:-505637d6e}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then
@@ -39,12 +41,14 @@ cd "$FORK"
 git rev-parse --verify "$BASELINE" >/dev/null 2>&1 || { echo "ERROR: baseline $BASELINE not found in $FORK" >&2; exit 1; }
 git rev-parse --verify "$TIP" >/dev/null 2>&1 || { echo "ERROR: blocks tip $TIP not found in $FORK" >&2; exit 1; }
 
-rm -f "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-4]-*.patch
+rm -f "$PATCHES"/0000-*.patch "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-4]-*.patch
 
-# Blocks 01-14: format-patch (keeps the original subjects; applies with git am).
-git format-patch "$BASELINE".."$TIP" -o "$PATCHES" >/dev/null
+# block 00 + blocks 01-14: format-patch (keeps the original subjects; applies with git am).
+# --start-number 0 makes the first commit's file 0000-* so the file number matches
+# the block number (block 00 -> 0000, block 01 -> 0001, ... block 14 -> 0014).
+git format-patch --start-number 0 "$BASELINE".."$TIP" -o "$PATCHES" >/dev/null
 
 echo "Regenerated $PATCHES:"
-ls "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-4]-*.patch | wc -l
-echo "patches (14 blocks).  Verify with scripts/apply-all.sh on a"
+ls "$PATCHES"/0000-*.patch "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-4]-*.patch | wc -l
+echo "patches (15 blocks: 00 + 01-14).  Verify with scripts/apply-all.sh on a"
 echo "fresh checkout at $BASELINE."

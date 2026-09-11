@@ -4,7 +4,7 @@ Cross-project tracker so important state survives context compaction.
 Forward-looking: open items + current active experiments; closed work is a
 one-line bullet (details live in AGENTS.md, patches/README.md, MANIFESTS.md,
 `beta/qwen4exp/README.md`, `wip/` handovers, `benchmarks/`). Current
-delivery = the 14-patch set against fork point `9113cc188` (blocks 01-14).
+delivery = the 15-patch set against fork point `9113cc188` (block 00 + blocks 01-14).
 Block 15 is STAGED in `beta/block-15-campaign-wins/`, not promoted.
 
 ## Current active
@@ -87,8 +87,8 @@ Block 15 is STAGED in `beta/block-15-campaign-wins/`, not promoted.
   splitter tolerate a zero-extent device share.  See `patches/README.md`.
 - **Fork/canonical state**: the working checkout's `rdna-boosts` is a local rebuild and must NOT be used
   for regeneration if it sits on a master newer than the fork point (it would export `f3f1a8f27`
-  + `304665fe7` as patches 0001/0002).  The canonical 14-block chain used for the delivery ends at the
-  block-14 commit `ff2b35f49` (rebuilt at `9113cc188`); `make-patches.sh` default tip = `ff2b35f49`.
+  + `304665fe7` as patches 0001/0002).  The canonical 15-block chain used for the delivery ends at the
+  block-14 commit `505637d6e` (rebuilt at `9113cc188`); `make-patches.sh` default tip = `505637d6e`.
   The beta block-15 patch is applied manually on top of that tree.
 - Superseded/still-useful artifacts: the work branch `wip/block15-campaign-wins` (`b26ae06f0`) and
   `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch` remain as the pre-merge

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply the full rdna-boosts patch set (blocks 01-14)
+# Apply the full rdna-boosts patch set (block 00 + blocks 01-14)
 # to a clean llama.cpp checkout at the recorded baseline.
 #
 # Usage: ./apply-all.sh [llama.cpp-checkout] [rdna-boosts-repo]
@@ -7,9 +7,11 @@
 #   rdna-boosts-repo     path to THIS repo (default: parent of scripts/)
 #
 # Requires a clean llama.cpp working tree checked out at the baseline SHA
-# recorded in MANIFESTS.md (currently 9113cc188).  All 14 blocks are applied
+# recorded in MANIFESTS.md (currently 9113cc188).  All 15 blocks are applied
 # with `git am` (plain `git apply` of the concatenated series silently drops
 # hunks -- verified 2026-08-29), one commit each with the block subject.
+# Block 00 (structural and architecture fixes) is applied first; every other
+# block builds on top of it.
 # If the strict apply ever fails (e.g. applying onto a close-but-drifted
 # base), the whole series is retried with `git am -3` (3-way merge against
 # the blob ids recorded in the format-patch output); true conflicts still
@@ -44,15 +46,15 @@ git checkout -q -b "$BRANCH"
 # retry the whole series with `git am -3`, warning loudly that merged hunks
 # may differ from the canonical tree.
 APPLIED_WITH_3WAY=0
-if ! git am "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-4]-*.patch; then
+if ! git am "$PATCHES"/0000-*.patch "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-4]-*.patch; then
     echo "strict 'git am' failed at this base; aborting and retrying the series with 'git am -3' (3-way merge)" >&2
     git am --abort >/dev/null 2>&1 || true
-    git am -3 "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-4]-*.patch
+    git am -3 "$PATCHES"/0000-*.patch "$PATCHES"/000[1-9]-*.patch "$PATCHES"/001[0-4]-*.patch
     APPLIED_WITH_3WAY=1
 fi
 
 echo
-N_BLOCKS=14
+N_BLOCKS=15
 if [ "$APPLIED_WITH_3WAY" -eq 1 ]; then
     echo "WARNING: applied with 'git am -3' (hunks merged against the recorded blob ids)."
     echo "If this checkout was not at the recorded baseline, diff the applied tree against"

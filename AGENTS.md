@@ -7,13 +7,21 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
 A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
-(`rdna-boosts` branch) as a **14-patch set** that applies to a clean
-llama.cpp checkout at the fork point **`9113cc188`** (re-based 2026-09-08
+(`rdna-boosts` branch) as a **15-patch set** (block 00 + blocks 01-14) that
+applies to a clean llama.cpp checkout at the fork point **`9113cc188`** (re-based 2026-09-08
 from `050dde50c`, itself re-based 2026-09-07 from `465e49b9c`, itself
 re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
 
+- Block **00** (`patches/0000-rdna-boosts-block-00-structural-and-architecture-fix.patch`):
+  **structural and architecture fixes** — the base every later block applies on
+  top of.  Added 2026-09-10 with (1) FA small-batch KV-split width invariance
+  (issue #25: decode and every speculative verify width now reduce identically,
+  so greedy MTP output no longer changes with `--spec-draft-n-max`) and (2) the
+  Vulkan masked-V/freed-cell fixes (`flash_attn_cm1.comp`/`flash_attn.comp`).
+  See the 2026-09-10 block-00 section in `patches/README.md`.
 - Blocks **01-11** (`patches/0001-…0011-…`): MTP draft depth, fused chunked
-  GDN, BF16 KV, WMMA flash-attn, CPU bit-identical decode, host-buffer
+  GDN, BF16 KV (block 03 also carries the **HIP masked-V/freed-cell fixes**
+  since 2026-09-10), WMMA flash-attn, CPU bit-identical decode, host-buffer
   revert, meta wrapper skip, fused core, meta headroom, k-quant boosts,
   CUDA prefill-graph skip.
 - Block **12** (`patches/0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch`): the hybrid HIP
@@ -54,19 +62,15 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   2026-09-07 — QSA sparse FA (default) + fused indexer top-k/score,
   HC_MIX/HC_COMBINE fused decode ops, managed lazy reader + PLE n-gram
   loading, MTP draft-head, WS4 hyperconn prefill fusions, per-arch
-  dense/QSA decode policy; **amended 2026-09-10 with the kernel-side
-  masked-V fixes, and the 2026-09-09 gfx1151-only freed-cell host
-  zeroing it replaces is REMOVED** (`llama-kv-cache.{cpp,h}` back to the
-  upstream state; no `zero_freed`/env `LLAMA_KV_ZERO_FREED`/per-free GPU
-  memsets).  In its place block 14 carries three unconditional kernel
-  fixes that keep masked (freed/stale) flash-attention cells at exactly
-  +0.0 on every device: HIP `fattn-tile.cuh` (packed-bf16 PV), HIP
-  `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles), Vulkan
-  `flash_attn_cm1.comp` + `flash_attn.comp` (dead columns never read V) —
-  see the 2026-09-10 block-14 amendment section in
-  `patches/README.md`); see the block-14 notes in
-  `patches/README.md`
-  and the beta validation record in `beta/qwen4exp/README.md`.
+  dense/QSA decode policy; **the 2026-09-09 gfx1151-only freed-cell host
+  zeroing stays REMOVED** (`llama-kv-cache.{cpp,h}` are the upstream state; no
+  `zero_freed`/env `LLAMA_KV_ZERO_FREED`/per-free GPU memsets) and the
+  kernel-side masked-V fixes it was replaced with were re-homed on 2026-09-10:
+  the Vulkan `flash_attn_cm1.comp`/`flash_attn.comp` fixes now live in block 00,
+  the HIP `fattn-tile.cuh`/`fattn-mma-f16.cuh` fixes now live in block 03 (they
+  sit on the native-BF16 FA path block 03 introduces), so block 14 carries none
+  of them.  See the block-14 notes in `patches/README.md` and the beta
+  validation record in `beta/qwen4exp/README.md`.
 - Block **15** (STAGED in `beta/block-15-campaign-wins/`, **NOT a delivery patch**): the attention-memory campaign wins --
   **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived QSA
   per-block bias + derived visibility + the input-fill null guards
@@ -98,20 +102,24 @@ time been rebased onto a master **two commits newer than the recorded fork
 point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
-two upstream commits as patches 0001/0002.  The **canonical** 14-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `ff2b35f49`,
+two upstream commits as patches 0001/0002.  The **canonical** 15-block
+chain is a rebuild of the delivery set at `9113cc188` (tip `505637d6e`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`), which is what `scripts/make-patches.sh`'s default tip refers
 to; always regenerate from a canonical fork rebuilt at the fork point.
 **Block 15 (the attention-memory campaign) is NOT in the delivery** -- it
 is staged in `beta/block-15-campaign-wins/`.
 
-Block provenance on the canonical chain: blocks 01-14 = the fork's block
+Block provenance on the canonical chain: block 00 added 2026-09-10 (FA
+small-batch KV-split width invariance, issue #25, plus the Vulkan
+masked-V fixes — see the block-00 section in `patches/README.md`);
+blocks 01-14 = the fork's block
 commits on master `9113cc188` (2026-09-08 re-base; block 01 refreshed
 2026-09-09 to the upstream PR #27210 review head `d236d41a2`, still one
-squashed block; block 14 amended 2026-09-10 with the kernel-side
-masked-V fixes — the 2026-09-09 gfx1151-only freed-cell host zeroing is
-removed; on the re-base block 06 was
+squashed block; block 03 amended 2026-09-10 with the HIP masked-V/
+freed-cell fixes, re-homed from block 14; block 14's 2026-09-09 gfx1151-only
+freed-cell host zeroing is removed and its 2026-09-10 masked-V fixes were
+re-homed — Vulkan to block 00, HIP to block 03; on the re-base block 06 was
 reduced to a host-buffer
 rationale marker — upstream itself reverted #24233 in #28604 on
 2026-09-08, matching its end state, so the functional delta is now
@@ -138,11 +146,12 @@ guard). The
 canonical `9113cc188` fork used for `make-patches.sh`
 regeneration is disposable and is re-created from `patches/` +
 `scripts/apply-all.sh` whenever it needs rebuilding (fresh clone at the
-fork point + apply) — the last 14-block regeneration (2026-09-10, block 14
-with the kernel-side masked-V fixes) applied strict 14/14 `git am` and
-produced tip `ff2b35f49`; the `0001`-`0014` bodies are byte-identical to
-the previous regeneration apart from the `From <sha>` line and the
-`[PATCH NN/14]` series count.  (The block-15 attention-memory campaign was
+fork point + apply) — the last regeneration (2026-09-10, the 15-block set
+with block 00 and the re-homed masked-V fixes) applied strict 15/15 `git am`
+and produced tip `505637d6e`; the blocks' bodies are byte-identical to the
+previous regeneration apart from the `From <sha>` line and the
+`[PATCH NN/14]` series count (plus the block-00 Vulkan and block-03 HIP
+hunks).  (The block-15 attention-memory campaign was
 temporarily staged as a 15th patch and then un-promoted; it lives only in
 `beta/block-15-campaign-wins/`.)  Older fork states are
 preserved on the `stew675/llama.cpp` fork remote (`rdna-boosts` =
@@ -183,10 +192,10 @@ explicitly requests it.**
 | `MANIFESTS.md` | apply order, per-block verification, validation history |
 | `BASELINE.md` | fork point, patch provenance, drift policy |
 | `GREEDY-PURITY.md` | block-10 decode-variance analysis (read before shipping) |
-| `patches/` | **the delivery set** (0001-0014) + apply README |
-| `scripts/apply-all.sh` | the verified apply flow (`git am` blocks 01-14, automatic `git am -3` fallback on a drifted base) |
+| `patches/` | **the delivery set** (0000-0014: block 00 + blocks 01-14) + apply README |
+| `scripts/apply-all.sh` | the verified apply flow (`git am` block 00 + blocks 01-14, automatic `git am -3` fallback on a drifted base) |
 | `scripts/make-patches.sh` | regenerates the set from the fork |
-| `rdna-boosts-all.patch` | the entire 14-patch net as ONE patch (fork point only) |
+| `rdna-boosts-all.patch` | the entire 15-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `wip/` | exploration docs, tuning tools, session handoffs — **NOT part of the delivery** (see the WIP rule below) |
 | `beta/` | **promoted-from-WIP staging** (e.g. `beta/qwen4exp/` = qwen4exp support + its validation record; `qwen4exp-support.patch` promoted into the delivery as block 14).  `beta/block-15-campaign-wins/` is the beta record for **Block 15** (staged 2026-09-10, **NOT a delivery patch**; it lives only in `beta/block-15-campaign-wins/block-15-campaign-wins.patch`): its README is the promotion/gate record and `BETA-TESTING.md` the tester checklist — see the WIP rule below |
@@ -346,15 +355,16 @@ Diff the output against a known-good build (or against RCCL via
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `ff2b35f49`): `git format-patch` the block commits (all 14
-blocks are committed fork commits; `git diff <base>..<tip>` yields
+blocks tip `505637d6e`): `git format-patch --start-number 0` the block
+commits (all 15 blocks are committed fork commits; block 00 keeps the file
+prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
 `~/llama.cpp` checkout's `rdna-boosts` branch is NOT the canonical chain**
 — it may be rebased onto a master two commits newer
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
-0001/0002.  The canonical 14-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `ff2b35f49`), which is what the default tip names.  Always regenerate from a
+0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
+`9113cc188` (tip `505637d6e`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/14]` series count change.  Then

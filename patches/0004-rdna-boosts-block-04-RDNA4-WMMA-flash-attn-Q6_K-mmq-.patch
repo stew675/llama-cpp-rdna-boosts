@@ -1,4 +1,4 @@
-From ce1e1f226293354f35662e33561dfa02e8a9e84a Mon Sep 17 00:00:00 2001
+From 9526a30933815ab1d7b76d7214fdee06d4ba210c Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 04/14] rdna-boosts: block 04: RDNA4 WMMA flash-attn + Q6_K mmq
@@ -14,7 +14,7 @@ Subject: [PATCH 04/14] rdna-boosts: block 04: RDNA4 WMMA flash-attn + Q6_K mmq
  6 files changed, 194 insertions(+), 15 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index bc5060e81..14e196af7 100644
+index 8eac8dd4f..8428b01f7 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 @@ -159,19 +159,19 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
@@ -44,7 +44,7 @@ index bc5060e81..14e196af7 100644
      GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 128, 2,  32, 160, 128, 128, 1, true);
  
      return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
-@@ -1742,7 +1742,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1772,7 +1772,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  }
              }
          }
@@ -55,7 +55,7 @@ index bc5060e81..14e196af7 100644
              __syncthreads();
          }
      }
-@@ -1826,7 +1828,7 @@ static __global__ void flash_attn_ext_f16(
+@@ -1856,7 +1858,7 @@ static __global__ void flash_attn_ext_f16(
  #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
  
  #if defined(AMD_WMMA_AVAILABLE)
@@ -64,7 +64,7 @@ index bc5060e81..14e196af7 100644
          NO_DEVICE_CODE;
          return;
      }
-@@ -1907,6 +1909,11 @@ static __global__ void flash_attn_ext_f16(
+@@ -1937,6 +1939,11 @@ static __global__ void flash_attn_ext_f16(
                   ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
          }
  

@@ -3693,6 +3693,33 @@ index 6df89013c..408cbce3d 100644
      if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
          const T * src0_d = (const T *) src0->data;
          const T * src1_d = (const T *) src1->data;
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 7442bc22a..22eec7d57 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1167,13 +1167,21 @@ void launch_fattn(
+         // parallel_blocks must not be larger than what the tensor size allows:
+         parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+ 
++        // Decode and speculative verify batches (n_q <= 8) must use a query-width-
++        // independent KV split: ntiles_dst is a function of Q->ne[1]
++        // (ntiles_x = ceil(Q->ne[1]/ncols1)), so n_q=3 and n_q=5 would otherwise
++        // feed different partial sums into the online-softmax/PV combine, drift the
++        // logits in the last bits and flip greedy near-ties (issue #25).  Evaluate
++        // the heuristic as if n_q == 1 so every small batch agrees.
++        const int ntiles_dst_eff = Q->ne[1] <= 8 ? (ntiles_z_gqa * K->ne[2] * Q->ne[3]) : ntiles_dst;
++
+         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
+         // Test whether parallel_blocks can be set to a higher value for better efficiency.
+         const int blocks_per_wave = nsm * max_blocks_per_sm;
+         int nwaves_best = 0;
+         int efficiency_percent_best = 0;
+         for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+-            const int nblocks_total = ntiles_dst * parallel_blocks_test;
++            const int nblocks_total = ntiles_dst_eff * parallel_blocks_test;
+             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+ 
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 index bc5060e81..8428b01f7 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh

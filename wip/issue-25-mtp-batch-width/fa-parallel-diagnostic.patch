@@ -1,0 +1,51 @@
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 5da4083fe..72197a46b 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1388,6 +1388,28 @@ void launch_fattn(
+         blocks_num.y = parallel_blocks;
+         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
+ 
++        {
++            const char * fap = std::getenv("FA_FORCE_PARALLEL");
++            if (fap) {
++                parallel_blocks = std::atoi(fap);
++                blocks_num.y = parallel_blocks;
++            }
++            static const bool fa_pin = std::getenv("FA_PIN_PARALLEL") != nullptr;
++            if (fa_pin && Q->ne[1] <= 8) {
++                parallel_blocks = std::min(max_blocks_per_sm, ntiles_KV);
++                blocks_num.y = parallel_blocks;
++            }
++        }
++
++        {
++            static const bool fa_dbg = std::getenv("FA_DEBUG") != nullptr;
++            if (fa_dbg) {
++                std::fprintf(stderr, "[FA_DEBUG] nq=%lld ntiles_x=%d ntiles_dst=%d ntiles_KV=%d parallel=%d ncols=%d ncols1=%d ncols2=%d grid=(%u,%u,%u) max_bpsm=%d stream_k=%d\n",
++                    (long long) Q->ne[1], ntiles_x, ntiles_dst, ntiles_KV, parallel_blocks, ncols, ncols1, ncols2,
++                    blocks_num.x, blocks_num.y, blocks_num.z, max_blocks_per_sm, (int) stream_k);
++            }
++        }
++
+         if (parallel_blocks > 1) {
+             dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
+             dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index dd554056e..dedb0a74c 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -1517,6 +1517,13 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+         const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+         const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+         fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
++        {
++            static const bool fa_dbg_t = std::getenv("FA_DEBUG") != nullptr;
++            if (fa_dbg_t) {
++                std::fprintf(stderr, "[FA_DEBUG_TILE] nq=%lld ncols2=%d cols_per_block=%d nwarps=%d nbatch_fa=%d\n",
++                    (long long) Q->ne[1], ncols2, cols_per_block, nwarps, nbatch_fa);
++            }
++        }
+         launch_fattn<DV, cols_per_block/ncols2, ncols2>
+             (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+             need_f16_K, need_f16_V, false, false, warp_size);

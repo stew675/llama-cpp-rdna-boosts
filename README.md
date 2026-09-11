@@ -1,6 +1,6 @@
 # llama-cpp-rdna-boosts
 
-A delivery repo for a **14-patch set** of **RDNA3 / RDNA3.5 / RDNA4**
+A delivery repo for a **15-patch set** (block 00 + blocks 01-14) of **RDNA3 / RDNA3.5 / RDNA4**
 (ROCm) feature enhancements and performance fixes for llama.cpp:
 **blocks 01-11** (MTP, GDN, BF16 KV,
 WMMA flash-attn, fused core, k-quant boosts, CUDA prefill-graph skip),
@@ -26,7 +26,7 @@ see
 native q8_0/bf16 K/V (V4/V5), QSA score-chain/bias/indexer-cache pruning
 (W1-W3) and the ggml-alloc unused-view release (W4)) is **NOT part of the
 delivery yet** — it is staged in `beta/block-15-campaign-wins/` and applied
-manually on top of the 14-block tree, pending the maintainer's go-ahead.
+manually on top of the 15-block tree, pending the maintainer's go-ahead.
 The patches apply to a clean
 llama.cpp checkout at the recorded fork point `9113cc188` (re-based 2026-09-08 from `050dde50c`, itself re-based 2026-09-07 from `465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`).
 
@@ -71,9 +71,10 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 
 ## Current state
 
-The current delivery is a **14-patch set** for llama.cpp at the fork
-point `9113cc188` (blocks 01-14 in `patches/`, applied with `git am` via
-`scripts/apply-all.sh`; canonical 14-block tip `ff2b35f49` rebuilt at the
+The current delivery is a **15-patch set** (block 00 + blocks 01-14) for
+llama.cpp at the fork
+point `9113cc188` (blocks 00-14 in `patches/`, applied with `git am` via
+`scripts/apply-all.sh`; canonical 15-block tip `505637d6e` rebuilt at the
 fork point).  **Block 15 (the attention-memory campaign) is staged in
 `beta/block-15-campaign-wins/` and is not delivered yet** -- the notes
 below are the beta record.  The set applies
@@ -88,8 +89,22 @@ integrations, re-baselines, regenerations) are tracked as dated entries
 — newest first — in **[`WORKLOG.md`](WORKLOG.md)**; the current-state
 summary below is deliberately short and does not repeat them.
 
-- **Latest entry (2026-09-10): block 15 (attention-memory campaign) is
-  STAGED in `beta/block-15-campaign-wins/`, NOT part of the 14-patch
+- **Latest entry (2026-09-10): block 00 (structural and architecture fixes)
+  is the new first block.**  `patches/0000` holds the FA small-batch
+  KV-split width invariance (issue #25 — `launch_fattn`'s `parallel_blocks`
+  heuristic keyed off `Q->ne[1]`, so decode and a speculative verify batch
+  grouped the online-softmax/PV partials differently and greedy output
+  changed with the MTP draft length; it now evaluates the heuristic as if
+  `n_q == 1` for every `n_q <= 8`) plus the Vulkan masked-V/freed-cell fixes
+  (`flash_attn_cm1.comp`/`flash_attn.comp`).  The **HIP** masked-V fixes
+  moved from block 14 into block 03 (they sit on the native-BF16 FA path
+  block 03 introduces).  The set is now 15 patches (`0000`-`0014`);
+  validated clean-apply 15/15, issue #25 fixed on 1/2/3-GPU, plain decode
+  byte-identical, MTP acceptance gate unchanged.  Full record in
+  [`WORKLOG.md`](WORKLOG.md).
+
+- **Previous entry (2026-09-10): block 15 (attention-memory campaign) is
+  STAGED in `beta/block-15-campaign-wins/`, NOT part of the 15-patch
   delivery** (beta patch tip `377f8e790`; V5 native bf16 K/V and the
   RDNA3_5/gfx1151 V3 fix amended in).  Seven validated wins
   in one block, each with an environment A/B gate (V4 is opt-in):
@@ -164,8 +179,8 @@ summary below is deliberately short and does not repeat them.
 ├── BASELINE.md            # fork point, patch provenance, drift policy
 ├── GREEDY-PURITY.md       # block 10 decode-variance analysis (read before shipping)
 ├── WORKLOG.md             # dated delivery records (newest first; README points here)
-├── rdna-boosts-all.patch  # convenience: the entire 14-patch net as ONE patch
-├── patches/               # the delivery set: 0001-0014
+├── rdna-boosts-all.patch  # convenience: the entire 15-patch net as ONE patch
+├── patches/               # the delivery set: 0000-0014
 │   └── README.md          # apply instructions + block-12 env knobs + server config
 ├── scripts/
 │   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift)
@@ -182,13 +197,14 @@ summary below is deliberately short and does not repeat them.
 > in `archive/docs/` (see also `archive/work/` for the closed experiments).
 > Do not mix them with the current `patches/` files.
 
-## The 14 blocks
+## The 15 blocks
 
 | patch | what |
 |-------|------|
+| `0000` | **structural and architecture fixes** — FA small-batch KV-split width invariance (issue #25) + Vulkan masked-V/freed-cell fixes (dead columns never read V). The base every later block applies on top of. |
 | `0001` | adaptive MTP draft depth (`--draft-mtp-adaptive`) |
 | `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA, arch-segregated gfx12/gfx11) |
-| `0003` | BF16 KV cache + native-BF16 flash-attn |
+| `0003` | BF16 KV cache + native-BF16 flash-attn (+ the HIP masked-V/freed-cell fixes since 2026-09-10) |
 | `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf (WMMA path also runs on RDNA3.0/3.5, tuned head limits) |
 | `0005` | CPU bit-identical decode/verify batches |
 | `0006` | host-buffer revert for discrete GPUs |
@@ -199,12 +215,12 @@ summary below is deliberately short and does not repeat them.
 | `0011` | skip CUDA graphs for multi-token PRE-FILL (decode keeps graph replay) |
 | `0012` | **hybrid HIP all-reduce** — custom internal AR for the small-tensor decode path, per-size hybrid dispatch vs RCCL, RDNA4-only gate (bounded in-kernel spin since 2026-08-30 fix round; builds without RCCL) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** — prefill fused expert MMQ (RDNA4 + RDNA3_5 + RDNA3_0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K, env opt-out `GGML_CUDA_DISABLE_MOE_MMQ_FUSION`) + decode item-split (rpb 2/4/8) merged with the upstream has_fusion mmvq path |
-| `0014` | **qwen4exp / Qwen3.8-Flash-Next support** — QSA sparse FA (default) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy (promoted from `beta/qwen4exp`; see `patches/README.md` block-14 notes) |
+| `0014` | **qwen4exp / Qwen3.8-Flash-Next support** — QSA sparse FA (default) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy (promoted from `beta/qwen4exp`; see `patches/README.md` block-14 notes). The masked-V/freed-cell fixes it once carried now live in blocks 00 (Vulkan) and 03 (HIP). |
 
 > **Block 15 (attention-memory wins: V3 derived kq mask, V4/V5 native
 > q8_0/bf16 K/V, W1-W4) is NOT part of this delivery — it is staged in
 > `beta/block-15-campaign-wins/` and applied manually on top of the
-> 14-block tree, pending the maintainer's go-ahead.**
+> 15-block tree, pending the maintainer's go-ahead.**
 
 > **Greedy-purity note (read before shipping):** on the K-split decode
 > paths, block 10 (`0010`) is the only patch that changes decode numerics on

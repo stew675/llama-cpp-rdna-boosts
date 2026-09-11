@@ -259,3 +259,19 @@ includes block 13**:
    Dense long-K decode (the common case) is back to block-10-only variance;
    MoE/short-K decode carries block-13 variance. Full-set greedy output
    remains fully deterministic within a single build.
+
+## 10. Block 00 makes the verify width irrelevant on the small-batch path (2026-09-10)
+
+Block 00 (the structural block) removes a second, previously separate
+source of greedy variance: the flash-attention KV split. `launch_fattn`'s
+`parallel_blocks` heuristic keyed off `ntiles_dst`, a function of
+`Q->ne[1]`, so single-token decode (`n_q = 1`) and a speculative verify
+batch (`n_q = 3`, `5`, …) grouped the fp32 online-softmax / PV partial
+sums differently and produced different logits.  `--spec-draft-n-max 2`
+and `4` therefore streamed apart at near-ties even though both ran the
+same kernel instantiation (issue #25).  Block 00 evaluates the heuristic
+as if `n_q == 1` for every `n_q <= 8`; decode and every verify width now
+reduce identically, and plain decode is byte-identical (only `n_q >= 2`
+moves).  `n_q = 1` vs a verify batch can still differ because the FA
+*kernel* is selected from `Q->ne[1]` (decode may take the VEC kernel);
+that is a decode-vs-verify difference, not a draft-length one.
