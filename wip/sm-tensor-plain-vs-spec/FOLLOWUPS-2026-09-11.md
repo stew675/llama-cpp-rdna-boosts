@@ -228,7 +228,25 @@ dump **every** node, including fused ones).
 
 ---
 
-## Part 3 — the multi-token verify batch is not bit-identical to single-token decode (OPEN, pre-existing)
+## Part 3 — the multi-token verify batch is not bit-identical to single-token decode
+
+> **STATUS 2026-09-11: root-caused, and the fork-specific half is FIXED.**
+> There are two independent causes.
+> **Cause A (fork-specific) = block 12's size-based all-reduce dispatch** --
+> `ggml_backend_cuda_comm_is_small()` routed reductions below 32768 elements (2
+> devices) to the internal pipeline and above them to NCCL; the reduced tensors
+> scale with the batch width (`ne = ne0 * n_tokens`, ne0 = 5120), so a 7-token
+> verify batch crossed the limit and was reduced by a different algorithm than
+> 1-token decode.  **Fixed** by raising the 2-device crossover to 131072 (block
+> 12, tip `daf32f804`): probe `W = 1/6/7/8` are now all `a4817ee6` and text
+> `none == n4 == n6 == n7` (`6e8ccd25`), with MTP +12% at `n_max 6`/`12` and
+> pp/tg unchanged.  **Cause B (deliberate, still open) = the FA
+> tile-vs-WMMA switch at `Q->ne[1] > 8`**, which caps the guarantee at the
+> designed `n_max <= 7`; it is documented in the fork's own `fattn.cu` comment.
+> The *upstream* comparison below is a separate mechanism again (the CPU
+> backend's own batched-vs-single dispatch).  Everything after this box is the
+> pre-fix record, kept for method.
+
 
 ### What it is
 

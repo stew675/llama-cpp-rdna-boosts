@@ -10,6 +10,55 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Block 12 amended: the hybrid all-reduce's size-based dispatch changed the reduction algorithm with the batch width (2026-09-11).**
+  `ggml_backend_cuda_comm_is_small()` sent reductions below a per-device-count
+  element count to the internal host-staged pipeline and everything above it to
+  NCCL.  The two paths are **not bit-identical** (different summation order;
+  the internal path always does the FP32->BF16 round-trip).  Under `-sm tensor`
+  the reduced tensors scale with the batch width (`ne = ne0 * n_tokens`; ne0 =
+  5120 on the 27B), so with the old 2-device value 32768 a **7-token**
+  speculative verify batch (35840 elements) was reduced by NCCL while 1..6-token
+  decode stayed on the internal pipeline: the same logical reduction, a
+  different algorithm, purely because the batch got one token wider.  This -- not
+  the GDN, and not MMVQ -- is what the earlier entries in this log called a
+  pre-existing `n_max >= 6` divergence for 2-GPU `-sm tensor`.  (A second,
+  *separate and deliberate* boundary remains at `W >= 9`: the FA launcher's
+  tile-vs-WMMA switch at `Q->ne[1] > 8`, which caps the guaranteed range at
+  `n_max <= 7` by design.  `GREEDY-PURITY.md` section 11 now states both causes
+  and the per-configuration ranges.)
+  **Fix:** raise the 2-device crossover 32768 -> 131072 (the 3-device value).
+  The largest verify batch (`--spec-draft-n-max 16` -> 17 tokens = 87040
+  elements) stays well under it, and still far below the internal pipeline's own
+  1 MB (262144 element) cap, so nothing is pushed off the fast path.  Only
+  7..25-token tensors change path; one-token decode and prefill (>25 tokens) are
+  untouched.
+  **Evidence** (27B Q8_0, 2-GPU tensor, `-ts 1/1`, probe/`llama-cli`):
+  `GGML_CUDA_ALLREDUCE=internal` (one algorithm for every size) makes probe
+  `W = 1/6/7/8` all `a4817ee6`; the fix does the same, with `W <= 6` keeping
+  their previous hash, i.e. plain decode is bit-unchanged and only `W = 7,8`
+  move onto the internal pipeline.  Text `none == n4 == n6 == n7` (`6e8ccd25`;
+  previously pure only to `n_max 4`/5).  1-GPU `W=1 == W=8`; 3-GPU text
+  `none == n6`; GDN K-independence `RS=6 W=6 == RS=0 W=1`; determinism `W=7`
+  twice identical.
+  **Perf is a win on both axes:** MTP `n_max 6` acceptance 0.509 -> 0.533 and
+  63.6 -> 71.3 t/s (+12.1%); `n_max 12` 51.7 -> 58.0 t/s (+12.2%); llama-bench
+  pp512 2009.08 -> 2004.12, pp4096 1905.00 -> 1907.41, tg128 31.92 -> 31.97
+  (all unchanged within noise).
+  **Localisation method** (temporary instrumentation, since reverted): a
+  backend-side per-node digest dump in `ggml_backend_cuda_graph_compute`, gated
+  on a phase file, reading each tensor through its own `nb[]` strides after a
+  device sync.  `cb_eval` is unusable for this (it changes MoE numerics and
+  aborts in the meta backend under tensor split), and `ggml_backend_tensor_get`
+  flattens from the view's base pointer ignoring `nb[]`, which alone produced a
+  field of false positives.  The dump showed the layer-0 GDN chain bit-exact and
+  the first divergence exactly at the first cross-device reduction
+  (`attn_residual-0`), whose buffer the meta backend rewrites in place between
+  the producing MUL_MAT and its consumer.
+  Canonical: block 12 `eec68b2ad` -> `cac14423e` (blocks 13/14 re-cut: `070096e16`
+  -> `c43beca1b`, `30d119ea9` -> `daf32f804`), tip `daf32f804`, net tree
+  `10f94d635`; clean-apply strict 15/15 `git am`, zero whitespace, applied tree
+  == canonical; blocks 00-11 bodies byte-identical.
+
 - **Block 02 amended (final form): the whole-batch K-independent chunked GDN prefill — free, no tail, no gate (2026-09-11).**
   Follows the KTAIL=16 entry below, which it supersedes.  Option B from
   `wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md`: instead of *sharing a

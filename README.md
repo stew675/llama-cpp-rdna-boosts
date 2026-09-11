@@ -74,7 +74,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 The current delivery is a **15-patch set** (block 00 + blocks 01-14) for
 llama.cpp at the fork
 point `9113cc188` (blocks 00-14 in `patches/`, applied with `git am` via
-`scripts/apply-all.sh`; canonical 15-block tip `30d119ea9` rebuilt at the
+`scripts/apply-all.sh`; canonical 15-block tip `daf32f804` rebuilt at the
 fork point).  **Block 15 (the attention-memory campaign) is staged in
 `beta/block-15-campaign-wins/` and is not delivered yet** -- the notes
 below are the beta record.  The set applies

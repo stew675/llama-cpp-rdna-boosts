@@ -103,7 +103,7 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `30d119ea9`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `daf32f804`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the whole-batch
 K-independent chunked GDN prefill), which is what
@@ -126,7 +126,10 @@ reduced to a host-buffer
 rationale marker — upstream itself reverted #24233 in #28604 on
 2026-09-08, matching its end state, so the functional delta is now
 upstream (see the WORKLOG re-base entry); block 12 carries the
-2026-09-04 runtime NCCL-failure fallback, issue #13; block 13 amended
+2026-09-04 runtime NCCL-failure fallback, issue #13, and was amended
+2026-09-11 so the hybrid dispatch's small/large crossover no longer changes
+the reduction algorithm across the decode/verify band (2-device `32768` ->
+`131072` elements); block 13 amended
 2026-09-02/09-05/09-06 as above and 2026-09-08 with the
 moe_weighted_reduction float4 remainder fix (issue #19, reported by
 briansp2020); block 14 added 2026-09-07 and amended
@@ -160,7 +163,7 @@ it again: strict 15/15 `git am`, zero whitespace warnings, applied tree
 `31e153fe3` == canonical, tip `27bd754b6`; the 2026-09-11 block-02 re-cut to
 the whole-batch chunked prefill (free alignment, gate + K-dependent branches
 removed, rollback guard added) re-ran it last: strict 15/15 `git am`, zero
-whitespace, applied tree `29714ad1f` == canonical, tip `30d119ea9`).  Apart from the
+whitespace, applied tree `10f94d635` == canonical, tip `daf32f804`).  Apart from the
 block-02 and block-13 hunks the blocks' bodies are byte-identical to the
 previous regeneration apart from the `From <sha>` line and the
 `[PATCH NN/15]` series count (plus the block-00 Vulkan and block-03 HIP
@@ -265,9 +268,11 @@ explicitly requests it.**
   **removed** (~118 lines) — both were unreachable with the gate ON and the
   opt-out no longer bought any performance.  `GGML_CUDA_GDN_CHUNKED=0` is the
   only switch left (forces the sequential kernel: correct, bit-identical,
-  slow).  **Note the pure `none == draft-mtp` range is `n_max <= 5`, not 15** —
-  beyond that a multi-token verify batch hits a different MUL_MAT dispatch
-  regardless of this block (`GREEDY-PURITY.md` §11, follow-ups Part 3).
+  slow).  **Note the pure `none == draft-mtp` range is `n_max <= 7`, not 15** —
+  an 8-token verify batch is the designed limit (the FA tile-vs-WMMA switch at
+  `Q->ne[1] > 8` changes the reduction beyond it); on 2-GPU `-sm tensor` it was
+  `n_max <= 5` until the block-12 dispatch fix described below
+  (`GREEDY-PURITY.md` §11, follow-ups Part 3).
   Record: `wip/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FIX.md`.
 - **Block-12 AR_PROFILE init fix (2026-09-01, PR #8, integrated):**
   `devices[]` is filled from the caller list before the profiler
@@ -385,7 +390,7 @@ Diff the output against a known-good build (or against RCCL via
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `30d119ea9`): `git format-patch --start-number 0` the block
+blocks tip `daf32f804`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -394,7 +399,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `30d119ea9`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `daf32f804`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

@@ -276,43 +276,88 @@ moves).  `n_q = 1` vs a verify batch can still differ because the FA
 *kernel* is selected from `Q->ne[1]` (decode may take the VEC kernel);
 that is a decode-vs-verify difference, not a draft-length one.
 
-## 11. The real purity range is `n_max <= 5`, not 15 (2026-09-11 correction)
+## 11. The real purity range, and its two causes (2026-09-11 correction + fix)
 
 Earlier notes (and the 2026-09-11 block-02 entries) claimed
 `--spec-type none == draft-mtp` for `n_max <= 15`.  **That was wrong.**  The
-claim had only ever been validated up to `n_max = 4`; a full sweep shows the
-last pure value is **`n_max = 5`**, with the first divergence at `n_max = 6`
-(a 7-token verify batch):
+claim had only ever been validated up to `n_max = 4`.  There are in fact **two
+independent causes**, and they bound different configurations:
+
+| config | `none == draft-mtp` guaranteed for | binding cause |
+|---|---|---|
+| 1 GPU (no split) | `n_max <= 7` (W <= 8) | B |
+| 2-GPU `-sm layer` / no split | `n_max <= 7` | B |
+| 2-GPU `-sm tensor` | `n_max <= 5` **before** this fix, `n_max <= 7` after | A, then B |
+| 3-GPU `-sm tensor` | `n_max <= 7` | B |
+| 2-GPU `-sm tensor` + `GGML_CUDA_ALLREDUCE=meta` | `n_max <= 7` | B |
+
+**Cause A (fork-specific; FIXED 2026-09-11): block 12's size-based all-reduce
+dispatch.**  `ggml_backend_cuda_comm_is_small()` routes a reduction to the
+internal host-staged pipeline below a per-device-count element count (32768 for
+2 devices, 131072 for 3, 262144 for 4+) and to NCCL above it.  The two paths
+are **not bit-identical** (different summation order; the internal pipeline
+always does the FP32->BF16 round-trip).  Under `-sm tensor` the reduced tensors
+scale with the batch width (`ne = ne0 * n_tokens`, `ne0 = 5120` here), so a
+**7-token** verify batch is 35840 elements and crossed the old 2-device limit
+while 1..6-token decode stayed below it: the same logical reduction, a
+different algorithm, purely because the batch got one token wider.  Raising the
+2-device crossover to 131072 (the 3-device value) fixes it -- the largest
+verify batch, `n_max 16` -> 17 tokens, is 87040 elements, well under it, and
+still far below the internal pipeline's own 1 MB (262144 element) cap.
+Measured: `GGML_CUDA_ALLREDUCE=internal` (one algorithm for every size) gives
+`W = 1/6/7/8` **all** `a4817ee6`, and so does the fix, with `W <= 6` keeping
+their original hash (plain decode bit-unchanged) and only `W = 7,8` moving onto
+the internal pipeline.  MTP throughput at `n_max 6` went 63.6 -> 71.3 t/s
+(+12%) and at `n_max 12` 51.7 -> 58.0 t/s (+12%), pp/tg unchanged -- the
+internal pipeline is the faster path at these sizes, so the fix is a win on
+both axes.  1 GPU has no cross-device reduction at all, 3 GPUs stay under their
+boundary until `W = 26`, and `-sm layer` never splits the reduction dimension:
+all three were unaffected.
+
+**Cause B (deliberate; open): the flash-attention tile-vs-WMMA switch at
+`Q->ne[1] > 8`.**  Beyond `W = 8` the FA launcher prefers the WMMA kernel (much
+faster at prefill-scale batches) and its reduction order differs from the tile
+kernel's.  This is not accidental -- the fork's own comment in
+`ggml-cuda/fattn.cu` says speculative verify batches (`n_q <= 8`) must stay on
+the tile kernel because decode never uses WMMA.  So `n_max <= 7` **is the
+designed guarantee**, and any configuration whose reduction tensors stay under
+Cause A's crossover is pure all the way through it.  Removing Cause B would
+mean giving up WMMA for 9..N-token batches.
+
+The table below is the original `n_max` sweep (pre-fix).  Both builds in it
+carried Cause A (block 12 was identical in them) and Cause B, so it shows their
+*joint* effect; the GDN prefill boundary was not a factor in either.
 
 | `--spec-draft-n-max` | none / 1 / 4 / 5 | 6 / 7 | 8 / 9 / 10 | 12 | 16 |
 |---|---|---|---|---|---|
 | delivered build (KTAIL=16) | equal | `5037ef2e` | `e721b8b5` | `e721b8b5` | `5037ef2e` |
 | whole-batch chunked prefill | equal | `b6d86d62` | `ed922c76` | `5037ef2e` | `4f3ee41c` |
 
-The two builds diverge in exactly the same place, so **this is pre-existing and
-has nothing to do with the GDN prefill boundary**: block 02's change fixed the
-*prefill* (probe `RS=6 W=6 == RS=0 W=1` — the prefill state is now
-K-independent), and this cap was there before it.
+The two builds diverge in exactly the same place, so this is **not the GDN
+prefill boundary's doing**: block 02's change fixed the *prefill* (probe
+`RS=6 W=6 == RS=0 W=1` — the prefill state is now K-independent), and this cap
+is Cause A + Cause B, both of which were present in both builds.
 
-**Cause (bounded).** It is a pure *decode-batch-width* effect, not `K` and not
-the GDN.  At `RS=0` (no snapshots at all, `K = 1`, so the GDN cannot be
-involved) the probe still separates on width alone:
+**Localisation (as measured).**  Both causes are pure *decode-batch-width*
+effects; neither is `K`, and neither is the GDN.  At `RS=0` (no snapshots at
+all, `K = 1`, so the GDN cannot be involved) the probe separates on width alone:
 
 ```
-RS=0   W = 1..6 -> a4817ee6      W = 7,8 -> e286b75c      W = 9 -> 24f302f6
+2-GPU tensor, pre-fix:  W = 1..6 -> a4817ee6   W = 7,8 -> e286b75c   W = 9 -> 24f302f6
 ```
 
-i.e. adding columns to the batch changes column 0's result.  `W >= 9` lines up
-with MMVQ's own limit (`MMVQ_MAX_BATCH_SIZE = 8` in `mmvq.cuh`): beyond 8
-columns `ggml_cuda_mul_mat` leaves the vector kernels for MMQ, a different
-algorithm with a different K-accumulation order.  The `W = 7` boundary is a
-second dispatch change inside MMVQ that has not been pinned yet.
+i.e. adding columns to the batch changes column 0's own result.  `W = 7` is
+Cause A.  `W = 9` is Cause B, and it coincides with `MMVQ_MAX_BATCH_SIZE = 8` in
+`mmvq.cuh` (beyond 8 columns `ggml_cuda_mul_mat` leaves the vector kernels for
+MMQ); both the FA WMMA gate and the MMVQ/MMQ crossover sit at that boundary, so
+Cause B is fixed at `W <= 8` regardless of which of the two fires first.
 `GGML_CUDA_GDN_CHUNKED=0` does not help (it is a prefill switch); block 13's
 dense `ncols==1` ksplit alignment does not either — it aligns `ncols = 1` with
-the `2..8` *verify* dispatch, and this boundary sits above that.
+the `2..8` *verify* dispatch, and these boundaries sit above that.
 
-**Is upstream affected?**  Yes — the mechanism is upstream, not fork-specific.
-Upstream master's own `calc_nwarps`/`calc_rows_per_block`
+**Is upstream affected?**  Cause B is upstream-inherited; Cause A is
+fork-specific (upstream has no internal AR pipeline).  Upstream master's own
+`calc_nwarps`/`calc_rows_per_block`
 (`ggml/src/ggml-cuda/mmvq.cu`) switch on `ncols_dst`, and
 `ggml_cuda_mul_mat` selects MMVQ only for `ncols_dst <= MMVQ_MAX_BATCH_SIZE`,
 so any batched evaluation uses different kernels than a one-token decode.
@@ -321,11 +366,13 @@ Measured on **upstream master `9cf3bf256`** (clean checkout, unmodified
 while `W = 2..12` all give `3cd0eb0e...` — upstream diverges at the *first*
 width step and is therefore **worse** than the fork, not better.  (That build
 was CPU-only, so upstream's ROCm boundary was not measured; the fork's
-`n_max <= 5` is a fork *result*, not an upstream guarantee.)
+`n_max <= 7` is a fork *result*, not an upstream guarantee.)
 
-**Practical consequence.**  Do not use `none == draft-mtp` byte-equality as a
-gate above `n_max = 5`; use acceptance + MTP-vs-plain throughput (see
-`benchmarks/mtp-adaptive-methodology.md`).  Note that adaptive MTP's
-recommended `n_max = 12` is *outside* the pure range.  Root-causing the
-`ncols`-dependent dispatch is an open follow-up —
-`wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 3.
+**Practical consequence.**  With Cause A fixed the guarantee is `n_max <= 7` for
+2-GPU `-sm tensor` too (it already applied to 1 GPU, 3-GPU tensor and
+`-sm layer`).  Do not use `none == draft-mtp` byte-equality as a gate above
+that; use acceptance + MTP-vs-plain throughput (see
+`benchmarks/mtp-adaptive-methodology.md`).  Adaptive MTP's recommended
+`n_max = 12` remains outside the *guaranteed* range by Cause B, which is
+deliberate.  Records: `patches/README.md` block-12 notes, the 2026-09-11
+WORKLOG entry, `wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 3.

@@ -10,7 +10,7 @@ The **current delivery** is a **15-patch set** (block 00 + blocks 01-14) against
 re-based 2026-09-02 from `0eadefebd`):
 blocks 00-14 (`patches/0000-…0014-…`, format-patch of the
 fork's `rdna-boosts` block commits — the current regeneration
-on `9113cc188` uses the canonical 15-block tip `30d119ea9` (block 02 amended twice 2026-09-11 — the
+on `9113cc188` uses the canonical 15-block tip `daf32f804` (block 02 amended twice 2026-09-11 — the
 K-independent whole-batch chunked GDN prefill is the final form — and block 13 amended 2026-09-11), because the reference `~/llama.cpp` checkout had drifted
 two upstream master commits past the fork point (`f3f1a8f27`, `304665fe7`
 — SYCL + iGPU-only code) and a `format-patch` there would have exported
@@ -26,7 +26,7 @@ the llama.cpp PR #27210 review head `d236d41a2`; block 03 amended 2026-09-10
 with the HIP masked-V fixes (re-homed from block 14); block 14's 2026-09-09
 gfx1151-only freed-cell KV host zeroing is removed and its masked-V fixes were
 re-homed (Vulkan to block 00, HIP to block 03) — see
-the dated records below; regenerated tip `30d119ea9`, blocks' bodies
+the dated records below; regenerated tip `daf32f804`, blocks' bodies
 byte-identical to the previous regeneration apart from the `From <sha>` line,
 (the block-13 amendment adds the dense ncols==1 ksplit alignment)
 the series count and the block-00/block-03 masked-V hunks; the previous
@@ -39,8 +39,11 @@ single-device `SPLIT_MODE_TENSOR` warn in `llama-context.cpp`; blocks
 01-05 + 07-13 are content-identical to the previous `050dde50c`-based
 delivery, whose regeneration `d65a96084..ce641322e` is superseded and
 preserved on the fork's history/remotes); block 12 was amended
-2026-09-04 with the runtime NCCL-failure fallback (issue #13), block
-13 was amended 2026-09-02 with two MTP regression fixes, 2026-09-05
+2026-09-04 with the runtime NCCL-failure fallback (issue #13) and again
+2026-09-11 so the hybrid dispatch's small/large crossover is width-safe
+(2-device `32768` -> `131072` elements - the size-based dispatch had been
+changing the reduction algorithm with the batch width under `-sm tensor`),
+block 13 was amended 2026-09-02 with two MTP regression fixes, 2026-09-05
 with the RDNA3.5/RDNA3.0 gate relaxations and 2026-09-06 with the
 model-neutral Strix MoE mmq folds and 2026-09-08 with the
 moe_weighted_reduction float4 remainder fix (issue #19, reported by
@@ -172,7 +175,7 @@ per-win measurement tables are in `beta/block-15-campaign-wins/README.md`.
 
 Apply + regeneration verification (the 14/14 / `[PATCH NN/14]` / `ff2b35f49`
 figures below are the then-current state; block 00 was added 2026-09-10, so the
-current delivery is the 15-patch set `0000`-`0014`, tip `30d119ea9`):
+current delivery is the 15-patch set `0000`-`0014`, tip `daf32f804`):
 
 - fresh worktree at `9113cc188` -> `scripts/apply-all.sh` (**strict 14/14
   `git am`** for the then-14-patch delivery, zero whitespace warnings) + the beta

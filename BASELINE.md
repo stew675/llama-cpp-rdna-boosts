@@ -33,7 +33,7 @@ bottom of this file): block 00 = the structural/architecture fixes added
 2026-09-10 (FA small-batch KV-split width invariance + Vulkan masked-V), and
 blocks 01-14 = the fork's `rdna-boosts` block
 commits on `9113cc188` (the canonical 15-block tip is block 14
-`30d119ea9`; block 02 amended 2026-09-11 with the
+`daf32f804`; block 02 amended 2026-09-11 with the
 K-independent whole-batch chunked GDN prefill (free; the
 `GGML_CUDA_GDN_ALIGN_BOUNDARY` gate and its K-dependent branches removed; +
 rollback guard), and block 13 amended
@@ -47,7 +47,7 @@ load default) and `304665fe7` (SYCL IQ-type-for-MoE), both dated after
 wrongly export those two upstream commits as patches 0001/0002.
 **Always regenerate from a canonical fork rebuilt at `9113cc188` via
 `scripts/apply-all.sh`** (that is what `make-patches.sh`'s default tip
-`30d119ea9` refers to).  The two commits' content is 106 lines in 3 files
+`daf32f804` refers to).  The two commits' content is 106 lines in 3 files
 (`ggml/src/ggml-sycl/mmvq.cpp`, `ggml/src/ggml-sycl/vecdotq.hpp`,
 `src/llama-model.cpp`) and is deliberately **not** in the delivery — it
 is upstream code past the recorded fork point; it does not touch any
@@ -58,7 +58,10 @@ KV-row-zeroing host gate it replaces is removed — see the WORKLOG entries; blo
 carries only the host-buffer
 rationale marker — upstream #28604 reverted #24233 on 2026-09-08,
 matching its end state; block 12 amended 2026-09-04 with the runtime
-NCCL-failure fallback (issue #13), block 13 amended 2026-09-02 with
+NCCL-failure fallback (issue #13) and 2026-09-11 so the hybrid dispatch's
+small/large crossover does not change the reduction algorithm with the batch
+width (`-sm tensor`, 2-device `32768` -> `131072` elements); block 13 amended
+2026-09-02 with
 two MTP regression fixes, 2026-09-05 with the RDNA3.5/RDNA3.0 gate
 relaxations and 2026-09-06 with the model-neutral Strix MoE mmq folds,
 block 14 (qwen4exp support) promoted from `beta/qwen4exp` 2026-09-07
@@ -146,7 +149,7 @@ PR #27210 review head `d236d41a2`, squash — see the WORKLOG entry) with
 block 03 amended 2026-09-10 (HIP masked-V fixes, re-homed from block 14)
 and block 14 amended 2026-09-10 (the kernel-side masked-V fixes were
 re-homed — Vulkan to block 00, HIP to block 03; the freed-cell host zeroing
-is removed; tip `30d119ea9`; block 02 amended 2026-09-11 with the
+is removed; tip `daf32f804`; block 02 amended 2026-09-11 with the
 K-independent whole-batch chunked GDN prefill (free, no gate, + rollback guard)
 and block 13 amended
 2026-09-11 with the dense ncols==1 ksplit alignment; block 14 = the qwen4exp-support delta promoted
@@ -179,7 +182,7 @@ to apply against a newer upstream master:
    than one block needs manual re-base hunks, regenerate the whole set from
    the fork with `scripts/make-patches.sh` (re-exports blocks 00-14 from
    `9113cc188..<blocks-tip>`; defaults target
-the current 15-block tip `30d119ea9`), then re-verify the clean-apply
+the current 15-block tip `daf32f804`), then re-verify the clean-apply
 simulation (fresh worktree at the new fork point, `scripts/apply-all.sh`,
 build, coherence) and update the fork point + verification numbers in
 `patches/README.md` and `README.md`.

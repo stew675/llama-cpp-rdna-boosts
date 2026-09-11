@@ -59,7 +59,7 @@ the 15-block tree):
 | `0009` | meta-buffer compute-container headroom |
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
-| `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
+| `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13); **amended 2026-09-11 - the small/large crossover is now width-safe** (2-device `32768` -> `131072` elements; see the block-12 notes) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-11 with the dense ncols==1 ksplit alignment** (dense `MUL_MAT` rows always ksplit for every K so single-token decode is row-identical to the 2..8-token verify batch; `MUL_MAT_ID`/MoE keeps the item-split) — see the block-13 notes below; **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)** — see the block-13 notes below.
 | `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-07 with the derived-cache pool gate** (the F32 block-vector pool is now allocated only when the derived cache is enabled *and* the indexer keys are unquantized — no more dead ~100 MiB buffer + no-op fill launches otherwise) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. | **amended 2026-09-08 with the quantized-KV tensor-split gate** — `q4_1`-family KV cache types (`q4_1`/`q5_0`/`q5_1`/`iq4_nl`) abort at graph reserve under multi-GPU `SPLIT_MODE_TENSOR` (upstream bug, also on vanilla `050dde50c`); now rejected at context creation with a clear error when the Meta device is in use — see the block-14 notes below. | **amended 2026-09-09 with the gfx1151-only freed-cell KV-zeroing gate** — the seq_rm/seq_keep/clear row zeroing (strix-port aad5adb08f masked-column guard for the gfx1151 WMMA f16 `x+(-0.0)` inexactness) now enables only when a KV buffer device is gfx1151 (env `LLAMA_KV_ZERO_FREED` overrides); everywhere else pre-block-14 behavior (no per-free GPU memsets) is restored — see the 2026-09-09 block-14 amendment section below. | **amended 2026-09-10: the freed-cell host zeroing is removed and the kernel-side masked-V fixes were re-homed** — `llama-kv-cache.{cpp,h}` are the upstream state (no `zero_freed`/env/GPU memsets); the Vulkan `flash_attn_cm1.comp`/`flash_attn.comp` fixes live in block 00 and the HIP `fattn-tile.cuh`/`fattn-mma-f16.cuh` fixes live in block 03, so block 14 carries none of them — see the 2026-09-10 block-00 section below. |
 
@@ -655,6 +655,31 @@ upstream's additions.
 
 ## Block 12 notes
 
+- **Amended 2026-09-11: the hybrid dispatch's small/large crossover is now
+  width-safe.**  `ggml_backend_cuda_comm_is_small()` picks the internal
+  host-staged pipeline below a per-device-count element count and NCCL above
+  it.  The two paths are **not bit-identical** (different summation order; the
+  internal path always does the FP32->BF16 round-trip), so any tensor whose
+  size straddles the crossover got a different result depending on its *shape*.
+  Under `-sm tensor` the reduced tensors scale with the batch width
+  (`ne = ne0 * n_tokens`; `ne0 = 5120` on Qwen3.8-27B), so with the old
+  2-device value of 32768 a **7-token** speculative verify batch (35840
+  elements) was reduced by NCCL while 1..6-token decode stayed on the internal
+  pipeline - and `--spec-type none` stopped matching `draft-mtp` from
+  `n_max = 6` on 2 GPUs (`GREEDY-PURITY.md` §11, cause A).  The 2-device
+  crossover is now **131072**, i.e. the 3-device value: the largest verify
+  batch (`--spec-draft-n-max 16` -> 17 tokens = 87040 elements) stays well
+  under it, and still far below the internal pipeline's own 1 MB (262144
+  element) cap, so nothing is pushed off the fast path.  Only the decode/verify
+  band (7..25 tokens) changes path; one-token decode and prefill (>25 tokens)
+  are untouched.  Measured (27B Q8_0, 2-GPU tensor, `-ts 1/1`): probe
+  `W = 1/6/7/8` all `a4817ee6` (with `W <= 6` bit-identical to the previous
+  build, so plain decode is unchanged); text `none == n4 == n6 == n7`
+  (`6e8ccd25`; previously pure only to `n_max 4`/5); MTP `n_max 6` acceptance
+  0.509 -> 0.533 and 63.6 -> 71.3 t/s (+12%), `n_max 12` 51.7 -> 58.0 t/s
+  (+12%), pp512/pp4096/tg128 unchanged within noise.  `W >= 9` still diverges -
+  that is the *separate, deliberate* FA tile-vs-WMMA switch (`Q->ne[1] > 8`),
+  which caps the guarantee at the designed `n_max <= 7`.
 - **RDNA4-only gate**: the internal all-reduce refuses to init on any
   architecture other than gfx1200/gfx1201 (the pipeline falls back to the
   default RCCL path with a warning).  Community verification on RDNA3 pairs
@@ -812,9 +837,11 @@ upstream's additions.
   Verified: gfx1201 probe (`RS=from_w`, P=256) `W = 1/3/5/6` all `a4817ee6`
   (4B 1-GPU `671d6096`); 27B 2-GPU tensor text `none == n1 == n4 == n5`
   (`6e8ccd25`); `test-backend-ops -o GATED_DELTA_NET` OK.
-  **The pure `none == draft-mtp` range is `n_max <= 5`, NOT 15** — beyond that a
-  multi-token verify batch hits a different MUL_MAT dispatch and diverges
-  regardless of this block.  See `../GREEDY-PURITY.md` §11 and
+  **The pure `none == draft-mtp` range is `n_max <= 7`, not 15** (an 8-token
+  verify batch is the designed limit; beyond it the FA tile-vs-WMMA switch at
+  `Q->ne[1] > 8` changes the reduction).  On 2-GPU `-sm tensor` it was
+  `n_max <= 5` until the block-12 dispatch fix of 2026-09-11.  See
+  `../GREEDY-PURITY.md` §11 and
   `../wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 3.
   Record: `../wip/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FIX.md`.
 
@@ -989,8 +1016,9 @@ baseline table live in `wip/qwen35moe-prefill/bench-config.md`.
   chunk the whole prompt, so the post-prefill state no longer depends on
   `n_rs_seq` — and it is **free** (no sequential tail; pp parity).
   With both, 27B 2-GPU and 3-GPU tensor and 1-GPU are
-  `none == n1 == n2 == n4` for `n_max <= 5` (the pure range — see
-  `GREEDY-PURITY.md` §11).  See
+  `none == n1 == n4 == n6 == n7` for `n_max <= 7` (the designed pure range;
+  the 2-GPU tensor case reached it only after the block-12 dispatch fix of
+  2026-09-11 — see `GREEDY-PURITY.md` §11).  See
   `wip/sm-tensor-plain-vs-spec/HANDOVER-2026-09-11.md`.
 
 ## Server config (the +22% deployment win)
