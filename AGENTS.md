@@ -109,7 +109,7 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `1d8f53594`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `1bcf4e82d`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the whole-batch
 K-independent chunked GDN prefill; block 14 amended 2026-09-11 with the
@@ -154,7 +154,9 @@ true on HIP builds only — the ROCm-validated backend; other builds
 keep upstream's clean "not implemented" error / arch-test SKIP instead
 of the meta-splitter abort found on Vulkan); block 08
 amended 2026-09-07 with the PR #15 mul_mat+add through-view shape
-guard). The
+guard and 2026-09-11 with the decode/verify FA kernel-family fix (F1: a
+quantized K/V cache used VEC at `n_q <= 2` and TILE from `n_q = 3`, so
+plain decode disagreed with spec verify — `GREEDY-PURITY.md` §14)). The
 canonical `9113cc188` fork used for `make-patches.sh`
 regeneration is disposable and is re-created from `patches/` +
 `scripts/apply-all.sh` whenever it needs rebuilding (fresh clone at the
@@ -398,24 +400,30 @@ explicitly requests it.**
   `8ed58aa9` vs `da56855b`).  This is **pre-existing** (bit-identical on a
   build without any block-15 code; `GGML_CUDA_FA_KV_NATIVE` on/off
   identical; reproduced on 1 GPU, so it is not the all-reduce) and it is a
-  *trade*: the impure set is exactly the two types with a fast native
+  *trade*: the impure set was exactly the two types with a fast native
   both-quantized FA path (the rest stage through F16 and are ~3.4x
-  slower).  **Test plain-vs-spec purity with f16/bf16 K/V**; with a
-  q8_0/q4_0 cache gate on adaptive-MTP acceptance/throughput instead.
+  slower).  **FIXED 2026-09-11** (block-08 amendment): the cause was the FA
+  *kernel-family* chooser — VEC at `n_q <= 2` vs TILE from `n_q = 3` — not
+  the KV staging, and the band is TILE throughout now, so `q8_0`/`q4_0` are
+  width-pure on every split config (only `W=1,2` moved; MTP bit-identical,
+  tg128 -0.5..-0.9 %).  `GREEDY-PURITY.md` §14.
   qwen4exp's two stacked causes (root-caused 2026-09-11) are now **half fixed**: its
   hyperconnection fusions (`hc-mix.cu`, gated `nt == 1`) were the cause-1 defect and the block-14
   2026-09-11 amendment routes the whole **decode/verify band `1 <= nt <= 8`** through them, so
   qwen4exp is now **width-pure for `W <= 4`** (`-sm layer` W=1..4 `3adeb313042a`, `-sm tensor`
   `dcf1ae66`, on f16/bf16; W=1 decode byte-identical to the pre-fix build for every KV type), plain
   == `draft-mtp --spec-draft-n-max 3` greedy text, f16 MTP acceptance 0.500 -> **0.76744** and MTP
-  generation 63.3 -> 79.9 t/s.  Cause 2 (a kernel-dispatch band at `W >= 5`, shared with F1) is
-  **still open**, so the band stops at `n_max 3` for qwen4exp, and the impure `q8_0`/`q4_0` KV
-  configurations (F1) must be re-measured after F1 — see
-  `wip/kv-quant-purity-followups/README.md` (F2).  **Differing K/V cache *types* are rejected** (maintainer
+  generation 63.3 -> 79.9 t/s.  Cause 2 (a kernel-dispatch band at `W >= 5`) is **still open**, so
+  the band stops at `n_max 3` for qwen4exp.  The "cause 2 shares F1's cause" hypothesis was
+  **refuted 2026-09-11**: fixing F1 left cause 2's `{5} {6,7} {8}` grouping completely unchanged —
+  see `wip/kv-quant-purity-followups/README.md` (F2).  **Differing K/V cache *types* are rejected** (maintainer
   decision 2026-09-11: mixed pairs are 1.7–3.6x slower than the same-type
   equivalent and never smaller).  Details, repro tooling and the follow-up
-  items (F1 purity, F2 qwen4exp, F3 sub-`q8_0` parity — note a native
-  `iq4_nl` would be the same 1800 MiB as q4_0, pure, and 3.4x faster):
+  items (F1 purity — **fixed 2026-09-11**; F2 qwen4exp; F3 sub-`q8_0` parity
+  — note a native `iq4_nl` would be the same 1800 MiB as q4_0, pure, and
+  3.4x faster; F3's first experiment is a `GGML_CUDA_FA_ALL_QUANTS=ON` build
+  A/B, since the slow types are rejected by
+  `ggml_cuda_fattn_kv_type_supported()` rather than missing a kernel):
   `GREEDY-PURITY.md` §12 and `wip/kv-quant-purity-followups/`.
 
 ## Common tasks
@@ -452,7 +460,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `1d8f53594`): `git format-patch --start-number 0` the block
+blocks tip `1bcf4e82d`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -461,7 +469,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `1d8f53594`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `1bcf4e82d`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

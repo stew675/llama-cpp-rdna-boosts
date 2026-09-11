@@ -404,6 +404,10 @@ WORKLOG entry, `wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 3.
 
 ## 12. The guarantee depends on the KV cache type (2026-09-11, measured during the Block-15 revalidation)
 
+> **The `q8_0`/`q4_0` impurity below is FIXED** (2026-09-11, block-08 amendment) — it was the FA
+> *kernel-family* chooser, not the KV staging; see **§14**.  The §12 measurements stand as the
+> pre-fix record, and its F16-staging explanation of the slow types is refined in §14.
+
 Everything above was measured with an **f16** (or bf16) K/V cache.  Extending the probe matrix to every
 same-type KV pair (`tools` + evidence: `wip/kv-quant-purity-followups/README.md`) shows the guarantee is
 **not universal in the cache type**:
@@ -430,7 +434,7 @@ Two facts worth keeping straight:
   width-dependent, the generic (F16-staging) ones are not.  Any future native path (see the sub-q8_0
   parity item) must be built width-invariant by construction.
 
-**Guidance.**  For plain-vs-speculative greedy purity, use **f16 or bf16** for K and V.  If a q8_0/q4_0
+**Guidance (as of the §12 measurements; `q8_0`/`q4_0` are fixed — see §14).**  For plain-vs-speculative greedy purity, use **f16 or bf16** for K and V.  If a q8_0/q4_0
 cache is required, treat plain-vs-spec text equality as *not* guaranteed and gate on adaptive-MTP
 acceptance/throughput instead.  Mixed K/V *types* are a rejected configuration (see
 `beta/block-15-campaign-wins/README.md` §7) and are irrelevant to this table.  This table is orthogonal
@@ -455,8 +459,54 @@ Measured (3 GPUs, f16 KV, P=256, RS=0):
 
 So qwen4exp is width-pure for **`--spec-draft-n-max <= 3`**, and there plain decode == `draft-mtp`
 greedy text (byte-identical, 3275 chars).  The `W >= 5` grouping is **cause 2** (§11): the same
-`ncols_dst`/`ne11` kernel-selection band as the `q8_0`/`q4_0` KV impurity in §12 — which is why F1 and
-the remainder of F2 are one workstream.  Two caveats: a `<= 8`-token **prefill** chunk also takes the
+`ncols_dst`/`ne11` kernel-selection band **that was assumed to be the same site as the `q8_0`/`q4_0` KV
+impurity in §12**.  That hypothesis was **refuted on 2026-09-11**: fixing F1 (§14) left cause 2's
+`{5} {6,7} {8}` grouping completely unchanged, so cause 2 is a *separate* site (a matmul/MoE dispatch
+band), not the FA kernel-family chooser.  Two caveats: a `<= 8`-token **prefill** chunk also takes the
 fused path (indistinguishable from a verify batch — the point is that such a batch gets the decode
 arithmetic); and with a `q8_0`/`q4_0` **KV cache** the cache's own impurity (§12) dominates, so the band
 does not restore text equality there (the `W=1` decode is still unchanged).
+
+## 14. F1 fixed (2026-09-11, block-08 amendment): the decode/verify band no longer spans two FA kernel families
+
+§12's `q8_0`/`q4_0` impurity is fixed.  Root cause, found with a new kernel-chooser trace (committed for
+reuse as `wip/kv-quant-purity-followups/tools/fa-kernel-chooser-trace.patch`, `GGML_CUDA_FA_TRACE=1`):
+`ggml_cuda_get_best_fattn_kernel()` (`ggml/src/ggml-cuda/fattn.cu`) returned **VEC** for `n_q <= 2` with
+a quantized K/V and **TILE** from `n_q = 3`.  The two families order the online-softmax/PV reduction
+differently, so token-0 logits at `W = 1,2` disagreed with every verify width.  Both VEC conditions are
+always inside the `n_q <= 8` band, so the branch is deleted and the band is TILE throughout — the same
+shape as the block-08 WMMA guard (`Q->ne[1] > 8`) and block 00's `ntiles_dst_eff`.  The launcher plan
+itself was already width-independent (`ntiles_dst_eff`; `parallel_blocks == ntiles_KV` at every width),
+which is why every earlier F1 suspect measured clean.
+
+| K/V cache (same type) | before §14 | after §14 |
+|---|---|---|
+| f16, bf16 | pure | pure, hashes **bit-identical** (they never took VEC) |
+| q4_1, q5_0, q5_1, iq4_nl | pure | unchanged (see the F3 reframing below) |
+| **q8_0** | `W=1,2` != `W=3..8` | **`W=1..8` bit-identical in all four split configs** |
+| **q4_0** | same shape as q8_0 | **same** |
+
+Measured (3x gfx1201): 4B `q8_0/q8_0` 1 GPU `W=1..8` all `31a0c1bace68`, 2-GPU `-sm tensor` `abebfb93`,
+3-GPU `-sm tensor` `7fe106f5` (`q4_0`: `619c151e48c7` / `240bc37d` / `483a850e`); 27B Q8_0 3-GPU
+`W = 1,2,3,4,5,8` all `d4156dbeb225`.  Text level (27B, 300 greedy tokens, q8_0 KV): plain ==
+`n_max 3` == `n_max 7` = `3537bc2b36be` (was `73b2565bce47` vs `3537bc2b36be`); f16 control
+`f32aac948600` for both.  Every new value equals that config's **previous verify** value: only
+`W = 1,2` moved, so MTP is bit-unchanged (27B acceptance 0.90789 identical) and the cost is
+decode-only — tg128 -0.9% (4B) / -0.5% (27B), pp512 ~-0.2%, reserves byte-identical.
+
+**The pure range is still `n_max <= 7`** (the verify batch is `n_max + 1` and the designed FA
+tile-vs-WMMA switch sits at `Q->ne[1] > 8`) — now for *every* supported KV type, not just the float
+ones.
+
+**F3 reframed.**  §12's "no native FA kernel" explanation is wrong in detail: `q4_1`/`q5_0`/`q5_1`/
+`iq4_nl` are rejected by `ggml_cuda_fattn_kv_type_supported()` unless the build enables
+`GGML_CUDA_FA_ALL_QUANTS` (OFF here), so `ggml_cuda_get_best_fattn_kernel()` returns `NONE` *before*
+any VEC/TILE choice (0 `[FATPATH]` lines for `q4_1`, 1+ for `q8_0`) and attention takes the generic
+fallback — width-invariant by construction (hence pure) and ~3.4x slower.  F3's first experiment is a
+build-flag A/B of `GGML_CUDA_FA_ALL_QUANTS=ON` (plus §14's band rule, which keeps any newly-enabled
+native path width-invariant).
+
+**Harness lesson (three false positives in one session).**  `llama-cli`'s `/\|` spinner is `\b`-based
+and timing-dependent, and the ASCII banner embeds the build SHA: apply backspaces, strip the banner and
+the `[ Prompt: ... | Generation: ... ]` footer before hashing output — and always run a control that
+must agree (the f16 pair) before believing any divergence.

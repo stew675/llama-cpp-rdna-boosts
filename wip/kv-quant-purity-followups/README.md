@@ -43,7 +43,22 @@ Notes: `CB=0` is mandatory (the callback changes MoE numerics and aborts under t
 V cache — upstream refuses it (`quantized V cache requires flash_attn to be enabled`, from upstream
 #25871, present at the fork point, not fork-specific).
 
-## F1 — `q8_0` / `q4_0` K/V caches break the dense width purity
+## F1 — `q8_0` / `q4_0` K/V caches break the dense width purity — **FIXED 2026-09-11**
+
+> **Fixed** in the block-08 amendment (canonical tip `1bcf4e82d`).  Root cause: the FlashAttention
+> **kernel-family chooser** `ggml_cuda_get_best_fattn_kernel()` (`ggml/src/ggml-cuda/fattn.cu`)
+> returned the generic **VEC** kernel for `n_q <= 2` when K/V is quantized and **TILE** from
+> `n_q = 3`; the two families order the online-softmax/PV reduction differently, so `W = 1,2` logits
+> disagreed with every verify width.  Both VEC conditions are always inside the `n_q <= 8` band, so
+> the branch was **deleted** and the band uses TILE throughout (the same shape as the block-08 WMMA
+> guard `Q->ne[1] > 8` and block 00's `ntiles_dst_eff`) — the launcher plan was already
+> width-independent, which is why every earlier suspect (staging, the KV write path, `stream_k`
+> rounding) measured clean.  Now `W=1..8` bit-identical for `q8_0`/`q4_0` on **all four split
+> configs**; only `W=1,2` changed and they moved onto the *previous verify* value, so MTP is
+> bit-identical (0.90789) and the cost is tg128 -0.5..-0.9 %.  Instrumentation:
+> `tools/fa-kernel-chooser-trace.patch` (`GGML_CUDA_FA_TRACE=1` — the `[FATPATH]` line prints the
+> chosen family).  Full record: `../../GREEDY-PURITY.md` §14 + the 2026-09-11 (3) WORKLOG entry.
+> The measurements below stand as the pre-fix evidence.
 
 Measured with the probe at `W=1..9`, 4B, 1 GPU (identical shape on 1 GPU, 2-GPU `-sm layer`, 2-GPU
 `-sm tensor`, 3-GPU `-sm tensor`, so it is **not** an all-reduce/tensor-split effect):
@@ -85,7 +100,7 @@ quant type unchanged; `test-backend-ops -o FLASH_ATTN_EXT` still 7859/7859 on RO
 
 ## F2 — qwen4exp is not width-pure: ROOT-CAUSED into TWO stacked causes; **cause 1 FIXED 2026-09-11**
 
-> **Cause 1 is fixed** in the block-14 amendment (canonical tip `1d8f53594`, delivery):
+> **Cause 1 is fixed** in the block-14 amendment (canonical tip `1bcf4e82d`, delivery):
 > `ggml/src/ggml-cuda/hc-mix.cu` + the `src/models/qwen4exp.cpp` gates now serve the whole band
 > **`1 <= nt <= 8`** (token index on `blockIdx.y`, every per-token pointer offset by the tensor's own
 > stride — `inject` with its view stride; at `nt == 1` all added terms are zero, so decode is
@@ -171,6 +186,14 @@ the two causes stack, so neither alone restores the `n_max <= 7` band for qwen4e
 * `rv.sh` — the driver (`res`/`kv`/`coh`/`mtp`/`bench`/`width`).
 
 ## F3 — sub-`q8_0` KV quant parity (the biggest win available)
+
+> **Reframed 2026-09-11:** the slow types are **not** missing a native kernel — they are rejected by
+> `ggml_cuda_fattn_kv_type_supported()` unless the build sets **`GGML_CUDA_FA_ALL_QUANTS`** (OFF in
+> the delivery build), so `ggml_cuda_get_best_fattn_kernel()` returns `NONE` *before* the VEC/TILE
+> choice (0 `[FATPATH]` trace lines for `q4_1`, 1+ for `q8_0`) and attention takes the generic
+> fallback: width-invariant by construction (hence pure) and ~3.4x slower.  **The first experiment is
+> therefore a `-DGGML_CUDA_FA_ALL_QUANTS=ON` build A/B**, not a new kernel — and any newly-enabled
+> native path is kept width-invariant by the F1 band rule above.
 
 4B, ctx 204800, ub 2048, 1 GPU, same-type pairs:
 

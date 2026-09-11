@@ -5,7 +5,9 @@
 > (tree `928852cdc`) and re-validated end to end**: new beta tip **`fe4f55278`**
 > (tree `ffe197e2f`) — and **re-cut again 2026-09-11** after block 14's hyper-connection band
 > amendment moved the canonical tip: base `1d8f53594` -> **beta tip `54859fdda`, tree
-> `543ccc015`**, metadata/offset-only (0 changed body lines) — see the beta `README.md`.
+> `543ccc015`**, metadata/offset-only (0 changed body lines) — see the beta `README.md`;
+> **re-cut a third time 2026-09-11** after the block-08 FA kernel-family amendment (F1): base
+> `1bcf4e82d` -> **beta tip `0c8099ca2`, tree `7335b923d`**, again metadata/offset-only.
 > The dependent delta was exactly one file
 > (`fattn-common.cuh`), the textual apply was clean, every 2026-09-10 number
 > reproduced to the last decimal, and three **pre-existing** follow-ups were

@@ -5564,7 +5564,7 @@ index 8981ab804..23ce9a1c4 100644
 +EXTERN_DECL_FATTN_TILE_CASES(512, 512);
 +EXTERN_DECL_FATTN_TILE_CASES(576, 512);
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index ae217fbd9..5097310cf 100644
+index ae217fbd9..b5d8b8139 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -506,6 +506,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
@@ -5577,12 +5577,26 @@ index ae217fbd9..5097310cf 100644
      // The effective batch size for the kernel can be increased by gqa_ratio.
      // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
      bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
-@@ -645,8 +648,30 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -645,24 +648,45 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      }
  
      // AMD WMMA is always faster than the tile kernel if the full tile width of 16 can be utilized.
 -    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 128) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
 -        return BEST_FATTN_KERNEL_MMA_F16;
+-    }
+-
+-    // If there are no tensor cores available, use the generic tile kernel:
+-    if (can_use_vector_kernel) {
+-        if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
+-            if (Q->ne[1] == 1) {
+-                if (!gqa_opt_applies) {
+-                    return BEST_FATTN_KERNEL_VEC;
+-                }
+-            }
+-        } else {
+-            if (Q->ne[1] <= 2) {
+-                return BEST_FATTN_KERNEL_VEC;
+-            }
 +    // RDNA4 WMMA has higher throughput than RDNA3; heads up to 576 (incl. the DKQ != DV shapes)
 +    // are enabled by default there. RDNA3_0 (gfx1100-1103) verified 2026-08-28: FLASH_ATTN_EXT
 +    // 4568/4568 vs CPU ref, gemma-4-12b head 240 pp2048 2263 vs 2226 (+1.7%), harness +14.2%
@@ -5606,11 +5620,26 @@ index ae217fbd9..5097310cf 100644
 +        // The kernel instantiates logit_softcap only for heads 128/256/512.
 +        if (logit_softcap == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512) {
 +            return BEST_FATTN_KERNEL_MMA_F16;
-+        }
+         }
      }
++
++    // If there are no tensor cores available, the generic tile kernel is used.
++    //
++    // The former VEC fallback here (upstream: VEC for n_q == 1 with no GQA opt, and for
++    // n_q <= 2 with a quantized K/V) split the decode/verify band across two kernel families:
++    // measured on gfx1201 with q8_0/q4_0 K/V, n_q = 1,2 took VEC and n_q >= 3 took TILE, and
++    // since the two families order the online-softmax/PV reduction differently, n_q = 1
++    // disagreed bit-wise with every verify width -- so plain greedy decode and spec-draft-mtp
++    // verify produced different tokens with a quantized KV cache (greedy-purity invariant,
++    // GREEDY-PURITY.md).  Both conditions are always inside the n_q <= 8 band, so removing
++    // them only changes n_q <= 2 (prefill always fell through to TILE) and makes the whole
++    // band use TILE, matching the WMMA guard above and the ntiles_dst_eff fix in launch_fattn.
++    // Cost, measured 3x gfx1201, q8_0 KV: tg128 -0.5..-0.9%, pp512 -0.2% (within noise on the
++    // 4B, -0.2% on the 27B); MTP acceptance is bit-identical (the verify widths did not move).
+     return BEST_FATTN_KERNEL_TILE;
+ }
  
-     // If there are no tensor cores available, use the generic tile kernel:
-@@ -681,7 +706,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -681,7 +705,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
      bool need_f16_V = false;
  
      switch (kernel) {

@@ -153,3 +153,15 @@ equivalent (pp512 2152–4476 vs 7713–7838) and never smaller, so it has no up
    block-15-vs-15-block difference with the §3 template.
 3. Always attach the *generated text* for coherence issues (a diff of the two outputs is enough) and the
    exact command lines — they are usually enough to reproduce it without your model.
+
+## 2026-09-11 (later) — third re-cut
+
+The base moved a third time the same day: block 08's decode/verify FA kernel-family amendment (F1,
+`../../GREEDY-PURITY.md` §14) changed `ggml/src/ggml-cuda/fattn.cu`.  Block 15 touches that file too,
+but the hunks are far apart, so the re-cut is **metadata/offset-only** (0 changed body lines):
+
+* base `1bcf4e82d` (tree `4104e7d34`) -> **beta tip `0c8099ca2`**, tree `7335b923d`
+* apply the patch in *this directory*; it needs the 15-block delivery at `1bcf4e82d`
+
+Nothing in the tester checklist changes: the revalidation numbers above were taken on the previous
+re-cut and the delta is metadata only.

@@ -10,7 +10,7 @@ The **current delivery** is a **15-patch set** (block 00 + blocks 01-14) against
 re-based 2026-09-02 from `0eadefebd`):
 blocks 00-14 (`patches/0000-…0014-…`, format-patch of the
 fork's `rdna-boosts` block commits — the current regeneration
-on `9113cc188` uses the canonical 15-block tip `1d8f53594` (block 02 amended twice 2026-09-11 — the
+on `9113cc188` uses the canonical 15-block tip `1bcf4e82d` (block 02 amended twice 2026-09-11 — the
 K-independent whole-batch chunked GDN prefill is the final form — block 13 amended 2026-09-11 and
 block 14 amended 2026-09-11 with the hyper-connection decode/verify band fix), because the reference `~/llama.cpp` checkout had drifted
 two upstream master commits past the fork point (`f3f1a8f27`, `304665fe7`
@@ -27,7 +27,7 @@ the llama.cpp PR #27210 review head `d236d41a2`; block 03 amended 2026-09-10
 with the HIP masked-V fixes (re-homed from block 14); block 14's 2026-09-09
 gfx1151-only freed-cell KV host zeroing is removed and its masked-V fixes were
 re-homed (Vulkan to block 00, HIP to block 03) — see
-the dated records below; regenerated tip `1d8f53594`, blocks' bodies
+the dated records below; regenerated tip `1bcf4e82d`, blocks' bodies
 byte-identical to the previous regeneration apart from the `From <sha>` line,
 (the block-13 amendment adds the dense ncols==1 ksplit alignment)
 the series count and the block-00/block-03 masked-V hunks; the previous
@@ -176,7 +176,7 @@ per-win measurement tables are in `beta/block-15-campaign-wins/README.md`.
 
 Apply + regeneration verification (the 14/14 / `[PATCH NN/14]` / `ff2b35f49`
 figures below are the then-current state; block 00 was added 2026-09-10, so the
-current delivery is the 15-patch set `0000`-`0014`, tip `1d8f53594`):
+current delivery is the 15-patch set `0000`-`0014`, tip `1bcf4e82d`):
 
 - fresh worktree at `9113cc188` -> `scripts/apply-all.sh` (**strict 14/14
   `git am`** for the then-14-patch delivery, zero whitespace warnings) + the beta

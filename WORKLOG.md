@@ -10,6 +10,63 @@ for the full record; per-block technical notes live in
 
 ---
 
+## 2026-09-11 (3) — Block 08 amended: the decode/verify band no longer spans two FlashAttention kernel families (F1 fixed)
+
+**What changed.**  `ggml_cuda_get_best_fattn_kernel()` (`ggml/src/ggml-cuda/fattn.cu`) no longer returns
+`BEST_FATTN_KERNEL_VEC` for small batches.  The fallback was upstream code (`11f0af550`, "for small
+batch sizes the vector kernel may be preferable"): VEC for `n_q == 1` when `!gqa_opt_applies`, and for
+`n_q <= 2` whenever K or V is quantized.  Both conditions are *always* inside the `n_q <= 8`
+decode/verify band (prefill fell through to TILE anyway), so the branch only ever split the band; it is
+deleted and the whole band uses TILE — the same shape of fix as the block-08 WMMA guard added
+2026-08-29 (`Q->ne[1] > 8`) and block 00's `ntiles_dst_eff` in `launch_fattn`.
+
+**Why.**  Measured with a new `GGML_CUDA_FA_TRACE` instrumentation (committed for reuse as
+`wip/kv-quant-purity-followups/tools/fa-kernel-chooser-trace.patch`): with `q8_0` or `q4_0` K/V the
+chooser returned **VEC (100) at `n_q = 1,2` and TILE (200) at `n_q >= 3`**; the two families order the
+online-softmax/PV reduction differently, so token-0 logits at `W = 1,2` disagreed with every verify
+width.  The launcher's own plan was *already* width-independent (`ntiles_dst_eff`, `parallel_blocks`
+== `ntiles_KV` at every width), which is why the earlier F1 suspects (KV-type staging, the KV-cache
+write path, `stream_k` rounding) all measured clean.
+
+**Measured (3x gfx1201, ROCm 7.14, unpinned).**
+- 4B Q8_0 `q8_0/q8_0` **1 GPU `W=1..8` all `31a0c1bace68`**, 2-GPU `-sm tensor` `abebfb93`, 3-GPU
+  `-sm tensor` `7fe106f5`; `q4_0/q4_0` `619c151e48c7` / `240bc37d` / `483a850e` — all four split
+  configs pure, and every value is that config's *previous verify* value (only `W=1,2` moved).
+- 27B Q8_0 `q8_0/q8_0` 3-GPU tensor `W = 1,2,3,4,5,8` all `d4156dbeb225`.
+- f16/bf16 configs byte-identical (they never took VEC): 4B f16 `671d60969874`, bf16 `b5d7e7b4`.
+- text level, 27B 3-GPU tensor, ctx 8192, 300 greedy tokens, `q8_0` KV: plain == `n_max 3` ==
+  `n_max 7` = `3537bc2b36be` (before: plain `73b2565bce47`/2810 chars vs verify `3537bc2b36be`/2801);
+  f16 control `f32aac948600` for both.  **Harness note:** `llama-cli`'s `/\|` spinner is ``-based and
+  timing-dependent and the banner embeds the build SHA — apply backspaces and strip both before
+  hashing; three "divergences" this session were spinner noise.
+- MTP: 27B `n=96` q8_0 KV acceptance **0.90789 (69/76), identical** to the pre-fix build.  MoE
+  asterisk unchanged (`ac8825358d9adfda` / `bd138ad2326fbbf2`, and both `bd138ad2326fbbf2` with
+  `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`).
+- perf (llama-bench, q8_0 KV, interleaved, same binary): 4B pp512 7609.8 -> 7597.9 (-0.15% = noise),
+  tg128 98.03 -> 97.11 (**-0.9%**); 27B 3-GPU tensor pp512 2257.3 -> 2253.2 (-0.2%), tg128 38.46 ->
+  38.28 (**-0.5%**).  Reserves byte-identical (27B ub2048 q8_0: dev 1920.3284 / host 880.3360).
+- op suites **with the fix active**: `test-backend-ops -o FLASH_ATTN_EXT` **4591/4591, 4/4 backends**;
+  `-o GATED_DELTA_NET` 46/46, 2/2.  Quantized-KV coherence (the only configs that move) —
+  gemma-4-E4B / 27B / qwen4exp with q8_0 KV: deterministic across runs and coherent.
+- clean-apply: fresh `9113cc188` + `scripts/apply-all.sh` -> strict **15/15 `git am`**, **0 whitespace
+  warnings**, applied tree == **`4104e7d34dd8cf9cb5488d46dcbba1b17eaa32d3`**.
+- block-15 beta re-cut against the new base: **`0c8099ca2`**, tree **`7335b923d`** — metadata/offset
+  only, 0 changed body lines (block 15's `fattn.cu` hunks sit at lines 166-326, the fix at ~690).
+
+**New canonical tip `1bcf4e82d`**, tree `4104e7d34` (block 08 = `38cffdece`; blocks 09-14 got new SHAs,
+bodies metadata-only — 2 lines each).  `rdna-boosts-all.patch` refreshed (95 files).
+
+**This is NOT F2 cause 2.**  qwen4exp's `W >= 5` residual (`{1..4} {5} {6,7} {8}`) is **completely
+unchanged** by this fix (W=1,4 `3adeb313042a`, W=5 `c999233926f0`, W=8 `c56ebb61963a`), which
+**refutes the "F1 and F2 cause 2 share a cause" hypothesis** — cause 2 is not the kernel-family
+chooser (it is a matmul/MoE dispatch band, still open).
+
+**F3 refinement.**  The "slow pure" KV types are not missing a native kernel: they are rejected by
+`ggml_cuda_fattn_kv_type_supported()` unless the build sets **`GGML_CUDA_FA_ALL_QUANTS`** (this build:
+OFF), so `ggml_cuda_get_best_fattn_kernel()` returns `NONE` *before* the VEC/TILE choice (0 `[FATPATH]`
+lines for `q4_1` vs 1+ for `q8_0`) and the attention takes the generic fallback — width-invariant by
+construction (hence pure) and ~3.4x slower.  F3's first experiment is therefore a build-flag A/B.
+
 ## 2026-09-11 (2) — Block 14 amended: the fused hyper-connection ops serve the decode/verify band (qwen4exp width purity, cause 1 of 2)
 
 **What changed.**  `ggml/src/ggml-cuda/hc-mix.cu` (`ggml_cuda_op_hc_mix`, `ggml_cuda_op_hc_combine`) and

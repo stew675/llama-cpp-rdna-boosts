@@ -1,0 +1,49 @@
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -597,16 +597,6 @@
+                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
+                     return BEST_FATTN_KERNEL_VEC;
+                 }
+-            } else {
+-                if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+-                    if (Q->ne[1] <= 2) {
+-                        return BEST_FATTN_KERNEL_VEC;
+-                    }
+-                } else {
+-                    if (Q->ne[1] == 1) {
+-                        return BEST_FATTN_KERNEL_VEC;
+-                    }
+-                }
+             }
+             if (!gqa_opt_applies && Q->ne[1] == 1) {
+                 return BEST_FATTN_KERNEL_VEC;
+@@ -649,20 +639,14 @@
+         return BEST_FATTN_KERNEL_MMA_F16;
+     }
+ 
+-    // If there are no tensor cores available, use the generic tile kernel:
+-    if (can_use_vector_kernel) {
+-        if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
+-            if (Q->ne[1] == 1) {
+-                if (!gqa_opt_applies) {
+-                    return BEST_FATTN_KERNEL_VEC;
+-                }
+-            }
+-        } else {
+-            if (Q->ne[1] <= 2) {
+-                return BEST_FATTN_KERNEL_VEC;
+-            }
+-        }
+-    }
++    // If there are no tensor cores available, the generic tile kernel is used.  The former
++    // VEC fallback here (and the quantized arm above) split the decode/verify band across two
++    // kernel families: a quantized K/V cache took VEC for n_q <= 2 and the tile kernel from
++    // n_q == 3, and because the families order the online-softmax/PV reduction differently a
++    // one-token decode was not bit-identical to an (n_draft + 1)-token speculative verify
++    // batch, so greedy decode and speculative decoding produced different tokens.  Both
++    // conditions only ever fire inside the n_q <= 8 band, so dropping them cannot change any
++    // prefill decision; decode/verify now agree bit-wise on every KV type.
+     return BEST_FATTN_KERNEL_TILE;
+ }
+ 

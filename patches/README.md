@@ -9,7 +9,9 @@ functional delta was dropped — upstream itself reverted #24233 in #28604 the
 same day, matching its end state — and the block now carries only the
 host-buffer rationale marker comment (see the block-06 note below); block 14's
 quantized-KV tensor-split gate merged additively with upstream #28390's
-single-device `SPLIT_MODE_TENSOR` warn; block 12 amended 2026-09-04 with the runtime
+single-device `SPLIT_MODE_TENSOR` warn; block 08 amended 2026-09-11 with the decode/verify FlashAttention kernel-family fix
+(F1: a quantized K/V cache used VEC at `n_q <= 2` and TILE from `n_q = 3`, so plain decode disagreed
+with spec-draft-mtp verify — see the block-08 notes below); block 12 amended 2026-09-04 with the runtime
 NCCL-failure fallback (issue #13, see the block-12 notes
 below); block 13 amended 2026-09-02 with two MTP regression fixes and
 2026-09-05 with the RDNA3.5 (Strix Halo, gfx1151) + RDNA3.0 (gfx1100)
@@ -652,6 +654,26 @@ upstream's additions.
 > HIP compiler test appends `--cuda-host-only` right after it, and the
 > bare `-mllvm` swallows it into LLVM option parsing (configure fails).
 > Build with `EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS="` to override.
+
+## Block 08 notes
+
+- **Decode/verify kernel-family fix (2026-09-11, F1).**  `ggml_cuda_get_best_fattn_kernel()`
+  (`ggml/src/ggml-cuda/fattn.cu`) used to return the generic **VEC** kernel for small batches — for
+  `n_q == 1` when GQA optimizations do not apply, and for `n_q <= 2` whenever K or V is quantized
+  (upstream heuristic, "for small batch sizes the vector kernel may be preferable").  Those two
+  conditions are always inside the decode/verify band (`n_q = n_draft + 1 <= 8`; prefill fell through
+  to TILE regardless), so with a `q8_0`/`q4_0` KV cache `n_q = 1,2` ran one kernel family and
+  `n_q >= 3` another.  The families order the online-softmax/PV reduction differently, so a 1-token
+  decode was not bit-identical to a verify batch and plain greedy decode disagreed with
+  `--spec-type draft-mtp`.  The branch is deleted: the whole band uses TILE, matching the WMMA guard
+  this block added on 2026-08-29 (`Q->ne[1] > 8`) and block 00's `ntiles_dst_eff` in `launch_fattn`.
+  Measured: 4B `q8_0`/`q4_0` `W=1..8` bit-identical in **all four split configs** (1 GPU / 2-GPU layer /
+  2-GPU tensor / 3-GPU tensor), 27B the same; 27B text plain == `n_max 3` == `n_max 7`; MTP
+  acceptance bit-identical (0.90789); tg128 -0.5..-0.9%, pp512 ~-0.2%, reserves byte-identical;
+  FLASH_ATTN_EXT 4591/4591.  Only `W=1,2` change, and the new value equals the previous *verify*
+  value, so the spec path is untouched.  Debug tool:
+  `../wip/kv-quant-purity-followups/tools/fa-kernel-chooser-trace.patch` (`GGML_CUDA_FA_TRACE=1`);
+  details in `../GREEDY-PURITY.md` §14 and the 2026-09-11 (3) WORKLOG entry.
 
 ## Block 12 notes
 

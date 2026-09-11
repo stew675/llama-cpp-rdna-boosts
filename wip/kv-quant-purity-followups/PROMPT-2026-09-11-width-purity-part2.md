@@ -4,6 +4,13 @@
 > the block-14 hyper-connection amendment landed (delivery `c6489c1`, canonical tip `1d8f53594`).
 > Everything below was measured on 3x gfx1201 (R9700) with ROCm `/opt/rocm-7.14-gfx1201`.
 
+> **STATUS 2026-09-11: F1 is DONE** — fixed as a block-08 amendment (canonical tip `1bcf4e82d`); the
+> cause was the FA *kernel-family* chooser, not the staging (see `../../GREEDY-PURITY.md` §14).  **The
+> remaining work in this brief is F2 cause 2 and F3**, and the F1 sections below are the pre-fix
+> record — read them for the instruments and the excluded-suspect list, not for the cause.  The F1 fix
+> installed a band rule (`n_q <= 8` must use one FA family) that any new native path must respect;
+> F3's first experiment is a `GGML_CUDA_FA_ALL_QUANTS=ON` build A/B.
+
 ## Mission
 
 The decode==verify invariant holds for dense models with **f16/bf16/q4_1/q5_0/q5_1/iq4_nl** KV, and now

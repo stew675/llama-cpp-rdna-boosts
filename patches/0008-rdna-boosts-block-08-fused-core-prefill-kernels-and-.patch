@@ -1,4 +1,4 @@
-From 5ea46d1b201fd1dfba411093df5d8cb52ebc1f78 Mon Sep 17 00:00:00 2001
+From 38cffdece545a645da39ad592d5900fdef664256 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 08/14] rdna-boosts: block 08: fused-core prefill kernels and
@@ -20,7 +20,7 @@ single-sequence case is unaffected.
 ---
  ggml/src/ggml-cuda/common.cuh     |  87 ++++
  ggml/src/ggml-cuda/fattn-tile.cuh |  16 +
- ggml/src/ggml-cuda/fattn.cu       |   5 +-
+ ggml/src/ggml-cuda/fattn.cu       |  32 +-
  ggml/src/ggml-cuda/ggml-cuda.cu   | 546 +++++++++++++++++++++++-
  ggml/src/ggml-cuda/mmvq.cu        | 670 +++++++++++++++++++++++++++---
  ggml/src/ggml-cuda/mmvq.cuh       |  23 +
@@ -28,7 +28,7 @@ single-sequence case is unaffected.
  ggml/src/ggml-cuda/norm.cuh       |   7 +
  ggml/src/ggml-cuda/unary.cu       | 150 +++++++
  ggml/src/ggml-cuda/unary.cuh      |   6 +
- 10 files changed, 1657 insertions(+), 68 deletions(-)
+ 10 files changed, 1670 insertions(+), 82 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
 index 2e5d27bb8..6b43f8d05 100644
@@ -170,10 +170,10 @@ index 46d26a723..23ce9a1c4 100644
      if constexpr (DKQ <= 128) {
          if (Q->ne[1] > 32/ncols2) {
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 3036829bb..5097310cf 100644
+index 3036829bb..b5d8b8139 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -664,7 +664,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -664,27 +664,29 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      // GGML_CUDA_FA_WMMA_MAX_HEAD overrides the per-arch cap (experiment/escape hatch).
      const char * wmma_max_env = getenv("GGML_CUDA_FA_WMMA_MAX_HEAD");
      const int wmma_max_head = wmma_max_env ? std::atoi(wmma_max_env) : (wmma_256 && GGML_CUDA_CC_IS_RDNA4(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_0(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_5(cc) ? 320 : 128);
@@ -185,6 +185,39 @@ index 3036829bb..5097310cf 100644
          // The kernel instantiates logit_softcap only for heads 128/256/512.
          if (logit_softcap == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512) {
              return BEST_FATTN_KERNEL_MMA_F16;
+         }
+     }
+ 
+-    // If there are no tensor cores available, use the generic tile kernel:
+-    if (can_use_vector_kernel) {
+-        if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
+-            if (Q->ne[1] == 1) {
+-                if (!gqa_opt_applies) {
+-                    return BEST_FATTN_KERNEL_VEC;
+-                }
+-            }
+-        } else {
+-            if (Q->ne[1] <= 2) {
+-                return BEST_FATTN_KERNEL_VEC;
+-            }
+-        }
+-    }
++    // If there are no tensor cores available, the generic tile kernel is used.
++    //
++    // The former VEC fallback here (upstream: VEC for n_q == 1 with no GQA opt, and for
++    // n_q <= 2 with a quantized K/V) split the decode/verify band across two kernel families:
++    // measured on gfx1201 with q8_0/q4_0 K/V, n_q = 1,2 took VEC and n_q >= 3 took TILE, and
++    // since the two families order the online-softmax/PV reduction differently, n_q = 1
++    // disagreed bit-wise with every verify width -- so plain greedy decode and spec-draft-mtp
++    // verify produced different tokens with a quantized KV cache (greedy-purity invariant,
++    // GREEDY-PURITY.md).  Both conditions are always inside the n_q <= 8 band, so removing
++    // them only changes n_q <= 2 (prefill always fell through to TILE) and makes the whole
++    // band use TILE, matching the WMMA guard above and the ntiles_dst_eff fix in launch_fattn.
++    // Cost, measured 3x gfx1201, q8_0 KV: tg128 -0.5..-0.9%, pp512 -0.2% (within noise on the
++    // 4B, -0.2% on the 27B); MTP acceptance is bit-identical (the verify widths did not move).
+     return BEST_FATTN_KERNEL_TILE;
+ }
+ 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index 6dd925267..6b4fe93df 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu

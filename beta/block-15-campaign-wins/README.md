@@ -24,6 +24,11 @@ now a **15-patch set**: block 00 + blocks 01-14 at canonical tip **`389c5341f`**
 tree `928852cdc`, with block 13 amended twice on 2026-09-11), so the beta patch was
 re-cut and re-validated end to end.
 
+* **Re-cut a third time 2026-09-11** after block 08's decode/verify FA kernel-family amendment (F1,
+  `GREEDY-PURITY.md` §14) moved the canonical tip: base `1bcf4e82d` -> **beta tip `0c8099ca2`** (tree
+  `7335b923d`).  Block 15 *does* touch `fattn.cu`, but its hunks sit at lines 166-326 while the fix is
+  at ~690, so the re-cut is metadata/offset-only again: **0 changed body lines**.  No renumbering
+  (`[PATCH 15/15]`).
 * **Re-cut again 2026-09-11** after block 14's hyper-connection band amendment moved the canonical
   tip: base `1d8f53594` -> **beta tip `54859fdda`** (tree `543ccc015`).  Block 15 touches
   `src/models/qwen4exp.cpp` but only in the QSA/indexer regions (its hunks start after the amended HC

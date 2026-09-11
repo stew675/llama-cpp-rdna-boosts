@@ -1,4 +1,4 @@
-From 54859fddad773f971c86db80d84413dcd5ba8c52 Mon Sep 17 00:00:00 2001
+From 0c8099ca2b3cfdd0dadd6303fa66a5e63c48e968 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -1584,7 +1584,7 @@ index 57a285565..21c8077f8 100644
  #ifdef FLASH_ATTN_AVAILABLE
      const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 5097310cf..8a5abc315 100644
+index b5d8b8139..20af9bd29 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -166,6 +166,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
@@ -1647,7 +1647,7 @@ index 5097310cf..8a5abc315 100644
      for (const ggml_tensor * t : {Q, K, V, mask}) {
          if (t == nullptr || ggml_is_quantized(t->type)) {
              continue;
-@@ -711,13 +719,23 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -710,13 +718,23 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
              // the remaining types to F16. BF16 K/V needs native BF16 support.
              const bool use_bf16 = K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_BF16 &&
                  bf16_mma_hardware_available(ggml_cuda_info().devices[device].cc);
@@ -1677,7 +1677,7 @@ index 5097310cf..8a5abc315 100644
          case BEST_FATTN_KERNEL_VEC:
              need_f16_K = K->type == GGML_TYPE_F32;
              need_f16_V = V->type == GGML_TYPE_F32;
-@@ -750,5 +768,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -749,5 +767,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
  }
  
  bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {

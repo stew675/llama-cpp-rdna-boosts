@@ -101,9 +101,9 @@ Block 15 is STAGED in `beta/block-15-campaign-wins/`, not promoted.
 - **Fork/canonical state**: the working checkout's `rdna-boosts` is a local rebuild and must NOT be used
   for regeneration if it sits on a master newer than the fork point (it would export `f3f1a8f27`
   + `304665fe7` as patches 0001/0002).  The canonical 15-block chain used for the delivery ends at the
-  block-14 commit `1d8f53594` (rebuilt at `9113cc188`; block 02 amended 2026-09-11 with the
+  block-14 commit `1bcf4e82d` (rebuilt at `9113cc188`; block 02 amended 2026-09-11 with the
   K-independent whole-batch chunked GDN prefill — free, gate removed, + rollback guard); `make-patches.sh`
-  default tip = `1d8f53594`.
+  default tip = `1bcf4e82d`.
   The beta block-15 patch is applied manually on top of that tree.
 - Superseded/still-useful artifacts: the work branch `wip/block15-campaign-wins` (`b26ae06f0`) and
   `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch` remain as the pre-merge
@@ -295,12 +295,20 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   not block 00's `n_q<=8`; text level on the 27B: plain `8ed58aa9` (1330 chars) vs
   `n_max 3 == n_max 7` `da56855b` (1406 chars).  f16/bf16/q4_1/q5_0/q5_1/iq4_nl are all pure, and
   the impure set is exactly the two types with a *fast native* both-quantized FA path.  Not V4
-  (switch on/off identical), not all-reduce (1 GPU shows it).  Next step: dump
-  `ntiles_dst`/`ntiles_KV`/`parallel_blocks` + the staging branch for `W=1..4` in `launch_fattn` and
-  in the native `q8_0×q8_0`/`q4_0×q4_0` kernel selection.  Acceptance: `W=1..8` bit-identical on all
-  four split configs, no perf regression, other types unchanged, FLASH_ATTN_EXT still 7859/7859.
+  (switch on/off identical), not all-reduce (1 GPU shows it).  **FIXED 2026-09-11** (block-08 amendment, canonical tip `1bcf4e82d`).  The cause was **not** the
+  staging or the launcher plan (both measured width-independent) but the FA **kernel-family chooser**
+  `ggml_cuda_get_best_fattn_kernel()`: with a quantized K/V it returned VEC for `n_q <= 2` and TILE
+  from `n_q = 3`, and the two families order the online-softmax/PV reduction differently.  Both VEC
+  conditions are always inside the `n_q <= 8` band, so the branch is deleted and the band is TILE
+  throughout (the same shape as the block-08 WMMA guard and block 00's `ntiles_dst_eff`).  Result:
+  `q8_0`/`q4_0` `W=1..8` bit-identical on **all four split configs** (4B 1 GPU `31a0c1bace68`,
+  2-GPU tensor `abebfb93`, 3-GPU `7fe106f5`; `q4_0` `619c151e48c7`/`240bc37d`/`483a850e`; 27B
+  `d4156dbeb225`), 27B text plain == `n_max 3` == `n_max 7`, f16/bf16 byte-identical, MTP acceptance
+  bit-identical (0.90789), FLASH_ATTN_EXT 4591/4591, reserves byte-identical.  Cost: tg128 -0.5..-0.9 %
+  (only `W=1,2` move, onto the value the verify widths already produced).  Debug tool:
+  `wip/kv-quant-purity-followups/tools/fa-kernel-chooser-trace.patch`.  Details: `GREEDY-PURITY.md` §14.
 - **F2 (correctness): qwen4exp was not width-pure — CAUSE 1 FIXED 2026-09-11 (block-14 amendment,
-  canonical tip `1d8f53594`); cause 2 open.**
+  canonical tip `1bcf4e82d`); cause 2 open.**
   The earlier attribution ("the fused sparse QSA path") was **wrong**: `LLAMA_QSA_OFF=1`,
   `LLAMA_QSA_SPARSE_FA=0`, the dense-shortcut and the arch decode policy all leave the divergence
   unchanged, as do graphs, every CUDA fusion, the float-mmvf band and a batch-content test.  It is
