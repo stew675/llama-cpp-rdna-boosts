@@ -8,13 +8,18 @@ Model: `Qwen3.8-27B-Q8_0.gguf` unless stated; f16 KV, `-fa auto`.
 Follow-up to `GDN-CHUNKED-PREFILL-FOLLOWUP.md` (the gfx1151 finding).  Root
 cause confirmed on gfx1201, fix implemented, validated, and landed as a
 **block-02 amendment** (`patches/0002-…`).  Patch:
-`gdn-chunked-align-boundary.patch` — dispatch-only change to
-`ggml/src/ggml-cuda/gated_delta_net.cu`, +90/-2.
+`gdn-chunked-align-boundary.patch` — the ORIGINAL opt-in form of the
+dispatch-only change to `ggml/src/ggml-cuda/gated_delta_net.cu`, +90/-2;
+superseded by the delivery's block 02, which now carries the same gate with
+the default flipped ON (opt out with `=0`).
 
-**Opt-in: `GGML_CUDA_GDN_ALIGN_BOUNDARY=1`, default `0`.**  The fork's existing
-boundary is deliberate (and slightly faster), so the default is unchanged
-byte-for-byte; the gate only exists so a plain/spec-consistent mode can be
-selected when wanted.
+**`GGML_CUDA_GDN_ALIGN_BOUNDARY`, later flipped to default ON (opt-out with
+`=0`), 2026-09-11.**  Originally landed opt-in because the fork's existing
+boundary is deliberate and slightly faster; it was then made the default after
+the `-sm tensor` follow-up showed it is the second of the two independent
+causes of the plain-vs-spec drift (the first being the block-13 dense-MMVQ
+alignment).  `=0` restores the K-dependent boundary and its ~1.5-1.8 % prefill
+edge.  See `../sm-tensor-plain-vs-spec/HANDOVER-2026-09-11.md`.
 
 ## Root cause (confirmed)
 
@@ -108,9 +113,9 @@ Performance (27B Q8_0, 1 GPU, `-r 3`), gate on vs off:
 | gate on | 1379.03 | 1348.96 | 1308.60 | 20.43 |
 | `GGML_CUDA_GDN_CHUNKED=0` | 1227.84 | 1205.27 | 1184.87 | 20.43 |
 
-The gate costs **~1.1-1.2 %** prefill (the 64-token sequential tail); the
-chunked win over sequential is still **~12 %**, decode unchanged.  This is why
-it is opt-in.
+The gate costs **~1.1-1.8 %** prefill (the 64-token sequential tail); the
+chunked win over sequential is still **~12 %**, decode unchanged.  This was
+why it was initially opt-in; it is now the default (opt out with `=0`).
 
 ## Separate finding — `-sm tensor` plain-vs-spec divergence (NOT this bug)
 

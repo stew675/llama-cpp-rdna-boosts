@@ -1,24 +1,24 @@
-From 38641280bae6978ccaf829863331ed81c15c0336 Mon Sep 17 00:00:00 2001
+From d60bb52ef6bb12b697f2770d259a8a07e418bde2 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 02/14] rdna-boosts: block 02: fused chunked gated-delta-net
  prefill kernel
 
 ---
- ggml/src/ggml-cuda/gated_delta_net.cu         |  197 ++++
+ ggml/src/ggml-cuda/gated_delta_net.cu         |  200 ++++
  ggml/src/ggml-cuda/gated_delta_net_chunked.cu |  702 ++++++++++++
  .../src/ggml-cuda/gated_delta_net_chunked.cuh |   58 +
  .../ggml-cuda/gated_delta_net_chunked_bf16.cu |  995 ++++++++++++++++
  .../gated_delta_net_chunked_bf16_gfx11.cu     | 1014 +++++++++++++++++
  tests/test-backend-ops.cpp                    |   97 +-
- 6 files changed, 3058 insertions(+), 5 deletions(-)
+ 6 files changed, 3061 insertions(+), 5 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a724..4f12a93b9 100644
+index 1b431a724..c8e639789 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,4 +1,5 @@
@@ -27,16 +27,19 @@ index 1b431a724..4f12a93b9 100644
  #include "ggml-cuda/common.cuh"
  
  template <int S_v, bool KDA, bool keep_rs_t>
-@@ -286,6 +287,202 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -286,6 +287,205 @@ static void ggml_cuda_op_gated_delta_net_impl(
      const int K = ggml_get_op_params_i32(dst, 0);
      const bool keep_rs = K > 1;
  
-+    // Opt-in (DEFAULT OFF) K-independent chunked/sequential boundary: see the aligned block at
-+    // the bottom of this function.  The default keeps the fork's deliberate boundary (plain
-+    // chunks the whole prompt, MTP chunks n_tokens - K); the gate makes plain and the MTP spec
-+    // path agree on the post-prefill state (wip/issue-25-mtp-batch-width/).
++    // DEFAULT ON (opt-out) K-independent chunked/sequential boundary: see the aligned block at
++    // the bottom of this function.  The fork's original boundary is K-dependent (plain chunks
++    // the whole prompt, MTP chunks n_tokens - K), so the post-prefill state depends on n_rs_seq
++    // and --spec-type none disagrees with draft-mtp (the recurrent GDN amplifies the chunked
++    // kernel's inexactness).  The aligned boundary gives plain and the MTP spec path one state.
++    // GGML_CUDA_GDN_ALIGN_BOUNDARY=0 restores the K-dependent boundary (the ~2-2.6% faster
++    // prefill) when that bit-exactness is not wanted (wip/issue-25-mtp-batch-width/).
 +    const char * env_align = getenv("GGML_CUDA_GDN_ALIGN_BOUNDARY");
-+    const bool align_boundary = env_align != nullptr && strcmp(env_align, "0") != 0;
++    const bool align_boundary = env_align == nullptr || strcmp(env_align, "0") != 0;
 +
 +    // fused chunked prefill: more than one token per sequence, no snapshots, scalar gate, and
 +    // no fused-state-cache cpy to honour -- the grid maps one block per (chunk, head, seq).
@@ -146,10 +149,10 @@ index 1b431a724..4f12a93b9 100644
 +        }
 +    }
 +
-+    // Opt-in K-independent boundary (GGML_CUDA_GDN_ALIGN_BOUNDARY=1).  The chunked kernel is
-+    // not bit-exact with the sequential kernel (the bf16/WMMA path is deliberately
-+    // near-lossless, the fp32 path differs too), so the default K-dependent boundary makes the
-+    // post-prefill state depend on n_rs_seq: plain decode (K == 1) chunks the whole prompt
++    // K-independent boundary (DEFAULT ON; GGML_CUDA_GDN_ALIGN_BOUNDARY=0 opts out).  The
++    // chunked kernel is not bit-exact with the sequential kernel (the bf16/WMMA path is
++    // deliberately near-lossless, the fp32 path differs too), so the K-dependent boundary makes
++    // the post-prefill state depend on n_rs_seq: plain decode (K == 1) chunks the whole prompt
 +    // while the MTP path (K == n_max + 1) chunks n_tokens - K + a K-token tail, and the two
 +    // disagree, so greedy near-ties flip between --spec-type none and draft-mtp.  Chunking the
 +    // first (n_tokens - KTAIL) tokens and running the sequential kernel over the last KTAIL for

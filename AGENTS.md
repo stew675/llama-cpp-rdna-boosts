@@ -103,10 +103,10 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `27bd754b6`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `33ccf7e28`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
-`9113cc188`; block 02 amended 2026-09-11 with the opt-in
-`GGML_CUDA_GDN_ALIGN_BOUNDARY` branch), which is what
+`9113cc188`; block 02 amended 2026-09-11 with the
+`GGML_CUDA_GDN_ALIGN_BOUNDARY` branch, default ON / opt out with `=0`), which is what
 `scripts/make-patches.sh`'s default tip refers
 to; always regenerate from a canonical fork rebuilt at the fork point.
 **Block 15 (the attention-memory campaign) is NOT in the delivery** -- it
@@ -154,7 +154,10 @@ and produced tip `505637d6e` (the 2026-09-11 block-02 amendment re-ran the
 regeneration: strict 15/15 `git am`, applied tree `fcf3e4bb7` == canonical,
 tip `7b79930b2`; the 2026-09-11 block-13 dense-MMVQ-alignment amendment
 re-ran it once more: strict 15/15 `git am`, zero whitespace warnings,
-applied tree `c0775c33c` == canonical, tip `27bd754b6`).  Apart from the
+applied tree `c0775c33c` == canonical, tip `27bd754b6`; the 2026-09-11
+block-02 default-flip (GGML_CUDA_GDN_ALIGN_BOUNDARY now opt-**out**) re-ran
+it again: strict 15/15 `git am`, zero whitespace warnings, applied tree
+`31e153fe3` == canonical, tip `33ccf7e28`).  Apart from the
 block-02 and block-13 hunks the blocks' bodies are byte-identical to the
 previous regeneration apart from the `From <sha>` line and the
 `[PATCH NN/15]` series count (plus the block-00 Vulkan and block-03 HIP
@@ -246,13 +249,15 @@ explicitly requests it.**
   ~38k; 64-token same-seed output token-identical to sequential.  Opt
   out: `GGML_CUDA_GDN_CHUNKED=0` (also `GGML_CUDA_GDN_CHUNKED_BF16=0`).
   Bench record: `benchmarks/2026-08-31-mtp-gdn-chunked-prefix.md`.
-  Amended 2026-09-11 with an **opt-in** (`GGML_CUDA_GDN_ALIGN_BOUNDARY=1`,
-  default off) K-independent boundary: chunk `n_tokens - 64` and run the
-  sequential kernel over the last 64 for both `K == 1` and `K > 1`, so plain
-  decode and the MTP path agree (`--spec-type none == draft-mtp`) instead of
-  picking different K-dependent boundaries.  Default off keeps the existing,
-  deliberate boundary byte-identically and its ~1.1-1.2% prefill edge; the
-  gate trades that for consistency.  Record:
+  Amended 2026-09-11 with a K-independent boundary
+  (`GGML_CUDA_GDN_ALIGN_BOUNDARY`, **default ON**, opt out with `=0`):
+  chunk `n_tokens - 64` and run the sequential kernel over the last 64 for
+  both `K == 1` and `K > 1`, so plain decode and the MTP path agree
+  (`--spec-type none == draft-mtp`) instead of picking different K-dependent
+  boundaries.  Flipped to default ON 2026-09-11 (was opt-in) because the
+  K-dependent boundary is the other half of the `-sm tensor` plain-vs-spec
+  drift (with the block-13 dense-MMVQ alignment); the `=0` opt-out keeps the
+  ~1.5-1.8% faster prefill when the bit-exactness is not needed.  Record:
   `wip/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FIX.md`.
 - **Block-12 AR_PROFILE init fix (2026-09-01, PR #8, integrated):**
   `devices[]` is filled from the caller list before the profiler
@@ -370,7 +375,7 @@ Diff the output against a known-good build (or against RCCL via
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `27bd754b6`): `git format-patch --start-number 0` the block
+blocks tip `33ccf7e28`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -379,7 +384,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `27bd754b6`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `33ccf7e28`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

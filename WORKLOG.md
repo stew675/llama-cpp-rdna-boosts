@@ -10,6 +10,19 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Block 02 amended: `GGML_CUDA_GDN_ALIGN_BOUNDARY` flipped to default ON (opt-out), 2026-09-11.**
+  The K-independent chunked-GDN boundary is now enabled by default (`GGML_CUDA_GDN_ALIGN_BOUNDARY=0`
+  opts out and restores the K-dependent boundary).  This is the second of the two independent fixes
+  required for `--spec-type none == draft-mtp`: with the block-13 dense-MMVQ alignment in place, the
+  default is `none == n1 == n2 == n4` on 27B 2-GPU tensor (`5037ef2e`), 3-GPU tensor (`f60b79d0`),
+  2-GPU layer and 1-GPU (`7d566fee`), and on the 4B 1-GPU probe.  Cost of the default
+  (27B Q8_0, 1 GPU, llama-bench, `-r 5`, two alternating runs): pp512 1393.7/1384.5 ->
+  1363.6/1363.8 (**-1.8 / -1.5 %**), pp2048 1362.2/1358.3 -> 1337.3/1338.1 (-1.8 / -1.5 %),
+  pp4096 1329.5/1328.5 -> 1309.2/1309.6 (-1.5 %); decode unchanged (tg128 20.43 -> 20.40).  The
+  maintainer accepted the prefill cost to close the divergence.  Canonical chain re-cut: block 02
+  `38641280b` -> `d60bb52ef`, tip **`33ccf7e28`**, net tree **`31e153fe3`**; clean-apply strict 15/15
+  `git am`, zero whitespace warnings, applied tree == canonical.
+
 - **Block 13 amended: dense decode/verify MMVQ kernel alignment (`mmvq.cu`, 2026-09-11).**
   Closes the remaining batch-width half of the `-sm tensor` plain-vs-spec divergence.  Root cause:
   the block-13 `ncols_dst == 1` dispatch kept **dense** rows with `K < 4096` on the item-split/rpb
