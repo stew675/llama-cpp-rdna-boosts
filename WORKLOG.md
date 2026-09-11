@@ -10,6 +10,47 @@ for the full record; per-block technical notes live in
 
 ---
 
+## 2026-09-11 (6) — cause 3 localised: qwen4exp's plain-vs-spec gap is the QSA indexer path (not the FA kernel)
+
+Follow-up measurement on the cause-3 item of entry (5).  All three runs are qwen4exp, 3-GPU
+`-sm tensor`, f16 KV, `/tmp/prompt3k.txt` (~3.3k prompt), 128 greedy tokens, `--temp 0 --seed 42`,
+`n_max 3` where applicable; the emitted text is extracted by backspace-stripping and hashing the
+generation between the `> ` prompt echo and the `[ Prompt: ... ]` footer.
+
+| run | plain (`--spec-type none`) | `draft-mtp --spec-draft-n-max 3` |
+|---|---|---|
+| default | `3ee9daee5c07` (658 chars) | `8a50ea24e8d5` (729) |
+| `GGML_CUDA_GDN_CHUNKED=0` | `dad4f4442580` (721) | `9d29b773906f` (665) |
+| **`LLAMA_QSA_OFF=1`** | **`d4499ac8db72` (711)** | **`d4499ac8db72` (711)** — identical |
+| `LLAMA_QSA_SPARSE_FA=0` | `25f300a81b9e` (723) | `0d466b2dcf09` (721) |
+
+* **The kill-switch that works is `LLAMA_QSA_OFF=1`**: plain == `draft-mtp` byte-identical, and the
+  knob provably fires (the plain text moves `3ee9daee5c07` -> `d4499ac8db72`).
+* **`LLAMA_QSA_SPARSE_FA=0` does *not* fix it** (two different texts, both moved — so the knob fired):
+  the sparse-FA kernel (`fattn-qsa.cu`) is therefore **exonerated**, and the defect is in the rest of
+  the QSA machinery — the **indexer/score** path (`indexer-topk.cu` plus the `qwen4exp.cpp` gates).
+  `LLAMA_QSA_OFF=1`'s own comment says it "forces the dense no-indexer regime everywhere", which is
+  exactly the part `LLAMA_QSA_SPARSE_FA=0` keeps.
+* **The site class is cause 1's**: `src/models/qwen4exp.cpp:1094` gates the fused indexer score on
+  `idx_score_fused && idx_key_float && n_tokens == 1 && ...` and `:1419` gates the early-decode dense
+  shortcut on `qsa_dense_decode_until > 0 && n_tokens == 1 && n_kv < qsa_dense_decode_until` — so a
+  1-token decode and an n-token verify batch take different QSA paths.  The single-step width probe is
+  pure because it never reaches the sparse/indexer decode regime (its one decode step sits in the
+  dense window).
+* **It is not a prefill-state difference**: the divergence appears only after ~100 chars (~20 generated
+  tokens) of the 3.3k-prompt run, i.e. the first steps agree (and `n_max 3` == `n_max 7` text is
+  **identical** — `8a50ea24e8d5` — which is the cause-2 fix's win, since pre-fix they disagreed:
+  `8a50ea24e8d5` vs `e6918a7af1f9`).
+* The known **Issue #25 GDN chunked-prefill** item is a *separate* contributor, not this one: its
+  kill-switch moves both texts (`3ee9daee5c07` -> `dad4f4442580`, `8a50ea24e8d5` -> `9d29b773906f`)
+  without making them agree.  So cause 3 is **not** the GDN item and closing the GDN item will not
+  close qwen4exp's plain-vs-spec gap.
+
+**Consequence for the backlog:** cause 3 is a *small, well-scoped* fix in the established F2-cause-1
+pattern (make the QSA decode band take one path for `n_tokens = 1..8`), with two identified sites and a
+proven kill-switch — **not** a deep kernel issue.  Until it lands, `LLAMA_QSA_OFF=1` restores
+`plain == draft-mtp` for qwen4exp byte-identically.
+
 ## 2026-09-11 (5) — F2 cause 2 FIXED: the MoE decode/verify band is band-uniform (block-13 amendment)
 
 **qwen4exp is now width-pure `W = 1..8`**, so the designed `--spec-draft-n-max <= 7` verify batch is
@@ -86,7 +127,8 @@ at exactly `+0.0` in the HIP `fattn-tile`/`fattn-mma-f16` and Vulkan paths but *
 **QSA sparse-attention path** (`fattn-qsa.cu`).  Next instrument: a multi-step probe (prefill P, then
 feed a *fixed* token sequence, comparing the logits at each position between `W = 1` steps and `W = k`
 chunks) — the single-step probe and `RS` dimension cannot see a cell that is only stale after a
-roll-back.
+roll-back.  **Corrected in the 2026-09-11 (6) entry: the cause-3 site is the QSA *indexer* machinery,
+not the sparse-FA kernel, and the proven kill-switch is `LLAMA_QSA_OFF=1`.**
 
 ## 2026-09-11 (4) — F2 cause 2 localised: it is the MoE gate+up+GLU fusion flipping at `n_q = 5`, not a kernel-dispatch band
 

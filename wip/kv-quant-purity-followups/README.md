@@ -176,8 +176,8 @@ token-generic** (`int64_t n_tokens`, `if (it >= n_tokens) return;`).
 > splits (every width = that split's pre-fix `W = 1`), `+14-26 %` at the verify widths, dense untouched.
 > See `patches/README.md` (block-13 notes) and the 2026-09-11 (5) WORKLOG entry.  **Cause 3 — `plain`
 > still != `draft-mtp` text, a pre-existing multi-step/roll-back effect (the fix is a no-op at
-> `n_max 3`); prime suspect the QSA sparse path's masked/stale KV cells — see the WORKLOG entry and
-> `GREEDY-PURITY.md` §15.**
+> `n_max 3`); **localised 2026-09-11 (further measurement): it is in the QSA *machinery*, and the site class is the same as cause 1's.**  `LLAMA_QSA_OFF=1` makes `plain` == `draft-mtp --spec-draft-n-max 3` **byte-identical** (`d4499ac8db72` both, 711 chars) — and the knob provably fires (the plain text moves `3ee9daee5c07` -> `d4499ac8db72`) — while `LLAMA_QSA_SPARSE_FA=0` (dense attention, indexer still on) leaves two different texts (`25f300a81b9e` vs `0d466b2dcf09`), so the defect is **not** the sparse-FA kernel but the **indexer/score machinery** (`indexer-topk.cu` + the `qwen4exp.cpp` gates).  Both QSA-side `n_tokens == 1` gates are the prime suspects — `src/models/qwen4exp.cpp:1094` (`idx_score_fused`, the fused indexer score) and `:1419` (`qsa_dense_decode_until`, the early-decode dense shortcut) — i.e. exactly the cause-1 pattern, and the single-step width probe cannot see them because it never reaches the sparse/indexer decode regime.  The divergence appears only after ~100 chars (~20 tokens) of a 3.3k-prompt greedy run (the first steps agree), so it is not a prefill-state difference; `GGML_CUDA_GDN_CHUNKED=0` moves both sides without making them agree (the known Issue #25 chunked-prefill item is a separate contributor, not this).  **Kill-switch for users meanwhile: `LLAMA_QSA_OFF=1`.**
+> See the WORKLOG (2026-09-11 (6)) and `GREEDY-PURITY.md` §15.**
 >
 > (Superseded text follows — kept as the record of how the boundary was localised.)
 

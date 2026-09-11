@@ -321,10 +321,7 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   **Cause 3 (OPEN): `plain` still differs from `draft-mtp` text** (`plain` `3ee9daee5c07` vs
   `n_max 3 == n_max 7` `8a50ea24e8d5`) — pre-existing and independent of cause 2 (at `n_max 3`/`W = 4`
   the cause-2 fix is a verified no-op).  The single-step width probe is pure (both splits, `RS=0` and
-  `RS=from_w`), so this is a **multi-step / roll-back** effect: prime suspect the masked (freed/stale)
-  KV cells in qwen4exp's **QSA sparse-attention** path (`fattn-qsa.cu`), which block 14's masked-V
-  fixes do not cover.  Next instrument: a multi-step probe (prefill P, feed a fixed token sequence,
-  compare per-position logits between `W = 1` steps and `W = k` chunks).**
+  `RS=from_w`), so this is a **multi-step / roll-back** effect: **localised 2026-09-11 (further measurement): it is in the QSA *machinery*, and the site class is the same as cause 1's.**  `LLAMA_QSA_OFF=1` makes `plain` == `draft-mtp --spec-draft-n-max 3` **byte-identical** (`d4499ac8db72` both, 711 chars) — and the knob provably fires (the plain text moves `3ee9daee5c07` -> `d4499ac8db72`) — while `LLAMA_QSA_SPARSE_FA=0` (dense attention, indexer still on) leaves two different texts (`25f300a81b9e` vs `0d466b2dcf09`), so the defect is **not** the sparse-FA kernel but the **indexer/score machinery** (`indexer-topk.cu` + the `qwen4exp.cpp` gates).  Both QSA-side `n_tokens == 1` gates are the prime suspects — `src/models/qwen4exp.cpp:1094` (`idx_score_fused`, the fused indexer score) and `:1419` (`qsa_dense_decode_until`, the early-decode dense shortcut) — i.e. exactly the cause-1 pattern, and the single-step width probe cannot see them because it never reaches the sparse/indexer decode regime.  The divergence appears only after ~100 chars (~20 tokens) of a 3.3k-prompt greedy run (the first steps agree), so it is not a prefill-state difference; `GGML_CUDA_GDN_CHUNKED=0` moves both sides without making them agree (the known Issue #25 chunked-prefill item is a separate contributor, not this).  **Kill-switch for users meanwhile: `LLAMA_QSA_OFF=1`.****
   The earlier attribution ("the fused sparse QSA path") was **wrong**: `LLAMA_QSA_OFF=1`,
   `LLAMA_QSA_SPARSE_FA=0`, the dense-shortcut and the arch decode policy all leave the divergence
   unchanged, as do graphs, the float-mmvf band and a batch-content test — **but note that list was
@@ -340,9 +337,12 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   (`3adeb313042a871b` / `dcf1ae667f730879`), W=1 is byte-identical to the pre-fix build for every KV
   type, plain == `draft-mtp --spec-draft-n-max 3` greedy text, and f16 MTP acceptance rose
   0.50000 -> 0.76744 (MTP generation 63.3 -> 79.9 t/s) with decode/prefill/reserves unchanged.
-  **(cause 2) still open**: a kernel-dispatch band at W >= 5 (`{1,2,3,4} {5} {6,7} {8}`) that
-  survives all fusions disabled — **the same cause as F1**, so fix it with F1/F3 and re-check
-  qwen4exp (the band stops at `n_max 3` until then; `q8_0`/`q4_0` KV must be re-measured after F1).
+  **(cause 2) FIXED 2026-09-11** as a block-13 amendment: it was not a kernel-dispatch band but
+  upstream's **per-type mmvq cap** — compiled into `mul_mat_vec_q_moe`'s `__launch_bounds__` (so
+  `ncols_dst > cap` cannot launch) and selecting MMQ above the cap (the `mul_mat_q_pair` arm).
+  `W = 1..8` is now bit-identical on both splits, `+14-26 %` at the verify widths; see
+  `GREEDY-PURITY.md` §15 and the 2026-09-11 (5) WORKLOG entry.  (`q8_0`/`q4_0` KV were re-measured
+  after F1 and are width-pure; the earlier "the same cause as F1" guess was wrong.)
   Full evidence, the excluded-list and the re-appliable node-dump instrument:
   `wip/kv-quant-purity-followups/` (`README.md` F2 + `tools/node-dump-instrumentation.patch`).
 - **F3 (performance, biggest available win): sub-`q8_0` KV quant parity.**  q4_1/q5_0/q5_1/iq4_nl
