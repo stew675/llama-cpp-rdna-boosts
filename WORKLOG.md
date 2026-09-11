@@ -10,6 +10,27 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Block 13 amended: dense decode/verify MMVQ kernel alignment (`mmvq.cu`, 2026-09-11).**
+  Closes the remaining batch-width half of the `-sm tensor` plain-vs-spec divergence.  Root cause:
+  the block-13 `ncols_dst == 1` dispatch kept **dense** rows with `K < 4096` on the item-split/rpb
+  kernel while the ncols 2..8 dispatch (and `K >= 4096` ncols==1) unconditionally use the ksplit
+  kernel; the two accumulate K in different orders, so a single-token dense `MUL_MAT` is not
+  row-identical to the same row in a 2..8-token verify batch (~1e-6 at the first divergent
+  projection, amplified by the recurrent GDN).  Visible as `--spec-type none` != `draft-mtp` on
+  small dense models (`n_embd < 4096`, e.g. Qwen3.5-4B, the cheap 1-GPU repro) and under
+  `-sm tensor` on any model whose per-GPU K shard drops below 4096 (Qwen3.8-27B 5120 -> 2560).
+  Fix: `!has_ids || ncols_x >= 4096` — dense rows always ksplit; `MUL_MAT_ID`/MoE keeps the
+  item-split (its multi-token kernel is `mul_mat_vec_q_moe`).  Verified per-process (token-0 logit
+  hash, callback-free): 4B 1-GPU and 27B 2-GPU-tensor W=1/3/5 bit-identical (was 0.133 on the
+  27B).  Perf neutral (4B/27B/MoE-A3B within noise, MoE tg128 95.66 -> 96.02); MTP gates
+  0.487/36.5 (dense) and 0.675/153.1 (MoE); `GATED_DELTA_NET` 46/46; hybrid-vs-NCCL coherence
+  identical.  **The default-config `-sm tensor` text equality additionally requires the block-02
+  `GGML_CUDA_GDN_ALIGN_BOUNDARY=1` gate** (K-dependent chunked-GDN prefill boundary); that gate
+  stays opt-in because it costs ~2-2.6% prefill.  Canonical chain re-cut: block 13
+  `fc7f52f96` -> `029b07b30`, tip **`27bd754b6`**, net tree **`c0775c33c`**; clean-apply strict
+  15/15 `git am`, zero whitespace warnings, applied tree == canonical.  Record:
+  `wip/sm-tensor-plain-vs-spec/HANDOVER-2026-09-11.md`; block-13 notes in `patches/README.md`.
+
 - **Block 02 amended: opt-in K-independent chunked-GDN boundary (`GGML_CUDA_GDN_ALIGN_BOUNDARY=1`, 2026-09-11).**
   Fixes the fork-only plain-vs-spec divergence found during the gfx1151 issue-#25 validation (the issue
   #25 *follow-up*): the chunked GDN prefill had a **K-dependent** chunk/sequential boundary (plain

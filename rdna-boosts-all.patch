@@ -13862,7 +13862,7 @@ index b4a747720..1a512b296 100644
  
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 6305230b1..5119ae275 100644
+index 6305230b1..da85014cc 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -50,9 +50,9 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
@@ -14647,7 +14647,7 @@ index 6305230b1..5119ae275 100644
      }
  }
  
-@@ -1157,92 +1584,191 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1157,92 +1584,201 @@ static void mul_mat_vec_q_switch_ncols_dst(
      }
  
      switch (ncols_dst) {
@@ -14767,14 +14767,24 @@ index 6305230b1..5119ae275 100644
 +            switch (ncols_dst) {
 +                case 1: {
 +                    // Single-token decode. Block 13's item-split kernel + rpb
-+                    // override wins on short-K rows (MoE down/router, expert
-+                    // projections are K < 4096 regardless of quant type), but its
-+                    // rpb=16 register fan-out loses on long-K dense projections
-+                    // (qkv/FFN K >= 4096); those use the ksplit kernel
++                    // override wins on short-K MoE rows (down/router, K < 4096),
++                    // but its rpb=16 register fan-out loses on long-K dense
++                    // projections (qkv/FFN K >= 4096); those use the ksplit kernel
 +                    // (pre-block-13 geometry) instead.
++                    //
++                    // Dense (non-MUL_MAT_ID) rows are ALWAYS ksplit, for every K:
++                    // the multi-token dispatch below (ncols 2..8) uses ksplit
++                    // unconditionally, so a dense ncols==1 row that stayed on the
++                    // item-split kernel accumulated K in a different order than the
++                    // verify batch and stopped being bit-identical row by row.  A
++                    // ~1e-6 per-row difference is amplified by the recurrent GDN
++                    // into greedy flips between --spec-type none and draft-mtp
++                    // (and under --split-mode tensor, where the per-GPU K shard
++                    // drops below 4096).  MoE rows keep the item-split: their
++                    // multi-token path is the dedicated mul_mat_vec_q_moe kernel.
 +                    constexpr int c_ncols_dst = 1;
 +                    if (table_id >= MMVQ_PARAMETERS_RDNA2) {
-+                        if (ncols_x >= 4096) {
++                        if (!has_ids || ncols_x >= 4096) {
 +                            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
 +                            mul_mat_vec_q_switch_fusion_ksplit<type, c_ncols_dst>(
 +                                vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
@@ -14875,7 +14885,7 @@ index 6305230b1..5119ae275 100644
          } break;
          default:
              GGML_ABORT("fatal error");
-@@ -1435,8 +1961,8 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1435,8 +1971,8 @@ void ggml_cuda_mul_mat_vec_q(
          GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
          GGML_ASSERT(  ids || dst->ne[1] == 1);
          // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
@@ -14886,7 +14896,7 @@ index 6305230b1..5119ae275 100644
  
          if (fusion->x_bias) {
              GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
-@@ -1457,9 +1983,23 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1457,9 +1993,23 @@ void ggml_cuda_mul_mat_vec_q(
          if (fusion->x_scale) {
              GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
              GGML_ASSERT(ggml_is_contiguous(fusion->x_scale));
@@ -14911,7 +14921,7 @@ index 6305230b1..5119ae275 100644
          if (fusion->gate_scale) {
              GGML_ASSERT(fusion->gate_scale->type == GGML_TYPE_F32);
              GGML_ASSERT(ggml_is_contiguous(fusion->gate_scale));
-@@ -1468,6 +2008,10 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1468,6 +2018,10 @@ void ggml_cuda_mul_mat_vec_q(
          }
          fusion_local.glu_op = fusion->glu_op;
          fusion_local.glu_limit = fusion->glu_limit;
@@ -14922,7 +14932,7 @@ index 6305230b1..5119ae275 100644
      }
  
      // If src0 is a temporary compute buffer, clear any potential padding.
-@@ -1482,12 +2026,22 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1482,12 +2036,22 @@ void ggml_cuda_mul_mat_vec_q(
      }
  
      const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -14951,7 +14961,7 @@ index 6305230b1..5119ae275 100644
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1513,12 +2067,466 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1513,12 +2077,466 @@ void ggml_cuda_mul_mat_vec_q(
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
      mul_mat_vec_q_switch_type(
@@ -15419,7 +15429,7 @@ index 6305230b1..5119ae275 100644
  void ggml_cuda_op_mul_mat_vec_q(
      ggml_backend_cuda_context & ctx,
      const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
-@@ -1549,3 +2557,152 @@ void ggml_cuda_op_mul_mat_vec_q(
+@@ -1549,3 +2567,152 @@ void ggml_cuda_op_mul_mat_vec_q(
  
      GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
  }

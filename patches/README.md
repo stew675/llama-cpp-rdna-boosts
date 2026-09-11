@@ -60,7 +60,7 @@ the 15-block tree):
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13) |
-| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)** — see the block-13 notes below.
+| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-11 with the dense ncols==1 ksplit alignment** (dense `MUL_MAT` rows always ksplit for every K so single-token decode is row-identical to the 2..8-token verify batch; `MUL_MAT_ID`/MoE keeps the item-split) — see the block-13 notes below; **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)** — see the block-13 notes below.
 | `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-07 with the derived-cache pool gate** (the F32 block-vector pool is now allocated only when the derived cache is enabled *and* the indexer keys are unquantized — no more dead ~100 MiB buffer + no-op fill launches otherwise) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. | **amended 2026-09-08 with the quantized-KV tensor-split gate** — `q4_1`-family KV cache types (`q4_1`/`q5_0`/`q5_1`/`iq4_nl`) abort at graph reserve under multi-GPU `SPLIT_MODE_TENSOR` (upstream bug, also on vanilla `050dde50c`); now rejected at context creation with a clear error when the Meta device is in use — see the block-14 notes below. | **amended 2026-09-09 with the gfx1151-only freed-cell KV-zeroing gate** — the seq_rm/seq_keep/clear row zeroing (strix-port aad5adb08f masked-column guard for the gfx1151 WMMA f16 `x+(-0.0)` inexactness) now enables only when a KV buffer device is gfx1151 (env `LLAMA_KV_ZERO_FREED` overrides); everywhere else pre-block-14 behavior (no per-free GPU memsets) is restored — see the 2026-09-09 block-14 amendment section below. | **amended 2026-09-10: the freed-cell host zeroing is removed and the kernel-side masked-V fixes were re-homed** — `llama-kv-cache.{cpp,h}` are the upstream state (no `zero_freed`/env/GPU memsets); the Vulkan `flash_attn_cm1.comp`/`flash_attn.comp` fixes live in block 00 and the HIP `fattn-tile.cuh`/`fattn-mma-f16.cuh` fixes live in block 03, so block 14 carries none of them — see the 2026-09-10 block-00 section below. |
 
 ## Apply (fresh checkout at the fork point)
@@ -930,6 +930,38 @@ baseline table live in `wip/qwen35moe-prefill/bench-config.md`.
   `n_embd % 4 == 0`) and the upstream scalar bounds-checked kernel for
   the remainder.  Verified (3x R9700 gfx1201): MOE_WEIGHTED_REDUCTION
   6/6, full test-backend-ops 16590/16590.
+- **Dense decode/verify MMVQ kernel alignment (2026-09-11, folded into
+  block 13):** the block-13 MTP fix above left one asymmetry: at
+  `ncols_dst == 1`, dense (non-`MUL_MAT_ID`) rows with `K < 4096` stayed
+  on the block-13 item-split kernel while ncols 2..8 unconditionally use
+  the ksplit kernel (and `K >= 4096` ncols==1 already used ksplit).  The
+  two kernels accumulate K in different orders, so a single-token dense
+  `MUL_MAT` was **not** row-identical to the same row inside a 2..8-token
+  verify batch — a ~1e-6 logit difference at the first such projection,
+  amplified by the recurrent GDN into greedy flips.  Effect:
+  `--spec-type none` and `draft-mtp` produced different text (a) on small
+  dense models with `K = n_embd < 4096` (e.g. Qwen3.5-4B) and (b) under
+  `--split-mode tensor` on any model whose per-GPU K shard drops below
+  4096 (Qwen3.8-27B: 5120 -> 2560).  Fix: dense ncols==1 rows use ksplit
+  for **every** K (condition `!has_ids || ncols_x >= 4096`); the MoE
+  (`MUL_MAT_ID`) rows keep the block-13 item-split + rpb path — their
+  multi-token path is the dedicated `mul_mat_vec_q_moe` kernel (one warp
+  per token), so the row-bit-identity invariant holds there without
+  touching the short-K MoE decode win.  Verified (1x R9700 gfx1201,
+  per-process token-0 logit hash, chunked GDN off): Qwen3.5-4B Q8_0
+  1-GPU W=1/3/5 bit-identical; Qwen3.8-27B Q8_0 2-GPU tensor W=1/3/5
+  bit-identical (was W1-W3 = 0.133).  Perf neutral (llama-bench, 1 GPU):
+  4B pp512 7714 -> 7680 / tg128 100.26 -> 100.65; 27B pp512 1394 -> 1390
+  / tg128 20.42 -> 20.42; MoE-A3B Q4_K_M pp512 4804 -> 4802 / tg128
+  95.66 -> 96.02.  MTP gates unchanged/healthier (dense 27B acceptance
+  0.487 / 36.5 t/s, MoE 0.675 / 153.1 t/s); `GATED_DELTA_NET` 46/46 and
+  the hybrid-vs-NCCL coherence gate identical.  **Companion requirement:**
+  with `GGML_CUDA_GDN_CHUNKED` on (the default) the default-config
+  `-sm tensor` text equality **also** needs the block-02
+  `GGML_CUDA_GDN_ALIGN_BOUNDARY=1` gate (the K-dependent chunked-GDN
+  prefill boundary), which stays opt-in because it costs ~2-2.6% prefill
+  (pp512 1390 -> 1355, pp2048 1360 -> 1328, pp4096 1323 -> 1296).  See
+  `wip/sm-tensor-plain-vs-spec/HANDOVER-2026-09-11.md`.
 
 ## Server config (the +22% deployment win)
 

@@ -103,7 +103,7 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `7b79930b2`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `27bd754b6`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the opt-in
 `GGML_CUDA_GDN_ALIGN_BOUNDARY` branch), which is what
@@ -152,8 +152,10 @@ fork point + apply) — the last regeneration (2026-09-10, the 15-block set
 with block 00 and the re-homed masked-V fixes) applied strict 15/15 `git am`
 and produced tip `505637d6e` (the 2026-09-11 block-02 amendment re-ran the
 regeneration: strict 15/15 `git am`, applied tree `fcf3e4bb7` == canonical,
-tip `7b79930b2`).  Apart from the block-02 K-independent-boundary hunk the
-blocks' bodies are byte-identical to the
+tip `7b79930b2`; the 2026-09-11 block-13 dense-MMVQ-alignment amendment
+re-ran it once more: strict 15/15 `git am`, zero whitespace warnings,
+applied tree `c0775c33c` == canonical, tip `27bd754b6`).  Apart from the
+block-02 and block-13 hunks the blocks' bodies are byte-identical to the
 previous regeneration apart from the `From <sha>` line and the
 `[PATCH NN/15]` series count (plus the block-00 Vulkan and block-03 HIP
 hunks).  (The block-15 attention-memory campaign was
@@ -368,7 +370,7 @@ Diff the output against a known-good build (or against RCCL via
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `7b79930b2`): `git format-patch --start-number 0` the block
+blocks tip `27bd754b6`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -377,7 +379,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `7b79930b2`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `27bd754b6`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

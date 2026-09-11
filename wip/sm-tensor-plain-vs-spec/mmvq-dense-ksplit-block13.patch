@@ -1,0 +1,34 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 5119ae275..da85014cc 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1671,14 +1671,24 @@ static void mul_mat_vec_q_switch_ncols_dst(
+             switch (ncols_dst) {
+                 case 1: {
+                     // Single-token decode. Block 13's item-split kernel + rpb
+-                    // override wins on short-K rows (MoE down/router, expert
+-                    // projections are K < 4096 regardless of quant type), but its
+-                    // rpb=16 register fan-out loses on long-K dense projections
+-                    // (qkv/FFN K >= 4096); those use the ksplit kernel
++                    // override wins on short-K MoE rows (down/router, K < 4096),
++                    // but its rpb=16 register fan-out loses on long-K dense
++                    // projections (qkv/FFN K >= 4096); those use the ksplit kernel
+                     // (pre-block-13 geometry) instead.
++                    //
++                    // Dense (non-MUL_MAT_ID) rows are ALWAYS ksplit, for every K:
++                    // the multi-token dispatch below (ncols 2..8) uses ksplit
++                    // unconditionally, so a dense ncols==1 row that stayed on the
++                    // item-split kernel accumulated K in a different order than the
++                    // verify batch and stopped being bit-identical row by row.  A
++                    // ~1e-6 per-row difference is amplified by the recurrent GDN
++                    // into greedy flips between --spec-type none and draft-mtp
++                    // (and under --split-mode tensor, where the per-GPU K shard
++                    // drops below 4096).  MoE rows keep the item-split: their
++                    // multi-token path is the dedicated mul_mat_vec_q_moe kernel.
+                     constexpr int c_ncols_dst = 1;
+                     if (table_id >= MMVQ_PARAMETERS_RDNA2) {
+-                        if (ncols_x >= 4096) {
++                        if (!has_ids || ncols_x >= 4096) {
+                             std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
+                             mul_mat_vec_q_switch_fusion_ksplit<type, c_ncols_dst>(
+                                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
