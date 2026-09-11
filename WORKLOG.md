@@ -10,6 +10,84 @@ for the full record; per-block technical notes live in
 
 ---
 
+## 2026-09-11 (5) — F2 cause 2 FIXED: the MoE decode/verify band is band-uniform (block-13 amendment)
+
+**qwen4exp is now width-pure `W = 1..8`**, so the designed `--spec-draft-n-max <= 7` verify batch is
+bit-identical to the 1-token decode — the remaining *logit-level* condition for `plain == draft-mtp`.
+Canonical tip **`bfaa83d8a`**, net tree **`4e5f2952f016f1ac160c53261f7b01d346322534`**; only
+`ggml/src/ggml-cuda/mmvq.cu` changed (26 insertions / 11 deletions).
+
+**Task 1 answered by measurement, and it moved the diagnosis.**  `[GD]` full-graph dumps show the graphs
+are **identical** at every stage (2647/2404/2271/1863/1668/1565 nodes at both `W=4` and `W=5`), so the
+previous entry's question ("fusion-applied vs graph-built-with-fewer-ops") is settled: the graph always
+contains `MUL_MAT_ID(ffn_moe_gate)`, `MUL_MAT_ID(ffn_moe_up)`, `GLU(ffn_moe_swiglu)` at the same node
+indices (`k=76/77/78`), and only the *fusion coverage* differs.  But the cause was **not** the
+`mul_mat_id_glu_ops` fusion the previous entry blamed:
+
+* `mul_mat_vec_q_moe`'s `__launch_bounds__` was `get_mmvq_mmid_max_batch_for_device<type>()*warp_size`
+  — the upstream **per-type mmvq cap compiled into the kernel**, while the block is
+  `(warp_size, ncols_dst)`.  Launching `IQ3_S` (cap 4) with `ncols_dst = 5` is 160 threads > the bound
+  and dies with `ROCm error: unspecified launch failure`, so the cap is a *capability* limit, not just
+  a heuristic.
+* the same cap routes the upper band to MMQ: `ggml_cuda_mul_mat_id` takes `ne2 <= cap → mmvq` else
+  `should_use_mmq → MMQ`, and `use_mmvq` (`ggml-cuda.cu:3730`) gates the `mul_mat_q_pair` fusion
+  (which is what actually fired at `W = 5..7`).  mmvq (one warp per token, `mul_mat_vec_q_moe`) and
+  MMQ reduce in different orders, so the band splits.
+* the **UD-IQ4_XS quant mixes expert types per layer** — 47 layers `IQ3_S` gate/up (cap 4), layer 2
+  `IQ4_XS` (cap 5), down `IQ4_NL`/`Q8_0` (cap 7) — which *predicts the census exactly*: fused layers
+  48/48/48/48/1/0/0/0 for `W = 1..8` (measured `ffn_moe_up` MUL_MAT_ID counts 0/0/0/0/47/48/48).  That
+  is the 4→5 and 5→6 boundary; the down's cap 7 is the 7→8 boundary.
+
+**Fix.**  Block 13 already carries the invariant — `mul_mat_vec_q_switch_ncols_dst`'s `has_ids` branch
+("this must cover `ncols_dst == 1` as well … the decode == verify invariant", added by block 13
+2026-09-01) routes every `MUL_MAT_ID` to the column-generic MoE kernel.  The fix completes it for the
+whole band:
+
+1. `mmvq_mmid_max_batch_band(cap)` floors the per-type cap at `MMVQ_MAX_BATCH_SIZE` (the decode/verify
+   band), applied to every AMD arch lookup, host *and* device;
+2. `mul_mat_vec_q_moe`'s launch bound becomes `MMVQ_MAX_BATCH_SIZE*warp_size`, so the kernel can
+   actually be launched across the band.
+
+No other path changes: the caps' call sites are all `MUL_MAT_ID`-only, so dense models are untouched.
+
+**Validation.**  `W = 1..8` all `3adeb313042a871b` (`-sm layer`) and `dcf1ae667f730879`
+(`-sm tensor`) — i.e. every width equals that split's **pre-fix `W = 1` value**, so plain decode is
+bit-unchanged and only `W = 5..8` moved onto it (the F1 "move the cheap side" pattern).  Also pure with
+the state-sequence dimension exercised (`RS=0` and `RS=from_w`).  Controls: the **pre-fix vs post-fix
+`plain` text is byte-identical** (`3ee9daee5c07`), and at the MTP gate config (`n_max 3` = `W=4`, a
+no-op width) the runs are byte-identical: acceptance `0.76744` (66/86), generation 80.1 vs 80.0 t/s.
+Text level: pre-fix `n_max 3` ≠ `n_max 7`; **with the fix they agree** (`8a50ea24e8d5`).
+
+**Perf — the fix is a large win at the verify widths** (`llama-batched-bench`, fixed vs baseline
+interleaved, swappable `libggml-hip.so`):
+
+| model | batch 1 | 2 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|
+| qwen4exp 3-GPU `-sm tensor` tg128 | 50.5 / 50.4 | 85.4 / 85.6 | 134.1 / 132.9 | **149.5 / 118.4 (+26 %)** | **162.5 / 130.6 (+24 %)** | **171.4 / 147.0 (+17 %)** | **178.0 / 155.4 (+14.5 %)** |
+| 35B-A3B MoE 1 GPU tg128 | 98.3 / 98.1 | 156.4 / 156.2 | 254.2 / 254.1 | – | – | – | **341.3 / 289.9 (+17.8 %)** |
+| 4B dense 1 GPU tg128 | 100.6 / 100.5 | 167.2 / 167.3 | 294.0 / 294.9 | – | – | – | 414.5 / 413.3 |
+
+Widths inside the caps are unchanged (and bit-identical), dense is untouched, and MTP `n_max 7` goes
+**41.8–42.5 vs 36.1 t/s (+16–18 %)** with acceptance `0.59375` vs `0.55556`.  The upstream per-type
+mmvq caps were actively *costing* throughput on RDNA4 with the fork's mmvq + fused-GLU kernels.
+
+**Cross-checks.**  `GATED_DELTA_NET` 4/4 backends OK; `FLASH_ATTN_EXT` 4/4 OK; MoE asterisk intact
+(`ac8825358d9adfda` / `bd138ad2326fbbf2`); reserves unchanged (no allocation changes); clean-apply
+simulation strict 15/15 with **0 whitespace warnings** and tree == canonical.
+
+**Open — cause 3 (new, pre-existing, independent of cause 2).**  `plain` still differs from
+`draft-mtp` text for qwen4exp even after the fix (`plain` `3ee9daee5c07` vs `n_max 3 == n_max 7`
+`8a50ea24e8d5`), and the fix **cannot** be responsible: `n_max 3` uses `W = 4`, where the fix is a
+verified no-op (bit-identical logits, byte-identical text, byte-identical acceptance).  Since the
+single-step probe shows bit-identical logits for `W = 1..8` across both splits and the state-sequence
+dimension, the divergence must be a **multi-step** effect — i.e. the speculative roll-back itself.
+Prime suspect: the **masked (freed/stale) KV cells** written by rejected drafts, which block 14 keeps
+at exactly `+0.0` in the HIP `fattn-tile`/`fattn-mma-f16` and Vulkan paths but **not** in qwen4exp's
+**QSA sparse-attention path** (`fattn-qsa.cu`).  Next instrument: a multi-step probe (prefill P, then
+feed a *fixed* token sequence, comparing the logits at each position between `W = 1` steps and `W = k`
+chunks) — the single-step probe and `RS` dimension cannot see a cell that is only stale after a
+roll-back.
+
 ## 2026-09-11 (4) — F2 cause 2 localised: it is the MoE gate+up+GLU fusion flipping at `n_q = 5`, not a kernel-dispatch band
 
 **Instrument.**  The per-node `[ND]` dump (`GGML_CUDA_NODE_DUMP=1`, re-appliable from

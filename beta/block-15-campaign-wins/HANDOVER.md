@@ -7,7 +7,11 @@
 > amendment moved the canonical tip: base `1d8f53594` -> **beta tip `54859fdda`, tree
 > `543ccc015`**, metadata/offset-only (0 changed body lines) — see the beta `README.md`;
 > **re-cut a third time 2026-09-11** after the block-08 FA kernel-family amendment (F1): base
-> `1bcf4e82d` -> **beta tip `0c8099ca2`, tree `7335b923d`**, again metadata/offset-only.
+> `1bcf4e82d` -> **beta tip `0c8099ca2`, tree `7335b923d`**, again metadata/offset-only; and
+> **re-cut a fourth time 2026-09-11** after block 13's F2 cause-2 band-uniformity amendment: base
+> `bfaa83d8a` (tree `4e5f2952f`) -> **beta tip `3f4e0747d`, tree `d50b4e121`**, metadata-only (block 15
+> does not touch `mmvq.cu`; the patch file is 3722 lines before and after, only the `From <sha>` line
+> differs, and re-applying on the new base reproduces `d50b4e121` exactly).
 > The dependent delta was exactly one file
 > (`fattn-common.cuh`), the textual apply was clean, every 2026-09-10 number
 > reproduced to the last decimal, and three **pre-existing** follow-ups were

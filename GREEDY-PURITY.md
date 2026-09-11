@@ -457,8 +457,9 @@ Measured (3 GPUs, f16 KV, P=256, RS=0):
 | `-sm layer`  | **all `3adeb313042a871b`** (= the W=1 decode) | `c999233926f0` | `a8c532e12f9c` | `c56ebb61963a` |
 | `-sm tensor` | **all `dcf1ae667f730879`** (= the W=1 decode) | `2bfb89f59ec2` | `e8b1253ea93e` | `a7c5dfd26a56` |
 
-So qwen4exp is width-pure for **`--spec-draft-n-max <= 3`**, and there plain decode == `draft-mtp`
-greedy text (byte-identical, 3275 chars).  The `W >= 5` grouping is **cause 2** (§11): the same
+So qwen4exp was width-pure for **`--spec-draft-n-max <= 3`** *at the time of this measurement*
+(2026-09-11, block-14 amendment); **§15 fixes the `W >= 5` half, so the band is now `n_max <= 7`**.
+The `W >= 5` grouping is **cause 2** (§11): the same
 `ncols_dst`/`ne11` kernel-selection band **that was assumed to be the same site as the `q8_0`/`q4_0` KV
 impurity in §12**.  That hypothesis was **refuted on 2026-09-11**: fixing F1 (§14) left cause 2's
 `{5} {6,7} {8}` grouping completely unchanged, so cause 2 is a *separate* site (a matmul/MoE dispatch
@@ -510,3 +511,64 @@ native path width-invariant).
 and timing-dependent, and the ASCII banner embeds the build SHA: apply backspaces, strip the banner and
 the `[ Prompt: ... | Generation: ... ]` footer before hashing output — and always run a control that
 must agree (the f16 pair) before believing any divergence.
+
+## 15. F2 cause 2 fixed (2026-09-11, block-13 amendment): the MoE decode/verify band is band-uniform
+
+§13's `W >= 5` grouping is fixed, and the *mechanism* is **not** the gate+up+GLU fusion coverage the
+first pass blamed — it is upstream's **per-type mmvq cap** (`get_mmvq_mmid_max_batch_*`), which does two
+things:
+
+1. it sizes `mul_mat_vec_q_moe`'s `__launch_bounds__` (`cap × warp_size`) while the block is
+   `(warp_size, ncols_dst)` — so it is a *capability* limit (launching `IQ3_S`, cap 4, with
+   `ncols_dst = 5` is 160 threads > the bound and aborts with `unspecified launch failure`);
+2. it chooses mmvq vs MMQ (`ggml_cuda_mul_mat_id`: `ne2 <= cap → mmvq`, else `should_use_mmq → MMQ`)
+   and gates the `mul_mat_q_pair` fusion (`use_mmvq`, `ggml-cuda.cu:3730`) — which is what ran at
+   `W = 5..7`.  **mmvq and MMQ reduce in different orders**, so every cap boundary inside the band is a
+   numeric boundary.
+
+This is a *graph-identical* bug: `[GD]` full-graph dumps give the same node counts (2647/2404/2271/1863/
+1668/1565) at `W=4` and `W=5`, with `MUL_MAT_ID(ffn_moe_gate)` / `MUL_MAT_ID(ffn_moe_up)` /
+`GLU(ffn_moe_swiglu)` at the same indices in both.  The quant is what makes it visible: the UD-IQ4_XS
+file mixes expert types per layer (47 layers `IQ3_S` gate/up → cap 4; layer 2 `IQ4_XS` → cap 5; down
+`IQ4_NL`/`Q8_0` → cap 7), which predicts the observed grouping **exactly** — fused layers
+48/48/48/48/1/0/0/0 for `W = 1..8`, i.e. the 4→5 and 5→6 boundaries, and the down's cap 7 for 7→8.
+
+**Fix** (block 13 amendment; it completes block 13's own `has_ids` "decode == verify invariant"):
+floor the cap at `MMVQ_MAX_BATCH_SIZE` for every AMD lookup and size the MoE kernel's launch bound at
+the band.  All cap call sites are `MUL_MAT_ID`-only ⇒ dense models cannot be affected (verified).
+
+| split | W=1..8 (f16 KV, P=256, RS=0) |
+|---|---|
+| `-sm layer`  | **all `3adeb313042a871b`** (= the pre-fix W=1 decode) |
+| `-sm tensor` | **all `dcf1ae667f730879`** (= the pre-fix W=1 decode) |
+
+Every width moved onto that split's **pre-fix `W = 1`** value: plain decode is bit-unchanged, and only
+`W = 5..8` moved (the F1 "move the cheap side" pattern).  Also pure with `RS=from_w`.  At the MTP gate
+config (`n_max 3` = `W=4`, a no-op width) pre/post-fix runs are **byte-identical** (acceptance 0.76744,
+80.0 vs 80.1 t/s) — the fix provably does not touch what already worked — and at `n_max 7` it is
+**+16-18 % t/s** with acceptance 0.59375 vs 0.55556; `n_max 3` == `n_max 7` text (`8a50ea24e8d5`) where
+they previously disagreed (`8a50ea24e8d5` vs `e6918a7af1f9`).
+
+**The fix is also a large throughput win** (`llama-batched-bench`, interleaved, swappable
+`libggml-hip.so`; fixed/baseline):
+
+| model | b1 | b2 | b4 | b5 | b6 | b7 | b8 |
+|---|---|---|---|---|---|---|---|
+| qwen4exp 3-GPU `-sm tensor` | 50.5/50.4 | 85.4/85.6 | 134.1/132.9 | **149.5/118.4** | **162.5/130.6** | **171.4/147.0** | **178.0/155.4** |
+| 35B-A3B MoE 1 GPU | 98.3/98.1 | 156.4/156.2 | 254.2/254.1 | – | – | – | **341.3/289.9** |
+| 4B dense 1 GPU | 100.6/100.5 | 167.2/167.3 | 294.0/294.9 | – | – | – | 414.5/413.3 |
+
+So upstream's per-type mmvq caps were costing 14-26 % at exactly the speculative-verify widths on RDNA4
+with the fork's mmvq + fused-GLU kernels.
+
+**Cause 3 (open).**  `plain` still differs from `draft-mtp` text (`plain` `3ee9daee5c07` vs
+`n_max 3 == n_max 7` `8a50ea24e8d5`) — and this fix cannot be responsible: at `n_max 3` (`W = 4`) it is
+a verified no-op (bit-identical logits, byte-identical text, byte-identical acceptance).  A control
+confirms the harness is deterministic and that plain decode is unchanged (pre-fix and post-fix plain
+text are both `3ee9daee5c07`).  Because the single-step width probe is bit-identical across `W = 1..8`
+on both splits *and* with the state-sequence dimension (`RS=0` and `RS=from_w`), the divergence must be
+a **multi-step / roll-back** effect — prime suspect the **masked (freed/stale) KV cells** written by
+rejected drafts: block 14 pins those at exactly `+0.0` in the HIP `fattn-tile`/`fattn-mma-f16` and
+Vulkan paths but **not** in qwen4exp's **QSA sparse path** (`fattn-qsa.cu`).  Next instrument: a
+multi-step probe (prefill P; feed a *fixed* token sequence; compare the per-position logits between
+`W = 1` steps and `W = k` chunks).

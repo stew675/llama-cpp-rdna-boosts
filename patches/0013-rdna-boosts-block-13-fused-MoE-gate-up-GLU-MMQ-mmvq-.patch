@@ -1,4 +1,4 @@
-From 1e5580ee968d38819112477738d3debaad9966c0 Mon Sep 17 00:00:00 2001
+From e3b189cee04528cc583cbbcc7dcdaa5fa06c2a38 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 06:50:35 -0500
 Subject: [PATCH 13/14] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -46,17 +46,17 @@ Subject: [PATCH 13/14] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
  ggml/src/ggml-cuda/ggml-cuda.cu               | 166 +++-
  ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh     |   6 +-
  ggml/src/ggml-cuda/mmq-vec-dot.cuh            |  16 +-
- ggml/src/ggml-cuda/mmq.cu                     | 228 +++++-
- ggml/src/ggml-cuda/mmq.cuh                    | 409 +++++++++-
- ggml/src/ggml-cuda/mmvq.cu                    | 750 ++++++++++++++++--
+ ggml/src/ggml-cuda/mmq.cu                     | 228 ++++-
+ ggml/src/ggml-cuda/mmq.cuh                    | 409 ++++++++-
+ ggml/src/ggml-cuda/mmvq.cu                    | 787 ++++++++++++++++--
  ggml/src/ggml-cuda/mmvq.cuh                   |   8 +
  ggml/src/ggml-cuda/moe-weighted-reduction.cu  |  58 +-
- ggml/src/ggml-cuda/quantize.cu                | 221 ++++--
+ ggml/src/ggml-cuda/quantize.cu                | 221 +++--
  ggml/src/ggml-cuda/quantize.cuh               |  26 +-
  .../template-instances/generate_cu_files.py   |  14 +
  .../template-instances/mmq-instance-q3_k.cu   |   1 +
  tests/test-backend-ops.cpp                    |   2 +-
- 13 files changed, 1702 insertions(+), 203 deletions(-)
+ 13 files changed, 1728 insertions(+), 214 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index f097ff101..57d5b1538 100644
@@ -1303,10 +1303,74 @@ index 964c9678e..801f990d2 100644
  
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index e873fe080..a30221ceb 100644
+index e873fe080..2b0728dde 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -644,6 +644,292 @@ static __global__ void mul_mat_vec_q(
+@@ -287,6 +287,17 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+     }
+ }
+ 
++// rdna-boosts: floor the per-type mmvq cap at the decode/verify band.
++//
++// The caps above are a throughput heuristic for the generic MUL_MAT_ID mmvq-vs-MMQ choice, but
++// they subdivide the decode/verify band (ncols_dst <= MMVQ_MAX_BATCH_SIZE).  Greedy MTP requires a
++// 1-token decode and an (n_draft + 1)-token speculative verify batch of the same MoE matmul to be
++// bit-identical, and MUL_MAT_ID mmvq (mul_mat_vec_q_moe, one warp per token) and MMQ reduce in
++// different orders, so no cap may split the band.  The cap still applies above the band.
++static constexpr __host__ __device__ int mmvq_mmid_max_batch_band(int cap) {
++    return cap > MMVQ_MAX_BATCH_SIZE ? cap : MMVQ_MAX_BATCH_SIZE;
++}
++
+ // Host function: returns the max batch size for the current arch+type at runtime.
+ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
+@@ -303,19 +314,19 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+     // AMD
+     if (GGML_CUDA_CC_IS_AMD(cc)) {
+         if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+-            return get_mmvq_mmid_max_batch_rdna4(type);
++            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type));
+         }
+         if (GGML_CUDA_CC_IS_RDNA3(cc)) {
+-            return get_mmvq_mmid_max_batch_rdna3(type);
++            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type));
+         }
+         if (GGML_CUDA_CC_IS_RDNA1(cc) || GGML_CUDA_CC_IS_RDNA2(cc)) {
+-            return get_mmvq_mmid_max_batch_rdna1_rdna2(type);
++            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna1_rdna2(type));
+         }
+         if (GGML_CUDA_CC_IS_CDNA(cc)) {
+-            return get_mmvq_mmid_max_batch_cdna(type);
++            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_cdna(type));
+         }
+         if (GGML_CUDA_CC_IS_GCN(cc)) {
+-            return get_mmvq_mmid_max_batch_gcn(type);
++            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_gcn(type));
+         }
+     }
+     return MMVQ_MAX_BATCH_SIZE;
+@@ -421,15 +432,15 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+ template <ggml_type type>
+ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
+ #if defined(RDNA4)
+-    return get_mmvq_mmid_max_batch_rdna4(type);
++    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type));
+ #elif defined(RDNA3)
+-    return get_mmvq_mmid_max_batch_rdna3(type);
++    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type));
+ #elif defined(RDNA2) || defined(RDNA1)
+-    return get_mmvq_mmid_max_batch_rdna1_rdna2(type);
++    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna1_rdna2(type));
+ #elif defined(CDNA)
+-    return get_mmvq_mmid_max_batch_cdna(type);
++    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_cdna(type));
+ #elif defined(GCN)
+-    return get_mmvq_mmid_max_batch_gcn(type);
++    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_gcn(type));
+ #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == GGML_CUDA_CC_VOLTA || __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE)
+     return MMVQ_MAX_BATCH_SIZE;
+ #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
+@@ -644,6 +655,292 @@ static __global__ void mul_mat_vec_q(
  
      constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
  
@@ -1599,7 +1663,20 @@ index e873fe080..a30221ceb 100644
      const     int tid = warp_size*threadIdx.y + threadIdx.x;
      const     int row0 = rows_per_cuda_block*blockIdx.x;
      const     int blocks_per_row_x = ncols_x / qk;
-@@ -922,7 +1208,7 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -914,15 +1211,19 @@ static __global__ void mul_mat_vec_q(
+ // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
+ // Block: (warp_size, ncols_dst) - each warp handles one token independently.
+ // No shared memory reduction needed since each warp works alone.
++// The block is (warp_size, ncols_dst) and ncols_dst spans the whole decode/verify band, and this
++// kernel is the one that keeps the band on a single accumulation order (see the has_ids branch in
++// mul_mat_vec_q_switch_ncols_dst), so its launch bound must cover the band rather than the per-type
++// cap -- otherwise a launch with ncols_dst > cap fails outright.
+ template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
+-__launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
++__launch_bounds__(MMVQ_MAX_BATCH_SIZE*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q_moe(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
+         float * dst_ptr,
          const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
          const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
          const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
@@ -1608,7 +1685,7 @@ index e873fe080..a30221ceb 100644
      const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
      const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
      const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
-@@ -956,12 +1242,16 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -956,12 +1257,16 @@ static __global__ void mul_mat_vec_q_moe(
              x_scale    = (const float *) fusion.x_scale;
              gate_scale = (const float *) fusion.gate_scale;
          }
@@ -1626,7 +1703,7 @@ index e873fe080..a30221ceb 100644
  
      const uint32_t channel_dst = blockIdx.y;
  
-@@ -980,17 +1270,19 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -980,17 +1285,19 @@ static __global__ void mul_mat_vec_q_moe(
      float tmp[c_rows_per_block] = {0.0f};
      float tmp_gate[c_rows_per_block] = {0.0f};
  
@@ -1656,7 +1733,7 @@ index e873fe080..a30221ceb 100644
              }
          }
      }
-@@ -1019,6 +1311,9 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -1019,6 +1326,9 @@ static __global__ void mul_mat_vec_q_moe(
                      result *= x_scale[channel_x];
                  }
              }
@@ -1666,7 +1743,7 @@ index e873fe080..a30221ceb 100644
              if (x_bias) {
                  result += x_bias[bias_idx];
              }
-@@ -1106,6 +1401,39 @@ static void mul_mat_vec_q_switch_fusion(
+@@ -1106,6 +1416,39 @@ static void mul_mat_vec_q_switch_fusion(
          sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
  }
  
@@ -1706,7 +1783,7 @@ index e873fe080..a30221ceb 100644
  template <ggml_type type>
  static void mul_mat_vec_q_moe_launch(
          const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
-@@ -1115,27 +1443,43 @@ static void mul_mat_vec_q_moe_launch(
+@@ -1115,27 +1458,43 @@ static void mul_mat_vec_q_moe_launch(
          const uint32_t ncols_dst, const uint32_t ids_stride,
          const int warp_size, const int nchannels_dst, cudaStream_t stream) {
  
@@ -1762,7 +1839,7 @@ index e873fe080..a30221ceb 100644
      }
  }
  
-@@ -1229,8 +1573,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1229,8 +1588,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
          return idle * 8 <= iters_wide * 2;
      };
  
@@ -1780,7 +1857,7 @@ index e873fe080..a30221ceb 100644
          mul_mat_vec_q_moe_launch<type>(
              vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
              stride_row_x, stride_col_y, stride_col_dst,
-@@ -1240,109 +1591,201 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1240,109 +1606,201 @@ static void mul_mat_vec_q_switch_ncols_dst(
      }
  
      switch (ncols_dst) {
@@ -2030,7 +2107,7 @@ index e873fe080..a30221ceb 100644
          } break;
          default:
              GGML_ABORT("fatal error");
-@@ -1559,7 +2002,7 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1559,7 +2017,7 @@ void ggml_cuda_mul_mat_vec_q(
              GGML_ASSERT(ggml_is_contiguous(fusion->x_scale));
              if (fusion->x_scale_channel_dst) {
                  GGML_ASSERT(ids);
@@ -2039,7 +2116,7 @@ index e873fe080..a30221ceb 100644
              } else {
                  GGML_ASSERT(ggml_nelements(fusion->x_scale) == (ids ? src0->ne[2] : 1));
              }
-@@ -2030,7 +2473,13 @@ static __global__ void shexp_down_gated_q8_0(
+@@ -2030,7 +2488,13 @@ static __global__ void shexp_down_gated_q8_0(
      sum_down = warp_reduce_sum<warp_size>(sum_down);
  
      if (threadIdx.x == 0) {
@@ -2054,7 +2131,7 @@ index e873fe080..a30221ceb 100644
      }
  }
  
-@@ -2131,3 +2580,152 @@ void ggml_cuda_op_mul_mat_vec_q(
+@@ -2131,3 +2595,152 @@ void ggml_cuda_op_mul_mat_vec_q(
  
      GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
  }

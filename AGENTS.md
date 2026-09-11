@@ -109,7 +109,8 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `1bcf4e82d`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `bfaa83d8a`, net tree
+  `4e5f2952f016f1ac160c53261f7b01d346322534`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the whole-batch
 K-independent chunked GDN prefill; block 14 amended 2026-09-11 with the
@@ -137,9 +138,13 @@ upstream (see the WORKLOG re-base entry); block 12 carries the
 2026-09-11 so the hybrid dispatch's small/large crossover no longer changes
 the reduction algorithm across the decode/verify band (2-device `32768` ->
 `131072` elements); block 13 amended
-2026-09-02/09-05/09-06 as above and 2026-09-08 with the
+2026-09-02/09-05/09-06 as above, 2026-09-08 with the
 moe_weighted_reduction float4 remainder fix (issue #19, reported by
-briansp2020); block 14 added 2026-09-07 and amended
+briansp2020) and 2026-09-11 with the F2 cause-2 decode/verify
+**band-uniformity** fix (the per-type mmvq caps are floored at
+`MMVQ_MAX_BATCH_SIZE` and `mul_mat_vec_q_moe`'s launch bound is sized at the
+band, so `W = 1..8` is bit-identical — **+14-26 %** at the verify widths);
+block 14 added 2026-09-07 and amended
 2026-09-07 with the QSA quantized-KV decode gate + the derived-cache
 pool gate (quantized indexer-key caches no longer abort the fused
 decode path, and the F32 derived-cache pool is allocated only when the
@@ -414,12 +419,25 @@ explicitly requests it.**
   `dcf1ae66`, on f16/bf16; W=1 decode byte-identical to the pre-fix build for every KV type), plain
   == `draft-mtp --spec-draft-n-max 3` greedy text, f16 MTP acceptance 0.500 -> **0.76744** and MTP
   generation 63.3 -> 79.9 t/s.  Cause 2 (a kernel-dispatch band at `W >= 5`) is **still open**, so
-  the band stops at `n_max 3` for qwen4exp.  The "cause 2 shares F1's cause" hypothesis was
-  **refuted 2026-09-11**: fixing F1 left cause 2's `{5} {6,7} {8}` grouping completely unchanged —
-  see `wip/kv-quant-purity-followups/README.md` (F2).  **Differing K/V cache *types* are rejected** (maintainer
+  the band stops at `n_max 3` for qwen4exp — **until 2026-09-11**, when cause 2 was **fixed** as a
+  block-13 amendment: the boundary was a **fusion-coverage** flip at `n_q = 5` (graphs are identical
+  across widths) whose *mechanism* is upstream's **per-type mmvq cap** — `mul_mat_vec_q_moe`'s
+  `__launch_bounds__` was `cap × warp_size` (so `ncols_dst > cap` cannot launch) and the same cap
+  routes the upper band to MMQ through `mul_mat_q_pair`; the UD-IQ4_XS per-layer expert types
+  (IQ3_S cap 4 / IQ4_XS cap 5 / IQ4_NL cap 7) predict the whole `{1..4}{5}{6,7}{8}` grouping.  The
+  fix floors the cap at the band and sizes the kernel at it: `W = 1..8` is bit-identical on both
+  splits (every width = that split's pre-fix `W = 1` value), **+14-26 %** at the verify widths, MTP
+  `n_max 7` +16-18 % t/s, dense untouched.  The `n_max <= 7` guarantee now holds **logit-wise** for
+  qwen4exp.  **Cause 3 (open): `plain` still != `draft-mtp` *text*** — pre-existing and independent
+  (at `n_max 3`/`W = 4` the cause-2 fix is a verified no-op: byte-identical logits, text and
+  acceptance), a **multi-step/roll-back** effect since the single-step probe is pure on both splits
+  and with `RS=from_w`; prime suspect the masked (freed/stale) KV cells in qwen4exp's **QSA sparse**
+  path (`fattn-qsa.cu`), which block 14's masked-V fixes do not cover.
+  **Differing K/V cache *types* are rejected** (maintainer
   decision 2026-09-11: mixed pairs are 1.7–3.6x slower than the same-type
   equivalent and never smaller).  Details, repro tooling and the follow-up
-  items (F1 purity — **fixed 2026-09-11**; F2 qwen4exp; F3 sub-`q8_0` parity
+  items (F1 purity — **fixed 2026-09-11**; F2 qwen4exp — cause 2 **fixed 2026-09-11** (block-13
+  amendment), cause 3 (plain vs `draft-mtp` text; see above) **open**; F3 sub-`q8_0` parity
   — note a native `iq4_nl` would be the same 1800 MiB as q4_0, pure, and
   3.4x faster; F3's first experiment is a `GGML_CUDA_FA_ALL_QUANTS=ON` build
   A/B, since the slow types are rejected by
@@ -460,7 +478,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `1bcf4e82d`): `git format-patch --start-number 0` the block
+blocks tip `bfaa83d8a`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -469,7 +487,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `1bcf4e82d`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `bfaa83d8a`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

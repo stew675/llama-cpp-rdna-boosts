@@ -15,7 +15,11 @@ with spec-draft-mtp verify — see the block-08 notes below); block 12 amended 2
 NCCL-failure fallback (issue #13, see the block-12 notes
 below); block 13 amended 2026-09-02 with two MTP regression fixes and
 2026-09-05 with the RDNA3.5 (Strix Halo, gfx1151) + RDNA3.0 (gfx1100)
-fused-MoE-MMQ gate relaxations — see the block-13 notes below, the MTP
+fused-MoE-MMQ gate relaxations, and 2026-09-11 with the F2 cause-2
+**decode/verify band-uniformity** fix (the per-type mmvq caps are floored at
+`MMVQ_MAX_BATCH_SIZE` and `mul_mat_vec_q_moe` is sized at the band, so
+`W = 1..8` is bit-identical — **+14-26 %** at the verify widths) — see the
+block-13 notes below, the MTP
 baseline gate in
 `../benchmarks/mtp-adaptive-methodology.md`, the Strix record in
 `../wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`, and
@@ -62,7 +66,7 @@ the 15-block tree):
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13); **amended 2026-09-11 - the small/large crossover is now width-safe** (2-device `32768` -> `131072` elements; see the block-12 notes) |
-| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-11 with the dense ncols==1 ksplit alignment** (dense `MUL_MAT` rows always ksplit for every K so single-token decode is row-identical to the 2..8-token verify batch; `MUL_MAT_ID`/MoE kept the item-split at that point — superseded by the second 2026-09-11 amendment below) — see the block-13 notes below; **amended again 2026-09-11 with the MoE `MUL_MAT_ID` dispatch fix** (all `MUL_MAT_ID` now use the dedicated MoE kernel, completing what the dense fix left open — `ncols_dst == 1` previously took the dense ksplit kernel with an ids gather; **+6.2% MoE decode**) **and the `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE` kill-switch** (the decode-only fused shared-expert epilogue is not bit-exact with the unfused chain — the accepted MoE residual; see the block-13 notes); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)** — see the block-13 notes below.
+| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-11 with the dense ncols==1 ksplit alignment** (dense `MUL_MAT` rows always ksplit for every K so single-token decode is row-identical to the 2..8-token verify batch; `MUL_MAT_ID`/MoE kept the item-split at that point — superseded by the second 2026-09-11 amendment below) — see the block-13 notes below; **amended again 2026-09-11 with the MoE `MUL_MAT_ID` dispatch fix** (all `MUL_MAT_ID` now use the dedicated MoE kernel, completing what the dense fix left open — `ncols_dst == 1` previously took the dense ksplit kernel with an ids gather; **+6.2% MoE decode**) **and the `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE` kill-switch** (the decode-only fused shared-expert epilogue is not bit-exact with the unfused chain — the accepted MoE residual; see the block-13 notes); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)**; **amended 2026-09-11 with the F2 cause-2 decode/verify band-uniformity fix** (upstream's per-type mmvq caps are floored at `MMVQ_MAX_BATCH_SIZE` and `mul_mat_vec_q_moe`'s launch bound is sized at the band, completing block 13's own "decode == verify" invariant for the whole band — `W=1..8` bit-identical, **+14-26 %** at the verify widths) — see the block-13 notes below.
 | `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-07 with the derived-cache pool gate** (the F32 block-vector pool is now allocated only when the derived cache is enabled *and* the indexer keys are unquantized — no more dead ~100 MiB buffer + no-op fill launches otherwise) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. | **amended 2026-09-08 with the quantized-KV tensor-split gate** — `q4_1`-family KV cache types (`q4_1`/`q5_0`/`q5_1`/`iq4_nl`) abort at graph reserve under multi-GPU `SPLIT_MODE_TENSOR` (upstream bug, also on vanilla `050dde50c`); now rejected at context creation with a clear error when the Meta device is in use — see the block-14 notes below. | **amended 2026-09-09 with the gfx1151-only freed-cell KV-zeroing gate** — the seq_rm/seq_keep/clear row zeroing (strix-port aad5adb08f masked-column guard for the gfx1151 WMMA f16 `x+(-0.0)` inexactness) now enables only when a KV buffer device is gfx1151 (env `LLAMA_KV_ZERO_FREED` overrides); everywhere else pre-block-14 behavior (no per-free GPU memsets) is restored — see the 2026-09-09 block-14 amendment section below. | **amended 2026-09-10: the freed-cell host zeroing is removed and the kernel-side masked-V fixes were re-homed** — `llama-kv-cache.{cpp,h}` are the upstream state (no `zero_freed`/env/GPU memsets); the Vulkan `flash_attn_cm1.comp`/`flash_attn.comp` fixes live in block 00 and the HIP `fattn-tile.cuh`/`fattn-mma-f16.cuh` fixes live in block 03, so block 14 carries none of them — see the 2026-09-10 block-00 section below. | **amended 2026-09-11 with the hyper-connection decode/verify band fix** — `ggml/src/ggml-cuda/hc-mix.cu` + the `src/models/qwen4exp.cpp` gates served `nt == 1` only, so a 1-token decode used the fused `HC_MIX`/`HC_COMBINE` chain while an n-token verify batch used the unfused chain (the "F2" divergence: plain decode != `draft-mtp`).  Both ops now serve the whole band `1 <= nt <= 8` (`HC_FUSED_MAX_TOKENS`), taking the token from `blockIdx.y` and reading `inject` with its own view stride, so every token in the band runs the per-token kernel sequence a single-token decode runs and W=1 is byte-identical to the pre-fix build.  qwen4exp is thereby width-pure for `--spec-draft-n-max <= 3` (f16/bf16 KV; plain == `draft-mtp` text, f16 acceptance 0.500 -> 0.76744, MTP generation 63.3 -> 79.9 t/s); the `W >= 5` grouping is **cause 2**, shared with the `q8_0`/`q4_0` KV impurity, and remains open — see `GREEDY-PURITY.md` §13 and `wip/kv-quant-purity-followups/README.md` (F2).  A `<= 8`-token *prefill* chunk also takes the fused path (indistinguishable from a verify batch). |
 
 ## Apply (fresh checkout at the fork point)
@@ -868,6 +872,50 @@ upstream's additions.
   Record: `../wip/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FIX.md`.
 
 ## Block 13 notes
+
+**2026-09-11 (third amendment) — the decode/verify band is band-uniform (F2 cause 2).**
+
+qwen4exp's logits were not bit-identical across decode/verify batch widths (`{1,2,3,4} {5} {6,7} {8}`).
+Task 1 (fusion vs graph-builder) was settled by `[GD]` full-graph dumps: the graphs are **identical** at
+every stage (2647/2404/2271/1863/1668/1565 nodes at both `W=4` and `W=5`), always containing
+`MUL_MAT_ID(ffn_moe_gate)` / `MUL_MAT_ID(ffn_moe_up)` / `GLU(ffn_moe_swiglu)` at `k=76/77/78` — only the
+*fusion coverage* differed.  The mechanism, however, is upstream's **per-type mmvq cap**
+(`get_mmvq_mmid_max_batch_*`), used in two places:
+
+* `mul_mat_vec_q_moe`'s `__launch_bounds__` was `get_mmvq_mmid_max_batch_for_device<type>()*warp_size`
+  while the block is `(warp_size, ncols_dst)` — so the cap is a *capability* limit: launching `IQ3_S`
+  (cap 4) with `ncols_dst = 5` is 160 threads > the bound and aborts the run (`ROCm error: unspecified
+  launch failure`);
+* the same cap drives the mmvq-vs-MMQ choice (`ggml_cuda_mul_mat_id`: `ne2 <= cap → mmvq`, else
+  `should_use_mmq → MMQ`), and `use_mmvq` (`ggml-cuda.cu:3730`) gates the `mul_mat_q_pair` fusion —
+  which is what actually ran at `W = 5..7`.  mmvq and MMQ reduce in different orders.
+
+The UD-IQ4_XS quant mixes expert types per layer (47 layers `IQ3_S` gate/up → cap 4; layer 2 `IQ4_XS`
+→ cap 5; down `IQ4_NL`/`Q8_0` → cap 7), which **predicts the measured census exactly**: fused layers
+48/48/48/48/1/0/0/0 for `W = 1..8` (`ffn_moe_up` `MUL_MAT_ID` counts 0/0/0/0/47/48/48) — the 4→5 and
+5→6 boundaries; the down's cap 7 is the 7→8 boundary.
+
+**Fix** (completes block 13's own `has_ids` "decode == verify invariant"):
+`mmvq_mmid_max_batch_band(cap)` floors the per-type cap at `MMVQ_MAX_BATCH_SIZE` for every AMD arch
+lookup, host and device, and `mul_mat_vec_q_moe`'s launch bound becomes `MMVQ_MAX_BATCH_SIZE*warp_size`.
+All four cap call sites are `MUL_MAT_ID`-only, so **dense models are untouched** (verified: 4B
+bit-identical and perf-identical).
+
+**Validation** (3× gfx1201, f16 KV, P=256): `W = 1..8` all `3adeb313042a871b` (`-sm layer`) and
+`dcf1ae667f730879` (`-sm tensor`) — every width equals that split's **pre-fix `W = 1` value**, so plain
+decode is bit-unchanged and only `W = 5..8` moved (also pure with `RS=from_w`).  At the MTP gate config
+(`n_max 3` = `W=4`) pre/post-fix runs are byte-identical (acceptance 0.76744, 80.0 vs 80.1 t/s); at
+`n_max 7` the fix gives **41.8-42.5 vs 36.1 t/s (+16-18 %)** and acceptance 0.59375 vs 0.55556, and
+`n_max 3` == `n_max 7` text (`8a50ea24e8d5`) where they previously disagreed.  Perf
+(`llama-batched-bench`, interleaved, fixed vs baseline): qwen4exp tg128 b5 **149.5/118.4 (+26 %)**,
+b6 **162.5/130.6 (+24 %)**, b7 **171.4/147.0 (+17 %)**, b8 **178.0/155.4 (+14.5 %)**; 35B-A3B MoE b8
+**341.3/289.9 (+17.8 %)**; 4B dense unchanged.  `GATED_DELTA_NET` and `FLASH_ATTN_EXT` 4/4 backends OK;
+MoE asterisk intact (`ac8825358d9adfda`/`bd138ad2326fbbf2`); clean-apply strict 15/15, 0 whitespace
+warnings, tree `4e5f2952f016f1ac160c53261f7b01d346322534`.
+
+**Note (open, not this amendment):** qwen4exp `plain` text still differs from `draft-mtp` — that is a
+*pre-existing, independent* multi-step/roll-back effect (the fix is a verified no-op at `n_max 3`/`W=4`),
+prime suspect the masked (freed/stale) KV cells in its QSA sparse path; see `GREEDY-PURITY.md` §15.
 
 **2026-09-11 (second amendment) — MoE `MUL_MAT_ID` decode/verify dispatch + the shared-expert fusion kill-switch.**
 

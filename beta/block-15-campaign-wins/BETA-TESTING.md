@@ -165,3 +165,18 @@ but the hunks are far apart, so the re-cut is **metadata/offset-only** (0 change
 
 Nothing in the tester checklist changes: the revalidation numbers above were taken on the previous
 re-cut and the delta is metadata only.
+
+
+---
+
+**Re-cut 2026-09-11 (fourth), after block 13's F2 cause-2 amendment.**  The canonical tip moved from
+`1bcf4e82d` to `bfaa83d8a` (tree `4e5f2952f`) because block 13's MoE decode/verify **band-uniformity**
+fix changed `ggml/src/ggml-cuda/mmvq.cu`.  Block 15 does not touch that file, so this re-cut is
+**metadata-only**: the patch is 3722 lines before and after and only its `From <sha>` line differs; a
+re-apply on the new base reproduces the recorded tree exactly.
+
+* base `bfaa83d8a` (tree `4e5f2952f`) -> **beta tip `3f4e0747d`**, tree `d50b4e121`
+* apply the patch in *this directory*; it needs the 15-block delivery at `bfaa83d8a`
+* the 2026-09-10/11 validation numbers above are unaffected (the base amendment does not touch any
+  block-15 operand or kernel: it changes only `MUL_MAT_ID` mmvq-vs-MMQ selection and the
+  `mul_mat_vec_q_moe` launch bound, which is block-13 territory)

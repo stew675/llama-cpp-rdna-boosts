@@ -164,7 +164,24 @@ token-generic** (`int64_t n_tokens`, `if (it >= n_tokens) return;`).
   purity.  Then re-run: `W=1..4` pure (already demonstrated with the env mitigation) and, once cause 2
   is also fixed, `W=1..8`.
 
-### Cause 2 — the MoE gate+up+GLU fusion flips at `n_q = 5` (LOCALISED 2026-09-11, OPEN)
+### Cause 2 — FIXED 2026-09-11 (block-13 amendment): the per-type mmvq cap split the band
+
+> **FIXED.**  The `n_q = 5` boundary was correctly localised (below), but the *mechanism* is upstream's
+> per-type mmvq cap, not the fusion coverage: `mul_mat_vec_q_moe`'s `__launch_bounds__` was
+> `cap × warp_size` (so `ncols_dst > cap` cannot launch — `IQ3_S`, cap 4, dies at 5), and the same cap
+> sends the upper band to MMQ through `mul_mat_q_pair` (`use_mmvq`, `ggml-cuda.cu:3730`) — and mmvq and
+> MMQ reduce in different orders.  The UD-IQ4_XS per-layer expert types (IQ3_S cap 4 / IQ4_XS cap 5 /
+> IQ4_NL cap 7) predict the whole `{1..4}{5}{6,7}{8}` grouping.  The fix floors the cap at
+> `MMVQ_MAX_BATCH_SIZE` and sizes the MoE kernel at the band: `W = 1..8` is now bit-identical on both
+> splits (every width = that split's pre-fix `W = 1`), `+14-26 %` at the verify widths, dense untouched.
+> See `patches/README.md` (block-13 notes) and the 2026-09-11 (5) WORKLOG entry.  **Cause 3 — `plain`
+> still != `draft-mtp` text, a pre-existing multi-step/roll-back effect (the fix is a no-op at
+> `n_max 3`); prime suspect the QSA sparse path's masked/stale KV cells — see the WORKLOG entry and
+> `GREEDY-PURITY.md` §15.**
+>
+> (Superseded text follows — kept as the record of how the boundary was localised.)
+
+### (superseded) Cause 2 localisation — the MoE gate+up+GLU fusion flips at `n_q = 5` (LOCALISED 2026-09-11, then OPEN)
 
 > **The brief's framing was wrong**: cause 2 is **not** a `ncols_dst`/`ne11` *kernel-dispatch* band.  A
 > per-node census of the **executed** ops (the `[ND]` dump, `GGML_CUDA_NODE_DUMP=1`) shows that at each

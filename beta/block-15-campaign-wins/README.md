@@ -24,6 +24,13 @@ now a **15-patch set**: block 00 + blocks 01-14 at canonical tip **`389c5341f`**
 tree `928852cdc`, with block 13 amended twice on 2026-09-11), so the beta patch was
 re-cut and re-validated end to end.
 
+* **Re-cut a fourth time 2026-09-11** after block 13's F2 cause-2 decode/verify band-uniformity
+  amendment moved the canonical tip: base `bfaa83d8a` (tree `4e5f2952f`) -> **beta tip `3f4e0747d`**
+  (tree `d50b4e121`).  Block 15 does not touch `ggml/src/ggml-cuda/mmvq.cu` at all, so the re-cut is
+  metadata-only: **0 changed body lines** (3722 lines before and after; only the `From <sha>` line
+  differs), and a re-apply on the new base reproduces the recorded tree `d50b4e121...` exactly.  The
+  new beta commit differs from the previous one (`0c8099ca2`) in exactly one file — `mmvq.cu`, i.e.
+  the base amendment.  No renumbering (`[PATCH 15/15]`).
 * **Re-cut a third time 2026-09-11** after block 08's decode/verify FA kernel-family amendment (F1,
   `GREEDY-PURITY.md` §14) moved the canonical tip: base `1bcf4e82d` -> **beta tip `0c8099ca2`** (tree
   `7335b923d`).  Block 15 *does* touch `fattn.cu`, but its hunks sit at lines 166-326 while the fix is

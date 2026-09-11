@@ -101,9 +101,9 @@ Block 15 is STAGED in `beta/block-15-campaign-wins/`, not promoted.
 - **Fork/canonical state**: the working checkout's `rdna-boosts` is a local rebuild and must NOT be used
   for regeneration if it sits on a master newer than the fork point (it would export `f3f1a8f27`
   + `304665fe7` as patches 0001/0002).  The canonical 15-block chain used for the delivery ends at the
-  block-14 commit `1bcf4e82d` (rebuilt at `9113cc188`; block 02 amended 2026-09-11 with the
+  block-14 commit `bfaa83d8a` (rebuilt at `9113cc188`; block 02 amended 2026-09-11 with the
   K-independent whole-batch chunked GDN prefill — free, gate removed, + rollback guard); `make-patches.sh`
-  default tip = `1bcf4e82d`.
+  default tip = `bfaa83d8a`.
   The beta block-15 patch is applied manually on top of that tree.
 - Superseded/still-useful artifacts: the work branch `wip/block15-campaign-wins` (`b26ae06f0`) and
   `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch` remain as the pre-merge
@@ -295,7 +295,7 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   not block 00's `n_q<=8`; text level on the 27B: plain `8ed58aa9` (1330 chars) vs
   `n_max 3 == n_max 7` `da56855b` (1406 chars).  f16/bf16/q4_1/q5_0/q5_1/iq4_nl are all pure, and
   the impure set is exactly the two types with a *fast native* both-quantized FA path.  Not V4
-  (switch on/off identical), not all-reduce (1 GPU shows it).  **FIXED 2026-09-11** (block-08 amendment, canonical tip `1bcf4e82d`).  The cause was **not** the
+  (switch on/off identical), not all-reduce (1 GPU shows it).  **FIXED 2026-09-11** (block-08 amendment, canonical tip `bfaa83d8a`).  The cause was **not** the
   staging or the launcher plan (both measured width-independent) but the FA **kernel-family chooser**
   `ggml_cuda_get_best_fattn_kernel()`: with a quantized K/V it returned VEC for `n_q <= 2` and TILE
   from `n_q = 3`, and the two families order the online-softmax/PV reduction differently.  Both VEC
@@ -307,14 +307,24 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   bit-identical (0.90789), FLASH_ATTN_EXT 4591/4591, reserves byte-identical.  Cost: tg128 -0.5..-0.9 %
   (only `W=1,2` move, onto the value the verify widths already produced).  Debug tool:
   `wip/kv-quant-purity-followups/tools/fa-kernel-chooser-trace.patch`.  Details: `GREEDY-PURITY.md` §14.
-- **F2 (correctness): qwen4exp was not width-pure — CAUSE 1 FIXED 2026-09-11 (block-14 amendment,
-  canonical tip `1bcf4e82d`); cause 2 LOCALISED 2026-09-11 — it is the MoE gate+up+GLU fusion
-  (`mul_mat_id_glu_ops`, `ggml-cuda.cu:3324`) flipping at `n_q = 5`, **not** a kernel-dispatch band;
-  the executed-op census gives `ffn_moe_up` MUL_MAT_ID counts 0/47/48 at W=4/5/6 with every other op
-  count identical, and the `W=6`/`W=7` pair is a perfect calibration (+0 nodes, 0 differing ops).
-  Fix = the F1/HC shape (keep the fusion for the whole `n_q <= 8` band); next step is a post-HC-fix
-  `GGML_CUDA_DISABLE_FUSION=1` width matrix to confirm the unfused path is width-invariant.  See the
-  wip README (F2 cause 2) + the 2026-09-11 (4) WORKLOG entry.**
+- **F2 (correctness): qwen4exp was not width-pure — ALL THREE SITES FIXED 2026-09-11, and
+  `W = 1..8` is now bit-identical on both splits (canonical tip `bfaa83d8a`).**  **Cause 1** (the
+  hyper-connection `nt == 1` gates) was fixed as a block-14 amendment.  **Cause 2** was localised as
+  the MoE gate+up+GLU **fusion coverage** flipping at `n_q = 5`, but the *mechanism* turned out to be
+  upstream's **per-type mmvq cap**: `mul_mat_vec_q_moe`'s `__launch_bounds__` was the cap × warp_size
+  (so a `ncols_dst > cap` launch dies), and the same cap sends the upper band to MMQ via
+  `mul_mat_q_pair` — and the UD-IQ4_XS expert types (IQ3_S cap 4 / IQ4_XS cap 5 / IQ4_NL cap 7 per
+  layer) predict the measured `{1..4}{5}{6,7}{8}` grouping exactly.  **FIXED as a block-13 amendment**
+  (floors the cap at `MMVQ_MAX_BATCH_SIZE` and sizes the kernel at the band): every width now equals
+  the pre-fix `W = 1` value, `+14–26 %` at the verify widths, `n_max 3` byte-identical, `n_max 7`
+  `+16–18 %` t/s.  See `GREEDY-PURITY.md` §15 + the 2026-09-11 (5) WORKLOG entry.
+  **Cause 3 (OPEN): `plain` still differs from `draft-mtp` text** (`plain` `3ee9daee5c07` vs
+  `n_max 3 == n_max 7` `8a50ea24e8d5`) — pre-existing and independent of cause 2 (at `n_max 3`/`W = 4`
+  the cause-2 fix is a verified no-op).  The single-step width probe is pure (both splits, `RS=0` and
+  `RS=from_w`), so this is a **multi-step / roll-back** effect: prime suspect the masked (freed/stale)
+  KV cells in qwen4exp's **QSA sparse-attention** path (`fattn-qsa.cu`), which block 14's masked-V
+  fixes do not cover.  Next instrument: a multi-step probe (prefill P, feed a fixed token sequence,
+  compare per-position logits between `W = 1` steps and `W = k` chunks).**
   The earlier attribution ("the fused sparse QSA path") was **wrong**: `LLAMA_QSA_OFF=1`,
   `LLAMA_QSA_SPARSE_FA=0`, the dense-shortcut and the arch decode policy all leave the divergence
   unchanged, as do graphs, the float-mmvf band and a batch-content test — **but note that list was
