@@ -10,6 +10,55 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Block 15 beta revalidation (2026-09-11): re-cut against the current 15-patch delivery + full re-validation.**
+  The Block-15 beta patch was cut on `b425aa8f7` (block 14 of the old **14-block** chain, block 13
+  `e61676292`) — before block 00 existed and before the 2026-09-11 block-02/12/13 amendments — so it
+  was re-cut against the current delivery (base `389c5341f`, tree `928852cdc`) and re-validated end to
+  end.  Block 15 is still **staged in `beta/block-15-campaign-wins/`, NOT a delivery patch**; this is a
+  beta-record update, not a delivery change (no `patches/` file and no block SHA moved).
+
+  - **Re-cut**: new beta tip **`fe4f55278`** (tree `ffe197e2f`, parent `389c5341f`); the patch in the
+    beta directory was replaced.  Measured dependency delta: **exactly one file** —
+    `ggml/src/ggml-cuda/fattn-common.cuh` `7442bc22a` → `22eec7d57`, i.e. block 00's
+    `ntiles_dst_eff` fix inside `launch_fattn`; the other 22 touched files are byte-identical to the
+    cut base, so the re-cut changes only the `From` line, that one `index` line and one `@@` hunk
+    header (+8 offset).
+  - **Numbering correction**: the first draft of the revalidation plan claimed the beta patch had to be
+    renumbered `[PATCH 15/15]` → `[PATCH 16/16]`.  That was **wrong**: `make-patches.sh` uses
+    `git format-patch --start-number 0`, so the denominator is the *last block index* — the delivered
+    15-patch set is `[PATCH 00/14]`…`[PATCH 14/14]` and block 15 is correctly `[PATCH 15/15]`.
+    Verified by regenerating the 16-commit range with the same convention: all 15 delivery patch
+    *bodies* byte-identical, block 15 emitted as `[PATCH 15/15]`.
+  - **Clean-apply**: fresh `9113cc188` + `scripts/apply-all.sh` → strict **15/15**, **0 whitespace
+    warnings**, tree `928852cdc`; + the re-cut block-15 patch → 16 commits, tree `ffe197e2f`.
+  - **Result: every 2026-09-10 Block-15 claim reproduced.**  Reserves to the last decimal (27B
+    `1920.3284/880.3360` → `1121.1252/81.1329`; 4B `1800.3284/840.3360` → `1001.1252/41.1329` →
+    `257.1252/41.1329`; gemma-4-E4B/E4B-31B and the qwen4exp W1/W2/W3 chain incl. indexer KV
+    `956.26` → `318.76` and the bf16/V5 table with bf16+V5 costing exactly f16); the 27B width-purity
+    probe hashes **identical to the delivered reference** (`4089b4d4` / `a4817ee6` / `91434ea9`,
+    `W=9` `72af52db`/`b059daa6`/`bc3faabd`) so `n_max <= 7` holds and block 15 changes no FA numerics;
+    V4/V5 on == off **bit-identically** (the flagged `launch_fattn` risk is cleared); same-seed output
+    byte-identical across gates on 4B/27B (short + 40k)/both SWA gemmas/qwen4exp; MoE asterisk intact
+    (`ac8825358d9adfda`/`bd138ad2326fbbf2`, `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` → both
+    `bd138ad2326fbbf2`); MTP 27B `0.90789` and MoE `0.58378` identical on both builds; op suites
+    `FLASH_ATTN_EXT` **7859/7859 ROCm0 + 7859/7859 CPU** (6 derived), `GATED_DELTA_NET` OK,
+    `test-alloc`/`test-batch-alloc` clean, W4 round trip 16.00 → 56.00 → 16.00 MiB; cost inside the
+    documented envelope (4B prefill V3 −1.6 % / V4 −1.75 %, 27B V3 −0.3 %, decode flat; vs the
+    delivery build 27B pp512 −1.7 % / tg128 flat, MoE pp512 −0.3 % / tg128 −1.25 %).  gfx1151 was
+    **not** re-run (no such hardware on this host).
+  - **Three PRE-EXISTING findings (not Block-15 regressions — identical hashes on the delivery build),
+    now tracked in `wip/kv-quant-purity-followups/` + `TODO.md` + `GREEDY-PURITY.md` §12:** (F1) a
+    **q8_0 or q4_0 K/V cache breaks the dense `n_max <= 7` purity guarantee** (`W=1 == W=2` then
+    `W=3..8`; text-level plain `8ed58aa9` vs spec `da56855b` on the 27B) — the impure set is exactly
+    the two types with a fast native both-quantized FA path; (F2) qwen4exp's fused sparse QSA path is
+    not width-invariant; (F3) the sub-`q8_0` quants (q4_1/q5_0/q5_1/iq4_nl) are pure and 1800–2400 MiB
+    but ~3.4x slower because they have no native FA path.  **Policy decided (maintainer
+    2026-09-11): differing K/V cache types are rejected as an accepted limitation** (mixed pairs are
+    1.7–3.6x slower than the same-type equivalent and never smaller; upstream #25871 already enforces
+    same-K/V for DeepSeek V4).
+  - Records updated: `beta/block-15-campaign-wins/{README,HANDOVER,BETA-TESTING}.md`,
+    `GREEDY-PURITY.md` §12, `TODO.md`, `AGENTS.md`, `wip/kv-quant-purity-followups/`.
+
 - **Block 13 amendment (2026-09-11, second): MoE `MUL_MAT_ID` decode/verify dispatch fix + the shared-expert fusion kill-switch.**
   Root-causes and closes the qwen35moe batch-width residual
   (`wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 2).  The residual was

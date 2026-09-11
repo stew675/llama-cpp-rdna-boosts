@@ -4,10 +4,15 @@ For beta testers with a machine that can build the Block-15 tree.  Purpose: conf
 memory wins on *your* models and hardware, and — if something looks wrong — isolate it to a single win
 without rebuilding five times.  Every win except W4 is switchable by environment variable.
 
-> **Status: OPEN — the beta window started 2026-09-10.**  Block 15 is **staged in this directory**
-> (`block-15-campaign-wins.patch`), **NOT in the delivery** (the delivery is the 14-block set), and every row below was re-checked **as a combination** on the tree built from the
-> beta patch on top of the delivered 14-block set (fresh worktree at `9113cc188`, strict 14/14 `git am` + the beta patch, fresh build): reserves,
-> byte-identical coherence on all five models, the MTP gate, and the op suites all reproduce.
+> **Status: OPEN — the beta window started 2026-09-10; re-cut and re-validated 2026-09-11.**
+> Block 15 is **staged in this directory**
+> (`block-15-campaign-wins.patch`), **NOT in the delivery** (the delivery is the 15-patch set:
+> block 00 + blocks 01-14), and every row below was re-checked **as a combination** on the tree built
+> from the beta patch on top of the delivered **15-block** set (fresh worktree at `9113cc188`, strict
+> **15/15** `git am` + the beta patch, fresh build): reserves, byte-identical coherence on all five
+> models, the MTP gate, and the op suites all reproduce.  The 2026-09-11 re-cut is tip **`fe4f55278`**
+> (base `389c5341f`, tree `928852cdc`) and every 2026-09-10 number reproduced **to the last decimal**
+> — see `README.md` and `HANDOVER.md` §10.
 > V3 is **on by default** (`LLAMA_KQ_MASK_DERIVED`), V4 and V5 are **opt-in through one switch**
 (`GGML_CUDA_FA_KV_NATIVE=1`, V4 for q8_0 K/V, V5 for bf16 K/V — see the amendment note in `README.md`),
 > default off — a ~1.7 % prefill cost for a large memory win).  What testers should do is reproduce the
@@ -108,7 +113,30 @@ what broke / what looks off:
   a deterministic **buffer-layout** sensitivity of the engine, not an arithmetic difference (proven by
   running the same binary with a zero placeholder tensor).  The gate is **≥ ~0.45**;
 * a *higher* reserve for a model that does not use a given win is not a regression if that win's gate
-  was off.
+  was off;
+* **with a `q8_0` or `q4_0` K/V cache, plain decode and speculative decode legitimately disagree** —
+  see §4b.  Do **not** report it against Block 15: it reproduces byte-identically without Block 15.
+
+### 4b. KV cache type: what the measurements in §2 mean (2026-09-11)
+
+The two §2 measurements below use `-ctk q8_0 -ctv q8_0`.  The revalidation of 2026-09-11 showed that
+the **KV cache type changes what "same-seed coherence" can mean**, and this is **pre-existing**
+(identical results with and without Block 15 — it is not a campaign win):
+
+| K/V type | width purity (`n_max <= 7`, i.e. plain == spec) | KV size, 4B @ ctx 204800 | pp512 / tg32 |
+|---|---|---|---|
+| f16, bf16 | **pure** | 6400 MiB | 7765 / 99 |
+| q4_1, q5_0, q5_1, iq4_nl | **pure** (no native kernel: ~3.4x slower) | 2000 / 2200 / 2400 / 1800 MiB | 2197–2293 / 56–64 |
+| **q8_0** | **NOT pure** — `W=1,2` agree, `W=3..8` agree, they differ from each other | 3400 MiB | 7713 / 97 |
+| **q4_0** | **NOT pure** — same shape as q8_0 | 1800 MiB | 7696 / 95 |
+
+So: **use `f16` or `bf16` when you are testing plain-vs-speculative *coherence*** (that is the pair whose
+purity is guaranteed), and treat a q8_0/q4_0 plain-vs-spec text difference as expected rather than a
+regression.  The adaptive-MTP **acceptance** gate (≥ ~0.45) is unaffected — it passes on every type.
+
+**Do not mix K and V types** (`-ctk bf16 -ctv q8_0`, etc.).  This is now a **rejected configuration**
+(maintainer decision 2026-09-11): every mixed pair measured is 1.7–3.6x slower than the same-type
+equivalent (pp512 2152–4476 vs 7713–7838) and never smaller, so it has no upside.
 
 ## 5. What is not in Block 15
 
@@ -122,6 +150,6 @@ what broke / what looks off:
 1. Re-run with the suspected gate off.  If the regression disappears, it belongs to that win — say so
    and the session that owns it will fix or gate it.
 2. If it persists with every gate off, it is probably not a campaign win: report it as a
-   block-15-vs-14-block difference with the §3 template.
+   block-15-vs-15-block difference with the §3 template.
 3. Always attach the *generated text* for coherence issues (a diff of the two outputs is enough) and the
    exact command lines — they are usually enough to reproduce it without your model.

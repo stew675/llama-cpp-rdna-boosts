@@ -4,11 +4,12 @@
 > 2026-09-10, the merge/gate/validate/cut steps, the state inventory and the open questions.
 > This file is the reference: inventory, gate audit, validation protocol, reference numbers.
 
-**Status: BETA — staged, NOT promoted (2026-09-10).**  The campaign is
+**Status: BETA — staged, NOT promoted (2026-09-10); REVALIDATED 2026-09-11
+against the 15-patch delivery.**  The campaign is
 complete and the block-15 patch lives **only in this directory**
-(`block-15-campaign-wins.patch`); it is **not part of the delivery**
-(`patches/` is the 14-block set) and is applied manually on top of the
-14-block tree.  The beta window (~4–5 days) is open for tester feedback;
+(`block-15-campaign-wins.patch`, re-cut 2026-09-11); it is **not part of the
+delivery** (`patches/` is the 15-patch set: block 00 + blocks 01-14) and is
+applied manually on top of the 15-block tree.  The beta window (~4–5 days) is open for tester feedback;
 promotion into the delivery set requires the maintainer's go-ahead (at
 which point `scripts/apply-all.sh` becomes a 15-block flow).  All seven wins are on by default
 except **V4 and V5, which are opt-in through the same switch**
@@ -18,16 +19,66 @@ with a large memory win and no cheap fix ships as an enable switch rather
 than a kill-switch), and the explicit instruction for the bf16 item
 ("treat it similarly to V4 ... gated by the same environment variable").
 
-**Revalidation pending (2026-09-11).**  The delivery moved on: it is now a
-**15-patch set** (block 00 + blocks 01-14) at canonical tip **`389c5341f`**
-(tree `928852cdc`), with block 13 amended twice on 2026-09-11.  This beta
-patch was cut on `b425aa8f7` (the 14-block chain), so it must be re-cut,
-re-validated and renumbered `[PATCH 16/16]` — the measured dependency delta
-is exactly one file (`fattn-common.cuh`, block 00's `ntiles_dst_eff` fix in
-`launch_fattn`) and the textual apply is clean.  **The plan, the dependency
-hashes and the full perf/correctness validation matrix are in
-[`HANDOVER.md`](HANDOVER.md) §10.**  The dated tables below are the
-2026-09-10 records and stay as written.
+**Revalidation 2026-09-11 — DONE.**  The delivery moved on since the cut (it is
+now a **15-patch set**: block 00 + blocks 01-14 at canonical tip **`389c5341f`**,
+tree `928852cdc`, with block 13 amended twice on 2026-09-11), so the beta patch was
+re-cut and re-validated end to end.
+
+* **New beta tip `fe4f55278`** (tree `ffe197e2f`, parent `389c5341f`); the re-cut patch
+  replaced `block-15-campaign-wins.patch` in this directory.  Previous tip `377f8e790`
+  was cut on `b425aa8f7` = block 14 of the old **14-block** chain.
+* **Dependency delta: exactly one file.**  `ggml/src/ggml-cuda/fattn-common.cuh`
+  `7442bc22a` → `22eec7d57` (block 00's `ntiles_dst_eff` fix inside `launch_fattn` — the
+  query-width-independent KV split).  The other 22 touched files are byte-identical to the
+  cut base, so the re-cut changes only the `From <sha>` line, that one `index` line and one
+  `@@` hunk header (`+8` lines offset).  Textual apply on `389c5341f`: clean, no rejects.
+* **Numbering: no renumbering was needed** (this corrects the first draft of
+  `HANDOVER.md` §10.1).  The repo convention is `git format-patch --start-number 0`, so the
+  denominator is the *last block index*, not the count: the delivered 15-patch set reads
+  `[PATCH 00/14]`…`[PATCH 14/14]`, and the beta patch's long-standing **`[PATCH 15/15]` was
+  already correct**.  On promotion the whole set's denominator simply moves `/14` → `/15`
+  (regenerate with `make-patches.sh`; 15/15 of the regenerated delivery patches are
+  byte-identical apart from that denominator).
+* **Clean-apply**: fresh `9113cc188` + `scripts/apply-all.sh` → strict **15/15**, **0
+  whitespace warnings**, tree `928852cdc`; then the re-cut block-15 patch → 16 commits, tree
+  **`ffe197e2f`** (exactly the re-cut tree).
+
+| check | 2026-09-11 revalidation result |
+|---|---|
+| reserve matrix (5 models × ub × V4/V5, qwen4exp W1/W2/W3, bf16/V5 table) | **every 2026-09-10 number reproduced to the last decimal** — e.g. 27B 1920.3284/880.3360 → 1121.1252/81.1329; 4B 1800.3284/840.3360 → 1001.1252/41.1329 → 257.1252/41.1329; gemma-4-E4B 1887.3517→1078.1740→452.1740; gemma-4-31B 2753.3517→1942.1759→718.1759; qwen4exp 6690.3987/1262.6954 → W1 4450.3987 → W2-only 5491.3909/63.6876 → W1+W2+W3 **3251.3909/63.6876** with indexer KV 956.26 → **318.76**; bf16 4B 968.8596→256.8596 (ub1024 884.8206→128.8206, ub512 842.8010→64.8010), 27B 1072.8596→488.8596 / 868.8010→122.8010, E4B 1062.8927→404.8927, 31B 2068.8947→716.8947; **bf16+V5 costs exactly f16 (256.8596)** |
+| dense width-purity probe (block 00's guarantee, block 15 active) | 27B hashes **identical to the delivered reference**: 1 GPU `4089b4d4` (W=9 `72af52db`), 2-GPU tensor `a4817ee6` (`b059daa6`), 3-GPU tensor `91434ea9` (`bc3faabd`); 4B pure in all four split configs (1 GPU, 2-GPU layer, 2-GPU tensor, 3-GPU tensor), W=9 divergent.  ⇒ **`n_max <= 7` still holds and block 15 changes no FA numerics** |
+| staging invariance (the flagged risk: block 00's split heuristic and V4/V5's operand staging share `launch_fattn`) | V4 on == V4 off and V5 on == V5 off **bit-identically** (4B 3-GPU tensor q8_0 `e826b757…`/`7fe106f5…`/`6f0f0cd0…`; bf16 `07a57be6…`/`c80d981b…`) — stronger than the recorded text coherence |
+| same-seed coherence, gates flipped | **byte-identical** (only the timing footer differs) on 4B (default/V3off/V4on), gemma-4-E4B SWA, gemma-4-31B SWA, 27B (short **and** 40k prompt, default/V3off/V4on), qwen4exp (default vs all QSA gates off) |
+| MoE asterisk | **identical on both builds**: default W1 `ac8825358d9adfda` / W3 `bd138ad2326fbbf2`; `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` → both `bd138ad2326fbbf2` |
+| adaptive-MTP gate | 27B 0.90789 (69/76) **identical on both builds**; MoE 0.58378 (324/555) **identical on both builds**; qwen4exp 0.47826 (block 15) vs 0.50000 (delivery) — one token, and qwen4exp's raw logits are **bit-identical across builds** (`dcf1ae66…`/`1c801d63…`), so it is the documented buffer-layout sensitivity, not arithmetic; both pass the >= 0.45 gate |
+| op suites | `FLASH_ATTN_EXT` **7859/7859 ROCm0** (6 derived cases) and **7859/7859 CPU** (4/4 backends), `GATED_DELTA_NET` OK, `test-alloc` 0 failures, `test-batch-alloc` OK; W4 repro 16.00 MiB, revert → **56.00 MiB** (bug back), restore → 16.00 MiB with `ggml-alloc.c` byte-identical |
+| prefill/decode cost (interleaved same-binary, pp20480/ub2048) | 4B V3 −1.6 % / V4 −1.75 %, decode flat (101.0–101.4); 27B V3 −0.3 %, decode flat (36.99); headline vs delivery: 27B 2-GPU tensor 1993.9 vs 2028.7 pp512 (**−1.7 %**) / 32.019 vs 31.999 tg128, MoE 1 GPU 4801 vs 4816 pp512 (−0.3 %) / 99.94 vs 101.21 tg128 (−1.25 %) — all inside the documented envelope |
+| RDNA3_5 (gfx1151) | **not re-run** — no such hardware on this host (3× gfx1201 + a gfx1036 iGPU).  The 2026-09-10 gfx1151 record stands; the re-cut changes no gfx1151-relevant code (the `fattn-common.cuh` hunk only) |
+| `--parallel 4` (n_seq_max > 1) | runs with V3 on and off, no abort (the 2026-09-10 `kq_mask_derivable()` single-stream guard holds) |
+
+**Findings recorded during the revalidation (all PRE-EXISTING — identical hashes on the
+delivery build — and all outside Block 15's scope; see §7 and
+`../../wip/kv-quant-purity-followups/README.md`):**
+
+1. **The dense `n_max <= 7` purity guarantee does not hold for a fast-quantized KV cache.**
+   Same-type pairs: f16, bf16, q4_1, q5_0, q5_1 and iq4_nl are **pure** (`W=1..8` bit-identical);
+   **q8_0/q8_0 and q4_0/q4_0 are impure** (`W=1 == W=2`, then `W=3..8` — the boundary is `W=2→3`).
+   The impure set is exactly the two KV types with a **fast native** both-quantized FA path
+   (>7700 t/s pp512); every other quant is ~3.4x slower because it stages through the F16 scratch.
+   Text level (27B 3-GPU, ctx 8192, 300 greedy tokens, q8_0 KV): plain `8ed58aa9` (1330 chars) vs
+   `n_max 3 == n_max 7` `da56855b` (1406 chars) — a real greedy divergence.  f16 control: all three
+   `ce7b9a75` (pure).  `BETA-TESTING.md` §2 prescribes q8_0 KV, so beta MTP/coherence numbers taken
+   that way carry this pre-existing impurity — use f16/bf16 when purity matters.
+2. **qwen4exp (fused sparse QSA) is not width-pure** (`W=1` `dcf1ae66…` != `W=3` `1c801d63…`, on both
+   builds).  Consistent with its treatment: qwen4exp is acceptance-gated, not byte-identity-gated.
+3. **Mixed K/V types are never worth it**: every mixed pair measured is 1.7–3.6x slower than the
+   same-type equivalent (pp512 2152–4476 vs 7713–7838) while using **more** memory than the
+   same-type quantized pair (e.g. f16/q8_0 is slower than q8_0/q8_0 and larger).  The maintainer's
+   2026-09-11 decision is therefore to **reject differing K/V cache types as an accepted limitation**
+   of this repo/block (aligned with upstream #25871, which already enforces same-K/V for DeepSeek V4).
+4. **The sub-q8_0 quants are the parity gap**: q4_1/q5_0/q5_1/iq4_nl give 1800–2400 MiB (vs 3400 for
+   q8_0, 6400 for f16) and are pure, but cost 2197–2293 pp512 / 56–64 tg32.  Note **iq4_nl is the same
+   size as q4_0 (1800 MiB), is pure, and is 3.4x slower** — making it native would obsolete q4_0.
 
 **Amendment (2026-09-10): V5 native bf16 K/V.**  Folded into the block the
 same day it was designed: a bf16 K/V cache no longer needs the F16 staging
@@ -40,9 +91,10 @@ amendment touched only this directory's `block-15-campaign-wins.patch`
 and was re-validated end to end — see §3.4/§9 of
 `../../wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`.
 
-**Beta start: 2026-09-10.**  The beta patch tip is `377f8e790` (block 15,
-amended with V5 and the RDNA3_5/gfx1151 V3 fix; the original cut was
-`09a137566`, then `f5ab5350b`).  It applies on top of the 14-block
+**Beta start: 2026-09-10 (tip `377f8e790`, cut on the 14-block chain `b425aa8f7`); re-cut
+2026-09-11 to tip `fe4f55278` on the 15-patch delivery (`389c5341f`, tree `928852cdc`).**  The
+2026-09-10 tip was `377f8e790` (block 15, amended with V5 and the RDNA3_5/gfx1151 V3 fix; the
+original cut was `09a137566`, then `f5ab5350b`).  It applies on top of the **15-block**
 delivery built at the fork point `9113cc188` (always regenerate the
 delivery from a canonical fork rebuilt at the fork point — see
 `../../BASELINE.md`).
@@ -143,7 +195,7 @@ the cache-level ones).
 * **Adaptive MTP gate** (`tools/mtp-ab.sh`): acceptance ≥ ~0.45 and MTP ≥ plain at depth 3 — the repo
   rule for anything that can move buffer layout.
 * **Performance parity**: `tools/ub-sweep.sh` (llama-bench pp20480 / tg256, r=3) at ub 2048 and 1024 vs
-  the 14-block build; the L1 measurement showed +1 % prefill, nothing else.
+  the 15-block build; the L1 measurement showed +1 % prefill, nothing else.
 * **`test-backend-ops`** (at least VIEW/CONT/CPY/DUP/CONCAT/FLASH_ATTN_EXT on CPU + ROCm0),
   `test-alloc`, `test-batch-alloc`.
 * **No reserve growth** across repeated graph builds (the W4 acceptance criterion).
@@ -181,6 +233,12 @@ the cache-level ones).
 
 ## 6. Reference numbers to protect (do not regress)
 
+> **Revalidated 2026-09-11** against the 15-patch delivery (base `389c5341f`, tree
+> `928852cdc`) with block 15 re-cut to `fe4f55278` (tree `ffe197e2f`): **every number in the
+> tables below reproduced to the last decimal**, and the pristine rows reproduce the 15-block
+> delivery build exactly.  The row label "pristine (14 blocks)" is the 2026-09-10 record's name
+> for the then-current delivery — at revalidation it is the 15-block delivery.
+
 qwen4exp, ctx 204800, `-ctk/-ctv q8_0`, 3× R9700, per GPU:
 
 | state | ub2048 compute | ub2048 host | ub1024 compute | ub1024 host |
@@ -211,3 +269,20 @@ Dense controls (no qwen4exp involved; block 15 measured with V3 on): Qwen3.5-4B-
 (the pre-block-15 values 1800.33/840.34 and 1920.33/880.34 are the V3-off states).  Block 15 must
 leave the V3-off numbers unchanged and the V3-on numbers as above — both were re-measured from the
 the beta patch on top of the 14-block tree on 2026-09-10.
+
+## 7. Follow-up work from the revalidation (2026-09-11) — NOT Block 15's scope
+
+All three were found while re-validating, all reproduce **identically on the delivery build** (so
+they are pre-existing, not block-15 regressions).  The full brief, evidence, repro commands and
+hypotheses live in **`../../wip/kv-quant-purity-followups/README.md`**; the summary:
+
+| # | item | measured | why it matters |
+|---|---|---|---|
+| F1 | **quantized-KV width purity** — `q8_0/q8_0` and `q4_0/q4_0` break the dense `n_max <= 7` guarantee (`W=1 == W=2` then `W=3..8`); text level: plain `8ed58aa9` vs spec `da56855b` on the 27B | 4B 1 GPU `0edf55a1`/`31a0c1ba` (q8_0), `8125e094`/`619c151e` (q4_0); f16/bf16/q4_1/q5_0/q5_1/iq4_nl pure | anyone speculating with a q8_0 or q4_0 cache gets a different greedy result than plain decode; `BETA-TESTING.md` §2 prescribes q8_0 KV |
+| F2 | **qwen4exp width purity** — the fused sparse QSA path is not width-invariant (`W=1` `dcf1ae66…` != `W=3` `1c801d63…`) | identical on both builds; its MTP acceptance is unaffected (0.47826/0.50000, gate >= 0.45) | its gate is acceptance-based by design, so this is a **known-but-undocumented** exemption — either fix it (block 00's approach: make the split/plan query-width-independent) or state the exemption in `../../GREEDY-PURITY.md` |
+| F3 | **sub-q8_0 KV quant parity** — q4_1/q5_0/q5_1/iq4_nl are pure and much smaller (1800–2400 MiB vs 3400 q8_0 / 6400 f16 at ctx 204800) but run at 2197–2293 pp512 / 56–64 tg32 vs 7713–7838 / 95–99 | they have **no native FA path** (F16 staging scratch); the native ones are f16, bf16, q8_0, q4_0 | extending block 15's own `FATTN_KV_NATIVE_{NONE,Q8_0,BF16}` type-code design to them would buy ~3.3x prefill; **iq4_nl is the same size as q4_0 (1800 MiB) and is pure**, so a native iq4_nl obsoletes q4_0 outright.  **Any new native path must be built width-invariant** — do not repeat the q8_0/q4_0 mistake |
+
+**Maintainer decision 2026-09-11 (recorded here):** differing K **and** V cache *types* are to be
+**rejected as an accepted limitation** of this repo / Block 15 — the measurements show mixed pairs are
+always 1.7–3.6x slower than the same-type equivalent and never smaller, so the configuration has no
+upside (upstream already enforces same-K/V for DeepSeek V4, #25871).

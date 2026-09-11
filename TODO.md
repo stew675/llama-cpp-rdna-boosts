@@ -285,6 +285,36 @@ Block 15 is STAGED in `beta/block-15-campaign-wins/`, not promoted.
   files + generators, then bit-exact + bench validation per the 0004
   recipe.
 
+### KV-cache quant purity + parity (found 2026-09-11 by the Block-15 revalidation; PRE-EXISTING)
+
+All three reproduce **bit-identically without Block 15** — not campaign regressions.  Full brief,
+evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `tools/`).
+
+- **F1 (correctness, highest interest): `q8_0` and `q4_0` K/V caches break the dense
+  `n_max <= 7` greedy-purity guarantee.**  `W=1 == W=2`, then `W=3..8` — the boundary is `W=2→3`,
+  not block 00's `n_q<=8`; text level on the 27B: plain `8ed58aa9` (1330 chars) vs
+  `n_max 3 == n_max 7` `da56855b` (1406 chars).  f16/bf16/q4_1/q5_0/q5_1/iq4_nl are all pure, and
+  the impure set is exactly the two types with a *fast native* both-quantized FA path.  Not V4
+  (switch on/off identical), not all-reduce (1 GPU shows it).  Next step: dump
+  `ntiles_dst`/`ntiles_KV`/`parallel_blocks` + the staging branch for `W=1..4` in `launch_fattn` and
+  in the native `q8_0×q8_0`/`q4_0×q4_0` kernel selection.  Acceptance: `W=1..8` bit-identical on all
+  four split configs, no perf regression, other types unchanged, FLASH_ATTN_EXT still 7859/7859.
+- **F2 (correctness, documented exemption or fix): qwen4exp (fused sparse QSA) is not width-pure**
+  (`W=1` `dcf1ae66…` != `W=3` `1c801d63…`, both builds).  Either make the QSA sparse path's
+  split/plan query-width-independent (block 00's method — then `none` == `n_max 3` == `n_max 7` on
+  the text), or state the exemption in `GREEDY-PURITY.md`.
+- **F3 (performance, biggest available win): sub-`q8_0` KV quant parity.**  q4_1/q5_0/q5_1/iq4_nl
+  are pure and 1800–2400 MiB (vs 3400 q8_0 / 6400 f16) but run 2197–2293 pp512 / 56–64 tg32 versus
+  7713–7838 / 95–99, because they have no native FA path (F16 staging scratch).  Block 15 already
+  ships the mechanism (the shared `FATTN_KV_NATIVE_{NONE,Q8_0,BF16}` per-operand staging type code);
+  extend it with these types.  **iq4_nl is the standout: same 1800 MiB as q4_0, pure, 3.4x slow — a
+  native iq4_nl would dominate/obsolete q4_0.**  Any new native path must be **width-invariant by
+  construction** (F1 and F3 must be designed together, not sequentially).
+- **Policy (maintainer decision 2026-09-11): reject differing K/V cache *types* as an accepted
+  limitation.**  Every mixed pair is 1.7–3.6x slower than the same-type equivalent and never smaller
+  (pp512 2152–4476 vs 7713–7838); upstream already enforces same-K/V for DeepSeek V4 (#25871).
+  Hard error vs warning vs docs-only is the open sub-decision.
+
 ## Parked
 
 ### LFRU host->GPU slow hot-weight migration

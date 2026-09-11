@@ -377,6 +377,31 @@ explicitly requests it.**
   model (gemma-4-E4B / -31B).  Known pre-existing issue: gemma-4-E4B-it on
   3 GPUs with `-sm tensor` aborts in the meta splitter (2 KV heads < 3
   devices) — use 1/2 GPUs or `-sm layer`.
+  **Revalidated 2026-09-11** against the 15-patch delivery (re-cut beta tip
+  `fe4f55278`, tree `ffe197e2f`, base `389c5341f`): the dependency delta was
+  exactly one file (`fattn-common.cuh`, block 00's `ntiles_dst_eff`), every
+  2026-09-10 number reproduced to the last decimal, and the width probe
+  reproduces the delivered reference hashes — see the beta `README.md` +
+  `HANDOVER.md` §10.
+- **The dense greedy-purity guarantee (`--spec-draft-n-max <= 7`) depends on the KV cache type.**
+  It holds for **f16, bf16, q4_1, q5_0, q5_1 and iq4_nl**, but **NOT for a
+  `q8_0` or `q4_0` K/V cache**: there `W=1 == W=2` and `W=3..8` agree,
+  but the two groups differ (`W=2→3`, *not* block 00's `n_q <= 8`), and at
+  the text level plain vs `draft-mtp` differ for real (27B, q8_0 KV:
+  `8ed58aa9` vs `da56855b`).  This is **pre-existing** (bit-identical on a
+  build without any block-15 code; `GGML_CUDA_FA_KV_NATIVE` on/off
+  identical; reproduced on 1 GPU, so it is not the all-reduce) and it is a
+  *trade*: the impure set is exactly the two types with a fast native
+  both-quantized FA path (the rest stage through F16 and are ~3.4x
+  slower).  **Test plain-vs-spec purity with f16/bf16 K/V**; with a
+  q8_0/q4_0 cache gate on adaptive-MTP acceptance/throughput instead.
+  qwen4exp's fused sparse QSA path is likewise not width-pure (also
+  pre-existing).  **Differing K/V cache *types* are rejected** (maintainer
+  decision 2026-09-11: mixed pairs are 1.7–3.6x slower than the same-type
+  equivalent and never smaller).  Details, repro tooling and the follow-up
+  items (F1 purity, F2 qwen4exp, F3 sub-`q8_0` parity — note a native
+  `iq4_nl` would be the same 1800 MiB as q4_0, pure, and 3.4x faster):
+  `GREEDY-PURITY.md` §12 and `wip/kv-quant-purity-followups/`.
 
 ## Common tasks
 

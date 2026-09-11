@@ -1,10 +1,13 @@
 # Block 0015 handover — campaign wins → beta delivery (+ upstream candidates)
 
-> **REVALIDATION PENDING (2026-09-11): the delivery moved on — see §10 at the
-> bottom of this file.  The beta patch was cut on `b425aa8f7` (the 14-block chain)
-> and must be re-cut against canonical tip `389c5341f` (tree `928852cdc`), re-validated
-> (perf + correctness, §10.3/§10.4) and renumbered `[PATCH 16/16]`.  The textual apply is
-> already known to be clean with exactly one changed dependency (`fattn-common.cuh`).**
+> **REVALIDATED 2026-09-11 — see §10.6 for the outcome.**  The beta patch was cut on
+> `b425aa8f7` (the 14-block chain) and has been **re-cut against canonical tip `389c5341f`
+> (tree `928852cdc`) and re-validated end to end**: new beta tip **`fe4f55278`**
+> (tree `ffe197e2f`).  The dependent delta was exactly one file
+> (`fattn-common.cuh`), the textual apply was clean, every 2026-09-10 number
+> reproduced to the last decimal, and three **pre-existing** follow-ups were
+> found (§10.7).  §10.1's original `[PATCH 16/16]` renumbering claim was **wrong** —
+> see the correction there.
 
 > **STATUS 2026-09-10 (end of the cut session): DONE — Block 15 is CUT and
 > in the delivery.**  `block-15-campaign-wins.patch`
@@ -431,6 +434,14 @@ plumbing + probe + enable; the three V3 patches are already in the fork tree), `
 (V4, 6 files, +357/−47, opt-in, also already in the fork tree).  W3 and W4 are the only campaign pieces
 not yet on the fork tree.
 
+> **Revalidation artifacts (2026-09-11, `/tmp` — rebuild if wiped):** `/tmp/bin-15blk` = the delivered
+> 15-patch build (baseline), `/tmp/bin-blk15` = the re-cut block-15 build (`fe4f55278`); `/tmp/blk15` =
+> the worktree holding the re-cut block-15 commit (branch `blk15-recut`); `/tmp/p16b/` = the regenerated
+> 16-patch set; `/tmp/rv-sim2/` = the clean-apply simulation result (16 commits, tree `ffe197e2f`);
+> the reusable driver + KV-capable probe are committed in `../../wip/kv-quant-purity-followups/tools/`
+> (`rv.sh`, `logits-dump-kv.cpp` — the latter is the width probe with `CTK`/`CTV`, which is what the F1
+> table needs).  `/tmp/lw-kv-blk15` and `/tmp/lw-kv-15blk` were the two probe builds.
+
 **Volatile helpers** (rebuild; `/tmp` may be wiped): `/tmp/bin-pristine` (14 blocks), `/tmp/bin-l2` (W1),
 `/tmp/bin-l1` (W1+W2 pre-guard), `/tmp/bin-l1guarded` (= the current tree), `/tmp/bin-l3b` (tree + W4),
 `/tmp/bin-keysonly` (W3), `/tmp/bin-l0base|l0c|l0d` (instrumented allocators; source
@@ -580,12 +591,16 @@ Unchanged (blob-identical to the cut base — their `index` lines stay valid):
 `src/llama-memory-hybrid-idx.cpp`, `src/llama-memory-hybrid-idx.h`,
 `src/models/qwen4exp.cpp`, `tests/test-backend-ops.cpp`.
 
-**Consequences for the re-cut:** only `fattn-common.cuh`'s *pre-image* hash
-changes; the `From <sha>` identity changes (the re-cut commit); and the series
-count must go `[PATCH 15/15]` → **`[PATCH 16/16]`** — the delivery is 15 patches
-now and block 15 rides on top as the 16th.  Note the *old* count was already
-ambiguous: `[PATCH 15/15]` was the campaign's own number while the delivery had
-14 blocks; on promotion the set is **block 00 + 01-14 + 15 = 16**.
+**Consequences for the re-cut (verified 2026-09-11):** only `fattn-common.cuh`'s
+*pre-image* hash changes (along with its post-image and one `@@` hunk header), and the
+`From <sha>` identity changes (the re-cut commit).  **CORRECTION to the first draft of this
+section: no renumbering is needed, and `[PATCH 16/16]` was wrong.**  The repo convention is
+`git format-patch --start-number 0 $BASELINE..$TIP`, which makes the denominator the **last
+block index**, not the count: the delivered 15-patch set reads `[PATCH 00/14]`…`[PATCH 14/14]`,
+and the beta patch's long-standing **`[PATCH 15/15]` was already correct** (verified: regenerating
+the 16-commit range with the same convention reproduces all 15 delivery patch bodies
+byte-identically and emits block 15 as `[PATCH 15/15]`).  On promotion the whole set's
+denominator simply moves `/14` → `/15`, which `scripts/make-patches.sh` does by construction.
 
 ### 10.2 The one real semantic risk — block 00 and V4/V5 in the same function
 
@@ -652,7 +667,62 @@ about that interaction**, so the revalidation must:
    WORKLOG entry (never edit the dated 2026-09-10 records in place).
 5. Commit and push to **this repo's `origin` only**.
 
-### 10.6 What not to do
+### 10.6 Outcome (2026-09-11) — DONE
+
+**Re-cut:** block 15 = **`fe4f55278`** (tree **`ffe197e2f`**, parent `389c5341f`); the re-cut patch
+replaced `block-15-campaign-wins.patch` in this directory.  **Clean-apply:** fresh `9113cc188` +
+`apply-all.sh` → strict **15/15**, **0 whitespace warnings**, tree `928852cdc`; + the re-cut patch →
+16 commits, tree `ffe197e2f`.
+
+**Every 2026-09-10 claim reproduced.**  The full tables are in `README.md` (status block + §6/§7);
+the headlines:
+
+* **Reserves — every number to the last decimal** (27B 1920.3284/880.3360 → 1121.1252/81.1329; 4B
+  1800.3284/840.3360 → 1001.1252/41.1329 → 257.1252/41.1329; E4B 1887.3517→1078.1740→452.1740; 31B
+  2753.3517→1942.1759→718.1759; qwen4exp 6690.3987/1262.6954 → W1 4450.3987 → W2-only
+  5491.3909/63.6876 → **3251.3909/63.6876** with indexer KV 956.26 → **318.76**; bf16/V5 4B
+  968.8596→256.8596 = the f16 cost, 27B 1072.8596→488.8596, E4B 1062.8927→404.8927, 31B
+  2068.8947→716.8947).
+* **The §10.2 risk is cleared**: the 27B width probe reproduces the delivered reference hashes exactly
+  (1 GPU `4089b4d4`, 2-GPU tensor `a4817ee6`, 3-GPU tensor `91434ea9`; `W=9` `72af52db`/`b059daa6`/
+  `bc3faabd`), so `n_max <= 7` holds and block 15 changes no FA numerics; **V4/V5 on == off
+  bit-identically**, so the operand staging does not perturb the split.
+* **Coherence byte-identical** across gates (4B, both SWA gemmas, 27B short **+ 40k**, qwen4exp).
+* **MoE asterisk intact**: `ac8825358d9adfda`/`bd138ad2326fbbf2`, and
+  `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` collapses both to `bd138ad2326fbbf2` — identical on both builds.
+* **MTP**: 27B 0.90789 and MoE 0.58378 identical on both builds; qwen4exp 0.47826 vs 0.50000 is the
+  documented layout sensitivity (its raw logits are bit-identical across builds).
+* **Op suites**: `FLASH_ATTN_EXT` 7859/7859 ROCm0 + 7859/7859 CPU (6 derived cases), `GATED_DELTA_NET`
+  OK, `test-alloc`/`test-batch-alloc` clean, W4 round trip 16.00 → (revert) 56.00 → 16.00 MiB.
+* **Cost**: 4B prefill V3 −1.6 % / V4 −1.75 %, decode flat; 27B V3 −0.3 %, decode flat; headline vs
+  the delivery build 27B pp512 −1.7 % / tg128 flat, MoE pp512 −0.3 % / tg128 −1.25 %.
+* **gfx1151: not re-run** (no such hardware on this host — 3× gfx1201 + a gfx1036 iGPU); the re-cut
+  touches no gfx1151-relevant code.
+
+### 10.7 Follow-ups found by the revalidation (PRE-EXISTING, not block-15 regressions)
+
+Brief + evidence + repro commands: **`../../wip/kv-quant-purity-followups/README.md`**; summary in
+`README.md` §7.
+
+* **F1 — quantized-KV width purity.**  `q8_0/q8_0` and `q4_0/q4_0` break the dense `n_max <= 7`
+  guarantee (`W=1 == W=2`, then `W=3..8`); text level on the 27B: plain `8ed58aa9` (1330 chars) vs
+  `n_max 3 == n_max 7` `da56855b` (1406 chars).  f16, bf16, q4_1, q5_0, q5_1 and iq4_nl are pure.
+  The impure set is exactly the two types with a *fast native* both-quantized FA path (>7700 t/s);
+  everything else stages through F16 and is ~3.4x slower.  Mixed K/V types are not a usable control
+  (2–3.6x slower, different path).
+* **F2 — qwen4exp width purity.**  The fused sparse QSA path is not width-invariant
+  (`W=1` `dcf1ae66…` != `W=3` `1c801d63…`), identically on both builds; its acceptance gate still
+  passes.  Either fix it the block-00 way or document the exemption.
+* **F3 — sub-q8_0 quant parity.**  q4_1/q5_0/q5_1/iq4_nl are pure and 1800–2400 MiB but run at
+  2197–2293 pp512 / 56–64 tg32 vs 7713–7838 / 95–99 for the native ones.  They have no native FA
+  path; extending block 15's own `FATTN_KV_NATIVE_{NONE,Q8_0,BF16}` type-code design to them is the
+  obvious route.  **iq4_nl is the same size as q4_0 (1800 MiB) and is pure** — a native iq4_nl would
+  obsolete q4_0.  Any new native path must be built **width-invariant**.
+* **Decision (maintainer, 2026-09-11):** differing K and V cache *types* are **rejected as an accepted
+  limitation** — mixed pairs are always 1.7–3.6x slower than the same-type equivalent and never
+  smaller.
+
+### 10.8 What not to do
 
 - **Do not fold block 15 into `patches/`** before the maintainer's go-ahead — it
   is a beta, and `patches/` is the 15-block delivery.

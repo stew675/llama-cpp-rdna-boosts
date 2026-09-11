@@ -401,3 +401,38 @@ that; use acceptance + MTP-vs-plain throughput (see
 `n_max = 12` remains outside the *guaranteed* range by Cause B, which is
 deliberate.  Records: `patches/README.md` block-12 notes, the 2026-09-11
 WORKLOG entry, `wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 3.
+
+## 12. The guarantee depends on the KV cache type (2026-09-11, measured during the Block-15 revalidation)
+
+Everything above was measured with an **f16** (or bf16) K/V cache.  Extending the probe matrix to every
+same-type KV pair (`tools` + evidence: `wip/kv-quant-purity-followups/README.md`) shows the guarantee is
+**not universal in the cache type**:
+
+| K/V cache (same type) | `W = 1..8` (i.e. `n_max <= 7`) | notes |
+|---|---|---|
+| f16, bf16 | **pure** | the reference configuration |
+| q4_1, q5_0, q5_1, iq4_nl | **pure** | no native FA kernel — they stage through the F16 scratch, ~3.4x slower |
+| **q8_0** | **impure**: `W=1 == W=2`, `W=3..8 == W=3..8`, but the two groups differ | the boundary is `W=2→3`, *not* block 00's `n_q <= 8` |
+| **q4_0** | **impure**, same shape as q8_0 | ditto |
+
+Text-level impact (27B, 3-GPU `-ts 1/1/1`, ctx 8192, 300 greedy tokens): with a q8_0 cache, `--spec-type
+none` gives `8ed58aa9` and `draft-mtp --spec-draft-n-max 3` (== `7`) gives `da56855b` — a real
+divergence, not a near-tie.  The f16 control is `ce7b9a75` for all three (pure).
+
+Two facts worth keeping straight:
+
+* This is **pre-existing** and **not** a delivery-block effect: the same hashes come out of a build
+  without any of the blocks' F1/F3-relevant code (verified: identical on the 15-block delivery build
+  and on the block-15 tree).  `GGML_CUDA_FA_KV_NATIVE` on/off is identical too, so it is not V4's
+  native staging; 1 GPU alone reproduces it, so it is not the all-reduce.
+* The impure set is exactly the two KV types that have a **fast native** both-quantized FA path
+  (>7700 t/s pp512).  So this is a *trade*, not an oversight: the fast implementations are
+  width-dependent, the generic (F16-staging) ones are not.  Any future native path (see the sub-q8_0
+  parity item) must be built width-invariant by construction.
+
+**Guidance.**  For plain-vs-speculative greedy purity, use **f16 or bf16** for K and V.  If a q8_0/q4_0
+cache is required, treat plain-vs-spec text equality as *not* guaranteed and gate on adaptive-MTP
+acceptance/throughput instead.  Mixed K/V *types* are a rejected configuration (see
+`beta/block-15-campaign-wins/README.md` §7) and are irrelevant to this table.  This table is orthogonal
+to Causes A and B in §11: those are about the *fork's* widths and the FA kernel switch, this is about
+which dequant kernels the cache type selects.
