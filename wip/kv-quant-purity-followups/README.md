@@ -1,6 +1,8 @@
 # KV-quant purity and parity follow-ups (found 2026-09-11)
 
-> **Starting a new session?** Read
+> **Starting the F3 (KV-diagonal) work?** Read
+> **`HANDOVER-2026-09-11-f3-kv-diagonals.md`** — scope, the verified-vs-open mechanism facts, and the
+> "instrument before coding" first task.  **Starting anything else?** Read
 > **`HANDOVER-2026-09-11-remaining-work.md`** in this directory first — it is the self-contained plan
 > for the remaining work (item order, environment, binary/probe locations, instruments, reference
 > hashes, the exact code sites for the first two items, the landing procedure and the trap list).
