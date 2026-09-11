@@ -243,6 +243,10 @@ dump **every** node, including fused ones).
 > pp/tg unchanged.  **Cause B (deliberate, still open) = the FA
 > tile-vs-WMMA switch at `Q->ne[1] > 8`**, which caps the guarantee at the
 > designed `n_max <= 7`; it is documented in the fork's own `fattn.cu` comment.
+> Verified with the raw-logit probe across 1/2/3 GPUs and both split modes:
+> `W = 1..8` bit-identical, `W = 9` divergent, in every one.  Note that the
+> 3-GPU *text* gate at `n_max = 8` coincidentally matched while the logits had
+> already diverged -- establish boundaries with the probe, not the text hash.
 > The *upstream* comparison below is a separate mechanism again (the CPU
 > backend's own batched-vs-single dispatch).  Everything after this box is the
 > pre-fix record, kept for method.

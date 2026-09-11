@@ -10,6 +10,33 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Block 12 amendment: verification matrix completed, and the boundary is `W = 8` / `n_max = 7`, not `n_max = 8` (2026-09-11).**
+  Completes the entry above with the full per-configuration probe matrix and a
+  correction to how the boundary is established.  The verified guarantee is
+  **`--spec-draft-n-max <= 7`** (an 8-token verify batch) on the dense 27B with
+  MTP, for 1 GPU, 2-GPU `-sm layer`, 2-GPU `-sm tensor` and 3-GPU
+  `-sm tensor` alike; the first violating depth is `n_max = 8` (a 9-token
+  batch).  The target verifies the drafts *plus* the last committed token, so
+  `K = n_max + 1` -- `n_max = 8` is a 9-token batch, one past the designed
+  `Q->ne[1] > 8` limit (cause B).
+  Raw-logit probe (27B Q8_0, `RS = 0`, P = 256), `W = 1..8` -> `W = 9`:
+  `4089b4d4` -> `72af52db` (1 GPU); `4089b4d4` -> `72af52db` (2-GPU `-sm layer`);
+  `a4817ee6` -> `b059daa6` (2-GPU `-sm tensor`); `91434ea9` -> `bc3faabd`
+  (3-GPU `-sm tensor`).  Uniform: bit-identical through `W = 8` everywhere,
+  divergent at `W = 9` everywhere.  1 GPU and `-sm layer` share a hash because
+  layer splitting changes no kernel; tensor splitting is the only configuration
+  with different numeric paths (and the only one cause A could affect).
+  **Method correction:** the 3-GPU 300-token *text* gate at `n_max = 8` matched
+  the plain run (`5037ef2e` both) even though the logits had already diverged --
+  no greedy near-tie flipped inside that window.  Text equality is evidence for
+  purity, never evidence against divergence; boundaries must be established with
+  the probe.  (This is the near-tie rarity noted in
+  `wip/sm-tensor-plain-vs-spec/HANDOVER-2026-09-11.md`.)
+  Cause B is left as-is by maintainer decision: correctness through `W = 8`
+  is already far beyond what upstream delivers (upstream's CPU path diverges at
+  the first width step, `W = 2`), and removing it would give up WMMA for
+  9..N-token batches.  The gain from the block-12 fix (+12% MTP) is retained.
+
 - **Block 12 amended: the hybrid all-reduce's size-based dispatch changed the reduction algorithm with the batch width (2026-09-11).**
   `ggml_backend_cuda_comm_is_small()` sent reductions below a per-device-count
   element count to the internal host-staged pipeline and everything above it to

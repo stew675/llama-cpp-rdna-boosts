@@ -291,6 +291,31 @@ independent causes**, and they bound different configurations:
 | 3-GPU `-sm tensor` | `n_max <= 7` | B |
 | 2-GPU `-sm tensor` + `GGML_CUDA_ALLREDUCE=meta` | `n_max <= 7` | B |
 
+The boundary is on the **verify batch width**, not on `--spec-draft-n-max`
+directly: the target verifies the drafts *plus* the last committed token, so
+`K = n_max + 1` and `n_max = 8` is already a 9-token batch.  Measured with the
+raw-logit probe (27B Q8_0, `RS=0`, P=256; identical within a row = bit-identical
+token-0 logits):
+
+| config | `W = 1..8` | `W = 9` (= `n_max 8`) |
+|---|---|---|
+| 1 GPU | `4089b4d4` | `72af52db` |
+| 2-GPU `-sm layer` | `4089b4d4` | `72af52db` |
+| 2-GPU `-sm tensor` | `a4817ee6` | `b059daa6` |
+| 3-GPU `-sm tensor` | `91434ea9` | `bc3faabd` |
+
+So the guarantee is **`--spec-draft-n-max <= 7`** in every configuration, and
+the first violating depth is `n_max = 8`.  (Before the fix, 2-GPU tensor broke
+at `W = 7`.  1 GPU and `-sm layer` share a hash because layer splitting does
+not change any kernel.)
+
+**Use the probe, not the text gate, to establish a boundary.**  On 3 GPUs the
+300-token greedy text at `n_max = 8` matched the plain run (`5037ef2e` in both)
+while the logits had already diverged (`bc3faabd` vs `91434ea9`) -- no greedy
+near-tie happened to flip inside that window.  Text equality is evidence *for*
+purity, never evidence *against* divergence; this is the same near-tie rarity
+noted in `../wip/sm-tensor-plain-vs-spec/HANDOVER-2026-09-11.md`.
+
 **Cause A (fork-specific; FIXED 2026-09-11): block 12's size-based all-reduce
 dispatch.**  `ggml_backend_cuda_comm_is_small()` routes a reduction to the
 internal host-staged pipeline below a per-device-count element count (32768 for
