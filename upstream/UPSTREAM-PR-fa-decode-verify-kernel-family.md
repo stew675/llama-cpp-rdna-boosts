@@ -1,7 +1,9 @@
 # UPSTREAM-PR: ggml-cuda: keep the decode/verify band on one flash-attention kernel family
 
 **Status:** candidate, written and validated against the delivery (canonical tip `1bcf4e82d`); not yet
-filed.  The fork-side form of this fix is the 2026-09-11 block-08 amendment
+filed.  Per the scope policy in `AGENTS.md` ("RDNA first, other backends uninjured"), the fork lands
+only the AMD-reachable half of this fix and leaves the NVIDIA arms to this PR — that is a deliberate
+split, not an omission.  The fork-side form of this fix is the 2026-09-11 block-08 amendment
 (`patches/0008-rdna-boosts-block-08-fused-core-prefill-kernels-and-.patch`); this copy is the
 self-contained upstream form (it also carries the NVIDIA/Ada arm the fork does not need — see Scope).
 

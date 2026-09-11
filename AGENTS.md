@@ -267,6 +267,29 @@ explicitly requests it.**
 | `archive/work/` | closed experiments, preserved for future re-evaluation |
 | `baseline/*` branches, `block/*` tags | **historical** pre-block-12 checkpoints — do not use for the current delivery |
 
+## Scope policy — RDNA first, other backends uninjured (2026-09-11)
+
+This repo is **RDNA/ROCm-specific**: its validation, tuning and claims cover the AMD devices the
+maintainer runs (gfx1201 = RDNA4, plus validated gfx1151/RDNA3_5 and gfx1100/RDNA3_0 work).  The
+patch set is generic llama.cpp, so it should not *break* other backends (NVIDIA/CUDA, MUSA, SYCL,
+Vulkan, CPU) — that is why the shared CMake lists, the dispatch tables and the predicates are kept
+mutually consistent even when a change is unreachable on AMD — but **behaviour and performance on
+non-AMD backends are explicitly out of scope**: no tuning, no validation, no waiting on hardware there.
+NVIDIA parts have their own developers and maintainers; that is not this repo's job.
+
+Consequences, so it is not re-litigated:
+
+* A fix that is reachable on AMD only may be landed **without** its non-AMD counterpart, as long as
+  the non-AMD paths stay *consistent* (no aborts, no uninstantiated pairs) and the difference is
+  documented.  Worked example: the F1 decode/verify band fix deleted the VEC arms in the chooser's
+  generic fallback (the only one AMD reaches); the NVIDIA (`turing_`/`volta_mma_available`) arms are
+  **left alone deliberately** — the staged `upstream/UPSTREAM-PR-fa-decode-verify-kernel-family.*`
+  carries them for upstream, and nothing AMD-side depends on it.
+* New KV-cache types / instances / predicates **are** kept cross-backend consistent, because an
+  inconsistent set is a crash on whichever backend reaches it (see `GREEDY-PURITY.md` §20 and the
+  block-08 notes) — that is correctness, not scope creep.
+* "Not validated on NVIDIA" is an acceptable, documented state — never a blocker for an RDNA win.
+
 ## Critical facts (do not re-derive)
 
 - **Apply method:** all 15 blocks with **`git am`** (each block is a
