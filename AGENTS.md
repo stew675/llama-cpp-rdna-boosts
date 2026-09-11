@@ -23,7 +23,13 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   GDN, BF16 KV (block 03 also carries the **HIP masked-V/freed-cell fixes**
   since 2026-09-10), WMMA flash-attn, CPU bit-identical decode, host-buffer
   revert, meta wrapper skip, fused core, meta headroom, k-quant boosts,
-  CUDA prefill-graph skip.
+  CUDA prefill-graph skip.  **Block 08 amended 2026-09-11**: the decode/verify
+  FlashAttention kernel-family fix (F1) and the **quantized KV-type enablement** —
+  `q4_1`/`q5_0`/`q5_1` were behind `GGML_CUDA_FA_ALL_QUANTS`, which made the FA
+  probe disable flash attention for the whole context (3.4x slower prefill / 1.7x
+  decode); they are enabled unconditionally with their three diagonal vec instances,
+  while the flag remains the knob for the *mixed* K!=V pairs (K==V is still enforced
+  without it).  See the block-08 notes in `patches/README.md` and `GREEDY-PURITY.md` §20.
 - Block **12** (`patches/0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch`): the hybrid HIP
   all-reduce (custom internal AR for the small-tensor decode path +
   per-size hybrid dispatch vs RCCL), **RDNA4-only** (gfx1200/gfx1201; falls
@@ -87,6 +93,15 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   selection width (`indexer_top_k + r - 1` = 2051) a W=1 decode ran dense while the n-token verify
   batch fell through to the sparse top-k selection — the cause-3 text divergence.  The arm now serves
   the whole band (`QSA_DECODE_BAND = 8`); prefill keeps the sparse selection.
+  **Also amended 2026-09-11 with the QSA-vs-KV-type arm gate + the tensor-split gate
+  narrowing**: the fused sparse QSA op reads the cache natively for f16/bf16/q8_0 only,
+  so with any other quantized cache type the graph now takes the dense masked path
+  (`qsa_sparse` also requires a QSA-native cache type) — otherwise the un-split op left
+  the attention output mirrored while the gate stayed hidden-split and the meta splitter
+  aborted on `attn_gated`, which hit `q4_0` too (**pre-existing**).  The tensor-split gate
+  (`llama_init_from_model`) now asks `llama_kv_type_has_native_fa()` instead of a
+  hardcoded `{q4_0, q8_0}`, so `q4_1`/`q5_0`/`q5_1` are allowed under tensor parallelism
+  and `iq4_nl` keeps a clean error.  Verified per type on 3-GPU `-sm tensor` (27B, qwen4exp).
   See the block-14 notes in `patches/README.md` and the beta
   validation record in `beta/qwen4exp/README.md`.
 - Block **15** (STAGED in `beta/block-15-campaign-wins/`, **NOT a delivery patch**): the attention-memory campaign wins --
@@ -121,15 +136,18 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `5ad11fd35`, net tree
-  `3e7accbd7f46c3d196e168a4d29a0350f813f5ff`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `6f07fe67a`, net tree
+  `0c9dece6b0798e41360b8a8366187f38f37e1566`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the whole-batch
-K-independent chunked GDN prefill; block 13 amended 2026-09-11 with the MoE
+K-independent chunked GDN prefill; block 08 amended 2026-09-11 with the
+decode/verify FA kernel-family fix and again with the quantized-KV-type
+enablement (`q4_1`/`q5_0`/`q5_1`); block 13 amended 2026-09-11 with the MoE
 decode/verify mmvq band and again with the fused shared-expert epilogue band;
 block 14 amended 2026-09-11 with the
-hyper-connection decode/verify band fix and again with the QSA decode-arm
-band), which is what
+hyper-connection decode/verify band fix, again with the QSA decode-arm
+band, and again with the QSA-vs-KV-type arm gate + the tensor-split gate
+narrowing), which is what
 `scripts/make-patches.sh`'s default tip refers
 to; always regenerate from a canonical fork rebuilt at the fork point.
 **Block 15 (the attention-memory campaign) is NOT in the delivery** -- it
@@ -513,7 +531,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `5ad11fd35`): `git format-patch --start-number 0` the block
+blocks tip `6f07fe67a`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -522,7 +540,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `5ad11fd35`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `6f07fe67a`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

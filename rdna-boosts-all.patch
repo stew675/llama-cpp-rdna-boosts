@@ -1767,6 +1767,20 @@ index 4c1642a67..259f418a4 100644
  void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index 10828ad81..37f0e85a6 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -120,6 +120,9 @@ if (CUDAToolkit_FOUND)
+         list(APPEND GGML_SOURCES_CUDA
+             template-instances/fattn-vec-instance-f16-f16.cu
+             template-instances/fattn-vec-instance-q4_0-q4_0.cu
++            template-instances/fattn-vec-instance-q4_1-q4_1.cu
++            template-instances/fattn-vec-instance-q5_0-q5_0.cu
++            template-instances/fattn-vec-instance-q5_1-q5_1.cu
+             template-instances/fattn-vec-instance-q8_0-q8_0.cu
+             template-instances/fattn-vec-instance-bf16-bf16.cu)
+     endif()
 diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
 new file mode 100644
 index 000000000..e46b4ab8c
@@ -5564,10 +5578,59 @@ index 8981ab804..23ce9a1c4 100644
 +EXTERN_DECL_FATTN_TILE_CASES(512, 512);
 +EXTERN_DECL_FATTN_TILE_CASES(576, 512);
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index ae217fbd9..b5d8b8139 100644
+index ae217fbd9..38a977326 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -506,6 +506,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -451,8 +451,13 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+ #else
++    // Keep in sync with ggml_cuda_fattn_kv_type_supported and with the default
++    //   instance list in the backend CMakeLists.txt files.
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1, GGML_TYPE_Q4_1)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_Q5_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q5_1)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+ #endif // GGML_CUDA_FA_ALL_QUANTS
+@@ -468,6 +473,18 @@ enum best_fattn_kernel {
+     BEST_FATTN_KERNEL_MMA_F16 = 400,
+ };
+ 
++// KV cache types that at least one of the flash-attention families reachable
++//   below can consume:
++//     - the tile and mma-f16 kernels stage K/V through ggml_get_to_fp16_cuda,
++//       which covers the whole q4_0/q4_1/q5_0/q5_1/q8_0 set, so any of those
++//       types works there (at the cost of the staging copy);
++//     - the vec kernel reads K/V natively and is instantiated per (K,V) pair, so
++//       a type listed here must have an instance for every reachable pair.
++//   With GGML_CUDA_FA_ALL_QUANTS undefined the chooser enforces K->type ==
++//   V->type, so the reachable pairs are exactly the diagonals: keep this list
++//   and the default instance lists in ggml-{cuda,hip,musa}/CMakeLists.txt in
++//   sync, otherwise a reachable pair falls through to the GGML_ABORT at the end
++//   of ggml_cuda_flash_attn_ext_vec.
+ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
+     switch (type) {
+         case GGML_TYPE_F32:
+@@ -476,9 +493,12 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
+         case GGML_TYPE_Q4_1:
+         case GGML_TYPE_Q5_0:
+         case GGML_TYPE_Q5_1:
+-#ifndef GGML_CUDA_FA_ALL_QUANTS
+-            return false;
+-#endif // GGML_CUDA_FA_ALL_QUANTS
++            // These three were behind GGML_CUDA_FA_ALL_QUANTS together with the
++            //   whole 49-pair cross product. They are enabled unconditionally
++            //   here because the tile/mma staging path handles them and the
++            //   diagonals are part of the default instance list; the flag is
++            //   then only needed for the *mixed* K!=V pairs.
++            return true;
+         case GGML_TYPE_Q4_0:
+         case GGML_TYPE_Q8_0:
+         case GGML_TYPE_BF16:
+@@ -506,6 +526,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      float max_bias = 0.0f;
      memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
  
@@ -5577,7 +5640,7 @@ index ae217fbd9..b5d8b8139 100644
      // The effective batch size for the kernel can be increased by gqa_ratio.
      // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
      bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
-@@ -645,24 +648,45 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -645,24 +668,45 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      }
  
      // AMD WMMA is always faster than the tile kernel if the full tile width of 16 can be utilized.
@@ -5639,7 +5702,7 @@ index ae217fbd9..b5d8b8139 100644
      return BEST_FATTN_KERNEL_TILE;
  }
  
-@@ -681,7 +705,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -681,7 +725,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
      bool need_f16_V = false;
  
      switch (kernel) {
@@ -17164,6 +17227,20 @@ index f2a6f2009..d42feb23b 100644
  #define VDR_IQ2_XXS_Q8_1_MMVQ 2
  #define VDR_IQ2_XXS_Q8_1_MMQ  2
  
+diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
+index 47f16f56c..b187d7f2b 100644
+--- a/ggml/src/ggml-hip/CMakeLists.txt
++++ b/ggml/src/ggml-hip/CMakeLists.txt
+@@ -78,6 +78,9 @@ else()
+     list(APPEND GGML_SOURCES_ROCM
+         ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
+         ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q4_1-q4_1.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q5_0-q5_0.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-q5_1-q5_1.cu
+         ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
+         ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
+ endif()
 diff --git a/ggml/src/ggml-moe-weighted-reduction.h b/ggml/src/ggml-moe-weighted-reduction.h
 new file mode 100644
 index 000000000..c90460a45
@@ -17330,6 +17407,20 @@ index 000000000..c90460a45
 +    match.node_count   = node_count;
 +    return true;
 +}
+diff --git a/ggml/src/ggml-musa/CMakeLists.txt b/ggml/src/ggml-musa/CMakeLists.txt
+index faf979033..24f783053 100644
+--- a/ggml/src/ggml-musa/CMakeLists.txt
++++ b/ggml/src/ggml-musa/CMakeLists.txt
+@@ -51,6 +51,9 @@ if (MUSAToolkit_FOUND)
+         list(APPEND GGML_SOURCES_MUSA
+             ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
+             ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
++            ../ggml-cuda/template-instances/fattn-vec-instance-q4_1-q4_1.cu
++            ../ggml-cuda/template-instances/fattn-vec-instance-q5_0-q5_0.cu
++            ../ggml-cuda/template-instances/fattn-vec-instance-q5_1-q5_1.cu
+             ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
+             ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
+     endif()
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
 index 0c1b6d067..3437c6e38 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
@@ -17977,7 +18068,7 @@ index f1d173a57..01e2bbe1d 100644
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_FC,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 21501574a..505901964 100644
+index 21501574a..7df231909 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -152,7 +152,7 @@ llama_context::llama_context(
@@ -18014,17 +18105,45 @@ index 21501574a..505901964 100644
      // with causal attention, the batch size is limited by the context size
      cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
  
-@@ -3692,6 +3710,35 @@ llama_context * llama_init_from_model(
+@@ -3657,6 +3675,25 @@ llama_context_params llama_context_default_params() {
+     return result;
+ }
+ 
++// True for the KV cache types whose flash-attention kernels have a native read path on the
++// HIP/CUDA backends and can therefore be used with SPLIT_MODE_TENSOR (see the gate below).
++// Keep in sync with ggml_cuda_fattn_kv_type_supported() in ggml/src/ggml-cuda/fattn.cu.
++static bool llama_kv_type_has_native_fa(ggml_type type) {
++    switch (type) {
++        case GGML_TYPE_F32:
++        case GGML_TYPE_F16:
++        case GGML_TYPE_BF16:
++        case GGML_TYPE_Q4_0:
++        case GGML_TYPE_Q4_1:
++        case GGML_TYPE_Q5_0:
++        case GGML_TYPE_Q5_1:
++        case GGML_TYPE_Q8_0:
++            return true;
++        default:
++            return false;
++    }
++}
++
+ llama_context * llama_init_from_model(
+                  llama_model * model,
+         llama_context_params   params) {
+@@ -3692,6 +3729,36 @@ llama_context * llama_init_from_model(
          if (model->get_split_state_ud.n_devices == 1) {
              LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
          }
 +
 +        // SPLIT_MODE_TENSOR runs the attention through the flash-attention kernels split across
-+        // the tensor-parallel devices. Those kernels read the quantized K/V cache natively only
-+        // for a subset of quantized types (q4_0/q8_0); for the rest (q4_1 family, iq4_nl, ...)
-+        // the graph cannot express a splittable attention and the meta splitter aborts during
-+        // reserve. This is only a problem when the Meta device is actually used (tensor split
-+        // over >= 2 GPUs; a single-device "tensor" mode skips the Meta wrapper and is fine).
++        // the tensor-parallel devices. Those kernels have a native read path only for a subset of
++        // quantized types (see llama_kv_type_has_native_fa below, which must mirror
++        // ggml_cuda_fattn_kv_type_supported() in ggml/src/ggml-cuda/fattn.cu); for the rest
++        // (iq4_nl, ...) the graph cannot express a splittable attention and the meta splitter
++        // aborts during reserve. This is only a problem when the Meta device is actually used
++        // (tensor split over >= 2 GPUs; a single-device "tensor" mode skips the Meta wrapper and
++        // is fine).
 +        const bool use_meta_device =
 +            [&]() {
 +                for (const auto & dev : model->devices) {
@@ -18036,13 +18155,12 @@ index 21501574a..505901964 100644
 +            }();
 +        if (use_meta_device) {
 +            for (ggml_type type_kv : { params.type_k, params.type_v }) {
-+                if (ggml_is_quantized(type_kv) &&
-+                        type_kv != GGML_TYPE_Q4_0 && type_kv != GGML_TYPE_Q8_0) {
++                if (ggml_is_quantized(type_kv) && !llama_kv_type_has_native_fa(type_kv)) {
 +                    LLAMA_LOG_ERROR("%s: KV cache type %s is not supported with tensor parallelism "
 +                            "(SPLIT_MODE_TENSOR, %zu GPUs): flash attention cannot read this type from a "
 +                            "split KV cache\n", __func__, ggml_type_name(type_kv), model->get_split_state_ud.n_devices);
-+                    LLAMA_LOG_ERROR("%s: use f32/f16/bf16/q8_0/q4_0 KV cache types, or switch to "
-+                            "SPLIT_MODE_LAYER which supports every KV cache type\n", __func__);
++                    LLAMA_LOG_ERROR("%s: use f32/f16/bf16/q4_0/q4_1/q5_0/q5_1/q8_0 KV cache types, "
++                            "or switch to SPLIT_MODE_LAYER which supports every KV cache type\n", __func__);
 +                    return nullptr;
 +                }
 +            }
@@ -19270,7 +19388,7 @@ index 87195fddd..75b9b3493 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8ace95f73..8c5f01113 100644
+index 8ace95f73..ef588d06d 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -5,6 +5,31 @@
@@ -20214,7 +20332,7 @@ index 8ace95f73..8c5f01113 100644
      cb(top_k, "indexer_top_k", il);
  
      return top_k;
-@@ -744,10 +1283,41 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -744,10 +1283,52 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
      ggml_tensor * k = mctx_cur->get_k(ctx0, il);
      ggml_tensor * v = mctx_cur->get_v(ctx0, il);
  
@@ -20230,7 +20348,18 @@ index 8ace95f73..8c5f01113 100644
 +        const char * env = getenv("LLAMA_QSA_SPARSE_FA");
 +        return env == nullptr || std::atoi(env) != 0;
 +    }();
-+    const bool qsa_sparse = qsa_sparse_env && cparams.flash_attn;
++    // The fused sparse kernel reads the K/V cache rows natively, and its load dispatch
++    // covers f16/bf16/q8_0 only (ggml_cuda_flash_attn_qsa_supported() - the same set the
++    // backend exposes for GGML_OP_FLASH_ATTN_QSA).  Every other cache type - including the
++    // quantized q4_0/q4_1/q5_0/q5_1 that plain flash attention does support - must take the
++    // dense masked path below instead: an unsupported qsa op is not split across the
++    // tensor-parallel devices, so its output ends up mirrored while the attention gate stays
++    // hidden-split and the meta splitter aborts on the attn_gated MUL (observed on
++    // qwen4exp + --cache-type-k q4_0/q4_1 + -sm tensor).  This is the same path as
++    // LLAMA_QSA_SPARSE_FA=0, which stays as the A/B knob.
++    const bool qsa_kv_native = k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16 ||
++                               k->type == GGML_TYPE_Q8_0;
++    const bool qsa_sparse = qsa_sparse_env && cparams.flash_attn && qsa_kv_native;
 +
 +    ggml_tensor * cur;
 +
@@ -20260,7 +20389,7 @@ index 8ace95f73..8c5f01113 100644
      cb(cur, "kqv_out", il);
  
      // the rotation is its own inverse, so undo it on the value side of the output
-@@ -768,10 +1338,102 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -768,10 +1349,102 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      const int64_t n_embd_head = hparams.n_embd_head_v();
      GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
  
@@ -20367,7 +20496,7 @@ index 8ace95f73..8c5f01113 100644
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -1035,10 +1697,14 @@ public:
+@@ -1035,10 +1708,14 @@ public:
  
      bool can_reuse(const llm_graph_params & params) override {
          mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
@@ -20383,7 +20512,7 @@ index 8ace95f73..8c5f01113 100644
  
      const llama_model_qwen4exp & pmodel;
  
-@@ -1047,6 +1713,7 @@ public:
+@@ -1047,6 +1724,7 @@ public:
  
      // scratch, reused across set_input() calls
      std::vector<llama_token> prev;
@@ -20391,7 +20520,7 @@ index 8ace95f73..8c5f01113 100644
  };
  
  void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
-@@ -1109,7 +1776,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -1109,7 +1787,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
          }
      }
  
@@ -20459,7 +20588,7 @@ index 8ace95f73..8c5f01113 100644
  }
  
  // Read a conv history out of its own recurrent row and write the new tail back.
-@@ -1176,6 +1902,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+@@ -1176,6 +1913,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
      auto ple_inp = std::make_unique<llm_graph_input_ple>(
              static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
  

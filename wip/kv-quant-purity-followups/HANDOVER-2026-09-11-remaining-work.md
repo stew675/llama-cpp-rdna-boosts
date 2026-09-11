@@ -6,9 +6,12 @@ accumulated trap list. Read §1 (the plan) and §2–§5 (environment + instrume
 
 ## 0. STATUS after the 2026-09-11 session (read this first)
 
-**Items 1 and 5 are DONE, landed and pushed** (canonical tip **`5ad11fd35`**, net tree
-**`3e7accbd7f46c3d196e168a4d29a0350f813f5ff`**; delivery repo `main` has the regeneration, the docs
-sweep and the re-cut beta patch).  Both were the same defect shape — a band gate written
+**Items 1 and 5 are DONE, landed and pushed; ITEM 2's step 1 is DONE too** (canonical tip
+**`6f07fe67a`**, net tree **`0c9dece6b0798e41360b8a8366187f38f37e1566`**; delivery repo `main` has the
+regeneration, the docs sweep and the re-cut beta patch).  Item 2 step 1 (`q4_1`/`q5_0`/`q5_1` as FA
+cache types) landed as a block-08 + block-14 amendment on 2026-09-11 — its outcome section, with the
+chooser trace that settled the mechanism and the pre-existing qwen4exp tensor-split abort it exposed,
+is `HANDOVER-2026-09-11-f3-kv-diagonals.md` §10; **step 2 (`iq4_nl`) is what remains of item 2.**  Both were the same defect shape — a band gate written
 `n_tokens == 1` — and both were proved with an instrument before being fixed:
 
 * **Item 5 (block 13, fourth amendment): the MoE shared-expert epilogue serves the band.**  The gate
@@ -408,6 +411,11 @@ adaptive-MTP gate: acceptance `0.58378` not below, MTP ≥ plain (Protocol A in
 2197–2293 pp512 / 56–64 tg32 versus 7713–7838 / 95–99, because they are rejected by
 `ggml_cuda_fattn_kv_type_supported()` (no native path ⇒ F16 staging scratch). `iq4_nl` is the
 standout: same 1800 MiB as `q4_0`, pure, 3.4× slow — a native `iq4_nl` would obsolete `q4_0`.
+
+**ITEM 2's step 1 is DONE (2026-09-11, block 08 + block 14 amendments).**  The dedicated brief
+`HANDOVER-2026-09-11-f3-kv-diagonals.md` now carries a §10 outcome section (the trace result, what
+landed, the numbers, and what step 2 — `iq4_nl` — still needs).  Everything below is the original
+reconnaissance, kept for step 2:
 
 **Step 1 (the three flag-gated types) now has its own dedicated brief:
 `HANDOVER-2026-09-11-f3-kv-diagonals.md` — read that instead of this section** (it carries the

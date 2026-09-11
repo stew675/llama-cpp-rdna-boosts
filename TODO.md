@@ -108,9 +108,12 @@ Block 15 is STAGED in `beta/block-15-campaign-wins/`, not promoted.
 - **Fork/canonical state**: the working checkout's `rdna-boosts` is a local rebuild and must NOT be used
   for regeneration if it sits on a master newer than the fork point (it would export `f3f1a8f27`
   + `304665fe7` as patches 0001/0002).  The canonical 15-block chain used for the delivery ends at the
-  block-14 commit `5ad11fd35` (rebuilt at `9113cc188`, net tree `3e7accbd7`; block 02 amended 2026-09-11 with the
-  K-independent whole-batch chunked GDN prefill — free, gate removed, + rollback guard); `make-patches.sh`
-  default tip = `5ad11fd35`.
+  block-14 commit `6f07fe67a` (rebuilt at `9113cc188`, net tree `0c9dece6b`; block 02 amended 2026-09-11 with the
+  K-independent whole-batch chunked GDN prefill — free, gate removed, + rollback guard; block 08 with the
+  FA kernel-family fix + the quantized-KV-type enablement — see F3 below; block 13 with the two decode/verify
+  band fixes; block 14 with the QSA decode arm + the QSA-vs-KV-type arm gate + the tensor-split gate
+  narrowing); `make-patches.sh`
+  default tip = `6f07fe67a`.
   The beta block-15 patch is applied manually on top of that tree.
 - Superseded/still-useful artifacts: the work branch `wip/block15-campaign-wins` (`b26ae06f0`) and
   `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch` remain as the pre-merge
@@ -388,8 +391,18 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   reachable).  It also makes `iq4_nl` all-or-nothing (its V side needs `dequantize_V_iq4_nl`), and it
   means F3 must also **narrow block 14's tensor-split gate** (`src/llama-context.cpp` ~3716 rejects
   every quantized KV type except q4_0/q8_0 for multi-GPU `-sm tensor` *because* they have no native
-  path).  **Step 1 (the three flag-gated types) has its own dedicated brief:**
-  `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-f3-kv-diagonals.md` — **read that first.**  It
+  path).  **Step 1 (the three flag-gated types) is DONE 2026-09-11** (block 08 + block 14 amendments; see the
+  2026-09-11 (8) WORKLOG entry): the trace showed the TILE/MMA families already consume every type
+  `ggml_get_to_fp16_cuda` covers (`need_f16_K/V = 1`, i.e. staging) and that the flag-gated types
+  produced **no FA call at all** — the predicate had made the FA probe disable FA for the whole
+  context.  `q4_1`/`q5_0`/`q5_1` are enabled unconditionally with their three diagonal vec instances
+  (4B pp512 2119.6 -> 7366.3, tg32 55.94 -> 94.16; on par with q4_0/q8_0 and within 1 % of f16 on
+  qwen4exp), every diagonal is `W=1..8`-pure on both splits, plain == `n_max 3` == `7` and the MTP gate
+  holds.  Discovered and fixed on the way: qwen4exp + a *quantized* KV type + `-sm tensor` aborted in
+  the meta splitter (**`q4_0` too, pre-existing**) because the graph built the fused QSA op for a type
+  it cannot read; block 14 now takes the dense masked path for non-QSA-native cache types, and the
+  tensor-split gate asks `llama_kv_type_has_native_fa()`.  **Step 1's brief (kept for the record):**
+  `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-f3-kv-diagonals.md`.  It
   also records what is *verified* versus still *open* about the mechanism: the HIP CMake globs the
   TILE/MMA instances unconditionally and gates only VEC, the TILE **launcher converts every non-f16
   (non-bf16) K/V type to f16** (`need_f16_K/V`, `fattn.cu:706`), and every VEC return in the chooser

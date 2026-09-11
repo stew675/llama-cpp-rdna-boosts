@@ -1,41 +1,54 @@
-# FA kernel-chooser/plan trace instrumentation (2026-09-11)
+# FA kernel-chooser/plan trace instrumentation (2026-09-11; launch_fattn placement fixed 2026-09-11)
 #
-# Adds GGML_CUDA_FA_TRACE=1 logging to the FlashAttention kernel-family chooser and to
-# launch_fattn's plan, for n_q <= 8 only:
-#   [FATPATH]  n_q, the chosen family (100=VEC, 200=TILE, 400=MMA_F16), mask presence, K/V types
-#   [FATTRACE] n_q, ncols1/ncols2, stream_k, ntiles_dst/KV, parallel_blocks, the launch grid
-#   [FATTRACE2] n_q, ncols, nwarps, nbatch_fa, need_f16_K/V
+# Adds GGML_CUDA_FA_TRACE=1 logging, for n_q <= 8 only:
+#   [FATPATH]  in ggml_cuda_flash_attn_ext:  n_q, the chosen family (100=VEC, 200=TILE, 400=MMA_F16),
+#              mask presence, K/V types
+#   [FATTRACE] just before the main kernel launch: n_q, ncols(1/2), nwarps, nbatch_fa, stream_k,
+#              sparse, parallel_blocks, the tile counts, n_kv, the launch grid, occupancy/nsm/cc,
+#              mask/sink presence, need_f16_K/V (the launcher's staging copy) and the K/V types
 # Apply with: git apply fa-kernel-chooser-trace.patch   (revert before landing)
-# This is how F1 was localised: with a quantized K/V the chooser returned VEC at n_q<=2 and
-# TILE at n_q>=3, splitting the decode/verify band across two kernel families.
+#
+# How it was used:
+#   * F1 (2026-09-11): a quantized K/V cache returned VEC at n_q<=2 and TILE at n_q>=3, splitting the
+#     decode/verify band across two kernel families.
+#   * F3 step 1 (2026-09-11): f16/q4_0/q8_0 all take TILE with need_f16_K/V=1 (the tile/mma families
+#     consume every type ggml_get_to_fp16_cuda covers through the launcher's staging copy) while
+#     q4_1/q5_0/q5_1 produced NO [FATPATH] line at all - the failed support predicate had made
+#     llama_context::resolve_fused_ops() disable FA for the whole context.  Answering that first is what
+#     turned "port a kernel" into a one-line predicate change; see the F3 handover's section 10.
+#
+# NOTE: the [FATTRACE] print must sit where blocks_num/parallel_blocks/ntiles_KV/n_kv/max_blocks_per_sm
+# are all in scope, i.e. immediately before the ggml_cuda_kernel_launch of fattn_kernel - not in the
+# KV_max block above it (the original placement did not compile against the 2026-09-11 tree).
 
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 22eec7d57..8dc8001e4 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
-@@ -1116,6 +1116,19 @@ void launch_fattn(
-         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
+@@ -1230,6 +1230,18 @@ void launch_fattn(
  
-         KV_max.alloc(ne_KV_max);
+     GGML_ASSERT(block_dim.x % warp_size == 0);
+ 
 +        if (getenv("GGML_CUDA_FA_TRACE") && Q->ne[1] <= 8) {
-+            fprintf(stderr, "[FATTRACE] n_q=%d ncols1=%d ncols2=%d stream_k=%d sparse=%d K=%d V=%d"
-+                    " ntiles_x=%d ntiles_z_gqa=%d ntiles_dst=%d ntiles_KV=%d n_kv=%lld"
-+                    " maxblk_sm=%d nsm=%d par_blocks=%d grid=(%u,%u,%u) name=%s\n",
-+                    (int) Q->ne[1], ncols1, ncols2, (int) stream_k, (int) use_sparse,
-+                    (int) K->type, (int) V->type,
++            fprintf(stderr, "[FATTRACE] n_q=%d ncols=%d ncols1=%d ncols2=%d nwarps=%d nbatch_fa=%d"
++                    " stream_k=%d sparse=%d par_blocks=%d ntiles_x=%d ntiles_z_gqa=%d ntiles_dst=%d"
++                    " ntiles_KV=%d n_kv=%lld grid=(%u,%u,%u) maxblk_sm=%d nsm=%d cc=%x"
++                    " mask=%d sink=%d f16K=%d f16V=%d Kt=%d Vt=%d name=%s\n",
++                    (int) Q->ne[1], ncols, ncols1, ncols2, nwarps, nbatch_fa,
++                    (int) stream_k, (int) use_sparse, (int) parallel_blocks,
 +                    ntiles_x, ntiles_z_gqa, ntiles_dst, ntiles_KV, (long long) n_kv,
-+                    max_blocks_per_sm, nsm, parallel_blocks,
-+                    blocks_num.x, blocks_num.y, blocks_num.z, dst->name);
-+            fprintf(stderr, "[FATTRACE2] n_q=%d ncols=%d nwarps=%d nbatch_fa=%d mask=%d f16K=%d f16V=%d name=%s\n",
-+                    (int) Q->ne[1], ncols, nwarps, nbatch_fa, mask != nullptr ? 1 : 0,
-+                    (int) need_f16_K, (int) need_f16_V, dst->name);
++                    blocks_num.x, blocks_num.y, blocks_num.z, max_blocks_per_sm, nsm, (unsigned) cc,
++                    mask != nullptr ? 1 : 0, sinks != nullptr ? 1 : 0,
++                    (int) need_f16_K, (int) need_f16_V, (int) K->type, (int) V->type, dst->name);
 +        }
-         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
-         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-             (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
+         ggml_cuda_kernel_launch(fattn_kernel, launch_params,
+         (const char *) Q->data,
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 38a977326..95048015e 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -734,6 +733,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -753,6 +753,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
  
  void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      ggml_cuda_set_device(ctx.device);
@@ -47,4 +60,3 @@ diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
      switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
          case BEST_FATTN_KERNEL_NONE:
              GGML_ABORT("fatal error");
-

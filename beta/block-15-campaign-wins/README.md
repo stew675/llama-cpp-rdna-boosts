@@ -24,6 +24,21 @@ now a **15-patch set**: block 00 + blocks 01-14 at canonical tip **`389c5341f`**
 tree `928852cdc`, with block 13 amended twice on 2026-09-11), so the beta patch was
 re-cut and re-validated end to end.
 
+* **Re-cut a sixth time 2026-09-11** after the F3 step-1 amendments moved the canonical tip (block 08
+  gained the quantized KV-type enablement, block 14 the QSA-vs-KV-type arm gate + the tensor-split gate
+  narrowing): base `6f07fe67a` (tree `0c9dece6b`) -> **beta commit `8c377b958`**, tree
+  **`34527a2926246893104015d6ca5d12844b14f037`**.  This one is **not metadata-only**: the block-14
+  amendment reworks the very region block 15 refactored (the arm gate now lives in
+  `qwen4exp_qsa_sparse()`), so the merge threads the KV type in — `llama_cparams` gains
+  `type_k`/`type_v` (filled where the memory module is created) and `qwen4exp_qsa_sparse()` now also
+  requires a QSA-native cache type (f16/bf16/q8_0), taking the dense masked path for every other type
+  exactly like the delivery's inline predicate.  **It is a no-op for every validated beta config**
+  (f16/bf16/q8_0 ⇒ the new conjunct is always true), so no beta number needs re-measuring; the delta
+  is +43 patch lines (`llama-context.cpp` +4, `llama-cparams.h` +3, `qwen4exp.cpp` +22 net).
+  Verified on the re-cut itself: the full tree builds (`build-beta`) and, against the delivery build at
+  the **same** config, the beta's output is byte-identical — qwen4exp f16 plain `804de0576868` (704
+  chars) on both, and 27B f16 `--spec-draft-n-max 3` acceptance **0.82716** (67/81, mean len 3.48) on
+  both; the new type behaves there too (27B `q4_1` acceptance 0.80723 = the delivery's value).
 * **Re-cut a fifth time 2026-09-11** after the two same-day band amendments moved the canonical tip
   again (block 13's fused shared-expert epilogue band, block 14's QSA decode arm): base `5ad11fd35`
   (tree `3e7accbd7`) -> **beta commit `f3ece1e12`**, tree `5316920f13`.  Block 15 touches

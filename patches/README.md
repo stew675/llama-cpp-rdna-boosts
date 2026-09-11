@@ -11,7 +11,11 @@ host-buffer rationale marker comment (see the block-06 note below); block 14's
 quantized-KV tensor-split gate merged additively with upstream #28390's
 single-device `SPLIT_MODE_TENSOR` warn; block 08 amended 2026-09-11 with the decode/verify FlashAttention kernel-family fix
 (F1: a quantized K/V cache used VEC at `n_q <= 2` and TILE from `n_q = 3`, so plain decode disagreed
-with spec-draft-mtp verify — see the block-08 notes below); block 12 amended 2026-09-04 with the runtime
+with spec-draft-mtp verify — see the block-08 notes below), and again 2026-09-11 with the **quantized
+KV-type enablement** (`q4_1`/`q5_0`/`q5_1` become first-class FlashAttention cache types — the
+`GGML_CUDA_FA_ALL_QUANTS`-only types are enabled unconditionally, with their three diagonal vec
+instances — so they stop disabling flash attention for the whole context; see the block-08 notes
+below and `../GREEDY-PURITY.md` §20); block 12 amended 2026-09-04 with the runtime
 NCCL-failure fallback (issue #13, see the block-12 notes
 below); block 13 amended 2026-09-02 with two MTP regression fixes and
 2026-09-05 with the RDNA3.5 (Strix Halo, gfx1151) + RDNA3.0 (gfx1100)
@@ -26,8 +30,12 @@ block-13 notes below; block 14 amended 2026-09-11 with the **QSA decode-arm
 band** (the dense arch-policy arm was gated `n_tokens == 1`, so a W=1 decode and
 an n-token verify took different attention regimes above the indexer selection
 width; the arm now serves the whole decode/verify band, making
-`plain == draft-mtp` byte-identical for `n_max <= 7`) — see the 2026-09-11
-block-14 amendment section below, the MTP
+`plain == draft-mtp` byte-identical for `n_max <= 7`), and again 2026-09-11 with the
+**QSA-vs-KV-type arm gate** (the fused sparse QSA op reads the cache natively for f16/bf16/q8_0 only;
+with any other quantized cache the graph now takes the dense masked path instead of building an op the
+backend cannot split — which is what aborted the meta splitter on qwen4exp + `-sm tensor`, for `q4_0`
+as well) and the **tensor-split gate narrowing** to the types that really have a native FA read path
+— see the 2026-09-11 block-14 amendment section below, the MTP
 baseline gate in
 `../benchmarks/mtp-adaptive-methodology.md`, the Strix record in
 `../wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`, and
@@ -160,6 +168,35 @@ record and the 2026-09-10 Strix Halo (gfx1151) pass live in
 `../beta/block-15-campaign-wins/README.md` and
 `../wip/strix-halo/GATE-2026-09-10-block15-rdna35.md`; the dated
 WORKLOG entries carry the history.
+
+## 2026-09-11 block-14 amendment (third): the QSA arm respects the KV type + the tensor-split gate
+
+Two changes, both needed before `q4_1`/`q5_0`/`q5_1` could be offered as KV cache types under
+multi-GPU `-sm tensor`.
+
+**1. The QSA-vs-dense arm now depends on the cache type.**  `build_attn_qsa`
+(`src/models/qwen4exp.cpp`) chooses between the fused sparse op (`ggml_flash_attn_qsa`, the default)
+and the dense masked path (`LLAMA_QSA_SPARSE_FA=0`), and that choice ignored the KV type.  The fused
+kernel reads the cache rows natively for **f16/bf16/q8_0 only**
+(`ggml_cuda_flash_attn_qsa_supported()`), so with `q4_0`/`q4_1`/`q5_0`/`q5_1` the graph still built a
+`GGML_OP_FLASH_ATTN_QSA` the backend could not run — and under `-sm tensor` that op was never split
+across the tensor-parallel devices while the attention gate still was, so the meta splitter hit
+`GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN)` (`ggml-backend-meta.cpp:538`) on
+`MUL name=attn_gated-<il>`.  This was **pre-existing**, not a consequence of the enablement: `q4_0`,
+which the previous gate allowed, aborted the same way.  `qsa_sparse` now also requires a QSA-native
+cache type, so those types take the dense masked path (exactly `LLAMA_QSA_SPARSE_FA=0`, which remains
+the A/B knob, and which is a no-op numerically for the gfx1201 decode band — the arch policy was
+already dense there, and the `q4_1` probe hash is identical with and without it).  `LLAMA_QSA_OFF=1`
+(a plain-dense reference) and `-sm layer` both avoided the abort too, which is how the mechanism was
+localised.
+
+**2. The tensor-split gate is narrowed.**  `llama_init_from_model` (`src/llama-context.cpp`) rejects,
+for `SPLIT_MODE_TENSOR` with a Meta device, any quantized KV type outside `{q4_0, q8_0}` — it cannot
+ask the backend (it runs before any backend probe), so it carried a hardcoded list.  The list is now
+the helper `llama_kv_type_has_native_fa()` (f32/f16/bf16/`q4_0`/`q4_1`/`q5_0`/`q5_1`/`q8_0`, mirroring
+the backend predicate), the error message lists the allowed set, and `iq4_nl` (and any future
+unlisted type) keeps the clean error instead of an abort.  Verified per type on 3-GPU `-sm tensor`
+(27B, qwen4exp): all six types create a context and run, `iq4_nl` is rejected with the message.
 
 ## 2026-09-11 block-14 amendment: the QSA decode arm is band-uniform
 
@@ -723,6 +760,24 @@ upstream's additions.
 
 ## Block 08 notes
 
+- **Quantized KV-type enablement (2026-09-11, F3 step 1).**  `ggml_cuda_fattn_kv_type_supported()`
+  (`ggml/src/ggml-cuda/fattn.cu`) returned false for `Q4_1`/`Q5_0`/`Q5_1` unless
+  `GGML_CUDA_FA_ALL_QUANTS` was defined, and `llama_context::resolve_fused_ops()`' FlashAttention probe
+  (which asks the backend whether `GGML_OP_FLASH_ATTN_EXT` is supported) then turned flash attention
+  **off for the whole context**: those cache types ran the non-FA attention path, 3.4x slower prefill /
+  1.7x decode (4B pp512 2119.6 / tg32 55.94 vs 7366.3 / 94.16 after).  Nothing was missing on the
+  kernel side — the tile and mma-f16 families stage K/V through `ggml_get_to_fp16_cuda`, which already
+  covers the whole `q4_0/q4_1/q5_0/q5_1/q8_0` set (the trace shows `f16K=1 f16V=1` for `q4_0`/`q8_0`
+  too), and the vec family is instantiated per (K,V) pair.  The three types lose the `#ifndef` guard,
+  the default (non-`FA_ALL_QUANTS`) vec dispatch gains the three diagonal cases and
+  `ggml-{cuda,hip,musa}/CMakeLists.txt` gain the three diagonal instances (3 TUs).
+  `GGML_CUDA_FA_ALL_QUANTS` remains the knob for the 42 *mixed* `K != V` pairs; with it off the chooser
+  still rejects `K != V` before the family decision, so the reachable pair set is exactly the
+  diagonals and the predicate, the dispatch and the instance lists cannot disagree.  The types are
+  band-uniform on gfx1201 by construction (with a quantized cache the whole band takes TILE, block
+  08's F1 fix below); every newly reachable diagonal was swept `W = 1..8` on both splits and both
+  `RS` modes and passed the `plain == draft-mtp` and MTP gates — see the 2026-09-11 (8) WORKLOG entry
+  and `../GREEDY-PURITY.md` §20.
 - **Decode/verify kernel-family fix (2026-09-11, F1).**  `ggml_cuda_get_best_fattn_kernel()`
   (`ggml/src/ggml-cuda/fattn.cu`) used to return the generic **VEC** kernel for small batches — for
   `n_q == 1` when GQA optimizations do not apply, and for `n_q <= 2` whenever K or V is quantized

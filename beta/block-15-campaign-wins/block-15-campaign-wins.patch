@@ -1,4 +1,4 @@
-From f3ece1e123905a98059025a7e7a3c7e8e28f54dc Mon Sep 17 00:00:00 2001
+From 8c377b958d89add4d6b6441973e482f02898f359 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -167,29 +167,29 @@ serves and passes the 16-run gate.  Discrete GPUs are unaffected (they
 report GGML_BACKEND_DEVICE_TYPE_GPU and normally have n_stream == 1).
 ---
  ggml/include/ggml.h                  |  31 ++-
- ggml/src/ggml-alloc.c                |  35 ++++
+ ggml/src/ggml-alloc.c                |  35 +++
  ggml/src/ggml-backend-meta.cpp       |  18 +-
- ggml/src/ggml-cpu/ops.cpp            |  71 ++++++-
- ggml/src/ggml-cuda/fattn-common.cuh  | 209 +++++++++++++++++-
- ggml/src/ggml-cuda/fattn-mma-f16.cuh | 290 ++++++++++++++++++++++---
- ggml/src/ggml-cuda/fattn-qsa.cu      |  47 ++++-
+ ggml/src/ggml-cpu/ops.cpp            |  71 +++++-
+ ggml/src/ggml-cuda/fattn-common.cuh  | 209 ++++++++++++++++-
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh | 290 +++++++++++++++++++++---
+ ggml/src/ggml-cuda/fattn-qsa.cu      |  47 +++-
  ggml/src/ggml-cuda/fattn-tile.cu     |  10 +
  ggml/src/ggml-cuda/fattn-tile.cuh    | 125 +++++++++--
  ggml/src/ggml-cuda/fattn-vec.cuh     |   6 +-
- ggml/src/ggml-cuda/fattn.cu          |  51 +++--
- ggml/src/ggml-cuda/indexer-topk.cu   |  74 +++++--
- ggml/src/ggml.c                      |  99 +++++++--
- src/llama-context.cpp                | 126 ++++++++++-
- src/llama-cparams.h                  |   2 +
- src/llama-graph.cpp                  | 183 +++++++++++-----
- src/llama-graph.h                    |  60 ++++++
- src/llama-kv-cache.cpp               | 189 ++++++++++++++++-
+ ggml/src/ggml-cuda/fattn.cu          |  51 ++++-
+ ggml/src/ggml-cuda/indexer-topk.cu   |  74 ++++--
+ ggml/src/ggml.c                      |  99 ++++++--
+ src/llama-context.cpp                | 130 ++++++++++-
+ src/llama-cparams.h                  |   5 +
+ src/llama-graph.cpp                  | 183 +++++++++++----
+ src/llama-graph.h                    |  60 +++++
+ src/llama-kv-cache.cpp               | 189 +++++++++++++++-
  src/llama-kv-cache.h                 |  20 +-
- src/llama-memory-hybrid-idx.cpp      |  95 ++++++++-
+ src/llama-memory-hybrid-idx.cpp      |  95 +++++++-
  src/llama-memory-hybrid-idx.h        |  17 +-
- src/models/qwen4exp.cpp              | 303 +++++++++++++++++++++++----
- tests/test-backend-ops.cpp           |  49 ++++-
- 23 files changed, 1895 insertions(+), 215 deletions(-)
+ src/models/qwen4exp.cpp              | 325 ++++++++++++++++++++++-----
+ tests/test-backend-ops.cpp           |  49 +++-
+ 23 files changed, 1913 insertions(+), 226 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 1a8e68103..8b9ebb315 100644
@@ -1584,7 +1584,7 @@ index 57a285565..21c8077f8 100644
  #ifdef FLASH_ATTN_AVAILABLE
      const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index b5d8b8139..20af9bd29 100644
+index 38a977326..312d6a7fc 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -166,6 +166,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
@@ -1638,7 +1638,7 @@ index b5d8b8139..20af9bd29 100644
              GGML_ASSERT(use_gqa_opt);
  
              GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
-@@ -511,7 +519,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -531,7 +539,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
  
      // The effective batch size for the kernel can be increased by gqa_ratio.
      // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
@@ -1647,7 +1647,7 @@ index b5d8b8139..20af9bd29 100644
      for (const ggml_tensor * t : {Q, K, V, mask}) {
          if (t == nullptr || ggml_is_quantized(t->type)) {
              continue;
-@@ -710,13 +718,23 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -730,13 +738,23 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
              // the remaining types to F16. BF16 K/V needs native BF16 support.
              const bool use_bf16 = K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_BF16 &&
                  bf16_mma_hardware_available(ggml_cuda_info().devices[device].cc);
@@ -1677,7 +1677,7 @@ index b5d8b8139..20af9bd29 100644
          case BEST_FATTN_KERNEL_VEC:
              need_f16_K = K->type == GGML_TYPE_F32;
              need_f16_V = V->type == GGML_TYPE_F32;
-@@ -749,5 +767,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -769,5 +787,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
  }
  
  bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
@@ -2040,7 +2040,7 @@ index 7ee2c06d8..5f6d2fb85 100644
  
      return result;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 505901964..57ff5c8db 100644
+index 7df231909..ba1689502 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -36,6 +36,18 @@ struct llm_fused_op_probe {
@@ -2152,7 +2152,18 @@ index 505901964..57ff5c8db 100644
      cparams.fused_gdn_ar = true;
      cparams.fused_gdn_ch = true;
      cparams.auto_fgdn    = false;
-@@ -527,19 +615,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -409,6 +497,10 @@ llama_context::llama_context(
+             /*.ctx_type  =*/ cparams.ctx_type,
+             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+         };
++        // the graph builders that choose between quantized-aware attention arms need the same
++        // types the memory module was given (see qwen4exp_qsa_sparse)
++        cparams.type_k = params_mem.type_k;
++        cparams.type_v = params_mem.type_v;
+ 
+         memory.reset(model.create_memory(params_mem, cparams));
+     }
+@@ -527,19 +619,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
              return;
          }
  
@@ -2178,7 +2189,7 @@ index 505901964..57ff5c8db 100644
              GGML_ASSERT(node.il >= 0);
  
              ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
-@@ -559,6 +651,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -559,6 +655,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                  device_mismatch = true;
                  break;
              }
@@ -2208,7 +2219,7 @@ index 505901964..57ff5c8db 100644
          }
  
          if (device_mismatch) {
-@@ -575,6 +690,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -575,6 +694,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
          cparams.auto_fa = false;
      }
  
@@ -2223,7 +2234,7 @@ index 505901964..57ff5c8db 100644
          LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", func);
          resolve(llm_fused_op_gdn_ar_probe, cparams.fused_gdn_ar);
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index 08a1a264f..8b76f2ea5 100644
+index 08a1a264f..e9ad8fb1c 100644
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
 @@ -39,6 +39,8 @@ struct llama_cparams {
@@ -2235,6 +2246,16 @@ index 08a1a264f..8b76f2ea5 100644
      bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
      bool fused_gdn_ch;       // use fused gated delta net (chunked)
      bool auto_fgdn;
+@@ -54,6 +56,9 @@ struct llama_cparams {
+     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
+     bool op_offload;
+     bool kv_unified;
++
++    ggml_type type_k;          // KV cache types, as handed to the memory module (the qwen4exp
++    ggml_type type_v;          // QSA arm selection needs to know what the sparse kernel can read)
+     bool pipeline_parallel;
+ 
+     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
 index 5855393ef..adb3bd69f 100644
 --- a/src/llama-graph.cpp
@@ -3195,10 +3216,10 @@ index 4b30994d1..c5ce4bd51 100644
                         int32_t * dst_derived_from = nullptr,
                         int32_t * dst_derived_lim  = nullptr) const;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8c5f01113..7f1119d38 100644
+index ef588d06d..9a0ba27ca 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -935,20 +935,90 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
+@@ -935,20 +935,101 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
  
  // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
  // one mean-pooled indexer key scores each block; set_input resolves the cache layout
@@ -3251,7 +3272,18 @@ index 8c5f01113..7f1119d38 100644
 +        const char * env = getenv("LLAMA_QSA_SPARSE_FA");
 +        return env == nullptr || std::atoi(env) != 0;
 +    }();
-+    return enabled && cparams.flash_attn;
++    // The fused sparse kernel reads the K/V cache rows natively and its load dispatch covers
++    // f16/bf16/q8_0 only - the set ggml_cuda_flash_attn_qsa_supported() exposes for
++    // GGML_OP_FLASH_ATTN_QSA.  Any other cache type, including the quantized
++    // q4_0/q4_1/q5_0/q5_1 that plain flash attention does support, must take the dense masked
++    // path instead (the same path as LLAMA_QSA_SPARSE_FA=0): an unsupported qsa op is not split
++    // across the tensor-parallel devices, so its output stays mirrored while the attention gate
++    // remains hidden-split and the meta splitter aborts on the attn_gated MUL (observed with
++    // qwen4exp + --cache-type-k q4_0/q4_1 + -sm tensor).  That path reads the kq mask, so the
++    // derived-visibility/mask-elision arm is off with it (qwen4exp_want_derived_vis below).
++    const bool kv_native = cparams.type_k == GGML_TYPE_F16 || cparams.type_k == GGML_TYPE_BF16 ||
++                           cparams.type_k == GGML_TYPE_Q8_0;
++    return enabled && cparams.flash_attn && kv_native;
 +}
 +
 +// the mask may be dropped (never created, hence never allocated) only when nothing in the graph
@@ -3293,7 +3325,7 @@ index 8c5f01113..7f1119d38 100644
          }
      }
  
-@@ -968,13 +1038,34 @@ public:
+@@ -968,13 +1049,34 @@ public:
  
          res &= params.ubatch.n_tokens % n_stream == 0;
  
@@ -3330,7 +3362,7 @@ index 8c5f01113..7f1119d38 100644
  
          return res;
      }
-@@ -987,11 +1078,28 @@ public:
+@@ -987,11 +1089,28 @@ public:
      ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
      ggml_tensor * rng       = nullptr;   // I32 [2*n_stream] derived-cache range leaf (decode only)
  
@@ -3359,7 +3391,7 @@ index 8c5f01113..7f1119d38 100644
  };
  
  ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
-@@ -1020,9 +1128,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1020,9 +1139,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
      // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
      // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
@@ -3393,7 +3425,7 @@ index 8c5f01113..7f1119d38 100644
  
      // env gates (per-process, read once): the fused INDEXER_SCORE op + the incremental derived
      // cache are the DEFAULT decode path (parity-verified byte-identical to the per-op chain);
-@@ -1045,13 +1174,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1045,13 +1185,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      if (it != qsa_inps.end()) {
          inp = it->second;
      } else {
@@ -3419,7 +3451,7 @@ index 8c5f01113..7f1119d38 100644
          if (idx_cache && n_stream == 1) {
              // per-step derived fill range leaf: [from_s, lim_s] (one stream in decode)
              qsa->rng = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 2);
-@@ -1060,7 +1199,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1060,7 +1210,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          ggml_set_input(qsa->cell_blk);
          ggml_set_input(qsa->blk_cells);
          ggml_set_input(qsa->blk_pos);
@@ -3438,7 +3470,7 @@ index 8c5f01113..7f1119d38 100644
          if (qsa->rng != nullptr) {
              ggml_set_input(qsa->rng);
          }
-@@ -1174,23 +1323,70 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1174,23 +1334,70 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
  
          // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
          // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
@@ -3523,7 +3555,7 @@ index 8c5f01113..7f1119d38 100644
              score = ggml_add(ctx0, score, inp->bias);
          }
      }
-@@ -1206,7 +1402,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1206,7 +1413,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      // kernel reads it as [n_kv, n_tps, n_stream] and no per-layer copy is needed
      ggml_tensor * additive = blk_bias ? kq_mask : inp->bias;
  
@@ -3539,7 +3571,7 @@ index 8c5f01113..7f1119d38 100644
      cb(top_k, "indexer_top_k", il);
  
      return top_k;
-@@ -1251,8 +1454,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1251,8 +1465,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
      }
  
@@ -3571,7 +3603,7 @@ index 8c5f01113..7f1119d38 100644
      // prepare new kq mask - starts filled with -INFINITY
      ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
  
-@@ -1278,21 +1503,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1278,32 +1514,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
  
      // combine with the original kq mask
      kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
@@ -3589,12 +3621,23 @@ index 8c5f01113..7f1119d38 100644
 -        const char * env = getenv("LLAMA_QSA_SPARSE_FA");
 -        return env == nullptr || std::atoi(env) != 0;
 -    }();
--    const bool qsa_sparse = qsa_sparse_env && cparams.flash_attn;
+-    // The fused sparse kernel reads the K/V cache rows natively, and its load dispatch
+-    // covers f16/bf16/q8_0 only (ggml_cuda_flash_attn_qsa_supported() - the same set the
+-    // backend exposes for GGML_OP_FLASH_ATTN_QSA).  Every other cache type - including the
+-    // quantized q4_0/q4_1/q5_0/q5_1 that plain flash attention does support - must take the
+-    // dense masked path below instead: an unsupported qsa op is not split across the
+-    // tensor-parallel devices, so its output ends up mirrored while the attention gate stays
+-    // hidden-split and the meta splitter aborts on the attn_gated MUL (observed on
+-    // qwen4exp + --cache-type-k q4_0/q4_1 + -sm tensor).  This is the same path as
+-    // LLAMA_QSA_SPARSE_FA=0, which stays as the A/B knob.
+-    const bool qsa_kv_native = k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16 ||
+-                               k->type == GGML_TYPE_Q8_0;
+-    const bool qsa_sparse = qsa_sparse_env && cparams.flash_attn && qsa_kv_native;
 -
      ggml_tensor * cur;
  
      if (qsa_sparse) {
-@@ -1304,7 +1520,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1315,7 +1531,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          k = ggml_permute(ctx0, k, 0, 2, 1, 3);
          v = ggml_permute(ctx0, v, 0, 2, 1, 3);
  
@@ -3606,7 +3649,7 @@ index 8c5f01113..7f1119d38 100644
          ggml_flash_attn_qsa_set_prec(cur, GGML_PREC_F32);
          cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
          cb(cur, "kqv_out", il);
-@@ -1431,7 +1650,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -1442,7 +1661,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
              // the W=1 decode (see QSA_DECODE_BAND above).
              build_qsa_store_k(mctx_hyb, cur, il);
          } else {

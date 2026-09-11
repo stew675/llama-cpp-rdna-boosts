@@ -711,3 +711,28 @@ attention/GEMM throughput cannot pay for a lower acceptance rate.
 Corollary for tuning: an apparent "win" measured before a purity fix (e.g. a dense/sparse crossover
 depth, or a fusion's "+x % decode") may have been measured with a *width-dependent* path, which is
 exactly what happened to the gfx1151 QSA crossover below.
+
+## 20. A newly enabled KV-cache type is a new kernel family (2026-09-11, F3 step 1)
+
+The band guarantee is a property of *every* op on the decode/verify path, and a KV-cache type is one
+of the inputs that selects an op.  `q4_1`/`q5_0`/`q5_1` were enabled as FlashAttention cache types on
+2026-09-11 (block 08; `GGML_CUDA_FA_ALL_QUANTS` was the only way to reach them before, and that flag
+also permits *mixed* K/V pairs).  Each newly reachable (K,V) diagonal is therefore treated exactly
+like a new kernel family: it gets its own `W = 1..8` sweep on every split (plus `RS=0`/`RS=from_w`),
+its own `plain == draft-mtp` text gate and its own MTP acceptance reading before it is offered.
+
+Two consequences worth recording:
+
+* **On gfx1201 the enabled types are band-uniform by construction** — with a quantized cache the whole
+  band takes `BEST_FATTN_KERNEL_TILE` with the launcher's f16 staging (`need_f16_K/V = 1`), and the
+  guard that made that true is block 08's F1 fix (§14).  A quantized cache never reaches the vec
+  family on this arch, so the new diagonal instances exist for the *other* backends (where the chooser
+  still picks VEC for small `n_q`) and for consistency with the predicate.
+* **A type the model's *other* attention ops cannot read is a correctness trap, not just a
+  performance one.**  qwen4exp + a quantized cache + `-sm tensor` aborted in the meta splitter
+  (`GGML_BACKEND_SPLIT_AXIS_UNKNOWN` on the `attn_gated` MUL): the graph kept building the fused sparse
+  QSA op for a type its kernel cannot read (f16/bf16/q8_0 only), so that op was never split across the
+  devices while the attention gate still was.  Block 14 now takes the dense masked path whenever the
+  cache type is not QSA-native.  The lesson generalises: when a cache type is enabled for one
+  attention op, check every op that consumes the cache in that graph (and every split mode).
+

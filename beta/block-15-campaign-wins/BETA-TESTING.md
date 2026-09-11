@@ -183,6 +183,25 @@ re-apply on the new base reproduces the recorded tree exactly.
 
 ---
 
+**Re-cut 2026-09-11 (sixth), after the F3 step-1 amendments.**  The canonical tip moved from
+`5ad11fd35` (tree `3e7accbd7`) to **`6f07fe67a`** (tree `0c9dece6b`) because block 08 gained the
+quantized KV-type enablement (`q4_1`/`q5_0`/`q5_1` as FlashAttention cache types) and block 14 the
+QSA-vs-KV-type arm gate + the tensor-split gate narrowing.  Block 15 patches the same
+`build_attn_qsa` region, so `git am -3` stops with a real conflict this time and the merge is
+functional, not just offset arithmetic: the KV types travel through the graph via two new
+`llama_cparams` fields and `qwen4exp_qsa_sparse()` gains the same "QSA can read this type" conjunct the
+delivery carries inline.  **Every beta config in this document uses f16 or q8_0 KV, for which the new
+conjunct is unconditionally true, so the recorded numbers stand** — but unlike the previous re-cuts the
+patch body really does differ (+43 lines) — but the re-cut was checked: the tree builds and, at the
+gate configs, the beta output equals the delivery's byte for byte (qwen4exp f16 plain `804de0576868`,
+27B f16 `n_max 3` acceptance `0.82716` including the mean length; 27B `q4_1` `0.80723`).
+
+* base `6f07fe67a` (tree `0c9dece6b`) -> **beta commit `8c377b958d89add4d6b6441973e482f02898f359`**,
+  tree `34527a2926246893104015d6ca5d12844b14f037`
+* a plain `git am` fails (as in the fifth re-cut, and for the same reason) — **use `git am -3`**
+
+---
+
 **Re-cut 2026-09-11 (fifth), after the two same-day band amendments.**  The canonical tip moved from
 `bfaa83d8a` (tree `4e5f2952f`) to `5ad11fd35` (tree `3e7accbd7`) because block 13 gained the fused
 shared-expert epilogue band (`mmvq.cu`, `ggml-cuda.cu`) and block 14 the QSA decode arm

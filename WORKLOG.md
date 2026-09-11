@@ -1,5 +1,71 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-11 (8) — F3 step 1: `q4_1`/`q5_0`/`q5_1` become first-class KV cache types
+
+**Canonical tip `6f07fe67a`** (block 08 `1a488fcf0`, block 14 `6f07fe67a`), net tree
+`0c9dece6b0798e41360b8a8366187f38f37e1566`, 15 blocks, clean-apply strict 15/15 with 0 whitespace
+warnings and the applied tree equal to the canonical one.  Two blocks amended: 08 (the FlashAttention
+KV-type enablement) and 14 (the QSA-vs-KV-type arm + the tensor-split gate).
+
+**Step 0 of the job was an instrument, not code.**  `--cache-type-k/v q4_1|q5_0|q5_1` were width-pure
+and cheap (27B, ctx 204800: 1375/1512/1650 MiB vs 2337 `q8_0` / 4400 f16) but 3.4x slower prefill and
+1.7x decode.  The `[FATPATH]`/`[FATTRACE]` trace settled the mechanism: f16/`q4_0`/`q8_0` take
+`BEST_FATTN_KERNEL_TILE` at every width **with `need_f16_K/V = 1`** — i.e. the launcher stages f16
+copies and the tile/mma families consume every type `ggml_get_to_fp16_cuda` covers — while `q4_1`
+produced **no FA call at all**, because `ggml_cuda_fattn_kv_type_supported()` returned false and
+`llama_context::resolve_fused_ops()`' FlashAttention probe then disabled FA for the whole context (the
+non-FA attention path).  So the fix is not a new kernel: it is to let the FA path accept the types and
+keep the vec family's instance list consistent.
+
+**Block 08 (second 2026-09-11 amendment): the three types are enabled.**  `Q4_1`/`Q5_0`/`Q5_1` lose
+their `#ifndef GGML_CUDA_FA_ALL_QUANTS` guard, the default vec dispatch gains the three diagonal cases,
+and `ggml-{cuda,hip,musa}/CMakeLists.txt` gain the three diagonal instances (3 TUs).  `FA_ALL_QUANTS`
+stays the knob for the 42 *mixed* `K != V` pairs; with it off the chooser still enforces `K == V`, so
+the reachable pair set is exactly the diagonals and the predicate cannot disagree with the instances.
+Measured (4B, 1 GPU, pp512/tg32): `q4_1` **2119.6/55.94 -> 7366.3/94.16** (+248 %/+68 %), on par with
+`q4_0` (7376.0/93.9) and `q8_0` (7337.7/93.8); qwen4exp 3-GPU `-sm tensor` `q4_1` within 1 % of f16 at
+every width (pp512 476.1, tg pl=1 40.60 / pl=4 126.44 / pl=8 176.16).
+
+**Block 14 (third 2026-09-11 amendment): qwen4exp's QSA arm respects the KV type, and the tensor-split
+gate is narrowed.**  Narrowing the gate alone was not enough — qwen4exp + a *quantized* KV cache +
+`-sm tensor` **aborted** (`ggml-backend-meta.cpp:538`, `ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN`)
+— and it aborted for **`q4_0` too**, which the delivery's own gate allowed: this is a pre-existing bug,
+not a consequence of the enablement.  Instrumented, the op with the unknown split state is
+`MUL name=attn_gated-<il>`, whose sources are the (mirrored) attention output and the hidden-split
+attention gate.  The graph built `GGML_OP_FLASH_ATTN_QSA` for a cache type the fused QSA kernel cannot
+read (`ggml_cuda_flash_attn_qsa_supported()`: f16/bf16/q8_0 only), so the op was never split and the
+split states stopped agreeing.  `LLAMA_QSA_OFF=1` and `LLAMA_QSA_SPARSE_FA=0` both made it work; the fix
+takes the dense masked path whenever the cache type is not QSA-native (`qsa_sparse` now also requires
+f16/bf16/q8_0).  The tensor-split gate is narrowed to the types that really have a native FA read path
+(`llama_kv_type_has_native_fa`, mirroring the backend predicate), which turns the pre-existing `q4_0`
+abort into the clean error; the message lists the allowed set.  On dense models the newly enabled types
+split fine (`27B` + `q4_1`/`q5_0`/`q5_1` + 3-GPU `-sm tensor` validated), and on qwen4exp only the
+*fused sparse* prefill arm is given up for quantized caches — the decode band was already dense there
+by arch policy, so its logits are unchanged (the `q4_1` probe hash is identical with and without
+`LLAMA_QSA_SPARSE_FA=0`).
+
+**Validation (gfx1201, per type).**  Width purity (probe, P=256, `W=1..8`, `CB=0`, `RS=0` and
+`RS=from_w`) on 4B/1-GPU, 27B/`-sm layer`, 27B/`-sm tensor`, MoE-35B-A3B/1-GPU, gemma-4-E4B (SWA)/1-GPU
+and qwen4exp/`-sm tensor`: **one hash per (model, split, RS)** for f16/`q4_0`/`q4_1`/`q5_0`/`q5_1`/`q8_0`,
+with every pre-existing value reproducing its recorded reference (`671d6096987470cb` 4B f16,
+`31a0c1bace68e211` 4B q8_0, `619c151e48c76613` 4B q4_0, `4089b4d40b91090c` 27B layer f16,
+`91434ea90f2cbfa0` 27B tensor f16, `d4156dbeb2252022` 27B tensor q8_0, `ac8825358d9adfda` MoE f16,
+`dcf1ae667f730879` qwen4exp tensor f16).  Greedy purity: 27B and qwen4exp, `plain` ==
+`--spec-draft-n-max 3` == `7` byte-identical for `q4_1`/`q5_0`/`q5_1` (qwen4exp `q4_1`
+`42dfe66f25ed`, qwen4exp `q8_0` control `75d8530c5bb1` = the recorded item-1 value, 27B `q5_0`
+`baca8ae6b30e`, 27B `q5_1` `675a1aa57b90`).  MTP gate: qwen4exp `q4_1` pos-1 acceptance **0.628**
+(`q8_0` 0.700) with 61.2 t/s vs plain 45.9; 27B `q4_1` **0.893** (`q8_0` 0.962) with 85.7 vs 36.9 t/s.
+`test-backend-ops -o FLASH_ATTN_EXT` **5599/5599** (up from 4591/4591 — the new pairs are now covered)
+and `-o GATED_DELTA_NET` 4/4.  Coherence: 4B 3-GPU `-sm tensor` same-seed `1c5d32ac537d` on both the
+canonical and the clean-apply sim build.  The block-15 beta patch was re-cut a sixth time on the new
+tip (**base `6f07fe67a` -> beta commit `8c377b958`**, tree `34527a292`) — this re-cut is *not*
+metadata-only: the merge threads the KV type into block 15's refactored `qwen4exp_qsa_sparse()` via new
+`llama_cparams::type_k/type_v` fields, and it is a no-op for every validated beta config (f16/bf16/q8_0).
+
+**Next (F3 step 2):** `iq4_nl` (same memory class as `q4_0`, but no V-side dequant at all in the FA
+kernels — needs `dequantize_V_iq4_nl` + an instance + the vec/cross-product instance decision + the
+same sweeps); see `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-f3-kv-diagonals.md`.
+
 ## 2026-09-11 (7) — the QSA decode arm and the MoE shared-expert epilogue are band-uniform
 
 **Canonical tip `5ad11fd35`** (block 13 `ee6b7d53d`, block 14 `5ad11fd35`), net tree

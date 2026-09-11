@@ -16,7 +16,14 @@
 > block 14's QSA decode arm): base `5ad11fd35` (tree `3e7accbd7`) -> **beta commit `f3ece1e12`**, tree
 > `5316920f13`.  This one needs **`git am -3`** (block 15 patches `src/models/qwen4exp.cpp`, where the
 > block-14 amendment added 9 lines); the patch body is otherwise unchanged (3722 lines, only the `From`
-> line and the `qwen4exp.cpp` hunk headers differ), so no beta number needs re-measuring.
+> line and the `qwen4exp.cpp` hunk headers differ), so no beta number needs re-measuring.  **Re-cut a
+> sixth time 2026-09-11** after the F3 step-1 amendments (block 08's quantized KV-type enablement,
+> block 14's QSA-vs-KV-type arm gate + tensor-split gate): base `6f07fe67a` (tree `0c9dece6b`) ->
+> **beta commit `8c377b958`**, tree `34527a292`.  This one is **functional**, not metadata-only — the
+> merge threads the KV type through block 15's refactored `qwen4exp_qsa_sparse()` (new
+> `llama_cparams::type_k/type_v`), which is a no-op for every f16/q8_0 beta config: the tree builds and
+> the beta output is byte-identical to the delivery's at the gate configs (qwen4exp f16 plain
+> `804de0576868`; 27B f16 `n_max 3` acceptance `0.82716`), so the recorded numbers stand.
 > The dependent delta was exactly one file
 > (`fattn-common.cuh`), the textual apply was clean, every 2026-09-10 number
 > reproduced to the last decimal, and three **pre-existing** follow-ups were

@@ -64,14 +64,19 @@ Consequences for the design:
 
 ## 2. State you are starting from
 
-* **Canonical fork**: `/tmp/canon-llama`, branch `rdna-boosts`, tip **`5ad11fd35`**, net tree
-  **`3e7accbd7f46c3d196e168a4d29a0350f813f5ff`**, 15 blocks (00-14), clean, `build-base` built.
+* **Canonical fork**: `/tmp/canon-llama`, branch `rdna-boosts`, tip **`6f07fe67a`**, net tree
+  **`0c9dece6b0798e41360b8a8366187f38f37e1566`**, 15 blocks (00-14), clean, `build-base` built.
+  (Step 1 landed on 2026-09-11: **block 08 was amended** with the enablement — the predicate, the vec
+  dispatch and the three diagonal instances in `ggml-{cuda,hip,musa}/CMakeLists.txt` — and **block 14
+  twice more**: the QSA-vs-KV-type arm gate and the `llama_kv_type_has_native_fa()` tensor-split gate.)
   *(If `/tmp` was wiped, rebuild it: clone at `9113cc188`, `scripts/apply-all.sh`, then
   `BUILD_DIR=build-base EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` — the
   `EXTRA_CMAKE_FLAGS` override is required on CMake ≥ 4.3.)*
 * **Delivery repo**: `~/llama-cpp-rdna-boosts`, `main` == `origin/main` == **the commit that contains
-  this file** (pushed), 15 patches `0000`-`0014`, `make-patches.sh` default tip `5ad11fd35`.
-* **Block 15 beta**: base `5ad11fd35` → beta commit `f3ece1e12`, tree `5316920f13`; **any block
+  this file** (pushed), 15 patches `0000`-`0014`, `make-patches.sh` default tip `6f07fe67a`.
+* **Block 15 beta**: base `6f07fe67a` → beta commit `8c377b958`, tree `34527a292` (sixth re-cut,
+  2026-09-11; the merge threads the KV type through block 15's `qwen4exp_qsa_sparse()` via new
+  `llama_cparams::type_k/type_v` fields); **any block
   amendment invalidates it and it must be re-cut** (`beta/block-15-campaign-wins/`, `HANDOVER.md`
   §10.5; note it now needs `git am -3`).
 * **Reference state**: the fork's FA story is *already* fork-specific — block 08's F1 amendment made
@@ -107,6 +112,15 @@ Consequences for the design:
    cause as the slowness, so F3 step 1 also **narrows this gate** (§8).
 
 ## 4. FIRST TASK (before any code): establish which path these types need
+
+> **ANSWERED 2026-09-11 — see §10 for the result and what step 1 landed.**  Short version: the AMD band
+> takes `BEST_FATTN_KERNEL_TILE` with the launcher's f16 staging (`need_f16_K/V = 1`) for *every*
+> quantized cache type the predicate accepts, and the flag-gated types produced **no FA call at all**
+> (the failed probe disabled FA for the whole context).  That is **case A/B crossed**: no new kernel is
+> needed (the staging path covers these types), the enablement is the predicate + the vec dispatch +
+> three diagonal instances, and the interesting work turned out to be a *pre-existing* qwen4exp
+> tensor-split abort that the enablement exposed.  The instrument recipe below is kept for step 2
+> (`iq4_nl`), where the family question is still open.
 
 The design is *not* settled by the source alone — points 3-5 above leave a real ambiguity: if the
 AMD band always lands on TILE (which converts to f16), then flipping the predicate buys **nothing**, and
@@ -212,3 +226,52 @@ narrowing, and a dated `WORKLOG.md` entry.  **Then** hand back with a short note
 * `git checkout -- <path>` restores from the **index** — check `git status --porcelain` (first column =
   staged) and `git reset` first if a leftover was staged.
 * The block-15 beta patch needs `git am -3` since the block-14 amendment.
+
+## 10. OUTCOME — step 1 landed 2026-09-11 (addendum by the session that did it)
+
+**What the trace said** (`GGML_CUDA_FA_TRACE=1`, 4B, `W=8`, `P=256`):
+
+| KV type | `BEST_FATTN_KERNEL_*` | `need_f16_K/V` | note |
+|---|---|---|---|
+| f16 | TILE (200) | 0/0 | native |
+| `q8_0` | TILE (200) | 1/1 | **staged**, not native |
+| `q4_0` | TILE (200) | 1/1 | **staged**, not native |
+| `q4_1` | *no FA call* | — | `ggml_cuda_fattn_kv_type_supported()` false ⇒ `resolve_fused_ops()`'s FA probe disabled FA for the context |
+
+So the "supported" types were never native either: the tile/mma families read what
+`ggml_get_to_fp16_cuda` covers through the launcher's staging copy, and the vec family (the only
+per-(K,V)-pair family) is not reachable on AMD at all — every VEC return in the chooser sits in a
+`turing_mma_available`/`volta_mma_available` branch.  The three types therefore needed **no new
+kernel**: the predicate, the default vec dispatch list and the three diagonal instance lists had to be
+made consistent, and that is the whole block-08 amendment.
+
+**What landed**
+
+* **Block 08 (second 2026-09-11 amendment)**: `Q4_1`/`Q5_0`/`Q5_1` lose the
+  `#ifndef GGML_CUDA_FA_ALL_QUANTS` guard; the non-`FA_ALL_QUANTS` branch of
+  `ggml_cuda_flash_attn_ext_vec` gains the three diagonal cases; `ggml-{cuda,hip,musa}/CMakeLists.txt`
+  gain the three diagonal instances.  `FA_ALL_QUANTS` keeps its meaning for the mixed `K != V` pairs,
+  and K==V stays enforced without it.
+* **Block 14 (third 2026-09-11 amendment)**: (a) `qsa_sparse` in `build_attn_qsa` now also requires a
+  QSA-native cache type (f16/bf16/`q8_0`), because with any other type the graph built a
+  `GGML_OP_FLASH_ATTN_QSA` the backend cannot run — under `-sm tensor` that op was never split, so its
+  output stayed mirrored while the attention gate stayed hidden-split and the meta splitter aborted on
+  `MUL name=attn_gated-<il>` (`ggml-backend-meta.cpp:538`).  `q4_0` hit this too: **the previous gate's
+  allowance was wrong, not just incomplete**.  (b) `llama_init_from_model`'s tensor-split gate now uses
+  `llama_kv_type_has_native_fa()` (f32/f16/bf16/`q4_0`/`q4_1`/`q5_0`/`q5_1`/`q8_0`), so the three new
+  types are allowed and `iq4_nl` keeps a clean error.
+
+**Numbers** (details in the 2026-09-11 (8) `WORKLOG.md` entry): 4B pp512/tg32 `q4_1`
+2119.6/55.94 -> **7366.3/94.16**; qwen4exp 3-GPU `-sm tensor` `q4_1` within 1 % of f16 everywhere;
+`W=1..8` pure on 4B/27B(both splits)/MoE/gemma(SWA)/qwen4exp for all six types; plain == `n_max 3`
+== `7` for the three new types on 27B and qwen4exp; MTP pos-1 acceptance `q4_1` 0.628 (qwen4exp) /
+0.893 (27B); `FLASH_ATTN_EXT` 5599/5599.
+
+**What is left: step 2 = `iq4_nl`.**  It is *not* the same shape as step 1: `iq4_nl` is rejected by
+`ggml_cuda_fattn_kv_type_supported()`'s `default:` clause (so the predicate change above does not reach
+it), it has no vec instance, and — the real work — **no V-side dequant**: the seven
+`dequantize_V_*` in `fattn-common.cuh` stop at `q8_0`.  So step 2 = `dequantize_V_iq4_nl` + a
+`fattn-vec-instance-iq4_nl-iq4_nl.cu` (+ the CMake entry, in all three backends) + the predicate case +
+the same sweeps *and* the `-sm tensor` type verification.  The [F3 handover's §3 facts] still hold, and
+the block-15 beta already carries a per-operand native-KV staging type code
+(`FATTN_KV_NATIVE_{NONE,Q8_0,BF16}`) if a *native* (non-staged) path is wanted instead.
