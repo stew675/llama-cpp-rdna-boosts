@@ -403,8 +403,10 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   it cannot read; block 14 now takes the dense masked path for non-QSA-native cache types, and the
   tensor-split gate asks `llama_kv_type_has_native_fa()`.  Two follow-ups it left behind: (a) on
   qwen4exp, quantized caches now use the **masked-dense prefill** for the indexer layers instead of the
-  fused sparse QSA op — restoring it needs `fattn-qsa` to read those types natively (the same work as
-  step 2), see the third 2026-09-11 block-14 amendment section in `patches/README.md`; (b) the *other*
+  fused sparse QSA op (**~13.8 % of long-context prefill**, measured 2026-09-11) — restoring it needs
+  `fattn-qsa` to read those types natively; **it is the next session's task and has its own brief:
+  `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-qsa-quantized-kv.md`** (see also the third
+  2026-09-11 block-14 amendment section in `patches/README.md`); (b) the *other*
   backends (NVIDIA) reach the vec family for these types at small `n_q`, where the F1-style
   VEC-vs-TILE band split still exists upstream — not touched here (the fork's band guarantee is
   gfx1201's TILE path), worth revisiting if the fork is ever validated on NVIDIA.

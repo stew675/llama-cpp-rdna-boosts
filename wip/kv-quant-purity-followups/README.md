@@ -1,5 +1,8 @@
 # KV-quant purity and parity follow-ups (found 2026-09-11)
 
+> **Starting the QSA-quantized-KV work (the current task)?** Read
+> **`HANDOVER-2026-09-11-qsa-quantized-kv.md`** — the measured prize, the verified mechanism facts, the
+> gate list and the landing steps for restoring the fused sparse QSA path on quantized caches.
 > **Starting the F3 (KV-diagonal) work?** Read
 > **`HANDOVER-2026-09-11-f3-kv-diagonals.md`** — scope, the verified-vs-open mechanism facts, and the
 > "instrument before coding" first task.  **Starting anything else?** Read

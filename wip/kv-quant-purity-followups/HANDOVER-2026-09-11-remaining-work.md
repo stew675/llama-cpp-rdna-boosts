@@ -11,7 +11,9 @@ accumulated trap list. Read §1 (the plan) and §2–§5 (environment + instrume
 regeneration, the docs sweep and the re-cut beta patch).  Item 2 step 1 (`q4_1`/`q5_0`/`q5_1` as FA
 cache types) landed as a block-08 + block-14 amendment on 2026-09-11 — its outcome section, with the
 chooser trace that settled the mechanism and the pre-existing qwen4exp tensor-split abort it exposed,
-is `HANDOVER-2026-09-11-f3-kv-diagonals.md` §10; **step 2 (`iq4_nl`) is what remains of item 2.**  Both were the same defect shape — a band gate written
+is `HANDOVER-2026-09-11-f3-kv-diagonals.md` §10; **step 2 (`iq4_nl`) is what remains of item 2** — but
+the *next* session's task is `HANDOVER-2026-09-11-qsa-quantized-kv.md` (restoring the fused sparse QSA
+path for the quantized caches, worth ~13.8 % of long-context qwen4exp prefill), with `iq4_nl` after it.  Both were the same defect shape — a band gate written
 `n_tokens == 1` — and both were proved with an instrument before being fixed:
 
 * **Item 5 (block 13, fourth amendment): the MoE shared-expert epilogue serves the band.**  The gate

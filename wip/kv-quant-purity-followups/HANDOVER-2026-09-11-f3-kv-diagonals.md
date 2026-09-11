@@ -267,7 +267,12 @@ made consistent, and that is the whole block-08 amendment.
 == `7` for the three new types on 27B and qwen4exp; MTP pos-1 acceptance `q4_1` 0.628 (qwen4exp) /
 0.893 (27B); `FLASH_ATTN_EXT` 5599/5599.
 
-**What is left: step 2 = `iq4_nl`.**  It is *not* the same shape as step 1: `iq4_nl` is rejected by
+**The follow-on task has its own brief:** restoring the **fused sparse QSA path for the quantized
+types** on qwen4exp (the block-14 gate currently forces the dense masked path there, which costs ~13.8 %
+of long-context prefill) is `HANDOVER-2026-09-11-qsa-quantized-kv.md` — read that next; this file's
+step 2 (`iq4_nl`) comes after it and ends in the same place.
+
+**What is left here: step 2 = `iq4_nl`.**  It is *not* the same shape as step 1: `iq4_nl` is rejected by
 `ggml_cuda_fattn_kv_type_supported()`'s `default:` clause (so the predicate change above does not reach
 it), it has no vec instance, and — the real work — **no V-side dequant**: the seven
 `dequantize_V_*` in `fattn-common.cuh` stop at `q8_0`.  So step 2 = `dequantize_V_iq4_nl` + a
