@@ -409,6 +409,11 @@ adaptive-MTP gate: acceptance `0.58378` not below, MTP ≥ plain (Protocol A in
 `ggml_cuda_fattn_kv_type_supported()` (no native path ⇒ F16 staging scratch). `iq4_nl` is the
 standout: same 1800 MiB as `q4_0`, pure, 3.4× slow — a native `iq4_nl` would obsolete `q4_0`.
 
+**Step 1 (the three flag-gated types) now has its own dedicated brief:
+`HANDOVER-2026-09-11-f3-kv-diagonals.md` — read that instead of this section** (it carries the
+verified-vs-open mechanism facts and the instrument-before-coding first task).  The reconnaissance
+below is the raw material it was built from:
+
 **Reconnaissance (done 2026-09-11 — read this before building anything):**
 
 * **The build flag only covers three of the four types.**  `ggml_cuda_fattn_kv_type_supported()`

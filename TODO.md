@@ -388,7 +388,14 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   reachable).  It also makes `iq4_nl` all-or-nothing (its V side needs `dequantize_V_iq4_nl`), and it
   means F3 must also **narrow block 14's tensor-split gate** (`src/llama-context.cpp` ~3716 rejects
   every quantized KV type except q4_0/q8_0 for multi-GPU `-sm tensor` *because* they have no native
-  path) — see the handover §8.
+  path).  **Step 1 (the three flag-gated types) has its own dedicated brief:**
+  `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-f3-kv-diagonals.md` — **read that first.**  It
+  also records what is *verified* versus still *open* about the mechanism: the HIP CMake globs the
+  TILE/MMA instances unconditionally and gates only VEC, the TILE **launcher converts every non-f16
+  (non-bf16) K/V type to f16** (`need_f16_K/V`, `fattn.cu:706`), and every VEC return in the chooser
+  sits in a `turing_/volta_mma_available` branch (NVIDIA-only) — so "flip the predicate" may buy
+  **nothing**, and the first task is to trace the chooser for `q8_0`/`q4_0` (working) versus `q4_1`
+  (broken) with the existing `tools/fa-kernel-chooser-trace.patch` before writing any code.
   Reconnaissance done 2026-09-11: `-DGGML_CUDA_FA_ALL_QUANTS=ON` enables native paths for
   **q4_1/q5_0/q5_1 only** (the flag gates those three in `ggml_cuda_fattn_kv_type_supported()`, and the
   49 `fattn-vec-instance-*` TUs already exist), while **`iq4_nl` cannot be helped by it** (`default:
