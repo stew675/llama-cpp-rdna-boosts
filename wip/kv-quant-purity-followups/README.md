@@ -8,9 +8,13 @@ against the 15-patch delivery (`beta/block-15-campaign-wins/HANDOVER.md` §10, `
 | item | one-line |
 |---|---|
 | **F1** | `q8_0` and `q4_0` K/V caches break the dense `n_max <= 7` greedy-purity guarantee (`W=1,2` agree and `W=3..8` agree, but the two groups differ). |
-| **F2** | qwen4exp's fused sparse QSA attention is not width-invariant (exempt from the guarantee in practice, but the exemption is undocumented). |
+| **F2** | qwen4exp is not width-invariant — **two stacked causes**, not the QSA path (that attribution was measured false): cause 1 = the hyper-connection fusions gated `nt == 1` (**FIXED 2026-09-11**, block-14 amendment, `W <= 4` now pure); cause 2 = a kernel-dispatch band at `W >= 5` (**OPEN**, same class as F1). |
 | **F3** | The sub-`q8_0` KV quants (`q4_1`, `q5_0`, `q5_1`, `iq4_nl`) are pure and much smaller but run ~3.4x slower than `f16` because they have no native FA path. |
 | **policy** | Differing K and V cache *types* are **rejected** (maintainer decision 2026-09-11). |
+
+> **Next session starts here:** `PROMPT-2026-09-11-width-purity-part2.md` (this directory) — the
+> self-contained brief for F1 + F2 cause 2 + F3, including the prime-suspect list with `file:line`
+> anchors, the accepted/instrumented workflow, the acceptance criteria and the landing steps.
 
 ## Why the machinery to reproduce this is cheap
 
