@@ -10,6 +10,29 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Correction: `GGML_CUDA_ALLREDUCE=nccl` was never a bit-identical reference under `-sm tensor` (2026-09-11).**
+  Several docs used "hybrid vs RCCL coherence IDENTICAL" as a validation gate
+  (`AGENTS.md`'s verify recipe, `patches/README.md` block-13 note, `RUN.md`).
+  It does not hold: the internal AR pipeline always BF16-round-trips
+  (`GGML_CUDA_AR_BF16_THRESHOLD` defaults to 1) while the NCCL path reduces
+  *small* tensors in FP32 ("Reduces as FP32 for small tensors and BF16 for
+  large", `allreduce.cu`), so the two backends differ by design.  Measured
+  2-GPU `-sm tensor`, 27B Q8_0, 300-token greedy `--spec-type none`:
+  text `6e8ccd25` (hybrid) vs `6129e077` (nccl), and the token-0 logits differ
+  in the decode/verify band (W=6: `a4817ee6` vs `73ff91bf`).  The gate only
+  holds where no cross-device reduction happens at all -- 1 GPU and
+  `-sm layer` both gave `8fd24746` under either backend, because the AR is
+  never reached.  Past records that quote the gate (e.g. `BASELINE.md`'s dated
+  validation lines) are left as written per the dated-record policy; they were
+  probably true at the text level for the split mode used, or a near-tie
+  collision.  Docs corrected: `AGENTS.md` (verify recipe -- now says
+  "smoke comparison only", with the measurements), `patches/README.md`
+  (block-13 note), `wip/sm-tensor-plain-vs-spec/RUN.md` (the gate list).
+  Not a correctness bug: the default (hybrid) path is self-consistent, which is
+  what the n_max sweep gates.  It is a reminder that **text equality is
+  evidence for purity, never evidence against divergence** -- the same trap as
+  the 3-GPU `n_max = 8` false negative recorded in the entry above.
+
 - **Block 12 amendment: verification matrix completed, and the boundary is `W = 8` / `n_max = 7`, not `n_max = 8` (2026-09-11).**
   Completes the entry above with the full per-configuration probe matrix and a
   correction to how the boundary is established.  The verified guarantee is

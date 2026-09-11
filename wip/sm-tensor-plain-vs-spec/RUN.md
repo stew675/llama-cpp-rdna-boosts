@@ -70,8 +70,14 @@ python3 extract.py /tmp/g-none.log /tmp/g-n1.log /tmp/g-n2.log /tmp/g-n4.log
 ## 3. Other gates
 
 - `test-backend-ops -o GATED_DELTA_NET` (expect OK).
-- Coherence: 4B, 3-GPU tensor, hybrid default vs `GGML_CUDA_ALLREDUCE=nccl`
-  — same-seed output must be identical.
+- Coherence: 4B, 3-GPU tensor, default vs the known-good build — same-seed
+  output must be identical.  Do **not** use `GGML_CUDA_ALLREDUCE=nccl` as a
+  bit-identical reference under `-sm tensor`: the internal AR always
+  BF16-round-trips (`GGML_CUDA_AR_BF16_THRESHOLD` default 1) while NCCL reduces
+  small tensors in FP32, so the two differ by design (measured 27B 2-GPU tensor
+  greedy text `6e8ccd25` hybrid vs `6129e077` nccl, logits W=6 `a4817ee6` vs
+  `73ff91bf`).  It only matches for splits with no cross-device reduction
+  (1 GPU, `-sm layer`).
 - MTP gate: `benchmarks/mtp-adaptive-methodology.md` Protocol A (acceptance
   >= ~0.45, MTP t/s >= plain).
 - perf: `llama-bench -m <27B> -ngl 99 -p 512,2048,4096 -n 128 -r 5`

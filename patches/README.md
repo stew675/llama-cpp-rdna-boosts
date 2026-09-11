@@ -1010,7 +1010,10 @@ baseline table live in `wip/qwen35moe-prefill/bench-config.md`.
   / tg128 20.42 -> 20.42; MoE-A3B Q4_K_M pp512 4804 -> 4802 / tg128
   95.66 -> 96.02.  MTP gates unchanged/healthier (dense 27B acceptance
   0.487 / 36.5 t/s, MoE 0.675 / 153.1 t/s); `GATED_DELTA_NET` 46/46 and
-  the hybrid-vs-NCCL coherence gate identical.  **Companion:** the
+  the hybrid-vs-NCCL comparison is text-level only and does not hold under
+  `-sm tensor` (the internal path always BF16-round-trips while NCCL reduces
+  small tensors in FP32 — see the 2026-09-11 WORKLOG entry on the AR backends);
+  `GATED_DELTA_NET` was 46/46.  **Companion:** the
   default-config `-sm tensor` text equality **also** needs the block-02
   K-independent whole-batch chunked GDN prefill (2026-09-11) — both paths
   chunk the whole prompt, so the post-prefill state no longer depends on

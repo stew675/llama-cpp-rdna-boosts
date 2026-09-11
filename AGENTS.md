@@ -384,8 +384,18 @@ HIP_VISIBLE_DEVICES=0,1,2 ./build/bin/llama-cli -m ~/Qwen3.5-4B-Q8_0.gguf \
   --seed 42 --temp 0 --no-display-prompt --single-turn
 ```
 
-Diff the output against a known-good build (or against RCCL via
-`GGML_CUDA_ALLREDUCE=nccl`). Same-seed output must be IDENTICAL.
+Diff the output against a known-good build.  Same-seed output must be
+IDENTICAL.
+
+**`GGML_CUDA_ALLREDUCE=nccl` is NOT a bit-identical reference under
+`-sm tensor`.**  The internal AR always BF16-round-trips
+(`GGML_CUDA_AR_BF16_THRESHOLD` defaults to 1) while the NCCL path reduces small
+tensors in FP32, so the two backends differ by design: measured 2-GPU tensor,
+27B Q8_0, 300-token greedy `--spec-type none` -> text `6e8ccd25` (hybrid) vs
+`6129e077` (nccl), and the token-0 logits differ too (W=6: `a4817ee6` vs
+`73ff91bf`).  Treat it as a smoke comparison only.  For splits that do no
+cross-device reduction (1 GPU, `-sm layer`) the two are identical, because the
+AR backend is then never reached.
 
 ### Regenerate the patches (after fork changes)
 
