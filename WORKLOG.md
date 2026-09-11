@@ -10,6 +10,50 @@ for the full record; per-block technical notes live in
 
 ---
 
+## 2026-09-11 (4) — F2 cause 2 localised: it is the MoE gate+up+GLU fusion flipping at `n_q = 5`, not a kernel-dispatch band
+
+**Instrument.**  The per-node `[ND]` dump (`GGML_CUDA_NODE_DUMP=1`, re-appliable from
+`wip/kv-quant-purity-followups/tools/node-dump-instrumentation.patch`) on qwen4exp, `-sm layer`,
+P=256, RS=0, at W=4/5/6/7.
+
+**Result — the executed-op census is the signature, and it is unambiguous:** only one op's count changes
+across the whole band, and it changes at exactly the boundary:
+
+| width | `ffn_moe_down` | `ffn_moe_up` | total nodes |
+|---|---|---|---|
+| `W=1..4` | 48 | **0** | 1920 |
+| `W=5`   | 48 | **47** | 1967 |
+| `W=6,7` | 48 | **48** | 1968 |
+
+So the MoE **gate+up+GLU fusion** (`mul_mat_id_glu_ops = {MUL_MAT_ID, MUL_MAT_ID, GLU}`,
+`ggml-cuda.cu:3324`, admitted via `ggml_cuda_should_fuse_mul_mat`) is applied for `n_q <= 4` and
+abandoned from `n_q = 5`, and the fused GLU epilogue and the separate `MUL_MAT_ID` + `GLU` chain do not
+sum identically — which is the impurity.  The `W=6`/`W=7` pair is a **perfect calibration** (`+0` nodes,
+`0` differing ops) — that is *why* they hash identically, and it validates the census (the previous
+session's node-dump diff was unusable because it had no such calibration, and because shape equality is
+not sufficient: cache/state tensors legitimately differ with W).
+
+**Refuted by measurement (the pre-HC-fix exclusion list was unreliable — the `W=1` vs `W>=2` break
+dominated those hashes):** the block-13 `get_mmvq_mmid_max_batch` cap and its MMQ pair arm (forcing MMVQ
+across the band via a temporary `GGML_CUDA_MOE_MMVQ_BAND=1` is **byte-identical**, and `should_use_mmq`
+is false for `n_q <= 8`, so that arm never fires in the band); the MoE expert kernel (`mul_mat_vec_q_moe`
+is **provably width-invariant** — `rpb` derives from `blocks_per_row_x`, a K property, and
+`block_dims = (warp_size, ncols_dst)` is one warp per token); `LLAMA_QSA_OFF`,
+`GGML_CUDA_DISABLE_GRAPHS`, `GGML_CUDA_DISABLE_MOE_MMQ_FUSION`, `GGML_CUDA_DISABLE_WEIGHTED_DOWN`,
+`GGML_CUDA_DISABLE_SHEXP_DOWN_GATE` (all leave `W=5` = `c999233926f0`; positive control
+`LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=0` -> `bdaa8fc57381`, the recorded HC-off value, proving the
+env plumbing); `ggml_cuda_should_use_mmvf(F32)` on gfx1201 = `ne11 <= 3` (a 3/4 boundary that does not
+appear).
+
+**Consequence for the brief:** cause 2 is a **fusion-coverage** band, not an `ncols_dst`/`ne11`
+kernel-dispatch band — so it is *not* the same workstream as F3, and the fix is the F1/HC shape: keep the
+gate+up+GLU fusion for the whole decode/verify band (`n_q <= 8`) rather than only `n_q <= 4`, measuring
+the verify-throughput cost the way F1's was.  Next step: re-run the `GGML_CUDA_DISABLE_FUSION=1` width
+matrix **post-HC-fix** (the earlier "survives all fusions disabled" observation predates it) to confirm
+the unfused path is itself width-invariant.  Debug tooling to reuse: the node census above (nothing is
+committed as code — it is the existing `[ND]` dump plus 30 lines of parsing), and the
+`W=6` vs `W=7` calibration trick.
+
 ## 2026-09-11 (3) — Block 08 amended: the decode/verify band no longer spans two FlashAttention kernel families (F1 fixed)
 
 **What changed.**  `ggml_cuda_get_best_fattn_kernel()` (`ggml/src/ggml-cuda/fattn.cu`) no longer returns

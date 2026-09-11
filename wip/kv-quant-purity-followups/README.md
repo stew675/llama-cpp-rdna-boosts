@@ -164,7 +164,48 @@ token-generic** (`int64_t n_tokens`, `if (it >= n_tokens) return;`).
   purity.  Then re-run: `W=1..4` pure (already demonstrated with the env mitigation) and, once cause 2
   is also fixed, `W=1..8`.
 
-### Cause 2 — a kernel-dispatch band at W ≥ 5 (OPEN, and it is F1's cause)
+### Cause 2 — the MoE gate+up+GLU fusion flips at `n_q = 5` (LOCALISED 2026-09-11, OPEN)
+
+> **The brief's framing was wrong**: cause 2 is **not** a `ncols_dst`/`ne11` *kernel-dispatch* band.  A
+> per-node census of the **executed** ops (the `[ND]` dump, `GGML_CUDA_NODE_DUMP=1`) shows that at each
+> boundary exactly one thing changes — the **MoE gate+up+GLU fusion** is applied at `n_q <= 4` and
+> abandoned from `n_q = 5` on:
+>
+> | width | executed `ffn_moe_down` | executed `ffn_moe_up` |
+> |---|---|---|
+> | `W=1..4` | 48 | **0** (gate+up fused) |
+> | `W=5`   | 48 | **47** |
+> | `W=6,7` | 48 | **48** |
+>
+> Every other op's count is *identical* at every width (the `W=6`/`W=7` pair is a **perfect
+> calibration**: `+0` nodes, `0` differing ops — which is *why* they hash identically, and it validates
+> the census as a signature).  The fused arm is `mul_mat_id_glu_ops = {MUL_MAT_ID, MUL_MAT_ID, GLU}`
+> (`ggml-cuda.cu:3324`, matched at `:3341`, admitted by `ggml_cuda_should_fuse_mul_mat`), so the
+> fused GLU epilogue and the separate `MUL_MAT_ID` + `GLU` pair do not sum identically.  The odd **47**
+> at `W=5` is one layer with a different expert type (a second, per-type threshold — the same
+> `get_mmvq_mmid_max_batch*` table that gates the other MoE arms).
+>
+> **Refuted this session, each by measurement** (the pre-HC-fix exclusion list was unreliable — the
+> `W=1` vs `W>=2` break dominated those hashes):
+> * the block-13 `get_mmvq_mmid_max_batch` cap / the MMQ pair arm — forcing MMVQ across the whole band
+>   (`GGML_CUDA_MOE_MMVQ_BAND=1`) is **byte-identical**, and `should_use_mmq` is false for `n_q <= 8`
+>   so that arm never fires in the band at all;
+> * the MoE expert kernel itself — `mul_mat_vec_q_moe` is **provably width-invariant**: `rpb` derives
+>   from `blocks_per_row_x` (a *K* property) and `block_dims = (warp_size, ncols_dst)` gives one warp
+>   per token;
+> * `LLAMA_QSA_OFF`, `GGML_CUDA_DISABLE_GRAPHS`, `GGML_CUDA_DISABLE_MOE_MMQ_FUSION`,
+>   `GGML_CUDA_DISABLE_WEIGHTED_DOWN`, `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE` — all leave `W=5` at
+>   `c999233926f0` (positive control: `LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=0` moves it to
+>   `bdaa8fc57381`, the recorded HC-off value, so the env plumbing is proven);
+> * `ggml_cuda_should_use_mmvf(F32)` on gfx1201 is `ne11 <= 3` — a 3/4 boundary that does not appear.
+>
+> **Next step:** re-run the `GGML_CUDA_DISABLE_FUSION=1` width matrix **post-HC-fix** (the earlier
+> "survives all fusions disabled" observation predates it).  If the unfused path is itself
+> width-invariant, the fix is the F1/HC shape — keep the gate+up+GLU fusion for the whole band
+> (`n_q <= 8`) instead of only `<= 4` — and the trade-off (verify-batch throughput) should be measured
+> the same way F1's was.
+
+### (superseded) Cause 2 as originally characterised — a kernel-dispatch band at W ≥ 5
 
 With the HC fusions off, the residual grouping is `{1,2,3,4} {5} {6,7} {8}` and it **survives every
 CUDA fusion being disabled** → it is a *kernel dispatch* boundary, not a fusion.  That is the same
