@@ -164,8 +164,11 @@ summary below is deliberately short and does not repeat them.
 ├── BASELINE.md            # fork point, patch provenance, drift policy
 ├── GREEDY-PURITY.md       # block 10 decode-variance analysis (read before shipping)
 ├── WORKLOG.md             # dated delivery records (newest first; README points here)
-├── rdna-boosts-all.patch  # convenience: the entire 14-patch net as ONE patch
-├── patches/               # the delivery set: 0001-0014
+├── CONTAINERS.md          # prebuilt ROCm container images (GHCR) + workflow
+├── .github/workflows/     # docker-ghcr.yml: apply patches, build+push ROCm images
+├── .devops/               # rdna-rocm.Dockerfile (from upstream's rocm.Dockerfile)
+├── rdna-boosts-all.patch  # convenience: the entire 15-patch net as ONE patch
+├── patches/               # the delivery set: 0001-0015
 │   └── README.md          # apply instructions + block-12 env knobs + server config
 ├── scripts/
 │   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift)
