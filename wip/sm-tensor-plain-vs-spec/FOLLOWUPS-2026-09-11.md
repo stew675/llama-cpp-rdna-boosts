@@ -4,7 +4,8 @@ Date: 2026-09-11.  Box: GFX1201, 3x R9700 (gfx1201, RDNA4), ROCm 7.14
 (`/opt/rocm-7.14-gfx1201`).  Companion to `HANDOVER-2026-09-11.md` (the
 plain-vs-spec root-cause + the mmvq/block-13 and GDN-gate/block-02 fixes).
 
-Status: **Part 1 is DONE and delivered** (2026-09-11, block-02 amendment, tip
+Status: **Parts 1 and 2 are DONE and delivered** (Part 3 delivered
+earlier, 2026-09-11: the block-12 size-dispatch amendment).  Part 1 is DONE and delivered (2026-09-11, block-02 amendment, tip
 `30d119ea9`) — see the closing note in Part 1.  **Parts 2 and 3 are open** and
 deferred by the maintainer to follow-up sessions.  The delivery is
 at canonical tip `30d119ea9` (tree `29714ad1f`), 15 blocks, block 02 with the
@@ -225,6 +226,40 @@ dump **every** node, including fused ones).
   on and off, 1 GPU and 2/3-GPU tensor, **without** `DISABLE_FUSION`.
 - The MoE MTP gate holds or improves (>= 0.633 acceptance, MTP >= plain).
 - No perf regression from the fix.
+
+### CLOSED 2026-09-11 (second block-13 amendment)
+
+The residual was **not** in the MoE expert GEMM kernels.  A per-node,
+stride-aware dump of the decode graph that also covers fused-window
+destinations (gate `GGML_CUDA_NODE_DUMP` + `/tmp/nodedump_on`, sync before every
+read, gather with real `nb[]`) localised the first divergence to the **fused
+shared-expert window** (`ggml_cuda_op_shexp_down_gate`, gated `// decode only` on
+`ne[1] == 1`).  Two independent causes:
+
+1. **`MUL_MAT_ID` at `ncols_dst == 1` never used the dedicated MoE kernel** —
+   `mul_mat_vec_q_switch_ncols_dst` returned early only for `has_ids &&
+   ncols_dst > 1`, so single-token `MUL_MAT_ID` fell through to the *dense* ksplit
+   kernel with an ids gather while the verify batch ran `mul_mat_vec_q_moe`.
+   Fixed (all `MUL_MAT_ID` go through the MoE kernel): **+6.2% MoE decode**
+   (tg128 95.62 -> 101.52).
+2. **The fused shared-expert epilogue is not bit-exact with the unfused chain** —
+   custom gate-dot reduction order + an FMA-contracted epilogue multiply.  The
+   FMA is removed (`__fmul_rn`); the gate order is not, so the window remains the
+   **accepted MoE residual**.  Kill-switch
+   `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` gives bit-identical MoE decode/verify
+   (`bd138ad2`); the fusion is worth +3.1% decode, so it is ON by default.
+
+Two instrumentation traps that cost most of the debugging time, both worth
+remembering: (a) `cudaDeviceSynchronize()` is required before every read
+(`get_tensor` copies on `cudaStreamPerThread`, not the compute stream) and
+`ggml_backend_tensor_get` ignores `nb[]`, so the gather must be done host-side;
+(b) **tensor names are NOT unique** — `norm-N` exists per layer *and* for the GDN
+inner norm, so a name-keyed diff compares different tensors and
+manufactures false positives.  Key the diff on `(name, node index)` and always
+validate against a control that must show **zero** divergence (fusions off:
+W=1 and W=3 logits are already identical).  Also: `cb_eval` changes MoE numerics
+and hides the bug entirely.
+
 
 ---
 

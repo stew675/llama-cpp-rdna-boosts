@@ -10,6 +10,55 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Block 13 amendment (2026-09-11, second): MoE `MUL_MAT_ID` decode/verify dispatch fix + the shared-expert fusion kill-switch.**
+  Root-causes and closes the qwen35moe batch-width residual
+  (`wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 2).  The residual was
+  **not** in the MoE expert GEMM kernels.  A per-node, stride-aware dump of the
+  decode graph that also covers fused-window destinations localised the first
+  divergence to the **fused shared-expert window**
+  (`ggml_cuda_op_shexp_down_gate`, gated `// decode only` on `ne[1] == 1`).  Two
+  independent causes, both in that region:
+
+  1. **`MUL_MAT_ID` never used the dedicated MoE kernel at `ncols_dst == 1`.**
+     `mul_mat_vec_q_switch_ncols_dst` returned early only for `has_ids &&
+     ncols_dst > 1`, so a single-token `MUL_MAT_ID` fell through to the **dense
+     ksplit kernel with an ids gather** while a multi-token verify batch ran
+     `mul_mat_vec_q_moe` -- two kernels, two accumulation orders, so a 1-token
+     decode and an n-token verify batch of the same MoE matmul were not
+     bit-identical.  The dense half of this was fixed earlier the same day (dense
+     `MUL_MAT` rows always ksplit); the MMID half was still open
+     ("`MUL_MAT_ID`/MoE keeps the item-split").  **Fixed**: route all `MUL_MAT_ID`
+     through the MoE kernel -- it is column-generic (one warp per token column;
+     `n_groups` and `warp_reduce_sum` depend only on `warp_size`), so decode and
+     verify now share one path.  **+6.2% MoE decode** (tg128 95.62 -> 101.52),
+     +1.4% pp512 (4790.6 -> 4858.6); dense 27B flat (tg128 31.95 -> 32.00,
+     pp512 2021.9 -> 2033.5).
+  2. **The fused shared-expert epilogue is not bit-exact with the unfused chain**:
+     its gate dot uses `shexp_gate_sigmoid`'s own reduction order (not the
+     standalone mmvq order), and its epilogue multiply was contracted into an FMA.
+     The FMA is now removed (`__fmul_rn`, one rounding, matching the separate MUL
+     kernel) -- necessary but not sufficient while the gate reduction differs.
+     Making the whole window bit-exact needs the gate dot to reproduce
+     `mul_mat_vec_q`'s order; scoped as future work.  The fusion is worth **+3.1%
+     MoE decode** (101.5 vs 98.5 t/s), so it stays ON by default behind a
+     first-class kill-switch: **`GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`**.
+
+  Verified: with the kill-switch set (plus fix 1) qwen35moe decode is
+  **bit-identical** to the verify batch (`bd138ad2` both -- the W=3 value, so the
+  decode path moves and the reference is preserved); by default both hashes are
+  unchanged from the previous tip (no regression).  MoE MTP gate unchanged
+  (acceptance 0.58378 = the canonical baseline exactly; per-pos 0.785/0.575/0.382;
+  draft 130.9 vs plain 91.6 t/s).  Dense gates unchanged (`none == n_max 3 ==
+  n_max 7` = `13acc229`; `n_max 8` still divergent = cause B).
+  `test-backend-ops -o GATED_DELTA_NET` 2/2 OK.
+  **Accepted residual**: by default the MoE decode/verify pair is still not
+  byte-identical -- MoE is exempt from that gate by
+  `benchmarks/mtp-adaptive-methodology.md` rule 3, and the gate it *is* held to
+  passes.  Canonical chain re-cut: block 13 `c43beca1b` -> `855515420`, block 14
+  `daf32f804` -> `389c5341f`, tip **`389c5341f`**, net tree **`928852cdc`**;
+  clean-apply strict 15/15 `git am`, zero whitespace warnings, applied tree ==
+  canonical.  All temporary instrumentation reverted.
+
 - **Correction: `GGML_CUDA_ALLREDUCE=nccl` was never a bit-identical reference under `-sm tensor` (2026-09-11).**
   Several docs used "hybrid vs RCCL coherence IDENTICAL" as a validation gate
   (`AGENTS.md`'s verify recipe, `patches/README.md` block-13 note, `RUN.md`).

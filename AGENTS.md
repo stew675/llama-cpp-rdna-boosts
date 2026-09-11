@@ -103,7 +103,7 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `daf32f804`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `389c5341f`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the whole-batch
 K-independent chunked GDN prefill), which is what
@@ -163,7 +163,7 @@ it again: strict 15/15 `git am`, zero whitespace warnings, applied tree
 `31e153fe3` == canonical, tip `27bd754b6`; the 2026-09-11 block-02 re-cut to
 the whole-batch chunked prefill (free alignment, gate + K-dependent branches
 removed, rollback guard added) re-ran it last: strict 15/15 `git am`, zero
-whitespace, applied tree `10f94d635` == canonical, tip `daf32f804`).  Apart from the
+whitespace, applied tree `928852cdc` == canonical, tip `389c5341f`).  Apart from the
 block-02 and block-13 hunks the blocks' bodies are byte-identical to the
 previous regeneration apart from the `From <sha>` line and the
 `[PATCH NN/15]` series count (plus the block-00 Vulkan and block-03 HIP
@@ -317,6 +317,18 @@ explicitly requests it.**
   `benchmarks/mtp-adaptive-methodology.md`.  Verify decode changes with
   Protocol A there (acceptance must stay > ~0.45, MTP >= plain at depth 3)
   before relying on llama-bench numbers.
+- **MoE (`qwen35moe`) decode/verify is NOT byte-identical by default (accepted).**
+  The decode-only fused shared-expert window (`ggml_cuda_op_shexp_down_gate`,
+  +3.1% MoE decode) does not reproduce the unfused chain's arithmetic: its gate
+  dot uses its own reduction order rather than the standalone mmvq order (the
+  epilogue FMA was removed 2026-09-11).  Set
+  **`GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`** for byte-identical MoE decode/verify.
+  MoE is exempt from the byte-identity gate by
+  `benchmarks/mtp-adaptive-methodology.md` rule 3 and its MTP gate passes
+  (acceptance 0.58378).  The companion block-13 fix of the same day — all
+  `MUL_MAT_ID` use the dedicated MoE kernel, not the dense ksplit-with-ids path —
+  is **+6.2% MoE decode** (tg128 95.62 -> 101.52); see the 2026-09-11 (second)
+  WORKLOG entry.
 - The one-sided AR wait (dev0/bus-06 dispatch-gap asymmetry, ~12.7 µs/call)
   is a **platform-level CP/driver property**, not reachable from the AR
   kernel, graph tail, or host-side pacing — fusion/pacing are CLOSED
@@ -400,7 +412,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `daf32f804`): `git format-patch --start-number 0` the block
+blocks tip `389c5341f`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -409,7 +421,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `daf32f804`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `389c5341f`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

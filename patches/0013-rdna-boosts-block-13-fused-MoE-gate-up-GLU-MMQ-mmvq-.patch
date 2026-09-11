@@ -1,4 +1,4 @@
-From c43beca1bcbd204c3a682c31eb1ee40bca976f4c Mon Sep 17 00:00:00 2001
+From 8555154206675d3d7f9e03f80047070f0577ba2b Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 06:50:35 -0500
 Subject: [PATCH 13/14] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -43,12 +43,12 @@ Subject: [PATCH 13/14] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
   mul_mat_q_pair, weighted-down mmvq, scale-unary window) - see
   patches/README.md and wip/archive/qwen4exp/README.md.
 ---
- ggml/src/ggml-cuda/ggml-cuda.cu               | 154 +++-
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 166 +++-
  ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh     |   6 +-
  ggml/src/ggml-cuda/mmq-vec-dot.cuh            |  16 +-
  ggml/src/ggml-cuda/mmq.cu                     | 228 +++++-
  ggml/src/ggml-cuda/mmq.cuh                    | 409 +++++++++-
- ggml/src/ggml-cuda/mmvq.cu                    | 731 ++++++++++++++++--
+ ggml/src/ggml-cuda/mmvq.cu                    | 750 ++++++++++++++++--
  ggml/src/ggml-cuda/mmvq.cuh                   |   8 +
  ggml/src/ggml-cuda/moe-weighted-reduction.cu  |  58 +-
  ggml/src/ggml-cuda/quantize.cu                | 221 ++++--
@@ -56,10 +56,10 @@ Subject: [PATCH 13/14] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
  .../template-instances/generate_cu_files.py   |  14 +
  .../template-instances/mmq-instance-q3_k.cu   |   1 +
  tests/test-backend-ops.cpp                    |   2 +-
- 13 files changed, 1675 insertions(+), 199 deletions(-)
+ 13 files changed, 1702 insertions(+), 203 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index f097ff101..91e77843c 100644
+index f097ff101..57d5b1538 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -813,6 +813,24 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
@@ -223,7 +223,26 @@ index f097ff101..91e77843c 100644
                  ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
                  return 1;
              }
-@@ -4843,6 +4945,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4553,7 +4655,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     // Shared-expert output chain: down projection + gate + gating + residual
+     // adds. dst = down(swiglu) * sigmoid(gate(x)) + moe_out + ffn_residual.
+-    if (i + 5 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
++    //
++    // Decode-only.  The fused gate reduction (shexp_gate_sigmoid) does not
++    // reproduce the order of the standalone mmvq/MUL_MAT it replaces, so a
++    // 1-token decode and an n-token verify batch of the same MoE layer are not
++    // bit-identical (the decode == verify invariant; the multi-token path runs
++    // the unfused chain).  Worth +3.1% decode on Qwen3.6-35B-A3B (tg128 101.6
++    // vs 98.5 t/s), so it is on by default; set GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1
++    // for byte-identical MoE decode/verify results.  Hard opt-out for A/B too.
++    static const bool disable_shexp_down_gate =
++        getenv("GGML_CUDA_DISABLE_SHEXP_DOWN_GATE") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_SHEXP_DOWN_GATE"));
++    if (!disable_shexp_down_gate && i + 5 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+         const ggml_op ops[6] = {
+             GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD
+         };
+@@ -4843,6 +4955,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 2;
      }
  
@@ -258,7 +277,7 @@ index f097ff101..91e77843c 100644
      return 0;
  }
  
-@@ -4853,7 +4983,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4853,7 +4993,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
      const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
      std::vector<cudaEvent_t> op_ev0;
      std::vector<cudaEvent_t> op_ev1;
@@ -267,7 +286,7 @@ index f097ff101..91e77843c 100644
      if (op_timing) {
          op_ev0.resize(cgraph->n_nodes);
          op_ev1.resize(cgraph->n_nodes);
-@@ -5006,9 +5136,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5006,9 +5146,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue;
                  }
  
@@ -287,7 +306,7 @@ index f097ff101..91e77843c 100644
  #ifdef GGML_CUDA_DEBUG
                      const int last_fused = i + nodes_to_skip;
                      GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
-@@ -5018,6 +5158,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5018,6 +5168,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      i += nodes_to_skip;
                      continue;
                  }
@@ -295,7 +314,7 @@ index f097ff101..91e77843c 100644
  #ifndef NDEBUG
                  // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                  // node's output on the host-visible buffer, which the compute path
-@@ -5047,7 +5188,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5047,7 +5198,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
                  if (op_timing) {
                      CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
@@ -304,7 +323,7 @@ index f097ff101..91e77843c 100644
                  }
  
                  if (!is_concurrent_event_active) {
-@@ -5110,14 +5251,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5110,14 +5261,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          static std::map<std::string, int>    op_cnt_total;
          std::map<std::string, double> op_ms;
          std::map<std::string, int>    op_cnt;
@@ -1284,7 +1303,7 @@ index 964c9678e..801f990d2 100644
  
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index e873fe080..da85014cc 100644
+index e873fe080..a30221ceb 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -644,6 +644,292 @@ static __global__ void mul_mat_vec_q(
@@ -1743,7 +1762,25 @@ index e873fe080..da85014cc 100644
      }
  }
  
-@@ -1240,109 +1584,201 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1229,8 +1573,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         return idle * 8 <= iters_wide * 2;
+     };
+ 
+-    if (has_ids && ncols_dst > 1) {
+-        // Multi-token MUL_MAT_ID path - dedicated MoE kernel
++    if (has_ids) {
++        // MUL_MAT_ID path - dedicated MoE kernel.  This must cover ncols_dst == 1
++        // as well: the dense ksplit path below computes the same rows with a
++        // different accumulation order, so a 1-token decode and a multi-token
++        // verify batch of the same MoE matmul would not be bit-identical (the
++        // decode == verify invariant).  The kernel is column-generic -- each
++        // block column is one token (`if (token_idx >= ncols_dst) return;`,
++        // `ids[channel_dst + token_idx*ids_stride]`) -- so ncols_dst == 1 is a
++        // plain single-column launch.
+         mul_mat_vec_q_moe_launch<type>(
+             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
+             stride_row_x, stride_col_y, stride_col_dst,
+@@ -1240,109 +1591,201 @@ static void mul_mat_vec_q_switch_ncols_dst(
      }
  
      switch (ncols_dst) {
@@ -1993,7 +2030,7 @@ index e873fe080..da85014cc 100644
          } break;
          default:
              GGML_ABORT("fatal error");
-@@ -1559,7 +1995,7 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1559,7 +2002,7 @@ void ggml_cuda_mul_mat_vec_q(
              GGML_ASSERT(ggml_is_contiguous(fusion->x_scale));
              if (fusion->x_scale_channel_dst) {
                  GGML_ASSERT(ids);
@@ -2002,7 +2039,22 @@ index e873fe080..da85014cc 100644
              } else {
                  GGML_ASSERT(ggml_nelements(fusion->x_scale) == (ids ? src0->ne[2] : 1));
              }
-@@ -2131,3 +2567,152 @@ void ggml_cuda_op_mul_mat_vec_q(
+@@ -2030,7 +2473,13 @@ static __global__ void shexp_down_gated_q8_0(
+     sum_down = warp_reduce_sum<warp_size>(sum_down);
+ 
+     if (threadIdx.x == 0) {
+-        dst[row] = sum_down * gate_sig[0] + moe_out[row] + ffn_residual[row];
++        // Bit-exactness with the unfused chain: the graph computes
++        //   gated = down * gate_sig   (separate MUL kernel, rounded)
++        //   ffn_out = gated + moe_out (separate ADD kernel, rounded)
++        //   dst = ffn_out + ffn_residual
++        // so the multiply must NOT be contracted into an FMA here (an FMA would
++        // round once instead of twice and break decode == verify).
++        dst[row] = __fmul_rn(sum_down, gate_sig[0]) + moe_out[row] + ffn_residual[row];
+     }
+ }
+ 
+@@ -2131,3 +2580,152 @@ void ggml_cuda_op_mul_mat_vec_q(
  
      GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
  }

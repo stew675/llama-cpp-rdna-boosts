@@ -60,7 +60,7 @@ the 15-block tree):
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
 | `0012` | **hybrid HIP all-reduce (block 12)** - the custom internal AR; hybrid dispatch; RDNA4-only gate; runtime NCCL-failure fallback (amended 2026-09-04, issue #13); **amended 2026-09-11 - the small/large crossover is now width-safe** (2-device `32768` -> `131072` elements; see the block-12 notes) |
-| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-11 with the dense ncols==1 ksplit alignment** (dense `MUL_MAT` rows always ksplit for every K so single-token decode is row-identical to the 2..8-token verify batch; `MUL_MAT_ID`/MoE keeps the item-split) — see the block-13 notes below; **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)** — see the block-13 notes below.
+| `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-11 with the dense ncols==1 ksplit alignment** (dense `MUL_MAT` rows always ksplit for every K so single-token decode is row-identical to the 2..8-token verify batch; `MUL_MAT_ID`/MoE kept the item-split at that point — superseded by the second 2026-09-11 amendment below) — see the block-13 notes below; **amended again 2026-09-11 with the MoE `MUL_MAT_ID` dispatch fix** (all `MUL_MAT_ID` now use the dedicated MoE kernel, completing what the dense fix left open — `ncols_dst == 1` previously took the dense ksplit kernel with an ids gather; **+6.2% MoE decode**) **and the `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE` kill-switch** (the decode-only fused shared-expert epilogue is not bit-exact with the unfused chain — the accepted MoE residual; see the block-13 notes); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: wip/archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)** — see the block-13 notes below.
 | `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-07 with the derived-cache pool gate** (the F32 block-vector pool is now allocated only when the derived cache is enabled *and* the indexer keys are unquantized — no more dead ~100 MiB buffer + no-op fill launches otherwise) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. | **amended 2026-09-08 with the quantized-KV tensor-split gate** — `q4_1`-family KV cache types (`q4_1`/`q5_0`/`q5_1`/`iq4_nl`) abort at graph reserve under multi-GPU `SPLIT_MODE_TENSOR` (upstream bug, also on vanilla `050dde50c`); now rejected at context creation with a clear error when the Meta device is in use — see the block-14 notes below. | **amended 2026-09-09 with the gfx1151-only freed-cell KV-zeroing gate** — the seq_rm/seq_keep/clear row zeroing (strix-port aad5adb08f masked-column guard for the gfx1151 WMMA f16 `x+(-0.0)` inexactness) now enables only when a KV buffer device is gfx1151 (env `LLAMA_KV_ZERO_FREED` overrides); everywhere else pre-block-14 behavior (no per-free GPU memsets) is restored — see the 2026-09-09 block-14 amendment section below. | **amended 2026-09-10: the freed-cell host zeroing is removed and the kernel-side masked-V fixes were re-homed** — `llama-kv-cache.{cpp,h}` are the upstream state (no `zero_freed`/env/GPU memsets); the Vulkan `flash_attn_cm1.comp`/`flash_attn.comp` fixes live in block 00 and the HIP `fattn-tile.cuh`/`fattn-mma-f16.cuh` fixes live in block 03, so block 14 carries none of them — see the 2026-09-10 block-00 section below. |
 
 ## Apply (fresh checkout at the fork point)
@@ -847,13 +847,38 @@ upstream's additions.
 
 ## Block 13 notes
 
+**2026-09-11 (second amendment) — MoE `MUL_MAT_ID` decode/verify dispatch + the shared-expert fusion kill-switch.**
+
+- **`MUL_MAT_ID` at `ncols_dst == 1` now uses the dedicated MoE kernel.**
+  `mul_mat_vec_q_switch_ncols_dst` used to return early only for `has_ids &&
+  ncols_dst > 1`, so a single-token `MUL_MAT_ID` fell through to the *dense*
+  ksplit kernel (with an ids gather) while the 2..8-token verify batch ran
+  `mul_mat_vec_q_moe`.  Two kernels with different accumulation orders ⇒ the same
+  MoE matmul was not bit-identical between a 1-token decode and an n-token verify
+  batch.  The dense half of this was fixed earlier the same day (dense rows always
+  ksplit); this closes the MMID half.  Cost/benefit: **+6.2% MoE decode** (tg128
+  95.62 → 101.52), +1.4% pp512, dense unchanged (tg 31.95 → 32.00).
+- **The fused shared-expert window is decode-only and NOT bit-exact with the
+  unfused chain.**  `ggml_cuda_op_shexp_down_gate` computes `dst = down(swiglu) *
+  sigmoid(gate(x)) + moe_out + ffn_residual` in one kernel, gated on
+  `ne[1] == 1`.  Its gate dot (`shexp_gate_sigmoid`) does not reproduce the
+  standalone mmvq/MUL_MAT reduction order, and its epilogue multiply was
+  contracted into an FMA.  The FMA is removed (`__fmul_rn`); the gate order is
+  not, so this window remains the **accepted MoE decode≠verify residual** (MoE is
+  exempt from byte-identity by `benchmarks/mtp-adaptive-methodology.md` rule 3,
+  and its MTP gate passes: acceptance 0.58378, unchanged from canonical).
+  **Kill-switch: `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`** — with it (and the
+  dispatch fix above) qwen35moe decode is bit-identical to verify (`bd138ad2`).
+  The fusion is worth +3.1% MoE decode (101.5 vs 98.5 t/s), hence ON by default.
+
 **Fused MoE gate+up+GLU MMQ (prefill) + mmvq short-K item-split (decode).**
 
 - **Prefill fused expert MMQ** (block 13, the `mul_mat_id_glu_ops` pattern):
   the {MUL_MAT_ID(gate), MUL_MAT_ID(up), GLU} triple runs as ONE MMQ kernel
   reading both weight streams with a GLU epilogue in registers.  Types
   instantiated: Q3_K/Q4_K/Q5_K/Q8_0/Q6_K (M4 quant extension).  Env opt-out:
-  `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1`.
+  `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1`.  Decode-side shared-expert fusion opt-out:
+  `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`.
   Validated (1-GPU qwen35moe Q6_K/Q4_K_M, the verified config): prefill
   pp16384 Q6_K +5.1% (3344 vs 3181), Q4_K_M +3.6% (3488 vs 3367); fused
   path fires as `FUSED MUL_MAT_ID ffn_moe_down-*` on all layers.
