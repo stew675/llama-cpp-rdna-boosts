@@ -74,7 +74,9 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 The current delivery is a **15-patch set** (block 00 + blocks 01-14) for
 llama.cpp at the fork
 point `9113cc188` (blocks 00-14 in `patches/`, applied with `git am` via
-`scripts/apply-all.sh`; canonical 15-block tip `389c5341f` rebuilt at the
+`scripts/apply-all.sh`; canonical 15-block tip `1d8f53594` rebuilt at the
+fork point; block 14 amended 2026-09-11 with the hyper-connection decode/verify band fix, which
+makes qwen4exp width-pure for `W <= 4` -- see the WORKLOG entry)
 fork point); block 13 was amended again 2026-09-11 with the MoE `MUL_MAT_ID`
 decode/verify dispatch fix (**+6.2% MoE decode**) and the `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE` kill-switch (see the WORKLOG entry -- the
 decode-only fused shared-expert window is the accepted MoE decode!=verify

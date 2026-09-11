@@ -24,6 +24,11 @@ now a **15-patch set**: block 00 + blocks 01-14 at canonical tip **`389c5341f`**
 tree `928852cdc`, with block 13 amended twice on 2026-09-11), so the beta patch was
 re-cut and re-validated end to end.
 
+* **Re-cut again 2026-09-11** after block 14's hyper-connection band amendment moved the canonical
+  tip: base `1d8f53594` -> **beta tip `54859fdda`** (tree `543ccc015`).  Block 15 touches
+  `src/models/qwen4exp.cpp` but only in the QSA/indexer regions (its hunks start after the amended HC
+  gates), so the re-cut diff is metadata/offset-only: **0 changed body lines**, only the `From`/`index`
+  lines and hunk offsets (the qwen4exp hunks shift by +24 lines).  No renumbering (`[PATCH 15/15]`).
 * **New beta tip `fe4f55278`** (tree `ffe197e2f`, parent `389c5341f`); the re-cut patch
   replaced `block-15-campaign-wins.patch` in this directory.  Previous tip `377f8e790`
   was cut on `b425aa8f7` = block 14 of the old **14-block** chain.

@@ -10,6 +10,56 @@ for the full record; per-block technical notes live in
 
 ---
 
+## 2026-09-11 (2) — Block 14 amended: the fused hyper-connection ops serve the decode/verify band (qwen4exp width purity, cause 1 of 2)
+
+**What changed.**  `ggml/src/ggml-cuda/hc-mix.cu` (`ggml_cuda_op_hc_mix`, `ggml_cuda_op_hc_combine`) and
+the two graph gates in `src/models/qwen4exp.cpp` no longer require `nt == 1`: the fused
+hyper-connection (HC) chain now serves the whole **decode/verify band `1 <= nt <= 8`**
+(`HC_FUSED_MAX_TOKENS`, asserted in both ops).  The four mix kernels and the combine kernel take the
+token index from `blockIdx.y` and offset every per-token pointer with the tensor's own stride
+(`inject` is read with its view stride); at `nt == 1` every added term is zero, so the decode result is
+unchanged (verified byte-identical for f16/bf16/q8_0/q4_0).  A `<= 8`-token **prefill** chunk also takes
+the fused path — it cannot be told apart from a verify batch, and both must use the decode arithmetic;
+wider chunks keep the unfused chain.  The ops are otherwise the same arithmetic, so no kernel numerics
+were touched (the env fallback `LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=0` reproduces the pre-fix
+adaptive-MTP numbers exactly).
+
+**Why.**  qwen4exp failed the decode==verify invariant ("F2"): a 1-token decode used the fused HC ops
+while an n-token verify batch used the unfused chain, so the two computed the same position differently
+and plain decode and `draft-mtp` disagreed.  Root-caused 2026-09-11 into **two stacked causes** (the
+second is a `W >= 5` kernel-dispatch band shared with F1); this lands **cause 1**, as a block-14
+amendment (block 14 introduced `hc-mix.cu` and the qwen4exp HC paths, so it owns them — the same
+owner-based rule used for the block-02/12/13 amendments, not block 00).
+
+**Measured** (3x gfx1201, ROCm `/opt/rocm-7.14-gfx1201`, unpinned):
+- width probe, qwen4exp IQ4_XS f16 KV P=256 RS=0: `-sm layer` W=1..4 all **`3adeb313042a871b`** (was
+  W=1 `3adeb313042a` + W=2..4 `044715b66e72f077`), `-sm tensor` W=1..4 all **`dcf1ae667f730879`**;
+  **W=1 byte-identical to the pre-fix build on both splits and for every KV type** (f16
+  `3adeb313042a`, bf16 `42e1bcfa57c1`, q8_0 `cb018394fd37`, q4_0 `688835658f30`).
+- W=5 `c999233926f0` / W=6,7 `a8c532e12f9c` / W=8 `c56ebb61963a` (`-sm layer`) still grouped = **cause 2**,
+  the `ncols_dst`/`ne11` selection band at `W >= 5`, shared with the `q8_0`/`q4_0` KV impurity (F1).
+- greedy text: plain == `--spec-type draft-mtp --spec-draft-n-max 3`, byte-identical (3275 chars);
+  `n_max 7` still differs (cause 2).  qwen4exp is therefore width-pure for **`n_max <= 3`**.
+- adaptive-MTP (f16 KV, n=96): acceptance **0.50000 -> 0.76744**, MTP generation **63.3 -> 79.9 t/s**.
+  With a `q8_0` KV cache: 0.50000 -> 0.43089 — that configuration is already width-impure via F1 (its
+  W=1 decode is also unchanged), so it must be re-measured once F1 is fixed; recorded, not gated.
+- perf: `-sm tensor` f16 pp512 1288-1300 (**parity**), tg128 48.30/48.72 (**decode unchanged** vs the
+  pre-fix build, and the fusion's +14% over the unfused fallback 42.28/42.32 is kept).
+- no regressions: 27B 1 GPU W=1/W=8 `4089b4d4`, W=9 `72af52db`; MoE W1 `ac8825358d9adfda` / W3
+  `bd138ad2326fbbf2`; reserves byte-identical (qwen4exp ub2048 q8_0 dev 6690.3987 / host 1262.6954 /
+  kvbuf 956.26; f16 6642.1331 / 1262.4297 / 1800.00); `test-backend-ops -o FLASH_ATTN_EXT` and
+  `-o GATED_DELTA_NET` both 4/4 OK; `llama-batched-bench` B=1..8 clean.
+- clean-apply: fresh `9113cc188` + `scripts/apply-all.sh` -> strict **15/15 `git am`**, **0 whitespace
+  warnings**, applied tree == canonical **`e36263da57b8985cb98018af59fe639be0290dc4`**.
+- the block-15 beta patch was re-cut against the new base (**beta tip `54859fdda`**, tree
+  **`543ccc015`**, parent `1d8f53594`): metadata/offset-only, **0 changed body lines**.
+
+**New canonical tip `1d8f53594`**, tree `e36263da5`.  Blocks 00-13 are byte-identical to the previous
+regeneration; only `patches/0014-…` changed (the `From`/`index`/hunk-offset metadata plus the band fix).
+
+**Follow-ups.**  Cause 2 (`W >= 5`) — fix together with F1/F3 (`wip/kv-quant-purity-followups/`);
+the HC ops have no `test-backend-ops` coverage (a CUDA-vs-CPU band test would close that gap).
+
 - **Block 15 beta revalidation (2026-09-11): re-cut against the current 15-patch delivery + full re-validation.**
   The Block-15 beta patch was cut on `b425aa8f7` (block 14 of the old **14-block** chain, block 13
   `e61676292`) — before block 00 existed and before the 2026-09-11 block-02/12/13 amendments — so it

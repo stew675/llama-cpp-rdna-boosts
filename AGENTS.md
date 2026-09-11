@@ -69,7 +69,13 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   the Vulkan `flash_attn_cm1.comp`/`flash_attn.comp` fixes now live in block 00,
   the HIP `fattn-tile.cuh`/`fattn-mma-f16.cuh` fixes now live in block 03 (they
   sit on the native-BF16 FA path block 03 introduces), so block 14 carries none
-  of them.  See the block-14 notes in `patches/README.md` and the beta
+  of them.  **Amended 2026-09-11**: the fused hyper-connection ops
+  (`ggml_cuda_op_hc_mix`/`_hc_combine` in `ggml/src/ggml-cuda/hc-mix.cu`) and the
+  `src/models/qwen4exp.cpp` gates now serve the whole decode/verify band `1 <= nt <= 8` (they were
+  `nt == 1`), which fixes qwen4exp's decode-vs-verify divergence up to `--spec-draft-n-max 3`; the
+  ops map the token onto `blockIdx.y` with explicit per-token strides, and a <= 8-token *prefill*
+  chunk also takes the fused path (it cannot be told apart from a verify batch — that is the point).
+  See the block-14 notes in `patches/README.md` and the beta
   validation record in `beta/qwen4exp/README.md`.
 - Block **15** (STAGED in `beta/block-15-campaign-wins/`, **NOT a delivery patch**): the attention-memory campaign wins --
   **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived QSA
@@ -103,10 +109,11 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `389c5341f`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `1d8f53594`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the whole-batch
-K-independent chunked GDN prefill), which is what
+K-independent chunked GDN prefill; block 14 amended 2026-09-11 with the
+hyper-connection decode/verify band fix), which is what
 `scripts/make-patches.sh`'s default tip refers
 to; always regenerate from a canonical fork rebuilt at the fork point.
 **Block 15 (the attention-memory campaign) is NOT in the delivery** -- it
@@ -395,10 +402,16 @@ explicitly requests it.**
   both-quantized FA path (the rest stage through F16 and are ~3.4x
   slower).  **Test plain-vs-spec purity with f16/bf16 K/V**; with a
   q8_0/q4_0 cache gate on adaptive-MTP acceptance/throughput instead.
-qwen4exp is likewise not width-pure (also pre-existing) — root-caused
-2026-09-11 into two stacked causes: its hyperconnection fusions are gated `nt == 1` (so decode and
-verify use different arithmetic) plus a kernel-dispatch band at `W >= 5` that shares F1's cause; see
-`wip/kv-quant-purity-followups/README.md` (F2).  **Differing K/V cache *types* are rejected** (maintainer
+  qwen4exp's two stacked causes (root-caused 2026-09-11) are now **half fixed**: its
+  hyperconnection fusions (`hc-mix.cu`, gated `nt == 1`) were the cause-1 defect and the block-14
+  2026-09-11 amendment routes the whole **decode/verify band `1 <= nt <= 8`** through them, so
+  qwen4exp is now **width-pure for `W <= 4`** (`-sm layer` W=1..4 `3adeb313042a`, `-sm tensor`
+  `dcf1ae66`, on f16/bf16; W=1 decode byte-identical to the pre-fix build for every KV type), plain
+  == `draft-mtp --spec-draft-n-max 3` greedy text, f16 MTP acceptance 0.500 -> **0.76744** and MTP
+  generation 63.3 -> 79.9 t/s.  Cause 2 (a kernel-dispatch band at `W >= 5`, shared with F1) is
+  **still open**, so the band stops at `n_max 3` for qwen4exp, and the impure `q8_0`/`q4_0` KV
+  configurations (F1) must be re-measured after F1 — see
+  `wip/kv-quant-purity-followups/README.md` (F2).  **Differing K/V cache *types* are rejected** (maintainer
   decision 2026-09-11: mixed pairs are 1.7–3.6x slower than the same-type
   equivalent and never smaller).  Details, repro tooling and the follow-up
   items (F1 purity, F2 qwen4exp, F3 sub-`q8_0` parity — note a native
@@ -439,7 +452,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `389c5341f`): `git format-patch --start-number 0` the block
+blocks tip `1d8f53594`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -448,7 +461,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `389c5341f`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `1d8f53594`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

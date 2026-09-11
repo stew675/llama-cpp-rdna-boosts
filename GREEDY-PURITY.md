@@ -436,3 +436,27 @@ acceptance/throughput instead.  Mixed K/V *types* are a rejected configuration (
 `beta/block-15-campaign-wins/README.md` §7) and are irrelevant to this table.  This table is orthogonal
 to Causes A and B in §11: those are about the *fork's* widths and the FA kernel switch, this is about
 which dequant kernels the cache type selects.
+
+## 13. qwen4exp and the hyper-connection band (2026-09-11, Block 14 amendment)
+
+qwen4exp (Qwen3.8-Flash-Next) has its own fused decode chain: the hyper-connection mixer
+(`GGML_OP_HC_MIX`) and residual combine (`GGML_OP_HC_COMBINE`) replaced the unfused
+`SCALE/SILU/MUL_MAT/SIGMOID/MUL/ADD` chain, but only for a **single-token** batch, so a 1-token decode
+and an n-token verify batch took different arithmetic (measured in the per-node dump: 98
+`HC_COMBINE` dispatches at `W=1`, **0** at `W>=2`).  Block 14, amended 2026-09-11, routes the whole
+**decode/verify band `1 <= nt <= 8`** through the fused ops with the token index on `blockIdx.y`, so
+every token in the band runs exactly the per-token kernel sequence a single-token decode runs.
+Measured (3 GPUs, f16 KV, P=256, RS=0):
+
+| split | W=1..4 | W=5 | W=6,7 | W=8 |
+|---|---|---|---|---|
+| `-sm layer`  | **all `3adeb313042a871b`** (= the W=1 decode) | `c999233926f0` | `a8c532e12f9c` | `c56ebb61963a` |
+| `-sm tensor` | **all `dcf1ae667f730879`** (= the W=1 decode) | `2bfb89f59ec2` | `e8b1253ea93e` | `a7c5dfd26a56` |
+
+So qwen4exp is width-pure for **`--spec-draft-n-max <= 3`**, and there plain decode == `draft-mtp`
+greedy text (byte-identical, 3275 chars).  The `W >= 5` grouping is **cause 2** (§11): the same
+`ncols_dst`/`ne11` kernel-selection band as the `q8_0`/`q4_0` KV impurity in §12 — which is why F1 and
+the remainder of F2 are one workstream.  Two caveats: a `<= 8`-token **prefill** chunk also takes the
+fused path (indistinguishable from a verify batch — the point is that such a batch gets the decode
+arithmetic); and with a `q8_0`/`q4_0` **KV cache** the cache's own impurity (§12) dominates, so the band
+does not restore text equality there (the `W=1` decode is still unchanged).

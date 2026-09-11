@@ -3,7 +3,10 @@
 > **REVALIDATED 2026-09-11 — see §10.6 for the outcome.**  The beta patch was cut on
 > `b425aa8f7` (the 14-block chain) and has been **re-cut against canonical tip `389c5341f`
 > (tree `928852cdc`) and re-validated end to end**: new beta tip **`fe4f55278`**
-> (tree `ffe197e2f`).  The dependent delta was exactly one file
+> (tree `ffe197e2f`) — and **re-cut again 2026-09-11** after block 14's hyper-connection band
+> amendment moved the canonical tip: base `1d8f53594` -> **beta tip `54859fdda`, tree
+> `543ccc015`**, metadata/offset-only (0 changed body lines) — see the beta `README.md`.
+> The dependent delta was exactly one file
 > (`fattn-common.cuh`), the textual apply was clean, every 2026-09-10 number
 > reproduced to the last decimal, and three **pre-existing** follow-ups were
 > found (§10.7).  §10.1's original `[PATCH 16/16]` renumbering claim was **wrong** —

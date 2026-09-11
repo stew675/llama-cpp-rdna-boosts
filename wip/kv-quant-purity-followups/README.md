@@ -79,12 +79,26 @@ Acceptance criteria for a fix: `W=1..8` bit-identical for both q8_0/q8_0 and q4_
 2-GPU layer, 2-GPU tensor and 3-GPU tensor; no prefill/decode regression; f16/bf16 and every other
 quant type unchanged; `test-backend-ops -o FLASH_ATTN_EXT` still 7859/7859 on ROCm0 and CPU.
 
-## F2 — qwen4exp is not width-pure: ROOT-CAUSED 2026-09-11 into TWO stacked causes
+## F2 — qwen4exp is not width-pure: ROOT-CAUSED into TWO stacked causes; **cause 1 FIXED 2026-09-11**
+
+> **Cause 1 is fixed** in the block-14 amendment (canonical tip `1d8f53594`, delivery):
+> `ggml/src/ggml-cuda/hc-mix.cu` + the `src/models/qwen4exp.cpp` gates now serve the whole band
+> **`1 <= nt <= 8`** (token index on `blockIdx.y`, every per-token pointer offset by the tensor's own
+> stride — `inject` with its view stride; at `nt == 1` all added terms are zero, so decode is
+> unchanged and was verified byte-identical for f16/bf16/q8_0/q4_0).  Result: `-sm layer` W=1..4 all
+> `3adeb313042a871b`, `-sm tensor` W=1..4 all `dcf1ae667f730879` — both equal to their W=1 decode;
+> plain == `--spec-type draft-mtp --spec-draft-n-max 3` greedy text (byte-identical); f16 MTP
+> acceptance **0.50000 -> 0.76744**, MTP generation **63.3 -> 79.9 t/s**; decode/perf/reserves
+> unchanged; 27B/MoE untouched.  **Cause 2 (`W >= 5`) is still open** and is the same band as F1 —
+> fix it there, not here.  With a `q8_0`/`q4_0` KV cache the cache's own impurity (F1) dominates
+> (acceptance 0.50 -> 0.43), so those configurations must be re-measured after F1; they are not a
+> valid gate for this fix.  The table below is the **pre-fix** state.
 
 ```
-qwen4exp (IQ4_XS), 3-GPU f16 KV, P=256, RS=0 — logits0 hash per decode width:
+qwen4exp (IQ4_XS), 3-GPU f16 KV, P=256, RS=0 — logits0 hash per decode width (PRE-FIX):
   delivery build:  W=1 dcf1ae667f73 | W=2,3,4 1c801d63666b | W=5 fa34f99951fb | W=6,7 96dbf8375adf | W=8 2ca9b9f5e801
   -sm layer:       W=1 3adeb313042a | W=2,3,4 044715b66e72 | W=5 bdaa8fc57381 | W=6,7 1ffc73e03571 | W=8 15786ddeffad
+  after the fix:   W=1..4 = W=1's value on both splits; W=5 c999233926f0 | W=6,7 a8c532e12f9c | W=8 c56ebb61963a (layer)
 ```
 
 The earlier guess in this file ("the sparse-QSA attention path") was **wrong**.  The divergence is
