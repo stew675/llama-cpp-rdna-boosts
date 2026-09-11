@@ -42,17 +42,18 @@ share a cause — the measured boundaries differ (F1 `W=2->3` for 4B q8_0, cause
 
 ## Environment and state
 
-* Canonical fork `/tmp/canon-llama` @ **`1d8f53594`** (tree **`e36263da5`**), branch `rdna-boosts`,
+* Canonical fork `/tmp/canon-llama` @ **`1bcf4e82d`** (tree **`4104e7d34`**), branch `rdna-boosts`,
   **clean**, 15 blocks; build dir `build-base` (built 2026-09-11 = the current canonical build).
   Blocks: 00 `1c7ab0e89`, 01 `aa4108b9d`, 02 `6e81ed5ed`, 03 `4dc962aa9`, 04 `03d004517`,
-  05 `70f330aed`, 06 `d2fc2cb34`, 07 `110b5391d`, 08 `5ea46d1b2`, 09 `29880b1e4`, 10 `33a1e5f27`,
-  11 `f4e75a30a`, 12 `cac14423e`, 13 `855515420`, 14 `1d8f53594`.  If `/tmp` is gone: clone
-  `ggml-org/llama.cpp`, checkout `9113cc188`, `scripts/apply-all.sh .` (15/15 strict, tree
-  `e36263da5`), build with `BUILD_DIR=build-base EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714`.
+  05 `70f330aed`, 06 `d2fc2cb34`, 07 `110b5391d`, **08 `38cffdece`** (the F1 fix), 09 `3484c378f`,
+  10 `d60105926`, 11 `e07549b55`, 12 `f6198fbc9`, 13 `1e5580ee9`, 14 `1bcf4e82d`.  If `/tmp` is gone:
+  clone `ggml-org/llama.cpp`, checkout `9113cc188`, `scripts/apply-all.sh .` (15/15 strict, tree
+  `4104e7d34`), build with `BUILD_DIR=build-base EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714`.
   Fast loop: `cmake --build build-base --target llama-cli llama-bench ggml-hip -j 16`.
-* Delivery repo `~/llama-cpp-rdna-boosts`, `main` = **`c6489c1`** (pushed).  Block 15 beta: tip
-  **`54859fdda`** (tree `543ccc015`, base `1d8f53594`), patch in
+* Delivery repo `~/llama-cpp-rdna-boosts`, `main` = **`b5da3cc`** (pushed).  Block 15 beta: tip
+  **`0c8099ca2`** (tree `7335b923d`, base `1bcf4e82d`), patch in
   `beta/block-15-campaign-wins/block-15-campaign-wins.patch`, `[PATCH 15/15]`.
+* **Your two workstreams are F2 cause 2 and F3** (F1 is done — see the STATUS note at the top).
 * 3x gfx1201 (R9700); ROCm `/opt/rocm-7.14-gfx1201`; `LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib`.
 * Models: 4B `/home/stew675/Qwen3.5-4B-Q8_0.gguf`; 27B `/llm/models/Qwen3.8/27B/Q8_0/Qwen3.8-27B-Q8_0.gguf`;
   MoE `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`;
