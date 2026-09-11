@@ -7,7 +7,7 @@
 **Status: BETA — staged, NOT promoted (2026-09-10); REVALIDATED 2026-09-11
 against the 15-patch delivery.**  The campaign is
 complete and the block-15 patch lives **only in this directory**
-(`block-15-campaign-wins.patch`, re-cut 2026-09-11); it is **not part of the
+(`block-15-campaign-wins.patch`, re-cut 2026-09-11 (9) on base `a0cd6ce02`); it is **not part of the
 delivery** (`patches/` is the 15-patch set: block 00 + blocks 01-14) and is
 applied manually on top of the 15-block tree.  The beta window (~4–5 days) is open for tester feedback;
 promotion into the delivery set requires the maintainer's go-ahead (at
@@ -24,6 +24,19 @@ now a **15-patch set**: block 00 + blocks 01-14 at canonical tip **`389c5341f`**
 tree `928852cdc`, with block 13 amended twice on 2026-09-11), so the beta patch was
 re-cut and re-validated end to end.
 
+* **Re-cut a seventh time 2026-09-11 (9)** after the fourth block-14 amendment (the QSA quantized-KV
+  enablement + the K/V-head chunking fix): base **`a0cd6ce02`** (tree `0966e66731`) -> **beta commit
+  `5a0734c9d`**, tree **`6b1155b68b1741d7e7c6e8f80b88ed90ce406bd6`**, patch **3 787 lines**.  One real
+  conflict again, in `src/models/qwen4exp.cpp` (block 15's `qwen4exp_qsa_sparse()` helper needs the
+  extended "QSA can read this type" conjunct - the amendment added the four nibble types there);
+  `fattn-qsa.cu`, `ggml-cpu/ops.cpp` and `tests/test-backend-ops.cpp` auto-merged.  **Auto-merge was not
+  enough in the test file:** block 15 adds two inputs to `ggml_flash_attn_qsa` (the derived-visibility
+  `cell_vis`/`q_vis`), so the new `test_flash_attn_qsa` case had to pass `nullptr, nullptr` - a *semantic*
+  merge fix that only the build caught (the tree compiled only after it).  Verified as a no-op at the gate
+  configs against the delivery build: qwen4exp f16 plain `804de0576868` (704 chars) and q4_1 plain
+  `886292b17a93` (694 chars) on both, 27B f16 `--spec-draft-n-max 3` acceptance `0.82716` (67/81, mean len
+  3.48) on both.  Patch round-trip re-verified (`git am -3` on a fresh `a0cd6ce02` reproduces tree
+  `6b1155b68`).
 * **Re-cut a sixth time 2026-09-11** after the F3 step-1 amendments moved the canonical tip (block 08
   gained the quantized KV-type enablement, block 14 the QSA-vs-KV-type arm gate + the tensor-split gate
   narrowing): base `6f07fe67a` (tree `0c9dece6b`) -> **beta commit `8c377b958`**, tree

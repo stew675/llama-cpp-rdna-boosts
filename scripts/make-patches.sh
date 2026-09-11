@@ -7,11 +7,12 @@
 #   baseline-sha  the upstream baseline the patches are generated against
 #                 (default: 9113cc188, see MANIFESTS.md)
 #   blocks-tip    the fork commit carrying block 00 + all 14 feature
-#                 blocks (default: 6f07fe67a, the block-14 commit of the
+#                 blocks (default: a0cd6ce02, the block-14 commit of the
 #                 CANONICAL fork rebuilt at 9113cc188, after the 2026-09-11
 #                 block-13 amendment -- the MoE decode/verify mmvq band --
-#                 and the 2026-09-11 block-14 amendment -- the QSA decode arm
-#                 band).
+#                 and the 2026-09-11 amendments to block 14: the QSA decode
+#                 arm band, and then the QSA quantized-KV enablement + the
+#                 K/V-head-aware block chunking).
 #                 The block-15
 #                 (attention-memory campaign) work is NOT part of the
 #                 delivery; it is staged in beta/block-15-campaign-wins/
@@ -34,7 +35,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
 BASELINE="${2:-9113cc188}"
-TIP="${3:-6f07fe67a}"
+TIP="${3:-a0cd6ce02}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then

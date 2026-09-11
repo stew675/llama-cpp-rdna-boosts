@@ -108,12 +108,12 @@ Block 15 is STAGED in `beta/block-15-campaign-wins/`, not promoted.
 - **Fork/canonical state**: the working checkout's `rdna-boosts` is a local rebuild and must NOT be used
   for regeneration if it sits on a master newer than the fork point (it would export `f3f1a8f27`
   + `304665fe7` as patches 0001/0002).  The canonical 15-block chain used for the delivery ends at the
-  block-14 commit `6f07fe67a` (rebuilt at `9113cc188`, net tree `0c9dece6b`; block 02 amended 2026-09-11 with the
+  block-14 commit `a0cd6ce02` (rebuilt at `9113cc188`, net tree `0c9dece6b`; block 02 amended 2026-09-11 with the
   K-independent whole-batch chunked GDN prefill — free, gate removed, + rollback guard; block 08 with the
   FA kernel-family fix + the quantized-KV-type enablement — see F3 below; block 13 with the two decode/verify
   band fixes; block 14 with the QSA decode arm + the QSA-vs-KV-type arm gate + the tensor-split gate
   narrowing); `make-patches.sh`
-  default tip = `6f07fe67a`.
+  default tip = `a0cd6ce02`.
   The beta block-15 patch is applied manually on top of that tree.
 - Superseded/still-useful artifacts: the work branch `wip/block15-campaign-wins` (`b26ae06f0`) and
   `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch` remain as the pre-merge
@@ -403,10 +403,27 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   it cannot read; block 14 now takes the dense masked path for non-QSA-native cache types, and the
   tensor-split gate asks `llama_kv_type_has_native_fa()`.  Two follow-ups it left behind: (a) on
   qwen4exp, quantized caches now use the **masked-dense prefill** for the indexer layers instead of the
-  fused sparse QSA op (**~13.8 % of long-context prefill**, measured 2026-09-11) — restoring it needs
-  `fattn-qsa` to read those types natively; **it is the next session's task and has its own brief:
-  `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-qsa-quantized-kv.md`** (see also the third
-  2026-09-11 block-14 amendment section in `patches/README.md`); (b) **NVIDIA only, and dead code on
+  fused sparse QSA op (**~13.8 % of long-context prefill**, measured 2026-09-11) — restoring it needed
+  `fattn-qsa` to read those types natively.  **DONE 2026-09-11 (9)** (fourth block-14 amendment, brief
+  `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-qsa-quantized-kv.md` §11): the kernel dequantizes
+  the four nibble types while staging a tile (prefill `q4_1` 2076 -> 2384 t/s at 32k on `-sm tensor`,
+  uniform with f16), and — the bigger find — the same sitting root-caused and fixed a **quality** bug
+  that every purity gate was blind to: the QSA kernel's head chunking was `QSA_MAX_HEADS` (16) per
+  block although all of a block's warps share **one** staged smem K/V tile, so with qwen4exp's
+  gqa = 12 (24 q-heads / 2 kv-heads) a block spanned two K/V heads and the tile mixed their rows for
+  16 of 24 heads (perplexity 7.33 -> 6.53 = the dense masked reference).  The chunking is now
+  `min(QSA_MAX_HEADS, gqa_ratio)`, the missing CPU reference for the new types plus a
+  `FLASH_ATTN_QSA` backend-op test (18 cases) were added (see `GREEDY-PURITY.md` §21 for the
+  instruments and the "why it survived" analysis).  Follow-ups it left behind: (i) **F3 step 2 =
+  `iq4_nl`** (the same shape: `dequantize_V_iq4_nl` + the predicate/instance/`qsa_kv_native` entries +
+  the same sweeps); (ii) the QSA **prefill** sparse-vs-dense crossover is not depth-configurable today
+  (measured on the reference `-sm tensor`: dense wins pp8192 by ~4.7 %, parity at pp16384, sparse wins
+  pp32768 by +14.5 %), so a `LLAMA_QSA_DENSE_PREFILL_UNTIL`-style gate is the natural next knob —
+  tensor-tuned, per the maintainer's rule that the crossover policy follows the tensor split; (iii) the
+  QSA op could be brought into the regular fused-op probe machinery
+  (`LLM_FUSED_OP_FLASH_ATTN_QSA`) so the model-side `qsa_kv_native` list stops duplicating the backend
+  predicate — note the probe compares the *device* a fused node lands on, which is a genuine
+  improvement over a hand-kept list but does not by itself catch a meta-split inconsistency; (b) **NVIDIA only, and dead code on
   every AMD device**: the chooser's remaining VEC returns live under `turing_mma_available()` /
   `volta_mma_available()`, both defined as `GGML_CUDA_CC_IS_NVIDIA(cc) && ...` (common.cuh:355-361), so
   `gfx1201`/`gfx1151`/`gfx1100` can never take them — and on RDNA4 the band is TILE *by construction*

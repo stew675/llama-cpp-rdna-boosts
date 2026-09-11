@@ -183,6 +183,20 @@ re-apply on the new base reproduces the recorded tree exactly.
 
 ---
 
+**Re-cut 2026-09-11 (seventh), after the fourth block-14 amendment.**  The canonical tip moved from
+`6f07fe67a` (tree `0c9dece6b`) to **`a0cd6ce02`** (tree `0966e66731`) because block 14 gained the QSA
+quantized-KV enablement (`q4_0`/`q4_1`/`q5_0`/`q5_1` are now read natively by the fused sparse kernel)
+plus the K/V-head chunking fix.  Merge: `git am -3` stops once, in `src/models/qwen4exp.cpp` (block 15's
+refactored `qwen4exp_qsa_sparse()` needs the extended type conjunct); `fattn-qsa.cu`, `ggml-cpu/ops.cpp`
+and `tests/test-backend-ops.cpp` auto-merge - but the test file needed a **semantic** fix that only the
+build found: block 15 adds `cell_vis`/`q_vis` to `ggml_flash_attn_qsa`, so the new `test_flash_attn_qsa`
+must pass `nullptr, nullptr` (the tree did not compile until it did).  Beta commit **`5a0734c9d`**, tree
+`6b1155b68b1741d7e7c6e8f80b88ed90ce406bd6`, patch **3 787 lines**, subject `[PATCH 15/15]`.
+**No beta number changes**: the merge is a no-op at every gate config, verified against the delivery
+build - qwen4exp f16 plain `804de0576868` (704 chars) and q4_1 plain `886292b17a93` (694 chars) on both,
+27B f16 `--spec-draft-n-max 3` acceptance `0.82716` (67/81, mean len 3.48) on both.  The patch
+round-trips (`git am -3` on a fresh `a0cd6ce02` reproduces the tree).
+
 **Re-cut 2026-09-11 (sixth), after the F3 step-1 amendments.**  The canonical tip moved from
 `5ad11fd35` (tree `3e7accbd7`) to **`6f07fe67a`** (tree `0c9dece6b`) because block 08 gained the
 quantized KV-type enablement (`q4_1`/`q5_0`/`q5_1` as FlashAttention cache types) and block 14 the

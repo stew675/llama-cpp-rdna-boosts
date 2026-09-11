@@ -102,6 +102,17 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   (`llama_init_from_model`) now asks `llama_kv_type_has_native_fa()` instead of a
   hardcoded `{q4_0, q8_0}`, so `q4_1`/`q5_0`/`q5_1` are allowed under tensor parallelism
   and `iq4_nl` keeps a clean error.  Verified per type on 3-GPU `-sm tensor` (27B, qwen4exp).
+  **Also amended 2026-09-11 with the QSA quantized-KV enablement and the K/V-head chunking fix**:
+  the fused QSA kernel now dequantizes `q4_0`/`q4_1`/`q5_0`/`q5_1` while staging a tile
+  (`get_dequantize_V<type, half, 4>`), so every cache type takes the same attention path on
+  qwen4exp (prefill 2076 -> 2384 t/s at 32k on `-sm tensor`, uniform with f16), and its head
+  chunking is now `min(QSA_MAX_HEADS, gqa_ratio)` instead of `QSA_MAX_HEADS` — the old split put
+  16 heads in one block whose shared smem K/V tile mixed **two** K/V heads (qwen4exp: 24 q-heads /
+  2 kv-heads = gqa 12), i.e. a silent quality bug (perplexity 7.33 -> 6.53 = the dense masked
+  oracle).  The same amendment adds the missing **CPU reference** for the four new types in
+  `ggml/src/ggml-cpu/ops.cpp` plus a `FLASH_ATTN_QSA` backend-op test (18 cases) — the kernel had
+  no oracle at all before, which is why a width-pure corruption survived every gate.  See
+  `GREEDY-PURITY.md` §21 and the block-14 notes in `patches/README.md`.
   See the block-14 notes in `patches/README.md` and the beta
   validation record in `beta/qwen4exp/README.md`.
 - Block **15** (STAGED in `beta/block-15-campaign-wins/`, **NOT a delivery patch**): the attention-memory campaign wins --
@@ -136,8 +147,8 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `6f07fe67a`, net tree
-  `0c9dece6b0798e41360b8a8366187f38f37e1566`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `a0cd6ce02`, net tree
+  `0966e66731a4c3da85ffd96525688865a89242cd`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the whole-batch
 K-independent chunked GDN prefill; block 08 amended 2026-09-11 with the
@@ -316,6 +327,19 @@ Consequences, so it is not re-litigated:
   relaxation, and again 2026-09-05 after the RDNA3_0/gfx1100 fold,
   and again 2026-09-06 on the `465e49b9c` re-base, and again 2026-09-07
   on the `050dde50c` re-base + block 14).
+- **The QSA op has an oracle now, and it needed one (2026-09-11).**  `test-backend-ops -o FLASH_ATTN_QSA`
+  compares the GPU kernel against `ggml_compute_forward_flash_attn_qsa` (CPU) over all seven KV types,
+  `gqa` 1 and 8, both decode/verify widths and the sliced walk — **18/18** must pass.  Two hard-won
+  facts: (1) the `W=1..8` logits-purity matrix is *blind* to a width-uniform corruption (it can only
+  prove widths agree with each other), and the probe cannot even reach this op by default (the indexer
+  selection width is 2051 > the probe's max `P`; force it with
+  `LLAMA_QSA_DENSE_SHORTCUT=0 LLAMA_QSA_DENSE_DECODE_UNTIL=0`); (2) **MTP acceptance is not a quality
+  signal when the defect is in both the draft and the main context** — the corrupted pair is
+  self-consistent and accepts *more* (0.65 vs 0.49).  The comparable quality metric is the
+  **perplexity ratio against the dense masked path** (`LLAMA_QSA_SPARSE_FA=0`, same attention, FA
+  kernels), which must match within noise.  A fused op with several heads sharing one staging buffer
+  must keep the block homogeneous in every index the staging reads (QSA: the K/V head) — see
+  `GREEDY-PURITY.md` §21.
 - **Block 02 (0002) now also carries the MTP chunked-prefix dispatch
   (PR #9, 2026-09-01):** long single-sequence MTP prefills (`K > 1`,
   `n_seqs == 1`, `n_tokens > K+64`) run the chunked WMMA GDN on the
@@ -554,7 +578,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `6f07fe67a`): `git format-patch --start-number 0` the block
+blocks tip `a0cd6ce02`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -563,7 +587,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `6f07fe67a`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `a0cd6ce02`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

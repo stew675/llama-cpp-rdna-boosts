@@ -1,8 +1,12 @@
 # KV-quant purity and parity follow-ups (found 2026-09-11)
 
-> **Starting the QSA-quantized-KV work (the current task)?** Read
-> **`HANDOVER-2026-09-11-qsa-quantized-kv.md`** — the measured prize, the verified mechanism facts, the
-> gate list and the landing steps for restoring the fused sparse QSA path on quantized caches.
+> **Starting the QSA-quantized-KV work?  DONE 2026-09-11 (9).**  It is
+> **`HANDOVER-2026-09-11-qsa-quantized-kv.md`** (see its §9 OUTCOME): the four nibble types are now read
+> natively by the fused sparse QSA kernel (fourth block-14 amendment), and the same sitting found and
+> fixed a **quality** bug in that kernel's head chunking (a block's shared smem K/V tile mixed two K/V
+> heads for qwen4exp's gqa 12; perplexity 7.33 -> 6.53 = the dense oracle).  That brief also carries the
+> instrument lessons (the width-purity matrix is blind to a width-uniform corruption; the probe never ran
+> the op by default; MTP acceptance points the wrong way) — they are now in `../../GREEDY-PURITY.md` §21.
 > **Starting the F3 (KV-diagonal) work?** Read
 > **`HANDOVER-2026-09-11-f3-kv-diagonals.md`** — scope, the verified-vs-open mechanism facts, and the
 > "instrument before coding" first task.  **Starting anything else?** Read

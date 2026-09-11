@@ -19,11 +19,20 @@
 > line and the `qwen4exp.cpp` hunk headers differ), so no beta number needs re-measuring.  **Re-cut a
 > sixth time 2026-09-11** after the F3 step-1 amendments (block 08's quantized KV-type enablement,
 > block 14's QSA-vs-KV-type arm gate + tensor-split gate): base `6f07fe67a` (tree `0c9dece6b`) ->
-> **beta commit `8c377b958`**, tree `34527a292`.  This one is **functional**, not metadata-only — the
+> **beta commit `8c377b958`**, tree `34527a2926246893104015d6ca5d12844b14f037`.  This one is **functional**, not metadata-only — the
 > merge threads the KV type through block 15's refactored `qwen4exp_qsa_sparse()` (new
 > `llama_cparams::type_k/type_v`), which is a no-op for every f16/q8_0 beta config: the tree builds and
 > the beta output is byte-identical to the delivery's at the gate configs (qwen4exp f16 plain
 > `804de0576868`; 27B f16 `n_max 3` acceptance `0.82716`), so the recorded numbers stand.
+> **Re-cut a seventh time 2026-09-11 (9)** after the **fourth** block-14 amendment (the QSA quantized-KV
+> enablement + the K/V-head chunking fix): base `a0cd6ce02` (tree `0966e66731`) -> **beta commit
+> `5a0734c9d`**, tree `6b1155b68b1741d7e7c6e8f80b88ed90ce406bd6`, patch **3 787 lines**.  One real
+> conflict in `src/models/qwen4exp.cpp` (block 15's `qwen4exp_qsa_sparse()` needs the extended QSA-type
+> conjunct; `fattn-qsa.cu`/`ops.cpp`/`test-backend-ops.cpp` auto-merged) **plus a semantic fix the build
+> caught**: block 15 adds `cell_vis`/`q_vis` to `ggml_flash_attn_qsa`, so the delivery's new
+> `test_flash_attn_qsa` passes `nullptr, nullptr` in the beta.  Verified as a no-op at the gate configs
+> against the delivery build (qwen4exp f16 plain `804de0576868`, q4_1 plain `886292b17a93`, 27B f16
+> `n_max 3` acceptance `0.82716`); the patch round-trips on a fresh `a0cd6ce02`.
 > The dependent delta was exactly one file
 > (`fattn-common.cuh`), the textual apply was clean, every 2026-09-10 number
 > reproduced to the last decimal, and three **pre-existing** follow-ups were

@@ -9,32 +9,24 @@ The **current delivery** is a **15-patch set** (block 00 + blocks 01-14) against
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`):
 blocks 00-14 (`patches/0000-…0014-…`, format-patch of the
-fork's `rdna-boosts` block commits — the current regeneration
-on `9113cc188` uses the canonical 15-block tip `6f07fe67a` (block 02 amended twice 2026-09-11 — the
-K-independent whole-batch chunked GDN prefill is the final form — block 13 amended 2026-09-11 three
-times (MoE `MUL_MAT_ID` dispatch, the per-type mmvq cap band and the fused shared-expert epilogue
-band) and block 14 amended 2026-09-11 twice (the hyper-connection band and the QSA decode arm)),
-because the reference `~/llama.cpp` checkout had drifted
-two upstream master commits past the fork point (`f3f1a8f27`, `304665fe7`
-— SYCL + iGPU-only code) and a `format-patch` there would have exported
-those as patches 0001/0002; the delivered `0001`-`0014` bodies are
-byte-identical to the previous (14-patch) regeneration apart from the `From <sha>`
-line and the `[PATCH NN/15]` series count; block `0000` is new.  **Block 15 (the attention-memory
-campaign, V3/V4/V5 + W1-W4) is NOT part of the delivery** — it is staged in
-`beta/block-15-campaign-wins/` and applied manually on top of the 15-block
-tree; see that directory's README and the WORKLOG entry; block 00 added
-2026-09-10 (structural and architecture fixes: FA small-batch KV-split width
-invariance for issue #25 + Vulkan masked-V); block 01 refreshed 2026-09-09 to
-the llama.cpp PR #27210 review head `d236d41a2`; block 03 amended 2026-09-10
-with the HIP masked-V fixes (re-homed from block 14); block 14's 2026-09-09
-gfx1151-only freed-cell KV host zeroing is removed and its masked-V fixes were
-re-homed (Vulkan to block 00, HIP to block 03) — see
-the dated records below; regenerated tip `6f07fe67a`, blocks' bodies
-byte-identical to the previous regeneration apart from the `From <sha>` line,
-(the block-13 amendment adds the dense ncols==1 ksplit alignment)
-the series count and the block-00/block-03 masked-V hunks; the previous
-regeneration `f84549d23..78e67a3d8` is superseded
-and preserved on the fork's history/remotes); the 2026-09-08 re-base reduced
+fork's `rdna-boosts` block commits).  **Current regeneration (2026-09-11 (9))**: canonical 15-block
+tip **`a0cd6ce02`** (net tree `0966e66731a4c3da85ffd96525688865a89242cd`), clean-apply strict 15/15
+with 0 whitespace warnings and the applied tree equal to the canonical one.  Block 14's body changed
+in this regeneration (its fourth 2026-09-11 amendment: the QSA quantized-KV enablement + the K/V-head
+chunking fix); block 15's beta patch was re-cut for it (7th re-cut) and every other block body is
+byte-identical to the 2026-09-11 (8) regeneration apart from the `From <sha>` line.  The regeneration
+is always run against a canonical fork **rebuilt at the fork point**, because the reference
+`~/llama.cpp` checkout had drifted two upstream master commits past `9113cc188` (`f3f1a8f27`,
+`304665fe7` — SYCL + iGPU-only code) and a `format-patch` there would export those as patches
+0001/0002; block `0000` is the structural/architecture-fix block added 2026-09-10 (FA small-batch
+KV-split width invariance for issue #25 + Vulkan masked-V), block 01 was refreshed 2026-09-09 to the
+llama.cpp PR #27210 review head `d236d41a2`, block 03 carries the HIP masked-V fixes (re-homed from
+block 14 on 2026-09-10), block 06 is the host-buffer rationale marker (upstream itself reverted
+#24233 in #28604, so the functional delta is upstream), and block 14's 2026-09-09 gfx1151-only
+freed-cell KV host zeroing is removed.  **Block 15 (the attention-memory campaign, V3/V4/V5 + W1-W4)
+is NOT part of the delivery** — it is staged in `beta/block-15-campaign-wins/` and applied manually
+on top of the 15-block tree with `git am -3`; see that directory's README and the dated WORKLOG
+entries.  The 2026-09-08 re-base reduced
 block 06 to its host-buffer rationale marker (upstream itself reverted
 #24233 in #28604 on 2026-09-08 — end state identical) and merged block
 14's quantized-KV tensor-split gate additively with upstream #28390's
@@ -178,7 +170,7 @@ per-win measurement tables are in `beta/block-15-campaign-wins/README.md`.
 
 Apply + regeneration verification (the 14/14 / `[PATCH NN/14]` / `ff2b35f49`
 figures below are the then-current state; block 00 was added 2026-09-10, so the
-current delivery is the 15-patch set `0000`-`0014`, tip `6f07fe67a`):
+current delivery is the 15-patch set `0000`-`0014`, tip `a0cd6ce02`):
 
 - fresh worktree at `9113cc188` -> `scripts/apply-all.sh` (**strict 14/14
   `git am`** for the then-14-patch delivery, zero whitespace warnings) + the beta

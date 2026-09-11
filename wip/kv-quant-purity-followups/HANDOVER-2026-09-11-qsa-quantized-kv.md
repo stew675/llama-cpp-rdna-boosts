@@ -203,3 +203,59 @@ prefill A/B table above filled in for quantized caches, a `FLASH_ATTN_QSA` backe
 documented reason there is none), and a dated WORKLOG entry.  Then hand back with a one-line pointer to
 the `iq4_nl` brief (F3 step 2), which by then is only "one more `dequantize_V_iq4_nl` + the same four
 edits".
+
+## 9. OUTCOME — landed 2026-09-11 (fourth block-14 amendment), plus a quality bug found on the way
+
+**Both changes are in, and the second one matters far more than the task.**
+
+1. **The four types are enabled** (as planned in §5): the tile staging dequantizes `q4_0`/`q4_1`/`q5_0`/`q5_1`
+   to F16 through `get_dequantize_V<type_KV, half, 4>` (the vec-FA / lightning-indexer idiom), the dispatch
+   and `kv_ok` predicates gained them, and `qsa_kv_native` was extended in lockstep.  Measured on the
+   reference config (3x R9700 `-sm tensor`, pp-only): `q4_1` 2076.4 -> **2384.2 t/s at 32 768** (f16 sparse
+   2380.9, dense-masked `q4_1` 2078.1), pp8192 2416.7 -> 2404.1 (f16 2376.5) - the long-context prefill the
+   type used to lose is recovered and it now tracks f16 exactly.  So the §2 prize table was right about the
+   *shape*: the quantized cache was denied the sparse arm, not a faster kernel per se.
+2. **The kernel's head chunking was wrong, and it was a silence-a quality bug.**  One QSA block stages ONE
+   K/V tile into shared memory for all its warps, so every q-head in a block must map to the same K/V head -
+   but the chunking was `head_base += QSA_MAX_HEADS` (16) while qwen4exp is 24 q-heads / 2 kv-heads
+   (gqa = **12**): a 16-warp block spanned two K/V heads (each staging thread adds its own head's offset
+   before the cooperative gather), so 16 of 24 heads attended over a **mixed** tile.  Fixed to
+   `min(QSA_MAX_HEADS, gqa_ratio)` heads per block.  Quality, over 8 x 4096 tokens, 3-GPU `-sm layer`:
+   perplexity 7.3269 +/- 0.151 -> **6.5267 +/- 0.132**, i.e. exactly the dense-masked oracle (6.5306 +/- 0.132);
+   `q4_1` 6.5787 vs 6.5805 dense, `q5_0` 6.5444 vs 6.5375.
+
+**Three instrument lessons, all now in the gates (`GREEDY-PURITY.md` §21):**
+
+* the `W=1..8` purity matrix is **blind to a width-uniform corruption** - it proves widths agree with each
+  other, not with the definition of the op.  (Both builds are perfectly pure.)
+* **the probe never ran the QSA op at all** unless the selection path is forced: the op only exists above the
+  indexer selection width (`indexer_top_k + r - 1` = 2051) and the probe's `n_ctx` is 2048 (max `P` = 2040).
+  The QSA purity gate is therefore `LLAMA_QSA_DENSE_SHORTCUT=0 LLAMA_QSA_DENSE_DECODE_UNTIL=0` + the probe.
+* **MTP acceptance pointed the wrong way**: draft and main context share the same wrong attention, so the
+  corrupted pair is self-consistent and accepts *more* (0.65 vs the fixed 0.49).  The comparable quality
+  metric is **perplexity against the dense masked path** (`LLAMA_QSA_SPARSE_FA=0`), and that is what caught it.
+
+**New permanent instruments** (both part of the amendment): the CPU reference
+`ggml_compute_forward_flash_attn_qsa` now covers the four nibble types, and `tests/test-backend-ops.cpp` has
+18 `test_flash_attn_qsa` cases (all 7 KV types, gqa 1 and 8, `D` 64/128/256, `n_tps` 1 and 4, sliced walks) -
+**0/18 before the fix, 18/18 after** (the old kernel scores NMSE ~1.0 against the reference).  The scripts
+live in `tools/` (`qsa-ppl-oracle.sh`, `qsa-width-qsaforced.sh`, `qsa-tensor-perf.sh`).
+
+**Landing**: fourth block-14 amendment, canonical tip **`a0cd6ce02`** (tree
+`0966e66731a4c3da85ffd96525688865a89242cd`); clean-apply strict 15/15 (0 whitespace warnings, tree equal),
+sim build + coherence (`1c5d32ac537d`) equal to the canonical build; block 15 re-cut a 7th time
+(`8a0e2eb3f`, tree `764808b4c`, patch 3 774 lines - one real conflict in `src/models/qwen4exp.cpp`:
+block 15's `qwen4exp_qsa_sparse()` helper needs the extended type conjunct; `fattn-qsa.cu` auto-merged).
+Full gate list and numbers in the 2026-09-11 (9) `WORKLOG.md` entry.
+
+**The next brief is F3 step 2 = `iq4_nl`** (`HANDOVER-2026-09-11-f3-kv-diagonals.md` §10): it now has the
+same shape as this one - one more `dequantize_V_iq4_nl` (CPU reference too), the predicate/instance/
+`qsa_kv_native` entries, the same sweeps **plus** the new CPU oracle and the perplexity-against-dense gate,
+which is the part that would otherwise stay invisible.
+
+**A note on the arch policy (tensor split is the reference):** the decode crossover
+(`qsa_dense_decode_until` = dense decode at every depth on gfx1201) was re-measured on the fixed kernel and
+**stands** (tg128 d0/8192/32768: dense 51.4/51.8/49.9 vs forced-sparse 51.1/47.6/44.7).  The *prefill*
+sparse arm is not depth-configurable today: on `-sm tensor` dense wins pp8192 by ~4.7 %, they are at parity
+at pp16384 and sparse wins pp32768 by +14.5 % (f16 2380.9 vs 2079.9; `q4_1` 2384.2 vs 2078.1) - a
+`LLAMA_QSA_DENSE_PREFILL_UNTIL`-style gate tuned on the tensor split is the natural follow-up.

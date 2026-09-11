@@ -736,3 +736,55 @@ Two consequences worth recording:
   cache type is not QSA-native.  The lesson generalises: when a cache type is enabled for one
   attention op, check every op that consumes the cache in that graph (and every split mode).
 
+## 21. A shared staging tile makes a block head-homogeneous (2026-09-11, block-14 amendment; and the two instruments that found it)
+
+The QSA kernel (`ggml/src/ggml-cuda/fattn-qsa.cu`) gives one block up to `QSA_MAX_HEADS = 16` query
+heads (one warp each) and stages **one** K/V tile into shared memory for all of them: the cooperative
+gather is issued by every thread of the block, and each thread adds *its own head's* K/V offset
+(`nb12*(head/gqa_ratio)`) before it writes the shared rows.  That is only valid while every q-head in
+the block maps to the **same K/V head** - which the old `head_base += QSA_MAX_HEADS` chunking silently
+assumed.  qwen4exp is 24 q-heads / 2 kv-heads = **gqa 12 < 16**, so a 16-warp block covered heads
+0..15 and heads 12..15 wrote the *second* K/V head's rows into the same smem slots: 16 of 24 heads
+attended over a tile that mixed both heads' V rows.  The chunking is now
+`min(QSA_MAX_HEADS, gqa_ratio)` heads per block (a no-op at `gqa_ratio >= 16`).
+
+**This is the general rule, not a QSA detail:** whenever several heads/sequences/rows share one
+staged buffer, the block's work partition must be homogeneous in every index that the *staging* reads
+but the *compute* does not re-apply.  QSA applies the head only to Q (and to K/V, before staging), so
+the head is exactly such an index.
+
+### Why nothing caught it (and the two instruments that do)
+
+1. **Width purity cannot see it.**  The bug is perfectly *width-uniform*: every `W = 1..8` takes the
+   same arm, the same tile composition and the same wrong rows, so the primary instrument of every
+   earlier QSA finding (the `W=1..8` logits-purity matrix) reports a clean, self-consistent band.  An
+   *internal* consistency gate is necessary but never sufficient: it can only prove that widths agree
+   with **each other**, not that they agree with the definition of the op.
+2. **The probe was blind to the op.**  The QSA op is only built above the indexer selection width
+   (`indexer_top_k + r - 1` = 2051 for qwen4exp) or when the dense-shortcut/decode gates are off; the
+   probe's context is `n_ctx = 2048` (max `P = 2040`), so the *default* probe configuration never
+   executed `GGML_OP_FLASH_ATTN_QSA` at all.  The matrix becomes meaningful only with
+   `LLAMA_QSA_DENSE_SHORTCUT=0 LLAMA_QSA_DENSE_DECODE_UNTIL=0` (force the selection path at every
+   width) - which is now how the QSA kernel's purity gate is run.
+3. **MTP acceptance points the wrong way here.**  The draft context and the main context run the same
+   wrong attention, so the corrupted pair is *self-consistent* and accepts **more** than the correct
+   pair (0.65 vs 0.49): acceptance is a quality signal only when both sides are known-good, never when
+   the same defect sits in both.
+4. **The instruments that do catch it** (both added in the same amendment):
+   * a **CPU reference for the op** - `ggml_compute_forward_flash_attn_qsa` already implemented
+     f16/bf16/q8_0 and now the four nibble types too, and a new `test_flash_attn_qsa` case in
+     `tests/test-backend-ops.cpp` compares the GPU kernel against it over the KV types, both cache-
+     type widths (gqa 1 and gqa 8), the three head sizes, `n_tps = 1` and `4` and the sliced+combined
+     walk (**18 cases**; the old kernel scores NMSE ~1.0, the fixed one < 5e-4);
+   * the **dense masked path as an oracle** - `LLAMA_QSA_SPARSE_FA=0` computes the *same* attention
+     (the same top-k cells, unmasked, through the well-tested FA kernels), so the sparse/dense
+     perplexity over one token stream is a directly comparable quality metric.  On 3x R9700
+     (`-sm layer`, 8 x 4096 tokens) the old kernel is **7.3269 +/- 0.151** against the dense
+     **6.5306 +/- 0.132** (+12 %), and the fixed kernel **6.5267 +/- 0.132** - i.e. the fix recovers
+     exactly the oracle.  The same table for `q4_1` (6.5787 vs 6.5805) and `q5_0` (6.5444 vs 6.5375)
+     validates the newly enabled quantized paths.
+
+The corollary for this project's gate list: for any *fused* op, a purity sweep is not a correctness
+gate.  Pair it with an independent oracle (a CPU/reference implementation, or a well-tested
+alternative path computing the same math) and keep the oracle in the test suite, not just in a
+one-off measurement.

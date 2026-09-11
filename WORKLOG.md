@@ -1,5 +1,81 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-11 (9) — the QSA kernel gets an oracle, four more KV types, and a head-group fix (quality)
+
+**Canonical tip `a0cd6ce02`** (block 14 amended a fourth time; block 13 `1a88c92f5`), net tree
+`0966e66731a4c3da85ffd96525688865a89242cd`, 15 blocks, clean-apply strict 15/15 with 0 whitespace
+warnings, applied tree == canonical, sim build clean and its coherence hash equal to the canonical
+build's (`1c5d32ac537d`).  Delivery `main` carries the regenerated set (`rdna-boosts-all.patch`
+21 750 lines) and the 7th block-15 beta re-cut (`8a0e2eb3f`, tree `764808b4c`, patch 3 774 lines).
+
+**The task was "let the fused sparse QSA op read the quantized caches" — it turned into a correctness
+finding.**  Two changes, one amendment:
+
+* **Quantized KV for QSA.**  `q4_0`/`q4_1`/`q5_0`/`q5_1` rows are now dequantized to F16 while a tile is
+  staged (`get_dequantize_V<type_KV, half, 4>`, the idiom the vec FA kernel and the lightning indexer
+  already use), with the four types threaded through the dispatch, `ggml_cuda_flash_attn_qsa_supported()`
+  and `qsa_kv_native`.  Effect on 3x R9700 `-sm tensor`: `q4_1` prefill 2076.4 -> **2384.2 t/s at
+  32 768** (dense masked reference 2078.1, f16 sparse 2380.9) — the quantized cache now tracks f16
+  exactly, at pp8192 2404.1 (f16 2376.5) — i.e. the ~13.8 % long-context prefill the type used to lose
+  is recovered, which was the measured prize that started this.
+* **The head-group fix (the important half).**  A QSA block stages ONE K/V tile into shared memory and
+  every warp reads it, so all of the block's q-heads must map to the same K/V head.  The chunking was
+  `head_base += QSA_MAX_HEADS` (16) — and qwen4exp is 24 q-heads / 2 kv-heads = **gqa 12**, so a 16-warp
+  block mixed heads 0..11 (kv 0) with 12..15 (kv 1) into the same smem rows (each staging thread adds
+  its own head's K/V offset before the cooperative gather).  16 of 24 heads attended over the wrong V
+  rows.  Now `min(QSA_MAX_HEADS, gqa_ratio)` heads per block (a no-op at gqa >= 16; for qwen4exp two
+  blocks of 12).  Quality, measured as perplexity over 8 x 4096 tokens, 3-GPU `-sm layer`:
+  **7.3269 +/- 0.151 -> 6.5267 +/- 0.132**, versus the dense masked oracle **6.5306 +/- 0.132** (the
+  dense path computes the same top-k attention through the well-tested FA kernels).  The same table
+  validates the new types (`q4_1` 6.5787 vs 6.5805 dense, `q5_0` 6.5444 vs 6.5375).
+
+**It also fixed a hole in the test suite.**  `test-backend-ops` had **no** `FLASH_ATTN_QSA` coverage, and
+the CPU reference (`ggml_compute_forward_flash_attn_qsa`) knew only f16/bf16/q8_0 — so the kernel that
+serves qwen4exp's default attention path had *no oracle anywhere*.  This entry adds the four types to
+the CPU reference and 18 `test_flash_attn_qsa` cases (all seven KV types; gqa 1 and 8; the three head
+sizes; `n_tps` 1 and 4; sliced+combined top-k walks).  **0/18 -> 18/18**: the old kernel scores NMSE
+~1.0 (i.e. it computes something else entirely), the fixed one < 5e-4.
+
+**Why every earlier gate missed it** (`GREEDY-PURITY.md` §21): the corruption is *width-uniform*, so the
+`W=1..8` purity matrix — the instrument behind every previous QSA finding — is structurally blind to
+it; the probe never even executed the op (the QSA op only exists above the indexer selection width
+`indexer_top_k + r - 1` = 2051, and the probe's `n_ctx` is 2048, so its max `P` = 2040 — forcing the
+selection path with `LLAMA_QSA_DENSE_SHORTCUT=0 LLAMA_QSA_DENSE_DECODE_UNTIL=0` is now part of the QSA
+gate); and MTP acceptance pointed the *wrong way* (draft and main run the same wrong attention, so the
+corrupted pair is self-consistent and accepts **more**: 0.65 vs 0.49).  The instruments that catch it
+are the CPU oracle and the dense path as a reference — both now permanent.
+
+**Validation** (all 3x R9700 gfx1201, canonical `a0cd6ce02`): `FLASH_ATTN_QSA` 18/18, `FLASH_ATTN_EXT`
+5599/5599, `GATED_DELTA_NET` 4/4; probe purity with the QSA op forced at every width, all seven types,
+both splits (f16 tensor `f400a002bd0af7df` is **identical** for the pre-fix and fixed builds — the fix
+is provably a no-op in the tensor split, where the kernel sees one K/V head per device: `Q.ne2=12,
+K.ne2=1`; layer f16 `18bc218586c80f91` -> `9aef99f6a614de4c`; the four new types
+layer `83b460071c92c4be`/`9e6035525c2e3f07`/`c5e332fed9aa1c18`/`a0bad36e46adaf57`, tensor
+`85cd44e288fe6124`/`595721104be83ac1`/`524d2df8d1be0987`/`3b4a5b989b988134`, all `W=1..8` pure);
+text purity (`/tmp/prompt3k.txt` = 2122 tokens, just over the selection width, so the sparse arm really
+runs) tensor f16 `804de0576868` (**unchanged** = the recorded reference), layer f16 `95817e5d366a`,
+tensor `q4_1` `886292b17a93`, layer `q4_1` `b15e1c98dbf8`, tensor `q4_0` `26065aab382c`, each
+`plain == n_max 3 == n_max 7`; MTP `n_max 3` pos-1 acceptance 0.651 (layer `q4_1`, aggregate 0.402) /
+0.771 (tensor `q4_1`) / 0.49 (layer f16) / 0.47009 (tensor f16, unchanged); prefill `-sm tensor`
+p8192/16384/32768 f16 2376.5/2435.1/2380.9, `q4_1` 2404.1/2452.5/2384.2, dense 2493.0/2411.8/2079.9;
+decode `-sm tensor` d0/8192/32768 tg128 f16 51.4/51.8/49.9 (dense-decode default) vs 51.1/47.6/44.7
+(forced sparse) — **the arch decode policy was re-measured on the fixed kernel and stands** (dense wins
+at every depth); non-QSA regression: 4B/27B probe hashes reproduce exactly and every non-QSA file is
+untouched.
+
+**Landing**: block 14 amended in place (`git commit --amend`, the delta byte-identical to the validated
+working diff — it is the tip, so no rebase), `scripts/make-patches.sh` default tip -> `a0cd6ce02`,
+`rdna-boosts-all.patch` refreshed by hand, clean-apply sim re-verified, block 15 re-cut a seventh time
+(one real conflict in `src/models/qwen4exp.cpp`: block 15's refactored `qwen4exp_qsa_sparse()` needs the
+extended type conjunct; `fattn-qsa.cu`/`ops.cpp`/`test-backend-ops.cpp` auto-merged), beta patch
+re-exported (3 774 lines, subject `[PATCH 15/15]`, round-trip verified).
+
+**Also recorded**: `AGENTS.md` gained the "RDNA first, other backends uninjured" scope policy (the F1
+VEC arms stay as they are — AMD can't reach them, NVIDIA has its own maintainers) and the QSA-oracle
+critical fact; `patches/README.md` gained the fourth-amendment section; `GREEDY-PURITY.md` §21 records
+the shared-staging-tile rule and the instrument analysis; `TODO.md` marks the task done and lists
+`iq4_nl` (F3 step 2), the tensor-tuned prefill crossover knob and the QSA fused-op probe as follow-ups.
+
 ## 2026-09-11 (8) — F3 step 1: `q4_1`/`q5_0`/`q5_1` become first-class KV cache types
 
 **Canonical tip `6f07fe67a`** (block 08 `1a488fcf0`, block 14 `6f07fe67a`), net tree

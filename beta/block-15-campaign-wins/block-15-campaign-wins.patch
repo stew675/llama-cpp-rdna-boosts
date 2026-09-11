@@ -1,4 +1,4 @@
-From 8c377b958d89add4d6b6441973e482f02898f359 Mon Sep 17 00:00:00 2001
+From 5a0734c9d1ec666102b911e88527bfb38acdd59b Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -171,25 +171,25 @@ report GGML_BACKEND_DEVICE_TYPE_GPU and normally have n_stream == 1).
  ggml/src/ggml-backend-meta.cpp       |  18 +-
  ggml/src/ggml-cpu/ops.cpp            |  71 +++++-
  ggml/src/ggml-cuda/fattn-common.cuh  | 209 ++++++++++++++++-
- ggml/src/ggml-cuda/fattn-mma-f16.cuh | 290 +++++++++++++++++++++---
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh | 290 ++++++++++++++++++++---
  ggml/src/ggml-cuda/fattn-qsa.cu      |  47 +++-
  ggml/src/ggml-cuda/fattn-tile.cu     |  10 +
- ggml/src/ggml-cuda/fattn-tile.cuh    | 125 +++++++++--
+ ggml/src/ggml-cuda/fattn-tile.cuh    | 125 ++++++++--
  ggml/src/ggml-cuda/fattn-vec.cuh     |   6 +-
- ggml/src/ggml-cuda/fattn.cu          |  51 ++++-
+ ggml/src/ggml-cuda/fattn.cu          |  51 +++-
  ggml/src/ggml-cuda/indexer-topk.cu   |  74 ++++--
  ggml/src/ggml.c                      |  99 ++++++--
  src/llama-context.cpp                | 130 ++++++++++-
  src/llama-cparams.h                  |   5 +
  src/llama-graph.cpp                  | 183 +++++++++++----
  src/llama-graph.h                    |  60 +++++
- src/llama-kv-cache.cpp               | 189 +++++++++++++++-
+ src/llama-kv-cache.cpp               | 189 ++++++++++++++-
  src/llama-kv-cache.h                 |  20 +-
  src/llama-memory-hybrid-idx.cpp      |  95 +++++++-
  src/llama-memory-hybrid-idx.h        |  17 +-
- src/models/qwen4exp.cpp              | 325 ++++++++++++++++++++++-----
- tests/test-backend-ops.cpp           |  49 +++-
- 23 files changed, 1913 insertions(+), 226 deletions(-)
+ src/models/qwen4exp.cpp              | 335 ++++++++++++++++++++++-----
+ tests/test-backend-ops.cpp           |  55 ++++-
+ 23 files changed, 1920 insertions(+), 235 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 1a8e68103..8b9ebb315 100644
@@ -336,7 +336,7 @@ index a39b4f6ca..5ad0a5027 100644
              } break;
              case GGML_OP_INDEXER_SCORE: {
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index cd4122a7d..da3f411cd 100644
+index f4c89292c..f89b29a2c 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -8612,6 +8612,21 @@ void ggml_compute_forward_top_k(
@@ -424,7 +424,7 @@ index cd4122a7d..da3f411cd 100644
      GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
      GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
      GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
-@@ -12556,10 +12588,14 @@ static void ggml_compute_forward_indexer_topk_impl(
+@@ -12580,10 +12612,14 @@ static void ggml_compute_forward_indexer_topk_impl(
      const ggml_tensor * score    = dst->src[0];
      const ggml_tensor * cell_blk = dst->src[1];
      const ggml_tensor * additive = dst->src[2];
@@ -440,7 +440,7 @@ index cd4122a7d..da3f411cd 100644
      GGML_ASSERT(dst->type      == GGML_TYPE_I32);
  
      const int k = ggml_get_op_params_i32(dst, 0);
-@@ -12579,8 +12615,29 @@ static void ggml_compute_forward_indexer_topk_impl(
+@@ -12603,8 +12639,29 @@ static void ggml_compute_forward_indexer_topk_impl(
      const int64_t s0 = 0;
      GGML_UNUSED(s0);
      const auto cell_value = [&](int64_t c, int64_t row) -> float {
@@ -1213,10 +1213,10 @@ index 8428b01f7..d178ebf40 100644
      GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
          max_bias, m0, m1, n_head_log2, logit_softcap,
 diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
-index d61e96a68..1e20d6ddc 100644
+index 31d4a1ce7..bbc61d8b4 100644
 --- a/ggml/src/ggml-cuda/fattn-qsa.cu
 +++ b/ggml/src/ggml-cuda/fattn-qsa.cu
-@@ -48,6 +48,10 @@ static __global__ void flash_attn_qsa(
+@@ -50,6 +50,10 @@ static __global__ void flash_attn_qsa(
          const char * V_ptr,
          const int  * idx_ptr,
          const char * mask_ptr,
@@ -1227,7 +1227,7 @@ index d61e96a68..1e20d6ddc 100644
          float      * dst_ptr,
          float      * parts_ptr,
          float2     * meta_ptr,
-@@ -110,7 +114,22 @@ static __global__ void flash_attn_qsa(
+@@ -112,7 +116,22 @@ static __global__ void flash_attn_qsa(
      K += nb13*sequence + nb12*(head / gqa_ratio);
      V += nb23*sequence + nb22*(head / gqa_ratio);
      idx += col*ne40 + sequence*ne40*ne41; // [n_top_k, n_tps, 1, n_stream]
@@ -1251,7 +1251,7 @@ index d61e96a68..1e20d6ddc 100644
  
      const int row  = (sequence*int(ne01.z) + col)*ne02 + head;
      const int k0   = slice*n_slice_cells;
-@@ -211,7 +230,7 @@ static __global__ void flash_attn_qsa(
+@@ -241,7 +260,7 @@ static __global__ void flash_attn_qsa(
                      }
                  }
                  if (flat < tile_len) {
@@ -1260,7 +1260,7 @@ index d61e96a68..1e20d6ddc 100644
                  }
              }
              __syncthreads();
-@@ -359,7 +378,7 @@ static __global__ void flash_attn_qsa(
+@@ -389,7 +408,7 @@ static __global__ void flash_attn_qsa(
                  // reads M_smem for every K/V type, but only the F16/Q8_0
                  // gather wrote it (uninitialized smem otherwise)
                  if (flat < tile_len) {
@@ -1269,7 +1269,7 @@ index d61e96a68..1e20d6ddc 100644
                  }
              }
              __syncthreads();
-@@ -457,6 +476,8 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
+@@ -487,6 +506,8 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
      const ggml_tensor * V   = dst->src[2];
      const ggml_tensor * idx = dst->src[3];
      const ggml_tensor * mask = dst->src[4];
@@ -1278,7 +1278,7 @@ index d61e96a68..1e20d6ddc 100644
  
      cudaStream_t main_stream = ctx.stream();
  
-@@ -534,14 +555,20 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
+@@ -574,14 +595,20 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
                  (const char *) K->data,
                  (const char *) V->data,
                  (const int  *) idx->data,
@@ -1301,7 +1301,7 @@ index d61e96a68..1e20d6ddc 100644
                  idx->ne[0], idx->ne[1], idx->ne[3], idx->nb[1], idx->nb[3]);
          } else {
              constexpr bool use_logit_softcap = true;
-@@ -550,14 +577,20 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
+@@ -590,14 +617,20 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
                  (const char *) K->data,
                  (const char *) V->data,
                  (const int  *) idx->data,
@@ -3216,10 +3216,10 @@ index 4b30994d1..c5ce4bd51 100644
                         int32_t * dst_derived_from = nullptr,
                         int32_t * dst_derived_lim  = nullptr) const;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index ef588d06d..9a0ba27ca 100644
+index 83476eeec..02bcc6c2d 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -935,20 +935,101 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
+@@ -935,20 +935,104 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
  
  // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
  // one mean-pooled indexer key scores each block; set_input resolves the cache layout
@@ -3272,17 +3272,20 @@ index ef588d06d..9a0ba27ca 100644
 +        const char * env = getenv("LLAMA_QSA_SPARSE_FA");
 +        return env == nullptr || std::atoi(env) != 0;
 +    }();
-+    // The fused sparse kernel reads the K/V cache rows natively and its load dispatch covers
-+    // f16/bf16/q8_0 only - the set ggml_cuda_flash_attn_qsa_supported() exposes for
-+    // GGML_OP_FLASH_ATTN_QSA.  Any other cache type, including the quantized
-+    // q4_0/q4_1/q5_0/q5_1 that plain flash attention does support, must take the dense masked
-+    // path instead (the same path as LLAMA_QSA_SPARSE_FA=0): an unsupported qsa op is not split
-+    // across the tensor-parallel devices, so its output stays mirrored while the attention gate
-+    // remains hidden-split and the meta splitter aborts on the attn_gated MUL (observed with
-+    // qwen4exp + --cache-type-k q4_0/q4_1 + -sm tensor).  That path reads the kq mask, so the
++    // The fused sparse kernel reads the K/V cache rows itself - F16/BF16 natively, and
++    // Q8_0/q4_0/q4_1/q5_0/q5_1 by dequantizing them while a tile is staged.  The
++    // authoritative list of accepted types is ggml_cuda_flash_attn_qsa_supported() (the same
++    // set the backend exposes for GGML_OP_FLASH_ATTN_QSA), and this gate must stay in lockstep
++    // with it.  Any other cache type must take the dense masked path instead (the same path as
++    // LLAMA_QSA_SPARSE_FA=0): an unsupported qsa op is not split across the tensor-parallel
++    // devices, so its output stays mirrored while the attention gate remains hidden-split and
++    // the meta splitter aborts on the attn_gated MUL (observed with qwen4exp +
++    // --cache-type-k q4_0/q4_1 + -sm tensor).  That path reads the kq mask, so the
 +    // derived-visibility/mask-elision arm is off with it (qwen4exp_want_derived_vis below).
-+    const bool kv_native = cparams.type_k == GGML_TYPE_F16 || cparams.type_k == GGML_TYPE_BF16 ||
-+                           cparams.type_k == GGML_TYPE_Q8_0;
++    const bool kv_native = cparams.type_k == GGML_TYPE_F16  || cparams.type_k == GGML_TYPE_BF16 ||
++                           cparams.type_k == GGML_TYPE_Q8_0 || cparams.type_k == GGML_TYPE_Q4_0 ||
++                           cparams.type_k == GGML_TYPE_Q4_1 || cparams.type_k == GGML_TYPE_Q5_0 ||
++                           cparams.type_k == GGML_TYPE_Q5_1;
 +    return enabled && cparams.flash_attn && kv_native;
 +}
 +
@@ -3325,7 +3328,7 @@ index ef588d06d..9a0ba27ca 100644
          }
      }
  
-@@ -968,13 +1049,34 @@ public:
+@@ -968,13 +1052,34 @@ public:
  
          res &= params.ubatch.n_tokens % n_stream == 0;
  
@@ -3362,7 +3365,7 @@ index ef588d06d..9a0ba27ca 100644
  
          return res;
      }
-@@ -987,11 +1089,28 @@ public:
+@@ -987,11 +1092,28 @@ public:
      ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
      ggml_tensor * rng       = nullptr;   // I32 [2*n_stream] derived-cache range leaf (decode only)
  
@@ -3391,7 +3394,7 @@ index ef588d06d..9a0ba27ca 100644
  };
  
  ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
-@@ -1020,9 +1139,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1020,9 +1142,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
      // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
      // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
@@ -3425,7 +3428,7 @@ index ef588d06d..9a0ba27ca 100644
  
      // env gates (per-process, read once): the fused INDEXER_SCORE op + the incremental derived
      // cache are the DEFAULT decode path (parity-verified byte-identical to the per-op chain);
-@@ -1045,13 +1185,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1045,13 +1188,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      if (it != qsa_inps.end()) {
          inp = it->second;
      } else {
@@ -3451,7 +3454,7 @@ index ef588d06d..9a0ba27ca 100644
          if (idx_cache && n_stream == 1) {
              // per-step derived fill range leaf: [from_s, lim_s] (one stream in decode)
              qsa->rng = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 2);
-@@ -1060,7 +1210,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1060,7 +1213,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          ggml_set_input(qsa->cell_blk);
          ggml_set_input(qsa->blk_cells);
          ggml_set_input(qsa->blk_pos);
@@ -3470,7 +3473,7 @@ index ef588d06d..9a0ba27ca 100644
          if (qsa->rng != nullptr) {
              ggml_set_input(qsa->rng);
          }
-@@ -1174,23 +1334,70 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1174,23 +1337,70 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
  
          // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
          // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
@@ -3525,12 +3528,12 @@ index ef588d06d..9a0ba27ca 100644
 +
 +                ggml_tensor * pooled_c = ggml_view_3d(ctx0, pooled, idx_dim, cb, n_stream,
 +                        pooled->nb[1], pooled->nb[2], b0*pooled->nb[1]);
- 
--        score = summed;
++
 +                ggml_tensor * sc = ggml_mul_mat(ctx0, pooled_c, q3);
 +                sc = ggml_relu(ctx0, sc);
 +                sc = ggml_reshape_4d(ctx0, sc, cb, n_idx_h, n_tps, n_stream);
-+
+ 
+-        score = summed;
 +                ggml_tensor * summed = head_sum(sc);
 +
 +                acc = acc ? ggml_concat(ctx0, acc, summed, 0) : summed;
@@ -3555,7 +3558,7 @@ index ef588d06d..9a0ba27ca 100644
              score = ggml_add(ctx0, score, inp->bias);
          }
      }
-@@ -1206,7 +1413,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1206,7 +1416,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      // kernel reads it as [n_kv, n_tps, n_stream] and no per-layer copy is needed
      ggml_tensor * additive = blk_bias ? kq_mask : inp->bias;
  
@@ -3571,14 +3574,14 @@ index ef588d06d..9a0ba27ca 100644
      cb(top_k, "indexer_top_k", il);
  
      return top_k;
-@@ -1251,8 +1465,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1251,8 +1468,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
      }
  
 -    ggml_tensor * kq_mask = inp->get_kq_mask();
 +    // Fused sparse FA (top-k cells only) vs dense masked FA: see qwen4exp_qsa_sparse().
 +    const bool qsa_sparse = qwen4exp_qsa_sparse(cparams);
-+
+ 
 +    // the derived visibility keys live in this layer's QSA graph input set (null on the tensor
 +    // path, where the kernel keeps gathering the mask); the mask src stays until the prunable form
 +    ggml_tensor * qsa_cell_vis = nullptr;
@@ -3598,12 +3601,12 @@ index ef588d06d..9a0ba27ca 100644
 +    ggml_tensor * kq_mask = qsa_derive_vis ? nullptr : inp->get_kq_mask();
 +
 +    ggml_tensor * kq_mask_top_k = nullptr;
- 
++
 +    if (kq_mask != nullptr) {
      // prepare new kq mask - starts filled with -INFINITY
      ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
  
-@@ -1278,32 +1514,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1278,38 +1517,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
  
      // combine with the original kq mask
      kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
@@ -3612,7 +3615,7 @@ index ef588d06d..9a0ba27ca 100644
      ggml_tensor * q = q_cur;
      ggml_tensor * k = mctx_cur->get_k(ctx0, il);
      ggml_tensor * v = mctx_cur->get_v(ctx0, il);
- 
+-
 -    // The fused sparse kernel (attend only the indexer-selected top-k cells)
 -    // is the DEFAULT flash-attention path; LLAMA_QSA_SPARSE_FA=0 keeps the
 -    // dense masked flash-attention path instead. Both require flash attention
@@ -3621,23 +3624,29 @@ index ef588d06d..9a0ba27ca 100644
 -        const char * env = getenv("LLAMA_QSA_SPARSE_FA");
 -        return env == nullptr || std::atoi(env) != 0;
 -    }();
--    // The fused sparse kernel reads the K/V cache rows natively, and its load dispatch
--    // covers f16/bf16/q8_0 only (ggml_cuda_flash_attn_qsa_supported() - the same set the
--    // backend exposes for GGML_OP_FLASH_ATTN_QSA).  Every other cache type - including the
--    // quantized q4_0/q4_1/q5_0/q5_1 that plain flash attention does support - must take the
--    // dense masked path below instead: an unsupported qsa op is not split across the
--    // tensor-parallel devices, so its output ends up mirrored while the attention gate stays
--    // hidden-split and the meta splitter aborts on the attn_gated MUL (observed on
--    // qwen4exp + --cache-type-k q4_0/q4_1 + -sm tensor).  This is the same path as
--    // LLAMA_QSA_SPARSE_FA=0, which stays as the A/B knob.
--    const bool qsa_kv_native = k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16 ||
--                               k->type == GGML_TYPE_Q8_0;
+-    // The fused sparse kernel reads the K/V cache rows itself - F16/BF16 natively, and
+-    // Q8_0/q4_0/q4_1/q5_0/q5_1 by dequantizing them while a tile is staged.  The
+-    // authoritative list of accepted types is ggml_cuda_flash_attn_qsa_supported()
+-    // (it mirrors the kernel's load dispatch).  Every other cache type must
+-    // take the dense masked path below instead: an unsupported qsa op is not split
+-    // across the tensor-parallel devices, so its output ends up mirrored while the
+-    // attention gate stays hidden-split and the meta splitter aborts on the
+-    // attn_gated MUL (observed on qwen4exp + --cache-type-k q4_0/q4_1 + -sm tensor).
+-    // This is the same path as LLAMA_QSA_SPARSE_FA=0, which stays as the A/B knob.
+-    // NOTE: this list must stay in lockstep with ggml_cuda_flash_attn_qsa_supported()
+-    // in ggml/src/ggml-cuda/fattn-qsa.cu - the graph gate is on the host side and the
+-    // meta splitter does not report an unsupported qsa op, so a stale entry here is a
+-    // crash (not a fallback) under -sm tensor.
+-    const bool qsa_kv_native = k->type == GGML_TYPE_F16  || k->type == GGML_TYPE_BF16 ||
+-                               k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0 ||
+-                               k->type == GGML_TYPE_Q4_1 || k->type == GGML_TYPE_Q5_0 ||
+-                               k->type == GGML_TYPE_Q5_1;
 -    const bool qsa_sparse = qsa_sparse_env && cparams.flash_attn && qsa_kv_native;
 -
      ggml_tensor * cur;
  
      if (qsa_sparse) {
-@@ -1315,7 +1531,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1321,7 +1533,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          k = ggml_permute(ctx0, k, 0, 2, 1, 3);
          v = ggml_permute(ctx0, v, 0, 2, 1, 3);
  
@@ -3649,7 +3658,7 @@ index ef588d06d..9a0ba27ca 100644
          ggml_flash_attn_qsa_set_prec(cur, GGML_PREC_F32);
          cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
          cb(cur, "kqv_out", il);
-@@ -1442,7 +1661,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -1448,7 +1663,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
              // the W=1 decode (see QSA_DECODE_BAND above).
              build_qsa_store_k(mctx_hyb, cur, il);
          } else {
@@ -3663,7 +3672,7 @@ index ef588d06d..9a0ba27ca 100644
      }
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index a779975ac..1ae96333b 100644
+index 750c93f16..d5f8aef3e 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -7673,9 +7673,10 @@ struct test_flash_attn_ext : public test_case {
@@ -3742,7 +3751,20 @@ index a779975ac..1ae96333b 100644
              } else {
                  init_tensor_uniform(t);
              }
-@@ -10740,6 +10770,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -7830,8 +7860,10 @@ struct test_flash_attn_qsa : public test_case {
+         ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, 1);
+         ggml_set_name(m, "m");
+ 
+-        // softcap must be 0: the kernel's softcap arm is not implemented
+-        ggml_tensor * out = ggml_flash_attn_qsa(ctx, q, k, v, idx, m, 1.0f/sqrtf((float) hsk), 0.0f);
++        // softcap must be 0: the kernel's softcap arm is not implemented.
++        // block 15 (memory campaign) adds the derived-visibility inputs; the mask path (this test)
++        // passes null for both, exactly like the model does when the mask is present.
++        ggml_tensor * out = ggml_flash_attn_qsa(ctx, q, k, v, idx, m, 1.0f/sqrtf((float) hsk), 0.0f, nullptr, nullptr);
+         ggml_prec_set_acc(out, GGML_PREC_F32);
+         ggml_set_name(out, "out");
+ 
+@@ -10830,6 +10862,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
  
