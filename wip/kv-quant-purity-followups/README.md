@@ -1,5 +1,10 @@
 # KV-quant purity and parity follow-ups (found 2026-09-11)
 
+> **Starting a new session?** Read
+> **`HANDOVER-2026-09-11-remaining-work.md`** in this directory first — it is the self-contained plan
+> for the remaining work (item order, environment, binary/probe locations, instruments, reference
+> hashes, the exact code sites for the first two items, the landing procedure and the trap list).
+
 **Status: OPEN — nothing here is a delivery blocker, and nothing here is caused by any of the 16
 blocks.**  All three items reproduce **bit-identically on a build without Block 15**, which is how
 they were classified as pre-existing.  They were found while re-validating the Block 15 beta patch
@@ -8,7 +13,7 @@ against the 15-patch delivery (`beta/block-15-campaign-wins/HANDOVER.md` §10, `
 | item | one-line |
 |---|---|
 | **F1** | `q8_0` and `q4_0` K/V caches break the dense `n_max <= 7` greedy-purity guarantee (`W=1,2` agree and `W=3..8` agree, but the two groups differ). |
-| **F2** | qwen4exp is not width-invariant — **two stacked causes**, not the QSA path (that attribution was measured false): cause 1 = the hyper-connection fusions gated `nt == 1` (**FIXED 2026-09-11**, block-14 amendment, `W <= 4` now pure); cause 2 = a kernel-dispatch band at `W >= 5` (**OPEN**, same class as F1). |
+| **F2** | qwen4exp is not width-invariant — **two stacked causes**: cause 1 = the hyper-connection fusions gated `nt == 1` (**FIXED 2026-09-11**, block-14 amendment); cause 2 = the **per-type mmvq cap** splitting the band, compiled into `mul_mat_vec_q_moe`'s launch bound (**FIXED 2026-09-11**, block-13 amendment — `W = 1..8` is now bit-identical on both splits, **+14-26 %** at the verify widths). **Cause 3 (OPEN): `plain != draft-mtp` *text*** — localised to the **QSA indexer** machinery; `LLAMA_QSA_OFF=1` is a proven kill-switch. See the handover. |
 | **F3** | The sub-`q8_0` KV quants (`q4_1`, `q5_0`, `q5_1`, `iq4_nl`) are pure and much smaller but run ~3.4x slower than `f16` because they have no native FA path. |
 | **policy** | Differing K and V cache *types* are **rejected** (maintainer decision 2026-09-11). |
 

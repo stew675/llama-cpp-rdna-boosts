@@ -9,6 +9,11 @@ Block 15 is STAGED in `beta/block-15-campaign-wins/`, not promoted.
 
 ## Current active
 
+> **Next session: start at `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-remaining-work.md`** — it
+> carries the agreed item order (1 = cause 3 QSA indexer + 5 = the MoE asterisk, in one session; then
+> F3, block-15 promotion, upstream PRs), the environment, the instruments, the reference hashes and the
+> landing procedure.
+
 ### Issue #25 follow-up: GDN chunked prefill (plain vs spec divergence) - IMMEDIATE, GFX1201
 - **OPEN (2026-09-11).**  On one build+prompt `--spec-type none` and MTP differ, and it is entirely
   the GDN chunked prefill: `GGML_CUDA_GDN_CHUNKED=0` makes `none == n-max 2 == n-max 4`
