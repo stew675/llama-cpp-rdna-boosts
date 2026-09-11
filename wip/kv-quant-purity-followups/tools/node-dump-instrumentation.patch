@@ -1,0 +1,114 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 68ddeec70..d6c562f6a 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -95,6 +95,7 @@
+ #include <cstdarg>
+ #include <cstdio>
+ #include <cstdlib>
++#include <unistd.h> // TEMP node-dump instrumentation
+ #include <string>
+ #include <vector>
+ 
+@@ -5389,6 +5390,72 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     return 0;
+ }
+ 
++// TEMP (width-invariance forensics, 2026-09-11): per-node dump.
++// Gated on GGML_CUDA_NODE_DUMP!=0 AND /tmp/nodedump_on existing.  Rules learned the hard
++// way: sync before reading; read the view's whole address span in one shot; gather host-side
++// with the real nb[] strides (ggml_backend_tensor_get ignores nb[]); skip non-device buffers
++// and quantized tensors; key any diff on (name, node index) because names are not unique.
++static bool ggml_cuda_node_dump_enabled() {
++    static const bool on = []() {
++        const char * e = getenv("GGML_CUDA_NODE_DUMP");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return on && access("/tmp/nodedump_on", F_OK) == 0;
++}
++
++static void ggml_cuda_node_dump(int idx, const char * tag, ggml_tensor * t, int depth) {
++    if (!ggml_cuda_node_dump_enabled() || t == nullptr) {
++        return;
++    }
++    if (t->buffer == nullptr || t->buffer->buft == nullptr || !ggml_backend_buft_is_cuda(t->buffer->buft)) {
++        return; // host/meta-resident: read it with the host path, not cudaMemcpy
++    }
++    if (ggml_is_quantized(t->type)) {
++        return;
++    }
++    const size_t esz = ggml_element_size(t);
++    if (esz == 0) {
++        return;
++    }
++    size_t span = esz;
++    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
++        span += (size_t) (t->ne[d] > 0 ? t->ne[d] - 1 : 0) * t->nb[d];
++    }
++    if (span == 0 || span > (size_t) 512*1024*1024) {
++        return;
++    }
++    std::vector<unsigned char> buf(span, 0);
++    CUDA_CHECK(cudaDeviceSynchronize());
++    CUDA_CHECK(cudaMemcpy(buf.data(), t->data, span, cudaMemcpyDeviceToHost));
++
++    uint64_t h[4] = { 1469598103934665603ULL, 1469598103934665603ULL, 1469598103934665603ULL, 1469598103934665603ULL };
++    int64_t ix[4];
++    for (ix[3] = 0; ix[3] < t->ne[3]; ++ix[3]) {
++        for (ix[2] = 0; ix[2] < t->ne[2]; ++ix[2]) {
++            for (ix[1] = 0; ix[1] < t->ne[1]; ++ix[1]) {
++                for (ix[0] = 0; ix[0] < t->ne[0]; ++ix[0]) {
++                    const size_t off = (size_t) ix[0]*t->nb[0] + (size_t) ix[1]*t->nb[1] + (size_t) ix[2]*t->nb[2] + (size_t) ix[3]*t->nb[3];
++                    const unsigned char * pe = buf.data() + off;
++                    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
++                        if (ix[d] == 0) {
++                            for (size_t b = 0; b < esz; ++b) {
++                                h[d] ^= pe[b];
++                                h[d] *= 1099511628211ULL;
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++    GGML_LOG_INFO("[ND] idx=%d %s op=%s ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld] h0=%016llx h1=%016llx h2=%016llx h3=%016llx dev=%d %s\n",
++            idx, tag, ggml_op_name(t->op),
++            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
++            (long long) t->nb[0], (long long) t->nb[1], (long long) t->nb[2], (long long) t->nb[3],
++            (unsigned long long) h[0], (unsigned long long) h[1], (unsigned long long) h[2], (unsigned long long) h[3],
++            (int) ggml_cuda_get_device(), t->name);
++}
++
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+     bool graph_evaluated_or_captured = false;
+ 
+@@ -5568,6 +5635,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
+                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
+ #endif
++                    if (ggml_cuda_node_dump_enabled()) {
++                        const int last_fused = i + nodes_to_skip;
++                        ggml_cuda_node_dump(last_fused, "fdst", cgraph->nodes[last_fused], 1);
++                    }
+                     i += nodes_to_skip;
+                     continue;
+                 }
+@@ -5598,6 +5669,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+                 GGML_ASSERT(ok);
++                if (ggml_cuda_node_dump_enabled()) {
++                    ggml_cuda_node_dump(i, "out", node, 1);
++                    const char * e = getenv("GGML_CUDA_NODE_DUMP");
++                    if (e != nullptr && atoi(e) >= 2) {
++                        for (int s_i = 0; s_i < GGML_MAX_SRC; ++s_i) {
++                            if (node->src[s_i] != nullptr) {
++                                ggml_cuda_node_dump(i, "src", node->src[s_i], 2);
++                            }
++                        }
++                    }
++                }
+                 if (op_timing) {
+                     CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
+                     op_nodes.emplace_back(node, i, false);

@@ -143,8 +143,11 @@ int main(int argc, char ** argv) {
     g_enable = false;
     if (llama_decode(ctx, b) != 0) { fprintf(stderr, "prefill failed\n"); return 1; }
     b.n_tokens = 0;
+    // REPEAT=1: batch = W copies of token P (so a batch-content dependence shows up as a
+    // difference from the W=1 run; a pure width/kernel dependence does not care).
+    const bool repeat = getenv("REPEAT") != nullptr && atoi(getenv("REPEAT")) != 0;
     for (int j = 0; j < W; ++j) {
-        b.token[b.n_tokens] = toks[P + j]; b.pos[b.n_tokens] = P + j;
+        b.token[b.n_tokens] = repeat ? toks[P] : toks[P + j]; b.pos[b.n_tokens] = P + j;
         b.n_seq_id[b.n_tokens] = 1; b.seq_id[b.n_tokens][0] = 0; b.logits[b.n_tokens] = 1;
         b.n_tokens++;
     }

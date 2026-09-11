@@ -69,8 +69,14 @@ delivery build — and all outside Block 15's scope; see §7 and
    `n_max 3 == n_max 7` `da56855b` (1406 chars) — a real greedy divergence.  f16 control: all three
    `ce7b9a75` (pure).  `BETA-TESTING.md` §2 prescribes q8_0 KV, so beta MTP/coherence numbers taken
    that way carry this pre-existing impurity — use f16/bf16 when purity matters.
-2. **qwen4exp (fused sparse QSA) is not width-pure** (`W=1` `dcf1ae66…` != `W=3` `1c801d63…`, on both
-   builds).  Consistent with its treatment: qwen4exp is acceptance-gated, not byte-identity-gated.
+2. **qwen4exp is not width-pure — root-caused 2026-09-11 into TWO stacked causes, and the earlier
+   "fused sparse QSA" attribution was wrong** (the whole QSA regime can be switched off with no effect).
+   (a) the hyperconnection fusions are gated `nt == 1` (`qwen4exp.cpp:386/458`), so a 1-token decode
+   uses `GGML_OP_HC_MIX`/`HC_COMBINE` while an n-token verify batch uses the unfused chain — measured
+   98 `HC_COMBINE` dispatches at W=1 vs 0 at W>=2; the fusion is worth +13.1 % decode, so the fix is to
+   make `ggml/src/ggml-cuda/hc-mix.cu:273/445` (`GGML_ASSERT(n_tokens == 1)`) serve the decode/verify
+   band, not to disable it; (b) a kernel-dispatch band at W>=5 that survives all fusions disabled —
+   the same cause as F1.  Both must be fixed for the band to return: `wip/kv-quant-purity-followups/`.
 3. **Mixed K/V types are never worth it**: every mixed pair measured is 1.7–3.6x slower than the
    same-type equivalent (pp512 2152–4476 vs 7713–7838) while using **more** memory than the
    same-type quantized pair (e.g. f16/q8_0 is slower than q8_0/q8_0 and larger).  The maintainer's
@@ -279,7 +285,7 @@ hypotheses live in **`../../wip/kv-quant-purity-followups/README.md`**; the summ
 | # | item | measured | why it matters |
 |---|---|---|---|
 | F1 | **quantized-KV width purity** — `q8_0/q8_0` and `q4_0/q4_0` break the dense `n_max <= 7` guarantee (`W=1 == W=2` then `W=3..8`); text level: plain `8ed58aa9` vs spec `da56855b` on the 27B | 4B 1 GPU `0edf55a1`/`31a0c1ba` (q8_0), `8125e094`/`619c151e` (q4_0); f16/bf16/q4_1/q5_0/q5_1/iq4_nl pure | anyone speculating with a q8_0 or q4_0 cache gets a different greedy result than plain decode; `BETA-TESTING.md` §2 prescribes q8_0 KV |
-| F2 | **qwen4exp width purity** — the fused sparse QSA path is not width-invariant (`W=1` `dcf1ae66…` != `W=3` `1c801d63…`) | identical on both builds; its MTP acceptance is unaffected (0.47826/0.50000, gate >= 0.45) | its gate is acceptance-based by design, so this is a **known-but-undocumented** exemption — either fix it (block 00's approach: make the split/plan query-width-independent) or state the exemption in `../../GREEDY-PURITY.md` |
+| F2 | **qwen4exp width purity** — TWO stacked causes, root-caused 2026-09-11 (the "fused sparse QSA" attribution was wrong) | (1) the HC fusions are gated `nt == 1` (`qwen4exp.cpp:386/458`; 98 `HC_COMBINE` at W=1 vs 0 at W>=2), and the fused path is worth **+13.1 % decode**; (2) a kernel-dispatch band at W>=5 that survives all fusions off — the same cause as F1 | (1) make `hc-mix.cu:273/445` (`GGML_ASSERT(n_tokens == 1)`) serve the decode/verify band (the `dsv4-hc.cu` kernels are already token-generic) so the +13 % is kept; (2) fix it with F1/F3, then re-check (the causes stack) — evidence in `../../wip/kv-quant-purity-followups/` |
 | F3 | **sub-q8_0 KV quant parity** — q4_1/q5_0/q5_1/iq4_nl are pure and much smaller (1800–2400 MiB vs 3400 q8_0 / 6400 f16 at ctx 204800) but run at 2197–2293 pp512 / 56–64 tg32 vs 7713–7838 / 95–99 | they have **no native FA path** (F16 staging scratch); the native ones are f16, bf16, q8_0, q4_0 | extending block 15's own `FATTN_KV_NATIVE_{NONE,Q8_0,BF16}` type-code design to them would buy ~3.3x prefill; **iq4_nl is the same size as q4_0 (1800 MiB) and is pure**, so a native iq4_nl obsoletes q4_0 outright.  **Any new native path must be built width-invariant** — do not repeat the q8_0/q4_0 mistake |
 
 **Maintainer decision 2026-09-11 (recorded here):** differing K **and** V cache *types* are to be

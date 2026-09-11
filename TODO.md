@@ -299,10 +299,21 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   `ntiles_dst`/`ntiles_KV`/`parallel_blocks` + the staging branch for `W=1..4` in `launch_fattn` and
   in the native `q8_0×q8_0`/`q4_0×q4_0` kernel selection.  Acceptance: `W=1..8` bit-identical on all
   four split configs, no perf regression, other types unchanged, FLASH_ATTN_EXT still 7859/7859.
-- **F2 (correctness, documented exemption or fix): qwen4exp (fused sparse QSA) is not width-pure**
-  (`W=1` `dcf1ae66…` != `W=3` `1c801d63…`, both builds).  Either make the QSA sparse path's
-  split/plan query-width-independent (block 00's method — then `none` == `n_max 3` == `n_max 7` on
-  the text), or state the exemption in `GREEDY-PURITY.md`.
+- **F2 (correctness, root-caused 2026-09-11 — TWO stacked causes): qwen4exp is not width-pure.**
+  The earlier attribution ("the fused sparse QSA path") was **wrong**: `LLAMA_QSA_OFF=1`,
+  `LLAMA_QSA_SPARSE_FA=0`, the dense-shortcut and the arch decode policy all leave the divergence
+  unchanged, as do graphs, every CUDA fusion, the float-mmvf band and a batch-content test.  It is
+  **two** width-selected code paths in the non-attention graph: **(cause 1)** the hyperconnection
+  fusions are gated `nt == 1` in `src/models/qwen4exp.cpp:386/458`, so a 1-token decode uses
+  `GGML_OP_HC_MIX`/`HC_COMBINE` while an n-token verify batch uses the unfused chain (measured: 98
+  `HC_COMBINE` at W=1, 0 at W>=2) — the fused path is worth **+13.1 % decode**, so the fix is to make
+  the two `ggml/src/ggml-cuda/hc-mix.cu` host paths (`:273`, `:445`, `GGML_ASSERT(n_tokens == 1)`)
+  serve nt <= 8, not to disable the fusion (the kernels in `dsv4-hc.cu` are already token-generic);
+  **(cause 2)** a kernel-dispatch band at W >= 5 (`{1,2,3,4} {5} {6,7} {8}`) that survives all
+  fusions disabled — **the same cause as F1**.  Fix cause 2 with F1/F3 and re-check qwen4exp: the
+  causes stack, so neither alone restores its `n_max <= 7` band.  Full evidence, the excluded-list and
+  the re-appliable node-dump instrument: `wip/kv-quant-purity-followups/` (`README.md` F2 +
+  `tools/node-dump-instrumentation.patch`).
 - **F3 (performance, biggest available win): sub-`q8_0` KV quant parity.**  q4_1/q5_0/q5_1/iq4_nl
   are pure and 1800–2400 MiB (vs 3400 q8_0 / 6400 f16) but run 2197–2293 pp512 / 56–64 tg32 versus
   7713–7838 / 95–99, because they have no native FA path (F16 staging scratch).  Block 15 already

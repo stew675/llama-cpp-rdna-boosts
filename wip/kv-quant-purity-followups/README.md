@@ -79,26 +79,78 @@ Acceptance criteria for a fix: `W=1..8` bit-identical for both q8_0/q8_0 and q4_
 2-GPU layer, 2-GPU tensor and 3-GPU tensor; no prefill/decode regression; f16/bf16 and every other
 quant type unchanged; `test-backend-ops -o FLASH_ATTN_EXT` still 7859/7859 on ROCm0 and CPU.
 
-## F2 — qwen4exp is not width-pure
+## F2 — qwen4exp is not width-pure: ROOT-CAUSED 2026-09-11 into TWO stacked causes
 
 ```
-qwen4exp (IQ4_XS), 3-GPU `-sm tensor`, f16 KV, P=256, RS=0:
-  W=1 -> dcf1ae667f730879     W=3 -> 1c801d63666ba416     (identical on both builds)
+qwen4exp (IQ4_XS), 3-GPU f16 KV, P=256, RS=0 — logits0 hash per decode width:
+  delivery build:  W=1 dcf1ae667f73 | W=2,3,4 1c801d63666b | W=5 fa34f99951fb | W=6,7 96dbf8375adf | W=8 2ca9b9f5e801
+  -sm layer:       W=1 3adeb313042a | W=2,3,4 044715b66e72 | W=5 bdaa8fc57381 | W=6,7 1ffc73e03571 | W=8 15786ddeffad
 ```
 
-The fused sparse-QSA attention (block 14) is a different attention implementation from the dense
-tile/MMA FA path that block 00 fixed, so the fix simply never applied to it.  Its repo gate is the
-adaptive-MTP **acceptance** rate (`benchmarks/mtp-adaptive-methodology.md`; rule 3 exempts MoE-style
-models from byte-identity), which passes (block 15 0.47826, delivery 0.50000 — the delta is the
-documented layout sensitivity, since the raw logits are bit-identical across builds).
+The earlier guess in this file ("the sparse-QSA attention path") was **wrong**.  The divergence is
+**not** the attention at all; it is two independent width-selected code paths in the *non-attention*
+part of the graph.  Both were found with the per-node dump instrument (see "Tooling" below); the
+first divergent node is layer 0's MoE router, and its *input* (`hc_mixed`) is already divergent — i.e.
+the HC (hyperconnection) block, not the indexer.
 
-Two acceptable outcomes, in order of preference:
+### Excluded, each with a measurement (all leave the W-grouping unchanged)
 
-1. **Fix it** the block-00 way: make the QSA sparse path's split/plan query-width-independent, then
-   re-run the plain-vs-spec greedy probe on qwen4exp (`none` vs `n_max 3` vs `n_max 7` must be
-   text-identical, as f16 dense already is).
-2. **Document the exemption** explicitly in `../../GREEDY-PURITY.md` (the matrix there currently
-   covers the dense models only, and nothing states that the sparse path is exempt).
+| candidate | how it was excluded |
+|---|---|
+| QSA / indexer / selection / arch decode policy | `LLAMA_QSA_OFF=1` (the **whole** QSA regime off) → identical hashes; `LLAMA_QSA_SPARSE_FA=0` (dense masked FA) → identical; `LLAMA_QSA_DENSE_SHORTCUT=0`, `LLAMA_QSA_DENSE_DECODE_UNTIL=0` → identical |
+| CUDA graphs, CUDA-side fusions | `GGML_CUDA_DISABLE_GRAPHS=1` → identical; `GGML_CUDA_DISABLE_FUSION=1` (and `_HC_MIX`/`_HC_COMB`/`_HC_FUSION`, `_SCALE_UNARY`) → values change, **grouping unchanged** |
+| the float mmvf family | the first divergent node is the router and its weight is **F32** (`blk.0.ffn_gate_inp.weight`, dims [2560,512]), so `ggml_cuda_should_use_mmvf` picks `ne11 <= 3` on fp32-MMA AMD parts (a W-switch at 4).  Widening that band to 8 → *grouping unchanged*; disabling F32 mmvf entirely (all F32 → cuBLAS) → *grouping unchanged* |
+| batch **content** | `REPEAT=1` in the probe (batch = W copies of the same token) reproduces the same width's hash byte-for-byte → the divergence is purely width-*selected*, not a content/`l_last` effect |
+| all-reduce / tensor split | reproduced with `-sm layer` (whole layers per device, no partial sums) **and** on 1 GPU with `-ngl 4` |
+
+### Cause 1 — the HC fusions are gated on `nt == 1` (fix identified, needs kernel work)
+
+`src/models/qwen4exp.cpp:386` (`build_hc_mix`) and `:458` (`build_hc_combine`) gate the fused
+`GGML_OP_HC_MIX` / `GGML_OP_HC_COMBINE` on `nt == 1`:
+
+```cpp
+if (nt == 1 && cparams.fused_hc_mix     && fused_ok) { ... ggml_hc_mix(...)     }   // "decode"
+if (nt == 1 && cparams.fused_hc_combine)            { ... ggml_hc_combine(...) }   // "decode"
+```
+
+Measured in the dump: **98 `op=HC_COMBINE` dispatches at W=1 and 0 at W≥2**; `hc_mixed` is a plain
+`VIEW` at W=1 but a fused `SCALE` window at W≥2.  The fused and unfused paths are **not
+bit-identical**, so "decode" (nt=1) and "verify" (nt=2..8) disagree.
+
+* **Disabling them is not an acceptable fix**: the fusion is worth **+13.1 % decode** on qwen4exp
+  (tg128 48.49 with vs 42.15 without; prefill at parity), measured with
+  `LLAMA_FUSED_HC_MIX=0 LLAMA_FUSED_HC_COMBINE=0` (note: those are the graph-side knobs — the
+  `GGML_CUDA_DISABLE_HC_*` envs are different, CUDA-side arms, which is why they did nothing here).
+  With them off, W=1 becomes pure against W=2..4, which *proves* cause 1 and its location.
+* **Widening the graph gate alone crashes**: `ggml/src/ggml-cuda/hc-mix.cu:273` and `:445` assert
+  `GGML_ASSERT(n_tokens == 1);   // decode-only fused op`.  The kernels *below* those host functions
+  (`dsv4-hc.cu`: `dsv4_hc_comb_f32` / `dsv4_hc_pre_f32` / `dsv4_hc_post_f32`) are **already
+token-generic** (`int64_t n_tokens`, `if (it >= n_tokens) return;`).
+* **The fix**: make the two `hc-mix.cu` host paths serve `nt <= 8` (and drop the graph gate to the same
+  bound), so the whole decode/verify band uses the fused path — keeping the +13 % **and** restoring
+  purity.  Then re-run: `W=1..4` pure (already demonstrated with the env mitigation) and, once cause 2
+  is also fixed, `W=1..8`.
+
+### Cause 2 — a kernel-dispatch band at W ≥ 5 (OPEN, and it is F1's cause)
+
+With the HC fusions off, the residual grouping is `{1,2,3,4} {5} {6,7} {8}` and it **survives every
+CUDA fusion being disabled** → it is a *kernel dispatch* boundary, not a fusion.  That is the same
+`ncols_dst` / `ne11` band class as **F1** (the matmul kernel selection crossing at ne11 = 4/5 and 8),
+i.e. the two findings share this cause.  ⇒ **Fix cause 2 together with F1/F3**, then re-check qwen4exp:
+the two causes stack, so neither alone restores the `n_max <= 7` band for qwen4exp.
+
+### Tooling added for this investigation (all committed under `tools/`)
+
+* `logits-dump-kv.cpp` — now also takes `CTK`/`CTV` (all KV types) and `REPEAT` (batch = W copies of
+  one token), and exits 2 on an unknown KV type instead of silently using f16.
+* `node-dump-instrumentation.patch` — re-applies the per-node `[ND]` dump to `ggml-cuda.cu`
+  (`GGML_CUDA_NODE_DUMP=1|2` + `/tmp/nodedump_on`, which the probe creates around the decode batch;
+  prints `idx/tag/op/ne/nb/h0..h3/dev/name`).  **This is what located the divergence**; apply it, rebuild
+  `ggml-hip`, and diff two widths.  Traps (all hit at least once): sync before reading; read the whole
+  view address span and gather with the real `nb[]`; key diffs on *(name, node index)*; names are not
+  unique and auto-`node_N` names *shift* between widths (only `cb()`-named tensors are comparable);
+  `fdst` lines carry the fused window's dest index, not the head's.
+* `rv.sh` — the driver (`res`/`kv`/`coh`/`mtp`/`bench`/`width`).
 
 ## F3 — sub-`q8_0` KV quant parity (the biggest win available)
 

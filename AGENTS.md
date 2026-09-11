@@ -395,8 +395,10 @@ explicitly requests it.**
   both-quantized FA path (the rest stage through F16 and are ~3.4x
   slower).  **Test plain-vs-spec purity with f16/bf16 K/V**; with a
   q8_0/q4_0 cache gate on adaptive-MTP acceptance/throughput instead.
-  qwen4exp's fused sparse QSA path is likewise not width-pure (also
-  pre-existing).  **Differing K/V cache *types* are rejected** (maintainer
+qwen4exp is likewise not width-pure (also pre-existing) — root-caused
+2026-09-11 into two stacked causes: its hyperconnection fusions are gated `nt == 1` (so decode and
+verify use different arithmetic) plus a kernel-dispatch band at `W >= 5` that shares F1's cause; see
+`wip/kv-quant-purity-followups/README.md` (F2).  **Differing K/V cache *types* are rejected** (maintainer
   decision 2026-09-11: mixed pairs are 1.7–3.6x slower than the same-type
   equivalent and never smaller).  Details, repro tooling and the follow-up
   items (F1 purity, F2 qwen4exp, F3 sub-`q8_0` parity — note a native
