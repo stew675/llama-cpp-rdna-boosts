@@ -1,10 +1,13 @@
 # WIP follow-up — GDN chunked-prefill makes plain decode and speculative verify disagree
 
-**Status:** OPEN, immediately actionable.  Found 2026-09-11 during the gfx1151
-issue-#25 validation; **not** part of issue #25 (that is FA `parallel_blocks`,
-fixed by Block 00) and **not** an upstream defect — see "Provenance".
-**Owner box:** the GFX1201 machine (faster tests) — the maintainer is moving
-this work there after the updated delivery `main` is pushed.
+**Status:** FIXED (opt-in), 2026-09-11.  Found during the gfx1151 issue-#25
+validation; **not** part of issue #25 (that is FA `parallel_blocks`, fixed by
+Block 00) and **not** an upstream defect — see "Provenance".  A gated fix
+(`GGML_CUDA_GDN_ALIGN_BOUNDARY=1`, **default off**) is now in block 02; see
+`GDN-CHUNKED-PREFILL-FIX.md` (root cause + validation) and `patches/README.md`.
+The default keeps the behaviour this document describes, byte-for-byte.
+**Owner box:** the GFX1201 machine (investigation + fix done; see
+`GDN-CHUNKED-PREFILL-FIX.md`).
 **Source of record:** the GFX1201 agent's issue-#25 investigation
 (`README.md` in this directory) and the gfx1151 validation
 (`../strix-halo/issue25/GATE-2026-09-11-block00-rdna35.md`).

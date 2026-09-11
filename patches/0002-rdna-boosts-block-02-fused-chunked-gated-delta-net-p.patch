@@ -1,24 +1,24 @@
-From 5cbfbafd923255059ce6691339207503cec1e847 Mon Sep 17 00:00:00 2001
+From 38641280bae6978ccaf829863331ed81c15c0336 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 02/14] rdna-boosts: block 02: fused chunked gated-delta-net
  prefill kernel
 
 ---
- ggml/src/ggml-cuda/gated_delta_net.cu         |  109 ++
+ ggml/src/ggml-cuda/gated_delta_net.cu         |  197 ++++
  ggml/src/ggml-cuda/gated_delta_net_chunked.cu |  702 ++++++++++++
  .../src/ggml-cuda/gated_delta_net_chunked.cuh |   58 +
  .../ggml-cuda/gated_delta_net_chunked_bf16.cu |  995 ++++++++++++++++
  .../gated_delta_net_chunked_bf16_gfx11.cu     | 1014 +++++++++++++++++
  tests/test-backend-ops.cpp                    |   97 +-
- 6 files changed, 2970 insertions(+), 5 deletions(-)
+ 6 files changed, 3058 insertions(+), 5 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a724..f9da81722 100644
+index 1b431a724..4f12a93b9 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,4 +1,5 @@
@@ -27,10 +27,17 @@ index 1b431a724..f9da81722 100644
  #include "ggml-cuda/common.cuh"
  
  template <int S_v, bool KDA, bool keep_rs_t>
-@@ -286,6 +287,114 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -286,6 +287,202 @@ static void ggml_cuda_op_gated_delta_net_impl(
      const int K = ggml_get_op_params_i32(dst, 0);
      const bool keep_rs = K > 1;
  
++    // Opt-in (DEFAULT OFF) K-independent chunked/sequential boundary: see the aligned block at
++    // the bottom of this function.  The default keeps the fork's deliberate boundary (plain
++    // chunks the whole prompt, MTP chunks n_tokens - K); the gate makes plain and the MTP spec
++    // path agree on the post-prefill state (wip/issue-25-mtp-batch-width/).
++    const char * env_align = getenv("GGML_CUDA_GDN_ALIGN_BOUNDARY");
++    const bool align_boundary = env_align != nullptr && strcmp(env_align, "0") != 0;
++
 +    // fused chunked prefill: more than one token per sequence, no snapshots, scalar gate, and
 +    // no fused-state-cache cpy to honour -- the grid maps one block per (chunk, head, seq).
 +    // Everything else (decode, MTP snapshots, KDA vector gates) stays on the sequential kernel.
@@ -43,7 +50,7 @@ index 1b431a724..f9da81722 100644
 +    // kernel below instead of aborting -- a rejected launch has no side effects, so the
 +    // fallback is bit-identical to running with GGML_CUDA_GDN_CHUNKED=0. An async fault inside
 +    // a launched kernel is NOT caught here and still surfaces at the next sync point.
-+    if ((cache == nullptr || K == 1) && !kda && K == 1 && n_tokens > 1 &&
++    if (!align_boundary && (cache == nullptr || K == 1) && !kda && K == 1 && n_tokens > 1 &&
 +        (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
 +        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
 +        if (env == nullptr || strcmp(env, "0") != 0) {
@@ -95,7 +102,7 @@ index 1b431a724..f9da81722 100644
 +    // (n_tokens - K), sequential GDN only on the last K tokens so slots 0..K-1
 +    // stay correct. n_seqs > 1 stays fully sequential — the chunked n_tokens
 +    // override is also the sequence stride. Opt out with GGML_CUDA_GDN_CHUNKED=0.
-+    if (!kda && K > 1 && n_seqs == 1 && n_tokens > (int64_t) K + 64 &&
++    if (!align_boundary && !kda && K > 1 && n_seqs == 1 && n_tokens > (int64_t) K + 64 &&
 +        (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
 +        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
 +        if (env == nullptr || strcmp(env, "0") != 0) {
@@ -135,6 +142,87 @@ index 1b431a724..f9da81722 100644
 +                    S_v, H, K, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
 +                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
 +                return;
++            }
++        }
++    }
++
++    // Opt-in K-independent boundary (GGML_CUDA_GDN_ALIGN_BOUNDARY=1).  The chunked kernel is
++    // not bit-exact with the sequential kernel (the bf16/WMMA path is deliberately
++    // near-lossless, the fp32 path differs too), so the default K-dependent boundary makes the
++    // post-prefill state depend on n_rs_seq: plain decode (K == 1) chunks the whole prompt
++    // while the MTP path (K == n_max + 1) chunks n_tokens - K + a K-token tail, and the two
++    // disagree, so greedy near-ties flip between --spec-type none and draft-mtp.  Chunking the
++    // first (n_tokens - KTAIL) tokens and running the sequential kernel over the last KTAIL for
++    // both K == 1 and K > 1 gives one boundary, hence one state, regardless of exactness.  The
++    // tail also produces the K snapshots (slot j = j tokens back), so rollback <= KTAIL-1 is
++    // exact.  n_seqs > 1 keeps the whole-ubatch chunked path: the chunked n_tokens override is
++    // also the sequence stride, so only n_seqs == 1 may truncate.  GGML_CUDA_GDN_CHUNKED=0 still
++    // forces the sequential kernel; the launch-rejection fallback matches the branches above.
++    if (align_boundary && !kda && n_tokens > 1 &&
++        (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
++        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
++        if (env == nullptr || strcmp(env, "0") != 0) {
++            // fixed sequential tail length == the chunk size; must be >= the deepest rollback
++            constexpr int64_t GDN_CHUNKED_KTAIL = 64;
++            // GGML_CUDA_GDN_CHUNKED_BF16 / arch selection: same rules as the default branches
++            // (RDNA4 -> the RDNA4 WMMA kernel, RDNA3 -> the gfx11 port, everything else fp32).
++            // n_tokens_limit > 0 truncates to the prefix of a single sequence.
++            auto launch_chunked = [&](float * state_d_ext, int64_t n_tokens_limit) -> bool {
++#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
++                const int cc_c = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++                const bool bf16_rdna_c = GGML_CUDA_CC_IS_RDNA4(cc_c) || GGML_CUDA_CC_IS_RDNA3(cc_c);
++                const char * envb_c = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
++                const bool want_bf16_c = bf16_rdna_c && S_v == 128 &&
++                    (envb_c == nullptr || strcmp(envb_c, "0") != 0);
++                if (want_bf16_c) {
++                    if (GGML_CUDA_CC_IS_RDNA4(cc_c)) {
++                        return ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_d_ext, n_tokens_limit);
++                    }
++                    return ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ctx, dst, state_d_ext, n_tokens_limit);
++                }
++#endif
++                return ggml_cuda_op_gated_delta_net_chunked(ctx, dst, state_d_ext, n_tokens_limit);
++            };
++
++            if (n_seqs == 1) {
++                const int64_t n_prefix = n_tokens > GDN_CHUNKED_KTAIL ? n_tokens - GDN_CHUNKED_KTAIL : 0;
++                if (n_prefix > 0) {
++                    ggml_cuda_pool_alloc<float> prefix_state(ctx.pool(), (size_t) H * S_v * S_v * n_seqs);
++                    if (launch_chunked(prefix_state.get(), n_prefix)) {
++                        static bool logged_prefix = false;
++                        if (!logged_prefix) {
++                            GGML_LOG_INFO("%s: aligned chunked GDN prefix n=%ld K=%d prefix=%ld tail=%ld\n",
++                                          __func__, (long) n_tokens, K, (long) n_prefix,
++                                          (long) (n_tokens - n_prefix));
++                            logged_prefix = true;
++                        }
++                        const int64_t n_tail = n_tokens - n_prefix;
++                        float * state_d = cache ? cache->data : (dst_d + S_v * H * n_tokens * n_seqs);
++                        const int64_t state_slot_stride = cache ? cache->slot_stride : (S_v * S_v * H * n_seqs);
++                        if (keep_rs) {
++                            launch_gated_delta_net<false, true>(
++                                q_d + n_prefix * sq2, k_d + n_prefix * sq2, v_d + n_prefix * sv2,
++                                g_d + n_prefix * sb2, b_d + n_prefix * sb2, prefix_state.get(),
++                                dst_d + n_prefix * S_v * H, state_d,
++                                S_v, H, n_tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                        } else {
++                            launch_gated_delta_net<false, false>(
++                                q_d + n_prefix * sq2, k_d + n_prefix * sq2, v_d + n_prefix * sv2,
++                                g_d + n_prefix * sb2, b_d + n_prefix * sb2, prefix_state.get(),
++                                dst_d + n_prefix * S_v * H, state_d,
++                                S_v, H, n_tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                        }
++                        return;
++                    }
++                    GGML_LOG_WARN("%s: chunked GDN launch rejected by the driver; falling back to the sequential kernel (GGML_CUDA_GDN_CHUNKED=0 equivalent)\n", __func__);
++                }
++            } else if (K == 1) {
++                if (launch_chunked(cache ? cache->data : nullptr, 0)) {
++                    return;
++                }
++                GGML_LOG_WARN("%s: chunked GDN launch rejected by the driver; falling back to the sequential kernel (GGML_CUDA_GDN_CHUNKED=0 equivalent)\n", __func__);
 +            }
 +        }
 +    }

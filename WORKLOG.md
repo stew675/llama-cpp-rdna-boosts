@@ -1,7 +1,7 @@
 # WORKLOG — dated delivery records
 
 Reverse-chronological log of every delivery-affecting change to the
-**rdna-boosts 14-patch set** (block amendments, community-fix
+**rdna-boosts 15-patch set** (block amendments, community-fix
 integrations, re-baselines, regeneration + clean-apply re-verifications).
 Newest entry first.  The README's
 [Current state](README.md) section is a lean summary and points here
@@ -9,6 +9,27 @@ for the full record; per-block technical notes live in
 `patches/README.md`, the verification contract in `MANIFESTS.md`.
 
 ---
+
+- **Block 02 amended: opt-in K-independent chunked-GDN boundary (`GGML_CUDA_GDN_ALIGN_BOUNDARY=1`, 2026-09-11).**
+  Fixes the fork-only plain-vs-spec divergence found during the gfx1151 issue-#25 validation (the issue
+  #25 *follow-up*): the chunked GDN prefill had a **K-dependent** chunk/sequential boundary (plain
+  `K == 1` chunked the whole prompt; MTP `K == n_max + 1` chunked `n_tokens - K` + a K-token tail), so
+  the post-prefill SSM state depended on `n_rs_seq` and `--spec-type none` disagreed with `draft-mtp`
+  (greedy near-ties flipped).  The amendment adds a gated third branch that chunks `n_tokens - 64` and
+  runs the sequential kernel over the last 64 for both `K == 1` and `K > 1`, giving one boundary and one
+  state; the tail also emits the K snapshots (rollback <= 63 exact), and `n_seqs > 1` keeps the old
+  whole-ubatch path.  **Default OFF** — the fork's existing boundary is deliberate and ~1.1-1.2 % faster
+  prefill; the gate only guards the two existing branch conditions, so the default output is
+  **byte-identical** (`d9bf6850`), while with the gate on `none == n2 == n4` (`1a9ef0a1`, which also
+  equals the `GGML_CUDA_GDN_CHUNKED=0` reference on the short prompts).  gfx1201 probe (`RS=from_w`,
+  P=256): `W1-W3/W3-W5 = 0.136693/0.182106` default (unchanged) -> `0.000000/0.000000` gated;
+  `test-backend-ops -o GATED_DELTA_NET` 46/46 in default, gated and gated+fp32.  Record:
+  `wip/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FIX.md`.  Canonical fork rebuilt at `9113cc188`,
+  block 02 (`5cbfbafd9` -> `38641280b`) amended by rebase, new tip **`7b79930b2`**, net tree
+  `fcf3e4bb7`; clean-apply **strict 15/15 `git am`**, zero whitespace warnings, applied tree ==
+  canonical.  A separate `-sm tensor` (2/3-GPU) plain-vs-spec divergence — independent of GDN and of
+  this gate — is documented there as an open follow-up (the server's 3-GPU tensor-split config is
+  affected).
 
 - **Block 00 (structural and architecture fixes) added; the set is now 15 patches and the masked-V
   freed-cell fixes are re-homed (2026-09-10).**  A new first block, `patches/0000`, holds baseline-level

@@ -33,7 +33,8 @@ bottom of this file): block 00 = the structural/architecture fixes added
 2026-09-10 (FA small-batch KV-split width invariance + Vulkan masked-V), and
 blocks 01-14 = the fork's `rdna-boosts` block
 commits on `9113cc188` (the canonical 15-block tip is block 14
-`505637d6e`; **block 15, the attention-memory campaign, is NOT part of the
+`7b79930b2`; block 02 amended 2026-09-11 with the opt-in
+`GGML_CUDA_GDN_ALIGN_BOUNDARY` K-independent boundary; **block 15, the attention-memory campaign, is NOT part of the
 delivery** -- it is staged in `beta/block-15-campaign-wins/` and applied
 manually, see `patches/README.md` and `WORKLOG.md`); the reference `~/llama.cpp`
 `rdna-boosts` branch is *disposable* and had at cut time drifted two
@@ -43,7 +44,7 @@ load default) and `304665fe7` (SYCL IQ-type-for-MoE), both dated after
 wrongly export those two upstream commits as patches 0001/0002.
 **Always regenerate from a canonical fork rebuilt at `9113cc188` via
 `scripts/apply-all.sh`** (that is what `make-patches.sh`'s default tip
-`505637d6e` refers to).  The two commits' content is 106 lines in 3 files
+`7b79930b2` refers to).  The two commits' content is 106 lines in 3 files
 (`ggml/src/ggml-sycl/mmvq.cpp`, `ggml/src/ggml-sycl/vecdotq.hpp`,
 `src/llama-model.cpp`) and is deliberately **not** in the delivery — it
 is upstream code past the recorded fork point; it does not touch any
@@ -142,7 +143,8 @@ PR #27210 review head `d236d41a2`, squash — see the WORKLOG entry) with
 block 03 amended 2026-09-10 (HIP masked-V fixes, re-homed from block 14)
 and block 14 amended 2026-09-10 (the kernel-side masked-V fixes were
 re-homed — Vulkan to block 00, HIP to block 03; the freed-cell host zeroing
-is removed; tip `505637d6e`; block 14 = the qwen4exp-support delta promoted
+is removed; tip `7b79930b2`; block 02 amended 2026-09-11 with the opt-in
+`GGML_CUDA_GDN_ALIGN_BOUNDARY` K-independent boundary; block 14 = the qwen4exp-support delta promoted
 from `beta/qwen4exp`; re-based 2026-09-08 from the `050dde50c` set
 `90a816a68..3bebffd6b` (block 06 reduced to a marker — see the WORKLOG
 re-base entry); previously the
@@ -172,7 +174,7 @@ to apply against a newer upstream master:
    than one block needs manual re-base hunks, regenerate the whole set from
    the fork with `scripts/make-patches.sh` (re-exports blocks 00-14 from
    `9113cc188..<blocks-tip>`; defaults target
-the current 15-block tip `505637d6e`), then re-verify the clean-apply
+the current 15-block tip `7b79930b2`), then re-verify the clean-apply
 simulation (fresh worktree at the new fork point, `scripts/apply-all.sh`,
 build, coherence) and update the fork point + verification numbers in
 `patches/README.md` and `README.md`.

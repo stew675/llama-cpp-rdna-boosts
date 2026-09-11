@@ -49,7 +49,7 @@ the 15-block tree):
 |---|---|
 | `0000` | **structural and architecture fixes** — FA small-batch KV-split width invariance (issue #25: decode and every speculative verify width now reduce identically, so greedy output no longer changes with the MTP draft length) + Vulkan masked-V/freed-cell fixes (dead columns never read V). Added 2026-09-10; this is the base every other block applies on top of. |
 | `0001` | adaptive MTP draft depth | **refreshed 2026-09-09 to the upstream PR #27210 review head** (`d236d41a2`; review-round feedback-handling, option validation + docs) — see the 2026-09-09 block-01 refresh section below.
-| `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | **amended 2026-09-06 with the gfx11 NW16 scan retune** (gated_delta_net_chunked_bf16_gfx11.cu, fork 376f02aa0).
+| `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | **amended 2026-09-06 with the gfx11 NW16 scan retune** (gated_delta_net_chunked_bf16_gfx11.cu, fork 376f02aa0); **amended 2026-09-11 with the opt-in `GGML_CUDA_GDN_ALIGN_BOUNDARY` K-independent boundary** (gated_delta_net.cu, default off).
 | `0003` | BF16 KV cache + native-BF16 flash-attn | **amended 2026-09-10 with the HIP masked-V/freed-cell fixes** (moved here from block 14 on 2026-09-10 — they sit on the native-BF16 PV staging this block introduces): `fattn-tile.cuh` (packed-bf16 PV) + `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles). |
 | `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf | **amended 2026-09-06 with the RDNA WMMA (256,256,64) config row** (fattn-mma-f16.cuh, fork e7eecb369).
 | `0005` | CPU bit-identical decode/verify batches |
@@ -772,6 +772,23 @@ upstream's additions.
   to sequential; non-MTP coherence unchanged.  Not bit-identical vs
   sequential in general (same class as the bf16 chunked: near-lossless).
   Lab numbers: `benchmarks/2026-08-31-mtp-gdn-chunked-prefix.md`.
+- **Opt-in K-independent chunked-GDN boundary added** (2026-09-11,
+  `GGML_CUDA_GDN_ALIGN_BOUNDARY=1`, **default off**).  Fixes the fork-only
+  plain-vs-spec divergence from the gfx1151 issue-#25 validation: the two
+  branches above have a K-dependent chunk/sequential boundary (plain `K == 1`
+  chunks the whole prompt; MTP `K > 1` chunks `n_tokens - K`), so the
+  post-prefill SSM state depends on `n_rs_seq` and `--spec-type none`
+  disagrees with `draft-mtp`.  The gated branch chunks `n_tokens - 64` and
+  runs the sequential kernel over the last 64 for both `K == 1` and `K > 1`,
+  giving one boundary and one state (the tail also emits the K snapshots, so
+  rollback <= 63 is exact; `n_seqs > 1` keeps the whole-ubatch path).  Default
+  OFF because the existing boundary is deliberate and ~1.1-1.2 % faster
+  prefill; the gate only guards the two existing branch conditions, so the
+  default output stays byte-identical.  gfx1201 probe (`RS=from_w`, P=256):
+  `W1-W3/W3-W5 = 0.136693/0.182106` default -> `0.000000/0.000000` gated;
+  gated text `none == n2 == n4` and equals the `GGML_CUDA_GDN_CHUNKED=0`
+  reference on the short prompts; `test-backend-ops -o GATED_DELTA_NET` 46/46
+  both ways.  Record: `../wip/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FIX.md`.
 
 ## Block 13 notes
 
