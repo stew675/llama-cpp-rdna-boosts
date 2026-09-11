@@ -426,6 +426,10 @@ any block amendment** (§12.6).
    genuinely needed.
 2. Work in `/tmp/canon-llama` with a **clean** tree (check `git branch --show-current` == `rdna-boosts`
    and `git status --porcelain` empty; see §13).
+   **Items 1 and 5 land in *different* blocks (1 → block 14, 5 → block 13).  Amend the *earlier*
+   block first (13 before 14), or do both in one `rebase -i` pass — amending the later block never
+   disturbs the earlier one, but doing them in the opposite order costs two full rebases.**  If you
+   touch block 13, block 14 replays on top; verify block 14's body is metadata-only afterwards.
 3. Amend: `git diff -- <files> > /tmp/fix.patch && git checkout -- .` →
    `GIT_SEQUENCE_EDITOR="sed -i 's/^pick <sha>/edit <sha>/'" git rebase -i <prev-block-sha>` →
    `git apply /tmp/fix.patch && git add -A && git commit --amend --no-edit` → `git rebase --continue`.
