@@ -53,13 +53,17 @@ chunked kernel over [0, n_prefix)  ->  prefix_state
 sequential kernel over the last (n_tokens - n_prefix) tokens, with keep_rs = (K > 1)
 ```
 
-`GDN_CHUNKED_KTAIL = 64` (== the chunk size).  Plain (`K == 1`) and MTP
-(`K == n_max + 1`) now share exactly one boundary and one tail length, so they
-compute the **same state regardless of whether the chunked kernel is exact**.
-The sequential tail also produces the K snapshots (slot j = j tokens back), so
-rollback <= 63 is exact.  No `K <= KTAIL` guard is used: the fixed tail always
-writes slots `0..63`, so the final state matches plain for any K; only
-`n_rs_seq >= 64` (a >63-deep MTP draft) would leave deep slots stale.  The
+`GDN_CHUNKED_KTAIL` is now **16** (`K > 16 ? K : 16`).  Plain (`K == 1`) and
+MTP (`K == n_max + 1`) share exactly one boundary and one tail length for
+`K <= 16`, so they compute the **same state regardless of whether the chunked
+kernel is exact**.  The sequential tail also produces the K snapshots (slot j =
+j tokens back), so rollback <= KTAIL-1 is exact.  The tail must be a *fixed*
+constant (a K-derived boundary would give the two paths different prefixes and
+defeat the branch); **16** covers `K <= 16` / `n_max <= 15`, including adaptive
+MTP's recommended `n_max = 12`.  The `K > 16 ? K : 16` floor keeps deeper
+drafts exact by reproducing the pre-alignment `K > 1` boundary (correct
+snapshots, correct-but-not-bit-identical).  The tail is the entire cost
+(27B pp512/2048/4096: KTAIL 64 = -1.5 %, 16 = -0.3..-0.8 %, 8 = ~0).  The
 bf16/fp32 kernel selection, the launch-rejection fallback and the fused
 GDN->cpy (`cache != nullptr`) behaviour are unchanged from the default
 branches.  `n_seqs > 1` keeps the whole-ubatch chunked path (the chunked

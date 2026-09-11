@@ -7,7 +7,7 @@
 #   baseline-sha  the upstream baseline the patches are generated against
 #                 (default: 9113cc188, see MANIFESTS.md)
 #   blocks-tip    the fork commit carrying block 00 + all 14 feature
-#                 blocks (default: 33ccf7e28, the block-14 commit of the
+#                 blocks (default: eb26da812, the block-14 commit of the
 #                 CANONICAL fork rebuilt at 9113cc188).  The block-15
 #                 (attention-memory campaign) work is NOT part of the
 #                 delivery; it is staged in beta/block-15-campaign-wins/
@@ -30,7 +30,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
 BASELINE="${2:-9113cc188}"
-TIP="${3:-33ccf7e28}"
+TIP="${3:-eb26da812}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then

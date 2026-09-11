@@ -5627,7 +5627,7 @@ index ae217fbd9..5097310cf 100644
              need_f16_K = true;
              need_f16_V = true;
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a724..c8e639789 100644
+index 1b431a724..ba5bc1aa1 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,4 +1,5 @@
@@ -5636,7 +5636,7 @@ index 1b431a724..c8e639789 100644
  #include "ggml-cuda/common.cuh"
  
  template <int S_v, bool KDA, bool keep_rs_t>
-@@ -286,6 +287,205 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -286,6 +287,212 @@ static void ggml_cuda_op_gated_delta_net_impl(
      const int K = ggml_get_op_params_i32(dst, 0);
      const bool keep_rs = K > 1;
  
@@ -5774,8 +5774,15 @@ index 1b431a724..c8e639789 100644
 +        (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
 +        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
 +        if (env == nullptr || strcmp(env, "0") != 0) {
-+            // fixed sequential tail length == the chunk size; must be >= the deepest rollback
-+            constexpr int64_t GDN_CHUNKED_KTAIL = 64;
++            // Sequential tail length.  It must be a *constant* for K <= 16 (not derived from K),
++            // or the K==1 and K>1 prefills pick different prefix boundaries and stop being
++            // bit-identical -- which is the whole point of this branch.  16 covers K <= 16
++            // (n_max <= 15, including adaptive MTP's recommended n_max=12); the cost is entirely
++            // the tail length (27B Q8_0 pp512/2048/4096: tail 64 = -1.5%, 16 = -0.35%, 8 = ~0).
++            // The floor at K keeps the snapshots exact for deeper drafts: those reproduce the
++            // pre-alignment K>1 boundary exactly (chunk n_tokens - K + sequential K), i.e. they
++            // fall back to correct-but-not-bit-identical instead of reading stale snapshot slots.
++            const int64_t GDN_CHUNKED_KTAIL = K > 16 ? (int64_t) K : 16;
 +            // GGML_CUDA_GDN_CHUNKED_BF16 / arch selection: same rules as the default branches
 +            // (RDNA4 -> the RDNA4 WMMA kernel, RDNA3 -> the gfx11 port, everything else fp32).
 +            // n_tokens_limit > 0 truncates to the prefix of a single sequence.

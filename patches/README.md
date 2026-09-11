@@ -49,7 +49,7 @@ the 15-block tree):
 |---|---|
 | `0000` | **structural and architecture fixes** — FA small-batch KV-split width invariance (issue #25: decode and every speculative verify width now reduce identically, so greedy output no longer changes with the MTP draft length) + Vulkan masked-V/freed-cell fixes (dead columns never read V). Added 2026-09-10; this is the base every other block applies on top of. |
 | `0001` | adaptive MTP draft depth | **refreshed 2026-09-09 to the upstream PR #27210 review head** (`d236d41a2`; review-round feedback-handling, option validation + docs) — see the 2026-09-09 block-01 refresh section below.
-| `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | **amended 2026-09-06 with the gfx11 NW16 scan retune** (gated_delta_net_chunked_bf16_gfx11.cu, fork 376f02aa0); **amended 2026-09-11 with the `GGML_CUDA_GDN_ALIGN_BOUNDARY` K-independent boundary** (gated_delta_net.cu; **default ON**, opt out with `=0`).
+| `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | **amended 2026-09-06 with the gfx11 NW16 scan retune** (gated_delta_net_chunked_bf16_gfx11.cu, fork 376f02aa0); **amended 2026-09-11 with the `GGML_CUDA_GDN_ALIGN_BOUNDARY` K-independent boundary** (gated_delta_net.cu; **default ON**, opt out with `=0`; `KTAIL=16`, covers `n_max`<=15).
 | `0003` | BF16 KV cache + native-BF16 flash-attn | **amended 2026-09-10 with the HIP masked-V/freed-cell fixes** (moved here from block 14 on 2026-09-10 — they sit on the native-BF16 PV staging this block introduces): `fattn-tile.cuh` (packed-bf16 PV) + `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles). |
 | `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf | **amended 2026-09-06 with the RDNA WMMA (256,256,64) config row** (fattn-mma-f16.cuh, fork e7eecb369).
 | `0005` | CPU bit-identical decode/verify batches |
@@ -779,15 +779,23 @@ upstream's additions.
   boundary (plain `K == 1` chunks the whole prompt; MTP `K > 1` chunks
   `n_tokens - K`), so the post-prefill SSM state depends on `n_rs_seq` and
   `--spec-type none` disagrees with `draft-mtp`.  The aligned branch chunks
-  `n_tokens - 64` and runs the sequential kernel over the last 64 for both
-  `K == 1` and `K > 1`, giving one boundary and one state (the tail also
-  emits the K snapshots, so rollback <= 63 is exact; `n_seqs > 1` keeps the
-  whole-ubatch path).  **Flipped to default ON 2026-09-11** (was opt-in):
+  `n_tokens - KTAIL` and runs the sequential kernel over the last `KTAIL` for
+  both `K == 1` and `K > 1`, giving one boundary and one state (the tail also
+  emits the K snapshots; `n_seqs > 1` keeps the whole-ubatch path).
+  `KTAIL` must be a **fixed constant** for `K <= 16` — a K-derived boundary
+  would make `K == 1` and `K > 1` pick different prefixes and defeat the whole
+  branch.  It is **16** (covers `K <= 16`, i.e. `n_max <= 15`, including
+  adaptive MTP's recommended `n_max = 12`), with a floor at `K` for deeper
+  drafts: those reproduce the pre-alignment `K > 1` boundary exactly (correct
+  snapshots, correct-but-not-bit-identical) rather than reading stale slots.
+  The cost is entirely the tail length — 27B Q8_0 pp512/2048/4096:
+  `KTAIL=64` ≈ -1.5 %, **`KTAIL=16` ≈ -0.3..-0.8 %**, `KTAIL=8` ≈ 0 (decode
+  unchanged in all cases).  **Flipped to default ON 2026-09-11** (was opt-in):
   together with the block-13 dense-MMVQ alignment this is what makes
   `--spec-type none == draft-mtp` under `-sm tensor` (and on 1 GPU) with
   `GGML_CUDA_GDN_CHUNKED` at its default; the opt-out (`=0`) keeps the
-  K-dependent boundary and its ~1.5-1.8 % faster prefill for callers that do
-  not need the bit-exactness.  gfx1201 probe (`RS=from_w`, P=256):
+  K-dependent boundary and its prefill edge for callers that do not need the
+  bit-exactness.  gfx1201 probe (`RS=from_w`, P=256):
   `W1-W3/W3-W5 = 0.136693/0.182106` default -> `0.000000/0.000000` gated;
   gated text `none == n2 == n4` and equals the `GGML_CUDA_GDN_CHUNKED=0`
   reference on the short prompts; `test-backend-ops -o GATED_DELTA_NET` 46/46

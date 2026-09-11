@@ -10,6 +10,20 @@ for the full record; per-block technical notes live in
 
 ---
 
+- **Block 02 amended: GDN alignment tail shortened to `KTAIL=16` (2026-09-11).**  The aligned
+  boundary's cost is entirely its sequential tail (which writes the K rollback snapshots), and the
+  tail was 64 — ~16x longer than the default `--spec-draft-n-max 3` needs.  `KTAIL=16` covers
+  `K <= 16` / `n_max <= 15`, including adaptive MTP's recommended `n_max = 12`; for deeper drafts the
+  new `K > 16 ? K : 16` floor keeps the snapshots exact (those reproduce the pre-alignment `K > 1`
+  boundary, i.e. correct-but-not-bit-identical, instead of reading stale snapshot slots).  Measured
+  (27B Q8_0, 1 GPU, interleaved `-r 5`): `KTAIL=64` ≈ -1.5 %, **`KTAIL=16` ≈ -0.3..-0.8 %**,
+  `KTAIL=8` ≈ 0; decode unchanged.  Bit-identity re-verified with `KTAIL=16`: 27B 2-GPU tensor
+  probe W=1/3/5 and text `none == n1 == n2 == n4` (`e386b50d`), 3-GPU tensor `none == n4`, 4B 1-GPU.
+  Canonical re-cut: block 02 `d60bb52ef` -> `63f8ab023`, tip **`eb26da812`**, net tree
+  **`b64f21644`**; clean-apply strict 15/15 `git am`, zero whitespace, applied tree == canonical.
+  Follow-ups (free GDN prefill alignment + the MoE batch-width residual) written up in
+  `wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md`.
+
 - **Block 02 amended: `GGML_CUDA_GDN_ALIGN_BOUNDARY` flipped to default ON (opt-out), 2026-09-11.**
   The K-independent chunked-GDN boundary is now enabled by default (`GGML_CUDA_GDN_ALIGN_BOUNDARY=0`
   opts out and restores the K-dependent boundary).  This is the second of the two independent fixes
@@ -20,7 +34,8 @@ for the full record; per-block technical notes live in
   1363.6/1363.8 (**-1.8 / -1.5 %**), pp2048 1362.2/1358.3 -> 1337.3/1338.1 (-1.8 / -1.5 %),
   pp4096 1329.5/1328.5 -> 1309.2/1309.6 (-1.5 %); decode unchanged (tg128 20.43 -> 20.40).  The
   maintainer accepted the prefill cost to close the divergence.  Canonical chain re-cut: block 02
-  `38641280b` -> `d60bb52ef`, tip **`33ccf7e28`**, net tree **`31e153fe3`**; clean-apply strict 15/15
+  `38641280b` -> `d60bb52ef`, tip **`33ccf7e28`**, net tree **`31e153fe3`** (later re-cut again for KTAIL=16:
+tip `eb26da812`, tree `b64f21644`); clean-apply strict 15/15
   `git am`, zero whitespace warnings, applied tree == canonical.
 
 - **Block 13 amended: dense decode/verify MMVQ kernel alignment (`mmvq.cu`, 2026-09-11).**

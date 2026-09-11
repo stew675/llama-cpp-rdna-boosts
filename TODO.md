@@ -101,9 +101,9 @@ Block 15 is STAGED in `beta/block-15-campaign-wins/`, not promoted.
 - **Fork/canonical state**: the working checkout's `rdna-boosts` is a local rebuild and must NOT be used
   for regeneration if it sits on a master newer than the fork point (it would export `f3f1a8f27`
   + `304665fe7` as patches 0001/0002).  The canonical 15-block chain used for the delivery ends at the
-  block-14 commit `33ccf7e28` (rebuilt at `9113cc188`; block 02 amended 2026-09-11 with the
+  block-14 commit `eb26da812` (rebuilt at `9113cc188`; block 02 amended 2026-09-11 with the
   `GGML_CUDA_GDN_ALIGN_BOUNDARY` boundary, **default ON / opt out with `=0`**); `make-patches.sh`
-  default tip = `33ccf7e28`.
+  default tip = `eb26da812`.
   The beta block-15 patch is applied manually on top of that tree.
 - Superseded/still-useful artifacts: the work branch `wip/block15-campaign-wins` (`b26ae06f0`) and
   `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch` remain as the pre-merge
