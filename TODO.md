@@ -406,10 +406,20 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   fused sparse QSA op (**~13.8 % of long-context prefill**, measured 2026-09-11) — restoring it needs
   `fattn-qsa` to read those types natively; **it is the next session's task and has its own brief:
   `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-qsa-quantized-kv.md`** (see also the third
-  2026-09-11 block-14 amendment section in `patches/README.md`); (b) the *other*
-  backends (NVIDIA) reach the vec family for these types at small `n_q`, where the F1-style
-  VEC-vs-TILE band split still exists upstream — not touched here (the fork's band guarantee is
-  gfx1201's TILE path), worth revisiting if the fork is ever validated on NVIDIA.
+  2026-09-11 block-14 amendment section in `patches/README.md`); (b) **NVIDIA only, and dead code on
+  every AMD device**: the chooser's remaining VEC returns live under `turing_mma_available()` /
+  `volta_mma_available()`, both defined as `GGML_CUDA_CC_IS_NVIDIA(cc) && ...` (common.cuh:355-361), so
+  `gfx1201`/`gfx1151`/`gfx1100` can never take them — and on RDNA4 the band is TILE *by construction*
+  (`amd_mfma_available` is CDNA-only, the WMMA branch is gated `n_q > 8`, and the fallback where F1
+  deleted the VEC arms now returns TILE unconditionally).  So the F1-class split is **not** a caveat
+  for this fork's supported hardware; it is (i) live *upstream* on Turing+/Volta for quantized caches
+  at `n_q <= 2`, which is exactly what the staged
+  `upstream/UPSTREAM-PR-fa-decode-verify-kernel-family.{md,patch}` removes (the fork's block-08 fix
+  landed only the fallback hunk; the PR also carries the NVIDIA/Ada arm — see that note's Scope), and
+  (ii) newly reachable for `q4_1`/`q5_0`/`q5_1` on those NVIDIA parts, because this session's
+  enablement made them FA-supported (they used to be rejected outright), which is why their three
+  diagonal vec instances are *required* there rather than merely defensive.  Nothing to do for AMD;
+  filing the PR is the NVIDIA fix.
   **Step 1's brief (kept for the record):**
   `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-f3-kv-diagonals.md`.  It
   also records what is *verified* versus still *open* about the mechanism: the HIP CMake globs the

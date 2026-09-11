@@ -53,6 +53,15 @@ single-token throughput; a split band costs greedy equivalence, which spec decod
 * The same class of defect exists in the surrounding width-dependent choices (`8/ncols2`, `16/ncols2`
   instantiation switches, `ntiles_dst`-derived split counts); the tile-launcher one was fixed in the
   fork by `ntiles_dst_eff` (see `UPSTREAM-PR-fa-kv-split-width.md`, already written up here).
+* **Why the NVIDIA arm here matters more since 2026-09-11:** the delivery now enables
+  `q4_1`/`q5_0`/`q5_1` as flash-attention KV types (`GGML_CUDA_FA_ALL_QUANTS` is no longer required;
+  see the block-08 notes and `GREEDY-PURITY.md` §20) and adds their three diagonal vec instances.  On
+  an Ada+ NVIDIA part those types therefore take `VEC` at `n_q <= 2` and the MMA family above it —
+  i.e. they now inherit exactly the split this PR removes, whereas before the enablement they were
+  rejected by the support predicate and never reached flash attention at all.  (The fork's own fix
+  scope is AMD, where the Turing/Volta branches are unreachable dead code: both predicates require
+  `GGML_CUDA_CC_IS_NVIDIA(cc)`, and on RDNA4 the band reaches the fallback, which now returns TILE
+  unconditionally — `amd_mfma_available` is CDNA-only and the WMMA branch is gated `Q->ne[1] > 8`.)
 
 ## Repro
 
