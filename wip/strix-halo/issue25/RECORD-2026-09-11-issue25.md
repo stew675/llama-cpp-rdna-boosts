@@ -1,5 +1,12 @@
 # Issue #25 on gfx1151 (Strix Halo) — raw investigation record (2026-09-11)
 
+> **SUPERSEDED (2026-09-11).**  The true root cause is the FA `parallel_blocks`
+> KV split keyed off `Q->ne[1]` (found by the GFX1201 agent), fixed by block 00
+> and validated on gfx1151 in `GATE-2026-09-11-block00-rdna35.md`.  Two claims
+> below are **wrong** (the reporter's mechanism, and the "spec-side"
+> attribution) — the gate record explains why.  Kept as the investigation
+> history.
+
 Reporter: 1337hero, dual R9700 (gfx1201), "Greedy output on dense qwen35 changes
 with the MTP draft length (verify batch width) on the 14-block set".
 

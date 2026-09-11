@@ -7,11 +7,13 @@ BE=${1:-rocm}
 TYPE=${2:-bf16}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 if [ "$BE" = rocm ]; then
-  BIN=/home/stew675/llama.cpp/build-rocm/bin; LIB=$BIN/libggml-hip.so
+  BUILD_DIR=${BUILD_DIR:-/home/stew675/llama.cpp/build-rocm}
+  BIN=$BUILD_DIR/bin; LIB=$BIN/libggml-hip.so
   export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$BIN
   export HIP_VISIBLE_DEVICES=0; unset GGML_VK_VISIBLE_DEVICES
 else
-  BIN=/home/stew675/llama.cpp/build-vulkan/bin; LIB=$BIN/libggml-vulkan.so
+  BUILD_DIR=${BUILD_DIR:-/home/stew675/llama.cpp/build-vulkan}
+  BIN=$BUILD_DIR/bin; LIB=$BIN/libggml-vulkan.so
   export LD_LIBRARY_PATH=$BIN
   export GGML_VK_VISIBLE_DEVICES=0; unset HIP_VISIBLE_DEVICES
 fi
