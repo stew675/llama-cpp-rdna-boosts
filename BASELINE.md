@@ -170,9 +170,9 @@ to apply against a newer upstream master:
    master and continue.
 3. Do NOT hand-edit the committed patches as the permanent fix: when more
    than one block needs manual re-base hunks, regenerate the whole set from
-   the fork with `scripts/make-patches.sh` (re-exports blocks 01-14 from
+   the fork with `scripts/make-patches.sh` (re-exports blocks 00-14 from
    `9113cc188..<blocks-tip>`; defaults target
-the current 14-block tip `b425aa8f7`), then re-verify the clean-apply
+the current 15-block tip `505637d6e`), then re-verify the clean-apply
 simulation (fresh worktree at the new fork point, `scripts/apply-all.sh`,
 build, coherence) and update the fork point + verification numbers in
 `patches/README.md` and `README.md`.

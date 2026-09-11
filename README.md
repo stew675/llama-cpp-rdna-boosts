@@ -249,7 +249,7 @@ git checkout 9113cc188        # the SHA recorded in patches/README.md
 
 # 2. apply the set (automated; VERIFIED 2026-08-29, re-verified 2026-09-01/02/05/06/07 and 2026-09-08)
 bash <path-to-this-repo>/scripts/apply-all.sh .
-#    = git am patches/0001…0014  (one commit per block on a fresh `rdna-boosts` branch)
+#    = git am patches/0000…0014  (one commit per block on a fresh `rdna-boosts` branch)
 
 # 3. build + verify (trim -DGPU_TARGETS to your GPU arch for a faster build)
 cmake -B build -DGGML_HIP=ON -DGGML_HIP_RCCL=1 -DGPU_TARGETS="gfx1100;gfx1151;gfx1201" -DCMAKE_BUILD_TYPE=Release

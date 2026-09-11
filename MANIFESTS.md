@@ -14,8 +14,8 @@ on `9113cc188` uses the canonical 15-block tip `505637d6e`, because the referenc
 two upstream master commits past the fork point (`f3f1a8f27`, `304665fe7`
 — SYCL + iGPU-only code) and a `format-patch` there would have exported
 those as patches 0001/0002; the delivered `0001`-`0014` bodies are
-byte-identical to the previous regeneration apart from the `From <sha>`
-line and the `[PATCH NN/14]` series count.  **Block 15 (the attention-memory
+byte-identical to the previous (14-patch) regeneration apart from the `From <sha>`
+line and the `[PATCH NN/15]` series count; block `0000` is new.  **Block 15 (the attention-memory
 campaign, V3/V4/V5 + W1-W4) is NOT part of the delivery** — it is staged in
 `beta/block-15-campaign-wins/` and applied manually on top of the 15-block
 tree; see that directory's README and the WORKLOG entry; block 00 added
@@ -168,14 +168,15 @@ byte-identical output.  Six wins, each with an environment A/B gate
 (V4 is an *enable* switch, default off); full mechanism notes and the
 per-win measurement tables are in `beta/block-15-campaign-wins/README.md`.
 
-Apply + regeneration verification:
+Apply + regeneration verification (the 14/14 / `[PATCH NN/14]` / `ff2b35f49`
+figures below are the then-current state; block 00 was added 2026-09-10, so the
+current delivery is the 15-patch set `0000`-`0014`, tip `505637d6e`):
 
 - fresh worktree at `9113cc188` -> `scripts/apply-all.sh` (**strict 14/14
-  `git am`** for the delivery, zero whitespace warnings) + the beta
+  `git am`** for the then-14-patch delivery, zero whitespace warnings) + the beta
   `block-15-campaign-wins.patch` applied on top; this is how the beta
   patch was validated when it was temporarily staged in `patches/`.  It is
-  no longer staged: the delivery is 14 patches and the beta patch lives in
-  `beta/block-15-campaign-wins/`.
+  no longer staged: the beta patch lives in `beta/block-15-campaign-wins/`.
 - the delivered `0001`-`0014` files are byte-identical to the previous
   regeneration except the `From <sha>` line and the `[PATCH NN/14]`
   series count (verified hunk by hunk); there is no `patches/0015`.

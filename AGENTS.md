@@ -150,7 +150,7 @@ fork point + apply) — the last regeneration (2026-09-10, the 15-block set
 with block 00 and the re-homed masked-V fixes) applied strict 15/15 `git am`
 and produced tip `505637d6e`; the blocks' bodies are byte-identical to the
 previous regeneration apart from the `From <sha>` line and the
-`[PATCH NN/14]` series count (plus the block-00 Vulkan and block-03 HIP
+`[PATCH NN/15]` series count (plus the block-00 Vulkan and block-03 HIP
 hunks).  (The block-15 attention-memory campaign was
 temporarily staged as a 15th patch and then un-promoted; it lives only in
 `beta/block-15-campaign-wins/`.)  Older fork states are
@@ -367,7 +367,7 @@ than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188` (tip `505637d6e`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
-the `[PATCH NN/14]` series count change.  Then
+the `[PATCH NN/15]` series count change.  Then
 re-verify the clean-apply simulation (worktree at the fork point,
 apply-all, build, coherence) before committing.
 
