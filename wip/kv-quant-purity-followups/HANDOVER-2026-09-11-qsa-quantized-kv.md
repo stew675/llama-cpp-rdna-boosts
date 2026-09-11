@@ -88,7 +88,7 @@ All checked in the delivery source on 2026-09-11:
    sizes (`64/128/256`, `:597-612`) is a mechanical edit; qwen4exp uses **128**.
 5. **The predicate** `ggml_cuda_flash_attn_qsa_supported()` (`:621`) requires `Q->type == F32`,
    `idx->type == I32`, `D ∈ {64,128,256}` and `kv_ok = (F16,F16) | (BF16,BF16) | (Q8_0,Q8_0)`.  It is
-   consulted by the backend's `supports_op` (`ggml-cuda.cu:6858`), which is what decides whether the
+   consulted by the backend's `supports_op` (`ggml-cuda.cu:6857`), which is what decides whether the
    graph may build the op at all.
 6. **The op has an identity mode** and this is the crucial consequence: `top_k == nullptr` (the
    `shortcut` and dense-decode arms) plus `env GGML_CUDA_QSA_IDENTITY` make the kernel read cells
