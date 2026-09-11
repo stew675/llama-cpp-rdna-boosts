@@ -380,6 +380,17 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   k-block loop (one weight read per `(row)` block, per-token accumulators), which stays bit-identical
   per token.  Not a purity issue — every width already takes the fused path.
 
+- **gfx1151: re-evaluate the QSA crossover (new, 2026-09-11, purity-first).**  The published 64K
+  "dense below, QSA above" crossover was measured for the **W=1 decode** regime, whose arm is
+  unchanged by the band fix (W=1 took the dense arm before and after — the plain stream that moved on
+  gfx1201 did so because of a 4-token prompt-tail batch, not its decode), so the *decode* table still
+  stands.  But the **verify** batch now takes the dense arm below the crossover instead of the sparse
+  selection, so the **MTP-side** crossover has never been measured — and above 64K the sparse regime
+  is (i) at parity with dense per the controlled 2026-09-07 protocol and (ii) still **impure for MTP**
+  (`GREEDY-PURITY.md` §18).  Under §19's purity-first policy the likely answer is **dense decode at
+  every depth on gfx1151 too** (a one-line policy change in `build_layer_attn`) until §18's two items
+  are fixed; measure the MTP crossover on the Strix Halo box either way before changing the constant.
+
 - **F3 (performance, biggest available win): sub-`q8_0` KV quant parity.**  q4_1/q5_0/q5_1/iq4_nl
   are pure and 1800–2400 MiB (vs 3400 q8_0 / 6400 f16) but run 2197–2293 pp512 / 56–64 tg32 versus
   7713–7838 / 95–99, because they have no native FA path (F16 staging scratch).  Block 15 already

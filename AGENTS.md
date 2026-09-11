@@ -344,8 +344,12 @@ explicitly requests it.**
   draft-mtp 53 -> 126 t/s vs upstream ~113).  MoE MTP had no baseline data
   — that is why it slipped; the MTP gate now lives in
   `benchmarks/mtp-adaptive-methodology.md`.  Verify decode changes with
-  Protocol A there (acceptance must stay > ~0.45, MTP >= plain at depth 3)
-  before relying on llama-bench numbers.
+  Protocol A there (acceptance must stay > ~0.45 **at pos 1**, MTP >= plain at
+  the default depth 3) before relying on llama-bench numbers.  **Purity ranks above raw non-MTP
+  throughput**: a fix that makes the verify batch compute what the decode computes may cost a few
+  percent at the wide verify widths — land it, record the delta and file the optimisation follow-up
+  (measured 2026-09-11: −2.4 % at `pl=8` bought MoE acceptance 0.51 -> 0.81707, +73 % MTP).  See
+  `GREEDY-PURITY.md` §19.
 - **MoE (`qwen35moe`) decode/verify IS byte-identical by default (fixed 2026-09-11).**
   The fused shared-expert window (`ggml_cuda_op_shexp_down_gate`, +3.1% MoE
   decode) does not reproduce the unfused chain's arithmetic: its gate dot uses

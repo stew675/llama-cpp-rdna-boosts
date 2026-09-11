@@ -677,3 +677,37 @@ and for the dense models and the MoE; the **gfx1151 sparse regime above 64K** st
 above.  Repro knobs: `LLAMA_QSA_DENSE_DECODE_UNTIL=0`, `GGML_CUDA_QSA_INDEXER_SCORE=0`,
 `GGML_CUDA_QSA_INDEXER_CACHE=0`; the arm trace is kept at
 `wip/kv-quant-purity-followups/tools/qsa-arm-trace.patch`.
+
+## 19. Purity first: the measured trade (2026-09-11, policy)
+
+**A purity fix may cost a few percent of raw non-MTP throughput.  That is not a gate failure.**
+The gate is bit-identical decode/verify plus MTP acceptance/throughput, and the 2026-09-11 work
+measured why the order of those priorities is not a matter of taste:
+
+* the MoE shared-expert band fix (§17) **costs** ~2.4 % at the widest verify batch (`pl=8` 332.8 vs
+  341.0 with the unfused chain; `pl=4` −0.9 %, `pl=1` flat) — and it **raised MoE `draft-mtp`
+  acceptance from 0.51 to 0.81707** (167.3 t/s vs plain 96.9, **+73 %**), because the verify batch now
+  computes what the draft's single-token decode steps compute;
+* the QSA decode-arm fix (§16) **costs** ~1.5-2 % at `pl=5/6` — and it makes `plain == draft-mtp`
+  byte-identical with `n_max 3` pos-1 acceptance 0.615 at 63.9 t/s vs plain 50.1 (**+28 %**).
+
+The asymmetry is structural: the draft model's proposals *are* decode steps, so any arithmetic
+difference between decode and verify shows up as draft-vs-verify disagreement, and lost acceptance
+costs a multiple of whatever the "faster" path saved in the kernel it changed.  A few percent of
+attention/GEMM throughput cannot pay for a lower acceptance rate.
+
+**Gate for a purity fix** (replace any previous "must not regress" wording):
+
+1. **correctness**: `plain` vs `draft-mtp` byte-identical across the whole band (`n_max <= 7`), on
+   every supported KV type, or a documented reason why the affected regime is unreachable by default;
+2. **MTP**: acceptance at **pos 1** >= ~0.45 and `draft-mtp` throughput >= `plain` at the default
+   depth (`n_max 3`); a fixed high depth (`n_max 7+`) may lose — that is over-drafting, not a
+   regression (see `benchmarks/mtp-adaptive-methodology.md`);
+3. **perf**: no *hard* requirement at the wide verify widths.  If a fix costs > ~1 % anywhere, record
+   the delta and file the optimisation follow-up (e.g. TODO's column-blocked shared-expert kernel),
+   but land the purity fix first — and if a choice exists, prefer the side whose arithmetic is the
+   *decode* side, since that is what the draft reproduces.
+
+Corollary for tuning: an apparent "win" measured before a purity fix (e.g. a dense/sparse crossover
+depth, or a fusion's "+x % decode") may have been measured with a *width-dependent* path, which is
+exactly what happened to the gfx1151 QSA crossover below.
