@@ -74,8 +74,9 @@ the rest in order:
 06 `d2fc2cb34`, 07 `110b5391d`, 08 `38cffdece`, 09 `3484c378f`, 10 `d60105926`, 11 `e07549b55`,
 12 `f6198fbc9`, **13 `e3b189cee`** (the 2026-09-11 band fix), **14 `bfaa83d8a`**.
 
-Scratch branches that also exist there and are **not** the canonical chain: `blk15-f2c2` (the block-15
-re-cut commit `3f4e0747d`) and `blk15-recut` (held by the `/tmp/blk15` worktree). `rdna-boosts` is the
+Scratch branches that also exist there and are **not** the canonical chain: **`blk15-f3` (the current
+block-15 beta commit `8c377b958`, tree `34527a292` — the sixth re-cut)**, `blk15-f2c2` (the older re-cut
+`3f4e0747d`) and `blk15-recut` (held by the `/tmp/blk15` worktree, older still). `rdna-boosts` is the
 canonical chain; check `git branch --show-current` and `git rev-parse --short rdna-boosts` **before**
 committing anything there (see the trap in §13).
 
