@@ -10,9 +10,11 @@ Block 15 is STAGED in `beta/block-15-campaign-wins/`, not promoted.
 ## Current active
 
 > **Next session: start at `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-remaining-work.md`** — it
-> carries the agreed item order (1 = cause 3 QSA indexer + 5 = the MoE asterisk, in one session; then
-> F3, block-15 promotion, upstream PRs), the environment, the instruments, the reference hashes and the
-> landing procedure.
+> carries the environment, the instruments, the reference hashes and the landing procedure.  Items 1
+> (the QSA decode arm) and 5 (the MoE asterisk) were **done in the 2026-09-11 (7) session** — status
+> section at the top of that file.  Next in the agreed order: F3 (sub-`q8_0` KV native FA), block-15
+> promotion (beta window), upstream PRs, then the tail (the two QSA *sparse*-regime items, the fused
+> shexp kernel column-blocking, Issue #25 GDN, gemma-4-E4B meta splitter).
 
 ### Issue #25 follow-up: GDN chunked prefill (plain vs spec divergence) - IMMEDIATE, GFX1201
 - **OPEN (2026-09-11).**  On one build+prompt `--spec-type none` and MTP differ, and it is entirely
@@ -106,9 +108,9 @@ Block 15 is STAGED in `beta/block-15-campaign-wins/`, not promoted.
 - **Fork/canonical state**: the working checkout's `rdna-boosts` is a local rebuild and must NOT be used
   for regeneration if it sits on a master newer than the fork point (it would export `f3f1a8f27`
   + `304665fe7` as patches 0001/0002).  The canonical 15-block chain used for the delivery ends at the
-  block-14 commit `bfaa83d8a` (rebuilt at `9113cc188`; block 02 amended 2026-09-11 with the
+  block-14 commit `5ad11fd35` (rebuilt at `9113cc188`, net tree `3e7accbd7`; block 02 amended 2026-09-11 with the
   K-independent whole-batch chunked GDN prefill — free, gate removed, + rollback guard); `make-patches.sh`
-  default tip = `bfaa83d8a`.
+  default tip = `5ad11fd35`.
   The beta block-15 patch is applied manually on top of that tree.
 - Superseded/still-useful artifacts: the work branch `wip/block15-campaign-wins` (`b26ae06f0`) and
   `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch` remain as the pre-merge
@@ -313,7 +315,7 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   (only `W=1,2` move, onto the value the verify widths already produced).  Debug tool:
   `wip/kv-quant-purity-followups/tools/fa-kernel-chooser-trace.patch`.  Details: `GREEDY-PURITY.md` §14.
 - **F2 (correctness): qwen4exp was not width-pure — ALL THREE SITES FIXED 2026-09-11, and
-  `W = 1..8` is now bit-identical on both splits (canonical tip `bfaa83d8a`).**  **Cause 1** (the
+  `W = 1..8` is now bit-identical on both splits (canonical tip `5ad11fd35`).**  **Cause 1** (the
   hyper-connection `nt == 1` gates) was fixed as a block-14 amendment.  **Cause 2** was localised as
   the MoE gate+up+GLU **fusion coverage** flipping at `n_q = 5`, but the *mechanism* turned out to be
   upstream's **per-type mmvq cap**: `mul_mat_vec_q_moe`'s `__launch_bounds__` was the cap × warp_size
@@ -323,10 +325,29 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   (floors the cap at `MMVQ_MAX_BATCH_SIZE` and sizes the kernel at the band): every width now equals
   the pre-fix `W = 1` value, `+14–26 %` at the verify widths, `n_max 3` byte-identical, `n_max 7`
   `+16–18 %` t/s.  See `GREEDY-PURITY.md` §15 + the 2026-09-11 (5) WORKLOG entry.
-  **Cause 3 (OPEN): `plain` still differs from `draft-mtp` text** (`plain` `3ee9daee5c07` vs
-  `n_max 3 == n_max 7` `8a50ea24e8d5`) — pre-existing and independent of cause 2 (at `n_max 3`/`W = 4`
-  the cause-2 fix is a verified no-op).  The single-step width probe is pure (both splits, `RS=0` and
-  `RS=from_w`), so this is a **multi-step / roll-back** effect: **localised 2026-09-11 (further measurement): it is in the QSA *machinery*, and the site class is the same as cause 1's.**  `LLAMA_QSA_OFF=1` makes `plain` == `draft-mtp --spec-draft-n-max 3` **byte-identical** (`d4499ac8db72` both, 711 chars) — and the knob provably fires (the plain text moves `3ee9daee5c07` -> `d4499ac8db72`) — while `LLAMA_QSA_SPARSE_FA=0` (dense attention, indexer still on) leaves two different texts (`25f300a81b9e` vs `0d466b2dcf09`), so the defect is **not** the sparse-FA kernel but the **indexer/score machinery** (`indexer-topk.cu` + the `qwen4exp.cpp` gates).  Both QSA-side `n_tokens == 1` gates are the prime suspects — `src/models/qwen4exp.cpp:1094` (`idx_score_fused`, the fused indexer score) and `:1419` (`qsa_dense_decode_until`, the early-decode dense shortcut) — i.e. exactly the cause-1 pattern, and the single-step width probe cannot see them because it never reaches the sparse/indexer decode regime.  The divergence appears only after ~100 chars (~20 tokens) of a 3.3k-prompt greedy run (the first steps agree), so it is not a prefill-state difference; `GGML_CUDA_GDN_CHUNKED=0` moves both sides without making them agree (the known Issue #25 chunked-prefill item is a separate contributor, not this).  **Kill-switch for users meanwhile: `LLAMA_QSA_OFF=1`.****
+  **Cause 3 — FIXED 2026-09-11** (second block-14 amendment): `plain` differed from `draft-mtp` text
+  (`plain` `3ee9daee5c07` vs `n_max 3 == n_max 7` `8a50ea24e8d5`).  It was the QSA **indexer** arm
+  choice, not a kernel: `LLAMA_QSA_OFF=1` was byte-identical while `LLAMA_QSA_SPARSE_FA=0` was not.  An
+  arm trace in `build_layer_attn` showed the middle arm (the arch policy's dense decode arm) gated
+  `n_tokens == 1`: with `width = indexer_top_k + r - 1 = 2051` and `n_kv = 2304` at the first decode
+  graph, `--spec-type none` (`n_tokens=1`) took the **dense** arm while `draft-mtp` (`n_tokens=4`)
+  fell through to the **sparse top-k selection** — identical for the first 11 graph builds, split at
+  the first decode graph.  **FIXED** by `QSA_DECODE_BAND = 8` (arm 2 takes the whole band; prefill
+  keeps the sparse selection): `plain == n_max 3 == n_max 7` = `804de0576868` (f16) and
+  `plain == n_max 3` = `75d8530c5bb1` (q8_0); MTP `n_max 3` pos-1 acceptance 0.615, 63.9 t/s vs plain
+  50.1.  The single-step width probe could never see it (`P <= 2048` keeps `n_kv` below `width`), and
+  the earlier "multi-step / roll-back" framing was wrong — it was one width-selected arm.  Arm trace
+  kept at `wip/kv-quant-purity-followups/tools/qsa-arm-trace.patch`.
+  **Two width-dependences remain in the QSA *sparse* regime (open)**: (a)
+  `GGML_CUDA_QSA_INDEXER_SCORE`'s "replicates the per-op F32 arithmetic byte-identically" claim is
+  **measurably false** (with `LLAMA_QSA_DENSE_DECODE_UNTIL=0` forcing the sparse arm on both widths,
+  `SCORE=0` moves both streams) and it is itself `n_tokens == 1`-gated — unreachable on gfx1201's
+  default config (decode never builds a top-k selection, so no scores) but the **default path on
+  gfx1151 above its 64K crossover**; fixing it means making the kernel token-generic (or dropping the
+  probe to default-OFF); (b) a residual split survives even with one arm
+  (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`: common prefix 706 chars vs 100, then divergence) — a
+  state/store width-dependence still unlocalised (`GGML_CUDA_QSA_INDEXER_CACHE=0` does not reconcile
+  them).  See `GREEDY-PURITY.md` §18.
   The earlier attribution ("the fused sparse QSA path") was **wrong**: `LLAMA_QSA_OFF=1`,
   `LLAMA_QSA_SPARSE_FA=0`, the dense-shortcut and the arch decode policy all leave the divergence
   unchanged, as do graphs, the float-mmvf band and a batch-content test — **but note that list was
@@ -350,6 +371,15 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   after F1 and are width-pure; the earlier "the same cause as F1" guess was wrong.)
   Full evidence, the excluded-list and the re-appliable node-dump instrument:
   `wip/kv-quant-purity-followups/` (`README.md` F2 + `tools/node-dump-instrumentation.patch`).
+- **Fused shared-expert kernel: column-block it (small perf follow-up, 2026-09-11).**  Making the
+  epilogue band-uniform costs a little at the widest verify batches because the kernel is
+  `grid = (nrows, ncols)` — one block per `(row, token)` — so the down weight row is re-read once per
+  token (35B-A3B `llama-batched-bench` pl=8: 332.1 fused vs 341.5 with
+  `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`; pl=4 252.0 vs 254.2; pl=1 unchanged 97.9 vs 98.3).  The fix is
+  the `mul_mat_vec_q` pattern: template the kernel on `ncols_dst` and keep the token loop *inside* the
+  k-block loop (one weight read per `(row)` block, per-token accumulators), which stays bit-identical
+  per token.  Not a purity issue — every width already takes the fused path.
+
 - **F3 (performance, biggest available win): sub-`q8_0` KV quant parity.**  q4_1/q5_0/q5_1/iq4_nl
   are pure and 1800–2400 MiB (vs 3400 q8_0 / 6400 f16) but run 2197–2293 pp512 / 56–64 tg32 versus
   7713–7838 / 95–99, because they have no native FA path (F16 staging scratch).  Block 15 already

@@ -1,5 +1,60 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-11 (7) — the QSA decode arm and the MoE shared-expert epilogue are band-uniform
+
+**Canonical tip `5ad11fd35`** (block 13 `ee6b7d53d`, block 14 `5ad11fd35`), net tree
+`3e7accbd7f46c3d196e168a4d29a0350f813f5ff`, 15 blocks, clean-apply strict 15/15 with 0 whitespace
+warnings.  Two width-dependences of the same shape as the F1/F2/HC fixes — a band gate written as
+`n_tokens == 1` — closed in one session, each in its owning block.
+
+**Block 13 (fourth amendment) — the MoE shared-expert epilogue serves the band.**
+`ggml_cuda_op_shexp_down_gate` (the fused `down(swiglu) * sigmoid(gate(x)) + moe_out + ffn_residual`)
+was gated `down_mm->src[1]->ne[1] == 1 && gate_mm->src[1]->ne[1] == 1` *because* its fused gate
+reduction does not reproduce the standalone mmvq order — so `W=1` ran the fused epilogue and `W>=2`
+the unfused chain: the last width-impurity in the MoE class (`W=1 ac8825358d9adfda` vs
+`W>=2 bd138ad2326fbbf2`, 35B-A3B Q4_K_M).  The kernels are now token-generic (`shexp_gate_sigmoid`:
+one warp per token; `shexp_down_gated_q8_0`: one block per `(row, token)`) with **`nwarps` pinned to
+the single-token value** (`calc_nwarps` returns 4 for `ncols_dst 1..4` but 2 for `5..8`, and `nwarps`
+sets `blocks_per_iter` = the reduction order), and the fusion arm accepts
+`1 <= ne[1] <= MMVQ_MAX_BATCH_SIZE` (same width on both matmuls, contiguous epilogue operands).
+Probe: `W = 1,2,3,4,8` all `ac8825358d9adfda`; kill-switch (`GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`)
+all `bd138ad2326fbbf2` (uniform unfused reference).  **MoE MTP improved**: 35B-A3B, 1 GPU, f16,
+`n_max 3`, `n=96`: acceptance **0.81707** (was 0.51) with 167.3 t/s vs plain 96.9 (**+73 %**) — the
+verify now uses the same epilogue arithmetic as the draft's single-token decode steps.  Cost: the
+fused kernel re-reads the down weight row per token, so at the widest verify batches it loses a
+little to the unfused chain (pl=8 332.1 vs 341.5, pl=4 252.0 vs 254.2); the decode win is kept
+(pl=1 97.9 vs 98.3) and the fix (a column-blocked fused kernel that reads the weight row once per
+`(row)` block) is a follow-up in `TODO.md`.  `patches/README.md` block-13 notes; `GREEDY-PURITY.md`
+§17.
+
+**Block 14 (second 2026-09-11 amendment) — the QSA decode arm serves the band.**  qwen4exp was still
+not `plain == draft-mtp` in *text* (only ~100 of ~700 characters in common) even after the
+hyper-connection band fix.  Localised to the QSA **indexer** arm choice: `LLAMA_QSA_OFF=1` is
+byte-identical (`d4499ac8db72`) while `LLAMA_QSA_SPARSE_FA=0` is not, so the sparse-FA kernel is
+exonerated; the single-step width probe is pure (it cannot reach the bug: `P <= 2048` keeps `n_kv`
+below the selection width).  An arm trace (`build_layer_attn`): the middle arm — the arch policy's
+dense decode arm — was gated `n_tokens == 1`, and with `width = indexer_top_k + r - 1 = 2051`
+(`n_kv = 2304` at the first decode graph) `--spec-type none` took **arm 2 (dense)** while
+`draft-mtp` (`n_tokens=4`) fell through to **arm 3 (sparse top-k selection)**; identical for the first
+11 graph builds, split at the first decode graph.  Fix: `QSA_DECODE_BAND = 8` (the `n_max <= 7` purity
+band), arm 2 takes `n_tokens <= QSA_DECODE_BAND`; prefill keeps the sparse selection (the policy
+"prefill is untouched: QSA always").  Measured: `plain == n_max 3 == n_max 7` = `804de0576868`
+(f16 KV, 704 chars) and `plain == n_max 3` = `75d8530c5bb1` (q8_0 KV, 660 chars); MTP `n_max 3` pos-1
+acceptance 0.615 with 63.9 t/s vs plain 50.1 (**+28 %**), `n_max 7` pos-1 0.618.  The plain stream
+moves with the fix (658 -> 704 chars) — the shared 4-token non-decode shape at `n_kv = 2304` also
+moves to the dense arm.  Cost: the verify is now dense, slightly more attention work than the top-k
+selection when the cache has just crossed the budget (pl=5 146.7 vs 149.5, pl=6 160.1 vs 162.5,
+pl=1/2/4/7/8 flat or better).  Two width-dependences remain in the **sparse** regime and are recorded
+in `GREEDY-PURITY.md` §18 + `TODO.md`: the fused indexer score's "byte-identical" claim is measurably
+false and is itself `n_tokens == 1`-gated (unreachable on gfx1201 by default, but the default path on
+gfx1151 above its 64K crossover), and a residual split survives even with one arm (706-character
+common prefix instead of 100, then divergence).
+
+Full gate set: probes on both platforms, `plain`/`n_max 3`/`n_max 7` text purity on f16 + q8_0 KV,
+MTP acceptance/throughput gates (MoE + qwen4exp), `llama-batched-bench` pl=1..8 on both models,
+`test-backend-ops -o GATED_DELTA_NET` and `-o FLASH_ATTN_EXT` (4/4 backends), 4B coherence smoke.
+The block-15 beta patch was re-cut on the new tip on the new tip: base `5ad11fd35` -> beta commit `f3ece1e123905a98059025a7e7a3c7e8e28f54dc`, tree `5316920f130e585e23b9a38eef6e2c3c5940259e` (the `qwen4exp.cpp` hunk headers shift by +9 lines; `git am -3`/`git apply -3` resolves it cleanly, a plain `git am` does not).
+
 Reverse-chronological log of every delivery-affecting change to the
 **rdna-boosts 15-patch set** (block amendments, community-fix
 integrations, re-baselines, regeneration + clean-apply re-verifications).

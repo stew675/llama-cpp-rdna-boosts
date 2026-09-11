@@ -568,3 +568,112 @@ confirms the harness is deterministic and that plain decode is unchanged (pre-fi
 text are both `3ee9daee5c07`).  Because the single-step width probe is bit-identical across `W = 1..8`
 on both splits *and* with the state-sequence dimension (`RS=0` and `RS=from_w`), the divergence must be
 a **multi-step / roll-back** effect — **localised 2026-09-11 (further measurement): it is in the QSA *machinery*, and the site class is the same as cause 1's.**  `LLAMA_QSA_OFF=1` makes `plain` == `draft-mtp --spec-draft-n-max 3` **byte-identical** (`d4499ac8db72` both, 711 chars) — and the knob provably fires (the plain text moves `3ee9daee5c07` -> `d4499ac8db72`) — while `LLAMA_QSA_SPARSE_FA=0` (dense attention, indexer still on) leaves two different texts (`25f300a81b9e` vs `0d466b2dcf09`), so the defect is **not** the sparse-FA kernel but the **indexer/score machinery** (`indexer-topk.cu` + the `qwen4exp.cpp` gates).  Both QSA-side `n_tokens == 1` gates are the prime suspects — `src/models/qwen4exp.cpp:1094` (`idx_score_fused`, the fused indexer score) and `:1419` (`qsa_dense_decode_until`, the early-decode dense shortcut) — i.e. exactly the cause-1 pattern, and the single-step width probe cannot see them because it never reaches the sparse/indexer decode regime.  The divergence appears only after ~100 chars (~20 tokens) of a 3.3k-prompt greedy run (the first steps agree), so it is not a prefill-state difference; `GGML_CUDA_GDN_CHUNKED=0` moves both sides without making them agree (the known Issue #25 chunked-prefill item is a separate contributor, not this).  **Kill-switch for users meanwhile: `LLAMA_QSA_OFF=1`.**
+
+## 16. Cause 3 fixed (2026-09-11, block-14 amendment): the QSA decode arm is band-uniform
+
+After §13-§15 the dense models, the MoE and qwen4exp's hyper-connection band were pure, but qwen4exp
+still had a **text** divergence: `--spec-type none` and `draft-mtp --spec-draft-n-max 3` / `7` shared
+only ~100 of ~700 generated characters (f16 KV, `/tmp/prompt3k.txt`, 128 greedy tokens, 3-GPU
+`-sm tensor`).  It was **not** a kernel and **not** the sparse-FA attention:
+
+* `LLAMA_QSA_OFF=1` makes both runs **byte-identical** (711 chars), and the knob provably fires (the
+  plain text moves `3ee9daee5c07` → `d4499ac8db72`), so the defect lives in the QSA **indexer**
+  machinery (store / score / top-k selection);
+* `LLAMA_QSA_SPARSE_FA=0` does **not** fix it (both texts move, both stay different) — the
+  `fattn-qsa` kernel is exonerated;
+* the single-step width probe is **pure** on both splits and with `RS=from_w`: its blind spot is
+  exactly this bug (it prefills `P <= 2048` tokens and decodes one step, so `n_kv` stays below the
+  QSA selection width and every width takes the same arm).
+
+**Mechanism** (`build_layer_attn`, `src/models/qwen4exp.cpp`).  The indexer picks one of three arms:
+
+```cpp
+if (shortcut && n_kv <= width)                                        // 1: dense, store keys
+else if (qsa_dense_decode_until > 0 && n_tokens == 1 && n_kv < ...)   // 2: dense policy arm
+else  top_k = build_qsa_top_k(...);                                   // 3: sparse selection
+```
+
+`width = indexer_top_k + r - 1`; on qwen4exp `indexer_top_k = 2048`, `r = 4` (only every 4th layer has
+an indexer), so `width = 2051`.  From the arm trace at the first decode graph: `n_kv = 2304 > 2051`, so
+arm 1 no longer applies — and arm 2 is gated on `n_tokens == 1`:
+
+| run | shape | arm |
+|---|---|---|
+| `--spec-type none` | `n_tokens=1 n_kv=2304` | **2 (dense)** |
+| `draft-mtp n_max 3` | `n_tokens=4 n_kv=2304` | **3 (sparse top-k selection)** |
+
+Same state, two attention regimes, purely because of the batch width.  (Both runs are identical for the
+first 11 graph builds; the split starts at the first decode graph.)
+
+**Fix**: `QSA_DECODE_BAND = 8` (the `n_max <= 7` purity band, the same constant class as
+`HC_FUSED_MAX_TOKENS`), and arm 2 takes `n_tokens <= QSA_DECODE_BAND` instead of `n_tokens == 1`.
+Prefill is untouched (`n_tokens` is far above the band, so it keeps arm 3 — the arch policy "prefill is
+untouched, QSA always"), and on gfx1201 `qsa_dense_decode_until = 1 << 62`, so decode is now dense at
+every width — which is the policy the arm's own comment describes.  Post-fix arm trace: `n_tokens=4
+n_kv=2304` gives **arm 2** in *both* runs.
+
+**Measured**: `plain == n_max 3 == n_max 7` = `804de0576868` (704 chars, f16 KV) and `plain == n_max 3`
+= `75d8530c5bb1` (660 chars, q8_0 KV).  The plain stream moved with the fix (658 → 704 chars): the fix
+also moves the shared 4-token non-decode shape at `n_kv = 2304` onto the dense arm, which is the same
+"the band must take one path" trade as §14 — the *value* chosen is the policy-consistent dense one.
+
+## 17. The MoE shared-expert epilogue is band-uniform too (2026-09-11, block-13 amendment)
+
+§15 fixed the `W >= 5` split; what remained for Qwen3.6-35B-A3B was strictly `W=1 ac8825358d9adfda` vs
+`W>=2 bd138ad2326fbbf2` — the fused shared-expert down epilogue (`dst = down(swiglu) *
+sigmoid(gate(x)) + moe_out + ffn_residual`, a 6-node fusion in `ggml-cuda.cu`), gated
+
+```cpp
+down_mm->src[1]->ne[1] == 1 && gate_mm->src[1]->ne[1] == 1; // decode only
+```
+
+with an in-code note that the fused gate reduction (`shexp_gate_sigmoid`) does not reproduce the
+standalone mmvq/MUL_MAT order — so `W=1` ran the fused epilogue and `W>=2` the unfused chain.
+
+**Fix**: the two kernels are now token-generic, and the band takes the *fused* path (which keeps the
++3.1 % decode win instead of throwing it away):
+
+* `shexp_gate_sigmoid` — one block (one warp) per token: the token index only selects the input column
+  (`grid: (ncols)`), so each token's dot is computed by the same 32-thread warp reduction as before;
+* `shexp_down_gated_q8_0` — one block per `(output row, token)` (`grid: (nrows, ncols)`), addressing
+  `y_swiglu`, `moe_out`, `ffn_residual` and `dst` at the token's offset;
+* **`nwarps` is pinned to the single-token value** (`calc_nwarps(type, 1, table_id)`): `calc_nwarps`
+  returns 4 for `ncols_dst 1..4` but 2 for `5..8`, and `nwarps` sets `blocks_per_iter`, i.e. the
+  reduction order — the same trap as §15's cap.  Pinning it is what makes every width bit-identical;
+* the fusion arm accepts `1 <= ne[1] <= MMVQ_MAX_BATCH_SIZE` (with both matmuls the same width and the
+  three epilogue operands contiguous); `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` still selects the unfused
+  reference.
+
+**Measured**: default probe `W = 1, 2, 3, 4, 8` all `ac8825358d9adfda` (the pre-fix `W=1`/fused value);
+with the kill-switch all of them `bd138ad2326fbbf2` (a uniform unfused reference, = the pre-fix `W>=2`
+value); qwen4exp was unaffected (`plain == n3 == 804de0576868`).  The asterisk is gone: the MoE decode
+and verify batches now take one arithmetic, so the `n_max <= 7` guarantee covers MoE too.
+
+## 18. Two width-dependences remain in the QSA *sparse* regime (open, 2026-09-11)
+
+§16 fixes the **default** regime, which is what gfx1201 (and gfx1151 below its 64K crossover) runs.
+Two further items were found while localising it and are **open**:
+
+1. **The fused indexer score is not byte-identical, and it is itself `n_tokens == 1`-gated.**
+   `GGML_CUDA_QSA_INDEXER_SCORE` (default **ON**, `src/models/qwen4exp.cpp` — the `idx_score_fused`
+   gate at the `build_qsa_top_k` entry) replaces the per-op score chain with one kernel and claims to
+   "replicate the per-op F32 arithmetic byte-identically".  Measured **false**: with the sparse regime
+   forced on both widths (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`), `GGML_CUDA_QSA_INDEXER_SCORE=0` changes
+   *both* streams (`361c9daa7ed8`/`9959840e2747` → `14924014c66f`/`e5c7a3f91699`).  Because the gate is
+   `n_tokens == 1`, a W=1 decode and an n-token verify consume the indexer state through different
+   score paths.  It is **unreachable on gfx1201's default config** (the plain run never builds scores
+   at all — the dense arm skips `build_qsa_top_k`), but it is the default path on **gfx1151 above the
+   64K crossover**, where decode is sparse.  (This also explains why the earlier `SCORE=0` test in the
+   default regime was a *legitimate* null: neither run executes the score path there.)
+2. **A residual split survives even with one arm.**  With `LLAMA_QSA_DENSE_DECODE_UNTIL=0` (both
+   widths on the sparse arm) `plain` and `n3` agree for 706 chars instead of 100 — i.e. the arm split
+   was the first cause — but they still diverge, so at least one more width-dependence lives in the
+   sparse-regime state path (indexer store / derived-cache pooling).  `GGML_CUDA_QSA_INDEXER_CACHE=0`
+   alone does not reconcile them (in the default regime that knob is a no-op: the dense arm never fills
+   or reads the derived cache).
+
+Consequence: the exhaustive greedy-purity guarantee is complete for **RDNA4/gfx1201's default regime**
+and for the dense models and the MoE; the **gfx1151 sparse regime above 64K** still needs the two items
+above.  Repro knobs: `LLAMA_QSA_DENSE_DECODE_UNTIL=0`, `GGML_CUDA_QSA_INDEXER_SCORE=0`,
+`GGML_CUDA_QSA_INDEXER_CACHE=0`; the arm trace is kept at
+`wip/kv-quant-purity-followups/tools/qsa-arm-trace.patch`.

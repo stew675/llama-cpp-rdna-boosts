@@ -1,0 +1,22 @@
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1417,6 +1417,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+         } else {
+             top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il);
+         }
++        // QSA arm trace (LLAMA_QSA_TRACE=1, requires --log-verbosity 4+): one line per indexer
++        // layer per graph BUILD (replayed CUDA graphs do not rebuild).  Use it to prove whether
++        // two runs of the same state take the same attention arm; arm=1 is the dense
++        // width-shortcut (n_kv <= width), arm=2 the dense policy arm, arm=3 the sparse top-k
++        // selection.  Revert before landing.
++        if (getenv("LLAMA_QSA_TRACE") != nullptr) {
++            static int qsa_trace_call = 0;
++            LLAMA_LOG_INFO("[QSA] call=%d il=%d n_tokens=%d n_kv=%lld r=%lld width=%lld arm=%d topk=%d\n",
++                qsa_trace_call++, (int) il, (int) n_tokens, (long long) n_kv, (long long) r,
++                (long long) width, top_k != nullptr ? 3 : (shortcut && n_kv <= width ? 1 : 2),
++                top_k != nullptr);
++        }
+     }
+ 
+     // Qwen3Next uses a single Q projection that outputs query + gate

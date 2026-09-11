@@ -180,3 +180,21 @@ re-apply on the new base reproduces the recorded tree exactly.
 * the 2026-09-10/11 validation numbers above are unaffected (the base amendment does not touch any
   block-15 operand or kernel: it changes only `MUL_MAT_ID` mmvq-vs-MMQ selection and the
   `mul_mat_vec_q_moe` launch bound, which is block-13 territory)
+
+---
+
+**Re-cut 2026-09-11 (fifth), after the two same-day band amendments.**  The canonical tip moved from
+`bfaa83d8a` (tree `4e5f2952f`) to `5ad11fd35` (tree `3e7accbd7`) because block 13 gained the fused
+shared-expert epilogue band (`mmvq.cu`, `ggml-cuda.cu`) and block 14 the QSA decode arm
+(`src/models/qwen4exp.cpp`).  **This is the first re-cut that is not purely metadata:** block 15 also
+patches `src/models/qwen4exp.cpp`, so the block-14 amendment's 9 added lines shift block 15's hunk
+headers and a plain `git am` fails — **apply with `git am -3`** (the 3-way merge resolves it; all other
+files still apply cleanly).  Nothing else changes: the patch is 3722 lines before and after and the
+only body differences are the `From <sha>` line and the `qwen4exp.cpp` hunk headers/offsets.
+
+* base `5ad11fd35` (tree `3e7accbd7`) -> **beta commit `f3ece1e123905a98059025a7e7a3c7e8e28f54dc`**,
+  tree `5316920f130e585e23b9a38eef6e2c3c5940259e`
+* the 2026-09-10/11 validation numbers above are unaffected: neither amendment touches a block-15
+  operand or kernel (block 13's is the shared-expert epilogue and the mmvq cap; block 14's is the QSA
+  indexer arm choice in the *graph builder*), and the beta re-apply reproduces the recorded tree.
+  **Re-run the beta A/B gates only if a block-15 file changed** — here nothing did.

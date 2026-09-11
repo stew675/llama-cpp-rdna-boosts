@@ -4,6 +4,42 @@
 instruments, reference hashes, the code sites for the first two items, the landing procedure, and the
 accumulated trap list. Read §1 (the plan) and §2–§5 (environment + instruments) before touching a GPU.
 
+## 0. STATUS after the 2026-09-11 session (read this first)
+
+**Items 1 and 5 are DONE, landed and pushed** (canonical tip **`5ad11fd35`**, net tree
+**`3e7accbd7f46c3d196e168a4d29a0350f813f5ff`**; delivery repo `main` has the regeneration, the docs
+sweep and the re-cut beta patch).  Both were the same defect shape — a band gate written
+`n_tokens == 1` — and both were proved with an instrument before being fixed:
+
+* **Item 5 (block 13, fourth amendment): the MoE shared-expert epilogue serves the band.**  The gate
+  was `down_mm->src[1]->ne[1] == 1 && gate_mm->src[1]->ne[1] == 1`; the kernels are now token-generic
+  and **`nwarps` is pinned to the single-token value** (`calc_nwarps` returns 4 for `ncols_dst 1..4`
+  but 2 for `5..8`, and `nwarps` sets `blocks_per_iter` = the reduction order — the §15 mmvq-cap trap
+  again).  Probe: all widths `ac8825358d9adfda`; kill-switch all `bd138ad2326fbbf2`; **MoE MTP
+  acceptance 0.51 -> 0.81707** (167.3 t/s vs plain 96.9).  *Cost:* the fused kernel is `grid =
+  (nrows, ncols)`, so it re-reads the down weight row per token and loses ~2.6 % at pl=8 to the unfused
+  chain (332.1 vs 341.5) — a column-blocked kernel (the `mul_mat_vec_q` `ncols_dst` pattern) is the
+  follow-up, in `TODO.md`.
+* **Item 1 (block 14, second amendment): the QSA decode arm serves the band.**  The dense arch-policy
+  arm in `build_layer_attn` was gated `n_tokens == 1`; with `width = indexer_top_k + r - 1 = 2051` and
+  `n_kv = 2304` at the first decode graph, `--spec-type none` took the dense arm and `draft-mtp` the
+  sparse top-k selection.  `QSA_DECODE_BAND = 8` fixes it: `plain == n_max 3 == n_max 7` =
+  `804de0576868` (f16) / `75d8530c5bb1` (q8_0).  *Cost:* the verify is now dense (pl=5/6 ~1.5-2 %
+  slower than the top-k selection; pl=1/2/4/7/8 flat or better).
+* **New, and NOT fixed:** two width-dependences remain in the QSA **sparse** regime — the fused
+  indexer score's "byte-identical" claim is **measurably false** and is itself `n_tokens == 1`-gated
+  (the default path on gfx1151 above 64K), and a residual split survives even with one arm.  Details
+  and repro knobs: `GREEDY-PURITY.md` §18.
+* **Instruments added:** `tools/qsa-arm-trace.patch` (the arm trace that proved item 1 — it prints one
+  line per indexer layer per graph *build*, and it needs `--log-verbosity 4`);
+  `tools/textgen.py`, `tools/sobench.sh`, `tools/mtpab2.sh` are now committed.
+* **Traps that bit this session:** `--log-verbosity 4` interleaves log lines into the generation, so
+  text-purity runs must use the default verbosity (the acceptance line needs 4 — run the two
+  measurements separately); the gate criterion is acceptance **at pos 1** (`acc per pos`), not the
+  aggregate (a degenerate repetition stream inflates the aggregate to 0.77 and the fixed stream reads
+  0.47); and `git am` of the block-15 beta patch now needs `-3` (its `qwen4exp.cpp` hunks overlap the
+  block-14 amendment).
+
 ## 1. The plan (agreed order, 2026-09-11)
 
 Do **item 1 and item 5 in the same session** (they are the same defect shape and share all validation), then

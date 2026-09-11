@@ -57,6 +57,13 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   `patches/README.md` block-13 notes and
   `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md` +
   `wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
+  **Also amended 2026-09-11 (fourth amendment) with the fused shared-expert
+  epilogue band**: the decode-only `ne[1] == 1` gate on `ggml_cuda_op_shexp_down_gate`
+  now serves the whole `n_tokens <= MMVQ_MAX_BATCH_SIZE` band — the two kernels are
+  token-generic and `nwarps` is pinned to the single-token reduction order — so the
+  MoE decode and verify take one arithmetic (`W = 1..8` bit-identical, the
+  "MoE asterisk" is gone) and MoE `draft-mtp` acceptance rises 0.51 -> 0.82
+  (167.3 t/s vs plain 96.9 on 35B-A3B).
 - Block **14** (`patches/0014-rdna-boosts-block-14-qwen4exp-support.patch`):
   qwen4exp / Qwen3.8-Flash-Next support, promoted from `beta/qwen4exp`
   2026-09-07 — QSA sparse FA (default) + fused indexer top-k/score,
@@ -75,6 +82,11 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   `nt == 1`), which fixes qwen4exp's decode-vs-verify divergence up to `--spec-draft-n-max 3`; the
   ops map the token onto `blockIdx.y` with explicit per-token strides, and a <= 8-token *prefill*
   chunk also takes the fused path (it cannot be told apart from a verify batch — that is the point).
+  **Also amended 2026-09-11 with the QSA decode-arm band**: the arch policy's dense decode arm
+  (`build_layer_attn`, `src/models/qwen4exp.cpp`) was gated `n_tokens == 1`, so above the indexer
+  selection width (`indexer_top_k + r - 1` = 2051) a W=1 decode ran dense while the n-token verify
+  batch fell through to the sparse top-k selection — the cause-3 text divergence.  The arm now serves
+  the whole band (`QSA_DECODE_BAND = 8`); prefill keeps the sparse selection.
   See the block-14 notes in `patches/README.md` and the beta
   validation record in `beta/qwen4exp/README.md`.
 - Block **15** (STAGED in `beta/block-15-campaign-wins/`, **NOT a delivery patch**): the attention-memory campaign wins --
@@ -109,12 +121,15 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `bfaa83d8a`, net tree
-  `4e5f2952f016f1ac160c53261f7b01d346322534`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `5ad11fd35`, net tree
+  `3e7accbd7f46c3d196e168a4d29a0350f813f5ff`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the whole-batch
-K-independent chunked GDN prefill; block 14 amended 2026-09-11 with the
-hyper-connection decode/verify band fix), which is what
+K-independent chunked GDN prefill; block 13 amended 2026-09-11 with the MoE
+decode/verify mmvq band and again with the fused shared-expert epilogue band;
+block 14 amended 2026-09-11 with the
+hyper-connection decode/verify band fix and again with the QSA decode-arm
+band), which is what
 `scripts/make-patches.sh`'s default tip refers
 to; always regenerate from a canonical fork rebuilt at the fork point.
 **Block 15 (the attention-memory campaign) is NOT in the delivery** -- it
@@ -331,18 +346,35 @@ explicitly requests it.**
   `benchmarks/mtp-adaptive-methodology.md`.  Verify decode changes with
   Protocol A there (acceptance must stay > ~0.45, MTP >= plain at depth 3)
   before relying on llama-bench numbers.
-- **MoE (`qwen35moe`) decode/verify is NOT byte-identical by default (accepted).**
-  The decode-only fused shared-expert window (`ggml_cuda_op_shexp_down_gate`,
-  +3.1% MoE decode) does not reproduce the unfused chain's arithmetic: its gate
-  dot uses its own reduction order rather than the standalone mmvq order (the
-  epilogue FMA was removed 2026-09-11).  Set
-  **`GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`** for byte-identical MoE decode/verify.
-  MoE is exempt from the byte-identity gate by
-  `benchmarks/mtp-adaptive-methodology.md` rule 3 and its MTP gate passes
-  (acceptance 0.58378).  The companion block-13 fix of the same day — all
+- **MoE (`qwen35moe`) decode/verify IS byte-identical by default (fixed 2026-09-11).**
+  The fused shared-expert window (`ggml_cuda_op_shexp_down_gate`, +3.1% MoE
+  decode) does not reproduce the unfused chain's arithmetic: its gate dot uses
+  its own reduction order rather than the standalone mmvq order (the epilogue FMA
+  was removed 2026-09-11).  Until 2026-09-11 it was therefore gated to `n_tokens == 1`
+  and the unfused chain served the verify batch — a width-dependence, not just a
+  numerical drift.  The kernels are now token-generic with `nwarps` pinned to the
+  single-token reduction order, and the **whole band** `1 <= nt <= 8` takes the
+  fused path: probe `W = 1,2,3,4,8` all `ac8825358d9adfda`, and with
+  **`GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`** (kept for A/B) all `bd138ad2326fbbf2`.
+  MoE MTP gained too (acceptance 0.51 -> 0.81707, 167.3 t/s vs plain 96.9 on
+  35B-A3B).  The companion block-13 fix of the same day — all
   `MUL_MAT_ID` use the dedicated MoE kernel, not the dense ksplit-with-ids path —
-  is **+6.2% MoE decode** (tg128 95.62 -> 101.52); see the 2026-09-11 (second)
-  WORKLOG entry.
+  is **+6.2% MoE decode** (tg128 95.62 -> 101.52); see the 2026-09-11 WORKLOG
+  entries.
+- **The QSA decode arm is band-uniform (2026-09-11) — but the QSA *sparse* regime has two open items.**
+  qwen4exp's `--spec-type none` vs `draft-mtp` text divergence ("cause 3") was the
+  dense arch-policy arm gated `n_tokens == 1` in `src/models/qwen4exp.cpp`: above
+  `width = indexer_top_k + r - 1` (= 2051) a W=1 decode stayed dense while the
+  verify batch fell through to the sparse top-k selection.  The arm now serves the
+  whole band (`QSA_DECODE_BAND = 8`), so `plain == n_max 3 == n_max 7`
+  byte-identically (`804de0576868` f16, `75d8530c5bb1` q8_0); an arm trace proved
+  it (`wip/kv-quant-purity-followups/tools/qsa-arm-trace.patch`).  **Still open,
+  sparse regime only:** (1) `GGML_CUDA_QSA_INDEXER_SCORE`'s "byte-identical" claim
+  is measurably false and is itself `n_tokens == 1`-gated — unreachable on gfx1201's
+  default config (decode never builds scores) but the **default path on gfx1151
+  above its 64K crossover**; (2) a residual split survives even with one arm
+  (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`: common prefix 706 chars vs 100, then divergence).
+  See `GREEDY-PURITY.md` §§16-18.
 - The one-sided AR wait (dev0/bus-06 dispatch-gap asymmetry, ~12.7 µs/call)
   is a **platform-level CP/driver property**, not reachable from the AR
   kernel, graph tail, or host-side pacing — fusion/pacing are CLOSED
@@ -477,7 +509,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `bfaa83d8a`): `git format-patch --start-number 0` the block
+blocks tip `5ad11fd35`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -486,7 +518,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `bfaa83d8a`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `5ad11fd35`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

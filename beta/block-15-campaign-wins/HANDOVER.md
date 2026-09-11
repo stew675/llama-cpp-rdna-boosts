@@ -11,7 +11,12 @@
 > **re-cut a fourth time 2026-09-11** after block 13's F2 cause-2 band-uniformity amendment: base
 > `bfaa83d8a` (tree `4e5f2952f`) -> **beta tip `3f4e0747d`, tree `d50b4e121`**, metadata-only (block 15
 > does not touch `mmvq.cu`; the patch file is 3722 lines before and after, only the `From <sha>` line
-> differs, and re-applying on the new base reproduces `d50b4e121` exactly).
+> differs, and re-applying on the new base reproduces `d50b4e121` exactly).  **Re-cut a fifth time
+> 2026-09-11** after the two same-day band amendments (block 13's fused shared-expert epilogue band,
+> block 14's QSA decode arm): base `5ad11fd35` (tree `3e7accbd7`) -> **beta commit `f3ece1e12`**, tree
+> `5316920f13`.  This one needs **`git am -3`** (block 15 patches `src/models/qwen4exp.cpp`, where the
+> block-14 amendment added 9 lines); the patch body is otherwise unchanged (3722 lines, only the `From`
+> line and the `qwen4exp.cpp` hunk headers differ), so no beta number needs re-measuring.
 > The dependent delta was exactly one file
 > (`fattn-common.cuh`), the textual apply was clean, every 2026-09-10 number
 > reproduced to the last decimal, and three **pre-existing** follow-ups were
