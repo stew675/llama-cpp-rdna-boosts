@@ -381,6 +381,14 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   per token.  Not a purity issue — every width already takes the fused path.
 
 - **F3 (memory play, not an accuracy one — see GREEDY-PURITY.md §19): sub-`q8_0` KV quant parity.**
+  **K==V is mandatory (mixed types rejected), so only the 7 diagonal (K,V) pairs are reachable** —
+  which is what keeps the purity-validation budget sane (each pair is its own kernel family and needs
+  its own `W=1..8` sweep) and means the right mechanism is *diagonal instances*, **not**
+  `-DGGML_CUDA_FA_ALL_QUANTS=ON` (that compiles all 45 extra cross-product TUs, ~1-3 h, of which 3 are
+  reachable).  It also makes `iq4_nl` all-or-nothing (its V side needs `dequantize_V_iq4_nl`), and it
+  means F3 must also **narrow block 14's tensor-split gate** (`src/llama-context.cpp` ~3716 rejects
+  every quantized KV type except q4_0/q8_0 for multi-GPU `-sm tensor` *because* they have no native
+  path) — see the handover §8.
   Reconnaissance done 2026-09-11: `-DGGML_CUDA_FA_ALL_QUANTS=ON` enables native paths for
   **q4_1/q5_0/q5_1 only** (the flag gates those three in `ggml_cuda_fattn_kv_type_supported()`, and the
   49 `fattn-vec-instance-*` TUs already exist), while **`iq4_nl` cannot be helped by it** (`default:

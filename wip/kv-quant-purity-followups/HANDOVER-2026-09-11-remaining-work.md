@@ -423,6 +423,27 @@ standout: same 1800 MiB as `q4_0`, pure, 3.4× slow — a native `iq4_nl` would 
   ggml-cuda.cu).  **Mixed K/V types are a rejected configuration** (2026-09-11), so an `iq4_nl` KV
   cache needs both sides: dequant kernel + template instances (`generate_cu_files.py`) + the
   staging-type plumbing + the supported list — hours-to-a-day, and an upstream-able PR.
+* **The K==V policy decides the mechanism (and is what makes F3 tractable).**  Mixed K/V cache types
+  are a rejected configuration, so only the **7 diagonal (K,V) pairs** are reachable out of the 49
+  cross-product instances.  Every pair is its own kernel family, and per F1 (§14) *each newly enabled
+  pair* needs its own `W=1..8` purity sweep — so the policy is what keeps F3's validation budget sane,
+  and it makes the blunt `-DGGML_CUDA_FA_ALL_QUANTS=ON` the **wrong tool**: that flag compiles all 45
+  extra cross-product TUs (~1-3 h) of which exactly 3 are reachable.  Enable the **diagonal instances**
+  instead — `ggml/src/ggml-hip/CMakeLists.txt`'s default branch already lists exactly the four
+  supported diagonals (f16-f16, q4_0-q4_0, q8_0-q8_0, bf16-bf16), so the change is "add the diagonals
+  we support".  Caveat to design for: `ggml_cuda_fattn_kv_type_supported()` (`fattn.cu:471`) is
+  *per-type*, so the compile define, that predicate and the instantiated pair set must be kept
+  consistent; check the pair dispatch in `ggml_cuda_flash_attn_ext_vec` (`fattn.cu:392`) before
+  relying on an uninstantiated pair failing gracefully.
+* **iq4_nl has no shortcut under the policy.**  The K side is ready (`vec_dot_iq4_nl_q8_1`,
+  `vecdotq.cuh:1580`), but the V side needs a `dequantize_V_iq4_nl` in `fattn-common.cuh` — the seven
+  existing `dequantize_V_*` cover f16/bf16/q4_0/q4_1/q5_0/q5_1/q8_0, **not** iq4_nl — plus a TU and the
+  enable.  With K==V mandatory, "iq4_nl K with an f16 V" is not an option: it is all-or-nothing.
+* **F3 also lifts the tensor-split rejection — budget a block-14 amendment.**  `src/llama-context.cpp`
+  (~3716) rejects, for multi-GPU `SPLIT_MODE_TENSOR`, every quantized KV type except `q4_0`/`q8_0`,
+  *because* they have no native FA path (the F16 staging cannot be expressed by the meta splitter).  So
+  the slowness and the tensor-split rejection have one root cause: F3's deliverable is the
+  build/dispatch change **plus** narrowing that gate, verified per type on 3-GPU `-sm tensor`.
 * **`FA_ALL_QUANTS` is a LONG build.**  It compiles 45 extra fattn-vec instance TUs; the FA TUs are
   memory-hungry, so budget 1-3 h and use `-j6`..`-j8` (not `-j16` — RAM).  Do it in a *separate* build
   dir (`/tmp/canon-llama/build-faall`) so the canonical `build-base` stays usable.
