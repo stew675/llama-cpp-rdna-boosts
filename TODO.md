@@ -308,11 +308,20 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   (only `W=1,2` move, onto the value the verify widths already produced).  Debug tool:
   `wip/kv-quant-purity-followups/tools/fa-kernel-chooser-trace.patch`.  Details: `GREEDY-PURITY.md` §14.
 - **F2 (correctness): qwen4exp was not width-pure — CAUSE 1 FIXED 2026-09-11 (block-14 amendment,
-  canonical tip `1bcf4e82d`); cause 2 open.**
+  canonical tip `1bcf4e82d`); cause 2 LOCALISED 2026-09-11 — it is the MoE gate+up+GLU fusion
+  (`mul_mat_id_glu_ops`, `ggml-cuda.cu:3324`) flipping at `n_q = 5`, **not** a kernel-dispatch band;
+  the executed-op census gives `ffn_moe_up` MUL_MAT_ID counts 0/47/48 at W=4/5/6 with every other op
+  count identical, and the `W=6`/`W=7` pair is a perfect calibration (+0 nodes, 0 differing ops).
+  Fix = the F1/HC shape (keep the fusion for the whole `n_q <= 8` band); next step is a post-HC-fix
+  `GGML_CUDA_DISABLE_FUSION=1` width matrix to confirm the unfused path is width-invariant.  See the
+  wip README (F2 cause 2) + the 2026-09-11 (4) WORKLOG entry.**
   The earlier attribution ("the fused sparse QSA path") was **wrong**: `LLAMA_QSA_OFF=1`,
   `LLAMA_QSA_SPARSE_FA=0`, the dense-shortcut and the arch decode policy all leave the divergence
-  unchanged, as do graphs, every CUDA fusion, the float-mmvf band and a batch-content test.  It is
-  **two** width-selected code paths in the non-attention graph: **(cause 1)** the hyperconnection
+  unchanged, as do graphs, the float-mmvf band and a batch-content test — **but note that list was
+  measured before the cause-1 fix, when the `W=1` vs `W>=2` break dominated those hashes** (re-measured
+  2026-09-11: QSA/graph/MoE-MMQ/weighted-down/shexp knobs are all genuine no-ops for the width probe,
+  with the HC knob as the positive control).  It is **two** width-selected code paths in the
+  non-attention graph: **(cause 1)** the hyperconnection
   fusions are gated `nt == 1` in `src/models/qwen4exp.cpp:386/458`, so a 1-token decode uses
   `GGML_OP_HC_MIX`/`HC_COMBINE` while an n-token verify batch uses the unfused chain (measured: 98
   `HC_COMBINE` at W=1, 0 at W>=2).  **FIXED** by routing the whole band `1 <= nt <= 8` through the
