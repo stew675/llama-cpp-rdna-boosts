@@ -1,5 +1,11 @@
 # Block 0015 handover — campaign wins → beta delivery (+ upstream candidates)
 
+> **REVALIDATION PENDING (2026-09-11): the delivery moved on — see §10 at the
+> bottom of this file.  The beta patch was cut on `b425aa8f7` (the 14-block chain)
+> and must be re-cut against canonical tip `389c5341f` (tree `928852cdc`), re-validated
+> (perf + correctness, §10.3/§10.4) and renumbered `[PATCH 16/16]`.  The textual apply is
+> already known to be clean with exactly one changed dependency (`fattn-common.cuh`).**
+
 > **STATUS 2026-09-10 (end of the cut session): DONE — Block 15 is CUT and
 > in the delivery.**  `block-15-campaign-wins.patch`
 > (canonical tip `09a137566` on a fork rebuilt at `9113cc188`), 15 patches
@@ -540,3 +546,121 @@ None blocking.  Everything V3/V4 raised is either answered or explicitly deferre
    costs a bf16 user ~712 MiB/GPU at ctx 204800 / ub 2048 and is the recommended next lever (§3.4).  It is
    the *easier* case than q8_0 (in-place conversion keeps the cp_async pipeline, so it can likely ship on
    by default) and it belongs in Block 15 if it lands before the cut.
+
+
+---
+
+## 10. Revalidation against the current delivery (2026-09-11) — **THE CURRENT TASK**
+
+**Why this exists.**  The beta patch was cut on **`b425aa8f7`** — block 14 of the
+**14-block** chain (block 13 `e61676292`), i.e. *before* block 00 existed and
+before the 2026-09-11 block-02/12/13 amendments.  The delivery is now a
+**15-patch set** (block 00 + blocks 01-14) at canonical tip **`389c5341f`**
+(net tree **`928852cdc`**).  Block 15 must be re-cut against that tree and
+re-validated; §10.3/§10.4 are the gates.
+
+### 10.1 The dependency delta — measured 2026-09-11, and it is small
+
+`git apply --check block-15-campaign-wins.patch` on a worktree at `389c5341f`:
+**clean, no rejects**, a single hunk offset (`fattn-common.cuh` hunk #7 lands at
+line 1439 = +8 lines).  Per-file base blob hashes (`b425aa8f7` → `389c5341f`) for
+all **23** files the patch touches: **22 are identical**, exactly one changed.
+
+| file | old base blob | new base blob | what changed |
+|---|---|---|---|
+| `ggml/src/ggml-cuda/fattn-common.cuh` | `7442bc22a` | `22eec7d57` | **block 00** (FA small-batch KV-split width invariance, issue #25): inside `launch_fattn` the `parallel_blocks`/`ntiles_dst` heuristic is evaluated as if `n_q == 1` when `Q->ne[1] <= 8`, so every decode/verify width selects the *same* KV split. +8 lines. |
+
+Unchanged (blob-identical to the cut base — their `index` lines stay valid):
+`ggml/include/ggml.h`, `ggml/src/ggml-alloc.c`, `ggml/src/ggml-backend-meta.cpp`,
+`ggml/src/ggml-cpu/ops.cpp`, `ggml/src/ggml-cuda/fattn-mma-f16.cuh`,
+`fattn-qsa.cu`, `fattn-tile.cu`, `fattn-tile.cuh`, `fattn-vec.cuh`, `fattn.cu`,
+`indexer-topk.cu`, `ggml/src/ggml.c`, `src/llama-context.cpp`,
+`src/llama-cparams.h`, `src/llama-graph.cpp`, `src/llama-graph.h`,
+`src/llama-kv-cache.cpp`, `src/llama-kv-cache.h`,
+`src/llama-memory-hybrid-idx.cpp`, `src/llama-memory-hybrid-idx.h`,
+`src/models/qwen4exp.cpp`, `tests/test-backend-ops.cpp`.
+
+**Consequences for the re-cut:** only `fattn-common.cuh`'s *pre-image* hash
+changes; the `From <sha>` identity changes (the re-cut commit); and the series
+count must go `[PATCH 15/15]` → **`[PATCH 16/16]`** — the delivery is 15 patches
+now and block 15 rides on top as the 16th.  Note the *old* count was already
+ambiguous: `[PATCH 15/15]` was the campaign's own number while the delivery had
+14 blocks; on promotion the set is **block 00 + 01-14 + 15 = 16**.
+
+### 10.2 The one real semantic risk — block 00 and V4/V5 in the same function
+
+Block 00's fix and Block 15's V4/V5 operand-staging changes live in **the same
+function** (`launch_fattn`) and the same decision region.  Block 00 makes the
+KV-split heuristic query-width-independent; V4/V5 change how K/V are staged
+(native q8_0/bf16 instead of an F16 scratch) and therefore the smem/alloc-size
+queries.  Both feed the split choice.  **A clean textual apply proves nothing
+about that interaction**, so the revalidation must:
+
+1. show the selected split is **invariant to the KV staging type** (V4/V5 off vs
+   on) across the whole decode/verify band;
+2. re-establish the **dense `--spec-draft-n-max <= 7` (W <= 8) guarantee** for
+   every gate combination — with the **raw-logit probe**
+   (`wip/sm-tensor-plain-vs-spec/logits-dump-singlewidth.cpp`), **never** the
+   text gate (a 300-token text match hid already-divergent logits at W=9);
+3. confirm `FATTN_KV_NATIVE_{NONE,Q8_0,BF16}` (the single shared type code used
+   by the launcher, the alloc-size query and the kernels) still yields the same
+   `ntiles`/`ntiles_KV` values as the unamended launcher.
+
+### 10.3 Correctness validations (re-run all; the 2026-09-10 records are history)
+
+| # | check | detail / new-invariant notes |
+|---|---|---|
+| C1 | reserve matrix | 5 models × ub 2048/1024/512 × V4/V5 off/on; each number must reproduce the per-win records and compose additively (qwen4exp pristine 6690.40 → W1 4450.40 → W1+W2 **3251.39**; W2 alone 5491.39; gates off = 6690.40/1262.70 exactly) |
+| C2 | same-seed **byte-identical** output, gates flipped | 4B, 27B, **gemma-4-E4B (SWA)**, **gemma-4-31B (SWA)**, qwen4exp — short + 40k prompt, every gate combo. The SWA models are mandatory: V3 changes the kq mask |
+| C3 | **dense `n_max <= 7` probe matrix** *(new invariant)* | 1 GPU / 2-GPU `-sm layer` / 2-GPU `-sm tensor` / 3-GPU `-sm tensor`: W=1..8 bit-identical, W=9 divergent (cause B, accepted). Run per gate combo (V3/V4/V5). **The boundary must not move** |
+| C4 | **MoE asterisk** *(new, accepted)* | qwen35moe: default W=1 != W=3 (accepted, rule 3); with `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` W=1 == W=3 (`bd138ad2`). Validate the **delivery default first**, then the switch — never flip a switch to make a gate pass |
+| C5 | adaptive-MTP gate | 27B, qwen4exp, MoE — per gate combo; acceptance must equal the **in-session** baseline (the absolute number is prompt/config dependent: the MoE read 0.675 in the old record and **0.58378** with the current command — always measure baseline and arm in the same session) |
+| C6 | op suites | `FLASH_ATTN_EXT` on ROCm0 (both V4/V5 gates) + CPU incl. **the six derived-mask cases**; `GATED_DELTA_NET`; VIEW/CONT/CPY/DUP/CONCAT; `test-alloc`; `test-batch-alloc` |
+| C7 | W4 | repro 56.00 → 16.00 MiB and `ab/w4-revert.patch` restores `ggml-alloc.c` byte-identically |
+| C8 | clean-apply simulation | fresh `9113cc188` + `scripts/apply-all.sh` (strict **15/15**, tree == `928852cdc`) + the re-cut block-15 patch (16 commits) + fresh build; record the resulting tree |
+| C9 | serving | `--parallel 4` works (the RDNA3_5 V3 fix), gfx1151 pass if the hardware is available (`wip/strix-halo/GATE-2026-09-10-block15-rdna35.md` is the template) |
+| C10 | reference discipline | **`GGML_CUDA_ALLREDUCE=nccl` is NOT a bit-identical reference under `-sm tensor`** (2026-09-11 HEADER correction in `AGENTS.md`: the internal AR always BF16-round-trips while NCCL reduces small tensors in FP32). Use a known-good build or the probe |
+
+### 10.4 Performance validations (re-baseline in-session)
+
+| # | check | reference |
+|---|---|---|
+| P1 | prefill A/B, interleaved same-binary, pp20480/ub2048 | V3 −1.28 % (4B) / +0.28 % (27B); V4 a further −1.85 % (4B) / −1.72 % (27B); V5 0.2–2.4 % by prompt length. Re-measure, do not quote |
+| P2 | decode | V3/V4/V5 "within noise" — against **current** baselines: MoE 1 GPU tg128 **101.52** / pp512 **4858.6** (post-MMID-fix), dense 27B 2-GPU tensor tg128 **32.00** / pp512 **2033.5** |
+| P3 | MTP | 27B (0.76744 historically), qwen4exp (0.44262 historically), MoE; re-measure the baseline in the same session (see C5) |
+| P4 | reserves | the MiB numbers per model/gate (the block's whole point) |
+| P5 | switches | if touched: `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` costs −3.0 % MoE decode (tg 101.5 → 98.5); V4/V5 opt-in cost as documented |
+
+### 10.5 Landing procedure (when the validations pass)
+
+1. Work in a canonical fork rebuilt at **`9113cc188`** (or reuse `/tmp/canon-llama`
+   at `389c5341f`, tree `928852cdc`, ROCm `/opt/rocm-7.14-gfx1201`, build dir
+   `build-base`).  Block SHAs 00-14: `1c7ab0e89`, `aa4108b9d`, `6e81ed5ed`,
+   `4dc962aa9`, `03d004517`, `70f330aed`, `d2fc2cb34`, `110b5391d`, `5ea46d1b2`,
+   `29880b1e4`, `33a1e5f27`, `f4e75a30a`, `cac14423e`, **`855515420`** (block 13,
+   amended twice 2026-09-11), **`389c5341f`** (block 14).
+2. Apply `block-15-campaign-wins.patch` on top, squash to one block-15 commit,
+   and re-cut the patch file: `From <new sha>`, `[PATCH 16/16]`, the
+   `fattn-common.cuh` pre-image hash, body otherwise byte-identical.
+3. Record in this directory: the new base (`389c5341f`/`928852cdc`), the new
+   block-15 SHA, the resulting tree, and the sim tree; refresh the README/HANDOVER
+   numbers and the "14-block"/"14/14" references (they now read 15/15 + block 15).
+4. **Promotion (only on the maintainer's go-ahead, beta window closed):** move the
+   patch to `patches/0015-…`, make `apply-all.sh` a 16-block flow, and sweep the
+   tip/tree + block counts in `AGENTS.md`, `MANIFESTS.md`, `README.md`,
+   `BASELINE.md`, `TODO.md`, `WORKLOG.md`, `scripts/make-patches.sh`, plus a new
+   WORKLOG entry (never edit the dated 2026-09-10 records in place).
+5. Commit and push to **this repo's `origin` only**.
+
+### 10.6 What not to do
+
+- **Do not fold block 15 into `patches/`** before the maintainer's go-ahead — it
+  is a beta, and `patches/` is the 15-block delivery.
+- Never apply anything to `~/llama.cpp`'s remotes; the fork checkout is
+  disposable and nothing is ever pushed from it (`AGENTS.md` pushing policy).
+- Do not flip `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE` / the V4/V5 defaults to make a
+  gate pass: validate the delivery's **defaults**, then the switches.
+- Do not treat a text match as evidence *against* divergence, and do not use
+  `GGML_CUDA_ALLREDUCE=nccl` as a bit-identical reference.
+- Do not edit the dated 2026-09-10 validation records in place — add a new dated
+  section/entry (this section is that practice).

@@ -18,6 +18,17 @@ with a large memory win and no cheap fix ships as an enable switch rather
 than a kill-switch), and the explicit instruction for the bf16 item
 ("treat it similarly to V4 ... gated by the same environment variable").
 
+**Revalidation pending (2026-09-11).**  The delivery moved on: it is now a
+**15-patch set** (block 00 + blocks 01-14) at canonical tip **`389c5341f`**
+(tree `928852cdc`), with block 13 amended twice on 2026-09-11.  This beta
+patch was cut on `b425aa8f7` (the 14-block chain), so it must be re-cut,
+re-validated and renumbered `[PATCH 16/16]` — the measured dependency delta
+is exactly one file (`fattn-common.cuh`, block 00's `ntiles_dst_eff` fix in
+`launch_fattn`) and the textual apply is clean.  **The plan, the dependency
+hashes and the full perf/correctness validation matrix are in
+[`HANDOVER.md`](HANDOVER.md) §10.**  The dated tables below are the
+2026-09-10 records and stay as written.
+
 **Amendment (2026-09-10): V5 native bf16 K/V.**  Folded into the block the
 same day it was designed: a bf16 K/V cache no longer needs the F16 staging
 scratch, so with the switch on it costs exactly what an f16 cache costs
