@@ -9,6 +9,19 @@ Block 15 is STAGED in `beta/block-15-campaign-wins/`, not promoted.
 
 ## Current active
 
+### Issue #25 follow-up: GDN chunked prefill (plain vs spec divergence) - IMMEDIATE, GFX1201
+- **OPEN (2026-09-11).**  On one build+prompt `--spec-type none` and MTP differ, and it is entirely
+  the GDN chunked prefill: `GGML_CUDA_GDN_CHUNKED=0` makes `none == n-max 2 == n-max 4`
+  byte-identical (p0: `9216c6d1` -> `bba7741d`).  Cause: `gated_delta_net.cu` branch 1 runs the
+  plain multi-token prefill (`K=1`) chunked while spec prefill (`K=n_max+1`) runs sequential; and
+  for prompts `> K+64` branch 2's prefix boundary `n_tokens-K` shifts with `n_max`.  Fork-only
+  (block 02) - upstream `9113cc188` ships only the sequential kernel (`gated_delta_net.cu:180`
+  `//TODO: Add chunked kernel`), so this is **not** a Block 00 item.  Latent in practice (a
+  2.8k-token MTP run did not flip in 200 tokens) but a real state divergence; probe
+  `P=256 RS=from_w` gives W3-W5 = 0.210405 (chunked on) vs 0.000000 (off).  Fix directions, repro
+  and the validation gate: `wip/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FOLLOWUP.md`.
+  Owner: the GFX1201 box, after the updated delivery `main` is pushed.
+
 ### Memory campaign -> Block 0015 (derived kq mask + FA scratch + QSA wins) - STAGED IN beta/ (not promoted)
 - **DONE (2026-09-10): RDNA3_5 (gfx1151) validation pass + beta block-15 amendment.**  First
   single-device iGPU run (Strix Halo, ROCm 7.14).  Block-14 masked-V fixes +
