@@ -275,3 +275,57 @@ reduce identically, and plain decode is byte-identical (only `n_q >= 2`
 moves).  `n_q = 1` vs a verify batch can still differ because the FA
 *kernel* is selected from `Q->ne[1]` (decode may take the VEC kernel);
 that is a decode-vs-verify difference, not a draft-length one.
+
+## 11. The real purity range is `n_max <= 5`, not 15 (2026-09-11 correction)
+
+Earlier notes (and the 2026-09-11 block-02 entries) claimed
+`--spec-type none == draft-mtp` for `n_max <= 15`.  **That was wrong.**  The
+claim had only ever been validated up to `n_max = 4`; a full sweep shows the
+last pure value is **`n_max = 5`**, with the first divergence at `n_max = 6`
+(a 7-token verify batch):
+
+| `--spec-draft-n-max` | none / 1 / 4 / 5 | 6 / 7 | 8 / 9 / 10 | 12 | 16 |
+|---|---|---|---|---|---|
+| delivered build (KTAIL=16) | equal | `5037ef2e` | `e721b8b5` | `e721b8b5` | `5037ef2e` |
+| whole-batch chunked prefill | equal | `b6d86d62` | `ed922c76` | `5037ef2e` | `4f3ee41c` |
+
+The two builds diverge in exactly the same place, so **this is pre-existing and
+has nothing to do with the GDN prefill boundary**: block 02's change fixed the
+*prefill* (probe `RS=6 W=6 == RS=0 W=1` — the prefill state is now
+K-independent), and this cap was there before it.
+
+**Cause (bounded).** It is a pure *decode-batch-width* effect, not `K` and not
+the GDN.  At `RS=0` (no snapshots at all, `K = 1`, so the GDN cannot be
+involved) the probe still separates on width alone:
+
+```
+RS=0   W = 1..6 -> a4817ee6      W = 7,8 -> e286b75c      W = 9 -> 24f302f6
+```
+
+i.e. adding columns to the batch changes column 0's result.  `W >= 9` lines up
+with MMVQ's own limit (`MMVQ_MAX_BATCH_SIZE = 8` in `mmvq.cuh`): beyond 8
+columns `ggml_cuda_mul_mat` leaves the vector kernels for MMQ, a different
+algorithm with a different K-accumulation order.  The `W = 7` boundary is a
+second dispatch change inside MMVQ that has not been pinned yet.
+`GGML_CUDA_GDN_CHUNKED=0` does not help (it is a prefill switch); block 13's
+dense `ncols==1` ksplit alignment does not either — it aligns `ncols = 1` with
+the `2..8` *verify* dispatch, and this boundary sits above that.
+
+**Is upstream affected?**  Yes — the mechanism is upstream, not fork-specific.
+Upstream master's own `calc_nwarps`/`calc_rows_per_block`
+(`ggml/src/ggml-cuda/mmvq.cu`) switch on `ncols_dst`, and
+`ggml_cuda_mul_mat` selects MMVQ only for `ncols_dst <= MMVQ_MAX_BATCH_SIZE`,
+so any batched evaluation uses different kernels than a one-token decode.
+Measured on **upstream master `9cf3bf256`** (clean checkout, unmodified
+`mmvq.cu`), CPU backend, 4B Q8_0, `P = 256`: `W = 1` gives `9024dd2e...`
+while `W = 2..12` all give `3cd0eb0e...` — upstream diverges at the *first*
+width step and is therefore **worse** than the fork, not better.  (That build
+was CPU-only, so upstream's ROCm boundary was not measured; the fork's
+`n_max <= 5` is a fork *result*, not an upstream guarantee.)
+
+**Practical consequence.**  Do not use `none == draft-mtp` byte-equality as a
+gate above `n_max = 5`; use acceptance + MTP-vs-plain throughput (see
+`benchmarks/mtp-adaptive-methodology.md`).  Note that adaptive MTP's
+recommended `n_max = 12` is *outside* the pure range.  Root-causing the
+`ncols`-dependent dispatch is an open follow-up —
+`wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 3.

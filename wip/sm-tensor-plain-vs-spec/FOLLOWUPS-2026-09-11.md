@@ -4,10 +4,12 @@ Date: 2026-09-11.  Box: GFX1201, 3x R9700 (gfx1201, RDNA4), ROCm 7.14
 (`/opt/rocm-7.14-gfx1201`).  Companion to `HANDOVER-2026-09-11.md` (the
 plain-vs-spec root-cause + the mmvq/block-13 and GDN-gate/block-02 fixes).
 
-Status of the two items here: **both open, both deferred by the maintainer to
-follow-up sessions.**  Nothing in this document is delivered; the delivery is
-at canonical tip `eb26da812` (tree `b64f21644`), 15 blocks, block 02 with
-`GGML_CUDA_GDN_ALIGN_BOUNDARY` default-ON and `KTAIL=16`.
+Status: **Part 1 is DONE and delivered** (2026-09-11, block-02 amendment, tip
+`30d119ea9`) — see the closing note in Part 1.  **Parts 2 and 3 are open** and
+deferred by the maintainer to follow-up sessions.  The delivery is
+at canonical tip `30d119ea9` (tree `29714ad1f`), 15 blocks, block 02 with the
+K-independent whole-batch chunked GDN prefill (no tail, no gate, rollback
+guard).
 
 ---
 
@@ -118,13 +120,30 @@ without paying the tail up front:
   (acceptance >= ~0.45, MTP >= plain), `test-backend-ops -o GATED_DELTA_NET`,
   and the hybrid-vs-NCCL coherence gate.
 
-### Acceptance for Option B
+### Acceptance for Option B — MET 2026-09-11 (delivered as the block-02 amendment)
 
-- Default-config bit-identity everywhere the gate gives it today, **with the
-  gate off** and `KTAIL` gone.
-- Prefill back to `GGML_CUDA_GDN_ALIGN_BOUNDARY=0` numbers (~+0.3–0.8 % on the
-  27B pp), i.e. the alignment cost goes to zero.
-- No `n_max` bound; the KTAIL floor disappears.
+- Default-config bit-identity **with the gate and `KTAIL` gone**: 27B 2-GPU
+  tensor `none == n1 == n4 == n5` (`6e8ccd25`), 3-GPU tensor `none == n4`,
+  1-GPU 4B `671d6096`; probe (`RS=from_w`, P=256) `W = 1/3/5/6` all
+  `a4817ee6`, with `RS=6 W=6 == RS=0 W=1` proving the prefill is now
+  K-independent.
+- ~~Prefill back to `ALIGN=0` numbers~~ **better: parity with them at zero
+  cost.**  27B Q8_0 1 GPU pp512/2048/4096 = 1385.3/1356.4/1328.2 vs
+  1384.7/1355.0/1327.8 for the old K-dependent boundary, tg unchanged.  The
+  previous -0.3..-0.8 % tail is gone entirely.
+- **No `n_max` bound from this mechanism**; KTAIL gone.  (A *different*,
+  pre-existing `n_max <= 5` purity cap remains — Part 3.)
+- **Invariant proved as required:** static (the `n_max`/rollback bound is
+  stated in `delta-net-base.cpp` itself) + dynamic (449 rollbacks over
+  llama-cli `draft-mtp` n_max 1/4/8/16 plus 20 in llama-server
+  `--cache-reuse`; *every* one preceded by a batch of `<= K` tokens, zero
+  crossings) + adversarial (context shift, `n_cache_reuse`, adaptive depth).
+  The guard option (B) was implemented: `llama_memory_recurrent::seq_rm` warns
+  once if a rollback ever crosses a batch boundary.
+- **The gate and both K-dependent branches were deleted** (~118 lines) rather
+  than kept: they were unreachable with the gate ON, and `GGML_CUDA_GDN_CHUNKED=0`
+  is a strictly better fallback (correct *and* bit-identical plain-vs-MTP)
+  than `GGML_CUDA_GDN_ALIGN_BOUNDARY=0` was.
 
 ---
 
@@ -208,6 +227,100 @@ dump **every** node, including fused ones).
 - No perf regression from the fix.
 
 ---
+
+## Part 3 — the multi-token verify batch is not bit-identical to single-token decode (OPEN, pre-existing)
+
+### What it is
+
+`--spec-type none == draft-mtp` is byte-identical only up to **`n_max = 5`**
+(a 6-token verify batch).  From `n_max = 6` (7-token verify batch) onward the
+verify batch's `MUL_MAT` columns are computed by a different kernel path than
+single-token decode and the logits differ by ~1e-6, so greedy near-ties flip.
+
+This is **pre-existing and independent of block 02**.  The delivered KTAIL=16
+build and the current whole-batch-chunked build diverge in exactly the same
+place:
+
+| `--spec-draft-n-max` | none / 1 / 4 / 5 | 6 / 7 | 8 / 9 / 10 | 12 | 16 |
+|---|---|---|---|---|---|
+| delivered (KTAIL=16) | equal | `5037ef2e` | `e721b8b5` | `e721b8b5` | `5037ef2e` |
+| whole-batch chunked | equal | `b6d86d62` | `ed922c76` | `5037ef2e` | `4f3ee41c` |
+
+**This is the part nobody had validated:** every earlier "`n_max <= 15`" claim
+was tested only to `n_max = 4`.  The claim is wrong and has been corrected in
+`GREEDY-PURITY.md` §11 and `benchmarks/mtp-adaptive-methodology.md`.
+
+### Evidence (bounded)
+
+1. It is a pure **width** effect, not `K` and not the GDN.  At `RS=0` (no
+   snapshots at all, `K = 1`) the probe still separates on width alone:
+
+   ```
+   RS=0   W = 1..6 -> a4817ee6      W = 7,8 -> e286b75c      W = 9 -> 24f302f6
+   ```
+
+   The probe hashes `llama_get_logits_ith(ctx, 0)` — batch item 0 — so this
+   says *adding columns changes column 0's own result*.
+2. The GDN is exonerated: at `RS=6` (K=7) `W=1` and `W=6` both give `a4817ee6`,
+   identical to `RS=0 W=1`, i.e. the K=7 prefill is already K-independent.
+3. **`W >= 9` is explained:** `MMVQ_MAX_BATCH_SIZE = 8` (`mmvq.cuh`) — past 8
+   columns `ggml_cuda_mul_mat` leaves the vector kernels for MMQ, a different
+   algorithm/K-accumulation order.
+4. **`W = 7` is NOT yet explained** (inside MMVQ's range).
+5. **Upstream is affected and is worse.**  Upstream master's own
+   `calc_nwarps`/`calc_rows_per_block` switch on `ncols_dst`, and
+   `ggml_cuda_mul_mat` uses MMVQ only for `ncols_dst <= MMVQ_MAX_BATCH_SIZE`.
+   Measured on upstream master `9cf3bf256` (clean checkout, unmodified
+   `mmvq.cu`), **CPU backend**, 4B Q8_0, `P = 256`:
+   `W = 1 -> 9024dd2e...` but `W = 2..12 -> 3cd0eb0e...`.  So upstream diverges
+   at the *first* width step.  (That build was CPU-only — upstream's ROCm
+   boundary was not measured, so the fork's `n_max <= 5` is a fork result, not
+   an upstream guarantee.)
+
+### Where to look (ranked)
+
+1. **The `ncols_dst`-dependent mmvq dispatch** — `calc_nwarps` (upstream
+   groups 1-4 / 5-8 / default) and `calc_rows_per_block` (1 / 2-8 / default),
+   plus the fork's `mul_mat_vec_q_switch_ncols_dst` arms added by block 13.
+   The `W = 7` boundary must come from one of the template instantiations or an
+   arm condition; bisect by forcing `MMVQ_PARAMETERS_GENERIC` / a fixed
+   `nwarps` / `rows_per_block` and re-running the `RS=0` width probe (that
+   probe is the whole instrument — it needs no spec decode).
+   Note `ncols_dst` is a **template parameter**, so different widths are
+   different code; the question is which instantiation changes the *K-order*
+   of the dot product (`halve_iters`/`small_k`/rpb do).
+2. **Non-MMVQ width-dependent selection on the verify path** — the FA kernel
+   from `Q->ne[1]` (block 00 already handles the `parallel_blocks` half), the
+   KV/mask path, and scheduler-level node splits that differ with width.
+3. **Method:** extend the backend per-node dump to run without `cb_eval` (see
+   the gotcha in Part 2 — on MoE the callback *changes* the numerics and masks
+   the bug), then diff the *first* diverging node for `RS=0 W=6` vs `W=7`.
+   This is dense 27B, so `cb_eval` is safe there; it is only MoE that needs the
+   backend-side dump.
+
+### Why it matters
+
+Adaptive MTP's **recommended `n_max = 12` sits outside the pure range**, so on
+this model speculative decoding *does* change the output at near-ties even
+though acceptance and throughput are healthy.  Until this is fixed, the
+`none == draft-mtp` equality gate must not be used above `n_max = 5`
+(`benchmarks/mtp-adaptive-methodology.md` rule 4).
+
+### Acceptance
+
+- Probe `RS=0`: `W = 1..K` all equal for every width a verify batch can have
+  (currently only `W <= 6`).
+- Text: `none == draft-mtp` for at least `n_max = 12`, ideally 16, on 1/2/3-GPU
+  and `-sm tensor`/`-sm layer`.
+- No perf regression on pp or tg.
+- Cross-check against Part 2: if the same dispatch fix closes the qwen35moe
+  residual, say so — they may share a cause.
+
+### Upstream
+
+The mechanism is upstream (see evidence 5), so a fix is a strong
+`upstream/UPSTREAM-PR-*.md` candidate once a minimal reproducer exists.  The
+`RS=0` width probe is already a candidate test to attach to such a PR.
 
 ## Tooling in this directory
 

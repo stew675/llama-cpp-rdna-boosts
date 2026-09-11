@@ -7,7 +7,7 @@ export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib
 CANON=/tmp/canon-llama                 # canonical fork, branch rdna-boosts
 cmake --build $CANON/build-base --target llama-cli llama-bench test-backend-ops -j 16
 # if /tmp is gone: clone ggml-org/llama.cpp, checkout 9113cc188, run
-#   scripts/apply-all.sh .        -> branch rdna-boosts, tree b64f21644
+#   scripts/apply-all.sh .        -> branch rdna-boosts, tree 29714ad1f
 #   then cmake configure/build (see patches/README.md for the flags)
 ```
 

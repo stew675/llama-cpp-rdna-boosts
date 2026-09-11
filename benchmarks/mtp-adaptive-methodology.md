@@ -68,6 +68,16 @@ Run the same with `--spec-type none` and compare. Gate rules:
    be byte-identical between the build under test and the known-good build.
    On MoE this is not required (fusion-ordering numerics drift is an
    accepted trade-off); sane output is the bar there.
+4. **Purity range is `n_max <= 5`** (2026-09-11 correction): `--spec-type none`
+   == `draft-mtp` is byte-identical only up to a 6-token verify batch.  At
+   `n_max >= 6` a multi-token verify batch selects a different MUL_MAT
+   dispatch than single-token decode and the logits differ by ~1e-6, so greedy
+   near-ties can flip (measured identically on the delivered KTAIL=16 build, so
+   it is pre-existing and not block-02's doing; pure up to `n_max=5`, first
+   divergence at `n_max=6`, and the earlier "`n_max <= 15`" claim was never
+   validated past `n_max=4`).  Do not use `none == draft-mtp` equality above
+   `n_max=5` as a gate; use acceptance + MTP-vs-plain throughput instead.  See
+   `../GREEDY-PURITY.md` §11.
 
 ### Protocol B — server harness (dense canonical, long-context workloads)
 

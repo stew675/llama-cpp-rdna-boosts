@@ -49,7 +49,7 @@ the 15-block tree):
 |---|---|
 | `0000` | **structural and architecture fixes** — FA small-batch KV-split width invariance (issue #25: decode and every speculative verify width now reduce identically, so greedy output no longer changes with the MTP draft length) + Vulkan masked-V/freed-cell fixes (dead columns never read V). Added 2026-09-10; this is the base every other block applies on top of. |
 | `0001` | adaptive MTP draft depth | **refreshed 2026-09-09 to the upstream PR #27210 review head** (`d236d41a2`; review-round feedback-handling, option validation + docs) — see the 2026-09-09 block-01 refresh section below.
-| `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | **amended 2026-09-06 with the gfx11 NW16 scan retune** (gated_delta_net_chunked_bf16_gfx11.cu, fork 376f02aa0); **amended 2026-09-11 with the `GGML_CUDA_GDN_ALIGN_BOUNDARY` K-independent boundary** (gated_delta_net.cu; **default ON**, opt out with `=0`; `KTAIL=16`, covers `n_max`<=15).
+| `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | **amended 2026-09-06 with the gfx11 NW16 scan retune** (gated_delta_net_chunked_bf16_gfx11.cu, fork 376f02aa0); **amended 2026-09-11 with the K-independent whole-batch chunked prefill** (gated_delta_net.cu; no sequential tail, `GGML_CUDA_GDN_ALIGN_BOUNDARY` gate + its two K-dependent branches **removed**; + the `llama_memory_recurrent` rollback-boundary guard).
 | `0003` | BF16 KV cache + native-BF16 flash-attn | **amended 2026-09-10 with the HIP masked-V/freed-cell fixes** (moved here from block 14 on 2026-09-10 — they sit on the native-BF16 PV staging this block introduces): `fattn-tile.cuh` (packed-bf16 PV) + `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles). |
 | `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf | **amended 2026-09-06 with the RDNA WMMA (256,256,64) config row** (fattn-mma-f16.cuh, fork e7eecb369).
 | `0005` | CPU bit-identical decode/verify batches |
@@ -772,34 +772,51 @@ upstream's additions.
   to sequential; non-MTP coherence unchanged.  Not bit-identical vs
   sequential in general (same class as the bf16 chunked: near-lossless).
   Lab numbers: `benchmarks/2026-08-31-mtp-gdn-chunked-prefix.md`.
-- **K-independent chunked-GDN boundary added** (2026-09-11,
-  `GGML_CUDA_GDN_ALIGN_BOUNDARY`, **default ON** — opt out with `=0`).
-  Fixes the fork-only plain-vs-spec divergence from the gfx1151 issue-#25
-  validation: the two branches above have a K-dependent chunk/sequential
-  boundary (plain `K == 1` chunks the whole prompt; MTP `K > 1` chunks
-  `n_tokens - K`), so the post-prefill SSM state depends on `n_rs_seq` and
-  `--spec-type none` disagrees with `draft-mtp`.  The aligned branch chunks
-  `n_tokens - KTAIL` and runs the sequential kernel over the last `KTAIL` for
-  both `K == 1` and `K > 1`, giving one boundary and one state (the tail also
-  emits the K snapshots; `n_seqs > 1` keeps the whole-ubatch path).
-  `KTAIL` must be a **fixed constant** for `K <= 16` — a K-derived boundary
-  would make `K == 1` and `K > 1` pick different prefixes and defeat the whole
-  branch.  It is **16** (covers `K <= 16`, i.e. `n_max <= 15`, including
-  adaptive MTP's recommended `n_max = 12`), with a floor at `K` for deeper
-  drafts: those reproduce the pre-alignment `K > 1` boundary exactly (correct
-  snapshots, correct-but-not-bit-identical) rather than reading stale slots.
-  The cost is entirely the tail length — 27B Q8_0 pp512/2048/4096:
-  `KTAIL=64` ≈ -1.5 %, **`KTAIL=16` ≈ -0.3..-0.8 %**, `KTAIL=8` ≈ 0 (decode
-  unchanged in all cases).  **Flipped to default ON 2026-09-11** (was opt-in):
-  together with the block-13 dense-MMVQ alignment this is what makes
-  `--spec-type none == draft-mtp` under `-sm tensor` (and on 1 GPU) with
-  `GGML_CUDA_GDN_CHUNKED` at its default; the opt-out (`=0`) keeps the
-  K-dependent boundary and its prefill edge for callers that do not need the
-  bit-exactness.  gfx1201 probe (`RS=from_w`, P=256):
-  `W1-W3/W3-W5 = 0.136693/0.182106` default -> `0.000000/0.000000` gated;
-  gated text `none == n2 == n4` and equals the `GGML_CUDA_GDN_CHUNKED=0`
-  reference on the short prompts; `test-backend-ops -o GATED_DELTA_NET` 46/46
-  both ways.  Record: `../wip/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FIX.md`.
+- **K-independent whole-batch chunked prefill — free, no tail, no gate**
+  (2026-09-11).  Fixes the fork-only plain-vs-spec divergence from the gfx1151
+  issue-#25 validation.  The chunked kernel is not bit-exact with the
+  sequential one, so a K-dependent boundary makes the post-prefill SSM state
+  depend on `n_rs_seq`: plain decode (`K == 1`) chunks the whole prompt while
+  the MTP path (`K == n_max + 1`) chunks `n_tokens - K` plus a K-token tail,
+  and `--spec-type none` then disagrees with `draft-mtp`.  The alignment is
+  done by giving both paths the **same call**: a batch with more than
+  `max(K, 16)` tokens is chunked **whole** — exactly what `K == 1` does — and
+  anything smaller falls through to the sequential kernel.  No sequential tail,
+  no `KTAIL`.
+  A batch larger than `max(K, 16)` cannot be a speculative verify batch (a
+  verify batch decodes at most `K = n_rs_seq + 1` tokens) and is never rolled
+  back into, which is why its K rollback snapshots can be skipped; every batch
+  at or below the threshold — in particular every verify batch — stays on the
+  sequential kernel and writes the snapshots the spec rollback reads.  The
+  threshold must be a constant for `K <= 16` (or the two paths diverge again on
+  short prompts); the floor at `K` keeps deeper drafts correct (sequential)
+  instead of reading an unwritten slot.  `n_seqs > 1` keeps the whole-ubatch
+  path for `K == 1`.
+  **Cost: none.**  27B Q8_0 1 GPU pp512/2048/4096 = 1385.3/1356.4/1328.2 vs
+  1384.7/1355.0/1327.8 for the old K-dependent boundary (parity); this replaces
+  the previous KTAIL=16 tail cost (-0.3..-0.8 %) with zero.  The old
+  `GGML_CUDA_GDN_ALIGN_BOUNDARY` gate and its two K-dependent branches were
+  **removed** (~118 lines): both were unreachable with the gate on, and the
+  opt-out no longer bought anything now that the default is free.
+  `GGML_CUDA_GDN_CHUNKED=0` remains the only switch — it forces the sequential
+  kernel everywhere (correct, bit-identical, slow) — and is the fallback if the
+  snapshot assumption below is ever violated.
+  **Guard:** the invariant above (only verify batches are rolled back into) is
+  empirical, so `llama_memory_recurrent::seq_rm` now tracks the last batch's
+  per-seq token count and logs a **once-only warning** if a rollback ever
+  crosses that boundary, instead of silently restoring an unwritten slot.
+  Measured against it: llama-cli `draft-mtp` n_max 1/4/8/16 (449 rollbacks) and
+  llama-server `--cache-reuse` (20 rollbacks) — every rollback was preceded by a
+  batch of <= K tokens, 0 warnings; gfx1201 probe `RS=6 W=6 == RS=0 W=1`
+  confirms the prefill is K-independent.
+  Verified: gfx1201 probe (`RS=from_w`, P=256) `W = 1/3/5/6` all `a4817ee6`
+  (4B 1-GPU `671d6096`); 27B 2-GPU tensor text `none == n1 == n4 == n5`
+  (`6e8ccd25`); `test-backend-ops -o GATED_DELTA_NET` OK.
+  **The pure `none == draft-mtp` range is `n_max <= 5`, NOT 15** — beyond that a
+  multi-token verify batch hits a different MUL_MAT dispatch and diverges
+  regardless of this block.  See `../GREEDY-PURITY.md` §11 and
+  `../wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 3.
+  Record: `../wip/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FIX.md`.
 
 ## Block 13 notes
 
@@ -968,11 +985,12 @@ baseline table live in `wip/qwen35moe-prefill/bench-config.md`.
   0.487 / 36.5 t/s, MoE 0.675 / 153.1 t/s); `GATED_DELTA_NET` 46/46 and
   the hybrid-vs-NCCL coherence gate identical.  **Companion:** the
   default-config `-sm tensor` text equality **also** needs the block-02
-  `GGML_CUDA_GDN_ALIGN_BOUNDARY` K-independent chunked-GDN prefill
-  boundary, now **ON by default** (opt out with `=0`); that bit-exactness
-  costs ~1.5-1.8% prefill (pp512 1389 -> 1364, pp2048 1360 -> 1338,
-  pp4096 1329 -> 1309).  With both, 27B 2-GPU and 3-GPU tensor and 1-GPU
-  are `none == n1 == n2 == n4`.  See
+  K-independent whole-batch chunked GDN prefill (2026-09-11) — both paths
+  chunk the whole prompt, so the post-prefill state no longer depends on
+  `n_rs_seq` — and it is **free** (no sequential tail; pp parity).
+  With both, 27B 2-GPU and 3-GPU tensor and 1-GPU are
+  `none == n1 == n2 == n4` for `n_max <= 5` (the pure range — see
+  `GREEDY-PURITY.md` §11).  See
   `wip/sm-tensor-plain-vs-spec/HANDOVER-2026-09-11.md`.
 
 ## Server config (the +22% deployment win)

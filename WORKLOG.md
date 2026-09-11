@@ -10,7 +10,48 @@ for the full record; per-block technical notes live in
 
 ---
 
-- **Block 02 amended: GDN alignment tail shortened to `KTAIL=16` (2026-09-11).**  The aligned
+- **Block 02 amended (final form): the whole-batch K-independent chunked GDN prefill — free, no tail, no gate (2026-09-11).**
+  Follows the KTAIL=16 entry below, which it supersedes.  Option B from
+  `wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md`: instead of *sharing a
+  sequential tail* between the plain (`K == 1`) and MTP (`K > 1`) prefills, both
+  paths now make the **same call** — a batch with more than `max(K, 16)` tokens
+  is chunked **whole**, exactly what `K == 1` already did, and anything smaller
+  stays on the sequential kernel.  No tail, so the previous -0.3..-0.8 % tail
+  cost goes to **zero**: 27B Q8_0 1 GPU pp512/2048/4096 = 1385.3/1356.4/1328.2
+  vs 1384.7/1355.0/1327.8 for the old K-dependent boundary (parity), tg
+  unchanged.  A batch larger than `max(K, 16)` cannot be a verify batch (those
+  decode `<= K` tokens) and is never rolled back into, so its K snapshots are
+  skipped; every verify batch keeps them.
+  **Guard added** (the invariant is empirical): `llama_memory_recurrent::seq_rm`
+  tracks the last batch's per-seq token count and logs a once-only warning if a
+  rollback ever crosses that boundary.  Measured: 449 rollbacks over llama-cli
+  `draft-mtp` n_max 1/4/8/16 + 20 in llama-server `--cache-reuse`, all preceded
+  by a `<= K`-token batch, 0 warnings.
+  **Removed**: `GGML_CUDA_GDN_ALIGN_BOUNDARY`, the `align_boundary` variable and
+  both K-dependent branches (~118 lines) — they were unreachable with the gate
+  ON, and the opt-out is superseded by `GGML_CUDA_GDN_CHUNKED=0`, which is
+  *both* correct (all snapshots written) and bit-identical plain-vs-MTP.
+  **Gate re-verification** (all corrected against the new build): 27B 2-GPU
+  tensor `none == n1 == n4 == n5` (`6e8ccd25`), 3-GPU tensor `none == n4`,
+  1-GPU 4B probe `671d6096`, 27B prefill probe `W = 1/3/5/6` all `a4817ee6`
+  with `RS=6 W=6 == RS=0 W=1` (prefill now K-independent), `test-backend-ops -o
+  GATED_DELTA_NET` OK, 3x determinism check identical.
+  **Correction (important):** the `n_max <= 15` purity claim in the entries
+  below — and in every doc — was **wrong**; it was never validated past
+  `n_max = 4`.  The real `none == draft-mtp` range is **`n_max <= 5`**, and the
+  cause is a **pre-existing** multi-token-verify-batch MUL_MAT dispatch
+  difference (identical divergence pattern on the delivered KTAIL=16 build;
+  pure at `RS=0` up to `W = 6`, breaks at `W = 7`, again at `W >= 9` where MMVQ
+  hands over to MMQ).  Upstream master is affected too and *worse*: on upstream
+  `9cf3bf256` (CPU, 4B) `W = 1` already differs from `W >= 2`.  Docs corrected
+  (`GREEDY-PURITY.md` §11, `benchmarks/mtp-adaptive-methodology.md` rule 4,
+  `patches/README.md`, `AGENTS.md`); root-causing it is
+  `wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 3.
+  Canonical re-cut: block 02 `63f8ab023` -> `6e81ed5ed`, tip **`30d119ea9`**,
+  net tree **`29714ad1f`**; clean-apply strict 15/15 `git am`, zero whitespace,
+  applied tree == canonical.
+
+- **Block 02 amended: GDN alignment tail shortened to `KTAIL=16` (2026-09-11). — SUPERSEDED by the entry above.**  The aligned
   boundary's cost is entirely its sequential tail (which writes the K rollback snapshots), and the
   tail was 64 — ~16x longer than the default `--spec-draft-n-max 3` needs.  `KTAIL=16` covers
   `K <= 16` / `n_max <= 15`, including adaptive MTP's recommended `n_max = 12`; for deeper drafts the
@@ -19,8 +60,8 @@ for the full record; per-block technical notes live in
   (27B Q8_0, 1 GPU, interleaved `-r 5`): `KTAIL=64` ≈ -1.5 %, **`KTAIL=16` ≈ -0.3..-0.8 %**,
   `KTAIL=8` ≈ 0; decode unchanged.  Bit-identity re-verified with `KTAIL=16`: 27B 2-GPU tensor
   probe W=1/3/5 and text `none == n1 == n2 == n4` (`e386b50d`), 3-GPU tensor `none == n4`, 4B 1-GPU.
-  Canonical re-cut: block 02 `d60bb52ef` -> `63f8ab023`, tip **`eb26da812`**, net tree
-  **`b64f21644`**; clean-apply strict 15/15 `git am`, zero whitespace, applied tree == canonical.
+  Canonical re-cut: block 02 `d60bb52ef` -> `63f8ab023`, tip **`30d119ea9`**, net tree
+  **`29714ad1f`**; clean-apply strict 15/15 `git am`, zero whitespace, applied tree == canonical.
   Follow-ups (free GDN prefill alignment + the MoE batch-width residual) written up in
   `wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md`.
 
@@ -35,7 +76,7 @@ for the full record; per-block technical notes live in
   pp4096 1329.5/1328.5 -> 1309.2/1309.6 (-1.5 %); decode unchanged (tg128 20.43 -> 20.40).  The
   maintainer accepted the prefill cost to close the divergence.  Canonical chain re-cut: block 02
   `38641280b` -> `d60bb52ef`, tip **`33ccf7e28`**, net tree **`31e153fe3`** (later re-cut again for KTAIL=16:
-tip `eb26da812`, tree `b64f21644`); clean-apply strict 15/15
+tip `30d119ea9`, tree `29714ad1f`); clean-apply strict 15/15
   `git am`, zero whitespace warnings, applied tree == canonical.
 
 - **Block 13 amended: dense decode/verify MMVQ kernel alignment (`mmvq.cu`, 2026-09-11).**

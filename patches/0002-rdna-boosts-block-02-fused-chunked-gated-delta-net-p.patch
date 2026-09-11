@@ -1,24 +1,26 @@
-From 63f8ab023f9fe7f402d4ac228482045428a26e17 Mon Sep 17 00:00:00 2001
+From 6e81ed5ed9365f3fa1470930ae276bf883af7345 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 02/14] rdna-boosts: block 02: fused chunked gated-delta-net
  prefill kernel
 
 ---
- ggml/src/ggml-cuda/gated_delta_net.cu         |  207 ++++
+ ggml/src/ggml-cuda/gated_delta_net.cu         |   84 ++
  ggml/src/ggml-cuda/gated_delta_net_chunked.cu |  702 ++++++++++++
  .../src/ggml-cuda/gated_delta_net_chunked.cuh |   58 +
  .../ggml-cuda/gated_delta_net_chunked_bf16.cu |  995 ++++++++++++++++
  .../gated_delta_net_chunked_bf16_gfx11.cu     | 1014 +++++++++++++++++
+ src/llama-memory-recurrent.cpp                |   26 +
+ src/llama-memory-recurrent.h                  |    7 +
  tests/test-backend-ops.cpp                    |   97 +-
- 6 files changed, 3068 insertions(+), 5 deletions(-)
+ 8 files changed, 2978 insertions(+), 5 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a724..ba5bc1aa1 100644
+index 1b431a724..67676dea6 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,4 +1,5 @@
@@ -27,153 +29,49 @@ index 1b431a724..ba5bc1aa1 100644
  #include "ggml-cuda/common.cuh"
  
  template <int S_v, bool KDA, bool keep_rs_t>
-@@ -286,6 +287,212 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -286,6 +287,89 @@ static void ggml_cuda_op_gated_delta_net_impl(
      const int K = ggml_get_op_params_i32(dst, 0);
      const bool keep_rs = K > 1;
  
-+    // DEFAULT ON (opt-out) K-independent chunked/sequential boundary: see the aligned block at
-+    // the bottom of this function.  The fork's original boundary is K-dependent (plain chunks
-+    // the whole prompt, MTP chunks n_tokens - K), so the post-prefill state depends on n_rs_seq
-+    // and --spec-type none disagrees with draft-mtp (the recurrent GDN amplifies the chunked
-+    // kernel's inexactness).  The aligned boundary gives plain and the MTP spec path one state.
-+    // GGML_CUDA_GDN_ALIGN_BOUNDARY=0 restores the K-dependent boundary (the ~2-2.6% faster
-+    // prefill) when that bit-exactness is not wanted (wip/issue-25-mtp-batch-width/).
-+    const char * env_align = getenv("GGML_CUDA_GDN_ALIGN_BOUNDARY");
-+    const bool align_boundary = env_align == nullptr || strcmp(env_align, "0") != 0;
-+
-+    // fused chunked prefill: more than one token per sequence, no snapshots, scalar gate, and
-+    // no fused-state-cache cpy to honour -- the grid maps one block per (chunk, head, seq).
-+    // Everything else (decode, MTP snapshots, KDA vector gates) stays on the sequential kernel.
-+    // GGML_CUDA_GDN_CHUNKED=0 forces the sequential fallback (A/B perf comparison).
-+    // The fused GDN->cpy (cache != nullptr) is honoured for K == 1: the chunked kernel writes
-+    // its new state directly into the cache slot, so the cpy node can be skipped.
++    // K-independent chunked prefill -- no K-dependent boundary and no sequential tail.  The
++    // chunked kernel is not bit-exact with the sequential kernel (the bf16/WMMA path is
++    // deliberately near-lossless, the fp32 path differs too), so a K-dependent boundary makes the
++    // post-prefill state depend on n_rs_seq: plain decode (K == 1) chunks the whole prompt while
++    // the MTP path (K == n_max + 1) chunks n_tokens - K + a K-token tail, and the two disagree, so
++    // greedy near-ties flip between --spec-type none and draft-mtp.
++    //
++    // The alignment is done by giving BOTH paths the SAME call -- chunk the whole batch, exactly
++    // what K == 1 does -- rather than by sharing a sequential tail.  A batch with more tokens than
++    // max(K, 16) cannot be a speculative verify batch (a verify batch decodes n_tokens <= K = n_rs_seq + 1)
++    // and is therefore never rolled back into, so the K rollback snapshots are useless to it and
++    // the sequential kernel can be skipped entirely: zero cost, unbounded n_max, no KTAIL.  Every
++    // batch at or below the threshold -- in particular every verify batch -- falls through to the
++    // sequential kernel below, which writes the K snapshots the spec rollback actually reads.
++    // (Verified: over llama-cli draft-mtp and llama-server with --cache-reuse, every partial
++    // rollback was preceded by a batch of exactly K or fewer tokens.)
++    //
++    // The threshold must be a constant for K <= 16 or the two paths diverge again on short prompts;
++    // 16 covers K <= 16 (n_max <= 15, including adaptive MTP's recommended n_max = 12).  The floor
++    // at K keeps verify batches sequential for deeper drafts, so those keep the K-dependent
++    // boundary and stay correct-but-not-bit-identical, exactly as before.
++    //
++    // The fused GDN->cpy (cache != nullptr) is still honoured: the chunked kernel writes the new
++    // state (slot 0) straight into the cache slot, so the cpy node can be skipped.  n_seqs > 1
++    // keeps the whole-ubatch chunked path for K == 1 -- the chunked n_tokens override is also the
++    // sequence stride, so only n_seqs == 1 may choose per-batch.  GGML_CUDA_GDN_CHUNKED=0 forces
++    // the sequential kernel everywhere (the A/B switch, and the fully-snapshot-safe fallback).
 +    // The chunked ops report a synchronous launch rejection (ROCm: AQL dispatch refused, e.g. a
 +    // code object carrying a hidden hostcall buffer on a platform without PCIe atomics ->
-+    // hipErrorIllegalState, llama-cpp-rdna-boosts#2) and we recompute with the sequential
-+    // kernel below instead of aborting -- a rejected launch has no side effects, so the
-+    // fallback is bit-identical to running with GGML_CUDA_GDN_CHUNKED=0. An async fault inside
-+    // a launched kernel is NOT caught here and still surfaces at the next sync point.
-+    if (!align_boundary && (cache == nullptr || K == 1) && !kda && K == 1 && n_tokens > 1 &&
++    // hipErrorIllegalState, llama-cpp-rdna-boosts#2); a rejected launch has no side effects, so we
++    // recompute with the sequential kernel below, bit-identical to GGML_CUDA_GDN_CHUNKED=0.  An
++    // async fault inside a launched kernel is NOT caught here and surfaces at the next sync point.
++    if (!kda && n_tokens > 1 &&
 +        (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
 +        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
 +        if (env == nullptr || strcmp(env, "0") != 0) {
-+            // GGML_CUDA_GDN_CHUNKED_BF16=0 opts OUT of the bf16/WMMA tensor-core path; it is
-+            // the DEFAULT for S_v == 128 on the HIP build (near-lossless: PPL +0.056%, KL
-+            // 0.0036 on wikitext-2 vs the fp32 path; not bit-exact). Everything else keeps
-+            // the fp32 chunked path.
-+            float * state_d_ext = cache ? cache->data : nullptr;
-+#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
-+            // NOTE: RDNA3/RDNA4 are device-pass-only macros - never gate HOST code on them.
-+            // Use the runtime device cc. The two bf16/WMMA kernels are fully segregated by
-+            // architecture (no shared code, so they cannot cross-regress):
-+            //   RDNA4 (gfx12) -> gated_delta_net_chunked_bf16.cu (the fork's validated
-+            //     RDNA4-only kernel, restored verbatim after the in-place dual-arch refactor
-+            //     regressed the gfx12 path - NaN/inf on the bf16 chunked GDN).
-+            //   RDNA3 (gfx11) -> gated_delta_net_chunked_bf16_gfx11.cu (first-gen WMMA port).
-+            const int cc_ = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-+            const bool bf16_rdna = GGML_CUDA_CC_IS_RDNA4(cc_) || GGML_CUDA_CC_IS_RDNA3(cc_);
-+            const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
-+            // bf16/WMMA is the S_v == 128 default on RDNA3 and RDNA4 (opt-OUT via
-+            // GGML_CUDA_GDN_CHUNKED_BF16=0; near-lossless: PPL +0.056% on RDNA4, -0.09% on
-+            // RDNA3, not bit-exact). Everything else keeps the fp32 chunked path.
-+            const bool want_bf16 = bf16_rdna && S_v == 128 &&
-+                (envb == nullptr || strcmp(envb, "0") != 0);
-+            if (want_bf16) {
-+                bool bf16_ok = false;
-+                if (GGML_CUDA_CC_IS_RDNA4(cc_)) {
-+                    bf16_ok = ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_d_ext);
-+                } else {
-+                    bf16_ok = ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ctx, dst, state_d_ext);
-+                }
-+                if (bf16_ok) {
-+                    return;
-+                }
-+                GGML_LOG_WARN("%s: bf16 chunked GDN launch rejected by the driver; falling back to the sequential kernel (GGML_CUDA_GDN_CHUNKED=0 equivalent)\n", __func__);
-+            } else
-+#endif
-+            {
-+                if (ggml_cuda_op_gated_delta_net_chunked(ctx, dst, state_d_ext)) {
-+                    return;
-+                }
-+                GGML_LOG_WARN("%s: fp32 chunked GDN launch rejected by the driver; falling back to the sequential kernel (GGML_CUDA_GDN_CHUNKED=0 equivalent)\n", __func__);
-+            }
-+        }
-+    }
-+
-+    // MTP (K > 1) needs snapshot slots, so the K==1 fused-cache chunked path
-+    // cannot cover it. Long single-sequence prefill: chunked GDN on the prefix
-+    // (n_tokens - K), sequential GDN only on the last K tokens so slots 0..K-1
-+    // stay correct. n_seqs > 1 stays fully sequential — the chunked n_tokens
-+    // override is also the sequence stride. Opt out with GGML_CUDA_GDN_CHUNKED=0.
-+    if (!align_boundary && !kda && K > 1 && n_seqs == 1 && n_tokens > (int64_t) K + 64 &&
-+        (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
-+        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
-+        if (env == nullptr || strcmp(env, "0") != 0) {
-+            const int64_t n_prefix = n_tokens - K;
-+            ggml_cuda_pool_alloc<float> prefix_state(ctx.pool(), (size_t) H * S_v * S_v * n_seqs);
-+            bool prefix_ok = false;
-+#if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
-+            const int cc_p = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-+            const bool bf16_rdna_p = GGML_CUDA_CC_IS_RDNA4(cc_p) || GGML_CUDA_CC_IS_RDNA3(cc_p);
-+            const char * envb_p = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
-+            const bool want_bf16_p = bf16_rdna_p && S_v == 128 &&
-+                (envb_p == nullptr || strcmp(envb_p, "0") != 0);
-+            if (want_bf16_p) {
-+                if (GGML_CUDA_CC_IS_RDNA4(cc_p)) {
-+                    prefix_ok = ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, prefix_state.get(), n_prefix);
-+                } else {
-+                    prefix_ok = ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ctx, dst, prefix_state.get(), n_prefix);
-+                }
-+            } else
-+#endif
-+            {
-+                prefix_ok = ggml_cuda_op_gated_delta_net_chunked(ctx, dst, prefix_state.get(), n_prefix);
-+            }
-+            if (prefix_ok) {
-+                static bool logged_prefix = false;
-+                if (!logged_prefix) {
-+                    GGML_LOG_INFO("%s: MTP chunked GDN prefix n=%ld K=%d prefix=%ld\n",
-+                                  __func__, (long) n_tokens, K, (long) n_prefix);
-+                    logged_prefix = true;
-+                }
-+                float * state_d = cache ? cache->data : (dst_d + S_v * H * n_tokens * n_seqs);
-+                const int64_t state_slot_stride = cache ? cache->slot_stride : (S_v * S_v * H * n_seqs);
-+                launch_gated_delta_net<false, true>(
-+                    q_d + n_prefix * sq2, k_d + n_prefix * sq2, v_d + n_prefix * sv2,
-+                    g_d + n_prefix * sb2, b_d + n_prefix * sb2, prefix_state.get(),
-+                    dst_d + n_prefix * S_v * H, state_d,
-+                    S_v, H, K, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-+                return;
-+            }
-+        }
-+    }
-+
-+    // K-independent boundary (DEFAULT ON; GGML_CUDA_GDN_ALIGN_BOUNDARY=0 opts out).  The
-+    // chunked kernel is not bit-exact with the sequential kernel (the bf16/WMMA path is
-+    // deliberately near-lossless, the fp32 path differs too), so the K-dependent boundary makes
-+    // the post-prefill state depend on n_rs_seq: plain decode (K == 1) chunks the whole prompt
-+    // while the MTP path (K == n_max + 1) chunks n_tokens - K + a K-token tail, and the two
-+    // disagree, so greedy near-ties flip between --spec-type none and draft-mtp.  Chunking the
-+    // first (n_tokens - KTAIL) tokens and running the sequential kernel over the last KTAIL for
-+    // both K == 1 and K > 1 gives one boundary, hence one state, regardless of exactness.  The
-+    // tail also produces the K snapshots (slot j = j tokens back), so rollback <= KTAIL-1 is
-+    // exact.  n_seqs > 1 keeps the whole-ubatch chunked path: the chunked n_tokens override is
-+    // also the sequence stride, so only n_seqs == 1 may truncate.  GGML_CUDA_GDN_CHUNKED=0 still
-+    // forces the sequential kernel; the launch-rejection fallback matches the branches above.
-+    if (align_boundary && !kda && n_tokens > 1 &&
-+        (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
-+        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
-+        if (env == nullptr || strcmp(env, "0") != 0) {
-+            // Sequential tail length.  It must be a *constant* for K <= 16 (not derived from K),
-+            // or the K==1 and K>1 prefills pick different prefix boundaries and stop being
-+            // bit-identical -- which is the whole point of this branch.  16 covers K <= 16
-+            // (n_max <= 15, including adaptive MTP's recommended n_max=12); the cost is entirely
-+            // the tail length (27B Q8_0 pp512/2048/4096: tail 64 = -1.5%, 16 = -0.35%, 8 = ~0).
-+            // The floor at K keeps the snapshots exact for deeper drafts: those reproduce the
-+            // pre-alignment K>1 boundary exactly (chunk n_tokens - K + sequential K), i.e. they
-+            // fall back to correct-but-not-bit-identical instead of reading stale snapshot slots.
-+            const int64_t GDN_CHUNKED_KTAIL = K > 16 ? (int64_t) K : 16;
++            // Minimum batch size that may take the whole-batch chunked path.  A constant for
++            // K <= 16 (see above); the floor at K keeps K > 16 drafts on the sequential kernel.
++            const int64_t GDN_CHUNKED_MIN_TOKENS = K > 16 ? (int64_t) K : 16;
 +            // GGML_CUDA_GDN_CHUNKED_BF16 / arch selection: same rules as the default branches
 +            // (RDNA4 -> the RDNA4 WMMA kernel, RDNA3 -> the gfx11 port, everything else fp32).
 +            // n_tokens_limit > 0 truncates to the prefix of a single sequence.
@@ -195,34 +93,15 @@ index 1b431a724..ba5bc1aa1 100644
 +            };
 +
 +            if (n_seqs == 1) {
-+                const int64_t n_prefix = n_tokens > GDN_CHUNKED_KTAIL ? n_tokens - GDN_CHUNKED_KTAIL : 0;
-+                if (n_prefix > 0) {
-+                    ggml_cuda_pool_alloc<float> prefix_state(ctx.pool(), (size_t) H * S_v * S_v * n_seqs);
-+                    if (launch_chunked(prefix_state.get(), n_prefix)) {
-+                        static bool logged_prefix = false;
-+                        if (!logged_prefix) {
-+                            GGML_LOG_INFO("%s: aligned chunked GDN prefix n=%ld K=%d prefix=%ld tail=%ld\n",
-+                                          __func__, (long) n_tokens, K, (long) n_prefix,
-+                                          (long) (n_tokens - n_prefix));
-+                            logged_prefix = true;
-+                        }
-+                        const int64_t n_tail = n_tokens - n_prefix;
-+                        float * state_d = cache ? cache->data : (dst_d + S_v * H * n_tokens * n_seqs);
-+                        const int64_t state_slot_stride = cache ? cache->slot_stride : (S_v * S_v * H * n_seqs);
-+                        if (keep_rs) {
-+                            launch_gated_delta_net<false, true>(
-+                                q_d + n_prefix * sq2, k_d + n_prefix * sq2, v_d + n_prefix * sv2,
-+                                g_d + n_prefix * sb2, b_d + n_prefix * sb2, prefix_state.get(),
-+                                dst_d + n_prefix * S_v * H, state_d,
-+                                S_v, H, n_tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-+                                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-+                        } else {
-+                            launch_gated_delta_net<false, false>(
-+                                q_d + n_prefix * sq2, k_d + n_prefix * sq2, v_d + n_prefix * sv2,
-+                                g_d + n_prefix * sb2, b_d + n_prefix * sb2, prefix_state.get(),
-+                                dst_d + n_prefix * S_v * H, state_d,
-+                                S_v, H, n_tail, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-+                                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++                if (n_tokens > GDN_CHUNKED_MIN_TOKENS) {
++                    if (launch_chunked(cache ? cache->data : nullptr, 0)) {
++                        static bool logged_free = false;
++                        if (!logged_free) {
++                            GGML_LOG_INFO("%s: whole-batch chunked GDN prefill n=%ld K=%d n_seqs=%ld "
++                                          "(> %ld: no snapshot tail needed)\n",
++                                          __func__, (long) n_tokens, K, (long) n_seqs,
++                                          (long) GDN_CHUNKED_MIN_TOKENS);
++                            logged_free = true;
 +                        }
 +                        return;
 +                    }
@@ -3034,6 +2913,68 @@ index 000000000..944110792
 +
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 \ No newline at end of file
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 57919accf..b11a1ac6d 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -196,6 +196,25 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+                 // pending rollback is single-use
+                 const bool pending = rs_idx[seq_id] != 0;
+                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
++                    // Guard: the snapshot path assumes a rollback only removes tokens the last
++                    // batch decoded, i.e. that only speculative verify batches -- which never
++                    // decode more than (n_rs_seq + 1) tokens -- are rolled back into.  A larger
++                    // batch is not a verify batch, and the whole-batch chunked GDN prefill
++                    // (gated_delta_net.cu, GDN_CHUNKED_MIN_TOKENS) writes only the newest
++                    // snapshot for it, so restoring snapshot `rollback` would read an unwritten
++                    // slot.  Warn once rather than corrupt silently.
++                    if (!warned_rollback_boundary && last_ubatch_nseq_tokens > n_rs_seq + 1) {
++                        warned_rollback_boundary = true;
++                        LLAMA_LOG_WARN("%s: rollback crossed a batch boundary: seq %d rollback=%d but "
++                                "the last batch decoded %u tokens (last pos %d, n_rs_seq=%u). The "
++                                "recurrent snapshot path assumes only verify batches (<= n_rs_seq + 1 "
++                                "tokens) are rolled back into; if that batch exceeded the chunked-GDN "
++                                "threshold it wrote no usable snapshot and the restored state is "
++                                "wrong -- set GGML_CUDA_GDN_CHUNKED=0 for the sequential kernel. "
++                                "Please report this at github.com/stew675/llama-cpp-rdna-boosts/issues\n",
++                                __func__, (int) seq_id, (int) rollback, last_ubatch_nseq_tokens,
++                                (int) last_ubatch_pos_last, n_rs_seq);
++                    }
+                     set_rs_idx(seq_id, (uint32_t) rollback);
+                     cell.pos = p0 - 1;
+                     return true;
+@@ -499,6 +518,13 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
+     used = org_used;
+     head = org_head;
+ 
++    // remember the shape of the batch that is about to run, for the rollback guard in seq_rm()
++    if (!ubatches.empty()) {
++        const llama_ubatch & ub = ubatches.back();
++        last_ubatch_nseq_tokens = ub.n_seq_tokens;
++        last_ubatch_pos_last    = ub.n_tokens > 0 ? ub.pos[ub.n_tokens - 1] : -1;
++    }
++
+     return success;
+ }
+ 
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index 4abb3f5cf..c1531fc83 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -76,6 +76,13 @@ public:
+     // per-seq rollback index
+     std::vector<uint32_t> rs_idx;
+ 
++    // Shape of the most recently prepared ubatch, used by the rollback guard in seq_rm():
++    // a rollback may only remove tokens the last batch decoded, and a speculative verify
++    // batch never decodes more than (n_rs_seq + 1) tokens.  See the guard there.
++    uint32_t  last_ubatch_nseq_tokens = 0;
++    llama_pos last_ubatch_pos_last    = -1;
++    bool      warned_rollback_boundary = false;
++
+     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+ 
+     // computed before each graph build
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
 index 01e72041b..6b438c0e0 100644
 --- a/tests/test-backend-ops.cpp

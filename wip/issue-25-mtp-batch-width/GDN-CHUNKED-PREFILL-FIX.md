@@ -1,3 +1,17 @@
+# GDN chunked-prefill alignment (fork record)
+
+> **SUPERSEDED 2026-09-11.**  The KTAIL=16 aligned-tail design described below
+> was replaced in block 02 by the **whole-batch chunked prefill** (Option B):
+> both the plain (`K == 1`) and MTP (`K > 1`) prefills chunk the whole batch
+> when it exceeds `max(K, 16)` tokens, so there is no sequential tail and no
+> cost, and the `GGML_CUDA_GDN_ALIGN_BOUNDARY` gate is gone.  A once-only
+> rollback-boundary guard was added in `llama_memory_recurrent::seq_rm`.
+> Read `../../wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 1 and
+> `../../WORKLOG.md` for the final form.  The text below is the historical
+> record of the intermediate step, INCLUDING a claim that later proved wrong:
+> the "`n_max <= 15`" purity range quoted here should be **`n_max <= 5`**
+> (`GREEDY-PURITY.md` §11) — the GDN was not the limiting factor.
+
 # GDN chunked-prefill plain-vs-spec divergence — gated fix (block 02 amendment)
 
 Date: 2026-09-11.  Box: 3x R9700 (gfx1201, RDNA4), ROCm 7.14

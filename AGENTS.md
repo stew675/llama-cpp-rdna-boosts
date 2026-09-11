@@ -103,10 +103,10 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `eb26da812`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `30d119ea9`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
-`9113cc188`; block 02 amended 2026-09-11 with the
-`GGML_CUDA_GDN_ALIGN_BOUNDARY` branch, default ON / opt out with `=0`), which is what
+`9113cc188`; block 02 amended 2026-09-11 with the whole-batch
+K-independent chunked GDN prefill), which is what
 `scripts/make-patches.sh`'s default tip refers
 to; always regenerate from a canonical fork rebuilt at the fork point.
 **Block 15 (the attention-memory campaign) is NOT in the delivery** -- it
@@ -157,9 +157,10 @@ re-ran it once more: strict 15/15 `git am`, zero whitespace warnings,
 applied tree `c0775c33c` == canonical, tip `27bd754b6`; the 2026-09-11
 block-02 default-flip (GGML_CUDA_GDN_ALIGN_BOUNDARY now opt-**out**) re-ran
 it again: strict 15/15 `git am`, zero whitespace warnings, applied tree
-`31e153fe3` == canonical, tip `27bd754b6`; the KTAIL=16 follow-up re-ran it
-once more: strict 15/15 `git am`, zero whitespace, applied tree `b64f21644` ==
-canonical, tip `eb26da812`).  Apart from the
+`31e153fe3` == canonical, tip `27bd754b6`; the 2026-09-11 block-02 re-cut to
+the whole-batch chunked prefill (free alignment, gate + K-dependent branches
+removed, rollback guard added) re-ran it last: strict 15/15 `git am`, zero
+whitespace, applied tree `29714ad1f` == canonical, tip `30d119ea9`).  Apart from the
 block-02 and block-13 hunks the blocks' bodies are byte-identical to the
 previous regeneration apart from the `From <sha>` line and the
 `[PATCH NN/15]` series count (plus the block-00 Vulkan and block-03 HIP
@@ -251,19 +252,23 @@ explicitly requests it.**
   ~38k; 64-token same-seed output token-identical to sequential.  Opt
   out: `GGML_CUDA_GDN_CHUNKED=0` (also `GGML_CUDA_GDN_CHUNKED_BF16=0`).
   Bench record: `benchmarks/2026-08-31-mtp-gdn-chunked-prefix.md`.
-  Amended 2026-09-11 with a K-independent boundary
-  (`GGML_CUDA_GDN_ALIGN_BOUNDARY`, **default ON**, opt out with `=0`):
-  chunk `n_tokens - KTAIL` and run the sequential kernel over the last `KTAIL`
-  for both `K == 1` and `K > 1`, so plain decode and the MTP path agree
-  (`--spec-type none == draft-mtp`) instead of picking different K-dependent
-  boundaries.  `KTAIL` must be a fixed constant (16; `K > 16 ? K : 16`) —
-  covers `n_max <= 15`, incl. adaptive MTP's recommended 12 — because the
-  tail is the whole cost (64 ≈ -1.5 % prefill, 16 ≈ -0.3..-0.8 %, 8 ≈ 0).
-  Flipped to default ON 2026-09-11 (was opt-in) because the K-dependent
-  boundary is the other half of the `-sm tensor` plain-vs-spec drift (with the
-  block-13 dense-MMVQ alignment); the `=0` opt-out keeps the prefill edge when
-  the bit-exactness is not needed.  Record:
-  `wip/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FIX.md`.
+  Amended 2026-09-11 with the **whole-batch K-independent chunked prefill**:
+  a batch with more than `max(K, 16)` tokens is chunked whole — the exact same
+  call `K == 1` makes — and anything smaller stays on the sequential kernel, so
+  plain decode and the MTP path agree (`--spec-type none == draft-mtp`) with
+  **no sequential tail and no cost** (27B pp512/2048/4096 = 1385/1356/1328,
+  parity with the old K-dependent boundary).  A batch larger than `max(K, 16)`
+  cannot be a verify batch (those decode `<= K` tokens) and is never rolled back
+  into, so its snapshots are skipped; a **once-only guard** in
+  `llama_memory_recurrent::seq_rm` warns if that assumption is ever violated.
+  The `GGML_CUDA_GDN_ALIGN_BOUNDARY` gate and its two K-dependent branches were
+  **removed** (~118 lines) — both were unreachable with the gate ON and the
+  opt-out no longer bought any performance.  `GGML_CUDA_GDN_CHUNKED=0` is the
+  only switch left (forces the sequential kernel: correct, bit-identical,
+  slow).  **Note the pure `none == draft-mtp` range is `n_max <= 5`, not 15** —
+  beyond that a multi-token verify batch hits a different MUL_MAT dispatch
+  regardless of this block (`GREEDY-PURITY.md` §11, follow-ups Part 3).
+  Record: `wip/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FIX.md`.
 - **Block-12 AR_PROFILE init fix (2026-09-01, PR #8, integrated):**
   `devices[]` is filled from the caller list before the profiler
   hipMallocs — with `GGML_CUDA_AR_PROFILE=1` the buffers were allocated
@@ -380,7 +385,7 @@ Diff the output against a known-good build (or against RCCL via
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `eb26da812`): `git format-patch --start-number 0` the block
+blocks tip `30d119ea9`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -389,7 +394,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `eb26da812`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `30d119ea9`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then
