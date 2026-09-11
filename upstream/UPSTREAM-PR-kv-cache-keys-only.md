@@ -55,7 +55,7 @@ Qwen3.8-Flash-Next UD-IQ4_XS (the real 3-shard GGUF), `-ngl 0 -c 8192 -n 1 -v`:
 * fork (3× R9700 gfx1201, ctx 204800, ub 2048, `-ctk/-ctv q8_0`): indexer KV 956.26 → 318.76 MiB/GPU,
   box 88.58 → 86.70 GiB (the store is replicated per GPU); the fork's broader matrix (bf16/F32 caches,
   `--parallel 2`, unified cache, prompt-cache/checkpoint round-trips, MTP acceptance 0.741, F16
-  byte-identity) also passed — the fork has carried this change since 2026-09-10 as block-15 win W3.
+  byte-identity) also passed — the staged beta block-15 win W3 carries this change.
 
 **Not validated here / what to check before filing:** the upstream GPU (HIP/CUDA) configuration and
 the flash-attention `v_trans=false` layout (this box has no upstream HIP build); other architectures

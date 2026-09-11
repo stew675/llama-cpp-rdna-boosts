@@ -4,14 +4,22 @@ For beta testers with a machine that can build the Block-15 tree.  Purpose: conf
 memory wins on *your* models and hardware, and — if something looks wrong — isolate it to a single win
 without rebuilding five times.  Every win except W4 is switchable by environment variable.
 
-> **Status: OPEN — the beta window started 2026-09-10.**  Block 15 is cut and in the delivery
-> (`patches/0015-…`), and every row below was re-checked **as a combination** on the tree built from the
-> delivered patches (fresh worktree at `9113cc188`, strict 15/15 `git am`, fresh build): reserves,
+> **Status: OPEN — the beta window started 2026-09-10.**  Block 15 is **staged in this directory**
+> (`block-15-campaign-wins.patch`), **NOT in the delivery** (the delivery is the 14-block set), and every row below was re-checked **as a combination** on the tree built from the
+> beta patch on top of the delivered 14-block set (fresh worktree at `9113cc188`, strict 14/14 `git am` + the beta patch, fresh build): reserves,
 > byte-identical coherence on all five models, the MTP gate, and the op suites all reproduce.
 > V3 is **on by default** (`LLAMA_KQ_MASK_DERIVED`), V4 and V5 are **opt-in through one switch**
 (`GGML_CUDA_FA_KV_NATIVE=1`, V4 for q8_0 K/V, V5 for bf16 K/V — see the amendment note in `README.md`),
 > default off — a ~1.7 % prefill cost for a large memory win).  What testers should do is reproduce the
 > two measurements in §2 on their own hardware/models and report through the template in §3.
+
+> **Amendment (2026-09-10, RDNA3_5 / gfx1151):** V3 now engages on a ROCm/HIP **iGPU** (the derived
+> probe previously rejected `GGML_BACKEND_DEVICE_TYPE_IGPU`, silently disabling the win), and a context
+> with `--parallel` / `n_seq_max > 1` no longer aborts in `ggml_flash_attn_ext_add_kq_derived` (the
+> derived form now requires a single KV stream, so a multi-slot context keeps the packed mask).  On a
+> Strix Halo APU a single-slot context gets the full V3 win and the V4/V5 arms are *cheaper* than on
+> RDNA4 (V4 **+2.6 %** at pp20480).  iGPU testers: V3's win needs head ≤ 320 (the MMA kernel); head
+> 512+ and the qwen4exp fused-QSA path do not use it.
 
 ## 0. What Block 15 promises
 

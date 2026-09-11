@@ -50,7 +50,7 @@ No behaviour change for any graph that has a mask (the only kind master builds t
 * `git apply --check` clean on `9cf3bf256` and on `9113cc188`.
 
 **Not validated here:** an actual null-mask graph (none exists upstream today, so the guarded branch is
-not exercised).  The fork reaches it — its derived-kq-mask work (delivery block 15, win V3) builds
+not exercised).  The fork reaches it — its derived-kq-mask work (beta block 15, win V3) builds
 graphs where the packed mask has no consumer, which is how the missing guard was found (the fork has
 carried the guard since 2026-09-10 as part of that block).  If a null-mask feature lands upstream, this
 guard is its prerequisite, and that feature's own tests are the real coverage.

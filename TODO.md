@@ -4,14 +4,38 @@ Cross-project tracker so important state survives context compaction.
 Forward-looking: open items + current active experiments; closed work is a
 one-line bullet (details live in AGENTS.md, patches/README.md, MANIFESTS.md,
 `beta/qwen4exp/README.md`, `wip/` handovers, `benchmarks/`). Current
-delivery = the 15-patch set against fork point `9113cc188` (blocks 01-15).
-Reality pass: 2026-09-10 (block 15 cut).
+delivery = the 14-patch set against fork point `9113cc188` (blocks 01-14).
+Block 15 is STAGED in `beta/block-15-campaign-wins/`, not promoted.
 
 ## Current active
 
-### Memory campaign -> Block 0015 (derived kq mask + FA scratch + QSA wins) - DONE / CUT 2026-09-10
-- **Block 15 is CUT and in the delivery**: `patches/0015-rdna-boosts-block-15-campaign-memory-wins.patch`
-  (canonical tip `09a137566`, rebuilt at `9113cc188`; 15 patches total, strict 15/15 `git am`).  Six wins,
+### Memory campaign -> Block 0015 (derived kq mask + FA scratch + QSA wins) - STAGED IN beta/ (not promoted)
+- **DONE (2026-09-10): RDNA3_5 (gfx1151) validation pass + beta block-15 amendment.**  First
+  single-device iGPU run (Strix Halo, ROCm 7.14).  Block-14 masked-V fixes +
+  V3/V4/V5 exercised with a BF16 KV cache in both arm states; the block-14 fixes are clean on
+  gfx1151 and V4/V5 do not reintroduce a masked-cell leak.  Two V3 regressions were found and
+  fixed as a dated amendment to the **beta** block-15 patch (**beta patch tip `377f8e790`**; the
+  delivery stays 14 patches, clean-apply strict 14/14, applied tree `6ce36849`): (1) the derived
+  probe rejected `GGML_BACKEND_DEVICE_TYPE_IGPU`, silently disabling V3 on the iGPU;
+  (2) `n_seq_max > 1` aborted in `ggml_flash_attn_ext_add_kq_derived` (`kq_mask_derivable()`
+  now rejects `n_stream != 1`).  After the fix the reserves reproduce RDNA4 exactly (4B V3
+  -799.20/-799.21, V5 bf16 968.86->256.86, V4 q8_0 1001.13->257.13; Flash-Next 3251.39/63.69
+  indexer 318.76), 14 ROCm + 7 Vulkan gates PASS 16/16, probes clean, MTP identical.  V4 is
+  *faster* on gfx1151 at depth (+2.6 % pp20480) and V5 costs 0.4-0.9 % vs RDNA4 0.2-2.4 %.
+  Record: `wip/strix-halo/GATE-2026-09-10-block15-rdna35.md`.
+- **Follow-up (RDNA3_5, low priority): V3 prefill cost is arch-dependent.**  gfx1151 measured
+  -3.2 % at pp20480 (4B, q8_0) vs the RDNA4 4B reference -1.3 %, decode flat.  Still a large
+  net win (-799 MiB compute + -799 MiB host) and on by default; if an iGPU tuning pass ever
+  runs, the derived MMA kernel's `J`/occupancy on gfx1151 is the place to look.
+- **Follow-up (block 13, RDNA3_5): the isolated fused-MoE delta is now ~0 on Strix Halo.**
+  With the 2026-09-06 model-neutral folds in the tree, `GGML_CUDA_DISABLE_MOE_MMQ_FUSION` on vs
+  off measured pp2048 +0.4 %/pp16384 +0.2 % (was +5.3 %/+4.6 % on the 2026-09-05 build);
+  absolute prefill is ~10-13 % higher and the fusion still fires, so this is the folds
+  capturing the same work, not a regression.  Re-check whether the gate+up+GLU arm still has a
+  unique win before any future tuning.
+- **Block 15 is STAGED in `beta/block-15-campaign-wins/`**, NOT in the delivery
+  (`beta/block-15-campaign-wins/block-15-campaign-wins.patch`, beta patch tip `377f8e790`,
+  including the 2026-09-10 V5 and RDNA3_5 amendments).  Six wins,
   each with an env A/B gate (V4 is opt-in): W1 QSA score-chain (`GGML_QSA_SCORE_MEM`), W2 derived QSA bias
   + visibility + the input-fill null guards (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), W3 keys-only
   indexer cache (`LLAMA_QSA_KEYS_ONLY`), W4 ggml-alloc unused-view release (no gate; `ab/w4-revert.patch`),
@@ -22,11 +46,11 @@ Reality pass: 2026-09-10 (block 15 cut).
   host (V4 a further -744 (4B) / -632 (27B)); byte-identical same-seed output on all five models across
   every gate combination; MTP unchanged (27B 0.76744, qwen4exp 0.44262); ~1.3 % prefill / ~0.3 % decode
   (V4 ~1.7-1.9 % more, hence opt-in).  Combination-validated on the merged tree AND on the tree built from
-  the delivered patches (fresh worktree + build).  Records: `beta/block-15-campaign-wins/README.md`,
-  `patches/README.md` (2026-09-10 block-15 section), `WORKLOG.md`.
+  the beta patch on top of the 14-block tree (fresh worktree + build).  Records:
+  `beta/block-15-campaign-wins/README.md`, `WORKLOG.md`.
 - **Beta window open** (2026-09-10, ~4-5 days): tester material is `beta/block-15-campaign-wins/BETA-TESTING.md`.
   Promotion = declaring it stable; feedback that needs a change becomes a dated amendment to block 15.
-- **DONE (2026-09-10, D12 closed): V5 native bf16 K/V, folded into Block 15 as a dated amendment.**
+- **DONE (2026-09-10, D12 closed): V5 native bf16 K/V, folded into the beta Block 15 patch as a dated amendment.**
   bf16 was the last KV type paying the F16 staging scratch in prefill; the MMA loader now converts each
   16-byte staged chunk in registers (bit-identical to the launcher's own conversion), behind the **same
   `GGML_CUDA_FA_KV_NATIVE` switch as V4 (default 0, opt-in)**.  With it enabled a bf16 cache costs
@@ -61,10 +85,11 @@ Reality pass: 2026-09-10 (block 15 cut).
   than the 3 devices (one device gets a zero-extent share); it works on 1 GPU, on 2 GPUs and on 3 GPUs with
   `-sm layer`.  Every other model is unaffected.  A future block (or an upstream report) should make the
   splitter tolerate a zero-extent device share.  See `patches/README.md`.
-- **Fork/canonical state**: the working checkout's `rdna-boosts` (block 15 + V5 = `c3f58165b`) sits on a master
-  two commits newer than the fork point, so it must NOT be used for regeneration (it exports `f3f1a8f27`
-  + `304665fe7` as patches 0001/0002).  The canonical 15-block chain is the local branch
-  `block15-canonical` (`09a137566`, rebuilt at `9113cc188`); `make-patches.sh` default tip = `09a137566`.
+- **Fork/canonical state**: the working checkout's `rdna-boosts` is a local rebuild and must NOT be used
+  for regeneration if it sits on a master newer than the fork point (it would export `f3f1a8f27`
+  + `304665fe7` as patches 0001/0002).  The canonical 14-block chain used for the delivery ends at the
+  block-14 commit `ff2b35f49` (rebuilt at `9113cc188`); `make-patches.sh` default tip = `ff2b35f49`.
+  The beta block-15 patch is applied manually on top of that tree.
 - Superseded/still-useful artifacts: the work branch `wip/block15-campaign-wins` (`b26ae06f0`) and
   `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch` remain as the pre-merge
   record; the per-win patches/plans under `wip/arch-independent-memory/` + `wip/qwen4exp/qsa-memory/` are

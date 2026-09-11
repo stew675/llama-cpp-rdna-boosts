@@ -1,4 +1,4 @@
-From f5ab5350be1ece7bfe7b77c52ba536c592d453ca Mon Sep 17 00:00:00 2001
+From 377f8e790a498ccba153c74814d16402964c395c Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -141,6 +141,30 @@ Mixed K/V cache types (bf16+q8_0, f16+q8_0, either direction) remain a
 pre-existing trap, documented but not fixed here: the attention falls off
 the GPU kernel path (graph splits 18 vs 2, ~1.5 GiB host compute buffer,
 4B pp2048 7924 -> 640-1049 t/s).  Same-type K/V is the practical choice.
+
+2026-09-10 RDNA3_5 (gfx1151) amendment: V3 (derived kq mask) now
+engages on a ROCm/HIP iGPU.  The probe rejected
+GGML_BACKEND_DEVICE_TYPE_IGPU as "not the CUDA/HIP backend", so on
+Strix Halo V3 was silently disabled and its ~800 MiB compute + ~800 MiB
+host win was lost.  The device-type gate now accepts IGPU (the ROCm/HIP
+reg name is still required), and the derived form additionally requires
+a single KV stream: build_attn_mha derives the attention stream count
+from the KV tensor (k->ne[3] == the cache's n_stream), so with
+n_seq_max > 1 -- even for a single-sequence ubatch -- the derived tok_lo
+was built for one stream while Q was reshaped for n_seq_max streams and
+the shape assert in ggml_flash_attn_ext_add_kq_derived aborted context
+creation.  kq_mask_derivable() now rejects n_stream != 1, so a
+multi-slot context keeps the packed mask (no crash) and a single-stream
+context gets the win.
+
+Validated on Strix Halo (gfx1151, ROCm 7.14): V3 on/off byte-identical
+over 7 KV/arm configs x 16 runs x 129 tokens (2064 gate cells each);
+reserves reproduce the RDNA4 numbers exactly (4B ctx 204800/ub 2048:
+V3 -799.20 MiB compute / -799.21 host, V5 bf16 968.86 -> 256.86, V4 q8_0
+1001.13 -> 257.13); the derived test-backend-ops cases pass on ROCm0;
+and llama-server --parallel 4 (the config that aborted before) now
+serves and passes the 16-run gate.  Discrete GPUs are unaffected (they
+report GGML_BACKEND_DEVICE_TYPE_GPU and normally have n_stream == 1).
 ---
  ggml/include/ggml.h                  |  31 ++-
  ggml/src/ggml-alloc.c                |  35 ++++
@@ -155,17 +179,17 @@ the GPU kernel path (graph splits 18 vs 2, ~1.5 GiB host compute buffer,
  ggml/src/ggml-cuda/fattn.cu          |  51 +++--
  ggml/src/ggml-cuda/indexer-topk.cu   |  74 +++++--
  ggml/src/ggml.c                      |  99 +++++++--
- src/llama-context.cpp                | 119 ++++++++++-
+ src/llama-context.cpp                | 126 ++++++++++-
  src/llama-cparams.h                  |   2 +
  src/llama-graph.cpp                  | 183 +++++++++++-----
  src/llama-graph.h                    |  60 ++++++
- src/llama-kv-cache.cpp               | 180 +++++++++++++++-
+ src/llama-kv-cache.cpp               | 189 ++++++++++++++++-
  src/llama-kv-cache.h                 |  20 +-
  src/llama-memory-hybrid-idx.cpp      |  95 ++++++++-
  src/llama-memory-hybrid-idx.h        |  17 +-
  src/models/qwen4exp.cpp              | 303 +++++++++++++++++++++++----
  tests/test-backend-ops.cpp           |  49 ++++-
- 23 files changed, 1879 insertions(+), 215 deletions(-)
+ 23 files changed, 1895 insertions(+), 215 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 1a8e68103..8b9ebb315 100644
@@ -2016,7 +2040,7 @@ index 7ee2c06d8..5f6d2fb85 100644
  
      return result;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 505901964..631693f91 100644
+index 505901964..57ff5c8db 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -36,6 +36,18 @@ struct llm_fused_op_probe {
@@ -2038,7 +2062,7 @@ index 505901964..631693f91 100644
  };
  
  static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
-@@ -80,6 +92,62 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+@@ -80,6 +92,69 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
      /*.n_tokens_per_seq =*/ 1,
  };
  
@@ -2055,9 +2079,15 @@ index 505901964..631693f91 100644
 +};
 +
 +// the derived kq mask is implemented by the CUDA/HIP backend only - any other backend that accepts
-+// the flash attention op would silently ignore the derived sources
++// the flash attention op would silently ignore the derived sources.  An iGPU (APU) is still the
++// CUDA/HIP backend, so it implements the derived path too (the MMA kernel is the same one).
 +static bool ggml_backend_dev_is_cuda(ggml_backend_dev_t dev) {
-+    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
++    if (dev == nullptr) {
++        return false;
++    }
++
++    const auto type = ggml_backend_dev_type(dev);
++    if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
 +        return false;
 +    }
 +
@@ -2090,6 +2120,7 @@ index 505901964..631693f91 100644
 +
 +    switch (ggml_backend_dev_type(dev)) {
 +        case GGML_BACKEND_DEVICE_TYPE_GPU:
++        case GGML_BACKEND_DEVICE_TYPE_IGPU:
 +            return ggml_backend_dev_is_cuda(dev);
 +        case GGML_BACKEND_DEVICE_TYPE_META:
 +            return ggml_backend_cuda_family_available();
@@ -2101,7 +2132,7 @@ index 505901964..631693f91 100644
  llama_context::llama_context(
          const llama_model & model,
                llama_context_params params) :
-@@ -229,6 +297,19 @@ llama_context::llama_context(
+@@ -229,6 +304,19 @@ llama_context::llama_context(
      cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
      cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
  
@@ -2121,7 +2152,7 @@ index 505901964..631693f91 100644
      cparams.fused_gdn_ar = true;
      cparams.fused_gdn_ch = true;
      cparams.auto_fgdn    = false;
-@@ -527,19 +608,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -527,19 +615,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
              return;
          }
  
@@ -2147,7 +2178,7 @@ index 505901964..631693f91 100644
              GGML_ASSERT(node.il >= 0);
  
              ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
-@@ -559,6 +644,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -559,6 +651,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                  device_mismatch = true;
                  break;
              }
@@ -2177,7 +2208,7 @@ index 505901964..631693f91 100644
          }
  
          if (device_mismatch) {
-@@ -575,6 +683,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -575,6 +690,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
          cparams.auto_fa = false;
      }
  
@@ -2689,7 +2720,7 @@ index cc4110639..2002f63b2 100644
              llm_graph_input_attn_kv * inp,
              ggml_tensor * wo,
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index a342ee119..09fa3ea6d 100644
+index a342ee119..574294e51 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -79,8 +79,9 @@ llama_kv_cache::llama_kv_cache(
@@ -2713,7 +2744,7 @@ index a342ee119..09fa3ea6d 100644
  
          ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
          ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
-@@ -1785,6 +1786,169 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+@@ -1785,6 +1786,178 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
      //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
  }
  
@@ -2740,6 +2771,15 @@ index a342ee119..09fa3ea6d 100644
 +bool llama_kv_cache::kq_mask_derivable(const llama_ubatch & ubatch) const {
 +    // alibi writes a distance into the mask, that is a value, not a predicate
 +    if (hparams.use_alibi) {
++        return false;
++    }
++
++    // a single KV stream too: build_attn_mha derives the attention stream count from the KV tensor
++    // (k->ne[3] == the cache's n_stream), so a multi-stream cache (n_seq_max > 1 without kv_unified)
++    // cannot use the derived form even when the ubatch holds a single sequence.  Without this the
++    // derived tok_lo is built for one stream while Q is reshaped for n_seq_max streams and the
++    // shape assert in ggml_flash_attn_ext_add_kq_derived fires at context creation.
++    if (n_stream != 1) {
 +        return false;
 +    }
 +
@@ -2883,7 +2923,7 @@ index a342ee119..09fa3ea6d 100644
  void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
      const int64_t n_tokens = ubatch->n_tokens;
  
-@@ -2798,6 +2962,16 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
+@@ -2798,6 +2971,16 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
      kv->set_input_kq_mask(dst, ubatch, causal_attn);
  }
  

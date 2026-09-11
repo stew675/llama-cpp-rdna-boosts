@@ -1,7 +1,7 @@
 # WORKLOG — dated delivery records
 
 Reverse-chronological log of every delivery-affecting change to the
-**rdna-boosts 15-patch set** (block amendments, community-fix
+**rdna-boosts 14-patch set** (block amendments, community-fix
 integrations, re-baselines, regeneration + clean-apply re-verifications).
 Newest entry first.  The README's
 [Current state](README.md) section is a lean summary and points here
@@ -27,6 +27,60 @@ for the full record; per-block technical notes live in
   build 16 / commit `ee93ba5`) with `librccl.so.1` linked.  Registry
   `buildcache-*` tags (mode=max) carry the layer cache; `provenance: false`
   keeps each single-arch tag a plain image manifest.  See `CONTAINERS.md`.
+- **Block 15 un-promoted from the delivery — it belongs only in `beta/block-15-campaign-wins/`
+  (2026-09-10).**  Block 15 was promoted into `patches/0015` by mistake; the maintainer never
+  approved cutting it as a delivery patch.  The delivery is a **14-patch set** again
+  (`patches/0001`-`0014`, canonical tip `ff2b35f49`), `scripts/apply-all.sh` and
+  `scripts/make-patches.sh` are back to 14 blocks, `rdna-boosts-all.patch` is the 14-block net,
+  and the docs/headers no longer present Block 15 as delivered.  The block-15 work (including
+  the 2026-09-10 V5 and RDNA3_5/gfx1151 amendments) continues to live only in
+  `beta/block-15-campaign-wins/block-15-campaign-wins.patch` and is applied manually on top of
+  the 14-block tree, pending the maintainer's promotion go-ahead.  The `0001`-`0014` bodies are
+  unchanged from the promoted set; only the `From <sha>` line and the `[PATCH NN/15]` →
+  `[PATCH NN/14]` series count differ.  Clean-apply sim: fresh worktree at `9113cc188` +
+  `apply-all.sh` → strict 14/14 `git am`, zero whitespace warnings, applied tree `6ce36849` ==
+  the canonical 14-block tree.  (The dated entries below that say "cut" / "15-patch" record the
+  promotion as it happened; this entry reverses it.)
+
+- **RDNA3_5 (gfx1151) validation of the 14-block delivery + the beta block-15 patch; V3 iGPU enablement + multi-stream
+  guard folded into the beta block-15 patch (2026-09-10, single Strix Halo, ROCm 7.14).**  The first
+  single-device iGPU run of the delivery (Radeon 8060S, `VMM: no`, 1 device).  Block-14
+  masked-V fixes, V3 derived mask, V4 native q8_0 and V5 native bf16 were exercised with
+  a BF16 KV cache in both arm states, per the sign-leak campaign matrix.  Two V3
+  regressions found and fixed as a dated amendment to the **beta** block-15 patch (the delivery
+  stays 14 patches; beta patch tip `377f8e790`):
+  1. the derived-mask probe rejected `GGML_BACKEND_DEVICE_TYPE_IGPU`, so V3 was silently
+     disabled on the HIP iGPU and its ~800 MiB compute + ~800 MiB host win was lost;
+     `ggml_backend_dev_is_cuda()` / `ggml_backend_dev_implements_kq_derived()` now accept
+     `IGPU` (ROCm/CUDA reg name still required);
+  2. `n_seq_max > 1` aborted context creation in `ggml_flash_attn_ext_add_kq_derived`
+     (`GGML_ASSERT(tok_lo->ne[0] == a->src[0]->ne[1])`): `build_attn_mha` derives the
+     stream count from `k->ne[3]` (the cache's `n_stream` == `n_seq_max`), while
+     `kq_mask_derivable()` only checked `ubatch.n_seqs_unq`; it now rejects
+     `n_stream != 1`, so a multi-slot context keeps the packed mask (no abort) and a
+     single-stream context keeps the win.  `llama-server --parallel 4`, which aborted on
+     the pre-amendment tree, now serves and passes the 16-run gate.
+  Validation on the amended tree: reserves reproduce the RDNA4 block-15 numbers exactly
+  (4B ctx 204800/ub 2048 V3 −799.20 compute / −799.21 host, V5 bf16 968.86 → 256.86,
+  V4 q8_0 1001.13 → 257.13; 27B f16/bf16/q8_0 488.86 / 1072.86→488.86 /
+  1121.13→489.13; Flash-Next W on 3251.39/63.69 indexer 318.76, W off 6690.40/1262.70
+  indexer 956.26).  Determinism: 14 ROCm + 7 Vulkan gate runs PASS 16/16, V3 on vs off
+  byte-identical over 7 × 2064 cells, bf16 arm on/off (V5), q8_0 arm on/off (V4) and
+  q4_0 arm on/off byte-identical; bf16 vs f16 differs only by cache precision.  Isolated
+  probes clean in both arms on both backends (ROCm bf16 34/34, f16 36/36, Vulkan
+  bf16/f16 36/36; only the documented deterministic live-cell bf16 diag ≤1.1e-13).
+  `test-backend-ops` FLASH_ATTN_EXT 4596/4596 ROCm0 (FA_ALL_QUANTS=OFF; 5 derived cases
+  OK) + 7859/7859 CPU, `test-alloc`/`test-batch-alloc` pass, W4 repro 16.00 MiB.  MTP
+  acceptance identical V3 on/off and arm on/off (27B 0.79762, Flash-Next draft 0.52727).
+  Arm cost on gfx1151 is *lower* than RDNA4 — V5 −0.4…−0.9 % prefill, V4 **+2.6 %** at
+  pp20480, decode ±0.1 % (the large MALL absorbs the interleaved-view re-reads); V3
+  ~−3.2 % pp20480.  Clean-apply sim: fresh worktree at `9113cc188` + `apply-all.sh` →
+  strict 15/15 `git am`, zero whitespace warnings, applied tree `6f5d23b5` == amended
+  canonical.  Block-13 fused MoE re-check on Q3_K_M: the isolated
+  `GGML_CUDA_DISABLE_MOE_MMQ_FUSION` delta is ~0 on this build (fusion fires, coherence
+  holds, decode untouched) — absolute prefill is ~10–13 % above the 2026-09-05 record,
+  consistent with the 2026-09-06 model-neutral Strix folds capturing the same work.
+  Raw matrix: `wip/strix-halo/GATE-2026-09-10-block15-rdna35.md`.
 
 - **V5 native bf16 K/V folded into Block 15 (opt-in, same switch as V4) — D12 closed
   (2026-09-10).**  The bf16 lever is implemented, validated and packaged as a **dated

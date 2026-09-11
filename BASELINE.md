@@ -1,7 +1,7 @@
 # BASELINE - provenance and drift policy
 
-Current state: `main` is the delivery branch carrying the **15-patch set**
-(blocks 01-15) generated against the fork
+Current state: `main` is the delivery branch carrying the **14-patch set**
+(blocks 01-14) generated against the fork
 point **llama.cpp master `9113cc188`** (re-based 2026-09-08 from
 `050dde50c`, itself re-based 2026-09-07 from `465e49b9c`, itself
 re-based 2026-09-06 from `9cffdcc80`, itself re-based
@@ -24,14 +24,16 @@ at `192067b72`), `baseline/d222767c7` (validated against `d222767c7`) and
 ## Baseline (current delivery)
 
 
-All 15 patches are generated against **llama.cpp upstream master at
+All 14 patches are generated against **llama.cpp upstream master at
 `9113cc188`** (re-based 2026-09-08 from `050dde50c`, itself re-based
 2026-09-07 from `465e49b9c`, itself re-based
 2026-09-06 from `9cffdcc80`, itself re-based
 2026-09-02 from `0eadefebd`; dated records at the
-bottom of this file): blocks 01-15 = the fork's `rdna-boosts` block
-commits on `9113cc188` (block 15, the attention-memory campaign wins, is
-the canonical-fork tip `f5ab5350b` (the block-15 commit, amended 2026-09-10 with V5 native bf16 K/V; the pre-amendment cut was `09a137566`); the reference `~/llama.cpp`
+bottom of this file): blocks 01-14 = the fork's `rdna-boosts` block
+commits on `9113cc188` (the canonical 14-block tip is block 14
+`b425aa8f7`; **block 15, the attention-memory campaign, is NOT part of the
+delivery** -- it is staged in `beta/block-15-campaign-wins/` and applied
+manually, see `patches/README.md` and `WORKLOG.md`); the reference `~/llama.cpp`
 `rdna-boosts` branch is *disposable* and had at cut time drifted two
 upstream master commits past the fork point — `f3f1a8f27` (iGPU lazy-
 load default) and `304665fe7` (SYCL IQ-type-for-MoE), both dated after
@@ -39,8 +41,7 @@ load default) and `304665fe7` (SYCL IQ-type-for-MoE), both dated after
 wrongly export those two upstream commits as patches 0001/0002.
 **Always regenerate from a canonical fork rebuilt at `9113cc188` via
 `scripts/apply-all.sh`** (that is what `make-patches.sh`'s default tip
-`f5ab5350b` refers to, kept alive by the fork checkout's local branch
-`block15-canonical`).  The two commits' content is 106 lines in 3 files
+`b425aa8f7` refers to).  The two commits' content is 106 lines in 3 files
 (`ggml/src/ggml-sycl/mmvq.cpp`, `ggml/src/ggml-sycl/vecdotq.hpp`,
 `src/llama-model.cpp`) and is deliberately **not** in the delivery — it
 is upstream code past the recorded fork point; it does not touch any
@@ -163,10 +164,9 @@ to apply against a newer upstream master:
    master and continue.
 3. Do NOT hand-edit the committed patches as the permanent fix: when more
    than one block needs manual re-base hunks, regenerate the whole set from
-   the fork with `scripts/make-patches.sh` (re-exports blocks 01-15 from
+   the fork with `scripts/make-patches.sh` (re-exports blocks 01-14 from
    `9113cc188..<blocks-tip>`; defaults target
-the current blocks tip `27485f1ca` — the 2026-09-10 regeneration
-was run against tip `ff2b35f49`), then re-verify the clean-apply
+the current 14-block tip `b425aa8f7`), then re-verify the clean-apply
 simulation (fresh worktree at the new fork point, `scripts/apply-all.sh`,
 build, coherence) and update the fork point + verification numbers in
 `patches/README.md` and `README.md`.
