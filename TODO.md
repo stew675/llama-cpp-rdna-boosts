@@ -401,7 +401,14 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   holds.  Discovered and fixed on the way: qwen4exp + a *quantized* KV type + `-sm tensor` aborted in
   the meta splitter (**`q4_0` too, pre-existing**) because the graph built the fused QSA op for a type
   it cannot read; block 14 now takes the dense masked path for non-QSA-native cache types, and the
-  tensor-split gate asks `llama_kv_type_has_native_fa()`.  **Step 1's brief (kept for the record):**
+  tensor-split gate asks `llama_kv_type_has_native_fa()`.  Two follow-ups it left behind: (a) on
+  qwen4exp, quantized caches now use the **masked-dense prefill** for the indexer layers instead of the
+  fused sparse QSA op — restoring it needs `fattn-qsa` to read those types natively (the same work as
+  step 2), see the third 2026-09-11 block-14 amendment section in `patches/README.md`; (b) the *other*
+  backends (NVIDIA) reach the vec family for these types at small `n_q`, where the F1-style
+  VEC-vs-TILE band split still exists upstream — not touched here (the fork's band guarantee is
+  gfx1201's TILE path), worth revisiting if the fork is ever validated on NVIDIA.
+  **Step 1's brief (kept for the record):**
   `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-f3-kv-diagonals.md`.  It
   also records what is *verified* versus still *open* about the mechanism: the HIP CMake globs the
   TILE/MMA instances unconditionally and gates only VEC, the TILE **launcher converts every non-f16

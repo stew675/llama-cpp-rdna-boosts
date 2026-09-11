@@ -188,7 +188,11 @@ cache type, so those types take the dense masked path (exactly `LLAMA_QSA_SPARSE
 the A/B knob, and which is a no-op numerically for the gfx1201 decode band — the arch policy was
 already dense there, and the `q4_1` probe hash is identical with and without it).  `LLAMA_QSA_OFF=1`
 (a plain-dense reference) and `-sm layer` both avoided the abort too, which is how the mechanism was
-localised.
+localised.  Consequence to keep in mind: with a quantized cache on qwen4exp the **prefill** attention
+of the indexer layers runs masked-dense instead of the fused sparse op (the decode band was already
+dense there by arch policy, so its logits are unchanged — the `q4_1` probe hash is identical with and
+without `LLAMA_QSA_SPARSE_FA=0`).  Restoring the fused sparse prefill for those types means teaching
+`fattn-qsa` to read them (the same work item as F3 step 2's `iq4_nl`), not reverting this gate.
 
 **2. The tensor-split gate is narrowed.**  `llama_init_from_model` (`src/llama-context.cpp`) rejects,
 for `SPLIT_MODE_TENSOR` with a Meta device, any quantized KV type outside `{q4_0, q8_0}` — it cannot
