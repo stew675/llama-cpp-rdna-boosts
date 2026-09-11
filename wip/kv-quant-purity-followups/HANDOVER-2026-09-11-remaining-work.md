@@ -409,13 +409,34 @@ adaptive-MTP gate: acceptance `0.58378` not below, MTP ≥ plain (Protocol A in
 `ggml_cuda_fattn_kv_type_supported()` (no native path ⇒ F16 staging scratch). `iq4_nl` is the
 standout: same 1800 MiB as `q4_0`, pure, 3.4× slow — a native `iq4_nl` would obsolete `q4_0`.
 
-* The mechanism already exists in **block 15** (the shared `FATTN_KV_NATIVE_{NONE,Q8_0,BF16}`
-  per-operand staging type code, `GGML_CUDA_FA_KV_NATIVE`) — so this either rides on block-15's
-  promotion or reimplements it in a delivery block.
-* **First experiment is a build A/B** (`-DGGML_CUDA_FA_ALL_QUANTS=ON`), not a new kernel: measure the
-  reserve deltas and the pp/tg speed for each type, then decide which types deserve a native path.
-* Any new native path must be **width-invariant by construction** (F1 was exactly a native-path band
-  split). Validate with §4.1 across `W = 1..8` on both splits, and re-check the `n_max <= 7` guarantee.
+**Reconnaissance (done 2026-09-11 — read this before building anything):**
+
+* **The build flag only covers three of the four types.**  `ggml_cuda_fattn_kv_type_supported()`
+  (`fattn.cu:471`) lists `q4_1/q5_0/q5_1` behind `#ifndef GGML_CUDA_FA_ALL_QUANTS` and
+  `iq4_nl` under `default: return false` — so `-DGGML_CUDA_FA_ALL_QUANTS=ON` makes those three
+  native and **cannot** help `iq4_nl`.  All 49 combinations of {bf16,f16,q4_0,q4_1,q5_0,q5_1,q8_0}²
+  already have TUs (`template-instances/fattn-vec-instance-*.cu`, gated in
+  `ggml/src/ggml-hip/CMakeLists.txt`); **no `iq4_nl` instance exists**.
+* **`iq4_nl` is asymmetric, and the V side is the work.**  K only needs a q8_1 dot and
+  `vec_dot_iq4_nl_q8_1` exists (`vecdotq.cuh:1580`, `VDR_IQ4_NL_Q8_1_MMVQ 2`); V needs a *dequantize*
+  to f16 and there is **no CUDA `dequantize_iq4_nl`** (the type appears only in mmq/mmvq/set-rows/
+  ggml-cuda.cu).  **Mixed K/V types are a rejected configuration** (2026-09-11), so an `iq4_nl` KV
+  cache needs both sides: dequant kernel + template instances (`generate_cu_files.py`) + the
+  staging-type plumbing + the supported list — hours-to-a-day, and an upstream-able PR.
+* **`FA_ALL_QUANTS` is a LONG build.**  It compiles 45 extra fattn-vec instance TUs; the FA TUs are
+  memory-hungry, so budget 1-3 h and use `-j6`..`-j8` (not `-j16` — RAM).  Do it in a *separate* build
+  dir (`/tmp/canon-llama/build-faall`) so the canonical `build-base` stays usable.
+* **The experiment, in order**: (1) the build above; (2) the type matrix — reserve delta + pp/tg at
+  `pl=1` for {f16, bf16, q8_0, q4_0, q4_1, q5_0, q5_1, iq4_nl}; (3) **the width-purity probe for the
+  newly-native types** (`q4_1/q5_0/q5_1`, both splits, `W=1..8`, `RS=0` and `RS=from_w`) — a native FA
+  path is exactly how F1 (§14) split the band, so a newly enabled type must be band-uniform *before*
+  it is offered; (4) decide: ship `FA_ALL_QUANTS` as a documented build option and/or scope the
+  `iq4_nl` native path.
+* **Accuracy direction (§19):** these types are *lower precision than `q8_0`*, so F3 is a **memory
+  play**, not an MTP-accuracy one — compare `iq4_nl` KV against `q4_0` (same 1800 MiB) rather than
+  against `q8_0`.
+ The block-15 `FATTN_KV_NATIVE` staging code is the mechanism to reuse if this becomes a delivery block
+ (block 15 is beta-only, so either ride its promotion or reimplement).
 
 ## 9. ITEM 3 — block-15 promotion (time-gated)
 

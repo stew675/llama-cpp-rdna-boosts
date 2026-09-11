@@ -380,7 +380,22 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   k-block loop (one weight read per `(row)` block, per-token accumulators), which stays bit-identical
   per token.  Not a purity issue — every width already takes the fused path.
 
-- **gfx1151: re-evaluate the QSA crossover (new, 2026-09-11, purity-first).**  The published 64K
+- **F3 (memory play, not an accuracy one — see GREEDY-PURITY.md §19): sub-`q8_0` KV quant parity.**
+  Reconnaissance done 2026-09-11: `-DGGML_CUDA_FA_ALL_QUANTS=ON` enables native paths for
+  **q4_1/q5_0/q5_1 only** (the flag gates those three in `ggml_cuda_fattn_kv_type_supported()`, and the
+  49 `fattn-vec-instance-*` TUs already exist), while **`iq4_nl` cannot be helped by it** (`default:
+  return false`; no iq4_nl instance exists).  For `iq4_nl` the K side is ready
+  (`vec_dot_iq4_nl_q8_1`, `vecdotq.cuh:1580`) but the V side needs a dequantize to f16 and there is
+  **no CUDA `dequantize_iq4_nl`** — and since mixed K/V types are rejected, that is a real
+  dequant+instances+staging job (upstream-able).  Plan + build-cost warning in the handover §8.
+  Details of the type: q4_1/q5_0/q5_1/iq4_nl
+  are pure and 1800–2400 MiB (vs 3400 q8_0 / 6400 f16) but run 2197–2293 pp512 / 56–64 tg32 versus
+  7713–7838 / 95–99, because they have no native FA path (F16 staging scratch).  Block 15 already
+  ships the mechanism (the shared `FATTN_KV_NATIVE_{NONE,Q8_0,BF16}` per-operand staging type code);
+  extend it with these types.  **iq4_nl is the standout: same 1800 MiB as q4_0, pure, 3.4x slow — a
+  native iq4_nl would dominate/obsolete q4_0.**  Any new native path must be **width-invariant by
+  construction** (F1 and F3 must be designed together, not sequentially).
+- **gfx1151 bundle (deprioritised 2026-09-11 at the maintainer's request — gfx1201 first): re-evaluate the QSA crossover + the §18 sparse-regime items.**  The published 64K
   "dense below, QSA above" crossover was measured for the **W=1 decode** regime, whose arm is
   unchanged by the band fix (W=1 took the dense arm before and after — the plain stream that moved on
   gfx1201 did so because of a 4-token prompt-tail batch, not its decode), so the *decode* table still
@@ -391,13 +406,6 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   every depth on gfx1151 too** (a one-line policy change in `build_layer_attn`) until §18's two items
   are fixed; measure the MTP crossover on the Strix Halo box either way before changing the constant.
 
-- **F3 (performance, biggest available win): sub-`q8_0` KV quant parity.**  q4_1/q5_0/q5_1/iq4_nl
-  are pure and 1800–2400 MiB (vs 3400 q8_0 / 6400 f16) but run 2197–2293 pp512 / 56–64 tg32 versus
-  7713–7838 / 95–99, because they have no native FA path (F16 staging scratch).  Block 15 already
-  ships the mechanism (the shared `FATTN_KV_NATIVE_{NONE,Q8_0,BF16}` per-operand staging type code);
-  extend it with these types.  **iq4_nl is the standout: same 1800 MiB as q4_0, pure, 3.4x slow — a
-  native iq4_nl would dominate/obsolete q4_0.**  Any new native path must be **width-invariant by
-  construction** (F1 and F3 must be designed together, not sequentially).
 - **Policy (maintainer decision 2026-09-11): reject differing K/V cache *types* as an accepted
   limitation.**  Every mixed pair is 1.7–3.6x slower than the same-type equivalent and never smaller
   (pp512 2152–4476 vs 7713–7838); upstream already enforces same-K/V for DeepSeek V4 (#25871).
