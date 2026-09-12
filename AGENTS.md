@@ -475,12 +475,22 @@ Consequences, so it is not re-litigated:
   same text with `GGML_CUDA_QSA_INDEXER_SCORE`/`_CACHE` default vs 0), the pre-fix
   divergence reproduces only with `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1`,
   and **default gfx1151 configs are pure** (shallow dense on every KV type, deep sparse
-  at ~74K on f16 and q8_0).  The 64K crossover stays.  **One residual is open and
-  unlocalised:** a prompt-dependent q8_0 width dependence in the *forced*-sparse
-  shallow regime (`plain a57bc13bbf2a` vs `n3 3124adfd2b94`, `/tmp/p5000.txt`), which
-  `LLAMA_QSA_SPARSE_FA=0` does not fix and `GGML_CUDA_DISABLE_FUSION=1` /
-  `GGML_CUDA_GDN_CHUNKED=0` perturb to purity; tracked as TODO item 4.  See
-  `GREEDY-PURITY.md` §§16-18 and `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`.
+  at ~74K on f16 and q8_0).  The 64K crossover stays.  **One residual is open** — a
+  prompt-dependent q8_0 dependence in the *forced*-sparse shallow regime
+  (`plain a57bc13bbf2a` vs `n3 3124adfd2b94`, `/tmp/p5000.txt`).  Deep dive 2026-09-12 (6):
+  it is **not** a width dependence (teacher-forced replay at every verify width, with
+  rollback schedules and unrelated rolled-back tokens, is bit-pure over 200 positions;
+  the snapshot rollback restore is exact) and `GGML_CUDA_DISABLE_FUSION=1` /
+  `GGML_CUDA_GDN_CHUNKED=0` only "reconcile" by perturbing the trajectory (GDN_CHUNKED=0
+  moves the *plain* stream at char 49; the chunked-GDN call sequence is identical between
+  the runs).  The one measurable plain-vs-MTP structural difference is the MTP target's
+  `embeddings_nextn` export (`common/speculative.cpp:1431`), which defers qwen4exp's
+  last-layer output gather (`gather_now`, `src/models/qwen4exp.cpp`) and shifts the
+  **prefill's last-position logits by a ULP** (`ad3acaa7…` vs `b624a79f…`) — a real
+  logits-level violation of `plain == draft-mtp`, tracked as TODO item 4(a).  The
+  token-level divergence itself (item 4(b)) needs a faithful mini-MTP driver (target +
+  draft, per-step target-logit dump).  See `GREEDY-PURITY.md` §§16-18 and
+  `wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`.
 - The one-sided AR wait (dev0/bus-06 dispatch-gap asymmetry, ~12.7 µs/call)
   is a **platform-level CP/driver property**, not reachable from the AR
   kernel, graph tail, or host-side pacing — fusion/pacing are CLOSED
