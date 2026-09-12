@@ -37,6 +37,14 @@ pre-amendment `main` patches, amended block 13 (`f5d0cdd25`), replayed block 14 
 `From`/`index`/hunk-header lines, only block 13's body changed.  `rdna-boosts-all.patch` regenerated
 (`git diff 9113cc188 13af95ac1`) and verified equal to the regenerated `patches/` applied at the base.
 
+**Beta block-15 re-cut (12th).**  Re-cut on this base: base `13af95ac1`, beta tip `888a59ee0`, tree
+`476d2d1e95947de7cc8cd806c40efc0f01927cd3`; the exported patch is byte-identical to the 11th re-cut
+apart from the `From <sha>` line (block 13's amendment touches only `ggml-cuda.cu`/`mmvq.cu`, which the
+block-15 patch does not touch), and strict `git am` applies.  Beta-tree revalidation: build clean;
+width probe `W = 1,4,8` one hash on qwen4exp f16 (`453eaa61`) / q8_0 (`113696b9`); a same-seed greedy
+run is byte-identical delivery-vs-beta; `FLASH_ATTN_QSA` + `GATED_DELTA_NET` pass.  See
+`beta/block-15-campaign-wins/BETA-TESTING.md` (12th-re-cut section).
+
 ## 2026-09-12 — block 13: the fused shared-expert epilogue is column-blocked (the item-5 cost repaid), and the routed-compact MoE MMQ claim re-verified
 
 **Canonical tip `124abba9e`** (tree `d7c8e8984b8bd65838d8ae58c0f5de449d9c5d4d`), 15 blocks, clean-apply

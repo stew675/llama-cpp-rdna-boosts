@@ -229,9 +229,13 @@ standalone arithmetic and so broke `W=1` decode vs `W>=2` verify bit-identity.  
 patch applies with strict `git am` and is byte-identical to the eleventh re-cut except the `From <sha>`
 line (the changed files, `ggml-cuda.cu`/`mmvq.cu`, are absent from this patch).
 
-**Nothing in the tester checklist changes** — the gate table above is unaffected, and the amendment was
-validated on the delivery itself (`W = 1,2,4,8` one hash per config: qwen4exp f16 `453eaa61`, q8_0
-`113696b9`, MoE `18999a78`).
+**Revalidation (2026-09-12 (2), this re-cut's tree).**  The beta tree builds clean (`build-rocm`,
+gfx1151); the width probe on the **beta** tree gives `W = 1,4,8` one hash per config (qwen4exp f16
+`453eaa618738273d`, q8_0 `113696b9d3eff98c`); a same-seed 24-token `llama-cli` greedy run is
+**byte-identical between the delivery and the beta tree** (the only diff is the build-SHA and timing
+lines); `test-backend-ops -o FLASH_ATTN_QSA` and `-o GATED_DELTA_NET` both pass.  **Nothing in the
+tester checklist changes** — the gate table above is unaffected (the amendment was also validated on
+the delivery itself: qwen4exp f16 `453eaa61`, q8_0 `113696b9`, MoE `18999a78` at `W = 1,2,4,8`).
 
 ## 2026-09-12 — eleventh re-cut: block 13's column-blocked shared-expert epilogue
 
