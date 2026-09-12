@@ -118,6 +118,9 @@ Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
     (acceptance gate).  Same box as item 5(e).
   * gfx1151 (`halo`): Phase 3's cross-arch fingerprint check (gfx1201 == gfx1151 numerics) — a
     verification goal, not a port; also item 4's §18 items and item 7's MTP crossover re-measure.
+- **Next session's brief: `wip/items-6-10-wrapup/HANDOVER-2026-09-12-items-6-and-10.md`** (with item
+  10; it defines the concrete probe: routed ON vs OFF must be byte-identical on qwen4exp — the model
+  that actually takes the routed path — and inert on the 35B-A3B Q4_K_M, i.e. the fallback control).
 - **Tracker hygiene:** the plan's own open checkboxes are **stale** (Phase 1 is complete and the doc
   predates qwen4exp's promotion to block 14); read the banner at the top of
   `wip/qwen4exp/gfx1201-porting.md` before trusting them.
@@ -165,6 +168,10 @@ the single-token reduction order so decode == verify; the unfused chain stays on
   disable the fusion above some width — the `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` path makes "decode and
   verify differ, as before the 2026-09-11 band amendment", i.e. it is the *forbidden* (impure) route.
   Not a purity issue if done as described.  Where: block 13.
+- **Next session's brief (the main task): `wip/items-6-10-wrapup/HANDOVER-2026-09-12-items-6-and-10.md`**
+  — it carries the item-10 measurement command (the fused-vs-unfused `llama-batched-bench` A/B), the
+  fix recipe, the gate list and the landing flow (block-13 amendment ⇒ regeneration ⇒ an 11th beta
+  re-cut).
 
 ### 11. MXFP4 (and NVFP4) fused gate+up+GLU MMQ — the last block-13 item
 - `ggml_cuda_mul_mat_q_switch_type_gate` is instantiated for Q3_K/Q4_K/Q5_K/Q8_0/Q6_K only, so the
