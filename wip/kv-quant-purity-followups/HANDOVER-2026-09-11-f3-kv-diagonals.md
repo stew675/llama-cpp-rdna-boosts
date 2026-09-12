@@ -277,7 +277,7 @@ step 2 (`iq4_nl`) comes after it and ends in the same place.
 > backend-op test** and the **perplexity-against-dense** quality gate, both of which step 2 below must
 > also pass.  Step 2's shape is unchanged.
 
-**What is left here: step 2 = `iq4_nl`.**  It is *not* the same shape as step 1: `iq4_nl` is rejected by
+**What is left here: step 2 = `iq4_nl`** — it now has its own brief: **`HANDOVER-2026-09-11-f3-step2-iq4_nl.md`** (verified code sites, the measured pre-state, the generator trap, the gate list).  It is *not* the same shape as step 1: `iq4_nl` is rejected by
 `ggml_cuda_fattn_kv_type_supported()`'s `default:` clause (so the predicate change above does not reach
 it), it has no vec instance, and — the real work — **no V-side dequant**: the seven
 `dequantize_V_*` in `fattn-common.cuh` stop at `q8_0`.  So step 2 = `dequantize_V_iq4_nl` + a

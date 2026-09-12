@@ -70,6 +70,13 @@ working diff — it is the tip, so no rebase), `scripts/make-patches.sh` default
 extended type conjunct; `fattn-qsa.cu`/`ops.cpp`/`test-backend-ops.cpp` auto-merged), beta patch
 re-exported (3 774 lines, subject `[PATCH 15/15]`, round-trip verified).
 
+**Next session's task (F3 step 2, `iq4_nl`) has its brief**:
+`wip/kv-quant-purity-followups/HANDOVER-2026-09-11-f3-step2-iq4_nl.md` — the same two-block shape
+(block 08 for the dense FA enablement, block 14 for QSA + the CPU oracle + the test), with the measured
+pre-state (`-ctk iq4_nl` on the 4B is 2269.8 pp512 / 48.5 tg32 today because FA is disabled for the
+whole context) and the prize (`iq4_nl` is the smallest KV cache of the set: 288 MiB vs f16's 1024 at
+c=32768 on the 4B).
+
 **Also recorded**: `AGENTS.md` gained the "RDNA first, other backends uninjured" scope policy (the F1
 VEC arms stay as they are — AMD can't reach them, NVIDIA has its own maintainers) and the QSA-oracle
 critical fact; `patches/README.md` gained the fourth-amendment section; `GREEDY-PURITY.md` §21 records

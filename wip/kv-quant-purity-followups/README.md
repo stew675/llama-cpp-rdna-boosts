@@ -7,9 +7,11 @@
 > heads for qwen4exp's gqa 12; perplexity 7.33 -> 6.53 = the dense oracle).  That brief also carries the
 > instrument lessons (the width-purity matrix is blind to a width-uniform corruption; the probe never ran
 > the op by default; MTP acceptance points the wrong way) — they are now in `../../GREEDY-PURITY.md` §21.
-> **Starting the F3 (KV-diagonal) work?** Read
-> **`HANDOVER-2026-09-11-f3-kv-diagonals.md`** — scope, the verified-vs-open mechanism facts, and the
-> "instrument before coding" first task.  **Starting anything else?** Read
+> **Starting the F3 (KV-diagonal) work?** Step 1 is done; **step 2 (`iq4_nl`) is the current task and has
+> its own brief: `HANDOVER-2026-09-11-f3-step2-iq4_nl.md`** (the two-block amendment, the verified code
+> sites, the generator trap, the measured pre-state and the tensor-tuned perf/gate list).  Step 1's
+> mechanism record stays in **`HANDOVER-2026-09-11-f3-kv-diagonals.md`** — scope, the verified-vs-open
+> facts, and the "instrument before coding" first task.  **Starting anything else?** Read
 > **`HANDOVER-2026-09-11-remaining-work.md`** in this directory first — it is the self-contained plan
 > for the remaining work (item order, environment, binary/probe locations, instruments, reference
 > hashes, the exact code sites for the first two items, the landing procedure and the trap list).

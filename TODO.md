@@ -416,7 +416,10 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   `FLASH_ATTN_QSA` backend-op test (18 cases) were added (see `GREEDY-PURITY.md` §21 for the
   instruments and the "why it survived" analysis).  Follow-ups it left behind: (i) **F3 step 2 =
   `iq4_nl`** (the same shape: `dequantize_V_iq4_nl` + the predicate/instance/`qsa_kv_native` entries +
-  the same sweeps); (ii) the QSA **prefill** sparse-vs-dense crossover is not depth-configurable today
+  the same sweeps) — **it is the next session's task and has its own brief:
+  `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-f3-step2-iq4_nl.md`** (measured pre-state
+  2269.8/48.5 pp512/tg32 on the 4B -> ~7700/95 expected; the 288 MiB smallest-cache win; the
+  `TYPES_KV`/generator trap; the two-block amendment); (ii) the QSA **prefill** sparse-vs-dense crossover is not depth-configurable today
   (measured on the reference `-sm tensor`: dense wins pp8192 by ~4.7 %, parity at pp16384, sparse wins
   pp32768 by +14.5 %), so a `LLAMA_QSA_DENSE_PREFILL_UNTIL`-style gate is the natural next knob —
   tensor-tuned, per the maintainer's rule that the crossover policy follows the tensor split; (iii) the
