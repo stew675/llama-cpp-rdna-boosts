@@ -75,7 +75,9 @@ crossover stays.
   * **(b) the char-458 token divergence itself** — driver-level; needs a faithful mini-MTP driver
     (target + draft contexts, `embeddings_nextn`, real proposals + driver rollback, per-step target-logit
     dump) to find the first step whose logits differ.  Everything cheaper is exhausted.
-  Instruments: `wip/strix-halo/qsa-item4/{mstep,rbprobe}.cpp`; record
+  Instruments: `wip/strix-halo/qsa-item4/` (`README.md` = the harness + build/repro command lines;
+  `mstep.cpp`, `rbprobe.cpp`, `logits-dump-kv-long.cpp`, `gate.sh`, `nmax.sh`, `p5000.txt` — made durable
+  in-repo 2026-09-12 (11)); record
   `wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md` (the earlier disposition is
   `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`); analysis `GREEDY-PURITY.md` §18.
 
