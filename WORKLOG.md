@@ -1,5 +1,27 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-12 (8) — TODO triage: Active cut from 13 items to 3, item 11 closed with a measurement
+
+No delivery change (one experiment implemented, measured and **reverted**).
+
+- **Item 11 (MXFP4/NVFP4 fused gate+up+GLU MMQ) attempted and closed — the type-list edit is a no-op.**
+  Implemented the planned change (`GGML_TYPE_MXFP4` in `MMQ_GATE_TYPES` + the generated gate instance, the
+  `ggml_cuda_mul_mat_q_switch_type_gate` case, `moe_mmq_type`), built it, and instrumented the gate case
+  with a one-shot counter: **0 firings** over a full `gpt-oss-20b-MXFP4` prefill with the arm enabled.
+  The model's MoE graph is the expert-bias `{MUL_MAT_ID, ADD_ID, MUL_MAT_ID, ADD_ID, GLU}` pattern, whose
+  only fused arm is the **mmvq/decode** one — there is no MMQ (prefill) fused arm for it and the MMQ
+  fused epilogue has no `x_bias`/`gate_bias`/scale support.  Perf ~0 (pp2048 1741.3 vs 1742.0 t/s,
+  pp16384 1506.7 vs 1501.6, fused vs `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1`), same-seed text byte-identical.
+  Experiment reverted; `wip`-free.  Side finding: `generate_cu_files.py`'s `SOURCE_MMQ_GATE` re-emits the
+  file header on append, so re-running the generator mutates the 5 committed gate instance files.
+- **TODO restructure (the point of the session):** Active is now only what this repo will work on next —
+  items **3** (`iq4_nl` prefill), **4** (QSA sparse residual + the `embeddings_nextn` logits caveat) and
+  **9** (QSA knobs).  Items 1/6/8/12 → *Waiting on others* (maintainer go-ahead, other hardware, upstream
+  filing); 5(c)/5(d)/5(g)/13 → *accepted limitations* (item 5(d): the mmq `sum[]` overflow is latent — no
+  upstream config violates `I >= nwarps*16`, so there is no reproducer to file); 5(a)/5(b)/15/16 →
+  *Parked*; item 14 → *Closed* (canonical chain re-verified at `13af95ac1`).  No item content was deleted —
+  every moved item keeps its body under the new heading, and the details stay in the dated records.
+
 ## 2026-09-12 (7) — item 16 re-scoped (the "pin" plan is a dead end) and item 15's `-Wshadow` audit
 
 No delivery change.

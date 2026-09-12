@@ -14,38 +14,12 @@ KV-quant purity/parity campaign) are **all closed** — every KV cache type the 
 width-pure and takes the f16 attention path — and so is the gfx1151 within-band mmvq fusion variance
 (block-13 amendment, 2026-09-12; see Closed).  The QSA *sparse* regime was re-measured on gfx1151
 2026-09-12: default configs are pure (item 7 closed); one prompt-dependent **q8_0** forced-sparse
-residual is tracked in item 4.
+residual is tracked in item 4.  **Triaged 2026-09-12 (8)**: the Active list is now **three items** (3, 4,
+9); items 1/6/8/12 moved to *Waiting on others*, items 5(c)/5(d)/5(g)/13 to *accepted limitations*, items
+5(a)/5(b)/15/16 to *Parked*, and items 11 (MXFP4 fused gate — unreachable for the available MXFP4 MoE)
+and 14 (canonical-fork hygiene — verified) to *Closed*.
 
-## Active
-
-### 1. Block 15 promotion — **UNBLOCKED** (waiting on the beta window + the maintainer's go-ahead)
-- **Live state:** the 12th re-cut is on the current base (`13af95ac1` → beta tip **`888a59ee0`**, tree
-  **`476d2d1e95947de7cc8cd806c40efc0f01927cd3`**); it builds clean, applies strict `git am`, and
-  revalidates (width probe `W = 1,4,8` one hash, same-seed greedy byte-identical delivery-vs-beta,
-  `FLASH_ATTN_QSA` + `GATED_DELTA_NET` pass).  The dense-arm blocker and its fix are closed — see the
-  Closed section; the cut is in `beta/block-15-campaign-wins/` (BETA-TESTING.md 12th-re-cut section).
-- **Now gating the promotion:** only the ~4–5 day beta window + the maintainer's go-ahead.  Six wins, gates:
-  W1 `GGML_QSA_SCORE_MEM`, W2 `GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`, W3 `LLAMA_QSA_KEYS_ONLY`,
-  W4 (no gate; `ab/w4-revert.patch`), V3 `LLAMA_KQ_MASK_DERIVED`, V4+V5 `GGML_CUDA_FA_KV_NATIVE` (opt-in).
-  Tester material: `BETA-TESTING.md` — its gate list now includes the perplexity oracle
-  (`tools/qsa-ppl-oracle.sh`, which is what caught this) **and** the dense-arm text/random-text gates.
-- **Post-fix gates (all against the delivery build, identical configs):** oracle sparse `6.5394` / dense
-  `6.5377`; dense texts tensor f16 `2daa19579316`, tensor `iq4_nl` `3c46e47ab345`, layer f16
-  `e656b50f2cc8`, layer f16 `-fa off` `b96459bf02ca` (all == the delivery); random text `19.0589` /
-  `7.9682` (== the delivery); production arm untouched (sparse f16 `804de0576868`, q4_1 `886292b17a93`,
-  `plain == n_max 3 == n_max 7`, MTP f16 bit-identical `0.56028`/`(0.681, 0.553, 0.447)`,
-  `LLAMA_QSA_OFF=1` `6.5376`); KV reserves unchanged; backend suites OK.
-- **Accepted caveat (do not re-report):** W2's derived per-block bias is not bit-exact for `iq4_nl` — its
-  greedy text (`fcb2d47f94cf`) and MTP acceptance (`0.46203` / pos-1 `(0.717, 0.434, 0.226)`) differ from
-  the delivery's while the sparse-arm PPL is identical (`6.5244`), and `GGML_QSA_DERIVED_*=0` restores the
-  delivery's values exactly; the last ULP flips an indexer top-k boundary.  See `BETA-TESTING.md` §4d.
-- **Optional follow-up (would make V5 free, not needed for the opt-in delivery):** the native-bf16 loss
-  is not the conversion (native staging measures within 0.2 % of an f16 cache) but the removed F16
-  scratch, which was a *dense, normalised* copy of the cache view (for a 4-KV-head model `nb[1]` is 4×
-  the row size — the GQA heads are interleaved), while the native path re-reads that interleaved view on
-  every staging pass.  Options: (a) restrict the arm to `nb[1] == ne[0]*2` layouts (1 line, then free
-  there), (b) make the native staging read densely, (c) make the KV cache non-interleaved (llama.cpp-wide).
-  Design: `wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md` §9.
+## Active (kept compact: only what this repo will work on next)
 
 ### 3. qwen4exp `iq4_nl` prefill delta (~8–12 %, open — profiled to be host/launch-side)
 - Measured on the reference `-sm tensor`: `iq4_nl` 2303.1/2421.0 t/s at pp8192 (sparse/dense) vs f16
@@ -99,23 +73,44 @@ crossover stays.
   `wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md` (the earlier disposition is
   `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`); analysis `GREEDY-PURITY.md` §18.
 
-### 5. Strix Halo (gfx1151) prefill-gap follow-ons (all prefill; decode is closed)
-Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
-- (a) **MoE topk fusion adoption (~0.5 % prefill)** — replaces the full-512 argsort with the fused
-  partial top-10.  **Numerics fork**: top1 logit 18.424 (unfused) vs 18.690 (fused); needs a CPU
-  reference + PPL/KL quality gate before adoption.  ~188 MB arena cost if adopted
-  (`2026-09-06-strix-halo-gfx1151-launch-overhead-topk.md`).
-- (b) **`ssm_alpha`+`ssm_beta` single-walk fusion (~0.3–0.6 % prefill)** — blocked by graph expansion
-  order (the two MMs are non-adjacent); routes: load-time stacked weights or a qwen4exp graph
-  restructure + custom kernel (`2026-09-06-strix-halo-gfx1151-cijk-dense-gemm.md`).
-- (c) **launch-ledger remainder** (small-pp): +38 `scale_f32`/eval, `rms_norm<256,true>` count diff,
-  fusion-surface diffs — likely sub-0.2 %, root-cause-only value.
-- (d) **mmq accumulator-overflow latent defect** (`I < nwarps*16`) — report upstream (correctness
-  hygiene, no perf value).
-- (g) **V3 prefill cost is arch-dependent (low priority)**: gfx1151 measured −3.2 % at pp20480 (4B, q8_0)
-  vs the RDNA4 reference −1.3 %, decode flat.  Still a large net win (−799 MiB compute + −799 MiB host)
-  and on by default; if an iGPU tuning pass ever runs, the derived MMA kernel's `J`/occupancy on gfx1151
-  is the place to look.
+### 9. QSA knobs: a tensor-tuned prefill crossover + the fused-op probe (small, from F3)
+- **`LLAMA_QSA_DENSE_PREFILL_UNTIL`-style gate**: the prefill crossover is not depth-configurable today
+  (reference `-sm tensor`: dense wins pp8192 by ~4.7 %, parity at pp16384, sparse wins pp32768 by
+  +14.5 %).  Tensor-tuned, per the maintainer's rule that the crossover policy follows the tensor split.
+- **`LLM_FUSED_OP_FLASH_ATTN_QSA` probe** so `qsa_kv_native` stops duplicating the backend predicate —
+  note the probe compares the *device* a fused node lands on, which does not by itself catch a
+  meta-split inconsistency.
+
+## Waiting on others (not actionable in this repo)
+
+### 1. Block 15 promotion — **UNBLOCKED** (waiting on the beta window + the maintainer's go-ahead)
+- **Live state:** the 12th re-cut is on the current base (`13af95ac1` → beta tip **`888a59ee0`**, tree
+  **`476d2d1e95947de7cc8cd806c40efc0f01927cd3`**); it builds clean, applies strict `git am`, and
+  revalidates (width probe `W = 1,4,8` one hash, same-seed greedy byte-identical delivery-vs-beta,
+  `FLASH_ATTN_QSA` + `GATED_DELTA_NET` pass).  The dense-arm blocker and its fix are closed — see the
+  Closed section; the cut is in `beta/block-15-campaign-wins/` (BETA-TESTING.md 12th-re-cut section).
+- **Now gating the promotion:** only the ~4–5 day beta window + the maintainer's go-ahead.  Six wins, gates:
+  W1 `GGML_QSA_SCORE_MEM`, W2 `GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`, W3 `LLAMA_QSA_KEYS_ONLY`,
+  W4 (no gate; `ab/w4-revert.patch`), V3 `LLAMA_KQ_MASK_DERIVED`, V4+V5 `GGML_CUDA_FA_KV_NATIVE` (opt-in).
+  Tester material: `BETA-TESTING.md` — its gate list now includes the perplexity oracle
+  (`tools/qsa-ppl-oracle.sh`, which is what caught this) **and** the dense-arm text/random-text gates.
+- **Post-fix gates (all against the delivery build, identical configs):** oracle sparse `6.5394` / dense
+  `6.5377`; dense texts tensor f16 `2daa19579316`, tensor `iq4_nl` `3c46e47ab345`, layer f16
+  `e656b50f2cc8`, layer f16 `-fa off` `b96459bf02ca` (all == the delivery); random text `19.0589` /
+  `7.9682` (== the delivery); production arm untouched (sparse f16 `804de0576868`, q4_1 `886292b17a93`,
+  `plain == n_max 3 == n_max 7`, MTP f16 bit-identical `0.56028`/`(0.681, 0.553, 0.447)`,
+  `LLAMA_QSA_OFF=1` `6.5376`); KV reserves unchanged; backend suites OK.
+- **Accepted caveat (do not re-report):** W2's derived per-block bias is not bit-exact for `iq4_nl` — its
+  greedy text (`fcb2d47f94cf`) and MTP acceptance (`0.46203` / pos-1 `(0.717, 0.434, 0.226)`) differ from
+  the delivery's while the sparse-arm PPL is identical (`6.5244`), and `GGML_QSA_DERIVED_*=0` restores the
+  delivery's values exactly; the last ULP flips an indexer top-k boundary.  See `BETA-TESTING.md` §4d.
+- **Optional follow-up (would make V5 free, not needed for the opt-in delivery):** the native-bf16 loss
+  is not the conversion (native staging measures within 0.2 % of an f16 cache) but the removed F16
+  scratch, which was a *dense, normalised* copy of the cache view (for a 4-KV-head model `nb[1]` is 4×
+  the row size — the GQA heads are interleaved), while the native path re-reads that interleaved view on
+  every staging pass.  Options: (a) restrict the arm to `nb[1] == ne[0]*2` layouts (1 line, then free
+  there), (b) make the native staging read densely, (c) make the KV cache non-interleaved (llama.cpp-wide).
+  Design: `wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md` §9.
 
 ### 6. Cross-arch / gfx1100 validation (the gfx1201 port + its Phase 2.5 probe are DONE — see Closed)
 - **Still open, needs other hardware:**
@@ -136,21 +131,6 @@ Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
 - The block-13 gfx1100 leg is DONE (single-GPU 7900 XTX, §Closed); what remains here is block 12, which
   is N/A on a single-GPU box.  Where: `patches/0012` + the block-12 notes in `patches/README.md`.
 
-### 9. QSA knobs: a tensor-tuned prefill crossover + the fused-op probe (small, from F3)
-- **`LLAMA_QSA_DENSE_PREFILL_UNTIL`-style gate**: the prefill crossover is not depth-configurable today
-  (reference `-sm tensor`: dense wins pp8192 by ~4.7 %, parity at pp16384, sparse wins pp32768 by
-  +14.5 %).  Tensor-tuned, per the maintainer's rule that the crossover policy follows the tensor split.
-- **`LLM_FUSED_OP_FLASH_ATTN_QSA` probe** so `qsa_kv_native` stops duplicating the backend predicate —
-  note the probe compares the *device* a fused node lands on, which does not by itself catch a
-  meta-split inconsistency.
-
-### 11. MXFP4 (and NVFP4) fused gate+up+GLU MMQ — the last block-13 item
-- `ggml_cuda_mul_mat_q_switch_type_gate` is instantiated for Q3_K/Q4_K/Q5_K/Q8_0/Q6_K only, so the
-  `try_fuse` arm is gated on that list (MXFP4/NVFP4 would abort if admitted).  MXFP4 is the interesting
-  type for future native-MXFP4 MoE models.
-- "Done" = add the switch cases + instance files + generator entries, then bit-exact + bench validation
-  per the `0004` recipe.  Tracked from the block-13 notes in `patches/README.md`.
-
 ### 12. Upstream: file the staged PR candidates
 - `upstream/README.md` — five are written up and evidence-verified on pristine master `9cf3bf256`:
   the ggml-alloc unused-view release, the sched probe, the keys-only indexer cache (A1), the `attn_k`
@@ -158,53 +138,23 @@ Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
   whose NVIDIA/Ada half the fork deliberately does not land — see the AGENTS.md scope policy).
 - Filing is the maintainer's call.
 
-### 13. Upstream monitor: ROCm unaligned-width split-load (Q6_K/Q3_K, 2-GPU)
-- Upstream bug: H2D 2D copies whose width is not a multiple of 4 (Q6_K block = 210 B, Q3_K = 110 B) are
-  ~1000× slower on ROCm.  Fixed locally in block 13 (`set_tensor_2d`: aligned H2D + unaligned D2D
-  staging).  No PR planned (upstream is busy with its own qwen4exp work) — watch whether they fix it
-  themselves; if so it surfaces as a re-base conflict and resolves naturally.  Re-check at each re-base.
-
-### 14. Canonical-fork hygiene (do this before ANY regeneration)
-- The working `~/llama.cpp` `rdna-boosts` branch is a local rebuild and must **not** be used for
-  regeneration while it sits on a master newer than the fork point (it would export `f3f1a8f27` +
-  `304665fe7` as patches 0001/0002).  Regenerate from a canonical fork rebuilt at `9113cc188` by
-  `scripts/apply-all.sh` — currently tip `13af95ac1`, tree
-  `f4791066f4a582316b1ca95f51c96cd10b905ef7`.  See `BASELINE.md`/`AGENTS.md`.
-- Superseded-but-useful artifacts: the work branch `wip/block15-campaign-wins` (`b26ae06f0`) and
-  `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch` are the pre-merge
-  record; the per-win plans under `wip/arch-independent-memory/` + `wip/qwen4exp/qsa-memory/` are the
-  designs.
-
-### 15. Enable `-Wshadow` for `src/` (would have caught the Block 15 dense-arm bug as a compile error)
-The 2026-09-11 (11) blocker was a one-token shadowing bug (`ggml_tensor * kq_mask_top_k = ...` inside a
-block that already had an outer declaration of the same name) that made a whole mask chain dead code —
-silent because the code still compiles and the chain still gets built.  `-Wshadow` reports it directly.
-Not currently enabled anywhere in the build.  **Audited 2026-09-12 (7)**: replaying the tree's own host
-compile commands for the `llama` target (186 `src/` TUs) with `-Wshadow` gives **128 warnings in 27
-files**, of which **46 are the risky `shadows a local variable` class** (the Block-15 class) and 82 are
-benign `shadows a field` (mostly constructor params).  `src/models/qwen4exp.cpp` is clean — the delivery
-does not carry the bug.  **Revised proposal**: enable `-Wshadow -Wno-shadow-field-in-constructor` for
-`src/` (kills the constructor-param noise) and fix the ~46 local-variable sites (mechanical renames);
-doing that touches ~20 upstream `src/` files, so it wants its own block/cleanup commit to avoid colliding
-on every re-base.  Record: `wip/shadow-warnings/RECORD-2026-09-12-shadow-audit.md` (with the full
-46-site list).  Reference: `GREEDY-PURITY.md` §23.3, `WORKLOG.md` 2026-09-11 (11).
-
-### 16. Restore the block-13 RDNA3_5 single-token fusion perf (low priority, gfx1151)
-- The block-13 RDNA3_5 mmvq purity amendment (Closed) skips the two single-token-only fusions at a cost of
-  ≈ −0.9 % `tg128` on qwen4exp (25.53 vs 25.77 t/s; prefill flat).  **Re-scoped 2026-09-12 (7): the
-  "pin `nwarps`/`rps`/item-split" plan does not apply** — the fused and unfused dense arms already share
-  the same kernel template (`mul_mat_vec_q_ksplit<...,has_fusion,...>`), the same `calc_nwarps`,
-  `rows_per_block` (= 1 on RDNA3_5) and launch dims, and the fused epilogue uses the same
-  `ggml_cuda_op_silu_single` as the standalone GLU (`op_silu`).  Two live candidates: **(a) codegen** —
-  `has_fusion=true` adds registers + a second `vec_dot` in the inner loop and may contract the `tmp` (up)
-  FMAs differently; **(b) the Q8_1 cache** (`common.cuh:1611`, keyed on the src1 tensor/layout only, *not*
-  the weight type, while `quantize_row_q8_1_cuda` takes `src0->type`) — fusing changes which call fills it.
-  Next step: dump `tmp`/`tmp_gate` from the ksplit kernel under an env at `W=1` and compare the `up`
-  values bit-for-bit (match → epilogue/cache; differ → codegen).  A/B:
-  `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1`.  See `GREEDY-PURITY.md` §25 and
-  `wip/strix-halo/rdna35-mmvq-fusion-purity/README.md` §5/§7/§9.
-
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
+
+- **The `launch-ledger` remainder (item 5(c)) — measured, not pursued (2026-09-12 (8)).**  The small-pp
+  remainder (+38 `scale_f32`/eval, an `rms_norm<256,true>` count diff) is sub-0.2 %, root-cause-only.
+- **The mmq mma `sum[]` accumulator-overflow latent defect (item 5(d)) — accepted, no upstream report
+  (2026-09-12 (8)).**  `process_tile` sizes the per-thread accumulator as `J*I/(nwarps*32)` while the
+  AMD-WMMA vec_dot indexes up to `J/2-1`, so any config with `I < nwarps*16` silently corrupts
+  (deterministic for J=128, racy for J=48/24).  Root cause + full evidence matrix:
+  `wip/archive/qwen4exp/discovery/2026-09-06-strix-halo-gfx1151-mmq-j128-latent-defect.md`.  Upstream
+  ships **no** violating config (every `mmq-config-*.cuh` row keeps `I >= nwarps*16`) and the block-13
+  rows never violate it either, so there is no upstream reproducer to file.
+- **V3 prefill cost is arch-dependent (item 5(g)) — accepted.**  gfx1151 measured −3.2 % at pp20480
+  (4B, q8_0) vs the RDNA4 reference −1.3 %, decode flat; still a large net win (−799 MiB compute +
+  −799 MiB host) and on by default.
+- **Upstream monitor: ROCm unaligned-width split-load (item 13) — standing, no action (2026-09-12 (8)).**
+  Fixed locally in block 13; no PR planned (upstream is busy with its own qwen4exp work).  It resolves
+  naturally as a re-base conflict if upstream fixes it; nothing to track.
 
 - **Mixed K/V cache types fall off the GPU attention path.**  Any mixed pair (`bf16`+`q8_0`, `f16`+`q8_0`)
   gives `graph splits = 18`, a ~1.5 GiB host compute buffer and pp2048 7924 → 640–1049 t/s on the 4B.
@@ -226,6 +176,19 @@ on every re-base.  Record: `wip/shadow-warnings/RECORD-2026-09-12-shadow-audit.m
   (cosmetic).
 
 ## Parked (not planned now)
+- **Restore the block-13 RDNA3_5 single-token fusion perf (item 16).**  The ~0.9 % `tg128` the purity
+  skip costs; the proposed "pin `nwarps`/`rps`/item-split" fix is **invalid** (the two arms are already
+  launch-identical).  Live candidates: codegen (`has_fusion` register pressure / FMA contraction) and the
+  Q8_1 cache.  Low priority — the skip is the accepted purity trade.  `wip/strix-halo/rdna35-mmvq-fusion-purity/README.md` §9.
+- **`-Wshadow` cleanup for `src/` (item 15).**  Audited: 128 warnings / 27 files, 46 in the risky
+  "shadows a local variable" class.  Wants a dedicated cleanup commit (~20 upstream files) to avoid
+  colliding on every re-base.  `wip/shadow-warnings/RECORD-2026-09-12-shadow-audit.md`.
+- **MoE topk fusion adoption (item 5(a)).**  ~0.5 % prefill for a ~188 MB arena cost and a numerics fork
+  (fused top1 logit 18.424 -> 18.690 vs the unfused reference), so it needs a quality gate before it can
+  be trusted.  `wip/archive/qwen4exp/discovery/2026-09-06-strix-halo-gfx1151-launch-overhead-topk.md`.
+- **`ssm_alpha` + `ssm_beta` single-walk fusion (item 5(b)).**  ~0.3-0.6 % prefill, blocked by the graph
+  expansion order (the two MMs are non-adjacent) -> needs a graph restructure or load-time stacked
+  weights.  `wip/archive/qwen4exp/discovery/2026-09-06-strix-halo-gfx1151-cijk-dense-gemm.md`.
 
 ### LFRU host→GPU slow hot-weight migration
 - Survivor of the expert-tiering experiment (dropped 2026-09-05 — most of its aims are already covered by
@@ -234,6 +197,28 @@ on every re-base.  Record: `wip/shadow-warnings/RECORD-2026-09-12-shadow-audit.m
   `wip/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
+
+**Item 11 — the MXFP4 fused gate+up+GLU MMQ is not reachable; the type-list enablement is a no-op (closed 2026-09-12 (8)).**
+Implemented and measured the planned change (add `GGML_TYPE_MXFP4` to `MMQ_GATE_TYPES` + the generated
+gate instance, the `ggml_cuda_mul_mat_q_switch_type_gate` case, and `moe_mmq_type`): it builds and is
+bit-identical where it runs, but it **never fires** on the available MXFP4 MoE (`gpt-oss-20b-MXFP4`).
+That model's MoE graph is the expert-bias `{MUL_MAT_ID, ADD_ID, MUL_MAT_ID, ADD_ID, GLU}` pattern, whose
+only fused arm is the **mmvq/decode** one — there is no MMQ (prefill) fused arm for it, and the MMQ fused
+epilogue carries no `x_bias`/`gate_bias`/scale support.  Evidence: instrumented gate counter -> 0
+firings over a full prefill with the arm enabled; pp2048 1741.3 vs 1742.0 t/s and pp16384 1506.7 vs
+1501.6 t/s (fused vs `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1`, ×2, within noise); same-seed greedy text
+byte-identical (`6c1cdaa5d52d`).  So the item's premise (a type-list/instance edit) does not buy anything;
+the real feature would be a bias/scale-aware MMQ fused gate, worth doing only if a plain 3-op MXFP4 MoE
+appears.  Experiment reverted (no delivery change).  Side finding to fix before adding any gate type:
+`generate_cu_files.py`'s `SOURCE_MMQ_GATE` re-emits the file header when appending, so re-running the
+generator mutates the 5 committed gate instance files.
+
+**Item 14 — canonical-fork hygiene: closed, verified (2026-09-12 (8)).**  The policy (never regenerate
+from a drifted `~/llama.cpp`; rebuild at `9113cc188` via `scripts/apply-all.sh`) lives in `AGENTS.md` and
+`BASELINE.md`.  The canonical chain was re-verified on 2026-09-12: strict 15/15 `git am`, applied tree
+`f4791066f4a582316b1ca95f51c96cd10b905ef7` == canonical, tip `13af95ac1`, `make-patches.sh` default tip
+updated.  The superseded artifacts are the pre-merge record only.
+
 
 **Item 5(f) — the block-13 fused MoE gate+up+GLU arm still wins on Strix Halo (closed 2026-09-12).**
 Re-measured on the current delivery tip (35B-A3B Q4_K_M, 1 GPU, `-p 2048`/`-p 16384`, interleaved
