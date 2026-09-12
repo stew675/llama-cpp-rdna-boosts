@@ -100,13 +100,27 @@ Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
   and on by default; if an iGPU tuning pass ever runs, the derived MMA kernel's `J`/occupancy on gfx1151
   is the place to look.
 
-### 6. gfx1201 (RDNA4) port of the gfx1151-gated campaign items — ACTIVE (pointer only)
-- The remaining gfx1151-gated content (routed-compact MoE MMQ, quantize chunk, `split_j`/config rows,
-  per-file RDNA3_5 rows) is **inert on gfx1201** and needs an RDNA4 port + per-arch tuning + validation,
-  plus the model-level beta ladder + cross-arch coherence.  Phase 4 of the same plan covers the
-  **gfx1100 (RDNA3) env-level opt-in** (the fingon box is a single 24 GiB GPU, so validation is light,
-  on 35B-A3B-class models) with its safety audit.
-- Live plan and dated entries: `wip/qwen4exp/gfx1201-porting.md`.  Track items there; this is the pointer.
+### 6. Cross-arch / gfx1100 validation of the ported items (was "the gfx1201 port" — that part is DONE)
+- **The RDNA4 porting work is closed (2026-09-11 (12) note):** the gfx1151-gated kernels were ported to
+  gfx1201 and are **enabled by default on RDNA4**, including the routed-compact MoE MMQ
+  (`mmq_routed_compact_arch_ok()` = `RDNA3_5 || RDNA4`; 2026-09-06 record
+  `wip/archive/qwen4exp/discovery/2026-09-06-gfx1201-rdna4-routed-moe-mmq.md`: +4-8 % prefill, tg flat,
+  byte-identical, opt-out `GGML_CUDA_DISABLE_MMQ_ROUTED=1`) and the quantize chunk (flat, kept).  The
+  block-13 **fused MoE gate+up+GLU MMQ is ungated outright** for RDNA3_5 *and* RDNA3_0 (2026-09-05
+  records, both with coherence IDENTICAL), so there is no "env-level opt-in" left to design for it.
+- **Still open, actionable here:** Phase 2.5 of `wip/qwen4exp/gfx1201-porting.md` — the fallback-path
+  regression probe on gfx1201 (with the RDNA3_5/RDNA4 kernels active, check that a supported-type
+  fallback still lands on the plain path correctly).  Small, no other box needed.
+- **Still open, needs other hardware:**
+  * gfx1100 (`fingon`, 24 GiB): the §4.2 remainder with *no* gfx1100 data yet — the GDN gfx11 NW16 scan
+    retune (~106K VGPR/CU vs a possible 64K classic), `split_j`/config rows, the quantize chunk,
+    routed-compact, the hc/PLE fusions, and the two block-13 MTP regression fixes under RDNA3
+    (acceptance gate).  Same box as item 5(e).
+  * gfx1151 (`halo`): Phase 3's cross-arch fingerprint check (gfx1201 == gfx1151 numerics) — a
+    verification goal, not a port; also item 4's §18 items and item 7's MTP crossover re-measure.
+- **Tracker hygiene:** the plan's own open checkboxes are **stale** (Phase 1 is complete and the doc
+  predates qwen4exp's promotion to block 14); read the banner at the top of
+  `wip/qwen4exp/gfx1201-porting.md` before trusting them.
 
 ### 7. Strix Halo / gfx1151 bundle (deprioritised 2026-09-11 — gfx1201 first)
 - Re-measure the **MTP-side** QSA crossover on the Strix box: the published 64K "dense below, QSA above"
@@ -208,6 +222,15 @@ Reference: `GREEDY-PURITY.md` §23.3, `WORKLOG.md` 2026-09-11 (11).
   `wip/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
+
+**The gfx1201 (RDNA4) port of the gfx1151-gated campaign items (2026-09-11 (12) note — mostly closed
+2026-09-06/07).**  Every gated kernel was ported and is enabled by default on RDNA4: the
+**routed-compact MoE MMQ** (`mmq_routed_compact_arch_ok() = RDNA3_5 || RDNA4`,
+`2026-09-06-gfx1201-rdna4-routed-moe-mmq.md`: +4-8 % prefill, byte-identical, `GGML_CUDA_DISABLE_MMQ_ROUTED=1`
+to A/B), the quantize chunk (flat, kept), and the block-13 fused MoE gate+up+GLU MMQ is **ungated
+outright** for RDNA3_5 *and* RDNA3_0 (2026-09-05).  What remains is validation on other boxes and one
+small gfx1201 probe — see item 6, which is now scoped to that.  The plan doc
+(`wip/qwen4exp/gfx1201-porting.md`) carries a status banner; its checkboxes are stale.
 
 **Issue #25's GDN plain-vs-MTP divergence (2026-09-11 (12)) — FIXED and re-verified.**  The `K`-dependent
 chunked/sequential boundary in `gated_delta_net.cu` was removed by block 02's **K-independent whole-batch

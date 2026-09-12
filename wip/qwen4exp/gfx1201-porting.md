@@ -1,5 +1,27 @@
 # gfx1201 porting — implementation plan + live worklog (qwen4exp completion stretch)
 
+> **STATUS BANNER (2026-09-11 (12)) — the PORTING phase is COMPLETE; the open checkboxes below are
+> stale, do not use them as the tracker.**  Phase 1 (the gfx1151-gated kernels -> gfx1201 ports) is
+> done and enabled by default on RDNA4, including the headline item: the **routed-compact MoE MMQ**
+> (`mmq_routed_compact_arch_ok()` = `RDNA3_5 || RDNA4` in `ggml/src/ggml-cuda/mmq.cuh`, ported and
+> validated 2026-09-06 — `wip/archive/qwen4exp/discovery/2026-09-06-gfx1201-rdna4-routed-moe-mmq.md`:
+> ub2048 tensor-split prefill +4-8 %, tg unchanged, byte-identical compact-vs-plain, 846 compact
+> launches/pp2048; opt-out `GGML_CUDA_DISABLE_MMQ_ROUTED=1`) and the quantize chunk (flat on RDNA4,
+> kept).  The block-13 **fused MoE gate+up+GLU MMQ is ungated outright** for RDNA3_5 *and* RDNA3_0
+> (2026-09-05 records) — so Phase 4.1's "env-level opt-in for RDNA3" is moot for the MoE part: there
+> is no gate left to design, and the gfx1100 validation of it is already recorded.
+> **What is genuinely still open** (all of it needs hardware other than soar, or is a small probe):
+> * `fingon` (gfx1100): the 4.2 remainder that has *no* gfx1100 data yet — the GDN gfx11 NW16 scan
+>   retune, `split_j`/config rows, the quantize chunk, routed-compact, the hc/PLE fusions, and the
+>   two MTP regression fixes under RDNA3 (acceptance gate).  Tracked as TODO item 6.
+> * `halo` (gfx1151): Phase 3's cross-arch fingerprint check (gfx1201 vs gfx1151 numerics) — a
+>   verification goal, not a port; and the §18 QSA sparse-regime items (TODO item 4).
+> * Actionable *here*: Phase 2.5's fallback-path regression probe (with the RDNA3_5/RDNA4 kernels
+>   ungated, the *plain* path is what a supported-type fallback lands on) — TODO item 6.
+> Also note this plan predates the delivery reorganisation: the fork layout it describes (a
+> `qwen4exp` branch, a 13-patch delivery, `beta/qwen4exp/`) is historical — qwen4exp support is now
+> **block 14** of the 15-patch set (canonical tip `484231cb9`), and the beta ladder work is closed.
+
 Status: ACTIVE WORKLOG (live doc — append dated entries at the bottom; tick checkboxes).
 Date created: 2026-09-06 (post-reboot session; sched-gate fix `c63f7f2a0`/`d6eb551` closed).
 Scope: the final long stretch of the qwen4exp campaign — port/tune/validate the
