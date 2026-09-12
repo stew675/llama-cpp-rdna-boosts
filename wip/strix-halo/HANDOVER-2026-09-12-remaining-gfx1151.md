@@ -19,6 +19,20 @@ compacted, so treat this file (plus the docs it points at) as the source of trut
 > still wins ~+0.6 % prefill on the current tip → keep).  **Still open:** item 4's q8_0 residual;
 > item 5(a) (needs the logits pin + a PPL/KL gate), 5(b)/5(c)/5(d)/5(g) (small / upstream); item 6
 > (gfx1151 Phase-3 fingerprint — needs the gfx1201 box); item 16 (fusion perf).
+>
+> **OUTCOME (2026-09-12 (6)/(7), follow-up session).**  Item 4 deep dive: the residual is **not** a
+> width dependence — teacher-forced replay at every verify width, with rollback schedules and unrelated
+> rolled-back tokens, is bit-pure over 200 positions; the snapshot rollback restore is exact; `n_rs_seq`,
+> `n_outputs_max`, CUDA-graph capture and the chunked-GDN boundary (identical call sequence) are ruled
+> out.  New concrete defect: the MTP target's `embeddings_nextn` (`common/speculative.cpp:1431`) defers
+> qwen4exp's last-layer output gather and shifts the **prefill's last-position logits by a ULP** — a real
+> logits-level violation of `plain == draft-mtp`.  Record
+> `wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`; instruments
+> `wip/strix-halo/qsa-item4/{mstep,rbprobe}.cpp`.  **Item 16 re-scoped** (the "pin nwarps/rps/item-split"
+> plan is a dead end — the arms are already launch-identical; candidates are codegen and the Q8_1 cache)
+> and **item 15 audited** (128 `-Wshadow` warnings / 27 `src/` files, 46 in the risky class).  Records:
+> `wip/strix-halo/rdna35-mmvq-fusion-purity/README.md` §9,
+> `wip/shadow-warnings/RECORD-2026-09-12-shadow-audit.md`.
 
 ## 0. Session hygiene / policy
 
