@@ -24,6 +24,21 @@
 > `llama_cparams::type_k/type_v`), which is a no-op for every f16/q8_0 beta config: the tree builds and
 > the beta output is byte-identical to the delivery's at the gate configs (qwen4exp f16 plain
 > `804de0576868`; 27B f16 `n_max 3` acceptance `0.82716`), so the recorded numbers stand.
+> **Re-cut a ninth time 2026-09-11 (11) — the `LLAMA_QSA_SPARSE_FA=0` blocker is FIXED, one line.**  The
+> base did **not** move (still `6d3155faa`, tree `0c3f0c2c2f4e7439d9489d45573a4021a8eee106`); only block 15
+> changed: the mask chain's `ggml_tensor * kq_mask_top_k = ggml_set_rows(...)` in `build_attn_qsa` had been
+> shadowing the outer variable declared by the V2/V3 refactor, so the chain was built but its result never
+> reached the attention — the dense arm attended unmasked (a causal leak).  Dropping the inner
+> `ggml_tensor *` fixes it.  Base `6d3155faa` -> **beta tip `3712e2dc1`**, tree
+> **`e39f8c2b6f0593113b93c4e57c512bc7373a2250`**, patch **3 811 lines** (the 8th re-cut + 1 diff line + the
+> commit-message paragraph).  Same single `git am -3` conflict as the seventh/eighth re-cuts
+> (`qwen4exp_qsa_sparse()` must accept `GGML_TYPE_IQ4_NL`); the tree builds clean and the exported patch
+> round-trips (identical tree).  Gates: the oracle sparse `6.5394` / dense `6.5377` (= the delivery; the
+> blocker's `1.0558` is gone), dense-arm texts byte-identical to the delivery in every configuration, the
+> production arm untouched (sparse f16 `804de0576868`, q4_1 `886292b17a93`, `plain == n_max 3 == n_max 7`,
+> MTP f16 bit-identical, `LLAMA_QSA_OFF=1` `6.5376`), KV reserves unchanged, backend suites OK.  The
+> `iq4_nl` W2 caveat stands (and now also covers its MTP acceptance).  See `README.md` (ninth re-cut) and
+> `BETA-TESTING.md` §4c (resolution) + §4d.
 > **Re-cut an eighth time 2026-09-11 (10)** after block 08's fifth amendment (the `iq4_nl` FA
 > enablement: predicate, vec dispatch, the 15 missing `fattn-vec-instance-iq4_nl-*.cu` files, the three
 > CMake default lists, `dequantize_q4_nl` and the three non-contiguous conversion switches) plus the

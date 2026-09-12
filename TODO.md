@@ -14,42 +14,34 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
 
 ## Active
 
-### 1. Block 15 promotion — BLOCKED on a dense-arm defect (highest priority: it gates a release)
-- **The blocker (found 2026-09-11 (10)):** in the beta tree, `LLAMA_QSA_SPARSE_FA=0` (the dense masked
-  path, i.e. this repo's *quality oracle*) gives **PPL `1.0558` on qwen4exp for every KV type** where the
-  delivery gives `6.49-6.55` — a lost causal constraint.  Block-15-inherent (the 7th re-cut reproduces
-  it), and **no** block-15 gate fixes it (`LLAMA_KQ_MASK_DERIVED=0`, `GGML_QSA_DERIVED_*=0`,
-  `GGML_QSA_SCORE_MEM=0`, `LLAMA_QSA_KEYS_ONLY=0`, all together → still `1.0558`), while the production
-  sparse arm (`iq4_nl` `6.5244`, f16 `6.5394`) and `LLAMA_QSA_OFF=1` (`6.5376`) are byte-identical to the
-  delivery.  Repro: `BIN=<beta>/build-beta/bin wip/kv-quant-purity-followups/tools/qsa-ppl-oracle.sh
-  tensor f16`.  Evidence: `beta/block-15-campaign-wins/BETA-TESTING.md` §4c.
-  **The next session's brief — and the narrowed search space — is
-  `wip/block15-dense-arm/HANDOVER-2026-09-11-block15-dense-arm.md`** (read it first): the dense arm
-  also differs in a *plain text* run (delivery `2daa19579316` vs beta `d910d0b499ec` while the sparse
-  arm stays byte-identical), it still differs with **`-fa off`** (so it is *not* the FA kernel or V3's
-  derived-mask arm), and **W4 is exonerated** (`ab/w4-revert.patch` + rebuild → identical).  The
-  epicenter is the **top-k mask chain** in `build_attn_qsa` — which only the dense arm builds (the
-  sparse arm skips it, that being the -800 MiB mask win) — so look at the graph/mask/allocator side
-  (`llama-graph.*`, `llama-kv-cache.*`, `llama-memory-hybrid-idx.*`, `ggml.c`/`ggml.h`,
-  `llama-context.cpp`).
-- **Second, benign finding:** W2's derived per-block bias is not bit-exact for `iq4_nl` (the greedy text
-  differs, `GGML_QSA_DERIVED_*=0` restores it) — the last ULP flips an indexer top-k boundary; the
-  sparse-arm PPL is identical, so it is a rounding sensitivity, not a defect.  See the same file §4d.
-- **State:** beta patch `block-15-campaign-wins.patch`, **8th re-cut** on base `6d3155faa` → beta commit
-  `d0f71b2e8`, tree `39540b7f4fd8e8569dee64bfa3ee84bf1b20e75d`, 3 787 lines; `git am -3`, one expected
-  `src/models/qwen4exp.cpp` conflict, round-trips exactly, builds clean.  Verified against the delivery:
-  f16/q4_1/`iq4_nl` texts, MTP (27B `0.82716`, f16 `0.47009`, `iq4_nl` `0.52727`), `W=1..8` purity,
-  `FLASH_ATTN_QSA` 22/22, `FLASH_ATTN_EXT` 5940/5940, `LLAMA_QSA_OFF=1` PPL — all equal.
-- **Next:** root-cause the dense-arm defect (brief: `wip/block15-dense-arm/HANDOVER-2026-09-11-block15-dense-arm.md`;
-  start with the node-dump instrumentation on the dense arm, which finds the first diverging tensor).
-  What is *known*: not the QSA kernel, not the FA kernels, not V3's derived-mask arm (`-fa off` still
-  differs), not W4, not the no-indexer dense path (`LLAMA_QSA_OFF=1` matches), not any gate the beta
-  exposes, and not the perplexity harness (a text run shows it too).  The epicenter is the top-k mask
-  chain in `build_attn_qsa` (built only by the dense arm) ⇒ the graph/mask/allocator side.  Then the
-  ~4–5 day beta window + the maintainer's go-ahead; tester material is `BETA-TESTING.md` (its gate list
-  now includes the perplexity oracle, which is what caught this).  Six wins, gates: W1
-  `GGML_QSA_SCORE_MEM`, W2 `GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`, W3 `LLAMA_QSA_KEYS_ONLY`, W4
-  (no gate; `ab/w4-revert.patch`), V3 `LLAMA_KQ_MASK_DERIVED`, V4+V5 `GGML_CUDA_FA_KV_NATIVE` (opt-in).
+### 1. Block 15 promotion — **UNBLOCKED** (the dense-arm defect was found and fixed 2026-09-11 (11))
+- **The blocker is FIXED.**  It was a variable-shadowing bug in block 15's own `build_attn_qsa` dense path:
+  the V2/V3 refactor added an outer `ggml_tensor * kq_mask_top_k = nullptr;` while the top-k mask chain
+  inside `if (kq_mask != nullptr) { ... }` still declared its own `kq_mask_top_k`, so the chain was built
+  but its result never reached the attention — `build_attn_mha` got `nullptr`, the chain's nodes were
+  unreachable from the graph output, the packed mask lost its only consumer (so it was left unallocated
+  and its input fill skipped) and the dense arm attended unmasked: a full causal leak, seen as PPL
+  `1.0558` on every KV type where the delivery gives `6.49–6.55`.  One-line fix (drop the inner
+  `ggml_tensor *`).  Ninth re-cut: base `6d3155faa` → beta tip **`3712e2dc1`**, tree
+  **`e39f8c2b6f0593113b93c4e57c512bc7373a2250`**, patch **3 811 lines**; round-trips exactly, builds clean.
+  Full evidence chain, the instruments and the new leak gate are in
+  `wip/block15-dense-arm/HANDOVER-2026-09-11-block15-dense-arm.md` (now with an OUTCOME banner) and
+  `WORKLOG.md` 2026-09-11 (11).
+- **Now gating the promotion:** only the ~4–5 day beta window + the maintainer's go-ahead.  Six wins, gates:
+  W1 `GGML_QSA_SCORE_MEM`, W2 `GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`, W3 `LLAMA_QSA_KEYS_ONLY`,
+  W4 (no gate; `ab/w4-revert.patch`), V3 `LLAMA_KQ_MASK_DERIVED`, V4+V5 `GGML_CUDA_FA_KV_NATIVE` (opt-in).
+  Tester material: `BETA-TESTING.md` — its gate list now includes the perplexity oracle
+  (`tools/qsa-ppl-oracle.sh`, which is what caught this) **and** the dense-arm text/random-text gates.
+- **Post-fix gates (all against the delivery build, identical configs):** oracle sparse `6.5394` / dense
+  `6.5377`; dense texts tensor f16 `2daa19579316`, tensor `iq4_nl` `3c46e47ab345`, layer f16
+  `e656b50f2cc8`, layer f16 `-fa off` `b96459bf02ca` (all == the delivery); random text `19.0589` /
+  `7.9682` (== the delivery); production arm untouched (sparse f16 `804de0576868`, q4_1 `886292b17a93`,
+  `plain == n_max 3 == n_max 7`, MTP f16 bit-identical `0.56028`/`(0.681, 0.553, 0.447)`,
+  `LLAMA_QSA_OFF=1` `6.5376`); KV reserves unchanged; backend suites OK.
+- **Accepted caveat (do not re-report):** W2's derived per-block bias is not bit-exact for `iq4_nl` — its
+  greedy text (`fcb2d47f94cf`) and MTP acceptance (`0.46203` / pos-1 `(0.717, 0.434, 0.226)`) differ from
+  the delivery's while the sparse-arm PPL is identical (`6.5244`), and `GGML_QSA_DERIVED_*=0` restores the
+  delivery's values exactly; the last ULP flips an indexer top-k boundary.  See `BETA-TESTING.md` §4d.
 - **Optional follow-up (would make V5 free, not needed for the opt-in delivery):** the native-bf16 loss
   is not the conversion (native staging measures within 0.2 % of an f16 cache) but the removed F16
   scratch, which was a *dense, normalised* copy of the cache view (for a 4-KV-head model `nb[1]` is 4×
@@ -186,6 +178,14 @@ Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
   record; the per-win plans under `wip/arch-independent-memory/` + `wip/qwen4exp/qsa-memory/` are the
   designs.
 
+### 15. Enable `-Wshadow` for `src/` (would have caught the Block 15 dense-arm bug as a compile error)
+The 2026-09-11 (11) blocker was a one-token shadowing bug (`ggml_tensor * kq_mask_top_k = ...` inside a
+block that already had an outer declaration of the same name) that made a whole mask chain dead code —
+silent because the code still compiles and the chain still gets built.  `-Wshadow` reports it directly.
+Not currently enabled anywhere in the build.  Proposal: add it to the fork's HIP/CUDA C++ flags (or at
+least to CI) and clean up whatever pre-existing warnings appear; keep it scoped to `src/` first.
+Reference: `GREEDY-PURITY.md` §23.3, `WORKLOG.md` 2026-09-11 (11).
+
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
 
 - **Mixed K/V cache types fall off the GPU attention path.**  Any mixed pair (`bf16`+`q8_0`, `f16`+`q8_0`)
@@ -213,6 +213,17 @@ Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
   `wip/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
+
+**Block 15 dense-arm blocker (2026-09-11 (11)) — FIXED, one line.**  `LLAMA_QSA_SPARSE_FA=0` gave PPL
+`1.0558` for every KV type because the top-k mask chain's `ggml_tensor * kq_mask_top_k` shadowed the outer
+declaration added by the V2/V3 refactor, so the attention got a null mask (a full causal leak).  Found via
+the node dump (the map: the delivery consumed `attn_inp_kq_mask` 36×, the beta 0×) and a `[QDM]` log
+(`kq_mask=1` … `outer_top_k=0`).  Ninth beta re-cut: base `6d3155faa` → tip `3712e2dc1`, tree
+`e39f8c2b6f0593113b93c4e57c512bc7373a2250`, patch 3 811 lines; oracle sparse `6.5394` / dense `6.5377`,
+dense texts and random-text PPL byte-identical to the delivery, production arm untouched.  Details:
+`wip/block15-dense-arm/HANDOVER-2026-09-11-block15-dense-arm.md`, `WORKLOG.md` 2026-09-11 (11),
+`GREEDY-PURITY.md` §23, `beta/block-15-campaign-wins/BETA-TESTING.md` §4c.  Follow-ups filed: `-Wshadow`
+(item 15) and the residual `iq4_nl` W2 sensitivity (accepted, above).
 
 **KV-quant purity / parity campaign — ALL CLOSED (2026-09-11).**  Brief, evidence and tooling:
 `wip/kv-quant-purity-followups/` (`README.md` + `tools/`); analysis: `GREEDY-PURITY.md` §14–§22.

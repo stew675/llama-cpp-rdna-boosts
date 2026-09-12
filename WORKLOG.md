@@ -1,5 +1,65 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-11 (11) — Block 15's dense-arm blocker fixed (a shadowed variable); no delivery change
+
+**Delivery unchanged** (`main` still the 15-patch set at canonical tip `6d3155faa`, tree
+`0c3f0c2c2f4e7439d9489d45573a4021a8eee106`): the defect lived in block 15's own `build_attn_qsa` dense
+path, which is **not** in the delivery (the delivery has no `if (kq_mask != nullptr)` wrapper and no outer
+declaration), so nothing in `patches/` changes.  Only the staged beta patch is amended — the ninth re-cut.
+
+**Root cause (one line, found by instrumentation after every hypothesis in the handover was excluded):**
+the V2/V3 refactor wrapped the top-k mask chain in `if (kq_mask != nullptr) { ... }` and declared an
+*outer* `ggml_tensor * kq_mask_top_k = nullptr;`, leaving the chain's own
+`ggml_tensor * kq_mask_top_k = ggml_set_rows(...)` inside the block as a **new local**.  The chain was
+therefore built whenever the mask existed, but its result never reached the attention — `build_attn_mha`
+received the outer `nullptr`.  Consequences: the chain's nodes were unreachable from the graph output (so
+`ggml_build_forward_expand` never emitted them), the packed mask lost its only consumer (the allocator
+left it unallocated, and block 15's own `if (self_kq_mask && self_kq_mask->buffer)` guard in
+`llm_graph_input_attn_kv::set_input` then skipped `set_input_kq_mask`), and the dense arm attended with **no
+mask at all** — a full causal leak.  Fix: drop the inner `ggml_tensor *` so the block assigns the outer
+variable.
+
+**How it was isolated** (full detail: `wip/block15-dense-arm/HANDOVER-2026-09-11-block15-dense-arm.md`):
+the dense arm also differed in a plain text run; it *still* differed with `-fa off` (⇒ not the FA kernels,
+not V3's derived-mask arm); `beta/block-15-campaign-wins/ab/w4-revert.patch` + rebuild changed nothing (⇒
+not W4); `LLAMA_KQ_MASK_DERIVED=0` removed the resolver's derived-mask warnings (a working positive
+control) but not the leak (⇒ not V3); then the node dump
+(`wip/kv-quant-purity-followups/tools/node-dump-instrumentation.patch`, `GGML_CUDA_NODE_DUMP=1/2` +
+`/tmp/nodedump_on`, `--verbose` needed for the ggml-level INFO lines) showed the delivery's dense prefill
+consuming `attn_inp_kq_mask` 36 times (12 indexer layers × 3 devices) while the beta consumed it **zero**
+times and emitted **no** `FILL`/`SET_ROWS` chain nodes at all; a temporary `[QDM]` log then printed
+`kq_mask=1` (the guard passes) with `outer_top_k=0` (what the attention reads is still null) — the
+shadowing, in one line.  A cheap by-product instrument is now the first thing to try for any "is the model
+seeing the future?" question: **random text** (`/tmp/rand-text.txt`, 40 000 random words) — a model that
+can see the target scores ≈1 on noise, where the broken beta gave `1.0205` and the delivery `19.0589`.
+
+**Gates after the fix (identical configs, against the delivery build):**
+`tools/qsa-ppl-oracle.sh tensor f16` → sparse `6.5394` / dense `6.5377` (= the delivery; the blocker's
+`1.0558` is gone); dense-arm greedy texts byte-identical to the delivery — tensor f16 `2daa19579316` (720
+chars), tensor `iq4_nl` `3c46e47ab345` (680), layer f16 `e656b50f2cc8` (685), layer f16 `-fa off`
+`b96459bf02ca` (703); random-text PPL `19.0589` @ c2560/ub2560 and `7.9682` @ c4096/ub512 (= the delivery);
+production arm untouched — sparse f16 `804de0576868`, q4_1 `886292b17a93`, `plain == n_max 3 == n_max 7`,
+MTP f16 `acc 0.56028` / pos-1 `(0.681, 0.553, 0.447)` bit-identical to the delivery on the same command,
+`LLAMA_QSA_OFF=1` `6.5376`; the KV reserves are unchanged by the fix and still show the campaign's
+mask-elision win (`1600.00 + 600.00` MiB at c204800/ub512 f16 vs the delivery's `1600.00 + 1800.00`, in
+both arms); backend suites OK.  The pre-existing `iq4_nl` W2 sensitivity is unchanged (its greedy text
+`fcb2d47f94cf` and MTP `0.46203`/`(0.717, 0.434, 0.226)` stay off the delivery's values, and
+`GGML_QSA_DERIVED_* =0` restores them exactly — verified) because the sparse arm never enters the fixed
+block.
+
+**Beta:** ninth re-cut — base `6d3155faa` → beta tip **`3712e2dc1`**, tree
+**`e39f8c2b6f0593113b93c4e57c512bc7373a2250`**, patch **3 811 lines** (the 8th re-cut + 1 diff line + the
+commit-message paragraph); `git am -3` on a fresh base reproduces the tree exactly.  Records:
+`beta/block-15-campaign-wins/{README,BETA-TESTING,HANDOVER}.md`; the revalidation pointer in
+`TODO.md`.
+
+**Lessons recorded in `GREEDY-PURITY.md` §23:** (1) a graph tensor with no consumer is *silently* dropped —
+the allocator leaves it unallocated and the input fill is skipped, so "the input is in the graph" proves
+nothing; (2) in a refactor that adds an outer declaration, an inner `Type * name = ...` **shadows** it and
+the result is dead code that still compiles — `-Wshadow` (not currently enabled) would have caught this
+class outright; (3) when a chain's nodes are missing from an executed-graph dump, suspect the *graph
+builder* (reachability), not the allocator.
+
 ## 2026-09-11 (10) — `iq4_nl` becomes a first-class FA KV type (F3 step 2), and the beta re-cut finds a Block 15 blocker
 
 **Canonical tip `6d3155faa`** (block 08 amended a fifth time, block 14 a fifth time), net tree

@@ -827,3 +827,38 @@ Three things this enablement taught that generalise:
   same-seed/MTP gate can see, and one that only surfaced because this session's gate list runs the
   perplexity oracle as a matter of course.  Keep the oracle in the list, even when its answer is
   expected to be "unchanged".
+
+## 23. A silently dead chain: the shadowed variable (2026-09-11 (11), Block 15 dense-arm blocker)
+
+**The bug, in one line:** block 15's V2/V3 refactor added an *outer* `ggml_tensor * kq_mask_top_k =
+nullptr;` in `build_attn_qsa` while the top-k mask chain *inside* the new `if (kq_mask != nullptr) { ... }`
+wrapper kept its own `ggml_tensor * kq_mask_top_k = ggml_set_rows(...)` — a **new local** that shadowed the
+outer one.  The chain was therefore built whenever the mask existed, and the attention
+(`build_attn_mha(q, k, v, nullptr, kq_mask_top_k, ...)`) read the outer one: `nullptr`.  The dense masked
+arm attended with no mask at all — a full causal leak, seen as PPL `1.0558` on qwen4exp for every KV type
+where the delivery gives `6.49-6.55`, and as ≈`1.02` on *random* text where a working build gives `18.4`.
+
+**Four generalisable lessons:**
+
+1. **A graph tensor with no consumer is silently dropped.**  The chain's nodes were unreachable from the
+graph output, so `ggml_build_forward_expand` never emitted them; with no consumer the allocator left the
+packed mask unallocated, and block 15's own `if (self_kq_mask && self_kq_mask->buffer)` guard in
+`llm_graph_input_attn_kv::set_input` then skipped `set_input_kq_mask` entirely.  So "the input is created
+in the graph" proves nothing about it being *filled* — and an unfilled mask is indistinguishable from a
+correct one until you measure quality.  A defensive check (assert the mask was filled when a consumer
+exists) is worth considering for the beta.
+2. **When an executed-graph dump is *missing* nodes, suspect the graph builder, not the allocator.**  The
+   `[ND]` node dump showed the delivery's dense prefill consuming `attn_inp_kq_mask` 36 times (12 indexer
+   layers × 3 devices) and emitting the `FILL`/`SET_ROWS`/zeros chain, while the beta consumed it **zero**
+   times and emitted **no** `FILL` at all.  Dead code is absent from the graph *by construction* — that is
+   the signature, and it points straight at the builder.
+3. **`-Wshadow` would have caught this class outright.**  The fork does not enable it.  Adding it (at
+   least for `src/` on the CI path) would make this whole failure mode a compile error; the fix itself is
+   one token.  Filed as a follow-up.
+4. **The leak instrument to reach for first is random text.**  A model that can see the target predicts
+   *anything* — including noise — near-perfectly: `llama-perplexity -f /tmp/rand-text.txt --chunks 1
+   -c 2560 -b 2560 -ub 2560` gave the broken build `1.0205` and the delivery `19.0589`.  Natural, or even
+   repetitive, text is a *bad* leak detector (a repetitive prompt scores ≈1 in a perfectly healthy build,
+   which sent this session down a false trail until random text settled it).  Keep both the oracle and the
+   random-text probe in the gate list; they answer different questions ("is the fused path as good as the
+   dense one?" vs "is the attention causal?").

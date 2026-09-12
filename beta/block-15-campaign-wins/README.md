@@ -7,7 +7,7 @@
 **Status: BETA — staged, NOT promoted (2026-09-10); REVALIDATED 2026-09-11
 against the 15-patch delivery.**  The campaign is
 complete and the block-15 patch lives **only in this directory**
-(`block-15-campaign-wins.patch`, re-cut 2026-09-11 (10) on base `6d3155faa`); it is **not part of the
+(`block-15-campaign-wins.patch`, re-cut 2026-09-11 (11) on base `6d3155faa`); it is **not part of the
 delivery** (`patches/` is the 15-patch set: block 00 + blocks 01-14) and is
 applied manually on top of the 15-block tree.  The beta window (~4–5 days) is open for tester feedback;
 promotion into the delivery set requires the maintainer's go-ahead (at
@@ -24,6 +24,44 @@ now a **15-patch set**: block 00 + blocks 01-14 at canonical tip **`389c5341f`**
 tree `928852cdc`, with block 13 amended twice on 2026-09-11), so the beta patch was
 re-cut and re-validated end to end.
 
+* **Re-cut a ninth time 2026-09-11 (11) — the dense-arm BLOCKER (§4c) is FIXED, one line.**  The defect
+  was a variable-shadowing bug in block 15's own `build_attn_qsa` dense path: the V2/V3 refactor wrapped
+  the top-k mask chain in `if (kq_mask != nullptr) { ... }` and declared an *outer* `kq_mask_top_k`,
+  leaving the chain's own `ggml_tensor * kq_mask_top_k = ggml_set_rows(...)` inside the block as a **new
+  local** — so the chain was built whenever the mask existed, but its result never reached the attention
+  (`build_attn_mha` got the outer `nullptr`).  The chain's nodes were then unreachable from the graph
+  output (ggml never emitted them), the packed mask lost its only consumer (the allocator dropped it, and
+  block 15's `if (self_kq_mask->buffer)` fill guard then skipped `set_input_kq_mask`), and the dense arm
+  attended with **no mask at all** — a full causal leak.  Fixed by dropping the inner `ggml_tensor *` so
+  the block assigns the outer variable.  New beta tip **`3712e2dc1`**, tree
+  **`e39f8c2b6f0593113b93c4e57c512bc7373a2250`**, patch **3 811 lines** (the 8th re-cut + 1 line + the
+  commit-message paragraph); `git am -3` on a fresh `6d3155faa` reproduces that tree exactly.
+  * **How it was found** (full detail in
+    `wip/block15-dense-arm/HANDOVER-2026-09-11-block15-dense-arm.md`): the dense arm also differed in a
+    plain text run; it *still* differed with `-fa off` (⇒ not the FA kernels, not V3's derived-mask arm);
+    `ab/w4-revert.patch` changed nothing (⇒ not W4); `LLAMA_KQ_MASK_DERIVED=0` removed the resolver's
+    derived-mask warnings but not the leak (⇒ not V3); the **node dump**
+    (`wip/kv-quant-purity-followups/tools/node-dump-instrumentation.patch`, `GGML_CUDA_NODE_DUMP=1/2` +
+    the `/tmp/nodedump_on` sentinel) showed the delivery's dense prefill consuming `attn_inp_kq_mask`
+    36 times (12 indexer layers × 3 devices) while the beta consumed it **zero** times and emitted no
+    `FILL`/`SET_ROWS` chain nodes at all; a temporary `[QDM]` log then printed `kq_mask=1` (the chain's
+    guard passes) together with `outer_top_k=0` (the variable the attention reads is still null).
+    A cheaper leak instrument emerged on the way: **random text** (a model that can see the target
+    scores ≈1 on noise) — `-f /tmp/rand-text.txt --chunks 1 -c 2560 -b 2560 -ub 2560` gave the broken
+    beta `1.0205` where the delivery gives `19.0589`.
+  * **Gates after the fix (identical configs, against the delivery build):** the oracle
+    `tools/qsa-ppl-oracle.sh tensor f16` → **sparse `6.5394` / dense `6.5377`**, exactly the delivery's
+    (the blocker's `1.0558` is gone); dense-arm greedy texts **byte-identical to the delivery** — tensor
+    f16 `2daa19579316` (720 chars), tensor `iq4_nl` **`3c46e47ab345`** (680), layer f16
+    **`e656b50f2cc8`** (685), layer f16 `-fa off` **`b96459bf02ca`** (703); random-text PPL
+    (`19.0589` @ c2560/ub2560, `7.9682` @ c4096/ub512) equal to the delivery's; the production arm
+    untouched (sparse f16 `804de0576868`, q4_1 `886292b17a93`, `plain == n_max 3 == n_max 7`, MTP f16
+    `acc 0.56028` / pos-1 `(0.681, 0.553, 0.447)` bit-identical to the delivery on the same command,
+    `LLAMA_QSA_OFF=1` `6.5376`); the KV reserves are unchanged by the fix and still carry the campaign's
+    mask-elision win (beta `1600.00 + 600.00` MiB at c204800/ub512 f16 vs the delivery's
+    `1600.00 + 1800.00`, in *both* arms); backend suites OK (`FLASH_ATTN_QSA`, `GATED_DELTA_NET`,
+    `FLASH_ATTN_EXT`).  The `iq4_nl` W2 caveat below is unchanged by the fix (the sparse arm never enters
+    the fixed block), as expected.
 * **Re-cut an eighth time 2026-09-11 (10)** after the fifth block-08 amendment + the iq4_nl half of the
   F3 step-2 work moved the canonical tip (block 08 gained `iq4_nl` in the FA predicate/vec dispatch/three
   CMake default lists + the 15 missing `fattn-vec-instance-iq4_nl-*.cu` files + `dequantize_q4_nl` + the
@@ -46,7 +84,8 @@ re-cut and re-validated end to end.
     block 15's `cell_vis` plumbing is right for the new type), `GATED_DELTA_NET` 46/46,
     `FLASH_ATTN_EXT` **5940/5940**; `LLAMA_QSA_OFF=1` PPL `6.5376` == the delivery's `6.5376`; the
     production sparse PPL for `iq4_nl` `6.5244` == the delivery's `6.5244`.
-  * **BLOCKER FOUND (block 15, pre-existing, not a re-cut artefact): the dense masked arm is broken.**
+  * **~~BLOCKER FOUND~~ RESOLVED by the ninth re-cut above — kept for the record.**  Original finding:
+    **BLOCKER (block 15, pre-existing, not a re-cut artefact): the dense masked arm is broken.**
     `LLAMA_QSA_SPARSE_FA=0` gives **PPL `1.0558 +/- 0.003` for every KV type** (f16 `1.0558`, q4_0
     `1.0552`, q4_1 `1.0500`, q8_0 `1.0552`, `iq4_nl` `1.0554`) where the delivery gives `6.49-6.55` (f16
     `6.5377`) - a near-1 PPL is the signature of a lost causal constraint, and that arm is this repo's

@@ -1,4 +1,4 @@
-From d0f71b2e84bf8fb8ed305336e4cb01344cc43e74 Mon Sep 17 00:00:00 2001
+From 3712e2dc1951aee6a827553007bee70209dc6e63 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -165,6 +165,21 @@ V3 -799.20 MiB compute / -799.21 host, V5 bf16 968.86 -> 256.86, V4 q8_0
 and llama-server --parallel 4 (the config that aborted before) now
 serves and passes the 16-run gate.  Discrete GPUs are unaffected (they
 report GGML_BACKEND_DEVICE_TYPE_GPU and normally have n_stream == 1).
+
+Amended 2026-09-11 (9th re-cut): fix a variable-shadowing bug in build_attn_qsa that broke the
+LLAMA_QSA_SPARSE_FA=0 dense arm for every model/type.  The V2/V3 refactor wrapped the top-k mask
+chain in `if (kq_mask != nullptr) { ... }` and added an outer `kq_mask_top_k` declaration, leaving
+the chain's own `ggml_tensor * kq_mask_top_k = ggml_set_rows(...)` inside the block as a NEW local.
+The chain was therefore built (whenever the mask existed) but its result never reached the
+attention: build_attn_mha got the outer `nullptr`, the chain's nodes were unreachable from the
+graph output (so ggml never emitted them), the packed mask lost its only consumer (so the
+allocator dropped it and set_input_kq_mask was skipped), and the dense arm attended with no mask
+at all - a full causal leak.  Observed as qwen4exp perplexity ~1.02-1.06 on every KV type
+(delivery: 6.49-6.55), and as ~1.03 on RANDOM text (delivery ~18.4), with dense-arm greedy text
+differing from the delivery.  Fixed by assigning the block's result to the outer variable
+(dropping the inner `ggml_tensor *`).  The production (sparse) arm never enters that block, so it
+is bit-identical before and after.  See beta/block-15-campaign-wins/BETA-TESTING.md 4c and
+WORKLOG.md 2026-09-11 (11).
 ---
  ggml/include/ggml.h                  |  31 ++-
  ggml/src/ggml-alloc.c                |  35 +++
@@ -187,9 +202,9 @@ report GGML_BACKEND_DEVICE_TYPE_GPU and normally have n_stream == 1).
  src/llama-kv-cache.h                 |  20 +-
  src/llama-memory-hybrid-idx.cpp      |  95 +++++++-
  src/llama-memory-hybrid-idx.h        |  17 +-
- src/models/qwen4exp.cpp              | 335 ++++++++++++++++++++++-----
+ src/models/qwen4exp.cpp              | 337 ++++++++++++++++++++++-----
  tests/test-backend-ops.cpp           |  55 ++++-
- 23 files changed, 1920 insertions(+), 235 deletions(-)
+ 23 files changed, 1921 insertions(+), 236 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 1a8e68103..8b9ebb315 100644
@@ -3216,7 +3231,7 @@ index 4b30994d1..c5ce4bd51 100644
                         int32_t * dst_derived_from = nullptr,
                         int32_t * dst_derived_lim  = nullptr) const;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8c4076307..5b4015b41 100644
+index 8c4076307..2f803b01f 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -935,20 +935,104 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
@@ -3606,6 +3621,15 @@ index 8c4076307..5b4015b41 100644
      // prepare new kq mask - starts filled with -INFINITY
      ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
  
+@@ -1270,7 +1509,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+ 
+     // modify KQ mask by unmasking elements that are in top_k indices
+     // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
+-    ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
++    kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
+ 
+     // reshape to restore the original shape of KQ mask:
+     // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
 @@ -1278,38 +1517,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
  
      // combine with the original kq mask

@@ -1,5 +1,26 @@
 # HANDOVER — TODO item 1: the Block 15 dense-arm defect (`LLAMA_QSA_SPARSE_FA=0`)
 
+# HANDOVER — TODO item 1: the Block 15 dense-arm defect (`LLAMA_QSA_SPARSE_FA=0`)
+
+> **OUTCOME (2026-09-11 (11)): SOLVED — the task is done; this file is the record of how.**  The defect was
+> a **variable-shadowing bug** in block 15's own `build_attn_qsa` dense path: the V2/V3 refactor added an
+> outer `ggml_tensor * kq_mask_top_k = nullptr;` while the top-k mask chain *inside*
+> `if (kq_mask != nullptr) { ... }` still declared its own `kq_mask_top_k`, so the chain was built but its
+> result never reached the attention (`build_attn_mha` got the outer `nullptr`).  The chain's nodes were
+> then unreachable from the graph output, the packed mask lost its only consumer (unallocated + unfilled)
+> and the dense arm attended with no mask at all — the causal leak.  Fix: drop the inner
+> `ggml_tensor *`.  Steps 5.1-5.3 below were followed; the decisive instrument was the node dump (the
+> delivery consumed `attn_inp_kq_mask` 36× in its dense prefill, the beta **zero** times and emitted no
+> `FILL`/`SET_ROWS` chain nodes), confirmed by a temporary `[QDM]` log printing `kq_mask=1` …
+> `outer_top_k=0`.  Ninth re-cut landed: base `6d3155faa` → beta tip **`3712e2dc1`**, tree
+> **`e39f8c2b6f0593113b93c4e57c512bc7373a2250`**, patch **3 811 lines**.  Post-fix gates (vs the delivery,
+> identical configs): oracle sparse `6.5394` / dense `6.5377`; dense texts tensor f16 `2daa19579316`,
+> tensor `iq4_nl` `3c46e47ab345`, layer f16 `e656b50f2cc8`, layer f16 `-fa off` `b96459bf02ca`;
+> random text `19.0589` / `7.9682`; production arm untouched.  See `WORKLOG.md` 2026-09-11 (11) and
+> `beta/block-15-campaign-wins/BETA-TESTING.md` §4c.  Two instruments worth reusing for any "does the model
+> see the future?" question: **random text** with `llama-perplexity` (a leak scores ≈1 on noise) and the
+> **node dump** (a tensor whose consumer is missing is *silently* dropped by the allocator).
+
 **Read this file first; it is self-contained for this task.**  The shared environment, instruments,
 reference hashes and landing procedure are in
 `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-remaining-work.md` §2–§5/§12/§13 (its *plan* is
@@ -238,6 +259,11 @@ delivery repo's `origin`.
   delivery amendment.
 
 ## 9. Reference points
+
+> **Post-fix state (2026-09-11 (11)):** the beta is the ninth re-cut — `/tmp/blk15x` @ **`3712e2dc1`**
+> (branch `blk15-iq4`), tree **`e39f8c2b6f0593113b93c4e57c512bc7373a2250`**, patch **3 811 lines**
+> (`git am -3` on `6d3155faa`, same `qwen4exp_qsa_sparse()` `iq4_nl` conflict).  The values in the table
+> below are the *pre-fix* eighth re-cut and are kept only to show what the broken build looked like.
 
 * Delivery: `/tmp/canon-llama` @ `6d3155faa`, tree `0c3f0c2c2f4e7439d9489d45573a4021a8eee106`;
   build `build-base`; binaries `build-base/bin/{llama-cli,llama-perplexity,test-backend-ops}`.

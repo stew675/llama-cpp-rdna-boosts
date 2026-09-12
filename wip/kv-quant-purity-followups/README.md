@@ -321,5 +321,14 @@ a maintainer call — the current fork behaviour is to accept the pair and silen
   `res`/`kv` (reserves via `-v`), `coh` (same-seed text), `mtp` (27B / qwen4exp / MoE acceptance),
   `bench` (interleaved llama-bench), `width` (the probe matrix).  `BIN`/`PROBE` select the build
   under test; extra `KEY=VAL` args are exported for that run.
+* `tools/leakgate.sh` — **the causal-boundary gate** (2026-09-11 (11)): perplexity of *random* text (a
+  model that can see its target predicts even noise near-perfectly, so a leak collapses the PPL to ~1
+  while a healthy build stays in the tens).  Natural/repetitive text is a bad leak detector — see
+  `GREEDY-PURITY.md` §23.4.  Usage: `leakgate.sh <bin-dir> [n_ctx] [ubatch] [env...]`; reference values
+  in the header.  This instrument, plus the node dump and a temporary `[QDM]` log, root-caused and
+  fixed the Block 15 dense-arm blocker — the brief and the full evidence chain are in
+  [`../block15-dense-arm/HANDOVER-2026-09-11-block15-dense-arm.md`](../block15-dense-arm/HANDOVER-2026-09-11-block15-dense-arm.md)
+  (now with an OUTCOME banner: a one-line shadowed variable in `build_attn_qsa`).
 * Auxiliary inputs (not committed; recreate if missing): the 40k prompt (`/tmp/t-q40.txt` was used),
-  `p0long.txt` (in this repo) and `/tmp/tiny.txt`.
+  `p0long.txt` (in this repo) and `/tmp/tiny.txt`.  `tools/leakgate.sh` recreates `/tmp/rand-text.txt`
+  itself when it is missing.
