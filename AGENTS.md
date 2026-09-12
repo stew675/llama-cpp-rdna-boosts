@@ -113,6 +113,14 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   `ggml/src/ggml-cpu/ops.cpp` plus a `FLASH_ATTN_QSA` backend-op test (18 cases) — the kernel had
   no oracle at all before, which is why a width-pure corruption survived every gate.  See
   `GREEDY-PURITY.md` §21 and the block-14 notes in `patches/README.md`.
+  **Amended 2026-09-12 (seventh) with the MTP-export logits-purity fix** (the last layer always gathers
+  its output rows; the unmasked `embeddings_nextn` export gets a separate full-row tail for `t_h_nextn`
+  — `GREEDY-PURITY.md` §28) **and (eighth) with the QSA indexer-score decode/verify band-uniformity fix**
+  (the score flattens the indexer heads into `ne11 = n_idx_h * n_tps = 4 * n_tps`, which crossed
+  `MMVF_MAX_BATCH_SIZE` at `n_tps = 3`, so the verify batch fell through to MMF while decode stayed on
+  MMVF and a top-k near-tie flipped; the guard now covers the whole flattened band
+  `MMVF_MAX_BATCH_SIZE_FLAT = 32` with `mul_mat_vec_f` instantiated for `ncols_dst` 9..32 —
+  `GREEDY-PURITY.md` §29).
   See the block-14 notes in `patches/README.md` and the beta
   validation record in `beta/qwen4exp/README.md`.
 - Block **15** (STAGED in `beta/block-15-campaign-wins/`, **NOT a delivery patch**): the attention-memory campaign wins --
@@ -510,15 +518,17 @@ Consequences, so it is not re-litigated:
   export (`common/speculative.cpp:1431`) defers qwen4exp's last-layer output gather (`gather_now`,
   `src/models/qwen4exp.cpp`) and shifted the prefill's last-position logits by a ULP
   (`ad3acaa7…` vs `b624a79f…`) — is **fixed** (the last layer always gathers its output rows;
-  the export gets a separate full-row tail, `mstep NEXTN=1` 0 mismatches, was 1); sub-item (b),
-  the prompt-dependent q8_0 dependence in the *forced*-sparse shallow regime
-  (`plain a57bc13bbf2a` vs `n3 3124adfd2b94`, `p5000.txt`), survives a genuine driver-level
-  investigation and is **recorded, deliberately not fixed** (a target-logits dump of the real
-  `server-context.cpp` driver pins the first divergence to target position 4432, identical accepted
-  token, argmax 264 -> 9859; forward width, the GDN rollback bound/checkpoint restore (`n_rs_seq = 16`
-  forced), `n_outputs_max`, CUDA graphs, the chunked-prefill boundary, the fused indexer
-  score/derived cache and the sparse FA kernel are all excluded; `LLAMA_QSA_OFF=1` is the
-  affordance).  See `GREEDY-PURITY.md` §§16-18, §28 and
+  the export gets a separate full-row tail, `mstep NEXTN=1` 0 mismatches, was 1); sub-item (b) was
+  **re-opened by the gfx1201 investigation and root-caused + fixed** (2026-09-12 (13), block-14
+  amendment (eighth)): the *forced*-sparse q8_0 forward is width-dependent at W >= 3 because the
+  indexer score flattens its heads into `ne11 = 4 * n_tps`, which crosses `MMVF_MAX_BATCH_SIZE` at
+  `n_tps = 3` (verify -> MMF, decode -> MMVF) and flips a top-k near-tie; the guard now covers the whole
+  flattened band (`MMVF_MAX_BATCH_SIZE_FLAT` = 32, `ncols_dst` 9..32 instantiated) so W = 1..8 is
+  bit-identical with decode's `Thash` unchanged (the earlier "driver-level, not a width dependence"
+  conclusion was drawn from gfx1151's `mstep`, which is pure there).  The gfx1151 `plain != draft-mtp`
+  **text** residual (`a57bc13bbf2a` vs `n3 3124adfd2b94`) did not reproduce on gfx1201; a cross-check on
+  gfx1151 against branch `block14-band-uniformity` is pending (TODO item 17).  See `GREEDY-PURITY.md`
+  §§16-18, §28-§29 and
   `wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`.
 - The one-sided AR wait (dev0/bus-06 dispatch-gap asymmetry, ~12.7 µs/call)
   is a **platform-level CP/driver property**, not reachable from the AR

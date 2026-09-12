@@ -7,7 +7,7 @@
 **Status: BETA — staged, NOT promoted (2026-09-10); REVALIDATED 2026-09-11
 against the 15-patch delivery.**  The campaign is
 complete and the block-15 patch lives **only in this directory**
-(`block-15-campaign-wins.patch`, re-cut 2026-09-12 (12) on base `c6f1e8e78`, beta tip `bdd09891d`); it is **not part of the
+(`block-15-campaign-wins.patch`, re-cut 2026-09-12 (13) on base `d306d4b4b`, beta tip `f399b1349`); it is **not part of the
 delivery** (`patches/` is the 15-patch set: block 00 + blocks 01-14) and is
 applied manually on top of the 15-block tree.  The beta window (~4–5 days) is open for tester feedback;
 promotion into the delivery set requires the maintainer's go-ahead (at
@@ -36,6 +36,15 @@ re-cut and re-validated end to end.
   dense `6.5377`, and the new K/V reject fires in the beta build).  **Testers: pass matching
   `-ctk`/`-ctv`** (the hard reject applies to the beta too; every
   script here already does).  See `BETA-TESTING.md` (the dated tenth-re-cut section).
+* **Re-cut a seventeenth time 2026-09-12 (13)** after the block-14 **QSA indexer-score decode/verify
+  band-uniformity fix** amendment (the root cause of TODO item 4(b)'s gfx1201 width dependence).  Base
+  **`d306d4b4b`** (tree `3b0874b6aa367fea846a437b45f1689bd173b38c`) -> **beta tip `f399b1349`**, tree
+  **`c3142fe0b311757f458647f172f623859f5bc983`**.  The apply was conflict-free: block 15 does not touch
+  the three delivery files this amendment changes (`ggml/src/ggml-cuda/mmvf.cu`, `mmvf.cuh`,
+  `ggml-cuda.cu`), and round-tripped (fresh worktree at the new base + strict `git am` -> identical
+  tree).  gfx1151 revalidation is pending against the delivery branch `block14-band-uniformity` (the
+  same branch carries the fix); the block-15 gate table is unchanged and the amendment is expected to
+  be tester-neutral (it only changes the kernel family of flattened `ne11` 9..32 matmuls).
 * **Re-cut a sixteenth time 2026-09-12 (12)** after the block-14 **MTP-export logits-purity fix**
   amendment (TODO item 4(a)).  Base **`c6f1e8e78`** (tree
   `e1e42e23c2913cd529b0064eb1cb74525a746098`) -> **beta tip `bdd09891d`**, tree

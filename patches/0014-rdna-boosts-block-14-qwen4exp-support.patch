@@ -1,4 +1,4 @@
-From c6f1e8e78cfb2a70958998cdd81fad363e869f93 Mon Sep 17 00:00:00 2001
+From d306d4b4b194738dd5baad89ef77fa31a931e8ff Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/14] rdna-boosts: block 14: qwen4exp support
@@ -111,6 +111,26 @@ probe is 0 mismatches with the W=8 position list unmoved, the default
 and forced-sparse text gates are byte-identical, MTP acceptance is
 bit-identical (f16 0.51678 = 77/149 pre- and post-fix), and the graph is
 a no-op on every non-NEXTN path.  Instrument: wip/strix-halo/qsa-item4/.
+
+Amended 2026-09-12 (eighth) with the decode/verify band-uniformity fix
+for the QSA indexer score.  The score's matmul carries the indexer heads
+in its N dimension, so its ne11 is n_idx_h * n_tps (4 * n_tps for
+qwen4exp); block 08's "keep the verify batch on the decode kernel" guard
+only covered ne11 <= MMVF_MAX_BATCH_SIZE (8), so from n_tps = 3 the
+verify batch fell through to MMF while decode (n_tps = 1) stayed on
+MMVF.  The two families accumulate the truncated dot product differently,
+so the indexer score differed by a ULP and flipped a top-k near-tie: the
+forward was bit-identical to decode for 101 steps and then diverged.
+The guard now keeps the whole flattened band on the decode family
+(ne11 <= MMVF_MAX_BATCH_SIZE_FLAT = 32) and mul_mat_vec_f is instantiated
+for ncols_dst 9..32.  The guard is block 08's; block 14 extends it
+because it is the block that introduces the flattened batch.  Verified
+on gfx1201 (3x R9700, layer split): mstep W = 1,2,3,4,5,8 all 0
+mismatches (was W >= 3 impure), the W = 1 reference Thash is unchanged
+(2bd73063dd0a9524) so decode numerics are untouched, the f16 band stays
+pure, and the forced-sparse q8_0 and default text gates are
+byte-identical (a4cdc10dfb6c / 2e078b6966c0).  Cross-check on gfx1151
+pending.  Instruments: wip/strix-halo/qsa-item4/.
 ---
  common/arg.cpp                         |   22 +
  common/common.cpp                      |    1 +
@@ -128,7 +148,7 @@ a no-op on every non-NEXTN path.  Instrument: wip/strix-halo/qsa-item4/.
  ggml/src/ggml-cuda/concat.cu           |   73 ++
  ggml/src/ggml-cuda/fattn-qsa.cu        |  705 +++++++++++++++
  ggml/src/ggml-cuda/fattn-qsa.cuh       |   24 +
- ggml/src/ggml-cuda/ggml-cuda.cu        |  726 +++++++++++----
+ ggml/src/ggml-cuda/ggml-cuda.cu        |  732 +++++++++++----
  ggml/src/ggml-cuda/hc-mix.cu           |  535 +++++++++++
  ggml/src/ggml-cuda/hc-mix.cuh          |    5 +
  ggml/src/ggml-cuda/hyperconn.cu        |  375 ++++++++
@@ -139,6 +159,8 @@ a no-op on every non-NEXTN path.  Instrument: wip/strix-halo/qsa-item4/.
  ggml/src/ggml-cuda/indexer-topk.cuh    |    7 +
  ggml/src/ggml-cuda/mmid.cu             |   63 ++
  ggml/src/ggml-cuda/mmq.cuh             |   28 +-
+ ggml/src/ggml-cuda/mmvf.cu             |  168 ++++
+ ggml/src/ggml-cuda/mmvf.cuh            |    6 +
  ggml/src/ggml-cuda/quantize.cuh        |   13 +-
  ggml/src/ggml-cuda/unary.cu            |   15 +-
  ggml/src/ggml-moe-weighted-reduction.h |  160 ++++
@@ -164,7 +186,7 @@ a no-op on every non-NEXTN path.  Instrument: wip/strix-halo/qsa-item4/.
  tests/test-backend-ops.cpp             |  110 +++
  tests/test-lazy-reader.cpp             |  264 ++++++
  tests/test-llama-archs.cpp             |    7 +-
- 52 files changed, 7086 insertions(+), 326 deletions(-)
+ 54 files changed, 7265 insertions(+), 327 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
@@ -2268,7 +2290,7 @@ index 000000000..d44d06be9
 +void ggml_cuda_flash_attn_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +bool ggml_cuda_flash_attn_qsa_supported(int device, const ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 9d8a9ae26..7db439871 100644
+index 9d8a9ae26..576fdf6fd 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -2297,7 +2319,20 @@ index 9d8a9ae26..7db439871 100644
  #include "ggml-cuda/set.cuh"
  #include "ggml-cuda/set-rows.cuh"
  #include "ggml-cuda/pad_reflect_1d.cuh"
-@@ -2555,6 +2561,19 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2028,7 +2034,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     // decode (ne11 = 1): decode uses the MMVF kernel, while a larger batch can
+     // fall through to MMF, which accumulates differently and produces different
+     // logits. Use the decode (ne11 = 1) config for all small batches.
+-    const int64_t ne11_mmvf = ne11 <= MMVF_MAX_BATCH_SIZE ? 1 : ne11;
++    // The QSA indexer score flattens heads*tokens into ne11 (4*n_tps for qwen4exp), so the
++    // decode/verify band can reach ne11 = MMVF_MAX_BATCH_SIZE_FLAT while its token count is
++    // still <= MMVF_MAX_BATCH_SIZE.  Keep the whole band on the decode family (MMVF) or the
++    // verify batch falls through to MMF and accumulates differently.
++    const int64_t ne11_mmvf = ne11 <= MMVF_MAX_BATCH_SIZE_FLAT ? 1 : ne11;
+     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11_mmvf)) {
+         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
+         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+@@ -2555,6 +2565,19 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_FLASH_ATTN_EXT:
              ggml_cuda_flash_attn_ext(ctx, dst);
              break;
@@ -2317,7 +2352,7 @@ index 9d8a9ae26..7db439871 100644
          case GGML_OP_CROSS_ENTROPY_LOSS:
              ggml_cuda_cross_entropy_loss(ctx, dst);
              break;
-@@ -2579,6 +2598,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -2579,6 +2602,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
          case GGML_OP_DSV4_HC_POST:
              ggml_cuda_op_dsv4_hc_post(ctx, dst);
              break;
@@ -2330,7 +2365,7 @@ index 9d8a9ae26..7db439871 100644
          case GGML_OP_RWKV_WKV7:
              ggml_cuda_op_rwkv_wkv7(ctx, dst);
              break;
-@@ -3296,151 +3321,6 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+@@ -3296,151 +3325,6 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
      return is_ok;
  }
  
@@ -2482,7 +2517,7 @@ index 9d8a9ae26..7db439871 100644
  static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                 int                                       node_idx,
                                 std::initializer_list<enum ggml_op>       ops,
-@@ -3693,6 +3573,75 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -3693,6 +3577,75 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
  }
  
  // try and fuse nodes and return the number of nodes to skip
@@ -2558,7 +2593,7 @@ index 9d8a9ae26..7db439871 100644
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-@@ -3703,15 +3652,113 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3703,15 +3656,113 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing
      static bool disable_moe_mmq = getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_MMQ_FUSION"));
  
@@ -2674,7 +2709,7 @@ index 9d8a9ae26..7db439871 100644
                  ggml_cuda_op_moe_weighted_reduction(
                      *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                  return match.node_count - 1;
-@@ -4954,6 +5001,362 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4954,6 +5005,362 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 1;
      }
  
@@ -3037,7 +3072,7 @@ index 9d8a9ae26..7db439871 100644
      if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
          ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-@@ -5222,7 +5625,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5222,7 +5629,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                  }
                  GGML_ASSERT(ok);
@@ -3045,7 +3080,7 @@ index 9d8a9ae26..7db439871 100644
                  if (op_timing) {
                      CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
                      op_nodes.emplace_back(node, i, false);
-@@ -5463,8 +5865,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5463,8 +5869,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  continue;
              }
  
@@ -3056,7 +3091,7 @@ index 9d8a9ae26..7db439871 100644
                  continue;
              }
  
-@@ -5763,6 +6165,14 @@ static std::string ggml_cuda_device_description(int device) {
+@@ -5763,6 +6169,14 @@ static std::string ggml_cuda_device_description(int device) {
          description += " (dev p" + std::to_string(info.devices[device].physical_device) +
                         "/v" + std::to_string(info.devices[device].virtual_index) + ")";
      }
@@ -3071,7 +3106,7 @@ index 9d8a9ae26..7db439871 100644
      return description;
  }
  
-@@ -6452,8 +6862,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6452,8 +6866,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
@@ -5228,6 +5263,202 @@ index 801f990d2..1a512b296 100644
              const int64_t rows_per_expert = (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y;
              const bool use_j48_128e = mmq_rdna3_5_id_use_j48_128e(type, args.nchannels_y, rows_per_expert);
              int J_rdna3_5 = use_j48_128e ? 48 : mmq_rdna3_5_id_get_J(type, rows_per_expert);
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index bd5c5d421..c500442e5 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -600,6 +600,174 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
+                  stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  nsamples_dst, ids_stride, stream);
+             break;
++        case 9:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 9>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 10:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 10>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 11:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 11>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 12:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 12>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 13:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 13>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 14:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 14>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 15:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 15>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 16:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 16>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 17:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 17>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 18:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 18>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 19:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 19>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 20:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 20>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 21:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 21>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 22:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 22>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 23:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 23>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 24:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 24>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 25:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 25>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 26:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 26>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 27:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 27>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 28:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 28>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 29:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 29>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 30:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 30>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 31:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 31>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 32:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 32>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
+         default:
+             GGML_ABORT("fatal error");
+             break;
+diff --git a/ggml/src/ggml-cuda/mmvf.cuh b/ggml/src/ggml-cuda/mmvf.cuh
+index a50f7c021..b8545077a 100644
+--- a/ggml/src/ggml-cuda/mmvf.cuh
++++ b/ggml/src/ggml-cuda/mmvf.cuh
+@@ -1,6 +1,12 @@
+ #include "common.cuh"
+ 
+ #define MMVF_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVF kernels.
++// The QSA indexer score flattens its indexer heads into the matmul's N dimension, so the
++// decode/verify band (n_tokens <= MMVF_MAX_BATCH_SIZE) spans n_idx_h * n_tokens columns.
++// That whole band must stay on the decode family or a verify batch falls through to MMF,
++// whose different accumulation flips a top-k near-tie (the forced-sparse q8_0 residual).
++// n_idx_h = 4 for qwen4exp, so the flattened band is <= 32.
++#define MMVF_MAX_BATCH_SIZE_FLAT (MMVF_MAX_BATCH_SIZE * 4)
+ 
+ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+     const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 diff --git a/ggml/src/ggml-cuda/quantize.cuh b/ggml/src/ggml-cuda/quantize.cuh
 index ce0774822..e113ee4d9 100644
 --- a/ggml/src/ggml-cuda/quantize.cuh

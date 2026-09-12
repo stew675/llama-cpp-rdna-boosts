@@ -1015,3 +1015,38 @@ node the logits traverse — and prefer "compute the logits path exactly as the 
 compute the export separately" over "compute once and gather for the logits".  The cost is one extra
 tail at output-row width (cheap; a prefill has ~1 output row), and the non-export paths are
 byte-identical by construction.
+
+## 29. A flattened batch is not a token count (2026-09-12 (13), block-14 amendment (eighth))
+
+The decode/verify band guarantee is a property of **every op** on the path, and the engine's
+"keep a verify batch on the decode (MMVF) family" guard
+(`ggml_cuda_mul_mat`: `ne11_mmvf = ne11 <= MMVF_MAX_BATCH_SIZE ? 1 : ne11`) keys on the matmul's
+`ne11`.  That is correct while `ne11` is the token count.  The QSA indexer score is the counterexample:
+its matmul carries the **indexer heads** in the N dimension, so its `ne11` is
+`n_idx_h * n_tps` (**`4 * n_tps`** for qwen4exp).  From `n_tps = 3` the guard stopped rescuing it:
+decode (`n_tps = 1`, `ne11 = 4`) stayed on MMVF, the verify batch (`ne11 = 12`) fell through to MMF,
+and the two families accumulate the truncated dot product differently.  The indexer score then differed
+by a ULP and flipped a top-k near-tie.
+
+**Signature to recognise it by:** the forward is *exactly* bit-identical to decode for many steps and
+then diverges once, at a fixed position (here target position 4395, 102 tokens in) - a selection flip,
+not drift.  The greedy **text** may stay equal for a given prompt, so this is a logits-level
+`plain != draft-mtp` violation that text gates cannot see; `mstep` (`wip/strix-halo/qsa-item4/`) is the
+instrument, and W=2 pure / W>=3 impure is the clean boundary.
+
+**Instruments that localised it** (worth reusing): a `rocprofv3 --kernel-trace` diff of the two widths -
+the only exclusive kernels were ncols-templated MMVF/ksplit variants, and the score moved from
+`mul_mat_vec_f<float,float,8,64>` (N=8) to no MMVF instantiation at N=12; and a temporary "force the
+fallback family for every F32 matmul" diagnostic, which made the band pure again and confirmed
+"one family across the band" as the fix (the reverse - forcing MMVF at every width - was already the
+intent of the guard).
+
+**The fix (block 14, eighth amendment):** `MMVF_MAX_BATCH_SIZE_FLAT` (`MMVF_MAX_BATCH_SIZE * 4 = 32`)
+and the guard widened to it, with `mul_mat_vec_f` instantiated for `ncols_dst` 9..32.  The band stays
+on the *decode* family, which is the side the draft's single-token decode reproduces (the §19 rule).
+`ne11 <= 8` and `ne11 > 32` are unchanged, so ordinary decode/verify and prefill are untouched.
+
+**The general rule:** the band guard's "batch size" must be the **maximum flattened N** the op can
+produce in the band, not the token count.  Any matmul whose N is a product of a per-token factor and a
+per-head (or per-expert, per-group) factor is a candidate; audit it the same way a newly enabled KV
+type is audited (§20) - one family, W = 1..8, on every split.

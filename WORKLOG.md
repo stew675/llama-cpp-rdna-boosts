@@ -1,5 +1,51 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-12 (13) — block-14 amendment (eighth): the QSA indexer-score decode/verify band-uniformity fix
+
+Block-14 amendment (eighth), found by the gfx1201 investigation of TODO item 4's q8_0 forced-sparse
+residual.  Canonical tip `c6f1e8e78` -> **`d306d4b4b`** (tree `e1e42e23c` ->
+**`3b0874b6aa367fea846a437b45f1689bd173b38c`**); block 14 amended in place (the tip block, so no
+replay), `make-patches.sh` default tip updated, `rdna-boosts-all.patch` regenerated; strict **15/15**
+`git am` on a fresh worktree at `9113cc188` (0 whitespace warnings, applied tree == canonical).
+
+* **The defect**: the QSA indexer score's matmul carries the indexer heads in its N dimension, so its
+  `ne11` is `n_idx_h * n_tps` (**4 * n_tps** for qwen4exp).  Block 08's "keep the verify batch on the
+  decode kernel" guard (`ne11_mmvf = ne11 <= MMVF_MAX_BATCH_SIZE ? 1 : ne11`) assumed `ne11` *is* the
+  token count, so from `n_tps = 3` the guard stopped rescuing the verify batch: decode (`n_tps = 1`)
+  stayed on the MMVF family while the verify fell through to MMF, and the two families accumulate the
+  truncated dot product differently.  The indexer score then differed by a ULP and flipped a top-k
+  near-tie - the forward was **bit-identical to decode for 101 steps and then diverged** at target
+  position 4395.  On the `p5000` prompt the greedy **text** happened to stay equal, so it was a
+  logits-level `plain != draft-mtp` violation, not a visible text change.
+* **How it was found** (gfx1201, 3x R9700): a `mstep` width matrix showed W=2 pure, W>=3 impure with the
+  first divergence at a fixed position (4395, not the first batch), i.e. a selection flip rather than
+  drift; `LLAMA_QSA_SPARSE_FA=0` / `LLAMA_QSA_OFF=1` were pure and block-15's gates irrelevant.  A
+  `rocprofv3 --kernel-trace` diff of W=2 vs W=3 showed the only exclusive kernels were ncols-templated
+  MMVF/ksplit variants, with the score moving from `mul_mat_vec_f<float,float,8,64>` (N=8) to no MMVF
+  instantiation at W=3.  Forcing the fallback family for *every* F32 matmul (a temporary diagnostic)
+  made the band pure again - confirming "one family across the band" as the fix.
+* **The fix**: `MMVF_MAX_BATCH_SIZE_FLAT` (`= MMVF_MAX_BATCH_SIZE * 4 = 32`) in `mmvf.cuh`; the block-08
+  guard widened to it in `ggml-cuda.cu`; `mul_mat_vec_f_cuda_switch_ncols_dst` instantiates
+  `ncols_dst` 9..32 in `mmvf.cu` (+168 lines).  The guard stays at the decode family (MMVF) so the
+  verified arithmetic is the one the draft's single-token decode reproduces.  The guard is block 08's;
+  block 14 extends it because block 14 is the block that introduces the flattened batch.
+* **Validation (canonical delivery tree, gfx1201, 3x R9700, layer split)**: `mstep` W = **1,2,3,4,5,8**
+  q8_0 all **0 mismatches** (pre-fix W>=3 impure), and the W=1 reference `Thash` is unchanged
+  (`2bd73063dd0a9524`) so **decode numerics are untouched**; f16 W=4 pure; forced-sparse q8_0 and
+  default text gates byte-identical (`a4cdc10dfb6c` 678 chars / `2e078b6966c0` 682 chars);
+  `FLASH_ATTN_QSA`, `GATED_DELTA_NET` and `FLASH_ATTN_EXT` all OK (4/4 backends); 27B dense
+  `plain == n_max 3` (`da2e2d192e21`); MTP acceptance healthy (forced-sparse q8_0 `0.46497`, pos-1
+  `(0.698, 0.415, 0.264)`; default `0.44444`, pos-1 `(0.673, 0.418, 0.218)`).
+* **No delivery behaviour change outside the flattened band**: for `ne11 <= 8` (decode/verify of every
+  ordinary op) and `ne11 > 32` (prefill) the guard decision is unchanged, so dense models are
+  unaffected by construction (verified: 27B `plain == draft-mtp`).
+* **Open cross-check**: whether this also removes the gfx1151 `plain != draft-mtp` text residual that
+  `TODO.md` *Documented* records (same signature, different arch - gfx1151's `mstep` was reported pure)
+  is to be confirmed by the gfx1151 box against this branch.  The fix is arch-independent in the engine
+  (per-arch MMVF tables aside), so the branch is the test vehicle.
+* Records: this entry, `GREEDY-PURITY.md` §29, `patches/README.md` (the block-14 amendments list),
+  `wip/strix-halo/qsa-item4/` (the `mstep` harness).
+
 ## 2026-09-12 (12) — TODO item 4 closed: the block-14 MTP-export logits-purity fix + the q8_0 forced-sparse residual recorded as a limitation
 
 TODO item 4 is closed.  It had two sub-items; **(a)** is fixed and landed as a block-14

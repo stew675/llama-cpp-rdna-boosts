@@ -35,7 +35,13 @@
 #                 device query that replaced the hand-maintained qsa_kv_native type list,
 #                 and the 2026-09-12 block-14 (seventh) MTP-export logits-purity fix
 #                 (the last layer always gathers its output rows; the unmasked
-#                 embeddings_nextn export gets a separate full-row tail for t_h_nextn).
+#                 embeddings_nextn export gets a separate full-row tail for t_h_nextn),
+#                 and the 2026-09-12 block-14 (eighth) decode/verify band-uniformity fix
+#                 for the QSA indexer score (its flattened n_idx_h*n_tps N dimension crossed
+#                 MMVF_MAX_BATCH_SIZE at n_tps=3, so the verify batch fell through to MMF
+#                 while decode stayed on MMVF; the guard now covers the whole flattened band
+#                 MMVF_MAX_BATCH_SIZE_FLAT=32 and mul_mat_vec_f is instantiated for
+#                 ncols_dst 9..32).
 #                 The block-15
 #                 (attention-memory campaign) work is NOT part of the
 #                 delivery; it is staged in beta/block-15-campaign-wins/
@@ -58,7 +64,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
 BASELINE="${2:-9113cc188}"
-TIP="${3:-c6f1e8e78cfb2a70958998cdd81fad363e869f93}"
+TIP="${3:-d306d4b4b194738dd5baad89ef77fa31a931e8ff}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then

@@ -7,9 +7,9 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
 `wip/*` and `benchmarks/`.
 
 **Current state (2026-09-12):** the delivery is the 15-patch set against fork point `9113cc188`
-(block 00 + blocks 01-14), canonical tip **`c6f1e8e78cfb2a70958998cdd81fad363e869f93`** (tree `e1e42e23c2913cd529b0064eb1cb74525a746098`),
-`make-patches.sh` default tip = `c6f1e8e78cfb2a70958998cdd81fad363e869f93`.  Block 15 (the attention-memory campaign) is **staged in
-`beta/block-15-campaign-wins/`, not promoted** (16th re-cut: `c6f1e8e78` → `bdd09891d`).  F1/F2/F3 (the
+(block 00 + blocks 01-14), canonical tip **`d306d4b4b194738dd5baad89ef77fa31a931e8ff`** (tree `3b0874b6aa367fea846a437b45f1689bd173b38c`),
+`make-patches.sh` default tip = `d306d4b4b194738dd5baad89ef77fa31a931e8ff`.  Block 15 (the attention-memory campaign) is **staged in
+`beta/block-15-campaign-wins/`, not promoted** (17th re-cut: `d306d4b4b` → `f399b1349`).  F1/F2/F3 (the
 KV-quant purity/parity campaign) are **all closed** — every KV cache type the delivery supports is
 width-pure and takes the f16 attention path — and so is the gfx1151 within-band mmvq fusion variance
 (block-13 amendment, 2026-09-12; see Closed).  The QSA *sparse* regime was re-measured on gfx1151
@@ -17,7 +17,7 @@ width-pure and takes the f16 attention path — and so is the gfx1151 within-ban
 amendment (seventh))**: sub-item (a), the unmasked-MTP-export last-layer gather deferral that shifted the
 prefill logits by a ULP, is fixed; sub-item (b), the prompt-dependent **q8_0** forced-sparse shallow
 residual, survives a genuine driver-level investigation and is recorded in *Documented, deliberately NOT
-fixed* (for the exact repro, the exclusions and the `LLAMA_QSA_OFF=1` affordance — see there).  **Triaged 2026-09-12 (8)**: the Active list became **three items** (3, 4,
+fixed* (for the exact repro, the exclusions and the `LLAMA_QSA_OFF=1` affordance — see there).  **Sub-item (b) was then re-opened by the gfx1201 investigation and root-caused + fixed (2026-09-12 (13), block-14 amendment (eighth))**: the q8_0 forced-sparse width dependence is the QSA indexer score's flattened N (`4 * n_tps`) crossing `MMVF_MAX_BATCH_SIZE` at `n_tps = 3` — the verify batch fell to MMF while decode stayed on MMVF, and the ULP-different score flipped a top-k near-tie (a *logits-level* violation that its text did not expose).  The guard now covers the whole flattened band and `W = 1..8` is bit-identical with decode's `Thash` unchanged; see the *Documented* entry for the still-open **gfx1151 cross-check** (the branch is the test vehicle).  **Triaged 2026-09-12 (8)**: the Active list became **three items** (3, 4,
 9); items 1/6/8/12 moved to *Waiting on others*, items 5(c)/5(d)/5(g)/13 to *accepted limitations*, items
 5(a)/5(b)/15/16 to *Parked*, and items 11 (MXFP4 fused gate — unreachable for the available MXFP4 MoE)
 and 14 (canonical-fork hygiene — verified) to *Closed*.  A **block-02 amendment** landed a
@@ -52,9 +52,21 @@ the device-query arm gate replacing the mirrored type list — so **Active is no
 
 ## Waiting on others (not actionable in this repo)
 
+### 17. gfx1151 cross-check of the block-14 (eighth) band-uniformity fix — **IN FLIGHT**
+- The delivery branch `block14-band-uniformity` carries the block-14 (eighth) amendment: the QSA
+  indexer-score flattened-`ne11` family mix (`MMVF_MAX_BATCH_SIZE_FLAT` = 32 + `mul_mat_vec_f`
+  `ncols_dst` 9..32) that made gfx1201's forced-sparse q8_0 forward width-dependent at W >= 3.  See
+  `patches/README.md` (2026-09-12 (eighth)), `WORKLOG.md` 2026-09-12 (13), `GREEDY-PURITY.md` §29.
+- **What gfx1151 must determine:** whether the branch removes its recorded `plain != draft-mtp`
+  forced-sparse q8_0 **text** residual (`a57bc13bbf2a` vs `3124adfd2b94` on `p5000.txt`; the residual
+  that the 2026-09-12 (12) driver-level investigation could not localise and the eighth-amendment work
+  did *not* reproduce on gfx1201).  Run the `mstep` W = 1..8 matrix (expect 0 mismatches) and the text
+  gate against the branch; if the text residual also clears, fold it into the delivery and drop the
+  *Documented* item 4(b) entry.  Instrument: `wip/strix-halo/qsa-item4/`.
+
 ### 1. Block 15 promotion — **UNBLOCKED** (waiting on the beta window + the maintainer's go-ahead)
-- **Live state:** the 16th re-cut is on the current base (`c6f1e8e78` → beta tip **`bdd09891d`**, tree
-  **`3a47913c0bdca7f1154a8f0310a20435a36c0faa`**); it builds clean, applies strict `git am` (round-tripped,
+- **Live state:** the 17th re-cut is on the current base (`d306d4b4b` → beta tip **`f399b1349`**, tree
+  **`c3142fe0b311757f458647f172f623859f5bc983`**); it builds clean, applies strict `git am` (round-tripped,
   applied tree == the beta worktree tree), and
   revalidates (the four gate combos + `draft-mtp n_max 3` all `0fc4910d5824`, `FLASH_ATTN_QSA` 22/22 +
   `GATED_DELTA_NET` 46/46 + `test-recurrent-state-rollback` PASS).  The dense-arm blocker and its fix are closed — see the
@@ -110,7 +122,7 @@ the device-query arm gate replacing the mirrored type list — so **Active is no
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
 
-- **QSA *forced*-sparse shallow `q8_0` residual (TODO item 4(b)) — measured, deliberately not fixed (2026-09-12 (12)).**  With the sparse arm forced (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`) + `-ctk/-ctv q8_0` on `p5000.txt`, qwen4exp `plain != draft-mtp n3` (`a57bc13bbf2a` vs `3124adfd2b94`); the delivery default (dense decode below 64K) is pure and `LLAMA_QSA_OFF=1` fixes it.  A target-logits dump of the real `server-context.cpp` driver localises the first divergence to target position 4432 (identical accepted token 381, argmax flips 264 -> 9859) in the QSA indexer selection/state, *not* a width dependence; forward width (`mstep` W=1..8 pure), the GDN rollback bound/checkpoint restore (`n_rs_seq = 16` forced), `n_outputs_max`, CUDA graphs, the chunked-prefill boundary, the fused indexer score/derived cache and the sparse FA kernel (`LLAMA_QSA_SPARSE_FA=0` does not fix it) are all excluded.  Exact repro/evidence: `wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`, `GREEDY-PURITY.md` §18/§28.
+- **QSA *forced*-sparse shallow `q8_0` residual (TODO item 4(b)) — root-caused and fixed on gfx1201 (2026-09-12 (13), block-14 amendment (eighth)); gfx1151 cross-check pending.**  On gfx1201 the first divergence of the *forward* is a width dependence, not a driver-level effect: `mstep` W=2 pure, W >= 3 impure, first divergence at a fixed position (4395) - a top-k selection flip.  Root cause: the QSA indexer score carries the indexer heads in its matmul N dimension (`ne11 = 4 * n_tps`), which crossed block 08's `MMVF_MAX_BATCH_SIZE` (8) at `n_tps = 3`, so the verify batch fell through to MMF while decode stayed on MMVF; the two families accumulate differently, the score differs by a ULP and flips a top-k near-tie.  `LLAMA_QSA_SPARSE_FA=0` / `LLAMA_QSA_OFF=1` were pure and block-15's gates irrelevant; a `rocprofv3` kernel-trace diff and a temporary "force the fallback family for every F32 matmul" diagnostic confirmed the family mix.  **Fixed** by `MMVF_MAX_BATCH_SIZE_FLAT` (32) + `mul_mat_vec_f` instantiations for `ncols_dst` 9..32 (block-14 amendment (eighth)): `mstep` W = 1..8 pure, W=1 `Thash` unchanged, text gates byte-identical.  **Still open:** the original gfx1151 `plain != draft-mtp` **text** residual (`a57bc13bbf2a` vs `3124adfd2b94`) was *not* reproduced on gfx1201 (its text gate is pure), so whether the eighth amendment removes it on gfx1151 must be confirmed there against this branch.  Exact repro/evidence: `wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`, `GREEDY-PURITY.md` §18/§28/§29, `WORKLOG.md` 2026-09-12 (13).
 
 - **The `launch-ledger` remainder (item 5(c)) — measured, not pursued (2026-09-12 (8)).**  The small-pp
   remainder (+38 `scale_f32`/eval, an `rms_norm<256,true>` count diff) is sub-0.2 %, root-cause-only.
@@ -170,7 +182,7 @@ the device-query arm gate replacing the mirrored type list — so **Active is no
 
 ## Closed (one-liners; details in the dated docs)
 
-- **QSA sparse-regime width purity (TODO item 4, closed 2026-09-12 (12), block-14 amendment (seventh)).**  Sub-item (a), the `embeddings_nextn` MTP-export last-layer gather deferral, is fixed — the last layer always gathers its output rows and builds a separate full-row tail for `t_h_nextn` — so the prefill logits are bit-identical to `--spec-type none` (`mstep NEXTN=1` 0 mismatches, was 1 at `pos = 4293`); sub-item (b), the driver-level q8_0 forced-sparse residual, is a documented, deliberately-not-fixed limitation (see *Documented*).  See `WORKLOG.md` 2026-09-12 (12) and `patches/README.md`.
+- **QSA sparse-regime width purity (TODO item 4, closed 2026-09-12 (12), block-14 amendment (seventh); sub-item (b) re-opened and root-caused/fixed 2026-09-12 (13), block-14 amendment (eighth)).**  Sub-item (a), the `embeddings_nextn` MTP-export last-layer gather deferral, is fixed — the last layer always gathers its output rows and builds a separate full-row tail for `t_h_nextn` — so the prefill logits are bit-identical to `--spec-type none` (`mstep NEXTN=1` 0 mismatches, was 1 at `pos = 4293`).  Sub-item (b) turned out to be a **width dependence** on gfx1201 (the QSA indexer score's flattened `ne11 = 4 * n_tps` crossed `MMVF_MAX_BATCH_SIZE` at `n_tps = 3`, putting the verify batch on MMF while decode stayed on MMVF); the eighth amendment keeps the whole flattened band on the decode family and makes W = 1..8 bit-identical on gfx1201, with a gfx1151 text-residual cross-check still open (item 17).  See `WORKLOG.md` 2026-09-12 (12)/(13) and `patches/README.md`.
 
 **The GDN recurrent-state rollback bound (`n_rs_batch`) + the pre-batch snapshot slot (landed 2026-09-12 (10), block-02 amendment).**
 Integrated from the gfx1201 investigation in `~/ngram-mod/` (record `wip/gdn-rs-rollback/`, originals

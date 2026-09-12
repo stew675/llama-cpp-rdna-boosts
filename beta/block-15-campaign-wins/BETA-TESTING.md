@@ -10,8 +10,8 @@ without rebuilding five times.  Every win except W4 is switchable by environment
 > block 00 + blocks 01-14), and every row below was re-checked **as a combination** on the tree built
 > from the beta patch on top of the delivered **15-block** set (fresh worktree at `9113cc188`, strict
 > **15/15** `git am` + the beta patch, fresh build): reserves, byte-identical coherence on all five
-> models, the MTP gate, and the op suites all reproduce.  The current re-cut is tip **`bdd09891d`**
-> (base `c6f1e8e78`, tree `3a47913c0bdca7f1154a8f0310a20435a36c0faa`) and every recorded number carries forward — see the dated
+> models, the MTP gate, and the op suites all reproduce.  The current re-cut is tip **`f399b1349`**
+> (base `d306d4b4b`, tree `c3142fe0b311757f458647f172f623859f5bc983`) and every recorded number carries forward — see the dated
 > re-cut log below, `README.md` and `HANDOVER.md` §10.  (Earlier tip `eb15f3ee1`, base `47a9d4d86`,
 > tree `ffa3a11c3`.)
 > V3 is **on by default** (`LLAMA_KQ_MASK_DERIVED`), V4 and V5 are **opt-in through one switch**
