@@ -24,6 +24,18 @@ now a **15-patch set**: block 00 + blocks 01-14 at canonical tip **`389c5341f`**
 tree `928852cdc`, with block 13 amended twice on 2026-09-11), so the beta patch was
 re-cut and re-validated end to end.
 
+* **Re-cut a tenth time 2026-09-11 (12)** after two delivery amendments (block 01: `--spec-draft-n-max`
+  capped at 7 with a visible notice + `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0`; block 14: mixed K/V cache types
+  hard-rejected for every model).  Base **`484231cb9`** (tree `fc3c73da4ac68e92348043b992fb963b006e14df`)
+  -> **beta tip `a796a1d49`**, tree **`b48565e69f77f0c20a20cd75d87c2559d11e6de2`**, patch **3 811
+  lines**.  `git am -3` merged the new `llama-context.cpp` region **without a conflict** (both the new
+  reject and block 15's tensor-split type gate are present), and the diff against the ninth re-cut is
+  exactly the three new delivery files — no block-15 content changed, so the ninth re-cut's gate results
+  carry over.  Confirmed on the re-cut: the tree builds clean (`build-rec10`) and the smoke gates
+  reproduce the ninth re-cut's values (qwen4exp f16 sparse `804de0576868`, oracle sparse `6.5394` /
+  dense `6.5377`, and the new K/V reject fires in the beta build).  **Testers: pass matching
+  `-ctk`/`-ctv`** (the hard reject applies to the beta too; every
+  script here already does).  See `BETA-TESTING.md` (the dated tenth-re-cut section).
 * **Re-cut a ninth time 2026-09-11 (11) — the dense-arm BLOCKER (§4c) is FIXED, one line.**  The defect
   was a variable-shadowing bug in block 15's own `build_attn_qsa` dense path: the V2/V3 refactor wrapped
   the top-k mask chain in `if (kq_mask != nullptr) { ... }` and declared an *outer* `kq_mask_top_k`,

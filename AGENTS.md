@@ -147,8 +147,8 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `6d3155faa`, net tree
-  `0c3f0c2c2f4e7439d9489d45573a4021a8eee106`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `484231cb9`, net tree
+  `fc3c73da4ac68e92348043b992fb963b006e14df`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the whole-batch
 K-independent chunked GDN prefill; block 08 amended 2026-09-11 with the
@@ -172,7 +172,8 @@ masked-V fixes — see the block-00 section in `patches/README.md`);
 blocks 01-14 = the fork's block
 commits on master `9113cc188` (2026-09-08 re-base; block 01 refreshed
 2026-09-09 to the upstream PR #27210 review head `d236d41a2`, still one
-squashed block; block 03 amended 2026-09-10 with the HIP masked-V/
+squashed block, and amended 2026-09-11 so `--spec-draft-n-max` is clamped to 7
+with a visible notice + `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` escape hatch; block 03 amended 2026-09-10 with the HIP masked-V/
 freed-cell fixes, re-homed from block 14; block 14's 2026-09-09 gfx1151-only
 freed-cell host zeroing is removed and its 2026-09-10 masked-V fixes were
 re-homed — Vulkan to block 00, HIP to block 03; on the re-base block 06 was
@@ -203,7 +204,10 @@ aborting), 2026-09-08 with the compiler-warning cleanup
 tensor-split backend gate (`llm_arch_supports_sm_tensor(qwen4exp)`
 true on HIP builds only — the ROCm-validated backend; other builds
 keep upstream's clean "not implemented" error / arch-test SKIP instead
-of the meta-splitter abort found on Vulkan); block 08
+of the meta-splitter abort found on Vulkan),
+2026-09-11 with the mixed-K/V hard reject
+(`params.type_k != params.type_v` now fails context creation for every model,
+not just MLA/DeepSeek4); block 08
 amended 2026-09-07 with the PR #15 mul_mat+add through-view shape
 guard and 2026-09-11 with the decode/verify FA kernel-family fix (F1: a
 quantized K/V cache used VEC at `n_q <= 2` and TILE from `n_q = 3`, so
@@ -319,6 +323,15 @@ Consequences, so it is not re-litigated:
 - **Everything is fast at depth 0** — decode perf work must be validated at
   depth-16384 (benchy protocol), not shallow llama-bench.
 - **Never run parallel/background benches** — they contaminate results.
+- **Mixed K/V cache types are HARD-REJECTED** (`params.type_k != params.type_v` fails context
+  creation with a message naming both types).  Maintainer decision 2026-09-11: every mixed pair
+  measured 1.7–3.6× slower than the same-type equivalent and never smaller, and the attention path
+  (including the split/FA one) assumes `type_k == type_v`.  Implemented as a block-14 amendment with
+  a `f16`/`f16`-style pairing in every gate; test scripts must pass matching `-ctk`/`-ctv`.
+- **`--spec-draft-n-max` is capped at 7** (a clamp + one warning, not an error).  A verify batch
+  decodes `n_max + 1` rows and the HIP FA chooser switches kernel family above 8 rows, so deeper
+  drafts can change greedy output between plain and MTP.  Block-01 amendment; see
+  `GREEDY-PURITY.md` §11/§19.
 - **The pin regressed** (session 7): `~/bin/high-power` (dpm=high +
   runtime-PM) costs tg -5-7% / pp -15-18% on RCCL/hybrid paths. Server runs
   UNPINNED, 3-GPU (`HIP_VISIBLE_DEVICES=0,1,2`), hybrid default.
@@ -580,7 +593,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `6d3155faa`): `git format-patch --start-number 0` the block
+blocks tip `484231cb9`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -589,7 +602,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `6d3155faa`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `484231cb9`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

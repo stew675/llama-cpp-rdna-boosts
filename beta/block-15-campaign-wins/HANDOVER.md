@@ -24,6 +24,13 @@
 > `llama_cparams::type_k/type_v`), which is a no-op for every f16/q8_0 beta config: the tree builds and
 > the beta output is byte-identical to the delivery's at the gate configs (qwen4exp f16 plain
 > `804de0576868`; 27B f16 `n_max 3` acceptance `0.82716`), so the recorded numbers stand.
+> **Re-cut a tenth time 2026-09-11 (12)** after two delivery amendments (block 01: `--spec-draft-n-max`
+> clamped to 7 with a visible notice + `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0`; block 14: mixed K/V cache types
+> hard-rejected).  Base `484231cb9` (tree `fc3c73da4ac68e92348043b992fb963b006e14df`) -> **beta tip
+> `a796a1d49`**, tree **`b48565e69f77f0c20a20cd75d87c2559d11e6de2`**, patch **3 811 lines**.  `git am -3`
+> merged cleanly (the `llama-context.cpp` region now carries both the new reject and block 15's
+> tensor-split type gate); the only delta vs the ninth re-cut is those three delivery files.  Testers must
+> pass matching `-ctk`/`-ctv`.  See `README.md` (tenth re-cut) and `BETA-TESTING.md`.
 > **Re-cut a ninth time 2026-09-11 (11) — the `LLAMA_QSA_SPARSE_FA=0` blocker is FIXED, one line.**  The
 > base did **not** move (still `6d3155faa`, tree `0c3f0c2c2f4e7439d9489d45573a4021a8eee106`); only block 15
 > changed: the mask chain's `ggml_tensor * kq_mask_top_k = ggml_set_rows(...)` in `build_attn_qsa` had been

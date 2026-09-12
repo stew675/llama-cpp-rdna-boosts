@@ -1,5 +1,68 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-11 (12) — mixed K/V types hard-rejected, `--spec-draft-n-max` capped at 7, and issue #25's GDN divergence re-verified
+
+**Canonical tip `484231cb9`** (tree `fc3c73da4ac68e92348043b992fb963b006e14df`), 15 blocks, clean-apply
+strict 15/15 with 0 whitespace warnings and the applied tree equal to the canonical one (sim build
+verified).  Two block amendments, both from maintainer decisions of 2026-09-11:
+
+**Block 14 — mixed K/V cache types are now HARD-REJECTED for every model.**  Upstream enforces
+`type_k == type_v` for MLA/DeepSeek4 only; the condition is dropped, so `params.type_k !=
+params.type_v` now fails context creation for every architecture with
+
+```
+E llama_init_from_model: models require the same K and V cache types, got K=q8_0 and V=f16; set
+  --cache-type-v to match --cache-type-k (both default to f16)
+```
+
+Rationale (measured, `TODO.md` accepted limitations / `GREEDY-PURITY.md`): every mixed pair is
+1.7–3.6× slower than the same-type equivalent and never smaller, and the attention path — including the
+split/flash-attention one, whose type gate lives a few lines above — assumes `type_k == type_v`.  Both
+types default to f16, so only an explicit `--cache-type-k`/`-v` can trigger it.  Verified: `-ctk q8_0`
+(V=f16) and `-ctk q8_0 -ctv q4_0` both fail with the message above; `-ctk q8_0 -ctv q8_0` runs normally.
+
+**Block 01 — `--spec-draft-n-max` is capped at 7** (a clamp with a visible notice, **not** an error,
+per the maintainer's instruction).  A verify batch decodes `n_max + 1` query rows and the HIP
+flash-attention chooser switches the band from the tile kernel to the MMA/WMMA kernel above 8 rows
+(`fattn.cu`, the `Q->ne[1] > 8` switch); the two kernels are not bit-identical, so a deeper draft makes
+decode and verify disagree and greedy output can change between `--spec-type none` and `draft-mtp`
+(upstream master has the same class of boundary).  The guarantee published in `GREEDY-PURITY.md` §11 is
+therefore enforced rather than documented:
+
+* the clamp lives in **`common_init_from_params`**, not in the argument parser, because a warning
+  emitted while parsing is *below the default log threshold* and never reaches the user (verified: the
+  control `--log-mmap` combination warning is equally invisible; `--log-verbosity 4` shows both) — it
+  runs before the model/context and before the speculative engine are created, so all of them see the
+  capped depth;
+* the notice is emitted at `LOG_ERR` level deliberately (llama-cli's default verbosity hides `W` but
+  shows `E`; `common_fit_params` uses the same pattern for its non-fatal abort notice) and **names the
+  escape hatch**: `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` keeps the configured value (with a `W` notice);
+* the help string now reads "(default: 3, max: 7)".
+
+Verified end to end on the 27B (2-GPU): `--spec-draft-n-max 12` → the notice **at the default
+verbosity** and the GDN log line showing `K=8` (= n_max 7 + 1); `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` →
+`K=13` (= 12 + 1, i.e. the env really reaches the kernels) with the "keeping it" notice; `n_max 7` and
+`n_max 4` are silent and give `K=8`/`K=5`.  Note (documented in the code): unclamping to `n_max > 15`
+re-introduces the K-dependent chunked-GDN boundary as well.
+
+**Issue #25's GDN plain-vs-spec divergence: already fixed, re-verified, and the records corrected.**
+A concurrent gfx1151 session reported that `--spec-type none` and `draft-mtp` disagreed through the GDN
+chunked prefill.  That was fixed on 2026-09-11 by block 02's **K-independent whole-batch chunked
+prefill** (`GGML_CUDA_GDN_ALIGN_BOUNDARY` and both K-dependent branches deleted); the `TODO.md` item and
+the `wip/issue-25-mtp-batch-width/` status lines still described the superseded opt-in gate, and are now
+corrected.  **Fresh gate on the current tree** (27B Q8_0, 2-GPU `-sm tensor -ts 1/1`, `p0long.txt`, 512
+greedy tokens, `-c 8192 -ctk f16 -ctv f16 -fa auto`): `--spec-type none == draft-mtp n_max 1 == 4 ==
+5`, all `299566b902bb` (2727 chars) — byte-identical.  Control: `GGML_CUDA_GDN_CHUNKED=0` changes the
+plain text (`60777872b890`), which is the expected chunked-vs-sequential kernel difference (and that
+switch remains the fully-snapshot-safe fallback), not a plain-vs-spec divergence.
+
+**Beta:** tenth re-cut — base `484231cb9` → beta tip **`a796a1d49`**, tree
+**`b48565e69f77f0c20a20cd75d87c2559d11e6de2`**, patch **3 811 lines**; `git am -3` merged the new
+`llama-context.cpp` region **without a conflict**, and the diff vs the ninth re-cut is exactly the three
+new delivery files (`common/arg.cpp`, `common/common.cpp`, `src/llama-context.cpp`) — no block-15 content
+changed.  Beta testers must pass matching `-ctk`/`-ctv` from now on (the hard reject applies to the beta
+too); see `beta/block-15-campaign-wins/BETA-TESTING.md`.
+
 ## 2026-09-11 (11) — Block 15's dense-arm blocker fixed (a shadowed variable); no delivery change
 
 **Delivery unchanged** (`main` still the 15-patch set at canonical tip `6d3155faa`, tree

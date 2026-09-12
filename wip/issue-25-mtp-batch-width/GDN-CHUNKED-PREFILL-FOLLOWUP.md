@@ -1,11 +1,17 @@
 # WIP follow-up — GDN chunked-prefill makes plain decode and speculative verify disagree
 
-**Status:** FIXED (opt-in), 2026-09-11.  Found during the gfx1151 issue-#25
-validation; **not** part of issue #25 (that is FA `parallel_blocks`, fixed by
-Block 00) and **not** an upstream defect — see "Provenance".  A gated fix
-(`GGML_CUDA_GDN_ALIGN_BOUNDARY=1`, **default off**) is now in block 02; see
-`GDN-CHUNKED-PREFILL-FIX.md` (root cause + validation) and `patches/README.md`.
-The default keeps the behaviour this document describes, byte-for-byte.
+**Status:** **FIXED in the default path, 2026-09-11** — and re-verified 2026-09-11 (12).  Both the
+plain (`K == 1`) and the MTP (`K = n_max + 1`) prefill now make the *same* call: block 02's
+**K-independent whole-batch chunked prefill** chunks the whole batch when it exceeds `max(K, 16)`
+tokens, so there is no K-dependent boundary and no sequential tail.  `GGML_CUDA_GDN_ALIGN_BOUNDARY`
+and both K-dependent branches were **deleted** (the opt-in fix this document originally described is
+gone); `GGML_CUDA_GDN_CHUNKED=0` remains as the A/B switch and the fully-snapshot-safe fallback.
+Measured 2026-09-11 (12): 27B Q8_0, 2-GPU `-sm tensor -ts 1/1`, `p0long.txt`, 512 greedy tokens —
+`--spec-type none == draft-mtp n_max 1 == 4 == 5`, all `299566b902bb` (2727 chars).
+**Not** part of issue #25 (that is FA `parallel_blocks`, fixed by Block 00) and **not** an upstream
+defect — see "Provenance".  The historical analysis below (including the `GGML_CUDA_GDN_ALIGN_BOUNDARY`
+fix directions) is superseded but kept as the record of how it was found; the final form is in
+`../../WORKLOG.md` (2026-09-11, the block-02 amendment) and `../../patches/README.md`.
 **Owner box:** the GFX1201 machine (investigation + fix done; see
 `GDN-CHUNKED-PREFILL-FIX.md`).
 **Source of record:** the GFX1201 agent's issue-#25 investigation

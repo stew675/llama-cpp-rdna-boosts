@@ -63,7 +63,11 @@ Run the same with `--spec-type none` and compare. Gate rules:
    and within ~10% on generic prose at draft depth 3. (Do NOT test at
    `--spec-draft-n-max 12` fixed depth: fixed-depth over-drafting is
    expected to lose; the adaptive configs C3/C6 below are the meaningful
-   high-depth tests.)
+   high-depth tests.)  **As of 2026-09-11 (12) the CLI clamps
+   `--spec-draft-n-max` to 7** (a visible notice; `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0`
+   keeps a larger value), so any pre-existing baseline measured above 7 must be
+   re-measured at 7 (or with the env set) before comparing.  See
+   `../beta/block-15-campaign-wins/BETA-TESTING.md` for the notice semantics.
 3. **Same-seed determinism vs the previous release** (dense): outputs must
    be byte-identical between the build under test and the known-good build.
    On MoE this is not required (fusion-ordering numerics drift is an
@@ -78,7 +82,8 @@ Run the same with `--spec-type none` and compare. Gate rules:
    elements = 7 tokens); that was fixed on 2026-09-11, and the earlier
    "`n_max <= 15`" claim was never validated past `n_max = 4`.  Do not use
    `none == draft-mtp` equality above `n_max = 7` as a gate; use acceptance +
-   MTP-vs-plain throughput instead.  See `../GREEDY-PURITY.md` §11.
+   MTP-vs-plain throughput instead.  See `../GREEDY-PURITY.md` §11.  **The range
+   is now enforced:** the CLI clamps the depth to 7 (2026-09-11 (12)).
 
 ### Protocol B — server harness (dense canonical, long-context workloads)
 

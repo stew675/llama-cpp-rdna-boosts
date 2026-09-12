@@ -70,7 +70,7 @@ the 15-block tree):
 | patch | content |
 |---|---|
 | `0000` | **structural and architecture fixes** — FA small-batch KV-split width invariance (issue #25: decode and every speculative verify width now reduce identically, so greedy output no longer changes with the MTP draft length) + Vulkan masked-V/freed-cell fixes (dead columns never read V). Added 2026-09-10; this is the base every other block applies on top of. |
-| `0001` | adaptive MTP draft depth | **refreshed 2026-09-09 to the upstream PR #27210 review head** (`d236d41a2`; review-round feedback-handling, option validation + docs) — see the 2026-09-09 block-01 refresh section below.
+| `0001` | adaptive MTP draft depth | **refreshed 2026-09-09 to the upstream PR #27210 review head** (`d236d41a2`; review-round feedback-handling, option validation + docs) — see the 2026-09-09 block-01 refresh section below.  **amended 2026-09-11: `--spec-draft-n-max` is capped at 7** (`common/common.cpp`, a clamp with a visible `E`-level notice naming the `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` escape hatch, + the `max: 7` help string in `common/arg.cpp`) — see the 2026-09-11 (12) section below.
 | `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | **amended 2026-09-06 with the gfx11 NW16 scan retune** (gated_delta_net_chunked_bf16_gfx11.cu, fork 376f02aa0); **amended 2026-09-11 with the K-independent whole-batch chunked prefill** (gated_delta_net.cu; no sequential tail, `GGML_CUDA_GDN_ALIGN_BOUNDARY` gate + its two K-dependent branches **removed**; + the `llama_memory_recurrent` rollback-boundary guard).
 | `0003` | BF16 KV cache + native-BF16 flash-attn | **amended 2026-09-10 with the HIP masked-V/freed-cell fixes** (moved here from block 14 on 2026-09-10 — they sit on the native-BF16 PV staging this block introduces): `fattn-tile.cuh` (packed-bf16 PV) + `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles). |
 | `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf | **amended 2026-09-06 with the RDNA WMMA (256,256,64) config row** (fattn-mma-f16.cuh, fork e7eecb369).
@@ -168,6 +168,36 @@ record and the 2026-09-10 Strix Halo (gfx1151) pass live in
 `../beta/block-15-campaign-wins/README.md` and
 `../wip/strix-halo/GATE-2026-09-10-block15-rdna35.md`; the dated
 WORKLOG entries carry the history.
+
+## 2026-09-11 (12) block-01 + block-14 amendment: the draft-depth cap and the mixed-K/V reject
+
+Two maintainer decisions of 2026-09-11, both landed together (canonical tip **`484231cb9`**, tree
+`fc3c73da4ac68e92348043b992fb963b006e14df`):
+
+**block 01 — `--spec-draft-n-max` is capped at 7 (clamp, not an error).**  `common/common.cpp`
+(`common_init_from_params`) clamps the depth and prints an `E`-level notice; `common/arg.cpp` keeps only
+the `max: 7` help string.  *Why here and not in the parser:* a warning emitted during argument parsing
+sits below the default log threshold and never reaches the user (verified against llama.cpp's own
+control, the `--load-mode`/`--mmap` combination warning — equally invisible; `--log-verbosity 4` shows
+both), and `E` is the level llama-cli's default verbosity displays (the same pattern
+`common_fit_params` uses for its non-fatal abort notice).  *Why 7:* a verify batch decodes `n_max + 1`
+rows and `fattn.cu`'s chooser switches kernel family above 8 rows, so deeper drafts can change greedy
+output between `--spec-type none` and `draft-mtp` (the range measured in `GREEDY-PURITY.md` §11).
+*Escape hatch:* `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` keeps the configured value (with a `W` notice);
+`n_max > 15` also re-introduces the K-dependent chunked-GDN boundary, which the code comment says.
+*Verified:* 27B 2-GPU — `n_max 12` → notice **at default verbosity** + GDN `K=8`; `n_max 12` with the
+env → `K=13` + "keeping it"; `n_max 7`/`4` silent, `K=8`/`K=5`.
+
+**block 14 — mixed K/V cache types are hard-rejected for every model.**  `src/llama-context.cpp`: the
+upstream `(is_mla() || LLM_ARCH_DEEPSEEK4) && type_k != type_v` condition is reduced to
+`type_k != type_v`, i.e. every architecture now fails context creation with a message naming both types
+and telling the user to set `--cache-type-v` to match `--cache-type-k`.  *Why:* every mixed pair measured
+1.7–3.6× slower than the same-type equivalent and never smaller, and the attention path (including the
+tensor-split FA type gate a few lines above, which only supports the native-FA types) assumes
+`type_k == type_v`; the maintainer's decision was "reject, not document".  Both types default to f16, so
+only an explicit `--cache-type-k`/`-v` can trigger it.  *Verified:* `-ctk q8_0` (V=f16) and
+`-ctk q8_0 -ctv q4_0` both produce the new error; `-ctk q8_0 -ctv q8_0` runs normally.  All gate/test
+commands must now pass matching `-ctk`/`-ctv`.
 
 ## 2026-09-11 block-08 + block-14 amendment (fifth): `iq4_nl` is a first-class FA KV type
 

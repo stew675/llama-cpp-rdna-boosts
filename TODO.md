@@ -7,8 +7,8 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
 `wip/*` and `benchmarks/`.
 
 **Current state (2026-09-11 (10)):** the delivery is the 15-patch set against fork point `9113cc188`
-(block 00 + blocks 01-14), canonical tip **`6d3155faa`** (tree `0c3f0c2c2f4e7439d9489d45573a4021a8eee106`),
-`make-patches.sh` default tip = `6d3155faa`.  Block 15 (the attention-memory campaign) is **staged in
+(block 00 + blocks 01-14), canonical tip **`484231cb9`** (tree `fc3c73da4ac68e92348043b992fb963b006e14df`),
+`make-patches.sh` default tip = `484231cb9`.  Block 15 (the attention-memory campaign) is **staged in
 `beta/block-15-campaign-wins/`, not promoted**.  F1/F2/F3 (the KV-quant purity/parity campaign) are
 **all closed** — every KV cache type the delivery supports is width-pure and takes the f16 attention path.
 
@@ -50,15 +50,7 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
   there), (b) make the native staging read densely, (c) make the KV cache non-interleaved (llama.cpp-wide).
   Design: `wip/arch-independent-memory/BF16-NATIVE-KV-PLAN.md` §9.
 
-### 2. Issue #25: GDN chunked prefill makes `--spec-type none` differ from MTP (correctness, latent)
-- On one build+prompt the plain and MTP streams differ and it is entirely the GDN chunked prefill:
-  `GGML_CUDA_GDN_CHUNKED=0` makes `none == n-max 2 == n-max 4` byte-identical (`9216c6d1` → `bba7741d`).
-  Cause: `gated_delta_net.cu` branch 1 runs the plain multi-token prefill (`K=1`) chunked while spec
-  prefill (`K=n_max+1`) runs sequential; and for prompts `> K+64` branch 2's prefix boundary `n_tokens-K`
-  shifts with `n_max`.  Fork-only (block 02 — upstream ships only the sequential kernel).
-- Latent in practice (a 2.8k-token MTP run did not flip within 200 tokens) but a real state divergence;
-  probe `P=256 RS=from_w` gives W3–W5 = `0.210405` (chunked on) vs `0.000000` (off).
-- Repro, fix directions and the validation gate: `wip/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FOLLOWUP.md`.
+### 2. (demoted 2026-09-11 (12) — issue #25's GDN divergence is FIXED; see the Closed section)
 
 ### 3. qwen4exp `iq4_nl` prefill delta (~8–12 %, open — profiled to be host/launch-side)
 - Measured on the reference `-sm tensor`: `iq4_nl` 2303.1/2421.0 t/s at pp8192 (sparse/dense) vs f16
@@ -171,8 +163,8 @@ Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
 - The working `~/llama.cpp` `rdna-boosts` branch is a local rebuild and must **not** be used for
   regeneration while it sits on a master newer than the fork point (it would export `f3f1a8f27` +
   `304665fe7` as patches 0001/0002).  Regenerate from a canonical fork rebuilt at `9113cc188` by
-  `scripts/apply-all.sh` — currently tip `6d3155faa`, tree
-  `0c3f0c2c2f4e7439d9489d45573a4021a8eee106`.  See `BASELINE.md`/`AGENTS.md`.
+  `scripts/apply-all.sh` — currently tip `484231cb9`, tree
+  `fc3c73da4ac68e92348043b992fb963b006e14df`.  See `BASELINE.md`/`AGENTS.md`.
 - Superseded-but-useful artifacts: the work branch `wip/block15-campaign-wins` (`b26ae06f0`) and
   `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch` are the pre-merge
   record; the per-win plans under `wip/arch-independent-memory/` + `wip/qwen4exp/qsa-memory/` are the
@@ -191,8 +183,11 @@ Reference: `GREEDY-PURITY.md` §23.3, `WORKLOG.md` 2026-09-11 (11).
 - **Mixed K/V cache types fall off the GPU attention path.**  Any mixed pair (`bf16`+`q8_0`, `f16`+`q8_0`)
   gives `graph splits = 18`, a ~1.5 GiB host compute buffer and pp2048 7924 → 640–1049 t/s on the 4B.
   Maintainer policy (2026-09-11): **reject differing K/V types** — every mixed pair is 1.7–3.6× slower
-  and never smaller; upstream already enforces same-K/V for DeepSeek V4 (#25871).  Open sub-decision
-  only: hard error vs warning vs docs-only.
+  and never smaller; upstream already enforces same-K/V for DeepSeek V4 (#25871).  **Decided and
+  implemented 2026-09-11 (12): hard-rejected at context creation** — `params.type_k != params.type_v`
+  now fails `llama_init_from_model` with a message naming both types and telling the user to set
+  `--cache-type-v` to match (block-14 amendment; upstream's MLA/DeepSeek4-only condition is dropped).
+  Both types default to f16, so only an explicit `--cache-type-k`/`-v` can trigger it.
 - **gemma-4-E4B-it + 3-GPU `-sm tensor`** aborts in the meta splitter (`ggml-backend-meta.cpp:1177`)
   because its 2 KV heads are fewer than the 3 devices (one device gets a zero-extent share).  Works on
   1/2 GPUs and on 3 GPUs with `-sm layer`; maintainer's call: no fix.  Every other model is unaffected
@@ -213,6 +208,19 @@ Reference: `GREEDY-PURITY.md` §23.3, `WORKLOG.md` 2026-09-11 (11).
   `wip/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
+
+**Issue #25's GDN plain-vs-MTP divergence (2026-09-11 (12)) — FIXED and re-verified.**  The `K`-dependent
+chunked/sequential boundary in `gated_delta_net.cu` was removed by block 02's **K-independent whole-batch
+chunked prefill** (Option B, 2026-09-11): both the plain (`K == 1`) and the MTP (`K == n_max + 1`) prefill
+now make the *same* call, so the post-prefill state no longer depends on `n_max`; `GGML_CUDA_GDN_ALIGN_BOUNDARY`
+and both K-dependent branches were deleted and `GGML_CUDA_GDN_CHUNKED=0` remains as the A/B switch and the
+fully-snapshot-safe fallback.  **Re-verified 2026-09-11 (12) on the current tree** (27B Q8_0, 2-GPU
+`-sm tensor -ts 1/1`, `p0long.txt`, 512 greedy tokens, `-c 8192 -ctk f16 -ctv f16 -fa auto`):
+`--spec-type none == draft-mtp n_max 1 == 4 == 5` → all `299566b902bb` (2727 chars), byte-identical.
+(With `GGML_CUDA_GDN_CHUNKED=0` the plain text differs → `60777872b890`, which is the expected
+chunked-vs-sequential kernel difference, not a plain-vs-spec divergence.)  The stale status lines in
+`wip/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-{FOLLOWUP,FIX}.md` (they still describe the opt-in
+`GGML_CUDA_GDN_ALIGN_BOUNDARY` fix, a gate that no longer exists) are corrected there.
 
 **Block 15 dense-arm blocker (2026-09-11 (11)) — FIXED, one line.**  `LLAMA_QSA_SPARSE_FA=0` gave PPL
 `1.0558` for every KV type because the top-k mask chain's `ggml_tensor * kq_mask_top_k` shadowed the outer

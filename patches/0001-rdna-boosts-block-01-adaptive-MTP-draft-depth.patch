@@ -1,4 +1,4 @@
-From aa4108b9d99ae6f1e6d2f2350dc4b1a7606bea77 Mon Sep 17 00:00:00 2001
+From 7611ef81616a3473ed40ccf430618874d6e629e6 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Wed, 9 Sep 2026 05:29:21 -0500
 Subject: [PATCH 01/14] rdna-boosts: block 01: adaptive MTP draft depth
@@ -47,8 +47,8 @@ Controller behaviour was re-validated by the PR author on delta-net
 hardware after the review changes (C3/C6 on Qwen3.8-27B): throughput
 and acceptance match prior measurements within run-to-run noise.
 ---
- common/arg.cpp                                |  14 +-
- common/common.cpp                             |   2 +-
+ common/arg.cpp                                |  21 +-
+ common/common.cpp                             |  39 +++-
  common/common.h                               |  36 +--
  common/speculative-adaptive.h                 |  80 +++++++
  common/speculative.cpp                        | 143 +++++++++++-
@@ -62,12 +62,12 @@ and acceptance match prior measurements within run-to-run noise.
  tools/cli/README.md                           |   3 +-
  tools/server/README.md                        |   3 +-
  tools/server/server-context.cpp               |  11 +-
- 15 files changed, 519 insertions(+), 35 deletions(-)
+ 15 files changed, 562 insertions(+), 36 deletions(-)
  create mode 100644 common/speculative-adaptive.h
  create mode 100644 tests/test-speculative-adaptive.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 74241f931..663d76ad4 100644
+index 74241f931..c596e1e05 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -363,9 +363,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
@@ -81,7 +81,25 @@ index 74241f931..663d76ad4 100644
  
      const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                             params.speculative.types.end(),
-@@ -4177,6 +4175,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4162,11 +4160,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+ 
+     add_opt(common_arg(
+         {"--spec-draft-n-max"}, "N",
+-        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
++        string_format("number of tokens to draft for speculative decoding (default: %d, max: 7)", params.speculative.draft.n_max),
+         [](common_params & params, int value) {
+             if (value < 0) {
+                 throw std::invalid_argument("invalid value");
+             }
++            // Values above 7 are clamped, with a visible warning, in common_init_from_params - not
++            // here: a warning emitted during argument parsing is below the default log threshold and
++            // would not reach the user.  The cap exists because a verify batch decodes n_max + 1
++            // query rows and the flash-attention chooser switches kernel family above 8 rows, which
++            // can change greedy output between --spec-type none and draft-mtp.
+             params.speculative.draft.n_max = value;
+         }
+     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
+@@ -4177,6 +4180,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_min = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
@@ -99,10 +117,54 @@ index 74241f931..663d76ad4 100644
          {"--spec-synth-len"}, "L",
          "target mean synthetic acceptance length, including the target token (benchmarking only)",
 diff --git a/common/common.cpp b/common/common.cpp
-index d162a3880..a2c447225 100644
+index d162a3880..a1b22d217 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1711,7 +1711,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1434,6 +1434,43 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
+ }
+ 
+ common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
++    // --spec-draft-n-max is capped at 7 (a clamp, not an error).  A verify batch decodes n_max + 1
++    // query rows, and the HIP flash-attention chooser switches the band from the tile kernel to the
++    // MMA/WMMA kernel above 8 rows (ggml/src/ggml-cuda/fattn.cu, the Q->ne[1] > 8 switch).  The two
++    // kernels are not bit-identical, so a deeper draft makes verify and decode disagree and greedy
++    // output can change between --spec-type none and draft-mtp (upstream master has the same class
++    // of boundary).  The clamp lives here rather than in the argument parser so the warning is above
++    // the default log threshold and the user actually sees it (a warning emitted while parsing is
++    // hidden without --log-verbosity, as llama.cpp's own DEPRECATED notices are).  It runs before the
++    // model/context are created, so both see the capped depth.  See GREEDY-PURITY.md 11 and 19.
++    //
++    // LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 opts out for experiments: the depth is then honoured as given
++    // (with a warning).  Note that n_max > 16 also re-introduces the K-dependent chunked-GDN
++    // boundary (gated_delta_net.cu falls back to the K-floor threshold above K = 16), i.e. it can
++    // bring back the plain-vs-MTP prefill divergence on top of the flash-attention one.
++    if (params.speculative.draft.n_max > 7) {
++        static const bool clamp_enabled = []() {
++            const char * env = getenv("LLAMA_SPEC_DRAFT_N_MAX_CLAMP");
++            return env == nullptr || atoi(env) != 0;
++        }();
++        if (clamp_enabled) {
++            // ERR, not WRN, on purpose: llama-cli's default verbosity hides W-level messages, and the
++            // user must learn that their setting was not honoured.  This is a notice, not a failure -
++            // the run continues (same pattern as common_fit_params' abort notice).
++            LOG_ERR("--spec-draft-n-max %d exceeds the maximum of 7; clamping to 7 (a wider verify "
++                    "batch changes the flash-attention kernel and can alter greedy output).  Set "
++                    "LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 to keep %d if you accept that risk.  "
++                    "Not an error: the run continues.\n",
++                    params.speculative.draft.n_max, params.speculative.draft.n_max);
++            params.speculative.draft.n_max = 7;
++        } else {
++            LOG_WRN("--spec-draft-n-max %d is above the supported maximum of 7 and "
++                    "LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 is set: keeping it.  Drafts deeper than 7 can "
++                    "change greedy output between --spec-type none and draft-mtp.\n",
++                    params.speculative.draft.n_max);
++        }
++    }
++
+     common_init_result_ptr res(new common_init_result(params, model_only));
+ 
+     llama_model * model = res->model();
+@@ -1711,7 +1748,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.progress_callback           = params.load_progress_callback;
      mparams.progress_callback_user_data = params.load_progress_callback_user_data;
      mparams.no_alloc                    = params.no_alloc;

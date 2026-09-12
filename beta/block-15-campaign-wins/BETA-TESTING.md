@@ -218,6 +218,27 @@ but the hunks are far apart, so the re-cut is **metadata/offset-only** (0 change
 Nothing in the tester checklist changes: the revalidation numbers above were taken on the previous
 re-cut and the delta is metadata only.
 
+## 2026-09-11 (12) — tenth re-cut: two new delivery rules apply to the beta
+
+The base moved (block 01: the `--spec-draft-n-max ≤ 7` clamp with the `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0`
+escape hatch; block 14: mixed K/V types hard-rejected).  Base `484231cb9` -> **beta tip `a796a1d49`**,
+tree `b48565e69f77f0c20a20cd75d87c2559d11e6de2`, patch **3 811 lines**; `git am -3` merged cleanly (no
+conflict this time), and the only delta vs the ninth re-cut is those three delivery files, so the
+gate results above carry over unchanged.
+
+**Two new rules testers must respect:**
+
+* **`-ctk` and `-ctv` must match** for every command (any mismatch now fails context creation with
+  `models require the same K and V cache types`).  Every script in this directory already passes the
+  same type twice; older notes that used mixed pairs to measure the slow path stay valid as historical
+  measurements only.
+* **`--spec-draft-n-max` above 7 is clamped to 7** with a visible notice (the binary prints an `E`-level
+  line naming the env var; the clamp happens in `common_init_from_params`, so it is visible at the
+  default verbosity).  `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` keeps the configured depth and prints a `W`
+  notice — use it only for deliberate divergence experiments, and note that `n_max > 15` also
+  re-introduces the K-dependent chunked-GDN boundary.  Any recorded acceptance number taken at
+  `n_max > 7` (e.g. the adaptive-MTP baseline) must be re-measured at 7 or with the env set.
+
 ## 2026-09-11 (11) — ninth re-cut: the §4c dense-arm blocker is FIXED (one line)
 
 The base did **not** move (still the delivery tip `6d3155faa`, tree `0c3f0c2c2f4e7439d9489d45573a4021a8eee106`);
