@@ -1,5 +1,5 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 74241f931..90ffd4cd8 100644
+index 74241f931..fed86a73c 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -363,9 +363,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
@@ -42,7 +42,25 @@ index 74241f931..90ffd4cd8 100644
      add_opt(common_arg(
          {"--numa"}, "TYPE",
          "attempt optimizations that help on some NUMA systems\n"
-@@ -4177,6 +4197,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4162,11 +4182,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+ 
+     add_opt(common_arg(
+         {"--spec-draft-n-max"}, "N",
+-        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
++        string_format("number of tokens to draft for speculative decoding (default: %d, max: 7)", params.speculative.draft.n_max),
+         [](common_params & params, int value) {
+             if (value < 0) {
+                 throw std::invalid_argument("invalid value");
+             }
++            // Values above 7 are clamped, with a visible warning, in common_init_from_params - not
++            // here: a warning emitted during argument parsing is below the default log threshold and
++            // would not reach the user.  The cap exists because a verify batch decodes n_max + 1
++            // query rows and the flash-attention chooser switches kernel family above 8 rows, which
++            // can change greedy output between --spec-type none and draft-mtp.
+             params.speculative.draft.n_max = value;
+         }
+     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
+@@ -4177,6 +4202,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_min = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
@@ -60,10 +78,54 @@ index 74241f931..90ffd4cd8 100644
          {"--spec-synth-len"}, "L",
          "target mean synthetic acceptance length, including the target token (benchmarking only)",
 diff --git a/common/common.cpp b/common/common.cpp
-index d162a3880..72d8e65c6 100644
+index d162a3880..91f3b6038 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1689,6 +1689,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1434,6 +1434,43 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
+ }
+ 
+ common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
++    // --spec-draft-n-max is capped at 7 (a clamp, not an error).  A verify batch decodes n_max + 1
++    // query rows, and the HIP flash-attention chooser switches the band from the tile kernel to the
++    // MMA/WMMA kernel above 8 rows (ggml/src/ggml-cuda/fattn.cu, the Q->ne[1] > 8 switch).  The two
++    // kernels are not bit-identical, so a deeper draft makes verify and decode disagree and greedy
++    // output can change between --spec-type none and draft-mtp (upstream master has the same class
++    // of boundary).  The clamp lives here rather than in the argument parser so the warning is above
++    // the default log threshold and the user actually sees it (a warning emitted while parsing is
++    // hidden without --log-verbosity, as llama.cpp's own DEPRECATED notices are).  It runs before the
++    // model/context are created, so both see the capped depth.  See GREEDY-PURITY.md 11 and 19.
++    //
++    // LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 opts out for experiments: the depth is then honoured as given
++    // (with a warning).  Note that n_max > 16 also re-introduces the K-dependent chunked-GDN
++    // boundary (gated_delta_net.cu falls back to the K-floor threshold above K = 16), i.e. it can
++    // bring back the plain-vs-MTP prefill divergence on top of the flash-attention one.
++    if (params.speculative.draft.n_max > 7) {
++        static const bool clamp_enabled = []() {
++            const char * env = getenv("LLAMA_SPEC_DRAFT_N_MAX_CLAMP");
++            return env == nullptr || atoi(env) != 0;
++        }();
++        if (clamp_enabled) {
++            // ERR, not WRN, on purpose: llama-cli's default verbosity hides W-level messages, and the
++            // user must learn that their setting was not honoured.  This is a notice, not a failure -
++            // the run continues (same pattern as common_fit_params' abort notice).
++            LOG_ERR("--spec-draft-n-max %d exceeds the maximum of 7; clamping to 7 (a wider verify "
++                    "batch changes the flash-attention kernel and can alter greedy output).  Set "
++                    "LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 to keep %d if you accept that risk.  "
++                    "Not an error: the run continues.\n",
++                    params.speculative.draft.n_max, params.speculative.draft.n_max);
++            params.speculative.draft.n_max = 7;
++        } else {
++            LOG_WRN("--spec-draft-n-max %d is above the supported maximum of 7 and "
++                    "LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 is set: keeping it.  Drafts deeper than 7 can "
++                    "change greedy output between --spec-type none and draft-mtp.\n",
++                    params.speculative.draft.n_max);
++        }
++    }
++
+     common_init_result_ptr res(new common_init_result(params, model_only));
+ 
+     llama_model * model = res->model();
+@@ -1689,6 +1726,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.split_mode      = params.split_mode;
      mparams.load_mode       = params.load_mode;
      mparams.lazy_mode = params.lazy_mode;
@@ -71,7 +133,7 @@ index d162a3880..72d8e65c6 100644
      mparams.tensor_split    = params.tensor_split;
      mparams.check_tensors   = params.check_tensors;
      mparams.use_extra_bufts = !params.no_extra_bufts;
-@@ -1711,7 +1712,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1711,7 +1749,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.progress_callback           = params.load_progress_callback;
      mparams.progress_callback_user_data = params.load_progress_callback_user_data;
      mparams.no_alloc                    = params.no_alloc;
@@ -18634,7 +18696,7 @@ index f1d173a57..01e2bbe1d 100644
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_FC,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 21501574a..71be86089 100644
+index 21501574a..cf1fcc3e1 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -152,7 +152,7 @@ llama_context::llama_context(
@@ -18698,7 +18760,7 @@ index 21501574a..71be86089 100644
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
-@@ -3692,6 +3730,37 @@ llama_context * llama_init_from_model(
+@@ -3692,10 +3730,49 @@ llama_context * llama_init_from_model(
          if (model->get_split_state_ud.n_devices == 1) {
              LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
          }
@@ -18735,7 +18797,21 @@ index 21501574a..71be86089 100644
 +        }
      }
  
-     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
+-    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
+-        LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
++    // Every model requires the same K and V cache types (rdna-boosts, 2026-09-11).  Upstream enforces
++    // this for MLA and DeepSeek4 only; here it is general: every mixed pair measured 1.7-3.6x slower
++    // than the same-type equivalent and never smaller, and the attention path - including the
++    // split/flash-attention one - assumes type_k == type_v, so a mixed configuration is rejected
++    // rather than accepted as a slow-but-valid one.  Both types default to f16, so only an explicit
++    // --cache-type-k (or --cache-type-v) can trigger this.
++    if (params.type_k != params.type_v) {
++        LLAMA_LOG_ERROR("%s: models require the same K and V cache types, got K=%s and V=%s; "
++                "set --cache-type-v to match --cache-type-k (both default to f16)\n",
++                __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+         return nullptr;
+     }
+ 
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
 index b592de18c..08a1a264f 100644
 --- a/src/llama-cparams.h
