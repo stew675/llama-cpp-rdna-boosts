@@ -468,13 +468,19 @@ Consequences, so it is not re-litigated:
   verify batch fell through to the sparse top-k selection.  The arm now serves the
   whole band (`QSA_DECODE_BAND = 8`), so `plain == n_max 3 == n_max 7`
   byte-identically (`804de0576868` f16, `75d8530c5bb1` q8_0); an arm trace proved
-  it (`wip/kv-quant-purity-followups/tools/qsa-arm-trace.patch`).  **Still open,
-  sparse regime only:** (1) `GGML_CUDA_QSA_INDEXER_SCORE`'s "byte-identical" claim
-  is measurably false and is itself `n_tokens == 1`-gated — unreachable on gfx1201's
-  default config (decode never builds scores) but the **default path on gfx1151
-  above its 64K crossover**; (2) a residual split survives even with one arm
-  (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`: common prefix 706 chars vs 100, then divergence).
-  See `GREEDY-PURITY.md` §§16-18.
+  it (`wip/kv-quant-purity-followups/tools/qsa-arm-trace.patch`).  **Re-measured on
+  gfx1151 2026-09-12 (the two previously-recorded sparse-regime items):** both were
+  artifacts of the block-13 RDNA3_5 mmvq-fusion impurity (fixed 2026-09-12) — the fused
+  indexer score is byte-identical to the per-op chain (512-token forced-sparse A/B:
+  same text with `GGML_CUDA_QSA_INDEXER_SCORE`/`_CACHE` default vs 0), the pre-fix
+  divergence reproduces only with `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1`,
+  and **default gfx1151 configs are pure** (shallow dense on every KV type, deep sparse
+  at ~74K on f16 and q8_0).  The 64K crossover stays.  **One residual is open and
+  unlocalised:** a prompt-dependent q8_0 width dependence in the *forced*-sparse
+  shallow regime (`plain a57bc13bbf2a` vs `n3 3124adfd2b94`, `/tmp/p5000.txt`), which
+  `LLAMA_QSA_SPARSE_FA=0` does not fix and `GGML_CUDA_DISABLE_FUSION=1` /
+  `GGML_CUDA_GDN_CHUNKED=0` perturb to purity; tracked as TODO item 4.  See
+  `GREEDY-PURITY.md` §§16-18 and `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`.
 - The one-sided AR wait (dev0/bus-06 dispatch-gap asymmetry, ~12.7 µs/call)
   is a **platform-level CP/driver property**, not reachable from the AR
   kernel, graph tail, or host-side pacing — fusion/pacing are CLOSED

@@ -649,33 +649,42 @@ with the kill-switch all of them `bd138ad2326fbbf2` (a uniform unfused reference
 value); qwen4exp was unaffected (`plain == n3 == 804de0576868`).  The asterisk is gone: the MoE decode
 and verify batches now take one arithmetic, so the `n_max <= 7` guarantee covers MoE too.
 
-## 18. Two width-dependences remain in the QSA *sparse* regime (open, 2026-09-11)
+## 18. The QSA *sparse* regime is width-pure on gfx1151; one q8_0 residual remains (2026-09-12)
 
-§16 fixes the **default** regime, which is what gfx1201 (and gfx1151 below its 64K crossover) runs.
-Two further items were found while localising it and are **open**:
+§18 previously recorded **two** width-dependences in the QSA sparse regime, measured 2026-09-11 during
+the cause-3 hunt (on the 3-GPU gfx1201 box, with the sparse arm forced by
+`LLAMA_QSA_DENSE_DECODE_UNTIL=0`) — i.e. **before** the 2026-09-12 block-13 RDNA3_5 mmvq-fusion
+amendment (§25).  Re-measured on gfx1151 with the current delivery, **neither reproduces**:
 
-1. **The fused indexer score is not byte-identical, and it is itself `n_tokens == 1`-gated.**
-   `GGML_CUDA_QSA_INDEXER_SCORE` (default **ON**, `src/models/qwen4exp.cpp` — the `idx_score_fused`
-   gate at the `build_qsa_top_k` entry) replaces the per-op score chain with one kernel and claims to
-   "replicate the per-op F32 arithmetic byte-identically".  Measured **false**: with the sparse regime
-   forced on both widths (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`), `GGML_CUDA_QSA_INDEXER_SCORE=0` changes
-   *both* streams (`361c9daa7ed8`/`9959840e2747` → `14924014c66f`/`e5c7a3f91699`).  Because the gate is
-   `n_tokens == 1`, a W=1 decode and an n-token verify consume the indexer state through different
-   score paths.  It is **unreachable on gfx1201's default config** (the plain run never builds scores
-   at all — the dense arm skips `build_qsa_top_k`), but it is the default path on **gfx1151 above the
-   64K crossover**, where decode is sparse.  (This also explains why the earlier `SCORE=0` test in the
-   default regime was a *legitimate* null: neither run executes the score path there.)
-2. **A residual split survives even with one arm.**  With `LLAMA_QSA_DENSE_DECODE_UNTIL=0` (both
-   widths on the sparse arm) `plain` and `n3` agree for 706 chars instead of 100 — i.e. the arm split
-   was the first cause — but they still diverge, so at least one more width-dependence lives in the
-   sparse-regime state path (indexer store / derived-cache pooling).  `GGML_CUDA_QSA_INDEXER_CACHE=0`
-   alone does not reconcile them (in the default regime that knob is a no-op: the dense arm never fills
-   or reads the derived cache).
+1. **The fused indexer score is byte-identical to the per-op chain.**  A 512-token forced-sparse A/B
+   (qwen4exp UD-IQ4_XS, f16 KV, `P=5000`) gives the *same* text for the fused score (default),
+   the per-op chain (`GGML_CUDA_QSA_INDEXER_SCORE=0`) and the no-derived-cache form
+   (`GGML_CUDA_QSA_INDEXER_CACHE=0`) — `0d29890e0f04` for both widths in all three (bf16 the same,
+   `945f89766e3c`).  The positive control (`GGML_CUDA_QSA_INDEXER_CACHE=2`, the unfilled-pool probe)
+   *does* move the W=1 text, proving the fused path is the one running.  The "not byte-identical"
+   claim does not hold on gfx1151.
+2. **The residual split was the block-13 mmvq fusion.**  Forced sparse, f16, `P=5000`: the current
+   delivery is `plain == n3 = cb2912b186b9`, and the pre-fix behaviour reproduces exactly with the
+   opt-in `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1` (`plain 471ea250f8e2` vs `n3
+   cb2912b186b9`) — the "706-char prefix then divergence" was the dense gate+up+GLU / weighted-down
+   single-token fusion non-byte-identity (§25), not the indexer machinery.
 
-Consequence: the exhaustive greedy-purity guarantee is complete for **RDNA4/gfx1201's default regime**
-and for the dense models and the MoE; the **gfx1151 sparse regime above 64K** still needs the two items
-above.  Repro knobs: `LLAMA_QSA_DENSE_DECODE_UNTIL=0`, `GGML_CUDA_QSA_INDEXER_SCORE=0`,
-`GGML_CUDA_QSA_INDEXER_CACHE=0`; the arm trace is kept at
+**Default gfx1151 configs are pure** (plain == `draft-mtp n_max 3` byte-identical): shallow dense
+decode on every tested KV type (q8_0 included, `e8f8bba3942b`), and deep sparse decode at ~74K (f16
+`83e0ed0f0f80`, q8_0 `7205399d367d` — the maintainer's `-ctk q8_0` serving config).  The 64K crossover
+therefore stays: there is no purity driver to make gfx1151 dense-decode at every depth.
+
+**One residual, q8_0-only and prompt-dependent (open).**  With the arm *forced* sparse at shallow
+context, qwen4exp + `-ctk q8_0` diverges on one prompt (`/tmp/p5000.txt`: `plain a57bc13bbf2a` vs
+`n3 3124adfd2b94`), reproducibly; f16/bf16/q4_0/q4_1/iq4_nl and q8_0 on other prompts are pure, and
+the default deep q8_0 config is pure — a ULP-level width dependence.  `LLAMA_QSA_SPARSE_FA=0` does
+**not** reconcile it (so the standard masked-FA path is affected too, not just the fused `fattn-qsa`
+kernel), `LLAMA_QSA_OFF=1` does, and `GGML_CUDA_DISABLE_FUSION=1` / `GGML_CUDA_GDN_CHUNKED=0` each
+perturb it to purity (both move the whole stream, so they localise nothing by themselves).  Root cause
+is **unlocalised** — next step is a node-dump/op-trace rebuild (`GGML_CUDA_OP_TIMING` is not compiled
+into the shipped build; `tools/node-dump-instrumentation.patch` is the instrument) to diff the W=1 and
+W=4 graphs.  It is tracked as TODO item 4.  Repro knobs: `LLAMA_QSA_DENSE_DECODE_UNTIL=0` and the KV
+type; record `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`; the arm trace is kept at
 `wip/kv-quant-purity-followups/tools/qsa-arm-trace.patch`.
 
 ## 19. Purity first: the measured trade (2026-09-11, policy)

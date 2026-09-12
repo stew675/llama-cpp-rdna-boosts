@@ -1,5 +1,34 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-12 (4) — QSA sparse-regime width purity on gfx1151: items 4/7 re-measured (item 4 re-scoped, item 7 closed)
+
+No delivery change.  Re-measured the two QSA-*sparse*-regime width dependences that TODO item 4 recorded
+on 2026-09-11 (on the 3-GPU gfx1201 box, sparse arm forced) — both were measured **before** the
+2026-09-12 block-13 RDNA3_5 mmvq-fusion amendment, and **neither reproduces on gfx1151 with the current
+delivery**:
+
+- the fused indexer score **is** byte-identical to the per-op chain: a 512-token forced-sparse A/B
+  (qwen4exp UD-IQ4_XS, f16/bf16, `P=5000`) gives the same text for `GGML_CUDA_QSA_INDEXER_SCORE` and
+  `_CACHE` at their defaults and at 0 (`0d29890e0f04` f16), and the `CACHE=2` unfilled-pool probe does
+  move the W=1 text (so the fused path is the one running);
+- the recorded "residual split" was the block-13 single-token mmvq fusion (§25): the current delivery is
+  `plain == n3 = cb2912b186b9`, and the pre-fix impurity reproduces exactly with
+  `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1` (`471ea250f8e2` vs `cb2912b186b9`).
+
+**Default gfx1151 configs are pure**: shallow dense decode on every tested KV type (q8_0 included) and
+deep sparse decode at ~74K (f16 `83e0ed0f0f80`, q8_0 `7205399d367d` — the maintainer's `-ctk q8_0`
+config).  Item 7 (the "dense decode at every depth" workaround) is therefore **closed** — the 64K
+crossover stays.
+
+One residual remains and is **open/unlocalised**: a prompt-dependent q8_0 width dependence in the
+*forced*-sparse shallow regime (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`, `/tmp/p5000.txt`: `plain a57bc13bbf2a`
+vs `n3 3124adfd2b94`).  `LLAMA_QSA_SPARSE_FA=0` does not reconcile it (the standard masked-FA path is
+affected too), `LLAMA_QSA_OFF=1` does, and `GGML_CUDA_DISABLE_FUSION=1` / `GGML_CUDA_GDN_CHUNKED=0` each
+perturb to purity.  It is a ULP-level effect (the default deep q8_0 config is pure).  Next step: a
+node-dump/op-trace rebuild to diff the W=1 and W=4 graphs.  Item 4 is re-scoped to this.  Record:
+`wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`; analysis `GREEDY-PURITY.md` §18; docs updated
+(`AGENTS.md`, `TODO.md`).
+
 ## 2026-09-12 (3) — TODO.md audit: the Active list is active-only, closed items moved out, state header refreshed
 
 Docs-only tracker cleanup (no delivery change).  `TODO.md`'s *Active* list had accumulated finished-work

@@ -12,7 +12,9 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
 `beta/block-15-campaign-wins/`, not promoted** (12th re-cut: `13af95ac1` → `888a59ee0`).  F1/F2/F3 (the
 KV-quant purity/parity campaign) are **all closed** — every KV cache type the delivery supports is
 width-pure and takes the f16 attention path — and so is the gfx1151 within-band mmvq fusion variance
-(block-13 amendment, 2026-09-12; see Closed).
+(block-13 amendment, 2026-09-12; see Closed).  The QSA *sparse* regime was re-measured on gfx1151
+2026-09-12: default configs are pure (item 7 closed); one prompt-dependent **q8_0** forced-sparse
+residual is tracked in item 4.
 
 ## Active
 
@@ -65,14 +67,20 @@ width-pure and takes the f16 attention path — and so is the gfx1151 within-ban
   `rocprofv3 --kernel-trace` + the `[GD]` graph dump (`wip/kv-quant-purity-followups/tools/`), and
   `tools/qperf.sh` for the interleaved per-type table.  Analysis: `GREEDY-PURITY.md` §22.
 
-### 4. QSA *sparse*-regime width-dependences (2 items, open; gfx1151's default regime)
-Both are in `GREEDY-PURITY.md` §18; gfx1201's default (dense decode) is unaffected.
-- (a) `GGML_CUDA_QSA_INDEXER_SCORE`'s "byte-identical" claim is **measurably false** and the probe is
-  itself `n_tokens == 1`-gated — unreachable on gfx1201's default, but the default path on gfx1151 above
-  its 64K crossover.  Fix = make the kernel token-generic, or default the probe OFF.
-- (b) A residual split survives even with one arm (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`: common prefix 706
-  chars vs 100, then divergence) — a state/store width-dependence still unlocalised
-  (`GGML_CUDA_QSA_INDEXER_CACHE=0` does not reconcile them).
+### 4. QSA *sparse*-regime width purity (re-scoped 2026-09-12; default configs pure)
+The two items previously recorded here were re-measured on gfx1151 (2026-09-12, after the block-13
+RDNA3_5 mmvq-fusion fix) and **do not reproduce**: the fused indexer score is byte-identical to the
+per-op chain (512-token forced-sparse A/B), and the "residual split" was the block-13 single-token mmvq
+fusion (§25) — the pre-fix divergence reproduces only with
+`GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1`.  **Default gfx1151 configs are pure** (shallow dense:
+every KV type incl. q8_0; deep sparse at ~74K: f16 `83e0ed0f0f80`, q8_0 `7205399d367d`), so the 64K
+crossover stays.
+- **Open, unlocalised (low severity):** a prompt-dependent **q8_0** width dependence in the *forced*-sparse
+  shallow regime (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`, `/tmp/p5000.txt`: `plain a57bc13bbf2a` vs
+  `n3 3124adfd2b94`).  `LLAMA_QSA_SPARSE_FA=0` does not fix it; `LLAMA_QSA_OFF=1`,
+  `GGML_CUDA_DISABLE_FUSION=1` and `GGML_CUDA_GDN_CHUNKED=0` each perturb to purity.  Next step: a
+  node-dump/op-trace rebuild to diff the W=1 and W=4 graphs.  Record:
+  `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`; analysis `GREEDY-PURITY.md` §18.
 
 ### 5. Strix Halo (gfx1151) prefill-gap follow-ons (all prefill; decode is closed)
 Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
@@ -107,14 +115,6 @@ Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
 - **Tracker hygiene:** the plan's own open checkboxes are **stale** (Phase 1 is complete and the doc
   predates qwen4exp's promotion to block 14); read the banner at the top of
   `wip/qwen4exp/gfx1201-porting.md` before trusting them.
-
-### 7. Strix Halo / gfx1151 bundle (**actionable now** — we are on the Strix box)
-- Re-measure the **MTP-side** QSA crossover on the Strix box: the published 64K "dense below, QSA above"
-  table was measured for the W=1 decode regime, and the verify batch now takes the dense arm below the
-  crossover.  Above 64K the sparse regime is at parity with dense per the controlled 2026-09-07 protocol
-  **and** still impure for MTP (§18), so under the purity-first policy the likely answer is **dense
-  decode at every depth on gfx1151 too** (a one-line `build_layer_attn` change) once §18 is fixed.
-- See `GREEDY-PURITY.md` §18–19 and `wip/strix-halo/HANDOVER-2026-09-12-remaining-gfx1151.md` §3.
 
 ### 8. Dual 7900XTX (gfx1100, community): block-12 validation
 - Hybrid HIP all-reduce on RDNA3 **pairs** is being validated by a community member on their dual-7900XTX
@@ -209,6 +209,15 @@ Reference: `GREEDY-PURITY.md` §23.3, `WORKLOG.md` 2026-09-11 (11).
   `wip/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
+
+**The gfx1151 dense-decode-at-every-depth policy (TODO item 7, closed 2026-09-12).**  The proposed
+workaround (force gfx1151 decode dense at every depth, so the sparse regime becomes unreachable) was
+motivated by the sparse regime's recorded width impurity.  Re-measured 2026-09-12: the two recorded
+items were artifacts of the block-13 RDNA3_5 mmvq fusion (fixed the same day), and the sparse regime is
+**pure** in the default configs (deep sparse ~74K: f16 `83e0ed0f0f80`, q8_0 `7205399d367d`), so gfx1151
+**keeps the 64K crossover** (sparse wins deep decode).  A pure per-*perf* MTP-side crossover re-measure
+is parked — no purity driver.  The one residual is the q8_0 forced-sparse item now tracked under item 4;
+record `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`, analysis `GREEDY-PURITY.md` §18.
 
 **The gfx1151 within-band mmvq fusion variance (block 13, closed 2026-09-12 (2)).**  The 2026-09-11
 block-13 band work made the *standalone* mmvq path `W = 1..8`-uniform, but on gfx1151 two
@@ -326,6 +335,7 @@ dense texts and random-text PPL byte-identical to the delivery, production arm u
 ## Where the current lists live
 
 - Remaining gfx1151 work + the 2026-09-12 TODO audit: `wip/strix-halo/HANDOVER-2026-09-12-remaining-gfx1151.md`.
+- QSA sparse-regime width purity (items 4/7 disposition): `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`.
 - Environment, instruments, reference hashes and the landing procedure for KV/FA work:
   `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-remaining-work.md` (its §0 status and its items 1/5
   and F3 are **superseded** — see the Closed section here).
