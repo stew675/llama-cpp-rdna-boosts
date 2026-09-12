@@ -31,6 +31,11 @@
 > merged cleanly (the `llama-context.cpp` region now carries both the new reject and block 15's
 > tensor-split type gate); the only delta vs the ninth re-cut is those three delivery files.  Testers must
 > pass matching `-ctk`/`-ctv`.  See `README.md` (tenth re-cut) and `BETA-TESTING.md`.
+> **Re-cut an eleventh time 2026-09-12** after the block-13 column-block amendment (bit-identical; repays
+> the band amendment's `pl=8` cost).  Base `124abba9e` (tree `d7c8e8984b8bd65838d8ae58c0f5de449d9c5d4d`)
+> -> **beta tip `a90f75896`**, tree **`ed6ee74df8b690c5a1584adb3f85c45eda70a09b`**, patch **3 811 lines**.
+> `git am -3` merged cleanly; the patch differs from the tenth re-cut only in the `From <sha>` line.  The
+> re-cut builds and its smoke gates reproduce the tenth re-cut's values, so no recorded number moves.
 > **Re-cut a ninth time 2026-09-11 (11) — the `LLAMA_QSA_SPARSE_FA=0` blocker is FIXED, one line.**  The
 > base did **not** move (still `6d3155faa`, tree `0c3f0c2c2f4e7439d9489d45573a4021a8eee106`); only block 15
 > changed: the mask chain's `ggml_tensor * kq_mask_top_k = ggml_set_rows(...)` in `build_attn_qsa` had been

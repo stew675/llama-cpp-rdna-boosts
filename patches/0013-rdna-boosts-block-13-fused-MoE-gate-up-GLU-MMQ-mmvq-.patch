@@ -1,4 +1,4 @@
-From 1672225bc2e3bdd27d348704ef23f71d86282066 Mon Sep 17 00:00:00 2001
+From feb0a8d808a3de313cab7ad9cd8146e1c4f46bba Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 06:50:35 -0500
 Subject: [PATCH 13/14] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -47,8 +47,8 @@ Subject: [PATCH 13/14] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
  ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh     |   6 +-
  ggml/src/ggml-cuda/mmq-vec-dot.cuh            |  16 +-
  ggml/src/ggml-cuda/mmq.cu                     | 228 ++++-
- ggml/src/ggml-cuda/mmq.cuh                    | 409 ++++++++-
- ggml/src/ggml-cuda/mmvq.cu                    | 842 +++++++++++++++---
+ ggml/src/ggml-cuda/mmq.cuh                    | 409 +++++++-
+ ggml/src/ggml-cuda/mmvq.cu                    | 905 +++++++++++++++---
  ggml/src/ggml-cuda/mmvq.cuh                   |   8 +
  ggml/src/ggml-cuda/moe-weighted-reduction.cu  |  58 +-
  ggml/src/ggml-cuda/quantize.cu                | 221 +++--
@@ -56,7 +56,7 @@ Subject: [PATCH 13/14] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
  .../template-instances/generate_cu_files.py   |  14 +
  .../template-instances/mmq-instance-q3_k.cu   |   1 +
  tests/test-backend-ops.cpp                    |   2 +-
- 13 files changed, 1775 insertions(+), 233 deletions(-)
+ 13 files changed, 1825 insertions(+), 246 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index f097ff101..72982fbc9 100644
@@ -1321,7 +1321,7 @@ index 964c9678e..801f990d2 100644
  
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index e873fe080..3837dee34 100644
+index e873fe080..15947ef3d 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -287,6 +287,17 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
@@ -2134,7 +2134,7 @@ index e873fe080..3837dee34 100644
              } else {
                  GGML_ASSERT(ggml_nelements(fusion->x_scale) == (ids ? src0->ne[2] : 1));
              }
-@@ -1974,31 +2432,38 @@ void ggml_cuda_op_ssm_conv_l2_gatebeta(
+@@ -1974,30 +2432,39 @@ void ggml_cuda_op_ssm_conv_l2_gatebeta(
  
  // Fused shared-expert output: down projection plus the gate and residual adds.
  // dst = down(swiglu) * sigmoid(gate(x)) + moe_out + ffn_residual.
@@ -2167,36 +2167,69 @@ index e873fe080..3837dee34 100644
      }
  }
  
-+// One block per (output row, token): the token only selects the input/output columns, so the
-+// per-token arithmetic (and thus the result) is the same as for a single-token decode.
- template <int nwarps>
+-template <int nwarps>
++// One block per output row, the whole decode/verify band in registers: the weight row is read once
++// per (row, k-block) and reused for every token, instead of once per (row, token).  The token only
++// selects the input/output columns, so each token keeps the single-token kernel's per-thread
++// accumulation order and the same cross-warp reduction order -- every (row, token) result is
++// bit-identical at every width (the decode == verify invariant, GREEDY-PURITY.md §19).
++template <int nwarps, int ncols_dst>
  static __global__ void shexp_down_gated_q8_0(
          const void * vx_down, const block_q8_1 * y_swiglu, const float * gate_sig,
          const float * moe_out, const float * ffn_residual,
 -        float * dst, const int k_down) {
 +        float * dst, const int k_down, const int stride_col_y, const int nrows_dst) {
      const int row = blockIdx.x;
-+    const int t   = blockIdx.y;
      constexpr int warp_size = 32;
      const int tid = warp_size*threadIdx.y + threadIdx.x;
-     constexpr int qk = 32; // Q8_0 block size
-@@ -2007,12 +2472,13 @@ static __global__ void shexp_down_gated_q8_0(
- 
+@@ -2008,29 +2475,55 @@ static __global__ void shexp_down_gated_q8_0(
      const int blocks_per_row_x = k_down / qk;
      const block_q8_0 * wd = (const block_q8_0 *) vx_down + (int64_t) row * blocks_per_row_x;
-+    const block_q8_1 * y_swiglu_t = y_swiglu + (int64_t) t * stride_col_y;
  
-     float sum_down = 0.0f;
+-    float sum_down = 0.0f;
++    float sum_down[ncols_dst];
++#pragma unroll
++    for (int t = 0; t < ncols_dst; ++t) {
++        sum_down[t] = 0.0f;
++    }
++
      const int blocks_per_iter = vdr * nwarps*warp_size / qi;
      for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
          const int kqs = vdr * (tid % (qi/vdr));
 -        sum_down += vec_dot_q8_0_q8_1(wd, &y_swiglu[kbx], kbx, kqs);
-+        sum_down += vec_dot_q8_0_q8_1(wd, &y_swiglu_t[kbx], kbx, kqs);
++        // the weight block is read once and reused by every token of the band
++#pragma unroll
++        for (int t = 0; t < ncols_dst; ++t) {
++            sum_down[t] += vec_dot_q8_0_q8_1(wd, &y_swiglu[(int64_t) t*stride_col_y + kbx], kbx, kqs);
++        }
      }
  
-     // cross-warp reduction, same order as mul_mat_vec_q
-@@ -2030,7 +2496,14 @@ static __global__ void shexp_down_gated_q8_0(
-     sum_down = warp_reduce_sum<warp_size>(sum_down);
+-    // cross-warp reduction, same order as mul_mat_vec_q
+-    __shared__ float sh_down[nwarps > 1 ? nwarps-1 : 1][warp_size];
++    // cross-warp reduction, same order as mul_mat_vec_q (and per token, as the single-token kernel)
++    __shared__ float sh_down[nwarps > 1 ? nwarps-1 : 1][ncols_dst][warp_size];
+     if (threadIdx.y > 0) {
+-        sh_down[threadIdx.y-1][threadIdx.x] = sum_down;
++#pragma unroll
++        for (int t = 0; t < ncols_dst; ++t) {
++            sh_down[threadIdx.y-1][t][threadIdx.x] = sum_down[t];
++        }
+     }
+     __syncthreads();
+     if (threadIdx.y > 0) {
+         return;
+     }
+-    for (int l = 0; l < nwarps-1; ++l) {
+-        sum_down += sh_down[l][threadIdx.x];
++#pragma unroll
++    for (int t = 0; t < ncols_dst; ++t) {
++#pragma unroll
++        for (int l = 0; l < nwarps-1; ++l) {
++            sum_down[t] += sh_down[l][t][threadIdx.x];
++        }
++        sum_down[t] = warp_reduce_sum<warp_size>(sum_down[t]);
+     }
+-    sum_down = warp_reduce_sum<warp_size>(sum_down);
  
      if (threadIdx.x == 0) {
 -        dst[row] = sum_down * gate_sig[0] + moe_out[row] + ffn_residual[row];
@@ -2206,12 +2239,15 @@ index e873fe080..3837dee34 100644
 +        //   dst = ffn_out + ffn_residual
 +        // so the multiply must NOT be contracted into an FMA here (an FMA would
 +        // round once instead of twice and break decode == verify).
-+        const int64_t o = (int64_t) t * nrows_dst + row;
-+        dst[o] = __fmul_rn(sum_down, gate_sig[t]) + moe_out[o] + ffn_residual[o];
++#pragma unroll
++        for (int t = 0; t < ncols_dst; ++t) {
++            const int64_t o = (int64_t) t * nrows_dst + row;
++            dst[o] = __fmul_rn(sum_down[t], gate_sig[t]) + moe_out[o] + ffn_residual[o];
++        }
      }
  }
  
-@@ -2048,8 +2521,7 @@ void ggml_cuda_op_shexp_down_gate(
+@@ -2048,8 +2541,7 @@ void ggml_cuda_op_shexp_down_gate(
  
      // Quantize the swiglu to Q8_1 once per graph.
      const int64_t ne10_padded = GGML_PAD(swiglu->ne[0], MATRIX_ROW_PADDING);
@@ -2221,7 +2257,7 @@ index e873fe080..3837dee34 100644
      while (src1_key->view_src != nullptr) {
          src1_key = src1_key->view_src;
      }
-@@ -2066,23 +2538,34 @@ void ggml_cuda_op_shexp_down_gate(
+@@ -2066,37 +2558,65 @@ void ggml_cuda_op_shexp_down_gate(
                                 swiglu->ne[1], swiglu->ne[2], swiglu->ne[3], stream);
      }
  
@@ -2257,22 +2293,50 @@ index e873fe080..3837dee34 100644
 +    // reduction order of the down projection, so a width-dependent nwarps would make the
 +    // verify batch arithmetically different from the decode (the decode == verify invariant).
      const int nwarps = calc_nwarps(GGML_TYPE_Q8_0, 1, get_device_table_id(cc));
--    const dim3 block_nums(nrows);
 +    const int stride_col_y = (int) (ne10_padded / QK8_1);
-+    const dim3 block_nums(nrows, ncols);
++    // One block per row: the band is block-internal (ncols_dst), so the weight row is read once for
++    // all tokens.  This keeps grid.x at nrows regardless of the batch width (the per-token grid
++    // duplicated the whole block -- its two barriers, the reduction and the epilogue -- per token).
+     const dim3 block_nums(nrows);
      const dim3 block_dims(32, nwarps);
      const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-     const auto launch = [&](auto nwarps_c) {
-@@ -2090,7 +2573,7 @@ void ggml_cuda_op_shexp_down_gate(
-         ggml_cuda_kernel_launch(shexp_down_gated_q8_0<NW>, launch_params,
+-    const auto launch = [&](auto nwarps_c) {
++    const auto launch = [&](auto nwarps_c, auto ncols_c) {
+         constexpr int NW = decltype(nwarps_c)::value;
+-        ggml_cuda_kernel_launch(shexp_down_gated_q8_0<NW>, launch_params,
++        constexpr int NC = decltype(ncols_c)::value;
++        ggml_cuda_kernel_launch(shexp_down_gated_q8_0<NW, NC>, launch_params,
              w_down->data, (const block_q8_1 *) y_swiglu, gate_scratch.get(),
              (const float *) moe_out->data, (const float *) ffn_residual->data,
 -            (float *) dst->data, w_down->ne[0]);
 +            (float *) dst->data, w_down->ne[0], stride_col_y, nrows);
++    };
++    const auto launch_ncols = [&](auto nwarps_c) {
++        switch (ncols) {
++            case 1:  launch(nwarps_c, std::integral_constant<int, 1>{}); break;
++            case 2:  launch(nwarps_c, std::integral_constant<int, 2>{}); break;
++            case 3:  launch(nwarps_c, std::integral_constant<int, 3>{}); break;
++            case 4:  launch(nwarps_c, std::integral_constant<int, 4>{}); break;
++            case 5:  launch(nwarps_c, std::integral_constant<int, 5>{}); break;
++            case 6:  launch(nwarps_c, std::integral_constant<int, 6>{}); break;
++            case 7:  launch(nwarps_c, std::integral_constant<int, 7>{}); break;
++            case 8:  launch(nwarps_c, std::integral_constant<int, 8>{}); break;
++            default: GGML_ASSERT(false); break;
++        }
      };
      switch (nwarps) {
-         case 1:  launch(std::integral_constant<int, 1>{}); break;
-@@ -2131,3 +2614,152 @@ void ggml_cuda_op_mul_mat_vec_q(
+-        case 1:  launch(std::integral_constant<int, 1>{}); break;
+-        case 2:  launch(std::integral_constant<int, 2>{}); break;
+-        case 4:  launch(std::integral_constant<int, 4>{}); break;
+-        case 8:  launch(std::integral_constant<int, 8>{}); break;
++        case 1:  launch_ncols(std::integral_constant<int, 1>{}); break;
++        case 2:  launch_ncols(std::integral_constant<int, 2>{}); break;
++        case 4:  launch_ncols(std::integral_constant<int, 4>{}); break;
++        case 8:  launch_ncols(std::integral_constant<int, 8>{}); break;
+         default: GGML_ASSERT(false); break;
+     }
+ }
+@@ -2131,3 +2651,152 @@ void ggml_cuda_op_mul_mat_vec_q(
  
      GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
  }

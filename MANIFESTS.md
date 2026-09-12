@@ -10,7 +10,7 @@ The **current delivery** is a **15-patch set** (block 00 + blocks 01-14) against
 re-based 2026-09-02 from `0eadefebd`):
 blocks 00-14 (`patches/0000-…0014-…`, format-patch of the
 fork's `rdna-boosts` block commits).  **Current regeneration (2026-09-11 (10))**: canonical 15-block
-tip **`484231cb9`** (net tree `fc3c73da4ac68e92348043b992fb963b006e14df`), clean-apply strict 15/15
+tip **`124abba9e`** (net tree `d7c8e8984b8bd65838d8ae58c0f5de449d9c5d4d`), clean-apply strict 15/15
 with 0 whitespace warnings and the applied tree equal to the canonical one.  Block 08's body changed
 in this regeneration (its fifth 2026-09-11 amendment: the `iq4_nl` FA enablement -- the predicate, the
 15 new `fattn-vec-instance-iq4_nl-*.cu` files, `dequantize_q4_nl` and the three non-contiguous
@@ -173,7 +173,7 @@ per-win measurement tables are in `beta/block-15-campaign-wins/README.md`.
 
 Apply + regeneration verification (the 14/14 / `[PATCH NN/14]` / `ff2b35f49`
 figures below are the then-current state; block 00 was added 2026-09-10, so the
-current delivery is the 15-patch set `0000`-`0014`, tip `484231cb9`):
+current delivery is the 15-patch set `0000`-`0014`, tip `124abba9e`):
 
 - fresh worktree at `9113cc188` -> `scripts/apply-all.sh` (**strict 14/14
   `git am`** for the then-14-patch delivery, zero whitespace warnings) + the beta

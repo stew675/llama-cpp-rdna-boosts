@@ -218,6 +218,22 @@ but the hunks are far apart, so the re-cut is **metadata/offset-only** (0 change
 Nothing in the tester checklist changes: the revalidation numbers above were taken on the previous
 re-cut and the delta is metadata only.
 
+## 2026-09-12 — eleventh re-cut: block 13's column-blocked shared-expert epilogue
+
+The base moved for a *performance* amendment (no new rule, no changed default): block 13's
+`shexp_down_gated_q8_0` was restructured from one block per `(output row, token)` to one block per row
+with the whole decode/verify band block-internal, which is **bit-identical** (old-vs-new `.so` A/B: MoE
+probe `W = 1..8` `ac8825358d9adfda`, kill-switch `bd138ad2326fbbf2`, §19 text `68c0a24ed8d4`, MTP
+`0.87179` — all unchanged) and buys back the 2026-09-11 band amendment's cost (`pl=8` 461.0 -> 475.4 t/s,
+`pl=4` +2.4 %, `pl=1` flat).  Base `124abba9e` -> **beta tip `a90f75896`**, tree
+`ed6ee74df8b690c5a1584adb3f85c45eda70a09b`, patch **3 811 lines**; `git am -3` merged cleanly and the
+patch differs from the tenth re-cut only in the `From <sha>` line (the changed file, `mmvq.cu`, is absent
+from this patch).
+
+**Nothing in the tester checklist changes** — the gate table above was re-run on this re-cut's build and
+reproduces it exactly (qwen4exp f16 sparse text `804de0576868`, QSA oracle sparse `6.5394` / dense
+`6.5377`).
+
 ## 2026-09-11 (12) — tenth re-cut: two new delivery rules apply to the beta
 
 The base moved (block 01: the `--spec-draft-n-max ≤ 7` clamp with the `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0`

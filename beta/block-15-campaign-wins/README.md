@@ -36,6 +36,17 @@ re-cut and re-validated end to end.
   dense `6.5377`, and the new K/V reject fires in the beta build).  **Testers: pass matching
   `-ctk`/`-ctv`** (the hard reject applies to the beta too; every
   script here already does).  See `BETA-TESTING.md` (the dated tenth-re-cut section).
+* **Re-cut an eleventh time 2026-09-12** after the block-13 column-block amendment (`shexp_down_gated_q8_0`
+  is now `ncols_dst`-templated with the token loop inside the k-block loop and `grid = (nrows)`; a
+  bit-identical restructure that repays the band amendment's `pl=8` cost — `pl=8` 461.0 -> 475.4 t/s,
+  `pl=4` +2.4 %, `pl=1` flat).  Base **`124abba9e`** (tree `d7c8e8984b8bd65838d8ae58c0f5de449d9c5d4d`)
+  -> **beta tip `a90f75896`**, tree **`ed6ee74df8b690c5a1584adb3f85c45eda70a09b`**, patch **3 811
+  lines** — the exported patch differs from the tenth re-cut **only in the `From <sha>` line**, because
+  block 13's change touches only `mmvq.cu`, which the block-15 patch does not hunk-touch.  `git am -3`
+  applies with no conflict; round-tripped (fresh worktree at the base + `git am -3` -> identical tree).
+  Builds clean (`build-rec11`); smoke gates reproduce the tenth re-cut's values exactly (qwen4exp f16
+  sparse `804de0576868`, oracle sparse `6.5394` / dense `6.5377`).  **No tester-visible change** — the
+  MoE-side win is delivery-side, and nothing in the gate table moves.
 * **Re-cut a ninth time 2026-09-11 (11) — the dense-arm BLOCKER (§4c) is FIXED, one line.**  The defect
   was a variable-shadowing bug in block 15's own `build_attn_qsa` dense path: the V2/V3 refactor wrapped
   the top-k mask chain in `if (kq_mask != nullptr) { ... }` and declared an *outer* `kq_mask_top_k`,

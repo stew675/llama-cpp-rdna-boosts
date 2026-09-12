@@ -147,8 +147,8 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `484231cb9`, net tree
-  `fc3c73da4ac68e92348043b992fb963b006e14df`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `124abba9e`, net tree
+  `d7c8e8984b8bd65838d8ae58c0f5de449d9c5d4d`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the whole-batch
 K-independent chunked GDN prefill; block 08 amended 2026-09-11 with the
@@ -156,7 +156,10 @@ decode/verify FA kernel-family fix, again with the quantized-KV-type
 enablement (`q4_1`/`q5_0`/`q5_1`), and again with the `iq4_nl` enablement (the predicate, the 15
 new `fattn-vec-instance-iq4_nl-*.cu` files, `dequantize_q4_nl` and the three non-contiguous
 converters); block 13 amended 2026-09-11 with the MoE
-decode/verify mmvq band and again with the fused shared-expert epilogue band;
+decode/verify mmvq band, again with the fused shared-expert epilogue band, and
+again 2026-09-12 with the column-blocked epilogue (its band launch shape made
+the kernel read the down-weight row once per token and idle 7 of its 8 warps —
+a bit-identical restructure repays the band amendment's `pl=8` cost);
 block 14 amended 2026-09-11 with the
 hyper-connection decode/verify band fix, again with the QSA decode-arm
 band, again with the QSA-vs-KV-type arm gate + the tensor-split gate
@@ -428,7 +431,9 @@ Consequences, so it is not re-litigated:
   the default depth 3) before relying on llama-bench numbers.  **Purity ranks above raw non-MTP
   throughput**: a fix that makes the verify batch compute what the decode computes may cost a few
   percent at the wide verify widths — land it, record the delta and file the optimisation follow-up
-  (measured 2026-09-11: −2.4 % at `pl=8` bought MoE acceptance 0.51 -> 0.81707, +73 % MTP).  See
+  (measured 2026-09-11: −2.4 % at `pl=8` bought MoE acceptance 0.51 -> 0.81707, +73 % MTP; that
+  particular cost was repaid on 2026-09-12 by the column-blocked epilogue below — `pl=8` 461.0 ->
+  475.4 t/s, bit-identical).  See
   `GREEDY-PURITY.md` §19.
 - **MoE (`qwen35moe`) decode/verify IS byte-identical by default (fixed 2026-09-11).**
   The fused shared-expert window (`ggml_cuda_op_shexp_down_gate`, +3.1% MoE
@@ -444,7 +449,14 @@ Consequences, so it is not re-litigated:
   35B-A3B).  The companion block-13 fix of the same day — all
   `MUL_MAT_ID` use the dedicated MoE kernel, not the dense ksplit-with-ids path —
   is **+6.2% MoE decode** (tg128 95.62 -> 101.52); see the 2026-09-11 WORKLOG
-  entries.
+  entries.  **2026-09-12:** the epilogue's `grid = (nrows, ncols)` (one block per
+  `(output row, token)`) was replaced by a `ncols_dst`-templated kernel with the
+  token loop inside the k-block loop and `grid = (nrows)` — one weight read per
+  `(row, k-block)` for the whole band, per-token accumulators, `nwarps` still
+  pinned and every token's reduction order unchanged, so it is a **no-op at every
+  gate** (old-vs-new `.so` A/B: all hashes equal) while `pl=8` gains 3.1 %,
+  `pl=4` 2.4 % and `pl=1` is flat; the fused default now beats the unfused
+  reference at every width (see `GREEDY-PURITY.md` §24).
 - **The QSA decode arm is band-uniform (2026-09-11) — but the QSA *sparse* regime has two open items.**
   qwen4exp's `--spec-type none` vs `draft-mtp` text divergence ("cause 3") was the
   dense arch-policy arm gated `n_tokens == 1` in `src/models/qwen4exp.cpp`: above
@@ -593,7 +605,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `484231cb9`): `git format-patch --start-number 0` the block
+blocks tip `124abba9e`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -602,7 +614,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `484231cb9`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `124abba9e`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

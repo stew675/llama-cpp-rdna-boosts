@@ -6,9 +6,9 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (2026-09-11 (10)):** the delivery is the 15-patch set against fork point `9113cc188`
-(block 00 + blocks 01-14), canonical tip **`484231cb9`** (tree `fc3c73da4ac68e92348043b992fb963b006e14df`),
-`make-patches.sh` default tip = `484231cb9`.  Block 15 (the attention-memory campaign) is **staged in
+**Current state (2026-09-12):** the delivery is the 15-patch set against fork point `9113cc188`
+(block 00 + blocks 01-14), canonical tip **`124abba9e`** (tree `d7c8e8984b8bd65838d8ae58c0f5de449d9c5d4d`),
+`make-patches.sh` default tip = `124abba9e`.  Block 15 (the attention-memory campaign) is **staged in
 `beta/block-15-campaign-wins/`, not promoted**.  F1/F2/F3 (the KV-quant purity/parity campaign) are
 **all closed** — every KV cache type the delivery supports is width-pure and takes the f16 attention path.
 
@@ -61,6 +61,12 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
   identical (1010 nodes, 0 diff), and the traced kernel *sum* lower for `iq4_nl` — while the wall clock
   is slower and host CPU is +95 ms/token in the forced-sparse-decode case (11.9 vs 41.9 t/s; *not* the
   production arm — the arch policy uses dense decode and still wins by 5 %).
+- **Before re-measuring: this axis is noisy on this host.**  On 2026-09-12 the *same* qwen4exp config
+  (pp2048, f16 KV, 3-GPU tensor) drifted 2042.6 -> 1933.7 -> 1906.1 -> 1822.0 -> 1730.8 t/s over one
+  session (−15 %, box at 141 GiB buff/cache with swap full) while a 35B-A3B pp512 control reproduced
+  to 0.2 %; use only same-session interleaved brackets, and note that `LLAMA_QSA_OFF=1` shifts pp2048
+  by only +2.2 % / pp8192 +7.4 %, so the QSA machinery does not explain the drift.  See the 2026-09-12
+  WORKLOG entry.
 - Leads: the dense/sparse topology-flip sync the qwen4exp graph documents, and the per-type indexer op
   counts (`iq4_nl` runs *fewer* `k_argsort`/`soft_max` dispatches than `q4_0`).  Instruments:
   `rocprofv3 --kernel-trace` + the `[GD]` graph dump (`wip/kv-quant-purity-followups/tools/`), and
@@ -108,9 +114,18 @@ Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
   byte-identical, opt-out `GGML_CUDA_DISABLE_MMQ_ROUTED=1`) and the quantize chunk (flat, kept).  The
   block-13 **fused MoE gate+up+GLU MMQ is ungated outright** for RDNA3_5 *and* RDNA3_0 (2026-09-05
   records, both with coherence IDENTICAL), so there is no "env-level opt-in" left to design for it.
-- **Still open, actionable here:** Phase 2.5 of `wip/qwen4exp/gfx1201-porting.md` — the fallback-path
-  regression probe on gfx1201 (with the RDNA3_5/RDNA4 kernels active, check that a supported-type
-  fallback still lands on the plain path correctly).  Small, no other box needed.
+- **Phase 2.5 (the gfx1201 fallback-path probe) is DONE — 2026-09-12.**  Re-verified on the current tip:
+  the port's "bit-identical to the plain `mul_mat_q` path" claim holds on **both** available MoE models
+  (qwen4exp IQ4_XS J=64 text `804de0576868`, 35B-A3B Q4_K J=32 text `68c0a24ed8d4`, both identical
+  `GGML_CUDA_DISABLE_MMQ_ROUTED` on/off; probe `W = 1..8` and MTP acceptance `0.87179` identical too), and
+  the perf claim reproduces (qwen4exp prefill +4.0..+11.1 %, 35B-A3B +5.1..+7.8 %, tg flat).  **Two
+  corrections to the plan's wording:** the Q4_K model *does* take the routed path (480
+  `mul_mat_q_routed_compact<(ggml_type)12, 32>` launches per pp512/ub512 — so it is not the "plain"
+  control the plan assumed; the real control is that the dispatch is prefill-only: 0 compact launches in a
+  `tg` run, which is also why it cannot affect width purity), and `GGML_CUDA_DISABLE_MMQ_ROUTED=1` isolates
+  only the compact *enumeration* (the per-expert J selection stays active in both arms — neutral by
+  construction, and covered by the delivered hash table and `test-backend-ops -o MUL_MAT_ID`).  Record:
+  `wip/qwen4exp/gfx1201-porting.md` (2026-09-12 entry) + the 2026-09-12 WORKLOG entry.
 - **Still open, needs other hardware:**
   * gfx1100 (`fingon`, 24 GiB): the §4.2 remainder with *no* gfx1100 data yet — the GDN gfx11 NW16 scan
     retune (~106K VGPR/CU vs a possible 64K classic), `split_j`/config rows, the quantize chunk,
@@ -118,9 +133,6 @@ Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
     (acceptance gate).  Same box as item 5(e).
   * gfx1151 (`halo`): Phase 3's cross-arch fingerprint check (gfx1201 == gfx1151 numerics) — a
     verification goal, not a port; also item 4's §18 items and item 7's MTP crossover re-measure.
-- **Next session's brief: `wip/items-6-10-wrapup/HANDOVER-2026-09-12-items-6-and-10.md`** (with item
-  10; it defines the concrete probe: routed ON vs OFF must be byte-identical on qwen4exp — the model
-  that actually takes the routed path — and inert on the 35B-A3B Q4_K_M, i.e. the fallback control).
 - **Tracker hygiene:** the plan's own open checkboxes are **stale** (Phase 1 is complete and the doc
   predates qwen4exp's promotion to block 14); read the banner at the top of
   `wip/qwen4exp/gfx1201-porting.md` before trusting them.
@@ -148,31 +160,6 @@ Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
   note the probe compares the *device* a fused node lands on, which does not by itself catch a
   meta-split inconsistency.
 
-### 10. Fused shared-expert kernel: column-block it (~2.4 % at the widest verify batches)
-**Re-verified 2026-09-11 (12): still open, and the premise is in the code.**  `shexp_down_gated_q8_0`
-(`ggml/src/ggml-cuda/mmvq.cu`) is launched with `block_nums(nrows, ncols)` — the comment says "One block
-per (output row, token): the token only selects the input/output columns" — so the down-weight row is
-re-read once per token.  This is the *deliberate* cost of the 2026-09-11 band-uniformity amendment (item
-5): the fused gate+down chain serves the whole band (`n_tokens <= MMVQ_MAX_BATCH_SIZE`) and is pinned to
-the single-token reduction order so decode == verify; the unfused chain stays only as the
-`GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` A/B reference.
-- Measured cost (35B-A3B `llama-batched-bench`, fused vs unfused A/B): pl=8 332.1 vs 341.5 t/s, pl=4
-  252.0 vs 254.2, pl=1 unchanged ⇒ ~2.4-2.8 % at the widest verify batches.  With
-  `--spec-draft-n-max` now capped at 7, the payout band is exactly `pl <= 8` (the widest *supported*
-  verify batch), so the item is current rather than historical.
-- Fix = the `mul_mat_vec_q` pattern: template the kernel on `ncols_dst` and keep the token loop *inside*
-  the k-block loop (one weight read per row block, per-token accumulators), which stays bit-identical per
-  token.  **Two constraints from the code:** (a) `nwarps` must stay pinned to the single-token value
-  (`calc_nwarps(GGML_Q8_0, 1, table_id)` sets `blocks_per_iter` and hence the reduction order — a
-  width-dependent `nwarps` would re-break decode == verify); (b) it is **not** acceptable to instead
-  disable the fusion above some width — the `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` path makes "decode and
-  verify differ, as before the 2026-09-11 band amendment", i.e. it is the *forbidden* (impure) route.
-  Not a purity issue if done as described.  Where: block 13.
-- **Next session's brief (the main task): `wip/items-6-10-wrapup/HANDOVER-2026-09-12-items-6-and-10.md`**
-  — it carries the item-10 measurement command (the fused-vs-unfused `llama-batched-bench` A/B), the
-  fix recipe, the gate list and the landing flow (block-13 amendment ⇒ regeneration ⇒ an 11th beta
-  re-cut).
-
 ### 11. MXFP4 (and NVFP4) fused gate+up+GLU MMQ — the last block-13 item
 - `ggml_cuda_mul_mat_q_switch_type_gate` is instantiated for Q3_K/Q4_K/Q5_K/Q8_0/Q6_K only, so the
   `try_fuse` arm is gated on that list (MXFP4/NVFP4 would abort if admitted).  MXFP4 is the interesting
@@ -197,8 +184,8 @@ the single-token reduction order so decode == verify; the unfused chain stays on
 - The working `~/llama.cpp` `rdna-boosts` branch is a local rebuild and must **not** be used for
   regeneration while it sits on a master newer than the fork point (it would export `f3f1a8f27` +
   `304665fe7` as patches 0001/0002).  Regenerate from a canonical fork rebuilt at `9113cc188` by
-  `scripts/apply-all.sh` — currently tip `484231cb9`, tree
-  `fc3c73da4ac68e92348043b992fb963b006e14df`.  See `BASELINE.md`/`AGENTS.md`.
+  `scripts/apply-all.sh` — currently tip `124abba9e`, tree
+  `d7c8e8984b8bd65838d8ae58c0f5de449d9c5d4d`.  See `BASELINE.md`/`AGENTS.md`.
 - Superseded-but-useful artifacts: the work branch `wip/block15-campaign-wins` (`b26ae06f0`) and
   `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch` are the pre-merge
   record; the per-win plans under `wip/arch-independent-memory/` + `wip/qwen4exp/qsa-memory/` are the
@@ -242,6 +229,16 @@ Reference: `GREEDY-PURITY.md` §23.3, `WORKLOG.md` 2026-09-11 (11).
   `wip/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
+
+**The fused shared-expert epilogue's band cost (TODO item 10, closed 2026-09-12).**  The
+band-uniformity fix's `grid = (nrows, ncols)` launch shape (one block per `(output row, token)`,
+down-weight row re-read per token, 7 of 8 warps idle on the 35B-A3B geometry) is replaced by a
+`ncols_dst`-templated kernel with the token loop inside the k-block loop and `grid = (nrows)` — a
+**bit-identical** restructure (old-vs-new `.so` A/B: every gate hash equal, incl. the MoE probe
+`W = 1..8` `ac8825358d9adfda` and MTP `0.87179`) that repays the item-5 cost: `pl=8` 461.0 -> 475.4
+t/s (+3.1 %), `pl=4` 299.1 -> 306.5 (+2.4 %), `pl=1` flat, and the fused default now beats the
+unfused reference at every width.  Block-13 patch anyway; see the 2026-09-12 WORKLOG entry,
+`patches/README.md`'s 2026-09-12 section and `GREEDY-PURITY.md` §24.
 
 **The gfx1201 (RDNA4) port of the gfx1151-gated campaign items (2026-09-11 (12) note — mostly closed
 2026-09-06/07).**  Every gated kernel was ported and is enabled by default on RDNA4: the

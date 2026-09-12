@@ -862,3 +862,38 @@ exists) is worth considering for the beta.
    which sent this session down a false trail until random text settled it).  Keep both the oracle and the
    random-text probe in the gate list; they answer different questions ("is the fused path as good as the
    dense one?" vs "is the attention causal?").
+
+## 24. The cost of a band amendment can be structural, not arithmetic (2026-09-12)
+
+The 2026-09-11 fused shared-expert epilogue band amendment (§17) bought MoE decode/verify purity with a
+*measured* cost: `llama-batched-bench` `pl=8` 461.0 t/s fused vs 472.7 unfused (−2.4 %), because the band
+was served by `grid = (nrows, ncols)` — one block per `(output row, token)` — so the down-weight row was
+re-read per token and the block's two barriers, cross-warp reduction and epilogue were duplicated per
+token.  That shape is the *absent-minded* half of the amendment, not a requirement of it: the token only
+selects input/output columns, so the band can live **inside** the block.  Three lessons:
+
+1. **Band-uniformity constrains the arithmetic, not the launch shape.**  What the invariant needs is that
+   each token's per-thread accumulation order and cross-warp reduction order are the ones the
+   single-token kernel used — which survives any restructuring that keeps that order per token (here: a
+   `ncols_dst`-templated kernel with the token loop inside the k-block loop, per-token accumulators, the
+   weight block read once per `(row, k-block)`, `nwarps` still pinned because it sets `blocks_per_iter`).
+   When a band fix costs a few percent, first ask whether the cost is the *invariant* or the *shape* it
+   was implemented with.  Here it was the shape, and repaying it turned `pl=8` from −2.4 % into +3.1 %
+   with **zero** numerical change.
+2. **The strongest control for a "this must change nothing" claim is two binaries, not one hash.**  A
+   documented gate hash reproduced by the new build only shows the new build is *as documented*; keeping
+   both `libggml-hip.so` builds of the same tip and swapping them in (`tools/sobench.sh`'s idiom) shows
+   the two builds agree *with each other* at every gate — probe `W = 1..8` fused and under the kill-switch,
+   the §5 model matrix, the §19 `plain == n_max 3 == n_max 7` text gate, MTP acceptance, the backend
+   suites.  That is what makes "no-op at the gate config" a fact rather than a hope.
+3. **A no-op at the gate config can still be a large win in wall clock** — the two are independent
+   measurements and both are required.  Contrariwise, an *arithmetic* change that happens to keep a hash
+   stable at one width is not purity; the band is the unit of purity, so the A/B must span `W = 1..8`.
+
+Related: a band/dispatch exercise must also *check the premise of its own control*.  Item 6's probe assumed
+a Q4_K MoE model did not take the RDNA4 routed-compact MMQ dispatch and could serve as the "plain"
+reference; `rocprofv3 --kernel-trace` showed it takes it (480 `mul_mat_q_routed_compact<(ggml_type)12,
+32>` launches per `pp512`/`ub512`), and that `GGML_CUDA_DISABLE_MMQ_ROUTED=1` disables only the compact
+*enumeration* — the per-expert J selection stays in both arms.  The usable control was the dispatch's
+*reach* (0 compact launches at decode, i.e. prefill-only), not the model choice.  A control you have not
+measured is not a control.

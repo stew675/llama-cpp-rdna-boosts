@@ -1,5 +1,23 @@
 # HANDOVER — TODO items 6 (the gfx1201 half) and 10 (column-block the fused shared-expert epilogue)
 
+> **OUTCOME (2026-09-12) — both items are closed; this brief is a historical record now.**
+> **Item 10 landed** as a block-13 amendment: `shexp_down_gated_q8_0` is `ncols_dst`-templated with the
+> token loop inside the k-block loop and `grid = (nrows)` — a **bit-identical** restructure (old-vs-new
+> `libggml-hip.so` A/B: every gate hash equal, incl. all `W = 1..8` probe hashes, the §5 matrix, the §19
+> `plain == n_max 3 == n_max 7` gate `68c0a24ed8d4` and MTP `0.87179`) that repays the band amendment's
+> cost: `pl=8` 461.0 -> 475.4 t/s (+3.1 %), `pl=4` 299.1 -> 306.5 (+2.4 %), `pl=1` flat, with the fused
+> default now ahead of the unfused reference at every width.  Canonical tip `124abba9e` (tree
+> `d7c8e8984b8bd65838d8ae58c0f5de449d9c5d4d`), beta re-cut an 11th time (`a90f75896` / tree
+> `ed6ee74df8b690c5a1584adb3f85c45eda70a09b`, patch 3 811 lines, only the `From` line changed).  See
+> `WORKLOG.md` 2026-09-12, `patches/README.md` (the new section + the block-13 notes) and
+> `GREEDY-PURITY.md` §24.
+> **Item 6 is closed too, with two corrections to this brief's own premise:** the 35B-A3B Q4_K_M **does**
+> take the routed-compact path (480 `mul_mat_q_routed_compact<(ggml_type)12, 32>` launches per pp512/ub512;
+> the control is that the dispatch is prefill-only — 0 compact launches at decode), and
+> `GGML_CUDA_DISABLE_MMQ_ROUTED=1` isolates only the compact enumeration, not the per-expert J selection.
+> The port's bit-identity claim holds on both MoE models; perf reproduces (+4-11 % qwen4exp, +5-7.8 %
+> 35B-A3B, tg flat).  See `wip/qwen4exp/gfx1201-porting.md` (2026-09-12 entry) and TODO item 6.
+
 **Read this file first; it is self-contained.**  Shared environment/instrument rules live in
 `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-remaining-work.md` §2–§5/§12/§13 and in
 `AGENTS.md` ("Critical facts"); the purity doctrine is `GREEDY-PURITY.md` (§11 the purity range,

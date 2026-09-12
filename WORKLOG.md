@@ -1,5 +1,121 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-12 — block 13: the fused shared-expert epilogue is column-blocked (the item-5 cost repaid), and the routed-compact MoE MMQ claim re-verified
+
+**Canonical tip `124abba9e`** (tree `d7c8e8984b8bd65838d8ae58c0f5de449d9c5d4d`), 15 blocks, clean-apply
+strict 15/15 with 0 whitespace warnings and the applied tree equal to the canonical one; the sim build
+(`/tmp/simx`) reproduces the MoE probe gate `ac8825358d9adfda` at `W = 1,4,8`.  One block amendment
+(block 13), one staged-beta re-cut (11th), one validation record (the gfx1201 routed-compact probe).
+Both items come from `TODO.md` items 10 and 6, worked to the brief
+`wip/items-6-10-wrapup/HANDOVER-2026-09-12-items-6-and-10.md`.
+
+**Block 13 — `shexp_down_gated_q8_0` is now column-blocked (band-internal).**  The 2026-09-11 band
+amendment made the fused shared-expert epilogue serve the whole decode/verify band but launched it as
+`grid = (nrows, ncols)` — one block per `(output row, token)` — so the down-weight row was re-read once
+per token and the whole block (two barriers, the cross-warp reduction and the epilogue) was duplicated
+per token.  On the reachable geometry this is severe: for Qwen3.6-35B-A3B (`k_down` 512 → 16 k-blocks,
+`vdr` 4, `nwarps` 8) `blocks_per_iter` = 128 > 16, so **only warp 0 of 8 does any work** (88 % of the
+block idles) and the weight row is read 8x over at `pl = 8`.
+
+The kernel is now templated on `ncols_dst` as well, with the **token loop inside the k-block loop**, a
+per-token accumulator per thread and the weight block read once per `(row, k-block)` for the whole band;
+`grid` is `(nrows)` with the band block-internal.  Two invariants are preserved exactly, which is what
+makes the change numerically invisible:
+
+* `nwarps` stays pinned to the single-token value (`calc_nwarps(GGML_Q8_0, 1, table_id)`), because it
+  sets `blocks_per_iter` and hence the down-projection reduction order;
+* each token keeps the single-token path's per-thread accumulation order *and* the same cross-warp
+  reduction order (serial `sh_down[l]` adds in `l` order, then `warp_reduce_sum`), so `decode == verify`
+  holds by construction, not by measurement.  The `__fmul_rn` epilogue (no FMA contraction) and the
+  `dst[t*nrows + row]` layout are unchanged.
+
+Perf (`llama-batched-bench`, 35B-A3B Q4_K_M, 3-GPU tensor, `-npp 2048 -ntg 128 -npl 1,2,4,8`, f16 KV,
+two interleaved reps, `pl` is the batch width = `n_max + 1`):
+
+| `pl` | before (fused) | after (fused) | unfused reference |
+|---|---|---|---|
+| 1 | 95.84 / 95.64 | 95.57 / 95.55 | 93.55 / 93.11 |
+| 2 | 167.69 / 167.48 | 168.65 / 168.45 | 165.88 / 165.02 |
+| 4 | 299.07 / 299.49 | **306.52 / 305.79** | 299.86 / 299.96 |
+| 8 | 461.00 / 461.09 | **475.41 / 473.07** | 472.65 / 470.72 |
+
+i.e. `pl 8 +3.1 %`, `pl 4 +2.4 %`, `pl 2 +0.6 %`, `pl 1` flat — and the fused default is now **ahead of**
+the unfused `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` reference at every width, where before it lost 2.4 % at
+`pl 8`.  With `--spec-draft-n-max` capped at 7 the payout band is exactly `pl <= 8`, the widest
+*supported* verify batch.
+
+Numerical invisibility was proven with a **direct old-vs-new A/B** (both `libggml-hip.so` builds of the
+same tip kept side by side and swapped in, the `tools/sobench.sh` idiom) rather than by trusting
+documented values:
+
+* MoE probe (`/tmp/lw-f2`, 1 GPU, `SPLIT=layer`, `RS=0`, `CB=0`, `P=256`, `p0long.txt`): fused
+  `W = 1..8` **all `ac8825358d9adfda`** before and after; unfused all `bd138ad2326fbbf2` before and
+  after.  Both are the documented gate values, so the fix is a **no-op at the gate config** — the
+  strongest available control.
+* The §5 acceptance matrix is unchanged: qwen4exp tensor all-W `dcf1ae667f730879`, layer
+  `3adeb313042a871b`; 27B layer `4089b4d40b91090c`, tensor `91434ea90f2cbfa0`.
+* §19 text gate on 35B-A3B (Protocol A prompt, 96 tokens, 1 GPU, f16 KV):
+  `--spec-type none == draft-mtp n_max 3 == n_max 7` = `68c0a24ed8d4` (447 chars) before and after.
+* MTP acceptance (Protocol A, `n_max 3`, `n=96`): `0.87179` before and after (identical
+  `68 accepted / 78 generated`, mean len 3.62).
+* `test-backend-ops`: `FLASH_ATTN_EXT`, `FLASH_ATTN_QSA`, `GATED_DELTA_NET` all pass on ROCm 0/1/2.
+* The change also leaves qwen4exp's documented sparse text `804de0576868` untouched (re-checked while
+  validating the re-cut).
+
+**Beta re-cut (11th).**  Base `124abba9e` → beta tip **`a90f75896`**, tree
+**`ed6ee74df8b690c5a1584adb3f85c45eda70a09b`**, patch still **3 811 lines**; `git am -3` applies with no
+conflict and the exported patch differs from the 10th re-cut **only in the `From <sha>` line** (block 13's
+amendment does not touch any file the beta patch hunk-touches).  Round-tripped (fresh worktree at the base
++ `git am -3` → identical tree), builds clean (`/tmp/blk15z/build-rec11`), and the smoke gates reproduce
+the 10th re-cut's values exactly: qwen4exp f16 sparse text `804de0576868`, QSA oracle sparse `6.5394` /
+dense `6.5377`.
+
+**Item 6 — the gfx1201 routed-compact MoE MMQ ("Phase 2.5") re-verified; two corrections.**  The port's
+in-code claim is "*Numerics are bit-identical to the plain `mul_mat_q` path (same `mul_mat_q_process_tile`,
+same per-tile accumulation order; only the tile enumeration differs)*".  Re-checked on the current tip
+with `GGML_CUDA_DISABLE_MMQ_ROUTED` on/off:
+
+* **Byte-identity holds, on two different expert types/J bands.**  qwen4exp (IQ4_XS, J=64): same-seed
+  greedy text `804de0576868` both ways; 35B-A3B Q4_K_M (Q4_K, J=32): `68c0a24ed8d4` both ways.  Probe
+  hashes `W = 1..8` identical on both models under both settings (MoE `ac8825358d9adfda`, qwen4exp tensor
+  `dcf1ae667f730879`), and the MoE MTP acceptance is `0.87179` either way.
+* **Correction 1 — the brief's premise was wrong.**  It assumed the 35B-A3B Q4_K_M does *not* take the
+  routed path and could serve as the "plain" control.  It does: `mmq_rdna3_5_id_use_compact` accepts
+  Q4_K/Q5_K/Q6_K, and a `rocprofv3 --kernel-trace` count shows **480
+  `mul_mat_q_routed_compact<(ggml_type)12, 32, false>`** launches per `pp512`/`ub512` run (type 12 =
+  Q4_K, J = 32), i.e. the Q4_K experts take it too.  Both available MoE models therefore exercise the
+  compact dispatch — which *strengthens* the validation to two type/J bands but removes the proposed
+  control.  The control is instead the **prefill-only reach**: a `tg` run shows **0** compact launches
+  and **0** descriptor-builder launches, because decode and the verify band go through mmvq
+  (`ncols_dst <= MMQ_MAX_BATCH_SIZE`), which is also why the compact dispatch cannot affect width
+  purity.
+* **Correction 2 — the env opt-out does not isolate the whole port.**  `GGML_CUDA_DISABLE_MMQ_ROUTED=1`
+  disables only the compact *enumeration*; the per-expert J selection (`mmq_rdna3_5_id_get_J` in
+  `mul_mat_q_switch_J`) stays active in both arms (the code says so explicitly).  So ON==OFF proves the
+  compact enumeration is arithmetic-neutral, not the J selection.  The J change is arithmetic-neutral by
+  construction (J is the output-row tile width; an output element's accumulation is over K only), and it
+  is additionally covered by the delivered hash table, the MoE probe/text/MTP gates above and
+  `test-backend-ops -o MUL_MAT_ID` (which also passes).
+* Perf claim re-measured (interleaved, 2 reps, ub2048, 3-GPU tensor, f16 KV, `-r 2`): qwen4exp pp512
+  **+11.1 % / +9.3 %**, pp2048 **+5.6 % / +4.6 %**, pp8192 **+4.5 % / +3.1 %**, pp16384
+  **+4.0 % / +3.6 %**, tg128 flat (51.57 vs 51.58); 35B-A3B pp512 **+5.1 % / +5.3 %**, pp2048
+  **+7.7 % / +7.8 %**, pp8192 **+7.4 % / +7.2 %**, pp16384 **+6.9 % / +7.0 %**, tg128 flat (99.61 vs
+  99.45).  The 2026-09-06 record's "+4-8 % prefill, tg flat" is reproduced on both models.
+
+**One measurement caveat recorded for the follow-ups.**  The cross-day comparison against the port's
+2026-09-06 *absolute* numbers is not usable: qwen4exp `pp2048` (f16 KV, same config) ran
+2042.6 -> 1933.7 -> 1906.1 -> 1822.0 -> 1730.8 t/s over one session (a monotone -15 % drift while the box
+sits at 141 GiB buff/cache with swap full), while the 35B-A3B `pp512` control reproduced to 0.2 % in the
+same window (5372.2 vs 5360.1/5353.9).  Only same-session interleaved brackets are meaningful for this
+model's prefill; the same warning is now on `TODO.md` item 3 (the qwen4exp `iq4_nl` prefill-delta item,
+which is an 8-12 % claim measured on this same axis).  A quick QSA-arm check in the same window
+(`LLAMA_QSA_OFF=1` +2.2 % pp2048 / +7.4 % pp8192, `LLAMA_QSA_SPARSE_FA=0` +2.3 % / +2.7 %) shows the QSA
+machinery is *not* the explanation for the drift.
+
+**Pushing/tips:** `scripts/make-patches.sh` default tip -> `124abba9e`; `rdna-boosts-all.patch`
+regenerated by hand (22 347 lines, 115 files, `git apply --check` clean at `9113cc188` and a full apply
+reproduces the canonical tree).
+
 ## 2026-09-11 (12) — mixed K/V types hard-rejected, `--spec-draft-n-max` capped at 7, and issue #25's GDN divergence re-verified
 
 **Canonical tip `484231cb9`** (tree `fc3c73da4ac68e92348043b992fb963b006e14df`), 15 blocks, clean-apply

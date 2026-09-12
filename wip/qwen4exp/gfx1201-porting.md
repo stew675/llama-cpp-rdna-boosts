@@ -16,8 +16,9 @@
 >   two MTP regression fixes under RDNA3 (acceptance gate).  Tracked as TODO item 6.
 > * `halo` (gfx1151): Phase 3's cross-arch fingerprint check (gfx1201 vs gfx1151 numerics) — a
 >   verification goal, not a port; and the §18 QSA sparse-regime items (TODO item 4).
-> * Actionable *here*: Phase 2.5's fallback-path regression probe (with the RDNA3_5/RDNA4 kernels
->   ungated, the *plain* path is what a supported-type fallback lands on) — TODO item 6.
+> * Phase 2.5's fallback-path regression probe — **DONE 2026-09-12** (see the dated entry at the bottom):
+>   the routed-compact dispatch is byte-identical to the plain path on both available MoE models and is
+>   prefill-only.  TODO item 6 is now only the `fingon`/`halo` hardware remainder.
 > Also note this plan predates the delivery reorganisation: the fork layout it describes (a
 > `qwen4exp` branch, a 13-patch delivery, `beta/qwen4exp/`) is historical — qwen4exp support is now
 > **block 14** of the 15-patch set (canonical tip `484231cb9`), and the beta ladder work is closed.
@@ -264,9 +265,15 @@ session) made the ggml layer safe multi-GPU; now validate the model level end-to
       Side-finding: llama-cli with the DEFAULT small ctx (4096) + a near-ctx prompt aborts
       at `ggml-backend-meta.cpp:1758 GGML_ASSERT(bufs.back() != nullptr)` on 3-GPU tensor
       (meta-buffer alloc edge; -c >= prompt len avoids it; llama-bench unaffected).
-- [ ] **2.5** Regression check for the gfx1201 fallback paths: with the RDNA3_5 kernels
-      inert, confirm the mmq.cuh/mmq-config refactors did not perturb the RDNA4 id-MMQ path
-      (this is implicitly covered by 2.1 vs the pre-port numbers; call it out explicitly).
+- [x] **2.5** Regression check for the gfx1201 fallback paths.  **DONE 2026-09-12, with the premise
+      corrected:** the RDNA3_5 kernels are *not* inert — the routed-compact dispatch is enabled by
+      default on RDNA4 — so the probe is `GGML_CUDA_DISABLE_MMQ_ROUTED` on/off.  The port's
+      bit-identity claim holds on both available MoE models (qwen4exp IQ4_XS/J=64 and **35B-A3B
+      Q4_K/J=32** — the plan's assumption that a Q4_K model would not take the routed path is wrong:
+      480 `mul_mat_q_routed_compact<(ggml_type)12, 32>` launches per pp512/ub512), and the dispatch is
+      prefill-only (0 compact launches in a `tg` run — decode and the verify band use mmvq), which is
+      why it cannot affect width purity.  Note the env opt-out isolates only the compact *enumeration*
+      (the per-expert J selection stays in both arms).  Details + numbers: the 2026-09-12 entry below.
 
 ## PHASE 3 — Cross-arch coherence (gfx1201 converges on the gfx1151 canonical)
 
@@ -1063,3 +1070,52 @@ gfx1151 (halo) same-build output, NOT CPU/pre-re-base builds (upstream GDN-norm 
   cleanup (tip 6e4778ed8, the pre-cleanup state incl. the round2 topk).
 
 <!-- keep the newest entry below this marker -->
+
+## 2026-09-12 — Phase 2.5 (the fallback-path / routed-compact probe): claim re-verified, two corrections
+
+TODO item 6's actionable half, run on the canonical tip `124abba9e` (the 15-block delivery after the
+block-13 column-block amendment).  The port's in-code claim — "*Numerics are bit-identical to the plain
+`mul_mat_q` path (same `mul_mat_q_process_tile`, same per-tile accumulation order; only the tile
+enumeration differs)*" — had not been re-checked since the 2026-09-11 block-13 amendments, so it was
+re-tested with `GGML_CUDA_DISABLE_MMQ_ROUTED` on/off.
+
+**Result: the claim holds, on two different expert types and two different J bands.**
+
+| probe | qwen4exp (IQ4_XS, J=64) | 35B-A3B Q4_K_M (Q4_K, J=32) |
+|---|---|---|
+| same-seed greedy text (3-GPU tensor, f16 KV) | `804de0576868` both ways | `68c0a24ed8d4` both ways |
+| probe hash `W = 1..8` (1 GPU / layer, `P=256`) | `dcf1ae667f730879` tensor / `3adeb313042a871b` layer, both ways | `ac8825358d9adfda`, both ways |
+| MTP acceptance (Protocol A, `n_max 3`, `n=96`) | — | `0.87179` both ways |
+| prefill, ON vs OFF (interleaved, 2 reps, ub2048) | pp512 +11.1/+9.3 %, pp2048 +5.6/+4.6 %, pp8192 +4.5/+3.1 %, pp16384 +4.0/+3.6 % | pp512 +5.1/+5.3 %, pp2048 +7.7/+7.8 %, pp8192 +7.4/+7.2 %, pp16384 +6.9/+7.0 % |
+| tg128, ON vs OFF | 51.57 vs 51.58 (flat) | 99.61 vs 99.45 (flat) |
+
+So the 2026-09-06 record's "+4-8 % prefill, tg flat, byte-identical" reproduces on both models, and the
+RDNA4 enablement's numerics claim survives the 2026-09-11 block-13 amendments (the mmvq ksplit dispatch,
+the rms_norm-fold gate, the per-type mmvq caps and the fused shared-expert epilogue).
+
+**Correction 1 — the "plain-path control" model choice was wrong.**  This plan assumed the 35B-A3B
+Q4_K_M would not take the routed path and could therefore serve as the plain/fallback control.  It does
+take it: `mmq_rdna3_5_id_use_compact` accepts Q4_K/Q5_K/Q6_K, and `rocprofv3 --kernel-trace` shows **480
+`mul_mat_q_routed_compact<(ggml_type)12, 32, false>` launches** (type 12 = Q4_K, J = 32) plus 480
+`build_mmq_routed_descriptors<32>` per `pp512`/`ub512` run.  Both available MoE models exercise the
+compact dispatch, so the two-model agreement is a *stronger* numerics result than planned, but the
+"fallback control" has to come from the dispatch's **reach** instead: a `tg` run (decode) shows **0**
+compact launches and **0** descriptor builders, because decode and the verify band go through mmvq
+(`ncols_dst <= MMQ_MAX_BATCH_SIZE`).  The compact path is therefore prefill-only, which also explains why
+it can never perturb the width-purity band.
+
+**Correction 2 — the opt-out does not isolate the whole port.**  `GGML_CUDA_DISABLE_MMQ_ROUTED=1`
+"disables ONLY this compact dispatch (the per-expert J selection in `mul_mat_q_switch_J` stays; both are
+part of the same port)" — the code says so explicitly.  So ON==OFF proves the compact *enumeration* is
+arithmetic-neutral, not the J change.  The J change is neutral by construction (J is the output-row tile
+width; a given output element's accumulation is over K only), and it is independently covered by the
+delivered hash table, the MoE probe/text/MTP gates above, and `test-backend-ops -o MUL_MAT_ID` (which
+passes on all backends).
+
+**Measurement caveat (recorded so nobody repeats the mistake).**  Comparing *absolute* numbers against
+the 2026-09-06 pre-port record is not usable: the same qwen4exp `pp2048` config (f16 KV, 3-GPU tensor)
+drifted 2042.6 -> 1933.7 -> 1906.1 -> 1822.0 -> 1730.8 t/s across one session (−15 %, the box at 141 GiB
+buff/cache with swap full) while a 35B-A3B `pp512` control held to 0.2 %.  Only same-session interleaved
+brackets mean anything on this axis (which is also why this table quotes ON/OFF pairs, never absolutes).
+A side check in the same window (`LLAMA_QSA_OFF=1` +2.2 % pp2048 / +7.4 % pp8192, `LLAMA_QSA_SPARSE_FA=0`
++2.3 % / +2.7 %) rules the QSA machinery out as the cause of the drift.
