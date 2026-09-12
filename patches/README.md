@@ -75,7 +75,7 @@ the 15-block tree):
 |---|---|
 | `0000` | **structural and architecture fixes** — FA small-batch KV-split width invariance (issue #25: decode and every speculative verify width now reduce identically, so greedy output no longer changes with the MTP draft length) + Vulkan masked-V/freed-cell fixes (dead columns never read V). Added 2026-09-10; this is the base every other block applies on top of. |
 | `0001` | adaptive MTP draft depth | **refreshed 2026-09-09 to the upstream PR #27210 review head** (`d236d41a2`; review-round feedback-handling, option validation + docs) — see the 2026-09-09 block-01 refresh section below.  **amended 2026-09-11: `--spec-draft-n-max` is capped at 7** (`common/common.cpp`, a clamp with a visible `E`-level notice naming the `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` escape hatch, + the `max: 7` help string in `common/arg.cpp`) — see the 2026-09-11 (12) section below.
-| `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | **amended 2026-09-06 with the gfx11 NW16 scan retune** (gated_delta_net_chunked_bf16_gfx11.cu, fork 376f02aa0); **amended 2026-09-11 with the K-independent whole-batch chunked prefill** (gated_delta_net.cu; no sequential tail, `GGML_CUDA_GDN_ALIGN_BOUNDARY` gate + its two K-dependent branches **removed**; + the `llama_memory_recurrent` rollback-boundary guard).
+| `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | **amended 2026-09-06 with the gfx11 NW16 scan retune** (gated_delta_net_chunked_bf16_gfx11.cu, fork 376f02aa0); **amended 2026-09-11 with the K-independent whole-batch chunked prefill** (gated_delta_net.cu; no sequential tail, `GGML_CUDA_GDN_ALIGN_BOUNDARY` gate + its two K-dependent branches **removed**; + the `llama_memory_recurrent` rollback-boundary guard). | **amended 2026-09-12 with the rollback-bounded chunked threshold (`n_rs_batch`) + the pre-batch snapshot slot** — the whole-batch chunked path now requires `n_tokens > max(K > 16 ? K : 16, n_rs_batch)` where `n_rs_batch` is the longest draft an enabled speculator can produce + 1 (from `common_speculative_n_max()`), because a batch that can be rolled back into must run the sequential kernel that writes its snapshots; fixes a silent recurrent-state rewind with ngram-style long drafts (ngram-mod 64 > MTP's `n_rs_seq` 7) that the 2026-09-11 guard detects — see the 2026-09-12 block-02 amendment section below.
 | `0003` | BF16 KV cache + native-BF16 flash-attn | **amended 2026-09-10 with the HIP masked-V/freed-cell fixes** (moved here from block 14 on 2026-09-10 — they sit on the native-BF16 PV staging this block introduces): `fattn-tile.cuh` (packed-bf16 PV) + `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles). |
 | `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf | **amended 2026-09-06 with the RDNA WMMA (256,256,64) config row** (fattn-mma-f16.cuh, fork e7eecb369).
 | `0005` | CPU bit-identical decode/verify batches |
@@ -179,6 +179,50 @@ record and the 2026-09-10 Strix Halo (gfx1151) pass live in
 `../wip/strix-halo/GATE-2026-09-10-block15-rdna35.md`; the dated
 WORKLOG entries carry the history.
 
+## 2026-09-12 block-02 amendment: the chunked-GDN snapshot bound (`n_rs_batch`) + the pre-batch slot
+
+Integrated from the gfx1201 investigation in `~/ngram-mod/` (record copied to
+`../wip/gdn-rs-rollback/README.md`).  The whole-batch chunked GDN path assumed that a batch which can
+be rolled back into is a verify batch, i.e. at most `K = n_rs_seq + 1` tokens, so it wrote **no**
+rollback snapshots for anything above the threshold.  That is false for long-draft speculators:
+`n_rs_seq` is sized from `speculative.draft.n_max` (7 here) while `--spec-ngram-mod-n-max` can draft
+64, so a 65-token verify batch took the chunked path and a small tail rollback then restored a
+snapshot plane that batch never wrote — the recurrent state silently rewound (finite but wrong, so
+decoding "worked").  The `llama_memory_recurrent` guard added 2026-09-11 detects exactly this; that
+warning is the bug report, and it is not a false positive.
+
+* **`n_rs_batch`** — the longest per-seq batch that can be rolled back into (the longest draft any
+  enabled speculator can produce, plus the sampled token):
+  `common_speculative_n_max(&params.speculative) + 1` flows through
+  `llama_context_params::n_rs_batch` -> `llama_cparams` -> `ggml_gated_delta_net()` (new op param 1)
+  -> the CUDA dispatch, and into `llama_memory_recurrent` so the `seq_rm` guard stays a real invariant
+  check.  The chunked threshold becomes
+  `GDN_CHUNKED_MIN_TOKENS = max(K > 16 ? K : 16, n_rs_batch)`, so any batch that can be rolled back
+  into runs the sequential kernel (which writes its `K` snapshots) and long prefills still chunk.
+  Snapshot memory is unchanged (`n_rs_seq + 1` planes; sizing `n_rs_seq = 64` instead would have cost
+  ~+8 GiB).  **Default configs do not move**: no speculator -> `n_rs_batch = 1`, MTP `n_max 7` -> 8,
+  so the threshold stays 16 and the chunked path keeps its whole-batch, K-independent shape.
+* **Pre-batch slot** — for `0 < n_tokens < K` the graph now also writes the *pre-batch* ssm and conv
+  state into slot `n_tokens` (`delta-net-base.cpp`), so a rollback of the whole last batch restores the
+  state before it instead of whatever older plane was in that slot.  Graph-level copy, no kernel
+  change, no effect on output for `n_tokens >= K`.
+* The upstream `ssm_scan` (Mamba, `mamba-base.cpp`) path has the same two characteristics and is
+  deliberately **not** touched here (it would need the same bound and pre-batch slots).
+
+**Validation (gfx1151, this repo's dev box).**  The in-tree `test-recurrent-state-rollback`
+(`-m Qwen3.8-27B-Q8_0 -ngl 99 -c 512 -b 512 -ub 512`) **fails on the unpatched library** —
+`multi-seq split replay logits mismatch (max diff 6.5366, first at seq 0 pos 16)` — and **passes with
+this amendment** (`multi-seq split replay matched (max diff 0)` and `seq-1-only decode independent of
+seq 0 (max diff 0)`, both cache fills `0x00` and `0x3e`).  `test-backend-ops -o GATED_DELTA_NET` =
+**46/46**.  Neutrality on the delivery's own configs: 27B `plain` == `draft-mtp n_max 7` =
+`e164f09af338` (670 chars) and qwen4exp `plain` = `0fc4910d5824` are **identical** before and after
+the patch, and 27B pp2048/pp8192 are within noise (450.4/428.0 -> 451.0/428.9).  The change only moves
+batches in `(max(K,16), n_rs_batch]` — verify batches of a long-draft speculator — onto the sequential
+kernel, which is what writes the snapshots they are rolled back into; the cost is a ~49-token verify
+batch paying ~44 us per GDN layer (gfx1201: chunked 22.6 us/op vs sequential 86.5 at head_count 32 /
+head_size 128 / n_seq_tokens 64), i.e. low single-digit percent of a long-draft verify step and
+cheaper than a checkpoint replay.  `GGML_CUDA_GDN_CHUNKED=0` is no longer needed for correctness.
+
 ## 2026-09-12 block-14 amendment (sixth): the configurable QSA prefill arm + the device-query arm gate
 
 Two changes to `src/models/qwen4exp.cpp`, both resolving TODO item 9.  Full measurements, repro and
@@ -224,8 +268,10 @@ old list over the 8 native types + f32/f16/bf16/q6_K/q3_K/q4_K/iq4_xs, and an un
 (`D=80`) is now rejected (the list accepted it - the kernel `GGML_ABORT`s on it); a same-seed text
 A/B against the pre-amendment build is byte-identical (`0fc4910d5824`).  Cost 0.112 us per query.
 
-**Gates on this tip (gfx1151):** strict 15/15 `git am` with the applied tree == the canonical
-`0edf654cdea653b9969f866977a541ee4429f846`; `test-backend-ops -o FLASH_ATTN_QSA` **22/22** and
+**Gates on this tip (gfx1151):** strict 15/15 `git am` with the applied tree == the canonical tree at that point
+(`c24871386c479865d41476726cf1f01c43b23ea6`; the block-14 section below was verified against the
+`0edf654cdea653b9969f866977a541ee4429f846` tip, which the 2026-09-12 block-02 amendment above then
+moved); `test-backend-ops -o FLASH_ATTN_QSA` **22/22** and
 `-o FLASH_ATTN_EXT` pass; the default behaviour is byte-identical to the pre-amendment build
 (f16 `plain == n_max 3` = `0fc4910d5824` at 632 chars, q8_0 `plain == n_max 7` = `e8f8bba3942b` at
 626 chars = the recorded pre-amendment shallow q8_0 value); the predicate table is 0 mismatches
@@ -1257,7 +1303,8 @@ upstream's additions.
   sequential in general (same class as the bf16 chunked: near-lossless).
   Lab numbers: `benchmarks/2026-08-31-mtp-gdn-chunked-prefix.md`.
 - **K-independent whole-batch chunked prefill — free, no tail, no gate**
-  (2026-09-11).  Fixes the fork-only plain-vs-spec divergence from the gfx1151
+  (2026-09-11; the threshold is `max(K > 16 ? K : 16, n_rs_batch)` since 2026-09-12, see the block-02
+  amendment above — still K-independent for every config whose speculator drafts <= 16 tokens).  Fixes the fork-only plain-vs-spec divergence from the gfx1151
   issue-#25 validation.  The chunked kernel is not bit-exact with the
   sequential one, so a K-dependent boundary makes the post-prefill SSM state
   depend on `n_rs_seq`: plain decode (`K == 1`) chunks the whole prompt while

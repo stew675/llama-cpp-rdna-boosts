@@ -147,11 +147,12 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `890a9c5b1`, net tree
-  `0edf654cdea653b9969f866977a541ee4429f846`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `47a9d4d86`, net tree
+  `c24871386c479865d41476726cf1f01c43b23ea6`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the whole-batch
-K-independent chunked GDN prefill; block 08 amended 2026-09-11 with the
+K-independent chunked GDN prefill and again 2026-09-12 with the rollback-bounded
+chunked threshold (`n_rs_batch`) + the pre-batch snapshot slots; block 08 amended 2026-09-11 with the
 decode/verify FA kernel-family fix, again with the quantized-KV-type
 enablement (`q4_1`/`q5_0`/`q5_1`), and again with the `iq4_nl` enablement (the predicate, the 15
 new `fattn-vec-instance-iq4_nl-*.cu` files, `dequantize_q4_nl` and the three non-contiguous
@@ -396,7 +397,24 @@ Consequences, so it is not re-litigated:
   **removed** (~118 lines) — both were unreachable with the gate ON and the
   opt-out no longer bought any performance.  `GGML_CUDA_GDN_CHUNKED=0` is the
   only switch left (forces the sequential kernel: correct, bit-identical,
-  slow).  **Note the pure `none == draft-mtp` range is `n_max <= 7`, not 15** —
+  slow).  **Amended 2026-09-12 with the rollback-bounded chunked threshold (`n_rs_batch`)**:
+  the whole-batch path wrote no rollback snapshots, on the assumption that a
+  batch above `max(K, 16)` "cannot be a verify batch" — false for long-draft
+  speculators (`n_rs_seq` comes from `speculative.draft.n_max` = 7, while
+  `--spec-ngram-mod-n-max` can draft 64), so a 65-token verify batch followed by
+  a small tail rollback restored an unwritten plane and the recurrent state
+  silently rewound.  The threshold is now
+  `max(K > 16 ? K : 16, n_rs_batch)` with `n_rs_batch =
+  common_speculative_n_max() + 1` (a new `ggml_gated_delta_net` op param,
+  threaded through `llama_context_params`/`llama_cparams` and into the
+  `seq_rm` guard), and the pre-batch ssm/conv state is written into slot
+  `n_tokens` when `0 < n_tokens < K` so a whole-batch rollback restores the
+  state before it.  Default configs are unaffected (`n_rs_batch` 1 / 8 <= 16);
+  validated by **FAIL -> PASS** on `test-recurrent-state-rollback`
+  (`max diff 6.5366, first at seq 0 pos 16` -> `max diff 0`) and
+  `GATED_DELTA_NET` 46/46 on gfx1151 — `GREEDY-PURITY.md` §27,
+  `patches/README.md` (the 2026-09-12 block-02 amendment).
+  **Note the pure `none == draft-mtp` range is `n_max <= 7`, not 15** —
   an 8-token verify batch is the designed limit (the FA tile-vs-WMMA switch at
   `Q->ne[1] > 8` changes the reduction beyond it); on 2-GPU `-sm tensor` it was
   `n_max <= 5` until the block-12 dispatch fix described below
@@ -637,7 +655,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `890a9c5b1`): `git format-patch --start-number 0` the block
+blocks tip `47a9d4d86`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -646,7 +664,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `890a9c5b1`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `47a9d4d86`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

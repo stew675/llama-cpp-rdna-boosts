@@ -1,5 +1,41 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-12 (10) — block-02 amendment: the chunked-GDN snapshot bound (`n_rs_batch`) + the pre-batch slot
+
+Integrated from the gfx1201 investigation in `~/ngram-mod/` (record: `wip/gdn-rs-rollback/README.md`;
+originals `~/ngram-mod/{README.md,fix-ngram-mod.md,gdn-rs-rollback-bound.patch}`).  Canonical tip
+`890a9c5b1` -> **`47a9d4d86`** (tree `0edf654cdea653b9969f866977a541ee4429f846` ->
+**`c24871386c479865d41476726cf1f01c43b23ea6`**); block 02 amended in place and blocks 03-14 replayed with
+**no conflicts** (the net delta is byte-exactly the patch: 20 files, +96/-23), and patch bodies
+`0003`-`0014` changed **only in their `From`/`index` lines plus hunk offsets** (verified: all 52 changed
+lines in `0014` are hunk headers).  `make-patches.sh` default tip updated; strict 15/15 `git am` on a
+fresh worktree at `9113cc188` (0 whitespace warnings, applied tree == canonical); beta block-15
+**re-cut 15th** (`eb15f3ee1`, tree `ffa3a11c30ba6d42dea2520f402126370df3bbb6`, patch 3 819 lines,
+round-tripped, cherry-pick clean).
+
+* **The defect**: the whole-batch chunked GDN path wrote no rollback snapshots for batches above its
+  threshold, on the assumption that such a batch is "not a verify batch".  `n_rs_seq` comes from
+  `speculative.draft.n_max` (7) but `--spec-ngram-mod-n-max` can draft 64, so a 65-token verify batch
+  took the chunked path and a small tail rollback restored an unwritten plane - a silent
+  recurrent-state rewind.  The block-02 `seq_rm` guard (2026-09-11) is the detector; the reported
+  warning is real.
+* **The fix**: `n_rs_batch` (longest draft any enabled speculator can produce + 1, from
+  `common_speculative_n_max()`) is threaded `llama_context_params` -> `llama_cparams` ->
+  `ggml_gated_delta_net()` op param 1 -> the CUDA dispatch, where the threshold becomes
+  `max(K > 16 ? K : 16, n_rs_batch)`; plus the pre-batch ssm/conv state is written into slot
+  `n_tokens` when `0 < n_tokens < K`, so a whole-batch rollback has the state it needs.  No snapshot
+  memory change (sizing `n_rs_seq = 64` would have cost ~+8 GiB).
+* **Validation (gfx1151)**: in-tree `test-recurrent-state-rollback` **FAIL -> PASS** (unpatched:
+  `multi-seq split replay logits mismatch (max diff 6.5366, first at seq 0 pos 16)`; patched:
+  `matched (max diff 0)` for both cache fills + the seq-1-only case); `GATED_DELTA_NET` **46/46**;
+  neutrality: 27B `plain == draft-mtp n_max 7` = `e164f09af338` and qwen4exp `plain` = `0fc4910d5824`
+  identical before/after, 27B pp2048/8192 within noise; beta re-cut revalidated (`GATED_DELTA_NET`
+  46/46, `FLASH_ATTN_QSA` 22/22, rollback test PASS, all four gate combos + `draft-mtp n_max 3`
+  byte-identical `0fc4910d5824`).
+* Trade recorded: batches in `(max(K,16), n_rs_batch]` now run the sequential kernel (correctness
+  requires it - the chunked kernel cannot write those snapshots).  Delivery configs are unaffected
+  because their `n_rs_batch <= 16`.
+
 ## 2026-09-12 (9) — TODO item 9 resolved and closed: the configurable QSA prefill arm + the device-query arm gate
 
 Block-14 amendment (sixth).  Canonical tip `13af95ac1` -> **`890a9c5b1`** (tree

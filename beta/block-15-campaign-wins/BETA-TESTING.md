@@ -10,8 +10,8 @@ without rebuilding five times.  Every win except W4 is switchable by environment
 > block 00 + blocks 01-14), and every row below was re-checked **as a combination** on the tree built
 > from the beta patch on top of the delivered **15-block** set (fresh worktree at `9113cc188`, strict
 > **15/15** `git am` + the beta patch, fresh build): reserves, byte-identical coherence on all five
-> models, the MTP gate, and the op suites all reproduce.  The current re-cut is tip **`86c7df1f5`**
-> (base `890a9c5b1`, tree `66f0762a2`) and every recorded number carries forward — see the dated
+> models, the MTP gate, and the op suites all reproduce.  The current re-cut is tip **`eb15f3ee1`**
+> (base `47a9d4d86`, tree `ffa3a11c30ba6d42dea2520f402126370df3bbb6`) and every recorded number carries forward — see the dated
 > re-cut log below, `README.md` and `HANDOVER.md` §10.  (Earlier tip `888a59ee0`, base `13af95ac1`,
 > tree `476d2d1e9`.)
 > V3 is **on by default** (`LLAMA_KQ_MASK_DERIVED`), V4 and V5 are **opt-in through one switch**
@@ -219,13 +219,36 @@ but the hunks are far apart, so the re-cut is **metadata/offset-only** (0 change
 Nothing in the tester checklist changes: the revalidation numbers above were taken on the previous
 re-cut and the delta is metadata only.
 
+## 2026-09-12 (10) — fifteenth re-cut: the block-02 rollback-bounded chunked-GDN threshold
+
+The base moved for a block-02 amendment: the whole-batch chunked GDN path now requires
+`n_tokens > max(K > 16 ? K : 16, n_rs_batch)`, where `n_rs_batch` is the longest draft any enabled
+speculator can produce + 1 (`common_speculative_n_max()`, plumbed as a new `ggml_gated_delta_net` op
+param), and the pre-batch ssm/conv state is written into slot `n_tokens` when `0 < n_tokens < K`.
+That fixes a silent recurrent-state rewind with long-draft speculators (ngram-mod 64 vs MTP's
+`n_rs_seq` 7), whose verify batches had taken the chunked path that writes no rollback snapshots.
+Base `47a9d4d86` -> **beta tip `eb15f3ee1`**, tree `ffa3a11c30ba6d42dea2520f402126370df3bbb6`, patch
+**3 819 lines**; conflict-free cherry-pick, round-tripped (fresh worktree at the new base + `git am`
+-> identical tree).
+
+**Revalidation (2026-09-12 (10), this re-cut's tree, gfx1151).**  Builds clean; `GATED_DELTA_NET`
+**46/46**; `FLASH_ATTN_QSA` **22/22**; `test-recurrent-state-rollback` (`-m Qwen3.8-27B-Q8_0 -c 512 -b
+512 -ub 512`) **PASS** — `recurrent rollback checkpoint restored successfully` and
+`multi-seq split replay matched (max diff 0)` + `seq-1-only decode independent of seq 0 (max diff 0)`,
+both cache fills; and the gate identity holds: `--spec-type none` with the default,
+`GGML_QSA_SCORE_MEM=0`, `GGML_QSA_DERIVED_BIAS=0 GGML_QSA_DERIVED_VIS=0` and `LLAMA_QSA_KEYS_ONLY=0`
+all produce byte-identical text (`0fc4910d5824`, 632 chars), as does `draft-mtp --spec-draft-n-max 3`
+— the delivery's value for that config.  The delivery default is unaffected by the block-02
+amendment (`n_rs_batch` is 1 with no speculator and 8 with MTP `n_max 7`, both below the 16 floor), so
+**no tester-visible change**.
+
 ## 2026-09-12 (9) — fourteenth re-cut: the block-14 configurable QSA prefill arm + device-query arm gate
 
 The base moved for a delivery amendment (TODO item 9): the QSA prefill axis is now depth-configurable
 (`qsa_dense_prefill_until` / `LLAMA_QSA_DENSE_PREFILL_UNTIL`) — **default `0` = QSA prefill always**,
 the documented arch policy, so nothing in the gate table moves — and `qsa_kv_native`'s hand-maintained
 type list is replaced by a `ggml_backend_dev_supports_op()` query on a shaped probe tensor.  Base
-`890a9c5b1` -> **beta tip `86c7df1f5`**, tree `66f0762a2ec19cbc34b1842d1b5984bb82ecec45`, patch
+`47a9d4d86` -> **beta tip `86c7df1f5`**, tree `66f0762a2ec19cbc34b1842d1b5984bb82ecec45`, patch
 **3 819 lines**.
 
 **This re-cut needed a real merge** (the first one): block 15 hoists the QSA arm gate out of
@@ -235,7 +258,7 @@ into block 15's helper: `qwen4exp_qsa_sparse(const llama_model &, const llama_hp
 llama_cparams &)` calling `qsa_op_supported(model, hparams, il, cparams.type_k)` (so the beta inherits
 the device query and the Meta device's `all_of()` meta-split safety), with its call sites updated and
 the probe-tensor call taking block 15's two extra `ggml_flash_attn_qsa` arguments
-(`nullptr, nullptr`).  The exported patch round-trips: a fresh worktree at `890a9c5b1` + `git am`
+(`nullptr, nullptr`).  The exported patch round-trips: a fresh worktree at `47a9d4d86` + `git am`
 reproduces `66f0762a2`.
 
 **Revalidation (2026-09-12 (9), this re-cut's tree, gfx1151).**  Builds clean (`build-rocm`);

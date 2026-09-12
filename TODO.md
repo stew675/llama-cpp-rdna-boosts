@@ -7,9 +7,9 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
 `wip/*` and `benchmarks/`.
 
 **Current state (2026-09-12):** the delivery is the 15-patch set against fork point `9113cc188`
-(block 00 + blocks 01-14), canonical tip **`890a9c5b1`** (tree `0edf654cdea653b9969f866977a541ee4429f846`),
-`make-patches.sh` default tip = `890a9c5b1`.  Block 15 (the attention-memory campaign) is **staged in
-`beta/block-15-campaign-wins/`, not promoted** (14th re-cut: `890a9c5b1` → `86c7df1f5`).  F1/F2/F3 (the
+(block 00 + blocks 01-14), canonical tip **`47a9d4d86`** (tree `c24871386c479865d41476726cf1f01c43b23ea6`),
+`make-patches.sh` default tip = `47a9d4d86`.  Block 15 (the attention-memory campaign) is **staged in
+`beta/block-15-campaign-wins/`, not promoted** (15th re-cut: `47a9d4d86` → `eb15f3ee1`).  F1/F2/F3 (the
 KV-quant purity/parity campaign) are **all closed** — every KV cache type the delivery supports is
 width-pure and takes the f16 attention path — and so is the gfx1151 within-band mmvq fusion variance
 (block-13 amendment, 2026-09-12; see Closed).  The QSA *sparse* regime was re-measured on gfx1151
@@ -17,7 +17,9 @@ width-pure and takes the f16 attention path — and so is the gfx1151 within-ban
 residual is tracked in item 4.  **Triaged 2026-09-12 (8)**: the Active list became **three items** (3, 4,
 9); items 1/6/8/12 moved to *Waiting on others*, items 5(c)/5(d)/5(g)/13 to *accepted limitations*, items
 5(a)/5(b)/15/16 to *Parked*, and items 11 (MXFP4 fused gate — unreachable for the available MXFP4 MoE)
-and 14 (canonical-fork hygiene — verified) to *Closed*.  **Item 9 was then resolved and closed
+and 14 (canonical-fork hygiene — verified) to *Closed*.  A **block-02 amendment** landed a
+handed-over gfx1201 fix in the same window (the rollback-bounded chunked-GDN threshold `n_rs_batch`
++ the pre-batch snapshot slot — see Closed).  **Item 9 was then resolved and closed
 (2026-09-12 (9), block-14 amendment)** — the QSA prefill arm is now depth-configurable with the
 documented arch policy kept as its default (**0 = QSA prefill always**, so the delivery stays
 byte-identical to the pre-amendment build; the crossing numbers are recorded as an opt-in knob), plus
@@ -80,8 +82,8 @@ crossover stays.
 ## Waiting on others (not actionable in this repo)
 
 ### 1. Block 15 promotion — **UNBLOCKED** (waiting on the beta window + the maintainer's go-ahead)
-- **Live state:** the 14th re-cut is on the current base (`890a9c5b1` → beta tip **`86c7df1f5`**, tree
-  **`66f0762a2ec19cbc34b1842d1b5984bb82ecec45`**); it builds clean, applies strict `git am`, and
+- **Live state:** the 15th re-cut is on the current base (`47a9d4d86` → beta tip **`eb15f3ee1`**, tree
+  **`ffa3a11c30ba6d42dea2520f402126370df3bbb6`**); it builds clean, applies strict `git am`, and
   revalidates (width probe `W = 1,4,8` one hash, same-seed greedy byte-identical delivery-vs-beta,
   `FLASH_ATTN_QSA` + `GATED_DELTA_NET` pass).  The dense-arm blocker and its fix are closed — see the
   Closed section; the cut is in `beta/block-15-campaign-wins/` (BETA-TESTING.md 12th-re-cut section).
@@ -193,6 +195,23 @@ crossover stays.
   `wip/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
+
+**The GDN recurrent-state rollback bound (`n_rs_batch`) + the pre-batch snapshot slot (landed 2026-09-12 (10), block-02 amendment).**
+Integrated from the gfx1201 investigation in `~/ngram-mod/` (record `wip/gdn-rs-rollback/`, originals
+copied in).  The whole-batch chunked GDN kernel writes no rollback snapshots and assumed a batch above
+`max(K, 16)` is never rolled back into — false when a long-draft speculator is enabled
+(`n_rs_seq` comes from `speculative.draft.n_max` = 7 while `--spec-ngram-mod-n-max` can draft 64), so
+a 65-token verify batch followed by a small tail rollback restored an unwritten plane and the
+recurrent state silently rewound (the block-02 `seq_rm` guard is the detector — the reported warning
+is real).  Fix: `n_rs_batch = common_speculative_n_max() + 1` through
+`llama_context_params`/`llama_cparams`/`ggml_gated_delta_net` (new op param 1) into the CUDA threshold
+`max(K > 16 ? K : 16, n_rs_batch)` and the `seq_rm` guard, plus the pre-batch ssm/conv state written
+into slot `n_tokens` when `0 < n_tokens < K`.  Validated on gfx1151: in-tree
+`test-recurrent-state-rollback` **FAIL -> PASS** (`max diff 6.5366, first at seq 0 pos 16` ->
+`max diff 0`), `GATED_DELTA_NET` 46/46, and neutrality on the delivery configs (27B
+`plain == draft-mtp n_max 7` = `e164f09af338`, qwen4exp `plain` = `0fc4910d5824`, pp within noise).
+`GREEDY-PURITY.md` §27; `patches/README.md` (the 2026-09-12 block-02 amendment); `WORKLOG.md`
+2026-09-12 (10).
 
 **Item 9 — the configurable QSA prefill arm + the device-query arm gate (closed 2026-09-12 (9), block-14 amendment).**
 Two changes in `src/models/qwen4exp.cpp`.  (a) The prefill axis of the arch policy was not

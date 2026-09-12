@@ -31,9 +31,16 @@
 > merged cleanly (the `llama-context.cpp` region now carries both the new reject and block 15's
 > tensor-split type gate); the only delta vs the ninth re-cut is those three delivery files.  Testers must
 > pass matching `-ctk`/`-ctv`.  See `README.md` (tenth re-cut) and `BETA-TESTING.md`.
+> **Re-cut a fifteenth time 2026-09-12 (10)** after the block-02 rollback-bounded chunked-GDN
+> amendment (`n_rs_batch` + the pre-batch snapshot slot).  Base `47a9d4d86` (tree
+> `c24871386c479865d41476726cf1f01c43b23ea6`) -> **beta tip `eb15f3ee1`**, tree
+> **`ffa3a11c30ba6d42dea2520f402126370df3bbb6`**, patch **3 819 lines**.  Conflict-free cherry-pick,
+> round-tripped, builds clean; gfx1151 revalidation: `GATED_DELTA_NET` 46/46, `FLASH_ATTN_QSA` 22/22,
+> `test-recurrent-state-rollback` PASS, all four gate combos + `draft-mtp n_max 3` byte-identical
+> (`0fc4910d5824`, 632 chars).  No tester-visible change.  See `README.md`.
 > **Re-cut a fourteenth time 2026-09-12 (9)** after the block-14 configurable QSA prefill arm +
-> device-query arm gate amendment.  Base `890a9c5b1` (tree
-> `0edf654cdea653b9969f866977a541ee4429f846`) -> **beta tip
+> device-query arm gate amendment.  Base `47a9d4d86` (tree
+> `c24871386c479865d41476726cf1f01c43b23ea6`) -> **beta tip
 > `86c7df1f5`**, tree **`66f0762a2ec19cbc34b1842d1b5984bb82ecec45`**, patch **3 819 lines**.  First re-cut
 > with a real merge: block 15's hoisted `qwen4exp_qsa_sparse()` now takes `(model, hparams, il, cparams)`
 > and calls the delivery's `qsa_op_supported()` instead of its own type-list copy, and its probe tensor

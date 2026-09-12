@@ -7,7 +7,7 @@
 **Status: BETA — staged, NOT promoted (2026-09-10); REVALIDATED 2026-09-11
 against the 15-patch delivery.**  The campaign is
 complete and the block-15 patch lives **only in this directory**
-(`block-15-campaign-wins.patch`, re-cut 2026-09-12 (9) on base `890a9c5b1`, beta tip `86c7df1f5`); it is **not part of the
+(`block-15-campaign-wins.patch`, re-cut 2026-09-12 (10) on base `47a9d4d86`, beta tip `eb15f3ee1`); it is **not part of the
 delivery** (`patches/` is the 15-patch set: block 00 + blocks 01-14) and is
 applied manually on top of the 15-block tree.  The beta window (~4–5 days) is open for tester feedback;
 promotion into the delivery set requires the maintainer's go-ahead (at
@@ -36,9 +36,19 @@ re-cut and re-validated end to end.
   dense `6.5377`, and the new K/V reject fires in the beta build).  **Testers: pass matching
   `-ctk`/`-ctv`** (the hard reject applies to the beta too; every
   script here already does).  See `BETA-TESTING.md` (the dated tenth-re-cut section).
+* **Re-cut a fifteenth time 2026-09-12 (10)** after the block-02 **rollback-bounded chunked-GDN
+  threshold (`n_rs_batch`) + the pre-batch snapshot slot** amendment.  Base **`47a9d4d86`** (tree
+  `c24871386c479865d41476726cf1f01c43b23ea6`) -> **beta tip `eb15f3ee1`**, tree
+  **`ffa3a11c30ba6d42dea2520f402126370df3bbb6`**, patch **3 819 lines**.  The cherry-pick was
+  conflict-free (the delivery diff is 20 files, +96/-23, and block 15 shares only `ggml.h` among
+  them, in a different region); round-tripped (fresh worktree at the new base + `git am` -> identical
+  tree).  Revalidated on gfx1151: builds clean, `GATED_DELTA_NET` **46/46**, `FLASH_ATTN_QSA`
+  **22/22**, `test-recurrent-state-rollback` **PASS** (`max diff 0`, both cache fills), and all four
+  gate combos plus `draft-mtp --spec-draft-n-max 3` are byte-identical (`0fc4910d5824`, 632 chars) =
+  the delivery's value.  **No tester-visible change.**
 * **Re-cut a fourteenth time 2026-09-12 (9)** after the block-14 **configurable QSA prefill arm +
-  device-query arm gate** amendment.  Base **`890a9c5b1`** (tree
-  `0edf654cdea653b9969f866977a541ee4429f846`) -> **beta tip `86c7df1f5`**, tree
+  device-query arm gate** amendment.  Base **`47a9d4d86`** (tree
+  `c24871386c479865d41476726cf1f01c43b23ea6`) -> **beta tip `86c7df1f5`**, tree
   **`66f0762a2ec19cbc34b1842d1b5984bb82ecec45`**, patch **3 819 lines**.  This is the first re-cut that
   **required a real merge**: block 15 hoists the QSA arm gate out of `build_attn_qsa` into a file-scope
   `qwen4exp_qsa_sparse()`, and the delivery's new `qsa_op_supported()` sits in exactly that region.

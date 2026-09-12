@@ -1018,3 +1018,36 @@ Two corollaries worth keeping for whenever such an arm *is* enabled:
   below the threshold, so a long prefill keeps the sparse chunks that measured faster (sparse wins
   pp32768 by 17.4 % when it is *all* sparse) while the shallow ones go dense.  That property is what
   would make a future at-depth-justified default safe rather than a crossover gamble.
+
+## 27. A rollback bound is a purity bound: the batch you roll back into must be written by the kernel whose snapshots you read (2026-09-12 (10))
+
+The recurrent (GDN) rollback keeps `K = n_rs_seq + 1` snapshot planes, and only the **sequential** GDN
+kernel writes them (slot `s` = the state `s` tokens back).  The **whole-batch chunked** prefill kernel
+writes slot 0 only, so it is safe for a batch only if that batch is never rolled back into.  Block 02
+originally expressed that as a constant: "a batch longer than `max(K, 16)` cannot be a speculative
+verify batch", which held only while every speculator's maximum draft was bounded by `n_rs_seq`
+(sized from `speculative.draft.n_max`).  It was **false** for ngram-style long drafts: with ngram-mod
+able to draft 64 tokens, a 65-token verify batch took the chunked path and a small tail rollback then
+restored a plane that batch never wrote - a silent, finite-but-wrong recurrent state.
+
+The invariant to check in any future change here: **every batch that can be rolled back into must run
+the kernel that writes the snapshots it will read.**  The bound therefore has to come from the
+*speculator's* maximum draft, not from the snapshot depth - `n_rs_batch =
+common_speculative_n_max() + 1`, consumed as `GDN_CHUNKED_MIN_TOKENS = max(K > 16 ? K : 16,
+n_rs_batch)`.  Consequences worth keeping:
+
+* **Default configs are unaffected**, so this is not a purity trade for the delivery: no speculator
+  gives `n_rs_batch = 1` and MTP `n_max 7` gives 8, both below the 16 floor, so the chunked path keeps
+  its whole-batch, K-independent shape and the recorded hashes do not move (verified: 27B
+  `plain == draft-mtp n_max 7` = `e164f09af338`, qwen4exp `plain` = `0fc4910d5824`, unchanged; 27B
+  pp2048/8192 within noise).  Only a long-draft speculator's verify batches move to the sequential
+  kernel - and for those the alternative is corruption, so correctness decides (§19's trade).
+* **A whole-batch rollback needs a pre-batch plane.**  The sequential kernel writes slots
+  `0..min(n_tokens,K)-1`, so a rollback of exactly the whole batch needs slot `n_tokens`, which no
+  kernel wrote: the graph now copies the pre-batch ssm and conv state there when `0 < n_tokens < K`
+  (`delta-net-base.cpp`).  That is what `test-recurrent-state-rollback`'s `multi_seq_split_replay`
+  exercises - it failed with `max diff 6.5366, first at seq 0 pos 16` before and matches with
+  `max diff 0` after (both cache fills) on this box.
+* **The guard stays a real invariant check.**  `llama_memory_recurrent::seq_rm` compares the last
+  ubatch's per-seq token count against `n_rs_batch` (not `n_rs_seq + 1`), so it still warns - once -
+  if a future change lets a rollback cross a batch boundary.

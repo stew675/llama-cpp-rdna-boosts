@@ -25,7 +25,9 @@
 #                 mmvq fusion skip (the dense gate+up+GLU fusion and the weighted-down
 #                 MoE tail are single-token-only and not bit-identical with the
 #                 standalone arithmetic on gfx1151; gated there unless the A/B opt-in
-#                 GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1 is set), and the
+#                 GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1 is set), the 2026-09-12 block-02
+#                 amendment (the rollback-bounded chunked-GDN threshold `n_rs_batch` + the
+#                 pre-batch snapshot slots), and the
 #                 2026-09-12 block-14 QSA prefill crossover (qsa_dense_prefill_until,
 #                 per-split defaults: gfx1151 8192 / tensor split 16384 / other 0, env
 #                 LLAMA_QSA_DENSE_PREFILL_UNTIL) together with the qsa_op_supported()
@@ -52,7 +54,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
 BASELINE="${2:-9113cc188}"
-TIP="${3:-890a9c5b1}"
+TIP="${3:-47a9d4d86}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then

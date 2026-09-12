@@ -1,26 +1,93 @@
-From dd312736d17e20445fb20a758a8bc312363b2879 Mon Sep 17 00:00:00 2001
+From 11345b71ef9e289b216d7fc544bf2c9dbc296fed Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 02/14] rdna-boosts: block 02: fused chunked gated-delta-net
  prefill kernel
 
 ---
- ggml/src/ggml-cuda/gated_delta_net.cu         |   84 ++
+ common/common.cpp                             |    3 +
+ common/speculative.cpp                        |    1 +
+ ggml/include/ggml.h                           |    7 +-
+ ggml/src/ggml-cuda/gated_delta_net.cu         |   94 ++
  ggml/src/ggml-cuda/gated_delta_net_chunked.cu |  702 ++++++++++++
  .../src/ggml-cuda/gated_delta_net_chunked.cuh |   58 +
  .../ggml-cuda/gated_delta_net_chunked_bf16.cu |  995 ++++++++++++++++
  .../gated_delta_net_chunked_bf16_gfx11.cu     | 1014 +++++++++++++++++
- src/llama-memory-recurrent.cpp                |   26 +
- src/llama-memory-recurrent.h                  |    7 +
- tests/test-backend-ops.cpp                    |   97 +-
- 8 files changed, 2978 insertions(+), 5 deletions(-)
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          |    2 +-
+ ggml/src/ggml.c                               |    4 +-
+ include/llama.h                               |    1 +
+ src/llama-context.cpp                         |    6 +
+ src/llama-cparams.h                           |    1 +
+ src/llama-memory-hybrid-idx.cpp               |    3 +-
+ src/llama-memory-hybrid-idx.h                 |    1 +
+ src/llama-memory-hybrid-iswa.cpp              |    2 +
+ src/llama-memory-hybrid-iswa.h                |    1 +
+ src/llama-memory-hybrid.cpp                   |    2 +
+ src/llama-memory-hybrid.h                     |    1 +
+ src/llama-memory-recurrent.cpp                |   30 +-
+ src/llama-memory-recurrent.h                  |   12 +
+ src/llama-model.cpp                           |    4 +
+ src/models/delta-net-base.cpp                 |   29 +-
+ tests/test-backend-ops.cpp                    |   99 +-
+ 24 files changed, 3059 insertions(+), 13 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked.cuh
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16.cu
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 
+diff --git a/common/common.cpp b/common/common.cpp
+index a1b22d217..347ba3d1c 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1759,6 +1759,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.n_ctx             = params.n_ctx;
+     cparams.n_seq_max         = params.n_parallel;
+     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
++    // the longest draft any enabled speculator can produce plus the sampled token; a speculative
++    // verify batch with more tokens than this cannot be rolled back into
++    cparams.n_rs_batch        = std::max(1, common_speculative_n_max(&params.speculative) + 1);
+     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
+     cparams.n_batch           = params.n_batch;
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 3b6738f1d..49d116569 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2646,6 +2646,7 @@ common_speculative_init_result::common_speculative_init_result(
+     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
+     //       the extra memory for small models is likely negligible?
+     cparams.n_rs_seq  = 0;
++    cparams.n_rs_batch = 1;
+     cparams.ctx_other = ctx_tgt;
+ 
+     std::string model_path;
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 85a1ae7ae..ba929e638 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2649,6 +2649,10 @@ extern "C" {
+     // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
+     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
+     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
++    //
++    // n_rs_batch is the largest per-seq batch that can be rolled back into (0 = unset). Backends
++    // with a chunked prefill kernel may skip writing the snapshots for a batch above this bound,
++    // because such a batch is never rolled back into.
+     GGML_API struct ggml_tensor * ggml_gated_delta_net(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * q,
+@@ -2657,7 +2661,8 @@ extern "C" {
+             struct ggml_tensor  * g,
+             struct ggml_tensor  * beta,
+             struct ggml_tensor  * state,
+-            int64_t               K);
++            int64_t               K,
++            int64_t               n_rs_batch);
+ 
+     // DSA lightning indexer
+     //
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 1b431a724..67676dea6 100644
+index 1b431a724..86b79fafb 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
 @@ -1,4 +1,5 @@
@@ -29,10 +96,18 @@ index 1b431a724..67676dea6 100644
  #include "ggml-cuda/common.cuh"
  
  template <int S_v, bool KDA, bool keep_rs_t>
-@@ -286,6 +287,89 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -286,6 +287,99 @@ static void ggml_cuda_op_gated_delta_net_impl(
      const int K = ggml_get_op_params_i32(dst, 0);
      const bool keep_rs = K > 1;
  
++    // op param 1 is the largest per-seq batch that can be rolled back into (0 = unset). The
++    // rollback snapshots only cover K tokens and only the sequential kernel writes them, so a
++    // batch longer than this bound must not take the chunked path. K alone is NOT a safe bound:
++    // the snapshot depth comes from the draft-model n_max, while ngram-style speculators can draft
++    // far longer (ngram-mod n_max = 64 by default). A verify batch then holds 1 + n_max tokens and
++    // is exactly the batch that gets rolled back into, so the bound must cover the longest draft.
++    const int64_t n_rs_batch = keep_rs ? std::max<int64_t>(1, ggml_get_op_params_i32(dst, 1)) : 0;
++
 +    // K-independent chunked prefill -- no K-dependent boundary and no sequential tail.  The
 +    // chunked kernel is not bit-exact with the sequential kernel (the bf16/WMMA path is
 +    // deliberately near-lossless, the fp32 path differs too), so a K-dependent boundary makes the
@@ -42,7 +117,8 @@ index 1b431a724..67676dea6 100644
 +    //
 +    // The alignment is done by giving BOTH paths the SAME call -- chunk the whole batch, exactly
 +    // what K == 1 does -- rather than by sharing a sequential tail.  A batch with more tokens than
-+    // max(K, 16) cannot be a speculative verify batch (a verify batch decodes n_tokens <= K = n_rs_seq + 1)
++    // max(K, 16, n_rs_batch) cannot be a speculative verify batch (a verify batch decodes the
++    // sampled token plus the longest draft any enabled speculator can produce)
 +    // and is therefore never rolled back into, so the K rollback snapshots are useless to it and
 +    // the sequential kernel can be skipped entirely: zero cost, unbounded n_max, no KTAIL.  Every
 +    // batch at or below the threshold -- in particular every verify batch -- falls through to the
@@ -70,8 +146,9 @@ index 1b431a724..67676dea6 100644
 +        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
 +        if (env == nullptr || strcmp(env, "0") != 0) {
 +            // Minimum batch size that may take the whole-batch chunked path.  A constant for
-+            // K <= 16 (see above); the floor at K keeps K > 16 drafts on the sequential kernel.
-+            const int64_t GDN_CHUNKED_MIN_TOKENS = K > 16 ? (int64_t) K : 16;
++            // K <= 16 (see above); the floors at K and n_rs_batch keep deeper drafts and every
++            // possible verify batch on the sequential kernel, which writes the rollback snapshots.
++            const int64_t GDN_CHUNKED_MIN_TOKENS = std::max<int64_t>(K > 16 ? (int64_t) K : 16, n_rs_batch);
 +            // GGML_CUDA_GDN_CHUNKED_BF16 / arch selection: same rules as the default branches
 +            // (RDNA4 -> the RDNA4 WMMA kernel, RDNA3 -> the gfx11 port, everything else fp32).
 +            // n_tokens_limit > 0 truncates to the prefix of a single sequence.
@@ -2913,37 +2990,242 @@ index 000000000..944110792
 +
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 \ No newline at end of file
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 8f37f65b8..c0295e1e8 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -20786,7 +20786,7 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
+         } else if (tensor->op == GGML_OP_GATED_DELTA_NET) {
+             tensor_clone = ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1],
+             src_clone[2], src_clone[3], src_clone[4], src_clone[5],
+-            ggml_get_op_params_i32(tensor, 0));
++            ggml_get_op_params_i32(tensor, 0), ggml_get_op_params_i32(tensor, 1));
+         } else if (tensor->op == GGML_OP_OPT_STEP_ADAMW) {
+             src_clone[0]->flags = tensor->src[0]->flags;
+             tensor_clone = ggml_opt_step_adamw(ggml_ctx, src_clone[0], src_clone[1],
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 5ef03e190..acffdb4b7 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6371,7 +6371,8 @@ struct ggml_tensor * ggml_gated_delta_net(
+         struct ggml_tensor  * g,
+         struct ggml_tensor  * beta,
+         struct ggml_tensor  * state,
+-        int64_t               K) {
++        int64_t               K,
++        int64_t               n_rs_batch) {
+     GGML_ASSERT(ggml_is_contiguous_rows(q));
+     GGML_ASSERT(ggml_is_contiguous_rows(k));
+     GGML_ASSERT(ggml_is_contiguous_rows(v));
+@@ -6406,6 +6407,7 @@ struct ggml_tensor * ggml_gated_delta_net(
+     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+ 
+     ggml_set_op_params_i32(result, 0, (int32_t) K);
++    ggml_set_op_params_i32(result, 1, (int32_t) n_rs_batch);
+ 
+     result->op     = GGML_OP_GATED_DELTA_NET;
+     result->src[0] = q;
+diff --git a/include/llama.h b/include/llama.h
+index ef7a012c4..f6c6ef862 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -362,6 +362,7 @@ extern "C" {
+         uint32_t n_ubatch;              // physical maximum batch size
+         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
+         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
++        uint32_t n_rs_batch;            // largest per-seq batch that can be rolled back into (0 = n_rs_seq + 1) [EXPERIMENTAL]
+         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
+         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
+         int32_t  n_threads;             // number of threads to use for generation
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 21501574a..0d25e78b5 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -108,6 +108,10 @@ llama_context::llama_context(
+         cparams.n_rs_seq = 0;
+     }
+ 
++    // a rollback candidate decodes the sampled token plus a full draft, which can be longer than
++    // the snapshot depth; never allow the bound to drop below the snapshot depth itself
++    cparams.n_rs_batch = std::max(cparams.n_rs_seq + 1, params.n_rs_batch);
++
+     cparams.n_threads               = params.n_threads;
+     cparams.n_threads_batch         = params.n_threads_batch;
+     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
+@@ -314,6 +318,7 @@ llama_context::llama_context(
+     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
+     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
+     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
++    LLAMA_LOG_INFO("%s: n_rs_batch            = %u\n",   __func__, cparams.n_rs_batch);
+     LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
+     LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
+ 
+@@ -3620,6 +3625,7 @@ llama_context_params llama_context_default_params() {
+         /*.n_ubatch                    =*/ 512,
+         /*.n_seq_max                   =*/ 1,
+         /*.n_rs_seq                    =*/ 0,
++        /*.n_rs_batch                  =*/ 0,
+         /*.n_outputs_max               =*/ 0,
+         /*.n_outputs_max_per_seq       =*/ 1,
+         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index b592de18c..a6345b64a 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -14,6 +14,7 @@ struct llama_cparams {
+     uint32_t n_ubatch;
+     uint32_t n_seq_max;
+     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
++    uint32_t n_rs_batch;      // largest per-seq batch that can be rolled back into (0 = n_rs_seq + 1)
+     uint32_t n_outputs_max;   // max outputs supported by the context
+     uint32_t n_outputs_max_per_seq;
+     int32_t  n_threads;       // number of threads to use for generation
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index 93b468784..42ef700ed 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -33,6 +33,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+                             /* common */
+                  uint32_t   n_seq_max,
+                  uint32_t   n_rs_seq,
++                 uint32_t   n_rs_batch,
+                      bool   offload,
+                      bool   unified,
+                             /* layer filters */
+@@ -43,7 +44,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+         model,
+         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
+         type_r, type_s, rs_size,
+-        n_seq_max, n_rs_seq, offload, unified,
++        n_seq_max, n_rs_seq, n_rs_batch, offload, unified,
+         filter_attn, filter_recr),
+     hparams_idx(model.hparams),
+     mem_idx(filter_idx == nullptr ? nullptr : [&] {
+diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
+index 705189e7e..7ad264d8e 100644
+--- a/src/llama-memory-hybrid-idx.h
++++ b/src/llama-memory-hybrid-idx.h
+@@ -31,6 +31,7 @@ public:
+                             /* common */
+                  uint32_t   n_seq_max,
+                  uint32_t   n_rs_seq,
++                 uint32_t   n_rs_batch,
+                      bool   offload,
+                      bool   unified,
+                             /* layer filters */
+diff --git a/src/llama-memory-hybrid-iswa.cpp b/src/llama-memory-hybrid-iswa.cpp
+index 06f7fd542..75b5fabb7 100644
+--- a/src/llama-memory-hybrid-iswa.cpp
++++ b/src/llama-memory-hybrid-iswa.cpp
+@@ -25,6 +25,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
+                             /* common */
+                  uint32_t   n_seq_max,
+                  uint32_t   n_rs_seq,
++                 uint32_t   n_rs_batch,
+                      bool   offload,
+                      bool   unified,
+                             /* layer filters */
+@@ -58,6 +59,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
+         rs_size,
+         n_seq_max,
+         n_rs_seq,
++        n_rs_batch,
+         filter_recr == nullptr ?
+             [&](int32_t il) { return hparams.is_recr(il); }
+             : filter_recr
+diff --git a/src/llama-memory-hybrid-iswa.h b/src/llama-memory-hybrid-iswa.h
+index c9d3f9f57..a9852b00b 100644
+--- a/src/llama-memory-hybrid-iswa.h
++++ b/src/llama-memory-hybrid-iswa.h
+@@ -35,6 +35,7 @@ public:
+                             /* common */
+                  uint32_t   n_seq_max,
+                  uint32_t   n_rs_seq,
++                 uint32_t   n_rs_batch,
+                      bool   offload,
+                      bool   unified,
+                             /* layer filters */
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+index 42c7381a9..dc81b9a86 100644
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -25,6 +25,7 @@ llama_memory_hybrid::llama_memory_hybrid(
+                             /* common */
+                  uint32_t   n_seq_max,
+                  uint32_t   n_rs_seq,
++                 uint32_t   n_rs_batch,
+                      bool   offload,
+                      bool   unified,
+                             /* layer filters */
+@@ -59,6 +60,7 @@ llama_memory_hybrid::llama_memory_hybrid(
+         rs_size,
+         n_seq_max,
+         n_rs_seq,
++        n_rs_batch,
+         filter_recr == nullptr ?
+             [&](int32_t il) { return hparams.is_recr(il); }
+             : filter_recr
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+index 484eafb74..fb8164664 100644
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -35,6 +35,7 @@ public:
+                             /* common */
+                  uint32_t   n_seq_max,
+                  uint32_t   n_rs_seq,
++                 uint32_t   n_rs_batch,
+                      bool   offload,
+                      bool   unified,
+                             /* layer filters */
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
-index 57919accf..b11a1ac6d 100644
+index 57919accf..f7a118230 100644
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
-@@ -196,6 +196,25 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+@@ -25,6 +25,7 @@ llama_memory_recurrent::llama_memory_recurrent(
+                  uint32_t   mem_size,
+                  uint32_t   n_seq_max,
+                  uint32_t   n_rs_seq,
++                 uint32_t   n_rs_batch,
+     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
+     const int32_t n_layer = hparams.n_layer();
+ 
+@@ -32,7 +33,8 @@ llama_memory_recurrent::llama_memory_recurrent(
+     size = mem_size;
+     used = 0;
+ 
+-    this->n_rs_seq = n_rs_seq;
++    this->n_rs_seq   = n_rs_seq;
++    this->n_rs_batch = n_rs_batch > 0 ? n_rs_batch : n_rs_seq + 1;
+     rs_idx.assign(n_seq_max, 0);
+ 
+     cells.clear();
+@@ -196,6 +198,25 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                  // pending rollback is single-use
                  const bool pending = rs_idx[seq_id] != 0;
                  if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
 +                    // Guard: the snapshot path assumes a rollback only removes tokens the last
-+                    // batch decoded, i.e. that only speculative verify batches -- which never
-+                    // decode more than (n_rs_seq + 1) tokens -- are rolled back into.  A larger
-+                    // batch is not a verify batch, and the whole-batch chunked GDN prefill
-+                    // (gated_delta_net.cu, GDN_CHUNKED_MIN_TOKENS) writes only the newest
-+                    // snapshot for it, so restoring snapshot `rollback` would read an unwritten
-+                    // slot.  Warn once rather than corrupt silently.
-+                    if (!warned_rollback_boundary && last_ubatch_nseq_tokens > n_rs_seq + 1) {
++                    // batch decoded, i.e. that only batches at or below n_rs_batch -- speculative
++                    // verify batches -- are rolled back into.  A larger batch is not a verify
++                    // batch, and the whole-batch chunked GDN prefill (gated_delta_net.cu,
++                    // GDN_CHUNKED_MIN_TOKENS) writes only the newest snapshot for it, so restoring
++                    // snapshot `rollback` would read an unwritten slot.  Warn once rather than
++                    // corrupt silently.
++                    if (!warned_rollback_boundary && last_ubatch_nseq_tokens > n_rs_batch) {
 +                        warned_rollback_boundary = true;
 +                        LLAMA_LOG_WARN("%s: rollback crossed a batch boundary: seq %d rollback=%d but "
-+                                "the last batch decoded %u tokens (last pos %d, n_rs_seq=%u). The "
-+                                "recurrent snapshot path assumes only verify batches (<= n_rs_seq + 1 "
++                                "the last batch decoded %u tokens (last pos %d, n_rs_seq=%u, n_rs_batch=%u). The "
++                                "recurrent snapshot path assumes only verify batches (<= n_rs_batch "
 +                                "tokens) are rolled back into; if that batch exceeded the chunked-GDN "
 +                                "threshold it wrote no usable snapshot and the restored state is "
 +                                "wrong -- set GGML_CUDA_GDN_CHUNKED=0 for the sequential kernel. "
 +                                "Please report this at github.com/stew675/llama-cpp-rdna-boosts/issues\n",
 +                                __func__, (int) seq_id, (int) rollback, last_ubatch_nseq_tokens,
-+                                (int) last_ubatch_pos_last, n_rs_seq);
++                                (int) last_ubatch_pos_last, n_rs_seq, n_rs_batch);
 +                    }
                      set_rs_idx(seq_id, (uint32_t) rollback);
                      cell.pos = p0 - 1;
                      return true;
-@@ -499,6 +518,13 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
+@@ -499,6 +520,13 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
      used = org_used;
      head = org_head;
  
@@ -2958,16 +3240,31 @@ index 57919accf..b11a1ac6d 100644
  }
  
 diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
-index 4abb3f5cf..c1531fc83 100644
+index 4abb3f5cf..8420c2152 100644
 --- a/src/llama-memory-recurrent.h
 +++ b/src/llama-memory-recurrent.h
-@@ -76,6 +76,13 @@ public:
+@@ -24,6 +24,7 @@ public:
+                      uint32_t   mem_size,
+                      uint32_t   n_seq_max,
+                      uint32_t   n_rs_seq,
++                     uint32_t   n_rs_batch,
+         const layer_filter_cb & filter);
+ 
+     ~llama_memory_recurrent() = default;
+@@ -73,9 +74,20 @@ public:
+     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
+     uint32_t n_rs_seq = 0;
+ 
++    // largest per-seq batch that can be rolled back into; batches above this bound cannot be
++    // speculative verify batches, so their rollback snapshots are never read
++    uint32_t n_rs_batch = 0;
++
      // per-seq rollback index
      std::vector<uint32_t> rs_idx;
  
 +    // Shape of the most recently prepared ubatch, used by the rollback guard in seq_rm():
-+    // a rollback may only remove tokens the last batch decoded, and a speculative verify
-+    // batch never decodes more than (n_rs_seq + 1) tokens.  See the guard there.
++    // a rollback may only remove tokens the last batch decoded, and a batch that can be
++    // rolled back into never decodes more than n_rs_batch tokens.  See the guard there.
 +    uint32_t  last_ubatch_nseq_tokens = 0;
 +    llama_pos last_ubatch_pos_last    = -1;
 +    bool      warned_rollback_boundary = false;
@@ -2975,8 +3272,99 @@ index 4abb3f5cf..c1531fc83 100644
      void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
  
      // computed before each graph build
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index ffedf89e6..ab00e1067 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2511,6 +2511,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             std::max((uint32_t) 1, cparams.n_seq_max),
+                             cparams.n_seq_max,
+                             cparams.n_rs_seq,
++                            cparams.n_rs_batch,
+                             nullptr);
+                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
+                     // The main difference between hybrid architectures is the
+@@ -2563,6 +2564,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                             /* n_seq_max         */ cparams.n_seq_max,
+                             /* n_rs_seq          */ cparams.n_rs_seq,
++                            /* n_rs_batch        */ cparams.n_rs_batch,
+                             /* offload           */ cparams.offload_kqv,
+                             /* unified           */ cparams.kv_unified,
+                             /* filter_attn       */ std::move(filter_attn),
+@@ -2583,6 +2585,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                             /* n_seq_max         */ cparams.n_seq_max,
+                             /* n_rs_seq          */ cparams.n_rs_seq,
++                            /* n_rs_batch        */ cparams.n_rs_batch,
+                             /* offload           */ cparams.offload_kqv,
+                             /* unified           */ cparams.kv_unified,
+                             /* filter_attn       */ std::move(filter_attn),
+@@ -2603,6 +2606,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                             /* n_seq_max         */ cparams.n_seq_max,
+                             /* n_rs_seq          */ cparams.n_rs_seq,
++                            /* n_rs_batch        */ cparams.n_rs_batch,
+                             /* offload           */ cparams.offload_kqv,
+                             /* unified           */ cparams.kv_unified,
+                             /* filter_attn       */ std::move(filter_attn),
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index a29d8b89c..6c5defb4b 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -399,7 +399,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
+     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
+ 
+     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
+-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
++    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1, /*n_rs_batch=*/1);
+     if (n_tokens == 1) {
+         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
+     } else {
+@@ -528,6 +528,19 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+ 
+             ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+         }
++
++        // same as the ssm state: keep the pre-batch conv state in slot n_seq_tokens when the whole
++        // batch can be rolled back and the slot fits
++        if (0 < ubatch.n_seq_tokens && (int64_t) ubatch.n_seq_tokens < K) {
++            ggml_tensor * conv_state_pre = ggml_reshape_2d(ctx0, conv_states, row_count, n_seqs);
++            ggml_tensor * conv_state_pre_dst =
++                ggml_view_2d(ctx0,
++                        conv_states_all, row_count, n_seqs,
++                        conv_states_all->nb[1],
++                        ((size_t) ubatch.n_seq_tokens * mem_size + kv_head) * row_size);
++
++            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_pre, conv_state_pre_dst));
++        }
+     }
+ 
+     return conv_input;
+@@ -572,8 +585,20 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     const int64_t D = S_v * S_v * H_v;
+     const int64_t K = cparams.n_rs_seq + 1;
+ 
++    // the GDN op only snapshots the per-token states (slots 0..n_seq_tokens-1), so a rollback that
++    // removes the whole batch needs the pre-batch state: keep it in slot n_seq_tokens when it fits
++    if (0 < n_seq_tokens && n_seq_tokens < K) {
++        const size_t pre_row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
++        ggml_tensor * pre_src = ggml_reshape_2d(ctx0, s, D, n_seqs);
++        ggml_tensor * pre_dst = ggml_view_2d(ctx0, ssm_states_all, D, n_seqs,
++                ssm_states_all->nb[1], ((size_t) n_seq_tokens * mem_size + kv_head) * pre_row_size);
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, pre_src, pre_dst));
++    }
++
+     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
++    // a batch above n_rs_batch cannot be a speculative verify batch and is never rolled back
++    // into, so a chunked GDN kernel may skip the rollback snapshots for it
++    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K, cparams.n_rs_batch);
+     if (n_seq_tokens > 1) {
+         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+     } else {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 01e72041b..6b438c0e0 100644
+index 01e72041b..bbe5839ca 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1499,14 +1499,64 @@ struct test_case {
@@ -3074,6 +3462,15 @@ index 01e72041b..6b438c0e0 100644
      test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
              int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
              int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
+@@ -4618,7 +4686,7 @@ struct test_gated_delta_net : public test_case {
+         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
+         q = ggml_l2_norm(ctx, q, 1e-6f);
+         k = ggml_l2_norm(ctx, k, 1e-6f);
+-        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
++        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K, /*n_rs_batch=*/1);
+         return out;
+     }
+ 
 @@ -10775,6 +10843,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));

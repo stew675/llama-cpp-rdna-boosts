@@ -9,7 +9,7 @@ The **current delivery** is a **15-patch set** (block 00 + blocks 01-14) against
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`):
 blocks 00-14 (`patches/0000-…0014-…`, format-patch of the
-fork's `rdna-boosts` block commits).  **Current regeneration (2026-09-12 (9))**: canonical 15-block tip **`890a9c5b1`** (net tree `0edf654cdea653b9969f866977a541ee4429f846`), clean-apply strict 15/15 with 0 whitespace warnings and the applied tree equal to the canonical one.  Block 14's body changed in this regeneration (its 2026-09-12 (sixth) amendment: the configurable QSA prefill arm (default `0` = QSA prefill always, the documented arch policy) + the `qsa_op_supported()` device query that replaced the mirrored `qsa_kv_native` type list) and every other block body is byte-identical to the previous regeneration apart from the `From <sha>`/`index` lines.  **The beta block-15 patch was re-cut (14th) on this base**: tip `86c7df1f5`, tree `66f0762a2ec19cbc34b1842d1b5984bb82ecec45`.  The previous regeneration was 2026-09-12 (2) (tip `13af95ac1`, block 13's body changed - the RDNA3_5 single-token-only mmvq fusion skip).  The regeneration
+fork's `rdna-boosts` block commits).  **Current regeneration (2026-09-12 (10))**: canonical 15-block tip **`47a9d4d86`** (net tree `c24871386c479865d41476726cf1f01c43b23ea6`), clean-apply strict 15/15 with 0 whitespace warnings and the applied tree equal to the canonical one.  Block **02**'s body changed in this regeneration (its 2026-09-12 amendment: the rollback-bounded chunked threshold `n_rs_batch` + the pre-batch ssm/conv snapshot slot); blocks 03-14 were **replayed** onto it with no conflicts, and their patch bodies are byte-identical to the previous regeneration apart from the `From <sha>`/`index` lines and hunk offsets (checked: all 52 changed lines in `0014` are hunk headers, no content lines).  **The beta block-15 patch was re-cut (15th) on this base**: tip `eb15f3ee1`, tree `ffa3a11c30ba6d42dea2520f402126370df3bbb6`.  The previous regeneration was 2026-09-12 (9) (tip `890a9c5b1`, block 14's body changed - the configurable QSA prefill arm + the `qsa_op_supported()` device query).  The regeneration
 is always run against a canonical fork **rebuilt at the fork point**, because the reference
 `~/llama.cpp` checkout had drifted two upstream master commits past `9113cc188` (`f3f1a8f27`,
 `304665fe7` — SYCL + iGPU-only code) and a `format-patch` there would export those as patches
@@ -166,7 +166,7 @@ per-win measurement tables are in `beta/block-15-campaign-wins/README.md`.
 Apply + regeneration verification (the 14/14 / `[PATCH NN/14]` / `ff2b35f49`
 figures below are the then-current state; block 00 was added 2026-09-10, so the
 current delivery is the 15-patch set `0000`-`0014`,
-tip `890a9c5b1`):
+tip `47a9d4d86`):
 
 - fresh worktree at `9113cc188` -> `scripts/apply-all.sh` (**strict 14/14
   `git am`** for the then-14-patch delivery, zero whitespace warnings) + the beta

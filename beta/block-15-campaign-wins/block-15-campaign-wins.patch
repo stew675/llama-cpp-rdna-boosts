@@ -1,4 +1,4 @@
-From 86c7df1f59e90988755cd2c6fd53afbb9d7410d1 Mon Sep 17 00:00:00 2001
+From eb15f3ee13efdb70a6bcb20c281717c23e6b6c59 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -207,7 +207,7 @@ WORKLOG.md 2026-09-11 (11).
  23 files changed, 1925 insertions(+), 233 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 1a8e68103..8b9ebb315 100644
+index 74032ef18..dfc9b2b7e 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -2518,6 +2518,17 @@ extern "C" {
@@ -1903,7 +1903,7 @@ index b15af7104..1b9e63516 100644
          dst->type == GGML_TYPE_I32;
  }
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 7ee2c06d8..5f6d2fb85 100644
+index 8c323379a..1ca17ad74 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -5578,6 +5578,34 @@ void ggml_flash_attn_ext_set_n_kv_max(
@@ -2055,7 +2055,7 @@ index 7ee2c06d8..5f6d2fb85 100644
  
      return result;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index cf1fcc3e1..fa15a6934 100644
+index 1d35d7812..272878f67 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -36,6 +36,18 @@ struct llm_fused_op_probe {
@@ -2147,7 +2147,7 @@ index cf1fcc3e1..fa15a6934 100644
  llama_context::llama_context(
          const llama_model & model,
                llama_context_params params) :
-@@ -229,6 +304,19 @@ llama_context::llama_context(
+@@ -233,6 +308,19 @@ llama_context::llama_context(
      cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
      cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
  
@@ -2167,7 +2167,7 @@ index cf1fcc3e1..fa15a6934 100644
      cparams.fused_gdn_ar = true;
      cparams.fused_gdn_ch = true;
      cparams.auto_fgdn    = false;
-@@ -409,6 +497,10 @@ llama_context::llama_context(
+@@ -414,6 +502,10 @@ llama_context::llama_context(
              /*.ctx_type  =*/ cparams.ctx_type,
              /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
          };
@@ -2178,7 +2178,7 @@ index cf1fcc3e1..fa15a6934 100644
  
          memory.reset(model.create_memory(params_mem, cparams));
      }
-@@ -527,19 +619,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -532,19 +624,23 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
              return;
          }
  
@@ -2204,7 +2204,7 @@ index cf1fcc3e1..fa15a6934 100644
              GGML_ASSERT(node.il >= 0);
  
              ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
-@@ -559,6 +655,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -564,6 +660,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                  device_mismatch = true;
                  break;
              }
@@ -2234,7 +2234,7 @@ index cf1fcc3e1..fa15a6934 100644
          }
  
          if (device_mismatch) {
-@@ -575,6 +694,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -580,6 +699,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
          cparams.auto_fa = false;
      }
  
@@ -2249,10 +2249,10 @@ index cf1fcc3e1..fa15a6934 100644
          LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", func);
          resolve(llm_fused_op_gdn_ar_probe, cparams.fused_gdn_ar);
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index 08a1a264f..e9ad8fb1c 100644
+index 5854a27e9..26ee97b1c 100644
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
-@@ -39,6 +39,8 @@ struct llama_cparams {
+@@ -40,6 +40,8 @@ struct llama_cparams {
      bool offload_kqv;
      bool flash_attn;
      bool auto_fa;
@@ -2261,7 +2261,7 @@ index 08a1a264f..e9ad8fb1c 100644
      bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
      bool fused_gdn_ch;       // use fused gated delta net (chunked)
      bool auto_fgdn;
-@@ -54,6 +56,9 @@ struct llama_cparams {
+@@ -55,6 +57,9 @@ struct llama_cparams {
      bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
      bool op_offload;
      bool kv_unified;
@@ -3029,7 +3029,7 @@ index c4d8699de..a597a85fc 100644
      void set_input_v_rot(ggml_tensor * dst) const;
  
 diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
-index b5dad83bd..41d769e36 100644
+index cbd5b1e67..a11c4ca77 100644
 --- a/src/llama-memory-hybrid-idx.cpp
 +++ b/src/llama-memory-hybrid-idx.cpp
 @@ -16,6 +16,18 @@
@@ -3051,7 +3051,7 @@ index b5dad83bd..41d769e36 100644
  llama_memory_hybrid_idx::llama_memory_hybrid_idx(
          const llama_model & model,
                              /* attn */
-@@ -57,10 +69,12 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+@@ -58,10 +70,12 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
  
          LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
  
@@ -3065,7 +3065,7 @@ index b5dad83bd..41d769e36 100644
      }()) {
      // incremental block-vector cache (env-gated, default OFF; decode waste fix)
      const char * env_cache = getenv("GGML_CUDA_QSA_INDEXER_CACHE");
-@@ -444,6 +458,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -445,6 +459,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
          ggml_tensor * blk_cells,
          ggml_tensor * blk_pos,
          ggml_tensor * bias,
@@ -3076,7 +3076,7 @@ index b5dad83bd..41d769e36 100644
          const llama_ubatch * ubatch,
          uint32_t ratio,
          bool blk_bias,
-@@ -466,7 +484,32 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -467,7 +485,32 @@ void llama_memory_hybrid_idx::set_input_qsa(
      int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
      int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
      int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
@@ -3110,7 +3110,7 @@ index b5dad83bd..41d769e36 100644
  
      // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
      // from zero, so the bucket alone would pool two sequences into one block
-@@ -625,6 +668,20 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -626,6 +669,20 @@ void llama_memory_hybrid_idx::set_input_qsa(
              group_cells();
          }
  
@@ -3131,7 +3131,7 @@ index b5dad83bd..41d769e36 100644
          GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
  
          int32_t n_bid = 0;
-@@ -684,6 +741,21 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -685,6 +742,21 @@ void llama_memory_hybrid_idx::set_input_qsa(
              cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
          }
  
@@ -3153,7 +3153,7 @@ index b5dad83bd..41d769e36 100644
          for (int64_t ii = 0; ii < n_tps; ++ii) {
              const int64_t      i      = s*n_tps + ii;
              const llama_seq_id seq_id = ubatch->seq_id[i][0];
-@@ -716,7 +788,18 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -717,7 +789,18 @@ void llama_memory_hybrid_idx::set_input_qsa(
              // the tail is an incomplete block and is always visible, as in the reference
              const int64_t tail_start = (q + 1)/r*r;
  
@@ -3172,7 +3172,7 @@ index b5dad83bd..41d769e36 100644
                  // a block sits wholly inside or outside the tail, so one value covers it
                  // the caller adds the attention mask, which drops empty, foreign and future cells
                  float * cur_blk_bias = dst_bias + i*n_blocks;
-@@ -855,6 +938,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
+@@ -856,6 +939,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
          ggml_tensor * blk_cells,
          ggml_tensor * blk_pos,
          ggml_tensor * bias,
@@ -3183,7 +3183,7 @@ index b5dad83bd..41d769e36 100644
          const llama_ubatch * ubatch,
          uint32_t ratio,
          bool blk_bias,
-@@ -862,8 +949,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
+@@ -863,8 +950,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
          int32_t * dst_derived_lim) const {
      GGML_ASSERT(mem != nullptr);
  
@@ -3195,10 +3195,10 @@ index b5dad83bd..41d769e36 100644
  
  ggml_tensor * llama_memory_hybrid_idx_context::get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks) const {
 diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
-index 4b30994d1..c5ce4bd51 100644
+index 907e53ea1..e18c76399 100644
 --- a/src/llama-memory-hybrid-idx.h
 +++ b/src/llama-memory-hybrid-idx.h
-@@ -94,8 +94,19 @@ public:
+@@ -95,8 +95,19 @@ public:
      //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
      // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
      // the caller then adds the attention mask, the only part of the bias that varies within a block
@@ -3219,7 +3219,7 @@ index 4b30994d1..c5ce4bd51 100644
                         bool blk_bias,
                         int32_t * dst_derived_from = nullptr,
                         int32_t * dst_derived_lim  = nullptr) const;
-@@ -186,7 +197,9 @@ public:
+@@ -187,7 +198,9 @@ public:
      uint32_t get_n_stream() const;
  
      void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
@@ -3704,7 +3704,7 @@ index 70e701ca3..18c58e2c7 100644
      }
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 5bde860a8..2c16bcab2 100644
+index d6aed6379..bd2ed57e6 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -7673,9 +7673,10 @@ struct test_flash_attn_ext : public test_case {
