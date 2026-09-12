@@ -788,3 +788,42 @@ The corollary for this project's gate list: for any *fused* op, a purity sweep i
 gate.  Pair it with an independent oracle (a CPU/reference implementation, or a well-tested
 alternative path computing the same math) and keep the oracle in the test suite, not just in a
 one-off measurement.
+
+## 22. `iq4_nl` (F3 step 2, 2026-09-11 (10)): the type is not the only thing an enablement touches
+
+`iq4_nl` is now a first-class FA cache type (block 08's fifth amendment + block 14's fifth), so §20
+applies in full: the diagonal gets its `W = 1..8` sweep on every split and model, the
+`plain == n_max 3 == n_max 7` text gate, the MTP acceptance reading, and - the part §21 added - the
+CPU/backend-op oracle and the perplexity-vs-dense comparison.  Results: pure everywhere, text
+`acd18ad2d55c` (tensor) / `a38a6e2d8efa` (layer) with the f16/`q4_1` controls unmoved, MTP pos-1
+0.757, `FLASH_ATTN_QSA` 22/22 (`iq4_nl` at D=128/gqa=8 **and** at the model geometry D=256/gqa=12),
+perplexity sparse 6.5244 vs dense 6.4930.
+
+Three things this enablement taught that generalise:
+
+* **A type rejected by the FA probe hides *unreachable code paths*, not just slow ones.**  The
+  non-contiguous staging converter (`ggml_get_to_fp16_nc_cuda`) had never listed `iq4_nl`, and
+  `launch_fattn` calls its result unconditionally when K/V is a *view* - i.e. an enablement can turn a
+  dormant `nullptr` into a null-pointer call on the first token.  It was the **backend-op suite** that
+  found it (`-o FLASH_ATTN_EXT` SIGSEGV in `launch_fattn`), because that suite already contained 336
+  `iq4_nl` cases that had only ever been *skipped*.  When a predicate starts accepting a type, assume
+  the type's coverage in *every* consumer of that predicate is stale and run the whole suite.
+* **"The type is 3.4x slower" is a statement about the pre-state, not the type.**  The `iq4_nl`
+  pre-state (2269.8 pp512 / 48.5 tg32 on the 4B) was the *no-FA-at-all* path; with FA it is
+  7931.8/95.0, i.e. within 2 % of f16 on dense models.  Record the pre-state *with the regime*
+  attached, or the old number becomes a false expectation (this amendment's brief predicted exactly
+  this correction, and the qwen4exp numbers needed the same care).
+* **A type-specific cost can live outside the type's kernels - prove it with a profile before
+  optimizing.**  On qwen4exp `iq4_nl` costs ~8-12 % of prefill versus f16/`q4_0`/`q4_1` at pp8192+
+  (`q4_0` has the identical 18-byte layout and is flat), which looks like a dequant problem.  It is
+  not: `rocprofv3` puts the QSA kernel's `iq4_nl` instantiation within 1.3 % of `q4_0`'s (same
+  VGPR/LDS/occupancy), the dequant kernels at an identical 1.2 ms, the traced kernel *sum* lower, and
+  the *executed graph* identical (1010 nodes, 0 diff) - so the delta is host/launch-side.  The
+  instrument that settles it is `rocprofv3 --kernel-trace` + a `[GD]`-style full-graph dump (both
+  cheap); the trap is to "optimize" the dequant on a hunch and call the result a fix.  Follow-up filed
+  in `TODO.md`.
+* **A change in one op can be visible only through another type.**  The Block 15 beta re-cut turned
+  out to break its own oracle arm (`LLAMA_QSA_SPARSE_FA=0`, PPL ~1.05 for *every* type) - a defect no
+  same-seed/MTP gate can see, and one that only surfaced because this session's gate list runs the
+  perplexity oracle as a matter of course.  Keep the oracle in the list, even when its answer is
+  expected to be "unchanged".

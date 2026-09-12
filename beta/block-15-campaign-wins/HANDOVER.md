@@ -24,6 +24,22 @@
 > `llama_cparams::type_k/type_v`), which is a no-op for every f16/q8_0 beta config: the tree builds and
 > the beta output is byte-identical to the delivery's at the gate configs (qwen4exp f16 plain
 > `804de0576868`; 27B f16 `n_max 3` acceptance `0.82716`), so the recorded numbers stand.
+> **Re-cut an eighth time 2026-09-11 (10)** after block 08's fifth amendment (the `iq4_nl` FA
+> enablement: predicate, vec dispatch, the 15 missing `fattn-vec-instance-iq4_nl-*.cu` files, the three
+> CMake default lists, `dequantize_q4_nl` and the three non-contiguous conversion switches) plus the
+> matching block-14 entries (QSA kernel + CPU reference + `qsa_kv_native` + the tensor-split gate + the
+> engine test list): base `6d3155faa` (tree `0c3f0c2c2f4e7439d9489d45573a4021a8eee106`) -> **beta commit
+> `d0f71b2e8`**, tree `39540b7f4fd8e8569dee64bfa3ee84bf1b20e75d`, patch **3 787 lines**.  Same single
+> conflict as the seventh re-cut (`qwen4exp_qsa_sparse()` must accept `GGML_TYPE_IQ4_NL`) — use
+> `git am -3`; the test file needed no fix (block 15's body already carries `nullptr, nullptr`).  The
+> tree builds clean, the patch round-trips, and the gate sweep matches the delivery (qwen4exp f16 plain
+> `804de0576868`, q4_1 plain `886292b17a93`, f16 `n_max 3` `0.47009`, `iq4_nl` `0.52727`, 27B f16
+> `0.82716`, width purity per split/type, `FLASH_ATTN_QSA` 22/22, `GATED_DELTA_NET` 46/46,
+> `FLASH_ATTN_EXT` 5940/5940, `LLAMA_QSA_OFF=1` PPL `6.5376`) **except two iq4_nl/arm findings**:
+> `LLAMA_QSA_SPARSE_FA=0` is broken in block 15 for *every* KV type (PPL `1.0558` vs the delivery's
+> `6.49–6.55`, pre-existing, no gate fixes it) — a promotion blocker, since that arm is the quality
+> oracle — and W2's derived bias is not bit-exact for `iq4_nl` (benign: identical sparse-arm PPL).  See
+> `README.md` (eighth re-cut) and `BETA-TESTING.md` §4c/§4d.
 > **Re-cut a seventh time 2026-09-11 (9)** after the **fourth** block-14 amendment (the QSA quantized-KV
 > enablement + the K/V-head chunking fix): base `a0cd6ce02` (tree `0966e66731`) -> **beta commit
 > `5a0734c9d`**, tree `6b1155b68b1741d7e7c6e8f80b88ed90ce406bd6`, patch **3 787 lines**.  One real

@@ -54,8 +54,15 @@ Block 15 is STAGED in `beta/block-15-campaign-wins/`, not promoted.
   capturing the same work, not a regression.  Re-check whether the gate+up+GLU arm still has a
   unique win before any future tuning.
 - **Block 15 is STAGED in `beta/block-15-campaign-wins/`**, NOT in the delivery
-  (`beta/block-15-campaign-wins/block-15-campaign-wins.patch`, beta patch tip `377f8e790`,
-  including the 2026-09-10 V5 and RDNA3_5 amendments).  Six wins,
+  (`beta/block-15-campaign-wins/block-15-campaign-wins.patch`, beta patch **8th re-cut 2026-09-11 (10)** on
+  base `6d3155faa` -> beta commit `d0f71b2e8`, tree `39540b7f4fd8e8569dee64bfa3ee84bf1b20e75d`).
+  **PROMOTION BLOCKER (found 2026-09-11 (10)): `LLAMA_QSA_SPARSE_FA=0` (the dense masked path, i.e. this
+  repo's quality ORACLE) gives PPL `1.0558` on qwen4exp for every KV type where the delivery gives
+  `6.49-6.55`; block-15-inherent (the 7th re-cut reproduces it) and no block-15 gate fixes it (all of
+  `LLAMA_KQ_MASK_DERIVED=0`, `GGML_QSA_DERIVED_*=0`, `GGML_QSA_SCORE_MEM=0`, `LLAMA_QSA_KEYS_ONLY=0`
+  together still give `1.0558`), while the production sparse arm and `LLAMA_QSA_OFF=1` are byte-identical
+  to the delivery.  Also: W2's derived bias is not bit-exact for `iq4_nl` (benign - identical sparse-arm
+  PPL).  Full evidence + repro: `beta/block-15-campaign-wins/BETA-TESTING.md` §4c/§4d.  Six wins,
   each with an env A/B gate (V4 is opt-in): W1 QSA score-chain (`GGML_QSA_SCORE_MEM`), W2 derived QSA bias
   + visibility + the input-fill null guards (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), W3 keys-only
   indexer cache (`LLAMA_QSA_KEYS_ONLY`), W4 ggml-alloc unused-view release (no gate; `ab/w4-revert.patch`),
@@ -108,12 +115,12 @@ Block 15 is STAGED in `beta/block-15-campaign-wins/`, not promoted.
 - **Fork/canonical state**: the working checkout's `rdna-boosts` is a local rebuild and must NOT be used
   for regeneration if it sits on a master newer than the fork point (it would export `f3f1a8f27`
   + `304665fe7` as patches 0001/0002).  The canonical 15-block chain used for the delivery ends at the
-  block-14 commit `a0cd6ce02` (rebuilt at `9113cc188`, net tree `0c9dece6b`; block 02 amended 2026-09-11 with the
+  block-14 commit `6d3155faa` (rebuilt at `9113cc188`, net tree `0c3f0c2c2f4e7439d9489d45573a4021a8eee106`; block 02 amended 2026-09-11 with the
   K-independent whole-batch chunked GDN prefill — free, gate removed, + rollback guard; block 08 with the
-  FA kernel-family fix + the quantized-KV-type enablement — see F3 below; block 13 with the two decode/verify
-  band fixes; block 14 with the QSA decode arm + the QSA-vs-KV-type arm gate + the tensor-split gate
-  narrowing); `make-patches.sh`
-  default tip = `a0cd6ce02`.
+  FA kernel-family fix + the quantized-KV-type enablement + the `iq4_nl` enablement — see F3 below;
+  block 13 with the two decode/verify band fixes; block 14 with the QSA decode arm, the QSA-vs-KV-type arm
+  gate, the tensor-split gate narrowing and the `iq4_nl` QSA/CPU-oracle/test entries); `make-patches.sh`
+  default tip = `6d3155faa`.
   The beta block-15 patch is applied manually on top of that tree.
 - Superseded/still-useful artifacts: the work branch `wip/block15-campaign-wins` (`b26ae06f0`) and
   `wip/arch-independent-memory/snapshots/fork-tree-W1-W2-V3-V4-2026-09-10.patch` remain as the pre-merge
@@ -414,12 +421,22 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   16 of 24 heads (perplexity 7.33 -> 6.53 = the dense masked reference).  The chunking is now
   `min(QSA_MAX_HEADS, gqa_ratio)`, the missing CPU reference for the new types plus a
   `FLASH_ATTN_QSA` backend-op test (18 cases) were added (see `GREEDY-PURITY.md` §21 for the
-  instruments and the "why it survived" analysis).  Follow-ups it left behind: (i) **F3 step 2 =
-  `iq4_nl`** (the same shape: `dequantize_V_iq4_nl` + the predicate/instance/`qsa_kv_native` entries +
-  the same sweeps) — **it is the next session's task and has its own brief:
-  `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-f3-step2-iq4_nl.md`** (measured pre-state
-  2269.8/48.5 pp512/tg32 on the 4B -> ~7700/95 expected; the 288 MiB smallest-cache win; the
-  `TYPES_KV`/generator trap; the two-block amendment); (ii) the QSA **prefill** sparse-vs-dense crossover is not depth-configurable today
+  instruments and the "why it survived" analysis).  **Step 2 (`iq4_nl`) is DONE 2026-09-11 (10)**
+  (fifth block-08 amendment + fifth block-14 amendment; brief
+  `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-f3-step2-iq4_nl.md`): the 4B flips
+  2269.8/48.5 -> **7931.8/95.0** pp512/tg32 (q4_0 7913.1/96.8, f16 7981.7/99.7), dense models are
+  unchanged (27B 3-GPU tensor pp8192/16384 within 0.7 % of f16; 4B pp8192 -2 %), the cache is the
+  smallest of the set (288 MiB = q4_0 vs f16's 1024 at c=32768; -72 %), `FLASH_ATTN_EXT`
+  **5935/5935** (the 336 previously-skipped `iq4_nl` cases now run) and `FLASH_ATTN_QSA` **22/22**
+  (two new model-geometry cases: D=256, gqa=12).  Two things the enablement found: (1) the
+  **non-contiguous FA staging path had no `iq4_nl` converter at all** (`ggml_get_to_fp16_nc_cuda`
+  returned nullptr -> a `GRAB_ABORT`/SIGSEGV the moment a K/V *view* reached the tile kernel, now
+  `dequantize_q4_nl` in all three NC switches) - it was unreachable only because the type had no FA
+  at all; (2) the qwen4exp **prefill** arm is ~8-12 % slower for `iq4_nl` than for f16/q4_0/q4_1 at
+  pp8192+ (`q4_0` has the *same* byte layout and is flat), and profiling shows it is **not** the new
+  code (the QSA kernel's `iq4_nl` instantiation is within 1.3 % of `q4_0`'s, the dequant kernels are
+  identical in time, VGPR/LDS/occupancy equal, the executed graph identical) - followed up below.
+  Follow-ups it left behind: (i) the QSA **prefill** sparse-vs-dense crossover is not depth-configurable today
   (measured on the reference `-sm tensor`: dense wins pp8192 by ~4.7 %, parity at pp16384, sparse wins
   pp32768 by +14.5 %), so a `LLAMA_QSA_DENSE_PREFILL_UNTIL`-style gate is the natural next knob —
   tensor-tuned, per the maintainer's rule that the crossover policy follows the tensor split; (iii) the
@@ -455,6 +472,10 @@ evidence and repro tooling: **`wip/kv-quant-purity-followups/README.md`** (+ `to
   (`vec_dot_iq4_nl_q8_1`, `vecdotq.cuh:1580`) but the V side needs a dequantize to f16 and there is
   **no CUDA `dequantize_iq4_nl`** — and since mixed K/V types are rejected, that is a real
   dequant+instances+staging job (upstream-able).  Plan + build-cost warning in the handover §8.
+  **Update 2026-09-11 (10): DONE — see the F3 block above** (the K-side `vec_dot_fattn_vec_KQ_iq4_nl`,
+  the V-side `dequantize_V_iq4_nl`, the 15 missing vec instances, `dequantize_q4_nl` for the
+  non-contiguous converters and the QSA/CPU-oracle/test entries all landed; the "3.4x slow" figure was
+  the *no-FA-at-all* pre-state, now 2 % behind f16 on dense models).
   Details of the type: q4_1/q5_0/q5_1/iq4_nl
   are pure and 1800–2400 MiB (vs 3400 q8_0 / 6400 f16) but run 2197–2293 pp512 / 56–64 tg32 versus
   7713–7838 / 95–99, because they have no native FA path (F16 staging scratch).  Block 15 already

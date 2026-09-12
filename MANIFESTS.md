@@ -9,12 +9,15 @@ The **current delivery** is a **15-patch set** (block 00 + blocks 01-14) against
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`):
 blocks 00-14 (`patches/0000-…0014-…`, format-patch of the
-fork's `rdna-boosts` block commits).  **Current regeneration (2026-09-11 (9))**: canonical 15-block
-tip **`a0cd6ce02`** (net tree `0966e66731a4c3da85ffd96525688865a89242cd`), clean-apply strict 15/15
-with 0 whitespace warnings and the applied tree equal to the canonical one.  Block 14's body changed
-in this regeneration (its fourth 2026-09-11 amendment: the QSA quantized-KV enablement + the K/V-head
-chunking fix); block 15's beta patch was re-cut for it (7th re-cut) and every other block body is
-byte-identical to the 2026-09-11 (8) regeneration apart from the `From <sha>` line.  The regeneration
+fork's `rdna-boosts` block commits).  **Current regeneration (2026-09-11 (10))**: canonical 15-block
+tip **`6d3155faa`** (net tree `0c3f0c2c2f4e7439d9489d45573a4021a8eee106`), clean-apply strict 15/15
+with 0 whitespace warnings and the applied tree equal to the canonical one.  Block 08's body changed
+in this regeneration (its fifth 2026-09-11 amendment: the `iq4_nl` FA enablement -- the predicate, the
+15 new `fattn-vec-instance-iq4_nl-*.cu` files, `dequantize_q4_nl` and the three non-contiguous
+converters) and block 14's did too (its fifth: the QSA kernel/CPU-reference/`qsa_kv_native`/
+tensor-split-gate/test entries); block 15's beta patch was re-cut for it (8th re-cut) and every other
+block body is byte-identical to the 2026-09-11 (9) regeneration apart from the `From <sha>` and
+`index` lines (block 13 touches `generate_cu_files.py`, which block 08's amendment also edits).  The regeneration
 is always run against a canonical fork **rebuilt at the fork point**, because the reference
 `~/llama.cpp` checkout had drifted two upstream master commits past `9113cc188` (`f3f1a8f27`,
 `304665fe7` — SYCL + iGPU-only code) and a `format-patch` there would export those as patches
@@ -170,7 +173,7 @@ per-win measurement tables are in `beta/block-15-campaign-wins/README.md`.
 
 Apply + regeneration verification (the 14/14 / `[PATCH NN/14]` / `ff2b35f49`
 figures below are the then-current state; block 00 was added 2026-09-10, so the
-current delivery is the 15-patch set `0000`-`0014`, tip `a0cd6ce02`):
+current delivery is the 15-patch set `0000`-`0014`, tip `6d3155faa`):
 
 - fresh worktree at `9113cc188` -> `scripts/apply-all.sh` (**strict 14/14
   `git am`** for the then-14-patch delivery, zero whitespace warnings) + the beta

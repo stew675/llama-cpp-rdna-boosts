@@ -1,4 +1,4 @@
-From 5a0734c9d1ec666102b911e88527bfb38acdd59b Mon Sep 17 00:00:00 2001
+From d0f71b2e84bf8fb8ed305336e4cb01344cc43e74 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -336,10 +336,10 @@ index a39b4f6ca..5ad0a5027 100644
              } break;
              case GGML_OP_INDEXER_SCORE: {
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index f4c89292c..f89b29a2c 100644
+index 451f66f5d..60ebfc304 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -8612,6 +8612,21 @@ void ggml_compute_forward_top_k(
+@@ -8618,6 +8618,21 @@ void ggml_compute_forward_top_k(
      }
  }
  
@@ -361,7 +361,7 @@ index f4c89292c..f89b29a2c 100644
  static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          const ggml_compute_params * params,
          ggml_tensor * dst,
-@@ -8626,6 +8641,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8632,6 +8647,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
      const ggml_tensor * mask  = dst->src[3];
      const ggml_tensor * sinks = dst->src[4];
  
@@ -372,7 +372,7 @@ index f4c89292c..f89b29a2c 100644
      GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
      GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
      GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
-@@ -8737,7 +8756,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8743,7 +8762,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          // ref: https://arxiv.org/pdf/2112.05682.pdf
  
          for (int64_t ic = ic_start; ic < ic_end; ++ic) {
@@ -382,7 +382,7 @@ index f4c89292c..f89b29a2c 100644
              if (mv == -INFINITY) {
                  continue;
              }
-@@ -8860,6 +8880,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+@@ -8866,6 +8886,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
      const ggml_tensor * mask  = dst->src[3];
      const ggml_tensor * sinks = dst->src[4];
  
@@ -393,7 +393,7 @@ index f4c89292c..f89b29a2c 100644
      GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
      GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
      GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
-@@ -8997,12 +9021,14 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+@@ -9003,12 +9027,14 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
              const int kv_tile = (int)std::min((int64_t)KV_TILE_SZ, nek1 - ic);
  
              // skip the tile entirely if all the masks are -inf
@@ -411,7 +411,7 @@ index f4c89292c..f89b29a2c 100644
                          if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
                              can_skip = false;
                          }
-@@ -9379,6 +9405,12 @@ static void ggml_compute_forward_flash_attn_qsa_f32(
+@@ -9385,6 +9411,12 @@ static void ggml_compute_forward_flash_attn_qsa_f32(
      const ggml_tensor * idx  = dst->src[3];
      const ggml_tensor * mask = dst->src[4];
  
@@ -424,7 +424,7 @@ index f4c89292c..f89b29a2c 100644
      GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
      GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
      GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
-@@ -12580,10 +12612,14 @@ static void ggml_compute_forward_indexer_topk_impl(
+@@ -12592,10 +12624,14 @@ static void ggml_compute_forward_indexer_topk_impl(
      const ggml_tensor * score    = dst->src[0];
      const ggml_tensor * cell_blk = dst->src[1];
      const ggml_tensor * additive = dst->src[2];
@@ -440,7 +440,7 @@ index f4c89292c..f89b29a2c 100644
      GGML_ASSERT(dst->type      == GGML_TYPE_I32);
  
      const int k = ggml_get_op_params_i32(dst, 0);
-@@ -12603,8 +12639,29 @@ static void ggml_compute_forward_indexer_topk_impl(
+@@ -12615,8 +12651,29 @@ static void ggml_compute_forward_indexer_topk_impl(
      const int64_t s0 = 0;
      GGML_UNUSED(s0);
      const auto cell_value = [&](int64_t c, int64_t row) -> float {
@@ -473,7 +473,7 @@ index f4c89292c..f89b29a2c 100644
              const float * add_d = (const float *) additive->data;
              return sc + add_d[c + row*n_kv];
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 22eec7d57..07938c41d 100644
+index 12eab7745..ecb034f3f 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -39,7 +39,15 @@ typedef void (* fattn_kernel_t)(
@@ -671,7 +671,7 @@ index 22eec7d57..07938c41d 100644
  template <int D, int nthreads>
  static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
      const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
-@@ -989,6 +1168,11 @@ void launch_fattn(
+@@ -1078,6 +1257,11 @@ void launch_fattn(
      const ggml_tensor * mask  = dst->src[3];
      const ggml_tensor * sinks = dst->src[4];
  
@@ -683,7 +683,7 @@ index 22eec7d57..07938c41d 100644
      ggml_tensor * KQV = dst;
  
      GGML_ASSERT(Q->type == GGML_TYPE_F32);
-@@ -1006,8 +1190,19 @@ void launch_fattn(
+@@ -1095,8 +1279,19 @@ void launch_fattn(
      const int cc  = ggml_cuda_info().devices[id].cc;
      const int nsm = ggml_cuda_info().devices[id].nsm;
  
@@ -704,7 +704,7 @@ index 22eec7d57..07938c41d 100644
  
      ggml_cuda_pool_alloc<int>    KV_max(pool);
      ggml_cuda_pool_alloc<float>  dst_tmp(pool);
-@@ -1023,7 +1218,7 @@ void launch_fattn(
+@@ -1112,7 +1307,7 @@ void launch_fattn(
      size_t nb22 = V->nb[2];
      size_t nb23 = V->nb[3];
  
@@ -713,7 +713,7 @@ index 22eec7d57..07938c41d 100644
          const size_t bs = ggml_blck_size(K->type);
          const size_t ts = ggml_type_size(K->type);
  
-@@ -1051,7 +1246,7 @@ void launch_fattn(
+@@ -1140,7 +1335,7 @@ void launch_fattn(
          K_data = (char *) K_f16;
      }
  
@@ -722,7 +722,7 @@ index 22eec7d57..07938c41d 100644
          if (V_is_K_view) {
              V_data = K_data;
              nb21   = nb11;
-@@ -1244,7 +1439,11 @@ void launch_fattn(
+@@ -1333,7 +1528,11 @@ void launch_fattn(
          K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
          nb21, nb22, nb23,
          mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
@@ -1213,7 +1213,7 @@ index 8428b01f7..d178ebf40 100644
      GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
          max_bias, m0, m1, n_head_log2, logit_softcap,
 diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
-index 31d4a1ce7..bbc61d8b4 100644
+index 656e0002a..afe4f31cb 100644
 --- a/ggml/src/ggml-cuda/fattn-qsa.cu
 +++ b/ggml/src/ggml-cuda/fattn-qsa.cu
 @@ -50,6 +50,10 @@ static __global__ void flash_attn_qsa(
@@ -1584,7 +1584,7 @@ index 57a285565..21c8077f8 100644
  #ifdef FLASH_ATTN_AVAILABLE
      const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 38a977326..312d6a7fc 100644
+index 00c46f9d5..b11f6432c 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -166,6 +166,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
@@ -1638,7 +1638,7 @@ index 38a977326..312d6a7fc 100644
              GGML_ASSERT(use_gqa_opt);
  
              GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
-@@ -531,7 +539,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -557,7 +565,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
  
      // The effective batch size for the kernel can be increased by gqa_ratio.
      // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
@@ -1647,7 +1647,7 @@ index 38a977326..312d6a7fc 100644
      for (const ggml_tensor * t : {Q, K, V, mask}) {
          if (t == nullptr || ggml_is_quantized(t->type)) {
              continue;
-@@ -730,13 +738,23 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -756,13 +764,23 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
              // the remaining types to F16. BF16 K/V needs native BF16 support.
              const bool use_bf16 = K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_BF16 &&
                  bf16_mma_hardware_available(ggml_cuda_info().devices[device].cc);
@@ -1677,7 +1677,7 @@ index 38a977326..312d6a7fc 100644
          case BEST_FATTN_KERNEL_VEC:
              need_f16_K = K->type == GGML_TYPE_F32;
              need_f16_V = V->type == GGML_TYPE_F32;
-@@ -769,5 +787,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -795,5 +813,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
  }
  
  bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
@@ -2040,7 +2040,7 @@ index 7ee2c06d8..5f6d2fb85 100644
  
      return result;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 7df231909..ba1689502 100644
+index 71be86089..f1783471e 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -36,6 +36,18 @@ struct llm_fused_op_probe {
@@ -3216,7 +3216,7 @@ index 4b30994d1..c5ce4bd51 100644
                         int32_t * dst_derived_from = nullptr,
                         int32_t * dst_derived_lim  = nullptr) const;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 83476eeec..02bcc6c2d 100644
+index 8c4076307..5b4015b41 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -935,20 +935,104 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
@@ -3273,7 +3273,7 @@ index 83476eeec..02bcc6c2d 100644
 +        return env == nullptr || std::atoi(env) != 0;
 +    }();
 +    // The fused sparse kernel reads the K/V cache rows itself - F16/BF16 natively, and
-+    // Q8_0/q4_0/q4_1/q5_0/q5_1 by dequantizing them while a tile is staged.  The
++    // Q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl by dequantizing them while a tile is staged.  The
 +    // authoritative list of accepted types is ggml_cuda_flash_attn_qsa_supported() (the same
 +    // set the backend exposes for GGML_OP_FLASH_ATTN_QSA), and this gate must stay in lockstep
 +    // with it.  Any other cache type must take the dense masked path instead (the same path as
@@ -3285,7 +3285,7 @@ index 83476eeec..02bcc6c2d 100644
 +    const bool kv_native = cparams.type_k == GGML_TYPE_F16  || cparams.type_k == GGML_TYPE_BF16 ||
 +                           cparams.type_k == GGML_TYPE_Q8_0 || cparams.type_k == GGML_TYPE_Q4_0 ||
 +                           cparams.type_k == GGML_TYPE_Q4_1 || cparams.type_k == GGML_TYPE_Q5_0 ||
-+                           cparams.type_k == GGML_TYPE_Q5_1;
++                           cparams.type_k == GGML_TYPE_Q5_1 || cparams.type_k == GGML_TYPE_IQ4_NL;
 +    return enabled && cparams.flash_attn && kv_native;
 +}
 +
@@ -3625,7 +3625,7 @@ index 83476eeec..02bcc6c2d 100644
 -        return env == nullptr || std::atoi(env) != 0;
 -    }();
 -    // The fused sparse kernel reads the K/V cache rows itself - F16/BF16 natively, and
--    // Q8_0/q4_0/q4_1/q5_0/q5_1 by dequantizing them while a tile is staged.  The
+-    // Q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl by dequantizing them while a tile is staged.  The
 -    // authoritative list of accepted types is ggml_cuda_flash_attn_qsa_supported()
 -    // (it mirrors the kernel's load dispatch).  Every other cache type must
 -    // take the dense masked path below instead: an unsupported qsa op is not split
@@ -3640,7 +3640,7 @@ index 83476eeec..02bcc6c2d 100644
 -    const bool qsa_kv_native = k->type == GGML_TYPE_F16  || k->type == GGML_TYPE_BF16 ||
 -                               k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0 ||
 -                               k->type == GGML_TYPE_Q4_1 || k->type == GGML_TYPE_Q5_0 ||
--                               k->type == GGML_TYPE_Q5_1;
+-                               k->type == GGML_TYPE_Q5_1 || k->type == GGML_TYPE_IQ4_NL;
 -    const bool qsa_sparse = qsa_sparse_env && cparams.flash_attn && qsa_kv_native;
 -
      ggml_tensor * cur;
@@ -3672,7 +3672,7 @@ index 83476eeec..02bcc6c2d 100644
      }
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 750c93f16..d5f8aef3e 100644
+index 5bde860a8..2c16bcab2 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -7673,9 +7673,10 @@ struct test_flash_attn_ext : public test_case {

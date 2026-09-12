@@ -147,18 +147,20 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `a0cd6ce02`, net tree
-  `0966e66731a4c3da85ffd96525688865a89242cd`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `6d3155faa`, net tree
+  `0c3f0c2c2f4e7439d9489d45573a4021a8eee106`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the whole-batch
 K-independent chunked GDN prefill; block 08 amended 2026-09-11 with the
-decode/verify FA kernel-family fix and again with the quantized-KV-type
-enablement (`q4_1`/`q5_0`/`q5_1`); block 13 amended 2026-09-11 with the MoE
+decode/verify FA kernel-family fix, again with the quantized-KV-type
+enablement (`q4_1`/`q5_0`/`q5_1`), and again with the `iq4_nl` enablement (the predicate, the 15
+new `fattn-vec-instance-iq4_nl-*.cu` files, `dequantize_q4_nl` and the three non-contiguous
+converters); block 13 amended 2026-09-11 with the MoE
 decode/verify mmvq band and again with the fused shared-expert epilogue band;
 block 14 amended 2026-09-11 with the
 hyper-connection decode/verify band fix, again with the QSA decode-arm
-band, and again with the QSA-vs-KV-type arm gate + the tensor-split gate
-narrowing), which is what
+band, again with the QSA-vs-KV-type arm gate + the tensor-split gate
+narrowing, and again with the `iq4_nl` QSA/CPU-oracle/test entries), which is what
 `scripts/make-patches.sh`'s default tip refers
 to; always regenerate from a canonical fork rebuilt at the fork point.
 **Block 15 (the attention-memory campaign) is NOT in the delivery** -- it
@@ -578,7 +580,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `a0cd6ce02`): `git format-patch --start-number 0` the block
+blocks tip `6d3155faa`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -587,7 +589,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `a0cd6ce02`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `6d3155faa`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

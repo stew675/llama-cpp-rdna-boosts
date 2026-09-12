@@ -1264,10 +1264,18 @@ index 99b7d5afa..73e582acd 100644
  #endif
  
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 266261c5e..f4c89292c 100644
+index 266261c5e..451f66f5d 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -3,6 +3,7 @@
+@@ -1,8 +1,15 @@
++// The ggml-common.h tables (kvalues_iq4nl, ...) sit behind GGML_COMMON_IMPL_*; the
++//   declaration side of that header arrives through quants.h below, so defining the
++//   impl variant here is what makes the tables visible - the flash_attn_qsa reference
++//   reads kvalues_iq4nl for iq4_nl.  Same idiom as ggml-cpu/repack.cpp and iqp.cpp.
++#define GGML_COMMON_IMPL_CPP
++
+ #include "ops.h"
+ 
  #include "ggml-cpu.h"
  #include "ggml-impl.h"
  #include "binary-ops.h"
@@ -1275,7 +1283,7 @@ index 266261c5e..f4c89292c 100644
  #include "simd-gemm.h"
  #include "ggml.h"
  #include "unary-ops.h"
-@@ -9362,6 +9363,164 @@ void ggml_compute_forward_flash_attn_ext(
+@@ -9362,6 +9369,170 @@ void ggml_compute_forward_flash_attn_ext(
      }
  }
  
@@ -1367,6 +1375,12 @@ index 266261c5e..f4c89292c 100644
 +                const int q = ((blk->qs[j % (QK5_1/2)] >> (4*(j/(QK5_1/2)))) & 0x0F) | (((blk->qh[j/8] >> (j%8)) & 0x01) << 4);
 +                return ggml_fp16_to_fp32(blk->d) * q + ggml_fp16_to_fp32(blk->m);
 +            }
++            case GGML_TYPE_IQ4_NL: {
++                const block_iq4_nl * blk = (const block_iq4_nl *) (row + (d/QK4_NL)*sizeof(block_iq4_nl));
++                const int j = (int) (d % QK4_NL);
++                const int q = (blk->qs[j % (QK4_NL/2)] >> (4*(j/(QK4_NL/2)))) & 0x0F;
++                return ggml_fp16_to_fp32(blk->d) * kvalues_iq4nl[q];
++            }
 +            default:
 +                GGML_ABORT("unsupported K/V type for flash_attn_qsa");
 +        }
@@ -1440,7 +1454,7 @@ index 266261c5e..f4c89292c 100644
  // ggml_compute_forward_flash_attn_back
  
  static void ggml_compute_forward_flash_attn_back_f32(
-@@ -12162,3 +12321,328 @@ void ggml_compute_forward_lightning_indexer(
+@@ -12162,3 +12333,328 @@ void ggml_compute_forward_lightning_indexer(
          }
      }
  }
@@ -1792,10 +1806,10 @@ index 4c1642a67..259f418a4 100644
  void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
-index 10828ad81..37f0e85a6 100644
+index 10828ad81..e4c356515 100644
 --- a/ggml/src/ggml-cuda/CMakeLists.txt
 +++ b/ggml/src/ggml-cuda/CMakeLists.txt
-@@ -120,6 +120,9 @@ if (CUDAToolkit_FOUND)
+@@ -120,8 +120,12 @@ if (CUDAToolkit_FOUND)
          list(APPEND GGML_SOURCES_CUDA
              template-instances/fattn-vec-instance-f16-f16.cu
              template-instances/fattn-vec-instance-q4_0-q4_0.cu
@@ -1803,8 +1817,12 @@ index 10828ad81..37f0e85a6 100644
 +            template-instances/fattn-vec-instance-q5_0-q5_0.cu
 +            template-instances/fattn-vec-instance-q5_1-q5_1.cu
              template-instances/fattn-vec-instance-q8_0-q8_0.cu
-             template-instances/fattn-vec-instance-bf16-bf16.cu)
+-            template-instances/fattn-vec-instance-bf16-bf16.cu)
++            template-instances/fattn-vec-instance-bf16-bf16.cu
++            template-instances/fattn-vec-instance-iq4_nl-iq4_nl.cu)
      endif()
+ 
+     ggml_add_backend_library(ggml-cuda
 diff --git a/ggml/src/ggml-cuda/allreduce-hip.cu b/ggml/src/ggml-cuda/allreduce-hip.cu
 new file mode 100644
 index 000000000..e46b4ab8c
@@ -3731,11 +3749,183 @@ index 6df89013c..408cbce3d 100644
      if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
          const T * src0_d = (const T *) src0->data;
          const T * src1_d = (const T *) src1->data;
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index 360c614a4..b1bf5fbf7 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -641,6 +641,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
+             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
+         case GGML_TYPE_Q4_1:
+             return dequantize_block_cuda<QK4_1, QR4_1, dequantize_q4_1>;
++        case GGML_TYPE_IQ4_NL:
++            return dequantize_block_cuda<QK4_NL, QR4_NL, dequantize_q4_nl>;
+         case GGML_TYPE_Q5_0:
+             return dequantize_block_cuda<QK5_0, QR5_0, dequantize_q5_0>;
+         case GGML_TYPE_Q5_1:
+@@ -666,6 +668,8 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
+             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
+         case GGML_TYPE_Q4_1:
+             return dequantize_block_cuda<QK4_1, QR4_1, dequantize_q4_1>;
++        case GGML_TYPE_IQ4_NL:
++            return dequantize_block_cuda<QK4_NL, QR4_NL, dequantize_q4_nl>;
+         case GGML_TYPE_Q5_0:
+             return dequantize_block_cuda<QK5_0, QR5_0, dequantize_q5_0>;
+         case GGML_TYPE_Q5_1:
+@@ -691,6 +695,8 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
+             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
+         case GGML_TYPE_Q4_1:
+             return dequantize_block_cuda<QK4_1, QR4_1, dequantize_q4_1>;
++        case GGML_TYPE_IQ4_NL:
++            return dequantize_block_cuda<QK4_NL, QR4_NL, dequantize_q4_nl>;
+         case GGML_TYPE_Q5_0:
+             return dequantize_block_cuda<QK5_0, QR5_0, dequantize_q5_0>;
+         case GGML_TYPE_Q5_1:
+diff --git a/ggml/src/ggml-cuda/dequantize.cuh b/ggml/src/ggml-cuda/dequantize.cuh
+index 651524be7..a8cf54eb5 100644
+--- a/ggml/src/ggml-cuda/dequantize.cuh
++++ b/ggml/src/ggml-cuda/dequantize.cuh
+@@ -57,6 +57,19 @@ static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const in
+     v.y = (v.y - 8.0f) * d;
+ }
+ 
++static __device__ __forceinline__ void dequantize_q4_nl(const void * vx, const int64_t ib, const int iqs, float2 & v){
++    const block_iq4_nl * x = (const block_iq4_nl *) vx;
++
++    const float d = x[ib].d;
++
++    const int vui = x[ib].qs[iqs];
++
++    // Same nibble layout as q4_0 (byte iqs carries elements iqs and iqs + QK4_NL/2) but the
++    //   codes index kvalues_iq4nl instead of being centred on 8.
++    v.x = d * kvalues_iq4nl[vui & 0xF];
++    v.y = d * kvalues_iq4nl[vui >> 4];
++}
++
+ static __device__ __forceinline__ void dequantize_q4_1(const void * vx, const int64_t ib, const int iqs, float2 & v){
+     const block_q4_1 * x = (const block_q4_1 *) vx;
+ 
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 7442bc22a..22eec7d57 100644
+index 7442bc22a..12eab7745 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
-@@ -1167,13 +1167,21 @@ void launch_fattn(
+@@ -300,6 +300,48 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_1(
+     return sum;
+ }
+ 
++// K side of the vector (per-(K,V)-pair) flash-attention kernel for iq4_nl.  Same index
++//   arithmetic and scale handling as q4_0, but the 4-bit codes are values in kvalues_iq4nl
++//   rather than q-8, so they must be expanded through the table before the dp4a (the same
++//   idiom the mmvq iq4_nl kernel uses); there is no bias term to correct for.
++template <int D, int nthreads>
++static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_iq4_nl(
++    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
++
++    const block_iq4_nl * K_iq4_nl = (const block_iq4_nl *) K_c;
++    GGML_UNUSED(Q_v);
++
++    float sum = 0.0f;
++
++#pragma unroll
++    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
++        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
++
++        const int ib    = k_KQ /  QI8_1;
++        const int iqs4  = k_KQ %  QI4_0;
++        const int shift = k_KQ & (QI8_1/2);
++
++        int v;
++        ggml_cuda_memcpy_1<sizeof(int), 2>(&v, K_iq4_nl[ib].qs + sizeof(int)*iqs4);
++        v = (v >> shift) & 0x0F0F0F0F;
++
++        // .x holds the looked-up values of the low nibbles (the four elements this
++        //   thread's int covers), .y the high ones (the +QK4_NL/2 half), which `shift`
++        //   has already zeroed here - so only .x is needed, exactly as many ints as the
++        //   q4_0 vector dot feeds to dp4a.
++        const int vq = get_int_from_table_16(v, kvalues_iq4nl).x;
++
++        const int u = Q_q8[k_KQ_0/nthreads];
++
++        const int sumi = ggml_cuda_dp4a(vq, u, 0);
++
++        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
++        sum += __half2float(K_iq4_nl[ib].d) * sumi * Q_ds.x;
++    }
++
++    return sum;
++}
++
+ template <int D, int nthreads>
+ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
+     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+@@ -584,6 +626,49 @@ static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict
+     }
+ }
+ 
++// iq4_nl keeps the q4_0/q5_0 nibble layout (nibble j of the block carries elements j and
++//   j + QK4_NL/2) but maps each 4-bit code through kvalues_iq4nl instead of the q-8 offset
++//   and stores no bias, so the index arithmetic below is q4_0's and only the value map
++//   differs.  kvalues_iq4nl is a __device__ table (ggml-common.h), already read by the mmvq
++//   and mmq iq4_nl kernels.
++template <typename T, int ne>
++static __device__ __forceinline__ void dequantize_V_iq4_nl(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
++    const block_iq4_nl * x = (const block_iq4_nl *) vx;
++
++    const int64_t ib    =  i0            /  QK4_NL;
++    const int     iqs   =  i0            % (QK4_NL/2);
++    const int     shift = (i0 % QK4_NL) / (QK4_NL/2);
++
++    int q;
++    static_assert(ne == 2 || ne == 4, "bad ne");
++    ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
++    q >>= 4*shift;
++    q &= 0x0F0F0F0F;
++
++    const uint8_t * q8 = (const uint8_t *) &q;
++
++#ifdef FP16_AVAILABLE
++    if constexpr (std::is_same_v<T, half>) {
++        const half2 d = __half2half2(x[ib].d);
++
++#pragma unroll
++        for (int l0 = 0; l0 < ne; l0 += 2) {
++            ((half2 *) dst)[l0/2] = d * make_half2(kvalues_iq4nl[q8[l0 + 0]], kvalues_iq4nl[q8[l0 + 1]]);
++        }
++    } else
++#endif // FP16_AVAILABLE
++    if constexpr (std::is_same_v<T, float>) {
++        const float d = x[ib].d;
++
++#pragma unroll
++        for (int l = 0; l < ne; ++l) {
++            ((float *) dst)[l] = d * kvalues_iq4nl[q8[l]];
++        }
++    } else {
++        static_assert(std::is_same_v<T, void>, "bad type");
++    }
++}
++
+ template <typename T, int ne>
+ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+     const block_q8_0 * x = (const block_q8_0 *) vx;
+@@ -631,6 +716,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
+         return vec_dot_fattn_vec_KQ_q5_1<D, nthreads>;
+     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
+         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
++    } else if constexpr (type_K == GGML_TYPE_IQ4_NL) {
++        return vec_dot_fattn_vec_KQ_iq4_nl<D, nthreads>;
+     } else if constexpr (type_K == GGML_TYPE_BF16) {
+         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+     } else {
+@@ -653,6 +740,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
+         return dequantize_V_q5_1<T, ne>;
+     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
+         return dequantize_V_q8_0<T, ne>;
++    } else if constexpr (type_V == GGML_TYPE_IQ4_NL) {
++        return dequantize_V_iq4_nl<T, ne>;
+     } else if constexpr (type_V == GGML_TYPE_BF16) {
+         return dequantize_V_bf16<float, ne>;
+     } else {
+@@ -1167,13 +1256,21 @@ void launch_fattn(
          // parallel_blocks must not be larger than what the tensor size allows:
          parallel_blocks = std::min(parallel_blocks, ntiles_KV);
  
@@ -3860,10 +4050,10 @@ index bc5060e81..8428b01f7 100644
  
 diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
 new file mode 100644
-index 000000000..31d4a1ce7
+index 000000000..656e0002a
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/fattn-qsa.cu
-@@ -0,0 +1,703 @@
+@@ -0,0 +1,705 @@
 +#include "common.cuh"
 +#include "fattn-qsa.cuh"
 +#include "fattn-common.cuh"
@@ -4005,7 +4195,7 @@ index 000000000..31d4a1ce7
 +    // The quantized types whose rows are dequantized to F16 on load.
 +    constexpr bool kv_dequant_f16 = type_KV == GGML_TYPE_Q8_0 || type_KV == GGML_TYPE_Q4_0 ||
 +                                    type_KV == GGML_TYPE_Q4_1 || type_KV == GGML_TYPE_Q5_0 ||
-+                                    type_KV == GGML_TYPE_Q5_1;
++                                    type_KV == GGML_TYPE_Q5_1 || type_KV == GGML_TYPE_IQ4_NL;
 +    __shared__ kv2_t K_smem[WARP_SIZE][D/2 + 1];
 +    __shared__ kv2_t V_smem[WARP_SIZE][D/2 + 1];
 +    __shared__ half  M_smem[WARP_SIZE];  // per-cell mask, staged with K
@@ -4072,7 +4262,7 @@ index 000000000..31d4a1ce7
 +                        }
 +                    }
 +                } else if constexpr (kv_dequant_f16) {
-+                    // q4_0/q4_1/q5_0/q5_1: one thread per (cell, 32-element block),
++                    // q4_0/q4_1/q5_0/q5_1/iq4_nl: one thread per (cell, 32-element block),
 +                    // the block dequantized to F16 in 4-element (2 half2) steps via
 +                    // the shared dequantize_V_* helpers - the same ones the vec FA
 +                    // kernel and the lightning indexer stage through, whose multiply
@@ -4527,14 +4717,15 @@ index 000000000..31d4a1ce7
 +        case GGML_TYPE_Q4_1: ggml_cuda_flash_attn_qsa_dispatch<GGML_TYPE_Q4_1>(ctx, dst, identity, D); break;
 +        case GGML_TYPE_Q5_0: ggml_cuda_flash_attn_qsa_dispatch<GGML_TYPE_Q5_0>(ctx, dst, identity, D); break;
 +        case GGML_TYPE_Q5_1: ggml_cuda_flash_attn_qsa_dispatch<GGML_TYPE_Q5_1>(ctx, dst, identity, D); break;
++        case GGML_TYPE_IQ4_NL: ggml_cuda_flash_attn_qsa_dispatch<GGML_TYPE_IQ4_NL>(ctx, dst, identity, D); break;
 +        default: GGML_ABORT("unsupported K/V type");
 +    }
 +}
 +
 +// K/V cache types the kernel above can read: the native F16/BF16 caches, plus
-+// every quantized type the delivery enables for plain flash attention (Q8_0 and
-+// the q4_0/q4_1/q5_0/q5_1 nibble types, which the kernel dequantizes while
-+// staging a tile).  Keep in sync with the dispatch above, with
++// every quantized type the delivery enables for plain flash attention (Q8_0,
++// the q4_0/q4_1/q5_0/q5_1 nibble types and iq4_nl, which the kernel dequantizes
++// while staging a tile).  Keep in sync with the dispatch above, with
 +// ggml_cuda_flash_attn_qsa_supported() and with the qsa_kv_native gate in
 +// src/models/qwen4exp.cpp.
 +static bool ggml_cuda_flash_attn_qsa_kv_type_supported(ggml_type type) {
@@ -4546,6 +4737,7 @@ index 000000000..31d4a1ce7
 +        case GGML_TYPE_Q4_1:
 +        case GGML_TYPE_Q5_0:
 +        case GGML_TYPE_Q5_1:
++        case GGML_TYPE_IQ4_NL:
 +            return true;
 +        default:
 +            return false;
@@ -5669,12 +5861,71 @@ index 8981ab804..23ce9a1c4 100644
 +EXTERN_DECL_FATTN_TILE_CASES(512, 512);
 +EXTERN_DECL_FATTN_TILE_CASES(576, 512);
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index ae217fbd9..38a977326 100644
+index ae217fbd9..00c46f9d5 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -451,8 +451,13 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+@@ -402,6 +402,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_F16)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_F16)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_F16)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_F16)
+ 
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q4_0)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
+@@ -410,6 +411,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q4_0)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q4_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0)
+ 
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q4_1)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_1)
+@@ -418,6 +420,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q4_1)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_1)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q4_1)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_1)
+ 
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q5_0)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q5_0)
+@@ -426,6 +429,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q5_0)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q5_0)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q5_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_0)
+ 
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q5_1)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q5_1)
+@@ -434,6 +438,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q5_1)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q5_1)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q5_1)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_1)
+ 
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q8_0)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0)
+@@ -442,6 +447,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q8_0)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0)
+ 
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_BF16)
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_BF16)
+@@ -450,11 +456,27 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
+     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_BF16)
      FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
      FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_BF16)
++
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_IQ4_NL)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_IQ4_NL)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL)
  #else
 +    // Keep in sync with ggml_cuda_fattn_kv_type_supported and with the default
 +    //   instance list in the backend CMakeLists.txt files.
@@ -5685,16 +5936,19 @@ index ae217fbd9..38a977326 100644
 +    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q5_1)
      FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
      FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
++    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL)
  #endif // GGML_CUDA_FA_ALL_QUANTS
-@@ -468,6 +473,18 @@ enum best_fattn_kernel {
+ 
+     GGML_ABORT("fatal error");
+@@ -468,6 +490,18 @@ enum best_fattn_kernel {
      BEST_FATTN_KERNEL_MMA_F16 = 400,
  };
  
 +// KV cache types that at least one of the flash-attention families reachable
 +//   below can consume:
 +//     - the tile and mma-f16 kernels stage K/V through ggml_get_to_fp16_cuda,
-+//       which covers the whole q4_0/q4_1/q5_0/q5_1/q8_0 set, so any of those
-+//       types works there (at the cost of the staging copy);
++//       which covers the whole q4_0/q4_1/q5_0/q5_1/q8_0/iq4_nl set, so any of
++//       those types works there (at the cost of the staging copy);
 +//     - the vec kernel reads K/V natively and is instantiated per (K,V) pair, so
 +//       a type listed here must have an instance for every reachable pair.
 +//   With GGML_CUDA_FA_ALL_QUANTS undefined the chooser enforces K->type ==
@@ -5705,7 +5959,7 @@ index ae217fbd9..38a977326 100644
  static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
      switch (type) {
          case GGML_TYPE_F32:
-@@ -476,9 +493,12 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
+@@ -476,9 +510,21 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
          case GGML_TYPE_Q4_1:
          case GGML_TYPE_Q5_0:
          case GGML_TYPE_Q5_1:
@@ -5718,10 +5972,19 @@ index ae217fbd9..38a977326 100644
 +            //   diagonals are part of the default instance list; the flag is
 +            //   then only needed for the *mixed* K!=V pairs.
 +            return true;
++        case GGML_TYPE_IQ4_NL:
++            // Same arrangement as the three above, except that upstream's
++            //   TYPES_KV list (template-instances/generate_cu_files.py) does not
++            //   carry iq4_nl, so its instances are not part of the checked-in
++            //   cross product and are shipped alongside this enablement.  The
++            //   tile/mma staging path covers it through ggml_get_to_fp16_cuda,
++            //   and the vector family has the K-side vec_dot and V-side dequant
++            //   for every pair (see the instance list below).
++            return true;
          case GGML_TYPE_Q4_0:
          case GGML_TYPE_Q8_0:
          case GGML_TYPE_BF16:
-@@ -506,6 +526,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -506,6 +552,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      float max_bias = 0.0f;
      memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
  
@@ -5731,7 +5994,7 @@ index ae217fbd9..38a977326 100644
      // The effective batch size for the kernel can be increased by gqa_ratio.
      // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
      bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
-@@ -645,24 +668,45 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -645,24 +694,45 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      }
  
      // AMD WMMA is always faster than the tile kernel if the full tile width of 16 can be utilized.
@@ -5793,7 +6056,7 @@ index ae217fbd9..38a977326 100644
      return BEST_FATTN_KERNEL_TILE;
  }
  
-@@ -681,7 +725,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -681,7 +751,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
      bool need_f16_V = false;
  
      switch (kernel) {
@@ -16751,10 +17014,214 @@ index e546fb655..76ff68450 100644
          } else {
              GGML_ABORT("fatal error");
          }
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-bf16-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-bf16-iq4_nl.cu
+new file mode 100644
+index 000000000..4a03a30d3
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-bf16-iq4_nl.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_BF16, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_BF16, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_BF16, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-iq4_nl.cu
+new file mode 100644
+index 000000000..2bd3ee208
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-iq4_nl.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_F16, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_F16, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_F16, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-bf16.cu
+new file mode 100644
+index 000000000..7ccd568da
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-bf16.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_IQ4_NL, GGML_TYPE_BF16);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_IQ4_NL, GGML_TYPE_BF16);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_BF16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-f16.cu
+new file mode 100644
+index 000000000..651332e89
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-f16.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_IQ4_NL, GGML_TYPE_F16);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_IQ4_NL, GGML_TYPE_F16);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-iq4_nl.cu
+new file mode 100644
+index 000000000..90456693c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-iq4_nl.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q4_0.cu
+new file mode 100644
+index 000000000..f41de40fa
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q4_0.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q4_1.cu
+new file mode 100644
+index 000000000..919054613
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q4_1.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_1);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_1);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q5_0.cu
+new file mode 100644
+index 000000000..a3f7bad9a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q5_0.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_0);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_0);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q5_1.cu
+new file mode 100644
+index 000000000..66abfb332
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q5_1.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_1);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_1);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q8_0.cu
+new file mode 100644
+index 000000000..36aa0edd6
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-q8_0.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-iq4_nl.cu
+new file mode 100644
+index 000000000..bcc7dbd96
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-iq4_nl.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_1-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_1-iq4_nl.cu
+new file mode 100644
+index 000000000..fd725e7bb
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_1-iq4_nl.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_0-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_0-iq4_nl.cu
+new file mode 100644
+index 000000000..dbfd833be
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_0-iq4_nl.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_1-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_1-iq4_nl.cu
+new file mode 100644
+index 000000000..81596431f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_1-iq4_nl.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-iq4_nl.cu
+new file mode 100644
+index 000000000..a379c23dc
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-iq4_nl.cu
+@@ -0,0 +1,7 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-vec.cuh"
++
++DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL);
++DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL);
 diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
-index d7cd27167..92db7c201 100755
+index d7cd27167..094de1b8c 100755
 --- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
 +++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+@@ -8,7 +8,7 @@ HEAD_SIZES_KQ = [40, 64, 72, 80, 96, 112, 128, 192, 256, 320, 512, 576]
+ # DKQ -> DV override for asymmetric head dims.
+ HEAD_SIZES_V_OVERRIDE = {576: 512, 320: 256, 192: 128}
+ 
+-TYPES_KV = ["GGML_TYPE_F16", "GGML_TYPE_Q4_0", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q8_0", "GGML_TYPE_BF16"]
++TYPES_KV = ["GGML_TYPE_F16", "GGML_TYPE_Q4_0", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q8_0", "GGML_TYPE_BF16", "GGML_TYPE_IQ4_NL"]
+ 
+ SOURCE_FATTN_TILE = """// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+ 
 @@ -50,6 +50,16 @@ SOURCE_MMQ = """// This file has been autogenerated by generate_cu_files.py, do
  DECL_MMQ_CASE({type});
  """
@@ -17319,10 +17786,10 @@ index f2a6f2009..d42feb23b 100644
  #define VDR_IQ2_XXS_Q8_1_MMQ  2
  
 diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
-index 47f16f56c..b187d7f2b 100644
+index 47f16f56c..f23e021a1 100644
 --- a/ggml/src/ggml-hip/CMakeLists.txt
 +++ b/ggml/src/ggml-hip/CMakeLists.txt
-@@ -78,6 +78,9 @@ else()
+@@ -78,8 +78,12 @@ else()
      list(APPEND GGML_SOURCES_ROCM
          ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
          ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
@@ -17330,8 +17797,12 @@ index 47f16f56c..b187d7f2b 100644
 +        ../ggml-cuda/template-instances/fattn-vec-instance-q5_0-q5_0.cu
 +        ../ggml-cuda/template-instances/fattn-vec-instance-q5_1-q5_1.cu
          ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
-         ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
+-        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
++        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu
++        ../ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-iq4_nl.cu)
  endif()
+ 
+ ggml_add_backend_library(ggml-hip
 diff --git a/ggml/src/ggml-moe-weighted-reduction.h b/ggml/src/ggml-moe-weighted-reduction.h
 new file mode 100644
 index 000000000..c90460a45
@@ -17499,10 +17970,10 @@ index 000000000..c90460a45
 +    return true;
 +}
 diff --git a/ggml/src/ggml-musa/CMakeLists.txt b/ggml/src/ggml-musa/CMakeLists.txt
-index faf979033..24f783053 100644
+index faf979033..753d68cd0 100644
 --- a/ggml/src/ggml-musa/CMakeLists.txt
 +++ b/ggml/src/ggml-musa/CMakeLists.txt
-@@ -51,6 +51,9 @@ if (MUSAToolkit_FOUND)
+@@ -51,8 +51,12 @@ if (MUSAToolkit_FOUND)
          list(APPEND GGML_SOURCES_MUSA
              ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
              ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
@@ -17510,8 +17981,12 @@ index faf979033..24f783053 100644
 +            ../ggml-cuda/template-instances/fattn-vec-instance-q5_0-q5_0.cu
 +            ../ggml-cuda/template-instances/fattn-vec-instance-q5_1-q5_1.cu
              ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
-             ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
+-            ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
++            ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu
++            ../ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-iq4_nl.cu)
      endif()
+ 
+     set_source_files_properties(${GGML_SOURCES_MUSA} PROPERTIES LANGUAGE CXX)
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
 index 0c1b6d067..3437c6e38 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
@@ -18159,7 +18634,7 @@ index f1d173a57..01e2bbe1d 100644
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_FC,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 21501574a..7df231909 100644
+index 21501574a..71be86089 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -152,7 +152,7 @@ llama_context::llama_context(
@@ -18196,7 +18671,7 @@ index 21501574a..7df231909 100644
      // with causal attention, the batch size is limited by the context size
      cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
  
-@@ -3657,6 +3675,25 @@ llama_context_params llama_context_default_params() {
+@@ -3657,6 +3675,26 @@ llama_context_params llama_context_default_params() {
      return result;
  }
  
@@ -18213,6 +18688,7 @@ index 21501574a..7df231909 100644
 +        case GGML_TYPE_Q5_0:
 +        case GGML_TYPE_Q5_1:
 +        case GGML_TYPE_Q8_0:
++        case GGML_TYPE_IQ4_NL:
 +            return true;
 +        default:
 +            return false;
@@ -18222,7 +18698,7 @@ index 21501574a..7df231909 100644
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
-@@ -3692,6 +3729,36 @@ llama_context * llama_init_from_model(
+@@ -3692,6 +3730,37 @@ llama_context * llama_init_from_model(
          if (model->get_split_state_ud.n_devices == 1) {
              LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
          }
@@ -18231,8 +18707,9 @@ index 21501574a..7df231909 100644
 +        // the tensor-parallel devices. Those kernels have a native read path only for a subset of
 +        // quantized types (see llama_kv_type_has_native_fa below, which must mirror
 +        // ggml_cuda_fattn_kv_type_supported() in ggml/src/ggml-cuda/fattn.cu); for the rest
-+        // (iq4_nl, ...) the graph cannot express a splittable attention and the meta splitter
-+        // aborts during reserve. This is only a problem when the Meta device is actually used
++        // (the k-quants and the remaining i-quants) the graph cannot express a splittable
++        // attention and the meta splitter aborts during reserve. This is only a problem when
++        // the Meta device is actually used
 +        // (tensor split over >= 2 GPUs; a single-device "tensor" mode skips the Meta wrapper and
 +        // is fine).
 +        const bool use_meta_device =
@@ -18250,7 +18727,7 @@ index 21501574a..7df231909 100644
 +                    LLAMA_LOG_ERROR("%s: KV cache type %s is not supported with tensor parallelism "
 +                            "(SPLIT_MODE_TENSOR, %zu GPUs): flash attention cannot read this type from a "
 +                            "split KV cache\n", __func__, ggml_type_name(type_kv), model->get_split_state_ud.n_devices);
-+                    LLAMA_LOG_ERROR("%s: use f32/f16/bf16/q4_0/q4_1/q5_0/q5_1/q8_0 KV cache types, "
++                    LLAMA_LOG_ERROR("%s: use f32/f16/bf16/q4_0/q4_1/q5_0/q5_1/q8_0/iq4_nl KV cache types, "
 +                            "or switch to SPLIT_MODE_LAYER which supports every KV cache type\n", __func__);
 +                    return nullptr;
 +                }
@@ -19479,7 +19956,7 @@ index 87195fddd..75b9b3493 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8ace95f73..83476eeec 100644
+index 8ace95f73..8c4076307 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -5,6 +5,31 @@
@@ -20440,7 +20917,7 @@ index 8ace95f73..83476eeec 100644
 +        return env == nullptr || std::atoi(env) != 0;
 +    }();
 +    // The fused sparse kernel reads the K/V cache rows itself - F16/BF16 natively, and
-+    // Q8_0/q4_0/q4_1/q5_0/q5_1 by dequantizing them while a tile is staged.  The
++    // Q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl by dequantizing them while a tile is staged.  The
 +    // authoritative list of accepted types is ggml_cuda_flash_attn_qsa_supported()
 +    // (it mirrors the kernel's load dispatch).  Every other cache type must
 +    // take the dense masked path below instead: an unsupported qsa op is not split
@@ -20455,7 +20932,7 @@ index 8ace95f73..83476eeec 100644
 +    const bool qsa_kv_native = k->type == GGML_TYPE_F16  || k->type == GGML_TYPE_BF16 ||
 +                               k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0 ||
 +                               k->type == GGML_TYPE_Q4_1 || k->type == GGML_TYPE_Q5_0 ||
-+                               k->type == GGML_TYPE_Q5_1;
++                               k->type == GGML_TYPE_Q5_1 || k->type == GGML_TYPE_IQ4_NL;
 +    const bool qsa_sparse = qsa_sparse_env && cparams.flash_attn && qsa_kv_native;
 +
 +    ggml_tensor * cur;
@@ -20773,7 +21250,7 @@ index e0907631a..61a7fbe16 100644
      assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
      assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 01e72041b..750c93f16 100644
+index 01e72041b..5bde860a8 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1499,14 +1499,64 @@ struct test_case {
@@ -21042,7 +21519,7 @@ index 01e72041b..750c93f16 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
-@@ -10821,6 +11001,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10821,6 +11001,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_falcon(2));
  #endif
  
@@ -21050,8 +21527,8 @@ index 01e72041b..750c93f16 100644
 +    // cells.  Every supported K/V type (i.e. every load path, the quantized ones dequantizing
 +    // while a tile is staged), the decode width and the speculative verify width, the three
 +    // head sizes, the grouped-query mapping, and the sliced+combined top-k walk.
-+    for (ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0,
-+                               GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1 }) {
++    for (ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
++                               GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL }) {
 +        test_cases.emplace_back(new test_flash_attn_qsa(128, 16, 2, 512, 1,  64, type_kv));
 +        test_cases.emplace_back(new test_flash_attn_qsa(128, 16, 2, 512, 4, 100, type_kv));
 +    }
@@ -21059,11 +21536,17 @@ index 01e72041b..750c93f16 100644
 +    test_cases.emplace_back(new test_flash_attn_qsa(256,  4, 1, 256, 2,  96, GGML_TYPE_Q4_1));
 +    test_cases.emplace_back(new test_flash_attn_qsa(128,  1, 1, 128, 1,  16, GGML_TYPE_Q5_1));
 +    test_cases.emplace_back(new test_flash_attn_qsa(128, 32, 4, 512, 1,  64, GGML_TYPE_Q8_0));
++    // iq4_nl at the shapes qwen4exp actually runs: D = 256, and a GQA ratio of 12
++    // (24 q-heads / 2 kv-heads), which is what sets the K/V-head chunking of the
++    // shared staging tile (min(QSA_MAX_HEADS, gqa_ratio)); the loop above only
++    // covers D = 128 with gqa 8.
++    test_cases.emplace_back(new test_flash_attn_qsa(256, 24, 2, 512, 1, 128, GGML_TYPE_IQ4_NL));
++    test_cases.emplace_back(new test_flash_attn_qsa(256,  4, 1, 256, 2,  96, GGML_TYPE_IQ4_NL));
 +
      // lightning_indexer
      for (int kv : { 256 }) {
          for (int bs : { 1, 512 }) {
-@@ -10875,6 +11069,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10875,6 +11075,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_leaky_relu(GGML_TYPE_F32, { 17408, n_tokens, 1, 1 }, 0.1f));
      }
  
@@ -21094,7 +21577,7 @@ index 01e72041b..750c93f16 100644
      // Conv2d: K=CRS=NPQ=4096 matmul performance
      uint32_t                        iwh_idx  = 0;
      uint32_t                        kwh_idx  = 1;
-@@ -11045,9 +11263,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11045,9 +11269,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -21130,7 +21613,7 @@ index 01e72041b..750c93f16 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -11055,8 +11297,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11055,8 +11303,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -21141,7 +21624,7 @@ index 01e72041b..750c93f16 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 1792, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));
-@@ -11251,6 +11493,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11251,6 +11499,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
  

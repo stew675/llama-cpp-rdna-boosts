@@ -51,7 +51,7 @@ dense masked flash-attention path (the packed mask is then kept automatically).
 | `GGML_QSA_SCORE_MEM` | `1` | W1 — the QSA score-chain memory cuts | qwen4exp compute **+2240 MiB** |
 | `GGML_QSA_DERIVED_BIAS` | `1` | W2 — the derived per-block bias (`0` = uploaded 400 MiB tensor) | **+400 MiB** |
 | `GGML_QSA_DERIVED_VIS` | `1` | W2 — the derived visibility (the packed `n_kv × n_tps` mask comes back) | **+800 MiB** compute **and +800 MiB host** |
-| `LLAMA_QSA_SPARSE_FA` | `1` | the fused sparse QSA flash-attn (dense masked fallback) | slower prefill; the mask is required and kept |
+| `LLAMA_QSA_SPARSE_FA` | `1` | the fused sparse QSA flash-attn (dense masked fallback) | slower prefill; the mask is required and kept.  **WARNING 2026-09-11 (10): this arm is currently broken in Block 15** — PPL `1.0558` on qwen4exp for *every* KV type (vs the delivery's `6.49–6.55`), i.e. a lost causal constraint; no Block 15 gate restores it.  Do not use it as an oracle until it is fixed (see §4c) |
 | `LLAMA_QSA_KEYS_ONLY` | `1` | W3 — the keys-only QSA indexer cache (V buffer allocated again) | **+638 MiB** indexer KV |
 | `GGML_CUDA_FA_KV_NATIVE` | `0` (**opt-in**) | **V4 + V5** — stage the K/V tiles natively instead of through the F16 staging scratch: q8_0 is dequantized (V4), bf16 is converted (V5), so the scratch (~800 MiB/GPU at ctx 204800 with q8_0, 712/584/658/1352 MiB with bf16) and its per-ubatch conversion pass are gone for that operand.  Measured q8_0: −744 MiB/GPU (4B), −632 (27B), −1224 (gemma-4-31B); bf16: 4B 968.86 → **256.86**, 27B 1072.86 → **488.86**, gemma-4-E4B 1062.89 → **404.89**, gemma-4-31B 2068.89 → **716.89** (i.e. a bf16 cache then costs exactly an f16 one); coherence byte-identical, MTP acceptance unchanged.  Cost: **q8_0 prefill −1.7 %, bf16 prefill −0.2 % (pp2048) to −2.4 % (pp40960), decode ±0.1 %** — that is why it is off by default.  f16 K/V and every other type keep the old path | with `1`: **−744 MiB** compute (4B q8_0), or the bf16 table above with a bf16 cache; nothing else changes.
   A/B recipe for V5: `-ctk bf16 -ctv bf16` with the switch unset (= 968.86 MiB on the 4B ub 2048) vs `=1` (= 256.86, the same as `-ctk f16 -ctv f16`); same-seed text must be identical in all three.  **Do not mix K/V types** (`-ctk bf16 -ctv q8_0`): any mixed pair drops the attention off the GPU path (pre-existing, documented in `../../patches/README.md`) |
@@ -59,6 +59,13 @@ dense masked flash-attention path (the packed mask is then kept automatically).
 | **W4** | always on | — | it is a bug fix, not a policy.  To A/B it: `git apply ab/w4-revert.patch`, rebuild |
 
 ## 2. The three measurements per model
+
+> **Added 2026-09-11 (10): a fourth measurement — the perplexity oracle.**  Before promoting, run
+> `wip/kv-quant-purity-followups/tools/qsa-ppl-oracle.sh <split> <kv>` against the beta build: the
+> *sparse* column must match the delivery's value (qwen4exp tensor: f16 `6.5394`, `iq4_nl` `6.5244`)
+> and the *dense* column must be a sane PPL (`6.49–6.55` on qwen4exp, not `~1.05`).  This gate is what
+> found the `LLAMA_QSA_SPARSE_FA=0` breakage recorded in §4c; the same-seed/MTP gates cannot see it
+> (the production sparse arm is byte-identical to the delivery).
 
 ```bash
 # environment used for every run
@@ -105,6 +112,25 @@ what broke / what looks off:
 ```
 
 ## 4. Known and accepted differences — do not report these
+
+### 4c. `LLAMA_QSA_SPARSE_FA=0` (the dense masked oracle) is BROKEN in Block 15 — report it, do not
+accept it.  Found 2026-09-11 (10) by the eighth re-cut's gate sweep: the dense masked arm gives PPL
+`1.0558 ± 0.003` on qwen4exp for **every** KV type (f16 `1.0558`, q4_0 `1.0552`, q4_1 `1.0500`, q8_0
+`1.0552`, `iq4_nl` `1.0554`) where the delivery gives `6.49–6.55` (`iq4_nl` `6.4930`, f16 `6.5377`) — a
+near-1 PPL means the model effectively sees the answer.  It is **block-15-inherent** (the seventh re-cut
+on the older tip `5a0734c9d` reproduces `1.0558` exactly) and **no Block 15 gate fixes it**
+(`LLAMA_KQ_MASK_DERIVED=0`, `GGML_QSA_DERIVED_BIAS=0 GGML_QSA_DERIVED_VIS=0`, `GGML_QSA_SCORE_MEM=0`,
+`LLAMA_QSA_KEYS_ONLY=0`, and all of them together → all `1.0558`), while `LLAMA_QSA_OFF=1` (`6.5376`) and
+the production sparse arm (`6.5244` for `iq4_nl`, `6.5394` for f16) are byte-identical to the delivery.
+Repro: `BIN=<beta>/build-beta/bin tools/qsa-ppl-oracle.sh tensor f16`.
+
+### 4d. `iq4_nl` (added to the delivery 2026-09-11 (9)/(10)) is W2-sensitive, benign.  With the default
+sparse arm the `iq4_nl` greedy text differs from the delivery (`fcb2d47f94cf` vs `acd18ad2d55c`) and the
+forced-QSA tensor probe too (`34975a35691aa387` vs `a2e272ce51bf663f`), while f16/q4_1/bf16/q8_0 are
+byte-identical.  `GGML_QSA_DERIVED_BIAS=0 GGML_QSA_DERIVED_VIS=0` restores the delivery's values exactly:
+W2 re-derives the per-block bias and its last ULP can flip an indexer top-k boundary — and the indexer
+cache is quantized with the same `-ctk`, so a different KV quantization moves that boundary.  Benign:
+the sparse PPL is `6.5244`, identical to the delivery, and `W=1..8` purity holds.
 
 * the `[ Prompt: … | Generation: … ]` footer always differs (compare the text, not the process log);
 * sparse vs dense flash-attention produce legitimately different floats (different kernels) — compare
@@ -231,3 +257,26 @@ only body differences are the `From <sha>` line and the `qwen4exp.cpp` hunk head
   operand or kernel (block 13's is the shared-expert epilogue and the mmvq cap; block 14's is the QSA
   indexer arm choice in the *graph builder*), and the beta re-apply reproduces the recorded tree.
   **Re-run the beta A/B gates only if a block-15 file changed** — here nothing did.
+
+---
+
+**Re-cut 2026-09-11 (eighth), after block 08's fifth amendment + the iq4_nl half of F3 step 2.**  The
+canonical tip moved from `a0cd6ce02` (tree `0966e66731`) to `6d3155faa` (tree
+`0c3f0c2c2f4e7439d9489d45573a4021a8eee106`): block 08 now enables `iq4_nl` as a flash-attention K/V
+type (predicate + vec dispatch + the 15 missing `fattn-vec-instance-iq4_nl-*.cu` files + the three
+CMake default lists + `dequantize_q4_nl` + the three non-contiguous conversion switches) and block 14
+gained the matching QSA/CPU-reference/`qsa_kv_native`/tensor-split-gate/backend-test entries.  The
+merge is the same single conflict as the seventh re-cut (`qwen4exp_qsa_sparse()` must accept
+`GGML_TYPE_IQ4_NL`) — **use `git am -3`** — and the test file needs no fix this time (block 15's body
+already carries the `nullptr, nullptr` call).
+
+* base `6d3155faa` (tree `0c3f0c2c2f4e7439d9489d45573a4021a8eee106`) -> **beta commit `d0f71b2e8`**,
+  tree `39540b7f4fd8e8569dee64bfa3ee84bf1b20e75d`, patch 3 787 lines
+* the tree builds (`build-beta`, clean) and the exported patch round-trips on a fresh base
+* gates (all against the delivery build): qwen4exp f16 plain `804de0576868`, q4_1 plain
+  `886292b17a93`, f16 `n_max 3` `0.47009` (pos-1 0.615), `iq4_nl` `n_max 3` `0.52727` (pos-1 0.757),
+  27B f16 `0.82716`; width purity `W=1..8` equal to the delivery for tensor/layer × f16/`iq4_nl` ×
+  default/QSA-forced (the two exceptions: `iq4_nl`'s forced-QSA tensor hash and greedy text, both
+  W2-sensitivity — §4d); `FLASH_ATTN_QSA` 22/22, `GATED_DELTA_NET` 46/46, `FLASH_ATTN_EXT` 5940/5940
+* **the new `LLAMA_QSA_SPARSE_FA=0` defect (§4c) is a promotion blocker**: found here, block-15-inherent,
+  not fixable by any Block 15 gate, and it invalidates that arm as the quality oracle

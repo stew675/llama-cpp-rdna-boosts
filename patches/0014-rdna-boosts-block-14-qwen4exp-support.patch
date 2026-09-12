@@ -1,4 +1,4 @@
-From a0cd6ce02ac86b9fb7a08461283880e774d07163 Mon Sep 17 00:00:00 2001
+From 6d3155faaeffa66b0a8b4e8ce9e75983f33c2ca6 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/14] rdna-boosts: block 14: qwen4exp support
@@ -107,11 +107,11 @@ freed-cell zeroing gate it describes no longer exists in the block.
  ggml/src/ggml-backend-meta.cpp         |  129 ++-
  ggml/src/ggml-backend.cpp              |   47 +-
  ggml/src/ggml-cpu/ggml-cpu.c           |   37 +
- ggml/src/ggml-cpu/ops.cpp              |  484 +++++++++++
+ ggml/src/ggml-cpu/ops.cpp              |  496 ++++++++++++
  ggml/src/ggml-cpu/ops.h                |    4 +
  ggml/src/ggml-cuda/common.cuh          |    1 +
  ggml/src/ggml-cuda/concat.cu           |   73 ++
- ggml/src/ggml-cuda/fattn-qsa.cu        |  703 ++++++++++++++++
+ ggml/src/ggml-cuda/fattn-qsa.cu        |  705 ++++++++++++++++
  ggml/src/ggml-cuda/fattn-qsa.cuh       |   24 +
  ggml/src/ggml-cuda/ggml-cuda.cu        |  726 +++++++++++++----
  ggml/src/ggml-cuda/hc-mix.cu           |  535 +++++++++++++
@@ -132,7 +132,7 @@ freed-cell zeroing gate it describes no longer exists in the block.
  src/CMakeLists.txt                     |    1 +
  src/llama-arch.cpp                     |   20 +-
  src/llama-arch.h                       |    5 +
- src/llama-context.cpp                  |   69 +-
+ src/llama-context.cpp                  |   71 +-
  src/llama-cparams.h                    |    2 +
  src/llama-lazy-reader.cpp              |  330 ++++++++
  src/llama-lazy-reader.h                |   91 +++
@@ -146,10 +146,10 @@ freed-cell zeroing gate it describes no longer exists in the block.
  src/models/models.h                    |   48 +-
  src/models/qwen4exp.cpp                | 1019 +++++++++++++++++++++---
  tests/CMakeLists.txt                   |    1 +
- tests/test-backend-ops.cpp             |  104 +++
+ tests/test-backend-ops.cpp             |  110 +++
  tests/test-lazy-reader.cpp             |  264 ++++++
  tests/test-llama-archs.cpp             |    7 +-
- 52 files changed, 6942 insertions(+), 325 deletions(-)
+ 52 files changed, 6964 insertions(+), 325 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
@@ -860,10 +860,18 @@ index 87a329f26..204c6f6d8 100644
                      {
                          GGML_ABORT("fatal error");
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 266261c5e..f4c89292c 100644
+index 266261c5e..451f66f5d 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -3,6 +3,7 @@
+@@ -1,8 +1,15 @@
++// The ggml-common.h tables (kvalues_iq4nl, ...) sit behind GGML_COMMON_IMPL_*; the
++//   declaration side of that header arrives through quants.h below, so defining the
++//   impl variant here is what makes the tables visible - the flash_attn_qsa reference
++//   reads kvalues_iq4nl for iq4_nl.  Same idiom as ggml-cpu/repack.cpp and iqp.cpp.
++#define GGML_COMMON_IMPL_CPP
++
+ #include "ops.h"
+ 
  #include "ggml-cpu.h"
  #include "ggml-impl.h"
  #include "binary-ops.h"
@@ -871,7 +879,7 @@ index 266261c5e..f4c89292c 100644
  #include "simd-gemm.h"
  #include "ggml.h"
  #include "unary-ops.h"
-@@ -9362,6 +9363,164 @@ void ggml_compute_forward_flash_attn_ext(
+@@ -9362,6 +9369,170 @@ void ggml_compute_forward_flash_attn_ext(
      }
  }
  
@@ -963,6 +971,12 @@ index 266261c5e..f4c89292c 100644
 +                const int q = ((blk->qs[j % (QK5_1/2)] >> (4*(j/(QK5_1/2)))) & 0x0F) | (((blk->qh[j/8] >> (j%8)) & 0x01) << 4);
 +                return ggml_fp16_to_fp32(blk->d) * q + ggml_fp16_to_fp32(blk->m);
 +            }
++            case GGML_TYPE_IQ4_NL: {
++                const block_iq4_nl * blk = (const block_iq4_nl *) (row + (d/QK4_NL)*sizeof(block_iq4_nl));
++                const int j = (int) (d % QK4_NL);
++                const int q = (blk->qs[j % (QK4_NL/2)] >> (4*(j/(QK4_NL/2)))) & 0x0F;
++                return ggml_fp16_to_fp32(blk->d) * kvalues_iq4nl[q];
++            }
 +            default:
 +                GGML_ABORT("unsupported K/V type for flash_attn_qsa");
 +        }
@@ -1036,7 +1050,7 @@ index 266261c5e..f4c89292c 100644
  // ggml_compute_forward_flash_attn_back
  
  static void ggml_compute_forward_flash_attn_back_f32(
-@@ -12162,3 +12321,328 @@ void ggml_compute_forward_lightning_indexer(
+@@ -12162,3 +12333,328 @@ void ggml_compute_forward_lightning_indexer(
          }
      }
  }
@@ -1499,10 +1513,10 @@ index 6df89013c..408cbce3d 100644
          const T * src1_d = (const T *) src1->data;
 diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
 new file mode 100644
-index 000000000..31d4a1ce7
+index 000000000..656e0002a
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/fattn-qsa.cu
-@@ -0,0 +1,703 @@
+@@ -0,0 +1,705 @@
 +#include "common.cuh"
 +#include "fattn-qsa.cuh"
 +#include "fattn-common.cuh"
@@ -1644,7 +1658,7 @@ index 000000000..31d4a1ce7
 +    // The quantized types whose rows are dequantized to F16 on load.
 +    constexpr bool kv_dequant_f16 = type_KV == GGML_TYPE_Q8_0 || type_KV == GGML_TYPE_Q4_0 ||
 +                                    type_KV == GGML_TYPE_Q4_1 || type_KV == GGML_TYPE_Q5_0 ||
-+                                    type_KV == GGML_TYPE_Q5_1;
++                                    type_KV == GGML_TYPE_Q5_1 || type_KV == GGML_TYPE_IQ4_NL;
 +    __shared__ kv2_t K_smem[WARP_SIZE][D/2 + 1];
 +    __shared__ kv2_t V_smem[WARP_SIZE][D/2 + 1];
 +    __shared__ half  M_smem[WARP_SIZE];  // per-cell mask, staged with K
@@ -1711,7 +1725,7 @@ index 000000000..31d4a1ce7
 +                        }
 +                    }
 +                } else if constexpr (kv_dequant_f16) {
-+                    // q4_0/q4_1/q5_0/q5_1: one thread per (cell, 32-element block),
++                    // q4_0/q4_1/q5_0/q5_1/iq4_nl: one thread per (cell, 32-element block),
 +                    // the block dequantized to F16 in 4-element (2 half2) steps via
 +                    // the shared dequantize_V_* helpers - the same ones the vec FA
 +                    // kernel and the lightning indexer stage through, whose multiply
@@ -2166,14 +2180,15 @@ index 000000000..31d4a1ce7
 +        case GGML_TYPE_Q4_1: ggml_cuda_flash_attn_qsa_dispatch<GGML_TYPE_Q4_1>(ctx, dst, identity, D); break;
 +        case GGML_TYPE_Q5_0: ggml_cuda_flash_attn_qsa_dispatch<GGML_TYPE_Q5_0>(ctx, dst, identity, D); break;
 +        case GGML_TYPE_Q5_1: ggml_cuda_flash_attn_qsa_dispatch<GGML_TYPE_Q5_1>(ctx, dst, identity, D); break;
++        case GGML_TYPE_IQ4_NL: ggml_cuda_flash_attn_qsa_dispatch<GGML_TYPE_IQ4_NL>(ctx, dst, identity, D); break;
 +        default: GGML_ABORT("unsupported K/V type");
 +    }
 +}
 +
 +// K/V cache types the kernel above can read: the native F16/BF16 caches, plus
-+// every quantized type the delivery enables for plain flash attention (Q8_0 and
-+// the q4_0/q4_1/q5_0/q5_1 nibble types, which the kernel dequantizes while
-+// staging a tile).  Keep in sync with the dispatch above, with
++// every quantized type the delivery enables for plain flash attention (Q8_0,
++// the q4_0/q4_1/q5_0/q5_1 nibble types and iq4_nl, which the kernel dequantizes
++// while staging a tile).  Keep in sync with the dispatch above, with
 +// ggml_cuda_flash_attn_qsa_supported() and with the qsa_kv_native gate in
 +// src/models/qwen4exp.cpp.
 +static bool ggml_cuda_flash_attn_qsa_kv_type_supported(ggml_type type) {
@@ -2185,6 +2200,7 @@ index 000000000..31d4a1ce7
 +        case GGML_TYPE_Q4_1:
 +        case GGML_TYPE_Q5_0:
 +        case GGML_TYPE_Q5_1:
++        case GGML_TYPE_IQ4_NL:
 +            return true;
 +        default:
 +            return false;
@@ -5916,7 +5932,7 @@ index f1d173a57..01e2bbe1d 100644
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_FC,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 21501574a..7df231909 100644
+index 21501574a..71be86089 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -152,7 +152,7 @@ llama_context::llama_context(
@@ -5953,7 +5969,7 @@ index 21501574a..7df231909 100644
      // with causal attention, the batch size is limited by the context size
      cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
  
-@@ -3657,6 +3675,25 @@ llama_context_params llama_context_default_params() {
+@@ -3657,6 +3675,26 @@ llama_context_params llama_context_default_params() {
      return result;
  }
  
@@ -5970,6 +5986,7 @@ index 21501574a..7df231909 100644
 +        case GGML_TYPE_Q5_0:
 +        case GGML_TYPE_Q5_1:
 +        case GGML_TYPE_Q8_0:
++        case GGML_TYPE_IQ4_NL:
 +            return true;
 +        default:
 +            return false;
@@ -5979,7 +5996,7 @@ index 21501574a..7df231909 100644
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
-@@ -3692,6 +3729,36 @@ llama_context * llama_init_from_model(
+@@ -3692,6 +3730,37 @@ llama_context * llama_init_from_model(
          if (model->get_split_state_ud.n_devices == 1) {
              LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
          }
@@ -5988,8 +6005,9 @@ index 21501574a..7df231909 100644
 +        // the tensor-parallel devices. Those kernels have a native read path only for a subset of
 +        // quantized types (see llama_kv_type_has_native_fa below, which must mirror
 +        // ggml_cuda_fattn_kv_type_supported() in ggml/src/ggml-cuda/fattn.cu); for the rest
-+        // (iq4_nl, ...) the graph cannot express a splittable attention and the meta splitter
-+        // aborts during reserve. This is only a problem when the Meta device is actually used
++        // (the k-quants and the remaining i-quants) the graph cannot express a splittable
++        // attention and the meta splitter aborts during reserve. This is only a problem when
++        // the Meta device is actually used
 +        // (tensor split over >= 2 GPUs; a single-device "tensor" mode skips the Meta wrapper and
 +        // is fine).
 +        const bool use_meta_device =
@@ -6007,7 +6025,7 @@ index 21501574a..7df231909 100644
 +                    LLAMA_LOG_ERROR("%s: KV cache type %s is not supported with tensor parallelism "
 +                            "(SPLIT_MODE_TENSOR, %zu GPUs): flash attention cannot read this type from a "
 +                            "split KV cache\n", __func__, ggml_type_name(type_kv), model->get_split_state_ud.n_devices);
-+                    LLAMA_LOG_ERROR("%s: use f32/f16/bf16/q4_0/q4_1/q5_0/q5_1/q8_0 KV cache types, "
++                    LLAMA_LOG_ERROR("%s: use f32/f16/bf16/q4_0/q4_1/q5_0/q5_1/q8_0/iq4_nl KV cache types, "
 +                            "or switch to SPLIT_MODE_LAYER which supports every KV cache type\n", __func__);
 +                    return nullptr;
 +                }
@@ -7097,7 +7115,7 @@ index 87195fddd..75b9b3493 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8ace95f73..83476eeec 100644
+index 8ace95f73..8c4076307 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -5,6 +5,31 @@
@@ -8058,7 +8076,7 @@ index 8ace95f73..83476eeec 100644
 +        return env == nullptr || std::atoi(env) != 0;
 +    }();
 +    // The fused sparse kernel reads the K/V cache rows itself - F16/BF16 natively, and
-+    // Q8_0/q4_0/q4_1/q5_0/q5_1 by dequantizing them while a tile is staged.  The
++    // Q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl by dequantizing them while a tile is staged.  The
 +    // authoritative list of accepted types is ggml_cuda_flash_attn_qsa_supported()
 +    // (it mirrors the kernel's load dispatch).  Every other cache type must
 +    // take the dense masked path below instead: an unsupported qsa op is not split
@@ -8073,7 +8091,7 @@ index 8ace95f73..83476eeec 100644
 +    const bool qsa_kv_native = k->type == GGML_TYPE_F16  || k->type == GGML_TYPE_BF16 ||
 +                               k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0 ||
 +                               k->type == GGML_TYPE_Q4_1 || k->type == GGML_TYPE_Q5_0 ||
-+                               k->type == GGML_TYPE_Q5_1;
++                               k->type == GGML_TYPE_Q5_1 || k->type == GGML_TYPE_IQ4_NL;
 +    const bool qsa_sparse = qsa_sparse_env && cparams.flash_attn && qsa_kv_native;
 +
 +    ggml_tensor * cur;
@@ -8355,7 +8373,7 @@ index 83a14fee9..242fb1cb8 100644
      set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
      file(MAKE_DIRECTORY "${MODEL_DIR}")
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index a779975ac..750c93f16 100644
+index a779975ac..5bde860a8 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -7783,6 +7783,96 @@ struct test_flash_attn_ext : public test_case {
@@ -8455,7 +8473,7 @@ index a779975ac..750c93f16 100644
  // GGML_OP_CROSS_ENTROPY_LOSS
  struct test_cross_entropy_loss : public test_case {
      const ggml_type type;
-@@ -10911,6 +11001,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10911,6 +11001,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_falcon(2));
  #endif
  
@@ -8463,8 +8481,8 @@ index a779975ac..750c93f16 100644
 +    // cells.  Every supported K/V type (i.e. every load path, the quantized ones dequantizing
 +    // while a tile is staged), the decode width and the speculative verify width, the three
 +    // head sizes, the grouped-query mapping, and the sliced+combined top-k walk.
-+    for (ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0,
-+                               GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1 }) {
++    for (ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
++                               GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL }) {
 +        test_cases.emplace_back(new test_flash_attn_qsa(128, 16, 2, 512, 1,  64, type_kv));
 +        test_cases.emplace_back(new test_flash_attn_qsa(128, 16, 2, 512, 4, 100, type_kv));
 +    }
@@ -8472,6 +8490,12 @@ index a779975ac..750c93f16 100644
 +    test_cases.emplace_back(new test_flash_attn_qsa(256,  4, 1, 256, 2,  96, GGML_TYPE_Q4_1));
 +    test_cases.emplace_back(new test_flash_attn_qsa(128,  1, 1, 128, 1,  16, GGML_TYPE_Q5_1));
 +    test_cases.emplace_back(new test_flash_attn_qsa(128, 32, 4, 512, 1,  64, GGML_TYPE_Q8_0));
++    // iq4_nl at the shapes qwen4exp actually runs: D = 256, and a GQA ratio of 12
++    // (24 q-heads / 2 kv-heads), which is what sets the K/V-head chunking of the
++    // shared staging tile (min(QSA_MAX_HEADS, gqa_ratio)); the loop above only
++    // covers D = 128 with gqa 8.
++    test_cases.emplace_back(new test_flash_attn_qsa(256, 24, 2, 512, 1, 128, GGML_TYPE_IQ4_NL));
++    test_cases.emplace_back(new test_flash_attn_qsa(256,  4, 1, 256, 2,  96, GGML_TYPE_IQ4_NL));
 +
      // lightning_indexer
      for (int kv : { 256 }) {

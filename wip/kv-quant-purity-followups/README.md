@@ -7,11 +7,12 @@
 > heads for qwen4exp's gqa 12; perplexity 7.33 -> 6.53 = the dense oracle).  That brief also carries the
 > instrument lessons (the width-purity matrix is blind to a width-uniform corruption; the probe never ran
 > the op by default; MTP acceptance points the wrong way) — they are now in `../../GREEDY-PURITY.md` §21.
-> **Starting the F3 (KV-diagonal) work?** Step 1 is done; **step 2 (`iq4_nl`) is the current task and has
-> its own brief: `HANDOVER-2026-09-11-f3-step2-iq4_nl.md`** (the two-block amendment, the verified code
-> sites, the generator trap, the measured pre-state and the tensor-tuned perf/gate list).  Step 1's
-> mechanism record stays in **`HANDOVER-2026-09-11-f3-kv-diagonals.md`** — scope, the verified-vs-open
-> facts, and the "instrument before coding" first task.  **Starting anything else?** Read
+> **F3 is COMPLETE (2026-09-11 (10)).**  Step 1 (`q4_1`/`q5_0`/`q5_1`) and step 2 (`iq4_nl`) both landed;
+> **every KV cache type the delivery supports now takes the same attention path f16 does.**  Step 2's brief
+> is `HANDOVER-2026-09-11-f3-step2-iq4_nl.md` (its §9 has the outcome) and step 1's mechanism record stays in
+> **`HANDOVER-2026-09-11-f3-kv-diagonals.md`**.  The two open follow-ups are in `../../TODO.md`: the
+> qwen4exp `iq4_nl` prefill delta (host/launch-side, *not* the dequant - see `GREEDY-PURITY.md` §22) and the
+> Block 15 `LLAMA_QSA_SPARSE_FA=0` blocker found by the 8th beta re-cut.  **Starting anything else?** Read
 > **`HANDOVER-2026-09-11-remaining-work.md`** in this directory first — it is the self-contained plan
 > for the remaining work (item order, environment, binary/probe locations, instruments, reference
 > hashes, the exact code sites for the first two items, the landing procedure and the trap list).

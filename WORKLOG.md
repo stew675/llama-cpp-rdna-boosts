@@ -1,5 +1,63 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-11 (10) — `iq4_nl` becomes a first-class FA KV type (F3 step 2), and the beta re-cut finds a Block 15 blocker
+
+**Canonical tip `6d3155faa`** (block 08 amended a fifth time, block 14 a fifth time), net tree
+`0c3f0c2c2f4e7439d9489d45573a4021a8eee106`, 15 blocks, clean-apply strict 15/15 with 0 whitespace
+warnings and the applied tree equal to the canonical one; the sim build's generated text is
+byte-identical to the canonical build's (only its `build : <sha>` banner line differs, because the sim
+chain has its own commit SHAs) and its `iq4_nl` text gate reproduces the canonical value.  Delivery
+`main` carries the regenerated set (`rdna-boosts-all.patch` 22 233 lines, 115 files, +17 203/-935) and
+the **8th** block-15 beta re-cut (`d0f71b2e8`, tree `39540b7f4fd8e8569dee64bfa3ee84bf1b20e75d`, patch
+3 787 lines).
+
+**The task: F3 step 2 = `iq4_nl`** (brief
+`wip/kv-quant-purity-followups/HANDOVER-2026-09-11-f3-step2-iq4_nl.md`) — the last sub-`q8_0` KV type,
+and the smallest cache of the set (288 MiB at c=32768 on the 4B, tied with `q4_0`, -72 % vs f16).
+Before this, `iq4_nl` produced **no flash-attention call at all**: the predicate's `default:` clause
+rejected it, the FA probe then disabled FA for the whole context.  After: **4B pp512 2269.8 -> 7931.8
+t/s, tg32 48.5 -> 95.0** (`q4_0` 7913.1/96.8, f16 7981.7/99.7); dense models unchanged (27B 3-GPU
+tensor pp8192/16384 within 0.7 % of f16, 4B pp8192 -2 %); `-sm tensor` now accepts the type.
+
+**The mechanics were bookkeeping, not a new kernel** — the tile/MMA families stage K/V through
+`ggml_get_to_fp16_cuda`, which already covers `iq4_nl` upstream.  What was missing: the predicate case,
+the **15 `fattn-vec-instance-iq4_nl-*.cu` pairs** (upstream's generated cross product never had them
+because `TYPES_KV` did not list the type - they ship with that list now, and `FA_ALL_QUANTS` gains its
+15 pairs so that build mode stays complete), the K-side `vec_dot_fattn_vec_KQ_iq4_nl` (perm-based
+`get_int_from_table_16` lookup, no bias) and V-side `dequantize_V_iq4_nl` (the q4_0/q5_0 nibble layout,
+the `kvalues_iq4nl` table, no `-8`/`-16`) in `fattn-common.cuh`, the three CMake default lists, and - the
+**one real latent bug** - the non-contiguous FA staging converter: `ggml_get_to_fp16_nc_cuda()` returned
+`nullptr` for `iq4_nl` and `launch_fattn` called it, so any K/V *view* would have been a null-pointer
+call.  Unreachable before (no FA path for the type), instant on the first `iq4_nl` backend-op case: the
+very first `-o FLASH_ATTN_EXT` run **SIGSEGV'd in `launch_fattn<64,2,1>`**.  Fixed with
+`dequantize_q4_nl` + all three NC switches.
+
+**Gates** (final binary): `FLASH_ATTN_EXT` **5935/5935** (was 5599 - the 336 `iq4_nl` cases now run,
+incl. mask/sink/alibi/softcap/permute/view variants), `FLASH_ATTN_QSA` **22/22** (two new cases at the
+model's own geometry D=256 / gqa=12), `GATED_DELTA_NET` 46/46; `W=1..8` pure on 4B (1 GPU, both `RS`),
+27B (both splits), MoE, gemma-4-E4B and qwen4exp (both splits, default **and** QSA-forced); qwen4exp text
+`plain == n_max 3 == n_max 7` = `acd18ad2d55c` (tensor) / `a38a6e2d8efa` (layer) with the f16/q4_1
+controls unmoved; MTP `n_max 3` 0.52727 (pos-1 0.757) and 27B f16 0.82716; perplexity oracle qwen4exp
+tensor `iq4_nl` sparse 6.5244 / dense 6.4930 (controls within +-0.006, `iq4_nl` +0.031).  The vec-family
+helpers are NVIDIA-only code on AMD, so they were validated by **forcing** the chooser to VEC with a
+temporary env-gated instrument: 5935/5935 again with 880 forced hits (the instrument was reverted before
+landing).
+
+**Two open items, both filed** (`TODO.md`): (a) qwen4exp prefill is ~8-12 % slower for `iq4_nl` than for
+f16/`q4_0`/`q4_1` at pp8192+, growing with context, even though `q4_0` has the identical byte layout —
+`rocprofv3` shows it is **not** this amendment's code (QSA `iq4_nl` 1318.5 ms vs `q4_0` 1335.8 ms, same
+VGPR/LDS/occupancy; dequant kernels identical at 1.2 ms; the executed graph identical at 1010 nodes, 0
+diff; the traced kernel sum *lower* for `iq4_nl`), so the follow-up targets the host/launch side (the
+per-type indexer op counts and the dense/sparse topology-flip sync); (b) **Block 15's
+`LLAMA_QSA_SPARSE_FA=0` dense masked arm is broken for every KV type** (PPL ~1.05 vs the delivery's
+6.49-6.55) — found by the 8th re-cut, pre-existing (the 7th re-cut reproduces it), not fixable by any
+Block 15 gate, and a **promotion blocker** because that arm is this repo's quality oracle; the beta
+records (`BETA-TESTING.md` §4c/§4d) now carry the evidence and add the oracle to the beta gate list.  The
+re-cut also confirmed the beta's production path is byte-identical to the delivery (f16/q4_1 texts,
+`iq4_nl` text, MTP acceptances, width purity, `FLASH_ATTN_QSA` 22/22, `FLASH_ATTN_EXT` 5940/5940,
+`LLAMA_QSA_OFF=1` PPL) apart from W2's ULP-level derived-bias sensitivity on `iq4_nl` (benign: identical
+sparse-arm PPL).
+
 ## 2026-09-11 (9) — the QSA kernel gets an oracle, four more KV types, and a head-group fix (quality)
 
 **Canonical tip `a0cd6ce02`** (block 14 amended a fourth time; block 13 `1a88c92f5`), net tree

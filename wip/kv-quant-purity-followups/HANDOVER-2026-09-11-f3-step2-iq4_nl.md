@@ -317,3 +317,38 @@ splits; the tensor-split perf table is recorded; the non-QSA sweeps reproduce; c
 the follow-ups that remain are the ones listed in `TODO.md` (the tensor-tuned `iq4_nl`/QSA prefill
 crossover gate, the QSA fused-op probe, the gfx1151 bundle, and the block-15 promotion when its beta
 window closes).
+
+## 9. OUTCOME — landed 2026-09-11 (10), F3 complete
+
+**Both halves landed** (block 08's fifth amendment + block 14's fifth), canonical tip **`6d3155faa`**
+(tree `0c3f0c2c2f4e7439d9489d45573a4021a8eee106`), clean-apply strict 15/15 with 0 whitespace warnings and
+the applied tree equal to the canonical one.  The brief's plan held on every point (the dense half *was*
+predicate/instance/CMake bookkeeping — the tile/MMA staging already covered the type — and the QSA half was
+five small edits plus the CPU reference and the test list).
+
+**Numbers** (4B, 1 GPU): pp512 **2269.8 -> 7931.8**, tg32 **48.5 -> 95.0** (`q4_0` 7913.1/96.8, f16
+7981.7/99.7 — the brief predicted ~7700/95).  Dense models: 27B 3-GPU `-sm tensor` pp8192/16384
+2218.7/2073.6 vs f16 2231.1/2072.0 (**within 0.7 %**), 4B pp8192 -2 %.  Cache: 288 MiB at c=32768 (=
+`q4_0`, -72 % vs f16); qwen4exp 204800/ub512 tensor 450.00 + 506.26 MiB = `q4_0` exactly.
+
+**Gates**: `FLASH_ATTN_EXT` **5935/5935** (336 previously-skipped `iq4_nl` cases now run), `FLASH_ATTN_QSA`
+**22/22** (two new cases at the model's geometry D=256 / gqa=12), `GATED_DELTA_NET` 46/46; `W=1..8` pure on
+4B (both `RS`), 27B (both splits), MoE, gemma-4-E4B, qwen4exp (both splits, default + QSA-forced); text
+`plain == n_max 3 == n_max 7` = `acd18ad2d55c` (tensor) / `a38a6e2d8efa` (layer) with the f16/`q4_1`
+controls unmoved; MTP `n_max 3` 0.52727 (pos-1 0.757), 27B f16 0.82716; perplexity oracle sparse 6.5244 /
+dense 6.4930.
+
+**Two things the brief did not predict:**
+
+1. **The non-contiguous FA staging converter had no `iq4_nl` case** (`ggml_get_to_fp16_nc_cuda` ->
+   `nullptr` -> `launch_fattn` called it): the first `-o FLASH_ATTN_EXT` run **SIGSEGV'd**.  Unreachable
+   before the enablement, instant after.  Fixed with `dequantize_q4_nl` + all three NC switches.  (The
+   brief's §4a claim was right for the *contiguous* path only.)
+2. **The vec helpers needed a positive control**: they are dead code on AMD, so they were validated by
+   temporarily forcing the chooser to VEC (`GGML_CUDA_FA_FORCE_VEC=1`: 5935/5935 with 880 forced hits),
+   then reverting the instrument.  Without that, the K-side `vec_dot_fattn_vec_KQ_iq4_nl` would have
+   shipped untested.
+
+**Left for later** (both in `TODO.md`): the qwen4exp `iq4_nl` prefill delta (~8-12 % at pp8192+, growing
+with context; profiled to be host/launch-side, *not* the new code — see `GREEDY-PURITY.md` §22), and the
+Block 15 `LLAMA_QSA_SPARSE_FA=0` blocker the 8th beta re-cut found.

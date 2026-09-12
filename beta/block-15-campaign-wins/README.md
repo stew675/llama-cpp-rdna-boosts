@@ -7,7 +7,7 @@
 **Status: BETA — staged, NOT promoted (2026-09-10); REVALIDATED 2026-09-11
 against the 15-patch delivery.**  The campaign is
 complete and the block-15 patch lives **only in this directory**
-(`block-15-campaign-wins.patch`, re-cut 2026-09-11 (9) on base `a0cd6ce02`); it is **not part of the
+(`block-15-campaign-wins.patch`, re-cut 2026-09-11 (10) on base `6d3155faa`); it is **not part of the
 delivery** (`patches/` is the 15-patch set: block 00 + blocks 01-14) and is
 applied manually on top of the 15-block tree.  The beta window (~4–5 days) is open for tester feedback;
 promotion into the delivery set requires the maintainer's go-ahead (at
@@ -24,6 +24,50 @@ now a **15-patch set**: block 00 + blocks 01-14 at canonical tip **`389c5341f`**
 tree `928852cdc`, with block 13 amended twice on 2026-09-11), so the beta patch was
 re-cut and re-validated end to end.
 
+* **Re-cut an eighth time 2026-09-11 (10)** after the fifth block-08 amendment + the iq4_nl half of the
+  F3 step-2 work moved the canonical tip (block 08 gained `iq4_nl` in the FA predicate/vec dispatch/three
+  CMake default lists + the 15 missing `fattn-vec-instance-iq4_nl-*.cu` files + `dequantize_q4_nl` + the
+  three non-contiguous conversion switches; block 14 gained the QSA/CPU/oracle/`qsa_kv_native`/tensor-split
+  entries): base **`6d3155faa`** (tree `0c3f0c2c2f4e7439d9489d45573a4021a8eee106`) -> **beta commit
+  `d0f71b2e8`**, tree **`39540b7f4fd8e8569dee64bfa3ee84bf1b20e75d`**, patch **3 787 lines** (`git am -3`;
+  one real conflict again, the same place: `qwen4exp_qsa_sparse()` must now accept `GGML_TYPE_IQ4_NL` -
+  the *only* body delta vs the seventh re-cut apart from `index`/offset lines; `fattn-qsa.cu`,
+  `ggml-cpu/ops.cpp` and `tests/test-backend-ops.cpp` auto-merged, and the test file needed no fix this
+  time because the seventh re-cut's `nullptr, nullptr` fix is already in block 15's own body).  The
+  exported patch round-trips (`git am -3` on a fresh `6d3155faa` reproduces tree `39540b7f4` exactly) and
+  the tree builds (`build-beta`, 0 errors and 0 warnings from the change).
+  * **Gate verification against the delivery build (2026-09-11 (10))** - all green except the finding
+    below: qwen4exp f16 plain `804de0576868`, q4_1 plain `886292b17a93`, f16 `--spec-draft-n-max 3`
+    acceptance `0.47009` (pos-1 0.615), `iq4_nl` `n_max 3` `0.52727` (pos-1 0.757), 27B f16 `0.82716`
+    (67/81); width purity `W=1..8` one hash per (split, type) - tensor f16 `dcf1ae667f730879`, tensor
+    `iq4_nl` `676fe273a633e4da`, layer `iq4_nl` `3a94c47dbc1470e4`, QSA-forced tensor f16
+    `f400a002bd0af7df`, QSA-forced layer `iq4_nl` `146ec7b517ce1576` - **all equal to the delivery**;
+    backend-op suites `FLASH_ATTN_QSA` **22/22** (incl. the two new model-geometry `iq4_nl` cases, so
+    block 15's `cell_vis` plumbing is right for the new type), `GATED_DELTA_NET` 46/46,
+    `FLASH_ATTN_EXT` **5940/5940**; `LLAMA_QSA_OFF=1` PPL `6.5376` == the delivery's `6.5376`; the
+    production sparse PPL for `iq4_nl` `6.5244` == the delivery's `6.5244`.
+  * **BLOCKER FOUND (block 15, pre-existing, not a re-cut artefact): the dense masked arm is broken.**
+    `LLAMA_QSA_SPARSE_FA=0` gives **PPL `1.0558 +/- 0.003` for every KV type** (f16 `1.0558`, q4_0
+    `1.0552`, q4_1 `1.0500`, q8_0 `1.0552`, `iq4_nl` `1.0554`) where the delivery gives `6.49-6.55` (f16
+    `6.5377`) - a near-1 PPL is the signature of a lost causal constraint, and that arm is this repo's
+    documented *quality oracle*, so block 15 cannot be promoted in this state.  Reproduced on the
+    **seventh** re-cut too (old tip `5a0734c9d`: same `1.0558`), so it is block-15-inherent, and **no
+    block-15 gate restores it**: `LLAMA_KQ_MASK_DERIVED=0`, `GGML_QSA_DERIVED_BIAS=0
+    GGML_QSA_DERIVED_VIS=0`, `GGML_QSA_SCORE_MEM=0`, `LLAMA_QSA_KEYS_ONLY=0`, and all five together all
+    give `1.0558`; `LLAMA_QSA_OFF=1` is unaffected (`6.5376` = the delivery).  Repro:
+    `BIN=beta/build-beta/bin tools/qsa-ppl-oracle.sh tensor f16` (sparse column fine, dense column 1.05).
+    The production sparse arm and the no-indexer dense regime are provably untouched, which is why the
+    beta's own same-seed/MTP gates never caught it - **`qsa-ppl-oracle.sh` must be added to the beta
+    gate list** (see `BETA-TESTING.md`).
+  * **Known caveat for the new type: W2's derived bias is not bit-exact for `iq4_nl`.**  With the default
+    (sparse) arm the `iq4_nl` greedy text differs from the delivery (`fcb2d47f94cf`/640 chars vs the
+    delivery's `acd18ad2d55c`/671 chars) while f16/q4_1 are byte-identical; the forced-QSA tensor-split
+    probe differs the same way (`34975a35691aa387` vs `a2e272ce51bf663f`).  `GGML_QSA_DERIVED_BIAS=0
+    GGML_QSA_DERIVED_VIS=0` restores the delivery's exact values, i.e. it is W2's re-derivation of the
+    per-block bias whose last ULP flips an indexer top-k boundary on a given prompt - and since the
+    indexer key cache is quantized with the same `-ctk`, a *different* KV quantization moves that
+    boundary.  It is benign: the sparse-arm PPL is `6.5244`, identical to the delivery's `6.5244`, and
+    width purity holds.  The promotion record's "byte-identical on every model" claim needs this caveat.
 * **Re-cut a seventh time 2026-09-11 (9)** after the fourth block-14 amendment (the QSA quantized-KV
   enablement + the K/V-head chunking fix): base **`a0cd6ce02`** (tree `0966e66731`) -> **beta commit
   `5a0734c9d`**, tree **`6b1155b68b1741d7e7c6e8f80b88ed90ce406bd6`**, patch **3 787 lines**.  One real
