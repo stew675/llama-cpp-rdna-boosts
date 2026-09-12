@@ -1,5 +1,27 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-12 (7) — item 16 re-scoped (the "pin" plan is a dead end) and item 15's `-Wshadow` audit
+
+No delivery change.
+
+- **TODO item 16** (restore the ~0.9 % `tg128` the block-13 RDNA3_5 fusion skip costs): the suggested
+  "pin `nwarps`/`rps`/item-split" fix does **not** apply.  Verified against the delivery: the fused and
+  unfused dense `ncols_dst==1` arms already share the same `mul_mat_vec_q_ksplit<…,has_fusion,…>`
+  template, the same `calc_nwarps(type,1,table_id)` (RDNA3_5: 2 for `Q8_0`, else 1), `rows_per_block` 1
+  and identical launch dims; the fused epilogue uses the same `ggml_cuda_op_silu_single` as the standalone
+  GLU (`op_silu`), and `up * silu(gate)` is commutative.  Two live candidates: **(a) codegen**
+  (`has_fusion` adds registers + a second `vec_dot` in the inner loop and may contract the `tmp` FMAs
+  differently) and **(b) the Q8_1 cache** (`common.cuh:1611` — keyed on the src1 tensor/layout only, not
+  the weight type, while `quantize_row_q8_1_cuda` takes `src0->type`; fusing changes which call fills it).
+  Next step: dump `tmp`/`tmp_gate` from the ksplit kernel under an env at `W=1`.  Record
+  `wip/strix-halo/rdna35-mmvq-fusion-purity/README.md` §9.
+- **TODO item 15** (`-Wshadow` for `src/`, which would have caught the Block-15 dead-mask bug): audited by
+  replaying the tree's own host compile commands for the 186 `src/` TUs with `-Wshadow` — **128 warnings
+  in 27 files**, 46 of them the risky `shadows a local variable` class (82 are benign `shadows a field`,
+  mostly constructor params).  `src/models/qwen4exp.cpp` is clean.  Revised proposal:
+  `-Wshadow -Wno-shadow-field-in-constructor` for `src/` + fix the ~46 local sites in their own cleanup
+  block.  Record `wip/shadow-warnings/RECORD-2026-09-12-shadow-audit.md` (full 46-site list).
+
 ## 2026-09-12 (6) — QSA forced-sparse q8_0 residual (TODO item 4): it is not a width dependence; `embeddings_nextn` breaks logits-level `plain == draft-mtp`
 
 No delivery change.  Deep dive on the one open item-4 residual (forced sparse + `-ctk q8_0` + the

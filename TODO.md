@@ -179,9 +179,15 @@ Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
 The 2026-09-11 (11) blocker was a one-token shadowing bug (`ggml_tensor * kq_mask_top_k = ...` inside a
 block that already had an outer declaration of the same name) that made a whole mask chain dead code —
 silent because the code still compiles and the chain still gets built.  `-Wshadow` reports it directly.
-Not currently enabled anywhere in the build.  Proposal: add it to the fork's HIP/CUDA C++ flags (or at
-least to CI) and clean up whatever pre-existing warnings appear; keep it scoped to `src/` first.
-Reference: `GREEDY-PURITY.md` §23.3, `WORKLOG.md` 2026-09-11 (11).
+Not currently enabled anywhere in the build.  **Audited 2026-09-12 (7)**: replaying the tree's own host
+compile commands for the `llama` target (186 `src/` TUs) with `-Wshadow` gives **128 warnings in 27
+files**, of which **46 are the risky `shadows a local variable` class** (the Block-15 class) and 82 are
+benign `shadows a field` (mostly constructor params).  `src/models/qwen4exp.cpp` is clean — the delivery
+does not carry the bug.  **Revised proposal**: enable `-Wshadow -Wno-shadow-field-in-constructor` for
+`src/` (kills the constructor-param noise) and fix the ~46 local-variable sites (mechanical renames);
+doing that touches ~20 upstream `src/` files, so it wants its own block/cleanup commit to avoid colliding
+on every re-base.  Record: `wip/shadow-warnings/RECORD-2026-09-12-shadow-audit.md` (with the full
+46-site list).  Reference: `GREEDY-PURITY.md` §23.3, `WORKLOG.md` 2026-09-11 (11).
 
 ### 16. Restore the block-13 RDNA3_5 single-token fusion perf (low priority, gfx1151)
 - The block-13 RDNA3_5 mmvq purity amendment (Closed) skips the two single-token-only fusions at a cost of
