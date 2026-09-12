@@ -1,5 +1,12 @@
 # HANDOVER — remaining purity / perf work (written 2026-09-11, after the block-13 band fix)
 
+> **STATUS 2026-09-11 (10): the plan in this file is COMPLETE.**  Items 1 and 5 landed, F3 (items 2/2b)
+> landed both steps (`q4_1`/`q5_0`/`q5_1` **and** `iq4_nl`), the QSA quantized-KV work landed with a
+> quality bug fixed, and the block-15 beta re-cut found a promotion blocker.  §0 below is the
+> **history** of the 2026-09-11 (7) session and §1's ordering is spent - the live list is `../../TODO.md`
+> and the current tips are in that file's header.  **What is still useful here: §2 environment, §3
+> models, §4 instruments, §5 reference hashes, §12 landing procedure, §13 traps.**
+
 **Hand this file to the next session first.** It is self-contained: environment, binary locations,
 instruments, reference hashes, the code sites for the first two items, the landing procedure, and the
 accumulated trap list. Read §1 (the plan) and §2–§5 (environment + instruments) before touching a GPU.
