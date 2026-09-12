@@ -185,12 +185,18 @@ Reference: `GREEDY-PURITY.md` §23.3, `WORKLOG.md` 2026-09-11 (11).
 
 ### 16. Restore the block-13 RDNA3_5 single-token fusion perf (low priority, gfx1151)
 - The block-13 RDNA3_5 mmvq purity amendment (Closed) skips the two single-token-only fusions at a cost of
-  ≈ −0.9 % `tg128` on qwen4exp (25.53 vs 25.77 t/s; prefill flat).  The honest fix that keeps the win is
-  to make the fused `ncols_dst == 1` kernels reproduce the standalone `mul_mat_vec_q` reduction (pin
-  `nwarps`/`rps`/item-split — the §17 pattern), for the dense gate+up+GLU fusion and the weighted-down
-  tail, instead of skipping them; that would also retire the gfx1151 within-band variance at the kernel
-  level.  A/B: `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1`.  See `GREEDY-PURITY.md` §25 and
-  `wip/strix-halo/rdna35-mmvq-fusion-purity/README.md` §5/§7.
+  ≈ −0.9 % `tg128` on qwen4exp (25.53 vs 25.77 t/s; prefill flat).  **Re-scoped 2026-09-12 (7): the
+  "pin `nwarps`/`rps`/item-split" plan does not apply** — the fused and unfused dense arms already share
+  the same kernel template (`mul_mat_vec_q_ksplit<...,has_fusion,...>`), the same `calc_nwarps`,
+  `rows_per_block` (= 1 on RDNA3_5) and launch dims, and the fused epilogue uses the same
+  `ggml_cuda_op_silu_single` as the standalone GLU (`op_silu`).  Two live candidates: **(a) codegen** —
+  `has_fusion=true` adds registers + a second `vec_dot` in the inner loop and may contract the `tmp` (up)
+  FMAs differently; **(b) the Q8_1 cache** (`common.cuh:1611`, keyed on the src1 tensor/layout only, *not*
+  the weight type, while `quantize_row_q8_1_cuda` takes `src0->type`) — fusing changes which call fills it.
+  Next step: dump `tmp`/`tmp_gate` from the ksplit kernel under an env at `W=1` and compare the `up`
+  values bit-for-bit (match → epilogue/cache; differ → codegen).  A/B:
+  `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1`.  See `GREEDY-PURITY.md` §25 and
+  `wip/strix-halo/rdna35-mmvq-fusion-purity/README.md` §5/§7/§9.
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
 

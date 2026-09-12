@@ -179,3 +179,44 @@ HIP_VISIBLE_DEVICES=0 W=1 CTK=q8_0 CTV=q8_0 RS=0 CB=0 SPLIT=layer \
 The gfx1151 width instrument from the issue25 work
 (`wip/strix-halo/issue25/logits-width.cpp`) measures `max|W1-W3|` / `max|W3-W5|`
 directly and is the natural gate to add this fix to.
+
+## 9. Post-fold follow-up analysis (2026-09-12 (7)): the "pin nwarps/rps/item-split" plan is a dead end
+
+TODO item 16 proposed restoring the ~0.9 % `tg128` by making the fused `ncols_dst == 1` kernels
+*reproduce the standalone reduction* — "pin `nwarps`/`rps`/item-split", the §17 pattern.  Read against
+the current delivery, that plan does **not** apply: the fused and unfused dense paths are **already
+launch-identical**.  For the dense gate+up+GLU (`ids == nullptr`, no `MUL_MAT_ID`):
+
+* both go through the **same** kernel template `mul_mat_vec_q_ksplit<type, ncols_dst=1, has_fusion,
+  small_k=false, halve_iters=false, rows_per_block=0>` (`mmvq.cu` `mul_mat_vec_q_switch_fusion_ksplit`
+  vs the same function with `has_fusion=false`); the `ncols_dst == 1` dense dispatch is the
+  unconditional ksplit branch (`if (!has_ids || ncols_x >= 4096)`), so no item-split/ksplit asymmetry
+  remains — that was the *2026-09-11 dense-MMVQ-alignment* amendment, and it moved **both** arms;
+* `nwarps` comes from the same `calc_nwarps(type, 1, table_id)` (RDNA3_5: 2 for `Q8_0`, 1 otherwise),
+  `rows_per_block` from the same `calc_rows_per_block` (**1** on RDNA3_5), and `calc_launch_params`
+  produces the same `block_nums`/`block_dims` — nothing to pin;
+* inside the kernel the `tmp` (up) accumulation is textually identical; the fusion only adds a second
+  accumulator (`tmp_gate`) and the epilogue (`result_val *= ggml_cuda_op_silu_single(gate_value)`), which
+  is the **same** device function (`unary.cuh:104`) the standalone GLU kernel uses (`op_silu` ==
+  `ggml_cuda_op_silu_single`), and `up * silu(gate)` == `silu(gate) * up`.
+
+So the remaining difference is **not** a launch/reduction parameter.  The two live candidates are:
+
+1. **codegen**: `has_fusion=true` adds registers and a second `vec_dot` in the inner loop; if that makes
+   the compiler contract/associate the `tmp` FMAs differently than in the unfused instantiation, the
+   `up` value shifts by a ULP.  (Fixing that means forcing an explicit FMA order in the shared inner
+   function, or lowering the fused kernel's register pressure — not a dispatch pin.)
+2. **the surrounding graph**: `ggml_cuda_mul_mat_vec_q` quantizes `src1` to Q8_1 through
+   `ctx.q8_1_cache_get(src1_key, …)` (`common.cuh:1611`), a cache keyed on the **src1 tensor/layout
+   only — not on the weight type** (`quantize_row_q8_1_cuda(..., src0->type, ...)`).  Fusing the two
+   matmuls changes which call fills the cache for a given `x`, so if two consumers of one `x` have
+   different weight types the Q8_1 they see could differ (and the fused arm only ever quantizes with the
+   `up` type).
+
+Next instrumentation step (the only way to separate them): dump `tmp`/`tmp_gate` from the ksplit kernel
+under an env for the fused launch and `tmp` from the two unfused launches, at `W=1`, and compare the
+`up` values bit-for-bit.  If `up` matches → the epilogue/cache; if it differs → codegen.
+
+**Disposition**: TODO item 16 stays open, but re-scoped — it is *not* a "pin the parameters" fix.  The
+cost is ~0.9 % `tg128` on qwen4exp (25.53 vs 25.77 t/s, prefill flat), purity is already restored by the
+skip, so this remains low priority.
