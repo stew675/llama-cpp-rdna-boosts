@@ -31,14 +31,17 @@
 > merged cleanly (the `llama-context.cpp` region now carries both the new reject and block 15's
 > tensor-split type gate); the only delta vs the ninth re-cut is those three delivery files.  Testers must
 > pass matching `-ctk`/`-ctv`.  See `README.md` (tenth re-cut) and `BETA-TESTING.md`.
-> **Re-cut a thirteenth time 2026-09-12 (9)** after the block-14 QSA prefill crossover + device-query arm
-> gate amendment.  Base `15e3bdcbd` (tree `86b6cce726b0f0f2f3935781ed782659529b38fe`) -> **beta tip
-> `3d9b578c5`**, tree **`b214b3d9d42e294fb351a58be7f05b10fe1d9a04`**, patch **3 808 lines**.  First re-cut
+> **Re-cut a fourteenth time 2026-09-12 (9)** after the block-14 configurable QSA prefill arm +
+> device-query arm gate amendment.  Base `890a9c5b1` (tree
+> `0edf654cdea653b9969f866977a541ee4429f846`) -> **beta tip
+> `86c7df1f5`**, tree **`66f0762a2ec19cbc34b1842d1b5984bb82ecec45`**, patch **3 819 lines**.  First re-cut
 > with a real merge: block 15's hoisted `qwen4exp_qsa_sparse()` now takes `(model, hparams, il, cparams)`
 > and calls the delivery's `qsa_op_supported()` instead of its own type-list copy, and its probe tensor
 > passes block 15's two extra `ggml_flash_attn_qsa` arguments.  Round-tripped; builds clean; gfx1151
-> revalidation: `FLASH_ATTN_QSA` passes and all four gate combos plus `draft-mtp n_max 3` are
-> byte-identical (`d10a6c561b67`, 652 chars, = the delivery build's value).  See `README.md`.
+> revalidation: `FLASH_ATTN_QSA` 22/22 and all four gate combos plus `draft-mtp n_max 3` are
+> byte-identical (`0fc4910d5824`, 632 chars, = the delivery build's value).  The thirteenth re-cut is
+> **superseded — do not use** (its exported patch omitted the `nullptr, nullptr` argument and it was cut
+> against a prefill default the maintainer has since corrected to always-QSA).  See `README.md`.
 > **Re-cut a twelfth time 2026-09-12 (2)** after the block-13 RDNA3_5 single-token-only mmvq fusion skip
 > (the dense gate+up+GLU fusion and the weighted-down MoE tail; gfx1151-only, opt-in
 > `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1`).  Base `13af95ac1` (tree

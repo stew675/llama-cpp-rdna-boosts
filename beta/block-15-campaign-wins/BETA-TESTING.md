@@ -10,8 +10,8 @@ without rebuilding five times.  Every win except W4 is switchable by environment
 > block 00 + blocks 01-14), and every row below was re-checked **as a combination** on the tree built
 > from the beta patch on top of the delivered **15-block** set (fresh worktree at `9113cc188`, strict
 > **15/15** `git am` + the beta patch, fresh build): reserves, byte-identical coherence on all five
-> models, the MTP gate, and the op suites all reproduce.  The current re-cut is tip **`3d9b578c5`**
-> (base `15e3bdcbd`, tree `b214b3d9d`) and every recorded number carries forward — see the dated
+> models, the MTP gate, and the op suites all reproduce.  The current re-cut is tip **`86c7df1f5`**
+> (base `890a9c5b1`, tree `66f0762a2`) and every recorded number carries forward — see the dated
 > re-cut log below, `README.md` and `HANDOVER.md` §10.  (Earlier tip `888a59ee0`, base `13af95ac1`,
 > tree `476d2d1e9`.)
 > V3 is **on by default** (`LLAMA_KQ_MASK_DERIVED`), V4 and V5 are **opt-in through one switch**
@@ -219,33 +219,38 @@ but the hunks are far apart, so the re-cut is **metadata/offset-only** (0 change
 Nothing in the tester checklist changes: the revalidation numbers above were taken on the previous
 re-cut and the delta is metadata only.
 
-## 2026-09-12 (9) — thirteenth re-cut: the block-14 QSA prefill crossover + device-query arm gate
+## 2026-09-12 (9) — fourteenth re-cut: the block-14 configurable QSA prefill arm + device-query arm gate
 
-The base moved for a delivery amendment (TODO item 9): `qsa_dense_prefill_until` (gfx1151 8192 /
-tensor split 16384 / other 0, env `LLAMA_QSA_DENSE_PREFILL_UNTIL`) makes the prefill half of the QSA
-arch policy depth-configurable — +3.2 %/+2.7 %/+1.4 %/+0.6 % at pp4096/8192/16384/32768 on gfx1151
-and perplexity equal to the no-indexer full-dense reference below the crossover — and
-`qsa_kv_native`'s hand-maintained type list is replaced by a `ggml_backend_dev_supports_op()` query on
-a shaped probe tensor.  Base `15e3bdcbd` -> **beta tip `3d9b578c5`**, tree
-`b214b3d9d42e294fb351a58be7f05b10fe1d9a04`, patch **3 808 lines**.
+The base moved for a delivery amendment (TODO item 9): the QSA prefill axis is now depth-configurable
+(`qsa_dense_prefill_until` / `LLAMA_QSA_DENSE_PREFILL_UNTIL`) — **default `0` = QSA prefill always**,
+the documented arch policy, so nothing in the gate table moves — and `qsa_kv_native`'s hand-maintained
+type list is replaced by a `ggml_backend_dev_supports_op()` query on a shaped probe tensor.  Base
+`890a9c5b1` -> **beta tip `86c7df1f5`**, tree `66f0762a2ec19cbc34b1842d1b5984bb82ecec45`, patch
+**3 819 lines**.
 
 **This re-cut needed a real merge** (the first one): block 15 hoists the QSA arm gate out of
 `build_attn_qsa` into the file-scope `qwen4exp_qsa_sparse(const llama_cparams &)`, with its own copy of
 the kernel's type list — exactly the code the delivery now replaces.  Resolved by hoisting the query
 into block 15's helper: `qwen4exp_qsa_sparse(const llama_model &, const llama_hparams &, int il, const
 llama_cparams &)` calling `qsa_op_supported(model, hparams, il, cparams.type_k)` (so the beta inherits
-the device query and the Meta device's `all_of()` meta-split safety), with the two call sites
-(`build_attn_qsa`, `qwen4exp_want_derived_vis` and its caller) updated, and the probe-tensor call
-taking block 15's two extra `ggml_flash_attn_qsa` arguments (`nullptr, nullptr`).  The exported patch
-round-trips: a fresh worktree at `15e3bdcbd` + `git am` reproduces `b214b3d9d`.
+the device query and the Meta device's `all_of()` meta-split safety), with its call sites updated and
+the probe-tensor call taking block 15's two extra `ggml_flash_attn_qsa` arguments
+(`nullptr, nullptr`).  The exported patch round-trips: a fresh worktree at `890a9c5b1` + `git am`
+reproduces `66f0762a2`.
 
 **Revalidation (2026-09-12 (9), this re-cut's tree, gfx1151).**  Builds clean (`build-rocm`);
-`test-backend-ops -o FLASH_ATTN_QSA` passes; the gate identity holds — `--spec-type none` with the
+`test-backend-ops -o FLASH_ATTN_QSA` **22/22**; the gate identity holds — `--spec-type none` with the
 default, `GGML_QSA_SCORE_MEM=0`, `GGML_QSA_DERIVED_BIAS=0 GGML_QSA_DERIVED_VIS=0` and
-`LLAMA_QSA_KEYS_ONLY=0` all produce byte-identical text (`d10a6c561b67`, 652 chars on the 4293-token
+`LLAMA_QSA_KEYS_ONLY=0` all produce byte-identical text (`0fc4910d5824`, 632 chars on the 4293-token
 prompt, f16 KV, `-sm layer`), and `draft-mtp --spec-draft-n-max 3` produces the same value — which is
 also the delivery build's value for that config.  Nothing in the gate table moves; the memory wins are
-unaffected because W1/W2/V3/V4/V5 act on the sparse path, which is unchanged above the crossover.
+unaffected because W1/W2/V3/V4/V5 act on the sparse path, which is the same code path at every depth
+under the shipped default.
+
+**Note on the superseded thirteenth re-cut (same day).**  It was cut against the delivery's first
+(incorrect) prefill default and its exported patch carried the `nullptr, nullptr` argument only in the
+working tree, not in the commit — a clean `git am` would not have compiled.  Both are fixed here; do
+not use the thirteenth.
 
 ## 2026-09-12 (2) — twelfth re-cut: block 13's RDNA3_5 single-token-only mmvq fusion skip
 

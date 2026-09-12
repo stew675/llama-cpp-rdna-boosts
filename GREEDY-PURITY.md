@@ -978,8 +978,8 @@ unchanged: FA's tile→WMMA switch (`Q->ne[1] > 8`) and the `MMVQ_MAX_BATCH_SIZE
 
 ## 26. A regime policy is only pure if the *band* takes one arm — including the prefill half (2026-09-12 (9))
 
-§§11/16-18 are about the decode/verify band; the same structural rule governs the *prefill* side of
-the QSA arch policy, which block 14's 2026-09-12 (sixth) amendment made depth-configurable
+§§11/16-18 are about the decode/verify band; the same structural rule governs the *prefill* side of the
+QSA arch policy, which block 14's 2026-09-12 (sixth) amendment made depth-configurable
 (`qsa_dense_prefill_until`; `patches/README.md`, record
 `wip/strix-halo/qsa-item9/RECORD-2026-09-12-qsa-prefill-crossover.md`).
 
@@ -993,21 +993,28 @@ the design).  An arm gated on `n_tokens == 1` — the shape of the original caus
 is what breaks it, and the same trap applies to any new depth-keyed policy: key it on the band, not
 on the exact width.
 
-Measured on gfx1151 with the threshold live: q8_0 KV is pure across the **whole** band (`plain` ==
-`n_max 1/2/3/5/7` == `93deb49ca115`, 685 chars) and f16 is pure in both regimes.  The `mstep` width
-probe is 0 mismatches at W=4 in both regimes; W=8's 38 mismatches occur with **identical position
-lists** in both (`=0` and the new default), which is how the pre-existing item-4 residual class was
-separated from this change - a width probe alone cannot do that, only the same-run A/B can.
+**The prefill arm ships disabled, and that is its purity guarantee.**  `qsa_dense_prefill_until`
+defaults to `0` = QSA prefill always, which is the documented 2026-09-07 arch policy on both arches
+("prefill is always QSA"; Soar wins from ~8K monotonically to +181 % @160K) — so the delivered default
+selects one arm for prefill at every depth and no reference hash moves.  It is an opt-in A/B knob
+(`LLAMA_QSA_DENSE_PREFILL_UNTIL`), and switching it on is a deliberate regime change whose default
+would have to be justified with an **at-depth** measurement: the 2026-09-07 record explicitly rejects
+the whole-prompt banner shape, which is exactly what a first attempt at a default used (the record
+carries those numbers, flagged non-comparable, as a description of the knob rather than evidence).
 
-Two corollaries worth keeping:
+Verified on the amended tip (gfx1151): the default is byte-identical to the pre-amendment build —
+f16 `plain == n_max 3` = `0fc4910d5824` (632 chars) and q8_0 `plain == n_max 7` = `e8f8bba3942b`
+(626 chars, the recorded pre-amendment shallow q8_0 value) — and the `mstep` width probe is 0
+mismatches at W=4 (the W=8 38-mismatch item-4 residual class is unaffected and its position list is
+identical with and without the knob, which is how it was separated from this change).
 
-* **A regime knob is a quality knob.**  Below the crossover the old default used the lossy top-k
-  selection anyway: perplexity (8x4096, f16) is 24.7142 there versus **23.2727, exactly the
-  `LLAMA_QSA_OFF=1` full-dense/no-indexer reference** for the new default.  "Sparse is the fast
-  approximation" is a statement about the deep regime; below the crossover it was both slower
-  (+2.7 % at pp8192) and approximating.
-* **A self-limiting arm cannot lose at depth.**  The prefill arm only ever covers chunks whose `n_kv`
-  is still below the threshold, so a long prefill keeps the sparse chunks that measured faster
-  (sparse wins pp32768 by 17.4 % when it is *all* sparse) while the shallow ones - the ones that
-  measured faster dense - go dense.  That is why the policy is a strict win at every measured pp and
-  not a crossover gamble; measured +3.2 % pp4096, +2.7 % pp8192, +1.4 % pp16384, +0.6 % pp32768.
+Two corollaries worth keeping for whenever such an arm *is* enabled:
+
+* **A regime knob is a quality knob, and the default is the arbiter.**  Below a crossover the sparse
+  arm is both an approximation and (in the whole-prompt measurement) slower, so a dense arm there is
+  not obviously wrong — but "the arm is faster in my measurement shape" is not the same as "the
+  project's default should change", which is why the shipped value is the policy.
+* **A self-limiting arm cannot lose at depth.**  The arm only ever covers chunks whose `n_kv` is still
+  below the threshold, so a long prefill keeps the sparse chunks that measured faster (sparse wins
+  pp32768 by 17.4 % when it is *all* sparse) while the shallow ones go dense.  That property is what
+  would make a future at-depth-justified default safe rather than a crossover gamble.

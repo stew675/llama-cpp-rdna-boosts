@@ -7,9 +7,9 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
 `wip/*` and `benchmarks/`.
 
 **Current state (2026-09-12):** the delivery is the 15-patch set against fork point `9113cc188`
-(block 00 + blocks 01-14), canonical tip **`15e3bdcbd`** (tree `86b6cce726b0f0f2f3935781ed782659529b38fe`),
-`make-patches.sh` default tip = `15e3bdcbd`.  Block 15 (the attention-memory campaign) is **staged in
-`beta/block-15-campaign-wins/`, not promoted** (13th re-cut: `15e3bdcbd` → `3d9b578c5`).  F1/F2/F3 (the
+(block 00 + blocks 01-14), canonical tip **`890a9c5b1`** (tree `0edf654cdea653b9969f866977a541ee4429f846`),
+`make-patches.sh` default tip = `890a9c5b1`.  Block 15 (the attention-memory campaign) is **staged in
+`beta/block-15-campaign-wins/`, not promoted** (14th re-cut: `890a9c5b1` → `86c7df1f5`).  F1/F2/F3 (the
 KV-quant purity/parity campaign) are **all closed** — every KV cache type the delivery supports is
 width-pure and takes the f16 attention path — and so is the gfx1151 within-band mmvq fusion variance
 (block-13 amendment, 2026-09-12; see Closed).  The QSA *sparse* regime was re-measured on gfx1151
@@ -18,9 +18,10 @@ residual is tracked in item 4.  **Triaged 2026-09-12 (8)**: the Active list beca
 9); items 1/6/8/12 moved to *Waiting on others*, items 5(c)/5(d)/5(g)/13 to *accepted limitations*, items
 5(a)/5(b)/15/16 to *Parked*, and items 11 (MXFP4 fused gate — unreachable for the available MXFP4 MoE)
 and 14 (canonical-fork hygiene — verified) to *Closed*.  **Item 9 was then resolved and closed
-(2026-09-12 (9), block-14 amendment)** — the QSA prefill crossover (split-tuned, +2.7 % at pp8192 and
-oracle-equal perplexity below it) plus the device-query arm gate replacing the mirrored type list — so
-**Active is now items 3 and 4 only**.
+(2026-09-12 (9), block-14 amendment)** — the QSA prefill arm is now depth-configurable with the
+documented arch policy kept as its default (**0 = QSA prefill always**, so the delivery stays
+byte-identical to the pre-amendment build; the crossing numbers are recorded as an opt-in knob), plus
+the device-query arm gate replacing the mirrored type list — so **Active is now items 3 and 4 only**.
 
 ## Active (kept compact: only what this repo will work on next)
 
@@ -79,8 +80,8 @@ crossover stays.
 ## Waiting on others (not actionable in this repo)
 
 ### 1. Block 15 promotion — **UNBLOCKED** (waiting on the beta window + the maintainer's go-ahead)
-- **Live state:** the 13th re-cut is on the current base (`15e3bdcbd` → beta tip **`3d9b578c5`**, tree
-  **`b214b3d9d42e294fb351a58be7f05b10fe1d9a04`**); it builds clean, applies strict `git am`, and
+- **Live state:** the 14th re-cut is on the current base (`890a9c5b1` → beta tip **`86c7df1f5`**, tree
+  **`66f0762a2ec19cbc34b1842d1b5984bb82ecec45`**); it builds clean, applies strict `git am`, and
   revalidates (width probe `W = 1,4,8` one hash, same-seed greedy byte-identical delivery-vs-beta,
   `FLASH_ATTN_QSA` + `GATED_DELTA_NET` pass).  The dense-arm blocker and its fix are closed — see the
   Closed section; the cut is in `beta/block-15-campaign-wins/` (BETA-TESTING.md 12th-re-cut section).
@@ -193,23 +194,28 @@ crossover stays.
 
 ## Closed (one-liners; details in the dated docs)
 
-**Item 9 — the QSA prefill crossover + the device-query arm gate (closed 2026-09-12 (9), block-14 amendment).**
-Two changes in `src/models/qwen4exp.cpp`.  (a) The prefill half of the arch policy is now
-depth-configurable and split-tuned (`qsa_dense_prefill_until`: gfx1151 **8192**, tensor split
-**16384** from the recorded 3x R9700 table, other 0; env `LLAMA_QSA_DENSE_PREFILL_UNTIL`); measured on
-gfx1151 the new default is **+3.2 %/+2.7 %/+1.4 %/+0.6 %** at pp4096/8192/16384/32768 over the old
-regime (a strict win at every measured pp - the arm only covers the shallow chunks of a long prefill)
-and perplexity equals the no-indexer full-dense reference exactly (23.2727) where the old regime read
-24.7142.  (b) `qsa_kv_native`'s hand-maintained copy of the kernel's type list is replaced by a
+**Item 9 — the configurable QSA prefill arm + the device-query arm gate (closed 2026-09-12 (9), block-14 amendment).**
+Two changes in `src/models/qwen4exp.cpp`.  (a) The prefill axis of the arch policy was not
+depth-configurable at all (only the decode crossover was); it now is — `qsa_dense_prefill_until`
+(env `LLAMA_QSA_DENSE_PREFILL_UNTIL`, `K/M/G` suffixes, `0` disables the arm) lets a prefill ubatch
+whose `n_kv` is still below the threshold attend dense while storing the indexer keys, so the sparse
+path takes over above it.  **Its default is `0` = QSA prefill always on every arch and split, which is
+the documented ARCH POLICY** (`beta/qwen4exp/README.md`: "prefill is always QSA"; 2026-09-07 crossover
+record: Soar QSA wins prefill from ~8K to +181 % @160K, Halo from ~16K; a first pass that tried to set
+a default from a whole-prompt `llama-bench` A/B was corrected by the maintainer — dense is never better
+for prefill there, and that record already rejects the whole-prompt shape as non-comparable with its
+at-depth tables).  The delivery's default behaviour is therefore **byte-identical to the pre-amendment
+build** (f16 `0fc4910d5824`, q8_0 `e8f8bba3942b` = the recorded pre-amendment shallow values;
+`plain == draft-mtp n_max 3 == n_max 7`), so no reference hash moves and the arm is an opt-in A/B.
+(b) `qsa_kv_native`'s hand-maintained copy of the kernel's type list is replaced by a
 `ggml_backend_dev_supports_op()` query on a shaped probe tensor, so the gate is the back-end's own
-answer - and under `-sm tensor` the Meta device's `all_of()` is the meta-split safety condition; the
+answer — and under `-sm tensor` the Meta device's `all_of()` *is* the meta-split safety condition; the
 `LLM_FUSED_OP_FLASH_ATTN_QSA` probe the item suggested is structurally impossible (no QSA node exists
 in a reserve-time graph).  Gates: strict 15/15 apply (tree == canonical), `FLASH_ATTN_QSA` 22/22,
-band-pure text (q8_0 `93deb49ca115` across `plain` == `n_max 1/2/3/5/7`), `mstep` W=4 pure in both
-regimes and W=8's pre-existing 38 mismatches with identical position lists, MTP +16 % at `n_max 3`
-(pos-1 acceptance 0.667), beta re-cut on the new base.  Record:
-`wip/strix-halo/qsa-item9/RECORD-2026-09-12-qsa-prefill-crossover.md`; `GREEDY-PURITY.md` §26;
-`WORKLOG.md` 2026-09-12 (9).
+predicate table 0 mismatches (with `D=80` newly rejected), default byte-identical to pre-amendment,
+beta block-15 re-cut 14th on the new base (which also folded the missing `nullptr, nullptr` argument
+into the beta commit).  Record: `wip/strix-halo/qsa-item9/RECORD-2026-09-12-qsa-prefill-crossover.md`;
+`GREEDY-PURITY.md` §26; `WORKLOG.md` 2026-09-12 (9).
 
 **Item 11 — the MXFP4 fused gate+up+GLU MMQ is not reachable; the type-list enablement is a no-op (closed 2026-09-12 (8)).**
 Implemented and measured the planned change (add `GGML_TYPE_MXFP4` to `MMQ_GATE_TYPES` + the generated

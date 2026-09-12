@@ -1,4 +1,4 @@
-From 3d9b578c5f5132c4562e0c79427d64e0532becaa Mon Sep 17 00:00:00 2001
+From 86c7df1f59e90988755cd2c6fd53afbb9d7410d1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -202,9 +202,9 @@ WORKLOG.md 2026-09-11 (11).
  src/llama-kv-cache.h                 |  20 +-
  src/llama-memory-hybrid-idx.cpp      |  95 +++++++-
  src/llama-memory-hybrid-idx.h        |  17 +-
- src/models/qwen4exp.cpp              | 334 ++++++++++++++++++++++-----
+ src/models/qwen4exp.cpp              | 338 ++++++++++++++++++++++-----
  tests/test-backend-ops.cpp           |  55 ++++-
- 23 files changed, 1922 insertions(+), 232 deletions(-)
+ 23 files changed, 1925 insertions(+), 233 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 1a8e68103..8b9ebb315 100644
@@ -3231,10 +3231,21 @@ index 4b30994d1..c5ce4bd51 100644
                         int32_t * dst_derived_from = nullptr,
                         int32_t * dst_derived_lim  = nullptr) const;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index f268e0d93..b2540fa93 100644
+index 70e701ca3..18c58e2c7 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -1055,20 +1055,105 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
+@@ -110,7 +110,9 @@ static bool qsa_op_supported(const llama_model & model, const llama_hparams & hp
+     ggml_tensor * idx = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1,       1, 1, 1);
+     ggml_tensor * msk = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1,       1, 1, 1);
+ 
+-    const bool ok = ggml_backend_dev_supports_op(dev, ggml_flash_attn_qsa(ctx, q, k, v, idx, msk, 1.0f, 0.0f));
++    // mask form (cell_vis/q_vis are the derived-visibility alternative, not needed for a probe)
++    const bool ok = ggml_backend_dev_supports_op(dev,
++            ggml_flash_attn_qsa(ctx, q, k, v, idx, msk, 1.0f, 0.0f, nullptr, nullptr));
+     ggml_free(ctx);
+     return ok;
+ }
+@@ -1019,20 +1021,105 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
  
  // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
  // one mean-pooled indexer key scores each block; set_input resolves the cache layout
@@ -3344,7 +3355,7 @@ index f268e0d93..b2540fa93 100644
          }
      }
  
-@@ -1088,13 +1173,34 @@ public:
+@@ -1052,13 +1139,34 @@ public:
  
          res &= params.ubatch.n_tokens % n_stream == 0;
  
@@ -3381,7 +3392,7 @@ index f268e0d93..b2540fa93 100644
  
          return res;
      }
-@@ -1107,11 +1213,28 @@ public:
+@@ -1071,11 +1179,28 @@ public:
      ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
      ggml_tensor * rng       = nullptr;   // I32 [2*n_stream] derived-cache range leaf (decode only)
  
@@ -3410,7 +3421,7 @@ index f268e0d93..b2540fa93 100644
  };
  
  ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
-@@ -1140,9 +1263,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1104,9 +1229,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
      // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
      // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
@@ -3444,7 +3455,7 @@ index f268e0d93..b2540fa93 100644
  
      // env gates (per-process, read once): the fused INDEXER_SCORE op + the incremental derived
      // cache are the DEFAULT decode path (parity-verified byte-identical to the per-op chain);
-@@ -1165,13 +1309,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1129,13 +1275,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      if (it != qsa_inps.end()) {
          inp = it->second;
      } else {
@@ -3470,7 +3481,7 @@ index f268e0d93..b2540fa93 100644
          if (idx_cache && n_stream == 1) {
              // per-step derived fill range leaf: [from_s, lim_s] (one stream in decode)
              qsa->rng = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 2);
-@@ -1180,7 +1334,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1144,7 +1300,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          ggml_set_input(qsa->cell_blk);
          ggml_set_input(qsa->blk_cells);
          ggml_set_input(qsa->blk_pos);
@@ -3489,7 +3500,7 @@ index f268e0d93..b2540fa93 100644
          if (qsa->rng != nullptr) {
              ggml_set_input(qsa->rng);
          }
-@@ -1294,23 +1458,70 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1258,23 +1424,70 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
  
          // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
          // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
@@ -3544,12 +3555,12 @@ index f268e0d93..b2540fa93 100644
 +
 +                ggml_tensor * pooled_c = ggml_view_3d(ctx0, pooled, idx_dim, cb, n_stream,
 +                        pooled->nb[1], pooled->nb[2], b0*pooled->nb[1]);
-+
+ 
+-        score = summed;
 +                ggml_tensor * sc = ggml_mul_mat(ctx0, pooled_c, q3);
 +                sc = ggml_relu(ctx0, sc);
 +                sc = ggml_reshape_4d(ctx0, sc, cb, n_idx_h, n_tps, n_stream);
- 
--        score = summed;
++
 +                ggml_tensor * summed = head_sum(sc);
 +
 +                acc = acc ? ggml_concat(ctx0, acc, summed, 0) : summed;
@@ -3574,7 +3585,7 @@ index f268e0d93..b2540fa93 100644
              score = ggml_add(ctx0, score, inp->bias);
          }
      }
-@@ -1326,7 +1537,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1290,7 +1503,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      // kernel reads it as [n_kv, n_tps, n_stream] and no per-layer copy is needed
      ggml_tensor * additive = blk_bias ? kq_mask : inp->bias;
  
@@ -3590,14 +3601,14 @@ index f268e0d93..b2540fa93 100644
      cb(top_k, "indexer_top_k", il);
  
      return top_k;
-@@ -1371,8 +1589,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1335,8 +1555,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
      }
  
 -    ggml_tensor * kq_mask = inp->get_kq_mask();
 +    // Fused sparse FA (top-k cells only) vs dense masked FA: see qwen4exp_qsa_sparse().
 +    const bool qsa_sparse = qwen4exp_qsa_sparse(model, hparams, il, cparams);
- 
++
 +    // the derived visibility keys live in this layer's QSA graph input set (null on the tensor
 +    // path, where the kernel keeps gathering the mask); the mask src stays until the prunable form
 +    ggml_tensor * qsa_cell_vis = nullptr;
@@ -3617,12 +3628,12 @@ index f268e0d93..b2540fa93 100644
 +    ggml_tensor * kq_mask = qsa_derive_vis ? nullptr : inp->get_kq_mask();
 +
 +    ggml_tensor * kq_mask_top_k = nullptr;
-+
+ 
 +    if (kq_mask != nullptr) {
      // prepare new kq mask - starts filled with -INFINITY
      ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
  
-@@ -1390,7 +1630,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1354,7 +1596,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
  
      // modify KQ mask by unmasking elements that are in top_k indices
      // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
@@ -3631,7 +3642,7 @@ index f268e0d93..b2540fa93 100644
  
      // reshape to restore the original shape of KQ mask:
      // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
-@@ -1398,34 +1638,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1362,34 +1604,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
  
      // combine with the original kq mask
      kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
@@ -3667,7 +3678,7 @@ index f268e0d93..b2540fa93 100644
      ggml_tensor * cur;
  
      if (qsa_sparse) {
-@@ -1437,7 +1654,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1401,7 +1620,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          k = ggml_permute(ctx0, k, 0, 2, 1, 3);
          v = ggml_permute(ctx0, v, 0, 2, 1, 3);
  
@@ -3679,7 +3690,7 @@ index f268e0d93..b2540fa93 100644
          ggml_flash_attn_qsa_set_prec(cur, GGML_PREC_F32);
          cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
          cb(cur, "kqv_out", il);
-@@ -1546,7 +1766,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -1530,7 +1752,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
              // cannot be distinguished from a verify batch - that is the point).
              build_qsa_store_k(mctx_hyb, cur, il);
          } else {

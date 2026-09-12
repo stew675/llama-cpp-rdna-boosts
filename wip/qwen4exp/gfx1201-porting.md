@@ -228,6 +228,18 @@ session) made the ggml layer safe multi-GPU; now validate the model level end-to
       record).  DENSE_SHORTCUT=0: -15.5% pp2048.  HC_FUSION=1: -15.8% pp2048 / -14.3%
       pp8192 (gfx1151 gains reproduce).  MMID_512=1: -4.1% (2.0.3).  WEIGHTED_DOWN=1:
       no-op control ✓.  Layer-split anchor: pp2048 2238 / pp16384 1710 / tg128 37.2.
+      **CORRECTION (2026-09-12, do not reuse the "prefill crossover" line above as evidence):**
+      the "dense slightly ahead ≤16K" reading is a **whole-prompt** `LLAMA_QSA_OFF=1` comparison,
+      and the dedicated 2026-09-07 crossover record explicitly rejects that shape ("also a
+      non-comparable whole-prompt llama-cli banner") — its tables are pp2048 measured *at depth*.
+      The settled arch policy is **QSA prefill ALWAYS on gfx1201/Soar (and Halo from ~16K)**, dense
+      never better for prefill: `beta/qwen4exp/README.md` ("decode uses the dense attend below a
+      per-arch depth and QSA above; **prefill is always QSA**") +
+      `wip/archive/qwen4exp/discovery/2026-09-07-qsa-dense-crossover-tables-soar-halo.md` ("**Soar:
+      QSA for prefill ALWAYS** (wins from ~8K, monotonically to +181 % @160K)").  The **decode**
+      half of the line above stands (dense decode always on gfx1201), and that is unrelated to the
+      prefill arm.  See TODO item 9's closure and
+      `wip/strix-halo/qsa-item9/RECORD-2026-09-12-qsa-prefill-crossover.md`.
       QSA depth interleaves double as partial 2.2 depth rows.
 - [x] **2.2** Depth rows (12k/32k, r1) + memory stability −r3 through 32k.
       DONE 2026-09-07 — default tensor bf16 current-state ladder (1.1+mmid in):

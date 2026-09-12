@@ -147,8 +147,8 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `15e3bdcbd`, net tree
-  `86b6cce726b0f0f2f3935781ed782659529b38fe`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `890a9c5b1`, net tree
+  `0edf654cdea653b9969f866977a541ee4429f846`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the whole-batch
 K-independent chunked GDN prefill; block 08 amended 2026-09-11 with the
@@ -168,13 +168,13 @@ block 14 amended 2026-09-11 with the
 hyper-connection decode/verify band fix, again with the QSA decode-arm
 band, again with the QSA-vs-KV-type arm gate + the tensor-split gate
 narrowing, and again with the `iq4_nl` QSA/CPU-oracle/test entries, and again
-2026-09-12 (sixth) with the QSA prefill crossover + the device-query arm gate —
-the prefill half of the arch policy is now depth-configurable and split-tuned
-(`qsa_dense_prefill_until`: gfx1151 8192, tensor split 16384, other 0; env
-`LLAMA_QSA_DENSE_PREFILL_UNTIL`), which is +3.2 %/+2.7 %/+1.4 %/+0.6 % at
-pp4096/8192/16384/32768 on gfx1151 (a strict win at every measured pp — the arm
-only covers the shallow chunks of a long prefill) and reads exactly the
-no-indexer full-dense perplexity (23.2727) where the old regime read 24.7142, and
+2026-09-12 (sixth) with the configurable QSA prefill arm + the device-query arm gate —
+the prefill axis is now depth-configurable (`qsa_dense_prefill_until`, env
+`LLAMA_QSA_DENSE_PREFILL_UNTIL`) with the documented arch policy preserved as its
+default: **0 = QSA prefill always, every arch and split** (the 2026-09-07 policy —
+Soar QSA wins prefill from ~8K monotonically to +181 % @160K, Halo from ~16K), so
+the delivery stays byte-identical to the pre-amendment build and the arm is an
+opt-in A/B, and
 `qsa_kv_native`'s hand-maintained copy of the kernel's type list is replaced by a
 `ggml_backend_dev_supports_op()` query on a shaped probe tensor (under `-sm
 tensor` the Meta device's `all_of()` IS the meta-split safety condition) — see the
@@ -637,7 +637,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `15e3bdcbd`): `git format-patch --start-number 0` the block
+blocks tip `890a9c5b1`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -646,7 +646,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `15e3bdcbd`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `890a9c5b1`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

@@ -1,0 +1,40 @@
+We need answer user: farmer has 17 sheep. All but 9 run away. Then he buys twice as many as remain. How many sheep? Show reasoning step by step, then write same logic as TypeScript function.
+
+Need solve: initial 17. All but 9 run away means 9 remain. Buys twice as many as remain: remain=9, buys 18. Total = 9+18=27. Need TypeScript function. Could be simple:
+function sheepCount(initial: number, remainingAfterRunaway: number): number { const remain = remainingAfterRunaway; const bought = 2 * remain; return remain + bought; }
+But "same logic" maybe function with initial? Since all but 9 run away, initial irrelevant except to know remain? Could implement:
+function countSheep(initialSheep: number, remainingAfterRunaway: number): number {
+  const remaining = remainingAfterRunaway; // all but 9 run away
+  const bought = remaining * 2;
+  return remaining + bought;
+}
+Or more literal:
+function sheepCount(initial: number, allBut: number): number {
+  const remaining = allBut; // all but 9 run away
+  const bought = remaining * 2;
+  return remaining + bought;
+}
+Maybe include example: sheepCount(17,9) => 27.
+Need final with step-by-step and TS. Ensure no hidden trick? "All but 9 run away" means 9 left. "buys twice as many as remain" could mean twice as many as remain after run away = 18. Total 27. Some might misread "twice as many as remain" as twice as many as he had? No, remain = 9. Good.
+
+Need final concise but detailed enough. Include TypeScript function maybe typed, maybe with comments. Could also make function that takes initial and number that remain: 
+export function sheepCount(initialSheep: number, remainingAfterRunaway: number): number {
+  const remaining = remainingAfterRunaway;
+  const bought = remaining * 2;
+  return remaining + bought;
+}
+console.log(sheepCount(17, 9)); // 27
+
+But if "same logic" maybe function should compute from initial and allBut? Since all but 9 run away, remaining = 9. If we want use initial: const remaining = 9; initial not used. Could avoid unused parameter by not including initial. But user asks same logic as TS function. Could define:
+function sheepCount(initial: number, allBut: number): number {
+  const remaining = allBut; // all but 9 run away
+  const bought = remaining * 2;
+  return remaining + bought;
+}
+But initial unused. Could use initial to validate? e.g. if (allBut > initial) throw. But not necessary. Maybe better:
+function sheepCount(initialSheep: number, remainingAfterRunaway: number): number {
+  if (remainingAfterRunaway > initialSheep) throw new Error(...);
+  const bought = remainingAfterRunaway * 2;
+  return remainingAfterRunaway + bought;
+}
+This uses initial for sanity. But "same logic
