@@ -649,7 +649,7 @@ with the kill-switch all of them `bd138ad2326fbbf2` (a uniform unfused reference
 value); qwen4exp was unaffected (`plain == n3 == 804de0576868`).  The asterisk is gone: the MoE decode
 and verify batches now take one arithmetic, so the `n_max <= 7` guarantee covers MoE too.
 
-## 18. The QSA *sparse* regime is width-pure on gfx1151; one q8_0 residual remains (2026-09-12)
+## 18. The QSA *sparse* regime is width-pure on gfx1151; one q8_0 residual remains (2026-09-12; extended 2026-09-12 (6))
 
 §18 previously recorded **two** width-dependences in the QSA sparse regime, measured 2026-09-11 during
 the cause-3 hunt (on the 3-GPU gfx1201 box, with the sparse arm forced by
@@ -677,15 +677,32 @@ therefore stays: there is no purity driver to make gfx1151 dense-decode at every
 **One residual, q8_0-only and prompt-dependent (open).**  With the arm *forced* sparse at shallow
 context, qwen4exp + `-ctk q8_0` diverges on one prompt (`/tmp/p5000.txt`: `plain a57bc13bbf2a` vs
 `n3 3124adfd2b94`), reproducibly; f16/bf16/q4_0/q4_1/iq4_nl and q8_0 on other prompts are pure, and
-the default deep q8_0 config is pure — a ULP-level width dependence.  `LLAMA_QSA_SPARSE_FA=0` does
-**not** reconcile it (so the standard masked-FA path is affected too, not just the fused `fattn-qsa`
-kernel), `LLAMA_QSA_OFF=1` does, and `GGML_CUDA_DISABLE_FUSION=1` / `GGML_CUDA_GDN_CHUNKED=0` each
-perturb it to purity (both move the whole stream, so they localise nothing by themselves).  Root cause
-is **unlocalised** — next step is a node-dump/op-trace rebuild (`GGML_CUDA_OP_TIMING` is not compiled
-into the shipped build; `tools/node-dump-instrumentation.patch` is the instrument) to diff the W=1 and
-W=4 graphs.  It is tracked as TODO item 4.  Repro knobs: `LLAMA_QSA_DENSE_DECODE_UNTIL=0` and the KV
-type; record `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`; the arm trace is kept at
-`wip/kv-quant-purity-followups/tools/qsa-arm-trace.patch`.
+the default deep q8_0 config is pure.  `LLAMA_QSA_SPARSE_FA=0` does **not** reconcile it (so the
+standard masked-FA path is affected too, not just the fused `fattn-qsa` kernel), `LLAMA_QSA_OFF=1`
+does, and `GGML_CUDA_DISABLE_FUSION=1` / `GGML_CUDA_GDN_CHUNKED=0` each perturb it to purity.  It is
+tracked as TODO item 4.
+
+**Extended the same day (2026-09-12 (6)) — it is *not* a width dependence.**  A multi-step,
+teacher-forced replay (new instrument `wip/strix-halo/qsa-item4/mstep.cpp`) of the plain greedy sequence
+in the exact residual config is **bit-pure at every verify width** — 200 positions, `W = 1..8`, with a
+spec-like batch+rollback schedule (`RB`), with deliberately unrelated tokens in the rolled-back rows
+(`JUNK`), and with `n_rs_seq` 0 vs 2/3 — the recurrent snapshot rollback restore is exact and the
+rolled-back content does not leak.  The divergence has a sharp **binary toggle at `--spec-draft-n-max`
+2** (`n_max 1` pure at 31.1 t/s, i.e. MTP genuinely active; `n_max 2/3/5/7` all identical, first diff at
+char 458).  Ruled out: `n_rs_seq`, `n_outputs_max` (`1 + n_max`), CUDA-graph capture
+(`GGML_CUDA_GRAPH_OPT=0`), and the chunked-GDN prefill boundary — the boundary is a real hazard (moving
+it by one token changes the greedy text) and it is why `GGML_CUDA_GDN_CHUNKED=0` moves the *plain* stream
+at char 49, but an instrumented `gated_delta_net.cu` shows the actual chunked-GDN call sequence is
+**identical** between the two runs (144 calls, same sizes).  So those two "reconciles" are perturbations,
+not localisers.  The one measurable *structural* plain-vs-MTP difference on this model is that the MTP
+driver turns on the target's `embeddings_nextn` (`common/speculative.cpp:1431`), which makes qwen4exp's
+last-layer output gather defer (`gather_now` in `src/models/qwen4exp.cpp`) and shifts the **prefill's
+last-position logits by a ULP** (`ad3acaa7…` vs `b624a79f…`) — a real logits-level violation of the
+`plain == draft-mtp` guarantee, but on its own it does not flip the replayed greedy tokens, so it is the
+leading partial cause, not the whole story.  The residual is therefore a **driver-level (plain-vs-MTP)
+divergence**; the next step is a faithful mini-MTP driver (target + draft + real proposals + driver
+rollback, per-step target-logit dump), because everything cheaper is exhausted.  Repro + instruments:
+`wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`.
 
 ## 19. Purity first: the measured trade (2026-09-11, policy)
 

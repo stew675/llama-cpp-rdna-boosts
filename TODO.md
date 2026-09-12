@@ -75,12 +75,29 @@ fusion (§25) — the pre-fix divergence reproduces only with
 `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1`.  **Default gfx1151 configs are pure** (shallow dense:
 every KV type incl. q8_0; deep sparse at ~74K: f16 `83e0ed0f0f80`, q8_0 `7205399d367d`), so the 64K
 crossover stays.
-- **Open, unlocalised (low severity):** a prompt-dependent **q8_0** width dependence in the *forced*-sparse
-  shallow regime (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`, `/tmp/p5000.txt`: `plain a57bc13bbf2a` vs
-  `n3 3124adfd2b94`).  `LLAMA_QSA_SPARSE_FA=0` does not fix it; `LLAMA_QSA_OFF=1`,
-  `GGML_CUDA_DISABLE_FUSION=1` and `GGML_CUDA_GDN_CHUNKED=0` each perturb to purity.  Next step: a
-  node-dump/op-trace rebuild to diff the W=1 and W=4 graphs.  Record:
-  `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`; analysis `GREEDY-PURITY.md` §18.
+- **Open (low severity, re-scoped again 2026-09-12 (6) to a *driver-level* divergence).**  A
+  prompt-dependent **q8_0** dependence in the *forced*-sparse shallow regime
+  (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`, `/tmp/p5000.txt`: `plain a57bc13bbf2a` vs `n3 3124adfd2b94`).
+  `LLAMA_QSA_SPARSE_FA=0` does not fix it; `LLAMA_QSA_OFF=1` does; `GGML_CUDA_DISABLE_FUSION=1` and
+  `GGML_CUDA_GDN_CHUNKED=0` "reconcile" only by perturbing the trajectory (both move the plain stream
+  early), so neither localises it.  **Deep dive (2026-09-12 (6)): it is not a width dependence** —
+  teacher-forced replay at every verify width, with batch+rollback schedules and unrelated rolled-back
+  tokens, is bit-pure (200 positions, `W=1..8`); the snapshot rollback restore is exact; `n_rs_seq`,
+  `n_outputs_max`, CUDA-graph capture and the chunked-GDN boundary (call sequence *identical* between the
+  runs) are all ruled out.  Sharp signature: pure at `--spec-draft-n-max 1`, and all `n_max 2/3/5/7`
+  land on the same divergent text (first diff at char 458).  **Two sub-items:**
+  * **(a) `embeddings_nextn` breaks logits-level plain==MTP on qwen4exp** (real defect, fixable on its
+    own): the MTP driver enables the target's export (`common/speculative.cpp:1431`), which makes the
+    last-layer output gather defer (`gather_now` in `src/models/qwen4exp.cpp`) so the last layer runs on
+    the full ubatch, shifting the **prefill's last-position logits by a ULP** (`ad3acaa7…` vs
+    `b624a79f…`).  Fix direction: keep the output path bit-identical (gather early for the logits, export
+    the full rows) or accept and document.  It does not by itself flip the replayed tokens.
+  * **(b) the char-458 token divergence itself** — driver-level; needs a faithful mini-MTP driver
+    (target + draft contexts, `embeddings_nextn`, real proposals + driver rollback, per-step target-logit
+    dump) to find the first step whose logits differ.  Everything cheaper is exhausted.
+  Instruments: `wip/strix-halo/qsa-item4/{mstep,rbprobe}.cpp`; record
+  `wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md` (the earlier disposition is
+  `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`); analysis `GREEDY-PURITY.md` §18.
 
 ### 5. Strix Halo (gfx1151) prefill-gap follow-ons (all prefill; decode is closed)
 Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:

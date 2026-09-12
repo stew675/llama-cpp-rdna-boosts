@@ -1,5 +1,34 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-12 (6) — QSA forced-sparse q8_0 residual (TODO item 4): it is not a width dependence; `embeddings_nextn` breaks logits-level `plain == draft-mtp`
+
+No delivery change.  Deep dive on the one open item-4 residual (forced sparse + `-ctk q8_0` + the
+`p5000` prompt: `plain a57bc13bbf2a` vs `n3 3124adfd2b94`).
+
+- **It is not a decode/verify width dependence.**  A new multi-step teacher-forced replay
+  (`wip/strix-halo/qsa-item4/mstep.cpp`) of the plain greedy sequence in the exact residual config is
+  bit-pure at every width: 200 positions, `W = 1..8`, with a spec-like batch+rollback schedule, with
+  unrelated tokens in the rolled-back rows, and with `n_rs_seq` 0 vs 2/3 — 0 mismatches.  The recurrent
+  snapshot rollback restore is exact and rolled-back content does not leak.
+- **Sharp signature:** pure at `--spec-draft-n-max 1` (MTP genuinely active, 31.1 t/s vs plain 23.7);
+  `n_max 2/3/5/7` all land on the *same* divergent text (first diff char 458).
+- **Ruled out:** `n_rs_seq`, `n_outputs_max` (`1+n_max`), CUDA-graph capture (`GGML_CUDA_GRAPH_OPT=0`),
+  and the chunked-GDN prefill boundary — the boundary is a real hazard (moving it by one token changes
+  the text) and it is why `GGML_CUDA_GDN_CHUNKED=0` moves the *plain* stream at char 49, but an
+  instrumented `gated_delta_net.cu` shows the actual chunked-GDN call sequence is **identical** between
+  the runs (144 calls, same sizes).  So `GDN_CHUNKED=0` / `DISABLE_FUSION=1` "reconcile" by perturbing
+  the trajectory, not by localising the cause (correcting the earlier record's reading).
+- **New concrete defect:** the MTP driver enables the target's `embeddings_nextn`
+  (`common/speculative.cpp:1431`), which makes qwen4exp's last-layer output gather defer
+  (`gather_now` in `src/models/qwen4exp.cpp`) so the last layer runs on the full ubatch — the **prefill's
+  last-position logits shift by a ULP** (`ad3acaa7…` vs `b624a79f…`).  That is a real logits-level
+  violation of the `plain == draft-mtp` guarantee (item 4(a)), though it does not by itself flip the
+  replayed tokens.
+- **Disposition:** item 4 stays open, re-scoped to a driver-level divergence; the next step is a faithful
+  mini-MTP driver (target + draft, per-step target-logit dump), since everything cheaper is exhausted.
+  Records: `wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`; analysis `GREEDY-PURITY.md` §18;
+  `TODO.md` item 4.
+
 ## 2026-09-12 (4) — QSA sparse-regime width purity on gfx1151: items 4/7 re-measured (item 4 re-scoped, item 7 closed)
 
 No delivery change.  Re-measured the two QSA-*sparse*-regime width dependences that TODO item 4 recorded
