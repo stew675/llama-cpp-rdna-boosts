@@ -146,12 +146,25 @@ Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
   meta-split inconsistency.
 
 ### 10. Fused shared-expert kernel: column-block it (~2.4 % at the widest verify batches)
-- The epilogue band-uniformity fix is `grid = (nrows, ncols)` — one block per `(row, token)` — so the
-  down-weight row is re-read once per token (35B-A3B `llama-batched-bench`, `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1`
-  as the A/B: pl=8 332.1 fused vs 341.5 unfused; pl=4 252.0 vs 254.2; pl=1 unchanged).
+**Re-verified 2026-09-11 (12): still open, and the premise is in the code.**  `shexp_down_gated_q8_0`
+(`ggml/src/ggml-cuda/mmvq.cu`) is launched with `block_nums(nrows, ncols)` — the comment says "One block
+per (output row, token): the token only selects the input/output columns" — so the down-weight row is
+re-read once per token.  This is the *deliberate* cost of the 2026-09-11 band-uniformity amendment (item
+5): the fused gate+down chain serves the whole band (`n_tokens <= MMVQ_MAX_BATCH_SIZE`) and is pinned to
+the single-token reduction order so decode == verify; the unfused chain stays only as the
+`GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` A/B reference.
+- Measured cost (35B-A3B `llama-batched-bench`, fused vs unfused A/B): pl=8 332.1 vs 341.5 t/s, pl=4
+  252.0 vs 254.2, pl=1 unchanged ⇒ ~2.4-2.8 % at the widest verify batches.  With
+  `--spec-draft-n-max` now capped at 7, the payout band is exactly `pl <= 8` (the widest *supported*
+  verify batch), so the item is current rather than historical.
 - Fix = the `mul_mat_vec_q` pattern: template the kernel on `ncols_dst` and keep the token loop *inside*
   the k-block loop (one weight read per row block, per-token accumulators), which stays bit-identical per
-  token.  Not a purity issue.  Where: block 13.
+  token.  **Two constraints from the code:** (a) `nwarps` must stay pinned to the single-token value
+  (`calc_nwarps(GGML_Q8_0, 1, table_id)` sets `blocks_per_iter` and hence the reduction order — a
+  width-dependent `nwarps` would re-break decode == verify); (b) it is **not** acceptable to instead
+  disable the fusion above some width — the `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1` path makes "decode and
+  verify differ, as before the 2026-09-11 band amendment", i.e. it is the *forbidden* (impure) route.
+  Not a purity issue if done as described.  Where: block 13.
 
 ### 11. MXFP4 (and NVFP4) fused gate+up+GLU MMQ — the last block-13 item
 - `ggml_cuda_mul_mat_q_switch_type_gate` is instantiated for Q3_K/Q4_K/Q5_K/Q8_0/Q6_K only, so the
