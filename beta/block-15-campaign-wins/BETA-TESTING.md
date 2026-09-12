@@ -122,7 +122,13 @@ on the older tip `5a0734c9d` reproduces `1.0558` exactly) and **no Block 15 gate
 (`LLAMA_KQ_MASK_DERIVED=0`, `GGML_QSA_DERIVED_BIAS=0 GGML_QSA_DERIVED_VIS=0`, `GGML_QSA_SCORE_MEM=0`,
 `LLAMA_QSA_KEYS_ONLY=0`, and all of them together → all `1.0558`), while `LLAMA_QSA_OFF=1` (`6.5376`) and
 the production sparse arm (`6.5244` for `iq4_nl`, `6.5394` for f16) are byte-identical to the delivery.
-Repro: `BIN=<beta>/build-beta/bin tools/qsa-ppl-oracle.sh tensor f16`.
+Repro: `BIN=<beta>/build-beta/bin tools/qsa-ppl-oracle.sh tensor f16`.  **Session brief (2026-09-11,
+with the narrowed search space): `../../wip/block15-dense-arm/HANDOVER-2026-09-11-block15-dense-arm.md`.**
+Since this was written: the dense arm also differs in a plain text run (delivery `2daa19579316` vs beta
+`d910d0b499ec`; the sparse arm stays byte-identical), it *still* differs with **`-fa off`** (so neither
+the FA kernels nor V3's derived-mask arm is at fault), and **W4 is exonerated**
+(`ab/w4-revert.patch` + rebuild + re-measure → unchanged) — the epicenter is the top-k mask chain in
+`build_attn_qsa`, which only this arm builds.
 
 ### 4d. `iq4_nl` (added to the delivery 2026-09-11 (9)/(10)) is W2-sensitive, benign.  With the default
 sparse arm the `iq4_nl` greedy text differs from the delivery (`fcb2d47f94cf` vs `acd18ad2d55c`) and the

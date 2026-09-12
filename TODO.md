@@ -23,6 +23,15 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
   sparse arm (`iq4_nl` `6.5244`, f16 `6.5394`) and `LLAMA_QSA_OFF=1` (`6.5376`) are byte-identical to the
   delivery.  Repro: `BIN=<beta>/build-beta/bin wip/kv-quant-purity-followups/tools/qsa-ppl-oracle.sh
   tensor f16`.  Evidence: `beta/block-15-campaign-wins/BETA-TESTING.md` §4c.
+  **The next session's brief — and the narrowed search space — is
+  `wip/block15-dense-arm/HANDOVER-2026-09-11-block15-dense-arm.md`** (read it first): the dense arm
+  also differs in a *plain text* run (delivery `2daa19579316` vs beta `d910d0b499ec` while the sparse
+  arm stays byte-identical), it still differs with **`-fa off`** (so it is *not* the FA kernel or V3's
+  derived-mask arm), and **W4 is exonerated** (`ab/w4-revert.patch` + rebuild → identical).  The
+  epicenter is the **top-k mask chain** in `build_attn_qsa` — which only the dense arm builds (the
+  sparse arm skips it, that being the -800 MiB mask win) — so look at the graph/mask/allocator side
+  (`llama-graph.*`, `llama-kv-cache.*`, `llama-memory-hybrid-idx.*`, `ggml.c`/`ggml.h`,
+  `llama-context.cpp`).
 - **Second, benign finding:** W2's derived per-block bias is not bit-exact for `iq4_nl` (the greedy text
   differs, `GGML_QSA_DERIVED_*=0` restores it) — the last ULP flips an indexer top-k boundary; the
   sparse-arm PPL is identical, so it is a rounding sensitivity, not a defect.  See the same file §4d.
@@ -31,11 +40,12 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
   `src/models/qwen4exp.cpp` conflict, round-trips exactly, builds clean.  Verified against the delivery:
   f16/q4_1/`iq4_nl` texts, MTP (27B `0.82716`, f16 `0.47009`, `iq4_nl` `0.52727`), `W=1..8` purity,
   `FLASH_ATTN_QSA` 22/22, `FLASH_ATTN_EXT` 5940/5940, `LLAMA_QSA_OFF=1` PPL — all equal.
-- **Next:** root-cause the dense-arm defect.  What is *known*: it is not the QSA kernel (the sparse arm is
-  bit-identical to the delivery), not the no-indexer dense path (`LLAMA_QSA_OFF=1` matches), and not any
-  single gate the beta exposes.  Leads: the dense arm builds its mask from `inp->get_kq_mask()`
-  (`src/models/qwen4exp.cpp`, `kq_mask = qsa_derive_vis ? nullptr : inp->get_kq_mask()`) and then adds the
-  top-k `set_rows` term — so the mask *plumbing*, not the knobs, is where to look.  Then the
+- **Next:** root-cause the dense-arm defect (brief: `wip/block15-dense-arm/HANDOVER-2026-09-11-block15-dense-arm.md`;
+  start with the node-dump instrumentation on the dense arm, which finds the first diverging tensor).
+  What is *known*: not the QSA kernel, not the FA kernels, not V3's derived-mask arm (`-fa off` still
+  differs), not W4, not the no-indexer dense path (`LLAMA_QSA_OFF=1` matches), not any gate the beta
+  exposes, and not the perplexity harness (a text run shows it too).  The epicenter is the top-k mask
+  chain in `build_attn_qsa` (built only by the dense arm) ⇒ the graph/mask/allocator side.  Then the
   ~4–5 day beta window + the maintainer's go-ahead; tester material is `BETA-TESTING.md` (its gate list
   now includes the perplexity oracle, which is what caught this).  Six wins, gates: W1
   `GGML_QSA_SCORE_MEM`, W2 `GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`, W3 `LLAMA_QSA_KEYS_ONLY`, W4
