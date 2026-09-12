@@ -210,7 +210,7 @@ Reference: `GREEDY-PURITY.md` §23.3, `WORKLOG.md` 2026-09-11 (11).
 Re-measured on the current delivery tip (35B-A3B Q4_K_M, 1 GPU, `-p 2048`/`-p 16384`, interleaved
 `GGML_CUDA_DISABLE_MOE_MMQ_FUSION` off/on ×3): fusion active **+0.6 %** at pp2048
 (1711.9/1710.2 vs 1710.1/1701.4 t/s) and **+0.6 %** at pp16384 (1485.3/1485.8 vs 1476.4/1478.6), the
-fusion fires, prefill absolute ~1710/1485 t/s.  So the arm is **kept** (small but real Strix win, not
+fusion fires, prefill absolute ~1710/1485 t/s.  So the arm is **kept** (a small but real Strix win).
 
 **The gfx1151 dense-decode-at-every-depth policy (TODO item 7, closed 2026-09-12).**  The proposed
 workaround (force gfx1151 decode dense at every depth, so the sparse regime becomes unreachable) was

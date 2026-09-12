@@ -10,12 +10,15 @@ compacted, so treat this file (plus the docs it points at) as the source of trut
 2. **Close out the remaining gfx1151 work** (§3–§5).
 
 > **OUTCOME (2026-09-12, this session).**  Goal 1 is done — `TODO.md`'s Active list is now active-only
-> (state header refreshed, closed items moved to the Closed section).  Of goal 2, **items 4 and 7 were
-> re-measured and disposed** (record `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`,
-> `GREEDY-PURITY.md` §18): the two recorded sparse-regime items were artifacts of the block-13 mmvq
-> fusion (fixed 2026-09-12), **default gfx1151 configs are pure**, item 7 is **closed**, and item 4 is
-> re-scoped to a prompt-dependent q8_0 *forced*-sparse residual (open, unlocalised).  **Still open:**
-> item 5 (prefill follow-ons), item 6 (gfx1151 Phase-3 fingerprint), item 16 (fusion perf).
+> (state header refreshed, closed items moved to the Closed section).  Of goal 2:
+> **items 4 and 7 were re-measured and disposed** (record
+> `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`, `GREEDY-PURITY.md` §18): the two recorded
+> sparse-regime items were artifacts of the block-13 mmvq fusion (fixed 2026-09-12), **default gfx1151
+> configs are pure**, item 7 is **closed**, and item 4 is re-scoped to a prompt-dependent q8_0
+> *forced*-sparse residual (open, unlocalised).  **Item 5(f) is closed** (the fused MoE gate+up+GLU
+> still wins ~+0.6 % prefill on the current tip → keep).  **Still open:** item 4's q8_0 residual;
+> item 5(a) (needs the logits pin + a PPL/KL gate), 5(b)/5(c)/5(d)/5(g) (small / upstream); item 6
+> (gfx1151 Phase-3 fingerprint — needs the gfx1201 box); item 16 (fusion perf).
 
 ## 0. Session hygiene / policy
 
