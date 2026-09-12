@@ -9,15 +9,7 @@ The **current delivery** is a **15-patch set** (block 00 + blocks 01-14) against
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`):
 blocks 00-14 (`patches/0000-…0014-…`, format-patch of the
-fork's `rdna-boosts` block commits).  **Current regeneration (2026-09-11 (10))**: canonical 15-block
-tip **`124abba9e`** (net tree `d7c8e8984b8bd65838d8ae58c0f5de449d9c5d4d`), clean-apply strict 15/15
-with 0 whitespace warnings and the applied tree equal to the canonical one.  Block 08's body changed
-in this regeneration (its fifth 2026-09-11 amendment: the `iq4_nl` FA enablement -- the predicate, the
-15 new `fattn-vec-instance-iq4_nl-*.cu` files, `dequantize_q4_nl` and the three non-contiguous
-converters) and block 14's did too (its fifth: the QSA kernel/CPU-reference/`qsa_kv_native`/
-tensor-split-gate/test entries); block 15's beta patch was re-cut for it (8th re-cut) and every other
-block body is byte-identical to the 2026-09-11 (9) regeneration apart from the `From <sha>` and
-`index` lines (block 13 touches `generate_cu_files.py`, which block 08's amendment also edits).  The regeneration
+fork's `rdna-boosts` block commits).  **Current regeneration (2026-09-12 (2))**: canonical 15-block tip **`13af95ac1`** (net tree `f4791066f4a582316b1ca95f51c96cd10b905ef7`), clean-apply strict 15/15 with 0 whitespace warnings and the applied tree equal to the canonical one.  Block 13's body changed in this regeneration (its 2026-09-12 amendment: the RDNA3_5 single-token-only mmvq fusion skip -- the dense gate+up+GLU fusion and the weighted-down MoE tail) and every other block body is byte-identical to the previous regeneration apart from the `From <sha>`/`index` lines (block 14's hunks shift line numbers only).  The previous regeneration was 2026-09-11 (10) (tip `124abba9e`, block 08/14 bodies changed, block 15 re-cut 8th).  **The beta block-15 patch still needs its re-cut on this base** -- the 8th re-cut was on the 2026-09-11 (10) tip.  The regeneration
 is always run against a canonical fork **rebuilt at the fork point**, because the reference
 `~/llama.cpp` checkout had drifted two upstream master commits past `9113cc188` (`f3f1a8f27`,
 `304665fe7` — SYCL + iGPU-only code) and a `format-patch` there would export those as patches
@@ -173,7 +165,7 @@ per-win measurement tables are in `beta/block-15-campaign-wins/README.md`.
 
 Apply + regeneration verification (the 14/14 / `[PATCH NN/14]` / `ff2b35f49`
 figures below are the then-current state; block 00 was added 2026-09-10, so the
-current delivery is the 15-patch set `0000`-`0014`, tip `124abba9e`):
+current delivery is the 15-patch set `0000`-`0014`, tip `13af95ac1`):
 
 - fresh worktree at `9113cc188` -> `scripts/apply-all.sh` (**strict 14/14
   `git am`** for the then-14-patch delivery, zero whitespace warnings) + the beta

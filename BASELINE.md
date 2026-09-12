@@ -33,13 +33,14 @@ bottom of this file): block 00 = the structural/architecture fixes added
 2026-09-10 (FA small-batch KV-split width invariance + Vulkan masked-V), and
 blocks 01-14 = the fork's `rdna-boosts` block
 commits on `9113cc188` (the canonical 15-block tip is block 14
-`124abba9e`; block 02 amended 2026-09-11 with the
+`13af95ac1`; block 02 amended 2026-09-11 with the
 K-independent whole-batch chunked GDN prefill (free; the
 `GGML_CUDA_GDN_ALIGN_BOUNDARY` gate and its K-dependent branches removed; +
 rollback guard), block 08 amended 2026-09-11 with the decode/verify FA kernel-family fix, the
 quantized-KV-type enablement (`q4_1`/`q5_0`/`q5_1`) and the `iq4_nl` enablement (predicate, the 15
 new vec instances, `dequantize_q4_nl`, the non-contiguous converters), and block 13 amended
-2026-09-11 with the dense ncols==1 ksplit alignment (decode/verify bit-identity), and block 14
+2026-09-11 with the dense ncols==1 ksplit alignment (decode/verify bit-identity), again
+2026-09-12 with the RDNA3_5 single-token-only mmvq fusion skip, and block 14
 amended 2026-09-11 with the hyper-connection decode/verify band fix, the QSA decode arm, the QSA
 quantized-KV enablement + K/V-head chunking fix and the `iq4_nl` QSA/CPU-oracle/test entries;
 **block 15, the attention-memory campaign, is NOT part of the
@@ -52,7 +53,7 @@ load default) and `304665fe7` (SYCL IQ-type-for-MoE), both dated after
 wrongly export those two upstream commits as patches 0001/0002.
 **Always regenerate from a canonical fork rebuilt at `9113cc188` via
 `scripts/apply-all.sh`** (that is what `make-patches.sh`'s default tip
-`124abba9e` refers to).  The two commits' content is 106 lines in 3 files
+`13af95ac1` refers to).  The two commits' content is 106 lines in 3 files
 (`ggml/src/ggml-sycl/mmvq.cpp`, `ggml/src/ggml-sycl/vecdotq.hpp`,
 `src/llama-model.cpp`) and is deliberately **not** in the delivery — it
 is upstream code past the recorded fork point; it does not touch any
@@ -187,7 +188,7 @@ to apply against a newer upstream master:
    than one block needs manual re-base hunks, regenerate the whole set from
    the fork with `scripts/make-patches.sh` (re-exports blocks 00-14 from
    `9113cc188..<blocks-tip>`; defaults target
-the current 15-block tip `124abba9e`), then re-verify the clean-apply
+the current 15-block tip `13af95ac1`), then re-verify the clean-apply
 simulation (fresh worktree at the new fork point, `scripts/apply-all.sh`,
 build, coherence) and update the fork point + verification numbers in
 `patches/README.md` and `README.md`.

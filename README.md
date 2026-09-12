@@ -74,8 +74,8 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 The current delivery is a **15-patch set** (block 00 + blocks 01-14) for
 llama.cpp at the fork
 point `9113cc188` (blocks 00-14 in `patches/`, applied with `git am` via
-`scripts/apply-all.sh`; canonical 15-block tip `124abba9e`, net tree
-`d7c8e8984b8bd65838d8ae58c0f5de449d9c5d4d`, rebuilt at the
+`scripts/apply-all.sh`; canonical 15-block tip `13af95ac1`, net tree
+`f4791066f4a582316b1ca95f51c96cd10b905ef7`, rebuilt at the
 fork point; block 13 amended 2026-09-11 with the MoE decode/verify mmvq band and the fused
 shared-expert epilogue band, block 14 amended 2026-09-11 with the hyper-connection band, the QSA
 decode arm and the iq4_nl QSA enablement, and block 08 amended 2026-09-11 with the `iq4_nl` FA

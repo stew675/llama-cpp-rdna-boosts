@@ -897,3 +897,55 @@ reference; `rocprofv3 --kernel-trace` showed it takes it (480 `mul_mat_q_routed_
 *enumeration* — the per-expert J selection stays in both arms.  The usable control was the dispatch's
 *reach* (0 compact launches at decode, i.e. prefill-only), not the model choice.  A control you have not
 measured is not a control.
+
+## 25. The RDNA3_5 single-token-only mmvq fusions are not decode/verify bit-identical (2026-09-12, block-13 amendment)
+
+The block-13 band work (§15, §17, the dense `ncols==1` ksplit alignment, the `MUL_MAT_ID` dispatch fix)
+made the **standalone** mmvq path band-uniform for `W = 1..8`.  On RDNA3_5 (gfx1151) two
+**single-token-only** fusions still route `W=1` through fused kernels that do not reproduce the
+standalone arithmetic, so a 1-token decode and an n-token speculative verify of the same layer compute
+different bits — this is the issue-25 record's "block-13 `n_q=1` short-K mmvq variance", localised:
+
+* the **dense gate+up+GLU mmvq fusion** — `mul_mat_vec_q<..., ncols=1, has_fusion=true>`; `mmvq.cu`
+  restricts fusion to `ncols_dst == 1` (`GGML_ASSERT(!has_fusion && "fusion only supported for
+  ncols_dst=1")`), so it fires at `W=1` only.  The matchers and `ggml_cuda_should_fuse_mul_mat_vec_q`
+  are **upstream at the fork point**; block 13's mmvq item-split rewrite changed the `n_q=1` path they
+  route through.
+* the **MoE weighted-down tail** `ggml_cuda_mul_mat_id_weighted_rdna3_5` — RDNA3_5-only, single-token by
+  its shape fingerprint (`ggml_nelements(y) == 640 * n_used`).  Kernel/`_ok` added by block 13, matcher
+  by block 14.
+
+Measured (qwen4exp UD-IQ4_XS, `P=100`, f16, gfx1151, probe `logits-dump-kv.cpp`):
+
+| config | `W=1` | `W=8` |
+|---|---|---|
+| default | `8abc6206d1e80709` | `453eaa618738273d` |
+| `GGML_CUDA_DISABLE_WEIGHTED_DOWN=1` | `8d036a7b8c8a5ce5` | `453eaa618738273d` |
+| dense-GLU fusion disabled | `969940599c5426e9` | `453eaa618738273d` |
+| **both disabled** | **`453eaa618738273d`** | **`453eaa618738273d`** |
+| `GGML_CUDA_DISABLE_FUSION=1` | `5a7e4c21e86e34c2` | `5a7e4c21e86e34c2` |
+
+Each fusion moves `W=1` independently; only both together make it equal to the `W=8` standalone
+reference.  `GGML_CUDA_DISABLE_MMVQ_MAT` (all dense `MUL_MAT` mmvq fusions) + weighted-down off also
+reconciles, so the whole gap is inside the mmvq fusion family.  A fusion trace confirms the `W=1`-only
+arms as exactly `n=21 MUL_MAT_ID(ffn_moe_down)` and `n=3 MUL_MAT(ffn_gate)`.  The other `W=1`-only arms
+(dual-output K/V, SSM conv-input, GDN `ssm_gate_beta`, L2-norm pair) are bit-identical to their unfused
+reference and stay enabled, as does the `MUL_MAT_ID` gate+up+GLU (it fires at every width and is
+band-uniform).
+
+**Fix** (block 13, folded 2026-09-12): skip both on RDNA3_5 unless
+`GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1` (A/B).  The dense GLU is guarded at the six
+`{op,op,GLU}`/`{op,bias,op,bias,GLU}` matchers in `ggml_cuda_try_fuse` (with `ids != nullptr` keeping
+the `MUL_MAT_ID`/MoE fusions on), and the weighted-down in `ggml_cuda_mul_mat_id_weighted_rdna3_5_ok`.
+
+**Validation** (post-fix, `W = 1,2,4,8` one hash per config): qwen4exp f16 `453eaa61`, q8_0 `113696b9`,
+MoE 35B-A3B `18999a78`; the 27B dense (`e165ef98`) was already pure and is unchanged; the gfx1201 path
+is untouched (`GGML_CUDA_CC_IS_RDNA3_5`-only).  **Cost** ≈ −0.9 % `tg128` on qwen4exp (25.53 vs 25.77
+t/s), prefill flat — the §19 trade.  The optimisation follow-up that would restore it is to make the
+fused `ncols_dst==1` kernel reproduce the standalone reduction (pin `nwarps`/`rps`/item-split) instead
+of skipping the fusion.
+
+**Scope note.**  This is *within* the 8-wide band, unlike §11's `n_max <= 7` bound: it broke draft-vs-
+verify purity for qwen4exp and the MoE even at `n_max <= 7` (the dense GLU also affects pure-attention
+models, which is the Gemma4-12B `W1-W3 = 1.016` line in the issue-25 record).  The band edge above 8 is
+unchanged: FA's tile→WMMA switch (`Q->ne[1] > 8`) and the `MMVQ_MAX_BATCH_SIZE` mmvq→MMQ crossover.

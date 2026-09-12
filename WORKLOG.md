@@ -1,5 +1,42 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-12 (2) — block 13: the RDNA3_5 single-token-only mmvq fusions are not decode/verify bit-identical (folded)
+
+**Canonical tip `13af95ac1`** (tree `f4791066f4a582316b1ca95f51c96cd10b905ef7`), 15 blocks,
+clean-apply strict 15/15 `git am` with 0 whitespace warnings and the applied tree equal to the
+canonical one.  One block amendment (block 13), one net-patch regeneration.  Full record:
+`GREEDY-PURITY.md` §25 and the (now folded) `wip/strix-halo/rdna35-mmvq-fusion-purity/README.md`.
+
+**Block 13 — the two RDNA3_5 single-token-only mmvq fusions are skipped on gfx1151.**  The
+2026-09-11 block-13 band work made the *standalone* mmvq path `W = 1..8`-uniform, but on gfx1151 two
+**single-token-only** fusions still ran at `W=1` only and their fused kernels do not reproduce the
+standalone arithmetic, so a 1-token decode and an n-token verify of the same layer were not
+bit-identical (the issue-25 "block-13 `n_q=1` short-K mmvq variance"): the dense gate+up+GLU mmvq
+fusion (`mul_mat_vec_q<..., ncols=1, has_fusion=true>`; `mmvq.cu` restricts fusion to `ncols_dst == 1`)
+and the MoE weighted-down tail `ggml_cuda_mul_mat_id_weighted_rdna3_5` (RDNA3_5-only, single-token by
+its shape fingerprint).  Measured (qwen4exp UD-IQ4_XS, `P=100`, f16): `W=1` `8abc6206` vs `W=8`
+`453eaa61`; each fusion moves `W=1` independently and only both together equal the `W=8` standalone.
+The fix guards the six `{op,op,GLU}`/`{op,bias,op,bias,GLU}` matchers in `ggml_cuda_try_fuse` (keeping
+the band-uniform `MUL_MAT_ID`/MoE fusions) and `ggml_cuda_mul_mat_id_weighted_rdna3_5_ok`, both gated
+on RDNA3_5 unless `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1` (A/B).  Post-fix `W = 1,2,4,8` is
+one hash per config: qwen4exp f16 `453eaa61`, q8_0 `113696b9`, MoE 35B-A3B `18999a78`; the 27B dense
+(`e165ef98`) was already pure and is unchanged.  Cost ≈ −0.9 % `tg128` on qwen4exp (25.53 vs 25.77
+t/s), prefill flat — the §19 trade; the follow-up is to make the fused `ncols_dst==1` kernel reproduce
+the standalone reduction instead of skipping the fusion.  The gfx1201 path is untouched
+(`GGML_CUDA_CC_IS_RDNA3_5`-only).
+
+**Placement.**  The dense GLU matchers are upstream at the fork point and the weighted-down `_ok` is a
+block-13 addition, so the whole fix lands in block 13 — not block 00 (which is generated from the fork
+point and touches only `fattn-common.cuh` + Vulkan shaders, and the weighted-down matcher does not
+exist there), and not block 14 (which owns the weighted-down *matcher*; guarding in `_ok` keeps block
+13 self-contained and avoids a mid-chain rebase of block 14's overlapping `ggml-cuda.cu` hunks).
+
+**Regeneration.**  Rebuilt the canonical chain by `scripts/apply-all.sh` at `9113cc188` from the
+pre-amendment `main` patches, amended block 13 (`f5d0cdd25`), replayed block 14 (`13af95ac1`) and ran
+`scripts/make-patches.sh`; blocks 00-12 and 14 patch bodies are byte-identical apart from the
+`From`/`index`/hunk-header lines, only block 13's body changed.  `rdna-boosts-all.patch` regenerated
+(`git diff 9113cc188 13af95ac1`) and verified equal to the regenerated `patches/` applied at the base.
+
 ## 2026-09-12 — block 13: the fused shared-expert epilogue is column-blocked (the item-5 cost repaid), and the routed-compact MoE MMQ claim re-verified
 
 **Canonical tip `124abba9e`** (tree `d7c8e8984b8bd65838d8ae58c0f5de449d9c5d4d`), 15 blocks, clean-apply

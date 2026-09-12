@@ -1,0 +1,121 @@
+From ab4444eb241d6c9258f84d897b882c1f1cce4fe5 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Fri, 11 Sep 2026 21:28:09 -0500
+Subject: [PATCH] rdna3_5: skip single-token-only mmvq fusions that break
+ decode/verify bit-identity
+
+The dense gate+up+GLU mmvq fusion and the MoE weighted-down tail
+(ggml_cuda_mul_mat_id_weighted_rdna3_5) are single-token-only and do not
+reproduce the standalone mmvq arithmetic on RDNA3_5 (gfx1151).  A 1-token
+decode and an n-token speculative verify batch of the same layer are
+therefore not bit-identical, breaking the decode==verify invariant greedy
+MTP depends on.
+
+Measured (qwen4exp UD-IQ4_XS, P=100, f16, gfx1151): W=1 8abc6206d1e80709
+vs W=8 453eaa618738273d; disabling both fusions restores W=1,2,4,8 ==
+453eaa618738273d (q8_0: 113696b9...).  MoE 35B-A3B likewise; the 27B dense
+was already pure.
+
+Skip them by default on RDNA3_5 (opt back in for A/B with
+GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1).  Cost: ~0.9% tg128 on
+qwen4exp (25.53 vs 25.77 t/s).
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 33 ++++++++++++++++++++++++++-------
+ 1 file changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index beb662aac..42fc4842a 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1935,6 +1935,24 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+     return true;
+ }
+ 
++// RDNA3_5 (Strix Halo, gfx1151): the single-token-only mmvq fusions (the dense
++// gate+up+GLU fusion and the MoE weighted-down tail) do not reproduce the standalone
++// mmvq arithmetic - a 1-token decode and an n-token speculative verify batch of the
++// same layer are not bit-identical, which breaks the decode==verify invariant greedy
++// MTP depends on.  Measured 2026-09-11: W=1 8abc6206... vs W=8 453eaa61...; disabling
++// both restores W=1..8 == 453eaa61... .  Skip them on that arch unless explicitly
++// re-enabled for A/B (see GREEDY-PURITY.md).
++static bool ggml_cuda_rdna3_5_single_token_fusions_disabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS");
++        return env != nullptr && std::atoi(env) != 0;
++    }();
++    if (enabled) {
++        return false;
++    }
++    return GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
++}
++
+ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+     ggml_tensor *       src0 = tensor->src[0];
+     ggml_tensor *       src1 = tensor->src[1];
+@@ -3648,7 +3666,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     // separate reduction launch. Hard opt-out (A/B, regression testing). Single-token only
+     // (n_tokens == 1, gate in ggml_cuda_mul_mat_id_weighted_rdna3_5_ok).
+     static const bool disable_weighted_down = getenv("GGML_CUDA_DISABLE_WEIGHTED_DOWN") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_WEIGHTED_DOWN"));
+-    if (!disable_weighted_down && node->op == GGML_OP_MUL_MAT_ID && i + 20 < cgraph->n_nodes &&
++    if (!disable_weighted_down && !ggml_cuda_rdna3_5_single_token_fusions_disabled() &&
++            node->op == GGML_OP_MUL_MAT_ID && i + 20 < cgraph->n_nodes &&
+             cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
+         constexpr int n_used = 10;
+         constexpr int n_ops  = 2 + n_used + (n_used - 1);
+@@ -4208,7 +4227,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.glu_op     = ggml_get_glu_op(glu);
+                 fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
+ 
+-                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
++                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n) && (ids != nullptr || !ggml_cuda_rdna3_5_single_token_fusions_disabled())) {
+                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
+                     fused_mul_mat_vec = true;
+                     fused_node_count  = n_ops;
+@@ -4302,7 +4321,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.glu_op     = ggml_get_glu_op(glu);
+                 fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
+ 
+-                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
++                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n) && (ids != nullptr || !ggml_cuda_rdna3_5_single_token_fusions_disabled())) {
+                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
+                     fused_mul_mat_vec = true;
+                     fused_node_count  = n_ops;
+@@ -4351,7 +4370,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             const ggml_tensor * src1 = up_n->src[1];
+             const ggml_tensor * ids  = up_n->src[2];
+ 
+-            if (ggml_cuda_should_fuse_mul_mat_vec_f(up_n)) {
++            if (ggml_cuda_should_fuse_mul_mat_vec_f(up_n) && (ids != nullptr || !ggml_cuda_rdna3_5_single_token_fusions_disabled())) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate      = gate_n->src[0];
+                 fusion_data.x_bias    = up_bias_tensor;
+@@ -4365,7 +4384,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 break;
+             }
+ 
+-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
++            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n) && (ids != nullptr || !ggml_cuda_rdna3_5_single_token_fusions_disabled())) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate      = gate_n->src[0];
+                 fusion_data.x_bias    = up_bias_tensor;
+@@ -4394,7 +4413,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             const ggml_tensor * src1 = up->src[1];
+             const ggml_tensor * ids  = up->src[2];
+ 
+-            if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
++            if (ggml_cuda_should_fuse_mul_mat_vec_f(up) && (ids != nullptr || !ggml_cuda_rdna3_5_single_token_fusions_disabled())) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate      = gate->src[0];
+                 fusion_data.glu_op    = ggml_get_glu_op(glu);
+@@ -4406,7 +4425,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 break;
+             }
+ 
+-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
++            if (ggml_cuda_should_fuse_mul_mat_vec_q(up) && (ids != nullptr || !ggml_cuda_rdna3_5_single_token_fusions_disabled())) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate      = gate->src[0];
+                 fusion_data.glu_op    = ggml_get_glu_op(glu);
+-- 
+2.55.0
+
