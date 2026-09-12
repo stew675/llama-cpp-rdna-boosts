@@ -1,5 +1,54 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-12 (12) — TODO item 4 closed: the block-14 MTP-export logits-purity fix + the q8_0 forced-sparse residual recorded as a limitation
+
+TODO item 4 is closed.  It had two sub-items; **(a)** is fixed and landed as a block-14
+amendment (seventh), **(b)** survives a genuine driver-level investigation and is recorded as a
+measured, deliberately-NOT-fixed limitation.  Canonical tip `47a9d4d86` ->
+**`c6f1e8e78cfb2a70958998cdd81fad363e869f93`** (tree `c24871386c479865d41476726cf1f01c43b23ea6` ->
+**`e1e42e23c2913cd529b0064eb1cb74525a746098`**); block 14 amended in place (the tip block, so no
+replay), `make-patches.sh` default tip updated; strict **15/15** `git am` on a fresh worktree at
+`9113cc188` (0 whitespace warnings, applied tree == canonical); `rdna-boosts-all.patch`
+regenerated; beta block-15 **re-cut 16th** (`bdd09891d588225e139a67e510094d972acd1858`, tree
+`3a47913c0bdca7f1154a8f0310a20435a36c0faa`, patch 206 454 bytes, round-tripped strict `git am`).
+
+* **(a) `embeddings_nextn` broke logits-level `plain == draft-mtp` on qwen4exp.**  The unmasked MTP
+export needs a hidden row for every prefill token, so the last layer's output-row gather was
+deferred; the last layer's ffn tail then ran on the full ubatch and the prefill's last-position
+logits shifted by a ULP (`ad3acaa75d19ddf2` vs `b624a79f19b1b1f0`).  The last layer now always
+gathers the output rows before its tail (exactly the plain path) and builds a **second, full-row
+tail** solely for `t_h_nextn` when the chunk drops rows (`n_outputs < n_tokens`); a decode/verify
+batch drops none, so nothing is duplicated there.  **Verified (gfx1151):** the `mstep` `NEXTN=1`
+prefill mismatch is gone (`0` mismatches; was `1` at `pos = 4293`); the `W=4 RB=3 RS=3 JUNK=1`
+width probe is `0` mismatches and the `W=8` 38-mismatch position list is byte-identical pre/post
+(all 38 positions); default and forced-sparse text gates byte-identical (`e8f8bba3942b` /
+`0fc4910d5824`); MTP acceptance bit-identical (f16 `0.51678` = 77/149 both builds); the graph is a
+no-op on every non-NEXTN path (the gather already ran with `gather_now == true`).  Instrument:
+`wip/strix-halo/qsa-item4/`.
+* **(b) the forced-sparse shallow q8_0 residual is recorded, not fixed.**  Repro:
+`LLAMA_QSA_DENSE_DECODE_UNTIL=0` + `-ctk/-ctv q8_0` + `p5000.txt` + `draft-mtp n3` on qwen4exp ->
+`plain a57bc13bbf2a` vs `n3 3124adfd2b94` (632/657 chars).  A logits-level first divergence was
+localised with a temporary target-logits dump in the real `server-context.cpp` driver: at target
+position **4432** the accepted token is identical (381) but the target logits argmax flips
+**264 -> 9859** - a QSA-indexer *selection/state* divergence, not a forward width dependence (the
+`mstep` replay is bit-pure).  Excluded on the current tip: forward width (`mstep` W=1..8 pure), the
+GDN rollback bound and checkpoint restore (`n_rs_seq = 16` forced - still diverges;
+`test-recurrent-state-rollback` PASS), `n_outputs_max`, CUDA-graph capture, the chunked-prefill
+boundary, the fused indexer score and the derived cache (both bypassed with quantized keys), and the
+sparse FA kernel (`LLAMA_QSA_SPARSE_FA=0` does not fix it - the shared dense masked path is
+affected).  `LLAMA_QSA_OFF=1` fixes it and `GGML_CUDA_GDN_CHUNKED=0` only perturbs the trajectory to
+purity; the delivery default (dense decode below 64K) is pure, so this is a forced-arm,
+prompt-dependent, q8_0-only low-severity limitation.  Record:
+`wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md` + `GREEDY-PURITY.md` §18/§28.
+* **Gates (gfx1151, current tip):** `FLASH_ATTN_QSA` 22/22, `GATED_DELTA_NET` 46/46, `FLASH_ATTN_EXT`
+5935/5935; dense-masked oracle (Sherlock corpus, 4x4096, f16) sparse `1.0539` vs dense `1.0544`;
+band purity default q8_0/f16 pure and forced-sparse f16 pure; `draft-mtp n_max 3/5/7` acceptance /
+text unchanged; beta re-cut revalidated (`GATED_DELTA_NET` 46/46, `FLASH_ATTN_QSA` 22/22,
+`test-recurrent-state-rollback` PASS, the four gate combos + `draft-mtp n_max 3` all
+`0fc4910d5824`).
+* **No new Active item**; item 4 is removed from Active with a Closed one-liner, and the residual is
+one entry in *Documented, deliberately NOT fixed*.
+
 ## 2026-09-12 (10) — block-02 amendment: the chunked-GDN snapshot bound (`n_rs_batch`) + the pre-batch slot
 
 Integrated from the gfx1201 investigation in `~/ngram-mod/` (record: `wip/gdn-rs-rollback/README.md`;

@@ -7,14 +7,17 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
 `wip/*` and `benchmarks/`.
 
 **Current state (2026-09-12):** the delivery is the 15-patch set against fork point `9113cc188`
-(block 00 + blocks 01-14), canonical tip **`47a9d4d86`** (tree `c24871386c479865d41476726cf1f01c43b23ea6`),
-`make-patches.sh` default tip = `47a9d4d86`.  Block 15 (the attention-memory campaign) is **staged in
-`beta/block-15-campaign-wins/`, not promoted** (15th re-cut: `47a9d4d86` → `eb15f3ee1`).  F1/F2/F3 (the
+(block 00 + blocks 01-14), canonical tip **`c6f1e8e78cfb2a70958998cdd81fad363e869f93`** (tree `e1e42e23c2913cd529b0064eb1cb74525a746098`),
+`make-patches.sh` default tip = `c6f1e8e78cfb2a70958998cdd81fad363e869f93`.  Block 15 (the attention-memory campaign) is **staged in
+`beta/block-15-campaign-wins/`, not promoted** (16th re-cut: `c6f1e8e78` → `bdd09891d`).  F1/F2/F3 (the
 KV-quant purity/parity campaign) are **all closed** — every KV cache type the delivery supports is
 width-pure and takes the f16 attention path — and so is the gfx1151 within-band mmvq fusion variance
 (block-13 amendment, 2026-09-12; see Closed).  The QSA *sparse* regime was re-measured on gfx1151
-2026-09-12: default configs are pure (item 7 closed); one prompt-dependent **q8_0** forced-sparse
-residual is tracked in item 4.  **Triaged 2026-09-12 (8)**: the Active list became **three items** (3, 4,
+2026-09-12: default configs are pure (item 7 closed).  **Item 4 is now closed (2026-09-12 (12), block-14
+amendment (seventh))**: sub-item (a), the unmasked-MTP-export last-layer gather deferral that shifted the
+prefill logits by a ULP, is fixed; sub-item (b), the prompt-dependent **q8_0** forced-sparse shallow
+residual, survives a genuine driver-level investigation and is recorded in *Documented, deliberately NOT
+fixed* (for the exact repro, the exclusions and the `LLAMA_QSA_OFF=1` affordance — see there).  **Triaged 2026-09-12 (8)**: the Active list became **three items** (3, 4,
 9); items 1/6/8/12 moved to *Waiting on others*, items 5(c)/5(d)/5(g)/13 to *accepted limitations*, items
 5(a)/5(b)/15/16 to *Parked*, and items 11 (MXFP4 fused gate — unreachable for the available MXFP4 MoE)
 and 14 (canonical-fork hygiene — verified) to *Closed*.  A **block-02 amendment** landed a
@@ -23,7 +26,7 @@ handed-over gfx1201 fix in the same window (the rollback-bounded chunked-GDN thr
 (2026-09-12 (9), block-14 amendment)** — the QSA prefill arm is now depth-configurable with the
 documented arch policy kept as its default (**0 = QSA prefill always**, so the delivery stays
 byte-identical to the pre-amendment build; the crossing numbers are recorded as an opt-in knob), plus
-the device-query arm gate replacing the mirrored type list — so **Active is now items 3 and 4 only**.
+the device-query arm gate replacing the mirrored type list — so **Active is now item 3 only**.
 
 ## Active (kept compact: only what this repo will work on next)
 
@@ -47,47 +50,14 @@ the device-query arm gate replacing the mirrored type list — so **Active is no
   `rocprofv3 --kernel-trace` + the `[GD]` graph dump (`wip/kv-quant-purity-followups/tools/`), and
   `tools/qperf.sh` for the interleaved per-type table.  Analysis: `GREEDY-PURITY.md` §22.
 
-### 4. QSA *sparse*-regime width purity (re-scoped 2026-09-12; default configs pure)
-The two items previously recorded here were re-measured on gfx1151 (2026-09-12, after the block-13
-RDNA3_5 mmvq-fusion fix) and **do not reproduce**: the fused indexer score is byte-identical to the
-per-op chain (512-token forced-sparse A/B), and the "residual split" was the block-13 single-token mmvq
-fusion (§25) — the pre-fix divergence reproduces only with
-`GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1`.  **Default gfx1151 configs are pure** (shallow dense:
-every KV type incl. q8_0; deep sparse at ~74K: f16 `83e0ed0f0f80`, q8_0 `7205399d367d`), so the 64K
-crossover stays.
-- **Open (low severity, re-scoped again 2026-09-12 (6) to a *driver-level* divergence).**  A
-  prompt-dependent **q8_0** dependence in the *forced*-sparse shallow regime
-  (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`, `/tmp/p5000.txt`: `plain a57bc13bbf2a` vs `n3 3124adfd2b94`).
-  `LLAMA_QSA_SPARSE_FA=0` does not fix it; `LLAMA_QSA_OFF=1` does; `GGML_CUDA_DISABLE_FUSION=1` and
-  `GGML_CUDA_GDN_CHUNKED=0` "reconcile" only by perturbing the trajectory (both move the plain stream
-  early), so neither localises it.  **Deep dive (2026-09-12 (6)): it is not a width dependence** —
-  teacher-forced replay at every verify width, with batch+rollback schedules and unrelated rolled-back
-  tokens, is bit-pure (200 positions, `W=1..8`); the snapshot rollback restore is exact; `n_rs_seq`,
-  `n_outputs_max`, CUDA-graph capture and the chunked-GDN boundary (call sequence *identical* between the
-  runs) are all ruled out.  Sharp signature: pure at `--spec-draft-n-max 1`, and all `n_max 2/3/5/7`
-  land on the same divergent text (first diff at char 458).  **Two sub-items:**
-  * **(a) `embeddings_nextn` breaks logits-level plain==MTP on qwen4exp** (real defect, fixable on its
-    own): the MTP driver enables the target's export (`common/speculative.cpp:1431`), which makes the
-    last-layer output gather defer (`gather_now` in `src/models/qwen4exp.cpp`) so the last layer runs on
-    the full ubatch, shifting the **prefill's last-position logits by a ULP** (`ad3acaa7…` vs
-    `b624a79f…`).  Fix direction: keep the output path bit-identical (gather early for the logits, export
-    the full rows) or accept and document.  It does not by itself flip the replayed tokens.
-  * **(b) the char-458 token divergence itself** — driver-level; needs a faithful mini-MTP driver
-    (target + draft contexts, `embeddings_nextn`, real proposals + driver rollback, per-step target-logit
-    dump) to find the first step whose logits differ.  Everything cheaper is exhausted.
-  Instruments: `wip/strix-halo/qsa-item4/` (`README.md` = the harness + build/repro command lines;
-  `mstep.cpp`, `rbprobe.cpp`, `logits-dump-kv-long.cpp`, `gate.sh`, `nmax.sh`, `p5000.txt` — made durable
-  in-repo 2026-09-12 (11)); record
-  `wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md` (the earlier disposition is
-  `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`); analysis `GREEDY-PURITY.md` §18.
-
 ## Waiting on others (not actionable in this repo)
 
 ### 1. Block 15 promotion — **UNBLOCKED** (waiting on the beta window + the maintainer's go-ahead)
-- **Live state:** the 15th re-cut is on the current base (`47a9d4d86` → beta tip **`eb15f3ee1`**, tree
-  **`ffa3a11c30ba6d42dea2520f402126370df3bbb6`**); it builds clean, applies strict `git am`, and
-  revalidates (width probe `W = 1,4,8` one hash, same-seed greedy byte-identical delivery-vs-beta,
-  `FLASH_ATTN_QSA` + `GATED_DELTA_NET` pass).  The dense-arm blocker and its fix are closed — see the
+- **Live state:** the 16th re-cut is on the current base (`c6f1e8e78` → beta tip **`bdd09891d`**, tree
+  **`3a47913c0bdca7f1154a8f0310a20435a36c0faa`**); it builds clean, applies strict `git am` (round-tripped,
+  applied tree == the beta worktree tree), and
+  revalidates (the four gate combos + `draft-mtp n_max 3` all `0fc4910d5824`, `FLASH_ATTN_QSA` 22/22 +
+  `GATED_DELTA_NET` 46/46 + `test-recurrent-state-rollback` PASS).  The dense-arm blocker and its fix are closed — see the
   Closed section; the cut is in `beta/block-15-campaign-wins/` (BETA-TESTING.md 12th-re-cut section).
 - **Now gating the promotion:** only the ~4–5 day beta window + the maintainer's go-ahead.  Six wins, gates:
   W1 `GGML_QSA_SCORE_MEM`, W2 `GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`, W3 `LLAMA_QSA_KEYS_ONLY`,
@@ -119,7 +89,7 @@ crossover stays.
     routed-compact, the hc/PLE fusions, and the two block-13 MTP regression fixes under RDNA3
     (acceptance gate).
   * gfx1151 (`halo`): Phase 3's cross-arch fingerprint check (gfx1201 == gfx1151 numerics) — a
-    verification goal, not a port; also item 4's §18 items and item 7's MTP crossover re-measure.
+    verification goal, not a port; also item 7's MTP crossover re-measure (item 4 is closed).
 - **Tracker hygiene:** the plan's own open checkboxes are **stale** (Phase 1 is complete and the doc
   predates qwen4exp's promotion to block 14); read the banner at the top of
   `wip/qwen4exp/gfx1201-porting.md` before trusting them.
@@ -139,6 +109,8 @@ crossover stays.
 - Filing is the maintainer's call.
 
 ## Documented, deliberately NOT fixed (accepted limitations — do not re-report)
+
+- **QSA *forced*-sparse shallow `q8_0` residual (TODO item 4(b)) — measured, deliberately not fixed (2026-09-12 (12)).**  With the sparse arm forced (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`) + `-ctk/-ctv q8_0` on `p5000.txt`, qwen4exp `plain != draft-mtp n3` (`a57bc13bbf2a` vs `3124adfd2b94`); the delivery default (dense decode below 64K) is pure and `LLAMA_QSA_OFF=1` fixes it.  A target-logits dump of the real `server-context.cpp` driver localises the first divergence to target position 4432 (identical accepted token 381, argmax flips 264 -> 9859) in the QSA indexer selection/state, *not* a width dependence; forward width (`mstep` W=1..8 pure), the GDN rollback bound/checkpoint restore (`n_rs_seq = 16` forced), `n_outputs_max`, CUDA graphs, the chunked-prefill boundary, the fused indexer score/derived cache and the sparse FA kernel (`LLAMA_QSA_SPARSE_FA=0` does not fix it) are all excluded.  Exact repro/evidence: `wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`, `GREEDY-PURITY.md` §18/§28.
 
 - **The `launch-ledger` remainder (item 5(c)) — measured, not pursued (2026-09-12 (8)).**  The small-pp
   remainder (+38 `scale_f32`/eval, an `rms_norm<256,true>` count diff) is sub-0.2 %, root-cause-only.
@@ -197,6 +169,8 @@ crossover stays.
   `wip/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
+
+- **QSA sparse-regime width purity (TODO item 4, closed 2026-09-12 (12), block-14 amendment (seventh)).**  Sub-item (a), the `embeddings_nextn` MTP-export last-layer gather deferral, is fixed — the last layer always gathers its output rows and builds a separate full-row tail for `t_h_nextn` — so the prefill logits are bit-identical to `--spec-type none` (`mstep NEXTN=1` 0 mismatches, was 1 at `pos = 4293`); sub-item (b), the driver-level q8_0 forced-sparse residual, is a documented, deliberately-not-fixed limitation (see *Documented*).  See `WORKLOG.md` 2026-09-12 (12) and `patches/README.md`.
 
 **The GDN recurrent-state rollback bound (`n_rs_batch`) + the pre-batch snapshot slot (landed 2026-09-12 (10), block-02 amendment).**
 Integrated from the gfx1201 investigation in `~/ngram-mod/` (record `wip/gdn-rs-rollback/`, originals
@@ -272,7 +246,8 @@ motivated by the sparse regime's recorded width impurity.  Re-measured 2026-09-1
 items were artifacts of the block-13 RDNA3_5 mmvq fusion (fixed the same day), and the sparse regime is
 **pure** in the default configs (deep sparse ~74K: f16 `83e0ed0f0f80`, q8_0 `7205399d367d`), so gfx1151
 **keeps the 64K crossover** (sparse wins deep decode).  A pure per-*perf* MTP-side crossover re-measure
-is parked — no purity driver.  The one residual is the q8_0 forced-sparse item now tracked under item 4;
+is parked — no purity driver.  The one residual is the q8_0 forced-sparse item, now recorded under
+*Documented, deliberately NOT fixed* (item 4(b));
 record `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`, analysis `GREEDY-PURITY.md` §18.
 
 **The gfx1151 within-band mmvq fusion variance (block 13, closed 2026-09-12 (2)).**  The 2026-09-11

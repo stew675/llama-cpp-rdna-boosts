@@ -147,8 +147,8 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `47a9d4d86`, net tree
-  `c24871386c479865d41476726cf1f01c43b23ea6`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `c6f1e8e78`, net tree
+  `e1e42e23c2913cd529b0064eb1cb74525a746098`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the whole-batch
 K-independent chunked GDN prefill and again 2026-09-12 with the rollback-bounded
@@ -505,21 +505,20 @@ Consequences, so it is not re-litigated:
   same text with `GGML_CUDA_QSA_INDEXER_SCORE`/`_CACHE` default vs 0), the pre-fix
   divergence reproduces only with `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1`,
   and **default gfx1151 configs are pure** (shallow dense on every KV type, deep sparse
-  at ~74K on f16 and q8_0).  The 64K crossover stays.  **One residual is open** — a
-  prompt-dependent q8_0 dependence in the *forced*-sparse shallow regime
-  (`plain a57bc13bbf2a` vs `n3 3124adfd2b94`, `/tmp/p5000.txt`).  Deep dive 2026-09-12 (6):
-  it is **not** a width dependence (teacher-forced replay at every verify width, with
-  rollback schedules and unrelated rolled-back tokens, is bit-pure over 200 positions;
-  the snapshot rollback restore is exact) and `GGML_CUDA_DISABLE_FUSION=1` /
-  `GGML_CUDA_GDN_CHUNKED=0` only "reconcile" by perturbing the trajectory (GDN_CHUNKED=0
-  moves the *plain* stream at char 49; the chunked-GDN call sequence is identical between
-  the runs).  The one measurable plain-vs-MTP structural difference is the MTP target's
-  `embeddings_nextn` export (`common/speculative.cpp:1431`), which defers qwen4exp's
-  last-layer output gather (`gather_now`, `src/models/qwen4exp.cpp`) and shifts the
-  **prefill's last-position logits by a ULP** (`ad3acaa7…` vs `b624a79f…`) — a real
-  logits-level violation of `plain == draft-mtp`, tracked as TODO item 4(a).  The
-  token-level divergence itself (item 4(b)) needs a faithful mini-MTP driver (target +
-  draft, per-step target-logit dump).  See `GREEDY-PURITY.md` §§16-18 and
+  at ~74K on f16 and q8_0).  The 64K crossover stays.  **Item 4 is closed (2026-09-12 (12),
+  block-14 amendment (seventh))**: sub-item (a) — the MTP target's unmasked `embeddings_nextn`
+  export (`common/speculative.cpp:1431`) defers qwen4exp's last-layer output gather (`gather_now`,
+  `src/models/qwen4exp.cpp`) and shifted the prefill's last-position logits by a ULP
+  (`ad3acaa7…` vs `b624a79f…`) — is **fixed** (the last layer always gathers its output rows;
+  the export gets a separate full-row tail, `mstep NEXTN=1` 0 mismatches, was 1); sub-item (b),
+  the prompt-dependent q8_0 dependence in the *forced*-sparse shallow regime
+  (`plain a57bc13bbf2a` vs `n3 3124adfd2b94`, `p5000.txt`), survives a genuine driver-level
+  investigation and is **recorded, deliberately not fixed** (a target-logits dump of the real
+  `server-context.cpp` driver pins the first divergence to target position 4432, identical accepted
+  token, argmax 264 -> 9859; forward width, the GDN rollback bound/checkpoint restore (`n_rs_seq = 16`
+  forced), `n_outputs_max`, CUDA graphs, the chunked-prefill boundary, the fused indexer
+  score/derived cache and the sparse FA kernel are all excluded; `LLAMA_QSA_OFF=1` is the
+  affordance).  See `GREEDY-PURITY.md` §§16-18, §28 and
   `wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`.
 - The one-sided AR wait (dev0/bus-06 dispatch-gap asymmetry, ~12.7 µs/call)
   is a **platform-level CP/driver property**, not reachable from the AR
@@ -655,7 +654,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `47a9d4d86`): `git format-patch --start-number 0` the block
+blocks tip `c6f1e8e78`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -664,7 +663,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `47a9d4d86`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `c6f1e8e78`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

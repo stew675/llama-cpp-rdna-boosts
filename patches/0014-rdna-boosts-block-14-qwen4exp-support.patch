@@ -1,4 +1,4 @@
-From 47a9d4d8693c12f4a17911c6218bee8e1208f5dc Mon Sep 17 00:00:00 2001
+From c6f1e8e78cfb2a70958998cdd81fad363e869f93 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/14] rdna-boosts: block 14: qwen4exp support
@@ -96,6 +96,21 @@ wip/strix-halo/kvzero/RECORD-2026-09-09.md and
 wip/kv-sign-leak/HANDOVER-2026-09-09-mma-f16.md in the delivery repo.
 The 2026-09-09 amendment text below is retained as history only; the
 freed-cell zeroing gate it describes no longer exists in the block.
+
+Amended 2026-09-12 (seventh) with the MTP-export logits-purity fix: an
+unmasked embeddings_nextn export (the draft-mtp target) used to defer the
+last layer's output-row gather, so the last layer's ffn tail ran on the
+full ubatch and the prefill's last-position logits shifted by a ULP
+against --spec-type none.  The last layer now always gathers the output
+rows before its tail (exactly the plain path) and builds a second
+full-row tail solely for t_h_nextn when the chunk drops rows
+(n_outputs < n_tokens); a decode/verify batch drops none, so nothing is
+duplicated there.  Verified on gfx1151: the mstep NEXTN=1 prefill
+mismatch is gone (0 mismatches; was 1 at pos = 4293), the W=4 width
+probe is 0 mismatches with the W=8 position list unmoved, the default
+and forced-sparse text gates are byte-identical, MTP acceptance is
+bit-identical (f16 0.51678 = 77/149 pre- and post-fix), and the graph is
+a no-op on every non-NEXTN path.  Instrument: wip/strix-halo/qsa-item4/.
 ---
  common/arg.cpp                         |   22 +
  common/common.cpp                      |    1 +
@@ -113,8 +128,8 @@ freed-cell zeroing gate it describes no longer exists in the block.
  ggml/src/ggml-cuda/concat.cu           |   73 ++
  ggml/src/ggml-cuda/fattn-qsa.cu        |  705 +++++++++++++++
  ggml/src/ggml-cuda/fattn-qsa.cuh       |   24 +
- ggml/src/ggml-cuda/ggml-cuda.cu        |  726 ++++++++++++----
- ggml/src/ggml-cuda/hc-mix.cu           |  535 ++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu        |  726 +++++++++++----
+ ggml/src/ggml-cuda/hc-mix.cu           |  535 +++++++++++
  ggml/src/ggml-cuda/hc-mix.cuh          |    5 +
  ggml/src/ggml-cuda/hyperconn.cu        |  375 ++++++++
  ggml/src/ggml-cuda/hyperconn.cuh       |   56 ++
@@ -127,7 +142,7 @@ freed-cell zeroing gate it describes no longer exists in the block.
  ggml/src/ggml-cuda/quantize.cuh        |   13 +-
  ggml/src/ggml-cuda/unary.cu            |   15 +-
  ggml/src/ggml-moe-weighted-reduction.h |  160 ++++
- ggml/src/ggml.c                        |  342 +++++++-
+ ggml/src/ggml.c                        |  342 ++++++-
  include/llama.h                        |    4 +
  src/CMakeLists.txt                     |    1 +
  src/llama-arch.cpp                     |   20 +-
@@ -144,12 +159,12 @@ freed-cell zeroing gate it describes no longer exists in the block.
  src/llama-model.h                      |    6 +
  src/llama.cpp                          |    3 +-
  src/models/models.h                    |   48 +-
- src/models/qwen4exp.cpp                | 1101 +++++++++++++++++++++---
+ src/models/qwen4exp.cpp                | 1130 +++++++++++++++++++++---
  tests/CMakeLists.txt                   |    1 +
  tests/test-backend-ops.cpp             |  110 +++
  tests/test-lazy-reader.cpp             |  264 ++++++
  tests/test-llama-archs.cpp             |    7 +-
- 52 files changed, 7056 insertions(+), 327 deletions(-)
+ 52 files changed, 7086 insertions(+), 326 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
@@ -7129,7 +7144,7 @@ index 87195fddd..75b9b3493 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8ace95f73..70e701ca3 100644
+index 8ace95f73..4f31776bf 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -5,6 +5,115 @@
@@ -7588,45 +7603,81 @@ index 8ace95f73..70e701ca3 100644
      ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
      b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
  
-@@ -397,7 +672,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -374,6 +649,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+             n_embd, hc, n_tokens, 1);
+     cb(res_hc, "hc_init", -1);
+ 
++    // set on the last layer when the full-row residual for the unmasked MTP export is
++    // built as a second tail, so the logits tail can stay gathered (see below)
++    ggml_tensor * res_hc_export = nullptr;
++
+     for (int il = 0; il < n_layer; ++il) {
+         res->t_layer_inp[il] = res_hc;
+ 
+@@ -397,6 +676,26 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
              cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
          }
  
--        if (il == n_layer - 1 && inp_out_ids) {
-+        // an unmasked MTP export needs a hidden row for every token, so in that case the
-+        // gather is deferred until after t_h_nextn is taken below
-+        const bool gather_now = !cparams.embeddings_nextn || cparams.embeddings_nextn_masked;
++        // The last layer's tail is always computed on the gathered output rows, so the
++        // logits path is bit-identical to `--spec-type none` (a plain decode gathers here
++        // too).  An unmasked MTP export additionally needs a hidden row for *every* token,
++        // so when this prefill chunk drops rows it gets a second, full-row tail whose
++        // result is exported as t_h_nextn.  Running the logits off the full-row tail
++        // instead shifts the last-position logits by a ULP (the wide ffn's reduction order
++        // depends on the batch width).  A decode/verify batch drops no rows
++        // (n_outputs == n_tokens), so nothing is duplicated there.
++        const bool mtp_export_defer = il == n_layer - 1 && inp_out_ids &&
++                cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && n_outputs < n_tokens;
 +
-+        if (il == n_layer - 1 && inp_out_ids && gather_now) {
++        ggml_tensor * res_hc_full = nullptr;
++        ggml_tensor * cur_full    = nullptr;
++        ggml_tensor * inject_full = nullptr;
++        if (mtp_export_defer) {
++            res_hc_full = res_hc;
++            cur_full    = cur;
++            inject_full = inject;
++        }
++
+         if (il == n_layer - 1 && inp_out_ids) {
              // everything below is per token, so drop the rows that produce no output
              cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
-             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
-@@ -425,6 +704,24 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
-         cb(res_hc, "l_last", il);
-     }
+@@ -423,6 +722,35 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
  
-+    // The MTP head consumes the wide residual before the head mixer collapses it. Export
-+    // the combine result itself rather than a reshape of it: a pure view gets no backend
-+    // assignment from the scheduler, and the readback in llama_context looks one up. It is
-+    // contiguous, so [n_embd, hc, rows] already has the [n_embd_out, rows] layout the
-+    // reader expects, and it carries exactly the right rows either way - gathered above
-+    // when masked, ungathered when not.
-+    if (cparams.embeddings_nextn) {
-+        cb(res_hc, "h_nextn", -1);
-+        res->t_h_nextn = res_hc;
+         // "l_last" is the layer output name that build_cvec and imatrix look for
+         cb(res_hc, "l_last", il);
 +
-+        // deferred from the last layer: collapse to the output rows now that the export is taken
-+        if (!cparams.embeddings_nextn_masked && inp_out_ids) {
-+            res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
-+            res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
-+            res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
++        if (mtp_export_defer) {
++            // second, full-row tail: the unmasked MTP export only.  It does not feed the
++            // logits (those come from the gathered tail above).
++            ggml_tensor * res_hc_x = build_hc_combine(res_hc_full, cur_full, inject_full, il);
++            ggml_tensor * cur_x    = build_hc_mix(res_hc_x,
++                    model.layers[il].hc_ffn_norm,
++                    model.layers[il].hc_ffn_down,
++                    model.layers[il].hc_ffn_up,
++                    model.layers[il].hc_ffn_inject,
++                    &inject_full, il);
++            cur_x = build_layer_ffn(cur_x, il);
++            res_hc_export = build_hc_combine(res_hc_x, cur_x, inject_full, il);
 +        }
 +    }
 +
++    // The MTP head consumes the wide residual before the head mixer collapses it. Export the
++    // combine result itself rather than a reshape of it: a pure view gets no backend
++    // assignment from the scheduler, and the readback in llama_context looks one up. It is
++    // contiguous, so [n_embd, hc, rows] already has the [n_embd_out, rows] layout the reader
++    // expects.  A masked export uses the gathered tail (rows already collapsed); an
++    // unmasked one uses the separate full-row tail built above.
++    if (cparams.embeddings_nextn) {
++        ggml_tensor * h_nextn = res_hc_export ? res_hc_export : res_hc;
++        cb(h_nextn, "h_nextn", -1);
++        // the separate full-row export tail is not on the logits path, so it has to be
++        // expanded explicitly (ggml_set_output() alone does not add it to the graph)
++        ggml_build_forward_expand(gf, h_nextn);
++        res->t_h_nextn = h_nextn;
+     }
+ 
      // the final mixer is the output norm: there is no separate one
-     ggml_tensor * cur = build_hc_mix(res_hc,
-             model.hc_head_norm, model.hc_head_down, model.hc_head_up,
-@@ -440,6 +737,208 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -440,6 +768,208 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
      ggml_build_forward_expand(gf, cur);
  }
  
@@ -7835,7 +7886,7 @@ index 8ace95f73..70e701ca3 100644
  std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
                  ggml_tensor * input,
                          int   il) {
-@@ -468,6 +967,56 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
+@@ -468,6 +998,56 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
      return ggml_mul(ctx0, normalized, gated);
  }
  
@@ -7892,7 +7943,7 @@ index 8ace95f73..70e701ca3 100644
  // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
  // one mean-pooled indexer key scores each block; set_input resolves the cache layout
  class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
-@@ -478,7 +1027,13 @@ public:
+@@ -478,7 +1058,13 @@ public:
  
      void set_input(const llama_ubatch * ubatch) override {
          mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
@@ -7907,7 +7958,7 @@ index 8ace95f73..70e701ca3 100644
      }
  
      bool can_reuse(const llm_graph_params & params) override {
-@@ -514,6 +1069,7 @@ public:
+@@ -514,6 +1100,7 @@ public:
      ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
      ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
      ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
@@ -7915,7 +7966,7 @@ index 8ace95f73..70e701ca3 100644
  
      const llama_memory_hybrid_idx_context * mctx;
      const uint32_t ratio;
-@@ -539,7 +1095,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -539,7 +1126,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      GGML_ASSERT(r > 0);
  
      const int64_t n_blocks = (n_kv + r - 1)/r;
@@ -7923,7 +7974,7 @@ index 8ace95f73..70e701ca3 100644
      // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
      const int64_t n_stream = mctx_hyb->get_n_stream();
      GGML_ASSERT(n_tokens % n_stream == 0);
-@@ -553,6 +1108,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -553,6 +1139,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
          cparams.causal_attn && !hparams.use_alibi;
  
@@ -7944,7 +7995,7 @@ index 8ace95f73..70e701ca3 100644
      // nothing above depends on the layer, so the layers sharing a ratio share one input set
      llm_graph_input_qsa * inp = nullptr;
  
-@@ -567,11 +1136,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -567,11 +1167,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
          qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
          qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
@@ -7963,7 +8014,7 @@ index 8ace95f73..70e701ca3 100644
  
          inp = qsa.get();
          res->add_input(std::move(qsa));
-@@ -589,33 +1165,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -589,33 +1196,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
      k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
  
@@ -7998,7 +8049,7 @@ index 8ace95f73..70e701ca3 100644
      ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
      q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
      q = build_norm(q, model.layers[il].index_q_norm, nullptr, LLM_NORM_RMS, il);
-@@ -624,50 +1174,123 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -624,50 +1205,123 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
              ext_factor, attn_factor, beta_fast, beta_slow);
      cb(q, "indexer_q", il);
  
@@ -8157,7 +8208,7 @@ index 8ace95f73..70e701ca3 100644
      cb(top_k, "indexer_top_k", il);
  
      return top_k;
-@@ -744,10 +1367,54 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -744,10 +1398,54 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
      ggml_tensor * k = mctx_cur->get_k(ctx0, il);
      ggml_tensor * v = mctx_cur->get_v(ctx0, il);
  
@@ -8216,7 +8267,7 @@ index 8ace95f73..70e701ca3 100644
      cb(cur, "kqv_out", il);
  
      // the rotation is its own inverse, so undo it on the value side of the output
-@@ -768,10 +1435,104 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -768,10 +1466,104 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      const int64_t n_embd_head = hparams.n_embd_head_v();
      GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
  
@@ -8325,7 +8376,7 @@ index 8ace95f73..70e701ca3 100644
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -1035,10 +1796,14 @@ public:
+@@ -1035,10 +1827,14 @@ public:
  
      bool can_reuse(const llm_graph_params & params) override {
          mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
@@ -8341,7 +8392,7 @@ index 8ace95f73..70e701ca3 100644
  
      const llama_model_qwen4exp & pmodel;
  
-@@ -1047,6 +1812,7 @@ public:
+@@ -1047,6 +1843,7 @@ public:
  
      // scratch, reused across set_input() calls
      std::vector<llama_token> prev;
@@ -8349,7 +8400,7 @@ index 8ace95f73..70e701ca3 100644
  };
  
  void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
-@@ -1109,7 +1875,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -1109,7 +1906,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
          }
      }
  
@@ -8417,7 +8468,7 @@ index 8ace95f73..70e701ca3 100644
  }
  
  // Read a conv history out of its own recurrent row and write the new tail back.
-@@ -1176,6 +2001,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+@@ -1176,6 +2032,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
      auto ple_inp = std::make_unique<llm_graph_input_ple>(
              static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
  

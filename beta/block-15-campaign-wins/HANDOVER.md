@@ -31,6 +31,12 @@
 > merged cleanly (the `llama-context.cpp` region now carries both the new reject and block 15's
 > tensor-split type gate); the only delta vs the ninth re-cut is those three delivery files.  Testers must
 > pass matching `-ctk`/`-ctv`.  See `README.md` (tenth re-cut) and `BETA-TESTING.md`.
+> **Re-cut a sixteenth time 2026-09-12 (12)** after the block-14 MTP-export logits-purity amendment
+> (TODO item 4(a)).  Base `c6f1e8e78` (tree `e1e42e23c2913cd529b0064eb1cb74525a746098`) -> **beta tip
+> `bdd09891d`**, tree **`3a47913c0bdca7f1154a8f0310a20435a36c0faa`**, patch **206 454 bytes**.  Conflict-free
+> cherry-pick, round-tripped (strict `git am`), builds clean; gfx1151 revalidation: `GATED_DELTA_NET`
+> 46/46, `FLASH_ATTN_QSA` 22/22, `test-recurrent-state-rollback` PASS, all four gate combos +
+> `draft-mtp n_max 3` byte-identical (`0fc4910d5824`, 632 chars).  No tester-visible change.  See `README.md`.
 > **Re-cut a fifteenth time 2026-09-12 (10)** after the block-02 rollback-bounded chunked-GDN
 > amendment (`n_rs_batch` + the pre-batch snapshot slot).  Base `47a9d4d86` (tree
 > `c24871386c479865d41476726cf1f01c43b23ea6`) -> **beta tip `eb15f3ee1`**, tree

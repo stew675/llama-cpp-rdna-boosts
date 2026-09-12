@@ -7,7 +7,7 @@
 **Status: BETA — staged, NOT promoted (2026-09-10); REVALIDATED 2026-09-11
 against the 15-patch delivery.**  The campaign is
 complete and the block-15 patch lives **only in this directory**
-(`block-15-campaign-wins.patch`, re-cut 2026-09-12 (10) on base `47a9d4d86`, beta tip `eb15f3ee1`); it is **not part of the
+(`block-15-campaign-wins.patch`, re-cut 2026-09-12 (12) on base `c6f1e8e78`, beta tip `bdd09891d`); it is **not part of the
 delivery** (`patches/` is the 15-patch set: block 00 + blocks 01-14) and is
 applied manually on top of the 15-block tree.  The beta window (~4–5 days) is open for tester feedback;
 promotion into the delivery set requires the maintainer's go-ahead (at
@@ -36,6 +36,16 @@ re-cut and re-validated end to end.
   dense `6.5377`, and the new K/V reject fires in the beta build).  **Testers: pass matching
   `-ctk`/`-ctv`** (the hard reject applies to the beta too; every
   script here already does).  See `BETA-TESTING.md` (the dated tenth-re-cut section).
+* **Re-cut a sixteenth time 2026-09-12 (12)** after the block-14 **MTP-export logits-purity fix**
+  amendment (TODO item 4(a)).  Base **`c6f1e8e78`** (tree
+  `e1e42e23c2913cd529b0064eb1cb74525a746098`) -> **beta tip `bdd09891d`**, tree
+  **`3a47913c0bdca7f1154a8f0310a20435a36c0faa`**, patch **206 454 bytes**.  The cherry-pick was
+  conflict-free (block 15's `qwen4exp.cpp` hunks sit in `build_qsa_top_k`/`build_attn_qsa`, disjoint
+  from the last-layer export region); round-tripped (fresh worktree at the new base + strict `git am`
+  -> identical tree).  Revalidated on gfx1151: builds clean, `GATED_DELTA_NET` **46/46**,
+  `FLASH_ATTN_QSA` **22/22**, `test-recurrent-state-rollback` **PASS** (`max diff 0`, both cache
+  fills), and all four gate combos plus `draft-mtp --spec-draft-n-max 3` are byte-identical
+  (`0fc4910d5824`, 632 chars) = the delivery's value.  **No tester-visible change.**
 * **Re-cut a fifteenth time 2026-09-12 (10)** after the block-02 **rollback-bounded chunked-GDN
   threshold (`n_rs_batch`) + the pre-batch snapshot slot** amendment.  Base **`47a9d4d86`** (tree
   `c24871386c479865d41476726cf1f01c43b23ea6`) -> **beta tip `eb15f3ee1`**, tree

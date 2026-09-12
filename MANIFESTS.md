@@ -9,7 +9,7 @@ The **current delivery** is a **15-patch set** (block 00 + blocks 01-14) against
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`):
 blocks 00-14 (`patches/0000-…0014-…`, format-patch of the
-fork's `rdna-boosts` block commits).  **Current regeneration (2026-09-12 (10))**: canonical 15-block tip **`47a9d4d86`** (net tree `c24871386c479865d41476726cf1f01c43b23ea6`), clean-apply strict 15/15 with 0 whitespace warnings and the applied tree equal to the canonical one.  Block **02**'s body changed in this regeneration (its 2026-09-12 amendment: the rollback-bounded chunked threshold `n_rs_batch` + the pre-batch ssm/conv snapshot slot); blocks 03-14 were **replayed** onto it with no conflicts, and their patch bodies are byte-identical to the previous regeneration apart from the `From <sha>`/`index` lines and hunk offsets (checked: all 52 changed lines in `0014` are hunk headers, no content lines).  **The beta block-15 patch was re-cut (15th) on this base**: tip `eb15f3ee1`, tree `ffa3a11c30ba6d42dea2520f402126370df3bbb6`.  The previous regeneration was 2026-09-12 (9) (tip `890a9c5b1`, block 14's body changed - the configurable QSA prefill arm + the `qsa_op_supported()` device query).  The regeneration
+fork's `rdna-boosts` block commits).  **Current regeneration (2026-09-12 (12))**: canonical 15-block tip **`c6f1e8e78cfb2a70958998cdd81fad363e869f93`** (net tree `e1e42e23c2913cd529b0064eb1cb74525a746098`), clean-apply strict 15/15 with 0 whitespace warnings and the applied tree equal to the canonical one.  Block **14**'s body changed in this regeneration (its 2026-09-12 (seventh) amendment: the MTP-export logits-purity fix; block 14 is the tip, so no blocks were replayed), and patch bodies `0000`-`0013` are byte-identical to the previous regeneration.  **The beta block-15 patch was re-cut (16th) on this base**: tip `bdd09891d588225e139a67e510094d972acd1858`, tree `3a47913c0bdca7f1154a8f0310a20435a36c0faa`, strict `git am` round-trip.  The previous regeneration was 2026-09-12 (10) (tip `47a9d4d86`, block 02's rollback-bounded chunked threshold `n_rs_batch` + the pre-batch ssm/conv snapshot slot).  The regeneration
 is always run against a canonical fork **rebuilt at the fork point**, because the reference
 `~/llama.cpp` checkout had drifted two upstream master commits past `9113cc188` (`f3f1a8f27`,
 `304665fe7` — SYCL + iGPU-only code) and a `format-patch` there would export those as patches
@@ -166,7 +166,7 @@ per-win measurement tables are in `beta/block-15-campaign-wins/README.md`.
 Apply + regeneration verification (the 14/14 / `[PATCH NN/14]` / `ff2b35f49`
 figures below are the then-current state; block 00 was added 2026-09-10, so the
 current delivery is the 15-patch set `0000`-`0014`,
-tip `47a9d4d86`):
+tip `c6f1e8e78`):
 
 - fresh worktree at `9113cc188` -> `scripts/apply-all.sh` (**strict 14/14
   `git am`** for the then-14-patch delivery, zero whitespace warnings) + the beta

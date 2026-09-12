@@ -52,7 +52,7 @@ finding, narrative moved to the findings file):
 | 15 | F2 cause 2: upstream's per-type mmvq caps are numeric boundaries inside the band (fixed; also a 14-26 % win) | fix |
 | 16 | cause 3: the QSA dense decode arm was `n_tokens == 1` — now `<= QSA_DECODE_BAND` (8) | fix |
 | 17 | the MoE shared-expert epilogue is token-generic with `nwarps` pinned | fix |
-| 18 | the QSA sparse regime on gfx1151: the two 2026-09-11 width-dependences do not reproduce; one forced-arm q8_0 residual remains | current |
+| 18 | the QSA sparse regime on gfx1151: the two 2026-09-11 width-dependences do not reproduce; the MTP-export logits ULP is fixed; one forced-arm q8_0 residual is documented, not fixed | fix + current |
 | 19 | purity first: a correctness fix may cost a few percent — land it, record it, repay it | doctrine |
 | 20 | a newly enabled KV type is a new kernel family (the enablement checklist) | doctrine |
 | 21 | a shared staging tile makes a block head-homogeneous (the QSA K/V-head bug + the two instruments that found it) | doctrine + fix |
@@ -62,6 +62,7 @@ finding, narrative moved to the findings file):
 | 25 | the RDNA3_5 single-token-only mmvq fusions are not decode/verify bit-identical (block-13 gate) | current |
 | 26 | the prefill half of a regime policy must be band-keyed too (and defaults follow the documented policy) | doctrine |
 | 27 | a rollback bound is a purity bound (`n_rs_batch`, the GDN chunked kernel's snapshots) | doctrine + fix |
+| 28 | an export-only tail must not redefine the logits path (the MTP `embeddings_nextn` gather deferral) | doctrine + fix |
 
 
 ## 1. The one-sentence version
@@ -566,7 +567,7 @@ band's `pl=8` cost — see **§24**.
 
 Narrative: `../archive/docs/GREEDY-PURITY-FINDINGS.md` §17.
 
-## 18. The QSA *sparse* regime is width-pure on gfx1151; one q8_0 residual remains (2026-09-12; extended 2026-09-12 (6))
+## 18. The QSA *sparse* regime on gfx1151: the MTP-export logits ULP is fixed and the q8_0 residual is documented, not fixed (2026-09-12; extended 2026-09-12 (6); closed 2026-09-12 (12))
 
 §18 previously recorded **two** width-dependences in the QSA sparse regime, measured 2026-09-11 during
 the cause-3 hunt (on the 3-GPU gfx1201 box, with the sparse arm forced by
@@ -620,6 +621,25 @@ leading partial cause, not the whole story.  The residual is therefore a **drive
 divergence**; the next step is a faithful mini-MTP driver (target + draft + real proposals + driver
 rollback, per-step target-logit dump), because everything cheaper is exhausted.  Repro + instruments:
 `wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`.
+
+**Closed 2026-09-12 (12).**  The faithful driver was built on the **real** server loop (a temporary
+target-logits dump in `tools/server/server-context.cpp`, the in-process engine `llama-cli` actually
+runs — not the standalone speculative example, whose raw-prompt input EOGs immediately).  It pins
+the first divergence exactly: at target position **4432** the accepted token is identical (381) but
+the target logits' argmax flips **264 -> 9859**, so this is a QSA-indexer **selection/state**
+divergence, not a forward width dependence.  Excluded on the current tip by direct measurement:
+forward width (the `mstep` W=1..8 replay is bit-pure), the GDN rollback bound and the checkpoint
+restore (forcing `n_rs_seq = 16` so every rollback takes the plain `seq_rm` path still diverges;
+`test-recurrent-state-rollback` PASS), `n_outputs_max`, CUDA-graph capture, the chunked-prefill
+boundary, the fused indexer score / derived cache (both bypassed with a quantized key cache), and
+the sparse FA kernel (`LLAMA_QSA_SPARSE_FA=0` also diverges — the shared dense masked path is hit).
+The only reconcilers are `LLAMA_QSA_OFF=1` (the user affordance) and `GGML_CUDA_GDN_CHUNKED=0`
+(a trajectory perturbation).  Sub-item **(a)** is fixed in the block-14 seventh amendment — the
+`embeddings_nextn` export no longer defers the logits gather (see §28) — and the prefill ULP no
+longer exists.  Sub-item **(b)** is recorded as a **measured, deliberately-not-fixed limitation** in
+`TODO.md` (*Documented*): forced-arm (`LLAMA_QSA_DENSE_DECODE_UNTIL=0`), shallow, `q8_0`-only and
+prompt-dependent; the delivered default (dense decode below 64K) is pure.  Evidence/records:
+`wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`, `wip/strix-halo/qsa-item4/` (harness).
 
 ## 19. Purity first: the measured trade (2026-09-11, policy)
 
@@ -965,3 +985,33 @@ n_rs_batch)`.  Consequences worth keeping:
 * **The guard stays a real invariant check.**  `llama_memory_recurrent::seq_rm` compares the last
   ubatch's per-seq token count against `n_rs_batch` (not `n_rs_seq + 1`), so it still warns - once -
   if a future change lets a rollback cross a batch boundary.
+
+## 28. An export-only tail must not redefine the logits path (2026-09-12 (12), block-14 amendment (seventh))
+
+**The invariant:** an extra graph output (here the MTP draft's `t_h_nextn`) may add work, but it must
+not move the arithmetic of the *logits* path.  The trap is a shared tail whose batch width is chosen
+for the export: an unmasked `embeddings_nextn` export needs a hidden row for **every** token, so
+`src/models/qwen4exp.cpp` deferred the last layer's output-row gather (`gather_now`) until after
+`t_h_nextn` was taken — and the last layer's hyper-connection combine + ffn tail then ran on the full
+prefill ubatch instead of the gathered output rows.  The wide ffn's reduction order depends on the
+batch width, so the prefill's last-position logits shifted by a ULP (`ad3acaa75d19ddf2` vs
+`b624a79f19b1b1f0`) — a real logits-level violation of `plain == draft-mtp`, invisible to the text
+gates (the ULP did not flip the sampled token) and only observable in a per-step logits dump.
+
+**The fix (block 14, seventh amendment):** the last layer now **always** gathers its output rows
+before the tail — exactly what `--spec-type none` does — and builds a **second, full-row tail** whose
+only consumer is `t_h_nextn`, and only when the export is on and the chunk actually drops rows
+(`n_outputs < n_tokens`, i.e. a prefill; a decode/verify batch drops none, so nothing is duplicated
+there).  The separate tail is not on the logits path, so it must be expanded explicitly
+(`ggml_build_forward_expand(gf, h_nextn)`); `ggml_set_output()` alone does not add a tensor to the
+graph.
+
+**Why the gates missed it until now:** the `plain == draft-mtp` text gates compare *sampled tokens*,
+and a one-ULP logits shift only matters when the argmax is within a ULP of a tie.  The instrument that
+sees it is a teacher-forced per-step logits replay with the export toggled (`mstep` `NEXTN=1` in
+`wip/strix-halo/qsa-item4/`), which went from 1 mismatch at `pos = 4293` to 0.  Generalise: when a
+graph gains an extra output that is read by a *different* consumer, check the batch width of every
+node the logits traverse — and prefer "compute the logits path exactly as the plain arm does, then
+compute the export separately" over "compute once and gather for the logits".  The cost is one extra
+tail at output-row width (cheap; a prefill has ~1 output row), and the non-export paths are
+byte-identical by construction.

@@ -5,7 +5,7 @@ Everything needed to reproduce item 4's residual and its gates, durable in-repo 
 (+ §§16-17, 26) and the records are `../RECORD-2026-09-12-qsa-item4-deep-dive.md` (the 2026-09-12 (6)
 deep dive) and `../RECORD-2026-09-12-qsa-sparse-width.md` (the earlier disposition).
 
-## Quick state (2026-09-12 (11), delivery tip `47a9d4d86`)
+## Quick state (2026-09-12 (12), delivery tip `c6f1e8e78`)
 
 * **Default gfx1151 configs are pure** — shallow dense for every KV type (q8_0 `e8f8bba3942b`, 626
   chars on `p5000.txt`) and deep sparse (~74K: f16 `83e0ed0f0f80`, q8_0 `7205399d367d`), so the 64K
@@ -13,11 +13,15 @@ deep dive) and `../RECORD-2026-09-12-qsa-sparse-width.md` (the earlier dispositi
   has since gained the block-02 GDN rollback bound and the block-14 prefill arm (default 0), neither of
   which was supposed to move default numerics.
 * **The residual needs the *forced* sparse regime**: `LLAMA_QSA_DENSE_DECODE_UNTIL=0` + q8_0 KV +
-  `p5000.txt` → `plain` != `draft-mtp n3`, and the two sub-items in `TODO.md` §4:
-  **(a)** `embeddings_nextn` shifts qwen4exp's prefill last-position logits by a ULP
-  (`ad3acaa7…` vs `b624a79f…`, `common/speculative.cpp:1431` + the deferred `gather_now`), and
-  **(b)** the char-458 driver-level token divergence (not a width dependence — the teacher-forced
-  replay is bit-pure at every width).
+  `p5000.txt` → `plain` != `draft-mtp n3`.  **Sub-item (a) is FIXED** (block-14 amendment (seventh),
+  2026-09-12 (12)): the `embeddings_nextn` export no longer defers the last-layer logits gather, so
+  `mstep NEXTN=1` is 0 mismatches (was 1 at `pos = 4293`) and the prefill logits are bit-identical to
+  `--spec-type none`.  **Sub-item (b) is CLOSED as a documented, deliberately-not-fixed limitation**
+  (`TODO.md` *Documented*): a temporary target-logits dump in the real `server-context.cpp` driver (the
+  engine `llama-cli` runs) pins the first divergence to target position **4432**, identical accepted
+  token 381, argmax flips **264 -> 9859** — a QSA-indexer selection/state divergence, not a width one;
+  see `../RECORD-2026-09-12-qsa-item4-deep-dive.md` and `GREEDY-PURITY.md` §18/§28.  The kill switch is
+  `LLAMA_QSA_OFF=1`; the delivery default (dense decode below 64K) is pure.
 
 ## Instruments
 

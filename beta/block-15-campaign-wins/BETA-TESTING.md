@@ -10,10 +10,10 @@ without rebuilding five times.  Every win except W4 is switchable by environment
 > block 00 + blocks 01-14), and every row below was re-checked **as a combination** on the tree built
 > from the beta patch on top of the delivered **15-block** set (fresh worktree at `9113cc188`, strict
 > **15/15** `git am` + the beta patch, fresh build): reserves, byte-identical coherence on all five
-> models, the MTP gate, and the op suites all reproduce.  The current re-cut is tip **`eb15f3ee1`**
-> (base `47a9d4d86`, tree `ffa3a11c30ba6d42dea2520f402126370df3bbb6`) and every recorded number carries forward — see the dated
-> re-cut log below, `README.md` and `HANDOVER.md` §10.  (Earlier tip `888a59ee0`, base `13af95ac1`,
-> tree `476d2d1e9`.)
+> models, the MTP gate, and the op suites all reproduce.  The current re-cut is tip **`bdd09891d`**
+> (base `c6f1e8e78`, tree `3a47913c0bdca7f1154a8f0310a20435a36c0faa`) and every recorded number carries forward — see the dated
+> re-cut log below, `README.md` and `HANDOVER.md` §10.  (Earlier tip `eb15f3ee1`, base `47a9d4d86`,
+> tree `ffa3a11c3`.)
 > V3 is **on by default** (`LLAMA_KQ_MASK_DERIVED`), V4 and V5 are **opt-in through one switch**
 (`GGML_CUDA_FA_KV_NATIVE=1`, V4 for q8_0 K/V, V5 for bf16 K/V — see the amendment note in `README.md`),
 > default off — a ~1.7 % prefill cost for a large memory win).  What testers should do is reproduce the
@@ -218,6 +218,26 @@ but the hunks are far apart, so the re-cut is **metadata/offset-only** (0 change
 
 Nothing in the tester checklist changes: the revalidation numbers above were taken on the previous
 re-cut and the delta is metadata only.
+
+## 2026-09-12 (12) — sixteenth re-cut: the block-14 MTP-export logits-purity fix
+
+The base moved for TODO item 4(a): block 14's seventh amendment makes the last layer always gather its
+output rows and builds a separate full-row tail for the unmasked `embeddings_nextn` export, so the
+`draft-mtp` target's prefill logits are bit-identical to `--spec-type none`.  Base `c6f1e8e78` (tree
+`e1e42e23c2913cd529b0064eb1cb74525a746098`) -> **beta tip `bdd09891d`**, tree
+**`3a47913c0bdca7f1154a8f0310a20435a36c0faa`**, patch **206 454 bytes**.  The cherry-pick merged cleanly
+(block 15's `qwen4exp.cpp` hunks are in `build_qsa_top_k`/`build_attn_qsa`, disjoint from the
+last-layer export region) and round-trips (fresh worktree at the new base + strict `git am` -> identical
+tree).
+
+**Revalidation (2026-09-12 (12), this re-cut's tree, gfx1151).**  Builds clean; `GATED_DELTA_NET`
+**46/46**; `FLASH_ATTN_QSA` **22/22**; `test-recurrent-state-rollback` (`-m Qwen3.8-27B-Q8_0 -c 512 -b
+512 -ub 512`) **PASS** (`recurrent rollback checkpoint restored successfully`,
+`multi-seq split replay matched (max diff 0)` + `seq-1-only decode independent of seq 0 (max diff 0)`,
+both cache fills); the gate identity holds — `--spec-type none` with the default,
+`GGML_QSA_SCORE_MEM=0`, `GGML_QSA_DERIVED_BIAS=0 GGML_QSA_DERIVED_VIS=0` and `LLAMA_QSA_KEYS_ONLY=0`
+all produce byte-identical text (`0fc4910d5824`, 632 chars), as does `draft-mtp --spec-draft-n-max 3`.
+**No tester-visible change.**
 
 ## 2026-09-12 (10) — fifteenth re-cut: the block-02 rollback-bounded chunked-GDN threshold
 

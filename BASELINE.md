@@ -33,7 +33,7 @@ bottom of this file): block 00 = the structural/architecture fixes added
 2026-09-10 (FA small-batch KV-split width invariance + Vulkan masked-V), and
 blocks 01-14 = the fork's `rdna-boosts` block
 commits on `9113cc188` (the canonical 15-block tip is block 14
-`47a9d4d86`; block 02 amended 2026-09-11 with the
+`c6f1e8e78`; block 02 amended 2026-09-11 with the
 K-independent whole-batch chunked GDN prefill and again 2026-09-12 with the rollback-bounded
 chunked threshold (`n_rs_batch`, long-draft speculators) + the pre-batch snapshot slots (free; the
 `GGML_CUDA_GDN_ALIGN_BOUNDARY` gate and its K-dependent branches removed; +
@@ -189,7 +189,7 @@ to apply against a newer upstream master:
    than one block needs manual re-base hunks, regenerate the whole set from
    the fork with `scripts/make-patches.sh` (re-exports blocks 00-14 from
    `9113cc188..<blocks-tip>`; defaults target
-the current 15-block tip `47a9d4d86`), then re-verify the clean-apply
+the current 15-block tip `c6f1e8e78`), then re-verify the clean-apply
 simulation (fresh worktree at the new fork point, `scripts/apply-all.sh`,
 build, coherence) and update the fork point + verification numbers in
 `patches/README.md` and `README.md`.
