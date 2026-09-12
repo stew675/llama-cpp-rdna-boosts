@@ -7,7 +7,7 @@
 **Status: BETA — staged, NOT promoted (2026-09-10); REVALIDATED 2026-09-11
 against the 15-patch delivery.**  The campaign is
 complete and the block-15 patch lives **only in this directory**
-(`block-15-campaign-wins.patch`, re-cut 2026-09-12 (2) on base `13af95ac1`); it is **not part of the
+(`block-15-campaign-wins.patch`, re-cut 2026-09-12 (9) on base `15e3bdcbd`, beta tip `3d9b578c5`); it is **not part of the
 delivery** (`patches/` is the 15-patch set: block 00 + blocks 01-14) and is
 applied manually on top of the 15-block tree.  The beta window (~4–5 days) is open for tester feedback;
 promotion into the delivery set requires the maintainer's go-ahead (at
@@ -36,6 +36,25 @@ re-cut and re-validated end to end.
   dense `6.5377`, and the new K/V reject fires in the beta build).  **Testers: pass matching
   `-ctk`/`-ctv`** (the hard reject applies to the beta too; every
   script here already does).  See `BETA-TESTING.md` (the dated tenth-re-cut section).
+* **Re-cut a thirteenth time 2026-09-12 (9)** after the block-14 **QSA prefill crossover + device-query
+  arm gate** amendment.  Base **`15e3bdcbd`** (tree `86b6cce726b0f0f2f3935781ed782659529b38fe`) -> **beta
+  tip `3d9b578c5`**, tree **`b214b3d9d42e294fb351a58be7f05b10fe1d9a04`**, patch **3 808 lines**.  This is
+  the first re-cut that **required a real merge**: block 15 hoists the QSA arm gate out of
+  `build_attn_qsa` into a file-scope `qwen4exp_qsa_sparse()`, and the delivery's new
+  `qsa_op_supported()` / prefill arm sit in exactly that region.  Resolution: the hoisted helper now
+  takes `(model, hparams, il, cparams)` and calls `qsa_op_supported(model, hparams, il, cparams.type_k)`
+  instead of its own copy of the kernel's type list (so block 15 inherits the device query and, under
+  `-sm tensor`, the Meta device's `all_of()` meta-split safety), and its probe-tensor construction
+  passes the two extra `nullptr, nullptr` arguments block 15's own `ggml_flash_attn_qsa` signature
+  requires.  Patch round-tripped (fresh worktree at the new base + `git am` -> identical tree).
+  Revalidated on gfx1151: builds clean, `test-backend-ops -o FLASH_ATTN_QSA` passes, and all four gate
+  combos (default / `GGML_QSA_SCORE_MEM=0` / `GGML_QSA_DERIVED_BIAS=0 GGML_QSA_DERIVED_VIS=0` /
+  `LLAMA_QSA_KEYS_ONLY=0`) **plus `draft-mtp --spec-draft-n-max 3`** are byte-identical
+  (`d10a6c561b67`, 652 chars) — the same value the delivery build produces.  The wins are unaffected:
+  W1/W2/V3/V4/V5 act on the sparse path, which is the same code path above the crossover; below it the
+  prefill graph takes the dense arm, where the derived-visibility tensors are not built at all and the
+  packed kq mask (V3's subject) is allocated but is only ~n_kv x 1 KiB at those depths — V3's measured
+  800 MiB came from deep contexts.
 * **Re-cut a twelfth time 2026-09-12 (2)** after the block-13 RDNA3_5 single-token-only mmvq fusion skip
   (the dense gate+up+GLU fusion and the weighted-down MoE tail are skipped on gfx1151 unless
   `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1`).  Base **`13af95ac1`** (tree

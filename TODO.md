@@ -7,17 +7,20 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
 `wip/*` and `benchmarks/`.
 
 **Current state (2026-09-12):** the delivery is the 15-patch set against fork point `9113cc188`
-(block 00 + blocks 01-14), canonical tip **`13af95ac1`** (tree `f4791066f4a582316b1ca95f51c96cd10b905ef7`),
-`make-patches.sh` default tip = `13af95ac1`.  Block 15 (the attention-memory campaign) is **staged in
-`beta/block-15-campaign-wins/`, not promoted** (12th re-cut: `13af95ac1` → `888a59ee0`).  F1/F2/F3 (the
+(block 00 + blocks 01-14), canonical tip **`15e3bdcbd`** (tree `86b6cce726b0f0f2f3935781ed782659529b38fe`),
+`make-patches.sh` default tip = `15e3bdcbd`.  Block 15 (the attention-memory campaign) is **staged in
+`beta/block-15-campaign-wins/`, not promoted** (13th re-cut: `15e3bdcbd` → `3d9b578c5`).  F1/F2/F3 (the
 KV-quant purity/parity campaign) are **all closed** — every KV cache type the delivery supports is
 width-pure and takes the f16 attention path — and so is the gfx1151 within-band mmvq fusion variance
 (block-13 amendment, 2026-09-12; see Closed).  The QSA *sparse* regime was re-measured on gfx1151
 2026-09-12: default configs are pure (item 7 closed); one prompt-dependent **q8_0** forced-sparse
-residual is tracked in item 4.  **Triaged 2026-09-12 (8)**: the Active list is now **three items** (3, 4,
+residual is tracked in item 4.  **Triaged 2026-09-12 (8)**: the Active list became **three items** (3, 4,
 9); items 1/6/8/12 moved to *Waiting on others*, items 5(c)/5(d)/5(g)/13 to *accepted limitations*, items
 5(a)/5(b)/15/16 to *Parked*, and items 11 (MXFP4 fused gate — unreachable for the available MXFP4 MoE)
-and 14 (canonical-fork hygiene — verified) to *Closed*.
+and 14 (canonical-fork hygiene — verified) to *Closed*.  **Item 9 was then resolved and closed
+(2026-09-12 (9), block-14 amendment)** — the QSA prefill crossover (split-tuned, +2.7 % at pp8192 and
+oracle-equal perplexity below it) plus the device-query arm gate replacing the mirrored type list — so
+**Active is now items 3 and 4 only**.
 
 ## Active (kept compact: only what this repo will work on next)
 
@@ -73,19 +76,11 @@ crossover stays.
   `wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md` (the earlier disposition is
   `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`); analysis `GREEDY-PURITY.md` §18.
 
-### 9. QSA knobs: a tensor-tuned prefill crossover + the fused-op probe (small, from F3)
-- **`LLAMA_QSA_DENSE_PREFILL_UNTIL`-style gate**: the prefill crossover is not depth-configurable today
-  (reference `-sm tensor`: dense wins pp8192 by ~4.7 %, parity at pp16384, sparse wins pp32768 by
-  +14.5 %).  Tensor-tuned, per the maintainer's rule that the crossover policy follows the tensor split.
-- **`LLM_FUSED_OP_FLASH_ATTN_QSA` probe** so `qsa_kv_native` stops duplicating the backend predicate —
-  note the probe compares the *device* a fused node lands on, which does not by itself catch a
-  meta-split inconsistency.
-
 ## Waiting on others (not actionable in this repo)
 
 ### 1. Block 15 promotion — **UNBLOCKED** (waiting on the beta window + the maintainer's go-ahead)
-- **Live state:** the 12th re-cut is on the current base (`13af95ac1` → beta tip **`888a59ee0`**, tree
-  **`476d2d1e95947de7cc8cd806c40efc0f01927cd3`**); it builds clean, applies strict `git am`, and
+- **Live state:** the 13th re-cut is on the current base (`15e3bdcbd` → beta tip **`3d9b578c5`**, tree
+  **`b214b3d9d42e294fb351a58be7f05b10fe1d9a04`**); it builds clean, applies strict `git am`, and
   revalidates (width probe `W = 1,4,8` one hash, same-seed greedy byte-identical delivery-vs-beta,
   `FLASH_ATTN_QSA` + `GATED_DELTA_NET` pass).  The dense-arm blocker and its fix are closed — see the
   Closed section; the cut is in `beta/block-15-campaign-wins/` (BETA-TESTING.md 12th-re-cut section).
@@ -197,6 +192,24 @@ crossover stays.
   `wip/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
+
+**Item 9 — the QSA prefill crossover + the device-query arm gate (closed 2026-09-12 (9), block-14 amendment).**
+Two changes in `src/models/qwen4exp.cpp`.  (a) The prefill half of the arch policy is now
+depth-configurable and split-tuned (`qsa_dense_prefill_until`: gfx1151 **8192**, tensor split
+**16384** from the recorded 3x R9700 table, other 0; env `LLAMA_QSA_DENSE_PREFILL_UNTIL`); measured on
+gfx1151 the new default is **+3.2 %/+2.7 %/+1.4 %/+0.6 %** at pp4096/8192/16384/32768 over the old
+regime (a strict win at every measured pp - the arm only covers the shallow chunks of a long prefill)
+and perplexity equals the no-indexer full-dense reference exactly (23.2727) where the old regime read
+24.7142.  (b) `qsa_kv_native`'s hand-maintained copy of the kernel's type list is replaced by a
+`ggml_backend_dev_supports_op()` query on a shaped probe tensor, so the gate is the back-end's own
+answer - and under `-sm tensor` the Meta device's `all_of()` is the meta-split safety condition; the
+`LLM_FUSED_OP_FLASH_ATTN_QSA` probe the item suggested is structurally impossible (no QSA node exists
+in a reserve-time graph).  Gates: strict 15/15 apply (tree == canonical), `FLASH_ATTN_QSA` 22/22,
+band-pure text (q8_0 `93deb49ca115` across `plain` == `n_max 1/2/3/5/7`), `mstep` W=4 pure in both
+regimes and W=8's pre-existing 38 mismatches with identical position lists, MTP +16 % at `n_max 3`
+(pos-1 acceptance 0.667), beta re-cut on the new base.  Record:
+`wip/strix-halo/qsa-item9/RECORD-2026-09-12-qsa-prefill-crossover.md`; `GREEDY-PURITY.md` §26;
+`WORKLOG.md` 2026-09-12 (9).
 
 **Item 11 — the MXFP4 fused gate+up+GLU MMQ is not reachable; the type-list enablement is a no-op (closed 2026-09-12 (8)).**
 Implemented and measured the planned change (add `GGML_TYPE_MXFP4` to `MMQ_GATE_TYPES` + the generated

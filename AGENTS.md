@@ -147,8 +147,8 @@ point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
 IQ-type-for-MoE, both dated after `9113cc188`), so
 `git format-patch 9113cc188..<that branch's tip>` there would export those
 two upstream commits as patches 0001/0002.  The **canonical** 15-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `13af95ac1`, net tree
-  `f4791066f4a582316b1ca95f51c96cd10b905ef7`,
+chain is a rebuild of the delivery set at `9113cc188` (tip `15e3bdcbd`, net tree
+  `86b6cce726b0f0f2f3935781ed782659529b38fe`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `9113cc188`; block 02 amended 2026-09-11 with the whole-batch
 K-independent chunked GDN prefill; block 08 amended 2026-09-11 with the
@@ -167,7 +167,19 @@ verify took different reductions on gfx1151; gated there — `GREEDY-PURITY.md` 
 block 14 amended 2026-09-11 with the
 hyper-connection decode/verify band fix, again with the QSA decode-arm
 band, again with the QSA-vs-KV-type arm gate + the tensor-split gate
-narrowing, and again with the `iq4_nl` QSA/CPU-oracle/test entries), which is what
+narrowing, and again with the `iq4_nl` QSA/CPU-oracle/test entries, and again
+2026-09-12 (sixth) with the QSA prefill crossover + the device-query arm gate —
+the prefill half of the arch policy is now depth-configurable and split-tuned
+(`qsa_dense_prefill_until`: gfx1151 8192, tensor split 16384, other 0; env
+`LLAMA_QSA_DENSE_PREFILL_UNTIL`), which is +3.2 %/+2.7 %/+1.4 %/+0.6 % at
+pp4096/8192/16384/32768 on gfx1151 (a strict win at every measured pp — the arm
+only covers the shallow chunks of a long prefill) and reads exactly the
+no-indexer full-dense perplexity (23.2727) where the old regime read 24.7142, and
+`qsa_kv_native`'s hand-maintained copy of the kernel's type list is replaced by a
+`ggml_backend_dev_supports_op()` query on a shaped probe tensor (under `-sm
+tensor` the Meta device's `all_of()` IS the meta-split safety condition) — see the
+2026-09-12 block-14 amendment in `patches/README.md` and `GREEDY-PURITY.md` §26),
+which is what
 `scripts/make-patches.sh`'s default tip refers
 to; always regenerate from a canonical fork rebuilt at the fork point.
 **Block 15 (the attention-memory campaign) is NOT in the delivery** -- it
@@ -625,7 +637,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `13af95ac1`): `git format-patch --start-number 0` the block
+blocks tip `15e3bdcbd`): `git format-patch --start-number 0` the block
 commits (all 15 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -634,7 +646,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
 `9113cc188..HEAD` range there exports those two upstream commits as patches
 0001/0002.  The canonical 15-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `13af95ac1`), which is what the default tip names.  Always regenerate from a
+`9113cc188` (tip `15e3bdcbd`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

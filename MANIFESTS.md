@@ -9,7 +9,7 @@ The **current delivery** is a **15-patch set** (block 00 + blocks 01-14) against
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`):
 blocks 00-14 (`patches/0000-…0014-…`, format-patch of the
-fork's `rdna-boosts` block commits).  **Current regeneration (2026-09-12 (2))**: canonical 15-block tip **`13af95ac1`** (net tree `f4791066f4a582316b1ca95f51c96cd10b905ef7`), clean-apply strict 15/15 with 0 whitespace warnings and the applied tree equal to the canonical one.  Block 13's body changed in this regeneration (its 2026-09-12 amendment: the RDNA3_5 single-token-only mmvq fusion skip -- the dense gate+up+GLU fusion and the weighted-down MoE tail) and every other block body is byte-identical to the previous regeneration apart from the `From <sha>`/`index` lines (block 14's hunks shift line numbers only).  The previous regeneration was 2026-09-11 (10) (tip `124abba9e`, block 08/14 bodies changed, block 15 re-cut 8th).  **The beta block-15 patch still needs its re-cut on this base** -- the 8th re-cut was on the 2026-09-11 (10) tip.  The regeneration
+fork's `rdna-boosts` block commits).  **Current regeneration (2026-09-12 (9))**: canonical 15-block tip **`15e3bdcbd`** (net tree `86b6cce726b0f0f2f3935781ed782659529b38fe`), clean-apply strict 15/15 with 0 whitespace warnings and the applied tree equal to the canonical one.  Block 14's body changed in this regeneration (its 2026-09-12 (sixth) amendment: the QSA prefill crossover + the `qsa_op_supported()` device query that replaced the mirrored `qsa_kv_native` type list) and every other block body is byte-identical to the previous regeneration apart from the `From <sha>`/`index` lines.  **The beta block-15 patch was re-cut (13th) on this base**: tip `3d9b578c5`, tree `b214b3d9d42e294fb351a58be7f05b10fe1d9a04`.  The previous regeneration was 2026-09-12 (2) (tip `13af95ac1`, block 13's body changed - the RDNA3_5 single-token-only mmvq fusion skip).  The regeneration
 is always run against a canonical fork **rebuilt at the fork point**, because the reference
 `~/llama.cpp` checkout had drifted two upstream master commits past `9113cc188` (`f3f1a8f27`,
 `304665fe7` — SYCL + iGPU-only code) and a `format-patch` there would export those as patches
@@ -165,7 +165,8 @@ per-win measurement tables are in `beta/block-15-campaign-wins/README.md`.
 
 Apply + regeneration verification (the 14/14 / `[PATCH NN/14]` / `ff2b35f49`
 figures below are the then-current state; block 00 was added 2026-09-10, so the
-current delivery is the 15-patch set `0000`-`0014`, tip `13af95ac1`):
+current delivery is the 15-patch set `0000`-`0014`,
+tip `15e3bdcbd`):
 
 - fresh worktree at `9113cc188` -> `scripts/apply-all.sh` (**strict 14/14
   `git am`** for the then-14-patch delivery, zero whitespace warnings) + the beta

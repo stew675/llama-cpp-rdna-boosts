@@ -975,3 +975,39 @@ of skipping the fusion.
 verify purity for qwen4exp and the MoE even at `n_max <= 7` (the dense GLU also affects pure-attention
 models, which is the Gemma4-12B `W1-W3 = 1.016` line in the issue-25 record).  The band edge above 8 is
 unchanged: FA's tile→WMMA switch (`Q->ne[1] > 8`) and the `MMVQ_MAX_BATCH_SIZE` mmvq→MMQ crossover.
+
+## 26. A regime policy is only pure if the *band* takes one arm — including the prefill half (2026-09-12 (9))
+
+§§11/16-18 are about the decode/verify band; the same structural rule governs the *prefill* side of
+the QSA arch policy, which block 14's 2026-09-12 (sixth) amendment made depth-configurable
+(`qsa_dense_prefill_until`; `patches/README.md`, record
+`wip/strix-halo/qsa-item9/RECORD-2026-09-12-qsa-prefill-crossover.md`).
+
+The invariant, in the form a review can check: **an arm may only be selected from state that is
+identical for every graph that computes the same sequence position — the `n_tokens` *band*
+(`<= QSA_DECODE_BAND` vs above it) and `n_kv`.**  The prefill arm is therefore defined as
+`n_tokens > QSA_DECODE_BAND && n_kv < threshold`, i.e. disjoint from the decode arm by construction,
+so a W=1 decode and a W=(`--spec-draft-n-max` + 1) verify step still take the same arm; a prefill
+chunk of `<= 8` tokens is indistinguishable from a verify batch, so it takes the decode arm (that is
+the design).  An arm gated on `n_tokens == 1` — the shape of the original cause-1/cause-3 defects —
+is what breaks it, and the same trap applies to any new depth-keyed policy: key it on the band, not
+on the exact width.
+
+Measured on gfx1151 with the threshold live: q8_0 KV is pure across the **whole** band (`plain` ==
+`n_max 1/2/3/5/7` == `93deb49ca115`, 685 chars) and f16 is pure in both regimes.  The `mstep` width
+probe is 0 mismatches at W=4 in both regimes; W=8's 38 mismatches occur with **identical position
+lists** in both (`=0` and the new default), which is how the pre-existing item-4 residual class was
+separated from this change - a width probe alone cannot do that, only the same-run A/B can.
+
+Two corollaries worth keeping:
+
+* **A regime knob is a quality knob.**  Below the crossover the old default used the lossy top-k
+  selection anyway: perplexity (8x4096, f16) is 24.7142 there versus **23.2727, exactly the
+  `LLAMA_QSA_OFF=1` full-dense/no-indexer reference** for the new default.  "Sparse is the fast
+  approximation" is a statement about the deep regime; below the crossover it was both slower
+  (+2.7 % at pp8192) and approximating.
+* **A self-limiting arm cannot lose at depth.**  The prefill arm only ever covers chunks whose `n_kv`
+  is still below the threshold, so a long prefill keeps the sparse chunks that measured faster
+  (sparse wins pp32768 by 17.4 % when it is *all* sparse) while the shallow ones - the ones that
+  measured faster dense - go dense.  That is why the policy is a strict win at every measured pp and
+  not a crossover gamble; measured +3.2 % pp4096, +2.7 % pp8192, +1.4 % pp16384, +0.6 % pp32768.

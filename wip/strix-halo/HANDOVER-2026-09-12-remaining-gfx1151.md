@@ -33,6 +33,20 @@ compacted, so treat this file (plus the docs it points at) as the source of trut
 > and **item 15 audited** (128 `-Wshadow` warnings / 27 `src/` files, 46 in the risky class).  Records:
 > `wip/strix-halo/rdna35-mmvq-fusion-purity/README.md` §9,
 > `wip/shadow-warnings/RECORD-2026-09-12-shadow-audit.md`.
+>
+> **OUTCOME (2026-09-12 (9), item 9 — resolved and closed, block-14 amendment; Active is now items 3
+> and 4 only).**  The QSA prefill crossover is depth-configurable and split-tuned (`qsa_dense_prefill_until`:
+> gfx1151 **8192** measured, tensor split **16384** from the recorded 3x R9700 table, other 0; env
+> `LLAMA_QSA_DENSE_PREFILL_UNTIL`): +3.2 %/+2.7 %/+1.4 %/+0.6 % at pp4096/8192/16384/32768 over the old
+> regime (a strict win at every measured pp — the arm only covers the shallow chunks of a long prefill)
+> and perplexity **exactly the no-indexer full-dense reference** (23.2727) where the old regime read
+> 24.7142.  `qsa_kv_native`'s mirrored type list is replaced by a `ggml_backend_dev_supports_op()` query
+> on a shaped probe tensor — under `-sm tensor` the Meta device's `all_of()` *is* the meta-split safety
+> condition, and the `LLM_FUSED_OP_FLASH_ATTN_QSA` probe the item suggested is structurally impossible
+> (no QSA node exists in a reserve-time graph).  Canonical tip `13af95ac1` -> **`15e3bdcbd`**, tree
+> `86b6cce726b0f0f2f3935781ed782659529b38fe`; beta block-15 re-cut 13th (`3d9b578c5`); strict 15/15 apply,
+> `FLASH_ATTN_QSA` 22/22, band-pure text, MTP +16 % at `n_max 3`.  Record
+> `wip/strix-halo/qsa-item9/RECORD-2026-09-12-qsa-prefill-crossover.md`; `GREEDY-PURITY.md` §26.
 
 ## 0. Session hygiene / policy
 

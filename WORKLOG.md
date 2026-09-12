@@ -1,5 +1,49 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-12 (9) — TODO item 9 resolved and closed: the QSA prefill crossover + the device-query arm gate
+
+Block-14 amendment (sixth).  Canonical tip `13af95ac1` -> **`15e3bdcbd`** (tree
+`f4791066f4a582316b1ca95f51c96cd10b905ef7` -> **`86b6cce726b0f0f2f3935781ed782659529b38fe`**);
+`make-patches.sh` default tip updated; strict 15/15 `git am` re-verified on a fresh worktree at
+`9113cc188` (0 whitespace warnings, applied tree == canonical); beta block-15 **re-cut 13th** on the
+new base (`3d9b578c5`, tree `b214b3d9d42e294fb351a58be7f05b10fe1d9a04`, patch 3 808 lines,
+round-tripped).  Full record: `wip/strix-halo/qsa-item9/RECORD-2026-09-12-qsa-prefill-crossover.md`.
+
+* **9(a) the prefill crossover is now depth-configurable and split-tuned.**  `qsa_dense_prefill_until`
+  with per-(split, arch) defaults (gfx1151 **8192**, tensor split **16384**, other **0**), env
+  `LLAMA_QSA_DENSE_PREFILL_UNTIL` for A/B.  Measured on gfx1151 (whole-prompt pp, f16, interleaved
+  r2): **+3.2 % pp4096, +2.7 % pp8192, +1.4 % pp16384, +0.6 % pp32768** over the old regime - a
+  strict win at every measured pp because the arm only ever covers the shallow chunks of a long
+  prefill.  Crossover measured at ~8-16K (dense wins pp4096/8192, sparse wins pp16384 by 3.0 % and
+  pp32768 by 17.4 %), materially the same place the recorded 3x R9700 table puts it (which is what
+  the tensor default is set from; the 1-GPU box cannot re-measure a tensor split).  It is also a
+  **quality** win: perplexity (8x4096) is **identical to the no-indexer full-dense reference**
+  (23.2727) where the old regime read 24.7142, i.e. the old default spent a 6.2 % PPL penalty on the
+  lossy selection below the crossover *and* ran slower.
+* **9(b) the arm gate asks the device instead of mirroring the kernel's type list.**  `qsa_kv_native`
+  was a hand-maintained copy of `ggml_cuda_flash_attn_qsa_supported()` (kept in lockstep by comment)
+  and its staleness is what made the 2026-09-11 third amendment an abort in the meta splitter instead
+  of a fallback.  `qsa_op_supported()` now builds a minimal probe tensor and asks
+  `ggml_backend_dev_supports_op(model.dev_layer(il), probe)`; under `-sm tensor` that device is the
+  Meta device, whose `supports_op()` is `all_of(sub-devs)`, so the query is the meta-split safety
+  condition.  The `LLM_FUSED_OP_FLASH_ATTN_QSA` probe the item suggested is structurally impossible
+  (a QSA node exists only above the 2051 selection width, so a reserve-time probe graph has none).
+  Probe table: 0 mismatches vs the old list on gfx1151, plus an unsupported head size (D=80) now
+  rejected where the list accepted it; same-seed text byte-identical to the pre-amendment build
+  (`0fc4910d5824`); cost 0.112 us/call.
+* **Gates:** `FLASH_ATTN_QSA` 22/22, `FLASH_ATTN_EXT` pass; q8_0 text pure across the whole band
+  (`plain` == `n_max 1/2/3/5/7` == `93deb49ca115`, 685 chars), f16 pure in both regimes; `mstep` W=4
+  0 mismatches both regimes, W=8's 38 mismatches **identical position lists** in both (pre-existing);
+  MTP `n_max 3` 28.3 t/s vs plain 24.5 (+16 %), pos-1 acceptance 0.667; beta re-cut builds clean,
+  its `FLASH_ATTN_QSA` suite passes and all four gate combos (default / `GGML_QSA_SCORE_MEM=0` /
+  `GGML_QSA_DERIVED_*=0` / `LLAMA_QSA_KEYS_ONLY=0`) plus `draft-mtp n_max 3` are byte-identical
+  (`d10a6c561b67`, 652 chars).
+* **TODO**: item 9 removed from Active (Closed one-liner added); Active is now items 3 and 4 only.
+  One observation recorded, not filed as an item: on the substitute PPL text the halo sparse path
+  reads 24.71 against the same selection computed densely at 22.28 - the documented oracle text is
+  absent on this box, so this is not comparable with the recorded 6.5267/6.5306 parity and is left as
+  an observation (the patch does not touch that path).
+
 ## 2026-09-12 (8) — TODO triage: Active cut from 13 items to 3, item 11 closed with a measurement
 
 No delivery change (one experiment implemented, measured and **reverted**).

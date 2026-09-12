@@ -1,4 +1,4 @@
-From 888a59ee07ef6d12dbdc10c5fa5c7fb3a4dc3113 Mon Sep 17 00:00:00 2001
+From 3d9b578c5f5132c4562e0c79427d64e0532becaa Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -202,9 +202,9 @@ WORKLOG.md 2026-09-11 (11).
  src/llama-kv-cache.h                 |  20 +-
  src/llama-memory-hybrid-idx.cpp      |  95 +++++++-
  src/llama-memory-hybrid-idx.h        |  17 +-
- src/models/qwen4exp.cpp              | 337 ++++++++++++++++++++++-----
+ src/models/qwen4exp.cpp              | 334 ++++++++++++++++++++++-----
  tests/test-backend-ops.cpp           |  55 ++++-
- 23 files changed, 1921 insertions(+), 236 deletions(-)
+ 23 files changed, 1922 insertions(+), 232 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 1a8e68103..8b9ebb315 100644
@@ -3231,10 +3231,10 @@ index 4b30994d1..c5ce4bd51 100644
                         int32_t * dst_derived_from = nullptr,
                         int32_t * dst_derived_lim  = nullptr) const;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8c4076307..2f803b01f 100644
+index f268e0d93..b2540fa93 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -935,20 +935,104 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
+@@ -1055,20 +1055,105 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
  
  // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
  // one mean-pooled indexer key scores each block; set_input resolves the cache layout
@@ -3282,25 +3282,25 @@ index 8c4076307..2f803b01f 100644
 +// the QSA sparse (fused, top-k only) flash attention is the DEFAULT path; LLAMA_QSA_SPARSE_FA=0
 +// selects the dense masked path, which still reads the kq mask through build_attn_mha and must
 +// therefore keep it alive.  Both paths need flash attention enabled.
-+static bool qwen4exp_qsa_sparse(const llama_cparams & cparams) {
++static bool qwen4exp_qsa_sparse(const llama_model & model, const llama_hparams & hparams, int il, const llama_cparams & cparams) {
 +    static const bool enabled = []() {
 +        const char * env = getenv("LLAMA_QSA_SPARSE_FA");
 +        return env == nullptr || std::atoi(env) != 0;
 +    }();
 +    // The fused sparse kernel reads the K/V cache rows itself - F16/BF16 natively, and
-+    // Q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl by dequantizing them while a tile is staged.  The
-+    // authoritative list of accepted types is ggml_cuda_flash_attn_qsa_supported() (the same
-+    // set the backend exposes for GGML_OP_FLASH_ATTN_QSA), and this gate must stay in lockstep
-+    // with it.  Any other cache type must take the dense masked path instead (the same path as
-+    // LLAMA_QSA_SPARSE_FA=0): an unsupported qsa op is not split across the tensor-parallel
-+    // devices, so its output stays mirrored while the attention gate remains hidden-split and
-+    // the meta splitter aborts on the attn_gated MUL (observed with qwen4exp +
-+    // --cache-type-k q4_0/q4_1 + -sm tensor).  That path reads the kq mask, so the
++    // Q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl by dequantizing them while a tile is staged.  Whether the
++    // acting device accepts the op is asked of the back-end itself (qsa_op_supported, which
++    // reaches ggml_cuda_flash_attn_qsa_supported through ggml_backend_dev_supports_op) rather
++    // than mirrored here: a stale mirror is not a fallback but an abort, because an unsupported
++    // qsa op is not split across the tensor-parallel devices, so its output stays mirrored while
++    // the attention gate remains hidden-split and the meta splitter aborts on the attn_gated MUL
++    // (observed with qwen4exp + --cache-type-k q4_0/q4_1 + -sm tensor before the query replaced
++    // the hand-maintained list).  Under -sm tensor model.dev_layer(il) is the Meta device, whose
++    // supports_op requires EVERY tensor-parallel device to accept the op, so the query covers
++    // the meta split as well.  Any cache type it rejects takes the dense masked path instead
++    // (the same path as LLAMA_QSA_SPARSE_FA=0): that path reads the kq mask, so the
 +    // derived-visibility/mask-elision arm is off with it (qwen4exp_want_derived_vis below).
-+    const bool kv_native = cparams.type_k == GGML_TYPE_F16  || cparams.type_k == GGML_TYPE_BF16 ||
-+                           cparams.type_k == GGML_TYPE_Q8_0 || cparams.type_k == GGML_TYPE_Q4_0 ||
-+                           cparams.type_k == GGML_TYPE_Q4_1 || cparams.type_k == GGML_TYPE_Q5_0 ||
-+                           cparams.type_k == GGML_TYPE_Q5_1 || cparams.type_k == GGML_TYPE_IQ4_NL;
++    const bool kv_native = qsa_op_supported(model, hparams, il, cparams.type_k);
 +    return enabled && cparams.flash_attn && kv_native;
 +}
 +
@@ -3308,8 +3308,9 @@ index 8c4076307..2f803b01f 100644
 +// reads it: the derived-visibility path plus the sparse FA that derives the cell visibility in
 +// its kernel.  This is the -800 MiB win; the predicate is exactly the one blk_bias would have
 +// checked against the mask's own shape (the mask is always [n_kv, n_tps, 1, n_stream] here).
-+static bool qwen4exp_want_derived_vis(const llama_cparams & cparams, const llama_hparams & hparams, int64_t n_tokens) {
-+    return qwen4exp_derived_bias_mode() != 0 && qwen4exp_derived_vis_enabled() && qwen4exp_qsa_sparse(cparams) &&
++static bool qwen4exp_want_derived_vis(const llama_model & model, const llama_hparams & hparams, int il, const llama_cparams & cparams, int64_t n_tokens) {
++    return qwen4exp_derived_bias_mode() != 0 && qwen4exp_derived_vis_enabled() &&
++            qwen4exp_qsa_sparse(model, hparams, il, cparams) &&
 +            n_tokens > 1 && cparams.causal_attn && !hparams.use_alibi;
 +}
 +
@@ -3343,7 +3344,7 @@ index 8c4076307..2f803b01f 100644
          }
      }
  
-@@ -968,13 +1052,34 @@ public:
+@@ -1088,13 +1173,34 @@ public:
  
          res &= params.ubatch.n_tokens % n_stream == 0;
  
@@ -3380,7 +3381,7 @@ index 8c4076307..2f803b01f 100644
  
          return res;
      }
-@@ -987,11 +1092,28 @@ public:
+@@ -1107,11 +1213,28 @@ public:
      ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
      ggml_tensor * rng       = nullptr;   // I32 [2*n_stream] derived-cache range leaf (decode only)
  
@@ -3409,7 +3410,7 @@ index 8c4076307..2f803b01f 100644
  };
  
  ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
-@@ -1020,9 +1142,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1140,9 +1263,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
      // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
      // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
@@ -3421,7 +3422,7 @@ index 8c4076307..2f803b01f 100644
 +    const bool blk_bias = kq_mask != nullptr
 +            ? (kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
 +               cparams.causal_attn && !hparams.use_alibi)
-+            : qwen4exp_want_derived_vis(cparams, hparams, n_tokens);
++            : qwen4exp_want_derived_vis(model, hparams, il, cparams, n_tokens);
 +
 +    // The per-block half of the bias is a pure function of the block bookkeeping (blk_idx) and
 +    // the token's tail start (blk_tail), so the prefill graph has the top-k derive it in-kernel
@@ -3443,7 +3444,7 @@ index 8c4076307..2f803b01f 100644
  
      // env gates (per-process, read once): the fused INDEXER_SCORE op + the incremental derived
      // cache are the DEFAULT decode path (parity-verified byte-identical to the per-op chain);
-@@ -1045,13 +1188,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1165,13 +1309,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      if (it != qsa_inps.end()) {
          inp = it->second;
      } else {
@@ -3469,7 +3470,7 @@ index 8c4076307..2f803b01f 100644
          if (idx_cache && n_stream == 1) {
              // per-step derived fill range leaf: [from_s, lim_s] (one stream in decode)
              qsa->rng = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 2);
-@@ -1060,7 +1213,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1180,7 +1334,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          ggml_set_input(qsa->cell_blk);
          ggml_set_input(qsa->blk_cells);
          ggml_set_input(qsa->blk_pos);
@@ -3488,7 +3489,7 @@ index 8c4076307..2f803b01f 100644
          if (qsa->rng != nullptr) {
              ggml_set_input(qsa->rng);
          }
-@@ -1174,23 +1337,70 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1294,23 +1458,70 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
  
          // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
          // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
@@ -3573,7 +3574,7 @@ index 8c4076307..2f803b01f 100644
              score = ggml_add(ctx0, score, inp->bias);
          }
      }
-@@ -1206,7 +1416,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1326,7 +1537,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      // kernel reads it as [n_kv, n_tps, n_stream] and no per-layer copy is needed
      ggml_tensor * additive = blk_bias ? kq_mask : inp->bias;
  
@@ -3589,13 +3590,13 @@ index 8c4076307..2f803b01f 100644
      cb(top_k, "indexer_top_k", il);
  
      return top_k;
-@@ -1251,8 +1468,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1371,8 +1589,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
      }
  
 -    ggml_tensor * kq_mask = inp->get_kq_mask();
 +    // Fused sparse FA (top-k cells only) vs dense masked FA: see qwen4exp_qsa_sparse().
-+    const bool qsa_sparse = qwen4exp_qsa_sparse(cparams);
++    const bool qsa_sparse = qwen4exp_qsa_sparse(model, hparams, il, cparams);
  
 +    // the derived visibility keys live in this layer's QSA graph input set (null on the tensor
 +    // path, where the kernel keeps gathering the mask); the mask src stays until the prunable form
@@ -3621,7 +3622,7 @@ index 8c4076307..2f803b01f 100644
      // prepare new kq mask - starts filled with -INFINITY
      ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
  
-@@ -1270,7 +1509,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1390,7 +1630,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
  
      // modify KQ mask by unmasking elements that are in top_k indices
      // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
@@ -3630,7 +3631,7 @@ index 8c4076307..2f803b01f 100644
  
      // reshape to restore the original shape of KQ mask:
      // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
-@@ -1278,38 +1517,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1398,34 +1638,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
  
      // combine with the original kq mask
      kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
@@ -3649,28 +3650,24 @@ index 8c4076307..2f803b01f 100644
 -        return env == nullptr || std::atoi(env) != 0;
 -    }();
 -    // The fused sparse kernel reads the K/V cache rows itself - F16/BF16 natively, and
--    // Q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl by dequantizing them while a tile is staged.  The
--    // authoritative list of accepted types is ggml_cuda_flash_attn_qsa_supported()
--    // (it mirrors the kernel's load dispatch).  Every other cache type must
--    // take the dense masked path below instead: an unsupported qsa op is not split
--    // across the tensor-parallel devices, so its output ends up mirrored while the
--    // attention gate stays hidden-split and the meta splitter aborts on the
--    // attn_gated MUL (observed on qwen4exp + --cache-type-k q4_0/q4_1 + -sm tensor).
--    // This is the same path as LLAMA_QSA_SPARSE_FA=0, which stays as the A/B knob.
--    // NOTE: this list must stay in lockstep with ggml_cuda_flash_attn_qsa_supported()
--    // in ggml/src/ggml-cuda/fattn-qsa.cu - the graph gate is on the host side and the
--    // meta splitter does not report an unsupported qsa op, so a stale entry here is a
--    // crash (not a fallback) under -sm tensor.
--    const bool qsa_kv_native = k->type == GGML_TYPE_F16  || k->type == GGML_TYPE_BF16 ||
--                               k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0 ||
--                               k->type == GGML_TYPE_Q4_1 || k->type == GGML_TYPE_Q5_0 ||
--                               k->type == GGML_TYPE_Q5_1 || k->type == GGML_TYPE_IQ4_NL;
+-    // Q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl by dequantizing them while a tile is staged.  Whether the
+-    // acting device accepts the op is asked of the back-end itself (qsa_op_supported above,
+-    // which reaches ggml_cuda_flash_attn_qsa_supported through ggml_backend_dev_supports_op)
+-    // rather than mirrored here: an unsupported qsa op is not split across the tensor-parallel
+-    // devices, so its output ends up mirrored while the attention gate stays hidden-split and
+-    // the meta splitter aborts on the attn_gated MUL (observed on qwen4exp + --cache-type-k
+-    // q4_0/q4_1 + -sm tensor before the query replaced the hand-maintained list).  Under
+-    // -sm tensor model.dev_layer(il) is the Meta device, whose supports_op requires EVERY
+-    // tensor-parallel device to accept the op, so the query covers the meta split as well.
+-    // Every cache type the query rejects takes the dense masked path below (the same path as
+-    // LLAMA_QSA_SPARSE_FA=0, which stays as the A/B knob).
+-    const bool qsa_kv_native = qsa_op_supported(model, hparams, il, k->type);
 -    const bool qsa_sparse = qsa_sparse_env && cparams.flash_attn && qsa_kv_native;
 -
      ggml_tensor * cur;
  
      if (qsa_sparse) {
-@@ -1321,7 +1533,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1437,7 +1654,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          k = ggml_permute(ctx0, k, 0, 2, 1, 3);
          v = ggml_permute(ctx0, v, 0, 2, 1, 3);
  
@@ -3682,14 +3679,14 @@ index 8c4076307..2f803b01f 100644
          ggml_flash_attn_qsa_set_prec(cur, GGML_PREC_F32);
          cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
          cb(cur, "kqv_out", il);
-@@ -1448,7 +1663,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
-             // the W=1 decode (see QSA_DECODE_BAND above).
+@@ -1546,7 +1766,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+             // cannot be distinguished from a verify batch - that is the point).
              build_qsa_store_k(mctx_hyb, cur, il);
          } else {
 -            top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il);
 +            // the derived path never creates the kq mask; the qsa input's can_reuse below carries
 +            // the same gate, so a prefill graph (no mask) and a decode graph (mask) never mix
-+            const bool want_derived_vis = qwen4exp_want_derived_vis(cparams, hparams, n_tokens);
++            const bool want_derived_vis = qwen4exp_want_derived_vis(model, hparams, il, cparams, n_tokens);
 +            top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos,
 +                    want_derived_vis ? nullptr : inp->get_kq_mask(), sections, il);
          }
