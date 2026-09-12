@@ -21,7 +21,11 @@
 #                 K-independent whole-batch chunked GDN prefill, and the
 #                 2026-09-12 block-13 column-blocked shared-expert
 #                 epilogue (bit-identical; repays the band amendment's
-#                 pl=8 cost).
+#                 pl=8 cost) and the 2026-09-12 block-13 RDNA3_5 single-token-only
+#                 mmvq fusion skip (the dense gate+up+GLU fusion and the weighted-down
+#                 MoE tail are single-token-only and not bit-identical with the
+#                 standalone arithmetic on gfx1151; gated there unless the A/B opt-in
+#                 GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1 is set).
 #                 The block-15
 #                 (attention-memory campaign) work is NOT part of the
 #                 delivery; it is staged in beta/block-15-campaign-wins/
@@ -44,7 +48,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
 BASELINE="${2:-9113cc188}"
-TIP="${3:-124abba9e}"
+TIP="${3:-13af95ac1}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then
