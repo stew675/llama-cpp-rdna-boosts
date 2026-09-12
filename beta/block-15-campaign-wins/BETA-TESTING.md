@@ -10,9 +10,10 @@ without rebuilding five times.  Every win except W4 is switchable by environment
 > block 00 + blocks 01-14), and every row below was re-checked **as a combination** on the tree built
 > from the beta patch on top of the delivered **15-block** set (fresh worktree at `9113cc188`, strict
 > **15/15** `git am` + the beta patch, fresh build): reserves, byte-identical coherence on all five
-> models, the MTP gate, and the op suites all reproduce.  The 2026-09-11 re-cut is tip **`fe4f55278`**
-> (base `389c5341f`, tree `928852cdc`) and every 2026-09-10 number reproduced **to the last decimal**
-> — see `README.md` and `HANDOVER.md` §10.
+> models, the MTP gate, and the op suites all reproduce.  The current re-cut is tip **`888a59ee0`**
+> (base `13af95ac1`, tree `476d2d1e9`) and every recorded number carries forward — see the dated
+> re-cut log below, `README.md` and `HANDOVER.md` §10.  (Earlier tip `fe4f55278`, base `389c5341f`,
+> tree `928852cdc`.)
 > V3 is **on by default** (`LLAMA_KQ_MASK_DERIVED`), V4 and V5 are **opt-in through one switch**
 (`GGML_CUDA_FA_KV_NATIVE=1`, V4 for q8_0 K/V, V5 for bf16 K/V — see the amendment note in `README.md`),
 > default off — a ~1.7 % prefill cost for a large memory win).  What testers should do is reproduce the
@@ -217,6 +218,20 @@ but the hunks are far apart, so the re-cut is **metadata/offset-only** (0 change
 
 Nothing in the tester checklist changes: the revalidation numbers above were taken on the previous
 re-cut and the delta is metadata only.
+
+## 2026-09-12 (2) — twelfth re-cut: block 13's RDNA3_5 single-token-only mmvq fusion skip
+
+The base moved for a gfx1151 **purity** amendment (no new rule, no changed default): block 13 now skips
+the dense gate+up+GLU mmvq fusion and the weighted-down MoE tail on RDNA3_5 unless
+`GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1`, because their fused kernels do not reproduce the
+standalone arithmetic and so broke `W=1` decode vs `W>=2` verify bit-identity.  Base `13af95ac1` ->
+**beta tip `888a59ee0`**, tree `476d2d1e95947de7cc8cd806c40efc0f01927cd3`, patch **3 811 lines**; the
+patch applies with strict `git am` and is byte-identical to the eleventh re-cut except the `From <sha>`
+line (the changed files, `ggml-cuda.cu`/`mmvq.cu`, are absent from this patch).
+
+**Nothing in the tester checklist changes** — the gate table above is unaffected, and the amendment was
+validated on the delivery itself (`W = 1,2,4,8` one hash per config: qwen4exp f16 `453eaa61`, q8_0
+`113696b9`, MoE `18999a78`).
 
 ## 2026-09-12 — eleventh re-cut: block 13's column-blocked shared-expert epilogue
 

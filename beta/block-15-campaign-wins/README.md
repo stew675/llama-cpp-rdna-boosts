@@ -7,7 +7,7 @@
 **Status: BETA — staged, NOT promoted (2026-09-10); REVALIDATED 2026-09-11
 against the 15-patch delivery.**  The campaign is
 complete and the block-15 patch lives **only in this directory**
-(`block-15-campaign-wins.patch`, re-cut 2026-09-11 (11) on base `6d3155faa`); it is **not part of the
+(`block-15-campaign-wins.patch`, re-cut 2026-09-12 (2) on base `13af95ac1`); it is **not part of the
 delivery** (`patches/` is the 15-patch set: block 00 + blocks 01-14) and is
 applied manually on top of the 15-block tree.  The beta window (~4–5 days) is open for tester feedback;
 promotion into the delivery set requires the maintainer's go-ahead (at
@@ -36,6 +36,15 @@ re-cut and re-validated end to end.
   dense `6.5377`, and the new K/V reject fires in the beta build).  **Testers: pass matching
   `-ctk`/`-ctv`** (the hard reject applies to the beta too; every
   script here already does).  See `BETA-TESTING.md` (the dated tenth-re-cut section).
+* **Re-cut a twelfth time 2026-09-12 (2)** after the block-13 RDNA3_5 single-token-only mmvq fusion skip
+  (the dense gate+up+GLU fusion and the weighted-down MoE tail are skipped on gfx1151 unless
+  `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1`).  Base **`13af95ac1`** (tree
+  `f4791066f4a582316b1ca95f51c96cd10b905ef7`) -> **beta tip `888a59ee0`**, tree
+  **`476d2d1e95947de7cc8cd806c40efc0f01927cd3`**, patch **3 811 lines** — the exported patch is
+  byte-identical to the eleventh re-cut **except the `From <sha>` line**, because block 13's amendment
+  touches only `ggml-cuda.cu`/`mmvq.cu`, which the block-15 patch does not touch.  Applies with strict
+  `git am` (no `-3` needed); round-tripped (fresh worktree at the base -> identical tree).  **No
+  tester-visible change** — nothing in the gate table moves.
 * **Re-cut an eleventh time 2026-09-12** after the block-13 column-block amendment (`shexp_down_gated_q8_0`
   is now `ncols_dst`-templated with the token loop inside the k-block loop and `grid = (nrows)`; a
   bit-identical restructure that repays the band amendment's `pl=8` cost — `pl=8` 461.0 -> 475.4 t/s,

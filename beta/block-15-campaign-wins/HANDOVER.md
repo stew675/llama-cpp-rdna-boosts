@@ -31,6 +31,14 @@
 > merged cleanly (the `llama-context.cpp` region now carries both the new reject and block 15's
 > tensor-split type gate); the only delta vs the ninth re-cut is those three delivery files.  Testers must
 > pass matching `-ctk`/`-ctv`.  See `README.md` (tenth re-cut) and `BETA-TESTING.md`.
+> **Re-cut a twelfth time 2026-09-12 (2)** after the block-13 RDNA3_5 single-token-only mmvq fusion skip
+> (the dense gate+up+GLU fusion and the weighted-down MoE tail; gfx1151-only, opt-in
+> `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1`).  Base `13af95ac1` (tree
+> `f4791066f4a582316b1ca95f51c96cd10b905ef7`) -> **beta tip `888a59ee0`**, tree
+> **`476d2d1e95947de7cc8cd806c40efc0f01927cd3`**, patch **3 811 lines**.  Strict `git am` applies
+> (block 13's amendment touches only `ggml-cuda.cu`/`mmvq.cu`, which the patch does not hunk-touch), and
+> the export is byte-identical to the eleventh re-cut apart from the `From <sha>` line; no recorded
+> number moves.
 > **Re-cut an eleventh time 2026-09-12** after the block-13 column-block amendment (bit-identical; repays
 > the band amendment's `pl=8` cost).  Base `124abba9e` (tree `d7c8e8984b8bd65838d8ae58c0f5de449d9c5d4d`)
 > -> **beta tip `a90f75896`**, tree **`ed6ee74df8b690c5a1584adb3f85c45eda70a09b`**, patch **3 811 lines**.
