@@ -29,6 +29,14 @@ node-dump/op-trace rebuild to diff the W=1 and W=4 graphs.  Item 4 is re-scoped 
 `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`; analysis `GREEDY-PURITY.md` §18; docs updated
 (`AGENTS.md`, `TODO.md`).
 
+## 2026-09-12 (5) — item 5(f): the block-13 fused MoE gate+up+GLU arm still wins on Strix Halo
+
+Re-measured on the current delivery tip (35B-A3B Q4_K_M, 1 GPU, interleaved
+`GGML_CUDA_DISABLE_MOE_MMQ_FUSION` off/on ×3, pp2048 and pp16384): the fusion is still worth
+**+0.6 %** prefill at both sizes (pp2048 1711.9/1710.2 vs 1710.1/1701.4 t/s; pp16384 1485.3/1485.8 vs
+1476.4/1478.6 — the first p2048 off-run 1733.3 is a warm-up outlier) and the fusion fires, so TODO item
+5(f) is **closed: keep the arm**.  Docs-only; no delivery change.
+
 ## 2026-09-12 (3) — TODO.md audit: the Active list is active-only, closed items moved out, state header refreshed
 
 Docs-only tracker cleanup (no delivery change).  `TODO.md`'s *Active* list had accumulated finished-work

@@ -95,10 +95,6 @@ Consolidated list with the records under `wip/archive/qwen4exp/discovery/`:
   fusion-surface diffs — likely sub-0.2 %, root-cause-only value.
 - (d) **mmq accumulator-overflow latent defect** (`I < nwarps*16`) — report upstream (correctness
   hygiene, no perf value).
-- (f) **Re-check whether the block-13 gate+up+GLU arm still has a unique win on Strix Halo**: with the
-  2026-09-06 model-neutral folds in the tree the isolated fused-MoE delta is now ~0 there
-  (`GGML_CUDA_DISABLE_MOE_MMQ_FUSION` on vs off: pp2048 +0.4 %, pp16384 +0.2 %; absolute prefill ~10–13 %
-  higher, the fusion still fires) — the folds are capturing the same work, not a regression.
 - (g) **V3 prefill cost is arch-dependent (low priority)**: gfx1151 measured −3.2 % at pp20480 (4B, q8_0)
   vs the RDNA4 reference −1.3 %, decode flat.  Still a large net win (−799 MiB compute + −799 MiB host)
   and on by default; if an iGPU tuning pass ever runs, the derived MMA kernel's `J`/occupancy on gfx1151
@@ -209,6 +205,12 @@ Reference: `GREEDY-PURITY.md` §23.3, `WORKLOG.md` 2026-09-11 (11).
   `wip/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
+
+**Item 5(f) — the block-13 fused MoE gate+up+GLU arm still wins on Strix Halo (closed 2026-09-12).**
+Re-measured on the current delivery tip (35B-A3B Q4_K_M, 1 GPU, `-p 2048`/`-p 16384`, interleaved
+`GGML_CUDA_DISABLE_MOE_MMQ_FUSION` off/on ×3): fusion active **+0.6 %** at pp2048
+(1711.9/1710.2 vs 1710.1/1701.4 t/s) and **+0.6 %** at pp16384 (1485.3/1485.8 vs 1476.4/1478.6), the
+fusion fires, prefill absolute ~1710/1485 t/s.  So the arm is **kept** (small but real Strix win, not
 
 **The gfx1151 dense-decode-at-every-depth policy (TODO item 7, closed 2026-09-12).**  The proposed
 workaround (force gfx1151 decode dense at every depth, so the sparse regime becomes unreachable) was
