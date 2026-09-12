@@ -1,5 +1,19 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-12 (3) — TODO.md audit: the Active list is active-only, closed items moved out, state header refreshed
+
+Docs-only tracker cleanup (no delivery change).  `TODO.md`'s *Active* list had accumulated finished-work
+footnotes, so the file no longer told a reader what was actually open: item 2 was an empty heading for the
+fixed issue-25 GDN divergence (heading deleted; already in Closed), item 1's Block-15 dense-arm blocker
+narrative was a Closed record repeated in Active (trimmed to the live 12th-re-cut + beta-window state),
+item 6 carried the completed gfx1201 port and Phase-2.5 narrative (moved to Closed, leaving only the open
+gfx1100/gfx1151 legs), item 5(e) (gfx1100/gfx1201) duplicated item 6 and was dropped, and the state header
+still named the superseded canonical tip `124abba9e` / tree `d7c8e898…` (now `13af95ac1` /
+`f4791066f4…`, matching `make-patches.sh`).  Added the Closed one-liner for the 2026-09-12 (2) block-13
+RDNA3_5 mmvq-fusion purity amendment and a new Active item 16 for its perf follow-up (make the fused
+`ncols_dst==1` kernels reproduce the standalone reduction rather than skip the fusion).  Also prepared the
+post-compaction brief `wip/strix-halo/HANDOVER-2026-09-12-remaining-gfx1151.md`.
+
 ## 2026-09-12 (2) — block 13: the RDNA3_5 single-token-only mmvq fusions are not decode/verify bit-identical (folded)
 
 **Canonical tip `13af95ac1`** (tree `f4791066f4a582316b1ca95f51c96cd10b905ef7`), 15 blocks,
