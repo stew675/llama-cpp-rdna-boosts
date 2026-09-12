@@ -291,7 +291,7 @@ explicitly requests it.**
 | `README.md` | consumer overview + workflow (start here) |
 | `MANIFESTS.md` | apply order, per-block verification, validation history |
 | `BASELINE.md` | fork point, patch provenance, drift policy |
-| `GREEDY-PURITY.md` | block-10 decode-variance analysis (read before shipping) |
+| `GREEDY-PURITY.md` | the purity rulebook (index + invariants + per-finding claims; read before shipping) — its dated narratives/evidence for the closed cases are in `archive/docs/GREEDY-PURITY-FINDINGS.md` under the same `§` numbers |
 | `patches/` | **the delivery set** (0000-0014: block 00 + blocks 01-14) + apply README |
 | `scripts/apply-all.sh` | the verified apply flow (`git am` block 00 + blocks 01-14, automatic `git am -3` fallback on a drifted base) |
 | `scripts/make-patches.sh` | regenerates the set from the fork |

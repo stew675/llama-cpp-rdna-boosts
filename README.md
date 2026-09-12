@@ -188,7 +188,8 @@ summary below is deliberately short and does not repeat them.
 ├── AGENTS.md              # working guide for LLM agents in this repo
 ├── MANIFESTS.md           # apply order, per-block verification, validation history
 ├── BASELINE.md            # fork point, patch provenance, drift policy
-├── GREEDY-PURITY.md       # block 10 decode-variance analysis (read before shipping)
+├── GREEDY-PURITY.md       # purity rulebook: index, invariants, per-finding claims (read before shipping)
+│                          #   narratives/evidence for the closed cases: archive/docs/GREEDY-PURITY-FINDINGS.md
 ├── WORKLOG.md             # dated delivery records (newest first; README points here)
 ├── rdna-boosts-all.patch  # convenience: the entire 15-patch net as ONE patch
 ├── patches/               # the delivery set: 0000-0014
