@@ -4,8 +4,8 @@
 # Pipeline:
 #   1. shallow-download upstream llama.cpp at the recorded fork point
 #      (codeload tarball by SHA -- no full history),
-#   2. `git init` + base commit, then apply patches/0001..0015 with
-#      scripts/apply-all.sh (strict `git am`),
+#   2. `git init` + base commit, then apply patches/0000..0015 (block 00 +
+#      blocks 01-15) with scripts/apply-all.sh (strict `git am`),
 #   3. build the full / light / server images from .devops/rdna-rocm.Dockerfile
 #      against ROCm 7.2 (complete base), 7.14 and 10.0 (full base),
 #   4. push to ghcr.io/<owner>/<repo>.
@@ -102,9 +102,11 @@ jobs:
           git add -A
           git commit -q -m "llama.cpp ${FORK_POINT} (base)"
           bash "$GITHUB_WORKSPACE/scripts/apply-all.sh" .
-          # base commit + 15 block commits
-          test "$(git rev-list --count HEAD)" -eq 16
-          git log --oneline -15
+          # base commit + one commit per block patch (derive the count so it
+          # cannot go stale when a block is added)
+          n_blocks="$(find "$GITHUB_WORKSPACE/patches" -maxdepth 1 -name '[0-9][0-9][0-9][0-9]-*.patch' | wc -l)"
+          test "$(git rev-list --count HEAD)" -eq "$((n_blocks + 1))"
+          git log --oneline -"$n_blocks"
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1

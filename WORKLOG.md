@@ -1,5 +1,32 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-13 — CI fix: GHCR container workflow's stale commit-count assertion
+
+The `.github/workflows/docker-ghcr.yml` apply step hard-asserted
+`test "$(git rev-list --count HEAD)" -eq 16` ("base commit + 15 block commits") and
+`git log --oneline -15`.  It was authored 2026-09-10, when the set was 15 blocks
+(block 00 + blocks 01-14 = 16 commits); **block 15 was promoted 2026-09-12**, making
+the set 16 blocks and the applied history **17 commits**.  The patches still applied
+strict 16/16 `git am` and `apply-all.sh` reported success, so the sanity check — not
+the delivery — aborted every matrix job (all three ROCm entries) with exit code 1
+before any image was built (runs 34733460496, 34733771241).
+
+Fix: derive the expected count from the patch set instead of hardcoding it, so it
+cannot drift on the next block:
+
+```sh
+n_blocks="$(find "$GITHUB_WORKSPACE/patches" -maxdepth 1 -name '[0-9][0-9][0-9][0-9]-*.patch' | wc -l)"
+test "$(git rev-list --count HEAD)" -eq "$((n_blocks + 1))"
+git log --oneline -"$n_blocks"
+```
+
+The header comment now also says `patches/0000..0015 (block 00 + blocks 01-15)`.
+Reproduced the exact CI step locally with a fresh `9113cc188` tarball + `apply-all.sh`:
+16 patches -> 17 commits, dynamic check passes (the old `-eq 16` fails as observed).
+The three base image tags (`rocm/dev-ubuntu-24.04:{7.2.4-complete,7.14.1-full,10.0.0-full}`)
+were confirmed to exist, so the pipeline can proceed past the fixed step.  No delivery
+patch content changed.
+
 ## 2026-09-12 (18) — block-13 amendment: dense mmvq weight per-(type, K) nwarps (targeted MoE recovery)
 
 Follow-up to (16)/(17).  The (16) band-uniform RDNA4 `nwarps = 1` fixed the dense verify widths but
