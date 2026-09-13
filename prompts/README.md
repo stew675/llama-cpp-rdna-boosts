@@ -41,12 +41,20 @@ build/bin/llama-cli -m "$MODEL" --spec-type none -f "$PROMPT" \
   -n 128 --seed 42 --temp 0 --single-turn --no-display-prompt \
   -c 32768 -b 2048 -ub 2048 -ctk f16 -ctv f16 -fa auto -ngl 99 -lv 4
 
-# MTP verify (draft depth 3 / 7); acceptance is the `draft acceptance = …` line
-build/bin/llama-cli -m "$MODEL" --spec-type draft-mtp -md DRAFT.gguf \
+# MTP verify (draft depth 3 / 7); acceptance is the `draft acceptance = ...` line.
+# No -md: the drafter is the MTP head built into the model GGUF (blk.<n>.nextn.*,
+# *.nextn_predict_layers).  A separate -md draft model is a different drafter and
+# gives different acceptance.
+build/bin/llama-cli -m "$MODEL" --spec-type draft-mtp \
   --spec-draft-n-max 3 -f "$PROMPT" \
   -n 128 --seed 42 --temp 0 --single-turn --no-display-prompt \
   -c 32768 -b 2048 -ub 2048 -ctk f16 -ctv f16 -fa auto -ngl 99 -lv 4
 ```
+
+> **Drafting head:** use the model's built-in MTP head.  Unsloth's Qwen GGUFs carry it at
+> `blk.<block_count-1>.nextn.*` (e.g. `blk.64.nextn.eh_proj.weight` with `nextn_predict_layers = 1`),
+> and llama.cpp uses it automatically when no `-md` is given.  Do **not** pass the old standalone
+> `mtp-*.gguf`: it is a different (older) drafter, and it changes acceptance and throughput.
 
 See `benchmarks/mtp-adaptive-methodology.md` for the full gate.
 
@@ -60,8 +68,8 @@ generated text).
 
 ```sh
 for spec in "--spec-type none" \
-            "--spec-type draft-mtp -md DRAFT.gguf --spec-draft-n-max 3" \
-            "--spec-type draft-mtp -md DRAFT.gguf --spec-draft-n-max 7"; do
+            "--spec-type draft-mtp --spec-draft-n-max 3" \
+            "--spec-type draft-mtp --spec-draft-n-max 7"; do
   build/bin/llama-cli -m "$MODEL" $spec -f "$PROMPT" \
     -n 64 --seed 42 --temp 0 --single-turn --no-display-prompt \
     -c 32768 -b 2048 -ub 2048 -ctk f16 -ctv f16 -fa auto -ngl 99 > run.log 2>&1
@@ -72,6 +80,7 @@ done
 The helper strips llama-cli's backspace (`\b`) stream corrections before slicing the generated span;
 a naive `sed`/`grep` slice does **not** reproduce the hashes.
 
-When reporting a result, quote the prompt path + hash, the model/draft files, the build
-(`git rev-parse HEAD` of the stock base and the applied tree of the patched arm) and the full command
-lines — see the issue-#30 reproduction report for the shape of that provenance block.
+When reporting a result, quote the prompt path + hash, the model file(s) (the drafting head is in the
+model; no separate draft file), the build (`git rev-parse HEAD` of the stock base and the applied tree
+of the patched arm) and the full command lines.  The issue-#30 reproduction report shows the shape of
+that provenance block.

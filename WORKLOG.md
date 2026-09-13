@@ -49,7 +49,12 @@ in place).  First entry: `prompts/prose-rdna-boosts.txt` (16074 B, 5298 tokens, 
 the prompt used for the issue-#30 reproduction and the Protocol-A MTP gate.  The issue-#30 reply now
 points at it instead of pasting the prompt inline, so reported numbers are tied to a committed hash.
 Also added `scripts/extract-generated.py`, the backspace-aware generated-text extractor the purity gate
-hashes with (a naive `sed`/`grep` slice does not reproduce the values).
+hashes with (a naive `sed`/`grep` slice does not reproduce the values).  Also corrected the MTP test
+procedure: the drafter is the **MTP head built into the target GGUF** (`blk.<n>.nextn.*`,
+`nextn_predict_layers`), used automatically when no `-md` is passed.  The old standalone
+`mtp-Qwen3.8-27B-Q4_0.gguf` is a different drafter and changes the numbers (27B UD-Q4_K_XL, n3:
+0.57554 acceptance / 46.9 t/s with `-md` vs 0.61654 / 47.1 t/s with the built-in head).  Docs now use
+no `-md`; the separate file is not needed.
 
 ## 2026-09-13 (even later) — block-08 amendment (seventh): the fused MoE router is bit-identical — TODO item 19 closed
 

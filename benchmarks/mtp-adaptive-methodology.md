@@ -97,6 +97,10 @@ Run the same with `--spec-type none` and compare.  The prompt is the versioned
 `prompts/prose-rdna-boosts.txt` (16074 B, 5298 tokens, `sha256 fabdec65…`) — record the hash with any
 result, and never edit a shipped prompt in place (see `prompts/README.md`).
 
+The drafting model is the **MTP head built into the target GGUF** (`blk.<block_count-1>.nextn.*`,
+`*.nextn_predict_layers`), used automatically when no `-md` is passed.  Do not pass the old standalone
+`mtp-*.gguf`; it is a different drafter and changes acceptance.
+
 Gate rules:
 1. **Acceptance**: with `--log-verbosity 4`, the `draft acceptance` /
    `acc per pos` lines must show a healthy rate on prose (>= ~0.45 at pos 1
