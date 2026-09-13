@@ -86,7 +86,11 @@ the sparse top-k arm for a 9..16-row verify (`QSA_DECODE_BAND = 8`); the arm ban
 `max(QSA_DECODE_BAND, cparams.n_rs_batch)`.  The residual purity loss above depth 7 is the documented
 kernel-family switch at 8 rows (FA tile/MMA **and** matmul MMVQ/MMVF -> MMQ), now an accepted trade
 with a visible notice instead of a clamp; only `> 15` (the recurrent snapshot bound) is clamped.  The
-default `n_max 3` is unaffected.  Canonical tip `c45244c72`, tree `a5683e1b008e`.  Full record:
+default `n_max 3` is unaffected.  The adaptive-MTP four-axis table is re-presented at the mode's
+recommended ceiling **12** (the old 7 was the clamp): on verbatim recall that is 81.1 t/s / mean len
+5.80, **+14.2%** over the old ceiling-7 cell and **+21.4%** over fixed `n3`, and still text-pure on all
+four axes (`benchmarks/2026-09-13-adaptive-mtp-4-axis-n12.md`).  Canonical tip `c45244c72`, tree
+`a5683e1b008e`.  Full record:
 [`WORKLOG.md`](WORKLOG.md) 2026-09-13 (latest) and the issue-#30 section of
 [`patches/README.md`](patches/README.md).
 

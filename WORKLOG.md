@@ -75,6 +75,19 @@ facts), `GREEDY-PURITY.md` §11/§19, `benchmarks/mtp-adaptive-methodology.md`, 
 `MANIFESTS.md`/`BASELINE.md`/`README.md` headers.  The parked issue-#30 response is corrected (its
 clamp description) and its revision bumped.
 
+**6. Adaptive MTP is presented at its recommended ceiling 12 (same day).**  With the clamp gone, the
+adaptive-MTP four-axis table (`benchmarks/2026-09-13-adaptive-mtp-4-axis-n12.md`) re-measures
+`--spec-type draft-mtp-adaptive --spec-draft-n-max 12` (block 001's original recommendation) instead of
+the clamp-limited 7.  New (27B UD-Q4_K_XL, 1 GPU, f16, `-n 256`, R/P/C/K; second run within ~1 %):
+R 57.8 t/s / acc 0.79204 / mean len 3.36; P 43.4 / 0.54483 / 2.63; C 45.5 / 0.55789 / 2.66;
+K **81.1** / 0.93363 / **5.80** — i.e. the controller still settles at the floor on R/P/C (identical to
+fixed `n3`, ~1 % decision cost) and climbs on recall, where ceiling 12 is **+14.2 %** over the old
+ceiling-7 cell (71.03 t/s, mean len 5.43) and **+21.4 %** over fixed `n3` (66.8 t/s).  The `plain` and
+`mtp n3` cells reproduce the ceiling-7 record to within noise.  Text-pure on all four axes at `-n 256`
+with no `-lv 4`: `plain == fixed n3 == fixed n7 == adaptive n12` on recall (`63f30098feea`) and
+`plain == adaptive n12` on R/P/C — observed purity, not a new guarantee (the `n_max <= 7` warning
+stands), and depth 12 is well inside the hard 15 bound.
+
 **Lesson.**  "Depth > 7 is unsupported" had been resting on one stated reason (FA purity) while the real
 qwen4exp effect was a different band (the QSA arm).  The no-corruption result came from a deterministic
 reference-context sweep, not from acceptance numbers: acceptance is not a correctness signal (a

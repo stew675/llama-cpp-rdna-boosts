@@ -148,7 +148,10 @@ split `HIP_VISIBLE_DEVICES=0,2`, Q8_0 27B dense, f16 KV, ctx 262144).
 Run passes 1 and 2, repeat >= 2, and compare against the baselines below.
 The dense expectations table was recorded 2026-08-23 (rdna-boosts era
 `e0aa19e25`) and re-verified 2026-09-02 on the fixed 13-block build —
-see the results table.
+see the results table.  **The adaptive ceiling is 12** (`--spec-draft-n-max 12`,
+the mode's recommended depth); since the 2026-09-13 clamp relaxation it is no
+longer capped at 7.  The current four-axis measurement is
+[2026-09-13-adaptive-mtp-4-axis-n12.md](2026-09-13-adaptive-mtp-4-axis-n12.md).
 
 ## Baselines
 

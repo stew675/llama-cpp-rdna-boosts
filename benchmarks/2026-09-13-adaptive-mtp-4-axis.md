@@ -1,5 +1,12 @@
 # Adaptive MTP across the four workloads (2026-09-13)
 
+> **Superseded for the adaptive ceiling (2026-09-13).**  The `adaptive n7` column below was measured
+> while the CLI clamped `--spec-draft-n-max` to 7.  The clamp is now 15 and the adaptive mode's
+> recommended ceiling is **12**; the re-measured table (and the text-purity result) lives in
+> [2026-09-13-adaptive-mtp-4-axis-n12.md](2026-09-13-adaptive-mtp-4-axis-n12.md).  The `plain` and
+> `mtp n3` columns here remain the reference for those modes.
+
+
 Measures the delivery's MTP draft depth variants across the four workloads the adaptive-MTP gate uses:
 **R**easoning, **P**rose, **C**ode and verbatim recall (**K**). It exists because MTP acceptance is a
 function of *what the model is generating*, so a single-prompt measurement is not representative, and

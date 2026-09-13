@@ -17,6 +17,16 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 > clean-apply build; depth-16384 3-GPU hybrid 38.71 t/s unpinned) and the
 > benchy depth-16384 protocol in `wip/HANDOFF.md`.
 
+## Adaptive MTP — four-workload records
+
+**[2026-09-13-adaptive-mtp-4-axis-n12.md](2026-09-13-adaptive-mtp-4-axis-n12.md)** is the
+current adaptive-MTP table: `draft-mtp-adaptive` at its recommended **ceiling 12** (the
+2026-09-13 clamp relaxation), across the R/P/C/K workloads, with the `plain` and fixed
+`mtp n3` baselines and the text-purity check.  It supersedes the `adaptive n7` column of
+[2026-09-13-adaptive-mtp-4-axis.md](2026-09-13-adaptive-mtp-4-axis.md) (that ceiling was an
+artifact of the old `n_max <= 7` clamp).  The gate protocol and baselines live in
+[mtp-adaptive-methodology.md](mtp-adaptive-methodology.md).
+
 ## Block 12 — hybrid all-reduce env matrix (2026-08-30)
 
 **[block12-hybrid-ar-matrix.md](block12-hybrid-ar-matrix.md)** — the
