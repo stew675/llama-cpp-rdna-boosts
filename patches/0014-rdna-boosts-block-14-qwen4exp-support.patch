@@ -1,4 +1,4 @@
-From 378c9a9d65d8b28c70ffb1a751f25fbf8164fe07 Mon Sep 17 00:00:00 2001
+From 55c733d5c93e5d8a7ba1c3e6bbf5ec363bf53e30 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -142,7 +142,7 @@ pending.  Instruments: wip/strix-halo/qsa-item4/.
  ggml/src/ggml-backend-meta.cpp         |  129 ++-
  ggml/src/ggml-backend.cpp              |   47 +-
  ggml/src/ggml-cpu/ggml-cpu.c           |   37 +
- ggml/src/ggml-cpu/ops.cpp              |  496 +++++++++++
+ ggml/src/ggml-cpu/ops.cpp              |  496 ++++++++++
  ggml/src/ggml-cpu/ops.h                |    4 +
  ggml/src/ggml-cuda/common.cuh          |    1 +
  ggml/src/ggml-cuda/concat.cu           |   73 ++
@@ -182,12 +182,12 @@ pending.  Instruments: wip/strix-halo/qsa-item4/.
  src/llama-model.h                      |    6 +
  src/llama.cpp                          |    3 +-
  src/models/models.h                    |   48 +-
- src/models/qwen4exp.cpp                | 1130 +++++++++++++++++++++---
+ src/models/qwen4exp.cpp                | 1143 +++++++++++++++++++++---
  tests/CMakeLists.txt                   |    1 +
  tests/test-backend-ops.cpp             |  110 +++
  tests/test-lazy-reader.cpp             |  264 ++++++
  tests/test-llama-archs.cpp             |    7 +-
- 55 files changed, 7279 insertions(+), 330 deletions(-)
+ 55 files changed, 7292 insertions(+), 330 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
@@ -204,7 +204,7 @@ pending.  Instruments: wip/strix-halo/qsa-item4/.
  create mode 100644 tests/test-lazy-reader.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 9ea9a47a4..8338f01a7 100644
+index 59407cdbf..463c3c52c 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2713,6 +2713,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -237,10 +237,10 @@ index 9ea9a47a4..8338f01a7 100644
          {"--numa"}, "TYPE",
          "attempt optimizations that help on some NUMA systems\n"
 diff --git a/common/common.cpp b/common/common.cpp
-index 347ba3d1c..7b8ede26e 100644
+index c0560a237..b8aff0924 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1726,6 +1726,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1762,6 +1762,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.split_mode      = params.split_mode;
      mparams.load_mode       = params.load_mode;
      mparams.lazy_mode = params.lazy_mode;
@@ -7424,10 +7424,10 @@ index 87195fddd..75b9b3493 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8ace95f73..4f31776bf 100644
+index 8ace95f73..ca118f4ea 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -5,6 +5,115 @@
+@@ -5,6 +5,122 @@
  
  #include <algorithm>
  #include <cinttypes>
@@ -7455,6 +7455,13 @@ index 8ace95f73..4f31776bf 100644
 +// n_kv = 2304 > width = indexer_top_k + r - 1 = 2051 the plain run took the dense arm and
 +// the verify the sparse one from the first decode graph on.  Prefill (n_tokens >> the band)
 +// keeps the sparse selection (the arch policy: "prefill is untouched, QSA always").
++// The effective band is extended to the widest speculative verify batch (cparams.n_rs_batch,
++// i.e. common_speculative_n_max() + 1) in build_layer_attn: this constant is only the
++// no-speculation floor.  With --spec-draft-n-max clamped at 7 the verify is <= 8 tokens and
++// the floor covers it, but a deeper draft (n_max > 7, LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0) makes
++// the verify W = n_max + 1 > 8 and the exact same dense-vs-sparse flip returns - measured
++// 2026-09-13 on qwen4exp-moe at n_kv = 2501 (W = 1..8 `5009c55bca5e01ca`, W = 9..16
++// `596ec8bf7461da1a`, `LLAMA_QSA_OFF=1` pure at the dense hash).
 +static constexpr int64_t QSA_DECODE_BAND = 8;
 +
 +// LLAMA_QSA_DENSE_* values: a token count, optionally K/M/G suffixed.  -1 when unset or invalid.
@@ -7543,7 +7550,7 @@ index 8ace95f73..4f31776bf 100644
  
  // bad metadata must be catchable: GGML_ASSERT aborts the whole process
  static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
-@@ -23,7 +132,26 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
+@@ -23,7 +139,26 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
      }
  }
  
@@ -7570,7 +7577,7 @@ index 8ace95f73..4f31776bf 100644
      ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
      ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
      ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
-@@ -154,15 +282,19 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -154,15 +289,19 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
      const int64_t hc_dim = hc * n_embd;
      const int64_t hc_lr  = hparams.hc_low_rank;
  
@@ -7595,7 +7602,7 @@ index 8ace95f73..4f31776bf 100644
          output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
      }
  
-@@ -176,7 +308,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -176,7 +315,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
  
          // the converter pads the table; a model synthesised from metadata has no tensor to ask
          const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
@@ -7605,7 +7612,7 @@ index 8ace95f73..4f31776bf 100644
              if (ple_w->tensor->ne[1] < ple_rows) {
                  throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
                                                  ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
-@@ -184,13 +317,49 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -184,13 +324,49 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
              ple_rows = ple_w->tensor->ne[1];
          }
  
@@ -7658,7 +7665,7 @@ index 8ace95f73..4f31776bf 100644
          const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
          const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
  
-@@ -203,61 +372,91 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -203,61 +379,91 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
          const int64_t conv_dim   = key_dim * 2 + value_dim;
  
          // two HC modules per layer: before the token mixer, before the MoE
@@ -7788,7 +7795,7 @@ index 8ace95f73..4f31776bf 100644
      return std::make_unique<graph>(*this, params);
  }
  
-@@ -275,6 +474,53 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+@@ -275,6 +481,53 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
      const int64_t hc_dim = hc * n_embd;
      const int64_t nt     = x->ne[2];
  
@@ -7842,7 +7849,7 @@ index 8ace95f73..4f31776bf 100644
      // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
      // the converter folded each gamma to (1 + w)
      ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
-@@ -319,11 +565,40 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+@@ -319,11 +572,40 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
      const int64_t hc = hparams.dsv4_hc_mult;
      const int64_t nt = residual->ne[2];
  
@@ -7883,7 +7890,7 @@ index 8ace95f73..4f31776bf 100644
      ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
      b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
  
-@@ -374,6 +649,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -374,6 +656,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
              n_embd, hc, n_tokens, 1);
      cb(res_hc, "hc_init", -1);
  
@@ -7894,7 +7901,7 @@ index 8ace95f73..4f31776bf 100644
      for (int il = 0; il < n_layer; ++il) {
          res->t_layer_inp[il] = res_hc;
  
-@@ -397,6 +676,26 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -397,6 +683,26 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
              cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
          }
  
@@ -7921,7 +7928,7 @@ index 8ace95f73..4f31776bf 100644
          if (il == n_layer - 1 && inp_out_ids) {
              // everything below is per token, so drop the rows that produce no output
              cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
-@@ -423,6 +722,35 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -423,6 +729,35 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
  
          // "l_last" is the layer output name that build_cvec and imatrix look for
          cb(res_hc, "l_last", il);
@@ -7957,7 +7964,7 @@ index 8ace95f73..4f31776bf 100644
      }
  
      // the final mixer is the output norm: there is no separate one
-@@ -440,6 +768,208 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -440,6 +775,208 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
      ggml_build_forward_expand(gf, cur);
  }
  
@@ -8166,7 +8173,7 @@ index 8ace95f73..4f31776bf 100644
  std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
                  ggml_tensor * input,
                          int   il) {
-@@ -468,6 +998,56 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
+@@ -468,6 +1005,56 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
      return ggml_mul(ctx0, normalized, gated);
  }
  
@@ -8223,7 +8230,7 @@ index 8ace95f73..4f31776bf 100644
  // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
  // one mean-pooled indexer key scores each block; set_input resolves the cache layout
  class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
-@@ -478,7 +1058,13 @@ public:
+@@ -478,7 +1065,13 @@ public:
  
      void set_input(const llama_ubatch * ubatch) override {
          mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
@@ -8238,7 +8245,7 @@ index 8ace95f73..4f31776bf 100644
      }
  
      bool can_reuse(const llm_graph_params & params) override {
-@@ -514,6 +1100,7 @@ public:
+@@ -514,6 +1107,7 @@ public:
      ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
      ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
      ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
@@ -8246,7 +8253,7 @@ index 8ace95f73..4f31776bf 100644
  
      const llama_memory_hybrid_idx_context * mctx;
      const uint32_t ratio;
-@@ -539,7 +1126,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -539,7 +1133,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      GGML_ASSERT(r > 0);
  
      const int64_t n_blocks = (n_kv + r - 1)/r;
@@ -8254,7 +8261,7 @@ index 8ace95f73..4f31776bf 100644
      // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
      const int64_t n_stream = mctx_hyb->get_n_stream();
      GGML_ASSERT(n_tokens % n_stream == 0);
-@@ -553,6 +1139,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -553,6 +1146,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
          cparams.causal_attn && !hparams.use_alibi;
  
@@ -8275,7 +8282,7 @@ index 8ace95f73..4f31776bf 100644
      // nothing above depends on the layer, so the layers sharing a ratio share one input set
      llm_graph_input_qsa * inp = nullptr;
  
-@@ -567,11 +1167,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -567,11 +1174,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
          qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
          qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
          qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
@@ -8294,7 +8301,7 @@ index 8ace95f73..4f31776bf 100644
  
          inp = qsa.get();
          res->add_input(std::move(qsa));
-@@ -589,33 +1196,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -589,33 +1203,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
      k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
  
@@ -8329,7 +8336,7 @@ index 8ace95f73..4f31776bf 100644
      ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
      q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
      q = build_norm(q, model.layers[il].index_q_norm, nullptr, LLM_NORM_RMS, il);
-@@ -624,50 +1205,123 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -624,50 +1212,123 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
              ext_factor, attn_factor, beta_fast, beta_slow);
      cb(q, "indexer_q", il);
  
@@ -8488,7 +8495,7 @@ index 8ace95f73..4f31776bf 100644
      cb(top_k, "indexer_top_k", il);
  
      return top_k;
-@@ -744,10 +1398,54 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -744,10 +1405,54 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
      ggml_tensor * k = mctx_cur->get_k(ctx0, il);
      ggml_tensor * v = mctx_cur->get_v(ctx0, il);
  
@@ -8547,7 +8554,7 @@ index 8ace95f73..4f31776bf 100644
      cb(cur, "kqv_out", il);
  
      // the rotation is its own inverse, so undo it on the value side of the output
-@@ -768,10 +1466,104 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -768,10 +1473,110 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      const int64_t n_embd_head = hparams.n_embd_head_v();
      GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
  
@@ -8634,17 +8641,23 @@ index 8ace95f73..4f31776bf 100644
 +            const int64_t env = qsa_env_tokens("LLAMA_QSA_DENSE_PREFILL_UNTIL");
 +            return env >= 0 ? env : 0;
 +        }();
++        // the dense decode band and the verify width: a speculative verify batch must take the
++        // dense decode arm whenever the W=1 decode does (see QSA_DECODE_BAND above).  The widest
++        // batch that can be a verify is cparams.n_rs_batch (the rollback bound = the longest
++        // enabled draft + 1), so the effective band is at least that wide; it is 1 without
++        // speculation, which leaves the plain QSA_DECODE_BAND in charge.
++        const int64_t qsa_decode_band = std::max<int64_t>(QSA_DECODE_BAND, (int64_t) cparams.n_rs_batch);
 +        if (shortcut && n_kv <= width) {
 +            build_qsa_store_k(mctx_hyb, cur, il);
-+        } else if (qsa_dense_decode_until > 0 && n_tokens <= QSA_DECODE_BAND && n_kv < qsa_dense_decode_until) {
++        } else if (qsa_dense_decode_until > 0 && n_tokens <= qsa_decode_band && n_kv < qsa_dense_decode_until) {
 +            // arch policy gate: dense decode below the crossover depth (store keys only).
-+            // QSA_DECODE_BAND, not n_tokens == 1: the verify batch must take the same arm as
++            // qsa_decode_band, not n_tokens == 1: the verify batch must take the same arm as
 +            // the W=1 decode (see QSA_DECODE_BAND above).
 +            build_qsa_store_k(mctx_hyb, cur, il);
-+        } else if (qsa_dense_prefill_until > 0 && n_tokens > QSA_DECODE_BAND &&
++        } else if (qsa_dense_prefill_until > 0 && n_tokens > qsa_decode_band &&
 +                   n_kv < qsa_dense_prefill_until) {
 +            // arch policy, prefill half: dense attend below the prefill crossover (store keys
-+            // only).  n_tokens > QSA_DECODE_BAND keeps this arm disjoint from the decode one, so
++            // only).  n_tokens > qsa_decode_band keeps this arm disjoint from the decode one, so
 +            // a W=1 decode and a W=(--spec-draft-n-max + 1) verify of the same state still take
 +            // the same arm; a prefill chunk is > the band by definition (a chunk <= the band
 +            // cannot be distinguished from a verify batch - that is the point).
@@ -8656,7 +8669,7 @@ index 8ace95f73..4f31776bf 100644
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -1035,10 +1827,14 @@ public:
+@@ -1035,10 +1840,14 @@ public:
  
      bool can_reuse(const llm_graph_params & params) override {
          mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
@@ -8672,7 +8685,7 @@ index 8ace95f73..4f31776bf 100644
  
      const llama_model_qwen4exp & pmodel;
  
-@@ -1047,6 +1843,7 @@ public:
+@@ -1047,6 +1856,7 @@ public:
  
      // scratch, reused across set_input() calls
      std::vector<llama_token> prev;
@@ -8680,7 +8693,7 @@ index 8ace95f73..4f31776bf 100644
  };
  
  void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
-@@ -1109,7 +1906,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -1109,7 +1919,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
          }
      }
  
@@ -8748,7 +8761,7 @@ index 8ace95f73..4f31776bf 100644
  }
  
  // Read a conv history out of its own recurrent row and write the new tail back.
-@@ -1176,6 +2032,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+@@ -1176,6 +2045,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
      auto ple_inp = std::make_unique<llm_graph_input_ple>(
              static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
  
@@ -8788,10 +8801,10 @@ index 8ace95f73..4f31776bf 100644
      ggml_set_input(ple_inp->rows);
      ggml_tensor * rows = ple_inp->rows;
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 6abe090cf..92246f96f 100644
+index e0e3d431f..5125fe0b8 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -193,6 +193,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+@@ -194,6 +194,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
      # llama_build_and_test(test-double-float.cpp) # SLOW
  
      llama_build(test-llama-archs.cpp)

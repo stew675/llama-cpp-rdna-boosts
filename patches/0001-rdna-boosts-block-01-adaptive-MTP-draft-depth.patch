@@ -1,4 +1,4 @@
-From 10a7c331dce0fda7f831eb079cfe801a3c741df2 Mon Sep 17 00:00:00 2001
+From 38fc37c5e18f11e0fe6bf013a08a4a01424eb7fc Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Wed, 9 Sep 2026 05:29:21 -0500
 Subject: [PATCH 01/15] rdna-boosts: block 01: adaptive MTP draft depth
@@ -47,8 +47,8 @@ Controller behaviour was re-validated by the PR author on delta-net
 hardware after the review changes (C3/C6 on Qwen3.8-27B): throughput
 and acceptance match prior measurements within run-to-run noise.
 ---
- common/arg.cpp                                |  21 +-
- common/common.cpp                             |  39 +++-
+ common/arg.cpp                                |  22 +-
+ common/common.cpp                             |  75 +++++-
  common/common.h                               |  36 +--
  common/speculative-adaptive.h                 |  80 +++++++
  common/speculative.cpp                        | 143 +++++++++++-
@@ -56,18 +56,20 @@ and acceptance match prior measurements within run-to-run noise.
  docs/speculative.md                           |   6 +-
  .../speculative-simple/speculative-simple.cpp |   4 +
  src/models/delta-net-base.cpp                 |  11 +-
- tests/CMakeLists.txt                          |   1 +
+ tests/CMakeLists.txt                          |  23 ++
  tests/test-arg-parser.cpp                     |  17 ++
- tests/test-speculative-adaptive.cpp           | 218 ++++++++++++++++++
+ tests/test-recurrent-state-depth.cpp          | 219 ++++++++++++++++++
+ tests/test-speculative-adaptive.cpp           | 218 +++++++++++++++++
  tools/cli/README.md                           |   3 +-
  tools/server/README.md                        |   3 +-
  tools/server/server-context.cpp               |  11 +-
- 15 files changed, 562 insertions(+), 36 deletions(-)
+ 16 files changed, 840 insertions(+), 36 deletions(-)
  create mode 100644 common/speculative-adaptive.h
+ create mode 100644 tests/test-recurrent-state-depth.cpp
  create mode 100644 tests/test-speculative-adaptive.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index c4c4e143c..9ea9a47a4 100644
+index c4c4e143c..59407cdbf 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -363,9 +363,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
@@ -81,25 +83,26 @@ index c4c4e143c..9ea9a47a4 100644
  
      const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                             params.speculative.types.end(),
-@@ -4125,11 +4123,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4125,11 +4123,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
  
      add_opt(common_arg(
          {"--spec-draft-n-max"}, "N",
 -        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
-+        string_format("number of tokens to draft for speculative decoding (default: %d, max: 7)", params.speculative.draft.n_max),
++        string_format("number of tokens to draft for speculative decoding (default: %d, max: 15)", params.speculative.draft.n_max),
          [](common_params & params, int value) {
              if (value < 0) {
                  throw std::invalid_argument("invalid value");
              }
-+            // Values above 7 are clamped, with a visible warning, in common_init_from_params - not
-+            // here: a warning emitted during argument parsing is below the default log threshold and
-+            // would not reach the user.  The cap exists because a verify batch decodes n_max + 1
-+            // query rows and the flash-attention chooser switches kernel family above 8 rows, which
-+            // can change greedy output between --spec-type none and draft-mtp.
++            // Values above 15 are clamped, and values above 7 get a visible purity notice, in
++            // common_init_from_params - not here: a warning emitted during argument parsing is below
++            // the default log threshold and would not reach the user.  The 15 cap is the recurrent
++            // rollback snapshot bound (a verify batch decodes n_max + 1 rows and is a K <= 16
++            // batch); above 7 the flash-attention chooser switches kernel family above 8 rows,
++            // which can change greedy output between --spec-type none and draft-mtp.
              params.speculative.draft.n_max = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
-@@ -4140,6 +4143,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4140,6 +4144,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_min = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
@@ -117,46 +120,82 @@ index c4c4e143c..9ea9a47a4 100644
          {"--spec-synth-len"}, "L",
          "target mean synthetic acceptance length, including the target token (benchmarking only)",
 diff --git a/common/common.cpp b/common/common.cpp
-index d162a3880..a1b22d217 100644
+index d162a3880..c952bfbd7 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1434,6 +1434,43 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
+@@ -1434,6 +1434,79 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
  }
  
  common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-+    // --spec-draft-n-max is capped at 7 (a clamp, not an error).  A verify batch decodes n_max + 1
-+    // query rows, and the HIP flash-attention chooser switches the band from the tile kernel to the
-+    // MMA/WMMA kernel above 8 rows (ggml/src/ggml-cuda/fattn.cu, the Q->ne[1] > 8 switch).  The two
-+    // kernels are not bit-identical, so a deeper draft makes verify and decode disagree and greedy
-+    // output can change between --spec-type none and draft-mtp (upstream master has the same class
-+    // of boundary).  The clamp lives here rather than in the argument parser so the warning is above
-+    // the default log threshold and the user actually sees it (a warning emitted while parsing is
-+    // hidden without --log-verbosity, as llama.cpp's own DEPRECATED notices are).  It runs before the
++    // --spec-draft-n-max is capped at 15 (a clamp, not an error).  There are two independent
++    // bounds, and they have different severities:
++    //
++    // 1. correctness - recurrent rollback coverage.  A verify batch decodes n_max + 1 query rows
++    //    and a partial accept rolls the recurrent (chunked-GDN) state back into that same batch.
++    //    The sequential GDN kernel writes n_rs_seq + 1 = n_max + 1 rollback snapshots, and the
++    //    whole-batch chunked kernel threshold is floored at max(K, 16, n_rs_batch) with
++    //    n_rs_batch = n_max + 1, so every verify batch runs the sequential kernel and restores
++    //    snapshots it wrote.  The "16" in that floor is the constant the K-independent chunked
++    //    path was built around (K <= 16, i.e. n_max <= 15); a deeper draft makes K the active
++    //    floor and re-introduces the K-dependent prefill/verify boundary.  This bound is hard,
++    //    which is why the clamp stays at 15.  (test-rs-depth, the deterministic snapshot sweep,
++    //    is green for n_rs_seq 1..15 on qwen35 / dsv4 / kimi-k3 / qwen4exp, including deep
++    //    drafts n_tokens = n_rs_batch > K.)
++    //
++    // 2. greedy purity - kernel-family switches at 8 rows.  A verify wider than 8 rows changes
++    //    kernel family in more than one place: the HIP FA chooser switches from the tile kernel
++    //    to the MMA/WMMA kernel above 8 query rows (ggml/src/ggml-cuda/fattn.cu, the Q->ne[1] > 8
++    //    switch), and the matmuls switch from the MMVQ/MMVF families (ncols <= MMVQ_MAX_BATCH_SIZE
++    //    = 8) to MMQ.  None of these families is bit-identical to the W=1 kernel, so a verify of
++    //    more than 8 rows can disagree with a W=1 decode on a greedy near-tie (measured 2026-09-13:
++    //    27B UD-Q4_K_XL, W=1..8 one logits hash and W=9..16 another, with FA disabled too, so it is
++    //    not only the FA chooser).  This is a trade, not a correctness bound: depth 8..15 keeps the
++    //    throughput win (measured 2026-09-13: 27B UD-Q4_K_XL recall n_max 15 = 116 t/s vs 71 at
++    //    n_max 7) and only risks a near-tie flip, so it is allowed with a prominent notice.
++    //    qwen4exp also had its own QSA decode arm flip at W > 8 (dense below, sparse above) on top
++    //    of these; the arm is now band-matched to the verify width (src/models/qwen4exp.cpp), so
++    //    that larger dense-vs-sparse divergence is gone and only the kernel-family near-ties remain.
++    //
++    // The clamp lives here rather than in the argument parser so the notice is above the default
++    // log threshold and the user actually sees it (a warning emitted while parsing is hidden
++    // without --log-verbosity, as llama.cpp's own DEPRECATED notices are).  It runs before the
 +    // model/context are created, so both see the capped depth.  See GREEDY-PURITY.md 11 and 19.
 +    //
 +    // LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 opts out for experiments: the depth is then honoured as given
-+    // (with a warning).  Note that n_max > 16 also re-introduces the K-dependent chunked-GDN
-+    // boundary (gated_delta_net.cu falls back to the K-floor threshold above K = 16), i.e. it can
-+    // bring back the plain-vs-MTP prefill divergence on top of the flash-attention one.
++    // (with a warning).
 +    if (params.speculative.draft.n_max > 7) {
 +        static const bool clamp_enabled = []() {
 +            const char * env = getenv("LLAMA_SPEC_DRAFT_N_MAX_CLAMP");
 +            return env == nullptr || atoi(env) != 0;
 +        }();
-+        if (clamp_enabled) {
-+            // ERR, not WRN, on purpose: llama-cli's default verbosity hides W-level messages, and the
-+            // user must learn that their setting was not honoured.  This is a notice, not a failure -
-+            // the run continues (same pattern as common_fit_params' abort notice).
-+            LOG_ERR("--spec-draft-n-max %d exceeds the maximum of 7; clamping to 7 (a wider verify "
-+                    "batch changes the flash-attention kernel and can alter greedy output).  Set "
-+                    "LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 to keep %d if you accept that risk.  "
++        if (params.speculative.draft.n_max > 15) {
++            if (clamp_enabled) {
++                // ERR, not WRN, on purpose: llama-cli's default verbosity hides W-level messages,
++                // and the user must learn that their setting was not honoured.  A notice, not a
++                // failure - the run continues (same pattern as common_fit_params' abort notice).
++                LOG_ERR("--spec-draft-n-max %d exceeds the maximum of 15; clamping to 15 (a deeper "
++                        "verify batch is no longer covered by the recurrent rollback snapshot "
++                        "set).  Set LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 to keep %d if you accept that "
++                        "risk.  Not an error: the run continues.\n",
++                        params.speculative.draft.n_max, params.speculative.draft.n_max);
++                params.speculative.draft.n_max = 15;
++            } else {
++                LOG_ERR("--spec-draft-n-max %d is above the supported maximum of 15 and "
++                        "LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 is set: keeping it.  A verify batch deeper "
++                        "than the recurrent snapshot set is not guaranteed to restore a correctly "
++                        "decoded boundary.  Not an error: the run continues.\n",
++                        params.speculative.draft.n_max);
++            }
++        }
++        if (params.speculative.draft.n_max > 7) {
++            // ERR, not WRN, on purpose: the default verbosity hides W-level messages and the user
++            // must learn that greedy output may differ between --spec-type none and draft-mtp.
++            LOG_ERR("--spec-draft-n-max %d is above 7: drafts this deep are supported, but a verify "
++                    "batch of more than 8 rows takes different flash-attention and matmul kernels, "
++                    "so --spec-type none and draft-mtp may no longer produce identical greedy output "
++                    "(a near-tie can flip).  The output stays valid and coherent; use "
++                    "--spec-draft-n-max 7 for bit-identical plain-vs-draft output.  "
 +                    "Not an error: the run continues.\n",
-+                    params.speculative.draft.n_max, params.speculative.draft.n_max);
-+            params.speculative.draft.n_max = 7;
-+        } else {
-+            LOG_WRN("--spec-draft-n-max %d is above the supported maximum of 7 and "
-+                    "LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 is set: keeping it.  Drafts deeper than 7 can "
-+                    "change greedy output between --spec-type none and draft-mtp.\n",
 +                    params.speculative.draft.n_max);
 +        }
 +    }
@@ -164,7 +203,7 @@ index d162a3880..a1b22d217 100644
      common_init_result_ptr res(new common_init_result(params, model_only));
  
      llama_model * model = res->model();
-@@ -1711,7 +1748,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1711,7 +1784,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.progress_callback           = params.load_progress_callback;
      mparams.progress_callback_user_data = params.load_progress_callback_user_data;
      mparams.no_alloc                    = params.no_alloc;
@@ -700,10 +739,46 @@ index ad6612647..a29d8b89c 100644
              const int64_t s_slot = K - t;
  
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 2c05c0c93..6abe090cf 100644
+index 2c05c0c93..e0e3d431f 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -299,6 +299,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
+@@ -149,6 +149,7 @@ if (LLAMA_LLGUIDANCE)
+ endif ()
+ 
+ llama_build(test-recurrent-state-rollback.cpp)
++llama_build(test-recurrent-state-depth.cpp)
+ llama_build(test-save-load-state.cpp)
+ 
+ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+@@ -244,6 +245,27 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+         FIXTURES_REQUIRED generate-models
+     )
+ 
++    # snapshots for the speculative verify band: n_rs_seq 1..15 through the
++    # full rollback range, compared against a sequential reference
++    llama_test(
++        test-recurrent-state-depth
++        LABEL main
++        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
++    )
++    set_tests_properties(test-recurrent-state-depth PROPERTIES
++        FIXTURES_REQUIRED generate-models
++    )
++
++    llama_test(
++        test-recurrent-state-depth
++        NAME test-recurrent-state-depth-qwen4exp
++        LABEL main
++        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf"
++    )
++    set_tests_properties(test-recurrent-state-depth-qwen4exp PROPERTIES
++        FIXTURES_REQUIRED generate-models
++    )
++
+     # Test state save/load functionality across all architectures, using the generated dummy models
+     llama_test(
+         test-save-load-state
+@@ -299,6 +321,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
  set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
  
  llama_build_and_test(test-arg-parser.cpp)
@@ -739,6 +814,231 @@ index e0907631a..61a7fbe16 100644
      argv = {"binary_name", "-lm", "none"};
      assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
      assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
+diff --git a/tests/test-recurrent-state-depth.cpp b/tests/test-recurrent-state-depth.cpp
+new file mode 100644
+index 000000000..ca5abc0fd
+--- /dev/null
++++ b/tests/test-recurrent-state-depth.cpp
+@@ -0,0 +1,219 @@
++// Deterministic sweep of the recurrent rollback snapshot machinery for the
++// speculative verify band.  For every (n_rs_seq, batch shape, rollback) it:
++//   ctx_roll: decode the full batch, partial-rollback r tokens through the
++//             snapshot path, then replay the removed tokens one at a time;
++//   ctx_ref : decode only the accepted prefix and then the same replay tokens.
++// A correct snapshot restore makes the replayed logits match bit-for-bit
++// (eps allows backend scheduling noise).
++//
++// This is the Phase 0 gate for the issue-#30 clamp policy: it must be green for
++// every allowed depth (n_rs_seq up to 15) before purity above 7 can be traded.
++
++#include "arg.h"
++#include "common.h"
++#include "ggml-backend.h"
++#include "llama.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <vector>
++
++static llama_context * make_ctx(
++        const common_params & params, llama_model * model,
++        uint32_t n_rs_seq, uint32_t n_rs_batch, uint32_t n_ubatch,
++        uint32_t n_seq_max, uint32_t n_ctx) {
++    auto cparams = common_context_params_to_llama(params);
++    cparams.n_seq_max  = n_seq_max;
++    cparams.n_rs_seq   = n_rs_seq;
++    cparams.n_rs_batch = n_rs_batch;
++    cparams.n_ctx      = n_ctx;
++    cparams.n_batch    = n_ctx;
++    cparams.n_ubatch   = n_ubatch;
++    cparams.kv_unified = false;
++    return llama_init_from_model(model, cparams);
++}
++
++static bool decode_batch(llama_context * ctx, const std::vector<llama_token> & toks,
++                         llama_pos pos0, uint32_t n, llama_seq_id seq, bool last_logits) {
++    llama_batch batch = llama_batch_init(n, 0, 1);
++    for (uint32_t i = 0; i < n; ++i) {
++        common_batch_add(batch, toks[pos0 + i], pos0 + i, { seq }, last_logits && i + 1 == n);
++    }
++    const bool ok = llama_decode(ctx, batch) == 0;
++    llama_batch_free(batch);
++    return ok;
++}
++
++static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos, llama_seq_id seq) {
++    llama_batch batch = llama_batch_init(1, 0, 1);
++    common_batch_add(batch, tok, pos, { seq }, true);
++    const bool ok = llama_decode(ctx, batch) == 0;
++    llama_batch_free(batch);
++    return ok;
++}
++
++static std::vector<llama_token> make_tokens(
++        llama_context * ctx, const llama_vocab * vocab, uint32_t n_tokens, uint32_t n_vocab) {
++    std::vector<llama_token> toks;
++    if (llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_NONE) {
++        for (uint32_t i = 0; i < n_tokens; ++i) {
++            toks.push_back((llama_token) ((7*i + 3) % n_vocab));
++        }
++    } else {
++        auto toks0 = common_tokenize(ctx, "The quick brown fox jumps over the lazy dog", true);
++        if (toks0.empty()) {
++            toks0 = { 1, 2, 3, 4, 5, 6, 7, 8, 9 };
++        }
++        for (uint32_t i = 0; i < n_tokens; ++i) {
++            toks.push_back(toks0[i % toks0.size()] + (llama_token) ((i / toks0.size()) % 3));
++        }
++    }
++    return toks;
++}
++
++// returns max logit diff, or -1 on hard error
++static double run_case(
++        const common_params & params, llama_model * model, llama_context * ctx_tok,
++        const llama_vocab * vocab,
++        uint32_t n_rs_seq, uint32_t n_rs_batch, uint32_t n_ubatch,
++        uint32_t n_tokens, uint32_t n_rollback, bool verbose) {
++    const int n_vocab = llama_vocab_n_tokens(vocab);
++
++    std::vector<llama_token> toks = make_tokens(ctx_tok, vocab, n_tokens, (uint32_t) n_vocab);
++
++    llama_context * ctx_roll = make_ctx(params, model, n_rs_seq, n_rs_batch, n_ubatch, 1, 512);
++    llama_context * ctx_ref  = make_ctx(params, model, n_rs_seq, n_rs_batch, n_ubatch, 1, 512);
++    if (ctx_roll == nullptr || ctx_ref == nullptr) {
++        fprintf(stderr, "  [%s] failed to init contexts\n", __func__);
++        if (ctx_roll) llama_free(ctx_roll);
++        if (ctx_ref)  llama_free(ctx_ref);
++        return -1;
++    }
++
++    const uint32_t p0 = n_tokens - n_rollback;
++
++    bool ok = true;
++    ok = ok && decode_batch(ctx_roll, toks, 0, n_tokens, 0, true);
++    ok = ok && decode_batch(ctx_ref,  toks, 0, p0,      0, true);
++    if (!ok) {
++        fprintf(stderr, "  [prefill] decode failed\n");
++        llama_free(ctx_roll); llama_free(ctx_ref);
++        return -1;
++    }
++
++    const bool rm = llama_memory_seq_rm(llama_get_memory(ctx_roll), 0, (llama_pos) p0, -1);
++    if (!rm) {
++        fprintf(stderr, "  [rollback] seq_rm refused (n_tokens=%u rollback=%u)\n", n_tokens, n_rollback);
++        llama_free(ctx_roll); llama_free(ctx_ref);
++        return -1;
++    }
++
++    double diff_max = 0.0;
++    for (uint32_t i = p0; i < n_tokens; ++i) {
++        if (!decode_one(ctx_roll, toks[i], (llama_pos) i, 0) ||
++            !decode_one(ctx_ref,  toks[i], (llama_pos) i, 0)) {
++            fprintf(stderr, "  [replay] decode failed at pos %u\n", i);
++            llama_free(ctx_roll); llama_free(ctx_ref);
++            return -1;
++        }
++        const float * l_roll = llama_get_logits_ith(ctx_roll, 0);
++        const float * l_ref  = llama_get_logits_ith(ctx_ref,  0);
++        if (l_roll == nullptr || l_ref == nullptr) {
++            fprintf(stderr, "  [replay] missing logits at pos %u\n", i);
++            llama_free(ctx_roll); llama_free(ctx_ref);
++            return -1;
++        }
++        for (int t = 0; t < n_vocab; ++t) {
++            const double d = std::fabs((double) l_roll[t] - (double) l_ref[t]);
++            if (d > diff_max) diff_max = d;
++        }
++    }
++
++    if (verbose) {
++        fprintf(stderr, "  n_rs_seq=%2u n_rs_batch=%2u n_ub=%4u n_tokens=%3u rollback=%2u -> max diff %g\n",
++                n_rs_seq, n_rs_batch, n_ubatch, n_tokens, n_rollback, diff_max);
++    }
++
++    llama_free(ctx_roll);
++    llama_free(ctx_ref);
++    return diff_max;
++}
++
++int main(int argc, char ** argv) {
++    std::setlocale(LC_NUMERIC, "C");
++
++    common_params params;
++    params.sampling.seed = 1234;
++    params.n_predict     = 1;
++
++    common_init();
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
++        return 1;
++    }
++    ggml_backend_load_all();
++
++    common_init_result_ptr llama_init = common_init_from_params(params);
++    llama_model * model = llama_init->model();
++    if (model == nullptr) {
++        fprintf(stderr, "failed to init model\n");
++        return 1;
++    }
++    if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
++        fprintf(stderr, "skipping for non-recurrent model\n");
++        return 0;
++    }
++
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++
++    constexpr double eps = 1e-5;
++    int n_fail = 0;
++
++    // Phase A: verify-batch shape.  n_tokens = K = n_rs_seq + 1, rollback the
++    // whole allowed range.  This is exactly the speculative verify + partial
++    // accept path for depth n_max = n_rs_seq.
++    fprintf(stderr, "=== Phase A: verify-batch shape (n_tokens = n_rs_seq+1) ===\n");
++    for (uint32_t n_rs_seq = 1; n_rs_seq <= 15; ++n_rs_seq) {
++        const uint32_t n_rs_batch = n_rs_seq + 1;
++        const uint32_t n_tokens   = n_rs_seq + 1;
++        int fail_a = 0;
++        for (uint32_t r = 1; r <= n_rs_seq; ++r) {
++            const double d = run_case(params, model, llama_init->context(), vocab, n_rs_seq, n_rs_batch, 32, n_tokens, r, false);
++            if (d < 0 || d > eps) {
++                fprintf(stderr, "FAIL A: n_rs_seq=%u rollback=%u max diff=%g\n", n_rs_seq, r, d);
++                ++fail_a;
++            }
++        }
++        n_fail += fail_a;
++        fprintf(stderr, "  n_rs_seq=%2u verify shape: %s\n", n_rs_seq, fail_a ? "FAIL" : "PASS");
++    }
++
++    // Phase B: deeper-than-K batch still at/below the draft bound.  A batch with
++    // n_tokens > K can be rolled back into when the speculator drafts deeply
++    // (n_rs_batch > K).  n_tokens = n_rs_batch, rollback the full draft range.
++    fprintf(stderr, "=== Phase B: deep draft (n_tokens = n_rs_batch > K) ===\n");
++    for (uint32_t n_rs_seq = 7; n_rs_seq <= 15; n_rs_seq += 4) {
++        const uint32_t K = n_rs_seq + 1;
++        for (uint32_t extra = 1; extra <= 16; extra += 5) {
++            const uint32_t n_rs_batch = K + extra;
++            const uint32_t n_tokens   = n_rs_batch;
++            int fail_b = 0;
++            for (uint32_t r = 1; r <= n_rs_seq; ++r) {
++                const double d = run_case(params, model, llama_init->context(), vocab, n_rs_seq, n_rs_batch, 32, n_tokens, r, false);
++                if (d < 0 || d > eps) {
++                    fprintf(stderr, "FAIL B: n_rs_seq=%u n_rs_batch=%u n_tokens=%u rollback=%u max diff=%g\n",
++                            n_rs_seq, n_rs_batch, n_tokens, r, d);
++                    ++fail_b;
++                }
++            }
++            n_fail += fail_b;
++            fprintf(stderr, "  n_rs_seq=%2u n_rs_batch=%2u n_tokens=%2u: %s\n",
++                    n_rs_seq, n_rs_batch, n_tokens, fail_b ? "FAIL" : "PASS");
++        }
++    }
++
++    fprintf(stderr, "\n%s: total failures = %d\n", n_fail ? "FAIL" : "PASS", n_fail);
++    return n_fail ? 2 : 0;
++}
 diff --git a/tests/test-speculative-adaptive.cpp b/tests/test-speculative-adaptive.cpp
 new file mode 100644
 index 000000000..ea959f223

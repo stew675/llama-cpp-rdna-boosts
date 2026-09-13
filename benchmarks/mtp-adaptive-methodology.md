@@ -112,10 +112,11 @@ Gate rules:
    and within ~10% on generic prose at draft depth 3. (Do NOT test at
    `--spec-draft-n-max 12` fixed depth: fixed-depth over-drafting is
    expected to lose; the adaptive configs C3/C6 below are the meaningful
-   high-depth tests.)  **As of 2026-09-11 (12) the CLI clamps
-   `--spec-draft-n-max` to 7** (a visible notice; `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0`
-   keeps a larger value), so any pre-existing baseline measured above 7 must be
-   re-measured at 7 (or with the env set) before comparing.  See
+   high-depth tests.)  **As of 2026-09-13 (issue #30) the CLI clamps
+   `--spec-draft-n-max` at 15 (a visible notice; `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0`
+   keeps a larger value) and keeps depths 8..15 with a visible purity notice**, so
+   a baseline measured above 15 must be re-measured at 15 (or with the env set)
+   before comparing.  See
    `../archive/work/block-15-campaign-wins/BETA-TESTING.md` for the notice semantics.
 3. **Same-seed determinism vs the previous release** (dense): outputs must
    be byte-identical between the build under test and the known-good build.
@@ -124,15 +125,18 @@ Gate rules:
 4. **Purity range is `n_max <= 7`** (2026-09-11, after the block-12 fix):
    `--spec-type none` == `draft-mtp` is byte-identical up to an 8-token verify
    batch, which is the designed limit -- beyond it the flash-attention launcher
-   switches to WMMA (`Q->ne[1] > 8`), whose reduction order differs from the
-   tile kernel's.  On 2-GPU `-sm tensor` the range used to stop at `n_max = 5`
-   because of a second, fork-specific cause (block 12's size-based all-reduce
-   dispatch changed the reduction algorithm when the batch crossed 32768
-   elements = 7 tokens); that was fixed on 2026-09-11, and the earlier
-   "`n_max <= 15`" claim was never validated past `n_max = 4`.  Do not use
+   switches to WMMA (`Q->ne[1] > 8`) **and** the matmuls switch from the
+   MMVQ/MMVF decode families to MMQ (`ncols == MMVQ_MAX_BATCH_SIZE` = 8), both of
+   which change the reduction order.  On 2-GPU `-sm tensor` the range used to
+   stop at `n_max = 5` because of a second, fork-specific cause (block 12's
+   size-based all-reduce dispatch changed the reduction algorithm when the batch
+   crossed 32768 elements = 7 tokens); that was fixed on 2026-09-11.  Do not use
    `none == draft-mtp` equality above `n_max = 7` as a gate; use acceptance +
-   MTP-vs-plain throughput instead.  See `../GREEDY-PURITY.md` §11.  **The range
-   is now enforced:** the CLI clamps the depth to 7 (2026-09-11 (12)).
+   MTP-vs-plain throughput instead.  See `../GREEDY-PURITY.md` §11.  **Since
+   2026-09-13 (issue #30) the CLI no longer enforces the purity range by
+   clamping:** `--spec-draft-n-max 8..15` is allowed with a visible notice that
+   `none` vs `draft-mtp` may differ, and only `> 15` is clamped (the recurrent
+   rollback snapshot bound -- a correctness bound, not the purity one).
 
 ### Protocol B — server harness (dense canonical, long-context workloads)
 

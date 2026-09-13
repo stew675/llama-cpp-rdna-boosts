@@ -1,5 +1,85 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-13 (latest) — issue #30 clamp policy: `--spec-draft-n-max` is raised from 7 to 15 (block 01) + the QSA decode-arm band fix (block 14)
+
+**Mission (issue #30 follow-up).**  The `--spec-draft-n-max` clamp had to be re-decided: the maintainer
+wants depth 15, and the park reason was a claim that depth > 7 allows **rewind-induced recurrent (chunked
+GDN) corruption** on qwen4exp.  The rule the session was given: no rewind corruption at any allowed
+depth; purity above 7 may be traded with a prominent warning; preferred end state 15 everywhere;
+fallback 7 for QSA models only.  Result: **there is no rewind corruption, the clamp is now 15 with a
+purity notice above 7, and the reported qwen4exp depth-15 divergence past the 2051 selection width was
+a QSA decode-arm band flip, now fixed.**
+
+**Canonical chain amended in place** (block 01 `10a7c331d` -> `38fc37c5e`, block 14 `378c9a9d6` ->
+`55c733d5c`, block 15 replayed; new tip **`c45244c728dfcbcad86ae95aa97ae76f94ee9f7f`**, net tree
+**`a5683e1b008e3ad197ac2a9e3f99e5b0652df7d4`**).  `patches/` regenerated; a fresh `790cf51aa` worktree +
+`apply-all.sh` applies **strict 16/16 `git am`**, zero whitespace warnings, produced tree == canonical.
+`make-patches.sh` default tip updated; `rdna-boosts-all.patch` regenerated (`sha256
+39eab5fa917ea28ad2e43a5925fb5cb03481a27951435b245281c20f3fb19056`).
+
+**1. No rewind corruption at depth 15 — `test-recurrent-state-depth` (new, block 01).**  A deterministic
+sweep over the recurrent snapshot machinery: for every `n_rs_seq` 1..15, decode the full verify-shaped
+batch, partial-rollback `r` tokens through the snapshot path, replay them, and compare the replayed
+logits against a *reference context that never decoded past the rollback point* (bitwise, `eps=1e-5`).
+Phase A is the verify shape (`n_tokens = K = n_rs_seq+1`, every `rollback` 1..`n_rs_seq`); Phase B is a
+deep draft (`n_tokens = n_rs_batch > K`, which is what `n_rs_batch` exists for).  **All green** on
+`qwen35-dense` / `qwen4exp-moe` / `deepseek4-moe` / `kimi-k3-moe` (the generated dummy models), i.e. the
+band the delivery allows covers the snapshot set exactly.  The gate is registered as
+`test-recurrent-state-depth` + `test-recurrent-state-depth-qwen4exp` in `tests/CMakeLists.txt`.
+
+**2. The qwen4exp depth-15 divergence was the QSA decode arm, not the recurrent state (block 14).**  A
+real-model decode/verify width matrix (3x R9700 `-sm tensor`, `P=2500 > width = indexer_top_k + r - 1 =
+2051`, f16 KV, token-0 logits) shows the pre-fix behaviour: **W = 1..8 one hash, W = 9..16 another** and
+the upper group == the forced-sparse hash — `QSA_DECODE_BAND = 8` gated the dense decode arm
+`n_tokens <= 8`, so a depth-8..15 verify batch fell through to the approximate sparse top-k selection
+while the W=1 decode stayed dense.  That is the same class as the block-14 cause-2/cause-3 amendments,
+re-opened for the built-in draft widths (it only manifests once `n_kv` passes the 2051 selection width —
+the "triggers after ~2051 tokens" report).  The arm band is now
+`max(QSA_DECODE_BAND, cparams.n_rs_batch)` (`cparams.n_rs_batch` = the longest enabled draft + 1, the
+verify-width bound), so the whole verify band takes the same arm as the W=1 decode; the prefill arm is
+made disjoint on the same effective band.  Default configs are unaffected (`n_max 3` -> `n_rs_batch 4` ->
+band 8; `n_max 7` -> 8), so every recorded reference hash still holds.
+
+Measured (real qwen4exp IQ4_XS, 3-GPU tensor, f16, `P=2500`, `RS=15`): pre-fix W=1..8 `643a8166d8dad677`
+/ W=9..16 `1354757f9daf03db` (sparse); post-fix W=1..8 `643a8166d8dad677` / W=9..16 `05be2f7f30dbc426`
+(dense).  The dummy `qwen4exp-moe` is now pure W=1..16 for **all eight native KV types** (f16/bf16/q4_0/
+q4_1/q5_0/q5_1 `5009c55bca5e01ca`, q8_0 `3d51c0592b7cf913`, iq4_nl `bc19354924bcfb84`); pre-fix
+it split `5009c55bca5e01ca` (W<=8) vs `596ec8bf7461da1a` (W>8).
+
+**3. Purity above 7 is lost to the kernel families, not to a defect (the accepted trade).**  On the
+real models W=1..8 and W=9..16 never agree even with QSA and FA off (27B UD-Q4_K_XL, f16, `P=2500`:
+`8ef5ce3ab2d942dd` vs `7d1e01e82be4ce6b`; with `FA=0` `b5d4df87caa0348e` vs `0c0cb329b59aedc9`, and
+qwen4exp with `LLAMA_QSA_OFF=1` likewise), because a verify wider than 8 rows switches kernel family in
+more than one place: the FA tile/MMA chooser (`Q->ne[1] > 8`) **and** the matmul family
+(`ncols <= MMVQ_MAX_BATCH_SIZE`/`MMVF_MAX_BATCH_SIZE` = 8 uses the decode kernels, above it MMQ).  That
+is a near-tie trade, not corruption — end to end the depth-15 output is coherent and only differs from
+`plain`/`n_max 7` where a greedy near-tie flipped (27B code-replay 3000 tokens: `plain` == `n_max 7` =
+`57776c25503d`; `n_max 15` = `269a445fe4e8`, both rc=0 and coherent; qwen4exp code-replay `n_max 7`
+57.9 t/s vs `n_max 15` 40.9 t/s — depth 15 over-drafts on that prompt, it is not corrupt).
+
+**4. The clamp is now 15 with a purity notice above 7 (block 01).**  `common/common.cpp` clamps `> 15`
+to 15 (visible `E`-level notice, `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` escape hatch) and prints a visible
+notice for any depth `> 7` stating that `--spec-type none` and `draft-mtp` may no longer be bit-identical
+(the output stays valid and coherent); `common/arg.cpp` help now says `max: 15`.  The old comment blamed
+FA purity alone; the new one states the hierarchy — the 15 bound is the **recurrent rollback snapshot
+bound** (`n_max + 1 = K <= 16`, the constant the K-independent chunked-GDN threshold was built around), and
+purity above 7 is the accepted trade.  The default `--spec-draft-n-max` is still 3, so the clamp
+relaxation changes nothing unless the user asks for it.
+
+**5. Revalidation.**  `tests/test-recurrent-state-rollback` unchanged and PASS (qwen35-dense,
+qwen4exp-moe); `test-recurrent-state-depth` PASS on four recurrent/hybrid dummy archs; the qwen4exp
+`FLASH_ATTN_QSA` suite is a kernel-op suite (graph-arm change only) and is unaffected; the depth-15
+same-seed outputs are coherent on both real models.  Docs updated: `patches/README.md` (the block-01
+and block-14 amendment notes + the current-state header), `AGENTS.md` (the block-01 bullet + Critical
+facts), `GREEDY-PURITY.md` §11/§19, `benchmarks/mtp-adaptive-methodology.md`, `TODO.md`,
+`MANIFESTS.md`/`BASELINE.md`/`README.md` headers.  The parked issue-#30 response is corrected (its
+clamp description) and its revision bumped.
+
+**Lesson.**  "Depth > 7 is unsupported" had been resting on one stated reason (FA purity) while the real
+qwen4exp effect was a different band (the QSA arm).  The no-corruption result came from a deterministic
+reference-context sweep, not from acceptance numbers: acceptance is not a correctness signal (a
+self-consistent corrupted pair can accept *more*), and over-drafting at depth 15 looks like a drop too.
+
 ## 2026-09-13 (latest) — block-14 amendment (ninth): the re-base's `ncols_opt` broke the pair fusion (dense prefill −14-48 %)
 
 **Canonical chain amended in place** (block 14 `20bf37962` -> `378c9a9d6`, block 15 replayed; new tip

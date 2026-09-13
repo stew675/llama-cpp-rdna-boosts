@@ -1,5 +1,5 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index c4c4e143c..8338f01a7 100644
+index c4c4e143c..463c3c52c 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -363,9 +363,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
@@ -42,25 +42,26 @@ index c4c4e143c..8338f01a7 100644
      add_opt(common_arg(
          {"--numa"}, "TYPE",
          "attempt optimizations that help on some NUMA systems\n"
-@@ -4125,11 +4145,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4125,11 +4145,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
  
      add_opt(common_arg(
          {"--spec-draft-n-max"}, "N",
 -        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
-+        string_format("number of tokens to draft for speculative decoding (default: %d, max: 7)", params.speculative.draft.n_max),
++        string_format("number of tokens to draft for speculative decoding (default: %d, max: 15)", params.speculative.draft.n_max),
          [](common_params & params, int value) {
              if (value < 0) {
                  throw std::invalid_argument("invalid value");
              }
-+            // Values above 7 are clamped, with a visible warning, in common_init_from_params - not
-+            // here: a warning emitted during argument parsing is below the default log threshold and
-+            // would not reach the user.  The cap exists because a verify batch decodes n_max + 1
-+            // query rows and the flash-attention chooser switches kernel family above 8 rows, which
-+            // can change greedy output between --spec-type none and draft-mtp.
++            // Values above 15 are clamped, and values above 7 get a visible purity notice, in
++            // common_init_from_params - not here: a warning emitted during argument parsing is below
++            // the default log threshold and would not reach the user.  The 15 cap is the recurrent
++            // rollback snapshot bound (a verify batch decodes n_max + 1 rows and is a K <= 16
++            // batch); above 7 the flash-attention chooser switches kernel family above 8 rows,
++            // which can change greedy output between --spec-type none and draft-mtp.
              params.speculative.draft.n_max = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
-@@ -4140,6 +4165,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4140,6 +4166,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_min = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
@@ -78,46 +79,82 @@ index c4c4e143c..8338f01a7 100644
          {"--spec-synth-len"}, "L",
          "target mean synthetic acceptance length, including the target token (benchmarking only)",
 diff --git a/common/common.cpp b/common/common.cpp
-index d162a3880..7b8ede26e 100644
+index d162a3880..b8aff0924 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1434,6 +1434,43 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
+@@ -1434,6 +1434,79 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
  }
  
  common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-+    // --spec-draft-n-max is capped at 7 (a clamp, not an error).  A verify batch decodes n_max + 1
-+    // query rows, and the HIP flash-attention chooser switches the band from the tile kernel to the
-+    // MMA/WMMA kernel above 8 rows (ggml/src/ggml-cuda/fattn.cu, the Q->ne[1] > 8 switch).  The two
-+    // kernels are not bit-identical, so a deeper draft makes verify and decode disagree and greedy
-+    // output can change between --spec-type none and draft-mtp (upstream master has the same class
-+    // of boundary).  The clamp lives here rather than in the argument parser so the warning is above
-+    // the default log threshold and the user actually sees it (a warning emitted while parsing is
-+    // hidden without --log-verbosity, as llama.cpp's own DEPRECATED notices are).  It runs before the
++    // --spec-draft-n-max is capped at 15 (a clamp, not an error).  There are two independent
++    // bounds, and they have different severities:
++    //
++    // 1. correctness - recurrent rollback coverage.  A verify batch decodes n_max + 1 query rows
++    //    and a partial accept rolls the recurrent (chunked-GDN) state back into that same batch.
++    //    The sequential GDN kernel writes n_rs_seq + 1 = n_max + 1 rollback snapshots, and the
++    //    whole-batch chunked kernel threshold is floored at max(K, 16, n_rs_batch) with
++    //    n_rs_batch = n_max + 1, so every verify batch runs the sequential kernel and restores
++    //    snapshots it wrote.  The "16" in that floor is the constant the K-independent chunked
++    //    path was built around (K <= 16, i.e. n_max <= 15); a deeper draft makes K the active
++    //    floor and re-introduces the K-dependent prefill/verify boundary.  This bound is hard,
++    //    which is why the clamp stays at 15.  (test-rs-depth, the deterministic snapshot sweep,
++    //    is green for n_rs_seq 1..15 on qwen35 / dsv4 / kimi-k3 / qwen4exp, including deep
++    //    drafts n_tokens = n_rs_batch > K.)
++    //
++    // 2. greedy purity - kernel-family switches at 8 rows.  A verify wider than 8 rows changes
++    //    kernel family in more than one place: the HIP FA chooser switches from the tile kernel
++    //    to the MMA/WMMA kernel above 8 query rows (ggml/src/ggml-cuda/fattn.cu, the Q->ne[1] > 8
++    //    switch), and the matmuls switch from the MMVQ/MMVF families (ncols <= MMVQ_MAX_BATCH_SIZE
++    //    = 8) to MMQ.  None of these families is bit-identical to the W=1 kernel, so a verify of
++    //    more than 8 rows can disagree with a W=1 decode on a greedy near-tie (measured 2026-09-13:
++    //    27B UD-Q4_K_XL, W=1..8 one logits hash and W=9..16 another, with FA disabled too, so it is
++    //    not only the FA chooser).  This is a trade, not a correctness bound: depth 8..15 keeps the
++    //    throughput win (measured 2026-09-13: 27B UD-Q4_K_XL recall n_max 15 = 116 t/s vs 71 at
++    //    n_max 7) and only risks a near-tie flip, so it is allowed with a prominent notice.
++    //    qwen4exp also had its own QSA decode arm flip at W > 8 (dense below, sparse above) on top
++    //    of these; the arm is now band-matched to the verify width (src/models/qwen4exp.cpp), so
++    //    that larger dense-vs-sparse divergence is gone and only the kernel-family near-ties remain.
++    //
++    // The clamp lives here rather than in the argument parser so the notice is above the default
++    // log threshold and the user actually sees it (a warning emitted while parsing is hidden
++    // without --log-verbosity, as llama.cpp's own DEPRECATED notices are).  It runs before the
 +    // model/context are created, so both see the capped depth.  See GREEDY-PURITY.md 11 and 19.
 +    //
 +    // LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 opts out for experiments: the depth is then honoured as given
-+    // (with a warning).  Note that n_max > 16 also re-introduces the K-dependent chunked-GDN
-+    // boundary (gated_delta_net.cu falls back to the K-floor threshold above K = 16), i.e. it can
-+    // bring back the plain-vs-MTP prefill divergence on top of the flash-attention one.
++    // (with a warning).
 +    if (params.speculative.draft.n_max > 7) {
 +        static const bool clamp_enabled = []() {
 +            const char * env = getenv("LLAMA_SPEC_DRAFT_N_MAX_CLAMP");
 +            return env == nullptr || atoi(env) != 0;
 +        }();
-+        if (clamp_enabled) {
-+            // ERR, not WRN, on purpose: llama-cli's default verbosity hides W-level messages, and the
-+            // user must learn that their setting was not honoured.  This is a notice, not a failure -
-+            // the run continues (same pattern as common_fit_params' abort notice).
-+            LOG_ERR("--spec-draft-n-max %d exceeds the maximum of 7; clamping to 7 (a wider verify "
-+                    "batch changes the flash-attention kernel and can alter greedy output).  Set "
-+                    "LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 to keep %d if you accept that risk.  "
++        if (params.speculative.draft.n_max > 15) {
++            if (clamp_enabled) {
++                // ERR, not WRN, on purpose: llama-cli's default verbosity hides W-level messages,
++                // and the user must learn that their setting was not honoured.  A notice, not a
++                // failure - the run continues (same pattern as common_fit_params' abort notice).
++                LOG_ERR("--spec-draft-n-max %d exceeds the maximum of 15; clamping to 15 (a deeper "
++                        "verify batch is no longer covered by the recurrent rollback snapshot "
++                        "set).  Set LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 to keep %d if you accept that "
++                        "risk.  Not an error: the run continues.\n",
++                        params.speculative.draft.n_max, params.speculative.draft.n_max);
++                params.speculative.draft.n_max = 15;
++            } else {
++                LOG_ERR("--spec-draft-n-max %d is above the supported maximum of 15 and "
++                        "LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 is set: keeping it.  A verify batch deeper "
++                        "than the recurrent snapshot set is not guaranteed to restore a correctly "
++                        "decoded boundary.  Not an error: the run continues.\n",
++                        params.speculative.draft.n_max);
++            }
++        }
++        if (params.speculative.draft.n_max > 7) {
++            // ERR, not WRN, on purpose: the default verbosity hides W-level messages and the user
++            // must learn that greedy output may differ between --spec-type none and draft-mtp.
++            LOG_ERR("--spec-draft-n-max %d is above 7: drafts this deep are supported, but a verify "
++                    "batch of more than 8 rows takes different flash-attention and matmul kernels, "
++                    "so --spec-type none and draft-mtp may no longer produce identical greedy output "
++                    "(a near-tie can flip).  The output stays valid and coherent; use "
++                    "--spec-draft-n-max 7 for bit-identical plain-vs-draft output.  "
 +                    "Not an error: the run continues.\n",
-+                    params.speculative.draft.n_max, params.speculative.draft.n_max);
-+            params.speculative.draft.n_max = 7;
-+        } else {
-+            LOG_WRN("--spec-draft-n-max %d is above the supported maximum of 7 and "
-+                    "LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0 is set: keeping it.  Drafts deeper than 7 can "
-+                    "change greedy output between --spec-type none and draft-mtp.\n",
 +                    params.speculative.draft.n_max);
 +        }
 +    }
@@ -125,7 +162,7 @@ index d162a3880..7b8ede26e 100644
      common_init_result_ptr res(new common_init_result(params, model_only));
  
      llama_model * model = res->model();
-@@ -1689,6 +1726,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1689,6 +1762,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.split_mode      = params.split_mode;
      mparams.load_mode       = params.load_mode;
      mparams.lazy_mode = params.lazy_mode;
@@ -133,7 +170,7 @@ index d162a3880..7b8ede26e 100644
      mparams.tensor_split    = params.tensor_split;
      mparams.check_tensors   = params.check_tensors;
      mparams.use_extra_bufts = !params.no_extra_bufts;
-@@ -1711,7 +1749,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1711,7 +1785,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.progress_callback           = params.load_progress_callback;
      mparams.progress_callback_user_data = params.load_progress_callback_user_data;
      mparams.no_alloc                    = params.no_alloc;
@@ -142,7 +179,7 @@ index d162a3880..7b8ede26e 100644
  
      return mparams;
  }
-@@ -1722,6 +1760,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1722,6 +1796,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.n_ctx             = params.n_ctx;
      cparams.n_seq_max         = params.n_parallel;
      cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
@@ -23446,10 +23483,10 @@ index 87195fddd..75b9b3493 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 8ace95f73..d1c99524a 100644
+index 8ace95f73..d99030570 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -5,6 +5,117 @@
+@@ -5,6 +5,124 @@
  
  #include <algorithm>
  #include <cinttypes>
@@ -23477,6 +23514,13 @@ index 8ace95f73..d1c99524a 100644
 +// n_kv = 2304 > width = indexer_top_k + r - 1 = 2051 the plain run took the dense arm and
 +// the verify the sparse one from the first decode graph on.  Prefill (n_tokens >> the band)
 +// keeps the sparse selection (the arch policy: "prefill is untouched, QSA always").
++// The effective band is extended to the widest speculative verify batch (cparams.n_rs_batch,
++// i.e. common_speculative_n_max() + 1) in build_layer_attn: this constant is only the
++// no-speculation floor.  With --spec-draft-n-max clamped at 7 the verify is <= 8 tokens and
++// the floor covers it, but a deeper draft (n_max > 7, LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0) makes
++// the verify W = n_max + 1 > 8 and the exact same dense-vs-sparse flip returns - measured
++// 2026-09-13 on qwen4exp-moe at n_kv = 2501 (W = 1..8 `5009c55bca5e01ca`, W = 9..16
++// `596ec8bf7461da1a`, `LLAMA_QSA_OFF=1` pure at the dense hash).
 +static constexpr int64_t QSA_DECODE_BAND = 8;
 +
 +// LLAMA_QSA_DENSE_* values: a token count, optionally K/M/G suffixed.  -1 when unset or invalid.
@@ -23567,7 +23611,7 @@ index 8ace95f73..d1c99524a 100644
  
  // bad metadata must be catchable: GGML_ASSERT aborts the whole process
  static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
-@@ -23,7 +134,26 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
+@@ -23,7 +141,26 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
      }
  }
  
@@ -23594,7 +23638,7 @@ index 8ace95f73..d1c99524a 100644
      ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
      ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
      ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
-@@ -154,15 +284,19 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -154,15 +291,19 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
      const int64_t hc_dim = hc * n_embd;
      const int64_t hc_lr  = hparams.hc_low_rank;
  
@@ -23619,7 +23663,7 @@ index 8ace95f73..d1c99524a 100644
          output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
      }
  
-@@ -176,7 +310,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -176,7 +317,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
  
          // the converter pads the table; a model synthesised from metadata has no tensor to ask
          const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
@@ -23629,7 +23673,7 @@ index 8ace95f73..d1c99524a 100644
              if (ple_w->tensor->ne[1] < ple_rows) {
                  throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
                                                  ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
-@@ -184,13 +319,49 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -184,13 +326,49 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
              ple_rows = ple_w->tensor->ne[1];
          }
  
@@ -23682,7 +23726,7 @@ index 8ace95f73..d1c99524a 100644
          const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
          const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
  
-@@ -203,61 +374,91 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+@@ -203,61 +381,91 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
          const int64_t conv_dim   = key_dim * 2 + value_dim;
  
          // two HC modules per layer: before the token mixer, before the MoE
@@ -23812,7 +23856,7 @@ index 8ace95f73..d1c99524a 100644
      return std::make_unique<graph>(*this, params);
  }
  
-@@ -275,6 +476,53 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+@@ -275,6 +483,53 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
      const int64_t hc_dim = hc * n_embd;
      const int64_t nt     = x->ne[2];
  
@@ -23866,7 +23910,7 @@ index 8ace95f73..d1c99524a 100644
      // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
      // the converter folded each gamma to (1 + w)
      ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
-@@ -319,11 +567,40 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+@@ -319,11 +574,40 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
      const int64_t hc = hparams.dsv4_hc_mult;
      const int64_t nt = residual->ne[2];
  
@@ -23907,7 +23951,7 @@ index 8ace95f73..d1c99524a 100644
      ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
      b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
  
-@@ -374,6 +651,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -374,6 +658,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
              n_embd, hc, n_tokens, 1);
      cb(res_hc, "hc_init", -1);
  
@@ -23918,7 +23962,7 @@ index 8ace95f73..d1c99524a 100644
      for (int il = 0; il < n_layer; ++il) {
          res->t_layer_inp[il] = res_hc;
  
-@@ -397,6 +678,26 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -397,6 +685,26 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
              cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
          }
  
@@ -23945,7 +23989,7 @@ index 8ace95f73..d1c99524a 100644
          if (il == n_layer - 1 && inp_out_ids) {
              // everything below is per token, so drop the rows that produce no output
              cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
-@@ -423,6 +724,35 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -423,6 +731,35 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
  
          // "l_last" is the layer output name that build_cvec and imatrix look for
          cb(res_hc, "l_last", il);
@@ -23981,7 +24025,7 @@ index 8ace95f73..d1c99524a 100644
      }
  
      // the final mixer is the output norm: there is no separate one
-@@ -440,6 +770,208 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+@@ -440,6 +777,208 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
      ggml_build_forward_expand(gf, cur);
  }
  
@@ -24190,7 +24234,7 @@ index 8ace95f73..d1c99524a 100644
  std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
                  ggml_tensor * input,
                          int   il) {
-@@ -468,17 +1000,158 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
+@@ -468,17 +1007,158 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
      return ggml_mul(ctx0, normalized, gated);
  }
  
@@ -24352,7 +24396,7 @@ index 8ace95f73..d1c99524a 100644
      }
  
      bool can_reuse(const llm_graph_params & params) override {
-@@ -497,13 +1170,34 @@ public:
+@@ -497,13 +1177,34 @@ public:
  
          res &= params.ubatch.n_tokens % n_stream == 0;
  
@@ -24389,7 +24433,7 @@ index 8ace95f73..d1c99524a 100644
  
          return res;
      }
-@@ -514,12 +1208,30 @@ public:
+@@ -514,12 +1215,30 @@ public:
      ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
      ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
      ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
@@ -24420,7 +24464,7 @@ index 8ace95f73..d1c99524a 100644
  };
  
  ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
-@@ -539,7 +1251,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -539,7 +1258,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      GGML_ASSERT(r > 0);
  
      const int64_t n_blocks = (n_kv + r - 1)/r;
@@ -24428,7 +24472,7 @@ index 8ace95f73..d1c99524a 100644
      // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
      const int64_t n_stream = mctx_hyb->get_n_stream();
      GGML_ASSERT(n_tokens % n_stream == 0);
-@@ -549,9 +1260,44 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -549,9 +1267,44 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
      // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
      // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
@@ -24476,7 +24520,7 @@ index 8ace95f73..d1c99524a 100644
  
      // nothing above depends on the layer, so the layers sharing a ratio share one input set
      llm_graph_input_qsa * inp = nullptr;
-@@ -560,18 +1306,45 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -560,18 +1313,45 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      if (it != qsa_inps.end()) {
          inp = it->second;
      } else {
@@ -24525,7 +24569,7 @@ index 8ace95f73..d1c99524a 100644
  
          inp = qsa.get();
          res->add_input(std::move(qsa));
-@@ -589,33 +1362,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -589,33 +1369,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
      k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
  
@@ -24560,7 +24604,7 @@ index 8ace95f73..d1c99524a 100644
      ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
      q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
      q = build_norm(q, model.layers[il].index_q_norm, nullptr, LLM_NORM_RMS, il);
-@@ -624,50 +1371,177 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -624,50 +1378,177 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
              ext_factor, attn_factor, beta_fast, beta_slow);
      cb(q, "indexer_q", il);
  
@@ -24774,7 +24818,7 @@ index 8ace95f73..d1c99524a 100644
      cb(top_k, "indexer_top_k", il);
  
      return top_k;
-@@ -712,8 +1586,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -712,8 +1593,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
      }
  
@@ -24806,7 +24850,7 @@ index 8ace95f73..d1c99524a 100644
      // prepare new kq mask - starts filled with -INFINITY
      ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
  
-@@ -731,7 +1627,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -731,7 +1634,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
  
      // modify KQ mask by unmasking elements that are in top_k indices
      // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
@@ -24815,7 +24859,7 @@ index 8ace95f73..d1c99524a 100644
  
      // reshape to restore the original shape of KQ mask:
      // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
-@@ -739,15 +1635,39 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -739,15 +1642,39 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
  
      // combine with the original kq mask
      kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
@@ -24859,7 +24903,7 @@ index 8ace95f73..d1c99524a 100644
      cb(cur, "kqv_out", il);
  
      // the rotation is its own inverse, so undo it on the value side of the output
-@@ -768,10 +1688,108 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -768,10 +1695,114 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
      const int64_t n_embd_head = hparams.n_embd_head_v();
      GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
  
@@ -24946,17 +24990,23 @@ index 8ace95f73..d1c99524a 100644
 +            const int64_t env = qsa_env_tokens("LLAMA_QSA_DENSE_PREFILL_UNTIL");
 +            return env >= 0 ? env : 0;
 +        }();
++        // the dense decode band and the verify width: a speculative verify batch must take the
++        // dense decode arm whenever the W=1 decode does (see QSA_DECODE_BAND above).  The widest
++        // batch that can be a verify is cparams.n_rs_batch (the rollback bound = the longest
++        // enabled draft + 1), so the effective band is at least that wide; it is 1 without
++        // speculation, which leaves the plain QSA_DECODE_BAND in charge.
++        const int64_t qsa_decode_band = std::max<int64_t>(QSA_DECODE_BAND, (int64_t) cparams.n_rs_batch);
 +        if (shortcut && n_kv <= width) {
 +            build_qsa_store_k(mctx_hyb, cur, il);
-+        } else if (qsa_dense_decode_until > 0 && n_tokens <= QSA_DECODE_BAND && n_kv < qsa_dense_decode_until) {
++        } else if (qsa_dense_decode_until > 0 && n_tokens <= qsa_decode_band && n_kv < qsa_dense_decode_until) {
 +            // arch policy gate: dense decode below the crossover depth (store keys only).
-+            // QSA_DECODE_BAND, not n_tokens == 1: the verify batch must take the same arm as
++            // qsa_decode_band, not n_tokens == 1: the verify batch must take the same arm as
 +            // the W=1 decode (see QSA_DECODE_BAND above).
 +            build_qsa_store_k(mctx_hyb, cur, il);
-+        } else if (qsa_dense_prefill_until > 0 && n_tokens > QSA_DECODE_BAND &&
++        } else if (qsa_dense_prefill_until > 0 && n_tokens > qsa_decode_band &&
 +                   n_kv < qsa_dense_prefill_until) {
 +            // arch policy, prefill half: dense attend below the prefill crossover (store keys
-+            // only).  n_tokens > QSA_DECODE_BAND keeps this arm disjoint from the decode one, so
++            // only).  n_tokens > qsa_decode_band keeps this arm disjoint from the decode one, so
 +            // a W=1 decode and a W=(--spec-draft-n-max + 1) verify of the same state still take
 +            // the same arm; a prefill chunk is > the band by definition (a chunk <= the band
 +            // cannot be distinguished from a verify batch - that is the point).
@@ -24972,7 +25022,7 @@ index 8ace95f73..d1c99524a 100644
  
      // Qwen3Next uses a single Q projection that outputs query + gate
      ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
-@@ -1035,10 +2053,14 @@ public:
+@@ -1035,10 +2066,14 @@ public:
  
      bool can_reuse(const llm_graph_params & params) override {
          mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
@@ -24988,7 +25038,7 @@ index 8ace95f73..d1c99524a 100644
  
      const llama_model_qwen4exp & pmodel;
  
-@@ -1047,6 +2069,7 @@ public:
+@@ -1047,6 +2082,7 @@ public:
  
      // scratch, reused across set_input() calls
      std::vector<llama_token> prev;
@@ -24996,7 +25046,7 @@ index 8ace95f73..d1c99524a 100644
  };
  
  void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
-@@ -1109,7 +2132,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
+@@ -1109,7 +2145,66 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
          }
      }
  
@@ -25064,7 +25114,7 @@ index 8ace95f73..d1c99524a 100644
  }
  
  // Read a conv history out of its own recurrent row and write the new tail back.
-@@ -1176,6 +2258,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+@@ -1176,6 +2271,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
      auto ple_inp = std::make_unique<llm_graph_input_ple>(
              static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
  
@@ -25104,10 +25154,18 @@ index 8ace95f73..d1c99524a 100644
      ggml_set_input(ple_inp->rows);
      ggml_tensor * rows = ple_inp->rows;
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 2c05c0c93..92246f96f 100644
+index 2c05c0c93..5125fe0b8 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -193,6 +193,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+@@ -149,6 +149,7 @@ if (LLAMA_LLGUIDANCE)
+ endif ()
+ 
+ llama_build(test-recurrent-state-rollback.cpp)
++llama_build(test-recurrent-state-depth.cpp)
+ llama_build(test-save-load-state.cpp)
+ 
+ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+@@ -193,6 +194,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
      # llama_build_and_test(test-double-float.cpp) # SLOW
  
      llama_build(test-llama-archs.cpp)
@@ -25115,7 +25173,35 @@ index 2c05c0c93..92246f96f 100644
  
      set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
      file(MAKE_DIRECTORY "${MODEL_DIR}")
-@@ -299,6 +300,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
+@@ -244,6 +246,27 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+         FIXTURES_REQUIRED generate-models
+     )
+ 
++    # snapshots for the speculative verify band: n_rs_seq 1..15 through the
++    # full rollback range, compared against a sequential reference
++    llama_test(
++        test-recurrent-state-depth
++        LABEL main
++        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
++    )
++    set_tests_properties(test-recurrent-state-depth PROPERTIES
++        FIXTURES_REQUIRED generate-models
++    )
++
++    llama_test(
++        test-recurrent-state-depth
++        NAME test-recurrent-state-depth-qwen4exp
++        LABEL main
++        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf"
++    )
++    set_tests_properties(test-recurrent-state-depth-qwen4exp PROPERTIES
++        FIXTURES_REQUIRED generate-models
++    )
++
+     # Test state save/load functionality across all architectures, using the generated dummy models
+     llama_test(
+         test-save-load-state
+@@ -299,6 +322,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
  set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
  
  llama_build_and_test(test-arg-parser.cpp)
@@ -25957,6 +26043,231 @@ index 3496f72e4..659ea263f 100644
                          const std::vector<float> logits_roundtrip = get_logits(
                              model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                          status_roundtrip = "\033[1;32mOK\033[0m";
+diff --git a/tests/test-recurrent-state-depth.cpp b/tests/test-recurrent-state-depth.cpp
+new file mode 100644
+index 000000000..ca5abc0fd
+--- /dev/null
++++ b/tests/test-recurrent-state-depth.cpp
+@@ -0,0 +1,219 @@
++// Deterministic sweep of the recurrent rollback snapshot machinery for the
++// speculative verify band.  For every (n_rs_seq, batch shape, rollback) it:
++//   ctx_roll: decode the full batch, partial-rollback r tokens through the
++//             snapshot path, then replay the removed tokens one at a time;
++//   ctx_ref : decode only the accepted prefix and then the same replay tokens.
++// A correct snapshot restore makes the replayed logits match bit-for-bit
++// (eps allows backend scheduling noise).
++//
++// This is the Phase 0 gate for the issue-#30 clamp policy: it must be green for
++// every allowed depth (n_rs_seq up to 15) before purity above 7 can be traded.
++
++#include "arg.h"
++#include "common.h"
++#include "ggml-backend.h"
++#include "llama.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#include <vector>
++
++static llama_context * make_ctx(
++        const common_params & params, llama_model * model,
++        uint32_t n_rs_seq, uint32_t n_rs_batch, uint32_t n_ubatch,
++        uint32_t n_seq_max, uint32_t n_ctx) {
++    auto cparams = common_context_params_to_llama(params);
++    cparams.n_seq_max  = n_seq_max;
++    cparams.n_rs_seq   = n_rs_seq;
++    cparams.n_rs_batch = n_rs_batch;
++    cparams.n_ctx      = n_ctx;
++    cparams.n_batch    = n_ctx;
++    cparams.n_ubatch   = n_ubatch;
++    cparams.kv_unified = false;
++    return llama_init_from_model(model, cparams);
++}
++
++static bool decode_batch(llama_context * ctx, const std::vector<llama_token> & toks,
++                         llama_pos pos0, uint32_t n, llama_seq_id seq, bool last_logits) {
++    llama_batch batch = llama_batch_init(n, 0, 1);
++    for (uint32_t i = 0; i < n; ++i) {
++        common_batch_add(batch, toks[pos0 + i], pos0 + i, { seq }, last_logits && i + 1 == n);
++    }
++    const bool ok = llama_decode(ctx, batch) == 0;
++    llama_batch_free(batch);
++    return ok;
++}
++
++static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos, llama_seq_id seq) {
++    llama_batch batch = llama_batch_init(1, 0, 1);
++    common_batch_add(batch, tok, pos, { seq }, true);
++    const bool ok = llama_decode(ctx, batch) == 0;
++    llama_batch_free(batch);
++    return ok;
++}
++
++static std::vector<llama_token> make_tokens(
++        llama_context * ctx, const llama_vocab * vocab, uint32_t n_tokens, uint32_t n_vocab) {
++    std::vector<llama_token> toks;
++    if (llama_vocab_type(vocab) == LLAMA_VOCAB_TYPE_NONE) {
++        for (uint32_t i = 0; i < n_tokens; ++i) {
++            toks.push_back((llama_token) ((7*i + 3) % n_vocab));
++        }
++    } else {
++        auto toks0 = common_tokenize(ctx, "The quick brown fox jumps over the lazy dog", true);
++        if (toks0.empty()) {
++            toks0 = { 1, 2, 3, 4, 5, 6, 7, 8, 9 };
++        }
++        for (uint32_t i = 0; i < n_tokens; ++i) {
++            toks.push_back(toks0[i % toks0.size()] + (llama_token) ((i / toks0.size()) % 3));
++        }
++    }
++    return toks;
++}
++
++// returns max logit diff, or -1 on hard error
++static double run_case(
++        const common_params & params, llama_model * model, llama_context * ctx_tok,
++        const llama_vocab * vocab,
++        uint32_t n_rs_seq, uint32_t n_rs_batch, uint32_t n_ubatch,
++        uint32_t n_tokens, uint32_t n_rollback, bool verbose) {
++    const int n_vocab = llama_vocab_n_tokens(vocab);
++
++    std::vector<llama_token> toks = make_tokens(ctx_tok, vocab, n_tokens, (uint32_t) n_vocab);
++
++    llama_context * ctx_roll = make_ctx(params, model, n_rs_seq, n_rs_batch, n_ubatch, 1, 512);
++    llama_context * ctx_ref  = make_ctx(params, model, n_rs_seq, n_rs_batch, n_ubatch, 1, 512);
++    if (ctx_roll == nullptr || ctx_ref == nullptr) {
++        fprintf(stderr, "  [%s] failed to init contexts\n", __func__);
++        if (ctx_roll) llama_free(ctx_roll);
++        if (ctx_ref)  llama_free(ctx_ref);
++        return -1;
++    }
++
++    const uint32_t p0 = n_tokens - n_rollback;
++
++    bool ok = true;
++    ok = ok && decode_batch(ctx_roll, toks, 0, n_tokens, 0, true);
++    ok = ok && decode_batch(ctx_ref,  toks, 0, p0,      0, true);
++    if (!ok) {
++        fprintf(stderr, "  [prefill] decode failed\n");
++        llama_free(ctx_roll); llama_free(ctx_ref);
++        return -1;
++    }
++
++    const bool rm = llama_memory_seq_rm(llama_get_memory(ctx_roll), 0, (llama_pos) p0, -1);
++    if (!rm) {
++        fprintf(stderr, "  [rollback] seq_rm refused (n_tokens=%u rollback=%u)\n", n_tokens, n_rollback);
++        llama_free(ctx_roll); llama_free(ctx_ref);
++        return -1;
++    }
++
++    double diff_max = 0.0;
++    for (uint32_t i = p0; i < n_tokens; ++i) {
++        if (!decode_one(ctx_roll, toks[i], (llama_pos) i, 0) ||
++            !decode_one(ctx_ref,  toks[i], (llama_pos) i, 0)) {
++            fprintf(stderr, "  [replay] decode failed at pos %u\n", i);
++            llama_free(ctx_roll); llama_free(ctx_ref);
++            return -1;
++        }
++        const float * l_roll = llama_get_logits_ith(ctx_roll, 0);
++        const float * l_ref  = llama_get_logits_ith(ctx_ref,  0);
++        if (l_roll == nullptr || l_ref == nullptr) {
++            fprintf(stderr, "  [replay] missing logits at pos %u\n", i);
++            llama_free(ctx_roll); llama_free(ctx_ref);
++            return -1;
++        }
++        for (int t = 0; t < n_vocab; ++t) {
++            const double d = std::fabs((double) l_roll[t] - (double) l_ref[t]);
++            if (d > diff_max) diff_max = d;
++        }
++    }
++
++    if (verbose) {
++        fprintf(stderr, "  n_rs_seq=%2u n_rs_batch=%2u n_ub=%4u n_tokens=%3u rollback=%2u -> max diff %g\n",
++                n_rs_seq, n_rs_batch, n_ubatch, n_tokens, n_rollback, diff_max);
++    }
++
++    llama_free(ctx_roll);
++    llama_free(ctx_ref);
++    return diff_max;
++}
++
++int main(int argc, char ** argv) {
++    std::setlocale(LC_NUMERIC, "C");
++
++    common_params params;
++    params.sampling.seed = 1234;
++    params.n_predict     = 1;
++
++    common_init();
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
++        return 1;
++    }
++    ggml_backend_load_all();
++
++    common_init_result_ptr llama_init = common_init_from_params(params);
++    llama_model * model = llama_init->model();
++    if (model == nullptr) {
++        fprintf(stderr, "failed to init model\n");
++        return 1;
++    }
++    if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
++        fprintf(stderr, "skipping for non-recurrent model\n");
++        return 0;
++    }
++
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++
++    constexpr double eps = 1e-5;
++    int n_fail = 0;
++
++    // Phase A: verify-batch shape.  n_tokens = K = n_rs_seq + 1, rollback the
++    // whole allowed range.  This is exactly the speculative verify + partial
++    // accept path for depth n_max = n_rs_seq.
++    fprintf(stderr, "=== Phase A: verify-batch shape (n_tokens = n_rs_seq+1) ===\n");
++    for (uint32_t n_rs_seq = 1; n_rs_seq <= 15; ++n_rs_seq) {
++        const uint32_t n_rs_batch = n_rs_seq + 1;
++        const uint32_t n_tokens   = n_rs_seq + 1;
++        int fail_a = 0;
++        for (uint32_t r = 1; r <= n_rs_seq; ++r) {
++            const double d = run_case(params, model, llama_init->context(), vocab, n_rs_seq, n_rs_batch, 32, n_tokens, r, false);
++            if (d < 0 || d > eps) {
++                fprintf(stderr, "FAIL A: n_rs_seq=%u rollback=%u max diff=%g\n", n_rs_seq, r, d);
++                ++fail_a;
++            }
++        }
++        n_fail += fail_a;
++        fprintf(stderr, "  n_rs_seq=%2u verify shape: %s\n", n_rs_seq, fail_a ? "FAIL" : "PASS");
++    }
++
++    // Phase B: deeper-than-K batch still at/below the draft bound.  A batch with
++    // n_tokens > K can be rolled back into when the speculator drafts deeply
++    // (n_rs_batch > K).  n_tokens = n_rs_batch, rollback the full draft range.
++    fprintf(stderr, "=== Phase B: deep draft (n_tokens = n_rs_batch > K) ===\n");
++    for (uint32_t n_rs_seq = 7; n_rs_seq <= 15; n_rs_seq += 4) {
++        const uint32_t K = n_rs_seq + 1;
++        for (uint32_t extra = 1; extra <= 16; extra += 5) {
++            const uint32_t n_rs_batch = K + extra;
++            const uint32_t n_tokens   = n_rs_batch;
++            int fail_b = 0;
++            for (uint32_t r = 1; r <= n_rs_seq; ++r) {
++                const double d = run_case(params, model, llama_init->context(), vocab, n_rs_seq, n_rs_batch, 32, n_tokens, r, false);
++                if (d < 0 || d > eps) {
++                    fprintf(stderr, "FAIL B: n_rs_seq=%u n_rs_batch=%u n_tokens=%u rollback=%u max diff=%g\n",
++                            n_rs_seq, n_rs_batch, n_tokens, r, d);
++                    ++fail_b;
++                }
++            }
++            n_fail += fail_b;
++            fprintf(stderr, "  n_rs_seq=%2u n_rs_batch=%2u n_tokens=%2u: %s\n",
++                    n_rs_seq, n_rs_batch, n_tokens, fail_b ? "FAIL" : "PASS");
++        }
++    }
++
++    fprintf(stderr, "\n%s: total failures = %d\n", n_fail ? "FAIL" : "PASS", n_fail);
++    return n_fail ? 2 : 0;
++}
 diff --git a/tests/test-speculative-adaptive.cpp b/tests/test-speculative-adaptive.cpp
 new file mode 100644
 index 000000000..ea959f223

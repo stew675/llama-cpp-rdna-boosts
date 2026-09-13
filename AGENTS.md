@@ -175,8 +175,8 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `790cf51aa` is a rebuild of the delivery set
-(tip `f27dc6d8006188d00ff96dadab6eb0edf79e2b7c`, net tree
-  `bbbe005e95381301fdc71e5d636f448bab147a65`,
+(tip `c45244c728dfcbcad86ae95aa97ae76f94ee9f7f`, net tree
+  `a5683e1b008e3ad197ac2a9e3f99e5b0652df7d4`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `790cf51aa`; the 2026-09-13 re-base resolved the four upstream clashes --
 `16378d93f` gfx1201 FA tuning (our block-04 head-256 configs kept: upstream's
@@ -227,8 +227,8 @@ new `mmq_args` field was unset by `ggml_cuda_mul_mat_q_pair`, selecting the narr
 to 2.2x slower dense prefill; see the 2026-09-13 block-14 (ninth) section).
 **Block 15 (the attention-memory campaign) is the delivery's last patch** --
 promoted 2026-09-12 from `archive/work/block-15-campaign-wins/` (`patches/0015`;
-the canonical 16-block tip is `f27dc6d8006188d00ff96dadab6eb0edf79e2b7c`, tree
-`bbbe005e95381301fdc71e5d636f448bab147a65` (the 2026-09-13 master re-base + the
+the canonical 16-block tip is `c45244c728dfcbcad86ae95aa97ae76f94ee9f7f`, tree
+`a5683e1b008e3ad197ac2a9e3f99e5b0652df7d4` (the 2026-09-13 master re-base + the
 2026-09-13 block-08 `iq4_nl` `GET_ROWS` amendment; the
 previous base `9113cc188` had tip `907799de3`, tree `c2e284c2acc032238ef85cb35d427c1598ed0949`).
 
@@ -240,7 +240,10 @@ commits on master `790cf51aa` (block 15 = the promoted attention-memory
 campaign; 2026-09-08 re-base; block 01 refreshed
 2026-09-09 to the upstream PR #27210 review head `d236d41a2`, still one
 squashed block, and amended 2026-09-11 so `--spec-draft-n-max` is clamped to 7
-with a visible notice + `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` escape hatch; block 03 amended 2026-09-10 with the HIP masked-V/
+with a visible notice + `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` escape hatch; **further amended
+2026-09-13 (issue #30) to clamp at 15 instead** (the recurrent rollback
+snapshot bound), keeping a visible purity notice above 7 — see the "Critical
+facts" bullet below and `WORKLOG.md` 2026-09-13 (latest); block 03 amended 2026-09-10 with the HIP masked-V/
 freed-cell fixes, re-homed from block 14; block 14's 2026-09-09 gfx1151-only
 freed-cell host zeroing is removed and its 2026-09-10 masked-V fixes were
 re-homed — Vulkan to block 00, HIP to block 03; on the re-base block 06 was
@@ -403,10 +406,18 @@ Consequences, so it is not re-litigated:
   measured 1.7–3.6× slower than the same-type equivalent and never smaller, and the attention path
   (including the split/FA one) assumes `type_k == type_v`.  Implemented as a block-14 amendment with
   a `f16`/`f16`-style pairing in every gate; test scripts must pass matching `-ctk`/`-ctv`.
-- **`--spec-draft-n-max` is capped at 7** (a clamp + one warning, not an error).  A verify batch
-  decodes `n_max + 1` rows and the HIP FA chooser switches kernel family above 8 rows, so deeper
-  drafts can change greedy output between plain and MTP.  Block-01 amendment; see
-  `GREEDY-PURITY.md` §11/§19.
+- **`--spec-draft-n-max` is capped at 15; purity above 7 is a warned trade** (2026-09-13, issue #30).
+  The 15 is a hard **correctness** bound: a verify batch decodes `n_max + 1` rows and a partial accept
+  rolls the recurrent state back into that batch, and the chunked-GDN threshold
+  `max(K > 16 ? K : 16, n_rs_batch)` covers `K = n_max + 1 <= 16` exactly (the constant the
+  K-independent chunked path was built around).  There is **no rewind corruption** in 1..15 — the new
+  `tests/test-recurrent-state-depth` sweep is green (`n_rs_seq` 1..15, every rollback, plus deep drafts).
+  Above 7 **purity** is not promised: a verify wider than 8 rows switches kernel family (the FA
+  tile/MMA chooser at `Q->ne[1] > 8`, and the matmul family at `MMVQ_MAX_BATCH_SIZE`/`MMVF_MAX_BATCH_SIZE`
+  = 8), so `--spec-type none` and `draft-mtp` may disagree on a greedy near-tie.  The CLI prints a
+  visible `E`-level notice for any depth 8..15 and clamps `> 15` to 15 (`LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0`
+  keeps a larger value with its own notice).  The default is still 3.  See `GREEDY-PURITY.md` §11/§19
+  and `WORKLOG.md` 2026-09-13 (latest).
 - **The pin regressed** (session 7): `~/bin/high-power` (dpm=high +
   runtime-PM) costs tg -5-7% / pp -15-18% on RCCL/hybrid paths. Server runs
   UNPINNED, 3-GPU (`HIP_VISIBLE_DEVICES=0,1,2`), hybrid default.
@@ -498,8 +509,11 @@ Consequences, so it is not re-litigated:
   `patches/README.md` (the 2026-09-12 block-02 amendment).
   **Note the pure `none == draft-mtp` range is `n_max <= 7`, not 15** —
   an 8-token verify batch is the designed limit (the FA tile-vs-WMMA switch at
-  `Q->ne[1] > 8` changes the reduction beyond it); on 2-GPU `-sm tensor` it was
-  `n_max <= 5` until the block-12 dispatch fix described below
+  `Q->ne[1] > 8` plus the mmvq/mmq matmul switch at `ncols == 8` change the
+  reduction beyond it).  Since 2026-09-13 the CLI no longer clamps that range:
+  `--spec-draft-n-max 8..15` is allowed with a visible purity notice, and the
+  >15 clamp is the recurrent snapshot bound, not this one.  On 2-GPU `-sm tensor`
+  the purity range was `n_max <= 5` until the block-12 dispatch fix described below
   (`GREEDY-PURITY.md` §11, follow-ups Part 3).
   Record: `archive/work/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FIX.md`.
 - **Block-12 AR_PROFILE init fix (2026-09-01, PR #8, integrated):**
@@ -743,7 +757,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `790cf51aa`,
-blocks tip `f27dc6d8006188d00ff96dadab6eb0edf79e2b7c`): `git format-patch --start-number 0` the block
+blocks tip `c45244c728dfcbcad86ae95aa97ae76f94ee9f7f`): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -751,7 +765,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 — it may have been rebased onto a drifted master, so a raw
 `<base>..HEAD` range there can export upstream commits as patches
 0001/0002.  The canonical 16-block chain is a rebuild of the delivery set at
-`790cf51aa` (tip `f27dc6d80…`), which is what the default tip names.  Always regenerate from a
+`790cf51aa` (tip `c45244c72…`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `790cf51aa`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

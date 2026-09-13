@@ -11,8 +11,8 @@ The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against
 re-based 2026-09-02 from `0eadefebd`).
 **Current regeneration (2026-09-13, the master re-base + the block-08 `iq4_nl` `GET_ROWS`
 amendment + the block-08 (seventh) MoE-router bit-identity amendment)**: canonical 16-block tip
-**`f27dc6d8006188d00ff96dadab6eb0edf79e2b7c`** (net tree
-**`bbbe005e95381301fdc71e5d636f448bab147a65`**), clean-apply strict 16/16 with 0 whitespace
+**`c45244c728dfcbcad86ae95aa97ae76f94ee9f7f`** (net tree
+**`a5683e1b008e3ad197ac2a9e3f99e5b0652df7d4`**), clean-apply strict 16/16 with 0 whitespace
 warnings and the applied tree equal to the canonical one.  (The re-base tip was `43ec14228…`, tree
 `5cc664…`; the 2026-09-13 block-08 (sixth) amendment — TODO item 3, the `iq4_nl` `GET_ROWS`
 sub-`QK_K` path — and the (seventh) amendment — TODO item 19, the bit-identical fused MoE

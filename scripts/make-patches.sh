@@ -85,6 +85,19 @@
 #                 args, so the MMQ tile heuristic picked the narrowest tile (J=8) - up to 2.2x
 #                 slower dense prefill.  Both pair arms now set it like the standalone and the
 #                 heuristic falls back to ncols_max when unset.
+#                 `2026-09-13 block-01 + block-14 amendment (issue #30 clamp policy)`: the
+#                 --spec-draft-n-max clamp is raised from 7 to 15 (the recurrent rollback
+#                 snapshot bound: a verify batch decodes n_max + 1 = K <= 16 rows, which is the
+#                 constant the K-independent chunked-GDN threshold was built around), with a
+#                 visible purity notice above 7 instead (a verify wider than 8 rows switches
+#                 kernel family - the FA tile/MMA chooser and the matmul MMVQ/MMVF -> MMQ switch -
+#                 so plain and draft-mtp may no longer be bit-identical).  It also adds the
+#                 `tests/test-recurrent-state-depth` snapshot sweep (n_rs_seq 1..15, the whole
+#                 rollback range, including deep drafts) and block-14's QSA decode-arm band fix:
+#                 the arm's band is now max(QSA_DECODE_BAND, cparams.n_rs_batch), so a verify of
+#                 the full built-in draft depth takes the same dense arm as the W=1 decode instead
+#                 of flipping to the sparse top-k arm above W=8 (the 2051-selection-width
+#                 divergence reported for qwen4exp at depth 15).
 #                 The block-15 tip of the *working*
 #                 fork checkout (~/llama.cpp rdna-boosts) is a different SHA,
 #                 because that branch is a local rebuild -- do not use it for
@@ -104,7 +117,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
 BASELINE="${2:-790cf51aa}"
-TIP="${3:-f27dc6d8006188d00ff96dadab6eb0edf79e2b7c}"
+TIP="${3:-c45244c728dfcbcad86ae95aa97ae76f94ee9f7f}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then

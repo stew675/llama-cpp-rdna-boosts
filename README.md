@@ -63,18 +63,34 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
   **`790cf51aa`** (re-based 2026-09-13; previously `9113cc188`).
 - Patches `patches/0000-…0015-…`, applied with **strict 16/16 `git am`** by
   `scripts/apply-all.sh` (no 3-way fallback, whitespace-clean).
-- Canonical 16-block chain: tip `f27dc6d8006188d00ff96dadab6eb0edf79e2b7c`,
-  net tree `bbbe005e95381301fdc71e5d636f448bab147a65`.
+- Canonical 16-block chain: tip `c45244c728dfcbcad86ae95aa97ae76f94ee9f7f`,
+  net tree `a5683e1b008e3ad197ac2a9e3f99e5b0652df7d4`.
 - Greedy purity: plain decode == `draft-mtp` verify for
   `--spec-draft-n-max <= 7` across the supported KV types (4B and 27B all
-  eight; qwen4exp MTP).
+  eight; qwen4exp MTP).  Depths 8..15 are allowed with a visible notice that
+  the two may differ (kernel-family switches above an 8-row verify); `> 15` is
+  clamped (the recurrent rollback snapshot bound, 2026-09-13).
 - Every block is build- and coherence-verified.  Detail lives in:
   [`WORKLOG.md`](WORKLOG.md) (dated record, newest first),
   [`patches/README.md`](patches/README.md) (per-block notes, env knobs, server
   config), [`MANIFESTS.md`](MANIFESTS.md) (apply order + verification contract)
   and [`BASELINE.md`](BASELINE.md) (fork point + drift policy).
 
-**Latest change (2026-09-13, latest) — block-14 pair-fusion `ncols_opt` fix: dense prefill regression
+**Latest change (2026-09-13, latest) — issue #30: the `--spec-draft-n-max` clamp is raised from 7 to
+15, and the qwen4exp QSA decode arm is band-matched to the verify width.**  The park reason for depth 15
+was a claimed recurrent-rewind corruption on qwen4exp.  A new deterministic reference-context sweep
+(`tests/test-recurrent-state-depth`: `n_rs_seq` 1..15, every rollback, plus deep drafts) is green on
+qwen35/dsv4/kimi-k3/qwen4exp — **no rewind corruption in the allowed range** — and the qwen4exp
+depth-15 divergence past the 2051 indexer selection width was the **QSA dense decode arm** flipping to
+the sparse top-k arm for a 9..16-row verify (`QSA_DECODE_BAND = 8`); the arm band is now
+`max(QSA_DECODE_BAND, cparams.n_rs_batch)`.  The residual purity loss above depth 7 is the documented
+kernel-family switch at 8 rows (FA tile/MMA **and** matmul MMVQ/MMVF -> MMQ), now an accepted trade
+with a visible notice instead of a clamp; only `> 15` (the recurrent snapshot bound) is clamped.  The
+default `n_max 3` is unaffected.  Canonical tip `c45244c72`, tree `a5683e1b008e`.  Full record:
+[`WORKLOG.md`](WORKLOG.md) 2026-09-13 (latest) and the issue-#30 section of
+[`patches/README.md`](patches/README.md).
+
+**Previous change (2026-09-13, later) — block-14 pair-fusion `ncols_opt` fix: dense prefill regression
 repaired.**  The 2026-09-13 re-base merged upstream's new `mmq_args::ncols_opt` field, but block-14's
 `ggml_cuda_mul_mat_q_pair` builds its `mmq_args` by hand and still left it `0`, so the MMQ tile
 heuristic selected the narrowest tile (`J=8`) — up to **2.2x slower dense prefill** (and 14-48% below
@@ -82,9 +98,9 @@ the pre-rebase delivery) on every dense model.  Both pair arms now set it like t
 the token count; `MUL_MAT_ID`: the RDNA per-expert average) and the heuristic falls back to
 `ncols_max` when unset.  pp4096 restored/beaten: 27B Q8_0 623 -> **1363** (1 GPU) / 1718 -> **2176**
 (tensor), 27B UD-Q4_K_XL 905 -> **1264** / 1693 -> **2040**, 4B 5386 -> **7304**; qwen4exp unaffected.
-Numerics unchanged (pair on == off, same-seed `d03d0bc727a8`).  Canonical tip `f27dc6d80`, tree
-`bbbe005e9538`.  Full record: [`WORKLOG.md`](WORKLOG.md) 2026-09-13 (latest) and the 2026-09-13
-block-14 (ninth) section of [`patches/README.md`](patches/README.md).
+Numerics unchanged (pair on == off, same-seed `d03d0bc727a8`).  Full record: [`WORKLOG.md`](WORKLOG.md)
+2026-09-13 (latest) and the 2026-09-13 block-14 (ninth) section of
+[`patches/README.md`](patches/README.md).
 
 **Previous change (2026-09-13, later) — the fused MoE router is bit-identical (TODO item 19).**
 The block-08 `iq4_nl` `GET_ROWS` fix moved the qwen4exp greedy text, and the reason was a pre-existing

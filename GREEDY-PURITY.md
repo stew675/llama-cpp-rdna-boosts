@@ -45,7 +45,7 @@ finding, narrative moved to the findings file):
 | 6-8 | speculative verify runs the same kernels on a wider batch, so the variance composes orthogonally; measured magnitude and stock-reproduction guidance | doctrine (§9 supersedes §2/§8 for block-13+ sets) |
 | 9 | block 13's rewritten mmvq rows are a **second** decode-numerics source | doctrine |
 | 10 | block 00 makes the verify width irrelevant on the small-batch FA path (`ntiles_dst_eff`) | doctrine |
-| 11 | the guarantee is `--spec-draft-n-max <= 7`; cause A (block-12 AR crossover, fixed) + cause B (FA tile->WMMA at `Q->ne[1] > 8`, by design) | current |
+| 11 | the guarantee is `--spec-draft-n-max <= 7`; cause A (block-12 AR crossover, fixed) + cause B (the FA tile->WMMA switch at `Q->ne[1] > 8` **and** the mmvq/mmq matmul switch at `ncols == 8`, both by design).  Since 2026-09-13 the CLI no longer clamps depths 8..15; it warns and keeps them (the >15 clamp is the recurrent snapshot bound) | current |
 | 12 | the guarantee depends on the KV-cache type; the two fast native types were impure (fixed by §14) | fix + the fast/slow trade |
 | 13 | qwen4exp's hyper-connection band is `1 <= nt <= 8` (`HC_FUSED_MAX_TOKENS`) | fix |
 | 14 | F1: the FA chooser spanned VEC (`n_q <= 2`) and TILE (`n_q >= 3`) for quantized K/V — one family now | fix |
@@ -345,6 +345,17 @@ that is a decode-vs-verify difference, not a draft-length one.
 batch width*, not on `n_max`: the target verifies the drafts plus the last committed token, so `K = n_max + 1`
 and `n_max = 8` is already a 9-token batch).  Earlier notes claimed `n_max <= 15`; they had only ever
 been validated to `n_max = 4`.  Two independent causes bound it:
+
+> **2026-09-13 (issue #30) update.**  This section's *guarantee* is unchanged, but the CLI's policy is:
+> the draft depth is **no longer clamped at 7** — `--spec-draft-n-max 8..15` is kept with a visible
+> notice that `plain` vs `draft-mtp` may no longer be bit-identical, and only `> 15` is clamped (the
+> recurrent rollback snapshot bound, a *correctness* bound, not this purity one).  Cause B is now known
+> to be broader than the FA chooser: the real models also flip at `W = 9` with flash attention
+> **disabled**, because the matmul family changes at `ncols == MMVQ_MAX_BATCH_SIZE`/`MMVF_MAX_BATCH_SIZE`
+> = 8 (27B UD-Q4_K_XL, f16, P=2500: W=1..8 `8ef5ce3ab2d942dd` vs W=9..16 `7d1e01e82be4ce6b`; `FA=0`
+> `b5d4df87caa0348e` vs `0c0cb329b59aedc9`).  A third, fork-specific cause (the qwen4exp QSA dense arm
+> flipping to sparse above `W = 8`) is fixed in block 14 — see §32; the deterministic recurrent
+> snapshot sweep (`tests/test-recurrent-state-depth`) shows there is **no corruption** in 1..15.
 
 | config | guaranteed for | binding cause |
 |---|---|---|
@@ -1131,3 +1142,46 @@ exactly:
   have passed with either path (both are internally width-uniform).  The force-fuse probe
   (`GGML_CUDA_TOPK_MOE_IGNORE_ALIAS`, temporary) additionally covers the call sites the address guard
   would otherwise skip.
+
+## 32. A decode/verify band policy must scale with the configured draft depth (2026-09-13, issue #30, block-14 amendment)
+
+**Claim.**  `QSA_DECODE_BAND = 8` matched the qwen4exp dense decode arm to the `n_max <= 7` verify, but
+it was a fixed constant while the verify width is `n_max + 1`.  Once the draft-depth clamp moved from 7
+to 15, a depth-8..15 verify became a 9..16-token batch: above the indexer selection width
+(`indexer_top_k + r - 1` = 2051) the W=1 decode took the **dense** arm while the verify fell through to
+the **sparse** top-k selection — the "triggers after ~2051 tokens" qwen4exp depth-15 divergence.  This is
+the same *class* as §26 (a regime policy is only pure if the whole band takes one arm), re-opened because
+the band was pinned to a compile-time constant instead of the configured draft depth.
+
+**Evidence (real qwen4exp IQ4_XS, 3x R9700 `-sm tensor`, f16, `P=2500 > 2051`, token-0 logits).**
+
+| build | `W = 1..8` | `W = 9..16` |
+|---|---|---|
+| pre-fix | `643a8166d8dad677` | `1354757f9daf03db` (== the `LLAMA_QSA_DENSE_DECODE_UNTIL=0` forced-sparse hash) |
+| post-fix | `643a8166d8dad677` | `05be2f7f30dbc426` (the dense arm; the base kernel-family impurity of §11 remains) |
+
+The dummy `qwen4exp-moe` isolates it cleanly (no matmul-family flip at these sizes): pre-fix W=1..8
+`5009c55bca5e01ca` vs W=9..16 `596ec8bf7461da1a`; post-fix all W=1..16 `5009c55bca5e01ca`, and pure for
+all eight native KV types.  With the QSA arm routed to sparse on **both** sides
+(`LLAMA_QSA_DENSE_DECODE_UNTIL=0`) the width matrix is pure, so the fix does not weaken the sparse arm.
+
+**Fix.**  `qsa_decode_band = max(QSA_DECODE_BAND, cparams.n_rs_batch)`; the decode arm uses
+`n_tokens <= qsa_decode_band` and the prefill arm `n_tokens > qsa_decode_band`, keeping them disjoint.
+`cparams.n_rs_batch` (`common_speculative_n_max() + 1`, the recurrent rollback bound) is exactly the
+widest batch that can be a verify, so the arm now tracks the configured depth.  Default configs
+(`n_max 3` -> `n_rs_batch 4`; `n_max 7` -> `8`) leave the band at 8 and are byte-identical to the
+pre-amendment build, so every recorded reference hash holds.
+
+**Rules to take from it:**
+
+* **A band constant must be derived from the quantity it is matching.**  `QSA_DECODE_BAND = 8` was
+  correct only while the clamp made 8 the maximum verify width; it silently rotted when the policy
+  changed.  The verify width is `n_rs_batch`, so use it.
+* **A bug that only fires past a regime threshold needs the threshold crossed in the test.**  The
+  1..8-width probe was green because below 2051 the `shortcut` arm covers every width; the divergence
+  appears only for a `W > 8` verify with `n_kv >` the selection width.  The regression is the real-model
+  width matrix at `P > 2051` (`wip/recurrent-rewind-depth/`), not the short-context probe.
+* **A depth-policy change has to re-run the width matrix for every model family the band touches.**
+  The clamp relaxation was validated on the recurrent snapshot machinery (deterministic sweep) and on
+  qwen4exp's QSA arm; the residual `W=9` difference on all models is the documented §11 kernel-family
+  trade, not a defect.

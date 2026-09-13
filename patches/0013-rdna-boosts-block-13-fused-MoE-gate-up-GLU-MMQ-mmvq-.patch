@@ -1,4 +1,4 @@
-From fc460d2664db3b4d41c4e5fc5ff456037ce23c49 Mon Sep 17 00:00:00 2001
+From 733ab9307f336b1005c21221e265ddd728d63379 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 06:50:35 -0500
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -42,20 +42,6 @@ Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
   swiglu-input quantize, mwr float4, split_j/Q8_0 rows, quantize chunk,
   mul_mat_q_pair, weighted-down mmvq, scale-unary window) - see
   patches/README.md and wip/archive/qwen4exp/README.md.
---- 2026-09-12 amendment: RDNA3_5 single-token-only mmvq fusions are not decode/verify bit-identical ---
-
-On RDNA3_5 (gfx1151) two single-token-only mmvq fusions run at W=1 but not at W>=2, and
-their fused kernels do not reproduce the standalone mul_mat_vec_q / mul_mat_vec_q_moe
-arithmetic, so a 1-token decode and an n-token speculative verify of the same layer diverge
-(the issue-25 "block-13 n_q=1 short-K mmvq variance"): the dense gate+up+GLU fusion
-(mm ...) and the weighted-down MoE tail (ggml_cuda_mul_mat_id_weighted_rdna3_5).  Measured
-(qwen4exp UD-IQ4_XS, P=100, f16): W=1 8abc6206d1e80709 vs W=8 453eaa618738273d; skipping both
-restores W=1,2,4,8 == 453eaa618738273d (q8_0 113696b9), MoE 35B-A3B likewise, the 27B dense was
-already pure.  The dense-GLU fusion is skipped in ggml_cuda_try_fuse (the six
-{op,op,GLU}/{op,bias,op,bias,GLU} matchers) and the weighted-down tail in
-ggml_cuda_mul_mat_id_weighted_rdna3_5_ok, both gated on RDNA3_5 unless
-GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1 (A/B).  MUL_MAT_ID (MoE) gate+up+GLU is
-untouched (it fires at every width and is band-uniform).  Cost ~0.9% tg128 on qwen4exp.
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu               | 207 +++-
  ggml/src/ggml-cuda/mmq-config-rdna3-5.cuh     |   6 +-

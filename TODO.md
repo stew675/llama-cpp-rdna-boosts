@@ -7,9 +7,9 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
 `wip/*` and `benchmarks/`.
 
 **Current state (2026-09-13, latest):** the delivery is the **16-patch set** against fork point `790cf51aa`
-(block 00 + blocks 01-15), canonical 16-block tip **`f27dc6d8006188d00ff96dadab6eb0edf79e2b7c`** (tree
-`bbbe005e95381301fdc71e5d636f448bab147a65`), `make-patches.sh` default tip =
-`f27dc6d8006188d00ff96dadab6eb0edf79e2b7c` (the 2026-09-13 master re-base + the block-08 (sixth)
+(block 00 + blocks 01-15), canonical 16-block tip **`c45244c728dfcbcad86ae95aa97ae76f94ee9f7f`** (tree
+`a5683e1b008e3ad197ac2a9e3f99e5b0652df7d4`), `make-patches.sh` default tip =
+`c45244c728dfcbcad86ae95aa97ae76f94ee9f7f` (the 2026-09-13 master re-base + the block-08 (sixth)
 `iq4_nl` `GET_ROWS` sub-`QK_K` amendment that closed item 3 + the block-08 (seventh) MoE-router
 bit-identity amendment that closed item 19 + the block-14 (ninth) pair-fusion `ncols_opt` fix that
 repaired the dense prefill regression the re-base introduced).  Block 15 (the attention-memory campaign) was **promoted to the delivery** as `patches/0015` (2026-09-12; TODO item 1 closed).  F1/F2/F3 (the
@@ -137,6 +137,20 @@ are superseded by the 2026-09-13 re-base to `790cf51aa` (tip `6303f0489`, tree `
   `archive/work/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
+
+- **Issue #30 draft-depth policy: the `--spec-draft-n-max` clamp moved from 7 to 15, and the qwen4exp
+  QSA decode-arm band now tracks the verify width (closed 2026-09-13, block-01 + block-14 amendments).**
+  The park reason was a claimed **rewind corruption** above depth 7 on qwen4exp.  Investigation: (1) a
+  new deterministic reference-context sweep (`tests/test-recurrent-state-depth`, `n_rs_seq` 1..15 ×
+  every rollback × deep drafts) is green on qwen35/dsv4/kimi-k3/qwen4exp — **there is no rewind
+  corruption in the allowed range**; (2) the qwen4exp depth-15 divergence past the 2051 selection width
+  was the QSA dense decode arm (`QSA_DECODE_BAND = 8`) flipping to the sparse top-k arm for a 9..16-row
+  verify, now `max(QSA_DECODE_BAND, cparams.n_rs_batch)`; (3) the residual purity loss above 7 is the
+  documented kernel-family switch at 8 rows (FA tile/MMA **and** matmul MMVQ/MMVF -> MMQ), accepted
+  with a visible notice.  The clamp is now 15 (recurrent snapshot bound) with a purity notice above 7;
+  default `n_max 3` is unaffected.  New canonical tip `c45244c72`, tree `a5683e1b008e`; strict 16/16
+  apply.  `WORKLOG.md` 2026-09-13 (latest), `patches/README.md` (the issue-#30 section), `GREEDY-PURITY.md`
+  §11/§32.
 
 - **Dense prefill regression from the 2026-09-13 re-base (closed 2026-09-13 (latest), block-14 amendment
   (ninth)).**  The re-base merged upstream's new `mmq_args::ncols_opt`, but block-14's
