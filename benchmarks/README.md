@@ -36,6 +36,10 @@ baselines) lives in [mtp-adaptive-methodology.md](mtp-adaptive-methodology.md).
 depth-16384: hybrid wins prefill (1620 t/s), internal/none unchanged by
 P2P (as designed), RCCL legs lose ~6% with P2P disabled.
 
+## 2026-09-13 — Qwen3.8-27B Unc Q8 ngram-mod 16/2/96
+
+**[2026-09-13-qwen38-unc-ngram-mod.md](2026-09-13-qwen38-unc-ngram-mod.md)** — HIP 12-set, 2× R9700. Stock `--spec-type ngram-mod` with **n-min 2** drafts on dense Unc (farm 24/48/64 did not). Prefill ≈ nospec; MTP n-max 3 still wins unique-prose median. Not qwen4exp managed-ngrams.
+
 ## v2 — the current results (llama-benchy live-server suite)
 
 **[v2-results.md](v2-results.md)** is the canonical results document:
