@@ -49,6 +49,17 @@ are superseded by the 2026-09-13 re-base to `790cf51aa` (tip `6303f0489`, tree `
 
 ## Active (kept compact: only what this repo will work on next)
 
+### 1. Adapt/implement Tiled Gated Delta Net
+
+- This repo implements chunked gated delta net as it provides both performance and quality assurance
+- pwilkins has implemented an excellently performing tiled GDN solution here: https://github.com/pwilkin/llama.cpp/tree/strix-halo
+- The associated documentation ascribes Tiled GDN as a trade-off of high speed at the cost of numerical quality resulting in a hit to PPL scores, and this almost led to its dismissal for being considered worthy of implementing.
+- Tiled GDN is attributed with being the single greatest prefill speed boost achieved on that project
+- The goal here will to adapt that work into this project as an environment variable gated option where the user accepts the trade-off
+- Early analysis shows that the Tiled GDN work is highly dependent on a number of precise factors aligning to achieve its astonishing prefill performance
+- Rather than attempt a straight-up copy which after initial analysis appears will break many of the quality assurance guarantees that this delivery repo is aimed at, my goal will instead be to attempt to generalise that work as much as possible into the framework that this repo provides
+- I am not even sure if this is at all possible.  This will be purely an exploratory WIP project
+
 ## Waiting on others (not actionable in this repo)
 
 ### 6. Cross-arch / gfx1100 validation (the gfx1201 port + its Phase 2.5 probe are DONE — see Closed)
