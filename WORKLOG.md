@@ -48,6 +48,8 @@ fallback is the guard against the class.  See `patches/README.md` (2026-09-13 bl
 in place).  First entry: `prompts/prose-rdna-boosts.txt` (16074 B, 5298 tokens, `sha256 fabdec65…`),
 the prompt used for the issue-#30 reproduction and the Protocol-A MTP gate.  The issue-#30 reply now
 points at it instead of pasting the prompt inline, so reported numbers are tied to a committed hash.
+Also added `scripts/extract-generated.py`, the backspace-aware generated-text extractor the purity gate
+hashes with (a naive `sed`/`grep` slice does not reproduce the values).
 
 ## 2026-09-13 (even later) — block-08 amendment (seventh): the fused MoE router is bit-identical — TODO item 19 closed
 

@@ -343,6 +343,7 @@ explicitly requests it.**
 | `patches/` | **the delivery set** (0000-0015: block 00 + blocks 01-15) + apply README |
 | `scripts/apply-all.sh` | the verified apply flow (`git am` block 00 + blocks 01-15, automatic `git am -3` fallback on a drifted base) |
 | `scripts/make-patches.sh` | regenerates the set from the fork |
+| `scripts/extract-generated.py` | hashes the generated text from a `llama-cli` log (strips the CLI's backspace stream corrections); the extractor the text-purity gate uses — a naive `sed`/`grep` slice does not reproduce the hashes |
 | `rdna-boosts-all.patch` | the entire 16-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `prompts/` | versioned, hash-stable test prompts for the decode/MTP/coherence gates; each prompt's size + token count + **sha256** is recorded in `prompts/README.md`, and a shipped prompt is **never edited in place** (add a new file).  A reported throughput/acceptance/purity result is only valid against the prompt hash it names |

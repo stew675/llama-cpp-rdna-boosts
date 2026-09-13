@@ -48,7 +48,30 @@ build/bin/llama-cli -m "$MODEL" --spec-type draft-mtp -md DRAFT.gguf \
   -c 32768 -b 2048 -ub 2048 -ctk f16 -ctv f16 -fa auto -ngl 99 -lv 4
 ```
 
-See `benchmarks/mtp-adaptive-methodology.md` for the full gate.  When reporting a result, quote the
-prompt path + hash, the model/draft files, the build (`git rev-parse HEAD` of the stock base and the
-applied tree of the patched arm) and the full command lines — see the issue-#30 reproduction report
-for the shape of that provenance block.
+See `benchmarks/mtp-adaptive-methodology.md` for the full gate.
+
+### Build-validity: text purity
+
+Run plain / `n_max 3` / `n_max 7` with the same prompt, seed and greedy sampler, and hash the generated
+text with `scripts/extract-generated.py`.  A correct build is byte-identical across the three (the
+multi-token verify batch must compute the same thing as single-token decode); an impure build differs.
+Run with `-n 64` and **without** `-lv 4` (the verbose log interleaves statistics lines into the
+generated text).
+
+```sh
+for spec in "--spec-type none" \
+            "--spec-type draft-mtp -md DRAFT.gguf --spec-draft-n-max 3" \
+            "--spec-type draft-mtp -md DRAFT.gguf --spec-draft-n-max 7"; do
+  build/bin/llama-cli -m "$MODEL" $spec -f "$PROMPT" \
+    -n 64 --seed 42 --temp 0 --single-turn --no-display-prompt \
+    -c 32768 -b 2048 -ub 2048 -ctk f16 -ctv f16 -fa auto -ngl 99 > run.log 2>&1
+  scripts/extract-generated.py run.log
+done
+```
+
+The helper strips llama-cli's backspace (`\b`) stream corrections before slicing the generated span;
+a naive `sed`/`grep` slice does **not** reproduce the hashes.
+
+When reporting a result, quote the prompt path + hash, the model/draft files, the build
+(`git rev-parse HEAD` of the stock base and the applied tree of the patched arm) and the full command
+lines — see the issue-#30 reproduction report for the shape of that provenance block.
