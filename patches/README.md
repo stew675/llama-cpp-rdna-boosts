@@ -102,11 +102,32 @@ applied tree == canonical.  Four upstream commits collided with the delivery:
 
 * **`16378d93f` "CUDA/HIP: Flash Attention tuning (gfx1201) (#28102)"** — rewrote the AMD-WMMA
   gate block 04 owns, the `(256,256,32/64)` config cases, upstream's AMD `switch_ncols2`
-  preference and `should_use_stream_k`.  **Head-to-head:** upstream's WMMA prefill tuning makes the
-  4B `q4_0` decode/verify band **impure** (`W=1` vs `W>=2`); the block-04 `(256,256,32/64)` configs
+  preference and `should_use_stream_k`.  Head-to-head on the 27B (head 256), single R9700,
+  `llama-bench -r 3`, built as two `.so` variants and measured interleaved:
+
+  | built-in `q8_0` | pp2048 | pp16384 | tg128 |
+  |---|---|---|---|
+  | PURE (ours) | 902.41 | 843.71 | 28.73 |
+  | upstream FA | 902.02 | **847.95** | 28.75 |
+
+  `f16`: PURE pp2048 903.8–907.4 / pp16384 843.7–845.0 / tg128 29.13–29.14; upstream FA pp2048
+  903.8–904.3 / pp16384 **851.0–851.5** / tg128 29.15.  On the 4B Q8_0 both are within noise
+  (`q8_0` pp2048 5432/5348 vs 5387/5341, `f16` 5389/5385 vs 5373/5377; decode flat).
+
+  Upstream's tuning buys **~+0.5 % (q8_0) to +0.9 % (f16) at 27B `pp16384`**, and is flat at
+  `pp2048`/decode and on the 4B.  But it makes the 4B `q4_0` decode/verify band **impure**
+  (`W=1 2b4c0165dc73567d` vs `W>=2 98e60bfd6e242b47`); the block-04 `(256,256,32/64)` configs
   (and no AMD `switch_ncols2` block) restore the whole band to one hash, **byte-identical to the
-  (18) delivery** (`q4_0 bb6ae482f50502b3`).  Upstream's `should_use_stream_k` (`DKQ == 64`) and
-  gate threshold are kept (purity-neutral, preserve upstream's stream-K preference).
+  (18) delivery** (`q4_0 bb6ae482f50502b3`).  Per the purity-first rule the sub-1 % long-prefill
+  gain is **not** taken; upstream's `should_use_stream_k` (`DKQ == 64`) and gate threshold are kept
+  (purity-neutral, and they preserve upstream's stream-K preference).
+
+  > **Open finding (latent width sensitivity).**  The impurity is triggered by the *prefill* path
+  > yet shows up as a `W=1` vs `W>=2` **decode** difference for `q4_0` only, while the TILE decode
+  > is width-invariant by construction.  The shipped build reproduces the validated (18) hashes
+  > exactly (4B/27B, all eight KV types), so it is as pure as the recorded delivery — but the
+  > underlying prefill-sensitive width sensitivity is worth a proper upstream-quality repro rather
+  > than being treated as fully explained.
 * **`5a4d0feca` "CUDA: replace `GGML_FA_ALL_QUANTS` with `GGML_FA_QUANTS`"** — block 08's
   `q4_1`/`q5_0`/`q5_1` + `iq4_nl` enablement is re-homed: `iq4_nl` joins `FA_TYPES`, the default
   `GGML_CUDA_FA_QUANTS` is the eight diagonals, `ggml_cuda_get_fattn_vec_case()` gains the 15

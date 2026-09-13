@@ -71,81 +71,38 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 
 ## Current state
 
-The current delivery is a **16-patch set** (block 00 + blocks 01-15) for
-llama.cpp at the fork
-point `9113cc188` (blocks 00-15 in `patches/`, applied with `git am` via
-`scripts/apply-all.sh`; canonical 16-block tip `907799de3`, net tree
-`c2e284c2acc032238ef85cb35d427c1598ed0949`, rebuilt at the
-fork point; block 15 promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`; block 02 amended 2026-09-12 with the rollback-bounded chunked-GDN threshold
-(`n_rs_batch`) and the pre-batch snapshot slots, block 13 amended 2026-09-11 with the MoE
-decode/verify mmvq band and the fused shared-expert epilogue band, block 14 amended 2026-09-11 with the hyper-connection band, the QSA
-decode arm and the iq4_nl QSA enablement and 2026-09-12 with the configurable QSA prefill arm
-(default `0` = QSA prefill always) + the device-query arm gate, the MTP-export logits-purity fix,
-and the QSA indexer-score decode/verify band-uniformity fix (`ne11 = 4 * n_tps` crossed
-`MMVF_MAX_BATCH_SIZE` at `n_tps = 3`, so the verify batch fell to MMF while decode stayed on MMVF and
-flipped a top-k near-tie; the band now stays on MMVF), and block 08 amended 2026-09-11 with the `iq4_nl` FA
-enablement -- qwen4exp and the MoE are both width-pure for `--spec-draft-n-max <= 7` now, and every
-KV cache type the delivery supports takes the f16 path -- see the WORKLOG entries)
-fork point); block 13 was amended again 2026-09-11 with the MoE `MUL_MAT_ID`
-decode/verify dispatch fix (**+6.2% MoE decode**) and the `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE` kill-switch (see the WORKLOG entry -- the
-decode-only fused shared-expert window is the accepted MoE decode!=verify
-residual).  **Block 15 (the attention-memory campaign) was promoted on
-2026-09-12** to `patches/0015` (previously staged in
-`archive/work/block-15-campaign-wins/`) -- the notes below are its promotion record.
-The set applies
-**whitespace-clean** (strict `git am`, no 3-way fallback) and each block
-is build- and coherence-verified — see [`MANIFESTS.md`](MANIFESTS.md)
-(apply order + verification contract), [`patches/README.md`](patches/README.md)
-(per-block notes, env knobs, server config) and
-[`BASELINE.md`](BASELINE.md) (fork point + drift policy).
+- **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
+  **`790cf51aa`** (re-based 2026-09-13; previously `9113cc188`).
+- Patches `patches/0000-…0015-…`, applied with **strict 16/16 `git am`** by
+  `scripts/apply-all.sh` (no 3-way fallback, whitespace-clean).
+- Canonical 16-block chain: tip `43ec14228c60b0b8cb90205365c8e0aabec8bc7b`,
+  net tree `5cc664170a29cd78975f8679936d4d0adf28c605`.
+- Greedy purity: plain decode == `draft-mtp` verify for
+  `--spec-draft-n-max <= 7` across the supported KV types (4B and 27B all
+  eight; qwen4exp MTP).
+- Every block is build- and coherence-verified.  Detail lives in:
+  [`WORKLOG.md`](WORKLOG.md) (dated record, newest first),
+  [`patches/README.md`](patches/README.md) (per-block notes, env knobs, server
+  config), [`MANIFESTS.md`](MANIFESTS.md) (apply order + verification contract)
+  and [`BASELINE.md`](BASELINE.md) (fork point + drift policy).
 
-All delivery-affecting changes (block amendments, community-fix
-integrations, re-baselines, regenerations) are tracked as dated entries
-— newest first — in **[`WORKLOG.md`](WORKLOG.md)**; the current-state
-summary below is deliberately short and does not repeat them.
+**Latest change (2026-09-13) — re-base onto master `790cf51aa` (70 commits).**
+Four upstream clashes resolved (`16378d93f` gfx1201 FA tuning, `5a4d0feca`
+`GGML_FA_QUANTS`, `d4abd573f` MoE MMQ `ncols_opt`, `311d4211b` indexer V
+cache).  The FA head-to-head kept the block-04 head-256 configs: upstream's
+WMMA prefill tuning is worth only ~+0.5–0.9 % at 27B `pp16384` (flat at
+`pp2048`/decode, nothing on the 4B) and breaks 4B `q4_0` decode/verify width
+purity; upstream's `should_use_stream_k` preference and gate threshold are
+kept.  Validation: `test-backend-ops` 18061/18061; 4B/27B width probes, the
+27B 8-type text gate and qwen4exp 3-GPU MTP all pure and **byte-identical to
+the previous delivery**; rule-5 batched bench and 27B server MTP equal to it
+and ahead of stock `9113cc188`.  Full record:
+[`WORKLOG.md`](WORKLOG.md) 2026-09-13 and the 2026-09-13 section of
+[`patches/README.md`](patches/README.md).
 
-- **Latest entry (2026-09-12): block 15 (attention-memory campaign)
-  promoted to the delivery** — the beta patch is now
-  `patches/0015-rdna-boosts-block-15-campaign-memory-wins.patch`, so the
-  set is **16 patches** (`0000`-`0015`, block 00 + blocks 01-15) and
-  `scripts/apply-all.sh` / `make-patches.sh` are 16-block flows (block 15
-  is applied with `git am` like every other block; the earlier
-  "beta patch applied manually on top" flow is gone).  Canonical 16-block
-  tip `907799de3`, net tree `c2e284c2acc032238ef85cb35d427c1598ed0949`;
-  strict **16/16** `git am` on a fresh worktree at `9113cc188`, zero
-  whitespace warnings, applied tree == the re-validated beta tree.  The
-  promoted patch is byte-identical to
-  `archive/work/block-15-campaign-wins/block-15-campaign-wins.patch` except its
-  `From <sha>` line.  The seven wins keep their env gates: **W1**
-  QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived QSA
-  per-block bias + visibility + input-fill null guards
-  (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), **W3** keys-only
-  QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), **W4** ggml-alloc unused-view
-  release (no gate), **V3** derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by
-  default), **V4** native q8_0 K/V and **V5** native bf16 K/V (both behind
-  `GGML_CUDA_FA_KV_NATIVE`, **opt-in, default 0**).  Re-validated 2026-09-11
-  against the then-15-patch delivery and re-cut onto the current base
-  2026-09-12: every reserve number reproduces to the last decimal
-  (qwen4exp ub 2048 compute 6690.40 → 3251.39 MiB/GPU, host 1262.70 →
-  63.69, indexer KV 956.26 → 318.76; dense 4B 1800.33 → 1001.13, 27B
-  1920.33 → 1121.13; a further −744/−632 MiB/GPU with V4), the width
-  probe reproduces the delivered reference hashes
-  (1 GPU `4089b4d4`, 2-GPU tensor `a4817ee6`, 3-GPU tensor `91434ea9`;
-  `W=9` divergent as accepted), `V4/V5` on == off bit-identically, coherence
-  is byte-identical across gates on 4B / both SWA gemmas / 27B (short +
-  40k) / qwen4exp, the op suites pass (`FLASH_ATTN_EXT` 7859/7859 ROCm0 +
-  CPU, `GATED_DELTA_NET` 46/46, `FLASH_ATTN_QSA` 22/22), the MTP gate is
-  unchanged (27B `0.76744`, qwen4exp `0.44262`), and W4 round-trips
-  56.00 → 16.00 MiB.  Cost ~1.3 % prefill / ~0.3 % decode (V4 ~1.7 %,
-  V5 0.2-2.4 %).  One accepted caveat (do not re-report): W2's derived
-  per-block bias is not bit-exact for `iq4_nl` (its greedy text/MTP
-  acceptance differ from the delivery's while the sparse-arm PPL is
-  identical at `6.5244`; `GGML_QSA_DERIVED_*=0` restores the delivery's
-  values).  Full record: `patches/README.md` (block-15 promotion section),
-  [`WORKLOG.md`](WORKLOG.md) and
-  [`archive/work/block-15-campaign-wins/README.md`](archive/work/block-15-campaign-wins/README.md)
-  (marked PROMOTED).
-
+All delivery-affecting changes (block amendments, community-fix integrations,
+re-baselines, regenerations) are tracked as dated entries — newest first — in
+**[`WORKLOG.md`](WORKLOG.md)**; this section holds only the latest one.
 
 ## Layout
 
@@ -225,11 +182,11 @@ summary below is deliberately short and does not repeat them.
 # 1. fresh clone of llama.cpp, at the fork point
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
-git checkout 9113cc188        # the SHA recorded in patches/README.md
+git checkout 790cf51aa        # the SHA recorded in patches/README.md
 
-# 2. apply the set (automated; VERIFIED 2026-08-29, re-verified 2026-09-01/02/05/06/07 and 2026-09-08)
+# 2. apply the set (automated; re-verified 2026-09-13 on the `790cf51aa` base)
 bash <path-to-this-repo>/scripts/apply-all.sh .
-#    = git am patches/0000…0014  (one commit per block on a fresh `rdna-boosts` branch)
+#    = git am patches/0000…0015  (one commit per block on a fresh `rdna-boosts` branch)
 
 # 3. build + verify (trim -DGPU_TARGETS to your GPU arch for a faster build)
 cmake -B build -DGGML_HIP=ON -DGGML_HIP_RCCL=1 -DGPU_TARGETS="gfx1100;gfx1151;gfx1201" -DCMAKE_BUILD_TYPE=Release
@@ -252,7 +209,7 @@ git add -A && git commit -m "rdna-boosts: block 15: campaign memory wins"
 
 ## When upstream master moves
 
-The patches are static against `9113cc188`. When upstream drifts and hunks
+The patches are static against `790cf51aa`. When upstream drifts and hunks
 no longer apply, regenerate the whole set from the fork with
 `scripts/make-patches.sh` (needs the `~/llama.cpp` fork checkout, which
 carries the block commits), then update

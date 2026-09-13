@@ -15,14 +15,31 @@ The delivery moved from the 2026-09-08 fork point `9113cc188` to current master
   line block 04 owns (`Q->ne[0] <= 128` -> `<= 256`, plus a `> (ne0 <= 128 ? 8 : 16)` batch
   threshold), the `(256,256,32/64)` MMA config cases, upstream's AMD `switch_ncols2` preference
   (`gqa % 8/4/2` -> ncols1 8/4/2) and `should_use_stream_k` (stream-K on AMD only for `DKQ == 64`).
-  **Head-to-head result (gfx1201):** upstream's WMMA *prefill* tuning **breaks the 4B decode/verify
-  width purity** — with upstream's `(256,256,32/64)` configs the 4B `q4_0` probe is impure
-  (`W=1 2b4c0165dc73567d` vs `W>=2 98e60bfd6e242b47`), and with our block-04 configs the whole band
-  returns to **one hash, byte-identical to the (18) delivery** (`q4_0 bb6ae482f50502b3`).  The
-  27B was pure either way.  Resolution: keep our **block-04 `(256,256,32/64)` configs** and
-  drop upstream's AMD `switch_ncols2` block; **keep** upstream's `should_use_stream_k`
-  (`DKQ == 64`) and its gate threshold (both are purity-neutral here and preserve upstream's
-  stream-K preference).  Full validation below.
+  **Head-to-head result (gfx1201, 27B head 256, single R9700, `llama-bench -r 3`, two `.so`
+  variants measured interleaved):**
+
+  | built-in `q8_0` | pp2048 | pp16384 | tg128 |
+  |---|---|---|---|
+  | PURE (ours) | 902.41 | 843.71 | 28.73 |
+  | upstream FA | 902.02 | **847.95** | 28.75 |
+
+  `f16`: PURE pp16384 843.7–845.0, upstream 851.0–851.5 (~+0.8 %); pp2048/tg flat; 4B Q8_0 within
+  noise on both.  So upstream's tuning is worth only **~+0.5–0.9 % at `pp16384`**, flat elsewhere —
+  but it **breaks the 4B decode/verify width purity** (`q4_0` `W=1 2b4c0165dc73567d` vs
+  `W>=2 98e60bfd6e242b47`), while our block-04 configs return the whole band to **one hash,
+  byte-identical to the (18) delivery** (`q4_0 bb6ae482f50502b3`).  Resolution: keep our
+  **block-04 `(256,256,32/64)` configs** and drop upstream's AMD `switch_ncols2` block; **keep**
+  upstream's `should_use_stream_k` (`DKQ == 64`) and its gate threshold (both are purity-neutral
+  here and preserve upstream's stream-K preference).  Per the purity-first rule the sub-1 %
+  long-prefill gain is not taken.
+
+  > **Open finding:** the impurity is triggered by the *prefill* path yet appears as a `W=1` vs
+  > `W>=2` **decode** difference for `q4_0` only, while the TILE decode is width-invariant by
+  > construction.  The shipped build reproduces the validated (18) hashes exactly, so it is as pure
+  > as the recorded delivery, but the underlying prefill-sensitive width sensitivity deserves a
+  > proper upstream-quality repro rather than being considered fully explained.
+
+  Full validation below.
 * **`5a4d0feca` — CUDA: replace `GGML_FA_ALL_QUANTS` with `GGML_FA_QUANTS`** rewrote the FA-quant
   selection.  Block 08's 2026-09-11 enablement (`q4_1`/`q5_0`/`q5_1` and the 15 `iq4_nl` vec
   instances) is re-homed onto the new mechanism: `iq4_nl` is added to `FA_TYPES` in
