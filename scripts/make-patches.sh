@@ -7,9 +7,9 @@
 #   baseline-sha  the upstream baseline the patches are generated against
 #                 (default: 790cf51aa, see MANIFESTS.md)
 #   blocks-tip    the fork commit carrying block 00 + all 15 feature
-#                 blocks (default: 0f4f83f9ef01ffd1662f58d714d62b9155325a62,
+#                 blocks (default: c45244c728dfcbcad86ae95aa97ae76f94ee9f7f,
 #                 the block-15 commit of the
-#                 CANONICAL fork rebuilt at 9113cc188, after the 2026-09-11
+#                 CANONICAL fork rebuilt at 790cf51aa, after the 2026-09-11
 #                 block-13 amendment -- the MoE decode/verify mmvq band --
 #                 the 2026-09-11 amendments to block 14 (the QSA decode
 #                 arm band, the QSA quantized-KV enablement + the

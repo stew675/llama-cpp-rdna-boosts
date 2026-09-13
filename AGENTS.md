@@ -344,8 +344,11 @@ explicitly requests it.**
 | `BASELINE.md` | fork point, patch provenance, drift policy |
 | `GREEDY-PURITY.md` | the purity rulebook (index + invariants + per-finding claims; read before shipping) — its dated narratives/evidence for the closed cases are in `archive/docs/GREEDY-PURITY-FINDINGS.md` under the same `§` numbers |
 | `patches/` | **the delivery set** (0000-0015: block 00 + blocks 01-15) + apply README |
-| `scripts/apply-all.sh` | the verified apply flow (`git am` block 00 + blocks 01-15, automatic `git am -3` fallback on a drifted base) |
-| `scripts/make-patches.sh` | regenerates the set from the fork |
+| `release.json` | **delivery single source of truth** (fork point, canonical tip/tree, block count, per-artifact sha256) — read by `apply-all.sh`, `validate-set.sh` and CI; regenerate with `scripts/make-release.sh`, never hand-edit the hashes |
+| `scripts/apply-all.sh` | the verified apply flow (`git am` block 00 + blocks 01-15, automatic `git am -3` fallback on a drifted base); on the strict path it asserts the applied tree == `release.json.tree` |
+| `scripts/make-patches.sh` | regenerates the set from the fork (then run `scripts/make-release.sh`) |
+| `scripts/make-release.sh` | regenerates `release.json` (patch hashes + metadata; metadata is inherited unless `--base`/`--tip`/`--tree` are given) |
+| `scripts/validate-set.sh` | cheap delivery gate: checksums + strict apply on a fresh tarball of `release.json.base` + base/applied tree match (runs in `validate.yml`; ~1 min, no Docker) |
 | `scripts/extract-generated.py` | hashes the generated text from a `llama-cli` log (strips the CLI's backspace stream corrections); the extractor the text-purity gate uses — a naive `sed`/`grep` slice does not reproduce the hashes |
 | `rdna-boosts-all.patch` | the entire 16-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
@@ -356,6 +359,8 @@ explicitly requests it.**
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
 | `archive/work/` | closed experiments, preserved for future re-evaluation (includes the completed `wip/` trees archived 2026-09-12) |
 | `baseline/*` branches, `block/*` tags | **historical** pre-block-12 checkpoints — do not use for the current delivery |
+| `.github/workflows/validate.yml` | per-push/PR delivery validation (runs `scripts/validate-set.sh`; no build) |
+| `.github/workflows/docker-ghcr.yml` | **tag-driven** release pipeline (`v*` tag → ROCm images to GHCR + a GitHub Release with the packaged patch set; manual dispatch and weekly schedule also build).  Fork point is read from `release.json`; see `CONTAINERS.md` |
 
 ## Scope policy — RDNA first, other backends uninjured (2026-09-11)
 

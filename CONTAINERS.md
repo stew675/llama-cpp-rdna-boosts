@@ -7,10 +7,11 @@ container images to the GitHub Container Registry.
 It does **not** rebuild or ship the patches themselves; it re-creates the
 patched tree the same way the consumer workflow does:
 
-1. download upstream `ggml-org/llama.cpp` at the fork point (`9113cc188`)
+1. download upstream `ggml-org/llama.cpp` at the fork point (`790cf51aa`)
    as a tarball (no full history),
-2. `git init` + one base commit, then `scripts/apply-all.sh` applies
-   `patches/0001..0015` with strict `git am`,
+2. `git init` + one base commit (`git add -A -f`, so upstream-tracked files
+   that match `.gitignore` are kept and the base tree is canonical), then
+   `scripts/apply-all.sh` applies `patches/0000..0015` with strict `git am`,
 3. build with [`.devops/rdna-rocm.Dockerfile`](.devops/rdna-rocm.Dockerfile),
    an adaptation of upstream llama.cpp's `.devops/rocm.Dockerfile`
    (adds `-DGGML_HIP_RCCL=ON`, an RDNA-only `AMDGPU_TARGETS`, and a
@@ -28,7 +29,7 @@ Registry path: `ghcr.io/<owner>/<repo>` (here
 | 7.14 | `rocm/dev-ubuntu-24.04:7.14.1-full`     | `rocm-7.14`, `server-rocm-7.14`, `light-rocm-7.14`, `full-rocm-7.14` |
 | 10.0 | `rocm/dev-ubuntu-24.04:10.0.0-full`     | `rocm-10.0`, `server-rocm-10.0`, `light-rocm-10.0`, `full-rocm-10.0`, `latest` |
 
-Each tag also has an immutable `<tag>-9113cc188` variant pinned to the fork
+Each tag also has an immutable `<tag>-790cf51aa` variant pinned to the fork
 point. `rocm-<version>` is an alias of `server-rocm-<version>` (the serving
 image); `latest` points at the newest ROCm (10.0) server image.
 
@@ -52,29 +53,75 @@ docker run --rm -it \
 If the package is private, authenticate first:
 `echo "$GHCR_TOKEN" | docker login ghcr.io -u <user> --password-stdin`.
 
-## Triggering
+## Triggering and releases
 
+The release pipeline is **tag-driven** (see `.github/workflows/docker-ghcr.yml`):
+
+- push of a `v*` tag — the normal release path (build images, push them, and
+  cut a GitHub Release carrying the packaged patch set),
 - `workflow_dispatch` — pick the ROCm release lines (`7.2 7.14 10.0` by
-  default) and whether to push; unchecking push runs a build-only
-  validation.
-- push to `main`.
-- weekly `schedule` (the images are expensive, so no per-push rebuild).
+  default) and whether to push; unchecking push runs a build-only validation,
+- weekly `schedule` — rebuild the `rocm-*`/`latest` images (no release is cut).
 
-To run it on a feature branch before merging, temporarily add that branch to
-`on.push.branches` (or merge first and use `workflow_dispatch`, which GitHub
-only exposes once the workflow is on the default branch).
+Ordinary commits to `main` (docs / `WORKLOG.md` / `benchmarks/`) do **not**
+trigger the container build; they run
+[`.github/workflows/validate.yml`](.github/workflows/validate.yml) instead,
+which applies the patch set and checks it against `release.json` in about a
+minute.  Building the nine images (3 ROCm lines x 3 targets) for a docs commit
+was wasted runner time, and it let a docs push fail at `git am` when the
+workflow's fork point had gone stale — the breakage this split exists to
+prevent.
 
-The fork point is the `FORK_POINT` env var in the workflow; bump it (and the
-patch set) together when the delivery is re-based.
+### Cutting a release
+
+`release.json` is the single source of truth: the fork point, the canonical
+upstream tree of that fork point, the canonical tip/tree of the applied set,
+the block count, and the sha256 of every shipped artifact.  `apply-all.sh`,
+`validate-set.sh` and the workflows all read it, so the fork point cannot
+drift out of sync in one place while another stays stale.
+
+To cut a release after a re-base or a block amendment:
+
+```bash
+# refresh the artifact hashes (metadata is inherited from the existing file)
+./scripts/make-release.sh
+# or, on a re-base, set all four metadata values together:
+./scripts/make-release.sh \
+  --base <new-base-sha> \
+  --base-tree "$(git -C ~/llama.cpp rev-parse <new-base-sha>^{tree})" \
+  --tip  <canonical-block-15-tip> \
+  --tree "$(git -C ~/llama.cpp rev-parse <canonical-block-15-tip>^{tree})"
+
+./scripts/validate-set.sh          # strict apply + tree/hash/checksum gate
+
+# freeze it: annotated tag on the commit that carries this release.json
+git tag -a v16-<base-sha> -m "rdna-boosts v16 against llama.cpp <base-sha>"
+git push origin main v16-<base-sha>
+```
+
+The `v*` tag push runs the container matrix and then creates the GitHub
+Release with `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json` and
+`SHA256SUMS` attached.  Consumers can pin the tag and verify the checksums
+instead of tracking a moving `main`.
+
+The `tree` field in `release.json` is the strongest check available: CI
+rebuilds the patched source from a tarball and asserts the resulting git tree
+is byte-for-byte the recorded canonical tree.  If it fails, the patch set
+and/or the recorded base are not the delivery.
+
+To run the container build for a branch before tagging, use
+`workflow_dispatch` (merge first, since GitHub only exposes it once the
+workflow is on the default branch).
 
 ## Local build
 
 `docker`/`podman` can build the same image without the workflow:
 
 ```bash
-# 1. patched source tree
+# 1. patched source tree (the fork point comes from release.json)
+base="$(jq -r .base release.json)"
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 9113cc188
+git checkout "$base"
 bash <this-repo>/scripts/apply-all.sh .
 # 2. build
 docker build -f <this-repo>/.devops/rdna-rocm.Dockerfile \

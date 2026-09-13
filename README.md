@@ -21,6 +21,21 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 - What changed recently: [`WORKLOG.md`](WORKLOG.md)
 - Current status and validation: [Current state](#current-state)
 
+## Releases
+
+Frozen deliveries are published as GitHub Releases and tagged in this repo
+(e.g. **`v16-790cf51aa`** — the tag names the block count and the fork point).
+Each release carries `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
+and `SHA256SUMS`, so a consumer can pin a tag and verify the artifacts instead
+of tracking a moving `main`.
+
+`release.json` is the delivery's single source of truth (fork point, canonical
+tip/tree, block count, per-artifact sha256); `scripts/apply-all.sh`,
+`scripts/validate-set.sh` and CI all read it.  The container pipeline is
+**tag-driven**, so ordinary commits to `main` (docs / benchmarks / `WORKLOG.md`)
+only run the cheap patch validation — see [`CONTAINERS.md`](CONTAINERS.md) for
+the release process and the prebuilt ROCm images.
+
 ## Supported architectures
 
 The set targets the **RDNA3 / RDNA3.5 / RDNA4** GPU families:

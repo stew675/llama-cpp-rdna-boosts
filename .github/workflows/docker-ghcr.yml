@@ -1,21 +1,39 @@
-# Build llama.cpp with the rdna-boosts patch set applied and publish ROCm
-# container images to GHCR.
+# Release pipeline: build llama.cpp with the rdna-boosts patch set applied,
+# publish ROCm container images to GHCR, and cut a GitHub Release carrying the
+# packaged patch set.
+#
+# This workflow is TAG-DRIVEN.  It runs for a `v*` tag (a frozen delivery), on
+# manual dispatch, and on the weekly schedule.  Ordinary commits to main
+# (docs / WORKLOG / benchmarks churn) do NOT trigger it -- those are covered
+# by validate.yml.  Documentation churn used to fan out into nine multi-hour
+# container builds and, worse, could fail at `git am` over a stale fork point.
+#
+# release.json is the single source of truth (fork point, canonical tip/tree,
+# block count, per-artifact sha256).  The base is read from it, and each build
+# asserts the reconstructed tree equals release.json.tree, so the workflow can
+# no longer drift from the patch set.
 #
 # Pipeline:
-#   1. shallow-download upstream llama.cpp at the recorded fork point
-#      (codeload tarball by SHA -- no full history),
-#   2. `git init` + base commit, then apply patches/0000..0015 (block 00 +
-#      blocks 01-15) with scripts/apply-all.sh (strict `git am`),
-#   3. build the full / light / server images from .devops/rdna-rocm.Dockerfile
-#      against ROCm 7.2 (complete base), 7.14 and 10.0 (full base),
-#   4. push to ghcr.io/<owner>/<repo>.
+#   1. read release.json + resolve the ROCm build matrix,
+#   2. shallow-download upstream llama.cpp at release.json.base (codeload
+#      tarball by SHA -- no full history; `git add -A -f` so upstream-tracked
+#      files that match .gitignore are kept and the base tree is canonical),
+#   3. apply patches/0000..0015 with scripts/apply-all.sh (strict `git am`)
+#      and assert the applied tree == release.json.tree,
+#   4. build the full / light / server images against ROCm 7.2 (complete
+#      base), 7.14 and 10.0 (full base),
+#   5. push to ghcr.io/<owner>/<repo> and, when every build passed, create the
+#      GitHub Release with the patch set + SHA256SUMS.
 #
 # Reference: upstream llama.cpp's .github/workflows/docker.yml and
 # .devops/rocm.Dockerfile.
 
-name: Build and publish ROCm containers (GHCR)
+name: Release ROCm containers + patch set
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       rocm_versions:
@@ -28,20 +46,18 @@ on:
         required: true
         default: true
         type: boolean
-  push:
-    branches:
-      - main
   schedule:
     # Weekly rebuild: the images are expensive, no need for per-push builds.
     - cron: "23 5 * * 0"
 
 concurrency:
-  group: docker-ghcr-${{ github.ref }}
-  cancel-in-progress: true
+  # A release must not be cancelled mid-push; group by ref so a new tag never
+  # clobbers an in-flight release.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
-  FORK_POINT: 9113cc188
   UPSTREAM_TARBALL: https://codeload.github.com/ggml-org/llama.cpp/tar.gz
 
 permissions:
@@ -50,11 +66,35 @@ permissions:
 
 jobs:
   prepare:
-    name: Resolve build matrix
+    name: Resolve release manifest and build matrix
     runs-on: ubuntu-24.04
     outputs:
+      base: ${{ steps.r.outputs.base }}
+      tree: ${{ steps.r.outputs.tree }}
+      n_blocks: ${{ steps.r.outputs.n_blocks }}
       matrix: ${{ steps.m.outputs.matrix }}
     steps:
+      - name: Check out delivery repo
+        uses: actions/checkout@v5
+
+      - name: Read release.json
+        id: r
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f release.json
+          base="$(jq -r '.base' release.json)"
+          tree="$(jq -r '.tree' release.json)"
+          n_blocks="$(jq -r '.n_blocks' release.json)"
+          test -n "$base" && test "$base" != "null"
+          test -n "$tree" && test "$tree" != "null"
+          {
+            echo "base=$base"
+            echo "tree=$tree"
+            echo "n_blocks=$n_blocks"
+          } >> "$GITHUB_OUTPUT"
+          echo "release.json: base=$base tree=$tree blocks=$n_blocks"
+
       - name: Build matrix from requested ROCm versions
         id: m
         shell: bash
@@ -86,27 +126,37 @@ jobs:
         include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - name: Check out delivery repo (patches + Dockerfile)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Clone upstream at the fork point and apply the rdna-boosts set
+      - name: Reconstruct the patched source tree
+        env:
+          BASE: ${{ needs.prepare.outputs.base }}
+          N_BLOCKS: ${{ needs.prepare.outputs.n_blocks }}
+          EXPECTED_TREE: ${{ needs.prepare.outputs.tree }}
         run: |
           set -euo pipefail
           git config --global user.email "ci@rdna-boosts.invalid"
           git config --global user.name "rdna-boosts CI"
           src="$GITHUB_WORKSPACE/llama-src"
           mkdir -p "$src"
-          curl -fsSL -o /tmp/llama.tar.gz "${UPSTREAM_TARBALL}/${FORK_POINT}"
+          curl -fsSL -o /tmp/llama.tar.gz "${UPSTREAM_TARBALL}/${BASE}"
           tar -xzf /tmp/llama.tar.gz -C "$src" --strip-components=1
           cd "$src"
           git init -q .
-          git add -A
-          git commit -q -m "llama.cpp ${FORK_POINT} (base)"
+          # -f: the tarball contains upstream-tracked files that match
+          # .gitignore (e.g. build-xcframework.sh, benches/**/*.log); a plain
+          # `git add -A` silently drops them and the base tree is not the
+          # canonical upstream tree.
+          git add -A -f
+          git commit -q -m "llama.cpp ${BASE} (base)"
           bash "$GITHUB_WORKSPACE/scripts/apply-all.sh" .
-          # base commit + one commit per block patch (derive the count so it
-          # cannot go stale when a block is added)
-          n_blocks="$(find "$GITHUB_WORKSPACE/patches" -maxdepth 1 -name '[0-9][0-9][0-9][0-9]-*.patch' | wc -l)"
-          test "$(git rev-list --count HEAD)" -eq "$((n_blocks + 1))"
-          git log --oneline -"$n_blocks"
+          test "$(git rev-list --count HEAD)" -eq "$((N_BLOCKS + 1))"
+          applied="$(git rev-parse HEAD^{tree})"
+          if [ "$applied" != "$EXPECTED_TREE" ]; then
+            echo "ERROR: applied tree $applied != release.json tree $EXPECTED_TREE" >&2
+            exit 1
+          fi
+          git log --oneline -"$N_BLOCKS"
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
@@ -132,11 +182,13 @@ jobs:
       - name: Compute image names and tags
         id: tags
         shell: bash
+        env:
+          BASE: ${{ needs.prepare.outputs.base }}
         run: |
           set -euo pipefail
           image="${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/${GITHUB_REPOSITORY#*/}"
           v="${{ matrix.rocm }}"
-          fp="${FORK_POINT}"
+          fp="${BASE}"
           {
             echo "image=$image"
             echo "full=${image}:full-rocm-${v},${image}:full-rocm-${v}-${fp}"
@@ -168,8 +220,8 @@ jobs:
             AMDGPU_VERSION=${{ matrix.rocm_version }}
             ROCM_IMAGE_SUFFIX=${{ matrix.rocm_suffix }}
             BUILD_DATE=${{ steps.date.outputs.value }}
-            APP_VERSION=${{ env.FORK_POINT }}
-            APP_REVISION=${{ env.FORK_POINT }}
+            APP_VERSION=${{ needs.prepare.outputs.base }}
+            APP_REVISION=${{ needs.prepare.outputs.base }}
           cache-from: type=registry,ref=${{ steps.tags.outputs.cache }}
           cache-to: type=registry,ref=${{ steps.tags.outputs.cache }},mode=max
 
@@ -188,8 +240,8 @@ jobs:
             AMDGPU_VERSION=${{ matrix.rocm_version }}
             ROCM_IMAGE_SUFFIX=${{ matrix.rocm_suffix }}
             BUILD_DATE=${{ steps.date.outputs.value }}
-            APP_VERSION=${{ env.FORK_POINT }}
-            APP_REVISION=${{ env.FORK_POINT }}
+            APP_VERSION=${{ needs.prepare.outputs.base }}
+            APP_REVISION=${{ needs.prepare.outputs.base }}
           cache-from: type=registry,ref=${{ steps.tags.outputs.cache }}
           cache-to: type=registry,ref=${{ steps.tags.outputs.cache }},mode=max
 
@@ -208,7 +260,59 @@ jobs:
             AMDGPU_VERSION=${{ matrix.rocm_version }}
             ROCM_IMAGE_SUFFIX=${{ matrix.rocm_suffix }}
             BUILD_DATE=${{ steps.date.outputs.value }}
-            APP_VERSION=${{ env.FORK_POINT }}
-            APP_REVISION=${{ env.FORK_POINT }}
+            APP_VERSION=${{ needs.prepare.outputs.base }}
+            APP_REVISION=${{ needs.prepare.outputs.base }}
           cache-from: type=registry,ref=${{ steps.tags.outputs.cache }}
           cache-to: type=registry,ref=${{ steps.tags.outputs.cache }},mode=max
+
+  release:
+    name: Package GitHub Release
+    needs: [prepare, build]
+    # Only for a tag push: a dispatch/schedule run must not cut a release.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out delivery repo
+        uses: actions/checkout@v5
+
+      - name: Assemble release assets
+        run: |
+          set -euo pipefail
+          tar czf patches.tar.gz patches/
+          sha256sum rdna-boosts-all.patch release.json patches/*.patch > SHA256SUMS
+          echo "=== SHA256SUMS ==="
+          cat SHA256SUMS
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE: ${{ needs.prepare.outputs.base }}
+          TREE: ${{ needs.prepare.outputs.tree }}
+          N_BLOCKS: ${{ needs.prepare.outputs.n_blocks }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          image="${REGISTRY}/${owner_lc}/${repo}"
+          notes="llama.cpp fork point \`${BASE}\`, canonical tree \`${TREE}\`, ${N_BLOCKS} patches (block 00 + blocks 01-15).
+
+          Apply with \`scripts/apply-all.sh\` on a fresh llama.cpp checkout at \`${BASE}\`; verify the artifacts against \`SHA256SUMS\`.
+
+          Container images (ROCm 7.2 / 7.14 / 10.0):
+
+          - \`${image}:server-rocm-<version>\` (alias \`${image}:rocm-<version>\`)
+          - \`${image}:light-rocm-<version>\`
+          - \`${image}:full-rocm-<version>\`
+          - immutable \`...-<version>-${BASE}\` variants and \`${image}:latest\` (ROCm 10.0)"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" --clobber \
+              rdna-boosts-all.patch patches.tar.gz release.json SHA256SUMS
+          else
+            gh release create "$tag" \
+              --title "rdna-boosts ${tag}" \
+              --notes "$notes" \
+              rdna-boosts-all.patch patches.tar.gz release.json SHA256SUMS
+          fi

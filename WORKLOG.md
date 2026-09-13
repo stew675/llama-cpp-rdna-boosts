@@ -1,6 +1,57 @@
 # WORKLOG — dated delivery records
 
-## 2026-09-13 (latest) — issue #30 clamp policy: `--spec-draft-n-max` is raised from 7 to 15 (block 01) + the QSA decode-arm band fix (block 14)
+## 2026-09-13 (latest) — release infrastructure: tag-driven CI, `release.json` as single source of truth, first tagged release `v16-790cf51aa`
+
+**Why.**  The GHCR container workflow failed on every push to `main`.  The run failed *before*
+Docker, in all three matrix jobs, at `git am`:
+
+```
+error: patch failed: common/speculative.cpp:1621
+error: common/speculative.cpp: patch does not apply
+...
+error: sha1 information is lacking or useless (common/arg.cpp).
+error: could not build fake ancestor
+```
+
+Two independent bugs.  **(1) A stale fork point:** the workflow pinned `FORK_POINT: 9113cc188`, but the
+delivery had been re-based onto `790cf51aa` the same day; the `git am -3` fallback could never rescue
+it, because a fresh `git init` over a codeload tarball has none of the preimage blobs named in the
+patches' `index` lines.  **(2) The tarball recipe dropped tracked files:** `git add -A` honours
+`.gitignore`, so three upstream-tracked files (`build-xcframework.sh` via `/build*`,
+`benches/dgx-spark/run-aime-120b-t8-x8-high.log` via `*.log`, and an Xcode `xcshareddata` plist) were
+dropped and the reconstructed base tree was `b19ff2b596…` instead of the canonical
+`97726d37607304e0215f19aee6af7fd33d1e65d4`.  `git add -A -f` restores the exact tree.
+
+**Redesign (delivery infrastructure, no `patches/` content change).**
+
+- **`release.json` is now the single source of truth** — fork point, canonical base tree, canonical
+  tip/tree, block count, and the sha256 of every artifact.  `apply-all.sh`, `validate-set.sh` and both
+  workflows read it, so the fork point can no longer drift in one place while another stays stale.
+- **`scripts/make-release.sh`** regenerates it (patch hashes are derived; the metadata is inherited
+  unless `--base`/`--base-tree`/`--tip`/`--tree` are passed on a re-base).
+- **`scripts/validate-set.sh`** is the cheap gate (~1 min, no compiler/Docker): artifact checksums +
+  strict `git am` on a fresh tarball of `release.json.base` + base-tree and applied-tree equality.
+- **`.github/workflows/validate.yml`** (new) runs that gate on every push/PR.
+- **`.github/workflows/docker-ghcr.yml`** is now **tag-driven**: `push.tags: ["v*"]`, manual dispatch and
+  the weekly schedule.  The `push: branches: [main]` trigger — the "spawn nine image builds per docs
+  commit" behaviour — is **removed**.  The base is read from `release.json`, each build asserts the
+  reconstructed tree equals `release.json.tree`, and a `release` job (only on a tag) creates the GitHub
+  Release with `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json` and `SHA256SUMS`.
+- **`scripts/apply-all.sh`** asserts the applied tree == `release.json.tree` on the strict path (so a
+  stale fork point fails immediately, even outside CI).  `actions/checkout` bumped v4 -> v5.
+- Docs: `CONTAINERS.md` (release process), `README.md` (#Releases), `AGENTS.md` layout table.
+
+**First release.**  `release.json` now records `release: v16-790cf51aa`, `base: 790cf51aa`,
+`base_tree: 97726d37607304e0215f19aee6af7fd33d1e65d4`, `tip: c45244c728dfcbcad86ae95aa97ae76f94ee9f7f`,
+`tree: a5683e1b008e3ad197ac2a9e3f99e5b0652df7d4`, `n_blocks: 16`.  Annotated tag **`v16-790cf51aa`**
+created on the commit carrying this manifest; the tag push runs the container matrix and cuts the
+GitHub Release.
+
+**Clean-apply / verification.**  `scripts/validate-set.sh` PASSES locally against a fresh
+`790cf51aa` codeload tarball: checksums OK, base tree == `97726d3760…`, strict 16/16 `git am`, applied
+tree == `a5683e1b008e…`.  This is the exact CI step reproduced outside CI.
+
+## 2026-09-13 — issue #30 clamp policy: `--spec-draft-n-max` is raised from 7 to 15 (block 01) + the QSA decode-arm band fix (block 14)
 
 **Mission (issue #30 follow-up).**  The `--spec-draft-n-max` clamp had to be re-decided: the maintainer
 wants depth 15, and the park reason was a claim that depth > 7 allows **rewind-induced recurrent (chunked

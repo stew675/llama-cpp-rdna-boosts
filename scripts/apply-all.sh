@@ -7,7 +7,7 @@
 #   rdna-boosts-repo     path to THIS repo (default: parent of scripts/)
 #
 # Requires a clean llama.cpp working tree checked out at the baseline SHA
-# recorded in MANIFESTS.md (currently 790cf51aa).  All 16 blocks are applied
+# recorded in release.json / MANIFESTS.md (currently 790cf51aa).  All 16 blocks are applied
 # with `git am` (plain `git apply` of the concatenated series silently drops
 # hunks -- verified 2026-08-29), one commit each with the block subject.
 # Block 00 (structural and architecture fixes) is applied first; every other
@@ -23,6 +23,15 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LLAMA="${1:-$(pwd)}"
 RDNA="${2:-$REPO_DIR}"
 PATCHES="$RDNA/patches"
+
+# release.json is the delivery's single source of truth (fork point, canonical
+# tip/tree, artifact hashes); see scripts/make-release.sh.  Optional, so the
+# script still works from a checkout that predates the manifest.
+RELEASE_JSON="$RDNA/release.json"
+RELEASE_TREE=""
+if [ -f "$RELEASE_JSON" ] && command -v jq >/dev/null 2>&1; then
+    RELEASE_TREE="$(jq -r '.tree // empty' "$RELEASE_JSON")"
+fi
 
 cd "$LLAMA"
 
@@ -62,6 +71,21 @@ if [ "$APPLIED_WITH_3WAY" -eq 1 ]; then
 else
     echo "All $N_BLOCKS patches applied cleanly (strict git am) and committed on branch $BRANCH:"
 fi
+
+# On the strict path, assert the reconstructed tree is byte-for-byte the
+# canonical delivery tree recorded in release.json.  Catches a stale fork
+# point or a partially regenerated patch set immediately (rather than letting
+# a wrong tree reach the build).
+if [ -n "$RELEASE_TREE" ] && [ "$APPLIED_WITH_3WAY" -eq 0 ]; then
+    applied_tree="$(git rev-parse HEAD^{tree})"
+    if [ "$applied_tree" != "$RELEASE_TREE" ]; then
+        echo "ERROR: applied tree $applied_tree != release.json tree $RELEASE_TREE" >&2
+        echo "ERROR: the checkout base and/or the patch set do not match the recorded delivery" >&2
+        exit 1
+    fi
+    echo "Applied tree matches release.json ($RELEASE_TREE)."
+fi
+
 git log --oneline -$N_BLOCKS
 echo
 echo "Build (uses your system ROCm install; see patches/README.md for the full env-knob list):"

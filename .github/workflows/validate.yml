@@ -1,0 +1,43 @@
+# Cheap delivery validation -- runs on every push and pull request.
+#
+# This is the gate that catches a stale fork point / drifted patch set in
+# about a minute, instead of letting three multi-hour container matrix jobs
+# fail at `git am` (which is exactly what happened on 2026-09-13: the
+# workflow's FORK_POINT had gone stale after the re-base onto 790cf51aa).
+#
+# It does NOT build anything and does NOT touch Docker/GHCR.  The expensive
+# release pipeline lives in docker-ghcr.yml and is tag-driven.
+#
+# Checks (scripts/validate-set.sh, driven by release.json):
+#   * every patches/*.patch matches its recorded sha256,
+#   * rdna-boosts-all.patch matches its recorded sha256,
+#   * the set applies strictly (no 3-way fallback) on a fresh tarball of
+#     release.json.base,
+#   * the reconstructed base tree == release.json.base_tree,
+#   * the applied tree / commit count == release.json.tree / n_blocks.
+
+name: Validate delivery set
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Apply and verify the patch set
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out delivery repo
+        uses: actions/checkout@v5
+
+      - name: Validate against release.json
+        run: bash scripts/validate-set.sh
