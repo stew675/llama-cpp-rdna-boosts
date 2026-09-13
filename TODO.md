@@ -52,7 +52,7 @@ the device-query arm gate replacing the mirrored type list — so **Active is no
   WORKLOG entry.
 - Leads: the dense/sparse topology-flip sync the qwen4exp graph documents, and the per-type indexer op
   counts (`iq4_nl` runs *fewer* `k_argsort`/`soft_max` dispatches than `q4_0`).  Instruments:
-  `rocprofv3 --kernel-trace` + the `[GD]` graph dump (`wip/kv-quant-purity-followups/tools/`), and
+  `rocprofv3 --kernel-trace` + the `[GD]` graph dump (`archive/work/kv-quant-purity-followups/tools/`), and
   `tools/qperf.sh` for the interleaved per-type table.  Analysis: `GREEDY-PURITY.md` §22.
 
 ## Waiting on others (not actionable in this repo)
@@ -67,7 +67,7 @@ the device-query arm gate replacing the mirrored type list — so **Active is no
     verification goal, not a port; also item 7's MTP crossover re-measure (item 4 is closed).
 - **Tracker hygiene:** the plan's own open checkboxes are **stale** (Phase 1 is complete and the doc
   predates qwen4exp's promotion to block 14); read the banner at the top of
-  `wip/qwen4exp/gfx1201-porting.md` before trusting them.
+  `archive/work/qwen4exp/gfx1201-porting.md` before trusting them.
 
 ### 8. Dual 7900XTX (gfx1100, community): block-12 validation
 - Hybrid HIP all-reduce on RDNA3 **pairs** is being validated by a community member on their dual-7900XTX
@@ -92,7 +92,7 @@ the device-query arm gate replacing the mirrored type list — so **Active is no
   (2026-09-12 (8)).**  `process_tile` sizes the per-thread accumulator as `J*I/(nwarps*32)` while the
   AMD-WMMA vec_dot indexes up to `J/2-1`, so any config with `I < nwarps*16` silently corrupts
   (deterministic for J=128, racy for J=48/24).  Root cause + full evidence matrix:
-  `wip/archive/qwen4exp/discovery/2026-09-06-strix-halo-gfx1151-mmq-j128-latent-defect.md`.  Upstream
+  `archive/work/wip-archive/qwen4exp/discovery/2026-09-06-strix-halo-gfx1151-mmq-j128-latent-defect.md`.  Upstream
   ships **no** violating config (every `mmq-config-*.cuh` row keeps `I >= nwarps*16`) and the block-13
   rows never violate it either, so there is no upstream reproducer to file.
 - **V3 prefill cost is arch-dependent (item 5(g)) — accepted.**  gfx1151 measured −3.2 % at pp20480
@@ -125,27 +125,27 @@ the device-query arm gate replacing the mirrored type list — so **Active is no
 - **Restore the block-13 RDNA3_5 single-token fusion perf (item 16).**  The ~0.9 % `tg128` the purity
   skip costs; the proposed "pin `nwarps`/`rps`/item-split" fix is **invalid** (the two arms are already
   launch-identical).  Live candidates: codegen (`has_fusion` register pressure / FMA contraction) and the
-  Q8_1 cache.  Low priority — the skip is the accepted purity trade.  `wip/strix-halo/rdna35-mmvq-fusion-purity/README.md` §9.
+  Q8_1 cache.  Low priority — the skip is the accepted purity trade.  `archive/work/strix-halo/rdna35-mmvq-fusion-purity/README.md` §9.
 - **`-Wshadow` cleanup for `src/` (item 15).**  Audited: 128 warnings / 27 files, 46 in the risky
   "shadows a local variable" class.  Wants a dedicated cleanup commit (~20 upstream files) to avoid
-  colliding on every re-base.  `wip/shadow-warnings/RECORD-2026-09-12-shadow-audit.md`.
+  colliding on every re-base.  `archive/work/shadow-warnings/RECORD-2026-09-12-shadow-audit.md`.
 - **MoE topk fusion adoption (item 5(a)).**  ~0.5 % prefill for a ~188 MB arena cost and a numerics fork
   (fused top1 logit 18.424 -> 18.690 vs the unfused reference), so it needs a quality gate before it can
-  be trusted.  `wip/archive/qwen4exp/discovery/2026-09-06-strix-halo-gfx1151-launch-overhead-topk.md`.
+  be trusted.  `archive/work/wip-archive/qwen4exp/discovery/2026-09-06-strix-halo-gfx1151-launch-overhead-topk.md`.
 - **`ssm_alpha` + `ssm_beta` single-walk fusion (item 5(b)).**  ~0.3-0.6 % prefill, blocked by the graph
   expansion order (the two MMs are non-adjacent) -> needs a graph restructure or load-time stacked
-  weights.  `wip/archive/qwen4exp/discovery/2026-09-06-strix-halo-gfx1151-cijk-dense-gemm.md`.
+  weights.  `archive/work/wip-archive/qwen4exp/discovery/2026-09-06-strix-halo-gfx1151-cijk-dense-gemm.md`.
 
 ### LFRU host→GPU slow hot-weight migration
 - Survivor of the expert-tiering experiment (dropped 2026-09-05 — most of its aims are already covered by
   current llama.cpp options).  The one idea left: an LFRU-style very slow migration of hot weights from
   host to GPU (persistent GPU slot cache + CPU-computed cold tail).  Design notes:
-  `wip/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
+  `archive/work/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
 
 - **Block 15 promoted to the delivery (TODO item 1, closed 2026-09-12).**  The attention-memory campaign
-  was promoted from `beta/block-15-campaign-wins/` to `patches/0015-rdna-boosts-block-15-campaign-memory-wins.patch`;
+  was promoted from `archive/work/block-15-campaign-wins/` to `patches/0015-rdna-boosts-block-15-campaign-memory-wins.patch`;
   the delivery is now a **16-patch set** (block 00 + blocks 01-15) with `scripts/apply-all.sh` /
   `make-patches.sh` as 16-block flows.  Canonical 16-block tip **`0f4f83f9ef01ffd1662f58d714d62b9155325a62`**,
   net tree **`c3142fe0b311757f458647f172f623859f5bc983`**; strict **16/16** `git am` on a fresh worktree at
@@ -156,12 +156,12 @@ the device-query arm gate replacing the mirrored type list — so **Active is no
   0); the revalidation reproduced every reserve number to the last decimal and the width-probe reference
   hashes, with byte-identical coherence across gates and the MTP gate unchanged (`draft-mtp` acceptance must
   stay > ~0.45).  The W2-`iq4_nl` ULP caveat is accepted and recorded.  See `patches/README.md` (the
-  block-15 promotion section), `WORKLOG.md` and `beta/block-15-campaign-wins/README.md` (PROMOTED).
+  block-15 promotion section), `WORKLOG.md` and `archive/work/block-15-campaign-wins/README.md` (PROMOTED).
 
 - **QSA sparse-regime width purity (TODO item 4, closed 2026-09-12 (12); sub-item (b) re-opened and root-caused/fixed 2026-09-12 (13), block-14 amendment (eighth); gfx1151 cross-check validated 2026-09-12 (14)).**  Sub-item (a), the `embeddings_nextn` MTP-export last-layer gather deferral, is fixed — the last layer always gathers its output rows and builds a separate full-row tail for `t_h_nextn` — so the prefill logits are bit-identical to `--spec-type none` (`mstep NEXTN=1` 0 mismatches, was 1 at `pos = 4293`).  Sub-item (b) was a **width dependence** (the QSA indexer score's flattened `ne11 = 4 * n_tps` crossed `MMVF_MAX_BATCH_SIZE` at `n_tps = 3`, putting the verify batch on MMF while decode stayed on MMVF); the eighth amendment keeps the whole flattened band on the decode family, so `W = 1..8` is bit-identical with the W=1 `Thash` unchanged.  **gfx1151 cross-check (item 17, closed 2026-09-12 (14)):** the recorded forced-sparse `plain != draft-mtp` text residual is gone (`a57bc13bbf2a` both, was n3 `3124adfd2b94`; first diff char 458 pre-fix), all eight native KV types (f16/bf16/q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl) are pure at n_max 1/2/3/5/7, and the mstep `W = 1,2,3,4,5,8` matrix is 0 mismatches (only q8_0/q5_0 were ever impure pre-fix).  See `WORKLOG.md` 2026-09-12 (12)/(13)/(14) and `patches/README.md`.
 
 **The GDN recurrent-state rollback bound (`n_rs_batch`) + the pre-batch snapshot slot (landed 2026-09-12 (10), block-02 amendment).**
-Integrated from the gfx1201 investigation in `~/ngram-mod/` (record `wip/gdn-rs-rollback/`, originals
+Integrated from the gfx1201 investigation in `~/ngram-mod/` (record `archive/work/gdn-rs-rollback/`, originals
 copied in).  The whole-batch chunked GDN kernel writes no rollback snapshots and assumed a batch above
 `max(K, 16)` is never rolled back into — false when a long-draft speculator is enabled
 (`n_rs_seq` comes from `speculative.draft.n_max` = 7 while `--spec-ngram-mod-n-max` can draft 64), so
@@ -197,7 +197,7 @@ answer — and under `-sm tensor` the Meta device's `all_of()` *is* the meta-spl
 in a reserve-time graph).  Gates: strict 15/15 apply (tree == canonical), `FLASH_ATTN_QSA` 22/22,
 predicate table 0 mismatches (with `D=80` newly rejected), default byte-identical to pre-amendment,
 beta block-15 re-cut 14th on the new base (which also folded the missing `nullptr, nullptr` argument
-into the beta commit).  Record: `wip/strix-halo/qsa-item9/RECORD-2026-09-12-qsa-prefill-crossover.md`;
+into the beta commit).  Record: `archive/work/strix-halo/qsa-item9/RECORD-2026-09-12-qsa-prefill-crossover.md`;
 `GREEDY-PURITY.md` §26; `WORKLOG.md` 2026-09-12 (9).
 
 **Item 11 — the MXFP4 fused gate+up+GLU MMQ is not reachable; the type-list enablement is a no-op (closed 2026-09-12 (8)).**
@@ -236,7 +236,7 @@ items were artifacts of the block-13 RDNA3_5 mmvq fusion (fixed the same day), a
 **keeps the 64K crossover** (sparse wins deep decode).  A pure per-*perf* MTP-side crossover re-measure
 is parked — no purity driver.  The one recorded residual (the q8_0/q5_0 forced-sparse item) is now
 fixed (block-14 amendment (eighth); gfx1151 cross-check validated 2026-09-12 (14));
-record `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`, analysis `GREEDY-PURITY.md` §18.
+record `archive/work/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`, analysis `GREEDY-PURITY.md` §18.
 
 **The gfx1151 within-band mmvq fusion variance (block 13, closed 2026-09-12 (2)).**  The 2026-09-11
 block-13 band work made the *standalone* mmvq path `W = 1..8`-uniform, but on gfx1151 two
@@ -251,7 +251,7 @@ fusions) and `ggml_cuda_mul_mat_id_weighted_rdna3_5_ok`, both RDNA3_5-only unles
 f16 `453eaa61`, q8_0 `113696b9`, MoE 35B-A3B `18999a78`; the 27B dense (`e165ef98`) was already pure and
 is unchanged; cost ≈ −0.9 % `tg128` (the purity-first trade, follow-up = item 16).  Canonical tip
 `13af95ac1`, tree `f4791066f4a582316b1ca95f51c96cd10b905ef7`; `GREEDY-PURITY.md` §25, `WORKLOG.md`
-2026-09-12 (2), `wip/strix-halo/rdna35-mmvq-fusion-purity/README.md`.
+2026-09-12 (2), `archive/work/strix-halo/rdna35-mmvq-fusion-purity/README.md`.
 
 **The fused shared-expert epilogue's band cost (TODO item 10, closed 2026-09-12).**  The
 band-uniformity fix's `grid = (nrows, ncols)` launch shape (one block per `(output row, token)`,
@@ -276,7 +276,7 @@ prefill, tg flat), with two wording corrections: the Q4_K model *does* take the 
 `mul_mat_q_routed_compact` launches per pp512 — the real control is that the dispatch is prefill-only, 0
 launches in a `tg` run), and `GGML_CUDA_DISABLE_MMQ_ROUTED=1` isolates only the compact *enumeration*
 (the per-expert J selection stays active in both arms).  What remains is validation on other boxes — see
-item 6.  The plan doc (`wip/qwen4exp/gfx1201-porting.md`) carries a status banner; its checkboxes are
+item 6.  The plan doc (`archive/work/qwen4exp/gfx1201-porting.md`) carries a status banner; its checkboxes are
 stale.
 
 **Issue #25's GDN plain-vs-MTP divergence (2026-09-11 (12)) — FIXED and re-verified.**  The `K`-dependent
@@ -289,7 +289,7 @@ fully-snapshot-safe fallback.  **Re-verified 2026-09-11 (12) on the current tree
 `--spec-type none == draft-mtp n_max 1 == 4 == 5` → all `299566b902bb` (2727 chars), byte-identical.
 (With `GGML_CUDA_GDN_CHUNKED=0` the plain text differs → `60777872b890`, which is the expected
 chunked-vs-sequential kernel difference, not a plain-vs-spec divergence.)  The stale status lines in
-`wip/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-{FOLLOWUP,FIX}.md` (they still describe the opt-in
+`archive/work/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-{FOLLOWUP,FIX}.md` (they still describe the opt-in
 `GGML_CUDA_GDN_ALIGN_BOUNDARY` fix, a gate that no longer exists) are corrected there.
 
 **Block 15 dense-arm blocker (2026-09-11 (11)) — FIXED, one line.**  `LLAMA_QSA_SPARSE_FA=0` gave PPL
@@ -299,12 +299,12 @@ the node dump (the map: the delivery consumed `attn_inp_kq_mask` 36×, the beta 
 (`kq_mask=1` … `outer_top_k=0`).  Ninth beta re-cut: base `6d3155faa` → tip `3712e2dc1`, tree
 `e39f8c2b6f0593113b93c4e57c512bc7373a2250`, patch 3 811 lines; oracle sparse `6.5394` / dense `6.5377`,
 dense texts and random-text PPL byte-identical to the delivery, production arm untouched.  Details:
-`wip/block15-dense-arm/HANDOVER-2026-09-11-block15-dense-arm.md`, `WORKLOG.md` 2026-09-11 (11),
-`GREEDY-PURITY.md` §23, `beta/block-15-campaign-wins/BETA-TESTING.md` §4c.  Follow-ups filed: `-Wshadow`
+`archive/work/block15-dense-arm/HANDOVER-2026-09-11-block15-dense-arm.md`, `WORKLOG.md` 2026-09-11 (11),
+`GREEDY-PURITY.md` §23, `archive/work/block-15-campaign-wins/BETA-TESTING.md` §4c.  Follow-ups filed: `-Wshadow`
 (item 15) and the residual `iq4_nl` W2 sensitivity (accepted, above).
 
 **KV-quant purity / parity campaign — ALL CLOSED (2026-09-11).**  Brief, evidence and tooling:
-`wip/kv-quant-purity-followups/` (`README.md` + `tools/`); analysis: `GREEDY-PURITY.md` §14–§22.
+`archive/work/kv-quant-purity-followups/` (`README.md` + `tools/`); analysis: `GREEDY-PURITY.md` §14–§22.
 - **F1** (`q8_0`/`q4_0` dense-band impurity) — FIXED as a block-08 amendment: the FA kernel-family
   chooser returned VEC for `n_q <= 2` with a quantized K/V and TILE above; the branch is deleted (the
   whole band is TILE), all four split configs `W=1..8` bit-identical, cost tg128 −0.5…−0.9 %.
@@ -327,9 +327,9 @@ dense texts and random-text PPL byte-identical to the delivery, production arm u
 - 2026-09-11 block 02: the K-independent whole-batch chunked GDN prefill (`GGML_CUDA_GDN_ALIGN_BOUNDARY`
   and its K-dependent branches deleted, + rollback guard) — `patches/README.md`.
 - 2026-09-06 sched-gate fix (`c63f7f2a0` / delivery `d6eb551`) validated on both arches; the pre-reboot
-  "flake" was a degraded box.  Records: `beta/qwen4exp/README.md`, `wip/qwen4exp/gfx1201-porting.md`.
+  "flake" was a degraded box.  Records: `beta/qwen4exp/README.md`, `archive/work/qwen4exp/gfx1201-porting.md`.
 - 2026-09-06 WS4 Strix Halo hc-prefill-fusion gates PASSED (depth-0 pp +5.2–8.8 %, decode flat) —
-  `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws4-hc-fusion-gates.md`.
+  `archive/work/wip-archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws4-hc-fusion-gates.md`.
 - 2026-09-06 real determinism root cause fixed (the indexer top-k `atomicAdd` gather scrambled the QSA
   list order run-to-run; replaced with an ascending count/scan/write) + the stale-cell zeroing port.
 - 2026-09-05 WS3 #2 (QSA dense-shortcut artifact) root-caused to `ggml_gallocr_reserve_n_probe` /
@@ -353,15 +353,15 @@ dense texts and random-text PPL byte-identical to the delivery, production arm u
 
 ## Where the current lists live
 
-- Remaining gfx1151 work + the 2026-09-12 TODO audit: `wip/strix-halo/HANDOVER-2026-09-12-remaining-gfx1151.md`.
-- QSA sparse-regime width purity (items 4/7 disposition): `wip/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`.
+- Remaining gfx1151 work + the 2026-09-12 TODO audit: `archive/work/strix-halo/HANDOVER-2026-09-12-remaining-gfx1151.md`.
+- QSA sparse-regime width purity (items 4/7 disposition): `archive/work/strix-halo/RECORD-2026-09-12-qsa-sparse-width.md`.
 - Environment, instruments, reference hashes and the landing procedure for KV/FA work:
-  `wip/kv-quant-purity-followups/HANDOVER-2026-09-11-remaining-work.md` (its §0 status and its items 1/5
+  `archive/work/kv-quant-purity-followups/HANDOVER-2026-09-11-remaining-work.md` (its §0 status and its items 1/5
   and F3 are **superseded** — see the Closed section here).
 - qwen4exp carried-forward open items: `beta/qwen4exp/README.md` ("Open items (carried forward from WIP)").
 - Delivery verification contract + dated records: `MANIFESTS.md`, `patches/README.md`, `WORKLOG.md`,
   `AGENTS.md` headers.
 - Purity/invariant analysis and the instrument rules: `GREEDY-PURITY.md`.
 - Benchmarks + gates: `benchmarks/` (the adaptive-MTP baseline gate: `mtp-adaptive-methodology.md`).
-- Memory campaign (wins, V3/V4 plans, Block 15 record — now promoted to `patches/0015`): `beta/block-15-campaign-wins/HANDOVER.md`,
+- Memory campaign (wins, V3/V4 plans, Block 15 record — now promoted to `patches/0015`): `archive/work/block-15-campaign-wins/HANDOVER.md`,
   `README.md`, `BETA-TESTING.md`; upstream PR candidates: `upstream/README.md`.

@@ -264,4 +264,4 @@ canonical, update `patches/README.md` + `WORKLOG.md` + the AGENTS/README/MANIFES
 - model: `https://huggingface.co/ilintar/qwen3.8-flash-next-gguf-strix-halo` (uniform IQ4_NL, 93.16 GiB;
   also `ilintar/qwen3.8-27b-gguf-strix-halo`)
 - halogen-flash (the other co-designed stack, for contrast): `https://github.com/peonist-ai/halogen-flash-server`
-- this repo: `TODO.md` item 3, `GREEDY-PURITY.md` §22, `wip/kv-quant-purity-followups/`
+- this repo: `TODO.md` item 3, `GREEDY-PURITY.md` §22, `archive/work/kv-quant-purity-followups/`

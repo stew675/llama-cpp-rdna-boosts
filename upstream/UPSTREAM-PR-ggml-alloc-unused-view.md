@@ -32,7 +32,7 @@ graph.
 
 ## The repro
 
-`../wip/arch-independent-memory/repro/ggml-alloc-unused-view.c` — self-contained, CPU backend, public
+`../archive/work/arch-independent-memory/repro/ggml-alloc-unused-view.c` — self-contained, CPU backend, public
 `ggml_gallocr_*` API, 12 layers x 4 MiB.  `argv[1]=1` builds the idiom (dangling side-effect copies),
 `argv[1]=0` consumes the copies.  Build/run recipe in the file header.
 

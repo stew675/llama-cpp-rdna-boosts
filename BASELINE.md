@@ -33,7 +33,7 @@ bottom of this file): block 00 = the structural/architecture fixes added
 2026-09-10 (FA small-batch KV-split width invariance + Vulkan masked-V), and
 blocks 01-15 = the fork's `rdna-boosts` block
 commits on `9113cc188` (the canonical 16-block tip is block 15
-`0f4f83f9e`, promoted 2026-09-12 from `beta/block-15-campaign-wins/`, on top of the 2026-09-12 (13) block-14 QSA indexer-score decode/verify band-uniformity fix -> `d306d4b4b`; block 02 amended 2026-09-11 with the
+`0f4f83f9e`, promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`, on top of the 2026-09-12 (13) block-14 QSA indexer-score decode/verify band-uniformity fix -> `d306d4b4b`; block 02 amended 2026-09-11 with the
 K-independent whole-batch chunked GDN prefill and again 2026-09-12 with the rollback-bounded
 chunked threshold (`n_rs_batch`, long-draft speculators) + the pre-batch snapshot slots (free; the
 `GGML_CUDA_GDN_ALIGN_BOUNDARY` gate and its K-dependent branches removed; +
@@ -44,7 +44,7 @@ new vec instances, `dequantize_q4_nl`, the non-contiguous converters), and block
 2026-09-12 with the RDNA3_5 single-token-only mmvq fusion skip, and block 14
 amended 2026-09-11 with the hyper-connection decode/verify band fix, the QSA decode arm, the QSA
 quantized-KV enablement + K/V-head chunking fix and the `iq4_nl` QSA/CPU-oracle/test entries;
-**block 15, the attention-memory campaign, is the last delivery patch** -- promoted 2026-09-12 from `beta/block-15-campaign-wins/`,
+**block 15, the attention-memory campaign, is the last delivery patch** -- promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`,
 see `patches/README.md` and `WORKLOG.md`); the reference `~/llama.cpp`
 `rdna-boosts` branch is *disposable* and had at cut time drifted two
 upstream master commits past the fork point — `f3f1a8f27` (iGPU lazy-
@@ -427,7 +427,7 @@ re-stamp: the gfx1151 campaign docs had run a week ahead of the real
 calendar; all `wip/`/`beta/`/archive dates were collapsed onto the real
 git dates (2026-09-05/06) and the moved benchmark records'
 `benchmarks/2026-09-*` references repointed at
-`wip/archive/qwen4exp/discovery/`.
+`archive/work/wip-archive/qwen4exp/discovery/`.
 
 ## Re-baseline to 050dde50c + block 14 (2026-09-07, dated record)
 
