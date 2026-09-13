@@ -26,6 +26,7 @@ recall passage (K).
 * Drafter: the MTP head built into the model GGUF (`blk.64.nextn.*`, `nextn_predict_layers = 1`).
   **No `-md`**.
 * `-n 3000 --seed 42 --temp 0 --single-turn --no-display-prompt -c 32768 -b 2048 -ub 2048`
+* One run per cell (acceptance is discrete and reproduces exactly; t/s varies by ~1 %).
 
 Prompts: `prompts/reasoning.txt` (R), `prose-rdna-boosts.txt` (P), `code-python.txt` (C),
 `recall.txt` (K).  See `../prompts/README.md`.
