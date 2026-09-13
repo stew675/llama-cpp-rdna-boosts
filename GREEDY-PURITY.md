@@ -385,7 +385,7 @@ acceptance + MTP-vs-plain throughput instead (`benchmarks/mtp-adaptive-methodolo
 it diverges at the first width step (its `calc_nwarps`/`MMVQ_MAX_BATCH_SIZE` dispatch is the same shape).
 
 Records: `patches/README.md` block-12 notes, the 2026-09-11 WORKLOG entry,
-`wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 3.  Narrative (the `n_max` sweep, the
+`archive/work/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 3.  Narrative (the `n_max` sweep, the
 localisation code block, why the GDN was not the boundary): `../archive/docs/GREEDY-PURITY-FINDINGS.md` §11.
 
 ## 12. The guarantee depends on the KV cache type (2026-09-11, measured during the Block-15 revalidation)
@@ -395,7 +395,7 @@ localisation code block, why the GDN was not the boundary): `../archive/docs/GRE
 > pre-fix record, and its F16-staging explanation of the slow types is refined in §14.
 
 Everything above was measured with an **f16** (or bf16) K/V cache.  Extending the probe matrix to every
-same-type KV pair (`tools` + evidence: `wip/kv-quant-purity-followups/README.md`) shows the guarantee is
+same-type KV pair (`tools` + evidence: `archive/work/kv-quant-purity-followups/README.md`) shows the guarantee is
 **not universal in the cache type**:
 
 | K/V cache (same type) | `W = 1..8` (i.e. `n_max <= 7`) | notes |
@@ -423,7 +423,7 @@ Two facts worth keeping straight:
 **Guidance (as of the §12 measurements; `q8_0`/`q4_0` are fixed — see §14).**  For plain-vs-speculative greedy purity, use **f16 or bf16** for K and V.  If a q8_0/q4_0
 cache is required, treat plain-vs-spec text equality as *not* guaranteed and gate on adaptive-MTP
 acceptance/throughput instead.  Mixed K/V *types* are a rejected configuration (see
-`beta/block-15-campaign-wins/README.md` §7) and are irrelevant to this table.  This table is orthogonal
+`archive/work/block-15-campaign-wins/README.md` §7) and are irrelevant to this table.  This table is orthogonal
 to Causes A and B in §11: those are about the *fork's* widths and the FA kernel switch, this is about
 which dequant kernels the cache type selects.
 
@@ -605,7 +605,7 @@ does, and `GGML_CUDA_DISABLE_FUSION=1` / `GGML_CUDA_GDN_CHUNKED=0` each perturb 
 tracked as TODO item 4.
 
 **Extended the same day (2026-09-12 (6)) — it is *not* a width dependence.**  A multi-step,
-teacher-forced replay (new instrument `wip/strix-halo/qsa-item4/mstep.cpp`) of the plain greedy sequence
+teacher-forced replay (new instrument `archive/work/strix-halo/qsa-item4/mstep.cpp`) of the plain greedy sequence
 in the exact residual config is **bit-pure at every verify width** — 200 positions, `W = 1..8`, with a
 spec-like batch+rollback schedule (`RB`), with deliberately unrelated tokens in the rolled-back rows
 (`JUNK`), and with `n_rs_seq` 0 vs 2/3 — the recurrent snapshot rollback restore is exact and the
@@ -624,7 +624,7 @@ last-position logits by a ULP** (`ad3acaa7…` vs `b624a79f…`) — a real logi
 leading partial cause, not the whole story.  The residual is therefore a **driver-level (plain-vs-MTP)
 divergence**; the next step is a faithful mini-MTP driver (target + draft + real proposals + driver
 rollback, per-step target-logit dump), because everything cheaper is exhausted.  Repro + instruments:
-`wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`.
+`archive/work/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`.
 
 **Closed 2026-09-12 (12).**  The faithful driver was built on the **real** server loop (a temporary
 target-logits dump in `tools/server/server-context.cpp`, the in-process engine `llama-cli` actually
@@ -647,7 +647,7 @@ putting the verify batch on MMF while decode stayed on MMVF.  **gfx1151 cross-ch
 2026-09-12 (14):** the forced-sparse text residual is gone (`a57bc13bbf2a` both, was n3
 `3124adfd2b94`, first diff char 458), all eight native KV types are pure at n_max 1/2/3/5/7, and
 `mstep` `W = 1,2,3,4,5,8` is 0 mismatches with decode's `Thash` unchanged.  Evidence/records:
-`wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`, `wip/strix-halo/qsa-item4/` (harness).
+`archive/work/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`, `archive/work/strix-halo/qsa-item4/` (harness).
 
 ## 19. Purity first: the measured trade (2026-09-11, policy)
 
@@ -821,7 +821,7 @@ Four lessons that generalise:
    construction; that is the signature.
 3. **`-Wshadow` would have caught this class outright** — the fork does not enable it; enabling it (at
    least for `src/`) would make the failure mode a compile error.  The fix itself is one token.  See the
-   2026-09-12 `-Wshadow` audit (`wip/shadow-warnings/`).
+   2026-09-12 `-Wshadow` audit (`archive/work/shadow-warnings/`).
 4. **The leak instrument to reach for first is random text.**  A model that can see the target predicts
    even noise: `llama-perplexity -f /tmp/rand-text.txt --chunks 1 -c 2560 -b 2560 -ub 2560` gives the
    broken build `1.0205` and a healthy one `19.0589`.  Natural or repetitive text is a *bad* leak
@@ -923,7 +923,7 @@ unchanged: FA's tile→WMMA switch (`Q->ne[1] > 8`) and the `MMVQ_MAX_BATCH_SIZE
 §§11/16-18 are about the decode/verify band; the same structural rule governs the *prefill* side of the
 QSA arch policy, which block 14's 2026-09-12 (sixth) amendment made depth-configurable
 (`qsa_dense_prefill_until`; `patches/README.md`, record
-`wip/strix-halo/qsa-item9/RECORD-2026-09-12-qsa-prefill-crossover.md`).
+`archive/work/strix-halo/qsa-item9/RECORD-2026-09-12-qsa-prefill-crossover.md`).
 
 The invariant, in the form a review can check: **an arm may only be selected from state that is
 identical for every graph that computes the same sequence position — the `n_tokens` *band*
@@ -1017,7 +1017,7 @@ graph.
 **Why the gates missed it until now:** the `plain == draft-mtp` text gates compare *sampled tokens*,
 and a one-ULP logits shift only matters when the argmax is within a ULP of a tie.  The instrument that
 sees it is a teacher-forced per-step logits replay with the export toggled (`mstep` `NEXTN=1` in
-`wip/strix-halo/qsa-item4/`), which went from 1 mismatch at `pos = 4293` to 0.  Generalise: when a
+`archive/work/strix-halo/qsa-item4/`), which went from 1 mismatch at `pos = 4293` to 0.  Generalise: when a
 graph gains an extra output that is read by a *different* consumer, check the batch width of every
 node the logits traverse — and prefer "compute the logits path exactly as the plain arm does, then
 compute the export separately" over "compute once and gather for the logits".  The cost is one extra
@@ -1039,7 +1039,7 @@ by a ULP and flipped a top-k near-tie.
 **Signature to recognise it by:** the forward is *exactly* bit-identical to decode for many steps and
 then diverges once, at a fixed position (here target position 4395, 102 tokens in) - a selection flip,
 not drift.  The greedy **text** may stay equal for a given prompt, so this is a logits-level
-`plain != draft-mtp` violation that text gates cannot see; `mstep` (`wip/strix-halo/qsa-item4/`) is the
+`plain != draft-mtp` violation that text gates cannot see; `mstep` (`archive/work/strix-halo/qsa-item4/`) is the
 instrument, and W=2 pure / W>=3 impure is the clean boundary.
 
 **Instruments that localised it** (worth reusing): a `rocprofv3 --kernel-trace` diff of the two widths -

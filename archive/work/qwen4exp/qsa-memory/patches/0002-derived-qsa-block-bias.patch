@@ -1,0 +1,1162 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 1a8e68103..091d40f6e 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2529,7 +2529,9 @@ extern "C" {
+             struct ggml_tensor  * idx,
+             struct ggml_tensor  * mask,
+             float                 scale,
+-            float                 logit_softcap);
++            float                 logit_softcap,
++            struct ggml_tensor  * cell_vis,
++            struct ggml_tensor  * q_vis);
+ 
+     GGML_API void ggml_flash_attn_qsa_set_prec(
+             struct ggml_tensor * a,
+@@ -2541,13 +2543,27 @@ extern "C" {
+     // fused expand + mask + top-k for the indexer: value[c] = score[cell_blk[c]] + additive[c]
+     // src0: block scores [n_blocks, n_tps, n_stream] F32
+     // src1: cell -> block map [n_kv, n_stream] I32
+-    // src2: per-cell additive [n_kv, n_tps, n_stream] F16 or F32 (attention mask or bias)
++    // src2: per-cell additive [n_kv, n_tps, n_stream] F16 or F32 (attention mask or bias), or
++    //       NULL when the additive is derived from src3/src4 (see below)
++    // src3: per-cell positions [n_kv, n_stream] I32, or NULL (derived visibility: the position of
++    //       the cell in this stream's sequence, -1 for an empty or foreign cell; the kernel then
++    //       adds 0 for a visible cell and -INFINITY for a hidden one, replacing src2)
++    // src4: per-token query positions [n_tps, n_stream] I32, or NULL (required with src3)
++    // src5: per-block bias state [n_blocks, n_stream] I32, or NULL (derived per-block bias: -1 for
++    //       a block that is not complete for this stream, INT32_MAX for the spare block holding
++    //       the unpooled tail cells, else the position of the block's first cell; the caller must
++    //       then NOT add the per-block bias into score0 itself)
++    // src6: per-token tail start [n_tps, n_stream] I32, or NULL (required with src5)
+     // k:   number of top cells to return
+     GGML_API struct ggml_tensor * ggml_indexer_top_k(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * score,
+             struct ggml_tensor  * cell_blk,
+             struct ggml_tensor  * additive,
++            struct ggml_tensor  * cell_pos,
++            struct ggml_tensor  * q_pos,
++            struct ggml_tensor  * blk_idx,
++            struct ggml_tensor  * blk_tail,
+             int                   k);
+ 
+     // Fused indexer block-pool + rms-norm (qwen4exp QSA): replaces the per-op chain
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index a39b4f6ca..5ad0a5027 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -795,7 +795,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+     // K/V by kv-head, result by head); idx and mask are mirrored.
+     auto handle_flash_attn_qsa = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+         GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+-        GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++        // src4 (mask) plus the optional derived-visibility keys are replicated when present; a
++        // null src slot (the mask on the derived path) carries no split state
++        for (size_t i = 4; i < 7; i++) {
++            GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
++                    src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
++        }
+ 
+         GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
+         const bool kv_split = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+@@ -1032,10 +1037,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+                 split_state = handle_flash_attn_qsa(src_ss);
+             } break;
+             case GGML_OP_INDEXER_TOPK: {
+-                // like TOP_K: the row (tps, stream) is the independent unit
+-                GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+-                GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+-                GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++                // like TOP_K: the row (tps, stream) is the independent unit.  every src is
++                // mirrored: the cell map plus the optional derived position/bias compact srcs
++                for (int i = 0; i < GGML_MAX_SRC; ++i) {
++                    if (tensor->src[i] != nullptr) {
++                        GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
++                    }
++                }
+                 split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+             } break;
+             case GGML_OP_INDEXER_SCORE: {
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index cd4122a7d..1f903107f 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9379,6 +9379,12 @@ static void ggml_compute_forward_flash_attn_qsa_f32(
+     const ggml_tensor * idx  = dst->src[3];
+     const ggml_tensor * mask = dst->src[4];
+ 
++    // the derived-visibility form (cell_vis/q_vis, src5/src6) carries no mask tensor; the CUDA
++    // kernel computes the per-cell value inline.  This reference does not implement it.
++    if (dst->src[5] != nullptr) {
++        GGML_ABORT("flash_attn_qsa: the derived cell visibility requires the CUDA backend");
++    }
++
+     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+     GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+@@ -12556,10 +12562,14 @@ static void ggml_compute_forward_indexer_topk_impl(
+     const ggml_tensor * score    = dst->src[0];
+     const ggml_tensor * cell_blk = dst->src[1];
+     const ggml_tensor * additive = dst->src[2];
++    const ggml_tensor * cell_pos = dst->src[3];
++    const ggml_tensor * q_pos    = dst->src[4];
++    const ggml_tensor * blk_idx  = dst->src[5];
++    const ggml_tensor * blk_tail = dst->src[6];
+ 
+     GGML_ASSERT(score->type    == GGML_TYPE_F32);
+     GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
+-    GGML_ASSERT(additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32);
++    GGML_ASSERT(additive == nullptr || additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32);
+     GGML_ASSERT(dst->type      == GGML_TYPE_I32);
+ 
+     const int k = ggml_get_op_params_i32(dst, 0);
+@@ -12579,8 +12589,29 @@ static void ggml_compute_forward_indexer_topk_impl(
+     const int64_t s0 = 0;
+     GGML_UNUSED(s0);
+     const auto cell_value = [&](int64_t c, int64_t row) -> float {
+-        const int b = cell_d[c + (row / n_tps)*n_kv];
+-        const float sc = score_d[b + row*n_blocks];
++        const int64_t s = row / n_tps;
++        const int64_t t = row % n_tps;
++        const int b = cell_d[c + s*n_kv];
++        float sc = score_d[b + row*n_blocks];
++
++        // derived per-block bias: src5 folds in the block bookkeeping, src6 the tail start
++        if (blk_idx != nullptr) {
++            const int    * blk_d = (const int *) blk_idx->data;
++            const int    * tail_d = (const int *) blk_tail->data;
++            const int bi = blk_d[b + s*n_blocks];
++
++            sc += bi < 0 ? -INFINITY : (bi >= tail_d[t + s*n_tps] ? 1e9f : 0.0f);
++        }
++
++        // derived visibility: same predicate as set_input_kq_mask_impl
++        if (cell_pos != nullptr) {
++            const int    * pos_d = (const int *) cell_pos->data;
++            const int    * q_d   = (const int *) q_pos->data;
++            const int cp = pos_d[c + s*n_kv];
++
++            return sc + (cp >= 0 && cp <= q_d[t + s*n_tps] ? 0.0f : -INFINITY);
++        }
++
+         if (additive->type == GGML_TYPE_F32) {
+             const float * add_d = (const float *) additive->data;
+             return sc + add_d[c + row*n_kv];
+diff --git a/ggml/src/ggml-cuda/fattn-qsa.cu b/ggml/src/ggml-cuda/fattn-qsa.cu
+index d61e96a68..1e20d6ddc 100644
+--- a/ggml/src/ggml-cuda/fattn-qsa.cu
++++ b/ggml/src/ggml-cuda/fattn-qsa.cu
+@@ -48,6 +48,10 @@ static __global__ void flash_attn_qsa(
+         const char * V_ptr,
+         const int  * idx_ptr,
+         const char * mask_ptr,
++        const int  * cell_vis_ptr,
++        const int  * q_vis_ptr,
++        const int    nb_cv1,
++        const int    nb_qv1,
+         float      * dst_ptr,
+         float      * parts_ptr,
+         float2     * meta_ptr,
+@@ -110,7 +114,22 @@ static __global__ void flash_attn_qsa(
+     K += nb13*sequence + nb12*(head / gqa_ratio);
+     V += nb23*sequence + nb22*(head / gqa_ratio);
+     idx += col*ne40 + sequence*ne40*ne41; // [n_top_k, n_tps, 1, n_stream]
+-    const half * maskh = (const half *) (mask + nb33*(sequence % ne33) + nb31*col);
++    const half * maskh = mask_ptr != nullptr
++            ? (const half *) (mask + nb33*(sequence % ne33) + nb31*col) : nullptr;
++
++    // the per-cell visibility: derived from the compact keys when they are present (cell_vis is
++    // the cell's compaction key, -1 for an empty or foreign cell; q_vis is the query's key), else
++    // gathered from the mask.  Same values, and the same fp16 constants the mask holds.
++    const int * cell_vis = cell_vis_ptr != nullptr ? cell_vis_ptr + sequence*nb_cv1 : nullptr;
++    const int   q_vis_r  = q_vis_ptr    != nullptr ? q_vis_ptr[col + sequence*nb_qv1] : 0;
++
++    auto qsa_cell_mask = [&](int cell_g) -> half {
++        if (cell_vis != nullptr) {
++            const int cv = cell_vis[cell_g];
++            return cv >= 0 && cv <= q_vis_r ? __float2half(0.0f) : __float2half(-INFINITY);
++        }
++        return maskh[cell_g];
++    };
+ 
+     const int row  = (sequence*int(ne01.z) + col)*ne02 + head;
+     const int k0   = slice*n_slice_cells;
+@@ -211,7 +230,7 @@ static __global__ void flash_attn_qsa(
+                     }
+                 }
+                 if (flat < tile_len) {
+-                    M_smem[flat] = maskh[identity ? tile0 + flat : idx[tile0 + flat]];
++                    M_smem[flat] = qsa_cell_mask(identity ? tile0 + flat : idx[tile0 + flat]);
+                 }
+             }
+             __syncthreads();
+@@ -359,7 +378,7 @@ static __global__ void flash_attn_qsa(
+                 // reads M_smem for every K/V type, but only the F16/Q8_0
+                 // gather wrote it (uninitialized smem otherwise)
+                 if (flat < tile_len) {
+-                    M_smem[flat] = maskh[identity ? tile0 + flat : idx[tile0 + flat]];
++                    M_smem[flat] = qsa_cell_mask(identity ? tile0 + flat : idx[tile0 + flat]);
+                 }
+             }
+             __syncthreads();
+@@ -457,6 +476,8 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
+     const ggml_tensor * V   = dst->src[2];
+     const ggml_tensor * idx = dst->src[3];
+     const ggml_tensor * mask = dst->src[4];
++    const ggml_tensor * cell_vis = dst->src[5];
++    const ggml_tensor * q_vis    = dst->src[6];
+ 
+     cudaStream_t main_stream = ctx.stream();
+ 
+@@ -534,14 +555,20 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
+                 (const char *) K->data,
+                 (const char *) V->data,
+                 (const int  *) idx->data,
+-                (const char *) mask->data,
++                mask != nullptr ? (const char *) mask->data : nullptr,
++                cell_vis != nullptr ? (const int *) cell_vis->data : nullptr,
++                q_vis    != nullptr ? (const int *) q_vis->data    : nullptr,
++                cell_vis != nullptr ? (int) (cell_vis->nb[1]/sizeof(int)) : 0,
++                q_vis    != nullptr ? (int) (q_vis->nb[1]/sizeof(int))    : 0,
+                 (float *) dst->data,
+                 dst_data, meta.ptr, n_slices, n_slice_cells,
+                 scale, logit_softcap, identity, head_base,
+                 Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
+                 K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3],
+                 V->nb[1], V->nb[2], V->nb[3],
+-                mask->ne[0], mask->ne[1], mask->ne[3], mask->nb[1], mask->nb[3],
++                mask != nullptr ? mask->ne[0] : 0, mask != nullptr ? mask->ne[1] : 0,
++                mask != nullptr ? mask->ne[3] : 0, mask != nullptr ? mask->nb[1] : 0,
++                mask != nullptr ? mask->nb[3] : 0,
+                 idx->ne[0], idx->ne[1], idx->ne[3], idx->nb[1], idx->nb[3]);
+         } else {
+             constexpr bool use_logit_softcap = true;
+@@ -550,14 +577,20 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
+                 (const char *) K->data,
+                 (const char *) V->data,
+                 (const int  *) idx->data,
+-                (const char *) mask->data,
++                mask != nullptr ? (const char *) mask->data : nullptr,
++                cell_vis != nullptr ? (const int *) cell_vis->data : nullptr,
++                q_vis    != nullptr ? (const int *) q_vis->data    : nullptr,
++                cell_vis != nullptr ? (int) (cell_vis->nb[1]/sizeof(int)) : 0,
++                q_vis    != nullptr ? (int) (q_vis->nb[1]/sizeof(int))    : 0,
+                 (float *) dst->data,
+                 dst_data, meta.ptr, n_slices, n_slice_cells,
+                 scale, logit_softcap, identity, head_base,
+                 Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
+                 K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3],
+                 V->nb[1], V->nb[2], V->nb[3],
+-                mask->ne[0], mask->ne[1], mask->ne[3], mask->nb[1], mask->nb[3],
++                mask != nullptr ? mask->ne[0] : 0, mask != nullptr ? mask->ne[1] : 0,
++                mask != nullptr ? mask->ne[3] : 0, mask != nullptr ? mask->nb[1] : 0,
++                mask != nullptr ? mask->nb[3] : 0,
+                 idx->ne[0], idx->ne[1], idx->ne[3], idx->nb[1], idx->nb[3]);
+         }
+     }
+diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
+index b15af7104..1b9e63516 100644
+--- a/ggml/src/ggml-cuda/indexer-topk.cu
++++ b/ggml/src/ggml-cuda/indexer-topk.cu
+@@ -44,16 +44,42 @@ static __global__ void indexer_topk_radix_init(indexer_topk_radix_state * states
+     }
+ }
+ 
+-// value(c) for row r: score[cell_blk(c, s), t, s] + additive(c, t, s)
++// value(c) for row r: score[cell_blk(c, s), t, s] + bias(b, t, s) + additive(c, t, s)
++// the per-block bias is already folded into score unless extra.blk_idx is set, and the
++// per-cell additive is the mask (or the bias when blk_bias is off) unless extra.cell_pos is
++struct indexer_topk_extra {
++    const int * cell_pos;   // I32 [n_kv, n_stream], -1 for an empty or foreign cell
++    const int * q_pos;      // I32 [n_tps, n_stream]
++    const int * blk_idx;    // I32 [n_blocks, n_stream], -1 incomplete, INT32_MAX for the spare
++    const int * blk_tail;   // I32 [n_tps, n_stream]
++};
++
+ template<typename kv_t>
+ static __device__ __forceinline__ float indexer_topk_value(
+         const float * __restrict__ score,
+         const int   * __restrict__ cell_blk,
+         const kv_t  * __restrict__ additive,
++        const indexer_topk_extra extra,
+         int c, int t, int s,
+         int n_blocks, int n_tps, int n_kv) {
+     const int b = cell_blk[c + s*n_kv];
+-    const float sc = score[b + t*n_blocks + s*n_blocks*n_tps];
++    float sc = score[b + t*n_blocks + s*n_blocks*n_tps];
++
++    if (extra.blk_idx != nullptr) {
++        // the block's first-cell position against this token's tail start: the tail is the
++        // incomplete block and is always visible.  a foreign block needs no -inf here - the
++        // visibility below drops every one of its cells, and -inf + -inf is still -inf, so
++        // the values (and the selection) stay identical.
++        const int bi = extra.blk_idx[b + s*n_blocks];
++        sc += bi < 0 ? -INFINITY : (bi >= extra.blk_tail[t + s*n_tps] ? 1e9f : 0.0f);
++    }
++
++    if (extra.cell_pos != nullptr) {
++        // same predicate as set_input_kq_mask_impl: empty, foreign and future cells are -inf
++        const int cp = extra.cell_pos[c + s*n_kv];
++        return sc + (cp >= 0 && cp <= extra.q_pos[t + s*n_tps] ? 0.0f : -INFINITY);
++    }
++
+     return sc + (float) additive[c + t*n_kv + s*n_kv*n_tps];
+ }
+ 
+@@ -62,6 +88,7 @@ static __global__ void indexer_topk_radix_histogram(
+         const float * __restrict__ score,
+         const int   * __restrict__ cell_blk,
+         const kv_t  * __restrict__ additive,
++        const indexer_topk_extra extra,
+         const indexer_topk_radix_state * __restrict__ states,
+         int * __restrict__ block_histograms,
+         int ncols, int n_tps, int n_blocks, int n_kv,
+@@ -86,7 +113,7 @@ static __global__ void indexer_topk_radix_histogram(
+          col < ncols;
+          col += blocks_per_row * BLOCK_SIZE) {
+         const uint32_t key = indexer_topk_float_to_ordered(
+-                indexer_topk_value(score, cell_blk, additive, col, t, s, n_blocks, n_tps, n_kv));
++                indexer_topk_value(score, cell_blk, additive, extra, col, t, s, n_blocks, n_tps, n_kv));
+         if ((key & state.prefix_mask) == state.prefix) {
+             atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
+         }
+@@ -148,6 +175,7 @@ static __global__ void indexer_topk_count(
+         const float * __restrict__ score,
+         const int   * __restrict__ cell_blk,
+         const kv_t  * __restrict__ additive,
++        const indexer_topk_extra extra,
+         const indexer_topk_radix_state * __restrict__ states,
+         int * __restrict__ g_cnt, int * __restrict__ e_cnt,
+         int ncols, int n_tps, int n_blocks, int n_kv,
+@@ -163,7 +191,7 @@ static __global__ void indexer_topk_count(
+     int g = 0, e = 0;
+     if (col < ncols) {
+         const uint32_t key = indexer_topk_float_to_ordered(
+-                indexer_topk_value(score, cell_blk, additive, col, t, s, n_blocks, n_tps, n_kv));
++                indexer_topk_value(score, cell_blk, additive, extra, col, t, s, n_blocks, n_tps, n_kv));
+         g = (key >  states[row].prefix) ? 1 : 0;
+         e = (key == states[row].prefix) ? 1 : 0;
+     }
+@@ -226,6 +254,7 @@ static __global__ void indexer_topk_deterministic_write(
+         const float * __restrict__ score,
+         const int   * __restrict__ cell_blk,
+         const kv_t  * __restrict__ additive,
++        const indexer_topk_extra extra,
+         const indexer_topk_radix_state * __restrict__ states,
+         const int * __restrict__ g_base, const int * __restrict__ e_base,
+         int * __restrict__ dst,
+@@ -242,7 +271,7 @@ static __global__ void indexer_topk_deterministic_write(
+     int g = 0, e = 0;
+     if (col < ncols) {
+         const uint32_t key = indexer_topk_float_to_ordered(
+-                indexer_topk_value(score, cell_blk, additive, col, t, s, n_blocks, n_tps, n_kv));
++                indexer_topk_value(score, cell_blk, additive, extra, col, t, s, n_blocks, n_tps, n_kv));
+         g = (key >  states[row].prefix) ? 1 : 0;
+         e = (key == states[row].prefix) ? 1 : 0;
+     }
+@@ -279,6 +308,7 @@ template<typename kv_t>
+ static void indexer_topk_radix_cuda(
+         ggml_cuda_pool & pool,
+         const float * score, const int * cell_blk, const kv_t * additive,
++        const indexer_topk_extra extra,
+         int * dst, int ncols, int nrows, int n_tps, int n_blocks, int n_kv, int k,
+         cudaStream_t stream) {
+     constexpr int BLOCK_SIZE = 256;
+@@ -297,7 +327,7 @@ static void indexer_topk_radix_cuda(
+     for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+         indexer_topk_radix_histogram<BLOCK_SIZE, RADIX_BITS, kv_t>
+             <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+-                score, cell_blk, additive, states, histograms,
++                score, cell_blk, additive, extra, states, histograms,
+                 ncols, n_tps, n_blocks, n_kv, blocks_per_row, shift);
+         indexer_topk_radix_select<BLOCK_SIZE, RADIX_BITS>
+             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
+@@ -318,12 +348,12 @@ static void indexer_topk_radix_cuda(
+     int * e_base = eb_alloc.get();
+ 
+     indexer_topk_count<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
+-            score, cell_blk, additive, states, g_cnt, e_cnt,
++            score, cell_blk, additive, extra, states, g_cnt, e_cnt,
+             ncols, n_tps, n_blocks, n_kv, cbpr);
+     indexer_topk_base_scan<<<nrows, BLOCK_SIZE, 0, stream>>>(
+             g_cnt, e_cnt, g_base, e_base, nrows, cbpr);
+     indexer_topk_deterministic_write<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
+-            score, cell_blk, additive, states, g_base, e_base, dst,
++            score, cell_blk, additive, extra, states, g_base, e_base, dst,
+             ncols, n_tps, n_blocks, n_kv, k, cbpr);
+ }
+ 
+@@ -331,18 +361,31 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     const ggml_tensor * score    = dst->src[0];
+     const ggml_tensor * cell_blk = dst->src[1];
+     const ggml_tensor * additive = dst->src[2];
++    const ggml_tensor * cell_pos = dst->src[3];
++    const ggml_tensor * q_pos    = dst->src[4];
++    const ggml_tensor * blk_idx  = dst->src[5];
++    const ggml_tensor * blk_tail = dst->src[6];
+     const float * score_d    = (const float *) score->data;
+     const int   * cell_blk_d = (const int  *) cell_blk->data;
+     int *         dst_d      = (int *) dst->data;
+     cudaStream_t  stream     = ctx.stream();
+ 
++    const indexer_topk_extra extra = {
++        cell_pos != nullptr ? (const int *) cell_pos->data : nullptr,
++        q_pos    != nullptr ? (const int *) q_pos->data    : nullptr,
++        blk_idx  != nullptr ? (const int *) blk_idx->data  : nullptr,
++        blk_tail != nullptr ? (const int *) blk_tail->data : nullptr,
++    };
++
+     GGML_ASSERT(score->type == GGML_TYPE_F32);
+     GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
+-    GGML_ASSERT(additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32);
++    GGML_ASSERT(additive == nullptr || additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32);
+     GGML_ASSERT(dst->type == GGML_TYPE_I32);
+     GGML_ASSERT(ggml_is_contiguous(score));
+     GGML_ASSERT(ggml_is_contiguous(cell_blk));
+-    GGML_ASSERT(ggml_is_contiguous(additive));
++    GGML_ASSERT(additive == nullptr || ggml_is_contiguous(additive));
++    GGML_ASSERT(cell_pos == nullptr || (ggml_is_contiguous(cell_pos) && ggml_is_contiguous(q_pos)));
++    GGML_ASSERT(blk_idx  == nullptr || (ggml_is_contiguous(blk_idx)  && ggml_is_contiguous(blk_tail)));
+     GGML_ASSERT(ggml_is_contiguous(dst));
+ 
+     const int n_blocks = score->ne[0];
+@@ -353,11 +396,12 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     const int k        = dst->ne[0];
+     ggml_cuda_pool & pool = ctx.pool();
+ 
+-    if (additive->type == GGML_TYPE_F16) {
+-        indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const half *) additive->data,
++    if (additive == nullptr || additive->type == GGML_TYPE_F16) {
++        indexer_topk_radix_cuda(pool, score_d, cell_blk_d,
++                additive != nullptr ? (const half *) additive->data : nullptr, extra,
+                 dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
+     } else {
+-        indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const float *) additive->data,
++        indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const float *) additive->data, extra,
+                 dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
+     }
+ }
+@@ -369,8 +413,10 @@ bool ggml_cuda_indexer_top_k_supported(int device, const ggml_tensor * dst) {
+     const ggml_tensor * cell_blk = dst->src[1];
+     const ggml_tensor * additive = dst->src[2];
+ 
++    // the additive is optional: the compact position/bias srcs derive it in-kernel
+     return score->type == GGML_TYPE_F32 &&
+         cell_blk->type == GGML_TYPE_I32 &&
+-        (additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32) &&
++        (additive == nullptr || additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32) &&
++        (additive != nullptr || dst->src[3] != nullptr || dst->src[5] != nullptr) &&
+         dst->type == GGML_TYPE_I32;
+ }
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 7ee2c06d8..1474b23fa 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5606,7 +5606,9 @@ struct ggml_tensor * ggml_flash_attn_qsa(
+         struct ggml_tensor  * idx,
+         struct ggml_tensor  * mask,
+         float                 scale,
+-        float                 logit_softcap) {
++        float                 logit_softcap,
++        struct ggml_tensor  * cell_vis,
++        struct ggml_tensor  * q_vis) {
+     GGML_ASSERT(ggml_can_mul_mat(k, q));
+ 
+     GGML_ASSERT(q->ne[3] == k->ne[3]);
+@@ -5616,11 +5618,24 @@ struct ggml_tensor * ggml_flash_attn_qsa(
+     GGML_ASSERT(idx->ne[1] == q->ne[1]);   // n_tps
+     GGML_ASSERT(idx->ne[3] == q->ne[3]);   // n_stream
+ 
+-    GGML_ASSERT(mask->type == GGML_TYPE_F16);
+-    GGML_ASSERT(ggml_is_contiguous(mask));
+-    GGML_ASSERT(mask->ne[0] == k->ne[1]);  // n_kv
+-    GGML_ASSERT(mask->ne[1] == q->ne[1]);
+-    GGML_ASSERT(mask->ne[3] == q->ne[3]);
++    // the mask is optional: when the compact visibility keys are given, the kernel derives the
++    // per-cell value from them instead (cell_vis[cell] in [0, q_vis[token]] means visible)
++    GGML_ASSERT(mask != NULL || (cell_vis != NULL && q_vis != NULL));
++
++    if (mask != NULL) {
++        GGML_ASSERT(mask->type == GGML_TYPE_F16);
++        GGML_ASSERT(ggml_is_contiguous(mask));
++        GGML_ASSERT(mask->ne[0] == k->ne[1]);  // n_kv
++        GGML_ASSERT(mask->ne[1] == q->ne[1]);
++        GGML_ASSERT(mask->ne[3] == q->ne[3]);
++    }
++
++    if (cell_vis != NULL) {
++        GGML_ASSERT(q_vis != NULL);
++        GGML_ASSERT(cell_vis->type == GGML_TYPE_I32 && q_vis->type == GGML_TYPE_I32);
++        GGML_ASSERT(cell_vis->ne[0] == k->ne[1] && cell_vis->ne[1] == q->ne[3]);
++        GGML_ASSERT(q_vis->ne[0]    == q->ne[1] && q_vis->ne[1]    == q->ne[3]);
++    }
+ 
+     // permute(0, 2, 1, 3)
+     int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+@@ -5635,6 +5650,8 @@ struct ggml_tensor * ggml_flash_attn_qsa(
+     result->src[2] = v;
+     result->src[3] = idx;
+     result->src[4] = mask;
++    result->src[5] = cell_vis;
++    result->src[6] = q_vis;
+ 
+     return result;
+ }
+@@ -5664,27 +5681,55 @@ struct ggml_tensor * ggml_indexer_top_k(
+         struct ggml_tensor  * score,
+         struct ggml_tensor  * cell_blk,
+         struct ggml_tensor  * additive,
++        struct ggml_tensor  * cell_pos,
++        struct ggml_tensor  * q_pos,
++        struct ggml_tensor  * blk_idx,
++        struct ggml_tensor  * blk_tail,
+         int                   k) {
+     GGML_ASSERT(score->type   == GGML_TYPE_F32);
+     GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
+-    GGML_ASSERT(additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32);
+     GGML_ASSERT(score->ne[0] > 0);
+-    GGML_ASSERT(cell_blk->ne[0] == additive->ne[0]);
+     GGML_ASSERT(cell_blk->ne[1] == score->ne[2]);
+-    GGML_ASSERT(additive->ne[1] == score->ne[1]);
+-    // the additive is the kq mask [n_kv, n_tps, 1, n_stream] (the size-1 dim is a
+-    // no-op stride the kernel reads as 3D) or a 3D bias [n_kv, n_tps, n_stream]
+-    GGML_ASSERT(additive->ne[2] == score->ne[2] ||
+-            (additive->ne[2] == 1 && additive->ne[3] == score->ne[2]));
+     GGML_ASSERT(k > 0);
+     GGML_ASSERT(k <= (int) cell_blk->ne[0]);
+ 
++    // the per-cell additive is optional: the compact position srcs derive it in-kernel
++    if (additive != NULL) {
++        GGML_ASSERT(additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32);
++        GGML_ASSERT(cell_blk->ne[0] == additive->ne[0]);
++        GGML_ASSERT(additive->ne[1] == score->ne[1]);
++        // the additive is the kq mask [n_kv, n_tps, 1, n_stream] (the size-1 dim is a
++        // no-op stride the kernel reads as 3D) or a 3D bias [n_kv, n_tps, n_stream]
++        GGML_ASSERT(additive->ne[2] == score->ne[2] ||
++                (additive->ne[2] == 1 && additive->ne[3] == score->ne[2]));
++    }
++
++    if (cell_pos != NULL) {
++        GGML_ASSERT(q_pos != NULL && cell_pos->type == GGML_TYPE_I32 && q_pos->type == GGML_TYPE_I32);
++        GGML_ASSERT(cell_pos->ne[0] == cell_blk->ne[0]);
++        GGML_ASSERT(cell_pos->ne[1] == cell_blk->ne[1]);
++        GGML_ASSERT(q_pos->ne[0] == score->ne[1]);
++        GGML_ASSERT(q_pos->ne[1] == score->ne[2]);
++    }
++
++    if (blk_idx != NULL) {
++        GGML_ASSERT(blk_tail != NULL && blk_idx->type == GGML_TYPE_I32 && blk_tail->type == GGML_TYPE_I32);
++        GGML_ASSERT(blk_idx->ne[0] == score->ne[0]);
++        GGML_ASSERT(blk_idx->ne[1] == score->ne[2]);
++        GGML_ASSERT(blk_tail->ne[0] == score->ne[1]);
++        GGML_ASSERT(blk_tail->ne[1] == score->ne[2]);
++    }
++
+     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, k, score->ne[1], 1, score->ne[2]);
+ 
+     result->op     = GGML_OP_INDEXER_TOPK;
+     result->src[0] = score;
+     result->src[1] = cell_blk;
+     result->src[2] = additive;
++    result->src[3] = cell_pos;
++    result->src[4] = q_pos;
++    result->src[5] = blk_idx;
++    result->src[6] = blk_tail;
+     ggml_set_op_params_i32(result, 0, k);
+ 
+     return result;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 5855393ef..8d9758fed 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -496,7 +496,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+ 
+-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
++    // the mask may never have been created (the qwen4exp derived-visibility prefill graph does not
++    // need it); the gate that owns that decision (llm_graph_input_qsa) rejects the reuse instead
++    res &= self_kq_mask == nullptr || can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+ 
+     return res;
+ }
+@@ -504,7 +506,11 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+ void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
+     mctx->set_input_k_idxs(self_k_idxs, ubatch);
+ 
+-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
++    // the mask is left unallocated when the graph does not attend to the cached K/V - see
++    // llm_graph_input_attn_kv::set_input; can_reuse_impl() below already accepts a null mask
++    if (self_kq_mask && self_kq_mask->buffer) {
++        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
++    }
+ }
+ 
+ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
+@@ -518,7 +524,7 @@ bool llm_graph_input_attn_k::can_reuse_impl(const llm_graph_params & params) {
+ 
+     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+ 
+-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
++    res &= self_kq_mask == nullptr || can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+ 
+     return res;
+ }
+@@ -1090,7 +1096,12 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
+     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
+ 
+-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
++    // the mask is left unallocated when the graph does not need it: the qwen4exp QSA
++    // derived-visibility path never reads it (the top-k and the flash attention derive the cell
++    // visibility from the compact per-cell/per-query keys instead), so there is nothing to fill
++    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
++        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
++    }
+ 
+     if (inp_attn->self_k_rot) {
+         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index b5dad83bd..8d6a39af7 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -444,6 +444,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
+         ggml_tensor * blk_cells,
+         ggml_tensor * blk_pos,
+         ggml_tensor * bias,
++        ggml_tensor * blk_idx,
++        ggml_tensor * blk_tail,
++        ggml_tensor * cell_vis,
++        ggml_tensor * q_vis,
+         const llama_ubatch * ubatch,
+         uint32_t ratio,
+         bool blk_bias,
+@@ -466,7 +470,40 @@ void llama_memory_hybrid_idx::set_input_qsa(
+     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
+     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
+-    float   * dst_bias      = (float   *) bias->data;
++    float   * dst_bias      = bias     != nullptr ? (float   *) bias->data     : nullptr;
++    int32_t * dst_blk_idx   = blk_idx  != nullptr ? (int32_t *) blk_idx->data  : nullptr;
++    int32_t * dst_blk_tail  = blk_tail != nullptr ? (int32_t *) blk_tail->data : nullptr;
++    int32_t * dst_cell_vis  = cell_vis != nullptr ? (int32_t *) cell_vis->data : nullptr;
++    int32_t * dst_q_vis     = q_vis    != nullptr ? (int32_t *) q_vis->data    : nullptr;
++
++    // exactly one form of the per-block bias is asked for: the uploaded tensor, or the compact
++    // pair the top-k derives it from.  Both is the diagnostic placeholder mode
++    // (GGML_QSA_DERIVED_BIAS=2|3): the tensor stays in the graph so that its node and its buffer
++    // slot match the tensor path, and it must hold exactly zeros - the kernel adds the real bias.
++    GGML_ASSERT((dst_blk_idx != nullptr) == (dst_blk_tail != nullptr));
++    GGML_ASSERT(dst_blk_idx == nullptr || blk_bias);
++    GGML_ASSERT(dst_bias    != nullptr || dst_blk_idx != nullptr);
++
++    // the derived visibility travels with blk_bias (it is the per-cell half of the same bias)
++    GGML_ASSERT((dst_cell_vis != nullptr) == (dst_q_vis != nullptr));
++    GGML_ASSERT(dst_cell_vis == nullptr || blk_bias);
++
++    const bool placeholder_bias = dst_bias != nullptr && dst_blk_idx != nullptr;
++
++    if (placeholder_bias) {
++        GGML_ASSERT(blk_bias);
++        std::fill(dst_bias, dst_bias + ggml_nelements(bias), 0.0f);
++    }
++
++    if (dst_blk_idx != nullptr) {
++        GGML_ASSERT(blk_idx->type  == GGML_TYPE_I32 && blk_idx->ne[0]  == n_blocks && blk_idx->ne[1]  == n_ns);
++        GGML_ASSERT(blk_tail->type == GGML_TYPE_I32 && blk_tail->ne[0] == n_tps    && blk_tail->ne[1] == n_ns);
++    }
++
++    if (dst_cell_vis != nullptr) {
++        GGML_ASSERT(cell_vis->type == GGML_TYPE_I32 && cell_vis->ne[0] == n_kv && cell_vis->ne[1] == n_ns);
++        GGML_ASSERT(q_vis->type    == GGML_TYPE_I32 && q_vis->ne[0]    == n_tps && q_vis->ne[1]    == n_ns);
++    }
+ 
+     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
+     // from zero, so the bucket alone would pool two sequences into one block
+@@ -625,6 +662,20 @@ void llama_memory_hybrid_idx::set_input_qsa(
+             group_cells();
+         }
+ 
++        // the per-cell half of the visibility as state: the compaction key of every cell of
++        // this stream's cache, -1 for a cell that is empty or owned by another sequence.
++        // a query token with key q_vis sees exactly the cells with 0 <= key <= q_vis, which is
++        // set_input_kq_mask_impl's predicate without its causal part - the same comparison the
++        // per-cell bias above already makes (idx = ranked ? rank[j] : pos_get(j) against q).
++        if (dst_cell_vis != nullptr) {
++            int32_t * cur_cell_vis = dst_cell_vis + s*n_kv;
++
++            for (int64_t j = 0; j < n_kv; ++j) {
++                cur_cell_vis[j] = cells.is_empty(j) || !cells.seq_has((uint32_t) j, seq_of_stream)
++                        ? -1 : (int32_t) (ranked ? rank[j] : cells.pos_get(j));
++            }
++        }
++
+         GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
+ 
+         int32_t n_bid = 0;
+@@ -684,6 +735,21 @@ void llama_memory_hybrid_idx::set_input_qsa(
+             cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+         }
+ 
++        if (dst_blk_idx != nullptr) {
++            // the per-block half of the bias as state: the top-k derives the -inf / 0 / 1e9
++            // value from this against the per-token tail start.  the per-sequence half of the
++            // original test is deliberately absent - the attention mask (or the derived cell
++            // positions) already drops every cell of a foreign block, and -inf + -inf is
++            // still -inf, so the values and the selection are identical.
++            int32_t * cur_blk_idx = dst_blk_idx + s*n_blocks;
++
++            for (int64_t b = 0; b < n_blocks; ++b) {
++                cur_blk_idx[b] = have_dead && b == dead_bid ? INT32_MAX
++                               : b >= n_bid                 ? -1
++                               :                              bid_idx[b];
++            }
++        }
++
+         for (int64_t ii = 0; ii < n_tps; ++ii) {
+             const int64_t      i      = s*n_tps + ii;
+             const llama_seq_id seq_id = ubatch->seq_id[i][0];
+@@ -716,7 +782,18 @@ void llama_memory_hybrid_idx::set_input_qsa(
+             // the tail is an incomplete block and is always visible, as in the reference
+             const int64_t tail_start = (q + 1)/r*r;
+ 
++            if (dst_q_vis != nullptr) {
++                dst_q_vis[s*n_tps + ii] = (int32_t) q;
++            }
++
+             if (blk_bias) {
++                if (dst_blk_tail != nullptr) {
++                    // compact form: the tail start is the only per-token part of the block bias
++                    dst_blk_tail[i] = (int32_t) tail_start;
++
++                    continue;
++                }
++
+                 // a block sits wholly inside or outside the tail, so one value covers it
+                 // the caller adds the attention mask, which drops empty, foreign and future cells
+                 float * cur_blk_bias = dst_bias + i*n_blocks;
+@@ -855,6 +932,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
+         ggml_tensor * blk_cells,
+         ggml_tensor * blk_pos,
+         ggml_tensor * bias,
++        ggml_tensor * blk_idx,
++        ggml_tensor * blk_tail,
++        ggml_tensor * cell_vis,
++        ggml_tensor * q_vis,
+         const llama_ubatch * ubatch,
+         uint32_t ratio,
+         bool blk_bias,
+@@ -862,8 +943,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
+         int32_t * dst_derived_lim) const {
+     GGML_ASSERT(mem != nullptr);
+ 
+-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias,
+-                       dst_derived_from, dst_derived_lim);
++    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_idx, blk_tail, cell_vis, q_vis,
++                       ubatch, ratio, blk_bias, dst_derived_from, dst_derived_lim);
+ }
+ 
+ ggml_tensor * llama_memory_hybrid_idx_context::get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks) const {
+diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
+index 4b30994d1..c5ce4bd51 100644
+--- a/src/llama-memory-hybrid-idx.h
++++ b/src/llama-memory-hybrid-idx.h
+@@ -94,8 +94,19 @@ public:
+     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
+     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
+     // the caller then adds the attention mask, the only part of the bias that varies within a block
++    //
++    // blk_idx/blk_tail are the compact (derived) alternative to the bias tensor: they let the
++    // top-k derive the per-block half of the bias in-kernel from 4 bytes per block instead of
++    // n_tokens/ns.  blk_idx is -1 for a block that is not complete for this stream, INT32_MAX
++    // for the spare block holding the unpooled tail cells, else the position of the block's
++    // first cell; blk_tail holds the per-token tail start.  The per-sequence half of the bias
++    // is not folded in: the visibility (the attention mask, or the derived cell positions)
++    // already drops every cell of a foreign block, so the values stay identical.  A caller
++    // passing blk_idx must not add the bias into the block score itself.
+     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
++                       ggml_tensor * bias, ggml_tensor * blk_idx, ggml_tensor * blk_tail,
++                       ggml_tensor * cell_vis, ggml_tensor * q_vis,
++                       const llama_ubatch * ubatch, uint32_t ratio,
+                        bool blk_bias,
+                        int32_t * dst_derived_from = nullptr,
+                        int32_t * dst_derived_lim  = nullptr) const;
+@@ -186,7 +197,9 @@ public:
+     uint32_t get_n_stream() const;
+ 
+     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
++                       ggml_tensor * bias, ggml_tensor * blk_idx, ggml_tensor * blk_tail,
++                       ggml_tensor * cell_vis, ggml_tensor * q_vis,
++                       const llama_ubatch * ubatch, uint32_t ratio,
+                        bool blk_bias,
+                        int32_t * dst_derived_from = nullptr,
+                        int32_t * dst_derived_lim  = nullptr) const;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 606af11fb..a6f10b51b 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -902,20 +902,86 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
+ 
+ // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
+ // one mean-pooled indexer key scores each block; set_input resolves the cache layout
++//
++// The per-block half of the bias is derived in-kernel from blk_idx/blk_tail by default (see
++// build_qsa_top_k); GGML_QSA_DERIVED_BIAS=0 restores the uploaded tensor for A/B validation.
++//
++// =2 is a diagnostic: the tensor stays in the graph exactly as in the tensor path - same node,
++// same shape, same buffer slot - but it is filled with zeros, so the top-k still derives the real
++// bias in-kernel while the graph structure and the buffer layout are unchanged.  Adding +0.0f
++// first is value-preserving for the three bias constants (-inf, 0.0f, 1e9f) and for the mask
++// values, none of which is -0.0f.  It separates "this change moved a node, so the multi-GPU
++// split / AllReduce grouping rounds differently" from "the derived values differ" - see
++// archive/work/qwen4exp/qsa-memory/L1-step1-derived-block-bias-findings.md section 3.
++static int qwen4exp_derived_bias_mode() {
++    static const int mode = [] {
++        const char * env = getenv("GGML_QSA_DERIVED_BIAS");
++        return env == nullptr ? 1 : std::atoi(env);
++    }();
++    return mode;
++}
++
++// The per-cell half of the same bias (the attention mask) is derived from two compact keys as
++// well: cell_vis is a cell's compaction key (-1 for an empty or foreign cell) and q_vis is the
++// query's key, and a cell is visible iff 0 <= cell_vis <= q_vis.  GGML_QSA_DERIVED_VIS=0 keeps
++// the uploaded mask as the additive for A/B.  The mask tensor stays allocated until the flash
++// attention derives the same value, so this is a drop-in equivalent on its own.
++static bool qwen4exp_derived_vis_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("GGML_QSA_DERIVED_VIS");
++        return env == nullptr || std::atoi(env) != 0;
++    }();
++    return enabled;
++}
++
++// The prefill derived-visibility gate, expressed WITHOUT the mask tensor, because the derived
++// path must not create the mask at all (that is the -800 MiB win: an unreachable mask is left
++// unallocated by the gallocr and then aborted on by a buffer query elsewhere).  It is exactly
++// the predicate blk_bias checks against the mask's shape - the mask is always
++// [n_kv, n_tps, 1, n_stream] for this model - so both paths agree by construction.
++// the QSA sparse (fused, top-k only) flash attention is the DEFAULT path; LLAMA_QSA_SPARSE_FA=0
++// selects the dense masked path, which still reads the kq mask through build_attn_mha and must
++// therefore keep it alive.  Both paths need flash attention enabled.
++static bool qwen4exp_qsa_sparse(const llama_cparams & cparams) {
++    static const bool enabled = []() {
++        const char * env = getenv("LLAMA_QSA_SPARSE_FA");
++        return env == nullptr || std::atoi(env) != 0;
++    }();
++    return enabled && cparams.flash_attn;
++}
++
++// the mask may be dropped (never created, hence never allocated) only when nothing in the graph
++// reads it: the derived-visibility path plus the sparse FA that derives the cell visibility in
++// its kernel.  This is the -800 MiB win; the predicate is exactly the one blk_bias would have
++// checked against the mask's own shape (the mask is always [n_kv, n_tps, 1, n_stream] here).
++static bool qwen4exp_want_derived_vis(const llama_cparams & cparams, const llama_hparams & hparams, int64_t n_tokens) {
++    return qwen4exp_derived_bias_mode() != 0 && qwen4exp_derived_vis_enabled() && qwen4exp_qsa_sparse(cparams) &&
++            n_tokens > 1 && cparams.causal_attn && !hparams.use_alibi;
++}
++
+ class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
+ public:
+-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
+-        mctx(mctx), ratio(ratio), blk_bias(blk_bias) {}
++    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool derived_bias, bool zero_bias, bool tiny_bias, bool derived_vis) :
++        mctx(mctx), ratio(ratio), blk_bias(blk_bias), derived_bias(derived_bias), zero_bias(zero_bias), tiny_bias(tiny_bias), derived_vis(derived_vis) {}
+     virtual ~llm_graph_input_qsa() = default;
+ 
+     void set_input(const llama_ubatch * ubatch) override {
+         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
++
++        // the QSA mapping tensors (cell_blk/blk_cells/blk_pos + the per-block and per-cell bias
++        // forms) are reachable only from the indexer top-k node.  The policies that store K only
++        // (decode and short-context graphs) do not build it, so the allocator leaves these
++        // unallocated - and there is nothing to fill for a tensor no node reads.
++        if (cell_blk == nullptr || cell_blk->buffer == nullptr) {
++            return;
++        }
++
+         if (rng != nullptr) {
+             // derived-cache decode: emit the per-step fill range [from, lim) into the leaf
+             int32_t * d = (int32_t *) rng->data;
+-            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, d, d + 1);
++            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_idx, blk_tail, cell_vis, q_vis, ubatch, ratio, blk_bias, d, d + 1);
+         } else {
+-            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
++            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_idx, blk_tail, cell_vis, q_vis, ubatch, ratio, blk_bias);
+         }
+     }
+ 
+@@ -935,13 +1001,41 @@ public:
+ 
+         res &= params.ubatch.n_tokens % n_stream == 0;
+ 
++        // a graph built for one form of the per-block bias cannot serve the other
++        const int  dbias_mode   = qwen4exp_derived_bias_mode();
++        const bool want_derived = dbias_mode != 0 && blk_bias && params.ubatch.n_tokens > 1;
++        const bool want_zero    = dbias_mode == 2 && blk_bias && params.ubatch.n_tokens > 1;
++        const bool want_tiny    = dbias_mode == 3 && blk_bias && params.ubatch.n_tokens > 1;
++        const bool want_vis     = want_derived && qwen4exp_derived_vis_enabled();
++        res &= derived_bias == want_derived;
++        res &= zero_bias    == want_zero;
++        res &= tiny_bias    == want_tiny;
++        res &= derived_vis  == want_vis;
++
+         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
+         res &= cell_blk->ne[0]  == n_kv;
+         res &= cell_blk->ne[1]  == n_stream;
+         res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
+         res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
+-        res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
+-        res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
++        if (derived_bias) {
++            res &= blk_idx->ne[0]  == n_blocks;
++            res &= blk_idx->ne[1]  == n_stream;
++            res &= blk_tail->ne[0] == params.ubatch.n_tokens/n_stream;
++            res &= blk_tail->ne[1] == n_stream;
++        }
++        if (derived_vis) {
++            res &= cell_vis->ne[0] == n_kv;
++            res &= cell_vis->ne[1] == n_stream;
++            res &= q_vis->ne[0]    == params.ubatch.n_tokens/n_stream;
++            res &= q_vis->ne[1]    == n_stream;
++        }
++        if (!derived_bias || zero_bias) {
++            res &= bias->ne[0] == (blk_bias ? n_blocks : n_kv);
++            res &= bias->ne[1] == params.ubatch.n_tokens/n_stream;
++        }
++        if (tiny_bias) {
++            res &= ggml_nelements(bias) == 1;
++        }
+ 
+         return res;
+     }
+@@ -954,11 +1048,34 @@ public:
+     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
+     ggml_tensor * rng       = nullptr;   // I32 [2*n_stream] derived-cache range leaf (decode only)
+ 
++    // derived_bias: the per-block half of the bias is not uploaded at all - the top-k derives
++    // it in-kernel from this compact pair (4 bytes per block instead of n_tokens/n_stream)
++    ggml_tensor * blk_idx   = nullptr;   // I32 [n_blocks, n_stream]
++    ggml_tensor * blk_tail  = nullptr;   // I32 [n_tokens/n_stream, n_stream]
++
++    // derived_vis: the per-cell half (the attention mask) is not uploaded either - a cell carries
++    // a compaction key and a token a query key, and the cell is visible iff 0 <= cell_vis <= q_vis
++    ggml_tensor * cell_vis  = nullptr;   // I32 [n_kv, n_stream]
++    ggml_tensor * q_vis     = nullptr;   // I32 [n_tokens/n_stream, n_stream]
++
+     const llama_memory_hybrid_idx_context * mctx;
+     const uint32_t ratio;
+ 
+     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
+     const bool blk_bias;
++
++    // ... unless it is derived from blk_idx/blk_tail (prefill only: the fused decode score op
++    // applies the bias itself, and 2d positions select the ranked tail metric)
++    const bool derived_bias;
++
++    // diagnostic (GGML_QSA_DERIVED_BIAS=2|3): the bias tensor above is a zero-filled placeholder
++    // kept in the graph only so that its node and its buffer layout match the tensor path.
++    // 2 = the real [n_blocks, n_tps, n_stream] shape (400 MiB), 3 = one broadcast element
++    const bool zero_bias;
++    const bool tiny_bias;
++
++    // ... and the per-cell half is derived from the visibility keys
++    const bool derived_vis;
+ };
+ 
+ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -987,9 +1104,35 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
+     // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
+     // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
+-    const bool blk_bias = kq_mask != nullptr &&
+-        kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
+-        cparams.causal_attn && !hparams.use_alibi;
++    // kq_mask is null on the derived-visibility path (the mask is never created there); the
++    // derived gate is the same predicate the mask's own shape would have satisfied
++    const bool blk_bias = kq_mask != nullptr
++            ? (kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
++               cparams.causal_attn && !hparams.use_alibi)
++            : qwen4exp_want_derived_vis(cparams, hparams, n_tokens);
++
++    // The per-block half of the bias is a pure function of the block bookkeeping (blk_idx) and
++    // the token's tail start (blk_tail), so the prefill graph has the top-k derive it in-kernel
++    // instead of uploading an [n_blocks, n_tps] F32 tensor (400 MiB at ctx 204800 / ub 2048).
++    // Decode keeps the tensor: the fused INDEXER_SCORE op applies the bias internally and its
++    // rows are one token wide anyway.
++    //
++    // Note: not gated on !ubatch.is_pos_2d().  This model is IMROPE, so n_pos_per_embd() is 4 and
++    // is_pos_2d() is always true, but that only describes the position *tensor*, not the data.
++    // Both sides of the bias test come from the same code path - the memory layer computes
++    // bid_idx and the query's tail start in rank units when it ranked the cells (mrope repeats a
++    // position across an image) and in position units otherwise - so the comparison is exact
++    // either way and the per-sequence half is redundant with the visibility.
++    const int  dbias_mode   = qwen4exp_derived_bias_mode();
++    const bool derived_bias = dbias_mode != 0 && blk_bias && n_tokens > 1;
++    // diagnostic mode 2: keep the bias tensor in the graph, zero-filled and still consumed, so the
++    // node count and the buffer layout match the tensor path while the top-k derives in-kernel.
++    // mode 3 is the same but with a single broadcast element (does the node alone carry the effect?)
++    const bool zero_bias    = derived_bias && dbias_mode == 2;
++    const bool tiny_bias    = derived_bias && dbias_mode == 3;
++    // the per-cell half of the same bias (the attention mask) is derived from the visibility
++    // keys too; the mask tensor stays until the flash attention reads the keys as well
++    const bool derived_vis  = derived_bias && qwen4exp_derived_vis_enabled();
+ 
+     // env gates (per-process, read once): the fused INDEXER_SCORE op + the incremental derived
+     // cache are the DEFAULT decode path (parity-verified byte-identical to the per-op chain);
+@@ -1012,13 +1155,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     if (it != qsa_inps.end()) {
+         inp = it->second;
+     } else {
+-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
++        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, derived_bias, zero_bias, tiny_bias, derived_vis);
+ 
+         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+         qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
+-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
++        if (derived_bias) {
++            qsa->blk_idx  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_blocks, n_stream);
++            qsa->blk_tail = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tps,    n_stream);
++        }
++        if (derived_vis) {
++            qsa->cell_vis = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv,  n_stream);
++            qsa->q_vis    = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tps, n_stream);
++        }
++        if (!derived_bias || zero_bias) {
++            qsa->bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
++        } else if (tiny_bias) {
++            qsa->bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, 1, 1);
++        }
+         if (idx_cache && n_stream == 1) {
+             // per-step derived fill range leaf: [from_s, lim_s] (one stream in decode)
+             qsa->rng = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 2);
+@@ -1027,7 +1182,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         ggml_set_input(qsa->cell_blk);
+         ggml_set_input(qsa->blk_cells);
+         ggml_set_input(qsa->blk_pos);
+-        ggml_set_input(qsa->bias);
++        if (derived_bias) {
++            ggml_set_input(qsa->blk_idx);
++            ggml_set_input(qsa->blk_tail);
++        }
++        if (derived_vis) {
++            ggml_set_input(qsa->cell_vis);
++            ggml_set_input(qsa->q_vis);
++        }
++        if (!derived_bias || zero_bias || tiny_bias) {
++            ggml_set_input(qsa->bias);
++        }
+         if (qsa->rng != nullptr) {
+             ggml_set_input(qsa->rng);
+         }
+@@ -1193,7 +1358,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         }
+ 
+         // one value per block, so it is cheaper to bias here than after the cells are expanded
+-        if (blk_bias) {
++        // (the derived path drops this tensor and lets the top-k add the bias in-kernel instead)
++        if (blk_bias && (!derived_bias || zero_bias || tiny_bias)) {
+             score = ggml_add(ctx0, score, inp->bias);
+         }
+     }
+@@ -1209,7 +1375,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+     // kernel reads it as [n_kv, n_tps, n_stream] and no per-layer copy is needed
+     ggml_tensor * additive = blk_bias ? kq_mask : inp->bias;
+ 
+-    ggml_tensor * top_k = ggml_indexer_top_k(ctx0, score, inp->cell_blk, additive, (int) width);
++    // compact per-block bias state (derived path); the derived *visibility* (cell_pos/q_pos)
++    // is a later step, so src3/src4 stay null for now
++    ggml_tensor * top_k = ggml_indexer_top_k(ctx0, score, inp->cell_blk, additive,
++            derived_vis ? inp->cell_vis : nullptr,
++            derived_vis ? inp->q_vis    : nullptr,
++            derived_bias ? inp->blk_idx  : nullptr,
++            derived_bias ? inp->blk_tail : nullptr,
++            (int) width);
+     cb(top_k, "indexer_top_k", il);
+ 
+     return top_k;
+@@ -1254,8 +1427,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+     }
+ 
+-    ggml_tensor * kq_mask = inp->get_kq_mask();
++    // Fused sparse FA (top-k cells only) vs dense masked FA: see qwen4exp_qsa_sparse().
++    const bool qsa_sparse = qwen4exp_qsa_sparse(cparams);
+ 
++    // the derived visibility keys live in this layer's QSA graph input set (null on the tensor
++    // path, where the kernel keeps gathering the mask); the mask src stays until the prunable form
++    ggml_tensor * qsa_cell_vis = nullptr;
++    ggml_tensor * qsa_q_vis    = nullptr;
++    {
++        const auto it_qsa = qsa_inps.find((uint32_t) hparams.dsv4_compress_ratios[il]);
++
++        if (it_qsa != qsa_inps.end()) {
++            qsa_cell_vis = it_qsa->second->cell_vis;
++            qsa_q_vis    = it_qsa->second->q_vis;
++        }
++    }
++
++    // the derived-visibility path creates no mask at all (nothing in this graph reads it: the FA
++    // derives from the keys and the dense fallback below is off) - this is the -800 MiB win
++    const bool qsa_derive_vis = qsa_sparse && qsa_cell_vis != nullptr;
++    ggml_tensor * kq_mask = qsa_derive_vis ? nullptr : inp->get_kq_mask();
++
++    ggml_tensor * kq_mask_top_k = nullptr;
++
++    if (kq_mask != nullptr) {
+     // prepare new kq mask - starts filled with -INFINITY
+     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
+ 
+@@ -1281,21 +1476,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+ 
+     // combine with the original kq mask
+     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
++    }
+ 
+     ggml_tensor * q = q_cur;
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+ 
+-    // The fused sparse kernel (attend only the indexer-selected top-k cells)
+-    // is the DEFAULT flash-attention path; LLAMA_QSA_SPARSE_FA=0 keeps the
+-    // dense masked flash-attention path instead. Both require flash attention
+-    // enabled; with FA off (-fa 0) the manual attention path below is used.
+-    static const bool qsa_sparse_env = []() {
+-        const char * env = getenv("LLAMA_QSA_SPARSE_FA");
+-        return env == nullptr || std::atoi(env) != 0;
+-    }();
+-    const bool qsa_sparse = qsa_sparse_env && cparams.flash_attn;
+-
+     ggml_tensor * cur;
+ 
+     if (qsa_sparse) {
+@@ -1307,7 +1493,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+         k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+         v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+ 
+-        cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f);
++        // kq_mask is null on the derived-visibility path (the graph never creates it): the kernel
++        // derives each cell's visibility from cell_vis/q_vis instead - see findings 2c
++        cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f,
++                qsa_cell_vis, qsa_q_vis);
+         ggml_flash_attn_qsa_set_prec(cur, GGML_PREC_F32);
+         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+         cb(cur, "kqv_out", il);
+@@ -1432,7 +1621,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+             // arch policy gate: dense decode below the crossover depth (store keys only)
+             build_qsa_store_k(mctx_hyb, cur, il);
+         } else {
+-            top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il);
++            // the derived path never creates the kq mask; the qsa input's can_reuse below carries
++            // the same gate, so a prefill graph (no mask) and a decode graph (mask) never mix
++            const bool want_derived_vis = qwen4exp_want_derived_vis(cparams, hparams, n_tokens);
++            top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos,
++                    want_derived_vis ? nullptr : inp->get_kq_mask(), sections, il);
+         }
+     }
+ 

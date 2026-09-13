@@ -20,7 +20,7 @@ block 14 on 2026-09-10), block 06 is the host-buffer rationale marker (upstream 
 #24233 in #28604, so the functional delta is upstream), and block 14's 2026-09-09 gfx1151-only
 freed-cell KV host zeroing is removed.  **Block 15 (the attention-memory campaign, V3/V4/V5 + W1-W4)
 is the last delivery patch** — promoted 2026-09-12 from
-`beta/block-15-campaign-wins/`; see that directory's README (PROMOTED) and the dated WORKLOG
+`archive/work/block-15-campaign-wins/`; see that directory's README (PROMOTED) and the dated WORKLOG
 entries.  The 2026-09-08 re-base reduced
 block 06 to its host-buffer rationale marker (upstream itself reverted
 #24233 in #28604 on 2026-09-08 — end state identical) and merged block
@@ -138,7 +138,7 @@ delivery — use `patches/` + `scripts/apply-all.sh`.
 | 12 | `0012-…-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch` | **hybrid HIP all-reduce** (internal AR for the small-tensor decode path + per-size hybrid dispatch vs RCCL; RDNA4-only gate: refuses to init off gfx1200/gfx1201, falls back to RCCL) | none (apply last) |
 | 13 | `0013-…-block-13-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** (prefill fused expert MMQ, RDNA4 + RDNA3.5 + RDNA3.0 (gfx1151 validated 2026-09-05, gfx1100 validated 2026-09-05), Q3_K/Q4_K/Q5_K/Q8_0/Q6_K + decode item-split, re-based on the upstream has_fusion mmvq path; multi-token mmvq x_scale_channel_dst fusion for MoE down x topk-weights, spec-dec verify batches n=2..8; ROCm unaligned-width split-load fix for Q6_K/Q3_K 2-GPU) | none (apply last) |
 | 14 | `0014-…-block-14-qwen4exp-support.patch` | **qwen4exp / Qwen3.8-Flash-Next support** (promoted from `beta/qwen4exp`, re-based): QSA sparse FA (default) + fused indexer top-k/score, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader + PLE n-gram loading, MTP draft-head, WS4 hyperconn prefill fusions, sched alloc-fallback sync fix, QSA dense shortcut + per-arch dense/QSA decode policy | none (apply last) |
-| 15 | `0015-…-block-15-campaign-memory-wins.patch` | **attention-memory wins (block 15)** (promoted 2026-09-12 from `beta/block-15-campaign-wins/`): V3 derived kq mask (`LLAMA_KQ_MASK_DERIVED`, default 1), V4 native q8_0 + V5 native bf16 K/V (`GGML_CUDA_FA_KV_NATIVE`, opt-in default 0), W1 QSA score-chain memory (`GGML_QSA_SCORE_MEM`), W2 derived QSA per-block bias + visibility (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), W3 keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), W4 ggml-alloc unused-view release (no gate) | **apply last** |
+| 15 | `0015-…-block-15-campaign-memory-wins.patch` | **attention-memory wins (block 15)** (promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`): V3 derived kq mask (`LLAMA_KQ_MASK_DERIVED`, default 1), V4 native q8_0 + V5 native bf16 K/V (`GGML_CUDA_FA_KV_NATIVE`, opt-in default 0), W1 QSA score-chain memory (`GGML_QSA_SCORE_MEM`), W2 derived QSA per-block bias + visibility (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), W3 keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), W4 ggml-alloc unused-view release (no gate) | **apply last** |
 
 Block numbers are the apply order: `01` applies first, `15` last. All blocks
 are mutually independent except **block 08 (fused core) requires blocks 03
@@ -161,7 +161,7 @@ Block 15 is the RDNA memory campaign squashed into one block.  It removes
 compute-buffer VRAM and host buffer from the attention paths at
 byte-identical output.  Six wins, each with an environment A/B gate
 (V4 is an *enable* switch, default off); full mechanism notes and the
-per-win measurement tables are in `beta/block-15-campaign-wins/README.md`.
+per-win measurement tables are in `archive/work/block-15-campaign-wins/README.md`.
 
 Apply + regeneration verification (the `[PATCH NN/14]` / `ff2b35f49`
 figures inside the bullets below are the then-current beta-staging state; the
@@ -171,7 +171,7 @@ tip `0f4f83f9e`, tree `c3142fe0b311757f458647f172f623859f5bc983`):
 - fresh worktree at `9113cc188` -> `scripts/apply-all.sh` (**strict 16/16
   `git am`** for the promoted 16-patch delivery, zero whitespace warnings,
   applied tree == canonical tree `c3142fe0b3`); the promoted `patches/0015`
-  is byte-identical to `beta/block-15-campaign-wins/block-15-campaign-wins.patch`
+  is byte-identical to `archive/work/block-15-campaign-wins/block-15-campaign-wins.patch`
   apart from its `From <sha>` line.  (During the beta window the same tree was
   validated by applying the 15-block delivery + the beta patch on top.)
 - the delivered `0001`-`0014` files are byte-identical to the previous
@@ -244,7 +244,7 @@ the tree built from the delivered patches):
   pp20480, decode ±0.1 %); V3 ~−3.2 % pp20480.  Clean-apply sim strict
   14/14 `git am` for the delivery + the beta patch, applied tree == the
   block-14 canonical tree.  Full matrix in
-  `wip/strix-halo/GATE-2026-09-10-block15-rdna35.md`.
+  `archive/work/strix-halo/GATE-2026-09-10-block15-rdna35.md`.
 
 Known pre-existing issue (reproduces on block 14, NOT a block-15
 regression): `gemma-4-E4B-it` on 3 GPUs with `-sm tensor` aborts in the
@@ -293,8 +293,8 @@ host zeroing disabled):
 - Clean-apply sim at `9113cc188`: strict 14/14 `git am`, zero whitespace
   warnings, applied tree == fork tip `ff2b35f49`.
 
-Full record: `wip/strix-halo/kvzero/RECORD-2026-09-09.md` +
-`wip/kv-sign-leak/HANDOVER-2026-09-09-mma-f16.md`.
+Full record: `archive/work/strix-halo/kvzero/RECORD-2026-09-09.md` +
+`archive/work/kv-sign-leak/HANDOVER-2026-09-09-mma-f16.md`.
 
 ### Block-14 freed-cell KV-row-zeroing gfx1151 gate (2026-09-09, superseded 2026-09-10)
 
@@ -603,7 +603,7 @@ local=600`), sim same-seed coherence identical, sim pp2048 1676.3 /
 pp16384 1424.6 (fused) vs 1590.7 / 1361.4 (unfused) — the regenerated
 set reproduces the validated gains.  `rdna-boosts-all.patch`
 regenerated (applies cleanly at `9cffdcc80`).  Full session record:
-`wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
+`archive/work/wip-archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`.
 
 ### RX 7900 XTX (RDNA3_0, gfx1100) fused-MoE-MMQ validation (2026-09-05, current)
 
@@ -644,7 +644,7 @@ gfx1100, RCCL+graphs+native), sim same-seed coherence identical, sim
 pp2048 5394.2 / pp16384 4481.6 (fused) vs 4938.7 / 4161.7 (3-op) — the
 regenerated set reproduces the validated gains.  `rdna-boosts-all.patch`
 regenerated (applies cleanly at `9cffdcc80`).  Full session record:
-`wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
+`archive/work/wip-archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
 
 ### Re-baseline to 0eadefebd (2026-09-01)
 

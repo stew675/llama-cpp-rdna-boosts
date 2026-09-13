@@ -95,7 +95,7 @@ and the 2048 row; only the 2048 row is the campaign row).
 
 ## Expected numbers (pre-fix campaign build, same box, r3 — the anchor)
 
-Depth-0 (from the delivery-revalidation record `wip/archive/qwen4exp/discovery/
+Depth-0 (from the delivery-revalidation record `archive/work/wip-archive/qwen4exp/discovery/
 2026-09-06-delivery-revalidation.md`, pre-fix A side):
 
 | row | pre-fix A (t/s) |
@@ -110,7 +110,7 @@ Depth-0 (from the delivery-revalidation record `wip/archive/qwen4exp/discovery/
 Cross-session swing on this box/model is up to ~9% — **only same-session A/B is valid**.
 The decision metric is `FIX vs PRE` same-session: expect |Δ| ≲ 3% at every row (both builds
 take the identical single-device fast path).  For reference the brief's depth-0 ladder
-(`wip/strix-halo/SESSION-BRIEF-2026-09-06.md`) showed A pp512 634 / pp2048 725 / pp4096 716
+(`archive/work/strix-halo/SESSION-BRIEF-2026-09-06.md`) showed A pp512 634 / pp2048 725 / pp4096 716
 / pp8192 693 / tg 25.9 — do NOT chase the older pre-split_j matrix numbers from
 `2026-09-05-...-ws3-shortcut-fix.md` (pp2048@0 399 etc. predates the split_j Q8_0 re-block;
 they are not the current state).

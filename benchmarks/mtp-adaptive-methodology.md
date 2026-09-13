@@ -12,7 +12,7 @@ acceptance/verification rules that would have caught the regression.
 Status: 2026-09-02 — gate defined; dense + MoE baselines recorded (pre- and
 post-fix). All runs on 3x R9700 (gfx1201), ROCm 7.14
 (`/opt/rocm-7.14-gfx1201`), fork build flags as in
-`wip/qwen35moe-prefill/bench-config.md`; 1-GPU runs pin `HIP_VISIBLE_DEVICES=0`
+`archive/work/wip-archive/qwen35moe-prefill/bench-config.md`; 1-GPU runs pin `HIP_VISIBLE_DEVICES=0`
 (GOLDEN RULE 1: without the pin llama.cpp layer-splits and decode drops
 ~97 -> ~81 t/s on the MoE model).
 
@@ -108,7 +108,7 @@ Run the same with `--spec-type none` and compare. Gate rules:
    `--spec-draft-n-max` to 7** (a visible notice; `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0`
    keeps a larger value), so any pre-existing baseline measured above 7 must be
    re-measured at 7 (or with the env set) before comparing.  See
-   `../beta/block-15-campaign-wins/BETA-TESTING.md` for the notice semantics.
+   `../archive/work/block-15-campaign-wins/BETA-TESTING.md` for the notice semantics.
 3. **Same-seed determinism vs the previous release** (dense): outputs must
    be byte-identical between the build under test and the known-good build.
    On MoE this is not required (fusion-ordering numerics drift is an
@@ -201,7 +201,7 @@ MTP accelerates at both splits (+37% 2-GPU, +29% 3-GPU) with acceptance
 
 ### MoE single-token decode anchors (MTP-free, for reference)
 
-Canonical commands in `wip/qwen35moe-prefill/bench-config.md`. Recorded
+Canonical commands in `archive/work/wip-archive/qwen35moe-prefill/bench-config.md`. Recorded
 baseline (2026-09-02, fork tip) vs fixed 13-block (2026-09-02):
 
 | test | baseline | fixed 13-block |

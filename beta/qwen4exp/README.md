@@ -222,7 +222,7 @@ bit-identical, deterministic indexer top-k gather, kv-cache stale-cell
 zeroing). Bit-exact same-seed llama-cli text on == off; depth-0 pp
 +5.2-8.8% (pp512..16384), pp@depth 12k/32k +4-6%, tg@depth flat,
 memory stable −r3 through 32k. Record:
-`wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws4-hc-fusion-gates.md`.
+`archive/work/wip-archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws4-hc-fusion-gates.md`.
 Opt-out: `GGML_CUDA_DISABLE_HC_FUSION=1`.
 
 ### 5. `ws3-routed-moe-mmq.patch` (2026-09-05)
@@ -237,7 +237,7 @@ and verified; depth-0 pp +2.4-5.3% (compact vs plain at the same J),
 tg flat, no depth regression; A-vs-B gap moved pp16384 1.14->1.06x,
 pp8192 1.37->1.26x, pp4096 1.68->1.53x, pp2048 2.21->2.01x, pp1024
 2.04->1.78x, pp512 2.05->1.61x. Record:
-`wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
+`archive/work/wip-archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
 Opt-out: `GGML_CUDA_DISABLE_MMQ_ROUTED=1` (compact dispatch only).
 Gate: RDNA3_5 only (B parity); gfx1201 enablement deferred to the
 delivery flow's gfx1201 box.
@@ -260,7 +260,7 @@ sync drained the whole ~3 s GPU queue — the dense/sparse ubatch
 alternation hit one EVERY ubatch of EVERY rep; now zero syncs in the
 steady state). No numerics change; OFF-path and real serving (syncs
 per decode) unaffected. Record:
-`wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-shortcut-fix.md`.
+`archive/work/wip-archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-shortcut-fix.md`.
 NOTE: core-ggml, arch-agnostic; multi-GPU / pipeline-parallel not
 exercised here (ordering argument holds per-device) — candidate for an
 upstream PR at the maintainer's discretion.
@@ -293,7 +293,7 @@ Shape-fingerprinted (w [640,2560,512] IQ4_NL/Q8_0, ids 10, dst 2560 =
 single token => decode-only). Text fused ==
 `GGML_CUDA_DISABLE_WEIGHTED_DOWN=1`; tg128@d12288 +1.3%, tg@0 ~flat,
 depth-0 pp unchanged. Record:
-`wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-weighted-down-fusion.md`.
+`archive/work/wip-archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-weighted-down-fusion.md`.
 
 ### 9. `ws5-ple-host-gather.patch` (2026-09-06)
 
@@ -311,7 +311,7 @@ sweep - no CPU graph split, no serial page faults. DEFAULT ON;
 626 vs 600 (A WINS), pp8192 637 vs 679, pp4096 646 vs 734, pp2048 655
 vs 776 (was 400/1.93x), pp1024 643 vs 731, pp512 591 vs 645, tg128
 25.95 vs 26.01 (parity). Records:
-`wip/archive/qwen4exp/discovery/2026-09-06-strix-halo-gfx1151-prefill-ple-host-gather.md`
+`archive/work/wip-archive/qwen4exp/discovery/2026-09-06-strix-halo-gfx1151-prefill-ple-host-gather.md`
 (+ the managed-path follow-up `...-managed-ple-batched-fetch.md`, which
 is folded into patch 1).
 
@@ -329,7 +329,7 @@ qwen4exp delta including the RDNA4 tuning commits (mmq RDNA4-enable, exact-SKU g
 quantize predicate, mmid-512x10 helper) that sit on the branch.  The 2026-09-07
 investigative code (QSA_DECODE_SKIP probe, fused INDEXER_POOL op, the topk init-fold +
 two-round select) is NOT in the patch - archived in
-`wip/archive/qwen4exp/patches/2026-09-07-investigative-drops/`.  The fused INDEXER_SCORE
+`archive/work/wip-archive/qwen4exp/patches/2026-09-07-investigative-drops/`.  The fused INDEXER_SCORE
 op + the derived cache are the DEFAULT decode path (env `GGML_CUDA_QSA_INDEXER_SCORE` /
 `GGML_CUDA_QSA_INDEXER_CACHE` default ON, `=0` disables for A/B), so a plain
 llama-bench/llama-server run reproduces the 2026-09-07 crossover tables with no env.
@@ -361,9 +361,9 @@ fattn / gdn / scale-unary kernel work lives in the amended top-level blocks 0002
   ACCEL device's gfx id (gfx1151: 64K crossover - dense below, QSA at/above; other arches:
   dense decode always);
   env `LLAMA_QSA_DENSE_DECODE_UNTIL` overrides (0 = gate off = QSA decode always).  Full
-  tables: `wip/archive/qwen4exp/discovery/2026-09-07-qsa-dense-crossover-tables-soar-halo.md`
+  tables: `archive/work/wip-archive/qwen4exp/discovery/2026-09-07-qsa-dense-crossover-tables-soar-halo.md`
 
-Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.md`.
+Full fold trail + the superseded 21-patch series: `archive/work/wip-archive/qwen4exp/README.md`.
 
 ## Validation status (the gates this baseline holds)
 
@@ -426,7 +426,7 @@ Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.m
   below the width == `LLAMA_QSA_SPARSE_FA=0` dense reference (text-
   identical); multi-ubatch p5000 shortcut-ON run twice byte-identical
   (deterministic under the new no-sync re-pointing). Record:
-  `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-shortcut-fix.md`.
+  `archive/work/wip-archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-shortcut-fix.md`.
   NOTE: gfx1201/multi-GPU validation of patch 6 still pending (see the
   patch-6 note).
 
@@ -440,7 +440,7 @@ Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.m
   (same session, B ~1% stable): pp512 2.05->1.61x, pp1024 2.04->1.78x,
   pp2048 2.21->2.01x, pp4096 1.68->1.53x, pp8192 1.37->1.26x, pp16384
   1.14->1.06x. Record:
-  `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
+  `archive/work/wip-archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws3-routed-moe-mmq.md`.
   NOTE: RDNA4/gfx1201 enablement for patch 5 is still gated OFF — it
   needs the gfx1201 box in the delivery flow before it can be claimed
   there (the mmq.cuh compact kernel + J tables are RDNA3.5-tuned).
@@ -452,7 +452,7 @@ Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.m
   pp rows keep +4-6% at depth 12k/32k, tg@depth flat (decode
   untouched), memory stable −r3 through 32k, llama-cli same-seed text
   identical on == off (logit-level bit-exactness proven in-session).
-  Record: `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws4-hc-fusion-gates.md`.
+  Record: `archive/work/wip-archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-ws4-hc-fusion-gates.md`.
   (The gfx1201/RDNA4 records for patches 1-3 are the bullets below.)
 
 - llama-bench (3x R9700 tensor, ngl 99, ub 2048, warm page cache):
@@ -527,8 +527,8 @@ Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.m
 ## Open items (carried forward from WIP)
 
 - **gfx1201 QSA-decode tuning (OPEN work package, 2026-09-06/07 — see
-  `wip/qwen4exp/gfx1201-porting.md` Phase 2.1 + the discovery record
-  `wip/archive/qwen4exp/discovery/2026-09-06-gfx1201-qsa-depth.md`):** sparse decode
+  `archive/work/qwen4exp/gfx1201-porting.md` Phase 2.1 + the discovery record
+  `archive/work/wip-archive/qwen4exp/discovery/2026-09-06-gfx1201-qsa-depth.md`):** sparse decode
   (QSA default ON) LOSES to the dense reference at depth on gfx1201 — dense +20% @32K /
   +29% @64K decode, flat at d0; prefill sparse wins +14.5% @32K / +48% @64K (crossover
   between 16-32K ctx).  Maintainer direction (2026-09-07): QSA was developed and showed
@@ -574,6 +574,6 @@ Full fold trail + the superseded 21-patch series: `wip/archive/qwen4exp/README.m
 
 The full WIP history (per-commit patch files 0005-0020 with notes, the
 handoff/handover docs, plans, and micro-bench tools) was moved to
-`../../wip/qwen4exp/archive/` when this directory was created - the
+`../../archive/work/qwen4exp/archive/` when this directory was created - the
 items there were promoted to this beta directory as the pair of
 squashed patches above.

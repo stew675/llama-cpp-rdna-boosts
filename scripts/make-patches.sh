@@ -46,7 +46,7 @@
 #                 W1 GGML_QSA_SCORE_MEM, W2 GGML_QSA_DERIVED_BIAS/_VIS, W3
 #                 LLAMA_QSA_KEYS_ONLY, W4 ggml-alloc unused-view release, V3
 #                 LLAMA_KQ_MASK_DERIVED, V4/V5 GGML_CUDA_FA_KV_NATIVE (opt-in);
-#                 promoted from beta/block-15-campaign-wins/).
+#                 promoted from archive/work/block-15-campaign-wins/).
 #                 And the 2026-09-12 (16) block-08 + block-10 amendment (issue #30):
 #                 the RDNA4 calc_nwarps table is band-uniform nwarps=1 and block 10's
 #                 VDR=4 mmvq boost is reverted (see patches/README.md).

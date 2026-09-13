@@ -61,8 +61,8 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   regressed below the 3-op fallback; a Q3_K@96 probe also lost to the
   cap 64).  Details + numbers:
   `patches/README.md` block-13 notes and
-  `wip/archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md` +
-  `wip/archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
+  `archive/work/wip-archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md` +
+  `archive/work/wip-archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`.
   **Also amended 2026-09-11 (fourth amendment) with the fused shared-expert
   epilogue band**: the decode-only `ne[1] == 1` gate on `ggml_cuda_op_shexp_down_gate`
   now serves the whole `n_tokens <= MMVQ_MAX_BATCH_SIZE` band — the two kernels are
@@ -124,7 +124,7 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   cleared and all eight native KV types are pure at n_max 1/2/3/5/7).
   See the block-14 notes in `patches/README.md` and the beta
   validation record in `beta/qwen4exp/README.md`.
-- Block **15** (`patches/0015`, **delivered 2026-09-12**, promoted from `beta/block-15-campaign-wins/`): the attention-memory campaign wins --
+- Block **15** (`patches/0015`, **delivered 2026-09-12**, promoted from `archive/work/block-15-campaign-wins/`): the attention-memory campaign wins --
   **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived QSA
   per-block bias + derived visibility + the input-fill null guards
   (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), **W3** keys-only QSA
@@ -147,7 +147,7 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   2026-09-12 promotion; the dense-arm blocker and its one-line fix are
   closed, the revalidation reproduced every reserve number and the width
   probe hashes, and the patch is now `patches/0015`.  See
-  `beta/block-15-campaign-wins/README.md` (PROMOTED),
+  `archive/work/block-15-campaign-wins/README.md` (PROMOTED),
   `patches/README.md` (the promotion section) and the `WORKLOG.md` entry.
 
 The repo is NOT the fork: the fork (source of truth for the block commits)
@@ -195,7 +195,7 @@ which is what
 `scripts/make-patches.sh`'s default tip refers
 to; always regenerate from a canonical fork rebuilt at the fork point.
 **Block 15 (the attention-memory campaign) is the delivery's last patch** --
-promoted 2026-09-12 from `beta/block-15-campaign-wins/` (`patches/0015`;
+promoted 2026-09-12 from `archive/work/block-15-campaign-wins/` (`patches/0015`;
 the canonical 16-block tip is `907799de3`, tree
 `c2e284c2acc032238ef85cb35d427c1598ed0949`; the 2026-09-12 (18) block-13
 amendment -- the dense mmvq weight per-(type, K) nwarps (Q8_0 `K < 4096` -> 8, else 1;
@@ -315,11 +315,11 @@ explicitly requests it.**
 | `scripts/make-patches.sh` | regenerates the set from the fork |
 | `rdna-boosts-all.patch` | the entire 16-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
-| `wip/` | exploration docs, tuning tools, session handoffs — **NOT part of the delivery** (see the WIP rule below) |
-| `beta/` | **promoted-from-WIP staging** (e.g. `beta/qwen4exp/` = qwen4exp support + its validation record; `qwen4exp-support.patch` promoted into the delivery as block 14; `beta/block-15-campaign-wins/` = the attention-memory campaign record, its patch **promoted into the delivery as block 15 on 2026-09-12**): each README is the promotion/gate record and `BETA-TESTING.md` the tester checklist — see the WIP rule below |
+| `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live work (currently `wip/iq4nl-prefill/`); completed trees are archived under `archive/work/` (see the WIP rule below) |
+| `beta/` | **promoted-from-WIP staging** (currently `beta/qwen4exp/` = qwen4exp support + its validation record; promoted into the delivery as block 14).  The block-15 campaign record it used to stage is now `archive/work/block-15-campaign-wins/` (promoted as block 15 on 2026-09-12): each README is the promotion/gate record and `BETA-TESTING.md` the tester checklist — see the WIP rule below |
 | `upstream/` | **upstream-PR candidates** — self-contained changes that could be filed against unadulterated `ggml-org/llama.cpp` master, each with a `UPSTREAM-PR-*.md` note + `.patch` (see its README for the double-apply caution and the status table) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
-| `archive/work/` | closed experiments, preserved for future re-evaluation |
+| `archive/work/` | closed experiments, preserved for future re-evaluation (includes the completed `wip/` trees archived 2026-09-12) |
 | `baseline/*` branches, `block/*` tags | **historical** pre-block-12 checkpoints — do not use for the current delivery |
 
 ## Scope policy — RDNA first, other backends uninjured (2026-09-11)
@@ -357,7 +357,7 @@ Consequences, so it is not re-litigated:
   records), "block 12" can mean the old *k-quant umbrella* (now block 10).
   In the current delivery, **block 12 = the hybrid all-reduce, period.**
 - **tg/throughput is NOT a correctness signal.** Always verify coherence:
-  llama-cli same-seed comparison (see below) or `wip/tools/ar_kernel_unit.cpp`.
+  llama-cli same-seed comparison (see below) or `archive/work/tools/ar_kernel_unit.cpp`.
 - **Everything is fast at depth 0** — decode perf work must be validated at
   depth-16384 (benchy protocol), not shallow llama-bench.
 - **Never run parallel/background benches** — they contaminate results.
@@ -464,7 +464,7 @@ Consequences, so it is not re-litigated:
   `Q->ne[1] > 8` changes the reduction beyond it); on 2-GPU `-sm tensor` it was
   `n_max <= 5` until the block-12 dispatch fix described below
   (`GREEDY-PURITY.md` §11, follow-ups Part 3).
-  Record: `wip/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FIX.md`.
+  Record: `archive/work/issue-25-mtp-batch-width/GDN-CHUNKED-PREFILL-FIX.md`.
 - **Block-12 AR_PROFILE init fix (2026-09-01, PR #8, integrated):**
   `devices[]` is filled from the caller list before the profiler
   hipMallocs — with `GGML_CUDA_AR_PROFILE=1` the buffers were allocated
@@ -543,7 +543,7 @@ Consequences, so it is not re-litigated:
   verify batch fell through to the sparse top-k selection.  The arm now serves the
   whole band (`QSA_DECODE_BAND = 8`), so `plain == n_max 3 == n_max 7`
   byte-identically (`804de0576868` f16, `75d8530c5bb1` q8_0); an arm trace proved
-  it (`wip/kv-quant-purity-followups/tools/qsa-arm-trace.patch`).  **Re-measured on
+  it (`archive/work/kv-quant-purity-followups/tools/qsa-arm-trace.patch`).  **Re-measured on
   gfx1151 2026-09-12 (the two previously-recorded sparse-regime items):** both were
   artifacts of the block-13 RDNA3_5 mmvq-fusion impurity (fixed 2026-09-12) — the fused
   indexer score is byte-identical to the per-op chain (512-token forced-sparse A/B:
@@ -570,35 +570,36 @@ Consequences, so it is not re-litigated:
   `W = 1,2,3,4,5,8` is 0 mismatches with decode's `Thash` unchanged (`ea713a1c1f515bc1`) — TODO
   item 17 closed and item 4(b) no longer *Documented*.  See `GREEDY-PURITY.md`
   §§16-18, §28-§29 and
-  `wip/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`.
+  `archive/work/strix-halo/RECORD-2026-09-12-qsa-item4-deep-dive.md`.
 - The one-sided AR wait (dev0/bus-06 dispatch-gap asymmetry, ~12.7 µs/call)
   is a **platform-level CP/driver property**, not reachable from the AR
   kernel, graph tail, or host-side pacing — fusion/pacing are CLOSED
   (`archive/work/fused-stage-pacing/`).
-- **WIP rule (MANDATORY):** everything under `wip/` — including the loose
-  patch/diff files in `wip/qwen4exp/patches/`,
-  `wip/qwen35moe-prefill/patches/`, `wip/hybrid-allreduce/` and
-  `wip/managed-ngrams/patches/` — is **experimental work, NOT part of the
-  delivery**. Never apply any `wip/` item to the `~/llama.cpp` fork or any
-  llama.cpp checkout, never fold `wip/` content into `patches/`, and never
-  present `wip/` results as delivery claims, **unless the user explicitly
-  asks you to work with a specific `wip/` item**. They are kept for future
-  re-evaluation only.
+- **WIP rule (MANDATORY):** everything under `wip/` **and `archive/work/`** — including the loose
+  patch/diff files in `archive/work/qwen4exp/patches/`,
+  `archive/work/wip-archive/qwen35moe-prefill/patches/`, `archive/work/wip-archive/hybrid-allreduce/` and
+  `archive/work/wip-archive/managed-ngrams/patches/` — is **experimental work, NOT part of the
+  delivery**. Never apply any `wip/` or `archive/work/` item to the `~/llama.cpp` fork or any
+  llama.cpp checkout, never fold their content into `patches/`, and never
+  present their results as delivery claims, **unless the user explicitly
+  asks you to work with a specific item**. They are kept for future
+  re-evaluation only.  (2026-09-12: the completed `wip/` trees were moved to
+  `archive/work/`; `wip/` now holds only the active `iq4nl-prefill/` handoff.)
 - **Promotion rule (the sanctioned way out of `wip/`):** a campaign's
   *validated* wins are collected under `beta/` (for the memory campaign:
-  `beta/block-15-campaign-wins/`), each win gets an environment kill-switch so
+  `archive/work/block-15-campaign-wins/`), each win gets an environment kill-switch so
   it can be A/B tested and bisected, the **combination** is re-validated (the
   individual validations do not carry over), and only then is a new delivery
   block cut — for this campaign **Block 0015** — with the maintainer's
   go-ahead after a ~4–5 day beta window.  Anything that is also applicable to
   unadulterated upstream `ggml-org/llama.cpp` gets a copy under `upstream/`
   (as `UPSTREAM-PR-<slug>.md` + `.patch`) so it can be filed as a PR.
-- **Block 15 is the memory campaign (`patches/0015` since the 2026-09-12 promotion; formerly staged in `beta/block-15-campaign-wins/`).**
+- **Block 15 is the memory campaign (`patches/0015` since the 2026-09-12 promotion; formerly staged in `archive/work/block-15-campaign-wins/`).**
   Its wins are **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`),
   **W2** derived QSA per-block bias + visibility (`GGML_QSA_DERIVED_BIAS`,
   `GGML_QSA_DERIVED_VIS`), **W3** keys-only QSA indexer cache
   (`LLAMA_QSA_KEYS_ONLY`), **W4** ggml-alloc unused-view release (no gate;
-  A/B with `beta/block-15-campaign-wins/ab/w4-revert.patch`), **V3** derived
+  A/B with `archive/work/block-15-campaign-wins/ab/w4-revert.patch`), **V3** derived
   kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default — the packed mask is still
   created in every graph and simply loses its consumer, so the allocator
   leaves it unallocated), **V4** native q8_0 K/V and **V5** native bf16
@@ -669,7 +670,7 @@ Consequences, so it is not re-litigated:
   3.4x faster; F3's first experiment is a `GGML_CUDA_FA_ALL_QUANTS=ON` build
   A/B, since the slow types are rejected by
   `ggml_cuda_fattn_kv_type_supported()` rather than missing a kernel):
-  `GREEDY-PURITY.md` §12 and `wip/kv-quant-purity-followups/`.
+  `GREEDY-PURITY.md` §12 and `archive/work/kv-quant-purity-followups/`.
 
 ## Common tasks
 

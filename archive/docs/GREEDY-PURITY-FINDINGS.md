@@ -48,7 +48,7 @@ not change any kernel.)
 while the logits had already diverged (`bc3faabd` vs `91434ea9`) -- no greedy
 near-tie happened to flip inside that window.  Text equality is evidence *for*
 purity, never evidence *against* divergence; this is the same near-tie rarity
-noted in `../wip/sm-tensor-plain-vs-spec/HANDOVER-2026-09-11.md`.
+noted in `../archive/work/sm-tensor-plain-vs-spec/HANDOVER-2026-09-11.md`.
 
 **Cause A (fork-specific; FIXED 2026-09-11): block 12's size-based all-reduce
 dispatch.**  `ggml_backend_cuda_comm_is_small()` routes a reduction to the
@@ -134,7 +134,7 @@ that; use acceptance + MTP-vs-plain throughput (see
 `benchmarks/mtp-adaptive-methodology.md`).  Adaptive MTP's recommended
 `n_max = 12` remains outside the *guaranteed* range by Cause B, which is
 deliberate.  Records: `patches/README.md` block-12 notes, the 2026-09-11
-WORKLOG entry, `wip/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 3.
+WORKLOG entry, `archive/work/sm-tensor-plain-vs-spec/FOLLOWUPS-2026-09-11.md` Part 3.
 
 ## 13. qwen4exp and the hyper-connection band (2026-09-11, Block 14 amendment)
 
@@ -166,7 +166,7 @@ does not restore text equality there (the `W=1` decode is still unchanged).
 ## 14. F1 fixed (2026-09-11, block-08 amendment): the decode/verify band no longer spans two FA kernel families
 
 §12's `q8_0`/`q4_0` impurity is fixed.  Root cause, found with a new kernel-chooser trace (committed for
-reuse as `wip/kv-quant-purity-followups/tools/fa-kernel-chooser-trace.patch`, `GGML_CUDA_FA_TRACE=1`):
+reuse as `archive/work/kv-quant-purity-followups/tools/fa-kernel-chooser-trace.patch`, `GGML_CUDA_FA_TRACE=1`):
 `ggml_cuda_get_best_fattn_kernel()` (`ggml/src/ggml-cuda/fattn.cu`) returned **VEC** for `n_q <= 2` with
 a quantized K/V and **TILE** from `n_q = 3`.  The two families order the online-softmax/PV reduction
 differently, so token-0 logits at `W = 1,2` disagreed with every verify width.  Both VEC conditions are

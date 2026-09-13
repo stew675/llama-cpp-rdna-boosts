@@ -26,7 +26,7 @@ see
 native q8_0/bf16 K/V (V4/V5), QSA score-chain/bias/indexer-cache pruning
 (W1-W3) and the ggml-alloc unused-view release (W4)) is **promoted to the
 delivery** as `patches/0015` (promoted 2026-09-12 from
-`beta/block-15-campaign-wins/`).
+`archive/work/block-15-campaign-wins/`).
 The patches apply to a clean
 llama.cpp checkout at the recorded fork point `9113cc188` (re-based 2026-09-08 from `050dde50c`, itself re-based 2026-09-07 from `465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`).
 
@@ -76,7 +76,7 @@ llama.cpp at the fork
 point `9113cc188` (blocks 00-15 in `patches/`, applied with `git am` via
 `scripts/apply-all.sh`; canonical 16-block tip `907799de3`, net tree
 `c2e284c2acc032238ef85cb35d427c1598ed0949`, rebuilt at the
-fork point; block 15 promoted 2026-09-12 from `beta/block-15-campaign-wins/`; block 02 amended 2026-09-12 with the rollback-bounded chunked-GDN threshold
+fork point; block 15 promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`; block 02 amended 2026-09-12 with the rollback-bounded chunked-GDN threshold
 (`n_rs_batch`) and the pre-batch snapshot slots, block 13 amended 2026-09-11 with the MoE
 decode/verify mmvq band and the fused shared-expert epilogue band, block 14 amended 2026-09-11 with the hyper-connection band, the QSA
 decode arm and the iq4_nl QSA enablement and 2026-09-12 with the configurable QSA prefill arm
@@ -91,7 +91,7 @@ decode/verify dispatch fix (**+6.2% MoE decode**) and the `GGML_CUDA_DISABLE_SHE
 decode-only fused shared-expert window is the accepted MoE decode!=verify
 residual).  **Block 15 (the attention-memory campaign) was promoted on
 2026-09-12** to `patches/0015` (previously staged in
-`beta/block-15-campaign-wins/`) -- the notes below are its promotion record.
+`archive/work/block-15-campaign-wins/`) -- the notes below are its promotion record.
 The set applies
 **whitespace-clean** (strict `git am`, no 3-way fallback) and each block
 is build- and coherence-verified — see [`MANIFESTS.md`](MANIFESTS.md)
@@ -115,7 +115,7 @@ summary below is deliberately short and does not repeat them.
   strict **16/16** `git am` on a fresh worktree at `9113cc188`, zero
   whitespace warnings, applied tree == the re-validated beta tree.  The
   promoted patch is byte-identical to
-  `beta/block-15-campaign-wins/block-15-campaign-wins.patch` except its
+  `archive/work/block-15-campaign-wins/block-15-campaign-wins.patch` except its
   `From <sha>` line.  The seven wins keep their env gates: **W1**
   QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived QSA
   per-block bias + visibility + input-fill null guards
@@ -143,7 +143,7 @@ summary below is deliberately short and does not repeat them.
   identical at `6.5244`; `GGML_QSA_DERIVED_*=0` restores the delivery's
   values).  Full record: `patches/README.md` (block-15 promotion section),
   [`WORKLOG.md`](WORKLOG.md) and
-  [`beta/block-15-campaign-wins/README.md`](beta/block-15-campaign-wins/README.md)
+  [`archive/work/block-15-campaign-wins/README.md`](archive/work/block-15-campaign-wins/README.md)
   (marked PROMOTED).
 
 
@@ -164,10 +164,10 @@ summary below is deliberately short and does not repeat them.
 │   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift)
 │   └── make-patches.sh    # regenerates the set from the fork (~/llama.cpp)
 ├── benchmarks/            # benchy methodology + v1/v2 results + graphs (dated records)
-├── wip/                   # exploration docs + tuning tools + HANDOFF (session log)
-├── beta/                  # promotion staging: beta/qwen4exp/ + beta/block-15-campaign-wins/
+├── wip/                   # ACTIVE exploration docs / handoffs (currently: iq4nl-prefill/)
+├── beta/                  # promotion staging (currently: beta/qwen4exp/); promoted campaigns move on
 ├── upstream/              # upstream-PR candidates (UPSTREAM-PR-*.md + .patch) + their index
-└── archive/               # the rest: archive/work/ (closed experiments) + archive/docs/ (history)
+└── archive/               # the rest: archive/work/ (closed experiments + the archived wip/ trees) + archive/docs/ (history)
 ```
 
 > **History:** the `baseline/<sha>` branches, `block/01-…11` tags, and all
@@ -195,11 +195,11 @@ summary below is deliberately short and does not repeat them.
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** — prefill fused expert MMQ (RDNA4 + RDNA3_5 + RDNA3_0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K, env opt-out `GGML_CUDA_DISABLE_MOE_MMQ_FUSION`) + decode item-split (rpb 2/4/8) merged with the upstream has_fusion mmvq path |
 | `0014` | **qwen4exp / Qwen3.8-Flash-Next support** — QSA sparse FA (default) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy (promoted from `beta/qwen4exp`; see `patches/README.md` block-14 notes). The masked-V/freed-cell fixes it once carried now live in blocks 00 (Vulkan) and 03 (HIP). |
 
-| `0015` | **attention-memory wins (block 15)** — promoted 2026-09-12 from `beta/block-15-campaign-wins/`: **V3** derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default), **V4** native q8_0 + **V5** native bf16 K/V in the FA kernels (both behind `GGML_CUDA_FA_KV_NATIVE`, opt-in default 0), **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived QSA per-block bias + visibility (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), **W3** keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), **W4** ggml-alloc unused-view release (no gate; A/B revert in `beta/block-15-campaign-wins/ab/`).  ~3.4 GiB/GPU + ~1.2 GiB host saved on qwen4exp, ~800 MiB/GPU + ~800 MiB host on dense models, at ~1.3 % prefill / ~0.3 % decode. |
+| `0015` | **attention-memory wins (block 15)** — promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`: **V3** derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default), **V4** native q8_0 + **V5** native bf16 K/V in the FA kernels (both behind `GGML_CUDA_FA_KV_NATIVE`, opt-in default 0), **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived QSA per-block bias + visibility (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), **W3** keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), **W4** ggml-alloc unused-view release (no gate; A/B revert in `archive/work/block-15-campaign-wins/ab/`).  ~3.4 GiB/GPU + ~1.2 GiB host saved on qwen4exp, ~800 MiB/GPU + ~800 MiB host on dense models, at ~1.3 % prefill / ~0.3 % decode. |
 
 > **Block 15 (attention-memory wins) is part of the delivery since
 > 2026-09-12** (`patches/0015`, promoted from
-> `beta/block-15-campaign-wins/`; a fresh set is now **16 patches**,
+> `archive/work/block-15-campaign-wins/`; a fresh set is now **16 patches**,
 > blocks 00-15).
 
 > **Greedy-purity note (read before shipping):** on the K-split decode

@@ -107,5 +107,5 @@ ub2048 runs at 2130-2156 t/s on the clean box; layer-split pp8192 ~1650-1700 t/s
   (`465e49b9c`), run llama-bench pp512..16384 single-GPU + a multi-GPU tensor-split sanity
   run, and a same-seed coherence diff vs the unpatched build.  Reference records live in
   the delivery repo: `beta/qwen4exp/README.md` (2026-09-06 validation bullet),
-  `beta/qwen4exp/HALO_HANDOFF.md` (halo protocol), and `wip/archive/qwen4exp/discovery/
+  `beta/qwen4exp/HALO_HANDOFF.md` (halo protocol), and `archive/work/wip-archive/qwen4exp/discovery/
   2026-09-05-strix-halo-gfx1151-ws3-shortcut-fix.md` (original artifact + fix analysis).
