@@ -35,16 +35,6 @@ the device-query arm gate replacing the mirrored type list — so **Active is no
 
 ## Active (kept compact: only what this repo will work on next)
 
-### 18. qwen4exp **weight**-IQ4_NL prefill fast path (>1100 t/s target)
-- Our prefill on pwilkin's uniform-IQ4_NL model is **787 t/s** at pp16384 vs his stack's **1409**
-  (1.79x); we are ahead on decode (31.26 vs 30.36).  The gap is a missing **quantized-weight -> bf16 ->
-  WMMA** GEMM (his `mmb`), not the model and not the KV cache (that is item 3).  Success = **>1100**
-  t/s on his model.  Port the *generic* parts only (weight GEMM first, fusions second); a follow-on
-  IQ3_S expert variant is what would help *our* checkpoint.  Handover + prompt:
-  `wip/iq4nl-prefill/` (`HANDOVER-2026-09-12-iq4nl-weight-gemm-port.md`, `PROMPT.md`,
-  `launcher-env.txt`).  A/B base: our 16-patch delivery ~787, pwilkin `strix-halo` + his launcher env
-  ~1409, same box/session.
-
 ### 3. qwen4exp `iq4_nl` prefill delta (~8–12 %, open — profiled to be host/launch-side)
 - Measured on the reference `-sm tensor`: `iq4_nl` 2303.1/2421.0 t/s at pp8192 (sparse/dense) vs f16
   2615.5/2736.2 and `q4_0` ~2597 — and the gap grows with context (pp32768 1992.1 vs 2434.5).  Dense
