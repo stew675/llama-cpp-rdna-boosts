@@ -11,6 +11,11 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
+> **Current baseline marker:** `baseline/790cf51aa` is the **new** (2026-09-13)
+> delivery baseline — the `main` release commit for the 16-block set at the
+> `790cf51aa` fork point.  It is NOT one of the historical pre-block-12
+> checkpoints listed below; those remain frozen records.
+
 > **Naming collision warning:** in the OLD records below, "block 12"
 > sometimes means the old *k-quant umbrella* (folded into what is now block
 > 10) and sometimes the *hybrid all-reduce* (the current block 12). In the
