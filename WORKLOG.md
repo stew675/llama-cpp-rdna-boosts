@@ -43,6 +43,12 @@ added to the re-base checklist, so a silent aggregate-init default slipped throu
 fallback is the guard against the class.  See `patches/README.md` (2026-09-13 block-14 (ninth)) and
 `TODO.md` (Closed).
 
+**Test-infrastructure follow-up (same day):** added `prompts/` — versioned, hash-stable test prompts
+(`prompts/README.md` records size, token count and sha256 per prompt; a shipped prompt is never edited
+in place).  First entry: `prompts/prose-rdna-boosts.txt` (16074 B, 5298 tokens, `sha256 fabdec65…`),
+the prompt used for the issue-#30 reproduction and the Protocol-A MTP gate.  The issue-#30 reply now
+points at it instead of pasting the prompt inline, so reported numbers are tied to a committed hash.
+
 ## 2026-09-13 (even later) — block-08 amendment (seventh): the fused MoE router is bit-identical — TODO item 19 closed
 
 **Canonical chain amended in place** (block 08 `8c072080a` -> `ffa7c1c1b`, the rest replayed; new tip

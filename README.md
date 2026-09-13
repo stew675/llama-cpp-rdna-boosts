@@ -139,6 +139,7 @@ re-baselines, regenerations) are tracked as dated entries — newest first — i
 │   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift)
 │   └── make-patches.sh    # regenerates the set from the fork (~/llama.cpp)
 ├── benchmarks/            # benchy methodology + v1/v2 results + graphs (dated records)
+├── prompts/               # versioned, hash-stable test prompts (sha256-recorded; never edited in place)
 ├── wip/                   # ACTIVE exploration docs / handoffs (currently: iq4nl-prefill/)
 ├── beta/                  # promotion staging (currently: beta/qwen4exp/); promoted campaigns move on
 ├── upstream/              # upstream-PR candidates (UPSTREAM-PR-*.md + .patch) + their index

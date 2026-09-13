@@ -90,10 +90,14 @@ HIP_VISIBLE_DEVICES=0 GGML_CUDA_DISABLE_GRAPHS=0 <build>/bin/llama-cli \
   --cache-type-k bf16 --cache-type-v bf16 --ctx-checkpoints 64 \
   --reasoning-budget 65536 --reasoning-preserve --repeat-penalty 1.0 \
   --presence-penalty 1.5 --seed 42 --single-turn \
-  --spec-type draft-mtp --prompt '<prose prompt>'
+  --spec-type draft-mtp --prompt "$(cat prompts/prose-rdna-boosts.txt)"
 ```
 
-Run the same with `--spec-type none` and compare. Gate rules:
+Run the same with `--spec-type none` and compare.  The prompt is the versioned
+`prompts/prose-rdna-boosts.txt` (16074 B, 5298 tokens, `sha256 fabdec65…`) — record the hash with any
+result, and never edit a shipped prompt in place (see `prompts/README.md`).
+
+Gate rules:
 1. **Acceptance**: with `--log-verbosity 4`, the `draft acceptance` /
    `acc per pos` lines must show a healthy rate on prose (>= ~0.45 at pos 1
    for these models; the 2026-09-02 regression showed 0.000). A collapse to
