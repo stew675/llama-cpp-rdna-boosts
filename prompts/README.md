@@ -19,11 +19,13 @@ numbers unreproducible. Every prompt here is a committed file with a recorded si
 
 | file | bytes | tokens¹ | sha256 | used for |
 |---|---:|---:|---|---|
-| `prose-rdna-boosts.txt` | 16074 | 5298 | `fabdec65f5859e5508cc863a6e5f976706d5a770bb53eb1b406dc5aee3667727` | the issue-#30 reproduction: dense 27B `plain`/`draft-mtp n3`/`n7` throughput + acceptance + text purity, and the same gate on qwen4exp. Long English prose (~5.3 k tokens) so the model has room to generate a multi-hundred-token greedy continuation. |
-| `code-python.txt` | 2025 | 533 | `53da7f2387e36baf6300b40262f1e17550fc96f2fd32a9da08ee453bc35f9b65` | an optional code-generation workload. Used to show that acceptance and MTP throughput are **prompt-content dependent**: the same build moved stock `n3` 40.66 -> 46.02 t/s purely by swapping this file in for the prose prompt. Never compare raw t/s across different prompts. |
+| `prose-rdna-boosts.txt` | 16074 | 5246 | `fabdec65f5859e5508cc863a6e5f976706d5a770bb53eb1b406dc5aee3667727` | the issue-#30 reproduction: dense 27B `plain`/`draft-mtp n3`/`n7` throughput + acceptance + text purity, and the same gate on qwen4exp. Long English prose so the model has room to generate a multi-hundred-token greedy continuation. |
+| `reasoning.txt` | 1689 | 385 | `242f5e6f2ba2b925cf218fc02bd69ac00b815d2e09f1897f7c037ba1f621bf4b` | reasoning workload (the **R** axis of the adaptive-MTP sweep): a constrained scheduling puzzle that induces a step-by-step derivation. |
+| `code-python.txt` | 2025 | 533 | `53da7f2387e36baf6300b40262f1e17550fc96f2fd32a9da08ee453bc35f9b65` | code-generation workload (the **C** axis): a fixed set of Python implementation tasks. Highly predictable output, so acceptance is higher than prose. |
+| `recall.txt` | 2001 | 551 | `4e11ce3c7369cee37932f545215d72a2750452405a7307060d63f119af6897cb` | verbatim-recall workload (the **K** axis): a distinctive passage to reproduce character for character. The highest-acceptance workload, and the one where the adaptive controller drafts deepest. |
 
-¹ Token count on the Qwen3.8-27B tokenizer with the standard llama.cpp BPE (a different model/tokenizer
-will differ — the **byte size and sha256** are the stable identity, not the token count).
+¹ Token count from `llama-tokenize` on the Qwen3.8-27B tokenizer (a different tokenizer will differ; the
+**byte size and sha256** are the stable identity, not the token count).
 
 The file's content is the delivery repo's own documentation; it is deliberately stable once committed
 and is *not* regenerated when the docs change. If a fresh prose prompt is wanted, add a new file.
@@ -32,6 +34,11 @@ and is *not* regenerated when the docs change. If a fresh prose prompt is wanted
 predictable output accept more than generic prose, so a stock-vs-patched MTP comparison is only
 meaningful between runs that use the *same* prompt file. Two builds measured on two different prompts
 are not comparable, no matter how identical the binaries are.
+
+The four prompts above are the four axes the adaptive-MTP gate uses: **R** (reasoning), **P** (prose),
+**C** (code) and **K** (verbatim recall). Run all four when judging an adaptive-MTP change, since the
+adaptive controller's behaviour (and therefore the throughput) is a function of the workload's
+acceptance rate. Recorded results: `benchmarks/2026-09-13-adaptive-mtp-4-axis.md`.
 
 ## Usage
 
