@@ -73,20 +73,26 @@ line; generation t/s from the `eval time` line.
 ## The reporter's configuration (`n_max 8 --spec-draft-p-min 0.55`)
 
 Issue #30's measurement used `--spec-type draft-mtp --spec-draft-n-max 8 --spec-draft-p-min 0.55`.
-On the prose prompt, `-n 128`, same environment:
+The delivery clamps `n_max` to 7, so that command measures depth 7 on the delivery and depth 8 on
+stock. `-n 256`, same environment, one row per axis (t/s / acceptance):
 
-| build | command | t/s | acceptance |
-|---|---|---|---|
-| stock `790cf51aa` | `n_max 7 --spec-draft-p-min 0.55` | 43.62 | 0.75000 |
-| stock `790cf51aa` | `n_max 8 --spec-draft-p-min 0.55` | 45.71 | 0.77143 |
-| rdna-boosts | `n_max 7 --spec-draft-p-min 0.55` | 44.62 | 0.76699 |
-| rdna-boosts | `n_max 8 --spec-draft-p-min 0.55` (clamps to 7) | 44.53 | 0.76699 |
-| rdna-boosts | `n_max 8 --spec-draft-p-min 0.55`, `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` | 47.28 | 0.71818 |
+| axis | stock `n7`+pmin | stock `n8`+pmin | delivery `n8`+pmin (depth 7) | delivery `n8`+pmin (depth 8) |
+|---|---|---|---|---|
+| reasoning (R) | 53.72 / 0.75969 | 65.03 / 0.70968 | 56.34 / 0.73606 | 65.68 / 0.68641 |
+| prose (P) | 39.20 / 0.67556 | 41.00 / 0.72683 | 40.53 / 0.71212 | 42.02 / 0.68932 |
+| code (C) | 35.96 / 0.47649 | 40.98 / 0.52685 | 39.91 / 0.54610 | 40.62 / 0.47826 |
+| recall (K) | 70.99 / 0.92373 | 98.06 / 0.89796 | 71.34 / 0.90041 | 94.48 / 0.88259 |
 
-`--spec-draft-p-min` raises acceptance a lot on both arms (prose `n3` without it: 0.49020 stock /
-0.61654 delivery; with it: ~0.77 on both), so it must be part of any comparison that uses it. The
-`n_max` clamp is load-bearing: the delivery clamps to 7, so the reporter's exact command measures depth
-7 on the patched arm; disable the clamp (`LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0`) to measure a true depth 8.
+The depth 8 column used `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0`. Notes:
+
+* **The clamp dominates this row.** With a true depth 8 the delivery matches or beats stock on every
+  axis (R +1.0%, P +2.5%, C -0.9%, K -3.6%). Clamped to 7 it is 13% behind on reasoning and 27%
+  behind on recall. The reporter's `n8 + p-min` ratio (39.61 patched vs 46.13 stock, -14%) is very
+  close to our clamped reasoning ratio.
+* **`--spec-draft-p-min` is a large knob** and must be on both arms. It lifts prose acceptance from
+  0.49 / 0.62 without it to 0.68 to 0.73 with it.
+* **`-n` matters.** On prose at `-n 128` the same cells are: stock 43.62 (`n7`) / 45.71 (`n8`),
+  delivery 44.62 (`n7`) / 44.53 (`n8` clamped) / 47.28 (`n8` unclamped).
 
 ## Reproducing
 
