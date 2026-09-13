@@ -70,6 +70,24 @@ line; generation t/s from the `eval time` line.
 * **Plain decode is workload-insensitive** (27.9 to 29.1 t/s everywhere), as expected: without
   speculation there is no acceptance term.
 
+## The reporter's configuration (`n_max 8 --spec-draft-p-min 0.55`)
+
+Issue #30's measurement used `--spec-type draft-mtp --spec-draft-n-max 8 --spec-draft-p-min 0.55`.
+On the prose prompt, `-n 128`, same environment:
+
+| build | command | t/s | acceptance |
+|---|---|---|---|
+| stock `790cf51aa` | `n_max 7 --spec-draft-p-min 0.55` | 43.62 | 0.75000 |
+| stock `790cf51aa` | `n_max 8 --spec-draft-p-min 0.55` | 45.71 | 0.77143 |
+| rdna-boosts | `n_max 7 --spec-draft-p-min 0.55` | 44.62 | 0.76699 |
+| rdna-boosts | `n_max 8 --spec-draft-p-min 0.55` (clamps to 7) | 44.53 | 0.76699 |
+| rdna-boosts | `n_max 8 --spec-draft-p-min 0.55`, `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` | 47.28 | 0.71818 |
+
+`--spec-draft-p-min` raises acceptance a lot on both arms (prose `n3` without it: 0.49020 stock /
+0.61654 delivery; with it: ~0.77 on both), so it must be part of any comparison that uses it. The
+`n_max` clamp is load-bearing: the delivery clamps to 7, so the reporter's exact command measures depth
+7 on the patched arm; disable the clamp (`LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0`) to measure a true depth 8.
+
 ## Reproducing
 
 ```sh
