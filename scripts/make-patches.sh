@@ -69,6 +69,17 @@
 #                 `ne00 % QK_K` (the sub-block path reuses `dequantize_q4_nl`), the
 #                 predicate accepts any `ne00 % QK4_NL == 0`, and test-backend-ops
 #                 covers iq4_nl get_rows at 32/128/160/224 columns.
+#                 And the 2026-09-13 block-08 amendment (TODO item 19): the fused MoE
+#                 router is now bit-identical to the generic softmax -> argsort ->
+#                 get_rows -> norm chain, so the address-overlap guard that decides
+#                 whether the fusion fires can no longer change the model output.
+#                 topk-moe.cu reproduces the generic soft_max_f32 block_reduce
+#                 reduction order (per-warp butterfly + cross-warp butterfly) and the
+#                 reduce_rows_f32 sum_rows order, and divides by the (clamped) sum like
+#                 the generic div; argsort.cu's bitonic network breaks ties by index
+#                 (the CUB path is a stable radix sort and the fused router's
+#                 iterative argmax also picks the smaller expert index), so the
+#                 routed top-k no longer depends on the allocation plan.
 #                 The block-15 tip of the *working*
 #                 fork checkout (~/llama.cpp rdna-boosts) is a different SHA,
 #                 because that branch is a local rebuild -- do not use it for
@@ -88,7 +99,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
 BASELINE="${2:-790cf51aa}"
-TIP="${3:-ab2fabb440ac909e02e0482cabd673c339106b57}"
+TIP="${3:-6303f04894fa6251f7e8c9e9eff8742a24267113}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then

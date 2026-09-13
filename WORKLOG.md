@@ -1,5 +1,61 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-13 (even later) — block-08 amendment (seventh): the fused MoE router is bit-identical — TODO item 19 closed
+
+**Canonical chain amended in place** (block 08 `8c072080a` -> `ffa7c1c1b`, the rest replayed; new tip
+**`6303f04894fa6251f7e8c9e9eff8742a24267113`**, net tree
+**`311f3acebe82a65b1b6f38d3e77997c31910c7dd`**).  `patches/` regenerated from the rebuilt
+`~/llama.cpp` chain; a fresh `790cf51aa` worktree + `apply-all.sh` applies **strict 16/16 `git am`**,
+zero whitespace warnings, and its tree equals the amended tip tree.  `scripts/make-patches.sh` default
+tip updated; the single net patch regenerated.
+
+**The bug (TODO item 19).**  The sixth amendment's absolute `iq4_nl` text move exposed it: the fused
+MoE router (`ggml_cuda_op_topk_moe`) was **not** bit-identical to the generic
+`soft_max -> reshape -> argsort -> view -> get_rows -> [norm] -> [scale]` chain, and whether the fusion
+fires is decided by `ggml_cuda_check_fusion_memory_ranges()`'s **buffer-address overlap** test.  So the
+model output depended on the allocation plan: moving the QSA indexer `get_rows` off the CPU flipped the
+fusion coverage and changed the greedy text.  Three independent gaps: (1) the fused softmax used a flat
+32-lane butterfly while the generic `soft_max_f32`/`block_reduce` uses a per-warp butterfly over each
+consecutive 32-column group followed by a cross-warp butterfly over the per-warp results (36 % of
+random 512-value rows disagree, up to 2.4e-7 relative); (2) the fused norm accumulated the selected
+weights in the per-winner lanes and multiplied by `1/sum` while the generic chain is `sum_rows -> clamp
+-> div` (`weights[i] / sum`); (3) the generic CUDA argsort is a **non-stable** bitonic network, so its
+top-k set/order for exact ties (4 in one 3.3k-prefill + 64-token run) disagrees with the fused
+iterative argmax's smaller-index tie-break — and the CUDA CUB argsort path (`SortPairsDescending`) **is**
+stable, so the two CUDA argsort implementations already disagreed with each other.
+
+**The fix.**  `ggml/src/ggml-cuda/topk-moe.cu`: the softmax reproduces the generic two-phase
+`block_reduce` order (with the `experts_per_thread == 1` single-warp path preserved), the norm sums the
+selected weights in the generic `reduce_rows_f32` order (`warp_reduce_sum(lane j < n_expert_used ?
+output_weights[0] : 0)`, lane `j` holding selection `j`'s weight) and **divides** by the clamped sum.
+`ggml/src/ggml-cuda/argsort.cu`: the bitonic network breaks ties by index (smaller index first for
+`DESC`), matching CUB and the fused router.  `ggml/src/ggml-cuda/ggml-cuda.cu`: the
+`GGML_CUDA_DISABLE_TOPK_MOE_FUSION=1` A/B kill-switch (kept).
+
+**Validation** (3x R9700 gfx1201, ROCm 7.14, qwen4exp `IQ4_XS`, `/tmp/prompt3k.txt`, `--seed 42
+--temp 0`, `-c 32768 -b 2048 -ub 2048`):
+
+* fused == `GGML_CUDA_DISABLE_TOPK_MOE_FUSION=1` for **all eight native KV types**
+  (f16/bf16/q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl), on `-sm tensor` and on `-sm layer` (the split where the
+  tie divergence reproduced: `6e2290d44875` vs `8bd14f326f2b` pre-fix, one hash post-fix); forcing
+  the fusion (guard ignored) gives the same hash as both.
+* `plain == n_max 3 == n_max 7` within every native KV type (`iq4_nl` `086df944f6af`, `f16`
+  `92d01d72f895`, `q8_0` `c4000a0285f3`, `q4_0` `28857dc2b3d1`, `bf16` `ba4d858ae2f6`, `q4_1`
+  `3e04ba1e7908`, `q5_0` `348c743eb1b2`, `q5_1` `a5b6a81c33fa`) and on `-sm layer` for iq4_nl/f16.
+* the pre-fix *unfused* reference is now the fused hash too (`iq4_nl` tensor `086df944f6af`; pre-fix
+  fused `14a1a3f257f4` != unfused `086df944f6af`).
+* MTP `n_max 3` iq4_nl acceptance 0.59091 (pos-1 0.783, mean len 2.70).
+* `test-backend-ops test` **18065/18065** (`ARGSORT`/`TOP_K`/`GET_ROWS` pass; `test_argsort` data is
+  tie-free by construction); 4B `Qwen3.5-4B-Q8_0` `-sm tensor` coherence `1c5d32ac537d` unchanged
+  (dense, no router).
+* qwen4exp pp2048/pp8192/tg128 (`llama-bench`, iq4_nl) 1739/1748/48.1 -> 1715/1741/48.0 t/s, within the
+  run-to-run noise.
+
+**Scope note.**  The argsort change makes the CUDA bitonic path deterministic and consistent with the
+CUDA CUB path; the CPU `std::sort` comparator leaves ties unspecified, so there is no cross-backend tie
+contract to preserve.  See `patches/README.md` (2026-09-13 block-08 (seventh) section), `TODO.md`
+(item 19 closed) and `GREEDY-PURITY.md` §31, and `upstream/UPSTREAM-PR-moe-router-tie-break.{md,patch}`.
+
 ## 2026-09-13 (later) — block-08 amendment (sixth): the `iq4_nl` `GET_ROWS` CPU fallback — TODO item 3 closed
 
 **Canonical chain amended in place** (block 08 `de5246ada`, the rest replayed; new tip

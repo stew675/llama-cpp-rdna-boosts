@@ -65,6 +65,7 @@ finding, narrative moved to the findings file):
 | 28 | an export-only tail must not redefine the logits path (the MTP `embeddings_nextn` gather deferral) | doctrine + fix |
 | 29 | a flattened batch is not a token count (the QSA indexer score's `ne11 = 4 * n_tps`) | fix |
 | 30 | a support predicate decides the *layout*; an address-driven fusion can move the output (the `iq4_nl` GET_ROWS CPU fallback) | doctrine + fix |
+| 31 | an address-selected fusion must be bit-identical to the path it replaces (the MoE `topk_moe` router + the argsort tie-break) | doctrine + fix |
 
 
 ## 1. The one-sentence version
@@ -1089,3 +1090,44 @@ the moved op itself is bit-exact against the CPU at every width.
 **Instrument that localised it:** `GGML_SCHED_DEBUG=1` prints the per-graph split count (`iq4_nl` 142 vs
 `q4_0` 22) and `=2` prints the per-node backend (`node #611 (GET_ROWS) ... CPU#cache_idx_k_l3`) - cheaper
 and more direct than a profiler for "which op left the GPU".
+
+## 31. An address-selected fusion must be bit-identical to the path it replaces (2026-09-13, block-08 amendment (seventh))
+
+Item 30's follow-up (TODO item 19): the fused MoE router (`ggml_cuda_op_topk_moe`) was **not**
+bit-identical to the generic `soft_max -> argsort -> get_rows -> norm` chain, and the fusion is selected
+by `ggml_cuda_check_fusion_memory_ranges()`'s **buffer-address overlap** test - so the model output was a
+function of the allocation plan.  The fused kernel is now made to reproduce the generic arithmetic
+exactly:
+
+* **Softmax reduction order.**  The generic `soft_max_f32` launches one thread per column and reduces
+  with `block_reduce`: a per-warp butterfly over each consecutive 32-column group, then a cross-warp
+  butterfly over the per-warp results.  The fused kernel held column `l + i*32` in lane `l`, so its
+  single flat butterfly was a different association (36 % of random 512-value rows differ by up to
+  2.4e-7 relative).  The fix does the generic per-"virtual warp" `warp_reduce_sum(vals[i])` phase first
+  and the cross-warp phase second.  Max is exact under any order, so it needed no change.
+* **Normalization.**  The generic chain is `sum_rows -> clamp -> div`; the fused kernel accumulated the
+  winners in their own lanes and multiplied by `1/sum`.  It now sums in the `reduce_rows_f32` order
+  (`warp_reduce_sum(lane j < n_expert_used ? output_weights[0] : 0)`, lane `j` = selection `j`'s weight)
+  and **divides**.
+* **Argsort tie-break.**  The generic CUDA argsort is a non-stable bitonic network, so for exact ties its
+  top-k set/order is a function of the network, not the index - while the fused iterative argmax breaks
+  ties by the smaller index, and the CUDA CUB `argsort` path (`SortPairsDescending`) is stable too.  The
+  bitonic comparator now breaks ties by index, so all three agree.  Ties are real here: 4 occurred in
+  one 3.3k-prefill + 64-token qwen4exp run.
+
+**Rules to take from it:**
+
+* **A fusion whose selection depends on memory addresses must be numerically transparent** - the fused
+  kernel has to reproduce the chain it elides, or the same numbers give different text depending on the
+  allocator.  "Within a config, the coverage is width-uniform" is not enough; an unrelated layout change
+  can flip the coverage between runs.
+* **A non-stable sort is a latent fusion hazard.**  The bitonic argsort and the CUB argsort are two
+  implementations of the same op that already disagreed on ties; making the bitonic path stable (and
+  consistent with CUB) is a correctness improvement, not a tuning choice.  The CPU `std::sort`
+  comparator leaves ties unspecified, so no cross-backend tie contract is broken, and the backend-op
+  `ARGSORT` case is tie-free by construction.
+* **Verify with the kill-switch, not the hashes.**  The gate is `fused == GGML_CUDA_DISABLE_TOPK_MOE_FUSION=1`
+  (and == force-fuse) for every native KV type on both split modes; `plain == draft-mtp` alone would
+  have passed with either path (both are internally width-uniform).  The force-fuse probe
+  (`GGML_CUDA_TOPK_MOE_IGNORE_ALIAS`, temporary) additionally covers the call sites the address guard
+  would otherwise skip.

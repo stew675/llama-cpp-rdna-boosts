@@ -7,10 +7,11 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
 `wip/*` and `benchmarks/`.
 
 **Current state (2026-09-13, later):** the delivery is the **16-patch set** against fork point `790cf51aa`
-(block 00 + blocks 01-15), canonical 16-block tip **`ab2fabb440ac909e02e0482cabd673c339106b57`** (tree
-`e279b222e8e98a7574814929d4b6d97edae32a48`), `make-patches.sh` default tip =
-`ab2fabb440ac909e02e0482cabd673c339106b57` (the 2026-09-13 master re-base + the block-08 (sixth)
-`iq4_nl` `GET_ROWS` sub-`QK_K` amendment that closed item 3).  Block 15 (the attention-memory campaign) was **promoted to the delivery** as `patches/0015` (2026-09-12; TODO item 1 closed).  F1/F2/F3 (the
+(block 00 + blocks 01-15), canonical 16-block tip **`6303f04894fa6251f7e8c9e9eff8742a24267113`** (tree
+`311f3acebe82a65b1b6f38d3e77997c31910c7dd`), `make-patches.sh` default tip =
+`6303f04894fa6251f7e8c9e9eff8742a24267113` (the 2026-09-13 master re-base + the block-08 (sixth)
+`iq4_nl` `GET_ROWS` sub-`QK_K` amendment that closed item 3 + the block-08 (seventh) MoE-router
+bit-identity amendment that closed item 19).  Block 15 (the attention-memory campaign) was **promoted to the delivery** as `patches/0015` (2026-09-12; TODO item 1 closed).  F1/F2/F3 (the
 KV-quant purity/parity campaign) are **all closed** — every KV cache type the delivery supports is
 width-pure and takes the f16 attention path — and so is the gfx1151 within-band mmvq fusion variance
 (block-13 amendment, 2026-09-12; see Closed).  The QSA *sparse* regime was re-measured on gfx1151
@@ -39,24 +40,13 @@ amendment (sixth))**: the qwen4exp `iq4_nl` prefill delta was the QSA indexer ke
 super-blocks — the indexer row is 128); `getrows.cu` now has the sub-`QK_K` path and qwen4exp `iq4_nl`
 prefill matches f16/`q4_0` (pp8192 ~1815-1951 -> ~2385-2422 t/s, pp32768 +36 %).  The absolute `iq4_nl`
 greedy text moved because removing the host split re-allocates the graph and flips the
-address-dependent MoE-router `topk_moe` fusion — a pre-existing upstream fragility filed as **item 19**.
-**Active is now item 19 (new) and item 18**; the previous header's `9113cc188` / `0f4f83f9` references
-are superseded by the 2026-09-13 re-base to `790cf51aa` (tip `ab2fabb44`, tree `e279b222e8`).
+address-dependent MoE-router `topk_moe` fusion — a pre-existing upstream fragility that was filed as
+**item 19 and is now closed** (2026-09-13, block-08 amendment (seventh): the fused router is
+bit-identical to the generic chain, so the fusion selection no longer changes the output).
+**Active is now item 18 only**; the previous header's `9113cc188` / `0f4f83f9` references
+are superseded by the 2026-09-13 re-base to `790cf51aa` (tip `6303f0489`, tree `311f3acebe82a65b`).
 
 ## Active (kept compact: only what this repo will work on next)
-
-### 19. MoE-router `topk_moe` fusion selection is address-dependent (pre-existing, upstream)
-- `ggml_cuda_check_fusion_memory_ranges()` decides the fused-router subgraph (`softmax/argsort/... ->
-  topk_moe`) by testing **buffer-address overlap**, so a graph whose allocation shifts by an unrelated
-  change (e.g. moving the QSA indexer `get_rows` off the CPU, 2026-09-13) flips the fusion coverage.
-  The fused kernel is **not** bit-identical to the generic chain: a temporary
-  `GGML_CUDA_DISABLE_TOPK_MOE_FUSION` A/B moved the qwen4exp `iq4_nl` greedy text `14a1a3f257f4` ->
-  `086df944f6af`, i.e. the *model output* depends on the allocation plan, not only on the numerics.
-  Pre-existing and upstream (`ggml-cuda.cu`); the delivery's `W = 1..8` and `plain == draft-mtp` gates
-  are unaffected because the coverage is width-uniform within a config.
-- Fix direction: make the fused router bit-identical to the generic chain (then the selection is
-  harmless), or drop the address-overlap guard for this fusion.  Evidence: `WORKLOG.md` 2026-09-13
-  (later), `patches/README.md` 2026-09-13 block-08 section.
 
 ## Waiting on others (not actionable in this repo)
 
@@ -146,6 +136,20 @@ are superseded by the 2026-09-13 re-base to `790cf51aa` (tip `ab2fabb44`, tree `
   `archive/work/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
+
+- **MoE-router `topk_moe` fusion selection was address-dependent (TODO item 19, closed 2026-09-13, block-08
+  amendment (seventh)).**  The fused router was **not** bit-identical to the generic
+  `soft_max -> argsort -> get_rows -> norm` chain (different softmax reduction order, a reciprocal
+  instead of `sum_rows`+`div`, and an unstable bitonic-argsort tie-break vs the fused iterative
+  argmax's smaller-index rule), and the fusion is selected by an **address-overlap** guard — so moving
+  the QSA indexer `get_rows` to the GPU flipped the coverage and the qwen4exp `iq4_nl` greedy text.  The
+  fused kernel now reproduces the generic reduction orders and the bitonic argsort breaks ties by index
+  (matching the CUB path and the fused router), so fused == unfused for every native KV type on both
+  split modes; the `GGML_CUDA_DISABLE_TOPK_MOE_FUSION=1` A/B kill-switch is kept.  `iq4_nl` tensor
+  `plain == n_max 3 == n_max 7` = `086df944f6af` (the pre-fix *unfused* reference); `test-backend-ops`
+  18065/18065; 4B coherence unchanged (`1c5d32ac537d`).  Canonical tip `6303f0489`, tree
+  `311f3acebe82a65b1b6f38d3e77997c31910c7dd`; `WORKLOG.md` 2026-09-13 (block-08 (seventh)),
+  `patches/README.md` (2026-09-13 block-08 (seventh) section), `GREEDY-PURITY.md` §31.
 
 - **qwen4exp `iq4_nl` prefill delta (TODO item 3, closed 2026-09-13, block-08 amendment (sixth)).**  The
   QSA indexer key cache tracks `type_k`, so an `iq4_nl` cache sent the 128-wide indexer `get_rows` to

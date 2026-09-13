@@ -9,7 +9,7 @@ functional delta was dropped — upstream itself reverted #24233 in #28604 the
 same day, matching its end state — and the block now carries only the
 host-buffer rationale marker comment (see the block-06 note below); block 14's
 quantized-KV tensor-split gate merged additively with upstream #28390's
-single-device `SPLIT_MODE_TENSOR` warn; block 08 amended 2026-09-13 (sixth) with the `iq4_nl` `GET_ROWS` sub-`QK_K` path (TODO item 3 — an `iq4_nl` indexer key cache sent the indexer gather to the CPU; the op is now on the GPU, restoring ~25 % of long-context qwen4exp prefill — see the 2026-09-13 block-08 section below), amended 2026-09-11 with the decode/verify FlashAttention kernel-family fix
+single-device `SPLIT_MODE_TENSOR` warn; block 08 amended 2026-09-13 (sixth) with the `iq4_nl` `GET_ROWS` sub-`QK_K` path (TODO item 3 — an `iq4_nl` indexer key cache sent the indexer gather to the CPU; the op is now on the GPU, restoring ~25 % of long-context qwen4exp prefill — see the 2026-09-13 block-08 section below) and 2026-09-13 (seventh) with the **MoE-router bit-identity fix** (TODO item 19 — the fused `topk_moe` router now reproduces the generic `soft_max`/`sum_rows` reduction orders and the argsort tie-break, so the address-overlap fusion guard no longer changes the model output — see the 2026-09-13 block-08 (seventh) section below), amended 2026-09-11 with the decode/verify FlashAttention kernel-family fix
 (F1: a quantized K/V cache used VEC at `n_q <= 2` and TILE from `n_q = 3`, so plain decode disagreed
 with spec-draft-mtp verify — see the block-08 notes below), and again 2026-09-11 with the **quantized
 KV-type enablement** (`q4_1`/`q5_0`/`q5_1` become first-class FlashAttention cache types — the
@@ -82,7 +82,7 @@ promotion section below), so the set now applies as block 00 + blocks
 | `0005` | CPU bit-identical decode/verify batches |
 | `0006` | host-buffer revert for discrete GPUs |
 | `0007` | meta device-wrapper skip |
-| `0008` | fused-core prefill kernels + GPU bit-identical results | **amended 2026-09-06 with the scale+unary fused kernel** (unary.cu/cuh, fork f5ac11903). | **amended 2026-09-07 with the mul_mat+add through-view shape guard (PR #15, DanoPTT)** — see the 2026-09-07 re-base section. | **amended 2026-09-11 with the quantized-KV-type enablement** (`q4_1`/`q5_0`/`q5_1` lose the `GGML_CUDA_FA_ALL_QUANTS` guard — predicate + the three diagonal vec instances + the three CMake default lists) | **amended 2026-09-11 (fifth) with `iq4_nl`** — the predicate case, the **15 missing `fattn-vec-instance-iq4_nl-*.cu` pairs** (the generator's `TYPES_KV` did not carry the type) with the diagonal in the three CMake default lists, `vec_dot_fattn_vec_KQ_iq4_nl` + `dequantize_V_iq4_nl`, and the **non-contiguous FA staging converter** `dequantize_q4_nl` (without it any `iq4_nl` K/V *view* reached the tile kernel as a null function pointer — a SIGSEGV that was unreachable only because the type had no FA path at all) | **amended 2026-09-12 with the RDNA4 band-uniform `nwarps=1`** (the 2026-09-11 purity work widened the RDNA4 `calc_nwarps` whitelist from `ncols_dst == 1` to the whole `ncols_dst <= MMVQ_MAX_BATCH_SIZE` band but kept the single-token-tuned `nwarps=8` values; the verify widths lose ~15% on them, so the whole RDNA4 band is `nwarps=1`; RDNA3_0/RDNA3_5 unchanged) — see the 2026-09-12 block-08 + block-10 amendment section below and the `iq4_nl` section below; **for the dense Q8_0 short-K shapes the band-uniform `nwarps=1` is refined by the 2026-09-12 (18) block-13 amendment** (per-`(type, K)` nwarps — see the (18) section below). | **amended 2026-09-13 (sixth) with the `iq4_nl` `GET_ROWS` sub-`QK_K` path** — the `GET_ROWS` support predicate required `ne[0] % QK_K == 0` for `IQ4_NL`/`MXFP4`, so the QSA indexer key gather (row width 128) on an `iq4_nl` cache was rejected by the HIP backend and ran on the **CPU** (26 graph splits per qwen4exp prefill graph, a host round trip per indexer layer), costing ~25 % of long-context qwen4exp prefill; `getrows.cu` now dispatches `iq4_nl` on `ne00 % QK_K` (sub-block `get_rows_cuda_q<QK4_NL, QR4_NL, dequantize_q4_nl>`) and the predicate accepts every `ne00 % QK4_NL == 0` — see the 2026-09-13 section above.
+| `0008` | fused-core prefill kernels + GPU bit-identical results | **amended 2026-09-06 with the scale+unary fused kernel** (unary.cu/cuh, fork f5ac11903). | **amended 2026-09-07 with the mul_mat+add through-view shape guard (PR #15, DanoPTT)** — see the 2026-09-07 re-base section. | **amended 2026-09-11 with the quantized-KV-type enablement** (`q4_1`/`q5_0`/`q5_1` lose the `GGML_CUDA_FA_ALL_QUANTS` guard — predicate + the three diagonal vec instances + the three CMake default lists) | **amended 2026-09-11 (fifth) with `iq4_nl`** — the predicate case, the **15 missing `fattn-vec-instance-iq4_nl-*.cu` pairs** (the generator's `TYPES_KV` did not carry the type) with the diagonal in the three CMake default lists, `vec_dot_fattn_vec_KQ_iq4_nl` + `dequantize_V_iq4_nl`, and the **non-contiguous FA staging converter** `dequantize_q4_nl` (without it any `iq4_nl` K/V *view* reached the tile kernel as a null function pointer — a SIGSEGV that was unreachable only because the type had no FA path at all) | **amended 2026-09-12 with the RDNA4 band-uniform `nwarps=1`** (the 2026-09-11 purity work widened the RDNA4 `calc_nwarps` whitelist from `ncols_dst == 1` to the whole `ncols_dst <= MMVQ_MAX_BATCH_SIZE` band but kept the single-token-tuned `nwarps=8` values; the verify widths lose ~15% on them, so the whole RDNA4 band is `nwarps=1`; RDNA3_0/RDNA3_5 unchanged) — see the 2026-09-12 block-08 + block-10 amendment section below and the `iq4_nl` section below; **for the dense Q8_0 short-K shapes the band-uniform `nwarps=1` is refined by the 2026-09-12 (18) block-13 amendment** (per-`(type, K)` nwarps — see the (18) section below). | **amended 2026-09-13 (sixth) with the `iq4_nl` `GET_ROWS` sub-`QK_K` path** — the `GET_ROWS` support predicate required `ne[0] % QK_K == 0` for `IQ4_NL`/`MXFP4`, so the QSA indexer key gather (row width 128) on an `iq4_nl` cache was rejected by the HIP backend and ran on the **CPU** (26 graph splits per qwen4exp prefill graph, a host round trip per indexer layer), costing ~25 % of long-context qwen4exp prefill; `getrows.cu` now dispatches `iq4_nl` on `ne00 % QK_K` (sub-block `get_rows_cuda_q<QK4_NL, QR4_NL, dequantize_q4_nl>`) and the predicate accepts every `ne00 % QK4_NL == 0` — see the 2026-09-13 section above. | **amended 2026-09-13 (seventh) with the MoE-router bit-identity fix** — the fused `ggml_cuda_op_topk_moe` router now reproduces the generic `soft_max` block-reduce order (per-warp + cross-warp butterfly) and the `reduce_rows_f32` `sum_rows` order, and divides by the clamped sum like `ggml_div`; the CUDA bitonic `argsort` breaks ties by index (matching the CUB path and the fused router's iterative argmax).  The `topk_moe` fusion is selected by an **address-overlap** guard, so before this amendment the model output depended on the allocation plan; now fused == unfused for every native KV type and both split modes (TODO item 19; the `GGML_CUDA_DISABLE_TOPK_MOE_FUSION` A/B kill-switch is kept) — see the 2026-09-13 block-08 (seventh) section above. |
 | `0009` | meta-buffer compute-container headroom |
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) | **amended 2026-09-12: the VDR=4 mmvq boost is reverted for the dense kernels** (`vecdotq.cuh` restored to the upstream dense VDR set — Q4_K/Q5_K/Q6_K back to 2/2/1 and Q8_0 back to 2; the 32-element variants lose on the spec verify widths, see the block-08 + block-10 amendment section below) | **amended 2026-09-12 (17): the VDR is now per kernel** — the dense mmvq selectors keep the upstream VDR while the MoE expert kernel `mul_mat_vec_q_moe` takes block 10's VDR=4 back through its own selectors; `vecdotq.cuh` returns to the block with the `_vdr4`/`_vdr2` functions only (the dense macros stay upstream).  The block keeps the `mmq-vec-dot.cuh` `dmA_reg` fold, the RDNA3_5 nwarps table and the Q4_K `MUL_MAT_ID` cap. |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
@@ -251,6 +251,71 @@ Pre-fix reproductions: the CPU-assigned node is exactly one `GET_ROWS` per index
 (`GGML_SCHED_DEBUG=2`: `node #611 (GET_ROWS) ... CPU#cache_idx_k_l3`), and `rocprofv3 --kernel-trace`
 shows the GPU busy fraction at 0.624 (`iq4_nl`) vs 0.958 (`q4_0`) with ~2844 extra
 `hipStreamSynchronize` calls.
+
+## 2026-09-13 block-08 amendment (seventh): the fused MoE router is now bit-identical (TODO item 19)
+
+**The task (TODO item 19).**  The sixth amendment's absolute `iq4_nl` text change revealed that the
+fused MoE router (`ggml_cuda_op_topk_moe`) was **not** bit-identical to the generic
+`soft_max -> reshape -> argsort -> view -> get_rows -> [norm] -> [scale]` chain.  Whether the fusion
+fires is decided by `ggml_cuda_check_fusion_memory_ranges()`'s **buffer-address overlap** test, so an
+unrelated layout change (moving the QSA indexer `get_rows` off the CPU) flips the fusion coverage and
+thereby the *model output* -- the numerics of a config depended on the allocator, not only on the
+inputs.  The item named two fix directions: make the fused router bit-identical, or drop the
+address-overlap guard.  This amendment does the former.
+
+**Root cause, three independent gaps.**
+
+1. **Softmax reduction order.**  The generic `soft_max_f32` kernel launches one thread per column (a
+   power of two `>= ncols`, capped at 1024) and reduces with `block_reduce`: a per-warp butterfly over
+   the first 32 columns, then a cross-warp butterfly over the 16 per-warp results.  The fused kernel
+   instead did a single flat 32-lane butterfly over `experts_per_thread` strided values.  Both are
+   valid softmaxes but differ by ULPs (measured: 36 % of random 512-value rows disagree, up to
+   2.4e-7 relative).
+2. **Normalization order.**  The generic chain is `sum_rows -> clamp -> div` (`weights[i] / sum`),
+   while the fused kernel accumulated the selected weights in the per-winner lanes and multiplied by
+   `1/sum`.  Both the sum order and the reciprocal-vs-division differ.
+3. **Argsort tie-break.**  The generic chain uses the CUDA bitonic `argsort` (with a descending order
+   and a strict comparator), which is **not stable** -- for exact ties the top-k set/order is a
+   function of the network, not of the expert index -- whereas the fused kernel's iterative argmax
+   breaks ties by the smaller index.  Exact ties do occur (4 in one 3.3k-prefill + 64-token run) and
+   the two orders then disagree.  The CUB argsort path (`SortPairsDescending`) **is** stable, so the
+   two CUDA argsort implementations already disagreed with each other.
+
+**The fix.**  `ggml/src/ggml-cuda/topk-moe.cu` reproduces the generic reduction orders: the softmax
+now does the per-"virtual warp" `warp_reduce_sum(vals[i])` phase followed by the cross-warp phase
+(the `experts_per_thread == 1` case keeps the single warp reduction the generic kernel uses for
+`ncols <= WARP_SIZE`); the norm sums the selected weights in the generic `reduce_rows_f32` order
+(`warp_reduce_sum(lane j < n_expert_used ? output_weights[0] : 0)`, lane `j` holding selection `j`'s
+weight) and **divides** by the clamped sum like `ggml_div`.  `ggml/src/ggml-cuda/argsort.cu`'s bitonic
+network now breaks ties by index (the smaller index first for `DESC`), matching the CUB path and the
+fused router's tie-break, so all three agree on the top-k set and order.  `ggml/src/ggml-cuda/ggml-cuda.cu`
+gains the `GGML_CUDA_DISABLE_TOPK_MOE_FUSION=1` A/B kill-switch used to prove the two paths now agree.
+
+**Measured** (3x R9700 gfx1201, qwen4exp `IQ4_XS`, `/tmp/prompt3k.txt`, `--seed 42 --temp 0` greedy,
+`-c 32768 -b 2048 -ub 2048`):
+
+| gate | before | after |
+|---|---|---|
+| `-sm tensor`, 64 tokens, fused vs `GGML_CUDA_DISABLE_TOPK_MOE_FUSION=1` (8 native KV types) | fused `14a1...`/`30d27ad1fc6d`/... != unfused `086df944f6af` | **identical for all 8 types** (`iq4_nl`/`f16`/`bf16`/`q8_0`/`q4_0`/`q4_1`/`q5_0`/`q5_1`) |
+| `-sm layer`, 64 tokens, fused vs unfused | `6e2290d44875` != `8bd14f326f2b` (iq4_nl) | **identical for all 8 types** (was the split where the tie divergence reproduced) |
+| `-sm layer`, force-fuse (guard ignored) | `c4000a0285f3` != fused/unfused | **identical to both** |
+| qwen4exp `plain == n_max 3 == n_max 7`, tensor, all 8 types | `14a1a3f257f4` (iq4_nl) | **identical within each type** (`iq4_nl` `086df944f6af`, `f16` `92d01d72f895`, `q8_0` `c4000a0285f3`, `q4_0` `28857dc2b3d1`, `bf16` `ba4d858ae2f6`, `q4_1` `3e04ba1e7908`, `q5_0` `348c743eb1b2`, `q5_1` `a5b6a81c33fa`) |
+| MTP `n_max 3` iq4_nl, draft acceptance | - | 0.59091 (pos-1 0.783, mean len 2.70) |
+| `test-backend-ops test` | 18065/18065 | **18065/18065** (`ARGSORT`, `TOP_K`, `GET_ROWS` all pass; the `test_argsort` data is tie-free by construction) |
+| 4B `Qwen3.5-4B-Q8_0` `-sm tensor` coherence | `1c5d32ac537d` | `1c5d32ac537d` (unchanged; dense model, no MoE router) |
+| qwen4exp pp2048/pp8192/tg128 (`llama-bench`, iq4_nl) | 1739/1748/48.1 t/s | 1715/1741/48.0 t/s (within the run-to-run noise) |
+
+**Every absolute hash that involves a MoE router moves, and that is the point.**  The generic chain is
+the reference (it is what the fusion was supposed to accelerate, not replace numerically):
+pre-amendment `iq4_nl` fused = `14a1a3f257f4`, unfused = `086df944f6af`; post-amendment both are
+`086df944f6af`.  The `W = 1..8` purity band and the `plain == draft-mtp` invariant hold for every
+native KV type and both split modes.  The exact-tie case is now handled identically by all three paths
+(bitonic, CUB, fused argmax), so the fusion-selection no longer changes the output -- which is what
+closes item 19.
+
+**Scope note.**  The argsort change makes the CUDA bitonic path deterministic and consistent with the
+CUDA CUB path.  The CPU `std::sort` comparator leaves ties unspecified, so there is no cross-backend
+tie contract to preserve, and `test-backend-ops`' `ARGSORT` case is tie-free by construction.
 
 ## 2026-09-12 block-08 + block-10 amendment: the MTP decode regression (issue #30)
 

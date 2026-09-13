@@ -63,8 +63,8 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
   **`790cf51aa`** (re-based 2026-09-13; previously `9113cc188`).
 - Patches `patches/0000-…0015-…`, applied with **strict 16/16 `git am`** by
   `scripts/apply-all.sh` (no 3-way fallback, whitespace-clean).
-- Canonical 16-block chain: tip `ab2fabb440ac909e02e0482cabd673c339106b57`,
-  net tree `e279b222e8e98a7574814929d4b6d97edae32a48`.
+- Canonical 16-block chain: tip `6303f04894fa6251f7e8c9e9eff8742a24267113`,
+  net tree `311f3acebe82a65b1b6f38d3e77997c31910c7dd`.
 - Greedy purity: plain decode == `draft-mtp` verify for
   `--spec-draft-n-max <= 7` across the supported KV types (4B and 27B all
   eight; qwen4exp MTP).
@@ -74,19 +74,30 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
   config), [`MANIFESTS.md`](MANIFESTS.md) (apply order + verification contract)
   and [`BASELINE.md`](BASELINE.md) (fork point + drift policy).
 
-**Latest change (2026-09-13) — block-08 `iq4_nl` `GET_ROWS` CPU-fallback fix (TODO item 3).**
+**Latest change (2026-09-13, later) — the fused MoE router is bit-identical (TODO item 19).**
+The block-08 `iq4_nl` `GET_ROWS` fix moved the qwen4exp greedy text, and the reason was a pre-existing
+upstream fragility: the fused `topk_moe` MoE router was **not** bit-identical to the generic
+`soft_max -> argsort -> get_rows -> norm` chain, and the fusion is selected by a **buffer-address
+overlap** guard — so the model output depended on the allocation plan.  The three gaps are fixed:
+`topk-moe.cu` reproduces the generic `block_reduce` softmax order (per-warp + cross-warp butterfly)
+and the `reduce_rows_f32` sum order and divides by the clamped sum like `ggml_div`; `argsort.cu`'s
+bitonic network breaks ties by index (matching the CUB path and the fused router's iterative argmax).
+Fused == `GGML_CUDA_DISABLE_TOPK_MOE_FUSION=1` for **all eight native KV types** on both `-sm tensor`
+and `-sm layer`, `plain == n_max 3 == n_max 7` still holds, `test-backend-ops` is 18065/18065 and the
+4B coherence is unchanged (`1c5d32ac537d`).  Canonical tip `6303f0489`, tree `311f3acebe82a65b`.  Full
+record: [`WORKLOG.md`](WORKLOG.md) 2026-09-13 (even later) and the 2026-09-13 block-08 (seventh) section
+of [`patches/README.md`](patches/README.md).
+
+**Previous change (2026-09-13) — block-08 `iq4_nl` `GET_ROWS` CPU-fallback fix (TODO item 3).**
 The qwen4exp `iq4_nl` KV-cache prefill delta was the QSA indexer key gather: the CUDA `GET_ROWS`
 support predicate required `ne[0] % QK_K == 0` for the 32-value sub-block types, and the indexer key
 row is 128, so an `iq4_nl` cache sent the gather to the **CPU** (26 graph splits per prefill graph, a
 host round trip per indexer layer).  `getrows.cu` now takes the sub-`QK_K` path
 (`dequantize_q4_nl`) and the predicate accepts every `ne00 % QK4_NL == 0`; qwen4exp `iq4_nl` prefill
 pp8192 1815-1951 -> **2385-2422 t/s** (= f16/`q4_0`), pp32768 **+36 %**, `GET_ROWS` 215/215 ->
-**219/219**.  The absolute `iq4_nl` greedy text moved (`c0d44c479ee1` -> `14a1a3f257f4`) because
-removing the host split re-allocates the graph and flips the address-driven MoE-router `topk_moe`
-fusion (filed as TODO item 19); the `W = 1..8`, `plain == n_max 3 == n_max 7` and control-hash gates
-all hold, and the 4B coherence is unchanged (`1c5d32ac537d`).  Full record:
-[`WORKLOG.md`](WORKLOG.md) 2026-09-13 (later) and the 2026-09-13 block-08 section of
-[`patches/README.md`](patches/README.md).
+**219/219**.  The `W = 1..8` and control-hash gates hold and the 4B coherence is unchanged
+(`1c5d32ac537d`).  Full record: [`WORKLOG.md`](WORKLOG.md) 2026-09-13 (later) and the 2026-09-13
+block-08 section of [`patches/README.md`](patches/README.md).
 
 **Previous change (2026-09-13) — re-base onto master `790cf51aa` (70 commits).**
 Four upstream clashes resolved (`16378d93f` gfx1201 FA tuning, `5a4d0feca`
