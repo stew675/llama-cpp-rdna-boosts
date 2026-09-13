@@ -63,8 +63,8 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
   **`790cf51aa`** (re-based 2026-09-13; previously `9113cc188`).
 - Patches `patches/0000-…0015-…`, applied with **strict 16/16 `git am`** by
   `scripts/apply-all.sh` (no 3-way fallback, whitespace-clean).
-- Canonical 16-block chain: tip `6303f04894fa6251f7e8c9e9eff8742a24267113`,
-  net tree `311f3acebe82a65b1b6f38d3e77997c31910c7dd`.
+- Canonical 16-block chain: tip `f27dc6d8006188d00ff96dadab6eb0edf79e2b7c`,
+  net tree `bbbe005e95381301fdc71e5d636f448bab147a65`.
 - Greedy purity: plain decode == `draft-mtp` verify for
   `--spec-draft-n-max <= 7` across the supported KV types (4B and 27B all
   eight; qwen4exp MTP).
@@ -74,7 +74,19 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
   config), [`MANIFESTS.md`](MANIFESTS.md) (apply order + verification contract)
   and [`BASELINE.md`](BASELINE.md) (fork point + drift policy).
 
-**Latest change (2026-09-13, later) — the fused MoE router is bit-identical (TODO item 19).**
+**Latest change (2026-09-13, latest) — block-14 pair-fusion `ncols_opt` fix: dense prefill regression
+repaired.**  The 2026-09-13 re-base merged upstream's new `mmq_args::ncols_opt` field, but block-14's
+`ggml_cuda_mul_mat_q_pair` builds its `mmq_args` by hand and still left it `0`, so the MMQ tile
+heuristic selected the narrowest tile (`J=8`) — up to **2.2x slower dense prefill** (and 14-48% below
+the pre-rebase delivery) on every dense model.  Both pair arms now set it like the standalone (dense:
+the token count; `MUL_MAT_ID`: the RDNA per-expert average) and the heuristic falls back to
+`ncols_max` when unset.  pp4096 restored/beaten: 27B Q8_0 623 -> **1363** (1 GPU) / 1718 -> **2176**
+(tensor), 27B UD-Q4_K_XL 905 -> **1264** / 1693 -> **2040**, 4B 5386 -> **7304**; qwen4exp unaffected.
+Numerics unchanged (pair on == off, same-seed `d03d0bc727a8`).  Canonical tip `f27dc6d80`, tree
+`bbbe005e9538`.  Full record: [`WORKLOG.md`](WORKLOG.md) 2026-09-13 (latest) and the 2026-09-13
+block-14 (ninth) section of [`patches/README.md`](patches/README.md).
+
+**Previous change (2026-09-13, later) — the fused MoE router is bit-identical (TODO item 19).**
 The block-08 `iq4_nl` `GET_ROWS` fix moved the qwen4exp greedy text, and the reason was a pre-existing
 upstream fragility: the fused `topk_moe` MoE router was **not** bit-identical to the generic
 `soft_max -> argsort -> get_rows -> norm` chain, and the fusion is selected by a **buffer-address
@@ -84,7 +96,7 @@ and the `reduce_rows_f32` sum order and divides by the clamped sum like `ggml_di
 bitonic network breaks ties by index (matching the CUB path and the fused router's iterative argmax).
 Fused == `GGML_CUDA_DISABLE_TOPK_MOE_FUSION=1` for **all eight native KV types** on both `-sm tensor`
 and `-sm layer`, `plain == n_max 3 == n_max 7` still holds, `test-backend-ops` is 18065/18065 and the
-4B coherence is unchanged (`1c5d32ac537d`).  Canonical tip `6303f0489`, tree `311f3acebe82a65b`.  Full
+4B coherence is unchanged (`1c5d32ac537d`).  Full
 record: [`WORKLOG.md`](WORKLOG.md) 2026-09-13 (even later) and the 2026-09-13 block-08 (seventh) section
 of [`patches/README.md`](patches/README.md).
 

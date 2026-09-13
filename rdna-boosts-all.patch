@@ -14907,10 +14907,10 @@ index 4d1c398fc..a2f27c80d 100644
              }
          }
 diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
-index 9b6038adf..c42d0b949 100644
+index 9b6038adf..972385e18 100644
 --- a/ggml/src/ggml-cuda/mmq.cu
 +++ b/ggml/src/ggml-cuda/mmq.cu
-@@ -82,8 +82,185 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
+@@ -82,8 +82,193 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
      }
  }
  
@@ -15014,7 +15014,7 @@ index 9b6038adf..c42d0b949 100644
 +                src0_i->ne[0], src0_i->ne[1], dst_i->ne[1], s01, ne11, s1,
 +                src0_i->ne[2], ne12, s02, s12_q, s2,
 +                src0_i->ne[3], ne13, s03, s13_q, s3,
-+                dst_i->ne[1]};
++                dst_i->ne[1], dst_i->ne[1]};
 +            ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 +        }
 +        return;
@@ -15079,13 +15079,21 @@ index 9b6038adf..c42d0b949 100644
 +        const int64_t s1 = dst_i->nb[1] / sizeof(float);
 +        const int64_t s2 = dst_i->nb[2] / sizeof(float);
 +        const int64_t s3 = dst_i->nb[3] / sizeof(float);
++        // ncols_opt drives the MMQ tile-size heuristic (smaller ntiles_x wins, the loop stops at
++        // the first J that covers the row).  It must be set like ggml_cuda_mul_mat_q does; leaving
++        // it 0 made every J give ntiles_x == 0, so the loop picked J=8 (the slowest tile).
++        int64_t ncols_opt = ne12;
++        if (GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
++            // each expert only sees ne12*n_expert_used/ne02 tokens on average
++            ncols_opt = (ne12*dst_i->ne[1] + src0_i->ne[2] - 1) / src0_i->ne[2];
++        }
 +        const mmq_args args = {
 +            (const char *) src0_i->data, src0_i->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), (float *) dst_i->data,
 +            nullptr,
 +            src0_i->ne[0], src0_i->ne[1], ne_get_rows, s01, ne_get_rows, s1,
 +            src0_i->ne[2], src0_i->ne[2], s02, s12_q, s2,
 +            src0_i->ne[3], ne13, s03, s13_q, s3,
-+            ne12};
++            ne12, ncols_opt};
 +        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 +    }
 +}
@@ -15097,7 +15105,7 @@ index 9b6038adf..c42d0b949 100644
      GGML_ASSERT(        src1->type == GGML_TYPE_F32);
      GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
      GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
-@@ -92,6 +269,8 @@ void ggml_cuda_mul_mat_q(
+@@ -92,6 +277,8 @@ void ggml_cuda_mul_mat_q(
  
      cudaStream_t stream = ctx.stream();
      const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -15106,7 +15114,7 @@ index 9b6038adf..c42d0b949 100644
  
      const size_t ts_src0 = ggml_type_size(src0->type);
      const size_t ts_src1 = ggml_type_size(src1->type);
-@@ -102,6 +281,14 @@ void ggml_cuda_mul_mat_q(
+@@ -102,6 +289,14 @@ void ggml_cuda_mul_mat_q(
      GGML_ASSERT(        nb0        == ts_dst);
      GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
  
@@ -15121,7 +15129,7 @@ index 9b6038adf..c42d0b949 100644
      const char  * src0_d = (const char  *) src0->data;
      const float * src1_d = (const float *) src1->data;
      float       *  dst_d = (float       *)  dst->data;
-@@ -152,9 +339,15 @@ void ggml_cuda_mul_mat_q(
+@@ -152,9 +347,15 @@ void ggml_cuda_mul_mat_q(
                  quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                          ne11, ne12, ne13, stream);
  
@@ -15138,7 +15146,7 @@ index 9b6038adf..c42d0b949 100644
              }
              CUDA_CHECK(cudaGetLastError());
          }
-@@ -229,12 +422,18 @@ void ggml_cuda_mul_mat_q(
+@@ -229,12 +430,18 @@ void ggml_cuda_mul_mat_q(
                  quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                          ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
              }
@@ -15159,7 +15167,7 @@ index 9b6038adf..c42d0b949 100644
          }
          CUDA_CHECK(cudaGetLastError());
      }
-@@ -260,9 +459,30 @@ void ggml_cuda_mul_mat_q(
+@@ -260,9 +467,30 @@ void ggml_cuda_mul_mat_q(
          ne03, ne13, s03, s13, s3,
          ne12, ncols_opt};
  
@@ -15191,7 +15199,7 @@ index 9b6038adf..c42d0b949 100644
  #ifdef GGML_CUDA_FORCE_CUBLAS
      return false;
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index 6923f3510..c31b9cb52 100644
+index 6923f3510..2632ff42f 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
 @@ -1,6 +1,7 @@
@@ -15645,7 +15653,7 @@ index 6923f3510..c31b9cb52 100644
  void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
      const int    id    = ggml_cuda_get_device();
      const int    cc    = ggml_cuda_info().devices[id].cc;
-@@ -1483,12 +1770,68 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+@@ -1483,17 +1770,76 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
      int J_best        = 0;
      int ntiles_J_best = INT_MAX;
  
@@ -15714,7 +15722,16 @@ index 6923f3510..c31b9cb52 100644
          if (mmq_get_nbytes_shared(config, cc) > smpbo) {
              continue;
          }
-@@ -1503,52 +1846,52 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+ 
+-        const int ntiles_x = (args.ncols_opt + config.J - 1) / config.J;
++        // ncols_opt <= 0 means a caller left it unset (its aggregate init predates the field):
++        // fall back to ncols_max rather than let the smallest J win by default.
++        const int64_t ncols_opt = args.ncols_opt > 0 ? args.ncols_opt : args.ncols_max;
++        const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
+ 
+         if (ntiles_x < ntiles_J_best) {
+             J_best = J;
+@@ -1503,52 +1849,52 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
  
      switch (J_best) {
          case   8:
@@ -15783,7 +15800,7 @@ index 6923f3510..c31b9cb52 100644
              break;
          default:
              fprintf(stderr, "J_best=%d\n", J_best);
-@@ -1557,20 +1900,23 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+@@ -1557,20 +1903,23 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
      }
  }
  
@@ -15810,7 +15827,7 @@ index 6923f3510..c31b9cb52 100644
  extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
  extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
  extern DECL_MMQ_CASE(GGML_TYPE_Q4_0);
-@@ -1600,6 +1946,13 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+@@ -1600,6 +1949,13 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
  // -------------------------------------------------------------------------------------------------------------------------
  
  void ggml_cuda_mul_mat_q(

@@ -1,5 +1,48 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-13 (latest) — block-14 amendment (ninth): the re-base's `ncols_opt` broke the pair fusion (dense prefill −14-48 %)
+
+**Canonical chain amended in place** (block 14 `20bf37962` -> `378c9a9d6`, block 15 replayed; new tip
+**`f27dc6d8006188d00ff96dadab6eb0edf79e2b7c`**, net tree
+**`bbbe005e95381301fdc71e5d636f448bab147a65`**).  `patches/` regenerated; a fresh `790cf51aa` worktree +
+`apply-all.sh` applies **strict 16/16 `git am`**, zero whitespace warnings, tree == canonical.
+`make-patches.sh` default tip updated; the net patch regenerated.
+
+**The bug.**  The 2026-09-13 re-base merged upstream `d4abd573f`, which added `ncols_opt` to `mmq_args`
+(the tile heuristic optimises `ntiles_x = ceil(ncols_opt/J)` and stops at the first `J` that covers the
+row).  The standalone MMQ path passes it, but block-14's `ggml_cuda_mul_mat_q_pair` builds its
+`mmq_args` by hand in **both** arms and still stopped one initialiser short, so the field defaulted to
+`0` and every `J` gave `ntiles_x == 0` - the loop kept the first candidate, `J = 8`, the narrowest and
+slowest tile.  Dense FFN gate+up pairs want `J = 64..128`, so the fusion was up to **2.2x slower than
+not fusing**.  Invisible on the qwen4exp `MUL_MAT_ID` pair it was written for (each expert sees few
+tokens, correct `J` ~8), and the pair A/B had only ever been run on qwen4exp.
+
+**The fix.**  `mmq.cu`: both pair arms set `ncols_opt` like the standalone (dense: `dst->ne[1]`;
+`MUL_MAT_ID`: the RDNA per-expert average `(ne12*n_expert_used + ne02 - 1)/ne02`).  `mmq.cuh`: the
+heuristic falls back to `ncols_max` when `ncols_opt <= 0`, so a caller that predates the field can
+never silently pick the worst tile again.
+
+**Measured** (`llama-bench`, f16 KV, pp4096, `-r 2`, 3x R9700; pre-rebase = the archived tip
+`907799de3` @ `9113cc188` rebuilt in a worktree, buggy = the pre-fix rebased tip `6303f0489`):
+
+| model / config | pre-rebase | rebased (buggy) | **rebased + fix** | stock `790cf51aa` |
+|---|---|---|---|---|
+| 27B Q8_0, 1 GPU | 1348.3 | 623.0 | **1363.2** | 1203.2 |
+| 27B Q8_0, `-sm tensor` | 2147.7 | 1717.6 | **2175.5** | 2001.7 |
+| 27B UD-Q4_K_XL, 1 GPU | 1262.1 | 904.6 | **1264.0** | 1094.1 |
+| 27B UD-Q4_K_XL, `-sm tensor` | 2016.4 | 1692.7 | **2039.9** | 1839.3 |
+| 4B Q8_0, 1 GPU | 7127.9 | 5386.1 | **7303.6** | 5807.5 |
+
+Numerics unchanged: the fused pair is byte-identical to the unfused path (27B same-seed
+`d03d0bc727a8` with and without `GGML_PAIR_DENSE_OFF=1`); only the tile width changes.  qwen4exp is
+unaffected (controlled pre-rebase A/B, `-b 2048 -ub 2048`, tensor, pp8192: f16 sparse 2405.3 ->
+**2435.9**, f16 dense 2586.8 -> **2657.0**, `iq4_nl` sparse 2043.0 -> **2456.7** from item 3).
+
+**Lesson.**  The pair fusion's A/B was only ever run on qwen4exp; the dense-arm prefill A/B was never
+added to the re-base checklist, so a silent aggregate-init default slipped through.  The `mmq.cuh`
+fallback is the guard against the class.  See `patches/README.md` (2026-09-13 block-14 (ninth)) and
+`TODO.md` (Closed).
+
 ## 2026-09-13 (even later) — block-08 amendment (seventh): the fused MoE router is bit-identical — TODO item 19 closed
 
 **Canonical chain amended in place** (block 08 `8c072080a` -> `ffa7c1c1b`, the rest replayed; new tip

@@ -80,6 +80,11 @@
 #                 (the CUB path is a stable radix sort and the fused router's
 #                 iterative argmax also picks the smaller expert index), so the
 #                 routed top-k no longer depends on the allocation plan.
+#                 `2026-09-13 block-14 amendment (ninth)`: the re-base's new `mmq_args::ncols_opt`
+#                 field was left unset (0) by block-14's hand-built `ggml_cuda_mul_mat_q_pair`
+#                 args, so the MMQ tile heuristic picked the narrowest tile (J=8) - up to 2.2x
+#                 slower dense prefill.  Both pair arms now set it like the standalone and the
+#                 heuristic falls back to ncols_max when unset.
 #                 The block-15 tip of the *working*
 #                 fork checkout (~/llama.cpp rdna-boosts) is a different SHA,
 #                 because that branch is a local rebuild -- do not use it for
@@ -99,7 +104,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
 BASELINE="${2:-790cf51aa}"
-TIP="${3:-6303f04894fa6251f7e8c9e9eff8742a24267113}"
+TIP="${3:-f27dc6d8006188d00ff96dadab6eb0edf79e2b7c}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then

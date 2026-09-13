@@ -6,12 +6,13 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (2026-09-13, later):** the delivery is the **16-patch set** against fork point `790cf51aa`
-(block 00 + blocks 01-15), canonical 16-block tip **`6303f04894fa6251f7e8c9e9eff8742a24267113`** (tree
-`311f3acebe82a65b1b6f38d3e77997c31910c7dd`), `make-patches.sh` default tip =
-`6303f04894fa6251f7e8c9e9eff8742a24267113` (the 2026-09-13 master re-base + the block-08 (sixth)
+**Current state (2026-09-13, latest):** the delivery is the **16-patch set** against fork point `790cf51aa`
+(block 00 + blocks 01-15), canonical 16-block tip **`f27dc6d8006188d00ff96dadab6eb0edf79e2b7c`** (tree
+`bbbe005e95381301fdc71e5d636f448bab147a65`), `make-patches.sh` default tip =
+`f27dc6d8006188d00ff96dadab6eb0edf79e2b7c` (the 2026-09-13 master re-base + the block-08 (sixth)
 `iq4_nl` `GET_ROWS` sub-`QK_K` amendment that closed item 3 + the block-08 (seventh) MoE-router
-bit-identity amendment that closed item 19).  Block 15 (the attention-memory campaign) was **promoted to the delivery** as `patches/0015` (2026-09-12; TODO item 1 closed).  F1/F2/F3 (the
+bit-identity amendment that closed item 19 + the block-14 (ninth) pair-fusion `ncols_opt` fix that
+repaired the dense prefill regression the re-base introduced).  Block 15 (the attention-memory campaign) was **promoted to the delivery** as `patches/0015` (2026-09-12; TODO item 1 closed).  F1/F2/F3 (the
 KV-quant purity/parity campaign) are **all closed** — every KV cache type the delivery supports is
 width-pure and takes the f16 attention path — and so is the gfx1151 within-band mmvq fusion variance
 (block-13 amendment, 2026-09-12; see Closed).  The QSA *sparse* regime was re-measured on gfx1151
@@ -136,6 +137,17 @@ are superseded by the 2026-09-13 re-base to `790cf51aa` (tip `6303f0489`, tree `
   `archive/work/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
+
+- **Dense prefill regression from the 2026-09-13 re-base (closed 2026-09-13 (latest), block-14 amendment
+  (ninth)).**  The re-base merged upstream's new `mmq_args::ncols_opt`, but block-14's
+  `ggml_cuda_mul_mat_q_pair` (a hand-built `mmq_args` in both arms) left it `0`, so the MMQ tile heuristic
+  stopped at `J=8` — up to **2.2x slower dense prefill**, 14-48 % below the pre-rebase delivery, on every
+  dense model (27B Q8_0/Q4_K_XL, 4B).  It was invisible on qwen4exp (its `MUL_MAT_ID` pair's correct `J`
+  is already ~8) and the pair A/B had only ever been run there.  Fixed both arms (standalone semantics)
+  plus a `ncols_max` fallback in the heuristic; pp4096: 27B Q8_0 623 -> **1363** / 1718 -> **2176**, 27B
+  UD-Q4_K_XL 905 -> **1264** / 1693 -> **2040**, 4B 5386 -> **7304** (all >= pre-rebase and well above
+  stock).  Numerics unchanged (pair on == off, same-seed `d03d0bc727a8`).  Canonical tip `f27dc6d80`, tree
+  `bbbe005e9538`; `WORKLOG.md` 2026-09-13 (latest), `patches/README.md` (block-14 (ninth)).
 
 - **MoE-router `topk_moe` fusion selection was address-dependent (TODO item 19, closed 2026-09-13, block-08
   amendment (seventh)).**  The fused router was **not** bit-identical to the generic

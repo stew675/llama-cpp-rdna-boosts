@@ -135,6 +135,14 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   `MMVF_MAX_BATCH_SIZE_FLAT = 32` with `mul_mat_vec_f` instantiated for `ncols_dst` 9..32 —
   `GREEDY-PURITY.md` §29; **gfx1151-validated 2026-09-12 (14)**: the forced-sparse text residual is
   cleared and all eight native KV types are pure at n_max 1/2/3/5/7).
+  **Amended 2026-09-13 (ninth) with the pair-fusion `ncols_opt` fix**: the re-base's new
+  `mmq_args` field was left unset by `ggml_cuda_mul_mat_q_pair`'s hand-built args, so the MMQ
+  tile heuristic selected the narrowest tile (`J=8`) — up to **2.2x slower dense prefill**
+  (27B Q8_0 `623 -> 1363`, 27B UD-Q4_K_XL `905 -> 1264`, 4B `5386 -> 7304` at pp4096; the buggy
+  re-based build was 14-48 % below pre-rebase).  Both pair arms now set it like the standalone
+  (dense: token count; `MUL_MAT_ID`: the RDNA per-expert average) and the heuristic falls back to
+  `ncols_max` when unset; qwen4exp unaffected and numerics unchanged (pair on == off,
+  same-seed `d03d0bc727a8`).
   See the block-14 notes in `patches/README.md` and the beta
   validation record in `beta/qwen4exp/README.md`.
 - Block **15** (`patches/0015`, **delivered 2026-09-12**, promoted from `archive/work/block-15-campaign-wins/`): the attention-memory campaign wins --
@@ -167,8 +175,8 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `790cf51aa` is a rebuild of the delivery set
-(tip `6303f04894fa6251f7e8c9e9eff8742a24267113`, net tree
-  `311f3acebe82a65b1b6f38d3e77997c31910c7dd`,
+(tip `f27dc6d8006188d00ff96dadab6eb0edf79e2b7c`, net tree
+  `bbbe005e95381301fdc71e5d636f448bab147a65`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `790cf51aa`; the 2026-09-13 re-base resolved the four upstream clashes --
 `16378d93f` gfx1201 FA tuning (our block-04 head-256 configs kept: upstream's
@@ -214,10 +222,13 @@ tensor` the Meta device's `all_of()` IS the meta-split safety condition) — see
 which is what
 `scripts/make-patches.sh`'s default tip refers
 to; always regenerate from a canonical fork rebuilt at the fork point.
+block 14 was amended again 2026-09-13 (ninth) with the pair-fusion `ncols_opt` fix (the re-base's
+new `mmq_args` field was unset by `ggml_cuda_mul_mat_q_pair`, selecting the narrowest MMQ tile — up
+to 2.2x slower dense prefill; see the 2026-09-13 block-14 (ninth) section).
 **Block 15 (the attention-memory campaign) is the delivery's last patch** --
 promoted 2026-09-12 from `archive/work/block-15-campaign-wins/` (`patches/0015`;
-the canonical 16-block tip is `6303f04894fa6251f7e8c9e9eff8742a24267113`, tree
-`311f3acebe82a65b1b6f38d3e77997c31910c7dd` (the 2026-09-13 master re-base + the
+the canonical 16-block tip is `f27dc6d8006188d00ff96dadab6eb0edf79e2b7c`, tree
+`bbbe005e95381301fdc71e5d636f448bab147a65` (the 2026-09-13 master re-base + the
 2026-09-13 block-08 `iq4_nl` `GET_ROWS` amendment; the
 previous base `9113cc188` had tip `907799de3`, tree `c2e284c2acc032238ef85cb35d427c1598ed0949`).
 
@@ -730,7 +741,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `790cf51aa`,
-blocks tip `6303f04894fa6251f7e8c9e9eff8742a24267113`): `git format-patch --start-number 0` the block
+blocks tip `f27dc6d8006188d00ff96dadab6eb0edf79e2b7c`): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -738,7 +749,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 — it may have been rebased onto a drifted master, so a raw
 `<base>..HEAD` range there can export upstream commits as patches
 0001/0002.  The canonical 16-block chain is a rebuild of the delivery set at
-`790cf51aa` (tip `6303f0489…`), which is what the default tip names.  Always regenerate from a
+`790cf51aa` (tip `f27dc6d80…`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `790cf51aa`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

@@ -1,4 +1,4 @@
-From 20bf37962367b49596943037c09696a5972e13ab Mon Sep 17 00:00:00 2001
+From 378c9a9d65d8b28c70ffb1a751f25fbf8164fe07 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -158,7 +158,8 @@ pending.  Instruments: wip/strix-halo/qsa-item4/.
  ggml/src/ggml-cuda/indexer-topk.cu     |  376 ++++++++
  ggml/src/ggml-cuda/indexer-topk.cuh    |    7 +
  ggml/src/ggml-cuda/mmid.cu             |   63 ++
- ggml/src/ggml-cuda/mmq.cuh             |   28 +-
+ ggml/src/ggml-cuda/mmq.cu              |   12 +-
+ ggml/src/ggml-cuda/mmq.cuh             |   33 +-
  ggml/src/ggml-cuda/mmvf.cu             |  168 ++++
  ggml/src/ggml-cuda/mmvf.cuh            |    6 +
  ggml/src/ggml-cuda/quantize.cuh        |   13 +-
@@ -186,7 +187,7 @@ pending.  Instruments: wip/strix-halo/qsa-item4/.
  tests/test-backend-ops.cpp             |  110 +++
  tests/test-lazy-reader.cpp             |  264 ++++++
  tests/test-llama-archs.cpp             |    7 +-
- 54 files changed, 7265 insertions(+), 327 deletions(-)
+ 55 files changed, 7279 insertions(+), 330 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
@@ -5185,8 +5186,44 @@ index 0b222e63a..ce8249222 100644
      switch (n_expert_used) {
          case  2:
              launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index c42d0b949..972385e18 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -182,7 +182,7 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+                 src0_i->ne[0], src0_i->ne[1], dst_i->ne[1], s01, ne11, s1,
+                 src0_i->ne[2], ne12, s02, s12_q, s2,
+                 src0_i->ne[3], ne13, s03, s13_q, s3,
+-                dst_i->ne[1]};
++                dst_i->ne[1], dst_i->ne[1]};
+             ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+         }
+         return;
+@@ -247,13 +247,21 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+         const int64_t s1 = dst_i->nb[1] / sizeof(float);
+         const int64_t s2 = dst_i->nb[2] / sizeof(float);
+         const int64_t s3 = dst_i->nb[3] / sizeof(float);
++        // ncols_opt drives the MMQ tile-size heuristic (smaller ntiles_x wins, the loop stops at
++        // the first J that covers the row).  It must be set like ggml_cuda_mul_mat_q does; leaving
++        // it 0 made every J give ntiles_x == 0, so the loop picked J=8 (the slowest tile).
++        int64_t ncols_opt = ne12;
++        if (GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
++            // each expert only sees ne12*n_expert_used/ne02 tokens on average
++            ncols_opt = (ne12*dst_i->ne[1] + src0_i->ne[2] - 1) / src0_i->ne[2];
++        }
+         const mmq_args args = {
+             (const char *) src0_i->data, src0_i->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), (float *) dst_i->data,
+             nullptr,
+             src0_i->ne[0], src0_i->ne[1], ne_get_rows, s01, ne_get_rows, s1,
+             src0_i->ne[2], src0_i->ne[2], s02, s12_q, s2,
+             src0_i->ne[3], ne13, s03, s13_q, s3,
+-            ne12};
++            ne12, ncols_opt};
+         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+     }
+ }
 diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
-index b42c4ce1e..c31b9cb52 100644
+index b42c4ce1e..2632ff42f 100644
 --- a/ggml/src/ggml-cuda/mmq.cuh
 +++ b/ggml/src/ggml-cuda/mmq.cuh
 @@ -1475,7 +1475,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
@@ -5263,6 +5300,18 @@ index b42c4ce1e..c31b9cb52 100644
              const int64_t rows_per_expert = (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y;
              const bool use_j48_128e = mmq_rdna3_5_id_use_j48_128e(type, args.nchannels_y, rows_per_expert);
              int J_rdna3_5 = use_j48_128e ? 48 : mmq_rdna3_5_id_get_J(type, rows_per_expert);
+@@ -1824,7 +1836,10 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+             continue;
+         }
+ 
+-        const int ntiles_x = (args.ncols_opt + config.J - 1) / config.J;
++        // ncols_opt <= 0 means a caller left it unset (its aggregate init predates the field):
++        // fall back to ncols_max rather than let the smallest J win by default.
++        const int64_t ncols_opt = args.ncols_opt > 0 ? args.ncols_opt : args.ncols_max;
++        const int ntiles_x = (ncols_opt + config.J - 1) / config.J;
+ 
+         if (ntiles_x < ntiles_J_best) {
+             J_best = J;
 diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
 index bd5c5d421..c500442e5 100644
 --- a/ggml/src/ggml-cuda/mmvf.cu
