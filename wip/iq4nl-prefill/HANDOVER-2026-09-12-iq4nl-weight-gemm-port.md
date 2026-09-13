@@ -7,7 +7,13 @@
 stays exactly as recorded — see §1.
 **Success criterion:** **> 1100 t/s** prefill at pp16384 on pwilkin's uniform-IQ4_NL model, up from the
 current **787 t/s** (rdna-boosts) / **1409 t/s** (pwilkin's stack)
-**Companion files:** `PROMPT.md` (the paste-ready session prompt), `launcher-env.txt` (pwilkin's full env)
+**Companion files:** `PROMPT.md` (the paste-ready session prompt), `launcher-env.txt` (pwilkin's full env),
+`mmb-port.patch` (the ported module + hooks, applies to canonical tip `be0d23d57`)
+
+> **STATUS: PARKED as WIP (2026-09-12).** The `mmb` port was built and measured (`GGML_CUDA_MMB=1`,
+> default **0**): **+18.4 %** on the uniform-IQ4_NL model (787 → 934 t/s @pp16384), **+12.0 %** on our
+> mixed UD-IQ4_XS model (755 → 846). It is **NOT in the delivery set** and must not be defaulted on.
+> Parked deliberately — see §12 for the design-objective rationale and the resume checklist.
 
 ---
 
@@ -352,3 +358,53 @@ work), not more weight-GEMM work.**
 - [ ] Purity TODO before landing: with `GGML_CUDA_MMB=1` the MMB path is prefill-only (T ≥ 512) so
       W = 1..8 is unchanged by construction; still run the item-4 `mstep` W = 1..8 probe + the MTP
       acceptance gate on the MMB-on build.
+
+---
+
+## 12. Why this is parked — a design-objective clash (decision 2026-09-12)
+
+Parked, not rejected. The blocker is not effort, it is that pwilkin's approach is **architecturally
+opposed to the property this repo sells**.
+
+**rdna-boosts' contract:** a given `main` build produces *one* answer. Decode (`W = 1`) and every
+speculative verify width (`W = 2..8`) must be bit-identical, so greedy output does not depend on
+`--spec-draft-n-max` or on which fast path fired. Anything that can change the arithmetic is therefore
+either (a) confined strictly above the decode/verify band (prefill-only, `T >= 512`, as the `mmb` port
+does), or (b) opt-in and default-off with an explicit accepted-risk note. That discipline is what
+`GREEDY-PURITY.md` exists to enforce, and it is what the last several sessions (F1, F2, cause-2/3, the
+QSA decode arm, the MoE band) were spent repairing.
+
+**pwilkin's contract:** throughput. His stack achieves it by token-count-gated switches that *change
+the numerics* — `LLAMA_MMB_MIN_T=512`, `LLAMA_MTP_QSA_MIN_T=128`, `LLAMA_QSA_DENSE_SHORTCUT`,
+`LLAMA_QSA_QUERY_STRIP=512`, the `LLAMA_HC_*` single-token fusions, bf16-WMMA vs q8_1 accumulation. He
+ships no determinism guarantee and has no W = 1..8 matrix; "the fast path turns on at N tokens" *is* the
+optimisation. Every such boundary is a potential decode-vs-verify split of exactly the class we keep
+fixing in our own tree.
+
+He is **not** unsafe about recurrent state — his tiled GDN carries `keep_rs = K > 1` and writes
+per-token rollback snapshots, and both trees share the upstream `test-recurrent-state-rollback`. The
+clash is about *determinism*, not corruption.
+
+**Consequence:** each win we take from his stack has to be re-homed behind band-uniform gating (as the
+`mmb` port already is, `T >= 512) before it can be a delivery default — and that is a per-win
+validation cost that scales with how many of his gates we adopt. Hence: park, keep the measurement,
+and only resume with a *general-purpose* rationale.
+
+**Resume checklist (before the port could be opt-in, let alone defaulted on):**
+1. Correctness vs a reference — same-seed coherence on our models and/or perplexity vs the
+   pre-port build. Never done.
+2. W = 1..8 logits matrix **with `GGML_CUDA_MMB=1`** (must match the gate-off widths).
+3. `benchmarks/mtp-adaptive-methodology.md` acceptance gate on the MMB-on build.
+4. `test-recurrent-state-rollback` with the gate on.
+5. **Narrow the fusion stand-down to the weight type.** `ggml_cuda_mmb_active()` is currently a
+   *global* guard on the block-13 MoE prefill pair/swiglu fusions, so `GGML_CUDA_MMB=1` on a
+   non-IQ4_NL MoE model disables our fusion without MMB being able to take over — a prefill
+   regression. Must become per-weight-type.
+6. Compile + consistency on gfx1100 / gfx1201 (only gfx1151 was built).
+7. Measure the **dense Q8_0 / F32** path on the 27B/4B Q8_0 models — that is the only genuinely
+   general-purpose candidate here (`mmb_supported_mmid`/`_glu` are IQ4_NL-only, so MoE wins are
+   inherently IQ4_NL-expert-model wins).
+
+**The bigger general-purpose lever is not a weight GEMM at all** — it is the QSA sparse-attention
+kernel: `flash_attn_qsa` 2842 ms vs his `qsa3` 730 ms, worth ~2.1 s on **both** the uniform-IQ4_NL and
+the mixed IQ4_XS model. That is the item to pick up first when this is resumed.
