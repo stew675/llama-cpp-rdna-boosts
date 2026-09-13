@@ -42,12 +42,18 @@ acceptance rate. Recorded results: `benchmarks/2026-09-13-adaptive-mtp-4-axis.md
 
 ## Usage
 
-> **Set `--reasoning` explicitly (2026-09-13).**  Qwen3.8 emits a thinking trace for instruction-like
-> prompts by default, so `-f prompts/code-python.txt` at the template default produces a reasoning
-> trace, not code, and the prose prompt is answered as a request.  The four-axis gate uses
-> `--reasoning on` for `reasoning.txt` and `--reasoning off` for `prose-rdna-boosts.txt`,
-> `code-python.txt` and `recall.txt`, so each axis measures its intended content.  Without it,
-> acceptance and throughput measure the thinking trace, not the workload.
+> **Set `--reasoning` explicitly, and run the gate long (2026-09-13).**
+>
+> * **Reasoning.**  Qwen3.8 emits a thinking trace for instruction-like prompts by default, so
+>   `-f prompts/code-python.txt` at the template default produces a reasoning trace, not code, and the
+>   prose prompt is answered as a request.  The four-axis gate uses `--reasoning on` for `reasoning.txt`
+>   and `--reasoning off` for `prose-rdna-boosts.txt`, `code-python.txt` and `recall.txt`, so each axis
+>   measures its intended content.
+> * **Length.**  Use **`-n 3000`** (`-n 2000` floor) for any performance/acceptance number.  A short
+>   spot check measures the drafter/controller warm-up: the code axis at adaptive ceiling 12 read -5%
+>   vs fixed `n3` at `-n 256` and +28% at `-n 3000`.  Short runs are fine only for a correctness smoke
+>   test (output non-empty, purity), never as a performance verdict.  The prompts are sized for this
+>   (code = hundreds of lines, prose = multi-thousand words, recall = a full passage).
 
 ```sh
 MODEL=/path/to/model.gguf

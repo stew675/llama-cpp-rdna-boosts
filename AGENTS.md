@@ -401,6 +401,14 @@ Consequences, so it is not re-litigated:
 - **Everything is fast at depth 0** — decode perf work must be validated at
   depth-16384 (benchy protocol), not shallow llama-bench.
 - **Never run parallel/background benches** — they contaminate results.
+- **MTP gates must be long enough to warm up, and must pin reasoning (2026-09-13).**  A short run measures
+  the drafter's and the adaptive controller's transient, not the mode: the code axis at adaptive ceiling
+  12 read -5% vs fixed `n3` at `-n 256` and +28% at `-n 3000`.  The four-axis gate uses **`-n 3000`**
+  (`-n 2000` floor) and **`--reasoning on` for R, `--reasoning off` for P/C/K** (Qwen3.8 emits a thinking
+  trace for instruction-like prompts by default, so an unpinned P/C run measures thinking, not content).
+  Short runs are valid only as a correctness smoke test.  Rule 0 in
+  `benchmarks/mtp-adaptive-methodology.md`; the results are `benchmarks/2026-09-13-adaptive-mtp-4-axis-n12.md`
+  (adaptive ceiling 12 vs fixed `n3`, `-n 3000`: prose +13%, code +28%, recall +61%, reasoning flat).
 - **Mixed K/V cache types are HARD-REJECTED** (`params.type_k != params.type_v` fails context
   creation with a message naming both types).  Maintainer decision 2026-09-11: every mixed pair
   measured 1.7–3.6× slower than the same-type equivalent and never smaller, and the attention path

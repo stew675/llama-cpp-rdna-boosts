@@ -75,25 +75,38 @@ facts), `GREEDY-PURITY.md` §11/§19, `benchmarks/mtp-adaptive-methodology.md`, 
 `MANIFESTS.md`/`BASELINE.md`/`README.md` headers.  The parked issue-#30 response is corrected (its
 clamp description) and its revision bumped.
 
-**6. Adaptive MTP is presented at its recommended ceiling 12 (same day).**  With the clamp gone, the
-adaptive-MTP four-axis table (`benchmarks/2026-09-13-adaptive-mtp-4-axis-n12.md`) re-measures
-`--spec-type draft-mtp-adaptive --spec-draft-n-max 12` (block 001's original recommendation) instead of
-the clamp-limited 7.  **The first cut of that table was wrong and was re-measured the same day:** it ran
-every axis with the model's default reasoning mode, and Qwen3.8 emits a thinking trace for the prose and
-code prompts, so those two columns measured *thinking*, not content (the code prompt at `-n 256` never
-reached any Python).  The corrected protocol sets `--reasoning off` for P/C/K and `--reasoning on` for R
-(the flag is part of the chat template, so R moved slightly too).  Corrected (27B UD-Q4_K_XL, 1 GPU,
-f16, `-n 256`, two reps): R 57.2 / 0.79204 / 3.36; P 52.3 / 0.72803 / 3.17; C 59.7 / 0.72059 / 4.32;
-K **91.6** / 0.98649 / **7.08**; fixed `n3` = R 58.0, P 52.8, C **63.1** / 0.89372, K 67.8 / 0.98446.
-So the controller settles at the floor on R/P (identical to `n3`, ~1 % overhead), **climbs on recall**
-(ceiling 12 is **+35 %** over fixed `n3` at 67.8 t/s and **+22 %** over the corrected ceiling-7 74.8 t/s),
-and **over-drafts on code** (mean len 4.32, acceptance 0.72: 59.7 t/s, about -5 % vs fixed `n3`) — a
-block-001 controller-tuning observation.  Text-pure on all four axes at `-n 256` with no `-lv 4`:
-`plain == fixed n3 == fixed n7 == adaptive n12` (R `383323542388`, P `ab94eb7db4d4`, C `355ce76d9c02`,
-K `6562618b567c`); stock is not pure under the same protocol (prose `plain 33ae8d598e7e` vs `n3/n7
-dc2b1cfd159f`), and the delivery's plain equals stock's MTP text.  Depth 12 is inside the hard 15 bound.
-The reasoning-control protocol is now recorded in `benchmarks/mtp-adaptive-methodology.md` and
-`prompts/README.md`.
+**6. Adaptive MTP is presented at its recommended ceiling 12, on realistic-length runs (same day).**
+With the clamp gone, the adaptive-MTP four-axis table (`benchmarks/2026-09-13-adaptive-mtp-4-axis-n12.md`)
+re-measures `--spec-type draft-mtp-adaptive --spec-draft-n-max 12` (block 001's original recommendation)
+instead of the clamp-limited 7.  **The first two cuts of that table were wrong and were re-measured the
+same day, and the two mistakes are the point:**
+
+* **Reasoning.**  They ran every axis with the model's default reasoning mode; Qwen3.8 emits a thinking
+trace for the prose and code prompts, so those two columns measured *thinking*, not content (the code
+prompt at `-n 256` never reached any Python).  Corrected with `--reasoning off` for P/C/K and
+`--reasoning on` for R (the flag is part of the chat template).
+* **Length.**  They used `-n 256`, which measures the drafter/controller warm-up, not the mode.  At
+  `-n 256` the code axis at ceiling 12 read **-5 %** vs fixed `n3`; at `-n 3000` it is **+28 %**.  The
+  controller's mean accepted length goes 4.32 -> 7.02 as it warms up.  A short spot test inverts the
+  ranking.
+
+**Final protocol and result** (27B UD-Q4_K_XL, 1 GPU, f16, `-n 3000`, reasoning pinned): plain ~28.5-28.9
+t/s everywhere; fixed `n3` R 46.4 / 0.57781 / 2.73, P 55.9 / 0.79379 / 3.38, C 63.7 / 0.91663 / 3.75,
+K 68.1 / 0.99200 / 3.98 (stock `n3` within ~2 % on every axis); **adaptive `n12` R 46.0 / 0.57632 / 2.74,
+P 63.4 / 0.50654 / 5.10, C 81.8 / 0.57863 / 7.02, K 109.6 / 0.96320 / 8.95**.  So against fixed `n3` the
+mode is reasoning -1 %, prose **+13 %**, code **+28.5 %**, recall **+61 %**; against the old ceiling 7
+it is prose +26 %, code +35 %, recall +44 %.  Acceptance is *lower* than fixed `n3` (it drafts deeper and
+rejects more) but throughput is higher -- acceptance alone is not the metric.  At the reporter's exact
+`n8 + p-min 0.55` configuration the delivery is ahead on every axis at both `n7` and `n8` (+0.8 % to
++8.2 %).  Text purity at `-n 3000` (no `-lv 4`): fixed `n3` == plain on every axis; adaptive `n12` ==
+plain on reasoning (`98d4e36a79fb`) and recall (`a87c4318b649`) and diverges on prose (`27f3f7d3f80c`
+vs `7ec08bc22946`) and code (`48241ec079f6` vs `a2eceaad5743`) -- the documented above-7 kernel-family
+trade, which only appears once the run is long enough to hit a near-tie (at `-n 256` all four matched).
+Stock is not pure under the protocol.  Depth 12 is inside the hard 15 bound.
+
+The **length and reasoning requirements are now recorded in `benchmarks/mtp-adaptive-methodology.md`
+(gate rule 0) and `prompts/README.md`**.  A short run is valid only as a correctness smoke test, never
+as a performance verdict.
 
 **Lesson.**  "Depth > 7 is unsupported" had been resting on one stated reason (FA purity) while the real
 qwen4exp effect was a different band (the QSA arm).  The no-corruption result came from a deterministic

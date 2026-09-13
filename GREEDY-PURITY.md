@@ -1185,3 +1185,33 @@ pre-amendment build, so every recorded reference hash holds.
   The clamp relaxation was validated on the recurrent snapshot machinery (deterministic sweep) and on
   qwen4exp's QSA arm; the residual `W=9` difference on all models is the documented §11 kernel-family
   trade, not a defect.
+
+## 33. A purity (or throughput) gate must run the content the axis intends, long enough to reach steady state (2026-09-13)
+
+**Claim.**  The four-axis adaptive-MTP gate was first run with the model's default reasoning mode and at
+`-n 256`.  Both invalidated it, in opposite directions:
+
+* **Reasoning.**  Qwen3.8 emits a thinking trace for instruction-like prompts, so the "code" axis at the
+  template default never reached any Python (at `-n 256`) and the "prose" axis answered as a request.
+  The code acceptance read 0.56 instead of 0.89-0.92; the gate was measuring the thinking trace.
+* **Length.**  `-n 256` measures the drafter/adaptive-controller warm-up, not the mode.  The code axis at
+  adaptive ceiling 12 read **-5%** vs fixed `n3` at `-n 256` (mean accepted length 4.32) and **+28%** at
+  `-n 3000` (mean length 7.02).  The ranking inverted.
+
+**Why it matters for purity specifically.**  Purity above `n_max 7` is a probabilistic near-tie
+property, so it needs enough tokens to hit a near-tie *and* the content the axis is meant to produce.
+At `-n 256` all four axes matched plain; at `-n 3000` reasoning and recall stayed byte-identical while
+prose and code diverged -- the documented above-7 kernel-family trade, made visible only by the longer
+run.  A short purity check can therefore report "pure" while the real workload is not.
+
+**Rules to take from it:**
+
+* **Run the gate at a length that matches the workload** (`-n 3000` here; `-n 2000` floor).  A short run
+  is a correctness smoke test (output non-empty, acceptance > 0), never a performance or purity verdict.
+* **Pin the content mode** (`--reasoning off` for P/C/K, `on` for R) for every gate that compares
+  builds or depths; a workload that is not actually produced cannot be measured.
+* **A spot test that passes is not evidence that a long run passes** -- the same class of blind spot as
+  §11's "text equality is evidence for purity, never against divergence".
+
+Results: `benchmarks/2026-09-13-adaptive-mtp-4-axis-n12.md`; protocol: gate rule 0 in
+`benchmarks/mtp-adaptive-methodology.md`; prompts: `prompts/README.md`.

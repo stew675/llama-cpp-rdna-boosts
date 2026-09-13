@@ -21,11 +21,12 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 
 **[2026-09-13-adaptive-mtp-4-axis-n12.md](2026-09-13-adaptive-mtp-4-axis-n12.md)** is the
 current adaptive-MTP table: `draft-mtp-adaptive` at its recommended **ceiling 12** (the
-2026-09-13 clamp relaxation), across the R/P/C/K workloads, with the `plain` and fixed
-`mtp n3` baselines and the text-purity check.  It supersedes the `adaptive n7` column of
-[2026-09-13-adaptive-mtp-4-axis.md](2026-09-13-adaptive-mtp-4-axis.md) (that ceiling was an
-artifact of the old `n_max <= 7` clamp).  The gate protocol and baselines live in
-[mtp-adaptive-methodology.md](mtp-adaptive-methodology.md).
+2026-09-13 clamp relaxation), across the R/P/C/K workloads, at a realistic **`-n 3000`** with
+reasoning pinned per axis (`--reasoning off` for P/C/K).  Against fixed `n3` it is reasoning
+-1%, prose +13%, code +28%, recall +61%; a 256-token run measured the warm-up and inverted the
+code ranking.  It supersedes all earlier adaptive records -- both the `n_max <= 7` clamp and the
+`-n 256` / default-reasoning protocol were artifacts.  The gate protocol (length, reasoning,
+baselines) lives in [mtp-adaptive-methodology.md](mtp-adaptive-methodology.md).
 
 ## Block 12 — hybrid all-reduce env matrix (2026-08-30)
 

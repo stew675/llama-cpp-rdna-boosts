@@ -1,20 +1,22 @@
-# Adaptive MTP across the four workloads, ceiling 12 (2026-09-13)
+# Adaptive MTP across the four workloads, ceiling 12, `-n 3000` (2026-09-13)
 
-Measures the delivery's `draft-mtp-adaptive` mode (block 001) at **`--spec-draft-n-max 12`**, the ceiling
-its original PR recommended, now that the old `n_max <= 7` clamp no longer caps it (the 2026-09-13
-issue-#30 amendment; see `../WORKLOG.md` 2026-09-13 (latest)).
+The definitive four-axis adaptive-MTP record: `draft-mtp-adaptive` (block 001) at its recommended
+ceiling **12**, across R/P/C/K, at a **realistic generation length**.
 
-> **Protocol correction (same day).**  The first cut of this record (and the earlier
-> [2026-09-13-adaptive-mtp-4-axis.md](2026-09-13-adaptive-mtp-4-axis.md)) ran **all four axes with the
-> model's default reasoning mode**.  Qwen3.8 emits a thinking trace for the prose and code prompts, so
-> those two columns were measuring *thinking*, not prose/code output: at `-n 256` the code run never
-> reached any Python.  The table below sets **`--reasoning off` for P/C/K** (the intended content) and
-> **`--reasoning on` for R** (the reasoning axis).  It also changes R slightly, because the flag is part
-> of the chat template.  Numbers in both older records are **not** comparable to these.
+> **Protocol: `-n 3000`, reasoning pinned per axis (2026-09-13).**  Both matter, and both were wrong in
+> the first cut of this record and in [2026-09-13-adaptive-mtp-4-axis.md](2026-09-13-adaptive-mtp-4-axis.md).
+>
+> * **Length.**  A short run measures the warm-up, not the mode.  The drafter needs context to predict,
+>   and the controller needs hundreds of verify rounds to settle.  At `-n 256` the code axis at ceiling
+>   12 read **-5%** vs fixed `n3` (mean accepted length 4.32, the controller still climbing); at
+>   `-n 3000` it is **+28%** (mean length 7.02).  `-n 2000` is the floor; the gate uses `-n 3000`.
+> * **Reasoning.**  Qwen3.8 emits a thinking trace for instruction-like prompts, so a run at the
+>   template default measures thinking, not content (`-n 256` produced no Python at all).  Use
+>   `--reasoning on` for R and `--reasoning off` for P/C/K.
 
-Workloads are the adaptive-MTP gate's four axes: **R**easoning, **P**rose, **C**ode and verbatim recall
-(**K**).  Run all four: the adaptive controller's behaviour (and therefore the throughput) is a function
-of the workload's acceptance rate.
+The four axes are the workloads the mode is designed for: hundreds of lines of code (C), a
+multi-thousand-word prose piece (P), a multi-thousand-character derivation (R), and a full verbatim
+recall passage (K).
 
 ## Environment
 
@@ -23,8 +25,7 @@ of the workload's acceptance rate.
 * Model: `Qwen3.8-27B-UD-Q4_K_XL.gguf` (17,559,178,144 bytes), f16 K/V, `-fa auto -ngl 99`
 * Drafter: the MTP head built into the model GGUF (`blk.64.nextn.*`, `nextn_predict_layers = 1`).
   **No `-md`**.
-* `-n 256 --seed 42 --temp 0 --single-turn --no-display-prompt -c 32768 -b 2048 -ub 2048`
-* Two repetitions per cell; the table shows the mean (t/s within ~1%, acceptance discrete).
+* `-n 3000 --seed 42 --temp 0 --single-turn --no-display-prompt -c 32768 -b 2048 -ub 2048`
 
 Prompts: `prompts/reasoning.txt` (R), `prose-rdna-boosts.txt` (P), `code-python.txt` (C),
 `recall.txt` (K).  See `../prompts/README.md`.
@@ -33,14 +34,13 @@ Prompts: `prompts/reasoning.txt` (R), `prose-rdna-boosts.txt` (P), `code-python.
 
 ```sh
 M=Qwen3.8-27B-UD-Q4_K_XL.gguf
-# R keeps thinking; P/C/K must turn it off so the model generates the intended content
 for axis in reasoning prose-rdna-boosts code-python recall; do
   case "$axis" in reasoning) REA=on;; *) REA=off;; esac
   for spec in "--spec-type none" \
               "--spec-type draft-mtp --spec-draft-n-max 3" \
               "--spec-type draft-mtp-adaptive --spec-draft-n-max 12"; do
     build/bin/llama-cli -m "$M" --reasoning $REA $spec -f prompts/$axis.txt \
-      -n 256 --seed 42 --temp 0 --single-turn --no-display-prompt \
+      -n 3000 --seed 42 --temp 0 --single-turn --no-display-prompt \
       -c 32768 -b 2048 -ub 2048 -ctk f16 -ctv f16 -fa auto -ngl 99 -lv 4
   done
 done
@@ -49,61 +49,51 @@ done
 Acceptance and mean accepted length come from the `-lv 4` `draft acceptance = ... , mean len = ...`
 line; generation t/s from the eval time line.
 
-## Results - rdna-boosts at ceiling 12
+## Results (`-n 3000`)
 
-| axis | plain t/s | `mtp n3` t/s | `mtp n3` acc | `mtp n3` mean len | `adaptive n12` t/s | `adaptive n12` acc | `adaptive n12` mean len |
-|---|---|---|---|---|---|---|---|
-| reasoning (R) | 29.1 | 58.0 | 0.79204 | 3.36 | 57.2 | 0.79204 | 3.36 |
-| prose (P) | 28.5 | 52.8 | 0.72803 | 3.17 | 52.3 | 0.72803 | 3.17 |
-| code (C) | 29.0 | **63.1** | **0.89372** | 3.68 | 59.7 | 0.72059 | 4.32 |
-| recall (K) | 29.0 | 67.8 | 0.98446 | 3.92 | **91.6** | 0.98649 | **7.08** |
+| axis | plain t/s | stock `n3` t/s | stock `n3` acc | delivery `n3` t/s | delivery `n3` acc | `adaptive n12` t/s | `adaptive n12` acc | `adaptive n12` mean len |
+|---|---|---|---|---|---|---|---|---|
+| reasoning (R) | 28.9 | 47.3 | 0.59659 | 46.4 | 0.57781 | 46.0 | 0.57632 | 2.74 |
+| prose (P) | 28.4 | 56.3 | 0.79948 | 55.9 | 0.79379 | **63.4** | 0.50654 | 5.10 |
+| code (C) | 28.8 | 62.9 | 0.91079 | 63.7 | 0.91663 | **81.8** | 0.57863 | 7.02 |
+| recall (K) | 28.9 | 68.0 | 0.99200 | 68.1 | 0.99200 | **109.6** | 0.96320 | 8.95 |
 
-For reference, the same matrix at the old ceiling 7: recall 74.8 t/s / 0.98618 / 6.22; R/P are
-identical to the n12 cells above (the controller stays at the floor, so the ceiling never matters);
-code 57.9 t/s / 0.73684 / 4.32.
+**Adaptive ceiling 12 vs fixed `n3`** (same build): R -1.0%, P **+13.3%**, C **+28.5%**, K **+61.0%**.
+**Ceiling 12 vs ceiling 7**: R flat (46.0 both), P 50.2 -> **63.4** (+26%), C 60.4 -> **81.8** (+35%),
+K 76.0 -> **109.6** (+44%).  Ceiling 12 is where the mode pays on every content axis; the old ceiling 7
+left most of it on the table.
+
+At fixed `n3` the delivery and stock are within ~2% of each other on every axis (R -1.8%, P -0.7%,
+C +1.2%, K +0.2%) -- the delivery's win is concentrated in the deeper/adaptive drafts, which is what
+block 001 is for.
 
 ## Observations
 
-* **Code is the predictable workload it was meant to be.**  With reasoning off, `mtp n3` acceptance is
-  0.894 (fixed-depth) and the output is real Python.  The earlier 0.558 code acceptance was a thinking
-  trace, not code.
-* **The adaptive controller tracks R/P correctly and buys a lot on K.**  On R/P it settles at the
-  floor (identical accepted/generated counts and mean length to fixed `n3`, ~1% decision overhead).
-  On verbatim recall it climbs hard: mean accepted length **7.08** vs 3.92, and ceiling 12 gives
-  **+35%** over fixed `n3` (91.6 vs 67.8 t/s) and **+22%** over the old ceiling 7 (74.8 t/s).
-* **The controller over-drafts on code.**  Code acceptance at `n3` (0.894) is high enough that the
-  controller climbs to mean length ~4.3, but the deeper verify accepts less (0.721) and the net is
-  **-5.4%** vs fixed `n3` (59.7 vs 63.1 t/s).  Raising the ceiling from 7 to 12 recovers a little
-  (57.9 -> 59.7) but does not reach fixed `n3`.  This is a block-001 controller-tuning observation, not
-  a correctness issue, and it is why the gate runs all four axes rather than one.
-* **Plain decode is workload-insensitive** (28.5 to 29.1 t/s), as expected without speculation.
+* **The controller tracks the workload across a real run.**  On reasoning it pins at the floor (mean
+  length 2.74, essentially identical to fixed `n3`).  On prose, code and recall it climbs (mean length
+  5.10 / 7.02 / 8.95) and wins 13-61%.
+* **Lower acceptance, higher throughput.**  The adaptive acceptance is *below* fixed `n3` on every axis
+  (e.g. code 0.579 vs 0.917) because it drafts deeper and rejects more -- but it accepts more tokens per
+  target forward pass (mean length x acceptance), so it is faster.  Acceptance alone is not the metric.
+* **The 256-token measurement inverted the ranking.**  Code at ceiling 12 was -5% at 256 tokens and
+  +28% at 3000; prose at ceiling 7 was -10% at 256 and -10% at 3000 (both lose to fixed `n3`) while
+  ceiling 12 wins.  The controller's steady state is not visible in a short run.
 
-## Text purity at ceiling 12
+## Text purity (`-n 3000`, no `-lv 4`)
 
-At `-n 256` with **no `-lv 4`**, the delivery is byte-identical across plain, fixed `n3`, fixed `n7`
-and adaptive `n12` on **every axis**:
+| axis | `plain` | `n3` | `adaptive n12` |
+|---|---|---|---|
+| reasoning | `98d4e36a79fb` | `98d4e36a79fb` | `98d4e36a79fb` |
+| prose | `27f3f7d3f80c` | `27f3f7d3f80c` | `7ec08bc22946` |
+| code | `48241ec079f6` | `48241ec079f6` | `a2eceaad5743` |
+| recall | `a87c4318b649` | `a87c4318b649` | `a87c4318b649` |
 
-| axis | `plain` | `adaptive n12` |
-|---|---|---|
-| reasoning | `383323542388` | `383323542388` |
-| prose | `ab94eb7db4d4` | `ab94eb7db4d4` |
-| code | `355ce76d9c02` | `355ce76d9c02` |
-| recall | `6562618b567c` | `6562618b567c` |
-
-The bit-identical guarantee is only *promised* for `n_max <= 7` (a verify wider than 8 rows switches FA
-and matmul kernel families), but no near-tie was hit on these runs, so depth 12 is pure here as well.
-Depth 12 is well inside the hard 15 bound (the recurrent rollback snapshot set; the deterministic
-`test-recurrent-state-depth` sweep is clean for `n_rs_seq` 1..15) — see `../GREEDY-PURITY.md` §11/§32.
-
-Stock is **not** width-pure under the same protocol (prose, `-n 64`, reasoning off):
-`stock plain 33ae8d598e7e` vs `stock n3 == stock n7 dc2b1cfd159f`; the delivery's plain/n3/n7 all give
-`dc2b1cfd159f`.  The delivery's plain equals stock's MTP text, i.e. the delivery fixed the stock
-plain-decode divergence.
-
-The gate is also pure across **all eight native KV-cache types** under the corrected protocol (delivery,
-prose, `-n 64`): f16/bf16/q8_0/q4_1 `dc2b1cfd159f`, q4_0 `9445bec67217`, q5_0/q5_1 `33ae8d598e7e`,
-iq4_nl `d20b650cea3f` (plain == n3 == n7 within each type).  The 27B **Q8_0** weights give
-`plain == n3 == n7 == d20b650cea3f` (f16 KV).
+Fixed `n3` is byte-identical to plain on every axis.  Adaptive `n12` is byte-identical on reasoning and
+recall, and diverges on prose and code -- the expected above-7 purity trade (a verify wider than 8 rows
+switches kernel families), which only shows up once the run is long enough to hit a near-tie.  At
+`-n 256` all four happened to match, which is exactly why purity must be checked at the gate length.
+Depth 12 is inside the hard 15 bound; stock is **not** pure under the same protocol (its plain decode
+disagrees with its own MTP), and the delivery's plain equals stock's MTP text.
 
 ## Reproducing
 
@@ -116,7 +106,7 @@ for axis in reasoning prose-rdna-boosts code-python recall; do
               "--spec-type draft-mtp --spec-draft-n-max 3" \
               "--spec-type draft-mtp-adaptive --spec-draft-n-max 12"; do
     HIP_VISIBLE_DEVICES=0 build/bin/llama-cli -m "$M" --reasoning $REA $spec -f prompts/$axis.txt \
-      -n 256 --seed 42 --temp 0 --single-turn --no-display-prompt \
+      -n 3000 --seed 42 --temp 0 --single-turn --no-display-prompt \
       -c 32768 -b 2048 -ub 2048 -ctk f16 -ctv f16 -fa auto -ngl 99 -lv 4
   done
 done

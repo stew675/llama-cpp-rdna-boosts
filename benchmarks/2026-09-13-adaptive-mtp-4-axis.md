@@ -1,11 +1,11 @@
 # Adaptive MTP across the four workloads (2026-09-13)
 
 > **Superseded (2026-09-13, same day).**  Every column below was measured with the model's default
-> reasoning mode, and because Qwen3.8 emits a thinking trace for the prose and code prompts, the **P and
-> C columns measured thinking, not prose/code**.  The corrected protocol (R reasons, P/C/K run with
-> `--reasoning off`) and the re-measured table live in
-> [2026-09-13-adaptive-mtp-4-axis-n12.md](2026-09-13-adaptive-mtp-4-axis-n12.md); the `plain` and
-> `mtp n3` values here are not comparable to it either, since the reasoning flag also changes R.
+> reasoning mode **and at `-n 256`**, so the **P and C columns measured thinking, not prose/code**, and
+> the short length measured the drafter/controller warm-up rather than the mode's steady state.  The
+> corrected protocol (R reasons, P/C/K run with `--reasoning off`, `-n 3000`) and the re-measured table
+> are in [2026-09-13-adaptive-mtp-4-axis-n12.md](2026-09-13-adaptive-mtp-4-axis-n12.md); none of the
+> numbers here are comparable to it.
 
 
 Measures the delivery's MTP draft depth variants across the four workloads the adaptive-MTP gate uses:

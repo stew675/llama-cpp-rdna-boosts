@@ -79,12 +79,12 @@ per-kernel optima.
 
 ### Protocol A — fast per-build gate (llama-cli, fixed seed)
 
-Canonical (dense): `bench.sh` style, seed 42, temp 0, predict >= 512:
+Canonical (dense): `bench.sh` style, seed 42, temp 0, predict >= 3000:
 
 ```sh
 HIP_VISIBLE_DEVICES=0 GGML_CUDA_DISABLE_GRAPHS=0 <build>/bin/llama-cli \
   --model <model> --fit false --top-k 20 --threads 8 --parallel 1 \
-  --top-p 0.95 --min-p 0.001 --predict 1024 --load-mode mlock \
+  --top-p 0.95 --min-p 0.001 --predict 3000 --load-mode mlock \
   --cache-ram 16384 --ctx-size 102400 --flash-attn auto --temperature 0.0 \
   --batch-size 1024 --ubatch-size 1024 --n-gpu-layers all \
   --cache-type-k bf16 --cache-type-v bf16 --ctx-checkpoints 64 \
@@ -116,7 +116,21 @@ equivalent template-level knob); both arms must use the same setting.  The earli
 (including the first cut of `2026-09-13-adaptive-mtp-4-axis.md`) were measured without it and are not
 comparable -- see `2026-09-13-adaptive-mtp-4-axis-n12.md` for the corrected table.
 
+**Generation length is part of the protocol (2026-09-13).**  **Never gate MTP on a short run.**  The
+drafter needs context to predict what comes next, and the adaptive controller needs hundreds of verify
+rounds to settle; a few hundred tokens measures the warm-up transient, not the mode.  Use **`-n 3000`**
+for the four-axis gate (`-n 2000` is the hard floor).  The workloads are hundreds of lines of code, a
+multi-thousand-word prose piece, a multi-thousand-character derivation, and a full recall passage --
+none of which fit in 256 tokens.  The effect is not subtle: the code axis at adaptive ceiling 12
+measured **-5%** vs fixed `n3` at `-n 256` (mean accepted length 4.32) and **+28%** at `-n 3000`
+(mean accepted length 7.02).  A 256-token spot check reports the transient and can invert the ranking.
+This is the same class of blind spot as the reasoning flag: a gate that does not reproduce the real
+usage shape optimises for the wrong thing.
+
 Gate rules:
+0. **Length**: the four-axis gate runs at `-n 3000` (floor `-n 2000`).  A shorter run may be used as a
+   smoke check for correctness (acceptance > 0, text purity), never as a performance verdict.  Record
+   `-n` with every number.
 1. **Acceptance**: with `--log-verbosity 4`, the `draft acceptance` /
    `acc per pos` lines must show a healthy rate on prose (>= ~0.45 at pos 1
    for these models; the 2026-09-02 regression showed 0.000). A collapse to
@@ -152,6 +166,11 @@ Gate rules:
    clamping:** `--spec-draft-n-max 8..15` is allowed with a visible notice that
    `none` vs `draft-mtp` may differ, and only `> 15` is clamped (the recurrent
    rollback snapshot bound -- a correctness bound, not the purity one).
+   **Purity above 7 is also length-dependent**, which is another reason to run the
+   gate long: at `-n 3000` the adaptive ceiling 12 is byte-identical to plain on
+   the reasoning and recall axes but diverges on prose and code (a near-tie
+   flips once the run is long enough), while at `-n 256` all four happened to
+   match.  Report purity at the gate length, not a short check.
 
 ### Protocol B — server harness (dense canonical, long-context workloads)
 
