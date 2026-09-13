@@ -1,4 +1,4 @@
-From 06b72a9e2b82bc2023f3376edae6ba9c362289c3 Mon Sep 17 00:00:00 2001
+From a879c6dd8a40aaf735013e028bd6836dfbaa3aa3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 08/15] rdna-boosts: block 08: fused-core prefill kernels and
@@ -18,13 +18,15 @@ dst->ne[1] == 1)).  Require the destination to satisfy the same
 constraint the kernels assert before fusing through a view.  The
 single-sequence case is unaffected.
 ---
- ggml/src/ggml-cuda/CMakeLists.txt             |   6 +-
+ docs/build.md                                 |   2 +-
+ ggml/CMakeLists.txt                           |   2 +-
+ ggml/cmake/common.cmake                       |   2 +-
  ggml/src/ggml-cuda/common.cuh                 |  87 +++
  ggml/src/ggml-cuda/convert.cu                 |   6 +
  ggml/src/ggml-cuda/dequantize.cuh             |  13 +
  ggml/src/ggml-cuda/fattn-common.cuh           |  89 +++
  ggml/src/ggml-cuda/fattn-tile.cuh             |  16 +
- ggml/src/ggml-cuda/fattn.cu                   |  84 ++-
+ ggml/src/ggml-cuda/fattn.cu                   |  59 +-
  ggml/src/ggml-cuda/ggml-cuda.cu               | 546 +++++++++++++-
  ggml/src/ggml-cuda/mmvq.cu                    | 690 ++++++++++++++++--
  ggml/src/ggml-cuda/mmvq.cuh                   |  23 +
@@ -48,9 +50,7 @@ single-sequence case is unaffected.
  .../template-instances/generate_cu_files.py   |   2 +-
  ggml/src/ggml-cuda/unary.cu                   | 150 ++++
  ggml/src/ggml-cuda/unary.cuh                  |   6 +
- ggml/src/ggml-hip/CMakeLists.txt              |   6 +-
- ggml/src/ggml-musa/CMakeLists.txt             |   6 +-
- 32 files changed, 1949 insertions(+), 108 deletions(-)
+ 32 files changed, 1913 insertions(+), 107 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-vec-instance-bf16-iq4_nl.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-iq4_nl.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-bf16.cu
@@ -67,24 +67,45 @@ single-sequence case is unaffected.
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_1-iq4_nl.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-iq4_nl.cu
 
-diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
-index 10828ad81..e4c356515 100644
---- a/ggml/src/ggml-cuda/CMakeLists.txt
-+++ b/ggml/src/ggml-cuda/CMakeLists.txt
-@@ -120,8 +120,12 @@ if (CUDAToolkit_FOUND)
-         list(APPEND GGML_SOURCES_CUDA
-             template-instances/fattn-vec-instance-f16-f16.cu
-             template-instances/fattn-vec-instance-q4_0-q4_0.cu
-+            template-instances/fattn-vec-instance-q4_1-q4_1.cu
-+            template-instances/fattn-vec-instance-q5_0-q5_0.cu
-+            template-instances/fattn-vec-instance-q5_1-q5_1.cu
-             template-instances/fattn-vec-instance-q8_0-q8_0.cu
--            template-instances/fattn-vec-instance-bf16-bf16.cu)
-+            template-instances/fattn-vec-instance-bf16-bf16.cu
-+            template-instances/fattn-vec-instance-iq4_nl-iq4_nl.cu)
-     endif()
+diff --git a/docs/build.md b/docs/build.md
+index 70fc17af2..23ec6d819 100644
+--- a/docs/build.md
++++ b/docs/build.md
+@@ -300,7 +300,7 @@ The following compilation options are also available to tweak performance:
+ |-------------------------------|------------------------|---------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+ | GGML_CUDA_FORCE_MMQ           | Boolean                | false   | Force the use of custom matrix multiplication kernels for quantized models instead of FP16 cuBLAS even if there is no int8 tensor core implementation available (affects V100, CDNA and RDNA3+). MMQ kernels are enabled by default on GPUs with int8 tensor core support. With MMQ force enabled, speed for large batch sizes will be worse but VRAM consumption will be lower. |
+ | GGML_CUDA_FORCE_CUBLAS        | Boolean                | false   | Force the use of FP16 cuBLAS instead of custom matrix multiplication kernels for quantized models. There may be issues with numerical overflows (except for V100, CDNA and RDNA4 which use FP32 compute type by default) and memory use will be higher. Prompt processing may become faster on recent datacenter GPUs (the custom kernels were tuned primarily for RTX 3000/4000).   |
+-| GGML_CUDA_FA_QUANTS           | `all` or `type_K-type_V` list | q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16 | Select which K/V type combinations to compile the FlashAttention CUDA kernels for. `all` compiles every combination, but compilation takes much longer. Otherwise a `;`-separated list of `type_K-type_V` pairs; f16-f16 is always compiled. Combinations that were not compiled fall back to f16-f16 kernel with a warning. Legal types: f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0. |
++| GGML_CUDA_FA_QUANTS           | `all` or `type_K-type_V` list | q4_0-q4_0;q4_1-q4_1;q5_0-q5_0;q5_1-q5_1;q8_0-q8_0;bf16-bf16;f16-f16;iq4_nl-iq4_nl | Select which K/V type combinations to compile the FlashAttention CUDA kernels for. `all` compiles every combination, but compilation takes much longer. Otherwise a `;`-separated list of `type_K-type_V` pairs; f16-f16 is always compiled. Combinations that were not compiled fall back to f16-f16 kernel with a warning. Legal types: f16, bf16, q4_0, q4_1, q5_0, q5_1, q8_0, iq4_nl. |
+ | GGML_CUDA_FA_ALL_QUANTS       | Boolean                | false   | Deprecated alias for `GGML_CUDA_FA_QUANTS=all`.                                                                                                                                                                                                                                                                                                                               |
  
-     ggml_add_backend_library(ggml-cuda
+ ## MUSA
+diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
+index ba9bc83b9..0928adcbd 100644
+--- a/ggml/CMakeLists.txt
++++ b/ggml/CMakeLists.txt
+@@ -204,7 +204,7 @@ option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copie
+ option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
+ option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
+ option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
+-set   (GGML_CUDA_FA_QUANTS "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16" CACHE STRING
++set   (GGML_CUDA_FA_QUANTS "q4_0-q4_0;q4_1-q4_1;q5_0-q5_0;q5_1-q5_1;q8_0-q8_0;bf16-bf16;f16-f16;iq4_nl-iq4_nl" CACHE STRING
+                                             "ggml: FlashAttention K-V type combinations to compile, \"all\" or a list such as \"q8_0-q8_0;q8_0-q4_0\"")
+ option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
+ option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
+diff --git a/ggml/cmake/common.cmake b/ggml/cmake/common.cmake
+index 25eff7a5e..0d00cb331 100644
+--- a/ggml/cmake/common.cmake
++++ b/ggml/cmake/common.cmake
+@@ -51,7 +51,7 @@ endfunction()
+ 
+ # Determines which FlashAttention vector kernel template instances to compile, returns them in OUT_SRCS.
+ function(ggml_cuda_fattn_vec_instances DIR OUT_SRCS)
+-    set(FA_TYPES q4_0 q4_1 q5_0 q5_1 q8_0 bf16 f16)
++    set(FA_TYPES q4_0 q4_1 q5_0 q5_1 q8_0 iq4_nl bf16 f16)
+ 
+     string(TOLOWER "${GGML_CUDA_FA_QUANTS}" FA_QUANTS)
+     string(STRIP   "${FA_QUANTS}" FA_QUANTS)
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
 index 2e5d27bb8..6b43f8d05 100644
 --- a/ggml/src/ggml-cuda/common.cuh
@@ -253,7 +274,7 @@ index 651524be7..a8cf54eb5 100644
      const block_q4_1 * x = (const block_q4_1 *) vx;
  
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 22eec7d57..12eab7745 100644
+index 9852a7439..83ec690f8 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -300,6 +300,48 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_1(
@@ -401,143 +422,72 @@ index 46d26a723..23ce9a1c4 100644
      if constexpr (DKQ <= 128) {
          if (Q->ne[1] > 32/ncols2) {
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 3036829bb..00c46f9d5 100644
+index d41ce42be..8619742d4 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -402,6 +402,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_F16)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_F16)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_F16)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_F16)
+@@ -448,6 +448,24 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
+     FATTN_VEC_CASES_ALL_D(Q8_0, BF16)
+     FATTN_VEC_CASES_ALL_D(BF16, BF16)
  
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q4_0)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
-@@ -410,6 +411,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q4_0)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q4_0)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_0)
- 
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q4_1)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_1)
-@@ -418,6 +420,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q4_1)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_1)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q4_1)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_1)
- 
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q5_0)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q5_0)
-@@ -426,6 +429,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q5_0)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q5_0)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q5_0)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_0)
- 
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q5_1)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q5_1)
-@@ -434,6 +438,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q5_1)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q5_1)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q5_1)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_1)
- 
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_Q8_0)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0)
-@@ -442,6 +447,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_Q8_0)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0)
- 
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_BF16)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_BF16)
-@@ -450,11 +456,27 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_BF16)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_BF16)
++    // iq4_nl pairs (not part of upstream's checked-in cross product; shipped with this enablement)
++    FATTN_VEC_CASES_ALL_D(IQ4_NL, F16)
++    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q4_0)
++    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q4_1)
++    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q5_0)
++    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q5_1)
++    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q8_0)
++    FATTN_VEC_CASES_ALL_D(IQ4_NL, BF16)
++    FATTN_VEC_CASES_ALL_D(IQ4_NL, IQ4_NL)
 +
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_IQ4_NL)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_IQ4_NL)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL)
- #else
-+    // Keep in sync with ggml_cuda_fattn_kv_type_supported and with the default
-+    //   instance list in the backend CMakeLists.txt files.
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_1, GGML_TYPE_Q4_1)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_0, GGML_TYPE_Q5_0)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_Q5_1)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
-     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
-+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL)
- #endif // GGML_CUDA_FA_ALL_QUANTS
++    FATTN_VEC_CASES_ALL_D(F16,  IQ4_NL)
++    FATTN_VEC_CASES_ALL_D(Q4_0, IQ4_NL)
++    FATTN_VEC_CASES_ALL_D(Q4_1, IQ4_NL)
++    FATTN_VEC_CASES_ALL_D(Q5_0, IQ4_NL)
++    FATTN_VEC_CASES_ALL_D(Q5_1, IQ4_NL)
++    FATTN_VEC_CASES_ALL_D(Q8_0, IQ4_NL)
++    FATTN_VEC_CASES_ALL_D(BF16, IQ4_NL)
++
+     return nullptr;
+ }
  
-     GGML_ABORT("fatal error");
-@@ -468,6 +490,18 @@ enum best_fattn_kernel {
+@@ -479,7 +497,11 @@ enum best_fattn_kernel {
      BEST_FATTN_KERNEL_MMA_F16 = 400,
  };
  
+-// K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
 +// KV cache types that at least one of the flash-attention families reachable
-+//   below can consume:
-+//     - the tile and mma-f16 kernels stage K/V through ggml_get_to_fp16_cuda,
-+//       which covers the whole q4_0/q4_1/q5_0/q5_1/q8_0/iq4_nl set, so any of
-+//       those types works there (at the cost of the staging copy);
-+//     - the vec kernel reads K/V natively and is instantiated per (K,V) pair, so
-+//       a type listed here must have an instance for every reachable pair.
-+//   With GGML_CUDA_FA_ALL_QUANTS undefined the chooser enforces K->type ==
-+//   V->type, so the reachable pairs are exactly the diagonals: keep this list
-+//   and the default instance lists in ggml-{cuda,hip,musa}/CMakeLists.txt in
-+//   sync, otherwise a reachable pair falls through to the GGML_ABORT at the end
-+//   of ggml_cuda_flash_attn_ext_vec.
- static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
++//   below can consume: the tile/mma-f16 kernels stage K/V through
++//   ggml_get_to_fp16_cuda (q4_0/q4_1/q5_0/q5_1/q8_0/iq4_nl included), and the
++//   vec kernel reads K/V natively per (K,V) instance selected by
++//   GGML_CUDA_FA_QUANTS (the iq4_nl pairs are shipped alongside this enablement).
+ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
      switch (type) {
          case GGML_TYPE_F32:
-@@ -476,9 +510,21 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
+@@ -489,6 +511,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
          case GGML_TYPE_Q4_1:
          case GGML_TYPE_Q5_0:
          case GGML_TYPE_Q5_1:
--#ifndef GGML_CUDA_FA_ALL_QUANTS
--            return false;
--#endif // GGML_CUDA_FA_ALL_QUANTS
-+            // These three were behind GGML_CUDA_FA_ALL_QUANTS together with the
-+            //   whole 49-pair cross product. They are enabled unconditionally
-+            //   here because the tile/mma staging path handles them and the
-+            //   diagonals are part of the default instance list; the flag is
-+            //   then only needed for the *mixed* K!=V pairs.
-+            return true;
 +        case GGML_TYPE_IQ4_NL:
-+            // Same arrangement as the three above, except that upstream's
-+            //   TYPES_KV list (template-instances/generate_cu_files.py) does not
-+            //   carry iq4_nl, so its instances are not part of the checked-in
-+            //   cross product and are shipped alongside this enablement.  The
-+            //   tile/mma staging path covers it through ggml_get_to_fp16_cuda,
-+            //   and the vector family has the K-side vec_dot and V-side dequant
-+            //   for every pair (see the instance list below).
-+            return true;
-         case GGML_TYPE_Q4_0:
          case GGML_TYPE_Q8_0:
-         case GGML_TYPE_BF16:
-@@ -664,27 +710,29 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+             return true;
+         default:
+@@ -669,29 +692,31 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      // GGML_CUDA_FA_WMMA_MAX_HEAD overrides the per-arch cap (experiment/escape hatch).
      const char * wmma_max_env = getenv("GGML_CUDA_FA_WMMA_MAX_HEAD");
      const int wmma_max_head = wmma_max_env ? std::atoi(wmma_max_env) : (wmma_256 && GGML_CUDA_CC_IS_RDNA4(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_0(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_5(cc) ? 320 : 128);
--    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8) {
 +    // Speculative verify batches (n_q = n_draft+1 <= 8) must stay on the tile
-+    // kernel: decode (n_q = 1) never uses WMMA (n_q*gqa_ratio_eff <= 8), so a
-+    // WMMA verify batch would produce different logits than decode.
-+    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 && Q->ne[1] * gqa_ratio_eff > 8 && Q->ne[1] > 8) {
++    // kernel: decode (n_q = 1) never uses WMMA, so a WMMA verify batch would
++    // produce different logits than decode (GREEDY-PURITY band invariant).
++    // Upstream's head>128 gqa-eff threshold (16) is kept on top.
+     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
+-            Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
++            Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16) && Q->ne[1] > 8) {
          // The kernel instantiates logit_softcap only for heads 128/256/512.
          if (logit_softcap == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512) {
              return BEST_FATTN_KERNEL_MMA_F16;
          }
      }
+-    }
  
 -    // If there are no tensor cores available, use the generic tile kernel:
 -    if (can_use_vector_kernel) {
@@ -570,7 +520,7 @@ index 3036829bb..00c46f9d5 100644
  }
  
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 6dd925267..6b4fe93df 100644
+index 99da7bee5..ba562d96d 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -709,6 +709,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
@@ -2756,42 +2706,6 @@ index 04f3af644..2a8c2e20c 100644
  void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
  
  __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
-diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
-index 47f16f56c..f23e021a1 100644
---- a/ggml/src/ggml-hip/CMakeLists.txt
-+++ b/ggml/src/ggml-hip/CMakeLists.txt
-@@ -78,8 +78,12 @@ else()
-     list(APPEND GGML_SOURCES_ROCM
-         ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
-         ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
-+        ../ggml-cuda/template-instances/fattn-vec-instance-q4_1-q4_1.cu
-+        ../ggml-cuda/template-instances/fattn-vec-instance-q5_0-q5_0.cu
-+        ../ggml-cuda/template-instances/fattn-vec-instance-q5_1-q5_1.cu
-         ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
--        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
-+        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu
-+        ../ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-iq4_nl.cu)
- endif()
- 
- ggml_add_backend_library(ggml-hip
-diff --git a/ggml/src/ggml-musa/CMakeLists.txt b/ggml/src/ggml-musa/CMakeLists.txt
-index faf979033..753d68cd0 100644
---- a/ggml/src/ggml-musa/CMakeLists.txt
-+++ b/ggml/src/ggml-musa/CMakeLists.txt
-@@ -51,8 +51,12 @@ if (MUSAToolkit_FOUND)
-         list(APPEND GGML_SOURCES_MUSA
-             ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
-             ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
-+            ../ggml-cuda/template-instances/fattn-vec-instance-q4_1-q4_1.cu
-+            ../ggml-cuda/template-instances/fattn-vec-instance-q5_0-q5_0.cu
-+            ../ggml-cuda/template-instances/fattn-vec-instance-q5_1-q5_1.cu
-             ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
--            ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
-+            ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu
-+            ../ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-iq4_nl.cu)
-     endif()
- 
-     set_source_files_properties(${GGML_SOURCES_MUSA} PROPERTIES LANGUAGE CXX)
 -- 
 2.55.0
 

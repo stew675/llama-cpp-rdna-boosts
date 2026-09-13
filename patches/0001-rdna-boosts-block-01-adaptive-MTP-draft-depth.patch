@@ -1,4 +1,4 @@
-From bd228dd2627da12c9ebe7b92332beea19da71dda Mon Sep 17 00:00:00 2001
+From b9d18b66a26a0040f77009c05a938e63e7dad3d1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Wed, 9 Sep 2026 05:29:21 -0500
 Subject: [PATCH 01/15] rdna-boosts: block 01: adaptive MTP draft depth
@@ -67,7 +67,7 @@ and acceptance match prior measurements within run-to-run noise.
  create mode 100644 tests/test-speculative-adaptive.cpp
 
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 74241f931..c596e1e05 100644
+index c4c4e143c..9ea9a47a4 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -363,9 +363,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
@@ -81,7 +81,7 @@ index 74241f931..c596e1e05 100644
  
      const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                             params.speculative.types.end(),
-@@ -4162,11 +4160,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4125,11 +4123,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
  
      add_opt(common_arg(
          {"--spec-draft-n-max"}, "N",
@@ -99,7 +99,7 @@ index 74241f931..c596e1e05 100644
              params.speculative.draft.n_max = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
-@@ -4177,6 +4180,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4140,6 +4143,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_min = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
@@ -327,7 +327,7 @@ index 000000000..ae18a1265
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 2db381d58..3b6738f1d 100644
+index 77dfe9535..2cab50737 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,7 @@
@@ -357,7 +357,7 @@ index 2db381d58..3b6738f1d 100644
      // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
      virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
      virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
-@@ -1357,8 +1363,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1363,8 +1369,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      std::vector<int>                i_last;
      std::vector<std::vector<float>> chain_h;
  
@@ -374,7 +374,7 @@ index 2db381d58..3b6738f1d 100644
          , params(params.draft)
      {
          auto * ctx_tgt = this->params.ctx_tgt;
-@@ -1370,6 +1382,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1376,6 +1388,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  "MTP input row width must match the target h_nextn width");
          n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
  
@@ -386,7 +386,7 @@ index 2db381d58..3b6738f1d 100644
          SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
          SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
          SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
-@@ -1417,6 +1434,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1423,6 +1440,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
          chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
  
@@ -396,7 +396,7 @@ index 2db381d58..3b6738f1d 100644
          if (chain_heads) {
              this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
  
-@@ -1427,6 +1447,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1433,6 +1453,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
          this->n_max = this->params.n_max;
  
@@ -430,7 +430,7 @@ index 2db381d58..3b6738f1d 100644
          pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
  
          i_last.assign(n_seq, -1);
-@@ -1458,6 +1505,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1464,6 +1511,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      }
  
      void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -443,7 +443,7 @@ index 2db381d58..3b6738f1d 100644
          const int32_t N = (int32_t) prompt.size();
          if (N <= 0) {
              return;
-@@ -1615,6 +1668,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1621,6 +1674,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              drafting[seq_id] = true;
              common_sampler_reset(smpls[seq_id].get());
  
@@ -454,10 +454,10 @@ index 2db381d58..3b6738f1d 100644
 +                n_cap[seq_id] = dp.n_max;
 +            }
 +
-             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
+             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
              std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
  
-@@ -1691,7 +1751,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1697,7 +1757,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
  
                  result.push_back(id);
  
@@ -466,7 +466,7 @@ index 2db381d58..3b6738f1d 100644
                      drafting[seq_id] = false;
                      n_drafting--;
                      continue;
-@@ -1738,17 +1798,46 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1744,17 +1804,46 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  continue;
              }
  
@@ -515,7 +515,7 @@ index 2db381d58..3b6738f1d 100644
          const int32_t n_rows = verify_h_rows[seq_id];
          if (n_rows <= 0) {
              return;
-@@ -1758,6 +1847,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1764,6 +1853,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          const size_t row_bytes = (size_t) n_embd * sizeof(float);
          std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
      }
@@ -533,7 +533,7 @@ index 2db381d58..3b6738f1d 100644
  };
  
  // state of self-speculation (simple implementation, not ngram-map)
-@@ -2243,6 +2343,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
+@@ -2249,6 +2349,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
          case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
          case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
          case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
@@ -541,7 +541,7 @@ index 2db381d58..3b6738f1d 100644
          case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
          case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
          case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
-@@ -2334,6 +2435,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
+@@ -2340,6 +2441,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
              case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
              case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
@@ -549,7 +549,7 @@ index 2db381d58..3b6738f1d 100644
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
              case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                  n_max = std::max(n_max, std::max(0, spec->draft.n_max));
-@@ -2529,9 +2631,7 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2535,9 +2637,7 @@ common_speculative_init_result::common_speculative_init_result(
      llama_context * ctx_tgt) :
      pimpl(new impl{}) {
      const bool has_draft = params.speculative.has_dft();
@@ -560,7 +560,7 @@ index 2db381d58..3b6738f1d 100644
  
      auto mparams = common_model_params_to_llama(params);
      auto cparams = common_context_params_to_llama(params);
-@@ -2623,7 +2723,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2629,7 +2729,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
@@ -576,7 +576,7 @@ index 2db381d58..3b6738f1d 100644
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -2636,6 +2743,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2642,6 +2749,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
@@ -584,7 +584,7 @@ index 2db381d58..3b6738f1d 100644
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
      }
-@@ -2655,7 +2763,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2661,7 +2769,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
@@ -597,7 +597,7 @@ index 2db381d58..3b6738f1d 100644
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
-@@ -2919,6 +3031,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+@@ -2925,6 +3037,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
      }
  }
  
@@ -616,7 +616,7 @@ index 2db381d58..3b6738f1d 100644
  bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
      if (spec == nullptr) {
 diff --git a/common/speculative.h b/common/speculative.h
-index 22505891f..0fcbcaa80 100644
+index c968750e2..9e7c42cc0 100644
 --- a/common/speculative.h
 +++ b/common/speculative.h
 @@ -85,6 +85,11 @@ void common_speculative_draft(common_speculative * spec);
@@ -663,7 +663,7 @@ index ffb1e34c7..400a04560 100644
  | `ngram-simple` | Use simple n-gram pattern matching |
  | `ngram-map-k` | Use n-gram pattern matching with n-gram-keys |
 diff --git a/examples/speculative-simple/speculative-simple.cpp b/examples/speculative-simple/speculative-simple.cpp
-index 487ae03ab..4b067ba5a 100644
+index 863af5a2c..259479de6 100644
 --- a/examples/speculative-simple/speculative-simple.cpp
 +++ b/examples/speculative-simple/speculative-simple.cpp
 @@ -267,6 +267,10 @@ int main(int argc, char ** argv) {
@@ -700,10 +700,10 @@ index ad6612647..a29d8b89c 100644
              const int64_t s_slot = K - t;
  
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 5531c4ce3..83a14fee9 100644
+index 2c05c0c93..6abe090cf 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -298,6 +298,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
+@@ -299,6 +299,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
  set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
  
  llama_build_and_test(test-arg-parser.cpp)
@@ -964,10 +964,10 @@ index 000000000..ea959f223
 +    return 0;
 +}
 diff --git a/tools/cli/README.md b/tools/cli/README.md
-index efe653494..76f5f0c49 100644
+index ea1f7aaf8..138f28f26 100644
 --- a/tools/cli/README.md
 +++ b/tools/cli/README.md
-@@ -202,6 +202,7 @@
+@@ -199,6 +199,7 @@
  | `--spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE) |
  | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
  | `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
@@ -975,7 +975,7 @@ index efe653494..76f5f0c49 100644
  | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
  | `--spec-synth-rates P0,P1,...` | comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_RATES) |
  | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
-@@ -210,7 +211,7 @@
+@@ -207,7 +208,7 @@
  | `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)<br/>use --list-devices to see a list of available devices |
  | `--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
  | `--spec-draft-model, -md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_MODEL) |
@@ -985,10 +985,10 @@ index efe653494..76f5f0c49 100644
  | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
  | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
 diff --git a/tools/server/README.md b/tools/server/README.md
-index 71ebb9543..3a81b49bb 100644
+index ef9033404..a3a0c3fae 100644
 --- a/tools/server/README.md
 +++ b/tools/server/README.md
-@@ -263,6 +263,7 @@ For the full list of features, please refer to [server's changelog](https://gith
+@@ -260,6 +260,7 @@ For the full list of features, please refer to [server's changelog](https://gith
  | `--spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE) |
  | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
  | `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
@@ -996,7 +996,7 @@ index 71ebb9543..3a81b49bb 100644
  | `--spec-synth-len L` | target mean synthetic acceptance length, including the target token (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_LEN) |
  | `--spec-synth-rates P0,P1,...` | comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)<br/>(env: LLAMA_ARG_SPEC_SYNTH_RATES) |
  | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
-@@ -271,7 +272,7 @@ For the full list of features, please refer to [server's changelog](https://gith
+@@ -268,7 +269,7 @@ For the full list of features, please refer to [server's changelog](https://gith
  | `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)<br/>use --list-devices to see a list of available devices |
  | `--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
  | `--spec-draft-model, -md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_MODEL) |
@@ -1006,7 +1006,7 @@ index 71ebb9543..3a81b49bb 100644
  | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
  | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index fe068d3e9..e7e6ec9d3 100644
+index b6835e434..4624a1fa6 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -1017,9 +1017,7 @@ private:

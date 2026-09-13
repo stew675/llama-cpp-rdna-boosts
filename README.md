@@ -28,7 +28,7 @@ native q8_0/bf16 K/V (V4/V5), QSA score-chain/bias/indexer-cache pruning
 delivery** as `patches/0015` (promoted 2026-09-12 from
 `archive/work/block-15-campaign-wins/`).
 The patches apply to a clean
-llama.cpp checkout at the recorded fork point `9113cc188` (re-based 2026-09-08 from `050dde50c`, itself re-based 2026-09-07 from `465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`).
+llama.cpp checkout at the recorded fork point `790cf51aa` (re-based 2026-09-13 from `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself re-based 2026-09-07 from `465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`).
 
 `scripts/apply-all.sh` automates the apply: it creates a fresh `rdna-boosts`
 branch and applies blocks 01-15 with `git am`, one commit each.

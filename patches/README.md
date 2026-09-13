@@ -1,8 +1,8 @@
 # rdna-boosts patch set (delivery)
 
-16 patches (block 00 structural fixes + blocks 01-15) against llama.cpp master `9113cc188`
-("ggml : fix msvc+clang ggml_vld1q_u32 (#28284)"; re-based 2026-09-08 from
-`050dde50c` ("hexagon: add RELU and LEAKY_RELU ops (#28585)"), itself
+16 patches (block 00 structural fixes + blocks 01-15) against llama.cpp master `790cf51aa`
+("chat : improve parsing of complex types in qwen3-coder (#28742)", re-based **2026-09-13** from
+`9113cc188`; previously re-based 2026-09-08 from `050dde50c` ("hexagon: add RELU and LEAKY_RELU ops (#28585)"), itself
 re-based 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`; on the 2026-09-08 re-base block 06's
 functional delta was dropped — upstream itself reverted #24233 in #28604 the
@@ -93,6 +93,36 @@ promotion section below), so the set now applies as block 00 + blocks
 | `0015` | **attention-memory wins (block 15)** — promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`: **V3** derived kq mask (`LLAMA_KQ_MASK_DERIVED`, default 1), **V4** native q8_0 + **V5** native bf16 K/V in the FA kernels (both behind `GGML_CUDA_FA_KV_NATIVE`, **opt-in default 0**), **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived QSA per-block bias + visibility (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), **W3** keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), **W4** ggml-alloc unused-view release (no gate; A/B revert `../archive/work/block-15-campaign-wins/ab/w4-revert.patch`); see the block-15 promotion section below. |
 
 ## Apply (fresh checkout at the fork point)
+
+### 2026-09-13 re-base onto master `790cf51aa` (70 upstream commits)
+
+Canonical 16-block tip **`43ec14228c60b0b8cb90205365c8e0aabec8bc7b`**, net tree
+**`5cc664170a29cd78975f8679936d4d0adf28c605`**; strict 16/16 `git am`, zero whitespace warnings,
+applied tree == canonical.  Four upstream commits collided with the delivery:
+
+* **`16378d93f` "CUDA/HIP: Flash Attention tuning (gfx1201) (#28102)"** — rewrote the AMD-WMMA
+  gate block 04 owns, the `(256,256,32/64)` config cases, upstream's AMD `switch_ncols2`
+  preference and `should_use_stream_k`.  **Head-to-head:** upstream's WMMA prefill tuning makes the
+  4B `q4_0` decode/verify band **impure** (`W=1` vs `W>=2`); the block-04 `(256,256,32/64)` configs
+  (and no AMD `switch_ncols2` block) restore the whole band to one hash, **byte-identical to the
+  (18) delivery** (`q4_0 bb6ae482f50502b3`).  Upstream's `should_use_stream_k` (`DKQ == 64`) and
+  gate threshold are kept (purity-neutral, preserve upstream's stream-K preference).
+* **`5a4d0feca` "CUDA: replace `GGML_FA_ALL_QUANTS` with `GGML_FA_QUANTS`"** — block 08's
+  `q4_1`/`q5_0`/`q5_1` + `iq4_nl` enablement is re-homed: `iq4_nl` joins `FA_TYPES`, the default
+  `GGML_CUDA_FA_QUANTS` is the eight diagonals, `ggml_cuda_get_fattn_vec_case()` gains the 15
+  `iq4_nl` pairs and the predicate lists `iq4_nl`.  Upstream's f16 runtime fallback is kept.
+* **`d4abd573f` "CUDA: size routed MoE MMQ N-tiles from typical expert width on RDNA3"** —
+  merged additively with block 13's fused-gate `mmq_args` fields and `J_max_gate` caps.
+* **`311d4211b` "memory: avoid allocating V cache for indexer"** — composes with block 15 W3
+  (`LLAMA_QSA_KEYS_ONLY`, `v_enabled=false`); W3 keeps its kill-switch.
+
+Also folded: block 01's `dp.n_past` -> `dp.pos0` (`b0dcb8192`), the `LLAMA_CORE_SOURCES` /
+`llama_build[_and_test]` CMake refactors (block 14), and block 14's second `ggml_gated_delta_net`
+test call gaining `n_rs_batch` (block 02's signature).  Post-rebase validation (gfx1201):
+**18061/18061** `test-backend-ops`; 4B W=1..8 **8/8 types PURE** (hashes byte-identical to (18));
+27B width probe and 8-type text gate PURE (byte-identical); rule-5 batched bench and 27B server MTP
+NEW == OLD (18) and ahead of stock `9113cc188`; MoE NEW == OLD.  Full record: `../WORKLOG.md`
+(2026-09-13).
 
 ```bash
 git checkout 9113cc188         # or: git apply each patch on a matching tree

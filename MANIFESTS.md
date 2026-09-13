@@ -5,11 +5,27 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-`9113cc188` (re-based 2026-09-08 from `050dde50c`, itself re-based
+**`790cf51aa`** ("chat : improve parsing of complex types in qwen3-coder (#28742)"; re-based
+2026-09-13 from `9113cc188`; previously re-based 2026-09-08 from `050dde50c`, itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
-re-based 2026-09-02 from `0eadefebd`):
+re-based 2026-09-02 from `0eadefebd`).
+**Current regeneration (2026-09-13, the master re-base)**: canonical 16-block tip
+**`43ec14228c60b0b8cb90205365c8e0aabec8bc7b`** (net tree
+**`5cc664170a29cd78975f8679936d4d0adf28c605`**), clean-apply strict 16/16 with 0 whitespace
+warnings and the applied tree equal to the canonical one.  Four upstream commits collided and were
+resolved (see the 2026-09-13 section in `patches/README.md` and `WORKLOG.md`): `16378d93f`
+(gfx1201 FA tuning — our block-04 head-256 configs are kept because upstream's WMMA prefill tuning
+breaks 4B `q4_0` decode/verify width purity; upstream's stream-K preference and gate threshold are
+kept), `5a4d0feca` (block 08's `q4_1`/`q5_0`/`q5_1`/`iq4_nl` enablement re-homed onto
+`GGML_CUDA_FA_QUANTS`), `d4abd573f` (block 13 MoE MMQ `ncols_opt` merged additively), `311d4211b`
+(block 15 W3 composes with the MLA indexer cache).  Post-rebase: `test-backend-ops` 18061/18061;
+4B/27B width probes and the 27B 8-type text gate pure and **byte-identical to the (18) delivery**;
+qwen4exp 3-GPU `-sm tensor` plain == mtp pure and byte-identical; rule-5 batched bench and 27B
+server MTP NEW == OLD and ahead of stock `9113cc188`.  The set is
 blocks 00-15 (`patches/0000-…0015-…`, format-patch of the
-fork's `rdna-boosts` block commits).  **Current regeneration (2026-09-12 (18), the dense mmvq weight per-(type,K) nwarps amendment)**: canonical 16-block tip **`907799de3e6a7dcbd206d03b2daef4c248144ca9`** (net tree `c2e284c2acc032238ef85cb35d427c1598ed0949`), clean-apply strict 16/16 with 0 whitespace warnings and the applied tree equal to the canonical one; only block 0013 changes content vs (17) — the dense ksplit kernel picks `nwarps` per `(type, K)` (Q8_0 `K < 4096` -> 8, every other shape -> 1; the pinned fusion ops keep band-uniform `calc_nwarps`) — see the 2026-09-12 (18) section in `patches/README.md`; the previous regeneration was 2026-09-12 (17) (tip `a05225f7361ea5a1116d7185ebec8867cfe4afe2`, tree `2833f1369bdea4cb45f68f85dbb2898fd98aab66`, the per-kernel mmvq VDR), and before that 2026-09-12 (16) (tip `1837856e3f8120449090c0f44594427573a541ed`, tree `56a1c5f23c54c038f78d7242dc05b181d872b69b`, the block-08 `nwarps=1` + block-10 VDR revert), and before that 2026-09-12 (15), the block-15 promotion (tip `0f4f83f9ef01ffd1662f58d714d62b9155325a62`, tree `c3142fe0b311757f458647f172f623859f5bc983`), and blocks `0000`-`0014` were byte-identical to the regeneration before that apart from the `From` lines and the `[PATCH NN/14]` -> `[PATCH NN/15]` series denominator, and `0015` is byte-identical to the promoted beta patch apart from its `From` line.  The previous regeneration was 2026-09-12 (13): canonical 15-block tip `d306d4b4b194738dd5baad89ef77fa31a931e8ff` (net tree `3b0874b6aa367fea846a437b45f1689bd173b38c`), which amended block 14 (its 2026-09-12 (eighth) QSA indexer-score decode/verify band-uniformity fix).  **The block-15 patch was promoted on this base** (it was the 17th beta re-cut: tip `f399b13494df50d44450b0a3960eb55f6952335b`, tree `c3142fe0b311757f458647f172f623859f5bc983`, strict `git am` round-trip).  The previous regeneration was 2026-09-12 (12) (tip `c6f1e8e78`, block 14's MTP-export logits-purity fix).  The regeneration
+fork's `rdna-boosts` block commits).  The previous regeneration was 2026-09-12 (18) (tip
+**`907799de3e6a7dcbd206d03b2daef4c248144ca9`**, net tree `c2e284c2acc032238ef85cb35d427c1598ed0949`,
+the dense mmvq weight per-(type,K) nwarps amendment) at the old base `9113cc188`; before that 2026-09-12 (17) (tip `a05225f7361ea5a1116d7185ebec8867cfe4afe2`, tree `2833f1369bdea4cb45f68f85dbb2898fd98aab66`, the per-kernel mmvq VDR), and before that 2026-09-12 (16) (tip `1837856e3f8120449090c0f44594427573a541ed`, tree `56a1c5f23c54c038f78d7242dc05b181d872b69b`, the block-08 `nwarps=1` + block-10 VDR revert), and before that 2026-09-12 (15), the block-15 promotion (tip `0f4f83f9ef01ffd1662f58d714d62b9155325a62`, tree `c3142fe0b311757f458647f172f623859f5bc983`), and blocks `0000`-`0014` were byte-identical to the regeneration before that apart from the `From` lines and the `[PATCH NN/14]` -> `[PATCH NN/15]` series denominator, and `0015` is byte-identical to the promoted beta patch apart from its `From` line.  The previous regeneration was 2026-09-12 (13): canonical 15-block tip `d306d4b4b194738dd5baad89ef77fa31a931e8ff` (net tree `3b0874b6aa367fea846a437b45f1689bd173b38c`), which amended block 14 (its 2026-09-12 (eighth) QSA indexer-score decode/verify band-uniformity fix).  **The block-15 patch was promoted on the old base** (it was the 17th beta re-cut: tip `f399b13494df50d44450b0a3960eb55f6952335b`, tree `c3142fe0b311757f458647f172f623859f5bc983`, strict `git am` round-trip).  The previous regeneration was 2026-09-12 (12) (tip `c6f1e8e78`, block 14's MTP-export logits-purity fix).  The regeneration
 is always run against a canonical fork **rebuilt at the fork point**, because the reference
 `~/llama.cpp` checkout had drifted two upstream master commits past `9113cc188` (`f3f1a8f27`,
 `304665fe7` — SYCL + iGPU-only code) and a `format-patch` there would export those as patches

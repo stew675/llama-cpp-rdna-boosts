@@ -2,8 +2,9 @@
 
 Current state: `main` is the delivery branch carrying the **16-patch set**
 (block 00 + blocks 01-15) generated against the fork
-point **llama.cpp master `9113cc188`** (re-based 2026-09-08 from
-`050dde50c`, itself re-based 2026-09-07 from `465e49b9c`, itself
+point **llama.cpp master `790cf51aa`** (re-based **2026-09-13** from
+`9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself re-based
+2026-09-07 from `465e49b9c`, itself
 re-based 2026-09-06 from `9cffdcc80`, itself re-based
 2026-09-02 from `0eadefebd`). The `baseline/<sha>` branches below
 are HISTORICAL checkpoints of the old pre-block-12 structure (patch
@@ -25,14 +26,18 @@ at `192067b72`), `baseline/d222767c7` (validated against `d222767c7`) and
 
 
 All 16 patches are generated against **llama.cpp upstream master at
-`9113cc188`** (re-based 2026-09-08 from `050dde50c`, itself re-based
+`790cf51aa`** (re-based **2026-09-13** from `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself re-based
 2026-09-07 from `465e49b9c`, itself re-based
 2026-09-06 from `9cffdcc80`, itself re-based
 2026-09-02 from `0eadefebd`; dated records at the
 bottom of this file): block 00 = the structural/architecture fixes added
 2026-09-10 (FA small-batch KV-split width invariance + Vulkan masked-V), and
 blocks 01-15 = the fork's `rdna-boosts` block
-commits on `9113cc188` (the canonical 16-block tip is block 15
+commits.  The canonical 16-block chain for the `790cf51aa` base is tip
+`43ec14228c60b0b8cb90205365c8e0aabec8bc7b`, tree
+`5cc664170a29cd78975f8679936d4d0adf28c605` (the 2026-09-13 re-base; the four
+upstream clashes and the FA head-to-head are recorded in `WORKLOG.md` and
+`patches/README.md`).  The previous base was `9113cc188` (canonical tip block 15
 `0f4f83f9e`, promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`, on top of the 2026-09-12 (13) block-14 QSA indexer-score decode/verify band-uniformity fix -> `d306d4b4b`; block 02 amended 2026-09-11 with the
 K-independent whole-batch chunked GDN prefill and again 2026-09-12 with the rollback-bounded
 chunked threshold (`n_rs_batch`, long-draft speculators) + the pre-batch snapshot slots (free; the

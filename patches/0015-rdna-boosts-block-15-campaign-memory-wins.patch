@@ -1,4 +1,4 @@
-From 907799de3e6a7dcbd206d03b2daef4c248144ca9 Mon Sep 17 00:00:00 2001
+From 43ec14228c60b0b8cb90205365c8e0aabec8bc7b Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -488,7 +488,7 @@ index 451f66f5d..60ebfc304 100644
              const float * add_d = (const float *) additive->data;
              return sc + add_d[c + row*n_kv];
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 12eab7745..ecb034f3f 100644
+index 83ec690f8..f90596ce9 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -39,7 +39,15 @@ typedef void (* fattn_kernel_t)(
@@ -737,7 +737,7 @@ index 12eab7745..ecb034f3f 100644
          if (V_is_K_view) {
              V_data = K_data;
              nb21   = nb11;
-@@ -1333,7 +1528,11 @@ void launch_fattn(
+@@ -1342,7 +1537,11 @@ void launch_fattn(
          K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
          nb21, nb22, nb23,
          mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
@@ -1599,7 +1599,7 @@ index 57a285565..21c8077f8 100644
  #ifdef FLASH_ATTN_AVAILABLE
      const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 00c46f9d5..b11f6432c 100644
+index 8619742d4..2ae3ce0df 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -166,6 +166,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
@@ -1653,7 +1653,7 @@ index 00c46f9d5..b11f6432c 100644
              GGML_ASSERT(use_gqa_opt);
  
              GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
-@@ -557,7 +565,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -542,7 +550,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
  
      // The effective batch size for the kernel can be increased by gqa_ratio.
      // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
@@ -1662,7 +1662,7 @@ index 00c46f9d5..b11f6432c 100644
      for (const ggml_tensor * t : {Q, K, V, mask}) {
          if (t == nullptr || ggml_is_quantized(t->type)) {
              continue;
-@@ -756,13 +764,23 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -741,13 +749,23 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
              // the remaining types to F16. BF16 K/V needs native BF16 support.
              const bool use_bf16 = K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_BF16 &&
                  bf16_mma_hardware_available(ggml_cuda_info().devices[device].cc);
@@ -1689,10 +1689,10 @@ index 00c46f9d5..b11f6432c 100644
 -            need_f16_K = true;
 -            need_f16_V = true;
 -            break;
-         case BEST_FATTN_KERNEL_VEC:
-             need_f16_K = K->type == GGML_TYPE_F32;
-             need_f16_V = V->type == GGML_TYPE_F32;
-@@ -795,5 +813,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+         case BEST_FATTN_KERNEL_VEC: {
+             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
+             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
+@@ -781,5 +799,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
  }
  
  bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
@@ -2055,7 +2055,7 @@ index 8c323379a..1ca17ad74 100644
  
      return result;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 1d35d7812..272878f67 100644
+index 1bc81c148..0a41b9b68 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -36,6 +36,18 @@ struct llm_fused_op_probe {
@@ -3029,7 +3029,7 @@ index c4d8699de..a597a85fc 100644
      void set_input_v_rot(ggml_tensor * dst) const;
  
 diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
-index cbd5b1e67..a11c4ca77 100644
+index 9d8b775a1..8c71fe7b0 100644
 --- a/src/llama-memory-hybrid-idx.cpp
 +++ b/src/llama-memory-hybrid-idx.cpp
 @@ -16,6 +16,18 @@
@@ -3051,7 +3051,7 @@ index cbd5b1e67..a11c4ca77 100644
  llama_memory_hybrid_idx::llama_memory_hybrid_idx(
          const llama_model & model,
                              /* attn */
-@@ -58,10 +70,12 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+@@ -62,10 +74,12 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
  
          LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
  
@@ -3065,7 +3065,7 @@ index cbd5b1e67..a11c4ca77 100644
      }()) {
      // incremental block-vector cache (env-gated, default OFF; decode waste fix)
      const char * env_cache = getenv("GGML_CUDA_QSA_INDEXER_CACHE");
-@@ -445,6 +459,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -449,6 +463,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
          ggml_tensor * blk_cells,
          ggml_tensor * blk_pos,
          ggml_tensor * bias,
@@ -3076,7 +3076,7 @@ index cbd5b1e67..a11c4ca77 100644
          const llama_ubatch * ubatch,
          uint32_t ratio,
          bool blk_bias,
-@@ -467,7 +485,32 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -471,7 +489,32 @@ void llama_memory_hybrid_idx::set_input_qsa(
      int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
      int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
      int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
@@ -3110,7 +3110,7 @@ index cbd5b1e67..a11c4ca77 100644
  
      // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
      // from zero, so the bucket alone would pool two sequences into one block
-@@ -626,6 +669,20 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -630,6 +673,20 @@ void llama_memory_hybrid_idx::set_input_qsa(
              group_cells();
          }
  
@@ -3131,7 +3131,7 @@ index cbd5b1e67..a11c4ca77 100644
          GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
  
          int32_t n_bid = 0;
-@@ -685,6 +742,21 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -689,6 +746,21 @@ void llama_memory_hybrid_idx::set_input_qsa(
              cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
          }
  
@@ -3153,7 +3153,7 @@ index cbd5b1e67..a11c4ca77 100644
          for (int64_t ii = 0; ii < n_tps; ++ii) {
              const int64_t      i      = s*n_tps + ii;
              const llama_seq_id seq_id = ubatch->seq_id[i][0];
-@@ -717,7 +789,18 @@ void llama_memory_hybrid_idx::set_input_qsa(
+@@ -721,7 +793,18 @@ void llama_memory_hybrid_idx::set_input_qsa(
              // the tail is an incomplete block and is always visible, as in the reference
              const int64_t tail_start = (q + 1)/r*r;
  
@@ -3172,7 +3172,7 @@ index cbd5b1e67..a11c4ca77 100644
                  // a block sits wholly inside or outside the tail, so one value covers it
                  // the caller adds the attention mask, which drops empty, foreign and future cells
                  float * cur_blk_bias = dst_bias + i*n_blocks;
-@@ -856,6 +939,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
+@@ -860,6 +943,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
          ggml_tensor * blk_cells,
          ggml_tensor * blk_pos,
          ggml_tensor * bias,
@@ -3183,7 +3183,7 @@ index cbd5b1e67..a11c4ca77 100644
          const llama_ubatch * ubatch,
          uint32_t ratio,
          bool blk_bias,
-@@ -863,8 +950,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
+@@ -867,8 +954,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
          int32_t * dst_derived_lim) const {
      GGML_ASSERT(mem != nullptr);
  
@@ -3704,10 +3704,10 @@ index 4f31776bf..d1c99524a 100644
      }
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index d6aed6379..bd2ed57e6 100644
+index 235f82a45..61d29ad49 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -7673,9 +7673,10 @@ struct test_flash_attn_ext : public test_case {
+@@ -7724,9 +7724,10 @@ struct test_flash_attn_ext : public test_case {
      const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
      const bool v_is_view_of_k;
      const int64_t n_kv_max;
@@ -3719,7 +3719,7 @@ index d6aed6379..bd2ed57e6 100644
      }
  
      double max_nmse_err() override {
-@@ -7692,9 +7693,12 @@ struct test_flash_attn_ext : public test_case {
+@@ -7743,9 +7744,12 @@ struct test_flash_attn_ext : public test_case {
      test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                          bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                          ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
@@ -3734,7 +3734,7 @@ index d6aed6379..bd2ed57e6 100644
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
-@@ -7741,7 +7745,7 @@ struct test_flash_attn_ext : public test_case {
+@@ -7792,7 +7796,7 @@ struct test_flash_attn_ext : public test_case {
          ggml_set_name(v, "v");
  
          ggml_tensor * m = nullptr;
@@ -3743,7 +3743,7 @@ index d6aed6379..bd2ed57e6 100644
              m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
              ggml_set_name(m, "m");
          }
-@@ -7754,6 +7758,18 @@ struct test_flash_attn_ext : public test_case {
+@@ -7805,6 +7809,18 @@ struct test_flash_attn_ext : public test_case {
  
          ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
          ggml_flash_attn_ext_add_sinks(out, s);
@@ -3762,7 +3762,7 @@ index d6aed6379..bd2ed57e6 100644
          ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
          ggml_prec_set_acc(out, prec);
          ggml_set_name(out, "out");
-@@ -7772,6 +7788,20 @@ struct test_flash_attn_ext : public test_case {
+@@ -7823,6 +7839,20 @@ struct test_flash_attn_ext : public test_case {
                  } else {
                      init_tensor_kq_mask(t);
                  }
@@ -3783,7 +3783,7 @@ index d6aed6379..bd2ed57e6 100644
              } else {
                  init_tensor_uniform(t);
              }
-@@ -7830,8 +7860,10 @@ struct test_flash_attn_qsa : public test_case {
+@@ -7881,8 +7911,10 @@ struct test_flash_attn_qsa : public test_case {
          ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, 1);
          ggml_set_name(m, "m");
  
@@ -3796,7 +3796,7 @@ index d6aed6379..bd2ed57e6 100644
          ggml_prec_set_acc(out, GGML_PREC_F32);
          ggml_set_name(out, "out");
  
-@@ -10830,6 +10862,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10906,6 +10938,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
  

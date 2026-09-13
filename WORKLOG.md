@@ -1,5 +1,84 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-13 — re-based onto master `790cf51aa` (the 16-block set, 70 upstream commits)
+
+The delivery moved from the 2026-09-08 fork point `9113cc188` to current master
+**`790cf51aa`** ("chat : improve parsing of complex types in qwen3-coder (#28742)",
+**70 commits** ahead).  The canonical 16-block chain was rebuilt at the new base
+(tip **`43ec14228c60b0b8cb90205365c8e0aabec8bc7b`**, net tree
+**`5cc664170a29cd78975f8679936d4d0adf28c605`**); `patches/` applies **strict 16/16
+`git am`**, zero whitespace warnings, and the applied tree equals the canonical one.
+
+### Upstream clashes resolved
+
+* **`16378d93f` — CUDA/HIP: Flash Attention tuning (gfx1201)** rewrote the exact AMD-WMMA FA gate
+  line block 04 owns (`Q->ne[0] <= 128` -> `<= 256`, plus a `> (ne0 <= 128 ? 8 : 16)` batch
+  threshold), the `(256,256,32/64)` MMA config cases, upstream's AMD `switch_ncols2` preference
+  (`gqa % 8/4/2` -> ncols1 8/4/2) and `should_use_stream_k` (stream-K on AMD only for `DKQ == 64`).
+  **Head-to-head result (gfx1201):** upstream's WMMA *prefill* tuning **breaks the 4B decode/verify
+  width purity** — with upstream's `(256,256,32/64)` configs the 4B `q4_0` probe is impure
+  (`W=1 2b4c0165dc73567d` vs `W>=2 98e60bfd6e242b47`), and with our block-04 configs the whole band
+  returns to **one hash, byte-identical to the (18) delivery** (`q4_0 bb6ae482f50502b3`).  The
+  27B was pure either way.  Resolution: keep our **block-04 `(256,256,32/64)` configs** and
+  drop upstream's AMD `switch_ncols2` block; **keep** upstream's `should_use_stream_k`
+  (`DKQ == 64`) and its gate threshold (both are purity-neutral here and preserve upstream's
+  stream-K preference).  Full validation below.
+* **`5a4d0feca` — CUDA: replace `GGML_FA_ALL_QUANTS` with `GGML_FA_QUANTS`** rewrote the FA-quant
+  selection.  Block 08's 2026-09-11 enablement (`q4_1`/`q5_0`/`q5_1` and the 15 `iq4_nl` vec
+  instances) is re-homed onto the new mechanism: `iq4_nl` is added to `FA_TYPES` in
+  `ggml/cmake/common.cmake`, the default `GGML_CUDA_FA_QUANTS` becomes the **eight diagonals**
+  (`q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`, `iq4_nl`, `bf16`, `f16`), `ggml_cuda_get_fattn_vec_case()`
+  gains the 15 `iq4_nl` pairs, and `ggml_cuda_fattn_kv_type_supported()` lists `iq4_nl`.
+  Upstream's runtime fallback (uncompiled pair -> f16-f16 with a one-time warning) is kept, so an
+  uncompiled type degrades instead of aborting.
+* **`d4abd573f` — CUDA: size routed MoE MMQ N-tiles from typical expert width on RDNA3 (#28552)**
+  added `int64_t ncols_opt` to `mmq_args` and switched `mul_mat_q_switch_J`'s `ntiles_x` to it.
+  Merged additively with block 13's `x_gate`/`glu_op`/`glu_limit` fields and `J_max_gate` caps;
+  `mmq_args args_gate = args` carries `ncols_opt` into the fused gate kernel.
+* **`311d4211b` — memory: avoid allocating V cache for indexer (#28330)** sets
+  `n_embd_head_k/v_mla_impl` to make the indexer cache look like MLA.  It composes additively with
+  block 15 W3's `LLAMA_QSA_KEYS_ONLY` (`v_enabled=false`): both skip the dead V buffer, and W3 keeps
+  its A/B kill-switch.
+* **`b0dcb8192` (`common/speculative.cpp`)** renamed `common_speculative_draft_params::n_past` to
+  `pos0`; block 01's added `n_cap` clamp now uses `dp.pos0`.
+* **Upstream CMake refactors** (`LLAMA_CORE_SOURCES`, `llama_build`/`llama_build_and_test`) folded
+  block 14's `llama-lazy-reader.cpp` / `test-lazy-reader.cpp` into the new structures; block 14's
+  second `ggml_gated_delta_net` test call gained the `n_rs_batch` argument.
+
+### Validation (gfx1201, ROCm 7.14, single R9700 unless noted)
+
+* `test-backend-ops test`: **18061/18061 passed** (was 17999 at the old base; upstream's new
+  head-256 `FLASH_ATTN_EXT` cases included).
+* 4B `Qwen3.5-4B-Q8_0` width probe, W = 1..8, **all 8 KV types PURE**, hashes **byte-identical to
+  the (18) delivery**: `f16 e3c53c3432c7815b`, `bf16 7254fecf4a9728df`, `q8_0 46a961911ca1fc12`,
+  `q4_0 bb6ae482f50502b3`, `q4_1 32df01d9f1c4aef1`, `q5_0 b15ab98c50aa8f51`,
+  `q5_1 bed6c581183172ce`, `iq4_nl b73b73f83ef30a12`.
+* 27B `Qwen3.8-27B-UD-Q4_K_XL` width probe PURE, byte-identical: `q8_0 45313682f9d41816`,
+  `f16 bf3348c0a49e461c`, `bf16 e3ad7b8a5ab74ed1`.
+* 27B 8-KV-type text gate (`--spec-type none` == `draft-mtp n_max 3` == `n_max 7`): **PURE for all
+  eight**, byte-identical to the (18) delivery (`f16/bf16/q8_0/q5_0 bf9a4fb7ddb5`,
+  `q4_0 2c6003ae4688`, `q4_1 a46ef09ed137`, `q5_1 587344c9e92e`, `iq4_nl e031e49a4b16`).
+* Rule-5 verify-width gate (27B `q8_0`, `llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8`, TG total
+  seconds, lower better): NEW **1.172 / 1.653 / 2.793** == OLD (18) **1.175 / 1.656 / 2.799**;
+  stock `9113cc188` 1.155 / 1.683 / **2.881**.
+* 27B server MTP (`runarm.sh` + `bench_mtp.py`, ctx 8192, `--spec-draft-p-min 0.55`, median of 5):
+  NEW **40.29 / 36.37 t/s** (n3/n7) == OLD **40.21 / 36.34**; stock 37.80 / 33.90.  Acceptances
+  match the (18) delivery exactly (n3 0.6111, n7 0.4746).
+* MoE `Qwen3.6-35B-A3B-UD-Q4_K_M` (f16 KV, ctx 8192, median of 3): NEW plain **93.05**, n3
+  **133.38** (acc 0.5430), n7 **92.30** (acc 0.2636) == OLD **92.64 / 133.20 / 92.41**.
+* `qwen4exp` (Qwen3.8-Flash-Next-UD-Q4_K_XL, 4 shards) on **3 GPUs `-sm tensor`** with the
+  dedicated MTP drafter (`/models/.../mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf`), ctx 8192, f16 KV:
+  `plain == draft-mtp n_max 3 == n_max 7` **PURE and byte-identical to the (18) delivery**
+  (`87a30d8cef7a`).  The QSA-derived kq-mask probe warning ("was not used in the probe graph") is
+  expected; the 8-native-KV-type qwen4exp matrix was validated on other hardware.
+
+### Housekeeping
+
+`scripts/make-patches.sh` default baseline/tip and `scripts/apply-all.sh`'s baseline comment now
+name `790cf51aa` / `43ec14228…`; block 13's hand-carried `--- 2026-09-12 amendment ---` note was
+re-inserted into `patches/0013` after regeneration (git drops `--- `-prefixed body lines).  No
+delivery patch content changed apart from the rebase resolutions above.
+
 ## 2026-09-13 — CI fix: GHCR container workflow's stale commit-count assertion
 
 The `.github/workflows/docker-ghcr.yml` apply step hard-asserted

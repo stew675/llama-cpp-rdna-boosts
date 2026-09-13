@@ -1,4 +1,4 @@
-From 9fec5409bed0eacaf3f3d605137d523947a402a9 Mon Sep 17 00:00:00 2001
+From 4ac34d2b42d6b9042a2be3edd6547f1537bae28d Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -
@@ -13,7 +13,7 @@ Subject: [PATCH 10/15] rdna-boosts: block 10: k-quant-boosts -
  5 files changed, 366 insertions(+), 24 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 6b4fe93df..6b3270e79 100644
+index ba562d96d..1b84c91f6 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -5030,13 +5030,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
@@ -571,10 +571,10 @@ index f2a6f2009..341b741f3 100644
  #define VDR_IQ2_XXS_Q8_1_MMQ  2
  
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 23c42c99d..b7aa619c3 100644
+index 7a996d934..aa4f93341 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11159,9 +11159,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11233,9 +11233,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -610,7 +610,7 @@ index 23c42c99d..b7aa619c3 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -11169,8 +11193,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11243,8 +11267,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  

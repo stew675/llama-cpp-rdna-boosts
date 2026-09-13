@@ -8,8 +8,9 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
-applies to a clean llama.cpp checkout at the fork point **`9113cc188`** (re-based 2026-09-08
-from `050dde50c`, itself re-based 2026-09-07 from `465e49b9c`, itself
+applies to a clean llama.cpp checkout at the fork point **`790cf51aa`** (re-based 2026-09-13
+from `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself
+re-based 2026-09-07 from `465e49b9c`, itself
 re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
 
 - Block **00** (`patches/0000-rdna-boosts-block-00-structural-and-architecture-fix.patch`):
@@ -152,16 +153,18 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
 
 The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
-before any regeneration):** the working `~/llama.cpp` checkout has at cut
-time been rebased onto a master **two commits newer than the recorded fork
-point** (`f3f1a8f27` iGPU lazy-load default + `304665fe7` SYCL
-IQ-type-for-MoE, both dated after `9113cc188`), so
-`git format-patch 9113cc188..<that branch's tip>` there would export those
-two upstream commits as patches 0001/0002.  The **canonical** 16-block
-chain is a rebuild of the delivery set at `9113cc188` (tip `907799de3`, net tree
-  `c2e284c2acc032238ef85cb35d427c1598ed0949`,
+before any regeneration):** the **canonical** 16-block
+chain for the current base `790cf51aa` is a rebuild of the delivery set
+(tip `43ec14228c60b0b8cb90205365c8e0aabec8bc7b`, net tree
+  `5cc664170a29cd78975f8679936d4d0adf28c605`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
-`9113cc188`; block 02 amended 2026-09-11 with the whole-batch
+`790cf51aa`; the 2026-09-13 re-base resolved the four upstream clashes --
+`16378d93f` gfx1201 FA tuning (our block-04 head-256 configs kept: upstream's
+WMMA prefill tuning breaks 4B `q4_0` decode/verify width purity), `5a4d0feca`
+`GGML_FA_QUANTS` (block 08's `q4_1`/`q5_0`/`q5_1`/`iq4_nl` enablement re-homed),
+`d4abd573f` (block 13 MoE MMQ `ncols_opt`, additive) and `311d4211b` (block 15 W3
+composes with the MLA indexer cache) -- see `WORKLOG.md`; block 02 amended
+2026-09-11 with the whole-batch
 K-independent chunked GDN prefill and again 2026-09-12 with the rollback-bounded
 chunked threshold (`n_rs_batch`) + the pre-batch snapshot slots; block 08 amended 2026-09-11 with the
 decode/verify FA kernel-family fix, again with the quantized-KV-type
@@ -196,17 +199,15 @@ which is what
 to; always regenerate from a canonical fork rebuilt at the fork point.
 **Block 15 (the attention-memory campaign) is the delivery's last patch** --
 promoted 2026-09-12 from `archive/work/block-15-campaign-wins/` (`patches/0015`;
-the canonical 16-block tip is `907799de3`, tree
-`c2e284c2acc032238ef85cb35d427c1598ed0949`; the 2026-09-12 (18) block-13
-amendment -- the dense mmvq weight per-(type, K) nwarps (Q8_0 `K < 4096` -> 8, else 1;
-the pinned fusion ops keep band-uniform `calc_nwarps`) -- is the newest content
-change, block 0013 only).
+the canonical 16-block tip is `43ec14228c60b0b8cb90205365c8e0aabec8bc7b`, tree
+`5cc664170a29cd78975f8679936d4d0adf28c605` (the 2026-09-13 master re-base; the
+previous base `9113cc188` had tip `907799de3`, tree `c2e284c2acc032238ef85cb35d427c1598ed0949`).
 
 Block provenance on the canonical chain: block 00 added 2026-09-10 (FA
 small-batch KV-split width invariance, issue #25, plus the Vulkan
 masked-V fixes — see the block-00 section in `patches/README.md`);
 blocks 01-15 = the fork's block
-commits on master `9113cc188` (block 15 = the promoted attention-memory
+commits on master `790cf51aa` (block 15 = the promoted attention-memory
 campaign; 2026-09-08 re-base; block 01 refreshed
 2026-09-09 to the upstream PR #27210 review head `d236d41a2`, still one
 squashed block, and amended 2026-09-11 so `--spec-draft-n-max` is clamped to 7
@@ -249,7 +250,7 @@ amended 2026-09-07 with the PR #15 mul_mat+add through-view shape
 guard and 2026-09-11 with the decode/verify FA kernel-family fix (F1: a
 quantized K/V cache used VEC at `n_q <= 2` and TILE from `n_q = 3`, so
 plain decode disagreed with spec verify — `GREEDY-PURITY.md` §14)). The
-canonical `9113cc188` fork used for `make-patches.sh`
+canonical `790cf51aa` fork used for `make-patches.sh`
 regeneration is disposable and is re-created from `patches/` +
 `scripts/apply-all.sh` whenever it needs rebuilding (fresh clone at the
 fork point + apply) — an earlier regeneration (2026-09-10, the 15-block set
@@ -346,6 +347,11 @@ Consequences, so it is not re-litigated:
 * "Not validated on NVIDIA" is an acceptable, documented state — never a blocker for an RDNA win.
 
 ## Critical facts (do not re-derive)
+
+- **`llama-cli` MUST always be invoked with `--single-turn`** (plus
+  `--no-display-prompt` for scripted output). Without `--single-turn` it drops into the
+  interactive chat loop and blocks forever. This applies to every `llama-cli` command in
+  every session — never omit it. Wrap potentially-blocking commands in `timeout` too.
 
 - **Apply method:** all 16 blocks with **`git am`** (each block is a
   committed fork commit, exported with `git format-patch`; block 12 is a
@@ -678,8 +684,8 @@ Consequences, so it is not re-litigated:
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 9113cc188
-bash <this-repo>/scripts/apply-all.sh .     # creates branch rdna-boosts, 14 commits
+git checkout 790cf51aa
+bash <this-repo>/scripts/apply-all.sh .     # creates branch rdna-boosts, 16 commits
 ```
 
 ### Verify (the coherence gate — mandatory after any change)
@@ -705,18 +711,17 @@ AR backend is then never reached.
 
 ### Regenerate the patches (after fork changes)
 
-`scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `9113cc188`,
-blocks tip `907799de3`): `git format-patch --start-number 0` the block
+`scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `790cf51aa`,
+blocks tip `43ec14228c60b0b8cb90205365c8e0aabec8bc7b`): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
 `~/llama.cpp` checkout's `rdna-boosts` branch is NOT the canonical chain**
-— it may be rebased onto a master two commits newer
-than the fork point (`f3f1a8f27`, `304665fe7`), so a raw
-`9113cc188..HEAD` range there exports those two upstream commits as patches
+— it may have been rebased onto a drifted master, so a raw
+`<base>..HEAD` range there can export upstream commits as patches
 0001/0002.  The canonical 16-block chain is a rebuild of the delivery set at
-`9113cc188` (tip `907799de3`), which is what the default tip names.  Always regenerate from a
-canonical fork rebuilt AT `9113cc188`; a rebuilt fork produces its own
+`790cf51aa` (tip `43ec14228…`), which is what the default tip names.  Always regenerate from a
+canonical fork rebuilt AT `790cf51aa`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then
 re-verify the clean-apply simulation (worktree at the fork point,
