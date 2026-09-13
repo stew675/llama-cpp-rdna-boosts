@@ -76,8 +76,9 @@ block 001 is for.
   (e.g. code 0.579 vs 0.917) because it drafts deeper and rejects more -- but it accepts more tokens per
   target forward pass (mean length x acceptance), so it is faster.  Acceptance alone is not the metric.
 * **The 256-token measurement inverted the ranking.**  Code at ceiling 12 was -5% at 256 tokens and
-  +28% at 3000; prose at ceiling 7 was -10% at 256 and -10% at 3000 (both lose to fixed `n3`) while
-  ceiling 12 wins.  The controller's steady state is not visible in a short run.
+  +28% at 3000; prose at ceiling 12 was flat at 256 tokens and +13% at 3000.  At 3000 the old ceiling 7
+  loses to fixed `n3` on prose and code (-10% / -5%) while ceiling 12 wins -- the two settings are not
+  interchangeable and neither is visible in a short run.
 
 ## Text purity (`-n 3000`, no `-lv 4`)
 
