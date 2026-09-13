@@ -1,37 +1,25 @@
 # llama-cpp-rdna-boosts
 
-A delivery repo for a **16-patch set** (block 00 + blocks 01-15) of **RDNA3 / RDNA3.5 / RDNA4**
-(ROCm) feature enhancements and performance fixes for llama.cpp:
-**blocks 01-11** (MTP, GDN, BF16 KV,
-WMMA flash-attn, fused core, k-quant boosts, CUDA prefill-graph skip),
-**block 12** (the hybrid HIP all-reduce; amended 2026-09-04 with a
-runtime NCCL-failure fallback — see [Current state](#current-state)),
-**block 13** (fused MoE gate+up+GLU MMQ + mmvq short-K item-split;
-amended 2026-09-02 with two MTP regression fixes and 2026-09-05 with
-the RDNA3.5 (Strix Halo, gfx1151) + RDNA3.0 (gfx1100) fused-MoE-MMQ
-gate relaxations, and 2026-09-08 with the moe_weighted_reduction
-float4 remainder fix (issue #19) — see
-[Current state](#current-state)) and
-**block 14** (qwen4exp / Qwen3.8-Flash-Next support, promoted from
-`beta/qwen4exp` — QSA sparse FA + indexer, HC fused decode ops, managed
-lazy reader, MTP draft-head, per-arch dense/QSA decode policy; amended
-2026-09-07 with the QSA quantized-KV decode gate + the derived-cache
-pool gate and 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate
-(issue #18), the compiler-warning cleanup, the qwen4exp tensor-split
-HIP gate and the quantized-KV tensor-split gate (an upstream
-multi-GPU `SPLIT_MODE_TENSOR` abort for `q4_1`-family KV cache types —
-see
-[Current state](#current-state)) and
-**block 15** (attention-memory wins — a derived kq mask (V3), opt-in
-native q8_0/bf16 K/V (V4/V5), QSA score-chain/bias/indexer-cache pruning
-(W1-W3) and the ggml-alloc unused-view release (W4)) is **promoted to the
-delivery** as `patches/0015` (promoted 2026-09-12 from
-`archive/work/block-15-campaign-wins/`).
-The patches apply to a clean
-llama.cpp checkout at the recorded fork point `790cf51aa` (re-based 2026-09-13 from `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself re-based 2026-09-07 from `465e49b9c`, itself re-based 2026-09-06 from `9cffdcc80`, itself re-based 2026-09-02 from `0eadefebd`).
+A patch collection that brings **AMD RDNA-specific performance work** to
+[llama.cpp](https://github.com/ggml-org/llama.cpp): MTP decode, chunked
+gated-delta-net prefill, BF16 KV and WMMA flash-attention, fused MoE and
+k-quant decode paths, a hybrid all-reduce, qwen4exp (Qwen3.8-Flash-Next)
+support, and an attention-memory campaign that frees several GiB of VRAM.
 
-`scripts/apply-all.sh` automates the apply: it creates a fresh `rdna-boosts`
-branch and applies blocks 01-15 with `git am`, one commit each.
+It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp
+checkout at the fork point **`790cf51aa`**.  Each block is a self-contained
+`git am` commit, so you can apply the whole set or pick the ones you want:
+
+```bash
+git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
+git checkout 790cf51aa
+bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
+```
+
+- One-line summary of each block: [The 16 blocks](#the-16-blocks)
+- Apply details, env knobs, server config: [`patches/README.md`](patches/README.md)
+- What changed recently: [`WORKLOG.md`](WORKLOG.md)
+- Current status and validation: [Current state](#current-state)
 
 ## Supported architectures
 
@@ -151,7 +139,6 @@ re-baselines, regenerations) are tracked as dated entries — newest first — i
 | `0012` | **hybrid HIP all-reduce** — custom internal AR for the small-tensor decode path, per-size hybrid dispatch vs RCCL, RDNA4-only gate (bounded in-kernel spin since 2026-08-30 fix round; builds without RCCL) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** — prefill fused expert MMQ (RDNA4 + RDNA3_5 + RDNA3_0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K, env opt-out `GGML_CUDA_DISABLE_MOE_MMQ_FUSION`) + decode item-split (rpb 2/4/8) merged with the upstream has_fusion mmvq path |
 | `0014` | **qwen4exp / Qwen3.8-Flash-Next support** — QSA sparse FA (default) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy (promoted from `beta/qwen4exp`; see `patches/README.md` block-14 notes). The masked-V/freed-cell fixes it once carried now live in blocks 00 (Vulkan) and 03 (HIP). |
-
 | `0015` | **attention-memory wins (block 15)** — promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`: **V3** derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default), **V4** native q8_0 + **V5** native bf16 K/V in the FA kernels (both behind `GGML_CUDA_FA_KV_NATIVE`, opt-in default 0), **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived QSA per-block bias + visibility (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), **W3** keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), **W4** ggml-alloc unused-view release (no gate; A/B revert in `archive/work/block-15-campaign-wins/ab/`).  ~3.4 GiB/GPU + ~1.2 GiB host saved on qwen4exp, ~800 MiB/GPU + ~800 MiB host on dense models, at ~1.3 % prefill / ~0.3 % decode. |
 
 > **Block 15 (attention-memory wins) is part of the delivery since
@@ -215,7 +202,7 @@ no longer apply, regenerate the whole set from the fork with
 carries the block commits), then update
 `patches/README.md` and this README with the new fork point. The old
 `baseline/<sha>`-branch-per-upstream-range workflow was retired when the
-delivery moved to the flat 13-patch set on `main`.
+delivery moved to the flat 16-patch set on `main`.
 
 ## Upstreaming
 
