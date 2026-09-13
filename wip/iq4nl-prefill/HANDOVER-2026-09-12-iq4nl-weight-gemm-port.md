@@ -265,3 +265,90 @@ canonical, update `patches/README.md` + `WORKLOG.md` + the AGENTS/README/MANIFES
   also `ilintar/qwen3.8-27b-gguf-strix-halo`)
 - halogen-flash (the other co-designed stack, for contrast): `https://github.com/peonist-ai/halogen-flash-server`
 - this repo: `TODO.md` item 3, `GREEDY-PURITY.md` §22, `archive/work/kv-quant-purity-followups/`
+
+---
+
+## 11. 2026-09-12 session results — the port was executed (result: +18.4 %, bar NOT met)
+
+Build base: canonical 16-patch tip `be0d23d57` (bu16). Ported artifact:
+`wip/iq4nl-prefill/mmb-port.patch` (938 insertions, 3 files: new `ggml/src/ggml-cuda/mmb.{cu,cuh}`
++ 6 hooks in `ggml-cuda.cu`).
+
+### Phase 0 — A/B reproduced (interleaved, same session, gfx1151)
+
+| build | pp2048 | pp8192 | pp16384 | tg128 |
+|---|---|---|---|---|
+| rdna-boosts bu16 b1/b2 | 761/757 | 784/778 | **794/791** | 31.39 |
+| pwilkin full env b1/b2 | 1241/1236 | 1350/1349 | **1407/1401** | 30.35 |
+
+Ratio 1404/793 = **1.77×** — matches §0. Build config **ruled out**: both CMakeCache already have
+`GGML_HIP_MMQ_MFMA=ON` and `GGML_HIP_NO_VMM=ON` (also GRAPHS=ON, RCCL=1, FA=ON, FA_ALL_QUANTS=OFF) —
+the 1.77× is code, not flags. Check (a)/(b) need no rebuild.
+
+### Phase 1 — family ranking (his build, full env minus one family, pp16384)
+
+| family disabled | pp16384 | Δ |
+|---|---|---|
+| — (full env) | 1404.8 | — |
+| NO QSA | 708.6 | −696 (nonlinear: dense fallback) |
+| NO MMB | 935.2 | **−470 (−33 %)** |
+| NO HC | 1115.8 | **−289 (−21 %)** |
+| NO CONV (PLE+GDN) | 1342.7 | −62 |
+| NO NORM | 1374.3 | −30 |
+| NO IDX_RELU_SUM | 1394.3 | −10 |
+| defaults (no env) | 705.9 | −699 |
+| MMB only | 765.6 | −639 |
+
+Families interact (deltas sum to >the whole); `LLAMA_MMB=1` alone is misleadingly small because the
+default attention is then slow.
+
+### Kernel-level attribution (rocprofv3, pp8192, our build 19.88 s kernel time)
+
+| component | ours | his | gap |
+|---|---|---|---|
+| IQ4_NL weight GEMM (`mmb_*` incl. f32split/cvt) | 8.53 | 6.40 | −2.13 |
+| `quantize_mmq_q8_1` (removed by bf16 staging) | 1.33 | ~0.2 | −1.13 |
+| **QSA attention** (`flash_attn_qsa` 2.78 → `qsa3_attn` 0.73) | 2.78 | 0.73 | **−2.05** |
+| HC (`hc_combine_norm`+`hc_mix_reduce` → 2 fused) | 1.62 | 0.93 | −0.69 |
+| rocBLAS f32 (`SB`) → `mmb_f32split` | 1.13 | 0.50 | −0.63 |
+| `mmb_cvt_f32_bf16` (bf16-producer cache absent) | — | 0.12 | −0.53 |
+
+### Phase 2 — the port, measured (our build, `GGML_CUDA_MMB`, interleaved)
+
+| gate | pp2048 | pp8192 | pp16384 | tg128 |
+|---|---|---|---|---|
+| off b1/b2 | 756/755 | 767/771 | **785/788** | 31.34 |
+| on b1/b2 | 967/984 | 935/938 | **934/935** | 31.46 |
+
+**+18.4 % prefill at pp16384 (787 → 934), decode unmoved.** What works: the dense IQ4_NL/Q8_0
+`mmb_dense_kernel` (both tile classes), the TALL (M ≤ 384) class, the fused MoE
+`mmb_routed_glu_kernel` + `mmb_routed_kernel`, and `mmb_f32split` (which replaced the rocBLAS `SB`
+GEMM). `quantize_mmq_q8_1` mostly disappears.
+
+**Two implementation notes that were required:**
+1. The qwen4exp MoE never reaches `ggml_cuda_mul_mat`/`_mul_mat_id` — our graph optimizer fuses the
+   whole gate+up+GLU (`mul_mat_q_pair` / swiglu→mmq) and the down (`mul_mat_id_weighted_rdna3_5`).
+   MMB therefore stands those **prefill** fusions down when `ggml_cuda_mmb_active()` (the pair and
+   swiglu branches; the single-token weighted-down one must NOT be gated — that is a decode fusion
+   and gating it would break W = 1..8 purity).
+2. `ggml_cuda_launch_mm_ids_bounded` is not in our tree; the existing
+   `ggml_cuda_launch_mm_ids_helper` (which already has the RDNA3_5 `mm_ids_helper_512_10` fast path)
+   is used instead.
+
+### Verdict — the remaining gap is NOT a weight GEMM
+
+After the port our kernel time is 16.79 s vs his 11.18 s. The remaining 5.6 s is dominated by
+`flash_attn_qsa` **2842 ms vs his `qsa3` 730 ms (−2.1 s = ~75 % of the 2.5 s still needed for
+1100)**; then `mmb_cvt` 645 ms (his bf16-producer marking), HC 0.70 s, misc. Our QSA is already the
+best arm we have — forcing `LLAMA_QSA_SPARSE_FA=0` (829) or `LLAMA_QSA_OFF=1` (851) is *slower* than
+the default (937). **Reaching >1100 requires porting his QSA v3 sparse-attention kernel (block-14
+work), not more weight-GEMM work.**
+
+### Next steps
+- [ ] QSA v3 (`qsa3_attn_kernel` + `qsa3_rows_kernel`, `LLAMA_QSA_SCORE_BOUNDS`/`PACK_KEYS`/`FA_V3`)
+      → expected ~+117 t/s; plus the bf16-producer marking (~+32) and the HC fusions (~+42) → ~1130.
+- [ ] Then land: the `mmb` module belongs in **block 08** (prefill kernels) as an amendment; regenerate
+      from a canonical fork at `9113cc188`, strict `git am`, applied tree == canonical.
+- [ ] Purity TODO before landing: with `GGML_CUDA_MMB=1` the MMB path is prefill-only (T ≥ 512) so
+      W = 1..8 is unchanged by construction; still run the item-4 `mstep` W = 1..8 probe + the MTP
+      acceptance gate on the MMB-on build.
