@@ -1,10 +1,11 @@
 # Adaptive MTP across the four workloads (2026-09-13)
 
-> **Superseded for the adaptive ceiling (2026-09-13).**  The `adaptive n7` column below was measured
-> while the CLI clamped `--spec-draft-n-max` to 7.  The clamp is now 15 and the adaptive mode's
-> recommended ceiling is **12**; the re-measured table (and the text-purity result) lives in
-> [2026-09-13-adaptive-mtp-4-axis-n12.md](2026-09-13-adaptive-mtp-4-axis-n12.md).  The `plain` and
-> `mtp n3` columns here remain the reference for those modes.
+> **Superseded (2026-09-13, same day).**  Every column below was measured with the model's default
+> reasoning mode, and because Qwen3.8 emits a thinking trace for the prose and code prompts, the **P and
+> C columns measured thinking, not prose/code**.  The corrected protocol (R reasons, P/C/K run with
+> `--reasoning off`) and the re-measured table live in
+> [2026-09-13-adaptive-mtp-4-axis-n12.md](2026-09-13-adaptive-mtp-4-axis-n12.md); the `plain` and
+> `mtp n3` values here are not comparable to it either, since the reasoning flag also changes R.
 
 
 Measures the delivery's MTP draft depth variants across the four workloads the adaptive-MTP gate uses:

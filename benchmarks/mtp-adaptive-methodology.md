@@ -101,6 +101,21 @@ The drafting model is the **MTP head built into the target GGUF** (`blk.<block_c
 `*.nextn_predict_layers`), used automatically when no `-md` is passed.  Do not pass the old standalone
 `mtp-*.gguf`; it is a different drafter and changes acceptance.
 
+**Reasoning mode is part of the protocol (2026-09-13).**  Qwen3.8 emits a thinking trace for
+instruction-like prompts, so a run left on the template default measures *thinking*, not the workload:
+at `-n 256` the "code" prompt never reached any Python and the "prose" prompt answered with a thinking
+trace.  The four-axis gate therefore sets reasoning explicitly per axis:
+
+```sh
+case "$axis" in reasoning) REA=on;; *) REA=off;; esac   # R reasons; P/C/K generate content
+... --reasoning $REA ...
+```
+
+`--reasoning off` is the llama.cpp flag (`--chat-template-kwargs '{"enable_thinking":false}'` is the
+equivalent template-level knob); both arms must use the same setting.  The earlier adaptive-MTP numbers
+(including the first cut of `2026-09-13-adaptive-mtp-4-axis.md`) were measured without it and are not
+comparable -- see `2026-09-13-adaptive-mtp-4-axis-n12.md` for the corrected table.
+
 Gate rules:
 1. **Acceptance**: with `--log-verbosity 4`, the `draft acceptance` /
    `acc per pos` lines must show a healthy rate on prose (>= ~0.45 at pos 1

@@ -87,9 +87,11 @@ the sparse top-k arm for a 9..16-row verify (`QSA_DECODE_BAND = 8`); the arm ban
 kernel-family switch at 8 rows (FA tile/MMA **and** matmul MMVQ/MMVF -> MMQ), now an accepted trade
 with a visible notice instead of a clamp; only `> 15` (the recurrent snapshot bound) is clamped.  The
 default `n_max 3` is unaffected.  The adaptive-MTP four-axis table is re-presented at the mode's
-recommended ceiling **12** (the old 7 was the clamp): on verbatim recall that is 81.1 t/s / mean len
-5.80, **+14.2%** over the old ceiling-7 cell and **+21.4%** over fixed `n3`, and still text-pure on all
-four axes (`benchmarks/2026-09-13-adaptive-mtp-4-axis-n12.md`).  Canonical tip `c45244c72`, tree
+recommended ceiling **12** (the old 7 was the clamp) with reasoning pinned per axis (`--reasoning off`
+for prose/code/recall): on verbatim recall that is 91.6 t/s / mean accepted length 7.08, **+35%** over
+fixed `n3` and **+22%** over the corrected ceiling-7 cell, while on code the controller over-drafts
+(-5% vs fixed `n3`) — and the delivery is still text-pure on all four axes
+(`benchmarks/2026-09-13-adaptive-mtp-4-axis-n12.md`).  Canonical tip `c45244c72`, tree
 `a5683e1b008e`.  Full record:
 [`WORKLOG.md`](WORKLOG.md) 2026-09-13 (latest) and the issue-#30 section of
 [`patches/README.md`](patches/README.md).

@@ -42,6 +42,13 @@ acceptance rate. Recorded results: `benchmarks/2026-09-13-adaptive-mtp-4-axis.md
 
 ## Usage
 
+> **Set `--reasoning` explicitly (2026-09-13).**  Qwen3.8 emits a thinking trace for instruction-like
+> prompts by default, so `-f prompts/code-python.txt` at the template default produces a reasoning
+> trace, not code, and the prose prompt is answered as a request.  The four-axis gate uses
+> `--reasoning on` for `reasoning.txt` and `--reasoning off` for `prose-rdna-boosts.txt`,
+> `code-python.txt` and `recall.txt`, so each axis measures its intended content.  Without it,
+> acceptance and throughput measure the thinking trace, not the workload.
+
 ```sh
 MODEL=/path/to/model.gguf
 PROMPT=prompts/prose-rdna-boosts.txt
