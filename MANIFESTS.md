@@ -9,10 +9,13 @@ The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against
 2026-09-13 from `9113cc188`; previously re-based 2026-09-08 from `050dde50c`, itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
-**Current regeneration (2026-09-13, the master re-base)**: canonical 16-block tip
-**`43ec14228c60b0b8cb90205365c8e0aabec8bc7b`** (net tree
-**`5cc664170a29cd78975f8679936d4d0adf28c605`**), clean-apply strict 16/16 with 0 whitespace
-warnings and the applied tree equal to the canonical one.  Four upstream commits collided and were
+**Current regeneration (2026-09-13, the master re-base + the block-08 `iq4_nl` `GET_ROWS`
+amendment)**: canonical 16-block tip
+**`ab2fabb440ac909e02e0482cabd673c339106b57`** (net tree
+**`e279b222e8e98a7574814929d4b6d97edae32a48`**), clean-apply strict 16/16 with 0 whitespace
+warnings and the applied tree equal to the canonical one.  (The re-base tip was `43ec14228…`, tree
+`5cc664…`; the 2026-09-13 block-08 (sixth) amendment — TODO item 3, the `iq4_nl` `GET_ROWS`
+sub-`QK_K` path — was applied on top and the whole chain replayed.)  Four upstream commits collided and were
 resolved (see the 2026-09-13 section in `patches/README.md` and `WORKLOG.md`): `16378d93f`
 (gfx1201 FA tuning — our block-04 head-256 configs are kept because upstream's WMMA prefill tuning
 breaks 4B `q4_0` decode/verify width purity; upstream's stream-K preference and gate threshold are

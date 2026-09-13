@@ -63,8 +63,8 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
   **`790cf51aa`** (re-based 2026-09-13; previously `9113cc188`).
 - Patches `patches/0000-…0015-…`, applied with **strict 16/16 `git am`** by
   `scripts/apply-all.sh` (no 3-way fallback, whitespace-clean).
-- Canonical 16-block chain: tip `43ec14228c60b0b8cb90205365c8e0aabec8bc7b`,
-  net tree `5cc664170a29cd78975f8679936d4d0adf28c605`.
+- Canonical 16-block chain: tip `ab2fabb440ac909e02e0482cabd673c339106b57`,
+  net tree `e279b222e8e98a7574814929d4b6d97edae32a48`.
 - Greedy purity: plain decode == `draft-mtp` verify for
   `--spec-draft-n-max <= 7` across the supported KV types (4B and 27B all
   eight; qwen4exp MTP).
@@ -74,19 +74,26 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
   config), [`MANIFESTS.md`](MANIFESTS.md) (apply order + verification contract)
   and [`BASELINE.md`](BASELINE.md) (fork point + drift policy).
 
-**Latest change (2026-09-13) — re-base onto master `790cf51aa` (70 commits).**
+**Latest change (2026-09-13) — block-08 `iq4_nl` `GET_ROWS` CPU-fallback fix (TODO item 3).**
+The qwen4exp `iq4_nl` KV-cache prefill delta was the QSA indexer key gather: the CUDA `GET_ROWS`
+support predicate required `ne[0] % QK_K == 0` for the 32-value sub-block types, and the indexer key
+row is 128, so an `iq4_nl` cache sent the gather to the **CPU** (26 graph splits per prefill graph, a
+host round trip per indexer layer).  `getrows.cu` now takes the sub-`QK_K` path
+(`dequantize_q4_nl`) and the predicate accepts every `ne00 % QK4_NL == 0`; qwen4exp `iq4_nl` prefill
+pp8192 1815-1951 -> **2385-2422 t/s** (= f16/`q4_0`), pp32768 **+36 %**, `GET_ROWS` 215/215 ->
+**219/219**.  The absolute `iq4_nl` greedy text moved (`c0d44c479ee1` -> `14a1a3f257f4`) because
+removing the host split re-allocates the graph and flips the address-driven MoE-router `topk_moe`
+fusion (filed as TODO item 19); the `W = 1..8`, `plain == n_max 3 == n_max 7` and control-hash gates
+all hold, and the 4B coherence is unchanged (`1c5d32ac537d`).  Full record:
+[`WORKLOG.md`](WORKLOG.md) 2026-09-13 (later) and the 2026-09-13 block-08 section of
+[`patches/README.md`](patches/README.md).
+
+**Previous change (2026-09-13) — re-base onto master `790cf51aa` (70 commits).**
 Four upstream clashes resolved (`16378d93f` gfx1201 FA tuning, `5a4d0feca`
 `GGML_FA_QUANTS`, `d4abd573f` MoE MMQ `ncols_opt`, `311d4211b` indexer V
-cache).  The FA head-to-head kept the block-04 head-256 configs: upstream's
-WMMA prefill tuning is worth only ~+0.5–0.9 % at 27B `pp16384` (flat at
-`pp2048`/decode, nothing on the 4B) and breaks 4B `q4_0` decode/verify width
-purity; upstream's `should_use_stream_k` preference and gate threshold are
-kept.  Validation: `test-backend-ops` 18061/18061; 4B/27B width probes, the
-27B 8-type text gate and qwen4exp 3-GPU MTP all pure and **byte-identical to
-the previous delivery**; rule-5 batched bench and 27B server MTP equal to it
-and ahead of stock `9113cc188`.  Full record:
-[`WORKLOG.md`](WORKLOG.md) 2026-09-13 and the 2026-09-13 section of
-[`patches/README.md`](patches/README.md).
+cache).  The FA head-to-head kept the block-04 head-256 configs (upstream's
+WMMA prefill tuning is worth only ~+0.5–0.9 % at 27B `pp16384` and breaks 4B
+`q4_0` width purity); validation was byte-identical to the previous delivery.
 
 All delivery-affecting changes (block amendments, community-fix integrations,
 re-baselines, regenerations) are tracked as dated entries — newest first — in

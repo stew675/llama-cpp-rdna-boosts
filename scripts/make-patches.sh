@@ -59,6 +59,16 @@
 #                 MoE attention qkv/gate and the lm_head) takes the pre-2026-09-11 wide
 #                 block (nwarps=8), every other shape stays at 1; the pinned fusion ops
 #                 (GDN/SSM, shared-expert, the gate fusions) keep band-uniform calc_nwarps.
+#                 And the 2026-09-13 block-08 amendment (TODO item 3): the iq4_nl
+#                 `GET_ROWS` sub-QK_K path (a row width that is not a whole number of
+#                 QK_K super-blocks - the qwen4exp indexer key row, 128 - took the
+#                 QK_K-only kernel and was rejected by the support predicate, so the
+#                 HIP backend sent the gather to the CPU; 13 indexer layers per ubatch
+#                 became host<->GPU round trips, ~25 % of long-context qwen4exp prefill
+#                 for a `--cache-type-k iq4_nl` cache).  getrows.cu now dispatches on
+#                 `ne00 % QK_K` (the sub-block path reuses `dequantize_q4_nl`), the
+#                 predicate accepts any `ne00 % QK4_NL == 0`, and test-backend-ops
+#                 covers iq4_nl get_rows at 32/128/160/224 columns.
 #                 The block-15 tip of the *working*
 #                 fork checkout (~/llama.cpp rdna-boosts) is a different SHA,
 #                 because that branch is a local rebuild -- do not use it for
@@ -78,7 +88,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
 BASELINE="${2:-790cf51aa}"
-TIP="${3:-43ec14228c60b0b8cb90205365c8e0aabec8bc7b}"
+TIP="${3:-ab2fabb440ac909e02e0482cabd673c339106b57}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then

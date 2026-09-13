@@ -63,6 +63,8 @@ finding, narrative moved to the findings file):
 | 26 | the prefill half of a regime policy must be band-keyed too (and defaults follow the documented policy) | doctrine |
 | 27 | a rollback bound is a purity bound (`n_rs_batch`, the GDN chunked kernel's snapshots) | doctrine + fix |
 | 28 | an export-only tail must not redefine the logits path (the MTP `embeddings_nextn` gather deferral) | doctrine + fix |
+| 29 | a flattened batch is not a token count (the QSA indexer score's `ne11 = 4 * n_tps`) | fix |
+| 30 | a support predicate decides the *layout*; an address-driven fusion can move the output (the `iq4_nl` GET_ROWS CPU fallback) | doctrine + fix |
 
 
 ## 1. The one-sentence version
@@ -1058,3 +1060,32 @@ on the *decode* family, which is the side the draft's single-token decode reprod
 produce in the band, not the token count.  Any matmul whose N is a product of a per-token factor and a
 per-head (or per-expert, per-group) factor is a candidate; audit it the same way a newly enabled KV
 type is audited (§20) - one family, W = 1..8, on every split.
+
+## 30. A support predicate decides the *layout*, and the layout decides the fusion (2026-09-13, block-08 amendment (sixth))
+
+The 2026-09-13 `iq4_nl` `GET_ROWS` fix (TODO item 3) is a support-predicate bug, not an arithmetic one:
+the CUDA `GET_ROWS` case required `ne[0] % QK_K == 0` for the 32-value sub-block types, so a 128-wide
+`iq4_nl` indexer-key gather was rejected and the scheduler ran that single node on the CPU.  That is a
+**performance** defect (13 host round trips per qwen4exp prefill graph, GPU busy/span 0.62 vs 0.96), but
+it also changes the *allocation*: removing the host split re-addresses the whole compute buffer, and
+`ggml_cuda_check_fusion_memory_ranges()` selects the MoE-router `topk_moe` fusion by buffer-address
+overlap.  The fused router is **not** bit-identical to the generic chain (a temporary
+`GGML_CUDA_DISABLE_TOPK_MOE_FUSION` A/B moved the qwen4exp `iq4_nl` greedy text `14a1a3f257f4` ->
+`086df944f6af`), so the model output moved with the layout (`c0d44c479ee1` -> `14a1a3f257f4`) even though
+the moved op itself is bit-exact against the CPU at every width.
+
+**Two rules to take from it:**
+
+* **A support predicate is a correctness surface for *layout*, not only for reachability.**  When you
+  widen a predicate the op's execution backend can change (CPU -> GPU), which relocates every tensor in
+  the graph.  Re-run the full gate set, not just the op's own backend-op test - the observable can move
+  in a *different* op.
+* **An address-overlap-driven fusion whose fused arithmetic is not bit-identical to the generic chain
+  makes the output allocation-dependent.**  That is pre-existing upstream behaviour (filed as TODO item
+  19); the delivery's own invariants (width `W = 1..8`, `plain == draft-mtp`, the control hashes) are
+  unaffected because the coverage is width-uniform within a config, but the absolute text of a config
+  is not a property of the numbers alone.
+
+**Instrument that localised it:** `GGML_SCHED_DEBUG=1` prints the per-graph split count (`iq4_nl` 142 vs
+`q4_0` 22) and `=2` prints the per-node backend (`node #611 (GET_ROWS) ... CPU#cache_idx_k_l3`) - cheaper
+and more direct than a profiler for "which op left the GPU".

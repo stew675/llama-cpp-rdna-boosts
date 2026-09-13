@@ -1,4 +1,4 @@
-From 62bfcb708c31e6c27806b6d3b3c78dcc62d8baba Mon Sep 17 00:00:00 2001
+From 97d4cb2c381157f40ffd10477c7dfa93775e9906 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -2290,7 +2290,7 @@ index 000000000..d44d06be9
 +void ggml_cuda_flash_attn_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +bool ggml_cuda_flash_attn_qsa_supported(int device, const ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 949243c7b..28117c67f 100644
+index 3042e7a5b..d00210bbc 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -3106,7 +3106,7 @@ index 949243c7b..28117c67f 100644
      return description;
  }
  
-@@ -6452,8 +6866,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -6455,8 +6869,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
@@ -8751,7 +8751,7 @@ index 6abe090cf..92246f96f 100644
      set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
      file(MAKE_DIRECTORY "${MODEL_DIR}")
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index ef2ed1d15..235f82a45 100644
+index d295aa08f..7fcc14376 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -7834,6 +7834,96 @@ struct test_flash_attn_ext : public test_case {
@@ -8851,7 +8851,7 @@ index ef2ed1d15..235f82a45 100644
  // GGML_OP_CROSS_ENTROPY_LOSS
  struct test_cross_entropy_loss : public test_case {
      const ggml_type type;
-@@ -10994,6 +11084,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10999,6 +11089,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_falcon(2));
  #endif
  

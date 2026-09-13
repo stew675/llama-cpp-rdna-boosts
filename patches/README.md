@@ -9,7 +9,7 @@ functional delta was dropped — upstream itself reverted #24233 in #28604 the
 same day, matching its end state — and the block now carries only the
 host-buffer rationale marker comment (see the block-06 note below); block 14's
 quantized-KV tensor-split gate merged additively with upstream #28390's
-single-device `SPLIT_MODE_TENSOR` warn; block 08 amended 2026-09-11 with the decode/verify FlashAttention kernel-family fix
+single-device `SPLIT_MODE_TENSOR` warn; block 08 amended 2026-09-13 (sixth) with the `iq4_nl` `GET_ROWS` sub-`QK_K` path (TODO item 3 — an `iq4_nl` indexer key cache sent the indexer gather to the CPU; the op is now on the GPU, restoring ~25 % of long-context qwen4exp prefill — see the 2026-09-13 block-08 section below), amended 2026-09-11 with the decode/verify FlashAttention kernel-family fix
 (F1: a quantized K/V cache used VEC at `n_q <= 2` and TILE from `n_q = 3`, so plain decode disagreed
 with spec-draft-mtp verify — see the block-08 notes below), and again 2026-09-11 with the **quantized
 KV-type enablement** (`q4_1`/`q5_0`/`q5_1` become first-class FlashAttention cache types — the
@@ -82,7 +82,7 @@ promotion section below), so the set now applies as block 00 + blocks
 | `0005` | CPU bit-identical decode/verify batches |
 | `0006` | host-buffer revert for discrete GPUs |
 | `0007` | meta device-wrapper skip |
-| `0008` | fused-core prefill kernels + GPU bit-identical results | **amended 2026-09-06 with the scale+unary fused kernel** (unary.cu/cuh, fork f5ac11903). | **amended 2026-09-07 with the mul_mat+add through-view shape guard (PR #15, DanoPTT)** — see the 2026-09-07 re-base section. | **amended 2026-09-11 with the quantized-KV-type enablement** (`q4_1`/`q5_0`/`q5_1` lose the `GGML_CUDA_FA_ALL_QUANTS` guard — predicate + the three diagonal vec instances + the three CMake default lists) | **amended 2026-09-11 (fifth) with `iq4_nl`** — the predicate case, the **15 missing `fattn-vec-instance-iq4_nl-*.cu` pairs** (the generator's `TYPES_KV` did not carry the type) with the diagonal in the three CMake default lists, `vec_dot_fattn_vec_KQ_iq4_nl` + `dequantize_V_iq4_nl`, and the **non-contiguous FA staging converter** `dequantize_q4_nl` (without it any `iq4_nl` K/V *view* reached the tile kernel as a null function pointer — a SIGSEGV that was unreachable only because the type had no FA path at all) | **amended 2026-09-12 with the RDNA4 band-uniform `nwarps=1`** (the 2026-09-11 purity work widened the RDNA4 `calc_nwarps` whitelist from `ncols_dst == 1` to the whole `ncols_dst <= MMVQ_MAX_BATCH_SIZE` band but kept the single-token-tuned `nwarps=8` values; the verify widths lose ~15% on them, so the whole RDNA4 band is `nwarps=1`; RDNA3_0/RDNA3_5 unchanged) — see the 2026-09-12 block-08 + block-10 amendment section below and the `iq4_nl` section below; **for the dense Q8_0 short-K shapes the band-uniform `nwarps=1` is refined by the 2026-09-12 (18) block-13 amendment** (per-`(type, K)` nwarps — see the (18) section below).
+| `0008` | fused-core prefill kernels + GPU bit-identical results | **amended 2026-09-06 with the scale+unary fused kernel** (unary.cu/cuh, fork f5ac11903). | **amended 2026-09-07 with the mul_mat+add through-view shape guard (PR #15, DanoPTT)** — see the 2026-09-07 re-base section. | **amended 2026-09-11 with the quantized-KV-type enablement** (`q4_1`/`q5_0`/`q5_1` lose the `GGML_CUDA_FA_ALL_QUANTS` guard — predicate + the three diagonal vec instances + the three CMake default lists) | **amended 2026-09-11 (fifth) with `iq4_nl`** — the predicate case, the **15 missing `fattn-vec-instance-iq4_nl-*.cu` pairs** (the generator's `TYPES_KV` did not carry the type) with the diagonal in the three CMake default lists, `vec_dot_fattn_vec_KQ_iq4_nl` + `dequantize_V_iq4_nl`, and the **non-contiguous FA staging converter** `dequantize_q4_nl` (without it any `iq4_nl` K/V *view* reached the tile kernel as a null function pointer — a SIGSEGV that was unreachable only because the type had no FA path at all) | **amended 2026-09-12 with the RDNA4 band-uniform `nwarps=1`** (the 2026-09-11 purity work widened the RDNA4 `calc_nwarps` whitelist from `ncols_dst == 1` to the whole `ncols_dst <= MMVQ_MAX_BATCH_SIZE` band but kept the single-token-tuned `nwarps=8` values; the verify widths lose ~15% on them, so the whole RDNA4 band is `nwarps=1`; RDNA3_0/RDNA3_5 unchanged) — see the 2026-09-12 block-08 + block-10 amendment section below and the `iq4_nl` section below; **for the dense Q8_0 short-K shapes the band-uniform `nwarps=1` is refined by the 2026-09-12 (18) block-13 amendment** (per-`(type, K)` nwarps — see the (18) section below). | **amended 2026-09-13 (sixth) with the `iq4_nl` `GET_ROWS` sub-`QK_K` path** — the `GET_ROWS` support predicate required `ne[0] % QK_K == 0` for `IQ4_NL`/`MXFP4`, so the QSA indexer key gather (row width 128) on an `iq4_nl` cache was rejected by the HIP backend and ran on the **CPU** (26 graph splits per qwen4exp prefill graph, a host round trip per indexer layer), costing ~25 % of long-context qwen4exp prefill; `getrows.cu` now dispatches `iq4_nl` on `ne00 % QK_K` (sub-block `get_rows_cuda_q<QK4_NL, QR4_NL, dequantize_q4_nl>`) and the predicate accepts every `ne00 % QK4_NL == 0` — see the 2026-09-13 section above.
 | `0009` | meta-buffer compute-container headroom |
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions) | **amended 2026-09-12: the VDR=4 mmvq boost is reverted for the dense kernels** (`vecdotq.cuh` restored to the upstream dense VDR set — Q4_K/Q5_K/Q6_K back to 2/2/1 and Q8_0 back to 2; the 32-element variants lose on the spec verify widths, see the block-08 + block-10 amendment section below) | **amended 2026-09-12 (17): the VDR is now per kernel** — the dense mmvq selectors keep the upstream VDR while the MoE expert kernel `mul_mat_vec_q_moe` takes block 10's VDR=4 back through its own selectors; `vecdotq.cuh` returns to the block with the `_vdr4`/`_vdr2` functions only (the dense macros stay upstream).  The block keeps the `mmq-vec-dot.cuh` `dmA_reg` fold, the RDNA3_5 nwarps table and the Q4_K `MUL_MAT_ID` cap. |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL |
@@ -191,6 +191,66 @@ previous regeneration apart from the `From` lines + the `[PATCH NN/14]` ->
 beta patch apart from its `From` line).  Block 15 (the attention-memory campaign)
 is the last delivery patch since 2026-09-12 — see the block-15 promotion section
 below.
+
+## 2026-09-13 block-08 amendment (sixth): the `iq4_nl` `GET_ROWS` CPU fallback (TODO item 3)
+
+**The task (TODO item 3).**  qwen4exp prefill with `--cache-type-k iq4_nl` was ~8-12 % slower than
+f16/`q4_0`/`q4_1` at pp8192 (2303.1 vs 2615.5 t/s) and the gap grew with context (pp32768 1992.1 vs
+2434.5), even though `iq4_nl` and `q4_0` share the 18-byte block layout and the traced kernel sum was
+*lower* for `iq4_nl`.  It was filed as "host/launch-side".
+
+**Root cause: the indexer key gather ran on the CPU.**  The QSA indexer key cache tracks `type_k`, so
+an `iq4_nl` cache gives the indexer gather (`ggml_get_rows` over the 128-wide indexer key view) an
+`iq4_nl` source.  `ggml_backend_cuda_device_supports_op()`'s `GGML_OP_GET_ROWS` case routed
+`IQ4_NL`/`MXFP4` to a `ne[0] % QK_K == 0` requirement (the 32-value sub-block types were only wired to
+the QK_K super-block kernel `get_rows_cuda_kq<..., dequantize_iq4_nl>`), and the indexer row is
+`idx_dim = 128`, so 128 % 256 != 0 and the op was **rejected by the HIP backend**.  The scheduler put
+the single node on the CPU and the graph became 26 alternating CPU/GPU splits; every one of the 12-13
+indexer-bearing layers per ubatch did a D2H gather, a host dequantize and an H2D copy, with a
+`hipStreamSynchronize` each.  The GPU sits idle (busy/span 0.62 vs 0.96 for `q4_0`) while the host
+waits.  The dense shortcut arm masks the bug below the indexer selection width
+(`indexer_top_k + r - 1 = 2051`), which is why pp2048 was flat and the gap only appeared above 2051 and
+grew with the number of selected blocks.
+
+**The fix (two sites).**  `ggml/src/ggml-cuda/getrows.cu`: the `GGML_TYPE_IQ4_NL` case now dispatches on
+`ne00 % QK_K` -- whole super-blocks keep the existing `get_rows_cuda_kq<32, ..., dequantize_iq4_nl>`
+path, any other width takes the sub-block `get_rows_cuda_q<QK4_NL, QR4_NL, dequantize_q4_nl>` (the
+per-32-block dequantize kernel block 08 already added for the FA staging).
+`ggml/src/ggml-cuda/ggml-cuda.cu`: the `GET_ROWS` predicate accepts `IQ4_NL` whenever
+`ne00 % QK4_NL == 0` (every legal `iq4_nl` row); `MXFP4` keeps the `QK_K` requirement (it has no
+sub-block dequantize kernel).  `tests/test-backend-ops.cpp` gains four `iq4_nl` `GET_ROWS` cases at
+32/128/160/224 columns -- the sub-`QK_K` widths the suite never tested.
+
+**Measured** (3x R9700 gfx1201, 3-GPU `-sm tensor`, `-b 2048 -ub 2048`, interleaved same-session):
+
+| gate | before | after |
+|---|---|---|
+| `sched_reserve` graph splits, `iq4_nl` pp4096 (indexer sparse) | **142** (26 per prefill graph) | **22** (2, like `q4_0`) |
+| qwen4exp `iq4_nl` prefill pp8192 (interleaved r3) | 1815-1951 | **2385-2422** (= f16 2348-2416 / `q4_0` 2316-2413) |
+| qwen4exp `iq4_nl` prefill pp32768 | 1754-1781 | **2423-2430** (+36 %) |
+| `test-backend-ops -o GET_ROWS` | 215/215 | **219/219** (4 new cases) |
+| iq4_nl `get_rows` vs CPU (temporarily forced NMSE=0) | - | **bit-exact** at 32/128/160/224/256/512/1024 |
+| qwen4exp `plain == n_max 3 == n_max 7` (tensor, iq4_nl) | `c0d44c479ee1` | `14a1a3f257f4` |
+| MTP `n_max 3` iq4_nl acceptance (pos-1) | 0.670 (0.812) | 0.677 (0.906) |
+| 4B `Qwen3.5-4B-Q8_0` `-sm tensor` coherence | `1c5d32ac537d` | `1c5d32ac537d` (unchanged) |
+
+**The absolute `iq4_nl` text hash changes, and that is expected and bounded.**  The moved `get_rows`
+itself is bit-identical to the CPU at every width (temporarily forced `max_nmse_err == 0` in
+`test-backend-ops`: 219/219).  What changes is the *graph layout*: removing the host split changes the
+buffer addresses, and `ggml_cuda_check_fusion_memory_ranges()`'s address-overlap test then flips the
+MoE-router `topk_moe` fusion coverage (pre-fix `iq4_nl` ran the fused router for ~540 sites and the
+generic chain for ~612 per trace -- an address-layout accident -- where `q4_0` runs 24 fused / 1128
+generic).  Measurements: `iq4_nl` post-fix is now layout-identical to `q4_0`; a temporary
+`GGML_CUDA_DISABLE_TOPK_MOE_FUSION` A/B moves the text (`14a1a3f257f4` -> `086df944f6af`), confirming
+the fused router is not bit-identical to the generic chain.  The `plain == n_max 3 == n_max 7`
+invariant, the width-purity probes, the f16/`q4_0` control hashes and the 4B coherence all hold; only
+the `iq4_nl`-specific absolute text moves.  The layout-sensitivity of the router fusion (an address
+dependence, upstream `ggml-cuda.cu`) is left as a separate follow-up -- see `TODO.md`.
+
+Pre-fix reproductions: the CPU-assigned node is exactly one `GET_ROWS` per indexer layer
+(`GGML_SCHED_DEBUG=2`: `node #611 (GET_ROWS) ... CPU#cache_idx_k_l3`), and `rocprofv3 --kernel-trace`
+shows the GPU busy fraction at 0.624 (`iq4_nl`) vs 0.958 (`q4_0`) with ~2844 extra
+`hipStreamSynchronize` calls.
 
 ## 2026-09-12 block-08 + block-10 amendment: the MTP decode regression (issue #30)
 

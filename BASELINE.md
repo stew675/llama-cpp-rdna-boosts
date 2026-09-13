@@ -39,8 +39,9 @@ bottom of this file): block 00 = the structural/architecture fixes added
 2026-09-10 (FA small-batch KV-split width invariance + Vulkan masked-V), and
 blocks 01-15 = the fork's `rdna-boosts` block
 commits.  The canonical 16-block chain for the `790cf51aa` base is tip
-`43ec14228c60b0b8cb90205365c8e0aabec8bc7b`, tree
-`5cc664170a29cd78975f8679936d4d0adf28c605` (the 2026-09-13 re-base; the four
+`ab2fabb440ac909e02e0482cabd673c339106b57`, tree
+`e279b222e8e98a7574814929d4b6d97edae32a48` (the 2026-09-13 re-base + the block-08 (sixth)
+`iq4_nl` `GET_ROWS` sub-`QK_K` amendment, TODO item 3; the four
 upstream clashes and the FA head-to-head are recorded in `WORKLOG.md` and
 `patches/README.md`).  The previous base was `9113cc188` (canonical tip block 15
 `0f4f83f9e`, promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`, on top of the 2026-09-12 (13) block-14 QSA indexer-score decode/verify band-uniformity fix -> `d306d4b4b`; block 02 amended 2026-09-11 with the

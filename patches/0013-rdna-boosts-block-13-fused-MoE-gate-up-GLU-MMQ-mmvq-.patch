@@ -1,4 +1,4 @@
-From bd0ec19c56cb35404bc3b92810a788d7dec02da6 Mon Sep 17 00:00:00 2001
+From db79a4a964edd175045c73f25e15fc8acd899ca5 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 06:50:35 -0500
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -73,7 +73,7 @@ untouched (it fires at every width and is band-uniform).  Cost ~0.9% tg128 on qw
  13 files changed, 1894 insertions(+), 294 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 948877046..949243c7b 100644
+index 4a022eb6b..3042e7a5b 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -813,6 +813,24 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
@@ -3143,10 +3143,10 @@ index ffb6213af..9e89727a9 100644
  DECL_MMQ_CASE(GGML_TYPE_Q3_K);
 +DECL_MMQ_CASE_GATE(GGML_TYPE_Q3_K);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index aa4f93341..ef2ed1d15 100644
+index 999a5c049..d295aa08f 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10165,7 +10165,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10170,7 +10170,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      }
  
      for (int bs : {1, 4, 512}) {

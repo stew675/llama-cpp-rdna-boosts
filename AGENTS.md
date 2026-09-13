@@ -30,7 +30,13 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   probe disable flash attention for the whole context (3.4x slower prefill / 1.7x
   decode); they are enabled unconditionally with their three diagonal vec instances,
   while the flag remains the knob for the *mixed* K!=V pairs (K==V is still enforced
-  without it).  See the block-08 notes in `patches/README.md` and `GREEDY-PURITY.md` §20.
+  without it).  **Block 08 amended 2026-09-13 (sixth)**: the `iq4_nl` `GET_ROWS`
+  sub-`QK_K` path (TODO item 3) — the QSA indexer key gather on an `iq4_nl` cache
+  (row width 128) was rejected by the support predicate and ran on the **CPU**
+  (26 graph splits per qwen4exp prefill graph), costing ~25 % of long-context
+  qwen4exp prefill; `getrows.cu` now dispatches on `ne00 % QK_K` and the predicate
+  accepts every `ne00 % QK4_NL == 0`.  See the block-08 notes in `patches/README.md`
+  and `GREEDY-PURITY.md` §20.
 - Block **12** (`patches/0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch`): the hybrid HIP
   all-reduce (custom internal AR for the small-tensor decode path +
   per-size hybrid dispatch vs RCCL), **RDNA4-only** (gfx1200/gfx1201; falls
@@ -155,8 +161,8 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `790cf51aa` is a rebuild of the delivery set
-(tip `43ec14228c60b0b8cb90205365c8e0aabec8bc7b`, net tree
-  `5cc664170a29cd78975f8679936d4d0adf28c605`,
+(tip `ab2fabb440ac909e02e0482cabd673c339106b57`, net tree
+  `e279b222e8e98a7574814929d4b6d97edae32a48`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `790cf51aa`; the 2026-09-13 re-base resolved the four upstream clashes --
 `16378d93f` gfx1201 FA tuning (our block-04 head-256 configs kept: upstream's
@@ -170,7 +176,9 @@ chunked threshold (`n_rs_batch`) + the pre-batch snapshot slots; block 08 amende
 decode/verify FA kernel-family fix, again with the quantized-KV-type
 enablement (`q4_1`/`q5_0`/`q5_1`), and again with the `iq4_nl` enablement (the predicate, the 15
 new `fattn-vec-instance-iq4_nl-*.cu` files, `dequantize_q4_nl` and the three non-contiguous
-converters); block 13 amended 2026-09-11 with the MoE
+converters); block 08 amended 2026-09-13 with the `iq4_nl` `GET_ROWS` sub-`QK_K`
+path (TODO item 3) -- the OP, not an enablement;
+block 13 amended 2026-09-11 with the MoE
 decode/verify mmvq band, again with the fused shared-expert epilogue band, and
 again 2026-09-12 with the column-blocked epilogue (its band launch shape made
 the kernel read the down-weight row once per token and idle 7 of its 8 warps —
@@ -199,8 +207,9 @@ which is what
 to; always regenerate from a canonical fork rebuilt at the fork point.
 **Block 15 (the attention-memory campaign) is the delivery's last patch** --
 promoted 2026-09-12 from `archive/work/block-15-campaign-wins/` (`patches/0015`;
-the canonical 16-block tip is `43ec14228c60b0b8cb90205365c8e0aabec8bc7b`, tree
-`5cc664170a29cd78975f8679936d4d0adf28c605` (the 2026-09-13 master re-base; the
+the canonical 16-block tip is `ab2fabb440ac909e02e0482cabd673c339106b57`, tree
+`e279b222e8e98a7574814929d4b6d97edae32a48` (the 2026-09-13 master re-base + the
+2026-09-13 block-08 `iq4_nl` `GET_ROWS` amendment; the
 previous base `9113cc188` had tip `907799de3`, tree `c2e284c2acc032238ef85cb35d427c1598ed0949`).
 
 Block provenance on the canonical chain: block 00 added 2026-09-10 (FA
@@ -712,7 +721,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `790cf51aa`,
-blocks tip `43ec14228c60b0b8cb90205365c8e0aabec8bc7b`): `git format-patch --start-number 0` the block
+blocks tip `ab2fabb440ac909e02e0482cabd673c339106b57`): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -720,7 +729,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 — it may have been rebased onto a drifted master, so a raw
 `<base>..HEAD` range there can export upstream commits as patches
 0001/0002.  The canonical 16-block chain is a rebuild of the delivery set at
-`790cf51aa` (tip `43ec14228…`), which is what the default tip names.  Always regenerate from a
+`790cf51aa` (tip `ab2fabb44…`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `790cf51aa`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

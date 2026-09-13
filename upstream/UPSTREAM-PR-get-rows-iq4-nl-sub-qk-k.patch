@@ -1,0 +1,53 @@
+diff --git a/ggml/src/ggml-cuda/getrows.cu b/ggml/src/ggml-cuda/getrows.cu
+index 6b36b8fbc..b7d105f25 100644
+--- a/ggml/src/ggml-cuda/getrows.cu
++++ b/ggml/src/ggml-cuda/getrows.cu
+@@ -393,8 +393,16 @@ static void ggml_cuda_get_rows_switch_src0_type(
+                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+             break;
+         case GGML_TYPE_IQ4_NL:
+-            get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
+-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++            // iq4_nl is a 32-value sub-block type: a row that is a whole number of QK_K
++            // super-blocks takes the super-block kernel, any other width (e.g. the qwen4exp
++            // indexer key row, 128) takes the per-block dequantize_q4_nl path.
++            if (ne00 % QK_K == 0) {
++                get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
++                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++            } else {
++                get_rows_cuda_q<QK4_NL, QR4_NL, dequantize_q4_nl>(src0_d, src1_d, dst_d,
++                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++            }
+             break;
+         case GGML_TYPE_IQ4_XS:
+             get_rows_cuda_kq<32, dst_t, dequantize_iq4_xs<dst_t>>(src0_d, src1_d, dst_d,
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 5ae3b8d22..0ad7fa83b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5200,6 +5200,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_IQ4_XS:
+                         return true;
+                     case GGML_TYPE_IQ4_NL:
++                        // 32-value sub-blocks: the QK_K super-block path needs ne00 % QK_K == 0,
++                        // while the sub-block path (dequantize_q4_nl) handles any row width
++                        return op->src[0]->ne[0] % QK4_NL == 0;
+                     case GGML_TYPE_MXFP4:
+                         // 32-value sub-blocks, the row size does not guarantee
+                         // the QK_K super-blocks the get_rows kernel iterates on
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b63b3773e..ed16060a6 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -8990,6 +8990,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+ 
+     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
++    // iq4_nl is a 32-value sub-block type: exercise row widths that are not a whole number of
++    // QK_K super-blocks (the qwen4exp indexer key row is 128) - the sub-block get_rows path.
++    for (int n : {32, 128, 160, 224}) {
++        test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, n, 5, 4, 1, 1, false, false));
++    }
+     for (ggml_type type : all_types) {
+         for (int b : {1, 7}) {
+             for (bool v : {false, true}) {

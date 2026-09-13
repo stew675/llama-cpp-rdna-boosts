@@ -1,5 +1,59 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-13 (later) — block-08 amendment (sixth): the `iq4_nl` `GET_ROWS` CPU fallback — TODO item 3 closed
+
+**Canonical chain amended in place** (block 08 `de5246ada`, the rest replayed; new tip
+**`ab2fabb440ac909e02e0482cabd673c339106b57`**, net tree
+**`e279b222e8e98a7574814929d4b6d97edae32a48`**).  `patches/` regenerated from the rebuilt
+`~/llama.cpp` chain; a fresh `790cf51aa` worktree + `apply-all.sh` applies **strict 16/16 `git am`**
+and its tree equals the amended tip tree.  `scripts/make-patches.sh` default tip updated; the single
+net patch regenerated.
+
+**The bug (TODO item 3).**  qwen4exp prefill with `--cache-type-k iq4_nl` was ~8-12 % slower than
+f16/`q4_0`/`q4_1` at pp8192 and the gap grew with context (pp32768 1992.1 vs 2434.5) although `iq4_nl`
+and `q4_0` share the 18-byte block layout.  The QSA indexer key cache tracks `type_k`, so the indexer
+gather (`ggml_get_rows` over the 128-wide indexer key view) got an `iq4_nl` source; the CUDA
+`GET_ROWS` support predicate required `ne[0] % QK_K == 0` for `IQ4_NL`/`MXFP4` (those types were only
+wired to the QK_K super-block kernel), and 128 % 256 != 0, so the HIP backend rejected the op and the
+scheduler ran it on the **CPU**.  One `GET_ROWS` per indexer-bearing layer became a D2H/H2D round trip
+with a `hipStreamSynchronize`; a qwen4exp prefill graph went from 2 to **26** splits and the GPU sat at
+0.62 busy/span vs `q4_0`'s 0.958.  The dense-shortcut arm hid it below the indexer selection width
+(2051), which is why pp2048 was flat.
+
+**The fix.**  `getrows.cu` dispatches `iq4_nl` on `ne00 % QK_K` (whole super-blocks keep
+`get_rows_cuda_kq<32, ..., dequantize_iq4_nl>`, any other width takes
+`get_rows_cuda_q<QK4_NL, QR4_NL, dequantize_q4_nl>`); the `GET_ROWS` predicate accepts
+`ne00 % QK4_NL == 0` for `IQ4_NL` (`MXFP4` keeps the `QK_K` requirement — it has no sub-block
+dequantize); `test-backend-ops.cpp` gains `iq4_nl` `GET_ROWS` cases at 32/128/160/224 columns.
+
+**Validation** (3x R9700 gfx1201, ROCm 7.14, 3-GPU `-sm tensor`):
+
+* `test-backend-ops test -o GET_ROWS`: **219/219** (was 215; the four new sub-`QK_K` cases run on the
+  GPU and match the CPU).  With `max_nmse_err()` temporarily forced to 0 for `iq4_nl`, the new path is
+  **bit-exact** against the CPU at 32/128/160/224/256/512/1024 columns — the moved op itself is pure.
+* Graph splits for `iq4_nl` pp4096: **142 -> 22** (`q4_0` is 22).
+* qwen4exp `iq4_nl` prefill, interleaved same-session: pp8192 **1815-1951 -> 2385-2422 t/s** (= f16
+  2348-2416 / `q4_0` 2316-2413); pp32768 **1754-1781 -> 2423-2430** (+36 %).
+* `plain == --spec-type draft-mtp n_max 3 == n_max 7` for `iq4_nl` (tensor):
+  **`c0d44c479ee1` -> `14a1a3f257f4`**; the f16 (`30d27ad1fc6d`) and `q4_0` (`912c03f2effc`) controls
+  are unmoved, and the 4B `Qwen3.5-4B-Q8_0` `-sm tensor` coherence is `1c5d32ac537d` (unchanged).
+* MTP `n_max 3` iq4_nl acceptance 0.670 -> 0.677 (pos-1 0.812 -> 0.906), both far above the gate.
+
+**The absolute `iq4_nl` text hash moves — and it had to.**  The `get_rows` values are bit-identical,
+but removing the host split changes the buffer addresses, and `ggml_cuda_check_fusion_memory_ranges()`'s
+address-overlap test then flips the **MoE-router `topk_moe`** fusion coverage: pre-fix `iq4_nl` ran the
+fused router for ~540 sites and the generic chain for ~612 per trace (an address-layout accident),
+where `q4_0` runs 24/1128.  Post-fix `iq4_nl` is layout-identical to `q4_0`; a temporary
+`GGML_CUDA_DISABLE_TOPK_MOE_FUSION` A/B moves the text (`14a1a3f257f4` -> `086df944f6af`), i.e. the
+fused router is **not** bit-identical to the generic chain and its selection is address-dependent.
+The purity invariants that matter (width `W = 1..8`, `plain == n_max 3 == n_max 7`, the controls, the
+4B coherence) all hold; only `iq4_nl`'s absolute text moves.  The router-fusion address sensitivity is
+filed as a new `TODO.md` item (upstream `ggml-cuda.cu`).
+
+**Instruments.**  `GGML_SCHED_DEBUG=1` (split count) and `=2` (per-node backend assignment) are what
+localised it; `rocprofv3 --kernel-trace` was used to cross-check the host-side signature.  The
+`GGML_CUDA_DISABLE_TOPK_MOE_FUSION` A/B was a temporary instrument, reverted before landing.
+
 ## 2026-09-13 — re-based onto master `790cf51aa` (the 16-block set, 70 upstream commits)
 
 The delivery moved from the 2026-09-08 fork point `9113cc188` to current master

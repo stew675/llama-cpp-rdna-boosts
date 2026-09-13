@@ -10259,8 +10259,31 @@ index 000000000..944110792
 +
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 \ No newline at end of file
+diff --git a/ggml/src/ggml-cuda/getrows.cu b/ggml/src/ggml-cuda/getrows.cu
+index 6b36b8fbc..b7d105f25 100644
+--- a/ggml/src/ggml-cuda/getrows.cu
++++ b/ggml/src/ggml-cuda/getrows.cu
+@@ -393,8 +393,16 @@ static void ggml_cuda_get_rows_switch_src0_type(
+                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+             break;
+         case GGML_TYPE_IQ4_NL:
+-            get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
+-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++            // iq4_nl is a 32-value sub-block type: a row that is a whole number of QK_K
++            // super-blocks takes the super-block kernel, any other width (e.g. the qwen4exp
++            // indexer key row, 128) takes the per-block dequantize_q4_nl path.
++            if (ne00 % QK_K == 0) {
++                get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
++                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++            } else {
++                get_rows_cuda_q<QK4_NL, QR4_NL, dequantize_q4_nl>(src0_d, src1_d, dst_d,
++                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++            }
+             break;
+         case GGML_TYPE_IQ4_XS:
+             get_rows_cuda_kq<32, dst_t, dequantize_iq4_xs<dst_t>>(src0_d, src1_d, dst_d,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 5ae3b8d22..28117c67f 100644
+index 5ae3b8d22..d00210bbc 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -1,5 +1,6 @@
@@ -12523,7 +12546,17 @@ index 5ae3b8d22..28117c67f 100644
      return description;
  }
  
-@@ -5492,8 +6866,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5200,6 +6574,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_IQ4_XS:
+                         return true;
+                     case GGML_TYPE_IQ4_NL:
++                        // 32-value sub-blocks: the QK_K super-block path needs ne00 % QK_K == 0,
++                        // while the sub-block path (dequantize_q4_nl) handles any row width
++                        return op->src[0]->ne[0] % QK4_NL == 0;
+                     case GGML_TYPE_MXFP4:
+                         // 32-value sub-blocks, the row size does not guarantee
+                         // the QK_K super-blocks the get_rows kernel iterates on
+@@ -5492,8 +6869,24 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
              return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                  op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                  op->type == GGML_TYPE_F32;
@@ -24929,7 +24962,7 @@ index e0907631a..61a7fbe16 100644
      assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
      assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index b63b3773e..61d29ad49 100644
+index b63b3773e..e92675c34 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1496,14 +1496,64 @@ struct test_case {
@@ -25213,7 +25246,19 @@ index b63b3773e..61d29ad49 100644
              } else {
                  init_tensor_uniform(t);
              }
-@@ -9779,6 +9969,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -8990,6 +9180,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+ 
+     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
++    // iq4_nl is a 32-value sub-block type: exercise row widths that are not a whole number of
++    // QK_K super-blocks (the qwen4exp indexer key row is 128) - the sub-block get_rows path.
++    for (int n : {32, 128, 160, 224}) {
++        test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, n, 5, 4, 1, 1, false, false));
++    }
+     for (ggml_type type : all_types) {
+         for (int b : {1, 7}) {
+             for (bool v : {false, true}) {
+@@ -9779,6 +9974,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
@@ -25227,7 +25272,7 @@ index b63b3773e..61d29ad49 100644
  #endif
  
      for (ggml_type type_a : all_types) {
-@@ -10090,7 +10287,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10090,7 +10292,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      }
  
      for (int bs : {1, 4, 512}) {
@@ -25236,7 +25281,7 @@ index b63b3773e..61d29ad49 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  // test with mul after (ffn_moe_weighted)
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1, true));
-@@ -10600,8 +10797,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10600,8 +10802,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -25247,7 +25292,7 @@ index b63b3773e..61d29ad49 100644
              if (hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
              if (hsk == 192 && (hsv != 128 && hsv != 192)) continue;
              if (hsk == 576 && hsv != 512) continue; // DeepSeek MLA
-@@ -10612,7 +10809,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10612,7 +10814,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      for (float max_bias : { 0.0f, 8.0f }) {
                          if (!mask && max_bias > 0.0f) continue;
                          for (float logit_softcap : {0.0f, 10.0f}) {
@@ -25257,7 +25302,7 @@ index b63b3773e..61d29ad49 100644
                              for (int nh : { 1, 4 }) {
                                  if (nh == 1 && hsk != 320 && hsk != 576) continue;
                                  for (int nr3 : { 1, 3, }) {
-@@ -10630,7 +10828,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10630,7 +10833,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                  for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
                                                      if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
                                                      for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
@@ -25268,7 +25313,7 @@ index b63b3773e..61d29ad49 100644
                                                          // DeepSeek MLA: the V cache is a sub-view of the K cache
                                                          const bool v_is_view_of_k = hsk == 576;
                                                          test_cases.emplace_back(new test_flash_attn_ext(
-@@ -10738,6 +10938,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10738,6 +10943,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
  
@@ -25286,7 +25331,7 @@ index b63b3773e..61d29ad49 100644
      // FLASH_ATTN_EXT MMA, swizzled K/V tiles, power-of-two stride: nbatch_K2 = 32, 64, 128, 256.
      test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {8, 1}, 4096,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096,  8, true,  true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-@@ -10851,6 +11062,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10851,6 +11067,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
@@ -25305,7 +25350,7 @@ index b63b3773e..61d29ad49 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
-@@ -10904,6 +11127,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10904,6 +11132,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_falcon(2));
  #endif
  
@@ -25332,7 +25377,7 @@ index b63b3773e..61d29ad49 100644
      // lightning_indexer
      for (int kv : { 256 }) {
          for (int bs : { 1, 512 }) {
-@@ -10958,6 +11201,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -10958,6 +11206,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_leaky_relu(GGML_TYPE_F32, { 17408, n_tokens, 1, 1 }, 0.1f));
      }
  
@@ -25363,7 +25408,7 @@ index b63b3773e..61d29ad49 100644
      // Conv2d: K=CRS=NPQ=4096 matmul performance
      uint32_t                        iwh_idx  = 0;
      uint32_t                        kwh_idx  = 1;
-@@ -11119,9 +11386,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11119,9 +11391,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -25399,7 +25444,7 @@ index b63b3773e..61d29ad49 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
-@@ -11129,8 +11420,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11129,8 +11425,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
@@ -25410,7 +25455,7 @@ index b63b3773e..61d29ad49 100644
              for (ggml_type type_b : {GGML_TYPE_F32}) {
                  test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 1792, bs, 2048));
                  test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 1792, bs, 2048, 1));
-@@ -11340,6 +11631,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11340,6 +11636,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
  

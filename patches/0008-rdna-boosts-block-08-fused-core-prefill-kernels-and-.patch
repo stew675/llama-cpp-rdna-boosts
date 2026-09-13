@@ -1,4 +1,4 @@
-From a879c6dd8a40aaf735013e028bd6836dfbaa3aa3 Mon Sep 17 00:00:00 2001
+From de5246ada06502a9f41265278ab5ee71bfd6599a Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 08/15] rdna-boosts: block 08: fused-core prefill kernels and
@@ -27,7 +27,8 @@ single-sequence case is unaffected.
  ggml/src/ggml-cuda/fattn-common.cuh           |  89 +++
  ggml/src/ggml-cuda/fattn-tile.cuh             |  16 +
  ggml/src/ggml-cuda/fattn.cu                   |  59 +-
- ggml/src/ggml-cuda/ggml-cuda.cu               | 546 +++++++++++++-
+ ggml/src/ggml-cuda/getrows.cu                 |  12 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu               | 549 +++++++++++++-
  ggml/src/ggml-cuda/mmvq.cu                    | 690 ++++++++++++++++--
  ggml/src/ggml-cuda/mmvq.cuh                   |  23 +
  ggml/src/ggml-cuda/norm.cu                    | 215 ++++++
@@ -50,7 +51,8 @@ single-sequence case is unaffected.
  .../template-instances/generate_cu_files.py   |   2 +-
  ggml/src/ggml-cuda/unary.cu                   | 150 ++++
  ggml/src/ggml-cuda/unary.cuh                  |   6 +
- 32 files changed, 1913 insertions(+), 107 deletions(-)
+ tests/test-backend-ops.cpp                    |   5 +
+ 34 files changed, 1931 insertions(+), 109 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-vec-instance-bf16-iq4_nl.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-vec-instance-f16-iq4_nl.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-vec-instance-iq4_nl-bf16.cu
@@ -519,8 +521,31 @@ index d41ce42be..8619742d4 100644
      return BEST_FATTN_KERNEL_TILE;
  }
  
+diff --git a/ggml/src/ggml-cuda/getrows.cu b/ggml/src/ggml-cuda/getrows.cu
+index 6b36b8fbc..b7d105f25 100644
+--- a/ggml/src/ggml-cuda/getrows.cu
++++ b/ggml/src/ggml-cuda/getrows.cu
+@@ -393,8 +393,16 @@ static void ggml_cuda_get_rows_switch_src0_type(
+                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+             break;
+         case GGML_TYPE_IQ4_NL:
+-            get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
+-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++            // iq4_nl is a 32-value sub-block type: a row that is a whole number of QK_K
++            // super-blocks takes the super-block kernel, any other width (e.g. the qwen4exp
++            // indexer key row, 128) takes the per-block dequantize_q4_nl path.
++            if (ne00 % QK_K == 0) {
++                get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
++                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++            } else {
++                get_rows_cuda_q<QK4_NL, QR4_NL, dequantize_q4_nl>(src0_d, src1_d, dst_d,
++                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
++            }
+             break;
+         case GGML_TYPE_IQ4_XS:
+             get_rows_cuda_kq<32, dst_t, dequantize_iq4_xs<dst_t>>(src0_d, src1_d, dst_d,
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 99da7bee5..ba562d96d 100644
+index 99da7bee5..5a4a18b3e 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -709,6 +709,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
@@ -1167,6 +1192,16 @@ index 99da7bee5..ba562d96d 100644
      bool use_cuda_graph             = false;
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
+@@ -5288,6 +5812,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_IQ4_XS:
+                         return true;
+                     case GGML_TYPE_IQ4_NL:
++                        // 32-value sub-blocks: the QK_K super-block path needs ne00 % QK_K == 0,
++                        // while the sub-block path (dequantize_q4_nl) handles any row width
++                        return op->src[0]->ne[0] % QK4_NL == 0;
+                     case GGML_TYPE_MXFP4:
+                         // 32-value sub-blocks, the row size does not guarantee
+                         // the QK_K super-blocks the get_rows kernel iterates on
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
 index 6305230b1..876b69875 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
@@ -2706,6 +2741,22 @@ index 04f3af644..2a8c2e20c 100644
  void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
  
  __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 7a996d934..f70e73144 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9058,6 +9058,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+ 
+     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
++    // iq4_nl is a 32-value sub-block type: exercise row widths that are not a whole number of
++    // QK_K super-blocks (the qwen4exp indexer key row is 128) - the sub-block get_rows path.
++    for (int n : {32, 128, 160, 224}) {
++        test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, n, 5, 4, 1, 1, false, false));
++    }
+     for (ggml_type type : all_types) {
+         for (int b : {1, 7}) {
+             for (bool v : {false, true}) {
 -- 
 2.55.0
 

@@ -6,9 +6,11 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (2026-09-12):** the delivery is the **16-patch set** against fork point `9113cc188`
-(block 00 + blocks 01-15), canonical 16-block tip **`0f4f83f9ef01ffd1662f58d714d62b9155325a62`** (tree `c3142fe0b311757f458647f172f623859f5bc983`),
-`make-patches.sh` default tip = `0f4f83f9ef01ffd1662f58d714d62b9155325a62`.  Block 15 (the attention-memory campaign) was **promoted to the delivery** as `patches/0015` (2026-09-12; TODO item 1 closed).  F1/F2/F3 (the
+**Current state (2026-09-13, later):** the delivery is the **16-patch set** against fork point `790cf51aa`
+(block 00 + blocks 01-15), canonical 16-block tip **`ab2fabb440ac909e02e0482cabd673c339106b57`** (tree
+`e279b222e8e98a7574814929d4b6d97edae32a48`), `make-patches.sh` default tip =
+`ab2fabb440ac909e02e0482cabd673c339106b57` (the 2026-09-13 master re-base + the block-08 (sixth)
+`iq4_nl` `GET_ROWS` sub-`QK_K` amendment that closed item 3).  Block 15 (the attention-memory campaign) was **promoted to the delivery** as `patches/0015` (2026-09-12; TODO item 1 closed).  F1/F2/F3 (the
 KV-quant purity/parity campaign) are **all closed** — every KV cache type the delivery supports is
 width-pure and takes the f16 attention path — and so is the gfx1151 within-band mmvq fusion variance
 (block-13 amendment, 2026-09-12; see Closed).  The QSA *sparse* regime was re-measured on gfx1151
@@ -31,29 +33,30 @@ handed-over gfx1201 fix in the same window (the rollback-bounded chunked-GDN thr
 (2026-09-12 (9), block-14 amendment)** — the QSA prefill arm is now depth-configurable with the
 documented arch policy kept as its default (**0 = QSA prefill always**, so the delivery stays
 byte-identical to the pre-amendment build; the crossing numbers are recorded as an opt-in knob), plus
-the device-query arm gate replacing the mirrored type list — so **Active is now item 3 only**.
+the device-query arm gate replacing the mirrored type list.  **Item 3 is closed (2026-09-13, block-08
+amendment (sixth))**: the qwen4exp `iq4_nl` prefill delta was the QSA indexer key gather running on the
+**CPU** (the CUDA `GET_ROWS` predicate rejected an `iq4_nl` row that is not a whole number of `QK_K`
+super-blocks — the indexer row is 128); `getrows.cu` now has the sub-`QK_K` path and qwen4exp `iq4_nl`
+prefill matches f16/`q4_0` (pp8192 ~1815-1951 -> ~2385-2422 t/s, pp32768 +36 %).  The absolute `iq4_nl`
+greedy text moved because removing the host split re-allocates the graph and flips the
+address-dependent MoE-router `topk_moe` fusion — a pre-existing upstream fragility filed as **item 19**.
+**Active is now item 19 (new) and item 18**; the previous header's `9113cc188` / `0f4f83f9` references
+are superseded by the 2026-09-13 re-base to `790cf51aa` (tip `ab2fabb44`, tree `e279b222e8`).
 
 ## Active (kept compact: only what this repo will work on next)
 
-### 3. qwen4exp `iq4_nl` prefill delta (~8–12 %, open — profiled to be host/launch-side)
-- Measured on the reference `-sm tensor`: `iq4_nl` 2303.1/2421.0 t/s at pp8192 (sparse/dense) vs f16
-  2615.5/2736.2 and `q4_0` ~2597 — and the gap grows with context (pp32768 1992.1 vs 2434.5).  Dense
-  models are unaffected (27B within 0.7 %, 4B −2 %), and `q4_0` has the **identical 18-byte layout**.
-- **Not** the new code: `rocprofv3` puts the QSA kernel's `iq4_nl` instantiation within 1.3 % of
-  `q4_0`'s (same VGPR/LDS/occupancy), the dequant kernels at an identical 1.2 ms, the *executed graph*
-  identical (1010 nodes, 0 diff), and the traced kernel *sum* lower for `iq4_nl` — while the wall clock
-  is slower and host CPU is +95 ms/token in the forced-sparse-decode case (11.9 vs 41.9 t/s; *not* the
-  production arm — the arch policy uses dense decode and still wins by 5 %).
-- **Before re-measuring: this axis is noisy on this host.**  On 2026-09-12 the *same* qwen4exp config
-  (pp2048, f16 KV, 3-GPU tensor) drifted 2042.6 -> 1933.7 -> 1906.1 -> 1822.0 -> 1730.8 t/s over one
-  session (−15 %, box at 141 GiB buff/cache with swap full) while a 35B-A3B pp512 control reproduced
-  to 0.2 %; use only same-session interleaved brackets, and note that `LLAMA_QSA_OFF=1` shifts pp2048
-  by only +2.2 % / pp8192 +7.4 %, so the QSA machinery does not explain the drift.  See the 2026-09-12
-  WORKLOG entry.
-- Leads: the dense/sparse topology-flip sync the qwen4exp graph documents, and the per-type indexer op
-  counts (`iq4_nl` runs *fewer* `k_argsort`/`soft_max` dispatches than `q4_0`).  Instruments:
-  `rocprofv3 --kernel-trace` + the `[GD]` graph dump (`archive/work/kv-quant-purity-followups/tools/`), and
-  `tools/qperf.sh` for the interleaved per-type table.  Analysis: `GREEDY-PURITY.md` §22.
+### 19. MoE-router `topk_moe` fusion selection is address-dependent (pre-existing, upstream)
+- `ggml_cuda_check_fusion_memory_ranges()` decides the fused-router subgraph (`softmax/argsort/... ->
+  topk_moe`) by testing **buffer-address overlap**, so a graph whose allocation shifts by an unrelated
+  change (e.g. moving the QSA indexer `get_rows` off the CPU, 2026-09-13) flips the fusion coverage.
+  The fused kernel is **not** bit-identical to the generic chain: a temporary
+  `GGML_CUDA_DISABLE_TOPK_MOE_FUSION` A/B moved the qwen4exp `iq4_nl` greedy text `14a1a3f257f4` ->
+  `086df944f6af`, i.e. the *model output* depends on the allocation plan, not only on the numerics.
+  Pre-existing and upstream (`ggml-cuda.cu`); the delivery's `W = 1..8` and `plain == draft-mtp` gates
+  are unaffected because the coverage is width-uniform within a config.
+- Fix direction: make the fused router bit-identical to the generic chain (then the selection is
+  harmless), or drop the address-overlap guard for this fusion.  Evidence: `WORKLOG.md` 2026-09-13
+  (later), `patches/README.md` 2026-09-13 block-08 section.
 
 ## Waiting on others (not actionable in this repo)
 
@@ -143,6 +146,20 @@ the device-query arm gate replacing the mirrored type list — so **Active is no
   `archive/work/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
+
+- **qwen4exp `iq4_nl` prefill delta (TODO item 3, closed 2026-09-13, block-08 amendment (sixth)).**  The
+  QSA indexer key cache tracks `type_k`, so an `iq4_nl` cache sent the 128-wide indexer `get_rows` to
+  the CPU (`ne[0] % QK_K != 0`; the CUDA `GET_ROWS` predicate only wired the sub-block types to the
+  `QK_K` super-block kernel), turning one node per indexer-bearing layer into a host round trip —
+  **26 graph splits** per qwen4exp prefill graph, GPU busy/span 0.62 vs `q4_0`'s 0.96.  `getrows.cu`
+  now has the `iq4_nl` sub-`QK_K` path and the predicate accepts `ne00 % QK4_NL == 0`; the gather is
+  **bit-exact vs the CPU** at every width.  qwen4exp `iq4_nl` prefill pp8192 1815-1951 -> **2385-2422
+  t/s** (= f16/`q4_0`), pp32768 **+36 %**, splits 142 -> 22, `GET_ROWS` 215/215 -> **219/219**.  The
+  absolute `iq4_nl` text moved (`c0d44c479ee1` -> `14a1a3f257f4`) because the layout change flips the
+  address-dependent MoE-router fusion (new item 19); the `W = 1..8` / `plain == n_max 3 == n_max 7`
+  gates and the f16/`q4_0`/4B controls all hold.  Canonical tip `ab2fabb44`, tree
+  `e279b222e8e98a7574814929d4b6d97edae32a48`; `WORKLOG.md` 2026-09-13 (later), `patches/README.md`
+  (2026-09-13 block-08 section).
 
 - **Block 15 promoted to the delivery (TODO item 1, closed 2026-09-12).**  The attention-memory campaign
   was promoted from `archive/work/block-15-campaign-wins/` to `patches/0015-rdna-boosts-block-15-campaign-memory-wins.patch`;
