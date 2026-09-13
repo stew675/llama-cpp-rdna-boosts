@@ -100,6 +100,11 @@ Stock is **not** width-pure under the same protocol (prose, `-n 64`, reasoning o
 `dc2b1cfd159f`.  The delivery's plain equals stock's MTP text, i.e. the delivery fixed the stock
 plain-decode divergence.
 
+The gate is also pure across **all eight native KV-cache types** under the corrected protocol (delivery,
+prose, `-n 64`): f16/bf16/q8_0/q4_1 `dc2b1cfd159f`, q4_0 `9445bec67217`, q5_0/q5_1 `33ae8d598e7e`,
+iq4_nl `d20b650cea3f` (plain == n3 == n7 within each type).  The 27B **Q8_0** weights give
+`plain == n3 == n7 == d20b650cea3f` (f16 KV).
+
 ## Reproducing
 
 ```sh
