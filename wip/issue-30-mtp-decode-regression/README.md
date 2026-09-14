@@ -260,27 +260,22 @@ staging at large `n_kv`, and the QSA/GDN prefill path (qwen35 is hybrid).
 
 **Status:** not started.  May be the same root cause as B.
 
-### E. Adopt the #28867 head-256 WMMA threshold (F-wmma)
+### E. Adopt the #28867 head-256 WMMA threshold (F-wmma) — **investigated; no delivery regression**
 
-**Question.**  Can the delivery generalise its `Q->ne[1] > 8` guard so that the head-256 WMMA path is
-used for *prefill* and for genuinely wide batches, but never for a narrow verify, recovering the
-verify-width decode while keeping the prefill gain and the purity band?
+**Answer.**  The delivery does not have the reported regression.  Its `Q->ne[1] > 8` guard already puts
+the whole purity band (`W <= 8`, the reporter's `n_max 3` repro range) on TILE — upstream master lacks
+that guard, which is why upstream sees it.  For the uncovered range (`n_q = 9..N`) the delivery's tuned
+block-04 head-256 WMMA configs are at **parity** with TILE: recall `n_max 8` (W=9) 115.10 vs 115.72 t/s
+and `n_max 15` (W=16) 147.19 vs 147.80 t/s (TILE +0.4-0.5 %, within noise), with **bit-identical
+acceptance**; `llama-batched-bench` npl 1/8/9/16/32 is neutral.  Full evidence: `MEASUREMENTS.md` §E.
 
-**Hypothesis.**  `Q->ne[1] * gqa_ratio_eff > (ne[0] <= 128 ? 8 : 64)` (the reporter's rule, matching the
-MFMA branch) is the principled threshold, and it subsumes our `n_q > 8` guard for head 256 without
-changing the purity band.  The delivery's `Q->ne[1] > 8` can then be relaxed to the head-256 rule (or
-kept as a belt-and-braces bound) and the two configs A/B'd.
+**Recommendation.**  No delivery change to fix a regression — there is none.  Adopting the MFMA-style
+threshold (`n_q*gqa_eff > 64` for head>128) is a **~0.4 % neutral** selection change and is *not* a
+purity change (the band is bounded at `W=8` by the matmul family switch, independent of FA).  Include it
+only if we want explicit upstream/MFMA alignment; otherwise leave the
+`GGML_CUDA_FA_WMMA_MAX_HEAD` control in place for future A/B.
 
-**Method.**  1-GPU A/B of the dispatch rule at `--spec-draft-n-max 3` and `7` (the reporter's harness
-and ours): decode t/s, acceptance, and the `W=1..8` logits probe + `plain == draft-mtp` text.  Also
-`test-backend-ops -o FLASH_ATTN_EXT` and pp4096/pp150k to prove the prefill is free.
-
-**Gate.**  The purity band must be **unchanged** (same hash for `W=1..8`), prefill not regressed, and the
-verify-width decode improves.  If raising the threshold moves a `W<=8` hash, it is rejected — that is the
-whole reason block 04 kept the guard.
-
-**Status:** not started.  Note the reporter's own caveat: he could not pin the MTP verify `Q->ne[1]`
-and used 64 by analogy with MFMA; confirm the batch geometry rather than trusting 64.
+**Status: DONE** (no action).
 
 ### F. (Umbrella) Keep the configuration matrix honest
 
@@ -314,7 +309,7 @@ with hashes (`prompts/README.md`), never edited in place.
 | B | quantized-KV decode/prefill (F-q8) | **fix prototyped + validated** | V4 activation policy + q4_0 native arm; q8_0 d65k +23 %, q4_0 +16 %, bit-identical, band-pure |
 | C | adaptive MTP buffer footprint (F-buf) | **root-caused** | RS = `n_seq x (1+n_max)` f32 GDN-state planes = 7781 MiB at ceiling 12; `--parallel 1` loads (1945 MiB); structural reduction not yet implemented |
 | D | deep-prefill at depth (F-pp) | not started | — |
-| E | #28867 head-256 WMMA threshold (F-wmma) | not started | — |
+| E | #28867 head-256 WMMA threshold (F-wmma) | **DONE — no action** | delivery has no regression: `n_q>8` guard + tuned head-256 configs; W=9/W=16 verify at parity with TILE, acceptance bit-identical |
 | F | protocol discipline | continuous | — |
 
 `MEASUREMENTS.md` holds the raw runs (commands, logs, tables); this file holds the conclusions and the

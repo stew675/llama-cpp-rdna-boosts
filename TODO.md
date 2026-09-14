@@ -55,7 +55,7 @@ d65k 18.92 -> **23.29**, q4_0 19.72 -> **22.82**; stock 22.43 / 21.03; bit-ident
 MTP-neutral).  The adaptive-MTP high-context load failure is root-caused to the recurrent-snapshot set
 (`n_seq_max x (1 + n_max)` f32 GDN planes = **7781 MiB** at ceiling 12; `--parallel 1` loads at 1945
 MiB).  The experiment is **validated but not yet promoted**; Action E (#28867 head-256 WMMA threshold)
-is in progress.  See **items 2 and 20**.
+is validated but **not yet promoted**; Action E is resolved (no delivery regression).  See **items 2 and 20**.
 
 ## Active (kept compact: only what this repo will work on next)
 
@@ -98,12 +98,13 @@ Dossier: `wip/issue-30-mtp-decode-regression/` (`README.md` action register, `ME
   `wip/issue-30-mtp-decode-regression/patches/2026-09-14-v4-default-plus-q4_0-native.diff`, validated
   bit-identical + band-pure + MTP-neutral on gfx1201.  Promote as a **block-15 amendment**, together
   with Action E, in one integration pass.
-- **Action E — #28867 head-256 WMMA threshold (in progress 2026-09-14).**  Upstream #28102 admitted
-  head 256 to the RDNA4 WMMA dispatch with `Q->ne[1]*gqa_ratio_eff > 16`; the reporter's #28867 shows a
-  narrow MTP verify (`n_q = 9`) on this model then takes WMMA and loses ~20 % of decode, and that the
-  MFMA branch already uses `> 64`.  Our delivery also has the `Q->ne[1] > 8` purity guard, so the two
-  overlap for `n_q <= 8`; the question is `n_q = 9..N` (depth 8..15 verify + batched serving).  Must not
-  move any `W <= 8` hash and must be prefill-neutral.
+- **Action E — #28867 head-256 WMMA threshold (resolved 2026-09-14: no delivery regression).**  The
+  reporter's ~20 % is upstream-master-specific: our `Q->ne[1] > 8` guard already puts the whole purity
+  band (`W <= 8`, his repro range) on TILE, and for `n_q = 9..N` the tuned block-04 head-256 WMMA configs
+  are at parity with TILE (recall `n_max 8` 115.10 vs 115.72 t/s, `n_max 15` 147.19 vs 147.80 t/s, TILE
+  +0.4-0.5 % within noise, acceptance bit-identical; batched npl 1/8/9/16/32 neutral).  Adopting the
+  MFMA threshold 64 is a ~0.4 % neutral selection change, not a purity change; recommended only for
+  upstream alignment.  Evidence: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §E.
 - **Action C — adaptive-MTP recurrent-snapshot buffer at high context (root-caused 2026-09-14).**
   `llama_memory_recurrent` allocates `n_seq_max x (1 + n_rs_seq)` f32 GDN-state planes with
   `n_rs_seq = draft.n_max`, so adaptive ceiling 12 = **7781 MiB** at the server default `n_parallel 4`

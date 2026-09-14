@@ -241,12 +241,34 @@ copy is `tools/width-matrix.cpp` (a full `kv_type_from_name`), built with `~/wip
 
 ---
 
-## §E — #28867 head-256 WMMA threshold (planned)
+## §E — #28867 head-256 WMMA threshold — **investigated; the delivery does not have the regression**
 
-Note from reading the tree: the delivery already has a `Q->ne[1] > 8` guard on the WMMA branch
-(`ggml/src/ggml-cuda/fattn.cu`), added for the `n_max <= 7` purity band.  The reporter's rule
-(`Q->ne[1]*gqa_ratio_eff > (ne[0] <= 128 ? 8 : 64)`) instead keeps narrow head-256 batches off WMMA by
-raising the gqa-eff threshold.  The two overlap for `n_q <= 8`; they differ for `n_q = 9..N`, i.e. the
-`n_max 8..15` verify widths and batched serving.  Action E is therefore: does the delivery's W=9 verify
-(and W=9..32 batched) lose to TILE the way master does, and can the threshold be adopted without moving
-any `W <= 8` hash?  Not yet measured.
+The delivery already carries the effect of #28867 for the purity band via the **`Q->ne[1] > 8` guard** on
+the WMMA branch (`ggml/src/ggml-cuda/fattn.cu`): a W<=8 verify is TILE regardless of the gqa-eff
+threshold, which is exactly the range the reporter's master build (`16378d93f`/#28102, no guard) put on
+WMMA.  The only uncovered range is `n_q = 9..N` (the `n_max 8..15` verify widths and batched serving), so
+that is what was measured.
+
+**Method.**  1 GPU, f16 K/V, recall prompt, greedy, `-n 400/500`, `draft-mtp`; the control forces the
+whole head-256 range off WMMA with `GGML_CUDA_FA_WMMA_MAX_HEAD=128` (block-04 env).  Hashes confirm the
+control is real: at `W=9` the default is WMMA and the control is TILE (f16 `609bc99910f8e616` vs
+`8d7bb8d845f1154d`; q8_0 `925594dd6ecd7fd1` vs `ed19bc62010c2df8`).
+
+| workload | WMMA (default) | TILE (forced) | acc / mean len |
+|---|---|---|---|
+| `n_max 8` (W=9), recall | 115.10 t/s | 115.72 t/s (+0.5 %) | 0.96712 / 8.67 — identical |
+| `n_max 15` (W=16), recall | 147.19 t/s | 147.80 t/s (+0.4 %) | 0.93186 / 14.68 — identical |
+| `llama-batched-bench` npl 1/8/9/16/32, f16 | — | — | neutral (<=0.6 %, either direction) |
+
+The acceptance is bit-identical between the arms at both depths, so this is not a draft-quality
+artifact: the two kernels are simply at parity for the head-256 verify on the delivery's tuned block-04
+configs.  The reporter's ~20 % TILE advantage is a property of upstream master's head-256 WMMA configs
+(the delivery deliberately kept its own in the 2026-09-13 re-base), not of the delivery.  Plain batched
+decode at the 8->9 boundary is likewise neutral.
+
+**Conclusion.**  No delivery change is needed to fix a regression — there is none.  Adopting the MFMA
+style threshold (`n_q*gqa_eff > 64` for head>128) would be a **~0.4 % neutral** selection change (it
+keeps `n_q=9..32` on TILE) and is *not* a purity change (the band is already bounded at `W=8` by the
+matmul family switch at `MMQC/MMVF_MAX_BATCH_SIZE`, independent of FA).  Recommendation: leave the
+delivery as-is; optionally match the MFMA threshold only if we want upstream alignment.
+
