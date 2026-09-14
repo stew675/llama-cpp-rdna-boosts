@@ -159,4 +159,5 @@ measurements agree it is a small end-to-end term once the stack is fast.
 This also sharpens the port decision: if the goal is to close *your* observed gap, the tiled GDN is
 the wrong lever.  The weight-set hinge is `mmb`, but the larger residual (per the archived handover)
 is the QSA v3 sparse-attention kernel plus the HC fusions — a separate campaign from TODO item 1,
-and worth its own scoping note.
+and worth its own scoping note.  That note now exists: [`../prefill-arrangements/README.md`](../prefill-arrangements/README.md)
+("arrangement" analogues, led by the packed-block WMMA QSA).
