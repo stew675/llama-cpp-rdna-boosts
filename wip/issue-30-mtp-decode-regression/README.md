@@ -249,19 +249,30 @@ loads at the default `n_slots = 4` and generates (34.76 t/s at 196k, ceiling 12)
 reproduces the failure.  The structural RS reduction remains open for extra headroom on smaller cards
 (lever 1 confirmed, levers 2-3 not implemented).
 
-### D. Deep-prefill at depth on quantized KV (F-pp)
+### D. Deep-prefill at depth (F-pp) — **root-caused; fix prototyped**
 
-**Question.**  Why does the delivery's prefill advantage invert at 150k on q8_0, and does it reproduce
-against true stock A?
+**Answer.**  Not q8_0 at all: the regression is KV-type-independent (delivery f16 609.5 vs stock 686.9 at
+pp150k on 1 GPU) and lives in the common FA path.  The per-token fit shows the delivery's `a` is smaller
+(low-depth wins) but the depth slope `b` is ~51 % steeper, i.e. a per-(query x KV)-cell attention cost.
+Two FA differences from stock cause it: **(1)** the delivery's head-256 `ncols=64` WMMA config is a
+Strix-Halo-tuned half-tile row used for *all* WMMA calls (prefill + wide verify), worth ~1.5x per cell on
+RDNA4/RDNA3_0; **(2)** the delivery omits stock's AMD `switch_ncols2` block, so for gqa 6 it picks
+`ncols2=8` (2 of 8 lanes wasted) where stock picks `ncols2=2`.
 
-**Method.**  `llama-bench` (or the server nonce-prefill harness) at 27k/64k/150k for f16, bf16, q8_0,
-q4_0 on A and B; then profile the 150k q8_0 case (rocprof / the block-15 staging accounting) if it
-reproduces.  Prime suspects: the f16 staging pass at depth (V4's domain), the tile kernel's quantized
-staging at large `n_kv`, and the QSA/GDN prefill path (qwen35 is hybrid).
+**Fix (experiment, `patches/2026-09-14-prefill-rdna-config-and-ncols2.diff`).**  (1) make the RDNA config
+`cc`-aware — RDNA3_5 keeps the halo row, RDNA4/RDNA3_0 take upstream's config; (2) adopt the AMD
+`switch_ncols2` block.  Result: 1 GPU f16 pp150k 609.5 -> **703.7 (+2.4 % over stock)**, bf16 591.5 ->
+**675.8 (−1.6 %)**; 3-GPU `-sm tensor` f16 **1152.3 (+3.6 % over stock)**; the 4B q4_0 `W=1..8` band stays
+**pure**.  The remaining tension is compute (single card -> ncols2=2) vs per-GPU bandwidth (`-sm tensor`
+-> ncols2=8): both choices beat stock; an ideal split-aware `ncols2` is a follow-up.  Details:
+`MEASUREMENTS.md` §D.
 
-**Gate.**  Same as B.
+**Testing rule (the finding that mattered).**  `-sm tensor` **masks single-card regressions**: the halo
+config was faster in tensor-only testing for exactly that reason.  
+Screen a candidate with the `t = a + b*n` slope fit from **pp8192/16384/32768/49152**, and always measure
+**1 GPU as well as `-sm tensor`**.
 
-**Status:** not started.  May be the same root cause as B.
+**Status: DONE (fix prototyped + validated; promotion pending).**
 
 ### E. Adopt the #28867 head-256 WMMA threshold (F-wmma) — **investigated; no delivery regression**
 
@@ -311,7 +322,7 @@ with hashes (`prompts/README.md`), never edited in place.
 | A | KV-type × depth scaling (f16/bf16 reference) | **DONE** | BF16 slopes match stock f16 and are ahead at depth; q8_0/q4_0 fall off faster than stock (`MEASUREMENTS.md` §A) |
 | B | quantized-KV decode/prefill (F-q8) | **fix prototyped + validated** | V4 activation policy + q4_0 native arm; q8_0 d65k +23 %, q4_0 +16 %, bit-identical, band-pure |
 | C | adaptive MTP buffer footprint (F-buf) | **load failure FIXED by V4; RS reduction open** | root cause: RS = `n_seq x (1+n_max)` f32 GDN planes + the 744 MiB F16 scratch; V4 removes the scratch -> loads at `n_slots=4`; `--parallel 1`/structural reduction for more headroom |
-| D | deep-prefill at depth (F-pp) | not started | — |
+| D | deep-prefill at depth (F-pp) | **root-caused; fix prototyped** | not q8_0-specific: head-256 `ncols=64` WMMA config (halo row) + missing AMD `switch_ncols2`; fixed -> single f16 +2.4 %, bf16 −1.6 %, tensor +3.6 % vs stock, purity held |
 | E | #28867 head-256 WMMA threshold (F-wmma) | **DONE — no action** | delivery has no regression: `n_q>8` guard + tuned head-256 configs; W=9/W=16 verify at parity with TILE, acceptance bit-identical |
 | F | protocol discipline | continuous | — |
 

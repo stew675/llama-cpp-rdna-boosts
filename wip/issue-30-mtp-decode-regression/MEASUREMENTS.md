@@ -253,6 +253,76 @@ copy is `tools/width-matrix.cpp` (a full `kv_type_from_name`), built with `~/wip
 
 ---
 
+---
+
+## §D — deep-prefill at depth (F-pp) — **root-caused: two FA-config issues, fixed in experiment**
+
+**The regression is real and KV-type-independent** (so it is the common prefill path, not q8_0/staging/V4):
+1 GPU, 27B UD-Q4_K_XL, `pp150000`, `llama-bench -p 150000 -n 0 -r 1`:
+
+| KV | delivery (pre-fix) | stock `790cf51aa` |
+|---|---|---|
+| f16 | 609.5 | 686.9 |
+| bf16 | 591.5 | — |
+| q8_0 | 592.6 | 669.5 |
+
+**Curve and shape.**  delivery f16 pp4k/16k/32k/64k = 1267.2/1162.9/1049.3/876.1 vs stock
+1102.9/1047.0/982.6/877.2.  Fitting `t = a + b*n` gives delivery `a` smaller (the low-depth wins) but `b`
+**~51 % larger** (5.73e-9 vs 3.79e-9) — a per-(query x KV)-cell attention cost, crossing over at ~64K.
+
+### Cause 1 — the head-256 `ncols=64` WMMA config (the big one)
+
+With `gqa_ratio = 6`, `use_gqa_opt && gqa_ratio > 4` -> `ncols2 = 8`; for `n_q > 8` the launcher picks
+`ncols1 = 64/ncols2 = 8`, so **every** WMMA call (prefill and wide verify) uses the `ncols = 64` entry in
+`ggml_cuda_fattn_mma_get_config_rdna`.  The delivery's entry was a **Strix Halo (gfx1151) "halo row"**
+tuning (`nthreads 256, occupancy 1, nbatch_fa 32, nbatch_V2 64, Q_in_reg=false`) -- half the KV/V tile
+and Q out of registers -- where stock (#28102) uses `(256, 2, 64, 128, 128, 64, 1, true)`.  That half-tile
+shape is ~1.5x per attention cell on RDNA4/RDNA3_0, which is exactly the steeper slope.
+
+**Fix (experiment):** make the RDNA config `cc`-aware -- `is_rdna3_5` keeps the halo row, RDNA4/RDNA3_0
+take the upstream config.  (`RDNA3_5`/`RDNA4` are per-gfx in `vendors/hip.h`, so the host dispatch uses
+`GGML_CUDA_CC_IS_RDNA3_5(cc)` and the device constexpr uses the `RDNA3_5` macro; the two agree.)
+
+1 GPU f16: pp65536 876.1 -> **916.6** (stock 877.2), pp150000 609.5 -> **664.8** (stock 686.9).  bf16
+pp150000 591.5 -> **644.1**.  The 4B q4_0 `W = 1..8` band stays **pure** (the config fix was kept separate
+from the `switch_ncols2` block that the 2026-09-13 re-base blamed).
+
+### Cause 2 — the AMD `switch_ncols2` preference (the last per-cell overhead)
+
+Stock #28102 also added an AMD `switch_ncols2` block ("on RDNA it is preferable to minimize wasted
+compute vs. duplicate I/O for the mask"): for `gqa_ratio = 6` it picks `ncols2 = 2` (6/2 exact; the
+kernel width matches the head count) where the delivery's generic `gqa_ratio > 4` rule picks
+`ncols2 = 8` (2 of 8 GQA lanes wasted).  The 2026-09-13 re-base omitted that block to hold the 4B q4_0
+`W=1..8` band.
+
+Adopting it (experiment) **on top of the config fix**:
+
+| build | 1 GPU pp150000 | 3-GPU `-sm tensor` pp150000 | 4B q4_0 W=1..8 |
+|---|---|---|---|
+| generic ncols2=8 (config fix only) | 664.8 | **1219.9** | pure |
+| **AMD block ncols2=2** | **703.7** | 1152.3 | pure |
+| stock | 686.9 | 1111.8 | — |
+
+Single-card f16 **703.7 (+2.4 % over stock)**, bf16 **675.8 (-1.6 %)**; tensor f16 **1152.3 (+3.6 %)**.
+The 4B q4_0 band is pure with the AMD block (so the re-base's impurity must have needed the config +
+block combination this tree no longer has).
+
+**The tension is compute-vs-I/O, not a bug:** single card is compute-bound (ncols2=2, no wasted lanes),
+`-sm tensor` is per-GPU bandwidth-bound (ncols2=8, less K/V re-read).  Both choices beat stock in both
+modes; the ideal is split-aware ncols2 (a follow-up -- the chooser would need a split signal).
+
+### Slope-testing without 150K runs
+
+The per-token fit `t = a + b*n` from **pp8192/16384/32768/49152** reproduces the `b` ranking (the
+150K point only amplifies it), so a candidate can be screened at 32-64K.  `-sm tensor` (3 GPUs) runs
+150K in ~1/2 the time (1219.9 vs 664.8 t/s) but **masks single-card regressions** -- the halo config was
+faster in tensor-only testing for exactly that reason.  Rule: any prefill change must be measured on
+**1 GPU as well as `-sm tensor`**.
+
+Experiment diff: `patches/2026-09-14-prefill-rdna-config-and-ncols2.diff`.
+
+---
+
 ## §E — #28867 head-256 WMMA threshold — **investigated; the delivery does not have the regression**
 
 The delivery already carries the effect of #28867 for the purity band via the **`Q->ne[1] > 8` guard** on

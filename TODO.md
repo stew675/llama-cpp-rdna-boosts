@@ -109,8 +109,7 @@ Dossier: `wip/issue-30-mtp-decode-regression/` (`README.md` action register, `ME
   +0.4-0.5 % within noise, acceptance bit-identical; batched npl 1/8/9/16/32 neutral).  Adopting the
   MFMA threshold 64 is a ~0.4 % neutral selection change, not a purity change; recommended only for
   upstream alignment.  Evidence: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §E.
-- **Action C — adaptive-MTP recurrent-snapshot buffer at high context (load failure FIXED by V4, 2026-09-14).**
-  The reporter's `--spec-draft-n-max 12 -c 196608 q8_0` load failure was root-caused to the recurrent
+- **Action C — adaptive-MTP recurrent-snapshot buffer at high context (load failure FIXED by V4, 2026-09-14).**  The reporter's `--spec-draft-n-max 12 -c 196608 q8_0` load failure was root-caused to the recurrent
   snapshot set (`n_seq_max x (1 + n_rs_seq)` f32 GDN planes = 7781 MiB at ceiling 12) leaving the draft
   260 MiB short — and **the missing margin is the ~744 MiB F16 staging scratch the V4 policy now
   removes**, so the config loads at the default `n_slots=4` and generates (34.76 t/s, acceptance 0.3404);
@@ -120,6 +119,17 @@ Dossier: `wip/issue-30-mtp-decode-regression/` (`README.md` action register, `ME
   smaller cards.  **Deeper follow-up (budgets, the L1-L5 levers, and the f32 -> bf16 snapshot opt-in to
   measure):** `wip/issue-30-mtp-decode-regression/RECURRENT-SNAPSHOT-BUDGET.md` — the maintainer's
   2026-09-14 request is to measure L5's impact on MTP acceptance before offering it.
+
+- **Action D — deep-prefill regression at depth (root-caused + fix prototyped 2026-09-14).**  Not
+  q8_0-specific (delivery f16 609.5 vs stock 686.9 at pp150k, 1 GPU): the delivery's head-256 `ncols=64`
+  WMMA config was a Strix-Halo half-tile row used for all WMMA calls, and the delivery omitted stock's
+  AMD `switch_ncols2` (ncols2=8 vs 2 for gqa 6).  Prototype fixes both: 1 GPU f16 **703.7 (+2.4 %)**,
+  bf16 675.8 (−1.6 %), 3-GPU tensor **1152.3 (+3.6 %)** vs stock, 4B q4_0 `W=1..8` pure.  Remaining:
+  split-aware `ncols2` (single card -> 2, `-sm tensor` -> 8; both already beat stock) and the V3
+  (~2.4 % single-card) / bf16 (~1.6 %) residuals.  Diff:
+  `wip/issue-30-mtp-decode-regression/patches/2026-09-14-prefill-rdna-config-and-ncols2.diff`;
+  analysis `MEASUREMENTS.md` §D.  **Testing lesson: `-sm tensor` masked the single-card regression —
+  screen with the `t = a + b*n` slope fit at pp8192-49152, and always measure 1 GPU too.**
 
 ## Waiting on others (not actionable in this repo)
 
