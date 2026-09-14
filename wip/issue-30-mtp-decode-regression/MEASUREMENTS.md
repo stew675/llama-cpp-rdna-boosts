@@ -474,3 +474,58 @@ the 4B; separate follow-up.
 
 Evidence: this section, `patches/2026-09-14-todo21-prefill-arena-staging.diff`, and the raw runs under
 `~/wip-issue30/results/2026-09-14-todo21-*.txt`.
+
+---
+
+## §G — the reporter's r3 q4_0 NaN regression — **FIXED (mixed-K/V kernel contract) + a second q4_0 scratch bug**
+
+Reported 2026-09-14 (issue #30 comment): r3 `test-backend-ops -o FLASH_ATTN_EXT` = **5947/5951**, four
+`NaN at index 0` failures, every one with q4_0 on a side of the KV cache; v16 (before the q4_0 arm) was
+5951/5951.  Reproduced exactly on gfx1201.
+
+### Cause 1 (the NaN) — the tile kernel's single K/V type vs the launcher's per-tensor decision
+
+`ggml_cuda_flash_attn_ext_tile_case_type` instantiates the tile kernel with **one** `type_KV` covering
+**both** K and V (it falls back to `F16` unless *both* operands qualify for the same native arm), and the
+kernel builds its `fattn_kv_native_t` from that compile-time type — it **ignores** the launcher's
+`kv_native_K/V` arguments.  `launch_fattn`, however, derived `use_native_K/V` **per tensor** from
+`ggml_cuda_fattn_kv_native_type()`.  So for a mixed pair (K=q4_0, V=f16, …) the kernel was the `F16`
+instantiation while the launcher *skipped K's staging* — the kernel then read raw q4_0 bytes as F16.
+llama.cpp rejects mixed K/V caches, but `test-backend-ops` builds the op directly, which is how it was
+found.
+
+Fix: `launch_fattn` takes the kernel's native type (`kv_native_kernel`, default
+`FATTN_KV_NATIVE_PER_OPERAND` for the MMA).  The tile caller passes its `type_KV`-derived type; the vec
+caller passes `FATTN_KV_NATIVE_NONE`.  Result: **5951/5951**.
+
+### Cause 2 — `get_alloc_size` never learned about the q4_0 arm
+
+`ggml_cuda_flash_attn_ext_get_alloc_size`'s TILE case only recognised `use_q8_native`, so for a q4_0 pair
+it computed `need_f16_K/V = true` and **reserved the whole F16 staging scratch the launcher no longer
+used**: `-c 196608` q4_0 reserve was **849.04 MiB** — i.e. the V4 memory win was never actually delivered
+for q4_0.  Now the TILE case mirrors `ggml_cuda_flash_attn_ext_tile_case_type` exactly (bf16 → q8_0 →
+q4_0 → f16) and q4_0 reserves **123.04 MiB** like q8_0.  (q4_0 prefill 694.5 vs the old native 653-ish,
+decode 28.62 / 25.34 / 22.73 unchanged, staged == native text.)
+
+### Side finding — the `W=1..8` purity claim is *prompt*-dependent for heavily-quantized caches
+
+Chasing the reporter's q4_0 hint turned up a residual, **pre-existing** (independent of this change and of
+the native/staging path — it reproduces with `GGML_CUDA_FA_KV_NATIVE=0` and `STAGE_MAX_MB=1`) width
+difference between `W=1` and `W>=2` on the 4B.  It is **data-dependent**, not q4_0-specific:
+
+| type | P=192 | P=200 | P=208 | P=224 | P=256 |
+|---|---|---|---|---|---|
+| f16 | pure | pure | pure | pure | pure |
+| q8_0 | pure | pure | pure | pure | pure |
+| q4_1 | pure | **IMPURE** | pure | pure | pure |
+| q4_0 | pure | pure | pure | **IMPURE** | **IMPURE** |
+
+and with 4 different prompts at (q4_0, P=256) only `prose-rdna-boosts.txt` flips.  The magnitude is a real
+0.209 logit difference (argmax unchanged in the observed case).  So it is a **near-tie flip**: the f16 and
+q8_0 caches are precise enough that the probe never peaks near a tie, while q4_0/q4_1 quantization noise
+does.  Consequence for the docs: `GREEDY-PURITY.md`'s "`W=1..8` is one hash for f16/bf16/q4_1/q5_0/q5_1/
+iq4_nl (and q8_0/q4_0 after the F1 fix)" is a **measured-on-the-probe** statement, not a guarantee — the
+tile kernel's `n_q=1` vs `n_q>=2` arithmetic still differs by a hair.  Separately worth chasing (it is NOT
+the reporter's NaN and NOT a regression).
+
+Evidence: `~/wip-issue30/results/2026-09-14-q4_0-nan.txt`.
