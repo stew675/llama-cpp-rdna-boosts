@@ -94,7 +94,19 @@ scales with context (768 MiB @ 196k).
    currently verifying; snapshot precision; recompute-on-rollback (space-time trade).  All purity-
    sensitive, all need the §C gate.
 
-**Status:** reproduced + root-caused; lever 1 confirmed; levers 2-3 not yet implemented.
+**RESOLVED 2026-09-14 by the Action B V4 policy (same experiment build).**  The old build allocated a
+**~744 MiB/GPU F16 staging scratch** for the q8_0 cache; the 260 MiB the draft context needed was the
+last straw.  With the new default (native q8_0/q4_0 staging, no scratch) the exact failing config now
+loads at the **default `n_slots = 4`** and generates (server health in 4 s; adaptive ceiling 12 at
+`-c 196608` q8_0 -> 34.76 t/s, acceptance 0.3404).  Proof it is V4 and not something else: forcing the
+old path with `GGML_CUDA_FA_KV_NATIVE=0` reproduces the failure byte-for-byte
+(`allocating 260.02 MiB ... cudaMalloc failed: out of memory`, `failed to create MTP context`).  So the
+MTP-at-depth load failure and the quantized-KV decode depth regression are **one root cause**, and the
+V4 activation policy fixes both.
+
+**Status:** load failure **FIXED by Action B's V4 policy**; the underlying RS-snapshot footprint (the
+reason the margin was thin) remains a structural follow-up — lever 1 (`--parallel 1`) confirmed,
+levers 2-3 not yet implemented.
 
 ---
 

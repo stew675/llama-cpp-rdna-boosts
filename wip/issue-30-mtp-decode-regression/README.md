@@ -243,8 +243,11 @@ memory is *less*, not merely moved.  If the lever touches the rollback path, the
 `test-recurrent-state-depth` sweep (`n_rs_seq` 1..15, every rollback) must stay green and the
 `W=1..8` width probe must not move.
 
-**Status:** reproduced + root-caused (`MEASUREMENTS.md` §C); `--parallel 1` control and lever 3 not yet
-measured.
+**Status:** the load failure is **FIXED by Action B's V4 policy** (2026-09-14): the ~744 MiB/GPU F16
+staging scratch the old build allocated was exactly the missing margin, so the reporter's config now
+loads at the default `n_slots = 4` and generates (34.76 t/s at 196k, ceiling 12); `KV_NATIVE=0`
+reproduces the failure.  The structural RS reduction remains open for extra headroom on smaller cards
+(lever 1 confirmed, levers 2-3 not implemented).
 
 ### D. Deep-prefill at depth on quantized KV (F-pp)
 
@@ -307,7 +310,7 @@ with hashes (`prompts/README.md`), never edited in place.
 |---|---|---|---|
 | A | KV-type × depth scaling (f16/bf16 reference) | **DONE** | BF16 slopes match stock f16 and are ahead at depth; q8_0/q4_0 fall off faster than stock (`MEASUREMENTS.md` §A) |
 | B | quantized-KV decode/prefill (F-q8) | **fix prototyped + validated** | V4 activation policy + q4_0 native arm; q8_0 d65k +23 %, q4_0 +16 %, bit-identical, band-pure |
-| C | adaptive MTP buffer footprint (F-buf) | **root-caused** | RS = `n_seq x (1+n_max)` f32 GDN-state planes = 7781 MiB at ceiling 12; `--parallel 1` loads (1945 MiB); structural reduction not yet implemented |
+| C | adaptive MTP buffer footprint (F-buf) | **load failure FIXED by V4; RS reduction open** | root cause: RS = `n_seq x (1+n_max)` f32 GDN planes + the 744 MiB F16 scratch; V4 removes the scratch -> loads at `n_slots=4`; `--parallel 1`/structural reduction for more headroom |
 | D | deep-prefill at depth (F-pp) | not started | — |
 | E | #28867 head-256 WMMA threshold (F-wmma) | **DONE — no action** | delivery has no regression: `n_q>8` guard + tuned head-256 configs; W=9/W=16 verify at parity with TILE, acceptance bit-identical |
 | F | protocol discipline | continuous | — |

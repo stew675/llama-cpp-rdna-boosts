@@ -53,9 +53,11 @@ quantized-KV depth fall-off is root-caused to the tile kernel's **whole-cache F1
 fixed by making `V4` native staging the default for sub-F16 quants plus a **new q4_0 native arm** (q8_0
 d65k 18.92 -> **23.29**, q4_0 19.72 -> **22.82**; stock 22.43 / 21.03; bit-identical, `W=1..8`-pure,
 MTP-neutral).  The adaptive-MTP high-context load failure is root-caused to the recurrent-snapshot set
-(`n_seq_max x (1 + n_max)` f32 GDN planes = **7781 MiB** at ceiling 12; `--parallel 1` loads at 1945
-MiB).  The experiment is **validated but not yet promoted**; Action E (#28867 head-256 WMMA threshold)
-is validated but **not yet promoted**; Action E is resolved (no delivery regression).  See **items 2 and 20**.
+(`n_seq_max x (1 + n_max)` f32 GDN planes = **7781 MiB** at ceiling 12) and **fixed by the same V4 policy**
+(the ~744 MiB F16 staging scratch it removes was the missing margin): `-c 196608` q8_0 ceiling 12 now
+loads at the default `n_slots=4` and generates, while `KV_NATIVE=0` reproduces the failure.  The
+experiment is **validated but not yet promoted**; Action E is resolved (no delivery regression).  See
+**items 2 and 20**.
 
 ## Active (kept compact: only what this repo will work on next)
 
@@ -105,12 +107,15 @@ Dossier: `wip/issue-30-mtp-decode-regression/` (`README.md` action register, `ME
   +0.4-0.5 % within noise, acceptance bit-identical; batched npl 1/8/9/16/32 neutral).  Adopting the
   MFMA threshold 64 is a ~0.4 % neutral selection change, not a purity change; recommended only for
   upstream alignment.  Evidence: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §E.
-- **Action C — adaptive-MTP recurrent-snapshot buffer at high context (root-caused 2026-09-14).**
-  `llama_memory_recurrent` allocates `n_seq_max x (1 + n_rs_seq)` f32 GDN-state planes with
-  `n_rs_seq = draft.n_max`, so adaptive ceiling 12 = **7781 MiB** at the server default `n_parallel 4`
-  (598.5 MiB/plane); the draft context's last 260 MiB then OOMs at `-c 196608` q8_0.  `--parallel 1`
-  loads (1945 MiB).  Structural reduction (lazy/shared planes, precision, recompute-on-rollback) is the
-  open R&D item; a memory-aware effective-ceiling fallback is the low-risk stopgap.
+- **Action C — adaptive-MTP recurrent-snapshot buffer at high context (load failure FIXED by V4, 2026-09-14).**
+  The reporter's `--spec-draft-n-max 12 -c 196608 q8_0` load failure was root-caused to the recurrent
+  snapshot set (`n_seq_max x (1 + n_rs_seq)` f32 GDN planes = 7781 MiB at ceiling 12) leaving the draft
+  260 MiB short — and **the missing margin is the ~744 MiB F16 staging scratch the V4 policy now
+  removes**, so the config loads at the default `n_slots=4` and generates (34.76 t/s, acceptance 0.3404);
+  `GGML_CUDA_FA_KV_NATIVE=0` reproduces the failure.  **No further fix is needed for the reported case.**
+  The structural RS reduction (lazy/shared planes, precision, recompute-on-rollback; `--parallel 1` and a
+  memory-aware effective-ceiling fallback as lower-risk levers) remains open only for extra headroom on
+  smaller cards.
 
 ## Waiting on others (not actionable in this repo)
 
