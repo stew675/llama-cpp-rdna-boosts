@@ -8,7 +8,7 @@ Read `PORT-PLAN.md` first; this file is the state + resume sheet.
 |---|---|---|
 | `~/llama-cpp-rdna-boosts` (delivery) | **`packed-qsa`** (off `main` `2ebf725`) | `wip/tiled-gdn/`, `wip/prefill-arrangements/`, `wip/packed-qsa/`; pushed to `origin/packed-qsa` |
 | `~/llama-cpp-rdna-boosts` (delivery) | `main` | untouched, at `2ebf725` (has `wip/tiled-gdn` + `wip/prefill-arrangements`) |
-| `~/llama.cpp` (fork) | **`packed-qsa`** (off `rdna-boosts`) | `2b84c7c62` = **P1** (block-aligned K/V pack + op sources, default-off) on top of `b214621da` = the tiled-GDN spike |
+| `~/llama.cpp` (fork) | **`packed-qsa`** (off `rdna-boosts`) | `1697ad10e` = **P2** (merge descriptor) on `2b84c7c62` = **P1** (pack + op sources) on `b214621da` = the tiled-GDN spike |
 | `~/llama.cpp` (fork) | `rdna-boosts` | clean, at the 16-block delivery tip |
 
 **Rule for this work:** everything goes on `packed-qsa` in both repos.  Never `main`/`master`, never
@@ -46,11 +46,14 @@ Implement `PORT-PLAN.md` P1 -> P5 on `packed-qsa`:
    the shape/type gate.~~ **DONE 2026-09-13** — fork `2b84c7c62`, record in `P1-NOTES.md`
    (22/22 `FLASH_ATTN_QSA`, gate-off == gate-on same-seed text `b72fb4d76af5`, pack built,
    `n_blocks=256`).  See its "What P2/P3 need to know" for the call-outs.
-2. **P2** (next) port `qsa3_rows_kernel` + `qsa3_merge_kernel` (union + membership descriptor);
-   unit-check the union/mask against the `idx` rows.
-3. **P3** port `qsa3_attn_kernel`; **re-derive the f16 WMMA fragments for gfx12** (8-half) vs the
-   reference's gfx11 (16-half) — `mma.cuh:1232` vs `:1239`.
-4. **P4** support predicate + dispatch + VEC fallback (RDNA4 gfx1201 and RDNA3.5 gfx1151).
+2. ~~**P2** port `qsa3_rows_kernel` + `qsa3_merge_kernel` (union + membership descriptor);
+   unit-check the union/mask against the `idx` rows.~~ **DONE 2026-09-13** — fork `1697ad10e`, record in
+   `P2-NOTES.md`.  Host cross-check + 202-case self-test both green; the self-test found and fixed a
+   duplicate-index block-split in the reference merge kernel.  See its "What P3 needs to know".
+3. **P3** (next) port `qsa3_attn_kernel`; **re-derive the f16 WMMA fragments for gfx12** (8-half) vs
+   the reference's gfx11 (16-half) — `mma.cuh:1232` vs `:1239`; fold the score visibility in.
+4. **P4** support predicate + dispatch + VEC fallback (RDNA4 gfx1201 and RDNA3.5 gfx1151); decide
+   the `-sm tensor` pack layout (currently asserts mirrored).
 5. **P5** validate: op correctness vs VEC, PPL, `W=1..8` (packed is prefill-only), MTP acceptance,
    perf A/B (`flash_attn_qsa` >= 2x; qwen4exp ~+117 t/s).
 
@@ -74,7 +77,7 @@ Implement `PORT-PLAN.md` P1 -> P5 on `packed-qsa`:
 ## Reading order
 
 1. `PORT-PLAN.md` (this tree) — the implementation plan.
-2. `P1-NOTES.md` (this tree) — the P1 record + the call-outs for P2/P3.
+2. `P1-NOTES.md` / `P2-NOTES.md` (this tree) — the P1/P2 records + the call-outs for P3.
 3. `../prefill-arrangements/README.md` — the arrangement landscape + the GDN-is-spent argument.
 4. `../tiled-gdn/05-where-the-speed-comes-from.md` — where the journey's ~2.2x really is.
 5. `../../archive/work/wip-archive/iq4nl-prefill/HANDOVER-2026-09-12-iq4nl-weight-gemm-port.md` —

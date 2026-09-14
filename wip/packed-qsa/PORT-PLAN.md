@@ -1,6 +1,7 @@
 # Packed-QSA port plan
 
-**Status:** P1 done (2026-09-13) — see `P1-NOTES.md`; fork `packed-qsa` `2b84c7c62`.  P2 is next.
+**Status:** P2 done (2026-09-13) — see `P1-NOTES.md` / `P2-NOTES.md`; fork `packed-qsa` `1697ad10e`.
+P3 is next.
 Branch: `packed-qsa` (delivery repo) / `packed-qsa` (fork).  Companion concept doc:
 `../prefill-arrangements/README.md`.  Archived measurement:
 `archive/work/wip-archive/iq4nl-prefill/HANDOVER-2026-09-12-iq4nl-weight-gemm-port.md`.
@@ -98,7 +99,7 @@ its own `W=1..8` matrix.
 | phase | work |
 |---|---|
 | P1 ✅ | graph pack ops + the two new op sources + the gate (no kernel change yet) — `P1-NOTES.md` |
-| P2 | port `qsa3_rows` + `qsa3_merge` (descriptor builder); unit-check the union/mask against the `idx` rows |
+| P2 ✅ | port `qsa3_rows` + `qsa3_merge` (descriptor builder); unit-check the union/mask against the `idx` rows — `P2-NOTES.md` |
 | P3 | port `qsa3_attn` adapted to our output/mask + **gfx12 f16 fragments**; land behind the gate |
 | P4 | support predicate + dispatch + fallback; RDNA4 (gfx1201) and RDNA3.5 (gfx1151) |
 | P5 | validate: correctness vs VEC, PPL, `W=1..8`, MTP acceptance, perf A/B |
