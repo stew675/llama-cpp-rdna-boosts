@@ -6,10 +6,12 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (2026-09-13, latest):** the delivery is the **16-patch set** against fork point `790cf51aa`
-(block 00 + blocks 01-15), canonical 16-block tip **`c45244c728dfcbcad86ae95aa97ae76f94ee9f7f`** (tree
-`a5683e1b008e3ad197ac2a9e3f99e5b0652df7d4`), `make-patches.sh` default tip =
-`c45244c728dfcbcad86ae95aa97ae76f94ee9f7f` (the 2026-09-13 master re-base + the block-08 (sixth)
+**Current state (2026-09-14, latest):** the delivery is the **16-patch set** against fork point `790cf51aa`
+(block 00 + blocks 01-15), canonical 16-block tip **`9ee71c356d8043227bc0e84481f783c7dacb6ede`** (tree
+`58317e0d64dd01a3622ba90b159ae12d1619c835`), `make-patches.sh` default tip =
+`9ee71c356d8043227bc0e84481f783c7dacb6ede` (the 2026-09-13 master re-base + the 2026-09-14 block-15
+amendment: the V4 native-staging policy for the sub-F16 KV quants + the q4_0 native arm, which also fixes
+the issue-#30 adaptive-MTP high-context load failure — see item 20) plus the earlier block-08 (sixth)
 `iq4_nl` `GET_ROWS` sub-`QK_K` amendment that closed item 3 + the block-08 (seventh) MoE-router
 bit-identity amendment that closed item 19 + the block-14 (ninth) pair-fusion `ncols_opt` fix that
 repaired the dense prefill regression the re-base introduced).  Block 15 (the attention-memory campaign) was **promoted to the delivery** as `patches/0015` (2026-09-12; TODO item 1 closed).  F1/F2/F3 (the
@@ -115,7 +117,9 @@ Dossier: `wip/issue-30-mtp-decode-regression/` (`README.md` action register, `ME
   `GGML_CUDA_FA_KV_NATIVE=0` reproduces the failure.  **No further fix is needed for the reported case.**
   The structural RS reduction (lazy/shared planes, precision, recompute-on-rollback; `--parallel 1` and a
   memory-aware effective-ceiling fallback as lower-risk levers) remains open only for extra headroom on
-  smaller cards.
+  smaller cards.  **Deeper follow-up (budgets, the L1-L5 levers, and the f32 -> bf16 snapshot opt-in to
+  measure):** `wip/issue-30-mtp-decode-regression/RECURRENT-SNAPSHOT-BUDGET.md` — the maintainer's
+  2026-09-14 request is to measure L5's impact on MTP acceptance before offering it.
 
 ## Waiting on others (not actionable in this repo)
 

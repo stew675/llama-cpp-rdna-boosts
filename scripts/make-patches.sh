@@ -117,7 +117,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
 BASELINE="${2:-790cf51aa}"
-TIP="${3:-c45244c728dfcbcad86ae95aa97ae76f94ee9f7f}"
+TIP="${3:-9ee71c356d8043227bc0e84481f783c7dacb6ede}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then

@@ -199,8 +199,8 @@ for per-block verification and `BASELINE.md` for provenance.
   **`790cf51aa`** (re-based 2026-09-13; previously `9113cc188`).
 - Patches `patches/0000-…0015-…`, applied with **strict 16/16 `git am`** by
   `scripts/apply-all.sh` (no 3-way fallback, whitespace-clean).
-- Canonical 16-block chain: tip `c45244c728dfcbcad86ae95aa97ae76f94ee9f7f`,
-  net tree `a5683e1b008e3ad197ac2a9e3f99e5b0652df7d4`.
+- Canonical 16-block chain: tip `9ee71c356d8043227bc0e84481f783c7dacb6ede`,
+  net tree `58317e0d64dd01a3622ba90b159ae12d1619c835`.
 - Greedy purity: plain decode == `draft-mtp` verify for
   `--spec-draft-n-max <= 7` across the supported KV types (4B and 27B all
   eight; qwen4exp MTP).  Depths 8..15 are allowed with a visible notice that
@@ -212,7 +212,21 @@ for per-block verification and `BASELINE.md` for provenance.
   config), [`MANIFESTS.md`](MANIFESTS.md) (apply order + verification contract)
   and [`BASELINE.md`](BASELINE.md) (fork point + drift policy).
 
-**Latest change (2026-09-13, latest) — issue #30: the `--spec-draft-n-max` clamp is raised from 7 to
+**Latest change (2026-09-14, latest) — issue #30 wide-configuration: block 15's V4 native staging is
+now the default for the sub-F16 KV quants, and q4_0 gained a native arm.**  The whole-cache F16 staging
+pass is a *decode-depth* cost, so a quantized KV cache fell off with depth vs stock (1 GPU, 27B
+UD-Q4_K_XL: q8_0 `tg64` d65536 18.92 = 66.1 % of d0 vs stock 22.43 = 80.1 %).  With
+`GGML_CUDA_FA_KV_NATIVE` = *unset = auto* (native q8_0/q4_0 **on**, native bf16 off; `=1` force all on,
+`=0` force the old staging path) plus the new q4_0 arm, q8_0 is **23.29** (+23 %) and q4_0 **22.82**
+(+16 %) at d65536, ~1.2-1.3 % prefill, bit-identical to the staging conversion and `W=1..8`-pure.  The
+same ~744 MiB scratch was the 260 MiB margin the adaptive-MTP draft context needed at `-c 196608` q8_0 /
+ceiling 12, so that config **now loads** at the default 4 slots.  The head-256 WMMA question (#28867) was
+investigated and needs no change (the `Q->ne[1] > 8` guard covers `W<=8`; `n_q=9..N` is at parity with
+TILE).  Canonical tip `9ee71c356`, tree `58317e0d64dd`; release `v16-790cf51aa-r2`.  Full record:
+[`WORKLOG.md`](WORKLOG.md) 2026-09-14, `GREEDY-PURITY.md` §34, and
+`wip/issue-30-mtp-decode-regression/`.
+
+**Previous change (2026-09-13) — issue #30: the `--spec-draft-n-max` clamp is raised from 7 to
 15, and the qwen4exp QSA decode arm is band-matched to the verify width.**  The park reason for depth 15
 was a claimed recurrent-rewind corruption on qwen4exp.  A new deterministic reference-context sweep
 (`tests/test-recurrent-state-depth`: `n_rs_seq` 1..15, every rollback, plus deep drafts) is green on
@@ -230,8 +244,8 @@ prose +26%, code +35%, recall +44%.  **Two protocol requirements are now part of
 both wrong in the first cut): `-n 3000` (`-n 2000` floor) -- a 256-token run measured the warm-up and
 inverted the code ranking -- and the per-axis reasoning flag.  See
 `benchmarks/2026-09-13-adaptive-mtp-4-axis-n12.md` and the gate rule in
-`benchmarks/mtp-adaptive-methodology.md`.  Canonical tip `c45244c72`, tree
-`a5683e1b008e`.  Full record:
+`benchmarks/mtp-adaptive-methodology.md`.  Canonical tip `9ee71c356`, tree
+`58317e0d64dd`.  Full record:
 [`WORKLOG.md`](WORKLOG.md) 2026-09-13 (latest) and the issue-#30 section of
 [`patches/README.md`](patches/README.md).
 

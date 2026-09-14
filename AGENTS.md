@@ -151,9 +151,10 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), **W3** keys-only QSA
   indexer cache (`LLAMA_QSA_KEYS_ONLY`), **W4** ggml-alloc unused-view
   release (no gate), **V3** derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by
-  default), **V4** native q8_0 K/V and **V5** native bf16 K/V in the FA
-  kernels (both behind the same `GGML_CUDA_FA_KV_NATIVE`, **opt-in,
-  default 0**).  The beta patch was cut 2026-09-10 and **amended twice on
+  default), **V4** native q8_0/q4_0 K/V and **V5** native bf16 K/V in the FA
+  kernels (one `GGML_CUDA_FA_KV_NATIVE` switch; **amended 2026-09-14**,
+  issue #30: unset = auto → native q8_0/q4_0 **on** / bf16 off, `=1` force
+  all on, `=0` force the F16-staging path).  The beta patch was cut 2026-09-10 and **amended twice on
   2026-09-10: V5, then the RDNA3_5/gfx1151 fix** (the gfx1151
   amendment enables V3 on a HIP iGPU -- the probe had rejected
   `GGML_BACKEND_DEVICE_TYPE_IGPU` -- and requires a single KV stream in
@@ -175,8 +176,8 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `790cf51aa` is a rebuild of the delivery set
-(tip `c45244c728dfcbcad86ae95aa97ae76f94ee9f7f`, net tree
-  `a5683e1b008e3ad197ac2a9e3f99e5b0652df7d4`,
+(tip `9ee71c356d8043227bc0e84481f783c7dacb6ede`, net tree
+  `58317e0d64dd01a3622ba90b159ae12d1619c835`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `790cf51aa`; the 2026-09-13 re-base resolved the four upstream clashes --
 `16378d93f` gfx1201 FA tuning (our block-04 head-256 configs kept: upstream's
@@ -227,8 +228,8 @@ new `mmq_args` field was unset by `ggml_cuda_mul_mat_q_pair`, selecting the narr
 to 2.2x slower dense prefill; see the 2026-09-13 block-14 (ninth) section).
 **Block 15 (the attention-memory campaign) is the delivery's last patch** --
 promoted 2026-09-12 from `archive/work/block-15-campaign-wins/` (`patches/0015`;
-the canonical 16-block tip is `c45244c728dfcbcad86ae95aa97ae76f94ee9f7f`, tree
-`a5683e1b008e3ad197ac2a9e3f99e5b0652df7d4` (the 2026-09-13 master re-base + the
+the canonical 16-block tip is `9ee71c356d8043227bc0e84481f783c7dacb6ede`, tree
+`58317e0d64dd01a3622ba90b159ae12d1619c835` (the 2026-09-13 master re-base + the
 2026-09-13 block-08 `iq4_nl` `GET_ROWS` amendment; the
 previous base `9113cc188` had tip `907799de3`, tree `c2e284c2acc032238ef85cb35d427c1598ed0949`).
 
@@ -666,12 +667,19 @@ Consequences, so it is not re-litigated:
   A/B with `archive/work/block-15-campaign-wins/ab/w4-revert.patch`), **V3** derived
   kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default — the packed mask is still
   created in every graph and simply loses its consumer, so the allocator
-  leaves it unallocated), **V4** native q8_0 K/V and **V5** native bf16
-  K/V in the FA kernels (both behind `GGML_CUDA_FA_KV_NATIVE`, **opt-in,
-  default 0**: V4 costs ~1.7 % prefill — the lost `cp_async` pipeline —
-  for −744/−632 MiB/GPU, V5 0.2–2.4 % for a bf16 cache to cost exactly
-  what an f16 one does; the per-operand staging source is one shared type
-  code `FATTN_KV_NATIVE_{NONE,Q8_0,BF16}`, so the launcher, the alloc-size
+  leaves it unallocated), **V4** native q8_0/q4_0 and **V5** native bf16
+  K/V in the FA kernels (one `GGML_CUDA_FA_KV_NATIVE` switch; **amended
+  2026-09-14**, issue #30: **unset = auto → native q8_0/q4_0 on / bf16
+  off**, `=1` force all on, `=0` force the F16-staging path).  The F16
+  whole-cache staging pass is a *decode-depth* cost for the sub-F16 quants
+  (q8_0 `tg64` d65536 18.92 → **23.29**, q4_0 19.72 → **22.82**, ~1.2-1.3 %
+  prefill, bit-identical and `W=1..8`-pure), and removing it also **fixes
+  the adaptive-MTP high-context load failure** (`--spec-draft-n-max 12
+  -c 196608 q8_0`: the ~744 MiB scratch was the 260 MiB the draft context
+  was short).  V4's original ~1.7 % figure stands for the opt-in era; V5
+  (bf16) stays opt-in at 0.2-2.4 % for a bf16 cache to cost exactly what an
+  f16 one does; the per-operand staging source is one shared type code
+  `FATTN_KV_NATIVE_{NONE,Q8_0,Q4_0,BF16}`, so the launcher, the alloc-size
   query and the kernels cannot disagree).  Two
   validation facts to protect: same-seed output is **byte-identical**
   across every gate combination on every model, and the adaptive-MTP gate
@@ -770,7 +778,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `790cf51aa`,
-blocks tip `c45244c728dfcbcad86ae95aa97ae76f94ee9f7f`): `git format-patch --start-number 0` the block
+blocks tip `9ee71c356d8043227bc0e84481f783c7dacb6ede`): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -778,7 +786,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 — it may have been rebased onto a drifted master, so a raw
 `<base>..HEAD` range there can export upstream commits as patches
 0001/0002.  The canonical 16-block chain is a rebuild of the delivery set at
-`790cf51aa` (tip `c45244c72…`), which is what the default tip names.  Always regenerate from a
+`790cf51aa` (tip `9ee71c356…`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `790cf51aa`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

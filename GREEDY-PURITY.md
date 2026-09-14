@@ -66,6 +66,9 @@ finding, narrative moved to the findings file):
 | 29 | a flattened batch is not a token count (the QSA indexer score's `ne11 = 4 * n_tps`) | fix |
 | 30 | a support predicate decides the *layout*; an address-driven fusion can move the output (the `iq4_nl` GET_ROWS CPU fallback) | doctrine + fix |
 | 31 | an address-selected fusion must be bit-identical to the path it replaces (the MoE `topk_moe` router + the argsort tie-break) | doctrine + fix |
+| 32 | a decode/verify band policy must scale with the configured draft depth | fix |
+| 33 | a purity (or throughput) gate must run the content the axis intends, long enough to reach steady state | doctrine |
+| 34 | a K/V staging policy is a decode-depth policy (and can be the margin for a high-context load) | doctrine + fix |
 
 
 ## 1. The one-sentence version
@@ -1215,3 +1218,35 @@ run.  A short purity check can therefore report "pure" while the real workload i
 
 Results: `benchmarks/2026-09-13-adaptive-mtp-4-axis-n12.md`; protocol: gate rule 0 in
 `benchmarks/mtp-adaptive-methodology.md`; prompts: `prompts/README.md`.
+
+## 34. A K/V staging policy is a decode-depth policy (and can be the margin for a high-context load) (2026-09-14, issue #30, block-15 amendment)
+
+**Claim.**  The block-15 `V4`/`V5` native-staging arms were documented and shipped as a *memory* feature
+(they remove the F16 staging scratch), with decode "unaffected".  That framing was incomplete: for a
+**quantized** K/V the F16 staging pass is a **whole-cache conversion that runs on every decode step and
+scales with `n_kv`**, so it is a *decode-depth* cost, and the choice of staging source is a decode-depth
+policy.  It can also be the difference between loading and not loading a high-context MTP config.
+
+**Evidence (1 GPU, gfx1201, 27B UD-Q4_K_XL, `-fa auto`).**  With V4 opt-in off, delivery q8_0 `tg64`
+d65536 was 18.92 t/s (66.1 % of its d0 rate) vs stock's 22.43 (80.1 %).  Turning native q8_0 staging on
+(and adding the missing q4_0 arm) gives **23.29** (80.7 %) for ~1.2 % prefill; q4_0 19.72 -> **22.82**
+(68.9 % -> 79.2 %, stock 21.03 / 75.9 %).  The values are **bit-identical** to the staging conversion
+(same-seed text), so this is a pure speed/memory change, and `W = 1..8` stays one logits hash on every
+supported type.  The same ~744 MiB/GPU scratch was the **260 MiB margin** the adaptive-MTP draft context
+was short at `-c 196608` q8_0 / ceiling 12, so the default now loads at the default 4 slots
+(`GGML_CUDA_FA_KV_NATIVE=0` reproduces the OOM).
+
+**Rules.**
+
+* **A native staging arm must reproduce the launcher's conversion bit-for-bit** (q8_0's
+`dequantize_block_q8_0_f16`, q4_0's `dequantize_block_q4_0`) — otherwise the recorded reference hashes
+move.  Gate it with the same-seed text gate first, the width matrix second, and the MTP acceptance third.
+* **The activation policy is per type class.**  Native staging is the default for the sub-F16 quants
+(q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl), where the F16 pass is the cost; bf16 already has a native tile/vec
+path, so its MMA-scratch arm (V5) stays opt-in.  `GGML_CUDA_FA_KV_NATIVE` is a three-state policy
+(unset = auto, 1 = force on, 0 = force the staging path), so the old behaviour is one env away.
+* **A memory win can be a load-time win.**  When a config fails to load by a few hundred MiB, the fix
+may be elsewhere in the same graph (here the staging scratch), not in the buffer named by the OOM.
+Measure the *total* budget, not the failing allocation.
+* The remaining headroom lever and the opt-in f32 -> bf16 snapshot trade (a purity trade to be *measured*,
+not assumed) are filed in `wip/issue-30-mtp-decode-regression/RECURRENT-SNAPSHOT-BUDGET.md`.

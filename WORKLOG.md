@@ -1,5 +1,62 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-14 — block-15 amendment: V4 native staging is the default for sub-F16 KV quants + the q4_0 native arm (issue #30)
+
+**Why.**  Issue #30's reconciliation (`wip/issue-30-mtp-decode-regression/`) isolated a real
+delivery-specific regression: with a **quantized** K/V cache the delivery's decode falls off faster with
+context depth than stock.  Measured on 1 GPU (27B UD-Q4_K_XL, `tg64`, `-fa auto`): the delivery q8_0
+retained 66.1 % of its d0 rate at d65536 vs stock's 80.1 % (18.92 vs 22.43 t/s), q4_0 68.9 % vs 75.9 %
+(19.72 vs 21.03).  The delivery's BF16 path was fine and ahead of stock's f16 at every depth (the block-03
+predicate); only the quantized types diverged.
+
+**Root cause.**  Block 08's F1 fix (`GREEDY-PURITY.md` §14) deleted the VEC fallback upstream uses for a
+quantized K/V at small `n_q`, so the whole delivery band takes the **tile** kernel — which for a
+quantized cache is preceded by a **whole-cache F16 staging pass** (`need_f16_K/V = 1`).  That pass is
+proportional to `n_kv` and runs on every decode step, so its cost grows with depth.  The block-15 `V4`
+native-staging arm removes it but was **opt-in** (`GGML_CUDA_FA_KV_NATIVE=1`), and q4_0 had no arm at
+all.
+
+**Change (block 15, one amendment).**
+
+* `GGML_CUDA_FA_KV_NATIVE` becomes a **three-state policy**: unset = **auto** (native q8_0/q4_0 **on**,
+native bf16 off), `=1` forces all on, `=0` forces the pre-amendment F16-staging path (the escape
+hatch).  The F16-staging pass is the cost for the sub-F16 quants; bf16 already has a native tile/vec
+path, so its MMA-scratch arm (V5) stays opt-in.
+* A **native q4_0 arm** (`ggml_cuda_fattn_dequantize_q4_0_chunk`, arithmetic-identical to `convert.cu`'s
+`dequantize_block_q4_0`) beside the q8_0/bf16 ones, wired through the tile and MMA loaders
+(`FATTN_KV_NATIVE_Q4_0`, the predicates, `flash_attn_tile_load_tile_native` /
+`flash_attn_ext_f16_load_tile_native`).
+
+**Measured (1 GPU, gfx1201, 27B UD-Q4_K_XL).**  q8_0 d65536 18.92 -> **23.29** (+23 %, stock 22.43) and
+q4_0 19.72 -> **22.82** (+16 %, stock 21.03), for ~1.2-1.3 % prefill.  Numerics are unchanged: same-seed
+greedy text native == staging (q8_0 `ab94eb7db4d4`, q4_0 `edafcdc7f8df`), `W=1..8` is one logits hash for
+every supported type, and MTP `n_max 3` acceptance is unchanged (0.75182).
+
+**Side effect — adaptive MTP at high context loads again.**  The `--spec-draft-n-max 12 -c 196608
+-ctk/ctv q8_0` load failure (reported in issue #30) was the **same root cause**: the ~744 MiB/GPU F16
+staging scratch was exactly the 260 MiB the MTP draft context was short.  With the new default the exact
+config loads at the default `n_slots = 4` and generates (34.76 t/s, acceptance 0.3404);
+`GGML_CUDA_FA_KV_NATIVE=0` reproduces the failure.  The deeper recurrent-state snapshot budget and its
+levers (including an opt-in f32 -> bf16 snapshot trade to be measured) are filed in
+`wip/issue-30-mtp-decode-regression/RECURRENT-SNAPSHOT-BUDGET.md`.
+
+**Action E (#28867 head-256 WMMA threshold) — investigated, no delivery change.**  The reporter's ~20 %
+regression is upstream-master-specific: the delivery's `Q->ne[1] > 8` guard already keeps the whole
+purity band (`W <= 8`, his repro range) on TILE, and for `n_q = 9..N` the tuned block-04 head-256 WMMA
+configs are at parity with TILE (recall `n_max 8` 115.10 vs 115.72 t/s, `n_max 15` 147.19 vs 147.80 t/s,
+acceptance bit-identical).  Adopting the MFMA threshold 64 is a ~0.4 % neutral selection change, not a
+purity change; left out.
+
+**Canonical chain / verification.**  Block 15 amended in place (`b36517087` -> `9ee71c356`), net tree
+`58317e0d64dd01a3622ba90b159ae12d1619c835`; `patches/` regenerated (16 patches) and
+`rdna-boosts-all.patch` re-cut.  `scripts/validate-set.sh` PASSES against a fresh `790cf51aa` tarball:
+checksums OK, base tree == `97726d3760…`, strict **16/16** `git am`, applied tree == `58317e0d…`.
+Release `release.json` bumped to **`v16-790cf51aa-r2`**.
+
+**Follow-ups filed.**  TODO item 2 (native arms for `q4_1`/`q5_0`/`q5_1`/`iq4_nl`; they track stock but
+sit ~12-16 % behind f16 at d32k) and item 20 (the issue-#30 umbrella: the recurrent-snapshot budget/levers
+and the f32 -> bf16 opt-in measurement).
+
 ## 2026-09-13 (latest) — release infrastructure: tag-driven CI, `release.json` as single source of truth, first tagged release `v16-790cf51aa`
 
 **Why.**  The GHCR container workflow failed on every push to `main`.  The run failed *before*

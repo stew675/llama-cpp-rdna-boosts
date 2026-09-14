@@ -9,10 +9,17 @@ The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against
 2026-09-13 from `9113cc188`; previously re-based 2026-09-08 from `050dde50c`, itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
+**Block-15 amendment (2026-09-14, issue #30):** `GGML_CUDA_FA_KV_NATIVE` is now a three-state policy
+(**unset = auto**: native q8_0/q4_0 on, bf16 off; `=1` force all on; `=0` force the F16-staging path) and
+q4_0 gained a native arm, closing the quantized-KV decode-depth fall-off (q8_0 `tg64` d65536 18.92 ->
+**23.29**, q4_0 19.72 -> **22.82**, ~1.2-1.3 % prefill, bit-identical + `W=1..8`-pure) and fixing the
+`--spec-draft-n-max 12 -c 196608 q8_0` adaptive-MTP load failure (the ~744 MiB F16 staging scratch was
+the 260 MiB the draft context was short).  Release `v16-790cf51aa-r2`; record
+`wip/issue-30-mtp-decode-regression/` + `WORKLOG.md` 2026-09-14 + `GREEDY-PURITY.md` §34.
 **Current regeneration (2026-09-13, the master re-base + the block-08 `iq4_nl` `GET_ROWS`
 amendment + the block-08 (seventh) MoE-router bit-identity amendment)**: canonical 16-block tip
-**`c45244c728dfcbcad86ae95aa97ae76f94ee9f7f`** (net tree
-**`a5683e1b008e3ad197ac2a9e3f99e5b0652df7d4`**), clean-apply strict 16/16 with 0 whitespace
+**`9ee71c356d8043227bc0e84481f783c7dacb6ede`** (net tree
+**`58317e0d64dd01a3622ba90b159ae12d1619c835`**), clean-apply strict 16/16 with 0 whitespace
 warnings and the applied tree equal to the canonical one.  (The re-base tip was `43ec14228…`, tree
 `5cc664…`; the 2026-09-13 block-08 (sixth) amendment — TODO item 3, the `iq4_nl` `GET_ROWS`
 sub-`QK_K` path — and the (seventh) amendment — TODO item 19, the bit-identical fused MoE
