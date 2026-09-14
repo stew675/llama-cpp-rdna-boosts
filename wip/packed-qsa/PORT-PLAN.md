@@ -1,6 +1,7 @@
 # Packed-QSA port plan
 
-**Status:** P2 done (2026-09-13) — see `P1-NOTES.md` / `P2-NOTES.md`; fork `packed-qsa` `1697ad10e`.
+**Status:** P3 in progress (2026-09-13) — the gfx12 f16 WMMA primitive + fragment layout are validated
+and the kernel body is designed (`P3-DESIGN.md`); fork `packed-qsa` `91f5e41a0`.
 P3 is next.
 Branch: `packed-qsa` (delivery repo) / `packed-qsa` (fork).  Companion concept doc:
 `../prefill-arrangements/README.md`.  Archived measurement:
@@ -100,7 +101,8 @@ its own `W=1..8` matrix.
 |---|---|
 | P1 ✅ | graph pack ops + the two new op sources + the gate (no kernel change yet) — `P1-NOTES.md` |
 | P2 ✅ | port `qsa3_rows` + `qsa3_merge` (descriptor builder); unit-check the union/mask against the `idx` rows — `P2-NOTES.md` |
-| P3 | port `qsa3_attn` adapted to our output/mask + **gfx12 f16 fragments**; land behind the gate |
+| P3 (part 1 ✅) | gfx12 f16 WMMA primitive + fragment-layout self-test validated; kernel body designed — `P3-DESIGN.md` |
+| P3 (part 2) | implement the kernel body (grid/block, 8-way dim split, masking, online softmax, LDS P-transpose) |
 | P4 | support predicate + dispatch + fallback; RDNA4 (gfx1201) and RDNA3.5 (gfx1151) |
 | P5 | validate: correctness vs VEC, PPL, `W=1..8`, MTP acceptance, perf A/B |
 
