@@ -176,12 +176,15 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `790cf51aa` is a rebuild of the delivery set
-(tip `9ee71c356d8043227bc0e84481f783c7dacb6ede`, net tree
-  `58317e0d64dd01a3622ba90b159ae12d1619c835`,
+(tip `a2c8d06a7931c9f6bec8542fe10149c615853be7`, net tree
+  `eb5b7583d14b30b7610fac53acf2fc52bc806ce4`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `790cf51aa`; the 2026-09-13 re-base resolved the four upstream clashes --
-`16378d93f` gfx1201 FA tuning (our block-04 head-256 configs kept: upstream's
-WMMA prefill tuning breaks 4B `q4_0` decode/verify width purity), `5a4d0feca`
+`16378d93f` gfx1201 FA tuning (our block-04 head-256 configs were kept at the time because upstream's
+WMMA prefill tuning then broke 4B `q4_0` decode/verify width purity — **superseded by the 2026-09-14
+block-04 amendment**, which makes the head-256 config arch-aware (RDNA3_5 keeps the gfx1151 halo row,
+RDNA4/RDNA3_0 take upstream's) and `ncols2` split-aware, recovering the deep-prefill slope with the 4B
+q4_0 band still pure), `5a4d0feca`
 `GGML_FA_QUANTS` (block 08's `q4_1`/`q5_0`/`q5_1`/`iq4_nl` enablement re-homed),
 `d4abd573f` (block 13 MoE MMQ `ncols_opt`, additive) and `311d4211b` (block 15 W3
 composes with the MLA indexer cache) -- see `WORKLOG.md`; block 02 amended
@@ -228,8 +231,8 @@ new `mmq_args` field was unset by `ggml_cuda_mul_mat_q_pair`, selecting the narr
 to 2.2x slower dense prefill; see the 2026-09-13 block-14 (ninth) section).
 **Block 15 (the attention-memory campaign) is the delivery's last patch** --
 promoted 2026-09-12 from `archive/work/block-15-campaign-wins/` (`patches/0015`;
-the canonical 16-block tip is `9ee71c356d8043227bc0e84481f783c7dacb6ede`, tree
-`58317e0d64dd01a3622ba90b159ae12d1619c835` (the 2026-09-13 master re-base + the
+the canonical 16-block tip is `a2c8d06a7931c9f6bec8542fe10149c615853be7`, tree
+`eb5b7583d14b30b7610fac53acf2fc52bc806ce4` (the 2026-09-13 master re-base + the
 2026-09-13 block-08 `iq4_nl` `GET_ROWS` amendment; the
 previous base `9113cc188` had tip `907799de3`, tree `c2e284c2acc032238ef85cb35d427c1598ed0949`).
 
@@ -778,7 +781,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `790cf51aa`,
-blocks tip `9ee71c356d8043227bc0e84481f783c7dacb6ede`): `git format-patch --start-number 0` the block
+blocks tip `a2c8d06a7931c9f6bec8542fe10149c615853be7`): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -786,7 +789,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 — it may have been rebased onto a drifted master, so a raw
 `<base>..HEAD` range there can export upstream commits as patches
 0001/0002.  The canonical 16-block chain is a rebuild of the delivery set at
-`790cf51aa` (tip `9ee71c356…`), which is what the default tip names.  Always regenerate from a
+`790cf51aa` (tip `a2c8d06a76…`), which is what the default tip names.  Always regenerate from a
 canonical fork rebuilt AT `790cf51aa`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/15]` series count change.  Then

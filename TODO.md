@@ -7,9 +7,9 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
 `wip/*` and `benchmarks/`.
 
 **Current state (2026-09-14, latest):** the delivery is the **16-patch set** against fork point `790cf51aa`
-(block 00 + blocks 01-15), canonical 16-block tip **`9ee71c356d8043227bc0e84481f783c7dacb6ede`** (tree
-`58317e0d64dd01a3622ba90b159ae12d1619c835`), `make-patches.sh` default tip =
-`9ee71c356d8043227bc0e84481f783c7dacb6ede` (the 2026-09-13 master re-base + the 2026-09-14 block-15
+(block 00 + blocks 01-15), canonical 16-block tip **`a2c8d06a7931c9f6bec8542fe10149c615853be7`** (tree
+`eb5b7583d14b30b7610fac53acf2fc52bc806ce4`), `make-patches.sh` default tip =
+`a2c8d06a7931c9f6bec8542fe10149c615853be7` (the 2026-09-13 master re-base + the 2026-09-14 block-15
 amendment: the V4 native-staging policy for the sub-F16 KV quants + the q4_0 native arm, which also fixes
 the issue-#30 adaptive-MTP high-context load failure — see item 20) plus the earlier block-08 (sixth)
 `iq4_nl` `GET_ROWS` sub-`QK_K` amendment that closed item 3 + the block-08 (seventh) MoE-router
@@ -97,11 +97,9 @@ and runs host-only/CPU (a >10 min run at 100 % CPU).
 ### 20. Issue #30 wider-configuration follow-ups (umbrella)
 
 Dossier: `wip/issue-30-mtp-decode-regression/` (`README.md` action register, `MEASUREMENTS.md`).
-- **Pending promotion:** the 2026-09-14 `V4` activation-policy refinement + the new q4_0 native arm
-  (item 2's q8_0/q4_0 half) — experiment diff
-  `wip/issue-30-mtp-decode-regression/patches/2026-09-14-v4-default-plus-q4_0-native.diff`, validated
-  bit-identical + band-pure + MTP-neutral on gfx1201.  Promote as a **block-15 amendment**, together
-  with Action E, in one integration pass.
+- **Pending promotion:** none — the 2026-09-14 `V4` activation-policy refinement + q4_0 native arm
+  (block 15, r2) and the block-04 prefill fix (r3) are **promoted**.  See the block-04/block-15 amendment
+  sections in `patches/README.md` and `WORKLOG.md` 2026-09-14.
 - **Action E — #28867 head-256 WMMA threshold (resolved 2026-09-14: no delivery regression).**  The
   reporter's ~20 % is upstream-master-specific: our `Q->ne[1] > 8` guard already puts the whole purity
   band (`W <= 8`, his repro range) on TILE, and for `n_q = 9..N` the tuned block-04 head-256 WMMA configs
@@ -125,9 +123,10 @@ Dossier: `wip/issue-30-mtp-decode-regression/` (`README.md` action register, `ME
   WMMA config was a Strix-Halo half-tile row used for all WMMA calls, and the delivery omitted stock's
   AMD `switch_ncols2` (ncols2=8 vs 2 for gqa 6).  Prototype fixes both: 1 GPU f16 **703.7 (+2.4 %)**,
   bf16 675.8 (−1.6 %), 3-GPU tensor **1218.6 (+9.6 %)** vs stock, 4B q4_0 `W=1..8` pure.  **Split-aware
-  `ncols2` is implemented**: a frontend hint (`ggml_set_fa_tensor_parallel`, set in `llama_context` from
-  `split_mode()==TENSOR && n_cuda_dev>1`) selects generic 8 for tensor split and stock's AMD 2 for a whole
-  card.  Remaining: the V3 (~2.4 % single-card) / bf16 (~1.6 %) residuals.  Diff:
+  `ncols2` is implemented** and **promoted** (block 04, r3): a frontend hint (`ggml_set_fa_tensor_parallel`,
+  set in `llama_context` from `split_mode()==TENSOR && n_cuda_dev>1`) selects generic 8 for tensor split
+  and stock's AMD 2 for a whole card.  Remaining: the V3 (~2.4 % single-card) / bf16 (~1.6 %) residuals;
+  the q8_0 prefill delta is **item 21**.
   `wip/issue-30-mtp-decode-regression/patches/2026-09-14-prefill-rdna-config-and-ncols2.diff`;
   analysis `MEASUREMENTS.md` §D.  **Testing lesson: `-sm tensor` masked the single-card regression —
   screen with the `t = a + b*n` slope fit at pp8192-49152, and always measure 1 GPU too.**

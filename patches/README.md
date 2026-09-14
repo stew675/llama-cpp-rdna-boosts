@@ -82,7 +82,7 @@ promotion section below), so the set now applies as block 00 + blocks
 | `0001` | adaptive MTP draft depth | **refreshed 2026-09-09 to the upstream PR #27210 review head** (`d236d41a2`; review-round feedback-handling, option validation + docs) — see the 2026-09-09 block-01 refresh section below.  **amended 2026-09-11: `--spec-draft-n-max` is capped at 7** (`common/common.cpp`, a clamp with a visible `E`-level notice naming the `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` escape hatch, + the `max: 7` help string in `common/arg.cpp`) — see the 2026-09-11 (12) section below.  **amended 2026-09-13 (issue #30): the cap is raised from 7 to 15** — the 15 is the recurrent rollback snapshot bound (`n_max + 1 = K <= 16`, the constant the K-independent chunked-GDN threshold was built around), and purity above 7 is now an explicit warned trade instead of a clamp: any depth 8..15 is kept with a visible notice that `--spec-type none` and `draft-mtp` may no longer be bit-identical (a verify wider than 8 rows switches FA and matmul kernel families), while `> 15` is clamped to 15.  Ships with the new `tests/test-recurrent-state-depth` snapshot sweep (n_rs_seq 1..15, the whole rollback range, incl. deep drafts) — see the 2026-09-13 issue-#30 section below and `../GREEDY-PURITY.md` §11/§19.
 | `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | **amended 2026-09-06 with the gfx11 NW16 scan retune** (gated_delta_net_chunked_bf16_gfx11.cu, fork 376f02aa0); **amended 2026-09-11 with the K-independent whole-batch chunked prefill** (gated_delta_net.cu; no sequential tail, `GGML_CUDA_GDN_ALIGN_BOUNDARY` gate + its two K-dependent branches **removed**; + the `llama_memory_recurrent` rollback-boundary guard). | **amended 2026-09-12 with the rollback-bounded chunked threshold (`n_rs_batch`) + the pre-batch snapshot slot** — the whole-batch chunked path now requires `n_tokens > max(K > 16 ? K : 16, n_rs_batch)` where `n_rs_batch` is the longest draft an enabled speculator can produce + 1 (from `common_speculative_n_max()`), because a batch that can be rolled back into must run the sequential kernel that writes its snapshots; fixes a silent recurrent-state rewind with ngram-style long drafts (ngram-mod 64 > MTP's `n_rs_seq` 7) that the 2026-09-11 guard detects — see the 2026-09-12 block-02 amendment section below.
 | `0003` | BF16 KV cache + native-BF16 flash-attn | **amended 2026-09-10 with the HIP masked-V/freed-cell fixes** (moved here from block 14 on 2026-09-10 — they sit on the native-BF16 PV staging this block introduces): `fattn-tile.cuh` (packed-bf16 PV) + `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles). |
-| `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf | **amended 2026-09-06 with the RDNA WMMA (256,256,64) config row** (fattn-mma-f16.cuh, fork e7eecb369).
+| `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf | **amended 2026-09-06 with the RDNA WMMA (256,256,64) config row** (fattn-mma-f16.cuh, fork e7eecb369). | **amended 2026-09-14 (issue #30) with the RDNA prefill tuning — the head-256 `ncols=64` config is arch-aware (RDNA3_5 keeps the gfx1151 halo row, RDNA4/RDNA3_0 take upstream #28102's row) and `ncols2` is split-aware (frontend `ggml_set_fa_tensor_parallel` hint); pp150K f16 +2.4 / +6.9 / +9.6 % vs stock on 1/2/3 cards** — see the 2026-09-14 block-04 section below. |
 | `0005` | CPU bit-identical decode/verify batches |
 | `0006` | host-buffer revert for discrete GPUs |
 | `0007` | meta device-wrapper skip |
@@ -606,6 +606,44 @@ the wide block, so its absolute hash moves (the (16)/(17) 4B hashes above no lon
 `git am`, zero whitespace warnings, applied tree **`c2e284c2acc032238ef85cb35d427c1598ed0949`**
 (rebuilt canonical tip `907799de3e6a7dcbd206d03b2daef4c248144ca9`).  Block 0013 is the only content
 change vs the (17) regeneration; block 13's hand-carried RDNA3_5 note is preserved.
+
+## 2026-09-14 block-04 amendment: RDNA prefill tuning, arch- and split-aware (issue #30)
+
+**Why.**  The delivery's prefill fell off ~51 % faster with depth than stock (`pp150000`, 1 GPU, 27B
+UD-Q4_K_XL, f16 609.5 vs 686.9; KV-type-independent, so not q8_0).  The per-token fit `t = a + b*n` has a
+smaller `a` (the low-depth wins) but `b = 5.73e-9` vs stock's `3.79e-9` — a per-(query x KV)-cell cost.
+
+**Cause 1 — the head-256 `ncols=64` WMMA config.**  With gqa 6, `gqa > 4 -> ncols2 = 8` and the launcher
+picks `ncols1 = 64/ncols2 = 8`, so every `n_q > 8` attention (prefill and wide verify) uses the `ncols=64`
+row of `ggml_cuda_fattn_mma_get_config_rdna` — which was a **Strix Halo (gfx1151) "halo row"**
+(`nthreads 256, occupancy 1, nbatch_fa 32, nbatch_V2 64, Q_in_reg=false`), ~1.5x per attention cell on
+the discrete cards.  Fix: make the row `cc`-aware — `is_rdna3_5` keeps the halo row, RDNA4/RDNA3_0 take
+upstream's `(256, 2, 64, 128, 128, 64, 1, true)`.  `RDNA3_5`/`RDNA4` are per-gfx in `vendors/hip.h`, so
+the host dispatch uses `GGML_CUDA_CC_IS_RDNA3_5(cc)` and the device constexpr uses the macro (they agree).
+
+**Cause 2 — the omitted AMD `switch_ncols2`.**  Upstream #28102 added an AMD block ("on RDNA it is
+preferable to minimize wasted compute"): for gqa 6 it picks `ncols2 = 2` (6/2 exact) where the generic
+rule picks `8` (2 of 8 GQA lanes wasted).  The 2026-09-13 re-base omitted it to hold the 4B q4_0 `W=1..8`
+band.  Fix: adopt it, but **split-aware** — a new frontend hint `ggml_set_fa_tensor_parallel`
+(ggml.h/ggml.c), set once in the `llama_context` constructor from
+`split_mode() == LLAMA_SPLIT_MODE_TENSOR && n_cuda_dev > 1` (`n_devices()` is 1 under tensor split because
+the meta device wraps the GPUs, so it counts CUDA sub-devices via `ggml_backend_dev_is_cuda`).  The
+chooser uses generic `ncols2=8` for tensor parallel (per-GPU bandwidth-bound) and stock's AMD `ncols2=2`
+for a whole card (compute-bound).
+
+**Results (27B UD-Q4_K_XL, f16, `pp150000`; stock 686.9 single / 1111.8 tensor).**
+
+| mode | before | after |
+|---|---|---|
+| 1 GPU | 609.5 | **703.4 (+2.4 %)** |
+| 2-GPU tensor | — | **1087.5 (+6.9 %)** |
+| 3-GPU tensor | — | **1218.6 (+9.6 %)** |
+
+`pp64K` single 876.1 -> 946.8.  q8_0 KV prefill is at parity with stock (−1.2 / −0.2 / +2.4 % across
+1/2/3 cards); the residual is the V4 native-staging prefill cost (TODO item 21).  Purity held: the 4B q4_0
+`W = 1..8` band is one hash; the two 2-card `ncols2` nuances (q8_0 marginally prefers the AMD rule) are
+inside that same cost.  Verification: block 04 amended, blocks 05-15 replayed (two `ggml.h` conflicts
+resolved by keeping both declaration sets), strict 16/16 `git am`, applied tree == `eb5b7583`.
 
 ## 2026-09-14 block-15 amendment: V4 native staging is the default for the sub-F16 KV quants + the q4_0 native arm (issue #30)
 

@@ -1,5 +1,49 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-14 (later) — block-04 amendment: RDNA prefill tuning, now arch- and split-aware
+
+**Why.**  Issue #30's reconciliation left one open finding: the delivery's prefill fell off faster with
+depth than stock (`llama-bench -p 150000`, 1 GPU, 27B UD-Q4_K_XL, f16: delivery 609.5 vs stock 686.9;
+KV-type-independent, so not q8_0).  Fitting `t = a + b*n` over pp4K..64K showed the delivery's `a`
+smaller (the low-depth wins) but its depth slope `b` ~51 % larger (5.73e-9 vs 3.79e-9) — a
+per-(query x KV)-cell attention cost.
+
+**Root cause — two FA-config issues.**
+* The head-256 `ncols=64` entry in `ggml_cuda_fattn_mma_get_config_rdna` was a **Strix Halo (gfx1151)
+  "halo row"** (`nthreads 256, occupancy 1, nbatch_fa 32, nbatch_V2 64, Q_in_reg=false`).  With gqa 6 the
+  launcher picks `ncols1 = 64/ncols2 = 8` for every `n_q > 8`, so **all** prefill/wide-verify attention
+  used it; that half-tile/Q-out-of-registers shape is ~1.5x per attention cell on RDNA4/RDNA3_0.
+* The delivery omitted upstream #28102's AMD `switch_ncols2` block ("minimize wasted compute"), so for
+  gqa 6 it picked `ncols2 = 8` (2 of 8 GQA lanes wasted) where stock picks `ncols2 = 2`.
+
+**Change (block 04).**
+* The RDNA config is `cc`-aware: `is_rdna3_5` keeps the halo row (it was tuned there), RDNA4/RDNA3_0 take
+  upstream's `(256, 2, 64, 128, 128, 64, 1, true)`.  `RDNA3_5`/`RDNA4` are per-gfx in `vendors/hip.h`, so
+  the host dispatch uses `GGML_CUDA_CC_IS_RDNA3_5(cc)` and the device constexpr uses the macro.
+* `ncols2` is **split-aware**: a new frontend hint `ggml_set_fa_tensor_parallel` (ggml.h/ggml.c), set once
+  in the `llama_context` constructor from `split_mode() == LLAMA_SPLIT_MODE_TENSOR && n_cuda_dev > 1`
+  (`n_devices()` is 1 under tensor split because the meta device wraps the GPUs, so it counts CUDA
+  sub-devices via `ggml_backend_dev_is_cuda`).  The chooser uses generic `ncols2=8` for tensor parallel,
+  stock's AMD `ncols2=2` for a whole card.
+
+**Measured (27B UD-Q4_K_XL, f16, `pp150000`; stock 686.9 single / 1111.8 tensor).**
+
+| mode | before | after |
+|---|---|---|
+| 1 GPU | 609.5 | **703.4 (+2.4 %)** |
+| 2-GPU tensor | — | **1087.5 (+6.9 %)** |
+| 3-GPU tensor | — | **1218.6 (+9.6 %)** |
+
+`pp64K` single 876.1 -> 946.8.  q8_0 KV prefill is at parity with stock (−1.2 / −0.2 / +2.4 % across
+1/2/3 cards); its 4-8 % gap to f16 is the V4 native-staging prefill cost, filed as TODO item 21.  Purity
+held: the 4B q4_0 `W = 1..8` band is one hash.
+
+**Verification.**  Block 04 amended in place (blocks 05-15 replayed; two `ggml.h` conflicts resolved by
+keeping both declaration sets).  Patches regenerated (16), `rdna-boosts-all.patch` re-cut, `release.json`
+-> **`v16-790cf51aa-r3`** (tip `a2c8d06a7`, tree `eb5b7583`).  `scripts/validate-set.sh` PASSES (strict
+16/16 `git am` on a fresh `790cf51aa` tarball).  Testing lesson: **`-sm tensor` masked the single-card
+regression** — screen with the slope fit at pp8-48K and always measure 1 GPU too.
+
 ## 2026-09-14 — block-15 amendment: V4 native staging is the default for sub-F16 KV quants + the q4_0 native arm (issue #30)
 
 **Why.**  Issue #30's reconciliation (`wip/issue-30-mtp-decode-regression/`) isolated a real

@@ -1,4 +1,4 @@
-From ef45a85f8e591449a7f4ee8e58916e9fcb67a425 Mon Sep 17 00:00:00 2001
+From 92b23ad510b3f362be030e4e3bc1d23982c79607 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -303,7 +303,7 @@ index cbfe40013..b96af7fb6 100644
  
  #define GGML_RPC_MAX_SERVERS       16
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index ba929e638..74032ef18 100644
+index 69465d96c..a8cdfc1eb 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -585,6 +585,12 @@ extern "C" {
@@ -319,10 +319,10 @@ index ba929e638..74032ef18 100644
  
          GGML_OP_UNARY,
  
-@@ -2512,6 +2518,111 @@ extern "C" {
-             struct ggml_tensor * a,
-             struct ggml_tensor * sinks);
- 
+@@ -2517,6 +2523,111 @@ extern "C" {
+     // friendly instead of compute-optimal for a whole card.  Set once per context; default false.
+     GGML_API void ggml_set_fa_tensor_parallel(bool enable);
+     GGML_API bool ggml_get_fa_tensor_parallel(void);
 +    // qwen4exp QSA sparse attention: attend only over the cells that the
 +    // indexer's top-k names, instead of the whole KV cache.  The mask is the
 +    // base kq_mask and is gathered in-kernel at the idx positions.
@@ -431,7 +431,7 @@ index ba929e638..74032ef18 100644
      // TODO: needs to be adapted to ggml_flash_attn_ext
      GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,
-@@ -2721,6 +2832,48 @@ extern "C" {
+@@ -2726,6 +2837,48 @@ extern "C" {
              struct ggml_tensor  * post,
              struct ggml_tensor  * comb);
  
@@ -5743,7 +5743,7 @@ index 000000000..c90460a45
 +    return true;
 +}
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index acffdb4b7..8c323379a 100644
+index e0851e48e..1d8e5e1f5 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1084,6 +1084,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -5796,7 +5796,7 @@ index acffdb4b7..8c323379a 100644
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -5583,6 +5594,252 @@ void ggml_flash_attn_ext_add_sinks(
+@@ -5594,6 +5605,252 @@ void ggml_flash_attn_ext_add_sinks(
      a->src[4] = sinks;
  }
  
@@ -6049,7 +6049,7 @@ index acffdb4b7..8c323379a 100644
  // ggml_flash_attn_back
  
  struct ggml_tensor * ggml_flash_attn_back(
-@@ -6582,6 +6839,87 @@ struct ggml_tensor * ggml_dsv4_hc_post(
+@@ -6593,6 +6850,87 @@ struct ggml_tensor * ggml_dsv4_hc_post(
      return result;
  }
  
@@ -6227,10 +6227,10 @@ index f1d173a57..01e2bbe1d 100644
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_FC,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index a0f27cc30..1bc81c148 100644
+index bbf08362e..729f5f839 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -156,7 +156,7 @@ llama_context::llama_context(
+@@ -168,7 +168,7 @@ llama_context::llama_context(
          cparams.ctx_other = params.ctx_other;
      }
  
@@ -6239,7 +6239,7 @@ index a0f27cc30..1bc81c148 100644
          if (model.tok_embd == nullptr || model.output == nullptr) {
              if (params.ctx_other == nullptr) {
                  throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
-@@ -245,6 +245,24 @@ llama_context::llama_context(
+@@ -257,6 +257,24 @@ llama_context::llama_context(
      cparams.fused_dsv4_hc_post = true;
      cparams.auto_fhc           = true;
  
@@ -6264,7 +6264,7 @@ index a0f27cc30..1bc81c148 100644
      // with causal attention, the batch size is limited by the context size
      cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
  
-@@ -3665,6 +3683,26 @@ llama_context_params llama_context_default_params() {
+@@ -3677,6 +3695,26 @@ llama_context_params llama_context_default_params() {
      return result;
  }
  
@@ -6291,7 +6291,7 @@ index a0f27cc30..1bc81c148 100644
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
-@@ -3700,10 +3738,49 @@ llama_context * llama_init_from_model(
+@@ -3712,10 +3750,49 @@ llama_context * llama_init_from_model(
          if (model->get_split_state_ud.n_devices == 1) {
              LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
          }

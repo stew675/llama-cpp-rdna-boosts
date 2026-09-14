@@ -9,6 +9,12 @@ The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against
 2026-09-13 from `9113cc188`; previously re-based 2026-09-08 from `050dde50c`, itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
+**Block-04 amendment (2026-09-14 (later), issue #30):** the RDNA prefill regression is fixed — the
+head-256 `ncols=64` WMMA config is now arch-aware (RDNA3_5 keeps the gfx1151 halo row, RDNA4/RDNA3_0 take
+upstream #28102's row) and `ncols2` is split-aware via the new `ggml_set_fa_tensor_parallel` frontend
+hint.  `pp150000` f16 vs stock: +2.4 % (1 card) / +6.9 % (2-card tensor) / +9.6 % (3-card tensor); 4B
+q4_0 `W=1..8` pure.  Release `v16-790cf51aa-r3`; record `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md`
+§D + `WORKLOG.md` 2026-09-14 (later) + `GREEDY-PURITY.md` §35.
 **Block-15 amendment (2026-09-14, issue #30):** `GGML_CUDA_FA_KV_NATIVE` is now a three-state policy
 (**unset = auto**: native q8_0/q4_0 on, bf16 off; `=1` force all on; `=0` force the F16-staging path) and
 q4_0 gained a native arm, closing the quantized-KV decode-depth fall-off (q8_0 `tg64` d65536 18.92 ->
@@ -18,8 +24,8 @@ the 260 MiB the draft context was short).  Release `v16-790cf51aa-r2`; record
 `wip/issue-30-mtp-decode-regression/` + `WORKLOG.md` 2026-09-14 + `GREEDY-PURITY.md` §34.
 **Current regeneration (2026-09-13, the master re-base + the block-08 `iq4_nl` `GET_ROWS`
 amendment + the block-08 (seventh) MoE-router bit-identity amendment)**: canonical 16-block tip
-**`9ee71c356d8043227bc0e84481f783c7dacb6ede`** (net tree
-**`58317e0d64dd01a3622ba90b159ae12d1619c835`**), clean-apply strict 16/16 with 0 whitespace
+**`a2c8d06a7931c9f6bec8542fe10149c615853be7`** (net tree
+**`eb5b7583d14b30b7610fac53acf2fc52bc806ce4`**), clean-apply strict 16/16 with 0 whitespace
 warnings and the applied tree equal to the canonical one.  (The re-base tip was `43ec14228…`, tree
 `5cc664…`; the 2026-09-13 block-08 (sixth) amendment — TODO item 3, the `iq4_nl` `GET_ROWS`
 sub-`QK_K` path — and the (seventh) amendment — TODO item 19, the bit-identical fused MoE

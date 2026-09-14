@@ -69,6 +69,7 @@ finding, narrative moved to the findings file):
 | 32 | a decode/verify band policy must scale with the configured draft depth | fix |
 | 33 | a purity (or throughput) gate must run the content the axis intends, long enough to reach steady state | doctrine |
 | 34 | a K/V staging policy is a decode-depth policy (and can be the margin for a high-context load) | doctrine + fix |
+| 35 | a prefill kernel config must be arch- and split-keyed, not one row for all RDNA | doctrine + fix |
 
 
 ## 1. The one-sentence version
@@ -1250,3 +1251,34 @@ may be elsewhere in the same graph (here the staging scratch), not in the buffer
 Measure the *total* budget, not the failing allocation.
 * The remaining headroom lever and the opt-in f32 -> bf16 snapshot trade (a purity trade to be *measured*,
 not assumed) are filed in `wip/issue-30-mtp-decode-regression/RECURRENT-SNAPSHOT-BUDGET.md`.
+
+## 35. A prefill kernel config must be arch- and split-keyed (2026-09-14, issue #30, block-04 amendment)
+
+**Claim.**  The head-256 WMMA config row and the `ncols2` rule were single values applied to *every*
+RDNA arch and *every* split mode.  Both were wrong as globals:
+
+* The `ncols=64` row was a **gfx1151 (Strix Halo) "halo row"** (`nbatch_fa 32`, `nbatch_V2 64`,
+  `Q_in_reg=false`), but the launcher uses `ncols=64` for *every* `n_q > 8` attention on gfx1201 too —
+  ~1.5x per attention cell, i.e. the delivery's prefill slope was ~51 % steeper than stock and only
+  showed at depth (delivery won at 4K, crossed at ~64K, lost at 150K).
+* The `ncols2` rule is a **compute-vs-bandwidth** trade: a whole card is compute-bound and prefers
+  `ncols2` that divides the GQA ratio (no wasted lanes); a tensor split is per-GPU bandwidth-bound and
+  prefers the wider `ncols2` (fewer K/V re-reads).  One value cannot serve both.
+
+**Rules to take from it.**
+
+* **A config tuned on one arch is not a config for the family.**  Key it on the arch (`RDNA3_5`/`RDNA4`
+  macros on the device, `GGML_CUDA_CC_IS_RDNA3_5(cc)` on the host — and they must agree).
+* **A regime (whole-card vs tensor-parallel) is a first-class axis**, not a constant; the frontend knows
+  the split mode, so pass it explicitly.  Here: `ggml_set_fa_tensor_parallel` (set in `llama_context`
+  from `split_mode() == LLAMA_SPLIT_MODE_TENSOR && n_cuda_dev > 1`).  Note `llama_model::n_devices()` is
+  **1** under tensor split (the meta device wraps the GPUs) — count the CUDA sub-devices instead.
+* **An `op_params` socket is not a reliable channel**: the graph is copied before execution and the copy
+  loses it (the builder's write was visible, the chooser read the default).  Pass through the
+  model/context layer.
+* **The instrument has a blind spot**: `-sm tensor` hides single-card regressions (its parallelism masks
+  per-cell cost).  Screen a prefill change with the `t = a + b*n` slope fit at pp8-48K and **always
+  measure one card as well**.
+
+Results and the full matrix: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §D; `WORKLOG.md`
+2026-09-14 (later); `patches/README.md` (2026-09-14 block-04 section).
