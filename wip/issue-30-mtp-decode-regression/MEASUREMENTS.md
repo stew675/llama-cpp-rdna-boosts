@@ -414,3 +414,63 @@ keeps `n_q=9..32` on TILE) and is *not* a purity change (the band is already bou
 matmul family switch at `MMQC/MMVF_MAX_BATCH_SIZE`, independent of FA).  Recommendation: leave the
 delivery as-is; optionally match the MFMA threshold only if we want upstream alignment.
 
+
+---
+
+## §F — TODO item 21: recover the V4 native-staging prefill cost — **FIXED (prefill stages, decode stays native)**
+
+Problem: V4's native read is a decode win but a prefill cost (`pp150000` q8_0 1 GPU: native 661.0 vs
+staging 690.4) because a quantized source cannot feed the `cp_async` pipeline and each K/V tile is
+re-dequantized once per query block, while the F16 staging conversion is paid once for many rows.
+
+### Design — the band split is the fix, the scratch is the memory trick
+
+* **Prefill (`Q->ne[1] > 8`) stages.** Measured conclusion: the conversion is amortised over the query
+  rows and the tiles feed `cp_async`, so staging wins at every depth (pp8192 1235 vs 1228, pp32768 1087
+  vs 1073, pp150000 690 vs 661).
+* **Decode/verify (`Q->ne[1] <= 8`) stays native** — that is the +22.5 % at d65k (23.17 vs 18.92).
+* The staging scratch for a native-capable operand could not stay in the node: `get_alloc_size` is
+  called on the *reserve* graph, whose `K->ne[1]` is `n_ctx` (verified 8192 at `-c 8192`,
+  196608 at `-c 196608` — the real graphs use the padded prefix, 256 initially).  Reserving it costs
+  726 MiB at a 200k context, which is exactly the adaptive-MTP load failure.
+* So the scratch comes from a **per-context, per-stream arena** (`ggml_backend_cuda_context::fattn_stage`,
+  grown by 25 %).  Safe because a multi-token graph is never CUDA-graph captured (the prefill skip in
+  `ggml_backend_cuda_graph_compute`), and the captured decode graph is native and needs no scratch.
+* `GGML_CUDA_FA_STAGE_MAX_MB` (default 512, 0 = unbounded) bounds the transient per operand; above it
+  the native read is used, so a very deep prefill cannot force an unbounded allocation.
+
+### Results (27B UD-Q4_K_XL, q8_0 K/V, `pp150000`)
+
+| config | native (V4) | **arena-staging (new)** | node-staging (V4 off) | f16 | stock |
+|---|---|---|---|---|---|
+| 1 GPU | 661.0 | **691.4** | 690.4 | 703.4 | 669.5 |
+| 2-card tensor | 996.0 | **1076.9** | 1080.1 | 1087.5 | 997.9 |
+| 3-card tensor | 1111.4 | **1199.0** | 1203.6 | 1218.6 | 1085.8 |
+
+`pp8192` 1251.5 / `pp32768` 1087.1 — staging parity at every depth.  Decode `tg64` q8_0 28.68 / 25.69 /
+23.17 (native, matches the V4-on baseline 28.86/25.77/23.29).  Reserve at `-c 196608` q8_0:
+**123.04 MiB**, 1 GPU and `-sm tensor` alike (vs 849.04 staging).  Adaptive MTP ceiling 12 at
+`-c 196608` q8_0 loads and generates (72.9 t/s).  Same-seed greedy text staged == native: q8_0
+`472b282950b5`, q4_0 `118eb7f5fe85`, f16 `70960317a203` (long ~4k prompt, `-n 128`).
+
+### Two findings worth keeping
+
+1. **The first attempt measured 651 (worse than both) for a code reason, not a memory one.**  The
+   launcher staged into the arena but still passed `kv_native_K/V` to the kernel, so the kernel
+   dequantized the raw cache *in addition to* the staging pass.  Fix: pass
+   `use_native ? kv_native_K : FATTN_KV_NATIVE_NONE` to the kernel.  The correct split is 691.4.
+2. **The growth policy is not the performance lever.**  An exact-fit (realloc-per-growth) arena
+   measured 691.02 vs 691.36/691.90 for the 25 %-growth arena.  The arena is kept for bounded *retained
+   memory* (the generic leg pool caches up to 256 buffers and this request grows with the prefix, so a
+   long prefill would leave ~150 distinct buffers cached), not for speed.
+
+### Side observation (pre-existing, orthogonal)
+
+The 4B with a q4_0 K/V cache shows `W=1` differing from `W=2..8` in the width probe (q8_0 and f16 are
+pure).  It reproduces identically with `GGML_CUDA_FA_STAGE_MAX_MB=1` (native prefill) *and* with
+`GGML_CUDA_FA_KV_NATIVE=0` (all-staging), and with a constant `n_ctx` in the probe, so it is neither
+this change nor the probe's `n_ctx` variation.  It may be a gap in the `GREEDY-PURITY.md` §14 claim for
+the 4B; separate follow-up.
+
+Evidence: this section, `patches/2026-09-14-todo21-prefill-arena-staging.diff`, and the raw runs under
+`~/wip-issue30/results/2026-09-14-todo21-*.txt`.

@@ -1,0 +1,21 @@
+=== 2026-09-14T16:57:11-05:00 arena + staged-kernel-arg fix ===
+awk: cmd. line:1: $0 ~ ("pp"p)"{gsub(/^ +| +$/,"",$(NF-1)); print $(NF-1)}
+awk: cmd. line:1:                               ^ unterminated string
+arena-staging pp8192    
+awk: cmd. line:1: $0 ~ ("pp"p)"{gsub(/^ +| +$/,"",$(NF-1)); print $(NF-1)}
+awk: cmd. line:1:                               ^ unterminated string
+arena-staging pp32768   
+awk: cmd. line:1: $0 ~ ("pp"p)"{gsub(/^ +| +$/,"",$(NF-1)); print $(NF-1)}
+awk: cmd. line:1:                               ^ unterminated string
+arena-staging pp150000  
+-- reference: node-staging pp150000 --
+node-staging   pp150000 690.35 ± 0.00
+-- reference: native pp150000 --
+native         pp150000 661.03 ± 0.00
+arena-staging pp8192    1238.91 ± 0.00
+arena-staging pp32768   1087.06 ± 0.00
+arena-staging pp150000  691.90 ± 0.00   (node-staging 690.35, native 661.03, stock 669.5, f16 703-704)
+-- decode tg64 q8_0 (native decode expected: 28.86 / 25.77 / 23.29 vs staging 28.61/22.78/18.92) --
+| qwen35 27B Q4_K - Medium       |  16.34 GiB |    27.32 B | ROCm       |  99 |   q8_0 |   q8_0 |            tg64 |         28.68 ± 0.00 |
+| qwen35 27B Q4_K - Medium       |  16.34 GiB |    27.32 B | ROCm       |  99 |   q8_0 |   q8_0 |   tg64 @ d32768 |         25.69 ± 0.00 |
+| qwen35 27B Q4_K - Medium       |  16.34 GiB |    27.32 B | ROCm       |  99 |   q8_0 |   q8_0 |   tg64 @ d65536 |         23.17 ± 0.00 |

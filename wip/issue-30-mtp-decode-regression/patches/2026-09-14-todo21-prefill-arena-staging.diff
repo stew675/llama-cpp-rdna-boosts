@@ -1,0 +1,163 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 72b0c9ef1..86aa32597 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1639,6 +1639,35 @@ struct ggml_backend_cuda_context {
+ 
+     ggml_cuda_stream_context concurrent_stream_context;
+ 
++    // Issue #30 TODO 21: F16 staging scratch for a native-capable (q8_0/q4_0/bf16) K/V operand at
++    // prefill.  A prefill stages (the conversion is amortised over many query rows, and the F16
++    // tiles then feed the cp_async pipeline) while decode/verify reads the raw cache, so this
++    // buffer is only ever touched by a multi-token graph -- which is never CUDA-graph captured (see
++    // the prefill skip in ggml_backend_cuda_graph_compute).  It is therefore safe to allocate it
++    // here instead of reserving it in the compute graph, where the reserve sizes it for n_ctx (up
++    // to ~800 MiB per GPU at a 200k context) even though the real scratch tracks the prefix length.
++    // One arena per stream (concurrent streams can be staging at the same time), bounding the
++    // retained memory to ~1.25x the largest request: the generic pool retains every distinct size,
++    // and this request grows with the prefix, so a long prefill would leave ~150 buffers cached.
++    // The growth policy is not a performance lever (exact-fit realloc measured the same).
++    char * fattn_stage[GGML_CUDA_MAX_STREAMS]      = {};
++    size_t fattn_stage_size[GGML_CUDA_MAX_STREAMS] = {};
++
++    void * fattn_stage_get(int stream_no, size_t size) {
++        GGML_ASSERT(stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS);
++        if (size > fattn_stage_size[stream_no]) {
++            const size_t new_size = std::max<size_t>(size_t(1) << 24, size + size/4); // 16 MiB floor, 25% growth
++            char * new_arena = nullptr;
++            CUDA_CHECK(cudaMalloc(&new_arena, new_size));
++            if (fattn_stage[stream_no] != nullptr) {
++                CUDA_CHECK(cudaFree(fattn_stage[stream_no]));
++            }
++            fattn_stage[stream_no]      = new_arena;
++            fattn_stage_size[stream_no] = new_size;
++        }
++        return fattn_stage[stream_no];
++    }
++
+     ~ggml_backend_cuda_context();
+ 
+     cudaStream_t stream(int device, int stream) {
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 28d3862af..85227c192 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1384,11 +1384,57 @@ void launch_fattn(
+     const int  kv_native_K  = need_f16_K ? ggml_cuda_fattn_kv_native_type(K) : FATTN_KV_NATIVE_NONE;
+     const int  kv_native_V  = !need_f16_V ? FATTN_KV_NATIVE_NONE :
+         (V_is_K_view ? kv_native_K : ggml_cuda_fattn_kv_native_type(V));
+-    const bool use_native_K = kv_native_K != FATTN_KV_NATIVE_NONE;
+-    const bool use_native_V = kv_native_V != FATTN_KV_NATIVE_NONE;
++
++    // The native read is a decode/verify win: it removes the whole-cache F16 conversion that a
++    // quantized source otherwise pays on *every* step (cost ~ n_kv, so it grows with depth) at the
++    // price of dequantizing each tile in-kernel (cost ~ n_q * n_kv / ncols, amortised at prefill but
++    // not at decode).  A prefill therefore stages instead -- the conversion is paid once for many
++    // query rows and the tiles feed the cp_async pipeline -- and only the <= 8-row band reads the
++    // raw cache.  The staging scratch for a native-capable operand is deliberately NOT part of the
++    // node allocation (see ggml_cuda_flash_attn_ext_get_alloc_size, whose scratch is sized for the
++    // reserve graph's n_kv = n_ctx), so it comes from the per-context arena instead; that is safe
++    // because a multi-token graph is never CUDA-graph captured (see the prefill skip in
++    // ggml_backend_cuda_graph_compute), while the captured decode graph is native and needs no
++    // scratch at all.  A very deep prefill can bound the transient with GGML_CUDA_FA_STAGE_MAX_MB
++    // (MiB per operand, 0 = unbounded); above it the native read is used.
++    static const size_t stage_max_bytes = []() {
++        const char * e = getenv("GGML_CUDA_FA_STAGE_MAX_MB");
++        return (size_t) (e ? atoll(e) : 512) << 20;
++    }();
++    const bool stage_ok_K = stage_max_bytes == 0 || (size_t) ggml_nelements(K)*sizeof(half) <= stage_max_bytes;
++    const bool stage_ok_V = stage_max_bytes == 0 || (size_t) ggml_nelements(V)*sizeof(half) <= stage_max_bytes;
++    const bool native_width = Q->ne[1] <= 8;
++    const bool use_native_K = (native_width || !stage_ok_K) && kv_native_K != FATTN_KV_NATIVE_NONE;
++    const bool use_native_V = (native_width || !stage_ok_V) && kv_native_V != FATTN_KV_NATIVE_NONE;
++    // A native-capable operand that stages takes its scratch from the per-context, per-stream arena
++    // rather than the generic CUDA pool.  The pool grows by exact fit and *retains* every distinct
++    // size (the leg pool caches up to 256 buffers), and this request grows with the prefix, so a
++    // long prefill would leave ~150 distinct buffers cached; the arena bounds the retained memory to
++    // ~1.25x the largest requested size.  (The growth policy itself is not a performance lever --
++    // measured pp150k 691.0 with an exact-fit realloc vs 691.4 with 25% growth.)
++    const bool stage_K = kv_native_K != FATTN_KV_NATIVE_NONE && !use_native_K;
++    const bool stage_V = kv_native_V != FATTN_KV_NATIVE_NONE && !use_native_V && !V_is_K_view;
++
++    // The kernel reads what the launcher staged: when an operand is staged (a native-capable type
++    // above the decode/verify band), it must be told FATTN_KV_NATIVE_NONE so it reads the F16 copy
++    // instead of the raw cache (otherwise the staging pass is paid *and* the tiles are dequantized).
++    const int kv_native_kernel_K = use_native_K ? kv_native_K : FATTN_KV_NATIVE_NONE;
++    const int kv_native_kernel_V = use_native_V ? kv_native_V : FATTN_KV_NATIVE_NONE;
+ 
+     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+-        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K && !use_native_K, need_f16_V && !use_native_V);
++        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV,
++            need_f16_K && !use_native_K && !stage_K,
++            need_f16_V && !use_native_V && !stage_V);
++
++    half * K_f16_stage = nullptr;
++    half * V_f16_stage = nullptr;
++    if (stage_K || stage_V) {
++        const size_t nK = stage_K ? (size_t) ggml_nelements(K) : 0;
++        const size_t nV = stage_V ? (size_t) ggml_nelements(V) : 0;
++        char * stage_buf = (char *) ctx.fattn_stage_get(ctx.curr_stream_no, (nK + nV)*sizeof(half));
++        K_f16_stage = (half *) stage_buf;
++        V_f16_stage = (half *) (stage_buf + nK*sizeof(half));
++    }
+ 
+     ggml_cuda_pool_alloc<int>    KV_max(pool);
+     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
+@@ -1408,8 +1454,13 @@ void launch_fattn(
+         const size_t bs = ggml_blck_size(K->type);
+         const size_t ts = ggml_type_size(K->type);
+ 
+-        GGML_ASSERT(f16_extra.K != 0);
+-        half * K_f16 = (half *) f16_extra.K;
++        half * K_f16;
++        if (stage_K) {
++            K_f16 = K_f16_stage;
++        } else {
++            GGML_ASSERT(f16_extra.K != 0);
++            K_f16 = (half *) f16_extra.K;
++        }
+         if (ggml_is_contiguously_allocated(K)) {
+             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+             to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
+@@ -1442,8 +1493,13 @@ void launch_fattn(
+             const size_t bs = ggml_blck_size(V->type);
+             const size_t ts = ggml_type_size(V->type);
+ 
+-            GGML_ASSERT(f16_extra.V != 0);
+-            half * V_f16 = (half *) f16_extra.V;
++            half * V_f16;
++            if (stage_V) {
++                V_f16 = V_f16_stage;
++            } else {
++                GGML_ASSERT(f16_extra.V != 0);
++                V_f16 = (half *) f16_extra.V;
++            }
+             if (ggml_is_contiguously_allocated(V)) {
+                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                 to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
+@@ -1638,7 +1694,7 @@ void launch_fattn(
+         cell_pos ? (const int *) cell_pos->data : nullptr,
+         tok_lo   ? (const int *) tok_lo  ->data : nullptr,
+         tok_hi   ? (const int *) tok_hi  ->data : nullptr,
+-        kv_native_K, kv_native_V
++        kv_native_kernel_K, kv_native_kernel_V
+     );
+     CUDA_CHECK(cudaGetLastError());
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 6a3881eb9..65ec1f263 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -719,6 +719,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+         CUDA_CHECK(cudaFree(q8_1_arena));
+     }
+ 
++    for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
++        if (fattn_stage[i] != nullptr) {
++            CUDA_CHECK(cudaFree(fattn_stage[i]));
++        }
++    }
++
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }

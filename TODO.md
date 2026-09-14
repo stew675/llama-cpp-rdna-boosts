@@ -133,6 +133,17 @@ Dossier: `wip/issue-30-mtp-decode-regression/` (`README.md` action register, `ME
 
 ### 21. Q8_0 K/V prefill: recover the V4 native-staging cost
 
+- **Status: FIXED — prototype validated on gfx1201, pending promotion + gfx1151 validation.**  The band
+  split is the fix: **prefill (`n_q > 8`) stages, decode/verify (`n_q <= 8`) stays native**, and the
+  prefill scratch comes from a new per-context, per-stream arena
+  (`ggml_backend_cuda_context::fattn_stage`) instead of the compute-graph reserve (which sizes it for
+  `n_ctx`).  `pp150000` q8_0: 1/2/3-card **691.4 / 1076.9 / 1199.0** (native 661.0/996.0/1111.4;
+  node-staging 690.4/1080.1/1203.6); decode d65k keeps 23.17; reserve at `-c 196608` stays 123.04 MiB
+  and adaptive-MTP ceiling 12 still loads.  Same-seed text staged == native.  Diff:
+  `wip/issue-30-mtp-decode-regression/patches/2026-09-14-todo21-prefill-arena-staging.diff`;
+  record **`MEASUREMENTS.md` §F**.  Remaining: gfx1151 (gfx1151 uses
+  `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS`/its own FA config, so the band split must be
+  re-measured there), then promote as a **block-15 amendment** (it refines V4's activation policy).
 - **Context.**  The V4 policy (unset = native q8_0/q4_0) gives the **+23 % d65K decode** and the adaptive-MTP
   high-context load (it removes the ~744 MiB F16 scratch).  But a quantized source cannot use the
   `cp_async` pipeline, so the native path re-dequantizes each K/V tile: q8_0 prefill at `pp150000` (27B,
@@ -145,7 +156,7 @@ Dossier: `wip/issue-30-mtp-decode-regression/` (`README.md` action register, `ME
   dequant into smem) to recover cp_async-equivalent throughput; (c) a hoisted/shared prefill conversion.
 - **Gate.**  q8_0 prefill >= stock by the f16 margin, decode +23 % retained, `W=1..8` pure, adaptive-MTP
   `-c 196608` ceiling 12 still loads.
-- Evidence: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §B.
+- Evidence: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §B (symptom) and §F (fix).
 
 ## Waiting on others (not actionable in this repo)
 

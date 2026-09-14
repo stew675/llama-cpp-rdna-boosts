@@ -1,0 +1,21 @@
+=== 2026-09-14T17:23:46-05:00 tensor-split (3 GPUs) ===
+-- reserve @196608 q8_0, -sm tensor: arena (default) vs staging (KV_NATIVE=0) --
+0.03.788.046 I sched_reserve:     Meta() compute buffer size =   123.04 MiB
+0.03.788.048 I sched_reserve:  ROCm_Host compute buffer size =    21.04 MiB
+0.05.072.613 D ~llama_context:     Meta() compute buffer size is 123.0354 MiB, matches expectation of 123.0354 MiB
+   ^ env=X=1
+0.03.787.416 I sched_reserve:     Meta() compute buffer size =   849.04 MiB
+0.03.787.418 I sched_reserve:  ROCm_Host compute buffer size =    21.04 MiB
+0.05.057.672 D ~llama_context:     Meta() compute buffer size is 849.0354 MiB, matches expectation of 849.0354 MiB
+   ^ env=GGML_CUDA_FA_KV_NATIVE=0
+-- pp150000 q8_0 -sm tensor --
+   arena-default  pp150000 1198.98 ± 0.00
+   native         pp150000 1111.36 ± 0.00
+   node-staging   pp150000 1203.59 ± 0.00
+-- pp150000 q8_0 -sm tensor 2 GPUs --
+   arena-default  1076.86 ± 0.00
+   native         996.02 ± 0.00
+-- adaptive MTP ceiling 12 @ -c 196608 q8_0 (memory gate; must LOAD and generate) --
+Loading model... |0.00.018.318 E --spec-draft-n-max 12 is above 7: drafts this deep are supported, but a verify batch of more than 8 rows takes different flash-attention and matmul kernels, so --spec-type none and draft-mtp may no longer produce identical greedy output (a near-tie can flip).  The output stays valid and coherent; use --spec-draft-n-max 7 for bit-identical plain-vs-draft output.  Not an error: the run continues.
+[ Prompt: 87.7 t/s | Generation: 72.9 t/s ]
+Exiting...
