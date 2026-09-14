@@ -1,8 +1,8 @@
 # Packed-QSA port plan
 
 **Status:** P3 done (2026-09-13) — the packed WMMA kernel is correct (rel 3e-5 vs VEC) and ~1.35x
-faster at the op level, flat end-to-end on gfx1201 (see `P3-NOTES.md`); fork `packed-qsa` `4f464941a`.
-P3.5 (optimisation) / P4 / P5 remain.
+faster at the op level, but **~2 % slower end-to-end** at pp8192 on gfx1201 (pack+merge -1.1 %,
+kernel -0.9 %); see `P3-NOTES.md`.  Fork `packed-qsa` `4f464941a`.  P3.5 (now required) / P4 / P5.
 P3 is next.
 Branch: `packed-qsa` (delivery repo) / `packed-qsa` (fork).  Companion concept doc:
 `../prefill-arrangements/README.md`.  Archived measurement:

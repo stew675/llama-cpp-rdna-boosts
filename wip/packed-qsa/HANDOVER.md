@@ -51,11 +51,12 @@ Implement `PORT-PLAN.md` P1 -> P5 on `packed-qsa`:
    `P2-NOTES.md`.  Host cross-check + 202-case self-test both green; the self-test found and fixed a
    duplicate-index block-split in the reference merge kernel.  See its "What P3 needs to know".
 3. **P3** — **DONE 2026-09-13** (fork `4f464941a`; parts: `91f5e41a0` primitive, then the kernel).
-   The packed WMMA kernel matches the VEC kernel (rel 3e-5) and is ~1.35x faster at the op level;
-   end-to-end pp4096 is flat on gfx1201.  Record + the two bring-up bugs (the `RDNA4` host-pass
-   guard, the per-row softmax reduction) are in `P3-NOTES.md`.
-4. **P3.5 (optional) / P4 / P5** — op optimisation; support predicate + `-sm tensor` pack layout +
-   gfx1151 16-half fragments; then PPL / `W=1..8` / MTP / pp8192-16384 A/B.
+   The packed WMMA kernel matches the VEC kernel (rel 3e-5) and is ~1.35x faster at the op level,
+   but **~2 % slower end-to-end** at pp8192 (pack+merge -1.1 %, kernel -0.9 %).  Record + the two
+   bring-up bugs (the `RDNA4` host-pass guard, the per-row softmax reduction) are in `P3-NOTES.md`.
+4. **P3.5 (now required) / P4 / P5** — make the pack+merge free and the kernel genuinely faster
+   (the end-to-end must go positive); support predicate + `-sm tensor` pack layout + gfx1151 16-half
+   fragments; then PPL / `W=1..8` / MTP / pp8192-16384 A/B.
 4. **P4** support predicate + dispatch + VEC fallback (RDNA4 gfx1201 and RDNA3.5 gfx1151); decide
    the `-sm tensor` pack layout (currently asserts mirrored).
 5. **P5** validate: op correctness vs VEC, PPL, `W=1..8` (packed is prefill-only), MTP acceptance,

@@ -55,21 +55,38 @@ Op-level, `GGML_CUDA_QSA_ATTN_CHECK=1` timing (`x20`, same inputs):
 | n_q=1656, ns=1792 | 8.23 ms | 11.19 ms | **1.36x** |
 | n_q=2756, ns=2051 | 16.47 ms | 21.99 ms | **1.34x** |
 
-End-to-end `llama-bench -p 4096` (the same model, `-sm layer`, f16 KV): 893 t/s VEC vs 895 t/s
-packed — **flat within noise**.  On this box the QSA op is only ~5 % of a prefill pass, so a 1.35x
-op win is ~1.5 % end-to-end, below the ±2 % bench noise.  (The archived gfx1151 attribution put QSA
-at 14 % of the pass; the delivery's VEC kernel is relatively faster there, and the box is slower
-overall, so the fraction differs.)
+End-to-end `llama-bench -p 8192` (same model, `-sm layer`, f16 KV, `LLAMA_QSA_DENSE_SHORTCUT=0`):
 
-The plan's op target was `>= 2x`; 1.35x is short of it.  The kernel is correct and lands the
-architecture, but the remaining headroom is real: the per-row softmax costs 8 separate shuffle
-reductions, the P transpose goes through LDS, there is no K/V prefetch, and only 16 keys are
-processed per iteration.  Treat those as the P3.5 optimisation list, not as blockers.
+| configuration | pp8192 | vs pure VEC |
+|---|---:|---:|
+| pure VEC (no pack) | 893.75 ± 3.07 | — |
+| pack+merge, VEC attention (`GGML_CUDA_QSA_PACKED_ATTN=0`) | 883.89 ± 2.17 | **-1.1 %** (P1+P2 overhead) |
+| pack+merge, WMMA attention | 876.42 ± 3.08 | **-2.0 %** (P1+P2 + kernel) |
+
+So the packed path is **a net ~2 % regression end-to-end** at pp8192 on gfx1201: ~1.1 % is the
+per-graph pack + per-op merge cost, and the WMMA kernel is ~0.9 % *slower* than the VEC kernel in
+the full pass even though it measured 1.35x *faster* in the isolated op benchmark.
+
+That contradiction is unresolved and is the first P3.5 item: the isolated `x20` timing reuses the
+same packed K/V (warm L2), while the full run reads it cold once per layer — so the microbenchmark
+likely flatters the packed kernel.  Either way the end-to-end number is the one that counts, and it
+says the QSA op is not the lever on gfx1201 that the gfx1151 attribution suggested (there QSA was
+14 % of the pass; here the VEC kernel is relatively better, so the whole op is a smaller share and
+even a 1.35x op win is swallowed by the pack/merge cost and bench noise).
+
+The plan's op target was `>= 2x`; 1.35x is short of it, and the end-to-end is negative.  The kernel
+is correct and lands the architecture, but **it should stay default-off** and the campaign should
+re-focus on either (a) making the pack+merge free (fold the merge into the packed layout build, skip
+the pack when nothing changed) and the kernel genuinely faster, or (b) the gfx1151 target where the
+op is a larger share.  P3.5 / P5 decide.
 
 ## What remains
 
-- **P3.5 (optimisation, optional):** fewer softmax shuffles (shuffle the 8-row vector once per
-  step), shuffle-based P transpose, K/V prefetch, wider key chunks.  Re-run the A/B + timing.
+- **P3.5 (optimisation):** the end-to-end is negative, so this is now a *requirement*, not just
+  polish.  Two tracks: (a) make the P1 pack + P2 merge free (fold the merge into the packed-layout
+  build; skip the whole pack when the selection/cache did not change) and (b) make the kernel
+  genuinely faster (shuffle-based P transpose, K/V prefetch, wider key chunks, fewer softmax
+  shuffles).  Re-validate with the A/B + the end-to-end `-p 8192` decomposition table.
 - **P4:** support predicate / dispatch fallback; `-sm tensor` pack layout (currently asserts the
   pack is mirrored); RDNA3.5 (gfx1151) needs a 16-half fragment instantiation.
 - **P5:** PPL vs the VEC build, `W=1..8` logits matrix (packed is prefill-only, so it should be
