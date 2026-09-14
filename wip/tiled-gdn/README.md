@@ -32,12 +32,14 @@ kernel on RDNA3.5", which also carries a KDA tiled variant).
    **bit-exact opt-in / fallback** for the chunked path, (b) a **KDA prefill** path (chunked is
    non-KDA only), or (c) a **gfx1100/RDNA3 fallback** where the gfx11 NW16 chunked kernel may not
    fit.  As a default prefill kernel it loses to what we already ship.
-5. **The journey's headline ~2.2× is not the GDN.**  It is the qwen4exp prefill stack.  The clean
-   weight-dependent term is pwilkin's `mmb.cu` — an IQ4_NL-only dequant-to-BF16 WMMA GEMM (1.42× in
-   his finished-stack ablation) with **no counterpart in our tree**; that is the "special weight
-   set" signature.  The PLE reader and its prefetch are shared on both sides, so they are a weak
-   explanation.  The step-11 2.37× is a *walk* number and does not appear in pwilkin's own
-   finished-stack ablation — see [`05-where-the-speed-comes-from.md`](05-where-the-speed-comes-from.md).
+5. **The journey's headline ~2.2× is not the GDN.**  It is the qwen4exp prefill stack; the
+   weight-set hinge is pwilkin's `mmb` (IQ4_NL-only dequant-to-BF16 WMMA GEMM), which the repo
+   already reproduced (1.77–1.79×) and ported (parked, default off, +18.4 %).  After that port the
+   residual is the **QSA v3 sparse-attention kernel** + HC fusions, not more weight GEMM.  The PLE
+   reader/prefetch are shared, so they are a weak explanation.  The step-11 2.37× is a *walk* number
+   and does not appear in pwilkin's own finished-stack ablation — see
+   [`05-where-the-speed-comes-from.md`](05-where-the-speed-comes-from.md) and the archived
+   `iq4nl-prefill` handover.
 
 ### Answer to the session question
 

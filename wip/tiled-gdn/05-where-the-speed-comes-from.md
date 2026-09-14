@@ -41,8 +41,8 @@ view: tiled is ~4 % end-to-end against the finished delivery, not 2.37×.)
 ## 2. The weight-set dependence has a specific source
 
 You saw ~2× with pwilkin's special weights and only "a little faster" with others.  That is the
-signature of one weight-path optimization our tree **has no counterpart for** — plus a loading path
-that is **shared in intent** and therefore a weak candidate:
+signature of one weight-path optimization the delivery **has no counterpart for** — plus a loading
+path that is **shared in intent** and therefore a weak candidate:
 
 ### 2a. `mmb.cu` — dequant-to-BF16 WMMA GEMM (pwilkin step 05, `e55085251`)
 
@@ -60,10 +60,28 @@ It is **IQ4_NL-specific** — that is the "special weight set".  With any other 
 not fire and the delta collapses, which is precisely your observation.  In pwilkin's tree it is
 gated to gfx1151/RDNA3.5; a gfx1201 port would be separate work.
 
-**Our tree has no `mmb.cu`/`mmb.cuh` at all.**  Our qwen4exp prefill runs the MoE/dense GEMMs on
+**The delivery has no `mmb.cu`/`mmb.cuh`.**  Our qwen4exp prefill runs the MoE/dense GEMMs on
 the MMQ path (block 13's routed-compact MMQ + `mul_mat_q_pair`), not on a dequant-to-bf16 WMMA
 shadow.  The earlier session brief already flagged this as the ~1.2–1.5× i-quant expert-GEMM gap;
 the bf16 shadow adds the rest.
+
+**This was already reproduced and ported.**  The archived handover
+[`archive/work/wip-archive/iq4nl-prefill/HANDOVER-2026-09-12-iq4nl-weight-gemm-port.md`](../../archive/work/wip-archive/iq4nl-prefill/HANDOVER-2026-09-12-iq4nl-weight-gemm-port.md)
+measured the same effect on the Strix Halo box: pwilkin's full stack **1408.8 t/s** vs the delivery
+**787.2** at pp16384 — **1.77–1.79×**, which is the ~2× you saw (and the delivery is *ahead* on
+decode, 31.26 vs 30.36).  It built the port (`mmb-port.patch`, `GGML_CUDA_MMB=1`, default **0**):
+**+18.4 %** (787 → 934), not the full gap.  Family ranking on pwilkin's build (disable one family):
+MMB **−33 %**, HC **−21 %**, QSA attention nonlinear (the default dense fallback), conv −62, norm
+−30, idx-relu-sum −10.  The weight-set hinge is explicit: his `mmb_supported_mmid`/`_glu` are
+**IQ4_NL-only**, so the fast path fires on a uniform-IQ4_NL checkpoint and not on a mixed
+expert-type one.
+
+The handover's own verdict: **the remaining gap is not a weight GEMM.**  After the port, the
+dominant item is the **QSA v3 sparse-attention kernel** (`flash_attn_qsa` 2842 ms vs his `qsa3`
+730 ms), then the HC fusions and the bf16-producer marking.  The port was **parked**, not rejected —
+for a *design-objective clash*: his stack turns on token-count-gated switches that change the
+arithmetic, which collides with this repo's W = 1..8 determinism contract (handover §12).  That is a
+separate campaign from TODO item 1.
 
 ### 2b. The PLE reader + prefetch — both trees have them
 
@@ -102,7 +120,7 @@ journey attributes 1.03–1.19× to those items.
 
 | term | mechanism | present in ours? | weight-dependent? |
 |---|---|---|---|
-| `mmb` dequant-to-BF16 WMMA GEMM | IQ4_NL dequant-once + WMMA | **no counterpart** | **yes** (IQ4_NL only) |
+| `mmb` dequant-to-BF16 WMMA GEMM | IQ4_NL dequant-once + WMMA | parked port (`GGML_CUDA_MMB`, default off) | **yes** (IQ4_NL only) |
 | PLE reader + prefetch | pread rows + WILLNEED/FADV batch | present on both paths | mostly model/UMA-specific |
 | sparse kernel + maskless KQ | selected-block attention graph | QSA (different form) | no |
 | HC / conv1d / norm-gated / indexer fusions | graph fusions | partly, different form | no |
@@ -129,14 +147,16 @@ The clean A/B is a **flag-matched** comparison, because the loading flags alone 
 
 ## 5. Bottom line
 
-The journey's ~2.2× is **the qwen4exp prefill stack**, and the cleanest weight-dependent term is
-**`mmb`** — the IQ4_NL dequant-to-bf16 WMMA GEMM path, which our tree has no counterpart for.  The
-PLE reader and its prefetch are shared on both sides (ours: managed arena + `fadvise`/`madvise`
-batching; pwilkin's: header-only pread + async next-chunk `prefetch()`), and its journey numbers are
-measured against pwilkin's own mmap baseline, so it is a weak explanation for your gap.  The tiled GDN's own 2.37× is a *walk* number that is absent from
-pwilkin's finished-stack ablation; our gfx1201 measurements agree it is a small end-to-end term
-once the stack is fast.  The weight-set dependence you saw is the `mmb` signature.
+The journey's ~2.2× is **the qwen4exp prefill stack**.  The **weight-set dependence you saw** is
+pwilkin's `mmb` (IQ4_NL-only dequant-to-bf16 WMMA GEMM) — and the repo already reproduced the
+1.77–1.79× and built the port (parked, default off, +18.4 %).  But `mmb` is not the whole gap: the
+archived handover's verdict is that the residual is dominated by the **QSA v3 sparse-attention
+kernel** (his `qsa3` 730 ms vs our `flash_attn_qsa` 2842 ms) plus the HC fusions.  The PLE reader
+and its prefetch are shared on both sides, so they are a weak explanation.  The tiled GDN's own
+2.37× is a *walk* number that is absent from pwilkin's finished-stack ablation; our gfx1201
+measurements agree it is a small end-to-end term once the stack is fast.
 
 This also sharpens the port decision: if the goal is to close *your* observed gap, the tiled GDN is
-the wrong lever — **`mmb`-style weight-path work (a dequant-to-bf16 WMMA GEMM, IQ4_NL-first) is the
-lever**.  That is a separate campaign from TODO item 1, and worth its own scoping note.
+the wrong lever.  The weight-set hinge is `mmb`, but the larger residual (per the archived handover)
+is the QSA v3 sparse-attention kernel plus the HC fusions — a separate campaign from TODO item 1,
+and worth its own scoping note.

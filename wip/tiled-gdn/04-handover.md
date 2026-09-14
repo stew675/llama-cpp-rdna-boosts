@@ -33,12 +33,10 @@ commit only `wip/tiled-gdn/` and leave it alone.
 2. **Tiled is slower than what we ship.**  ~1.8× vs the sequential scan, but ~5× slower than the
    chunked bf16 default at the op level, and ~4 % slower end-to-end (pp2048/pp8192).  The entire
    GDN prefill lever is ~9 % on this box/model.
-3. **The journey's ~2.2× is the prefill stack, not the GDN; its clean weight-dependent term is
-   `mmb`.**  pwilkin's `mmb` (IQ4_NL-only dequant-to-BF16 WMMA GEMM, 1.42× in the finished-stack
-   ablation) has no counterpart in our tree — the "special weight set" signature.  The PLE reader
-   and its prefetch are shared on both sides (managed arena + `fadvise`/`madvise` batching vs
-   header-only pread + async next-chunk `prefetch()`), so they are a weak explanation.  The step-11
-   2.37× is a walk number and is absent from that ablation.  See `05-where-the-speed-comes-from.md`.
+3. **The journey's ~2.2× is the prefill stack, not the GDN; the weight-set hinge is `mmb`.**  The
+   repo already reproduced 1.77–1.79× on the Strix Halo box and ported pwilkin's `mmb` (parked,
+   default off, +18.4 %); the residual is the QSA v3 sparse-attention kernel + HC fusions.  See
+   `05-where-the-speed-comes-from.md` and `archive/work/wip-archive/iq4nl-prefill/`.
 4. **The only likely wins are niche:** KDA prefill (chunked is non-KDA only), an exact opt-in /
    chunked-off fallback, and a gfx1100 fallback if the NW16 gfx11 chunked kernel does not fit.
 
