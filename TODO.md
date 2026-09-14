@@ -47,6 +47,16 @@ bit-identical to the generic chain, so the fusion selection no longer changes th
 **Active is now item 18 only**; the previous header's `9113cc188` / `0f4f83f9` references
 are superseded by the 2026-09-13 re-base to `790cf51aa` (tip `6303f0489`, tree `311f3acebe82a65b`).
 
+**2026-09-14 (issue #30, wider-configuration campaign).**  Dossier `wip/issue-30-mtp-decode-regression/`
+opened.  The BF16 depth scaling is verified clean (BF16 vs stock's f16, ahead at every depth); the
+quantized-KV depth fall-off is root-caused to the tile kernel's **whole-cache F16 staging pass** and
+fixed by making `V4` native staging the default for sub-F16 quants plus a **new q4_0 native arm** (q8_0
+d65k 18.92 -> **23.29**, q4_0 19.72 -> **22.82**; stock 22.43 / 21.03; bit-identical, `W=1..8`-pure,
+MTP-neutral).  The adaptive-MTP high-context load failure is root-caused to the recurrent-snapshot set
+(`n_seq_max x (1 + n_max)` f32 GDN planes = **7781 MiB** at ceiling 12; `--parallel 1` loads at 1945
+MiB).  The experiment is **validated but not yet promoted**; Action E (#28867 head-256 WMMA threshold)
+is in progress.  See **items 2 and 20**.
+
 ## Active (kept compact: only what this repo will work on next)
 
 ### 1. Adapt/implement Tiled Gated Delta Net
@@ -57,6 +67,49 @@ are superseded by the 2026-09-13 re-base to `790cf51aa` (tip `6303f0489`, tree `
 - The goal here will to adapt that work into this project as an environment variable gated option
 - Early analysis shows that the Tiled GDN work is highly dependent on a number of precise factors aligning to achieve its astonishing prefill performance
 - I am not even sure if this is at all possible.  This will be purely an exploratory WIP project
+
+### 2. Native FA staging for the remaining quantized KV types: `q4_1` / `q5_0` / `q5_1` / `iq4_nl`
+
+- **Context (2026-09-14, issue #30 + `wip/issue-30-mtp-decode-regression/`).**  The quantized-KV decode
+depth fall-off was the whole-cache F16 staging the tile kernel runs for a quantized cache.  Block 15's
+`V4` native staging removes it; the 2026-09-14 experiment made `V4` the default for sub-F16 quants and
+added the missing **q4_0** arm.  `q8_0` d65k **18.92 -> 23.29** and `q4_0` **19.72 -> 22.82** (tg64,
+1 GPU; stock 22.43 / 21.03), bit-identical and `W=1..8`-pure.
+- **What is still missing.**  `q4_1`/`q5_0`/`q5_1`/`iq4_nl` have **no native arm** — they still stage
+through F16.  They are *well supported* (retention tracks stock: q4_1 81.1 % vs 81.1 %, q5_0 78.8 % vs
+77.9 %, q5_1 78.9 % vs 78.1 %; all `W=1..8` one hash) but sit **~12-16 % behind f16** at d32k, so a
+native arm should recover that.
+- **Work.**  Add `ggml_cuda_fattn_dequantize_<type>_chunk` loaders beside the q8_0/q4_0 ones and wire
+them through the tile + MMA dispatch (`FATTN_KV_NATIVE_*`, `ggml_cuda_fattn_kv_native_type`, the
+predicates, the `flash_attn_tile_load_tile_native` / `flash_attn_ext_f16_load_tile_native`
+dispatches).  **Each helper must reproduce that type's `ggml_get_to_fp16_cuda` conversion bit-for-bit**
+(the q8_0/q4_0 arms do), or the recorded reference hashes move.
+- **Gate.**  Text `native == staging`, `W=1..8` one hash per type, `plain == draft-mtp`, MTP acceptance
+unchanged, prefill cost <= ~2 %.
+- **Gotcha.**  Do **not** benchmark `iq4_nl` on a stock/un-amended build — it has no FA enablement there
+and runs host-only/CPU (a >10 min run at 100 % CPU).
+- Record: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §B (audit table + the q4_0/q8_0 fix).
+
+### 20. Issue #30 wider-configuration follow-ups (umbrella)
+
+Dossier: `wip/issue-30-mtp-decode-regression/` (`README.md` action register, `MEASUREMENTS.md`).
+- **Pending promotion:** the 2026-09-14 `V4` activation-policy refinement + the new q4_0 native arm
+  (item 2's q8_0/q4_0 half) — experiment diff
+  `wip/issue-30-mtp-decode-regression/patches/2026-09-14-v4-default-plus-q4_0-native.diff`, validated
+  bit-identical + band-pure + MTP-neutral on gfx1201.  Promote as a **block-15 amendment**, together
+  with Action E, in one integration pass.
+- **Action E — #28867 head-256 WMMA threshold (in progress 2026-09-14).**  Upstream #28102 admitted
+  head 256 to the RDNA4 WMMA dispatch with `Q->ne[1]*gqa_ratio_eff > 16`; the reporter's #28867 shows a
+  narrow MTP verify (`n_q = 9`) on this model then takes WMMA and loses ~20 % of decode, and that the
+  MFMA branch already uses `> 64`.  Our delivery also has the `Q->ne[1] > 8` purity guard, so the two
+  overlap for `n_q <= 8`; the question is `n_q = 9..N` (depth 8..15 verify + batched serving).  Must not
+  move any `W <= 8` hash and must be prefill-neutral.
+- **Action C — adaptive-MTP recurrent-snapshot buffer at high context (root-caused 2026-09-14).**
+  `llama_memory_recurrent` allocates `n_seq_max x (1 + n_rs_seq)` f32 GDN-state planes with
+  `n_rs_seq = draft.n_max`, so adaptive ceiling 12 = **7781 MiB** at the server default `n_parallel 4`
+  (598.5 MiB/plane); the draft context's last 260 MiB then OOMs at `-c 196608` q8_0.  `--parallel 1`
+  loads (1945 MiB).  Structural reduction (lazy/shared planes, precision, recompute-on-rollback) is the
+  open R&D item; a memory-aware effective-ceiling fallback is the low-risk stopgap.
 
 ## Waiting on others (not actionable in this repo)
 
