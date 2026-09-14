@@ -321,6 +321,41 @@ faster in tensor-only testing for exactly that reason.  Rule: any prefill change
 
 Experiment diff: `patches/2026-09-14-prefill-rdna-config-and-ncols2.diff`.
 
+### Split-aware `ncols2` (the ideal, pending plumbing)
+
+The single-card and `-sm tensor` optima are **different and both real**:
+
+| rule | 1 GPU pp32K / pp64K / pp150K | `-sm tensor` pp150K |
+|---|---|---|
+| generic `gqa>4 -> ncols2=8` | 1096.3 / 916.6 (pre-AMD) / 664.8 | **1219.9** |
+| AMD `gqa%2 -> ncols2=2` | **~ / 947.7 / 703.7** | 1152.3 |
+| stock | 982.6 / 877.2 / 686.9 | 1111.8 |
+
+**The signal exists.**  Instrumenting `switch_ncols2` on the 27B shows the FA op is **head-split under
+tensor split**:
+
+```
+1 GPU:  n_q=512  Q.ne2=24  K.ne2=4  gqa=6
+ tensor: n_q=512  Q.ne2=12  K.ne2=2  gqa=6   and   Q.ne2=6  K.ne2=1  gqa=6
+```
+
+So under `-sm tensor` the KV heads are distributed (`K.ne2` 2/1 vs 4) while the *ratio* stays 6.  The
+chooser runs per split sub-op and sees the reduced head count, but **cannot know the model's total**
+from the op alone, so a robust rule needs the split mode:
+
+* **option A (proper):** a small `ggml_cuda` policy set from the llama layer, which already has
+  `llama_model::split_mode()` — e.g. a `ggml_cuda_set_fa_tensor_parallel(bool)` called once at model load,
+  read by `switch_ncols2`; tensor-parallel -> generic 8, otherwise -> stock's AMD 2.  This is a block-04
+  amendment (new API plumbing), and it must be validated in both modes + the 4B q4_0 band.
+* **option B (interim, safe):** adopt stock's AMD rule globally (it beats stock in *both* modes:
+  single 703.7 +2.4 %, tensor 1152.3 +3.6 %), giving up the extra ~5.5 % tensor win until A lands.
+* **option C (hacky):** infer from the op (`K.ne2` shrunk vs the full head count) — rejected: fragile for
+  models with few KV heads and for `-sm layer`, where the op is **not** split (Q.ne2=24) and the AMD rule
+  is correct despite `device_count > 1`.
+
+**Recommendation:** option A (it is what "tensor split is already tuned, single card was never
+re-checked" actually calls for); use option B if the promotion cannot wait for the API.
+
 ---
 
 ## §E — #28867 head-256 WMMA threshold — **investigated; the delivery does not have the regression**
