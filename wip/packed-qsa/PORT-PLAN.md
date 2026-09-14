@@ -1,7 +1,8 @@
 # Packed-QSA port plan
 
-**Status:** P3 in progress (2026-09-13) — the gfx12 f16 WMMA primitive + fragment layout are validated
-and the kernel body is designed (`P3-DESIGN.md`); fork `packed-qsa` `91f5e41a0`.
+**Status:** P3 done (2026-09-13) — the packed WMMA kernel is correct (rel 3e-5 vs VEC) and ~1.35x
+faster at the op level, flat end-to-end on gfx1201 (see `P3-NOTES.md`); fork `packed-qsa` `4f464941a`.
+P3.5 (optimisation) / P4 / P5 remain.
 P3 is next.
 Branch: `packed-qsa` (delivery repo) / `packed-qsa` (fork).  Companion concept doc:
 `../prefill-arrangements/README.md`.  Archived measurement:
@@ -102,7 +103,8 @@ its own `W=1..8` matrix.
 | P1 ✅ | graph pack ops + the two new op sources + the gate (no kernel change yet) — `P1-NOTES.md` |
 | P2 ✅ | port `qsa3_rows` + `qsa3_merge` (descriptor builder); unit-check the union/mask against the `idx` rows — `P2-NOTES.md` |
 | P3 (part 1 ✅) | gfx12 f16 WMMA primitive + fragment-layout self-test validated; kernel body designed — `P3-DESIGN.md` |
-| P3 (part 2) | implement the kernel body (grid/block, 8-way dim split, masking, online softmax, LDS P-transpose) |
+| P3 (part 2) ✅ | implement the kernel body (grid/block, 8-way dim split, masking, online softmax, LDS P-transpose) — `P3-NOTES.md` |
+| P3.5 (optional) | op optimisation: softmax shuffles, P transpose, K/V prefetch, wider key chunks |
 | P4 | support predicate + dispatch + fallback; RDNA4 (gfx1201) and RDNA3.5 (gfx1151) |
 | P5 | validate: correctness vs VEC, PPL, `W=1..8`, MTP acceptance, perf A/B |
 

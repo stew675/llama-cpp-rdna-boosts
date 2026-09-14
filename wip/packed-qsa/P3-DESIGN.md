@@ -1,7 +1,7 @@
 # Packed-QSA — P3 design (gfx12 WMMA attention)
 
-**Status:** primitive validated 2026-09-13; kernel body not yet written.  P1/P2: `P1-NOTES.md`,
-`P2-NOTES.md`.  Fork `packed-qsa`.
+**Status:** implemented 2026-09-13 (see `P3-NOTES.md` for the results and the bring-up fixes); this
+file is the design record.
 
 ## 1. The validated gfx12 primitive
 
