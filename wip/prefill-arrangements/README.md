@@ -185,3 +185,5 @@ already arranged** (bf16 staged, WMMA, state in accumulators) and already beats 
 gfx1201; its remaining analogues are the bf16 stream marking and the depthwise conv1d fusion.
 Follow our own trail: VEC stays the band/reference, packed-QSA lands prefill-only and opt-in, and
 nothing defaults on until the purity gates pass.
+
+**Implementation plan:** [`../packed-qsa/PORT-PLAN.md`](../packed-qsa/PORT-PLAN.md).
