@@ -226,6 +226,21 @@ Acceptance identical and text bit-identical; the native path is flat-to-slightly
 depth.  (A first run *with* `-lv 4` showed different text hashes — the known statistics-interleaving
 artifact, `GREEDY-PURITY.md` §14/§33; re-running without `-lv 4` is the correct gate.)
 
+**The default (V4) prefill cost grows with depth and split** (q8_0 K/V, `pp150000`, f16 control):
+
+| mode | V4 on | V4 off | f16 | stock q8_0 |
+|---|---|---|---|---|
+| 1-card | 661.6 | 690.3 | 703.4 | 669.5 |
+| 2-card tensor | 996.3 | 1080.1 | 1087.5 | 997.9 |
+| 3-card tensor | 1111.4 | — | 1218.6 | 1085.8 |
+
+So the native staging is **−4.2 % (1-card) to −7.8 % (2-card)** off the staging path at 150K (vs ~−1.2 %
+at pp32K), because a quantized source cannot use the `cp_async` pipeline and each K/V tile is
+re-dequantized.  Against **stock**, however, the delivery q8_0 is at parity (−1.2 / −0.2 / +2.4 %), and its
+f16 is well ahead (+2.4 / +6.9 / +9.6 %).  Making native a decode/verify-only choice would recover the
+prefill but re-materialise the ~744 MiB scratch — i.e. re-break the adaptive-MTP high-context load — so
+for now the trade is: q8_0 prefill parity with stock + **+23 % decode** + the MTP load win.
+
 ### Audit of the other enabled quant types (q4_1/q5_0/q5_1/iq4_nl)
 
 They have **no native arm** (only q8_0/bf16/q4_0 do), so they still stage through F16.  They are
