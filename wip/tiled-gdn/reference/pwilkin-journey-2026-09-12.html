@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Optimization journey — Qwen3.8-Next-Flash on Strix Halo</title>
+<meta name="description" content="Commit-by-commit record of the ROCm prefill work for Qwen3.8-Next-Flash on a Radeon 8060S, with the measurement for every step.">
+<link rel="icon" href="favicon.svg">
+<link rel="stylesheet" href="site.css">
+<style>
+/* journey-only: the step table and the per-step cards */
+td.n{font-family:var(--mono);color:var(--muted);white-space:nowrap}
+.sha{margin-left:8px;color:var(--muted);font-size:.76rem}
+.up{color:var(--cyan);font-weight:600;margin-left:6px}
+.down{color:var(--red);font-weight:600;margin-left:6px}
+.flat{color:var(--muted);margin-left:6px}
+tr.pending td{opacity:.5}
+table{min-width:760px}
+td.step{min-width:240px}
+.steps{display:grid;gap:16px}
+article{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:20px 22px}
+article header{display:flex;gap:12px;align-items:baseline;margin-bottom:10px;flex-wrap:wrap}
+article header .n{font-family:var(--mono);color:var(--violet);font-size:.85rem}
+article h3{margin:0;font-size:1.08rem}
+article p{margin:0 0 10px}
+article p:last-child{margin-bottom:0}
+.why,.meas{font-size:.92rem;padding-left:12px;border-left:2px solid var(--line-strong)}
+.why span{font-weight:600;color:var(--text);margin-right:6px}
+.meas{border-left-color:var(--cyan);font-family:var(--mono);font-size:.85rem;color:var(--muted)}
+.meas.pending{border-left-color:var(--line);opacity:.6}
+.meas strong{color:var(--text)}
+</style>
+</head>
+<body>
+<header class="top"><div class="shell">
+  <span class="brand">Strix Halo Lab</span>
+  <nav>
+    <a href="index.html">Overview</a>
+    <a href="#table">Measurements</a>
+    <a href="#recall">Recall</a>
+    <a href="#steps">Steps</a>
+    <a href="#method">Method</a>
+    <a href="https://github.com/pwilkin/llama.cpp/tree/strix-halo">Branch</a>
+  </nav>
+</div></header>
+
+<main>
+<div class="shell hero">
+  <p class="eyebrow">Optimization journey · 2026-09-12</p>
+  <h1>Getting Qwen3.8-Next-Flash to prefill on a Radeon 8060S</h1>
+  <p class="lede">A 177-billion-parameter hybrid model, 93 GiB of IQ4_NL weights and a 27.5 GB
+  per-layer-embedding table, on an integrated GPU with 256 GB/s of memory bandwidth. This is the
+  commit-by-commit record: what each change does, why it should help, and what it actually measured.</p>
+  <div class="cards">
+    <div class="card"><div class="k">6.07×</div><div class="l">prefill, start to finish</div></div>
+    <div class="card"><div class="k">98%</div><div class="l">of the out-of-tree reference stack</div></div>
+    <div class="card"><div class="k">16/16</div><div class="l">points measured</div></div>
+    <div class="card"><div class="k">16302</div><div class="l">operator tests passing</div></div>
+  </div>
+</div>
+
+<section id="table"><div class="shell">
+  <h2>Every step, measured</h2>
+  <p class="sub">One <code>llama-bench</code> run per commit, same command line throughout:
+  <code>-p 16384 -n 128 -d 0,40000 -b 24576 -ub 24576 -r 3</code>. The multiplier next to a prefill
+  figure is the ratio against the previous measured point, and anything inside 2% is shown as flat
+  rather than dressed up as a win.</p>
+  <p class="note"><span>On the batch width</span> The campaign ran at a 24576 ubatch; the installer
+  now defaults to 16384, because it reserves smaller compute buffers and nothing is lost. Measured
+  back to back on the finished stack: <strong>1204.31 &plusmn; 2.31</strong> t/s at 16384 against
+  <strong>1199.63 &plusmn; 7.12</strong> at 24576, with 24576 about 1% ahead at depth 40&nbsp;000.
+  Both are above the numbers in this table because the machine was running some 3% faster that
+  evening than during the campaign &mdash; which is the reason every comparison here is between
+  points measured in the same session, never across them.</p>
+  <div class="scroll"><table>
+    <thead><tr>
+      <th>#</th><th>Step</th>
+      <th style="text-align:right">pp16384 @ d0</th><th style="text-align:right">tg128 @ d0</th>
+      <th style="text-align:right">pp16384 @ d40k</th><th style="text-align:right">tg128 @ d40k</th>
+    </tr></thead>
+    <tbody>
+<tr class="pending">
+  <td class="n">00</td>
+  <td class="step"><strong>Starting point</strong>
+      <code class="sha">c5d692357</code></td>
+  <td class="num">191.25 <span class="pm">± 3.25</span> </td>
+  <td class="num">23.25 <span class="pm">± 0.20</span></td>
+  <td class="num">&mdash; </td>
+  <td class="num">&mdash;</td>
+</tr>
+<tr class="pending">
+  <td class="n">01</td>
+  <td class="step"><strong>Guard the KQ mask write</strong>
+      <code class="sha">58a9b386e</code></td>
+  <td class="num">195.46 <span class="pm">± 1.91</span> <span class="up">1.02×</span></td>
+  <td class="num">23.01 <span class="pm">± 0.17</span></td>
+  <td class="num">&mdash; </td>
+  <td class="num">&mdash;</td>
+</tr>
+<tr class="pending">
+  <td class="n">02</td>
+  <td class="step"><strong>MTP hyper-connection mixer tensors</strong>
+      <code class="sha">dda64492f</code></td>
+  <td class="num">188.34 <span class="pm">± 3.95</span> <span class="down">0.96×</span></td>
+  <td class="num">22.93 <span class="pm">± 0.26</span></td>
+  <td class="num">&mdash; </td>
+  <td class="num">&mdash;</td>
+</tr>
+<tr class="pending">
+  <td class="n">03</td>
+  <td class="step"><strong>Sparse attention graph and the lazy direct reader</strong>
+      <code class="sha">ddaf5214b</code></td>
+  <td class="num">242.52 <span class="pm">± 1.95</span> <span class="up">1.29×</span></td>
+  <td class="num">24.16 <span class="pm">± 2.07</span></td>
+  <td class="num">&mdash; </td>
+  <td class="num">&mdash;</td>
+</tr>
+<tr class="pending">
+  <td class="n">04</td>
+  <td class="step"><strong>Sparse selected attention kernel</strong>
+      <code class="sha">df8ad5b10</code></td>
+  <td class="num">286.75 <span class="pm">± 1.29</span> <span class="up">1.18×</span></td>
+  <td class="num">24.89 <span class="pm">± 0.05</span></td>
+  <td class="num">&mdash; </td>
+  <td class="num">&mdash;</td>
+</tr>
+<tr>
+  <td class="n">05</td>
+  <td class="step"><strong>bf16 WMMA dequant GEMM</strong>
+      <code class="sha">e55085251</code></td>
+  <td class="num">372.18 <span class="pm">± 1.85</span> <span class="up">1.30×</span></td>
+  <td class="num">24.43 <span class="pm">± 1.14</span></td>
+  <td class="num">348.58 <span class="pm">± 16.37</span> </td>
+  <td class="num">12.32 <span class="pm">± 1.98</span></td>
+</tr>
+<tr>
+  <td class="n">06</td>
+  <td class="step"><strong>Fused hyper-connection combine + norm</strong>
+      <code class="sha">90aba037c</code></td>
+  <td class="num">393.91 <span class="pm">± 5.94</span> <span class="up">1.06×</span></td>
+  <td class="num">24.46 <span class="pm">± 2.33</span></td>
+  <td class="num">372.59 <span class="pm">± 5.00</span> <span class="up">1.07×</span></td>
+  <td class="num">13.82 <span class="pm">± 0.19</span></td>
+</tr>
+<tr>
+  <td class="n">07</td>
+  <td class="step"><strong>Fused gate GEMM + stream mix</strong>
+      <code class="sha">6ec4a5f0d</code></td>
+  <td class="num">413.57 <span class="pm">± 16.05</span> <span class="up">1.05×</span></td>
+  <td class="num">24.90 <span class="pm">± 2.37</span></td>
+  <td class="num">402.64 <span class="pm">± 6.79</span> <span class="up">1.08×</span></td>
+  <td class="num">13.67 <span class="pm">± 1.43</span></td>
+</tr>
+<tr>
+  <td class="n">08</td>
+  <td class="step"><strong>Keep the streams in bf16 end to end</strong>
+      <code class="sha">816667e9d</code></td>
+  <td class="num">417.92 <span class="pm">± 2.79</span> <span class="flat">flat</span></td>
+  <td class="num">25.71 <span class="pm">± 1.29</span></td>
+  <td class="num">416.13 <span class="pm">± 6.12</span> <span class="up">1.03×</span></td>
+  <td class="num">13.22 <span class="pm">± 0.96</span></td>
+</tr>
+<tr>
+  <td class="n">09</td>
+  <td class="step"><strong>Gated rms-norm, indexer relu-sum, MoE reduction</strong>
+      <code class="sha">2e3ee2afa</code></td>
+  <td class="num">438.89 <span class="pm">± 4.05</span> <span class="up">1.05×</span></td>
+  <td class="num">25.50 <span class="pm">± 1.91</span></td>
+  <td class="num">424.09 <span class="pm">± 8.64</span> <span class="flat">flat</span></td>
+  <td class="num">14.25 <span class="pm">± 0.16</span></td>
+</tr>
+<tr>
+  <td class="n">10</td>
+  <td class="step"><strong>Depthwise conv1d and vectorized get_rows</strong>
+      <code class="sha">0540c6948</code></td>
+  <td class="num">499.52 <span class="pm">± 17.64</span> <span class="up">1.14×</span></td>
+  <td class="num">24.19 <span class="pm">± 0.11</span></td>
+  <td class="num">486.81 <span class="pm">± 4.18</span> <span class="up">1.15×</span></td>
+  <td class="num">16.08 <span class="pm">± 0.10</span></td>
+</tr>
+<tr>
+  <td class="n">11</td>
+  <td class="step"><strong>Tiled gated delta-net</strong>
+      <code class="sha">964c6f2f0</code></td>
+  <td class="num">1181.77 <span class="pm">± 1.97</span> <span class="up">2.37×</span></td>
+  <td class="num">26.71 <span class="pm">± 0.17</span></td>
+  <td class="num">1081.79 <span class="pm">± 1.36</span> <span class="up">2.22×</span></td>
+  <td class="num">16.44 <span class="pm">± 0.16</span></td>
+</tr>
+<tr>
+  <td class="n">12</td>
+  <td class="step"><strong>WMMA lightning indexer scoring</strong>
+      <code class="sha">f7539cf7b</code></td>
+  <td class="num">1176.60 <span class="pm">± 8.99</span> <span class="flat">flat</span></td>
+  <td class="num">26.76 <span class="pm">± 0.19</span></td>
+  <td class="num">1070.57 <span class="pm">± 2.17</span> <span class="flat">flat</span></td>
+  <td class="num">16.30 <span class="pm">± 0.14</span></td>
+</tr>
+<tr>
+  <td class="n">13</td>
+  <td class="step"><strong>Head-size-256 WMMA flash attention</strong>
+      <code class="sha">03733c23f</code></td>
+  <td class="num">1182.30 <span class="pm">± 0.34</span> <span class="flat">flat</span></td>
+  <td class="num">26.66 <span class="pm">± 0.25</span></td>
+  <td class="num">1074.24 <span class="pm">± 4.21</span> <span class="flat">flat</span></td>
+  <td class="num">16.07 <span class="pm">± 0.25</span></td>
+</tr>
+<tr>
+  <td class="n">14</td>
+  <td class="step"><strong>MMQ compaction and transposed concat</strong>
+      <code class="sha">be39c4ff0</code></td>
+  <td class="num">1182.91 <span class="pm">± 2.59</span> <span class="flat">flat</span></td>
+  <td class="num">25.23 <span class="pm">± 2.87</span></td>
+  <td class="num">1071.21 <span class="pm">± 2.06</span> <span class="flat">flat</span></td>
+  <td class="num">16.08 <span class="pm">± 0.15</span></td>
+</tr>
+<tr>
+  <td class="n">15</td>
+  <td class="step"><strong>TOP_K tie handling, a permute overflow fix, and operator coverage</strong>
+      <code class="sha">7abec5c24</code></td>
+  <td class="num">1160.02 <span class="pm">± 1.89</span> <span class="flat">flat</span></td>
+  <td class="num">26.68 <span class="pm">± 0.47</span></td>
+  <td class="num">1072.90 <span class="pm">± 0.83</span> <span class="flat">flat</span></td>
+  <td class="num">16.09 <span class="pm">± 0.24</span></td>
+</tr>
+    <tr><td class="n">ref</td>
+      <td class="step"><strong>Out-of-tree reference stack</strong>
+        <code class="sha">v46 + model-r</code></td>
+      <td class="num">1187.13 ± 31.40</td><td class="num">29.06 ± 1.45</td>
+      <td class="num">1082.92 ± 4.48</td><td class="num">19.02 ± 4.62</td></tr>
+    </tbody>
+  </table></div>
+</div></section>
+
+<section id="ablations"><div class="shell">
+  <h2>What each piece is worth in the finished stack</h2>
+  <p class="sub">The table above is the route actually taken, which means each step was measured
+  with whatever was still slow at the time. These arms instead disable one optimization at a time on
+  the <em>final</em> binary &mdash; one build, one variable, no build-to-build variation. The two
+  views disagree where an earlier bottleneck was masking something, and that disagreement is
+  informative rather than a problem.</p>
+<div class="scroll"><table>
+  <thead><tr><th>Disabled</th><th style="text-align:right">pp16384 @ d0</th><th style="text-align:right">worth</th></tr></thead>
+  <tbody>
+    <tr>
+      <td class="step"><strong>Everything on</strong><br><span class="pm">the reference point for this table</span></td>
+      <td class="num">1177.49 <span class="pm">± 4.46</span></td>
+      <td class="num"><span class="flat">baseline</span></td>
+    </tr>
+    <tr>
+      <td class="step"><strong>bf16 WMMA dequant GEMM</strong><br><span class="pm">MoE and dense GEMMs fall back to MMQ&rsquo;s integer path</span></td>
+      <td class="num">828.18 <span class="pm">± 0.83</span></td>
+      <td class="num"><span class="up">1.42×</span></td>
+    </tr>
+    <tr>
+      <td class="step"><strong>Fused HC combine + norm</strong><br><span class="pm">combine, residual add and rms-norm run as separate passes</span></td>
+      <td class="num">1154.65 <span class="pm">± 1.11</span></td>
+      <td class="num"><span class="flat">flat</span></td>
+    </tr>
+    <tr>
+      <td class="step"><strong>Fused HC gate GEMM + mix</strong><br><span class="pm">the gate projection round-trips through memory</span></td>
+      <td class="num">993.48 <span class="pm">± 2.79</span></td>
+      <td class="num"><span class="up">1.19×</span></td>
+    </tr>
+    <tr>
+      <td class="step"><strong>bf16 HC streams end to end</strong><br><span class="pm">the wide HC tensors keep writing their f32 form</span></td>
+      <td class="num">1087.54 <span class="pm">± 3.18</span></td>
+      <td class="num"><span class="up">1.08×</span></td>
+    </tr>
+    <tr>
+      <td class="step"><strong>Gated rms-norm, indexer relu-sum, MoE reduction</strong><br><span class="pm">three fusions split back apart</span></td>
+      <td class="num">1139.78 <span class="pm">± 8.85</span></td>
+      <td class="num"><span class="up">1.03×</span></td>
+    </tr>
+    <tr>
+      <td class="step"><strong>Depthwise conv1d for PLE and GDN</strong><br><span class="pm">the concat + transposed cont chains run unfused</span></td>
+      <td class="num">1089.63 <span class="pm">± 3.28</span></td>
+      <td class="num"><span class="up">1.08×</span></td>
+    </tr>
+    <tr>
+      <td class="step"><strong>Sparse attention kernel</strong><br><span class="pm">the graph still selects blocks, but attention runs dense</span></td>
+      <td class="num">690.04 <span class="pm">± 1.25</span></td>
+      <td class="num"><span class="up">1.71×</span></td>
+    </tr>
+    <tr>
+      <td class="step"><strong>Sparse attention entirely</strong><br><span class="pm">dense attention over the full context</span></td>
+      <td class="num">1184.52 <span class="pm">± 2.39</span></td>
+      <td class="num"><span class="flat">flat</span></td>
+    </tr>
+    <tr>
+      <td class="step"><strong>Maskless KQ path</strong><br><span class="pm">a dense KQ mask is built and written per ubatch</span></td>
+      <td class="num">795.72 <span class="pm">± 1.80</span></td>
+      <td class="num"><span class="up">1.48×</span></td>
+    </tr>
+    <tr>
+      <td class="step"><strong>Lazy direct PLE reader</strong><br><span class="pm">rows demand-paged through the mmap instead of pread()</span></td>
+      <td class="num">428.90 <span class="pm">± 9.60</span></td>
+      <td class="num"><span class="up">2.75×</span></td>
+    </tr>
+  </tbody>
+</table></div>
+  <p class="note" style="margin-top:18px"><span>Why both</span> The bf16 WMMA GEMM measures 1.30&times;
+  in the walk and more here: in the walk it landed while the stock delta-net recurrence was still the
+  bottleneck, so part of its benefit was invisible. Neither number is wrong; they answer different
+  questions.</p>
+</div></section>
+
+<section id="recall"><div class="shell">
+  <h2>Does it still answer correctly at depth?</h2>
+  <p class="sub">Throughput is the easy half. Sparse attention only looks at a subset of the keys, so
+  the question a prefill number cannot answer is whether the model can still reach the beginning of a
+  long context. Every correctness check up to this point had been an operator test or a short decode,
+  neither of which engages the sparse path at a length where it matters.</p>
+  <p class="sub">So: a 150,300-token prompt &mdash; the llama.cpp documentation tree, concatenated
+  &mdash; with a fact planted at character 6,466 and the question asked at the very end, roughly
+  149,000 tokens later. Greedy decoding, fixed seed, every kernel gate on.</p>
+  <div class="two">
+    <div class="panel">
+      <h3>Planted at character 6,466</h3>
+      <p class="quote">OPERATIONS NOTE 47-B: the calibration key for the Strix Halo test rig is
+      QUINCE-AMBER-7731, and the rig's thermal ceiling is recorded as 54 degrees Celsius</p>
+    </div>
+    <div class="panel">
+      <h3>Answered from 149k tokens away</h3>
+      <p class="quote">&hellip; the calibration key is QUINCE-AMBER-7731 and the thermal ceiling is
+      54 degrees Celsius &hellip;</p>
+      <p class="sub">Both values verbatim, and the model also summarized what the corpus was
+      &mdash; build documentation for a list of backends it enumerated correctly.</p>
+    </div>
+  </div>
+  <p class="note" style="margin-top:18px"><span>At that length</span> 947.2 t/s prefill over the full
+  150k prompt, 6.9 t/s generation with the context already filled. The decode rate is what a
+  262144-trained context costs on 256 GB/s of memory, not something the kernels here can fix.</p>
+</div></section>
+
+<section id="steps"><div class="shell">
+  <h2>What each step does</h2>
+  <p class="sub">In the order they land. Dependencies force some of it — the sparse attention graph has to
+  precede the kernel that consumes it — so this is not strictly biggest-win-first.</p>
+  <div class="steps">
+<article id="s-base">
+  <header><span class="n">00</span><h3>Starting point</h3>
+    <code class="sha">c5d692357</code></header>
+  <p>The strix-halo branch rebased onto upstream master, with nothing of our own on top except the restored <code>prop.integrated</code> flag. Lazy per-layer-embedding loading uses the upstream <code>--lazy-mode on</code> path, which demand-pages rows through the mmap.</p>
+  <p class="why"><span>Why</span> This is the honest baseline: everything here is already in mainline or in the UMA ring buffer stack, so every later number is attributable to one commit.</p>
+  <p class="meas pending">measurement pending</p><p class="note"><span>Caveat</span> The depth-40000 column is empty here, and stays empty until the bf16 GEMM commit, for a concrete reason: upstream&rsquo;s <code>mm_ids_helper</code> sizes its shared memory as <code>n_tokens × 4</code> bytes, which is 98 KB for a 24576-token batch against 64 KB of LDS on gfx1151. <code>GGML_ASSERT(nbytes_shared &lt;= smpbo)</code> fires while filling the context. Upstream cannot prefill at this ubatch on this part at all.</p>
+</article>
+<article id="s-kqmask">
+  <header><span class="n">01</span><h3>Guard the KQ mask write</h3>
+    <code class="sha">58a9b386e</code></header>
+  <p>Four of the thirteen <code>set_input_kq_mask</code> call sites in <code>llama-graph.cpp</code> wrote the mask without checking it was allocated. The other nine already did.</p>
+  <p class="why"><span>Why</span> A graph that stores K without attending through it never references the mask, so the allocator gives it no buffer and the write aborts. Nothing gets faster here, but nothing later works without it: this is what makes the maskless sparse-attention path reachable at all.</p>
+  <p class="meas pending">measurement pending</p><p class="note"><span>Caveat</span> Neutral on its own, by construction. It is an upstream bug in its own right.</p>
+</article>
+<article id="s-mtp">
+  <header><span class="n">02</span><h3>MTP hyper-connection mixer tensors</h3>
+    <code class="sha">dda64492f</code></header>
+  <p>The draft head carries its own hyper-connection mixer. Adds the three tensors, plus <code>--mtp-shared-embd</code>, which leaves the token embeddings, output norm and LM head out of the draft and takes them from the target at load time.</p>
+  <p class="why"><span>Why</span> A 2.8 GB draft instead of one that repeats the 27.5 GB embedding table.</p>
+  <p class="meas pending">measurement pending</p><p class="note"><span>Caveat</span> Invisible to llama-bench, which runs no draft model. It pays off in the server path.</p>
+</article>
+<article id="s-qsagraph">
+  <header><span class="n">03</span><h3>Sparse attention graph and the lazy direct reader</h3>
+    <code class="sha">ddaf5214b</code></header>
+  <p>Two model-side changes that resist separation. The sparse path: the lightning indexer already picks the top-k key blocks per query, so this builds the attention graph that visits only those — block selection, the packed key/value layouts, compact index metadata, causally-trimmed score bounds, and the indexer cache. The reader: <code>--lazy-mode on-direct</code> serves the rows of a lazy tensor with explicit <code>pread()</code>s from a thread pool instead of demand-faulting them through the mmap.</p>
+  <p class="why"><span>Why</span> The reader is worth it for two reasons, not one. Demand paging serialises 16384 scattered faults per ubatch in the fault handler; and <code>on</code> <em>requires</em> mmap, which keeps the weights resident twice during load — once as page cache, once in the managed copy an integrated GPU makes under unified memory.</p>
+  <p class="meas pending">measurement pending</p><p class="note"><span>Caveat</span> These two started as separate commits and were merged, honestly rather than tidily: the reader&rsquo;s consumer sits inside the same graph-input code the sparse path rewrites, as <code>if (ple_reader) { … } else { … }</code> pairs whose else-branch is the non-direct path. Splitting them mechanically produced dangling <code>else</code> branches. The reader&rsquo;s isolated contribution was instead measured directly — a one-variable A/B on a single fixed binary, <code>-lm mmap -lzm on</code> against <code>-lm none -lzm on-direct</code>: <strong>233.71 ± 5.14 → 395.58 ± 1.97</strong>, 1.69×. That figure is from that A/B, not from this table.</p>
+</article>
+<article id="s-qsakernel">
+  <header><span class="n">04</span><h3>Sparse selected attention kernel</h3>
+    <code class="sha">df8ad5b10</code></header>
+  <p>One workgroup of eight waves per (query group, kv head). Four consecutive queries share a sorted union of their selected blocks with a 16-bit membership mask, so 48 rows stay in registers as three WMMA tiles. Each wave owns 32 head dimensions; the K fragment is reused across all three tiles and the owning wave runs the online softmax.</p>
+  <p class="why"><span>Why</span> Without it the graph still builds block selection and the packed key/value layouts, and then a dense kernel runs over that layout — paying both costs. That configuration measures <strong>1.71× slower</strong> than the finished stack, so the graph and the kernel have to travel together. Anyone porting half of this will make things worse.</p>
+  <p class="meas pending">measurement pending</p><p class="note"><span>Caveat</span> <strong>And yet the whole sparse path is break-even.</strong> Disabling it entirely — graph, indexer, top-k and kernel — measures 0.98× at depth 0, 1.01× at 40 000 and 1.00× at 140 000. The dense alternative is the head-dim-256 WMMA flash-attention kernel, which is fast enough that the lightning indexer&rsquo;s cost (twelve layers × eighty strips per prefill) cancels what the sparsity saves, even at 140k context. I expected it to pay off at depth and said so; it does not. Dense is also the numerically exact computation, so at equal throughput it is the better choice — though that quality comparison is reasoned, not yet measured by perplexity, and should be before anyone retires this machinery.</p>
+</article>
+<article id="s-mmb">
+  <header><span class="n">05</span><h3>bf16 WMMA dequant GEMM</h3>
+    <code class="sha">e55085251</code></header>
+  <p>Dequantizes the weights to bf16 once per graph, caches them, and runs the GEMM on the WMMA units: a tall 384×64 tile for the narrow projections, a fused gate/up + SwiGLU for the MoE, and routed down-projections that write bf16 in place.</p>
+  <p class="why"><span>Why</span> At prefill batch sizes these GEMMs are compute-bound, and MMQ’s integer path leaves the f16/bf16 WMMA units idle. The f32 vector roof on this part is 29.7 TFLOPS against 59 for bf16 WMMA.</p>
+  <p class="meas">prefill <strong>372.18</strong> t/s at depth 0, <strong>348.58</strong> t/s at depth 40 000</p><p class="note"><span>Caveat</span> This commit also carries the route-bounded <code>mmid</code>, which is what makes a 24576-token ubatch possible on gfx1151 in the first place — so it is the point where the depth-40000 column starts having numbers at all.</p>
+</article>
+<article id="s-hccn">
+  <header><span class="n">06</span><h3>Fused hyper-connection combine + norm</h3>
+    <code class="sha">90aba037c</code></header>
+  <p>Fuses the combine, the residual add and the rms-norm into one kernel.</p>
+  <p class="why"><span>Why</span> The combine reads four f32 residual streams and writes the normalized stream plus the next residual — five DRAM passes over the same rows on a part with ~256 GB/s of bandwidth. Fusing leaves one.</p>
+  <p class="meas">prefill <strong>393.91</strong> t/s at depth 0, <strong>372.59</strong> t/s at depth 40 000</p>
+</article>
+<article id="s-hcmix">
+  <header><span class="n">07</span><h3>Fused gate GEMM + stream mix</h3>
+    <code class="sha">6ec4a5f0d</code></header>
+  <p>The gate projection [320 → 10240] is read only by the stream mix that follows it, so the GEMM, the sigmoid and the mix collapse into one kernel.</p>
+  <p class="why"><span>Why</span> The gate never reaches memory. This is also the commit whose env gate I initially failed to carry over, which cost a confusing afternoon — see the note on method below.</p>
+  <p class="meas">prefill <strong>413.57</strong> t/s at depth 0, <strong>402.64</strong> t/s at depth 40 000</p>
+</article>
+<article id="s-hc16">
+  <header><span class="n">08</span><h3>Keep the streams in bf16 end to end</h3>
+    <code class="sha">816667e9d</code></header>
+  <p>A marking pass over the scheduled graph: a tensor whose every consumer reads the bf16 copy never needs its f32 form written at all. Covers the normalized stream, the gate, the block output, the 16-bit residual chain, the fused SwiGLU output and the routed down-projection.</p>
+  <p class="why"><span>Why</span> Halves the traffic on the widest tensors in the graph. Needs the allocation dependency that stops an in-place residual sharing a buffer across a mark boundary.</p>
+  <p class="meas">prefill <strong>417.92</strong> t/s at depth 0, <strong>416.13</strong> t/s at depth 40 000</p>
+</article>
+<article id="s-smallfusions">
+  <header><span class="n">09</span><h3>Gated rms-norm, indexer relu-sum, MoE reduction</h3>
+    <code class="sha">2e3ee2afa</code></header>
+  <p>Three small fusions on the same path. The gated rms-norm folds the gate projection into the norm. The indexer’s relu and per-head sum become one kernel. The MoE weighted reduction absorbs the shared-expert merge that followed it.</p>
+  <p class="why"><span>Why</span> Each is a kernel launch and a memory round trip removed. Individually small; the indexer pipeline runs 12 layers × 80 strips per prefill.</p>
+  <p class="meas">prefill <strong>438.89</strong> t/s at depth 0, <strong>424.09</strong> t/s at depth 40 000</p>
+</article>
+<article id="s-convgetrows">
+  <header><span class="n">10</span><h3>Depthwise conv1d and vectorized get_rows</h3>
+    <code class="sha">0540c6948</code></header>
+  <p>The per-layer-embedding and delta-net short convolutions arrive as a concat plus a transposed cont chain; matching them lets one kernel write the tail directly. get_rows gains a 16-byte same-type copy and a mean-of-four fusion for the embedding gather.</p>
+  <p class="why"><span>Why</span> The embedding gather runs once per token per layer, so its constant factor is not negligible.</p>
+  <p class="meas">prefill <strong>499.52</strong> t/s at depth 0, <strong>486.81</strong> t/s at depth 40 000</p>
+</article>
+<article id="s-gdnlarge">
+  <header><span class="n">11</span><h3>Tiled gated delta-net</h3>
+    <code class="sha">964c6f2f0</code></header>
+  <p>Tiles the recurrence over tokens so the state stays in registers across a tile instead of round-tripping to memory per token, and replaces the generic warp reduction with a DPP/permlanex16 chain: five dependent <code>ds_bpermute</code> round trips become five DPP ops with the same pairing order, so the sum is bit-identical.</p>
+  <p class="why"><span>Why</span> <strong>This is the largest single step in the series</strong> — larger than the bf16 WMMA GEMM, larger than sparse attention, larger than everything else put together. Most layers of this model are delta-net rather than attention, and on RDNA the LDS crossbar dominated the per-token latency of the recurrence.</p>
+  <p class="meas">prefill <strong>1181.77</strong> t/s at depth 0, <strong>1081.79</strong> t/s at depth 40 000</p><p class="note"><span>Caveat</span> It was very nearly missed. Earlier work measured a delta-net rewrite at roughly 3% end-to-end and dropped it over a 0.21% perplexity cost — a reasonable call, except that it compared a <em>chunked</em> rewrite against this <em>tiled</em> kernel, both already fast. Nobody had measured tiled against stock upstream at a 24576-token ubatch. Walking the series from the real upstream baseline is what exposed it, and it also explains why the hyper-connection fusions look weaker here than they do on the finished stack: every point before this one was bottlenecked on the stock recurrence, which masked everything downstream of it.</p>
+</article>
+<article id="s-idxwmma">
+  <header><span class="n">12</span><h3>WMMA lightning indexer scoring</h3>
+    <code class="sha">f7539cf7b</code></header>
+  <p>Scores the indexer’s query × key grid on WMMA with the keys held in registers, falling back to the existing kernel for shapes it does not cover.</p>
+  <p class="why"><span>Why</span> Available, but left off by default.</p>
+  <p class="meas">prefill <strong>1176.60</strong> t/s at depth 0, <strong>1070.57</strong> t/s at depth 40 000</p><p class="note"><span>Caveat</span> Measured neutral-to-worse in the reference stack, so the gate defaults to off. Kept because the fallback is clean and the shape coverage may widen.</p>
+</article>
+<article id="s-fattn256">
+  <header><span class="n">13</span><h3>Head-size-256 WMMA flash attention</h3>
+    <code class="sha">03733c23f</code></header>
+  <p>qwen4exp attends with key and value length 256, where the D=256 tile kernel is FMA-bound for prefill batches. Adds the <code>mma_tile_sizes</code> specialization for DV=256, sizes the VKQ accumulator from the tile element type rather than a DV modulus, and adds the tile_Q reuse barrier.</p>
+  <p class="why"><span>Why</span> This is the model’s own attention path, so it is load-bearing even though the sparse kernel handles the long-context case.</p>
+  <p class="meas">prefill <strong>1182.30</strong> t/s at depth 0, <strong>1074.24</strong> t/s at depth 40 000</p><p class="note"><span>Caveat</span> Resolving this against upstream caught a real bug — see the note on method.</p>
+</article>
+<article id="s-mmqconcat">
+  <header><span class="n">14</span><h3>MMQ compaction and transposed concat</h3>
+    <code class="sha">be39c4ff0</code></header>
+  <p>MMQ compaction picks the tile from the routed column count rather than the padded maximum. The transposed concat gets a 16-row tile on RDNA3.5.</p>
+  <p class="why"><span>Why</span> Both target real inefficiencies in the trace.</p>
+  <p class="meas">prefill <strong>1182.91</strong> t/s at depth 0, <strong>1071.21</strong> t/s at depth 40 000</p><p class="note"><span>Caveat</span> Measured inside the noise on this workload. Recorded as neutral rather than claimed as a win.</p>
+</article>
+<article id="s-tests">
+  <header><span class="n">15</span><h3>TOP_K tie handling, a permute overflow fix, and operator coverage</h3>
+    <code class="sha">7abec5c24</code></header>
+  <p>Three commits in the branch — <code>ggml: widen ggml_permute&rsquo;s ne/nb locals</code>, <code>ggml-cuda: handle equal values in the TOP_K radix gather</code>, and the test cases. The TOP_K gather assumed distinct values, so a bucket containing ties could emit the wrong count and drop or duplicate indices.</p>
+  <p class="why"><span>Why</span> Correctness, not speed — and the first thing in this series to make the model measurably <em>slower</em>.</p>
+  <p class="meas">prefill <strong>1160.02</strong> t/s at depth 0, <strong>1072.90</strong> t/s at depth 40 000</p><p class="note"><span>Caveat</span> <strong>This step costs 1.9%</strong> (1182.91 &plusmn; 2.59 &rarr; 1160.02 &plusmn; 1.89 at depth 0, non-overlapping spreads; depth 40 000 unchanged). Bundled into one commit the regression was invisible, which is the clearest argument in this whole document for splitting commits. Two honest caveats: the three commits were separated <em>after</em> this measurement, so <code>permute</code> and <code>topkequal</code> have no individual figures — the before/after pair brackets all three. Attributing the cost to the TOP_K gather is inference, not measurement: test cases cannot affect runtime and <code>ggml_permute</code> is host-side graph construction, so it is the only candidate left. The indexer runs top-k twelve layers &times; eighty strips per prefill, which fits.</p>
+</article>
+  </div>
+</div></section>
+
+<section id="method"><div class="shell">
+  <h2>How this was measured, and what went wrong</h2>
+  <p class="sub">The failures were more instructive than the successes, so they are written down too.</p>
+  <div class="two">
+    <div class="panel">
+      <h3>Fixed environment</h3>
+      <p>Retained-PM4 HIP and ROCr, unified memory on, <code>gfx1151</code>. No <code>LD_PRELOAD</code>
+      and no kernel selected by anything other than the commit under test. Every run is wrapped in a
+      memory guard that stops it at 8 GiB of headroom rather than letting the OOM killer decide, and
+      takes an advisory GPU lock so two sessions cannot contend.</p>
+    </div>
+    <div class="panel">
+      <h3>The reference control</h3>
+      <p>Before concluding anything about a gap, the original out-of-tree stack was re-run on the same
+      machine on the same day. It reproduced within noise of its recorded figure, which is what made the
+      remaining difference attributable to code rather than to a machine that had drifted.</p>
+    </div>
+    <div class="panel">
+      <h3>An OOM worth keeping</h3>
+      <p>The first baseline attempt died with 27 GB resident and 151 GB of virtual address space. Under
+      unified memory with everything offloaded, the weights land in <em>managed</em> — anonymous — memory,
+      so all 93 GiB competes directly with the KV cache and the compute buffers. That is the whole reason
+      the lazy direct reader matters twice over.</p>
+    </div>
+    <div class="panel">
+      <h3>A false lead</h3>
+      <p>Five hyper-connection diagnostics were missing from our logs and present in the reference, which
+      looked like five broken paths. Four of them only print under a debug flag that had been left out;
+      their absence meant nothing. Only the fifth was real evidence, and it pointed at a single missing
+      env gate worth 1.15×.</p>
+    </div>
+    <div class="panel">
+      <h3>A bug caught by splitting</h3>
+      <p>The head-size-256 flash attention work conflicted with upstream retuning. Taking our narrower
+      RDNA3 gate compiled the DKQ=192 case down to <code>NO_DEVICE_CODE</code> while upstream's host-side
+      selector still chose it — a hardware exception, not a wrong number. Deferring that piece to its own
+      commit with its own verification is what surfaced it.</p>
+    </div>
+    <div class="panel">
+      <h3>Negative results, kept</h3>
+      <p>MMQ compaction, the transposed-concat tile and the head-size-256 tuning together moved depth-0
+      prefill by less than the run-to-run spread. The WMMA indexer scorer measured neutral-to-worse and
+      ships with its gate off. They are in the table at their measured value.</p>
+    </div>
+  </div>
+</div></section>
+
+<section><div class="shell">
+  <h2>Reproducing it</h2>
+  <p class="sub">The branch is <code>strix-halo</code> on <code>pwilkin/llama.cpp</code>, rebased on
+  upstream master. The series is 16 commits on top of the rebase point, each one buildable and
+  measurable on its own.</p>
+  <pre>git clone https://github.com/pwilkin/llama.cpp.git &amp;&amp; cd llama.cpp
+git checkout strix-halo
+HIPCXX="$(hipconfig -l)/clang++" HIP_PATH="$(hipconfig -R)" \
+  cmake -B build -DGGML_HIP=ON -DGPU_TARGETS=gfx1151 -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+build/bin/llama-bench -m Qwen3.8-Flash-Next-IQ4_NL-00001-of-00009.gguf \
+  -dev ROCm0 -ngl 999 -fa on -ctk f16 -ctv f16 \
+  -lm none -lzm on-direct -b 24576 -ub 24576 -p 16384 -n 128 -d 0,40000 -r 3</pre>
+</div></section>
+</main>
+
+<footer><div class="shell">
+  <p>Measured on a Ryzen AI Max+ with a Radeon 8060S (gfx1151), 128 GB unified memory, ROCm 10.0 with
+  the retained-PM4 HIP and ROCr runtimes. Figures are the mean of three repetitions with the spread
+  llama-bench reports; nothing here is a best-of.</p>
+</div></footer>
+</body>
+</html>
