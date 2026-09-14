@@ -131,7 +131,52 @@ or ~787 -> ~900 on the current delivery.
 - The delivery's prefill/band split is the whole point of this repo; the arrangements above are only
   admissible if they respect it.
 
-## 5. Bottom line
+## 5. Two clarifications (added 2026-09-13)
+
+### 5.1 The weight arrangement is a load-time shadow, not an on-disk format
+
+pwilkin's `mmb` does not consume a specially arranged GGUF.  It builds a **bf16 shadow of the weight
+rows at load/graph time** (dequantize once, cache, run WMMA).  The only "special" thing about his
+checkpoint is that it is **uniformly IQ4_NL**, which makes his `mmb_supported_mmid`/`_glu` predicates
+accept *every* expert weight.  Nothing on disk is pre-arranged.
+
+Consequence for us: the same trick works from any normal GGUF for any weight type.  What is needed is
+a **per-type dequant-to-bf16 staging** kernel.  pwilkin wrote IQ4_NL first because that is his model;
+our checkpoint's experts are IQ3_S, which his predicates reject.  So our generalization is a
+*generic dequant-to-bf16 shadow* (a small family of kernels, one per quant type), not a new file
+format — that is the parked `mmb-port.patch`'s next step.
+
+### 5.2 The GDN lever is already spent
+
+On the target box (27B Q6_K, gfx1201) the chunked bf16 GDN is **~1.1 % of a pp2048 pass**:
+
+| | per op (n=2048, est.) | x 48 layers | share of the 1991 ms pass |
+|---|---:|---:|---:|
+| chunked bf16 (ours) | ~0.46 ms | ~22 ms | **~1.1 %** |
+| sequential | ~3.9 ms | ~187 ms | ~9.4 % |
+
+The whole sequential -> chunked transition bought **~9 %** end-to-end (177 ms).  There is almost
+nothing left to win in the GDN op itself.  The 1.79x qwen4exp gap sits in the **weight GEMMs**
+(`mmb`), the **QSA attention**, the **HC fusions** and the **bf16 stream tail** — the archived
+handover's kernel attribution puts `flash_attn_qsa` (2.78 s vs 0.73 s), the IQ4_NL weight GEMM
+(8.53 s vs 6.40 s), `quantize_mmq_q8_1` (1.33 s vs ~0.2 s) and HC (1.62 s vs 0.93 s) at the top, with
+the GDN **not among them**.
+
+This is why "a weight/layout-optimized chunked GDN" cannot close the model-level gap: the GDN op
+**has no weights** (the weights are in the projections that feed it) and it **already runs the
+bf16/WMMA layout**.  The weight arrangement belongs to the projections (`mmb`); the data arrangement
+belongs to QSA (packed blocks).  Optimizing the GDN further — bf16 producer marking, depthwise
+conv1d — is worth the smaller 1.08x-class deltas, not the model-level gap.
+
+### 5.3 On "a lot of sequential processing" in the chunked GDN
+
+The chunked GDN is **two passes**: `kkt_solve` (fully parallel over `(chunk, head)`: the gram + the
+KT inverse) and `chunk_scan` (the state is sequential **across chunks** but parallel across `S_v/16`
+column slices x H heads x n_seqs).  So exactly one dimension is sequential; everything else is not.
+That is why it beats pwilkin's tiled kernel, which is a pure per-token scan (tiled LDS staging, fixed
+block parallelism).
+
+## 6. Bottom line
 
 The "chunked GDN + QSA equivalent" of pwilkin's weight arrangements exists, and it is mostly on the
 **QSA** side: pack the selected KV into block-aligned f16 tiles and run WMMA (his `qsa3`), which the
