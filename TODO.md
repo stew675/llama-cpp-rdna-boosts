@@ -132,6 +132,22 @@ Dossier: `wip/issue-30-mtp-decode-regression/` (`README.md` action register, `ME
   analysis `MEASUREMENTS.md` §D.  **Testing lesson: `-sm tensor` masked the single-card regression —
   screen with the `t = a + b*n` slope fit at pp8192-49152, and always measure 1 GPU too.**
 
+### 21. Q8_0 K/V prefill: recover the V4 native-staging cost
+
+- **Context.**  The V4 policy (unset = native q8_0/q4_0) gives the **+23 % d65K decode** and the adaptive-MTP
+  high-context load (it removes the ~744 MiB F16 scratch).  But a quantized source cannot use the
+  `cp_async` pipeline, so the native path re-dequantizes each K/V tile: q8_0 prefill at `pp150000` (27B,
+  f16 control) is **−4.2 % (1-card) / −7.8 % (2-card) / ~−8 % (3-card)** off the staging path, versus
+  only ~−1.2 % at pp32K.  Against **stock** the delivery q8_0 is at parity (−1.2 / −0.2 / +2.4 %), while
+  f16 is +2.4 / +6.9 / +9.6 %; the goal is to recover the q8_0 margin too.
+- **Approaches.**  (a) native at decode/verify only (`n_q <= 8`), staging at prefill — recovers prefill
+  but re-materialises the scratch, so it must be paired with scoping the F16 conversion to the prefill
+  graph so the decode-only graph keeps the memory win; (b) pipeline the native staging (double-buffered
+  dequant into smem) to recover cp_async-equivalent throughput; (c) a hoisted/shared prefill conversion.
+- **Gate.**  q8_0 prefill >= stock by the f16 margin, decode +23 % retained, `W=1..8` pure, adaptive-MTP
+  `-c 196608` ceiling 12 still loads.
+- Evidence: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §B.
+
 ## Waiting on others (not actionable in this repo)
 
 ### 6. Cross-arch / gfx1100 validation (the gfx1201 port + its Phase 2.5 probe are DONE — see Closed)

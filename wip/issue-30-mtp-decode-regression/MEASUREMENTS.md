@@ -342,6 +342,12 @@ Experiment diff: `patches/2026-09-14-prefill-rdna-config-and-ncols2.diff`.
 `-sm tensor` = **1812.7 / 1596.4 / 1218.6** (generic rule) — the best of both, and the 4B q4_0
 `W = 1..8` band stays **pure** (`fcdc29f3a315d377`).
 
+**2-card check (2026-09-14).**  The hint fires (`n_cuda=2` -> tensor_parallel) and 2-card `pp150K` is f16
+**1087.5** / q8_0 996.3 vs stock f16 1017.4 / q8_0 997.9.  A/B against the AMD rule at 2 cards: f16
+generic **1087.5** vs AMD 1043.0 (+4.3 %), q8_0 generic 996.3 vs AMD **1013.3** (−1.7 %).  So the rule is
+right for f16; for **q8_0 the 2-card optimum is marginally the AMD rule** — a ~2 % nuance to settle in
+the item-21 V4-prefill rework (it is inside the native-staging cost being tuned, not the split logic).
+
 **Mechanism.**  A process-wide hint set once per context: `ggml_set_fa_tensor_parallel(
 model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && n_cuda_dev > 1)` in the `llama_context` constructor
 (llama.h/ggml.h get `ggml_set_fa_tensor_parallel` / `ggml_get_fa_tensor_parallel`; the state lives in
