@@ -1,3 +1,20 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index dfc9b2b7e..9369e7d4d 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2518,6 +2518,12 @@ extern "C" {
+             struct ggml_tensor * a,
+             struct ggml_tensor * sinks);
+ 
++    // Frontend hint: attention ops are distributed across devices (tensor split / tensor parallel).
++    // The CUDA/HIP FA chooser uses it to select an RDNA WMMA ncols2 that is per-GPU-bandwidth
++    // friendly instead of compute-optimal for a whole card.  Set once per context; default false.
++    GGML_API void ggml_set_fa_tensor_parallel(bool enable);
++    GGML_API bool ggml_get_fa_tensor_parallel(void);
++
+     // kq mask derived from compact state: when cell_pos/tok_lo/tok_hi are given, the mask tensor
+     // may be NULL and each cell's value is derived in the kernel as
+     //     cell_pos[cell] >= tok_lo[token] && cell_pos[cell] <= tok_hi[token]  ->  0.0f, else -INF
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 index 9781f330d..f6638e1a8 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
@@ -50,19 +67,21 @@ index 9781f330d..f6638e1a8 100644
      GGML_UNUSED_VARS(DKQ, DV, ncols);
      return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 2ae3ce0df..6de77c216 100644
+index 2ae3ce0df..52c202c0e 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -229,6 +229,28 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
+@@ -229,6 +229,30 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
          }
      }
  
-+    // 2026-09-14: upstream #28102's RDNA preference -- minimize wasted compute rather than duplicate
-+    // mask I/O.  For gqa 6 it picks ncols2 = 2 (6/2 exact) where the generic rule below picks 8
-+    // (2 of 8 GQA lanes wasted), so an n_q>8 attention batch carries 8/6 extra MMA work that rides
-+    // the depth term.  Kept behind the same purity gate (the 2026-09-13 re-base omitted it to hold
-+    // the 4B q4_0 W=1..8 band).
-+    if (amd_wmma_available(cc)) {
++    // 2026-09-14: split-aware RDNA ncols2.  Whole-card attention is compute-bound and prefers stock's
++    // AMD rule (minimize wasted compute: ncols2 divides the GQA ratio); tensor-split attention is
++    // per-GPU bandwidth-bound and prefers the wider generic ncols2 (fewer K/V re-reads).  The frontend
++    // sets the hint (llama_context: split_mode == LLAMA_SPLIT_MODE_TENSOR with > 1 GPU).
++    // Measured on 27B head-256: single 703.7 vs 664.8, tensor 1152.3 vs 1219.9 t/s.
++    const bool tensor_parallel = ggml_get_fa_tensor_parallel();
++
++    if (amd_wmma_available(cc) && !tensor_parallel) {
 +        if (use_gqa_opt && gqa_ratio % 8 == 0) {
 +            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
 +            return;
@@ -82,3 +101,48 @@ index 2ae3ce0df..6de77c216 100644
      if (use_gqa_opt && gqa_ratio > 4) {
          ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
          return;
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 1ca17ad74..e7083f445 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5569,6 +5569,17 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
+     return (enum ggml_prec) prec_i32;
+ }
+ 
++// Frontend hint for the CUDA/HIP FA chooser (see ggml.h).  Process-wide; set once per context.
++static bool g_fa_tensor_parallel = false;
++
++void ggml_set_fa_tensor_parallel(bool enable) {
++    g_fa_tensor_parallel = enable;
++}
++
++bool ggml_get_fa_tensor_parallel(void) {
++    return g_fa_tensor_parallel;
++}
++
+ void ggml_flash_attn_ext_set_n_kv_max(
+         struct ggml_tensor * a,
+         int32_t              n_kv_max) {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0a41b9b68..64a65852b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -171,6 +171,18 @@ llama_context::llama_context(
+ 
+     const auto & hparams = model.hparams;
+ 
++    // Only a tensor split distributes a single attention op across devices; tell the HIP FA chooser
++    // so it can pick a per-GPU-bandwidth-friendly kernel config instead of the whole-card one.
++    {
++        int n_cuda_dev = 0;
++        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++            if (ggml_backend_dev_is_cuda(ggml_backend_dev_get(i))) {
++                n_cuda_dev++;
++            }
++        }
++        ggml_set_fa_tensor_parallel(model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && n_cuda_dev > 1);
++    }
++
+     cparams.n_seq_max = std::max(1u, params.n_seq_max);
+     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
+         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));

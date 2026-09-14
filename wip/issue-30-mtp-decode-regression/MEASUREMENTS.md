@@ -321,17 +321,29 @@ faster in tensor-only testing for exactly that reason.  Rule: any prefill change
 
 Experiment diff: `patches/2026-09-14-prefill-rdna-config-and-ncols2.diff`.
 
-### Split-aware `ncols2` (the ideal, pending plumbing)
+### Split-aware `ncols2` — **IMPLEMENTED 2026-09-14 (option A)**
+
+**Result (final build):** 1 GPU f16 pp32K/64K/150K = **1090.4 / 946.8 / 703.4** (AMD rule) and 3-GPU
+`-sm tensor` = **1812.7 / 1596.4 / 1218.6** (generic rule) — the best of both, and the 4B q4_0
+`W = 1..8` band stays **pure** (`fcdc29f3a315d377`).
+
+**Mechanism.**  A process-wide hint set once per context: `ggml_set_fa_tensor_parallel(
+model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && n_cuda_dev > 1)` in the `llama_context` constructor
+(llama.h/ggml.h get `ggml_set_fa_tensor_parallel` / `ggml_get_fa_tensor_parallel`; the state lives in
+`ggml.c`), read by `ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2`: tensor-parallel takes the generic
+`gqa > 4 -> 8` rule, otherwise stock's AMD `gqa % 2 -> 2` rule.  `n_devices()` is **1** under tensor
+split (the meta device wraps the GPUs), so the condition counts CUDA sub-devices via
+`ggml_backend_dev_is_cuda(ggml_backend_dev_get(i))` instead.
 
 The single-card and `-sm tensor` optima are **different and both real**:
 
 | rule | 1 GPU pp32K / pp64K / pp150K | `-sm tensor` pp150K |
 |---|---|---|
 | generic `gqa>4 -> ncols2=8` | 1096.3 / 916.6 (pre-AMD) / 664.8 | **1219.9** |
-| AMD `gqa%2 -> ncols2=2` | **~ / 947.7 / 703.7** | 1152.3 |
+| AMD `gqa%2 -> ncols2=2` | 1090.4 / 946.8 / **703.4** | 1152.3 |
 | stock | 982.6 / 877.2 / 686.9 | 1111.8 |
 
-**The signal exists.**  Instrumenting `switch_ncols2` on the 27B shows the FA op is **head-split under
+**The signal.**  Instrumenting `switch_ncols2` on the 27B shows the FA op is **head-split under
 tensor split**:
 
 ```
@@ -340,21 +352,13 @@ tensor split**:
 ```
 
 So under `-sm tensor` the KV heads are distributed (`K.ne2` 2/1 vs 4) while the *ratio* stays 6.  The
-chooser runs per split sub-op and sees the reduced head count, but **cannot know the model's total**
-from the op alone, so a robust rule needs the split mode:
+chooser runs per split sub-op and sees the reduced head count, but cannot know the model's total from
+the op alone, so the split mode is passed explicitly.  (Two rejected alternatives: an op_params socket is
+lost when the graph is copied before execution, and an op-shape heuristic is fragile for `-sm layer`,
+where the op is **not** split (Q.ne2=24) and the AMD rule is correct despite `device_count > 1`.)
 
-* **option A (proper):** a small `ggml_cuda` policy set from the llama layer, which already has
-  `llama_model::split_mode()` — e.g. a `ggml_cuda_set_fa_tensor_parallel(bool)` called once at model load,
-  read by `switch_ncols2`; tensor-parallel -> generic 8, otherwise -> stock's AMD 2.  This is a block-04
-  amendment (new API plumbing), and it must be validated in both modes + the 4B q4_0 band.
-* **option B (interim, safe):** adopt stock's AMD rule globally (it beats stock in *both* modes:
-  single 703.7 +2.4 %, tensor 1152.3 +3.6 %), giving up the extra ~5.5 % tensor win until A lands.
-* **option C (hacky):** infer from the op (`K.ne2` shrunk vs the full head count) — rejected: fragile for
-  models with few KV heads and for `-sm layer`, where the op is **not** split (Q.ne2=24) and the AMD rule
-  is correct despite `device_count > 1`.
-
-**Recommendation:** option A (it is what "tensor split is already tuned, single card was never
-re-checked" actually calls for); use option B if the promotion cannot wait for the API.
+**Recommendation (superseded):** option A, now implemented; option B (global AMD rule) and the
+op-shape heuristic (C) are not needed.
 
 ---
 

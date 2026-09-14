@@ -124,9 +124,10 @@ Dossier: `wip/issue-30-mtp-decode-regression/` (`README.md` action register, `ME
   q8_0-specific (delivery f16 609.5 vs stock 686.9 at pp150k, 1 GPU): the delivery's head-256 `ncols=64`
   WMMA config was a Strix-Halo half-tile row used for all WMMA calls, and the delivery omitted stock's
   AMD `switch_ncols2` (ncols2=8 vs 2 for gqa 6).  Prototype fixes both: 1 GPU f16 **703.7 (+2.4 %)**,
-  bf16 675.8 (−1.6 %), 3-GPU tensor **1152.3 (+3.6 %)** vs stock, 4B q4_0 `W=1..8` pure.  Remaining:
-  split-aware `ncols2` (single card -> 2, `-sm tensor` -> 8; both already beat stock) and the V3
-  (~2.4 % single-card) / bf16 (~1.6 %) residuals.  Diff:
+  bf16 675.8 (−1.6 %), 3-GPU tensor **1218.6 (+9.6 %)** vs stock, 4B q4_0 `W=1..8` pure.  **Split-aware
+  `ncols2` is implemented**: a frontend hint (`ggml_set_fa_tensor_parallel`, set in `llama_context` from
+  `split_mode()==TENSOR && n_cuda_dev>1`) selects generic 8 for tensor split and stock's AMD 2 for a whole
+  card.  Remaining: the V3 (~2.4 % single-card) / bf16 (~1.6 %) residuals.  Diff:
   `wip/issue-30-mtp-decode-regression/patches/2026-09-14-prefill-rdna-config-and-ncols2.diff`;
   analysis `MEASUREMENTS.md` §D.  **Testing lesson: `-sm tensor` masked the single-card regression —
   screen with the `t = a + b*n` slope fit at pp8192-49152, and always measure 1 GPU too.**

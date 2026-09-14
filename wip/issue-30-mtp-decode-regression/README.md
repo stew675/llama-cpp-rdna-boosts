@@ -261,11 +261,11 @@ RDNA4/RDNA3_0; **(2)** the delivery omits stock's AMD `switch_ncols2` block, so 
 
 **Fix (experiment, `patches/2026-09-14-prefill-rdna-config-and-ncols2.diff`).**  (1) make the RDNA config
 `cc`-aware — RDNA3_5 keeps the halo row, RDNA4/RDNA3_0 take upstream's config; (2) adopt the AMD
-`switch_ncols2` block.  Result: 1 GPU f16 pp150k 609.5 -> **703.7 (+2.4 % over stock)**, bf16 591.5 ->
-**675.8 (−1.6 %)**; 3-GPU `-sm tensor` f16 **1152.3 (+3.6 % over stock)**; the 4B q4_0 `W=1..8` band stays
-**pure**.  The remaining tension is compute (single card -> ncols2=2) vs per-GPU bandwidth (`-sm tensor`
--> ncols2=8): both choices beat stock; an ideal split-aware `ncols2` is a follow-up.  Details:
-`MEASUREMENTS.md` §D.
+`switch_ncols2` block **split-aware**: a frontend hint (`ggml_set_fa_tensor_parallel`, set in
+`llama_context` from `split_mode() == TENSOR && n_cuda_dev > 1`) selects the generic `ncols2=8` for tensor
+split and stock's AMD `ncols2=2` for a whole card.  Result: 1 GPU f16 pp150k **703.4 (+2.4 % over
+stock)**, pp64k 946.8 (+8.0 %), bf16 675.8 (−1.6 %); 3-GPU `-sm tensor` f16 **1218.6 (+9.6 % over
+stock)**; the 4B q4_0 `W=1..8` band stays **pure**.  Details: `MEASUREMENTS.md` §D.
 
 **Testing rule (the finding that mattered).**  `-sm tensor` **masks single-card regressions**: the halo
 config was faster in tensor-only testing for exactly that reason.  
@@ -322,7 +322,7 @@ with hashes (`prompts/README.md`), never edited in place.
 | A | KV-type × depth scaling (f16/bf16 reference) | **DONE** | BF16 slopes match stock f16 and are ahead at depth; q8_0/q4_0 fall off faster than stock (`MEASUREMENTS.md` §A) |
 | B | quantized-KV decode/prefill (F-q8) | **fix prototyped + validated** | V4 activation policy + q4_0 native arm; q8_0 d65k +23 %, q4_0 +16 %, bit-identical, band-pure |
 | C | adaptive MTP buffer footprint (F-buf) | **load failure FIXED by V4; RS reduction open** | root cause: RS = `n_seq x (1+n_max)` f32 GDN planes + the 744 MiB F16 scratch; V4 removes the scratch -> loads at `n_slots=4`; `--parallel 1`/structural reduction for more headroom |
-| D | deep-prefill at depth (F-pp) | **root-caused; fix prototyped** | not q8_0-specific: head-256 `ncols=64` WMMA config (halo row) + missing AMD `switch_ncols2`; fixed -> single f16 +2.4 %, bf16 −1.6 %, tensor +3.6 % vs stock, purity held |
+| D | deep-prefill at depth (F-pp) | **root-caused; fix prototyped** | not q8_0-specific: head-256 `ncols=64` WMMA config (halo row) + missing AMD `switch_ncols2`; fixed + split-aware -> single f16 +2.4 %, tensor +9.6 % vs stock, purity held |
 | E | #28867 head-256 WMMA threshold (F-wmma) | **DONE — no action** | delivery has no regression: `n_q>8` guard + tuned head-256 configs; W=9/W=16 verify at parity with TILE, acceptance bit-identical |
 | F | protocol discipline | continuous | — |
 
