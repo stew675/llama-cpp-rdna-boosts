@@ -144,16 +144,53 @@ comparing against the reporter.
 * Ruled out so far: the all-reduce (reporter A/B'd P2P/internal), and the
   `ggml_set_fa_tensor_parallel` hint (prefill `ncols2` only).
 
+## Investigation log — controller dynamics, pinned depth, and the bucketed alternative
+
+**The design constraints (maintainer, #35).**  The adaptive controller must hold all of these at
+once: **R** ≤ 1.03 × fixed MTP-3; **P** ≥ fixed MTP-3; **C** ≥ 1.10 × fixed MTP-3 **and
+C(n12) ≥ C(n7)** (ideally a little better); **K** must climb to depth 12 quickly.
+
+**Four-axis gate, Q8_0 27B × 2-card `-sm tensor`, f16 KV, `-n 3000`** (our box; 1 run/cell):
+
+| axis | fixed n3 | adaptive n7 | table adaptive n12 | bucketed adaptive n12 |
+|---|---:|---:|---:|---:|
+| reasoning | 58.3 | 57.7 | 57.7 (−0.5%) | 57.8 (−0.9%) |
+| prose | 73.2 | 79.5 | 76.5 (+5.1%) | 78.8 (+7.7%) |
+| code | 80.5 | **95.0** | 91.3 (+13.4%) | 92.7 (+15.4%) |
+| recall | 86.9 | 115.5 | 124.9 (+43.7%) | 119.6 (+37.5%) |
+
+Against fixed MTP-3 **all four constraints pass** — but **C(n12) < C(n7)** on the code axis is the
+violation the maintainer added, and the reason this is a tuning problem rather than a doc caveat.
+
+**Pinned depth isolates the cost.**  `--spec-draft-n-min-adaptive D --spec-draft-n-max D` pins the
+controller at exactly `D` (0 transitions).  Same cell: 7 → 97.0, **10 → 99.5**, 11 → 98.0,
+12 → 94.5 t/s.  **Depth 10 is the code optimum**, and every adaptive run is *below* the pinned
+throughput at its own mean depth — i.e. the controller's ramp + wander costs ~2-5%, and the
+ceiling-12 loss is the controller settling at 11–12 rather than at 10.
+
+**Mechanism (measured per round).**  At depth 7 code's full-accept rate is 0.51; at 11–12 it is
+0.21–0.28.  The table controller's `update()` **zeroes `n_drop` on every full accept**, so a
+workload that fully accepts every few rounds never accumulates the drop pressure and parks at
+11–12 — where the wide verify is dearest.  Removing the reset (partial relief) shifted the balance
+by only ~1 round and did not fix the cell.
+
+**The bucketed alternative (maintainer's preferred direction).**  `bucketed-port/` carries the
+maintainer's `bucketed-adaptive-mtp` controller (single credit bucket, no hard resets, surplus/
+deficit carried across depth changes) ported onto block 01, plus its measurements.  It beats the
+table on prose and code but under-climbs on recall, and it still gives C(n12) < C(n7) — it was
+tuned against upstream acceptance rates.  A depth-weighted credit that helps R/P/K pushes code's
+equilibrium *above* 10 toward 12, so the lever is controller **stability**, not the climb rate.
+
 ## Next steps (handover)
 
-1. **Retune the climb/drop table first** ([`common/speculative-adaptive.h`](../../common/speculative-adaptive.h)):
-   the `>= 7` climb of 2 and `drop_pressure = depth * 5` assume mainline (low) acceptance.  With the
-   delivery's improved drafting the controller sits at the cap, so try a steeper climb above ~7, a
-   larger drop pressure, and/or a verify-cost term — driven by
-   [`tests/test-speculative-adaptive.cpp`](../../tests/test-speculative-adaptive.cpp) and the curve in
-   `repro.sh`.  Only if that cannot fix it, fall back to the reporter's blanket cap (ceiling 7 when
-   `n_gpu > 1` (tensor) or the dominant weight type is Q8_0 — mirroring the existing `ncols2` split
-   gate).
+1. **Tune the bucketed controller** (`bucketed-port/`, the maintainer's preferred approach): the
+   win is holding code near depth 10 (pinned 99.5 vs an adaptive ~92) while recall rides at 12.
+   The table's `climb_threshold`/`drop_pressure` path was tried and does not fix the cell
+   (the `+1` climb and the partial drop-relief both leave C(n12) < C(n7)); a depth-weighted credit
+   helps R/P/K but overshoots code to 12.  Focus on hysteresis/stability and a depth-dependent
+   climb budget, not on the raw climb rate.  Validate against **all five** constraints
+   (R ≤ 1.03×, P ≥, C ≥ 1.10× **and C(n12) ≥ C(n7)**, K → 12) on both the reporter's cell and the
+   delivery's 1-card reference.
 2. Root-cause the Q8_0 wide-verify cost before changing the controller: profile the verify batch
    (`n_q > 8`, Q8_0 weights, Q8_0/f16 KV) with `test-backend-ops perf` at the verify widths and a
    `llama-batched-bench`/kernel-family A/B.  Is it the FA kernel, the Q8_0 `MUL_MAT`, or the

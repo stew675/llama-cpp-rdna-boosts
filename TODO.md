@@ -93,10 +93,14 @@ acceptance; the delivery's drafting improvements made it over-climb, so the tabl
 - Dossier + repro: [`wip/adaptive-mtp-ceiling-scaling/`](wip/adaptive-mtp-ceiling-scaling/)
   (`README.md` = finding/data, `HANDOVER.md` = the turnkey brief for the next session, `repro.sh` =
   the sweep).
-- Fix shape: **retune the climb/drop table first** (`common/speculative-adaptive.h`, block 01; unit
-  test `tests/test-speculative-adaptive.cpp`) — the `>= 7` climb of 2 and `drop_pressure = depth*5`
-  assume low acceptance.  Only if that fails, fall back to the reporter's cap (7 when `n_gpu > 1` or
-  the dominant weight type is Q8_0, mirroring the `ncols2` split gate).
+- Fix shape: **the maintainer prefers the bucketed controller** (`bucketed-port/`, from
+  `~/stew675/llama-master` branch `bucketed-adaptive-mtp`) — tune *it* rather than the table.  The
+  table's `+1` climb and partial drop-relief were tried on the reporter's cell and neither fixes
+  **C(n12) ≥ C(n7)**; the bucketed base is better on P/C but under-climbs recall.  Measured: code's
+  pinned optimum is depth **10** (99.5 vs 97.0 at 7 / 94.5 at 12), and every adaptive config is below
+  pinned at its own mean depth — the lever is controller **spread**, not the climb rate.  Validate
+  against all five constraints (R ≤ 1.03×, P ≥, C ≥ 1.10× **and C(n12) ≥ C(n7)**, K → 12).  Fallback
+  only if tuning fails: the reporter's cap (7 when `n_gpu > 1` or the dominant weight is Q8_0).
 - Interim: the `ceiling 12` recommendation needs a caveat in `benchmarks/README.md`,
   `benchmarks/mtp-adaptive-methodology.md` and `README.md` (7 is the default on Q8_0 / tensor split).
 - Separate, untriaged, in the same report: ROCm **7.2.4** breaks purity (clean on 7.14) — a

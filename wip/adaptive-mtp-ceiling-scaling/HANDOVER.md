@@ -1,8 +1,11 @@
 # HANDOVER — adaptive-MTP ceiling scaling
 
 Turnkey brief for the next session.  Read [`README.md`](README.md) first (the finding, the data, the
-confirmed/not-confirmed split, and the maintainer's climb/drop-table hypothesis).  **Tracked as issue
-[#35](https://github.com/stew675/llama-cpp-rdna-boosts/issues/35), not #30.**
+confirmed/not-confirmed split, the four-axis and pinned-depth data, and the controller dynamics).
+**The maintainer prefers the bucketed controller** — start at
+[`bucketed-port/`](bucketed-port/README.md) (his `bucketed-adaptive-mtp` algorithm ported onto
+block 01, with its numbers and the tuning direction), not at the table.  **Tracked as issue
+[#35](https://github.com/stew675/llama-cpp-rdna-boosts/issues/35).**
 
 ## TL;DR
 
@@ -11,10 +14,11 @@ Confirmed on `v16-d1d3c3396-r1`: **Qwen3.8-27B Q8_0, 2-card `-sm tensor`, adapti
 between the two.  1-card Q8_0 still wins from 12, and Q4/Q6 2-card still win here — so the loss is
 specific to **Q8_0 × tensor split**, and it is a *tuning/performance* issue, not a purity bug.
 
-**Working hypothesis (stew675, #35):** the adaptive controller's climb/drop cost table
-([`common/speculative-adaptive.h`](../../common/speculative-adaptive.h)) was tuned for mainline (low)
-acceptance; the delivery's drafting improvements made it over-climb.  **Retune that table before
-reaching for a blanket cap.**
+**Hypothesis, now refined:** the controller's constants were tuned for mainline (low) acceptance, and
+the delivery's higher acceptance moves the operating point.  Measured: the table parks code at 11–12
+(too high) while the bucketed controller parks it at ~7.8 (too low) — the issue is the controller's
+**spread**, and the maintainer's bucketed design is the preferred base to tune.  See `README.md` and
+`bucketed-port/`.
 
 ## Setup
 
@@ -64,6 +68,19 @@ BF16 KV (same cell): 7 → 97.0, 10 → 94.5, 12 → 90.6.  Native-bf16 FA force
 is a no-op here.  Quant × split, 7 → 12: Q8_0 2-card code −5.8 %, prose −4.8 %; **Q4_K_XL and Q6_K
 2-card still gain** (+8.2/+6.6 %, +11.3/+6.9 %); 1-card Q8_0 still gains (+7.3 %, q8_0 KV).  So the
 confirmed loss is exactly **Q8_0 × tensor split**.
+
+## The five constraints a tuned controller must hold at once (all at `-n 3000`)
+
+1. **R** (reasoning) ≤ 1.03 × fixed MTP-3.
+2. **P** (prose) ≥ fixed MTP-3.
+3. **C** (code) ≥ 1.10 × fixed MTP-3 **and C(n12) ≥ C(n7)** (ideally a little better).
+4. **K** (recall) climbs to depth 12 quickly.
+
+On Q8_0 × 2-card tensor all pass except **C(n12) < C(n7)** (n7 95.0, table n12 91.3, bucketed
+n12 92.7).  Pinned depth says the code optimum is **10** (99.5 t/s; 7 → 97.0, 12 → 94.5), so the fix
+is not a blanket ceiling — it is a controller that holds ~10 on code and rides 12 on recall.  Judge
+candidates on all four axes at once; a control change that helps one axis but breaks another is not
+a fix.
 
 ## Controller internals (the prime suspect)
 
@@ -127,6 +144,15 @@ Before proposing a change, run:
 * The maintainer's working hypothesis (#35) is that the **climb/drop table is tuned for mainline (low)
   acceptance** and the delivery's improved drafting made the controller over-climb — retune
   `common/speculative-adaptive.h` before reaching for a blanket `n_gpu > 1` / Q8_0 cap.
+* The maintainer prefers the **bucketed** controller (no hard resets, running credit bucket); the
+  table in `common/speculative-adaptive.h` is the *old* design.  The bucketed port is
+  `bucketed-port/port.patch` (apply in `~/llama-cpp-rebase`); measurements in its README.
+* **Pinned depth** (`--spec-draft-n-min-adaptive D --spec-draft-n-max D`) is the depth-cost oracle:
+  code 7 → 97.0, **10 → 99.5**, 11 → 98.0, 12 → 94.5 t/s.  Every adaptive config is *below* pinned at
+  its own mean depth (ramp + wander).
+* The table controller parks at 11–12 because `n_drop` is **zeroed on every full accept** (code's
+  full-accept rate at 11–12 is 0.21–0.28).  Partial drop-relief and the `+1` climb were both tried
+  and do not fix the cell; a depth-weighted credit helps R/P/K but overshoots code to 12.
 * The AR is not the cause (reporter A/B).  The `ggml_set_fa_tensor_parallel` hint is prefill-only.
 * BF16 vs f16 KV is not the cause (same shape; bf16 ~2 % faster absolute).
 * The absolute t/s in this dossier are our local cli footers; the reporter's and the historical server
