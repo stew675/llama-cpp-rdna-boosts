@@ -1,0 +1,21 @@
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index e1b62673a..1e950cc64 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1885,6 +1885,16 @@ void launch_fattn(
+         }
+     }
+ 
++    // TEMPORARY diagnosis (the W=1 vs W>=2 logits edge): dump everything that could make the KV-split
++    // reduction width-dependent.  Enable with GGML_CUDA_FA_DEBUG2=1.
++    static const bool fa_dbg2 = getenv("GGML_CUDA_FA_DEBUG2") != nullptr;
++    if (fa_dbg2) {
++        fprintf(stderr, "[FATTN2] n_q=%lld n_kv=%lld K.ne1=%lld | ncols1=%d ncols2=%d nwarps=%d nbatch_fa=%d stream_k=%d | ntiles_x=%d ntiles_z_gqa=%d ntiles_dst=%d parallel_blocks=%d blocks=(%u,%u,%u) sparse=%d ntiles_KV=%d max_blocks_per_sm=%d\n",
++            (long long) Q->ne[1], (long long) n_kv, (long long) K->ne[1], ncols1, ncols2, nwarps, nbatch_fa,
++            (int) stream_k, ntiles_x, ntiles_z_gqa, ntiles_dst, parallel_blocks,
++            blocks_num.x, blocks_num.y, blocks_num.z, (int) use_sparse, ntiles_KV, max_blocks_per_sm);
++    }
++
+     float scale         = 1.0f;
+     float max_bias      = 0.0f;
+     float logit_softcap = 0.0f;

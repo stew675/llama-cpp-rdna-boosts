@@ -61,6 +61,21 @@ unchanged** and the top-2 margin at 2.2+ (bf16 delta 0.014, q4_1 delta 0.064), a
 (items 2 and 21 -> Closed), `patches/README.md` (the 2026-09-15 block-15 amendment section),
 `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §F-H + §I.
 
+**Also 2026-09-15 — the `W=1` vs `W>=2` logits edge: investigated, documented, WON'T FIX.**  §36 had
+described a residual `n_q = 1` vs `n_q >= 2` difference and attributed it to the `n_q = 1` launch running
+the tile's whole `cols_per_block`.  A launcher dump (`tools/fattn-launch-dump.patch`, `GGML_CUDA_FA_DEBUG2`)
+**withdrew that explanation**: the KV split is already width-invariant (`parallel_blocks=8` at `n_q=1/2/4`;
+block 00's `ntiles_dst_eff` fix covers the band, `stream_k=0` on the tile path) and `ncols1=1` means there
+are no phantom query columns at all.  What remains is a rounding edge inside the FA path — `argmax`
+identical in every observed case, delta 0.014-0.064 logits against a top-2 margin of 2.2-2.7, MTP
+acceptance bit-identical across arms, and one to two orders of magnitude below the error the coarse KV
+quantization itself imposes.  Leading (unproven) candidate: the per-tile mask-derived `i_sup` bound.
+Decision: don't chase it — the fix would make every width process the same KV range, taxing the
+single-token decode for no measurable reward, and it is the same recurring 0.5-9 % retrofit class as §19.
+**Revisit only on an `argmax` change**; re-run the 8-type x 5-length grid (~20 min) whenever a
+single-token-tuned kernel changes.  Detail: `GREEDY-PURITY.md` §36 (withdrawn claim marked in place),
+`MEASUREMENTS.md` §J, `TODO.md` Closed.
+
 ## 2026-09-14 (later) — block-04 amendment: RDNA prefill tuning, now arch- and split-aware
 
 **Why.**  Issue #30's reconciliation left one open finding: the delivery's prefill fell off faster with

@@ -640,3 +640,99 @@ gfx1201, which is what the band split is there to avoid.
 TODO-21 change (`common.cuh`, `fattn-vec.cuh`, `fattn.cu`, `ggml-cuda.cu`), i.e. the r4 candidate plus
 item 2: `8 files changed, +445/-61`.  Logs: `results/2026-09-15-item2-*.txt` (fix1..fix4 = the
 `test-backend-ops` iterations, `-perf*`, `-purity*`, `-textgate*`).
+
+---
+
+## §J — the `W=1` vs `W>=2` logits edge: what it is, what it is not, and why it stays (won't fix)
+
+**Verdict: DOCUMENTED, WON'T FIX (maintainer decision 2026-09-15).**  The reward is unmeasurable at the
+quantizations where it appears; the plausible fix adds work to the single-token decode; and the trigger to
+revisit is an **argmax** change, not a hash change.
+
+### What it is (measured)
+
+A decode batch of `W = 1` and a decode batch of `W >= 2` can hash differently for the **token-0 logits**
+at the same prefill length `P`.  It is a *logits-level* edge, never a token-level one:
+
+| case (4B, gfx1201, P=200) | `argmax` W=1 / W=4 | top-1 | delta | top-2 margin |
+|---|---|---|---|---|
+| bf16 | 9146 / 9146 | 23.6626 / 23.6770 | **0.014** | 2.24 / 2.32 |
+| q4_1 | 9146 / 9146 | 23.9285 / 23.8647 | **0.064** | 2.73 / 2.64 |
+
+The full 8-type x 5-length grid (one logits hash per `W=1..8`, prose prompt, P = 192/200/208/224/256) is in
+`GREEDY-PURITY.md` §36: f16/bf16/q8_0/q5_0/q5_1/iq4_nl pure at all five, bf16 moves at P=200, q4_0 at
+P=224/P=256, q4_1 at P=200 — every case reproducible to the bit (rep 2 identical), and **identical with
+`GGML_CUDA_FA_KV_NATIVE=0`**, i.e. independent of the native arms and of the prefill-staging split.
+Logs: `results/2026-09-15-purity-native-arms-{a,b,c,d}.txt`.
+
+### What it is *not* (verified)
+
+`tools/fattn-launch-dump.patch` adds a `GGML_CUDA_FA_DEBUG2=1` dump of every quantity that could make the
+KV-split reduction width-dependent.  4B, bf16, `P=200`, cache padded to 256, the eight decode calls:
+
+| | `n_q=1` | `n_q=2` | `n_q=4` |
+|---|---|---|---|
+| `ntiles_x` / `ntiles_dst` | 1 / 4 | 2 / 8 | 4 / 16 |
+| `parallel_blocks` (KV split) | **8** | **8** | **8** |
+| `blocks_num` | (1,8,4) | (2,8,4) | (4,8,4) |
+| `ncols1`/`ncols2`/`nwarps`/`nbatch_fa` | 1/4/4/32 | same | same |
+| `ntiles_KV`/`ntiles_z_gqa`/`stream_k`/`max_blocks_per_sm` | 8/1/0/3 | same | same |
+
+So the **KV-split tree is already width-invariant** (block 00's `ntiles_dst_eff` fix covers the whole
+band), the tile path never enters the stream-K branch, and the fixup condition is the same.  `ncols1 = 1`
+means the tile has **no phantom query columns** — a 1-row tile computes exactly one query per x-tile — so
+§36's original explanation ("the `n_q = 1` launch still runs its whole `cols_per_block`") was **wrong** and
+has been withdrawn in place.
+
+### Leading hypothesis (not proven, deliberately not chased)
+
+The FA path's *values*: the mask-derived KV support bound (`i_sup`) is computed per query tile, so a 1-row
+tile can process one fewer KV tile than a `>= 2`-row tile at the same cache length (the padded tail only
+the later rows can attend to), and one extra/missing online-softmax rescale changes the last bits.  This
+fits the observations: inside the FA kernel, mechanism type-independent, visibility a rounding-boundary
+lottery that depends on where the cache padding falls (P=200 yes / P=208 no).  Note that "f16 is pure at
+P=200" does **not** exonerate the FA path — a pure hash only means the perturbation did not move a logit
+bit in that kernel's arithmetic.  Isolating it would need an op-level A/B (hash the attention output, not
+the logits); not done, see below.
+
+### Rewards (why the fix is not worth it)
+
+* The greedy token never moved in any observation, so **text, acceptance and draft/verify are unaffected**.
+  MTP acceptance is bit-identical across the arms where it was measured (`0.96712` at `n_max 8`,
+  `0.93186` at `n_max 15`; and unchanged across the r2/r3/r4 gates).
+* For sampling, a 0.014-0.064 logit delta is ~0.06-0.3 % relative on a logit of ~23 — one to two orders
+  of magnitude **below** the perturbation the coarse KV quantization itself already imposes.  The user of
+  a q4_0 cache has accepted an error 10-100x larger.
+* The genuine reward is epistemic only: one code path instead of "one code path plus a rounding edge", and
+  a contract that can be stated without a footnote.
+
+### Risks (why the fix is actively bad)
+
+* Under the hypothesis the uniform choice is to make every width process the same KV range — i.e. give the
+  **single-token decode** the tail work only wider batches need.  That is pure added work on the
+  latency-critical width, for a rounding lottery.  Magnitude is depth-dependent (a 55-entry padded tail
+  out of 256 is ~5 % of decode at short contexts; a few dozen entries out of tens of thousands is noise at
+  depth) — but it is the wrong direction at any size.
+* It is the same class of retrofit §19 records: 0.5-9 % on whichever axis it touches, recurring with every
+  new single-token-tuned kernel.  The *structural* band bugs (per-type mmvq caps, the MoE `nwarps`, the
+  QSA indexer flatten ahead of `MMVF_MAX_BATCH_SIZE_FLAT`) were families switching at a width boundary and
+  were worth fixing.  What is left here is the residue: no structural boundary, only a rounding edge.
+
+### Cadence and trigger
+
+* Re-run the 8-type x 5-length grid (~20 min, `wip-issue30/purity-matrix.sh`) whenever a single-token-tuned
+  kernel changes — that is the cheap check for a *new structural* boundary, which is the failure mode that
+  actually matters.
+* **Trigger to isolate:** an `argmax` change (a quality event).  A hash change with a 2.2+ top-2 margin is
+  not one.
+
+### Reproducing the dump
+
+```bash
+cd ~/llama.cpp && git apply <this repo>/wip/issue-30-mtp-decode-regression/tools/fattn-launch-dump.patch
+cmake --build build-rocm --target llama-cli -j 16
+# the probe is /tmp/wm-fixed.cpp (constant n_ctx); see tools/width-matrix.cpp for the shipped variant
+GGML_CUDA_FA_DEBUG2=1 HIP_VISIBLE_DEVICES=0 NGL=99 SPLIT=tensor CTK=bf16 CTV=bf16 \
+  /tmp/lw-kv <model> <prompt.txt> 200 512 1   2>&1 | grep FATTN2
+git checkout ggml/src/ggml-cuda/fattn-common.cuh   # revert
+```

@@ -1287,11 +1287,12 @@ Results and the full matrix: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md
 ## 36. §14's `W=1..8` purity is a *measured* claim, not a guarantee — relax it for the coarse quants (2026-09-14, issue #30)
 
 **Finding.**  §14 deleted the VEC/TILE family split for a quantized K/V, and that part holds — on AMD the
-chooser's fallback returns TILE unconditionally, so the whole `n_q <= 8` band is TILE.  But the tile
-kernel's arithmetic is still not *identical* for `n_q = 1` and `n_q >= 2`.  It only becomes visible as a
-**logits-level near-tie flip**, i.e. when the values land near a tie.  Measured on the 4B (gfx1201;
-`P` = prefill length, `W` = decode batch width, one logits hash per `W=1..8`, prose prompt; 2026-09-15,
-after the item-2 arms):
+chooser's fallback returns TILE unconditionally, so the whole `n_q <= 8` band is TILE, and (verified
+2026-09-15 by dumping the launcher state at every width, see below) the **KV split is width-invariant
+too**.  What remains is a **logits-level band edge** between `n_q = 1` and `n_q >= 2` that only becomes
+visible as a near-tie flip, i.e. when the values land near a rounding boundary.  Measured on the 4B
+(gfx1201; `P` = prefill length, `W` = decode batch width, one logits hash per `W=1..8`, prose prompt;
+2026-09-15, after the item-2 arms):
 
 | K/V | P=192 | P=200 | P=208 | P=224 | P=256 |
 |---|---|---|---|---|---|
@@ -1313,6 +1314,45 @@ difference.  It is **pre-existing and independent of the native arms**: reproduc
 four small quants are measured **pure at all five P** here — arming them (item 2) moved their `W=1` path
 from the F16 tile to the native tile, so their pre-2026-09-15 entries (a q4_1 edge at P=200) are
 superseded, not contradicted.
+
+**What is *not* the cause (verified 2026-09-15).**  A temporary launcher dump (`GGML_CUDA_FA_DEBUG2`,
+snippet in `wip/issue-30-mtp-decode-regression/tools/fattn-launch-dump.patch`) shows the decode calls at
+every width in the band have **identical** reduction structure — 4B, bf16, `P=200`, cache padded to 256:
+
+| | `n_q=1` | `n_q=2` | `n_q=4` |
+|---|---|---|---|
+| `ntiles_x` / `ntiles_dst` | 1 / 4 | 2 / 8 | 4 / 16 |
+| `parallel_blocks` (the KV split) | **8** | **8** | **8** |
+| `blocks_num` | (1,8,4) | (2,8,4) | (4,8,4) |
+| `ncols1`/`ncols2`/`nwarps`/`nbatch_fa` | 1/4/4/32 | same | same |
+| `ntiles_KV`/`ntiles_z_gqa`/`stream_k` | 8/1/0 | same | same |
+
+So the KV-split tree, the number of online-softmax rescale steps over KV *tiles* and the fixup condition
+are all width-invariant — block 00's `ntiles_dst_eff` fix covers the whole band, and the tile path never
+enters the stream-K branch (`stream_k=0`).  `ncols1 = 1` also means the tile has **no phantom query
+columns**: a 1-row tile computes exactly one query per x-tile and pads nothing, so an earlier note here
+attributing the edge to "the `n_q = 1` launch running its whole `cols_per_block`" was **wrong** and is
+withdrawn.  The only quantity that changes with `W` is `ntiles_x` (the number of independent query
+tiles), which is per-tile independent.
+
+**Leading hypothesis (not proven).**  That leaves the FA path's *values*: the mask-derived KV support
+range (`i_sup`) is a per-tile bound, so a 1-row tile can process one fewer KV tile than a `>= 2`-row tile
+at the same cache length (the padded tail only the later rows can attend to), changing the last bits
+through the online-softmax rescales.  This fits everything observed — inside the FA kernel, mechanism
+type-independent, visibility a rounding-boundary lottery that depends on where the cache padding falls
+(hence P=200 yes, P=208 no).  Note that "f16 is pure at P=200" is **not** evidence that the FA path is
+the wrong place: the mechanism is probably type-independent, and a pure hash only means the perturbation
+did not move a logit bit in that kernel's arithmetic.  Isolating it would need an op-level A/B (hash the
+attention output rather than the logits) — deliberately not done, see the decision below.
+
+**Decision (2026-09-15, maintainer).**  **Won't fix.**  The reward is unmeasurable — the greedy token never
+moved, MTP acceptance is bit-identical across the arms (`0.96712` at `n_max 8`, `0.93186` at `n_max 15`),
+and the perturbation is 0.014-0.064 logits against a top-2 margin of 2.2-2.7, one to two orders of
+magnitude *below* the error the coarse KV quantization itself imposes.  The plausible fix (make every
+width process the same KV range) adds work to the single-token decode — the latency-critical width — for
+nothing, and it is the same class of retrofit §19 records as costing 0.5-9 % on whichever axis it touches
+and recurring with every new single-token-tuned kernel.  The **trigger to revisit is an *argmax* change**
+(a quality event); a hash change with a 2.2+ margin is not one.
 
 **Doctrine (2026-09-14, maintainer decision; sharpened 2026-09-15 by the table above).**  Tier by
 *coherence*, not by bits, and be explicit about *which* level the guarantee is at:

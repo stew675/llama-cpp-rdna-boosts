@@ -192,6 +192,21 @@ enablement there and runs host-only/CPU.
 
 ## Closed (one-liners; details in the dated docs)
 
+- **The `W=1` vs `W>=2` logits edge — investigated, documented, WON'T FIX (2026-09-15).**  A decode batch of
+  one token and a batch of two or more can hash differently for the token-0 logits at some prefill
+  lengths (on the 4B: q4_0 at P=224/256, q4_1 and bf16 at P=200; f16/q8_0/q5_0/q5_1/iq4_nl pure across the
+  grid).  It is **logits-level only** — `argmax` identical in every observed case, delta 0.014-0.064
+  logits against a top-2 margin of 2.2-2.7, one to two orders of magnitude below the error the coarse KV
+  quantization itself imposes — and MTP acceptance is bit-identical across the arms.  It is pre-existing
+  and independent of the native arms (`GGML_CUDA_FA_KV_NATIVE=0` reproduces it byte-identically).  The
+  launcher dump (`tools/fattn-launch-dump.patch`) proves the **KV split is already width-invariant**
+  (`parallel_blocks=8` at every width; block 00's `ntiles_dst_eff` fix covers the band) and `ncols1=1`
+  means there are no phantom query columns, so the earlier "whole `cols_per_block`" explanation is
+  withdrawn; the leading (unproven) candidate is the per-tile mask-derived `i_sup` bound.  Not worth
+  chasing: the fix would add work to the single-token decode for an unmeasurable reward, and it is the
+  same recurring 0.5-9 % retrofit class as §19.  **Revisit only on an `argmax` change**; re-run the
+  8-type x 5-length grid (~20 min) whenever a single-token-tuned kernel changes.  Detail:
+  `GREEDY-PURITY.md` §36 + `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §J.
 - **Issue #30 wider-configuration umbrella — every action resolved (closed 2026-09-14; block-04 + block-15
   amendments, r3 + r4).**  Dossier `wip/issue-30-mtp-decode-regression/`.  What it cost: the arm-P
   reconciliation (the q8_0-KV depth fall-off, fixed by making block 15's V4 native staging the default for

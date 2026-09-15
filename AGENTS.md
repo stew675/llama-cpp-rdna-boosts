@@ -744,7 +744,13 @@ Consequences, so it is not re-litigated:
   kernel-family guarantee stands; the **text/acceptance-level** contract (`plain == draft-mtp` greedy
   text, MTP acceptance) is kept for f16/bf16/q8_0 and the *logits* level is relaxed for
   q4_0/q4_1/q5_0/q5_1/iq4_nl — every observed edge keeps the argmax and leaves the top-2 margin at
-  2.2+ — see `GREEDY-PURITY.md` §36 (the full per-quant grid, gfx1201 + gfx1151).
+  2.2+ — see `GREEDY-PURITY.md` §36 (the full per-quant grid, gfx1201 + gfx1151).  **Investigated and
+  closed as *won't fix* 2026-09-15:** the launcher dump proves the KV split is already width-invariant
+  (`parallel_blocks` identical at every width) and there are no phantom query columns (`ncols1=1`), so it
+  is a rounding edge inside the FA path (leading unproven candidate: the per-tile `i_sup` bound) with an
+  unmeasurable reward and a fix that would tax the single-token decode; **revisit only on an `argmax`
+  change**, and re-run the 8-type x 5-length grid when a single-token-tuned kernel changes.  Detail:
+  `GREEDY-PURITY.md` §36, MEASUREMENTS §J, `tools/fattn-launch-dump.patch`.
   qwen4exp's two stacked causes (root-caused 2026-09-11) are now **half fixed**: its
   hyperconnection fusions (`hc-mix.cu`, gated `nt == 1`) were the cause-1 defect and the block-14
   2026-09-11 amendment routes the whole **decode/verify band `1 <= nt <= 8`** through them, so
