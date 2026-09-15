@@ -13,18 +13,13 @@ We are porting pwilkin's packed-block WMMA QSA attention (`qsa3`) into the deliv
 close part of the qwen4exp prefill gap.
 
 * **P1, P2, P3 are implemented and committed** on the fork branch `packed-qsa`.
-* **P3.5 verdict (2026-09-15) — corrected:** the approach is **validated on gfx1151** (`halo`,
-pwilkin's own gfx11 kernel): packed QSA is **+9.1 % at ub2048**, **+15.2 % at ub8192**, **+15.9 % at
-ub16384** (pp8192, IQ4_XS).  On gfx1201 the current port is still negative, but the cause is our
-**gfx12 kernel + the P2 merge share**, not the design:
-  * the P2 merge is a fixed absolute cost, so it is ~1.3 % of a gfx1151 pass but ~5 % of a faster
-    gfx1201 pass; the `qsa3_rows_kernel` (kernel A) dominates it;
-  * the gfx12 WMMA D layout gives each lane **8 different rows**, so our row softmax needs **32
-    shuffles/chunk** where gfx11 needs ~2; our kernel is also the correctness-first variant (LDS P
-    transpose, no prefetch).  Hence the op A/B says 1.30x while the end-to-end is at parity.
-  * Next: make the gfx12 softmax cheap (transpose the 8-row vector across the wave), shuffle-network
-    P, K/V prefetch, and make merge kernel A cheap.  A gfx1201 win at ub2048 is plausible after
-    that.  See `P3.5-NOTES.md` §9.
+* **P3.5 verdict (2026-09-15):** the approach is **validated on gfx1151** (`halo`, pwilkin's own
+gfx11 kernel): packed QSA is **+9.1 % at ub2048**, **+15.2 % at ub8192**, **+15.9 % at ub16384**
+(pp8192, IQ4_XS).  On gfx1201 the **gfx12 softmax transpose** (2026-09-15) moved the port from
+−4.5 % to **+2.8 / +3.5 / +3.9 %** at ub2048/4096/6144 — a real win, but **below the 5 % bar**, so
+the maintainer's call is to **close gfx1201/gfx1100 as not applicable** (fast RDNA4 VEC baseline +
+a ~5 % fixed merge share on a 3.6 s pass vs ~1.3 % on a 14 s gfx1151 pass).  The gfx1151 side is
+the one to finish (`halo`).  Details: `P3.5-NOTES.md` §§9-9.4.
 * **P4 (tensor-split support) is implemented and validated** (packed shadows split with the kv-head
   axis, `rel ≈ 3.9e-5`).
 
@@ -216,21 +211,21 @@ Facts not to re-derive:
 
 ---
 
-## 5. P3.5 — measured (2026-09-15)
+## 5. P3.5 — measured (2026-09-15) — CLOSED on gfx1201
 
-**Read `P3.5-NOTES.md` for the full record.**  Two results:
+**Read `P3.5-NOTES.md` for the full record.**  Three results:
 
-1. **gfx1201 (`soar`, `-sm tensor -b/-ub 2048`):** the current port is **−4.5 %** at pp8192.  The
-   pack is free, the P2 merge descriptor build (kernel A) is ~5 %, and our gfx12 WMMA kernel is at
-   parity end-to-end (despite a 1.30x op-level A/B).  Large ubatch does *not* help here (the op
-   speedup peaks at n_q≈2K and declines; ub8192 is 0.97x).
-2. **gfx1151 (`halo`, pwilkin's gfx11 kernel):** the packed QSA is **+9.1 %** at ub2048 and
-   **+15.2/15.9 %** at ub8192/16384 — the approach works, and the win grows with ubatch.
+1. **gfx1201 (`soar`, `-sm tensor`) — the gfx12 softmax transpose** (fork `6f7a38b3f`) took the op
+   from **1.30x to 4.4x** and the end-to-end from **−4.5 % to +2.8 / +3.5 / +3.9 %** at
+   ub2048/4096/6144.  The P2 merge still costs ~5 %; with it removed the ceiling is +9.4 %.  Below
+   the 5 % bar → **gfx1201/gfx1100 closed as not applicable.**
+2. **gfx1151 (`halo`, pwilkin's gfx11 kernel):** **+9.1 %** at ub2048 and **+15.2/15.9 %** at
+   ub8192/16384 — the approach works where the VEC baseline is weak; finish it there.
+3. Large ubatch does *not* help on gfx1201 (the op speedup peaks at n_q≈2 K and declines; ub8192 is
+   0.97x), and tensor split cannot fit beyond ub6144 for this model.
 
-The gfx1201 gap is therefore the **gfx12 kernel implementation** (8-rows-per-lane D layout makes the
-softmax 32 shuffles/chunk vs gfx11's ~2; correct-ness-first LDS P transpose; no prefetch) plus the
-**fixed merge share** (~5 % of a fast pass vs ~1.3 % of a slow one).  Next steps in `P3.5-NOTES.md`
-§9.2.  Track A/Track B below are the historical plan.
+The gfx12 softmax transpose is architecture-general and is the main keep-worthy result for the
+gfx1151 port.  Track A/Track B below are the historical plan.
 
 ---
 
