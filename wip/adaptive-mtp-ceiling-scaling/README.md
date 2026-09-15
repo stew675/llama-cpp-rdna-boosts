@@ -1,12 +1,12 @@
 # WIP: adaptive-MTP ceiling scaling (quant × GPU split)
 
-**This is NOT part of issue #30.**  It is a separate, reporter-filed finding (GitHub
-`stew675/llama-cpp-rdna-boosts` issue **#30** comments
-[5683949195](https://github.com/stew675/llama-cpp-rdna-boosts/issues/30#issuecomment-5683949195) and
-[5684693398](https://github.com/stew675/llama-cpp-rdna-boosts/issues/30#issuecomment-5684693398), by
-**@1337hero**, 2026-09-15) that was posted onto #30 but is a different class of problem and should have
-had its own issue.  Created 2026-09-15 after the `v16-d1d3c3396-r1` re-base, at the maintainer's
-request, from the `v16-790cf51aa-r5` reporter evidence plus our own reproduction.
+**Tracked as issue [#35](https://github.com/stew675/llama-cpp-rdna-boosts/issues/35) — "Adaptive MTP
+behaviour after recent performance tuning".**  The original report was posted onto issue #30 (comments
+[5683949195](https://github.com/stew675/llama-cpp-rdna-boosts/issues/30#issuecomment-5683949195) /
+[5684693398](https://github.com/stew675/llama-cpp-rdna-boosts/issues/30#issuecomment-5684693398)), but
+it is a different class of problem and was split out into **#35** on 2026-09-15 — **this dossier tracks
+#35, not #30**.  Reporter **@1337hero**.  The data below was collected 2026-09-15 after the
+`v16-d1d3c3396-r1` re-base, from the `v16-790cf51aa-r5` reporter evidence plus our own reproduction.
 
 **Status: CONFIRMED (narrowly).**  The headline cell — Qwen3.8-27B **Q8_0**, 2-card `-sm tensor`,
 adaptive `--spec-draft-n-max 7` vs **12**, code prompt, `-n 3000` — reproduces on the re-based
@@ -35,6 +35,36 @@ is Q8_0 — the same pattern as the `ncols2` split gate.  They also note ROCm **
 purity guarantee (filed separately below) and that the AR is not the cause (they A/B'd
 `GGML_CUDA_P2P=1` / `GGML_CUDA_ALLREDUCE=internal`), and the `ggml_set_fa_tensor_parallel` hint is
 not either (it steers prefill `ncols2` only; forcing it 0/1 left decode flat).
+
+## Maintainer hypothesis (stew675, #35) — the climb/drop table is tuned for stock
+
+The maintainer reads the ceiling-scaling symptom as a **controller-tuning** issue rather than an
+upstream regression: the delivery's drafting-accuracy work raised acceptance well above the mainline
+behaviour the adaptive controller was originally tuned against, so the controller now climbs faster and
+higher than its constants assume — and the extra depth hurts when the (improved, but not perfect)
+drafter misses.  The prime suspect is therefore the per-depth **climb/drop cost table** in
+[`common/speculative-adaptive.h`](../../common/speculative-adaptive.h) (block 01):
+
+| depth | `climb_threshold` (consecutive full accepts needed to climb one step) |
+|---:|---:|
+| 1 | 2 |
+| 2 | 4 |
+| 3 | 10 (the hardened 3→4 barrier) |
+| 4 | 6 |
+| 5 | 3 |
+| 6 | 2 |
+| ≥ 7 | **2** |
+
+`drop_pressure(depth) = max(depth * 5, 20)`.
+
+Above depth 6 the climb needs only **2** consecutive full accepts per step, so a high-acceptance
+workload walks straight up to the cap and sits there.  The measured acceptance / mean-length table
+below is exactly that signature: acceptance falls (0.737 → 0.586) while mean accepted length saturates
+(5.70 → 6.72).  The Q8_0 × tensor-split cell is simply where the wide verify is most expensive relative
+to its marginal acceptance.  **Retuning the `>= 7` band (or adding a verify-cost term) is the leading
+fix, ahead of a blanket `n_gpu > 1` cap.**  The controller has a unit test
+([`tests/test-speculative-adaptive.cpp`](../../tests/test-speculative-adaptive.cpp)) to drive the
+retune.
 
 ## Reproduction on `v16-d1d3c3396-r1`
 
@@ -116,10 +146,14 @@ comparing against the reporter.
 
 ## Next steps (handover)
 
-1. Decide the **fix shape**: a controller/default cap (ceiling 7 when `n_gpu > 1` (tensor) or the
-   dominant weight type is Q8_0 — the reporter's suggestion, mirroring the existing `ncols2` split
-   gate), or teaching the adaptive controller the real verify-batch cost.  A cap is contained; a cost
-   model is the principled fix but touches block 01.
+1. **Retune the climb/drop table first** ([`common/speculative-adaptive.h`](../../common/speculative-adaptive.h)):
+   the `>= 7` climb of 2 and `drop_pressure = depth * 5` assume mainline (low) acceptance.  With the
+   delivery's improved drafting the controller sits at the cap, so try a steeper climb above ~7, a
+   larger drop pressure, and/or a verify-cost term — driven by
+   [`tests/test-speculative-adaptive.cpp`](../../tests/test-speculative-adaptive.cpp) and the curve in
+   `repro.sh`.  Only if that cannot fix it, fall back to the reporter's blanket cap (ceiling 7 when
+   `n_gpu > 1` (tensor) or the dominant weight type is Q8_0 — mirroring the existing `ncols2` split
+   gate).
 2. Root-cause the Q8_0 wide-verify cost before changing the controller: profile the verify batch
    (`n_q > 8`, Q8_0 weights, Q8_0/f16 KV) with `test-backend-ops perf` at the verify widths and a
    `llama-batched-bench`/kernel-family A/B.  Is it the FA kernel, the Q8_0 `MUL_MAT`, or the

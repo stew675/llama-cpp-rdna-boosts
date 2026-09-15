@@ -1,7 +1,7 @@
 #!/bin/bash
 # Repro for the adaptive-MTP ceiling-scaling report (1337hero, 2026-09-15).
 #
-# NOT issue #30.  This is the separate finding that the adaptive ceiling **12**
+# Tracked as issue #35 (split out of issue #30, 2026-09-15).  This is the finding that the adaptive ceiling **12**
 # recommendation does not generalize: on Qwen3.8-27B **Q8_0** with a 2-card
 # `-sm tensor` split, adaptive ceiling 12 loses to ceiling 7 on the code axis.
 #

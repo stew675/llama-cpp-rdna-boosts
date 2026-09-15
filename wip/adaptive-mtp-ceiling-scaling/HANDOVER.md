@@ -1,7 +1,8 @@
 # HANDOVER — adaptive-MTP ceiling scaling
 
 Turnkey brief for the next session.  Read [`README.md`](README.md) first (the finding, the data, the
-confirmed/not-confirmed split).  **This is not issue #30.**
+confirmed/not-confirmed split, and the maintainer's climb/drop-table hypothesis).  **Tracked as issue
+[#35](https://github.com/stew675/llama-cpp-rdna-boosts/issues/35), not #30.**
 
 ## TL;DR
 
@@ -9,6 +10,11 @@ Confirmed on `v16-d1d3c3396-r1`: **Qwen3.8-27B Q8_0, 2-card `-sm tensor`, adapti
 `--spec-draft-n-max 12` loses ~5-6 % to `n_max 7`** (code and prose, f16 and BF16 KV).  Depth 10 is
 between the two.  1-card Q8_0 still wins from 12, and Q4/Q6 2-card still win here — so the loss is
 specific to **Q8_0 × tensor split**, and it is a *tuning/performance* issue, not a purity bug.
+
+**Working hypothesis (stew675, #35):** the adaptive controller's climb/drop cost table
+([`common/speculative-adaptive.h`](../../common/speculative-adaptive.h)) was tuned for mainline (low)
+acceptance; the delivery's drafting improvements made it over-climb.  **Retune that table before
+reaching for a blanket cap.**
 
 ## Setup
 
@@ -45,7 +51,7 @@ separate run per cell; do not run benches in parallel with anything else.
 
 | area | files / notes |
 |---|---|
-| adaptive controller, `--spec-draft-n-max` | block 01; `wip/issue-30-*` and `patches/README.md` block-01 notes; the ceiling-12 record |
+| **adaptive controller — the climb/drop table** | **`common/speculative-adaptive.h`** (`climb_threshold` / `drop_pressure`), block 01; unit test `tests/test-speculative-adaptive.cpp`; `patches/README.md` block-01 notes |
 | wide-verify matmul family (MMVQ/MMVF → MMQ at `ncols == 8`) | block 08/10/13; `patches/README.md`; `GREEDY-PURITY.md` §11/§19 |
 | FA chooser (tile/MMA at `n_q > 8`) | block 00/03/04/08; `GREEDY-PURITY.md` §11 |
 | tensor-split dispatch / AR | block 12; but note the reporter **ruled the AR out** (P2P/internal A/B) |
@@ -75,6 +81,9 @@ Before proposing a change, run:
 
 ## Do not re-derive
 
+* The maintainer's working hypothesis (#35) is that the **climb/drop table is tuned for mainline (low)
+  acceptance** and the delivery's improved drafting made the controller over-climb — retune
+  `common/speculative-adaptive.h` before reaching for a blanket `n_gpu > 1` / Q8_0 cap.
 * The AR is not the cause (reporter A/B).  The `ggml_set_fa_tensor_parallel` hint is prefill-only.
 * BF16 vs f16 KV is not the cause (same shape; bf16 ~2 % faster absolute).
 * The absolute t/s in this dossier are our local cli footers; the reporter's and the historical server
