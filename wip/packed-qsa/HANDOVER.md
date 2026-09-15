@@ -1,5 +1,14 @@
 # Packed-QSA — session handover (2026-09-13)
 
+> **CONTINUATION (2026-09-15): the gfx1201 side is CLOSED.**  The port now wins **+2.8/3.5/3.9 %**
+at ub2048/4096/6144 (under the 5 % bar; fast RDNA4 VEC baseline + a ~5 % fixed merge share), and
+**gfx1201/gfx1100 are closed as not applicable**.  The gfx1151 work continues — **read
+`HALO-HANDOVER.md`, which is the self-contained entry point for the Strix Halo (`halo`) agent.**
+> 
+> Note for the maintainer's plan to find another ~5 % in the *VEC* implementation: any VEC speedup
+> raises the bar for the packed path (its relative win shrinks) and is the more promising direction
+> for gfx1201, so closing the packed side here does not close the QSA story on gfx1201.
+
 **Read this file top to bottom; it is self-contained.**  It tells you what the work is, where both
 repos stand, the exact commands to rebuild and re-validate, what P1–P3 already proved, and where the
 work must go next.  The detailed per-phase records are linked at the bottom; you do not need them to
