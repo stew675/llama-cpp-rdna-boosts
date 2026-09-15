@@ -1,7 +1,7 @@
 # Issue #30 — follow-up response to @briansp2020 (to post after the next cut)
 
-> Status: **draft, do not post until `v16-790cf51aa-r4` is tagged.** Fill in the r4 tag/tree at the
-> bottom before posting. Written 2026-09-14.
+> Status: **ready to post** — `v16-790cf51aa-r4` is tagged (tip `b19c70b34`). Written 2026-09-14,
+> updated 2026-09-15 after the r4 cut.
 
 ---
 
@@ -64,21 +64,27 @@ depth (+4.5 % @150k). So RDNA4/RDNA3_0 stage at prefill, RDNA3_5 keeps its nativ
 
 ## On purity — I'm relaxing the guarantee for the small quants, deliberately
 
-While chasing your q4_0 hint I found a second, unrelated width effect: a `W=1` vs `W>=2` greedy near-tie
-flip on the 4B. It is **not** q4_0-specific and **not** caused by the q4_0 arm — it reproduces with the
-pure F16 staging path, and gfx1151 is clean at the same shape. It is data-dependent: f16 and q8_0 are
-pure at every prefill length I tested, while q4_1 flips at P=200 and q4_0 at P=224/P=256, and only one of
-four prompts flips at the shape that does flip.
+While chasing your q4_0 hint I found a second, unrelated width effect: a `W=1` vs `W>=2` difference in the
+token-0 **logits** on the 4B. It is **not** q4_0-specific and **not** caused by the q4_0 arm — it
+reproduces byte-identically with the pure F16 staging path, and gfx1151 is clean at the same shape. It is
+data-dependent, and it is a *logits-level* edge rather than a decoding one: at the case that does move,
+bf16 gives `argmax 9146` for both `W=1` and `W=4` with the top-1 differing by 0.014 against a top-2
+margin of 2.2, and q4_1 by 0.064 against a margin of 2.6 — so the greedy token is unchanged. I re-ran the
+whole grid to state this precisely (4B, gfx1201, five prefill lengths, `W=1..8` one logits hash): f16,
+bf16, q8_0, q5_0, q5_1 and iq4_nl are pure at all five; bf16 moves at P=200; q4_0 at P=224/P=256; q4_1 at
+P=200.
 
-I've stopped treating that as a defect to chase, and made the policy explicit instead. The delivery
-**guarantees** bit-identical width-purity for **f16, bf16 and q8_0** — those are the caches anyone should
-use at depth, and the guarantee is a tested contract (`W=1..8` one hash, `plain == draft-mtp`). For
-**q4_0/q4_1/q5_0/q5_1/iq4_nl** it is best-effort: the dequantized values are bit-identical to the
-reference conversion, and the kernel family is uniform across the band, but a near-tie may flip. The
-reasoning is that at those quantizations the K/V cache is already the dominant long-context coherence
-loss, so the discrepancy a near-tie flip makes reproducible is the same order as the error the
-quantization itself introduces — and the retrofits needed to pin it cost 0.5–9 % on whatever axis each
-one touches, recurring with every new single-token-tuned kernel.
+So I've stopped treating it as a defect to chase and made the policy explicit, at the level it actually
+holds. The delivery **guarantees** the text/acceptance contract for **f16, bf16 and q8_0** — one greedy
+text across the decode/verify band (`plain == draft-mtp` for `n_max <= 7`) and unchanged MTP acceptance —
+and that is tested, not merely measured. **Logits-level** `W=1..8` purity is reported as a *measurement*,
+not a guarantee, for every type including bf16 (where the P=200 edge above is on record). For
+**q4_0/q4_1/q5_0/q5_1/iq4_nl** even the measurement is explicitly best-effort: the dequantized values are
+bit-identical to the reference conversion, and the kernel family is uniform across the band, but a
+near-tie may flip. The reasoning is that at those quantizations the K/V cache is already the dominant
+long-context coherence loss, so the discrepancy a near-tie flip makes reproducible is the same order as
+the error the quantization itself introduces — and the retrofits needed to pin it cost 0.5–9 % on
+whatever axis each one touches, recurring with every new single-token-tuned kernel.
 
 ## Your other two observations
 
@@ -94,23 +100,35 @@ each ubatch size makes a separate graph key and capture never amortises; measure
 with graphs off). Good to know it also fixes an upstream growth-with-load behaviour — I hadn't measured
 that, and I've noted it.
 
-## What's in the next cut, and what isn't
+## What's in r4
 
-**In r4:** the q4_0 fixes above, and the prefill band split (block 15 amendment).
+Everything above, plus a fourth item that closed while this was being written: **native arms for the
+remaining quantized block types** (`q4_1`, `q5_0`, `q5_1`, `iq4_nl`). These were the last KV types with
+no native read in the FA kernels, so they staged their whole cache through F16 on every step; they are
+now first-class like `q8_0`/`q4_0` (`tg64` @ d32768, staged -> native: `q4_1` 23.14 -> **25.44**,
+`q5_0` 22.16 -> **24.56**, `q5_1` 22.23 -> **25.00**, `iq4_nl` 22.92 -> **24.94** on gfx1201, and
++22-27 % on gfx1151 for ~1 % prefill). Two bugs surfaced getting there, both caught by the op test: the
+tile kernel's native branch was a hand-written `type_KV == Q8_0 || Q4_0` test (the new instantiations
+then took the F16 branch and read an unwritten staging buffer), and the q5 variants took the low nibble
+in both halves. Both are fixed, and the loader's native branch is now driven by the same predicate the
+dispatcher uses, so it cannot drift again.
 
-**Not in r4:** native arms for the remaining quantized block types (`q4_1`/`q5_0`/`q5_1`/`iq4_nl`). That
-work is started — the dequantizers and the dispatch plumbing are written — but it currently fails the
-op test (every failure at the padded `hsk=72` shape) and the width probe (all four types return the same
-hash, consistent with the staged operand coming back zeroed), so it is **not** landing until it's
-correct. It's a throughput/memory item, not a correctness one: those types are already supported and
-width-pure today via the F16 staging path, they just sit ~12-16 % behind f16 at d32k. When it does land
-it won't change your config (`q8_0/q8_0` is already native).
+## Not in r4
+
+The one thing I did **not** close is your `#28867` observation as a delivery change — see above for why
+I still think it isn't a regression here. If you'd rather have the threshold fix in the tree anyway, say
+so and I'll take it as a separate block; it's a two-line change and I have no objection to carrying it,
+I just don't want to claim a win I can't measure.
 
 ## Re-running
 
-Everything above is validated on gfx1201 and on gfx1151. If you re-run your suite against r4, the two
-things I'd most like a second pair of eyes on are (a) `test-backend-ops -o FLASH_ATTN_EXT` (expect
-5951/5951) and (b) a q4_0-KV soak with the `-c 196608` memory headroom, since q4_0's reserve just
-dropped by 726 MiB and that's the axis your VRAM measurements are strongest on.
+Everything above is validated on gfx1201 **and** on gfx1151 (`test-backend-ops -o FLASH_ATTN_EXT` is
+**5951/5951** on both, and same-seed greedy text is bit-identical between the native and staged paths for
+all eight KV types on both). If you re-run your suite against r4, the three things I'd most like a second
+pair of eyes on are (a) `test-backend-ops -o FLASH_ATTN_EXT` (expect **5951/5951** — the four NaNs should
+be gone), (b) a q4_0-KV soak with `-c 196608` headroom, since q4_0's reserve just dropped by 726 MiB and
+that is the axis your VRAM measurements are strongest on, and (c) the q4_1/q5_0/q5_1/iq4_nl decode at
+depth — those four should now sit with q8_0 instead of ~12-16 % behind it.
 
-r4: `v16-790cf51aa-r4`, tip `<TBD>`, tree `<TBD>`.
+r4: **`v16-790cf51aa-r4`**, tip `b19c70b341f9ed439bcda2a636fe6e5fa4fa634b`, tree
+`7fab975d9518b29aa7d890c1163f13a6c393c5df` (`scripts/validate-set.sh` passes strict 16/16).
