@@ -2,7 +2,8 @@
 
 Current state: `main` is the delivery branch carrying the **16-patch set**
 (block 00 + blocks 01-15) generated against the fork
-point **llama.cpp master `790cf51aa`** (re-based **2026-09-13** from
+point **llama.cpp master `d1d3c3396`** (re-based **2026-09-15** from
+`790cf51aa`, itself re-based 2026-09-13 from
 `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself re-based
 2026-09-07 from `465e49b9c`, itself
 re-based 2026-09-06 from `9cffdcc80`, itself re-based
@@ -11,10 +12,11 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current baseline marker:** `baseline/790cf51aa` is the **new** (2026-09-13)
+> **Current baseline marker:** `baseline/d1d3c3396` is the **new** (2026-09-15)
 > delivery baseline — the `main` release commit for the 16-block set at the
-> `790cf51aa` fork point.  It is NOT one of the historical pre-block-12
-> checkpoints listed below; those remain frozen records.
+> `d1d3c3396` fork point.  `baseline/790cf51aa` remains the previous (2026-09-13)
+> marker.  Neither is one of the historical pre-block-12 checkpoints listed
+> below; those remain frozen records.
 
 > **Naming collision warning:** in the OLD records below, "block 12"
 > sometimes means the old *k-quant umbrella* (folded into what is now block

@@ -1,4 +1,4 @@
-From 80c4ff269477f9005fb4c5b21a970992cdaf51b3 Mon Sep 17 00:00:00 2001
+From 2d7ccfe07454f453cd2bd8e5d407997785c62089 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 04/15] rdna-boosts: block 04: RDNA4 WMMA flash-attn + Q6_K mmq
@@ -33,7 +33,7 @@ index ba929e638..69465d96c 100644
      GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index 4ea15ecc1..0f55ee077 100644
+index 863fa36e7..7562538bc 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 @@ -125,7 +125,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
@@ -102,7 +102,7 @@ index 4ea15ecc1..0f55ee077 100644
  #else
      GGML_UNUSED_VARS(DKQ, DV, ncols);
      return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
-@@ -1772,7 +1783,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1774,7 +1785,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  }
              }
          }
@@ -113,7 +113,7 @@ index 4ea15ecc1..0f55ee077 100644
              __syncthreads();
          }
      }
-@@ -1856,7 +1869,7 @@ static __global__ void flash_attn_ext_f16(
+@@ -1858,7 +1871,7 @@ static __global__ void flash_attn_ext_f16(
  #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
  
  #if defined(AMD_WMMA_AVAILABLE)
@@ -122,7 +122,7 @@ index 4ea15ecc1..0f55ee077 100644
          NO_DEVICE_CODE;
          return;
      }
-@@ -1937,6 +1950,11 @@ static __global__ void flash_attn_ext_f16(
+@@ -1939,6 +1952,11 @@ static __global__ void flash_attn_ext_f16(
                   ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
          }
  
@@ -201,7 +201,7 @@ index 882fe5d91..3129b3e16 100644
  
      // If there are no tensor cores available, use the generic tile kernel:
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 39e569ee1..f19a199b2 100644
+index f644c3ac2..d32d6945e 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -72,6 +72,7 @@
@@ -212,7 +212,7 @@ index 39e569ee1..f19a199b2 100644
  #include <array>
  #include <atomic>
  #include <charconv>
-@@ -4177,6 +4178,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4185,6 +4186,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
      bool graph_evaluated_or_captured = false;
  
@@ -239,7 +239,7 @@ index 39e569ee1..f19a199b2 100644
      // flag used to determine whether it is an integrated_gpu
      const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
  
-@@ -4343,12 +4364,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4351,12 +4372,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  GGML_UNUSED(integrated);
  #endif  // NDEBUG
  
@@ -261,7 +261,7 @@ index 39e569ee1..f19a199b2 100644
                  if (!is_concurrent_event_active) {
                      try_launch_concurrent_event(node);
                 }
-@@ -4390,6 +4420,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4398,6 +4428,58 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          graph_evaluated_or_captured = true;
  #endif  // USE_CUDA_GRAPH
      }
@@ -444,10 +444,10 @@ index a0f27cc30..bbf08362e 100644
      if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
          throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index c9805ac79..7a996d934 100644
+index e35b40353..881872745 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -9847,6 +9847,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9859,6 +9859,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
@@ -461,7 +461,7 @@ index c9805ac79..7a996d934 100644
  #endif
  
      for (ggml_type type_a : all_types) {
-@@ -10680,7 +10687,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10696,7 +10703,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      for (float max_bias : { 0.0f, 8.0f }) {
                          if (!mask && max_bias > 0.0f) continue;
                          for (float logit_softcap : {0.0f, 10.0f}) {
@@ -471,7 +471,7 @@ index c9805ac79..7a996d934 100644
                              for (int nh : { 1, 4 }) {
                                  if (nh == 1 && hsk != 320 && hsk != 576) continue;
                                  for (int nr3 : { 1, 3, }) {
-@@ -11040,6 +11048,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11059,6 +11067,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_leaky_relu(GGML_TYPE_F32, { 17408, n_tokens, 1, 1 }, 0.1f));
      }
  

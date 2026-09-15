@@ -1,4 +1,4 @@
-From 80d5fc023a85b981a84668ce9cae03940407bb10 Mon Sep 17 00:00:00 2001
+From b64f99d8db258f77a192908e5f51c89e5ab058d7 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 19:09:06 -0500
 Subject: [PATCH 00/15] rdna-boosts: block 00: structural and architecture
@@ -17,9 +17,9 @@ Baseline-level fixes that every later block builds on.
    (prefill) is unchanged.
 ---
  ggml/src/ggml-cuda/fattn-common.cuh           | 10 +++-
- .../vulkan-shaders/flash_attn.comp            | 29 +++++++++++-
- .../vulkan-shaders/flash_attn_cm1.comp        | 47 +++++++++++++++++--
- 3 files changed, 79 insertions(+), 7 deletions(-)
+ .../vulkan-shaders/flash_attn.comp            | 29 ++++++++++-
+ .../vulkan-shaders/flash_attn_cm1.comp        | 49 +++++++++++++++++--
+ 3 files changed, 81 insertions(+), 7 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
 index 48b631e60..9852a7439 100644
@@ -49,10 +49,10 @@ index 48b631e60..9852a7439 100644
              const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
  
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
-index 9a12cdfb8..5de27d68d 100644
+index 107d44aaa..1f555cfd4 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
-@@ -512,9 +512,26 @@ void main() {
+@@ -522,9 +522,26 @@ void main() {
              }
  
              FLOAT_TYPE Pf[rows_per_thread];
@@ -79,9 +79,9 @@ index 9a12cdfb8..5de27d68d 100644
              }
  
              [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
-@@ -529,8 +546,16 @@ void main() {
+@@ -539,8 +556,16 @@ void main() {
                  } else {
-                     Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * v_stride / 4 + d * D_split + d_tid]);
+                     Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + vcol * v_stride / 4 + d * D_split + d_tid]);
                  }
 -                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
 -                    Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
@@ -99,7 +99,7 @@ index 9a12cdfb8..5de27d68d 100644
              }
          }
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
-index 057ed739a..3100e61b9 100644
+index aa9dd624b..143a25b0f 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
 +++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
 @@ -62,6 +62,11 @@ shared O_TYPEV4 pvsh[MatBc * osh_stride];
@@ -125,7 +125,7 @@ index 057ed739a..3100e61b9 100644
          if (MASK_ENABLE) {
              if (USE_MASK_OPT && mask_opt_idx != j / 16) {
                  mask_opt_idx = j / 16;
-@@ -389,6 +398,9 @@ void main() {
+@@ -402,6 +411,9 @@ void main() {
                      const FLOAT_TYPEV4 Pf = FLOAT_TYPEV4(exp(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec));
                      [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
                          Lf[r + vec_idx] += Pf[vec_idx];
@@ -135,7 +135,7 @@ index 057ed739a..3100e61b9 100644
                      }
                      Psh[col * psh_stride + row / 4] = Pf;
                  }
-@@ -396,12 +408,14 @@ void main() {
+@@ -409,6 +421,8 @@ void main() {
          }
  
          if (SHMEM_STAGING != 0) {
@@ -144,14 +144,16 @@ index 057ed739a..3100e61b9 100644
              [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV_pad / 4; idx += gl_WorkGroupSize.x) {
                  uint32_t d = (idx + tid) % (HSV_pad / 4);
                  uint32_t c = (idx + tid) / (HSV_pad / 4);
-                 if (idx + gl_WorkGroupSize.x <= Bc * HSV_pad / 4 || c < Bc) {
+@@ -416,7 +430,7 @@ void main() {
                      FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
--                    if ((!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4)) {
-+                    if (col_live[c] != 0 && (!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4)) {
+                     uint32_t v_row;
+                     bool kv_active = fa_kv_index(j * Bc + c, v_row);
+-                    if (kv_active && (HSV == HSV_pad || d < HSV / 4)) {
++                    if (kv_active && col_live[c] != 0 && (HSV == HSV_pad || d < HSV / 4)) {
  #if !defined(BFLOAT16)
                          if (USE_DECODE_V) {
-                             uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE_V + 4 * d;
-@@ -421,6 +435,27 @@ void main() {
+                             uint coord = v_row * v_stride * BLOCK_SIZE_V + 4 * d;
+@@ -436,6 +450,27 @@ void main() {
          }
          barrier();
  
@@ -179,34 +181,36 @@ index 057ed739a..3100e61b9 100644
          const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
  
          // Each subgroup handles HSV/4 columns
-@@ -441,7 +476,11 @@ void main() {
+@@ -456,7 +491,12 @@ void main() {
              if (SHMEM_STAGING == 0) {
              // For quants we always preload via kvsh. For f16/bf16 we only preload when
              // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
--            const bool stage_v = USE_DECODE_V || KV_bounds_check;
+-            const bool stage_v = USE_DECODE_V || KV_bounds_check || USE_SPARSE;
 +            // A fully masked column (col_live[c] == 0) must never read V: masked cells
 +            // would accumulate +-0.0 x V inexactly on gfx11 f16 WMMA and leak the sign
 +            // of whatever V the cell last held. Such columns are staged through kvsh
-+            // with their V zeroed instead of being loaded direct.
-+            const bool stage_v = USE_DECODE_V || KV_bounds_check || tile_has_dead;
++            // with their V zeroed instead of being loaded direct. The same applies to
++            // sparse-inactive slots (USE_SPARSE), which stage_v already forced.
++            const bool stage_v = USE_DECODE_V || KV_bounds_check || USE_SPARSE || tile_has_dead;
              if (stage_v) {
                  [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
                      const uint idx = i * gl_WorkGroupSize.x + tid;
-@@ -455,7 +494,7 @@ void main() {
+@@ -471,7 +511,8 @@ void main() {
                      const uint ib = coord / BLOCK_SIZE_V;
                      const uint iqs = coord % BLOCK_SIZE_V;
  
--                    if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
-+                    if (col_live[row] != 0 && (!KV_bounds_check || (v_row < KV && v_col < HSV))) {
+-                    if (USE_SPARSE ? (kv_active && v_col < HSV) : (!KV_bounds_check || (v_row < KV && v_col < HSV))) {
++                    if (USE_SPARSE ? (kv_active && col_live[row] != 0 && v_col < HSV)
++                                   : (col_live[row] != 0 && (!KV_bounds_check || (v_row < KV && v_col < HSV)))) {
  #if !defined(BFLOAT16)
                          if (USE_DECODE_V) {
                              kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
-@@ -479,7 +518,7 @@ void main() {
+@@ -495,7 +536,7 @@ void main() {
                      coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
  
                      if (SHMEM_STAGING == 0) {
--                    if (!USE_DECODE_V && !KV_bounds_check) {
-+                    if (!USE_DECODE_V && !KV_bounds_check && !tile_has_dead) {
+-                    if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE) {
++                    if (!USE_DECODE_V && !KV_bounds_check && !USE_SPARSE && !tile_has_dead) {
                          // F16/BF16 values can be loaded directly from global memory
                          const uint v_tile_row = j * Bc + bc_chunk * MatBc;
                          const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;

@@ -6,7 +6,18 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (2026-09-14, latest):** the delivery is the **16-patch set** against fork point `790cf51aa`
+**Current state (2026-09-15, re-base):** the delivery is the **16-patch set** against the new fork
+point **`d1d3c3396`** (block 00 + blocks 01-15), canonical 16-block tip
+**`af9ce375ded5238b59598290ad7366760b7dc6e0`** (tree `c6896785a5fefdf9438d26974c0274bf99f43263`),
+release **`v16-d1d3c3396-r1`** — a 2026-09-15 re-base onto current upstream master (51 commits past
+`790cf51aa`; three conflict files: the block-00 Vulkan masked-V fix vs upstream's sparse FA, the FA test
+matrix, and qwen4exp's `{n_embd, hc}` norm fold plus the MTP `nextn.hc_head_norm` load-shape fix; **no
+delivery item was retired**).  Revalidated end-to-end on gfx1201 (`FLASH_ATTN_EXT` 5951/5951, all custom
+ops pass, plain == `draft-mtp` byte-identical, delivery ahead of a stock build at the same base on
+every gate).  Full re-base record and numbers: `WORKLOG.md` 2026-09-15 (re-base).  The text below is the
+pre-re-base state, retained as history.
+
+**Previous state (2026-09-14):** the delivery was the **16-patch set** against fork point `790cf51aa`
 (block 00 + blocks 01-15), canonical 16-block tip **`a2c8d06a7931c9f6bec8542fe10149c615853be7`** (tree
 `eb5b7583d14b30b7610fac53acf2fc52bc806ce4`), `make-patches.sh` default tip =
 `a2c8d06a7931c9f6bec8542fe10149c615853be7` (the 2026-09-13 master re-base + the 2026-09-14 block-15

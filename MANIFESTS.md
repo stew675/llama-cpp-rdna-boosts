@@ -5,11 +5,19 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`790cf51aa`** ("chat : improve parsing of complex types in qwen3-coder (#28742)"; re-based
+**`d1d3c3396`** ("ci: build MUSA for only 1 arch (#28944)"; re-based 2026-09-15 from `790cf51aa`,
+itself re-based
 2026-09-13 from `9113cc188`; previously re-based 2026-09-08 from `050dde50c`, itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
-**Block-15 amendment (2026-09-15, build time) — the current release `v16-790cf51aa-r5`:** the tile
+**Re-base (2026-09-15) — the current release `v16-d1d3c3396-r1`:** the 16-block set re-based onto
+upstream master `d1d3c3396` (51 commits past `790cf51aa`).  Three conflict files: block 00's Vulkan
+masked-V fix composed with upstream's sparse FA (`fc82583e6`); the FA test matrix (`1e7bcf3da` +
+block 03's `112`); and qwen4exp's `{n_embd, hc}` norm fold (`41abbfd59`), where the MTP head's
+`nextn.hc_head_norm` also had to move to `{n_embd, hc}` (a reservation-only `ggml_can_repeat` crash
+that validation caught).  Canonical tip `af9ce375ded5238b59598290ad7366760b7dc6e0`, tree
+`c6896785a5fefdf9438d26974c0274bf99f43263`, strict 16/16 — see `WORKLOG.md` 2026-09-15 (re-base).
+**Block-15 amendment (2026-09-15, build time) — the previous release `v16-790cf51aa-r5`:** the tile
 kernel's native-KV type axis is instantiated in the 12 generated instance TUs again instead of
 implicitly in the dispatch TU.  Block 03 made `type_KV` a template parameter of
 `ggml_cuda_flash_attn_ext_tile_case` while `DECL_FATTN_TILE_CASE`/`EXTERN_DECL_FATTN_TILE_CASES` kept

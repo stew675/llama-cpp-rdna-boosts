@@ -1,4 +1,4 @@
-From 8b2eb8a6e1b85eef82b2187e7816b6925b93caef Mon Sep 17 00:00:00 2001
+From b71e10aa5cca36ebcbc249cda6c999af9db22d54 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net
@@ -36,10 +36,10 @@ Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 
 diff --git a/common/common.cpp b/common/common.cpp
-index c952bfbd7..c0560a237 100644
+index a2310744f..3d4e16005 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1795,6 +1795,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1794,6 +1794,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.n_ctx             = params.n_ctx;
      cparams.n_seq_max         = params.n_parallel;
      cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
@@ -2991,10 +2991,10 @@ index 000000000..944110792
 +#endif // GGML_USE_HIP && __HIP_PLATFORM_AMD__
 \ No newline at end of file
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index b28fdc9bb..cc6d90650 100644
+index f936127a6..7c246f0cf 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -20705,7 +20705,7 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
+@@ -20815,7 +20815,7 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
          } else if (tensor->op == GGML_OP_GATED_DELTA_NET) {
              tensor_clone = ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1],
              src_clone[2], src_clone[3], src_clone[4], src_clone[5],
@@ -3273,10 +3273,10 @@ index 4abb3f5cf..8420c2152 100644
  
      // computed before each graph build
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index f9e9a8bcb..0c4cbe76b 100644
+index 3b2536283..55f138abf 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -2526,6 +2526,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2528,6 +2528,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              std::max((uint32_t) 1, cparams.n_seq_max),
                              cparams.n_seq_max,
                              cparams.n_rs_seq,
@@ -3284,7 +3284,7 @@ index f9e9a8bcb..0c4cbe76b 100644
                              nullptr);
                  } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
                      // The main difference between hybrid architectures is the
-@@ -2578,6 +2579,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2580,6 +2581,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                              /* n_seq_max         */ cparams.n_seq_max,
                              /* n_rs_seq          */ cparams.n_rs_seq,
@@ -3292,7 +3292,7 @@ index f9e9a8bcb..0c4cbe76b 100644
                              /* offload           */ cparams.offload_kqv,
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
-@@ -2598,6 +2600,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2600,6 +2602,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                              /* n_seq_max         */ cparams.n_seq_max,
                              /* n_rs_seq          */ cparams.n_rs_seq,
@@ -3300,7 +3300,7 @@ index f9e9a8bcb..0c4cbe76b 100644
                              /* offload           */ cparams.offload_kqv,
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
-@@ -2618,6 +2621,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -2620,6 +2623,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                              /* n_seq_max         */ cparams.n_seq_max,
                              /* n_rs_seq          */ cparams.n_rs_seq,
@@ -3364,7 +3364,7 @@ index a29d8b89c..6c5defb4b 100644
          res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
      } else {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index b63b3773e..dd2439dff 100644
+index 1616004e0..84a81ce9c 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1496,14 +1496,64 @@ struct test_case {
@@ -3480,7 +3480,7 @@ index b63b3773e..dd2439dff 100644
          ggml_set_name(gdn_out, "gdn_out");
  
          // attn scores view (first part of the gdn output)
-@@ -10851,6 +10919,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10870,6 +10938,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
@@ -3499,7 +3499,7 @@ index b63b3773e..dd2439dff 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
-@@ -11340,6 +11420,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11391,6 +11471,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
  

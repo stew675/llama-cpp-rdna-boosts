@@ -1,5 +1,92 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-15 (re-base) — `v16-d1d3c3396-r1`: re-based onto upstream master `d1d3c3396`
+
+**Release.** `v16-d1d3c3396-r1`, fork point `d1d3c3396` (`ci: build MUSA for only 1 arch (#28944)`,
+tree `3ce99b5422bf022de24341606a9984e2c90d627b`), canonical 16-block tip
+`af9ce375ded5238b59598290ad7366760b7dc6e0`, tree `c6896785a5fefdf9438d26974c0274bf99f43263`.
+`scripts/validate-set.sh` passes strict 16/16 (`git am`, applied tree == recorded tree); the set
+applies whitespace-clean. The previous delivery was `v16-790cf51aa-r5` (tip `6f76c1cb1`, tree
+`d735d6c11`).
+
+**Why.** The working `~/llama.cpp` checkout was pulled to a fresh upstream master tip — 51 upstream
+commits past `790cf51aa`. The 16 block commits were replayed with
+`git rebase --onto d1d3c3396 790cf51aa 6f76c1cb` in a scratch worktree; the re-base is the sanctioned
+"rebuild at the fork point" (the delivery is the patches, not the fork branch).
+
+**Conflicts (3 files) and how they were resolved.**
+
+- **block 00 × `fc82583e6 vulkan: support sparse Flash Attention (#28105)`** — both sides rewrote the
+  V-staging path of `flash_attn_cm1.comp`. Upstream introduced the sparse indexer (`fa_kv_index()`,
+  `USE_SPARSE`, and the `stage_k/stage_v` forced-staging arms); block 00 carried the gfx1151
+  masked-V/freed-cell fix (the `col_live` per-column liveness + `tile_has_dead`). The merge keeps
+  **both**: `stage_v = USE_DECODE_V || KV_bounds_check || USE_SPARSE || tile_has_dead`, and every
+  staging condition is `kv_active && col_live[...] && …`. The non-sparse arm keeps upstream's exact
+  `(!KV_bounds_check || (v_row < KV && v_col < HSV))` semantics (the naive simplification would have
+  changed the out-of-range padding column read); `flash_attn.comp` auto-merged (upstream's
+  `fa_kv_index` skip composes with block 00's `any_live`/`any_mask` skip).
+- **block 03 × `1e7bcf3da`/`4a8993735` FA test matrix (`tests/test-backend-ops.cpp`)** — upstream added
+  the `hsk == 96` MiniCPM3 arm/filter, block 03 added the `112` head size to both sweep lists. Merged:
+  both lists carry `96, 112` and both filters (`hsk != 96 && …` and `hsk == 96 && hsv != 64 && hsv != 96`)
+  are kept.
+- **block 14 × `41abbfd59 qwen4exp: enable rms_norm + mul fusion (#28896)`** — upstream now stores the
+  grouped-norm gammas as `{n_embd, hc}` (with `TENSOR_ALLOW_RESHAPE`) and multiplies the stream-3d
+  tensor *before* the `hc_dim` reshape (`ggml_mul(ggml_rms_norm(x), w)`), in both `build_hc_mix` and
+  PLE's `grouped_norm`. Our block-14 flags (`trunk_flags`/`flags`) were folded into the new shapes
+  (`{n_embd, hc}, TENSOR_ALLOW_RESHAPE | flags`), and the fused `ggml_hc_mix` op's three
+  `w_norm->ne[0] == hc_dim` asserts became `ggml_nelements(w_norm) == hc_dim` (the layouts are
+  byte-identical). **One latent crash this exposed was found by validation and fixed:** the MTP head's
+  own `layer.nextn.hc_head_norm` (a block-14 tensor upstream does not have) was still loaded
+  `{hc_dim}`, so the reservation-only (`nt == 0`) unfused `build_hc_mix` chain hit
+  `GGML_ASSERT(ggml_can_repeat(b, a))` in `ggml_mul` on every qwen4exp `--spec-type draft-mtp` load.
+  It now loads `{n_embd, hc}, TENSOR_ALLOW_RESHAPE | flags` too; the MTP head's `nextn.hnorm` keeps its
+  `{hc_dim}` shape (it uses block-14's own reshape-before-mul path, not the upstream one).
+
+**Notable auto-merges (no textual conflict, verified by the gates).** `ggml-cuda.cu` (upstream's
+row-contiguous `SUM_ROWS`/`MEAN` support predicate and `DUP` relaxations), `reduce_rows.cuh`'s
+strided refactor (block 08's `topk_moe` implements its own reduction order — it does not call the
+kernel), `common_context_can_seq_rm`'s `llama_n_rs_seq` reorder, `models.h`/`llama-arch.*`/`llama-model.cpp`
+(MAPLE added alongside our qwen4exp), and the `fattn-mma-f16.cuh` MFMA fp32-accumulation split
+(upstream now has separate `AMD_MFMA_AVAILABLE`/`AMD_WMMA_AVAILABLE` VKQ_C arms; our WMMA/RDNA work is
+unaffected). **Nothing in the delivery was retired** — no upstream commit subsumes a delivery item
+(upstream's `41abbfd59` is the generic-chain norm fold; our `ggml_hc_mix` is a wider kernel fusion and
+stays).
+
+**Validation (gfx1201, ROCm 7.14, 3× R9700).** Clean ROCm build (`~/bin/build-llama-rocm-714`)
+exit 0. `test-backend-ops`: `FLASH_ATTN_EXT` **5951/5951**, `FLASH_ATTN_QSA`, `GATED_DELTA_NET`,
+`TOPK_MOE`, `HC_MIX`, `HC_COMBINE` all pass. Greedy purity: dense 27B `--spec-type none` ==
+`draft-mtp` byte-identical (`f23f5e77569907ef`, q8_0 KV, 1024 tokens, acceptance 0.5805); qwen4exp
+(Flash-Next Q4_K_XL) plain == `draft-mtp` byte-identical on the wide/sparse prose prompt
+(`608b7b3192e1`, 1231 chars), MTP acceptance 0.667. Gemma-4-E4B (SWA / kq-mask) generates coherently
+at `-sm layer` and on 2-GPU `-sm tensor` (identical `5dd272b4f316`); the 3-GPU `-sm tensor` meta-splitter
+abort (2 KV heads < 3 devices) is the documented pre-existing issue.
+
+**Performance vs the stock build at the same fork point** (`llama-bench -r 2`, 3-GPU tensor; stock built
+directly from `d1d3c3396`):
+
+| model / KV | test | new | stock | delta |
+|---|---|---:|---:|---:|
+| 27B UD-Q4_K_XL, f16 | pp512 | 2064 | 1904 | +8.4 % |
+| 27B UD-Q4_K_XL, f16 | tg128 | 47.9 | 42.6 | +12.5 % |
+| 27B UD-Q4_K_XL, f16 | pp512 @ d16384 | 1740 | 1569 | +10.9 % |
+| 27B UD-Q4_K_XL, f16 | tg128 @ d16384 | 46.96 | 41.91 | +12.0 % |
+| 27B UD-Q4_K_XL, q8_0 | pp512 | 2023 | 1886 | +7.3 % |
+| 27B UD-Q4_K_XL, q8_0 | tg128 @ d16384 | 45.96 | 40.85 | +12.5 % |
+| 35B-A3B UD-Q4_K_M | pp512 | 4929 | 4510 | +9.3 % |
+| 35B-A3B UD-Q4_K_M | tg128 @ d16384 | 96.5 | 82.4 | +17.1 % |
+| Flash-Next Q4_K_XL, `-sm layer` | pp512 | 1038 | 326 | +218 % |
+| Flash-Next Q4_K_XL, `-sm layer` | tg128 | 36.7 | 25.5 | +44 % |
+
+The rule-5 verify-width gate (`llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8`, 27B q8_0 KV) also
+holds: B=1 35.76 vs 34.97 t/s, B=4 140.7 vs 86.9, **B=8 195.1 vs 120.1**. qwen4exp `-sm tensor`
+(1181 pp / 50.8 tg) is a delivery-only configuration — stock upstream rejects tensor split for the
+architecture and cannot even load the 103.68 GiB checkpoint without block 14's managed lazy reader /
+PLE streaming.
+
+**Follow-ups.** None opened by the re-base. The re-base is behaviour-changing only where upstream's own
+changes are (qwen4exp norm fold, FA/MFMA and `SUM_ROWS` numerics); all delivery guarantees re-measured
+above. The `TODO.md` Open list is unchanged.
+
 ## 2026-09-15 (latest) — GHCR containers (issue #33): ROCm >= 7.14 images could not find the ROCm runtime
 
 **The report.**  Issue #33 ("No usable GPU found in container"): `ghcr.io/stew675/llama-cpp-rdna-boosts:latest`

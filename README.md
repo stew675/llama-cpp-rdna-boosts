@@ -196,12 +196,12 @@ for per-block verification and `BASELINE.md` for provenance.
 ## Current state
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
-  **`790cf51aa`** (re-based 2026-09-13; previously `9113cc188`).
+  **`d1d3c3396`** (re-based 2026-09-15; previously `790cf51aa`, re-based 2026-09-13 from `9113cc188`).
 - Patches `patches/0000-…0015-…`, applied with **strict 16/16 `git am`** by
   `scripts/apply-all.sh` (no 3-way fallback, whitespace-clean).
-- Canonical 16-block chain: tip `6f76c1cb1d80c7ecbf176f939a351bc385ff33fc`,
-  net tree `d735d6c11258ae939cfd392511e3f29ac22a7686`.
-- Release **`v16-790cf51aa-r5`**.  `scripts/validate-set.sh` passes strict 16/16
+- Canonical 16-block chain: tip `af9ce375ded5238b59598290ad7366760b7dc6e0`,
+  net tree `c6896785a5fefdf9438d26974c0274bf99f43263`.
+- Release **`v16-d1d3c3396-r1`**.  `scripts/validate-set.sh` passes strict 16/16
   (applied tree == the recorded tree).
 - Greedy purity: plain decode == `draft-mtp` verify for
   `--spec-draft-n-max <= 7` across the supported KV types (4B and 27B all
@@ -214,7 +214,17 @@ for per-block verification and `BASELINE.md` for provenance.
   config), [`MANIFESTS.md`](MANIFESTS.md) (apply order + verification contract)
   and [`BASELINE.md`](BASELINE.md) (fork point + drift policy).
 
-**Latest change (2026-09-15, r5) — build time: a clean backend build was gated by one translation
+**Latest change (2026-09-15) — re-base onto upstream master `d1d3c3396` (release
+`v16-d1d3c3396-r1`).**  51 upstream commits past `790cf51aa`; three files conflicted (block 00's
+Vulkan masked-V fix vs upstream's sparse FA, the FA test matrix, and qwen4exp's `{n_embd, hc}` norm
+fold — plus the MTP `nextn.hc_head_norm` load-shape crash the merge exposed and validation caught).
+Revalidated end-to-end on gfx1201: `FLASH_ATTN_EXT` 5951/5951, all custom ops pass, plain ==
+`draft-mtp` byte-identical on 27B and qwen4exp, and the delivery is ahead of a stock build at the
+same base on every gate (dense 27B +8-13 %, MoE 35B-A3B +9-17 %, qwen4exp 3.2× prefill / +44 %
+decode, batched verify-width B=8 195 vs 120 t/s).  Full record: [`WORKLOG.md`](WORKLOG.md)
+2026-09-15 (re-base).
+
+**Previous change (2026-09-15, r5) — build time: a clean backend build was gated by one translation
 unit.**  A fresh ROCm build had grown slow and `fattn-tile.cu` alone took **509 s of a 538 s** `-j16`
 backend build.  Cause (ours): block 03 made the tile kernel's `type_KV` a template parameter, but
 `DECL_FATTN_TILE_CASE`/`EXTERN_DECL_FATTN_TILE_CASES` still covered only F16/BF16 — and since the
@@ -229,7 +239,7 @@ TU) — diagnosed and left as a follow-up.  Canonical tip `6f76c1cb1`, tree `d73
 **`v16-790cf51aa-r5`**.  Full record: [`WORKLOG.md`](WORKLOG.md) 2026-09-15, `patches/README.md` (the
 2026-09-15 build-time block-15 amendment), and `wip/build-time-regression/`.
 
-**Previous change (2026-09-15, r4) — issue #30 second round: the reporter's q4_0 NaN, the prefill band
+**Earlier change (2026-09-15, r4) — issue #30 second round: the reporter's q4_0 NaN, the prefill band
 split, and the last four native KV arms.**  @briansp2020's r3 re-run found **4 NaNs** in
 `test-backend-ops -o FLASH_ATTN_EXT` with a q4_0 K/V; chasing them closed four items.  (1) The tile
 kernel is instantiated with ONE `type_KV` for both operands while `launch_fattn` chose its native read **per

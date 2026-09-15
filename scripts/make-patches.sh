@@ -7,7 +7,11 @@
 #   baseline-sha  the upstream baseline the patches are generated against
 #                 (default: 790cf51aa, see MANIFESTS.md)
 #   blocks-tip    the fork commit carrying block 00 + all 15 feature
-#                 blocks (default: c45244c728dfcbcad86ae95aa97ae76f94ee9f7f,
+#                 blocks (default: af9ce375ded5238b59598290ad7366760b7dc6e0,
+#                 the 2026-09-15 re-base of the 16-block delivery onto upstream
+#                 master d1d3c3396; the long provenance list below is retained
+#                 as history from the previous 790cf51aa base:
+#                 c45244c728dfcbcad86ae95aa97ae76f94ee9f7f,
 #                 the block-15 commit of the
 #                 CANONICAL fork rebuilt at 790cf51aa, after the 2026-09-11
 #                 block-13 amendment -- the MoE decode/verify mmvq band --
@@ -116,8 +120,8 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
-BASELINE="${2:-790cf51aa}"
-TIP="${3:-a2c8d06a7931c9f6bec8542fe10149c615853be7}"
+BASELINE="${2:-d1d3c3396}"
+TIP="${3:-af9ce375ded5238b59598290ad7366760b7dc6e0}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then

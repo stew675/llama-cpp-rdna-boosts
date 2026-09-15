@@ -1,7 +1,14 @@
 # rdna-boosts patch set (delivery)
 
-16 patches (block 00 structural fixes + blocks 01-15) against llama.cpp master `790cf51aa`
-**Current release: `v16-790cf51aa-r5`** (tip `6f76c1cb1`, tree `d735d6c11`).  r2 = block 15's V4 native
+16 patches (block 00 structural fixes + blocks 01-15) against llama.cpp master `d1d3c3396`
+**Current release: `v16-d1d3c3396-r1`** (tip `af9ce375d`, tree `c6896785a`) — the 2026-09-15 re-base
+onto `d1d3c3396` (51 upstream commits past `790cf51aa`).  Three conflict files were resolved: the
+block-00 Vulkan masked-V fix composed with upstream's sparse FA (`fc82583e6`), the FA test matrix
+(`1e7bcf3da` + block 03's `112` head size), and qwen4exp's `{n_embd, hc}` norm fold (`41abbfd59`),
+where the MTP head's `nextn.hc_head_norm` also had to move to `{n_embd, hc}` (a reservation-only
+`ggml_can_repeat` crash that validation caught).  **No delivery item was retired.**  The previous
+base `790cf51aa`'s release was **`v16-790cf51aa-r5`** (tip `6f76c1cb1`, tree `d735d6c11`).
+r2 = block 15's V4 native
 staging default for the sub-F16 quants + the q4_0 arm; r3 = block 04's arch- and split-aware prefill
 tuning; r4 = the 2026-09-15 block-15 amendment: the mixed-K/V kernel contract (the reporter's q4_0
 NaN), the `get_alloc_size` q4_0 scratch fix, the prefill band split + staging arena + the RDNA3_5 arch
@@ -9,7 +16,7 @@ gate, and native arms for `q4_1`/`q5_0`/`q5_1`/`iq4_nl`; **r5 = the build-time h
 amendment**: the tile kernel's native-KV type axis is instantiated in the generated instance TUs again
 instead of implicitly in the dispatch TU, which took a clean `-j16` backend build from **538 s to
 330 s** with no runtime change — see the two 2026-09-15 block-15 amendment sections below.
-("chat : improve parsing of complex types in qwen3-coder (#28742)", re-based **2026-09-13** from
+(`790cf51aa` = "chat : improve parsing of complex types in qwen3-coder (#28742)", re-based **2026-09-13** from
 `9113cc188`; previously re-based 2026-09-08 from `050dde50c` ("hexagon: add RELU and LEAKY_RELU ops (#28585)"), itself
 re-based 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`; on the 2026-09-08 re-base block 06's
