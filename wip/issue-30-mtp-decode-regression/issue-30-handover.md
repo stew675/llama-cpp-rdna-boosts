@@ -1,3 +1,12 @@
+> **SUPERSEDED 2026-09-15.**  Session 2 acted on this handover: **TODO item 2 is DONE**
+> (`q4_1`/`q5_0`/`q5_1`/`iq4_nl` all have native arms; the three WIP bugs are fixed) and the
+> r4 candidate was promoted — **`v16-790cf51aa-r4`**, tip `b19c70b341f9ed439bcda2a636fe6e5fa4fa634b`,
+> tree `7fab975d9518b29aa7d890c1163f13a6c393c5df`, `validate-set.sh` strict 16/16, CI green.
+> The sections below are kept as the session-2 starting state, not as current status: read
+> `WORKLOG.md` 2026-09-15, `patches/README.md` (the 2026-09-15 block-15 amendment),
+> `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §I and `GREEDY-PURITY.md` §36 instead.
+> `~/issue-30-followup-response.md` is **ready to post**.
+
 # Issue #30 — session handover (2026-09-14)
 
 **Read this file, then continue.** It is the complete state of the issue-#30 work: what is validated and
