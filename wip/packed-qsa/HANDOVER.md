@@ -13,18 +13,20 @@ We are porting pwilkin's packed-block WMMA QSA attention (`qsa3`) into the deliv
 close part of the qwen4exp prefill gap.
 
 * **P1, P2, P3 are implemented and committed** on the fork branch `packed-qsa`.
-* **P3.5 is now DONE and the verdict is negative** — see `P3.5-NOTES.md` for the full record.  The
-  original −2 % end-to-end was measured in the **wrong split mode** (`-sm layer`); the canonical
-  serving config is `-sm tensor -b/-ub 2048`, where pure VEC = 2289 t/s and the packed path is
-  **−4.5 %**.  The P1 pack is free, the P2 *merge* is the whole cost, and the P3 kernel is at
-  **parity** with VEC (the isolated 1.35x op figure was a layer-split artifact).  Even with the
-  expensive merge kernel removed the ceiling is +0.8 %.
-* **P4 (tensor-split support) is implemented and validated** (the packed shadows split with the
-  kv-head axis); the packed path now runs under `-sm tensor` with the same `rel ≈ 3.9e-5` as under
-  layer split.
-* **Recommendation: park the campaign on gfx1201.**  If it continues it must be on **gfx1151**
-  (where QSA is ~14 % of the pass and VEC is the slow reference this design targets) — but the ~5 %
-  merge cost is architecture-independent and must be beaten there too.
+* **P3.5 verdict (2026-09-15) — corrected:** the approach is **validated on gfx1151** (`halo`,
+pwilkin's own gfx11 kernel): packed QSA is **+9.1 % at ub2048**, **+15.2 % at ub8192**, **+15.9 % at
+ub16384** (pp8192, IQ4_XS).  On gfx1201 the current port is still negative, but the cause is our
+**gfx12 kernel + the P2 merge share**, not the design:
+  * the P2 merge is a fixed absolute cost, so it is ~1.3 % of a gfx1151 pass but ~5 % of a faster
+    gfx1201 pass; the `qsa3_rows_kernel` (kernel A) dominates it;
+  * the gfx12 WMMA D layout gives each lane **8 different rows**, so our row softmax needs **32
+    shuffles/chunk** where gfx11 needs ~2; our kernel is also the correctness-first variant (LDS P
+    transpose, no prefetch).  Hence the op A/B says 1.30x while the end-to-end is at parity.
+  * Next: make the gfx12 softmax cheap (transpose the 8-row vector across the wave), shuffle-network
+    P, K/V prefetch, and make merge kernel A cheap.  A gfx1201 win at ub2048 is plausible after
+    that.  See `P3.5-NOTES.md` §9.
+* **P4 (tensor-split support) is implemented and validated** (packed shadows split with the kv-head
+  axis, `rel ≈ 3.9e-5`).
 
 Everything is **opt-in and default-off**, so the delivery is unaffected whatever you do.
 
@@ -214,22 +216,21 @@ Facts not to re-derive:
 
 ---
 
-## 5. P3.5 — DONE (2026-09-15): the verdict is negative
+## 5. P3.5 — measured (2026-09-15)
 
-**Read `P3.5-NOTES.md` for the full record.**  The short version:
+**Read `P3.5-NOTES.md` for the full record.**  Two results:
 
-* The P1–P3 evaluation used `-sm layer`; the canonical config is `-sm tensor -b/-ub 2048`
-  (3× faster baseline).
-* Canonical pp8192: pure VEC 2289 / pack-only 2286 (**free**) / pack+merge+VEC 2178 (**−4.9 %**) /
-  pack+merge+WMMA 2186 (**−4.5 %**).
-* The whole cost is the P2 merge descriptor build — specifically `qsa3_rows_kernel` (12x
-  `qsa3_merge_kernel`).  The P3 WMMA kernel is **at parity** with VEC in the canonical geometry; the
-  1.35× op figure was a layer-split artifact.
-* With the merge's expensive half removed the ceiling is **+0.8 %** — the campaign cannot win on
-  gfx1201.  Park it here; the only open target is gfx1151 (and the merge cost applies there too).
+1. **gfx1201 (`soar`, `-sm tensor -b/-ub 2048`):** the current port is **−4.5 %** at pp8192.  The
+   pack is free, the P2 merge descriptor build (kernel A) is ~5 %, and our gfx12 WMMA kernel is at
+   parity end-to-end (despite a 1.30x op-level A/B).  Large ubatch does *not* help here (the op
+   speedup peaks at n_q≈2K and declines; ub8192 is 0.97x).
+2. **gfx1151 (`halo`, pwilkin's gfx11 kernel):** the packed QSA is **+9.1 %** at ub2048 and
+   **+15.2/15.9 %** at ub8192/16384 — the approach works, and the win grows with ubatch.
 
-Track A/Track B below are kept as the historical plan; Track B cannot pay on gfx1201 given the
-ceiling.
+The gfx1201 gap is therefore the **gfx12 kernel implementation** (8-rows-per-lane D layout makes the
+softmax 32 shuffles/chunk vs gfx11's ~2; correct-ness-first LDS P transpose; no prefetch) plus the
+**fixed merge share** (~5 % of a fast pass vs ~1.3 % of a slow one).  Next steps in `P3.5-NOTES.md`
+§9.2.  Track A/Track B below are the historical plan.
 
 ---
 
