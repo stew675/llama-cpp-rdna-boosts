@@ -74,6 +74,29 @@ experiment is **validated but not yet promoted**; Action E is resolved (no deliv
 
 ## Active (kept compact: only what this repo will work on next)
 
+### 22. Adaptive-MTP ceiling scaling: Q8_0 × tensor split (NOT issue #30)
+
+**Reporter finding 2026-09-15 (@1337hero), confirmed on `v16-d1d3c3396-r1`.**  The recommended adaptive
+ceiling **12** ([`benchmarks/2026-09-13-adaptive-mtp-4-axis-n12.md`](benchmarks/2026-09-13-adaptive-mtp-4-axis-n12.md))
+was measured on UD-Q4_K_XL / one card.  On **Q8_0 with a 2-card `-sm tensor` split** ceiling 12
+**loses** to ceiling 7: reproduced here at **n7 95.1 → n12 89.6 t/s (−5.8 %)** on the code prompt
+(reproducible; same shape on BF16 KV; depth 10 is between but still below 7).  1-card Q8_0 still wins
+from 12, and Q4/Q6 2-card still win here — so the loss is specific to **Q8_0 × tensor split** and is a
+decode/verify *tuning* issue, not a purity bug.  Reporter's comments:
+issue #30 [5683949195](https://github.com/stew675/llama-cpp-rdna-boosts/issues/30#issuecomment-5683949195)
+/ [5684693398](https://github.com/stew675/llama-cpp-rdna-boosts/issues/30#issuecomment-5684693398).
+
+- Dossier + repro: [`wip/adaptive-mtp-ceiling-scaling/`](wip/adaptive-mtp-ceiling-scaling/)
+  (`README.md` = finding/data, `HANDOVER.md` = the turnkey brief for the next session, `repro.sh` =
+  the sweep).
+- Likely fix shape: cap the adaptive default at 7 when `n_gpu > 1` (tensor) or the dominant weight
+  type is Q8_0 — the reporter's suggestion, mirroring the `ncols2` split gate — **or** teach the
+  controller the wide-verify cost.  Root-cause the Q8_0 wide-verify path first.
+- Interim: the `ceiling 12` recommendation needs a caveat in `benchmarks/README.md`,
+  `benchmarks/mtp-adaptive-methodology.md` and `README.md` (7 is the default on Q8_0 / tensor split).
+- Separate, untriaged, in the same report: ROCm **7.2.4** breaks purity (clean on 7.14) — a
+  supported-toolchain note, not this item.
+
 ### 1. Adapt/implement Tiled Gated Delta Net
 
 - This repo implements chunked gated delta net as it provides both performance and quality assurance
