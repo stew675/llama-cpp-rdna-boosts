@@ -301,7 +301,10 @@ enablement there and runs host-only/CPU.
   while gfx1151 has no crossover and keeps its native prefill (it wins there at every depth: +0.4 % @16k
   growing to +1.6 % @65k).  Decode d65k stays 23.17, the reserve stays 123 MiB (gfx1201) / 89 MiB
   (gfx1151), and both arches are 5951/5951 with purity PURE.  Evidence: `MEASUREMENTS.md` sections F/H;
-  diff `patches/2026-09-14-todo21-prefill-arena-staging.diff`.
+  diff `patches/2026-09-14-todo21-prefill-arena-staging.diff`.  **Follow-up (2026-09-15, r3, issue #33):**
+  the arena sits outside the compute-graph reserve on purpose, so `--fit` does not count it; its growth
+  now returns null on a failed `cudaMalloc` and the launcher falls back to the native read for that
+  prefill (bit-identical, prefill-speed only) instead of aborting on a nearly-full card.
 
 - **Issue #30 draft-depth policy: the `--spec-draft-n-max` clamp moved from 7 to 15, and the qwen4exp
   QSA decode-arm band now tracks the verify width (closed 2026-09-13, block-01 + block-14 amendments).**

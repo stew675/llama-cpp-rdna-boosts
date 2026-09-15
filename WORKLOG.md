@@ -1,5 +1,53 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-15 (block-15 amendment) — `v16-d1d3c3396-r3`: the FA prefill staging arena degrades instead of aborting
+
+**Release.** `v16-d1d3c3396-r3`, fork point `d1d3c3396` (tree `3ce99b5422bf`), canonical 16-block
+tip `4e942c071`, tree `28be875afbdb58f2f842f521ac3ec6764b52cf49`.  `scripts/validate-set.sh` passes
+strict 16/16 (`git am`, applied tree == recorded tree).  **Only block 15 changed.**
+
+**Reported (issue #33, @plchldr).**  On a single **7900 XTX (gfx1100)**, Unsloth
+`Qwen3.8-27B UD-Q4_K_M` with a quantized K/V cache, `llama-server --fit-target 256` ran upstream but
+aborted after a while with
+`ROCm error: out of memory ... in function fattn_stage_get ... hipMalloc(&new_arena, new_size)` at the
+deep prefill.  Raising the fit target merely deferred it; the demand tracked the prompt length.
+
+**Root cause.**  Block 15's prefill band split stages a native-capable quantized K/V cache to F16 in
+per-context, per-stream arena (`ggml_backend_cuda_context::fattn_stage`) that is deliberately **outside
+the compute-graph reserve** (the reserve sizes it for `n_ctx`, which is the adaptive-MTP
+`-c 196608` load failure the arena removed), and `llama_get_memory_breakdown` therefore never counts
+it.  A `--fit` run can thus legitimately leave less free memory than the transient needs; the arena
+grows with the prefix, so the shortfall appears part-way through the first deep prefill, and the old
+`CUDA_CHECK(cudaMalloc(...))` turned it into a process abort rather than a slowdown.
+
+**What landed (block 15).**  `fattn_stage_get` -> `fattn_stage_try_get`, which returns `nullptr` on a
+failed `cudaMalloc` (clearing the sticky error, warning once) instead of aborting; `launch_fattn`
+turns a null arena into the **native K/V read** for the operand(s) that would have been staged.  The
+native read is the same arithmetic the decode/verify band already uses and is bit-identical to the
+staged F16 copy, so this is a prefill slowdown only, never a correctness change -- and it is exactly
+what keeps the run inside the memory the fit reserved.  This is the right granularity (the arena's
+high-water mark tracks the *actual* prefix, not `n_ctx`), so `--fit` is not made to reserve an
+`n_ctx`-sized transient it would otherwise waste.
+
+**Validated (gfx1201, FAIL -> PASS).**  4B Q8_0, `-c 32768`, `-ctk q8_0 -ctv q8_0`, a 31.5k-token
+prefill, with a HIP holder pinning the card to 64 MiB free:
+
+* **pre-fix**: `llama-server` died with `ROCm error: out of memory ... fattn_stage_get`
+  (`common.cuh:1667`), client `RemoteDisconnected`;
+* **post-fix**: the same run logged
+  `fattn_stage_try_get: not enough free device memory for a 30 MiB FA prefill staging buffer, reading the K/V cache natively instead`
+  and completed the request **HTTP 200**, with content byte-identical to the staged run.
+
+`test-backend-ops -o FLASH_ATTN_EXT` **5952/5952**.  Same-seed greedy text is the reference hash
+(`139 chars sha=d2ffb97ccb76`) with staging on, with the static cap forcing native
+(`GGML_CUDA_FA_STAGE_MAX_MB=1`), and with the OOM fallback.  `GGML_CUDA_FA_STAGE_MAX_MB` semantics are
+unchanged (per-operand cap; above it the native read); the free-memory check is an additional,
+per-launch bound.
+
+**Bookkeeping.**  `rdna-boosts-all.patch` was regenerated for the first time since r1 (it had gone
+stale in r2, which amended block 01 but did not refresh the single-patch net), so its net now also
+contains the r2 block-01 controller.
+
 ## 2026-09-15 (block-01 amendment) — `v16-d1d3c3396-r2`: tuned bucketed adaptive-MTP controller
 
 **Release.** `v16-d1d3c3396-r2`, fork point `d1d3c3396` (tree `3ce99b5422bf`), canonical 16-block

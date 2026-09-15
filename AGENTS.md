@@ -194,11 +194,13 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   launcher no longer used — **the arm's memory win had never been delivered** (`-c 196608` q4_0
   849.04 -> **123.04 MiB**); (3) the **prefill band split**: a prefill (`n_q > 8`) stages K/V while
   decode/verify (`n_q <= 8`) reads the raw cache, with the staging scratch in a new per-context,
-  per-stream arena (`ggml_backend_cuda_context::fattn_stage` / `fattn_stage_get()`, bounded by
+  per-stream arena (`ggml_backend_cuda_context::fattn_stage` / `fattn_stage_try_get()`, bounded by
   `GGML_CUDA_FA_STAGE_MAX_MB`, default 512 MiB) instead of the compute-graph reserve (which sizes for
   `n_ctx` — that ~726 MiB is the adaptive-MTP `-c 196608` load failure), arch-gated
   `prefill_stages = !GGML_CUDA_CC_IS_RDNA3_5(cc)` (gfx1201 q8_0 `pp150000` 691.4/1076.9/1199.0 on
-  1/2/3 GPU, from 661.0/996.0/1111.4); (4) native arms for **`q4_1`/`q5_0`/`q5_1`/`iq4_nl`** (TODO item 2),
+  1/2/3 GPU, from 661.0/996.0/1111.4); the arena is a *speed* buffer, so a failed `cudaMalloc` now
+  returns null and the launcher reads the raw cache natively instead of aborting (issue #33 — being
+  outside the reserve, `--fit` never counted it); (4) native arms for **`q4_1`/`q5_0`/`q5_1`/`iq4_nl`** (TODO item 2),
   closing the last gap in the V4 set (+9-13 % tg64 @ d32768 on gfx1201, +22-27 % on gfx1151).  Two traps
   for the next person: the tile loader's native branch **must** be driven by the shared
   `ggml_cuda_fattn_native_type_from_kernel<type_KV>()` (a hand-written `Q8_0 || Q4_0` test left the new
@@ -276,8 +278,9 @@ new `mmq_args` field was unset by `ggml_cuda_mul_mat_q_pair`, selecting the narr
 to 2.2x slower dense prefill; see the 2026-09-13 block-14 (ninth) section).
 **Block 15 (the attention-memory campaign) is the delivery's last patch** --
 promoted 2026-09-12 from `archive/work/block-15-campaign-wins/` (`patches/0015`;
-the canonical 16-block tip is `af9ce375ded5238b59598290ad7366760b7dc6e0`, tree
-`c6896785a5fefdf9438d26974c0274bf99f43263` (the 2026-09-15 re-base onto `d1d3c3396`; the
+the canonical 16-block tip is `4e942c0715ada71a97fd3a24fe7a39447238f9b8`, tree
+`28be875afbdb58f2f842f521ac3ec6764b52cf49` (the 2026-09-15 re-base onto `d1d3c3396`, then r2 = the
+block-01 adaptive-MTP controller amendment and r3 = the block-15 staging-arena OOM fallback, issue #33; the
 previous base `790cf51aa` had tip `6f76c1cb1d80c7ecbf176f939a351bc385ff33fc`, tree
 `d735d6c11258ae939cfd392511e3f29ac22a7686`, the 2026-09-15 build-time amendment + the r4
 issue-#30 amendments on top of the 2026-09-13 master re-base + the
@@ -756,7 +759,13 @@ Consequences, so it is not re-litigated:
   (bf16) stays opt-in at 0.2-2.4 % for a bf16 cache to cost exactly what an
   f16 one does; the per-operand staging source is one shared type code
   `FATTN_KV_NATIVE_{NONE,Q8_0,Q4_0,BF16}`, so the launcher, the alloc-size
-  query and the kernels cannot disagree).  Two
+  query and the kernels cannot disagree).  **Amended 2026-09-15 (r3)**: the prefill staging arena is
+  grown outside the compute-graph reserve, so `--fit` / `llama_get_memory_breakdown` never counted
+  it (issue #33 — a nearly-full card aborted in `fattn_stage_get`'s `cudaMalloc` part-way through a
+  deep prefill).  The growth is now `fattn_stage_try_get()`: a failure clears the sticky error, warns
+  once and returns null, and `launch_fattn` falls back to the native K/V read for that launch (the
+  staged F16 copy and the native dequantization are bit-identical, so it is a prefill slowdown, not a
+  correctness change).  Two
   validation facts to protect: same-seed output is **byte-identical**
   across every gate combination on every model, and the adaptive-MTP gate
   is unchanged (27B 0.76744, qwen4exp 0.44262 = the block-14 baseline).

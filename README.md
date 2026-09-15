@@ -199,8 +199,8 @@ for per-block verification and `BASELINE.md` for provenance.
   **`d1d3c3396`** (re-based 2026-09-15; previously `790cf51aa`, re-based 2026-09-13 from `9113cc188`).
 - Patches `patches/0000-…0015-…`, applied with **strict 16/16 `git am`** by
   `scripts/apply-all.sh` (no 3-way fallback, whitespace-clean).
-- Canonical 16-block chain: tip `f8247e698`, net tree `b97cbdd4ab5cb435aaf07373b012fbb4de4d4af6`.
-- Release **`v16-d1d3c3396-r2`**.  `scripts/validate-set.sh` passes strict 16/16
+- Canonical 16-block chain: tip `4e942c071`, net tree `28be875afbdb58f2f842f521ac3ec6764b52cf49`.
+- Release **`v16-d1d3c3396-r3`**.  `scripts/validate-set.sh` passes strict 16/16
   (applied tree == the recorded tree).
 - Greedy purity: plain decode == `draft-mtp` verify for
   `--spec-draft-n-max <= 7` across the supported KV types (4B and 27B all
@@ -213,7 +213,17 @@ for per-block verification and `BASELINE.md` for provenance.
   config), [`MANIFESTS.md`](MANIFESTS.md) (apply order + verification contract)
   and [`BASELINE.md`](BASELINE.md) (fork point + drift policy).
 
-**Latest change (2026-09-15, r2) — the adaptive-MTP controller is re-tuned (issue #35).**  On the
+**Latest change (2026-09-15, r3) — the deep-prefill FA staging arena degrades instead of aborting (issue #33).**
+On a nearly-full card the block-15 prefill staging arena (deliberately outside the compute-graph
+reserve, so `--fit` does not count it) could OOM in `cudaMalloc` and abort the run; it now returns null,
+warns once and lets the launcher read the raw K/V cache natively for that prefill.  The staged F16 copy
+and the native per-tile dequantization are bit-identical, so this is a prefill-speed fallback only, and
+the transient can no longer exceed what the fit reserved.  Validated gfx1201 FAIL -> PASS: a
+31.5k-token `q8_0` prefill with the card pinned to 64 MiB free killed the pre-fix server with a
+`fattn_stage_get` OOM and completed post-fix with byte-identical content; `FLASH_ATTN_EXT` 5952/5952.
+Record: [`WORKLOG.md`](WORKLOG.md) (2026-09-15 r3).
+
+**Previous change (2026-09-15, r2) — the adaptive-MTP controller is re-tuned (issue #35).**  On the
 reporter's cell (27B Q8_0 x 2-card tensor, f16 KV, `-n 3000`) an adaptive ceiling of 12 lost 3.6 % to
 ceiling 7 (92.8 vs 96.3 t/s).  Block 01 now carries the credit-bucket controller with a depth-growing
 climb budget, a steeper drop pressure and a cold start at `cap - 3`, and reports its depth transitions

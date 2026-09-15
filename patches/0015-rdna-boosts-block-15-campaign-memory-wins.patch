@@ -1,4 +1,4 @@
-From f8247e6981ea632a2e66bfe3de2ddf87494fe6ea Mon Sep 17 00:00:00 2001
+From 4e942c0715ada71a97fd3a24fe7a39447238f9b8 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -274,11 +274,11 @@ run-to-run noise across five KV types.
  ggml/include/ggml.h                  |  31 +-
  ggml/src/ggml-alloc.c                |  35 ++
  ggml/src/ggml-backend-meta.cpp       |  18 +-
- ggml/src/ggml-cpu/ops.cpp            |  71 +++-
- ggml/src/ggml-cuda/common.cuh        |  29 ++
- ggml/src/ggml-cuda/fattn-common.cuh  | 602 ++++++++++++++++++++++++++-
+ ggml/src/ggml-cpu/ops.cpp            |  71 ++-
+ ggml/src/ggml-cuda/common.cuh        |  49 +++
+ ggml/src/ggml-cuda/fattn-common.cuh  | 622 ++++++++++++++++++++++++++-
  ggml/src/ggml-cuda/fattn-mma-f16.cuh | 317 ++++++++++++--
- ggml/src/ggml-cuda/fattn-qsa.cu      |  47 ++-
+ ggml/src/ggml-cuda/fattn-qsa.cu      |  47 +-
  ggml/src/ggml-cuda/fattn-tile.cu     |  29 ++
  ggml/src/ggml-cuda/fattn-tile.cuh    | 208 +++++++--
  ggml/src/ggml-cuda/fattn-vec.cuh     |   8 +-
@@ -288,15 +288,15 @@ run-to-run noise across five KV types.
  ggml/src/ggml.c                      |  99 ++++-
  src/llama-context.cpp                | 130 +++++-
  src/llama-cparams.h                  |   5 +
- src/llama-graph.cpp                  | 183 +++++---
+ src/llama-graph.cpp                  | 183 ++++++--
  src/llama-graph.h                    |  60 +++
- src/llama-kv-cache.cpp               | 189 ++++++++-
+ src/llama-kv-cache.cpp               | 189 +++++++-
  src/llama-kv-cache.h                 |  20 +-
- src/llama-memory-hybrid-idx.cpp      |  95 ++++-
+ src/llama-memory-hybrid-idx.cpp      |  95 +++-
  src/llama-memory-hybrid-idx.h        |  17 +-
  src/models/qwen4exp.cpp              | 338 ++++++++++++---
  tests/test-backend-ops.cpp           |  55 ++-
- 25 files changed, 2476 insertions(+), 258 deletions(-)
+ 25 files changed, 2516 insertions(+), 258 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index a8cdfc1eb..b149fe60f 100644
@@ -580,10 +580,10 @@ index 57f4f59fc..122e146ca 100644
              const float * add_d = (const float *) additive->data;
              return sc + add_d[c + row*n_kv];
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index a35de2cbf..bea02c8d4 100644
+index a35de2cbf..934b9cffb 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1645,6 +1645,35 @@ struct ggml_backend_cuda_context {
+@@ -1645,6 +1645,55 @@ struct ggml_backend_cuda_context {
  
      ggml_cuda_stream_context concurrent_stream_context;
  
@@ -600,13 +600,33 @@ index a35de2cbf..bea02c8d4 100644
 +    // The growth policy is not a performance lever (exact-fit realloc measured the same).
 +    char * fattn_stage[GGML_CUDA_MAX_STREAMS]      = {};
 +    size_t fattn_stage_size[GGML_CUDA_MAX_STREAMS] = {};
++    bool   fattn_stage_oom_warned                  = false;
 +
-+    void * fattn_stage_get(int stream_no, size_t size) {
++    // Try to make the per-stream staging arena hold at least `size` bytes.  Returns the arena
++    // (possibly larger than requested) on success, or nullptr when the device has no room for the
++    // transient: the previous arena is kept so a later, smaller request can still be served.
++    //
++    // A nullptr must not abort the compute: the arena is a deep-prefill *speed* buffer, not a
++    // correctness requirement (the caller falls back to reading the raw K/V cache, which is what
++    // decode/verify does anyway).  The allocation is deliberately not part of the compute-graph
++    // reserve -- the reserve sizes it for n_ctx -- so a llama-server --fit run can legitimately have
++    // less free memory at the first deep prefill than the fit projected; failing here must degrade
++    // to the native read, not kill the run.
++    void * fattn_stage_try_get(int stream_no, size_t size) {
 +        GGML_ASSERT(stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS);
 +        if (size > fattn_stage_size[stream_no]) {
 +            const size_t new_size = std::max<size_t>(size_t(1) << 24, size + size/4); // 16 MiB floor, 25% growth
 +            char * new_arena = nullptr;
-+            CUDA_CHECK(cudaMalloc(&new_arena, new_size));
++            if (cudaMalloc(&new_arena, new_size) != cudaSuccess) {
++                (void) cudaGetLastError(); // clear the sticky error
++                if (!fattn_stage_oom_warned) {
++                    fattn_stage_oom_warned = true;
++                    GGML_LOG_WARN("%s: not enough free device memory for a %zu MiB FA prefill staging "
++                                  "buffer, reading the K/V cache natively instead (prefill may be slower)\n",
++                                  __func__, new_size >> 20);
++                }
++                return nullptr;
++            }
 +            if (fattn_stage[stream_no] != nullptr) {
 +                CUDA_CHECK(cudaFree(fattn_stage[stream_no]));
 +            }
@@ -620,7 +640,7 @@ index a35de2cbf..bea02c8d4 100644
  
      cudaStream_t stream(int device, int stream) {
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 83ec690f8..e1b62673a 100644
+index 83ec690f8..35048b108 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -39,7 +39,15 @@ typedef void (* fattn_kernel_t)(
@@ -1157,7 +1177,7 @@ index 83ec690f8..e1b62673a 100644
      ggml_tensor * KQV = dst;
  
      GGML_ASSERT(Q->type == GGML_TYPE_F32);
-@@ -1095,8 +1599,74 @@ void launch_fattn(
+@@ -1095,8 +1599,94 @@ void launch_fattn(
      const int cc  = ggml_cuda_info().devices[id].cc;
      const int nsm = ggml_cuda_info().devices[id].nsm;
  
@@ -1188,8 +1208,11 @@ index 83ec690f8..e1b62673a 100644
 +        const char * e = getenv("GGML_CUDA_FA_STAGE_MAX_MB");
 +        return (size_t) (e ? atoll(e) : 512) << 20;
 +    }();
-+    const bool stage_ok_K = stage_max_bytes == 0 || (size_t) ggml_nelements(K)*sizeof(half) <= stage_max_bytes;
-+    const bool stage_ok_V = stage_max_bytes == 0 || (size_t) ggml_nelements(V)*sizeof(half) <= stage_max_bytes;
++    // Per-operand static cap: a transient larger than the cap is not staged at all (native read).
++    const size_t stage_bytes_K = (size_t) ggml_nelements(K)*sizeof(half);
++    const size_t stage_bytes_V = (size_t) ggml_nelements(V)*sizeof(half);
++    const bool stage_cap_K = stage_max_bytes == 0 || stage_bytes_K <= stage_max_bytes;
++    const bool stage_cap_V = stage_max_bytes == 0 || stage_bytes_V <= stage_max_bytes;
 +    // Prefill stages only where that actually wins.  On RDNA4/RDNA3_0 the whole-prefix F16 conversion
 +    // is paid once per ubatch and the tiles then feed the cp_async pipeline, which beats
 +    // re-dequantizing each tile once per query block (gfx1201 q8_0: pp150k 691 vs 661 native, pp32k
@@ -1198,14 +1221,32 @@ index 83ec690f8..e1b62673a 100644
 +    // 1266, pp65k 1043 vs 1059), so it keeps the native read at prefill too.
 +    const bool prefill_stages = !GGML_CUDA_CC_IS_RDNA3_5(cc);
 +    const bool native_width = Q->ne[1] <= 8 || !prefill_stages;
-+    const bool use_native_K = (native_width || !stage_ok_K) && kv_native_K != FATTN_KV_NATIVE_NONE;
-+    const bool use_native_V = (native_width || !stage_ok_V) && kv_native_V != FATTN_KV_NATIVE_NONE;
++
 +    // A native-capable operand that stages takes its scratch from the per-context, per-stream arena
 +    // rather than the generic CUDA pool.  The pool grows by exact fit and *retains* every distinct
 +    // size (the leg pool caches up to 256 buffers), and this request grows with the prefix, so a
 +    // long prefill would leave ~150 distinct buffers cached; the arena bounds the retained memory to
 +    // ~1.25x the largest requested size.  (The growth policy itself is not a performance lever --
 +    // measured pp150k 691.0 with an exact-fit realloc vs 691.4 with 25% growth.)
++    //
++    // The arena is grown on demand and its growth can fail when the device is nearly full -- e.g. a
++    // llama-server --fit run whose target left less free memory than the deep-prefill transient needs
++    // (the scratch is deliberately outside the compute-graph reserve, so the fit does not count it).
++    // Rather than abort on that OOM, fall back to the native read for the operand(s) that would have
++    // been staged: it is the same arithmetic the decode/verify band already uses, so this is a
++    // prefill slowdown, never a correctness change, and it keeps the run inside the memory the fit
++    // reserved.  The request covers both operands because they share the one arena buffer.
++    const bool stage_wants_K = !native_width && stage_cap_K && kv_native_K != FATTN_KV_NATIVE_NONE;
++    const bool stage_wants_V = !native_width && stage_cap_V && kv_native_V != FATTN_KV_NATIVE_NONE && !V_is_K_view;
++    const size_t stage_req = (stage_wants_K ? stage_bytes_K : 0) + (stage_wants_V ? stage_bytes_V : 0);
++    char * stage_buf = stage_req != 0 ? (char *) ctx.fattn_stage_try_get(ctx.curr_stream_no, stage_req) : nullptr;
++    const bool stage_ok = stage_buf != nullptr;
++
++    const bool use_native_K = (native_width || !stage_ok || !stage_cap_K) && kv_native_K != FATTN_KV_NATIVE_NONE;
++    // A V that is a view of K is the same cache data: it must follow K's staging decision rather than
++    // take its own (stage_V below is then false and K_f16_stage is reused).
++    const bool use_native_V = V_is_K_view ? use_native_K :
++        ((native_width || !stage_ok || !stage_cap_V) && kv_native_V != FATTN_KV_NATIVE_NONE);
 +    const bool stage_K = kv_native_K != FATTN_KV_NATIVE_NONE && !use_native_K;
 +    const bool stage_V = kv_native_V != FATTN_KV_NATIVE_NONE && !use_native_V && !V_is_K_view;
 +
@@ -1224,16 +1265,15 @@ index 83ec690f8..e1b62673a 100644
 +    half * K_f16_stage = nullptr;
 +    half * V_f16_stage = nullptr;
 +    if (stage_K || stage_V) {
-+        const size_t nK = stage_K ? (size_t) ggml_nelements(K) : 0;
-+        const size_t nV = stage_V ? (size_t) ggml_nelements(V) : 0;
-+        char * stage_buf = (char *) ctx.fattn_stage_get(ctx.curr_stream_no, (nK + nV)*sizeof(half));
++        GGML_ASSERT(stage_buf != nullptr);
++        const size_t nK = stage_K ? stage_bytes_K : 0;
 +        K_f16_stage = (half *) stage_buf;
-+        V_f16_stage = (half *) (stage_buf + nK*sizeof(half));
++        V_f16_stage = (half *) (stage_buf + nK);
 +    }
  
      ggml_cuda_pool_alloc<int>    KV_max(pool);
      ggml_cuda_pool_alloc<float>  dst_tmp(pool);
-@@ -1112,12 +1682,17 @@ void launch_fattn(
+@@ -1112,12 +1702,17 @@ void launch_fattn(
      size_t nb22 = V->nb[2];
      size_t nb23 = V->nb[3];
  
@@ -1254,7 +1294,7 @@ index 83ec690f8..e1b62673a 100644
          if (ggml_is_contiguously_allocated(K)) {
              to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
              to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
-@@ -1140,7 +1715,7 @@ void launch_fattn(
+@@ -1140,7 +1735,7 @@ void launch_fattn(
          K_data = (char *) K_f16;
      }
  
@@ -1263,7 +1303,7 @@ index 83ec690f8..e1b62673a 100644
          if (V_is_K_view) {
              V_data = K_data;
              nb21   = nb11;
-@@ -1150,8 +1725,13 @@ void launch_fattn(
+@@ -1150,8 +1745,13 @@ void launch_fattn(
              const size_t bs = ggml_blck_size(V->type);
              const size_t ts = ggml_type_size(V->type);
  
@@ -1279,7 +1319,7 @@ index 83ec690f8..e1b62673a 100644
              if (ggml_is_contiguously_allocated(V)) {
                  to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                  to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
-@@ -1342,7 +1922,11 @@ void launch_fattn(
+@@ -1342,7 +1942,11 @@ void launch_fattn(
          K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
          nb21, nb22, nb23,
          mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
