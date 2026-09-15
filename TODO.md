@@ -170,6 +170,16 @@ enablement there and runs host-only/CPU.
   (cosmetic).
 
 ## Parked (not planned now)
+- **`rdna-boosts-all.patch` hygiene (raised 2026-09-15).**  The single-file net patch is a documented
+  delivery artifact (1.35 MiB) that is regenerated on every release, so each revision adds ~1.3 MiB of
+  history — the dominant `.git` cost (the raw logs trimmed 2026-09-15 compressed to only ~1.07 MiB total,
+  so history is otherwise compact).  Options when someone picks this up: (a) keep as-is (it is derivable
+  from `patches/` + `scripts/apply-all.sh`, so it is pure convenience); (b) stop tracking it and generate
+  it on demand in the release pipeline / for the GitHub Release asset (the layout table and
+  `docker-ghcr.yml` both reference it, so those pointers move); (c) a history rewrite
+  (`git filter-repo` + force-push + re-tagging every `v16-*`) — measure the real recovery first: the
+  patch is already close to incompressible text, so the win is bounded and the cost is a force-push to a
+  published repo (see the Pushing policy).  **Not today; no work started.**
 - **Restore the block-13 RDNA3_5 single-token fusion perf (item 16).**  The ~0.9 % `tg128` the purity
   skip costs; the proposed "pin `nwarps`/`rps`/item-split" fix is **invalid** (the two arms are already
   launch-identical).  Live candidates: codegen (`has_fusion` register pressure / FMA contraction) and the
