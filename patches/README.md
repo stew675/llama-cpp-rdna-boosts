@@ -1,12 +1,14 @@
 # rdna-boosts patch set (delivery)
 
 16 patches (block 00 structural fixes + blocks 01-15) against llama.cpp master `790cf51aa`
-**Current release: `v16-790cf51aa-r4`** (tip `b19c70b34`, tree `7fab975d9`).  r2 = block 15's V4 native
+**Current release: `v16-790cf51aa-r5`** (tip `6f76c1cb1`, tree `d735d6c11`).  r2 = block 15's V4 native
 staging default for the sub-F16 quants + the q4_0 arm; r3 = block 04's arch- and split-aware prefill
-tuning; **r4 = the 2026-09-15 block-15 amendment**: the mixed-K/V kernel contract (the reporter's q4_0
+tuning; r4 = the 2026-09-15 block-15 amendment: the mixed-K/V kernel contract (the reporter's q4_0
 NaN), the `get_alloc_size` q4_0 scratch fix, the prefill band split + staging arena + the RDNA3_5 arch
-gate, and native arms for `q4_1`/`q5_0`/`q5_1`/`iq4_nl` — see the 2026-09-15 block-15 amendment section
-below.
+gate, and native arms for `q4_1`/`q5_0`/`q5_1`/`iq4_nl`; **r5 = the build-time half of the same block-15
+amendment**: the tile kernel's native-KV type axis is instantiated in the generated instance TUs again
+instead of implicitly in the dispatch TU, which took a clean `-j16` backend build from **538 s to
+330 s** with no runtime change — see the two 2026-09-15 block-15 amendment sections below.
 ("chat : improve parsing of complex types in qwen3-coder (#28742)", re-based **2026-09-13** from
 `9113cc188`; previously re-based 2026-09-08 from `050dde50c` ("hexagon: add RELU and LEAKY_RELU ops (#28585)"), itself
 re-based 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
@@ -683,6 +685,41 @@ at the default 4 slots; `GGML_CUDA_FA_KV_NATIVE=0` reproduces the OOM.
 `scripts/validate-set.sh` passes (strict 16/16 `git am` on a fresh `790cf51aa` tarball, applied tree ==
 `58317e0d…`).  Release `v16-790cf51aa-r2`.  Record: `WORKLOG.md` 2026-09-14, `GREEDY-PURITY.md` §34,
 `wip/issue-30-mtp-decode-regression/` (and `RECURRENT-SNAPSHOT-BUDGET.md` for the remaining levers).
+
+## 2026-09-15 block-15 amendment (build time): the tile native-KV type axis is instantiated in the generated instance TUs
+
+**Release:** `v16-790cf51aa-r5`, tip `6f76c1cb1d80c7ecbf176f939a351bc385ff33fc`, tree
+`d735d6c11258ae939cfd392511e3f29ac22a7686`.  `validate-set.sh` passes strict 16/16 (applied tree ==
+`release.json.tree`).  One file, `ggml/src/ggml-cuda/fattn-tile.cuh` (**+31/-8**), no runtime effect.
+
+**Why.**  Block 03 turned `type_KV` into a template parameter of `ggml_cuda_flash_attn_ext_tile_case` so
+the tile kernel could read BF16 (and later the quantized types) natively, but `DECL_FATTN_TILE_CASE` /
+`EXTERN_DECL_FATTN_TILE_CASES` kept covering only **F16 and BF16**.  The dispatch in `fattn-tile.cu` has
+an unconditional `case` per native KV type, so the other six were instantiated **implicitly in that
+TU**: `nm -C build-rocm/.../fattn-tile.cu.o` showed **96** `tile_case` symbols — 24 `extern` and **72
+compiled there** (12 head-size combos x 6 types), each pulling in both softcap variants and the whole
+`ncols2` chain.  With block 08's `GGML_CUDA_FA_QUANTS` default (8 diagonal pairs) that single TU took
+**509 s of a 538 s** clean `-j16` backend build on a 16-core machine (gfx1201, measured 2026-09-15) — it
+*was* the critical path, so no amount of `-j` could help.
+
+**Fix.**  The macros now expand per type (`DECL_FATTN_TILE_CASE_TYPE(DKQ, DV, T)` for F16, BF16, q8_0,
+q4_0, q4_1, q5_0, q5_1, iq4_nl), so the 12 generated
+`template-instances/fattn-tile-instance-*.cu` files instantiate **8 cases each** (was 2) and the
+dispatch TU holds only `extern` declarations (96 `U`).  Same template arguments, same flags, same device
+code — only the translation unit that emits the kernels changed.
+
+**Measured.**  `ggml-hip` clean `-j16`: **538 s -> 330 s** (-39 %); `fattn-tile.cu` **509 s -> < 10 s**.
+The new critical path is the `fattn-mma-f16` instance set, which this delivery also grew: its native-KV
+arm chain instantiates the whole WMMA kernel once per KV type inside each instance TU, so the same TU
+went 0.90 -> **7.26 MB** and 6.7 -> **229 s** versus the base.  That half is diagnosed and deliberately
+left as a follow-up (it needs a code-path change with its own A/B) — see `TODO.md` and
+`wip/build-time-regression/`.
+
+**Verified zero runtime change.**  `test-backend-ops -o FLASH_ATTN_EXT` **5951/5951 with zero
+failures** (identical to r4); 27B prose text hashes **bit-identical** to the pre-amendment build
+(q8_0 `472b282950b5`, q4_0 `118eb7f5fe85`, f16 `70960317a203`); `tg64@32768`/`pp8192` within **0.12 %**
+of the recorded r4 numbers across five KV types (controls: q4_1 staged 23.18 vs the recorded 23.14,
+default `-r 3` 25.58 +- 0.13 vs 25.44).
 
 ## 2026-09-15 block-15 amendment: the r4 candidate — the reporter's q4_0 NaN, the prefill band split, and the last four native KV arms
 

@@ -168,7 +168,21 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   -- V4 +2.6 % at pp20480, V5 0.4-0.9 %).  The beta window closed with the
   2026-09-12 promotion; the dense-arm blocker and its one-line fix are
   closed, the revalidation reproduced every reserve number and the width
-  probe hashes, and the patch is now `patches/0015`.  **Amended 2026-09-15 (issue #30's second
+  probe hashes, and the patch is now `patches/0015`.  **Amended 2026-09-15 (build time, release
+  `v16-790cf51aa-r5`)** with one change and no runtime effect: the tile kernel's native-KV `type_KV`
+  axis is instantiated in the 12 generated `template-instances/fattn-tile-instance-*.cu` files again
+  instead of implicitly in the dispatch TU.  Block 03 introduced the type axis but `DECL_FATTN_TILE_CASE`
+  / `EXTERN_DECL_FATTN_TILE_CASES` kept covering F16/BF16 only, and the dispatch has an unconditional
+  `case` per native type — so `fattn-tile.cu.o` defined **72 of its 96** `tile_case` symbols (12
+  head-size combos x 6 quantized types) and that one TU took **509 s of a 538 s** clean `-j16` backend
+  build.  The macros now expand per type: the generated files carry 8 cases each, the dispatch TU only
+  externs (**538 s -> 330 s**, `fattn-tile.cu` **< 10 s**), and the kernels/flags/device code are
+  unchanged — `test-backend-ops -o FLASH_ATTN_EXT` 5951/5951, 27B text hashes bit-identical, per-type
+  `tg64@32768`/`pp8192` within 0.12 %.  The remaining critical path is the `fattn-mma-f16` instance set,
+  which this delivery also grew (its native-KV arm chain instantiates the whole WMMA kernel per type in
+  every instance TU: 0.90 -> 7.26 MB, 6.7 -> 229 s) — diagnosed, left as a follow-up.  See
+  `patches/README.md` (the two 2026-09-15 block-15 amendment sections), `wip/build-time-regression/` and
+  `TODO.md`.  **Amended 2026-09-15 (issue #30's second
   round, release `v16-790cf51aa-r4`)** with four things: (1) the **mixed-K/V kernel contract** — the tile
   kernel is instantiated with ONE `type_KV` for both operands while `launch_fattn` chose its native read
   per tensor, so a mixed pair (K=q4_0/V=f16 …) fell back to the F16 tile with the native operand's
@@ -198,8 +212,9 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `790cf51aa` is a rebuild of the delivery set
-(tip `a2c8d06a7931c9f6bec8542fe10149c615853be7`, net tree
-  `eb5b7583d14b30b7610fac53acf2fc52bc806ce4`,
+(tip `6f76c1cb1d80c7ecbf176f939a351bc385ff33fc`, net tree
+  `d735d6c11258ae939cfd392511e3f29ac22a7686` = r5, the 2026-09-15 build-time block-15 amendment on top
+  of r4's `b19c70b34` / `7fab975d9`,
 built by applying the delivery patches with `scripts/apply-all.sh` at
 `790cf51aa`; the 2026-09-13 re-base resolved the four upstream clashes --
 `16378d93f` gfx1201 FA tuning (our block-04 head-256 configs were kept at the time because upstream's
@@ -253,8 +268,9 @@ new `mmq_args` field was unset by `ggml_cuda_mul_mat_q_pair`, selecting the narr
 to 2.2x slower dense prefill; see the 2026-09-13 block-14 (ninth) section).
 **Block 15 (the attention-memory campaign) is the delivery's last patch** --
 promoted 2026-09-12 from `archive/work/block-15-campaign-wins/` (`patches/0015`;
-the canonical 16-block tip is `a2c8d06a7931c9f6bec8542fe10149c615853be7`, tree
-`eb5b7583d14b30b7610fac53acf2fc52bc806ce4` (the 2026-09-13 master re-base + the
+the canonical 16-block tip is `6f76c1cb1d80c7ecbf176f939a351bc385ff33fc`, tree
+`d735d6c11258ae939cfd392511e3f29ac22a7686` (the 2026-09-15 build-time amendment + the r4
+issue-#30 amendments on top of the 2026-09-13 master re-base + the
 2026-09-13 block-08 `iq4_nl` `GET_ROWS` amendment; the
 previous base `9113cc188` had tip `907799de3`, tree `c2e284c2acc032238ef85cb35d427c1598ed0949`).
 
@@ -487,6 +503,19 @@ Consequences, so it is not re-litigated:
   Before shipping any decode/verify or mmvq change, run the stock-relative verify-width
   `llama-batched-bench -npl 1,4,8` gate added to `benchmarks/mtp-adaptive-methodology.md` (rule 5) —
   acceptance and `llama-bench tg128` both pass while a verify-width regression is present.
+- **FA instantiation discipline (2026-09-15): a FA kernel's KV *type* axis must be instantiated in the
+  generated `template-instances/*.cu` files, never left implicitly in the dispatch TU.**  The dispatch
+  (`fattn-tile.cu`, `fattn-mma-f16.cu`) has an unconditional `case`/arm chain per native KV type, so any
+  type the `DECL_*`/`EXTERN_DECL_*` macros do not cover is compiled *inside that single TU*.  That is
+  how a clean `-j16` backend build came to be gated by one file: covering only F16/BF16 made
+  `fattn-tile.cu` take **509 s of 538 s** (`fattn-tile.cu.o` defined 72 of its 96 `tile_case` symbols).
+  The tile half is fixed in r5 (the macros expand per type: **538 s -> 330 s**); the MMA half is the
+  *remaining* critical path and is already **6.7 -> 229 s per instance TU** (object 0.90 -> 7.26 MB,
+  because each instance file carries one WMMA kernel copy per type) — it needs a code-path change
+  (finer generated-file granularity, or a runtime KV-type dispatch in the loader) with its own A/B, so
+  it is parked in `TODO.md` with the measurements in `wip/build-time-regression/`.  Quick check with
+  `nm -C <obj> | grep -c <case symbol>`: the dispatch TU must show **`U`** for every type and the
+  instance TUs must show `T`/`W`.
 - **The set applies whitespace-clean**: `apply-all.sh` prints no git
   whitespace warnings (re-verified 2026-09-01 on `0eadefebd`,
   2026-09-02 on the `9cffdcc80` re-base, 2026-09-04 after the
@@ -816,7 +845,8 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults: fork `~/llama.cpp`, base `790cf51aa`,
-blocks tip `a2c8d06a7931c9f6bec8542fe10149c615853be7`): `git format-patch --start-number 0` the block
+blocks tip `6f76c1cb1d80c7ecbf176f939a351bc385ff33fc` — **the script's own header comment still names an
+older default, so pass the tip explicitly**): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working

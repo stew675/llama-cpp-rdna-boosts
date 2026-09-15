@@ -170,6 +170,20 @@ enablement there and runs host-only/CPU.
   (cosmetic).
 
 ## Parked (not planned now)
+- **The `fattn-mma-f16` instance-set build cost (raised 2026-09-15, r5).**  The tile half of the
+  build-time regression is fixed in r5 (`ggml-hip` clean `-j16` **538 s -> 330 s**), but the *remaining*
+  critical path is the MMA instance set and it is ours: the native-KV arm chain in
+  `ggml_cuda_flash_attn_ext_mma_f16_case` instantiates the whole WMMA kernel once per KV type **inside
+  every instance TU**, so each of the 21 instance files compiles 8 kernel copies.  Measured on the same
+  TU (`ncols1_4-ncols2_4`, 8 head-size cases in both): object **0.90 -> 7.26 MB**, compile **6.7 -> 229
+  s** versus the base `790cf51aa`; ~1950 s of CPU across the MMA group, and `ncols1_8-ncols2_4` is the
+  single worst TU at 250 s.  Two candidate fixes, both needing an A/B (they change code paths, not just
+  plumbing): (a) finer generated-file granularity — one file per `(ncols1, ncols2, head-size)` instead of
+  per `(ncols1, ncols2)`, i.e. ~21 -> ~150 TUs: same total work, better packing, wall ~330 -> ~230-250 s
+  (a pure `generate_cu_files.py` change, but it rewrites ~170 tracked generated files in the patch);
+  (b) make the WMMA loader's KV type a runtime dispatch (one kernel copy, ~8x less code) at the cost of a
+  uniform branch in the tile load — needs a decode + prefill A/B to price.  Evidence, the TU-timing tool
+  and the reproduction recipe: `wip/build-time-regression/`.
 - **`rdna-boosts-all.patch` hygiene (raised 2026-09-15).**  The single-file net patch is a documented
   delivery artifact (1.35 MiB) that is regenerated on every release, so each revision adds ~1.3 MiB of
   history — the dominant `.git` cost (the raw logs trimmed 2026-09-15 compressed to only ~1.07 MiB total,

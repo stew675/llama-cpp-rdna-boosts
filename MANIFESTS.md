@@ -9,7 +9,21 @@ The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against
 2026-09-13 from `9113cc188`; previously re-based 2026-09-08 from `050dde50c`, itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
-**Block-15 amendment (2026-09-15, issue #30 second round) — the current release `v16-790cf51aa-r4`:**
+**Block-15 amendment (2026-09-15, build time) — the current release `v16-790cf51aa-r5`:** the tile
+kernel's native-KV type axis is instantiated in the 12 generated instance TUs again instead of
+implicitly in the dispatch TU.  Block 03 made `type_KV` a template parameter of
+`ggml_cuda_flash_attn_ext_tile_case` while `DECL_FATTN_TILE_CASE`/`EXTERN_DECL_FATTN_TILE_CASES` kept
+covering only F16/BF16, so — the dispatch having an unconditional `case` per native type — the other
+six types were compiled into the dispatch TU (72 of its 96 `tile_case` symbols).  That one TU took
+**509 s of a 538 s** clean `-j16` backend build; the macros now expand per type, so the generated files
+carry 8 cases each and the dispatch only externs: **538 s -> 330 s**, `fattn-tile.cu` **509 s -> < 10
+s**, with byte-identical kernels (FA test 5951/5951; 27B text hashes unchanged; per-type perf within
+0.12 %).  The remaining critical path is the `fattn-mma-f16` instance set, which the same delivery grew
+8x (0.90 -> 7.26 MB, 6.7 -> 229 s per TU) — diagnosed, follow-up in `TODO.md`.
+`wip/build-time-regression/`.  Tip `6f76c1cb1d80c7ecbf176f939a351bc385ff33fc`, tree
+`d735d6c11258ae939cfd392511e3f29ac22a7686`.
+
+**Block-15 amendment (2026-09-15, issue #30 second round) — r4:**
 (1) the mixed-K/V kernel contract — the tile kernel's one `type_KV` vs the launcher's per-tensor native
 read, which made a mixed pair read raw q4_0 as F16 (the reporter's 4 NaN failures); (2) the
 `get_alloc_size` TILE case never learned the q4_0 arm, so the arm's memory win was never delivered

@@ -1,5 +1,56 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-15 (later) — `v16-790cf51aa-r5`: build time — a clean backend build was gated by one translation unit
+
+**Release.**  `v16-790cf51aa-r5`, tip `6f76c1cb1d80c7ecbf176f939a351bc385ff33fc`, tree
+`d735d6c11258ae939cfd392511e3f29ac22a7686`; block 15 amended again (message + one file), 16 patches +
+`rdna-boosts-all.patch` + `release.json` regenerated, `scripts/validate-set.sh` passes strict 16/16.
+
+**The report.**  A fresh ROCm build had become slow, and a single TU (`fattn-tile.cu`) took over 4
+minutes to compile on a 16-core machine.
+
+**The cause (ours).**  Block 03 turned `type_KV` into a template parameter of
+`ggml_cuda_flash_attn_ext_tile_case` (BF16, then the quantized arms), while
+`DECL_FATTN_TILE_CASE`/`EXTERN_DECL_FATTN_TILE_CASES` kept covering only F16/BF16 — the upstream
+mechanism splits the *head-size* axis over 12 generated `template-instances/fattn-tile-instance-*.cu`
+files and externs it in the dispatch, and the type axis was never added to it.  The dispatch has an
+unconditional `case` per native type, so the other six types were instantiated **implicitly in the
+dispatch TU**: `nm -C fattn-tile.cu.o` defined **72 of its 96** `tile_case` symbols (12 head-size combos
+x 6 quantized types, each with both softcap variants and the whole `ncols2` chain) while every generated
+instance file defined just 2.  That one TU was **509 s of a 538 s** clean `-j16` backend build.
+
+**The fix.**  The macros now expand per type (`DECL_FATTN_TILE_CASE_TYPE(DKQ, DV, T)` for F16, BF16,
+q8_0, q4_0, q4_1, q5_0, q5_1, iq4_nl) — one file, `ggml/src/ggml-cuda/fattn-tile.cuh`, +31/-8, no
+runtime effect.  The generated files carry 8 cases each and the dispatch TU holds only externs (96 `U`).
+
+**Measured.**  Clean `ggml-hip`, `-j16`, 16 cores (gfx1201): **538 s -> 330 s**; `fattn-tile.cu` **509 s
+-> < 10 s**; the new critical path is the `fattn-mma-f16` instance set at ~250 s.
+
+**The remaining half (diagnosed, deliberately not fixed here).**  The MMA instance TUs are ours too: the
+native-KV arm chain instantiates the whole WMMA kernel once per KV type *inside every instance TU*, so
+the same TU (`ncols1_4-ncols2_4`, 8 head-size cases in both) went **0.90 -> 7.26 MB** and **6.7 -> 229 s**
+versus the base — ~1950 s of CPU across 21 TUs.  Fixing it means either a finer generated-file
+granularity (~21 -> ~150 TUs, same total work, better packing) or a runtime KV-type dispatch in the WMMA
+loader (one kernel copy, ~8x less code, one uniform branch in the tile load) — both are code-path
+changes that need their own A/B, so they are parked in `TODO.md` rather than folded into this release.
+
+**Verified zero runtime change.**  `test-backend-ops -o FLASH_ATTN_EXT` **5951/5951, 0 failures**; 27B
+prose text hashes **bit-identical** to the pre-amendment build (q8_0 `472b282950b5`, q4_0
+`118eb7f5fe85`, f16 `70960317a203`); `tg64@32768`/`pp8192` within **0.12 %** of the recorded r4 values
+across five KV types, with controls (q4_1 staged 23.18 vs the recorded 23.14; default `-r 3`
+25.58 +- 0.13 vs 25.44) showing the sub-0.1 % first-pass offsets were single-sample noise.
+
+**Also measured (not a delivery issue).**  The full backend build emits **10,362** `warning: loop not
+unrolled ... [-Wpass-failed]` lines and every one is from `fattn-mma-f16.cuh` — the bare `#pragma unroll`
+loops whose bounds are runtime values (dominantly the K/V staging loop at `421:13`, "no viable unroll
+count found").  Those pragmas are upstream's and identical at the base; only the *count* is amplified by
+our extra instantiations.  Warnings, not errors.
+
+**Docs.**  `wip/build-time-regression/` (README + tools + the raw logs/timings),
+`patches/README.md` (the two 2026-09-15 block-15 amendment sections), `AGENTS.md` (the new
+"FA instantiation discipline" critical fact + the block-15 bullet + the canonical tip/tree),
+`README.md`, `MANIFESTS.md`, `BASELINE.md`, `TODO.md` (the MMA follow-up).
+
 ## 2026-09-15 — `v16-790cf51aa-r4`: the reporter's q4_0 NaN, the prefill band split, and the last four native KV arms
 
 **Release.**  `v16-790cf51aa-r4`, tip `b19c70b341f9ed439bcda2a636fe6e5fa4fa634b`, tree
