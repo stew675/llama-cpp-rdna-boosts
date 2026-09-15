@@ -45,6 +45,33 @@ Constraints: R within 3 % of fixed-3 (met: +5.0 %), P >= fixed-3 (met), C >= 1.1
 On the 1-card UD-Q4_K_XL reference: code cap-12 **84.7** vs cap-7 61.4 (+37.9 %), reasoning 47.3 vs
 47.7 fixed-3 (-0.8 %), prose 57.0 vs 56.8 (+0.4 %).
 
+## Single-card (1 x RDNA4, f16 KV, `-n 3000`)
+
+Both weight types, because the controller's cost/benefit shifts with the per-token cost:
+
+| axis | Q8_0 fixed-3 | Q8_0 cap 7 | Q8_0 cap 12 | UD-Q4_K_XL fixed-3 | UD-Q4_K_XL cap 7 | UD-Q4_K_XL cap 12 |
+|---|---:|---:|---:|---:|---:|---:|
+| code | — | 63.3 | **71.3** | 63.4 | 61.4 | **84.7** |
+| reasoning | 39.4 | — | 38.9 | 47.7 | — | 47.3 |
+| prose | 47.7 | — | 53.6 | 56.8 | — | 57.0 |
+| code <-> reasoning | — | — | 41.5 | — | — | — |
+| recall | — | — | — | — | — | 127.6 |
+
+Cap-12 vs cap-7 on the reporter's weight type, single card: **+12.6 %** (71.3 vs 63.3).  A pinned
+depth 10 on that cell reads 67.6, so the depth the controller settles at (~9) is at least as good as
+a pinned deep draft.  Reasoning is -1.3 % against fixed-3 (inside the 3 % bound) and prose +12.4 %.
+Settled trajectories: code cap-12 `9 -> 10 -> 9`, code cap-7 `4 -> 5 -> 6 -> 7` (the cold start is
+`cap - 3`), reasoning `9 -> 8 -> ... -> 3` staying at the floor.
+
+**Caveat to carry forward:** the code <-> reasoning phase-switching axis costs **2.4 %** on
+single-card Q8_0 (41.5 against a 42.5 floor optimum), where it cost only 0.5 % on the two-card cell.
+What is paid is the cold start plus the `9 -> 3` descent, and the descent is deliberately slow --
+`drop_pressure(d) = max(60, 10*d)` is the same constant that stops the `6 <-> 12` churn on the code
+axis.  A workload that spends most of its tokens at the floor *on a single card* is therefore the
+worst case for this tuning; its trajectory was `9 -> 8 -> 7 -> 6 -> 5 -> 4 -> 3` with `3 <-> 4`
+chatter afterwards.  Compare with the two-card mixed reading (64.0 against 64.3) before deciding
+whether a shape-specific `drop_pressure` slope is worth it.
+
 ## Purity
 
 Same seed, greedy, no `-lv` (the extractor needs a clean stream): `--spec-type none`, fixed
