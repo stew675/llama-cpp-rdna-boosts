@@ -47,6 +47,49 @@ HIP_VISIBLE_DEVICES=1,2 build-rocm/bin/llama-cli \
 **llama-cli MUST always be invoked with `--single-turn`** (else it blocks in the chat loop).  Use a
 separate run per cell; do not run benches in parallel with anything else.
 
+## Measured data on `v16-d1d3c3396-r1` (self-contained; do not re-derive)
+
+Q8_0 27B, 2-card `-sm tensor -ts 1/1`, code prompt, f16 KV:
+
+| ceiling | tg t/s | acceptance | mean accepted len |
+|---:|---:|---:|---:|
+| 7  | **95.1** | 0.73733 | 5.70 |
+| 8  | 92.2 | 0.71388 | 6.07 |
+| 9  | 93.5 | 0.68159 | 6.37 |
+| 10 | 92.8 | 0.65413 | 6.55 |
+| 11 | 92.4 | 0.62341 | 6.69 |
+| 12 | 89.6 | 0.58636 | 6.72 |
+
+BF16 KV (same cell): 7 → 97.0, 10 → 94.5, 12 → 90.6.  Native-bf16 FA forced (`GGML_CUDA_FA_KV_NATIVE=1`)
+is a no-op here.  Quant × split, 7 → 12: Q8_0 2-card code −5.8 %, prose −4.8 %; **Q4_K_XL and Q6_K
+2-card still gain** (+8.2/+6.6 %, +11.3/+6.9 %); 1-card Q8_0 still gains (+7.3 %, q8_0 KV).  So the
+confirmed loss is exactly **Q8_0 × tensor split**.
+
+## Controller internals (the prime suspect)
+
+| item | location |
+|---|---|
+| the climb/drop table | `common/speculative-adaptive.h` — `climb_threshold()`, `drop_pressure()` |
+| state + transition | `common/speculative-adaptive.h` — `reset()`, `update()` |
+| per-round feedback | `common/speculative.cpp` — `adaptive_feedback()` (~L1819), called from `accept()`/`accept_partial()` |
+| depth applied to the draft cap | `common/speculative.cpp` (~L1679): `n_cap[seq_id] = adaptive ? adaptive_ctrl[seq_id].n_cur : params.n_max` |
+| init / range validation | `common/speculative.cpp` (~L1456-1480); floor is `--spec-draft-n-min-adaptive` (default 3) |
+| CLI knob | `common/arg.cpp` (~L4170) `--spec-draft-n-min-adaptive` |
+| unit test (drive the retune) | `tests/test-speculative-adaptive.cpp` |
+
+Quick experiments to try (one variable at a time, re-run the 7/10/12 curve for Q8_0 2-card):
+
+1. Raise the `>= 7` climb from **2** to 4/6 (match the depth-4/3 barriers).
+2. Raise `drop_pressure` above `depth * 5` (e.g. `depth * 8`) so misses eject depth sooner.
+3. Make the climb/drop depend on the *verify cost* (e.g. penalise climbing when `n_gpu > 1` or the
+   dominant weight type is Q8_0, which is where the wide verify is dearest) — the principled version
+   of the reporter's cap.
+
+If the retune cannot close the gap, the fallback is the reporter's blanket rule: default the adaptive
+cap to 7 when `n_gpu > 1` (tensor) or the dominant weight type is Q8_0.  Detect `n_gpu` /
+split-mode at the same place the context is created and pass it into the controller; the weight type is
+on `llama_model`/the layer tensors.
+
 ## Where to look (delivery blocks)
 
 | area | files / notes |
