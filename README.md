@@ -219,10 +219,13 @@ for per-block verification and `BASELINE.md` for provenance.
 Vulkan masked-V fix vs upstream's sparse FA, the FA test matrix, and qwen4exp's `{n_embd, hc}` norm
 fold — plus the MTP `nextn.hc_head_norm` load-shape crash the merge exposed and validation caught).
 Revalidated end-to-end on gfx1201: `FLASH_ATTN_EXT` 5951/5951, all custom ops pass, plain ==
-`draft-mtp` byte-identical on 27B and qwen4exp, and the delivery is ahead of a stock build at the
-same base on every gate (dense 27B +8-13 %, MoE 35B-A3B +9-17 %, qwen4exp 3.2× prefill / +44 %
-decode, batched verify-width B=8 195 vs 120 t/s).  Full record: [`WORKLOG.md`](WORKLOG.md)
-2026-09-15 (re-base).
+`draft-mtp` byte-identical on 27B and qwen4exp, the full `-n 3000` adaptive-MTP four-axis gate passes
+(acceptance 0.60-0.99, `n3` byte-identical to plain on all four axes), and the delivery is ahead of a
+stock build at the same base on every gate (dense 27B +8-13 %, MoE 35B-A3B +9-17 %, qwen4exp 3.2×
+prefill / +44 % decode, batched verify-width B=8 195 vs 120 t/s).  Also passed on **gfx1151 (Strix
+Halo)**: custom ops + `FLASH_ATTN_EXT` clean, purity holds, prefill +25-82 % with decode flat.
+Full records: [`WORKLOG.md`](WORKLOG.md) 2026-09-15 (re-base) and
+[`benchmarks/2026-09-15-rebase-v17-validation.md`](benchmarks/2026-09-15-rebase-v17-validation.md).
 
 **Previous change (2026-09-15, r5) — build time: a clean backend build was gated by one translation
 unit.**  A fresh ROCm build had grown slow and `fattn-tile.cu` alone took **509 s of a 538 s** `-j16`

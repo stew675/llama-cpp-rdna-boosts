@@ -61,6 +61,20 @@ exit 0. `test-backend-ops`: `FLASH_ATTN_EXT` **5951/5951**, `FLASH_ATTN_QSA`, `G
 at `-sm layer` and on 2-GPU `-sm tensor` (identical `5dd272b4f316`); the 3-GPU `-sm tensor` meta-splitter
 abort (2 KV heads < 3 devices) is the documented pre-existing issue.
 
+**Full `-n 3000` adaptive-MTP four-axis gate (gfx1201, 1× R9700).** Fixed `n3` acceptance 0.60 / 0.81 /
+0.91 / 0.99 on R/P/C/K (all far above the ~0.45 floor); `n3` and adaptive `n12` are both well ahead of
+plain on every axis; delivery `n3` is within 1.4 % of the stock-at-`d1d3c3396` `n3` on every axis (the
+delivery's win is the deeper/adaptive drafts); **`plain == draft-mtp n3` is byte-identical on all four
+axes** at the gate length, with the adaptive `n12` above-7 divergence confined to prose/code as
+documented.  Table + stock reference: [`benchmarks/2026-09-15-rebase-v17-validation.md`](benchmarks/2026-09-15-rebase-v17-validation.md).
+
+**gfx1151 (Strix Halo) pass.** The same patch set built and validated on the `halo` box (applied tree
+`c6896785a`): custom ops pass, `FLASH_ATTN_EXT` 0 failures, 27B Q8_0 `plain == draft-mtp`
+(`2bde6e01c95f`), qwen4exp `plain == draft-mtp` (`07219ff0c119`, acceptance 0.489), SWA Gemma-4-E4B
+output `5dd272b4f316` identical to the gfx1201 build.  Prefill **+25-82 %** vs the stock base (27B Q8_0
+q8_0 KV pp512 471 vs 367, pp512 @ d16k 394 vs 314; 35B-A3B Q4_K_M pp512 **1717 vs 946**), decode flat
+to +1.5 %.  No gfx1151 regression.  Numbers: [`benchmarks/2026-09-15-rebase-v17-validation.md`](benchmarks/2026-09-15-rebase-v17-validation.md).
+
 **Performance vs the stock build at the same fork point** (`llama-bench -r 2`, 3-GPU tensor; stock built
 directly from `d1d3c3396`):
 
