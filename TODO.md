@@ -74,6 +74,21 @@ experiment is **validated but not yet promoted**; Action E is resolved (no deliv
 
 ### 2. Native FA staging for the remaining quantized KV types: `q4_1` / `q5_0` / `q5_1` / `iq4_nl`
 
+- **Status 2026-09-14: IMPLEMENTED BUT BROKEN — do not promote.**  All the plumbing is in place (the four
+  `ggml_cuda_fattn_dequantize_<t>_chunk` helpers, the `FATTN_KV_NATIVE_*` codes, the predicates, the
+  generic `ggml_cuda_fattn_tile_kv_native_type(K,V)`, the MMA + tile dispatch chains, the tile
+  instantiation switch, the `get_alloc_size` TILE case).  It compiles and the **staging path is
+  unaffected** (`GGML_CUDA_FA_KV_NATIVE=0` -> 5951/5951).  But with the arms enabled:
+  `test-backend-ops -o FLASH_ATTN_EXT` = **4703/5951**, every failure at `hsk=72` (`hsk_padded=96`,
+  `nr23=[4,1]`, `nb=32/75`, `mask=0`, pure same-type), and the 4B width probe at `P=64` returns the
+  **same** hash `ad42a04252969383` for all four types — consistent with the staged K/V being all zeros.
+  Since `P=64` is a *prefill* (so the build stages for these types anyway, into the arena) while
+  `GGML_CUDA_FA_KV_NATIVE=0` stages the same types correctly into the node scratch, the first suspect is
+  the launcher's staging branch/predicate for the new types, **not** the chunk dequantisers.
+  **Next step:** one debug build printing, in `launch_fattn`, `K->type`, `need_f16_K`, `kv_native_K`,
+  `use_native_K`, `stage_K`, `ggml_is_contiguously_allocated(K)`, `ggml_nelements(K)` and both
+  `ggml_get_to_fp16_cuda(K->type)` / `ggml_get_to_fp16_nc_cuda(K->type)`.  Diff (WIP, broken):
+  `patches/2026-09-14-item2-native-arms-WIP-BROKEN.diff`; log `~/wip-issue30/results/2026-09-14-item2-native-arms.txt`.
 - **Context (2026-09-14, issue #30 + `wip/issue-30-mtp-decode-regression/`).**  The quantized-KV decode
 depth fall-off was the whole-cache F16 staging the tile kernel runs for a quantized cache.  Block 15's
 `V4` native staging removes it; the 2026-09-14 experiment made `V4` the default for sub-F16 quants and
@@ -92,73 +107,10 @@ dispatches).  **Each helper must reproduce that type's `ggml_get_to_fp16_cuda` c
 unchanged, prefill cost <= ~2 %.
 - **Gotcha.**  Do **not** benchmark `iq4_nl` on a stock/un-amended build — it has no FA enablement there
 and runs host-only/CPU (a >10 min run at 100 % CPU).
-- Record: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §B (audit table + the q4_0/q8_0 fix).
-
-### 20. Issue #30 wider-configuration follow-ups (umbrella)
-
-Dossier: `wip/issue-30-mtp-decode-regression/` (`README.md` action register, `MEASUREMENTS.md`).
-- **Pending promotion:** none — the 2026-09-14 `V4` activation-policy refinement + q4_0 native arm
-  (block 15, r2) and the block-04 prefill fix (r3) are **promoted**.  See the block-04/block-15 amendment
-  sections in `patches/README.md` and `WORKLOG.md` 2026-09-14.
-- **Action E — #28867 head-256 WMMA threshold (resolved 2026-09-14: no delivery regression).**  The
-  reporter's ~20 % is upstream-master-specific: our `Q->ne[1] > 8` guard already puts the whole purity
-  band (`W <= 8`, his repro range) on TILE, and for `n_q = 9..N` the tuned block-04 head-256 WMMA configs
-  are at parity with TILE (recall `n_max 8` 115.10 vs 115.72 t/s, `n_max 15` 147.19 vs 147.80 t/s, TILE
-  +0.4-0.5 % within noise, acceptance bit-identical; batched npl 1/8/9/16/32 neutral).  Adopting the
-  MFMA threshold 64 is a ~0.4 % neutral selection change, not a purity change; recommended only for
-  upstream alignment.  Evidence: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §E.
-- **Action C — adaptive-MTP recurrent-snapshot buffer at high context (load failure FIXED by V4, 2026-09-14).**  The reporter's `--spec-draft-n-max 12 -c 196608 q8_0` load failure was root-caused to the recurrent
-  snapshot set (`n_seq_max x (1 + n_rs_seq)` f32 GDN planes = 7781 MiB at ceiling 12) leaving the draft
-  260 MiB short — and **the missing margin is the ~744 MiB F16 staging scratch the V4 policy now
-  removes**, so the config loads at the default `n_slots=4` and generates (34.76 t/s, acceptance 0.3404);
-  `GGML_CUDA_FA_KV_NATIVE=0` reproduces the failure.  **No further fix is needed for the reported case.**
-  The structural RS reduction (lazy/shared planes, precision, recompute-on-rollback; `--parallel 1` and a
-  memory-aware effective-ceiling fallback as lower-risk levers) remains open only for extra headroom on
-  smaller cards.  **Deeper follow-up (budgets, the L1-L5 levers, and the f32 -> bf16 snapshot opt-in to
-  measure):** `wip/issue-30-mtp-decode-regression/RECURRENT-SNAPSHOT-BUDGET.md` — the maintainer's
-  2026-09-14 request is to measure L5's impact on MTP acceptance before offering it.
-
-- **Action D — deep-prefill regression at depth (root-caused + fix prototyped 2026-09-14).**  Not
-  q8_0-specific (delivery f16 609.5 vs stock 686.9 at pp150k, 1 GPU): the delivery's head-256 `ncols=64`
-  WMMA config was a Strix-Halo half-tile row used for all WMMA calls, and the delivery omitted stock's
-  AMD `switch_ncols2` (ncols2=8 vs 2 for gqa 6).  Prototype fixes both: 1 GPU f16 **703.7 (+2.4 %)**,
-  bf16 675.8 (−1.6 %), 3-GPU tensor **1218.6 (+9.6 %)** vs stock, 4B q4_0 `W=1..8` pure.  **Split-aware
-  `ncols2` is implemented** and **promoted** (block 04, r3): a frontend hint (`ggml_set_fa_tensor_parallel`,
-  set in `llama_context` from `split_mode()==TENSOR && n_cuda_dev>1`) selects generic 8 for tensor split
-  and stock's AMD 2 for a whole card.  Remaining: the V3 (~2.4 % single-card) / bf16 (~1.6 %) residuals;
-  the q8_0 prefill delta is **item 21**.
-  `wip/issue-30-mtp-decode-regression/patches/2026-09-14-prefill-rdna-config-and-ncols2.diff`;
-  analysis `MEASUREMENTS.md` §D.  **Testing lesson: `-sm tensor` masked the single-card regression —
-  screen with the `t = a + b*n` slope fit at pp8192-49152, and always measure 1 GPU too.**
-
-### 21. Q8_0 K/V prefill: recover the V4 native-staging cost
-
-- **Status: FIXED — prototype validated on gfx1201, pending promotion + gfx1151 validation.**  The band
-  split is the fix: **prefill (`n_q > 8`) stages, decode/verify (`n_q <= 8`) stays native**, and the
-  prefill scratch comes from a new per-context, per-stream arena
-  (`ggml_backend_cuda_context::fattn_stage`) instead of the compute-graph reserve (which sizes it for
-  `n_ctx`).  `pp150000` q8_0: 1/2/3-card **691.4 / 1076.9 / 1199.0** (native 661.0/996.0/1111.4;
-  node-staging 690.4/1080.1/1203.6); decode d65k keeps 23.17; reserve at `-c 196608` stays 123.04 MiB
-  and adaptive-MTP ceiling 12 still loads.  Same-seed text staged == native.  Diff:
-  `wip/issue-30-mtp-decode-regression/patches/2026-09-14-todo21-prefill-arena-staging.diff`;
-  record **`MEASUREMENTS.md` §F/§H**.  gfx1151 validated 2026-09-14 (§H): test-backend-ops 5951/5951,
-  width purity PURE for q4_0/q4_1/q8_0/f16, text gates identical -- and it forced the **arch gate**
-  (`prefill_stages = !RDNA3_5`), because gfx1151 native wins prefill at every depth (+0.4 % @16k growing
-  to +1.6 % @65k) with no crossover, while gfx1201 staging wins (+4.5 % @150k).  The band split now
-  refines V4's activation policy; promote as a **block-15 amendment**.
-- **Context.**  The V4 policy (unset = native q8_0/q4_0) gives the **+23 % d65K decode** and the adaptive-MTP
-  high-context load (it removes the ~744 MiB F16 scratch).  But a quantized source cannot use the
-  `cp_async` pipeline, so the native path re-dequantizes each K/V tile: q8_0 prefill at `pp150000` (27B,
-  f16 control) is **−4.2 % (1-card) / −7.8 % (2-card) / ~−8 % (3-card)** off the staging path, versus
-  only ~−1.2 % at pp32K.  Against **stock** the delivery q8_0 is at parity (−1.2 / −0.2 / +2.4 %), while
-  f16 is +2.4 / +6.9 / +9.6 %; the goal is to recover the q8_0 margin too.
-- **Approaches.**  (a) native at decode/verify only (`n_q <= 8`), staging at prefill — recovers prefill
-  but re-materialises the scratch, so it must be paired with scoping the F16 conversion to the prefill
-  graph so the decode-only graph keeps the memory win; (b) pipeline the native staging (double-buffered
-  dequant into smem) to recover cp_async-equivalent throughput; (c) a hoisted/shared prefill conversion.
-- **Gate.**  q8_0 prefill >= stock by the f16 margin, decode +23 % retained, `W=1..8` pure, adaptive-MTP
-  `-c 196608` ceiling 12 still loads.
-- Evidence: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §B (symptom) and §F (fix).
+- Record: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §B (audit table + the q4_0/q8_0 fix) and
+  the WIP status block above.
+- **Note (2026-09-14):** per the maintainer decision recorded in `GREEDY-PURITY.md` §36, this item is a
+  **throughput/memory** goal, not a purity goal — the coarse quants keep a best-effort purity guarantee.
 
 ## Waiting on others (not actionable in this repo)
 
@@ -248,6 +200,29 @@ Dossier: `wip/issue-30-mtp-decode-regression/` (`README.md` action register, `ME
   `archive/work/qwen4exp/LRU_EXPERTS.md`, `PHASE0_ROUTING.md`, `HANDOVER-2026-09-04-tiering.md`.
 
 ## Closed (one-liners; details in the dated docs)
+
+- **Issue #30 wider-configuration umbrella — every action resolved (closed 2026-09-14; block-04 + block-15
+  amendments, r3 + r4).**  Dossier `wip/issue-30-mtp-decode-regression/`.  What it cost: the arm-P
+  reconciliation (the q8_0-KV depth fall-off, fixed by making block 15's V4 native staging the default for
+  sub-F16 quants and adding the missing q4_0 arm); the adaptive-MTP `-c 196608` ceiling-12 load failure
+  (the ~744 MiB F16 scratch the same policy removes); the deep-prefill regression (block 04: the head-256
+  WMMA config was arch-blind and `ncols2` split-blind); the #28867 head-256 threshold (not a delivery
+  regression -- the `Q->ne[1] > 8` guard already keeps the purity band on TILE); and the reporter's r3
+  q4_0 NaN (the tile kernel is instantiated with one `type_KV` for both operands while the launcher chose
+  its native read per tensor -- so a mixed pair staged nothing and read raw q4_0 as F16 -- plus the
+  `get_alloc_size` TILE case that never learned about the q4_0 arm and kept reserving the scratch).
+  Evidence: `MEASUREMENTS.md` sections A-H.
+
+- **Q8_0 K/V prefill recovered (closed 2026-09-14; block-15 amendment, r4).**  The band split: a prefill
+  (`n_q > 8`) stages -- the whole-prefix F16 conversion is amortised over the query rows and the tiles then
+  feed the `cp_async` pipeline -- while decode/verify keeps the native read.  The staging scratch moved out
+  of the compute-graph reserve (which sized it for `n_ctx`, ~800 MiB/GPU at 200k) into a per-context,
+  per-stream arena, so the memory win stays.  It is arch-gated (`prefill_stages = !RDNA3_5`): gfx1201
+  q8_0 pp150k **661.0 -> 691.4** (1 GPU), **996.0 -> 1076.9** (2-card), **1111.4 -> 1199.0** (3-card),
+  while gfx1151 has no crossover and keeps its native prefill (it wins there at every depth: +0.4 % @16k
+  growing to +1.6 % @65k).  Decode d65k stays 23.17, the reserve stays 123 MiB (gfx1201) / 89 MiB
+  (gfx1151), and both arches are 5951/5951 with purity PURE.  Evidence: `MEASUREMENTS.md` sections F/H;
+  diff `patches/2026-09-14-todo21-prefill-arena-staging.diff`.
 
 - **Issue #30 draft-depth policy: the `--spec-draft-n-max` clamp moved from 7 to 15, and the qwen4exp
   QSA decode-arm band now tracks the verify width (closed 2026-09-13, block-01 + block-14 amendments).**

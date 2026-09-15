@@ -1306,16 +1306,23 @@ and at (q4_0, P=256) only **one of four prompts** flips.  The magnitude is a rea
 and **arch/data-specific** (gfx1151 is pure for all four types at P=256).  So §14's own table states what
 *that probe and those prompts* measured, not a general invariant.
 
-**Doctrine (2026-09-14, maintainer decision).**  This is the coarseness of the quantization, not a defect
-to chase:
+**Doctrine (2026-09-14, maintainer decision): tier the guarantee by _coherence_, not by bits.**
 
-* The **kernel-family** guarantee stands: the whole `n_q <= 8` band takes one family (TILE), with no
-  VEC/TILE split.
-* The **bit-identical** guarantee is kept for the precise caches (**f16, bf16, q8_0**) and is *relaxed*
-  for the coarse integer quants (**q4_0, q4_1**, and by extension q5_0/q5_1/iq4_nl): there a greedy
-  decode/verify near-tie may flip.
+* **We guarantee bit-identical width-purity for the quantizations that are fit for long context:**
+  **f16, bf16 and q8_0**.  There the whole `n_q <= 8` band is one hash, and that is a *contract* the
+  delivery tests (`W=1..8` one hash, `plain == draft-mtp`), not merely a measurement.
+* **We make a good-faith effort for the small quants** (q4_0, q4_1, q5_0, q5_1, iq4_nl): their values
+  are bit-identical to the reference conversion (the dequant matches `convert.cu` — which is what the
+  oracle tests actually check), and the *kernel family* is uniform across the band, but a greedy
+  decode/verify near-tie may still flip.  We do **not** guarantee bit-identity there.
+* **Why**: at those quantizations the K/V cache is already the dominant long-context coherence loss, so
+  the discrepancy a near-tie flip makes reproducible is the same order as the error the quantization
+  itself introduces.  Guaranteeing bit-identity there buys a promise about a regime the model should not
+  be run in, at a real and *recurring* engineering cost — every new single-token-tuned fusion recreates a
+  band, and the retrofits measured here each cost 0.5–9 % on the axis they touched (or had to disable the
+  fusion outright).  A user who needs long-context coherence — and with it the strongest purity — uses
+  f16/bf16/q8_0 K/V; the small quants are a memory valve, documented as best-effort.
 * Consequence, the same one §19 already states for `n_max > 7`: once the cache is coarse, `plain` and
-  `draft-mtp` may disagree on a near-tie.  A user who needs the strongest guarantee uses f16/bf16/q8_0
-  K/V; the coarse caches are a memory trade with a documented purity relaxation.
+  `draft-mtp` may disagree on a near-tie.
 
 Evidence: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §G.
