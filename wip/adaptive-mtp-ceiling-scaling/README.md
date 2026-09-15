@@ -183,14 +183,20 @@ equilibrium *above* 10 toward 12, so the lever is controller **stability**, not 
 
 ## Next steps (handover)
 
-1. **Tune the bucketed controller** (`bucketed-port/`, the maintainer's preferred approach): the
-   win is holding code near depth 10 (pinned 99.5 vs an adaptive ~92) while recall rides at 12.
-   The table's `climb_threshold`/`drop_pressure` path was tried and does not fix the cell
-   (the `+1` climb and the partial drop-relief both leave C(n12) < C(n7)); a depth-weighted credit
-   helps R/P/K but overshoots code to 12.  Focus on hysteresis/stability and a depth-dependent
-   climb budget, not on the raw climb rate.  Validate against **all five** constraints
-   (R ≤ 1.03×, P ≥, C ≥ 1.10× **and C(n12) ≥ C(n7)**, K → 12) on both the reporter's cell and the
-   delivery's 1-card reference.
+1. **SOLVED 2026-09-15 — the tuned bucketed controller** (`bucketed-port/tuned-port.patch`).
+   The bucketed economics were already right (the credit's zero-crossing lands on the throughput
+   optimum of every axis), so the fix was three tuning changes for the delivery's higher acceptance:
+   a **cold start** at `cap - 3` (the expensive direction is the *climb*; from the floor the
+   controller burned ~106 of 477 rounds climbing 3→8 = the entire headroom), a **depth-growing climb
+   budget** (`20 + 6*(depth-1)`, which stops a lucky streak's integral windup from cascading 9→12),
+   and a **steeper drop pressure** (`max(60, 10*depth)`, which damps the slow 6↔12 limit cycle).
+   Result on the reporter's cell: code cap-12 **96.0** vs cap-7 **95.8** (was 92.8 vs 96.3) with
+   4 depth changes instead of 40; R +5.0 %, P +11.2 %, recall +58.7 % riding at 12; the new
+   phase-switching prompt reads 64.0 against its 64.3 pinned optimum.  On the 1-card reference code
+   cap-12 is **84.7** vs cap-7 61.4 (+37.9 %).  Purity: adaptive cap 7 ≡ cap 12 ≡ fixed `draft-mtp`
+   (byte-identical text).  Remaining: the ~2 % adaptive-vs-pinned per-round gap, `cap - 3` re-tuning
+   per shape, and re-deriving `tests/test-speculative-adaptive.cpp`.  See
+   `bucketed-port/README.md` for the full tables and the mechanism.
 2. Root-cause the Q8_0 wide-verify cost before changing the controller: profile the verify batch
    (`n_q > 8`, Q8_0 weights, Q8_0/f16 KV) with `test-backend-ops perf` at the verify widths and a
    `llama-batched-bench`/kernel-family A/B.  Is it the FA kernel, the Q8_0 `MUL_MAT`, or the

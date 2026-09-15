@@ -23,6 +23,7 @@ numbers unreproducible. Every prompt here is a committed file with a recorded si
 | `reasoning.txt` | 1689 | 385 | `242f5e6f2ba2b925cf218fc02bd69ac00b815d2e09f1897f7c037ba1f621bf4b` | reasoning workload (the **R** axis of the adaptive-MTP sweep): a constrained scheduling puzzle that induces a step-by-step derivation. |
 | `code-python.txt` | 2025 | 533 | `53da7f2387e36baf6300b40262f1e17550fc96f2fd32a9da08ee453bc35f9b65` | code-generation workload (the **C** axis): a fixed set of Python implementation tasks. Highly predictable output, so acceptance is higher than prose. |
 | `recall.txt` | 2001 | 551 | `4e11ce3c7369cee37932f545215d72a2750452405a7307060d63f119af6897cb` | verbatim-recall workload (the **K** axis): a distinctive passage to reproduce character for character. The highest-acceptance workload, and the one where the adaptive controller drafts deepest. |
+| `code-reasoning-mixed.txt` | 1226 | 296 | `97a4caa79355e12f10209e2545587dcc4c6a19087285c91679e1df5a5813d18f` | **phase-switching** probe (added 2026-09-15): ten tasks, each asking for two or three paragraphs of design reasoning *then* a short snippet, so the generated stream alternates code ↔ reasoning and the adaptive controller must drop back to a low depth after a productive code phase. The workload a real coding assistant produces, and the one a slow-dropping controller loses on. |
 
 ¹ Token count from `llama-tokenize` on the Qwen3.8-27B tokenizer (a different tokenizer will differ; the
 **byte size and sha256** are the stable identity, not the token count).
@@ -39,6 +40,13 @@ The four prompts above are the four axes the adaptive-MTP gate uses: **R** (reas
 **C** (code) and **K** (verbatim recall). Run all four when judging an adaptive-MTP change, since the
 adaptive controller's behaviour (and therefore the throughput) is a function of the workload's
 acceptance rate. Recorded results: `benchmarks/2026-09-13-adaptive-mtp-4-axis.md`.
+
+`code-reasoning-mixed.txt` (2026-09-15) is a fifth, orthogonal probe: it is the **phase-switching**
+gate. Its throughput is *maximal* at the floor (`--spec-type draft-mtp-adaptive
+--spec-draft-n-min-adaptive 3 --spec-draft-n-max 3` = 64.3 t/s on the 2-card Q8_0 cell, falling
+monotonically to 50.0 at depth 12), so it is the prompt that punishes a controller which is slow to
+drop after a code phase. Judge an adaptive change on it in addition to the four axes above; recorded
+results are in `wip/adaptive-mtp-ceiling-scaling/bucketed-port/README.md`.
 
 ## Usage
 

@@ -76,6 +76,14 @@ confirmed loss is exactly **Q8_0 × tensor split**.
 3. **C** (code) ≥ 1.10 × fixed MTP-3 **and C(n12) ≥ C(n7)** (ideally a little better).
 4. **K** (recall) climbs to depth 12 quickly.
 
+**RESULT (2026-09-15): the tuned bucketed controller meets all five** — see
+`bucketed-port/tuned-port.patch` + its README.  Code cap-12 **96.0** vs cap-7 **95.8** on the
+reporter's cell (was 92.8 vs 96.3), R +5.0 %, P +11.2 %, recall +58.7 % riding at depth 12, and the
+phase-switching prompt 64.0 vs its 64.3 pinned optimum.  The three tuning changes are a **cold start**
+at `cap - 3`, a **depth-growing climb budget** `20 + 6*(depth-1)`, and a **steeper drop pressure**
+`max(60, 10*depth)`.  What remains is the ~2 % adaptive-vs-pinned per-round gap, per-shape re-tuning
+of `cap - 3`, and re-deriving `tests/test-speculative-adaptive.cpp` for the new defaults.
+
 On Q8_0 × 2-card tensor all pass except **C(n12) < C(n7)** (n7 95.0, table n12 91.3, bucketed
 n12 92.7).  Pinned depth says the code optimum is **10** (99.5 t/s; 7 → 97.0, 12 → 94.5), so the fix
 is not a blanket ceiling — it is a controller that holds ~10 on code and rides 12 on recall.  Judge
@@ -149,7 +157,14 @@ Before proposing a change, run:
   `bucketed-port/port.patch` (apply in `~/llama-cpp-rebase`); measurements in its README.
 * **Pinned depth** (`--spec-draft-n-min-adaptive D --spec-draft-n-max D`) is the depth-cost oracle:
   code 7 → 97.0, **10 → 99.5**, 11 → 98.0, 12 → 94.5 t/s.  Every adaptive config is *below* pinned at
-  its own mean depth (ramp + wander).
+  its own mean depth (ramp + wander) — but the residual is per-round wall time, **not** the depth
+  changes: measured transition overhead is only **+1.0 ms** each.
+* The bucketed **credit's zero-crossing lands on the throughput optimum of every axis** (code 9,
+  reasoning/prose/mixed at the floor, recall at the ceiling), so the credit function needs no change;
+  the tuning is entirely in the start depth and the two thresholds.
+* Three orthogonal probes are needed, not two: **phase switching** (`prompts/code-reasoning-mixed.txt`)
+  is *maximal at the floor* (64.3 → 50.0 at depth 12), so a controller that is slow to drop after a
+  code phase loses there even when it wins on pure code.
 * The table controller parks at 11–12 because `n_drop` is **zeroed on every full accept** (code's
   full-accept rate at 11–12 is 0.21–0.28).  Partial drop-relief and the `+1` climb were both tried
   and do not fix the cell; a depth-weighted credit helps R/P/K but overshoots code to 12.

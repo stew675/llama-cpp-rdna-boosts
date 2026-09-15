@@ -1,0 +1,254 @@
+diff --git a/common/speculative-adaptive.h b/common/speculative-adaptive.h
+index ae18a1265..745d51b78 100644
+--- a/common/speculative-adaptive.h
++++ b/common/speculative-adaptive.h
+@@ -1,37 +1,79 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <cstdlib>
+ 
+ // Adaptive draft depth controller for MTP speculative decoding (draft-mtp-adaptive).
+ //
+-// Hysteresis state machine: the depth climbs one step after N consecutive
+-// full-accept verifies and drops one step when accumulated miss pressure
+-// (sum of n_draft - n_accepted per round) reaches a depth-scaled budget.
+-// The depth stays within [floor, cap]; at the floor no pressure accumulates.
+-// See climb_threshold / drop_pressure for the per-depth constants.
++// Single-bucket state machine. Every verification result moves a bucket B by
++// (n_accepted - depth), except that a full accept (n_accepted >= depth) is
++// flipped to add max(1, n_accepted - 1) instead: a deeper or longer accept is
++// worth more, so climbing accelerates with depth, and a strong run by another
++// speculator (which can accept far more than the current depth in one round)
++// climbs the depth one step per round while it lasts. Any shortfall drains
++// depth - n_accepted, i.e. a miss of k tokens subtracts k. There is no special
++// case for truncated drafts: a p_min-truncated draft is just a miss of the
++// tokens it came up short, which keeps the controller honest about the depth
++// it actually holds.
++//
++// B starts at the drop pressure D = max(20, 4*depth) on every depth change.
++// When B reaches the cap T = D + 20 the depth climbs one step; when B falls
++// to 0 the depth drops one step. The surplus above the cap (bounded at the
++// depth, so at most one step per update) carries into the new depth's bucket,
++// and a deficit below zero carries down the same way, instead of being
++// discarded. The climb budget is a flat 20, so from the reset point a climb
++// costs ceil(20 / max(1, depth - 1)) full accepts: slow off the floor (20
++// full accepts at depth 1-2), moderate in the middle (10 at depth 3, 5 at
++// depth 5), quicker at depth (3 at depth 8+, 2 at 11+). The drop pressure is
++// flat 20 up to depth 5 and then grows 4 per step (32 at depth 8, 40 at 10,
++// 48 at 12), so a total miss drains depth and a drop costs
++// max(ceil(20/depth), 4) misses: shallow depths fall slowly, deep depths
++// fall in ~4 misses regardless of how deep they are. That keeps
++// prose/reasoning pinned at the floor, lets code climb only while it earns
++// it, and lets verbatim recall ride on to the ceiling. At the floor B clamps
++// at 0 instead of dropping the depth; at the ceiling it clamps at the cap
++// instead of growing unbounded.
+ struct common_speculative_adaptive {
+-    int n_cur   = 0; // current adaptive draft depth N
+-    int n_climb = 0; // consecutive verifies that accepted every drafted token
+-    int n_drop  = 0; // accumulated drop pressure: sum of (n_draft - n_accepted)
+-
+-    // consecutive full accepts needed to climb one step from depth N; low at the
+-    // floor and at depth, high in the middle where acceptance is marginal
+-    static int climb_threshold(int depth) {
+-        switch (depth) {
+-            case 1: return 2;
+-            case 2: return 4;
+-            case 3: return 10; // hardened 3->4 barrier: keeps prose/reasoning pinned
+-            case 4: return 6;
+-            case 5: return 3;
+-            case 6: return 2;
+-            default: return 2; // depth >= 7
+-        }
++    int n_cur    = 0;  // current adaptive draft depth N
++    int n_bucket = 0;  // accumulated bucket: net accepted surplus over the depth
++    double n_m   = 0.0; // proportional mode: EWMA drift estimate (tokens/round)
++    int n_cool   = 0;  // proportional mode: rounds before the next depth change
++
++    // WIP sweep knobs (env-overridable so a parameter sweep needs no rebuild)
++    static int knobs(const char * name, int def) {
++        const char * s = std::getenv(name);
++        return s ? std::atoi(s) : def;
++    }
++
++    // accumulated (n_cur - n_accepted) needed to drop one step from depth N;
++    // flat 20 at the floor and mid depths, then growing 4 per step so a deep
++    // depth still falls in ~4 total misses instead of collapsing instantly
++    int drop_pressure(void) const {
++        return std::max(knobs("SPC_DROP_A", 60), knobs("SPC_DROP_B", 10) * n_cur);
++    }
++
++    // climb budget: 20 everywhere by default; SPC_CLIMB3/SPC_CLIMB4 override the
++    // floor barrier (depth 3) and the step above it
++    int climb_budget(void) const {
++        int base;
++        if (n_cur <= 3)      { base = knobs("SPC_CLIMB3", knobs("SPC_CLIMB", 20)); }
++        else if (n_cur == 4) { base = knobs("SPC_CLIMB4", knobs("SPC_CLIMB", 20)); }
++        else                 { base = knobs("SPC_CLIMB", 20); }
++        return base + knobs("SPC_CLIMB_GROW", 6) * (n_cur - 1);
+     }
+ 
+-    // accumulated (n_draft - n_accepted) needed to drop one step from depth N;
+-    // scaled by depth, with a floor so shallow depths do not collapse too fast
+-    static int drop_pressure(int depth) {
+-        return std::max(depth * 5, 20);
++    // max surplus carried into the new depth's bucket on a climb: n_cur (the
++    // stock behaviour, lets a strong run cascade) or a small constant to stop
++    // a lucky streak from cascading up several depths
++    int climb_carry(void) const {
++        const char * s = std::getenv("SPC_CARRY");
++        return s ? std::atoi(s) : n_cur;
++    }
++
++    // bucket cap: drop pressure plus the climb budget, so climbing from the
++    // reset point costs 20 net full-accept-equivalents
++    int bucket_cap(void) const {
++        return drop_pressure() + climb_budget();
+     }
+ 
+     // reset to the floor max(1, n_min_adaptive), bounded by the ceiling n_max;
+@@ -40,40 +82,89 @@ struct common_speculative_adaptive {
+         const int cap   = std::max(1, n_max);
+         const int floor = std::max(1, n_min_adaptive);
+ 
+-        n_cur   = std::min(floor, cap);
+-        n_climb = 0;
+-        n_drop  = 0;
++        // cold start: the floor by default; a higher start lets the drift pull
++        // the depth down (cheap, even for a reasoning workload) instead of the
++        // controller having to earn its way up one step at a time
++        const int start = std::min(cap, std::max(floor, knobs("SPC_START", std::max(floor, cap - 3))));
++        n_cur    = start;
++        n_bucket = drop_pressure();
++        n_m      = 0.0;
++        n_cool   = 0;
+     }
+ 
+-    // feed one verification result: n_draft is the number of tokens this
+-    // implementation drafted, n_accepted the number the target accepted
+-    void update(int n_draft, int n_accepted, int n_max, int n_min_adaptive) {
+-        if (n_draft <= 0) {
+-            return;
+-        }
+-
++    // feed one verification result: n_accepted is the number of tokens the
++    // target accepted this round. When another speculator (ngram-mod) produced
++    // the accepted draft, callers pass its accepted count (which can exceed
++    // the current depth), so strong runs by the other speculator are credited
++    // like full accepts
++    void update(int n_accepted, int n_max, int n_min_adaptive) {
+         const int cap   = std::max(1, n_max);
+         const int floor = std::max(1, n_min_adaptive);
+ 
+-        if (n_accepted == n_draft) {
+-            n_drop = 0;
++        int delta;
+ 
+-            // full acceptance: reset the drop pressure, accumulate the climb streak
+-            if (n_cur < cap && ++n_climb >= climb_threshold(n_cur)) {
++        if (n_accepted >= n_cur) {
++            delta = std::max(1, n_accepted - 1);
++        } else {
++            delta = n_accepted - n_cur;
++        }
++
++        if (knobs("SPC_MODE", 0) != 0) {
++            // proportional mode: track the drift as an EWMA of delta and move the
++            // depth whenever its magnitude says the depth is wrong. The drift
++            // carries the strength signal a threshold cannot: code sits at a
++            // weak negative drift just above its optimum (no drop), while a
++            // reasoning interlude at the same depth is strongly negative (drop
++            // every few rounds), so one controller serves both a code run and a
++            // phase switch, and the integral windup that made the bucket
++            // cascade 9 -> 12 on a lucky streak is gone.
++            n_m += ((double) delta - n_m) / (double) knobs("SPC_ALPHA", 8);
++
++            if (n_cool > 0) {
++                n_cool--;
++                return;
++            }
++
++            const double up = knobs("SPC_UP", 8)  / 10.0;
++            const double dn = knobs("SPC_DN", 20) / 10.0;
++
++            if (n_m >= up && n_cur < cap) {
+                 n_cur++;
+-                n_climb = 0;
++                n_cool = knobs("SPC_DWELL", 3);
++            } else if (n_m <= -dn && n_cur > floor) {
++                n_cur--;
++                n_cool = knobs("SPC_DWELL", 3);
+             }
+-        } else {
+-            n_climb = 0;
++            return;
++        }
+ 
+-            // any miss adds (n_draft - n_accepted) to the drop pressure; drop one
+-            // step when the accumulated pressure reaches the depth-scaled budget
++        n_bucket += delta;
++
++        // At the bucket boundaries adjust the current depth if possible. Otherwise
++        // both n_cur and n_bucket always get clamped to their minimum/maximum values.
++        // The surplus above the cap (clamped at the depth, so at most one climb per
++        // update) carries into the new depth's bucket, and a deficit below zero
++        // carries down the same way, instead of being discarded
++        if (n_bucket >= bucket_cap()) {
++            // At or above the high water mark
++            if (n_cur < cap) {
++                n_bucket = std::min(n_bucket, bucket_cap() + climb_carry());
++                n_bucket -= bucket_cap();
++                n_cur++;
++                n_bucket += drop_pressure();
++            } else {
++                n_cur = cap;
++                n_bucket = bucket_cap();
++            }
++        } else if (n_bucket <= 0) {
++            // At or below low water mark
+             if (n_cur > floor) {
+-                n_drop += n_draft - n_accepted;
+-                if (n_drop >= drop_pressure(n_cur)) {
+-                    n_cur--;
+-                    n_drop = 0;
+-                }
++                n_bucket -= drop_pressure();
++                n_cur--;
++                n_bucket += bucket_cap();
++            } else {
++                n_cur = floor;
++                n_bucket = 0;
+             }
+         }
+     }
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 09fc5a056..0e73afb7b 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1815,18 +1815,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     }
+ 
+     // feed one acceptance result to the adaptive controller; n_last[seq_id] is the
+-    // draft length of this round and is reset so a replayed round is not counted
++    // draft length of this round and is reset so a replayed round is not counted.
++    // The bucketed controller takes the accepted count directly and compares it to
++    // the depth it currently holds (a truncated draft that came up short is a miss).
+     void adaptive_feedback(llama_seq_id seq_id, uint16_t n_accepted) {
+         if (!adaptive || n_last[seq_id] <= 0) {
+             return;
+         }
+ 
+         const int depth_before = adaptive_ctrl[seq_id].n_cur;
+-        adaptive_ctrl[seq_id].update(n_last[seq_id], n_accepted, params.n_max, params.n_min_adaptive);
++        adaptive_ctrl[seq_id].update(n_accepted, params.n_max, params.n_min_adaptive);
+         if (adaptive_ctrl[seq_id].n_cur != depth_before) {
+-            SPC_DBG("adaptive draft depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d)\n",
++            SPC_TRC("adaptive draft depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d)\n",
+                     (int) seq_id, depth_before, adaptive_ctrl[seq_id].n_cur, n_last[seq_id], n_accepted);
+         }
++        SPC_TRC("adaptive round seq %d: depth=%d bucket=%d n_accepted=%d n_draft=%d\n",
++                (int) seq_id, adaptive_ctrl[seq_id].n_cur, adaptive_ctrl[seq_id].n_bucket,
++                n_accepted, n_last[seq_id]);
+ 
+         n_last[seq_id] = 0;
+     }
