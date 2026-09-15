@@ -1,6 +1,12 @@
 # rdna-boosts patch set (delivery)
 
 16 patches (block 00 structural fixes + blocks 01-15) against llama.cpp master `790cf51aa`
+**Current release: `v16-790cf51aa-r4`** (tip `b19c70b34`, tree `7fab975d9`).  r2 = block 15's V4 native
+staging default for the sub-F16 quants + the q4_0 arm; r3 = block 04's arch- and split-aware prefill
+tuning; **r4 = the 2026-09-15 block-15 amendment**: the mixed-K/V kernel contract (the reporter's q4_0
+NaN), the `get_alloc_size` q4_0 scratch fix, the prefill band split + staging arena + the RDNA3_5 arch
+gate, and native arms for `q4_1`/`q5_0`/`q5_1`/`iq4_nl` — see the 2026-09-15 block-15 amendment section
+below.
 ("chat : improve parsing of complex types in qwen3-coder (#28742)", re-based **2026-09-13** from
 `9113cc188`; previously re-based 2026-09-08 from `050dde50c` ("hexagon: add RELU and LEAKY_RELU ops (#28585)"), itself
 re-based 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
@@ -677,6 +683,68 @@ at the default 4 slots; `GGML_CUDA_FA_KV_NATIVE=0` reproduces the OOM.
 `scripts/validate-set.sh` passes (strict 16/16 `git am` on a fresh `790cf51aa` tarball, applied tree ==
 `58317e0d…`).  Release `v16-790cf51aa-r2`.  Record: `WORKLOG.md` 2026-09-14, `GREEDY-PURITY.md` §34,
 `wip/issue-30-mtp-decode-regression/` (and `RECURRENT-SNAPSHOT-BUDGET.md` for the remaining levers).
+
+## 2026-09-15 block-15 amendment: the r4 candidate — the reporter's q4_0 NaN, the prefill band split, and the last four native KV arms
+
+**Release:** `v16-790cf51aa-r4`, tip `b19c70b341f9ed439bcda2a636fe6e5fa4fa634b`, tree
+`7fab975d9518b29aa7d890c1163f13a6c393c5df`.  `validate-set.sh` passes strict 16/16 (applied tree ==
+`release.json.tree`).
+
+Three changes, all on top of the 2026-09-14 V4 default-on work:
+
+**1. The mixed-K/V kernel contract (the reporter's 4 NaN failures in `test-backend-ops -o
+FLASH_ATTN_EXT`).**  The tile kernel is instantiated with **one** `type_KV` covering both operands and
+builds its native operand descriptors from that compile-time type; it *ignores* the launcher's runtime
+native-type arguments.  `launch_fattn` meanwhile chose its native read **per tensor**, so a mixed pair
+(K=q4_0/V=f16, K=q4_0/V=q8_0, K=f16/V=q4_0, K=q8_0/V=q4_0) fell back to the `F16` tile **with the native
+operand's staging skipped**, and the kernel read raw q4_0 bytes as F16 -> NaN.  `launch_fattn` now takes
+the kernel's native type explicitly (`kv_native_kernel`; the tile passes its `type_KV`, the vec passes
+`FATTN_KV_NATIVE_NONE`, the MMA keeps `FATTN_KV_NATIVE_PER_OPERAND`).  llama.cpp hard-rejects mixed K/V
+caches, so only the op test could reach it — which is exactly why the op test is the oracle.
+
+**2. The `get_alloc_size` q4_0 gap (the second bug the same report exposed).**
+`ggml_cuda_flash_attn_ext_get_alloc_size`'s TILE case was updated for the q8_0 arm but never for q4_0, so
+a q4_0 cache computed "needs an F16 staging copy", allocated it, and the launcher — which by then knew
+better — never used it: **the q4_0 memory win had never actually been delivered**.  At `-c 196608` the
+compute buffer was 849.04 MiB and is now **123.04 MiB**, matching q8_0.  The case now mirrors
+`ggml_cuda_flash_attn_ext_tile_case_type` exactly, so the two cannot drift again.
+
+**3. The prefill band split + the staging arena + the RDNA3_5 arch gate (TODO item 21).**  A quantized
+cache's native read dequantizes each tile (a cost that grows with `n_q`), while the F16 staging pass is
+paid once per ubatch — so the arm's decode win was a prefill loss at depth.  The band split keeps the
+native read for decode/verify (`n_q <= 8`) and stages at prefill.  The staging scratch deliberately does
+**not** come from the compute-graph reserve: the reserve graph's `K->ne[1]` is `n_ctx`, so the scratch was
+sized for the whole context (~726 MiB at a 200k context) even though the real request tracks the prefix
+— that is the memory the adaptive-MTP `--spec-draft-n-max 12 -c 196608` load failure was short of.  It
+now comes from a new per-context, per-stream arena (`ggml_backend_cuda_context::fattn_stage` +
+`fattn_stage_get()`), which is safe precisely because a multi-token graph is never CUDA-graph captured
+(the prefill skip in `ggml_backend_cuda_graph_compute`), while the captured decode graph is native and
+needs no scratch at all.  Bounded by `GGML_CUDA_FA_STAGE_MAX_MB` (MiB per operand, default 512, 0 =
+unbounded).  **Arch-gated**: `prefill_stages = !GGML_CUDA_CC_IS_RDNA3_5(cc)` — on gfx1151 the native
+prefill wins at every measured depth, by a margin that grows with it, so RDNA3_5 keeps the native read at
+prefill too.  Results: gfx1201 q8_0 `pp150000` **691.4** (1 GPU) / **1076.9** (2) / **1199.0** (3) vs
+661.0 / 996.0 / 1111.4 native and 690.4 / 1080.1 / 1203.6 node-staged; q4_0 **694.5**; decode and the
+123 MiB reserve unchanged.
+
+**4. Native arms for the last four quantized K/V types (`q4_1`/`q5_0`/`q5_1`/`iq4_nl`, TODO item 2).**
+`ggml_cuda_fattn_dequantize_{q4_1,q5_0,q5_1,iq4_nl}_chunk` beside the q8_0/q4_0 ones (FP32 arithmetic +
+one F16 rounding, arithmetic-identical to `convert.cu`), wired through the same predicates, the shared
+`ggml_cuda_fattn_tile_kv_native_type`, the tile/MMA loaders and the `get_alloc_size` TILE case.  `tg64` @
+d32768, staged -> default: gfx1201 q4_1 23.14 -> **25.44**, q5_0 22.16 -> **24.56**, q5_1 22.23 ->
+**25.00**, iq4_nl 22.92 -> **24.94** (+9-13 %) with prefill unchanged; gfx1151 (9B) 19.24 -> **23.65**,
+18.63 -> **23.48**, 18.58 -> **23.54**, 19.10 -> **23.31** (**+22-27 %**) for a 0.6-1.1 % prefill cost.
+Two bugs the op test caught on the way: the tile loader chose its native branch with a hand-written
+`type_KV == Q8_0 || Q4_0` test (the new instantiations then took the F16 branch and read a staging buffer
+`need_f16_K == false` had left unwritten — the `hsk=72` NaNs), and the q5_0/q5_1 chunk helpers took the
+**low nibble in both halves** (the `lo ? ... : b0 >> 4` test was missing).
+
+**Gates (all green).**  `test-backend-ops -o FLASH_ATTN_EXT` **5951/5951 on both gfx1201 and gfx1151**;
+same-seed greedy text `native == staging` **identical for all eight KV types on both arches**; width
+purity `W=1..8` one logits hash per type — all eight types PURE on gfx1151, and on gfx1201 pure except
+the documented pre-existing q4_0 logits-level band edges (`GREEDY-PURITY.md` §36, whose guarantee is now
+stated at the text/acceptance level, with the full per-quant grid).  Evidence:
+`../wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §F-G-H (TODO 21, the q4_0 fixes, the arch gate)
+and §I (item 2).
 
 ## 2026-09-12 block-15 promotion: the attention-memory campaign is delivered
 

@@ -1286,35 +1286,48 @@ Results and the full matrix: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md
 
 ## 36. §14's `W=1..8` purity is a *measured* claim, not a guarantee — relax it for the coarse quants (2026-09-14, issue #30)
 
-**Finding.**  §14 deleted the VEC/TILE family split for a quantized K/V, and that part holds — the whole
-`n_q <= 8` band is TILE.  But the tile kernel's arithmetic is still not *identical* for `n_q = 1` and
-`n_q >= 2`: the `n_q = 1` launch still runs its whole `cols_per_block` (the phantom columns), so a
-hairline difference remains.  It only becomes visible as a **greedy near-tie flip**, i.e. when the cache
-quantization is coarse enough to land a value near a tie.  Measured on the 4B (gfx1201; `P` = prefill
-length, `W` = decode batch width, one hash per `W=1..8`):
+**Finding.**  §14 deleted the VEC/TILE family split for a quantized K/V, and that part holds — on AMD the
+chooser's fallback returns TILE unconditionally, so the whole `n_q <= 8` band is TILE.  But the tile
+kernel's arithmetic is still not *identical* for `n_q = 1` and `n_q >= 2`.  It only becomes visible as a
+**logits-level near-tie flip**, i.e. when the values land near a tie.  Measured on the 4B (gfx1201;
+`P` = prefill length, `W` = decode batch width, one logits hash per `W=1..8`, prose prompt; 2026-09-15,
+after the item-2 arms):
 
 | K/V | P=192 | P=200 | P=208 | P=224 | P=256 |
 |---|---|---|---|---|---|
 | f16 | pure | pure | pure | pure | pure |
+| bf16 | pure | **edge** | pure | pure | pure |
 | q8_0 | pure | pure | pure | pure | pure |
-| q4_1 | pure | **flip** | pure | pure | pure |
-| q4_0 | pure | pure | pure | **flip** | **flip** |
+| q4_0 | pure | pure | pure | **edge** | **edge** |
+| q4_1 | pure | **edge** | pure | pure | pure |
+| q5_0 | pure | pure | pure | pure | pure |
+| q5_1 | pure | pure | pure | pure | pure |
+| iq4_nl | pure | pure | pure | pure | pure |
 
-and at (q4_0, P=256) only **one of four prompts** flips.  The magnitude is a real 0.209 logit difference
-(argmax unchanged in every observed case).  It is **pre-existing** (it reproduces with
-`GGML_CUDA_FA_KV_NATIVE=0`, i.e. the pure F16 staging path, and with the prefill-staging split disabled)
-and **arch/data-specific** (gfx1151 is pure for all four types at P=256).  So §14's own table states what
-*that probe and those prompts* measured, not a general invariant.
+A **"edge"** is a genuine logits-level band edge, not a token-level one.  Measured at (P=200, `W=1` vs
+`W=4`, 4B, gfx1201): bf16 -> `argmax 9146` in both, top-1 **23.6626 vs 23.6770** (delta 0.014), top-2
+margin **2.24 vs 2.32**; q4_1 -> `argmax 9146` in both, delta 0.064, margin 2.73 vs 2.64.  So the greedy
+token is unchanged and the top-2 margin dwarfs the delta — it is a *hash* difference, not a decoding
+difference.  It is **pre-existing and independent of the native arms**: reproduced byte-identically with
+`GGML_CUDA_FA_KV_NATIVE=0` (the pure F16 staging path) and unchanged by the prefill-staging split.  The
+four small quants are measured **pure at all five P** here — arming them (item 2) moved their `W=1` path
+from the F16 tile to the native tile, so their pre-2026-09-15 entries (a q4_1 edge at P=200) are
+superseded, not contradicted.
 
-**Doctrine (2026-09-14, maintainer decision): tier the guarantee by _coherence_, not by bits.**
+**Doctrine (2026-09-14, maintainer decision; sharpened 2026-09-15 by the table above).**  Tier by
+*coherence*, not by bits, and be explicit about *which* level the guarantee is at:
 
-* **We guarantee bit-identical width-purity for the quantizations that are fit for long context:**
-  **f16, bf16 and q8_0**.  There the whole `n_q <= 8` band is one hash, and that is a *contract* the
-  delivery tests (`W=1..8` one hash, `plain == draft-mtp`), not merely a measurement.
-* **We make a good-faith effort for the small quants** (q4_0, q4_1, q5_0, q5_1, iq4_nl): their values
-  are bit-identical to the reference conversion (the dequant matches `convert.cu` — which is what the
-  oracle tests actually check), and the *kernel family* is uniform across the band, but a greedy
-  decode/verify near-tie may still flip.  We do **not** guarantee bit-identity there.
+* **The contract the delivery actually guarantees is a text/acceptance-level one**: for **f16, bf16 and
+  q8_0** the greedy text is bit-identical across the whole decode/verify band (`plain == draft-mtp` for
+  `n_max <= 7`, MTP acceptance unchanged), and that is *tested*, not merely measured.
+* **Logits-level band purity is a measurement, and it is stated as one.**  For f16/bf16/q8_0 it held at
+  every (prompt, P) tested **except bf16 at P=200 on the 4B**, which is recorded above — with the argmax
+  unchanged.  A new single-token-tuned kernel can add another such edge anywhere, so the delivery
+  re-measures this table on the prompt/P grid rather than promising the grid cannot move.
+* **For the small quants (q4_0, q4_1, q5_0, q5_1, iq4_nl) we make a good-faith effort**: their values are
+  bit-identical to the reference conversion (the dequant matches `convert.cu`, which is what the op-test
+  oracle checks) and the kernel family is uniform across the band, but we do **not** promise logits-level
+  purity; a near-tie may flip, and the flip stays argmax-stable as above.
 * **Why**: at those quantizations the K/V cache is already the dominant long-context coherence loss, so
   the discrepancy a near-tie flip makes reproducible is the same order as the error the quantization
   itself introduces.  Guaranteeing bit-identity there buys a promise about a regime the model should not
@@ -1325,4 +1338,7 @@ and **arch/data-specific** (gfx1151 is pure for all four types at P=256).  So §
 * Consequence, the same one §19 already states for `n_max > 7`: once the cache is coarse, `plain` and
   `draft-mtp` may disagree on a near-tie.
 
-Evidence: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §G.
+Evidence: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §G; the 2026-09-15 per-quant grid and the
+item-2 arms are §I (`results/2026-09-15-purity-native-arms-{a,b,c,d}.txt` -
+gfx1201, `results/2026-09-15-item2-purity-halo.txt` - gfx1151, where **all eight types are pure at
+P=256**).

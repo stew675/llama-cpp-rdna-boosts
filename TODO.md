@@ -74,43 +74,34 @@ experiment is **validated but not yet promoted**; Action E is resolved (no deliv
 
 ### 2. Native FA staging for the remaining quantized KV types: `q4_1` / `q5_0` / `q5_1` / `iq4_nl`
 
-- **Status 2026-09-14: IMPLEMENTED BUT BROKEN — do not promote.**  All the plumbing is in place (the four
-  `ggml_cuda_fattn_dequantize_<t>_chunk` helpers, the `FATTN_KV_NATIVE_*` codes, the predicates, the
-  generic `ggml_cuda_fattn_tile_kv_native_type(K,V)`, the MMA + tile dispatch chains, the tile
-  instantiation switch, the `get_alloc_size` TILE case).  It compiles and the **staging path is
-  unaffected** (`GGML_CUDA_FA_KV_NATIVE=0` -> 5951/5951).  But with the arms enabled:
-  `test-backend-ops -o FLASH_ATTN_EXT` = **4703/5951**, every failure at `hsk=72` (`hsk_padded=96`,
-  `nr23=[4,1]`, `nb=32/75`, `mask=0`, pure same-type), and the 4B width probe at `P=64` returns the
-  **same** hash `ad42a04252969383` for all four types — consistent with the staged K/V being all zeros.
-  Since `P=64` is a *prefill* (so the build stages for these types anyway, into the arena) while
-  `GGML_CUDA_FA_KV_NATIVE=0` stages the same types correctly into the node scratch, the first suspect is
-  the launcher's staging branch/predicate for the new types, **not** the chunk dequantisers.
-  **Next step:** one debug build printing, in `launch_fattn`, `K->type`, `need_f16_K`, `kv_native_K`,
-  `use_native_K`, `stage_K`, `ggml_is_contiguously_allocated(K)`, `ggml_nelements(K)` and both
-  `ggml_get_to_fp16_cuda(K->type)` / `ggml_get_to_fp16_nc_cuda(K->type)`.  Diff (WIP, broken):
-  `patches/2026-09-14-item2-native-arms-WIP-BROKEN.diff`; log `~/wip-issue30/results/2026-09-14-item2-native-arms.txt`.
-- **Context (2026-09-14, issue #30 + `wip/issue-30-mtp-decode-regression/`).**  The quantized-KV decode
-depth fall-off was the whole-cache F16 staging the tile kernel runs for a quantized cache.  Block 15's
-`V4` native staging removes it; the 2026-09-14 experiment made `V4` the default for sub-F16 quants and
-added the missing **q4_0** arm.  `q8_0` d65k **18.92 -> 23.29** and `q4_0` **19.72 -> 22.82** (tg64,
-1 GPU; stock 22.43 / 21.03), bit-identical and `W=1..8`-pure.
-- **What is still missing.**  `q4_1`/`q5_0`/`q5_1`/`iq4_nl` have **no native arm** — they still stage
-through F16.  They are *well supported* (retention tracks stock: q4_1 81.1 % vs 81.1 %, q5_0 78.8 % vs
-77.9 %, q5_1 78.9 % vs 78.1 %; all `W=1..8` one hash) but sit **~12-16 % behind f16** at d32k, so a
-native arm should recover that.
-- **Work.**  Add `ggml_cuda_fattn_dequantize_<type>_chunk` loaders beside the q8_0/q4_0 ones and wire
-them through the tile + MMA dispatch (`FATTN_KV_NATIVE_*`, `ggml_cuda_fattn_kv_native_type`, the
-predicates, the `flash_attn_tile_load_tile_native` / `flash_attn_ext_f16_load_tile_native`
-dispatches).  **Each helper must reproduce that type's `ggml_get_to_fp16_cuda` conversion bit-for-bit**
-(the q8_0/q4_0 arms do), or the recorded reference hashes move.
-- **Gate.**  Text `native == staging`, `W=1..8` one hash per type, `plain == draft-mtp`, MTP acceptance
-unchanged, prefill cost <= ~2 %.
-- **Gotcha.**  Do **not** benchmark `iq4_nl` on a stock/un-amended build — it has no FA enablement there
-and runs host-only/CPU (a >10 min run at 100 % CPU).
-- Record: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §B (audit table + the q4_0/q8_0 fix) and
-  the WIP status block above.
-- **Note (2026-09-14):** per the maintainer decision recorded in `GREEDY-PURITY.md` §36, this item is a
-  **throughput/memory** goal, not a purity goal — the coarse quants keep a best-effort purity guarantee.
+**CLOSED 2026-09-15 — all four armed and validated on gfx1201 + gfx1151; promoted as part of the r4
+block-15 amendment.**  The 2026-09-14 WIP (which failed `test-backend-ops` 4703/5951) needed three
+fixes, all found by the gates: (1) the tile loader's native branch was a hand-written
+`type_KV == Q8_0 || type_KV == Q4_0` test, so the four new instantiations took the **F16 branch and read
+an unwritten staging buffer** (the `hsk=72` NaNs) — now driven by the shared
+`ggml_cuda_fattn_native_type_from_kernel<type_KV>()`; (2) q5_0/q5_1 took the **low nibble in both
+halves** (the `lo ?` test was missing, so half of every block decoded from the wrong nibble); (3) the
+5th-bit index is the element index in *both* halves (the reference's `xh_1 = (qh >> (j + 12)) & 0x10`
+mask is bit 4 of the *shifted* value).  Gates: `test-backend-ops -o FLASH_ATTN_EXT` **5951/5951** on both
+arches; greedy text `native == staging` **IDENTICAL for all eight KV types** on both; width purity
+`W=1..8` one hash per type — gfx1151 all eight types PURE, gfx1201 per §36's grid.  Perf (tg64 @ d32768,
+staged -> default): gfx1201 q4_1 23.14->**25.44**, q5_0 22.16->**24.56**, q5_1 22.23->**25.00**,
+iq4_nl 22.92->**24.94** (+9-13 %) with prefill unchanged; gfx1151 (9B) 19.24->**23.65**, 18.63->**23.48**,
+18.58->**23.54**, 19.10->**23.31** (**+22-27 %**) for a 0.6-1.1 % prefill cost.  Record:
+`wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §I; diff
+`patches/2026-09-15-item2-native-arms-all-quants.diff`.
+
+- **Context.**  The quantized-KV decode depth fall-off was the whole-cache F16 staging the tile kernel
+runs for a quantized cache.  Block 15's `V4` native staging removes it; the 2026-09-14 experiment made
+`V4` the default for sub-F16 quants and added the missing **q4_0** arm (`q8_0` d65k **18.92 -> 23.29**,
+`q4_0` **19.72 -> 22.82**), bit-identical and `W=1..8`-pure.  Item 2 extends that to the last four
+types; they retain stock-level quality (q4_1 81.1 % vs 81.1 %, q5_0 78.8 % vs 77.9 %, q5_1 78.9 % vs
+78.1 %).
+- **Gotcha (kept).**  Do **not** benchmark `iq4_nl` on a stock/un-amended build — it has no FA
+enablement there and runs host-only/CPU.
+- **Note (2026-09-14).**  Per the maintainer decision in `GREEDY-PURITY.md` §36 this was a
+**throughput/memory** goal, not a purity goal — the coarse quants keep a best-effort purity guarantee
+(sharpen the level of that guarantee to *text/acceptance* per §36's 2026-09-15 update).
 
 ## Waiting on others (not actionable in this repo)
 

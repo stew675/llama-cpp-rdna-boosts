@@ -199,8 +199,10 @@ for per-block verification and `BASELINE.md` for provenance.
   **`790cf51aa`** (re-based 2026-09-13; previously `9113cc188`).
 - Patches `patches/0000-…0015-…`, applied with **strict 16/16 `git am`** by
   `scripts/apply-all.sh` (no 3-way fallback, whitespace-clean).
-- Canonical 16-block chain: tip `a2c8d06a7931c9f6bec8542fe10149c615853be7`,
-  net tree `eb5b7583d14b30b7610fac53acf2fc52bc806ce4`.
+- Canonical 16-block chain: tip `b19c70b341f9ed439bcda2a636fe6e5fa4fa634b`,
+  net tree `7fab975d9518b29aa7d890c1163f13a6c393c5df`.
+- Release **`v16-790cf51aa-r4`**.  `scripts/validate-set.sh` passes strict 16/16
+  (applied tree == the recorded tree).
 - Greedy purity: plain decode == `draft-mtp` verify for
   `--spec-draft-n-max <= 7` across the supported KV types (4B and 27B all
   eight; qwen4exp MTP).  Depths 8..15 are allowed with a visible notice that
@@ -212,7 +214,25 @@ for per-block verification and `BASELINE.md` for provenance.
   config), [`MANIFESTS.md`](MANIFESTS.md) (apply order + verification contract)
   and [`BASELINE.md`](BASELINE.md) (fork point + drift policy).
 
-**Latest change (2026-09-14 (later), r3) — issue #30 wide-configuration: the RDNA prefill regression is
+**Latest change (2026-09-15, r4) — issue #30 second round: the reporter's q4_0 NaN, the prefill band
+split, and the last four native KV arms.**  @briansp2020's r3 re-run found **4 NaNs** in
+`test-backend-ops -o FLASH_ATTN_EXT` with a q4_0 K/V; chasing them closed four items.  (1) The tile
+kernel is instantiated with ONE `type_KV` for both operands while `launch_fattn` chose its native read **per
+tensor**, so a mixed pair fell back to the F16 tile with the native operand's staging skipped and read
+raw q4_0 as F16 — `launch_fattn` now takes the kernel's native type explicitly.  (2)
+`get_alloc_size`'s TILE case never learned the q4_0 arm, so **the q4_0 memory win had never been
+delivered**: `-c 196608` q4_0 **849 -> 123 MiB**.  (3) TODO 21: a prefill now stages K/V while
+decode/verify reads natively, with the scratch in a per-context, per-stream arena instead of the
+graph reserve (which sized it for `n_ctx` — the adaptive-MTP `-c 196608` load failure); gfx1201 q8_0
+`pp150000` **691/1077/1199** (1/2/3 GPU, from 661/996/1111).  Arch-gated: gfx1151 keeps its native
+prefill (faster at every measured depth).  (4) TODO 2: native arms for `q4_1`/`q5_0`/`q5_1`/`iq4_nl`
+(tg64 @ d32768 +9-13 % on gfx1201, +22-27 % on gfx1151).  Gates: `test-backend-ops` **5951/5951 on both
+arches**, greedy text `native == staging` identical for all eight KV types on both, `W=1..8` one hash per
+type.  Canonical tip `b19c70b34`, tree `7fab975d9`; release **`v16-790cf51aa-r4`**.  Full record:
+[`WORKLOG.md`](WORKLOG.md) 2026-09-15, `patches/README.md` (the 2026-09-15 block-15 amendment),
+`GREEDY-PURITY.md` §36, and `wip/issue-30-mtp-decode-regression/`.
+
+**Previous change (2026-09-14 (later), r3) — issue #30 wide-configuration: the RDNA prefill regression is
 fixed and made split-aware.**  The delivery's prefill fell off ~51 % faster with depth than stock (1 GPU,
 27B f16 pp150k 609.5 vs 686.9) — not q8_0-specific.  Two causes: the head-256 `ncols=64` WMMA config was
 a Strix-Halo (gfx1151) half-tile row used for all WMMA calls, and the delivery omitted stock's AMD
@@ -225,7 +245,7 @@ split and stock's AMD `ncols2=2` for a whole card.  Result (pp150K, f16, vs stoc
 Full record: [`WORKLOG.md`](WORKLOG.md) 2026-09-14 (later), `patches/README.md` (block-04 amendment),
 `GREEDY-PURITY.md` §35, and `wip/issue-30-mtp-decode-regression/`.
 
-**Previous change (2026-09-14, r2) — issue #30 wide-configuration: block 15's V4 native staging is
+**Earlier change (2026-09-14, r2) — issue #30 wide-configuration: block 15's V4 native staging is
 now the default for the sub-F16 KV quants, and q4_0 gained a native arm.**  The whole-cache F16 staging
 pass is a *decode-depth* cost, so a quantized KV cache fell off with depth vs stock (1 GPU, 27B
 UD-Q4_K_XL: q8_0 `tg64` d65536 18.92 = 66.1 % of d0 vs stock 22.43 = 80.1 %).  With

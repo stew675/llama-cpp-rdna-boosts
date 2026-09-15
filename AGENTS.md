@@ -168,9 +168,31 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   -- V4 +2.6 % at pp20480, V5 0.4-0.9 %).  The beta window closed with the
   2026-09-12 promotion; the dense-arm blocker and its one-line fix are
   closed, the revalidation reproduced every reserve number and the width
-  probe hashes, and the patch is now `patches/0015`.  See
+  probe hashes, and the patch is now `patches/0015`.  **Amended 2026-09-15 (issue #30's second
+  round, release `v16-790cf51aa-r4`)** with four things: (1) the **mixed-K/V kernel contract** — the tile
+  kernel is instantiated with ONE `type_KV` for both operands while `launch_fattn` chose its native read
+  per tensor, so a mixed pair (K=q4_0/V=f16 …) fell back to the F16 tile with the native operand's
+  staging skipped and read raw q4_0 as F16 (the reporter's 4 NaN failures in
+  `test-backend-ops -o FLASH_ATTN_EXT`); `launch_fattn` now takes the kernel's native type explicitly
+  (`kv_native_kernel`; tile = its `type_KV`, vec = `NONE`, MMA = per-operand); (2) the
+  `get_alloc_size` TILE case never learned the q4_0 arm, so a q4_0 cache reserved the F16 scratch the
+  launcher no longer used — **the arm's memory win had never been delivered** (`-c 196608` q4_0
+  849.04 -> **123.04 MiB**); (3) the **prefill band split**: a prefill (`n_q > 8`) stages K/V while
+  decode/verify (`n_q <= 8`) reads the raw cache, with the staging scratch in a new per-context,
+  per-stream arena (`ggml_backend_cuda_context::fattn_stage` / `fattn_stage_get()`, bounded by
+  `GGML_CUDA_FA_STAGE_MAX_MB`, default 512 MiB) instead of the compute-graph reserve (which sizes for
+  `n_ctx` — that ~726 MiB is the adaptive-MTP `-c 196608` load failure), arch-gated
+  `prefill_stages = !GGML_CUDA_CC_IS_RDNA3_5(cc)` (gfx1201 q8_0 `pp150000` 691.4/1076.9/1199.0 on
+  1/2/3 GPU, from 661.0/996.0/1111.4); (4) native arms for **`q4_1`/`q5_0`/`q5_1`/`iq4_nl`** (TODO item 2),
+  closing the last gap in the V4 set (+9-13 % tg64 @ d32768 on gfx1201, +22-27 % on gfx1151).  Two traps
+  for the next person: the tile loader's native branch **must** be driven by the shared
+  `ggml_cuda_fattn_native_type_from_kernel<type_KV>()` (a hand-written `Q8_0 || Q4_0` test left the new
+  instantiations reading an unwritten staging buffer -> NaN), and the q5 5th bit is `qh` bit **e** in
+  both halves (the reference's `xh_1 = (qh >> (j + 12)) & 0x10` masks bit 4 of the *shifted* value).
+  `test-backend-ops -o FLASH_ATTN_EXT` **5951/5951 on gfx1201 and gfx1151**; greedy text
+  `native == staging` identical for all eight KV types on both.  See
   `archive/work/block-15-campaign-wins/README.md` (PROMOTED),
-  `patches/README.md` (the promotion section) and the `WORKLOG.md` entry.
+  `patches/README.md` (the promotion + the 2026-09-15 amendment) and the `WORKLOG.md` entries.
 
 The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
@@ -717,10 +739,12 @@ Consequences, so it is not re-litigated:
   width-pure on every split config (only `W=1,2` moved; MTP bit-identical,
   tg128 -0.5..-0.9 %).  `GREEDY-PURITY.md` §14.  **Relaxed 2026-09-14 (issue #30):** that is a
   *measured* claim, not an invariant — a residual `n_q=1` vs `n_q>=2` difference in the tile kernel still
-  lets a greedy **near-tie** flip for the coarse quants (`q4_0`/`q4_1`; f16/bf16/q8_0 never measured
-  flipping), data- and arch-dependent and pre-existing.  The kernel-family guarantee stands; the
-  bit-identical guarantee is kept for f16/bf16/q8_0 and relaxed for q4_0/q4_1/q5_0/q5_1/iq4_nl — see
-  `GREEDY-PURITY.md` §36.
+  lets a logits-level **near-tie** flip for the coarse quants (`q4_0`/`q4_1`; f16/bf16/q8_0 only ever
+  measured one edge, bf16 at `P=200` on the 4B), data- and arch-dependent and pre-existing.  The
+  kernel-family guarantee stands; the **text/acceptance-level** contract (`plain == draft-mtp` greedy
+  text, MTP acceptance) is kept for f16/bf16/q8_0 and the *logits* level is relaxed for
+  q4_0/q4_1/q5_0/q5_1/iq4_nl — every observed edge keeps the argmax and leaves the top-2 margin at
+  2.2+ — see `GREEDY-PURITY.md` §36 (the full per-quant grid, gfx1201 + gfx1151).
   qwen4exp's two stacked causes (root-caused 2026-09-11) are now **half fixed**: its
   hyperconnection fusions (`hc-mix.cu`, gated `nt == 1`) were the cause-1 defect and the block-14
   2026-09-11 amendment routes the whole **decode/verify band `1 <= nt <= 8`** through them, so

@@ -1,5 +1,66 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-15 — `v16-790cf51aa-r4`: the reporter's q4_0 NaN, the prefill band split, and the last four native KV arms
+
+**Release.**  `v16-790cf51aa-r4`, tip `b19c70b341f9ed439bcda2a636fe6e5fa4fa634b`, tree
+`7fab975d9518b29aa7d890c1163f13a6c393c5df`; 16 patches + `rdna-boosts-all.patch` + `release.json`
+regenerated, `scripts/validate-set.sh` **PASSED** (strict 16/16 `git am`, applied tree == the recorded
+tree).  Amends **block 15** only.
+
+**Why (issue #30's second round).**  @briansp2020 re-ran on r3 and reproduced every claim — and found a
+regression the gates had missed: **4 NaN failures in `test-backend-ops -o FLASH_ATTN_EXT`** with a
+`q4_0` K/V.  Chasing them surfaced a second bug and two open items, all now closed.
+
+**1. The NaN: the tile kernel's K/V type contract.**  The tile kernel is instantiated with ONE `type_KV`
+for both operands (that is why it needs a single-type predicate) and builds its native operand
+descriptors from that compile-time type; it ignores the launcher's runtime native-type arguments.
+`launch_fattn` chose its native read **per tensor**, so a mixed pair (K=q4_0/V=f16, K=q4_0/V=q8_0,
+K=f16/V=q4_0, K=q8_0/V=q4_0) fell back to the `F16` tile with the native operand's staging **skipped**,
+and the kernel read raw q4_0 bytes as F16.  `launch_fattn` now takes the kernel's native type explicitly
+(`kv_native_kernel`; tile = its `type_KV`, vec = `NONE`, MMA = per-operand).  Unreachable from a normal
+run (llama.cpp hard-rejects mixed caches) — only the op test could see it.
+
+**2. The second bug: the q4_0 arm's memory win was never delivered.**
+`ggml_cuda_flash_attn_ext_get_alloc_size`'s TILE case learned the q8_0 arm but not the q4_0 one, so a
+q4_0 cache reserved the F16 scratch the launcher no longer used: `-c 196608` q4_0 **849.04 -> 123.04
+MiB**.  The case now mirrors `ggml_cuda_flash_attn_ext_tile_case_type`.
+
+**3. The prefill band split + the arena + the arch gate (TODO item 21, CLOSED).**  Native staging removed
+the whole-cache F16 pass (a decode win at depth) but paid a per-tile dequant at prefill.  A prefill
+(`n_q > 8`) now stages and decode/verify (`n_q <= 8`) reads natively.  The scratch moved out of the
+compute-graph reserve into a per-context, per-stream arena, because the reserve graph's `K->ne[1]` is
+`n_ctx` — that is the ~726 MiB the adaptive-MTP `-c 196608` load was short of.  Safe because a
+multi-token graph is never CUDA-graph captured.  gfx1201 q8_0 `pp150000` **691.4/1076.9/1199.0**
+(1/2/3 GPU, from 661.0/996.0/1111.4), decode and the 123 MiB reserve unchanged.  Arch-gated: gfx1151
+measures the native prefill faster at *every* depth, so `prefill_stages = !GGML_CUDA_CC_IS_RDNA3_5(cc)`.
+
+**4. Native arms for `q4_1`/`q5_0`/`q5_1`/`iq4_nl` (TODO item 2, CLOSED).**  The four chunk dequantizers +
+the plumbing, closing the last gap in the V4 set.  The 2026-09-14 WIP failed the op test 4703/5951; two
+real bugs hid behind that one symptom: the **tile loader's native branch was a hand-written
+`type_KV == Q8_0 || Q4_0` test** (so the new instantiations took the F16 branch and read a staging buffer
+`need_f16_K == false` had left unwritten — the `hsk=72` NaNs), and the **q5_0/q5_1 chunk helpers took the
+low nibble in both halves** (the `lo ? ... : b0 >> 4` test was missing).  A third "fix" — using `qh` bit
+`e-4` for the upper half — was wrong and reverted: the reference's `xh_1 = (qh >> (j + 12)) & 0x10` masks
+bit 4 of the *shifted* value, i.e. `qh` bit `j + 16`, so the 5th bit is the element index in both halves
+(settled by a host test against `dequantize_row_q5_0`).  Gains: tg64 @ d32768 staged -> default gfx1201
++9.9/+10.8/+12.5/+8.8 %, gfx1151 +22.9/+26.0/+26.7/+22.0 % for a 0.6-1.1 % prefill cost.
+
+**Gates.**  `test-backend-ops -o FLASH_ATTN_EXT` **5951/5951 on gfx1201 and gfx1151**; same-seed greedy
+text `native == staging` **identical for all eight KV types on both**; `W=1..8` one logits hash per type
+(all eight PURE on gfx1151; gfx1201 pure except the pre-existing q4_0 band edges).
+
+**Doctrine update (`GREEDY-PURITY.md` §36).**  The per-quant purity grid was re-measured across all eight
+types and five prefill lengths on gfx1201.  It shows the guarantee must be stated **at the level it
+holds**: the *text/acceptance* contract (`plain == draft-mtp`, MTP acceptance, one greedy text) is what
+the delivery guarantees for f16/bf16/q8_0, while *logits-level* `W=1..8` purity is a **measurement** —
+bf16 has one recorded edge (P=200 on the 4B).  Every observed edge is logits-level with the **argmax
+unchanged** and the top-2 margin at 2.2+ (bf16 delta 0.014, q4_1 delta 0.064), and all are pre-existing
+(reproduced byte-identically with `GGML_CUDA_FA_KV_NATIVE=0`).
+
+**Docs.**  `../AGENTS.md` (the KV-purity critical-facts bullet), `GREEDY-PURITY.md` §36, `TODO.md`
+(items 2 and 21 -> Closed), `patches/README.md` (the 2026-09-15 block-15 amendment section),
+`wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §F-H + §I.
+
 ## 2026-09-14 (later) — block-04 amendment: RDNA prefill tuning, now arch- and split-aware
 
 **Why.**  Issue #30's reconciliation left one open finding: the delivery's prefill fell off faster with

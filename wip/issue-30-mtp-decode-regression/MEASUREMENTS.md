@@ -572,3 +572,71 @@ regression); width purity still PURE; `-c 196608` q8_0 reserve **89.04 MiB**.
 fattn.cu,ggml-cuda.cu}` (+160/-28).  gfx1201 gets prefill staging with the arena (pp150k q8_0 691.4 vs
 661.0 native), gfx1151 keeps native prefill (its faster path), both keep the native decode/verify read
 and the small reserve.
+
+---
+
+## §I — TODO item 2: native FA arms for q4_1 / q5_0 / q5_1 / iq4_nl — **DONE (all four armed)**
+
+**Goal.** These four types had no native FA arm, so they staged through F16 and only the F16 conversion
+is bit-exact — everything else (the tile dequant cost and the F16 scratch) came with the same ~10 %
+decode-at-depth penalty the other sub-F16 types used to pay.  The arms mirror the q8_0/q4_0 ones: a
+chunk dequantizer per type + the same predicate/alloc-size/loader plumbing.
+
+### The three bugs that had to be fixed first (all found by the gates, all in the WIP)
+
+1. **The tile loader's native branch was a hand-written two-type test.** `flash_attn_tile_iter_KQ` /
+   `..._iter` chose the native loader with `if constexpr (type_KV == Q8_0 || type_KV == Q4_0)`.  The
+   q4_1/q5_0/q5_1/iq4_nl instantiations (`type_KV` != those two) therefore took the **F16 branch and read
+   the staging buffer**, which `need_f16_K = (K->type != type_KV) == false` had deliberately left
+   unwritten -> **NaN in the KQ dot** (every `test-backend-ops` failure was at `hsk=72`, the shape whose
+   `ne0=96` reached this instantiation first; 4703/5951).  Now driven by the shared
+   `ggml_cuda_fattn_native_type_from_kernel<type_KV>()`, so it cannot drift from the loader set again.
+2. **q5_0/q5_1 took the low nibble in both halves.** The chunk helpers wrote `(b0 & 0x0F)` where q4_1's
+   validated helper writes `lo ? (b0 & 0x0F) : (b0 >> 4)`, so the whole upper half of every block was
+   decoded from the wrong nibble (ERR ~0.25-0.33 in every q5 test; the four 5-bit-free types passed).
+   Verified against the CPU oracle for all 32 elements of a randomized block (`q5_0`/`q5_1` bad=0/32).
+3. **The 5th-bit index is the element index in *both* halves.** An intermediate "fix" used
+   `qh` bit `e-4` for `e >= 16`; the reference's high half is `xh_1 = (qh >> (j + 12)) & 0x10`, which
+   masks bit 4 of the *shifted* value, i.e. `qh` bit `j + 16` = the element index of that half's element.
+   A host test against `dequantize_row_q5_0` settled it (`e=16 -> -16`, not `0`).
+
+### Correctness (gfx1201 + gfx1151)
+
+| gate | gfx1201 | gfx1151 |
+|---|---|---|
+| `test-backend-ops -o FLASH_ATTN_EXT` | **5951/5951** | **5951/5951** |
+| value fidelity (greedy text, native vs `GGML_CUDA_FA_KV_NATIVE=0`), all 8 types | **IDENTICAL** | **IDENTICAL** |
+| width purity `W=1..8` one logits hash/type (P = 192/200/208/224/256) | see §J | **PURE, all 8 types** |
+
+gfx1201 native-vs-staged text hashes (4B, `-sm layer`, 128 greedy tokens): f16 `ef279d67a708`,
+bf16 `56017911fa5e`, q8_0 `48bd1e182077`, q4_0 `9293d86f90e9`, q4_1 `318c1a31e0ec`,
+q5_0 `ef279d67a708`, q5_1 `146beb0df3f4`, iq4_nl `7eeaf3df02c3` — each type identical in both modes.
+(gfx1151 4B: f16/q8_0 `bbb051e2aeab`, bf16/q5_0 `48bd1e182077`, q4_0 `18f73fe73098`,
+q4_1 `84f3e5783c4f`, q5_1 `146beb0df3f4`, iq4_nl `6298a6e76c03`.)
+
+### Performance (27B UD-Q4_K_XL on gfx1201; 9B Q8_0 on gfx1151)
+
+`tg64` at depth 32768, staged (`GGML_CUDA_FA_KV_NATIVE=0`, the pre-item-2 behaviour) -> default (the new
+band split); `pp8192` as the prefill control:
+
+| type | gfx1201 tg64@32768 | gain | gfx1201 pp8192 | gfx1151 tg64@32768 | gain | gfx1151 pp8192 |
+|---|---|---|---|---|---|---|
+| q4_1 | 23.14 -> **25.44** | +9.9 % | 1227.0 -> 1236.2 | 19.24 -> **23.65** | +22.9 % | 1477.2 -> 1464.6 (-0.9 %) |
+| q5_0 | 22.16 -> **24.56** | +10.8 % | 1236.5 -> 1236.0 | 18.63 -> **23.48** | +26.0 % | 1474.6 -> 1457.8 (-1.1 %) |
+| q5_1 | 22.23 -> **25.00** | +12.5 % | 1237.9 -> 1236.2 | 18.58 -> **23.54** | +26.7 % | 1470.6 -> 1461.1 (-0.6 %) |
+| iq4_nl | 22.92 -> **24.94** | +8.8 % | 1235.9 -> 1235.7 | 19.10 -> **23.31** | +22.0 % | 1471.8 -> 1463.5 (-0.6 %) |
+| q4_0 (control, armed in r2) | 23.22 -> 25.39 | +9.4 % | 1237.5 -> 1237.6 | — | — | — |
+
+So on gfx1201 (where the band split stages at prefill) the prefill is unchanged and the decode wins
+~9-13 %; on gfx1151 (where the arch gate keeps the native read at prefill) the decode wins **22-27 %**
+for a **0.6-1.1 %** prefill cost — a net win dominated by the decode side, and the reason the arch gate
+is left as-is rather than made per-type (the prefill delta is under 1 %, the decode delta is over 20 %).
+Forced-native (`GGML_CUDA_FA_STAGE_MAX_MB=1`) reproduces the decode win and *loses* ~1-2 % prefill on
+gfx1201, which is what the band split is there to avoid.
+
+### End state
+
+`ggml/src/ggml-cuda/{fattn-common.cuh,fattn-tile.cuh,fattn-tile.cu,fattn-mma-f16.cuh}` on top of the
+TODO-21 change (`common.cuh`, `fattn-vec.cuh`, `fattn.cu`, `ggml-cuda.cu`), i.e. the r4 candidate plus
+item 2: `8 files changed, +445/-61`.  Logs: `results/2026-09-15-item2-*.txt` (fix1..fix4 = the
+`test-backend-ops` iterations, `-perf*`, `-purity*`, `-textgate*`).

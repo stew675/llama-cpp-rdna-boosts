@@ -9,6 +9,20 @@ The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against
 2026-09-13 from `9113cc188`; previously re-based 2026-09-08 from `050dde50c`, itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
+**Block-15 amendment (2026-09-15, issue #30 second round) — the current release `v16-790cf51aa-r4`:**
+(1) the mixed-K/V kernel contract — the tile kernel's one `type_KV` vs the launcher's per-tensor native
+read, which made a mixed pair read raw q4_0 as F16 (the reporter's 4 NaN failures); (2) the
+`get_alloc_size` TILE case never learned the q4_0 arm, so the arm's memory win was never delivered
+(`-c 196608` q4_0 849 -> **123 MiB**); (3) the prefill band split + the per-context, per-stream staging
+arena + the RDNA3_5 arch gate (TODO 21: gfx1201 q8_0 `pp150000` 691/1077/1199 on 1/2/3 GPU, from
+661/996/1111; the arena is also the adaptive-MTP `-c 196608` load fix); (4) native arms for
+`q4_1`/`q5_0`/`q5_1`/`iq4_nl` (TODO 2: tg64 @ d32768 +9-13 % on gfx1201, +22-27 % on gfx1151).
+`test-backend-ops -o FLASH_ATTN_EXT` **5951/5951 on gfx1201 and gfx1151**; greedy text
+`native == staging` identical for all eight KV types on both.  Canonical tip
+**`b19c70b341f9ed439bcda2a636fe6e5fa4fa634b`**, tree **`7fab975d9518b29aa7d890c1163f13a6c393c5df`**,
+strict 16/16, applied tree == recorded.  Record:
+`wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §F-H + §I, `WORKLOG.md` 2026-09-15,
+`patches/README.md` (the 2026-09-15 block-15 amendment), `GREEDY-PURITY.md` §36.
 **Block-04 amendment (2026-09-14 (later), issue #30):** the RDNA prefill regression is fixed — the
 head-256 `ncols=64` WMMA config is now arch-aware (RDNA3_5 keeps the gfx1151 halo row, RDNA4/RDNA3_0 take
 upstream #28102's row) and `ncols2` is split-aware via the new `ggml_set_fa_tensor_parallel` frontend
@@ -22,11 +36,11 @@ q4_0 gained a native arm, closing the quantized-KV decode-depth fall-off (q8_0 `
 `--spec-draft-n-max 12 -c 196608 q8_0` adaptive-MTP load failure (the ~744 MiB F16 staging scratch was
 the 260 MiB the draft context was short).  Release `v16-790cf51aa-r2`; record
 `wip/issue-30-mtp-decode-regression/` + `WORKLOG.md` 2026-09-14 + `GREEDY-PURITY.md` §34.
-**Current regeneration (2026-09-13, the master re-base + the block-08 `iq4_nl` `GET_ROWS`
-amendment + the block-08 (seventh) MoE-router bit-identity amendment)**: canonical 16-block tip
-**`a2c8d06a7931c9f6bec8542fe10149c615853be7`** (net tree
-**`eb5b7583d14b30b7610fac53acf2fc52bc806ce4`**), clean-apply strict 16/16 with 0 whitespace
-warnings and the applied tree equal to the canonical one.  (The re-base tip was `43ec14228…`, tree
+**Current regeneration (2026-09-15, the block-15 amendment for issue #30's second round)**: canonical
+16-block tip **`b19c70b341f9ed439bcda2a636fe6e5fa4fa634b`** (net tree
+**`7fab975d9518b29aa7d890c1163f13a6c393c5df`**), clean-apply strict 16/16 with 0 whitespace warnings and
+the applied tree equal to the canonical one.  (The previous canonical tip was
+`a2c8d06a7931c9f6bec8542fe10149c615853be7`, tree `eb5b7583d14b30b7610fac53acf2fc52bc806ce4`.)  (The re-base tip was `43ec14228…`, tree
 `5cc664…`; the 2026-09-13 block-08 (sixth) amendment — TODO item 3, the `iq4_nl` `GET_ROWS`
 sub-`QK_K` path — and the (seventh) amendment — TODO item 19, the bit-identical fused MoE
 router — were applied on top and the whole chain replayed.)  Four upstream commits collided and were
