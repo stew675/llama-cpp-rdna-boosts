@@ -13,6 +13,7 @@ Separately, the Strix Halo build printed "tens of thousands of can't unroll loop
 | | before r5 | after r5 |
 |---|---|---|
 | `ggml-hip` backend, clean, `-j16` | **538 s** | **330 s** |
+| **full fresh build** (`~/bin/build-llama-rocm-714`: `rm -rf build-rocm` + configure + **all targets**, `-j16`) | ~570 s | **362 s** |
 | worst single TU | **`fattn-tile.cu` 509 s** (95 % of the wall) | `fattn-mma-f16-instance-ncols1_8-ncols2_4.cu` 250 s |
 | `fattn-tile.cu` itself | 509 s | **< 10 s** |
 | tile instance TUs (12) | 9-26 s (2 cases each) | 9-136 s (8 cases each) |

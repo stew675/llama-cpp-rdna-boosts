@@ -708,7 +708,9 @@ q4_0, q4_1, q5_0, q5_1, iq4_nl), so the 12 generated
 dispatch TU holds only `extern` declarations (96 `U`).  Same template arguments, same flags, same device
 code — only the translation unit that emits the kernels changed.
 
-**Measured.**  `ggml-hip` clean `-j16`: **538 s -> 330 s** (-39 %); `fattn-tile.cu` **509 s -> < 10 s**.
+**Measured.**  `ggml-hip` clean `-j16`: **538 s -> 330 s** (-39 %); `fattn-tile.cu` **509 s -> < 10 s**;
+a **full fresh build** with the maintainer's own script (`rm -rf build-rocm` + configure + all targets,
+`-j16`, 16 cores): **362 s**.
 The new critical path is the `fattn-mma-f16` instance set, which this delivery also grew: its native-KV
 arm chain instantiates the whole WMMA kernel once per KV type inside each instance TU, so the same TU
 went 0.90 -> **7.26 MB** and 6.7 -> **229 s** versus the base.  That half is diagnosed and deliberately

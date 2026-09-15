@@ -24,7 +24,9 @@ q8_0, q4_0, q4_1, q5_0, q5_1, iq4_nl) — one file, `ggml/src/ggml-cuda/fattn-ti
 runtime effect.  The generated files carry 8 cases each and the dispatch TU holds only externs (96 `U`).
 
 **Measured.**  Clean `ggml-hip`, `-j16`, 16 cores (gfx1201): **538 s -> 330 s**; `fattn-tile.cu` **509 s
--> < 10 s**; the new critical path is the `fattn-mma-f16` instance set at ~250 s.
+-> < 10 s**; the new critical path is the `fattn-mma-f16` instance set at ~250 s.  A **full fresh build**
+with the maintainer's own script (`~/bin/build-llama-rocm-714`: `rm -rf build-rocm`, configure, every
+target, `-j16`) is **362 s** on this box.
 
 **The remaining half (diagnosed, deliberately not fixed here).**  The MMA instance TUs are ours too: the
 native-KV arm chain instantiates the whole WMMA kernel once per KV type *inside every instance TU*, so
