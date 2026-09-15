@@ -13,13 +13,20 @@ We are porting pwilkin's packed-block WMMA QSA attention (`qsa3`) into the deliv
 close part of the qwen4exp prefill gap.
 
 * **P1, P2, P3 are implemented and committed** on the fork branch `packed-qsa`.
-* **The kernel is correct**: it matches the VEC reference to `rel ≈ 3e-5` (f16 rounding only).
-* **But the end-to-end result on gfx1201 is negative**: at `pp8192`, pure VEC = 893.75 t/s,
-  pack+merge+VEC = 883.89, pack+merge+WMMA = 876.42 — i.e. the packed path is **−2 %**.
-  So the op does not pay for its pack/merge overhead on this box.
-* **The immediate job (P3.5) is to make the end-to-end go positive.**  Then P4 (dispatch/split) and
-  P5 (PPL / purity / MTP).
-* Everything is **opt-in and default-off**, so the delivery is unaffected whatever you do.
+* **P3.5 is now DONE and the verdict is negative** — see `P3.5-NOTES.md` for the full record.  The
+  original −2 % end-to-end was measured in the **wrong split mode** (`-sm layer`); the canonical
+  serving config is `-sm tensor -b/-ub 2048`, where pure VEC = 2289 t/s and the packed path is
+  **−4.5 %**.  The P1 pack is free, the P2 *merge* is the whole cost, and the P3 kernel is at
+  **parity** with VEC (the isolated 1.35x op figure was a layer-split artifact).  Even with the
+  expensive merge kernel removed the ceiling is +0.8 %.
+* **P4 (tensor-split support) is implemented and validated** (the packed shadows split with the
+  kv-head axis); the packed path now runs under `-sm tensor` with the same `rel ≈ 3.9e-5` as under
+  layer split.
+* **Recommendation: park the campaign on gfx1201.**  If it continues it must be on **gfx1151**
+  (where QSA is ~14 % of the pass and VEC is the slow reference this design targets) — but the ~5 %
+  merge cost is architecture-independent and must be beaten there too.
+
+Everything is **opt-in and default-off**, so the delivery is unaffected whatever you do.
 
 ---
 
@@ -80,11 +87,14 @@ is not actually running or is wrong — see §6 "two bring-up traps".
 
 ```bash
 M=/models/Qwen3.8/Flash-Next/IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf
-B="-m $M -ngl 99 -sm layer -fa on -ctk f16 -ctv f16 -p 8192 -n 0 -r 3"
+B="-m $M -ngl 99 -sm tensor -fa on -ctk f16 -ctv f16 -b 2048 -ub 2048 -p 8192 -n 0 -r 3"
 
 # pure VEC (no pack at all)
 HIP_VISIBLE_DEVICES=0,1,2 LLAMA_QSA_DENSE_SHORTCUT=0 \
   ./build-rocm/bin/llama-bench $B 2>/dev/null | grep pp8192
+# P1 pack only (no merge)
+HIP_VISIBLE_DEVICES=0,1,2 LLAMA_QSA_DENSE_SHORTCUT=0 LLAMA_QSA_PACKED=1 \
+  GGML_CUDA_QSA_PACKED_MERGE=0 ./build-rocm/bin/llama-bench $B 2>/dev/null | grep pp8192
 # pack+merge, VEC attention (isolates the P1+P2 overhead)
 HIP_VISIBLE_DEVICES=0,1,2 LLAMA_QSA_DENSE_SHORTCUT=0 LLAMA_QSA_PACKED=1 \
   GGML_CUDA_QSA_PACKED_ATTN=0 ./build-rocm/bin/llama-bench $B 2>/dev/null | grep pp8192
@@ -93,18 +103,24 @@ HIP_VISIBLE_DEVICES=0,1,2 LLAMA_QSA_DENSE_SHORTCUT=0 LLAMA_QSA_PACKED=1 \
   ./build-rocm/bin/llama-bench $B 2>/dev/null | grep pp8192
 ```
 
-The three numbers are the P3.5 scoreboard.  Today: `893.75 / 883.89 / 876.42`.
+These four numbers are the P3.5 scoreboard.  Measured 2026-09-15:
+`2289.18 / 2286.27 / 2177.92 / 2185.97` — the merge is the cost, the pack is free, the WMMA kernel
+is at parity.  The old `-sm layer` numbers (`893.75 / 883.89 / 876.42`) are superseded; see
+`P3.5-NOTES.md`.
 
 ---
 
 ## 2. Repository / branch state
 
+*Synced 2026-09-15 against delivery r5 (`main` @ `a0d1de7`, release `v16-790cf51aa-r5`, tree
+ `d735d6c11258ae939cfd392511e3f29ac22a7686`).*
+
 | repo | branch | state |
 |---|---|---|
-| `~/llama-cpp-rdna-boosts` (delivery, **docs only**) | **`packed-qsa`** @ `656cb73` | `wip/packed-qsa/` (this tree) + `wip/tiled-gdn/`, `wip/prefill-arrangements/`; pushed to `origin/packed-qsa` |
-| `~/llama-cpp-rdna-boosts` | `main` @ `2ebf725` | untouched; has `wip/tiled-gdn` + `wip/prefill-arrangements` but **not** `wip/packed-qsa` |
-| `~/llama.cpp` (fork, **the code**) | **`packed-qsa`** @ `4f464941a` | `4f464941a` P3 kernel → `91f5e41a0` P3 primitive → `1697ad10e` P2 → `2b84c7c62` P1 → `b214621da` tiled-GDN spike → `b36517087` delivery tip |
-| `~/llama.cpp` | `rdna-boosts` @ `b36517087` | clean, the 16-block delivery tip |
+| `~/llama-cpp-rdna-boosts` (delivery, **docs only**) | **`packed-qsa`** | rebased onto `main` @ `a0d1de7`; `wip/packed-qsa/` (this tree, + `P3.5-NOTES.md`), `wip/tiled-gdn/`, `wip/prefill-arrangements/` |
+| `~/llama-cpp-rdna-boosts` | `main` @ `a0d1de7` | the r5 delivery docs |
+| `~/llama.cpp` (fork, **the code**) | **`packed-qsa`** | rebased onto the r5 delivery tip `65001ac96` (tree `d735d6c1`): P3 → P2 → P1 → tiled-GDN spike, plus the 2026-09-15 P3.5 levers (tensor-split assertion relaxation, `GGML_CUDA_QSA_PACKED_MERGE`, `GGML_CUDA_QSA_MERGE_NOROWS`) |
+| `~/llama.cpp` | `rdna-boosts` @ `65001ac96` | clean, the r5 16-block delivery tip |
 
 **Rules (do not deviate):**
 * All code changes go on `packed-qsa` in **`~/llama.cpp`** (the fork).
@@ -142,8 +158,10 @@ Facts not to re-derive:
   already beats it on gfx1201.
 * The uniform-weight requirement belongs to `mmb`, **not** to QSA.  All qwen4exp models on this box
   are mixed-expert, so `mmb` would not fire without a per-type dequant kernel.
-* **The QSA lever does not transfer to gfx1201** (measured: −2 % end-to-end).  This is the central
-  new fact; see §4.
+* **The QSA lever does not transfer to gfx1201** — and the original "−2 %" was itself measured
+  in the wrong split mode.  In the canonical `-sm tensor -b/-ub 2048` config the packed path is
+  **−4.5 %**, the merge is the whole cost, and the kernel is at parity.  See §4/§5 and
+  `P3.5-NOTES.md`.
 
 ---
 
@@ -169,7 +187,8 @@ Facts not to re-derive:
   it emit the same block twice (the packed attention would double-count).  Both passes now coalesce
   all keys of a block into one entry.
 * Validation: `GGML_CUDA_QSA_MERGE_CHECK=1` → host cross-check + a 202-case synthetic self-test, both
-  green; `rows_sorted=0` shows the indexer rows are already distinct/ascending.
+  green; `rows_sorted=0` at small ub, but **`rows_sorted=1` at `-ub 2048`** — the rows are
+  *not* guaranteed ascending, so the rows kernel is required (see `P3.5-NOTES.md` §3).
 
 ### P3 — the WMMA kernel (fork `91f5e41a0` primitive, `4f464941a` kernel) — records `P3-DESIGN.md`, `P3-NOTES.md`
 * gfx12 f16 WMMA primitive + layout self-test (the "two runs of four" 8-half A/B fragment,
@@ -195,47 +214,36 @@ Facts not to re-derive:
 
 ---
 
-## 5. The immediate job: **P3.5** (now required, not optional)
+## 5. P3.5 — DONE (2026-09-15): the verdict is negative
 
-The packed path must beat the VEC path end-to-end at `pp8192`.  Two independent tracks, and the
-scoreboard in §1.4 is the gate:
+**Read `P3.5-NOTES.md` for the full record.**  The short version:
 
-**Track A — remove the pack/merge overhead (worth ~1.1 %).**
-* The P1 pack is rebuilt **per graph** (`build_attn_qsa`) as `cont(permute(reshape(...)))` — two full
-  copies of the K/V cache per layer per ubatch.  Ideas: skip the pack when the cache/selection did
-  not change; keep one packed buffer and update it incrementally; check whether the extra `cont`
-  intermediates can be avoided.
-* The P2 merge is rebuilt **per op call** (`ggml_cuda_qsa_merge_build`), writing ~50 MB for a
-  2048-token ubatch.  Ideas: fold the merge into the pack build; cache the descriptor when the `idx`
-  tensor is unchanged; shrink `cap` (it is the loose upper bound `4*ns`).
+* The P1–P3 evaluation used `-sm layer`; the canonical config is `-sm tensor -b/-ub 2048`
+  (3× faster baseline).
+* Canonical pp8192: pure VEC 2289 / pack-only 2286 (**free**) / pack+merge+VEC 2178 (**−4.9 %**) /
+  pack+merge+WMMA 2186 (**−4.5 %**).
+* The whole cost is the P2 merge descriptor build — specifically `qsa3_rows_kernel` (12x
+  `qsa3_merge_kernel`).  The P3 WMMA kernel is **at parity** with VEC in the canonical geometry; the
+  1.35× op figure was a layer-split artifact.
+* With the merge's expensive half removed the ceiling is **+0.8 %** — the campaign cannot win on
+  gfx1201.  Park it here; the only open target is gfx1151 (and the merge cost applies there too).
 
-**Track B — make the kernel genuinely faster (worth ~0.9 % today; the target is ≥2× op).**
-* The per-row softmax costs 8 separate shuffle reductions — restructure so the 8-row vector is
-  shuffled once per step (e.g. transpose the 8 values across the wave before reducing).
-* Replace the LDS P-transpose with a shuffle network (pwilkin's gfx11 approach, adapted).
-* Prefetch the next chunk's K/V fragments (pwilkin does).
-* Widen the key chunk beyond 16 keys, and/or reconsider the 8-wave head-dim split.
-* **Investigate the op-vs-end-to-end contradiction first**: the isolated `x20` benchmark reuses a
-  warm packed K/V while the full run reads it cold.  A cold-cache op benchmark (or `rocprofv3`) will
-  tell you whether the 1.35× is real.
-
-Keep the correctness gate green after every change:
-`GGML_CUDA_QSA_ATTN_CHECK=1` must stay `rel ≈ 1e-5`.
+Track A/Track B below are kept as the historical plan; Track B cannot pay on gfx1201 given the
+ceiling.
 
 ---
 
 ## 6. Then: P4 and P5
 
-**P4 — dispatch / split coverage.**
-* `ggml_cuda_flash_attn_qsa_supported()` currently accepts the op on shape/type alone; the packed
-  path is chosen purely by `src[7]`.  Decide the real predicate (device cc, `n_tokens`, `n_stream`,
-  gqa 12, D=256) and the VEC fallback.
-* **`-sm tensor`**: the meta splitter asserts the pack is *mirrored* (the pack folds `n_kv` and
-  `n_kv_heads` into one block dim, so a kv-head split is not representable).  Either confirm the
-  mirrored full-pack-per-device path or gate the packed path off under tensor split.
-* **RDNA3.5 (gfx1151)** needs a 16-half fragment instantiation (`wmma_f32_16x16x16_f16_w32`,
+**P4 — dispatch / split coverage.  PARTLY DONE (2026-09-15).**
+* `-sm tensor` is now **supported and validated**: the packed shadows split with the K/V kv-head
+  axis (keys axis 3, values axis 2), the P1 "must be mirrored" assertion is relaxed accordingly and
+  the A/B is still `rel ≈ 3.9e-5` (fork `packed-qsa`).
+* Still open: the real dispatch predicate (device cc, `n_tokens`, `n_stream`, gqa 12, D=256) and the
+  VEC fallback; `ggml_cuda_flash_attn_qsa_supported()` currently accepts on shape/type alone.
+* **RDNA3.5 (gfx1151)** still needs a 16-half fragment instantiation (`wmma_f32_16x16x16_f16_w32`,
   `#elif defined(RDNA3)`) — gfx1201 was done first.  This is the box where the QSA share is largest
-  (14 %), so it is the most likely place for the win to materialise.
+  (14 %), so it is the only place left where a win could materialise.
 
 **P5 — validation before any promotion.**
 * PPL vs the VEC build (the packed path is a prefill re-baseline).
@@ -258,12 +266,14 @@ path (`beta/` staging, env-gated A/B, maintainer go-ahead).  This is `wip/` work
 | `LLAMA_QSA_PACKED=1` | P1: build the packed K/V shadows and attach `src[7]/src[8]` (the master switch) |
 | `LLAMA_QSA_DENSE_SHORTCUT=0` | force the sparse selection even below `indexer_top_k + r - 1` (use in every packed test) |
 | `GGML_CUDA_QSA_PACKED_ATTN` | `0` = keep packed sources but run the **VEC** kernel (isolates the pack/merge overhead) |
+| `GGML_CUDA_QSA_PACKED_MERGE` | `0` = skip the P2 merge build entirely (isolates the P1 pack cost) |
+| `GGML_CUDA_QSA_MERGE_NOROWS` | `1` = skip merge kernel A (diagnostic only — **breaks correctness**) |
 | `GGML_CUDA_QSA_MERGE_CHECK=1` | P2: host cross-check + 202-case merge self-test + the WMMA layout self-test |
 | `GGML_CUDA_QSA_ATTN_CHECK=1` | P3: run packed **and** VEC on the same inputs, print `rel`/`max_abs` + op timing |
 | `GGML_CUDA_QSA_ATTN_DBG=1` | P3: dump the first group/tile/chunk score tile, P tile and `l` |
 | `GGML_CUDA_QSA_IDENTITY` | (pre-existing) force `idx = 0..n_top_k-1`, dense-equivalent validation |
 
-**Model** (3× R9700, ~82 GB, use `-sm layer -mg 0`):
+**Model** (3× R9700, ~82 GB; **use `-sm tensor -b/-ub 2048`** — the canonical serving config;
 `/models/Qwen3.8/Flash-Next/IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf`
 (others: `IQ4_XS`, `Q4_K_M`, `Q4_K_XL` in the same tree).  Geometry: 48 layers, D=256,
 24 q-heads / 2 kv-heads (gqa 12), `indexer.top_k=2048`, `compress_ratios` ratio 4 on every 4th
@@ -307,12 +317,15 @@ anything blocking in `timeout` — otherwise it enters the interactive loop and 
 * The pack is a graph-side op composition (no new ggml op, no on-disk format).
 * Visibility for P3: the kernel consumes the **same** source the VEC op gets — base `mask` when
   present, else the derived `cell_vis`/`q_vis` — and the A/B proves they agree.
+* P4 tensor-split support: the packed shadows follow the K/V kv-head split; validated `rel ≈ 3.9e-5`.
+* **P3.5: gfx1201 cannot win.**  The pack is free, the merge A kernel is the whole cost, and the P3
+  kernel is at parity under `-sm tensor`.  The ceiling with a free merge is +0.8 %.  (2026-09-15)
 
 **Open:**
-* P3.5: how to make the pack/merge free and the kernel faster (§5).
-* P4: `-sm tensor` pack layout (mirrored vs gated off); gfx1151 fragment instantiation.
-* Whether the campaign is worth continuing at all on gfx1201, or should move to gfx1151 where the op
-  is a larger share.  The `pp8192` decomposition (§1.4) is the deciding evidence.
+* Whether the campaign moves to **gfx1151** (QSA ~14 % of the pass, the slow VEC this design targets)
+  — and if so, how to make the merge A kernel cheap there (`P3.5-NOTES.md` §3).  Nothing on gfx1201.
+* P4: the real dispatch predicate / VEC fallback; gfx1151 16-half fragment instantiation.
+* P5 (only if the campaign continues): PPL, `W = 1..8` purity, MTP, pp8192/16384 A/B.
 
 ---
 
@@ -322,9 +335,11 @@ anything blocking in `timeout` — otherwise it enters the interactive loop and 
 2. `P1-NOTES.md`, `P2-NOTES.md` — the P1/P2 records and their call-outs.
 3. `P3-DESIGN.md` — the fragment address mappings + kernel design.
 4. `P3-NOTES.md` — the P3 result, the two bring-up bugs, the end-to-end decomposition, the P3.5 list.
-5. `../prefill-arrangements/README.md` — the arrangement landscape + the GDN-is-spent argument.
-6. `../tiled-gdn/05-where-the-speed-comes-from.md` — where the journey's ~2.2x really is.
-7. `../../archive/work/wip-archive/iq4nl-prefill/HANDOVER-2026-09-12-iq4nl-weight-gemm-port.md` —
+5. **`P3.5-NOTES.md`** — the canonical-config scoreboard, the `qsa3_rows_kernel` root cause, and the
+   park-on-gfx1201 decision (2026-09-15).
+6. `../prefill-arrangements/README.md` — the arrangement landscape + the GDN-is-spent argument.
+7. `../tiled-gdn/05-where-the-speed-comes-from.md` — where the journey's ~2.2x really is.
+8. `../../archive/work/wip-archive/iq4nl-prefill/HANDOVER-2026-09-12-iq4nl-weight-gemm-port.md` —
    the archived `mmb` port + the kernel attribution (and its §12 purity rationale).
 
 ## 11. Environment notes

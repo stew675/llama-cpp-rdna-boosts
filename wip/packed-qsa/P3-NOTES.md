@@ -1,5 +1,12 @@
 # Packed-QSA — P3 implementation notes
 
+# Packed-QSA — P3 implementation notes
+
+> **SUPERSEDED END-TO-END NUMBERS (2026-09-15):** the performance section below was measured under
+> `-sm layer`.  The canonical `-sm tensor -b/-ub 2048` result is in `P3.5-NOTES.md` — the packed
+> path is **−4.5 %**, the pack is free, the merge is the cost, and the WMMA kernel is at parity with
+> VEC (not 1.35x; that was a layer-split artifact).  The kernel-correctness record below stands.
+
 **Status:** P3 part 2 done (2026-09-13) — the packed WMMA kernel is correct and ~1.35x faster than
 the VEC kernel at the op level.  Fork `packed-qsa` `4f464941a` (on `91f5e41a0` = part 1).
 Design: `P3-DESIGN.md`.  P1/P2: `P1-NOTES.md`, `P2-NOTES.md`.

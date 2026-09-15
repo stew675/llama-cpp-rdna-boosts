@@ -49,6 +49,11 @@ randomized cases over `ns <= 37`, `nq <= 11`, `nk <= 130` with duplicates, out-o
 both sorted and shuffle-needed rows.  `rows_sorted=0` on the real data: the indexer emits **distinct,
 already-ascending** rows, so the rows kernel's sort path is exercised only by the self-test.
 
+> **CORRECTION (2026-09-15, `P3.5-NOTES.md` §3):** at the canonical `-b/-ub 2048` the real data
+> reports `rows_sorted=1` (one row in 2048 takes the sort path), and `GGML_CUDA_QSA_MERGE_NOROWS=1`
+> (skip the rows kernel) makes the descriptor mismatch the host oracle — so the ascending
+> assumption is **not** safe.  The rows kernel is required.
+
 ## The bug the self-test found (latent in the reference kernel)
 
 pwilkin's `qsa3_merge_kernel` assumes a block's keys are consumed in one shot: its pass-2 fast path
