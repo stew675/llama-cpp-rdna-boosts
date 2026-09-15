@@ -9,6 +9,8 @@
 # release pipeline lives in docker-ghcr.yml and is tag-driven.
 #
 # Checks (scripts/validate-set.sh, driven by release.json):
+#   * no tracked path uses a character Windows forbids (a single one makes the
+#     repo unclonable there -- issue #36),
 #   * every patches/*.patch matches its recorded sha256,
 #   * rdna-boosts-all.patch matches its recorded sha256,
 #   * the set applies strictly (no 3-way fallback) on a fresh tarball of
@@ -38,6 +40,9 @@ jobs:
     steps:
       - name: Check out delivery repo
         uses: actions/checkout@v5
+
+      - name: Check tracked paths are Windows-checkout-safe
+        run: bash scripts/check-windows-paths.sh
 
       - name: Validate against release.json
         run: bash scripts/validate-set.sh
