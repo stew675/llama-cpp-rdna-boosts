@@ -70,6 +70,7 @@ finding, narrative moved to the findings file):
 | 33 | a purity (or throughput) gate must run the content the axis intends, long enough to reach steady state | doctrine |
 | 34 | a K/V staging policy is a decode-depth policy (and can be the margin for a high-context load) | doctrine + fix |
 | 35 | a prefill kernel config must be arch- and split-keyed, not one row for all RDNA | doctrine + fix |
+| 36 | §14's `W=1..8` purity is a measured claim; relax the bit-identical guarantee for the coarse quants | doctrine |
 
 
 ## 1. The one-sentence version
@@ -1282,3 +1283,39 @@ RDNA arch and *every* split mode.  Both were wrong as globals:
 
 Results and the full matrix: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §D; `WORKLOG.md`
 2026-09-14 (later); `patches/README.md` (2026-09-14 block-04 section).
+
+## 36. §14's `W=1..8` purity is a *measured* claim, not a guarantee — relax it for the coarse quants (2026-09-14, issue #30)
+
+**Finding.**  §14 deleted the VEC/TILE family split for a quantized K/V, and that part holds — the whole
+`n_q <= 8` band is TILE.  But the tile kernel's arithmetic is still not *identical* for `n_q = 1` and
+`n_q >= 2`: the `n_q = 1` launch still runs its whole `cols_per_block` (the phantom columns), so a
+hairline difference remains.  It only becomes visible as a **greedy near-tie flip**, i.e. when the cache
+quantization is coarse enough to land a value near a tie.  Measured on the 4B (gfx1201; `P` = prefill
+length, `W` = decode batch width, one hash per `W=1..8`):
+
+| K/V | P=192 | P=200 | P=208 | P=224 | P=256 |
+|---|---|---|---|---|---|
+| f16 | pure | pure | pure | pure | pure |
+| q8_0 | pure | pure | pure | pure | pure |
+| q4_1 | pure | **flip** | pure | pure | pure |
+| q4_0 | pure | pure | pure | **flip** | **flip** |
+
+and at (q4_0, P=256) only **one of four prompts** flips.  The magnitude is a real 0.209 logit difference
+(argmax unchanged in every observed case).  It is **pre-existing** (it reproduces with
+`GGML_CUDA_FA_KV_NATIVE=0`, i.e. the pure F16 staging path, and with the prefill-staging split disabled)
+and **arch/data-specific** (gfx1151 is pure for all four types at P=256).  So §14's own table states what
+*that probe and those prompts* measured, not a general invariant.
+
+**Doctrine (2026-09-14, maintainer decision).**  This is the coarseness of the quantization, not a defect
+to chase:
+
+* The **kernel-family** guarantee stands: the whole `n_q <= 8` band takes one family (TILE), with no
+  VEC/TILE split.
+* The **bit-identical** guarantee is kept for the precise caches (**f16, bf16, q8_0**) and is *relaxed*
+  for the coarse integer quants (**q4_0, q4_1**, and by extension q5_0/q5_1/iq4_nl): there a greedy
+  decode/verify near-tie may flip.
+* Consequence, the same one §19 already states for `n_max > 7`: once the cache is coarse, `plain` and
+  `draft-mtp` may disagree on a near-tie.  A user who needs the strongest guarantee uses f16/bf16/q8_0
+  K/V; the coarse caches are a memory trade with a documented purity relaxation.
+
+Evidence: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §G.

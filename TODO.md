@@ -141,9 +141,11 @@ Dossier: `wip/issue-30-mtp-decode-regression/` (`README.md` action register, `ME
   node-staging 690.4/1080.1/1203.6); decode d65k keeps 23.17; reserve at `-c 196608` stays 123.04 MiB
   and adaptive-MTP ceiling 12 still loads.  Same-seed text staged == native.  Diff:
   `wip/issue-30-mtp-decode-regression/patches/2026-09-14-todo21-prefill-arena-staging.diff`;
-  record **`MEASUREMENTS.md` §F**.  Remaining: gfx1151 (gfx1151 uses
-  `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS`/its own FA config, so the band split must be
-  re-measured there), then promote as a **block-15 amendment** (it refines V4's activation policy).
+  record **`MEASUREMENTS.md` §F/§H**.  gfx1151 validated 2026-09-14 (§H): test-backend-ops 5951/5951,
+  width purity PURE for q4_0/q4_1/q8_0/f16, text gates identical -- and it forced the **arch gate**
+  (`prefill_stages = !RDNA3_5`), because gfx1151 native wins prefill at every depth (+0.4 % @16k growing
+  to +1.6 % @65k) with no crossover, while gfx1201 staging wins (+4.5 % @150k).  The band split now
+  refines V4's activation policy; promote as a **block-15 amendment**.
 - **Context.**  The V4 policy (unset = native q8_0/q4_0) gives the **+23 % d65K decode** and the adaptive-MTP
   high-context load (it removes the ~744 MiB F16 scratch).  But a quantized source cannot use the
   `cp_async` pipeline, so the native path re-dequantizes each K/V tile: q8_0 prefill at `pp150000` (27B,

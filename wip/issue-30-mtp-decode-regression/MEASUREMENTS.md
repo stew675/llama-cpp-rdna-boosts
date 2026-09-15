@@ -529,3 +529,46 @@ tile kernel's `n_q=1` vs `n_q>=2` arithmetic still differs by a hair.  Separatel
 the reporter's NaN and NOT a regression).
 
 Evidence: `~/wip-issue30/results/2026-09-14-q4_0-nan.txt`.
+
+---
+
+## §H — gfx1151 (Strix Halo) validation of the TODO-21 split + the arch gate it forced
+
+Built the exact delivery tree on halo: fresh clone at `790cf51aa`, the r3 patch set via
+`scripts/apply-all.sh` (applied tree **`eb5b7583`** == `release.json`), then the working diff.  Built with
+`~/bin/build-llama-rocm-714`'s flags into `build-todo21` (ROCm 7.14 gfx1151).
+
+### Correctness (all before any timing)
+
+* `test-backend-ops -o FLASH_ATTN_EXT` -> **5951/5951** (the mixed-K/V NaN fix holds on gfx1151 too).
+* Width purity, 4B Q8_0, P=256: **q4_0 PURE, q4_1 PURE, q8_0 PURE, f16 PURE** (all eight widths one
+  hash).  Note gfx1151 is pure for q4_0 at (P=256, prose) where gfx1201 flips -- §G.
+* Staged-vs-native greedy text (`-n 96`, seed 42, 4k prompt): q4_0 `a259b5e4f1d8` both, q8_0
+  `bc323daddad4` both, f16 `bc323daddad4` -- identical.
+
+### The split is arch-dependent (no crossover on either arch)
+
+`llama-bench -p N -n 0`, 9B Q8_0, q8_0 K/V:
+
+| pp | native | arena-staging | winner |
+|---|---|---|---|
+| 16384 | 1409.98 | 1404.53 | native +0.4 % |
+| 20480 | 1368.92 | 1359.18 | native +0.7 % |
+| 32768 | 1266.30 | 1253.09 | native +1.0 % |
+| 65536 | 1059.14 | 1042.86 | native **+1.6 %** |
+
+So **gfx1151 never crosses over** -- native wins at every depth and the gap *grows* with it, whereas on
+gfx1201 staging wins and its gap also grows with depth (pp32k +1.2 %, pp150k +4.5 %).  Each arch has a
+consistent winner, so the prefill decision is gated on the arch:
+`prefill_stages = !GGML_CUDA_CC_IS_RDNA3_5(cc)`, i.e. RDNA3_5 keeps the native read at prefill (exactly
+the pre-V4 behaviour there) while RDNA4/RDNA3_0 stage.
+
+After the gate, on gfx1151: q8_0 `pp16384` **1420.03**, `pp20480` **1373.26** (native-or-better, no
+regression); width purity still PURE; `-c 196608` q8_0 reserve **89.04 MiB**.
+
+### End state of the TODO-21 change
+
+`ggml/src/ggml-cuda/{common.cuh,fattn-common.cuh,fattn-mma-f16.cuh,fattn-tile.cuh,fattn-vec.cuh,
+fattn.cu,ggml-cuda.cu}` (+160/-28).  gfx1201 gets prefill staging with the arena (pp150k q8_0 691.4 vs
+661.0 native), gfx1151 keeps native prefill (its faster path), both keep the native decode/verify read
+and the small reserve.

@@ -715,7 +715,12 @@ Consequences, so it is not re-litigated:
   *kernel-family* chooser — VEC at `n_q <= 2` vs TILE from `n_q = 3` — not
   the KV staging, and the band is TILE throughout now, so `q8_0`/`q4_0` are
   width-pure on every split config (only `W=1,2` moved; MTP bit-identical,
-  tg128 -0.5..-0.9 %).  `GREEDY-PURITY.md` §14.
+  tg128 -0.5..-0.9 %).  `GREEDY-PURITY.md` §14.  **Relaxed 2026-09-14 (issue #30):** that is a
+  *measured* claim, not an invariant — a residual `n_q=1` vs `n_q>=2` difference in the tile kernel still
+  lets a greedy **near-tie** flip for the coarse quants (`q4_0`/`q4_1`; f16/bf16/q8_0 never measured
+  flipping), data- and arch-dependent and pre-existing.  The kernel-family guarantee stands; the
+  bit-identical guarantee is kept for f16/bf16/q8_0 and relaxed for q4_0/q4_1/q5_0/q5_1/iq4_nl — see
+  `GREEDY-PURITY.md` §36.
   qwen4exp's two stacked causes (root-caused 2026-09-11) are now **half fixed**: its
   hyperconnection fusions (`hc-mix.cu`, gated `nt == 1`) were the cause-1 defect and the block-14
   2026-09-11 amendment routes the whole **decode/verify band `1 <= nt <= 8`** through them, so

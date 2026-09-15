@@ -39,7 +39,7 @@ index 72b0c9ef1..86aa32597 100644
  
      cudaStream_t stream(int device, int stream) {
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 28d3862af..48536c05d 100644
+index 28d3862af..fa7d0e9cf 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -272,6 +272,11 @@ enum fattn_kv_native_type : int {
@@ -69,7 +69,7 @@ index 28d3862af..48536c05d 100644
      const int warp_size = WARP_SIZE
  ) {
      constexpr int ncols = ncols1 * ncols2;
-@@ -1381,14 +1394,62 @@ void launch_fattn(
+@@ -1381,14 +1394,69 @@ void launch_fattn(
      // skipped for that operand.  The predicates are shared with
      // ggml_cuda_flash_attn_ext_get_alloc_size, which sizes the node's scratch, so the two cannot
      // disagree on whether the scratch exists.
@@ -101,7 +101,14 @@ index 28d3862af..48536c05d 100644
 +    }();
 +    const bool stage_ok_K = stage_max_bytes == 0 || (size_t) ggml_nelements(K)*sizeof(half) <= stage_max_bytes;
 +    const bool stage_ok_V = stage_max_bytes == 0 || (size_t) ggml_nelements(V)*sizeof(half) <= stage_max_bytes;
-+    const bool native_width = Q->ne[1] <= 8;
++    // Prefill stages only where that actually wins.  On RDNA4/RDNA3_0 the whole-prefix F16 conversion
++    // is paid once per ubatch and the tiles then feed the cp_async pipeline, which beats
++    // re-dequantizing each tile once per query block (gfx1201 q8_0: pp150k 691 vs 661 native, pp32k
++    // 1087 vs 1073).  RDNA3_5 (Strix Halo, unified LPDDR5) is the other way round at every depth, the
++    // gap growing with it (gfx1151 9B q8_0 pp16k 1405 vs 1410, pp20k 1359 vs 1369, pp32k 1253 vs
++    // 1266, pp65k 1043 vs 1059), so it keeps the native read at prefill too.
++    const bool prefill_stages = !GGML_CUDA_CC_IS_RDNA3_5(cc);
++    const bool native_width = Q->ne[1] <= 8 || !prefill_stages;
 +    const bool use_native_K = (native_width || !stage_ok_K) && kv_native_K != FATTN_KV_NATIVE_NONE;
 +    const bool use_native_V = (native_width || !stage_ok_V) && kv_native_V != FATTN_KV_NATIVE_NONE;
 +    // A native-capable operand that stages takes its scratch from the per-context, per-stream arena
@@ -137,7 +144,7 @@ index 28d3862af..48536c05d 100644
  
      ggml_cuda_pool_alloc<int>    KV_max(pool);
      ggml_cuda_pool_alloc<float>  dst_tmp(pool);
-@@ -1408,8 +1469,13 @@ void launch_fattn(
+@@ -1408,8 +1476,13 @@ void launch_fattn(
          const size_t bs = ggml_blck_size(K->type);
          const size_t ts = ggml_type_size(K->type);
  
@@ -153,7 +160,7 @@ index 28d3862af..48536c05d 100644
          if (ggml_is_contiguously_allocated(K)) {
              to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
              to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
-@@ -1442,8 +1508,13 @@ void launch_fattn(
+@@ -1442,8 +1515,13 @@ void launch_fattn(
              const size_t bs = ggml_blck_size(V->type);
              const size_t ts = ggml_type_size(V->type);
  
@@ -169,7 +176,7 @@ index 28d3862af..48536c05d 100644
              if (ggml_is_contiguously_allocated(V)) {
                  to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                  to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
-@@ -1638,7 +1709,7 @@ void launch_fattn(
+@@ -1638,7 +1716,7 @@ void launch_fattn(
          cell_pos ? (const int *) cell_pos->data : nullptr,
          tok_lo   ? (const int *) tok_lo  ->data : nullptr,
          tok_hi   ? (const int *) tok_hi  ->data : nullptr,
