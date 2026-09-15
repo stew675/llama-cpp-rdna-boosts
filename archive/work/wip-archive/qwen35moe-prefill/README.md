@@ -46,3 +46,15 @@ llama-bench -m <...> -ngl 99 -p 16384 -ub 2048 -r 2          # ~4325 t/s
 # op-level picture
 GGML_CUDA_OP_TIMING=1 llama-bench -m <...> -ngl 99 -p 16384 -ub 2048 -r 1 --no-warmup -v
 ```
+
+## Cleanup (2026-09-15)
+
+The three raw `op timing:` dumps in `data/` (`op-decode-nofuse.txt` 6.9 MiB / 137876 lines,
+`op-decode-fused.txt` 3.2 MiB / 57261 lines, `op-moe-16k-ub2048.txt` 0.7 MiB / 12282 lines) were
+trimmed **in place** to their parsed aggregate by `data/trim-op-timing-log.py`, which uses
+`parse_ops.py`'s regexes verbatim so the shares are identical to the published ones.  `data/` is 60 KiB
+now; each file's banner records its original size, and the retained aggregate is exactly what
+`report.md`'s op-breakdown tables were built from (the deepest-eval shares reproduce them: deepest eval
+`MUL_MAT_ID` 40.1 % / `FLASH_ATTN_EXT` 28.4 % / `MUL_MAT` 17.6 % for the ub=2048 column, and the
+fused-vs-nofuse A/B reads 2174 nodes / 22.8 ms vs 923 nodes / 14.7 ms with `FUSED` at 70.8 %).  The bench
+logs, `gdn-ab.txt` and the parsers were left alone — they are small and are the primary records.

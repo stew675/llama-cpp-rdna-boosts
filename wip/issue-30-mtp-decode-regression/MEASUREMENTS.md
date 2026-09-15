@@ -639,7 +639,13 @@ gfx1201, which is what the band split is there to avoid.
 `ggml/src/ggml-cuda/{fattn-common.cuh,fattn-tile.cuh,fattn-tile.cu,fattn-mma-f16.cuh}` on top of the
 TODO-21 change (`common.cuh`, `fattn-vec.cuh`, `fattn.cu`, `ggml-cuda.cu`), i.e. the r4 candidate plus
 item 2: `8 files changed, +445/-61`.  Logs: `results/2026-09-15-item2-*.txt` (fix1..fix4 = the
-`test-backend-ops` iterations, `-perf*`, `-purity*`, `-textgate*`).
+`test-backend-ops` iterations, `-perf*`, `-purity*`, `-textgate*`).  **2026-09-15 hygiene:** the four
+`fix*.txt` raw logs (~12 MiB, ~27k lines each) were trimmed in place to their claim-carrying content --
+header, the per-K/V-type coverage table, the failure groups with one verbatim sample each, and the
+totals -- by `tools/trim-backend-ops-log.py`, which stamps the original size into each file.  Nothing is
+lost that is not in this section: fix1 shows the loader-branch NaNs (q4_1/q5_0/q5_1, hsk 64/72 + one
+`iq4_nl`), fix3 the q5 nibble `ERR`s, fix4 `5951/5951` with zero failures, and the coverage table still
+lists the reporter's four mixed-K/V pairs (f16/q4_0, q4_0/f16, q4_0/q8_0, q8_0/q4_0).
 
 ---
 

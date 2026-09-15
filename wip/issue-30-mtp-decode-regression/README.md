@@ -335,3 +335,21 @@ in `~/llama.cpp` (4 files under `ggml/src/ggml-cuda/`), saved as
 `patches/` and the fork's committed `rdna-boosts` branch are **untouched**.  Promotion to a block-15
 amendment (regenerate the set, re-run `apply-all.sh` + `validate-set.sh`) is a separate, explicit step
 gated on the maintainer.
+
+## 7. Repository hygiene (2026-09-15)
+
+The dossier's `results/` had accumulated ~12 MiB of raw `test-backend-ops` logs (~27k lines / ~3 MiB
+each) that dwarfed every other artifact in the delivery repo.  They were trimmed **in place** to their
+claim-carrying content by `tools/trim-backend-ops-log.py` (kept: header, the per-K/V-type coverage
+table, the failure groups with one verbatim sample each, the totals) — `results/` is 248 KiB now, and the
+banner in each file records its original line/byte count, so the trim is auditable rather than invisible.
+The content that mattered survived *and read better*: fix1 shows the loader-branch NaNs
+(q4_1/q5_0/q5_1 at hsk 64/72, plus one `iq4_nl`), fix2/fix3 the q5 nibble `ERR`s, fix4 `5951/5951` with
+zero failures — the three-bug progression at a glance.  `MEASUREMENTS.md` (§I) was annotated accordingly.
+
+Not touched, deliberately: the two `2026-09-15-launchdump-fw{1,2}.txt` (74 KiB each — they *are* the
+`W=1` vs `W>=2` evidence), the small text/hash logs, and everything under `tools/` and `patches/`.
+
+`archive/work/wip-archive/qwen35moe-prefill/data/` got the same treatment via its own
+`data/trim-op-timing-log.py` (11 MiB -> 60 KiB; the op-timing aggregates are what `report.md`'s tables
+were built from, so every cited share is preserved).
