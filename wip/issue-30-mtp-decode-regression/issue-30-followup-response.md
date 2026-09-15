@@ -1,4 +1,4 @@
-# Issue #30 — follow-up response to @briansp2020 (to post after the next cut)
+# Issue #30 — follow-up response to @briansp2020 (for r4)
 
 > Status: **ready to post** — `v16-790cf51aa-r4` is tagged (tip `b19c70b34`). Written 2026-09-14,
 > updated 2026-09-15 after the r4 cut.
@@ -39,8 +39,9 @@ matching q8_0. (The alloc-size function now mirrors the tile instantiation exact
 two can't drift again.)
 
 q4_0 perf after both fixes (27B UD-Q4_K_XL, 1 GPU): `pp150000` **694.5**, `tg64` **28.62 / 25.34 /
-22.73** at d0 / d32k / d65k, greedy text staged == native. Thanks for the nudge — without your q4_0
-report I would have shipped the V4 memory claim as applying to q4_0, and it didn't.
+22.73** at d0 / d32k / d65k, greedy text staged == native (**`118eb7f5fe85`** — and unchanged with
+``GGML_CUDA_FA_STAGE_MAX_MB=1``, i.e. with the prefill staging removed altogether). Thanks for the nudge
+— without your q4_0 report I would have shipped the V4 memory claim as applying to q4_0, and it didn't.
 
 ## The remaining issue-#30 item: quantized-KV prefill at depth
 
@@ -55,7 +56,10 @@ captured (multi-token graphs were already being skipped).
 
 Result (27B, q8_0, `pp150000`): **691.4** on one card (was 661.0 native), **1076.9** on two (was 996.0),
 **1199.0** on three (was 1111.4) — i.e. at or above the F16-scaling margin, with the decode win and the
-123 MiB reserve both intact. Same-seed greedy text is bit-identical staged vs native.
+123 MiB reserve both intact. Same-seed greedy text is bit-identical across all three arms — the band
+split, staging everywhere (`GGML_CUDA_FA_KV_NATIVE=0`) and native everywhere
+(`GGML_CUDA_FA_STAGE_MAX_MB=1`): **`472b282950b5`** (q8_0), **`118eb7f5fe85`** (q4_0),
+**`70960317a203`** (f16) on the 27B with a 5256-token prompt, `-n 128 --seed 42 --temp 0`.
 
 It is **arch-gated**, because gfx1151 has no crossover: I built the exact delivery tree on a Strix Halo
 box and measured native vs staging on 9B Q8_0, and native wins prefill at *every* depth there, by a
@@ -72,7 +76,7 @@ bf16 gives `argmax 9146` for both `W=1` and `W=4` with the top-1 differing by 0.
 margin of 2.2, and q4_1 by 0.064 against a margin of 2.6 — so the greedy token is unchanged. I re-ran the
 whole grid to state this precisely (4B, gfx1201, five prefill lengths, `W=1..8` one logits hash): f16,
 bf16, q8_0, q5_0, q5_1 and iq4_nl are pure at all five; bf16 moves at P=200; q4_0 at P=224/P=256; q4_1 at
-P=200.
+P=200.  (The per-type hashes are in the verification table at the end of this post.)
 
 So I've stopped treating it as a defect to chase and made the policy explicit, at the level it actually
 holds. The delivery **guarantees** the text/acceptance contract for **f16, bf16 and q8_0** — one greedy
@@ -92,7 +96,8 @@ whatever axis each one touches, recurring with every new single-token-tuned kern
 0.25 faster than stock in both settings because it carries the threshold fix; the delivery never showed
 the regression because `Q->ne[1] > 8` already keeps the whole `W <= 8` band (your repro range) on the
 tile kernel, and for `n_q = 9..N` the tuned head-256 WMMA configs sit at parity with the tile kernel
-(recall `n_max 8`: 115.10 vs 115.72 t/s; `n_max 15`: 147.19 vs 147.80; acceptance bit-identical). Your
+(recall `n_max 8`: 115.10 vs 115.72 t/s; `n_max 15`: 147.19 vs 147.80; acceptance bit-identical —
+`0.96712` at `n_max 8` and `0.93186` at `n_max 15`, both arms, same drafts). Your
 fix is still the right thing for upstream master — it's just not a gap in this tree.
 
 **The flat VRAM is the prefill-graph skip** (multi-token graphs were already not being captured, since
@@ -129,6 +134,27 @@ pair of eyes on are (a) `test-backend-ops -o FLASH_ATTN_EXT` (expect **5951/5951
 be gone), (b) a q4_0-KV soak with `-c 196608` headroom, since q4_0's reserve just dropped by 726 MiB and
 that is the axis your VRAM measurements are strongest on, and (c) the q4_1/q5_0/q5_1/iq4_nl decode at
 depth — those four should now sit with q8_0 instead of ~12-16 % behind it.
+
+For the record, the per-type gates on the 4B (128 greedy tokens, `-sm layer`, seed 42, prose prompt) —
+column 2 is the text hash, identical with the native path and the staged path, and column 3 is the single
+`W=1..8` logits hash at P=256 on gfx1201:
+
+| KV | greedy text (native == staged) | `W=1..8` @P=256 |
+|---|---|---|
+| f16 | `ef279d67a708` | `bc8c5b7b0f24c937` |
+| bf16 | `56017911fa5e` | `7577f1535c9b0e91` |
+| q8_0 | `48bd1e182077` | `3aa9cb89f496df8e` |
+| q4_0 | `9293d86f90e9` | `be935417430ebf54` (W=1) / `1cb34607a860b19b` (W>=2) |
+| q4_1 | `318c1a31e0ec` | `459a7671103cd72a` |
+| q5_0 | `ef279d67a708` | `86c0272ab7eaaa18` |
+| q5_1 | `146beb0df3f4` | `b3cfddf2cf5da3d2` |
+| iq4_nl | `7eeaf3df02c3` | `f12ae530be15fd2b` |
+
+On gfx1151 (Strix Halo, 4B) every type is pure at P=256: f16 `daf98ea7d1e2ea55`, bf16 `9160fca97e066781`,
+q8_0 `8a9f58ccaf311831`, q4_0 `a5d2af0c863b8cf4`, q4_1 `bccfbcd1126b0b9e`, q5_0 `98693387c5470724`,
+q5_1 `6dcc3610165acead`, iq4_nl `12ac2cae6ee6cdf8`; the greedy-text hashes there are f16/q8_0
+`bbb051e2aeab`, bf16/q5_0 `48bd1e182077`, q4_0 `18f73fe73098`, q4_1 `84f3e5783c4f`, q5_1 `146beb0df3f4`,
+iq4_nl `6298a6e76c03`.
 
 r4: **`v16-790cf51aa-r4`**, tip `b19c70b341f9ed439bcda2a636fe6e5fa4fa634b`, tree
 `7fab975d9518b29aa7d890c1163f13a6c393c5df` (`scripts/validate-set.sh` passes strict 16/16).
