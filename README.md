@@ -199,9 +199,8 @@ for per-block verification and `BASELINE.md` for provenance.
   **`d1d3c3396`** (re-based 2026-09-15; previously `790cf51aa`, re-based 2026-09-13 from `9113cc188`).
 - Patches `patches/0000-…0015-…`, applied with **strict 16/16 `git am`** by
   `scripts/apply-all.sh` (no 3-way fallback, whitespace-clean).
-- Canonical 16-block chain: tip `af9ce375ded5238b59598290ad7366760b7dc6e0`,
-  net tree `c6896785a5fefdf9438d26974c0274bf99f43263`.
-- Release **`v16-d1d3c3396-r1`**.  `scripts/validate-set.sh` passes strict 16/16
+- Canonical 16-block chain: tip `f8247e698`, net tree `b97cbdd4ab5cb435aaf07373b012fbb4de4d4af6`.
+- Release **`v16-d1d3c3396-r2`**.  `scripts/validate-set.sh` passes strict 16/16
   (applied tree == the recorded tree).
 - Greedy purity: plain decode == `draft-mtp` verify for
   `--spec-draft-n-max <= 7` across the supported KV types (4B and 27B all
@@ -214,8 +213,17 @@ for per-block verification and `BASELINE.md` for provenance.
   config), [`MANIFESTS.md`](MANIFESTS.md) (apply order + verification contract)
   and [`BASELINE.md`](BASELINE.md) (fork point + drift policy).
 
-**Latest change (2026-09-15) — re-base onto upstream master `d1d3c3396` (release
-`v16-d1d3c3396-r1`).**  51 upstream commits past `790cf51aa`; three files conflicted (block 00's
+**Latest change (2026-09-15, r2) — the adaptive-MTP controller is re-tuned (issue #35).**  On the
+reporter's cell (27B Q8_0 x 2-card tensor, f16 KV, `-n 3000`) an adaptive ceiling of 12 lost 3.6 % to
+ceiling 7 (92.8 vs 96.3 t/s).  Block 01 now carries the credit-bucket controller with a depth-growing
+climb budget, a steeper drop pressure and a cold start at `cap - 3`, and reports its depth transitions
+at TRC.  Same cell: code **96.0 vs 95.8** (4 depth changes instead of 40), reasoning +5.0 %, prose
++11.2 %, code +18.8 %, recall +58.7 % riding at the ceiling; the new phase-switching prompt
+(`prompts/code-reasoning-mixed.txt`) reads 64.0 against its 64.3 pinned-depth optimum; the 1-card
+UD-Q4_K_XL reference gains +37.9 % on code (84.7 vs 61.4).  Greedy output is unchanged.  Record:
+[`benchmarks/2026-09-15-adaptive-mtp-tuning.md`](benchmarks/2026-09-15-adaptive-mtp-tuning.md).
+
+**Previous change (2026-09-15, r1) — re-base onto upstream master `d1d3c3396`.**  51 upstream commits past `790cf51aa`; three files conflicted (block 00's
 Vulkan masked-V fix vs upstream's sparse FA, the FA test matrix, and qwen4exp's `{n_embd, hc}` norm
 fold — plus the MTP `nextn.hc_head_norm` load-shape crash the merge exposed and validation caught).
 Revalidated end-to-end on gfx1201: `FLASH_ATTN_EXT` 5951/5951, all custom ops pass, plain ==

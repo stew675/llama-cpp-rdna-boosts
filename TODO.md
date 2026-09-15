@@ -93,7 +93,7 @@ acceptance; the delivery's drafting improvements made it over-climb, so the tabl
 - Dossier + repro: [`wip/adaptive-mtp-ceiling-scaling/`](wip/adaptive-mtp-ceiling-scaling/)
   (`README.md` = finding/data, `HANDOVER.md` = the turnkey brief for the next session, `repro.sh` =
   the sweep).
-- Fix shape: **the tuned bucketed controller** (`wip/adaptive-mtp-ceiling-scaling/bucketed-port/`
+- Fix shape: **the tuned bucketed controller** (`archive/work/adaptive-mtp-ceiling-scaling/bucketed-port/`
   — `tuned-port.patch` + README; from `~/stew675/llama-master` branch `bucketed-adaptive-mtp`).  The
   bucketed credit's zero-crossing already lands on the throughput optimum of every axis, so the fix
   is three tuning changes for the delivery's higher acceptance: a **cold start** at `cap - 3` (the

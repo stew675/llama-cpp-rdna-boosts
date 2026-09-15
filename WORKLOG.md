@@ -1,5 +1,61 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-15 (block-01 amendment) — `v16-d1d3c3396-r2`: tuned bucketed adaptive-MTP controller
+
+**Release.** `v16-d1d3c3396-r2`, fork point `d1d3c3396` (tree `3ce99b5422bf`), canonical 16-block
+tip `f8247e698`, tree `b97cbdd4ab5cb435aaf07373b012fbb4de4d4af6`.  `scripts/validate-set.sh` passes
+strict 16/16 (`git am`, applied tree == recorded tree).  **Only block 01 changed.**
+
+**Why.**  The reporter's issue-#35 cell (Qwen3.8-27B **Q8_0 x 2-card `-sm tensor`**, f16 KV,
+`-n 3000`) lost ~3.6 % to a lower ceiling: adaptive `--spec-draft-n-max 12` read **92.8 t/s against
+96.3** at ceiling 7, while the pinned-depth optimum is **99.0** at depth 10.  The mean-reverting
+`climb_threshold`/`drop_pressure` table was tuned for mainline acceptance, and the delivery's higher
+acceptance moves the operating point.
+
+**What landed.**  Block 01's controller is replaced by the credit-bucket form (stew675's bucketed
+design: `delta = n_accepted - depth`, except that a full accept credits `max(1, n_accepted - 1)`, with
+the surplus or deficit carried across a depth change) and tuned:
+
+- `climb_budget(d) = 20 + 6*(d - 1)` — a flat budget let six consecutive full accepts at depth 8
+  cascade the depth 9 -> 10 -> 11 -> 12 in 16 rounds, because the credit grows with depth.
+- `drop_pressure(d) = max(60, 10*d)` (was `max(20, 4*d)`) — damps the slow 6 <-> 12 limit cycle that
+  produced **40 depth changes in 477 verification rounds**.
+- cold start `min(cap, max(floor, cap - 3))` (was the floor) — off the floor a step costs ~20 net
+  full accepts and the controller burned a third of a 3000-token run reaching the plateau, which is
+  the entire advantage of a higher ceiling; settling *down* is cheap even when the equilibrium is the
+  floor (the drift is strongly negative there), so a reasoning workload pays almost nothing.
+- the depth state transition is reported at **TRC** (it is the user-visible explanation of a run's
+  decode throughput) and now carries `n_bucket`; `tests/test-speculative-adaptive.cpp` is rewritten
+  against the bucket constants; the `--spec-draft-n-min-adaptive` help/doc wording no longer claims
+  it is the starting depth.
+
+**Why the credit function itself needed no tuning.**  The bucket drift's zero-crossing already lands
+on the throughput optimum of every workload measured -- code ~9, prose/reasoning/phase-switching at
+the floor, verbatim recall at the ceiling -- each confirmed with a pinned-depth sweep.  The
+delivery's higher acceptance raises the drift at every depth, which is why only the constants needed
+the tuning.
+
+**Measured** (Q8_0 27B x 2-card tensor, f16 KV, `-n 3000`): code ceiling-12 **96.0** vs ceiling-7
+**95.8** (was 92.8 vs 96.3), 4 depth changes instead of 40; reasoning 60.8 vs 57.9 fixed-3 (+5.0 %),
+prose 81.2 vs 73.0 (+11.2 %), code 96.0 vs 80.8 (+18.8 %), recall 137.3 vs 86.5 (+58.7 %, mean depth
+10.6 riding at the ceiling).  On the 1-card UD-Q4_K_XL reference code ceiling-12 is **84.7** vs
+ceiling-7 61.4 (+37.9 %), reasoning -0.8 %, prose +0.4 %.  Greedy output is purity-neutral:
+adaptive cap 7 == adaptive cap 12 == fixed `draft-mtp` (byte-identical text).  Record:
+`benchmarks/2026-09-15-adaptive-mtp-tuning.md`.
+
+**New gate prompt.**  `prompts/code-reasoning-mixed.txt` (sha256 `97a4caa7...`) -- ten tasks that each
+ask for prose reasoning *then* a snippet, so the stream alternates code <-> reasoning.  It is maximal
+at the floor (64.3 t/s at depth 3, falling monotonically to 50.0 at depth 12), so it is the prompt
+that punishes a controller slow to drop after a code phase; the tuned controller reads **64.0**
+against its 64.3 pinned-depth optimum.  A near-ratchet tuning that won pure code
+(`drop max(120, 30d)` = 94.7) lost 2 % here and was rejected.
+
+**Residual.**  An unexplained ~2 % gap between an adaptive run and a *pinned* run at the same mean
+depth (per-round wall time; the transitions themselves cost only +1.0 ms/change).  Maintainer
+hypothesis: graph invalidation on the depth change.  `cap - 3` and the constants are tuned on the
+reporter's cell and should be re-tuned per shape (the `SPC_*` env knobs used for the sweep are WIP
+only and are not in the delivery).
+
 ## 2026-09-15 (re-base) — `v16-d1d3c3396-r1`: re-based onto upstream master `d1d3c3396`
 
 **Release.** `v16-d1d3c3396-r1`, fork point `d1d3c3396` (`ci: build MUSA for only 1 arch (#28944)`,

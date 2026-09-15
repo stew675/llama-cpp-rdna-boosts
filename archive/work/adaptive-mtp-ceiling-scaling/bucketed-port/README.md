@@ -20,7 +20,7 @@ In the delivery worktree (`~/llama-cpp-rebase`):
 
 ```sh
 cd ~/llama-cpp-rebase
-git apply ~/llama-cpp-rdna-boosts/wip/adaptive-mtp-ceiling-scaling/bucketed-port/port.patch
+git apply ~/llama-cpp-rdna-boosts/archive/work/adaptive-mtp-ceiling-scaling/bucketed-port/port.patch
 cmake --build build-rocm --target llama-cli -j16
 ```
 
@@ -91,7 +91,7 @@ expensive). The lever is not the climb *rate* but the controller's **spread/stab
 
 ```sh
 cd ~/llama-cpp-rebase          # the disposable delivery worktree
-git apply ~/llama-cpp-rdna-boosts/wip/adaptive-mtp-ceiling-scaling/bucketed-port/tuned-port.patch
+git apply ~/llama-cpp-rdna-boosts/archive/work/adaptive-mtp-ceiling-scaling/bucketed-port/tuned-port.patch
 cmake --build build-rocm --target llama-cli -j16
 ```
 `tuned-port.patch` applies to the canonical HEAD (`af9ce375d`); it is self-contained (the bucketed

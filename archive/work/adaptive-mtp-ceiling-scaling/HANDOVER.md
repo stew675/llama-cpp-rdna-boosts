@@ -38,7 +38,7 @@ Models: `/llm/models/Qwen3.8/27B/Q8_0/Qwen3.8-27B-Q8_0.gguf`, `.../Q6_K/...`,
 ## Reproduce
 
 ```sh
-wip/adaptive-mtp-ceiling-scaling/repro.sh new        # the whole sweep (~20 min)
+archive/work/adaptive-mtp-ceiling-scaling/repro.sh new        # the whole sweep (~20 min)
 # the key cell by hand:
 HIP_VISIBLE_DEVICES=1,2 build-rocm/bin/llama-cli \
   -m /llm/models/Qwen3.8/27B/Q8_0/Qwen3.8-27B-Q8_0.gguf \

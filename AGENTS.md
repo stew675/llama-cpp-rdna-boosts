@@ -513,6 +513,18 @@ Consequences, so it is not re-litigated:
   Before shipping any decode/verify or mmvq change, run the stock-relative verify-width
   `llama-batched-bench -npl 1,4,8` gate added to `benchmarks/mtp-adaptive-methodology.md` (rule 5) —
   acceptance and `llama-bench tg128` both pass while a verify-width regression is present.
+- **The adaptive-MTP controller is the tuned bucketed one (2026-09-15, release `v16-d1d3c3396-r2`).**
+  Block 01 carries the credit-bucket controller (`delta = n_accepted - depth`, a full accept crediting
+  `max(1, n_accepted - 1)`, surplus/deficit carried across a depth change) with the delivery's tuned
+  constants: `climb_budget(d) = 20 + 6*(d - 1)`, `drop_pressure(d) = max(60, 10*d)`, and a cold start
+  at `min(cap, max(floor, cap - 3))`.  The credit function's drift zero-crossing already equals each
+  workload's throughput optimum (code ~9, prose/reasoning/phase-switching at the floor, verbatim
+  recall at the ceiling); the constants are what changes with the delivery's acceptance.  The depth
+  transitions are reported at **TRC** (with `n_bucket`).  Measurements, the pinned-depth oracle and
+  the rejected variants: `benchmarks/2026-09-15-adaptive-mtp-tuning.md` and
+  `archive/work/adaptive-mtp-ceiling-scaling/`.  **Judge any further adaptive change on the four axes
+  AND the phase-switching prompt `prompts/code-reasoning-mixed.txt`** -- a near-ratchet setting that
+  won pure code lost 2 % on it.
 - **FA instantiation discipline (2026-09-15): a FA kernel's KV *type* axis must be instantiated in the
   generated `template-instances/*.cu` files, never left implicitly in the dispatch TU.**  The dispatch
   (`fattn-tile.cu`, `fattn-mma-f16.cu`) has an unconditional `case`/arm chain per native KV type, so any
