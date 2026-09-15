@@ -1,5 +1,35 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-15 (latest) — GHCR containers (issue #33): ROCm >= 7.14 images could not find the ROCm runtime
+
+**The report.**  Issue #33 ("No usable GPU found in container"): `ghcr.io/stew675/llama-cpp-rdna-boosts:latest`
+started with `warning: no usable GPU found ... compiled without GPU support`, and `ldd libggml-hip.so`
+showed every ROCm dependency unresolved (`librccl.so.1`, `libhipblas.so.3`, `librocblas.so.5`,
+`libamdhip64.so.7` → `not found`).  The same `ldd` in upstream's `server-rocm` (ROCm 7.2.1) resolved
+them to `/opt/rocm-7.2.1/lib/...`, which is why the comparison looked like a build defect.
+
+**The cause (build system, not the patch set).**  The ROCm `>= 7.14` `-full` dev images install the
+runtime under `/opt/rocm/core-<ver>/lib` (exposed as `/opt/rocm/lib` through the alternatives links) but
+**do not register that path with the dynamic loader**: `/etc/ld.so.conf.d/` has only the OpenCL entry and
+the images set no `LD_LIBRARY_PATH` (`ldconfig -p | grep rocm` = 0).  The built `libggml-hip.so` carries
+only the useless build-tree `RUNPATH=/app/build/bin`, so the backend dlopen fails and llama.cpp falls back
+to "compiled without GPU support".  The `<= 7.2` `-complete` images still register `/opt/rocm-<ver>/lib`
+via ldconfig (81 cache entries) — that is the upstream-image case that works, and it is why only the
+`full`-based lines broke.
+
+**The fix.**  `.devops/rdna-rocm.Dockerfile`: `ENV LD_LIBRARY_PATH=/opt/rocm/lib` in the `base` stage
+(inherited by `full`/`light`/`server`); harmless on the 7.2 line, which already resolves via ldconfig.
+`/opt/rocm/lib` is safe to put first — it holds no system sonames (the sysdeps are isolated under
+`/opt/rocm/lib/rocm_sysdeps/lib`, which is deliberately *not* added, its libs resolve via `$ORIGIN`).
+Same change also drops the stale `MrDrMcCoy` URLs from the image labels (now `stew675`) and from
+`CONTAINERS.md`; the workflow already pushed to `ghcr.io/${GITHUB_REPOSITORY_OWNER}/...`.
+
+**Verified on gfx1201.**  Reproduced on the published `latest` and `server-rocm-7.14`
+(`llama-server --list-devices` → `Available devices: (none)`); with the env baked in (built as a one-line
+layer on top of each image) the dependencies resolve and it lists `ROCm0..2: AMD Radeon AI PRO R9700
+(gfx1201)` plus `ROCm3: gfx1036`.  `server-rocm-7.2` was already correct.  No patch/`release.json` change;
+the already-published 7.14/10.0 tags need a rebuild (weekly schedule or the next `v*` tag) to carry it.
+
 ## 2026-09-15 (later) — `v16-790cf51aa-r5`: build time — a clean backend build was gated by one translation unit
 
 **Release.**  `v16-790cf51aa-r5`, tip `6f76c1cb1d80c7ecbf176f939a351bc385ff33fc`, tree

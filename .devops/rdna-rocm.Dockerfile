@@ -30,8 +30,8 @@ ARG BASE_ROCM_DEV_CONTAINER=docker.io/rocm/dev-ubuntu-${UBUNTU_VERSION}:${ROCM_V
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
 ARG APP_REVISION=N/A
-ARG IMAGE_URL=https://github.com/MrDrMcCoy/llama-cpp-rdna-boosts
-ARG IMAGE_SOURCE=https://github.com/MrDrMcCoy/llama-cpp-rdna-boosts
+ARG IMAGE_URL=https://github.com/stew675/llama-cpp-rdna-boosts
+ARG IMAGE_SOURCE=https://github.com/stew675/llama-cpp-rdna-boosts
 
 ARG NODE_VERSION=24
 
@@ -101,11 +101,20 @@ RUN mkdir -p /app/full \
 ## Base image
 FROM ${BASE_ROCM_DEV_CONTAINER} AS base
 
+# ROCm >= 7.14 dev images install the runtime under /opt/rocm/core-<ver>/lib
+# (exposed as /opt/rocm/lib) and do not register it with the dynamic loader:
+# there is no /etc/ld.so.conf.d entry and the images set no LD_LIBRARY_PATH.
+# Without the line below libggml-hip.so cannot resolve libhipblas / librocblas /
+# libamdhip64 / librccl, the HIP backend fails to dlopen and llama.cpp falls
+# back to "no usable GPU found ... compiled without GPU support".  Harmless on
+# the <= 7.2 -complete images, which register the path via ldconfig.
+ENV LD_LIBRARY_PATH=/opt/rocm/lib
+
 ARG BUILD_DATE=N/A
 ARG APP_VERSION=N/A
 ARG APP_REVISION=N/A
-ARG IMAGE_URL=https://github.com/MrDrMcCoy/llama-cpp-rdna-boosts
-ARG IMAGE_SOURCE=https://github.com/MrDrMcCoy/llama-cpp-rdna-boosts
+ARG IMAGE_URL=https://github.com/stew675/llama-cpp-rdna-boosts
+ARG IMAGE_SOURCE=https://github.com/stew675/llama-cpp-rdna-boosts
 LABEL org.opencontainers.image.created=$BUILD_DATE \
       org.opencontainers.image.version=$APP_VERSION \
       org.opencontainers.image.revision=$APP_REVISION \

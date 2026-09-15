@@ -21,7 +21,7 @@ patched tree the same way the consumer workflow does:
 ## Images
 
 Registry path: `ghcr.io/<owner>/<repo>` (here
-`ghcr.io/mrdrmccoy/llama-cpp-rdna-boosts`).
+`ghcr.io/stew675/llama-cpp-rdna-boosts`).
 
 | ROCm | base image | tags |
 |------|-----------|------|
@@ -38,6 +38,11 @@ RDNA3.5 / RDNA4) with runtime dispatch, so one image serves every supported
 GPU family. `server` exposes the HTTP API on `8080`, `light` is CLI-only,
 `full` adds the Python conversion tooling.
 
+The ROCm `>= 7.14` `-full` base images do not register `/opt/rocm/lib` with the
+dynamic loader (no `/etc/ld.so.conf.d` entry, no `LD_LIBRARY_PATH`), so the
+image sets `LD_LIBRARY_PATH=/opt/rocm/lib` in its `base` stage — without it the
+HIP backend cannot dlopen and llama.cpp reports "no usable GPU found".
+
 ## Running
 
 ```bash
@@ -46,7 +51,7 @@ docker run --rm -it \
   --device /dev/kfd --device /dev/dri \
   --group-add video \
   -v ~/models:/models -p 8080:8080 \
-  ghcr.io/mrdrmccoy/llama-cpp-rdna-boosts:rocm-7.14 \
+  ghcr.io/stew675/llama-cpp-rdna-boosts:rocm-7.14 \
   -m /models/Qwen3.5-4B-Q8_0.gguf -ngl 99 -sm tensor -mg 0
 ```
 
