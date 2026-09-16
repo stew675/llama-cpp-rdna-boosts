@@ -2,14 +2,61 @@
 
 **Date:** 2026-09-16.  **Status:** the copy-engine AR is **LANDED in the delivery** as the block-12
 amendment of **`v16-d1d3c3396-r4`** (`GGML_CUDA_ALLREDUCE=ce`, opt-in, 2-GPU, `hybrid` still the
-default — see `WORKLOG.md` 2026-09-16).  The design work below is the still-unlanded *overlap* half:
-steps 1-3 are implemented and measured, the two blockers are root-caused, and the ~21-25 % is
-designed but not achieved.  Nothing in this directory is part of the delivery.
-**Read this top-to-bottom; it is written to be self-contained after a context compaction.**
+default — see `WORKLOG.md` 2026-09-16).  The work in *this* directory is the still-unlanded
+*overlap* half: steps 1-3 are implemented and measured, the two blockers are root-caused, and the
+~21-25 % is designed but not achieved.  **Nothing in this directory is part of the delivery.**
 
-Everything lives under `wip/q8-prefill-tuning/` (this repo).  **Nothing here is delivery work** — the
-`patches/` set is untouched, and `~/llama.cpp` was left clean (only the two pre-existing
-`common.cuh`/`fattn-common.cuh` edits).  The CE prototype is a `.patch` you apply and revert.
+**Read this top-to-bottom; it is written to be self-contained after a context compaction.**  If you
+are picking this up cold, read the *Where things stand* section immediately below first, then
+`OVERLAP-DESIGN.md` §6, then the rest as needed.
+
+---
+
+## Where things stand and what to do next
+
+**Delivery state.**  The repo's `main` is at release **`v16-d1d3c3396-r4`** (commit `c03db1a`, tag
+`v16-d1d3c3396-r4` pushed; `release.json` is the source of truth).  Block 12 now carries the opt-in
+`GGML_CUDA_ALLREDUCE=ce` copy-engine (SDMA) 2-GPU all-reduce; **`hybrid` is unchanged and remains the
+default**.  Validation (`scripts/validate-set.sh`) passes strict 16/16 and the CI *Validate delivery
+set* job is green.  `ce` is **in beta**: the maintainer posted it to GitHub for users to exercise, so
+beta bug reports may arrive as repo issues — treat any report as `ce`-specific until proven
+otherwise, and remember that `hybrid` must stay bit-for-bit unaffected (that is the whole point of
+landing it as a separate arm).
+
+**Unlanded.**  Everything in `wip/q8-prefill-tuning/` (this file, `OVERLAP-DESIGN.md`, `README.md`,
+`tools/`).  The delivery `patches/` do **not** contain the overlap work, the `GGML_AR_NOOP` knob, or
+the `ggml_backend_comm_set_stream_no` hook.
+
+**The next action, concretely — blocker A** (`OVERLAP-DESIGN.md` §6.1): the scheduler serializes
+consecutive chunk graphs.  `ggml_backend_sched_alloc_splits` (`ggml/src/ggml-backend.cpp`, ~line 1660)
+calls `ggml_backend_synchronize` on every backend whenever `n_async_devices > 1` and a graph is
+(re)allocated — always true with 2 GPUs.  Make that conditional (env-gate it), keep
+`GGML_META_CHUNK_PIPELINE=2`, and re-run with `GGML_META_CHUNK_TRACE=1`.  **The signature of success
+is the ~374 ms host gap between two chunk dispatches vanishing** (it collapses to 13-20 ms today only
+when `GGML_AR_NOOP=1`).  Blocker B (per-chunk input copies, §6.2) then decides whether the result is
+also *correct* — **A alone gives a race, B alone gives no overlap, so both are needed.**
+
+**What to do with the repo checkouts (verified 2026-09-16):**
+
+| path | what it is |
+|---|---|
+| `~/llama-cpp-rdna-boosts` | this delivery repo, branch `main` @ `c03db1a` (r4; the `ce` arm is in `patches/0012-...patch`).  Also carries the pre-r4 sets in history (`76c548b` = r3). |
+| `~/llama.cpp` | the working fork checkout, `rdna-boosts` @ `d64a878b9` — a *local rebuild* chain, **NOT** the canonical one, and it does **not** contain the `ce` code (`grep -c ggml_backend_cuda_comm_init_ce` = 0).  This is the build/bench tree all the measurements were taken in.  Two pre-existing uncommitted edits (`common.cuh`, `fattn-common.cuh`) — leave them. |
+| `~/llama-cpp-rebase` | a second, clean canonical checkout; the r4 block-12 amendment was made here.  Detached at `f8247e698`; the r4 chain tip is `c08efa1bc` (reachable by SHA). |
+
+**To reproduce the measured state** (this is the recommended starting point): in `~/llama.cpp`,
+
+```bash
+git apply <repo>/wip/q8-prefill-tuning/tools/ce-allreduce.patch        # ce + GGML_AR_NOOP + stream hook
+git apply <repo>/wip/q8-prefill-tuning/tools/meta-chunk-pipeline.patch # ggml-backend.h + meta backend
+export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib ROCM_PATH=/opt/rocm-7.14-gfx1201 HIP_PATH=/opt/rocm-7.14-gfx1201
+cmake --build build-rocm --target ggml-hip llama-bench llama-cli -j 16
+```
+
+`ce-allreduce.patch` was cut against the **r3** tree, which is exactly what `~/llama.cpp` is, so it
+applies cleanly there.  (Do **not** try to apply it on top of the r4 delivery tree — r4 already
+contains the `ce` arm, so it would conflict.  On an r4 tree you only need the two small extras:
+`GGML_AR_NOOP` and the `set_stream_no` hook.)
 
 ---
 
@@ -51,7 +98,7 @@ NCCL (see §3.6) — but it is the only *overlappable* one, so it stays the vehi
 |---|---|
 | GPUs | 2× AMD Radeon AI PRO R9700, gfx1201, 64 CU each; **BIOS PCIe Gen5 x4** per slot |
 | model | `/llm/models/Qwen3.8/27B/Q8_0/Qwen3.8-27B-Q8_0.gguf` (27.04 GiB, 27.32 B, qwen35 hybrid GDN) |
-| build | `~/llama.cpp` @ `d64a878b9` (block-15 tip), `build-rocm`, ROCm 7.14 gfx1201 |
+| build | `~/llama.cpp` @ `d64a878b9` (working fork, block-15 tip; it carries the `ce` code — the same code as delivery r4), `build-rocm`, ROCm 7.14 gfx1201 |
 | baseline cmd | `HIP_VISIBLE_DEVICES=0,1 llama-bench -m $M -ngl 99 -sm tensor -fa 1 -ctk bf16 -ctv bf16 -b 2048 -ub 2048 -p <P> -n 0 -r 3` |
 | profiler | `rocprofv3 --kernel-trace` (note: `SQ_INSTS_*` counters return 0 on gfx1201) |
 | vLLM ref | `~/vllm-build/logs/start-vllm.out` (config), model `Qwen3.8-27B-FP8-kvscales` |
@@ -67,8 +114,9 @@ default `-ub 512` (the one free config win; server default is still 512).
 
 ## 2. The diagnostic that settles everything
 
-`GGML_AR_NOOP=1` (a 2-line early-`return true` in `ggml_backend_cuda_comm_allreduce_nccl` and
-`..._internal` in `ggml-cuda.cu`) makes the AR do nothing — wrong output, benches only:
+`GGML_AR_NOOP=1` (a 2-line early-`return true` in `ggml_backend_cuda_comm_allreduce_tensor` in
+`ggml-cuda.cu`) makes the AR do nothing — wrong output, benches only.  **It is provided by
+`tools/ce-allreduce.patch` (this directory) and is deliberately NOT in the delivery.**
 
 | | pp512 | pp2048 | pp4096 |
 |---|---:|---:|---:|
@@ -80,7 +128,7 @@ i.e. the 2-GPU *compute* has zero scaling loss; all of the 1.42×-vs-2× loss is
 
 ---
 
-## 3. The prototype that exists: `GGML_CUDA_ALLREDUCE=ce` (copy-engine AR)
+## 3. The copy-engine AR: `GGML_CUDA_ALLREDUCE=ce` (shipped in r4; design + measurements below)
 
 ### 3.1 Design (what it is meant to be)
 
@@ -100,11 +148,20 @@ byte-identical to `hybrid`.  **Do not regress this routing when continuing.**
 
 ### 3.2 Implementation
 
-Files touched (all in `ggml/src/ggml-cuda/ggml-cuda.cu`; full diff parked):
+Files touched (all in `ggml/src/ggml-cuda/ggml-cuda.cu`):
 
 ```
-wip/q8-prefill-tuning/tools/ce-allreduce.patch     # 305 lines / 266 ins, apply with: git apply <patch>
+# the DELIVERY version of the ce arm (r4 block 12) is in patches/0012-...patch - that is the
+# shipped artifact; do not hand-edit it, regenerate from the fork.
+#
+# this directory holds the WIP experiment versions, which SUPERSEDE the delivery content:
+wip/q8-prefill-tuning/tools/ce-allreduce.patch        # ce + GGML_AR_NOOP + the stream hook
+wip/q8-prefill-tuning/tools/meta-chunk-pipeline.patch # ggml-backend.h + ggml-backend-meta.cpp
+# apply in that order; see "What to do with the repo checkouts" above
 ```
+
+The delivery block 12 content is exactly the `ce` arm below **minus** `GGML_AR_NOOP` and **minus**
+`ggml_backend_cuda_comm_set_stream_no` (those two are overlap-work scaffolding).
 
 - new context fields: `ce_buf` (bf16 staging, `ne` elements/rank), `ce_tmp` (reduce-scatter receive
   regions, **sender-indexed**), `ce_tmp2` (all-gather receive regions, sender-indexed), **four** events
@@ -135,7 +192,7 @@ wip/q8-prefill-tuning/tools/ce-allreduce.patch     # 305 lines / 266 ins, apply 
   to the **butterfly** (948 t/s on 3 GPUs vs 2376 for hybrid — a 2.5x cliff).  Never let `ce` fail
   into the butterfly.
 - `GGML_AR_NOOP=1` — bench-only escape hatch in the dispatcher that makes every AR a no-op, to measure
-  the AR-free ceiling.  Results are wrong by construction.
+  the AR-free ceiling.  Results are wrong by construction.  **WIP-only (not in the delivery).**
 
 ### 3.3 Measured result — 2 GPUs (27B Q8_0, `-sm tensor`, bf16 KV, `-b/-ub 2048`, `-r 2..3`)
 
@@ -256,26 +313,56 @@ scheduling.  Details, trace evidence and the revised order of work: `OVERLAP-DES
 
 ## 5. Proposed next steps, in order
 
-0. ~~Fix the multi-context crash~~ — **DONE** (§3.4; one-line sticky-error fix).
-1. ~~Re-measure decode with `ce`~~ — **DONE** (§3.3: `tg128` identical, greedy text identical,
-   `plain == draft-mtp` pure on 2 and 3 GPUs).  Warning for the future: `GGML_AR_NOOP` was stripped
-   from the tree; if you re-add it, remember it is bench-only.
-2. **Decide the config gate.**  `ce` wins on 2 GPUs (+4 %), loses on 3 (-6 %).  Options, in order of
-   preference: (a) leave `ce` as an explicit opt-in while the overlap work (§4) proceeds — the
-   overlapped form is expected to win on both; (b) if a default is ever wanted, gate it on
-   `n_backends == 2`.  Do **not** make it the default on 3+ GPUs as-is.
-3. **Build the token-chunk pipeline** — the ~21-25 %.  The design is complete and evidence-backed:
-   see `wip/q8-prefill-tuning/OVERLAP-DESIGN.md` (structure measurements, exact change sites, risks,
-   validation plan, and a 5-step order of work that starts with no-behaviour-change plumbing).  This
-   is the multi-day item; do it on 2 GPUs first.
-4. **After the pipeline lands**, re-test 3 GPUs and decide the config policy (the prefill AR exposure,
-   not its serialized speed, is what dominates; the pipeline is expected to change the 3-GPU
-   verdict).  Until then: `ce` on 2 GPUs, `hybrid` on 3.
+**Steps 0-2 are DONE and shipped.**  The multi-context crash is fixed (§3.4), decode is verified
+unharmed (§3.3), and the config decision was resolved by **shipping `ce` as an opt-in beta** in
+`v16-d1d3c3396-r4` (block 12) with `hybrid` untouched and still the default.  The "which is better"
+decision is **deliberately deferred** until the overlap work lands (the overlapped form is expected to
+win at every rank count).  Interim policy: **`ce` on 2 GPUs, `hybrid` on 3**.
+
+3. **THE NEXT THING — unblock the token-chunk pipeline** (the ~21-25 %).  The meta-backend plumbing
+   (parity streams + per-subgraph events) is **already built and validated inert**, so all that
+   remains is in ggml/llama core, in this order:
+   - **Blocker A:** gate the `n_async_devices > 1` synchronize in `ggml_backend_sched_alloc_splits`
+     (`ggml/src/ggml-backend.cpp`, ~line 1660, env-gate it).  This is the one conditional that
+     unlocks the overlap.  Success signature: the ~374 ms host gap between chunk dispatches vanishes
+     in `GGML_META_CHUNK_TRACE` output.
+   - **Blocker B:** give each chunk its own copy of the graph inputs (`inp_tokens`/`inp_pos`), else
+     the overlapped run is racy (and faults in `rope_multi` on non-uniform chunk sizes).
+   - Then re-validate and re-measure; the target is pp2048 ≈ 2700+ (from 2183) against the AR-free
+     ceiling of 2748.
+   Full design, change sites, risks and validation: **`OVERLAP-DESIGN.md` §6 and §7**.  Do it on
+   2 GPUs first.
+
+   **Ready-to-run commands** (after applying + building the two WIP patches as above):
+
+   ```bash
+   M=/llm/models/Qwen3.8/27B/Q8_0/Qwen3.8-27B-Q8_0.gguf
+   BASE="-m $M -ngl 99 -sm tensor -fa 1 -ctk bf16 -ctv bf16 -b 1024 -ub 1024 -p 2048 -n 0 -r 2 -o md"
+   # baseline: mode 1 = plumbing present, no cross-chunk waits (must equal mode 0)
+   env HIP_VISIBLE_DEVICES=0,1 GGML_CUDA_ALLREDUCE=ce GGML_META_CHUNK_PIPELINE=1 ./build-rocm/bin/llama-bench $BASE
+   # the pipeline under test; watch for the ~374 ms host gap disappearing (GGML_META_CHUNK_TRACE=1)
+   env HIP_VISIBLE_DEVICES=0,1 GGML_CUDA_ALLREDUCE=ce GGML_META_CHUNK_PIPELINE=2 GGML_META_CHUNK_TRACE=1 ./build-rocm/bin/llama-bench $BASE
+   # AR-free ceiling at this ubatch (2748 t/s) - the number a working pipeline should approach
+   env HIP_VISIBLE_DEVICES=0,1 GGML_AR_NOOP=1 ./build-rocm/bin/llama-bench $BASE
+   ```
+
+   Current numbers to beat at these settings: pp2048 = **2181** (mode 0) / 2179 (mode 1) / 2183
+   (mode 2), against the **2748** ceiling.  Purity gate: with `ce`, `--spec-type none` and
+   `--spec-type draft-mtp --spec-draft-n-max 3` must stay byte-identical (`16c5d2e75ad8`, prose
+   prompt, `-n 1500`); use `scripts/extract-generated.py` on a `llama-cli --single-turn
+   --no-display-prompt` log (a naive `sed` slice does NOT reproduce the hash).
+4. **After the pipeline lands**, re-test 3 GPUs and revisit the config policy (the prefill AR
+   *exposure*, not its serialized speed, dominates; the pipeline is expected to change the 3-GPU
+   verdict).
 5. **Optionally, in parallel: the Q8_0 MMQ epilogue** (the independent kernel win).  MMQ is
    epilogue-bound (64.7 vs 172.7 T-MAC/s, §7.2).  Attack the `sum += C*dA*dB` block — widen/hoist the
    per-element `dA` LDS loads, reduce the FMA count.  `tile_x` double-buffering is *secondary*
    (load-vs-compute serialisation, not the 2.7×).
-6. **Do not** spend more time on: FP8 (same T-MAC/s), weight-byte reduction (Q8_0 already wins), AR
+6. **Beta feedback on `ce`.**  Users are exercising the opt-in `ce` mode now; beta reports may arrive
+   as repo issues.  The known limits to point at: 2-ranks-only, ~6 % *slower* than NCCL on 3 GPUs,
+   and a `ce` run that silently gives ~1430 t/s at pp2048 means the mode did not engage and it fell
+   back to the butterfly.
+7. **Do not** spend more time on: FP8 (same T-MAC/s), weight-byte reduction (Q8_0 already wins), AR
    backend/algorithm/protocol switches (`internal` -18 %/-22 %; `nccl`/`Ring`/`Tree`/`LL`/`LL128`/
    `NCCL_P2P_*`/`RCCL_USE_AMD_SMI_LIB` all ≤ hybrid), or `iommu=pt` (the box already boots
    `iommu=off`).
@@ -292,7 +379,8 @@ scheduling.  Details, trace evidence and the revised order of work: `OVERLAP-DES
 | `p2p_bw.hip` | raw peer copy 12.5-14.3 GB/s ≈ 90 % of the Gen5 **x4** wire |
 | `overlap.hip` | SDMA transfers hide **100 %** behind GEMMs; SM-driven transfers hide 5-17 % |
 | `ce_ar.hip` | standalone SDMA 2-rank all-reduce: correct, 12.7 GB/s, 0 % gemm slowdown |
-| `ce-allreduce.patch` | the in-tree `GGML_CUDA_ALLREDUCE=ce` prototype (general-n; **+4 % prefill on 2 GPUs**, -6 % on 3; crash fixed; hybrid fallback) |
+| `ce-allreduce.patch` | the WIP `GGML_CUDA_ALLREDUCE=ce` patch: `ce` + `GGML_AR_NOOP` + the stream hook (the delivery's block 12 carries the `ce` arm only) |
+| `meta-chunk-pipeline.patch` | the WIP token-chunk pipeline plumbing (`GGML_META_CHUNK_PIPELINE` 1/2/3) — applies on top of `ce-allreduce.patch` |
 | `rocblas_i8.hip` | rocBLAS INT8 reference — currently `rocblas_status_invalid_size` on gfx1201 (TODO) |
 
 Most microbench builds: `hipcc --offload-arch=gfx1201 -O3 -o /tmp/x <file>.hip`.
@@ -313,8 +401,9 @@ Most microbench builds: `hipcc --offload-arch=gfx1201 -O3 -o /tmp/x <file>.hip`.
 5. **`GGML_LOG_ERROR` was suppressed** in prototype debug; use `fprintf(stderr, ...)`.
 6. **`SQ_INSTS_VALU`/`SQ_WAVE_CYCLES` return 0** under `rocprofv3 --pmc` on gfx1201; only
    `GRBM_GUI_ACTIVE` is non-zero.  Use kernel-trace durations instead.
-7. **`GGML_CUDA_ALLREDUCE=ce` currently trades a prefill win for a context-lifecycle bug** — do not
-   ship it as-is.
+7. ~~**`GGML_CUDA_ALLREDUCE=ce` trades a prefill win for a context-lifecycle bug**~~ — **FIXED and
+   shipped** (§3.4; the sticky-`PeerAccessAlreadyEnabled` fix).  The lesson stands and is general:
+   *a benign `cudaDeviceEnablePeerAccess` return poisons the next kernel launch* (see item 10).
 8. **The delivery purity rules still apply** to anything promoted: the AR is a bf16 reduction, the CE
    path's summation order differs from NCCL's, so any promotion needs the full `plain == draft-mtp`,
    `W=1..8` and MTP-acceptance gates (`GREEDY-PURITY.md`, `benchmarks/mtp-adaptive-methodology.md`).
@@ -342,13 +431,17 @@ Most microbench builds: `hipcc --offload-arch=gfx1201 -O3 -o /tmp/x <file>.hip`.
 We proved the entire vLLM prefill gap on this hardware is the tensor-parallel all-reduce (AR-free
 llama.cpp == vLLM, 2779 vs 2780), that the AR is at the BIOS x4 wire limit and cannot be sped up,
 that only copy-engine transfers can be hidden behind GEMMs, and that vLLM hides its AR via chunked
-prefill.  We built an SDMA copy-engine AR that is **+4 % on prefill with 2 GPUs** and leaves the
-decode path on the internal pipeline; it now also runs on **3 GPUs** (correct and pure, but -6 %
-vs NCCL there), the multi-context crash is fixed (a sticky `hipErrorPeerAccessAlreadyEnabled`),
-and a `ce` init failure degrades to **hybrid**, never to the butterfly.  The next session should
-build the token-chunk pipeline in `ggml-backend-meta.cpp` that hides the AR — the ~25 % that closes
-the gap, and where the SDMA transport should finally win at every rank count — and optionally attack
-the Q8_0 MMQ per-block-scale epilogue (62.5 % of the kernel) for the separate ~2.7× kernel headroom.
+prefill.  We built an SDMA copy-engine AR; **that part is now shipped** as the opt-in
+`GGML_CUDA_ALLREDUCE=ce` in release **`v16-d1d3c3396-r4`** (block 12): +2..+4 % prefill on 2 GPUs,
+decode byte-identical to `hybrid`, `hybrid` still the default, and a `ce` init failure degrades to
+`hybrid` rather than the butterfly.  It runs on 3 GPUs too, correctly and purely, but ~6 % slower than
+NCCL there, so it is documented as a 2-GPU win.  **What is left is the overlap half**: steps 1-3 of
+the token-chunk pipeline are implemented and validated inert, and the two blockers are root-caused —
+(A) the scheduler synchronizes every backend between chunk graphs when `n_async_devices > 1`
+(`ggml_backend_sched_alloc_splits`), and (B) the graph inputs are shared, so overlapping chunks race.
+Fix A first (one conditional, and the 374 ms host gap in `GGML_META_CHUNK_TRACE` should vanish), then
+B, and the AR should be hidden — the ~21-25 % that closes the gap.  Optionally attack the Q8_0 MMQ
+per-block-scale epilogue (62.5 % of the kernel) for the separate ~2.7× kernel headroom.
 
 ### Session log (2026-09-16, second session)
 
@@ -359,7 +452,8 @@ the Q8_0 MMQ per-block-scale epilogue (62.5 % of the kernel) for the separate ~2
 4. 3-GPU verified correct and pure; measured -6 % vs NCCL; ruled out barriers (double-buffered
    `ce_tmp`/`ce_tmp2`) and per-call overhead (ub4096 test) — it is fabric/link scheduling.
 5. Changed the `ce` failure path to keep `init_hybrid` (§3.2) after finding the butterfly cliff (948).
-6. Patch re-cut to `tools/ce-allreduce.patch` (305 lines); fork tree reverted and rebuilt clean.
+6. Patch re-cut to `tools/ce-allreduce.patch` (305 lines then; 336 after the fourth session added the
+   stream hook); fork tree reverted and rebuilt clean.
 
 ### Session log (2026-09-16, third session — 2-GPU overlap design)
 
@@ -395,3 +489,20 @@ the Q8_0 MMQ per-block-scale epilogue (62.5 % of the kernel) for the separate ~2
    pipelining.  Note for the next person: a `ce` run that silently gives ~1430 t/s at pp2048 means the
    CE patch is missing and it fell back to the butterfly.
 6. Both patches cut, verified to apply in sequence, fork tree reverted and rebuilt clean.
+
+### Session log (2026-09-16, fifth session — the `ce` transport landed as `v16-d1d3c3396-r4`)
+
+1. Landed the `ce` arm into the **delivery** by amending **block 12** (the AR block, now the home for
+the all-reduce alternatives) in `~/llama-cpp-rebase`: applied `tools/ce-allreduce.patch` to the block-12
+commit, stripped the two WIP-only extras (`GGML_AR_NOOP`, the `set_stream_no` hook), amended, and
+rebased blocks 13-15 on top (**clean rebase**).  Net change: **+263 lines, one file**
+(`ggml/src/ggml-cuda/ggml-cuda.cu`).
+2. Regenerated `patches/`, `rdna-boosts-all.patch` and `release.json` (`r3 -> r4`); new canonical tip
+`c08efa1bc35667e4a48af6e26ffab3c8b5500f4a`, net tree `a4cdb2800d5407656e84104199668c789a486b0a`.
+3. `scripts/validate-set.sh` green (strict 16/16 `git am`, applied tree == `release.json.tree`); the
+amended tree builds; **`hybrid` re-measured unchanged** and `ce` re-measured on the delivered build.
+4. Docs: `WORKLOG.md` (dated r4 record), `patches/README.md` (table row + a 2026-09-16 amendment
+section), `AGENTS.md` (block-12 bullet + tip/tree), `README.md`, `make-patches.sh` default tip.
+5. Merged to `main`, tagged **`v16-d1d3c3396-r4`**, pushed; the tag guard and *Validate delivery set*
+are green (the container/release job runs long).  The `ce` mode is now in beta with users.
+6. Nothing in `wip/` was promoted, and the overlap work is unchanged and still unlanded.
