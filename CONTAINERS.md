@@ -114,8 +114,8 @@ git push origin main v16-<base-sha>-r<N>
 that base's revision: `r1` is the release that lands the re-base and `r2`,
 `r3`, ... each later release on the same base.  `release.json.release` must be
 exactly the tag — `validate.yml` checks the manifest, and `docker-ghcr.yml`
-now refuses to build a tag whose name disagrees with it.  Only a **tag push**
-cuts a release; a `workflow_dispatch` or the weekly `schedule` rebuilds and
+now refuses to build a tag that disagrees with it or does not match
+`v16-<base-sha>-r<N>`.  Only a **tag push** cuts a release; a `workflow_dispatch` or the weekly `schedule` rebuilds and
 pushes the `rocm-*`/`latest` images but never bumps the revision and never
 creates a Release.  (The historical `v16-790cf51aa` tag predates the explicit
 `-rN`; it is the `r1` of its base.  Two revisions were never tagged —

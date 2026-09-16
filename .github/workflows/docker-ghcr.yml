@@ -98,6 +98,12 @@ jobs:
               echo "ERROR: tag ${GITHUB_REF_NAME} does not match release.json release ${rel}" >&2
               exit 1
             fi
+            # ... and the name must follow v16-<base>-r<N> for this base, so the pattern stays
+            # predictable.  (The historical v16-790cf51aa predates the -rN suffix; it is not re-pushed.)
+            if ! [[ "${GITHUB_REF_NAME}" =~ ^v16-${base}-r[1-9][0-9]*$ ]]; then
+              echo "ERROR: tag ${GITHUB_REF_NAME} must match v16-${base}-r<N>" >&2
+              exit 1
+            fi
             echo "release identity OK: ${rel}"
           fi
           {

@@ -16,7 +16,9 @@ Rule now documented in `CONTAINERS.md` (and `README.md`): one tag per release,
 `v16-790cf51aa` tag is the `r1` of its base.  `.github/workflows/docker-ghcr.yml` now fails the
 `prepare` job — before any image build — when a pushed tag does not equal `release.json.release`, so
 the tag and the manifest can no longer disagree.  `v16-d1d3c3396-r3` (the issue-#33 block-15
-amendment) is the first release under the explicit rule.
+amendment) is the first release under the explicit rule.  The guard also rejects a tag that does not
+match `v16-<base>-r<N>` for the current base, so the naming pattern itself is enforced, not just the
+equality.
 
 ## 2026-09-15 (block-15 amendment) — `v16-d1d3c3396-r3`: the FA prefill staging arena degrades instead of aborting
 
