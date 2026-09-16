@@ -7,8 +7,10 @@
 #   baseline-sha  the upstream baseline the patches are generated against
 #                 (default: 790cf51aa, see MANIFESTS.md)
 #   blocks-tip    the fork commit carrying block 00 + all 15 feature
-#                 blocks (default: af9ce375ded5238b59598290ad7366760b7dc6e0,
-#                 the 2026-09-15 re-base of the 16-block delivery onto upstream
+#                 blocks (default: c08efa1bc35667e4a48af6e26ffab3c8b5500f4a,
+#                 the 2026-09-16 r4 amendment of block 12 (the opt-in
+#                 GGML_CUDA_ALLREDUCE=ce copy-engine SDMA all-reduce), on the
+#                 2026-09-15 re-base of the 16-block delivery onto upstream
 #                 master d1d3c3396; the long provenance list below is retained
 #                 as history from the previous 790cf51aa base:
 #                 c45244c728dfcbcad86ae95aa97ae76f94ee9f7f,
@@ -121,7 +123,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FORK="${1:-$REPO_DIR/../llama.cpp}"
 BASELINE="${2:-d1d3c3396}"
-TIP="${3:-af9ce375ded5238b59598290ad7366760b7dc6e0}"
+TIP="${3:-c08efa1bc35667e4a48af6e26ffab3c8b5500f4a}"
 PATCHES="$REPO_DIR/patches"
 
 if [ ! -e "$FORK/.git" ]; then

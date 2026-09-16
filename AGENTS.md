@@ -54,6 +54,17 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   errors, warns once, stops using NCCL for the rest of the run and
   re-routes AllReduce to the internal pipeline (or meta-butterfly) — see
   the block-12 notes in `patches/README.md`.
+  **Amended 2026-09-16 (r4) with the opt-in `GGML_CUDA_ALLREDUCE=ce` copy-engine (SDMA) P2P
+  all-reduce** — this block is now the home for the all-reduce *alternatives*.  `ce` reuses the hybrid
+  structure (the internal pipeline still serves the small decode/verify tensors; the new arm replaces
+  only the large/prefill transport with `cudaMemcpyPeerAsync` + cross-device events instead of NCCL's
+  SM-driven kernels), so the decode path is byte-identical to `hybrid`.  **`hybrid` stays the
+  default**; `ce` is a **2-GPU beta** (any other rank count and any init failure degrades to
+  `hybrid`, never to the butterfly — the butterfly measured 948 t/s vs 2376 at 3 GPUs).  Measured
+  +2..+4 % prefill (pp512 1973→2019, pp2048 2103→2190, pp4096 2082→2170), tg128 unchanged, greedy text
+  identical, `plain == draft-mtp` byte-identical.  On 3 GPUs `ce` is ~6 % *slower* than NCCL, so it is
+  not defaulted anywhere.  See the 2026-09-16 block-12 amendment section in `patches/README.md` and
+  `WORKLOG.md`.
 - Block **13** (`patches/0013-…-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch`): fused MoE gate+up+GLU MMQ (prefill)
   + mmvq short-K item-split (decode); see the block-13 notes in `patches/README.md`.
   Amended 2026-09-02 with two regression fixes folded into the block: (1) the
@@ -278,8 +289,10 @@ new `mmq_args` field was unset by `ggml_cuda_mul_mat_q_pair`, selecting the narr
 to 2.2x slower dense prefill; see the 2026-09-13 block-14 (ninth) section).
 **Block 15 (the attention-memory campaign) is the delivery's last patch** --
 promoted 2026-09-12 from `archive/work/block-15-campaign-wins/` (`patches/0015`;
-the canonical 16-block tip is `4e942c0715ada71a97fd3a24fe7a39447238f9b8`, tree
-`28be875afbdb58f2f842f521ac3ec6764b52cf49` (the 2026-09-15 re-base onto `d1d3c3396`, then r2 = the
+the canonical 16-block tip is `c08efa1bc35667e4a48af6e26ffab3c8b5500f4a`, tree
+`a4cdb2800d5407656e84104199668c789a486b0a` — the 2026-09-16 **r4 block-12 amendment** (the opt-in
+`GGML_CUDA_ALLREDUCE=ce` copy-engine all-reduce) on top of `4e942c0715ada71a97fd3a24fe7a39447238f9b8`,
+tree `28be875afbdb58f2f842f521ac3ec6764b52cf49` (the 2026-09-15 re-base onto `d1d3c3396`, then r2 = the
 block-01 adaptive-MTP controller amendment and r3 = the block-15 staging-arena OOM fallback, issue #33; the
 previous base `790cf51aa` had tip `6f76c1cb1d80c7ecbf176f939a351bc385ff33fc`, tree
 `d735d6c11258ae939cfd392511e3f29ac22a7686`, the 2026-09-15 build-time amendment + the r4

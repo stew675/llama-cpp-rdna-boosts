@@ -1,5 +1,54 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-16 (block-12 r4 amendment) — `v16-d1d3c3396-r4`: opt-in copy-engine (SDMA) all-reduce
+
+**Release.** `v16-d1d3c3396-r4`, fork point `d1d3c3396` (tree `3ce99b5422bf`), canonical 16-block
+tip `c08efa1bc35667e4a48af6e26ffab3c8b5500f4a`, net tree
+`a4cdb2800d5407656e84104199668c789a486b0a`.  Block 12 is amended; blocks 00-11 and 13-15 are
+content-identical, the net change being **+263 lines in `ggml/src/ggml-cuda/ggml-cuda.cu`**
+(`git diff --stat 4e942c0715 c08efa1bc` = one file).
+
+**What.**  `GGML_CUDA_ALLREDUCE=ce` — a third, **opt-in** all-reduce algorithm: a 2-GPU
+**copy-engine (SDMA) P2P all-reduce** built from `cudaMemcpyPeerAsync` on the compute streams plus
+cross-device events, instead of NCCL's SM-driven kernels.  It keeps block 12's hybrid structure, so
+the internal host-staged pipeline still serves the latency-bound small tensors (decode/verify) and
+the new arm only replaces the **large-tensor (prefill)** transport: the decode path is byte-identical
+to `hybrid`.  Same dtype policy as the NCCL large path (fp32 -> bf16 reduce -> fp32).  The algorithm
+is a general-n reduce-scatter + all-gather with uneven-chunk handling and a double-buffered receive
+scratch; the destination peer's receive regions are sender-indexed, so the all-gather needs no wait on
+the peer's reduce phase.
+
+**Why it is opt-in.**  `hybrid` stays the **default, unchanged**; `ce` is a beta mode that needs
+community soak time before any default decision, which is exactly why it is a separate arm rather
+than a change to the hybrid path.  If `ce` cannot be set up (no peer access) it degrades to the
+**hybrid** path -- deliberately never to the meta-backend butterfly, which measured **948 t/s** on
+3 GPUs against the hybrid's 2376 (a 2.5x cliff).
+
+**Measured** (2x R9700 gfx1201, 27B Q8_0, `-sm tensor`, bf16 KV, `-b/-ub 2048`, delivered tree):
+
+| | `hybrid` (default) | `ce` |
+|---|---:|---:|
+| pp512 | 1973 | 2019 (**+2.3 %**) |
+| pp2048 | 2103-2134 | 2190-2218 (**+4.1 %**) |
+| pp4096 | 2082 | 2170 (**+4.2 %**) |
+| tg128 | 31.19 | 31.15 (unchanged) |
+
+Greedy text on the prose prompt is identical between `hybrid` and `ce`, and `ce` is
+**`plain == draft-mtp` byte-identical** (`16c5d2e75ad8`, 6053 chars).  On 3 GPUs `ce` currently runs
+(correct and pure) but is ~6 % *slower* than NCCL in the serialized regime, so the mode is documented
+as a 2-GPU win; it is not defaulted anywhere.
+
+**A fixed bug worth naming** (it cost a multi-context crash): a benign
+`cudaErrorPeerAccessAlreadyEnabled` from `cudaDeviceEnablePeerAccess` is still recorded in the sticky
+last-error slot, so it must be followed by `cudaGetLastError()` or the next kernel launch's error
+check aborts.  The `ce` init does that.
+
+**Validation.**  `scripts/validate-set.sh` green (checksums + strict 16/16 `git am` on a fresh
+tarball at `d1d3c3396`, applied tree == `release.json.tree`); the amended tree builds clean; the
+`hybrid` default and the `ce` (decode-unchanged, greedy-identical, MTP-pure) behaviour re-measured on
+the delivered tree.  Detail, the design of the follow-on overlap work, and the raw measurements:
+`wip/q8-prefill-tuning/` (HANDOVER.md, OVERLAP-DESIGN.md).
+
 ## 2026-09-15 (release process) — release versioning standardized and enforced
 
 The tag history had drifted from the documented recipe: `CONTAINERS.md` said the release tag is

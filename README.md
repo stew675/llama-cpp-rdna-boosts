@@ -202,9 +202,12 @@ for per-block verification and `BASELINE.md` for provenance.
   **`d1d3c3396`** (re-based 2026-09-15; previously `790cf51aa`, re-based 2026-09-13 from `9113cc188`).
 - Patches `patches/0000-…0015-…`, applied with **strict 16/16 `git am`** by
   `scripts/apply-all.sh` (no 3-way fallback, whitespace-clean).
-- Canonical 16-block chain: tip `4e942c071`, net tree `28be875afbdb58f2f842f521ac3ec6764b52cf49`.
-- Release **`v16-d1d3c3396-r3`**.  `scripts/validate-set.sh` passes strict 16/16
+- Canonical 16-block chain: tip `c08efa1bc3`, net tree `a4cdb2800d5407656e84104199668c789a486b0a`.
+- Release **`v16-d1d3c3396-r4`**.  `scripts/validate-set.sh` passes strict 16/16
   (applied tree == the recorded tree).
+- All-reduce algorithms: **`hybrid` is the default**; `GGML_CUDA_ALLREDUCE=ce` adds an opt-in
+  **copy-engine (SDMA) 2-GPU** mode (+2..+4 % prefill, decode byte-identical — see
+  [`WORKLOG.md`](WORKLOG.md), 2026-09-16).
 - Greedy purity: plain decode == `draft-mtp` verify for
   `--spec-draft-n-max <= 7` across the supported KV types (4B and 27B all
   eight; qwen4exp MTP).  Depths 8..15 are allowed with a visible notice that

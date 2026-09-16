@@ -1,0 +1,168 @@
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index cc3f8cd36..dff576eee 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -208,6 +208,9 @@ extern "C" {
+     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
+     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
+     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
++    // Select the per-device stream number used by subsequent work on this comm context's backends
++    // (0 = the default stream).  Used for token-chunk software pipelining.
++    typedef void   (*ggml_backend_comm_set_stream_no_t)(void * comm_ctx, int stream_no);
+ 
+     // Split buffer type for tensor parallelism (old)
+     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 5ad0a5027..44178d5dd 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1892,6 +1892,47 @@ struct ggml_backend_meta_context {
+ 
+     void *                               comm_ctx       = nullptr;
+     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
++    ggml_backend_comm_set_stream_no_t    comm_set_stream_no = nullptr;
++
++    // ---- token-chunk software pipelining state (see wip/q8-prefill-tuning/OVERLAP-DESIGN.md) ----
++    // Subgraphs of consecutive prefill chunk graphs are interleaved: chunk B's subgraph i must wait
++    // for chunk A's subgraph i (B's layer-i attention reads the K/V A wrote in subgraph i), which is
++    // exactly a one-subgraph pipeline lag.  One event per (parity, backend, subgraph index).
++    std::vector<ggml_backend_event_t> chunk_ev;      // [2 parity][n_backends][chunk_ev_cap]
++    size_t                            chunk_ev_cap     = 0;
++    int                               chunk_parity     = 0;
++    bool                              chunk_have_prev  = false;
++    size_t                            chunk_prev_n_sub = 0;
++    int                               chunk_enabled    = 0;
++    std::vector<std::vector<ggml_backend_event_t>> chunk_ev_old;  // retired tables, freed at teardown
++
++    ggml_backend_event_t & chunk_ev_at(int parity, size_t j, size_t i) {
++        const size_t n_backends = backend_configs.size();
++        return chunk_ev[((size_t) parity * n_backends + j) * chunk_ev_cap + i];
++    }
++
++    // (Re)allocate the per-subgraph event table.  The old events cannot be destroyed while a stream
++    // may still be waiting on them, so retire the table and free it at teardown.
++    void chunk_ev_reserve(size_t n_sub) {
++        if (chunk_ev_cap >= n_sub) {
++            return;
++        }
++        if (!chunk_ev.empty()) {
++            chunk_ev_old.push_back(chunk_ev);
++        }
++        const size_t n_backends = backend_configs.size();
++        chunk_ev.assign(2 * n_backends * n_sub, nullptr);
++        for (size_t p = 0; p < 2; ++p) {
++            for (size_t j = 0; j < n_backends; ++j) {
++                for (size_t i = 0; i < n_sub; ++i) {
++                    chunk_ev[(p * n_backends + j) * n_sub + i] =
++                        ggml_backend_event_new(ggml_backend_get_device(backend_configs[j].backend));
++                }
++            }
++        }
++        chunk_ev_cap    = n_sub;
++        chunk_have_prev = false;   // indices changed; do not wait on stale events
++    }
+ 
+     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
+         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
+@@ -1923,6 +1964,16 @@ struct ggml_backend_meta_context {
+                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
+                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
+             GGML_ASSERT(comm_allreduce != nullptr);
++            comm_set_stream_no = (ggml_backend_comm_set_stream_no_t)
++                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
++                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_set_stream_no");
++            chunk_enabled = 0;
++            if (comm_set_stream_no != nullptr) {
++                const char * p = getenv("GGML_META_CHUNK_PIPELINE");
++                if (p != nullptr) {
++                    chunk_enabled = atoi(p);
++                }
++            }
+         }
+     }
+ 
+@@ -1933,6 +1984,18 @@ struct ggml_backend_meta_context {
+             GGML_ASSERT(comm_free != nullptr);
+             comm_free(comm_ctx);
+         }
++        for (ggml_backend_event_t ev : chunk_ev) {
++            if (ev != nullptr) {
++                ggml_backend_event_free(ev);
++            }
++        }
++        for (auto & t : chunk_ev_old) {
++            for (ggml_backend_event_t ev : t) {
++                if (ev != nullptr) {
++                    ggml_backend_event_free(ev);
++                }
++            }
++        }
+         for (auto & bc : backend_configs) {
+             ggml_backend_free(bc.backend);
+         }
+@@ -2563,13 +2626,48 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+     };
+ 
+ 
++    // ---- token-chunk software pipelining (GGML_META_CHUNK_PIPELINE; see OVERLAP-DESIGN.md) ----
++    // Consecutive prefill chunk graphs are interleaved: subgraph i of the newer chunk waits for
++    // subgraph i of the previous chunk on the same device (chunk B's layer-i attention reads the K/V
++    // chunk A wrote in subgraph i) -- a one-subgraph pipeline lag, which is what lets the previous
++    // chunk's all-reduce overlap the current chunk's compute.  Modes:
++    //   1 = parity streams + per-subgraph events recorded, no cross-chunk waits (inert plumbing)
++    //   2 = + the cross-chunk waits (the actual pipeline)
++    //   3 = parity streams, NO waits (diagnostic only: races on the shared graph inputs, but shows
++    //       whether two chunk streams actually run in parallel)
++    int chunk_mode = 0;
++    if (backend_ctx->chunk_enabled && n_backends > 1 && backend_ctx->n_subgraphs > 1) {
++        ggml_cgraph * cg0 = backend_ctx->backend_configs[0].cgraphs[0].cgraph_main;
++        const int64_t n_tokens_graph = cg0->n_nodes > 0 ? cg0->nodes[cg0->n_nodes - 1]->ne[1] : 1;
++        if (n_tokens_graph > 1) {   // prefill only; decode keeps the automatic concurrent-branch path
++            chunk_mode = backend_ctx->chunk_enabled;
++            backend_ctx->chunk_ev_reserve(backend_ctx->n_subgraphs);
++            if (chunk_mode >= 2) {
++                // Streams 1/2, NOT 0: stream 0 carries llama.cpp's input writes (set_inputs), and
++                // reusing it for a chunk would order that chunk after the previous chunk entirely.
++                backend_ctx->comm_set_stream_no(backend_ctx->comm_ctx, backend_ctx->chunk_parity + 1);
++            }
++        }
++    }
++    const bool   chunk_active    = chunk_mode > 0;
++    const int    chunk_par       = backend_ctx->chunk_parity;
++    const int    chunk_prev_par  = 1 - chunk_par;
++    const size_t chunk_prev_n    = backend_ctx->chunk_prev_n_sub;
++    const bool   chunk_wait_prev = chunk_mode == 2 && backend_ctx->chunk_have_prev;
++
+     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+         for (size_t j = 0; j < n_backends; j++) {
+             auto & bcj = backend_ctx->backend_configs[j];
++            if (chunk_wait_prev && i < chunk_prev_n) {
++                ggml_backend_event_wait(bcj.backend, backend_ctx->chunk_ev_at(chunk_prev_par, j, i));
++            }
+             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+             if (status != GGML_STATUS_SUCCESS) {
+                 return status;
+             }
++            if (chunk_active) {
++                ggml_backend_event_record(backend_ctx->chunk_ev_at(chunk_par, j, i), bcj.backend);
++            }
+         }
+ 
+         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+@@ -2593,6 +2691,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+             }
+         }
+     }
++    if (chunk_active) {
++        backend_ctx->chunk_prev_n_sub = backend_ctx->n_subgraphs;
++        backend_ctx->chunk_have_prev  = true;
++        backend_ctx->chunk_parity     = 1 - chunk_par;
++        if (chunk_mode >= 2) {
++            // Leave the devices on stream 0 so that llama.cpp's input writes (set_inputs, which
++            // happen between graph computes) land on stream 0.
++            backend_ctx->comm_set_stream_no(backend_ctx->comm_ctx, 0);
++        }
++    }
+     return GGML_STATUS_SUCCESS;
+ }
+ 
