@@ -14,33 +14,51 @@ are picking this up cold, read the *Where things stand* section immediately belo
 
 ## Where things stand and what to do next
 
-> ## HEADLINE (2026-09-16, session 6, late): the real prefill win was never the all-reduce
+> ## HEADLINE (2026-09-16, session 6, late): the AR is the inherent price of tensor parallelism here
 >
-> The whole investigation chased the all-reduce inside **tensor split**.  But tensor split is not the
-> right parallelism mode for prefill on this box — **layer split has no all-reduce at all**, and it
-> only looked bad because it had been measured at `-ub 2048`, where its micro-batch pipelining cannot
-> engage.
+> **This section was first written as "layer split is the real prefill win".  That was overstated —
+> corrected below with the concurrency data, which is what decides it.**
 >
-> | 2x R9700, 27B Q8_0, bf16 KV, `-fa 1` | pp2048 | pp8192 | pp16384 | tg128 |
+> The AR investigation reached a dead end on *hiding* the all-reduce (§6.4, §6.5).  The one thing
+> that does avoid it is not sharding tokens: **layer split has no all-reduce at all**, and it only ever
+> looked bad because it had been measured at `-ub 2048`, where its micro-batch pipelining cannot
+> engage.  Layer split needs **>= 4 micro-batches in flight** to fill its pipeline (`-ub 512`), so it
+> wins long prompts and loses short ones.
+>
+> Single-sequence prefill (`-fa 1`, bf16 KV):
+>
+> | 2x R9700, 27B Q8_0 | pp512 | pp2048 | pp8192 | pp16384 |
 > |---|---:|---:|---:|---:|
-> | **`-sm layer -b 8192 -ub 512`** | 2207 | **2440** | **2411** | 18.4 |
-> | `-sm layer -b 2048 -ub 2048` (the old "no parallelism" measurement) | 1444 | 2150 | — | — |
-> | `-sm tensor -b 2048 -ub 2048` (what every AR number was measured on) | 2106 | 2052 | 1974 | **31.2** |
+> | `-sm layer -b 8192 -ub 512` | 1405 | 2207 | **2440** | **2411** |
+> | `-sm tensor -b 2048 -ub 2048` | **1875** | 2106 | 2052 | 1974 |
 >
-> So layer split beats tensor split by **+19 % at 8k and +22 % at 16k on prefill** — and the margin
-> grows with depth, because tensor split pays an all-reduce whose cost scales with token count while
-> layer split pays nothing.  `ub=512` is a genuine optimum (at pp8192: 2048 -> 2150, 1024 -> 2361,
-> **512 -> 2440**, 256 -> 2275, 128 -> 1897), consistent with a pipeline that needs ~4 micro-batches
-> to fill (`GGML_SCHED_MAX_COPIES == 4`).
+> `ub=512` is a real optimum (pp8192: 2048 -> 2150, 1024 -> 2361, **512 -> 2440**, 256 -> 2275,
+> 128 -> 1897), the shape of a pipeline that needs ~4 in flight.
 >
-> **The cost is decode: 18.4 vs 31.2 t/s (-41 %)** — layer split leaves one GPU idle per step, which
-> is exactly why tensor split exists.  So this is a **prefill-vs-decode deployment choice**, not a
-> universal win, and it needs no code change (it is a config/flags finding).
+> **But layer split loses on decode, and decode is what dominates wall time.**  With concurrent
+> sequences (`llama-batched-bench -npp 4096 -ntg 128`):
 >
-> **This is where the effort should go now**, not into the all-reduce: layer split at 2440 still sits
-> ~12 % below the two GPUs' combined AR-free capability (2766), which points at pipeline fill/drain and
-> load balance (65 blocks, hybrid GDN) rather than at the transport.  See "Layer-split pipelining"
-> below.
+> | config | B | PP t/s | TG t/s | total s | S t/s |
+> |---|---:|---:|---:|---:|---:|
+> | tensor `-ub 2048` | 4 | 2102 | **94.8** | **13.20** | **1280** |
+> | layer `-ub 512` | 4 | **2592** | 57.8 | 15.18 | 1113 |
+>
+> Layer split still wins prefill by +23 %, yet **tensor wins overall by +15 %** because 8.86 s of
+> layer's 15.18 s is decode.  The decode gap does *not* close with concurrency (at B=8, tensor 153.6
+> vs layer 92.3 t/s on 512-token prompts) — it is structural: layer split serialises a single token
+> through the GPUs, tensor split parallelises it.
+>
+> **Why a per-ubatch switch is not an option (asked and answered):** the blocker is the **KV cache
+> layout**, not effort.  In layer split a layer's K/V lives wholly on the GPU owning that layer; in
+> tensor split it is sharded across GPUs.  The cache layout is coupled to the compute layout, so a
+> switch would need the whole cache re-laid-out on every transition — GBs over the same x4 links,
+> costing far more than the ~20 % it buys.  Holding *both* weight layouts resident does not help
+> (memory would fit at ~20 GB/GPU, but the cache problem is unchanged).
+>
+> **Conclusion: tensor split stays the right default for generation; the all-reduce cost is the price
+> of sharding a token across two GPUs on an x4 link, and it is what buys the 1.6-1.7x decode.**
+> Layer split + `-ub 512` is a real *niche* config for prefill-dominated workloads (output negligible
+> vs prompt), not a general win.  Both are config findings — no code change.
 
 **Delivery state.**  The repo's `main` is at release **`v16-d1d3c3396-r4`** (commit `c03db1a`, tag
 `v16-d1d3c3396-r4` pushed; `release.json` is the source of truth).  Block 12 now carries the opt-in
@@ -428,19 +446,15 @@ win at every rank count).  Interim policy: **`ce` on 2 GPUs, `hybrid` on 3**.
    `NCCL_P2P_*`/`RCCL_USE_AMD_SMI_LIB` all ≤ hybrid), or `iommu=pt` (the box already boots
    `iommu=off`).
 
-8. **NEW (session 6, late) — layer-split pipelining, the actual way forwards.**  Investigate why
-   `-sm layer` needs `-ub 512` and whether it can be pushed further:
-   - confirm the mechanism is micro-batch pipelining (`cparams.pipeline_parallel`, `n_copies`) rather
-     than per-ubatch work-distribution luck — the `ub` sweep (a clean optimum at 512, worse at both
-     ends) strongly suggests a pipeline that needs ~4 in flight to fill;
-   - note `llama-context.cpp:1517` still `ggml_backend_sched_synchronize`s when `pipeline_parallel`,
-     so the pipeline may be operating on a handicap — the same class of serialization the AR work
-     spent a session cataloguing, but here there is no all-reduce to hide at all;
-   - layer split at 2440 is ~12 % under the 2766 AR-free tensor ceiling, so there is headroom;
-   - quantify the decode trade (18.4 vs 31.2 t/s) and decide the deployment recommendation
-     (prefill-heavy vs decode-heavy).
+8. **Layer-split pipelining (session 6, late) — a niche config, not the headline.**  See the HEADLINE
+   block at the top for the full data and the corrected conclusion.  Open items if it is ever worth
+   pursuing for a prefill-dominated workload: why `-ub 512` is the optimum (pipeline fill vs ubatch
+   efficiency), whether `llama-context.cpp:1517`'s `ggml_backend_sched_synchronize` when
+   `pipeline_parallel` is costing anything, and whether the decode gap can be narrowed.  It is a
+   config finding; no code change is required to use it.
 
-   Repro: `-sm layer -b 8192 -ub 512 -fa 1 -ctk bf16 -ctv bf16 -p 2048,8192,16384 -n 0 -r 2 -o md`.
+   Repro: `-sm layer -b 8192 -ub 512 -fa 1 -ck bf16 -cv bf16 -p 2048,8192,16384 -n 0 -r 2 -o md`,
+   and for the crossed comparison `llama-batched-bench -npp 4096 -ntg 128 -npl 1,4 -c 65536`.
 
 ---
 
