@@ -88,6 +88,18 @@ jobs:
           n_blocks="$(jq -r '.n_blocks' release.json)"
           test -n "$base" && test "$base" != "null"
           test -n "$tree" && test "$tree" != "null"
+          # Release identity: on a tag push the tag must equal release.json.release, so a release
+          # can never be cut under a name the manifest does not record.  The tag is the release
+          # identifier (format v16-<base>-r<N>, see CONTAINERS.md); workflow_dispatch and schedule
+          # runs are image-only and never bump a release.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            rel="$(jq -r '.release' release.json)"
+            if [ "${GITHUB_REF_NAME}" != "$rel" ]; then
+              echo "ERROR: tag ${GITHUB_REF_NAME} does not match release.json release ${rel}" >&2
+              exit 1
+            fi
+            echo "release identity OK: ${rel}"
+          fi
           {
             echo "base=$base"
             echo "tree=$tree"

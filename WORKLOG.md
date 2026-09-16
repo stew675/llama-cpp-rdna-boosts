@@ -1,5 +1,23 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-15 (release process) — release versioning standardized and enforced
+
+The tag history had drifted from the documented recipe: `CONTAINERS.md` said the release tag is
+`v16-<fork-point>`, but amendments added a `-r<N>` suffix, the `v16-d1d3c3396` re-base was never
+tagged (its `release.json` says `-r1`), `v16-790cf51aa-r5` was built by a `workflow_dispatch`
+(images only — commit `a0d1de70`, no tag and no Release), and two early tags (`v16-790cf51aa`,
+`-r2`) never got a Release.  Every tag that *did* exist matched its `release.json.release`, so the
+gap was process, not data.
+
+Rule now documented in `CONTAINERS.md` (and `README.md`): one tag per release,
+`v16-<fork-point>-r<N>` with `r1` the re-base and each later release on the same base incrementing
+`N`; `release.json.release` must be exactly the tag; only a **tag push** cuts a release
+(`workflow_dispatch`/`schedule` are image-only and never bump a revision).  The historical
+`v16-790cf51aa` tag is the `r1` of its base.  `.github/workflows/docker-ghcr.yml` now fails the
+`prepare` job — before any image build — when a pushed tag does not equal `release.json.release`, so
+the tag and the manifest can no longer disagree.  `v16-d1d3c3396-r3` (the issue-#33 block-15
+amendment) is the first release under the explicit rule.
+
 ## 2026-09-15 (block-15 amendment) — `v16-d1d3c3396-r3`: the FA prefill staging arena degrades instead of aborting
 
 **Release.** `v16-d1d3c3396-r3`, fork point `d1d3c3396` (tree `3ce99b5422bf`), canonical 16-block

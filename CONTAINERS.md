@@ -67,7 +67,9 @@ The release pipeline is **tag-driven** (see `.github/workflows/docker-ghcr.yml`)
 - push of a `v*` tag — the normal release path (build images, push them, and
   cut a GitHub Release carrying the packaged patch set),
 - `workflow_dispatch` — pick the ROCm release lines (`7.2 7.14 10.0` by
-  default) and whether to push; unchecking push runs a build-only validation,
+  default) and whether to push; unchecking push runs a build-only validation.
+  This path is **image-only**: it does not create a Release and must not be
+  treated as a release (only a tag push bumps the revision),
 - weekly `schedule` — rebuild the `rocm-*`/`latest` images (no release is cut).
 
 Ordinary commits to `main` (docs / `WORKLOG.md` / `benchmarks/`) do **not**
@@ -90,10 +92,12 @@ drift out of sync in one place while another stays stale.
 To cut a release after a re-base or a block amendment:
 
 ```bash
-# refresh the artifact hashes (metadata is inherited from the existing file)
-./scripts/make-release.sh
+# refresh the artifact hashes and stamp the release name (the git tag is the
+# release identity; it MUST equal release.json.release)
+./scripts/make-release.sh --release v16-<base-sha>-r<N>
 # or, on a re-base, set all four metadata values together:
 ./scripts/make-release.sh \
+  --release v16-<base-sha>-r1 \
   --base <new-base-sha> \
   --base-tree "$(git -C ~/llama.cpp rev-parse <new-base-sha>^{tree})" \
   --tip  <canonical-block-15-tip> \
@@ -102,14 +106,28 @@ To cut a release after a re-base or a block amendment:
 ./scripts/validate-set.sh          # strict apply + tree/hash/checksum gate
 
 # freeze it: annotated tag on the commit that carries this release.json
-git tag -a v16-<base-sha> -m "rdna-boosts v16 against llama.cpp <base-sha>"
-git push origin main v16-<base-sha>
+git tag -a v16-<base-sha>-r<N> -m "rdna-boosts v16-<base-sha>-r<N>"
+git push origin main v16-<base-sha>-r<N>
 ```
+
+**Release naming.**  One tag per release, `v16-<base-sha>-r<N>`, where `N` is
+that base's revision: `r1` is the release that lands the re-base and `r2`,
+`r3`, ... each later release on the same base.  `release.json.release` must be
+exactly the tag — `validate.yml` checks the manifest, and `docker-ghcr.yml`
+now refuses to build a tag whose name disagrees with it.  Only a **tag push**
+cuts a release; a `workflow_dispatch` or the weekly `schedule` rebuilds and
+pushes the `rocm-*`/`latest` images but never bumps the revision and never
+creates a Release.  (The historical `v16-790cf51aa` tag predates the explicit
+`-rN`; it is the `r1` of its base.  Two revisions were never tagged —
+`v16-790cf51aa-r5` was built by a dispatch and `v16-d1d3c3396-r1` is the
+re-base — so they exist only in `release.json` history.)
 
 The `v*` tag push runs the container matrix and then creates the GitHub
 Release with `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json` and
 `SHA256SUMS` attached.  Consumers can pin the tag and verify the checksums
-instead of tracking a moving `main`.
+instead of tracking a moving `main`.  The tag's name is checked against
+`release.json.release` before any image is built, so a release can never ship
+under a name the manifest does not record.
 
 The `tree` field in `release.json` is the strongest check available: CI
 rebuilds the patched source from a tarball and asserts the resulting git tree

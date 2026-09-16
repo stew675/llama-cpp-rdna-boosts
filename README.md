@@ -24,8 +24,11 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 ## Releases
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
-(e.g. **`v16-790cf51aa`** — the tag names the block count and the fork point).
-Each release carries `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
+(the tag is the release identity: `v16-<fork-point>-r<N>`, e.g.
+**`v16-790cf51aa-r4`**, where `r1` is the re-base and each later release on the
+same base increments `N`).  `release.json.release` must equal the tag — CI
+checks it — and only a tag push cuts a release.  Each release carries
+`rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
 and `SHA256SUMS`, so a consumer can pin a tag and verify the artifacts instead
 of tracking a moving `main`.
 
