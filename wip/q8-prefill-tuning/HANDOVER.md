@@ -14,6 +14,34 @@ are picking this up cold, read the *Where things stand* section immediately belo
 
 ## Where things stand and what to do next
 
+> ## HEADLINE (2026-09-16, session 6, late): the real prefill win was never the all-reduce
+>
+> The whole investigation chased the all-reduce inside **tensor split**.  But tensor split is not the
+> right parallelism mode for prefill on this box — **layer split has no all-reduce at all**, and it
+> only looked bad because it had been measured at `-ub 2048`, where its micro-batch pipelining cannot
+> engage.
+>
+> | 2x R9700, 27B Q8_0, bf16 KV, `-fa 1` | pp2048 | pp8192 | pp16384 | tg128 |
+> |---|---:|---:|---:|---:|
+> | **`-sm layer -b 8192 -ub 512`** | 2207 | **2440** | **2411** | 18.4 |
+> | `-sm layer -b 2048 -ub 2048` (the old "no parallelism" measurement) | 1444 | 2150 | — | — |
+> | `-sm tensor -b 2048 -ub 2048` (what every AR number was measured on) | 2106 | 2052 | 1974 | **31.2** |
+>
+> So layer split beats tensor split by **+19 % at 8k and +22 % at 16k on prefill** — and the margin
+> grows with depth, because tensor split pays an all-reduce whose cost scales with token count while
+> layer split pays nothing.  `ub=512` is a genuine optimum (at pp8192: 2048 -> 2150, 1024 -> 2361,
+> **512 -> 2440**, 256 -> 2275, 128 -> 1897), consistent with a pipeline that needs ~4 micro-batches
+> to fill (`GGML_SCHED_MAX_COPIES == 4`).
+>
+> **The cost is decode: 18.4 vs 31.2 t/s (-41 %)** — layer split leaves one GPU idle per step, which
+> is exactly why tensor split exists.  So this is a **prefill-vs-decode deployment choice**, not a
+> universal win, and it needs no code change (it is a config/flags finding).
+>
+> **This is where the effort should go now**, not into the all-reduce: layer split at 2440 still sits
+> ~12 % below the two GPUs' combined AR-free capability (2766), which points at pipeline fill/drain and
+> load balance (65 blocks, hybrid GDN) rather than at the transport.  See "Layer-split pipelining"
+> below.
+
 **Delivery state.**  The repo's `main` is at release **`v16-d1d3c3396-r4`** (commit `c03db1a`, tag
 `v16-d1d3c3396-r4` pushed; `release.json` is the source of truth).  Block 12 now carries the opt-in
 `GGML_CUDA_ALLREDUCE=ce` copy-engine (SDMA) 2-GPU all-reduce; **`hybrid` is unchanged and remains the
@@ -399,6 +427,20 @@ win at every rank count).  Interim policy: **`ce` on 2 GPUs, `hybrid` on 3**.
    backend/algorithm/protocol switches (`internal` -18 %/-22 %; `nccl`/`Ring`/`Tree`/`LL`/`LL128`/
    `NCCL_P2P_*`/`RCCL_USE_AMD_SMI_LIB` all ≤ hybrid), or `iommu=pt` (the box already boots
    `iommu=off`).
+
+8. **NEW (session 6, late) — layer-split pipelining, the actual way forwards.**  Investigate why
+   `-sm layer` needs `-ub 512` and whether it can be pushed further:
+   - confirm the mechanism is micro-batch pipelining (`cparams.pipeline_parallel`, `n_copies`) rather
+     than per-ubatch work-distribution luck — the `ub` sweep (a clean optimum at 512, worse at both
+     ends) strongly suggests a pipeline that needs ~4 in flight to fill;
+   - note `llama-context.cpp:1517` still `ggml_backend_sched_synchronize`s when `pipeline_parallel`,
+     so the pipeline may be operating on a handicap — the same class of serialization the AR work
+     spent a session cataloguing, but here there is no all-reduce to hide at all;
+   - layer split at 2440 is ~12 % under the 2766 AR-free tensor ceiling, so there is headroom;
+   - quantify the decode trade (18.4 vs 31.2 t/s) and decide the deployment recommendation
+     (prefill-heavy vs decode-heavy).
+
+   Repro: `-sm layer -b 8192 -ub 512 -fa 1 -ctk bf16 -ctv bf16 -p 2048,8192,16384 -n 0 -r 2 -o md`.
 
 ---
 
