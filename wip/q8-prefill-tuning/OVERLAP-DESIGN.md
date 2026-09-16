@@ -5,6 +5,11 @@ are implemented and measured** — the meta-backend plumbing works, but the pipe
 because of two blockers *outside* the meta backend (both root-caused below).  Companion to
 `HANDOVER.md` (§4) and `README.md` (§4.9).  Everything here is measured unless marked *(estimate)*.
 
+**Note (2026-09-16, later):** the `ce` transport itself has since been **landed into the delivery**
+as the block-12 amendment of `v16-d1d3c3396-r4` (opt-in `GGML_CUDA_ALLREDUCE=ce`; `hybrid` still the
+default).  The base this document builds on is therefore shipped; the *overlap* half it describes is
+not.
+
 ---
 
 ## 1. Why this is the whole remaining win

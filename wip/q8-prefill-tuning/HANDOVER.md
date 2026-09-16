@@ -1,9 +1,10 @@
 # HANDOVER — Q8_0 prefill on 2× R9700 (gfx1201): closing the vLLM gap
 
-**Date:** 2026-09-16.  **Status:** investigation complete; the copy-engine AR prototype is built,
-**debugged and now general-n** (2 and 3 GPUs verified, ~+4 % prefill on 2 GPUs, ~-6 % on 3 GPUs),
-and its config fallback is hybrid (never butterfly).  The big win (~25 %) is designed but not
-implemented.
+**Date:** 2026-09-16.  **Status:** the copy-engine AR is **LANDED in the delivery** as the block-12
+amendment of **`v16-d1d3c3396-r4`** (`GGML_CUDA_ALLREDUCE=ce`, opt-in, 2-GPU, `hybrid` still the
+default — see `WORKLOG.md` 2026-09-16).  The design work below is the still-unlanded *overlap* half:
+steps 1-3 are implemented and measured, the two blockers are root-caused, and the ~21-25 % is
+designed but not achieved.  Nothing in this directory is part of the delivery.
 **Read this top-to-bottom; it is written to be self-contained after a context compaction.**
 
 Everything lives under `wip/q8-prefill-tuning/` (this repo).  **Nothing here is delivery work** — the
