@@ -10,6 +10,10 @@ as the block-12 amendment of `v16-d1d3c3396-r4` (opt-in `GGML_CUDA_ALLREDUCE=ce`
 default).  The base this document builds on is therefore shipped; the *overlap* half it describes is
 not.
 
+**Note (2026-09-16, sixth session):** §§6.1 and 6.3 item 1 have been **corrected** — the blocker was
+misattributed to `ggml_backend_sched_alloc_splits`, which is never entered on this workload.  See the
+correction block in §6.1 and the revised §7 before acting on anything below.
+
 ---
 
 ## 1. Why this is the whole remaining win
@@ -188,7 +192,73 @@ The AR-free ceiling at `-ub 1024` is **2748** t/s, so ~195 ms of AR is still ful
 (no dependencies whatsoever) is also unchanged — i.e. the two chunk streams do **not** run in
 parallel at all.  Timing instrumentation found why.
 
-### 6.1 Blocker A — the scheduler synchronizes between chunk graphs (this is the real one)
+### 6.1 Blocker A — the scheduler synchronizes between chunk graphs
+
+> **CORRECTED 2026-09-16 (sixth session).  The diagnosis below is WRONG — kept for the record.**
+>
+> `ggml_backend_sched_alloc_splits` **never takes the reserve path** on this workload.  Direct
+> instrumentation (`tools/chunk-trace-instrumentation.patch`, `GGML_CHUNK_TRACE=1`) prints
+> `[asplit] ENTER/EXIT` (4.5-9.7 ms) and **no `reserve-path` line at all**, for every graph in the
+> run — so the `n_async_devices > 1` synchronize is never executed, and the 374 ms was never there.
+>
+> **The real host-blocking site** is the split-input copy in `ggml_backend_sched_compute_splits`
+> (the `else` branch, ~line 1897):
+>
+> ```cpp
+> if (!split_backend->iface.cpy_tensor_async ||
+>     !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+>     ggml_backend_synchronize(input_backend);
+>     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+>         ggml_backend_event_synchronize(...);   // stream-side, non-blocking host
+>     } else {
+>         ggml_backend_synchronize(split_backend);   // <-- full host block
+>     }
+>     ggml_backend_tensor_copy(input, input_cpy);
+> }
+> ```
+>
+> The **meta backend does not implement `cpy_tensor_async`**
+> (`ggml-backend-meta.cpp:2733` = `nullptr`; the CUDA backend does, `ggml-cuda.cu:6444`), so the
+> guard is always taken.  And `sched->events[...]` is NULL because `n_copies == 1`:
+> `ggml_backend_sched_new` sets `n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1` and only creates
+> events `if (sched->n_copies > 1)` — and `parallel` is `cparams.pipeline_parallel`, which is gated
+> on `LLAMA_SPLIT_MODE_LAYER` (`llama-context.cpp:555`), so it is **false** under `-sm tensor`.
+> Net effect: every split input (`model.input_embed` is the one that shows up) forces a full
+> `ggml_backend_synchronize(Meta)` = wait for the previous chunk's entire GPU work.
+>
+> Measured trace (instrumented):
+>
+> ```
+> [csplit] split 1/2 backend=Meta(ROCm0,ROCm1) n_inputs=10 nodes=3750 t=....301.0
+> [meta] GC ENTER t=....667.3        <-- 366.3 ms gap, no slow [tset], no S2 wait
+> ```
+>
+> ### …but fixing it does NOT unlock the win (measured)
+>
+> A bench-only diagnostic that skips the wait entirely (`GGML_CS_SKIP_WAIT=1`, in the
+> instrumentation patch; results are wrong by construction, the same class of diagnostic as
+> `GGML_AR_NOOP`):
+>
+> | pp2048, `-b/-ub 1024`, `ce` | t/s |
+> |---|---:|
+> | mode 2 (normal) | 2197.7 |
+> | mode 2 + wait skipped | 2204.8 (**+0.3 %**) |
+> | mode 3 (no cross-chunk waits) + wait skipped | 2199.3 |
+> | AR-free ceiling | 2766.1 |
+>
+> So the host block is **not** the throughput limiter: the host is waiting for a GPU that is
+> genuinely busy the whole time.  **Removing both the host wait and the GPU-side cross-chunk waits
+> changes nothing**, i.e. the two parity streams do not overlap *at all* — the serialization is
+> somewhere else (GPU-timeline or stream-placement), and that is the new open question.
+>
+> **New starting point for the next session:** instrument the *stream* actually used per subgraph
+> (dump `cctx->stream()` for `backend_configs[0]` in the meta loop; the parity value is already in
+> the `[meta] GC EXIT mode=… parity=…` trace) and check whether the CE AR's shared scratch + its
+> cross-call event guards (`ce_ev_done`/`ce_ev_out` are shared by both chunk parities) are forcing
+> chunk B's ARs to serialize behind chunk A's.  `GGML_META_CHUNK_PIPELINE=3` (no waits) is the
+> control: if the streams were parallel it would show a win even with the wrong answers.
+
+<details><summary>original (superseded) text</summary>
 
 Host timestamps around one prefill (`GGML_META_CHUNK_TRACE`, `-b/-ub 1024 -p 2048`):
 
@@ -220,6 +290,8 @@ until the previous graph's GPU work has finished**.  No amount of meta-backend s
 overlap across that.  (`ggml_backend_sched_graph_compute_async` calls `alloc_graph` whenever
 `sched->is_alloc` is false, i.e. for any non-reused graph.)
 
+</details>
+
 ### 6.2 Blocker B — the graph inputs are shared (correctness)
 
 Mode 2 on a prompt whose length is **not** a multiple of the ubatch (prose, 5298 tokens → 5x1024 +
@@ -241,24 +313,41 @@ input double-buffering that llama.cpp only does for layer-split pipeline paralle
 
 The meta backend is now the *easy* half and it is done.  The remaining work is in llama.cpp/ggml core:
 
-1. **Do not synchronize the host between chunk graphs.**  Either skip the `n_async_devices > 1`
-   synchronize when the meta backend's chunk pipeline is active, or make it per-graph.  This is what
-   unlocks the overlap; steps 1-3 above are already in place behind it.
+1. ~~**Do not synchronize the host between chunk graphs.**~~  **Measured, and NOT the lever**
+   (§6.1 correction): the host block is real but costs only 0.3 %.  The corrected action list is in
+   §7.
 2. **Double-buffer the graph inputs per chunk** so `set_inputs` for chunk B cannot clobber chunk A's
    reads (fixes blocker B).  The scheduler's `n_copies` machinery is the closest existing thing, but
    it copies from the shared original at dispatch time, so it needs to write the per-copy tensor
-   directly.
+   directly.  **Note the meta device has no event interface** (`event_new = nullptr`,
+   `caps.events = false`), so `n_copies = 2` alone would still leave `sched->events` NULL for that
+   backend — the meta backend also needs `event_*` (and `cpy_tensor_async`) implemented before the
+   scheduler's non-blocking paths become reachable.
 3. Only then re-tune the chunk count (2/3/4).
 
-## 7. Suggested order of work (revised)
+## 7. Suggested order of work (revised 2026-09-16, sixth session)
 
 1. **Second stream + parity plumbing.**  DONE (patch 2).
 2. **Per-subgraph events without overlap.**  DONE, validated byte-identical (mode 1).
-3. **Cross-chunk wait.**  DONE (mode 2) — but it does not overlap: see blockers A and B.
-4. **NEXT, in ggml/llama core:** stop the inter-graph synchronize (blocker A, §6.1) and double-buffer
-   the graph inputs (blocker B, §6.2).  Both are needed; A alone gives a race, B alone gives no
-   overlap.  Smallest first step: make the `n_async_devices > 1` synchronize in
-   `ggml_backend_sched_alloc_splits` conditional (env-gated), keep mode 2, and measure — the effect
-   is immediately visible in `GGML_META_CHUNK_TRACE` (the 374 ms gap should vanish).
-5. **Then tune the chunk count** (2 vs 3 vs 4) — there are 128 ARs per forward, so there is a lot of
+3. **Cross-chunk wait.**  DONE (mode 2) — but it does not overlap (§6.1 correction).
+4. **ANSWER THE OPEN QUESTION FIRST: why do the two parity streams not overlap at all?**  This is now
+   the gating item, and it is a measurement, not a change.  Removing *both* the host-side input wait
+   and the GPU-side cross-chunk waits leaves the number unchanged (2199 vs 2198), so the
+   serialization is neither of those.  Concretely:
+   - dump the actual stream per subgraph — add `(void *) cctx->stream()` for
+     `backend_configs[0]` to the meta loop's `[meta] GC` trace (the parity value is already there);
+   - check the CE AR's cross-call guards: `ce_ev_done`/`ce_ev_out` and the scratch buffers
+     (`ce_buf`/`ce_tmp`/`ce_tmp2`) are **shared by both chunk parities**, so chunk B's 128 ARs may be
+     serialized behind chunk A's 128 ARs even when the compute streams are independent;
+   - control with `GGML_META_CHUNK_PIPELINE=3` (no waits): if the streams were parallel it would show
+     a win despite the wrong answers.
+   The instrumentation to run all of this is `tools/chunk-trace-instrumentation.patch`
+   (`GGML_CHUNK_TRACE=1`; also `[asplit]`, `[csplit]`, `[tset]` and the `GGML_CS_SKIP_WAIT`
+   bench-only diagnostic) — apply it **after** the two WIP patches.
+5. **Then the plumbing that a real pipeline needs** (§6.3): implement the meta backend's
+   `cpy_tensor_async` (so split-input copies stop falling back to the blocking path) and its
+   `event_new`/`event_record`/`event_wait`/`event_synchronize`, then let the scheduler use
+   `n_copies = 2` under `-sm tensor` (today gated on layer split at `llama-context.cpp:555`, and note
+   the llama-context graph-reuse `synchronize()` just below it would need to be copy-aware).
+6. **Then tune the chunk count** (2 vs 3 vs 4) — there are 128 ARs per forward, so there is a lot of
    pipeline depth.

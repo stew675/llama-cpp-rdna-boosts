@@ -27,14 +27,22 @@ landing it as a separate arm).
 `tools/`).  The delivery `patches/` do **not** contain the overlap work, the `GGML_AR_NOOP` knob, or
 the `ggml_backend_comm_set_stream_no` hook.
 
-**The next action, concretely — blocker A** (`OVERLAP-DESIGN.md` §6.1): the scheduler serializes
-consecutive chunk graphs.  `ggml_backend_sched_alloc_splits` (`ggml/src/ggml-backend.cpp`, ~line 1660)
-calls `ggml_backend_synchronize` on every backend whenever `n_async_devices > 1` and a graph is
-(re)allocated — always true with 2 GPUs.  Make that conditional (env-gate it), keep
-`GGML_META_CHUNK_PIPELINE=2`, and re-run with `GGML_META_CHUNK_TRACE=1`.  **The signature of success
-is the ~374 ms host gap between two chunk dispatches vanishing** (it collapses to 13-20 ms today only
-when `GGML_AR_NOOP=1`).  Blocker B (per-chunk input copies, §6.2) then decides whether the result is
-also *correct* — **A alone gives a race, B alone gives no overlap, so both are needed.**
+**The next action, concretely** (`OVERLAP-DESIGN.md` §6.1 correction + §7).  The previously-recorded
+blocker A was **wrong**: `ggml_backend_sched_alloc_splits` is never entered with a growing reserve on
+this workload, so the `n_async_devices > 1` synchronize never runs (proved with
+`tools/chunk-trace-instrumentation.patch`, which prints `[asplit] ENTER/EXIT` but **no**
+`reserve-path` line).  The *real* host block is the split-input copy fallback in
+`ggml_backend_sched_compute_splits`, taken because the **meta backend does not implement
+`cpy_tensor_async`** and `sched->events` is NULL (`n_copies == 1` under `-sm tensor`).
+
+**BUT fixing that is worth only +0.3 %** (measured: 2204.8 vs 2197.7 with the wait skipped entirely),
+and removing the GPU-side cross-chunk waits too changes nothing (2199.3).  So neither host-side nor
+GPU-side *waits* are the limiter — the two parity streams simply do not overlap, and **finding out
+why is now the gating item**: dump the actual stream used per subgraph, and check whether the CE AR's
+shared scratch + cross-call event guards (`ce_ev_done`/`ce_ev_out`, shared by both chunk parities)
+serialize chunk B's ARs behind chunk A's.  `GGML_META_CHUNK_PIPELINE=3` is the control (no waits): if
+the streams were parallel it would show a win despite the wrong answers.  Blocker B (per-chunk input
+copies, §6.2) is still required for *correctness* once overlap is real.
 
 **What to do with the repo checkouts (verified 2026-09-16):**
 
@@ -293,6 +301,14 @@ cross-call per-subgraph events in `ggml_backend_meta_graph_compute`.
 **Update 2026-09-16 (fourth session): steps 1-3 of that plan are implemented, measured, and the
 two real blockers are now identified and root-caused** — both are *outside* the meta backend:
 
+> **SUPERSEDED 2026-09-16 (sixth session): blocker A below is WRONG and blocker B is not the
+> limiter.**  `ggml_backend_sched_alloc_splits` never takes its reserve path here, so that
+> synchronize never runs; the actual host block is the **split-input copy fallback** in
+> `ggml_backend_sched_compute_splits` (the meta backend has no `cpy_tensor_async`, and `sched->events`
+> is NULL) — and skipping it is worth only **+0.3 %**, so it is not the lever either.  The two parity
+> streams simply do not overlap, for a reason still to be found.  See the top of this file and
+> `OVERLAP-DESIGN.md` §6.1/§7.
+
 * **A (the killer): the scheduler synchronizes between chunk graphs.**  `ggml_backend_sched_alloc_splits`
   (`ggml-backend.cpp` ~1660) calls `ggml_backend_synchronize` on **every** backend whenever
   `n_async_devices > 1` and a graph is (re)allocated.  With 2 GPUs that is every non-reused graph, so
@@ -319,38 +335,40 @@ unharmed (§3.3), and the config decision was resolved by **shipping `ce` as an 
 decision is **deliberately deferred** until the overlap work lands (the overlapped form is expected to
 win at every rank count).  Interim policy: **`ce` on 2 GPUs, `hybrid` on 3**.
 
-3. **THE NEXT THING — unblock the token-chunk pipeline** (the ~21-25 %).  The meta-backend plumbing
-   (parity streams + per-subgraph events) is **already built and validated inert**, so all that
-   remains is in ggml/llama core, in this order:
-   - **Blocker A:** gate the `n_async_devices > 1` synchronize in `ggml_backend_sched_alloc_splits`
-     (`ggml/src/ggml-backend.cpp`, ~line 1660, env-gate it).  This is the one conditional that
-     unlocks the overlap.  Success signature: the ~374 ms host gap between chunk dispatches vanishes
-     in `GGML_META_CHUNK_TRACE` output.
-   - **Blocker B:** give each chunk its own copy of the graph inputs (`inp_tokens`/`inp_pos`), else
-     the overlapped run is racy (and faults in `rope_multi` on non-uniform chunk sizes).
-   - Then re-validate and re-measure; the target is pp2048 ≈ 2700+ (from 2183) against the AR-free
-     ceiling of 2748.
-   Full design, change sites, risks and validation: **`OVERLAP-DESIGN.md` §6 and §7**.  Do it on
-   2 GPUs first.
+3. **THE NEXT THING — find out why the two parity streams do not overlap** (the ~21-25 %).  This is
+   now a *measurement* item, not a change: the meta-backend plumbing is built and validated inert,
+   and the two wait sites that used to be blamed for the serialization were measured and are **not**
+   the limiter (see the next-action paragraph at the top of this file).  In order:
+   - Dump the real stream per subgraph (`cctx->stream()` for `backend_configs[0]` in the meta loop;
+     the parity is already in the `[meta] GC EXIT mode=… parity=…` trace) — confirm chunk A and
+     chunk B are actually on different streams.
+   - Check the CE AR's shared state across parities: `ce_buf`/`ce_tmp`/`ce_tmp2` and the
+     `ce_ev_done`/`ce_ev_out` cross-call guards are **shared by both chunks**, so chunk B's 128 ARs
+     may be forced to serialize behind chunk A's 128.
+   - Control: `GGML_META_CHUNK_PIPELINE=3` (no waits) — if the streams were parallel this would win.
+   - Then the plumbing: meta `cpy_tensor_async` + meta `event_*`, then `n_copies = 2` under
+     `-sm tensor` (today gated on layer split).
+   Full design, change sites, risks: **`OVERLAP-DESIGN.md` §6 and §7**.  Do it on 2 GPUs first.
 
-   **Ready-to-run commands** (after applying + building the two WIP patches as above):
+   **Ready-to-run commands** (apply the two WIP patches **and**
+   `tools/chunk-trace-instrumentation.patch`, then build):
 
    ```bash
    M=/llm/models/Qwen3.8/27B/Q8_0/Qwen3.8-27B-Q8_0.gguf
    BASE="-m $M -ngl 99 -sm tensor -fa 1 -ctk bf16 -ctv bf16 -b 1024 -ub 1024 -p 2048 -n 0 -r 2 -o md"
    # baseline: mode 1 = plumbing present, no cross-chunk waits (must equal mode 0)
    env HIP_VISIBLE_DEVICES=0,1 GGML_CUDA_ALLREDUCE=ce GGML_META_CHUNK_PIPELINE=1 ./build-rocm/bin/llama-bench $BASE
-   # the pipeline under test; watch for the ~374 ms host gap disappearing (GGML_META_CHUNK_TRACE=1)
-   env HIP_VISIBLE_DEVICES=0,1 GGML_CUDA_ALLREDUCE=ce GGML_META_CHUNK_PIPELINE=2 GGML_META_CHUNK_TRACE=1 ./build-rocm/bin/llama-bench $BASE
-   # AR-free ceiling at this ubatch (2748 t/s) - the number a working pipeline should approach
+   # the pipeline under test, with the full trace
+   env HIP_VISIBLE_DEVICES=0,1 GGML_CUDA_ALLREDUCE=ce GGML_META_CHUNK_PIPELINE=2 GGML_CHUNK_TRACE=1 ./build-rocm/bin/llama-bench $BASE
+   # AR-free ceiling at this ubatch (2766 t/s) - the number a working pipeline should approach
    env HIP_VISIBLE_DEVICES=0,1 GGML_AR_NOOP=1 ./build-rocm/bin/llama-bench $BASE
    ```
 
-   Current numbers to beat at these settings: pp2048 = **2181** (mode 0) / 2179 (mode 1) / 2183
-   (mode 2), against the **2748** ceiling.  Purity gate: with `ce`, `--spec-type none` and
-   `--spec-type draft-mtp --spec-draft-n-max 3` must stay byte-identical (`16c5d2e75ad8`, prose
-   prompt, `-n 1500`); use `scripts/extract-generated.py` on a `llama-cli --single-turn
-   --no-display-prompt` log (a naive `sed` slice does NOT reproduce the hash).
+   Numbers measured 2026-09-16 (sixth session, this box): pp2048 **2211.7** (mode 0) / 2202.3
+   (mode 1) / 2211.2 (mode 2), against the **2766** ceiling.  Purity gate: with `ce`,
+   `--spec-type none` and `--spec-type draft-mtp --spec-draft-n-max 3` must stay byte-identical
+   (`16c5d2e75ad8`, prose prompt, `-n 1500`); use `scripts/extract-generated.py` on a `llama-cli
+   --single-turn --no-display-prompt` log (a naive `sed` slice does NOT reproduce the hash).
 4. **After the pipeline lands**, re-test 3 GPUs and revisit the config policy (the prefill AR
    *exposure*, not its serialized speed, dominates; the pipeline is expected to change the 3-GPU
    verdict).
@@ -381,6 +399,7 @@ win at every rank count).  Interim policy: **`ce` on 2 GPUs, `hybrid` on 3**.
 | `ce_ar.hip` | standalone SDMA 2-rank all-reduce: correct, 12.7 GB/s, 0 % gemm slowdown |
 | `ce-allreduce.patch` | the WIP `GGML_CUDA_ALLREDUCE=ce` patch: `ce` + `GGML_AR_NOOP` + the stream hook (the delivery's block 12 carries the `ce` arm only) |
 | `meta-chunk-pipeline.patch` | the WIP token-chunk pipeline plumbing (`GGML_META_CHUNK_PIPELINE` 1/2/3) — applies on top of `ce-allreduce.patch` |
+| `chunk-trace-instrumentation.patch` | the `GGML_CHUNK_TRACE` tracing (`[asplit]`/`[csplit]`/`[tset]`) + the `GGML_CS_SKIP_WAIT` bench-only diagnostic — applies on top of the two above (see §7) |
 | `rocblas_i8.hip` | rocBLAS INT8 reference — currently `rocblas_status_invalid_size` on gfx1201 (TODO) |
 
 Most microbench builds: `hipcc --offload-arch=gfx1201 -O3 -o /tmp/x <file>.hip`.
@@ -436,12 +455,14 @@ prefill.  We built an SDMA copy-engine AR; **that part is now shipped** as the o
 decode byte-identical to `hybrid`, `hybrid` still the default, and a `ce` init failure degrades to
 `hybrid` rather than the butterfly.  It runs on 3 GPUs too, correctly and purely, but ~6 % slower than
 NCCL there, so it is documented as a 2-GPU win.  **What is left is the overlap half**: steps 1-3 of
-the token-chunk pipeline are implemented and validated inert, and the two blockers are root-caused —
-(A) the scheduler synchronizes every backend between chunk graphs when `n_async_devices > 1`
-(`ggml_backend_sched_alloc_splits`), and (B) the graph inputs are shared, so overlapping chunks race.
-Fix A first (one conditional, and the 374 ms host gap in `GGML_META_CHUNK_TRACE` should vanish), then
-B, and the AR should be hidden — the ~21-25 % that closes the gap.  Optionally attack the Q8_0 MMQ
-per-block-scale epilogue (62.5 % of the kernel) for the separate ~2.7× kernel headroom.
+the token-chunk pipeline are implemented and validated inert.  The blockers originally recorded here
+were **disproven on 2026-09-16 (sixth session)**: the `ggml_backend_sched_alloc_splits` synchronize is
+never reached, and the real host block (the split-input copy fallback, caused by the meta backend's
+missing `cpy_tensor_async` plus NULL `sched->events`) is worth only **+0.3 %** when removed.  So the
+open question is **why the two parity streams do not overlap at all** — that is the gating measurement
+(see the top of this file and `OVERLAP-DESIGN.md` §7 item 4), and the ~21-25 % is behind it.
+Optionally attack the Q8_0 MMQ per-block-scale epilogue (62.5 % of the kernel) for the separate ~2.7×
+kernel headroom.
 
 ### Session log (2026-09-16, second session)
 
@@ -506,3 +527,29 @@ section), `AGENTS.md` (block-12 bullet + tip/tree), `README.md`, `make-patches.s
 5. Merged to `main`, tagged **`v16-d1d3c3396-r4`**, pushed; the tag guard and *Validate delivery set*
 are green (the container/release job runs long).  The `ce` mode is now in beta with users.
 6. Nothing in `wip/` was promoted, and the overlap work is unchanged and still unlanded.
+
+### Session log (2026-09-16, sixth session — blocker A disproven; the open question moved)
+
+1. Started from this handover, applied the two WIP patches to `~/llama.cpp` (the r3 tree — they apply
+   cleanly there, verified) and built; reproduced the state: mode 0 **2211.7** / mode 1 2202.3 /
+   mode 2 2211.2, AR-free ceiling **2766.1**.
+2. **Disproved the recorded blocker A.** Instrumented `ggml_backend_sched_alloc_splits`: it prints
+   `[asplit] ENTER/EXIT` (4.5-9.7 ms) and **never** a `reserve-path` line, so the
+   `n_async_devices > 1` synchronize is *never executed*.  The 374 ms was never there.
+3. **Found the real host block:** `ggml_backend_sched_compute_splits`'s split-input copy takes its
+   blocking fallback — because the meta backend has **`cpy_tensor_async = nullptr`** (the CUDA backend
+   has it) and `sched->events` is NULL (`n_copies == 1`; events are only created when `n_copies > 1`,
+   and `parallel`/`pipeline_parallel` is layer-split-gated).  Measured: a **366 ms** gap between
+   `[csplit] split 1/2` and `[meta] GC ENTER`, with no slow `[tset]` and the S2 wait skipped.
+4. **But it is not the lever.**  Added a bench-only `GGML_CS_SKIP_WAIT` diagnostic: skipping the wait
+   entirely gives **2204.8 vs 2197.7 (+0.3 %)**; skipping the GPU-side cross-chunk waits too gives
+   2199.3.  So the host is waiting for a genuinely busy GPU, and the parity streams do not overlap for
+   some other reason — that is the new gating question (`OVERLAP-DESIGN.md` §7 item 4).
+5. Also confirmed: the meta device has **no event interface** (`event_new = nullptr`,
+   `caps.events = false`), so `n_copies = 2` alone would still leave `sched->events` NULL for it — the
+   meta backend needs `event_*` and `cpy_tensor_async` before the scheduler's non-blocking paths are
+   reachable.
+6. Saved the tracing/diagnostics as **`tools/chunk-trace-instrumentation.patch`** (applies on top of
+   the two WIP patches) and restored the fork tree to the clean WIP-patched state.
+7. Corrected `OVERLAP-DESIGN.md` (§6.1 correction block, §6.3 item 1, §7) and this file's next-action
+   paragraph, commands and numbers.

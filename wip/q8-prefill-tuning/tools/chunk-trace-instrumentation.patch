@@ -1,0 +1,226 @@
+--- a/ggml/src/ggml-backend.cpp	2026-09-16 10:00:25.727278817 -0500
++++ b/ggml/src/ggml-backend.cpp	2026-09-16 10:00:20.185158600 -0500
+@@ -20,9 +20,14 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <algorithm>
++#include <chrono>
+ #include <unordered_map>
+ #include <vector>
+ 
++// ---- TEMPORARY chunk-pipeline instrumentation (GGML_CHUNK_TRACE) ----
++static bool ggml_chunk_trace_enabled();
++static double ggml_chunk_now_ms();
++
+ #ifdef __APPLE__
+ #include <sys/types.h>
+ #include <sys/sysctl.h>
+@@ -344,7 +349,14 @@
+     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+ 
++    const double t_set0 = ggml_chunk_now_ms();
+     buf->iface.set_tensor(buf, tensor, data, offset, size);
++    if (ggml_chunk_trace_enabled()) {
++        const double dt = ggml_chunk_now_ms() - t_set0;
++        if (dt > 1.0) {
++            fprintf(stderr, "[tset] '%s' %.1f ms (%zu bytes)\n", tensor->name, dt, size);
++        }
++    }
+ }
+ 
+ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+@@ -1597,7 +1609,22 @@
+     }
+ }
+ 
++// ---- TEMPORARY chunk-pipeline instrumentation (GGML_CHUNK_TRACE) ----
++static bool ggml_chunk_trace_enabled() {
++    static const bool enabled = getenv("GGML_CHUNK_TRACE") != nullptr;
++    return enabled;
++}
++static double ggml_chunk_now_ms() {
++    return std::chrono::duration<double, std::milli>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
+ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
++    const double t_asplit0   = ggml_chunk_now_ms();
++    const bool   trace_split = ggml_chunk_trace_enabled();
++    if (trace_split) {
++        fprintf(stderr, "[asplit] ENTER t=%.1f\n", t_asplit0);
++    }
+     bool backend_ids_changed = false;
+     for (int i = 0; i < sched->graph.n_nodes; i++) {
+         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
+@@ -1656,12 +1683,21 @@
+         // be using.
+         const bool buffers_grown = ggml_gallocr_reserve_n_probe(
+                 sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
++        if (ggml_chunk_trace_enabled()) {
++            fprintf(stderr, "[asplit]   reserve-path t=%.1f (+%.1f ms) grown=%d n_async=%d\n",
++                    ggml_chunk_now_ms(), ggml_chunk_now_ms() - t_asplit0, (int) buffers_grown, n_async_devices);
++        }
+         if (buffers_grown || n_async_devices > 1) {
++            const double t_sync0 = ggml_chunk_now_ms();
+             // the re-allocation may cause the split inputs to be moved to a different address
+             // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+             for (int i = 0; i < sched->n_backends; i++) {
+                 ggml_backend_synchronize(sched->backends[i]);
+             }
++            if (ggml_chunk_trace_enabled()) {
++                fprintf(stderr, "[asplit]   *** SYNC %.1f ms *** t=%.1f\n",
++                        ggml_chunk_now_ms() - t_sync0, ggml_chunk_now_ms());
++            }
+ 
+             if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+                 GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+@@ -1674,11 +1710,18 @@
+         }
+     }
+ 
++    if (trace_split) {
++        fprintf(stderr, "[asplit] EXIT  t=%.1f (total %.1f ms)\n", ggml_chunk_now_ms(), ggml_chunk_now_ms() - t_asplit0);
++    }
+     return true;
+ }
+ 
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
++    const double t_cs0 = ggml_chunk_now_ms();
++    if (ggml_chunk_trace_enabled()) {
++        fprintf(stderr, "[csplit] ENTER t=%.1f n_splits=%d cur_copy=%d\n", t_cs0, sched->n_splits, sched->cur_copy);
++    }
+     struct ggml_backend_sched_split * splits = sched->splits;
+ 
+     ggml_tensor * prev_ids_tensor = nullptr;
+@@ -1691,15 +1734,26 @@
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
++        const double t_sp0 = ggml_chunk_now_ms();
++        if (ggml_chunk_trace_enabled()) {
++            fprintf(stderr, "[csplit] split %d/%d backend=%s n_inputs=%d nodes=%d t=%.1f\n",
++                    split_id, sched->n_splits, ggml_backend_name(split_backend), split->n_inputs,
++                    split->graph.n_nodes, t_sp0);
++        }
+ 
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
++            const double t0 = ggml_chunk_now_ms();
+             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+             } else {
+                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
+             }
++            if (ggml_chunk_trace_enabled()) {
++                fprintf(stderr, "[csplit]   S1 prev-split sync %s -> %.1f ms\n",
++                        ggml_backend_name(sched->backends[prev_backend_id]), ggml_chunk_now_ms() - t0);
++            }
+         }
+ 
+         // copy the input tensors to the split backend
+@@ -1710,19 +1764,39 @@
+ 
+             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
++                const double t_in0 = ggml_chunk_now_ms();
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                 } else {
+                     ggml_backend_synchronize(split_backend);
+                 }
++                if (ggml_chunk_trace_enabled()) {
++                    const double dt = ggml_chunk_now_ms() - t_in0;
++                    if (dt > 1.0) {
++                        fprintf(stderr, "[csplit]   BLOCK on input '%s': %.1f ms (copy=%d ev=%p)\n",
++                                input->name, dt, sched->cur_copy,
++                                (void *) sched->events[split_backend_id][sched->cur_copy]);
++                    }
++                }
+                 ggml_backend_tensor_copy(input, input_cpy);
+             } else {
+                 // wait for the split backend to finish using the input before overwriting it
+-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
++                const double t_w0 = ggml_chunk_now_ms();
++                static const bool skip_wait_diag = getenv("GGML_CS_SKIP_WAIT") != nullptr;
++                if (skip_wait_diag) {
++                    // bench-only diagnostic: skip the wait entirely (results are WRONG) - measures the
++                    // throughput ceiling that removing this host-blocking wait would unlock.
++                } else if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                 } else {
+                     ggml_backend_synchronize(split_backend);
+                 }
++                if (ggml_chunk_trace_enabled()) {
++                    const double dt = ggml_chunk_now_ms() - t_w0;
++                    if (dt > 0.5) {
++                        fprintf(stderr, "[csplit]   S2 wait-before-overwrite '%s': %.1f ms\n", input->name, dt);
++                    }
++                }
+ 
+                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+                 ggml_tensor * node = split->graph.nodes[0];
+@@ -1736,7 +1810,12 @@
+                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
+                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+ 
++                    const double t_e0 = ggml_chunk_now_ms();
+                     ggml_backend_synchronize(input_backend);
++                    if (ggml_chunk_trace_enabled()) {
++                        fprintf(stderr, "[csplit]   S3 expert-type sync %s -> %.1f ms\n",
++                                ggml_backend_name(input_backend), ggml_chunk_now_ms() - t_e0);
++                    }
+ 
+                     // get the ids
+                     ggml_tensor * ids_tensor = node->src[2];
+--- a/ggml/src/ggml-backend-meta.cpp	2026-09-16 10:00:25.727339808 -0500
++++ b/ggml/src/ggml-backend-meta.cpp	2026-09-16 10:00:20.185209821 -0500
+@@ -8,6 +8,7 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <chrono>
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdint>
+@@ -20,6 +21,16 @@
+ #include <utility>
+ #include <vector>
+ 
++// ---- TEMPORARY chunk-pipeline instrumentation (GGML_CHUNK_TRACE) ----
++static bool ggml_backend_meta_chunk_trace_enabled() {
++    static const bool enabled = getenv("GGML_CHUNK_TRACE") != nullptr;
++    return enabled;
++}
++static double ggml_backend_meta_chunk_now_ms() {
++    return std::chrono::duration<double, std::milli>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
+ struct ggml_backend_meta_device;
+ struct ggml_backend_meta_buffer_type;
+ struct ggml_backend_meta_buffer;
+@@ -2153,6 +2164,9 @@
+     GGML_ASSERT(cgraph->grads == nullptr);
+     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
++    if (ggml_backend_meta_chunk_trace_enabled()) {
++        fprintf(stderr, "[meta] GC ENTER t=%.1f\n", ggml_backend_meta_chunk_now_ms());
++    }
+ 
+     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
+     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
+@@ -2701,6 +2715,11 @@
+             backend_ctx->comm_set_stream_no(backend_ctx->comm_ctx, 0);
+         }
+     }
++    if (ggml_backend_meta_chunk_trace_enabled()) {
++        fprintf(stderr, "[meta] GC EXIT  t=%.1f mode=%d parity=%d n_sub=%zu wait_prev=%d\n",
++                ggml_backend_meta_chunk_now_ms(), chunk_mode, chunk_par, backend_ctx->n_subgraphs,
++                (int) chunk_wait_prev);
++    }
+     return GGML_STATUS_SUCCESS;
+ }
+ 
