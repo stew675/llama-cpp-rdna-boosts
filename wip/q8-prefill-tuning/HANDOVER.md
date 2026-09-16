@@ -41,13 +41,23 @@ blocker A was **wrong**, and so was the follow-up diagnosis.  What is actually k
   The parity streams *are* used (`curr_stream_no=2`, distinct pointers), so this is **GPU-side /
   structural**, and the "remove the host block" plan is dead.
 
-**So the gating question is now a hardware/driver one**: can two streams on these two GPUs overlap an
-SDMA transfer with compute at all?  The next step is a **minimal synthetic reproducer** (a two-stream
-variant of `tools/overlap.hip`: stream A = GEMMs + SDMA ARs, stream B = GEMMs).  If it overlaps, the
-problem is llama.cpp's structure and worth chasing; if it does not, the chunk-pipeline approach should
-be **closed** rather than pursued further.  `rocprofv3` (which would show the GPU timeline directly)
-hangs on this box, which is why the reproducer is needed.  Blocker B (per-chunk input copies, §6.2)
-remains required for *correctness* once overlap is real.
+**The answer is now in, and it is a "stop":** the chunk pipeline cannot pay on this box.  The
+reproducer `tools/overlap_ar.hip` (new, §6.5) models the real structure faithfully — two parity
+chains, per-device streams, cross-device event waits, separate *and* shared AR scratch — and shows:
+
+* with a **compute-bound** kernel the AR hides 100 % and shared scratch/events change nothing
+  (two more hypotheses eliminated);
+* with a **bandwidth-bound** kernel two concurrent chains are **14 % slower than serial**
+  (5510 vs 4864 ms) — contention, not overlap, which is exactly the signature the real model shows
+  (mode 2/3 slightly *worse* than mode 0 at every length).
+
+Tensor-parallel prefill is not a compute shadow that absorbs the AR, and the AR is not pure DMA — its
+staging conversions (`to_bf16` over the full tensor per rank, `ce_add_bf16`, `to_fp32`) are on the same
+critical path, and `GGML_AR_NOOP` removes those too.  **Recommendation: close the overlap/chunk-pipeline
+work** (see `OVERLAP-DESIGN.md` §6.5) and, if the ~20 % is still wanted, attack the AR's *cost*
+(its ~126 MB/AR/device of HBM staging traffic, and fusing the AR into the consumer's residual add)
+or the independent MMQ epilogue win (§0 item 7).  The instrumentation and both reproducers are kept so
+this can be re-opened if a future driver or kernel change alters the picture.
 
 **What to do with the repo checkouts (verified 2026-09-16):**
 
@@ -401,6 +411,7 @@ win at every rank count).  Interim policy: **`ce` on 2 GPUs, `hybrid` on 3**.
 | `wmma_epilogue.hip` | Q8_0 per-block scale epilogue costs **62.5 %** (172.7 → 64.7 T-MAC/s) |
 | `p2p_bw.hip` | raw peer copy 12.5-14.3 GB/s ≈ 90 % of the Gen5 **x4** wire |
 | `overlap.hip` | SDMA transfers hide **100 %** behind GEMMs; SM-driven transfers hide 5-17 % |
+| `overlap_ar.hip` | the real structure modelled (2 parity chains, parity streams, cross-device events, shared vs separate AR scratch): compute-bound -> AR hides 100 %, scratch sharing irrelevant; **bandwidth-bound -> 2 chains are 14 % slower than serial** (§6.5) |
 | `ce_ar.hip` | standalone SDMA 2-rank all-reduce: correct, 12.7 GB/s, 0 % gemm slowdown |
 | `ce-allreduce.patch` | the WIP `GGML_CUDA_ALLREDUCE=ce` patch: `ce` + `GGML_AR_NOOP` + the stream hook (the delivery's block 12 carries the `ce` arm only) |
 | `meta-chunk-pipeline.patch` | the WIP token-chunk pipeline plumbing (`GGML_META_CHUNK_PIPELINE` 1/2/3) — applies on top of `ce-allreduce.patch` |
@@ -571,3 +582,10 @@ are green (the container/release job runs long).  The `ce` mode is now in beta w
    invalid as a ceiling statement).  See `OVERLAP-DESIGN.md` §6.4.
 9. `tools/overlap.hip` (the two-stream variant) is the recommended next experiment -- see the
    next-action paragraph at the top of this file.
+10. **Ran that experiment and closed the question.**  Wrote `tools/overlap_ar.hip`, a faithful model
+    of the real structure (two parity chains, per-device parity streams, cross-device stream-wait
+    events, separate *and* shared AR scratch).  Compute-bound kernel -> the AR hides 100 % and scratch
+    sharing is irrelevant; bandwidth-bound kernel -> two chains are 14 % *slower* than serial.  The
+    real model's slight regression in modes 2/3 matches the second case.  Conclusion: the chunk
+    pipeline cannot pay here; recorded in `OVERLAP-DESIGN.md` §6.5 together with the two remaining
+    options (make the AR cheaper, or the MMQ epilogue).

@@ -344,6 +344,45 @@ variant: stream A = GEMMs + SDMA ARs, stream B = GEMMs).  If a minimal reproduce
 problem is llama.cpp's structure; if it does not, this driver/hardware will not do it and the
 chunk-pipeline approach should be closed.
 
+### 6.5 Session 6 — the reproducer explains it, and the answer is "do not chase the overlap"
+
+Two facts had to be reconciled: the pipeline gains nothing, yet `overlap.hip` says SDMA hides 100 %
+behind compute.  The difference is **what the compute is bound by**.
+
+`tools/overlap_ar.hip` (new) models the real structure faithfully: two "chains" (the two chunk
+parities), each on **both** devices on its own per-device stream (stream 1 / stream 2, exactly like
+`comm_set_stream_no(parity+1)`), each step being `[compute on both devices] -> [peer copy with a
+cross-device stream-wait event]`, with a flag for **separate vs shared** AR scratch + events.
+
+| compute model | 1 chain, no AR | 1 chain, +AR | 2 chains, sep. | 2 chains, shared | ideal if AR free |
+|---|---:|---:|---:|---:|---:|
+| WMMA 16x16x16 (compute-bound) | 748 | 740 | 1460 | 1462 | 1497 |
+| HBM sweep (bandwidth-bound) | 2409 | 2432 | **5510** | **5501** | 4864 |
+
+Readings:
+
+1. **For compute-bound work the AR hides completely** — and *sharing* the scratch and the cross-device
+   events changes nothing (1462 vs 1460).  So neither the shared CE scratch nor the cross-device event
+   waits is the culprit — two hypotheses eliminated.
+2. **For bandwidth-bound work, two concurrent chains are 14 % SLOWER than running them serially**
+   (5510 vs 4864).  The streams do not overlap; they *contend*.  That is exactly the signature the
+   real model shows (mode 2/3 slightly worse than mode 0 at every prompt length).
+
+So the chunk pipeline cannot pay: the tensor-parallel prefill is not a pure-compute workload that can
+absorb DMA in its shadow, and the AR is not pure DMA either — its staging conversions (`to_bf16` over
+the full tensor per rank, `ce_add_bf16`, `to_fp32`) are themselves SM/HBM work sitting on the same
+critical path, and the `GGML_AR_NOOP` "ceiling" (2766) removes those too.
+
+**Conclusion: close the chunk-pipeline approach.**  Both remaining \"ways to win the 20 %\" are dead:
+chunking does not overlap (§6.4, §6.5), and the transport is already at 80-90 % of the x4 wire.  What
+remains is to **make the AR itself cheaper**, not to hide it:
+
+* the per-rank full-tensor bf16 staging + un-staging is ~126 MB of HBM traffic per AR per device —
+  the largest single component after the DMA;
+* fusing the AR into its consumer (the residual `ADD` / `RMS_NORM`) would remove the f32 write-back
+  plus the consumer's read (~84 MB per AR per device);
+* and the compute side has its own independent headroom (the MMQ epilogue, 62.5 % of T-MAC/s, §0 item 7).
+
 ### 6.2 Blocker B — the graph inputs are shared (correctness)
 
 Mode 2 on a prompt whose length is **not** a multiple of the ubatch (prose, 5298 tokens → 5x1024 +
