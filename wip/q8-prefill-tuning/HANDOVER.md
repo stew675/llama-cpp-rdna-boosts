@@ -550,6 +550,9 @@ are green (the container/release job runs long).  The `ce` mode is now in beta w
    meta backend needs `event_*` and `cpy_tensor_async` before the scheduler's non-blocking paths are
    reachable.
 6. Saved the tracing/diagnostics as **`tools/chunk-trace-instrumentation.patch`** (applies on top of
-   the two WIP patches) and restored the fork tree to the clean WIP-patched state.
+   the two WIP patches) and left `~/llama.cpp` with **all three patches applied and built**, so the
+   next session can start measuring immediately -- just `source` the ROCm env and run the commands
+   above with `GGML_CHUNK_TRACE=1`.  (The instrumentation patch applies cleanly on top of the two WIP
+   patches, verified.)
 7. Corrected `OVERLAP-DESIGN.md` (§6.1 correction block, §6.3 item 1, §7) and this file's next-action
    paragraph, commands and numbers.
