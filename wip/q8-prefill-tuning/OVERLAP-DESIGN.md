@@ -292,6 +292,58 @@ overlap across that.  (`ggml_backend_sched_graph_compute_async` calls `alloc_gra
 
 </details>
 
+### 6.4 Session 6 addendum — every host blocker was found and removed, and it STILL does not overlap
+
+**Enumerated (all in `ggml_backend_sched_compute_splits`, plus one inside the copy):**
+
+| # | site | condition | blocking call |
+|---|---|---|---|
+| S0 | `FLAG_INPUT` branch | user inputs | `ggml_backend_synchronize(split_backend)` (events NULL) |
+| S2 | "wait before overwriting it" | non-INPUT inputs | `ggml_backend_synchronize(split_backend)` |
+| S4 | inner copy fallback | whenever `cpy_tensor_async` fails/absent | `ggml_backend_synchronize(input_backend)` + `ggml_backend_synchronize(split_backend)` |
+| S5 | inside the copy | always | `ggml_backend_cuda_buffer_set_tensor` ends in `cudaStreamSynchronize(cudaStreamPerThread)` |
+
+All four drain the device. Measured stage timings with `GGML_CHUNK_TRACE=1`:
+
+```
+[iloop] after-S2  model.input_embed t=...123.7
+[iloop] after-copy model.input_embed t=...484.0     <- 360.3 ms inside one 21 MiB input copy
+[meta] GC ENTER                    t=...484.5     <- instant
+```
+
+**Ruled out this session (each by measurement):**
+
+* `ggml_backend_sched_alloc_splits` / `n_async_devices` sync — never entered (§6.1).
+* CUDA graphs pinning the streams — prefill never uses CUDA graphs (`ggml-cuda.cu`:
+  `if (cgraph->nodes[0]->ne[1] > 1) use_cuda_graph = false;`).
+* The parity streams not being used — **they are**: `[cstream] dev=0 stream=0x… curr_stream_no=2`, i.e.
+  chunk B really runs on stream 2 (and chunk A on 1).
+* `GGML_CUDA_REGISTER_HOST=1` (pinned source) + `GGML_CUDA_SET_TENSOR_NOSYNC=1` (drop S5) — no gain alone.
+
+**The decisive test — skip S0 + S2 + S4 *and* S5 together** (bench-only, wrong results, `GGML_CS_SKIP_WAIT=1
+GGML_CUDA_SET_TENSOR_NOSYNC=1`):
+
+| pp2048, `-b/-ub 1024`, `ce` | t/s |
+|---|---:|
+| mode 0 (no chunking), all host blocks removed | 2220 |
+| **mode 2 (chunk pipeline), all host blocks removed** | **2120** |
+| mode 2, normal | 2187 |
+| AR-free ceiling | 2766 |
+
+**So with the host free to enqueue both chunks' graphs, the two streams still do not overlap.** The
+obstruction is GPU-side / structural, not host-side — and that invalidates the "remove the host block"
+plan of §6.1/§6.3 entirely.
+
+The suspicion now falls on the **CE AR itself**: its scratch (`ce_buf`/`ce_tmp`/`ce_tmp2`) and its
+cross-call event guards (`ce_ev_done`/`ce_ev_out`) are **shared by both chunk parities**, so the two
+chunks' ARs form one strictly alternating serial chain, and every AR also carries SM work
+(`to_bf16`, `ggml_cuda_ce_add_bf16`, `to_fp32`) on the compute stream.  `rocprofv3` (the tool that
+would show the GPU timeline) hangs on this box, so **the next step is a synthetic 2-stream reproducer**
+(`tools/overlap.hip` already proves SDMA hides 100 % behind a single GEMM; it needs a two-stream
+variant: stream A = GEMMs + SDMA ARs, stream B = GEMMs).  If a minimal reproducer overlaps, the
+problem is llama.cpp's structure; if it does not, this driver/hardware will not do it and the
+chunk-pipeline approach should be closed.
+
 ### 6.2 Blocker B — the graph inputs are shared (correctness)
 
 Mode 2 on a prompt whose length is **not** a multiple of the ubatch (prose, 5298 tokens → 5x1024 +

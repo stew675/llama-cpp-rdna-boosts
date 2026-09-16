@@ -27,22 +27,27 @@ landing it as a separate arm).
 `tools/`).  The delivery `patches/` do **not** contain the overlap work, the `GGML_AR_NOOP` knob, or
 the `ggml_backend_comm_set_stream_no` hook.
 
-**The next action, concretely** (`OVERLAP-DESIGN.md` §6.1 correction + §7).  The previously-recorded
-blocker A was **wrong**: `ggml_backend_sched_alloc_splits` is never entered with a growing reserve on
-this workload, so the `n_async_devices > 1` synchronize never runs (proved with
-`tools/chunk-trace-instrumentation.patch`, which prints `[asplit] ENTER/EXIT` but **no**
-`reserve-path` line).  The *real* host block is the split-input copy fallback in
-`ggml_backend_sched_compute_splits`, taken because the **meta backend does not implement
-`cpy_tensor_async`** and `sched->events` is NULL (`n_copies == 1` under `-sm tensor`).
+**The next action, concretely** (`OVERLAP-DESIGN.md` §6.1 and §6.4).  The previously-recorded
+blocker A was **wrong**, and so was the follow-up diagnosis.  What is actually known now:
 
-**BUT fixing that is worth only +0.3 %** (measured: 2204.8 vs 2197.7 with the wait skipped entirely),
-and removing the GPU-side cross-chunk waits too changes nothing (2199.3).  So neither host-side nor
-GPU-side *waits* are the limiter — the two parity streams simply do not overlap, and **finding out
-why is now the gating item**: dump the actual stream used per subgraph, and check whether the CE AR's
-shared scratch + cross-call event guards (`ce_ev_done`/`ce_ev_out`, shared by both chunk parities)
-serialize chunk B's ARs behind chunk A's.  `GGML_META_CHUNK_PIPELINE=3` is the control (no waits): if
-the streams were parallel it would show a win despite the wrong answers.  Blocker B (per-chunk input
-copies, §6.2) is still required for *correctness* once overlap is real.
+* `ggml_backend_sched_alloc_splits` is never entered with a growing reserve, so the
+  `n_async_devices > 1` synchronize never runs (`[asplit]` prints no `reserve-path` line).
+* There are **four** device-draining host syncs on the per-graph input path, all enumerated in
+  §6.4 (S0 the `FLAG_INPUT` branch, S2 "wait before overwriting", S4 the inner copy fallback — all
+  taken because the meta backend has no `cpy_tensor_async` and `sched->events` is NULL — and S5,
+  `cudaStreamSynchronize(cudaStreamPerThread)` inside `ggml_backend_cuda_buffer_set_tensor`).
+  Each blocks ~360-437 ms, i.e. the whole previous chunk.
+* **Removing all four at once still gives no overlap** (mode 2 2120 vs mode 0 2220, ceiling 2766).
+  The parity streams *are* used (`curr_stream_no=2`, distinct pointers), so this is **GPU-side /
+  structural**, and the "remove the host block" plan is dead.
+
+**So the gating question is now a hardware/driver one**: can two streams on these two GPUs overlap an
+SDMA transfer with compute at all?  The next step is a **minimal synthetic reproducer** (a two-stream
+variant of `tools/overlap.hip`: stream A = GEMMs + SDMA ARs, stream B = GEMMs).  If it overlaps, the
+problem is llama.cpp's structure and worth chasing; if it does not, the chunk-pipeline approach should
+be **closed** rather than pursued further.  `rocprofv3` (which would show the GPU timeline directly)
+hangs on this box, which is why the reproducer is needed.  Blocker B (per-chunk input copies, §6.2)
+remains required for *correctness* once overlap is real.
 
 **What to do with the repo checkouts (verified 2026-09-16):**
 
@@ -556,3 +561,13 @@ are green (the container/release job runs long).  The `ce` mode is now in beta w
    patches, verified.)
 7. Corrected `OVERLAP-DESIGN.md` (§6.1 correction block, §6.3 item 1, §7) and this file's next-action
    paragraph, commands and numbers.
+8. **Continued past the first write-up and found the rest.**  Enumerated and measured all four
+   device-draining host syncs on the input path (S0/S2/S4 in `compute_splits` + S5, the
+   `cudaStreamSynchronize(cudaStreamPerThread)` inside `ggml_backend_cuda_buffer_set_tensor`).
+   Ruled out CUDA graphs (prefill never uses them) and the parity streams not being used (they are).
+   The decisive combined test -- all four removed at once, mode 2 -- gives **2120 vs 2220** for mode 0,
+   i.e. **no overlap**.  So the obstruction is GPU-side/structural, not host-side, and the
+   `+0.3 %` figure earlier in this log was measured with three of the four still in place (it is
+   invalid as a ceiling statement).  See `OVERLAP-DESIGN.md` §6.4.
+9. `tools/overlap.hip` (the two-stream variant) is the recommended next experiment -- see the
+   next-action paragraph at the top of this file.

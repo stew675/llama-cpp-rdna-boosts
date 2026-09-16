@@ -1,5 +1,5 @@
---- a/ggml/src/ggml-backend.cpp	2026-09-16 10:00:25.727278817 -0500
-+++ b/ggml/src/ggml-backend.cpp	2026-09-16 10:00:20.185158600 -0500
+--- a/ggml/src/ggml-backend.cpp	2026-09-16 10:10:30.031674815 -0500
++++ b/ggml/src/ggml-backend.cpp	2026-09-16 10:10:25.077378159 -0500
 @@ -20,9 +20,14 @@
  #include <stdlib.h>
  #include <string.h>
@@ -94,7 +94,7 @@
      struct ggml_backend_sched_split * splits = sched->splits;
  
      ggml_tensor * prev_ids_tensor = nullptr;
-@@ -1691,15 +1734,26 @@
+@@ -1691,38 +1734,79 @@
          struct ggml_backend_sched_split * split = &splits[split_id];
          int split_backend_id = split->backend_id;
          ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -121,12 +121,25 @@
          }
  
          // copy the input tensors to the split backend
-@@ -1710,19 +1764,39 @@
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
++            const double t_inloop0 = ggml_chunk_now_ms();
+             struct ggml_tensor * input = split->inputs[input_id];
+             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
++            if (ggml_chunk_trace_enabled()) {
++                fprintf(stderr, "[iloop] id=%d name=%s src_host=%d flag_in=%d t=%.1f\n",
++                        input_id, input->name, (int) ggml_backend_buffer_is_host(input->buffer),
++                        (input->flags & GGML_TENSOR_FLAG_INPUT) ? 1 : 0, t_inloop0);
++            }
  
              if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                  // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
 +                const double t_in0 = ggml_chunk_now_ms();
-                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
++                static const bool skip_wait_diag0 = getenv("GGML_CS_SKIP_WAIT") != nullptr;
++                if (skip_wait_diag0) {
++                    // bench-only diagnostic: WRONG results, no-host-block ceiling
++                } else if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                      ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                  } else {
                      ggml_backend_synchronize(split_backend);
@@ -158,11 +171,12 @@
 +                    if (dt > 0.5) {
 +                        fprintf(stderr, "[csplit]   S2 wait-before-overwrite '%s': %.1f ms\n", input->name, dt);
 +                    }
++                    fprintf(stderr, "[iloop]    after-S2 %s t=%.1f\n", input->name, ggml_chunk_now_ms());
 +                }
  
                  // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                  ggml_tensor * node = split->graph.nodes[0];
-@@ -1736,7 +1810,12 @@
+@@ -1736,7 +1820,12 @@
                      const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                      const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
  
@@ -175,8 +189,47 @@
  
                      // get the ids
                      ggml_tensor * ids_tensor = node->src[2];
---- a/ggml/src/ggml-backend-meta.cpp	2026-09-16 10:00:25.727339808 -0500
-+++ b/ggml/src/ggml-backend-meta.cpp	2026-09-16 10:00:20.185209821 -0500
+@@ -1817,16 +1906,38 @@
+                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
++                        static const bool skip_wait_diag2 = getenv("GGML_CS_SKIP_WAIT") != nullptr;
++                        const double t_in0 = ggml_chunk_now_ms();
++                        if (skip_wait_diag2) {
++                            // bench-only diagnostic: WRONG results, measures the no-host-block ceiling
++                        } else {
+                         ggml_backend_synchronize(input_backend);
+                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                         } else {
+                             ggml_backend_synchronize(split_backend);
+                         }
++                        }
++                        if (ggml_chunk_trace_enabled()) {
++                            const double dt = ggml_chunk_now_ms() - t_in0;
++                            if (dt > 1.0) {
++                                fprintf(stderr, "[csplit]   S4 inner-sync-copy '%s': %.1f ms\n", input->name, dt);
++                            }
++                        }
+                         ggml_backend_tensor_copy(input, input_cpy);
++                        if (ggml_chunk_trace_enabled()) {
++                            fprintf(stderr, "[iloop]    after-copy %s t=%.1f\n", input->name, ggml_chunk_now_ms());
++                        }
+                     }
+                 }
+             }
++            if (ggml_chunk_trace_enabled()) {
++                const double dt = ggml_chunk_now_ms() - t_inloop0;
++                if (dt > 1.0) {
++                    fprintf(stderr, "[csplit]   input-loop '%s' total %.1f ms (src_is_host=%d)\n",
++                            input->name, dt, (int) ggml_backend_buffer_is_host(input->buffer));
++                }
++            }
+         }
+ 
+         if (!sched->callback_eval) {
+--- a/ggml/src/ggml-backend-meta.cpp	2026-09-16 10:10:30.031741076 -0500
++++ b/ggml/src/ggml-backend-meta.cpp	2026-09-16 10:10:25.077429610 -0500
 @@ -8,6 +8,7 @@
  
  #include <algorithm>
@@ -223,4 +276,41 @@
 +    }
      return GGML_STATUS_SUCCESS;
  }
+ 
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu	2026-09-16 10:10:30.031823877 -0500
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu	2026-09-16 10:10:25.077493841 -0500
+@@ -809,7 +809,9 @@
+ 
+     ggml_cuda_set_device(ctx->device);
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    if (getenv("GGML_CUDA_SET_TENSOR_NOSYNC") == nullptr) {
++        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    }
+ }
+ 
+ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+@@ -1698,6 +1700,10 @@
+     for (size_t i = 0; i < comm_ctx->backends.size(); ++i) {
+         auto * cctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+         cctx->curr_stream_no = stream_no;
++        if (getenv("GGML_CUDA_STREAM_TRACE") != nullptr) {
++            fprintf(stderr, "[cstream] set_stream_no -> %d on ctx=%p (n_backends=%zu)\n",
++                    stream_no, (void *) cctx, comm_ctx->backends.size());
++        }
+     }
+ }
+ 
+@@ -6071,6 +6077,12 @@
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
++    if (getenv("GGML_CUDA_STREAM_TRACE") != nullptr) {
++        fprintf(stderr, "[cstream] dev=%d stream=%p curr_stream_no=%d ctx=%p nodes=%d\n",
++                cuda_ctx->device, (void *) cuda_ctx->stream(), cuda_ctx->curr_stream_no,
++                (void *) cuda_ctx, cgraph->n_nodes);
++    }
++
+     // The Q8_1 input cache is only valid within one graph execution.
+     cuda_ctx->q8_1_cache_clear();
  
