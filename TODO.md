@@ -96,8 +96,7 @@ acceptance; the delivery's drafting improvements made it over-climb, so the tabl
 - Fix shape: **the tuned bucketed controller** (`archive/work/adaptive-mtp-ceiling-scaling/bucketed-port/`
   — `tuned-port.patch` + README; from `~/stew675/llama-master` branch `bucketed-adaptive-mtp`).  The
   bucketed credit's zero-crossing already lands on the throughput optimum of every axis, so the fix
-  is three tuning changes for the delivery's higher acceptance: a **cold start** at the integer
-  midpoint `(floor + cap) / 2` (the
+  is three tuning changes for the delivery's higher acceptance: a **cold start** at `cap - 3` (the
   expensive direction is the climb: from the floor the controller burned ~106 of 477 rounds climbing
   3→8, the entire headroom over cap 7), a **depth-growing climb budget** `20 + 6*(depth-1)` (stops a
   lucky streak's integral windup cascading 9→12), and a **steeper drop pressure** `max(60, 10*depth)`

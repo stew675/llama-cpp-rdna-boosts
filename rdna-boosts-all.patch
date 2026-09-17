@@ -1,5 +1,5 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index c4c4e143c..df22c7c1c 100644
+index c4c4e143c..c94626d03 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -363,9 +363,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
@@ -63,13 +63,13 @@ index c4c4e143c..df22c7c1c 100644
              params.speculative.draft.n_max = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
-@@ -4140,6 +4168,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+@@ -4140,6 +4168,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
              params.speculative.draft.n_min = value;
          }
      ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
 +    add_opt(common_arg(
 +        {"--spec-draft-n-min-adaptive"}, "N",
-+        string_format("minimum adaptive MTP draft depth; the depth never drops below it (the cold start is the midpoint of this floor and the ceiling) (default: %d)", params.speculative.draft.n_min_adaptive),
++        string_format("minimum adaptive MTP draft depth; the depth never drops below it (the default cold start is three steps below --spec-draft-n-max, bounded by this floor) (default: %d)", params.speculative.draft.n_min_adaptive),
 +        [](common_params & params, int value) {
 +            if (value < 1) {
 +                throw std::invalid_argument("invalid value");
@@ -77,6 +77,20 @@ index c4c4e143c..df22c7c1c 100644
 +            params.speculative.draft.n_min_adaptive = value;
 +        }
 +    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE"));
++    add_opt(common_arg(
++        {"--spec-draft-n-start"}, "N",
++        "initial adaptive MTP draft depth: the first verify round of each generation starts here "
++        "instead of the default cold start.  Clamped to [--spec-draft-n-min-adaptive, "
++        "--spec-draft-n-max].  Use it to start deeper when the workload settles high (e.g. "
++        "verbatim recall) or shallower for a short generation at a deep context, where a wide "
++        "verify batch costs more.  Unset: three steps below the ceiling, bounded by the floor.",
++        [](common_params & params, int value) {
++            if (value < 1) {
++                throw std::invalid_argument("invalid value");
++            }
++            params.speculative.draft.n_start = value;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_START"));
      add_opt(common_arg(
          {"--spec-synth-len"}, "L",
          "target mean synthetic acceptance length, including the target token (benchmarking only)",
@@ -189,7 +203,7 @@ index d8319cd9a..51c2d0a24 100644
      cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
      cparams.n_batch           = params.n_batch;
 diff --git a/common/common.h b/common/common.h
-index 63d0badd0..918be6af7 100644
+index 63d0badd0..ac21d6b4e 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -169,18 +169,19 @@ enum common_params_sampling_config : uint64_t {
@@ -223,15 +237,16 @@ index 63d0badd0..918be6af7 100644
  };
  
  // Grammar type enumeration
-@@ -325,6 +326,7 @@ struct common_params_model {
+@@ -325,6 +326,8 @@ struct common_params_model {
  struct common_params_speculative_draft {
      int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
      int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
-+    int32_t n_min_adaptive = 3; // minimum adaptive MTP draft depth (the cold start is the midpoint of this floor and the ceiling)
++    int32_t n_min_adaptive = 3; // minimum adaptive MTP draft depth (the default cold start is three steps below --spec-draft-n-max, bounded by this floor)
++    int32_t n_start        = 0; // explicit initial adaptive MTP draft depth; 0 = the default (clamped to [n_min_adaptive, n_max])
  
      float p_split = 0.1f; // speculative decoding split probability
      float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
-@@ -387,13 +389,21 @@ struct common_params_speculative {
+@@ -387,13 +390,21 @@ struct common_params_speculative {
          return !draft.mparams.empty();
      }
  
@@ -255,7 +270,7 @@ index 63d0badd0..918be6af7 100644
          });
  
          return needs_rs_seq ? draft.n_max : 0u;
-@@ -485,6 +495,8 @@ struct common_params {
+@@ -485,6 +496,8 @@ struct common_params {
  
      enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
  
@@ -266,10 +281,10 @@ index 63d0badd0..918be6af7 100644
  
 diff --git a/common/speculative-adaptive.h b/common/speculative-adaptive.h
 new file mode 100644
-index 000000000..ef8ba3737
+index 000000000..29449304d
 --- /dev/null
 +++ b/common/speculative-adaptive.h
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,140 @@
 +#pragma once
 +
 +#include <algorithm>
@@ -316,14 +331,18 @@ index 000000000..ef8ba3737
 +//     (measured 40 depth changes in 477 verification rounds, and each change
 +//     costs a rollback and a re-draft).
 +//
-+//   * the cold start is the midpoint of the floor and the ceiling, (floor + cap) / 2.
-+//     The expensive direction is the climb: off the floor a step costs ~20 net full
-+//     accepts, and the controller burned a third of a 3000-token run reaching the
-+//     plateau -- which is the entire advantage of a higher ceiling.  Starting at the
-+//     midpoint splits the difference: a workload whose equilibrium is the plateau is
-+//     already close to it, while settling *down* toward the floor is cheap because the
-+//     drift is strongly negative up there, so a reasoning or mixed workload pays almost
-+//     nothing for the midpoint start.
++//   * the cold start is cap - 3 rather than the floor. The expensive direction
++//     is the climb: off the floor a step costs ~20 net full accepts, and the
++//     controller burned a third of a 3000-token run reaching the plateau --
++//     which is the entire advantage of a higher ceiling. Settling *down* is
++//     cheap even for a workload whose equilibrium is the floor, because its
++//     drift is strongly negative up there, so starting near the plateau costs a
++//     reasoning or mixed workload almost nothing while a code workload starts
++//     on its optimum.  The start is only the entry point of the drift, so it
++//     can be overridden per context with --spec-draft-n-start (clamped to
++//     [floor, cap]) -- a workload generated at a deep context pays more for a
++//     wide verify batch than one generated shallow, and there the lower start
++//     wins.
 +struct common_speculative_adaptive {
 +    int n_cur    = 0; // current adaptive draft depth N
 +    int n_bucket = 0; // accumulated bucket: net accepted surplus over the depth
@@ -345,15 +364,16 @@ index 000000000..ef8ba3737
 +        return drop_pressure() + climb_budget();
 +    }
 +
-+    // cold start at the midpoint of the floor and the ceiling, bounded by both; the
-+    // drift then settles the depth in whichever direction the workload calls for
-+    void reset(int n_max, int n_min_adaptive) {
++    // cold start; the default is three steps below the ceiling, bounded by the
++    // floor, and n_start > 0 overrides it (--spec-draft-n-start, clamped to
++    // [floor, cap]); the drift then settles the depth in whichever direction the
++    // workload calls for
++    void reset(int n_max, int n_min_adaptive, int n_start = 0) {
 +        const int cap   = std::max(1, n_max);
 +        const int floor = std::max(1, n_min_adaptive);
 +
-+        // exact midpoint for the valid floor <= cap range; the min/max keep the
-+        // function total if it is ever called with the caller-rejected floor > cap
-+        n_cur    = std::min(cap, std::max(floor, (floor + cap) / 2));
++        n_cur    = n_start > 0 ? std::min(cap, std::max(floor, n_start))
++                               : std::min(cap, std::max(floor, cap - 3));
 +        n_bucket = drop_pressure();
 +    }
 +
@@ -406,7 +426,7 @@ index 000000000..ef8ba3737
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 77dfe9535..84ef2a2c4 100644
+index 77dfe9535..c711c30d0 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,7 @@
@@ -496,10 +516,10 @@ index 77dfe9535..84ef2a2c4 100644
 +
 +            adaptive_ctrl.assign(n_seq, common_speculative_adaptive());
 +            for (uint32_t s = 0; s < n_seq; ++s) {
-+                // start at the midpoint of the floor max(1, n_min_adaptive) and the
-+                // ceiling n_max; the controller settles from there once acceptance
-+                // feedback arrives
-+                adaptive_ctrl[s].reset(this->params.n_max, this->params.n_min_adaptive);
++                // start at --spec-draft-n-start when set, otherwise the default cold
++                // start (cap - 3, bounded by the floor); the controller settles from
++                // there once acceptance feedback arrives
++                adaptive_ctrl[s].reset(this->params.n_max, this->params.n_min_adaptive, this->params.n_start);
 +            }
 +            if (this->params.n_min > 0) {
 +                SPC_WRN("%s", "--spec-draft-n-min is not used in adaptive mode; use --spec-draft-n-min-adaptive for the floor\n");
@@ -510,20 +530,21 @@ index 77dfe9535..84ef2a2c4 100644
          pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
  
          i_last.assign(n_seq, -1);
-@@ -1464,6 +1512,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1464,6 +1512,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      }
  
      void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
 +        // new generation: the depth learned for the previous content is stale,
-+        // so the controller starts from the floor again, even for an empty prompt
++        // so the controller starts over from --spec-draft-n-start (or the default
++        // cold start), even for an empty prompt
 +        if (adaptive) {
-+            adaptive_ctrl[seq_id].reset(this->params.n_max, this->params.n_min_adaptive);
++            adaptive_ctrl[seq_id].reset(this->params.n_max, this->params.n_min_adaptive, this->params.n_start);
 +        }
 +
          const int32_t N = (int32_t) prompt.size();
          if (N <= 0) {
              return;
-@@ -1621,6 +1675,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1621,6 +1676,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              drafting[seq_id] = true;
              common_sampler_reset(smpls[seq_id].get());
  
@@ -537,7 +558,7 @@ index 77dfe9535..84ef2a2c4 100644
              common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
              std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
  
-@@ -1697,7 +1758,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1697,7 +1759,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
  
                  result.push_back(id);
  
@@ -546,7 +567,7 @@ index 77dfe9535..84ef2a2c4 100644
                      drafting[seq_id] = false;
                      n_drafting--;
                      continue;
-@@ -1744,17 +1805,52 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1744,17 +1806,52 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  continue;
              }
  
@@ -601,7 +622,7 @@ index 77dfe9535..84ef2a2c4 100644
          const int32_t n_rows = verify_h_rows[seq_id];
          if (n_rows <= 0) {
              return;
-@@ -1764,6 +1860,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1764,6 +1861,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          const size_t row_bytes = (size_t) n_embd * sizeof(float);
          std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
      }
@@ -619,7 +640,7 @@ index 77dfe9535..84ef2a2c4 100644
  };
  
  // state of self-speculation (simple implementation, not ngram-map)
-@@ -2249,6 +2356,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
+@@ -2249,6 +2357,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
          case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
          case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
          case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
@@ -627,7 +648,7 @@ index 77dfe9535..84ef2a2c4 100644
          case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
          case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
          case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
-@@ -2340,6 +2448,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
+@@ -2340,6 +2449,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
              case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
              case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
@@ -635,7 +656,7 @@ index 77dfe9535..84ef2a2c4 100644
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
              case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                  n_max = std::max(n_max, std::max(0, spec->draft.n_max));
-@@ -2535,9 +2644,7 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2535,9 +2645,7 @@ common_speculative_init_result::common_speculative_init_result(
      llama_context * ctx_tgt) :
      pimpl(new impl{}) {
      const bool has_draft = params.speculative.has_dft();
@@ -646,7 +667,7 @@ index 77dfe9535..84ef2a2c4 100644
  
      auto mparams = common_model_params_to_llama(params);
      auto cparams = common_context_params_to_llama(params);
-@@ -2552,6 +2659,7 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2552,6 +2660,7 @@ common_speculative_init_result::common_speculative_init_result(
      // note: for small models maybe we can set this to the maximum possible draft from all speculative types
      //       the extra memory for small models is likely negligible?
      cparams.n_rs_seq  = 0;
@@ -654,7 +675,7 @@ index 77dfe9535..84ef2a2c4 100644
      cparams.ctx_other = ctx_tgt;
  
      std::string model_path;
-@@ -2629,7 +2737,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2629,7 +2738,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
@@ -670,7 +691,7 @@ index 77dfe9535..84ef2a2c4 100644
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -2642,6 +2757,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2642,6 +2758,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
@@ -678,7 +699,7 @@ index 77dfe9535..84ef2a2c4 100644
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
      }
-@@ -2661,7 +2777,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2661,7 +2778,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
@@ -691,7 +712,7 @@ index 77dfe9535..84ef2a2c4 100644
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
-@@ -2925,6 +3045,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+@@ -2925,6 +3046,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
      }
  }
  
@@ -739,7 +760,7 @@ index 70fc17af2..23ec6d819 100644
  
  ## MUSA
 diff --git a/docs/speculative.md b/docs/speculative.md
-index ffb1e34c7..f14c12b8c 100644
+index ffb1e34c7..777734918 100644
 --- a/docs/speculative.md
 +++ b/docs/speculative.md
 @@ -224,7 +224,7 @@ Use exactly one of these options:
@@ -751,17 +772,20 @@ index ffb1e34c7..f14c12b8c 100644
                                          comma-separated list of types of speculative decoding to use
                                          (default: none)
                                          (env: LLAMA_ARG_SPEC_TYPE)
-@@ -247,6 +247,9 @@ Use exactly one of these options:
+@@ -247,6 +247,12 @@ Use exactly one of these options:
  --spec-draft-n-min                      N
                                          minimum number of draft tokens to use for speculative decoding (default: 0)
                                          (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
 +--spec-draft-n-min-adaptive                     N
-+                                        minimum adaptive MTP draft depth; the depth never drops below it (the cold start is the midpoint of this floor and the ceiling) (default: 3)
++                                        minimum adaptive MTP draft depth; the depth never drops below it (the default cold start is three steps below --spec-draft-n-max, bounded by this floor) (default: 3)
 +                                        (env: LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE)
++--spec-draft-n-start                    N
++                                        initial adaptive MTP draft depth: the first verify round of each generation starts here instead of the default cold start.  Clamped to [--spec-draft-n-min-adaptive, --spec-draft-n-max].  Use it to start deeper when the workload settles high (e.g. verbatim recall) or shallower for a short generation at a deep context, where a wide verify batch costs more.  Unset: three steps below the ceiling, bounded by the floor.
++                                        (env: LLAMA_ARG_SPEC_DRAFT_N_START)
  --spec-draft-p-split, --draft-p-split   P
                                          speculative decoding split probability (default: 0.10)
                                          (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)
-@@ -367,6 +370,7 @@ Specifies a comma-separated list of speculative decoding types to use.
+@@ -367,6 +373,7 @@ Specifies a comma-separated list of speculative decoding types to use.
  | `draft-dflash` | Use a DFlash block-diffusion draft model that emits a block per step |
  | `draft-dspark` | Use a DSpark draft model (DFlash backbone + semi-autoregressive Markov head) |
  | `draft-mtp` | Use Multi Token Prediction (MTP) heads from the main model |
@@ -27297,10 +27321,10 @@ index 000000000..ca5abc0fd
 +}
 diff --git a/tests/test-speculative-adaptive.cpp b/tests/test-speculative-adaptive.cpp
 new file mode 100644
-index 000000000..c4b38cb89
+index 000000000..a5ae0bc64
 --- /dev/null
 +++ b/tests/test-speculative-adaptive.cpp
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,237 @@
 +#include "speculative-adaptive.h"
 +
 +#undef NDEBUG
@@ -27313,24 +27337,24 @@ index 000000000..c4b38cb89
 +//   climb_budget(d)   = 20 + 6*(d - 1)     -> the distance from there to the cap
 +//   full accept       = max(1, n_accepted - 1)
 +//   miss              = n_accepted - d
-+//   cold start        = (floor + cap) / 2, bounded by [floor, cap]
++//   cold start        = min(cap, max(floor, cap - 3))
 +// Every case below is written against those numbers so a retune has to update
 +// this file deliberately rather than silently.
 +
 +static void test_reset(void) {
 +    common_speculative_adaptive ctrl;
 +
-+    // the cold start is the integer midpoint of the floor and the ceiling, with
-+    // the bucket at the drop pressure of that depth
++    // the cold start sits three steps below the ceiling, with the bucket at the
++    // drop pressure of that depth
 +    ctrl.reset(12, 3);
-+    assert(ctrl.n_cur == 7);
-+    assert(ctrl.n_bucket == 70);
++    assert(ctrl.n_cur == 9);
++    assert(ctrl.n_bucket == 90);
 +
 +    ctrl.reset(8, 1);
-+    assert(ctrl.n_cur == 4);
++    assert(ctrl.n_cur == 5);
 +    assert(ctrl.n_bucket == 60);
 +
-+    // the midpoint is always within [floor, cap] and never below the floor
++    // the floor bounds the cold start from below
 +    ctrl.reset(4, 3);
 +    assert(ctrl.n_cur == 3);
 +    assert(ctrl.n_bucket == 60);
@@ -27339,40 +27363,67 @@ index 000000000..c4b38cb89
 +    assert(ctrl.n_cur == 3);
 +    assert(ctrl.n_bucket == 60);
 +
-+    // a cap below the floor is rejected by the caller (n_min_adaptive > n_max);
-+    // the defensive clamp keeps the depth at the ceiling if called directly
++    // ... and the ceiling from above (a cap below the floor wins)
 +    ctrl.reset(1, 3);
 +    assert(ctrl.n_cur == 1);
 +    assert(ctrl.n_bucket == 60);
 +}
 +
++static void test_reset_start(void) {
++    common_speculative_adaptive ctrl;
++
++    // --spec-draft-n-start overrides the default cold start; the chosen depth is
++    // clamped to [floor, cap] and the bucket is that depth's drop pressure
++    ctrl.reset(12, 3, 7);
++    assert(ctrl.n_cur == 7);
++    assert(ctrl.n_bucket == 70);
++
++    ctrl.reset(12, 3, 3);
++    assert(ctrl.n_cur == 3);
++    assert(ctrl.n_bucket == 60);
++
++    // below the floor clamps up ...
++    ctrl.reset(12, 3, 1);
++    assert(ctrl.n_cur == 3);
++    assert(ctrl.n_bucket == 60);
++
++    // ... and above the cap clamps down
++    ctrl.reset(12, 4, 15);
++    assert(ctrl.n_cur == 12);
++    assert(ctrl.n_bucket == 120);
++
++    // n_start == 0 (unset) keeps the default cold start (cap - 3)
++    ctrl.reset(12, 3, 0);
++    assert(ctrl.n_cur == 9);
++    assert(ctrl.n_bucket == 90);
++}
++
 +static void test_climb(void) {
 +    common_speculative_adaptive ctrl;
 +
-+    // from the cold start at 7 a step needs climb_budget(7) = 56, and a full
-+    // accept is worth n_accepted - 1 = 6, so ten of them
++    // from the cold start at 9 a step needs climb_budget(9) = 68, and a full
++    // accept is worth n_accepted - 1 = 8, so nine of them
 +    ctrl.reset(12, 3);
-+    assert(ctrl.n_cur == 7);
-+    for (int i = 0; i < 9; ++i) {
-+        ctrl.update(7, 12, 3);
-+        assert(ctrl.n_cur == 7);
-+    }
-+    assert(ctrl.n_bucket == 124);
-+    ctrl.update(7, 12, 3);
-+    assert(ctrl.n_cur == 8);
-+    // the 4-token surplus over the cap carries, and the new depth adds its own
-+    // drop pressure: 0 + 4 carry + drop_pressure(8)
-+    assert(ctrl.n_bucket == 84);
-+
-+    // depth 8: budget 62, a full accept worth 7
 +    for (int i = 0; i < 8; ++i) {
-+        ctrl.update(8, 12, 3);
-+        assert(ctrl.n_cur == 8);
++        ctrl.update(9, 12, 3);
++        assert(ctrl.n_cur == 9);
 +    }
-+    assert(ctrl.n_bucket == 140);
-+    ctrl.update(8, 12, 3);
-+    assert(ctrl.n_cur == 9);
-+    assert(ctrl.n_bucket == 95);
++    assert(ctrl.n_bucket == 154);
++    ctrl.update(9, 12, 3);
++    assert(ctrl.n_cur == 10);
++    // the 4-token surplus over the cap carries, and the new depth adds its own
++    // drop pressure: 0 + 4 carry + drop_pressure(10)
++    assert(ctrl.n_bucket == 104);
++
++    // depth 10: budget 74, a full accept worth 9
++    for (int i = 0; i < 7; ++i) {
++        ctrl.update(10, 12, 3);
++        assert(ctrl.n_cur == 10);
++    }
++    assert(ctrl.n_bucket == 167);
++    ctrl.update(10, 12, 3);
++    assert(ctrl.n_cur == 11);
++    assert(ctrl.n_bucket == 112);
 +
 +    // off the floor: at depth 3 the budget is 32 and a full accept is worth 2
 +    ctrl.reset(4, 3);
@@ -27411,17 +27462,17 @@ index 000000000..c4b38cb89
 +static void test_drop(void) {
 +    common_speculative_adaptive ctrl;
 +
-+    // from 7, drop_pressure(7) = 70 and a total miss drains 7, so ten of them
++    // from 9, drop_pressure(9) = 90 and a total miss drains 9, so ten of them
 +    ctrl.reset(12, 3);
 +    for (int i = 0; i < 9; ++i) {
 +        ctrl.update(0, 12, 3);
-+        assert(ctrl.n_cur == 7);
++        assert(ctrl.n_cur == 9);
 +    }
-+    assert(ctrl.n_bucket == 7);
++    assert(ctrl.n_bucket == 9);
 +    ctrl.update(0, 12, 3);
-+    assert(ctrl.n_cur == 6);
-+    // 0 - drop_pressure(7) + bucket_cap(6)
-+    assert(ctrl.n_bucket == 40);
++    assert(ctrl.n_cur == 8);
++    // 0 - drop_pressure(9) + bucket_cap(8)
++    assert(ctrl.n_bucket == 52);
 +
 +    // the floor clamps: no drop below it, and the bucket parks at 0
 +    ctrl.reset(8, 2);
@@ -27501,6 +27552,7 @@ index 000000000..c4b38cb89
 +
 +int main(void) {
 +    test_reset();
++    test_reset_start();
 +    test_climb();
 +    test_drop();
 +    test_delta();

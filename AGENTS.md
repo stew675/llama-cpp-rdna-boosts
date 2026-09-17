@@ -533,7 +533,8 @@ Consequences, so it is not re-litigated:
   Block 01 carries the credit-bucket controller (`delta = n_accepted - depth`, a full accept crediting
   `max(1, n_accepted - 1)`, surplus/deficit carried across a depth change) with the delivery's tuned
   constants: `climb_budget(d) = 20 + 6*(d - 1)`, `drop_pressure(d) = max(60, 10*d)`, and a cold start
-  at the integer midpoint of the floor and the ceiling, `(floor + cap) / 2` (was `cap - 3`).  The credit
+  at `max(floor, cap - 3)`, overridable per context with `--spec-draft-n-start N` (clamped to
+  `[floor, cap]`).  The credit
   function's drift zero-crossing already equals each
   workload's throughput optimum (code ~9, prose/reasoning/phase-switching at the floor, verbatim
   recall at the ceiling); the constants are what changes with the delivery's acceptance.  The depth

@@ -214,7 +214,7 @@ surplus or deficit carried across a depth change), tuned for the delivery:
 |---|---|---|
 | `climb_budget(d)` | `20 + 6*(d - 1)` | a flat budget let six consecutive full accepts at depth 8 cascade the depth 9 -> 10 -> 11 -> 12 in 16 rounds, because the credit grows with depth |
 | `drop_pressure(d)` | `max(60, 10*d)` (was `max(20, 4*d)`) | damps the slow 6 <-> 12 limit cycle that produced 40 depth changes in 477 verification rounds |
-| cold start | `(floor + cap) / 2` (was `cap - 3`, originally the floor) | the midpoint splits the difference: a plateau-equilibrium workload is already near its optimum, and settling *down* toward the floor stays cheap |
+| cold start | `max(floor, cap - 3)`; overridable with `--spec-draft-n-start N` (clamped to `[floor, cap]`) | the climb is the expensive direction, so start near the plateau and let the drift pull the depth down; the start is only the drift's entry point, so it is a runtime knob rather than a constant |
 
 The credit function itself needed no tuning: the bucket drift's zero-crossing already lands on the
 throughput optimum of every workload measured (code ~9, prose/reasoning/phase-switching at the
