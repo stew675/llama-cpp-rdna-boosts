@@ -1,0 +1,181 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index c94626d03..3b48b26af 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4192,6 +4192,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.speculative.draft.n_start = value;
+         }
+     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_START"));
++    add_opt(common_arg(
++        {"--spec-draft-n-reasoning"}, "N",
++        string_format("initial adaptive MTP draft depth while the model is inside a reasoning block; "
++        "on the reasoning end tag the depth resets to --spec-draft-n-start (or the default cold "
++        "start).  Requires the model's reasoning tags to be known (a chat template, and the "
++        "reasoning-budget state to be armed).  Clamped to [--spec-draft-n-min-adaptive, "
++        "--spec-draft-n-max]. (default: %d)", params.speculative.draft.n_reasoning),
++        [](common_params & params, int value) {
++            if (value < 1) {
++                throw std::invalid_argument("invalid value");
++            }
++            params.speculative.draft.n_reasoning = value;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_REASONING"));
+     add_opt(common_arg(
+         {"--spec-synth-len"}, "L",
+         "target mean synthetic acceptance length, including the target token (benchmarking only)",
+diff --git a/common/common.h b/common/common.h
+index ac21d6b4e..43745fa94 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -328,6 +328,7 @@ struct common_params_speculative_draft {
+     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+     int32_t n_min_adaptive = 3; // minimum adaptive MTP draft depth (the default cold start is three steps below --spec-draft-n-max, bounded by this floor)
+     int32_t n_start        = 0; // explicit initial adaptive MTP draft depth; 0 = the default (clamped to [n_min_adaptive, n_max])
++    int32_t n_reasoning    = 4; // initial adaptive MTP draft depth while inside a reasoning block; resets to n_start/default on the end tag (clamped to [n_min_adaptive, n_max])
+ 
+     float p_split = 0.1f; // speculative decoding split probability
+     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 06dea1e1c..d29eb8187 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -726,6 +726,21 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
+     return common_reasoning_budget_force(gsmpl->rbudget);
+ }
+ 
++bool common_sampler_in_reasoning(const struct common_sampler * gsmpl) {
++    if (!gsmpl || !gsmpl->rbudget) {
++        return false;
++    }
++
++    switch (common_reasoning_budget_get_state(gsmpl->rbudget)) {
++        case REASONING_BUDGET_COUNTING:
++        case REASONING_BUDGET_WAITING_UTF8:
++        case REASONING_BUDGET_FORCING:
++            return true;
++        default:
++            return false;
++    }
++}
++
+ // helpers
+ 
+ llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort) {
+diff --git a/common/sampling.h b/common/sampling.h
+index ced3c8364..3a2a2c09b 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -93,6 +93,10 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
+ // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
+ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
+ 
++// true while the sampler is inside a reasoning/thinking block (between the reasoning start and
++// end tags).  False when no reasoning budget sampler is active.
++bool common_sampler_in_reasoning(const struct common_sampler * gsmpl);
++
+ // helpers
+ 
+ // access the internal list of current candidate tokens
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index c711c30d0..e92fa65e2 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1374,6 +1374,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<int> n_cap;   // [n_seq] effective draft cap for the current draft() call
+     std::vector<int> n_last;  // [n_seq] drafts attempted in the most recent draft() call; reset once fed back
+     std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq] per-seq adaptive depth controller
++    std::vector<uint8_t> reasoning_prev; // [n_seq] last observed reasoning-block state (edge detection)
+ 
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq, bool adaptive = false)
+         : common_speculative_impl(adaptive ? COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE : COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
+@@ -1469,6 +1470,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             }
+ 
+             adaptive_ctrl.assign(n_seq, common_speculative_adaptive());
++            reasoning_prev.assign(n_seq, 0);
+             for (uint32_t s = 0; s < n_seq; ++s) {
+                 // start at --spec-draft-n-start when set, otherwise the default cold
+                 // start (cap - 3, bounded by the floor); the controller settles from
+@@ -1678,6 +1680,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+             // effective draft cap for this step: adaptive depth (or the user n_max),
+             // then clamped by the per-call context bound from the server
++            if (adaptive) {
++                // A reasoning/thinking block is floor-bound, so enter it at
++                // --spec-draft-n-reasoning; when the model drops out of the block the
++                // depth resets to the normal start so the controller can adapt to
++                // whatever content (prose/code/recall) follows.
++                const uint8_t in_reasoning = (dp.in_reasoning ? 1 : 0);
++                if (in_reasoning != reasoning_prev[seq_id]) {
++                    adaptive_ctrl[seq_id].reset(params.n_max, params.n_min_adaptive,
++                            in_reasoning ? params.n_reasoning : params.n_start);
++                    reasoning_prev[seq_id] = in_reasoning;
++                }
++            }
++
+             n_cap[seq_id] = adaptive ? adaptive_ctrl[seq_id].n_cur : params.n_max;
+             if (dp.n_max > 0 && dp.n_max < n_cap[seq_id]) {
+                 n_cap[seq_id] = dp.n_max;
+diff --git a/common/speculative.h b/common/speculative.h
+index 9e7c42cc0..e5f85ccef 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -64,6 +64,10 @@ struct common_speculative_draft_params {
+     llama_pos   pos0;
+     llama_token id_last;
+ 
++    // true while the model is inside a reasoning/thinking block (from the sampler's
++    // reasoning-budget state); the adaptive MTP controller uses it to reset its depth
++    bool in_reasoning = false;
++
+     // TODO: remove in the future by keeping track of the prompt from the _begin() call and the consecutive accept calls
+     const llama_tokens * prompt;
+ 
+diff --git a/examples/speculative-simple/speculative-simple.cpp b/examples/speculative-simple/speculative-simple.cpp
+index 259479de6..400b0fb54 100644
+--- a/examples/speculative-simple/speculative-simple.cpp
++++ b/examples/speculative-simple/speculative-simple.cpp
+@@ -186,12 +186,13 @@ int main(int argc, char ** argv) {
+ 
+             // generate a new draft
+             common_speculative_get_draft_params(spec, seq_id) = {
+-                /* .drafting   = */ true,
+-                /* .n_max      = */ n_draft_max,
+-                /* .pos0       = */ n_past,
+-                /* .id_last    = */ id_last,
+-                /* .prompt     = */ &prompt_tgt,
+-                /* .result     = */ &draft, // output
++                /* .drafting     = */ true,
++                /* .n_max        = */ n_draft_max,
++                /* .pos0         = */ n_past,
++                /* .id_last      = */ id_last,
++                /* .in_reasoning = */ false,
++                /* .prompt       = */ &prompt_tgt,
++                /* .result       = */ &draft, // output
+             };
+             common_speculative_draft(spec);
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 4624a1fa6..1b2d7e5af 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3024,12 +3024,13 @@ private:
+                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+ 
+                         common_speculative_get_draft_params(spec.get(), slot.id) = {
+-                            /* .drafting = */ true,
+-                            /* .n_max    = */ n_draft_max,
+-                            /* .pos0     = */ slot.prompt.tokens.pos_next(),
+-                            /* .id_last  = */ slot.sampled,
+-                            /* .prompt   = */ &slot.spec_prompt,
+-                            /* .result   = */ &slot.spec_draft,
++                            /* .drafting     = */ true,
++                            /* .n_max        = */ n_draft_max,
++                            /* .pos0         = */ slot.prompt.tokens.pos_next(),
++                            /* .id_last      = */ slot.sampled,
++                            /* .in_reasoning = */ common_sampler_in_reasoning(slot.smpl.get()),
++                            /* .prompt       = */ &slot.spec_prompt,
++                            /* .result       = */ &slot.spec_draft,
+                         };
+ 
+                         drafting.push_back(&slot);
