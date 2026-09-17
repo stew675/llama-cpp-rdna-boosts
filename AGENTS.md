@@ -533,7 +533,8 @@ Consequences, so it is not re-litigated:
   Block 01 carries the credit-bucket controller (`delta = n_accepted - depth`, a full accept crediting
   `max(1, n_accepted - 1)`, surplus/deficit carried across a depth change) with the delivery's tuned
   constants: `climb_budget(d) = 20 + 6*(d - 1)`, `drop_pressure(d) = max(60, 10*d)`, and a cold start
-  at `min(cap, max(floor, cap - 3))`.  The credit function's drift zero-crossing already equals each
+  at the integer midpoint of the floor and the ceiling, `(floor + cap) / 2` (was `cap - 3`).  The credit
+  function's drift zero-crossing already equals each
   workload's throughput optimum (code ~9, prose/reasoning/phase-switching at the floor, verbatim
   recall at the ceiling); the constants are what changes with the delivery's acceptance.  The depth
   transitions are reported at **TRC** (with `n_bucket`).  Measurements, the pinned-depth oracle and
@@ -759,7 +760,12 @@ Consequences, so it is not re-litigated:
   A/B with `archive/work/block-15-campaign-wins/ab/w4-revert.patch`), **V3** derived
   kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default — the packed mask is still
   created in every graph and simply loses its consumer, so the allocator
-  leaves it unallocated), **V4** native q8_0/q4_0 and **V5** native bf16
+  leaves it unallocated; the backend support probe is **skipped** on a
+  multi-stream KV cache (`n_seq_max > 1` without `kv_unified`, and deepseek4,
+  which keeps per-sequence streams even when unified — `llama_kv_cache_dsv4`
+  pins `unified_raw`/`unified_compressed` to false), where the derived form is
+  unreachable and the probe's forced single-sequence graph would assert in the
+  dsv4 lightning indexer), **V4** native q8_0/q4_0 and **V5** native bf16
   K/V in the FA kernels (one `GGML_CUDA_FA_KV_NATIVE` switch; **amended
   2026-09-14**, issue #30: **unset = auto → native q8_0/q4_0 on / bf16
   off**, `=1` force all on, `=0` force the F16-staging path).  The F16

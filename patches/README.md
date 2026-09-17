@@ -214,7 +214,7 @@ surplus or deficit carried across a depth change), tuned for the delivery:
 |---|---|---|
 | `climb_budget(d)` | `20 + 6*(d - 1)` | a flat budget let six consecutive full accepts at depth 8 cascade the depth 9 -> 10 -> 11 -> 12 in 16 rounds, because the credit grows with depth |
 | `drop_pressure(d)` | `max(60, 10*d)` (was `max(20, 4*d)`) | damps the slow 6 <-> 12 limit cycle that produced 40 depth changes in 477 verification rounds |
-| cold start | `min(cap, max(floor, cap - 3))` (was the floor) | a step off the floor costs ~20 net full accepts and the controller burned a third of a 3000-token run reaching the plateau, which is the whole advantage of a higher ceiling; settling *down* is cheap even at a floor equilibrium |
+| cold start | `(floor + cap) / 2` (was `cap - 3`, originally the floor) | the midpoint splits the difference: a plateau-equilibrium workload is already near its optimum, and settling *down* toward the floor stays cheap |
 
 The credit function itself needed no tuning: the bucket drift's zero-crossing already lands on the
 throughput optimum of every workload measured (code ~9, prose/reasoning/phase-switching at the
@@ -948,7 +948,11 @@ mask for the plain attention path (`LLAMA_KQ_MASK_DERIVED`, default 1) —
 and the MMA kernel derives each cell's visibility, so the packed `n_kv ×
 n_tps` F16 mask and its host mirror are no longer materialised (−799.20
 MiB/GPU + −799.21 MiB host on dense, −809.18 on gemma-4-E4B ISWA,
-−811.17 on gemma-4-31B ISWA); **V4** native q8_0 K/V and **V5** native bf16
+−811.17 on gemma-4-31B ISWA); the backend support probe is **skipped** on a
+multi-stream KV cache (`n_seq_max > 1` without `kv_unified`, and deepseek4,
+which keeps per-sequence streams even when unified), where the derived form is
+unreachable and the probe's forced single-sequence graph would assert in the
+dsv4 lightning indexer; **V4** native q8_0 K/V and **V5** native bf16
 K/V in the FA kernels (`GGML_CUDA_FA_KV_NATIVE`, **opt-in, default 0**) —
 the whole-cache F16 staging scratch and its per-ubatch conversion are
 replaced by dequantising each 16-byte staged chunk while the shared K/V tiles

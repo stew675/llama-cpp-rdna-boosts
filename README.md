@@ -232,7 +232,7 @@ Record: [`WORKLOG.md`](WORKLOG.md) (2026-09-15 r3).
 **Previous change (2026-09-15, r2) — the adaptive-MTP controller is re-tuned (issue #35).**  On the
 reporter's cell (27B Q8_0 x 2-card tensor, f16 KV, `-n 3000`) an adaptive ceiling of 12 lost 3.6 % to
 ceiling 7 (92.8 vs 96.3 t/s).  Block 01 now carries the credit-bucket controller with a depth-growing
-climb budget, a steeper drop pressure and a cold start at `cap - 3`, and reports its depth transitions
+climb budget, a steeper drop pressure and a cold start at the midpoint of the floor and the ceiling, and reports its depth transitions
 at TRC.  Same cell: code **96.0 vs 95.8** (4 depth changes instead of 40), reasoning +5.0 %, prose
 +11.2 %, code +18.8 %, recall +58.7 % riding at the ceiling; the new phase-switching prompt
 (`prompts/code-reasoning-mixed.txt`) reads 64.0 against its 64.3 pinned-depth optimum; the 1-card

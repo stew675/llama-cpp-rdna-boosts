@@ -1,5 +1,36 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-16 (adaptive-MTP cold start + V3 probe guard) — delivery-set update (no version bump)
+
+**Change.** Two delivery amendments, folded into existing blocks (patch set regenerated; `release.json`
+hashes/tip/tree refreshed; release tag left at `v16-d1d3c3396-r4`; no tag/GHCR/GitHub Release):
+
+- **Block 01 — adaptive-MTP cold start.** `common_speculative_adaptive::reset()` now starts the draft
+  depth at the integer midpoint of the floor and the ceiling, `(floor + cap) / 2` (defensively clamped
+  to `[floor, cap]`), replacing `min(cap, max(floor, cap - 3))`.  The `--spec-draft-n-max > 15` clamp
+  and the `> 7` purity notice are now **W-level** notices split into short lines (the `CLAMP=0`
+  keep-anyway branch stays an error); `llama-server`'s default INFO threshold shows them, `llama-cli`'s
+  default ERROR threshold hides them (`-lv 2`).  `tests/test-speculative-adaptive.cpp` recomputed for
+  the new start.
+- **Block 15 — derived kq mask probe guard.** The V3 support probe forces a single-sequence graph
+  (`n_seqs = 1`).  On a multi-stream KV cache that violates deepseek4's stream layout (its lid cache
+  keeps per-sequence streams even under `kv_unified`, and `build_lid_top_k` ties the indexer query
+  stream count to the cache K's `ne[3]` while the mask uses the plan's), so the probe aborted in
+  `ggml_lightning_indexer`.  The probe is now skipped whenever derived is structurally unreachable
+  (`n_seq_max > 1` without `kv_unified`, or `n_seq_max > 1` on deepseek4), which is a no-op for the
+  memory win.  See `patches/README.md` and the block-15 message.
+
+**Validation.** `test-recurrent-state-rollback-dsv4` and `test-save-load-state` aborted at delivery
+HEAD and pass at base `d1d3c3396`; with the guard both pass.  Full `ctest` on the regenerated tree:
+**66/67** (the only failure is `test-tokenizers-ggml-vocabs`, environmental — no `git-lfs` installed,
+so the cloned vocab files are LFS pointers; it fails at base too).  `scripts/validate-set.sh`: strict
+16/16 `git am`, applied tree `19d42874c5b8ce8fee71be53a97375aa642c4905`.
+
+**Open.** The adaptive-MTP cold-start change predates a fresh 4-axis MTP gate run (the 2026-09-15
+tuning numbers were measured with `cap - 3`); the next decode/MTP session should re-run
+`benchmarks/mtp-adaptive-methodology.md` on the new start.  See
+`benchmarks/2026-09-16-adaptive-mtp-coldstart.md`.
+
 ## 2026-09-16 (block-12 r4 amendment) — `v16-d1d3c3396-r4`: opt-in copy-engine (SDMA) all-reduce
 
 **Release.** `v16-d1d3c3396-r4`, fork point `d1d3c3396` (tree `3ce99b5422bf`), canonical 16-block

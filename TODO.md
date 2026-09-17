@@ -96,7 +96,8 @@ acceptance; the delivery's drafting improvements made it over-climb, so the tabl
 - Fix shape: **the tuned bucketed controller** (`archive/work/adaptive-mtp-ceiling-scaling/bucketed-port/`
   — `tuned-port.patch` + README; from `~/stew675/llama-master` branch `bucketed-adaptive-mtp`).  The
   bucketed credit's zero-crossing already lands on the throughput optimum of every axis, so the fix
-  is three tuning changes for the delivery's higher acceptance: a **cold start** at `cap - 3` (the
+  is three tuning changes for the delivery's higher acceptance: a **cold start** at the integer
+  midpoint `(floor + cap) / 2` (the
   expensive direction is the climb: from the floor the controller burned ~106 of 477 rounds climbing
   3→8, the entire headroom over cap 7), a **depth-growing climb budget** `20 + 6*(depth-1)` (stops a
   lucky streak's integral windup cascading 9→12), and a **steeper drop pressure** `max(60, 10*depth)`
@@ -105,7 +106,7 @@ acceptance; the delivery's drafting improvements made it over-climb, so the tabl
   riding at 12, and the phase-switching prompt 64.0 against its 64.3 pinned optimum.  On the 1-card
   reference code cap-12 84.7 vs cap-7 61.4 (+37.9 %).  Purity holds (adaptive cap 7 ≡ cap 12 ≡ fixed
   `draft-mtp`).  Remaining: the ~2 % adaptive-vs-pinned per-round gap (unexplained), per-shape
-  re-tuning of `cap - 3`, and re-deriving `tests/test-speculative-adaptive.cpp` for the new defaults.
+  re-tuning of the cold start, and re-deriving `tests/test-speculative-adaptive.cpp` for the new defaults.
   Fallback if a shape regresses: the reporter's cap (7 when `n_gpu > 1` or the dominant weight is Q8_0).
 - Interim: the `ceiling 12` recommendation needs a caveat in `benchmarks/README.md`,
   `benchmarks/mtp-adaptive-methodology.md` and `README.md` (7 is the default on Q8_0 / tensor split).

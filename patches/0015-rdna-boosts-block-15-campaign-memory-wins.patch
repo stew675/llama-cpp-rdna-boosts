@@ -1,4 +1,4 @@
-From c08efa1bc35667e4a48af6e26ffab3c8b5500f4a Mon Sep 17 00:00:00 2001
+From 5f8bf949a8d6f535e69f5e9774925d3e2e185817 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -50,6 +50,12 @@ V3 - derived kq mask for the plain attention path (LLAMA_KQ_MASK_DERIVED,
   small/verify batches, non-MMA backends, M-RoPE ext clause).  Dense models:
   -799.20 MiB/GPU and -799.21 MiB host; gemma-4-E4B (ISWA) -809.18/-809.18;
   gemma-4-31B (ISWA) -811.17/-811.18; scaling exactly n_kv x n_tps x 2 B.
+  The backend support probe is skipped entirely on a multi-stream KV cache
+  (n_seq_max > 1 without kv_unified, and deepseek4, which keeps per-sequence
+  streams even in unified mode): it forces a single-sequence probe graph, and
+  on such a cache deepseek4's indexer stream layout asserts, while the derived
+  form is unreachable there anyway (kq_mask_derivable() requires a single
+  stream).
 
 V4 - native q8_0 K/V in the flash-attention kernels (GGML_CUDA_FA_KV_NATIVE,
   OPT-IN, default 0): the whole-cache F16 staging scratch and its per-ubatch
@@ -286,7 +292,7 @@ run-to-run noise across five KV types.
  ggml/src/ggml-cuda/ggml-cuda.cu      |   6 +
  ggml/src/ggml-cuda/indexer-topk.cu   |  74 +++-
  ggml/src/ggml.c                      |  99 ++++-
- src/llama-context.cpp                | 130 +++++-
+ src/llama-context.cpp                | 146 ++++++-
  src/llama-cparams.h                  |   5 +
  src/llama-graph.cpp                  | 183 ++++++--
  src/llama-graph.h                    |  60 +++
@@ -296,7 +302,7 @@ run-to-run noise across five KV types.
  src/llama-memory-hybrid-idx.h        |  17 +-
  src/models/qwen4exp.cpp              | 338 ++++++++++++---
  tests/test-backend-ops.cpp           |  55 ++-
- 25 files changed, 2516 insertions(+), 258 deletions(-)
+ 25 files changed, 2532 insertions(+), 258 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index a8cdfc1eb..b149fe60f 100644
@@ -2883,7 +2889,7 @@ index 383b5d994..db805e29d 100644
  
      return result;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 729f5f839..64a65852b 100644
+index 729f5f839..5652677e9 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -36,6 +36,18 @@ struct llm_fused_op_probe {
@@ -3062,14 +3068,30 @@ index 729f5f839..64a65852b 100644
          }
  
          if (device_mismatch) {
-@@ -592,6 +711,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -592,6 +711,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
          cparams.auto_fa = false;
      }
  
 +    // note: after the flash attention probe, so that cparams.flash_attn is already resolved
 +    if (cparams.auto_kq_mask_derived) {
-+        LLAMA_LOG_INFO("%s: resolving derived kq mask support:\n", func);
-+        resolve(llm_fused_op_kq_derived_probe, cparams.kq_mask_derived);
++        // The derived form needs a single KV stream: llama_kv_cache::kq_mask_derivable() rejects a
++        // multi-stream cache.  That is `n_seq_max > 1` without kv_unified for the plain cache, and
++        // always `n_seq_max > 1` for deepseek4, which keeps per-sequence streams even in unified
++        // mode (llama_kv_cache_dsv4 pins unified_raw/unified_compressed to false).  Do not run the
++        // probe there - it forces a single-sequence graph, and on a multi-stream cache that is a
++        // shape the cache-layout-driven attention builders reject (deepseek4's lightning indexer
++        // ties its query stream count to the cache K's ne[3] while its mask uses the plan's stream
++        // count, so mask->ne[1] != q->ne[2] and ggml_lightning_indexer asserts).  Derived is dead
++        // in that configuration anyway, so skipping the probe loses nothing.
++        const bool multi_stream = n_seqs > 1 && (!cparams.kv_unified || model.arch == LLM_ARCH_DEEPSEEK4);
++
++        if (multi_stream) {
++            LLAMA_LOG_INFO("%s: derived kq mask disabled (multi-stream KV cache)\n", func);
++            cparams.kq_mask_derived = false;
++        } else {
++            LLAMA_LOG_INFO("%s: resolving derived kq mask support:\n", func);
++            resolve(llm_fused_op_kq_derived_probe, cparams.kq_mask_derived);
++        }
 +        cparams.auto_kq_mask_derived = false;
 +    }
 +
