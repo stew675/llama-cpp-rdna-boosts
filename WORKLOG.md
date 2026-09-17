@@ -62,6 +62,17 @@ alternating `process()`/`draft()` graphs finally keep a warm, replayable HIP gra
 work is needed.  Full record + commands: `benchmarks/2026-09-17-mtp-pr28549-ab.md`.  This also
 reproduces the recorded 2026-09-16 cell within ~1-2 %.
 
+**`ngram-mod` + `draft-mtp-adaptive` combo measured (2026-09-17 follow-up).**  `--spec-type` argument
+order is irrelevant (the impl list is a fixed priority list with ngram-mod before MTP; verified
+identical acceptance).  The combo is worth **R +1.2 %, P flat, C +0.6 %, K +72 %** against the MTP-only
+default with `--spec-ngram-mod-n-match 45 --spec-draft-n-max 9 --spec-draft-n-start 9` (45, not the
+default 24, so ngram-mod fires only on verbatim recall and not on incidental code repeats; `n_match 48`
+with a raised start has a reproducible recall cliff).  The old `bucketed-adaptive-mtp` acceptance feed
+is **not** in the delivery and re-adding it is a **no-op** with the re-tuned controller (all cases within
+noise) — the `common/speculative-adaptive.h` comment that documents the feed is stale and should be
+corrected in a block-01 comment amendment.  bf16 KV does not raise acceptance on this cell (native bf16
+== staged bf16; both ~2-4 % slower on R/P).  Full record: `benchmarks/2026-09-17-mtp-ngram-combo.md`.
+
 **Not revalidated here (hardware unavailable):** gfx1151 (the block-14 `RDNA3` gate fix and the
 qwen4exp MTP purity gates), gfx1100, and the qwen4exp prefill/perplexity path (no qwen4exp model on
 this host) — the upstream hc-op change follows upstream's validated path, and the RDNA3.5 gate fix

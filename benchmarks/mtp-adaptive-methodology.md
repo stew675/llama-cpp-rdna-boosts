@@ -22,6 +22,15 @@ MTP draft"), which the isolated A/B now shows is worth **+0.3-1.4 %** on the fou
 those measurements is the 2-card Q8_0 Qwen3.8-27B row below; it reproduces the recorded 2026-09-16
 numbers within ~1-2 %.
 
+**2026-09-17 — `ngram-mod` + `draft-mtp-adaptive` combo.**  `--spec-type` order is irrelevant (fixed
+priority list, ngram-mod before MTP).  The combo is a real recall win: with
+`--spec-ngram-mod-n-match 45 --spec-draft-n-max 9 --spec-draft-n-start 9` it measures R 61.2 / P 80.3 /
+C 95.1 / K 234.3 t/s against the MTP-only 60.5 / 80.5 / 94.5 / 136.0 — **+72 % on recall, no harm
+elsewhere**.  `n_match` matters: the default 24 fires on incidental code repeats (and loses ~5 % on
+code), and 48 with a start > 8 has a recall cliff.  The old `bucketed-adaptive-mtp` acceptance feed is
+**not** in the delivery and is a **no-op** when re-added.  Full grid, the feed A/B and the bf16 check:
+`2026-09-17-mtp-ngram-combo.md`.
+
 ## Why decode benches cannot see MTP regressions
 
 MTP adds two decode shapes that plain decode never produces:
