@@ -8,8 +8,8 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
 
 **Current state (2026-09-17, re-base):** the delivery is the **16-patch set** against the new fork
 point **`ebbb18522`** (block 00 + blocks 01-15), canonical 16-block tip
-**`6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e`** (tree `d751f42d05cc4770189f4a5250cc4aea4fea8e08`),
-release **`v16-ebbb18522-r1`** — a 2026-09-17 re-base onto current upstream master (37 commits past
+**`31b1790372d17bf7f95f3e15f7b4e2b35eb661e1`** (tree `7dc63cb3c93aa1cd74435698f045f93d2ee3a9e6`),
+release **`v16-ebbb18522-r2`** — a 2026-09-17 re-base onto current upstream master (37 commits past
 `d1d3c3396`; three resolved blocks: block 02's Vulkan check-results move, block 12's upstream HIP
 AllReduce enablement, and block 14's upstream qwen4exp hc ops + the pair-fusion `ncols_opt` RDNA3
 consistency fix; **no delivery item was retired**).  Validated on gfx1201 (`test-backend-ops`

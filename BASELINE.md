@@ -15,9 +15,9 @@ remain as known-good records for those upstream versions.
 
 > **Current baseline marker:** `baseline/d1d3c3396` was the previous (2026-09-15)
 > delivery baseline.  The current one is **`ebbb18522`** (2026-09-17), the fork point of
-> release **`v16-ebbb18522-r1`** (canonical tip
-> `6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e`, tree
-> `d751f42d05cc4770189f4a5250cc4aea4fea8e08`).  `baseline/790cf51aa` remains the
+> release **`v16-ebbb18522-r2`** (canonical tip
+> `31b1790372d17bf7f95f3e15f7b4e2b35eb661e1`, tree
+> `7dc63cb3c93aa1cd74435698f045f93d2ee3a9e6`).  `baseline/790cf51aa` remains the
 > (2026-09-13) marker.  None of these is one of the historical pre-block-12
 > checkpoints listed below; those remain frozen records.
 
@@ -45,8 +45,8 @@ bottom of this file): block 00 = the structural/architecture fixes added
 2026-09-10 (FA small-batch KV-split width invariance + Vulkan masked-V), and
 blocks 01-15 = the fork's `rdna-boosts` block
 commits.  The canonical 16-block chain for the `ebbb18522` base is tip
-`6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e`, tree
-`d751f42d05cc4770189f4a5250cc4aea4fea8e08` (release **`v16-ebbb18522-r1`**, the
+`31b1790372d17bf7f95f3e15f7b4e2b35eb661e1`, tree
+`7dc63cb3c93aa1cd74435698f045f93d2ee3a9e6` (release **`v16-ebbb18522-r2`**, the
 2026-09-17 re-base of the 16-block set onto upstream master `ebbb18522`, 37 commits past `d1d3c3396`;
 the three resolved blocks are block 02's Vulkan GATED_DELTA_NET check-results clone (moved upstream to
 `ggml-vulkan-debug.cpp`), block 12's upstream HIP AllReduce enablement (the delivery keeps its HIP

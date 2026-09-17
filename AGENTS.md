@@ -9,7 +9,7 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`ebbb18522`** (re-based 2026-09-17,
-release `v16-ebbb18522-r1`; previously `d1d3c3396`, re-based 2026-09-15 from
+release `v16-ebbb18522-r2`; previously `d1d3c3396`, re-based 2026-09-15 from
 `790cf51aa`, re-based 2026-09-13
 from `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself
 re-based 2026-09-07 from `465e49b9c`, itself
@@ -227,8 +227,8 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `ebbb18522` is a rebuild of the delivery set
-(tip `6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e`, net tree
-  `d751f42d05cc4770189f4a5250cc4aea4fea8e08` = r1, the 2026-09-17 re-base onto `ebbb18522`; the
+(tip `31b1790372d17bf7f95f3e15f7b4e2b35eb661e1`, net tree
+  `7dc63cb3c93aa1cd74435698f045f93d2ee3a9e6` = r1, the 2026-09-17 re-base onto `ebbb18522`; the
   previous base `d1d3c3396` had tip `8465f08b9efb26c60e992b48b7d2857d9ffcaf7a`, tree
   `3bb7c223c60570978d1bbf996a03808fe31f2842`; before that the base `790cf51aa` had tip
   `6f76c1cb1d80c7ecbf176f939a351bc385ff33fc`, tree
@@ -365,8 +365,8 @@ canonical `ebbb18522` fork used for `make-patches.sh`
 regeneration is disposable and is re-created from `patches/` +
 `scripts/apply-all.sh` whenever it needs rebuilding (fresh clone at the
 fork point + apply) — the 2026-09-17 re-base regeneration applied strict
-16/16 `git am`, applied tree `d751f42d05cc4770189f4a5250cc4aea4fea8e08` == canonical, tip
-`6b1e9ffd1`; an earlier regeneration (2026-09-10, the 15-block set
+16/16 `git am`, applied tree `7dc63cb3c93aa1cd74435698f045f93d2ee3a9e6` == canonical, tip
+`31b179037`; an earlier regeneration (2026-09-10, the 15-block set
 with block 00 and the re-homed masked-V fixes) applied strict 15/15 `git am`
 and produced tip `505637d6e` (the 2026-09-11 block-02 amendment re-ran the
 regeneration: strict 15/15 `git am`, applied tree `fcf3e4bb7` == canonical,
@@ -909,7 +909,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults are read from `release.json`: base
-`ebbb18522`, blocks tip `6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e`): `git format-patch --start-number 0` the block
+`ebbb18522`, blocks tip `31b1790372d17bf7f95f3e15f7b4e2b35eb661e1`): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -917,7 +917,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 — it may have been rebased onto a drifted master, so a raw
 `<base>..HEAD` range there can export upstream commits as patches
 0001/0002.  The canonical 16-block chain is a rebuild of the delivery set at
-`ebbb18522` (tip `6b1e9ffd1…`), which is what `release.json.tip` names.  Always regenerate from a
+`ebbb18522` (tip `31b179037…`), which is what `release.json.tip` names.  Always regenerate from a
 canonical fork rebuilt AT `ebbb18522`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/16]` series count change.  Then

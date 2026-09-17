@@ -12,7 +12,7 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current re-base (2026-09-17) — release `v16-ebbb18522-r1`:** the 16-block set re-based onto
+**Current re-base (2026-09-17) — release `v16-ebbb18522-r2`:** the 16-block set re-based onto
 upstream master `ebbb18522` (37 commits past `d1d3c3396`).  Three blocks needed resolution: block 02
 (the `GATED_DELTA_NET` op-param clone in the Vulkan check-results moved to the new
 `ggml-vulkan-debug.cpp`), block 12 (upstream #27825 enabled the CUDA internal AllReduce on HIP; the
@@ -20,8 +20,8 @@ delivery keeps its HIP split, so `allreduce.cu` stays CUDA-only and the HIP hybr
 `allreduce-hip.cu`), and block 14 (upstream #28901 added the qwen4exp hc ops; the delivery's
 decode-band fused hc ops keep the `nt <= 8` band and upstream's `ggml_dsv4_hc_pre_gated`/`post`
 serve prefill — plus the pair-fusion `ncols_opt` gate broadened to `RDNA3` for gfx1151 consistency
-with upstream #28935).  Canonical tip `6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e`, tree
-`d751f42d05cc4770189f4a5250cc4aea4fea8e08`, strict 16/16, build + `test-backend-ops` 18083/18083 on
+with upstream #28935).  Canonical tip `31b1790372d17bf7f95f3e15f7b4e2b35eb661e1`, tree
+`7dc63cb3c93aa1cd74435698f045f93d2ee3a9e6`, strict 16/16, build + `test-backend-ops` 18083/18083 on
 gfx1201 — see `WORKLOG.md` 2026-09-17.
 
 The re-base history below (`d1d3c3396` and earlier) is retained as dated record.
