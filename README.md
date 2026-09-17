@@ -94,6 +94,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 │   └── make-patches.sh    # regenerates the set from the fork (~/llama.cpp)
 ├── benchmarks/            # benchy methodology + v1/v2 results + graphs (dated records)
 ├── prompts/               # versioned, hash-stable test prompts (sha256-recorded; never edited in place)
+├── wiki/                  # source for the GitHub wiki (Home, MTP & Adaptive MTP, Quick Reference); see wiki/README.md
 ├── wip/                   # ACTIVE exploration docs / handoffs (currently: iq4nl-prefill/)
 ├── beta/                  # promotion staging (currently: beta/qwen4exp/); promoted campaigns move on
 ├── upstream/              # upstream-PR candidates (UPSTREAM-PR-*.md + .patch) + their index
