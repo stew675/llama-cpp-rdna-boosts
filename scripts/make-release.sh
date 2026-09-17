@@ -19,10 +19,22 @@
 #                     [--tree SHA] [--release TAG] [--out FILE]
 #
 # On a re-base all four metadata values change together:
-#   --base      <new fork point>          (upstream commit the set applies to)
+#   --base      <new fork point>          (upstream commit the set applies to;
+#                                          the SHORT form, as used in the
+#                                          v16-<base>-r<N> release tag)
 #   --base-tree <git rev-parse BASE^{tree}>
 #   --tip       <canonical fork block-15 commit>
 #   --tree      <git rev-parse TIP^{tree}>
+#
+# `base` MUST be the short fork-point SHA: the release tag is
+# `v16-<base>-r<N>` and .github/workflows/docker-ghcr.yml rejects a pushed tag
+# that does not match `v16-<release.json.base>-r<N>`.
+#   e.g.  ./scripts/make-release.sh \
+#           --base ebbb18522 \
+#           --base-tree "$(git -C ~/llama.cpp rev-parse ebbb18522^{tree})" \
+#           --tip <canonical-block-15-tip> \
+#           --tree "$(git -C ~/llama.cpp rev-parse <canonical-block-15-tip>^{tree})" \
+#           --release v16-ebbb18522-r1
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

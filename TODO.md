@@ -6,13 +6,23 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (2026-09-15, re-base):** the delivery is the **16-patch set** against the new fork
-point **`d1d3c3396`** (block 00 + blocks 01-15), canonical 16-block tip
-**`af9ce375ded5238b59598290ad7366760b7dc6e0`** (tree `c6896785a5fefdf9438d26974c0274bf99f43263`),
-release **`v16-d1d3c3396-r1`** — a 2026-09-15 re-base onto current upstream master (51 commits past
+**Current state (2026-09-17, re-base):** the delivery is the **16-patch set** against the new fork
+point **`ebbb18522`** (block 00 + blocks 01-15), canonical 16-block tip
+**`6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e`** (tree `d751f42d05cc4770189f4a5250cc4aea4fea8e08`),
+release **`v16-ebbb18522-r1`** — a 2026-09-17 re-base onto current upstream master (37 commits past
+`d1d3c3396`; three resolved blocks: block 02's Vulkan check-results move, block 12's upstream HIP
+AllReduce enablement, and block 14's upstream qwen4exp hc ops + the pair-fusion `ncols_opt` RDNA3
+consistency fix; **no delivery item was retired**).  Validated on gfx1201 (`test-backend-ops`
+18083/18083, `FLASH_ATTN_EXT` 5952/5952, `FLASH_ATTN_QSA` 22/22; coherence gate coherent; re-base A/B
+perf within noise).  Full record: `WORKLOG.md` 2026-09-17.  The text below is the pre-re-base state,
+retained as history.
+
+**Previous state (2026-09-15, re-base):** the delivery was the **16-patch set** against fork point
+**`d1d3c3396`**, tip **`af9ce375ded5238b59598290ad7366760b7dc6e0`** (tree
+`c6896785a5fefdf9438d26974c0274bf99f43263`), release **`v16-d1d3c3396-r1`** (51 commits past
 `790cf51aa`; three conflict files: the block-00 Vulkan masked-V fix vs upstream's sparse FA, the FA test
-matrix, and qwen4exp's `{n_embd, hc}` norm fold plus the MTP `nextn.hc_head_norm` load-shape fix; **no
-delivery item was retired**).  Revalidated end-to-end on gfx1201 (`FLASH_ATTN_EXT` 5951/5951, all custom
+matrix, and qwen4exp's `{n_embd, hc}` norm fold plus the MTP `nextn.hc_head_norm` load-shape fix).
+Revalidated end-to-end on gfx1201 (`FLASH_ATTN_EXT` 5951/5951, all custom
 ops pass, plain == `draft-mtp` byte-identical, delivery ahead of a stock build at the same base on
 every gate).  Full re-base record and numbers: `WORKLOG.md` 2026-09-15 (re-base).  The text below is the
 pre-re-base state, retained as history.

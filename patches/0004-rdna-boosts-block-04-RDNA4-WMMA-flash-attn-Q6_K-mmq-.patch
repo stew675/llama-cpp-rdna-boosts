@@ -1,4 +1,4 @@
-From 625dad85559aab6de6ba0ad06d1d8b8bcdfced58 Mon Sep 17 00:00:00 2001
+From 0709acc64815453b9bda9999713b830e6e58099d Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 04/15] rdna-boosts: block 04: RDNA4 WMMA flash-attn + Q6_K mmq
@@ -17,7 +17,7 @@ Subject: [PATCH 04/15] rdna-boosts: block 04: RDNA4 WMMA flash-attn + Q6_K mmq
  9 files changed, 248 insertions(+), 20 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index ba929e638..69465d96c 100644
+index 5a3d66a99..3226270f7 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -2512,6 +2512,11 @@ extern "C" {
@@ -201,7 +201,7 @@ index 882fe5d91..3129b3e16 100644
  
      // If there are no tensor cores available, use the generic tile kernel:
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index f644c3ac2..d32d6945e 100644
+index 5178bbd9b..1b6abb515 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -72,6 +72,7 @@
@@ -399,7 +399,7 @@ index 6923f3510..9f6198523 100644
          if (ggml_cuda_mmq_get_config(type, ret, fallback, cc).type != GGML_TYPE_COUNT) {
              return ret;
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index acffdb4b7..e0851e48e 100644
+index 579b9b2cb..4e804c348 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -5558,6 +5558,17 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
@@ -421,7 +421,7 @@ index acffdb4b7..e0851e48e 100644
          struct ggml_tensor * a,
          int32_t              n_kv_max) {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index a0f27cc30..bbf08362e 100644
+index cddfc1a1d..97af7f57a 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -96,6 +96,18 @@ llama_context::llama_context(
@@ -444,10 +444,10 @@ index a0f27cc30..bbf08362e 100644
      if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
          throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index e35b40353..881872745 100644
+index 364d69d43..3907e389d 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -9859,6 +9859,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9884,6 +9884,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
      test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
@@ -461,7 +461,7 @@ index e35b40353..881872745 100644
  #endif
  
      for (ggml_type type_a : all_types) {
-@@ -10696,7 +10703,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10728,7 +10735,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                      for (float max_bias : { 0.0f, 8.0f }) {
                          if (!mask && max_bias > 0.0f) continue;
                          for (float logit_softcap : {0.0f, 10.0f}) {
@@ -471,7 +471,7 @@ index e35b40353..881872745 100644
                              for (int nh : { 1, 4 }) {
                                  if (nh == 1 && hsk != 320 && hsk != 576) continue;
                                  for (int nr3 : { 1, 3, }) {
-@@ -11059,6 +11067,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11091,6 +11099,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_leaky_relu(GGML_TYPE_F32, { 17408, n_tokens, 1, 1 }, 0.1f));
      }
  

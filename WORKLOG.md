@@ -1,5 +1,61 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-17 (re-base onto upstream master `ebbb18522`) — release `v16-ebbb18522-r1`
+
+**Release.** Fork point upstream master **`ebbb18522`** ("openvino : Update OpenVINO to 2026.4; fix
+clangd,MSVC warnings", tree `068106dfa23c63668abaea0113a1b38bc1352282`), 37 commits past `d1d3c3396`.
+Canonical 16-block tip **`6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e`**, net tree
+**`d751f42d05cc4770189f4a5250cc4aea4fea8e08`**.  `scripts/make-patches.sh` regenerated the set and
+`scripts/make-release.sh` refreshed `release.json`; `scripts/validate-set.sh` passes checksums +
+strict **16/16 `git am`** on a fresh tarball of `ebbb18522`, applied tree == recorded tree.
+
+**Why a re-base.** Upstream had moved 37 commits past the previous base.  Most blocks replayed
+cleanly; three needed resolution:
+
+- **Block 02 — the Vulkan check-results code moved.**  Upstream `f172be756` split `ggml-vulkan.cpp`
+  into `ggml-vulkan-{buffers,debug}.cpp` + shared headers.  Block 02's only Vulkan change was the
+  `ggml_gated_delta_net(..., K, n_rs_batch)` op-param clone in `ggml_vk_check_results_0`, so it was
+  re-homed to the new `ggml-vulkan-debug.cpp`; `ggml-vulkan.cpp` is now untouched by the delivery.
+- **Block 12 — upstream enabled the CUDA internal AllReduce on HIP.**  Upstream `38a5b42d9`
+  (#27825) changed `allreduce.cu`'s guard from `!GGML_USE_HIP && !GGML_USE_MUSA` to
+  `!GGML_USE_MUSA`, added the `cudaHostAlloc`/`hipHostMalloc` vendor aliases, and swapped
+  `__nanosleep` for `__builtin_amdgcn_s_sleep` on HIP.  The delivery already ships its own, more
+  advanced HIP all-reduce (the tuned hybrid dispatch + the opt-in `ce` copy-engine arm) in
+  `allreduce-hip.cu`, so compiling `allreduce.cu` for HIP too would have produced duplicate symbols.
+  Resolution: keep the delivery's split — `allreduce.cu` is re-guarded `!GGML_USE_HIP &&
+  !GGML_USE_MUSA` (CUDA-only), the `#elif defined(GGML_USE_MUSA)` stubs and the stage-hook stubs are
+  kept, and the HIP path stays in `allreduce-hip.cu`.  Upstream's `CUDA_CHECK` cleanups and the hip.h
+  aliases are retained (the aliases are unused by the delivery's HIP file, which calls the hip-native
+  APIs directly).
+- **Block 14 — upstream added the qwen4exp hyper-connection ops.**  Upstream `37b53fd45` (#28901)
+  added `ggml_dsv4_hc_pre_gated`/`ggml_dsv4_hc_post` (previously deepseek4-only) to qwen4exp's
+  `build_hc_mix`/`build_hc_combine`.  Both sides fuse the same math.  Resolution: the delivery's
+  decode/verify-band fused ops (`ggml_hc_mix`/`ggml_hc_combine`, `nt <= HC_FUSED_MAX_TOKENS`) keep
+  precedence for the `nt <= 8` band — that is the band-purity guarantee (`plain == draft-mtp`) — and
+  upstream's fused ops now serve the prefill path (previously the unfused chain) when `il >= 0`,
+  matching upstream's own structure.  The unfused chain remains the last fallback.
+
+**One performance-relevant semantic gap, fixed.**  Upstream `fccf7166f` (#28935) broadened the
+standalone MoE MMQ tile heuristic gate in `ggml_cuda_mul_mat_q` from `GGML_CUDA_CC_IS_RDNA3_0` to
+`GGML_CUDA_CC_IS_RDNA3` (a +11 % RDNA3.5/gfx1151 MoE prefill win).  The delivery's pair-fusion arm
+(`ggml_cuda_mul_mat_q_pair`, added by block 14) had copied the old `RDNA3_0` gate, so on gfx1151 it
+would have sized the fused gate+up pair's tile from the full token count instead of the per-expert
+average.  Block 14 is amended to use `GGML_CUDA_CC_IS_RDNA3`, matching upstream.  The change is a
+no-op on RDNA3_0 and RDNA4 (both predicates are true/false identically there), so gfx1201 behaviour
+is unchanged; it only removes the RDNA3_5 inconsistency.
+
+**Verification (gfx1201, ROCm 7.14, gfx1201-only build).**  Build clean.  `test-backend-ops`
+**18083/18083**, `-o FLASH_ATTN_EXT` **5952/5952**, `-o FLASH_ATTN_QSA` **22/22**.  Same-seed
+coherence gate (`Qwen3.5-4B-Q8_0`, `-sm tensor`, 3 GPU) coherent.  Re-base A/B against the previous
+delivery build (`8465f08b9`) on the same machine: `tg128` identical (1 GPU 96.13 vs 96.17 t/s;
+3-GPU 119.30 vs 119.32 t/s) and prefill equal within run-to-run variation (order-reversed pp4096
+runs: rebase 7385.7/7346.5 vs old 7365.8/7332.2 t/s).  No regression.
+
+**Not revalidated here (hardware unavailable):** gfx1151 (the block-14 `RDNA3` gate fix and the
+qwen4exp MTP purity gates), gfx1100, and the qwen4exp prefill/perplexity path (no qwen4exp model on
+this host) — the upstream hc-op change follows upstream's validated path, and the RDNA3.5 gate fix
+follows upstream #28935's own gfx1151 measurements.
+
 ## 2026-09-16 (adaptive-MTP cold start restored + `--spec-draft-n-start`) — delivery-set update (no version bump)
 
 **Change.** Two delivery amendments, folded into existing blocks (patch set regenerated; `release.json`

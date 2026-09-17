@@ -7,12 +7,13 @@ k-quant decode paths, a hybrid all-reduce, qwen4exp (Qwen3.8-Flash-Next)
 support, and an attention-memory campaign that frees several GiB of VRAM.
 
 It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp
-checkout at the fork point **`790cf51aa`**.  Each block is a self-contained
-`git am` commit, so you can apply the whole set or pick the ones you want:
+checkout at the fork point **`ebbb18522`** (upstream master, 2026-09-17
+re-base).  Each block is a self-contained `git am` commit, so you can apply
+the whole set or pick the ones you want:
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout 790cf51aa
+git checkout ebbb18522
 bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 ```
 
@@ -25,7 +26,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
 (the tag is the release identity: `v16-<fork-point>-r<N>`, e.g.
-**`v16-790cf51aa-r4`**, where `r1` is the re-base and each later release on the
+**`v16-ebbb18522-r1`**, where `r1` is the re-base and each later release on the
 same base increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
@@ -150,12 +151,13 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ## Consumer workflow
 
 ```
-# 1. fresh clone of llama.cpp, at the fork point
-git clone https://github.com/ggml-org/llama.cpp
-cd llama.cpp
-git checkout 790cf51aa        # the SHA recorded in patches/README.md
+# 1. fresh clone of llama.cpp, at the fork point recorded in release.json
+BASE=$(jq -r .base release.json)          # from this repo
+FORK=https://github.com/ggml-org/llama.cpp
+git clone $FORK && cd llama.cpp
+git checkout "$BASE"
 
-# 2. apply the set (automated; re-verified 2026-09-13 on the `790cf51aa` base)
+# 2. apply the set (automated; strict 16/16 git am on the recorded base)
 bash <path-to-this-repo>/scripts/apply-all.sh .
 #    = git am patches/0000…0015  (one commit per block on a fresh `rdna-boosts` branch)
 
@@ -180,13 +182,12 @@ git add -A && git commit -m "rdna-boosts: block 15: campaign memory wins"
 
 ## When upstream master moves
 
-The patches are static against `790cf51aa`. When upstream drifts and hunks
-no longer apply, regenerate the whole set from the fork with
-`scripts/make-patches.sh` (needs the `~/llama.cpp` fork checkout, which
-carries the block commits), then update
-`patches/README.md` and this README with the new fork point. The old
-`baseline/<sha>`-branch-per-upstream-range workflow was retired when the
-delivery moved to the flat 16-patch set on `main`.
+The patches are static against the fork point in `release.json.base`. When upstream
+drifts and hunks no longer apply, re-base the block commits (the fork checkout carries
+them), regenerate the whole set with `scripts/make-patches.sh`, then refresh
+`release.json` (`scripts/make-release.sh --base … --tip … --tree …`) and update the
+current-state headers. The old `baseline/<sha>`-branch-per-upstream-range workflow
+was retired when the delivery moved to the flat 16-patch set on `main`.
 
 ## Upstreaming
 
@@ -199,141 +200,27 @@ for per-block verification and `BASELINE.md` for provenance.
 ## Current state
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
-  **`d1d3c3396`** (re-based 2026-09-15; previously `790cf51aa`, re-based 2026-09-13 from `9113cc188`).
-- Patches `patches/0000-…0015-…`, applied with **strict 16/16 `git am`** by
-  `scripts/apply-all.sh` (no 3-way fallback, whitespace-clean).
-- Canonical 16-block chain: tip `c08efa1bc3`, net tree `a4cdb2800d5407656e84104199668c789a486b0a`.
-- Release **`v16-d1d3c3396-r4`**.  `scripts/validate-set.sh` passes strict 16/16
-  (applied tree == the recorded tree).
-- All-reduce algorithms: **`hybrid` is the default**; `GGML_CUDA_ALLREDUCE=ce` adds an opt-in
-  **copy-engine (SDMA) 2-GPU** mode (+2..+4 % prefill, decode byte-identical — see
-  [`WORKLOG.md`](WORKLOG.md), 2026-09-16).
-- Greedy purity: plain decode == `draft-mtp` verify for
-  `--spec-draft-n-max <= 7` across the supported KV types (4B and 27B all
-  eight; qwen4exp MTP).  Depths 8..15 are allowed with a visible notice that
-  the two may differ (kernel-family switches above an 8-row verify); `> 15` is
-  clamped (the recurrent rollback snapshot bound, 2026-09-13).
-- Every block is build- and coherence-verified.  Detail lives in:
-  [`WORKLOG.md`](WORKLOG.md) (dated record, newest first),
-  [`patches/README.md`](patches/README.md) (per-block notes, env knobs, server
-  config), [`MANIFESTS.md`](MANIFESTS.md) (apply order + verification contract)
-  and [`BASELINE.md`](BASELINE.md) (fork point + drift policy).
+  **`ebbb18522`** (upstream master "openvino : Update OpenVINO to 2026.4", 2026-09-17 re-base).
+- Canonical 16-block chain: tip **`6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e`**, net tree
+  **`d751f42d05cc4770189f4a5250cc4aea4fea8e08`**; release **`v16-ebbb18522-r1`**.
+- Patches `patches/0000-…0015-…` apply with **strict 16/16 `git am`** (no 3-way
+  fallback, whitespace-clean) via `scripts/apply-all.sh`.  `scripts/validate-set.sh`
+  re-checks the artifact hashes, the strict apply and the applied tree against `release.json`.
+- **`hybrid` is the default all-reduce**; `GGML_CUDA_ALLREDUCE=ce` selects the opt-in
+  copy-engine (SDMA) 2-GPU mode and `=nccl` forces RCCL.
+- **Greedy purity**: plain decode == `draft-mtp` verify for `--spec-draft-n-max <= 7`
+  across the supported KV types.  Depths 8..15 are allowed with a visible notice (a
+  verify wider than 8 rows switches kernel family); `> 15` is clamped (the recurrent
+  rollback snapshot bound).
+- Last full `test-backend-ops` on this cut (gfx1201): **18083/18083**, with
+  `FLASH_ATTN_EXT` **5952/5952** and `FLASH_ATTN_QSA` **22/22**.
 
-**Latest change (2026-09-15, r3) — the deep-prefill FA staging arena degrades instead of aborting (issue #33).**
-On a nearly-full card the block-15 prefill staging arena (deliberately outside the compute-graph
-reserve, so `--fit` does not count it) could OOM in `cudaMalloc` and abort the run; it now returns null,
-warns once and lets the launcher read the raw K/V cache natively for that prefill.  The staged F16 copy
-and the native per-tile dequantization are bit-identical, so this is a prefill-speed fallback only, and
-the transient can no longer exceed what the fit reserved.  Validated gfx1201 FAIL -> PASS: a
-31.5k-token `q8_0` prefill with the card pinned to 64 MiB free killed the pre-fix server with a
-`fattn_stage_get` OOM and completed post-fix with byte-identical content; `FLASH_ATTN_EXT` 5952/5952.
-Record: [`WORKLOG.md`](WORKLOG.md) (2026-09-15 r3).
-
-**Previous change (2026-09-15, r2) — the adaptive-MTP controller is re-tuned (issue #35).**  On the
-reporter's cell (27B Q8_0 x 2-card tensor, f16 KV, `-n 3000`) an adaptive ceiling of 12 lost 3.6 % to
-ceiling 7 (92.8 vs 96.3 t/s).  Block 01 now carries the credit-bucket controller with a depth-growing
-climb budget, a steeper drop pressure and a cold start at `cap - 3` (overridable per context with `--spec-draft-n-start`), and reports its depth transitions
-at TRC.  Same cell: code **96.0 vs 95.8** (4 depth changes instead of 40), reasoning +5.0 %, prose
-+11.2 %, code +18.8 %, recall +58.7 % riding at the ceiling; the new phase-switching prompt
-(`prompts/code-reasoning-mixed.txt`) reads 64.0 against its 64.3 pinned-depth optimum; the 1-card
-UD-Q4_K_XL reference gains +37.9 % on code (84.7 vs 61.4).  Greedy output is unchanged.  Record:
-[`benchmarks/2026-09-15-adaptive-mtp-tuning.md`](benchmarks/2026-09-15-adaptive-mtp-tuning.md).
-
-**Previous change (2026-09-15, r1) — re-base onto upstream master `d1d3c3396`.**  51 upstream commits past `790cf51aa`; three files conflicted (block 00's
-Vulkan masked-V fix vs upstream's sparse FA, the FA test matrix, and qwen4exp's `{n_embd, hc}` norm
-fold — plus the MTP `nextn.hc_head_norm` load-shape crash the merge exposed and validation caught).
-Revalidated end-to-end on gfx1201: `FLASH_ATTN_EXT` 5951/5951, all custom ops pass, plain ==
-`draft-mtp` byte-identical on 27B and qwen4exp, the full `-n 3000` adaptive-MTP four-axis gate passes
-(acceptance 0.60-0.99, `n3` byte-identical to plain on all four axes), and the delivery is ahead of a
-stock build at the same base on every gate (dense 27B +8-13 %, MoE 35B-A3B +9-17 %, qwen4exp 3.2×
-prefill / +44 % decode, batched verify-width B=8 195 vs 120 t/s).  Also passed on **gfx1151 (Strix
-Halo)**: custom ops + `FLASH_ATTN_EXT` clean, purity holds, prefill +25-82 % with decode flat.
-Full records: [`WORKLOG.md`](WORKLOG.md) 2026-09-15 (re-base) and
-[`benchmarks/2026-09-15-rebase-v17-validation.md`](benchmarks/2026-09-15-rebase-v17-validation.md).
-
-**Previous change (2026-09-15, r5) — build time: a clean backend build was gated by one translation
-unit.**  A fresh ROCm build had grown slow and `fattn-tile.cu` alone took **509 s of a 538 s** `-j16`
-backend build.  Cause (ours): block 03 made the tile kernel's `type_KV` a template parameter, but
-`DECL_FATTN_TILE_CASE`/`EXTERN_DECL_FATTN_TILE_CASES` still covered only F16/BF16 — and since the
-dispatch has an unconditional `case` per native type, the other **six** types were instantiated
-*implicitly in the dispatch TU* (72 of its 96 `tile_case` symbols; the 12 generated instance files had
-2 each).  Those macros now expand per type, so the generated files carry 8 cases each and the dispatch
-TU only externs: **538 s -> 330 s**, `fattn-tile.cu` **509 s -> < 10 s**, with the kernels, flags and
-device code unchanged — `test-backend-ops -o FLASH_ATTN_EXT` 5951/5951, 27B text hashes bit-identical,
-`tg64@32768`/`pp8192` within 0.12 % across five KV types.  The new critical path is the
-`fattn-mma-f16` instance set, which our native-KV arms made 8x larger (0.90 -> 7.26 MB, 6.7 -> 229 s per
-TU) — diagnosed and left as a follow-up.  Canonical tip `6f76c1cb1`, tree `d735d6c11`; release
-**`v16-790cf51aa-r5`**.  Full record: [`WORKLOG.md`](WORKLOG.md) 2026-09-15, `patches/README.md` (the
-2026-09-15 build-time block-15 amendment), and `wip/build-time-regression/`.
-
-**Earlier change (2026-09-15, r4) — issue #30 second round: the reporter's q4_0 NaN, the prefill band
-split, and the last four native KV arms.**  @briansp2020's r3 re-run found **4 NaNs** in
-`test-backend-ops -o FLASH_ATTN_EXT` with a q4_0 K/V; chasing them closed four items.  (1) The tile
-kernel is instantiated with ONE `type_KV` for both operands while `launch_fattn` chose its native read **per
-tensor**, so a mixed pair fell back to the F16 tile with the native operand's staging skipped and read
-raw q4_0 as F16 — `launch_fattn` now takes the kernel's native type explicitly.  (2)
-`get_alloc_size`'s TILE case never learned the q4_0 arm, so **the q4_0 memory win had never been
-delivered**: `-c 196608` q4_0 **849 -> 123 MiB**.  (3) TODO 21: a prefill now stages K/V while
-decode/verify reads natively, with the scratch in a per-context, per-stream arena instead of the
-graph reserve (which sized it for `n_ctx` — the adaptive-MTP `-c 196608` load failure); gfx1201 q8_0
-`pp150000` **691/1077/1199** (1/2/3 GPU, from 661/996/1111).  Arch-gated: gfx1151 keeps its native
-prefill (faster at every measured depth).  (4) TODO 2: native arms for `q4_1`/`q5_0`/`q5_1`/`iq4_nl`
-(tg64 @ d32768 +9-13 % on gfx1201, +22-27 % on gfx1151).  Gates: `test-backend-ops` **5951/5951 on both
-arches**, greedy text `native == staging` identical for all eight KV types on both, `W=1..8` one hash per
-type.  Canonical tip `b19c70b34`, tree `7fab975d9`; release **`v16-790cf51aa-r4`**.  Full record:
-[`WORKLOG.md`](WORKLOG.md) 2026-09-15, `patches/README.md` (the 2026-09-15 block-15 amendment),
-`GREEDY-PURITY.md` §36, and `wip/issue-30-mtp-decode-regression/`.
-
-**Previous change (2026-09-14 (later), r3) — issue #30 wide-configuration: the RDNA prefill regression is
-fixed and made split-aware.**  The delivery's prefill fell off ~51 % faster with depth than stock (1 GPU,
-27B f16 pp150k 609.5 vs 686.9) — not q8_0-specific.  Two causes: the head-256 `ncols=64` WMMA config was
-a Strix-Halo (gfx1151) half-tile row used for all WMMA calls, and the delivery omitted stock's AMD
-`switch_ncols2`.  Block 04 now makes the config `cc`-aware (RDNA3_5 keeps the halo row, RDNA4/RDNA3_0
-take upstream's) and `ncols2` **split-aware**: a frontend hint (`ggml_set_fa_tensor_parallel`, set in
-`llama_context` from `split_mode() == TENSOR && n_cuda_dev > 1`) selects generic `ncols2=8` for tensor
-split and stock's AMD `ncols2=2` for a whole card.  Result (pp150K, f16, vs stock): 1-card **703** (+2.4 %),
-2-card **1087** (+6.9 %), 3-card **1219** (+9.6 %); q8_0 KV at parity (−1.2 / −0.2 / +2.4 %); the 4B q4_0
-`W=1..8` band stays pure.  Canonical tip `a2c8d06a7`, tree `eb5b7583`; release **`v16-790cf51aa-r3`**.
-Full record: [`WORKLOG.md`](WORKLOG.md) 2026-09-14 (later), `patches/README.md` (block-04 amendment),
-`GREEDY-PURITY.md` §35, and `wip/issue-30-mtp-decode-regression/`.
-
-**Earlier change (2026-09-14, r2) — issue #30 wide-configuration: block 15's V4 native staging is
-now the default for the sub-F16 KV quants, and q4_0 gained a native arm.**  The whole-cache F16 staging
-pass is a *decode-depth* cost, so a quantized KV cache fell off with depth vs stock (1 GPU, 27B
-UD-Q4_K_XL: q8_0 `tg64` d65536 18.92 = 66.1 % of d0 vs stock 22.43 = 80.1 %).  With
-`GGML_CUDA_FA_KV_NATIVE` = *unset = auto* (native q8_0/q4_0 **on**, native bf16 off; `=1` force all on,
-`=0` force the old staging path) plus the new q4_0 arm, q8_0 is **23.29** (+23 %) and q4_0 **22.82**
-(+16 %) at d65536, ~1.2-1.3 % prefill, bit-identical to the staging conversion and `W=1..8`-pure.  The
-same ~744 MiB scratch was the 260 MiB margin the adaptive-MTP draft context needed at `-c 196608` q8_0 /
-ceiling 12, so that config **now loads** at the default 4 slots.  The head-256 WMMA question (#28867) was
-investigated and needs no change (the `Q->ne[1] > 8` guard covers `W<=8`; `n_q=9..N` is at parity with
-TILE).  Canonical tip `9ee71c356`, tree `58317e0d64dd`; release `v16-790cf51aa-r2`.  Full record:
-[`WORKLOG.md`](WORKLOG.md) 2026-09-14, `GREEDY-PURITY.md` §34, and
-`wip/issue-30-mtp-decode-regression/`.
-
-**Previous change (2026-09-13) — issue #30: the `--spec-draft-n-max` clamp is raised from 7 to
-15, and the qwen4exp QSA decode arm is band-matched to the verify width.**  The park reason for depth 15
-was a claimed recurrent-rewind corruption on qwen4exp.  A new deterministic reference-context sweep
-(`tests/test-recurrent-state-depth`: `n_rs_seq` 1..15, every rollback, plus deep drafts) is green on
-qwen35/dsv4/kimi-k3/qwen4exp — **no rewind corruption in the allowed range** — and the qwen4exp
-depth-15 divergence past the 2051 indexer selection width was the **QSA dense decode arm** flipping to
-the sparse top-k arm for a 9..16-row verify (`QSA_DECODE_BAND = 8`); the arm band is now
-`max(QSA_DECODE_BAND, cparams.n_rs_batch)`.  The residual purity loss above depth 7 is the documented
-kernel-family switch at 8 rows (FA tile/MMA **and** matmul MMVQ/MMVF -> MMQ), now an accepted trade
-with a visible notice instead of a clamp; only `> 15` (the recurrent snapshot bound) is clamped.  The
-default `n_max 3` is unaffected.  The adaptive-MTP four-axis table is re-presented at the mode's
-recommended ceiling **12**, measured at a realistic length (`-n 3000`) with reasoning pinned per axis
-(`--reasoning off` for prose/code/recall): adaptive `n12` vs fixed `n3` is reasoning -1%, prose **+13%**,
-code **+28%**, recall **+61%** (109.6 t/s, mean accepted length 8.95), and vs the old ceiling 7 it is
-prose +26%, code +35%, recall +44%.  **Two protocol requirements are now part of the gate** (and were
-both wrong in the first cut): `-n 3000` (`-n 2000` floor) -- a 256-token run measured the warm-up and
-inverted the code ranking -- and the per-axis reasoning flag.  See
-`benchmarks/2026-09-13-adaptive-mtp-4-axis-n12.md` and the gate rule in
-`benchmarks/mtp-adaptive-methodology.md`.  Canonical tip `c45244c72`, tree
-`a5683e1b008e`.  Full record:
-[`WORKLOG.md`](WORKLOG.md) 2026-09-13 (latest) and the issue-#30 section of
-[`patches/README.md`](patches/README.md).
-
+The **dated record of every change** (re-bases, block amendments, issue fixes,
+measurements) is [`WORKLOG.md`](WORKLOG.md), newest first.  Per-block notes, env knobs
+and server configuration live in [`patches/README.md`](patches/README.md); apply order
+and the verification contract in [`MANIFESTS.md`](MANIFESTS.md); fork point and drift
+policy in [`BASELINE.md`](BASELINE.md); the purity rulebook in
+[`GREEDY-PURITY.md`](GREEDY-PURITY.md).
 
 ## Community Acknowledgements
 

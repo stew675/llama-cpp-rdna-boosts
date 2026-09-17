@@ -5,11 +5,26 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`d1d3c3396`** ("ci: build MUSA for only 1 arch (#28944)"; re-based 2026-09-15 from `790cf51aa`,
+**`ebbb18522`** ("openvino : Update OpenVINO to 2026.4", 2026-09-17 re-base from `d1d3c3396`,
+itself re-based 2026-09-15 from `790cf51aa`,
 itself re-based
 2026-09-13 from `9113cc188`; previously re-based 2026-09-08 from `050dde50c`, itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
+
+**Current re-base (2026-09-17) — release `v16-ebbb18522-r1`:** the 16-block set re-based onto
+upstream master `ebbb18522` (37 commits past `d1d3c3396`).  Three blocks needed resolution: block 02
+(the `GATED_DELTA_NET` op-param clone in the Vulkan check-results moved to the new
+`ggml-vulkan-debug.cpp`), block 12 (upstream #27825 enabled the CUDA internal AllReduce on HIP; the
+delivery keeps its HIP split, so `allreduce.cu` stays CUDA-only and the HIP hybrid lives in
+`allreduce-hip.cu`), and block 14 (upstream #28901 added the qwen4exp hc ops; the delivery's
+decode-band fused hc ops keep the `nt <= 8` band and upstream's `ggml_dsv4_hc_pre_gated`/`post`
+serve prefill — plus the pair-fusion `ncols_opt` gate broadened to `RDNA3` for gfx1151 consistency
+with upstream #28935).  Canonical tip `6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e`, tree
+`d751f42d05cc4770189f4a5250cc4aea4fea8e08`, strict 16/16, build + `test-backend-ops` 18083/18083 on
+gfx1201 — see `WORKLOG.md` 2026-09-17.
+
+The re-base history below (`d1d3c3396` and earlier) is retained as dated record.
 **Re-base (2026-09-15) — the current release `v16-d1d3c3396-r1`:** the 16-block set re-based onto
 upstream master `d1d3c3396` (51 commits past `790cf51aa`).  Three conflict files: block 00's Vulkan
 masked-V fix composed with upstream's sparse FA (`fc82583e6`); the FA test matrix (`1e7bcf3da` +
@@ -183,7 +198,7 @@ patch set. It is written for humans AND LLM coding agents. Follow it exactly;
 do not skip blocks.
 
 Current state: `main` is the delivery branch (flat history, 16-patch set:
-block 00 + blocks 01-15 against `9113cc188`). The `baseline/<sha>` branches and `block/01-…11` tags
+block 00 + blocks 01-15 against `ebbb18522`). The `baseline/<sha>` branches and `block/01-…11` tags
 are HISTORICAL checkpoints of the old pre-block-12 structure (older
 upstream ranges, `git apply` flow); do not use them for the current
 delivery — use `patches/` + `scripts/apply-all.sh`.
@@ -207,7 +222,7 @@ delivery — use `patches/` + `scripts/apply-all.sh`.
 | 12 | `0012-…-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch` | **hybrid HIP all-reduce** (internal AR for the small-tensor decode path + per-size hybrid dispatch vs RCCL; RDNA4-only gate: refuses to init off gfx1200/gfx1201, falls back to RCCL) | none (apply last) |
 | 13 | `0013-…-block-13-fused-MoE-gate-up-GLU-MMQ-mmvq-.patch` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** (prefill fused expert MMQ, RDNA4 + RDNA3.5 + RDNA3.0 (gfx1151 validated 2026-09-05, gfx1100 validated 2026-09-05), Q3_K/Q4_K/Q5_K/Q8_0/Q6_K + decode item-split, re-based on the upstream has_fusion mmvq path; multi-token mmvq x_scale_channel_dst fusion for MoE down x topk-weights, spec-dec verify batches n=2..8; ROCm unaligned-width split-load fix for Q6_K/Q3_K 2-GPU) | none (apply last) |
 | 14 | `0014-…-block-14-qwen4exp-support.patch` | **qwen4exp / Qwen3.8-Flash-Next support** (promoted from `beta/qwen4exp`, re-based): QSA sparse FA (default) + fused indexer top-k/score, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader + PLE n-gram loading, MTP draft-head, WS4 hyperconn prefill fusions, sched alloc-fallback sync fix, QSA dense shortcut + per-arch dense/QSA decode policy | none (apply last) |
-| 15 | `0015-…-block-15-campaign-memory-wins.patch` | **attention-memory wins (block 15)** (promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`): V3 derived kq mask (`LLAMA_KQ_MASK_DERIVED`, default 1), V4 native q8_0 + V5 native bf16 K/V (`GGML_CUDA_FA_KV_NATIVE`, opt-in default 0), W1 QSA score-chain memory (`GGML_QSA_SCORE_MEM`), W2 derived QSA per-block bias + visibility (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), W3 keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), W4 ggml-alloc unused-view release (no gate) | **apply last** |
+| 15 | `0015-…-block-15-campaign-memory-wins.patch` | **attention-memory wins (block 15)** (promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`): V3 derived kq mask (`LLAMA_KQ_MASK_DERIVED`, default 1), V4/V5 native K/V in the FA kernels (`GGML_CUDA_FA_KV_NATIVE`: unset = auto -> native q8_0/q4_0 on, bf16 off; `=1` force all on; `=0` force the F16-staging path), W1 QSA score-chain memory (`GGML_QSA_SCORE_MEM`), W2 derived QSA per-block bias + visibility (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), W3 keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), W4 ggml-alloc unused-view release (no gate) | **apply last** |
 
 Block numbers are the apply order: `01` applies first, `15` last. All blocks
 are mutually independent except **block 08 (fused core) requires blocks 03

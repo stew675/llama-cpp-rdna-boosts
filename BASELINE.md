@@ -2,7 +2,8 @@
 
 Current state: `main` is the delivery branch carrying the **16-patch set**
 (block 00 + blocks 01-15) generated against the fork
-point **llama.cpp master `d1d3c3396`** (re-based **2026-09-15** from
+point **llama.cpp master `ebbb18522`** (re-based **2026-09-17** from
+`d1d3c3396`, itself re-based 2026-09-15 from
 `790cf51aa`, itself re-based 2026-09-13 from
 `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself re-based
 2026-09-07 from `465e49b9c`, itself
@@ -12,11 +13,13 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current baseline marker:** `baseline/d1d3c3396` is the **new** (2026-09-15)
-> delivery baseline — the `main` release commit for the 16-block set at the
-> `d1d3c3396` fork point.  `baseline/790cf51aa` remains the previous (2026-09-13)
-> marker.  Neither is one of the historical pre-block-12 checkpoints listed
-> below; those remain frozen records.
+> **Current baseline marker:** `baseline/d1d3c3396` was the previous (2026-09-15)
+> delivery baseline.  The current one is **`ebbb18522`** (2026-09-17), the fork point of
+> release **`v16-ebbb18522-r1`** (canonical tip
+> `6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e`, tree
+> `d751f42d05cc4770189f4a5250cc4aea4fea8e08`).  `baseline/790cf51aa` remains the
+> (2026-09-13) marker.  None of these is one of the historical pre-block-12
+> checkpoints listed below; those remain frozen records.
 
 > **Naming collision warning:** in the OLD records below, "block 12"
 > sometimes means the old *k-quant umbrella* (folded into what is now block
@@ -33,14 +36,27 @@ at `192067b72`), `baseline/d222767c7` (validated against `d222767c7`) and
 
 
 All 16 patches are generated against **llama.cpp upstream master at
-`790cf51aa`** (re-based **2026-09-13** from `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself re-based
+`ebbb18522`** (re-based **2026-09-17** from `d1d3c3396`, itself re-based 2026-09-15 from `790cf51aa`,
+itself re-based 2026-09-13 from `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself re-based
 2026-09-07 from `465e49b9c`, itself re-based
 2026-09-06 from `9cffdcc80`, itself re-based
 2026-09-02 from `0eadefebd`; dated records at the
 bottom of this file): block 00 = the structural/architecture fixes added
 2026-09-10 (FA small-batch KV-split width invariance + Vulkan masked-V), and
 blocks 01-15 = the fork's `rdna-boosts` block
-commits.  The canonical 16-block chain for the `790cf51aa` base is tip
+commits.  The canonical 16-block chain for the `ebbb18522` base is tip
+`6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e`, tree
+`d751f42d05cc4770189f4a5250cc4aea4fea8e08` (release **`v16-ebbb18522-r1`**, the
+2026-09-17 re-base of the 16-block set onto upstream master `ebbb18522`, 37 commits past `d1d3c3396`;
+the three resolved blocks are block 02's Vulkan GATED_DELTA_NET check-results clone (moved upstream to
+`ggml-vulkan-debug.cpp`), block 12's upstream HIP AllReduce enablement (the delivery keeps its HIP
+split: `allreduce.cu` CUDA-only, HIP hybrid in `allreduce-hip.cu`), and block 14's upstream qwen4exp hc
+ops (the delivery's decode-band fused hc ops keep `nt <= 8`, upstream's `ggml_dsv4_hc_pre_gated`/`post`
+serve prefill) plus the pair-fusion `ncols_opt` RDNA3 consistency fix; see `WORKLOG.md` 2026-09-17).
+The previous canonical chain (base `d1d3c3396`, 2026-09-15) was tip
+`8465f08b9efb26c60e992b48b7d2857d9ffcaf7a`, tree
+`3bb7c223c60570978d1bbf996a03808fe31f2842`.  Before that, the `790cf51aa` base:
+tip
 `6f76c1cb1d80c7ecbf176f939a351bc385ff33fc`, tree
 `d735d6c11258ae939cfd392511e3f29ac22a7686` (the 2026-09-15 **build-time** block-15 amendment: the tile
 kernel's native-KV type axis is instantiated in the generated instance TUs again instead of implicitly

@@ -1,98 +1,31 @@
 # rdna-boosts patch set (delivery)
 
-16 patches (block 00 structural fixes + blocks 01-15) against llama.cpp master `d1d3c3396`
-**Current release: `v16-d1d3c3396-r3`** (tip `4e942c071`, tree `28be875a`) — r3 amends block 15 so the
-deep-prefill FA staging arena degrades to the native K/V read when the device has no room, instead of
-aborting at the first deep prefill (issue #33; only block 15 changed).  r2 amended block 01 with
-the tuned bucketed adaptive-MTP controller (see the block-01 amendment below; only block 01 changed).
-r1 was the 2026-09-15 re-base onto `d1d3c3396` (51 upstream commits past `790cf51aa`).  Three conflict files were resolved: the
-block-00 Vulkan masked-V fix composed with upstream's sparse FA (`fc82583e6`), the FA test matrix
-(`1e7bcf3da` + block 03's `112` head size), and qwen4exp's `{n_embd, hc}` norm fold (`41abbfd59`),
-where the MTP head's `nextn.hc_head_norm` also had to move to `{n_embd, hc}` (a reservation-only
-`ggml_can_repeat` crash that validation caught).  **No delivery item was retired.**  The previous
-base `790cf51aa`'s release was **`v16-790cf51aa-r5`** (tip `6f76c1cb1`, tree `d735d6c11`).
-r2 = block 15's V4 native
-staging default for the sub-F16 quants + the q4_0 arm; r3 = block 04's arch- and split-aware prefill
-tuning; r4 = the 2026-09-15 block-15 amendment: the mixed-K/V kernel contract (the reporter's q4_0
-NaN), the `get_alloc_size` q4_0 scratch fix, the prefill band split + staging arena + the RDNA3_5 arch
-gate, and native arms for `q4_1`/`q5_0`/`q5_1`/`iq4_nl`; **r5 = the build-time half of the same block-15
-amendment**: the tile kernel's native-KV type axis is instantiated in the generated instance TUs again
-instead of implicitly in the dispatch TU, which took a clean `-j16` backend build from **538 s to
-330 s** with no runtime change — see the two 2026-09-15 block-15 amendment sections below.
-(`790cf51aa` = "chat : improve parsing of complex types in qwen3-coder (#28742)", re-based **2026-09-13** from
-`9113cc188`; previously re-based 2026-09-08 from `050dde50c` ("hexagon: add RELU and LEAKY_RELU ops (#28585)"), itself
-re-based 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
-re-based 2026-09-02 from `0eadefebd`; on the 2026-09-08 re-base block 06's
-functional delta was dropped — upstream itself reverted #24233 in #28604 the
-same day, matching its end state — and the block now carries only the
-host-buffer rationale marker comment (see the block-06 note below); block 14's
-quantized-KV tensor-split gate merged additively with upstream #28390's
-single-device `SPLIT_MODE_TENSOR` warn, and block 14 amended 2026-09-13 (ninth) with the pair-fusion
-`ncols_opt` fix (the re-base's new `mmq_args` field was left unset by `ggml_cuda_mul_mat_q_pair`, so the
-MMQ tile heuristic selected the narrowest tile — up to 2.2x slower dense prefill; both arms now set it
-and the heuristic falls back to `ncols_max` — see the 2026-09-13 block-14 (ninth) section below);
-block 08 amended 2026-09-13 (sixth) with the `iq4_nl` `GET_ROWS` sub-`QK_K` path (TODO item 3 — an `iq4_nl` indexer key cache sent the indexer gather to the CPU; the op is now on the GPU, restoring ~25 % of long-context qwen4exp prefill — see the 2026-09-13 block-08 section below) and 2026-09-13 (seventh) with the **MoE-router bit-identity fix** (TODO item 19 — the fused `topk_moe` router now reproduces the generic `soft_max`/`sum_rows` reduction orders and the argsort tie-break, so the address-overlap fusion guard no longer changes the model output — see the 2026-09-13 block-08 (seventh) section below), amended 2026-09-11 with the decode/verify FlashAttention kernel-family fix
-(F1: a quantized K/V cache used VEC at `n_q <= 2` and TILE from `n_q = 3`, so plain decode disagreed
-with spec-draft-mtp verify — see the block-08 notes below), and again 2026-09-11 with the **quantized
-KV-type enablement** (`q4_1`/`q5_0`/`q5_1` become first-class FlashAttention cache types — the
-`GGML_CUDA_FA_ALL_QUANTS`-only types are enabled unconditionally, with their three diagonal vec
-instances — so they stop disabling flash attention for the whole context; see the block-08 notes
-below and `../GREEDY-PURITY.md` §20); block 12 amended 2026-09-04 with the runtime
-NCCL-failure fallback (issue #13, see the block-12 notes
-below); block 13 amended 2026-09-02 with two MTP regression fixes and
-2026-09-05 with the RDNA3.5 (Strix Halo, gfx1151) + RDNA3.0 (gfx1100)
-fused-MoE-MMQ gate relaxations, and 2026-09-11 with the F2 cause-2
-**decode/verify band-uniformity** fix (the per-type mmvq caps are floored at
-`MMVQ_MAX_BATCH_SIZE` and `mul_mat_vec_q_moe` is sized at the band, so
-`W = 1..8` is bit-identical — **+14-26 %** at the verify widths) and
-2026-09-11 with the **fused shared-expert epilogue band** (the decode-only
-`ne[1] == 1` gate now serves the whole `n_tokens <= MMVQ_MAX_BATCH_SIZE` band
-— `W = 1..8` bit-identical, and MoE `draft-mtp` acceptance 0.51 -> 0.82), and
-2026-09-12 with the **RDNA3_5 single-token-only mmvq fusion skip** (the dense gate+up+GLU
-fusion and the weighted-down MoE tail are single-token-only and do not reproduce the
-standalone mmvq arithmetic on gfx1151, so `W=1` decoded a different reduction than the
-`W>=2` verify; skipping them restores `W = 1..8` to one hash) — see the
-block-13 notes below; block 14 amended 2026-09-11 with the **QSA decode-arm
-band** (the dense arch-policy arm was gated `n_tokens == 1`, so a W=1 decode and
-an n-token verify took different attention regimes above the indexer selection
-width; the arm now serves the whole decode/verify band, making
-`plain == draft-mtp` byte-identical for `n_max <= 7`), and again 2026-09-11 with the
-**QSA-vs-KV-type arm gate** (the fused sparse QSA op reads the cache natively for f16/bf16/q8_0 only;
-with any other quantized cache the graph now takes the dense masked path instead of building an op the
-backend cannot split — which is what aborted the meta splitter on qwen4exp + `-sm tensor`, for `q4_0`
-as well) and the **tensor-split gate narrowing** to the types that really have a native FA read path
-— see the 2026-09-11 block-14 amendment section below, the MTP
-baseline gate in
-`../benchmarks/mtp-adaptive-methodology.md`, the Strix record in
-`../archive/work/wip-archive/qwen4exp/discovery/2026-09-05-strix-halo-gfx1151-block-13-moe-mmq.md`, and
-the gfx1100 record in
-`../archive/work/wip-archive/qwen4exp/discovery/2026-09-05-rdna3-gfx1100-block-13-moe-mmq.md`; block 14
-amended 2026-09-07 with the QSA quantized-KV decode gate + the
-derived-cache pool gate — see the block-14 notes; block 13
-amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19); block 14
-amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18) — see the
-2026-09-08 fixes section and the block-13/14 notes below; block 14
-amended 2026-09-08 with the compiler-warning cleanup (Vulkan/clang-16 + ROCm
-host builds), 2026-09-08 with the qwen4exp tensor-split backend gate
-(HIP-only) and 2026-09-08 with the quantized-KV tensor-split gate
-(`q4_1`-family KV cache types aborting under multi-GPU `SPLIT_MODE_TENSOR`;
-an upstream bug — vanilla `050dde50c` reproduced it too) — see the block-14
-notes below); block 01 refreshed 2026-09-09 to the llama.cpp PR #27210
-review head `d236d41a2` (still one squashed block; blocks 02-14
-content-identical on the regeneration — see the 2026-09-09 block-01
-refresh section below); block 00 was added 2026-09-10 (see the
-2026-09-10 block-00 section below) and the kernel-side masked-V fixes for
-freed flash-attention cells were re-homed the same day: the host-side
-`zero_freed` row zeroing (added 2026-09-09, gfx1151-only) stays REMOVED
-(`llama-kv-cache.{cpp,h}` are back to the upstream state), the Vulkan
-`flash_attn_cm1.comp`/`flash_attn.comp` (dead columns never read V) fixes
-now live in block 00, and the HIP `fattn-tile.cuh` (packed-bf16 PV) +
-`fattn-mma-f16.cuh` (masked-V rows in staged shared tiles) fixes now live
-in block 03 (they sit on the native-BF16 FA path block 03 introduces);
-block 14 carries none of them; **block 15 (the attention-memory campaign) is the last delivery patch** — promoted
-2026-09-12 from `../archive/work/block-15-campaign-wins/` (see the block-15
-promotion section below), so the set now applies as block 00 + blocks
-01-15):
+16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`ebbb18522`**
+(re-based 2026-09-17 from `d1d3c3396`).
+
+**Current release: `v16-ebbb18522-r1`** — canonical tip
+`6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e`, tree
+`d751f42d05cc4770189f4a5250cc4aea4fea8e08`.  Strict 16/16 `git am`; build +
+`test-backend-ops` **18083/18083** on gfx1201 (`FLASH_ATTN_EXT` 5952/5952,
+`FLASH_ATTN_QSA` 22/22).
+
+The 2026-09-17 re-base resolved three blocks:
+
+- **block 02** — upstream #28732 moved the Vulkan check-results code out of `ggml-vulkan.cpp` into the
+  new `ggml-vulkan-debug.cpp`; the `GATED_DELTA_NET` op-param clone (`n_rs_batch`) was re-homed there.
+- **block 12** — upstream #27825 enabled the CUDA internal AllReduce on HIP in `allreduce.cu`.  The
+  delivery keeps its HIP split (the tuned hybrid + `ce` arms), so `allreduce.cu` stays CUDA-only
+  (guard `!GGML_USE_HIP && !GGML_USE_MUSA`) and the HIP implementation lives in `allreduce-hip.cu`;
+  upstream's `CUDA_CHECK` cleanups and the `cudaHostAlloc`/`hipHostMalloc` vendor aliases are kept.
+- **block 14** — upstream #28901 added the qwen4exp hyper-connection ops
+  (`ggml_dsv4_hc_pre_gated`/`ggml_dsv4_hc_post`).  The delivery's decode/verify-band fused hc ops
+  (`ggml_hc_mix`/`ggml_hc_combine`, `nt <= 8`) keep precedence, and upstream's fused ops now serve the
+  prefill path instead of the unfused chain.  The pair-fusion `MUL_MAT_ID` `ncols_opt` arch gate was
+  broadened from `GGML_CUDA_CC_IS_RDNA3_0` to `GGML_CUDA_CC_IS_RDNA3` to match upstream #28935 (a
+  gfx1151-only change; a no-op on RDNA3_0/RDNA4).
+
+The amendment history below is newest first.  Per-block content lives in the block notes
+(`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
 
 | patch | content |
 |---|---|
