@@ -201,8 +201,10 @@ for per-block verification and `BASELINE.md` for provenance.
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`ebbb18522`** (upstream master "openvino : Update OpenVINO to 2026.4", 2026-09-17 re-base).
-- Canonical 16-block chain: tip **`6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e`**, net tree
-  **`d751f42d05cc4770189f4a5250cc4aea4fea8e08`**; release **`v16-ebbb18522-r1`**.
+- Canonical 16-block chain: tip **`31b1790372d17bf7f95f3e15f7b4e2b35eb661e1`**, net tree
+  **`7dc63cb3c93aa1cd74435698f045f93d2ee3a9e6`**; release **`v16-ebbb18522-r2`**.
+- A clean HIP build no longer prints the ~10k FA "loop not unrolled" warnings
+  (`-Wno-pass-failed`, block 15; no codegen change).
 - Patches `patches/0000-…0015-…` apply with **strict 16/16 `git am`** (no 3-way
   fallback, whitespace-clean) via `scripts/apply-all.sh`.  `scripts/validate-set.sh`
   re-checks the artifact hashes, the strict apply and the applied tree against `release.json`.

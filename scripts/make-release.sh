@@ -20,15 +20,16 @@
 #
 # On a re-base all four metadata values change together:
 #   --base      <new fork point>          (upstream commit the set applies to;
-#                                          the SHORT form, as used in the
+#                                          use the SHORT form, as used in the
 #                                          v16-<base>-r<N> release tag)
 #   --base-tree <git rev-parse BASE^{tree}>
 #   --tip       <canonical fork block-15 commit>
 #   --tree      <git rev-parse TIP^{tree}>
 #
-# `base` MUST be the short fork-point SHA: the release tag is
-# `v16-<base>-r<N>` and .github/workflows/docker-ghcr.yml rejects a pushed tag
-# that does not match `v16-<release.json.base>-r<N>`.
+# Prefer the short fork-point SHA for `base` (it is the tag component).  A full
+# SHA also works -- .github/workflows/docker-ghcr.yml accepts a tag whose base
+# component is a prefix of the recorded base -- but the short form is the
+# convention in the tag history.
 #   e.g.  ./scripts/make-release.sh \
 #           --base ebbb18522 \
 #           --base-tree "$(git -C ~/llama.cpp rev-parse ebbb18522^{tree})" \

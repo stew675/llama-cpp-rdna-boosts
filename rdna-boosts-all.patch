@@ -281,10 +281,10 @@ index 63d0badd0..ac21d6b4e 100644
  
 diff --git a/common/speculative-adaptive.h b/common/speculative-adaptive.h
 new file mode 100644
-index 000000000..29449304d
+index 000000000..1f8e8a6b5
 --- /dev/null
 +++ b/common/speculative-adaptive.h
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,142 @@
 +#pragma once
 +
 +#include <algorithm>
@@ -294,9 +294,11 @@ index 000000000..29449304d
 +// Single credit-bucket state machine. Every verification result moves a bucket B
 +// by (n_accepted - depth), except that a full accept (n_accepted >= depth) is
 +// flipped to add max(1, n_accepted - 1) instead: a deeper or longer accept is
-+// worth more, so climbing accelerates with depth, and a strong run by another
-+// speculator (which can accept far more than the current depth in one round)
-+// climbs the depth one step per round while it lasts. Any shortfall drains
++// worth more, so climbing accelerates with depth.  Feeding another speculator's
++// rounds (ngram-mod) into this bucket was measured and is deliberately NOT done
++// (see common_speculative_impl_draft_mtp::accept): with this controller's
++// cap - 3 cold start the feed is a no-op, and a weak ngram win on novel content
++// is not evidence about the MTP content.  Any shortfall drains
 +// depth - n_accepted, i.e. a miss of k tokens subtracts k. There is no special
 +// case for truncated drafts: a p_min-truncated draft is just a miss of the
 +// tokens it came up short, which keeps the controller honest about the depth
@@ -377,11 +379,11 @@ index 000000000..29449304d
 +        n_bucket = drop_pressure();
 +    }
 +
-+    // feed one verification result: n_accepted is the number of tokens the
-+    // target accepted this round. When another speculator (ngram-mod) produced
-+    // the accepted draft, callers pass its accepted count (which can exceed the
-+    // current depth), so strong runs by the other speculator are credited like
-+    // full accepts
++    // feed one verification result from this implementation's own draft:
++    // n_accepted is the number of tokens the target accepted this round.  A
++    // round whose accepted draft came from another speculator (ngram-mod) is
++    // NOT fed -- see common_speculative_impl_draft_mtp::accept() and the note
++    // at the top of this file
 +    void update(int n_accepted, int n_max, int n_min_adaptive) {
 +        const int cap   = std::max(1, n_max);
 +        const int floor = std::max(1, n_min_adaptive);
@@ -20857,6 +20859,28 @@ index f2a6f2009..341b741f3 100644
  #define VDR_IQ2_XXS_Q8_1_MMVQ 2
  #define VDR_IQ2_XXS_Q8_1_MMQ  2
  
+diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
+index a6a6b7271..9246dd97b 100644
+--- a/ggml/src/ggml-hip/CMakeLists.txt
++++ b/ggml/src/ggml-hip/CMakeLists.txt
+@@ -117,6 +117,17 @@ if (GGML_HIP_EXPORT_METRICS)
+     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
+ endif()
+ 
++# Silence the "loop not unrolled" flood from the FlashAttention kernels.
++# AMDGPU clang's loop-unroll pass reports every bare `#pragma unroll` it cannot
++# honour, and `fattn-mma-f16.cuh` has several on runtime-bounded loops (the
++# K/V staging loop and the sparse combine path).  That is upstream noise, but
++# the delivery's native-KV arms instantiate the whole WMMA kernel once per KV
++# type per instance TU, which multiplies it into ~10k warning lines per clean
++# build.  The pragmas are advisory hints, the pass already failed, and the code
++# is unaffected, so keep `-Wpass-failed` off for the HIP build only (the flag is
++# a Clang/AMDGPU one; the CUDA toolchains do not emit this diagnostic).
++set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Wno-pass-failed")
++
+ if (NOT GGML_CUDA_FA)
+     add_compile_definitions(GGML_CUDA_NO_FA)
+ endif()
 diff --git a/ggml/src/ggml-moe-weighted-reduction.h b/ggml/src/ggml-moe-weighted-reduction.h
 new file mode 100644
 index 000000000..c90460a45

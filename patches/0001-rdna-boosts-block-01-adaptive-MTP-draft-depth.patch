@@ -1,4 +1,4 @@
-From ffe23bb09703447f281c24a3061e9e11820ff755 Mon Sep 17 00:00:00 2001
+From 7d7950ef708dbd245c067477e5c1f0326c456767 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Wed, 9 Sep 2026 05:29:21 -0500
 Subject: [PATCH 01/15] rdna-boosts: block 01: adaptive MTP draft depth
@@ -107,7 +107,7 @@ bucket constants.
  common/arg.cpp                                |  38 ++-
  common/common.cpp                             |  72 +++++-
  common/common.h                               |  37 ++-
- common/speculative-adaptive.h                 | 140 +++++++++++
+ common/speculative-adaptive.h                 | 142 +++++++++++
  common/speculative.cpp                        | 151 ++++++++++-
  common/speculative.h                          |   5 +
  docs/speculative.md                           |   9 +-
@@ -120,7 +120,7 @@ bucket constants.
  tools/cli/README.md                           |   3 +-
  tools/server/README.md                        |   3 +-
  tools/server/server-context.cpp               |  11 +-
- 16 files changed, 944 insertions(+), 36 deletions(-)
+ 16 files changed, 946 insertions(+), 36 deletions(-)
  create mode 100644 common/speculative-adaptive.h
  create mode 100644 tests/test-recurrent-state-depth.cpp
  create mode 100644 tests/test-speculative-adaptive.cpp
@@ -352,10 +352,10 @@ index 63d0badd0..c2e09784c 100644
          return needs_rs_seq ? draft.n_max : 0u;
 diff --git a/common/speculative-adaptive.h b/common/speculative-adaptive.h
 new file mode 100644
-index 000000000..29449304d
+index 000000000..1f8e8a6b5
 --- /dev/null
 +++ b/common/speculative-adaptive.h
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,142 @@
 +#pragma once
 +
 +#include <algorithm>
@@ -365,9 +365,11 @@ index 000000000..29449304d
 +// Single credit-bucket state machine. Every verification result moves a bucket B
 +// by (n_accepted - depth), except that a full accept (n_accepted >= depth) is
 +// flipped to add max(1, n_accepted - 1) instead: a deeper or longer accept is
-+// worth more, so climbing accelerates with depth, and a strong run by another
-+// speculator (which can accept far more than the current depth in one round)
-+// climbs the depth one step per round while it lasts. Any shortfall drains
++// worth more, so climbing accelerates with depth.  Feeding another speculator's
++// rounds (ngram-mod) into this bucket was measured and is deliberately NOT done
++// (see common_speculative_impl_draft_mtp::accept): with this controller's
++// cap - 3 cold start the feed is a no-op, and a weak ngram win on novel content
++// is not evidence about the MTP content.  Any shortfall drains
 +// depth - n_accepted, i.e. a miss of k tokens subtracts k. There is no special
 +// case for truncated drafts: a p_min-truncated draft is just a miss of the
 +// tokens it came up short, which keeps the controller honest about the depth
@@ -448,11 +450,11 @@ index 000000000..29449304d
 +        n_bucket = drop_pressure();
 +    }
 +
-+    // feed one verification result: n_accepted is the number of tokens the
-+    // target accepted this round. When another speculator (ngram-mod) produced
-+    // the accepted draft, callers pass its accepted count (which can exceed the
-+    // current depth), so strong runs by the other speculator are credited like
-+    // full accepts
++    // feed one verification result from this implementation's own draft:
++    // n_accepted is the number of tokens the target accepted this round.  A
++    // round whose accepted draft came from another speculator (ngram-mod) is
++    // NOT fed -- see common_speculative_impl_draft_mtp::accept() and the note
++    // at the top of this file
 +    void update(int n_accepted, int n_max, int n_min_adaptive) {
 +        const int cap   = std::max(1, n_max);
 +        const int floor = std::max(1, n_min_adaptive);

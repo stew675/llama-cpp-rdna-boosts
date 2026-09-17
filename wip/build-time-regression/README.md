@@ -1,6 +1,7 @@
 # Build-time regression: the delivery's own FA instantiations (2026-09-15, r5)
 
-**Status: the `fattn-tile` half is FIXED and VERIFIED in `v16-790cf51aa-r5`.  The `fattn-mma-f16`
+**Status: the `fattn-tile` half is FIXED and VERIFIED in `v16-790cf51aa-r5`; the unroll-warning flood
+is FIXED in `v16-ebbb18522-r2` (suppressed, see the unroll section).  The `fattn-mma-f16` compile-time
 half is DIAGNOSED, NOT FIXED — it needs a code-path change with its own A/B (see "Remaining").**
 
 ## The report
@@ -62,17 +63,27 @@ an A/B: (a) finer generated-file granularity (one file per head-size -> ~150 TUs
 total work), or (b) make the WMMA loader's KV type a runtime dispatch (one kernel copy, ~8x less code,
 at the cost of a uniform branch in the tile load).  See `TODO.md`.
 
-## The unroll warnings (upstream noise, amplified by us)
+## The unroll warnings (upstream noise, amplified by us) — FIXED in r2
 
-The full build emits **10,362** `warning: loop not unrolled ... [-Wpass-failed=transform-warning]` lines,
+The full build used to emit **10,362** `warning: loop not unrolled ...
+[-Wpass-failed=transform-warning]` lines,
 and **every one** comes from `fattn-mma-f16.cuh` (attributed to the kernel's declaration line,
-`2047:24`); nothing else in the backend emits any.  `-Rpass-missed=loop-unroll` on one instance file
+`2049:24`); nothing else in the backend emits any.  `-Rpass-missed=loop-unroll` on one instance file
 localises them to the bare `#pragma unroll` loops whose bounds are runtime values — dominantly
 `fattn-mma-f16.cuh:421` (`for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k)`, 4148 remarks in one
 file), with `1979:17`/`1997:21` (the `use_sparse` combine path) next.  Those pragmas are **upstream's**
 and exist identically at the base; there are no forced `#pragma unroll N` in the file.  The *count* is
 ours: it scales with the instantiation count that root cause 2 multiplied.  They are warnings, not
 errors, and the loops still compile — the flood is log noise (10k lines per build).
+
+**Fix (`v16-ebbb18522-r2`, block 15):** `ggml/src/ggml-hip/CMakeLists.txt` appends
+`-Wno-pass-failed` to `CMAKE_HIP_FLAGS`.  The hints are advisory and the unroll pass already failed,
+so this is a diagnostic-only change (no codegen).  Verified on the worst TU
+(`fattn-mma-f16-instance-ncols1_8-ncols2_4.cu`): **1692 -> 0** `-Wpass-failed` warnings, and the clean
+build now warns only on upstream's pre-existing `llama-kv-cache.h` unused field.  HIP-only: the
+diagnostic is a Clang/AMDGPU one and the CUDA toolchains do not emit it.  The proper upstream fix (drop
+the bare `#pragma unroll` from the runtime-bounded loops, or the runtime KV-type dispatch of root
+cause 2) is still worth an upstream PR — see `upstream/`.
 
 ## Zero-runtime-change verification (the fix is build-time only)
 

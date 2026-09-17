@@ -1,5 +1,38 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-17 (r2) — `v16-ebbb18522-r2`: FA unroll-warning flood + block-01 comment; CI tag guard
+
+**Release.** `v16-ebbb18522-r2`, fork point `ebbb18522` (unchanged).  Canonical 16-block tip
+**`31b1790372d17bf7f95f3e15f7b4e2b35eb661e1`**, net tree **`7dc63cb3c93aa1cd74435698f045f93d2ee3a9e6`**;
+strict 16/16 `git am`, build + `FLASH_ATTN_EXT` 5952/5952, coherence gate clean.  Two block amendments
+plus a CI fix:
+
+* **Block 15 — the "loop not unrolled" flood is gone.**  A clean build printed **10,362**
+  `warning: loop not unrolled ... [-Wpass-failed=transform-warning]` lines, every one from
+  `fattn-mma-f16.cuh` (attributed to the kernel's declaration line).  The FA kernels carry bare
+  `#pragma unroll` hints on runtime-bounded loops (the K/V staging loop, `fattn-mma-f16.cuh:421`, plus
+  the sparse combine path); AMDGPU clang reports every hint it cannot honour.  That is upstream noise,
+  but the delivery's native-KV arms instantiate the whole WMMA kernel once per KV type per instance TU,
+  which multiplied it.  `ggml/src/ggml-hip/CMakeLists.txt` now appends **`-Wno-pass-failed`** to
+  `CMAKE_HIP_FLAGS` (HIP-only; the diagnostic is Clang/AMDGPU).  The hints are advisory and the pass
+  already failed, so there is no codegen change -- verified on the worst TU
+  (`fattn-mma-f16-instance-ncols1_8-ncols2_4.cu`: **1692 -> 0** warnings), and the rebuilt tree is
+  clean apart from upstream's pre-existing `-Wunused-private-field`.  Details and the measurements:
+  `wip/build-time-regression/README.md`.
+* **Block 01 — the adaptive-controller comment no longer contradicts the code.**
+  `common/speculative-adaptive.h` documented an ngram-mod acceptance feed ("a strong run by another
+  speculator ... climbs the depth one step per round") that `common_speculative_impl_draft_mtp::accept`
+  deliberately does **not** do.  The comment now states the actual behaviour and points at the accept()
+  site; the delivery's 2026-09-17 investigation measured the old `bucketed-adaptive-mtp` gated feed and
+  found it a no-op with the re-tuned controller (`benchmarks/2026-09-17-mtp-ngram-combo.md`).
+* **CI — the release tag guard no longer requires a short SHA in `release.json.base`.**  The first
+  `v16-ebbb18522-r1` tag push (run 35218177859) failed the prepare job with
+  `tag v16-ebbb18522-r1 must match v16-ebbb185227c31f1652f1445e2623563d2f67fe5a-r<N>` because the
+  manifest had been generated with the full fork-point SHA.  The data was corrected and the tag re-cut
+  (run 35218381572), and `.github/workflows/docker-ghcr.yml` now accepts a tag whose base component is
+  a >=7-char **prefix** of the recorded base, so either form works; `scripts/make-release.sh` documents
+  the short-form convention.
+
 ## 2026-09-17 (re-base onto upstream master `ebbb18522`) — release `v16-ebbb18522-r1`
 
 **Release.** Fork point upstream master **`ebbb18522`** ("openvino : Update OpenVINO to 2026.4; fix

@@ -1,4 +1,4 @@
-From 6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e Mon Sep 17 00:00:00 2001
+From 31b1790372d17bf7f95f3e15f7b4e2b35eb661e1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -276,6 +276,14 @@ that emits them differs.  Verified: `test-backend-ops -o FLASH_ATTN_EXT` 5951/59
 the 27B prose text hashes bit-identical to the pre-amendment build (q8_0 472b282950b5, q4_0
 118eb7f5fe85, f16 70960317a203), and `tg64@32768`/`pp8192` reproduce the recorded values within
 run-to-run noise across five KV types.
+
+Amended 2026-09-17: the HIP build now passes `-Wno-pass-failed`.  The FA
+kernels carry bare `#pragma unroll` hints on runtime-bounded loops, so AMDGPU
+clang reports every one it cannot honour; the native-KV arms instantiate the
+WMMA kernel per KV type per instance TU and multiply that into ~10k "loop not
+unrolled" warning lines per clean build.  The hints are advisory and the pass
+already failed, so the build output is unchanged -- only the flood is gone.
+HIP-only (the diagnostic is Clang/AMDGPU).  See wip/build-time-regression/.
 ---
  ggml/include/ggml.h                  |  31 +-
  ggml/src/ggml-alloc.c                |  35 ++
@@ -291,6 +299,7 @@ run-to-run noise across five KV types.
  ggml/src/ggml-cuda/fattn.cu          |  68 ++-
  ggml/src/ggml-cuda/ggml-cuda.cu      |   6 +
  ggml/src/ggml-cuda/indexer-topk.cu   |  74 +++-
+ ggml/src/ggml-hip/CMakeLists.txt     |  11 +
  ggml/src/ggml.c                      |  99 ++++-
  src/llama-context.cpp                | 146 ++++++-
  src/llama-cparams.h                  |   5 +
@@ -302,7 +311,7 @@ run-to-run noise across five KV types.
  src/llama-memory-hybrid-idx.h        |  17 +-
  src/models/qwen4exp.cpp              | 338 ++++++++++++---
  tests/test-backend-ops.cpp           |  55 ++-
- 25 files changed, 2532 insertions(+), 258 deletions(-)
+ 26 files changed, 2543 insertions(+), 258 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 74def376c..358bc74d0 100644
@@ -2736,6 +2745,28 @@ index b15af7104..1b9e63516 100644
 +        (additive != nullptr || dst->src[3] != nullptr || dst->src[5] != nullptr) &&
          dst->type == GGML_TYPE_I32;
  }
+diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
+index a6a6b7271..9246dd97b 100644
+--- a/ggml/src/ggml-hip/CMakeLists.txt
++++ b/ggml/src/ggml-hip/CMakeLists.txt
+@@ -117,6 +117,17 @@ if (GGML_HIP_EXPORT_METRICS)
+     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
+ endif()
+ 
++# Silence the "loop not unrolled" flood from the FlashAttention kernels.
++# AMDGPU clang's loop-unroll pass reports every bare `#pragma unroll` it cannot
++# honour, and `fattn-mma-f16.cuh` has several on runtime-bounded loops (the
++# K/V staging loop and the sparse combine path).  That is upstream noise, but
++# the delivery's native-KV arms instantiate the whole WMMA kernel once per KV
++# type per instance TU, which multiplies it into ~10k warning lines per clean
++# build.  The pragmas are advisory hints, the pass already failed, and the code
++# is unaffected, so keep `-Wpass-failed` off for the HIP build only (the flag is
++# a Clang/AMDGPU one; the CUDA toolchains do not emit this diagnostic).
++set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Wno-pass-failed")
++
+ if (NOT GGML_CUDA_FA)
+     add_compile_definitions(GGML_CUDA_NO_FA)
+ endif()
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 index 34b458086..2ce34caf0 100644
 --- a/ggml/src/ggml.c

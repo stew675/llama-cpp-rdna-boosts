@@ -3,11 +3,16 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`ebbb18522`**
 (re-based 2026-09-17 from `d1d3c3396`).
 
-**Current release: `v16-ebbb18522-r1`** — canonical tip
-`6b1e9ffd1e5aef56534ba5ffe9f515f5ae31118e`, tree
-`d751f42d05cc4770189f4a5250cc4aea4fea8e08`.  Strict 16/16 `git am`; build +
+**Current release: `v16-ebbb18522-r2`** — canonical tip
+`31b1790372d17bf7f95f3e15f7b4e2b35eb661e1`, tree
+`7dc63cb3c93aa1cd74435698f045f93d2ee3a9e6`.  Strict 16/16 `git am`; build +
 `test-backend-ops` **18083/18083** on gfx1201 (`FLASH_ATTN_EXT` 5952/5952,
-`FLASH_ATTN_QSA` 22/22).
+`FLASH_ATTN_QSA` 22/22).  r2 (2026-09-17) folds in two amendments on top of r1:
+**block 15** adds `-Wno-pass-failed` to the HIP build flags (a clean build printed ~10k "loop not
+unrolled" warnings from the FA kernels' bare `#pragma unroll` hints, amplified by the native-KV
+instantiations — no codegen change), and **block 01** corrects the `common/speculative-adaptive.h`
+comment that claimed an ngram-mod acceptance feed the code deliberately does not do.  See
+`../WORKLOG.md` 2026-09-17 (r2) and `../wip/build-time-regression/README.md`.
 
 The 2026-09-17 re-base resolved three blocks:
 
