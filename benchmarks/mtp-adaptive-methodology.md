@@ -16,6 +16,12 @@ post-fix). All runs on 3x R9700 (gfx1201), ROCm 7.14
 (GOLDEN RULE 1: without the pin llama.cpp layer-splits and decode drops
 ~97 -> ~81 t/s on the MoE model).
 
+**2026-09-17 update:** the re-base onto `ebbb18522` picked up upstream #28549 ("Enable CUDA graph for
+MTP draft"), which the isolated A/B now shows is worth **+0.3-1.4 %** on the four-axis adaptive gate
+(scaling with draft depth) for free — see `2026-09-17-mtp-pr28549-ab.md`.  The MTP reference cell for
+those measurements is the 2-card Q8_0 Qwen3.8-27B row below; it reproduces the recorded 2026-09-16
+numbers within ~1-2 %.
+
 ## Why decode benches cannot see MTP regressions
 
 MTP adds two decode shapes that plain decode never produces:

@@ -51,6 +51,17 @@ delivery build (`8465f08b9`) on the same machine: `tg128` identical (1 GPU 96.13
 3-GPU 119.30 vs 119.32 t/s) and prefill equal within run-to-run variation (order-reversed pp4096
 runs: rebase 7385.7/7346.5 vs old 7365.8/7332.2 t/s).  No regression.
 
+**MTP revalidation — upstream #28549 (`Enable CUDA graph for MTP draft`) helps us.**  Isolated A/B on
+the MTP reference cell (2x R9700 gfx1201, GPUs 1,2 `-sm tensor -ts 1/1`, f16 KV,
+`/llm/models/Qwen3.8/27B/Q8_0/Qwen3.8-27B-Q8_0.gguf`, built-in NextN head, adaptive cap 12,
+`-n 3000`): reverting just `2f3fd0252` on the re-based tree costs **+0.3 % (reasoning, mean len 2.95),
++0.25 % (prose, 5.10), +0.85 % (code, 7.11), +1.43 % (recall, 11.13)** — a win that scales with draft
+depth, with byte-identical acceptance and mean length on every axis.  The PR is host-side
+`llama_context` bookkeeping (`gf_res_prev` split by `n_outputs > 0`), so the MTP draft context's
+alternating `process()`/`draft()` graphs finally keep a warm, replayable HIP graph; no HIP-specific
+work is needed.  Full record + commands: `benchmarks/2026-09-17-mtp-pr28549-ab.md`.  This also
+reproduces the recorded 2026-09-16 cell within ~1-2 %.
+
 **Not revalidated here (hardware unavailable):** gfx1151 (the block-14 `RDNA3` gate fix and the
 qwen4exp MTP purity gates), gfx1100, and the qwen4exp prefill/perplexity path (no qwen4exp model on
 this host) — the upstream hc-op change follows upstream's validated path, and the RDNA3.5 gate fix
