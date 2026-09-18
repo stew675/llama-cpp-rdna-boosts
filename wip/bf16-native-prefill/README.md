@@ -94,6 +94,43 @@ B is the target: keep the native read (no scratch, no pass) and make the access
 pattern match the dense copy.  If B is not achievable, C is the only route to
 true parity, and A is a partial (single-KV-head) win.
 
+## Findings (2026-09-18, second pass — roasted profile, root cause CORRECTED)
+
+`rocprofv3` per-kernel profile, Qwen3.6-35B-A3B-Q8_0, `-sm layer`, 2×R9700, `-fa 1`,
+pp8192, `GGML_CUDA_FA_KV_NATIVE=1`; staged = 512 MiB cap, native =
+`GGML_CUDA_FA_STAGE_MAX_MB=1`.  Raw traces in `profiles/`.
+
+**The recorded root cause (the GQA de-interleave) is WRONG, and the fix candidates
+built on it (B — reorder the loader; C — head-major cache) are aimed at the wrong
+3 %.**  The three arms, total time in the MMA FA kernel
+(`flash_attn_ext_f16<256,256,8,8,false,false,false>`, 320 dispatches):
+
+| arm | K/V read | loader | FA kernel | Δ vs staged |
+|---|---|---|---|---|
+| bf16 staged | dense F16 copy (de-interleaved by `to_fp16_nc`) | F16 copy | 213.2 ms | — |
+| **f16 cache** | raw, **interleaved** | F16 copy (no conversion) | **219.3 ms** | **+2.9 %** |
+| bf16 native | raw, interleaved | converting bf16 loader | 276.6 ms | +29.8 % |
+
+* **Layout (dense vs interleaved) = ~3 %** (213.2 -> 219.3, same F16 loader).
+* **The in-register bf16→f16 conversion = ~26 %** (219.3 -> 276.6).  It is re-paid on
+  **every K/V tile re-read**, whereas the launcher's staging pass converts each element
+  once (the whole-run conversion is only 19.5 ms over 640 dispatches, vs +63 ms added to
+  the FA kernel).
+* End-to-end at pp8192 the FA kernel is a small fraction of a MoE model's work, so the
+  whole-run penalty stays ~1.2 % even though the kernel is ~30 % slower.
+
+The real structural gap: **decode (TILE kernel, block 03) computes in native bf16; prefill
+(the MMA kernel) is F16-only.**  V5 is a native *read* with an f16 *compute* — i.e. no
+F16 removal at all.  See HANDOVER §"Direction" for the two routes.
+
+`profiles/`: `staged/` (f16 arm), `native/` (bf16 native), and the bf16-staged arm
+(re-runnable; its aggregate is the 213.2 ms row above).  `tools/agg-kernels.py` and
+`tools/fa-stats.py` do the aggregation.
+
+**Tooling note:** `rocprofv3` on this box aborts in its rocpd/SQLite writer
+(`ROCPD_STATUS_ERROR_SQL_SCHEMA_INVALID_VERSION`) and then hangs in its signal handler.
+Always pass `--output-format csv` to bypass that path (`tools/profile-fa.sh` does).
+
 ## Findings (2026-09-18, first measurement pass)
 
 `llama-bench`, `-sm layer`, 2×R9700, `-fa 1`, `GGML_CUDA_FA_KV_NATIVE=1`;

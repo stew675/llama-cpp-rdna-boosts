@@ -69,9 +69,11 @@ call sites, design, ship rule, the 5-part validation protocol).  V4 is the templ
   and there is no staging.  So the penalty is a **prefill/MMA** phenomenon.
 * **`cp_async` is NVIDIA-only** (`common.cuh:373`), so on RDNA4 both loaders are the synchronous
   `ggml_cuda_memcpy_1<16>` path; the difference is dense-vs-interleaved addressing, not async.
-* **The F16 staging pass is also a de-interleave**: `launch_fattn` runs `to_fp16` over the whole cache
+* **The F16 staging pass is also a de-interleave**: `launch_fattn` runs `to_fp16_nc` over the whole cache
   view and rewrites the strides to dense (`nb11 = ne[0]*sizeof(half)`, `nb12 = ne[1]*nb11`, …)
-  before the kernel reads it.
+  before the kernel reads it.  *(Confirmed in code: `ggml_is_contiguously_allocated(K)` is false for the
+  FA view, so the `to_fp16_nc` branch runs and the copy really is dense.  **But §4's correction shows
+  this dense layout is worth only ~3 % of the kernel time — it is not why staging wins.**)*
 * **An f16 cache can never be staged** (f16 *is* the staging type), so f16 is stuck on the native
   side too — the dense staged copy is currently the fastest path for any type.
 
@@ -118,14 +120,35 @@ pp8192 −1.1 %, tg128 +0.1 %.
 
 ## 4. Hypotheses (ranked) and what each experiment decides
 
+> ### CORRECTED 2026-09-18 (second pass) — read this first
+>
+> **H4 was right, H1 is ~3 %.**  The profile (35B-A3B pp8192, MMA FA kernel total) is:
+> bf16 staged 213.2 ms / **f16 cache (interleaved, no conversion) 219.3 ms (+2.9 %)** /
+> bf16 native (converting loader) 276.6 ms (+29.8 %).  So the interleaved layout costs
+> ~3 % and **the in-register bf16→f16 conversion costs ~26 %** — re-paid on every K/V
+> tile re-read, unlike the launcher's once-per-element staging pass.  §2's
+> "the F16 staging pass is really a de-interleave" is *not* the reason staging wins.
+>
+> **Do NOT pursue candidates B (reorder the loader) or C (head-major cache) for this
+> penalty** — they target the 3 %.  A (dense-layout gate) is likewise only the 3 %.
+> The real structural gap is that **the MMA kernel is F16-only** (decode's TILE kernel
+> already computes in native bf16): V5 is a native *read* with an f16 *compute*.
+> §6's routes now reduce to (1) cheapen the conversion, keeping f16 WMMA and
+> bit-identity (ceiling ~+6 % vs staged if the conversion were free), or (2) give the
+> MMA kernel a **bf16 WMMA** path and delete the conversion (the actual "no F16" fix;
+> `mma.cuh:1267` already has the RDNA4 bf16 builtin — but Q must become bf16 too, so
+> the logits change and V5-on/off is no longer bit-identical).  Details in README.md
+> "Findings (2026-09-18, second pass)".  Profiling recipe: `tools/profile-fa.sh`
+> (uses `--output-format csv`; the default rocpd/SQLite writer aborts and hangs here).
+
 | # | hypothesis | test that decides it |
 |---|---|---|
-| H1 | the interleaved native layout is the cost, and it scales with the stride | controlled microbench (one model, vary layout/stride); or two same-size different-`n_head_kv` models |
-| H2 | the cost is the **number of K/V re-reads** (layers × query tiles), not the stride | profile K/V tile-load traffic vs layers; compare a many-layer vs few-layer model at the same stride |
-| H3 | the 4B/35B inversion is a **boundness** artefact (compute-bound masks it) | run the 4B at a large-enough batch/context to become memory-bound, or the 35B at a small batch |
-| H4 | it is something else in the loader (register pressure, address math, the `el_off` path, conversion ALU) | `rocprofv3` counters; `bf16 native` vs `f16 cache` should be ~0 if H4 is false |
+| H1 | the interleaved native layout is the cost, and it scales with the stride | **MEASURED: ~3 %.**  f16 cache (interleaved, F16 loader, no convert) vs bf16 staged (dense) |
+| H2 | the cost is the **number of K/V re-reads** (layers × query tiles), not the stride | subsumed: the re-read *amplifies* the conversion (H4), it is not itself the cost |
+| H3 | the 4B/35B inversion is a **boundness** artefact (compute-bound masks it) | confirmed in effect: the FA share of total work sets the end-to-end size (kernel +30 % -> run +1.2 % on a MoE) |
+| H4 | it is something else in the loader (register pressure, address math, the `el_off` path, conversion ALU) | **MEASURED: ~26 % — the bf16->f16 conversion in the staging loop.**  f16 cache 219.3 vs bf16 native 276.6 |
 
-**H1/H2 are the live ones.  Do not design a fix until the profile distinguishes them.**
+**H4 is the answer; design the fix around removing/cheapening the conversion, not the layout.**
 
 ---
 
@@ -165,18 +188,21 @@ pp8192 −1.1 %, tg128 +0.1 %.
 
 ---
 
-## 6. Fix candidates (pick after §5)
+## 6. Fix candidates (REVISED 2026-09-18 — the profile re-aimed these)
+
+The original A-D table targeted the *layout* (measured ~3 %).  The penalty is the *conversion*
+(~26 %), so the routes are now:
 
 | # | idea | effort | notes |
 |---|---|---|---|
-| **A** | restrict the native arm to already-dense layouts (`nb[1] == ne[0]*2`, i.e. `n_head_kv == 1`) where staging buys nothing | small | partial only; the common GQA case is untouched.  Still worth shipping as a correctness-of-claim improvement. |
-| **B** | **read the native staging densely** — reorder the tile loader / process all K/V heads of a token together (the `ncols2` axis) so the interleaved view is traversed as a contiguous `n_embd_k_gqa` block | medium | the target.  Needs the profile to say *which* access is costly; may require touching `ncols2` selection and the loader's `i`/`k` loop nest. |
-| **C** | make the KV cache head-major (`[n_head_kv][n_kv][dim]`) | large | removes the root cause for every kernel/backend, but touches the cache update (`set_rows`), quant/split paths and every FA loader.  Likely upstream scope, not a WIP deliverable. |
-| D | keep a dense staging copy but as a pure bf16→bf16 de-interleave, no conversion | ? | keeps the pass and the scratch, so it cannot reach the native memory win; only interesting if a bf16 copy is genuinely cheaper than the strided read. |
+| **1** | **cheapen the in-register bf16→f16 conversion** (fewer ISA ops / better scheduling / wider chunks) | small-medium | keeps the f16 WMMA and therefore remains **bit-identical** to the staged path (bf16→f16 is exact in range, so only the loader changes).  Ceiling is real: if the conversion were free, native ≈ 219 ms vs staged ≈ 232.5 ms (213 + the 19.5 ms conversion pass) — **up to ~6 % *faster* than staged**.  But it will not be free; expect partial recovery.  This is the only route that preserves the current ship guarantee. |
+| **2** | **give the MMA kernel a bf16 WMMA path** and delete the conversion — the actual "no F16 anywhere" fix and the only route to *true* parity/win | medium-large | `mma.cuh:1267` already has `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12` (used by the GDN work) and `bf16_mma_hardware_available()` exists; the TILE kernel already does exactly this for decode.  **Catch:** WMMA needs both operands the same type, so **Q (f32 today) must round to bf16** (7 vs 10 mantissa bits) — K/V stay lossless.  So prefill logits change and **V5-on is no longer bit-identical to staged-off**; it would instead make prefill match decode's existing bf16 precision (arguably *more* consistent).  Needs a re-baseline and maintainer sign-off. |
+| 3 | keep the head-major cache (old **C**) or reorder the tile loader (old **B**) | large / medium | **deprioritized**: each buys only the ~3 % layout share.  Do not start here. |
+| 4 | old **A** — restrict the native arm to already-dense layouts (`n_head_kv == 1`) | small | still a valid correctness-of-claim tidy-up (there the compact read is free), but it does not touch the GQA case. |
 
 Ship rule to respect (maintainer's D9 refinement): a sub-2 % loss with a large memory win and **no
-cheap fix** ships *opt-in*.  So option B/C failing means the honest outcome is "V5 stays opt-in" plus
-the measured reason — not forcing a change.
+cheap fix** ships *opt-in*.  Route 1 failing means the honest outcome is "V5 stays opt-in" plus the
+measured reason; route 2 is a numerical change and is a maintainer decision, not a tuning result.
 
 ---
 
