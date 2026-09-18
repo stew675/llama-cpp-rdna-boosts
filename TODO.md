@@ -92,6 +92,25 @@ experiment is **validated but not yet promoted**; Action E is resolved (no deliv
 
 ## Active (kept compact: only what this repo will work on next)
 
+### 23. Native bf16 prefill parity (the V5 penalty)
+
+**Opened 2026-09-18.**  Block 15's V5 arm (`GGML_CUDA_FA_KV_NATIVE=1`) reads bf16 K/V natively in the
+MMA FA kernel and removes the F16 staging scratch, so a **bf16 cache costs what an f16 cache costs**
+(memory + output).  It is **~1-2 % slower at prefill** than bf16-with-staging, which is why it ships
+opt-in — the repo's "native BF16 support" arc is not at parity.  **Root cause (recorded by the V5
+campaign):** the F16 staging pass is really a *de-interleave*; the raw WMMA cache interleaves the GQA
+heads (`nb[1]` = 4 rows for the 27B's 4 K/V heads), and the tile loader re-reads that strided view on
+every K/V staging pass, whereas the staged F16 copy is dense.  The conversion is **free** (native bf16
+is within **0.17 %** of an f16 cache), and `cp_async` is NVIDIA-only, so it is purely the access
+pattern.  **Goal:** native bf16 at prefill parity (or faster) so V5 can be default-on and the arena
+blind spot disappears.  **First experiments:** confirm the GQA-ratio scaling (a `n_head_kv == 1` model
+should show a free native arm), then profile (`rocprofv3`) native vs staged memory-pipe/L2.  **Fix
+candidates:** (A) restrict the arm to already-dense `nb[1] == ne[0]*2` layouts (small, partial),
+(B) read the native staging densely / process all K/V heads of a token together (medium, the target),
+(C) make the KV cache head-major (large, upstream scope).  Full brief, measured table, protocol and
+references: [`wip/bf16-native-prefill/README.md`](wip/bf16-native-prefill/README.md); the V5 plan:
+`archive/work/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`.
+
 ### 22. Adaptive-MTP behaviour after recent performance tuning — climb/drop retune (issue #35)
 
 **Tracked as issue [#35](https://github.com/stew675/llama-cpp-rdna-boosts/issues/35)** (split out of
