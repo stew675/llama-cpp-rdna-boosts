@@ -3,11 +3,17 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`ebbb18522`**
 (re-based 2026-09-17 from `d1d3c3396`).
 
-**Current release: `v16-ebbb18522-r2`** — canonical tip
-`31b1790372d17bf7f95f3e15f7b4e2b35eb661e1`, tree
-`7dc63cb3c93aa1cd74435698f045f93d2ee3a9e6`.  Strict 16/16 `git am`; build +
+**Current release: `v16-ebbb18522-r3`** — canonical tip
+`3d71f34794b2ec929ac92314e0091722c478956b`, tree
+`3f3dfcfaa1795e9bd475d56ea695b90daea5b5fa`.  Strict 16/16 `git am`; build +
 `test-backend-ops` **18083/18083** on gfx1201 (`FLASH_ATTN_EXT` 5952/5952,
-`FLASH_ATTN_QSA` 22/22).  r2 (2026-09-17) folds in two amendments on top of r1:
+`FLASH_ATTN_QSA` 22/22).  **r3 (2026-09-18) fixes the `--fit` startup SIGSEGV with
+`--spec-type draft-mtp-adaptive` and a minimal per-tier MTP head (issue #38)**: the fit path's
+`spec_mtp` detection tested only `COMMON_SPECULATIVE_TYPE_DRAFT_MTP`, so the MTP context was fitted
+with the default `ctx_type` (full-model graph) and the minimal head's missing tensors produced a null
+`ggml_mul_mat` operand; it now uses `params.speculative.has_mtp()` like every other detection site.
+See the 2026-09-18 block-01 amendment section below and `../WORKLOG.md` 2026-09-18 (r3).  r2
+(2026-09-17) folds in two amendments on top of r1:
 **block 15** adds `-Wno-pass-failed` to the HIP build flags (a clean build printed ~10k "loop not
 unrolled" warnings from the FA kernels' bare `#pragma unroll` hints, amplified by the native-KV
 instantiations — no codegen change), and **block 01** corrects the `common/speculative-adaptive.h`
@@ -32,10 +38,50 @@ The 2026-09-17 re-base resolved three blocks:
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
 
+## 2026-09-18 block-01 amendment (r3): the `--fit` SIGSEGV with `draft-mtp-adaptive` (issue #38)
+
+**Release** `v16-ebbb18522-r3`, canonical tip `3d71f34794b2ec929ac92314e0091722c478956b`, net tree
+`3f3dfcfaa1795e9bd475d56ea695b90daea5b5fa`.  Block 01 is amended with **one line in
+`common/common.cpp`**; blocks 00 and 02-15 are content-identical (the net tree differs from r2's
+`7dc63cb3c…` in that one hunk).
+
+**Symptom.**  `--spec-type draft-mtp-adaptive` with a minimal per-tier MTP head SIGSEGVs during
+startup in the `--fit` probe (`common_params_fit_impl` → `common_get_device_memory_data_impl` →
+`llama_init_from_model` → `sched_reserve` → `graph_reserve`), before generation.  `--spec-type
+draft-mtp` with the same head and `--fit off` both work.  Reproduced on 2× R9700 gfx1201 with the
+EfficientThink 27B Q8_0 + `mtp-Qwen3.8-27B-Q4_0.gguf` (qwen35, 18 tensors): `-sm layer` crashes,
+`-sm tensor` does not run `--fit` at all (see below).
+
+**Root cause.**  Block 01 added the `COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE` type and switched
+most detection sites to `params.speculative.has_mtp()` (which covers both), but the `--fit` path in
+`common_init_result` still carried the pre-adaptive manual find for `COMMON_SPECULATIVE_TYPE_DRAFT_MTP`
+only.  With `draft-mtp-adaptive` `spec_mtp` was therefore false, so `cparams_dft.ctx_type` was left at
+`LLAMA_CONTEXT_TYPE_DEFAULT` and the extra model (the MTP head) was fitted as a **full model** — the
+minimal head has no full-model tensors, so `llama_model_qwen35::graph::build_qkvz` → `build_lora_mm`
+reached `ggml_mul_mat` with a null weight.  `draft-mtp` was unaffected because it set `ctx_type =
+LLAMA_CONTEXT_TYPE_MTP`, matching what `common_speculative_init_result` actually creates at runtime.
+
+**Fix.**  `common/common.cpp`: `const bool spec_mtp = params.speculative.has_mtp();` — the same
+detection the speculative init, the server context and the argument handlers already use, so the
+fit probe now measures the MTP context with the type the runtime will build (and the memory estimate
+for adaptive matches `draft-mtp`).  No other manual MTP-only find remained in a detection position
+(the two left are the `draft-mtp`+`draft-mtp-adaptive` conflict check and the GGUF/sidecar type
+inference, both intentional).
+
+**Verification.**  `-sm layer`, 2 GPUs, Qwen3.8-27B EfficientThink Q8_0 + the minimal MTP head,
+`--spec-type draft-mtp-adaptive`, `--fit` on: **fixed** (was SIGSEGV).  Isolation matrix —
+`--spec-type none` baseline, `draft-mtp-adaptive --fit off`, `draft-mtp-adaptive --fit on`,
+`draft-mtp --fit on`, and `draft-mtp-adaptive -sm tensor` — all exit 0 and produce the same greedy
+text `5dca93fd0986` (255 chars), i.e. the fix is greedy-pure against the workaround and the plain
+decode.  `-sm tensor` never reaches the crash because `common_params_fit_impl` aborts for
+`LLAMA_SPLIT_MODE_TENSOR` (`--fit` is documented as unsupported there; that is a pre-existing
+upstream limitation, untouched by the delivery — `common/fit.cpp` is upstream code and no block
+modifies it).
+
 | patch | content |
 |---|---|
 | `0000` | **structural and architecture fixes** — FA small-batch KV-split width invariance (issue #25: decode and every speculative verify width now reduce identically, so greedy output no longer changes with the MTP draft length) + Vulkan masked-V/freed-cell fixes (dead columns never read V). Added 2026-09-10; this is the base every other block applies on top of. |
-| `0001` | adaptive MTP draft depth | **refreshed 2026-09-09 to the upstream PR #27210 review head** (`d236d41a2`; review-round feedback-handling, option validation + docs) — see the 2026-09-09 block-01 refresh section below.  **amended 2026-09-11: `--spec-draft-n-max` is capped at 7** (`common/common.cpp`, a clamp with a visible `E`-level notice naming the `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` escape hatch, + the `max: 7` help string in `common/arg.cpp`) — see the 2026-09-11 (12) section below.  **amended 2026-09-13 (issue #30): the cap is raised from 7 to 15** — the 15 is the recurrent rollback snapshot bound (`n_max + 1 = K <= 16`, the constant the K-independent chunked-GDN threshold was built around), and purity above 7 is now an explicit warned trade instead of a clamp: any depth 8..15 is kept with a visible notice that `--spec-type none` and `draft-mtp` may no longer be bit-identical (a verify wider than 8 rows switches FA and matmul kernel families), while `> 15` is clamped to 15.  Ships with the new `tests/test-recurrent-state-depth` snapshot sweep (n_rs_seq 1..15, the whole rollback range, incl. deep drafts) — see the 2026-09-13 issue-#30 section below and `../GREEDY-PURITY.md` §11/§19.
+| `0001` | adaptive MTP draft depth | **refreshed 2026-09-09 to the upstream PR #27210 review head** (`d236d41a2`; review-round feedback-handling, option validation + docs) — see the 2026-09-09 block-01 refresh section below.  **amended 2026-09-11: `--spec-draft-n-max` is capped at 7** (`common/common.cpp`, a clamp with a visible `E`-level notice naming the `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` escape hatch, + the `max: 7` help string in `common/arg.cpp`) — see the 2026-09-11 (12) section below.  **amended 2026-09-13 (issue #30): the cap is raised from 7 to 15** — the 15 is the recurrent rollback snapshot bound (`n_max + 1 = K <= 16`, the constant the K-independent chunked-GDN threshold was built around), and purity above 7 is now an explicit warned trade instead of a clamp: any depth 8..15 is kept with a visible notice that `--spec-type none` and `draft-mtp` may no longer be bit-identical (a verify wider than 8 rows switches FA and matmul kernel families), while `> 15` is clamped to 15.  Ships with the new `tests/test-recurrent-state-depth` snapshot sweep (n_rs_seq 1..15, the whole rollback range, incl. deep drafts) — see the 2026-09-13 issue-#30 section below and `../GREEDY-PURITY.md` §11/§19.  **amended 2026-09-18 (issue #38): the `--fit` detection also recognises `draft-mtp-adaptive`** — `common_init_result`'s `spec_mtp` used the pre-adaptive manual find, so the fit probe built the minimal MTP head as a full model (null `wqkv` → SIGSEGV); it now uses `params.speculative.has_mtp()`, matching `common_speculative_init_result` — see the 2026-09-18 block-01 amendment section above.
 | `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | **amended 2026-09-06 with the gfx11 NW16 scan retune** (gated_delta_net_chunked_bf16_gfx11.cu, fork 376f02aa0); **amended 2026-09-11 with the K-independent whole-batch chunked prefill** (gated_delta_net.cu; no sequential tail, `GGML_CUDA_GDN_ALIGN_BOUNDARY` gate + its two K-dependent branches **removed**; + the `llama_memory_recurrent` rollback-boundary guard). | **amended 2026-09-12 with the rollback-bounded chunked threshold (`n_rs_batch`) + the pre-batch snapshot slot** — the whole-batch chunked path now requires `n_tokens > max(K > 16 ? K : 16, n_rs_batch)` where `n_rs_batch` is the longest draft an enabled speculator can produce + 1 (from `common_speculative_n_max()`), because a batch that can be rolled back into must run the sequential kernel that writes its snapshots; fixes a silent recurrent-state rewind with ngram-style long drafts (ngram-mod 64 > MTP's `n_rs_seq` 7) that the 2026-09-11 guard detects — see the 2026-09-12 block-02 amendment section below.
 | `0003` | BF16 KV cache + native-BF16 flash-attn | **amended 2026-09-10 with the HIP masked-V/freed-cell fixes** (moved here from block 14 on 2026-09-10 — they sit on the native-BF16 PV staging this block introduces): `fattn-tile.cuh` (packed-bf16 PV) + `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles). |
 | `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf | **amended 2026-09-06 with the RDNA WMMA (256,256,64) config row** (fattn-mma-f16.cuh, fork e7eecb369). | **amended 2026-09-14 (issue #30) with the RDNA prefill tuning — the head-256 `ncols=64` config is arch-aware (RDNA3_5 keeps the gfx1151 halo row, RDNA4/RDNA3_0 take upstream #28102's row) and `ncols2` is split-aware (frontend `ggml_set_fa_tensor_parallel` hint); pp150K f16 +2.4 / +6.9 / +9.6 % vs stock on 1/2/3 cards** — see the 2026-09-14 block-04 section below. |

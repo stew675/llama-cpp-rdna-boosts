@@ -237,8 +237,10 @@ for per-block verification and `BASELINE.md` for provenance.
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`ebbb18522`** (upstream master "openvino : Update OpenVINO to 2026.4", 2026-09-17 re-base).
-- Canonical 16-block chain: tip **`31b1790372d17bf7f95f3e15f7b4e2b35eb661e1`**, net tree
-  **`7dc63cb3c93aa1cd74435698f045f93d2ee3a9e6`**; release **`v16-ebbb18522-r2`**.
+- Canonical 16-block chain: tip **`3d71f34794b2ec929ac92314e0091722c478956b`**, net tree
+  **`3f3dfcfaa1795e9bd475d56ea695b90daea5b5fa`**; release **`v16-ebbb18522-r3`**.
+- `--fit` no longer SIGSEGVs with `--spec-type draft-mtp-adaptive` and a minimal per-tier MTP
+  head (issue #38; block 01, one line in `common/common.cpp`).
 - A clean HIP build no longer prints the ~10k FA "loop not unrolled" warnings
   (`-Wno-pass-failed`, block 15; no codegen change).
 - Patches `patches/0000-…0015-…` apply with **strict 16/16 `git am`** (no 3-way

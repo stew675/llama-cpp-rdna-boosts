@@ -6,8 +6,16 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (2026-09-17, re-base):** the delivery is the **16-patch set** against the new fork
-point **`ebbb18522`** (block 00 + blocks 01-15), canonical 16-block tip
+**Current state (2026-09-18, r3):** the delivery is the **16-patch set** against fork point
+**`ebbb18522`** (block 00 + blocks 01-15), canonical 16-block tip
+**`3d71f34794b2ec929ac92314e0091722c478956b`** (tree `3f3dfcfaa1795e9bd475d56ea695b90daea5b5fa`),
+release **`v16-ebbb18522-r3`** — a block-01 amendment on the r2 re-base: the `--fit` path in
+`common_init_result` now recognises `draft-mtp-adaptive` via `params.speculative.has_mtp()`, so a
+minimal per-tier MTP head no longer SIGSEGVs the fit probe (issue #38).  Full record: `WORKLOG.md`
+2026-09-18 (r3).
+
+**Previous state (2026-09-17, re-base):** the delivery was the **16-patch set** against fork point
+**`ebbb18522`** (block 00 + blocks 01-15), canonical 16-block tip
 **`31b1790372d17bf7f95f3e15f7b4e2b35eb661e1`** (tree `7dc63cb3c93aa1cd74435698f045f93d2ee3a9e6`),
 release **`v16-ebbb18522-r2`** — a 2026-09-17 re-base onto current upstream master (37 commits past
 `d1d3c3396`; three resolved blocks: block 02's Vulkan check-results move, block 12's upstream HIP
@@ -242,6 +250,18 @@ enablement there and runs host-only/CPU.
   (cosmetic).
 
 ## Parked (not planned now)
+- **`--fit` for `-sm tensor` (raised 2026-09-18, issue #38 investigation).**  `common/fit.cpp`
+  (`common_params_fit_impl`) aborts for `LLAMA_SPLIT_MODE_TENSOR` and `common_fit_params` warns and
+  continues, so `--fit` is a no-op under tensor split — documented upstream in `docs/multi-gpu.md`
+  since the fit-params PR #22171, and **upstream code no delivery block touches**.  The algorithm is
+  layer-granular (`tensor_split[id] = ngl_per_device[id].n_layer`, whole-layer back-to-front fills,
+  whole-tensor CPU overflow via `tensor_buft_overrides`), which does not map onto the shard-every-layer
+  tensor split.  A fix is a new allocator over the `tensor_split` proportion vector + `n_ctx` (the
+  `n_ctx` reduction part is already split-agnostic), keeping whole-tensor MoE CPU spill and reducing
+  `n_gpu_layers` only for gross overflow, with its own multi-GPU dense/MoE validation.  Recommended home:
+  `upstream/UPSTREAM-PR-*.md` + `.patch` (or upstream itself), **not** a delivery block.  Workaround for
+  users: pass explicit `-c` / `--tensor-split` / `-ngl`, or use `-sm layer` where `--fit` works.  No work
+  started.
 - **The `fattn-mma-f16` instance-set build cost (raised 2026-09-15, r5).**  The tile half of the
   build-time regression is fixed in r5 (`ggml-hip` clean `-j16` **538 s -> 330 s**), but the *remaining*
   critical path is the MMA instance set and it is ours: the native-KV arm chain in

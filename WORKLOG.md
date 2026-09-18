@@ -1,5 +1,51 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-18 (r3) — `v16-ebbb18522-r3`: the `--fit` SIGSEGV with `draft-mtp-adaptive` (issue #38)
+
+**Release.** `v16-ebbb18522-r3`, fork point `ebbb18522` (unchanged).  Canonical 16-block tip
+**`3d71f34794b2ec929ac92314e0091722c478956b`**, net tree **`3f3dfcfaa1795e9bd475d56ea695b90daea5b5fa`**;
+blocks 00 and 02-15 are content-identical to r2 (`7dc63cb3c…`), the tree delta is the one-line
+`common/common.cpp` hunk in block 01.  Strict 16/16 `git am` re-verified on a fresh `ebbb18522`
+tarball (`scripts/validate-set.sh` green: checksums, base tree, applied tree).
+
+**Issue.**  [#38](https://github.com/stew675/llama-cpp-rdna-boosts/issues/38): `--spec-type
+draft-mtp-adaptive` with a *minimal* per-tier MTP head (the shipped `mtp-Qwen3.8-27B-Q4_0.gguf`,
+qwen35, 18 tensors) SIGSEGVs during startup in the `--fit` probe (`common_params_fit_impl` →
+`common_get_device_memory_data_impl` → `llama_init_from_model` → `sched_reserve` → `resolve_fused_ops`
+→ `graph_reserve` → `build_qkvz` → `build_lora_mm` → `ggml_mul_mat` with a null operand).
+`--spec-type draft-mtp` with the same head, and `--fit off`, both work.  Reproduced here on 2× R9700
+(gfx1201) with Qwen3.8-27B-EfficientThink-SimPO-Q8_0 + the minimal head: `-sm layer` crashes,
+`-sm tensor` does not crash **because `common_params_fit_impl` aborts for `LLAMA_SPLIT_MODE_TENSOR`**
+(documented: `docs/multi-gpu.md` says `--fit` is unsupported with `tensor`; `common/fit.cpp` is
+upstream code and no delivery block modifies it — see the TODO note below).
+
+**Root cause.**  Block 01 added `COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE` and switched the
+detection sites to `params.speculative.has_mtp()`, but the fit path in `common_init_result` kept the
+pre-adaptive manual find for `COMMON_SPECULATIVE_TYPE_DRAFT_MTP` only.  With adaptive, `spec_mtp` was
+false, so `cparams_dft.ctx_type` stayed `LLAMA_CONTEXT_TYPE_DEFAULT` and the extra model (the MTP
+head) was fitted as a **full model** — the minimal head has no full-model tensors, hence the null
+weight.  With plain `draft-mtp`, `ctx_type` was `LLAMA_CONTEXT_TYPE_MTP`, matching what
+`common_speculative_init_result` builds at runtime.
+
+**Fix.**  Block 01, `common/common.cpp`: `const bool spec_mtp = params.speculative.has_mtp();`
+(one line).  The fit probe now measures the MTP context with the type the runtime will build, so the
+adaptive memory estimate matches `draft-mtp`.  No other MTP-only manual find remained in a detection
+position (the two left are the `draft-mtp`+`draft-mtp-adaptive` conflict check and the GGUF/sidecar
+type inference, both intentional).
+
+**Verification** (2× R9700, Qwen3.8-27B EfficientThink Q8_0 + `mtp-Qwen3.8-27B-Q4_0.gguf`, greedy
+`--seed 42 --temp 0`): `-sm layer --spec-type draft-mtp-adaptive` with `--fit` on now exits 0 (was
+SIGSEGV); isolation matrix `none`, `adaptive --fit off`, `adaptive --fit on`, `draft-mtp --fit on`,
+`adaptive -sm tensor` all exit 0 with the **same greedy text `5dca93fd0986`** (255 chars) — the fix
+is greedy-pure against the `--fit off` workaround and plain decode.  The fit probe log confirms the
+extra model is now measured at `ctx_type = MTP`.
+
+**TODO (not fixed, upstream scope).**  `--fit` aborting for `-sm tensor` is an upstream limitation
+(since fit-params #22171), not a delivery bug: the algorithm is layer-granular (`tensor_split[id] =
+ngl_per_device[id].n_layer`, whole-layer fills, whole-tensor CPU overflow), which does not map onto
+the shard-every-layer tensor split.  A tensor-split fit would be a new allocator over the
+`tensor_split` proportions + `n_ctx`; it belongs under `upstream/` or upstream, not in this block set.
+
 ## 2026-09-18 — adaptive-MTP controller re-validated; the "current record" doc pointers were stale (docs only)
 
 **No delivery artifact changed** (no patch, `release.json` untouched).  The adaptive-MTP controller was

@@ -15,9 +15,10 @@ remain as known-good records for those upstream versions.
 
 > **Current baseline marker:** `baseline/d1d3c3396` was the previous (2026-09-15)
 > delivery baseline.  The current one is **`ebbb18522`** (2026-09-17), the fork point of
-> release **`v16-ebbb18522-r2`** (canonical tip
-> `31b1790372d17bf7f95f3e15f7b4e2b35eb661e1`, tree
-> `7dc63cb3c93aa1cd74435698f045f93d2ee3a9e6`).  `baseline/790cf51aa` remains the
+> release **`v16-ebbb18522-r3`** (canonical tip
+> `3d71f34794b2ec929ac92314e0091722c478956b`, tree
+> `3f3dfcfaa1795e9bd475d56ea695b90daea5b5fa`; r3 = the 2026-09-18 block-01 `--fit` fix for
+> `draft-mtp-adaptive`, issue #38 — base `ebbb18522` unchanged from r2).  `baseline/790cf51aa` remains the
 > (2026-09-13) marker.  None of these is one of the historical pre-block-12
 > checkpoints listed below; those remain frozen records.
 
@@ -45,14 +46,15 @@ bottom of this file): block 00 = the structural/architecture fixes added
 2026-09-10 (FA small-batch KV-split width invariance + Vulkan masked-V), and
 blocks 01-15 = the fork's `rdna-boosts` block
 commits.  The canonical 16-block chain for the `ebbb18522` base is tip
-`31b1790372d17bf7f95f3e15f7b4e2b35eb661e1`, tree
-`7dc63cb3c93aa1cd74435698f045f93d2ee3a9e6` (release **`v16-ebbb18522-r2`**, the
-2026-09-17 re-base of the 16-block set onto upstream master `ebbb18522`, 37 commits past `d1d3c3396`;
-the three resolved blocks are block 02's Vulkan GATED_DELTA_NET check-results clone (moved upstream to
-`ggml-vulkan-debug.cpp`), block 12's upstream HIP AllReduce enablement (the delivery keeps its HIP
-split: `allreduce.cu` CUDA-only, HIP hybrid in `allreduce-hip.cu`), and block 14's upstream qwen4exp hc
-ops (the delivery's decode-band fused hc ops keep `nt <= 8`, upstream's `ggml_dsv4_hc_pre_gated`/`post`
-serve prefill) plus the pair-fusion `ncols_opt` RDNA3 consistency fix; see `WORKLOG.md` 2026-09-17).
+`3d71f34794b2ec929ac92314e0091722c478956b`, tree
+`3f3dfcfaa1795e9bd475d56ea695b90daea5b5fa` (release **`v16-ebbb18522-r3`**, the 2026-09-18 block-01 `--fit` fix for issue #38 on the same base;
+r2 was the 2026-09-17 re-base of the 16-block set onto upstream master `ebbb18522`, 37 commits past
+`d1d3c3396`, whose three resolved blocks were block 02's Vulkan GATED_DELTA_NET check-results clone
+(moved upstream to `ggml-vulkan-debug.cpp`), block 12's upstream HIP AllReduce enablement (the delivery
+keeps its HIP split: `allreduce.cu` CUDA-only, HIP hybrid in `allreduce-hip.cu`), and block 14's
+upstream qwen4exp hc ops (the delivery's decode-band fused hc ops keep `nt <= 8`, upstream's
+`ggml_dsv4_hc_pre_gated`/`post` serve prefill) plus the pair-fusion `ncols_opt` RDNA3 consistency fix;
+see `WORKLOG.md` 2026-09-18 (r3) and 2026-09-17).
 The previous canonical chain (base `d1d3c3396`, 2026-09-15) was tip
 `8465f08b9efb26c60e992b48b7d2857d9ffcaf7a`, tree
 `3bb7c223c60570978d1bbf996a03808fe31f2842`.  Before that, the `790cf51aa` base:

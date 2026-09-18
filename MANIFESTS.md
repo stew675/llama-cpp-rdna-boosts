@@ -12,7 +12,14 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current re-base (2026-09-17) — release `v16-ebbb18522-r2`:** the 16-block set re-based onto
+**Current release (2026-09-18) — `v16-ebbb18522-r3`:** a block-01 amendment on top of the r2 re-base —
+the `--fit` path in `common_init_result` now uses `params.speculative.has_mtp()` instead of the
+pre-adaptive manual find, so `--spec-type draft-mtp-adaptive` with a minimal per-tier MTP head no
+longer SIGSEGVs the fit probe (issue #38).  Canonical tip
+`3d71f34794b2ec929ac92314e0091722c478956b`, tree `3f3dfcfaa1795e9bd475d56ea695b90daea5b5fa`, strict
+16/16 — see `WORKLOG.md` 2026-09-18 (r3) and `patches/README.md`.
+
+**Re-base (2026-09-17) — release `v16-ebbb18522-r2`:** the 16-block set re-based onto
 upstream master `ebbb18522` (37 commits past `d1d3c3396`).  Three blocks needed resolution: block 02
 (the `GATED_DELTA_NET` op-param clone in the Vulkan check-results moved to the new
 `ggml-vulkan-debug.cpp`), block 12 (upstream #27825 enabled the CUDA internal AllReduce on HIP; the

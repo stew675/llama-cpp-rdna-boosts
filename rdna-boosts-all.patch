@@ -95,10 +95,20 @@ index c4c4e143c..c94626d03 100644
          {"--spec-synth-len"}, "L",
          "target mean synthetic acceptance length, including the target token (benchmarking only)",
 diff --git a/common/common.cpp b/common/common.cpp
-index d8319cd9a..51c2d0a24 100644
+index d8319cd9a..a0792fa58 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1434,6 +1434,76 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
+@@ -1298,8 +1298,7 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+ 
+         // the draft context is created from the same base params and follows the main context, fit both together
+         const bool has_draft = params.speculative.has_dft();
+-        const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+-            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
++        const bool spec_mtp  = params.speculative.has_mtp();
+ 
+         common_params params_dft = common_base_params_to_speculative(params);
+ 
+@@ -1434,6 +1433,76 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
  }
  
  common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
@@ -175,7 +185,7 @@ index d8319cd9a..51c2d0a24 100644
      common_init_result_ptr res(new common_init_result(params, model_only));
  
      llama_model * model = res->model();
-@@ -1688,6 +1758,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1688,6 +1757,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.split_mode      = params.split_mode;
      mparams.load_mode       = params.load_mode;
      mparams.lazy_mode = params.lazy_mode;
@@ -183,7 +193,7 @@ index d8319cd9a..51c2d0a24 100644
      mparams.tensor_split    = params.tensor_split;
      mparams.check_tensors   = params.check_tensors;
      mparams.use_extra_bufts = !params.no_extra_bufts;
-@@ -1710,7 +1781,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1710,7 +1780,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.progress_callback           = params.load_progress_callback;
      mparams.progress_callback_user_data = params.load_progress_callback_user_data;
      mparams.no_alloc                    = params.no_alloc;
@@ -192,7 +202,7 @@ index d8319cd9a..51c2d0a24 100644
  
      return mparams;
  }
-@@ -1721,6 +1792,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1721,6 +1791,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
      cparams.n_ctx             = params.n_ctx;
      cparams.n_seq_max         = params.n_parallel;
      cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
