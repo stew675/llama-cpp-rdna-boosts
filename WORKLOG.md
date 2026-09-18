@@ -46,6 +46,49 @@ ngl_per_device[id].n_layer`, whole-layer fills, whole-tensor CPU overflow), whic
 the shard-every-layer tensor split.  A tensor-split fit would be a new allocator over the
 `tensor_split` proportions + `n_ctx`; it belongs under `upstream/` or upstream, not in this block set.
 
+## 2026-09-18 (beta) — `beta/tensor-fit-fix/`: `--fit` for `--split-mode tensor` (upstream candidate)
+
+**No delivery artifact changed** (`release.json` untouched).  A new beta
+(`beta/tensor-fit-fix/`) stages a fix for upstream's `--fit` omission under
+`-sm tensor`: `common_params_fit_impl` used to throw
+`"llama_params_fit is not implemented for SPLIT_MODE_TENSOR"`, so `--fit`
+(default on) was a no-op there and users set `-c`/`-ngl`/`-ts` by hand.
+
+Why it was hard: under tensor split all GPUs wrap into one **Meta device**, and
+the `no_alloc` `memory_breakdown` for a Meta buft mixes a model *total* with
+per-device *maxima* for context/compute, while `ggml_backend_dev_memory(Meta)`
+is the device *sum* — the layer-granular fit algorithm and its per-device
+accounting do not apply.  The beta exposes the Meta device's simple devices
+(`ggml_backend_dev_is_meta` / `ggml_backend_meta_dev_n_devs` /
+`ggml_backend_meta_dev_simple_dev`, de-static'ed), then adds a tensor-split
+branch that sets `tensor_split[i] ∝ (free_i - margin_i)` (so the loader's
+proportional sharding reduces the per-device check to the single budget
+`D <= min_i(target_i / ratio_i)`, which is `sum(target)` for the auto split),
+estimates total use as `model + n_devices*(context+compute)` (context/compute
+are per-device maxima → slightly conservative), and reduces `n_ctx` (auto
+context only) then `n_gpu_layers` until it fits.  The extra (draft/MTP) model's
+Meta device is a distinct object, so it is measured directly (embedded MTP is
+covered by `shares_model`).  **Policy A (maintainer decision 2026-09-18): a
+user-pinned `-ts` is honored as a constraint, not an opt-out** — the fit keeps
+the requested balance and only chooses `-c`/`-ngl` around it (consistent with
+the documented `--fit` = "auto-fit unset args" and with how `-c` is already
+treated); it logs the effective budget next to the sum of targets.
+
+Validated on 2 and 3× R9700 gfx1201 with `Qwen3.8-27B-Q8_0` (dense, and
+embedded MTP), `Qwen3.8-27B-EfficientThink` + separate `mtp-...-Q4_0` head
+(adaptive), and `Qwen3.6-35B-A3B-Q8_0` (MoE, embedded MTP): fits cases leave
+`-c`/`-ngl` and emit proportional `-ts`; `--fit-target 26000,26000` → `-ngl 27`
+(dense) / `-ngl 14` (MoE); auto context 262144 → 43264 at a 16000 MiB target;
+asymmetric `--fit-target 1024,8000` → `-ts 31254,24278` with real per-device
+peak 15925/12018 MiB vs the predicted 15563/12080 (within 3 %).  Pinned splits
+are honored and budgeted: `-ts 1,3` → effective budget 41672 MiB
+(`min(31254/.25, 31254/.75)`), `-ts 1,20` → 32816 MiB, and `-ts 1,3
+--fit-target 26000,26000` → `-ngl 17` (budget 8370).  Reduced configs load and
+generate.  The patch applies cleanly to both the delivery tree
+and plain upstream `ebbb18522` (offset -1 in `ggml-backend-meta.cpp`).  Record:
+`beta/tensor-fit-fix/README.md` + `BETA-TESTING.md`.  Likely home: `upstream/`;
+decide later.
+
 ## 2026-09-18 — adaptive-MTP controller re-validated; the "current record" doc pointers were stale (docs only)
 
 **No delivery artifact changed** (no patch, `release.json` untouched).  The adaptive-MTP controller was
