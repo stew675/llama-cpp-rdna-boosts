@@ -1,0 +1,141 @@
+
+
+Loading model... |-\|/-\|/-\|/-\|/-\|/ 
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b11040-31b179037
+model      : /llm/models/Qwen3.8/27B/Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf
+ftype      : Q4_K - Medium
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> # llama-cpp-rdna-boosts A patch collection that brings **AMD RDNA-specific performance work** to [llama.cpp](https://github.com/ggml-org/llama.cpp): MTP decode, chunked gated-delta-net prefill, BF16 KV and WMMA flash-attention, fused MoE and k-quant decode paths, a hybrid all-reduce, qwen4exp (Qwen3.8-Flash-Next) support, and an attention-memory campaign that frees several GiB of VRAM. It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp checkout at the fork point **`790cf5 ... (truncated)
+Based on the documentation provided, here is a structured summary and technical breakdown of the **llama-cpp-rdna-boosts** patch collection.
+
+### **Overview**
+This is a specialized patch set for [llama.cpp](https://github.com/ggml-org/llama.cpp) designed to maximize performance on **AMD RDNA3, RDNA3.5, and RDNA4** GPUs. It consists of **16 self-contained patches** (blocks 00–15) that can be applied individually or as a whole using `git am`.
+
+*   **Base Commit:** `790cf51aa` (Re-based on 2026-09-13).
+*   **Target Architectures:**
+    *   **RDNA 3:** `gfx1100` (RX 7900 XTX/XT, RX 7800 XT)
+    *   **RDNA 3.5:** `gfx1150`/`gfx1151` (Strix Point / Strix Halo APUs)
+    *   **RDNA 4:** `gfx1200`/`gfx1201` (RX 9060 XT, RX 9070/9070 XT)
+*   **Key Benefit:** RDNA4 sees the most improvement, but significant optimizations are back-ported to RDNA3/3.5.
+
+---
+
+### **The 16 Patches (Blocks)**
+
+| Block | Description | Key Features / Notes |
+| :--- | :--- | :--- |
+| **0000** | **Structural & Arch Fixes** | Base patch. Fixes FA small-batch KV-split width invariance and Vulkan masked-V/freed-cell issues. |
+| **0001** | **Adaptive MTP** | Adds `--draft-mtp-adaptive` for dynamic draft depth. |
+| **0002** | **Chunked GDN Prefill** | Fused chunked gated-delta-net prefill kernel (bf16/WMMA). Arch-segregated kernels for gfx12 and gfx11. |
+| **0003** | **BF16 KV Cache** | Native BF16 KV cache + native-BF16 flash-attn. Includes HIP masked-V/freed-cell fixes. |
+| **0004** | **WMMA Flash-Attn** | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf. **Note:** Also runs on RDNA3.0/3.5 with tuned head limits (576 for RDNA3.0, 320 for RDNA3.5). |
+| **0005** | **CPU Bit-Identical** | Ensures CPU decode/verify batches are bit-identical. |
+| **0006** | **Host-Buffer Revert** | Reverts host-buffer changes for discrete GPUs (functional delta dropped in 2026-09-08 re-base; now only carries rationale comments). |
+| **0007** | **Meta Device Skip** | Skips meta device-wrapper. |
+| **0008** | **Fused-Core Prefill** | Fused-core prefill kernels + GPU bit-identical results. **Requires blocks 03+04.** Amended with `mul_mat+add` shape guard and quantized KV-type enablement (`q4_1`/`q5_0`/`q5_1`). |
+| **0009** | **Meta-Buffer Headroom** | Adds compute-container headroom for meta-buffers. |
+| **0010** | **K-Quant Boosts** | Optimizes Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR. Adds dedicated RDNA3.5 mmvq table. **Warning:** Changes decode numerics (reorders fp32 reduction). |
+| **0011** | **Skip CUDA Graphs (Prefill)** | Skips CUDA graphs for multi-token prefill; keeps them for decode. |
+| **0012** | **Hybrid HIP All-Reduce** | Custom internal all-reduce for small-tensor decode. **RDNA4-only** (gfx1200/gfx1201). Falls back to RCCL elsewhere. |
+| **0013** | **Fused MoE MMQ** | Fused MoE gate+up+GLU MMQ + mmvq short-K item-split. Supports RDNA4, RDNA3.5, and RDNA3.0. Includes fixes for MTP regressions and band-uniformity. |
+| **0014** | **Qwen4exp Support** | Support for Qwen3.8-Flash-Next (qwen4exp). Includes QSA sparse FA, fused indexer top-k, HC_MIX/HC_COMBINE ops, and MTP draft-head. |
+| **0015** | **Attention-Memory Wins** | Frees VRAM via derived kq mask, native q8_0/bf16 K/V in FA, QSA score-chain memory, and ggml-alloc unused-view release. Saves ~3.4 GiB/GPU on qwen4exp. |
+
+---
+
+### **Key Technical Highlights**
+
+1.  **Runtime Arch Selection:**
+    *   No compile-time arch gating. A single binary built with `GPU_TARGETS="gfx1100;gfx1151;gfx1201"` will automatically select the correct kernel path at runtime based on the detected GPU.
+    *   **Exception:** Block 12 (Hybrid All-Reduce) is strictly gated to RDNA4.
+
+2.  **Greedy Purity & Numerics:**
+    *   **Block 10 (K-Quant Boosts)** is the **only** patch that changes decode numerics on *any* architecture due to reordered fp32 reductions in VDR kernels.
+    *   **Block 13 (Fused MoE)** also affects numerics on specific rows (short-K, ncols==1) but was fixed to restore bit-identity for `W=1..8` in recent amendments.
+    *   If 100% greedy purity across builds is required, **exclude Block 10**.
+
+3.  **VRAM Savings (Block 15):**
+    *   **Qwen4exp:** ~3.4 GiB/GPU + ~1.2 GiB host saved.
+    *   **Dense Models:** ~800 MiB/GPU + ~800 MiB host saved.
+    *   Performance cost is minimal (~1.3% prefill, ~0.3% decode).
+
+4.  **Qwen4exp (Qwen3.8-Flash-Next) Support (Block 14):**
+    *   Includes QSA (Query-Sparse Attention) sparse FA, fused indexer top-k, and specific decode/prefill fusions.
+    *   Recent fixes ensure `plain decode == draft-mtp verify` for `n_max <= 7`.
+
+---
+
+### **Installation & Usage**
+
+*   **Do NOT use `git apply`** on concatenated patches. It silently drops hunks.
+*   **Use `git am`** or the provided script:
+    ```bash
+    scripts/apply-all.sh
+    ```
+*   **Manual Application:**
+    ```bash
+    git am patches/0000-*.patch
+    git am patches/0001-*.patch
+    # ... up to 0015
+    ```
+*   **Build:**
+    ```bash
+    cmake -B build -DGGML_HIP=ON -DCMAKE_CXX_FLAGS="-march=native"
+    cmake --build build --config Release
+    ```
+    *   For multi-arch support: `GPU_TARGETS="gfx1100;gfx1151;gfx1201"`
+
+---
+
+### **Recent Changes (2026-09-13 Re-base)**
+
+*   **Re-based** onto llama.cpp master `790cf51aa` (70 commits ahead of previous base).
+*   **Resolved 4 upstream clashes:**
+    1.  `gfx1201` FA tuning.
+    2.  `GGML_FA_QUANTS` handling.
+    3.  MoE MMQ `ncols_opt`.
+    4.  Indexer V cache.
+*   **Validation:**
+    *   `test-backend-ops`: 18061/18061 passed.
+    *   4B/27B width probes and 27B 8-type text gate are pure and byte-identical to previous delivery.
+    *   Qwen4exp 3-GPU MTP is pure and byte-identical.
+    *   Benchmarks show performance equal to or ahead of stock `9113cc188`.
+
+---
+
+### **Important Caveats**
+
+1.  **Block 12 (All-Reduce):** Only works on RDNA4. On RDNA3/3.5, it falls back to RCCL.
+2.  **Block 10 (K-Quant):** Changes decode numerics. Exclude if strict bit-identical output across different builds is required.
+3.  **Block 13 (MoE):** Recent fixes ensure bit-identity for `W=1..8` on RDNA3.5 and RDNA3.0, but verify your specific model configuration.
+4.  **Upstreaming:** Some blocks (e.g., Block 12) are candidates for upstream contribution but are currently fork-local due to arch-specific gating.
+
+### **Acknowledgements**
+Special thanks to community contributors: `1337hero`, `bakon11`, `briansp2020`, `eoprede`, `tungel`, `DanoPTT`, and the `halo-box/strix-llama.cpp` project for inspiration.
+
+### **License**
+MIT (same as llama.cpp).
+
+[ Prompt: 1227.0 t/s | Generation: 28.5 t/s ]
+
+
+Exiting...
