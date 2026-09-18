@@ -116,6 +116,19 @@ acceptance; the delivery's drafting improvements made it over-climb, so the tabl
   reference code cap-12 84.7 vs cap-7 61.4 (+37.9 %).  Purity holds (adaptive cap 7 ≡ cap 12 ≡ fixed
   `draft-mtp`).  Remaining: the ~2 % adaptive-vs-pinned per-round gap (unexplained), per-shape
   re-tuning of the cold start, and re-deriving `tests/test-speculative-adaptive.cpp` for the new defaults.
+
+**Resolution (2026-09-18): the retune was investigated and rejected as not Pareto-safe; no block-01
+change.**  A new 4-prompts-per-axis corpus (plus a sliding-mean and a target-acceptance-rate
+controller) was run on four cells -- dense Q4_K_XL 1 GPU, MoE 35B-A3B 1 GPU, Q8_0 2-GPU and 3-GPU
+tensor, plus 2-GPU `-sm layer`.  The candidate that wins dense Q4_K_XL (`DROP_FLOOR 250`, `DROP_SLOPE
+40`, `CLIMB_BASE 10`, `CLIMB_SLOPE 3`) **loses Q8_0 prose on every configuration** (1 GPU 0.960, 2 GPU
+tensor 0.936, 2 GPU layer 0.950, 3 GPU tensor 0.914), and `-sm layer` (no AllReduce) shows it too, so
+it is not the AR numerics -- the discriminator is the **weight quantization**.  The alternative
+controller designs are dominated (sliding-mean 0.980, target-rate 1.048, vs the base bucket 1.061 on
+the dense 16-prompt corpus).  The base constants are therefore the best multi-cell default.  The one
+real defect was a **stale record pointer** (the 2026-09-13 four-axis record used the *table*), now
+corrected.  Cap guidance: single card ~9, multi-GPU 6-7.  Full data:
+`wip/mtp-journey-2026-09-17/SUMMARY.md`.
   Fallback if a shape regresses: the reporter's cap (7 when `n_gpu > 1` or the dominant weight is Q8_0).
 - Interim: the `ceiling 12` recommendation needs a caveat in `benchmarks/README.md`,
   `benchmarks/mtp-adaptive-methodology.md` and `README.md` (7 is the default on Q8_0 / tensor split).

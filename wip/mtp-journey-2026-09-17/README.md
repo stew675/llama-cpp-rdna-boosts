@@ -1,8 +1,47 @@
-# MTP journey measurement — 2026-09-17 (scratch record)
+# MTP journey measurement — 2026-09-17
 
-**Status: scratch/WIP. Not part of the delivery. Not pushed.**
+**Status: WIP measurement record.**  It changes no patch — the delivery patch set is unchanged — but
+it **is committed and pushed** to this repo (`8d05e58`); it is *not* part of the delivery.
 
-This record exists to resolve a real inconsistency: the delivery's current adaptive-MTP
+## Executive summary — the configurations to use
+
+**The delivery's adaptive-MTP controller does not need changing.**  The base credit bucket is the best
+multi-cell default; the original PR #27210 table, a sliding-mean rule and a target-acceptance-rate rule
+are all worse on average, and no constant retune is Pareto-safe.
+
+### Recommended commands
+
+| cell / workload | configuration |
+|---|---|
+| **default, any cell** | `--spec-type draft-mtp-adaptive` (the delivery default — cap 12, cold start `cap-3`) |
+| **single card, any workload** | as above, but keep the MTP cap **≈ 9** and avoid 6 (cap 6 costs 11-14 % on code, 26 % on `c1`) |
+| **multi-card tensor split** | cap **6-7** is mildly better than 9 (+0.8 % on R/P/C); cap 12 loses a little on prose/code |
+| **recall / mixed (best overall)** | `--spec-type draft-mtp-adaptive,ngram-mod --spec-ngram-mod-n-match 45 --spec-draft-n-max 9 --spec-draft-n-start 9` |
+| **`n_match` rule** | `>= 40` **and** an integer multiple of the cap — `9/45`, `8/48`, `6/42` |
+
+### The three numbers that matter
+
+* **Bucket vs the PR #27210 table:** dense Q4_K_XL 1 GPU `1.012`, MoE `1.032`, Q8_0 2-GPU code
+  `+14 %` / prose `+22 %` — the bucket is the right *controller*.
+* **The combo vs plain adaptive MTP** (Q8_0 2-GPU 4x4 corpus): recall `+67.5 %`, overall `+13.6 %`,
+  reasoning `-1.9 %` — the combo is the right *configuration* for recall/mixed work, as an opt-in.
+* **The cap is split-dependent:** single card `~9`, multi-card `6-7`.  A low cap clips content whose
+  natural accepted length exceeds it, and the 1-GPU verify cost is flat in batch size, so the extra
+  rounds are pure loss.
+
+### What was actually wrong
+
+Not the controller — a **stale documentation pointer**: `benchmarks/README.md` and
+`benchmarks/mtp-adaptive-methodology.md` called the 2026-09-13 four-axis record "current", but it was
+measured with the pre-tuning **table**, not the delivery's bucket.  Corrected 2026-09-17.
+
+`SUMMARY.md` is the consolidated report; `HANDOVER.md` is the session handoff.
+
+---
+
+## Why this record exists
+
+This record resolves a real inconsistency: the delivery's current adaptive-MTP
 build does **not** reproduce the repo's "current" four-axis table on the dense 1-card cell,
 and the upstream+PR#27210 arm looks *faster* on prose. Everything below was measured on one
 machine, one methodology, one day, so the three arms are directly comparable.

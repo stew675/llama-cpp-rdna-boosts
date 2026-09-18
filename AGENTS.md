@@ -494,7 +494,9 @@ Consequences, so it is not re-litigated:
   trace for instruction-like prompts by default, so an unpinned P/C run measures thinking, not content).
   Short runs are valid only as a correctness smoke test.  Rule 0 in
   `benchmarks/mtp-adaptive-methodology.md`; the results are `benchmarks/2026-09-13-adaptive-mtp-4-axis-n12.md`
-  (adaptive ceiling 12 vs fixed `n3`, `-n 3000`: prose +13%, code +28%, recall +61%, reasoning flat).
+  (adaptive ceiling 12 vs fixed `n3`, `-n 3000`: prose +13%, code +28%, recall +61%, reasoning flat)
+  — but that record is the **pre-tuning table** arm; the delivery's credit-bucket numbers are in
+  `benchmarks/2026-09-15-adaptive-mtp-tuning.md`, and the bucket beats the table on every cell.
 - **Mixed K/V cache types are HARD-REJECTED** (`params.type_k != params.type_v` fails context
   creation with a message naming both types).  Maintainer decision 2026-09-11: every mixed pair
   measured 1.7–3.6× slower than the same-type equivalent and never smaller, and the attention path

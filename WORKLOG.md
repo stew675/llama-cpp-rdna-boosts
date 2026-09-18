@@ -1,5 +1,25 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-18 — adaptive-MTP controller re-validated; the "current record" doc pointers were stale (docs only)
+
+**No delivery artifact changed** (no patch, `release.json` untouched).  The adaptive-MTP controller was
+re-validated against a new **4-prompts-per-axis corpus** (16 prompts + 3 phase-switch) on four cells --
+dense Q4_K_XL 1 GPU, MoE 35B-A3B 1 GPU, Q8_0 2-GPU tensor and 3-GPU tensor, plus 2-GPU `-sm layer` --
+and against every alternative controller (the PR #27210 table, a sliding-mean rule, a
+target-acceptance-rate rule) on one build.  Conclusion: the **credit bucket is the best multi-cell
+default and no block-01 change is recommended**; the retunes and the alternative controllers are
+dominated or quant-specific.  The `ngram-mod` + adaptive-MTP combo is the best recall configuration
+(`--spec-ngram-mod-n-match 45 --spec-draft-n-max 9 --spec-draft-n-start 9`; recall +67.5 %, overall
++13.6 % on Q8_0 2-GPU, reasoning -1.9 %).  Cap guidance: single card ~9, multi-card 6-7.
+
+What was actually wrong: `benchmarks/README.md` and `benchmarks/mtp-adaptive-methodology.md` called
+`2026-09-13-adaptive-mtp-4-axis-n12.md` the "current" four-axis record, but it was measured with the
+**pre-tuning table** controller (its prose acceptance 0.50654 is the table's; the delivery bucket's is
+0.60232) -- which is why the delivery appeared to underperform its own documented numbers.  Both
+pointers now name `2026-09-15-adaptive-mtp-tuning.md` as the current controller record and mark the
+2026-09-13 record as the table arm.  Full corpus, sweeps and report:
+`wip/mtp-journey-2026-09-17/` (WIP, not part of the delivery).
+
 ## 2026-09-17 (r2) — `v16-ebbb18522-r2`: FA unroll-warning flood + block-01 comment; CI tag guard
 
 **Release.** `v16-ebbb18522-r2`, fork point `ebbb18522` (unchanged).  Canonical 16-block tip

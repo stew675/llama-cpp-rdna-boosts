@@ -199,8 +199,11 @@ The dense expectations table was recorded 2026-08-23 (rdna-boosts era
 `e0aa19e25`) and re-verified 2026-09-02 on the fixed 13-block build —
 see the results table.  **The adaptive ceiling is 12** (`--spec-draft-n-max 12`,
 the mode's recommended depth); since the 2026-09-13 clamp relaxation it is no
-longer capped at 7.  The current four-axis measurement is
-[2026-09-13-adaptive-mtp-4-axis-n12.md](2026-09-13-adaptive-mtp-4-axis-n12.md).
+longer capped at 7.  **The current controller record is
+[2026-09-15-adaptive-mtp-tuning.md](2026-09-15-adaptive-mtp-tuning.md)** (the credit bucket, the
+block-01 amendment); the [2026-09-13 four-axis
+record](2026-09-13-adaptive-mtp-4-axis-n12.md) is the pre-tuning **table** measurement, not the
+delivery's bucket.
 
 ## Baselines
 
