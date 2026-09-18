@@ -944,7 +944,16 @@ load, so a bf16 cache costs exactly an f16 one (4B 968.86 → 256.86 MiB/GPU,
 27B 1072.86 → 488.86, gemma-4-E4B 1062.89 → 404.89, gemma-4-31B 2068.89 →
 716.89) and a q8_0 cache drops a further −744/−632 MiB/GPU.  V4/V5 ship
 opt-in because the lost `cp_async` pipeline (V4) or the removed dense F16
-scratch (V5) costs a sub-2 % prefill.
+scratch (V5) costs a sub-2 % prefill.  **[root cause corrected 2026-09-18:** the
+V5 cost *is* the in-loader bf16→f16 conversion (~63 ms of the FA kernel on 35B
+pp8192, re-paid on every K/V tile re-read), not the removed scratch — and it
+cannot be cheapened: the compiler already emits the RN minimum, gfx12 has no
+packed RN f32→f16, and the packed RTZ / RN-exact `v_pack_b32_f16` alternatives
+are no faster.  The exposure is structural: `cp_async_available()` is
+NVIDIA-only, so the AMD MMA loader is synchronous (`nstages = 0`).  The
+"GQA de-interleave" rationale is retired — the raw native read is ~4 % *faster*
+than the dense staged one.  Details: `TODO.md` item 23 and
+`wip/bf16-native-prefill/README.md` "Step 2 findings".]**
 
 **Re-validation** (2026-09-11 against the then-15-patch delivery; re-cut onto
 the current base and revalidated 2026-09-12).  Reserves reproduce to the last
