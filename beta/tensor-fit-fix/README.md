@@ -164,10 +164,34 @@ numeric change is expected.
   `memory_breakdown()` can report per-device model/context/compute exactly.
   That is a larger `ggml-backend-meta.cpp` change and is the natural follow-up
   if the approximation is ever shown to under-reserve.
+- **The prefill staging arena** (see above) is the other known gap.  If it is
+  ever worth reserving, the least-fragile route is a second measurement probe
+  with `-ctk f16 -ctv f16` (the arena is the F16 copy of the cache, so its
+  size is the F16 context minus the actual one) folded into the budget when
+  `type_k`/`type_v` is a native quant and the arch stages at prefill — rather
+  than duplicating the kernel's type/arch predicates in `common/fit.cpp`.
 - **`tensor_split` rounding/rotation.**  Upstream #28506 / PR #27209 notes
   that non-divisible tensor slices can drift from the requested ratio.  The
   fit relies on the loader honouring the ratio; where it does not, the
   per-device fill diverges from the target.
+- **The Block-15 FA prefill staging arena is not counted.**  On the delivery,
+  native-capable K/V types (`q8_0`/`q4_0`/`q4_1`/`q5_0`/`q5_1`/`iq4_nl`, and
+  `bf16` where it stages) take a per-context, per-stream F16 prefill staging
+  buffer (`ggml_backend_cuda_context::fattn_stage`, capped at
+  `GGML_CUDA_FA_STAGE_MAX_MB` = 512 MiB **per operand**, K and V sharing one
+  arena) that is deliberately outside the compute-graph reserve — so neither
+  the layer fit nor this tensor fit counts it.  The blind spot is bounded and
+  narrow: it is allocated lazily, only at prefill (`n_q > 8`), only on
+  RDNA4/RDNA3_0 (`prefill_stages = !RDNA3_5`), and issue #33's
+  `fattn_stage_try_get` fallback degrades to the native K/V read on allocation
+  failure — so a tight `--fit-target` can cost prefill throughput, never
+  correctness.  Measured budget for the blind spot at 4096 ctx / 2 GPU / 27B:
+  F16 cache 330 MiB vs q8_0 210 / q4_0 146 MiB, i.e. the arena adds
+  ~120-184 MiB/device there (inside the default 1 GiB margin).  Plain upstream
+  `ebbb18522` has **no** such arena (`fattn_stage` is a block-15 addition), so
+  the upstream PR candidate is unaffected.  Counting it would need the fit to
+  predict the F16 cache per device (e.g. a `-ctk f16` probe) or the backend to
+  report the arena — see the follow-up below.
 - **`-ts` scale.**  When the fit *chooses* the split it writes MiB-scale
   ratios (`llama-fit-params` renders it as `uint32_t`); a user-pinned `-ts`
   is left exactly as given.
