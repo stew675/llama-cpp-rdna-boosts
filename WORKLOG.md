@@ -20,6 +20,10 @@ pointers now name `2026-09-15-adaptive-mtp-tuning.md` as the current controller 
 2026-09-13 record as the table arm.  Full corpus, sweeps and report:
 `wip/mtp-journey-2026-09-17/` (WIP, not part of the delivery).
 
+The top-level `README.md` gained a **Recommended configuration** section naming the `ngram-mod` +
+adaptive-MTP combo (`--spec-ngram-mod-n-match 45 --spec-draft-n-max 9 --spec-draft-n-start 9`) as the
+best general-purpose configuration, with the cap/`n_match` guidance and a pointer to the journey report.
+
 ## 2026-09-17 (r2) — `v16-ebbb18522-r2`: FA unroll-warning flood + block-01 comment; CI tag guard
 
 **Release.** `v16-ebbb18522-r2`, fork point `ebbb18522` (unchanged).  Canonical 16-block tip

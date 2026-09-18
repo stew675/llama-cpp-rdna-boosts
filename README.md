@@ -181,6 +181,41 @@ git am patches/000[1-9]-*.patch patches/001[0-5]-*.patch   # blocks 01-15
 git add -A && git commit -m "rdna-boosts: block 15: campaign memory wins"
 ```
 
+## Recommended configuration — adaptive MTP + `ngram-mod`
+
+The best general-purpose speculative-decoding configuration measured on this delivery combines the
+**adaptive MTP controller** with the draftless **`ngram-mod`** speculator:
+
+```bash
+--spec-type draft-mtp-adaptive,ngram-mod \
+  --spec-ngram-mod-n-match 45 \
+  --spec-draft-n-max 9 --spec-draft-n-start 9
+```
+
+`ngram-mod` supplies the long verbatim-recall drafts the MTP head cannot match, while the adaptive
+controller keeps the MTP depth right for everything else.  Measured against plain `draft-mtp-adaptive`
+on the Q8_0 2-GPU reference cell (`-n 3000`, a 4-prompts-per-axis corpus): **recall +67.5 %,
+code +0.8 %, prose +0.5 %, reasoning −1.9 %, overall +13.6 %**; on the dense 1-card cell it is
+code/prose-neutral with the same recall win.  The small reasoning cost is the price of the deeper
+`n-max 9`; a workload with no verbatim recall is marginally better served by plain
+`draft-mtp-adaptive`.
+
+Guidance:
+
+* **Cap.**  `9` is the general-purpose pick and the optimum on a **single card** (a cap of `6` costs
+  11-14 % on code there).  On a **multi-card tensor split** `6-7` is ~1 % better.  A lower cap saves
+  only a small verify-batch scratch, not the model/KV memory.
+* **`n_match`.**  Keep it `>= 40` **and an integer multiple of the cap** — `9/45`, `8/48`, `6/42`.
+  Too short (`nm24`) makes ngram fire on incidental code repeats and lose code throughput; a
+  non-multiple (e.g. `nm42` at cap 12) degrades acceptance.
+* The combo changes the draft strategy, so it is **opt-in** — the controller default stays plain
+  `--spec-type draft-mtp-adaptive`.
+
+Full derivation (the 4×4 corpus, all four cells, and the rejected controller alternatives):
+**[`wip/mtp-journey-2026-09-17/SUMMARY.md`](wip/mtp-journey-2026-09-17/SUMMARY.md)** (narrative in its
+[`README.md`](wip/mtp-journey-2026-09-17/README.md)); the dated controller records are in
+[`benchmarks/`](benchmarks/README.md), newest `2026-09-15-adaptive-mtp-tuning.md`.
+
 ## When upstream master moves
 
 The patches are static against the fork point in `release.json.base`. When upstream
