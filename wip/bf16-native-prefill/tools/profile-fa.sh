@@ -22,9 +22,13 @@ BIN="${LLAMA}/build-rocm/bin/llama-bench"
 export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib:${LD_LIBRARY_PATH:-}
 export HIP_VISIBLE_DEVICES="${GPUS}"
 export GGML_CUDA_FA_KV_NATIVE=1
-if [ "${LABEL}" = "native" ]; then
-    export GGML_CUDA_FA_STAGE_MAX_MB=1
-fi
+# Force the *native* prefill read (V5) whenever the label says `native`.  The original version tested
+# `= "native"` exactly, so `pack_native`/`rtz_native` labels silently measured the STAGED arm (2026-09-18,
+# wasted a full build+profile round).  A `*native*` glob removes the trap; an explicitly exported
+# GGML_CUDA_FA_STAGE_MAX_MB is honoured either way.
+case "${LABEL}" in
+    *native*) export GGML_CUDA_FA_STAGE_MAX_MB="${GGML_CUDA_FA_STAGE_MAX_MB:-1}" ;;
+esac
 
 cd "${LLAMA}"
 mkdir -p "${OUT}"

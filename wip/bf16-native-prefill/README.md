@@ -8,7 +8,15 @@ here is experimental until promoted (see the AGENTS.md promotion rule).
 > This README is the project record; the dated sections below are the log.
 
 > **CURRENT STEP (2026-09-18): step 2 — cheapen the bf16→f16 conversion in the MMA
-> tile loader, keeping f16 compute.**  Step 1 (full native bf16 MMA = "no F16 at
+> tile loader, keeping f16 compute — CLOSED as a negative result.**  The conversion is
+> already the RN minimum (`v_cvt_f16_f32` ×2); the only packed f32→f16 on gfx12 is
+> round-toward-zero (`v_cvt_pkrtz_f16_f32`), and an RN-exact `v_pack_b32_f16` form is no
+> faster.  None of the three candidate loaders reaches parity: the cost is per converted
+> word (exposed because the AMD MMA loader is synchronous — no `cp_async`, `nstages = 0`),
+> not per op.  The native *read* itself is ~4 % faster than the staged dense read.  See
+> "Step 2 findings" below.  V5 stays opt-in.
+>
+> Step 1 (full native bf16 MMA = "no F16 at
 > all") is **CLOSED as a negative result**: it is implemented and correct but
 > *slower* (321.7 ms vs the staged 232.9 on the 35B FA kernel), because gfx1201 has
 > no packed bf16 arithmetic and no bf16→f16 pack, so removing the conversion costs
@@ -53,7 +61,11 @@ prompt length: 4B pp2048 −0.22 %, pp8192 +0.27 %, pp20480 −1.06 %,
 pp40960 −2.36 %; 27B pp20480 −0.76 %; decode ±0.1 %.
 `archive/work/arch-independent-memory/BF16-NATIVE-KV-PLAN.md` §"Cost".
 
-## Root cause (recorded, confirmed by the campaign)
+## Root cause (recorded, confirmed by the campaign) — **SUPERSEDED, see "Step 2 findings"**
+
+> Correction (2026-09-18, fifth pass): this section's "the conversion is free" is wrong — the raw
+> read *is* fine/better, but the in-loader bf16→f16 conversion costs ~63 ms of the FA kernel.  See
+> the second-pass findings below and the "Step 2 findings" section at the end.
 
 * **The conversion is free** — native bf16 staging measures within **0.17 %** of
   an *f16* cache (both scratch-free).  So bf16→f16 conversion and the bf16
@@ -421,3 +433,102 @@ engine is *not* the problem -- bf16 WMMA is equal-rate to f16 (0.99x / 1.00x, wa
    (213.2 + 19.7) *while* removing the F16 scratch.  **This, not the bf16 MMA, is the recommended
    follow-up** -- it is the only measured path to the original goal (memory win at prefill parity)
    on gfx1201.
+
+## Step 2 findings (2026-09-18, fifth pass) — CLOSED as a negative result
+
+**Mandate (step 2):** make the V5 bf16-native arm reach prefill parity with the F16-staging path by
+making the in-loader bf16->f16 conversion cheap, keeping f16 compute.  **Outcome: the conversion
+cannot be cheapened in the loader on gfx1201.**  Three alternative conversion sequences were
+implemented and measured in the real MMA kernel; none reaches parity.  V5 stays opt-in.
+
+### The ISA reality (assembler-verified, `llvm-mc -triple=amdgcn -mcpu=gfx1201`, not `-S`)
+
+| mnemonics | gfx1201 | note |
+|---|---|---|
+| `v_cvt_f16_f32` (incl. `.l`/`.h` dst) | OK | the RN convert; `__float22half2_rn` lowers to two of these |
+| `v_cvt_pk_f16_f32` | **not supported** | the packed **RN** f32->f16 pack does not exist on gfx12 |
+| `v_cvt_pkrtz_f16_f32` | OK | the only packed f32->f16, **round-toward-zero** |
+| `v_pack_b32_f16` | OK | plain register pack (no conversion) |
+| `v_perm_b32`, `v_alignbit_b32`, `v_lshlrev_b32`, `v_and_b32` | OK | the bf16->f32 unpack is `<<16` / `&0xffff0000` |
+
+The compiler already emits the **RN minimum** for `__float22half2_rn(ggml_cuda_cast<float2>(x))`:
+`v_lshlrev_b32` + `v_and_b32` + `v_cvt_f16_f32 v.l` + `v_cvt_f16_f32 v.h` -> **4 ops per 2 elements**.
+The SALU suggestion in the earlier "next step 2" is impossible: the tile data is per-lane, so scalar
+(SALU) converts cannot be used.  Every candidate is VALU.
+
+### The three candidate sequences, measured in the real kernel (35B-A3B pp8192, 2xR9700, `-sm layer`)
+
+FA-kernel total `flash_attn_ext_f16<256,256,8,8,...>`, 320 dispatches.  `native` =
+`GGML_CUDA_FA_STAGE_MAX_MB=1` (bf16 read, no staging); `staged` = the same binary with staging
+allowed (the reference).  Same-build pairs are marked together.
+
+| loader arm | ops / 2 elems | native FA | staged FA | verdict |
+|---|---:|---:|---:|---|
+| **raw bit copy** (bitcast, no convert; floor) | 0 | **198.1 / 198.9 ms** | 206.3 ms | the native *read* is ~4 % **faster** than the dense staged read |
+| RTZ packed (`v_cvt_pkrtz_f16_f32`) | 3 | 270.9 ms | 221.3 ms | still ~50 ms of conversion; wrong values anyway |
+| PACK (`2x v_cvt_f16_f32` full-reg + `v_pack_b32_f16`) | 4 | 276.1 ms | 220.7 ms | **RN-exact** (0/1M mismatches) but no faster |
+| RN baseline (compiler `.l`/`.h`) | 4 | 276.6 / **276.9 ms** | 219.3 / 214.1 ms | reference |
+
+Per-run FA-kernel stats for every profile (old + step 2) are in
+[`profiles/STEP2-FA-KERNEL-STATS.csv`](profiles/STEP2-FA-KERNEL-STATS.csv); the raw traces are the
+`profiles/<label>/` directories.  The staged control drifts 206-221 ms across sessions (clocks/
+thermals), so compare the native arm against a same-session staged run, not across sessions.
+
+* **No sequence helps.**  Going from 4 ops to 3 saves ~5-6 ms of ~63; the RN-exact PACK variant is
+  indistinguishable from the baseline.  The cost is **per converted word**, not per op: any
+  conversion creates an exposed `load -> unpack -> convert -> store` chain (~2 ALU levels) that the
+  loader cannot hide.  This is the key correction to the step-2 premise ("~15 ms of conversion would
+  reach parity"): the conversion is ~63 ms and it is not op-selectable.
+* **The read is not the problem** (the raw-copy arm is faster than the staged dense read), which
+  also retires fixes A/B/C: the native read pattern is already good.
+* **Root cause of the exposure (new, 2026-09-18):** `cp_async_available()` is **NVIDIA-only**, so
+  `ggml_cuda_fattn_mma_get_nstages()` is **0 on RDNA4** — the MMA kernel has *no* multi-stage
+  pipelining on AMD.  The K/V loader is synchronous, so the conversion ALU/latency sits in the
+  critical path next to the MMA instead of overlapping it.  The kernel is at the 256-VGPR ceiling in
+  every variant (scratch 504-536 B), so there is no register budget for deeper prefetch/double
+  buffering.  Combined with the loader re-staging each K/V element per query tile (measured ~3.5x
+  the cache size in conversions), the native path does ~3.5x the conversion work of the one-shot
+  launcher pass (~20 ms), i.e. ~63 ms.
+* The pure-launcher alternative (staging) is the only way to pay the conversion once, and that is
+  exactly what V5 removes — so the trade is **memory (staging scratch) vs ~3.5x conversion ALU**, and
+  on gfx1201 the ALU side cannot be won in the loader.
+
+### Conclusion
+
+**V5 bf16 native stays opt-in.**  The conversion is the RN minimum already; the packed alternatives
+are either RTZ (not bit-exact) or no faster.  Reaching parity would require overlapping the conversion
+with the MMA — i.e. pipelining the AMD loader (there is no `cp_async`, and the kernel has no VGPR
+headroom for software double-buffering).  That is a kernel-structure change, not the loader-only task
+this step was scoped to, and it would need its own A/B.  On gfx950/CDNA4 the picture may differ
+(packed bf16 arithmetic exists there) — see the step-1 patch for that route.
+
+### Correctness / validation (all re-run on the candidate builds)
+
+* `test-backend-ops -b ROCm0 -o FLASH_ATTN_EXT` **5952/5952** with the PACK loader (CPU oracle).
+* The PACK conversion is bit-exact vs `__float22half2_rn` over 2^20 mixed bf16 words (0 mismatches)
+  and exhaustive over the 2^16 bf16 values in the low half.
+* 4B, 5246-token prompt (`prompts/prose-rdna-boosts.txt`), greedy 200 tokens, bf16 K/V:
+  staged vs native text **byte-identical** (`ae0ca6cd1b53`), so the loader is value-transparent.
+* End-to-end `llama-bench` (35B, pp512/2048/8192, r=5, interleaved): native is -0.3/-0.6/-0.8 % vs
+  staged — the FA-kernel conversion cost (~60 ms) only partly offset by the saved launcher pass
+  (~20 ms), diluted by the rest of the model.
+
+### Tooling lesson (2026-09-18)
+
+`tools/profile-fa.sh` forced the native read only when the label was **exactly** `native`; labels
+like `pack_native` silently measured the STAGED arm and produced a false "parity" result that cost a
+full build+profile round.  Fixed: a `*native*` glob now forces `GGML_CUDA_FA_STAGE_MAX_MB=1`.  Always
+cross-check a `native` profile against a same-session `staged` control before believing a delta.
+
+### Reproducing
+
+```bash
+# per-variant (edit GGML_CUDA_FA_BF16_CVT in fattn-mma-f16.cuh: 1=RN, 2=RTZ, 3=raw copy, 4=PACK),
+# the candidate code lives only in this WIP's session history, not in the delivery:
+cd ~/llama.cpp && cmake --build build-rocm --target ggml-hip llama-bench -- -j16   # ~4 min
+M=/llm/models/Qwen3.6/35B-A3B/Q8_0/Qwen3.6-35B-A3B-Q8_0.gguf
+bash ~/llama-cpp-rdna-boosts/wip/bf16-native-prefill/tools/profile-fa.sh rn_native_true   "$M" 8192 0,1
+bash ~/llama-cpp-rdna-boosts/wip/bf16-native-prefill/tools/profile-fa.sh staged_ctl      "$M" 8192 0,1
+python3 ~/llama-cpp-rdna-boosts/wip/bf16-native-prefill/tools/fa-stats.py \
+        ~/llama-cpp-rdna-boosts/wip/bf16-native-prefill/profiles/rn_native_true/prof_kernel_trace.csv 'flash_attn_ext_f16<'
+```

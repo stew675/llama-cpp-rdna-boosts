@@ -1,14 +1,45 @@
-# HANDOVER — bf16 prefill parity, STEP 2: cheapen the bf16→f16 conversion (`wip/bf16-native-prefill`)
+# HANDOVER — bf16 prefill parity (step 2 CLOSED as a negative result)
 
-**Status: step 1 (route 2, native bf16 MMA) is CLOSED as a negative result. Step 2 is the live task.
-Nothing pushed except this repo's own `origin/main`.**
+**Status: step 1 (route 2, native bf16 MMA) and step 2 (cheapen the bf16→f16 conversion) are both
+CLOSED as negative results.**  The V5 bf16-native arm cannot reach prefill parity on gfx1201: the
+in-loader conversion is already the RN minimum, and no cheaper sequence exists.  Nothing pushed
+except this repo's own `origin/main`.
 Repo root: `~/llama-cpp-rdna-boosts` — read `AGENTS.md` first; its rules override anything here.
-Project record: `wip/bf16-native-prefill/README.md` (the full narrative; §"Route 2 implemented",
-§"Attempt 2", §"What it would actually take" are the load-bearing parts).
+Project record: `wip/bf16-native-prefill/README.md` — **the load-bearing part is the new section
+"Step 2 findings (2026-09-18, fifth pass) — CLOSED as a negative result"**; §2a/§2b/§2c below are
+superseded by it where they disagree.
 
 ---
 
-## 0. Mandate (step 2)
+## 0. Outcome (step 2)
+
+Three conversion sequences were implemented in `flash_attn_ext_f16_load_tile_bf16` and measured in
+the real kernel (35B-A3B pp8192, 2×R9700, `-sm layer`):
+
+| loader | ops / 2 elems | native FA | staged FA |
+|---|---:|---:|---:|
+| raw bit copy (floor, wrong values) | 0 | **198 ms** | 206 ms |
+| RTZ packed `v_cvt_pkrtz_f16_f32` | 3 | 270.9 ms | 221.3 ms |
+| PACK `2× v_cvt_f16_f32` + `v_pack_b32_f16` (**bit-exact RN**, exhaustive 2^16×2) | 4 | 276.1 ms | 220.7 ms |
+| RN baseline (compiler `.l`/`.h`) | 4 | 276.9 ms | 214.1 ms |
+
+**No sequence reaches parity.**  4→3 ops saves ~5-6 ms of ~63; the RN-exact PACK form is no faster
+than the baseline.  The cost is **per converted word**, not per op — and the native *read* is already
+~4 % faster than the staged dense read, so fixes A/B/C in the README are moot.  **V5 stays opt-in;
+no delivery change.**
+
+The structural reason (new): `cp_async_available()` is NVIDIA-only, so `nstages = 0` on RDNA4 — the
+AMD MMA loader is synchronous and the conversion ALU/latency is exposed next to the MMA.  The kernel
+is at the 256-VGPR ceiling in every variant, so there is no register budget for prefetch. Hiding the
+conversion would need a loader/kernel pipelining change (its own A/B), not a loader-only tweak.
+
+Also fixed: `tools/profile-fa.sh` only forced the native read for the exact label `native`, so
+`pack_native`-style labels silently measured STAGED (a false parity result that cost a round).  It
+now matches `*native*`.
+
+---
+
+## 0b. Historical mandate (superseded — kept for context)
 
 **Make the delivery's V5 bf16-native flash-attention arm reach prefill *parity* with the
 F16-staging path by making the in-register bf16→f16 conversion cheap — keeping f16 compute.**
@@ -130,53 +161,22 @@ stay **5952/5952**.
 
 ---
 
-## 3. The task
+## 3. The task — **DONE (negative result)**
 
-1. **First, see what the conversion currently costs in ISA.** Build a one-file probe (or `-S` the
-   real TU) for gfx1201 and dump the emitted sequence for
-   `__float22half2_rn(ggml_cuda_cast<float2>(x))` on an `nv_bfloat162`, i.e. the per-chunk inner
-   loop. Count the ops per 2 elements. Baseline that before changing anything — the whole task is
-   "get this sequence shorter / onto the idle pipe".
-   ```bash
-   cd ~/llama.cpp
-   cat > /tmp/cvt.hip <<'EOF'
-   #include <hip/hip_runtime.h>
-   #include <hip/hip_fp16.h>
-   #include <hip/hip_bfloat16.h>
-   typedef __hip_bfloat162 nv_bfloat162;
-   __global__ void k(const nv_bfloat162 *i, half2 *o, int n) {
-       int j = blockIdx.x*blockDim.x + threadIdx.x; if (j >= n) return;
-       nv_bfloat162 x = i[j];
-       o[j] = __float22half2_rn(make_float2(__bfloat162float(__low2bfloat16(x)),
-                                            __bfloat162float(__high2bfloat16(x))));
-   }
-   EOF
-   /opt/rocm-7.14-gfx1201/bin/hipcc -O3 --offload-arch=gfx1201 --cuda-device-only -S -o /tmp/cvt.s /tmp/cvt.hip
-   awk '/_Z1k/,/s_endpgm/' /tmp/cvt.s | grep -E "^\s+v_|^\s+s_" | head -30
-   ```
-   (If the `__hip_bfloat162` type is not found, `-I/opt/rocm-7.14-gfx1201/include`; this exact
-   include dance burned time before — see README.) Then, for any candidate mnemonic you want to
-   use, **prove it with `-c`**, not `-S`.
-2. **Write the minimal bf16→f16 sequence.** The mathematical minimum per 2 elements is:
-   bf16→f32 as an integer op (`v_lshlrev_b32 x,16` / `v_and_b32 x,0xffff0000`) for the low/high
-   halves, then one packed f32→f16 (`s_cvt_f16_f32` + `s_pack_ll_b32_b16`, or whatever gfx12
-   actually offers — find the real packing op with an ISA probe). Targets, in order:
-   * avoid HIP's `__low2bfloat16`/`__high2bfloat16`/`__bfloat162float` round-trip if it emits more
-     than the shift/and pair;
-   * keep the whole sequence on the **scalar (SALU)** pipe if possible — the loader's pressure is
-     on the vector/memory pipe and the kernel is VGPR-ceiling-bound, so SALU work can overlap;
-   * consider processing 32 bytes per thread iteration if the smem swizzle granularity permits it
-     (it is 16 B — check before assuming);
-   * **do not** add live registers/locals to the hot loop (that is how step 1's fix lost).
-3. **A/B and measure** (§4). Iterate on the loader only; keep the diff minimal and local.
+> **Result:** the emitted sequence is already the RN minimum, and no candidate (RTZ packed, RN-exact
+> PACK) reaches parity.  The SALU suggestion in task 2 below is impossible (the tile data is
+> per-lane; scalar converts cannot be used) and the earlier "~15 ms of conversion would reach
+> parity" premise is wrong (the cost is ~63 ms and per-word, not per-op).  Tasks 1-3 below are kept
+> as the method; see §0 for the outcome.
 
-**Fallback / honest outcome:** if the conversion cannot be made cheap (e.g. the minimum sequence is
-already what the compiler emits and the 57 ms is inherent), then the answer is "V5 stays opt-in"
-plus the measured reason, and step 2 is documented as closed. A negative result with a clean
-decomposition is a valid deliverable here — step 1 is the precedent. **Do not force a change.**
-
-**Also document** (small, cheap, valuable): the corrected root cause (§2b) belongs in `TODO.md`
-item 23 and the block-15 notes so nobody re-derives the de-interleave story.
+1. **See what the conversion currently costs in ISA** (done).  The compiler emits, per 32-bit word
+   (2 bf16 elements): `v_lshlrev_b32` + `v_and_b32` + `v_cvt_f16_f32 v.l` + `v_cvt_f16_f32 v.h` =
+   **4 ops**.  Assemble-probe the candidates with `llvm-mc -triple=amdgcn -mcpu=gfx1201` (never trust
+   `-S`): `v_cvt_pk_f16_f32` (packed RN) is **absent**; `v_cvt_pkrtz_f16_f32` (packed RTZ) and
+   `v_pack_b32_f16` exist.
+2. **The minimal sequence.**  The only cheaper packed form is RTZ (3 ops), which is **not bit-exact**
+   for f16 subnormals; an RN-exact form (`2× v_cvt_f16_f32` full-reg + `v_pack_b32_f16`, 4 ops) is
+   no faster.  Neither reaches parity.
 
 ---
 
@@ -275,19 +275,14 @@ External context: `archive/work/arch-independent-memory/BF16-NATIVE-KV-PLAN.md` 
 Work in /home/stew675/llama-cpp-rdna-boosts.  Read AGENTS.md first (its rules override
 everything else), then wip/bf16-native-prefill/HANDOVER.md and wip/bf16-native-prefill/README.md.
 
-This is STEP 2 of the bf16 prefill-parity project: make the delivery's V5 bf16-native
-flash-attention arm reach prefill parity with the F16-staging path by making the in-register
-bf16->f16 conversion in the MMA tile loader CHEAP.  Do NOT try to remove the F16 compute -- that
-was step 1 (full native bf16 MMA) and it is measured-dead on gfx1201: bf16 WMMA is equal-rate to
-f16 but gfx1201 has no packed bf16 arithmetic and no bf16->f16 pack, so the element-wise glue
-costs more than the conversion it removes.  See HANDOVER sections 2a-2c.
+NOTE: this project's step 2 (cheapen the bf16->f16 conversion in the MMA tile loader) is
+CLOSED as a negative result -- see HANDOVER section 0 and README "Step 2 findings".  The
+conversion is already the RN minimum, and neither the packed RTZ form nor an RN-exact
+v_pack_b32_f16 form reaches parity; V5 stays opt-in.  Only reopen with a NEW idea (e.g. AMD
+loader pipelining, or gfx950/CDNA4 packed-bf16 hardware), not by re-trying the sequences.
 
-The target function is flash_attn_ext_f16_load_tile_bf16 in
-ggml/src/ggml-cuda/fattn-mma-f16.cuh (~line 471); the current inner loop is
-tmp[l] = __float22half2_rn(ggml_cuda_cast<float2>(tmp_bf[l])).  Start by dumping the emitted
-ISA for that sequence (HANDOVER section 3 has the exact probe), then hand-write the minimal
-bf16->f16 sequence using only ops that ASSEMBLE on gfx1201 (prove with `-c`, never trust -S).
-bf16->f16 is exact, so the output must stay byte-identical.
+The target function was flash_attn_ext_f16_load_tile_bf16 in
+ggml/src/ggml-cuda/fattn-mma-f16.cuh; the delivery tree is restored to the unmodified state.
 
 Measure with the kernel-level instrument, not end-to-end guesses:
 wip/bf16-native-prefill/tools/profile-fa.sh / fa-stats.py.  Baseline: V5 FA kernel 276.6 ms,

@@ -94,22 +94,28 @@ experiment is **validated but not yet promoted**; Action E is resolved (no deliv
 
 ### 23. Native bf16 prefill parity (the V5 penalty)
 
-**Opened 2026-09-18.**  Block 15's V5 arm (`GGML_CUDA_FA_KV_NATIVE=1`) reads bf16 K/V natively in the
-MMA FA kernel and removes the F16 staging scratch, so a **bf16 cache costs what an f16 cache costs**
-(memory + output).  It is **~1-2 % slower at prefill** than bf16-with-staging, which is why it ships
-opt-in — the repo's "native BF16 support" arc is not at parity.  **Root cause (recorded by the V5
-campaign):** the F16 staging pass is really a *de-interleave*; the raw WMMA cache interleaves the GQA
-heads (`nb[1]` = 4 rows for the 27B's 4 K/V heads), and the tile loader re-reads that strided view on
-every K/V staging pass, whereas the staged F16 copy is dense.  The conversion is **free** (native bf16
-is within **0.17 %** of an f16 cache), and `cp_async` is NVIDIA-only, so it is purely the access
-pattern.  **Goal:** native bf16 at prefill parity (or faster) so V5 can be default-on and the arena
-blind spot disappears.  **First experiments:** confirm the GQA-ratio scaling (a `n_head_kv == 1` model
-should show a free native arm), then profile (`rocprofv3`) native vs staged memory-pipe/L2.  **Fix
-candidates:** (A) restrict the arm to already-dense `nb[1] == ne[0]*2` layouts (small, partial),
-(B) read the native staging densely / process all K/V heads of a token together (medium, the target),
-(C) make the KV cache head-major (large, upstream scope).  Full brief, measured table, protocol and
-references: [`wip/bf16-native-prefill/README.md`](wip/bf16-native-prefill/README.md); the V5 plan:
-`archive/work/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`.
+**Opened 2026-09-18.  CLOSED 2026-09-18 as a *won't fix in the loader* — V5 stays opt-in.**  Block 15's
+V5 arm (`GGML_CUDA_FA_KV_NATIVE=1`) reads bf16 K/V natively in the MMA FA kernel and removes the F16
+staging scratch, so a **bf16 cache costs what an f16 cache costs** (memory + output).  It is **~1-2 %
+slower at prefill** than bf16-with-staging, which is why it ships opt-in.  **Root cause (corrected
+twice):** it is *not* the GQA de-interleave (the raw interleaved read is, if anything, ~4 % **faster**
+than the dense staged read — a zero-conversion copy loader measures 198 ms vs the staged 206 ms), it
+is the **in-loader bf16→f16 conversion, re-paid on every K/V tile re-read** (~3.5× the cache size, so
+~63 ms of FA kernel vs the launcher's one-shot ~20 ms pass).  **The conversion cannot be cheapened:**
+the compiler already emits the RN minimum (`v_lshlrev_b32` + `v_and_b32` + 2× `v_cvt_f16_f32`);
+gfx12 has **no packed RN f32→f16** (`v_cvt_pk_f16_f32` absent — assembler-verified), and the only
+packed form is RTZ (`v_cvt_pkrtz_f16_f32`, not bit-exact) which saves only ~5-6 ms of ~63.  An
+RN-exact `v_pack_b32_f16` form is bit-identical (exhaustive over 2^16 bf16 values) but **no faster**.
+The cost is per converted **word** (an exposed `load→unpack→convert→store` chain), not per op; the
+structural reason is that `cp_async_available()` is NVIDIA-only, so the AMD MMA kernel has **no
+multi-stage pipelining** (`nstages = 0`) and the conversion sits in the critical path, with the
+kernel already at the 256-VGPR ceiling (no prefetch headroom).  Reaching parity would need AMD loader
+pipelining (its own A/B) or gfx950/CDNA4 packed-bf16 hardware — not a loader-only tweak.  Full
+evidence, ISA matrix and the candidate measurements: [`wip/bf16-native-prefill/README.md`](wip/bf16-native-prefill/README.md)
+("Step 2 findings") and its `HANDOVER.md` §0; the V5 plan:
+`archive/work/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`.  Fix candidates A (dense-layout gate),
+B (reorder the loader) and C (head-major cache) are all **retired** — the read pattern is not the
+cost.
 
 ### 22. Adaptive-MTP behaviour after recent performance tuning — climb/drop retune (issue #35)
 
