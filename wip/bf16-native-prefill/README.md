@@ -255,3 +255,71 @@ it only affects the prefill width (`native_width`), so decode is unchanged.
   Local model spread available: E4B (kv 2, head 512, ISWA), Qwen3.5-4B/9B
   (kv 4), Qwen3.6/3.8-27B (kv 4), 35B-A3B (kv 2, gqa 8), Gemma4-31B (per-layer
   kv 16/4).
+
+## Route 2 implemented — first result (2026-09-18, third pass)
+
+The native bf16 MMA arm is **implemented and working** (env gate `GGML_CUDA_FA_BF16_MMA=1`,
+temporary).  Design/plan: [`IMPLEMENTATION-PLAN.md`](IMPLEMENTATION-PLAN.md).
+
+**What was built** (all in `~/llama.cpp`, uncommitted local WIP):
+
+* `mma.cuh`: bf16 low/high pack helpers, generic-tile `load_ldmatrix_trans` `I==32` branch,
+  `get_bfloat162` (P conversion), the `nv_bfloat162` I_MAJOR_SCRAMBLED C tile + `unscramble`, and
+  two bf16 `mma()` overloads — `tile<16,8,bf16>` bf16-accumulate (VKQ) and the SCRAMBLED
+  `tile<16,16,bf16> x tile<32,8,bf16>` split (KQ uses the pre-existing f32-accumulate overload).
+* `fattn-mma-f16.cuh`: `mma_tile_sizes_kv<DV,ncols,use_bf16>`, `bool use_bf16` on the kernel and
+  `process_tile` (the `iter` body **derives** the element type from its tile types), `kv_t` smem
+  tiles, bf16 Q-fill / P-conversion / V-tile zeroing / VKQ rescale / output combine, and a
+  `kv_bf16` loader flag that turns the `FATTN_KV_NATIVE_BF16` arm into a plain 16-byte **byte copy**
+  (bf16 and f16 are byte-identical, so the old F16 loader serves both — no conversion at all).
+* `fattn-swizzle.cuh`: the `load_ldmatrix`/`_trans` helpers are now element-type-generic.
+* `fattn-common.cuh`: `GGML_CUDA_FA_BF16_MMA` gate (implies the bf16 native read, so the launcher,
+  the predicates and `get_alloc_size` agree) + a `force_native_kv` arg to `launch_fattn` so the
+  bf16 kernel never stages.
+* `fattn-mma-f16.cuh` case fn: runtime selection (see the trap below).
+
+**Trap found (worth remembering):** `RDNA4` / `AMD_WMMA_AVAILABLE` are **device-pass-only** macros
+(`__GFX12__` is not defined in the hipcc *host* pass).  A host-side `#if defined(RDNA4)` around the
+kernel selection compiled the whole branch out, the bf16 kernel was never instantiated, and the arm
+silently never fired.  The arch test must be the **runtime** `GGML_CUDA_CC_IS_RDNA4(cc)`; the
+element type must be derived from the *tiles* (not the flag) so a non-RDNA4 device falls back to the
+f16 tiles consistently.
+
+**Correctness:** `test-backend-ops -o FLASH_ATTN_EXT` with the gate ON is **5952/5952** against the
+CPU oracle, and a short greedy run is coherent.  (Note: the bf16 arm deliberately computes at bf16
+precision, so it is *not* bit-identical to the f16 reference — that is the accepted route-2 trade.)
+
+**Performance — the arm works but is SLOWER on gfx1201 (do not ship as is).**
+
+`rocprofv3`, Qwen3.6-35B-A3B pp8192, 2×R9700, FA-kernel totals:
+
+| arm | FA kernel | convert_unary | notes |
+|---|---|---|---|
+| f16 cache (raw, no conversion) | 219.3 ms | 0 | the ceiling to beat |
+| bf16 staged (f16 kernel, dense F16 copy) | 213.2 ms | 19.7 ms | today's default |
+| bf16 + V5 (`GGML_CUDA_FA_KV_NATIVE=1`) | 276.6 ms | 0.5 ms | today's opt-in |
+| **bf16 + route 2 (`GGML_CUDA_FA_BF16_MMA=1`)** | **321.7 ms** | **0** | fires (`use_bf16=true`), no staging |
+
+So removing the conversion is real (convert_unary 19.7 -> 0, F16 scratch gone) but the kernel got
+*47 % slower* than the f16-cache arm — the bf16 WMMA path is a net loss as written.
+
+**Why (diagnosed, not yet fixed).**  The WMMA instructions are *not* the cause: a warmed-up
+microbench (`tools/wmma-bench`-style) shows `wmma_f32_16x16x16_bf16` = 0.99x the f16 equivalent and
+`wmma_bf16_16x16x16_bf16` = 1.00x, and the two kernels have identical VGPR/SGPR (256/128) and
+workgroup/grid shape.  The cost is the **element-wise glue**, where f16 has packed native ops and
+bf16 does not:
+* the VKQ accumulator rescale `VKQ_C[i].x[l] *= KQ_max_scale` — f16 = one `v_pk_mul_f16`;
+  `__hip_bfloat162::operator*` converts both operands to f32, multiplies and packs back
+  (~10 ops per element pair), and it runs over the whole accumulator on every k-tile iteration;
+* the P conversion (`get_bfloat162`, scalar `__float2bfloat16` x2) vs one packed
+  `__float22half2_rn`; the output combine (`kv_to_float2` bf16 = 2 scalar converts) vs one
+  `__half22float2`.
+
+**Next step (the promising fix):** stop doing arithmetic in bf16.  Switch `T_C_VKQ` to **f32**
+(the MFMA path already does this, and it matches the TILE kernel's f32 accumulation): the VKQ mma
+becomes the f32-accumulate `wmma_f32_16x16x16_bf16` (measured equal-rate to f16), the rescale
+becomes a scalar f32 multiply, there is no `unscramble`, and the P/output glue becomes f32.  That
+removes every per-element bf16 conversion from the inner loops.  The output-combine path stores the
+f32 accumulator into `tile_Q` as 16-bit values, so that branch needs a bf16-aware variant (it
+currently casts to `half*`).  Until that is done and measured, route 2 is **not** a win and V5
+correctly stays opt-in.
