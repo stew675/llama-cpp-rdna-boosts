@@ -3,6 +3,10 @@
 **Status: ACTIVE (opened 2026-09-18).  Not part of the delivery.**  Everything
 here is experimental until promoted (see the AGENTS.md promotion rule).
 
+> **New session?  Start with [`HANDOVER.md`](HANDOVER.md)** — the turnkey brief
+> (mandate, environment, established facts, the profile-first investigation plan,
+> fix candidates, and a copy-paste prompt).  This README is the project record.
+
 ## Goal (maintainer's "dream")
 
 **Native bf16 K/V must reach prefill parity with the F16-staging path** — and,
