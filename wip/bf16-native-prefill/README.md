@@ -4,8 +4,18 @@
 here is experimental until promoted (see the AGENTS.md promotion rule).
 
 > **New session?  Start with [`HANDOVER.md`](HANDOVER.md)** — the turnkey brief
-> (mandate, environment, established facts, the profile-first investigation plan,
-> fix candidates, and a copy-paste prompt).  This README is the project record.
+> (mandate, environment, established facts, the task, and a copy-paste prompt).
+> This README is the project record; the dated sections below are the log.
+
+> **CURRENT STEP (2026-09-18): step 2 — cheapen the bf16→f16 conversion in the MMA
+> tile loader, keeping f16 compute.**  Step 1 (full native bf16 MMA = "no F16 at
+> all") is **CLOSED as a negative result**: it is implemented and correct but
+> *slower* (321.7 ms vs the staged 232.9 on the 35B FA kernel), because gfx1201 has
+> no packed bf16 arithmetic and no bf16→f16 pack, so removing the conversion costs
+> more than it saves.  See "Route 2 implemented", "Attempt 2" and "What it would
+> actually take" below, and `patches/route2-native-bf16-mma.patch` (kept for
+> re-testing on gfx950/CDNA4).  Step 2's floor and target are in the table in
+> "What it would actually take".
 
 ## Goal (maintainer's "dream")
 
