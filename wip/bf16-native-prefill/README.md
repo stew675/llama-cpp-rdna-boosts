@@ -323,3 +323,46 @@ removes every per-element bf16 conversion from the inner loops.  The output-comb
 f32 accumulator into `tile_Q` as 16-bit values, so that branch needs a bf16-aware variant (it
 currently casts to `half*`).  Until that is done and measured, route 2 is **not** a win and V5
 correctly stays opt-in.
+
+### Attempt 2: f32 VKQ accumulator — also worse (2026-09-18, fourth pass)
+
+Hypothesis: the cost was the bf16 *element-wise* glue (the VKQ rescale using
+`__hip_bfloat162::operator*` instead of one `v_pk_mul_f16`).  Fix tried: set the bf16 arm's
+`T_A_VKQ = tile<16,8,bf16>`, `T_C_VKQ = tile<16,16,float>` (the MFMA shape) so the VKQ mma is the
+equal-rate f32-accumulate `wmma_f32_16x16x16_bf16`, the rescale is a scalar f32 multiply, there is
+no `unscramble`, and the P/output glue is f32; the output-combine store got a bf16-aware 2-byte
+variant.
+
+**It is slower still** — and the metadata says why: an f32 VKQ accumulator spans twice the DV
+width per tile, so `VKQ_C` doubles (DV/16 x 8 floats = 128 VGPRs) and the kernel, already pinned at
+the 256-VGPR ceiling, spills much harder.
+
+| arm | FA kernel | Scratch (spill) | VGPR |
+|---|---|---|---|
+| f16 raw cache (ceiling) | 219.3 ms | 520 B | 256 |
+| bf16 staged | 213.2 ms | 520 B | 256 |
+| bf16 + V5 (convert loader) | 276.6 ms | 520 B | 256 |
+| bf16 full, bf16-accumulate VKQ | 321.7 ms | 372 B | 256 |
+| bf16 full, f32-accumulate VKQ | 389.4 ms | 948 B | 256 |
+
+**Decomposition (FA kernel, 35B-A3B pp8192):** the native read itself is fine (the raw f16 read with
+the same interleaved stride and the same F16 loader is 219.3 ms), the in-register conversion costs
+~57 ms (219.3 -> 276.6, the original V5 finding), and the **bf16 compute path costs a further
+~45 ms versus the f16 compute path** (276.6 -> 321.7).  So the element type swap *costs more than
+the conversion it removes* (~102 ms of bf16 compute penalty vs the 19.7 ms launcher conversion + the
+~57 ms in-kernel conversion).
+
+**Conclusion (route 2 does not reach parity on gfx1201):** the bf16 WMMA instructions are the same
+rate as f16 (measured, warmed clocks: 0.99x and 1.00x) and occupancy is identical, yet a kernel
+whose operands and smem tiles are bf16 is consistently and substantially slower than the f16 one.
+The likely reasons are the absence of packed bf16 arithmetic (`v_pk_mul_f16` /
+`__float22half2_rn` / `__half22float2` have no bf16 equivalents used here, so the glue goes through
+f32) plus the compiler's handling of `__hip_bfloat162`, against a kernel that is already at the
+256-VGPR ceiling in every variant.  Full bf16 accumulation also *doubles* the VKQ register
+footprint, and the f32-accumulator variant measurably worsens the spills.
+
+**Recommendation:** keep V5 opt-in as today; do **not** ship the full bf16 MMA arm.  If the ~1 %
+bf16 prefill delta ever needs to be recovered, the route is *not* "remove the F16"; it is either a
+GPU with packed bf16 element-wise ops, or an f16 *staging type* question (the de-interleave without
+the type change), both out of scope here.  This is a well-evidenced negative result: the remaining
+f16 is not what makes bf16 slow.
