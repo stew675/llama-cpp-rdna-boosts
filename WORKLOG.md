@@ -1,5 +1,36 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-18 (r4) — `v16-ebbb18522-r4`: RDNA3_0 (gfx1100) keeps the stock FA `ncols2` under tensor split (issue #30)
+
+**Release.** `v16-ebbb18522-r4`, fork point `ebbb18522` (unchanged).  Canonical 16-block tip
+**`ba9e18cacfa3f97f13a822dded971eeb2cce2480`**, net tree **`b84b1783f7207e25600403df5a8e98c183b9f80a`**;
+blocks 00-03 and 05-15 are content-identical to r3 (`3f3dfcfaa…`), the tree delta is the `fattn.cu`
+hunk in block 04 (one condition + its comment; the later blocks' `fattn.cu` hunks shift by the five
+added lines).  Strict 16/16 `git am` re-verified on a fresh
+`ebbb18522` tarball (`scripts/validate-set.sh` green: checksums, base tree, applied tree).
+
+**Issue.**  [#30 comment](https://github.com/stew675/llama-cpp-rdna-boosts/issues/30#issuecomment-5735239749)
+(@a-n-t-0, 2× RX 7900 XTX / gfx1100, `-sm tensor`): the 2026-09-14 split-aware `ncols2` (the
+`ggml_set_fa_tensor_parallel` frontend hint switches tensor-split ATTENTION to the wider generic
+`ncols2 = 8`) was tuned on RDNA4.  On RDNA3_0 it costs deep prefill: `pp100K` 667.5 vs stock 805.0
+t/s (crosses stock between 8K and 32K), while decode stays ahead of stock.  Changing only
+`if (amd_wmma_available(cc) && !tensor_parallel)` to `if (amd_wmma_available(cc))` recovers `pp100K`
+to 779.4 / `pp65536` 940.4 / `pp32768` 1152.2 t/s with `tg128` unchanged.
+
+**Fix.**  Block 04, `ggml/src/ggml-cuda/fattn.cu`:
+`const bool tensor_parallel = ggml_get_fa_tensor_parallel() && !GGML_CUDA_CC_IS_RDNA3_0(cc);` — RDNA3_0
+always takes the stock AMD rule (minimize wasted compute); RDNA4/RDNA3_5 keep the split-aware
+behaviour.  A single gfx1100 card already had `tensor_parallel == false` (`n_cuda_dev == 1`), so the
+change is a no-op there.
+
+**Verification.**  RDNA4 (3× R9700): the guard is constant-false for gfx1201, and measured as
+equivalent — same-seed greedy text bit-identical for `-sm tensor` (`c3b81052c480`) and `-sm layer`
+(`4b8de6d3c871`), `FLASH_ATTN_EXT` 5952/5952, `llama-bench -d 100000` pp4096 parity across interleaved
+runs (pre 4300.18/4298.13, post 4297.12/4298.27).  RDNA3_0 single RX 7900 XTX (9B Q8_0, `-d 100000`):
+pre- and post-fix binaries in the same band (pp4096 1367-1398 t/s) and both ahead of the stock
+`ebbb18522` build (1351.0/1344.7); `tg128` 62.94 vs stock 59.89.  The gfx1100 **tensor-split** mode is
+community-validated (the reporter's dataset); it cannot be exercised on a single card.
+
 ## 2026-09-18 (r3) — `v16-ebbb18522-r3`: the `--fit` SIGSEGV with `draft-mtp-adaptive` (issue #38)
 
 **Release.** `v16-ebbb18522-r3`, fork point `ebbb18522` (unchanged).  Canonical 16-block tip

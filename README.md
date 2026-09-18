@@ -237,8 +237,12 @@ for per-block verification and `BASELINE.md` for provenance.
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`ebbb18522`** (upstream master "openvino : Update OpenVINO to 2026.4", 2026-09-17 re-base).
-- Canonical 16-block chain: tip **`3d71f34794b2ec929ac92314e0091722c478956b`**, net tree
-  **`3f3dfcfaa1795e9bd475d56ea695b90daea5b5fa`**; release **`v16-ebbb18522-r3`**.
+- Canonical 16-block chain: tip **`ba9e18cacfa3f97f13a822dded971eeb2cce2480`**, net tree
+  **`b84b1783f7207e25600403df5a8e98c183b9f80a`**; release **`v16-ebbb18522-r4`**.
+- **gfx1100 (RDNA3_0) tensor split keeps the stock AMD FA `ncols2` rule** (block 04, issue #30):
+  the 2026-09-14 split-aware hint (wider generic `ncols2` for tensor-split attention) was RDNA4-tuned
+  and cost RDNA3_0 deep prefill (`pp100K` 667.5 -> 779.4 t/s on 2× RX 7900 XTX, stock 805.0; decode
+  unchanged).  A single gfx1100 card is unaffected (it already took the AMD rule).
 - `--fit` no longer SIGSEGVs with `--spec-type draft-mtp-adaptive` and a minimal per-tier MTP
   head (issue #38; block 01, one line in `common/common.cpp`).
 - A clean HIP build no longer prints the ~10k FA "loop not unrolled" warnings

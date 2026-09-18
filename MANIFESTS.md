@@ -12,12 +12,14 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release (2026-09-18) — `v16-ebbb18522-r3`:** a block-01 amendment on top of the r2 re-base —
-the `--fit` path in `common_init_result` now uses `params.speculative.has_mtp()` instead of the
-pre-adaptive manual find, so `--spec-type draft-mtp-adaptive` with a minimal per-tier MTP head no
-longer SIGSEGVs the fit probe (issue #38).  Canonical tip
-`3d71f34794b2ec929ac92314e0091722c478956b`, tree `3f3dfcfaa1795e9bd475d56ea695b90daea5b5fa`, strict
-16/16 — see `WORKLOG.md` 2026-09-18 (r3) and `patches/README.md`.
+**Current release (2026-09-18) — `v16-ebbb18522-r4`:** a block-04 amendment on top of r3 — under
+`-sm tensor` RDNA3_0 (gfx1100) keeps the stock AMD FA `ncols2` rule (the 2026-09-14 split-aware hint
+was RDNA4-tuned and cost gfx1100 deep prefill: 2× RX 7900 XTX `pp100K` 667.5 -> 779.4 t/s, stock
+805.0; decode unchanged).  Canonical tip
+`ba9e18cacfa3f97f13a822dded971eeb2cce2480`, tree `b84b1783f7207e25600403df5a8e98c183b9f80a`, strict
+16/16 — see `WORKLOG.md` 2026-09-18 (r4) and `patches/README.md`.  **r3 (2026-09-18)** fixed the
+`--fit` startup SIGSEGV with `--spec-type draft-mtp-adaptive` and a minimal per-tier MTP head (issue
+#38; block 01, one line in `common/common.cpp`).
 
 **Re-base (2026-09-17) — release `v16-ebbb18522-r2`:** the 16-block set re-based onto
 upstream master `ebbb18522` (37 commits past `d1d3c3396`).  Three blocks needed resolution: block 02

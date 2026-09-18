@@ -15,10 +15,11 @@ remain as known-good records for those upstream versions.
 
 > **Current baseline marker:** `baseline/d1d3c3396` was the previous (2026-09-15)
 > delivery baseline.  The current one is **`ebbb18522`** (2026-09-17), the fork point of
-> release **`v16-ebbb18522-r3`** (canonical tip
-> `3d71f34794b2ec929ac92314e0091722c478956b`, tree
-> `3f3dfcfaa1795e9bd475d56ea695b90daea5b5fa`; r3 = the 2026-09-18 block-01 `--fit` fix for
-> `draft-mtp-adaptive`, issue #38 — base `ebbb18522` unchanged from r2).  `baseline/790cf51aa` remains the
+> release **`v16-ebbb18522-r4`** (canonical tip
+> `ba9e18cacfa3f97f13a822dded971eeb2cce2480`, tree
+> `b84b1783f7207e25600403df5a8e98c183b9f80a`; r4 = the 2026-09-18 block-04 RDNA3_0 tensor-split
+> `ncols2` fix for issue #30, on top of r3's 2026-09-18 block-01 `--fit` fix for `draft-mtp-adaptive`,
+> issue #38 — base `ebbb18522` unchanged from r2).  `baseline/790cf51aa` remains the
 > (2026-09-13) marker.  None of these is one of the historical pre-block-12
 > checkpoints listed below; those remain frozen records.
 
@@ -46,8 +47,8 @@ bottom of this file): block 00 = the structural/architecture fixes added
 2026-09-10 (FA small-batch KV-split width invariance + Vulkan masked-V), and
 blocks 01-15 = the fork's `rdna-boosts` block
 commits.  The canonical 16-block chain for the `ebbb18522` base is tip
-`3d71f34794b2ec929ac92314e0091722c478956b`, tree
-`3f3dfcfaa1795e9bd475d56ea695b90daea5b5fa` (release **`v16-ebbb18522-r3`**, the 2026-09-18 block-01 `--fit` fix for issue #38 on the same base;
+`ba9e18cacfa3f97f13a822dded971eeb2cce2480`, tree
+`b84b1783f7207e25600403df5a8e98c183b9f80a` (release **`v16-ebbb18522-r4`**, the 2026-09-18 block-04 RDNA3_0 tensor-split `ncols2` fix for issue #30 on top of r3's 2026-09-18 block-01 `--fit` fix for issue #38 on the same base;
 r2 was the 2026-09-17 re-base of the 16-block set onto upstream master `ebbb18522`, 37 commits past
 `d1d3c3396`, whose three resolved blocks were block 02's Vulkan GATED_DELTA_NET check-results clone
 (moved upstream to `ggml-vulkan-debug.cpp`), block 12's upstream HIP AllReduce enablement (the delivery

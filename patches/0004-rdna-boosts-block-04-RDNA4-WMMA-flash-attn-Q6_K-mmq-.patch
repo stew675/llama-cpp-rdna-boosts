@@ -1,4 +1,4 @@
-From 219aae6faadd0da7450fe3096b4955b5bd8e414a Mon Sep 17 00:00:00 2001
+From 131e6a6bcc55159401f2109662e7ab32714f2d37 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 04/15] rdna-boosts: block 04: RDNA4 WMMA flash-attn + Q6_K mmq
@@ -7,14 +7,14 @@ Subject: [PATCH 04/15] rdna-boosts: block 04: RDNA4 WMMA flash-attn + Q6_K mmq
 ---
  ggml/include/ggml.h                  |  5 ++
  ggml/src/ggml-cuda/fattn-mma-f16.cuh | 42 ++++++++++----
- ggml/src/ggml-cuda/fattn.cu          | 40 ++++++++++++--
+ ggml/src/ggml-cuda/fattn.cu          | 45 +++++++++++++--
  ggml/src/ggml-cuda/ggml-cuda.cu      | 82 ++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/mmq-vec-dot.cuh   | 38 ++++++++++++-
  ggml/src/ggml-cuda/mmq.cuh           |  4 ++
  ggml/src/ggml.c                      | 11 ++++
  src/llama-context.cpp                | 12 ++++
  tests/test-backend-ops.cpp           | 34 +++++++++++-
- 9 files changed, 248 insertions(+), 20 deletions(-)
+ 9 files changed, 253 insertions(+), 20 deletions(-)
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 5a3d66a99..3226270f7 100644
@@ -135,10 +135,10 @@ index 863fa36e7..7562538bc 100644
          kbc -= kbc % iter_k;
  
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 882fe5d91..3129b3e16 100644
+index 882fe5d91..e02270c43 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -221,8 +221,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
+@@ -221,8 +221,19 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
          }
      }
  
@@ -149,13 +149,18 @@ index 882fe5d91..3129b3e16 100644
 +    // per-GPU bandwidth-bound and prefers the wider generic ncols2 (fewer K/V re-reads).  The frontend
 +    // sets the hint (llama_context: split_mode == LLAMA_SPLIT_MODE_TENSOR with > 1 GPU).
 +    // Measured on 27B head-256: single 703.7 vs 664.8, tensor 1152.3 vs 1219.9 t/s.
-+    const bool tensor_parallel = ggml_get_fa_tensor_parallel();
++    // 2026-09-18 (issue #30): that split-aware rule is RDNA4-tuned.  On RDNA3_0 (gfx1100) the wider
++    // generic ncols2 loses deep prefill under tensor split (2x RX 7900 XTX, 27B Q8_0 f16 pp100K:
++    // 667.5 vs stock 805.0 t/s = ~17%, crossing stock between 8K and 32K), while decode is
++    // unaffected.  RDNA3_0 therefore keeps the stock AMD rule (minimize wasted compute) regardless
++    // of the tensor-split hint; RDNA4/RDNA3_5 keep the split-aware behaviour.
++    const bool tensor_parallel = ggml_get_fa_tensor_parallel() && !GGML_CUDA_CC_IS_RDNA3_0(cc);
 +
 +    if (amd_wmma_available(cc) && !tensor_parallel) {
          if (use_gqa_opt && gqa_ratio % 8 == 0) {
              ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
              return;
-@@ -532,6 +538,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -532,6 +543,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      float max_bias = 0.0f;
      memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
  
@@ -165,7 +170,7 @@ index 882fe5d91..3129b3e16 100644
      // The effective batch size for the kernel can be increased by gqa_ratio.
      // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
      bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
-@@ -665,9 +674,32 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -665,9 +679,32 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      }
  
      // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
