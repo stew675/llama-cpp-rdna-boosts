@@ -366,3 +366,48 @@ bf16 prefill delta ever needs to be recovered, the route is *not* "remove the F1
 GPU with packed bf16 element-wise ops, or an f16 *staging type* question (the de-interleave without
 the type change), both out of scope here.  This is a well-evidenced negative result: the remaining
 f16 is not what makes bf16 slow.
+
+## What it would actually take (2026-09-18, ISA verification)
+
+**The gfx1201 ISA is the limit — verified with the assembler, not assumed.**  Each candidate
+instruction was compiled with `--cuda-device-only -c` for gfx1201 (a `-S` text emission proves
+nothing; the assembler is what rejects):
+
+| instruction | on gfx1201 | meaning |
+|---|---|---|
+| `v_pk_mul_bf16` | **not supported on this GPU** | packed bf16 multiply is CDNA4/gfx950-only |
+| `v_pk_add_bf16` | **not supported on this GPU** | packed bf16 add likewise |
+| `v_cvt_pk_bf16_f32` | **not supported on this GPU** | f32->bf16 packing is gfx950-only |
+| `v_cvt_pk_f16_bf16` | **invalid instruction** | there is no direct bf16->f16 pack anywhere in the ISA |
+| `v_cvt_f32_bf16` | not supported (under that name) | bf16->f32 is the integer shift below |
+| `v_pk_mul_f16` | **OK** | f16 keeps the full packed arithmetic set |
+| `v_lshlrev_b32` / `v_and_b32` | OK | bf16->f32 is `<<16` / `&0xffff0000` |
+| `v_dot2_f32_bf16` | OK | the one packed-ish bf16 op RDNA has (f32 accumulate) |
+
+And `__float22half2_rn(float2)` on gfx1201 lowers to **SALU**: `s_cvt_f16_f32` x2 +
+`s_pack_ll_b32_b16` (i.e. f32->f16 is a scalar-side convert, quite unlike the old VOP3
+`v_cvt_pk_f16_f32`, which does not exist under that name on gfx12).
+
+So the "no F16 at all" route is **not** a software-tuning gap on gfx1201: with no packed bf16
+arithmetic and no bf16->f16 pack, every element-wise bf16 operation must round-trip through f32;
+the f32-accumulator workaround then doubles the VKQ register footprint on a kernel that is already
+pinned at the 256-VGPR ceiling (scratch 520 -> 948 B) and loses more than it saves.  The matrix
+engine is *not* the problem -- bf16 WMMA is equal-rate to f16 (0.99x / 1.00x, warmed clocks).
+
+**Documented next steps (ordered by expected value):**
+
+1. **Retest on hardware with packed bf16.**  CDNA4 / gfx950 has `v_pk_mul_bf16`,
+   `v_pk_add_bf16` and `v_cvt_pk_bf16_f32`.  On such a part the bf16 glue becomes as cheap as f16's
+   *and* the conversion disappears, which is exactly the combination that should make native bf16
+   win.  Keep the arm (env-gated OFF) so it can be re-measured on future RDNA/CDNA silicon instead
+   of being re-derived; the per-instruction check above is the go/no-go test.
+2. **The realistic route to parity *today* is not "remove F16" but "make the bf16->f16 conversion
+   in the V5 loader cheap"** -- i.e. attack the ~57 ms, not the ~102 ms.  bf16->f16 is *exact* for
+   in-range values, and gfx12 can do it as `v_lshlrev_b32`/`v_and_b32` (bf16->f32) plus
+   `s_cvt_f16_f32` + `s_pack_ll_b32_b16`, i.e. a short SALU sequence that runs on the scalar pipe
+   rather than competing with the vector/memory pipe.  That keeps the f16 compute (so output stays
+   bit-identical and every existing validation gate still applies) and keeps the no-scratch win.
+   Ceiling: V5's FA kernel 276.6 ms -> ~230 ms, i.e. parity with the staged path's 232.9 ms
+   (213.2 + 19.7) *while* removing the F16 scratch.  **This, not the bf16 MMA, is the recommended
+   follow-up** -- it is the only measured path to the original goal (memory win at prefill parity)
+   on gfx1201.
