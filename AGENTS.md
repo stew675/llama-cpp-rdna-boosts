@@ -956,6 +956,21 @@ commented `-mllvm --amdgpu-unroll-threshold-local=600`), and CMake's HIP
 compiler test now injects `--cuda-host-only` directly after it — the bare
 `-mllvm` swallows it into LLVM option parsing and the configure aborts.
 
+**ccache is strongly recommended** (the script enables it when `ccache` is on
+PATH; set `CCACHE=0` to opt out).  Because the script `rm -rf`s the build dir
+each run, a rebuild of unchanged sources is otherwise a full recompile; with
+ccache it measured **282 s -> 4.2 s** (657/657 compile steps hit; gfx1201,
+16 cores).  It replays the compiler's own objects, so codegen and perf are
+unchanged (`llama-bench` within noise, `test-backend-ops` green).  Note the
+FA instances are *deliberately* force-inlined: the optimiser's cross-inlining
+is why they are fast at runtime and slow to compile (RDNA4/ROCm 7.14); a
+`fattn-*.cuh` edit invalidates the whole FA group.  This is the sanctioned
+answer to "the build is slow" — do **not** outline the FA loader: option (b)
+was measured 2026-09-18 (runtime KV-type dispatch made it *worse*; a
+`__noinline__` loader cut the clean build 236 -> 136 s but cost a universal
+~1.5-2.5 % prefill, because the outlined call sites degrade the kernel's
+register allocation), see `patches/README.md` / `wip/build-time-regression/`.
+
 ## What NOT to do
 
 - Do not `git apply` the concatenated 01-13 series (drops hunks).

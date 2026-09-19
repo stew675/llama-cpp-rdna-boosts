@@ -316,11 +316,14 @@ enablement there and runs host-only/CPU.
   `(ncols1, ncols2, head size)` and the head-512 instances are listed **first** in the backend source
   order (the order is the actual fix — clean `ggml-hip -j16` **323.4 -> 236.0 s, -27 %**), and the tile
   instances are split per `(head size, KV type)`.  Build-time only: identical instantiations and
-  linked-library symbols.  **Candidate (b) remains open**: making the WMMA loader's KV type a runtime
-  dispatch (one kernel copy, ~8x less device code, estimated another ~20 %) is a runtime code-path
-  change needing a decode + prefill A/B.  Evidence, the TU-timing tool and the reproduction recipe:
+  linked-library symbols.  **Candidate (b) was tried and REJECTED (2026-09-18):** a runtime KV-type
+  dispatch made the build *slower* (236 -> 304 s), and `__noinline__` on the loader cut it to 136 s
+  but cost a universal 1.5-2.5 % prefill (f16 KV included), because the optimiser's cross-inlining of
+  the force-inlined native loaders is what makes them fast.  The loaders stay force-inlined and the
+  build-speed answer is **ccache** (the script's wiped rebuild went 282 -> 4.2 s; the script enables
+  it when `ccache` is on PATH).  Evidence, the TU-timing tool and the reproduction recipe:
   `wip/build-time-regression/`; the r6 records are in `patches/README.md` and `WORKLOG.md`
-  (2026-09-18 (r6)).
+  (2026-09-18 (r6) and (build process)).
 - **`rdna-boosts-all.patch` hygiene (raised 2026-09-15).**  The single-file net patch is a documented
   delivery artifact (1.35 MiB) that is regenerated on every release, so each revision adds ~1.3 MiB of
   history — the dominant `.git` cost (the raw logs trimmed 2026-09-15 compressed to only ~1.07 MiB total,

@@ -170,6 +170,17 @@ cmake --build build -j
   -n 20 --seed 42 --temp 0 --no-display-prompt --single-turn
 ```
 
+> **Speed up rebuilds with ccache.**  The set's flash-attention template instances are the build's
+> critical path, and their native-KV loader arms are deliberately force-inlined — the optimiser's
+> cross-inlining is what makes them fast at runtime *and* slow to compile.  With `ccache` on PATH,
+> a wiped rebuild of *unchanged* sources is a full cache hit: measured **282 s -> 4.2 s** on a
+> 16-core gfx1201 box (657/657 compile steps hit).  Add
+> `-DCMAKE_HIP_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache`
+> (the launcher form works with ROCm clang HIP device compilation; ccache 4.12.3 tested).  ccache
+> replays the compiler's own objects, so the cached build is the same code — verified with
+> `llama-bench` (within noise) and `test-backend-ops`.  Any header change (e.g. `fattn-mma-f16.cuh`)
+> invalidates its dependents, i.e. the whole FA group.
+>
 > **Do not use `git apply` on the concatenated 1-11 series** — it silently
 > drops hunks (30 files / 2483 lines vs the correct 35 / 6094, verified
 > 2026-08-29). `git am` (or `scripts/apply-all.sh`) is the required flow.

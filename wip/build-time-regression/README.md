@@ -6,9 +6,10 @@ r6 — the MMA instances are generated per `(ncols1, ncols2, head size)` and the
 listed **first** in the backend source order (clean `ggml-hip -j16` **323.4 -> 236.0 s**), the tile
 instances are split per `(head size, KV type)`, and the fused-gate MMQ instances moved out of
 `mmq.cu`.  The **reorder, not the split, is what delivers the win** (the six `dkq512` MMA TUs move
-from a t=80-150 s start to t=0).  The remaining lever is the runtime KV-type dispatch (option (b),
-~8x less device code, estimated another ~20 %), left as a follow-up because it needs a decode +
-prefill A/B.  The 2026-09-15 sections below are the diagnosis that led to r6.
+from a t=80-150 s start to t=0).  The per-TU native-arm duplication is **deliberate** (the loaders are
+force-inlined because that is what makes the native staging fast) and **option (b) was tried and
+rejected** on 2026-09-18 — see "Root cause 2" and the ccache section below.  The 2026-09-15 sections
+below are the diagnosis that led to r6.
 
 ## The report
 
@@ -52,9 +53,9 @@ BF16, q8_0, q4_0, q4_1, q5_0, q5_1, iq4_nl), so the 12 generated files emit 8 ca
 dispatch TU holds only externs.  Pure code placement: same template arguments, same flags, same device
 code.
 
-## Root cause 2 (diagnosed, NOT fixed): the MMA native arms duplicate the WMMA kernel 8x per TU
+## Root cause 2 (understood; the duplication is deliberate): the MMA native arms
 
-The new critical path is ours too: the native-KV arm chain in `ggml_cuda_flash_attn_ext_mma_f16_case`
+The critical path was ours: the native-KV arm chain in `ggml_cuda_flash_attn_ext_mma_f16_case`
 (`GGML_CUDA_FATTN_MMA_NATIVE_ARM` x 6 + the BF16 branch + the F16 fallback) instantiates the **whole
 WMMA kernel once per KV type inside every instance TU**.  Measured on the same TU
 (`template-instances/fattn-mma-f16-instance-ncols1_4-ncols2_4.cu`, 8 head-size cases in both cases):
@@ -64,10 +65,22 @@ WMMA kernel once per KV type inside every instance TU**.  Measured on the same T
 | object size | 0.90 MB | **7.26 MB** (8.1x) |
 | compile time | **6.7 s** | **229 s** (34x) |
 
-So of the remaining ~330 s, the MMA group is ~1950 s of CPU across 21 TUs.  Two ways out, both needing
-an A/B: (a) finer generated-file granularity (one file per head-size -> ~150 TUs, better packing, same
-total work), or (b) make the WMMA loader's KV type a runtime dispatch (one kernel copy, ~8x less code,
-at the cost of a uniform branch in the tile load).  See `TODO.md`.
+**r6 (2026-09-18)** fixed the *scheduling* half: the instances are generated per `(ncols1, ncols2,
+head size)` and the head-512 ones are listed first (clean `ggml-hip -j16` **323.4 -> 236.0 s**).  The
+per-TU duplication remains and is **deliberate**: the native loaders are `__forceinline__`, and the
+optimiser's cross-inlining of them into the kernel is what makes native staging fast.  **Option (b)
+was tried and rejected (2026-09-18):**
+
+- **runtime KV-type dispatch** (one loader, runtime switch): object 2.80 -> 2.46 MB but compile
+  **236 -> 304 s** — *worse*; one giant 36-copy CFG optimises more slowly than six specialised
+  functions.
+- **`__noinline__` on the native loader**: clean build **236 -> 136 s** (-43 %), but a universal
+  **-1.5..-2.5 % prefill** (f16 KV too — the outlined call sites degrade the kernel's register
+  allocation) and -0.3..-0.6 % decode.
+- **hybrid** (inline q8_0/q4_0, outline the rest): **no perf recovery** (q8_0 measured == full
+  outline) at 168 s — pointless.
+
+The answer is **ccache**, below: keep the optimised codegen, make rebuilds free.
 
 ## The unroll warnings (upstream noise, amplified by us) — FIXED in r2
 
@@ -113,3 +126,34 @@ awk '{if ($2>m[$1]) m[$1]=$2; if(!(($1) in f)) f[$1]=$3} END {for(p in m) print 
 # the runtime verification (text gate + per-type perf vs the r4 reference)
 wip/build-time-regression/tools/verify-r5.sh
 ```
+
+## The answer: ccache (2026-09-18)
+
+The build is compiler/CPU-bound, not I/O-bound: a full out-of-source build in `/tmp` (tmpfs) took
+237.9 s vs 236.0 s on the USB SSD, so moving the build dir does not help.  The optimisation time is
+the price of the force-inlined FA codegen, and that is the right default.  The right way to make the
+develop/edit loop cheap is a compiler cache.
+
+**`ccache` works with ROCm clang HIP device compilation** (4.12.3 tested).  Wire it in with the CMake
+launcher form; `~/bin/build-llama-rocm-714` does this automatically when `ccache` is on `PATH`
+(`CCACHE=0` opts out):
+
+```bash
+-DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
+-DCMAKE_C_COMPILER_LAUNCHER=ccache \
+-DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+```
+
+Measured on gfx1201 (16 cores), the script's `rm -rf "$BUILD_DIR"` + full build:
+
+| | wall |
+|---|---|
+| first build (populates the cache) | 282.3 s |
+| wiped rebuild of the *same* sources | **4.2 s** (657/657 compile steps hit) |
+
+The cache key is the preprocessed source + the exact command line, so it survives the `rm -rf`, and
+ccache replays the compiler's own objects — **the cached build is the same code**: `test-backend-ops
+-o FLASH_ATTN_EXT` 4/4 and `llama-bench` equal to the uncached build within noise (pp2048 d0 7548 vs
+7489, tg128 d16384 89.51 vs 89.47).  Costs: the cache grows ~0.1 GB per full build (limit raised to
+20 GB), and any `fattn-*.cuh` edit invalidates the whole FA group (the header is in every instance
+TU).

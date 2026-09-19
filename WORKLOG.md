@@ -1,5 +1,35 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-18 (build process) — FFI build cost: option (b) rejected, ccache adopted
+
+**Not a patch set change.**  Follow-up to the r6 build-time fix.  The r6 numbers are kept; this records
+what else was tried against the remaining ~236 s clean build and why the answer is a compiler cache.
+
+**Option (b) — outline / runtime-dispatch the MMA native loader — was tried and rejected.**
+
+| variant | clean `ggml-hip -j16` | perf (Qwen3.5-4B, `-r 5`) |
+|---|---|---|
+| r6 force-inlined (kept) | 236.2 s | reference |
+| runtime KV-type dispatch (one loader, runtime switch) | **304 s** | n/a — rejected on build time |
+| `__noinline__` native loader | **135.7 s** | **-1.5..-2.5 % prefill** (f16 KV too), -0.3..-0.6 % decode |
+| hybrid (inline q8_0/q4_0, outline the rest) | 168.0 s | q8_0 == full-outline (no recovery) |
+
+The runtime switch *reduced* object size (2.80 -> 2.46 MB) but *raised* compile time: one giant
+36-copy CFG (6 unroll x 6 types) optimises more slowly than six specialised functions.  `__noinline__`
+is the real compile win but the outlined call sites degrade the kernel's register allocation for
+every path, so the native loaders stay `__forceinline__` — the optimiser's cross-inlining is why
+they are fast at runtime and slow to compile.  The hybrid does not recover the perf, so it is
+strictly worse than either.
+
+**ccache is the answer.**  ccache 4.12.3 caches ROCm clang HIP device objects.  With
+`-DCMAKE_HIP_COMPILER_LAUNCHER=ccache` (+ the C/CXX launchers; `~/bin/build-llama-rocm-714` now adds
+them when `ccache` is on `PATH`, `CCACHE=0` opts out), the script's `rm -rf "$BUILD_DIR"` no longer
+costs a recompile of unchanged sources: first build 282.3 s, wiped rebuild of the same sources
+**4.2 s** (657/657 compile steps hit).  ccache replays the compiler's own objects, so the cached
+build is identical code — `test-backend-ops -o FLASH_ATTN_EXT` 4/4 and `llama-bench` within noise
+(pp2048 d0 7548 vs 7489, tg128 d16384 89.51 vs 89.47).  A `fattn-*.cuh` edit still invalidates the
+FA group.  See `wip/build-time-regression/README.md` and the README/AGENTS build notes.
+
 ## 2026-09-18 (r6) — `v16-ebbb18522-r6`: the FA instance build-time fix (blocks 06/13/15)
 
 **Release.** `v16-ebbb18522-r6`, fork point `ebbb18522` (unchanged).  Canonical 16-block tip
@@ -53,9 +83,10 @@ amended to declare the gate cases `extern` in `mmq.cuh` and define them in the p
 makes the generator idempotent (`DECL_MMQ_CASE_GATE` is now the append-only line) **and** moves five
 instantiations out of the monolithic `mmq.cu`.
 
-**Option (b) deferred.**  Making the WMMA loader's KV type a runtime dispatch would remove the 6-8x
-code duplication outright and is the remaining lever (estimated another ~20 %), but it is a runtime
-code-path change needing a decode + prefill A/B; it stays a follow-up.
+**Option (b) deferred at r6, then rejected (2026-09-18).**  Making the WMMA loader's KV type a runtime
+dispatch removes the 6-8x code duplication but was measured to make the build *slower* (304 s) or, as
+`__noinline__`, cost a universal 1.5-2.5 % prefill (see the build-process entry above).  The loaders
+stay force-inlined; ccache is the sanctioned build-speed answer.
 
 ## 2026-09-18 (r5) — `v16-ebbb18522-r5`: RDNA3_0 (gfx1100) WMMA FA is capped at head 256 (issue #30)
 
