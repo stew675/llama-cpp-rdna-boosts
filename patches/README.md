@@ -3,11 +3,17 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`ebbb18522`**
 (re-based 2026-09-17 from `d1d3c3396`).
 
-**Current release: `v16-ebbb18522-r7`** — canonical tip
-`f56689f179fa9f2f95c82d060e73b6b0fa9ae817`, tree
-`9d236e9a21622fb8e05d02b646168aa6f660a700`.  Strict 16/16 `git am`; clean build; on gfx1201
+**Current release: `v16-ebbb18522-r8`** — canonical tip
+`63e6aa1ffca8fe65d46f7152435a64deeb3ca59e`, tree
+`bee36f6f908acef9bc2093971304a6094fe67e63`.  Strict 16/16 `git am`; clean build; on gfx1201
 `test-backend-ops -o FLASH_ATTN_EXT` 4/4 backends and `-o MUL_MAT_ID_FUSION` 28/28 (the full-suite
-**18083/18083** figure is the r5 measurement).  **r7 (2026-09-19, issue #30) fixes block-15 V3's
+**18083/18083** figure is the r5 measurement).  **r8 (2026-09-19) makes the V3 derived-mask disable
+self-explanatory** (only block 15 changed): when the derived FA node lands off the GPU, the resolve
+probe now names the cause (the derived mask is MMA-kernel-only, so a head above the per-arch WMMA cap
+or `GGML_CUDA_FA_WMMA_256=0` / `_MAX_HEAD` selects the tile kernel and loses it).  The old "missing
+support" text sent a user hunting a device problem instead of a stale `GGML_CUDA_FA_WMMA_256=0`, which
+on gfx1201 head 256 costs **3x deep prefill** (9B `-d 98304`: 2104 -> 710 t/s) *and* disables V3.
+**r7 (2026-09-19, issue #30) fixes block-15 V3's
 derived-kq-mask kernel shape** (only block 15 changed): the derived branch processed one cell per
 thread step with a scalar `half` store and re-read `cell_pos` for every query row, which cost up to
 -6.0 % deep prefill (27B 2-GPU layer, gfx1201) and the reporter's gfx1100 loss; it now mirrors the
@@ -369,6 +375,16 @@ the tile and no tail handling is needed.  The mask values are unchanged.
 
 Bit-identical output: same-seed greedy text with `LLAMA_KQ_MASK_DERIVED=1` vs `0` hashes
 `0e83b43746e7` (9B, 1 GPU) and `5ec02413b9c9` (27B, 2-GPU layer).  No other block changed.
+
+**r8 follow-up (same day).**  The fix removes the regression, but the *disable* path was still opaque:
+with `GGML_CUDA_FA_WMMA_256=0` (a stale env from the September qwen4exp gates) the derived FA node
+lands on the CPU, because the head cap selects the tile kernel and the derived mask is MMA-only.  The
+probe printed only `not supported, set to disabled` plus `assigned to device CPU (usually due to
+missing support)`, which points at the device rather than the head cap.  It now adds a line naming the
+cause (tile kernel selected for this head via the per-arch WMMA cap, `GGML_CUDA_FA_WMMA_256=0` or
+`_MAX_HEAD`), and the README documents the interaction.  Worth knowing: on gfx1201 head 256 that env
+var is also **3x slower at deep prefill** (9B `-d 98304`: 2104 -> 710 t/s), so the two symptoms have
+one cure.  Release `v16-ebbb18522-r8` (only block 15 changed; tip `63e6aa1ff`, tree `bee36f6f9`).
 
 ## 2026-09-15 block-15 amendment (r3): the prefill staging arena degrades instead of aborting
 

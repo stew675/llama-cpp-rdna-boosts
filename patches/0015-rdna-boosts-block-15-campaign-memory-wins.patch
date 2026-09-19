@@ -1,4 +1,4 @@
-From f56689f179fa9f2f95c82d060e73b6b0fa9ae817 Mon Sep 17 00:00:00 2001
+From 63e6aa1ffca8fe65d46f7152435a64deeb3ca59e Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -410,7 +410,7 @@ instantiations, identical symbols.
  .../template-instances/generate_cu_files.py   |  11 +-
  ggml/src/ggml-hip/CMakeLists.txt              |  11 +
  ggml/src/ggml.c                               |  99 ++-
- src/llama-context.cpp                         | 146 +++-
+ src/llama-context.cpp                         | 158 ++++-
  src/llama-cparams.h                           |   5 +
  src/llama-graph.cpp                           | 183 ++++--
  src/llama-graph.h                             |  60 ++
@@ -420,7 +420,7 @@ instantiations, identical symbols.
  src/llama-memory-hybrid-idx.h                 |  17 +-
  src/models/qwen4exp.cpp                       | 338 ++++++++--
  tests/test-backend-ops.cpp                    |  55 +-
- 131 files changed, 3032 insertions(+), 305 deletions(-)
+ 131 files changed, 3044 insertions(+), 305 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-bf16.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-f16.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-iq4_nl.cu
@@ -4333,7 +4333,7 @@ index 34b458086..2ce34caf0 100644
  
      return result;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 268c1d04c..7530f4b37 100644
+index 268c1d04c..913d4fe4b 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -36,6 +36,18 @@ struct llm_fused_op_probe {
@@ -4482,7 +4482,7 @@ index 268c1d04c..7530f4b37 100644
              GGML_ASSERT(node.il >= 0);
  
              ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
-@@ -576,6 +672,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+@@ -576,11 +672,46 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                  device_mismatch = true;
                  break;
              }
@@ -4512,7 +4512,24 @@ index 268c1d04c..7530f4b37 100644
          }
  
          if (device_mismatch) {
-@@ -592,6 +711,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+             enabled = false;
+             LLAMA_LOG_WARN("%s: %s not supported, set to disabled\n", func, probe.name);
++
++            // The derived kq mask is an MMA-kernel-only feature, so when its node lands off the GPU
++            // the usual cause is a kernel-selection mismatch, not a missing device capability: a
++            // head above the per-arch WMMA cap (or GGML_CUDA_FA_WMMA_256=0 / _MAX_HEAD) makes the
++            // chooser pick the tile kernel, which has no derived arm.  The generic "missing
++            // support" text sends people looking at the device instead of the head cap.
++            if (probe.require_kq_derived) {
++                LLAMA_LOG_WARN("%s: note: the derived kq mask is implemented by the MMA flash attention "
++                        "kernel only; a configuration that selects the tile kernel for this head (head "
++                        "above the per-arch WMMA cap, GGML_CUDA_FA_WMMA_256=0, or "
++                        "GGML_CUDA_FA_WMMA_MAX_HEAD) cannot use it\n", func);
++            }
+         } else {
+             enabled = true;
+             LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
+@@ -592,6 +723,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
          cparams.auto_fa = false;
      }
  

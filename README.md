@@ -268,6 +268,20 @@ MoE / qwen4exp workload the default is the right side of the trade.
 **Not a correctness knob:** same-seed output is byte-identical either way (the derived mask produces
 the same values; only the memory layout and prefill cost differ).
 
+**It needs the MMA flash-attention kernel.**  The derived mask is implemented in the MMA FA kernel
+only, so anything that makes the chooser pick the *tile* kernel for a head also disables it: a head
+above the per-arch WMMA cap (RDNA4 576, RDNA3_5 320, RDNA3_0 256), or forcing it off with
+`GGML_CUDA_FA_WMMA_256=0` / `GGML_CUDA_FA_WMMA_MAX_HEAD`.  The launch log then prints
+`derived kq mask flash attention not supported, set to disabled`, followed by a note naming the cause
+(added 2026-09-19).  This matters because the tile kernel is often the much slower choice: on gfx1201
+a head-256 model runs **~3x slower at deep prefill** with it (9B, `-d 98304`: 2104 -> 710 t/s,
+`-r 3`).  So if you see that pair of lines, check for a stale `GGML_CUDA_FA_WMMA_256=0` first
+(it was a fixed env in the September qwen4exp gates): removing it restores both the fast kernel and
+the derived mask.  One exception worth knowing: **qwen4exp / Qwen3.8-Flash-Next gets its deep-context
+mask elision from the QSA path's own derived visibility** (`GGML_QSA_DERIVED_VIS`, the code's
+"-800 MiB win"), which is independent of this knob; `LLAMA_KQ_MASK_DERIVED` only serves that model's
+dense shortcut (`n_kv <= 2051`), where the mask is tiny.
+
 Full matrix, raw CSVs and the A/B harness: [`wip/kq-mask-derived-ab/`](wip/kq-mask-derived-ab/); the
 2026-09-19 block-15 (r7) amendment in [`patches/README.md`](patches/README.md).
 

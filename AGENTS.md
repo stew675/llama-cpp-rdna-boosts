@@ -9,7 +9,7 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`ebbb18522`** (re-based 2026-09-17;
-release `v16-ebbb18522-r7`, the 2026-09-19 block-15 V3 derived-kq-mask kernel-shape fix (issue #30: the derived mask loader now does two cells per thread step with a `half2` store and hoists `cell_pos` out of the query-row loop; gfx1100 @98k -3.47 -> -0.15 %, gfx1201 27B 2GPU layer @98k -5.96 -> -1.62 %, output bit-identical) on top of r6, the 2026-09-18 FA instance build-time fix (blocks 06/13/15: MMA per-head + tile per-KV-type split, head-512 source order, fused-gate MMQ instances moved out of `mmq.cu`; clean `ggml-hip -j16` 323 -> 236 s, no runtime change) on top of r5's block-04 gfx1100 WMMA-FA head cap back at 256 (issue #30) on
+release `v16-ebbb18522-r8`, the 2026-09-19 V3 derived-mask disable-path diagnostic (the resolve probe now names the cause when the derived FA node lands off the GPU: the derived mask is MMA-kernel-only, so a head above the per-arch WMMA cap or `GGML_CUDA_FA_WMMA_256=0` selects the tile kernel and loses it; that env is a stale qwen4exp gate and is 3x slower at deep prefill on gfx1201) on top of r7, the 2026-09-19 block-15 V3 derived-kq-mask kernel-shape fix (issue #30: the derived mask loader now does two cells per thread step with a `half2` store and hoists `cell_pos` out of the query-row loop; gfx1100 @98k -3.47 -> -0.15 %, gfx1201 27B 2GPU layer @98k -5.96 -> -1.62 %, output bit-identical) on top of r6, the 2026-09-18 FA instance build-time fix (blocks 06/13/15: MMA per-head + tile per-KV-type split, head-512 source order, fused-gate MMQ instances moved out of `mmq.cu`; clean `ggml-hip -j16` 323 -> 236 s, no runtime change) on top of r5's block-04 gfx1100 WMMA-FA head cap back at 256 (issue #30) on
 top of r4's block-04 RDNA3_0 tensor-split `ncols2` fix and r3's block-01 `--fit` fix for `draft-mtp-adaptive` + a minimal MTP head, issue #38; previously `d1d3c3396`, re-based 2026-09-15 from
 `790cf51aa`, re-based 2026-09-13
 from `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself
@@ -236,9 +236,10 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `ebbb18522` is a rebuild of the delivery set
-(tip `f56689f179fa9f2f95c82d060e73b6b0fa9ae817`, net tree
-  `9d236e9a21622fb8e05d02b646168aa6f660a700` = r7, the 2026-09-19 block-15 V3 derived-mask
-  kernel-shape fix, issue #30, on top of r6, the 2026-09-18 FA instance build-time fix
+(tip `63e6aa1ffca8fe65d46f7152435a64deeb3ca59e`, net tree
+  `bee36f6f908acef9bc2093971304a6094fe67e63` = r8, the 2026-09-19 V3 derived-mask disable-path
+  diagnostic, on top of r7, the block-15 V3 derived-mask kernel-shape fix, issue #30, on top of r6,
+  the 2026-09-18 FA instance build-time fix
   (block 06 MMA split + source order, block 13 gate externs, block 15 tile split) on top of the
   2026-09-17 re-base onto `ebbb18522` +
   r3's 2026-09-18 block-01 `--fit` fix, issue #38, r4's 2026-09-18 block-04 RDNA3_0 tensor-split
@@ -845,6 +846,16 @@ Consequences, so it is not re-litigated:
   2` (184.02 -> 88.39 MiB device + 112.02 -> 16.40 MiB host at `-c 98304`/ub 512), not the ~800 MiB
   the campaign note implies (that needs ub ~2048).  A/B matrix, raw CSVs and harness:
   `wip/kq-mask-derived-ab/`; block-15 amendment section in `patches/README.md`.
+  **Follow-up 2026-09-19 (r8)**: the disable path now explains itself.  With
+  `GGML_CUDA_FA_WMMA_256=0` (a stale September qwen4exp gate) the tile kernel is selected for head
+  256, the derived mask is MMA-kernel-only, and the FA node lands on the CPU; the probe warned only
+  `not supported, set to disabled` plus `assigned to device CPU (usually due to missing support)`,
+  which points at the device.  It now adds a line naming the cause (per-arch WMMA cap /
+  `GGML_CUDA_FA_WMMA_256` / `_MAX_HEAD`), and the README documents the interaction.  That env is also
+  **3x slower at deep prefill** on gfx1201 head 256 (9B `-d 98304`: 2104 -> 710 t/s), so check it
+  first when the derived mask is reported disabled.  Note for qwen4exp: its deep-context mask elision
+  is the QSA derived visibility (`GGML_QSA_DERIVED_VIS`), not V3; V3 only serves that model's dense
+  shortcut (`n_kv <= 2051`).
 - **The dense greedy-purity guarantee (`--spec-draft-n-max <= 7`) depends on the KV cache type.**
   It holds for **f16, bf16, q4_1, q5_0, q5_1 and iq4_nl**, but **NOT for a
   `q8_0` or `q4_0` K/V cache**: there `W=1 == W=2` and `W=3..8` agree,
@@ -938,7 +949,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults are read from `release.json`: base
-`ebbb18522`, blocks tip `f56689f179fa9f2f95c82d060e73b6b0fa9ae817`): `git format-patch --start-number 0` the block
+`ebbb18522`, blocks tip `63e6aa1ffca8fe65d46f7152435a64deeb3ca59e`): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working

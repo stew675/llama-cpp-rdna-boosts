@@ -1,5 +1,41 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-19 (r8) — `v16-ebbb18522-r8`: the V3 derived-mask disable now explains itself
+
+Follow-up to r7.  A user running Qwen3.8-Flash-Next on 3x gfx1201 with a stale
+`GGML_CUDA_FA_WMMA_256=0` (a fixed env from the September qwen4exp gates,
+`archive/work/qwen4exp/HANDOVER.md`) saw
+
+```
+W resolve_fused_ops: derived kq mask flash attention not supported, set to disabled
+```
+
+and reasonably read it as "the feature we added for this model does not work here".  Two findings:
+
+* **The mechanism.**  `GGML_CUDA_FA_WMMA_256=0` sets `wmma_max_head = 128`, so the chooser returns
+  `BEST_FATTN_KERNEL_TILE` for head 256.  The derived mask is implemented by the MMA kernel only
+  (`fattn.cu`), so the derived FA node has no backend, the scheduler moves it to the CPU, and the probe
+  disables V3.  Reproduced locally on a head-256 model; the duplicated lines are the main and
+  MTP-draft contexts each resolving it.  `--no-kv-unified` is *not* a factor (with `--parallel 1` the
+  cache is single-stream, so `kq_mask_derivable` passes).
+* **The env var is also expensive.**  On gfx1201 head 256 the tile kernel is **3x slower at deep
+  prefill** than the default WMMA path (9B, `-r 3`, derived off so the effects do not mix:
+  `-d 98304` 2104 -> 710 t/s, `-d 32768` 3370 -> 1608, `-d 0` 4844 -> 4651).  So the stale env cost
+  both the feature and most of the prefill speed.
+
+**What changed (block 15, +12 lines):** when a `require_kq_derived` probe is disabled, the resolve
+probe now adds a line naming the cause (the derived mask is MMA-kernel-only; the tile kernel is
+selected for this head via the per-arch WMMA cap, `GGML_CUDA_FA_WMMA_256=0` or `_MAX_HEAD`) instead
+of leaving the generic "missing support" text to point at the device.  The README section on the
+knob documents the interaction.
+
+**Correction recorded for the reader:** on qwen4exp the deep-context mask elision (the code's
+"-800 MiB win") is the **QSA** derived visibility (`GGML_QSA_DERIVED_VIS`), independent of V3; V3 only
+serves that model's dense shortcut (`n_kv <= indexer_top_k + r - 1` = 2051), where the mask is small.
+
+Release r8: tip `63e6aa1ff`, tree `bee36f6f9`; only block 15 changed; strict 16/16 `git am`,
+`validate-set.sh` green.
+
 ## 2026-09-19 (r7) — `v16-ebbb18522-r7`: block-15 V3 derived-mask kernel shape (issue #30)
 
 Issue #30's second report (@a-n-t-0, 2x RX 7900 XTX / gfx1100, 27B Q8_0, f16 KV) found
