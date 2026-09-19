@@ -247,7 +247,7 @@ Measured PP512, mask on vs off, `-r 3` ("+" = the mask helps):
 | gfx1201 9B dense 1 GPU | — | +1.9 % | — | **+3.5 %** |
 | gfx1201 27B 2 GPU **tensor** | −1.3 % | −0.4 % | **+1.3 %** | **+1.7 %** |
 | gfx1201 27B 2 GPU layer | — | — | — | −1.6 % |
-| gfx1201 27B 3 GPU tensor | −3.4 % | — | — | — |
+| gfx1201 27B 3 GPU tensor | −3.4 % | −0.6 % | — | **+2.0 %** |
 | gfx1151 9B dense 1 GPU | +0.4 % | −0.2 % | −0.9 % | −1.8 % |
 | gfx1151 35B-A3B MoE 1 GPU | −0.3 % | −0.3 % | −0.8 % | −1.6 % |
 | gfx1100 9B dense 1 GPU | −0.4 % | −0.5 % | −0.4 % | **−0.2 %** |

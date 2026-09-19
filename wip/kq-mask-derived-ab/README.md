@@ -135,7 +135,8 @@ Post-r7, PP512, `-r 3` (`data/csv-soar-tensor-curve.txt`):
 | 65536 | 1197.9 | 1182.7 | **+1.28 %** |
 | 98304 | 997.7 | 980.9 | **+1.71 %** |
 
-Crossing between 32k and 64k.  This is the "dynamic switch-over" the reporter hypothesised, and it is
+Crossing between 32k and 64k.  The 3-GPU tensor cell behaves the same: -3.36 % @ d0, -0.56 % @ 32k,
+**+2.02 %** @ 98k.  This is the "dynamic switch-over" the reporter hypothesised, and it is
 purely a depth effect: below the crossover the mask is cheap to materialise, above it deriving is
 cheaper.  A depth-dependent gate is *possible* (it would key on `n_kv` at graph-build time), but the
 shallow loss is ~1 % and the delivery therefore keeps the simple "always derive" default and
