@@ -1,5 +1,52 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-18 (r5) — `v16-ebbb18522-r5`: RDNA3_0 (gfx1100) WMMA FA is capped at head 256 (issue #30)
+
+**Release.** `v16-ebbb18522-r5`, fork point `ebbb18522` (unchanged).  Canonical 16-block tip
+**`d82d07a312dbc3d5df945b36cbb893784f0f31cf`**, net tree **`06b89471790c52d7afa32f75755fb1b3b22edada`**;
+blocks 00-03 and 05-15 are content-identical to r4 (`b84b1783f…`), the tree delta is the `fattn.cu`
+hunk in block 04 (one value + comment; the rebase replayed block 08 over the amended comment so its
+`fattn.cu` hunks shift).  Strict 16/16 `git am` re-verified on a fresh `ebbb18522` tarball
+(`scripts/validate-set.sh` green: checksums, base tree, applied tree).
+
+**Why (the r4 follow-up).**  The r4 amendment fixed the *tensor-split* half of the RDNA4-tuned
+2026-09-14 change but left the other half.  The 2026-09-14 RDNA prefill tuning had also copied
+upstream #28102's **RDNA4/gfx1201** config rows for heads 320/512/576 into the **RDNA3_0** branch of
+`ggml_cuda_fattn_mma_get_config_rdna`, and lifted the RDNA3_0 WMMA head cap from stock's 256 to 576.
+Neither was re-validated on gfx1100, and head 512 then took WMMA where stock takes the tile kernel.
+
+**Measured** (single RX 7900 XTX, gfx1100, ROCm 7.14; gemma-4-26B-A4B UD-Q4_K_XL head 512,
+`pp2048 @ d98304`, 2-3 reps):
+
+| K/V type | r4 (RDNA4 #28102 row, WMMA) | pre-2026-09-14 base row (WMMA) | tile kernel (r5) |
+|---|---:|---:|---:|
+| f16  | — | 791.0 | 818.7 |
+| bf16 | 655.9 | 774.6 | 851.1 |
+| q8_0 | 661.4 | 784.0 | 772.8 |
+
+r4 was **-14 % (q8_0) / -23 % (bf16)** below the tile kernel.  Restoring the base row recovers q8_0
+but still leaves bf16 9 % low, so the regression is the WMMA *kernel choice* for head 512, not just
+the row values.  Tile is stock's choice there, and it must not extend downward: forcing tile on the
+9B dense head-256 model costs `pp2048` 1780 -> 1232 t/s at d65536 and 1407 -> 929 at d98304
+(**+44-52 % for WMMA**).
+
+**Fix.**  Block 04, `ggml/src/ggml-cuda/fattn.cu`:
+`wmma_256 && GGML_CUDA_CC_IS_RDNA3_0(cc) ? 256` (was `576`).  RDNA4 (576) and RDNA3_5 (320) are
+untouched; `GGML_CUDA_FA_WMMA_MAX_HEAD` still overrides the cap.  Head > 256 *prefill* (`n_q > 8`) on
+gfx1100 now takes the tile kernel; the decode/verify band (`n_q <= 8`) already took tile, so the
+greedy-purity band invariant is untouched.
+
+**Verification (gfx1100).**  `test-backend-ops -o FLASH_ATTN_EXT` **5952/5952**; gemma-4-26B-A4B
+`pp2048` d0/d65536/d98304 q8_0 **3635.7 / 1051.3 / 778.2** (was 3480 / 906 / 661), bf16
+**3627.7 / 1139.6 / 853.3** (was — / 895 / 656), f16 **3660.4 / 1112.8 / 818.2**; dense 9B (head 256)
+q8_0 `@ d98304` **1404.7** (WMMA retained, no regression); same-seed greedy output coherent.
+
+**Related finding (documented, not changed).**  On gfx1100 the block-15 q8_0 native arm costs ~5 % of
+gemma-4-26B-A4B head-512 deep prefill (`GGML_CUDA_FA_KV_NATIVE=0` recovers 773 -> 813 t/s at d98304,
+stock 810) but buys **+44 %** decode at d65536 (tg128 109.9 vs 76.4 with native off; stock 71.5), so it
+stays on.  The dense head-256 model shows no prefill difference (1405.9 vs 1404.4).  A future fix
+would keep the native decode path and restore node-scratch F16 staging for prefill on RDNA3_0.
+
 ## 2026-09-18 (r4) — `v16-ebbb18522-r4`: RDNA3_0 (gfx1100) keeps the stock FA `ncols2` under tensor split (issue #30)
 
 **Release.** `v16-ebbb18522-r4`, fork point `ebbb18522` (unchanged).  Canonical 16-block tip

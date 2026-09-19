@@ -9,8 +9,8 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`ebbb18522`** (re-based 2026-09-17;
-release `v16-ebbb18522-r4`, the 2026-09-18 block-04 RDNA3_0 tensor-split `ncols2` fix (issue #30) on
-top of r3's block-01 `--fit` fix for `draft-mtp-adaptive` + a minimal MTP head, issue #38; previously `d1d3c3396`, re-based 2026-09-15 from
+release `v16-ebbb18522-r5`, the 2026-09-18 block-04 gfx1100 WMMA-FA head cap back at 256 (issue #30) on
+top of r4's block-04 RDNA3_0 tensor-split `ncols2` fix and r3's block-01 `--fit` fix for `draft-mtp-adaptive` + a minimal MTP head, issue #38; previously `d1d3c3396`, re-based 2026-09-15 from
 `790cf51aa`, re-based 2026-09-13
 from `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself
 re-based 2026-09-07 from `465e49b9c`, itself
@@ -35,7 +35,7 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   `-sm tensor` RDNA3_0 (gfx1100) now keeps the stock AMD FA `ncols2` rule (the chooser's
   `tensor_parallel` adds `&& !GGML_CUDA_CC_IS_RDNA3_0(cc)`), recovering the reporter's 2× RX 7900 XTX
   pp100K 667.5 -> 779.4 t/s (stock 805.0) with decode unchanged; a single gfx1100 card already took
-  the AMD rule (no-op), RDNA4/RDNA3_5 keep the split-aware hint.  **Block 08 amended 2026-09-11**: the decode/verify
+  the AMD rule (no-op), RDNA4/RDNA3_5 keep the split-aware hint.  **Block 04 amended again 2026-09-18 (r5, issue #30)**: the RDNA3_0 WMMA FA head cap returns to 256 (`GGML_CUDA_CC_IS_RDNA3_0(cc) ? 256` in `ggml_cuda_get_best_fattn_kernel`), because the 2026-09-14 #28102 config transfer had also shipped RDNA4-tuned rows *and* a lifted cap to gfx1100: head 512 then took WMMA where stock takes tile and lost up to 23 % of deep prefill (gemma-4-26B-A4B `pp2048 @ d98304` q8_0 661 -> 773 t/s, bf16 656 -> 851), while head 256 keeps WMMA (a +44-52 % deep-prefill win there).  RDNA4 (576) / RDNA3_5 (320) untouched.  **Block 08 amended 2026-09-11**: the decode/verify
   FlashAttention kernel-family fix (F1) and the **quantized KV-type enablement** —
   `q4_1`/`q5_0`/`q5_1` were behind `GGML_CUDA_FA_ALL_QUANTS`, which made the FA
   probe disable flash attention for the whole context (3.4x slower prefill / 1.7x
@@ -236,10 +236,10 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `ebbb18522` is a rebuild of the delivery set
-(tip `ba9e18cacfa3f97f13a822dded971eeb2cce2480`, net tree
-  `b84b1783f7207e25600403df5a8e98c183b9f80a` = r4, the 2026-09-17 re-base onto `ebbb18522` +
-  r3's 2026-09-18 block-01 `--fit` fix, issue #38, and r4's 2026-09-18 block-04 RDNA3_0 tensor-split
-  `ncols2` fix, issue #30; the
+(tip `d82d07a312dbc3d5df945b36cbb893784f0f31cf`, net tree
+  `06b89471790c52d7afa32f75755fb1b3b22edada` = r5, the 2026-09-17 re-base onto `ebbb18522` +
+  r3's 2026-09-18 block-01 `--fit` fix, issue #38, r4's 2026-09-18 block-04 RDNA3_0 tensor-split
+  `ncols2` fix and r5's 2026-09-18 block-04 gfx1100 WMMA-FA head cap, issue #30; the
   previous base `d1d3c3396` had tip `8465f08b9efb26c60e992b48b7d2857d9ffcaf7a`, tree
   `3bb7c223c60570978d1bbf996a03808fe31f2842`; before that the base `790cf51aa` had tip
   `6f76c1cb1d80c7ecbf176f939a351bc385ff33fc`, tree
@@ -262,7 +262,7 @@ and the 2026-09-13 re-base resolved the four earlier upstream clashes --
 `16378d93f` gfx1201 FA tuning (our block-04 head-256 configs were kept at the time because upstream's
 WMMA prefill tuning then broke 4B `q4_0` decode/verify width purity — **superseded by the 2026-09-14
 block-04 amendment**, which makes the head-256 config arch-aware (RDNA3_5 keeps the gfx1151 halo row,
-RDNA4/RDNA3_0 take upstream's) and `ncols2` split-aware, recovering the deep-prefill slope with the 4B
+RDNA4/RDNA3_0 take upstream's — the RDNA3_0 half of that transfer was reverted in r5; RDNA4 keeps it — and `ncols2` split-aware, recovering the deep-prefill slope with the 4B
 q4_0 band still pure), `5a4d0feca`
 `GGML_FA_QUANTS` (block 08's `q4_1`/`q5_0`/`q5_1`/`iq4_nl` enablement re-homed),
 `d4abd573f` (block 13 MoE MMQ `ncols_opt`, additive) and `311d4211b` (block 15 W3
@@ -922,7 +922,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults are read from `release.json`: base
-`ebbb18522`, blocks tip `ba9e18cacfa3f97f13a822dded971eeb2cce2480`): `git format-patch --start-number 0` the block
+`ebbb18522`, blocks tip `d82d07a312dbc3d5df945b36cbb893784f0f31cf`): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
@@ -930,7 +930,7 @@ prefix `0000`; `git diff <base>..<tip>` yields
 — it may have been rebased onto a drifted master, so a raw
 `<base>..HEAD` range there can export upstream commits as patches
 0001/0002.  The canonical 16-block chain is a rebuild of the delivery set at
-`ebbb18522` (tip `ba9e18cac…`), which is what `release.json.tip` names.  Always regenerate from a
+`ebbb18522` (tip `d82d07a31…`), which is what `release.json.tip` names.  Always regenerate from a
 canonical fork rebuilt AT `ebbb18522`; a rebuilt fork produces its own
 commit SHAs, so patch bodies stay identical but the `From <sha>` line and
 the `[PATCH NN/16]` series count change.  Then

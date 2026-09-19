@@ -237,8 +237,13 @@ for per-block verification and `BASELINE.md` for provenance.
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`ebbb18522`** (upstream master "openvino : Update OpenVINO to 2026.4", 2026-09-17 re-base).
-- Canonical 16-block chain: tip **`ba9e18cacfa3f97f13a822dded971eeb2cce2480`**, net tree
-  **`b84b1783f7207e25600403df5a8e98c183b9f80a`**; release **`v16-ebbb18522-r4`**.
+- Canonical 16-block chain: tip **`d82d07a312dbc3d5df945b36cbb893784f0f31cf`**, net tree
+  **`06b89471790c52d7afa32f75755fb1b3b22edada`**; release **`v16-ebbb18522-r5`**.
+- **gfx1100 (RDNA3_0) WMMA FA is capped at head 256** (block 04, issue #30): the 2026-09-14
+  RDNA4 #28102 config transfer shipped RDNA4-tuned rows *and* a lifted head cap to gfx1100, so head
+  512 took WMMA where stock takes tile and lost up to 23 % of deep prefill (gemma-4-26B-A4B
+  `pp2048 @ d98304` q8_0 661 -> 773 t/s, bf16 656 -> 851); head 256 keeps WMMA, a +44-52 %
+  deep-prefill win.  RDNA4 (576) / RDNA3_5 (320) are unchanged.
 - **gfx1100 (RDNA3_0) tensor split keeps the stock AMD FA `ncols2` rule** (block 04, issue #30):
   the 2026-09-14 split-aware hint (wider generic `ncols2` for tensor-split attention) was RDNA4-tuned
   and cost RDNA3_0 deep prefill (`pp100K` 667.5 -> 779.4 t/s on 2× RX 7900 XTX, stock 805.0; decode

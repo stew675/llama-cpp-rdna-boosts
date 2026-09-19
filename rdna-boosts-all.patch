@@ -7908,7 +7908,7 @@ index 57a285565..f2bf120e0 100644
  
  template <int D, ggml_type type_K, ggml_type type_V>
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index ceb472793..006634667 100644
+index ceb472793..716867c57 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -166,6 +166,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
@@ -8044,7 +8044,7 @@ index ceb472793..006634667 100644
      for (const ggml_tensor * t : {Q, K, V, mask}) {
          if (t == nullptr || ggml_is_quantized(t->type)) {
              continue;
-@@ -665,25 +710,50 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+@@ -665,25 +710,56 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
      }
  
      // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
@@ -8065,13 +8065,19 @@ index ceb472793..006634667 100644
 -            if (Q->ne[1] <= 2) {
 -                return BEST_FATTN_KERNEL_VEC;
 -            }
-+    // Extended 2026-08-28/29 to heads beyond 128 behind per-arch caps (RDNA4/RDNA3_0 576, RDNA3_5 320);
++    // Extended 2026-08-28/29 to heads beyond 128 behind per-arch caps (RDNA4 576, RDNA3_0 256, RDNA3_5 320);
 +    // upstream's 2026-09-11 gfx1201 FA tuning (16378d93f) supplies the head>128 batch threshold (16)
 +    // and the head-256 config cases; the per-arch cap and softcap guard are kept on top.
 +    // RDNA4 WMMA has higher throughput than RDNA3; heads up to 576 (incl. the DKQ != DV shapes)
 +    // are enabled by default there. RDNA3_0 (gfx1100-1103) verified 2026-08-28: FLASH_ATTN_EXT
 +    // 4568/4568 vs CPU ref, gemma-4-12b head 240 pp2048 2263 vs 2226 (+1.7%), harness +14.2%
-+    // at hsk=256/nh=8/nb=256, all other >128 shapes within +/-1% (neutral). RDNA3_5 (gfx115x)
++    // at hsk=256/nh=8/nb=256, all other >128 shapes within +/-1% (neutral). 2026-09-18 (issue #30):
++    // the 2026-09-14 RDNA prefill tuning overwrote the RDNA3_0-side config rows with RDNA4 #28102
++    // values, which turned head 512 from the 2026-08-28 'neutral' into a 3.5-10% loss vs the tile
++    // kernel (gemma-4-26B-A4B, head 512, pp2048 @ d98304: f16 791 vs 819 tile, bf16 776 vs 851 tile,
++    // q8_0 784 vs 773 tile) -- and the tile kernel is exactly stock's choice there.  The RDNA3_0 cap
++    // is therefore back at 256 (the head-256 WMMA row is itself a +44-52% deep-prefill win over tile
++    // on gfx1100, so it stays); RDNA4 (576) and RDNA3_5 (320) are untouched. RDNA3_5 (gfx115x)
 +    // verified 2026-08-29 on gfx1151 (Strix Halo iGPU): FLASH_ATTN_EXT 4568/4568 vs CPU ref with
 +    // the cap lifted; harness wins at hsk=256 (+34%) and hsk=320 (+36%) prefill, but hsk=512
 +    // (-5.6%) and hsk=576 (-7.4%) regress, so the default cap is 320 (covers Gemma4 240-head,
@@ -8083,7 +8089,7 @@ index ceb472793..006634667 100644
 +    const bool wmma_256 = wmma_256_env == nullptr || std::atoi(wmma_256_env) != 0;
 +    // GGML_CUDA_FA_WMMA_MAX_HEAD overrides the per-arch cap (experiment/escape hatch).
 +    const char * wmma_max_env = getenv("GGML_CUDA_FA_WMMA_MAX_HEAD");
-+    const int wmma_max_head = wmma_max_env ? std::atoi(wmma_max_env) : (wmma_256 && GGML_CUDA_CC_IS_RDNA4(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_0(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_5(cc) ? 320 : 128);
++    const int wmma_max_head = wmma_max_env ? std::atoi(wmma_max_env) : (wmma_256 && GGML_CUDA_CC_IS_RDNA4(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_0(cc) ? 256 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_5(cc) ? 320 : 128);
 +    // Speculative verify batches (n_q = n_draft+1 <= 8) must stay on the tile
 +    // kernel: decode (n_q = 1) never uses WMMA, so a WMMA verify batch would
 +    // produce different logits than decode (GREEDY-PURITY band invariant).
@@ -8112,7 +8118,7 @@ index ceb472793..006634667 100644
      return BEST_FATTN_KERNEL_TILE;
  }
  
-@@ -703,11 +773,37 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -703,11 +779,37 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
      bool need_f16_V = false;
  
      switch (kernel) {
@@ -8155,7 +8161,7 @@ index ceb472793..006634667 100644
          case BEST_FATTN_KERNEL_VEC: {
              const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
              need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
-@@ -741,5 +837,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -741,5 +843,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
  }
  
  bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {

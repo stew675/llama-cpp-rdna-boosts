@@ -6,7 +6,17 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (2026-09-18, r4):** the delivery is the **16-patch set** against fork point
+**Current state (2026-09-18, r5):** the delivery is the **16-patch set** against fork point
+**`ebbb18522`** (block 00 + blocks 01-15), canonical 16-block tip
+**`d82d07a312dbc3d5df945b36cbb893784f0f31cf`** (tree `06b89471790c52d7afa32f75755fb1b3b22edada`),
+release **`v16-ebbb18522-r5`** — a second block-04 gfx1100 amendment on top of r4: the RDNA3_0 WMMA FA
+head cap is back at 256 (the 2026-09-14 #28102 transfer shipped RDNA4 config rows *and* a lifted cap
+to gfx1100, so head 512 took WMMA where stock takes tile and lost up to 23 % of deep prefill:
+gemma-4-26B-A4B `pp2048 @ d98304` q8_0 661 -> 773 t/s, bf16 656 -> 851; head-256 WMMA is a
++44-52 % win and stays).  RDNA4 (576) / RDNA3_5 (320) untouched.  Full record: `WORKLOG.md`
+2026-09-18 (r5).
+
+**Previous state (2026-09-18, r4):** the delivery was the **16-patch set** against fork point
 **`ebbb18522`** (block 00 + blocks 01-15), canonical 16-block tip
 **`ba9e18cacfa3f97f13a822dded971eeb2cce2480`** (tree `b84b1783f7207e25600403df5a8e98c183b9f80a`),
 release **`v16-ebbb18522-r4`** — a block-04 amendment on top of r3: under `-sm tensor` RDNA3_0
@@ -225,6 +235,11 @@ enablement there and runs host-only/CPU.
     retune (~106K VGPR/CU vs a possible 64K classic), `split_j`/config rows, the quantize chunk,
     routed-compact, the hc/PLE fusions, and the two block-13 MTP regression fixes under RDNA3
     (acceptance gate).
+  * gfx1100 q8_0 native-arm prefill trade (2026-09-18, r5): the block-15 q8_0 native arm costs ~5 %
+    of gemma-4-26B-A4B head-512 deep prefill on gfx1100 (773 vs 813 t/s `pp2048 @ d98304` with
+    `GGML_CUDA_FA_KV_NATIVE=0`, stock 810) but buys +44 % decode at d65536, so it stays on.  The
+    dense head-256 model is unaffected (1405.9 vs 1404.4).  Candidate fix: keep native decode but
+    restore node-scratch F16 staging for prefill on RDNA3_0.  See `WORKLOG.md` 2026-09-18 (r5).
   * gfx1151 (`halo`): Phase 3's cross-arch fingerprint check (gfx1201 == gfx1151 numerics) — a
     verification goal, not a port; also item 7's MTP crossover re-measure (item 4 is closed).
 - **Tracker hygiene:** the plan's own open checkboxes are **stale** (Phase 1 is complete and the doc

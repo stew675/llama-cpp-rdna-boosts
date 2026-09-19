@@ -3,11 +3,17 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`ebbb18522`**
 (re-based 2026-09-17 from `d1d3c3396`).
 
-**Current release: `v16-ebbb18522-r4`** — canonical tip
-`ba9e18cacfa3f97f13a822dded971eeb2cce2480`, tree
-`b84b1783f7207e25600403df5a8e98c183b9f80a`.  Strict 16/16 `git am`; build +
+**Current release: `v16-ebbb18522-r5`** — canonical tip
+`d82d07a312dbc3d5df945b36cbb893784f0f31cf`, tree
+`06b89471790c52d7afa32f75755fb1b3b22edada`.  Strict 16/16 `git am`; build +
 `test-backend-ops` **18083/18083** on gfx1201 (`FLASH_ATTN_EXT` 5952/5952,
-`FLASH_ATTN_QSA` 22/22).  **r4 (2026-09-18) fixes the gfx1100 tensor-split deep-prefill regression
+`FLASH_ATTN_QSA` 22/22).  **r5 (2026-09-18, issue #30) caps RDNA3_0 WMMA FA at head 256**: the
+2026-09-14 RDNA prefill tuning had copied RDNA4 #28102's config rows onto gfx1100, turning head 512
+from the 2026-08-28 'neutral' into a 3.5-10 % deep-prefill loss vs the tile kernel (gemma-4-26B-A4B,
+pp2048 @ d98304: f16 791 vs 819 t/s tile, bf16 776 vs 851, q8_0 784 vs 773).  RDNA3_0 now uses the
+tile kernel for heads > 256 (stock's choice); the head-256 WMMA row itself is a **+44-52 %**
+deep-prefill win over tile on gfx1100, so it stays.  RDNA4 (576) and RDNA3_5 (320) are untouched.
+See the 2026-09-18 block-04 (r5) amendment section below.  **r4 (2026-09-18) fixes the gfx1100 tensor-split deep-prefill regression
 from the split-aware FA `ncols2` (issue #30)**: RDNA3_0 keeps the stock AMD `ncols2` rule regardless
 of the tensor-split hint (the hint stays for RDNA4/RDNA3_5), so the reporter's 2× RX 7900 XTX
 `-sm tensor` recovers `pp100K` 667.5 -> 779.4 t/s (stock 805.0) with decode unchanged; a single
@@ -42,6 +48,66 @@ The 2026-09-17 re-base resolved three blocks:
 
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
+
+## 2026-09-18 block-04 amendment (r5): RDNA3_0 WMMA FA is capped at head 256 (issue #30)
+
+**Release** `v16-ebbb18522-r5`, canonical tip `d82d07a312dbc3d5df945b36cbb893784f0f31cf`, net tree
+`06b89471790c52d7afa32f75755fb1b3b22edada`.  Block 04 is amended with **one value (576 -> 256) plus a
+comment** in `ggml/src/ggml-cuda/fattn.cu`; blocks 00-03 and 05-15 are content-identical (the rebase
+replayed block 08 over the amended comment; the net tree differs from r4's `b84b1783f...` in that one
+hunk).
+
+**Why.**  The 2026-09-18 r4 amendment fixed the *tensor-split* half of the RDNA4-tuned 2026-09-14
+change but left the other half: the 2026-09-14 config transfer had also overwritten the **RDNA3_0**
+side of `ggml_cuda_fattn_mma_get_config_rdna` (heads 320/512/576) with upstream #28102's
+**RDNA4/gfx1201** rows, and lifted the RDNA3_0 WMMA head cap from stock's 256 to 576.  Neither the
+rows nor the lifted cap was re-validated on gfx1100, and gfx1100 then took the WMMA kernel for head
+512 where stock takes the tile kernel.
+
+**Measured on a single RX 7900 XTX (gfx1100, ROCm 7.14), gemma-4-26B-A4B UD-Q4_K_XL (head 512,
+kv-heavy), `pp2048 @ d98304`, 2-3 reps:**
+
+| K/V type | r4 (RDNA4 #28102 row, WMMA) | pre-2026-09-14 base row (WMMA) | tile kernel (r5) |
+|---|---:|---:|---:|
+| f16  | — | 791.0 | 818.7 |
+| bf16 | 655.9 | 774.6 | 851.1 |
+| q8_0 | 661.4 | 784.0 | 772.8 |
+
+So the r4 delivery was **-14.4 % (q8_0) / -22.9 % (bf16)** below the tile kernel at this point.
+Restoring the upstream base head-512 row recovers most of q8_0 but still leaves bf16 9 % below tile,
+so the regression is the WMMA *kernel choice* for head 512 on RDNA3_0, not just the row values.  Tile
+is exactly what stock `ebbb18522` chooses (`Q->ne[0] <= 256`), and head 256 itself is emphatically
+not a candidate for tile: forcing tile on the 9B dense model (head 256, q8_0) costs `pp2048`
+1780 -> 1232 t/s at d65536 and 1407 -> 929 t/s at d98304 (**+44-52 % for WMMA**), so the cap must
+land at 256, not lower.
+
+**Fix.**  `ggml_cuda_get_best_fattn_kernel`:
+
+```cpp
+const int wmma_max_head = wmma_max_env ? std::atoi(wmma_max_env) : (wmma_256 && GGML_CUDA_CC_IS_RDNA4(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_0(cc) ? 256 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_5(cc) ? 320 : 128);
+```
+
+RDNA3_0 now takes the tile kernel for heads > 256 (stock behaviour); RDNA4 (576) and RDNA3_5 (320) are
+unchanged.  `GGML_CUDA_FA_WMMA_MAX_HEAD` still overrides the cap for experiments, and
+`GGML_CUDA_FA_WMMA_256=0` still forces the tile kernel entirely.
+
+**Verification (gfx1100, single RX 7900 XTX).**  `test-backend-ops -o FLASH_ATTN_EXT` **5952/5952**.
+Gemma-4-26B-A4B `pp2048` at d0 / d65536 / d98304 q8_0 **3635.7 / 1051.3 / 778.2 t/s** (was
+3480 / 906 / 661 pre-fix), bf16 **3627.7 / 1139.6 / 853.3** (was — / 895 / 656), f16
+**3660.4 / 1112.8 / 818.2**.  Dense 9B (head 256) q8_0 `pp2048 @ d98304` **1404.7 t/s** (WMMA still
+in use; no regression).  Same-seed greedy output coherent.  The change only touches head > 256
+*prefill* (`n_q > 8`); the decode/verify band (`n_q <= 8`) already took the tile kernel, so the
+greedy-purity band invariant is untouched.
+
+**Related finding (kept as a trade, not changed).**  On gfx1100 the block-15 q8_0 native arm costs
+~5 % of gemma-4-26B-A4B head-512 deep prefill (`GGML_CUDA_FA_KV_NATIVE=0` recovers 773 -> 813 t/s at
+d98304, matching stock 810) but buys **+44 %** decode at d65536 (tg128 109.9 -> 76.4 with native off;
+stock 71.5), so it stays on.  The dense head-256 model shows no prefill difference (1405.9 vs 1404.4).
+A future fix would keep the native decode path but restore the node-scratch F16 staging for prefill on
+RDNA3_0; not attempted here.
+
+**Files.**  `ggml/src/ggml-cuda/fattn.cu` only.  `scripts/validate-set.sh` green (strict 16/16 `git am`
+on a fresh `ebbb18522` tarball, applied tree == `06b8947179...`).
 
 ## 2026-09-18 block-04 amendment (r4): RDNA3_0 keeps the stock AMD `ncols2` under tensor split (issue #30)
 
@@ -152,7 +218,7 @@ modifies it).
 | `0001` | adaptive MTP draft depth | **refreshed 2026-09-09 to the upstream PR #27210 review head** (`d236d41a2`; review-round feedback-handling, option validation + docs) — see the 2026-09-09 block-01 refresh section below.  **amended 2026-09-11: `--spec-draft-n-max` is capped at 7** (`common/common.cpp`, a clamp with a visible `E`-level notice naming the `LLAMA_SPEC_DRAFT_N_MAX_CLAMP=0` escape hatch, + the `max: 7` help string in `common/arg.cpp`) — see the 2026-09-11 (12) section below.  **amended 2026-09-13 (issue #30): the cap is raised from 7 to 15** — the 15 is the recurrent rollback snapshot bound (`n_max + 1 = K <= 16`, the constant the K-independent chunked-GDN threshold was built around), and purity above 7 is now an explicit warned trade instead of a clamp: any depth 8..15 is kept with a visible notice that `--spec-type none` and `draft-mtp` may no longer be bit-identical (a verify wider than 8 rows switches FA and matmul kernel families), while `> 15` is clamped to 15.  Ships with the new `tests/test-recurrent-state-depth` snapshot sweep (n_rs_seq 1..15, the whole rollback range, incl. deep drafts) — see the 2026-09-13 issue-#30 section below and `../GREEDY-PURITY.md` §11/§19.  **amended 2026-09-18 (issue #38): the `--fit` detection also recognises `draft-mtp-adaptive`** — `common_init_result`'s `spec_mtp` used the pre-adaptive manual find, so the fit probe built the minimal MTP head as a full model (null `wqkv` → SIGSEGV); it now uses `params.speculative.has_mtp()`, matching `common_speculative_init_result` — see the 2026-09-18 block-01 amendment section above.
 | `0002` | fused chunked gated-delta-net prefill kernel (bf16/WMMA; + MTP long-prefill chunked-prefix + sequential K-tail, PR #9) | **amended 2026-09-06 with the gfx11 NW16 scan retune** (gated_delta_net_chunked_bf16_gfx11.cu, fork 376f02aa0); **amended 2026-09-11 with the K-independent whole-batch chunked prefill** (gated_delta_net.cu; no sequential tail, `GGML_CUDA_GDN_ALIGN_BOUNDARY` gate + its two K-dependent branches **removed**; + the `llama_memory_recurrent` rollback-boundary guard). | **amended 2026-09-12 with the rollback-bounded chunked threshold (`n_rs_batch`) + the pre-batch snapshot slot** — the whole-batch chunked path now requires `n_tokens > max(K > 16 ? K : 16, n_rs_batch)` where `n_rs_batch` is the longest draft an enabled speculator can produce + 1 (from `common_speculative_n_max()`), because a batch that can be rolled back into must run the sequential kernel that writes its snapshots; fixes a silent recurrent-state rewind with ngram-style long drafts (ngram-mod 64 > MTP's `n_rs_seq` 7) that the 2026-09-11 guard detects — see the 2026-09-12 block-02 amendment section below.
 | `0003` | BF16 KV cache + native-BF16 flash-attn | **amended 2026-09-10 with the HIP masked-V/freed-cell fixes** (moved here from block 14 on 2026-09-10 — they sit on the native-BF16 PV staging this block introduces): `fattn-tile.cuh` (packed-bf16 PV) + `fattn-mma-f16.cuh` (masked-V rows in staged shared tiles). |
-| `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf | **amended 2026-09-06 with the RDNA WMMA (256,256,64) config row** (fattn-mma-f16.cuh, fork e7eecb369). | **amended 2026-09-14 (issue #30) with the RDNA prefill tuning — the head-256 `ncols=64` config is arch-aware (RDNA3_5 keeps the gfx1151 halo row, RDNA4/RDNA3_0 take upstream #28102's row) and `ncols2` is split-aware (frontend `ggml_set_fa_tensor_parallel` hint); pp150K f16 +2.4 / +6.9 / +9.6 % vs stock on 1/2/3 cards** — see the 2026-09-14 block-04 section below. | **amended 2026-09-18 (r4, issue #30) with the RDNA3_0 tensor-split gate: gfx1100 keeps the stock AMD `ncols2` rule regardless of the tensor-split hint** (`!GGML_CUDA_CC_IS_RDNA3_0(cc)` in the chooser's `tensor_parallel` bool; the hint still applies to RDNA4/RDNA3_5) — the wider generic `ncols2=8` was RDNA4-tuned and cost gfx1100 deep prefill under `-sm tensor` (2× RX 7900 XTX pp100K 667.5 -> 779.4 t/s, stock 805.0; decode unchanged); a single gfx1100 card is unaffected by construction — see the 2026-09-18 block-04 amendment section above. |
+| `0004` | RDNA4 WMMA flash-attn + Q6_K mmq prefill perf | **amended 2026-09-06 with the RDNA WMMA (256,256,64) config row** (fattn-mma-f16.cuh, fork e7eecb369). | **amended 2026-09-14 (issue #30) with the RDNA prefill tuning — the head-256 `ncols=64` config is arch-aware (RDNA3_5 keeps the gfx1151 halo row, RDNA4/RDNA3_0 take upstream #28102's row) and `ncols2` is split-aware (frontend `ggml_set_fa_tensor_parallel` hint); pp150K f16 +2.4 / +6.9 / +9.6 % vs stock on 1/2/3 cards** — see the 2026-09-14 block-04 section below. | **amended 2026-09-18 (r4, issue #30) with the RDNA3_0 tensor-split gate: gfx1100 keeps the stock AMD `ncols2` rule regardless of the tensor-split hint** (`!GGML_CUDA_CC_IS_RDNA3_0(cc)` in the chooser's `tensor_parallel` bool; the hint still applies to RDNA4/RDNA3_5) — the wider generic `ncols2=8` was RDNA4-tuned and cost gfx1100 deep prefill under `-sm tensor` (2× RX 7900 XTX pp100K 667.5 -> 779.4 t/s, stock 805.0; decode unchanged); a single gfx1100 card is unaffected by construction — see the 2026-09-18 block-04 amendment section above. | **amended 2026-09-18 (r5, issue #30) with the RDNA3_0 WMMA FA head cap back at 256** (`GGML_CUDA_CC_IS_RDNA3_0(cc) ? 576` -> `? 256` in `ggml_cuda_get_best_fattn_kernel`): the 2026-09-14 #28102 config transfer shipped RDNA4-tuned rows and a lifted head cap to gfx1100 without re-validation, so head 512 took WMMA where stock takes tile and lost up to 23 % of deep prefill (gemma-4-26B-A4B head 512, `pp2048 @ d98304`: q8_0 661 -> 773 t/s, bf16 656 -> 851); head 256 keeps WMMA, which is a +44-52 % deep-prefill win on gfx1100.  RDNA4 (576) / RDNA3_5 (320) untouched — see the 2026-09-18 block-04 (r5) section above. |
 | `0005` | CPU bit-identical decode/verify batches |
 | `0006` | host-buffer revert for discrete GPUs |
 | `0007` | meta device-wrapper skip |
