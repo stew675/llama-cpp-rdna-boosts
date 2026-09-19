@@ -1,5 +1,50 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-19 (r7) — `v16-ebbb18522-r7`: block-15 V3 derived-mask kernel shape (issue #30)
+
+Issue #30's second report (@a-n-t-0, 2x RX 7900 XTX / gfx1100, 27B Q8_0, f16 KV) found
+`LLAMA_KQ_MASK_DERIVED=0` recovering **+5.7 % (tensor) / +13.2 % (layer)** deep prefill at 100k.  A
+three-arch A/B (`wip/kq-mask-derived-ab/`, 16 configs, `-r 3`, gfx1201 + gfx1151 + gfx1100)
+reproduced it and showed the effect is **sign-unstable across arch *and* model config**, not an arch
+gate:
+
+| PP512, derived=1 minus =0 | d0 | 32k | 64k | 98k |
+|---|---|---|---|---|
+| gfx1201 9B 1 GPU | +0.5 | +1.6 | +1.1 | **+2.6** |
+| gfx1201 9B 2 GPU tensor | -2.2 | +2.6 | — | **+7.7** |
+| gfx1201 27B 2 GPU layer | -0.1 | -3.0 | — | **-6.0** |
+| gfx1201 27B 2 GPU tensor | -1.5 | -0.6 | — | +0.7 |
+| gfx1151 9B 1 GPU | +0.1 | -0.5 | -0.9 | -1.9 |
+| gfx1100 9B 1 GPU | +0.8 | -1.7 | -2.3 | **-3.5** |
+
+**TG128 is flat everywhere** — the derived gate is prefill-only (`n_tokens <= 8` keeps the packed
+mask), so there is no decode-side trade.  The derived form forces the MMA kernel (`fattn.cu`), and the
+cost was in `flash_attn_ext_f16_load_mask`: the derived branch did **one cell per thread step with a
+scalar `half` store** (twice the iterations and unvectorised shared stores of the packed fallback, for
+strictly less global traffic) and re-read `cell_pos` for **every query row** although the value does
+not depend on the row.
+
+**Fix (only block 15 changed).**  Reshape the derived branch to mirror the packed fallback — two cells
+per thread step with one `half2` store, `cell_pos` hoisted out of the `j1` loop.  `nbatch_fa % 32 == 0`
+so no tail handling is needed.
+
+| config (PP512, `-r 3`) | before | after |
+|---|---|---|
+| gfx1201 27B 2GPU layer @98k | -5.96 % | -1.62 % |
+| gfx1201 9B 1GPU @98k | +2.57 % | **+3.49 %** |
+| gfx1151 9B 1GPU @32k | -0.53 % | -0.24 % |
+| gfx1100 9B 1GPU @32k / @64k / @98k | -1.65 / -2.31 / -3.47 % | -0.47 / -0.38 / **-0.15 %** |
+
+**Bit-identical.**  Same-seed greedy text `LLAMA_KQ_MASK_DERIVED=1` vs `0`: 9B 1 GPU `0e83b43746e7`
+both, 27B 2-GPU layer `5ec02413b9c9` both — only the store shape changed, every mask value is the
+same, so no purity gate moves.  The reported V3 memory win is `n_ubatch x n_ctx x 2` bytes: measured
+**184.02 -> 88.39 MiB** device + **112.02 -> 16.40 MiB** host at `-c 98304` / ub 512 (~96 MiB each;
+the campaign's ~800 MiB figure needs ub ~2048).
+
+Release r7: tip `f56689f17`, tree `9d236e9a2`; strict 16/16 `git am`, `validate-set.sh` green.  Work
+dossier (matrix, raw CSVs, harness, the patch): `wip/kq-mask-derived-ab/`; block-15 amendment section
+in `patches/README.md`.
+
 ## 2026-09-18 (build process) — FFI build cost: option (b) rejected, ccache adopted
 
 **Not a patch set change.**  Follow-up to the r6 build-time fix.  The r6 numbers are kept; this records

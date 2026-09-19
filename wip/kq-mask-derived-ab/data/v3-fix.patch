@@ -1,0 +1,66 @@
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 8eaedd96f..28e6f29c9 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -697,30 +697,47 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
+     // V3 derived mask: nothing to load, compute 0 / -INFINITY per cell instead.  This is a runtime
+     // branch and must precede the if constexpr chain below: the derived path cannot use cp_async.
+     // The i_sup handling mirrors the packed path exactly (the oob case holds 0.0f out of bounds).
++    //
++    // Shape mirrors the packed fallback below (two cells per thread step, one half2 store): the first
++    // cut of this loop did one cell per step with a scalar half store -- twice the iterations and
++    // unvectorised shared stores for strictly *less* global traffic than the packed path -- and that
++    // was a net loss wherever the saved mask bandwidth did not cover it (issue #30: -3.5% PP512 @
++    // d98k on gfx1100, -6.0% on a 27B 2-GPU layer split on gfx1201).  The per-cell position does not
++    // depend on the query row, so it is also hoisted out of the j1 loop: the packed path re-reads the
++    // mask for every row, the derived path must not re-read cell_pos for every row.
++    // nbatch_fa is a multiple of 32 and <= 256 (static_assert on the config table), so the even `i`
++    // never makes `i + 1` leave the tile and no tail handling is needed.
+     if (derived.cell_pos != nullptr) {
+ #pragma unroll
+-        for (int j1 = 0; j1 < ncols1; j1 += nwarps) {
+-            const int j_sram = j1 + threadIdx.y;
+-            const int j_vram = fastmodulo(j0 + j_sram, ne01);
++        for (int i0 = 0; i0 < nbatch_fa; i0 += 2*warp_size) {
++            const int i = i0 + 2*threadIdx.x;
+ 
+-            if (j1 + nwarps > ncols1 && j_sram >= ncols1) {
+-                break;
++            if (i >= nbatch_fa) {
++                continue; // the mask add and the dead-column detector never read past nbatch_fa
+             }
+ 
+-            const int lo = derived.tok_lo[j_vram];
+-            const int hi = derived.tok_hi[j_vram];
++            const int p0 = derived.cell_pos[k_VKQ_0 + i];
++            const int p1 = derived.cell_pos[k_VKQ_0 + i + 1];
++
++            const bool oob0 = oob_check && (i    ) >= i_sup;
++            const bool oob1 = oob_check && (i + 1) >= i_sup;
+ 
+ #pragma unroll
+-            for (int i0 = 0; i0 < nbatch_fa; i0 += warp_size) {
+-                const int i = i0 + threadIdx.x;
++            for (int j1 = 0; j1 < ncols1; j1 += nwarps) {
++                const int j_sram = j1 + threadIdx.y;
+ 
+-                if (i >= nbatch_fa) {
+-                    continue; // the mask add and the dead-column detector never read past nbatch_fa
++                if (j1 + nwarps > ncols1 && j_sram >= ncols1) {
++                    break;
+                 }
+ 
+-                const int p = derived.cell_pos[k_VKQ_0 + i];
+-                tile_mask[j_sram*(nbatch_fa + 8) + i] =
+-                    (oob_check && i >= i_sup) || (p >= lo && p <= hi) ? half(0.0f) : half(-INFINITY);
++                const int j_vram = fastmodulo(j0 + j_sram, ne01);
++                const int lo = derived.tok_lo[j_vram];
++                const int hi = derived.tok_hi[j_vram];
++
++                const half h0 = oob0 || (p0 >= lo && p0 <= hi) ? half(0.0f) : half(-INFINITY);
++                const half h1 = oob1 || (p1 >= lo && p1 <= hi) ? half(0.0f) : half(-INFINITY);
++
++                *reinterpret_cast<half2 *>(tile_mask + j_sram*(nbatch_fa + 8) + i) = __halves2half2(h0, h1);
+             }
+         }
+         return;

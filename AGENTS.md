@@ -9,7 +9,7 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`ebbb18522`** (re-based 2026-09-17;
-release `v16-ebbb18522-r6`, the 2026-09-18 FA instance build-time fix (blocks 06/13/15: MMA per-head + tile per-KV-type split, head-512 source order, fused-gate MMQ instances moved out of `mmq.cu`; clean `ggml-hip -j16` 323 -> 236 s, no runtime change) on top of r5's block-04 gfx1100 WMMA-FA head cap back at 256 (issue #30) on
+release `v16-ebbb18522-r7`, the 2026-09-19 block-15 V3 derived-kq-mask kernel-shape fix (issue #30: the derived mask loader now does two cells per thread step with a `half2` store and hoists `cell_pos` out of the query-row loop; gfx1100 @98k -3.47 -> -0.15 %, gfx1201 27B 2GPU layer @98k -5.96 -> -1.62 %, output bit-identical) on top of r6, the 2026-09-18 FA instance build-time fix (blocks 06/13/15: MMA per-head + tile per-KV-type split, head-512 source order, fused-gate MMQ instances moved out of `mmq.cu`; clean `ggml-hip -j16` 323 -> 236 s, no runtime change) on top of r5's block-04 gfx1100 WMMA-FA head cap back at 256 (issue #30) on
 top of r4's block-04 RDNA3_0 tensor-split `ncols2` fix and r3's block-01 `--fit` fix for `draft-mtp-adaptive` + a minimal MTP head, issue #38; previously `d1d3c3396`, re-based 2026-09-15 from
 `790cf51aa`, re-based 2026-09-13
 from `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself
@@ -236,8 +236,9 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `ebbb18522` is a rebuild of the delivery set
-(tip `f1773dc84633e65cf631acbf691c4f9fba89ec14`, net tree
-  `4c7c4e641637797c66c8a6a1cd952533fdcbfa04` = r6, the 2026-09-18 FA instance build-time fix
+(tip `f56689f179fa9f2f95c82d060e73b6b0fa9ae817`, net tree
+  `9d236e9a21622fb8e05d02b646168aa6f660a700` = r7, the 2026-09-19 block-15 V3 derived-mask
+  kernel-shape fix, issue #30, on top of r6, the 2026-09-18 FA instance build-time fix
   (block 06 MMA split + source order, block 13 gate externs, block 15 tile split) on top of the
   2026-09-17 re-base onto `ebbb18522` +
   r3's 2026-09-18 block-01 `--fit` fix, issue #38, r4's 2026-09-18 block-04 RDNA3_0 tensor-split
@@ -834,6 +835,16 @@ Consequences, so it is not re-litigated:
   2026-09-10 number reproduced to the last decimal, and the width probe
   reproduces the delivered reference hashes — see the beta `README.md` +
   `HANDOVER.md` §10.
+  **Amended 2026-09-19 (r7, issue #30) with the V3 derived-mask kernel shape**: the derived branch of
+  `flash_attn_ext_f16_load_mask` processed one cell per thread step with a scalar `half` store and
+  re-read `cell_pos` for every query row, which cost up to -6.0 % deep prefill (27B 2-GPU layer,
+  gfx1201) and the reporter's gfx1100 loss (-3.5 % 9B, -13 % 27B); it now mirrors the packed fallback
+  (two cells per step, one `half2` store, `cell_pos` hoisted out of the query-row loop).  gfx1100
+  @98k -3.47 -> **-0.15 %**, gfx1151 @32k -0.53 -> -0.24 %, gfx1201 27B layer @98k -5.96 -> -1.62 %,
+  gfx1201 9B @98k +2.57 -> **+3.49 %**, output bit-identical.  V3's memory win is `n_ubatch x n_ctx x
+  2` (184.02 -> 88.39 MiB device + 112.02 -> 16.40 MiB host at `-c 98304`/ub 512), not the ~800 MiB
+  the campaign note implies (that needs ub ~2048).  A/B matrix, raw CSVs and harness:
+  `wip/kq-mask-derived-ab/`; block-15 amendment section in `patches/README.md`.
 - **The dense greedy-purity guarantee (`--spec-draft-n-max <= 7`) depends on the KV cache type.**
   It holds for **f16, bf16, q4_1, q5_0, q5_1 and iq4_nl**, but **NOT for a
   `q8_0` or `q4_0` K/V cache**: there `W=1 == W=2` and `W=3..8` agree,
@@ -927,7 +938,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults are read from `release.json`: base
-`ebbb18522`, blocks tip `f1773dc84633e65cf631acbf691c4f9fba89ec14`): `git format-patch --start-number 0` the block
+`ebbb18522`, blocks tip `f56689f179fa9f2f95c82d060e73b6b0fa9ae817`): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
