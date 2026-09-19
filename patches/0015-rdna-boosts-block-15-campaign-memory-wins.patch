@@ -1,4 +1,4 @@
-From d82d07a312dbc3d5df945b36cbb893784f0f31cf Mon Sep 17 00:00:00 2001
+From f1773dc84633e65cf631acbf691c4f9fba89ec14 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -284,34 +284,247 @@ WMMA kernel per KV type per instance TU and multiply that into ~10k "loop not
 unrolled" warning lines per clean build.  The hints are advisory and the pass
 already failed, so the build output is unchanged -- only the flood is gone.
 HIP-only (the diagnostic is Clang/AMDGPU).  See wip/build-time-regression/.
+
+Amended 2026-09-18: the tile template instances are generated per (head size, KV type) instead of
+per head size, matching the per-type axis this block introduced.  Build-time only: the same 96
+instantiations, identical symbols.
 ---
- ggml/include/ggml.h                  |  31 +-
- ggml/src/ggml-alloc.c                |  35 ++
- ggml/src/ggml-backend-meta.cpp       |  18 +-
- ggml/src/ggml-cpu/ops.cpp            |  71 ++-
- ggml/src/ggml-cuda/common.cuh        |  49 +++
- ggml/src/ggml-cuda/fattn-common.cuh  | 622 ++++++++++++++++++++++++++-
- ggml/src/ggml-cuda/fattn-mma-f16.cuh | 317 ++++++++++++--
- ggml/src/ggml-cuda/fattn-qsa.cu      |  47 +-
- ggml/src/ggml-cuda/fattn-tile.cu     |  29 ++
- ggml/src/ggml-cuda/fattn-tile.cuh    | 208 +++++++--
- ggml/src/ggml-cuda/fattn-vec.cuh     |   8 +-
- ggml/src/ggml-cuda/fattn.cu          |  68 ++-
- ggml/src/ggml-cuda/ggml-cuda.cu      |   6 +
- ggml/src/ggml-cuda/indexer-topk.cu   |  74 +++-
- ggml/src/ggml-hip/CMakeLists.txt     |  11 +
- ggml/src/ggml.c                      |  99 ++++-
- src/llama-context.cpp                | 146 ++++++-
- src/llama-cparams.h                  |   5 +
- src/llama-graph.cpp                  | 183 ++++++--
- src/llama-graph.h                    |  60 +++
- src/llama-kv-cache.cpp               | 189 +++++++-
- src/llama-kv-cache.h                 |  20 +-
- src/llama-memory-hybrid-idx.cpp      |  95 +++-
- src/llama-memory-hybrid-idx.h        |  17 +-
- src/models/qwen4exp.cpp              | 338 ++++++++++++---
- tests/test-backend-ops.cpp           |  55 ++-
- 26 files changed, 2543 insertions(+), 258 deletions(-)
+ ggml/include/ggml.h                           |  31 +-
+ ggml/src/ggml-alloc.c                         |  35 +
+ ggml/src/ggml-backend-meta.cpp                |  18 +-
+ ggml/src/ggml-cpu/ops.cpp                     |  71 +-
+ ggml/src/ggml-cuda/common.cuh                 |  49 ++
+ ggml/src/ggml-cuda/fattn-common.cuh           | 622 +++++++++++++++++-
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh          | 317 ++++++++-
+ ggml/src/ggml-cuda/fattn-qsa.cu               |  47 +-
+ ggml/src/ggml-cuda/fattn-tile.cu              |  29 +
+ ggml/src/ggml-cuda/fattn-tile.cuh             | 208 +++++-
+ ggml/src/ggml-cuda/fattn-vec.cuh              |   8 +-
+ ggml/src/ggml-cuda/fattn.cu                   |  68 +-
+ ggml/src/ggml-cuda/ggml-cuda.cu               |   6 +
+ ggml/src/ggml-cuda/indexer-topk.cu            |  74 ++-
+ .../fattn-tile-instance-dkq112-dv112-bf16.cu  |   5 +
+ .../fattn-tile-instance-dkq112-dv112-f16.cu   |   5 +
+ ...fattn-tile-instance-dkq112-dv112-iq4_nl.cu |   5 +
+ .../fattn-tile-instance-dkq112-dv112-q4_0.cu  |   5 +
+ .../fattn-tile-instance-dkq112-dv112-q4_1.cu  |   5 +
+ .../fattn-tile-instance-dkq112-dv112-q5_0.cu  |   5 +
+ .../fattn-tile-instance-dkq112-dv112-q5_1.cu  |   5 +
+ .../fattn-tile-instance-dkq112-dv112-q8_0.cu  |   5 +
+ .../fattn-tile-instance-dkq128-dv128-bf16.cu  |   5 +
+ .../fattn-tile-instance-dkq128-dv128-f16.cu   |   5 +
+ ...fattn-tile-instance-dkq128-dv128-iq4_nl.cu |   5 +
+ .../fattn-tile-instance-dkq128-dv128-q4_0.cu  |   5 +
+ .../fattn-tile-instance-dkq128-dv128-q4_1.cu  |   5 +
+ .../fattn-tile-instance-dkq128-dv128-q5_0.cu  |   5 +
+ .../fattn-tile-instance-dkq128-dv128-q5_1.cu  |   5 +
+ .../fattn-tile-instance-dkq128-dv128-q8_0.cu  |   5 +
+ .../fattn-tile-instance-dkq192-dv128-bf16.cu  |   5 +
+ .../fattn-tile-instance-dkq192-dv128-f16.cu   |   5 +
+ ...fattn-tile-instance-dkq192-dv128-iq4_nl.cu |   5 +
+ .../fattn-tile-instance-dkq192-dv128-q4_0.cu  |   5 +
+ .../fattn-tile-instance-dkq192-dv128-q4_1.cu  |   5 +
+ .../fattn-tile-instance-dkq192-dv128-q5_0.cu  |   5 +
+ .../fattn-tile-instance-dkq192-dv128-q5_1.cu  |   5 +
+ .../fattn-tile-instance-dkq192-dv128-q8_0.cu  |   5 +
+ .../fattn-tile-instance-dkq256-dv256-bf16.cu  |   5 +
+ .../fattn-tile-instance-dkq256-dv256-f16.cu   |   5 +
+ ...fattn-tile-instance-dkq256-dv256-iq4_nl.cu |   5 +
+ .../fattn-tile-instance-dkq256-dv256-q4_0.cu  |   5 +
+ .../fattn-tile-instance-dkq256-dv256-q4_1.cu  |   5 +
+ .../fattn-tile-instance-dkq256-dv256-q5_0.cu  |   5 +
+ .../fattn-tile-instance-dkq256-dv256-q5_1.cu  |   5 +
+ .../fattn-tile-instance-dkq256-dv256-q8_0.cu  |   5 +
+ .../fattn-tile-instance-dkq320-dv256-bf16.cu  |   5 +
+ .../fattn-tile-instance-dkq320-dv256-f16.cu   |   5 +
+ ...fattn-tile-instance-dkq320-dv256-iq4_nl.cu |   5 +
+ .../fattn-tile-instance-dkq320-dv256-q4_0.cu  |   5 +
+ .../fattn-tile-instance-dkq320-dv256-q4_1.cu  |   5 +
+ .../fattn-tile-instance-dkq320-dv256-q5_0.cu  |   5 +
+ .../fattn-tile-instance-dkq320-dv256-q5_1.cu  |   5 +
+ .../fattn-tile-instance-dkq320-dv256-q8_0.cu  |   5 +
+ .../fattn-tile-instance-dkq320-dv256.cu       |   5 -
+ .../fattn-tile-instance-dkq40-dv40-bf16.cu    |   5 +
+ ... => fattn-tile-instance-dkq40-dv40-f16.cu} |   2 +-
+ .../fattn-tile-instance-dkq40-dv40-iq4_nl.cu  |   5 +
+ .../fattn-tile-instance-dkq40-dv40-q4_0.cu    |   5 +
+ .../fattn-tile-instance-dkq40-dv40-q4_1.cu    |   5 +
+ .../fattn-tile-instance-dkq40-dv40-q5_0.cu    |   5 +
+ .../fattn-tile-instance-dkq40-dv40-q5_1.cu    |   5 +
+ .../fattn-tile-instance-dkq40-dv40-q8_0.cu    |   5 +
+ .../fattn-tile-instance-dkq40-dv40.cu         |   5 -
+ .../fattn-tile-instance-dkq512-dv512-bf16.cu  |   5 +
+ .../fattn-tile-instance-dkq512-dv512-f16.cu   |   5 +
+ ...fattn-tile-instance-dkq512-dv512-iq4_nl.cu |   5 +
+ .../fattn-tile-instance-dkq512-dv512-q4_0.cu  |   5 +
+ .../fattn-tile-instance-dkq512-dv512-q4_1.cu  |   5 +
+ .../fattn-tile-instance-dkq512-dv512-q5_0.cu  |   5 +
+ .../fattn-tile-instance-dkq512-dv512-q5_1.cu  |   5 +
+ .../fattn-tile-instance-dkq512-dv512-q8_0.cu  |   5 +
+ .../fattn-tile-instance-dkq512-dv512.cu       |   5 -
+ .../fattn-tile-instance-dkq576-dv512-bf16.cu  |   5 +
+ .../fattn-tile-instance-dkq576-dv512-f16.cu   |   5 +
+ ...fattn-tile-instance-dkq576-dv512-iq4_nl.cu |   5 +
+ .../fattn-tile-instance-dkq576-dv512-q4_0.cu  |   5 +
+ .../fattn-tile-instance-dkq576-dv512-q4_1.cu  |   5 +
+ .../fattn-tile-instance-dkq576-dv512-q5_0.cu  |   5 +
+ .../fattn-tile-instance-dkq576-dv512-q5_1.cu  |   5 +
+ .../fattn-tile-instance-dkq576-dv512-q8_0.cu  |   5 +
+ .../fattn-tile-instance-dkq576-dv512.cu       |   5 -
+ .../fattn-tile-instance-dkq64-dv64-bf16.cu    |   5 +
+ ... => fattn-tile-instance-dkq64-dv64-f16.cu} |   2 +-
+ .../fattn-tile-instance-dkq64-dv64-iq4_nl.cu  |   5 +
+ .../fattn-tile-instance-dkq64-dv64-q4_0.cu    |   5 +
+ .../fattn-tile-instance-dkq64-dv64-q4_1.cu    |   5 +
+ .../fattn-tile-instance-dkq64-dv64-q5_0.cu    |   5 +
+ .../fattn-tile-instance-dkq64-dv64-q5_1.cu    |   5 +
+ .../fattn-tile-instance-dkq64-dv64-q8_0.cu    |   5 +
+ .../fattn-tile-instance-dkq64-dv64.cu         |   5 -
+ .../fattn-tile-instance-dkq72-dv72-bf16.cu    |   5 +
+ ... => fattn-tile-instance-dkq72-dv72-f16.cu} |   2 +-
+ .../fattn-tile-instance-dkq72-dv72-iq4_nl.cu  |   5 +
+ .../fattn-tile-instance-dkq72-dv72-q4_0.cu    |   5 +
+ .../fattn-tile-instance-dkq72-dv72-q4_1.cu    |   5 +
+ .../fattn-tile-instance-dkq72-dv72-q5_0.cu    |   5 +
+ .../fattn-tile-instance-dkq72-dv72-q5_1.cu    |   5 +
+ .../fattn-tile-instance-dkq72-dv72-q8_0.cu    |   5 +
+ .../fattn-tile-instance-dkq72-dv72.cu         |   5 -
+ .../fattn-tile-instance-dkq80-dv80-bf16.cu    |   5 +
+ ... => fattn-tile-instance-dkq80-dv80-f16.cu} |   2 +-
+ .../fattn-tile-instance-dkq80-dv80-iq4_nl.cu  |   5 +
+ .../fattn-tile-instance-dkq80-dv80-q4_0.cu    |   5 +
+ .../fattn-tile-instance-dkq80-dv80-q4_1.cu    |   5 +
+ .../fattn-tile-instance-dkq80-dv80-q5_0.cu    |   5 +
+ .../fattn-tile-instance-dkq80-dv80-q5_1.cu    |   5 +
+ .../fattn-tile-instance-dkq80-dv80-q8_0.cu    |   5 +
+ .../fattn-tile-instance-dkq80-dv80.cu         |   5 -
+ .../fattn-tile-instance-dkq96-dv96-bf16.cu    |   5 +
+ .../fattn-tile-instance-dkq96-dv96-f16.cu     |   5 +
+ .../fattn-tile-instance-dkq96-dv96-iq4_nl.cu  |   5 +
+ .../fattn-tile-instance-dkq96-dv96-q4_0.cu    |   5 +
+ .../fattn-tile-instance-dkq96-dv96-q4_1.cu    |   5 +
+ .../fattn-tile-instance-dkq96-dv96-q5_0.cu    |   5 +
+ .../fattn-tile-instance-dkq96-dv96-q5_1.cu    |   5 +
+ .../fattn-tile-instance-dkq96-dv96-q8_0.cu    |   5 +
+ .../fattn-tile-instance-dkq96-dv96.cu         |   5 -
+ .../template-instances/generate_cu_files.py   |  11 +-
+ ggml/src/ggml-hip/CMakeLists.txt              |  11 +
+ ggml/src/ggml.c                               |  99 ++-
+ src/llama-context.cpp                         | 146 +++-
+ src/llama-cparams.h                           |   5 +
+ src/llama-graph.cpp                           | 183 ++++--
+ src/llama-graph.h                             |  60 ++
+ src/llama-kv-cache.cpp                        | 189 +++++-
+ src/llama-kv-cache.h                          |  20 +-
+ src/llama-memory-hybrid-idx.cpp               |  95 ++-
+ src/llama-memory-hybrid-idx.h                 |  17 +-
+ src/models/qwen4exp.cpp                       | 338 ++++++++--
+ tests/test-backend-ops.cpp                    |  55 +-
+ 131 files changed, 3015 insertions(+), 305 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-bf16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-f16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-iq4_nl.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q4_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q4_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q5_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q5_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q8_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-bf16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-f16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-iq4_nl.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q4_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q4_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q5_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q5_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q8_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-bf16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-f16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-iq4_nl.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q4_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q4_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q5_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q5_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q8_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-bf16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-f16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-iq4_nl.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q4_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q4_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q5_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q5_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-bf16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-f16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-iq4_nl.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q4_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q4_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q5_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q5_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q8_0.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-bf16.cu
+ rename ggml/src/ggml-cuda/template-instances/{fattn-tile-instance-dkq112-dv112.cu => fattn-tile-instance-dkq40-dv40-f16.cu} (69%)
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-iq4_nl.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q4_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q4_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q5_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q5_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q8_0.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-bf16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-f16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-iq4_nl.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q4_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q4_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q5_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q5_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q8_0.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-bf16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-f16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-iq4_nl.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q4_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q4_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q5_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q5_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q8_0.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-bf16.cu
+ rename ggml/src/ggml-cuda/template-instances/{fattn-tile-instance-dkq128-dv128.cu => fattn-tile-instance-dkq64-dv64-f16.cu} (69%)
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-iq4_nl.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q4_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q4_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q5_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q5_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q8_0.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-bf16.cu
+ rename ggml/src/ggml-cuda/template-instances/{fattn-tile-instance-dkq192-dv128.cu => fattn-tile-instance-dkq72-dv72-f16.cu} (69%)
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-iq4_nl.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q4_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q4_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q5_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q5_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q8_0.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-bf16.cu
+ rename ggml/src/ggml-cuda/template-instances/{fattn-tile-instance-dkq256-dv256.cu => fattn-tile-instance-dkq80-dv80-f16.cu} (69%)
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-iq4_nl.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q4_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q4_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q5_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q5_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q8_0.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-bf16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-f16.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-iq4_nl.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q4_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q4_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q5_0.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q5_1.cu
+ create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q8_0.cu
+ delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96.cu
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 74def376c..358bc74d0 100644
@@ -2745,11 +2958,1194 @@ index b15af7104..1b9e63516 100644
 +        (additive != nullptr || dst->src[3] != nullptr || dst->src[5] != nullptr) &&
          dst->type == GGML_TYPE_I32;
  }
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-bf16.cu
+new file mode 100644
+index 000000000..a5fc4f97a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-bf16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_BF16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-f16.cu
+new file mode 100644
+index 000000000..bcdd6c8d8
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-f16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-iq4_nl.cu
+new file mode 100644
+index 000000000..20ea6ae1c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-iq4_nl.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q4_0.cu
+new file mode 100644
+index 000000000..6bb29a4ee
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q4_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_Q4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q4_1.cu
+new file mode 100644
+index 000000000..a7a56c835
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q4_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_Q4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q5_0.cu
+new file mode 100644
+index 000000000..63b66a07b
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q5_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_Q5_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q5_1.cu
+new file mode 100644
+index 000000000..bf6a865bf
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q5_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_Q5_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q8_0.cu
+new file mode 100644
+index 000000000..7377bb0bd
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-q8_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(112, 112, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-bf16.cu
+new file mode 100644
+index 000000000..18c7539b8
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-bf16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_BF16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-f16.cu
+new file mode 100644
+index 000000000..3ca01a7cb
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-f16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-iq4_nl.cu
+new file mode 100644
+index 000000000..0ba0e5033
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-iq4_nl.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q4_0.cu
+new file mode 100644
+index 000000000..ffd918ae5
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q4_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_Q4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q4_1.cu
+new file mode 100644
+index 000000000..ba7532d5f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q4_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_Q4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q5_0.cu
+new file mode 100644
+index 000000000..058dae475
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q5_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_Q5_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q5_1.cu
+new file mode 100644
+index 000000000..0b5c0d0c6
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q5_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_Q5_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q8_0.cu
+new file mode 100644
+index 000000000..752d0ca6e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128-q8_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(128, 128, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-bf16.cu
+new file mode 100644
+index 000000000..6b3e7cfc9
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-bf16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_BF16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-f16.cu
+new file mode 100644
+index 000000000..dbab3454d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-f16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-iq4_nl.cu
+new file mode 100644
+index 000000000..43a014e15
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-iq4_nl.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q4_0.cu
+new file mode 100644
+index 000000000..922466887
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q4_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_Q4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q4_1.cu
+new file mode 100644
+index 000000000..26c44eef5
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q4_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_Q4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q5_0.cu
+new file mode 100644
+index 000000000..1f3d1411d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q5_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_Q5_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q5_1.cu
+new file mode 100644
+index 000000000..6ec847040
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q5_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_Q5_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q8_0.cu
+new file mode 100644
+index 000000000..d637058b0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128-q8_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(192, 128, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-bf16.cu
+new file mode 100644
+index 000000000..9fbeb75c0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-bf16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_BF16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-f16.cu
+new file mode 100644
+index 000000000..e7c0ff278
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-f16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-iq4_nl.cu
+new file mode 100644
+index 000000000..36ac48ff6
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-iq4_nl.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q4_0.cu
+new file mode 100644
+index 000000000..8065cad2c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q4_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_Q4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q4_1.cu
+new file mode 100644
+index 000000000..7fb870fb5
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q4_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_Q4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q5_0.cu
+new file mode 100644
+index 000000000..209d25f8a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q5_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_Q5_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q5_1.cu
+new file mode 100644
+index 000000000..e563fee4a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q5_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_Q5_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0.cu
+new file mode 100644
+index 000000000..7bb4cceb9
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256-q8_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(256, 256, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-bf16.cu
+new file mode 100644
+index 000000000..084c12c2d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-bf16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_BF16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-f16.cu
+new file mode 100644
+index 000000000..91b61720e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-f16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-iq4_nl.cu
+new file mode 100644
+index 000000000..624f04fe0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-iq4_nl.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q4_0.cu
+new file mode 100644
+index 000000000..200abc7d1
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q4_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_Q4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q4_1.cu
+new file mode 100644
+index 000000000..86af7a30f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q4_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_Q4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q5_0.cu
+new file mode 100644
+index 000000000..9150e61fe
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q5_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_Q5_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q5_1.cu
+new file mode 100644
+index 000000000..3dabccf7d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q5_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_Q5_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q8_0.cu
+new file mode 100644
+index 000000000..454871ce9
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256-q8_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(320, 256, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256.cu
+deleted file mode 100644
+index c91f50807..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq320-dv256.cu
++++ /dev/null
+@@ -1,5 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-tile.cuh"
+-
+-DECL_FATTN_TILE_CASE(320, 256);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-bf16.cu
+new file mode 100644
+index 000000000..3eeb26bc7
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-bf16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(40, 40, GGML_TYPE_BF16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-f16.cu
+similarity index 69%
+rename from ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112.cu
+rename to ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-f16.cu
+index a8b15ad72..4127111f6 100644
+--- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112.cu
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-f16.cu
+@@ -2,4 +2,4 @@
+ 
+ #include "../fattn-tile.cuh"
+ 
+-DECL_FATTN_TILE_CASE(112, 112);
++DECL_FATTN_TILE_CASE_TYPE(40, 40, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-iq4_nl.cu
+new file mode 100644
+index 000000000..b0e64db67
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-iq4_nl.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(40, 40, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q4_0.cu
+new file mode 100644
+index 000000000..57eafebe0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q4_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(40, 40, GGML_TYPE_Q4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q4_1.cu
+new file mode 100644
+index 000000000..e04c642be
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q4_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(40, 40, GGML_TYPE_Q4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q5_0.cu
+new file mode 100644
+index 000000000..ed0f88a11
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q5_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(40, 40, GGML_TYPE_Q5_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q5_1.cu
+new file mode 100644
+index 000000000..6c8ce1ffa
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q5_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(40, 40, GGML_TYPE_Q5_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q8_0.cu
+new file mode 100644
+index 000000000..3b4a094f0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40-q8_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(40, 40, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40.cu
+deleted file mode 100644
+index 10b330fa6..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq40-dv40.cu
++++ /dev/null
+@@ -1,5 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-tile.cuh"
+-
+-DECL_FATTN_TILE_CASE(40, 40);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-bf16.cu
+new file mode 100644
+index 000000000..bf79b142f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-bf16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_BF16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-f16.cu
+new file mode 100644
+index 000000000..b02049681
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-f16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-iq4_nl.cu
+new file mode 100644
+index 000000000..5be0d9e74
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-iq4_nl.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q4_0.cu
+new file mode 100644
+index 000000000..e89ea421b
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q4_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_Q4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q4_1.cu
+new file mode 100644
+index 000000000..5bdd21b94
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q4_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_Q4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q5_0.cu
+new file mode 100644
+index 000000000..0df8d870a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q5_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_Q5_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q5_1.cu
+new file mode 100644
+index 000000000..fbe1035d1
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q5_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_Q5_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q8_0.cu
+new file mode 100644
+index 000000000..2a02279a1
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512-q8_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(512, 512, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512.cu
+deleted file mode 100644
+index 7c61d8d2e..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq512-dv512.cu
++++ /dev/null
+@@ -1,5 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-tile.cuh"
+-
+-DECL_FATTN_TILE_CASE(512, 512);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-bf16.cu
+new file mode 100644
+index 000000000..edc3cc8dd
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-bf16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_BF16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-f16.cu
+new file mode 100644
+index 000000000..efda55ad7
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-f16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-iq4_nl.cu
+new file mode 100644
+index 000000000..2d6dd417d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-iq4_nl.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q4_0.cu
+new file mode 100644
+index 000000000..c6b2f3b15
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q4_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_Q4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q4_1.cu
+new file mode 100644
+index 000000000..54117a9e7
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q4_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_Q4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q5_0.cu
+new file mode 100644
+index 000000000..7817bd116
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q5_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_Q5_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q5_1.cu
+new file mode 100644
+index 000000000..8b9d21198
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q5_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_Q5_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q8_0.cu
+new file mode 100644
+index 000000000..d5e19e051
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512-q8_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(576, 512, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512.cu
+deleted file mode 100644
+index 254b7d2e1..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq576-dv512.cu
++++ /dev/null
+@@ -1,5 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-tile.cuh"
+-
+-DECL_FATTN_TILE_CASE(576, 512);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-bf16.cu
+new file mode 100644
+index 000000000..fdc62f6ba
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-bf16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(64, 64, GGML_TYPE_BF16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-f16.cu
+similarity index 69%
+rename from ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128.cu
+rename to ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-f16.cu
+index 1da181055..2c2721937 100644
+--- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq128-dv128.cu
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-f16.cu
+@@ -2,4 +2,4 @@
+ 
+ #include "../fattn-tile.cuh"
+ 
+-DECL_FATTN_TILE_CASE(128, 128);
++DECL_FATTN_TILE_CASE_TYPE(64, 64, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-iq4_nl.cu
+new file mode 100644
+index 000000000..0534fc3f0
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-iq4_nl.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(64, 64, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q4_0.cu
+new file mode 100644
+index 000000000..abf47fe0f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q4_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(64, 64, GGML_TYPE_Q4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q4_1.cu
+new file mode 100644
+index 000000000..dfe73a9cc
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q4_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(64, 64, GGML_TYPE_Q4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q5_0.cu
+new file mode 100644
+index 000000000..91d8ab631
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q5_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(64, 64, GGML_TYPE_Q5_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q5_1.cu
+new file mode 100644
+index 000000000..4b6db4475
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q5_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(64, 64, GGML_TYPE_Q5_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q8_0.cu
+new file mode 100644
+index 000000000..8e7549679
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64-q8_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(64, 64, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64.cu
+deleted file mode 100644
+index 5caffac04..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq64-dv64.cu
++++ /dev/null
+@@ -1,5 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-tile.cuh"
+-
+-DECL_FATTN_TILE_CASE(64, 64);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-bf16.cu
+new file mode 100644
+index 000000000..a702fabd9
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-bf16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(72, 72, GGML_TYPE_BF16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-f16.cu
+similarity index 69%
+rename from ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128.cu
+rename to ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-f16.cu
+index b571cca0d..ee0192f23 100644
+--- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq192-dv128.cu
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-f16.cu
+@@ -2,4 +2,4 @@
+ 
+ #include "../fattn-tile.cuh"
+ 
+-DECL_FATTN_TILE_CASE(192, 128);
++DECL_FATTN_TILE_CASE_TYPE(72, 72, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-iq4_nl.cu
+new file mode 100644
+index 000000000..a478d8929
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-iq4_nl.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(72, 72, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q4_0.cu
+new file mode 100644
+index 000000000..71bd6778d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q4_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(72, 72, GGML_TYPE_Q4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q4_1.cu
+new file mode 100644
+index 000000000..5ea03a256
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q4_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(72, 72, GGML_TYPE_Q4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q5_0.cu
+new file mode 100644
+index 000000000..64f2a203c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q5_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(72, 72, GGML_TYPE_Q5_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q5_1.cu
+new file mode 100644
+index 000000000..958557b3d
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q5_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(72, 72, GGML_TYPE_Q5_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q8_0.cu
+new file mode 100644
+index 000000000..cb4e3bb45
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72-q8_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(72, 72, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72.cu
+deleted file mode 100644
+index 8f9d5315f..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq72-dv72.cu
++++ /dev/null
+@@ -1,5 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-tile.cuh"
+-
+-DECL_FATTN_TILE_CASE(72, 72);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-bf16.cu
+new file mode 100644
+index 000000000..676740c0a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-bf16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(80, 80, GGML_TYPE_BF16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-f16.cu
+similarity index 69%
+rename from ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256.cu
+rename to ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-f16.cu
+index bc65c723e..8300e36ce 100644
+--- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq256-dv256.cu
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-f16.cu
+@@ -2,4 +2,4 @@
+ 
+ #include "../fattn-tile.cuh"
+ 
+-DECL_FATTN_TILE_CASE(256, 256);
++DECL_FATTN_TILE_CASE_TYPE(80, 80, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-iq4_nl.cu
+new file mode 100644
+index 000000000..0c3e27720
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-iq4_nl.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(80, 80, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q4_0.cu
+new file mode 100644
+index 000000000..76a8ccbed
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q4_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(80, 80, GGML_TYPE_Q4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q4_1.cu
+new file mode 100644
+index 000000000..b373c8449
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q4_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(80, 80, GGML_TYPE_Q4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q5_0.cu
+new file mode 100644
+index 000000000..c542886af
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q5_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(80, 80, GGML_TYPE_Q5_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q5_1.cu
+new file mode 100644
+index 000000000..5e2a80a45
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q5_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(80, 80, GGML_TYPE_Q5_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q8_0.cu
+new file mode 100644
+index 000000000..f58df114f
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80-q8_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(80, 80, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80.cu
+deleted file mode 100644
+index 90abb3b18..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq80-dv80.cu
++++ /dev/null
+@@ -1,5 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-tile.cuh"
+-
+-DECL_FATTN_TILE_CASE(80, 80);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-bf16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-bf16.cu
+new file mode 100644
+index 000000000..789f86580
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-bf16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_BF16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-f16.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-f16.cu
+new file mode 100644
+index 000000000..2edf6672b
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-f16.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_F16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-iq4_nl.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-iq4_nl.cu
+new file mode 100644
+index 000000000..cdd9d6b51
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-iq4_nl.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_IQ4_NL);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q4_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q4_0.cu
+new file mode 100644
+index 000000000..1c27b4d7b
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q4_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_Q4_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q4_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q4_1.cu
+new file mode 100644
+index 000000000..10e9135e6
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q4_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_Q4_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q5_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q5_0.cu
+new file mode 100644
+index 000000000..b6b7e64e8
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q5_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_Q5_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q5_1.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q5_1.cu
+new file mode 100644
+index 000000000..0e906a4b1
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q5_1.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_Q5_1);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q8_0.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q8_0.cu
+new file mode 100644
+index 000000000..101b3f791
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96-q8_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../fattn-tile.cuh"
++
++DECL_FATTN_TILE_CASE_TYPE(96, 96, GGML_TYPE_Q8_0);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96.cu b/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96.cu
+deleted file mode 100644
+index 7292c0aab..000000000
+--- a/ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq96-dv96.cu
++++ /dev/null
+@@ -1,5 +0,0 @@
+-// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+-
+-#include "../fattn-tile.cuh"
+-
+-DECL_FATTN_TILE_CASE(96, 96);
+diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+index 6cd9b5f1c..9de62efef 100755
+--- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
++++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+@@ -14,7 +14,7 @@ SOURCE_FATTN_TILE = """// This file has been autogenerated by generate_cu_files.
+ 
+ #include "../fattn-tile.cuh"
+ 
+-DECL_FATTN_TILE_CASE({head_size_kq}, {head_size_v});
++DECL_FATTN_TILE_CASE_TYPE({head_size_kq}, {head_size_v}, {type_kv});
+ """
+ 
+ SOURCE_FATTN_VEC = """// This file has been autogenerated by generate_cu_files.py, do not edit manually.
+@@ -71,10 +71,15 @@ def get_short_name(long_quant_name):
+ for filename in glob("*.cu"):
+     os.remove(filename)
+ 
++# One translation unit per (head size, KV type) instead of one per head size.  The emitted
++# instantiations are exactly the same 12 x 8 cases; the tile kernel is instantiated per type, so
++# the 8-case files were up to 14.8 MB / 137 s and one of them gated the backend build.  CMake
++# globs template-instances/fattn-tile*.cu, so no CMake change is needed.
+ for head_size_kq in HEAD_SIZES_KQ:
+     head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
+-    with open(f"fattn-tile-instance-dkq{head_size_kq}-dv{head_size_v}.cu", "w") as f:
+-        f.write(SOURCE_FATTN_TILE.format(head_size_kq=head_size_kq, head_size_v=head_size_v))
++    for type_kv in TYPES_KV:
++        with open(f"fattn-tile-instance-dkq{head_size_kq}-dv{head_size_v}-{get_short_name(type_kv)}.cu", "w") as f:
++            f.write(SOURCE_FATTN_TILE.format(head_size_kq=head_size_kq, head_size_v=head_size_v, type_kv=type_kv))
+ 
+ for type_k in TYPES_KV:
+     for type_v in TYPES_KV:
 diff --git a/ggml/src/ggml-hip/CMakeLists.txt b/ggml/src/ggml-hip/CMakeLists.txt
-index a6a6b7271..9246dd97b 100644
+index f3ef92ef3..e1738d3d6 100644
 --- a/ggml/src/ggml-hip/CMakeLists.txt
 +++ b/ggml/src/ggml-hip/CMakeLists.txt
-@@ -117,6 +117,17 @@ if (GGML_HIP_EXPORT_METRICS)
+@@ -123,6 +123,17 @@ if (GGML_HIP_EXPORT_METRICS)
      set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
  endif()
  

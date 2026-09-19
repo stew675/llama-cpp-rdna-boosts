@@ -9,7 +9,7 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`ebbb18522`** (re-based 2026-09-17;
-release `v16-ebbb18522-r5`, the 2026-09-18 block-04 gfx1100 WMMA-FA head cap back at 256 (issue #30) on
+release `v16-ebbb18522-r6`, the 2026-09-18 FA instance build-time fix (blocks 06/13/15: MMA per-head + tile per-KV-type split, head-512 source order, fused-gate MMQ instances moved out of `mmq.cu`; clean `ggml-hip -j16` 323 -> 236 s, no runtime change) on top of r5's block-04 gfx1100 WMMA-FA head cap back at 256 (issue #30) on
 top of r4's block-04 RDNA3_0 tensor-split `ncols2` fix and r3's block-01 `--fit` fix for `draft-mtp-adaptive` + a minimal MTP head, issue #38; previously `d1d3c3396`, re-based 2026-09-15 from
 `790cf51aa`, re-based 2026-09-13
 from `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself
@@ -236,8 +236,10 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `ebbb18522` is a rebuild of the delivery set
-(tip `d82d07a312dbc3d5df945b36cbb893784f0f31cf`, net tree
-  `06b89471790c52d7afa32f75755fb1b3b22edada` = r5, the 2026-09-17 re-base onto `ebbb18522` +
+(tip `f1773dc84633e65cf631acbf691c4f9fba89ec14`, net tree
+  `4c7c4e641637797c66c8a6a1cd952533fdcbfa04` = r6, the 2026-09-18 FA instance build-time fix
+  (block 06 MMA split + source order, block 13 gate externs, block 15 tile split) on top of the
+  2026-09-17 re-base onto `ebbb18522` +
   r3's 2026-09-18 block-01 `--fit` fix, issue #38, r4's 2026-09-18 block-04 RDNA3_0 tensor-split
   `ncols2` fix and r5's 2026-09-18 block-04 gfx1100 WMMA-FA head cap, issue #30; the
   previous base `d1d3c3396` had tip `8465f08b9efb26c60e992b48b7d2857d9ffcaf7a`, tree
@@ -340,7 +342,10 @@ re-homed — Vulkan to block 00, HIP to block 03; on the re-base block 06 was
 reduced to a host-buffer
 rationale marker — upstream itself reverted #24233 in #28604 on
 2026-09-08, matching its end state, so the functional delta is now
-upstream (see the WORKLOG re-base entry); block 12 carries the
+upstream (see the WORKLOG re-base entry); **from r6 (2026-09-18) block 06 is repurposed as the
+FA instance build-time block** (MMA per-head split + the head-512 source order; the tile per-KV-type
+split lives in block 15 and the fused-gate MMQ instantiation move in block 13, because both need
+those blocks' features — see the r6 sections in `patches/README.md`); block 12 carries the
 2026-09-04 runtime NCCL-failure fallback, issue #13, and was amended
 2026-09-11 so the hybrid dispatch's small/large crossover no longer changes
 the reduction algorithm across the decode/verify band (2-device `32768` ->
@@ -922,7 +927,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults are read from `release.json`: base
-`ebbb18522`, blocks tip `d82d07a312dbc3d5df945b36cbb893784f0f31cf`): `git format-patch --start-number 0` the block
+`ebbb18522`, blocks tip `f1773dc84633e65cf631acbf691c4f9fba89ec14`): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working

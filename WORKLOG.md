@@ -1,5 +1,62 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-18 (r6) — `v16-ebbb18522-r6`: the FA instance build-time fix (blocks 06/13/15)
+
+**Release.** `v16-ebbb18522-r6`, fork point `ebbb18522` (unchanged).  Canonical 16-block tip
+**`f1773dc84633e65cf631acbf691c4f9fba89ec14`**, net tree
+**`4c7c4e641637797c66c8a6a1cd952533fdcbfa04`**.  Blocks 00-05, 07-12 and 14 are content-identical to
+r5 (only the `From <sha>`/`index` lines moved because this rebuild has its own commit SHAs); the real
+deltas are **block 06** (`generate_cu_files.py` + 126 added / 21 deleted `fattn-mma*.cu` + the
+backend source-order prepend), **block 13** (`mmq.cuh` extern gate declarations + the generator
+`SOURCE_MMQ_GATE` fix + 4 `mmq-instance-*.cu` gate lines) and **block 15** (the tile per-KV-type
+split: 96 added / 12 deleted `fattn-tile*.cu`).  Strict 16/16 `git am` re-verified on a fresh
+`ebbb18522` tarball (`scripts/validate-set.sh` green: checksums, base tree, applied tree).
+
+**Why.**  The delivery's own FA instantiations had become the build's critical path: block 15's
+native-KV arm chain in `ggml_cuda_flash_attn_ext_mma_f16_case` instantiates the whole WMMA kernel
+once per KV type **inside every generated MMA instance TU**, so each 8-case `fattn-mma*` file was
+~200 s and one TU gated the backend build (`wip/build-time-regression/`).  The r5 tile-macro fix had
+already moved the tile type axis into the generated files; this release does the same for the MMA
+head axis and the tile KV-type axis, and puts the heaviest instances **first** in the backend source
+order.
+
+**Measured** (gfx1201, 16 cores, clean `cmake --build --target ggml-hip -j16`, same base):
+
+| state | wall |
+|---|---|
+| before (21 MMA TUs, worst 216 s) | **323.4 s** |
+| MMA per-head split (126 TUs) | 266.6 s |
+| + tile per-KV-type split (96 TUs) | 276.8 s *(worse: the big MMA TUs now start even later)* |
+| + `dkq512` source-order prepend | **239.0 / 239.2 s** |
+| + `mmq` gate instantiations moved out of `mmq.cu` | **235.97 s** (−27 %) |
+
+The decisive change is the **order**, not the split: object mtimes show the six `dkq512` MMA TUs
+starting at t=80-150 s and ending at the wall before; with the prepend they start at t=0-4 s and
+finish at t≈140 s.  `mmq.cu.o` shrank **9.1 → 1.0 MB**.  A heavy-first goal list piped to
+`make -f .../build.make` was tried first and is **not** the fix (that is a build invoker, not the
+delivery); the source-order prepend reproduces the gain through the normal `cmake --build` path.
+
+**Build-time only.**  Source-level: the explicit instantiation sets are identical — **126 MMA and 96
+tile cases before and after, zero duplicates** — and the linked-library symbol sets are identical.
+Gates: `test-backend-ops -o FLASH_ATTN_EXT` **4/4 backends**, `-o MUL_MAT_ID_FUSION` **28/28** (the
+block-13 gate path), clean build with zero errors.  No runtime or device-code change.
+
+**Storage note.**  The box's `/home` is a USB SSD and `/tmp` is tmpfs; a fresh out-of-source build
+in `/tmp` took **237.9 s vs 236.0 s**, i.e. the build is compiler/CPU-bound, not I/O-bound (clang
+already stages intermediates in `/tmp`).  The three NVMe drives are Windows installs and are not
+available under Linux.
+
+**Also fixed (pre-existing generator wart).**  `generate_cu_files.py` did not reproduce the checked-in
+`mmq-instance-*.cu` files (it appended a duplicate `#include`), and only `q3_k` carried
+`DECL_MMQ_CASE_GATE` while the other four gate types were silently implicit in `mmq.cu`.  Block 13 is
+amended to declare the gate cases `extern` in `mmq.cuh` and define them in the per-type files, which
+makes the generator idempotent (`DECL_MMQ_CASE_GATE` is now the append-only line) **and** moves five
+instantiations out of the monolithic `mmq.cu`.
+
+**Option (b) deferred.**  Making the WMMA loader's KV type a runtime dispatch would remove the 6-8x
+code duplication outright and is the remaining lever (estimated another ~20 %), but it is a runtime
+code-path change needing a decode + prefill A/B; it stays a follow-up.
+
 ## 2026-09-18 (r5) — `v16-ebbb18522-r5`: RDNA3_0 (gfx1100) WMMA FA is capped at head 256 (issue #30)
 
 **Release.** `v16-ebbb18522-r5`, fork point `ebbb18522` (unchanged).  Canonical 16-block tip

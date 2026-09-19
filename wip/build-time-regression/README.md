@@ -1,8 +1,14 @@
 # Build-time regression: the delivery's own FA instantiations (2026-09-15, r5)
 
-**Status: the `fattn-tile` half is FIXED and VERIFIED in `v16-790cf51aa-r5`; the unroll-warning flood
-is FIXED in `v16-ebbb18522-r2` (suppressed, see the unroll section).  The `fattn-mma-f16` compile-time
-half is DIAGNOSED, NOT FIXED — it needs a code-path change with its own A/B (see "Remaining").**
+**Status (2026-09-18, `v16-ebbb18522-r6`): FIXED.**  The `fattn-tile` half landed in
+`v16-790cf51aa-r5`; the unroll-warning flood in `v16-ebbb18522-r2`; and the `fattn-mma-f16` half in
+r6 — the MMA instances are generated per `(ncols1, ncols2, head size)` and the head-512 ones are
+listed **first** in the backend source order (clean `ggml-hip -j16` **323.4 -> 236.0 s**), the tile
+instances are split per `(head size, KV type)`, and the fused-gate MMQ instances moved out of
+`mmq.cu`.  The **reorder, not the split, is what delivers the win** (the six `dkq512` MMA TUs move
+from a t=80-150 s start to t=0).  The remaining lever is the runtime KV-type dispatch (option (b),
+~8x less device code, estimated another ~20 %), left as a follow-up because it needs a decode +
+prefill A/B.  The 2026-09-15 sections below are the diagnosis that led to r6.
 
 ## The report
 

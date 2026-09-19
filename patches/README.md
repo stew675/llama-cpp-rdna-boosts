@@ -3,11 +3,18 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`ebbb18522`**
 (re-based 2026-09-17 from `d1d3c3396`).
 
-**Current release: `v16-ebbb18522-r5`** — canonical tip
-`d82d07a312dbc3d5df945b36cbb893784f0f31cf`, tree
-`06b89471790c52d7afa32f75755fb1b3b22edada`.  Strict 16/16 `git am`; build +
-`test-backend-ops` **18083/18083** on gfx1201 (`FLASH_ATTN_EXT` 5952/5952,
-`FLASH_ATTN_QSA` 22/22).  **r5 (2026-09-18, issue #30) caps RDNA3_0 WMMA FA at head 256**: the
+**Current release: `v16-ebbb18522-r6`** — canonical tip
+`f1773dc84633e65cf631acbf691c4f9fba89ec14`, tree
+`4c7c4e641637797c66c8a6a1cd952533fdcbfa04`.  Strict 16/16 `git am`; clean build; on gfx1201
+`test-backend-ops -o FLASH_ATTN_EXT` 4/4 backends and `-o MUL_MAT_ID_FUSION` 28/28 (the full-suite
+**18083/18083** figure is the r5 measurement).  **r6 (2026-09-18) is the FA instance build-time fix**:
+block 06 generates the MMA instances per `(ncols1, ncols2, head size)` and lists the head-512 ones
+first in the backend source order (mirrored for CUDA), block 15 generates the tile instances per
+`(head size, KV type)`, and block 13 declares/defines the fused-gate MMQ cases in the per-type
+instance files (idempotent generator; `mmq.cu` is no longer a monolith).  Clean `ggml-hip -j16`
+**323.4 -> 236.0 s (-27 %)**, identical instantiations and symbols, no runtime change; the fix is the
+build **order** (the six `dkq512` MMA TUs start at t=0 instead of t=80-150 s), not the split alone.
+See the 2026-09-18 (r6) sections below and `../wip/build-time-regression/`.  **r5 (2026-09-18, issue #30) caps RDNA3_0 WMMA FA at head 256**: the
 2026-09-14 RDNA prefill tuning had copied RDNA4 #28102's config rows onto gfx1100, turning head 512
 from the 2026-08-28 'neutral' into a 3.5-10 % deep-prefill loss vs the tile kernel (gemma-4-26B-A4B,
 pp2048 @ d98304: f16 791 vs 819 t/s tile, bf16 776 vs 851, q8_0 784 vs 773).  RDNA3_0 now uses the
@@ -48,6 +55,45 @@ The 2026-09-17 re-base resolved three blocks:
 
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
+
+## 2026-09-18 (r6) block-06 + block-13 + block-15 amendment: the FA instance build-time fix
+
+**Release** `v16-ebbb18522-r6`, canonical tip `f1773dc84633e65cf631acbf691c4f9fba89ec14`, net tree
+`4c7c4e641637797c66c8a6a1cd952533fdcbfa04`.  Blocks 00-05, 07-12 and 14 are content-identical to r5
+(their `From <sha>`/`index` lines move with the rebuild); the real deltas are block 06, block 13 and
+block 15.
+
+**What and why.**  The delivery's own flash-attn instantiations were the build's critical path.
+Block 15's native-KV arm chain (`GGML_CUDA_FATTN_MMA_NATIVE_ARM` x 6 in
+`ggml_cuda_flash_attn_ext_mma_f16_case`) instantiates the whole WMMA kernel once per KV type inside
+every generated MMA instance TU, so an 8-case `fattn-mma-f16-instance-*` file compiled in ~200 s and
+one TU gated the backend build (diagnosed in `../wip/build-time-regression/`, 2026-09-15).  r5 had
+already moved the tile type axis into the generated files; r6 does the same for the MMA head axis
+and the tile KV-type axis, then fixes the *order*.
+
+**Block 06** — `generate_cu_files.py` writes one MMA TU per `(ncols1, ncols2, head size)`
+(126 files, was 21) and `ggml/src/ggml-hip/CMakeLists.txt` + `ggml/src/ggml-cuda/CMakeLists.txt`
+prepend the head-512 instances (`SRCS_FA_HEAVY` + `list(INSERT ... 0 ...)`, removed from the general
+MMA glob) so make's FIFO dispatch starts the longest TUs first.  **Block 13** — `mmq.cuh` gains
+`extern DECL_MMQ_CASE_GATE(...)` for Q3_K/Q4_K/Q5_K/Q6_K/Q8_0 and the four corresponding
+`mmq-instance-*.cu` files define their gate case, so `mmq.cu` no longer implicitly instantiates all
+five; `SOURCE_MMQ_GATE` now appends only the case line, which also makes the generator idempotent
+(previously it re-emitted a duplicate `#include`).  **Block 15** — `generate_cu_files.py` writes one
+tile TU per `(head size, KV type)` (96 files, was 12).
+
+**Measured** (gfx1201, 16 cores, clean `cmake --build --target ggml-hip -j16`): 323.4 s baseline ->
+266.6 s (MMA split) -> 276.8 s (+ tile split, *worse*) -> **239.0/239.2 s** (+ the source-order
+prepend) -> **235.97 s** (+ the `mmq` move; `mmq.cu.o` 9.1 -> 1.0 MB).  Object mtimes show the six
+`dkq512` MMA TUs moving from a t=80-150 s start / wall-end finish to t=0-4 s / t≈140 s.  A heavy-first
+goal list piped to `make -f .../build.make` was tried and is **not** the fix (build-invoker only); the
+CMake source-order prepend reproduces the gain through the normal `cmake --build`.
+
+**Build-time only.**  Source-level: 126 MMA + 96 tile explicit instantiations identical before/after,
+zero duplicates; the linked-library symbol sets are identical.  Gates: clean build, zero errors,
+`FLASH_ATTN_EXT` 4/4, `MUL_MAT_ID_FUSION` 28/28.  Storage is not the bottleneck (a full out-of-source
+build in `/tmp` = 237.9 s vs 236.0 s on the USB SSD).  **Option (b)** — a runtime KV-type dispatch in
+the WMMA loader, ~8x less device code and an estimated further ~20 % — remains the follow-up, as it
+is a runtime code-path change needing decode + prefill A/B validation.
 
 ## 2026-09-18 block-04 amendment (r5): RDNA3_0 WMMA FA is capped at head 256 (issue #30)
 
