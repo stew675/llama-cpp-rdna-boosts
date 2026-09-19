@@ -991,9 +991,15 @@ compiler test now injects `--cuda-host-only` directly after it — the bare
 **ccache is strongly recommended** (the script enables it when `ccache` is on
 PATH; set `CCACHE=0` to opt out).  Because the script `rm -rf`s the build dir
 each run, a rebuild of unchanged sources is otherwise a full recompile; with
-ccache it measured **282 s -> 4.2 s** (657/657 compile steps hit; gfx1201,
-16 cores).  It replays the compiler's own objects, so codegen and perf are
-unchanged (`llama-bench` within noise, `test-backend-ops` green).  Note the
+ccache a wiped rebuild of unchanged sources measures **282 -> 4.2 s** on gfx1201
+(16 cores), **321.8 -> 5.2 s** on gfx1151 (`halo`, Strix Halo) and
+**383.9 -> 4.8 s** on gfx1100 (`fingon`, RX 7900 XTX) - 657/657 compile steps
+hit on each.  It replays the compiler's own objects, so codegen and perf are
+unchanged (same-seed greedy text hash identical to the pre-ccache build on every
+host; `llama-bench` within noise; `test-backend-ops` green).  All three hosts
+carry the same block in `~/bin/build-llama-rocm-714` (the per-host copies differ
+only in `ROCM_714` and `GPU_TARGETS`/`AMDGPU_TARGETS`), so a `halo`/`fingon`
+build needs no special handling; `~/.cache/ccache` is sized 20 G on each.  Note the
 FA instances are *deliberately* force-inlined: the optimiser's cross-inlining
 is why they are fast at runtime and slow to compile (RDNA4/ROCm 7.14); a
 `fattn-*.cuh` edit invalidates the whole FA group.  This is the sanctioned
