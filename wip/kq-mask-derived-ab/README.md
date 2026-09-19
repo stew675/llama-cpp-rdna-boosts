@@ -120,6 +120,27 @@ is small.  The gfx1151 dense 9B and the 35B-A3B MoE numbers are in `data/csv-fix
 9B 1GPU `0e83b43746e7` both, 27B 2GPU layer `5ec02413b9c9` both.  Only the shape of the stores
 changed; every mask value is the same, so no purity gate moves.
 
+## The depth curve (27B 2-GPU tensor, gfx1201)
+
+The packed mask grows with `n_kv`, so on a tensor split the derived form crosses over with depth.
+Post-r7, PP512, `-r 3` (`data/csv-soar-tensor-curve.txt`):
+
+| depth | derived=1 | derived=0 | delta |
+|---|---|---|---|
+| 0 | 2002.9 | 2029.4 | -1.30 % |
+| 4096 | 1851.8 | 1875.4 | -1.26 % |
+| 8192 | 1785.0 | 1813.2 | -1.56 % |
+| 16384 | 1671.7 | 1689.6 | -1.05 % |
+| 32768 | 1474.8 | 1480.9 | -0.41 % |
+| 65536 | 1197.9 | 1182.7 | **+1.28 %** |
+| 98304 | 997.7 | 980.9 | **+1.71 %** |
+
+Crossing between 32k and 64k.  This is the "dynamic switch-over" the reporter hypothesised, and it is
+purely a depth effect: below the crossover the mask is cheap to materialise, above it deriving is
+cheaper.  A depth-dependent gate is *possible* (it would key on `n_kv` at graph-build time), but the
+shallow loss is ~1 % and the delivery therefore keeps the simple "always derive" default and
+documents the opt-out instead (see the README section).
+
 ## If that had failed
 
 The effect was **sign-unstable across arch + model config**, so no single arch gate would have been

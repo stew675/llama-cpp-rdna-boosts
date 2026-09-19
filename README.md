@@ -227,6 +227,50 @@ Full derivation (the 4×4 corpus, all four cells, and the rejected controller al
 [`README.md`](wip/mtp-journey-2026-09-17/README.md)); the dated controller records are in
 [`benchmarks/`](benchmarks/README.md), newest `2026-09-15-adaptive-mtp-tuning.md`.
 
+## VRAM vs prefill — the derived KQ mask (`LLAMA_KQ_MASK_DERIVED`)
+
+**On by default, deliberately.**  The delivery derives the attention mask inside the FA kernel from
+compact per-cell state instead of materialising the `n_kv x n_q` f16 mask.  That removes
+`n_ubatch x n_ctx x 2` bytes of compute-buffer VRAM **plus the same again on the host** — measured on
+a 9B at `-c 98304` / ub 512: **184.0 -> 88.4 MiB** device and **112.0 -> 16.4 MiB** host.  The saving
+scales linearly with the ubatch, which is the point: a deep-context **MoE** or **qwen4exp /
+Qwen3.8-Flash-Next** workload wants a large ubatch, and that is exactly the configuration where the
+mask is biggest (~800 MiB/GPU at ub 2048 / 196k) and where the VRAM the feature frees is the
+difference between fitting the context and not.
+
+The cost is **prefill only** — decode is untouched, because the derived path only fires for batches
+larger than 8 tokens (speculative verify keeps the packed mask, so `n_max <= 7` stays bit-identical).
+Measured PP512, mask on vs off, `-r 3` ("+" = the mask helps):
+
+| config | d0 | 32k | 64k | 98k |
+|---|---|---|---|---|
+| gfx1201 9B dense 1 GPU | — | +1.9 % | — | **+3.5 %** |
+| gfx1201 27B 2 GPU **tensor** | −1.3 % | −0.4 % | **+1.3 %** | **+1.7 %** |
+| gfx1201 27B 2 GPU layer | — | — | — | −1.6 % |
+| gfx1201 27B 3 GPU tensor | −3.4 % | — | — | — |
+| gfx1151 9B dense 1 GPU | +0.4 % | −0.2 % | −0.9 % | −1.8 % |
+| gfx1151 35B-A3B MoE 1 GPU | −0.3 % | −0.3 % | −0.8 % | −1.6 % |
+| gfx1100 9B dense 1 GPU | −0.4 % | −0.5 % | −0.4 % | **−0.2 %** |
+
+The tensor-split shape is the one to understand: the packed mask grows with `n_kv`, so on a
+**tensor split at shallow depth the mask is a small loss (−1.3 % at d0, crossing zero near 48k) and
+becomes a win by 64k+**; on the maintainer's 3-GPU tensor serving setup it is a win at depth.  gfx1100
+and gfx1151 pay a depth-growing ~1–2 % (they did not recover as much from the r7 kernel fix as
+gfx1201 — the iGPU shares host bandwidth and the 7900 XTX has more of its own).  gfx1100 on a
+dual-card **`-sm tensor`** split is the one cell we still cannot measure here (only a single 7900 XTX
+is available); a community report on 2x RX 7900 XTX is pending.
+
+**Turning it off.**  `LLAMA_KQ_MASK_DERIVED=0` restores the packed mask (upstream's behaviour).
+Worth doing if you are on **gfx1100/gfx1151** and want the last ~1–2 % of deep prefill, or on a
+**tensor split at shallow depth** and prefill latency matters more than the VRAM.  For a deep-context
+MoE / qwen4exp workload the default is the right side of the trade.
+
+**Not a correctness knob:** same-seed output is byte-identical either way (the derived mask produces
+the same values; only the memory layout and prefill cost differ).
+
+Full matrix, raw CSVs and the A/B harness: [`wip/kq-mask-derived-ab/`](wip/kq-mask-derived-ab/); the
+2026-09-19 block-15 (r7) amendment in [`patches/README.md`](patches/README.md).
+
 ## When upstream master moves
 
 The patches are static against the fork point in `release.json.base`. When upstream
