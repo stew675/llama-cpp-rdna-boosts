@@ -1,8 +1,15 @@
 # WIP handover: V3 derived KQ mask on the tile FA kernel
 
-**Status:** not started (scoped 2026-09-19).  **Effort guess:** 1-2 sessions, mostly validation.
+**Status:** implemented + correctness-validated 2026-09-19; **not landed** (a measured decode cost
+decides the shape -- see `RESULTS-2026-09-19.md` §6).  **Effort guess:** 1-2 sessions, mostly validation.
 **Delivery state at handover:** `v16-ebbb18522-r8` (see `patches/README.md`).
 **Develop on** `soar` (3x gfx1201), **verify on** `halo` (gfx1151) and `fingon` (gfx1100).
+
+> **Read `RESULTS-2026-09-19.md` first if you are continuing this.**  The arm is written and is
+> bit-identical on all three arches (8 KV types on gfx1201, 4 each on gfx1151/gfx1100, natural tile
+> selection), with ~+1% deep prefill and flat decode on the target arches -- but the *runtime-branch*
+> shape costs ~0.5-0.8% decode at depth on the `ncols2=4` tile instances (including head-256 models
+> that get no benefit), so the open question is the template-split described there in §6(b).
 
 ---
 
