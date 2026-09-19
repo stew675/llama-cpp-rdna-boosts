@@ -103,13 +103,18 @@ never makes `i + 1` leave the tile and no tail handling is needed.
 | gfx1201 9B 1GPU @98k | +2.57 % | **+3.49 %** |
 | gfx1151 9B 1GPU @32k | -0.53 % | -0.24 % |
 | gfx1151 9B 1GPU @64k | -0.86 % | -0.86 % |
-| gfx1151 9B 1GPU @98k | -1.85 % | see `data/csv-fix-gfx1151.txt` |
+| gfx1151 9B 1GPU @98k | -1.85 % | -1.81 % (unchanged) |
 | gfx1100 9B 1GPU @32k | -1.65 % | -0.47 % |
 | gfx1100 9B 1GPU @64k | -2.31 % | -0.38 % |
 | gfx1100 9B 1GPU @98k | -3.47 % | **-0.15 %** |
 
 The regression is essentially gone on RDNA3 (the reporter's -3.5 % 9B / -13 % 27B cases), the
 RDNA4 wins grew, and the remaining RDNA4 27B layer-split cost is -1.6 % (down from -6.0 %).
+
+**Residual.**  gfx1151 (Strix Halo iGPU) still shows ~-1.8 % at 98k (it was -1.85 % before), while its
+32k point improved (-0.53 -> -0.24 %).  The iGPU shares memory bandwidth with the host, so this may be
+noise or a different (bandwidth) bottleneck than the loop shape; it is the one remaining cell, and it
+is small.  The gfx1151 dense 9B and the 35B-A3B MoE numbers are in `data/csv-fix-gfx1151.txt`.
 
 **Bit-identical.**  Same-seed 256/200-token greedy text with `LLAMA_KQ_MASK_DERIVED=1` vs `0`:
 9B 1GPU `0e83b43746e7` both, 27B 2GPU layer `5ec02413b9c9` both.  Only the shape of the stores
