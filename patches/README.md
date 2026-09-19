@@ -3,16 +3,24 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`ebbb18522`**
 (re-based 2026-09-17 from `d1d3c3396`).
 
-**Current release: `v16-ebbb18522-r8`** — canonical tip
-`63e6aa1ffca8fe65d46f7152435a64deeb3ca59e`, tree
-`bee36f6f908acef9bc2093971304a6094fe67e63`.  Strict 16/16 `git am`; clean build; on gfx1201
+**Current release: `v16-ebbb18522-r9`** — canonical tip
+`76b10f1fb8391562e30364d6c307e6606100bc57`, tree
+`cfb2f966448da2b02d24f88a3d30666660949b1f`.  Strict 16/16 `git am`; clean build; on gfx1201
 `test-backend-ops -o FLASH_ATTN_EXT` 4/4 backends and `-o MUL_MAT_ID_FUSION` 28/28 (the full-suite
-**18083/18083** figure is the r5 measurement).  **r8 (2026-09-19) makes the V3 derived-mask disable
-self-explanatory** (only block 15 changed): when the derived FA node lands off the GPU, the resolve
-probe now names the cause (the derived mask is MMA-kernel-only, so a head above the per-arch WMMA cap
-or `GGML_CUDA_FA_WMMA_256=0` / `_MAX_HEAD` selects the tile kernel and loses it).  The old "missing
-support" text sent a user hunting a device problem instead of a stale `GGML_CUDA_FA_WMMA_256=0`, which
-on gfx1201 head 256 costs **3x deep prefill** (9B `-d 98304`: 2104 -> 710 t/s) *and* disables V3.
+**18083/18083** figure is the r5 measurement).  **r9 (2026-09-19) implements block-15 V3's derived kq
+mask in the tile kernel** (only block 15 changed): the mask was MMA-only, so every configuration whose
+prefill the chooser serves with the *tile* kernel lost it — every head above the per-arch WMMA cap
+(gemma4's head 512 on gfx1100/gfx1151) and anything forcing `GGML_CUDA_FA_WMMA_256=0`.  There the tile
+path now gets it as a *win* (gfx1100 gemma4-12B pp512 **+1.2 % @16k / +0.9 % @32k**, gfx1151
+**+1.6 % @16k**, gfx1201 E4B tile-forced **+2.3 % @d0**), bit-identical derived-on-vs-off across all 8
+KV types on gfx1201 and 4 on gfx1151/gfx1100, and **decode pays nothing**: the derived branch is
+hoisted out of the KV loop because decode/verify *always* take the tile kernel (the WMMA branch needs
+`ne[1] > 8`), and the first per-iteration form cost -0.5..-0.8 % `tg128` at depth (r8 vs r9 on the 9B:
+gfx1201 **+0.01 %**, gfx1100 **+0.02 %**, gfx1151 flat).  No new kernel instantiations, so build time is
+unchanged.  **r8 (2026-09-19, superseded by r9)** made the derived-mask *disable* self-explanatory by
+naming the head-cap/tile cause, which no longer exists — the note now says only that neither prefill
+kernel served the graph, and the stale-`GGML_CUDA_FA_WMMA_256=0` advice survives as a pure performance
+note (on gfx1201 head 256 that env costs **3x deep prefill**, 9B `-d 98304`: 2104 -> 710 t/s).
 **r7 (2026-09-19, issue #30) fixes block-15 V3's
 derived-kq-mask kernel shape** (only block 15 changed): the derived branch processed one cell per
 thread step with a scalar `half` store and re-read `cell_pos` for every query row, which cost up to
@@ -336,6 +344,59 @@ pure) but is ~6 % *slower* than NCCL in the serialized regime, so it is document
 recorded in the sticky last-error slot, so the next kernel launch's error check aborted the process
 at the following context's first `rms_norm`; `init_ce` now clears it.  See `../WORKLOG.md`
 (2026-09-16) for the full record.
+
+## 2026-09-19 block-15 amendment (r9): the V3 derived kq mask reaches the tile kernel
+
+**Release `v16-ebbb18522-r9`** (only block 15 changed; tip `76b10f1fb`, tree `cfb2f9664`).
+
+**Why.**  V3 was implemented in the MMA kernel only, and `ggml_cuda_flash_attn_ext_supported` rejected
+any other selection, so the mask was unavailable wherever the chooser serves prefill with the **tile**
+kernel: every head above the per-arch WMMA cap (RDNA4 576, RDNA3_5 320, RDNA3_0 256) — the whole
+**gemma4** family (head 512) on gfx1100 and gfx1151 — and anything forcing the tile kernel with
+`GGML_CUDA_FA_WMMA_256=0` / `_MAX_HEAD`.  r8 made that visible in the log; this amendment removes the
+cause.  It also matters because the two arches that live on the tile kernel are the ones the memory win
+was documented for.
+
+**The change** (4 files, ~60 lines).  `kq_derived_t` moves to `fattn-common.cuh` so both kernels share
+one definition; the tile kernel's one mask read site gets the derived arm; and
+`launch_fattn_tile_switch_ncols2`'s `use_gqa_opt` learns the MMA kernel's `has_mask` notion
+(`src[3] != nullptr || src[5] != nullptr`), because a derived op leaves `src[3]` **null**
+(`build_attn_mha` sets `kq_mask = nullptr`) and the old predicate would otherwise have chosen a
+different `ncols2` than the packed path for the same shape — a numerics change, not just a path
+change.  `flash_attn_ext_supported` accepts derived on TILE as well as MMA_F16; VEC stays rejected
+(it is decode/verify-only and a derived op cannot reach it, `kq_mask_derivable()` rejects
+`n_tokens <= 8`).
+
+Two traps were live.  (1) The read guard `(ncols2 > 1 || mask)` was **false** for `ncols2 == 1` with a
+derived op — it would have run the attention *unmasked*.  The derived test is now taken **before** that
+guard rather than folded into it, so the trap cannot come back through the GQA-optimised variants.
+This is the trap to re-check in any future kq-mask work: `mask == nullptr` does not mean "no mask".
+(2) `use_gqa_opt` above.  Unlike the MMA kernel the tile kernel reads the packed mask straight from
+global memory (no shared staging), so the derived arm needed no loader or staging change at all.
+
+**Decode pays nothing, and that is the interesting part.**  Decode and the spec verify batch *always*
+take the tile kernel (the chooser's WMMA branch requires `ne[1] > 8`), so this change sits on the
+latency path of every configuration on every arch — including head-256 models that get nothing from it
+(their prefill is MMA).  The first cut tested `derived.cell_pos != nullptr` **inside** the unrolled KV
+loop, which made the compiler rematerialize the extra parameters instead of keeping them in registers
+in a register-bound kernel: **-0.48 % / -0.79 %** `tg128` (gfx1201, 3 alternating rounds of `-r 10`,
+non-overlapping sets; -0.69 % on gfx1100).  Hoisting the test to once per query row recovers it
+exactly: r8 vs r9 `tg128` on the 9B @d16384 is **+0.01 %** (gfx1201) / **+0.02 %** (gfx1100), flat on
+gfx1151, and gemma4-12B on the tile kernel is -0.07 %.  A `use_kq_derived` template parameter was the
+considered alternative (it would have grown the tile group by ~40 %); the measurement says it is not
+needed, so the build time is unchanged.
+
+**Validation.**  Bit-identical (`LLAMA_KQ_MASK_DERIVED=1` vs `0`, same-seed greedy text): all 8 KV
+types on gfx1201 (tile forced) and f16/bf16/q8_0/q4_0 on each of gfx1151 and gfx1100, where the
+head-512 gemma4 now selects tile **naturally** (no env) and enables the mask where r8 warned.  Controls:
+the MMA path is unchanged **and produces a different text from the tile runs** (708 chars
+`0229d81902b8` vs 701 `cc9d5ce277d4`), so the "derived == packed" results are not vacuous.  Prefill
+(derived on vs off, tile): gfx1100 gemma4-12B pp512 **+1.18 % @16k, +0.86 % @32k**, gfx1151
+**+1.60 % / +1.72 % @16k, +0.58 % @32k**, gfx1201 E4B (tile forced) **+2.30 % @d0**; the win tracks the
+mask size, so it is ~zero shallow and grows with depth.  SWA is covered (gemma4's window lives in
+`tok_lo`/`tok_hi`, already handled by the host fill).  `scripts/validate-set.sh` green (strict 16/16
+`git am`, applied tree `cfb2f9664`).  The r8 section below is superseded: its head-cap/tile cause no
+longer exists.
 
 ## 2026-09-19 block-15 amendment (r7): the V3 derived-kq-mask kernel shape (issue #30)
 

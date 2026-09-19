@@ -1,5 +1,72 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-19 (r9) — `v16-ebbb18522-r9`: V3's derived kq mask reaches the tile FA kernel
+
+Follow-up to the r8 finding.  r8 *reported* the head-cap case (a head above the per-arch WMMA cap
+selects the tile kernel, which had no derived arm, so V3 was disabled); the maintainer asked for the
+cause to be fixed rather than explained, and for the tile path's own performance to be protected.
+
+**Why the tile path mattered.**  The head caps are RDNA4 576 / RDNA3_5 320 / RDNA3_0 256, so the whole
+**gemma4** family (head 512) takes the **tile** kernel for prefill on gfx1100 and gfx1151 — the two
+arches the V3 memory win was documented for — and those configurations were getting nothing from it.
+On those arches the tile kernel is also the *faster* choice at head 512 (r5: 3.5-10 % over MMA on
+gfx1100), so "just use the MMA kernel" was never the answer.
+
+**The implementation** (4 files, ~60 lines; block 15 only): `kq_derived_t` moves to
+`fattn-common.cuh` so both kernels share one definition; the tile kernel's single mask read site gets
+the derived arm; `launch_fattn_tile_switch_ncols2`'s `use_gqa_opt` learns the MMA kernel's `has_mask`
+notion, because a derived op leaves `src[3]` **null** (`build_attn_mha` sets `kq_mask = nullptr`) and
+the old predicate would have chosen a different `ncols2` than the packed path for the same shape — a
+numerics change, not just a path change; and `ggml_cuda_flash_attn_ext_supported` accepts derived on
+TILE as well as MMA_F16 (VEC stays rejected: decode/verify-only, unreachable for a derived op).
+
+**Two traps were live**, both worth remembering.  The tile kernel's read guard `(ncols2 > 1 || mask)`
+is **false** for `ncols2 == 1` with a derived op, i.e. it would have run the attention *unmasked* —
+silent, no crash.  The derived test is now taken **before** that guard rather than folded into it, so
+the trap cannot come back through the GQA-optimised variants.  The general lesson for any future
+kq-mask work: `mask == nullptr` does not mean "no mask".  The second trap is the `use_gqa_opt`
+predicate above.  Unlike the MMA kernel, the tile kernel reads the packed mask straight from global
+memory (no shared staging), so the arm needed no loader or staging change at all.
+
+**The decode cost, and the fix that turned out to be enough.**  Decode and the spec verify batch
+*always* take the tile kernel (the chooser's WMMA branch requires `ne[1] > 8`), so the derived arm sits
+on the latency path of every configuration on every arch — including head-256 models whose prefill is
+MMA and which therefore gain nothing from the feature.  The first cut tested
+`derived.cell_pos != nullptr` **inside** the unrolled KV loop; that made the compiler rematerialize the
+three extra parameters instead of keeping them in registers in a register-bound kernel, and cost
+**-0.48 % / -0.79 %** `tg128` (3 alternating rounds of `-r 10`, non-overlapping sets) plus -0.69 % on
+gfx1100.  Hoisting the test to once per query row recovers it exactly (r8 vs r9: **+0.01 %** gfx1201,
+**+0.02 %** gfx1100, flat on gfx1151), so the planned `use_kq_derived` **template split was not
+needed** — which matters because it would have grown the tile instance set by roughly 40 %, and r6 had
+just spent a release on build time.  Worth recording that the first hypothesis (register pressure from
+the extra parameters) was wrong: the cheap code-shape fix was sufficient, and the kernel's register
+count is the same either way.  A related measurement from the same session, since it informs the FA
+policy: on gfx1201 the tile kernel is 6-10 % behind MMA for head-512 prefill and level on decode, while
+on gfx1100 the ordering flips — which is exactly what the per-arch caps encode.
+
+**Results** (bit-identical: `LLAMA_KQ_MASK_DERIVED=1` vs `0`, same-seed greedy text via
+`scripts/extract-generated.py`):
+
+* all 8 KV types on gfx1201 (tile forced), and f16/bf16/q8_0/q4_0 on each of gfx1151 and gfx1100,
+  where head-512 gemma4 now selects tile **naturally** and enables the mask with no env (r8 warned
+  here instead);
+* controls: the MMA path is unchanged *and* yields a different text from the tile runs (708 chars
+  `0229d81902b8` vs 701 `cc9d5ce277d4`), so the derived==packed results are not vacuous;
+* prefill derived-on vs off on the tile path: gfx1100 gemma4-12B pp512 **+1.18 % @16k, +0.86 % @32k**;
+  gfx1151 **+1.60 % / +1.72 % @16k, +0.58 % @32k**; gfx1201 E4B (tile forced) **+2.30 % @d0**, and
+  +1.7 % / +2.3 % on the 3-GPU layer split.  The win tracks the mask size, so it is ~zero shallow and
+  grows with depth;
+* SWA covered (gemma4's window is carried in `tok_lo`/`tok_hi` by the existing host fill);
+* `scripts/validate-set.sh` green: strict 16/16 `git am`, applied tree `cfb2f9664` == the canonical
+  tree.
+
+**Docs fixed in the same pass**: the r8 log note in `src/llama-context.cpp` (its "MMA kernel only"
+claim was now false, so it was reworded to say only that neither prefill kernel served the graph), the
+README "VRAM vs prefill" section (rewritten: the tile limitation is gone, the tile-path numbers and
+the no-decode-cost evidence are in, and the stale-`GGML_CUDA_FA_WMMA_256=0` advice survives as a pure
+performance note), `patches/README.md` (header + this amendment section), `MANIFESTS.md`'s header
+(which had drifted at r4), `AGENTS.md`, and the WIP records under `wip/kq-derived-tile/`.
+
 ## 2026-09-19 (r8) — `v16-ebbb18522-r8`: the V3 derived-mask disable now explains itself
 
 Follow-up to r7.  A user running Qwen3.8-Flash-Next on 3x gfx1201 with a stale

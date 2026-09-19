@@ -16,12 +16,18 @@ mask values on the fly.  Consequences:
 * the packed mask tensor is left unallocated -> the memory / H2D-copy win;
 * it is **prefill only**: `llama_kv_cache::kq_mask_derivable()` returns false for `n_tokens <= 8`, so
   decode and the spec-verify widths keep the packed mask (this is why TG is flat below);
-* it **forces the MMA_F16 kernel** (`fattn.cu:852`: `src[5] && kernel != MMA_F16` -> op unsupported),
-  which is why the tile kernel carries no derived arm;
+* it **forced the MMA_F16 kernel** until 2026-09-19: `fattn.cu` rejected any other selection
+  (`src[5] && kernel != MMA_F16`), so the tile kernel carried no derived arm.  **That is fixed in
+  `v16-ebbb18522-r9`** — the tile kernel now implements the derived arm too, so the head-cap
+  configurations (gemma4 head 512 on gfx1100/gfx1151) get the mask as a deep-prefill win with no
+  decode cost.  See `../kq-derived-tile/RESULTS-2026-09-19.md`.  The measurements below are the
+  pre-r9 (MMA-only era) matrix and stand for the configurations whose prefill is MMA;
 * `n_kv` is padded to a multiple of >= 256 (`get_n_kv`), so the `n_kv % 256 == 0` gate always passes.
 
 The in-kernel cost is a scalar `cell_pos[k_VKQ_0 + i]` load + compare per (query row, KV cell),
 re-read for every `ncols1` slot of the MMA tile, replacing the packed path's `cp_async` mask load.
+(In the tile kernel the same substitution reads global memory directly and the arm is hoisted out of
+the KV loop; see `../kq-derived-tile/RESULTS-2026-09-19.md` §4-§6.)
 
 ## Method
 

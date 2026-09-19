@@ -1,4 +1,4 @@
-From 63e6aa1ffca8fe65d46f7152435a64deeb3ca59e Mon Sep 17 00:00:00 2001
+From 76b10f1fb8391562e30364d6c307e6606100bc57 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -294,15 +294,15 @@ instantiations, identical symbols.
  ggml/src/ggml-backend-meta.cpp                |  18 +-
  ggml/src/ggml-cpu/ops.cpp                     |  71 +-
  ggml/src/ggml-cuda/common.cuh                 |  49 ++
- ggml/src/ggml-cuda/fattn-common.cuh           | 622 +++++++++++++++++-
- ggml/src/ggml-cuda/fattn-mma-f16.cuh          | 334 +++++++++-
+ ggml/src/ggml-cuda/fattn-common.cuh           | 633 +++++++++++++++++-
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh          | 326 ++++++++-
  ggml/src/ggml-cuda/fattn-qsa.cu               |  47 +-
  ggml/src/ggml-cuda/fattn-tile.cu              |  29 +
- ggml/src/ggml-cuda/fattn-tile.cuh             | 208 +++++-
+ ggml/src/ggml-cuda/fattn-tile.cuh             | 284 ++++++--
  ggml/src/ggml-cuda/fattn-vec.cuh              |   8 +-
- ggml/src/ggml-cuda/fattn.cu                   |  68 +-
+ ggml/src/ggml-cuda/fattn.cu                   |  70 +-
  ggml/src/ggml-cuda/ggml-cuda.cu               |   6 +
- ggml/src/ggml-cuda/indexer-topk.cu            |  74 ++-
+ ggml/src/ggml-cuda/indexer-topk.cu            |  74 +-
  .../fattn-tile-instance-dkq112-dv112-bf16.cu  |   5 +
  .../fattn-tile-instance-dkq112-dv112-f16.cu   |   5 +
  ...fattn-tile-instance-dkq112-dv112-iq4_nl.cu |   5 +
@@ -412,7 +412,7 @@ instantiations, identical symbols.
  ggml/src/ggml.c                               |  99 ++-
  src/llama-context.cpp                         | 158 ++++-
  src/llama-cparams.h                           |   5 +
- src/llama-graph.cpp                           | 183 ++++--
+ src/llama-graph.cpp                           | 183 +++--
  src/llama-graph.h                             |  60 ++
  src/llama-kv-cache.cpp                        | 189 +++++-
  src/llama-kv-cache.h                          |  20 +-
@@ -420,7 +420,7 @@ instantiations, identical symbols.
  src/llama-memory-hybrid-idx.h                 |  17 +-
  src/models/qwen4exp.cpp                       | 338 ++++++++--
  tests/test-backend-ops.cpp                    |  55 +-
- 131 files changed, 3044 insertions(+), 305 deletions(-)
+ 131 files changed, 3110 insertions(+), 320 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-bf16.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-f16.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-iq4_nl.cu
@@ -868,10 +868,28 @@ index a35de2cbf..934b9cffb 100644
  
      cudaStream_t stream(int device, int stream) {
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 83ec690f8..35048b108 100644
+index 83ec690f8..5de69c661 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
-@@ -39,7 +39,15 @@ typedef void (* fattn_kernel_t)(
+@@ -18,6 +18,17 @@
+ // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
+ #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
+ 
++// V3 derived kq mask (ggml_flash_attn_ext_add_kq_derived).  When cell_pos is not nullptr the mask
++// tensor is absent and each cell's value (0 or -INFINITY) is derived from the cell's position and the
++// query token's visibility window, exactly as the packed mask would hold it.  Implemented by the MMA
++// and the tile kernels; the vec kernel is decode/verify-only (n_tps <= 2) and never sees a derived op
++// (kq_mask_derivable() rejects n_tokens <= 8).
++struct kq_derived_t {
++    const int * cell_pos; // per KV cell: INT32_MIN = always dropped (empty cell, or another sequence's)
++    const int * tok_lo;   // per query token: inclusive lower bound of the visible position range
++    const int * tok_hi;   // per query token: inclusive upper bound
++};
++
+ typedef void (* fattn_kernel_t)(
+         const char * __restrict__ Q,
+         const char * __restrict__ K,
+@@ -39,7 +50,15 @@ typedef void (* fattn_kernel_t)(
                              const int32_t nb11, const int32_t nb12, const int64_t nb13,
                              const int32_t nb21, const int32_t nb22, const int64_t nb23,
                              const int32_t ne31, const int32_t ne32, const int32_t ne33,
@@ -888,7 +906,7 @@ index 83ec690f8..35048b108 100644
  
  typedef float (*vec_dot_KQ_t)(
      const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
-@@ -84,6 +92,489 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
+@@ -84,6 +103,489 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
      return data;
  }
  
@@ -1378,7 +1396,7 @@ index 83ec690f8..35048b108 100644
  template <int D, int nthreads>
  static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
      const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
-@@ -1065,6 +1556,14 @@ template <int DV, int ncols1, int ncols2>
+@@ -1065,6 +1567,14 @@ template <int DV, int ncols1, int ncols2>
  void launch_fattn(
      ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
      const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
@@ -1393,7 +1411,7 @@ index 83ec690f8..35048b108 100644
      const int warp_size = WARP_SIZE
  ) {
      constexpr int ncols = ncols1 * ncols2;
-@@ -1078,6 +1577,11 @@ void launch_fattn(
+@@ -1078,6 +1588,11 @@ void launch_fattn(
      const ggml_tensor * mask  = dst->src[3];
      const ggml_tensor * sinks = dst->src[4];
  
@@ -1405,7 +1423,7 @@ index 83ec690f8..35048b108 100644
      ggml_tensor * KQV = dst;
  
      GGML_ASSERT(Q->type == GGML_TYPE_F32);
-@@ -1095,8 +1599,94 @@ void launch_fattn(
+@@ -1095,8 +1610,94 @@ void launch_fattn(
      const int cc  = ggml_cuda_info().devices[id].cc;
      const int nsm = ggml_cuda_info().devices[id].nsm;
  
@@ -1501,7 +1519,7 @@ index 83ec690f8..35048b108 100644
  
      ggml_cuda_pool_alloc<int>    KV_max(pool);
      ggml_cuda_pool_alloc<float>  dst_tmp(pool);
-@@ -1112,12 +1702,17 @@ void launch_fattn(
+@@ -1112,12 +1713,17 @@ void launch_fattn(
      size_t nb22 = V->nb[2];
      size_t nb23 = V->nb[3];
  
@@ -1522,7 +1540,7 @@ index 83ec690f8..35048b108 100644
          if (ggml_is_contiguously_allocated(K)) {
              to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
              to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
-@@ -1140,7 +1735,7 @@ void launch_fattn(
+@@ -1140,7 +1746,7 @@ void launch_fattn(
          K_data = (char *) K_f16;
      }
  
@@ -1531,7 +1549,7 @@ index 83ec690f8..35048b108 100644
          if (V_is_K_view) {
              V_data = K_data;
              nb21   = nb11;
-@@ -1150,8 +1745,13 @@ void launch_fattn(
+@@ -1150,8 +1756,13 @@ void launch_fattn(
              const size_t bs = ggml_blck_size(V->type);
              const size_t ts = ggml_type_size(V->type);
  
@@ -1547,7 +1565,7 @@ index 83ec690f8..35048b108 100644
              if (ggml_is_contiguously_allocated(V)) {
                  to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                  to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
-@@ -1342,7 +1942,11 @@ void launch_fattn(
+@@ -1342,7 +1953,11 @@ void launch_fattn(
          K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
          nb21, nb22, nb23,
          mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
@@ -1561,7 +1579,7 @@ index 83ec690f8..35048b108 100644
      CUDA_CHECK(cudaGetLastError());
  
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index 7562538bc..28e6f29c9 100644
+index 7562538bc..b4a65c5d8 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 @@ -375,10 +375,201 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
@@ -1767,19 +1785,11 @@ index 7562538bc..28e6f29c9 100644
      constexpr int warp_size = ggml_cuda_get_physical_warp_size();
      // K/V data is loaded with decreasing granularity for D for better memory bandwidth.
      // The minimum granularity is 16 bytes.
-@@ -487,12 +678,71 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
+@@ -487,12 +678,63 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
      }
  }
  
-+// V3 derived kq mask (ggml_flash_attn_ext_add_kq_derived).  When cell_pos is not nullptr the mask
-+// tensor is absent and each cell's value (0 or -INFINITY) is derived from the cell's position and the
-+// query token's visibility window, exactly as the packed mask would hold it.
-+struct kq_derived_t {
-+    const int * cell_pos; // per KV cell: INT32_MIN = always dropped (empty cell, or another sequence's)
-+    const int * tok_lo;   // per query token: inclusive lower bound of the visible position range
-+    const int * tok_hi;   // per query token: inclusive upper bound
-+};
-+
++// kq_derived_t is defined in fattn-common.cuh (shared with the tile kernel).
  template<int ncols1, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check, bool use_sparse>
  static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
          const half * const __restrict__ mask_h, half * const __restrict__ tile_mask,
@@ -1840,7 +1850,7 @@ index 7562538bc..28e6f29c9 100644
      if constexpr (use_cp_async) {
          static_assert(nbatch_fa <= 8*warp_size && nbatch_fa % 8 == 0, "bad nbatch_fa");
          static_assert(!oob_check, "OOB check incompatible with cp_async");
-@@ -603,7 +853,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+@@ -603,7 +845,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
          float        * const __restrict__ KQ_rowsum,
          const int jt,
          const int kb0,
@@ -1849,7 +1859,7 @@ index 7562538bc..28e6f29c9 100644
  #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
      constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
      constexpr int  ncols           = ncols1 * ncols2;
-@@ -639,13 +889,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+@@ -639,13 +881,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
          cp_async_wait_all();
          __syncthreads();
          flash_attn_ext_f16_load_tile<stride_tile_V, swz_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
@@ -1867,7 +1877,7 @@ index 7562538bc..28e6f29c9 100644
          }
      }
  
-@@ -659,7 +910,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+@@ -659,7 +902,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
              const int k0_diff = k0_stop - k0_start;
              constexpr bool use_cp_async = nstages == 1;
              flash_attn_ext_f16_load_tile<stride_tile_K, swz_K, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
@@ -1877,7 +1887,7 @@ index 7562538bc..28e6f29c9 100644
              if (use_cp_async) {
                  cp_async_wait_all();
              }
-@@ -743,7 +995,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+@@ -743,7 +987,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
      float KQ_rowsum_add[cols_per_thread] = {0.0f};
  
      if constexpr (cols_per_warp == 8) {
@@ -1886,7 +1896,7 @@ index 7562538bc..28e6f29c9 100644
  #pragma unroll
              for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::I) {
                  const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::I;
-@@ -805,7 +1057,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+@@ -805,7 +1049,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
              }
          }
      } else { // not Turing mma or T_B_KQ::I > 8
@@ -1895,7 +1905,7 @@ index 7562538bc..28e6f29c9 100644
  #pragma unroll
              for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
                  const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
-@@ -991,12 +1243,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+@@ -991,12 +1235,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
          cp_async_wait_all();
          __syncthreads();
          if (!last_iter) {
@@ -1912,7 +1922,7 @@ index 7562538bc..28e6f29c9 100644
          }
      }
  
-@@ -1012,7 +1265,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+@@ -1012,7 +1257,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
              if (!V_is_K_view || i0_stop > 2*nbatch_K2) {
                  constexpr bool use_cp_async = nstages == 1;
                  flash_attn_ext_f16_load_tile<stride_tile_V, swz_V, nwarps, nbatch_fa, use_cp_async, oob_check, use_sparse>
@@ -1922,7 +1932,7 @@ index 7562538bc..28e6f29c9 100644
                  if (use_cp_async) {
                      cp_async_wait_all();
                  }
-@@ -1028,7 +1282,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+@@ -1028,7 +1274,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                  // leak. V_is_K_view (MLA) reuses K data as V and needs the K tile zeroed
                  // instead - not implemented here (RDNA caps route those heads to the tile kernel).
                  if constexpr (!V_is_K_view && !swz_V) {
@@ -1931,7 +1941,7 @@ index 7562538bc..28e6f29c9 100644
                          const int tid = threadIdx.y * warp_size + threadIdx.x;
  #pragma unroll
                          for (int i = tid; i < nbatch_fa; i += nwarps*warp_size) {
-@@ -1101,7 +1355,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+@@ -1101,7 +1347,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
          scale, slope, logit_softcap, ne01, ne02,
          stride_K, stride_V, stride_mask,
          tile_Q, tile_K, tile_V, tile_mask,
@@ -1940,7 +1950,7 @@ index 7562538bc..28e6f29c9 100644
      NO_DEVICE_CODE;
  #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
  }
-@@ -1220,7 +1474,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1220,7 +1466,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
          const int jt,
          const int zt_gqa,
          const int kb0_start,
@@ -1949,7 +1959,7 @@ index 7562538bc..28e6f29c9 100644
  #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
      //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
  
-@@ -1349,12 +1603,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1349,12 +1595,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
          constexpr bool use_cp_async = true;
          constexpr bool oob_check    = false;
          constexpr int  k_VKQ_sup    = nbatch_fa;
@@ -1966,7 +1976,7 @@ index 7562538bc..28e6f29c9 100644
      }
  
      // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
-@@ -1368,7 +1623,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1368,7 +1615,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                   T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                  (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                   ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
@@ -1975,7 +1985,7 @@ index 7562538bc..28e6f29c9 100644
          }
          constexpr bool last_iter = true;
          const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
-@@ -1377,7 +1632,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1377,7 +1624,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
              (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
               ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
@@ -1984,7 +1994,7 @@ index 7562538bc..28e6f29c9 100644
      } else {
          constexpr bool oob_check = false;
          for (; kb0 < kb0_stop-1; ++kb0) {
-@@ -1388,7 +1643,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1388,7 +1635,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                   T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
                  (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
                   ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
@@ -1993,7 +2003,7 @@ index 7562538bc..28e6f29c9 100644
          }
          constexpr bool last_iter = true;
          constexpr int  k_VKQ_sup = nbatch_fa;
-@@ -1397,7 +1652,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
+@@ -1397,7 +1644,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ>
              (Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup, scale, slope, logit_softcap,
               ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
@@ -2002,7 +2012,7 @@ index 7562538bc..28e6f29c9 100644
      }
  
      // With multi-stage loading there is no __syncthreads at the end of the iter,
-@@ -1829,7 +2084,13 @@ static __global__ void flash_attn_ext_f16(
+@@ -1829,7 +2076,13 @@ static __global__ void flash_attn_ext_f16(
                              const int32_t nb11, const int32_t nb12, const int64_t nb13,
                              const int32_t nb21, const int32_t nb22, const int64_t nb23,
                              const int32_t ne31, const int32_t ne32, const int32_t ne33,
@@ -2017,7 +2027,7 @@ index 7562538bc..28e6f29c9 100644
      ggml_cuda_pdl_sync(); // TODO optimize placement
  #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
      const char * GGML_CUDA_RESTRICT Q              = Q_ptr;
-@@ -1839,6 +2100,9 @@ static __global__ void flash_attn_ext_f16(
+@@ -1839,6 +2092,9 @@ static __global__ void flash_attn_ext_f16(
      const char * GGML_CUDA_RESTRICT sinks          = sinks_ptr;
      const int  * GGML_CUDA_RESTRICT KV_max         = use_sparse ? nullptr : KV_max_ptr;
      const int  * GGML_CUDA_RESTRICT sparse_indices = use_sparse ? KV_max_ptr : nullptr;
@@ -2027,7 +2037,7 @@ index 7562538bc..28e6f29c9 100644
      float      * GGML_CUDA_RESTRICT dst            = dst_ptr;
      float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
  
-@@ -1931,6 +2195,14 @@ static __global__ void flash_attn_ext_f16(
+@@ -1931,6 +2187,14 @@ static __global__ void flash_attn_ext_f16(
          float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
  
          const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
@@ -2042,7 +2052,7 @@ index 7562538bc..28e6f29c9 100644
          const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
          const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*ne31 + jt*ncols1)*ne11 : nullptr;
  
-@@ -1944,12 +2216,12 @@ static __global__ void flash_attn_ext_f16(
+@@ -1944,12 +2208,12 @@ static __global__ void flash_attn_ext_f16(
              constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
              flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
                  (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
@@ -2057,7 +2067,7 @@ index 7562538bc..28e6f29c9 100644
          }
  
          // The next process_tile call reuses the tile_Q buffer for its Q/K tiles, so all warps must
-@@ -1983,6 +2255,12 @@ static __global__ void flash_attn_ext_f16(
+@@ -1983,6 +2247,12 @@ static __global__ void flash_attn_ext_f16(
      float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
  
      const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
@@ -2070,7 +2080,7 @@ index 7562538bc..28e6f29c9 100644
      const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
      const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*ne31 + jt*ncols1)*ne11 : nullptr;
  
-@@ -1996,7 +2274,7 @@ static __global__ void flash_attn_ext_f16(
+@@ -1996,7 +2266,7 @@ static __global__ void flash_attn_ext_f16(
      constexpr bool needs_fixup = false;
      flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
          (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
@@ -2079,7 +2089,7 @@ index 7562538bc..28e6f29c9 100644
  #else
      GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
          max_bias, m0, m1, n_head_log2, logit_softcap,
-@@ -2113,7 +2391,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
+@@ -2113,7 +2383,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
      }
  
      launch_fattn<DV, ncols1, ncols2>
@@ -2241,7 +2251,7 @@ index 037b19258..85792b52c 100644
      ggml_cuda_flash_attn_ext_tile_case<DKQ, DV, GGML_TYPE_F16>(ctx, dst);
  }
 diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
-index 23ce9a1c4..87c274116 100644
+index 23ce9a1c4..1f2ae1877 100644
 --- a/ggml/src/ggml-cuda/fattn-tile.cuh
 +++ b/ggml/src/ggml-cuda/fattn-tile.cuh
 @@ -424,6 +424,81 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
@@ -2375,7 +2385,13 @@ index 23ce9a1c4..87c274116 100644
  static __device__ __forceinline__ void flash_attn_tile_iter(
          T_Q       * const Q_tmp,
          const T_KV * const __restrict__ K_h2,
-@@ -712,7 +798,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+@@ -707,12 +793,14 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+         const int stride_K2,
+         const int stride_V2,
+         const int stride_mask,
++        const kq_derived_t derived,
+         float * const KQ_max,
+         float * const KQ_sum,
          T_acc * const VKQ,
          const int k_VKQ_0,
          const int k_VKQ_max,
@@ -2385,7 +2401,7 @@ index 23ce9a1c4..87c274116 100644
      constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
      constexpr int cpy_ne = cpy_nb / 4;
  
-@@ -748,13 +835,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+@@ -748,13 +836,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
      constexpr int nbatch_K_last = DKQ % nbatch_K;
  #pragma unroll
      for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
@@ -2403,7 +2419,85 @@ index 23ce9a1c4..87c274116 100644
      }
  
      // Apply logit softcap + mask, update KQ_max:
-@@ -859,8 +946,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+@@ -762,25 +850,65 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
+     for (int jc0 = 0; jc0 < cpw; ++jc0) {
+         const int j = fastmodulo(col_Q_0 + (jc0 + (threadIdx.y / np)*cpw)/ncols2, ne01);
+ 
+-#pragma unroll
+-        for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
+-            const int i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x;
++        // V3 derived kq mask: cell values are derived instead of read from the packed mask, and the
++        // choice is made ONCE per query row rather than once per cell.  Testing it inside the unrolled
++        // KV loop (the first cut of this) cost ~0.5-0.8 % of tile decode at depth on gfx1201/gfx1100:
++        // the per-iteration test makes the compiler rematerialize `derived` out of the parameter space
++        // instead of keeping it in registers, and this kernel is register-bound by design.  Hoisting
++        // it leaves the packed path's code generation as it was, so decode pays nothing.
++        if (derived.cell_pos != nullptr) {
++            // The query token's visibility window, constant across the i loop below.  An empty or
++            // foreign cell carries the INT32_MIN sentinel, which is below every tok_lo, so it falls
++            // out of the compare and becomes -INFINITY exactly like the packed entry would.  The
++            // slope factor is skipped: the derived form is rejected for ALiBi (kq_mask_derivable()),
++            // so slope == 1 here.
++            const int tok_lo_j = derived.tok_lo[j];
++            const int tok_hi_j = derived.tok_hi[j];
++
++#pragma unroll
++            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
++                const int i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x;
+ 
+ #if defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE)
+-            // Without the v_dot2_f32_f16 instruction there is a higher risk of numerical overflow in the KQ calculation.
+-            // Therefore, scale down Q values and apply the inverse scale the FP32 KQ values afterwards again.
+-            KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0] *= 4.0f;
++                // Without the v_dot2_f32_f16 instruction there is a higher risk of numerical overflow in the KQ calculation.
++                // Therefore, scale down Q values and apply the inverse scale the FP32 KQ values afterwards again.
++                KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0] *= 4.0f;
+ #endif // defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE)
+ 
+-            if (use_logit_softcap) {
+-                KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = logit_softcap * tanhf(KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0]);
++                if (use_logit_softcap) {
++                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = logit_softcap * tanhf(KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0]);
++                }
++
++                if (!oob_check || i_KQ < k_VKQ_sup) {
++                    const int cell_p = derived.cell_pos[k_VKQ_0 + i_KQ];
++
++                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] +=
++                        (cell_p >= tok_lo_j && cell_p <= tok_hi_j) ? 0.0f : -INFINITY;
++
++                    KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] + FATTN_KQ_MAX_OFFSET);
++                }
+             }
++        } else {
++#pragma unroll
++            for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
++                const int i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x;
+ 
+-            if (!oob_check || i_KQ < k_VKQ_sup) {
+-                KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
+-                    slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
++#if defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE)
++                // Without the v_dot2_f32_f16 instruction there is a higher risk of numerical overflow in the KQ calculation.
++                // Therefore, scale down Q values and apply the inverse scale the FP32 KQ values afterwards again.
++                KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0] *= 4.0f;
++#endif // defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE)
+ 
+-                KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] + FATTN_KQ_MAX_OFFSET);
++                if (use_logit_softcap) {
++                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = logit_softcap * tanhf(KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0]);
++                }
++
++                if (!oob_check || i_KQ < k_VKQ_sup) {
++                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
++                        slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
++
++                    KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] + FATTN_KQ_MAX_OFFSET);
++                }
+             }
+         }
+ 
+@@ -859,8 +987,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
      static_assert(nbatch_V % np == 0, "bad nbatch_V");
  #pragma unroll
      for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
@@ -2419,20 +2513,38 @@ index 23ce9a1c4..87c274116 100644
          __syncthreads();
  
          if constexpr (use_bf16) {
-@@ -1037,7 +1129,11 @@ static __global__ void flash_attn_tile(
+@@ -1037,7 +1170,11 @@ static __global__ void flash_attn_tile(
                              const int32_t nb11, const int32_t nb12, const int64_t nb13,
                              const int32_t nb21, const int32_t nb22, const int64_t nb23,
                              const int32_t ne31, const int32_t ne32, const int32_t ne33,
 -                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
 +                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
-+                            // V3 derived kq mask: not implemented in this kernel (this kernel is only
-+                            // selected for batches with n_tps <= 8, which keep the packed mask).
-+                            const int *, const int *, const int *,
++                            // V3 derived kq mask (ggml_flash_attn_ext_add_kq_derived): the compact
++                            // per-cell visibility state, read instead of the packed mask when present.
++                            const int * cell_pos_ptr, const int * tok_lo_ptr, const int * tok_hi_ptr,
 +                            const int, const int) {
  #ifdef FLASH_ATTN_AVAILABLE
      const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
      const char * GGML_CUDA_RESTRICT K        = K_ptr;
-@@ -1084,6 +1180,18 @@ static __global__ void flash_attn_tile(
+@@ -1048,11 +1185,16 @@ static __global__ void flash_attn_tile(
+     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
+     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
+ 
++    // V3 derived kq mask: all three pointers are nullptr unless the caller replaced the packed mask
++    // with the derived form (kq_mask_derivable(): prefill-shaped batches only), in which case the mask
++    // add in flash_attn_tile_iter derives each cell instead of reading it.
++    const kq_derived_t derived = { cell_pos_ptr, tok_lo_ptr, tok_hi_ptr };
++
+     // Skip unused kernel variants for faster compilation:
+ 
+     if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512))) {
+         GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+-            max_bias, m0, m1, n_head_log2, logit_softcap,
++            max_bias, m0, m1, n_head_log2, logit_softcap, derived,
+             ne00, ne01, ne02, ne03,
+                   nb01, nb02, nb03,
+             ne10, ne11, ne12, ne13,
+@@ -1084,6 +1226,18 @@ static __global__ void flash_attn_tile(
      const T_KV * K_h2 = (const T_KV *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
      const T_KV * V_h2 = (const T_KV *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
  
@@ -2451,7 +2563,7 @@ index 23ce9a1c4..87c274116 100644
      const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
  
      const int stride_K2   = nb11 / sizeof(half2);
-@@ -1215,24 +1323,24 @@ static __global__ void flash_attn_tile(
+@@ -1215,24 +1369,24 @@ static __global__ void flash_attn_tile(
          int k_VKQ_0 = blockIdx.y*nbatch_fa;
          while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
              constexpr bool oob_check = false;
@@ -2459,7 +2571,7 @@ index 23ce9a1c4..87c274116 100644
 +            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
                  (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
 -                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
-+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
++                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
              k_VKQ_0 += gridDim.y*nbatch_fa;
          }
          if (k_VKQ_0 < k_VKQ_max) {
@@ -2468,7 +2580,7 @@ index 23ce9a1c4..87c274116 100644
 +            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
                  (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
 -                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
-+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
++                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
          }
      } else {
          // Branch without out-of-bounds checks.
@@ -2478,11 +2590,20 @@ index 23ce9a1c4..87c274116 100644
 +            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
                  (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
 -                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
-+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
++                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
          }
      }
  
-@@ -1414,6 +1522,15 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1389,7 +1543,7 @@ static __global__ void flash_attn_tile(
+     }
+ #else
+     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+-        max_bias, m0, m1, n_head_log2, logit_softcap,
++        max_bias, m0, m1, n_head_log2, logit_softcap, cell_pos_ptr, tok_lo_ptr, tok_hi_ptr,
+         ne00, ne01, ne02, ne03,
+               nb01, nb02, nb03,
+         ne10, ne11, ne12, ne13,
+@@ -1414,6 +1568,15 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
      const bool need_f16_K = K->type != type_KV;
      const bool need_f16_V = V->type != type_KV;
  
@@ -2498,7 +2619,7 @@ index 23ce9a1c4..87c274116 100644
      const int id        = ggml_cuda_get_device();
      const int cc        = ggml_cuda_info().devices[id].cc;
      const int warp_size = 32;
-@@ -1432,7 +1549,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1432,7 +1595,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
          fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
          launch_fattn<DV, cols_per_block/ncols2, ncols2>
              (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
@@ -2507,7 +2628,7 @@ index 23ce9a1c4..87c274116 100644
          return;
      }
  
-@@ -1445,7 +1562,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1445,7 +1608,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
              launch_fattn<DV, cols_per_block/ncols2, ncols2>
                  (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
@@ -2516,7 +2637,7 @@ index 23ce9a1c4..87c274116 100644
              return;
          }
      }
-@@ -1462,7 +1579,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1462,7 +1625,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
              launch_fattn<DV, cols_per_block/ncols2, ncols2>
                  (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
@@ -2525,7 +2646,7 @@ index 23ce9a1c4..87c274116 100644
              return;
          }
      }
-@@ -1475,7 +1592,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1475,7 +1638,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
              launch_fattn<DV, cols_per_block/ncols2, ncols2>
                  (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
@@ -2534,7 +2655,7 @@ index 23ce9a1c4..87c274116 100644
              return;
          }
      }
-@@ -1488,7 +1605,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1488,7 +1651,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
              launch_fattn<DV, cols_per_block/ncols2, ncols2>
                  (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
@@ -2543,7 +2664,7 @@ index 23ce9a1c4..87c274116 100644
              return;
          }
      }
-@@ -1501,7 +1618,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1501,7 +1664,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
              fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
              launch_fattn<DV, cols_per_block/ncols2, ncols2>
                  (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
@@ -2552,7 +2673,7 @@ index 23ce9a1c4..87c274116 100644
              return;
          }
      }
-@@ -1513,7 +1630,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+@@ -1513,7 +1676,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
          fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
          launch_fattn<DV, cols_per_block/ncols2, ncols2>
              (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
@@ -2561,7 +2682,16 @@ index 23ce9a1c4..87c274116 100644
          return;
      }
  
-@@ -1623,18 +1740,41 @@ void ggml_cuda_flash_attn_ext_tile_case(ggml_backend_cuda_context & ctx, ggml_te
+@@ -1537,7 +1700,7 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
+     const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+     const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
+-    const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
++    const bool use_gqa_opt = (mask != nullptr || KQV->src[5] != nullptr) && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+ 
+     if constexpr (DKQ == 320) {
+         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
+@@ -1623,18 +1786,41 @@ void ggml_cuda_flash_attn_ext_tile_case(ggml_backend_cuda_context & ctx, ggml_te
  void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
  
  // Explicit instantiations, used by the autogenerated template-instances/fattn-tile-*.cu.
@@ -2592,10 +2722,10 @@ index 23ce9a1c4..87c274116 100644
  
  // Extern template declarations, prevent implicit instantiation in TUs that include the header.
 -#define EXTERN_DECL_FATTN_TILE_CASES(DKQ, DV)                             \
+-    extern template void ggml_cuda_flash_attn_ext_tile_case               \
+-    <DKQ, DV, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst); \
 +#define EXTERN_DECL_FATTN_TILE_CASE_TYPE(DKQ, DV, T)                      \
      extern template void ggml_cuda_flash_attn_ext_tile_case               \
--    <DKQ, DV, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst); \
--    extern template void ggml_cuda_flash_attn_ext_tile_case               \
 -    <DKQ, DV, GGML_TYPE_BF16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 +    <DKQ, DV, T>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 +
@@ -2638,7 +2768,7 @@ index 57a285565..f2bf120e0 100644
  
  template <int D, ggml_type type_K, ggml_type type_V>
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index ede06d56c..716867c57 100644
+index ede06d56c..362b91657 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -166,6 +166,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
@@ -2748,7 +2878,7 @@ index ede06d56c..716867c57 100644
          case BEST_FATTN_KERNEL_VEC: {
              const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
              need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
-@@ -816,5 +843,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -816,5 +843,16 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
  }
  
  bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
@@ -2757,9 +2887,11 @@ index ede06d56c..716867c57 100644
 +    if (kernel == BEST_FATTN_KERNEL_NONE) {
 +        return false;
 +    }
-+    // The derived kq mask is only implemented by the MMA kernel; anywhere else (or on a shape that
-+    // would pick the vec/tile kernel) the op is rejected so the caller falls back to the packed mask.
-+    if (dst->src[5] != nullptr && kernel != BEST_FATTN_KERNEL_MMA_F16) {
++    // The derived kq mask is implemented by the MMA and the tile kernels.  The vec kernel has no
++    // derived arm, but it is decode/verify-only (n_tps <= 2) while the derived form only exists for
++    // prefill-shaped batches (kq_mask_derivable() rejects n_tokens <= 8), so it is unreachable there;
++    // the check stays as a guard for the day that stops being true.
++    if (dst->src[5] != nullptr && kernel != BEST_FATTN_KERNEL_MMA_F16 && kernel != BEST_FATTN_KERNEL_TILE) {
 +        return false;
 +    }
 +    return true;
@@ -4333,7 +4465,7 @@ index 34b458086..2ce34caf0 100644
  
      return result;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 268c1d04c..913d4fe4b 100644
+index 268c1d04c..b765bf77c 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -36,6 +36,18 @@ struct llm_fused_op_probe {
@@ -4515,16 +4647,16 @@ index 268c1d04c..913d4fe4b 100644
              enabled = false;
              LLAMA_LOG_WARN("%s: %s not supported, set to disabled\n", func, probe.name);
 +
-+            // The derived kq mask is an MMA-kernel-only feature, so when its node lands off the GPU
-+            // the usual cause is a kernel-selection mismatch, not a missing device capability: a
-+            // head above the per-arch WMMA cap (or GGML_CUDA_FA_WMMA_256=0 / _MAX_HEAD) makes the
-+            // chooser pick the tile kernel, which has no derived arm.  The generic "missing
-+            // support" text sends people looking at the device instead of the head cap.
++            // The derived kq mask is implemented by both kernels that can serve a prefill: the MMA
++            // and the tile flash attention kernel (the vec kernel is decode/verify-only, and the
++            // derived form only exists for prefill-shaped batches).  So a rejection here is no longer
++            // a head-cap or kernel-tuning issue - it means neither kernel served this graph.  The
++            // generic "missing support" text sends people looking at the device instead, hence the
++            // pointer at the kernel selection.
 +            if (probe.require_kq_derived) {
-+                LLAMA_LOG_WARN("%s: note: the derived kq mask is implemented by the MMA flash attention "
-+                        "kernel only; a configuration that selects the tile kernel for this head (head "
-+                        "above the per-arch WMMA cap, GGML_CUDA_FA_WMMA_256=0, or "
-+                        "GGML_CUDA_FA_WMMA_MAX_HEAD) cannot use it\n", func);
++                LLAMA_LOG_WARN("%s: note: the derived kq mask is implemented by the MMA and the tile "
++                        "flash attention kernels; it is disabled here because neither served this "
++                        "graph (or the node did not reach the GPU)\n", func);
 +            }
          } else {
              enabled = true;

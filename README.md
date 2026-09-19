@@ -268,19 +268,38 @@ MoE / qwen4exp workload the default is the right side of the trade.
 **Not a correctness knob:** same-seed output is byte-identical either way (the derived mask produces
 the same values; only the memory layout and prefill cost differ).
 
-**It needs the MMA flash-attention kernel.**  The derived mask is implemented in the MMA FA kernel
-only, so anything that makes the chooser pick the *tile* kernel for a head also disables it: a head
-above the per-arch WMMA cap (RDNA4 576, RDNA3_5 320, RDNA3_0 256), or forcing it off with
-`GGML_CUDA_FA_WMMA_256=0` / `GGML_CUDA_FA_WMMA_MAX_HEAD`.  The launch log then prints
-`derived kq mask flash attention not supported, set to disabled`, followed by a note naming the cause
-(added 2026-09-19).  This matters because the tile kernel is often the much slower choice: on gfx1201
-a head-256 model runs **~3x slower at deep prefill** with it (9B, `-d 98304`: 2104 -> 710 t/s,
-`-r 3`).  So if you see that pair of lines, check for a stale `GGML_CUDA_FA_WMMA_256=0` first
-(it was a fixed env in the September qwen4exp gates): removing it restores both the fast kernel and
-the derived mask.  One exception worth knowing: **qwen4exp / Qwen3.8-Flash-Next gets its deep-context
-mask elision from the QSA path's own derived visibility** (`GGML_QSA_DERIVED_VIS`, the code's
-"-800 MiB win"), which is independent of this knob; `LLAMA_KQ_MASK_DERIVED` only serves that model's
-dense shortcut (`n_kv <= 2051`), where the mask is tiny.
+**It works on both prefill kernels (r9).**  The derived mask is implemented by the **MMA** and the
+**tile** flash-attention kernels, so it is no longer tied to the chooser picking MMA: a head above the
+per-arch WMMA cap (RDNA4 576, RDNA3_5 320, RDNA3_0 256) used to lose the mask entirely, and that is
+every **Gemma4** (head 512) on gfx1100/gfx1151 — the two arches that live on the tile kernel.  There
+the mask is a *win*, not a tax (PP512, mask on vs off):
+
+| config (tile kernel, natural selection) | cell | delta |
+|---|---|---|
+| gfx1100 Gemma4 12B, q8_0 KV | @ 16k / @ 32k | **+1.2 %** / **+0.9 %** |
+| gfx1151 Gemma4 12B, q8_0 KV | @ 16k / @ 32k | **+1.6 %** / +0.6 % |
+| gfx1201 Gemma4 E4B (tile forced) | @ d0 | **+2.3 %** |
+
+and **decode pays nothing for it.**  Decode and the spec verify batch always take the tile kernel (the
+chooser's WMMA branch requires `ne[1] > 8`), so the derived branch there is a cost on every arch; it is
+hoisted out of the KV loop so the packed path's code generation is unchanged.  Measured r8 vs r9 at
+that kernel: `tg128` deltas of **+0.01 %** (gfx1201 9B @ d16384), **+0.02 %** (gfx1100 9B @ d16384),
+and flat on gfx1151 — the earlier per-iteration form cost −0.5..−0.8 % at depth before the hoist.
+
+**The vec kernel has no derived arm**, but it is decode/verify-only (`n_tps <= 2`) while the derived
+form only exists for prefill-shaped batches (`kq_mask_derivable()` rejects `n_tokens <= 8`), so it
+cannot be selected for one.  If the launch log *does* print `derived kq mask flash attention not
+supported, set to disabled` on a CUDA/HIP backend, the FA node did not reach the GPU at all — check
+which kernel serves that head (the log adds a note pointing there).
+
+One performance caveat with nothing to do with this knob: forcing the **tile** kernel for a head it
+would not normally serve (a stale `GGML_CUDA_FA_WMMA_256=0`, a fixed env in the September qwen4exp
+gates, is the usual cause) makes a head-256 model on gfx1201 **~3x slower at deep prefill** (9B,
+`-d 98304`: 2104 -> 710 t/s).  That env is worth removing regardless of the derived mask.  One
+exception worth knowing: **qwen4exp / Qwen3.8-Flash-Next gets its deep-context mask elision from the
+QSA path's own derived visibility** (`GGML_QSA_DERIVED_VIS`, the code's "-800 MiB win"), which is
+independent of this knob; `LLAMA_KQ_MASK_DERIVED` only serves that model's dense shortcut
+(`n_kv <= 2051`), where the mask is tiny.
 
 Full matrix, raw CSVs and the A/B harness: [`wip/kq-mask-derived-ab/`](wip/kq-mask-derived-ab/); the
 2026-09-19 block-15 (r7) amendment in [`patches/README.md`](patches/README.md).

@@ -5,11 +5,14 @@ decides the shape -- see `RESULTS-2026-09-19.md` §6).  **Effort guess:** 1-2 se
 **Delivery state at handover:** `v16-ebbb18522-r8` (see `patches/README.md`).
 **Develop on** `soar` (3x gfx1201), **verify on** `halo` (gfx1151) and `fingon` (gfx1100).
 
-> **Read `RESULTS-2026-09-19.md` first if you are continuing this.**  The arm is written and is
-> bit-identical on all three arches (8 KV types on gfx1201, 4 each on gfx1151/gfx1100, natural tile
-> selection), with ~+1% deep prefill and flat decode on the target arches -- but the *runtime-branch*
-> shape costs ~0.5-0.8% decode at depth on the `ncols2=4` tile instances (including head-256 models
-> that get no benefit), so the open question is the template-split described there in §6(b).
+> **Read `RESULTS-2026-09-19.md` first if you are continuing this.**  This work is DONE and landed as
+> `v16-ebbb18522-r9` (a block-15 amendment).  The arm is bit-identical on all three arches (8 KV types
+> on gfx1201, 4 each on gfx1151/gfx1100, with tile selected *naturally* on the target arches), it is a
+> deep-prefill win on the tile path, and it costs decode nothing: the decode regression it had in its
+> first cut came from testing `derived.cell_pos` inside the unrolled KV loop, and hoisting that test to
+> once per query row recovered the baseline exactly - so the template split discussed below was never
+> needed and the build time is unchanged.  The two invariants that must not be undone are recorded in
+> `AGENTS.md`'s block-15 bullet; §2 and §3 of this file remain the map of the code and the three traps.
 
 ---
 

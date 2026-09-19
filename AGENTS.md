@@ -9,7 +9,7 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`ebbb18522`** (re-based 2026-09-17;
-release `v16-ebbb18522-r8`, the 2026-09-19 V3 derived-mask disable-path diagnostic (the resolve probe now names the cause when the derived FA node lands off the GPU: the derived mask is MMA-kernel-only, so a head above the per-arch WMMA cap or `GGML_CUDA_FA_WMMA_256=0` selects the tile kernel and loses it; that env is a stale qwen4exp gate and is 3x slower at deep prefill on gfx1201) on top of r7, the 2026-09-19 block-15 V3 derived-kq-mask kernel-shape fix (issue #30: the derived mask loader now does two cells per thread step with a `half2` store and hoists `cell_pos` out of the query-row loop; gfx1100 @98k -3.47 -> -0.15 %, gfx1201 27B 2GPU layer @98k -5.96 -> -1.62 %, output bit-identical) on top of r6, the 2026-09-18 FA instance build-time fix (blocks 06/13/15: MMA per-head + tile per-KV-type split, head-512 source order, fused-gate MMQ instances moved out of `mmq.cu`; clean `ggml-hip -j16` 323 -> 236 s, no runtime change) on top of r5's block-04 gfx1100 WMMA-FA head cap back at 256 (issue #30) on
+release `v16-ebbb18522-r9`, the 2026-09-19 block-15 V3 derived-kq-mask tile-kernel implementation (the mask was MMA-only, so every head above the per-arch WMMA cap - the whole gemma4 head-512 family on gfx1100/gfx1151 - and anything forcing `GGML_CUDA_FA_WMMA_256=0` lost it; the tile arm is bit-identical to the packed mask across the 8 KV types on gfx1201 and 4 on each of gfx1151/gfx1100, is a deep-prefill win on the tile path, and costs decode nothing because the derived branch is hoisted out of the KV loop - decode/verify *always* take the tile kernel, and the first per-iteration form cost -0.5..-0.8 % `tg128` at depth) on top of r8, the 2026-09-19 V3 derived-mask disable-path diagnostic (superseded by r9: the resolve probe's note no longer claims MMA-only, since the head-cap/tile cause is gone) on top of r7, the 2026-09-19 block-15 V3 derived-kq-mask kernel-shape fix (issue #30: the derived mask loader now does two cells per thread step with a `half2` store and hoists `cell_pos` out of the query-row loop; gfx1100 @98k -3.47 -> -0.15 %, gfx1201 27B 2GPU layer @98k -5.96 -> -1.62 %, output bit-identical) on top of r6, the 2026-09-18 FA instance build-time fix (blocks 06/13/15: MMA per-head + tile per-KV-type split, head-512 source order, fused-gate MMQ instances moved out of `mmq.cu`; clean `ggml-hip -j16` 323 -> 236 s, no runtime change) on top of r5's block-04 gfx1100 WMMA-FA head cap back at 256 (issue #30) on
 top of r4's block-04 RDNA3_0 tensor-split `ncols2` fix and r3's block-01 `--fit` fix for `draft-mtp-adaptive` + a minimal MTP head, issue #38; previously `d1d3c3396`, re-based 2026-09-15 from
 `790cf51aa`, re-based 2026-09-13
 from `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself
@@ -236,9 +236,10 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `ebbb18522` is a rebuild of the delivery set
-(tip `63e6aa1ffca8fe65d46f7152435a64deeb3ca59e`, net tree
-  `bee36f6f908acef9bc2093971304a6094fe67e63` = r8, the 2026-09-19 V3 derived-mask disable-path
-  diagnostic, on top of r7, the block-15 V3 derived-mask kernel-shape fix, issue #30, on top of r6,
+(tip `76b10f1fb8391562e30364d6c307e6606100bc57`, net tree
+  `cfb2f966448da2b02d24f88a3d30666660949b1f` = r9, the 2026-09-19 block-15 V3 derived-kq-mask
+tile-kernel implementation (with r8's disable-path note reworded, since its head-cap/tile cause is gone),
+  on top of r7, the block-15 V3 derived-mask kernel-shape fix, issue #30, on top of r6,
   the 2026-09-18 FA instance build-time fix
   (block 06 MMA split + source order, block 13 gate externs, block 15 tile split) on top of the
   2026-09-17 re-base onto `ebbb18522` +
@@ -846,14 +847,23 @@ Consequences, so it is not re-litigated:
   2` (184.02 -> 88.39 MiB device + 112.02 -> 16.40 MiB host at `-c 98304`/ub 512), not the ~800 MiB
   the campaign note implies (that needs ub ~2048).  A/B matrix, raw CSVs and harness:
   `wip/kq-mask-derived-ab/`; block-15 amendment section in `patches/README.md`.
-  **Follow-up 2026-09-19 (r8)**: the disable path now explains itself.  With
-  `GGML_CUDA_FA_WMMA_256=0` (a stale September qwen4exp gate) the tile kernel is selected for head
-  256, the derived mask is MMA-kernel-only, and the FA node lands on the CPU; the probe warned only
-  `not supported, set to disabled` plus `assigned to device CPU (usually due to missing support)`,
-  which points at the device.  It now adds a line naming the cause (per-arch WMMA cap /
-  `GGML_CUDA_FA_WMMA_256` / `_MAX_HEAD`), and the README documents the interaction.  That env is also
-  **3x slower at deep prefill** on gfx1201 head 256 (9B `-d 98304`: 2104 -> 710 t/s), so check it
-  first when the derived mask is reported disabled.  Note for qwen4exp: its deep-context mask elision
+  **Follow-up 2026-09-19 (r9, supersedes r8)**: the derived mask now works on the **tile** kernel too,
+  so the head-cap case that r8 merely explained is *fixed*.  A head above the per-arch WMMA cap (or
+  `GGML_CUDA_FA_WMMA_256=0`) no longer loses V3, and on the tile path it is a deep-prefill *win*
+  (gfx1100 gemma4-12B pp512 +1.2 % @16k / +0.9 % @32k, gfx1151 +1.6 % @16k, gfx1201 E4B tile-forced
+  +2.3 % @d0), bit-identical derived-on-vs-off for all 8 KV types on gfx1201 and 4 on each of
+  gfx1151/gfx1100 with the head-512 gemma4 selecting tile **naturally**.  Two things a future
+  kq-mask patch must not undo: (1) the derived test must stay **before** the tile kernel's
+  `(ncols2 > 1 || mask)` read guard, because `mask == nullptr` does not mean "no mask" (that guard is
+  false for `ncols2 == 1` with a derived op, i.e. it would run unmasked); (2) the test must stay
+  **hoisted out of the unrolled KV loop** - decode/verify always take the tile kernel (the WMMA branch
+  needs `ne[1] > 8`), and the per-iteration form cost -0.5..-0.8 % `tg128` at depth by making the
+  compiler rematerialize the extra parameters in a register-bound kernel.  A `use_kq_derived`
+  template parameter was the alternative (about +40 % tile instantiations); it is not needed, so the
+  build time is unchanged.  The r8 note remains in the log but now says only that neither prefill
+  kernel served the graph.  Still worth knowing: a stale `GGML_CUDA_FA_WMMA_256=0` is also **3x
+  slower at deep prefill** on gfx1201 head 256 (9B `-d 98304`: 2104 -> 710 t/s), so check it first
+  when tile shows up where you did not expect it.  Note for qwen4exp: its deep-context mask elision
   is the QSA derived visibility (`GGML_QSA_DERIVED_VIS`), not V3; V3 only serves that model's dense
   shortcut (`n_kv <= 2051`).
 - **The dense greedy-purity guarantee (`--spec-draft-n-max <= 7`) depends on the KV cache type.**

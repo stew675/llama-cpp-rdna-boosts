@@ -12,14 +12,19 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release (2026-09-18) — `v16-ebbb18522-r4`:** a block-04 amendment on top of r3 — under
-`-sm tensor` RDNA3_0 (gfx1100) keeps the stock AMD FA `ncols2` rule (the 2026-09-14 split-aware hint
-was RDNA4-tuned and cost gfx1100 deep prefill: 2× RX 7900 XTX `pp100K` 667.5 -> 779.4 t/s, stock
-805.0; decode unchanged).  Canonical tip
-`ba9e18cacfa3f97f13a822dded971eeb2cce2480`, tree `b84b1783f7207e25600403df5a8e98c183b9f80a`, strict
-16/16 — see `WORKLOG.md` 2026-09-18 (r4) and `patches/README.md`.  **r3 (2026-09-18)** fixed the
-`--fit` startup SIGSEGV with `--spec-type draft-mtp-adaptive` and a minimal per-tier MTP head (issue
-#38; block 01, one line in `common/common.cpp`).
+**Current release (2026-09-19) — `v16-ebbb18522-r9`:** a block-15 amendment on top of r8 — the V3
+derived kq mask is now implemented in the **tile** FA kernel as well, so the head-cap configurations
+(gemma4 head 512 on gfx1100/gfx1151) that r8 could only *report* now get it, as a deep-prefill win with
+decode unchanged (the derived branch is hoisted out of the KV loop, because decode/verify always take
+the tile kernel).  Canonical tip
+`76b10f1fb8391562e30364d6c307e6606100bc57`, tree `cfb2f966448da2b02d24f88a3d30666660949b1f`, strict
+16/16.  Earlier releases on this base: **r8** made the derived-mask disable self-explanatory (block 15;
+superseded by r9's fix for the cause it named); **r7** fixed V3's derived-mask kernel shape (issue #30,
+block 15); **r6** the FA instance build-time fix (blocks 06/13/15; clean `ggml-hip -j16` 323 -> 236 s);
+**r5** the block-04 gfx1100 WMMA FA head cap (issue #30); **r4** the block-04 RDNA3_0 tensor-split
+`ncols2` fix (issue #30: 2× RX 7900 XTX `pp100K` 667.5 -> 779.4 t/s, stock 805.0), on top of **r3**
+(block-01 `--fit` SIGSEGV with `draft-mtp-adaptive` and a minimal per-tier MTP head, issue #38).  See
+`WORKLOG.md` and `patches/README.md` per release.
 
 **Re-base (2026-09-17) — release `v16-ebbb18522-r2`:** the 16-block set re-based onto
 upstream master `ebbb18522` (37 commits past `d1d3c3396`).  Three blocks needed resolution: block 02
