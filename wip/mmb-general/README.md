@@ -128,6 +128,97 @@ Neither is reachable by tuning; both need a kernel restructure (QSA v3 below, an
 Diagnostics are left gated in the tree: `GGML_CUDA_MMB_LOG=1` (shape log),
 `GGML_CUDA_MMB_TILE=0/1` (tile override).
 
+## qsa3 — packed-block WMMA prefill for the QSA sparse attention (2026-09-19, session 2)
+
+**DONE and validated** (was `NEXT WORK #1`).  `GGML_CUDA_QSA3=1` opts in; default OFF.
+
+### What it is
+
+The VEC kernel (`fattn-qsa.cu`) walks the top-k list cell by cell with `v_dot2` and one query
+column per block.  `fattn-qsa3.cu` (new, ported from the Strix Halo branch's `qsa-attn`) shares a
+block of work across **G = 4 queries x 12 q-heads** (48 output rows) and runs the score and PV
+passes on the **F16 WMMA tensor cores** over a package of 4 key blocks (16 keys) at a time.
+
+Three kernels: `qsa3_rows_kernel` (per-row sortedness check + rank-sort), `qsa3_merge_kernel`
+(merge 4 queries' rows into a sorted, deduplicated, block-aligned union + a 16-bit per-query
+membership mask), `qsa3_attn_kernel` (16x16x16 F16 WMMA, mask folded into the score pass).
+
+### Plumbing
+
+* The pack is a **pure graph composition** (reshape + permute + cont) - **no new ggml op**.
+  Helpers `qsa_pack_{keys,values}_graph` in `src/models/qwen4exp.cpp`.
+* The op gained two optional srcs: `ggml_flash_attn_qsa_set_packed(a, packed_keys, packed_values)`
+  (`src[7]`/`src[8]`).  NULL/NULL = the VEC path, unchanged.
+* **Every KV type is supported**, because the kernels read only the F16 packs.  The cast must happen
+  on the cache's *natural contiguous* view before any permute (`qsa3_f16_cast`), and the quantized
+  types route through F32 - **the backend `dup` only dequantizes quantized->F32 and cannot permute a
+  quantized tensor at all** (getting this wrong aborts in `ggml/src/ggml-cpu/ops.cpp:578`, once per
+  QSA layer).
+* **Prefill-only by construction**: the support check requires `q->ne[1] >= 128` and RDNA3_5, so the
+  whole W = 1..8 decode/verify band keeps the VEC kernel and width purity is untouched.
+* Portable WMMA wrapper (`qsa3_wmma_f16`, no-op on `RDNA4`) so a multi-arch build still compiles -
+  verified for **gfx1201 and gfx1100** as well as gfx1151.
+
+### Results (gfx1151, ROCm 7.14, IQ4_XS, `-b/-ub 2048`)
+
+| KV type | pp4096 off -> on | pp8192 off -> on |
+|---|---:|---:|
+| f16 | 855.5 -> 870.5 (+1.8 %) | 819.4 -> 861.7 (+5.2 %) |
+| bf16 | 836.9 -> **874.8 (+4.5 %)** | 791.2 -> **854.5 (+8.0 %)** |
+| q8_0 | 817.5 -> **872.9 (+6.8 %)** | 780.5 -> **856.6 (+9.8 %)** |
+
+All three converge at depth - the kernel reads the same F16 packs, so the KV type no longer matters
+for the attention arithmetic.
+
+**PPL parity** (wikitext):
+
+| c | VEC | qsa3 |
+|---|---:|---:|
+| 16384, bf16 | 3.3932 | 3.3900 |
+| 16384, q8_0 | 3.3861 | 3.3879 |
+| 16384, f16 | 3.3883 | 3.3869 |
+| 32768, bf16 | 4.3378 | 4.3353 |
+
+All within +/-0.002 (the run's own error bar is +/-0.027).  Greedy text is coherent and agrees for
+~40 tokens before the approved **prefill re-baseline** near-tie flip.
+
+### Kernel profile (rocprofv3, pp8192)
+
+| kernel | VEC | qsa3 |
+|---|---:|---:|
+| attention | 2944.4 ms (`flash_attn_qsa`) | **682.3 ms** (`qsa3_attn_kernel`) |
+| rows / sortedness | - | 441.0 ms (`qsa3_rows_kernel`) |
+| merge / union | - | 28.6 ms (`qsa3_merge_kernel`) |
+| **total** | **2944.4 ms** | **1151.9 ms (2.56x)** |
+
+### Two findings worth not re-deriving
+
+* **The dense startup portion must stay.**  `LLAMA_QSA_DENSE_SHORTCUT` (default ON) sends
+  `n_kv <= indexer_top_k + r - 1` (= 2051) to the dense arm, because there the selection covers every
+  cell so sparse saves nothing while paying the indexer.  Re-measured with qsa3: forcing QSA in the
+  startup region is a **pessimization** (pp2048 912.5 -> 903.2; pp8192 862.5 -> 856.9), so the
+  shortcut stays.  **Consequence: qsa3 only engages at n_kv > 2051**, so a `-c 2048` PPL test proves
+  nothing about it (it takes the dense arm silently).
+* **The top-k rows are UNSORTED**, so `qsa3_rows_kernel`'s rank-sort is on the critical path and is
+  the single largest remaining qsa3 cost (441 ms of 1152 ms).  Proven by disabling the sort: the
+  rows kernel drops 441 -> **8 ms** but the attn kernel explodes 682 -> **19593 ms** and throughput
+  collapses 866 -> 474 t/s (unsorted rows break the merge kernel's binary searches).  So the sort is
+  necessary and **the PPL parity above did exercise and validate it**.
+
+### Next qsa3 optimization (deferred)
+
+Make the sortedness path cheaper - either emit sorted rows from the indexer (`ggml_indexer_top_k`;
+but the `idx` order is shared with the VEC decode path, so a re-order there is a decode numerics
+change and must not be done casually), or replace the O(ns^2) rank-sort with a block-aware sort
+(the selection is by whole 4-key blocks, so sorting the ~ns/4 block ids and expanding is ~16x less
+work).  Target: ~441 ms -> ~30 ms, worth ~4 % of prefill.
+
+### Where the time goes now
+
+With qsa3 on, the pp8192 profile is led by **`mmb_*` kernels** (`mmb_f32split_kernel` 2164 ms,
+`mmb_routed_glu_kernel` 2085 + 1626 ms, `mmb_dense_kernel` 1904 + 1606 ms, `mmb_cvt_f32_bf16`
+648 ms) - QSA is no longer the #1 kernel.  The MMB follow-ups (SS 7-9) are now the bigger lever.
+
 ## Gates before this could be opt-in, let alone defaulted on (from the parked handover)
 
 - W = 1..8 logits matrix with `GGML_CUDA_MMB=1` == off (prefill-only, `T >= 512`).

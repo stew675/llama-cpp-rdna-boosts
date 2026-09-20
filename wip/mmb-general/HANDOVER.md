@@ -6,9 +6,52 @@ then `README.md` (the running record) beside it.
 
 > **One-line summary.** A general prefill weight-GEMM on the tensor cores (dequant-to-bf16 → WMMA)
 > is now implemented for **every** weight type the delivery's models use, validated PPL-parity, and
-> measured at up to **+68 % pp2048 / +56 % pp8192** on the Flash-Next Q4_K_M.  The remaining two
-> levers are kernel restructures: **QSA v3** (packed-block WMMA sparse attention) and a **Q8_0
-> IU8-WMMA** path.
+> measured at up to **+68 % pp2048 / +56 % pp8192** on the Flash-Next Q4_K_M.  **QSA v3 (packed-block
+> WMMA sparse attention) was then delivered in session 2**: the QSA attention kernel went **2944 ms ->
+> 1152 ms (2.56x)** and prefill +5-10 % on every KV type, PPL-parity.  The next levers are the
+> `qsa3_rows_kernel` sort (441 ms) and the now-dominant `mmb_*` kernels.
+
+---
+
+## UPDATE — session 2 (2026-09-19): QSA v3 is DONE
+
+**Read §8 as history; the work is landed.**  Everything below is still accurate for the MMB part.
+
+Session 2 delivered the packed-block WMMA QSA prefill (§8) and extended it to every KV cache type:
+
+* New file `ggml/src/ggml-cuda/fattn-qsa3.cu` (rows / merge / attn kernels, ported from the Strix
+  Halo branch's `qsa-attn`).
+* New optional op srcs `src[7]`/`src[8]` via `ggml_flash_attn_qsa_set_packed`; the pack itself is a
+  pure graph composition (no new ggml op), built in `src/models/qwen4exp.cpp`.
+* Gate: **`GGML_CUDA_QSA3=1`**, default OFF.  Prefill-only (`q->ne[1] >= 128`) and RDNA3_5, so the
+  W = 1..8 decode/verify band still takes the VEC kernel and width purity holds by construction.
+* gfx1201 + gfx1100 TU compiles verified (portable WMMA wrapper, no-op on RDNA4).
+
+Measured (gfx1151, IQ4_XS, `-b/-ub 2048`): pp8192 **f16 819.4->861.7, bf16 791.2->854.5, q8_0
+780.5->856.6**; PPL parity at c16384/c32768 on all three (e.g. bf16 3.3932 vs 3.3900); greedy text
+coherent.  Kernel profile pp8192: **VEC 2944.4 ms -> qsa3 1151.9 ms** (attn 682.3 + rows 441.0 +
+merge 28.6).
+
+Three things session 3 must not re-derive - full detail in `README.md`:
+
+1. **Do not remove the dense startup arm.**  `n_kv <= 2051` takes the dense path because the
+   selection covers every cell there; forcing QSA there is measurably worse (pp2048 912.5 -> 903.2).
+   Consequence: **qsa3 only engages above 2051 tokens**, so `-c 2048` tests silently prove nothing.
+2. **The top-k rows are unsorted**, so the rank-sort in `qsa3_rows_kernel` is required.  Disabling it
+   drops that kernel 441 -> 8 ms but blows the attn kernel up 682 -> 19593 ms and halves throughput.
+3. **Cast on the natural contiguous cache view, never on a permuted one**, and route quantized types
+   through F32 - the backend `dup` cannot permute a quantized tensor and only dequantizes to F32
+   (otherwise: `ggml/src/ggml-cpu/ops.cpp:578` abort, once per QSA layer).
+
+**Revised next-work order** (after session 2):
+
+1. `qsa3_rows_kernel` sort: 441 ms of the 1152 ms qsa3 total (~4 % of prefill).  A block-aware sort
+   (sort the ~ns/4 block ids, then expand) is ~16x less work.  **Do not** reorder `idx` at the
+   indexer: that tensor is shared with the VEC decode path, so it would be a decode numerics change.
+2. The `mmb_*` kernels now lead the profile (`mmb_f32split` 2164 ms, `mmb_routed_glu` 2085+1626,
+   `mmb_dense` 1904+1606, `mmb_cvt_f32_bf16` 648) - see §9/§10 for the Q8_0 IU8 and bf16-producer ideas.
+3. QSA v3 for **gfx1200/gfx1100** (needs an RDNA4/RDNA3_0 WMMA variant; the wrapper is currently a
+   deliberate no-op there, so only the VEC path runs).
 
 ---
 
@@ -21,11 +64,8 @@ then `README.md` (the running record) beside it.
    **`wip/mmb-general/patches/0001..0009-*.patch`** (per-commit), plus `commits.txt`.
    Verified: `git apply --check` passes on a clean checkout of `8a2567e1e`.
 3. Rebuild with the commands in §3; reproduce the numbers in §5.
-4. **The next work is QSA v3** (§8) — the #1 remaining kernel at 16.6 % of post-MMB prefill.
-   The maintainer has approved the prefill re-baseline (greedy prefill output may change) provided it
-   stays **consistent, deterministic and coherent**; the W=1..8 band stays on the VEC kernel so width
-   purity and `plain == draft-mtp` are untouched.
-5. Optional second lever: **Q8_0 IU8-WMMA** (§9).
+4. **QSA v3 is DONE** (see the UPDATE section) — the remaining QSA work is the 441 ms sort in
+   `qsa3_rows_kernel`.  The optional second lever is now **Q8_0 IU8-WMMA** (§9).
 
 ---
 
@@ -243,10 +283,14 @@ Q4_K_M pp8192, `GGML_CUDA_MMB=1`, rocprofv3 kernel trace (**total 17.75 s**, was
 
 ---
 
-## 8. NEXT WORK #1 — QSA v3 packed-block WMMA sparse attention
+## 8. QSA v3 — **DONE in session 2** (kept as the design record)
 
-**Goal:** replace, for prefill only, the VEC `flash_attn_qsa` score/PV with a packed-block WMMA
-implementation (pwilkin's `qsa3`), targeting ~2.94 s → ~0.8 s on Q4_K_M pp8192.
+**Status: landed behind `GGML_CUDA_QSA3=1`; results and the remaining optimization are in the
+"UPDATE" section above and in `README.md`.  The plan below is what was actually built - keep it for
+the gfx1200/gfx1100 follow-up.**
+
+**Goal (achieved):** replace, for prefill only, the VEC `flash_attn_qsa` score/PV with a packed-block
+WMMA implementation (pwilkin's `qsa3`).  Result: 2944 ms -> 1152 ms on the kernel, +5-10 % prefill.
 
 **Approved:** the maintainer accepts a prefill re-baseline (greedy prefill output changes) as long as
 it is **consistent, deterministic and coherent**.  Keep the **VEC `flash_attn_qsa` for the W=1..8
