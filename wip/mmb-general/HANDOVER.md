@@ -58,8 +58,9 @@ an UPDATE says otherwise.
    win needs native-bf16 **producers**: port the reference's `rms_norm`+`mul` `out_xn_bf16` fusion and
    the HC combine/norm bf16 marking, wire `ggml_cuda_mmb_marks_clear` into the graph optimizer, and add
    the bf16 arm to `dsv4_hc_pre`.  Ceiling ~2.3 % on Flash-Next; numerics change, needs the PPL gate.
-   Measured detail and the `mmb_cvt` breakdown: the session-7 UPDATE below.  `dsv4_hc_post` is already
-   at the bandwidth ceiling; the GLU→down bf16 reuse is already in place (`mmb_slot[2]`).
+   **Turnkey brief: [`BF16-PRODUCER-PORT.md`](BF16-PRODUCER-PORT.md)** (reference map, step plan,
+   gates, pitfalls, copy-paste prompt).  `dsv4_hc_post` is already at the bandwidth ceiling; the
+   GLU→down bf16 reuse is already in place (`mmb_slot[2]`).
 4. **The residual ~18 % kernel-local gap in `dsv4_hc_pre`** (~0.8 %) — smaller, still unexplained.
 5. **`ssm_alpha/beta`** (~1.2 %) — generalise the tiny-M kernel past the 8-accumulator register limit.
 6. **The indexer** — 1 % at 8K, 3.2 % at 32K, grows with context; deliberately deferred behind 3-5.
@@ -175,6 +176,10 @@ the bf16 arm to `dsv4_hc_pre` + the `hc_mixed` consumer, and re-run the PPL gate
 change on the HC path).  That is a multi-session project with a `~2.3 %` ceiling on Flash-Next; it is
 **not** a one-line cast.  Cheap inputs checked and rejected: `GGML_CUDA_MMB_CACHE` 32/128 is a wash on
 Flash-Next (960/957/957 t/s), and a plain `ggml_cast` is a net loss by the table above.
+
+**The turnkey brief for that port is [`BF16-PRODUCER-PORT.md`](BF16-PRODUCER-PORT.md)** — mandate,
+environment, the reference file:line map, the ordered step plan, the gates and the pitfalls.  Nothing
+has been started; the tree is at `2a73b02e4` with only the qsa3 pack landed this session.
 
 **The correct targets (current profile, bf16 KV, total 16782 ms):** `dsv4_hc_pre` 743.9 + `_post` 685.3 =
 **1429 ms (8.5 %)** via bf16 intermediates (~2.3 % win, next-work #3); `mmb_cvt_f32_bf16` **642.5 ms
