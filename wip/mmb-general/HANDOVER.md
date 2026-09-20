@@ -54,23 +54,27 @@ base (`benchmarks/2026-09-20-qwen4exp-iq4xs-prefill-wip-vs-base.md`).  All §11 
 **What remains is the prioritized list below**; the detailed sections further down (the indexer shapes,
 the per-kernel numbers, the measurement budget) are the reference for it.
 
-**Remaining work (prioritized — the whole list as of session 18):**
+**Remaining work (prioritized — the whole list as of session 19):**
 
 * **A. Indexer (the active lever).**
   1. **Block-level gather/emit — the one real remaining optimisation.**  The gather is still
-     cell-level (`indexer_topk_write_blocks_grouped`, **262 ms at 32K = 21 % of the family**); emitting
+     cell-level (`indexer_topk_write_blocks_grouped`, **259 ms at 32K = 22 % of the family**); emitting
      each selected block's cells directly would take it to ~60 ms (~1.2x on the family).  Blocked on
      making it **order-exact**: `blk_cells` lists a block's cells in `idx % r` order, which equals
      ascending **column** order only when the cache cell index is the position (single sequence, no
      ranked/mrope reorder) — otherwise the block's cells need a small sort — and the **dead/spare
      block** (`blk_idx == INT32_MAX`, the unpooled incomplete tail + empty cells) is **not** in
      `blk_cells` at all and still needs a scan.  It must preserve the deterministic ascending-column
-     order (gate 7) and be checked with the same-seed text gate, not just t/s.
+     order (gate 7) and be checked with the same-seed text gate, not just t/s.  (The `wvis` the block
+     path already computes could drive a cheap "skip the whole block" test in the cell-level gather
+     as a smaller, order-preserving intermediate step.)
   2. Small polish: template the `indexer_topk_extra` branches (`blk_idx`/`cell_pos` are run-time checks
      in the hot loop); optionally fuse `hist_accum` into `select` (blocked on `select` being per-row
-     while the suffix counts are per-(row, block)).
+     while the suffix counts are per-(row, block)).  Also open: the block passes' key-bound cost
+     (472 ms at 32K) and the `select`+`hist_accum` histogram-array traffic (152 ms).
   3. **Closed/refuted — do not redo:** "compact after pass 1" (cell tie groups are 50–60 % of the
-     cache); a wider radix / fewer passes (the wider `select`/`hist_accum` reads offset the saved pass).
+     cache); a wider radix / fewer passes (the wider `select`/`hist_accum` reads offset the saved pass);
+     pass 1's per-cell histogram atomics (session 19, now one per block).
 * **B. Non-temporal sweep remainder (small).**  qsa3 pack kernels (6.5 ms), the `rms_norm`/other unary
   producers, and `ssm_conv` under a different shape.  Rule: **loads only, per-kernel, A/B load vs
   store** (a non-temporal *store* evicts the next op's input).
@@ -84,26 +88,28 @@ the per-kernel numbers, the measurement budget) are the reference for it.
   `scripts/apply-all.sh`, regenerate `patches/` + `release.json`, and decide whether MMB rides as a
   **block-08 amendment**.  Every gate passes; it needs the maintainer's go-ahead + a beta window.
 
-**Progress (sessions 16-18):** the indexer is now **~2.1x faster** and still bit-identical.  Session 16
+**Progress (sessions 16-19):** the indexer is now **~2.2x faster** and still bit-identical.  Session 16
 removed the full-width count pass (the gather's per-block greater/equal counts are derived from the
 radix histograms).  Session 17 added **block-key sharing** on the `additive == nullptr` (derived
 default) path: since the value is per-block, the histograms and the gather evaluate the block key once
 per block's cells instead of once per cell.  Session 18 added a **block-level histogram path**: the op
 now carries `blk_cells` (so it knows the ratio), pass 1 is cell-level and accumulates each block's
-visible-cell count, and passes 2-4 bin that count at the block key (a block-aligned partition).  Family
-**177.1 -> 85.6 ms at pp8192 (-52 %)** and **2523.6 -> 1235.7 ms at pp32768 (-51 %, 2.94 -> 1.47 % of
+visible-cell count, and passes 2-4 bin that count at the block key (a block-aligned partition).  Session
+19 cut pass 1's histogram atomics from one **per cell** to one **per block** (the block key and the
+invisible `key_inf` bin are shared across a thread's run).  Family
+**177.1 -> 74.3 ms at pp8192 (-58 %)** and **2523.6 -> 1156.9 ms at pp32768 (-54 %, 2.94 -> 1.40 % of
 the run)**, output **bit-identical** (PPL 10.6015, greedy `9c281c415082`, all §11 gates green).  The
 failed "compact after pass 1" experiment is recorded in the session-16 UPDATE.  **The remaining indexer
-levers are the pass-1 cell scan (342 ms at 32K), the 3 block passes (470 ms, key-bound) and the gather
-(262 ms); a block-level gather/emit would need each block's cells in column order (see session 18).**
+levers are the 3 block passes (472 ms at 32K, key-bound), the gather (259 ms) and `select`+`hist_accum`
+(152 ms); a block-level gather/emit would need each block's cells in column order (see session 18).**
 
 **Environment**
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`5d55da3e9`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`bd261f0bf`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0030` + `commits.txt` (30 commits), on branch **`wip-mmb-general`** (cut from `main` at `1c2ec00`), pushed to `origin/wip-mmb-general`; `git apply --check` verified on a fresh `8a2567e1e` |
+| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0031` + `commits.txt` (31 commits), on branch **`wip-mmb-general`** (cut from `main` at `1c2ec00`), pushed to `origin/wip-mmb-general`; `git apply --check` verified on a fresh `8a2567e1e` |
 | target model | `/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf` (94 GiB; the only qwen4exp with HC + QSA) |
 | fast iteration model | `Qwen3.6-35B-A3B-Q4_K_M` (21 GiB, `qwen35moe`; **no** HC/QSA — use it only for `mmb_*` shapes) |
 | reference | `~/pwilkin-llama-cpp` @ `f5daaa3cf` (branch `strix-halo`) |
@@ -212,27 +218,29 @@ block-14 win: the `[n_kv, n_tps]` F32 expanded tensor -- 512 MB at 64K -- never 
 The default path therefore does **one full cell pass (pass 1) + three block passes (`n_blocks`/`n_kv`
 ~ 1/4) + one cell gather pass**.
 
-**Measured (session 18, gfx1151, bf16 KV, `-ub 2048`; sessions 15/16/17 where useful):**
+**Measured (session 19, gfx1151, bf16 KV, `-ub 2048`; session-18/15 numbers in brackets):**
 
 | kernel | pp8192 | pp32768 | calls @32K |
 |---|---:|---:|---:|
-| histogram pass 1 (`_pass1`, cell-level) | 24.0 | 341.8 ms | 384 |
-| histogram passes 2-4 (`_blocks`) | 22.4 | 470.4 ms | 1152 |
-| gather (`_grouped`) | 20.4 (22.4) | 262.5 ms (291.3, 668.3) | 384 |
-| `indexer_topk_radix_select` | 11.6 | 87.9 ms | 1536 |
-| `indexer_topk_hist_accum` | 5.3 | 65.0 ms | 1536 |
-| `base_scan` + `init` | 2.0 | 8.1 ms | 384 |
-| **family total** | **85.6 ms** (123.7 / 160.4 / 177.1) | **1235.7 ms** (1362.3 / 2028.4 / 2523.6) | |
+| histogram pass 1 (`_pass1`, cell-level) | 13.4 (24.0) | 266.0 ms (341.8) | 384 |
+| histogram passes 2-4 (`_blocks`) | 22.3 (22.4) | 471.9 ms (470.4) | 1152 |
+| gather (`_grouped`) | 20.1 (20.4) | 259.4 ms (262.5) | 384 |
+| `indexer_topk_radix_select` | 11.3 | 87.8 ms | 1536 |
+| `indexer_topk_hist_accum` | 5.2 | 64.3 ms | 1536 |
+| `base_scan` + `init` | 2.0 | 8.0 ms | 384 |
+| **family total** | **74.3 ms** (85.6 / 123.7 / 160.4 / 177.1) | **1156.9 ms** (1235.7 / 1362.3 / 2028.4 / 2523.6) | |
 
-Sessions 16+17+18 together: **-52 % at pp8192** and **-51 % at pp32768 (2.94 -> 1.47 % of the run)**,
+Sessions 16+17+18+19 together: **-58 % at pp8192** and **-54 % at pp32768 (2.94 -> 1.40 % of the run)**,
 output bit-identical.  Session 18's block-level histogram is the win at short context (-31 % at 8K); at
 32K it is only -9 % because the session-17 grouped pass already shared the block key, so the block
 passes save only the per-cell visibility/binning work (the key is still evaluated once per block).
+Session 19 then cut pass 1's histogram atomics from one per cell to one per block (-44 % pass1 at 8K).
 
-**Why the block passes are now the remaining cost.**  At 32K the family is pass 1 (28 %), the 3 block
-passes (38 %, key-bound: one `score` gather + `blk_idx` per block), the gather (21 %), select (7 %) and
-hist_accum (5 %).  The block passes are only ~2.2x cheaper per element than a cell pass because the
-per-block key evaluation dominates both.
+**Why the block passes are now the remaining cost.**  At 32K the family is the 3 block passes (41 %,
+key-bound: one `score` gather + `blk_idx` per block), pass 1 (23 %), the gather (22 %), select (8 %) and
+hist_accum (6 %).  The block passes are only ~2.2x cheaper per element than a cell pass because the
+per-block key evaluation dominates both, and the `select`/`hist_accum` pair is memory-bound on the
+histogram array.
 
 **Hypotheses, ranked:**
 
@@ -353,14 +361,14 @@ unilaterally** -- needs a beta window / go-ahead.
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`5d55da3e9`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`bd261f0bf`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
 | backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0030` + `commits.txt`, in this repo, pushed to `origin/main` |
 | verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (30 commits) |
 | build | §3 | run | §4 |
-| current numbers | the **session 18 UPDATE below** (indexer block-level histogram + sessions 16/17) -- indexer family pp8192 **85.6 ms** / pp32768 **1235.7 ms** -- plus the **session 15 UPDATE** (qsa3 compile-time gate + the rocprofiler-register profiling caveat), the **session 14/13 UPDATEs** (non-temporal) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
+| current numbers | the **session 19 UPDATE below** (indexer pass-1 per-block histogram atomics) -- indexer family pp8192 **74.3 ms** / pp32768 **1156.9 ms** -- plus the **session 18 UPDATE** (the block-level histogram + `blk_cells` src), the **session 15 UPDATE** (qsa3 compile-time gate + the rocprofiler-register profiling caveat), the **session 14/13 UPDATEs** (non-temporal) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
 
-**Historical ordering of the UPDATE sections:** 18 (newest, 2026-09-20, the indexer block-level histogram path + the `blk_cells` op src) → 17 (2026-09-20, indexer block-key sharing) → 16 (2026-09-20, the indexer count-pass elimination + the "compact after pass 1" refutation) → 15 (2026-09-20, the qsa3 compile-time gate + the rocprofiler-register profiling caveat) → 14 (2026-09-20, the non-temporal load sweep: concat/moe/unary) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
+**Historical ordering of the UPDATE sections:** 19 (newest, 2026-09-20, the indexer pass-1 per-block histogram atomics) → 18 (2026-09-20, the indexer block-level histogram path + the `blk_cells` op src) → 17 (2026-09-20, indexer block-key sharing) → 16 (2026-09-20, the indexer count-pass elimination + the "compact after pass 1" refutation) → 15 (2026-09-20, the qsa3 compile-time gate + the rocprofiler-register profiling caveat) → 14 (2026-09-20, the non-temporal load sweep: concat/moe/unary) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body and are correct except where
 an UPDATE says otherwise.
@@ -368,6 +376,48 @@ an UPDATE says otherwise.
 **Next work:** see the **"FOR THE NEXT SESSION"** brief at the very top of this file — its ordered
 list is the authoritative one, and the historical "next-work order" lists inside the UPDATE sections
 below are superseded.
+
+---
+
+## UPDATE — session 19 (2026-09-20): the indexer's pass-1 histogram atomics go per cell -> per
+## block (**-44 % pass1 @8K / -22 % @32K**, family **-12.5 % / -6.4 %**), bit-identically
+
+Continuation of the session-18 indexer mandate.  `indexer_topk_histogram_pass1` was doing one
+`atomicAdd(&histogram[bin], 1)` **per cell**.  On the default `additive == nullptr` path every cell of a
+block shares the `indexer_topk_block_key` and every invisible cell shares `key_inf`, so a thread's `VEC`
+run bins into at most two bins.  The kernel now accumulates the block's visible count
+(`cur_h`) and a per-thread pending counter for the invisible `key_inf` bin, flushing with **one atomic
+per block** plus **one atomic per thread** for the invisible stream.  The integer bin counts are
+unchanged -- the kernel's only change is how many atomics carry them.
+
+### Measured (gfx1151, bf16 KV, ub 2048, rocprofv3 kernel trace; session-18 baseline in brackets)
+
+| kernel | pp8192 | pp32768 |
+|---|---:|---:|
+| pass 1 (`_pass1`, cell-level) | **13.4** (23.7) | **266.0** (341.8) |
+| passes 2-4 (`_blocks`) | 22.3 (22.4) | 471.9 (470.4) |
+| gather (`_grouped`) | 20.1 (20.2) | 259.4 (262.5) |
+| `indexer_topk_radix_select` | 11.3 | 87.8 |
+| `indexer_topk_hist_accum` | 5.2 | 64.3 |
+| `base_scan` + `init` | 2.0 | 8.0 |
+| **family total** | **74.3** (85.6) | **1156.9** (1235.7) |
+
+**-44 % pass1 at pp8192, -22 % at pp32768; family -12.5 % / -6.4 %.**  The win is larger at 8K because
+the invisible stream is the same fraction of the cache at any depth but the partition has fewer
+hist-blocks per row at 8K, so the per-thread invisible flush amortises over fewer blocks.  No other
+kernel moved.  Bit-identical: PPL c2048 **10.6015**, greedy **`9c281c415082`** (624 chars); the change
+is an integer-count re-association (the same bins, the same sums), so every gate that was green at
+session 18 stays green by construction.
+
+### What remains
+
+The pass-1 cell scan is still cell-level (it must see every cell to count the per-block visibility).
+The other three cost centres are now the **three block passes (471.9 ms, key-bound: one `score` gather
++ `blk_idx` per block per pass)**, the **gather (259.4 ms, the shared-memory scan)** and
+**`select`+`hist_accum` (152.1 ms, memory-bound on the histogram array)**.  A block-level gather/emit
+is still the estimated ~1.2x family lever and still needs the column-order handling from session 18.
+A cheaper intermediate for the gather: it could take `wvis` (already computed in pass 1) and skip the
+`cell_pos` load/compare for any block with zero visible cells, without touching the output order.
 
 ---
 
