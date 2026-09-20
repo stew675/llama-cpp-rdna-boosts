@@ -110,9 +110,17 @@ cache, 86.3 ms = 0.48 %.  The session-5 "PACK/copy (qsa3 pack) 3.0 %" bucket was
 contiguous F16 view, and two new launcher kernels (`qsa3_pack_keys_kernel` / `qsa3_pack_values_kernel`)
 do the whole re-layout in one pass each.  **Bit-identical** (PPL c2048 10.5771 both; greedy
 `sha=04ddb94b1529` both), and the pack kernels go **50.5 -> 6.5 ms** (bf16, save **0.26 %** pp8192),
-**86.4 -> 49.1 ms** (q8_0, save 0.22 %).  **Next in-scope target: the `dsv4_hc_pre`+`_post` pair
-(8.5 %, bf16 intermediates), then `mmb_cvt` (3.8 %, producer marking).**  Full tables in
-`HANDOVER.md` §session 7.
+**86.4 -> 49.1 ms** (q8_0, save 0.22 %).  Full tables in `HANDOVER.md` §session 7.
+
+**Then investigated the next targets (`dsv4_hc_pre`+`_post` bf16 intermediates 8.5 %, `mmb_cvt`
+producer marking 3.8 %): they are the *same multi-session port*, not a cast.**  A plain `ggml_cast` is
+a net loss — the cast *is* the existing `mmb_cvt` (12 B/elem vs 4 B/elem for a native-bf16 producer).
+The reference gets bf16 for free from **fused producers** (`rms_norm`+`mul` with an `out_xn_bf16`
+output; `ggml_cuda_mmb_mark_bf16_only` on MMB chains); our tree lacks them, `ggml_cuda_mmb_marks_clear`
+is never called, and `LLAMA_MMB_CVT_LOG=1` shows the conversions are for `hc_norm` (5.24 M×2/layer),
+`final_output` (3.15 M), `hc_mixed` (1.31 M×2) — all non-MMB producers.  `dsv4_hc_post` is already at
+the bandwidth ceiling.  Cheap checks rejected: `GGML_CUDA_MMB_CACHE` 32/128 is a wash (960/957/957).
+**Recommendation: scoped follow-up port, ~2.3 % ceiling.**
 
 ## UPDATE — session 6 (2026-09-20): the `mmb_*` kernels are at their gfx1151 ceiling
 

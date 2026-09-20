@@ -53,8 +53,13 @@ an UPDATE says otherwise.
    wash or worse — the `mmb_routed_glu` geometry was read and tuned.  The remaining lever for prefill
    is **outside `mmb_*`**: FA (`flash_attn_ext_f16` 11.3 %), the GDN scan (~5.5 %), the MoE
    `concat_transposed_src1_dim0` + `moe_weighted_reduction` pair (~6.8 %), `rms_norm` (~5 %).
-3. **bf16 HC intermediates** for `dsv4_hc_pre`/`_post` (~2.3 % of prefill) — a **graph** change: the
-   `hc_norm` / `hc_gate` producers must write bf16.  Measured 1.8x traffic reduction; see 5e.
+3. **bf16 HC intermediates + producer marking** — **session 7 found these are the same multi-session
+   port, not a cast** (a plain `ggml_cast` is a net loss — the cast *is* the existing `mmb_cvt`).  The
+   win needs native-bf16 **producers**: port the reference's `rms_norm`+`mul` `out_xn_bf16` fusion and
+   the HC combine/norm bf16 marking, wire `ggml_cuda_mmb_marks_clear` into the graph optimizer, and add
+   the bf16 arm to `dsv4_hc_pre`.  Ceiling ~2.3 % on Flash-Next; numerics change, needs the PPL gate.
+   Measured detail and the `mmb_cvt` breakdown: the session-7 UPDATE below.  `dsv4_hc_post` is already
+   at the bandwidth ceiling; the GLU→down bf16 reuse is already in place (`mmb_slot[2]`).
 4. **The residual ~18 % kernel-local gap in `dsv4_hc_pre`** (~0.8 %) — smaller, still unexplained.
 5. **`ssm_alpha/beta`** (~1.2 %) — generalise the tiny-M kernel past the 8-accumulator register limit.
 6. **The indexer** — 1 % at 8K, 3.2 % at 32K, grows with context; deliberately deferred behind 3-5.
@@ -124,6 +129,52 @@ pp8192 (IQ4_XS, `-b/-ub 2048`), pack-kernel time and t/s:
 The F16/BF16 cast (`cpy_scalar_contiguous`, bf16 7.7 ms) and the quantized→F16 chain (q8_0 35 ms)
 remain graph ops — fusing them is <0.05 % for the default bf16 config and needs per-type dequant in the
 pack kernel, so it is left as a documented follow-up.
+
+### bf16 HC intermediates + producer marking — investigated: **a multi-session port, not a cast**
+
+The next-work #3 ("bf16 intermediates") and §10 ("bf16-producer marking") are the **same** underlying
+change: make a producer emit bf16 natively, then have the consumer read it.  A plain `ggml_cast` is a
+**net loss**, because the cast *is* the existing `mmb_cvt`:
+
+| path | traffic per element |
+|---|---|
+| today: producer writes f32 → `mmb_cvt` (read f32, write bf16) → consumer reads bf16 | 4 + 4 + 2 + 2 = **12 B** |
+| producer writes bf16 natively → consumer reads bf16 | 2 + 2 = **4 B** |
+| extra `ggml_cast` (read f32, write bf16) → consumer reads bf16 | 4 + 4 + 2 + 2 = **12 B** (no win) |
+
+So the win is entirely in the **producer**, and for `hc_norm` (`rms_norm * gamma`) / `hc_mixed`
+(`DSV4_HC_PRE`) / `node_9` (`MAP_CUSTOM1`) that means a **fused producer that writes bf16**.
+
+`LLAMA_MMB_CVT_LOG=1` (pp512, per layer) shows where the 642.5 ms of `mmb_cvt` goes:
+
+| converted tensor | producer (`op` / `view_src`) | elements |
+|---|---|---:|
+| `hc_norm-N` | `RESHAPE` (view of the `rms_norm*gamma` `MUL`) | 5.24 M ×2 |
+| `final_output-N` | `RESHAPE` | 3.15 M |
+| `hc_mixed-N` | `DSV4_HC_PRE` + its `RESHAPE` | 1.31 M ×2 |
+| `node-N` | `MAP_CUSTOM1` | 0.16 M |
+| `ROCm0#ple_embd#0` | `NONE` (model tensor) | 1.31 M |
+
+**What the reference (`~/pwilkin-llama-cpp`, `hc-mix.cu` + `ggml-cuda.cu`) does:** `hc_mix_reduce_bf16`
+reads bf16 copies it gets from `ggml_cuda_mmb_cache_lookup(xn)` / `(gate)` — and those copies exist
+because its graph-optimizer pass **marks native-bf16 producers** (`ggml_cuda_mmb_mark_bf16_only` on
+MMB-chain outputs, the `rms_norm`+`mul` fusion with an `out_xn_bf16` output, the HC combine/norm
+fusions).  It is gated `LLAMA_MMB_HC16` / `LLAMA_HC_BLK16` / `LLAMA_HC_RES16` and depends on
+reference-only matching helpers (`ggml_cuda_match_hc_combine_norm`, `ggml_cuda_hc_mix_closed`) plus the
+whole mark-lifetime machinery (`ggml_cuda_mmb_marks_clear` is **never called** in our tree).
+
+**What our tree already does:** the GLU→routed-down bf16 reuse is in place via `mmb_slot[2]` (no `GLU`
+producer appears in the `mmb_cvt` log), and `mmb_down16` / `mmb_blk16` / `mmb_res16` knobs exist but are
+default-0 and unmarked.  `dsv4_hc_post` (685 ms) is *already at the bandwidth ceiling* (~216-252 MB per
+launch / 0.9 ms ≈ 240 GB/s), so its `x` re-reads are L1-cached and restructuring it is a wash — the
+lever really is bytes, i.e. native bf16.
+
+**Scope:** port the reference's fused bf16 producers (at least the `rms_norm`+`mul` `out_xn_bf16`
+fusion and the HC combine/norm matcher), wire `ggml_cuda_mmb_marks_clear` into the graph optimizer, add
+the bf16 arm to `dsv4_hc_pre` + the `hc_mixed` consumer, and re-run the PPL gate (it is a numerics
+change on the HC path).  That is a multi-session project with a `~2.3 %` ceiling on Flash-Next; it is
+**not** a one-line cast.  Cheap inputs checked and rejected: `GGML_CUDA_MMB_CACHE` 32/128 is a wash on
+Flash-Next (960/957/957 t/s), and a plain `ggml_cast` is a net loss by the table above.
 
 **The correct targets (current profile, bf16 KV, total 16782 ms):** `dsv4_hc_pre` 743.9 + `_post` 685.3 =
 **1429 ms (8.5 %)** via bf16 intermediates (~2.3 % win, next-work #3); `mmb_cvt_f32_bf16` **642.5 ms
