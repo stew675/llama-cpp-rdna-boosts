@@ -138,36 +138,42 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
-## UPDATE — session 19 (2026-09-20): indexer pass-1 histogram atomics cut per cell → per block
-## (**−44 % pass1 at 8K / −22 % at 32K**), bit-identically
+## UPDATE — session 19 (2026-09-20): indexer histogram atomics per cell → per block (pass 1) and
+## per thread → per warp (block passes) (**family −16 % 8K / −7 % 32K** vs s18), bit-identically
 
-Follow-up on the session-18 block path.  `indexer_topk_histogram_pass1` was doing one
-`atomicAdd(&histogram[bin], 1)` **per cell**.  But every cell of a block shares the block key and every
-invisible cell shares `key_inf`, so a thread's `VEC` run bins into at most two bins.  It now accumulates
-the per-block visible count (and one per-thread pending counter for the invisible `key_inf` bin) and
-flushes with **one atomic per block** (plus one per thread for the invisible stream).  The integer bin
-counts are unchanged — only the atomic traffic shrinks.
+Follow-up on the session-18 block path.  Two integer re-associations:
+
+1. `indexer_topk_histogram_pass1` was doing one `atomicAdd(&histogram[bin], 1)` **per cell**.  But every
+   cell of a block shares the block key and every invisible cell shares `key_inf`, so a thread's `VEC`
+   run bins into at most two bins.  It now accumulates the per-block visible count (and one per-thread
+   pending counter for the invisible `key_inf` bin) and flushes with **one atomic per block** (plus one
+   per thread for the invisible stream).
+2. `indexer_topk_histogram_blocks` had every one of its 256 threads do `atomicAdd(&s_sumw, mysum)` on a
+   **single shared address** — 256 serialized same-address atomics per CU per pass.  It now warp-reduces
+   `mysum` and does **one atomic per warp** (8 instead of 256).
+
+The integer bin counts/sums are unchanged — only the atomic traffic shrinks.
 
 | kernel | pp8192 (s18) | pp32768 (s18) |
 |---|---:|---:|
 | pass 1 (cell-level) | **13.4** (23.7) | **266.0** (341.8) |
-| passes 2-4 (block-level) | 22.3 | 471.9 |
+| passes 2-4 (block-level) | **19.8** (22.4) | **461.8** (470.4) |
 | gather | 20.1 | 259.4 |
 | select | 11.3 | 87.8 |
 | hist_accum | 5.2 | 64.3 |
 | scan+init | 2.0 | 8.0 |
-| **family** | **74.3** (85.6) | **1156.9** (1235.7) |
+| **family** | **71.7** (85.6) | **1146.6** (1235.7) |
 
-**−44 % pass1 at 8K, −22 % at 32K; family −12.5 % / −6.4 %.**  Bit-identical: PPL c2048 **10.6015**,
-greedy **`9c281c415082`** (624 chars).  The 8K win is bigger because the invisible (`key_inf`) stream —
-which now costs one atomic per thread instead of one per cell — is the same fraction of the cache
-either way, but there are fewer hist-blocks per row at 8K.  The pass1 kernel is still cell-level: it
+**Pass 1 −44 % / −22 %; block pass −11 % / −2 %; family −16.2 % / −7.2 %.**  Both wins are larger at 8K
+because there are fewer hist-blocks per row there.  Bit-identical: PPL c2048 **10.6015**, greedy
+**`9c281c415082`** (624 chars), width probe PASS (maxdiff 0).  The pass-1 kernel is still cell-level: it
 must see every cell to count the per-block visibility.
 
 **Next:** the block-level gather/emit is unchanged and still the open item (needs each block's cells in
 column order; `blk_cells` slot order is `idx%r`, and the dead/spare block is not in `blk_cells`) →
-estimated ~259 → ~60 ms at 32K.  The other two cost centres are the three block passes (471.9 ms,
-key-bound) and `select`+`hist_accum` (152 ms, memory-bound on the histogram array).
+estimated ~259 → ~60 ms at 32K.  The remaining cost centres are the three block passes (461.8 ms,
+key-bound, now shown to be memory/latency-bound rather than reduction-bound) and `select`+`hist_accum`
+(152 ms, memory-bound on the histogram array).
 
 ---
 
