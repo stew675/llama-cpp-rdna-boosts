@@ -97,6 +97,25 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 11 (2026-09-20): skip the dead F32 store in the producer port — **+2.3 % pp8192 /
+## +3.3 % pp2048**, still bit-identical
+
+Session 9's producers wrote F32 *and* the BF16 copy.  A profile showed that of the 650 ms of `mmb_cvt`
+removed, only ~489 ms was net (the producers paid ~161 ms in extra BF16 stores).  But for activations
+whose every consumer reads the BF16 cache, the F32 output is dead.  The graph optimizer now classifies
+consumers: all-`bf16` (quantized `MUL_MAT`/`MUL_MAT_ID` through views) -> mark BF16-only and the
+producer skips its F32 store; otherwise keep F32 + copy.  The five producer kernels gained a
+`store_f32` flag.  Bit-identical (PPL 10.6428, greedy `9930c674a6ca`, width probe pure, FA/GDN pass).
+
+| config | pp2048 | pp8192 |
+|---|---:|---:|
+| `HC16=0` | 975.3 | 952.4 |
+| `HC16=1` (session 9, always-emit) | ~994 | ~966 |
+| `HC16=1` (session 11, dead-store skip) | **1007.4** | **974.0** |
+
+`unary_gated` 302 -> 229 ms.  `xn` still keeps its F32 (its `dsv4_hc_pre`-src0 and tiny-M consumers
+read F32); adding BF16 arms there is the next ~1 % but is a numerics change on the hidden stream.
+
 ## UPDATE — session 10 (2026-09-20): `ssm_alpha/beta` (M=48) profiled — **rocBLAS stays**
 
 The `ssm_alpha/beta` GEMMs are `[M=48, K=2560]` F32 and run on rocBLAS at **0.360 ms/call

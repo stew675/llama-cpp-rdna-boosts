@@ -29,21 +29,22 @@ then `README.md` (the running record) beside it.
 > every MMB dense prefill GEMM "wants a BF16 copy", and the fused `rms_norm+mul`, `sigmoid+mul`,
 > `scale+unary` and generic unary producers all emit it — so the whole `mmb_cvt` bucket is gone
 > (only the `ple_embd` model tensor still converts), **bit-identical** (PPL unchanged, greedy text
-> unchanged, all gates green), for **pp8192 951.6 -> 963.7 (+1.3 %), pp2048 977.1 -> 996.7 (+2.0 %)**;
+> unchanged, all gates green), and **session 11 skipped the dead F32 stores** (+2.3 % / +3.3 %), for
+> **pp8192 952.4 -> 974.0, pp2048 975.3 -> 1007.4**;
 > the same session also found and fixed a **delivery** bug (see the session-9 UPDATE).
 
 **Current state (start here):**
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`d6b803e70`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`af2f70580`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0021` + `commits.txt`, in this repo, pushed to `origin/main` |
-| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (21 commits) |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0022` + `commits.txt`, in this repo, pushed to `origin/main` |
+| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (22 commits) |
 | build | §3 | run | §4 |
-| current numbers | the **session 9 UPDATE below** (the full bf16-producer port: the `mmb_cvt` bucket eliminated, +1.3 %/+2.0 % pp8192/pp2048, bit-identical) and the **delivery `GGML_OP_NAME` fix**; then sessions 8/7/6 |
+| current numbers | the **session 11 UPDATE below** (the full bf16-producer port with the dead-F32-store skip, +2.3 %/+3.3 % pp8192/pp2048) and the **delivery `GGML_OP_NAME` fix**; sessions 10/9/8 |
 
-**Order the UPDATE sections by session: 10 (newest, 2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
+**Order the UPDATE sections by session: 11 (newest, 2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body and are correct except where
 an UPDATE says otherwise.
@@ -84,6 +85,41 @@ an UPDATE says otherwise.
 7. **Promotion**: every §11 gate now passes (see 5c/5d).  What remains is the rebase onto a canonical
    fork at `ebbb18522` + `scripts/apply-all.sh`, regenerating `patches/`, and deciding whether MMB
    rides as a block-08 amendment.  Given 1-2 are exhausted, this is now the highest-value step.
+
+---
+
+## UPDATE — session 11 (2026-09-20): the producer port's dead-F32-store skip — +2.3 % pp8192 /
+## +3.3 % pp2048, still bit-identical
+
+Session 9's producers wrote the F32 output **and** the BF16 slot copy.  A `rocprofv3` before/after shows
+that of the 650 ms of `mmb_cvt` eliminated, only ~489 ms was net: the producers paid ~161 ms in extra
+BF16 stores, and `rms_norm` in particular grew 1053 -> 1168 ms.  But for several activations the F32
+output is **dead** — every consumer reads the BF16 copy through the MMB activation cache — so the F32
+store is pure waste.
+
+The graph optimizer now classifies each MMB dense GEMM activation's consumers: if every one (through
+views/reshapes) is a quantized/bf16 `MUL_MAT` or `MUL_MAT_ID` (i.e. reads the BF16 cache), the
+activation is marked **BF16-only** and the producer skips its F32 store; otherwise it keeps the old
+"F32 + BF16 copy" behaviour.  The five producer kernels (`rms_norm+mul`, `sigmoid/silu+mul`,
+`scale+unary`, generic unary, `dsv4_hc_pre`) each gained a `store_f32` flag.
+
+It is **bit-identical** — the GEMM still reads the same BF16 value and nothing else read the F32
+output: PPL c2048 stays 10.6428, greedy `9930c674a6ca` unchanged, the `W = 1..8` probe is pure,
+`FLASH_ATTN_QSA` / `GATED_DELTA_NET` pass.
+
+Measured (gfx1151, IQ4_XS Flash-Next, bf16 KV, `-b/-ub 2048`, `GGML_CUDA_MMB=1 GGML_CUDA_QSA3=1`):
+
+| config | pp2048 | pp8192 |
+|---|---:|---:|
+| `HC16=0` | 975.3 | 952.4 |
+| `HC16=1` (session 9, always-emit) | ~994 | ~966 |
+| `HC16=1` (this session, dead-store skip) | **1007.4** | **974.0** |
+
+The `unary_gated` producer drops 302 -> 229 ms; `xn` stays on the copy path (`dsv4_hc_pre` src[0] and
+the tiny-M inject still read F32), so `rms_norm` is unchanged.  **Next lever here:** give those two
+consumers a BF16 arm and `xn` could go BF16-only too — `rms_norm` is 1168 ms and would drop ~30 %,
+but it is a numerics change on the main hidden stream (the same class as the gate BF16), so it wants
+the PPL gate.
 
 ---
 
@@ -1296,6 +1332,12 @@ the drifted working tree.
 * `LLAMA_MMB_CVT_LOG=1`: all 57 `hc_norm` conversions disappear with `HC16=1`.
 * Combined backup `mmb-general.patch` + `patches/0001..0019`: `git apply --check` clean on a fresh
   `8a2567e1e` (19 commits).
+
+**Session 11 (the dead-F32-store skip):**
+
+* `GGML_CUDA_MMB_HC16=1` vs `0`, gfx1151 IQ4_XS Flash-Next bf16 KV, `-b/-ub 2048`: pp8192
+  952.4 -> 974.0 (+2.3 %), pp2048 975.3 -> 1007.4 (+3.3 %); the `unary_gated` producer 302 -> 229 ms.
+* Bit-identical: PPL c2048 10.6428, greedy `9930c674a6ca`, width probe pure, FA/QSA/GDN ops pass.
 
 **Session 9 (the full bf16-producer port):**
 
