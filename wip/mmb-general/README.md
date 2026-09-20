@@ -152,6 +152,11 @@ the kernel is not DRAM-bound; the `<256>` loss is the unrolled predicated loop a
 iterations vs the dynamic loop's `ceil(ncols/block_size)`.  Do not retry (a shape-exact 2/3/4 dispatch
 could recover the loss, but the ceiling is ~1 % of one 3.5 % kernel).  The tree stays at `2da50418d`.
 
+**Next session's mandate: the MMB restructure** (the MMB weight GEMMs are **61.8 % of pp8192** on the
+target model).  A self-contained brief — code map, geometry/LDS budget, the 2-stage pipeline and where
+the dequant stalls, the dispatch chain, the measured per-kernel profile, the closed levers, the
+restructure candidates, the iteration loop and gates — is in **`HANDOVER.md` §F "MMB restructure"**.
+
 ---
 
 ## UPDATE — session 19 (2026-09-20): indexer histogram atomics per cell → per block (pass 1) and

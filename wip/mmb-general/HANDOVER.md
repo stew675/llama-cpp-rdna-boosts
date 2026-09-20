@@ -54,9 +54,11 @@ base (`benchmarks/2026-09-20-qwen4exp-iq4xs-prefill-wip-vs-base.md`).  All §11 
 **What remains is the prioritized list below**; the detailed sections further down (the indexer shapes,
 the per-kernel numbers, the measurement budget) are the reference for it.
 
-**Remaining work (prioritized — the whole list as of session 19):**
+**Remaining work (prioritized — the whole list as of session 20).**  **The next session's mandate is
+item F (the MMB restructure)** — it is now the largest lever by far (61.8 % of pp8192), and the
+indexer/polish items below are all at their practical floor.
 
-* **A. Indexer (the active lever).**
+* **A. Indexer (at its practical floor; the active lever is now F).**
   1. **Block-level gather/emit — the one real remaining optimisation.**  The gather is still
      cell-level (`indexer_topk_write_blocks_grouped`, **259 ms at 32K = 23 % of the family**); emitting
      each selected block's cells directly would take it to ~60 ms (~1.2x on the family).  Blocked on
@@ -87,19 +89,22 @@ the per-kernel numbers, the measurement budget) are the reference for it.
   GGUF loader, so it needs a load-time bf16 copy) -- now measured at **0.8 ms** per the session-11
   trace, i.e. not worth the loader change; `dsv4_hc`'s `mixed` as BF16-only would save ~21 MB/
   call but changes the GDN recurrence and MoE-routing numerics (deliberately out of scope).
-* **F. MMB structural (the only large lever left).**  The MMB family is ~48 % of prefill.  Session 6
-  closed the tuning (tiles/BN/VDR/shadow are washes or worse) and the kernel is already
-  software-pipelined (`load_regs(ks+1)` / `store_lds(ks+1)` around the WMMA loop, session-19
-  re-read).  The remaining gap is dequant-issue contention with WMMA issue (dense ~54 % of the bf16
-  WMMA peak, GLU ~36 %, which pays the dequant twice).  Closing it needs a real restructure (e.g. a
-  warp-specialised dequant producer), not a knob -- large and risky, and the win upper bound is a few
-  percent.
 * **D. Delivery items to fold in at promotion (block 14).**  `GGML_OP_INDEXER_FILL` is missing from
   `GGML_OP_NAME` (one line; already fixed in the WIP by `d1463bff3`); and the new **`blk_cells`
   `src[7]`** on `GGML_OP_INDEXER_TOPK` (the session-18 interface change).
 * **E. Promotion (maintainer-gated).**  Rebase onto a canonical fork rebuilt at `ebbb18522` +
   `scripts/apply-all.sh`, regenerate `patches/` + `release.json`, and decide whether MMB rides as a
   **block-08 amendment**.  Every gate passes; it needs the maintainer's go-ahead + a beta window.
+* **F. MMB structural (the next session's mandate -- the only large lever left).**  The MMB weight
+  GEMMs are **61.8 % of pp8192** on the target model (measured, session-20 profile), more than
+  everything else combined.  Session 6 closed the tuning (tiles/BN/VDR/shadow are washes or worse)
+  and the kernel is already software-pipelined (`load_regs(ks+1)` / `store_lds(ks+1)` around the
+  WMMA loop, session-19 re-read), but **the dequant runs on the same warps between the WMMA
+  phases** -- it is not overlapped with WMMA.  The remaining gap is that dequant-issue contention
+  (dense ~54 % of the bf16 WMMA peak, GLU ~36 %, which pays the dequant twice).  Closing it needs a
+  real restructure (a warp-specialised dequant producer + a multi-stage LDS ring), not a knob --
+  large and risky, upper bound a few percent of e2e.  **See the full brief in `### F. MMB
+  restructure` below.**
 
 **Progress (sessions 16-19):** the indexer is now **~2.2x faster** and still bit-identical.  Session 16
 removed the full-width count pass (the gather's per-block greater/equal counts are derived from the
@@ -125,7 +130,7 @@ levers are the 3 block passes (472 ms at 32K, key-bound), the gather (259 ms) an
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
 | backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0032` + `commits.txt` (32 commits), on branch **`wip-mmb-general`** (cut from `main` at `1c2ec00`), pushed to `origin/wip-mmb-general`; `git apply --check` verified on a fresh `8a2567e1e` |
 | target model | `/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf` (94 GiB; the only qwen4exp with HC + QSA) |
-| fast iteration model | `Qwen3.6-35B-A3B-Q4_K_M` (21 GiB, `qwen35moe`; **no** HC/QSA — use it only for `mmb_*` shapes) |
+| fast iteration model | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf` (21 GiB, `qwen35moe`; **no** HC/QSA — use it for `mmb_*` shapes) |
 | reference | `~/pwilkin-llama-cpp` @ `f5daaa3cf` (branch `strix-halo`) |
 | runtime | `export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH` |
 
@@ -305,6 +310,170 @@ is not a candidate (reads `x` twice).
 2. **`blk_cells` `src[7]` on `GGML_OP_INDEXER_TOPK`** (session 18) -- the block-level histogram path
    needs it; it must fold into block 14 at promotion (the `ggml_indexer_top_k` signature in
    `ggml/include/ggml.h`/`ggml/src/ggml.c`, and the call in `src/models/qwen4exp.cpp`).
+
+### F. MMB restructure — the brief (prepared session 20, for a fresh session)
+
+**Why.**  On the target model the MMB weight GEMMs are **61.8 % of pp8192** (9587 of 15508 ms,
+measured session 20) — more than all the non-MMB prefill work combined.  (The older "~52 %" figure is
+the same absolute MMB time against a larger denominator: qsa3 cut `flash_attn_qsa` from 16.6 % to
+5.3 %, so MMB's *share* rose.)  Session 6 closed every cheap lever and the only remaining candidate is
+a **structural** change to how the dequant and the WMMA share the warps.  This section is the
+self-contained start-up for that work; read it with the session-6 UPDATE (the ceiling measurements)
+and §5-§6 (the per-model tables + env knobs).
+
+#### Where the code is
+
+| path | what |
+|---|---|
+| `ggml/src/ggml-cuda/mmb.cu` (1586 lines) | everything: dequant helpers, tiles, kernels, host dispatch, shadow |
+| `ggml/src/ggml-cuda/mmb.cuh` | API: `ggml_cuda_mul_mat_mmb` / `_id` / `_id_mmb_glu`, the `ggml_cuda_mmb_supported_*` predicates, the bf16 activation-cache + producer-slot API, `ggml_cuda_mmb_dense_will_take` / `_routed_will_take` |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | the op hooks (MUL_MAT / MUL_MAT_ID call the MMB path when a support predicate passes) and the graph-optimizer hooks (the fusion stand-down + the activation bf16 marking pass) |
+| `tools/wmma-peak-gfx1151.cpp` | the peak microbenchmark (`hipcc --offload-arch=gfx1151 -O3`): **27.6 T-MAC/s bf16, 27.5 int8**, and the Q8_0-epilogue rows |
+
+#### Geometry, tiles and the pipeline
+
+Constants (`mmb.cu:15`): `MMB_BK = 64`, `MMB_NT = 256` (8 warps), `MMB_LDS_STRIDE = 72`.
+Per-block LDS is `As[BM*72] + Bs[BN*72]` uint16 (RDNA3 CU LDS budget 64 KB): dense `128x128` = 36 KB,
+dense `128x256` = 54 KB, routed-GLU `64x128` = 27 KB, tall `384x64` = **63 KB** (at the limit — the
+tall tile has no room for another stage).
+
+`mmb_tile_gemm` (`mmb.cu:405`; the GLU twin `mmb_tile_gemm_glu:640`) is the core:
+
+* one WMMA tile per block: `TM = WTM/16` x `TN = WTN/16` bf16 accumulators per warp; 8 warps split
+  `WAVES_M = BM/WTM` row-groups x `WTN/16` column-groups;
+* K is walked in `MMB_BK = 64` steps; the software pipeline is **2-stage**: `load_regs(ks+1)`
+  (weights -> registers) overlaps the WMMA of `ks`, and after the WMMA `store_lds(ks+1)` dequants
+  the next weights into LDS.  **The dequant runs on the same warps, between the WMMA phases** — it
+  is *not* overlapped with WMMA.  That is the gap;
+* `__launch_bounds__(MMB_NT, 2)`;
+* the A-side dequant: `WTYPE 0/1/3/4` load the quant fields into registers first, `WTYPE 5..10`
+  (IQ3_S/Q5_K/Q6_K/IQ4_XS/Q3_K/IQ3_XXS) read `Wbase` directly in `store_lds`; helpers `mmb_dq_row*`
+  (`mmb.cu:54-400`), one 64-value row per thread -> 64 bf16.
+
+The tile selections (host side): dense `big ? <128,256,64,64> : <128,128,32,64>`; routed
+`<128,128,32,64>` / `<128,32,32,16>`; fused GLU `<64,128,32,32>` / `<64,32,16,16>`; tall (IQ4_NL HC
+down/inject only) `<384,64,96,32>` / `<384,32,96,16>`; F32 `mmb_f32split_kernel<128,128,32,64>` and
+the tiny-M `mmb_tiny_m_f32_kernel<MMAX,TT,XBF16>`.
+
+`WTYPE` is the last kernel template arg (the type switch inside `mmb_tile_gemm` / `load_regs` /
+`store_lds`); the row byte width is `wrow_bytes`:
+
+| WTYPE | ggml type | bytes / row unit | notes |
+|---:|---|---|---|
+| 0 | IQ4_NL | `(K/32)*18` | fused `mmb_dq_row36` |
+| 1 | Q8_0 | `(K/32)*34` | fused `mmb_dq_row68` |
+| 2 | BF16 | `K*2` | direct, no dequant (shadow / native bf16) |
+| 3 | Q4_K | `(K/256)*144` | fused `mmb_dq_row_q4k` |
+| 4 | Q5_1 | `(K/32)*24` | fused `mmb_dq_row_q5_1` |
+| 5 | IQ3_S | `(K/256)*110` | `store_lds` reads `Wbase` |
+| 6 | Q5_K | `(K/256)*176` | `store_lds` reads `Wbase` |
+| 7 | Q6_K | `(K/256)*210` | `store_lds` reads `Wbase` |
+| 8 | IQ4_XS | `(K/256)*136` | `store_lds` reads `Wbase` |
+| 9 | Q3_K | `(K/256)*110` | `store_lds` reads `Wbase` |
+| 10 | IQ3_XXS | `(K/256)*98` | routed only (its fused GLU is default-off) |
+
+The target model (UD-IQ4_XS) is **IQ4_NL 52 % + IQ3_S 36 % + Q8_0 9.5 %** (the filename misleads —
+the IQ4_XS type is ~1 %).  The fast 35B Q4_K_M is **Q4_K** expert + Q8_0 dense.
+
+#### The dispatch chain
+
+1. `ggml_cuda_mmb_supported_mm` (`:1198`) / `_supported_mmid` (`:1244`) / `_supported_glu` (`:1471`)
+   gate by type/shape/contiguity, `T >= mmb_min_t()` (512, so prefill only) and `K % 64` (or `%256`
+   for the k-quants); routed additionally needs `n_used <= 64` and `(T*n_used)>>16 < 1024`.
+2. `ggml_cuda_mul_mat_mmb` (`:1252`): F32 (`mmb_f32split_kernel` / `mmb_tiny_m_f32_kernel`), the
+   tall IQ4_NL tile, the shadow path, then `mmb_dense_kernel<...>` per weight type.
+3. `ggml_cuda_mul_mat_id_mmb` (`:1440`) + `mmb_routed_kernel_dispatch` (`:1418`): per-expert grouping
+   via `ggml_cuda_launch_mm_ids_helper` + `mmb_build_desc2` (`:946`; two classes — `>=THRESH=128`
+   rows -> `128x128,32,64`, else `128x32,32,16`).
+4. `ggml_cuda_mul_mat_id_mmb_glu` (`:1521`) + `mmb_routed_glu_kernel_dispatch` (`:1484`): the fused
+   gate+up+SWIGLU.  **This is the #1 kernel.**
+5. `mmb_bf16_activation` (`:999`): the activation is converted F32->bf16 **once** per (tensor, n)
+   into a pool cache and reused; the old `mmb_cvt` pass is gone (sessions 8-12).  Do not re-add it.
+
+#### The measured profile (gfx1151, target model, bf16 KV, ub 2048, pp8192; grand 15508 ms)
+
+| kernel | ms | share | calls | tiles |
+|---|---:|---:|---:|---|
+| `mmb_routed_glu_kernel` | 3863.9 | **24.9 %** | 752 | `64x32,16,16` (2137) + `64x128,32,32` (1655) |
+| `mmb_dense_kernel` | 3622.1 | **23.4 %** | 3728 | `128x128,32,64` (1958) + `128x256,64,64` (1640) |
+| `mmb_routed_kernel` | 1270.7 | 8.2 % | 752 | `128x128,32,64` (603) + `128x32,32,16` (526) |
+| `mmb_tiny_m_f32_kernel` | 445.4 | 2.9 % | 1136 | tiny-M F32 (hc inject M=4, M=8) |
+| `mmb_f32split_kernel` | 381.2 | 2.5 % | 472 | F32 `128x128,32,64` (MoE router M=512) |
+| **MMB family** | **9587** | **61.8 %** | | |
+
+On the fast 35B Q4_K_M model the same family is ~49-52 % of pp8192 (session 6), so **use the 35B for
+dense/GLU-tile iteration and the target model only when the change is IQ4_XS/IQ3_S/HC-specific.**
+Dense grids seen: `blockIdx.x = M/128` (M = 128, 512, 640, 2560, 6144, 10240, 12288 ...); the GLU uses
+`blockIdx.x = M/64`.  `rocprofv3` reports `Grid_Size_X = blocks.x * 256` (divide before matching).
+
+#### The ceiling, and what is already closed
+
+Dense **54 %** of the 27.6 T-MAC/s bf16 WMMA peak; fused GLU **~36 %** (it dequants gate and up
+separately).  The loss is dequant-issue contention on the SIMD lanes, **not**:
+
+* weight bandwidth — a bf16 shadow is **2.44x slower** (the 1-byte format's L2 residency is a
+  feature; session 6);
+* int8 — gfx1151 int8 == bf16 WMMA rate, and the Q8_0 epilogue makes int8 *slower* (session 6, and
+  the `tools/wmma-peak-gfx1151.cpp` rows);
+* tile/BN/VDR/`MMB_CACHE` knobs — all washes or worse (session 6 table);
+* split-K — the dense kernel is already grid-rich (1024+ blocks).
+
+#### The restructure candidates, in order
+
+1. **Warp-specialised dequant + LDS ring (the session-6 "one remaining candidate").**  Split the 8
+   warps into producers (dequant -> LDS) and consumers (WMMA), with a multi-stage ring of
+   `MMB_BK`-wide `As`/`Bs` tiles so the producers stay ahead of the consumers.  Budget check: a
+   2-deep `A` ring + 1-deep `B` for the dense `128x128` tile is `2*128*72*2 + 1*128*72*2 = 54 KB`
+   (fits); a 3-deep ring needs 72 KB (does not), and dense `128x256` (2-deep A + 1-deep B = 72 KB)
+   and tall `384x64` (63 KB already) do **not** fit.  Start on the **dense `128x128`** and the
+   **GLU `64x128`** tiles only.
+2. **Share the GLU dequant.**  The fused GLU walks the gate and up weights separately; if both were
+   dequanted in one row step (a wider `mmb_dq_row` writing `Ag` and `Au`) or the two weights were
+   interleaved at load time, the issue + index arithmetic would be shared.  Requires either a load-
+   time repack (like the shadow) or accepting the two buffers as-is (then only the loop/index work is
+   saved — a smaller win).
+3. **Cheaper diagnostic first (recommended before any rewrite):** time the existing `128x128` dense
+   kernel with the dequant **replaced by a constant** (throwaway, wrong output) — if it does not
+   speed up ~proportionally to the 54 %-of-peak gap, the stall is elsewhere (LDS bank conflicts,
+   `__syncthreads` count, or occupancy) and the ring will not pay.
+4. The activation side is already optimal (`mmb_bf16_activation` caches the bf16 conversion once);
+   the F32 path and tiny-M are separate kernels with their own ceilings (sessions 5/10/12 at the
+   `F32SPLIT` comment).
+
+#### Iteration loop and gates
+
+```sh
+cd ~/llama-wip-mmb && cmake --build build-rocm -j16 --target llama-bench llama-perplexity llama-cli
+M35=/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf   # fast model
+GGML_CUDA_MMB=1 ./build-rocm/bin/llama-bench -m "$M35" -ngl 99 -fa 1 -b 2048 -ub 2048 -p 8192,2048 -n 0 -r 2
+# kernel-level judge (t/s is too noisy for a few-percent kernel change):
+export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH
+rm -rf /tmp/prof && mkdir -p /tmp/prof && GGML_CUDA_MMB=1 \
+  /opt/rocm-7.14-gfx1151/bin/rocprofv3 --kernel-trace -f csv -d /tmp/prof -o k -- \
+  ./build-rocm/bin/llama-bench -m "$M35" -ngl 99 -fa 1 -b 2048 -ub 2048 -p 8192 -n 0 -r 1
+# aggregate (Kernel_Name -> sum ms / calls; Grid_Size_X is blocks.x*256, divide it):
+python3 -c 'import csv,collections;t=collections.Counter();c=collections.Counter();g=0
+for r in csv.DictReader(open("/tmp/prof/k_kernel_trace.csv")):
+ if r["Kind"]=="KERNEL_DISPATCH":
+  n=r["Kernel_Name"];s=int(r["Start_Timestamp"]);e=int(r["End_Timestamp"]);d=(e-s)/1e6;t[n]+=d;c[n]+=1;g+=d
+print(f"grand {g:.0f} ms");[print(f"{v:9.1f} {100*v/g:5.2f}% {c[k]:6d} {k[:80]}") for k,v in t.most_common(20)]'
+```
+
+* **Confirm the MMB gate from the kernel names in the trace** — under `rocprofv3` an env-gated path
+  can read as unset (the `rocprofiler-register` race, session-15 caveat).
+* A restructure that changes only the *order* of the dequant cannot change the arithmetic: the WMMA
+  inputs are the same bf16 values, so the output is **bit-identical** and PPL/greedy must not move.
+  A changed *tile/summation* order is a numerics change and re-baselines PPL (bar ~±0.68 at c2048).
+* Gates: PPL c2048 **10.6015**, greedy **`9c281c415082`**, `test-logits-width-probe` **PASS**; the
+  `W=1..8` decode/verify band is untouched (`mmb_min_t()=512`), but keep the `mmb_supported_*` shape
+  guards consistent if the tile dispatch changes.
+
+#### Reference
+
+`~/pwilkin-llama-cpp` @ `f5daaa3cf` (branch `strix-halo`), `ggml/src/ggml-cuda/mmb.cu` (881 lines) is
+the origin of the tile design — and it has the **same** tiles and **no** warp-specialised pipeline
+(everything is already ported, incl. `mmb_tall`), so **there is nothing to port; this restructure is
+ours to design.**
 
 ### 4. Promotion (maintainer-gated)
 Every §11 gate passes.  Rebase onto a canonical fork rebuilt at `ebbb18522` + `scripts/apply-all.sh`,
