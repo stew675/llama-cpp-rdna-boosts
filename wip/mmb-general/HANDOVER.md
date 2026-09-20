@@ -43,24 +43,44 @@ The test models come from `test-llama-archs -o <dir>` (~200 tiny GGUF architectu
 
 All with `GGML_CUDA_MMB=1 GGML_CUDA_QSA3=1`.
 
-**`plain != draft-mtp` greedy text on qwen4exp — PRE-EXISTING, not this work.**  That is the delivery's
-open *cause 3*, and it needs to be stated carefully because the obvious check is misleading:
+**`plain == draft-mtp` greedy text on qwen4exp — PURE (byte-identical), gate PASSES.**
 
 | config | plain | draft-mtp | verdict |
 |---|---|---|---|
-| `MMB=1 QSA3=1` | 320 chars | 1942 chars | diverge at char **260** |
-| `MMB=0 QSA3=0` (features OFF) | 318 chars | 1964 chars | diverge at char **262** |
+| `MMB=1 QSA3=1` | `bbd4bcb519e4` | `bbd4bcb519e4` | **identical** (1700 chars) |
+| `MMB=0 QSA3=0` (features OFF) | `5120b28f2879` | `5120b28f2879` | **identical** (1720 chars) |
 
-The divergence reproduces with the features **off**, and its onset moves by 2 chars — so MMB/QSA3
-neither cause it nor change its amplitude.  (`LLAMA_QSA_OFF=1`, the documented workaround, **crashes**
-with `-md` here: `llama_server exited with code 1`, deterministically, on both modes — so it could not
-be used to demonstrate the dense reference.)
+The hashes differ *between* the two configs and that is the approved **prefill re-baseline** (MMB and
+QSA3 change prefill numerics by design) — but *within* each config the plain and `draft-mtp` arms are
+byte-identical, which is the purity contract.  This also supplies two of the re-baseline hashes that
+were previously missing from the record.
 
-**Two traps recorded for the next session:**
+### METHODOLOGY TRAP — this result was reported WRONG first, and how
 
-1. The first run of the purity matrix reported `LLAMA_QSA_OFF=1 … PURE`, but **both hashes were the
-   md5 of the empty string** — that run had failed to start.  A "pure" verdict where the two sides are
-   empty is not a pass; always check the output is non-empty before comparing.
+The first attempt concluded "`plain != draft-mtp`, pre-existing cause 3" from `320 chars vs 1942
+chars`.  That was **entirely an artifact**:
+
+* the **plain arm must not be given `-md`**.  Passing the draft model makes llama-cli initialise an
+  MTP context even with `--spec-type none`, and it dies with `failed to initialize the context: this
+  model is an MTP draft head without a trunk` -> `llama_server exited with code 1`, **exit status 1**;
+* the failed run's stdout still contained the `Loading model... |\b-\b\\...` **spinner**, and the
+  `grep -v '^\[' | tr -d '\b'` filter I used turned that spinner into exactly 320/318 "chars" — so I
+  was hashing **a spinner against real text**;
+* the 1942-char `draft-mtp` side was genuine; the 320-char side never generated a token.
+
+Two rules out of it:
+
+1. **Never pass `-md` to the plain arm** of a spec purity comparison.  Run the target model alone.
+2. **Assert the arm actually generated something** before comparing — check `$?` and that the output
+   is neither empty nor the spinner.  A comparison where one side is a load-failure artifact will
+   always "diverge", and it looks exactly like a real near-tie flip.
+
+### Other traps
+
+1. The first purity matrix printed `LLAMA_QSA_OFF=1 ... PURE` where **both hashes were md5 of the
+   empty string** — that run had failed to start.  A "pure" verdict where the two sides are empty is
+   not a pass; always check the output is non-empty before comparing.  (`LLAMA_QSA_OFF=1` itself is
+   genuinely unusable with `-md` here — `llama_server exited with code 1`, deterministic.)
 2. `FLASH_ATTN_QSA` is now **22/22**, not the 18/18 in the older notes (cases were added);
    `GATED_DELTA_NET` is 46/46 as expected.
 
@@ -651,12 +671,11 @@ the drifted working tree.
 * Greedy text coherent on a >2051-token prompt; the prefill re-baseline is expected and approved.
 * Combined patch `git apply --check` clean on a fresh `8a2567e1e` worktree (re-verified at session 4).
 
-**Still NOT run (blocking promotion, see §11):** the `W = 1..8` logits matrix with MMB on==off.
-Everything else on the §11 list was run in session 5c and passed — see that UPDATE at the top
-(recurrent-state x4, FLASH_ATTN_QSA 22/22, GATED_DELTA_NET 46/46, FLASH_ATTN_EXT OK; the qwen4exp
-`plain != draft-mtp` divergence is pre-existing cause 3, reproduced with the features off).  A
-same-seed **prefill re-baseline hash** also still needs writing down: MMB and QSA3 both change prefill
-numerics by design, so the approval covers it but the record does not exist yet.
+**Still NOT run (blocking promotion, see §11):** the `W = 1..8` logits matrix with MMB on==off — it
+needs a probe harness that does not exist in the tree, and it is guaranteed by construction (`T >= 512`
+keeps MMB out of the whole `W <= 8` band).  Everything else on the §11 list now passes; see the
+session-5c UPDATE at the top.  Two prefill re-baseline hashes are recorded there
+(`bbd4bcb519e4` with MMB+QSA3, `5120b28f2879` without).
 
 ---
 

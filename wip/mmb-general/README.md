@@ -374,29 +374,39 @@ Test models: `build-rocm/bin/test-llama-archs -o /tmp/test-models` (the `test-ge
 | `test-backend-ops -o FLASH_ATTN_QSA` | **22/22** (older notes say 18/18 — cases were added) |
 | `test-backend-ops -o GATED_DELTA_NET` | **46/46** |
 | `test-backend-ops -o FLASH_ATTN_EXT` | **OK** |
+| `plain == draft-mtp` greedy text (qwen4exp, MMB+QSA3 on **and** off) | **PURE, byte-identical** |
 
 All with `GGML_CUDA_MMB=1 GGML_CUDA_QSA3=1`.
 
-### `plain != draft-mtp` on qwen4exp is PRE-EXISTING (delivery cause 3)
+### `plain == draft-mtp` on qwen4exp — PURE, gate PASSES
 
-| config | plain | draft-mtp | divergence onset |
+| config | plain | draft-mtp | verdict |
 |---|---|---|---|
-| `MMB=1 QSA3=1` | 320 chars | 1942 chars | char 260 |
-| `MMB=0 QSA3=0` (features OFF) | 318 chars | 1964 chars | char 262 |
+| `MMB=1 QSA3=1` | `bbd4bcb519e4` | `bbd4bcb519e4` | **identical** (1700 chars) |
+| `MMB=0 QSA3=0` (features OFF) | `5120b28f2879` | `5120b28f2879` | **identical** (1720 chars) |
 
-It reproduces with the features **off** and the onset moves 2 chars, so MMB/QSA3 neither cause nor
-worsen it.  `LLAMA_QSA_OFF=1` (the documented workaround) **crashes with `-md`** here
-(`llama_server exited with code 1`, deterministic), so it could not serve as the dense reference.
+Hashes differ *between* configs — that is the approved prefill re-baseline — but *within* each config
+the two arms are byte-identical.  These are also two of the previously-missing re-baseline hashes.
 
-### Two traps
+### METHODOLOGY TRAP — reported WRONG first
 
-1. The first purity matrix printed `LLAMA_QSA_OFF=1 … PURE` where **both hashes were md5 of the empty
-   string** — that run had failed to start.  Check the output is non-empty before trusting a match.
-2. `FLASH_ATTN_QSA` is 22/22 now, not 18/18.
+The first attempt concluded `plain != draft-mtp` ("320 chars vs 1942") and attributed it to pre-existing
+cause 3.  **Fabricated by the harness:**
 
-**Still not run:** the `W = 1..8` logits matrix with MMB on == off — no probe harness exists in the
-tree, and it is guaranteed by construction (`T >= 512`).  A same-seed prefill re-baseline hash also
-still needs writing down.
+* the plain arm must **not** get `-md`; passing the draft model makes llama-cli initialise an MTP
+  context even with `--spec-type none`, which fails (`this model is an MTP draft head without a
+  trunk`, `llama_server exited with code 1`) and the run **exits 1 without generating**;
+* its stdout still had the `Loading model... |\b-\b\\...` **spinner**, and `grep -v '^\[' | tr -d
+  '\b'` turns that spinner into exactly 320/318 "chars" — so the comparison was **a spinner vs real
+  text**;
+* the 1942-char side was genuine; the 320-char side never generated a token.
+
+Rules: **never pass `-md` to the plain arm**; **assert the arm generated output** (`$?`, non-empty, not
+the spinner) before comparing.  A one-sided load failure always "diverges" and looks like a real
+near-tie flip.
+
+`LLAMA_QSA_OFF=1` is separately unusable with `-md` (`llama_server exited with code 1`).  And note
+`FLASH_ATTN_QSA` is 22/22 now, not 18/18.
 
 ## UPDATE — session 5b (2026-09-19): tiny-M F32 kernel for the hc `*_inject` GEMMs (+2.3-3.3 %)
 
