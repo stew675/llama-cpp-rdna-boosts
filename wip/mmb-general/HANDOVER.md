@@ -5,11 +5,22 @@ This document is the self-contained entry point for the next session.  Read it t
 then `README.md` (the running record) beside it.
 
 > **One-line summary.** A general prefill weight-GEMM on the tensor cores (dequant-to-bf16 → WMMA)
-> is now implemented for **every** weight type the delivery's models use, validated PPL-parity, and
+> is implemented for **every** weight type the delivery's models use, validated PPL-parity, and
 > measured at up to **+68 % pp2048 / +56 % pp8192** on the Flash-Next Q4_K_M.  **QSA v3 (packed-block
-> WMMA sparse attention) was then delivered in session 2/3**: the QSA attention went **2944 ms ->
-> 728.6 ms (4.04x)** and prefill is now **+8-12 %** on every KV type, PPL bit-identical.  The next
-> levers are the now-dominant `mmb_*` kernels.
+> WMMA sparse attention)** landed in sessions 2/3: the QSA attention went **2944 ms -> 728.6 ms
+> (4.04x)**, and session 4 made it the **default** at every context length.  The next lever is the
+> **indexer**, then a dedicated tiny-M F32 kernel, then the remaining `mmb_*` tuning.
+
+**Current state (start here):**
+
+| | |
+|---|---|
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`1d4dac09a`** |
+| base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0013` + `commits.txt`, in this repo, pushed to `origin/main` (`b78b96b`) |
+| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (13 commits, 9 files, +2190/-11) |
+| build | §3 | run | §4 |
+| current numbers | the session-4 UPDATE below (the §5/§7 tables predate the default flips) |
 
 ---
 
@@ -62,7 +73,8 @@ Two facts from getting there, so session 4 does not repeat the detour:
    or it reads the tensor before the producing kernel has run.  The first dump was garbage for
    exactly this reason.
 
-**Revised next-work order** (after session 3):
+**Revised next-work order** (after session 3 - **SUPERSEDED by the session-4 UPDATE above**; kept
+for history):
 
 1. The `mmb_*` kernels lead the profile (`mmb_f32split` 2164 ms, `mmb_routed_glu` 2085+1626,
    `mmb_dense` 1904+1606, `mmb_cvt_f32_bf16` 648) - see §9/§10 for the Q8_0 IU8 and bf16-producer ideas.
@@ -143,16 +155,29 @@ builtin, which gfx12 does not have — hence the RDNA3 gate and the portable wra
 
 ## 2. Where the code is / what changed
 
-Only **3 files** change:
+Two changesets in one WIP tree.
+
+**MMB** (session 1):
 
 | file | change |
 |---|---|
-| `ggml/src/ggml-cuda/mmb.cu` | new (+1381): the dequant row helpers, tile GEMM kernels, routed/GLU kernels, dispatch, predicates, shadow helpers |
-| `ggml/src/ggml-cuda/mmb.cuh` | new (+33): the exported API + `ggml_cuda_mmb_{dense,routed}_will_take` |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | ±39: MMB dispatch hooks in `ggml_cuda_mul_mat` / `_mul_mat_id` / `_glu`, and the **per-weight-type fusion stand-down** in the graph optimizer |
+| `ggml/src/ggml-cuda/mmb.cu` | new: the dequant row helpers, tile GEMM kernels, routed/GLU kernels, dispatch, predicates, shadow helpers |
+| `ggml/src/ggml-cuda/mmb.cuh` | new: the exported API + `ggml_cuda_mmb_{dense,routed}_will_take` |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | MMB dispatch hooks in `ggml_cuda_mul_mat` / `_mul_mat_id` / `_glu`, and the **per-weight-type fusion stand-down** in the graph optimizer |
 
-`mmb.cu` is picked up automatically by the existing `file(GLOB … "*.cu")` in
-`ggml/src/ggml-cuda/CMakeLists.txt` (no CMake edit).
+**QSA v3 / qsa3** (sessions 2-4):
+
+| file | change |
+|---|---|
+| `ggml/src/ggml-cuda/fattn-qsa3.cu` | new (~540 lines): rows/merge/attn kernels, the bitmap sort, the support check + launcher |
+| `ggml/src/ggml-cuda/fattn-qsa.cu` / `.cuh` | qsa3 declarations + a short "prefer qsa3 when supported" hook in the VEC launcher |
+| `ggml/include/ggml.h` + `ggml/src/ggml.c` | `ggml_flash_attn_qsa_set_packed` (op `src[7]`/`src[8]`) |
+| `src/models/qwen4exp.cpp` | the pack helpers (`qsa_pack_{keys,values}_graph`, `qsa3_f16_cast`), the `GGML_CUDA_QSA3` gate, and the **`LLAMA_QSA_DENSE_SHORTCUT` default flip** |
+
+Digest: **9 files, +2190/-11 across 13 commits**.
+
+Both new `.cu` files are picked up by the existing `file(GLOB … "*.cu")`, but the glob is evaluated at
+**configure** time - adding `fattn-qsa3.cu` needs a one-off `cmake -S . -B build-rocm` re-run (see §3).
 
 ### WTYPE map (used throughout the file)
 
@@ -256,6 +281,10 @@ state swings prefill noticeably, and never run benches in parallel.
 
 ## 5. Measured results (gfx1151, ROCm 7.14, `-b/-ub 2048`, bf16 KV)
 
+> **These were taken before the 2026-09-19 default flips** (`GGML_CUDA_MMB_F32SPLIT` 2->0 and
+> `LLAMA_QSA_DENSE_SHORTCUT` ON->OFF).  The tables are still the right *method* and the MMB `off`
+> column is unaffected, but the `on` column moves a little; re-measure rather than copy.
+
 | model / test | MMB off | MMB on | PPL off → on |
 |---|---:|---:|---|
 | **Q4_K_M** pp2048 | 604.6 | **1015.2 (+68 %)** | — |
@@ -299,7 +328,9 @@ so these are small additions).
 
 ---
 
-## 6. Environment knobs (all in `mmb.cu`)
+## 6. Environment knobs
+
+MMB (`mmb.cu` / `mmb.cuh`):
 
 | env | default | meaning |
 |---|---|---|
@@ -309,15 +340,30 @@ so these are small additions).
 | `GGML_CUDA_MMB_GLU` | 1 | fused gate/up+swiglu arm |
 | `GGML_CUDA_MMB_IQ3XXS` | 0 | enable the (net-loss) fused GLU arm for IQ3_XXS |
 | `GGML_CUDA_MMB_BF16W` | 1 | BF16 dense weights via MMB |
-| `GGML_CUDA_MMB_F32SPLIT` | 2 | F32 dense via f16-hi/lo WMMA |
+| `GGML_CUDA_MMB_F32SPLIT` | **0** | F32 dense via f16-hi/lo WMMA.  **Flipped 2->0 on 2026-09-19**: the F32 weights are all tiny-M and rocBLAS measured faster (see the session-4 UPDATE); `=1` opts it back in |
 | `GGML_CUDA_MMB_TALL` | 2 | the tall-M tile class |
 | `GGML_CUDA_MMB_SHADOW` / `_SHADOW_MB` | 0 / 6144 | legacy bf16 shadow (Q6_K/IQ4_NL); not needed now |
 | `GGML_CUDA_MMB_TILE` | -1 | **diagnostic**: force narrow(0)/wide(1) tile |
 | `GGML_CUDA_MMB_LOG` | 0 | **diagnostic**: one-shot `MMB_DENSE` shape log |
 
+QSA / qsa3 (`fattn-qsa3.cu`, `src/models/qwen4exp.cpp`):
+
+| env | default | meaning |
+|---|---|---|
+| `GGML_CUDA_QSA3` | 0 | **the qsa3 gate** (the packed-block WMMA prefill path).  Session 4 put the *dense-startup* default in line with it, but qsa3 itself is still opt-in |
+| `LLAMA_QSA_DENSE_SHORTCUT` | **0** | **FLIPPED ON->OFF on 2026-09-19 = always QSA** (maintainer decision).  `=1` restores the dense arm (the `LLAMA_QSA_SPARSE_FA=0` cross-check) |
+| `LLAMA_QSA_DENSE_DECODE_UNTIL` | 65536 (gfx1151) | decode stays dense below this; independent of the above |
+| `LLAMA_QSA_SPARSE_FA` | on | `=0` = the dense masked reference path |
+| `GGML_CUDA_QSA3_DUMP` | (removed) | was a temporary idx-row dump; it is **gone from the tree** - re-add it if the sort/structure needs re-checking (the procedure is in `README.md`) |
+
 ---
 
 ## 7. Post-MMB profile + where the time now goes
+
+> **This is the SESSION-1 profile** (MMB landed, no qsa3, `F32SPLIT`/shortcut at their old defaults).
+> It is still the best *shape* inventory, but the ranking has moved - qsa3 took the QSA kernel from
+> 2944 -> 728.6 ms and session 4 turned the F32 path off.  **Current numbers: the session-4 UPDATE**
+> and the always-QSA section in `README.md`.
 
 Q4_K_M pp8192, `GGML_CUDA_MMB=1`, rocprofv3 kernel trace (**total 17.75 s**, was ~28 s off):
 
@@ -443,14 +489,29 @@ the drifted working tree.
 
 ---
 
-## 12. Verification already done this session
+## 12. Verification already done (cumulative; update this when the tree changes)
 
-* Combined patch `git apply --check` clean on a fresh `8a2567e1e` worktree.
+**Session 1 (MMB):**
+
 * gfx1151 build clean after every commit; `llama-bench` / `llama-perplexity` / `llama-cli` /
   `llama-server` all build.
-* **gfx1201 TU compiles verified** for `mmb.cu` **and** `fattn-qsa.cu` (extract the command from
-  `build-rocm/compile_commands.json`, swap `--offload-arch=gfx1151` → `gfx1201`).
 * PPL parity recorded for: Q4_K_M, IQ4_XS, UD-Q5_K_M, Q6_K, UD-Q3_K_M (table in §5).
+
+**Sessions 2-4 (qsa3 + the default flips):**
+
+* **gfx1151 always**; `fattn-qsa3.cu` also **TU-verified for gfx1201 and gfx1100** (extract the command
+  from `build-rocm/compile_commands.json`, swap `--offload-arch=gfx1151`; `mmb.cu` and `fattn-qsa.cu`
+  verified the same way in session 1).
+* `fattn-qsa3.cu` is **order-exact**: the bitmap sort reproduces the rank sort's output, proven by
+  PPL being **bit-identical** across the rewrite (c16384 3.3900, c32768 4.3353, q8_0 3.3879 pre-flip).
+* Post-flip PPL: c16384 bf16 **3.3821**, q8_0 **3.3861**, c32768 bf16 **4.3397**.
+* Decode unaffected by the always-QSA flip: tg64 shallow 25.80 -> 25.83.
+* Greedy text coherent on a >2051-token prompt; the prefill re-baseline is expected and approved.
+* Combined patch `git apply --check` clean on a fresh `8a2567e1e` worktree (re-verified at session 4).
+
+**Still NOT run (blocking promotion, see §11):** the `W = 1..8` logits matrix with MMB on==off, the MTP
+acceptance gate, `test-recurrent-state-rollback`, `test-backend-ops`, and the same-seed prefill
+re-baseline document.
 
 ---
 
