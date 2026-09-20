@@ -3289,10 +3289,27 @@ index 2ce34caf0..6956028f4 100644
          struct ggml_tensor * a,
          enum ggml_prec       prec) {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 874cf5bd5..d9ea2f17a 100644
+index 874cf5bd5..32dc271c0 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -1571,6 +1571,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -14,6 +14,16 @@
+ #include <unistd.h> // dup
+ #endif
+ 
++// qsa3 (the packed-block WMMA QSA prefill path) is gated at COMPILE TIME, not by an environment
++// variable, on purpose.  The rocprofiler-register shipped with ROCm 7.14 calls setenv() during
++// early init (publishing GLOG_* vars), which can reallocate the process environment under a
++// concurrent getenv() in the target application and intermittently make an env gate read as unset
++// (ROCm issue #10196; fixed upstream 2026-09-15 in rocm-systems PR #11620).  An env gate therefore
++// makes qsa3 profiling non-reproducible.  Build with -DLLAMA_QSA3_ENABLE=0 to compile it out.
++#ifndef LLAMA_QSA3_ENABLE
++#define LLAMA_QSA3_ENABLE 1
++#endif
++
+ // Upper bound of the decode/verify band served by the fused hyper-connection ops
+ // (ggml_cuda_op_hc_mix / _hc_combine, which assert the same bound - HC_FUSED_MAX_TOKENS
+ // in ggml-cuda/hc-mix.cu). A verify batch is --spec-draft-n-max + 1 tokens and the
+@@ -1571,6 +1581,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      return top_k;
  }
  
@@ -3340,7 +3357,7 @@ index 874cf5bd5..d9ea2f17a 100644
  // Dense GQA self-attention restricted to the cells that top_k names.
  // The mask build below copies the MLA sparse path in llm_graph_context::build_attn.
  ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
-@@ -1664,6 +1705,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1664,6 +1715,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
      ggml_tensor * q = q_cur;
      ggml_tensor * k = mctx_cur->get_k(ctx0, il);
      ggml_tensor * v = mctx_cur->get_v(ctx0, il);
@@ -3350,17 +3367,14 @@ index 874cf5bd5..d9ea2f17a 100644
      ggml_tensor * cur;
  
      if (qsa_sparse) {
-@@ -1679,6 +1723,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1679,6 +1733,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          // derives each cell's visibility from cell_vis/q_vis instead - see findings 2c
          cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f,
                  qsa_cell_vis, qsa_q_vis);
 +        // qsa3 (packed-block WMMA) needs the packed F16 layouts; it is prefill-only, so the whole
 +        // W=1..8 decode/verify band keeps the VEC kernel and width purity holds by construction.
-+        // Default OFF while it is validated - GGML_CUDA_QSA3=1 opts in.
-+        static const bool qsa3_pack = [] {
-+            const char * env = getenv("GGML_CUDA_QSA3");
-+            return env != nullptr && atoi(env) != 0;
-+        }();
++        // Compile-time gate (see LLAMA_QSA3_ENABLE at the top of this file, default 1).
++        constexpr bool qsa3_pack = LLAMA_QSA3_ENABLE != 0;
 +        if (qsa3_pack && n_stream == 1 && q_p->ne[1] >= 128 && k_raw->ne[0] == 256 && k_raw->ne[2] % 4 == 0 &&
 +            qwen4exp_qsa3_kv_type(k_raw->type)) {
 +            // The launcher packs these into the block layouts itself (one fused pass, session 7);
@@ -3373,7 +3387,7 @@ index 874cf5bd5..d9ea2f17a 100644
          ggml_flash_attn_qsa_set_prec(cur, GGML_PREC_F32);
          cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
          cb(cur, "kqv_out", il);
-@@ -1731,9 +1791,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -1731,9 +1798,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
          const int64_t r     = hparams.dsv4_compress_ratios[il];
          const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
          const int64_t width = (int64_t) hparams.indexer_top_k + r - 1;
@@ -3401,7 +3415,7 @@ index 874cf5bd5..d9ea2f17a 100644
          // cause. Root-caused 2026-09-08/09: llama-bench's sync-free decode pipeline x ggml-gallocr's
          // single-layout alloc-fallback doing an unconditional full-device sync on every dense/sparse
          // topology flip (record: benchmarks/2026-09-10-*-shortcut-fix.md).  NOTE (2026-09-06): the
-@@ -1741,14 +1816,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -1741,14 +1823,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
          // must grow) was UNSAFE across backends and has been reverted: a re-reserve re-points tensor
          // addresses while the previous ubatch's kernels may still be in flight on other GPUs
          // (cross-GPU race -> in-kernel spin / memory faults at multi-ubatch prefill, reproduced on

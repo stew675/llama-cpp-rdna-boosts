@@ -1,6 +1,6 @@
 # HANDOVER — general-purpose `mmb` (bf16/i8-WMMA dequant weight GEMM) + QSA/Q8_0 next steps
 
-**Date:** 2026-09-20 (sessions 1-14).  **Status:** ACTIVE WIP, not part of the delivery, and the
+**Date:** 2026-09-20 (sessions 1-15).  **Status:** ACTIVE WIP, not part of the delivery, and the
 code is **not** pushed to any llama.cpp fork.  This document is the self-contained entry point for
 the next session; the "FOR THE NEXT SESSION" brief below is the whole handoff, and the UPDATE
 sections after it are the dated history (newest first).  `README.md` is the running record and
@@ -10,19 +10,20 @@ sections after it are the dated history (newest first).  `README.md` is the runn
 
 ## FOR THE NEXT SESSION — start here
 
-**Mandate.** Continue the `wip/mmb-general` work.  The delivery-facing prefill work is essentially
-done (the bf16-producer port including the `xn` stream, the `dsv4_hc` non-temporal fix, the
-concat/moe non-temporal loads, the QSA v3 path, the F32 split, the tiny-M kernel; all §11 gates
-green).  What remains is the rest of the non-temporal sweep, the indexer, one delivery bug fix, and
-promotion.
+**Mandate.** Optimise the **indexer top-k** (`GGML_OP_INDEXER_TOPK`, the delivery's block-14 fused op) --
+it is the long-context lever (0.90 % of pp8192, **2.94 % of pp32768**, and it grows ~linearly with
+context, so it is the first thing that matters at 64K/128K).  The delivery-facing prefill work is
+essentially done (the bf16-producer port including the `xn` stream, the `dsv4_hc`/concat/moe/unary
+non-temporal wins, the QSA v3 path, the F32 split, the tiny-M kernel; all §11 gates green).  After the
+indexer, what remains is the tail of the non-temporal sweep, one delivery bug fix, and promotion.
 
 **Environment**
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`f2e3df704`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`43be72812`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0026` + `commits.txt` (26 commits), pushed to `origin/main`; `git apply --check` verified on a fresh `8a2567e1e` |
+| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0027` + `commits.txt` (27 commits), pushed to `origin/main`; `git apply --check` verified on a fresh `8a2567e1e` |
 | target model | `/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf` (94 GiB; the only qwen4exp with HC + QSA) |
 | fast iteration model | `Qwen3.6-35B-A3B-Q4_K_M` (21 GiB, `qwen35moe`; **no** HC/QSA — use it only for `mmb_*` shapes) |
 | reference | `~/pwilkin-llama-cpp` @ `f5daaa3cf` (branch `strix-halo`) |
@@ -35,14 +36,29 @@ cd ~/llama-wip-mmb && cmake --build build-rocm -j16 --target llama-bench llama-p
 # warm the page cache before every bench; never run benches in parallel
 M=/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
 for f in /llm/models/Qwen3.8/Flash-Next/IQ4_XS/*-0000*.gguf; do dd if=$f of=/dev/null bs=4M 2>/dev/null; done
-GGML_CUDA_MMB=1 GGML_CUDA_QSA3=1 GGML_CUDA_MMB_HC16=1 ./build-rocm/bin/llama-bench -m "$M" \
+GGML_CUDA_MMB=1 GGML_CUDA_MMB_HC16=1 ./build-rocm/bin/llama-bench -m "$M" \
   -ngl 99 -fa 1 -ctk bf16 -ctv bf16 -b 2048 -ub 2048 -p 8192,2048 -n 0 -r 2
 ```
 
-Knobs: `GGML_CUDA_MMB=1` = the base MMB gate, `GGML_CUDA_QSA3=1` = the QSA v3 prefill path,
-`GGML_CUDA_MMB_HC16=1` = the bf16-producer port (all added by this WIP; the committed delivery runs
-with them off).  `LLAMA_MMB_CVT_LOG=1` lists the activation conversions, `GGML_CUDA_MMB_LOG=1` the
+Knobs: `GGML_CUDA_MMB=1` = the base MMB gate, `GGML_CUDA_MMB_HC16=1` = the bf16-producer port (both
+added by this WIP; the committed delivery runs with them off).  **The QSA v3 path is now a
+COMPILE-TIME gate** (`LLAMA_QSA3_ENABLE`, default 1) -- see the profiling caveat below; `-DLLAMA_QSA3_ENABLE=0`
+compiles it out.  `LLAMA_MMB_CVT_LOG=1` lists the activation conversions, `GGML_CUDA_MMB_LOG=1` the
 MMB dense shapes.
+
+> **PROFILING CAVEAT (session 15) -- read before trusting any `rocprofv3` profile.**  The
+> `rocprofiler-register` shipped with ROCm 7.14 (`librocprofiler-register.so.0.6.0`, built Jul 9)
+> calls `setenv()` with `GLOG_*` variables during early init.  That can reallocate the process
+> environment under a concurrent `getenv()` in the target app and intermittently make an env gate
+> read as **unset**.  Measured: with `GGML_CUDA_QSA3=1`, 15 pp8192 profiles took the qsa3 path and
+> later ones silently took the slow `flash_attn_qsa` one, with no reproducer pattern.  Root cause is
+> **ROCm issue #10196**, fixed upstream **2026-09-15** in **rocm-systems PR #11620**; our build
+> predates it.  Consequences: (a) `GGML_CUDA_QSA3` was replaced by the compile-time `LLAMA_QSA3_ENABLE`
+> (session 15) so qsa3 profiling is deterministic; (b) **any env-gated WIP path (`GGML_CUDA_MMB`,
+> `GGML_CUDA_MMB_HC16`, the tuning knobs) can in principle flip under the profiler** -- verify the gate
+> you care about from the kernel names in the trace, and corroborate perf claims with a *non-profiled*
+> t/s A/B (no profiler => no `rocprofiler-register` => no race).  The indexer kernels are not
+> env-gated, so they are safe to profile.
 
 **Gates (all must stay green; a bit-identical change reproduces the hashes exactly):**
 
@@ -50,35 +66,117 @@ MMB dense shapes.
    BF16-only work); `HC16=0` is 10.5771.  A numerics change re-baselines it (bar ~±0.68 at c2048;
    the tight ±0.027 bar needs c16384, which the prompt file cannot reach).
 2. Same-seed greedy text via `scripts/extract-generated.py` -> **`9c281c415082`** (624 chars),
-   `GGML_CUDA_MMB=1 GGML_CUDA_QSA3=1 GGML_CUDA_MMB_HC16=1 llama-cli -f prompts/prose-rdna-boosts.txt
+   `GGML_CUDA_MMB=1 GGML_CUDA_MMB_HC16=1 llama-cli -f prompts/prose-rdna-boosts.txt
    -n 128 --seed 42 --temp 0 -c 8192 -b 2048 -ub 2048 -ctk bf16 -ctv bf16 -fa 1 -ngl 99
    --no-display-prompt --single-turn` (`HC16=0` gives `c3f24ac9c114`).  The pre-session-12
    `9930c674a6ca` was a bit-identical-era hash; re-baselined there.
-3. `test-backend-ops -o FLASH_ATTN_QSA` (22/22), `-o GATED_DELTA_NET` (46/46), `-o FLASH_ATTN_EXT`.
+3. `test-backend-ops -o FLASH_ATTN_QSA` (22/22), `-o GATED_DELTA_NET` (46/46), `-o FLASH_ATTN_EXT`,
+   **`-o INDEXER_TOPK`** (the indexer op's own test -- check it still runs cases, not 0/0).
 4. `test-logits-width-probe <model> prompts/prose-rdna-boosts.txt 1024 512` -> `width_purity=PASS`.
 5. `plain == draft-mtp` greedy text (do **not** pass `-md` to the plain arm) — byte-identical.
-6. Judge value-changing variants on `rocprofv3` kernel time, **not** end-to-end t/s (session 5e rule).
+6. Judge value-changing variants on `rocprofv3` kernel time, **not** end-to-end t/s (session 5e rule),
+   and heed the profiling caveat above.
+7. **Indexer determinism is part of the contract**: the block-14 gather was made deterministic
+   (ascending column order) because the old atomic placement let the *list order* -- and at the rank
+   boundary *which tied cells made it* -- vary run to run, which the f16-state recurrences amplified
+   into llama-cli-visible nondeterminism.  Any rewrite must preserve that order (the `k_bin_bcast`
+   tie-break precedent) and be checked with the same-seed text gate, not just t/s.
 
-**Next work, in priority order**
+**Next work**
 
-1. **Finish the non-temporal sweep — LOADS ONLY, and A/B load vs store per kernel.**  Sessions 13/14
-   showed the hint is real but kernel-specific: `dsv4_hc_pre` (−18.6 %) and `dsv4_hc_post` win on both
-   accesses; `concat_transposed_src1_dim0` (−29.8), `moe_weighted_reduction` (−39.8) and
-   `unary_gated_op_kernel` (−38.0) win on **loads only**; `k_bin_bcast` (+52.8) and
-   `ssm_conv_long_token_f32` (+79 both) win on neither.  A non-temporal **store** evicts the output the
-   next op reads; a non-temporal **load** loses where the operand is reused/broadcast — so test
-   load-only / store-only / both separately and require a reproducible delta.  Untested: the qsa3
-   pack, `ssm_conv` under a different shape.  `rms_norm_f32` is **not** a candidate (reads `x` twice).
-   Templated kernels need `ggml_cuda_nt_load<T>()` (common.cuh), not the raw builtin (`__half` fails
-   to compile).
-2. **The indexer** — 1 % at 8K, 3.2 % at 32K, grows with context (`indexer_topk_radix_histogram`
-   dominates: 82 ms / 384 calls at pp8192).  The last un-optimised family.
-3. **Delivery bug: `GGML_OP_INDEXER_FILL` missing from `GGML_OP_NAME`.**  Found in session 9, fixed in
-   this WIP by `d1463bff3`; the delivery `patches/0014` (block 14) still has it.  One line in the name
-   table; fold into block 14 when the delivery is next regenerated.
-4. **Promotion.**  Every §11 gate passes.  Rebase onto a canonical fork rebuilt at `ebbb18522` +
-   `scripts/apply-all.sh`, regenerate `patches/`, and decide whether MMB rides as a block-08
-   amendment.  **Maintainer-gated** (beta window / go-ahead) — do not do this unilaterally.
+### 1. THE INDEXER (this session's mandate)
+
+**Where it is.**  `ggml/src/ggml-cuda/indexer-topk.cu` (422 lines, the whole top-k) +
+`indexer-score.cu` (the score kernels) + `ggml/src/ggml-cuda/ggml-cuda.cu` (the 3 op hooks) +
+`src/models/qwen4exp.cpp` (`build_qsa_top_k`, ~line 1261, op call ~1563).  **None of it is touched by
+this WIP** -- it is delivery block 14 (the `GGML_OP_INDEXER_*` ops are the delivery's own; pwilkin's
+tree has **no** such op, it uses the generic `top_k_nary_search_cuda` in `top-k.cu`, so there is
+nothing to port -- this is genuinely our code to optimise).
+
+**Shapes** (qwen4exp: n_embd 2560, indexer n_head 4, head_size 128, `indexer_top_k` 2048, compress
+ratio r=4):
+
+| tensor | shape | note |
+|---|---|---|
+| `score` | `[n_blocks, n_tps, n_stream]` F32 | n_blocks = ceil(n_kv/r) |
+| `cell_blk` | `[n_kv, n_stream]` I32 | maps each cell to its block |
+| `additive` | `[n_kv, n_tps, n_stream]` F16 (or F32) | the attention mask/bias, **the big stream** |
+| `dst` | `[width, n_tps, 1, n_stream]` I32 | width = min(n_kv, `indexer_top_k` + r - 1) = **2051** |
+
+`n_kv` = context length, `n_tps` = ubatch tokens (2048 at `-ub 2048`), 24 QSA layers drive it.
+`value(c) = score[cell_blk[c], t, s] + additive[c, t, s]` is computed **on the fly** in every pass (the
+block-14 win: the `[n_kv, n_tps]` F32 expanded tensor -- 512 MB at 64K -- never exists).  Each
+`(tps, stream)` row is an independent top-k over `n_kv` cells.
+
+**Algorithm** (`indexer_topk_radix_cuda`, ~line 337):
+
+1. `indexer_topk_radix_init` -- states[row].rank = k.
+2. **4 radix passes**, 8 bits each (shift 24 -> 0): `indexer_topk_radix_histogram` (256-bin shared
+   histogram of the ordered-key byte, filtered by `prefix_mask`) then `indexer_topk_radix_select`
+   (find the bin holding the k-th rank, narrow the prefix).  Every pass reads **and re-evaluates**
+   every one of the `n_kv` cells.
+3. **Deterministic gather** -- `indexer_topk_count` (per 256-col block: #greater / #equal vs the final
+   prefix), `indexer_topk_base_scan` (exclusive prefix per row), `indexer_topk_deterministic_write`
+   (places cells in ascending column order).  Two **more** full passes over every cell.
+
+So the op does **~6 full passes over `n_kv x n_tps` cells per layer**.
+
+**Measured (session 15, gfx1151, bf16 KV, `-ub 2048`, compile-time qsa3 so the trace is clean):**
+
+| kernel | pp8192 | pp32768 | calls @32K |
+|---|---:|---:|---:|
+| `indexer_topk_radix_histogram` | 83.5 ms | **1235.7 ms** (1.44 %) | 1536 (4 passes x 384) |
+| `indexer_topk_deterministic_write` | 46.6 ms | 668.3 ms (0.78 %) | 384 |
+| `indexer_topk_count` | 32.9 ms | 513.2 ms (0.60 %) | 384 |
+| `indexer_topk_radix_select` | 15.0 ms | 97.6 ms | 1536 |
+| `base_scan` + `init` | 2.1 ms | 8.7 ms | 384 |
+| **family total** | **180.2 ms (0.90 %)** | **2523.6 ms (2.94 %)** | |
+
+Per top-k op: **1.88 ms @ n_kv=8192 -> 6.57 ms @ n_kv=32768** (~3.5x for 4x the context, i.e. ~linear
+and still rising; expect ~5-6 % at 64K, ~10 % at 128K).  The histogram is 49 % of the family and
+`count+write` another 47 %.
+
+**Why it is slow.**  At 32K the additive mask alone is `32768 x 2048 x 2 = 134 MB` per layer and the
+histogram reads it **4x** (the score gather is L2-resident -- only `n_blocks` distinct values -- so the
+additive stream dominates).  The count+write then re-read it twice more.  The kernel is
+bandwidth-bound on those ~6 passes; reducing the pass count is the whole game.
+
+**Hypotheses, ranked:**
+
+1. **Compact after pass 1.**  Pass 1 fixes the top 8 bits of the k-th value; only ~1/256 of the cells
+   can still matter, then ~1/65536.  Gather the matching cell indices into a dense scratch list after
+   pass 1 (and reuse it for the gather) so passes 2-4 scan the compacted list, not `n_kv`.  Expected:
+   ~6 passes -> ~1 + 3 small, the histogram and the gather both shrink towards 1x.  **Keep the
+   ascending-column order** (the gather is order-sensitive, see gate 7).
+2. **Fewer radix passes.**  `RADIX_BITS` is 8 (256 bins, 1 KB shared).  11 bits -> 3 passes (2048 bins,
+   8 KB shared), 12 -> 3.  A cheap 25 % cut on the histogram if (1) is not done.
+3. **Collapse count+write.**  They only distinguish `> prefix` / `== prefix`.  A single fused pass with
+   a block-level prefix and the row base from the select phase could replace count+scan+write.
+4. **Specialise `indexer_topk_extra`.**  `blk_idx`/`cell_pos` presence is a run-time check inside
+   `indexer_topk_value`, evaluated per cell per pass; template the four combinations.
+5. Cheaper value re-evaluation: cache the **per-block** score part once per row (it is only
+   `n_blocks x n_tps`), leaving only the per-cell additive + `cell_blk` gather in the loop.
+
+**How to measure.**  `rocprofv3 --kernel-trace` at `-p 8192` and `-p 32768` (exact commands in §4),
+**plus a non-profiled `llama-bench -p 32768,65536 -r 2` t/s A/B** to corroborate (the profiler race
+cannot touch the indexer, but the total is easier to trust unproxied).  A cheap iteration model is not
+available for this op -- it only exists on qwen4exp (the `Qwen3.6-35B-A3B` has no indexer), so every
+measurement is on the 94 GiB model.  Budget: model load ~1 min, pp8192 profile ~2 min, pp32768 profile
+~4 min.
+
+### 2. Rest of the non-temporal sweep (small)
+Untested: the qsa3 pack kernels (6.5 ms), the `rms_norm`/other unary producers, `ssm_conv` under a
+different shape.  Rule: **loads only, per-kernel, A/B load vs store** (sessions 13/14); `rms_norm_f32`
+is not a candidate (reads `x` twice).
+
+### 3. Delivery bug: `GGML_OP_INDEXER_FILL` missing from `GGML_OP_NAME`
+Found in session 9, already fixed in this WIP by `d1463bff3`; delivery `patches/0014` (block 14) still
+has it -- one line in the name table, fold in at the next delivery regeneration.
+
+### 4. Promotion (maintainer-gated)
+Every §11 gate passes.  Rebase onto a canonical fork rebuilt at `ebbb18522` + `scripts/apply-all.sh`,
+regenerate `patches/`, decide whether MMB rides as a block-08 amendment.  **Do not do this
+unilaterally** -- needs a beta window / go-ahead.
 
 **Closed — do NOT redo** (each measured in the UPDATEs below):
 
@@ -135,20 +233,24 @@ MMB dense shapes.
 > non-temporal idea to the other streaming kernels and found it is **load-only and per-kernel**:
 > `concat_transposed_src1_dim0` 357 -> 327 ms and `moe_weighted_reduction` 384 -> 344 ms, while
 > `ssm_conv_long_token_f32` wins on neither (+79 ms both) — a non-temporal *store* evicts the output
-> the next op wants, so load and store must be A/B'd separately.
+> the next op wants, so load and store must be A/B'd separately.  **Session 15** turned up a
+> `rocprofv3` trap -- `rocprofiler-register` `setenv()`s during early init and can make an env gate
+> read unset, so qsa3 became a compile-time gate (`LLAMA_QSA3_ENABLE`) and the long-context indexer
+> was finally measured cleanly (**2.94 % at pp32768**, ~linear in context) -- that is the next
+> session's mandate.
 
 **Current state (also in the brief above; kept here for history):**
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`f2e3df704`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`43be72812`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0026` + `commits.txt`, in this repo, pushed to `origin/main` |
-| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (26 commits) |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0027` + `commits.txt`, in this repo, pushed to `origin/main` |
+| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (27 commits) |
 | build | §3 | run | §4 |
-| current numbers | the **session 14 UPDATE below** (non-temporal loads: concat −29.8, moe −39.8, unary_gated −38.0 ms; `k_bin_bcast`/`ssm_conv` rejected) and the **session 13 UPDATE** (`dsv4_hc` non-temporal) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
+| current numbers | the **session 15 UPDATE below** (qsa3 compile-time gate + the rocprofiler-register profiling caveat) and the **session 14/13 UPDATEs** (non-temporal) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
 
-**Historical ordering of the UPDATE sections:** 14 (newest, 2026-09-20, the non-temporal load sweep: concat/moe) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
+**Historical ordering of the UPDATE sections:** 15 (newest, 2026-09-20, the qsa3 compile-time gate + the rocprofiler-register profiling caveat) → 14 (2026-09-20, the non-temporal load sweep: concat/moe/unary) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body and are correct except where
 an UPDATE says otherwise.
@@ -158,6 +260,45 @@ list is the authoritative one, and the historical "next-work order" lists inside
 below are superseded.
 
 ---
+
+## UPDATE — session 15 (2026-09-20): qsa3 is now a compile-time gate; rocprofv3 was silently
+dropping env-gated paths (`rocprofiler-register` setenv race)
+
+While opening the indexer work, the pp32768 profile looked like it had found a long-context bug: the
+qsa3 attention kernels were **absent** and the slow `flash_attn_qsa` VEC kernel ran instead (16.9 % of
+the 96 s run).  It was not a long-context bug -- it was a **profiler artifact**.
+
+**The trail, and what killed each hypothesis:**
+
+* Non-profiled `llama-bench -p 8192` with `GGML_CUDA_QSA3=1` vs `=0`: **1015 vs 860 t/s**; at `-p 32768`
+  **960 vs 822**.  So qsa3 was active at both -- but under `rocprofv3` the qsa3 kernels vanished and
+  `flash_attn_qsa` ran at both 8K and 32K.
+* 15 of the first pp8192 profiles had taken qsa3; later ones did not, with no code change in between.
+* The graph-side gate printed `gate=1` (all terms satisfied) and the backend support predicate never
+  returned false -- yet the profiled op ran without the packs.
+* **Hard-gating qsa3 at COMPILE time (removing the env read) fixed it**: profiled pp8192 and pp32768
+  then took qsa3 (480 / 1920 kernels).  That isolated the cause to the env read.
+
+**Root cause (found by web search -- the pi web tool is gone, `curl` against the GitHub API worked):**
+`rocprofiler-register` in the ROCm 7.14 build (`librocprofiler-register.so.0.6.0`, dated Jul 9) calls
+`setenv()` with `GLOG_*` vars during early init.  That can reallocate the process environment under a
+concurrent `getenv()` in the target app and intermittently make an env read return unset.  It is
+**ROCm issue #10196** ("segfault with HIP / rocprofiler-register mutating env in early init"), fixed
+upstream **2026-09-15** in **rocm-systems PR #11620**; our build predates the fix.
+
+**Change:** the qsa3 gate is now `LLAMA_QSA3_ENABLE` (compile-time, default 1; `-DLLAMA_QSA3_ENABLE=0`
+compiles the path out) instead of `GGML_CUDA_QSA3`.  Verified: profiled pp8192 takes qsa3 (480 kernels)
+and pp32768 takes qsa3 (1920); non-profiled t/s unchanged (1024 at pp8192); PPL **10.6015** and greedy
+**`9c281c415082`** unchanged; QSA / GDN / FA-EXT OK; width probe PASS; `plain == draft-mtp` identical.
+
+**Methodology rule for every future session:** `rocprofv3` can silently drop an **env-gated** path, so
+verify the gate you care about from the kernel names in the trace and corroborate with a **non-profiled**
+t/s A/B (no profiler => no `rocprofiler-register` => no race).  The same risk applies to `GGML_CUDA_MMB`
+and `GGML_CUDA_MMB_HC16`; they read stable in every profile so far, but a future "regression" that only
+appears profiled should be checked here first.  The indexer kernels are not env-gated and are safe.
+
+**Bonus:** with the artifact removed, the long-context indexer numbers are clean -- pp32768 indexer
+**2523.6 ms = 2.94 %** (histogram 1235.7 / write 668.3 / count 513.2 ms), see the brief.
 
 ## UPDATE — session 14 (2026-09-20): the non-temporal hint generalises — but **loads only**, and
 ## per-kernel (concat −29.8 ms, moe −39.8 ms; ssm rejected), bit-identical
@@ -1369,7 +1510,7 @@ QSA / qsa3 (`fattn-qsa3.cu`, `src/models/qwen4exp.cpp`):
 
 | env | default | meaning |
 |---|---|---|
-| `GGML_CUDA_QSA3` | 0 | **the qsa3 gate** (the packed-block WMMA prefill path).  Session 4 put the *dense-startup* default in line with it, but qsa3 itself is still opt-in |
+| `GGML_CUDA_QSA3` | (removed) | was the qsa3 env gate.  **Since session 15 the gate is compile-time `LLAMA_QSA3_ENABLE` (default 1)** -- the env var no longer exists, because `rocprofiler-register` could make it read as unset under `rocprofv3` (see the session-15 UPDATE) |
 | `LLAMA_QSA_DENSE_SHORTCUT` | **0** | **FLIPPED ON->OFF on 2026-09-19 = always QSA** (maintainer decision).  `=1` restores the dense arm (the `LLAMA_QSA_SPARSE_FA=0` cross-check) |
 | `LLAMA_QSA_DENSE_DECODE_UNTIL` | 65536 (gfx1151) | decode stays dense below this; independent of the above |
 | `LLAMA_QSA_SPARSE_FA` | on | `=0` = the dense masked reference path |

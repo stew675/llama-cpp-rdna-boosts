@@ -138,6 +138,34 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 15 (2026-09-20): qsa3 becomes a compile-time gate; rocprofv3 silently drops
+## env-gated paths (`rocprofiler-register` setenv race); indexer measured at long context
+
+Opening the indexer work, the pp32768 profile appeared to show a long-context bug -- qsa3 attention
+kernels absent, `flash_attn_qsa` at 16.9 % -- but it was a **profiler artifact**.  Full trail in
+`HANDOVER.md`; the short version:
+
+* non-profiled t/s proved qsa3 active at both 8K (1015 vs 860 with `GGML_CUDA_QSA3=0`) and 32K
+  (960 vs 822), yet under `rocprofv3` the qsa3 kernels vanished;
+* 15 early pp8192 profiles had taken qsa3, later ones did not, with no code change;
+* hard-gating qsa3 at **compile time** (removing the env read) fixed it -- so the env read was the
+  variable;
+* root cause: `rocprofiler-register` in the ROCm 7.14 build (`librocprofiler-register.so.0.6.0`, Jul 9)
+  calls `setenv()` with `GLOG_*` during early init, racing the app's `getenv()` and intermittently
+  making an env gate read unset -- **ROCm issue #10196**, fixed upstream 2026-09-15 in **rocm-systems
+  PR #11620**.
+
+The qsa3 gate is now `LLAMA_QSA3_ENABLE` (compile-time, default 1; `-DLLAMA_QSA3_ENABLE=0` opts out).
+Bit-identical (PPL 10.6015, greedy `9c281c415082`, all gates green).  **Rule: `rocprofv3` can silently
+drop an env-gated path -- verify from kernel names and corroborate with a non-profiled t/s A/B.**
+
+With the artifact gone, the **indexer** (the next session's mandate) measures clean: pp8192 **180.2 ms
+(0.90 %)**, pp32768 **2523.6 ms (2.94 %)** -- histogram 1235.7, deterministic_write 668.3, count
+513.2 ms -- at **1.88 ms/op @8K -> 6.57 ms/op @32K**, ~linear in context.  `GGML_OP_INDEXER_TOPK` is
+delivery block 14 (not pwilkin's -- his tree uses the generic `top_k_nary_search_cuda`), so this is
+our own op to optimise; the brief in `HANDOVER.md` has the shapes, the algorithm, the ranked
+hypotheses and the gates.
+
 ## UPDATE — session 14 (2026-09-20): the non-temporal hint generalises — but **loads only**, and
 ## per-kernel (concat −29.8 ms, moe −39.8 ms; ssm rejected), bit-identical
 
@@ -431,7 +459,8 @@ Diagnostics are left gated in the tree: `GGML_CUDA_MMB_LOG=1` (shape log),
 
 ## qsa3 — packed-block WMMA prefill for the QSA sparse attention (2026-09-19, session 2)
 
-**DONE and validated** (was `NEXT WORK #1`).  `GGML_CUDA_QSA3=1` opts in; default OFF.
+**DONE and validated** (was `NEXT WORK #1`).  Was `GGML_CUDA_QSA3=1` (opt-in); **since session 15
+(2026-09-20) the gate is compile-time `LLAMA_QSA3_ENABLE`, default 1** (see the session-15 UPDATE).
 
 ### What it is
 
