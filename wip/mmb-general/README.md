@@ -97,6 +97,14 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 10 (2026-09-20): `ssm_alpha/beta` (M=48) profiled — **rocBLAS stays**
+
+The `ssm_alpha/beta` GEMMs are `[M=48, K=2560]` F32 and run on rocBLAS at **0.360 ms/call
+(207.3 ms, 1.26 % of kernels)**.  Two faster-looking replacements lose: the BM=64 WMMA f32 tile is
+0.312 ms but its f16-hi/lo split costs **+0.04 PPL** (alpha/beta gate the GDN recurrence), and an
+exact-f32 SIMT tile is 0.437 ms (too low an FMA:LDS ratio).  `MMB_F32SPLIT_MIN_M=128` is unchanged;
+both experiments reverted.  Full table in `HANDOVER.md` §session 10.
+
 ## UPDATE — session 9 (2026-09-20): the bf16-producer port is done — the whole `mmb_cvt` bucket is
 ## gone, bit-identically (+1.3 % pp8192 / +2.0 % pp2048); plus a **delivery** op-name bug
 

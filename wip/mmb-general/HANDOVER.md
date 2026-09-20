@@ -43,7 +43,7 @@ then `README.md` (the running record) beside it.
 | build | §3 | run | §4 |
 | current numbers | the **session 9 UPDATE below** (the full bf16-producer port: the `mmb_cvt` bucket eliminated, +1.3 %/+2.0 % pp8192/pp2048, bit-identical) and the **delivery `GGML_OP_NAME` fix**; then sessions 8/7/6 |
 
-**Order the UPDATE sections by session: 9 (newest, 2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
+**Order the UPDATE sections by session: 10 (newest, 2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body and are correct except where
 an UPDATE says otherwise.
@@ -76,11 +76,49 @@ an UPDATE says otherwise.
    fused `rms_norm+mul`, `sigmoid+mul`, `scale+unary`, generic unary and `dsv4_hc_pre` producers.  Only
    the `ple_embd` model tensor still converts.  See the session-9 UPDATE above.
 4. **The residual ~18 % kernel-local gap in `dsv4_hc_pre`** (~0.8 %) — smaller, still unexplained.
-5. **`ssm_alpha/beta`** (~1.2 %) — generalise the tiny-M kernel past the 8-accumulator register limit.
+5. **`ssm_alpha/beta`** (~1.2 %) — **session 10 profiled it and closed it: rocBLAS stays.**  The
+   rocBLAS kernel is 0.360 ms/call (207.3 ms total); a BM=64 WMMA f32 tile is 0.312 ms but costs
+   +0.04 PPL (it approximates f32 with f16 hi/lo and the gate drives the GDN recurrence), and an
+   exact-f32 SIMT tile is 0.437 ms (too low an FMA:LDS ratio).  See the session-10 UPDATE above.
 6. **The indexer** — 1 % at 8K, 3.2 % at 32K, grows with context; deliberately deferred behind 3-5.
 7. **Promotion**: every §11 gate now passes (see 5c/5d).  What remains is the rebase onto a canonical
    fork at `ebbb18522` + `scripts/apply-all.sh`, regenerating `patches/`, and deciding whether MMB
    rides as a block-08 amendment.  Given 1-2 are exhausted, this is now the highest-value step.
+
+---
+
+## UPDATE — session 10 (2026-09-20): `ssm_alpha/beta` (M=48) — profiled, three kernels tried,
+## **rocBLAS stays** (the faster WMMA tile costs +0.04 PPL)
+
+Item 5 of the next-work list.  A `rocprofv3` kernel trace on the target model (gfx1151, IQ4_XS
+Flash-Next, bf16 KV, `-b/-ub 2048`, pp8192, `GGML_CUDA_MMB=1 GGML_CUDA_QSA3=1 GGML_CUDA_MMB_HC16=1`)
+confirms the target: the `ssm_alpha/beta` GEMMs are `[M=48, K=2560]` F32 and run on rocBLAS
+`Cijk_Alik_Bljk_SB_MT32x32x8...` at **207.3 ms / 576 calls (0.360 ms)** = 1.26 % of the 16.43 s
+kernel total.  Three replacements were built and measured against it:
+
+| kernel | ms | per call | exact f32? | PPL c2048 |
+|---|---:|---:|---|---:|
+| rocBLAS MT32x32x8 (baseline) | 207.3 | 0.360 | yes | 10.6428 |
+| `mmb_f32split_kernel<64,64,16,32>` (WMMA f16 hi/lo, BM=64, 32 T-blocks) | **179.7** | **0.312** | no | 10.6824 |
+| `mmb_f32split_kernel<64,128,32,32>` (WMMA, BM=64, 16 T-blocks) | 247.0 | 0.429 | no | — |
+| `mmb_small_m_f32_kernel<48,64,32>` (exact-f32 SIMT tile, W once / 64 tokens) | 251.9 | 0.437 | yes | 10.6748 |
+
+**Verdict: keep rocBLAS (i.e. `MMB_F32SPLIT_MIN_M=128` and no small-M arm).**  Two independent
+reasons, both measured:
+
+1. The faster WMMA tile is **not worth its quality cost**.  The BM=64/BN=64 tile is 13 % faster on
+the kernel (0.312 vs 0.360 ms), but its f16-hi/lo split is an approximation and `alpha`/`beta` gate
+the GDN recurrence: **PPL c2048 10.6428 -> 10.6824 (+0.04)**.  End to end the win was ~0.17 %
+(kernel-time, within the bench noise) — a bad trade for a systematic quality shift.
+2. The **exact-f32** SIMT tile is *slower* than rocBLAS (0.437 vs 0.360 ms): a 48x64 output tile with
+`RM=3, RN=4` has an FMA:LDS ratio of only ~1.7, so it is LDS/issue-bound, not memory-bound.  Even
+exact, its PPL still shifts a little (+0.03) purely from the different f32 reduction order — the gate
+is that sensitive.
+
+Both experiments were reverted; the tree is back at `d6b803e70`.  A revisitable direction if someone
+wants to push further: a properly register-blocked exact-f32 tile (`RM=4, RN=8, BK=16`) or rocBLAS
+algorithm/split-K tuning — but it must beat 0.360 ms **and** stay exact-F32, because the WMMA split
+already loses on quality alone.
 
 ---
 
@@ -138,8 +176,8 @@ one-line addition to block 14) when the promotion happens.
 
 * `ple_embd` is the last `mmb_cvt`: its producer is the model loader, so a load-time bf16 copy would
   be needed (or it stays as-is; it is one conversion per graph).
-* `dsv4_hc_pre`'s ~18 % kernel-local gap (session 5e) and `ssm_alpha/beta` (session 5b) are the other
-  outstanding kernel-local items.
+* `dsv4_hc_pre`'s ~18 % kernel-local gap (session 5e) is the remaining kernel-local item;
+  `ssm_alpha/beta` was investigated and closed in session 10 (rocBLAS stays).
 * The delivery `GGML_OP_NAME` fix, and then **promotion** (all gates green).
 
 ---
