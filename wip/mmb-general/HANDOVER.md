@@ -337,6 +337,12 @@ short context (-31 % vs session 17 at 8K) but only -9 % at 32K, because the sess
 already evaluated the block key once per block -- the block passes save only the per-cell
 visibility/binning work (the key is still evaluated once per block).
 
+**End-to-end prefill record:** `benchmarks/2026-09-20-qwen4exp-iq4xs-prefill-wip-vs-base.md` — the
+WIP is **+32 % at pp2048 and +43–48 % from pp4096 to pp32768** against the **true** delivery base
+(`8a2567e1e`, built separately), of which ~+14–16 % at 8K–32K is the always-on WIP (qsa3, always-QSA,
+non-temporal, indexer) and ~+27–29 % is MMB/HC16.  The earlier "MMB off" arm was the WIP tree with only
+the MMB gates off, so it overstated the baseline by exactly that always-on work.
+
 ### Interface change (delivery-facing)
 
 `GGML_OP_INDEXER_TOPK` gained `src[7] = blk_cells` (`ggml_indexer_top_k(..., blk_cells, k)`), asserted

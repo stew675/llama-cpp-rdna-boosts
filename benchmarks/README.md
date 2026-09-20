@@ -17,6 +17,17 @@ gamut; the **v1** record (curl + `/completion`) is preserved for history.
 > clean-apply build; depth-16384 3-GPU hybrid 38.71 t/s unpinned) and the
 > benchy depth-16384 protocol in `wip/HANDOFF.md`.
 
+## 2026-09-20 — Qwen3.8-Flash-Next IQ4_XS prefill: delivery base vs the `mmb` WIP
+
+**[2026-09-20-qwen4exp-iq4xs-prefill-wip-vs-base.md](2026-09-20-qwen4exp-iq4xs-prefill-wip-vs-base.md)** —
+prefill (`-n 0`) on the 94 GiB qwen4exp model, gfx1151/ROCm 7.14, bf16 KV, `-b/-ub 2048`, `-r 3`, across
+the **true delivery base** (`8a2567e1e`, unmodified — built in a separate worktree) and two WIP arms:
+MMB/HC16 off and all gates on.  Headline: the WIP is **+32 % at pp2048 and +43–48 % from pp4096 to
+pp32768** end to end, of which ~+14–16 % at 8K–32K is the WIP's always-on work (qsa3, always-QSA,
+non-temporal, indexer) and ~+27–29 % is MMB/HC16.  Also records the base's pp4096 QSA dense-shortcut
+cliff that the always-QSA flip removes.  Read it before quoting any prefill delta: the older "MMB off"
+arm was the WIP tree with only the MMB gates off, **not** the delivery base.
+
 ## Adaptive MTP — four-workload records
 
 **[2026-09-15-adaptive-mtp-tuning.md](2026-09-15-adaptive-mtp-tuning.md)** is the **current**
