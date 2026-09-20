@@ -7,25 +7,52 @@ then `README.md` (the running record) beside it.
 > **One-line summary.** A general prefill weight-GEMM on the tensor cores (dequant-to-bf16 → WMMA)
 > is implemented for **every** weight type the delivery's models use, validated PPL-parity, and
 > measured at up to **+68 % pp2048 / +56 % pp8192** on the Flash-Next Q4_K_M.  **QSA v3 (packed-block
-> WMMA sparse attention)** landed in sessions 2/3: the QSA attention went **2944 ms -> 728.6 ms
-> (4.04x)**, and session 4 made it the **default** at every context length.  The next lever is the
-> **indexer**, then a dedicated tiny-M F32 kernel, then the remaining `mmb_*` tuning.
+> WMMA sparse attention)** landed in sessions 2/3 (QSA attention **2944 -> 728.6 ms, 4.04x**), and
+> session 4 made it the default at every context length.  Sessions 5..5e then added the **shape-aware
+> F32 split** (+2.1/+2.6/+3.1 %), the **tiny-M F32 kernel for the hc `*_inject` pair** (+2.3-3.3 %),
+> ran **all the promotion gates to green** (including the `W=1..8` probe, which needed a new harness),
+> and investigated **dsv4_hc** (no change landed — see 5e; the remaining lever there is bf16
+> intermediates, a graph change).  **The next levers are the two big `mmb_*` kernels** —
+> `mmb_routed_glu` 22.7 % + `mmb_dense` 21.1 % of pp8192 — which need a split-K / int8-IU8
+> restructure rather than tuning.  The **indexer** (1 % at 8K, 3.2 % at 32K, growing with context) is
+> deliberately deferred behind those.
 
 **Current state (start here):**
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`3ff571bf9`** |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`7e431fc82`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0013` + `commits.txt`, in this repo, pushed to `origin/main` (`b78b96b`) |
-| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (13 commits, 9 files, +2190/-11) |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0017` + `commits.txt`, in this repo, pushed to `origin/main` (`05f2c56`) |
+| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (17 commits, 11 files, +2506/-11) |
 | build | §3 | run | §4 |
-| current numbers | the session-4 UPDATE below (the §5/§7 tables predate the default flips) |
+| current numbers | the **session 5b/5e UPDATEs below** (kernel profiles); the §5/§7 tables and the session-4 numbers predate them |
+
+**Order the UPDATE sections by session: 5e (dsv4_hc, newest) → 5d (W=1..8 probe) → 5c (gates) → 5b
+(tiny-M) → 5 (profile + F32 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body
+and are correct except where an UPDATE says otherwise.
+
+**Next work (AUTHORITATIVE — the "next-work order" lists inside the UPDATE sections are historical):**
+
+1. **`mmb_routed_glu` (22.7 % of pp8192) + `mmb_dense` (21.1 %)** — the two big ones, and both need a
+   *restructure*, not tuning.  `mmb_dense` is occupancy/LDS-bound (§9: Q8_0 -> int8 IU8 WMMA).
+   `mmb_routed_glu`'s tile/descriptor geometry has **not been read yet** — start at
+   `mmb_build_desc2` / `mmb_tile_gemm_glu` (~lines 640-950 of `mmb.cu`).  **Their launch geometry is
+   already correct**: the GLU caller uses `(M + 63) / 64` to match `BM=64` (the routed caller uses
+   `/128` for `BM=128`), so do **not** "fix" that apparent mismatch.
+2. **bf16 HC intermediates** for `dsv4_hc_pre`/`_post` (~2.3 % of prefill) — a **graph** change: the
+   `hc_norm` / `hc_gate` producers must write bf16.  Measured 1.8x traffic reduction; see 5e.
+3. **The residual ~18 % kernel-local gap in `dsv4_hc_pre`** (~0.8 %) — smaller, still unexplained.
+4. **`ssm_alpha/beta`** (~1.2 %) — generalise the tiny-M kernel past the 8-accumulator register limit.
+5. **The indexer** — 1 % at 8K, 3.2 % at 32K, grows with context; deliberately deferred behind 1-2.
+6. **Promotion**: every §11 gate now passes (see 5c/5d).  What remains is the rebase onto a canonical
+   fork at `ebbb18522` + `scripts/apply-all.sh`, regenerating `patches/`, and deciding whether MMB
+   rides as a block-08 amendment.
 
 ---
 
 ## UPDATE — session 5e (2026-09-19): dsv4_hc — investigated, NOT landed; the reference's win is bf16
-## intermediates (a graph change), plus a residual ~13 % kernel-local gap
+## intermediates (a graph change), plus a residual ~18 % kernel-local gap
 
 `dsv4_hc_pre_f32` + `dsv4_hc_post_f32` are 1432.5 ms (8.5 % of pp8192) and the reference (pwilkin
 `hc-mix.cu`) is reportedly ~0.93 s against our 1.44 s.  **No change landed** — the tree is clean and
@@ -110,7 +137,8 @@ is a latency optimisation, and with the pattern itself reaching 227 GB/s in the 
 where the gap is.)
 
 **Conclusion:** two levers, neither a factor of two — **bf16 intermediates** (1.8x fewer bytes, a
-graph change, ~2.3 % of prefill) and a residual **~13 % kernel-local gap** (~0.6 % of prefill).  Every
+graph change, ~2.3 % of prefill) and a residual **~18 % kernel-local gap** (~0.8 % of prefill; the first
+pass put it at ~13 % because the probe had not swept its grid — see the ceiling section above).  Every
 kernel-local lever that could have explained a *large* gap has now been measured and is exhausted.
 
 ### METHODOLOGY — two traps, both mine, both generalisable
@@ -272,12 +300,13 @@ rejected — L2 serves the 164 KB W panels well enough); specialising `<8,TT>` �
 gate rejected the shape *before* the launcher ran — the kernel never executed.  The kernel trace
 (symbol absent) caught it; a bench delta alone would have read as "the idea failed".
 
-**Next-work order (revised):**
+**Next-work order (revised: HISTORICAL — superseded by the AUTHORITATIVE list at the top of this file):**
 
-1. **`mmb_dense` / `mmb_routed_glu`** (52 % combined) — §9's Q8_0 IU8-WMMA and the routed-GLU geometry.
+1. ~~`mmb_dense` / `mmb_routed_glu` (52 % combined)~~ — still the top item in the authoritative list.
 2. **`ssm_alpha/beta`** (207 ms, 0.359 vs a 0.082 floor, rocBLAS) — same ~60 GB/s parallel-wall shape
    as hc_inject had; the tiny-M kernel generalised to M=48 is the obvious next step.
 3. **`dsv4_hc_pre` + `_post`** (8 %) — the HC prefill fusion (pwilkin's pair is ~0.93 s vs our 1.44 s).
+   **Done in 5e** — investigated, nothing landed; the lever is bf16 intermediates.
 4. **qsa3 attn + its PACK** (4.9 % + 3.0 %) — the pack is a pure copy; fusing it reclaims most of 3 %.
 5. **The indexer** — 1 % at 8K, 3.2 % at 32K, growing.
 
@@ -321,7 +350,7 @@ the WMMA path to help the K=10240 hc inject pair).  It is wrong and costs 375 ms
 only because bucketing launches by grid alone merged `hc_inject` + `ssm` into one 1.065 ms average.
 **Split the bucket before believing a per-shape number.**
 
-**Next-work order (revised, by measured cost):**
+**Next-work order (revised, by measured cost: HISTORICAL — superseded by the list at the top):**
 
 1. **F32 tiny-M**: the remaining ~1.5 s is `hc_inject` (M=4, 1.332 ms/launch, floor ~0.33) and
    `ssm` (M=48, 0.359 vs ~0.084 floor) - both rocBLAS-bound now.  A dedicated small-M kernel (or
