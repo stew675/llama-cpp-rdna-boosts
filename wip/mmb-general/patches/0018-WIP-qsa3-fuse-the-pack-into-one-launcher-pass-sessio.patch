@@ -1,0 +1,265 @@
+From 2a73b02e409f6560cb920b4c45399b4ad9a0be77 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 20 Sep 2026 10:09:39 -0500
+Subject: [PATCH] WIP qsa3: fuse the pack into one launcher pass (session 7)
+
+The graph built pk/pv as cast + permute + cont + reshape + permute + cont -
+three copy passes over the cache, the two conts element-scalar
+(cpy_scalar<half,half> 41 ms + cpy_scalar_transpose 9.5 ms at pp8192).
+
+The graph now only materialises the natural contiguous F16 view
+[D=256, n_head_kv, n_kv]; two new launcher kernels do the whole re-layout in
+one pass each:
+  qsa3_pack_keys_kernel / qsa3_pack_values_kernel.
+
+Bit-identical (pure permutation of the same F16 values):
+  PPL c2048 bf16 10.5771 both builds
+  greedy sha=04ddb94b1529 (665 chars) both builds
+  test-backend-ops FLASH_ATTN_QSA / FLASH_ATTN_EXT green
+
+pp8192 (IQ4_XS, -b/-ub 2048):
+  bf16 KV 966.8 -> 968.75 t/s;  pack kernels 50.5 -> 6.5 ms (save 43.96 ms = 0.26 %)
+  q8_0 KV 953.6 -> 959.0 t/s;   pack chain   86.4 -> 49.1 ms (save 37.34 ms = 0.22 %)
+  f16  KV unchanged path, works (954.5 t/s)
+
+The F16/BF16 cast (bf16 7.7 ms) and the quantized->F16 chain (q8_0 35 ms)
+stay as graph ops; fusing them is <0.05 % for the default bf16 config.
+---
+ ggml/src/ggml-cuda/fattn-qsa3.cu | 78 ++++++++++++++++++++++++++++----
+ ggml/src/ggml.c                  | 12 ++---
+ src/models/qwen4exp.cpp          | 42 ++++++-----------
+ 3 files changed, 91 insertions(+), 41 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-qsa3.cu b/ggml/src/ggml-cuda/fattn-qsa3.cu
+index f8e348551..d5764a798 100644
+--- a/ggml/src/ggml-cuda/fattn-qsa3.cu
++++ b/ggml/src/ggml-cuda/fattn-qsa3.cu
+@@ -11,7 +11,8 @@
+ // (48 output rows) and runs the score and PV passes on the F16 WMMA tensor cores over a
+ // package of 4 key blocks (16 keys) at a time.
+ //
+-// It consumes the packed F16 layouts the graph builds in qwen4exp.cpp (op src[7]/src[8]):
++// It consumes the packed F16 layouts built by the launcher's fused pack kernels below from the natural
++// contiguous F16 cache view (op src[7]/src[8], `ggml_flash_attn_qsa_set_packed`):
+ //   pk  [16, 4, 16, n_kv/4*n_kvh]   F16   keys, 4-key blocks, (a, k, b, n) at a+16k+64b+1024n
+ //   pv  [ 4, 256, n_kv/4*n_kvh, 1]  F16   values, (k, d, n) at k+4d+1024n
+ // and derives the per-group block union here (rows/merge kernels), so the attention kernel
+@@ -239,6 +240,50 @@ __global__ __launch_bounds__(QSA3_MERGE_LANES) void qsa3_merge_kernel(
+     }
+ }
+ 
++// ------------------------------------------------------------------------------------------------------------
++// Fused qsa3 pack (session 7).  The graph used to build pk/pv as cast + permute + cont + reshape + permute +
++// cont - three passes over the cache, the two `cont`s element-scalar (`cpy_scalar<half,half>`).  These two
++// kernels do the whole re-layout in ONE pass from the natural contiguous F16 view `nat [D=256, H=n_head_kv,
++// N=n_kv]`, so the packs are bit-identical to the graph form (a pure permutation of the same F16 values):
++//   pk[a + 16*k + 64*b + 1024*m] = nat[(a + 16*b) + 256*h + 256*H*n],  m = n/4 + (N/4)*h, k = n&3
++//   pv[k + 4*d + 1024*m]         = nat[ d            + 256*h + 256*H*n]
++// (D = 16*16 fixes the two 16-wide dims `a` and `b`; both kernels write 32 B / 8 B per thread.)
++__global__ __launch_bounds__(256) void qsa3_pack_keys_kernel(
++        const uint16_t * __restrict__ nat, uint16_t * __restrict__ pk, const int H, const int N) {
++    const int q = N >> 2;                     // 4-key groups per head
++    const int total = H * q * 64;             // H * (N/4) * 16 (b) * 4 (k)
++    const int t = blockIdx.x * blockDim.x + threadIdx.x;
++    if (t >= total) return;
++    const int n0 = t & 3;                     // k = n & 3
++    const int j  = (t >> 2) & 15;             // b = d >> 4
++    const int r  = t >> 6;
++    const int qq = r % q;                     // n >> 2
++    const int h  = r / q;
++    const uint16_t * s = nat + (size_t) 16 * j + (size_t) 256 * h + (size_t) 256 * H * (4 * qq + n0);
++    uint16_t * d = pk + (size_t) 16 * n0 + (size_t) 64 * j + (size_t) 1024 * ((size_t) qq + (size_t) q * h);
++    *reinterpret_cast<uint4 *>(d)     = *reinterpret_cast<const uint4 *>(s);
++    *reinterpret_cast<uint4 *>(d + 8) = *reinterpret_cast<const uint4 *>(s + 8);
++}
++
++__global__ __launch_bounds__(256) void qsa3_pack_values_kernel(
++        const uint16_t * __restrict__ nat, uint16_t * __restrict__ pv, const int H, const int N) {
++    const int q = N >> 2;
++    const int total = 256 * q * H;
++    const int t = blockIdx.x * blockDim.x + threadIdx.x;
++    if (t >= total) return;
++    const int d  = t & 255;
++    const int r  = t >> 8;
++    const int qq = r % q;
++    const int h  = r / q;
++    const uint16_t * s = nat + d + (size_t) 256 * h + (size_t) 256 * H * (4 * qq);
++    uint16_t * o = pv + (size_t) 4 * d + (size_t) 1024 * ((size_t) qq + (size_t) q * h);
++    const size_t ks = (size_t) 256 * H;
++    uint16_t v[4];
++#pragma unroll
++    for (int k = 0; k < 4; ++k) { v[k] = s[(size_t) k * ks]; }
++    *reinterpret_cast<uint2 *>(o) = make_uint2((uint32_t) v[0] | ((uint32_t) v[1] << 16), (uint32_t) v[2] | ((uint32_t) v[3] << 16));
++}
++
+ struct qsa3_layout {
+     size_t q1, q2, o1, o2, m1;
+     int nk, n_q, gqa, cap;
+@@ -512,12 +557,15 @@ bool ggml_cuda_flash_attn_qsa3_supported(int device, const ggml_tensor * dst) {
+     if (ids->ne[0] < 1 || ids->ne[0] > 2560 || ids->ne[1] < q->ne[1] || ids->nb[1] % 4 || uintptr_t(ids->data) % 4) {
+         return false;
+     }
+-    if (pk->type != GGML_TYPE_F16 || !ggml_is_contiguous(pk) || pk->ne[0] != 16 || pk->ne[1] != 4 || pk->ne[2] != 16 ||
+-        pk->ne[3] != k->ne[1]/4*k->ne[2] || uintptr_t(pk->data) % 16) {
++    // src[7]/src[8] are the NATURAL contiguous F16 views [D=256, n_head_kv, n_kv] the launcher packs
++    // into the block layouts itself (session 7 fused pack).  k (src[1]) is the permuted
++    // [D, n_kv, n_head_kv] view, so the natural one swaps its dims 1 and 2.
++    if (pk->type != GGML_TYPE_F16 || !ggml_is_contiguous(pk) || pk->ne[0] != k->ne[0] ||
++        pk->ne[1] != k->ne[2] || pk->ne[2] != k->ne[1] || pk->ne[3] != 1 || uintptr_t(pk->data) % 16) {
+         return false;
+     }
+-    if (pv->type != GGML_TYPE_F16 || !ggml_is_contiguous(pv) || pv->ne[0] != 4 || pv->ne[1] != 256 ||
+-        pv->ne[2] != k->ne[1]/4*k->ne[2] || pv->ne[3] != 1 || uintptr_t(pv->data) % 8) {
++    if (pv->type != GGML_TYPE_F16 || !ggml_is_contiguous(pv) || pv->ne[0] != k->ne[0] ||
++        pv->ne[1] != k->ne[2] || pv->ne[2] != k->ne[1] || pv->ne[3] != 1 || uintptr_t(pv->data) % 16) {
+         return false;
+     }
+     if (mask) {
+@@ -538,7 +586,7 @@ void ggml_cuda_flash_attn_qsa3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+     const ggml_tensor * mask = dst->src[4];
+     const ggml_tensor * cell_vis = dst->src[5];
+     const ggml_tensor * q_vis    = dst->src[6];
+-    const ggml_tensor * pk   = dst->src[7];
++    const ggml_tensor * pk   = dst->src[7];   // natural F16 [D, n_head_kv, n_kv]; packed below
+     const ggml_tensor * pv   = dst->src[8];
+ 
+     float scale;
+@@ -547,10 +595,24 @@ void ggml_cuda_flash_attn_qsa3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+     const int n_q    = (int) q->ne[1];
+     const int ns     = (int) ids->ne[0];
+     const int nk     = (int) k->ne[1];
++    const int nh_kv  = (int) k->ne[2];
+     const int ngroups = (n_q + QSA3_G - 1) / QSA3_G;
+     const int cap     = (QSA3_G * ns + 3) & ~3;
+ 
+ 
++    // Fused pack (session 7): one pass per tensor from the natural [D, n_head_kv, n_kv] F16 view into the
++    // block layouts the attention kernel reads.  Replaces cast+permute+cont+reshape+permute+cont.
++    ggml_cuda_pool_alloc<uint16_t> pk16(ctx.pool(), (size_t) 256 * nk * nh_kv);
++    ggml_cuda_pool_alloc<uint16_t> pv16(ctx.pool(), (size_t) 256 * nk * nh_kv);
++    {
++        const int q4 = nk >> 2;
++        const int tk = nh_kv * q4 * 64;
++        const int tv = 256 * q4 * nh_kv;
++        if (tk > 0) qsa3_pack_keys_kernel  <<<(tk + 255) / 256, 256, 0, ctx.stream()>>>((const uint16_t *) pk->data, pk16.get(), nh_kv, nk);
++        if (tv > 0) qsa3_pack_values_kernel<<<(tv + 255) / 256, 256, 0, ctx.stream()>>>((const uint16_t *) pv->data, pv16.get(), nh_kv, nk);
++        CUDA_CHECK(cudaGetLastError());
++    }
++
+     ggml_cuda_pool_alloc<uint16_t> ublk(ctx.pool(), (size_t) ngroups * cap);
+     ggml_cuda_pool_alloc<uint16_t> umask(ctx.pool(), (size_t) ngroups * cap);
+     ggml_cuda_pool_alloc<int>      ucount(ctx.pool(), (size_t) ngroups);
+@@ -578,8 +640,8 @@ void ggml_cuda_flash_attn_qsa3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+     const ggml_cuda_kernel_launch_params launch(dim3(ngroups, k->ne[2]), dim3(256), 0, ctx.stream());
+     ggml_cuda_kernel_launch(qsa3_attn_kernel, launch,
+             (const float    *) q->data,
+-            (const uint16_t *) pk->data,
+-            (const uint16_t *) pv->data,
++            (const uint16_t *) pk16.get(),
++            (const uint16_t *) pv16.get(),
+             mask     ? (const uint16_t *) mask->data     : nullptr,
+             cell_vis ? (const int      *) cell_vis->data : nullptr,
+             q_vis    ? (const int      *) q_vis->data    : nullptr,
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 452e30bc9..bd4e2aabb 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5695,7 +5695,8 @@ struct ggml_tensor * ggml_flash_attn_qsa(
+     return result;
+ }
+ 
+-// attach (or clear) the packed-block K/V layouts consumed by the qsa3 prefill kernel
++// attach (or clear) the natural contiguous F16 K/V views the qsa3 prefill launcher packs into the
++// packed-block layouts it consumes (ggml/src/ggml-cuda/fattn-qsa3.cu)
+ void ggml_flash_attn_qsa_set_packed(
+         struct ggml_tensor * a,
+         struct ggml_tensor * packed_keys,
+@@ -5708,14 +5709,13 @@ void ggml_flash_attn_qsa_set_packed(
+         return;
+     }
+ 
+-    const struct ggml_tensor * k = a->src[1];
++    const struct ggml_tensor * k = a->src[1];   // permuted [D, n_kv, n_head_kv]
+     GGML_ASSERT(packed_keys->type   == GGML_TYPE_F16);
+     GGML_ASSERT(packed_values->type == GGML_TYPE_F16);
+     GGML_ASSERT(ggml_is_contiguous(packed_keys) && ggml_is_contiguous(packed_values));
+-    GGML_ASSERT(packed_keys->ne[0]   == 16 && packed_keys->ne[1]   == 4 && packed_keys->ne[2]   == 16);
+-    GGML_ASSERT(packed_keys->ne[3]   == k->ne[1]/4*k->ne[2]);
+-    GGML_ASSERT(packed_values->ne[0] == 4  && packed_values->ne[1] == 256 && packed_values->ne[3] == 1);
+-    GGML_ASSERT(packed_values->ne[2] == k->ne[1]/4*k->ne[2]);
++    // the natural view swaps k's dims 1 and 2: [D, n_head_kv, n_kv]
++    GGML_ASSERT(packed_keys->ne[0]   == k->ne[0] && packed_keys->ne[1]   == k->ne[2] && packed_keys->ne[2]   == k->ne[1] && packed_keys->ne[3]   == 1);
++    GGML_ASSERT(packed_values->ne[0] == k->ne[0] && packed_values->ne[1] == k->ne[2] && packed_values->ne[2] == k->ne[1] && packed_values->ne[3] == 1);
+ 
+     a->src[7] = packed_keys;
+     a->src[8] = packed_values;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 3134417dd..d9ea2f17a 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1572,11 +1572,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+ }
+ 
+ // qsa3 packed-block layouts (the F16 layouts the WMMA prefill kernel reads, ggml/src/ggml-cuda/
+-// fattn-qsa3.cu).  The pack is a pure graph composition - reshape + permute + cont - so no new
+-// ggml op is needed.  Keys: [D, n_kv, n_kvh, 1] -> [16, 4, 16, n_kv/4*n_kvh]; Values:
+-// [D, n_kv, n_kvh, 1] -> [4, 256, n_kv/4*n_kvh, 1].  Both are built only for the prefill band and
+-// any cache type the graph can materialize as F16 (the native ones, or a quantized cache cast on
+-// the way in); anything else leaves the VEC kernel in charge.
++// fattn-qsa3.cu).  The pack itself is done by the launcher in one fused pass per tensor
++// (qsa3_pack_{keys,values}_kernel, session 7); the graph only materialises the natural contiguous F16
++// view [D, n_head_kv, n_kv] the launcher packs from.  Keys -> [16, 4, 16, n_kv/4*n_kvh]; Values ->
++// [4, 256, n_kv/4*n_kvh, 1].  Both are built only for the prefill band and any cache type the graph
++// can materialize as F16 (the native ones, or a quantized cache cast on the way in); anything else
++// leaves the VEC kernel in charge.
+ // The cache types the qsa3 pack can consume: the native pair plus every type the VEC kernel can
+ // dequantize (the cast below materializes them).  Kept in sync with the VEC kernel's type list.
+ static bool qwen4exp_qsa3_kv_type(ggml_type type) {
+@@ -1605,22 +1606,10 @@ static ggml_tensor * qsa3_f16_cast(ggml_context * ctx0, ggml_tensor * raw) {
+     return ggml_cast(ctx0, ggml_cast(ctx0, raw, GGML_TYPE_F32), GGML_TYPE_F16);
+ }
+ 
+-static ggml_tensor * qsa_pack_keys_graph(ggml_context * ctx0, ggml_tensor * keys) {
+-    GGML_ASSERT(keys->ne[0] == 256 && keys->ne[1] % 4 == 0 && keys->ne[3] == 1);
+-    ggml_tensor * contiguous = ggml_is_contiguous(keys) ? keys : ggml_cont(ctx0, keys);
+-    ggml_tensor * blocks = ggml_reshape_4d(ctx0, contiguous, 16, 16, 4, keys->ne[1]/4*keys->ne[2]);
+-    ggml_tensor * packed = ggml_cont(ctx0, ggml_permute(ctx0, blocks, 0, 2, 1, 3));
+-    ggml_set_name(packed, "qsa_packed_keys");
+-    return packed;
+-}
+-
+-static ggml_tensor * qsa_pack_values_graph(ggml_context * ctx0, ggml_tensor * values) {
+-    GGML_ASSERT(values->ne[0] == 256 && values->ne[1] % 4 == 0 && values->ne[3] == 1);
+-    ggml_tensor * contiguous = ggml_is_contiguous(values) ? values : ggml_cont(ctx0, values);
+-    ggml_tensor * blocks = ggml_reshape_3d(ctx0, contiguous, 256, 4, values->ne[1]/4*values->ne[2]);
+-    ggml_tensor * packed = ggml_cont(ctx0, ggml_permute(ctx0, blocks, 1, 0, 2, 3));
+-    ggml_set_name(packed, "qsa_packed_values");
+-    return packed;
++static ggml_tensor * qsa3_f16_natural(ggml_context * ctx0, ggml_tensor * raw) {
++    ggml_tensor * t = qsa3_f16_cast(ctx0, raw);
++    if (!ggml_is_contiguous(t)) { t = ggml_cont(ctx0, t); }
++    return t;
+ }
+ 
+ // Dense GQA self-attention restricted to the cells that top_k names.
+@@ -1743,12 +1732,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+         }();
+         if (qsa3_pack && n_stream == 1 && q_p->ne[1] >= 128 && k_raw->ne[0] == 256 && k_raw->ne[2] % 4 == 0 &&
+             qwen4exp_qsa3_kv_type(k_raw->type)) {
+-            // cast on the natural layout, then permute into the op's [D, n_kv, n_head_kv] order;
+-            // the pack helper does the final cont.  Neither tensor is an explicit graph root - the
+-            // QSA op's new srcs pull them in when `cur` is expanded.
+-            ggml_tensor * k16 = ggml_permute(ctx0, qsa3_f16_cast(ctx0, k_raw), 0, 2, 1, 3);
+-            ggml_tensor * v16 = ggml_permute(ctx0, qsa3_f16_cast(ctx0, v_raw), 0, 2, 1, 3);
+-            ggml_flash_attn_qsa_set_packed(cur, qsa_pack_keys_graph(ctx0, k16), qsa_pack_values_graph(ctx0, v16));
++            // The launcher packs these into the block layouts itself (one fused pass, session 7);
++            // the graph only materialises the natural contiguous F16 view [D, n_head_kv, n_kv].
++            ggml_tensor * k16 = qsa3_f16_natural(ctx0, k_raw);
++            ggml_tensor * v16 = qsa3_f16_natural(ctx0, v_raw);
++            ggml_flash_attn_qsa_set_packed(cur, k16, v16);
+         }
+ 
+         ggml_flash_attn_qsa_set_prec(cur, GGML_PREC_F32);
+-- 
+2.55.0
+

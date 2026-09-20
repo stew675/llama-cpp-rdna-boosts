@@ -106,9 +106,13 @@ cache, 86.3 ms = 0.48 %.  The session-5 "PACK/copy (qsa3 pack) 3.0 %" bucket was
 `concat_transposed_src1_dim0` (357.5 ms, the **MoE output concat**, present with QSA3 off too) +
 `cpy_scalar<float,float>` (110.7 ms, base-graph copies) + the actual pack (57.8 ms).
 
-A fused one-pass pack kernel saves at best ~half of that (~0.17 % bf16 / ~0.3 % q8_0).  **The next
-in-scope target is the `dsv4_hc_pre`+`_post` pair (8.5 %, bf16 intermediates) or `mmb_cvt` (3.8 %,
-bf16-producer marking), not the pack.**  Full table + method in `HANDOVER.md` §session 7.
+**Implemented (same session):** the graph no longer builds `pk`/`pv`; it materialises only the natural
+contiguous F16 view, and two new launcher kernels (`qsa3_pack_keys_kernel` / `qsa3_pack_values_kernel`)
+do the whole re-layout in one pass each.  **Bit-identical** (PPL c2048 10.5771 both; greedy
+`sha=04ddb94b1529` both), and the pack kernels go **50.5 -> 6.5 ms** (bf16, save **0.26 %** pp8192),
+**86.4 -> 49.1 ms** (q8_0, save 0.22 %).  **Next in-scope target: the `dsv4_hc_pre`+`_post` pair
+(8.5 %, bf16 intermediates), then `mmb_cvt` (3.8 %, producer marking).**  Full tables in
+`HANDOVER.md` §session 7.
 
 ## UPDATE — session 6 (2026-09-20): the `mmb_*` kernels are at their gfx1151 ceiling
 

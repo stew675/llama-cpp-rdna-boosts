@@ -18,19 +18,20 @@ then `README.md` (the running record) beside it.
 > structural ceiling (dense Q8_0 at 54 % of the bf16 WMMA peak, GLU at 36 %).  The next prefill lever
 > is **outside `mmb_*`** (FA 11.3 %, GDN 5.5 %, MoE concat+reduction 6.8 %, rms_norm ~5 %), or
 > **promotion** (all gates green).  **Session 7** then measured the qsa3 pack (session-5b's "3 %"
-> item) and found it is **0.34 %** — the bucket was really the MoE `concat_transposed_src1_dim0` +
-> base-graph F32 copies.  The **indexer** (1 % at 8K, 3.2 % at 32K) stays deferred.
+> item), found it is **0.34 %** (the bucket was really the MoE `concat_transposed_src1_dim0` +
+> base-graph F32 copies), and **fused it into one launcher pass, bit-identical: 50.5 → 6.5 ms,
+> +0.26 % pp8192**.  The **indexer** (1 % at 8K, 3.2 % at 32K) stays deferred.
 
 **Current state (start here):**
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`7e431fc82`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`2a73b02e4`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0017` + `commits.txt`, in this repo, pushed to `origin/main` (`05f2c56`) |
-| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (17 commits, 11 files, +2506/-11) |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0018` + `commits.txt`, in this repo, pushed to `origin/main` |
+| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (18 commits) |
 | build | §3 | run | §4 |
-| current numbers | the **session 7 UPDATE below** (the qsa3 pack is 0.34 %, not 3 %) and the **session 6 UPDATE** (kernel ceiling, int8/bf16 microbench, rejected knobs); the session 5b/5e profile tables and the §5/§7 tables predate them |
+| current numbers | the **session 7 UPDATE below** (the qsa3 pack fused, 0.26 % bit-identical) and the **session 6 UPDATE** (kernel ceiling, int8/bf16 microbench, rejected knobs); the session 5b/5e profile tables and the §5/§7 tables predate them |
 
 **Order the UPDATE sections by session: 7 (newest, 2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
@@ -63,8 +64,8 @@ an UPDATE says otherwise.
 
 ---
 
-## UPDATE — session 7 (2026-09-20): the qsa3 pack is **0.3–0.5 %**, not 3 % — the session-5
-## "PACK/copy (qsa3 pack)" bucket was a misattribution
+## UPDATE — session 7 (2026-09-20): the qsa3 pack — 0.34 %, not 3 %, and now **fused** (0.26 % saved,
+## bit-identical)
 
 The session-5/5b next-work put "qsa3 attn + its PACK (4.9 % + **3.0 %**)" and proposed fusing the pack.
 Measured on the target model (`/llm/models/Qwen3.8/Flash-Next/IQ4_XS/`, 94 GiB, pp8192, `-b/-ub 2048`,
@@ -92,12 +93,37 @@ are the q8_0→F32→F16 chain).  The qsa3 win itself reproduces: pp8192 bf16 KV
 `cpy_scalar<float,float>` **110.7 ms (0.66 %)** (base-graph copies, also present with QSA3 off), plus
 the real pack **57.8 ms (0.34 %)**.  Sum ≈ 3.1 %.  The label "(qsa3 pack)" was wrong.
 
-**Ceiling for the proposed fusion:** the pack is cast(bf16→f16) + permute + `cont` = 3 passes over the
-cache.  A fused single-pass pack kernel (read native cache, write `pk`/`pv` directly) would do
-1 read + 1 write, so it saves at best roughly **half** the pack — **~0.17 % bf16**, ~0.3 % q8_0.  The
-attn kernel cannot skip the pack: the packed-block layout is what makes its per-block reads
-coalesced, and the same block is re-read by many groups, so packing once amortises the re-layout.
-**Recommendation: do not spend a session on it.**
+**Ceiling for the proposed fusion:** the pack is cast(bf16→f16) + permute + `cont` + reshape + permute
++ `cont` = 3 passes over the cache.  The attn kernel cannot skip the pack: the packed-block layout is
+what makes its per-block reads coalesced, and the same block is re-read by many groups, so packing
+once amortises the re-layout.  **The maintainer asked for it anyway ("0.3 % is still 0.3 %"), so it
+was implemented — see below.**
+
+### Implemented (same session): the pack is now ONE launcher pass, bit-identical
+
+The graph no longer builds `pk`/`pv`; it only materialises the natural contiguous F16 view
+`[D=256, n_head_kv, n_kv]` (`qsa3_f16_cast`, no permute/cont).  Two new launcher kernels
+(`qsa3_pack_keys_kernel` / `qsa3_pack_values_kernel`, `fattn-qsa3.cu`) do the whole re-layout in one
+pass each; the launcher allocates the `pk`/`pv` scratch from `ctx.pool()`.  Both are pure permutations
+of the same F16 values, so the result is **bit-identical**:
+
+| check | old (graph pack) | new (fused) |
+|---|---|---|
+| PPL c2048 bf16 | 10.5771 | **10.5771** |
+| greedy `sha=` (128 tok, seed 42) | `04ddb94b1529` (665 ch) | **`04ddb94b1529`** (665 ch) |
+| `test-backend-ops` FLASH_ATTN_QSA / EXT | OK | **OK** |
+
+pp8192 (IQ4_XS, `-b/-ub 2048`), pack-kernel time and t/s:
+
+| KV | old pack | new pack | saved | t/s |
+|---|---:|---:|---:|---|
+| bf16 (default) | 50.5 ms (`cpy_scalar<half,half>` 41.0 + `cpy_scalar_transpose` 9.5) | **6.5 ms** (keys 4.0 + values 2.5) | **43.96 ms = 0.26 %** | 966.8 → **968.75** |
+| q8_0 | 86.4 ms (incl. the q8_0→F32→F16 chain) | 49.1 ms | **37.34 ms = 0.22 %** | 953.6 → **959.0** |
+| f16 | (same 2 conts) | same fused kernels (no cast needed) | — | 954.5 |
+
+The F16/BF16 cast (`cpy_scalar_contiguous`, bf16 7.7 ms) and the quantized→F16 chain (q8_0 35 ms)
+remain graph ops — fusing them is <0.05 % for the default bf16 config and needs per-type dequant in the
+pack kernel, so it is left as a documented follow-up.
 
 **The correct targets (current profile, bf16 KV, total 16782 ms):** `dsv4_hc_pre` 743.9 + `_post` 685.3 =
 **1429 ms (8.5 %)** via bf16 intermediates (~2.3 % win, next-work #3); `mmb_cvt_f32_bf16` **642.5 ms
@@ -693,10 +719,10 @@ Two changesets in one WIP tree.
 
 | file | change |
 |---|---|
-| `ggml/src/ggml-cuda/fattn-qsa3.cu` | new (~540 lines): rows/merge/attn kernels, the bitmap sort, the support check + launcher |
+| `ggml/src/ggml-cuda/fattn-qsa3.cu` | new (~600 lines): the **fused pack kernels** (session 7), rows/merge/attn kernels, the bitmap sort, the support check + launcher |
 | `ggml/src/ggml-cuda/fattn-qsa.cu` / `.cuh` | qsa3 declarations + a short "prefer qsa3 when supported" hook in the VEC launcher |
-| `ggml/include/ggml.h` + `ggml/src/ggml.c` | `ggml_flash_attn_qsa_set_packed` (op `src[7]`/`src[8]`) |
-| `src/models/qwen4exp.cpp` | the pack helpers (`qsa_pack_{keys,values}_graph`, `qsa3_f16_cast`), the `GGML_CUDA_QSA3` gate, and the **`LLAMA_QSA_DENSE_SHORTCUT` default flip** |
+| `ggml/include/ggml.h` + `ggml/src/ggml.c` | `ggml_flash_attn_qsa_set_packed` (op `src[7]`/`src[8]` = the natural F16 K/V views) |
+| `src/models/qwen4exp.cpp` | `qsa3_f16_cast` + `qsa3_f16_natural` (the graph materialises only the F16 view; the launcher packs), the `GGML_CUDA_QSA3` gate, and the **`LLAMA_QSA_DENSE_SHORTCUT` default flip** |
 
 Digest: **9 files, +2190/-11 across 13 commits**.
 
