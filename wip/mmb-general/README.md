@@ -138,6 +138,37 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 18 (2026-09-20): indexer block-level histogram path (**−52 % pp8192 / −51 % pp32768**
+## vs s15), bit-identically; `GGML_OP_INDEXER_TOPK` gains a `blk_cells` src
+
+Implements the session-17 scoping.  The op now carries `blk_cells` as `src[7]`, so it derives
+`r = blk_cells->ne[0]/n_blocks` and uses a **block-aligned** partition: pass 1 is cell-level and counts
+each block's visible cells (`wvis`); passes 2-4 walk blocks only, binning `wvis[b]` at the block key
+(and the invisible remainder at -inf).  The gather stays the session-17 cell-level `_grouped` kernel with
+the block-aligned chunk, so the ascending-column order is unchanged.
+
+| kernel | pp8192 (s17) | pp32768 (s17) |
+|---|---:|---:|
+| pass 1 (cell-level) | 24.0 | 341.8 |
+| passes 2-4 (block-level) | 22.4 | 470.4 |
+| gather | 20.4 (22.4) | 262.5 (291.3) |
+| select | 11.6 (15.0) | 87.9 (100.1) |
+| hist_accum | 5.3 (16.9) | 65.0 (103.1) |
+| scan+init | 2.0 | 8.1 |
+| **family** | **85.6 (123.7)** | **1235.7 (1362.3)** |
+
+**−52 % / −51 % vs session 15 (2.94 → 1.47 % of the run at 32K).**  Bit-identical: PPL c2048 **10.6015**,
+greedy **`9c281c415082`**, width probe PASS, `FLASH_ATTN_QSA` / `GATED_DELTA_NET` OK.  The block
+histogram wins at short context (−31 % at 8K) but only −9 % at 32K, because the session-17 grouped pass
+already shared the block key; the block passes save only the per-cell visibility/binning work.
+
+**Delivery-facing:** the new `src[7] = blk_cells` must fold into block 14 at promotion.  A/B:
+`LLAMA_INDEXER_NOBLOCK=1` (session-17 path), `LLAMA_INDEXER_NOGROUP=1` (cell-level path).  `wvis` is
+`n_tps × n_kv/r` ints (~64 MB at 32K/ub2048, ~335 MB at 163840 context, pool-reused).
+
+**Next:** the block-level gather/emit (needs each block's cells in column order; `blk_cells` slot order
+is `idx%r`, and the dead/spare block is not in `blk_cells`) → estimated ~262 → ~60 ms at 32K.
+
 ## UPDATE — session 17 (2026-09-20): indexer block-key sharing (**−30 % pp8192 / −46 % pp32768** vs
 ## session 15), bit-identically; the full block-level selection needs an op change
 

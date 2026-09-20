@@ -1,5 +1,5 @@
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 358bc74d0..2ba751eba 100644
+index 358bc74d0..ef24629ce 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -2549,6 +2549,14 @@ extern "C" {
@@ -17,6 +17,14 @@ index 358bc74d0..2ba751eba 100644
      GGML_API void ggml_flash_attn_qsa_set_prec(
              struct ggml_tensor * a,
              enum ggml_prec       prec);
+@@ -2580,6 +2588,7 @@ extern "C" {
+             struct ggml_tensor  * q_pos,
+             struct ggml_tensor  * blk_idx,
+             struct ggml_tensor  * blk_tail,
++            struct ggml_tensor  * blk_cells,
+             int                   k);
+ 
+     // Fused indexer block-pool + rms-norm (qwen4exp QSA): replaces the per-op chain
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
 index 934b9cffb..e23628d4b 100644
 --- a/ggml/src/ggml-cuda/common.cuh
@@ -1158,7 +1166,7 @@ index edccfba13..aab997949 100644
      if (!disable_fusion) {
          for (int i = 0; i < cgraph->n_nodes; ++i) {
 diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
-index 1b9e63516..669841582 100644
+index 1b9e63516..db612ffbd 100644
 --- a/ggml/src/ggml-cuda/indexer-topk.cu
 +++ b/ggml/src/ggml-cuda/indexer-topk.cu
 @@ -54,6 +54,21 @@ struct indexer_topk_extra {
@@ -1375,7 +1383,7 @@ index 1b9e63516..669841582 100644
          const float * __restrict__ score,
          const int   * __restrict__ cell_blk,
          const kv_t  * __restrict__ additive,
-@@ -266,41 +361,162 @@ static __global__ void indexer_topk_deterministic_write(
+@@ -266,42 +361,309 @@ static __global__ void indexer_topk_deterministic_write(
      const int tid = threadIdx.x;
      const int t = row % n_tps;
      const int s = row / n_tps;
@@ -1462,7 +1470,7 @@ index 1b9e63516..669841582 100644
 +        const int * __restrict__ g_base, const int * __restrict__ e_base,
 +        int * __restrict__ dst,
 +        int ncols, int n_tps, int n_blocks, int n_kv, int k,
-+        int blocks_per_row) {
++        int blocks_per_row, int chunk_in) {
 +    constexpr int BLOCK_SIZE = 256;
 +    const int row = blockIdx.x / blocks_per_row;
 +    const int b   = blockIdx.x % blocks_per_row;
@@ -1470,7 +1478,7 @@ index 1b9e63516..669841582 100644
 +    const int t = row % n_tps;
 +    const int s = row / n_tps;
 +
-+    const int chunk = (ncols + blocks_per_row - 1) / blocks_per_row;
++    const int chunk = chunk_in > 0 ? chunk_in : (ncols + blocks_per_row - 1) / blocks_per_row;
 +    const int col0  = b * chunk;
 +    const int col1  = min(col0 + chunk, ncols);
  
@@ -1526,7 +1534,7 @@ index 1b9e63516..669841582 100644
 +            gv[v] = g; ev[v] = e;
 +            lgpre[v] = lg; lepre[v] = le;
 +            lg += g; le += e;
-+        }
+         }
 +        sg[tid] = lg;
 +        se[tid] = le;
 +        for (int off = 1; off < BLOCK_SIZE; off <<= 1) {
@@ -1558,12 +1566,159 @@ index 1b9e63516..669841582 100644
 +        if (tid == BLOCK_SIZE - 1) {
 +            carry_g += sg[BLOCK_SIZE - 1];
 +            carry_e += se[BLOCK_SIZE - 1];
-         }
++        }
 +        __syncthreads();
++    }
++}
++
++// ---------------------------------------------------------------------------
++// block-level histogram path (additive == nullptr, derived default).
++//
++// A block-aligned partition: hist-block h covers blocks [h*bchunk, (h+1)*bchunk) and the cells
++// [h*bchunk*r, min((h+1)*bchunk*r, n_kv)).  Pass 1 is cell-level (it must see every cell to count
++// per-block visibility) and accumulates wvis[row*n_blocks + b] = the block's visible-cell count.
++// Passes 2..4 are block-level: they walk blocks, read wvis, and bin the count at the block key, so
++// three of the four radix passes do ~n_blocks work instead of ~n_kv.  The gather stays cell-level
++// (so its ascending-column output order is unchanged); its partition uses the same chunk.
++
++template<int BLOCK_SIZE, int RADIX_BITS, int VEC>
++static __global__ void indexer_topk_histogram_pass1(
++        const float * __restrict__ score,
++        const int   * __restrict__ cell_blk,
++        const indexer_topk_extra extra,
++        const indexer_topk_radix_state * __restrict__ states,
++        int * __restrict__ block_histograms,
++        int * __restrict__ wvis,
++        int ncols, int n_tps, int n_blocks, int n_kv,
++        int blocks_per_row, int bchunk, int r,
++        int shift) {
++    constexpr int NBINS = 1 << RADIX_BITS;
++    const int row = blockIdx.x / blocks_per_row;
++    const int hb  = blockIdx.x % blocks_per_row;
++    const int tid = threadIdx.x;
++    const int t = row % n_tps;
++    const int s = row / n_tps;
++    __shared__ int histogram[NBINS];
++    for (int i = tid; i < NBINS; i += BLOCK_SIZE) {
++        histogram[i] = 0;
      }
++    __syncthreads();
++
++    const indexer_topk_radix_state state = states[row];
++    const uint32_t key_inf = indexer_topk_float_to_ordered(-INFINITY);
++    const int q    = extra.q_pos != nullptr ? extra.q_pos[t + s*n_tps] : 0;
++    const int nskv = s*n_kv;
++    int * row_wvis = wvis + (size_t) row * n_blocks;
++
++    const int col0 = hb * bchunk * r;
++    const int col1 = min(col0 + bchunk * r, ncols);
++    for (int base = col0 + tid*VEC; base < col1; base += BLOCK_SIZE*VEC) {
++        int      cur_b   = -1;
++        int      cur_w   = 0;
++        uint32_t cur_key = key_inf;
++        #pragma unroll
++        for (int v = 0; v < VEC; ++v) {
++            const int c = base + v;
++            if (c >= col1) {
++                break;
++            }
++            const int b = cell_blk[c + nskv];
++            if (b != cur_b) {
++                if (cur_b >= 0) {
++                    atomicAdd(&row_wvis[cur_b], cur_w);
++                }
++                cur_b   = b;
++                cur_w   = 0;
++                cur_key = indexer_topk_block_key(score, extra, b, t, s, n_blocks, n_tps);
++            }
++            uint32_t key = cur_key;
++            bool vis = true;
++            if (extra.cell_pos != nullptr) {
++                const int cp = extra.cell_pos[c + nskv];
++                vis = (cp >= 0 && cp <= q);
++                if (!vis) {
++                    key = key_inf;
++                }
++            }
++            cur_w += vis ? 1 : 0;
++            if ((key & state.prefix_mask) == state.prefix) {
++                atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
++            }
++        }
++        if (cur_b >= 0) {
++            atomicAdd(&row_wvis[cur_b], cur_w);
++        }
++    }
++    __syncthreads();
++    const size_t off = ((size_t) row * blocks_per_row + hb) * NBINS;
++    block_histograms[off + tid] = histogram[tid];
++}
++
++template<int BLOCK_SIZE, int RADIX_BITS>
++static __global__ void indexer_topk_histogram_blocks(
++        const float * __restrict__ score,
++        const indexer_topk_extra extra,
++        const indexer_topk_radix_state * __restrict__ states,
++        const int * __restrict__ wvis,
++        int * __restrict__ block_histograms,
++        int ncols, int n_tps, int n_blocks, int n_kv,
++        int blocks_per_row, int bchunk, int r,
++        int shift) {
++    constexpr int NBINS = 1 << RADIX_BITS;
++    const int row = blockIdx.x / blocks_per_row;
++    const int hb  = blockIdx.x % blocks_per_row;
++    const int tid = threadIdx.x;
++    const int t = row % n_tps;
++    const int s = row / n_tps;
++    __shared__ int histogram[NBINS];
++    __shared__ int s_sumw;
++    for (int i = tid; i < NBINS; i += BLOCK_SIZE) {
++        histogram[i] = 0;
++    }
++    if (tid == 0) {
++        s_sumw = 0;
++    }
++    __syncthreads();
++
++    const indexer_topk_radix_state state = states[row];
++    const uint32_t key_inf = indexer_topk_float_to_ordered(-INFINITY);
++    const int nsblk = s*n_blocks;
++    const int * row_wvis = wvis + (size_t) row * n_blocks;
++
++    const int B0 = hb * bchunk;
++    const int B1 = min(B0 + bchunk, n_blocks);
++    int mysum = 0;
++    for (int b = B0 + tid; b < B1; b += BLOCK_SIZE) {
++        if (extra.blk_idx[b + nsblk] == -1) {
++            continue;   // incomplete block: no cells
++        }
++        const int w = row_wvis[b];
++        mysum += w;
++        if (w > 0) {
++            const uint32_t key = indexer_topk_block_key(score, extra, b, t, s, n_blocks, n_tps);
++            if ((key & state.prefix_mask) == state.prefix) {
++                atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], w);
++            }
++        }
++    }
++    atomicAdd(&s_sumw, mysum);
++    __syncthreads();
++    if (tid == 0) {
++        // every cell in [B0*r, min(B1*r, n_kv)) belongs to one of this range's blocks; those not
++        // in `wvis` are invisible and carry the -inf key
++        const int range_cells = max(0, min(B1 * r, n_kv) - B0 * r);
++        const int inv = range_cells - s_sumw;
++        if (inv > 0 && (key_inf & state.prefix_mask) == state.prefix) {
++            atomicAdd(&histogram[(key_inf >> shift) & (NBINS - 1)], inv);
++        }
++    }
++    __syncthreads();
++    const size_t off = ((size_t) row * blocks_per_row + hb) * NBINS;
++    block_histograms[off + tid] = histogram[tid];
  }
  
-@@ -310,6 +526,7 @@ static void indexer_topk_radix_cuda(
+ template<typename kv_t>
+@@ -310,6 +672,7 @@ static void indexer_topk_radix_cuda(
          const float * score, const int * cell_blk, const kv_t * additive,
          const indexer_topk_extra extra,
          int * dst, int ncols, int nrows, int n_tps, int n_blocks, int n_kv, int k,
@@ -1571,7 +1726,7 @@ index 1b9e63516..669841582 100644
          cudaStream_t stream) {
      constexpr int BLOCK_SIZE = 256;
      constexpr int RADIX_BITS = 8;
-@@ -318,43 +535,55 @@ static void indexer_topk_radix_cuda(
+@@ -318,43 +681,116 @@ static void indexer_topk_radix_cuda(
  
      ggml_cuda_pool_alloc<indexer_topk_radix_state> states_alloc(pool, nrows);
      ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
@@ -1622,44 +1777,128 @@ index 1b9e63516..669841582 100644
 -    ggml_cuda_pool_alloc<int> ec_alloc(pool, (size_t) nrows * cbpr);
 -    ggml_cuda_pool_alloc<int> gb_alloc(pool, (size_t) nrows * cbpr);
 -    ggml_cuda_pool_alloc<int> eb_alloc(pool, (size_t) nrows * cbpr);
--    int * g_cnt  = gc_alloc.get();
--    int * e_cnt  = ec_alloc.get();
--    int * g_base = gb_alloc.get();
--    int * e_base = eb_alloc.get();
--
++    indexer_topk_base_scan<<<nrows, BLOCK_SIZE, 0, stream>>>(
++            g_cnt, e_cnt, g_base, e_base, nrows, blocks_per_row);
++    if (grouped) {
++        indexer_topk_write_blocks_grouped<4><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
++                score, cell_blk, extra, states, g_base, e_base, dst,
++                ncols, n_tps, n_blocks, n_kv, k, blocks_per_row, 0);
++    } else {
++        indexer_topk_write_blocks<kv_t><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
++                score, cell_blk, additive, extra, states, g_base, e_base, dst,
++                ncols, n_tps, n_blocks, n_kv, k, blocks_per_row);
++    }
++}
++
++static void indexer_topk_radix_cuda_blocks(
++        ggml_cuda_pool & pool,
++        const float * score, const int * cell_blk,
++        const indexer_topk_extra extra,
++        int * dst, int ncols, int nrows, int n_tps, int n_blocks, int n_kv, int k,
++        int r, cudaStream_t stream) {
++    constexpr int BLOCK_SIZE = 256;
++    constexpr int RADIX_BITS = 8;
++    constexpr int NBINS = 1 << RADIX_BITS;
++    const int blocks_per_row = std::min((n_blocks + 1023) / 1024, 8);
++    const int bchunk = (n_blocks + blocks_per_row - 1) / blocks_per_row;
++
++    ggml_cuda_pool_alloc<indexer_topk_radix_state> states_alloc(pool, nrows);
++    ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
++    ggml_cuda_pool_alloc<int> wvis_alloc(pool, (size_t) nrows * n_blocks);
++    ggml_cuda_pool_alloc<int> gc_alloc(pool, (size_t) nrows * blocks_per_row);
++    ggml_cuda_pool_alloc<int> ec_alloc(pool, (size_t) nrows * blocks_per_row);
++    ggml_cuda_pool_alloc<int> gb_alloc(pool, (size_t) nrows * blocks_per_row);
++    ggml_cuda_pool_alloc<int> eb_alloc(pool, (size_t) nrows * blocks_per_row);
++    indexer_topk_radix_state * states = states_alloc.get();
++    int * histograms = histograms_alloc.get();
++    int * wvis = wvis_alloc.get();
+     int * g_cnt  = gc_alloc.get();
+     int * e_cnt  = ec_alloc.get();
+     int * g_base = gb_alloc.get();
+     int * e_base = eb_alloc.get();
+ 
 -    indexer_topk_count<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
 -            score, cell_blk, additive, extra, states, g_cnt, e_cnt,
 -            ncols, n_tps, n_blocks, n_kv, cbpr);
++    indexer_topk_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows, k);
++    (void) cudaMemsetAsync(wvis,  0, (size_t) nrows * n_blocks * sizeof(int), stream);
++    (void) cudaMemsetAsync(g_cnt, 0, (size_t) nrows * blocks_per_row * sizeof(int), stream);
++
++    const dim3 row_grid((size_t) blocks_per_row * nrows);
++    for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
++        if (shift == 32 - RADIX_BITS) {
++            indexer_topk_histogram_pass1<BLOCK_SIZE, RADIX_BITS, 4>
++                <<<row_grid, BLOCK_SIZE, 0, stream>>>(
++                    score, cell_blk, extra, states, histograms, wvis,
++                    ncols, n_tps, n_blocks, n_kv, blocks_per_row, bchunk, r, shift);
++        } else {
++            indexer_topk_histogram_blocks<BLOCK_SIZE, RADIX_BITS>
++                <<<row_grid, BLOCK_SIZE, 0, stream>>>(
++                    score, extra, states, wvis, histograms,
++                    ncols, n_tps, n_blocks, n_kv, blocks_per_row, bchunk, r, shift);
++        }
++        indexer_topk_radix_select<BLOCK_SIZE, RADIX_BITS>
++            <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
++        indexer_topk_hist_accum<RADIX_BITS>
++            <<<(size_t) nrows * blocks_per_row, NBINS, 0, stream>>>(
++                histograms, states, g_cnt, e_cnt, nrows, blocks_per_row, shift);
++    }
++
++    if (k <= 0 || nrows == 0) {
++        return;
++    }
      indexer_topk_base_scan<<<nrows, BLOCK_SIZE, 0, stream>>>(
 -            g_cnt, e_cnt, g_base, e_base, nrows, cbpr);
 -    indexer_topk_deterministic_write<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
 -            score, cell_blk, additive, extra, states, g_base, e_base, dst,
 -            ncols, n_tps, n_blocks, n_kv, k, cbpr);
 +            g_cnt, e_cnt, g_base, e_base, nrows, blocks_per_row);
-+    if (grouped) {
-+        indexer_topk_write_blocks_grouped<4><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
-+                score, cell_blk, extra, states, g_base, e_base, dst,
-+                ncols, n_tps, n_blocks, n_kv, k, blocks_per_row);
-+    } else {
-+        indexer_topk_write_blocks<kv_t><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
-+                score, cell_blk, additive, extra, states, g_base, e_base, dst,
-+                ncols, n_tps, n_blocks, n_kv, k, blocks_per_row);
-+    }
++    indexer_topk_write_blocks_grouped<4><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
++            score, cell_blk, extra, states, g_base, e_base, dst,
++            ncols, n_tps, n_blocks, n_kv, k, blocks_per_row, bchunk * r);
  }
  
  void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-@@ -397,12 +626,16 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+@@ -365,6 +801,7 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     const ggml_tensor * q_pos    = dst->src[4];
+     const ggml_tensor * blk_idx  = dst->src[5];
+     const ggml_tensor * blk_tail = dst->src[6];
++    const ggml_tensor * blk_cells = dst->src[7];
+     const float * score_d    = (const float *) score->data;
+     const int   * cell_blk_d = (const int  *) cell_blk->data;
+     int *         dst_d      = (int *) dst->data;
+@@ -386,6 +823,7 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     GGML_ASSERT(additive == nullptr || ggml_is_contiguous(additive));
+     GGML_ASSERT(cell_pos == nullptr || (ggml_is_contiguous(cell_pos) && ggml_is_contiguous(q_pos)));
+     GGML_ASSERT(blk_idx  == nullptr || (ggml_is_contiguous(blk_idx)  && ggml_is_contiguous(blk_tail)));
++    GGML_ASSERT(blk_cells == nullptr || blk_cells->type == GGML_TYPE_I32);
+     GGML_ASSERT(ggml_is_contiguous(dst));
+ 
+     const int n_blocks = score->ne[0];
+@@ -397,12 +835,26 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
      ggml_cuda_pool & pool = ctx.pool();
  
      if (additive == nullptr || additive->type == GGML_TYPE_F16) {
+-        indexer_topk_radix_cuda(pool, score_d, cell_blk_d,
+-                additive != nullptr ? (const half *) additive->data : nullptr, extra,
+-                dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
 +        // the additive is null on the default derived path: the value is per-block, so the
 +        // grouped histogram can share the key across a block's cells (A/B: LLAMA_INDEXER_NOGROUP)
 +        static const bool nogroup = []() { return getenv("LLAMA_INDEXER_NOGROUP") != nullptr; }();
-+        const bool grouped = additive == nullptr && !nogroup;
-         indexer_topk_radix_cuda(pool, score_d, cell_blk_d,
-                 additive != nullptr ? (const half *) additive->data : nullptr, extra,
--                dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
-+                dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, grouped, stream);
++        static const bool noblock = []() { return getenv("LLAMA_INDEXER_NOBLOCK") != nullptr; }();
++        const int r = blk_cells != nullptr ? (int) (blk_cells->ne[0] / n_blocks) : 0;
++        const bool block_path = additive == nullptr && !noblock && !nogroup &&
++                blk_cells != nullptr && blk_tail != nullptr && blk_idx != nullptr &&
++                cell_pos != nullptr && r > 0 && r * n_blocks == (int) blk_cells->ne[0];
++        if (block_path) {
++            indexer_topk_radix_cuda_blocks(pool, score_d, cell_blk_d, extra,
++                    dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, r, stream);
++        } else {
++            const bool grouped = additive == nullptr && !nogroup;
++            indexer_topk_radix_cuda(pool, score_d, cell_blk_d,
++                    additive != nullptr ? (const half *) additive->data : nullptr, extra,
++                    dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, grouped, stream);
++        }
      } else {
          indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const float *) additive->data, extra,
 -                dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
@@ -3754,7 +3993,7 @@ index 55914e7a3..9b5a8d287 100644
          default:
              GGML_ABORT("unsupported unary op for fused scale+unary");
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 2ce34caf0..6956028f4 100644
+index 2ce34caf0..af73d7c7e 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1087,6 +1087,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -3798,8 +4037,39 @@ index 2ce34caf0..6956028f4 100644
  void ggml_flash_attn_qsa_set_prec(
          struct ggml_tensor * a,
          enum ggml_prec       prec) {
+@@ -5724,6 +5751,7 @@ struct ggml_tensor * ggml_indexer_top_k(
+         struct ggml_tensor  * q_pos,
+         struct ggml_tensor  * blk_idx,
+         struct ggml_tensor  * blk_tail,
++        struct ggml_tensor  * blk_cells,
+         int                   k) {
+     GGML_ASSERT(score->type   == GGML_TYPE_F32);
+     GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
+@@ -5759,6 +5787,14 @@ struct ggml_tensor * ggml_indexer_top_k(
+         GGML_ASSERT(blk_tail->ne[1] == score->ne[2]);
+     }
+ 
++    // the block -> cell map: [ratio*n_blocks, n_stream].  optional (the block-level fast
++    // path); when present it must divide evenly into per-block slots so ratio = ne[0]/n_blocks.
++    if (blk_cells != NULL) {
++        GGML_ASSERT(blk_cells->type == GGML_TYPE_I32);
++        GGML_ASSERT(blk_cells->ne[1] == score->ne[2]);
++        GGML_ASSERT(blk_cells->ne[0] > 0 && blk_cells->ne[0] % score->ne[0] == 0);
++    }
++
+     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, k, score->ne[1], 1, score->ne[2]);
+ 
+     result->op     = GGML_OP_INDEXER_TOPK;
+@@ -5769,6 +5805,7 @@ struct ggml_tensor * ggml_indexer_top_k(
+     result->src[4] = q_pos;
+     result->src[5] = blk_idx;
+     result->src[6] = blk_tail;
++    result->src[7] = blk_cells;
+     ggml_set_op_params_i32(result, 0, k);
+ 
+     return result;
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 874cf5bd5..32dc271c0 100644
+index 874cf5bd5..f8d3174d2 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -14,6 +14,16 @@
@@ -3819,7 +4089,14 @@ index 874cf5bd5..32dc271c0 100644
  // Upper bound of the decode/verify band served by the fused hyper-connection ops
  // (ggml_cuda_op_hc_mix / _hc_combine, which assert the same bound - HC_FUSED_MAX_TOKENS
  // in ggml-cuda/hc-mix.cu). A verify batch is --spec-draft-n-max + 1 tokens and the
-@@ -1571,6 +1581,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1565,12 +1575,54 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+             derived_vis ? inp->q_vis    : nullptr,
+             derived_bias ? inp->blk_idx  : nullptr,
+             derived_bias ? inp->blk_tail : nullptr,
++            inp->blk_cells,
+             (int) width);
+     cb(top_k, "indexer_top_k", il);
+ 
      return top_k;
  }
  
@@ -3867,7 +4144,7 @@ index 874cf5bd5..32dc271c0 100644
  // Dense GQA self-attention restricted to the cells that top_k names.
  // The mask build below copies the MLA sparse path in llm_graph_context::build_attn.
  ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
-@@ -1664,6 +1715,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1664,6 +1716,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
      ggml_tensor * q = q_cur;
      ggml_tensor * k = mctx_cur->get_k(ctx0, il);
      ggml_tensor * v = mctx_cur->get_v(ctx0, il);
@@ -3877,7 +4154,7 @@ index 874cf5bd5..32dc271c0 100644
      ggml_tensor * cur;
  
      if (qsa_sparse) {
-@@ -1679,6 +1733,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1679,6 +1734,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          // derives each cell's visibility from cell_vis/q_vis instead - see findings 2c
          cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f,
                  qsa_cell_vis, qsa_q_vis);
@@ -3897,7 +4174,7 @@ index 874cf5bd5..32dc271c0 100644
          ggml_flash_attn_qsa_set_prec(cur, GGML_PREC_F32);
          cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
          cb(cur, "kqv_out", il);
-@@ -1731,9 +1798,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -1731,9 +1799,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
          const int64_t r     = hparams.dsv4_compress_ratios[il];
          const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
          const int64_t width = (int64_t) hparams.indexer_top_k + r - 1;
@@ -3925,7 +4202,7 @@ index 874cf5bd5..32dc271c0 100644
          // cause. Root-caused 2026-09-08/09: llama-bench's sync-free decode pipeline x ggml-gallocr's
          // single-layout alloc-fallback doing an unconditional full-device sync on every dense/sparse
          // topology flip (record: benchmarks/2026-09-10-*-shortcut-fix.md).  NOTE (2026-09-06): the
-@@ -1741,14 +1823,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -1741,14 +1824,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
          // must grow) was UNSAFE across backends and has been reverted: a re-reserve re-points tensor
          // addresses while the previous ubatch's kernels may still be in flight on other GPUs
          // (cross-GPU race -> in-kernel spin / memory faults at multi-ubatch prefill, reproduced on
