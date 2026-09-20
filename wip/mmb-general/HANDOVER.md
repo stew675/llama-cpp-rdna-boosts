@@ -24,6 +24,53 @@ then `README.md` (the running record) beside it.
 
 ---
 
+## UPDATE — session 5c (2026-09-19): promotion gates actually run
+
+Session 5's profile put the remaining big kernels (`mmb_routed_glu` 22.7 %, `mmb_dense` 21.1 %) out
+of reach without a split-K / IU8 restructure, so this session ran the **promotion gates** instead —
+the handover had listed all of them as never run.
+
+The test models come from `test-llama-archs -o <dir>` (~200 tiny GGUF architectures), which is the
+`test-generate-models` ctest fixture.  `build-rocm/bin` does not contain the test binaries by default.
+
+| gate | result |
+|---|---|
+| `test-recurrent-state-rollback` qwen35-dense / nemotron_h-dense / deepseek4-moe | **PASS** (multi-seq split replay matched, max diff 0) |
+| `test-recurrent-state-depth` (n_rs_seq 1..15 sweep) | **PASS** (`total failures = 0`) |
+| `test-backend-ops -o FLASH_ATTN_QSA` | **22/22** |
+| `test-backend-ops -o GATED_DELTA_NET` | **46/46** |
+| `test-backend-ops -o FLASH_ATTN_EXT` | **OK** (ROCm0) |
+
+All with `GGML_CUDA_MMB=1 GGML_CUDA_QSA3=1`.
+
+**`plain != draft-mtp` greedy text on qwen4exp — PRE-EXISTING, not this work.**  That is the delivery's
+open *cause 3*, and it needs to be stated carefully because the obvious check is misleading:
+
+| config | plain | draft-mtp | verdict |
+|---|---|---|---|
+| `MMB=1 QSA3=1` | 320 chars | 1942 chars | diverge at char **260** |
+| `MMB=0 QSA3=0` (features OFF) | 318 chars | 1964 chars | diverge at char **262** |
+
+The divergence reproduces with the features **off**, and its onset moves by 2 chars — so MMB/QSA3
+neither cause it nor change its amplitude.  (`LLAMA_QSA_OFF=1`, the documented workaround, **crashes**
+with `-md` here: `llama_server exited with code 1`, deterministically, on both modes — so it could not
+be used to demonstrate the dense reference.)
+
+**Two traps recorded for the next session:**
+
+1. The first run of the purity matrix reported `LLAMA_QSA_OFF=1 … PURE`, but **both hashes were the
+   md5 of the empty string** — that run had failed to start.  A "pure" verdict where the two sides are
+   empty is not a pass; always check the output is non-empty before comparing.
+2. `FLASH_ATTN_QSA` is now **22/22**, not the 18/18 in the older notes (cases were added);
+   `GATED_DELTA_NET` is 46/46 as expected.
+
+**Still not run:** the `W = 1..8` logits matrix with MMB on == off.  It needs a probe harness that does
+not exist in the tree (there is no width-probe tool under `tests/` or `tools/`), and it is guaranteed
+by construction anyway (`T >= 512` keeps MMB out of the whole `W <= 8` band).  Building that probe is
+the remaining gate item.
+
+---
+
 ## UPDATE — session 5b (2026-09-19): tiny-M F32 kernel — the hc `*_inject` GEMMs (+2.3-3.3 %)
 
 Session-5 next-work #1 (the remaining F32 tiny-M) is **done**.
@@ -604,9 +651,12 @@ the drifted working tree.
 * Greedy text coherent on a >2051-token prompt; the prefill re-baseline is expected and approved.
 * Combined patch `git apply --check` clean on a fresh `8a2567e1e` worktree (re-verified at session 4).
 
-**Still NOT run (blocking promotion, see §11):** the `W = 1..8` logits matrix with MMB on==off, the MTP
-acceptance gate, `test-recurrent-state-rollback`, `test-backend-ops`, and the same-seed prefill
-re-baseline document.
+**Still NOT run (blocking promotion, see §11):** the `W = 1..8` logits matrix with MMB on==off.
+Everything else on the §11 list was run in session 5c and passed — see that UPDATE at the top
+(recurrent-state x4, FLASH_ATTN_QSA 22/22, GATED_DELTA_NET 46/46, FLASH_ATTN_EXT OK; the qwen4exp
+`plain != draft-mtp` divergence is pre-existing cause 3, reproduced with the features off).  A
+same-seed **prefill re-baseline hash** also still needs writing down: MMB and QSA3 both change prefill
+numerics by design, so the approval covers it but the record does not exist yet.
 
 ---
 

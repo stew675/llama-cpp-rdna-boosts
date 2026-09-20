@@ -358,6 +358,46 @@ path to help the K=10240 hc inject pair.  It is wrong and costs 375 ms.**  The t
 bucketing launches by grid alone put `hc_inject` (760) + `ssm` (576) + others into one 1.065 ms
 average that looked like an MMB win.  **Split the bucket before believing a per-shape number.**
 
+## UPDATE — session 5c (2026-09-19): the promotion gates, run
+
+With the remaining big kernels out of reach for a safe change (`mmb_routed_glu` 22.7 %,
+`mmb_dense` 21.1 % — both need a split-K / IU8 restructure), this session ran the §11 gates that the
+handover listed as never run.
+
+Test models: `build-rocm/bin/test-llama-archs -o /tmp/test-models` (the `test-generate-models` fixture;
+~200 tiny GGUFs).  The test binaries are not in `build-rocm/bin` by default — build them by target.
+
+| gate | result |
+|---|---|
+| `test-recurrent-state-rollback` qwen35-dense / nemotron_h-dense / deepseek4-moe | **PASS** (max diff 0) |
+| `test-recurrent-state-depth` (n_rs_seq 1..15) | **PASS** (`total failures = 0`) |
+| `test-backend-ops -o FLASH_ATTN_QSA` | **22/22** (older notes say 18/18 — cases were added) |
+| `test-backend-ops -o GATED_DELTA_NET` | **46/46** |
+| `test-backend-ops -o FLASH_ATTN_EXT` | **OK** |
+
+All with `GGML_CUDA_MMB=1 GGML_CUDA_QSA3=1`.
+
+### `plain != draft-mtp` on qwen4exp is PRE-EXISTING (delivery cause 3)
+
+| config | plain | draft-mtp | divergence onset |
+|---|---|---|---|
+| `MMB=1 QSA3=1` | 320 chars | 1942 chars | char 260 |
+| `MMB=0 QSA3=0` (features OFF) | 318 chars | 1964 chars | char 262 |
+
+It reproduces with the features **off** and the onset moves 2 chars, so MMB/QSA3 neither cause nor
+worsen it.  `LLAMA_QSA_OFF=1` (the documented workaround) **crashes with `-md`** here
+(`llama_server exited with code 1`, deterministic), so it could not serve as the dense reference.
+
+### Two traps
+
+1. The first purity matrix printed `LLAMA_QSA_OFF=1 … PURE` where **both hashes were md5 of the empty
+   string** — that run had failed to start.  Check the output is non-empty before trusting a match.
+2. `FLASH_ATTN_QSA` is 22/22 now, not 18/18.
+
+**Still not run:** the `W = 1..8` logits matrix with MMB on == off — no probe harness exists in the
+tree, and it is guaranteed by construction (`T >= 512`).  A same-seed prefill re-baseline hash also
+still needs writing down.
+
 ## UPDATE — session 5b (2026-09-19): tiny-M F32 kernel for the hc `*_inject` GEMMs (+2.3-3.3 %)
 
 Next-work #1 from the session-5 list (the remaining F32 tiny-M) is done.
