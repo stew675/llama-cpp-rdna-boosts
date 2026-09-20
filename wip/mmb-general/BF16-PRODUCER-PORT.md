@@ -1,11 +1,13 @@
 # Brief — bf16 producer port (HC intermediates + producer marking)
 
-**Status:** IN PROGRESS (session 8, tip `ccf28bc65`).  **Steps 1 and 2, and the `gate` + HC
-normalized-stream halves of 3/4, are landed** behind `GGML_CUDA_MMB_HC16=1` — see the session-8
-UPDATE in `HANDOVER.md`: gfx1151 pp8192 950.8 -> 961.9 (+1.2 %), pp2048 973.1 -> 994.2 (+2.2 %); the
-xn copy is bit-identical and the gate is the only numerics change.  **What remains:** the `hc_mixed`
-producer (we own `dsv4_hc_pre`, but its consumers must all read BF16) and the generic
-`final_output` / `MAP_CUSTOM1` producers.  **Read `HANDOVER.md` first** (the WIP entry point), then this.
+**Status:** DONE (sessions 8-9, tip `d6b803e70`).  The full port landed behind `GGML_CUDA_MMB_HC16=1`:
+the graph marks MMB dense GEMM activations `bf16_copy`, and the fused `rms_norm+mul`,
+`sigmoid/silu+mul`, `scale+unary`, generic unary and `dsv4_hc_pre` producers emit the copy into slot 0
+(the gate uses the existing slot-1 / BF16-only path).  Every copy is bit-identical (PPL 10.6428 and
+greedy `9930c674a6ca` unchanged, all gates green), the whole `mmb_cvt` bucket is gone except the
+`ple_embd` model tensor, and gfx1151 gives pp8192 951.6 -> 963.7 (+1.3 %) / pp2048 977.1 -> 996.7
+(+2.0 %).  See the session-8/9 UPDATEs in `HANDOVER.md`.  Remaining here: nothing (the `ple_embd`
+loader-side copy is optional); the next step is promotion.  **Read `HANDOVER.md` first** (the WIP entry point), then this.
 This is the turnkey brief for the next session: it is self-contained (mandate, environment, the
 established facts, the reference map, the step plan, the gates, and a copy-paste prompt).
 
@@ -88,11 +90,12 @@ lines — use it to see which producers are converting.
 
 ## 5. Step plan
 
-> **Session-8 progress:** step 1 (mark lifetime) DONE; step 2 (the marking pass) DONE for the gate
-> only; the `gate` half of step 4/5 DONE (`mmb_hc16_copy_ok`; slot 1 already existed and was unused);
-> the `xn` producer DONE as a *bit-identical* in-addition-to-F32 copy in the existing
-> `rms_norm+mul` fusion (slot 0) — this deliberately does **not** mark `xn` BF16-only, so no consumer
-> arm is needed.  The `hc_mixed` and `final_output`/`MAP_CUSTOM1` producers are open.
+> **Sessions 8-9 progress:** all DONE.  Step 1 (mark lifetime), step 2 (the marking pass — the gate
+> plus every MMB dense GEMM activation), the `gate` producer and the producer side of step 3/5 for the
+> HC normalized stream, the HC mixed stream (`dsv4_hc_pre`), the gated attention/norm outputs
+> (`unary_mul`), the `scale+unary` HC `lo` and the generic unary.  The `xn`/mixed/attention copies use
+> the *in-addition-to-F32* slot-0 route (so no consumer arm is needed); the gate uses the BF16-only
+> slot-1 route with the `dsv4_hc_pre` arm.  Only `ple_embd` (model tensor) still converts.
 
 1. **Mark lifetime first.** At the very top of our `ggml_backend_cuda_graph_optimize`
    (`ggml-cuda.cu:6185`) — **before** the `enable_graph_optimization` / `use_cuda_graph` early returns —

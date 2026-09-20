@@ -97,6 +97,31 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 9 (2026-09-20): the bf16-producer port is done — the whole `mmb_cvt` bucket is
+## gone, bit-identically (+1.3 % pp8192 / +2.0 % pp2048); plus a **delivery** op-name bug
+
+Session 8 did the HC gate and normalized stream.  This session generalised the mechanism: the graph
+now marks the **activation of every MMB dense prefill GEMM** `bf16_copy`, and the fused
+`rms_norm+mul`, fused `sigmoid/silu+mul`, fused `scale+unary`, generic unary and `dsv4_hc_pre` all
+emit the copy into slot 0 alongside their F32 output.  The GEMM finds it in the slot and skips its
+`mmb_cvt` pass.  All copies are RNE-rounded exactly as `mmb_cvt_f32_bf16` and the F32 outputs stay
+valid, so everything is **bit-identical**: PPL c2048 stays 10.6428, greedy sha stays `9930c674a6ca`,
+FLASH_ATTN_QSA/GATED_DELTA_NET/FLASH_ATTN_EXT pass, W=1..8 width probe pure.
+
+| config | pp2048 | pp8192 |
+|---|---:|---:|
+| `HC16=0` | 977.1 | 951.6 |
+| `HC16=1` | **996.7 (+2.0 %)** | **963.7 (+1.3 %)** |
+
+`LLAMA_MMB_CVT_LOG=1` now shows only the `ple_embd` model-tensor conversion — the `hc_norm`,
+`hc_mixed`, `final_output`, `attn_gated` and unary families are gone.
+
+**Delivery bug found and fixed:** `GGML_OP_NAME` in `ggml/src/ggml.c` is missing `"INDEXER_FILL"`
+(the enum has `GGML_OP_INDEXER_FILL` from delivery block 14; the base `8a2567e1e` confirms it).
+`ggml_op_name()` is therefore shifted by one from there on (`UNARY` prints as `MAP_CUSTOM1`).  It is
+cosmetic in the delivery but it mislabeled every `MMB_CVT` log; fixed by WIP commit `d1463bff3` and
+flagged to move into the delivery.
+
 ## UPDATE — session 8 (2026-09-20): the bf16-producer port begins — HC gate + normalized stream (+1.2 %
 ## pp8192 / +2.2 % pp2048), behind `GGML_CUDA_MMB_HC16=1`
 

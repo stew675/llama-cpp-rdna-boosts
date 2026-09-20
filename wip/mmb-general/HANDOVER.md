@@ -25,20 +25,25 @@ then `README.md` (the running record) beside it.
 > normalized stream (the fused rms_norm+mul emits a BF16 copy into slot 0) are native-bf16 producers —
 > **pp8192 950.8 -> 961.9 (+1.2 %), pp2048 973.1 -> 994.2 (+2.2 %)**, the gate is a measured numerics
 > change and the xn copy is bit-identical; `hc_mixed`/`final_output` and the (640 ms / 3.8 %)
-> `mmb_cvt` bucket are what remain.
+> `mmb_cvt` bucket are what remain.  **Session 9 finished it**: the graph now marks the activation of
+> every MMB dense prefill GEMM "wants a BF16 copy", and the fused `rms_norm+mul`, `sigmoid+mul`,
+> `scale+unary` and generic unary producers all emit it — so the whole `mmb_cvt` bucket is gone
+> (only the `ple_embd` model tensor still converts), **bit-identical** (PPL unchanged, greedy text
+> unchanged, all gates green), for **pp8192 951.6 -> 963.7 (+1.3 %), pp2048 977.1 -> 996.7 (+2.0 %)**;
+> the same session also found and fixed a **delivery** bug (see the session-9 UPDATE).
 
 **Current state (start here):**
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`ccf28bc65`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`d6b803e70`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0019` + `commits.txt`, in this repo, pushed to `origin/main` |
-| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (19 commits) |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0021` + `commits.txt`, in this repo, pushed to `origin/main` |
+| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (21 commits) |
 | build | §3 | run | §4 |
-| current numbers | the **session 8 UPDATE below** (the HC gate + normalized-stream bf16 producers, +1.2 %/+2.2 % pp8192/pp2048), then the session 7 pack and session 6 ceiling updates; the session 5 tables predate them |
+| current numbers | the **session 9 UPDATE below** (the full bf16-producer port: the `mmb_cvt` bucket eliminated, +1.3 %/+2.0 % pp8192/pp2048, bit-identical) and the **delivery `GGML_OP_NAME` fix**; then sessions 8/7/6 |
 
-**Order the UPDATE sections by session: 8 (newest, 2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
+**Order the UPDATE sections by session: 9 (newest, 2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body and are correct except where
 an UPDATE says otherwise.
@@ -66,18 +71,76 @@ an UPDATE says otherwise.
    **Turnkey brief: [`BF16-PRODUCER-PORT.md`](BF16-PRODUCER-PORT.md)** (reference map, step plan,
    gates, pitfalls, copy-paste prompt).  `dsv4_hc_post` is already at the bandwidth ceiling; the
    GLU→down bf16 reuse is already in place (`mmb_slot[2]`).
-   **Session 8 landed the first two producers (+1.2 % pp8192 / +2.2 % pp2048, `GGML_CUDA_MMB_HC16=1`):**
-   the mark lifetime + the gate producer (dense `MUL_MAT [320 x 10240]`, slot 1) and the HC normalized
-   stream (the fused `rms_norm+mul` emits a bit-identical BF16 copy into slot 0).  **What remains:** the
-   `hc_mixed` producer (we own `dsv4_hc_pre`, but every consumer of `mixed` must then read BF16 — it
-   feeds the attention/ffn GEMMs and possibly non-GEMM ops) and the generic `final_output` /
-   `MAP_CUSTOM1` families.  See the session-8 UPDATE above.
+   **Session 8 landed the gate and the HC normalized stream; session 9 generalised the mark and closed
+   the rest** (+1.3 % pp8192 / +2.0 % pp2048, bit-identical) — the activation mark now covers the
+   fused `rms_norm+mul`, `sigmoid+mul`, `scale+unary`, generic unary and `dsv4_hc_pre` producers.  Only
+   the `ple_embd` model tensor still converts.  See the session-9 UPDATE above.
 4. **The residual ~18 % kernel-local gap in `dsv4_hc_pre`** (~0.8 %) — smaller, still unexplained.
 5. **`ssm_alpha/beta`** (~1.2 %) — generalise the tiny-M kernel past the 8-accumulator register limit.
 6. **The indexer** — 1 % at 8K, 3.2 % at 32K, grows with context; deliberately deferred behind 3-5.
 7. **Promotion**: every §11 gate now passes (see 5c/5d).  What remains is the rebase onto a canonical
    fork at `ebbb18522` + `scripts/apply-all.sh`, regenerating `patches/`, and deciding whether MMB
    rides as a block-08 amendment.  Given 1-2 are exhausted, this is now the highest-value step.
+
+---
+
+## UPDATE — session 9 (2026-09-20): the bf16-producer port is done — the whole `mmb_cvt` bucket is
+## eliminated, bit-identically (+1.3 % pp8192 / +2.0 % pp2048); plus a **delivery** op-name bug fix
+
+Session 8 did the gate and the HC normalized stream.  This session generalised the mechanism and
+closed the rest of the port.  Tip **`d6b803e70`**, three commits on top of the session-7 pack.
+
+### What is done
+
+**A general "activation wants a BF16 copy" mark.**  The graph optimizer now walks every MMB dense
+prefill GEMM and marks its activation (`src1`'s root) `bf16_copy`.  Producers that can emit one write
+it into the pinned slot 0 **in addition to** their F32 output, and the GEMM's `mmb_bf16_activation`
+conversion finds it in the slot and is skipped.  The F32 output stays valid for every other consumer
+and the copy is RNE-rounded exactly as `mmb_cvt_f32_bf16`, so the GEMM result is **bit-identical**.
+The honoured producers are:
+
+| producer | file | what it covers |
+|---|---|---|
+| fused `rms_norm+mul` | `norm.cu` | HC `xn`, every norm feeding a GEMM |
+| fused `sigmoid/​silu+mul` (`ggml_cuda_op_unary_mul`) | `unary.cu` | `attn_gated`, `final_output` (the gated norm) |
+| fused `scale+unary` | `unary.cu` | the HC `lo = silu(scale(down))`, the `hc_gate` activation |
+| generic unary | `unary.cu` | any other unary activation |
+| `dsv4_hc_pre` | `dsv4-hc.cu` | the HC mixed stream |
+
+`LLAMA_MMB_CVT_LOG=1` now prints **only the `ple_embd` model-tensor conversion** (that tensor's
+producer is the GGUF loader, so it cannot emit a copy).  The `hc_norm` / `hc_mixed` /
+`final_output` / `attn_gated` / unary families are all gone.
+
+### Measured (gfx1151, IQ4_XS Flash-Next, bf16 KV, `-b/-ub 2048`, `GGML_CUDA_MMB=1 GGML_CUDA_QSA3=1`)
+
+| config | pp2048 | pp8192 | PPL c2048 | greedy sha |
+|---|---:|---:|---:|---|
+| `HC16=0` | 977.1 | 951.6 | 10.5771 | `9930c674a6ca` |
+| `HC16=1` (gate + all copies) | **996.7** | **963.7** | **10.6428** | `9930c674a6ca` |
+
+All the session-9 producers are bit-identical: the PPL and greedy hash are exactly the session-8
+gate-only values, and `FLASH_ATTN_QSA` (22/22) / `GATED_DELTA_NET` (46/46) / `FLASH_ATTN_EXT` pass
+while the `W = 1..8` width probe stays pure (maxdiff 0).  The **only** numerics change in the whole
+port remains the session-8 gate BF16 (PPL +0.066, within the c2048 run's +-0.68 bar).
+
+### A **delivery** bug found on the way: `GGML_OP_INDEXER_FILL` is missing from `GGML_OP_NAME`
+
+`ggml/src/ggml.c`'s `GGML_OP_NAME` table has no `"INDEXER_FILL"` entry (the enum has
+`GGML_OP_INDEXER_FILL`, added by delivery block 14; the base `8a2567e1e` confirms it is absent).
+`ggml_op_name()` is `GGML_OP_NAME[op]`, so **every op from `INDEXER_FILL` onward is shifted by one**:
+`GGML_OP_UNARY` prints as `MAP_CUSTOM1`, `HC_MIX` as `INDEXER_FILL`, and so on.  It is cosmetic in
+the delivery (`ggml_op_name` is only used for logging -- checked), but it is exactly what made the
+session-7 `MMB_CVT` log label the `lo = silu(scale(...))` producer `MAP_CUSTOM1` and sent this
+session on a chase.  Fixed in the WIP by commit `d1463bff3`; **it belongs in the delivery** (a
+one-line addition to block 14) when the promotion happens.
+
+### What remains (small)
+
+* `ple_embd` is the last `mmb_cvt`: its producer is the model loader, so a load-time bf16 copy would
+  be needed (or it stays as-is; it is one conversion per graph).
+* `dsv4_hc_pre`'s ~18 % kernel-local gap (session 5e) and `ssm_alpha/beta` (session 5b) are the other
+  outstanding kernel-local items.
+* The delivery `GGML_OP_NAME` fix, and then **promotion** (all gates green).
 
 ---
 
@@ -1195,6 +1258,17 @@ the drifted working tree.
 * `LLAMA_MMB_CVT_LOG=1`: all 57 `hc_norm` conversions disappear with `HC16=1`.
 * Combined backup `mmb-general.patch` + `patches/0001..0019`: `git apply --check` clean on a fresh
   `8a2567e1e` (19 commits).
+
+**Session 9 (the full bf16-producer port):**
+
+* `GGML_CUDA_MMB_HC16=1` vs `0` on gfx1151, IQ4_XS Flash-Next, bf16 KV, `-b/-ub 2048`: pp8192
+  951.6 -> 963.7 (+1.3 %), pp2048 977.1 -> 996.7 (+2.0 %) (interleaved repeated runs).
+* PPL c2048 **10.6428** (identical to the session-8 gate-only build) and same-seed greedy text
+  `9930c674a6ca` -- all session-9 producers are bit-identical.
+* `test-backend-ops -o FLASH_ATTN_QSA` 22/22, `-o GATED_DELTA_NET` 46/46, `-o FLASH_ATTN_EXT` OK;
+  `test-logits-width-probe` P=1024 width_purity=PASS (maxdiff 0).
+* `LLAMA_MMB_CVT_LOG=1`: only `ple_embd` remains.
+* The delivery `GGML_OP_NAME` `INDEXER_FILL` fix is confirmed against the base `8a2567e1e`.
 
 **Still NOT run (blocking promotion, see §11):** nothing — the `W = 1..8` matrix is now done
 (session 5d UPDATE at the top; probe `tests/test-logits-width-probe.cpp`, gate PASSES).  A same-seed
