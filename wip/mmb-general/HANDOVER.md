@@ -35,12 +35,54 @@ The WIP lives on **two dedicated branches**.  **New work goes to those branches,
 
 ## FOR THE NEXT SESSION — start here
 
-**Mandate.** Optimise the **indexer top-k** (`GGML_OP_INDEXER_TOPK`, the delivery's block-14 fused op) --
-it is the long-context lever (0.90 % of pp8192, **2.94 % of pp32768**, and it grows ~linearly with
-context, so it is the first thing that matters at 64K/128K).  The delivery-facing prefill work is
-essentially done (the bf16-producer port including the `xn` stream, the `dsv4_hc`/concat/moe/unary
-non-temporal wins, the QSA v3 path, the F32 split, the tiny-M kernel; all §11 gates green).  After the
-indexer, what remains is the tail of the non-temporal sweep, one delivery bug fix, and promotion.
+**Session start checklist (do this first).**
+
+1. `git -C ~/llama-cpp-rdna-boosts switch wip-mmb-general` — verify with `git branch --show-current`
+   (must be **`wip-mmb-general`**, never `main`).
+2. `cd ~/llama-wip-mmb`; confirm `git status` clean and `git log --oneline -1` = **`5d55da3e9`**.
+3. Build with the §3 command; run the **§Gates** before/after any numerics-touching change (all
+   currently green: PPL **10.6015**, greedy **`9c281c415082`**, width probe **PASS**).
+4. Pick an item from **Remaining work** below.
+5. Commit the record to `wip-mmb-general` and push (`origin/wip-mmb-general`).
+
+**Mandate.**  The campaign's prefill work is essentially complete: the general-purpose `mmb` weight
+GEMM, the QSA v3 path, the bf16-producer port (incl. the `xn` stream), the `dsv4_hc`/concat/moe/unary
+non-temporal wins, the F32 split and the tiny-M kernel are all landed, and sessions 16–18 took the
+**indexer top-k** (`GGML_OP_INDEXER_TOPK`, the delivery's block-14 fused op, once 2.94 % of pp32768) to
+**1.47 %**.  End-to-end prefill is **+32 % at pp2048 / +43–48 % at 4k–32k** against the true delivery
+base (`benchmarks/2026-09-20-qwen4exp-iq4xs-prefill-wip-vs-base.md`).  All §11 gates are green.
+**What remains is the prioritized list below**; the detailed sections further down (the indexer shapes,
+the per-kernel numbers, the measurement budget) are the reference for it.
+
+**Remaining work (prioritized — the whole list as of session 18):**
+
+* **A. Indexer (the active lever).**
+  1. **Block-level gather/emit — the one real remaining optimisation.**  The gather is still
+     cell-level (`indexer_topk_write_blocks_grouped`, **262 ms at 32K = 21 % of the family**); emitting
+     each selected block's cells directly would take it to ~60 ms (~1.2x on the family).  Blocked on
+     making it **order-exact**: `blk_cells` lists a block's cells in `idx % r` order, which equals
+     ascending **column** order only when the cache cell index is the position (single sequence, no
+     ranked/mrope reorder) — otherwise the block's cells need a small sort — and the **dead/spare
+     block** (`blk_idx == INT32_MAX`, the unpooled incomplete tail + empty cells) is **not** in
+     `blk_cells` at all and still needs a scan.  It must preserve the deterministic ascending-column
+     order (gate 7) and be checked with the same-seed text gate, not just t/s.
+  2. Small polish: template the `indexer_topk_extra` branches (`blk_idx`/`cell_pos` are run-time checks
+     in the hot loop); optionally fuse `hist_accum` into `select` (blocked on `select` being per-row
+     while the suffix counts are per-(row, block)).
+  3. **Closed/refuted — do not redo:** "compact after pass 1" (cell tie groups are 50–60 % of the
+     cache); a wider radix / fewer passes (the wider `select`/`hist_accum` reads offset the saved pass).
+* **B. Non-temporal sweep remainder (small).**  qsa3 pack kernels (6.5 ms), the `rms_norm`/other unary
+  producers, and `ssm_conv` under a different shape.  Rule: **loads only, per-kernel, A/B load vs
+  store** (a non-temporal *store* evicts the next op's input).
+* **C. Recorded follow-ups (not scheduled).**  `ple_embd` is the last `mmb_cvt` (its producer is the
+  GGUF loader, so it needs a load-time bf16 copy); `dsv4_hc`'s `mixed` as BF16-only would save ~21 MB/
+  call but changes the GDN recurrence and MoE-routing numerics (deliberately out of scope).
+* **D. Delivery items to fold in at promotion (block 14).**  `GGML_OP_INDEXER_FILL` is missing from
+  `GGML_OP_NAME` (one line; already fixed in the WIP by `d1463bff3`); and the new **`blk_cells`
+  `src[7]`** on `GGML_OP_INDEXER_TOPK` (the session-18 interface change).
+* **E. Promotion (maintainer-gated).**  Rebase onto a canonical fork rebuilt at `ebbb18522` +
+  `scripts/apply-all.sh`, regenerate `patches/` + `release.json`, and decide whether MMB rides as a
+  **block-08 amendment**.  Every gate passes; it needs the maintainer's go-ahead + a beta window.
 
 **Progress (sessions 16-18):** the indexer is now **~2.1x faster** and still bit-identical.  Session 16
 removed the full-width count pass (the gather's per-block greater/equal counts are derived from the
@@ -120,9 +162,9 @@ MMB dense shapes.
    into llama-cli-visible nondeterminism.  Any rewrite must preserve that order (the `k_bin_bcast`
    tie-break precedent) and be checked with the same-seed text gate, not just t/s.
 
-**Next work**
+**Next work — detail (the reference for the prioritized list at the top of this brief)**
 
-### 1. THE INDEXER (this session's mandate)
+### A. The indexer — shapes, algorithm and measured cost (items A1–A3)
 
 **Where it is.**  `ggml/src/ggml-cuda/indexer-topk.cu` (422 lines, the whole top-k) +
 `indexer-score.cu` (the score kernels) + `ggml/src/ggml-cuda/ggml-cuda.cu` (the 3 op hooks) +
@@ -232,9 +274,14 @@ Untested: the qsa3 pack kernels (6.5 ms), the `rms_norm`/other unary producers, 
 different shape.  Rule: **loads only, per-kernel, A/B load vs store** (sessions 13/14); `rms_norm_f32`
 is not a candidate (reads `x` twice).
 
-### 3. Delivery bug: `GGML_OP_INDEXER_FILL` missing from `GGML_OP_NAME`
-Found in session 9, already fixed in this WIP by `d1463bff3`; delivery `patches/0014` (block 14) still
-has it -- one line in the name table, fold in at the next delivery regeneration.
+### D. Delivery items to fold into block 14
+
+1. **`GGML_OP_INDEXER_FILL` missing from `GGML_OP_NAME`** -- found in session 9, already fixed in this
+   WIP by `d1463bff3`; delivery `patches/0014` (block 14) still has it (every op from `INDEXER_FILL`
+   onward is shifted by one in the name table).  One line to fold in at the next regeneration.
+2. **`blk_cells` `src[7]` on `GGML_OP_INDEXER_TOPK`** (session 18) -- the block-level histogram path
+   needs it; it must fold into block 14 at promotion (the `ggml_indexer_top_k` signature in
+   `ggml/include/ggml.h`/`ggml/src/ggml.c`, and the call in `src/models/qwen4exp.cpp`).
 
 ### 4. Promotion (maintainer-gated)
 Every §11 gate passes.  Rebase onto a canonical fork rebuilt at `ebbb18522` + `scripts/apply-all.sh`,
