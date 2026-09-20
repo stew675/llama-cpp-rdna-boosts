@@ -1,0 +1,370 @@
+From dea321f4ab40a17dfb8a007af31748749868c5c9 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 20 Sep 2026 12:09:48 -0500
+Subject: [PATCH 23/23] WIP HC16: make the HC normalized stream xn BF16-only
+
+The xn producer (fused rms_norm+mul) now skips its F32 store when every
+consumer reads the BF16 copy: the down GEMM (already bf16), dsv4_hc_pre
+src[0] (new xbf16 arm) and the tiny-M F32 inject GEMMs (new bf16 X read).
+
+xn is the one activation with delayed consumers, so its copy gets a
+dedicated producer slot (4): the generic slot 0 is reused by every other
+activation copy in between, and dsv4_hc_pre writes its own output there.
+
+PPL c2048 10.5771 (HC16=0) / 10.6015 (HC16=1), greedy re-baselined.
+---
+ ggml/src/ggml-cuda/dsv4-hc.cu   | 32 ++++++++++---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 13 +++++-
+ ggml/src/ggml-cuda/mmb.cu       | 83 +++++++++++++++++++++++++++------
+ ggml/src/ggml-cuda/mmb.cuh      |  7 +++
+ ggml/src/ggml-cuda/norm.cu      |  4 +-
+ ggml/src/ggml-cuda/unary.cu     | 12 ++---
+ 6 files changed, 121 insertions(+), 30 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/dsv4-hc.cu b/ggml/src/ggml-cuda/dsv4-hc.cu
+index d9658e78a..dc0f872f7 100644
+--- a/ggml/src/ggml-cuda/dsv4-hc.cu
++++ b/ggml/src/ggml-cuda/dsv4-hc.cu
+@@ -108,7 +108,7 @@ static __global__ void dsv4_hc_comb_f32(
+     }
+ }
+ 
+-template <bool gated, bool wbf16>
++template <bool gated, bool wbf16, bool xbf16>
+ static __global__ void dsv4_hc_pre_f32(
+         const float * x,
+         const float * weights,
+@@ -142,7 +142,15 @@ static __global__ void dsv4_hc_pre_f32(
+ 
+     float sum = 0.0f;
+     for (int64_t ih = 0; ih < hc; ++ih) {
+-        const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
++        float xv;
++        if constexpr (xbf16) {
++            // HC16: the xn producer skipped its F32 store; read the bf16 copy instead (exact
++            // expansion of the RNE-rounded value, so only the F32->bf16 rounding is new).
++            const uint16_t h = ((const uint16_t *) x)[i0*sx0 + ih*sx1 + it*sx2];
++            xv = __uint_as_float(((uint32_t) h) << 16);
++        } else {
++            xv = x[i0*sx0 + ih*sx1 + it*sx2];
++        }
+         float wv;
+         if constexpr (gated) {
+             float wr;
+@@ -288,14 +296,24 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+     const ggml_tensor * w_root = weights->view_src ? weights->view_src : weights;
+     const uint16_t * w16 = (gated && ggml_cuda_mmb_is_bf16_only(w_root)) ? ggml_cuda_mmb_cache_lookup(w_root) : nullptr;
+ 
++    // HC16: the normalized stream xn (src[0]) may have been marked BF16-only by the graph optimizer
++    // when every consumer (this op and the two F32 inject GEMMs) reads the bf16 copy.  Then its
++    // producer skipped the F32 store and only the bf16 slot holds data.  NOTE: x is a double view
++    // (mul -> reshape_2d -> reshape_3d) and the mark is on the mul root, so walk the whole view chain.
++    const ggml_tensor * x_root = x;
++    while (x_root->view_src) x_root = x_root->view_src;
++    const uint16_t * x16 = ggml_cuda_mmb_is_bf16_only(x_root) ? ggml_cuda_mmb_cache_lookup(x_root) : nullptr;
++
+     const int block_size = 256;
+     const int64_t nr = n_embd * n_tokens;
+     const dim3 block_dims(block_size, 1, 1);
+     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+ 
+-    auto kernel = gated ? (w16 ? dsv4_hc_pre_f32<true, true> : dsv4_hc_pre_f32<true, false>)
+-                        : dsv4_hc_pre_f32<false, false>;
++    auto kernel = gated ? (w16 ? (x16 ? dsv4_hc_pre_f32<true, true, true>  : dsv4_hc_pre_f32<true, true, false>)
++                               : (x16 ? dsv4_hc_pre_f32<true, false, true> : dsv4_hc_pre_f32<true, false, false>))
++                        : (x16 ? dsv4_hc_pre_f32<false, false, true> : dsv4_hc_pre_f32<false, false, false>);
++    const float * xptr = x16 ? (const float *) x16 : (const float *) x->data;
+     const float * wptr = w16 ? (const float *) w16 : (const float *) weights->data;
+     // HC16: if this mixed stream is an MMB GEMM activation, also emit the BF16 copy the GEMM will
+     // read (RNE-rounded exactly as mmb_cvt_f32_bf16), so it skips its own conversion pass.  The F32
+@@ -303,13 +321,13 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+     uint16_t * dst16 = nullptr;
+     bool store_f32 = true;
+     if (ggml_cuda_mmb_is_bf16_only(dst)) {
+-        dst16 = ggml_cuda_mmb_slot_reserve(ctx, 0, dst, (size_t) ggml_nelements(dst));
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, dst, (size_t) ggml_nelements(dst));
+         store_f32 = false;
+     } else if (ggml_cuda_mmb_wants_bf16_copy(dst)) {
+-        dst16 = ggml_cuda_mmb_slot_reserve(ctx, 0, dst, (size_t) ggml_nelements(dst));
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, dst, (size_t) ggml_nelements(dst));
+     }
+     ggml_cuda_kernel_launch(kernel, launch_params,
+-            (const float *) x->data, wptr, (float *) dst->data,
++            xptr, wptr, (float *) dst->data,
+             n_embd, hc, n_tokens,
+             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
+             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c087d8415..aab997949 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6263,10 +6263,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                     for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (rootof(t->src[s]) == root) { uses = true; break; }
+                     if (!uses) continue;
+                     if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) continue;
+-                    if (t->op == GGML_OP_MUL_MAT && t->src[1] && rootof(t->src[1]) == root && t->src[0] && t->src[0]->type != GGML_TYPE_F32 &&
+-                            ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
++                    if (t->op == GGML_OP_MUL_MAT && t->src[1] && rootof(t->src[1]) == root && t->src[0] &&
++                            ggml_cuda_mmb_reads_bf16_act(t->src[0], t->src[1], t)) continue;
+                     if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] && rootof(t->src[1]) == root &&
+                             ggml_cuda_mmb_supported_mmid(t->src[0], t->src[1], t->src[2], t)) continue;
++                    // dsv4_hc_pre reads src[0] (the HC normalized stream) through the bf16 cache when
++                    // the activation is marked BF16-only (dsv4-hc.cu's xbf16 arm).  It is the one
++                    // consumer that runs well after the producer, so give xn a dedicated slot: the
++                    // generic slot 0 is reused by every other activation copy in between (and
++                    // dsv4_hc_pre writes its own output there).
++                    if (t->op == GGML_OP_DSV4_HC_PRE && t->src[0] && rootof(t->src[0]) == root) {
++                        ggml_cuda_mmb_mark_bf16_slot(root, 4);
++                        continue;
++                    }
+                     return false;
+                 }
+                 return true;
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 9fda02372..056e9687a 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -824,7 +824,7 @@ __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo
+ // measured *worse* (pp8192 954.8 / 952.3 vs 957.4 at TT=1), so L2 serves the W panels well enough
+ // that the extra live registers and reduced block count cost more than the traffic saved.  Kept as
+ // a knob because the balance is a property of this cache, not of the algorithm.
+-template<int MMAX, int TT>
++template<int MMAX, int TT, bool XBF16 = false>
+ __global__ void __launch_bounds__(MMB_NT)
+ mmb_tiny_m_f32_kernel(const float * __restrict__ W, const float * __restrict__ X,
+                       float * __restrict__ D, const int M, const int K, const int T) {
+@@ -837,18 +837,33 @@ mmb_tiny_m_f32_kernel(const float * __restrict__ W, const float * __restrict__ X
+     for (int i = 0; i < TT; ++i)
+ #pragma unroll
+         for (int m = 0; m < MMAX; ++m) acc[i][m] = make_float4(0.f, 0.f, 0.f, 0.f);
+-    const float4 * xrow[TT];
++    const float4   * xrow[TT];
++    const uint16_t * xhrow[TT];
+ #pragma unroll
+     for (int i = 0; i < TT; ++i) {
+         const int t = t0 + i;
+         // out-of-range tokens get a valid dummy row; their results are dropped on the way out
+-        xrow[i] = (const float4 *) (X + (size_t) (t < T ? t : 0) * K);
++        const int tr = t < T ? t : 0;
++        xrow[i]  = (const float4 *) (X + (size_t) tr * K);
++        xhrow[i] = (const uint16_t *) X + (size_t) tr * K;
+     }
+     for (int k4 = lane; k4 < nk4; k4 += 32) {
+         const int k = k4 << 2;
+         float4 xv[TT], wv[MMAX];
+ #pragma unroll
+-        for (int i = 0; i < TT; ++i) xv[i] = xrow[i][k4];
++        for (int i = 0; i < TT; ++i) {
++            if constexpr (XBF16) {
++                // HC16: the producer marked this activation BF16-only, so X is a bf16 buffer (the
++                // F32 tensor was never written).  RNE-rounded on the way in, so the value matches
++                // exactly what the old F32->bf16 conversion produced (a numerics change vs rocBLAS
++                // only in that the GEMM now consumes the same rounded activation as the bf16 path).
++                const uint2 p = *(const uint2 *) (xhrow[i] + k);
++                xv[i] = make_float4(gm_bf2f((uint16_t) p.x), gm_bf2f((uint16_t) (p.x >> 16)),
++                                    gm_bf2f((uint16_t) p.y), gm_bf2f((uint16_t) (p.y >> 16)));
++            } else {
++                xv[i] = xrow[i][k4];
++            }
++        }
+ #pragma unroll
+         for (int m = 0; m < MMAX; ++m) wv[m] = (m < M) ? *(const float4 *) (W + (size_t) m * K + k) : make_float4(0.f, 0.f, 0.f, 0.f);
+ #pragma unroll
+@@ -959,11 +974,19 @@ __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t *
+ 
+ struct mmb_cache_entry { const ggml_tensor * root; const void * data; size_t n; ggml_cuda_pool_alloc<uint16_t> * buf; };
+ static std::vector<mmb_cache_entry> g_mmb_cache;
+-static mmb_cache_entry g_mmb_slots[4] = {{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr}};
++// Pinned producer slots (pinned until the next producer of the same slot): 0 = generic MMB-GEMM
++// activation copies, 1 = HC gate, 2 = GLU, 3 = routed MoE output, 4 = HC normalized stream xn.
++// Slot 4 exists because xn is the one activation with *delayed* consumers (dsv4_hc_pre src[0] and
++// the tiny-M inject GEMMs), so its copy cannot share the aggressively-reused generic slot 0 -- and
++// dsv4_hc_pre itself reads x from the slot while writing its own output to slot 0.
++static constexpr int MMB_SLOT_COUNT = 5;
++static mmb_cache_entry g_mmb_slots[MMB_SLOT_COUNT] = {{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr}};
+ static std::unordered_set<const ggml_tensor *> g_mmb_bf16_only;
+ // "also emit a BF16 copy" mark: the F32 output stays valid; producers that can emit a BF16 side copy
+ // write it into slot 0 and the MMB activation conversion finds and skips it.
+ static std::unordered_set<const ggml_tensor *> g_mmb_bf16_copy;
++// BF16-only tensors that must not use the generic slot 0 (their copy has to outlive other producers).
++static std::unordered_map<const ggml_tensor *, int> g_mmb_bf16_slot;
+ 
+ static size_t mmb_cache_max() { static const int v = getenv("GGML_CUDA_MMB_CACHE") ? atoi(getenv("GGML_CUDA_MMB_CACHE")) : 4; return (size_t) v; }
+ static const ggml_tensor * mmb_root(const ggml_tensor * t) { return t->view_src ? t->view_src : t; }
+@@ -1131,7 +1154,7 @@ const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t) {
+     for (auto & e : g_mmb_cache) if (e.root == root && e.data == t->data) return e.buf->get();
+     return nullptr;
+ }
+-static size_t g_mmb_slot_cap[4] = {0, 0, 0};
++static size_t g_mmb_slot_cap[MMB_SLOT_COUNT] = {0, 0, 0, 0, 0};
+ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot, const ggml_tensor * t, size_t n) {
+     mmb_cache_entry & e = g_mmb_slots[slot];
+     if (e.buf && g_mmb_slot_cap[slot] < n) { delete e.buf; e.buf = nullptr; }
+@@ -1139,17 +1162,25 @@ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot,
+     e.root = mmb_root(t); e.data = t->data; e.n = n;
+     return e.buf->get();
+ }
+-void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); g_mmb_bf16_copy.clear(); }
++void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); g_mmb_bf16_copy.clear(); g_mmb_bf16_slot.clear(); }
+ size_t ggml_cuda_mmb_marks_count() { return g_mmb_bf16_only.size(); }
+ void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) { g_mmb_bf16_only.insert(t); }
+ bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return g_mmb_bf16_only.count(t) > 0; }
+ void ggml_cuda_mmb_mark_bf16_copy(const ggml_tensor * t) { g_mmb_bf16_copy.insert(t); }
+ bool ggml_cuda_mmb_wants_bf16_copy(const ggml_tensor * t) { return g_mmb_bf16_copy.count(t) > 0; }
++void ggml_cuda_mmb_mark_bf16_slot(const ggml_tensor * t, int slot) { g_mmb_bf16_slot[t] = slot; }
++int  ggml_cuda_mmb_bf16_slot(const ggml_tensor * t) { auto it = g_mmb_bf16_slot.find(t); return it == g_mmb_bf16_slot.end() ? -1 : it->second; }
++// Producer-side reserve for a BF16 copy: honours the graph-assigned dedicated slot (xn) so the copy
++// is not clobbered by the next generic producer, falling back to slot 0.
++uint16_t * ggml_cuda_mmb_reserve_auto(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
++    const int slot = ggml_cuda_mmb_bf16_slot(t);
++    return ggml_cuda_mmb_slot_reserve(ctx, slot >= 0 && slot < MMB_SLOT_COUNT ? slot : 0, t, n);
++}
+ 
+ void ggml_cuda_mmb_begin_graph() { for (auto & e : g_mmb_cache) delete e.buf; g_mmb_cache.clear(); for (auto & e : g_mmb_slots) { e.root = nullptr; e.data = nullptr; e.n = 0; } }
+ void ggml_cuda_mmb_release_all() {
+     ggml_cuda_mmb_begin_graph();
+-    for (int i = 0; i < 4; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; }
++    for (int i = 0; i < MMB_SLOT_COUNT; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; }
+     // the shadow weights are raw cudaMalloc, keyed by data pointer and held for the life of the
+     // process. A model has finitely many weights so this never mattered, but a long-lived process
+     // that sees many distinct tensors (test-backend-ops) keeps every one of them.
+@@ -1191,6 +1222,17 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
+     return ggml_nrows(dst) == T;
+ }
+ 
++// True when this MMB GEMM reads its activation through the bf16 activation cache (i.e. the
++// activation's F32 buffer is not required): every weight type except F32 does, and of the F32
++// weights only the tiny-M warp-per-token kernel (the hc *_inject pair) does -- the WMMA f32-split
++// tile reads the F32 tensor directly.  The graph optimizer uses this to decide whether an
++// activation can be marked BF16-only (producer skips its F32 store).
++bool ggml_cuda_mmb_reads_bf16_act(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    if (!ggml_cuda_mmb_supported_mm(src0, src1, dst)) return false;
++    if (src0->type != GGML_TYPE_F32) return true;
++    return mmb_tiny_m_f32_ok(src0->ne[0], src0->ne[1]);
++}
++
+ bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
+     if (!mmb_enabled()) return false;
+     const bool wtype = src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ3_XXS;
+@@ -1225,12 +1267,27 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+             const int eff  = wide ? 1 : (tt >= 4 ? 4 : (tt == 2 ? 2 : 1));
+             dim3 tg((T + NWARPS * eff - 1) / (NWARPS * eff));
+             const float * Wf = (const float *) src0->data;
+-            const float * Xf = (const float *) src1->data;
++            // HC16: if the producer marked this activation BF16-only, the F32 tensor was never
++            // written; read the bf16 copy out of the activation cache instead.  Walk the whole view
++            // chain: the mark is on the fully-rooted producer output.
++            const ggml_tensor * x_root = src1;
++            while (x_root->view_src) x_root = x_root->view_src;
++            const uint16_t * Xh = ggml_cuda_mmb_is_bf16_only(x_root) ? ggml_cuda_mmb_cache_lookup(x_root) : nullptr;
++            const float * Xf = Xh ? (const float *) Xh : (const float *) src1->data;
+             float * Df = (float *) dst->data;
+-            if (wide)      mmb_tiny_m_f32_kernel<8, 1><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+-            else if (eff == 4) mmb_tiny_m_f32_kernel<4, 4><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+-            else if (eff == 2) mmb_tiny_m_f32_kernel<4, 2><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+-            else               mmb_tiny_m_f32_kernel<4, 1><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++            if (wide) {
++                if (Xh)  mmb_tiny_m_f32_kernel<8, 1, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++                else     mmb_tiny_m_f32_kernel<8, 1, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++            } else if (eff == 4) {
++                if (Xh)  mmb_tiny_m_f32_kernel<4, 4, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++                else     mmb_tiny_m_f32_kernel<4, 4, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++            } else if (eff == 2) {
++                if (Xh)  mmb_tiny_m_f32_kernel<4, 2, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++                else     mmb_tiny_m_f32_kernel<4, 2, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++            } else {
++                if (Xh)  mmb_tiny_m_f32_kernel<4, 1, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++                else     mmb_tiny_m_f32_kernel<4, 1, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++            }
+             CUDA_CHECK(cudaGetLastError()); return;
+         }
+         dim3 grid((M + 127) / 128, (T + 127) / 128);
+diff --git a/ggml/src/ggml-cuda/mmb.cuh b/ggml/src/ggml-cuda/mmb.cuh
+index cd76f0107..8d9c14539 100644
+--- a/ggml/src/ggml-cuda/mmb.cuh
++++ b/ggml/src/ggml-cuda/mmb.cuh
+@@ -3,6 +3,9 @@
+ // MMB: dequant-to-BF16 WMMA GEMM path for IQ4_NL weights on gfx1151 (RDNA3.5). Env-gated: LLAMA_MMB=1, LLAMA_MMB_MIN_T (default 512).
+ bool ggml_cuda_mmb_supported_mm  (const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+ bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst);
++// MMB takes this dense GEMM and reads its activation via the bf16 activation cache (so the
++// activation's F32 output is optional).
++bool ggml_cuda_mmb_reads_bf16_act(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+ void ggml_cuda_mul_mat_mmb   (ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+ void ggml_cuda_mmb_begin_graph();
+@@ -12,6 +15,10 @@ uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const gg
+ const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t);
+ // producer slots (pinned until the next producer of the same kind): 0 = HC normalized stream xn, 1 = HC gate
+ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot, const ggml_tensor * t, size_t n);
++// Producer-side BF16-copy reserve that honours a graph-assigned dedicated slot (xn).
++uint16_t * ggml_cuda_mmb_reserve_auto(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n);
++void ggml_cuda_mmb_mark_bf16_slot(const ggml_tensor * t, int slot);
++int  ggml_cuda_mmb_bf16_slot(const ggml_tensor * t);
+ void ggml_cuda_mmb_marks_clear();
+ size_t ggml_cuda_mmb_marks_count();
+ void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t);
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index ae9285360..5a60a47d6 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -770,10 +770,10 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+     bool store_f32 = true;
+     if (ggml_cuda_mmb_is_bf16_only(mul_tensor)) {
+         // every consumer reads the BF16 copy -> the F32 output is dead
+-        dst16 = ggml_cuda_mmb_slot_reserve(ctx, 0, mul_tensor, (size_t) ggml_nelements(mul_tensor));
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, mul_tensor, (size_t) ggml_nelements(mul_tensor));
+         store_f32 = false;
+     } else if (ggml_cuda_mmb_wants_bf16_copy(mul_tensor)) {
+-        dst16 = ggml_cuda_mmb_slot_reserve(ctx, 0, mul_tensor, (size_t) ggml_nelements(mul_tensor));
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, mul_tensor, (size_t) ggml_nelements(mul_tensor));
+     }
+ 
+     const int64_t ne00 = rms_norm_src->ne[0];
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index de6063103..fe3d4d20d 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -165,10 +165,10 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     uint16_t * dst16 = nullptr;
+     bool store_f32 = true;
+     if (ggml_cuda_mmb_is_bf16_only(dst)) {
+-        dst16 = ggml_cuda_mmb_slot_reserve(ctx, 0, dst, (size_t) ggml_nelements(dst));
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, dst, (size_t) ggml_nelements(dst));
+         store_f32 = false;
+     } else if (ggml_cuda_mmb_wants_bf16_copy(dst)) {
+-        dst16 = ggml_cuda_mmb_slot_reserve(ctx, 0, dst, (size_t) ggml_nelements(dst));
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, dst, (size_t) ggml_nelements(dst));
+     }
+     if (src0->type == GGML_TYPE_F16) {
+         unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream, dst16, store_f32);
+@@ -828,10 +828,10 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
+     uint16_t * dst16 = nullptr;
+     bool store_f32 = true;
+     if (ggml_cuda_mmb_is_bf16_only(mul_node)) {
+-        dst16 = ggml_cuda_mmb_slot_reserve(ctx, 0, mul_node, (size_t) ggml_nelements(mul_node));
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, mul_node, (size_t) ggml_nelements(mul_node));
+         store_f32 = false;
+     } else if (ggml_cuda_mmb_wants_bf16_copy(mul_node)) {
+-        dst16 = ggml_cuda_mmb_slot_reserve(ctx, 0, mul_node, (size_t) ggml_nelements(mul_node));
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, mul_node, (size_t) ggml_nelements(mul_node));
+     }
+     switch (ggml_get_unary_op(unary_node)) {
+         case GGML_UNARY_OP_SILU:
+@@ -915,10 +915,10 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
+     uint16_t * dst16 = nullptr;
+     bool store_f32 = true;
+     if (ggml_cuda_mmb_is_bf16_only(unary_node)) {
+-        dst16 = ggml_cuda_mmb_slot_reserve(ctx, 0, unary_node, (size_t) ggml_nelements(unary_node));
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, unary_node, (size_t) ggml_nelements(unary_node));
+         store_f32 = false;
+     } else if (ggml_cuda_mmb_wants_bf16_copy(unary_node)) {
+-        dst16 = ggml_cuda_mmb_slot_reserve(ctx, 0, unary_node, (size_t) ggml_nelements(unary_node));
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, unary_node, (size_t) ggml_nelements(unary_node));
+     }
+ 
+     switch (ggml_get_unary_op(unary_node)) {
+-- 
+2.55.0
+

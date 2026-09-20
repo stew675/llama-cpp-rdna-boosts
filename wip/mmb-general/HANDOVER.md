@@ -1,6 +1,6 @@
 # HANDOVER — general-purpose `mmb` (bf16/i8-WMMA dequant weight GEMM) + QSA/Q8_0 next steps
 
-**Date:** 2026-09-20 (sessions 1-11).  **Status:** ACTIVE WIP, not part of the delivery, and the
+**Date:** 2026-09-20 (sessions 1-12).  **Status:** ACTIVE WIP, not part of the delivery, and the
 code is **not** pushed to any llama.cpp fork.  This document is the self-contained entry point for
 the next session; the "FOR THE NEXT SESSION" brief below is the whole handoff, and the UPDATE
 sections after it are the dated history (newest first).  `README.md` is the running record and
@@ -11,17 +11,17 @@ sections after it are the dated history (newest first).  `README.md` is the runn
 ## FOR THE NEXT SESSION — start here
 
 **Mandate.** Continue the `wip/mmb-general` work.  The delivery-facing prefill work is essentially
-done (the bf16-producer port, the QSA v3 path, the F32 split, the tiny-M kernel; all §11 gates
-green).  What remains is one more bf16-producer lever, two hard kernel-local items, one delivery
-bug fix, and promotion.
+done (the bf16-producer port including the `xn` stream, the QSA v3 path, the F32 split, the tiny-M
+kernel; all §11 gates green).  What remains is two hard kernel-local items, one delivery bug fix,
+and promotion.
 
 **Environment**
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`af2f70580`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`dea321f4a`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0022` + `commits.txt` (22 commits), pushed to `origin/main`; `git apply --check` verified on a fresh `8a2567e1e` |
+| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0023` + `commits.txt` (23 commits), pushed to `origin/main`; `git apply --check` verified on a fresh `8a2567e1e` |
 | target model | `/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf` (94 GiB; the only qwen4exp with HC + QSA) |
 | fast iteration model | `Qwen3.6-35B-A3B-Q4_K_M` (21 GiB, `qwen35moe`; **no** HC/QSA — use it only for `mmb_*` shapes) |
 | reference | `~/pwilkin-llama-cpp` @ `f5daaa3cf` (branch `strix-halo`) |
@@ -45,11 +45,14 @@ MMB dense shapes.
 
 **Gates (all must stay green; a bit-identical change reproduces the hashes exactly):**
 
-1. PPL c2048 on `prompts/prose-rdna-boosts.txt` — current build **10.6428** (`HC16=1`); `HC16=0` is
-   10.5771.  A numerics change re-baselines it (bar ~±0.68 at c2048; the tight ±0.027 bar needs
-   c16384, which the prompt file cannot reach).
-2. Same-seed greedy text via `scripts/extract-generated.py` -> **`9930c674a6ca`** (the command is
-   recorded in the session-8/9 UPDATEs).
+1. PPL c2048 on `prompts/prose-rdna-boosts.txt` — current build **10.6015** (`HC16=1`, the `xn`
+   BF16-only work); `HC16=0` is 10.5771.  A numerics change re-baselines it (bar ~±0.68 at c2048;
+   the tight ±0.027 bar needs c16384, which the prompt file cannot reach).
+2. Same-seed greedy text via `scripts/extract-generated.py` -> **`9c281c415082`** (624 chars),
+   `GGML_CUDA_MMB=1 GGML_CUDA_QSA3=1 GGML_CUDA_MMB_HC16=1 llama-cli -f prompts/prose-rdna-boosts.txt
+   -n 128 --seed 42 --temp 0 -c 8192 -b 2048 -ub 2048 -ctk bf16 -ctv bf16 -fa 1 -ngl 99
+   --no-display-prompt --single-turn` (`HC16=0` gives `c3f24ac9c114`).  The pre-session-12
+   `9930c674a6ca` was a bit-identical-era hash; re-baselined there.
 3. `test-backend-ops -o FLASH_ATTN_QSA` (22/22), `-o GATED_DELTA_NET` (46/46), `-o FLASH_ATTN_EXT`.
 4. `test-logits-width-probe <model> prompts/prose-rdna-boosts.txt 1024 512` -> `width_purity=PASS`.
 5. `plain == draft-mtp` greedy text (do **not** pass `-md` to the plain arm) — byte-identical.
@@ -57,29 +60,17 @@ MMB dense shapes.
 
 **Next work, in priority order**
 
-1. **`xn` BF16-only (next ~1.5-2 %).**  The HC normalized stream (`xn = rms_norm(x)*gamma`) is still
-   on the "F32 + BF16 copy" path because two of its three consumers read F32: `dsv4_hc_pre` src[0]
-   and the tiny-M `hc_*_inject` F32 GEMM.  Give both a BF16 arm and the mark pass will classify `xn`
-   all-bf16, so the fused `rms_norm+mul` skips its F32 store — `rms_norm_f32` is **1168 ms (~7 %)**
-   and would drop ~30 %.  Concretely:
-   * `dsv4-hc.cu`: add an `xbf16` arm to `dsv4_hc_pre_f32` reading `ggml_cuda_mmb_cache_lookup(xn_root)`
-     (the same slot-0 lookup the gate arm already uses; `xn` is `dst->src[0]`).
-   * `mmb.cu`: the tiny-M launcher (`ggml_cuda_mul_mat_mmb`'s F32 branch) must look up the slot copy
-     and `mmb_tiny_m_f32_kernel` must read `X` as bf16 (add a template `xbf16` or a uint16 path).
-   * `ggml-cuda.cu`'s `all_bf16_consumers` must accept a tiny-M F32 GEMM and `dsv4_hc_pre` src[0] as
-     bf16-aware consumers.
-   * **This is a numerics change on the main hidden stream** (same class as the gate BF16), so it
-     needs the PPL + greedy re-baseline and every gate.  The reference does exactly this.
-2. **The residual ~18 % kernel-local gap in `dsv4_hc_pre`** (~0.8 %; session 5e: the pattern can do
+1. **The residual ~18 % kernel-local gap in `dsv4_hc_pre`** (~0.8 %; session 5e: the pattern can do
    232.6 GB/s vs our 197).  Already tried and rejected: `__expf`/identity sigmoid (free), float4
    (neutral), unroll+`__restrict__` (-2 %, not kept).  What is left is the runtime-stride address
-   arithmetic and the strided dst write.  Lower priority than 1.
-3. **The indexer** — 1 % at 8K, 3.2 % at 32K, grows with context (`indexer_topk_radix_histogram`
+   arithmetic and the strided dst write.  (Session 12 removed the F32 `x`/`gate` streams, so the
+   remaining gap is now measured against the bf16 pattern, not the F32 one.)
+2. **The indexer** — 1 % at 8K, 3.2 % at 32K, grows with context (`indexer_topk_radix_histogram`
    dominates: 82 ms / 384 calls at pp8192).  The last un-optimised family.
-4. **Delivery bug: `GGML_OP_INDEXER_FILL` missing from `GGML_OP_NAME`.**  Found in session 9, fixed in
+3. **Delivery bug: `GGML_OP_INDEXER_FILL` missing from `GGML_OP_NAME`.**  Found in session 9, fixed in
    this WIP by `d1463bff3`; the delivery `patches/0014` (block 14) still has it.  One line in the name
    table; fold into block 14 when the delivery is next regenerated.
-5. **Promotion.**  Every §11 gate passes.  Rebase onto a canonical fork rebuilt at `ebbb18522` +
+4. **Promotion.**  Every §11 gate passes.  Rebase onto a canonical fork rebuilt at `ebbb18522` +
    `scripts/apply-all.sh`, regenerate `patches/`, and decide whether MMB rides as a block-08
    amendment.  **Maintainer-gated** (beta window / go-ahead) — do not do this unilaterally.
 
@@ -90,7 +81,9 @@ MMB dense shapes.
 * `ssm_alpha/beta` (M=48) via a WMMA f32 tile or an exact SIMT tile (session 10: rocBLAS stays — the
   WMMA split costs +0.04 PPL, the SIMT tile is slower).
 * The qsa3 pack (session 7: 0.34 %, not 3 %; fused, bit-identical).
-* The `mmb_cvt` bucket (sessions 8/9/11: eliminated bit-identically, incl. the dead-F32-store skip).
+* The `mmb_cvt` bucket (sessions 8/9/11: eliminated bit-identically, incl. the dead-F32-store skip)
+  and the `xn` BF16-only stream (session 12: +4.4 %/+3.8 % over session 11; the last `mmb_cvt` is
+  the model-tensor `ple_embd`).
 
 ---
 
@@ -121,20 +114,25 @@ MMB dense shapes.
 > (only the `ple_embd` model tensor still converts), **bit-identical** (PPL unchanged, greedy text
 > unchanged, all gates green), and **session 11 skipped the dead F32 stores** (+2.3 % / +3.3 %), for
 > **pp8192 952.4 -> 974.0, pp2048 975.3 -> 1007.4**;
-> the same session also found and fixed a **delivery** bug (see the session-9 UPDATE).
+> the same session also found and fixed a **delivery** bug (see the session-9 UPDATE).  **Session 12**
+> finished the producer port: the HC normalized stream `xn` is now **BF16-only** too (the
+> `dsv4_hc_pre` src[0] and tiny-M inject consumers gained bf16 arms, and `xn` got a **dedicated
+> producer slot** so its delayed consumers cannot be clobbered by the intervening generic copies) —
+> a numerics change, PPL c2048 10.6015, **+4.4 % pp2048 / +3.8 % pp8192 over session 11** and the
+> last `mmb_cvt` is the model-tensor `ple_embd`.
 
 **Current state (also in the brief above; kept here for history):**
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`af2f70580`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`dea321f4a`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0022` + `commits.txt`, in this repo, pushed to `origin/main` |
-| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (22 commits) |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0023` + `commits.txt`, in this repo, pushed to `origin/main` |
+| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (23 commits) |
 | build | §3 | run | §4 |
-| current numbers | the **session 11 UPDATE below** (the full bf16-producer port with the dead-F32-store skip, +2.3 %/+3.3 % pp8192/pp2048) and the **delivery `GGML_OP_NAME` fix**; sessions 10/9/8 |
+| current numbers | the **session 12 UPDATE below** (`xn` BF16-only, +4.4 %/+3.8 % pp8192/pp2048 over session 11) and the **delivery `GGML_OP_NAME` fix**; sessions 11/10/9/8 |
 
-**Historical ordering of the UPDATE sections:** 11 (newest, 2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
+**Historical ordering of the UPDATE sections:** 12 (newest, 2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body and are correct except where
 an UPDATE says otherwise.
@@ -144,6 +142,57 @@ list is the authoritative one, and the historical "next-work order" lists inside
 below are superseded.
 
 ---
+
+## UPDATE — session 12 (2026-09-20): the HC normalized stream `xn` is BF16-only — +4.4 % pp8192 /
+## +3.8 % pp2048 over session 11, a numerics change (PPL re-baselined)
+
+Session 11's dead-F32-store skip stopped at `xn`: its two delayed consumers -- `dsv4_hc_pre` src[0]
+and the tiny-M `hc_*_inject` F32 GEMMs -- still read F32, so the graph only set `bf16_copy` and the
+fused `rms_norm+mul` kept writing its F32 output (`rms_norm_f32` 1168 ms, ~7 %).  This session gives
+both consumers a BF16 arm and lets `xn` be marked **BF16-only**:
+
+* `dsv4-hc.cu`: `dsv4_hc_pre_f32` gains an `xbf16` template arm; when `xn` is BF16-only the launcher
+  reads the bf16 slot instead of the (never written) F32 tensor.
+* `mmb.cu`: `mmb_tiny_m_f32_kernel` gains an `XBF16` arm (4 bf16 per `uint2` load, RNE-expanded); the
+  tiny-M launcher looks up the bf16 slot.  `ggml_cuda_mmb_reads_bf16_act()` is the new predicate
+  "this dense GEMM reads the activation through the bf16 cache" (every weight type, plus the tiny-M
+  F32 kernel) that `all_bf16_consumers` uses.
+* `ggml-cuda.cu`: `all_bf16_consumers` now accepts a tiny-M F32 `MUL_MAT` and a `DSV4_HC_PRE`
+  `src[0]` as bf16-aware consumers, so `xn` classifies BF16-only.
+
+**A slot lifetime bug had to be fixed on the way (it cost a NaN PPL).**  Slot 0 is shared by every
+"generic" activation copy, and `dsv4_hc_pre` *reads* `xn` from a slot while *writing* its own output
+to slot 0; between the `xn` producer and its delayed consumers the intervening producers (e.g.
+`lo = silu(scale(down))`) overwrite slot 0.  So `xn` now gets a **dedicated producer slot (4)**: the
+marking pass assigns it when it sees the `DSV4_HC_PRE` consumer
+(`ggml_cuda_mmb_mark_bf16_slot`), and producers reserve through `ggml_cuda_mmb_reserve_auto`
+(dedicated slot if assigned, else 0).  The first attempt (no dedicated slot) produced a
+coherent-*looking* but corrupt PPL of **492474** -- the huge apparent speedup was degenerate MoE
+routing, exactly the session-5e trap: **run PPL before believing a prefill gain**.  Two smaller traps:
+the mark is on the *fully-rooted* `mul` while `x->view_src` is only one level (a double reshape), so
+the root walk must be recursive; and the tiny-M `X` row stride is in bf16 elements, not floats.
+
+Gates: PPL c2048 **10.6015** (`HC16=0` 10.5771; session 11 was 10.6428 -- all within the ±0.68 bar);
+greedy `-f prompts/prose-rdna-boosts.txt -n 128 --seed 42 --temp 0 -c 8192` **`9c281c415082`**
+(624 chars, reproducible; `HC16=0` gives `c3f24ac9c114`); `FLASH_ATTN_QSA` / `GATED_DELTA_NET` /
+`FLASH_ATTN_EXT` OK; width probe PASS (maxdiff 0); `plain == draft-mtp` byte-identical
+(`c0f8fb2b6fc7`, 470 chars).
+
+Same-session A/B (gfx1151 IQ4_XS Flash-Next, bf16 KV, `-b/-ub 2048`, `-r 2`, two interleaved reps):
+
+| tip | pp2048 | pp8192 |
+|---|---:|---:|
+| `af2f70580` (session 11) | 999 | 977 |
+| this session (`xn` BF16-only) | **1043** | **1014** |
+
+The kernel trace attributes it (`rocprofv3 --kernel-trace`, pp8192; all-kernel total 16744 -> 15594 ms
+= **-6.9 %** for the whole `HC16` port, code loaded at `8a2567e1e` + this WIP): `mmb_cvt_f32_bf16`
+648.8 -> 0.8 ms (the last conversion is `ple_embd`), `dsv4_hc_pre_f32` 743.8 -> 460.9 ms (bf16 `x` +
+`gate`), `mmb_tiny_m_f32_kernel` 576 -> 431 ms (bf16 `X`), `rms_norm_f32<1024,true,false>` 649.5 ->
+569.5 ms (the skipped F32 store), `unary_gated` 255.6 -> 227.6 ms.
+
+Already-passing gates and the W=1..8 purity are unaffected by construction: in the decode/verify band
+(`T <= 8`) the GEMMs are below `mmb_min_t`, so `xn` is never BF16-only there and the F32 path runs.
 
 ## UPDATE — session 11 (2026-09-20): the producer port's dead-F32-store skip — +2.3 % pp8192 /
 ## +3.3 % pp2048, still bit-identical

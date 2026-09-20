@@ -101,6 +101,50 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 12 (2026-09-20): the HC normalized stream `xn` is now BF16-only — **+4.4 % pp2048 /
+## +3.8 % pp8192** over session 11, a numerics change (PPL re-baselined)
+
+Session 11's dead-F32-store skip stopped at `xn`: its two delayed consumers, `dsv4_hc_pre` src[0] and
+the tiny-M `hc_*_inject` F32 GEMMs, still read F32, so the graph only set `bf16_copy` and the fused
+`rms_norm+mul` kept writing the F32 output.  This session gives both consumers a BF16 arm and lets
+`xn` be marked **BF16-only**:
+
+* `dsv4-hc.cu`: `dsv4_hc_pre_f32` gains an `xbf16` template arm; when `xn` is BF16-only the launcher
+  reads the bf16 slot instead of the (never written) F32 tensor.
+* `mmb.cu`: `mmb_tiny_m_f32_kernel` gains an `XBF16` arm (the tiny-M launcher looks up the bf16 slot);
+  `ggml_cuda_mmb_reads_bf16_act()` is the new predicate that says a dense GEMM reads the activation
+  through the bf16 cache (all weight types, plus the tiny-M F32 kernel).
+* `ggml-cuda.cu`: `all_bf16_consumers` now accepts a tiny-M F32 `MUL_MAT` and a `DSV4_HC_PRE`
+  `src[0]` as bf16-aware consumers, so `xn` classifies BF16-only.
+
+**A slot lifetime bug had to be fixed on the way (it cost a NaN PPL).**  Slot 0 is shared by every
+generic activation copy, and `dsv4_hc_pre` *reads* `xn` from a slot while *writing* its own output to
+slot 0; between the `xn` producer and its delayed consumers the intervening producers (e.g. `lo =
+silu(scale(down))`) overwrite slot 0.  So `xn` now gets a **dedicated producer slot (4)**: the graph
+optimizer assigns it when it sees the `DSV4_HC_PRE` consumer (`ggml_cuda_mmb_mark_bf16_slot`), and the
+producers reserve through `ggml_cuda_mmb_reserve_auto` (dedicated slot if assigned, else 0).  The
+first attempt (no dedicated slot) produced a coherent-looking but corrupt 492474 PPL — the huge
+apparent speedup was degenerate MoE routing, exactly the session-5e trap: **always PPL before
+believing a prefill gain**.
+
+Gates: PPL c2048 **10.6015** (`HC16=0` 10.5771; session 11 was 10.6428 — all within the ±0.68 bar);
+greedy `-f prompts/prose-rdna-boosts.txt -n 128 --seed 42 --temp 0 -c 8192` **`9c281c415082`** (624 ch,
+reproducible; `HC16=0` gives `c3f24ac9c114`); `FLASH_ATTN_QSA` / `GATED_DELTA_NET` / `FLASH_ATTN_EXT`
+OK; width probe PASS (maxdiff 0); `plain == draft-mtp` byte-identical (`c0f8fb2b6fc7`).
+
+Same-session A/B (gfx1151 IQ4_XS Flash-Next, bf16 KV, `-b/-ub 2048`, `-r 2`, two interleaved reps):
+
+| tip | pp2048 | pp8192 |
+|---|---:|---:|
+| `af2f70580` (session 11) | 999 | 977 |
+| this session (`xn` BF16-only) | **1043** | **1014** |
+
+The kernel trace attributes it (pp8192, `rocprofv3 --kernel-trace`, all-kernel total 16744 ->
+15594 ms = **-6.9 %** for the whole `HC16` port): `mmb_cvt_f32_bf16` 648.8 -> 0.8 ms (this session's
+last conversion is `ple_embd`), `dsv4_hc_pre_f32` 743.8 -> 460.9 ms (bf16 `x` + `gate`),
+`mmb_tiny_m_f32_kernel` 576 -> 431 ms (bf16 `X`), `rms_norm_f32<1024,true,false>` 649.5 -> 569.5 ms
+(the skipped F32 store), `unary_gated` 255.6 -> 227.6 ms.
+
 ## UPDATE — session 11 (2026-09-20): skip the dead F32 store in the producer port — **+2.3 % pp8192 /
 ## +3.3 % pp2048**, still bit-identical
 
