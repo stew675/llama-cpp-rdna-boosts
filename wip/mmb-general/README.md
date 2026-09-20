@@ -4,6 +4,10 @@
 `~/llama-wip-mmb` worktree (branch `wip-mmb-general`, based on the `~/llama.cpp`
 delivery tree at `8a2567e1e`); nothing here is in `patches/`.
 
+> **New session?  Read [`HANDOVER.md`](HANDOVER.md) first** — its "FOR THE NEXT SESSION" brief at the
+top is the self-contained handoff (environment, build/run, gates, the prioritized remaining work).
+> This file is the running (dated) record.
+
 ## Why
 
 On Strix Halo (gfx1151) our prefill is ~2x behind the tuned RDNA3_5 stacks
