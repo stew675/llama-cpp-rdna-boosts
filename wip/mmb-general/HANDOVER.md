@@ -315,7 +315,10 @@ block -> cell map) as `src[7]`, so it can derive `ratio r = blk_cells->ne[0]/n_b
 * the gather is unchanged (session-17 `_grouped`) but its partition now uses the block-aligned chunk.
 
 Validated bit-identical: PPL c2048 **10.6015**, greedy **`9c281c415082`**, width probe **PASS**,
-`FLASH_ATTN_QSA` / `GATED_DELTA_NET` OK.
+`FLASH_ATTN_QSA` / `GATED_DELTA_NET` OK.  Also A/B-validated at large `n_kv`: a 4x-concatenated prose
+prompt (64 KB), `-c 32768 -n 16 --seed 42 --temp 0`, gives the same text hash (**`7d2e5b3e46dd`**) with
+the block path and with `LLAMA_INDEXER_NOBLOCK=1` (the session-17 path), so the block-aligned partition
+and the dead-suffix handling agree with the cell-level reference at ~16k context.
 
 ### Measured (gfx1151, bf16 KV, ub 2048, rocprofv3 kernel trace; session-15 baseline in brackets)
 

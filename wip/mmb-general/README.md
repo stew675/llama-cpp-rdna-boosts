@@ -158,7 +158,9 @@ the block-aligned chunk, so the ascending-column order is unchanged.
 | **family** | **85.6 (123.7)** | **1235.7 (1362.3)** |
 
 **−52 % / −51 % vs session 15 (2.94 → 1.47 % of the run at 32K).**  Bit-identical: PPL c2048 **10.6015**,
-greedy **`9c281c415082`**, width probe PASS, `FLASH_ATTN_QSA` / `GATED_DELTA_NET` OK.  The block
+greedy **`9c281c415082`**, width probe PASS, `FLASH_ATTN_QSA` / `GATED_DELTA_NET` OK; and at ~16k context
+(4x-concatenated prompt, `-c 32768 -n 16`) the block path and `LLAMA_INDEXER_NOBLOCK=1` agree
+(`7d2e5b3e46dd`).  The block
 histogram wins at short context (−31 % at 8K) but only −9 % at 32K, because the session-17 grouped pass
 already shared the block key; the block passes save only the per-cell visibility/binning work.
 
