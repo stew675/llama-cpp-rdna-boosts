@@ -22,9 +22,9 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 - What changed recently: [`WORKLOG.md`](WORKLOG.md)
 - Current status and validation: [Current state](#current-state)
 
-> **Active WIP lives on the `wip/mmb-general` branch, not `main` (2026-09-20).**  The general-purpose
+> **Active WIP lives on the `wip-mmb-general` branch, not `main` (2026-09-20).**  The general-purpose
 > `mmb` (bf16-WMMA weight GEMM) + QSA + indexer work-in-progress is developed on
-> **`wip/mmb-general`** (the delivery-repo record/backup branch, cut from `main` at `1c2ec00`) and the
+> **`wip-mmb-general`** (the delivery-repo record/backup branch, cut from `main` at `1c2ec00`) and the
 > fork worktree `~/llama-wip-mmb` on **`wip-mmb-general`**.  `main` is **frozen** for that work until
 > the maintainer calls the rebase.  New WIP sessions: read
 > [`wip/mmb-general/HANDOVER.md`](wip/mmb-general/HANDOVER.md) first and commit to the branch.

@@ -476,7 +476,7 @@ explicitly requests it.**
 | `rdna-boosts-all.patch` | the entire 16-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `prompts/` | versioned, hash-stable test prompts for the decode/MTP/coherence gates; each prompt's size + token count + **sha256** is recorded in `prompts/README.md`, and a shipped prompt is **never edited in place** (add a new file).  A reported throughput/acceptance/purity result is only valid against the prompt hash it names |
-| `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live work (currently `wip/iq4nl-prefill/` and `wip/mmb-general/`, on branch `wip/mmb-general`); completed trees are archived under `archive/work/` (see the WIP rule below) |
+| `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live work (currently `wip/iq4nl-prefill/` and `wip/mmb-general/`, on branch `wip-mmb-general`); completed trees are archived under `archive/work/` (see the WIP rule below) |
 | `beta/` | **promoted-from-WIP staging** - currently **empty**: every campaign staged here has been promoted and archived (`archive/work/block-15-campaign-wins/` = block 15, `archive/work/tensor-fit-fix/` = the r12 `--fit` for `-sm tensor` amendment, and the qwen4exp support = block 14).  Each record is the promotion/gate record and `BETA-TESTING.md` the tester checklist - see the WIP rule below |
 | `upstream/` | **upstream-PR candidates** — self-contained changes that could be filed against unadulterated `ggml-org/llama.cpp` master, each with a `UPSTREAM-PR-*.md` note + `.patch` (see its README for the double-apply caution and the status table) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
@@ -803,10 +803,10 @@ Consequences, so it is not re-litigated:
   `archive/work/`; `wip/` now holds only the active `iq4nl-prefill/` and `mmb-general/` handoffs.)
 - **Promotion rule (the sanctioned way out of `wip/`):** a campaign's
 - **WIP branch (2026-09-20):** the active WIP lives on dedicated branches and is committed **there,
-  never to `main`** — the delivery-repo record on **`wip/mmb-general`** (cut from `main` at `1c2ec00`)
+  never to `main`** — the delivery-repo record on **`wip-mmb-general`** (cut from `main` at `1c2ec00`)
   and the code in the `~/llama-wip-mmb` worktree on **`wip-mmb-general`**.  `main` is **frozen** for
   that work until the maintainer calls the rebase; `git rebase --onto <new-main> 1c2ec00
-  wip/mmb-general` replays only the branch's own commits.  New sessions: check
+  wip-mmb-general` replays only the branch's own commits.  New sessions: check
   `git branch --show-current`, read `wip/mmb-general/HANDOVER.md`, and commit to the branch.
 - **Promotion rule (the sanctioned way out of `wip/`):** a campaign's
   *validated* wins are collected under `beta/` (for the memory campaign:
