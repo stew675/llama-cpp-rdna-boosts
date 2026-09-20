@@ -101,6 +101,46 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 13 (2026-09-20): the `dsv4_hc_pre`/`_post` residual was L2/MALL pollution —
+## non-temporal accesses close it (**−18.6 % pre, −31 ms post**), bit-identically
+
+Session 5e left the `dsv4_hc_pre` residual as "~18 % kernel-local headroom" (a probe said the
+pattern can do 232.6 GB/s, the kernel did 197) with "address arithmetic / strided dst write" as the
+remaining suspects.  This session re-measured it in the bf16 era and found the real cause: **the
+kernel is not slow, its buffers are polluting the cache the surrounding GEMM weight streams need**.
+
+**The measurement that cracked it.**  A faithful standalone copy of the exact kernel
+traffic/shape (n_embd=2560, hc=4, nt=2048; bf16 x + bf16 gate read, F32 dst + bf16 dst16 written)
+runs at **0.434-0.535 ms** (215 GB/s), but the kernel in the model takes **0.605 ms** (190 GB/s).
+The same trace shows `dsv4_hc_post` at 206 GB/s on the same machine, so the environment is not
+bandwidth-limited.  Tiling is not it either: `vec4`/`vec8` (2D grid, `uint2`/`uint4` loads, proved
+bit-identical) are both **worse in situ** (625 / 642 us vs 605).  What fixed it was making the bulk
+accesses **non-temporal** (`__builtin_nontemporal_load`/`_store`, value-preserving hints):
+`dsv4_hc_pre_f32` **605 -> 493 us/call (-18.6 %, 190 -> 234 GB/s)** and `dsv4_hc_post_f32`
+**918 -> 880 us/call (691 -> 660 ms over 752 calls)**.  All-kernel total 15596 -> 15501 ms.
+
+The hint is a no-op in the standalone microbench (there is no competing traffic there) — the same
+reason session 5e/6 could not find it.  **Methodology rule: a microbenchmark that isolates a kernel
+can miss a real in-situ win, because the win is about coexisting with the rest of the model.**
+
+It is **bit-identical** (cache hints only): PPL c2048 stays **10.6015**, greedy
+**`9c281c415082`**, `FLASH_ATTN_QSA` / `GATED_DELTA_NET` / `FLASH_ATTN_EXT` OK, width probe PASS,
+`plain == draft-mtp` byte-identical.  e2e is within run noise (pp2048 1041.6 -> 1047.2, pp8192
+1015.6 -> 1017.9, same-session interleaved) — judge it on the kernel trace, per the standing rule.
+
+**Two things ruled out on the way:** (1) `vec4`/`vec8` beat the scalar kernel standalone (~5 %) but
+lose in situ, so the load-width/ILP line is closed for good; (2) `mixed` (the `dsv4_hc_pre` output)
+is written as F32 **and** bf16 because `all_bf16_consumers` rejects it: its consumers include the GDN
+`ssm_alpha/beta` `[2560x48]` F32 GEMM and the MoE router F32 GEMM (plus the expert GEMMs, which are
+bf16).  Making it BF16-only would save ~21 MB/call but requires changing the GDN recurrence and MoE
+routing input numerics — out of scope, documented as a follow-up.
+
+**Broader follow-up (not done):** the same non-temporal treatment is untested on the other large
+pure-streaming kernels (`concat_transposed_src1_dim0` 358 ms, `moe_weighted_reduction` 384 ms,
+`ssm_conv_long_token_f32` 292 ms, the qsa3 pack).  It must **not** be applied blindly — kernels that
+reuse data (the K/V cache in `qsa3_attn`, the weight panels in `mmb_*`) may lose.  Judge each on
+`rocprofv3` kernel time.
+
 ## UPDATE — session 12 (2026-09-20): the HC normalized stream `xn` is now BF16-only — **+4.4 % pp2048 /
 ## +3.8 % pp8192** over session 11, a numerics change (PPL re-baselined)
 

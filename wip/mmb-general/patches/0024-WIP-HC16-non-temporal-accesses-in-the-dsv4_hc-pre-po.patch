@@ -1,0 +1,91 @@
+From e620094d4d4c37699569d206a7f783b1c5221dd5 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 20 Sep 2026 12:43:37 -0500
+Subject: [PATCH 24/24] WIP HC16: non-temporal accesses in the dsv4_hc pre/post
+ kernels
+
+dsv4_hc_pre_f32 and dsv4_hc_post_f32 are pure streaming (each element read/written
+once), and in situ they were ~13-18% below their own pattern ceiling because their
+buffers thrash the L2/MALL the surrounding GEMM weight streams use.  Non-temporal
+loads/stores are value-preserving cache hints, so this is bit-identical (PPL
+10.6015, greedy 9c281c415082 unchanged), but in situ dsv4_hc_pre drops 605 -> 493
+us/call (-18.6%, 190 -> 234 GB/s) and dsv4_hc_post 691 -> 660 ms.
+
+A standalone microbench of the same kernel shows no difference (no competing
+traffic), which is why the earlier session-5e/6 sweep missed it.  vec4/vec8
+(2D grid + uint2/uint4 loads) were also tried and are *worse* in situ.
+---
+ ggml/src/ggml-cuda/dsv4-hc.cu | 22 ++++++++++++++--------
+ 1 file changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/dsv4-hc.cu b/ggml/src/ggml-cuda/dsv4-hc.cu
+index dc0f872f7..6451de414 100644
+--- a/ggml/src/ggml-cuda/dsv4-hc.cu
++++ b/ggml/src/ggml-cuda/dsv4-hc.cu
+@@ -108,6 +108,12 @@ static __global__ void dsv4_hc_comb_f32(
+     }
+ }
+ 
++// The HC pre/post kernels are pure streaming (every element is read/written once, no reuse), so the
++// bulk accesses use non-temporal loads/stores: they are value-preserving cache hints only (identical
++// results), but they stop these buffers from thrashing the L2/MALL that the surrounding GEMM weight
++// streams are using.  Measured in situ (gfx1151, IQ4_XS Flash-Next, pp8192): dsv4_hc_pre 605 -> 493
++// us/call (+18.6 %), dsv4_hc_post 691 -> 660 ms; the standalone microbench (no competing traffic)
++// shows no difference, which is why this was not visible before.
+ template <bool gated, bool wbf16, bool xbf16>
+ static __global__ void dsv4_hc_pre_f32(
+         const float * x,
+@@ -146,7 +152,7 @@ static __global__ void dsv4_hc_pre_f32(
+         if constexpr (xbf16) {
+             // HC16: the xn producer skipped its F32 store; read the bf16 copy instead (exact
+             // expansion of the RNE-rounded value, so only the F32->bf16 rounding is new).
+-            const uint16_t h = ((const uint16_t *) x)[i0*sx0 + ih*sx1 + it*sx2];
++            const uint16_t h = __builtin_nontemporal_load((const uint16_t *) x + i0*sx0 + ih*sx1 + it*sx2);
+             xv = __uint_as_float(((uint32_t) h) << 16);
+         } else {
+             xv = x[i0*sx0 + ih*sx1 + it*sx2];
+@@ -159,7 +165,7 @@ static __global__ void dsv4_hc_pre_f32(
+                 // bf16 back to f32 exactly (round-to-nearest-even on the way in, so this reproduces
+                 // the value the producer rounded to -- a numerics change vs the F32 chain, approved
+                 // as a prefill re-baseline).
+-                const uint16_t h = ((const uint16_t *) weights)[i0*sw0 + ih*sw1 + it*sw2];
++                const uint16_t h = __builtin_nontemporal_load((const uint16_t *) weights + i0*sw0 + ih*sw1 + it*sw2);
+                 wr = __uint_as_float(((uint32_t) h) << 16);
+             } else {
+                 wr = weights[i0*sw0 + ih*sw1 + it*sw2];
+@@ -172,9 +178,9 @@ static __global__ void dsv4_hc_pre_f32(
+     }
+ 
+     const float v = scale * sum;
+-    if (store_f32) dst[i0*sd0 + it*sd1] = v;
++    if (store_f32) __builtin_nontemporal_store(v, dst + i0*sd0 + it*sd1);
+     if (dst16 != nullptr) {
+-        dst16[i0*sd0 + it*sd1] = dsv4_f2bf(v);
++        __builtin_nontemporal_store(dsv4_f2bf(v), dst16 + i0*sd0 + it*sd1);
+     }
+ }
+ 
+@@ -215,16 +221,16 @@ static __global__ void dsv4_hc_post_f32(
+     const int64_t idst = (ir / n_embd) % hc;
+     const int64_t it   = ir / (n_embd * hc);
+ 
+-    float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
++    float sum = __builtin_nontemporal_load(x + i0*sx0 + it*sx1) * post[idst*sp0 + it*sp1];
+     if constexpr (has_comb) {
+         for (int64_t isrc = 0; isrc < hc; ++isrc) {
+-            sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
++            sum += __builtin_nontemporal_load(residual + i0*sr0 + isrc*sr1 + it*sr2) * comb[idst*sc0 + isrc*sc1 + it*sc2];
+         }
+     } else {
+-        sum += residual[i0*sr0 + idst*sr1 + it*sr2];
++        sum += __builtin_nontemporal_load(residual + i0*sr0 + idst*sr1 + it*sr2);
+     }
+ 
+-    dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
++    __builtin_nontemporal_store(sum, dst + i0*sd0 + idst*sd1 + it*sd2);
+ }
+ 
+ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+-- 
+2.55.0
+

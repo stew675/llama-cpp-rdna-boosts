@@ -1,6 +1,6 @@
 # HANDOVER — general-purpose `mmb` (bf16/i8-WMMA dequant weight GEMM) + QSA/Q8_0 next steps
 
-**Date:** 2026-09-20 (sessions 1-12).  **Status:** ACTIVE WIP, not part of the delivery, and the
+**Date:** 2026-09-20 (sessions 1-13).  **Status:** ACTIVE WIP, not part of the delivery, and the
 code is **not** pushed to any llama.cpp fork.  This document is the self-contained entry point for
 the next session; the "FOR THE NEXT SESSION" brief below is the whole handoff, and the UPDATE
 sections after it are the dated history (newest first).  `README.md` is the running record and
@@ -11,17 +11,17 @@ sections after it are the dated history (newest first).  `README.md` is the runn
 ## FOR THE NEXT SESSION — start here
 
 **Mandate.** Continue the `wip/mmb-general` work.  The delivery-facing prefill work is essentially
-done (the bf16-producer port including the `xn` stream, the QSA v3 path, the F32 split, the tiny-M
-kernel; all §11 gates green).  What remains is two hard kernel-local items, one delivery bug fix,
-and promotion.
+done (the bf16-producer port including the `xn` stream, the `dsv4_hc` non-temporal fix, the QSA v3
+path, the F32 split, the tiny-M kernel; all §11 gates green).  What remains is a broad but risky
+non-temporal sweep, the indexer, one delivery bug fix, and promotion.
 
 **Environment**
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`dea321f4a`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`e620094d4`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0023` + `commits.txt` (23 commits), pushed to `origin/main`; `git apply --check` verified on a fresh `8a2567e1e` |
+| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0024` + `commits.txt` (24 commits), pushed to `origin/main`; `git apply --check` verified on a fresh `8a2567e1e` |
 | target model | `/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf` (94 GiB; the only qwen4exp with HC + QSA) |
 | fast iteration model | `Qwen3.6-35B-A3B-Q4_K_M` (21 GiB, `qwen35moe`; **no** HC/QSA — use it only for `mmb_*` shapes) |
 | reference | `~/pwilkin-llama-cpp` @ `f5daaa3cf` (branch `strix-halo`) |
@@ -60,11 +60,14 @@ MMB dense shapes.
 
 **Next work, in priority order**
 
-1. **The residual ~18 % kernel-local gap in `dsv4_hc_pre`** (~0.8 %; session 5e: the pattern can do
-   232.6 GB/s vs our 197).  Already tried and rejected: `__expf`/identity sigmoid (free), float4
-   (neutral), unroll+`__restrict__` (-2 %, not kept).  What is left is the runtime-stride address
-   arithmetic and the strided dst write.  (Session 12 removed the F32 `x`/`gate` streams, so the
-   remaining gap is now measured against the bf16 pattern, not the F32 one.)
+1. **Non-temporal sweep of the other pure-streaming kernels (unmeasured, possibly the biggest
+   remaining prefill lever).**  Session 13 found that the `dsv4_hc` kernels were 18 % below their own
+   ceiling purely because their buffers thrashed the L2/MALL the GEMM weight streams use, and fixed
+   it with `__builtin_nontemporal_load`/`_store` (value-preserving, bit-identical).  The same may
+   hold for `concat_transposed_src1_dim0` (358 ms), `moe_weighted_reduction_f32_vec4` (384 ms),
+   `ssm_conv_long_token_f32` (292 ms) and the qsa3 pack (6.5 ms).  **Do not apply blindly**: kernels
+   with real reuse (`qsa3_attn`'s K/V cache, the `mmb_*` weight panels) can only lose; judge each on
+   `rocprofv3` kernel time, and remember a standalone microbench cannot see this class of win.
 2. **The indexer** — 1 % at 8K, 3.2 % at 32K, grows with context (`indexer_topk_radix_histogram`
    dominates: 82 ms / 384 calls at pp8192).  The last un-optimised family.
 3. **Delivery bug: `GGML_OP_INDEXER_FILL` missing from `GGML_OP_NAME`.**  Found in session 9, fixed in
@@ -84,6 +87,8 @@ MMB dense shapes.
 * The `mmb_cvt` bucket (sessions 8/9/11: eliminated bit-identically, incl. the dead-F32-store skip)
   and the `xn` BF16-only stream (session 12: +4.4 %/+3.8 % over session 11; the last `mmb_cvt` is
   the model-tensor `ple_embd`).
+* The `dsv4_hc_pre` "kernel-local residual" as a *tiling/ILP* problem (session 13: it is L2/MALL
+  pollution; non-temporal hints are the fix, vec4/vec8 are worse in situ).
 
 ---
 
@@ -119,20 +124,24 @@ MMB dense shapes.
 > `dsv4_hc_pre` src[0] and tiny-M inject consumers gained bf16 arms, and `xn` got a **dedicated
 > producer slot** so its delayed consumers cannot be clobbered by the intervening generic copies) —
 > a numerics change, PPL c2048 10.6015, **+4.4 % pp2048 / +3.8 % pp8192 over session 11** and the
-> last `mmb_cvt` is the model-tensor `ple_embd`.
+> last `mmb_cvt` is the model-tensor `ple_embd`.  **Session 13** then closed session 5e's
+> `dsv4_hc_pre` "kernel-local residual": the kernel was 18 % below its own ceiling because its
+> streaming buffers thrashed the L2/MALL the GEMM weight streams use, and **non-temporal
+> loads/stores** (value-preserving, bit-identical) take it 605 -> 493 us/call (**-18.6 %**) with
+> `_post` 691 -> 660 ms; vec4/vec8 were tried and are worse in situ.
 
 **Current state (also in the brief above; kept here for history):**
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`dea321f4a`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`e620094d4`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0023` + `commits.txt`, in this repo, pushed to `origin/main` |
-| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (23 commits) |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0024` + `commits.txt`, in this repo, pushed to `origin/main` |
+| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (24 commits) |
 | build | §3 | run | §4 |
-| current numbers | the **session 12 UPDATE below** (`xn` BF16-only, +4.4 %/+3.8 % pp8192/pp2048 over session 11) and the **delivery `GGML_OP_NAME` fix**; sessions 11/10/9/8 |
+| current numbers | the **session 13 UPDATE below** (`dsv4_hc` non-temporal hints, bit-identical, −18.6 % pre kernel time) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
 
-**Historical ordering of the UPDATE sections:** 12 (newest, 2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
+**Historical ordering of the UPDATE sections:** 13 (newest, 2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body and are correct except where
 an UPDATE says otherwise.
@@ -142,6 +151,50 @@ list is the authoritative one, and the historical "next-work order" lists inside
 below are superseded.
 
 ---
+
+## UPDATE — session 13 (2026-09-20): the `dsv4_hc_pre` residual was L2/MALL pollution; non-temporal
+## accesses close it (−18.6 % pre kernel time), bit-identically
+
+Session 5e left this as "~18 % kernel-local headroom" with "runtime-stride address arithmetic and the
+strided dst write" as the remaining suspects, and session 6's `mmb_*` sweep found only dead ends.
+This session re-measured it in the bf16 era and found the actual cause: **the kernel is fine in
+isolation; in situ its streaming buffers thrash the L2/MALL that the surrounding GEMM weight streams
+need.**
+
+**The measurement that cracked it.**
+
+* A faithful standalone copy of the exact kernel/traffic/shape (n_embd=2560, hc=4, nt=2048; bf16
+  `x` + bf16 `gate` read, F32 `dst` + bf16 `dst16` written) runs at **0.434-0.535 ms** (215 GB/s).
+* The same kernel in the model takes **0.605 ms** (190 GB/s), and the trace shows `dsv4_hc_post` at
+  206 GB/s on the same machine — so the environment is *not* the limit.
+* `vec4`/`vec8` (2D grid, `uint2`/`uint4` loads, proved bit-identical) are **worse in situ**
+  (625 / 642 us vs 605): the load-width/ILP line is closed.
+* **Non-temporal loads/stores** (`__builtin_nontemporal_load`/`_store`) on the bulk accesses
+  (`x`, `gate`, `dst`, `dst16` in `pre`; `x`, `residual`, `dst` in `post`) fix it:
+  `dsv4_hc_pre_f32` **605 -> 493 us/call (-18.6 %, 190 -> 234 GB/s**, i.e. the pattern ceiling),
+  `dsv4_hc_post_f32` **918 -> 880 us/call (691 -> 660 ms over 752 calls)**.  All-kernel total
+  15596 -> 15501 ms.
+
+They are **value-preserving cache hints, so the change is bit-identical**: PPL c2048 stays **10.6015**,
+greedy **`9c281c415082`** (624 ch), `FLASH_ATTN_QSA` / `GATED_DELTA_NET` / `FLASH_ATTN_EXT` OK, width
+probe PASS (maxdiff 0), `plain == draft-mtp` byte-identical (`c0f8fb2b6fc7`).  e2e is inside run noise
+(pp2048 1041.6 -> 1047.2, pp8192 1015.6 -> 1017.9, same-session interleaved, `-r 2`) — judge it on the
+kernel trace, per the standing rule.
+
+**Two traps worth keeping:**
+
+1. **A microbenchmark that isolates a kernel can miss a real in-situ win** — this one is invisible
+   standalone (identical timing with and without the hints) because there is no competing traffic.
+   The whole session-5e/6 "the pattern can do 232.6 GB/s" framing measured an *idle* part.
+2. `mixed` (the `dsv4_hc_pre` output) is written F32 **and** bf16 because `all_bf16_consumers`
+   rejects it: its consumers include the GDN `ssm_alpha/beta` `[2560x48]` F32 GEMM and the MoE
+   router F32 GEMM (the expert GEMMs are bf16).  Making it BF16-only would save ~21 MB/call but
+   changes the GDN recurrence and MoE routing input numerics — out of scope, recorded as a follow-up.
+
+**Broader follow-up (unmeasured):** the same hint is untested on the other large pure-streaming
+kernels (`concat_transposed_src1_dim0` 358 ms, `moe_weighted_reduction` 384 ms,
+`ssm_conv_long_token_f32` 292 ms).  It must **not** be applied blindly — kernels with real reuse
+(`qsa3_attn`'s K/V cache, the `mmb_*` weight panels) can only lose.
 
 ## UPDATE — session 12 (2026-09-20): the HC normalized stream `xn` is BF16-only — +4.4 % pp8192 /
 ## +3.8 % pp2048 over session 11, a numerics change (PPL re-baselined)
