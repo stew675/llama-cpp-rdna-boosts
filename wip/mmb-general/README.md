@@ -358,35 +358,55 @@ path to help the K=10240 hc inject pair.  It is wrong and costs 375 ms.**  The t
 bucketing launches by grid alone put `hc_inject` (760) + `ssm` (576) + others into one 1.065 ms
 average that looked like an MMB win.  **Split the bucket before believing a per-shape number.**
 
-## UPDATE — session 5e (2026-09-19): dsv4_hc investigated — already at the bandwidth wall
+## UPDATE — session 5e (2026-09-19): dsv4_hc investigated — a ~13 % kernel-local gap, and the real
+lever is bytes (bf16 intermediates)
 
 `dsv4_hc_pre_f32` + `dsv4_hc_post_f32` = 1432.5 ms (8.5 % of pp8192); pwilkin's reference is ~0.93 s
-vs our 1.44 s.  **Nothing landed** — the kernel-local levers are exhausted and the reference's
-advantage is elsewhere.
+vs our 1.44 s.  **Nothing landed** — the tree is clean, baseline pp8192 restored to 953.5 t/s.
 
-| kernel | per launch | unique DRAM traffic | effective |
-|---|---:|---:|---:|
-| `dsv4_hc_pre_f32` | 0.98 ms | 189 MB (x 84 + gate 84 + dst 21, each read once) | **197 GB/s** |
-| `dsv4_hc_post_f32` | 0.92 ms | ~192 MB (`residual` gets 4x L2 reuse) | **209 GB/s** |
+**Measure the ceiling, don't infer it.**  `tools/dram-bw-probe.cpp` (`hipcc --offload-arch=gfx1151 -O3`),
+192 MB buffers:
 
-They agree, and ~200 GB/s is this box's achievable LPDDR5X bandwidth — **both are already at the
-memory wall for f32**.  Kernel-level A/B (`rocprofv3`), all value-preserving except the identity row:
+| pattern | GB/s | % of 256 GB/s spec |
+|---|---:|---:|
+| pure sequential read (grid-stride float4) | **231.6** | 90.5 % |
+| copy (read + write) | **208.3** | 81.4 % |
+| **the exact `dsv4_hc_pre` shape** (x + gate, 4 streams each, + dst) | **227.2** | 88.7 % |
+| the real `dsv4_hc_pre_f32` | **197** | 77.0 % |
 
-| variant | `dsv4_hc_pre_f32` | verdict |
-|---|---:|---|
-| production (`expf`) | 745.0 ms | — |
-| `__expf` | 744.8 ms | sigmoid costs nothing |
-| identity (no sigmoid at all) | 745.3 ms | sigmoid costs nothing |
-| `float4` over the contiguous `i0` axis | neutral (end-to-end; values preserved) | not load-width bound |
-| hc loop unrolled + `__restrict__` | 729.9 ms (**-2.0 %** = 0.09 % of prefill) | real, not kept |
+The part sustains **~230 GB/s**, not 256 — and **the dsv4_hc_pre access pattern is not inherently
+slow**: a clean kernel of the identical shape hits 227 GB/s.  So our kernel sits **~13 % below what
+its own pattern allows**, not at a wall.  (My first pass inferred the ceiling from our own kernels and
+concluded "at the memory wall, nothing to gain" — that was wrong, and it took a direct measurement to
+show it.)
 
-No register spilling in any variant (VGPR 24->32, `Scratch_Size` 0).  The launch config was never the
-problem: `pre` runs 20480 blocks, fully occupied, coalesced.
+The split:
 
-The remaining lever is **bytes**: pwilkin's `hc_mix_reduce_bf16` reads bf16 copies of `xn`/`gate`
-("Halogen-style 16-bit HC intermediates"), taking unique traffic 189 -> ~105 MB = **1.8x**, which
-matches the reported 1.44 -> 0.93 s.  That needs the `hc_norm` / `hc_gate` producers to write bf16, so
-it is a **graph-level change and a numerics change on the HC path**, not a kernel-local fix.
+* **~13 % kernel-local** (197 -> 227) = ~95 ms = **~0.6 % of prefill**.  Unexplained so far; what
+  differs from the probe kernel is the sigmoid (measured free), the runtime-stride address arithmetic,
+  and the strided `dst` write.
+* **the dominant lever is bytes** — bf16 intermediates cut unique traffic 189 -> ~105 MB (1.8x); at
+  227 GB/s that is ~0.46 ms/launch vs 0.98 = **~2.3 % of prefill**, matching the reference's
+  1.44 -> 0.93 s.  It needs the `hc_norm`/`hc_gate` producers to write bf16, so it is a **graph-level
+  change**.
+
+Kernel-level A/B (`rocprofv3`):
+
+| variant | `dsv4_hc_pre_f32` |
+|---|---:|
+| production (`expf`) | 745.0 ms |
+| `__expf` | 744.8 ms |
+| identity (no sigmoid) | 745.3 ms |
+| `float4` over the contiguous `i0` axis | neutral (end-to-end, value-preserving) |
+| hc loop unrolled + `__restrict__` | 729.9 ms (**-2.0 %** = 0.09 % of prefill, not kept) |
+
+No register spilling anywhere (VGPR 24->32, `Scratch_Size` 0).
+
+**Two probe traps, both mine:** size buffers by *bytes* and index by *float4 count* (mixing them is a
+4x out-of-bounds read that presents as `Memory access fault ... Page not present`, looking like a
+HIP/driver problem); and count *write* bytes as the iterations actually performed, not one whole
+buffer (counting 3x192 MB when 50 MB was written reported **302 GB/s on a 256 GB/s part** — exceeding
+spec is the tell that the accounting, not the kernel, is wrong).
 
 ### METHODOLOGY — prefill time here is DATA-DEPENDENT; judge kernel variants on kernel time
 

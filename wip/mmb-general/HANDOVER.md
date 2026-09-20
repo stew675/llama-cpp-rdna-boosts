@@ -24,23 +24,51 @@ then `README.md` (the running record) beside it.
 
 ---
 
-## UPDATE — session 5e (2026-09-19): dsv4_hc — investigated, NOT landed. Both kernels are already at
-## the box's DRAM bandwidth; the reference's win is bf16 intermediates (a graph change)
+## UPDATE — session 5e (2026-09-19): dsv4_hc — investigated, NOT landed; the reference's win is bf16
+## intermediates (a graph change), plus a residual ~13 % kernel-local gap
 
 `dsv4_hc_pre_f32` + `dsv4_hc_post_f32` are 1432.5 ms (8.5 % of pp8192) and the reference (pwilkin
 `hc-mix.cu`) is reportedly ~0.93 s against our 1.44 s.  **No change landed** — the tree is clean and
 baseline pp8192 is 953.5 t/s post-revert.
 
-### The kernels are memory-bandwidth-bound, not tuning-bound
+### The machine's real ceiling, MEASURED (not inferred)
 
-| kernel | per launch | unique DRAM traffic | effective |
-|---|---:|---:|---:|
-| `dsv4_hc_pre_f32` | 0.98 ms | 189 MB (x 84 + gate 84 + dst 21, each read once) | **197 GB/s** |
-| `dsv4_hc_post_f32` | 0.92 ms | ~192 MB unique (`residual` gets 4x L2 reuse) | **209 GB/s** |
+`tools/dram-bw-probe.cpp` (kept in this directory; `hipcc --offload-arch=gfx1151 -O3`), 192 MB buffers:
 
-The two agree, and ~200 GB/s is this box's achievable LPDDR5X bandwidth — so **both are already at
-the memory wall for f32**.  The launch config was never the problem either: `pre` launches
-`ceil(n_embd*n_tokens/256)` = 20480 blocks, fully occupied, coalesced 128-byte reads.
+| pattern | GB/s | % of the 256 GB/s spec |
+|---|---:|---:|
+| pure sequential read (grid-stride float4) | **231.6** | 90.5 % |
+| copy (read + write) | **208.3** | 81.4 % |
+| **the exact `dsv4_hc_pre` shape** (x + gate, 4 streams each, + dst) | **227.2** | 88.7 % |
+| the real `dsv4_hc_pre_f32` | **197** | 77.0 % |
+
+The part sustains **~230 GB/s**, not 256, and — the part that matters — **the dsv4_hc_pre access
+pattern is not inherently slow**: a clean kernel with the identical shape reaches 227 GB/s.  So our
+kernel is **~13 % below what its own pattern allows**, not pinned at a wall.
+
+This correction matters because the first pass got it wrong twice: the ceiling was *inferred* from our
+own kernels rather than measured, and the conclusion drawn was "already at the memory wall, nothing to
+gain".  The honest split:
+
+* **~13 % kernel-local** (197 -> 227 GB/s) = ~95 ms = **~0.6 % of prefill**.  Not pinned down; what
+  remains different from the probe kernel is the sigmoid (measured free), the runtime-stride address
+  arithmetic, and the strided `dst` write.
+* **the dominant lever is bytes**: bf16 intermediates take unique traffic 189 -> ~105 MB (1.8x), which
+  at 227 GB/s is ~0.46 ms/launch vs 0.98 — **~2.3 % of prefill**, and that is what matches the
+  reference's 1.44 -> 0.93 s.  It needs the `hc_norm`/`hc_gate` producers to write bf16, so it is a
+  **graph-level change**.
+
+The launch config was never the problem: `pre` runs `ceil(n_embd*n_tokens/256)` = 20480 blocks, fully
+occupied, coalesced 128-byte reads.
+
+**Two probe traps, both mine, each costing a GPU fault or a wrong answer:**
+
+1. **Size buffers by bytes, index by `float4` count.**  Mixing them (`n4 = NB/4` against an `NB`-byte
+   allocation) is a 4x out-of-bounds read that presents as `Memory access fault ... Page not present`
+   — i.e. it looks like a HIP/driver problem, not an indexing bug.
+2. **Count write bytes as the iterations actually performed**, not as one whole buffer.  Counting
+   3x192 MB when only 50 MB was written reported **302 GB/s on a 256 GB/s part**; exceeding spec is
+   the tell that the accounting, not the kernel, is wrong.
 
 ### Three levers tested at the KERNEL level; all exhausted
 
@@ -65,11 +93,12 @@ intermediates", reading bf16 copies of `xn` and `gate`.  That takes the unique t
 `hc_norm` / `hc_gate` producers to write bf16, so it is a **graph-level change and a numerics change
 on the HC path**, not a kernel-local fix.  (His other variant,
 `hc_mix_reduce_f32_hc4_parallel`, spreads the hc loop over 4 warps with a shared-memory reduce; that
-is a latency optimisation, and since we are already at the bandwidth wall it cannot be where the
-gap is.)
+is a latency optimisation, and with the pattern itself reaching 227 GB/s in the probe it cannot be
+where the gap is.)
 
-**Conclusion: this is a graph item, not a kernel-tuning item.**  Both kernel-local levers that could
-have mattered have now been measured and are exhausted.
+**Conclusion:** two levers, neither a factor of two — **bf16 intermediates** (1.8x fewer bytes, a
+graph change, ~2.3 % of prefill) and a residual **~13 % kernel-local gap** (~0.6 % of prefill).  Every
+kernel-local lever that could have explained a *large* gap has now been measured and is exhausted.
 
 ### METHODOLOGY — two traps, both mine, both generalisable
 
