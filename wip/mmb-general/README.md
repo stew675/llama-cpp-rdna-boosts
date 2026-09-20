@@ -97,6 +97,19 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 7 (2026-09-20): the qsa3 pack is 0.34 %, not 3 % — a misattribution corrected
+
+Session-5b's next-work proposed fusing the qsa3 pack for ~3 % of prefill.  Measured by diffing QSA3
+**on vs off** (`rocprofv3`, `/llm/models/Qwen3.8/Flash-Next/IQ4_XS/`, pp8192, bf16 KV,
+`GGML_CUDA_MMB=1`), the **whole pack is 57.8 ms of 16782 ms = 0.34 %** (bf16 KV); with a q8_0 KV
+cache, 86.3 ms = 0.48 %.  The session-5 "PACK/copy (qsa3 pack) 3.0 %" bucket was really
+`concat_transposed_src1_dim0` (357.5 ms, the **MoE output concat**, present with QSA3 off too) +
+`cpy_scalar<float,float>` (110.7 ms, base-graph copies) + the actual pack (57.8 ms).
+
+A fused one-pass pack kernel saves at best ~half of that (~0.17 % bf16 / ~0.3 % q8_0).  **The next
+in-scope target is the `dsv4_hc_pre`+`_post` pair (8.5 %, bf16 intermediates) or `mmb_cvt` (3.8 %,
+bf16-producer marking), not the pack.**  Full table + method in `HANDOVER.md` §session 7.
+
 ## UPDATE — session 6 (2026-09-20): the `mmb_*` kernels are at their gfx1151 ceiling
 
 Session 5 left "`mmb_dense` (21 %) + `mmb_routed_glu` (16 %) need a split-K / int8-IU8 restructure".  This session closed both ideas, plus the bf16-shadow alternative.  **No code change** — the

@@ -17,7 +17,9 @@ then `README.md` (the running record) beside it.
 > weight shadow is 2.44x *slower*, and every tile knob is a wash or worse — the kernels are at their
 > structural ceiling (dense Q8_0 at 54 % of the bf16 WMMA peak, GLU at 36 %).  The next prefill lever
 > is **outside `mmb_*`** (FA 11.3 %, GDN 5.5 %, MoE concat+reduction 6.8 %, rms_norm ~5 %), or
-> **promotion** (all gates green).  The **indexer** (1 % at 8K, 3.2 % at 32K) stays deferred.
+> **promotion** (all gates green).  **Session 7** then measured the qsa3 pack (session-5b's "3 %"
+> item) and found it is **0.34 %** — the bucket was really the MoE `concat_transposed_src1_dim0` +
+> base-graph F32 copies.  The **indexer** (1 % at 8K, 3.2 % at 32K) stays deferred.
 
 **Current state (start here):**
 
@@ -28,11 +30,12 @@ then `README.md` (the running record) beside it.
 | backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0017` + `commits.txt`, in this repo, pushed to `origin/main` (`05f2c56`) |
 | verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (17 commits, 11 files, +2506/-11) |
 | build | §3 | run | §4 |
-| current numbers | the **session 6 UPDATE below** (kernel ceiling, int8/bf16 microbench + the rejected knobs); the session 5b/5e profile tables and the §5/§7 tables predate it |
+| current numbers | the **session 7 UPDATE below** (the qsa3 pack is 0.34 %, not 3 %) and the **session 6 UPDATE** (kernel ceiling, int8/bf16 microbench, rejected knobs); the session 5b/5e profile tables and the §5/§7 tables predate them |
 
-**Order the UPDATE sections by session: 6 (newest, 2026-09-20) → 5e (dsv4_hc) → 5d (W=1..8 probe) →
-5c (gates) → 5b (tiny-M) → 5 (profile + F32 split) → 4 → 3 → 2.**  §0-§14 after them are the original
-(session-1) body and are correct except where an UPDATE says otherwise.
+**Order the UPDATE sections by session: 7 (newest, 2026-09-20, the pack measurement) → 6 (2026-09-20, the
+`mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
+split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body and are correct except where
+an UPDATE says otherwise.
 
 **Next work (AUTHORITATIVE — the "next-work order" lists inside the UPDATE sections are historical):**
 
@@ -57,6 +60,54 @@ then `README.md` (the running record) beside it.
 7. **Promotion**: every §11 gate now passes (see 5c/5d).  What remains is the rebase onto a canonical
    fork at `ebbb18522` + `scripts/apply-all.sh`, regenerating `patches/`, and deciding whether MMB
    rides as a block-08 amendment.  Given 1-2 are exhausted, this is now the highest-value step.
+
+---
+
+## UPDATE — session 7 (2026-09-20): the qsa3 pack is **0.3–0.5 %**, not 3 % — the session-5
+## "PACK/copy (qsa3 pack)" bucket was a misattribution
+
+The session-5/5b next-work put "qsa3 attn + its PACK (4.9 % + **3.0 %**)" and proposed fusing the pack.
+Measured on the target model (`/llm/models/Qwen3.8/Flash-Next/IQ4_XS/`, 94 GiB, pp8192, `-b/-ub 2048`,
+bf16 KV, `GGML_CUDA_MMB=1`, `rocprofv3`), **by diffing QSA3 on vs off** so the pack is attributed
+exactly:
+
+| kernel | ON ms | OFF ms | Δ = the pack |
+|---|---:|---:|---:|
+| `cpy_scalar<…cpy_1_scalar<__half,__half>>` (cont) | 41.0 | 0 | **41.0** |
+| `cpy_scalar_transpose<__half>` | 9.5 | 0 | **9.5** |
+| `cpy_scalar_contiguous<__hip_bfloat16,__half>` (cast) | 7.3 | 0 | **7.3** |
+| `qsa3_attn_kernel` | 809.7 | 0 | 809.7 |
+| `qsa3_merge_kernel` / `qsa3_rows_kernel` | 60.1 | 0 | 60.1 |
+| `flash_attn_qsa` (VEC, replaced) | 0 | 3774.6 | −3774.6 |
+| **qsa3 total** | | | **927.6 vs 3774.6 (4.07x)** |
+
+**The entire qsa3 pack is 57.8 ms of the 16782 ms run = 0.34 %.**  With a **q8_0** KV cache it is
+**86.3 ms = 0.48 %** (the extra `cpy_q_f32<…q8_0…>` 31.1 + `cpy_scalar_contiguous<float,__half>` 4.7
+are the q8_0→F32→F16 chain).  The qsa3 win itself reproduces: pp8192 bf16 KV **827.2 → 966.8**
+(+16.9 %), q8_0 **850.4 → 953.6** (+12.1 %).
+
+**What the session-5 "PACK/copy (qsa3 pack) 3.0 %" bucket actually contained:**
+`concat_transposed_src1_dim0` **357.5 ms (2.1 %)** — that is the **MoE output concat** (`GGML_OP_CONCAT`,
+`unsigned int` elements; it is present with QSA3 **off** and has nothing to do with the pack) — plus
+`cpy_scalar<float,float>` **110.7 ms (0.66 %)** (base-graph copies, also present with QSA3 off), plus
+the real pack **57.8 ms (0.34 %)**.  Sum ≈ 3.1 %.  The label "(qsa3 pack)" was wrong.
+
+**Ceiling for the proposed fusion:** the pack is cast(bf16→f16) + permute + `cont` = 3 passes over the
+cache.  A fused single-pass pack kernel (read native cache, write `pk`/`pv` directly) would do
+1 read + 1 write, so it saves at best roughly **half** the pack — **~0.17 % bf16**, ~0.3 % q8_0.  The
+attn kernel cannot skip the pack: the packed-block layout is what makes its per-block reads
+coalesced, and the same block is re-read by many groups, so packing once amortises the re-layout.
+**Recommendation: do not spend a session on it.**
+
+**The correct targets (current profile, bf16 KV, total 16782 ms):** `dsv4_hc_pre` 743.9 + `_post` 685.3 =
+**1429 ms (8.5 %)** via bf16 intermediates (~2.3 % win, next-work #3); `mmb_cvt_f32_bf16` **642.5 ms
+(3.8 %, 3 insts)** via bf16-producer marking (§10); the MoE epilogue pair `moe_weighted_reduction`
+384.1 + `concat_transposed_src1_dim0` 357.5 = **741.6 ms (4.4 %)** (delivery block 13/14, out of this
+WIP's scope but the actual size the pack was credited with).
+
+**Methodology (do not relearn): a bucket label is not evidence.**  Attribute a suspected cost by
+turning the feature **off** and diffing the kernel trace; the session-5 bucket mixed three unrelated
+copy families under one name.
 
 ---
 
