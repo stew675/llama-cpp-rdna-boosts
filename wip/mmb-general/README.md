@@ -300,6 +300,64 @@ the MMB default is now **off**: IQ4_XS pp4096 896.0 -> **915.9**, pp8192 896.8 -
 kernel that is already parallelism-starved, and `BM=16` does not help M=512.  Reverted; the real fix
 is a dedicated tiny-M (or split-K) kernel.
 
+## UPDATE — session 5 (2026-09-19): the fresh profile + the shape-aware F32 split
+
+### Fresh post-session-4 profile — reprioritises the list
+
+`rocprofv3` kernel trace, MMB + QSA3 on, IQ4_XS `-b/-ub 2048`, in % of total kernel time:
+
+| family | pp8192 (17.77 s) | pp32768 (77.02 s) |
+|---|---:|---:|
+| `mmb_*` | 52.0 % | 48.2 % |
+| **F32 rocBLAS** (`Cijk_...`) | **11.7 %** | **12.0 %** |
+| `qsa3` attn/rows/merge | 4.9 % | 6.4 % |
+| `rms_norm_f32` | 5.9 % | 5.5 % |
+| `dsv4_hc_pre` + `_post` | 8.0 % | 7.4 % |
+| PACK/copy (qsa3 pack) | 3.0 % | 3.5 % |
+| **indexer top-k family** | **0.99 %** | **3.2 %** |
+| indexer score | 0.98 % | 3.2 % |
+
+**This contradicts the "indexer is next-work #1" ordering carried in from session 4.**  The indexer
+is ~1 % at 8K (it was 0.5 % at the pp2048 startup regime that ordering was based on) and only reaches
+3.2 % at 32K.  It does scale with `n_kv x n_tps` while its output is capped at 2051 cells, so it
+matters at depth - but the **F32 path is 12 % at *both* depths** and was the larger target.  The
+indexer is deferred, not dropped.
+
+### The fix: F32 dense weights, split on shape (+2.1 / +2.6 / +3.1 %)
+
+The F32 dense weights were all-or-nothing between rocBLAS and the MMB f32split tile, and the two
+paths disagree about *which shape* each wins - so the previous default was a wash (mode 2 was even the
+worst).  Per-shape, from the trace (the launcher grid is `ceil(M/128) x ceil(T/128)` workgroups, so
+the launch identity is exact):
+
+| shape | rocBLAS | MMB f32split | winner |
+|---|---:|---:|---|
+| `ffn_gate_inp` M=512 K=2560 | 2.044 ms | **0.846 ms** | **MMB 2.4x** |
+| `hc_attn/ffn_inject` M=4 K=10240 | **1.332 ms** | 1.825 ms | rocBLAS 1.37x |
+| `ssm_alpha/beta` M=48 K=2560 | **0.359 ms** | slower | rocBLAS |
+
+**The discriminator is M alone.**  Mode 1 (new default) takes MMB only when `M >= 128`:
+
+| pp | mode 0 (all rocBLAS) | **mode 1 (M>=128)** | mode 2 (all MMB) |
+|---|---:|---:|---:|
+| 2048 | 914.87 | **933.92 (+2.1 %)** | 901.73 |
+| 4096 | 908.93 | **933.03 (+2.6 %)** | 901.01 |
+| 8192 | 901.99 | **929.75 (+3.1 %)** | 902.97 |
+
+F32 GEMM total 1947 -> ~1537 ms.  Why rocBLAS wins the small-M/short-K shapes: its `MT32x32x8`
+kernel split-Ks hard (M=512/K=2560 launches 262144 blocks for ~1.0M outputs, ~64 threads per output,
+so it pays partial-sum traffic) and loses the 2.4x there; on M=4/K=10240 the 128-row MMB tile wastes
+WMMA rows and loses.
+
+**Numerics parity**: PPL c16384 bf16 3.3821 (mode 0) vs 3.3875 (mode 1), error bars ±0.027.  Decode
+untouched (tg64 25.95 vs 26.00) - the `T >= 512` gate is unchanged, so `W=1..8` purity still holds by
+construction.  Greedy text coherent.
+
+**Lesson (do not relearn): a first attempt added "or `K >= 4096`" to the rule, expecting the WMMA
+path to help the K=10240 hc inject pair.  It is wrong and costs 375 ms.**  The trap that hid it:
+bucketing launches by grid alone put `hc_inject` (760) + `ssm` (576) + others into one 1.065 ms
+average that looked like an MMB win.  **Split the bucket before believing a per-shape number.**
+
 ## Gates before this could be opt-in, let alone defaulted on (from the parked handover)
 
 - W = 1..8 logits matrix with `GGML_CUDA_MMB=1` == off (prefill-only, `T >= 512`).

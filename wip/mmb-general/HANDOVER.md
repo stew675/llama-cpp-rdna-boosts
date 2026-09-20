@@ -15,12 +15,64 @@ then `README.md` (the running record) beside it.
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`1d4dac09a`** |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`5c8583b9e`** |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
 | backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0013` + `commits.txt`, in this repo, pushed to `origin/main` (`b78b96b`) |
 | verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (13 commits, 9 files, +2190/-11) |
 | build | §3 | run | §4 |
 | current numbers | the session-4 UPDATE below (the §5/§7 tables predate the default flips) |
+
+---
+
+## UPDATE — session 5 (2026-09-19): fresh profile reprioritises; F32 split by shape (+2-3 %)
+
+**1. A fresh post-session-4 profile (MMB+QSA3 on, `-b/-ub 2048`) contradicts the session-4 ordering.**
+% of total kernel time:
+
+| family | pp8192 | pp32768 |
+|---|---:|---:|
+| `mmb_*` | 52.0 % | 48.2 % |
+| **F32 rocBLAS** | **11.7 %** | **12.0 %** |
+| `qsa3` attn/rows/merge | 4.9 % | 6.4 % |
+| `rms_norm_f32` | 5.9 % | 5.5 % |
+| `dsv4_hc_pre` + `_post` | 8.0 % | 7.4 % |
+| PACK/copy (qsa3 pack) | 3.0 % | 3.5 % |
+| indexer top-k family | 0.99 % | 3.2 % |
+
+The **indexer is ~1 % at 8K**, not the #1 item - it was promoted on the pp2048 startup regime (0.5 %).
+It does scale with `n_kv x n_tps` (3.2 % at 32K, output capped at 2051 cells) so it returns at depth,
+but the **F32 path is 12 % at both** and was the bigger, better-scoped target.  Indexer deferred.
+
+**2. F32 dense weights are now split by shape and default ON** (`GGML_CUDA_MMB_F32SPLIT=1`).
+All-or-nothing was a wash because the paths disagree per shape:
+
+| shape | rocBLAS | MMB f32split | winner |
+|---|---:|---:|---|
+| `ffn_gate_inp` M=512 K=2560 | 2.044 ms | **0.846 ms** | **MMB 2.4x** |
+| `hc_attn/ffn_inject` M=4 K=10240 | **1.332 ms** | 1.825 ms | rocBLAS |
+| `ssm_alpha/beta` M=48 K=2560 | **0.359 ms** | slower | rocBLAS |
+
+Rule: MMB iff `M >= 128`.  pp2048 914.9 -> **933.9 (+2.1 %)**, pp4096 908.9 -> **933.0 (+2.6 %)**,
+pp8192 902.0 -> **929.8 (+3.1 %)**; the old force-all mode 2 is worst at every length.  F32 GEMM
+1947 -> ~1537 ms.  PPL c16384 bf16 3.3821 vs 3.3875 (bars ±0.027) = parity; decode untouched
+(tg64 25.95 vs 26.00; the `T >= 512` gate is unchanged so `W=1..8` purity holds by construction).
+
+**Trap, recorded so it is not relearned:** the first rule also took MMB when `K >= 4096` (expecting
+the WMMA path to help the K=10240 hc inject pair).  It is wrong and costs 375 ms.  It looked right
+only because bucketing launches by grid alone merged `hc_inject` + `ssm` into one 1.065 ms average.
+**Split the bucket before believing a per-shape number.**
+
+**Next-work order (revised, by measured cost):**
+
+1. **F32 tiny-M**: the remaining ~1.5 s is `hc_inject` (M=4, 1.332 ms/launch, floor ~0.33) and
+   `ssm` (M=48, 0.359 vs ~0.084 floor) - both rocBLAS-bound now.  A dedicated small-M kernel (or
+   getting rocBLAS off its split-K) is the next ~8 % of prefill.
+2. **`mmb_dense` / `mmb_routed_glu`** (52 % combined) - §9's Q8_0 IU8-WMMA and the routed-GLU
+   geometry.
+3. **`dsv4_hc_pre`+`_post`** (8 %) - the HC prefill fusion.
+4. **qsa3 attn + its PACK** (4.9 % + 3.0 %) - the pack is a pure copy; fusing it into the kernel
+   would reclaim most of its 3 %.
+5. **The indexer** - 1 % at 8K, 3.2 % at 32K, growing; worth it once the above are done.
 
 ---
 
@@ -340,7 +392,8 @@ MMB (`mmb.cu` / `mmb.cuh`):
 | `GGML_CUDA_MMB_GLU` | 1 | fused gate/up+swiglu arm |
 | `GGML_CUDA_MMB_IQ3XXS` | 0 | enable the (net-loss) fused GLU arm for IQ3_XXS |
 | `GGML_CUDA_MMB_BF16W` | 1 | BF16 dense weights via MMB |
-| `GGML_CUDA_MMB_F32SPLIT` | **0** | F32 dense via f16-hi/lo WMMA.  **Flipped 2->0 on 2026-09-19**: the F32 weights are all tiny-M and rocBLAS measured faster (see the session-4 UPDATE); `=1` opts it back in |
+| `GGML_CUDA_MMB_F32SPLIT` | **1** | F32 dense via f16-hi/lo WMMA.  **Mode 1 = shape-aware and DEFAULT since session 5**: MMB only when `M >= 128` (the MoE router, 2.4x faster); rocBLAS keeps `hc_*_inject` (M=4) and `ssm_alpha/beta` (M=48).  `0` = all rocBLAS, `2` = all MMB (pre-session-5, worst).  Measured pp8192 902.0 (0) / **929.8 (1)** / 903.0 (2) |
+| `GGML_CUDA_MMB_F32SPLIT_MIN_M` / `_MIN_K` | 128 / 0 | the mode-1 shape rule.  **Do not add a K condition**: taking MMB for long K (the K=10240 inject pair) measured 1.825 vs 1.332 ms and cost 375 ms |
 | `GGML_CUDA_MMB_TALL` | 2 | the tall-M tile class |
 | `GGML_CUDA_MMB_SHADOW` / `_SHADOW_MB` | 0 / 6144 | legacy bf16 shadow (Q6_K/IQ4_NL); not needed now |
 | `GGML_CUDA_MMB_TILE` | -1 | **diagnostic**: force narrow(0)/wide(1) tile |

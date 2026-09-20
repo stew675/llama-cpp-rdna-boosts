@@ -746,10 +746,10 @@ index edccfba13..230d9fb68 100644
      bool cuda_graph_update_required = false;
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
 new file mode 100644
-index 000000000..3c6039d43
+index 000000000..fb5ee89f5
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -0,0 +1,1388 @@
+@@ -0,0 +1,1414 @@
 +#include "mmb.cuh"
 +#include "unary.cuh"
 +#include <unordered_map>
@@ -1741,15 +1741,37 @@ index 000000000..3c6039d43
 +    return allow_rdna3 && GGML_CUDA_CC_IS_RDNA3_0(cc);
 +}
 +int  mmb_min_t()   { static const int v = getenv("GGML_CUDA_MMB_MIN_T") ? atoi(getenv("GGML_CUDA_MMB_MIN_T")) : 512; return v; }
-+// F32 dense weights: DEFAULT OFF (2026-09-19).  They are all tiny-M (MoE router M=512, ssm alpha/beta
-+// M=48, hc *_inject M=4, the shared-expert gate M=1) and both paths cost the same ~1.0 s at pp8192 -
-+// the 128x128 f16-hi/lo tile computes a padded 128-row A tile (up to 128x wasted WMMA for M=4) and
-+// falls back to the same shape bound as rocBLAS.  Measured: `GGML_CUDA_MMB_F32SPLIT=0` (the stock
-+// path) is +1.3-2.3 % on IQ4_XS, and a 16x256 small-M tile was tried and is worse (870/847 vs
-+// 895/885 t/s - BN=256 halves the block count).  A dedicated tiny-M kernel is the real fix; until
-+// then the stock path wins.  `GGML_CUDA_MMB_F32SPLIT=1` opts the MMB path back in.
-+int  mmb_f32split_mode(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : 0; return v; }
-+bool mmb_f32split() { static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : 0; return v != 0; }
++// F32 dense weights: historically DEFAULT OFF (the 2026-09-19 session-4 note); SUPERSEDED by the
++// shape-aware default below.  Kept only for the measured history: a 16x256 small-M tile was tried
++// and is worse (870/847 vs 895/885 t/s -- BN=256 halves the block count).
++// F32 dense weights: SHAPE-AWARE, default ON since 2026-09-19.  These GEMMs are tiny-M and both
++// paths cost ~2.1 s at pp8192, but they do not agree on WHICH shape each wins.  Measured per shape
++// (the launcher grid is ceil(M/128) x ceil(T/128) workgroups, so the launch identity is exact):
++//
++//   ffn_gate_inp        M=512 K=2560    rocBLAS 2.044 ms   MMB 0.846 ms   -> MMB 2.4x
++//   hc_attn/ffn_inject  M=4   K=10240   rocBLAS 1.332 ms   MMB 1.825 ms   -> rocBLAS 1.37x
++//   ssm_alpha/beta      M=48  K=2560    rocBLAS 0.359 ms   MMB (slower)   -> rocBLAS
++//
++// **The discriminator is M alone -- do not "improve" it with a K rule.**  An earlier version of
++// this gate also took MMB for long K (>= 4096), expecting the hc inject pair (K=10240) to benefit
++// from the WMMA path; profiling it showed the opposite (1.825 vs 1.332 ms/launch) and cost 375 ms.
++// The trap that hid it: a first pass bucketed launches by grid alone, and the M<=128 bucket mixed
++// hc_inject (760) + ssm (576) + others into one 1.065 ms average, which looked like a win for MMB.
++// Split the bucket before believing a per-shape number.
++//
++// Why rocBLAS wins the small-M/short-K shapes: its MT32x32x8 kernel split-Ks hard (M=512/K=2560
++// launches 262144 blocks for ~1.0M outputs, i.e. ~64 threads per output, so it pays partial-sum
++// traffic) and loses the 2.4x there; on M=4/K=10240 the 128-row MMB tile wastes WMMA rows and loses.
++// Net with the M>=128 rule: 1947 -> ~1537 ms of F32 (about -3 % prefill).
++//
++// Modes: 0 = off (all rocBLAS), 1 = shape-aware (default), 2 = every F32 GEMM through MMB (the
++// pre-2026-09-19 behaviour, kept for A/B).
++int  mmb_f32split_mode(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : 1; return v; }
++bool mmb_f32split() { return mmb_f32split_mode() != 0; }
++// Defaults: MIN_M = 128 (the router; measured 2.4x better on MMB) and MIN_K = 0 (disabled -- the
++// long-K hc inject pair is *worse* on MMB despite the WMMA path; see the table above).
++int  mmb_f32split_min_k(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_K") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT_MIN_K")) : 0; return v; }
++int  mmb_f32split_min_m(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_M") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT_MIN_M")) : 128; return v; }
 +bool mmb_bf16w()    { static const int v = getenv("GGML_CUDA_MMB_BF16W") ? atoi(getenv("GGML_CUDA_MMB_BF16W")) : 1; return v != 0; }
 +bool mmb_hc16()    { static const int v = getenv("GGML_CUDA_MMB_HC16") ? atoi(getenv("GGML_CUDA_MMB_HC16")) : 0; return v != 0; }
 +int  mmb_tall_mode(){ static const int v = getenv("GGML_CUDA_MMB_TALL") ? atoi(getenv("GGML_CUDA_MMB_TALL")) : 2; return v; }
@@ -1813,12 +1835,16 @@ index 000000000..3c6039d43
 +                       (src0->type == GGML_TYPE_Q6_K && mmb_shadow_q6k() && mmb_is_resident_q6k(src0) &&
 +                        mmb_shadow_lookup(src0) != nullptr);
 +    const bool bf16w = src0->type == GGML_TYPE_BF16 && mmb_bf16w();
-+    const bool f32w  = src0->type == GGML_TYPE_F32 && mmb_f32split();
-+    if ((!quant && !bf16w && !f32w) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
++    const bool f32cand = src0->type == GGML_TYPE_F32 && mmb_f32split();
++    if ((!quant && !bf16w && !f32cand) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
 +    if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
 +    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
 +    const int64_t K = src0->ne[0], M = src0->ne[1];
-+    if ((f32w ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
++    // shape-aware F32 (mode 1, default): take only the shapes where MMB beat rocBLAS (see the
++    // F32SPLIT comment above).  Mode 2 forces every F32 GEMM here; mode 0 never gets this far.
++    const bool f32w = f32cand && (mmb_f32split_mode() >= 2 || (M >= mmb_f32split_min_m() && K >= mmb_f32split_min_k()));
++    if (f32cand && !f32w) return false;   // this F32 shape is better on rocBLAS -- no fusion stand-down either
++    if ((f32cand ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
 +    if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS) && K % 256 != 0) return false;   // whole 256-value super-blocks
 +    const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
 +    if (T < mmb_min_t() || T > INT32_MAX / 4) return false;
