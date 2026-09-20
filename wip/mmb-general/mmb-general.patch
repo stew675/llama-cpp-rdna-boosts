@@ -1158,10 +1158,32 @@ index edccfba13..aab997949 100644
      if (!disable_fusion) {
          for (int i = 0; i < cgraph->n_nodes; ++i) {
 diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
-index 1b9e63516..cca8c74bc 100644
+index 1b9e63516..669841582 100644
 --- a/ggml/src/ggml-cuda/indexer-topk.cu
 +++ b/ggml/src/ggml-cuda/indexer-topk.cu
-@@ -109,9 +109,13 @@ static __global__ void indexer_topk_radix_histogram(
+@@ -54,6 +54,21 @@ struct indexer_topk_extra {
+     const int * blk_tail;   // I32 [n_tps, n_stream]
+ };
+ 
++// ordered key of a whole block when the additive is null: value = score[block] + derived bias.
++// every cell of the block shares it, so the histogram/gather evaluate it once per block.
++static __device__ __forceinline__ uint32_t indexer_topk_block_key(
++        const float * __restrict__ score,
++        const indexer_topk_extra extra,
++        int b, int t, int s, int n_blocks, int n_tps) {
++    float sc = score[b + t*n_blocks + s*n_blocks*n_tps];
++    if (extra.blk_idx != nullptr) {
++        const int bi = extra.blk_idx[b + s*n_blocks];
++        const int tail = extra.blk_tail[t + s*n_tps];
++        sc += bi < 0 ? -INFINITY : (bi >= tail ? 1e9f : 0.0f);
++    }
++    return indexer_topk_float_to_ordered(sc);
++}
++
+ template<typename kv_t>
+ static __device__ __forceinline__ float indexer_topk_value(
+         const float * __restrict__ score,
+@@ -109,9 +124,13 @@ static __global__ void indexer_topk_radix_histogram(
      __syncthreads();
  
      const indexer_topk_radix_state state = states[row];
@@ -1178,7 +1200,85 @@ index 1b9e63516..cca8c74bc 100644
          const uint32_t key = indexer_topk_float_to_ordered(
                  indexer_topk_value(score, cell_blk, additive, extra, col, t, s, n_blocks, n_tps, n_kv));
          if ((key & state.prefix_mask) == state.prefix) {
-@@ -166,46 +170,48 @@ static __global__ void indexer_topk_radix_select(
+@@ -125,6 +144,77 @@ static __global__ void indexer_topk_radix_histogram(
+     block_histograms[histogram_offset + tid] = histogram[tid];
+ }
+ 
++// block-granularity histogram: with no additive the per-cell value is
++// `score[cell_blk[c]] + derived-bias` and the visibility is a per-cell predicate, so every cell of
++// one block shares one ordered key.  each thread walks a contiguous run of VEC cells and recomputes
++// the block key only when the block changes (the common `ratio == 4` case: once per thread step),
++// which removes the per-cell score gather.  bit-identical to the cell-level kernel -- only the
++// integer bin counts matter, and they are the same.
++template<int BLOCK_SIZE, int RADIX_BITS, int VEC>
++static __global__ void indexer_topk_radix_histogram_grouped(
++        const float * __restrict__ score,
++        const int   * __restrict__ cell_blk,
++        const indexer_topk_extra extra,
++        const indexer_topk_radix_state * __restrict__ states,
++        int * __restrict__ block_histograms,
++        int ncols, int n_tps, int n_blocks, int n_kv,
++        int blocks_per_row,
++        int shift) {
++    constexpr int NBINS = 1 << RADIX_BITS;
++
++    const int row = blockIdx.x / blocks_per_row;
++    const int row_block = blockIdx.x % blocks_per_row;
++    const int tid = threadIdx.x;
++    const int t = row % n_tps;
++    const int s = row / n_tps;
++    __shared__ int histogram[NBINS];
++
++    for (int i = tid; i < NBINS; i += BLOCK_SIZE) {
++        histogram[i] = 0;
++    }
++    __syncthreads();
++
++    const indexer_topk_radix_state state = states[row];
++    const uint32_t key_inf = indexer_topk_float_to_ordered(-INFINITY);
++    const int q    = extra.q_pos    != nullptr ? extra.q_pos[t + s*n_tps]    : 0;
++    const int nskv = s*n_kv;
++
++    const int chunk = (ncols + blocks_per_row - 1) / blocks_per_row;
++    const int col0 = row_block * chunk;
++    const int col1 = min(col0 + chunk, ncols);
++    for (int base = col0 + tid*VEC; base < col1; base += BLOCK_SIZE*VEC) {
++        int      cur_b   = -1;
++        uint32_t cur_key = key_inf;
++        #pragma unroll
++        for (int v = 0; v < VEC; ++v) {
++            const int c = base + v;
++            if (c >= col1) {
++                break;
++            }
++            const int b = cell_blk[c + nskv];
++            if (b != cur_b) {
++                cur_b = b;
++                cur_key = indexer_topk_block_key(score, extra, b, t, s, n_blocks, n_tps);
++            }
++            uint32_t key = cur_key;
++            if (extra.cell_pos != nullptr) {
++                const int cp = extra.cell_pos[c + nskv];
++                if (cp < 0 || cp > q) {
++                    key = key_inf;
++                }
++            }
++            if ((key & state.prefix_mask) == state.prefix) {
++                atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
++            }
++        }
++    }
++    __syncthreads();
++
++    const size_t histogram_offset =
++        ((size_t) row * blocks_per_row + row_block) * NBINS;
++    block_histograms[histogram_offset + tid] = histogram[tid];
++}
++
+ template<int BLOCK_SIZE, int RADIX_BITS>
+ static __global__ void indexer_topk_radix_select(
+         const int * __restrict__ block_histograms,
+@@ -166,46 +256,48 @@ static __global__ void indexer_topk_radix_select(
  // (and, at the rank boundary, which tied cells made it) varied run to run.  the
  // QSA kernel's online softmax is order-sensitive at the ulp level, and this
  // model's f16-state recurrences amplify that into llama-cli-visible
@@ -1262,7 +1362,7 @@ index 1b9e63516..cca8c74bc 100644
      }
  }
  
-@@ -249,8 +255,11 @@ static __global__ void indexer_topk_base_scan(
+@@ -249,8 +341,11 @@ static __global__ void indexer_topk_base_scan(
      }
  }
  
@@ -1275,7 +1375,7 @@ index 1b9e63516..cca8c74bc 100644
          const float * __restrict__ score,
          const int   * __restrict__ cell_blk,
          const kv_t  * __restrict__ additive,
-@@ -266,41 +275,57 @@ static __global__ void indexer_topk_deterministic_write(
+@@ -266,41 +361,162 @@ static __global__ void indexer_topk_deterministic_write(
      const int tid = threadIdx.x;
      const int t = row % n_tps;
      const int s = row / n_tps;
@@ -1290,35 +1390,19 @@ index 1b9e63516..cca8c74bc 100644
 -    }
 -    // inclusive prefix over the whole block in shared: gives each selected cell a
 -    // deterministic position (thread order = ascending column order within the block)
--    __shared__ int sg[BLOCK_SIZE], se[BLOCK_SIZE];
--    sg[tid] = g;
--    se[tid] = e;
--    for (int off = 1; off < BLOCK_SIZE; off <<= 1) {
--        __syncthreads();
--        const int vg = (tid >= off) ? sg[tid - off] : 0;
--        const int ve = (tid >= off) ? se[tid - off] : 0;
--        __syncthreads();
--        if (tid >= off) { sg[tid] += vg; se[tid] += ve; }
--    }
--    __syncthreads();
 +    const int chunk = (ncols + blocks_per_row - 1) / blocks_per_row;
 +    const int col0  = b * chunk;
 +    const int col1  = min(col0 + chunk, ncols);
- 
-     int * row_dst = dst + (size_t) row*k;
-     const int g_base_b = g_base[row*blocks_per_row + b];
-     const int e_base_b = e_base[row*blocks_per_row + b];
--    if (g) {
--        // exclusive position within this block's greater cells = inclusive - 1
--        row_dst[g_base_b + sg[tid] - 1] = col;
--    } else if (e) {
--        const int pos = se[tid] - 1;   // exclusive position within this block's equal cells
--        const int rank = states[row].rank;
--        if (e_base_b + pos < rank) {
--            row_dst[k - rank + e_base_b + pos] = col;
++
++    int * row_dst = dst + (size_t) row*k;
++    const int g_base_b = g_base[row*blocks_per_row + b];
++    const int e_base_b = e_base[row*blocks_per_row + b];
 +    const int rank = states[row].rank;
 +
-+    __shared__ int sg[BLOCK_SIZE], se[BLOCK_SIZE];
+     __shared__ int sg[BLOCK_SIZE], se[BLOCK_SIZE];
+-    sg[tid] = g;
+-    se[tid] = e;
+-    for (int off = 1; off < BLOCK_SIZE; off <<= 1) {
 +    __shared__ int carry_g, carry_e;
 +    if (tid == 0) { carry_g = 0; carry_e = 0; }
 +    __syncthreads();
@@ -1343,8 +1427,10 @@ index 1b9e63516..cca8c74bc 100644
 +            const int ve = (tid >= off) ? se[tid - off] : 0;
 +            __syncthreads();
 +            if (tid >= off) { sg[tid] += vg; se[tid] += ve; }
-         }
-+        __syncthreads();
++        }
+         __syncthreads();
+-        const int vg = (tid >= off) ? sg[tid - off] : 0;
+-        const int ve = (tid >= off) ? se[tid - off] : 0;
 +        if (g) {
 +            row_dst[g_base_b + running_g + sg[tid] - 1] = col;
 +        } else if (e) {
@@ -1358,11 +1444,134 @@ index 1b9e63516..cca8c74bc 100644
 +            carry_g += sg[BLOCK_SIZE - 1];
 +            carry_e += se[BLOCK_SIZE - 1];
 +        }
+         __syncthreads();
+-        if (tid >= off) { sg[tid] += vg; se[tid] += ve; }
+     }
+-    __syncthreads();
++}
++
++// block-key-sharing gather for the additive==null case.  each thread walks VEC contiguous cells
++// and caches the block key; the block scan then runs over the per-thread totals (the cells stay in
++// ascending column order across threads) so the placement is identical to indexer_topk_write_blocks.
++template<int VEC>
++static __global__ void indexer_topk_write_blocks_grouped(
++        const float * __restrict__ score,
++        const int   * __restrict__ cell_blk,
++        const indexer_topk_extra extra,
++        const indexer_topk_radix_state * __restrict__ states,
++        const int * __restrict__ g_base, const int * __restrict__ e_base,
++        int * __restrict__ dst,
++        int ncols, int n_tps, int n_blocks, int n_kv, int k,
++        int blocks_per_row) {
++    constexpr int BLOCK_SIZE = 256;
++    const int row = blockIdx.x / blocks_per_row;
++    const int b   = blockIdx.x % blocks_per_row;
++    const int tid = threadIdx.x;
++    const int t = row % n_tps;
++    const int s = row / n_tps;
++
++    const int chunk = (ncols + blocks_per_row - 1) / blocks_per_row;
++    const int col0  = b * chunk;
++    const int col1  = min(col0 + chunk, ncols);
+ 
+     int * row_dst = dst + (size_t) row*k;
+     const int g_base_b = g_base[row*blocks_per_row + b];
+     const int e_base_b = e_base[row*blocks_per_row + b];
+-    if (g) {
+-        // exclusive position within this block's greater cells = inclusive - 1
+-        row_dst[g_base_b + sg[tid] - 1] = col;
+-    } else if (e) {
+-        const int pos = se[tid] - 1;   // exclusive position within this block's equal cells
+-        const int rank = states[row].rank;
+-        if (e_base_b + pos < rank) {
+-            row_dst[k - rank + e_base_b + pos] = col;
++    const int rank = states[row].rank;
++    const uint32_t prefix  = states[row].prefix;
++    const uint32_t key_inf = indexer_topk_float_to_ordered(-INFINITY);
++    const int q    = extra.q_pos != nullptr ? extra.q_pos[t + s*n_tps] : 0;
++    const int nskv = s*n_kv;
++
++    __shared__ int sg[BLOCK_SIZE], se[BLOCK_SIZE];
++    __shared__ int carry_g, carry_e;
++    if (tid == 0) { carry_g = 0; carry_e = 0; }
++    __syncthreads();
++    for (int t0 = col0; t0 < col1; t0 += BLOCK_SIZE*VEC) {
++        const int running_g = carry_g;
++        const int running_e = carry_e;
++        const int c0 = t0 + tid*VEC;
++        int lg = 0, le = 0;
++        int gv[VEC], ev[VEC], lgpre[VEC], lepre[VEC];
++        int cur_b = -1;
++        uint32_t cur_key = key_inf;
++        #pragma unroll
++        for (int v = 0; v < VEC; ++v) {
++            const int c = c0 + v;
++            int g = 0, e = 0;
++            if (c < col1) {
++                const int bb = cell_blk[c + nskv];
++                if (bb != cur_b) {
++                    cur_b = bb;
++                    cur_key = indexer_topk_block_key(score, extra, bb, t, s, n_blocks, n_tps);
++                }
++                uint32_t key = cur_key;
++                if (extra.cell_pos != nullptr) {
++                    const int cp = extra.cell_pos[c + nskv];
++                    if (cp < 0 || cp > q) {
++                        key = key_inf;
++                    }
++                }
++                g = (key >  prefix) ? 1 : 0;
++                e = (key == prefix) ? 1 : 0;
++            }
++            gv[v] = g; ev[v] = e;
++            lgpre[v] = lg; lepre[v] = le;
++            lg += g; le += e;
++        }
++        sg[tid] = lg;
++        se[tid] = le;
++        for (int off = 1; off < BLOCK_SIZE; off <<= 1) {
++            __syncthreads();
++            const int vg = (tid >= off) ? sg[tid - off] : 0;
++            const int ve = (tid >= off) ? se[tid - off] : 0;
++            __syncthreads();
++            if (tid >= off) { sg[tid] += vg; se[tid] += ve; }
++        }
++        __syncthreads();
++        const int tex_g = sg[tid] - lg;
++        const int tex_e = se[tid] - le;
++        #pragma unroll
++        for (int v = 0; v < VEC; ++v) {
++            const int c = c0 + v;
++            if (c >= col1) {
++                continue;
++            }
++            if (gv[v]) {
++                row_dst[g_base_b + running_g + tex_g + lgpre[v]] = c;
++            } else if (ev[v]) {
++                const int pos = tex_e + lepre[v];
++                if (e_base_b + running_e + pos < rank) {
++                    row_dst[k - rank + e_base_b + running_e + pos] = c;
++                }
++            }
++        }
++        __syncthreads();
++        if (tid == BLOCK_SIZE - 1) {
++            carry_g += sg[BLOCK_SIZE - 1];
++            carry_e += se[BLOCK_SIZE - 1];
+         }
 +        __syncthreads();
      }
  }
  
-@@ -318,10 +343,19 @@ static void indexer_topk_radix_cuda(
+@@ -310,6 +526,7 @@ static void indexer_topk_radix_cuda(
+         const float * score, const int * cell_blk, const kv_t * additive,
+         const indexer_topk_extra extra,
+         int * dst, int ncols, int nrows, int n_tps, int n_blocks, int n_kv, int k,
++        bool grouped,
+         cudaStream_t stream) {
+     constexpr int BLOCK_SIZE = 256;
+     constexpr int RADIX_BITS = 8;
+@@ -318,43 +535,55 @@ static void indexer_topk_radix_cuda(
  
      ggml_cuda_pool_alloc<indexer_topk_radix_state> states_alloc(pool, nrows);
      ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
@@ -1382,8 +1591,21 @@ index 1b9e63516..cca8c74bc 100644
  
      const dim3 row_grid(blocks_per_row * nrows);
      for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
-@@ -331,30 +365,20 @@ static void indexer_topk_radix_cuda(
-                 ncols, n_tps, n_blocks, n_kv, blocks_per_row, shift);
+-        indexer_topk_radix_histogram<BLOCK_SIZE, RADIX_BITS, kv_t>
+-            <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+-                score, cell_blk, additive, extra, states, histograms,
+-                ncols, n_tps, n_blocks, n_kv, blocks_per_row, shift);
++        if (grouped) {
++            indexer_topk_radix_histogram_grouped<BLOCK_SIZE, RADIX_BITS, 4>
++                <<<row_grid, BLOCK_SIZE, 0, stream>>>(
++                    score, cell_blk, extra, states, histograms,
++                    ncols, n_tps, n_blocks, n_kv, blocks_per_row, shift);
++        } else {
++            indexer_topk_radix_histogram<BLOCK_SIZE, RADIX_BITS, kv_t>
++                <<<row_grid, BLOCK_SIZE, 0, stream>>>(
++                    score, cell_blk, additive, extra, states, histograms,
++                    ncols, n_tps, n_blocks, n_kv, blocks_per_row, shift);
++        }
          indexer_topk_radix_select<BLOCK_SIZE, RADIX_BITS>
              <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
 +        indexer_topk_hist_accum<RADIX_BITS>
@@ -1411,14 +1633,40 @@ index 1b9e63516..cca8c74bc 100644
      indexer_topk_base_scan<<<nrows, BLOCK_SIZE, 0, stream>>>(
 -            g_cnt, e_cnt, g_base, e_base, nrows, cbpr);
 -    indexer_topk_deterministic_write<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
-+            g_cnt, e_cnt, g_base, e_base, nrows, blocks_per_row);
-+    indexer_topk_write_blocks<kv_t><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
-             score, cell_blk, additive, extra, states, g_base, e_base, dst,
+-            score, cell_blk, additive, extra, states, g_base, e_base, dst,
 -            ncols, n_tps, n_blocks, n_kv, k, cbpr);
-+            ncols, n_tps, n_blocks, n_kv, k, blocks_per_row);
++            g_cnt, e_cnt, g_base, e_base, nrows, blocks_per_row);
++    if (grouped) {
++        indexer_topk_write_blocks_grouped<4><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
++                score, cell_blk, extra, states, g_base, e_base, dst,
++                ncols, n_tps, n_blocks, n_kv, k, blocks_per_row);
++    } else {
++        indexer_topk_write_blocks<kv_t><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
++                score, cell_blk, additive, extra, states, g_base, e_base, dst,
++                ncols, n_tps, n_blocks, n_kv, k, blocks_per_row);
++    }
  }
  
  void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -397,12 +626,16 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     ggml_cuda_pool & pool = ctx.pool();
+ 
+     if (additive == nullptr || additive->type == GGML_TYPE_F16) {
++        // the additive is null on the default derived path: the value is per-block, so the
++        // grouped histogram can share the key across a block's cells (A/B: LLAMA_INDEXER_NOGROUP)
++        static const bool nogroup = []() { return getenv("LLAMA_INDEXER_NOGROUP") != nullptr; }();
++        const bool grouped = additive == nullptr && !nogroup;
+         indexer_topk_radix_cuda(pool, score_d, cell_blk_d,
+                 additive != nullptr ? (const half *) additive->data : nullptr, extra,
+-                dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++                dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, grouped, stream);
+     } else {
+         indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const float *) additive->data, extra,
+-                dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++                dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, false, stream);
+     }
+ }
+ 
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
 new file mode 100644
 index 000000000..056e9687a

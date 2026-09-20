@@ -138,6 +138,32 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 17 (2026-09-20): indexer block-key sharing (**−30 % pp8192 / −46 % pp32768** vs
+## session 15), bit-identically; the full block-level selection needs an op change
+
+Continuation of session 16.  On the default `additive == nullptr` path the value is **per-block**; the
+session-16 kernels still evaluated it once per cell.  New `_grouped` histogram and gather kernels (VEC=4)
+cache the block key across a thread's contiguous cells and scan the per-thread totals, so the gather's
+ascending-column placement is unchanged.  `LLAMA_INDEXER_NOGROUP=1` forces the cell-level path.
+
+| kernel | pp8192 (s15) | pp32768 (s15) |
+|---|---:|---:|
+| histogram (grouped) | 67.3 (83.5) | 859.6 (1235.7) |
+| gather (grouped) | 22.4 (46.6) | 291.3 (668.3) |
+| hist_accum | 16.9 (32.9) | 103.1 (513.2) |
+| select | 15.0 (15.0) | 100.1 (97.6) |
+| scan+init | 2.1 | 8.2 |
+| **family** | **123.7 (177.1)** | **1362.3 (2523.6)** |
+
+**−30 % / −46 % (2.94 → 1.62 % of the run at 32K)**.  Bit-identical: PPL c2048 **10.6015**, greedy
+**`9c281c415082`**, width probe PASS, `FLASH_ATTN_QSA` / `GATED_DELTA_NET` / `FLASH_ATTN_EXT` OK.
+
+**Next lever:** the full block-level selection (weighted radix over `n_blocks` + a block-level emit)
+was scoped and needs the op to carry **`blk_cells`** (not currently a `src`) so the gather can enumerate
+a block's cells; `r` is then `blk_cells->ne[0] / n_blocks`.  Ordering subtleties (ranked/mrope slot
+order != column order; the dead/spare block has no `blk_cells` entries) make it more than a kernel swap
+and it is an op-interface change on delivery block 14.  Estimated a further ~1.5–2x on the family.
+
 ## UPDATE — session 16 (2026-09-20): the indexer top-k loses its full-width count pass (**−9.4 % pp8192,
 ## −19.6 % pp32768** of the family), bit-identically; "compact after pass 1" is refuted
 
