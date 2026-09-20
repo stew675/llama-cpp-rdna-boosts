@@ -196,12 +196,13 @@ total 1151.9 ms / 2.56x before it).
 
 ### Two findings worth not re-deriving
 
-* **The dense startup portion must stay.**  `LLAMA_QSA_DENSE_SHORTCUT` (default ON) sends
-  `n_kv <= indexer_top_k + r - 1` (= 2051) to the dense arm, because there the selection covers every
-  cell so sparse saves nothing while paying the indexer.  Re-measured with qsa3: forcing QSA in the
-  startup region is a **pessimization** (pp2048 912.5 -> 903.2; pp8192 862.5 -> 856.9), so the
-  shortcut stays.  **Consequence: qsa3 only engages at n_kv > 2051**, so a `-c 2048` PPL test proves
-  nothing about it (it takes the dense arm silently).
+* ~~**The dense startup portion must stay.**~~ **SUPERSEDED 2026-09-19 - see the always-QSA section
+  below; the shortcut is now default OFF.**  The original measurement (forcing QSA in the startup
+  region was a pessimization, pp2048 912.5 -> 903.2) was taken *before* the bitmap sort, when the
+  startup regime also paid the 441 ms rank-sort.  After the sort fix the same regime measures:
+  **qsa3 137.8 ms vs dense `flash_attn_ext_f16` 149.9 ms (qsa3 8 % faster on the attention even when
+  every cell is selected)**, with indexer+top-k 20.9 ms and qsa3 rows+merge 6.6 ms on the QSA side.
+  So the path only still lost because the indexer cost more than the kernel saved.
 * **The top-k rows are UNSORTED**, so `qsa3_rows_kernel` must sort them.  Proven by disabling the
   sort: the rows kernel drops 441 -> **8 ms** but the attn kernel explodes 682 -> **19593 ms** and
   throughput collapses 866 -> 474 t/s (unsorted rows break the merge kernel's binary searches).  So
@@ -234,6 +235,70 @@ With qsa3 on, the pp8192 profile is led by **`mmb_*` kernels** (`mmb_f32split_ke
 `mmb_routed_glu_kernel` 2085 + 1626 ms, `mmb_dense_kernel` 1904 + 1606 ms, `mmb_cvt_f32_bf16`
 648 ms) - QSA is now **728.6 ms (4th-ish)** and no longer the #1 kernel.  The MMB follow-ups
 (SS 7-9) are the bigger lever.
+
+## Always-QSA prefill + F32 dense weights off (2026-09-19, session 4)
+
+Two default flips, both measured; plus the revert of a failed experiment.
+
+### 1. `LLAMA_QSA_DENSE_SHORTCUT` default ON -> OFF = **always QSA** (maintainer decision)
+
+The shortcut sent `n_kv <= indexer_top_k + r - 1` (= 2051) to the dense masked FA arm on the
+reasoning that there the top-k selects *every* cell, so sparse attention saves no work while still
+paying the indexer.  **qsa3 changed that.**  Measured in the fully-dense startup regime (pp2048,
+single ubatch, every cell selected, gfx1151, `rocprofv3`):
+
+| | attention kernel | indexer + top-k | qsa3 rows/merge | total |
+|---|---:|---:|---:|---:|
+| dense (`shortcut=1`) | 149.9 ms (`flash_attn_ext_f16`) | - | - | **149.9 ms** |
+| QSA (`shortcut=0`) | **137.8 ms** (`qsa3_attn_kernel`) | 20.9 ms | 6.6 ms | **165.3 ms** |
+
+So qsa3's kernel is already **8 % faster than the dense FA kernel even when nothing is skipped** -
+the path only still lost because the indexer + top-k cost 20.9 ms against the 12.1 ms the kernel
+saved.  End to end the flip is ~neutral:
+
+| pp | always-QSA | dense-shortcut | delta |
+|---|---:|---:|---:|
+| 512 | 703.8 | 700.3 | +0.5 % |
+| 1024 | 839.0 | 841.5 | -0.3 % |
+| 2048 | 909.3 | 919.4 | -1.1 % |
+| 4096 | 904.0 | 913.9 | -1.1 % |
+| 8192 | 900.1 | 902.9 | -0.3 % |
+
+(within ~1 % run variance for most points).  What it buys: **no numerics seam at `n_kv == width`**,
+and qsa3 is now exercised at *every* context length - a `-c 2048` PPL exercise used to be silently
+dense, which is why the early "qsa3 is neutral" readings were vacuous.  **Decode is unaffected**: it
+stays dense via the existing arch policy (`qsa_dense_decode_until` = 64K on gfx1151, always on
+gfx1201) - verified `tg64` shallow 25.80 -> 25.83.
+
+PPL moves the right way: c16384 bf16 **3.3900 -> 3.3821**, q8_0 3.3879 -> 3.3861; c32768 bf16
+4.3353 -> 4.3397 (noise).  Greedy text coherent.  `LLAMA_QSA_DENSE_SHORTCUT=1` restores the dense
+arm (still the `LLAMA_QSA_SPARSE_FA=0` cross-check).
+
+**Remaining QSA gap = the indexer**, not attention: `indexer_topk_radix_histogram` 10.0 ms,
+`indexer_topk_deterministic_write` 4.7, `indexer_topk_count` 3.3, `indexer_topk_radix_select` 2.9
+(pp2048, n=96 launches each).  Halving that makes always-QSA a win even at pp2048.
+
+### 2. `GGML_CUDA_MMB_F32SPLIT` default 2 -> 0 (MMB F32 dense weights off)
+
+The F32 dense weights are all **tiny-M**: MoE router `ffn_gate_inp` M=512, `ssm_alpha`/`ssm_beta`
+M=48, `hc_*_inject` M=4, `ffn_gate_inp_shexp` M=1 (per-layer inventory via `GGML_CUDA_MMB_LOG=1`).
+Both paths cost ~1.0 s at pp8192 (12 % of prefill):
+
+* `mmb_f32split_kernel<128,128,32,64>` computes a padded **128-row A tile**, so M=4 wastes 32x of its
+  WMMA work (for `hc_attn_inject` M=4/K=10240 the launch computes ~53 GFLOP of WMMA for a 0.17 GFLOP
+  problem) - 2164 ms in the profile, `n=2160`;
+* `F32SPLIT=0` (rocBLAS, `Cijk_Alik_Bljk_SB_MT32x32x8_...`) lands on the same shape bound - 2076 ms,
+  `n=1784`.
+
+Both are ~10x off the memory-bound floor (A traffic = `(T/BN)*M*K*4`, B traffic = `(M/BM)*T*K*4`;
+for M=512/T=2048 that is 168 MB against a 26 MB floor).  Since rocBLAS measured *faster*,
+the MMB default is now **off**: IQ4_XS pp4096 896.0 -> **915.9**, pp8192 896.8 -> **902.9**.
+`GGML_CUDA_MMB_F32SPLIT=1` opts it back in.
+
+**Tried and rejected:** a 16x256 small-M tile for `M <= 64` (aimed at the 32x padding).  It is
+**worse** - 870/847 t/s vs 895/885 for the 128 tile - because `BN=256` halves the block count in a
+kernel that is already parallelism-starved, and `BM=16` does not help M=512.  Reverted; the real fix
+is a dedicated tiny-M (or split-K) kernel.
 
 ## Gates before this could be opt-in, let alone defaulted on (from the parked handover)
 

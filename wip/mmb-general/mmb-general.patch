@@ -746,10 +746,10 @@ index edccfba13..230d9fb68 100644
      bool cuda_graph_update_required = false;
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
 new file mode 100644
-index 000000000..14cb2171c
+index 000000000..3c6039d43
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -0,0 +1,1381 @@
+@@ -0,0 +1,1388 @@
 +#include "mmb.cuh"
 +#include "unary.cuh"
 +#include <unordered_map>
@@ -1741,8 +1741,15 @@ index 000000000..14cb2171c
 +    return allow_rdna3 && GGML_CUDA_CC_IS_RDNA3_0(cc);
 +}
 +int  mmb_min_t()   { static const int v = getenv("GGML_CUDA_MMB_MIN_T") ? atoi(getenv("GGML_CUDA_MMB_MIN_T")) : 512; return v; }
-+int  mmb_f32split_mode(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : 2; return v; }
-+bool mmb_f32split() { static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : 2; return v != 0; }
++// F32 dense weights: DEFAULT OFF (2026-09-19).  They are all tiny-M (MoE router M=512, ssm alpha/beta
++// M=48, hc *_inject M=4, the shared-expert gate M=1) and both paths cost the same ~1.0 s at pp8192 -
++// the 128x128 f16-hi/lo tile computes a padded 128-row A tile (up to 128x wasted WMMA for M=4) and
++// falls back to the same shape bound as rocBLAS.  Measured: `GGML_CUDA_MMB_F32SPLIT=0` (the stock
++// path) is +1.3-2.3 % on IQ4_XS, and a 16x256 small-M tile was tried and is worse (870/847 vs
++// 895/885 t/s - BN=256 halves the block count).  A dedicated tiny-M kernel is the real fix; until
++// then the stock path wins.  `GGML_CUDA_MMB_F32SPLIT=1` opts the MMB path back in.
++int  mmb_f32split_mode(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : 0; return v; }
++bool mmb_f32split() { static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : 0; return v != 0; }
 +bool mmb_bf16w()    { static const int v = getenv("GGML_CUDA_MMB_BF16W") ? atoi(getenv("GGML_CUDA_MMB_BF16W")) : 1; return v != 0; }
 +bool mmb_hc16()    { static const int v = getenv("GGML_CUDA_MMB_HC16") ? atoi(getenv("GGML_CUDA_MMB_HC16")) : 0; return v != 0; }
 +int  mmb_tall_mode(){ static const int v = getenv("GGML_CUDA_MMB_TALL") ? atoi(getenv("GGML_CUDA_MMB_TALL")) : 2; return v; }
@@ -2208,7 +2215,7 @@ index 2ce34caf0..452e30bc9 100644
          struct ggml_tensor * a,
          enum ggml_prec       prec) {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 874cf5bd5..90db3c449 100644
+index 874cf5bd5..3134417dd 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -1571,6 +1571,58 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
@@ -2304,3 +2311,51 @@ index 874cf5bd5..90db3c449 100644
          ggml_flash_attn_qsa_set_prec(cur, GGML_PREC_F32);
          cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
          cb(cur, "kqv_out", il);
+@@ -1731,9 +1803,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+         const int64_t r     = hparams.dsv4_compress_ratios[il];
+         const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
+         const int64_t width = (int64_t) hparams.indexer_top_k + r - 1;
+-        // LLAMA_QSA_DENSE_SHORTCUT: dense shortcut below the selection width, DEFAULT ON (B parity;
+-        // the env name matches B for cross-testing). It was opt-in default OFF while a llama-bench-
+-        // only multi-ubatch artifact (pp4096+@0 rows slower with the shortcut on) lacked a root
++        // LLAMA_QSA_DENSE_SHORTCUT: attend dense while every cell is still selected (n_kv <= the
++        // selection width).  **DEFAULT OFF as of 2026-09-19 = always QSA** (the env name matches B
++        // for cross-testing; LLAMA_QSA_DENSE_SHORTCUT=1 restores the dense shortcut).
++        //
++        // It was DEFAULT ON for B parity, on the reasoning that below the width the top-k selects
++        // every cell, so sparse attention saves no work while still paying the indexer + top-k.
++        // That stopped being true once qsa3 landed: measured at pp2048 (single ubatch, every cell
++        // selected, gfx1151) the qsa3 attention kernel is 137.8 ms vs 149.9 ms for the dense
++        // flash_attn_ext_f16 - i.e. qsa3 is already 8 % faster on the attention even when nothing
++        // is skipped.  The path only still lost because the indexer + top-k (20.9 ms) costs more
++        // than the kernel saves (12.1 ms), so the shortcut's net value had fallen to ~1 % at short
++        // prefill and ~0 at depth.  It also left a numerics discontinuity at n_kv == width and kept
++        // qsa3 out of every <= 2051-token validation (a `-c 2048` PPL exercise was silently dense).
++        // Removing the split makes the prefill attention path uniform and always exercised; the
++        // remaining gap is an indexer/top-k cost to attack, not a reason to keep two regimes.
++        //
++        // History (kept because it documents the alternative): the shortcut was once opt-in OFF
++        // while a llama-bench-only multi-ubatch artifact (pp4096+@0 slower with it on) lacked a root
+         // cause. Root-caused 2026-09-08/09: llama-bench's sync-free decode pipeline x ggml-gallocr's
+         // single-layout alloc-fallback doing an unconditional full-device sync on every dense/sparse
+         // topology flip (record: benchmarks/2026-09-10-*-shortcut-fix.md).  NOTE (2026-09-06): the
+@@ -1741,14 +1828,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+         // must grow) was UNSAFE across backends and has been reverted: a re-reserve re-points tensor
+         // addresses while the previous ubatch's kernels may still be in flight on other GPUs
+         // (cross-GPU race -> in-kernel spin / memory faults at multi-ubatch prefill, reproduced on
+-        // 3x R9700 gfx1201).  The per-flip full-device sync is back (upstream behavior) and the
+-        // shortcut stays DEFAULT ON on top of it.  Numerics below the width == the
+-        // LLAMA_QSA_SPARSE_FA=0 masked-dense path (the difference from the selection default is the
+-        // known dense-vs-sparse kernel signature, an env-selectable regime). =0 forces the selection
+-        // path (the pre-flip known-good numerics) either way.
++        // 3x R9700 gfx1201).  The per-flip full-device sync is back (upstream behavior).  Note the
++        // dense path's numerics below the width equal the LLAMA_QSA_SPARSE_FA=0 masked-dense path -
++        // useful as a cross-check, and still reachable with LLAMA_QSA_DENSE_SHORTCUT=1.  Decode is
++        // unaffected by this default either way: it stays dense via qsa_dense_decode_until below.
+         static const bool shortcut = [] {
+             const char * env = getenv("LLAMA_QSA_DENSE_SHORTCUT");
+-            return env == nullptr || atoi(env) != 0;
++            return env != nullptr && atoi(env) != 0;
+         }();
+         // ARCH POLICY (2026-09-07 crossover tables, pp2048/tg64 bf16 KV, discovery record):
+         // decode uses the plain dense attend while n_kv < the per-arch crossover depth and

@@ -13,6 +13,38 @@ then `README.md` (the running record) beside it.
 
 ---
 
+## UPDATE — session 4 (2026-09-19): two default flips + the F32 finding
+
+**1. `LLAMA_QSA_DENSE_SHORTCUT` is now default OFF (always QSA)** — maintainer decision.  The
+shortcut's rationale (below the selection width the top-k covers every cell, so sparse saves no
+attention work) was **overtaken by qsa3**: in the fully-dense pp2048 regime `qsa3_attn_kernel` is
+**137.8 ms vs 149.9 ms** for dense `flash_attn_ext_f16`, so qsa3 is already 8 % faster on the
+attention even when nothing is skipped.  The path only still lost because indexer+top-k (20.9 ms)
+cost more than the 12.1 ms saved.  Net end to end: +0.5 % pp512, -0.3 % pp1024, -1.1 % pp2048,
+-1.1 % pp4096, -0.3 % pp8192 (≈ neutral, within run variance).  It removes the `n_kv == width`
+numerics seam and makes qsa3 exercised at **every** context length - a `-c 2048` exercise used to be
+silently dense, which is why the early "qsa3 is neutral" readings were vacuous.  Decode unaffected
+(stays dense via `qsa_dense_decode_until`; verified tg64 25.80 -> 25.83).  PPL: c16384 bf16
+3.3900 -> **3.3821**, q8_0 3.3879 -> 3.3861, c32768 4.3353 -> 4.3397 (noise).
+
+**2. `GGML_CUDA_MMB_F32SPLIT` is now default 0.**  The F32 dense weights are all tiny-M (router
+M=512, ssm alpha/beta M=48, hc `*_inject` M=4, shexp gate M=1) and both the MMB 128-row tile and
+rocBLAS cost ~1.0 s at pp8192 (12 %).  rocBLAS measured faster: pp4096 896.0 -> **915.9**, pp8192
+896.8 -> **902.9**.  A 16x256 small-M tile was tried and is **worse** (870/847 vs 895/885).
+
+**Next-work order (revised):**
+
+1. **The indexer** - the only thing keeping always-QSA from being a strict win.  pp2048:
+   `indexer_topk_radix_histogram` 10.0 ms, `indexer_topk_deterministic_write` 4.7,
+   `indexer_topk_count` 3.3, `indexer_topk_radix_select` 2.9 (n=96 each).
+2. **A dedicated tiny-M F32 kernel** (or split-K): both current paths are ~10x off the memory-bound
+   floor; A traffic = `(T/BN)*M*K*4`, B = `(M/BM)*T*K*4` (168 MB vs a 26 MB floor at M=512/T=2048).
+3. The `mmb_*` kernels that still lead the profile (`mmb_routed_glu` 1873 ms real, `mmb_dense` 1758,
+   `mmb_cvt_f32_bf16` 319) - §9/§10.
+4. QSA v3 for gfx1200/gfx1100; then `qsa3_attn_kernel` itself (674.9 ms, ~93 % of qsa3).
+
+---
+
 ## UPDATE — session 3 (2026-09-19): the qsa3 sort is done too
 
 The `qsa3_rows_kernel` sort (session 2's remaining item, 441 ms of the 1152 ms qsa3 total) was
