@@ -1,0 +1,242 @@
+From 7e431fc82b225aa15bc468e78b9990a6177332fb Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 20 Sep 2026 08:46:23 -0500
+Subject: [PATCH] WIP: W=1..8 logits width-purity probe (the last promotion
+ gate)
+
+tests/test-logits-width-probe.cpp: feed an identical prefix as one prefill batch,
+then decode a W-token batch; row j sees the same context for every W, so its
+logits must not depend on W.  Runs W=1..8 in separate contexts, checks every row
+shared with the W=8 batch bit for bit, and prints per-row logits hashes so two
+builds can be diffed.  Env RS=n_rs_seq, FA, KV.
+
+Gate PASSES:
+  P=256  (below MMB_MIN_T=512, MMB unreachable)  MMB on == off, bit-identical
+  P=1024 MMB on != off (approved prefill re-baseline)  width_purity PASS maxdiff 0
+  P=2048 MMB on != off (approved prefill re-baseline)  width_purity PASS maxdiff 0
+
+Read in two halves: below the threshold MMB never runs in either the prefill or
+the decode batch, so the two configs are bit-identical across every row of every
+width - that is the 'identical by construction' claim demonstrated.  Above it the
+hashes differ because MMB replaces the MMQ reduction with a dequant-to-bf16 WMMA
+one (the approved re-baseline), while width_purity stays PASS with MMB on - MMB
+introduces no width dependence, and the T >= 512 gate is what keeps it out of the
+W <= 8 band.
+
+Two probe bugs, same class as the -md trap: llama_batch_init(ubatch) sizes for the
+micro-batch so a P-token prefill overruns it (silent SIGSEGV, plus a GGML_ASSERT
+abort for the n_batch half); and n_batch (per llama_decode) vs n_ubatch (per
+micro-batch) are different knobs, both must scale with P.  Also fixed: the first
+per-W 'hash=' hashed the std::vector objects rather than the floats.
+---
+ tests/CMakeLists.txt              |   1 +
+ tests/test-logits-width-probe.cpp | 185 ++++++++++++++++++++++++++++++
+ 2 files changed, 186 insertions(+)
+ create mode 100644 tests/test-logits-width-probe.cpp
+
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index e4a3846b7..da7fb5de4 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -150,6 +150,7 @@ endif ()
+ 
+ llama_build(test-recurrent-state-rollback.cpp)
+ llama_build(test-recurrent-state-depth.cpp)
++llama_build(test-logits-width-probe.cpp)
+ llama_build(test-save-load-state.cpp)
+ 
+ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+diff --git a/tests/test-logits-width-probe.cpp b/tests/test-logits-width-probe.cpp
+new file mode 100644
+index 000000000..9b6066f4f
+--- /dev/null
++++ b/tests/test-logits-width-probe.cpp
+@@ -0,0 +1,185 @@
++// W = 1..8 logits purity probe -- the delivery's §11 promotion gate item 1
++// ("`W = 1..8` logits matrix with GGML_CUDA_MMB=1 == off").
++//
++// Method (adapted from archive/work/strix-halo/issue25/logits-width.cpp): feed an
++// identical prefix as ONE prefill batch, then decode a W-token batch
++// [t_P .. t_{P+W-1}].  Row j of that batch sees exactly the same context for every
++// W (the tokens before it and its own position are identical), so its logits must
++// not depend on W.  Any difference is a verify-batch width dependence, isolated
++// from MTP/spec logic.
++//
++// Two things are checked:
++//   1. width purity  -- row 0 must hash the same for every W, and every row shared
++//      with the widest batch (W=8) must match it bit for bit.
++//   2. MMB on == off -- run the probe twice, with GGML_CUDA_MMB=0 and =1, and diff
++//      the per-W hashes.  MMB is gated T >= 512 and the band is W <= 8, so MMB
++//      must never be reachable here; this is the demonstration of that claim.
++//
++// Usage:
++//   test-logits-width-probe model.gguf text.txt [P=256] [ubatch=512]
++// Env: RS=0|from_w|<n>  pins llama_context_params.n_rs_seq (default 0 = plain decode)
++//      FA=0|1|auto     (default auto)
++//      KV=f16|bf16|q8_0|q4_0|... (default f16)
++// Exit: 0 all rows bit-identical across widths, 2 otherwise.
++
++#include "llama.h"
++#include "ggml-backend.h"
++#include "ggml.h"
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++static uint64_t fnv1a(const void * p, size_t n) {
++    const uint8_t * b = (const uint8_t *) p;
++    uint64_t h = 1469598103934665603ULL;
++    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ULL; }
++    return h;
++}
++
++static ggml_type kv_from_env() {
++    const char * s = getenv("KV");
++    if (!s) return GGML_TYPE_F16;
++    if (!strcmp(s, "f16"))   return GGML_TYPE_F16;
++    if (!strcmp(s, "bf16"))  return GGML_TYPE_BF16;
++    if (!strcmp(s, "q8_0"))  return GGML_TYPE_Q8_0;
++    if (!strcmp(s, "q4_0"))  return GGML_TYPE_Q4_0;
++    if (!strcmp(s, "q4_1"))  return GGML_TYPE_Q4_1;
++    if (!strcmp(s, "q5_0"))  return GGML_TYPE_Q5_0;
++    if (!strcmp(s, "q5_1"))  return GGML_TYPE_Q5_1;
++    if (!strcmp(s, "iq4_nl"))return GGML_TYPE_IQ4_NL;
++    fprintf(stderr, "unknown KV=%s\n", s);
++    exit(1);
++}
++
++static constexpr int NW = 8;   // widths 1..8
++
++typedef void (*llama_log_cb)(ggml_log_level, const char *, void *);
++static void quiet_log(ggml_log_level, const char *, void *) {}
++
++int main(int argc, char ** argv) {
++    if (argc < 3) {
++        fprintf(stderr, "usage: %s model.gguf text.txt [P=256] [ubatch=512]\n", argv[0]);
++        return 1;
++    }
++    const char * model_path = argv[1];
++    const char * text_path  = argv[2];
++    const int P      = argc > 3 ? atoi(argv[3]) : 256;
++    const int ubatch = argc > 4 ? atoi(argv[4]) : 512;
++
++    // this fork logs every tensor load at INFO; keep the probe's own output parseable
++    llama_log_set(quiet_log, nullptr);
++
++    ggml_backend_load_all();
++    llama_backend_init();
++
++    llama_model_params mp = llama_model_default_params();
++    mp.n_gpu_layers = 99;
++    llama_model * model = llama_model_load_from_file(model_path, mp);
++    if (!model) { fprintf(stderr, "model load failed\n"); return 1; }
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++
++    std::string text;
++    { FILE * f = fopen(text_path, "rb"); if (!f) { perror("text"); return 1; }
++      char buf[65536]; size_t r; while ((r = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, r); fclose(f); }
++
++    std::vector<llama_token> toks(8192);
++    int n = llama_tokenize(vocab, text.data(), (int) text.size(), toks.data(), (int) toks.size(), false, false);
++    if (n < 0) { fprintf(stderr, "tokenize failed (need %d)\n", -n); return 1; }
++    if (n < P + NW) { fprintf(stderr, "text too short: %d tokens, need %d\n", n, P + NW); return 1; }
++
++    const int n_vocab = llama_vocab_n_tokens(vocab);
++    const ggml_type kv_type = kv_from_env();
++    printf("tokens=%d P=%d ubatch=%d widths=1..%d KV=%s\n", n, P, ubatch, NW, ggml_type_name(kv_type));
++
++    // rows[w-1] = the logits of every row of the W-token batch, in row order
++    std::vector<std::vector<float>> rows[NW];
++
++    for (int W = 1; W <= NW; ++W) {
++        llama_context_params cp = llama_context_default_params();
++        // n_batch is the max tokens per llama_decode call (the whole prefill batch),
++        // n_ubatch the max per micro-batch -- they are NOT the same knob.
++        cp.n_ctx = 4096; cp.n_batch = P > ubatch ? P : ubatch; cp.n_ubatch = ubatch; cp.n_seq_max = 1;
++        // Replicate the MTP verify-batch recurrent-state snapshot count: common sets
++        // n_rs_seq = draft.n_max, so a W-token batch with n_max = W-1 uses n_rs_seq = W-1.
++        {
++            const char * rs = getenv("RS");
++            cp.n_rs_seq = (rs == nullptr) ? 0u
++                        : (strcmp(rs, "from_w") == 0) ? (uint32_t) (W - 1)
++                        : (uint32_t) atoi(rs);
++        }
++        {
++            const char * fa = getenv("FA");
++            cp.flash_attn_type = (fa && (!strcmp(fa, "0") || !strcmp(fa, "off"))) ? LLAMA_FLASH_ATTN_TYPE_DISABLED
++                                : (fa && (!strcmp(fa, "1") || !strcmp(fa, "on")))  ? LLAMA_FLASH_ATTN_TYPE_ENABLED
++                                : LLAMA_FLASH_ATTN_TYPE_AUTO;
++        }
++        cp.type_k = kv_type; cp.type_v = kv_type;
++        llama_context * ctx = llama_init_from_model(model, cp);
++        if (!ctx) { fprintf(stderr, "ctx init failed (W=%d)\n", W); return 1; }
++
++        // the prefill batch holds P tokens, so size the batch for P (not just n_ubatch)
++        llama_batch b = llama_batch_init(cp.n_batch, 0, 1);
++        b.n_tokens = 0;
++        for (int i = 0; i < P; ++i) {
++            b.token[b.n_tokens] = toks[i]; b.pos[b.n_tokens] = i;
++            b.n_seq_id[b.n_tokens] = 1; b.seq_id[b.n_tokens][0] = 0; b.logits[b.n_tokens] = 0;
++            b.n_tokens++;
++        }
++        if (llama_decode(ctx, b) != 0) { fprintf(stderr, "prefill decode failed (W=%d)\n", W); return 1; }
++
++        b.n_tokens = 0;
++        for (int j = 0; j < W; ++j) {
++            b.token[b.n_tokens] = toks[P + j]; b.pos[b.n_tokens] = P + j;
++            b.n_seq_id[b.n_tokens] = 1; b.seq_id[b.n_tokens][0] = 0; b.logits[b.n_tokens] = 1;
++            b.n_tokens++;
++        }
++        if (llama_decode(ctx, b) != 0) { fprintf(stderr, "batch decode failed (W=%d)\n", W); return 1; }
++
++        for (int j = 0; j < W; ++j) {
++            const float * l = llama_get_logits_ith(ctx, j);
++            if (!l) { fprintf(stderr, "no logits for row %d (W=%d)\n", j, W); return 1; }
++            rows[W - 1].push_back(std::vector<float>(l, l + n_vocab));
++        }
++        llama_batch_free(b);
++        llama_free(ctx);
++    }
++
++    // width purity: every row shared with the widest batch (W=8) must match it
++    int bad = 0;
++    float worst = 0.0f;
++    for (int W = 1; W <= NW; ++W) {
++        float wmax = 0.0f;
++        int   jmax = -1;
++        for (int j = 0; j < W; ++j) {
++            const std::vector<float> & a = rows[W - 1][j];
++            const std::vector<float> & b = rows[NW - 1][j];
++            for (size_t k = 0; k < a.size(); ++k) {
++                const float d = std::fabs(a[k] - b[k]);
++                if (d > wmax) { wmax = d; jmax = j; }
++            }
++        }
++        if (wmax != 0.0f) bad++;
++        if (wmax > worst) worst = wmax;
++        // hash the float bytes of every row, not the std::vector objects
++        uint64_t h = 1469598103934665603ULL;
++        for (int j = 0; j < W; ++j) h ^= fnv1a(rows[W - 1][j].data(), (size_t) n_vocab * sizeof(float));
++        printf("W=%d rows=%d hash=%016llx maxdiff_vs_W8=%.6g%s\n",
++               W, W, (unsigned long long) h, wmax, wmax == 0.0f ? "" : "   <-- DIFFERS");
++    }
++    printf("row0_row1_hashes: ");
++    for (int W = 1; W <= NW; ++W) {
++        uint64_t h0 = fnv1a(rows[W - 1][0].data(), (size_t) n_vocab * sizeof(float));
++        uint64_t h1 = W >= 2 ? fnv1a(rows[W - 1][1].data(), (size_t) n_vocab * sizeof(float)) : 0;
++        printf("%d:%016llx/%016llx ", W, (unsigned long long) h0, (unsigned long long) h1);
++    }
++    printf("\nwidth_purity=%s (worst maxdiff %.6g)\n", bad ? "FAIL" : "PASS", worst);
++
++    llama_model_free(model);
++    llama_backend_free();
++    return bad ? 2 : 0;
++}
+-- 
+2.55.0
+

@@ -24,6 +24,51 @@ then `README.md` (the running record) beside it.
 
 ---
 
+## UPDATE — session 5d (2026-09-19): the W=1..8 probe — LAST GATE ITEM CLOSED
+
+The `W = 1..8` logits matrix was the one §11 item never run, because no probe harness existed.  It
+does now: **`tests/test-logits-width-probe.cpp`** (built with `cmake --build build-rocm --target
+test-logits-width-probe`), adapted from `archive/work/strix-halo/issue25/logits-width.cpp`.
+
+**Method.** Feed an identical prefix as ONE prefill batch, then decode a W-token batch
+`[t_P .. t_{P+W-1}]`.  Row *j* of that batch sees exactly the same context for every W, so its logits
+must not depend on W.  The probe runs W = 1..8 in separate contexts and checks (a) every row shared
+with the W=8 batch matches it bit for bit, and (b) prints a per-row logits hash so two builds can be
+diffed.  Env: `RS=0|from_w|<n>` (`n_rs_seq`), `FA`, `KV`.
+
+**Result — gate PASSES.**
+
+| prefill P | `MMB=0` row0 hash | `MMB=1` row0 hash | width purity (W=1..8) |
+|---|---|---|---|
+| **256** (below `MMB_MIN_T = 512`, so MMB is unreachable anywhere) | `6228d03bd2b501b4` | `6228d03bd2b501b4` — **identical** | PASS, maxdiff 0 |
+| 1024 (MMB fires in prefill) | `ac4d5de3d40a2b1d` | `3703c13f03c4b25d` | PASS, maxdiff 0 |
+| 2048 (MMB fires in prefill) | `1996b44e491de5c9` | `e3e4220fe83831da` | PASS, maxdiff 0 |
+
+Read it in two halves, because the literal "MMB=1 == off" can only hold where MMB never runs:
+
+* **Below the threshold** (`P = 256 < 512`) MMB is unreachable in *both* the prefill and the decode
+  batch, and the two configs are **bit-identical across every row of every width**.  That is the
+  "identical by construction" claim, demonstrated rather than asserted.
+* **Above the threshold** the row-0 hashes differ — that is the **approved prefill re-baseline** (MMB
+  replaces the MMQ reduction with a dequant-to-bf16 WMMA one), not a band defect.  What matters for
+  purity is the second column: **`width_purity = PASS` with MMB on at every P** — no row of any width
+  differs from the widest batch by even 1 ulp, so MMB introduces no width dependence.  The `T >= 512`
+  gate is what keeps MMB out of the `W <= 8` band in the first place.
+
+**Two probe bugs worth recording** (both cost a cycle and both are the same class as the `-md` trap):
+
+1. `llama_batch_init(ubatch)` sizes the batch for the *micro*-batch; feeding a `P`-token prefill
+   overruns it.  Worse, the first symptom was a **silent segmentation fault** (and a `GGML_ASSERT`
+   abort for the `n_batch` half) rather than a clean error.
+2. `llama_context_params.n_batch` is the max tokens per `llama_decode` call (the whole prefill batch)
+   and `n_ubatch` the max per micro-batch — they are different knobs and both must scale with `P`.
+
+Also fixed in the probe: `rows[W-1].data()` hashes the `std::vector` objects, not the floats — the
+first run printed a plausible-looking `hash=` field that was hashing pointers.  The `width_purity`
+column and the `row0_row1_hashes` line were always correct (they hash `.data()` of the inner vector).
+
+---
+
 ## UPDATE — session 5c (2026-09-19): promotion gates actually run
 
 Session 5's profile put the remaining big kernels (`mmb_routed_glu` 22.7 %, `mmb_dense` 21.1 %) out
@@ -671,11 +716,9 @@ the drifted working tree.
 * Greedy text coherent on a >2051-token prompt; the prefill re-baseline is expected and approved.
 * Combined patch `git apply --check` clean on a fresh `8a2567e1e` worktree (re-verified at session 4).
 
-**Still NOT run (blocking promotion, see §11):** the `W = 1..8` logits matrix with MMB on==off — it
-needs a probe harness that does not exist in the tree, and it is guaranteed by construction (`T >= 512`
-keeps MMB out of the whole `W <= 8` band).  Everything else on the §11 list now passes; see the
-session-5c UPDATE at the top.  Two prefill re-baseline hashes are recorded there
-(`bbd4bcb519e4` with MMB+QSA3, `5120b28f2879` without).
+**Still NOT run (blocking promotion, see §11):** nothing — the `W = 1..8` matrix is now done
+(session 5d UPDATE at the top; probe `tests/test-logits-width-probe.cpp`, gate PASSES).  A same-seed
+**prefill re-baseline hash** also exists now (`bbd4bcb519e4` with MMB+QSA3, `5120b28f2879` without).
 
 ---
 
