@@ -1,0 +1,42 @@
+From 8243e539abd78b577c0b3a2952312605edad198c Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sat, 19 Sep 2026 18:23:38 -0500
+Subject: [PATCH] WIP mmb: gated MMB diagnostics (shape log + big/small tile
+ override)
+
+- GGML_CUDA_MMB_LOG=1: one-shot MMB_DENSE shape log
+- GGML_CUDA_MMB_TILE=0/1: override the big/small tile choice for A/B
+Findings: Q8_0 dense tiling is near-optimal (802 vs 798 vs 778 t/s on IQ4_XS
+pp8192); the Q8_0 MMB is occupancy/LDS-bound, not tiling-bound.
+QSA gather 8B->16B is neutral (796 vs 798), so the QSA cost is compute/
+reduction/occupancy, not load issue -> needs the WMMA restructure.
+---
+ ggml/src/ggml-cuda/mmb.cu | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index b14e225af..14cb2171c 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -1087,6 +1087,8 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     cudaStream_t stream = ctx.stream();
+     const int K = (int) src0->ne[0], M = (int) src0->ne[1];
+     const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
++    { static const int lg = getenv("GGML_CUDA_MMB_LOG") ? atoi(getenv("GGML_CUDA_MMB_LOG")) : 0;
++      if (lg) { static unsigned cnt = 0; if (cnt++ < 80) fprintf(stderr, "MMB_DENSE %s type=%s M=%d K=%d T=%d\n", src0->name, ggml_type_name(src0->type), M, K, T); } }
+     if (src0->type == GGML_TYPE_F32) {
+         dim3 grid((M + 127) / 128, (T + 127) / 128);
+         static const bool two = getenv("LLAMA_MMB_F32SPLIT") && atoi(getenv("LLAMA_MMB_F32SPLIT")) >= 2;
+@@ -1105,7 +1107,8 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+         return;
+     }
+     const uint16_t * shadow_pre = ((src0->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || src0->type == GGML_TYPE_Q6_K) ? mmb_shadow_lookup(src0) : nullptr;
+-    const bool big = (M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096);
++    static const int tile_ov = getenv("GGML_CUDA_MMB_TILE") ? atoi(getenv("GGML_CUDA_MMB_TILE")) : -1;
++    const bool big = tile_ov >= 0 ? (tile_ov != 0) : ((M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096));
+     uint16_t * Dh = (mmb_hc16() && K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
+     bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(dst));
+     if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0) {
+-- 
+2.55.0
+
