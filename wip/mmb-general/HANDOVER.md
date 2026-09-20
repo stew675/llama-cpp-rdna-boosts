@@ -39,7 +39,7 @@ The WIP lives on **two dedicated branches**.  **New work goes to those branches,
 
 1. `git -C ~/llama-cpp-rdna-boosts switch wip-mmb-general` — verify with `git branch --show-current`
    (must be **`wip-mmb-general`**, never `main`).
-2. `cd ~/llama-wip-mmb`; confirm `git status` clean and `git log --oneline -1` = **`5d55da3e9`**.
+2. `cd ~/llama-wip-mmb`; confirm `git status` clean and `git log --oneline -1` = **`bd261f0bf`**.
 3. Build with the §3 command; run the **§Gates** before/after any numerics-touching change (all
    currently green: PPL **10.6015**, greedy **`9c281c415082`**, width probe **PASS**).
 4. Pick an item from **Remaining work** below.
@@ -363,8 +363,8 @@ unilaterally** -- needs a beta window / go-ahead.
 |---|---|
 | worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`bd261f0bf`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0030` + `commits.txt`, in this repo, pushed to `origin/main` |
-| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (30 commits) |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0031` + `commits.txt`, in this repo, pushed to `origin/wip-mmb-general` |
+| verify | `git am` of `patches/` on a fresh `8a2567e1e` — clean (31 commits, applied tree `31d8fcf38663ade858a8f25e2e83305754e5bb83` == tip) |
 | build | §3 | run | §4 |
 | current numbers | the **session 19 UPDATE below** (indexer pass-1 per-block histogram atomics) -- indexer family pp8192 **74.3 ms** / pp32768 **1156.9 ms** -- plus the **session 18 UPDATE** (the block-level histogram + `blk_cells` src), the **session 15 UPDATE** (qsa3 compile-time gate + the rocprofiler-register profiling caveat), the **session 14/13 UPDATEs** (non-temporal) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
 
