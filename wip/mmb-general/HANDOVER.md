@@ -1,6 +1,6 @@
 # HANDOVER — general-purpose `mmb` (bf16/i8-WMMA dequant weight GEMM) + QSA/Q8_0 next steps
 
-**Date:** 2026-09-20 (sessions 1-13).  **Status:** ACTIVE WIP, not part of the delivery, and the
+**Date:** 2026-09-20 (sessions 1-14).  **Status:** ACTIVE WIP, not part of the delivery, and the
 code is **not** pushed to any llama.cpp fork.  This document is the self-contained entry point for
 the next session; the "FOR THE NEXT SESSION" brief below is the whole handoff, and the UPDATE
 sections after it are the dated history (newest first).  `README.md` is the running record and
@@ -11,17 +11,18 @@ sections after it are the dated history (newest first).  `README.md` is the runn
 ## FOR THE NEXT SESSION — start here
 
 **Mandate.** Continue the `wip/mmb-general` work.  The delivery-facing prefill work is essentially
-done (the bf16-producer port including the `xn` stream, the `dsv4_hc` non-temporal fix, the QSA v3
-path, the F32 split, the tiny-M kernel; all §11 gates green).  What remains is a broad but risky
-non-temporal sweep, the indexer, one delivery bug fix, and promotion.
+done (the bf16-producer port including the `xn` stream, the `dsv4_hc` non-temporal fix, the
+concat/moe non-temporal loads, the QSA v3 path, the F32 split, the tiny-M kernel; all §11 gates
+green).  What remains is the rest of the non-temporal sweep, the indexer, one delivery bug fix, and
+promotion.
 
 **Environment**
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`e620094d4`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`48b7683ca`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0024` + `commits.txt` (24 commits), pushed to `origin/main`; `git apply --check` verified on a fresh `8a2567e1e` |
+| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0025` + `commits.txt` (25 commits), pushed to `origin/main`; `git apply --check` verified on a fresh `8a2567e1e` |
 | target model | `/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf` (94 GiB; the only qwen4exp with HC + QSA) |
 | fast iteration model | `Qwen3.6-35B-A3B-Q4_K_M` (21 GiB, `qwen35moe`; **no** HC/QSA — use it only for `mmb_*` shapes) |
 | reference | `~/pwilkin-llama-cpp` @ `f5daaa3cf` (branch `strix-halo`) |
@@ -60,14 +61,14 @@ MMB dense shapes.
 
 **Next work, in priority order**
 
-1. **Non-temporal sweep of the other pure-streaming kernels (unmeasured, possibly the biggest
-   remaining prefill lever).**  Session 13 found that the `dsv4_hc` kernels were 18 % below their own
-   ceiling purely because their buffers thrashed the L2/MALL the GEMM weight streams use, and fixed
-   it with `__builtin_nontemporal_load`/`_store` (value-preserving, bit-identical).  The same may
-   hold for `concat_transposed_src1_dim0` (358 ms), `moe_weighted_reduction_f32_vec4` (384 ms),
-   `ssm_conv_long_token_f32` (292 ms) and the qsa3 pack (6.5 ms).  **Do not apply blindly**: kernels
-   with real reuse (`qsa3_attn`'s K/V cache, the `mmb_*` weight panels) can only lose; judge each on
-   `rocprofv3` kernel time, and remember a standalone microbench cannot see this class of win.
+1. **Finish the non-temporal sweep — LOADS ONLY, and A/B load vs store per kernel.**  Sessions 13/14
+   showed the hint is real but kernel-specific: `dsv4_hc_pre` (−18.6 %) and `dsv4_hc_post` win on both
+   accesses, `concat_transposed_src1_dim0` (−29.8 ms) and `moe_weighted_reduction` (−39.8 ms) win on
+   **loads only**, and `ssm_conv_long_token_f32` wins on neither (+79 ms both).  A non-temporal
+   **store** evicts the output the next op is about to read, so test load-only / store-only / both
+   separately (a `both`-only test would have kept two regressions here).  Untested: the qsa3 pack,
+   the `rms_norm`/unary producers, `ssm_conv` under a different shape.  Judge on `rocprofv3` kernel
+   time; note `ssm_conv`'s own baseline swings ~±20 ms run to run, so require a reproducible delta.
 2. **The indexer** — 1 % at 8K, 3.2 % at 32K, grows with context (`indexer_topk_radix_histogram`
    dominates: 82 ms / 384 calls at pp8192).  The last un-optimised family.
 3. **Delivery bug: `GGML_OP_INDEXER_FILL` missing from `GGML_OP_NAME`.**  Found in session 9, fixed in
@@ -128,20 +129,24 @@ MMB dense shapes.
 > `dsv4_hc_pre` "kernel-local residual": the kernel was 18 % below its own ceiling because its
 > streaming buffers thrashed the L2/MALL the GEMM weight streams use, and **non-temporal
 > loads/stores** (value-preserving, bit-identical) take it 605 -> 493 us/call (**-18.6 %**) with
-> `_post` 691 -> 660 ms; vec4/vec8 were tried and are worse in situ.
+> `_post` 691 -> 660 ms; vec4/vec8 were tried and are worse in situ.  **Session 14** extended the
+> non-temporal idea to the other streaming kernels and found it is **load-only and per-kernel**:
+> `concat_transposed_src1_dim0` 357 -> 327 ms and `moe_weighted_reduction` 384 -> 344 ms, while
+> `ssm_conv_long_token_f32` wins on neither (+79 ms both) — a non-temporal *store* evicts the output
+> the next op wants, so load and store must be A/B'd separately.
 
 **Current state (also in the brief above; kept here for history):**
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`e620094d4`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`48b7683ca`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0024` + `commits.txt`, in this repo, pushed to `origin/main` |
-| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (24 commits) |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0025` + `commits.txt`, in this repo, pushed to `origin/main` |
+| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (25 commits) |
 | build | §3 | run | §4 |
-| current numbers | the **session 13 UPDATE below** (`dsv4_hc` non-temporal hints, bit-identical, −18.6 % pre kernel time) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
+| current numbers | the **session 14 UPDATE below** (non-temporal loads: concat −29.8 ms, moe −39.8 ms) and the **session 13 UPDATE** (`dsv4_hc` non-temporal, bit-identical, −18.6 % pre kernel time) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
 
-**Historical ordering of the UPDATE sections:** 13 (newest, 2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
+**Historical ordering of the UPDATE sections:** 14 (newest, 2026-09-20, the non-temporal load sweep: concat/moe) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body and are correct except where
 an UPDATE says otherwise.
@@ -151,6 +156,39 @@ list is the authoritative one, and the historical "next-work order" lists inside
 below are superseded.
 
 ---
+
+## UPDATE — session 14 (2026-09-20): the non-temporal hint generalises — but **loads only**, and
+## per-kernel (concat −29.8 ms, moe −39.8 ms; ssm rejected), bit-identical
+
+Session 13 warned the sweep of the other streaming kernels must not be done blindly.  This session did
+it for the three session-5b/6 targets, testing **load-only / store-only / both** separately (three
+profiles each, `rocprofv3` kernel time, gfx1151 pp8192):
+
+| kernel | baseline | load-only | store-only | both | kept |
+|---|---:|---:|---:|---:|---|
+| `concat_transposed_src1_dim0` | 357.3 | **327.5** | 398.7 | 377.6 | **load-only (−29.8)** |
+| `moe_weighted_reduction_f32_vec4` | 383.8 | **344.0** | ~416 (both−load) | 375.8 | **load-only (−39.8)** |
+| `ssm_conv_long_token_f32` | 292.9 | (both−store) | 326.9* | 372.3 | **none** |
+
+\* `ssm` store-only is not reproducible (272.2 once, 326.9/327.0 twice) and the unchanged kernel's own
+baseline swung 292.9 -> 313.6 between runs, so `ssm` is noise-dominated here and is left alone.  The two
+kept kernels reproduce to <0.5 ms across runs (concat 327.9/327.9/327.5, moe 344.0/343.6/344.0).
+
+**The rule:** a non-temporal **store** evicts the output the next op is about to read (concat's dst
+feeds the weighted reduction immediately; moe's dst feeds the residual add), so it consistently loses;
+a non-temporal **load** helps when the input is streamed once and the L2/MALL is polluted.  Apply it to
+the **loads of pure-streaming kernels only**, and always A/B load vs store.
+
+Implementation note: `__builtin_nontemporal_*` rejects HIP's `float4` struct (builtin scalars/vectors
+only), so the moe kernel uses an `ext_vector_type(4)` view of the same 16 bytes.
+
+Bit-identical (value-preserving hints): PPL c2048 **10.6015**, greedy **`9c281c415082`** unchanged,
+`FLASH_ATTN_QSA` / `GATED_DELTA_NET` / `FLASH_ATTN_EXT` OK, width probe PASS (maxdiff 0),
+`plain == draft-mtp` byte-identical (`c0f8fb2b6fc7`).  Combined kernel saving ~70 ms of the 15.5 s
+profile (−0.45 %); the ALL-total is noisier than the per-kernel times, so judge on the kernel trace.
+
+**Still unmeasured:** the qsa3 pack, the `rms_norm`/unary producers, and `ssm_conv` under a different
+block shape / `split_n_t`.
 
 ## UPDATE — session 13 (2026-09-20): the `dsv4_hc_pre` residual was L2/MALL pollution; non-temporal
 ## accesses close it (−18.6 % pre kernel time), bit-identically

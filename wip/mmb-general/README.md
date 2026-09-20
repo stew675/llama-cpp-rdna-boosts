@@ -24,6 +24,43 @@ WMMA builtin `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32`.  gfx12 needs
 `gated_delta_net_chunked_bf16.cu` in the delivery).  So this is RDNA3-gated by
 construction; gfx1201/gfx1100 keep the existing MMQ/QSA path.
 
+## Attribution — what is pwilkin's and what is ours (added 2026-09-20)
+
+Compared against the reference `~/pwilkin-llama-cpp` @ `f5daaa3cf` (branch `strix-halo`) by direct
+file inspection.  This matters because the two trees overlap heavily, and it is easy to re-derive his
+work and think it is new (or vice versa).  What is verifiable is **presence/absence in his tree**;
+who first had an idea is inherently fuzzier, and there may be history not visible in a file diff.
+
+**His (we ported/integrated it):**
+
+* the **MMB core** (dequant→bf16 WMMA weight GEMM) — the original parked port was explicitly a port of
+  his work (`archive/work/wip-archive/iq4nl-prefill/mmb-port.patch`);
+* **native-bf16 HC intermediates + producer marking** — `out_xn_bf16`, `store_xn_f32`,
+  `ggml_cuda_mmb_mark_bf16_only(...)` for `xn`/`block_out`/`residual`/hc-mix-dst/gate/MoE-`ex`/`glu`,
+  and `hc_mix_reduce_bf16`.  **Session 12's `xn` BF16-only is his idea**, applied to the delivery's own
+  op (our `dsv4_hc_pre_f32` is a different kernel from his — ours does the sigmoid inline, his does
+  not); the bf16-producer port (sessions 8-12) is a port, not an invention;
+* `dsv4-hc.cu`, `hc-cn.cu`, `hc-mix.cu`, **`qsa3`** (`qsa.cu`), **`mmb_tall`** (384x64/384x32),
+  `mmb_f32split_kernel`.
+
+**Ours (absent from his tree):**
+
+| | pwilkin @ f5daaa3cf | this WIP |
+|---|---|---|
+| **non-temporal cache hints** | **zero** — `grep nontemporal` = 0, no `slc`/`glc` anywhere | session 13: `dsv4_hc_pre` 605→493 us/call (−18.6 %) in situ |
+| dense MMB weight types | IQ4_NL, Q8_0, Q6_K **only with a bf16 shadow** | + Q4_K, Q5_K, Q5_1, Q6_K on-the-fly, IQ4_XS, IQ3_S, Q3_K, IQ3_XXS |
+| routed/GLU types | **IQ4_NL only** (`src0->type != GGML_TYPE_IQ4_NL → false`) | the same 8 types, fused GLU |
+| tiny-M warp-per-token F32 (`hc_*_inject`) | no such kernel | `mmb_tiny_m_f32_kernel` |
+| shape-aware F32 split | `mmb_f32split()` defaults **0** | default **1**, shape-gated |
+| qsa3 itself | kernel exists | our optimizations: bitmap counting sort, fused pack, all KV types |
+
+**Why the distinction is not academic:** his MMB is **IQ4_NL-only**, and the delivery's models are not
+(Flash-Next is UD-**IQ4_XS**, the MoE iteration model is **Q4_K_M**), so his dense MMB does not fire on
+them at all — the type generalization is what makes the headline gains land on the delivery's own
+models.  Conversely, the non-temporal class (in-situ L2/MALL pollution) is something his tree does not
+do anywhere, which is exactly why sessions 5e/6 — which were partly reasoning against his design —
+missed it.
+
 ## Done (2026-09-19)
 
 - `mmb_dq_row_q4k` / `mmb_dq_row_q5_1` — on-the-fly bf16 LDS dequant, no bf16 shadow
@@ -100,6 +137,43 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 (Q8_0 PLE + Q5_1), `mmb_routed_glu` 2.46 s, `mmb_routed` 1.39 s, HC pre+post 1.44 s,
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
+
+## UPDATE — session 14 (2026-09-20): the non-temporal hint generalises — but **loads only**, and
+## per-kernel (concat −29.8 ms, moe −39.8 ms; ssm rejected), bit-identical
+
+Session 13 closed the `dsv4_hc` gap with non-temporal hints and warned the sweep of the other
+streaming kernels must not be done blindly.  This session did it for the three session-5b/6 targets,
+testing **load-only / store-only / both** separately (three profiles each, `rocprofv3` kernel time at
+gfx1151 pp8192), and the answer is emphatically per-kernel:
+
+| kernel | baseline | load-only | store-only | both | kept |
+|---|---:|---:|---:|---:|---|
+| `concat_transposed_src1_dim0` | 357.3 | **327.5** | 398.7 | 377.6 | **load-only (−29.8)** |
+| `moe_weighted_reduction_f32_vec4` | 383.8 | **344.0** | ~416 (both−load) | 375.8 | **load-only (−39.8)** |
+| `ssm_conv_long_token_f32` | 292.9 | (both−store) | 326.9* | 372.3 | **none** |
+
+\* not reproducible: `ssm` store-only measured 272.2 once and 326.9/327.0 twice — an unchanged kernel's
+own baseline also swung 292.9 -> 313.6 between runs, so `ssm` is noise-dominated at this granularity
+and is left alone.  The two kept kernels reproduce to <0.5 ms across runs (concat 327.9/327.9/327.5,
+moe 344.0/343.6/344.0).
+
+**The rule that falls out:** a non-temporal **store** evicts the output the next op is about to read
+(concat's dst feeds `moe_weighted_reduction` immediately, moe's dst feeds the residual add) and
+consistently loses; a non-temporal **load** helps when the input is streamed once and the L2/MALL is
+polluted by the surrounding weight streams.  So apply the hint to the **loads of pure-streaming
+kernels only**, and always A/B load vs store (a `both`-only test would have kept a regression here).
+
+The moe kernel needed an `ext_vector_type(4)` view of `float4` for the hint — `__builtin_nontemporal_*`
+rejects HIP's `float4` struct (it only accepts builtin scalars/vectors).
+
+Bit-identical (value-preserving hints): PPL c2048 **10.6015**, greedy **`9c281c415082`** unchanged,
+`FLASH_ATTN_QSA` / `GATED_DELTA_NET` / `FLASH_ATTN_EXT` OK, width probe PASS, `plain == draft-mtp`
+byte-identical.  Combined kernel saving ~70 ms of the 15.5 s profile (−0.45 %); the ALL-total is noisier
+than the per-kernel times, so judge on the kernel trace.
+
+**Still unmeasured (follow-up):** the qsa3 pack, the `rms_norm`/unary producers, and `ssm_conv` (no
+hint found, but only three variants tested — a different block shape or a `split_n_t` change might
+change the picture).
 
 ## UPDATE — session 13 (2026-09-20): the `dsv4_hc_pre`/`_post` residual was L2/MALL pollution —
 ## non-temporal accesses close it (**−18.6 % pre, −31 ms post**), bit-identically

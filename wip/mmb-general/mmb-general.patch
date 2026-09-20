@@ -17,6 +17,39 @@ index 358bc74d0..2ba751eba 100644
      GGML_API void ggml_flash_attn_qsa_set_prec(
              struct ggml_tensor * a,
              enum ggml_prec       prec);
+diff --git a/ggml/src/ggml-cuda/concat.cu b/ggml/src/ggml-cuda/concat.cu
+index 408cbce3d..030d8f6de 100644
+--- a/ggml/src/ggml-cuda/concat.cu
++++ b/ggml/src/ggml-cuda/concat.cu
+@@ -86,6 +86,10 @@ static void concat_cont_cuda(const T * x,
+     concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+ }
+ 
++// The routed-expert concat is a pure streaming transpose (each element read once, written once), so
++// its global LOADS use non-temporal hints to stop it thrashing the L2/MALL the surrounding GEMM
++// weight streams need.  LOADS ONLY: the dst stays cached for its immediate consumer, and a
++// non-temporal store here measured +41 ms (session 13/14, gfx1151, pp8192).
+ template <typename T>
+ static __global__ void concat_transposed_src1_dim0(
+         const char * src0, const char * src1, char * dst,
+@@ -108,7 +112,7 @@ static __global__ void concat_transposed_src1_dim0(
+         const int64_t token = token0 + ty + j;
+         const int64_t channel = channel0 + tx;
+         if (token < ne10 && channel < ne11) {
+-            values[ty + j][tx] = *reinterpret_cast<const T *>(src1 + i2 * nb12 + channel * nb11 + token * nb10);
++            values[ty + j][tx] = __builtin_nontemporal_load(reinterpret_cast<const T *>(src1 + i2 * nb12 + channel * nb11 + token * nb10));
+         }
+     }
+     __syncthreads();
+@@ -127,7 +131,7 @@ static __global__ void concat_transposed_src1_dim0(
+             if (channel < ne11) {
+                 for (int64_t state = tx; state < ne00; state += tile) {
+                     *reinterpret_cast<T *>(dst + i2 * nb2 + channel * nb1 + state * nb0) =
+-                        *reinterpret_cast<const T *>(src0 + i2 * nb02 + channel * nb01 + state * nb00);
++                        __builtin_nontemporal_load(reinterpret_cast<const T *>(src0 + i2 * nb02 + channel * nb01 + state * nb00));
+                 }
+             }
+         }
 diff --git a/ggml/src/ggml-cuda/dsv4-hc.cu b/ggml/src/ggml-cuda/dsv4-hc.cu
 index ca1d2dc8a..6451de414 100644
 --- a/ggml/src/ggml-cuda/dsv4-hc.cu
@@ -2741,6 +2774,74 @@ index 000000000..8d9c14539
 +void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu);
 +void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
 +void ggml_cuda_mmb_release_all();
+diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cu b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
+index a3f462271..f5ca12a1e 100644
+--- a/ggml/src/ggml-cuda/moe-weighted-reduction.cu
++++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
+@@ -1,5 +1,14 @@
+ #include "moe-weighted-reduction.cuh"
+ 
++// HIP's float4 is a struct, and __builtin_nontemporal_load/_store only accept builtin scalar or
++// vector types, so use an ext_vector_type view of the same 16 bytes for the streaming access.
++//
++// The expert-row read is the streaming bulk (each element read once), so it uses a non-temporal
++// LOAD; the small weights/expert_scale stay cached, and the dst STORE stays a normal store (a
++// non-temporal store here measured +32 ms: it evicts the output the next op wants).  Measured
++// -40 ms on this kernel at gfx1151 pp8192 (session 14).
++typedef float moe_nt_f4 __attribute__((ext_vector_type(4)));
++
+ // float4 quad variant: only valid when every expert row starts 16B-aligned, i.e. when
+ // n_embd % 4 == 0 (checked by the launcher). Real models have n_embd % 4 == 0, so the
+ // aligned path below covers them unchanged; the scalar kernel is the fallback for
+@@ -23,23 +32,23 @@ static __global__ void moe_weighted_reduction_f32_vec4(const float * __restrict_
+     const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
+     float4 sum;
+     {
+-        const float4 e = *reinterpret_cast<const float4 *>(experts + first_row * n_embd + col);
++        const moe_nt_f4 e = __builtin_nontemporal_load(reinterpret_cast<const moe_nt_f4 *>(experts + first_row * n_embd + col));
+         const float  w = weights[first_row];
+-        sum.x = (e.x * first_scale) * w;
+-        sum.y = (e.y * first_scale) * w;
+-        sum.z = (e.z * first_scale) * w;
+-        sum.w = (e.w * first_scale) * w;
++        sum.x = (e[0] * first_scale) * w;
++        sum.y = (e[1] * first_scale) * w;
++        sum.z = (e[2] * first_scale) * w;
++        sum.w = (e[3] * first_scale) * w;
+     }
+ 
+     for (int expert = 1; expert < n_expert_used; ++expert) {
+         const uint64_t row   = first_row + expert;
+         const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+-        const float4  e     = *reinterpret_cast<const float4 *>(experts + row * n_embd + col);
++        const moe_nt_f4 e   = __builtin_nontemporal_load(reinterpret_cast<const moe_nt_f4 *>(experts + row * n_embd + col));
+         const float   w     = weights[row];
+-        sum.x += (e.x * scale) * w;
+-        sum.y += (e.y * scale) * w;
+-        sum.z += (e.z * scale) * w;
+-        sum.w += (e.w * scale) * w;
++        sum.x += (e[0] * scale) * w;
++        sum.y += (e[1] * scale) * w;
++        sum.z += (e[2] * scale) * w;
++        sum.w += (e[3] * scale) * w;
+     }
+     reinterpret_cast<float4 *>(dst + token * n_embd + col)[0] = sum;
+ }
+@@ -59,12 +68,12 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
+ 
+     const uint64_t first_row   = (uint64_t) token * n_expert_used;
+     const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
+-    float          sum         = (experts[first_row * n_embd + col] * first_scale) * weights[first_row];
++    float          sum         = (__builtin_nontemporal_load(experts + first_row * n_embd + col) * first_scale) * weights[first_row];
+ 
+     for (int expert = 1; expert < n_expert_used; ++expert) {
+         const uint64_t row   = first_row + expert;
+         const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+-        sum += (experts[row * n_embd + col] * scale) * weights[row];
++        sum += (__builtin_nontemporal_load(experts + row * n_embd + col) * scale) * weights[row];
+     }
+     dst[token * n_embd + col] = sum;
+ }
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
 index 4bf198077..5a60a47d6 100644
 --- a/ggml/src/ggml-cuda/norm.cu
