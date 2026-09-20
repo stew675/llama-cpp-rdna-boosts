@@ -15,12 +15,53 @@ then `README.md` (the running record) beside it.
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`5c8583b9e`** |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`3ff571bf9`** |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
 | backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0013` + `commits.txt`, in this repo, pushed to `origin/main` (`b78b96b`) |
 | verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (13 commits, 9 files, +2190/-11) |
 | build | §3 | run | §4 |
 | current numbers | the session-4 UPDATE below (the §5/§7 tables predate the default flips) |
+
+---
+
+## UPDATE — session 5b (2026-09-19): tiny-M F32 kernel — the hc `*_inject` GEMMs (+2.3-3.3 %)
+
+Session-5 next-work #1 (the remaining F32 tiny-M) is **done**.
+
+`hc_attn_inject` / `hc_ffn_inject` are M=4 (hc), K=10240, T=2048 — 1012 ms, 1.330 ms/launch, 5.7 % of
+prefill.  Neither tile can serve them (M=4 gives no M parallelism: rocBLAS launches 64 blocks, the
+128-row MMB tile pads 32x), and both read the 84 MB activation once yet sit at **63 GB/s** while
+`rms_norm_f32` sustains **330 GB/s** — a *parallelism* wall, not bandwidth.  The two injects also
+cannot be fused (different `xn`).
+
+New `mmb_tiny_m_f32_kernel`: **one warp per token**, every lane accumulating a k-strided partial for
+all M rows, so X is read once, coalesced, and reused across M in registers.  256 blocks, not 16-64.
+
+| | per launch | GB/s |
+|---|---:|---:|
+| rocBLAS | 1.330 ms | 63 |
+| MMB f32split | 1.825 ms | 46 |
+| **tiny-M** | **0.500 ms** | **168** |
+
+pp2048 933.0 → **964.1 (+3.3 %)**, pp4096 934.4 → **962.0 (+2.9 %)**, pp8192 934.6 → **955.9 (+2.3 %)**.
+PPL c16384 bf16 3.3875 → 3.3851 (noise); decode identical (tg64 25.96; M=4 is a weight row count, so
+the `T >= 512` gate still keeps the decode/verify band off this path by construction).
+
+**Tuning (both negative, both recorded):** TT=1 beats TT=2/TT=4 (the W-traffic amortisation idea is
+rejected — L2 serves the 164 KB W panels well enough); specialising `<8,TT>` → `<4,TT>` is +0.5 %.
+
+**Trap:** the first version changed only the *launcher* and measured flat, because the new `M >= 128`
+gate rejected the shape *before* the launcher ran — the kernel never executed.  The kernel trace
+(symbol absent) caught it; a bench delta alone would have read as "the idea failed".
+
+**Next-work order (revised):**
+
+1. **`mmb_dense` / `mmb_routed_glu`** (52 % combined) — §9's Q8_0 IU8-WMMA and the routed-GLU geometry.
+2. **`ssm_alpha/beta`** (207 ms, 0.359 vs a 0.082 floor, rocBLAS) — same ~60 GB/s parallel-wall shape
+   as hc_inject had; the tiny-M kernel generalised to M=48 is the obvious next step.
+3. **`dsv4_hc_pre` + `_post`** (8 %) — the HC prefill fusion (pwilkin's pair is ~0.93 s vs our 1.44 s).
+4. **qsa3 attn + its PACK** (4.9 % + 3.0 %) — the pack is a pure copy; fusing it reclaims most of 3 %.
+5. **The indexer** — 1 % at 8K, 3.2 % at 32K, growing.
 
 ---
 
@@ -393,6 +434,7 @@ MMB (`mmb.cu` / `mmb.cuh`):
 | `GGML_CUDA_MMB_IQ3XXS` | 0 | enable the (net-loss) fused GLU arm for IQ3_XXS |
 | `GGML_CUDA_MMB_BF16W` | 1 | BF16 dense weights via MMB |
 | `GGML_CUDA_MMB_F32SPLIT` | **1** | F32 dense via f16-hi/lo WMMA.  **Mode 1 = shape-aware and DEFAULT since session 5**: MMB only when `M >= 128` (the MoE router, 2.4x faster); rocBLAS keeps `hc_*_inject` (M=4) and `ssm_alpha/beta` (M=48).  `0` = all rocBLAS, `2` = all MMB (pre-session-5, worst).  Measured pp8192 902.0 (0) / **929.8 (1)** / 903.0 (2) |
+| `GGML_CUDA_MMB_TINY_M` / `_TINY_TT` | 1 / 1 | the hc `*_inject` warp-per-token kernel.  `_TINY_M=0` forces rocBLAS (A/B); `_TINY_TT` = tokens per warp (**1 is measured best**; 2 and 4 are worse — L2 serves the W panels) |
 | `GGML_CUDA_MMB_F32SPLIT_MIN_M` / `_MIN_K` | 128 / 0 | the mode-1 shape rule.  **Do not add a K condition**: taking MMB for long K (the K=10240 inject pair) measured 1.825 vs 1.332 ms and cost 375 ms |
 | `GGML_CUDA_MMB_TALL` | 2 | the tall-M tile class |
 | `GGML_CUDA_MMB_SHADOW` / `_SHADOW_MB` | 0 / 6144 | legacy bf16 shadow (Q6_K/IQ4_NL); not needed now |

@@ -1,0 +1,147 @@
+From 0da57cc0c988e4b2b8d5ae50abe4742451965ad6 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 20 Sep 2026 05:24:11 -0500
+Subject: [PATCH] WIP: warp-per-token tiny-M F32 kernel for the hc *_inject
+ GEMMs
+
+The hc_attn_inject / hc_ffn_inject GEMMs are M=4 (hc = the hyperconnection stream
+count), K=10240, T=2048 and were the largest remaining F32 cost: 1012 ms, 1.330
+ms/launch.  Neither existing tile can serve them - M=4 gives no M parallelism, so
+rocBLAS launches ceil(T/32)=64 blocks and the 128-row MMB f32split tile pads the A
+panel 32x.  Both read the 84 MB activation exactly once (floor ~0.33 ms) yet sit at
+~63 GB/s, while rms_norm_f32 on the same part sustains ~330 GB/s: a parallelism
+wall, not a bandwidth or arithmetic one.
+
+mmb_tiny_m_f32_kernel: one warp per token, every lane accumulating a k-strided
+partial for all M rows, so X is read once, coalesced (consecutive lanes read
+consecutive float4) and reused across M in registers.  256 blocks at T=2048
+instead of 16-64.  0.500 ms/launch vs rocBLAS 1.330 (2.66x), and only 1.5x off the
+memory floor now.
+
+pp2048 938.2 -> 962.4 (+2.6 %), pp4096 932.2 -> 961.4 (+3.1 %), pp8192 931.4 ->
+955.0 (+2.5 %); hc_inject total 1012 -> 568 ms.
+
+PPL c16384 bf16 3.3875 -> 3.3851 (noise).  Decode identical (tg64 25.96 both) -
+M=4 here is a weight row count, not a token count, and the T >= 512 gate is
+unchanged.  Greedy text coherent.
+
+Two things this records so they are not relearned:
+- The tiny-M path HAD to be added to the *gate* (mmb_tiny_m_f32_ok), not just the
+  launcher.  The first version only changed the launcher and measured neutral, but
+  only because the M >= 128 rule rejected the shape before the launcher was
+  reached - the kernel never ran.  Verifying with a kernel trace (the symbol was
+  absent) is what caught it; a bench delta alone would have read as 'the idea
+  failed'.
+- Remaining headroom is W traffic: each warp reads the whole 164 KB W panel, so W
+  (336 MB from L2) outweighs X (84 MB).  Processing several t per warp amortises
+  it; left as the next tuning step.
+---
+ ggml/src/ggml-cuda/mmb.cu | 71 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 70 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index fb5ee89f5..1f0571fe5 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -800,6 +800,58 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
+ __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo) {
+     hi = __builtin_bit_cast(uint16_t, (_Float16) x); lo = __builtin_bit_cast(uint16_t, (_Float16) (x - (float) __builtin_bit_cast(_Float16, hi)));
+ }
++
++// ---------------------------------------------------------------------------
++// tiny-M F32 (the hc *_inject pair: M = hc = 4, K = 10240, T = 2048).
++//
++// Neither existing tile can help here.  M=4 offers no M parallelism, so rocBLAS launches
++// ceil(T/32)=64 blocks and the 128-row MMB tile pads the A panel 32x -- and BOTH read the 84 MB
++// activation exactly once (the memory floor is ~0.33 ms) yet measure 1.332 / 1.825 ms, i.e. ~63
++// GB/s.  The same part sustains ~330 GB/s on rms_norm_f32 (5.9 % of prefill, 1044 ms for
++// 84 MB read + 84 MB write per launch), so this is a *parallelism* wall, not a bandwidth or
++// arithmetic one: 16-64 blocks cannot keep enough loads in flight.
++//
++// The fix is to make the threads the parallelism.  One warp per token; every lane accumulates a
++// k-strided partial *for all M rows*, so X is read once, coalesced (consecutive lanes read
++// consecutive float4), and reused across M in registers.  grid = ceil(T / (MMB_NT/32)) = 256
++// blocks at T=2048, a 4-16x increase.  W is [M][K] and tiny (164 KB), so its panel reads are L2.
++//
++// Not bit-identical to rocBLAS (different summation order, and plain fp32 FMA rather than the
++// f16 hi/lo split) -- a prefill numerics change like the rest of the F32 work, so it is PPL-gated.
++template<int MMAX>
++__global__ void __launch_bounds__(MMB_NT)
++mmb_tiny_m_f32_kernel(const float * __restrict__ W, const float * __restrict__ X,
++                      float * __restrict__ D, const int M, const int K, const int T) {
++    constexpr int NWARPS = MMB_NT / 32;
++    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
++    const int t = blockIdx.x * NWARPS + w;
++    if (t >= T) return;
++    const float4 * __restrict__ xrow = (const float4 *) (X + (size_t) t * K);
++    const int nk4 = K >> 2;   // caller guarantees K % 4 == 0
++    float4 acc[MMAX];
++#pragma unroll
++    for (int m = 0; m < MMAX; ++m) acc[m] = make_float4(0.f, 0.f, 0.f, 0.f);
++    for (int k4 = lane; k4 < nk4; k4 += 32) {
++        const float4 x = xrow[k4];
++        const int k = k4 << 2;
++#pragma unroll
++        for (int m = 0; m < MMAX; ++m) {
++            if (m >= M) break;
++            const float4 wv = *(const float4 *) (W + (size_t) m * K + k);
++            acc[m].x += wv.x * x.x; acc[m].y += wv.y * x.y;
++            acc[m].z += wv.z * x.z; acc[m].w += wv.w * x.w;
++        }
++    }
++    // lane partial -> warp total, one shuffle tree reused for every m
++#pragma unroll
++    for (int m = 0; m < MMAX; ++m) {
++        if (m >= M) break;
++        float s = (acc[m].x + acc[m].y) + (acc[m].z + acc[m].w);
++#pragma unroll
++        for (int off = 16; off > 0; off >>= 1) s += __shfl_down(s, off);
++        if (lane == 0) D[(size_t) t * M + m] = s;
++    }
++}
+ template <int BM, int BN, int WTM, int WTN, bool TWO>
+ __global__ void __launch_bounds__(MMB_NT, 2)
+ mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X, float * __restrict__ D, const int M, const int K, const int T) {
+@@ -1020,6 +1072,14 @@ bool mmb_f32split() { return mmb_f32split_mode() != 0; }
+ // long-K hc inject pair is *worse* on MMB despite the WMMA path; see the table above).
+ int  mmb_f32split_min_k(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_K") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT_MIN_K")) : 0; return v; }
+ int  mmb_f32split_min_m(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_M") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT_MIN_M")) : 128; return v; }
++// tiny-M F32 (the hc *_inject pair): M=hc=4, K=10240.  Neither tile suits it (see
++// mmb_tiny_m_f32_kernel), so it gets its own warp-per-token kernel.  This has to be part of the
++// *gate* as well as the launcher -- an M-based rule that only admits M >= 128 would reject the
++// shape here and rocBLAS would run, silently, with the kernel never reached.
++bool mmb_tiny_m_f32_ok(const int64_t K, const int64_t M) {
++    static const int v = getenv("GGML_CUDA_MMB_TINY_M") ? atoi(getenv("GGML_CUDA_MMB_TINY_M")) : 1;
++    return v != 0 && M >= 1 && M <= 8 && K % 4 == 0;
++}
+ bool mmb_bf16w()    { static const int v = getenv("GGML_CUDA_MMB_BF16W") ? atoi(getenv("GGML_CUDA_MMB_BF16W")) : 1; return v != 0; }
+ bool mmb_hc16()    { static const int v = getenv("GGML_CUDA_MMB_HC16") ? atoi(getenv("GGML_CUDA_MMB_HC16")) : 0; return v != 0; }
+ int  mmb_tall_mode(){ static const int v = getenv("GGML_CUDA_MMB_TALL") ? atoi(getenv("GGML_CUDA_MMB_TALL")) : 2; return v; }
+@@ -1090,7 +1150,7 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
+     const int64_t K = src0->ne[0], M = src0->ne[1];
+     // shape-aware F32 (mode 1, default): take only the shapes where MMB beat rocBLAS (see the
+     // F32SPLIT comment above).  Mode 2 forces every F32 GEMM here; mode 0 never gets this far.
+-    const bool f32w = f32cand && (mmb_f32split_mode() >= 2 || (M >= mmb_f32split_min_m() && K >= mmb_f32split_min_k()));
++    const bool f32w = f32cand && (mmb_f32split_mode() >= 2 || (M >= mmb_f32split_min_m() && K >= mmb_f32split_min_k()) || mmb_tiny_m_f32_ok(K, M));
+     if (f32cand && !f32w) return false;   // this F32 shape is better on rocBLAS -- no fusion stand-down either
+     if ((f32cand ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
+     if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS) && K % 256 != 0) return false;   // whole 256-value super-blocks
+@@ -1123,6 +1183,15 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     { static const int lg = getenv("GGML_CUDA_MMB_LOG") ? atoi(getenv("GGML_CUDA_MMB_LOG")) : 0;
+       if (lg) { static unsigned cnt = 0; if (cnt++ < 80) fprintf(stderr, "MMB_DENSE %s type=%s M=%d K=%d T=%d\n", src0->name, ggml_type_name(src0->type), M, K, T); } }
+     if (src0->type == GGML_TYPE_F32) {
++        // tiny-M (the hc *_inject pair, M=hc=4): a warp-per-token kernel beats both tiles by a
++        // wide margin -- see the mmb_tiny_m_f32_kernel comment.  Wide-M F32 (the MoE router,
++        // M=512) keeps the WMMA f16-split tile, which is 2.4x faster than rocBLAS there.
++        if (mmb_tiny_m_f32_ok(K, M)) {
++            constexpr int NWARPS = MMB_NT / 32;
++            mmb_tiny_m_f32_kernel<8><<<(T + NWARPS - 1) / NWARPS, MMB_NT, 0, stream>>>(
++                    (const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
++            CUDA_CHECK(cudaGetLastError()); return;
++        }
+         dim3 grid((M + 127) / 128, (T + 127) / 128);
+         static const bool two = getenv("LLAMA_MMB_F32SPLIT") && atoi(getenv("LLAMA_MMB_F32SPLIT")) >= 2;
+         if (two) mmb_f32split_kernel<128, 128, 32, 64, true ><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
+-- 
+2.55.0
+

@@ -358,6 +358,50 @@ path to help the K=10240 hc inject pair.  It is wrong and costs 375 ms.**  The t
 bucketing launches by grid alone put `hc_inject` (760) + `ssm` (576) + others into one 1.065 ms
 average that looked like an MMB win.  **Split the bucket before believing a per-shape number.**
 
+## UPDATE — session 5b (2026-09-19): tiny-M F32 kernel for the hc `*_inject` GEMMs (+2.3-3.3 %)
+
+Next-work #1 from the session-5 list (the remaining F32 tiny-M) is done.
+
+**The shape:** `hc_attn_inject` / `hc_ffn_inject` are M=4 (hc = the hyperconnection stream count),
+K=10240, T=2048 — the largest remaining F32 cost at **1012 ms, 1.330 ms/launch, 5.7 % of prefill**.
+
+**Why neither existing tile could serve it:** M=4 gives no M parallelism, so rocBLAS launches
+`ceil(T/32)=64` blocks and the 128-row MMB f32split tile pads the A panel 32x.  Both read the 84 MB
+activation exactly once (memory floor ~0.33 ms) yet sit at **~63 GB/s**, while `rms_norm_f32` on the
+same part sustains **~330 GB/s** (1044 ms for 84 MB read + 84 MB write per launch).  So it is a
+**parallelism wall**, not a bandwidth or arithmetic one — 16-64 blocks cannot keep enough loads in
+flight.  (The two injects also cannot be fused: they consume different `xn`, pre-attn vs post-attn.)
+
+**The fix:** `mmb_tiny_m_f32_kernel` — one warp per token, every lane accumulating a k-strided
+partial *for all M rows*, so X is read once, coalesced (consecutive lanes read consecutive float4)
+and reused across M in registers.  256 blocks at T=2048 instead of 16-64.
+
+| | per launch | GB/s |
+|---|---:|---:|
+| rocBLAS | 1.330 ms | 63 |
+| MMB f32split | 1.825 ms | 46 |
+| **tiny-M warp-per-token** | **0.500 ms** | **168** |
+
+End to end: **pp2048 933.0 → 964.1 (+3.3 %), pp4096 934.4 → 962.0 (+2.9 %), pp8192 934.6 → 955.9
+(+2.3 %)**.  hc_inject total 1012 → 568 ms.  PPL c16384 bf16 3.3875 → **3.3851** (noise); decode
+identical (tg64 25.96 both — M=4 here is a weight row count, not a token count, so the `T >= 512`
+gate still keeps the whole decode/verify band off this path by construction).
+
+**Tuning, both negative results recorded:**
+
+* **Tokens-per-warp (TT): TT=1 is best.**  TT=2 (954.8) and TT=4 (952.3) measured *worse* than TT=1
+  (957.4) at pp8192.  The motivation was W traffic — each lane walks a k-strided slice so a warp
+  collectively reads all 164 KB of W (336 MB from L2 at 2048 warps) against X's 84 MB from DRAM.
+  L2 serves the panels well enough that the extra live registers and reduced block count cost more.
+* **MMAX specialisation: +0.5 %.**  The real M is 4, so `<4,TT>` (not `<8,TT>`) is the right
+  instantiation; `<8,1>` is kept as the general path for M in 5..8.
+
+**The trap worth carrying forward:** the first version changed only the *launcher* and measured
+neutral (+/-0.3 %) — because the `M >= 128` rule I had just added rejected the shape in the *gate*
+before the launcher was ever reached, so the kernel never ran.  A bench delta alone would have read
+as "the idea failed".  **The kernel trace is what caught it: the symbol was simply absent.**  When a
+new kernel measures flat, verify it actually executed.
+
 ## Gates before this could be opt-in, let alone defaulted on (from the parked handover)
 
 - W = 1..8 logits matrix with `GGML_CUDA_MMB=1` == off (prefill-only, `T >= 512`).
