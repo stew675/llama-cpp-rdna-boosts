@@ -31,32 +31,45 @@ then `README.md` (the running record) beside it.
 `hc-mix.cu`) is reportedly ~0.93 s against our 1.44 s.  **No change landed** — the tree is clean and
 baseline pp8192 is 953.5 t/s post-revert.
 
-### The machine's real ceiling, MEASURED (not inferred)
+### The machine's real ceiling, MEASURED (not inferred) — and the grid has to be swept
 
-`tools/dram-bw-probe.cpp` (kept in this directory; `hipcc --offload-arch=gfx1151 -O3`), 192 MB buffers:
+`tools/dram-bw-probe.cpp` (kept in this directory; `hipcc --offload-arch=gfx1151 -O3`), 192 MB buffers,
+grid swept, 34 C, no other GPU work:
 
 | pattern | GB/s | % of the 256 GB/s spec |
 |---|---:|---:|
-| pure sequential read (grid-stride float4) | **231.6** | 90.5 % |
-| copy (read + write) | **208.3** | 81.4 % |
-| **the exact `dsv4_hc_pre` shape** (x + gate, 4 streams each, + dst) | **227.2** | 88.7 % |
+| pure sequential read (best grid) | **241.5** | 94.3 % |
+| copy (read + write) | ~208-216 | 81-84 % |
+| write-only | ~217 | 85 % |
+| **the exact `dsv4_hc_pre` shape** (x + gate, 4 streams each, + dst), best grid | **232.6** | 90.8 % |
 | the real `dsv4_hc_pre_f32` | **197** | 77.0 % |
 
-The part sustains **~230 GB/s**, not 256, and — the part that matters — **the dsv4_hc_pre access
-pattern is not inherently slow**: a clean kernel with the identical shape reaches 227 GB/s.  So our
-kernel is **~13 % below what its own pattern allows**, not pinned at a wall.
+So the part sustains **~240 GB/s** as I can measure it (a separate report puts it at ~255 GB/s
+achievable, which would widen the gap a little), and — the part that matters — **the dsv4_hc_pre access
+pattern is not inherently slow**: a clean kernel with the identical shape reaches 232.6 GB/s.  Our
+kernel is therefore **~18 % below what its own pattern allows** (and ~23 % below the best pure read),
+not pinned at a wall.  That is ~1.0-1.4 % of prefill, more than the 0.6 % a first pass concluded.
 
-This correction matters because the first pass got it wrong twice: the ceiling was *inferred* from our
-own kernels rather than measured, and the conclusion drawn was "already at the memory wall, nothing to
-gain".  The honest split:
+**Two corrections this took, both worth keeping:**
 
-* **~13 % kernel-local** (197 -> 227 GB/s) = ~95 ms = **~0.6 % of prefill**.  Not pinned down; what
-  remains different from the probe kernel is the sigmoid (measured free), the runtime-stride address
+1. **The ceiling must be measured, not inferred.**  The first pass inferred it from our own kernels and
+   concluded "already at the memory wall, nothing to gain".  Wrong.
+2. **Sweep the grid before quoting a ceiling.**  The first pass ran grid=4096 everywhere and reported
+   231.6 GB/s (read) / 227.2 (pattern); the *same kernels* at grid=16384 give **241.5 / 232.6** — ~5 %.
+   Instruction sequence matters too: a 4-accumulator x4-unrolled read variant measured **worse**
+   (221-230) than a plain single-accumulator grid-stride loop, so "more ILP" is not automatically more
+   bandwidth on this part.  That matches the independent observation that this machine's number depends
+   on the exact sequence used.
+
+The split then:
+
+* **~18 % kernel-local** (197 -> 232.6 GB/s) = ~133 ms = **~0.8 % of prefill**.  Not yet explained;
+  what differs from the probe kernel is the sigmoid (measured free), the runtime-stride address
   arithmetic, and the strided `dst` write.
-* **the dominant lever is bytes**: bf16 intermediates take unique traffic 189 -> ~105 MB (1.8x), which
-  at 227 GB/s is ~0.46 ms/launch vs 0.98 — **~2.3 % of prefill**, and that is what matches the
-  reference's 1.44 -> 0.93 s.  It needs the `hc_norm`/`hc_gate` producers to write bf16, so it is a
-  **graph-level change**.
+* **the dominant remaining lever is bytes**: bf16 intermediates take unique traffic 189 -> ~105 MB
+  (1.8x), which at 232.6 GB/s is ~0.45 ms/launch vs 0.98 — **~2.3 % of prefill**, and that is what
+  matches the reference's 1.44 -> 0.93 s.  It needs the `hc_norm`/`hc_gate` producers to write bf16, so
+  it is a **graph-level change**.
 
 The launch config was never the problem: `pre` runs `ceil(n_embd*n_tokens/256)` = 20480 blocks, fully
 occupied, coalesced 128-byte reads.

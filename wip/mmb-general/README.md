@@ -358,35 +358,45 @@ path to help the K=10240 hc inject pair.  It is wrong and costs 375 ms.**  The t
 bucketing launches by grid alone put `hc_inject` (760) + `ssm` (576) + others into one 1.065 ms
 average that looked like an MMB win.  **Split the bucket before believing a per-shape number.**
 
-## UPDATE — session 5e (2026-09-19): dsv4_hc investigated — a ~13 % kernel-local gap, and the real
+## UPDATE — session 5e (2026-09-19): dsv4_hc investigated — ~18 % kernel-local headroom, and the real
 lever is bytes (bf16 intermediates)
 
 `dsv4_hc_pre_f32` + `dsv4_hc_post_f32` = 1432.5 ms (8.5 % of pp8192); pwilkin's reference is ~0.93 s
 vs our 1.44 s.  **Nothing landed** — the tree is clean, baseline pp8192 restored to 953.5 t/s.
 
-**Measure the ceiling, don't infer it.**  `tools/dram-bw-probe.cpp` (`hipcc --offload-arch=gfx1151 -O3`),
-192 MB buffers:
+**Measure the ceiling, don't infer it — and sweep the grid.**  `tools/dram-bw-probe.cpp`
+(`hipcc --offload-arch=gfx1151 -O3`), 192 MB buffers, grid swept, 34 C, no other GPU work:
 
 | pattern | GB/s | % of 256 GB/s spec |
 |---|---:|---:|
-| pure sequential read (grid-stride float4) | **231.6** | 90.5 % |
-| copy (read + write) | **208.3** | 81.4 % |
-| **the exact `dsv4_hc_pre` shape** (x + gate, 4 streams each, + dst) | **227.2** | 88.7 % |
+| pure sequential read (best grid) | **241.5** | 94.3 % |
+| copy (read + write) | ~208-216 | 81-84 % |
+| write-only | ~217 | 85 % |
+| **the exact `dsv4_hc_pre` shape** (x + gate, 4 streams each, + dst), best grid | **232.6** | 90.8 % |
 | the real `dsv4_hc_pre_f32` | **197** | 77.0 % |
 
-The part sustains **~230 GB/s**, not 256 — and **the dsv4_hc_pre access pattern is not inherently
-slow**: a clean kernel of the identical shape hits 227 GB/s.  So our kernel sits **~13 % below what
-its own pattern allows**, not at a wall.  (My first pass inferred the ceiling from our own kernels and
-concluded "at the memory wall, nothing to gain" — that was wrong, and it took a direct measurement to
-show it.)
+The part sustains **~240 GB/s** as measured here (a separate report puts it at ~255 achievable, which
+would widen the gap slightly) — and **the dsv4_hc_pre access pattern is not inherently slow**: a clean
+kernel of the identical shape reaches 232.6 GB/s.  So our kernel sits **~18 % below what its own
+pattern allows** (and ~23 % below the best pure read), not at a wall.
+
+Two corrections this took, both my own:
+
+1. **The ceiling was inferred from our own kernels** in the first pass, giving "already at the memory
+   wall, nothing to gain".  It has to be measured.
+2. **The grid must be swept before quoting a ceiling.**  grid=4096 everywhere gave 231.6 GB/s (read) /
+   227.2 (pattern); the *same kernels* at grid=16384 give **241.5 / 232.6** — ~5 %.  Instruction
+   sequence matters too: a 4-accumulator x4-unrolled read variant measured **worse** (221-230) than a
+   plain single-accumulator grid-stride loop, so "more ILP" is not automatically more bandwidth on
+   this part (consistent with this machine's number depending on the exact sequence used).
 
 The split:
 
-* **~13 % kernel-local** (197 -> 227) = ~95 ms = **~0.6 % of prefill**.  Unexplained so far; what
+* **~18 % kernel-local** (197 -> 232.6) = ~133 ms = **~0.8 % of prefill**.  Unexplained so far; what
   differs from the probe kernel is the sigmoid (measured free), the runtime-stride address arithmetic,
   and the strided `dst` write.
 * **the dominant lever is bytes** — bf16 intermediates cut unique traffic 189 -> ~105 MB (1.8x); at
-  227 GB/s that is ~0.46 ms/launch vs 0.98 = **~2.3 % of prefill**, matching the reference's
+  232.6 GB/s that is ~0.45 ms/launch vs 0.98 = **~2.3 % of prefill**, matching the reference's
   1.44 -> 0.93 s.  It needs the `hc_norm`/`hc_gate` producers to write bf16, so it is a **graph-level
   change**.
 
