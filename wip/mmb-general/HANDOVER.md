@@ -170,12 +170,17 @@ bf16 for the tensor core), and the GLU pays it twice (gate + up).
 
 ### Consequence for the next work
 
-The session-5 "two big restructures" are done: both ideas are closed.  The MMB path's remaining gains
-must come from arithmetic that is *already* bf16 (nothing) or from outside `mmb_*`.  The profile
-ranks the non-MMB prefill work as: **FA 11.3 %** > GDN scan 5.5 % > MoE concat+weighted-reduction
-6.8 % > rms_norm ~5 % > F32 5.4 %.  If the next session wants a prefill win it should profile those
-on the delivery's own kernels; otherwise the responsible step is **promotion** (all §11 gates are
-green — 5c/5d).
+The session-5 "two big restructures" are done: the **int8 IU8** idea is refuted, the **bf16 shadow** is
+refuted, and the **`mmb_routed_glu` geometry was read and every tile/BN knob tried**.  What was *not*
+tried: a true split-K restructure (the kernel is already grid-rich — 1024+ blocks for the dense
+shapes — so it would not raise occupancy) and a warp-specialised / double-buffered LDS pipeline
+(the LDS budget at `BM=128` is 36 KB of the 64 KB, so double-buffering both A and B does not fit;
+this is the one remaining candidate, and it is a non-trivial kernel rewrite).  The MMB path's
+remaining gains must otherwise come from arithmetic that is *already* bf16 (nothing) or from outside
+`mmb_*`.  The profile ranks the non-MMB prefill work as: **FA 11.3 %** > GDN scan 5.5 % > MoE
+concat+weighted-reduction 6.8 % > rms_norm ~5 % > F32 5.4 %.  If the next session wants a prefill win
+it should profile those on the delivery's own kernels; otherwise the responsible step is
+**promotion** (all §11 gates are green — 5c/5d).
 
 ---
 
