@@ -1,6 +1,6 @@
 # HANDOVER — general-purpose `mmb` (bf16/i8-WMMA dequant weight GEMM) + QSA/Q8_0 next steps
 
-**Date:** 2026-09-19.  **Status:** ACTIVE WIP, not part of the delivery, **not** pushed to any fork.
+**Date:** 2026-09-20.  **Status:** ACTIVE WIP, not part of the delivery, **not** pushed to any fork.
 This document is the self-contained entry point for the next session.  Read it top to bottom first,
 then `README.md` (the running record) beside it.
 
@@ -12,10 +12,12 @@ then `README.md` (the running record) beside it.
 > F32 split** (+2.1/+2.6/+3.1 %), the **tiny-M F32 kernel for the hc `*_inject` pair** (+2.3-3.3 %),
 > ran **all the promotion gates to green** (including the `W=1..8` probe, which needed a new harness),
 > and investigated **dsv4_hc** (no change landed — see 5e; the remaining lever there is bf16
-> intermediates, a graph change).  **The next levers are the two big `mmb_*` kernels** —
-> `mmb_routed_glu` 22.7 % + `mmb_dense` 21.1 % of pp8192 — which need a split-K / int8-IU8
-> restructure rather than tuning.  The **indexer** (1 % at 8K, 3.2 % at 32K, growing with context) is
-> deliberately deferred behind those.
+> intermediates, a graph change).  **Session 6 closed the `mmb_*` optimization line**: the int8-IU8
+> restructure is refuted on gfx1151 (int8 == bf16 WMMA; the Q8_0 epilogue makes it slower), a bf16
+> weight shadow is 2.44x *slower*, and every tile knob is a wash or worse — the kernels are at their
+> structural ceiling (dense Q8_0 at 54 % of the bf16 WMMA peak, GLU at 36 %).  The next prefill lever
+> is **outside `mmb_*`** (FA 11.3 %, GDN 5.5 %, MoE concat+reduction 6.8 %, rms_norm ~5 %), or
+> **promotion** (all gates green).  The **indexer** (1 % at 8K, 3.2 % at 32K) stays deferred.
 
 **Current state (start here):**
 
@@ -26,28 +28,154 @@ then `README.md` (the running record) beside it.
 | backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0017` + `commits.txt`, in this repo, pushed to `origin/main` (`05f2c56`) |
 | verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (17 commits, 11 files, +2506/-11) |
 | build | §3 | run | §4 |
-| current numbers | the **session 5b/5e UPDATEs below** (kernel profiles); the §5/§7 tables and the session-4 numbers predate them |
+| current numbers | the **session 6 UPDATE below** (kernel ceiling, int8/bf16 microbench + the rejected knobs); the session 5b/5e profile tables and the §5/§7 tables predate it |
 
-**Order the UPDATE sections by session: 5e (dsv4_hc, newest) → 5d (W=1..8 probe) → 5c (gates) → 5b
-(tiny-M) → 5 (profile + F32 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body
-and are correct except where an UPDATE says otherwise.
+**Order the UPDATE sections by session: 6 (newest, 2026-09-20) → 5e (dsv4_hc) → 5d (W=1..8 probe) →
+5c (gates) → 5b (tiny-M) → 5 (profile + F32 split) → 4 → 3 → 2.**  §0-§14 after them are the original
+(session-1) body and are correct except where an UPDATE says otherwise.
 
 **Next work (AUTHORITATIVE — the "next-work order" lists inside the UPDATE sections are historical):**
 
-1. **`mmb_routed_glu` (22.7 % of pp8192) + `mmb_dense` (21.1 %)** — the two big ones, and both need a
-   *restructure*, not tuning.  `mmb_dense` is occupancy/LDS-bound (§9: Q8_0 -> int8 IU8 WMMA).
-   `mmb_routed_glu`'s tile/descriptor geometry has **not been read yet** — start at
-   `mmb_build_desc2` / `mmb_tile_gemm_glu` (~lines 640-950 of `mmb.cu`).  **Their launch geometry is
-   already correct**: the GLU caller uses `(M + 63) / 64` to match `BM=64` (the routed caller uses
-   `/128` for `BM=128`), so do **not** "fix" that apparent mismatch.
-2. **bf16 HC intermediates** for `dsv4_hc_pre`/`_post` (~2.3 % of prefill) — a **graph** change: the
+1. **`mmb_dense` Q8_0 -> int8 IU8 WMMA** — **REFUTED on gfx1151 (session 6).**  An int8-WMMA
+   microbenchmark on the actual part measures **27.5 T-MAC/s vs bf16's 27.6** — gfx1151 has no
+   int8 tensor-core advantage over bf16 (the 174 T-MAC/s in §9 / `wip/q8-prefill-tuning` is
+   **gfx1201**), and the Q8_0 per-block-scale epilogue then makes the int8 path *slower* (14.1 vs
+   19.7).  **A bf16 weight shadow is also refuted**: the same GEMM shape is **2.44x slower** as native
+   BF16 (`mmb_dense` WTYPE 2) than as Q8_0 (WTYPE 1) — the larger weight footprint loses its L2
+   residency.  On-the-fly dequant is the right design; do not rebuild it.  See session 6 below.
+2. **The MMB kernels are at their structural ceiling on gfx1151 (session 6).**  The dense Q8_0 kernel
+   runs at **14.8 T-MAC/s = 54 %** of the measured 27.6 T-MAC/s bf16 WMMA peak; the GLU at ~36 %.
+   Every cheap knob (BM 64/128, BN_SMALL 32/64, force-wide/narrow, activation-cache size) measured a
+   wash or worse — the `mmb_routed_glu` geometry was read and tuned.  The remaining lever for prefill
+   is **outside `mmb_*`**: FA (`flash_attn_ext_f16` 11.3 %), the GDN scan (~5.5 %), the MoE
+   `concat_transposed_src1_dim0` + `moe_weighted_reduction` pair (~6.8 %), `rms_norm` (~5 %).
+3. **bf16 HC intermediates** for `dsv4_hc_pre`/`_post` (~2.3 % of prefill) — a **graph** change: the
    `hc_norm` / `hc_gate` producers must write bf16.  Measured 1.8x traffic reduction; see 5e.
-3. **The residual ~18 % kernel-local gap in `dsv4_hc_pre`** (~0.8 %) — smaller, still unexplained.
-4. **`ssm_alpha/beta`** (~1.2 %) — generalise the tiny-M kernel past the 8-accumulator register limit.
-5. **The indexer** — 1 % at 8K, 3.2 % at 32K, grows with context; deliberately deferred behind 1-2.
-6. **Promotion**: every §11 gate now passes (see 5c/5d).  What remains is the rebase onto a canonical
+4. **The residual ~18 % kernel-local gap in `dsv4_hc_pre`** (~0.8 %) — smaller, still unexplained.
+5. **`ssm_alpha/beta`** (~1.2 %) — generalise the tiny-M kernel past the 8-accumulator register limit.
+6. **The indexer** — 1 % at 8K, 3.2 % at 32K, grows with context; deliberately deferred behind 3-5.
+7. **Promotion**: every §11 gate now passes (see 5c/5d).  What remains is the rebase onto a canonical
    fork at `ebbb18522` + `scripts/apply-all.sh`, regenerating `patches/`, and deciding whether MMB
-   rides as a block-08 amendment.
+   rides as a block-08 amendment.  Given 1-2 are exhausted, this is now the highest-value step.
+
+---
+
+## UPDATE — session 6 (2026-09-20): the `mmb_*` kernels are at their gfx1151 structural ceiling —
+the Q8_0 IU8 restructure and the bf16 shadow are both refuted; the next lever is outside `mmb_*`
+
+Session 5 left "`mmb_dense` (21 % of pp8192) + `mmb_routed_glu` (23 %) need a split-K / int8-IU8
+restructure, not tuning" as the top item.  This session read the geometry, tried the tuning knobs and
+the two restructure ideas, and **closed all of them**.  No change landed — the worktree is clean at
+`7e431fc82` and every measurement below is from that build.
+
+### What was measured
+
+**New profile (the fast iteration model).**  The session-5 profile is on Qwen3.8-Flash-Next IQ4_XS
+(94 GiB).  For iteration this session used **`Qwen3.6-35B-A3B-Q4_K_M`** (21 GiB, `qwen35moe`, GDN +
+MoE, `rocprofv3 --kernel-trace`, `GGML_CUDA_MMB=1`, `-b/-ub 2048 -p 8192 -r 1`, two forward passes in
+the trace, total kernel 6937 ms):
+
+| kernel (by role) | ms | % | calls | note |
+|---|---:|---:|---:|---|
+| `mmb_dense_kernel<128,128,32,64,1>` **Q8_0** | **1514.8** | **21.8** | 1680 | attn_q/k/v/qkv + ssm_out + shexp |
+| `flash_attn_ext_f16` | 784.4 | 11.3 | 80 | the full-attention layers |
+| `mmb_routed_glu_kernel` Q4_K (small 32 + big 128) | 1093.3 | 15.8 | 320+320 | experts gate/up |
+| `mmb_routed_kernel` Q5_K/Q6_K | 800.4 | 11.5 | 296+296+24+24 | experts down |
+| `gdn_bf16_scan_cuda` | 380.2 | 5.5 | 240 | GDN |
+| `concat_transposed_src1_dim0` | 234.6 | 3.4 | 240 | MoE output concat |
+| `moe_weighted_reduction_f32_vec4` | 235.0 | 3.4 | 320 | MoE routing weights |
+| `ssm_conv_long_token_f32` | 198.2 | 2.9 | 240 | GDN |
+| `mmb_f32split` / `mmb_tiny_m_f32` / rocBLAS | 160.3+73.9+138.3 | 5.4 | | F32 (router + inject) |
+| `rms_norm_f32` (all insts) | ~450 | ~6.5 | | |
+| everything else | ~850 | 12 | | |
+
+The MMB share is **~49 %** (dense 21.8 + GLU 15.8 + routed 11.5), matching the Flash-Next picture.
+
+### 1. int8 WMMA is not faster than bf16 WMMA on gfx1151 (the §9 restructure is refuted)
+
+`tools/wmma-peak-gfx1151.cpp` (new, kept; `hipcc --offload-arch=gfx1151 -O3`), 256-thread blocks,
+NACC 8, both gfx11 builtins (`..._bf16_w32` with `v16s`, `..._iu8_w32` with `v4i`), plus a
+simulated Q8_0 per-32-block scale epilogue on each:
+
+| | T-MAC/s |
+|---|---:|
+| bf16 WMMA plain | **27.6** |
+| int8 WMMA plain | **27.5** |
+| bf16 WMMA + Q8_0 epilogue | 19.7 |
+| int8 WMMA + Q8_0 epilogue | 14.1 |
+
+**gfx1151's int8 and bf16 tensor cores run at the same rate**, and the Q8_0 epilogue then makes the
+int8 path *worse* than the bf16 path.  The 174 T-MAC/s / "FP8 == INT8" figures in §9 and
+`wip/q8-prefill-tuning` are **gfx1201** measurements; they do not transfer to Strix Halo.  The whole
+"Q8_0 -> int8 IU8 WMMA, avoid the dequant staging" idea is **a net loss on the target arch** — the
+current dequant-to-bf16 path is the correct design.  (27.6 T-MAC/s = 55.2 TFLOPS, matching the
+handover's ~59 TFLOPS bf16 roof; the tool reports 20 CUs.)
+
+### 2. A bf16 weight shadow is 2.44x *slower* (the on-the-fly dequant is right)
+
+Tested in situ: the **same architecture** loaded as `Qwen3.6-35B-A3B-BF16` (66 GiB) makes MMB take the
+dense weights as **WTYPE 2** (direct bf16, no dequant) instead of **WTYPE 1** (Q8_0 dequant).  Same
+grid group `(16384,16)` = `attn_qkv` M=8192 K=2048, 320 calls each:
+
+| weight format | ms | per call |
+|---|---:|---:|
+| Q8_0 (WTYPE 1) | 665.1 | 2.08 ms |
+| BF16 (WTYPE 2) | **1621.7** | 5.07 ms |
+
+2.44x slower.  The weight footprint doubles (17 -> 33 MB) and loses its L2 residency, so the kernel
+becomes weight-stream bound; it is **not** dequant-ALU bound (if it were, removing the dequant would
+help).  This also explains the earlier per-shape traffic arithmetic: the kernel is cache/bandwidth
+bound on the A (weight) stream, and Q8_0's 1-byte format is a *feature*.  A persistent bf16 shadow of
+the Q8_0 dense weights is therefore not a win even at the ~2.6 GB it would cost here, and the
+"on-the-fly dequant, no shadow" decision is confirmed from the other direction.
+
+**Trap:** the two models quantize different tensors, so the per-shape *call counts* differ
+(e.g. `(4096,16)` is 320 calls in Q4_K_M, 640 in BF16).  Only the **same grid group** is comparable.
+Do not compare totals.
+
+### 3. Every cheap knob is a wash or worse (geometry *was* read and tuned)
+
+All measured on the 35B Q4_K_M, pp2048/pp8192 t/s, `-r 2`:
+
+| knob | pp2048 | pp8192 | vs default (2520 / 2296) |
+|---|---:|---:|---|
+| default | 2520.5 | 2296.0 | — |
+| `GGML_CUDA_MMB_TILE=1` (force wide for all dense) | 2446.9 | 2231.4 | worse |
+| dense `BM=64` (`<64,128,32,32,1>`) | 2354.1 | 2141.3 | **-6.6 %** (B panel reloads 2x) |
+| GLU big `BM=128` (`<128,128,32,64,3>`) | 2495.5 | 2290.0 | ~-1 % |
+| GLU `BN_SMALL=64` (`<64,64,32,16,3>`) | 2517.5 | 2297.7 | wash |
+| `GGML_CUDA_MMB_CACHE=16` / `64` | 2514.5 | 2325 / 2323 | wash (noise; the f32->bf16 activation conversion is not redundant) |
+
+This matches the session-1 finding that forcing narrow/wide changes pp8192 by +0.6 / -2.4 %: the
+kernel is already at its tile optimum.  **`mmb_dense` runs at 14.8 T-MAC/s = 54 % of the 27.6 bf16
+WMMA peak** (measured: 44.7 TFLOP of dense GEMM over 1514.8 ms); the GLU at ~10 T-MAC/s = **36 %**.
+The missing fraction is dequant-issue contention (inherent, because Q8_0/Q4_K must be expanded to
+bf16 for the tensor core), and the GLU pays it twice (gate + up).
+
+### Methodology notes / traps
+
+1. **The fast iteration model is the 21 GiB `Qwen3.6-35B-A3B-Q4_K_M`, not the 94 GiB Flash-Next.**
+   It exercises the same `mmb_dense`/`mmb_routed_glu`/`mmb_routed` kernels (MMB is ~49 % of
+   pp8192 kernel time vs ~52 % on Flash-Next), loads in seconds, and makes a 5-variant sweep
+   affordable.  Confirm a finding on Flash-Next only if it is about the HC/`dsv4`/QSA paths (the 35B
+   has none).
+2. **`rocprofv3` grid columns are `grid_size_x` = blocks.x x 256 (the workgroup size), `grid_size_y`
+   = blocks.y.**  Divide `grid_size_x` by 256 before matching to a shape; the MMB dense grid is
+   `(M/128, T/128)` and the routed/GLU grid is `(M/BM, n_desc)`.
+3. **A separate model is a clean in-situ WTYPE A/B.**  The BF16 model isolates WTYPE 1 vs 2 with the
+   real kernel and real weights; no shadow plumbing is needed to test the idea.  Same for
+   `Qwen3.6-35B-A3B-Q4_K_M` vs `UD-Q5_K_M` for WTYPE 3 vs 6/8.
+4. **The microbenchmark builtin matters.**  gfx11's int8 WMMA takes `v4i` operands and has no
+   `_gfx12` suffix; the gfx12 tool in `wip/q8-prefill-tuning/tools/` will not compile for gfx1151.
+
+### Consequence for the next work
+
+The session-5 "two big restructures" are done: both ideas are closed.  The MMB path's remaining gains
+must come from arithmetic that is *already* bf16 (nothing) or from outside `mmb_*`.  The profile
+ranks the non-MMB prefill work as: **FA 11.3 %** > GDN scan 5.5 % > MoE concat+weighted-reduction
+6.8 % > rms_norm ~5 % > F32 5.4 %.  If the next session wants a prefill win it should profile those
+on the delivery's own kernels; otherwise the responsible step is **promotion** (all §11 gates are
+green — 5c/5d).
 
 ---
 

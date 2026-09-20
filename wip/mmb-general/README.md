@@ -97,14 +97,39 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 6 (2026-09-20): the `mmb_*` kernels are at their gfx1151 ceiling
+
+Session 5 left "`mmb_dense` (21 %) + `mmb_routed_glu` (16 %) need a split-K / int8-IU8 restructure".  This session closed both ideas, plus the bf16-shadow alternative.  **No code change** — the
+worktree stays clean at `7e431fc82`.  Full detail, tables and traps are in `HANDOVER.md` §session 6;
+the short version:
+
+* **int8 WMMA is not faster than bf16 WMMA on gfx1151.**  `tools/wmma-peak-gfx1151.cpp` (new) measures
+  **27.5 vs 27.6 T-MAC/s**; the Q8_0 per-block-scale epilogue then drops int8 to **14.1** vs bf16's
+  **19.7**.  The 174 T-MAC/s figure that motivated §9 is **gfx1201**.  **The IU8 restructure is a
+  net loss on the target arch.**
+* **A bf16 weight shadow is 2.44x slower.**  The same `attn_qkv` shape is 2.08 ms as Q8_0 (WTYPE 1,
+  dequant) and 5.07 ms as native BF16 (WTYPE 2), measured in situ on the BF16 twin of the model.  The
+  kernel is weight-cache/bandwidth bound, not dequant-ALU bound; on-the-fly dequant is correct.
+* **Every tile knob is a wash or worse:** dense `BM=64` -6.6 %, GLU big `BM=128` ~-1 %, GLU
+  `BN_SMALL=64` wash, force-wide -2.8 %, activation cache 16/64 wash.  The geometry *was* tuned.
+* **Efficiency:** `mmb_dense` Q8_0 = 14.8 T-MAC/s = **54 %** of the 27.6 bf16 peak; GLU ~**36 %**
+  (it pays the dequant twice).  The residue is dequant-issue contention and is inherent.
+* **Fast iteration model for the next session:** `Qwen3.6-35B-A3B-Q4_K_M` (21 GiB) exercises the same
+  kernels with the same shares as the 94 GiB Flash-Next, but loads in seconds.  `rocprofv3`'s
+  `grid_size_x` is `blocks.x x 256` — divide before matching a shape.
+
+**Revised next step:** the `mmb_*` kernels' remaining gains need arithmetic that is already bf16
+(none), so the prefill lever is **outside `mmb_*`** (FA 11.3 %, GDN 5.5 %, MoE concat+reduction 6.8 %,
+`rms_norm` ~5 %), or **promotion** — all §11 gates are green (sessions 5c/5d), which is now the
+highest-value step.
+
 ## Next
 
 1. **QSA v3 packed-WMMA attention** — now the #1 kernel.  Plan: graph-side `qsa_pack_keys`/`_values`,
    the `qsa3_rows`/`qsa3_merge` block descriptor, then the `qsa3_attn_kernel` WMMA; prefill-only
    (`n_query >= 128`), VEC kept for the W=1..8 band.  Estimated ~1017 -> ~1160 t/s on Q4_K_M.
-2. **Q8_0 IU8-WMMA** (int8 weights/activations straight to the int8 tensor cores, no dequant) — the
-   biggest single weight cost is now the Q8_0 dense path (23 %), and Q8_0 is already int8.  Profile
-   whether it is compute- or memory-bound first (the PLE table is lazily read).
+2. ~~**Q8_0 IU8-WMMA**~~ — **REFUTED on gfx1151 (session 6): int8 == bf16 WMMA, and the epilogue makes
+   it slower.**  Do not pursue.  See the session-6 UPDATE above.
 3. bf16-producer marking (kills `mmb_cvt`) and the HC prefill fusion.
 4. Optional, only after gfx1151 is exhausted: a single 7900 XTX (gfx1100) small-model test with
    `GGML_CUDA_MMB_RDNA3=1` — the tiling likely needs an RDNA3_0 pass.
