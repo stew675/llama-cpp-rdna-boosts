@@ -1,10 +1,35 @@
 # HANDOVER — general-purpose `mmb` (bf16/i8-WMMA dequant weight GEMM) + QSA/Q8_0 next steps
 
-**Date:** 2026-09-20 (sessions 1-15).  **Status:** ACTIVE WIP, not part of the delivery, and the
+**Date:** 2026-09-20 (sessions 1-18).  **Status:** ACTIVE WIP, not part of the delivery, and the
 code is **not** pushed to any llama.cpp fork.  This document is the self-contained entry point for
 the next session; the "FOR THE NEXT SESSION" brief below is the whole handoff, and the UPDATE
 sections after it are the dated history (newest first).  `README.md` is the running record and
 `BF16-PRODUCER-PORT.md` the producer-port reference map.
+
+---
+
+## Branch and workflow — READ THIS FIRST (set 2026-09-20)
+
+The WIP lives on **two dedicated branches**.  **New work goes to those branches, never to `main`.**
+
+| what | where | branch | base |
+|---|---|---|---|
+| **code** | fork worktree `~/llama-wip-mmb` (a worktree of `~/llama.cpp`) | **`wip-mmb-general`** | `8a2567e1e` (the applied delivery tree) |
+| **record + backup** | this repo (`llama-cpp-rdna-boosts`) | **`wip/mmb-general`** | cut from `main` at `1c2ec00` |
+
+* The delivery-repo branch `wip/mmb-general` was cut from `main` at **`1c2ec00`** (2026-09-20) and is
+  pushed to `origin/wip/mmb-general` (tracking).  **`main` is frozen for this work** — it keeps all
+  the pre-existing WIP history exactly as it was, and is not committed to again until the maintainer
+  calls the rebase.
+* **Every new session:** `git -C ~/llama-cpp-rdna-boosts switch wip/mmb-general` (check
+  `git branch --show-current` before committing) and commit the WIP record **there**.  Never commit
+  the WIP record to `main`.
+* The fork worktree stays on `wip-mmb-general`; regenerate the backup (`mmb-general.patch` +
+  `patches/` + `commits.txt`) from it as usual and commit that to `wip/mmb-general`.
+* **Rebase later, only on the maintainer's word.**  The branch point is `1c2ec00`, so
+  `git rebase --onto <new-main> 1c2ec00 wip/mmb-general` replays only the commits added after it, and
+  `git -C ~/llama-wip-mmb rebase --onto <new-delivery-base> 8a2567e1e wip-mmb-general` does the same
+  for the code; then regenerate the backup from the new base.
 
 ---
 
@@ -36,7 +61,7 @@ levers are the pass-1 cell scan (342 ms at 32K), the 3 block passes (470 ms, key
 |---|---|
 | worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`5d55da3e9`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0030` + `commits.txt` (30 commits), pushed to `origin/main`; `git apply --check` verified on a fresh `8a2567e1e` |
+| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0030` + `commits.txt` (30 commits), on branch **`wip/mmb-general`** (cut from `main` at `1c2ec00`), pushed to `origin/wip/mmb-general`; `git apply --check` verified on a fresh `8a2567e1e` |
 | target model | `/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf` (94 GiB; the only qwen4exp with HC + QSA) |
 | fast iteration model | `Qwen3.6-35B-A3B-Q4_K_M` (21 GiB, `qwen35moe`; **no** HC/QSA — use it only for `mmb_*` shapes) |
 | reference | `~/pwilkin-llama-cpp` @ `f5daaa3cf` (branch `strix-halo`) |
