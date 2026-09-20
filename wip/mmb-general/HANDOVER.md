@@ -1266,7 +1266,8 @@ the drifted working tree.
 * PPL c2048 **10.6428** (identical to the session-8 gate-only build) and same-seed greedy text
   `9930c674a6ca` -- all session-9 producers are bit-identical.
 * `test-backend-ops -o FLASH_ATTN_QSA` 22/22, `-o GATED_DELTA_NET` 46/46, `-o FLASH_ATTN_EXT` OK;
-  `test-logits-width-probe` P=1024 width_purity=PASS (maxdiff 0).
+  `test-logits-width-probe` P=1024 width_purity=PASS (maxdiff 0); and the qwen4exp
+  `plain == draft-mtp` greedy text is byte-identical (`9930c674a6ca` both, no `-md` on the plain arm).
 * `LLAMA_MMB_CVT_LOG=1`: only `ple_embd` remains.
 * The delivery `GGML_OP_NAME` `INDEXER_FILL` fix is confirmed against the base `8a2567e1e`.
 
