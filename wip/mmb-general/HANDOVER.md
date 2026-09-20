@@ -17,13 +17,20 @@ essentially done (the bf16-producer port including the `xn` stream, the `dsv4_hc
 non-temporal wins, the QSA v3 path, the F32 split, the tiny-M kernel; all §11 gates green).  After the
 indexer, what remains is the tail of the non-temporal sweep, one delivery bug fix, and promotion.
 
+**Progress (session 16):** the indexer's **full-width count pass is gone** -- the gather's per-block
+greater/equal counts are now derived from the radix histograms themselves.  Family **177.1 -> 160.4 ms
+at pp8192 (-9.4 %)** and **2523.6 -> 2028.4 ms at pp32768 (-19.6 %, 2.94 -> 2.39 % of the run)**, output
+**bit-identical** (PPL 10.6015, greedy `9c281c415082`, all §11 gates green).  The failed "compact after
+pass 1" experiment is recorded in the session-16 UPDATE.  **The remaining indexer lever is the radix
+histogram now (60 % of the family, 1250 ms at 32K, 4 passes).**
+
 **Environment**
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`43be72812`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`3da5009d4`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0027` + `commits.txt` (27 commits), pushed to `origin/main`; `git apply --check` verified on a fresh `8a2567e1e` |
+| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0028` + `commits.txt` (28 commits), pushed to `origin/main`; `git apply --check` verified on a fresh `8a2567e1e` |
 | target model | `/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf` (94 GiB; the only qwen4exp with HC + QSA) |
 | fast iteration model | `Qwen3.6-35B-A3B-Q4_K_M` (21 GiB, `qwen35moe`; **no** HC/QSA — use it only for `mmb_*` shapes) |
 | reference | `~/pwilkin-llama-cpp` @ `f5daaa3cf` (branch `strix-halo`) |
@@ -100,7 +107,7 @@ ratio r=4):
 |---|---|---|
 | `score` | `[n_blocks, n_tps, n_stream]` F32 | n_blocks = ceil(n_kv/r) |
 | `cell_blk` | `[n_kv, n_stream]` I32 | maps each cell to its block |
-| `additive` | `[n_kv, n_tps, n_stream]` F16 (or F32) | the attention mask/bias, **the big stream** |
+| `additive` | `[n_kv, n_tps, n_stream]` F16 (or F32), may be **null** | the attention mask/bias.  **Null in the default prefill path** -- derived visibility (`cell_pos`/`q_pos`) + derived per-block bias means the mask is never created, so the top-k reads no additive.  The session-15 "134 MB mask read 4x" framing is **wrong for the default config**; the cost is the key-evaluation/gather work, not that stream. |
 | `dst` | `[width, n_tps, 1, n_stream]` I32 | width = min(n_kv, `indexer_top_k` + r - 1) = **2051** |
 
 `n_kv` = context length, `n_tps` = ubatch tokens (2048 at `-ub 2048`), 24 QSA layers drive it.
@@ -108,54 +115,62 @@ ratio r=4):
 block-14 win: the `[n_kv, n_tps]` F32 expanded tensor -- 512 MB at 64K -- never exists).  Each
 `(tps, stream)` row is an independent top-k over `n_kv` cells.
 
-**Algorithm** (`indexer_topk_radix_cuda`, ~line 337):
+**Algorithm** (`indexer_topk_radix_cuda`):
 
 1. `indexer_topk_radix_init` -- states[row].rank = k.
 2. **4 radix passes**, 8 bits each (shift 24 -> 0): `indexer_topk_radix_histogram` (256-bin shared
-   histogram of the ordered-key byte, filtered by `prefix_mask`) then `indexer_topk_radix_select`
-   (find the bin holding the k-th rank, narrow the prefix).  Every pass reads **and re-evaluates**
-   every one of the `n_kv` cells.
-3. **Deterministic gather** -- `indexer_topk_count` (per 256-col block: #greater / #equal vs the final
-   prefix), `indexer_topk_base_scan` (exclusive prefix per row), `indexer_topk_deterministic_write`
-   (places cells in ascending column order).  Two **more** full passes over every cell.
+   histogram of the ordered-key byte, filtered by `prefix_mask`, over a **contiguous** column range per
+   block) then `indexer_topk_radix_select` (find the bin holding the k-th rank, narrow the prefix).
+   Every pass reads **and re-evaluates** every one of the `n_kv` cells.
+3. `indexer_topk_hist_accum` (session 16) folds each pass's **suffix** bin counts into the gather's
+   per-block `g_cnt` (greater) and, on the last pass, `e_cnt` (equal): a cell with key > the final
+   prefix is greater exactly at the first byte where it differs, so it lands in a bin above the
+   selected one in exactly one radix pass.  **This replaced the old full-width `indexer_topk_count`
+   pass.**
+4. `indexer_topk_base_scan` (exclusive prefix per row), then `indexer_topk_write_blocks` (one block per
+   (row, contiguous column range); a shared running carry over 256-column tiles keeps the ascending
+   order exact).  Places cells in ascending column order.
 
-So the op does **~6 full passes over `n_kv x n_tps` cells per layer**.
+So the op does **5 full passes over `n_kv x n_tps` cells per layer** (4 histogram + 1 write), down from 6.
 
-**Measured (session 15, gfx1151, bf16 KV, `-ub 2048`, compile-time qsa3 so the trace is clean):**
+**Measured (session 16, gfx1151, bf16 KV, `-ub 2048`; session-15 baseline in brackets):**
 
 | kernel | pp8192 | pp32768 | calls @32K |
 |---|---:|---:|---:|
-| `indexer_topk_radix_histogram` | 83.5 ms | **1235.7 ms** (1.44 %) | 1536 (4 passes x 384) |
-| `indexer_topk_deterministic_write` | 46.6 ms | 668.3 ms (0.78 %) | 384 |
-| `indexer_topk_count` | 32.9 ms | 513.2 ms (0.60 %) | 384 |
-| `indexer_topk_radix_select` | 15.0 ms | 97.6 ms | 1536 |
-| `base_scan` + `init` | 2.1 ms | 8.7 ms | 384 |
-| **family total** | **180.2 ms (0.90 %)** | **2523.6 ms (2.94 %)** | |
+| `indexer_topk_radix_histogram` | 84.5 ms [83.5] | **1250.3 ms** [1235.7] | 1536 (4 passes x 384) |
+| `indexer_topk_write_blocks` [was `deterministic_write`] | 41.9 ms [46.6] | 570.2 ms [668.3] | 384 |
+| `indexer_topk_hist_accum` [replaces `count`] | 17.0 ms [32.9] | 102.7 ms [513.2] | 1536 |
+| `indexer_topk_radix_select` | 14.9 ms [15.0] | 97.0 ms [97.6] | 1536 |
+| `base_scan` + `init` | 2.1 ms | 8.2 ms [8.7] | 384 |
+| **family total** | **160.4 ms** [177.1] | **2028.4 ms** [2523.6] | |
 
-Per top-k op: **1.88 ms @ n_kv=8192 -> 6.57 ms @ n_kv=32768** (~3.5x for 4x the context, i.e. ~linear
-and still rising; expect ~5-6 % at 64K, ~10 % at 128K).  The histogram is 49 % of the family and
-`count+write` another 47 %.
+So **-9.4 % at pp8192** and **-19.6 % at pp32768 (2.94 -> 2.39 % of the run)**, output bit-identical.
+The count elimination is a long-context lever because `hist_accum` is O(`nrows x bpr x 256`) per pass,
+i.e. **independent of `n_kv`**, while the pass it replaced scaled with `n_kv`.
 
-**Why it is slow.**  At 32K the additive mask alone is `32768 x 2048 x 2 = 134 MB` per layer and the
-histogram reads it **4x** (the score gather is L2-resident -- only `n_blocks` distinct values -- so the
-additive stream dominates).  The count+write then re-read it twice more.  The kernel is
-bandwidth-bound on those ~6 passes; reducing the pass count is the whole game.
+**Why the histogram is the remaining cost.**  The additive is null in the default path (see Shapes), so
+the per-cell work is `cell_blk` + the L2-resident score gather + the derived `blk_idx`/`cell_pos` checks.
+The 4 histogram passes are now ~60 % of the family (1250 ms at 32K).
 
 **Hypotheses, ranked:**
 
-1. **Compact after pass 1.**  Pass 1 fixes the top 8 bits of the k-th value; only ~1/256 of the cells
-   can still matter, then ~1/65536.  Gather the matching cell indices into a dense scratch list after
-   pass 1 (and reuse it for the gather) so passes 2-4 scan the compacted list, not `n_kv`.  Expected:
-   ~6 passes -> ~1 + 3 small, the histogram and the gather both shrink towards 1x.  **Keep the
-   ascending-column order** (the gather is order-sensitive, see gate 7).
-2. **Fewer radix passes.**  `RADIX_BITS` is 8 (256 bins, 1 KB shared).  11 bits -> 3 passes (2048 bins,
-   8 KB shared), 12 -> 3.  A cheap 25 % cut on the histogram if (1) is not done.
-3. **Collapse count+write.**  They only distinguish `> prefix` / `== prefix`.  A single fused pass with
-   a block-level prefix and the row base from the select phase could replace count+scan+write.
+1. **Compact after pass 1 -- REFUTED (session 16).**  Implemented and measured: **326 ms vs the 177 ms**
+   family at pp8192.  The premise "only ~1/256 of the cells can still matter" is false here: the
+   per-block indexer values are heavily tied (relu zeros, whole 4-cell blocks sharing a score, and a
+   causal visible count that can approach k), so the cells whose top-8 key byte shares/beats the k-th
+   value's are **~50-60 % of the cache** (measured `max_clen` 0.5-0.625 x `n_kv`).  The list gather and
+   its indirection then cost more than the passes they saved.  Do not retry without a finer first bin.
+2. **Fewer radix passes.**  `RADIX_BITS` is 8 (256 bins); 16 bits would be 2 passes but needs a 65536-bin
+   histogram (too big for shared).  A 12+12+8 split is 3 passes but 4096 bins (16 KB shared, 16x the
+   histogram memory).  The count elimination does **not** change this -- this is the next lever.
+3. **Block-granularity selection.**  When `additive == nullptr` the value is **per-block** (all visible
+   cells of a block share `score[blk] + derived bias`), so the top-k could be resolved over `n_blocks`
+   values with visible-cell weights instead of `n_kv` cells (~4x less work at r=4).  This is the biggest
+   remaining lever but a substantial rewrite and must stay order-exact.
 4. **Specialise `indexer_topk_extra`.**  `blk_idx`/`cell_pos` presence is a run-time check inside
    `indexer_topk_value`, evaluated per cell per pass; template the four combinations.
-5. Cheaper value re-evaluation: cache the **per-block** score part once per row (it is only
-   `n_blocks x n_tps`), leaving only the per-cell additive + `cell_blk` gather in the loop.
+5. **Fuse `hist_accum` into `select`** (it already reads the whole histogram array) -- but `select` is
+   per-row while the suffix counts are per-(row, block).
 
 **How to measure.**  `rocprofv3 --kernel-trace` at `-p 8192` and `-p 32768` (exact commands in §4),
 **plus a non-profiled `llama-bench -p 32768,65536 -r 2` t/s A/B** to corroborate (the profiler race
@@ -243,14 +258,14 @@ unilaterally** -- needs a beta window / go-ahead.
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`43be72812`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`3da5009d4`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0027` + `commits.txt`, in this repo, pushed to `origin/main` |
-| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (27 commits) |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0028` + `commits.txt`, in this repo, pushed to `origin/main` |
+| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (28 commits) |
 | build | §3 | run | §4 |
-| current numbers | the **session 15 UPDATE below** (qsa3 compile-time gate + the rocprofiler-register profiling caveat) and the **session 14/13 UPDATEs** (non-temporal) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
+| current numbers | the **session 16 UPDATE below** (the indexer count-pass elimination + the compact-after-pass-1 refutation) -- indexer family pp8192 **160.4 ms** / pp32768 **2028.4 ms** -- plus the **session 15 UPDATE** (qsa3 compile-time gate + the rocprofiler-register profiling caveat), the **session 14/13 UPDATEs** (non-temporal) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
 
-**Historical ordering of the UPDATE sections:** 15 (newest, 2026-09-20, the qsa3 compile-time gate + the rocprofiler-register profiling caveat) → 14 (2026-09-20, the non-temporal load sweep: concat/moe/unary) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
+**Historical ordering of the UPDATE sections:** 16 (newest, 2026-09-20, the indexer count-pass elimination + the "compact after pass 1" refutation) → 15 (newest, 2026-09-20, the qsa3 compile-time gate + the rocprofiler-register profiling caveat) → 14 (2026-09-20, the non-temporal load sweep: concat/moe/unary) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body and are correct except where
 an UPDATE says otherwise.
@@ -258,6 +273,72 @@ an UPDATE says otherwise.
 **Next work:** see the **"FOR THE NEXT SESSION"** brief at the very top of this file — its ordered
 list is the authoritative one, and the historical "next-work order" lists inside the UPDATE sections
 below are superseded.
+
+---
+
+## UPDATE — session 16 (2026-09-20): the indexer's full-width count pass is gone (-19.6 % of the
+## family at 32K); the "compact after pass 1" hypothesis is measured and refuted
+
+Scope: the first indexer session (the session-15 mandate).  All of it is bit-identical -- PPL c2048
+**10.6015**, greedy **`9c281c415082`** (624 ch), `test-logits-width-probe` **PASS** (maxdiff 0),
+`FLASH_ATTN_QSA` / `GATED_DELTA_NET` / `FLASH_ATTN_EXT` OK.
+
+### What landed: derive the gather's counts from the radix histograms
+
+The op used to do **6 full key-evaluation passes** over the `n_kv x n_tps` cells per layer: 4 radix
+histograms + `indexer_topk_count` + `indexer_topk_deterministic_write`.  The count pass only produced
+the gather's per-block `> prefix` / `== prefix` counts.  But **those counts are already in the radix
+histograms**: a cell with `key > final_prefix` differs from the prefix at some byte `p`, is larger
+there, and therefore sits in a bin above the selected one in exactly pass `p`; the equal cells are the
+last pass's selected bin.
+
+* `indexer_topk_hist_accum` folds each pass's suffix bin counts into `g_cnt` and, on the last pass,
+  `e_cnt`.  Cost is O(`nrows x bpr x 256`) per pass, **independent of `n_kv`** -- it does not grow with
+  context.
+* The radix histogram blocks now cover **contiguous** column ranges (they used to interleave), so the
+  per-block counts and the write's blocks agree.
+* `indexer_topk_write_blocks` replaces `indexer_topk_deterministic_write`: one CU per (row, contiguous
+  range), a **shared-memory** running carry over the range's 256-column tiles, same ascending-column
+  placement.  (`indexer_topk_count` is deleted.)
+
+### Measured (gfx1151, bf16 KV, ub 2048, rocprofv3 kernel trace; session-15 baseline in brackets)
+
+| kernel | pp8192 | pp32768 |
+|---|---:|---:|
+| `indexer_topk_radix_histogram` | 84.5 (83.5) | 1250.3 (1235.7) |
+| `indexer_topk_write_blocks` (was `deterministic_write`) | 41.9 (46.6) | 570.2 (668.3) |
+| `indexer_topk_hist_accum` (was `count`) | 17.0 (32.9) | 102.7 (513.2) |
+| `indexer_topk_radix_select` | 14.9 (15.0) | 97.0 (97.6) |
+| `base_scan` + `init` | 2.1 (2.1) | 8.2 (8.7) |
+| **family total** | **160.4 (177.1)** | **2028.4 (2523.6)** |
+
+**-9.4 % at pp8192, -19.6 % at pp32768 (2.94 -> 2.39 % of the run)**, bit-identical.  The win is
+long-context-weighted by construction: the eliminated pass scaled with `n_kv`, its replacement does not.
+
+**Correction to the session-15 framing:** the additive mask is **not** the stream the histogram reads.
+In the default prefill path the derived visibility + derived per-block bias mean the mask is never
+created, so `additive == nullptr` and the kernel reads only `cell_blk`, the score gather and the derived
+`blk_idx`/`cell_pos`.  The cost is key-evaluation/gather work, not mask bandwidth.
+
+### The refuted hypothesis: "compact after pass 1"
+
+Implemented fully (candidate list in ascending column order, count/scan/write, list-side radix passes
+and gather) and measured: **326 ms vs the 177 ms** family at pp8192 -- a loss.  The premise assumes the
+cells sharing the k-th value's top-8 key byte are ~1/256 of the cache.  They are **~50-60 %**:
+`max_clen` measured 0.5-0.625 x `n_kv` at 4-8K.  The reason is the value structure -- the score is per
+4-cell block, and the relu-heavy per-block scores are heavily tied (plus causal masking makes the
+visible count approach k near the startup), so one 8-bit bin holds a huge tie group.  The compaction
+gather + indirection then cost more than the three passes they replaced.  **Do not retry without a
+finer first bin (see the brief's hypothesis 2).**
+
+### Two implementation traps
+
+1. **The running carry must be in shared memory.**  A per-thread register carry is invisible to the
+   other threads, so tiles after the first placed cells with a stale base -- the same-seed text moved
+   (`b4888d290fe2`); with a `__shared__` carry it is exactly `9c281c415082` again.
+2. **`hist_accum` must be coalesced.**  The first form had one thread per (row, block) scanning 256
+   bins: 53 ms per call (uncoalesced warp stride) and made the whole change a **loss** (197.5 ms
+   family).  One 256-thread block per (row, block) with a warp-shuffle reduce is 17 ms at pp8192.
 
 ---
 

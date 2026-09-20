@@ -138,6 +138,39 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 16 (2026-09-20): the indexer top-k loses its full-width count pass (**−9.4 % pp8192,
+## −19.6 % pp32768** of the family), bit-identically; "compact after pass 1" is refuted
+
+The indexer (`GGML_OP_INDEXER_TOPK`, delivery block 14) was the session-15 mandate.  Its gather used a
+second full key-evaluation pass (`indexer_topk_count`) just to get the per-block `> prefix` /
+`== prefix` counts.  Those counts are already latent in the radix histograms: a `key > final_prefix`
+cell differs at some byte `p` and is larger there, so it lands in a bin above the selected one in
+exactly pass `p`.  `indexer_topk_hist_accum` now folds each pass's suffix counts into `g_cnt`/`e_cnt`,
+and `indexer_topk_write_blocks` (one CU per (row, contiguous range), shared running carry) replaces the
+old count+scan+write.  `hist_accum` is O(`nrows x bpr x 256`) per pass -- **independent of `n_kv`** --
+so the win grows with context.
+
+| kernel | pp8192 (baseline) | pp32768 (baseline) |
+|---|---:|---:|
+| histogram (4 passes) | 84.5 (83.5) | 1250.3 (1235.7) |
+| write | 41.9 (46.6) | 570.2 (668.3) |
+| hist_accum (was count) | 17.0 (32.9) | 102.7 (513.2) |
+| select | 14.9 (15.0) | 97.0 (97.6) |
+| scan+init | 2.1 (2.1) | 8.2 (8.7) |
+| **family** | **160.4 (177.1)** | **2028.4 (2523.6)** |
+
+Bit-identical: PPL c2048 **10.6015**, greedy **`9c281c415082`**, width probe PASS, `FLASH_ATTN_QSA` /
+`GATED_DELTA_NET` / `FLASH_ATTN_EXT` OK.  Two traps: the write's running carry must be in **shared
+memory** (a per-thread register gave `b4888d290fe2`), and `hist_accum` must be **coalesced** (one
+256-thread block per (row, block) + warp reduce; the one-thread-per-block scan was 53 ms/call and made
+the change a loss).
+
+**Refuted: "compact after pass 1".**  Fully implemented and measured: **326 ms vs 177 ms** at pp8192.
+The candidate set (cells whose top-8 key byte shares/beats the k-th value's) is **~50-60 %** of the
+cache, not ~1/256, because the per-block relu scores are heavily tied.  See `HANDOVER.md` for the
+numbers; the remaining lever is the radix histogram (60 % of the family) -- fewer passes or a
+block-granularity selection.
+
 ## UPDATE — session 15 (2026-09-20): qsa3 becomes a compile-time gate; rocprofv3 silently drops
 ## env-gated paths (`rocprofiler-register` setenv race); indexer measured at long context
 
