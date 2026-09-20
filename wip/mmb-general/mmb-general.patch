@@ -17,6 +17,31 @@ index 358bc74d0..2ba751eba 100644
      GGML_API void ggml_flash_attn_qsa_set_prec(
              struct ggml_tensor * a,
              enum ggml_prec       prec);
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 934b9cffb..e23628d4b 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -143,6 +143,20 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
+ #endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+ }
+ 
++// Non-temporal (streaming) load for pure-streaming kernels: it keeps the access out of the L2/MALL
++// that the surrounding weight GEMMs need (see the WIP mmb-general notes).  __builtin_nontemporal_load
++// only accepts pointers to builtin scalar/vector types, so wrapper types (__half, bfloat16, float4,
++// ...) fall back to a normal access -- a templated kernel therefore takes the hint on its f32 path
++// only, which is the path these activations use.
++template <typename T>
++static __device__ __forceinline__ T ggml_cuda_nt_load(const T * p) {
++    if constexpr (std::is_same<T, float>::value) {
++        return __builtin_nontemporal_load(p);
++    } else {
++        return *p;
++    }
++}
++
+ #ifdef __CUDA_ARCH_LIST__
+ constexpr bool ggml_cuda_has_arch_impl(int) {
+     return false;
 diff --git a/ggml/src/ggml-cuda/concat.cu b/ggml/src/ggml-cuda/concat.cu
 index 408cbce3d..030d8f6de 100644
 --- a/ggml/src/ggml-cuda/concat.cu
@@ -3001,7 +3026,7 @@ index 4bf198077..5a60a47d6 100644
  
  void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
 diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
-index 55914e7a3..fe3d4d20d 100644
+index 55914e7a3..9b5a8d287 100644
 --- a/ggml/src/ggml-cuda/unary.cu
 +++ b/ggml/src/ggml-cuda/unary.cu
 @@ -1,5 +1,13 @@
@@ -3082,12 +3107,14 @@ index 55914e7a3..fe3d4d20d 100644
      ggml_cuda_pdl_lc();
      const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
  
-@@ -273,7 +296,11 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst,
+@@ -273,7 +296,13 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst,
      const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
  
      ggml_cuda_pdl_sync();
 -    dst[i] = (T)(op((float)x[j0]) * (float)g[j1]);
-+    const float v = op((float)x[j0]) * (float)g[j1];
++    // streaming loads only (the dst is consumed immediately, so its store stays cached); -38 ms on
++    // this kernel in situ at gfx1151 pp8192.  `ggml_cuda_nt_load` no-ops for the non-f32 instantiations.
++    const float v = op((float)ggml_cuda_nt_load(x + j0)) * (float)ggml_cuda_nt_load(g + j1);
 +    if (store_f32) dst[i] = (T)v;
 +    if (dst16 != nullptr) {
 +        dst16[i] = unary_f2bf(v);
@@ -3095,7 +3122,7 @@ index 55914e7a3..fe3d4d20d 100644
  }
  
  // Same as unary_gated_op_kernel but writes the Q8_1 quantized product into the
-@@ -385,10 +412,10 @@ void ggml_cuda_op_unary_mul_q8_1(ggml_backend_cuda_context & ctx,
+@@ -385,10 +414,10 @@ void ggml_cuda_op_unary_mul_q8_1(ggml_backend_cuda_context & ctx,
  }
  
  template <float (*op)(float), typename T>
@@ -3108,7 +3135,7 @@ index 55914e7a3..fe3d4d20d 100644
  }
  
  template <float (*op)(float)>
-@@ -758,7 +785,7 @@ void ggml_cuda_op_leaky_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+@@ -758,7 +787,7 @@ void ggml_cuda_op_leaky_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
  /* fused unary + mul */
  
  template <float (*op)(float)>
@@ -3117,7 +3144,7 @@ index 55914e7a3..fe3d4d20d 100644
      // unary_node: UNARY op applied to unary_node->src[0]
      // mul_node:   MUL(a, b) where one of a/b is unary_node
      // Output goes to mul_node->data
-@@ -786,24 +813,35 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
+@@ -786,24 +815,35 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
      if (unary_src->type == GGML_TYPE_F16) {
          unary_gated_cuda<op>((const half *) unary_src->data, (const half *) other_src->data,
                               (half *) mul_node->data, k, nc,
@@ -3158,7 +3185,7 @@ index 55914e7a3..fe3d4d20d 100644
              break;
          default:
              GGML_ABORT("Unsupported unary op for fused unary+mul");
-@@ -836,7 +874,7 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
+@@ -836,7 +876,7 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
   */
  
  template <float (*op)(float)>
@@ -3167,7 +3194,7 @@ index 55914e7a3..fe3d4d20d 100644
      ggml_cuda_pdl_lc();
      const int i = blockDim.x*blockIdx.x + threadIdx.x;
  
-@@ -845,14 +883,18 @@ static __global__ void scale_unary_kernel(const float * x, float * dst, const fl
+@@ -845,14 +885,18 @@ static __global__ void scale_unary_kernel(const float * x, float * dst, const fl
      }
  
      ggml_cuda_pdl_sync();
@@ -3189,7 +3216,7 @@ index 55914e7a3..fe3d4d20d 100644
  }
  
  void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node) {
-@@ -867,12 +909,24 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
+@@ -867,12 +911,24 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
      const float bias  = ggml_get_op_params_f32(scale_node, 1);
      const int   k     = ggml_nelements(src);
  

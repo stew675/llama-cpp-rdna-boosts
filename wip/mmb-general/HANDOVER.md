@@ -20,9 +20,9 @@ promotion.
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`48b7683ca`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`f2e3df704`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0025` + `commits.txt` (25 commits), pushed to `origin/main`; `git apply --check` verified on a fresh `8a2567e1e` |
+| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0026` + `commits.txt` (26 commits), pushed to `origin/main`; `git apply --check` verified on a fresh `8a2567e1e` |
 | target model | `/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf` (94 GiB; the only qwen4exp with HC + QSA) |
 | fast iteration model | `Qwen3.6-35B-A3B-Q4_K_M` (21 GiB, `qwen35moe`; **no** HC/QSA — use it only for `mmb_*` shapes) |
 | reference | `~/pwilkin-llama-cpp` @ `f5daaa3cf` (branch `strix-halo`) |
@@ -63,12 +63,14 @@ MMB dense shapes.
 
 1. **Finish the non-temporal sweep — LOADS ONLY, and A/B load vs store per kernel.**  Sessions 13/14
    showed the hint is real but kernel-specific: `dsv4_hc_pre` (−18.6 %) and `dsv4_hc_post` win on both
-   accesses, `concat_transposed_src1_dim0` (−29.8 ms) and `moe_weighted_reduction` (−39.8 ms) win on
-   **loads only**, and `ssm_conv_long_token_f32` wins on neither (+79 ms both).  A non-temporal
-   **store** evicts the output the next op is about to read, so test load-only / store-only / both
-   separately (a `both`-only test would have kept two regressions here).  Untested: the qsa3 pack,
-   the `rms_norm`/unary producers, `ssm_conv` under a different shape.  Judge on `rocprofv3` kernel
-   time; note `ssm_conv`'s own baseline swings ~±20 ms run to run, so require a reproducible delta.
+   accesses; `concat_transposed_src1_dim0` (−29.8), `moe_weighted_reduction` (−39.8) and
+   `unary_gated_op_kernel` (−38.0) win on **loads only**; `k_bin_bcast` (+52.8) and
+   `ssm_conv_long_token_f32` (+79 both) win on neither.  A non-temporal **store** evicts the output the
+   next op reads; a non-temporal **load** loses where the operand is reused/broadcast — so test
+   load-only / store-only / both separately and require a reproducible delta.  Untested: the qsa3
+   pack, `ssm_conv` under a different shape.  `rms_norm_f32` is **not** a candidate (reads `x` twice).
+   Templated kernels need `ggml_cuda_nt_load<T>()` (common.cuh), not the raw builtin (`__half` fails
+   to compile).
 2. **The indexer** — 1 % at 8K, 3.2 % at 32K, grows with context (`indexer_topk_radix_histogram`
    dominates: 82 ms / 384 calls at pp8192).  The last un-optimised family.
 3. **Delivery bug: `GGML_OP_INDEXER_FILL` missing from `GGML_OP_NAME`.**  Found in session 9, fixed in
@@ -139,12 +141,12 @@ MMB dense shapes.
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`48b7683ca`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`f2e3df704`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0025` + `commits.txt`, in this repo, pushed to `origin/main` |
-| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (25 commits) |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0026` + `commits.txt`, in this repo, pushed to `origin/main` |
+| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (26 commits) |
 | build | §3 | run | §4 |
-| current numbers | the **session 14 UPDATE below** (non-temporal loads: concat −29.8 ms, moe −39.8 ms) and the **session 13 UPDATE** (`dsv4_hc` non-temporal, bit-identical, −18.6 % pre kernel time) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
+| current numbers | the **session 14 UPDATE below** (non-temporal loads: concat −29.8, moe −39.8, unary_gated −38.0 ms; `k_bin_bcast`/`ssm_conv` rejected) and the **session 13 UPDATE** (`dsv4_hc` non-temporal) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
 
 **Historical ordering of the UPDATE sections:** 14 (newest, 2026-09-20, the non-temporal load sweep: concat/moe) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
@@ -169,6 +171,8 @@ profiles each, `rocprofv3` kernel time, gfx1151 pp8192):
 | `concat_transposed_src1_dim0` | 357.3 | **327.5** | 398.7 | 377.6 | **load-only (−29.8)** |
 | `moe_weighted_reduction_f32_vec4` | 383.8 | **344.0** | ~416 (both−load) | 375.8 | **load-only (−39.8)** |
 | `ssm_conv_long_token_f32` | 292.9 | (both−store) | 326.9* | 372.3 | **none** |
+| `unary_gated_op_kernel` | 228.3 | **190.3** | — | — | **load-only (−38.0)** |
+| `k_bin_bcast` (add/mul) | 244.0 | 296.8 | — | — | **none (load hurt +52.8)** |
 
 \* `ssm` store-only is not reproducible (272.2 once, 326.9/327.0 twice) and the unchanged kernel's own
 baseline swung 292.9 -> 313.6 between runs, so `ssm` is noise-dominated here and is left alone.  The two
@@ -180,7 +184,11 @@ a non-temporal **load** helps when the input is streamed once and the L2/MALL is
 the **loads of pure-streaming kernels only**, and always A/B load vs store.
 
 Implementation note: `__builtin_nontemporal_*` rejects HIP's `float4` struct (builtin scalars/vectors
-only), so the moe kernel uses an `ext_vector_type(4)` view of the same 16 bytes.
+only), so the moe kernel uses an `ext_vector_type(4)` view of the same 16 bytes.  The same limit breaks
+the `__half` instantiations of the **templated** kernels, so `common.cuh` now has
+`ggml_cuda_nt_load<T>()` — the hint for `float` via `if constexpr`, a normal load otherwise (a templated
+kernel gets the hint on its f32 path only).  `k_bin_bcast` shows the sweep stays empirical: the same
+hint cost **+52.8 ms** there.
 
 Bit-identical (value-preserving hints): PPL c2048 **10.6015**, greedy **`9c281c415082`** unchanged,
 `FLASH_ATTN_QSA` / `GATED_DELTA_NET` / `FLASH_ATTN_EXT` OK, width probe PASS (maxdiff 0),

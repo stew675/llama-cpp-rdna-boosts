@@ -151,6 +151,8 @@ gfx1151 pp8192), and the answer is emphatically per-kernel:
 | `concat_transposed_src1_dim0` | 357.3 | **327.5** | 398.7 | 377.6 | **load-only (−29.8)** |
 | `moe_weighted_reduction_f32_vec4` | 383.8 | **344.0** | ~416 (both−load) | 375.8 | **load-only (−39.8)** |
 | `ssm_conv_long_token_f32` | 292.9 | (both−store) | 326.9* | 372.3 | **none** |
+| `unary_gated_op_kernel` | 228.3 | **190.3** | — | — | **load-only (−38.0)** |
+| `k_bin_bcast` (add/mul) | 244.0 | 296.8 | — | — | **none (load hurt)** |
 
 \* not reproducible: `ssm` store-only measured 272.2 once and 326.9/327.0 twice — an unchanged kernel's
 own baseline also swung 292.9 -> 313.6 between runs, so `ssm` is noise-dominated at this granularity
@@ -164,7 +166,16 @@ polluted by the surrounding weight streams.  So apply the hint to the **loads of
 kernels only**, and always A/B load vs store (a `both`-only test would have kept a regression here).
 
 The moe kernel needed an `ext_vector_type(4)` view of `float4` for the hint — `__builtin_nontemporal_*`
-rejects HIP's `float4` struct (it only accepts builtin scalars/vectors).
+rejects HIP's `float4` struct (it only accepts builtin scalars/vectors).  The same limitation bites the
+**templated** kernels (`unary_gated_op_kernel`, `k_bin_bcast` are instantiated for `__half` too, and the
+`__half` instantiations fail to compile).  The fix is `ggml_cuda_nt_load<T>()` in `common.cuh`: it takes
+the hint for `float` via `if constexpr` and falls back to a normal load for every wrapper type, so a
+templated kernel gets the hint on its f32 path only — which is the path these activations use.
+
+`unary_gated_op_kernel` (the fused `sigmoid`/`silu+mul` that produces `attn_gated` and `final_output`)
+wins with **load-only** too (−38.0 ms, two builds), but `k_bin_bcast` does **not** — a non-temporal
+`src0` load cost **+52.8 ms** there (its broadcast `src1` operand / residual pattern evidently wants the
+cache).  So the sweep stays empirical: same hint, opposite outcomes.
 
 Bit-identical (value-preserving hints): PPL c2048 **10.6015**, greedy **`9c281c415082`** unchanged,
 `FLASH_ATTN_QSA` / `GATED_DELTA_NET` / `FLASH_ATTN_EXT` OK, width probe PASS, `plain == draft-mtp`
@@ -173,7 +184,8 @@ than the per-kernel times, so judge on the kernel trace.
 
 **Still unmeasured (follow-up):** the qsa3 pack, the `rms_norm`/unary producers, and `ssm_conv` (no
 hint found, but only three variants tested — a different block shape or a `split_n_t` change might
-change the picture).
+change the picture).  Note `rms_norm_f32` is **not** a candidate: it reads `x` twice (sum-of-squares,
+then scale), so a non-temporal load would evict the row between the two passes.
 
 ## UPDATE — session 13 (2026-09-20): the `dsv4_hc_pre`/`_post` residual was L2/MALL pollution —
 ## non-temporal accesses close it (**−18.6 % pre, −31 ms post**), bit-identically
