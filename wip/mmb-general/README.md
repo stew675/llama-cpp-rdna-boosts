@@ -358,6 +358,75 @@ path to help the K=10240 hc inject pair.  It is wrong and costs 375 ms.**  The t
 bucketing launches by grid alone put `hc_inject` (760) + `ssm` (576) + others into one 1.065 ms
 average that looked like an MMB win.  **Split the bucket before believing a per-shape number.**
 
+## UPDATE — session 5e (2026-09-19): dsv4_hc investigated — already at the bandwidth wall
+
+`dsv4_hc_pre_f32` + `dsv4_hc_post_f32` = 1432.5 ms (8.5 % of pp8192); pwilkin's reference is ~0.93 s
+vs our 1.44 s.  **Nothing landed** — the kernel-local levers are exhausted and the reference's
+advantage is elsewhere.
+
+| kernel | per launch | unique DRAM traffic | effective |
+|---|---:|---:|---:|
+| `dsv4_hc_pre_f32` | 0.98 ms | 189 MB (x 84 + gate 84 + dst 21, each read once) | **197 GB/s** |
+| `dsv4_hc_post_f32` | 0.92 ms | ~192 MB (`residual` gets 4x L2 reuse) | **209 GB/s** |
+
+They agree, and ~200 GB/s is this box's achievable LPDDR5X bandwidth — **both are already at the
+memory wall for f32**.  Kernel-level A/B (`rocprofv3`), all value-preserving except the identity row:
+
+| variant | `dsv4_hc_pre_f32` | verdict |
+|---|---:|---|
+| production (`expf`) | 745.0 ms | — |
+| `__expf` | 744.8 ms | sigmoid costs nothing |
+| identity (no sigmoid at all) | 745.3 ms | sigmoid costs nothing |
+| `float4` over the contiguous `i0` axis | neutral (end-to-end; values preserved) | not load-width bound |
+| hc loop unrolled + `__restrict__` | 729.9 ms (**-2.0 %** = 0.09 % of prefill) | real, not kept |
+
+No register spilling in any variant (VGPR 24->32, `Scratch_Size` 0).  The launch config was never the
+problem: `pre` runs 20480 blocks, fully occupied, coalesced.
+
+The remaining lever is **bytes**: pwilkin's `hc_mix_reduce_bf16` reads bf16 copies of `xn`/`gate`
+("Halogen-style 16-bit HC intermediates"), taking unique traffic 189 -> ~105 MB = **1.8x**, which
+matches the reported 1.44 -> 0.93 s.  That needs the `hc_norm` / `hc_gate` producers to write bf16, so
+it is a **graph-level change and a numerics change on the HC path**, not a kernel-local fix.
+
+### METHODOLOGY — prefill time here is DATA-DEPENDENT; judge kernel variants on kernel time
+
+The identity-sigmoid variant measured **-13 % end-to-end** (951 -> 824 t/s) while **its own kernel was
+unchanged** (745.3 vs 745.0 ms).  The whole swing was downstream on *identical launch counts*:
+`mmb_routed_glu` 3803.6 -> 5906.6 ms (+55 %), `mmb_routed` +392 ms, `qsa3_attn` +167 ms.  Changing the
+activations changes the MoE routing, and the GLU launch is sized worst-case with early-return slots,
+so different routing = different work.
+
+**Rule: a value-changing kernel variant must be judged on `rocprofv3` kernel time, never end-to-end
+t/s.**  Corollary for the rest of this WIP: every end-to-end A/B here also changed numerics (MMB,
+QSA3), so those wins were confirmed in the kernel profile rather than taken from t/s alone.
+
+Second trap from the same episode: the first version passed the flag as a **runtime kernel argument**,
+so the "no sigmoid" variant still compiled the `expf` *and* a select — it did strictly *more* work.
+A diagnostic whose whole point is to remove work must be a **template** parameter.
+
+## UPDATE — session 5d (2026-09-19): W=1..8 width-purity probe — the last gate item closes
+
+The `W = 1..8` logits matrix was the one §11 gate never run because no harness existed.  It does now:
+**`tests/test-logits-width-probe.cpp`** (`cmake --build build-rocm --target test-logits-width-probe`),
+adapted from `archive/work/strix-halo/issue25/logits-width.cpp`.  Gate **PASSES**:
+
+| prefill P | `MMB=0` row0 | `MMB=1` row0 | width purity |
+|---|---|---|---|
+| 256 (below `MMB_MIN_T = 512`) | `6228d03bd2b501b4` | `6228d03bd2b501b4` — **identical** | PASS, maxdiff 0 |
+| 1024 | `ac4d5de3d40a2b1d` | `3703c13f03c4b25d` | PASS, maxdiff 0 |
+| 2048 | `1996b44e491de5c9` | `e3e4220fe83831da` | PASS, maxdiff 0 |
+
+Below the threshold MMB is unreachable in both the prefill and the decode batch, so the configs are
+bit-identical across every row of every width — the "identical by construction" claim demonstrated.
+Above it the row-0 hashes differ by the **approved prefill re-baseline** (MMB replaces the MMQ
+reduction with a dequant-to-bf16 WMMA one), while **`width_purity` stays PASS with MMB on** — MMB
+introduces no width dependence, and `T >= 512` is what keeps it out of the `W <= 8` band.
+
+Two probe bugs, same class as the `-md` trap: `llama_batch_init(ubatch)` sizes for the *micro*-batch
+so a `P`-token prefill overruns it (silent SIGSEGV, plus a `GGML_ASSERT` for the `n_batch` half); and
+`n_batch` (per `llama_decode`) vs `n_ubatch` (per micro-batch) are different knobs, both scaling
+with `P`.  Also: `rows[W-1].data()` hashes the `std::vector` objects, not the floats.
+
 ## UPDATE — session 5c (2026-09-19): the promotion gates, run
 
 With the remaining big kernels out of reach for a safe change (`mmb_routed_glu` 22.7 %,

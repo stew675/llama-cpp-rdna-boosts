@@ -24,6 +24,70 @@ then `README.md` (the running record) beside it.
 
 ---
 
+## UPDATE — session 5e (2026-09-19): dsv4_hc — investigated, NOT landed. Both kernels are already at
+## the box's DRAM bandwidth; the reference's win is bf16 intermediates (a graph change)
+
+`dsv4_hc_pre_f32` + `dsv4_hc_post_f32` are 1432.5 ms (8.5 % of pp8192) and the reference (pwilkin
+`hc-mix.cu`) is reportedly ~0.93 s against our 1.44 s.  **No change landed** — the tree is clean and
+baseline pp8192 is 953.5 t/s post-revert.
+
+### The kernels are memory-bandwidth-bound, not tuning-bound
+
+| kernel | per launch | unique DRAM traffic | effective |
+|---|---:|---:|---:|
+| `dsv4_hc_pre_f32` | 0.98 ms | 189 MB (x 84 + gate 84 + dst 21, each read once) | **197 GB/s** |
+| `dsv4_hc_post_f32` | 0.92 ms | ~192 MB unique (`residual` gets 4x L2 reuse) | **209 GB/s** |
+
+The two agree, and ~200 GB/s is this box's achievable LPDDR5X bandwidth — so **both are already at
+the memory wall for f32**.  The launch config was never the problem either: `pre` launches
+`ceil(n_embd*n_tokens/256)` = 20480 blocks, fully occupied, coalesced 128-byte reads.
+
+### Three levers tested at the KERNEL level; all exhausted
+
+Measured with `rocprofv3` kernel time (see the methodology note below — end-to-end is unusable here):
+
+| variant | `dsv4_hc_pre_f32` | verdict |
+|---|---:|---|
+| production (`expf`) | 745.0 ms | — |
+| `__expf` (fast intrinsic) | 744.8 ms | **sigmoid costs nothing** |
+| identity (no sigmoid at all) | 745.3 ms | **sigmoid costs nothing** |
+| `float4` over the contiguous `i0` axis | neutral (end-to-end, value-preserving) | not load-width bound |
+| hc loop unrolled + `__restrict__` on the 3 pointers | 729.9 ms (**-2.0 %**) | real but 0.09 % of prefill |
+
+The -2 % was not kept: it buys 15 ms out of 16810 ms and costs a duplicated loop body.
+**No register spilling in any variant** (VGPR 24 -> 32, `Scratch_Size` 0 throughout).
+
+### What the reference actually does differently
+
+The remaining lever is **bytes**, i.e. pwilkin's `hc_mix_reduce_bf16` — "Halogen-style 16-bit HC
+intermediates", reading bf16 copies of `xn` and `gate`.  That takes the unique traffic from 189 MB to
+~105 MB, a **1.8x** reduction, which matches the reported 1.44 -> 0.93 s almost exactly.  It needs the
+`hc_norm` / `hc_gate` producers to write bf16, so it is a **graph-level change and a numerics change
+on the HC path**, not a kernel-local fix.  (His other variant,
+`hc_mix_reduce_f32_hc4_parallel`, spreads the hc loop over 4 warps with a shared-memory reduce; that
+is a latency optimisation, and since we are already at the bandwidth wall it cannot be where the
+gap is.)
+
+**Conclusion: this is a graph item, not a kernel-tuning item.**  Both kernel-local levers that could
+have mattered have now been measured and are exhausted.
+
+### METHODOLOGY — two traps, both mine, both generalisable
+
+1. **A value-changing kernel variant MUST be judged on `rocprofv3` kernel time, never end-to-end
+t/s.**  The identity-sigmoid variant measured **-13 % end-to-end** (951 -> 824 t/s) while its own
+kernel was **unchanged** (745.3 vs 745.0 ms).  The whole swing was downstream: `mmb_routed_glu`
+3803.6 -> 5906.6 ms (+55 %), `mmb_routed` +392 ms, `qsa3_attn` +167 ms, on *identical launch counts*.
+Blowing up the activations changes the MoE routing, and the descriptor-driven GLU launch is sized
+worst-case with early-return slots, so different routing = different work.
+**Prefill throughput on this model is data-dependent** — which also means any end-to-end A/B of a
+numerics-changing patch needs its kernel profile checked, not just its t/s.
+2. **The first diagnostic was invalid**: I passed the flag as a *runtime kernel argument*, so the
+"no sigmoid" variant still compiled the `expf` **and** a select and did strictly *more* work.  The
+`gated` flag is a template parameter for exactly this reason.  (Redone as a template, giving the
+745.0 / 744.8 / 745.3 numbers above.)
+
+---
+
 ## UPDATE — session 5d (2026-09-19): the W=1..8 probe — LAST GATE ITEM CLOSED
 
 The `W = 1..8` logits matrix was the one §11 item never run, because no probe harness existed.  It
