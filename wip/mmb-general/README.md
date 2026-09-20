@@ -97,6 +97,31 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 8 (2026-09-20): the bf16-producer port begins — HC gate + normalized stream (+1.2 %
+## pp8192 / +2.2 % pp2048), behind `GGML_CUDA_MMB_HC16=1`
+
+Session 7 scoped the bf16-producer port (`BF16-PRODUCER-PORT.md`); this session landed its first two
+producers.  Tip `ccf28bc65`, two commits on top of the session-7 pack.
+
+* **Mark lifetime**: `ggml_cuda_mmb_marks_clear()` is now called on the first optimize after a
+  compute.
+* **Gate**: the graph marks a gated `DSV4_HC_PRE`'s gate (dense `MUL_MAT [320 x 10240]`, MMB-taken,
+  single consumer) BF16-only; MMB dense writes it into the pinned slot 1 (which already existed and
+  was unused) and `dsv4_hc_pre` reads the BF16 copy through a new `wbf16` arm.  A real numerics
+  change (PPL c2048 10.5771 -> 10.6428).
+* **HC normalized stream (`xn`)**: the fused `rms_norm+mul` now also emits a BF16 copy into slot 0,
+  RNE-rounded exactly as `mmb_cvt_f32_bf16`, so the MMB dense down projection skips its conversion
+  pass.  Bit-identical (all 57 `hc_norm` `MMB_CVT`s disappear, PPL unchanged from the gate build).
+
+| config | pp2048 | pp8192 | PPL c2048 |
+|---|---:|---:|---:|
+| `HC16=0` | 973.1 | 950.8 | 10.5771 |
+| `HC16=1` gate+xn | **994.2** | **961.9** | 10.6428 |
+
+**What remains:** the `hc_mixed` producer (`dsv4_hc_pre`'s own output — self-contained, but its
+consumers must all read BF16) and the `final_output` / `MAP_CUSTOM1` families.  Same-seed greedy text
+unchanged (`9930c674a6ca`).
+
 ## UPDATE — session 7 (2026-09-20): the qsa3 pack is 0.34 %, not 3 % — a misattribution corrected
 
 Session-5b's next-work proposed fusing the qsa3 pack for ~3 % of prefill.  Measured by diffing QSA3

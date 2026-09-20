@@ -20,20 +20,25 @@ then `README.md` (the running record) beside it.
 > **promotion** (all gates green).  **Session 7** then measured the qsa3 pack (session-5b's "3 %"
 > item), found it is **0.34 %** (the bucket was really the MoE `concat_transposed_src1_dim0` +
 > base-graph F32 copies), and **fused it into one launcher pass, bit-identical: 50.5 → 6.5 ms,
-> +0.26 % pp8192**.  The **indexer** (1 % at 8K, 3.2 % at 32K) stays deferred.
+> +0.26 % pp8192**.  The **indexer** (1 % at 8K, 3.2 % at 32K) stays deferred.  **Session 8** then began
+> the bf16-producer port: the HC gate (a dense MUL_MAT the graph now marks BF16-only) and the HC
+> normalized stream (the fused rms_norm+mul emits a BF16 copy into slot 0) are native-bf16 producers —
+> **pp8192 950.8 -> 961.9 (+1.2 %), pp2048 973.1 -> 994.2 (+2.2 %)**, the gate is a measured numerics
+> change and the xn copy is bit-identical; `hc_mixed`/`final_output` and the (640 ms / 3.8 %)
+> `mmb_cvt` bucket are what remain.
 
 **Current state (start here):**
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`2a73b02e4`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`ccf28bc65`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0018` + `commits.txt`, in this repo, pushed to `origin/main` |
-| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (18 commits) |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0019` + `commits.txt`, in this repo, pushed to `origin/main` |
+| verify | `git apply --check mmb-general.patch` on a fresh `8a2567e1e` — clean (19 commits) |
 | build | §3 | run | §4 |
-| current numbers | the **session 7 UPDATE below** (the qsa3 pack fused, 0.26 % bit-identical) and the **session 6 UPDATE** (kernel ceiling, int8/bf16 microbench, rejected knobs); the session 5b/5e profile tables and the §5/§7 tables predate them |
+| current numbers | the **session 8 UPDATE below** (the HC gate + normalized-stream bf16 producers, +1.2 %/+2.2 % pp8192/pp2048), then the session 7 pack and session 6 ceiling updates; the session 5 tables predate them |
 
-**Order the UPDATE sections by session: 7 (newest, 2026-09-20, the pack measurement) → 6 (2026-09-20, the
+**Order the UPDATE sections by session: 8 (newest, 2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body and are correct except where
 an UPDATE says otherwise.
@@ -61,12 +66,76 @@ an UPDATE says otherwise.
    **Turnkey brief: [`BF16-PRODUCER-PORT.md`](BF16-PRODUCER-PORT.md)** (reference map, step plan,
    gates, pitfalls, copy-paste prompt).  `dsv4_hc_post` is already at the bandwidth ceiling; the
    GLU→down bf16 reuse is already in place (`mmb_slot[2]`).
+   **Session 8 landed the first two producers (+1.2 % pp8192 / +2.2 % pp2048, `GGML_CUDA_MMB_HC16=1`):**
+   the mark lifetime + the gate producer (dense `MUL_MAT [320 x 10240]`, slot 1) and the HC normalized
+   stream (the fused `rms_norm+mul` emits a bit-identical BF16 copy into slot 0).  **What remains:** the
+   `hc_mixed` producer (we own `dsv4_hc_pre`, but every consumer of `mixed` must then read BF16 — it
+   feeds the attention/ffn GEMMs and possibly non-GEMM ops) and the generic `final_output` /
+   `MAP_CUSTOM1` families.  See the session-8 UPDATE above.
 4. **The residual ~18 % kernel-local gap in `dsv4_hc_pre`** (~0.8 %) — smaller, still unexplained.
 5. **`ssm_alpha/beta`** (~1.2 %) — generalise the tiny-M kernel past the 8-accumulator register limit.
 6. **The indexer** — 1 % at 8K, 3.2 % at 32K, grows with context; deliberately deferred behind 3-5.
 7. **Promotion**: every §11 gate now passes (see 5c/5d).  What remains is the rebase onto a canonical
    fork at `ebbb18522` + `scripts/apply-all.sh`, regenerating `patches/`, and deciding whether MMB
    rides as a block-08 amendment.  Given 1-2 are exhausted, this is now the highest-value step.
+
+---
+
+## UPDATE — session 8 (2026-09-20): the bf16-producer port begins — the HC gate and the normalized
+## stream are native-bf16 producers (+1.2 % pp8192 / +2.2 % pp2048)
+
+Session 7's investigation (and `BF16-PRODUCER-PORT.md`) scoped this as a multi-session port.  Two of
+its producers are now landed, behind `GGML_CUDA_MMB_HC16=1` (default off).  Tip **`ccf28bc65`**.
+
+### What is done
+
+**1. Mark lifetime + the gate marking pass.**  `ggml_cuda_mmb_marks_clear()` is now called on the
+first optimize after a compute (the scheduler optimizes every split of one graph before computing
+any of them, so marks must survive the remaining splits' optimize calls), and a new marking pass in
+`ggml_backend_cuda_graph_optimize` marks a **gated `DSV4_HC_PRE`'s gate producer** BF16-only when
+it is a dense `MUL_MAT` `[K=320, M=10240]`, MMB will take it, and every consumer (save the
+view/reshape into the pre op) reads the BF16 copy.  Structure-only, as before pointers are not
+assigned yet.  `MMB_HC16 gate marked BF16-only` is the one-shot log.
+
+**2. The gate producer/consumer.**  MMB dense already had pinned slot 1 for exactly this gate
+(`"1 = HC gate"`) but it was only allocated under `mmb_hc16()` and **nothing read it**.  It is now
+allocated from the mark alone, and `dsv4_hc_pre` reads the BF16 copy through a new `wbf16` arm.  The
+consumer falls back to F32 safely whenever the lookup is null (mark not set, producer not taken, or
+`nt < MMB_MIN_T`), so the change is inert with the gate off.  This one **is** a numerics change
+(the gate is written and read as BF16 instead of F32).
+
+**3. The HC normalized stream (xn) producer.**  The fused `rms_norm + mul` of the HC normalized
+stream (a broadcast `[n_embd, hc]` gamma over a 3D `[n_embd, hc, nt]` activation) now **also**
+emits a BF16 copy of its output into pinned slot 0, RNE-rounded exactly as `mmb_cvt_f32_bf16`
+would, so the following MMB dense down-projection finds it through `ggml_cuda_mmb_cache_lookup` and
+skips its own conversion pass.  The F32 output is still written, so this is **bit-identical** (see
+the PPL check below).  `LLAMA_MMB_CVT_LOG=1` shows all `hc_norm` conversions gone (57 -> 0).
+
+### Measured (gfx1151, IQ4_XS Flash-Next, bf16 KV, `-b/-ub 2048`, `GGML_CUDA_MMB=1 GGML_CUDA_QSA3=1`)
+
+| config | pp2048 | pp8192 | PPL c2048 | greedy sha |
+|---|---:|---:|---:|---|
+| `HC16=0` (baseline) | 973.1 | 950.8 | 10.5771 | `9930c674a6ca` |
+| `HC16=1` gate only | 986.4 | 962.9 | 10.6428 | `9930c674a6ca` |
+| `HC16=1` gate + xn | **994.2** | **961.9** | **10.6428** | `9930c674a6ca` |
+
+Read it as: the gate is the only numerics change (**+0.066 PPL**, within the c2048 run's +-0.68 bar;
+the same-seed greedy text is unchanged), and the xn copy is exactly bit-identical (the PPL of the
+gate-only and gate+xn builds is identical to 4 decimals).  The xn conversion elimination accounts
+for the pp2048 gain; pp8192 gains a little less because the run is more compute-bound.
+
+**The win is real but the two producers are a small part of the port.**  The remaining `MMB_CVT`
+bucket (642 ms / 3.8 % of pp8192) is now led by `hc_mixed` (`DSV4_HC_PRE`'s own output, 29 -> 40
+conversions), `final_output` (`RESHAPE`) and the `node_*` (`MAP_CUSTOM1`) family; `hc_norm` is gone.
+What is still needed: an `hc_mixed` producer arm on `dsv4_hc_pre` itself (we own that op, so it is
+self-contained but every downstream consumer of `mixed` must then read BF16 — it feeds the
+attention/ffn GEMMs and possibly non-GEMM ops), and the generic `final_output`/`MAP_CUSTOM1`
+producers.  `dsv4_hc_post` stays at its bandwidth ceiling (session 5e).
+
+**Trap for the next session:** the `dst16` arm added a runtime branch to the shared `rms_norm_f32`
+kernel; it is inside the write loop, so bench with and without `GGML_CUDA_MMB_HC16` before assuming
+the branch is free.  And the mark lifetime is the whole correctness story: a BF16 copy whose mark
+outlives its graph is a garbage read, so any new producer must go through `ggml_cuda_mmb_marks_clear`.
 
 ---
 
@@ -1116,6 +1185,16 @@ the drifted working tree.
 * Decode unaffected by the always-QSA flip: tg64 shallow 25.80 -> 25.83.
 * Greedy text coherent on a >2051-token prompt; the prefill re-baseline is expected and approved.
 * Combined patch `git apply --check` clean on a fresh `8a2567e1e` worktree (re-verified at session 4).
+
+**Session 8 (the HC bf16 producers):**
+
+* `GGML_CUDA_MMB_HC16=1` vs `0` on gfx1151, IQ4_XS Flash-Next, bf16 KV, `-b/-ub 2048`:
+  pp8192 950.8 -> 961.9 (+1.2 %), pp2048 973.1 -> 994.2 (+2.2 %) (repeated interleaved runs).
+* PPL c2048: 10.5771 (off) -> 10.6428 (gate on), **10.6428 also with the xn copy** (the xn producer is
+  bit-identical).  Same-seed greedy text `9930c674a6ca` in all three configs.
+* `LLAMA_MMB_CVT_LOG=1`: all 57 `hc_norm` conversions disappear with `HC16=1`.
+* Combined backup `mmb-general.patch` + `patches/0001..0019`: `git apply --check` clean on a fresh
+  `8a2567e1e` (19 commits).
 
 **Still NOT run (blocking promotion, see §11):** nothing — the `W = 1..8` matrix is now done
 (session 5d UPDATE at the top; probe `tests/test-logits-width-probe.cpp`, gate PASSES).  A same-seed

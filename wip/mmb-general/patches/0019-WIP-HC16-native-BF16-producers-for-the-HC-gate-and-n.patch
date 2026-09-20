@@ -1,0 +1,398 @@
+From ccf28bc655105e8da95d99c0b9d80db68ee94399 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 20 Sep 2026 10:45:56 -0500
+Subject: [PATCH] WIP HC16: native-BF16 producers for the HC gate and
+ normalized stream
+
+Session 8 of the bf16-producer port (wip/mmb-general/BF16-PRODUCER-PORT.md).
+
+- mark lifetime: clear the BF16-only marks on the first optimize after a compute
+  (the scheduler optimizes every split before computing any of them, so the
+  marks must survive the remaining splits' optimize calls), and add the marking
+  pass: a gated DSV4_HC_PRE whose gate (dense MUL_MAT [320 x 10240]) is MMB-taken
+  and whose only consumer is that op marks the gate output BF16-only.
+- MMB dense now allocates its pinned slot 1 for that gate from the mark alone
+  (it no longer requires mmb_hc16()); dsv4_hc_pre reads the BF16 copy through a
+  new `wbf16` arm.  The gate round trip is bf16(4B write) instead of
+  f32 write + f32 read = a real numerics change.
+- the fused rms_norm+mul of the HC normalized stream (broadcast [n_embd, hc]
+  gamma over a 3D [n_embd, hc, nt] activation) also emits a BF16 copy into slot
+  0, rounded exactly as mmb_cvt_f32_bf16, so the following MMB dense down
+  projection skips its own conversion pass.  That copy is bit-identical, so the
+  GEMM result is unchanged.
+
+Measured gfx1151, IQ4_XS Flash-Next, bf16 KV, -b/-ub 2048, MMB+QSA3 on:
+pp8192 950.8 -> 961.9 t/s (+1.2%), pp2048 973.1 -> 994.2 (+2.2%); the xn copy
+is bit-identical (PPL c2048 10.6428 both with and without it) and the same-seed
+greedy text is unchanged.  The gate BF16 is the only numerics change
+(PPL c2048 10.5771 -> 10.6428, within the run's +-0.68 bar).  All behind
+GGML_CUDA_MMB_HC16=1.
+---
+ ggml/src/ggml-cuda/dsv4-hc.cu   | 29 +++++++++++++---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 59 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmb.cu       | 23 ++++++++++++-
+ ggml/src/ggml-cuda/mmb.cuh      |  3 ++
+ ggml/src/ggml-cuda/norm.cu      | 52 ++++++++++++++++++++++-------
+ 5 files changed, 149 insertions(+), 17 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/dsv4-hc.cu b/ggml/src/ggml-cuda/dsv4-hc.cu
+index ca1d2dc8a..2ca168c07 100644
+--- a/ggml/src/ggml-cuda/dsv4-hc.cu
++++ b/ggml/src/ggml-cuda/dsv4-hc.cu
+@@ -1,5 +1,6 @@
+ #include "common.cuh"
+ #include "dsv4-hc.cuh"
++#include "mmb.cuh"
+ 
+ 
+ static constexpr int DSV4_HC = 4;
+@@ -100,7 +101,7 @@ static __global__ void dsv4_hc_comb_f32(
+     }
+ }
+ 
+-template <bool gated>
++template <bool gated, bool wbf16>
+ static __global__ void dsv4_hc_pre_f32(
+         const float * x,
+         const float * weights,
+@@ -135,7 +136,18 @@ static __global__ void dsv4_hc_pre_f32(
+         const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
+         float wv;
+         if constexpr (gated) {
+-            wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
++            float wr;
++            if constexpr (wbf16) {
++                // the producer (MMB dense) wrote the gate into its pinned BF16 slot; expand the
++                // bf16 back to f32 exactly (round-to-nearest-even on the way in, so this reproduces
++                // the value the producer rounded to -- a numerics change vs the F32 chain, approved
++                // as a prefill re-baseline).
++                const uint16_t h = ((const uint16_t *) weights)[i0*sw0 + ih*sw1 + it*sw2];
++                wr = __uint_as_float(((uint32_t) h) << 16);
++            } else {
++                wr = weights[i0*sw0 + ih*sw1 + it*sw2];
++            }
++            wv = 1.0f / (1.0f + expf(-wr));
+         } else {
+             wv = weights[ih*sw0 + it*sw1];
+         }
+@@ -256,15 +268,24 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+     const float scale = ggml_get_op_params_f32(dst, 0);
+     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
+ 
++    // If the graph marked the gate producer BF16-only, the MMB dense kernel wrote the gate into its
++    // pinned BF16 slot; read that copy instead of the (not-written) F32 tensor.  The lookup is null
++    // when no BF16 copy exists (MMB off, producer not taken, or threshold not met), so the F32 path
++    // runs and the result is bit-identical to before.
++    const ggml_tensor * w_root = weights->view_src ? weights->view_src : weights;
++    const uint16_t * w16 = (gated && ggml_cuda_mmb_is_bf16_only(w_root)) ? ggml_cuda_mmb_cache_lookup(w_root) : nullptr;
++
+     const int block_size = 256;
+     const int64_t nr = n_embd * n_tokens;
+     const dim3 block_dims(block_size, 1, 1);
+     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+ 
+-    auto kernel = gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
++    auto kernel = gated ? (w16 ? dsv4_hc_pre_f32<true, true> : dsv4_hc_pre_f32<true, false>)
++                        : dsv4_hc_pre_f32<false, false>;
++    const float * wptr = w16 ? (const float *) w16 : (const float *) weights->data;
+     ggml_cuda_kernel_launch(kernel, launch_params,
+-            (const float *) x->data, (const float *) weights->data, (float *) dst->data,
++            (const float *) x->data, wptr, (float *) dst->data,
+             n_embd, hc, n_tokens,
+             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
+             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 230d9fb68..e67e99c3f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6081,6 +6081,9 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+ }
+ #endif // USE_CUDA_GRAPH
+ 
++static bool         g_mmb_marks_after_compute = true;
++static const void * g_mmb_marks_first_split   = nullptr;
++
+ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+@@ -6154,6 +6157,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+ 
++    // BF16-only marks live for the whole scheduled graph (all splits) and are cleared by the first
++    // optimize pass after this compute (see ggml_backend_cuda_graph_optimize).
++    g_mmb_marks_after_compute = true;
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+@@ -6185,6 +6191,59 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
++    // BF16-only mark lifetime: clear on the first optimize after a compute, or when the first split
++    // of a new graph is seen (the scheduler optimizes every split of one graph before computing any
++    // of them, so marks set below must survive the remaining splits' optimize calls).
++    {   const void * key = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
++        if (g_mmb_marks_after_compute || g_mmb_marks_first_split == nullptr || key == g_mmb_marks_first_split) {
++            ggml_cuda_mmb_marks_clear(); g_mmb_marks_first_split = key; g_mmb_marks_after_compute = false;
++        }
++    }
++
++    // MMB HC16 (step 1 of the bf16-producer port): mark the gate producer of a gated DSV4_HC_PRE as
++    // BF16-only when MMB will produce it and every consumer reads the BF16 copy.  The gate is a
++    // dense MUL_MAT [320 x 10240] whose only consumer is the fused pre op, so this is the contained
++    // first win.  STRUCTURE ONLY: inside graph_optimize the data pointers are not assigned yet, so
++    // the check must not look at alias/buffer state.  LLAMA_MMB_HC16>=1 (== GGML_CUDA_MMB_HC16).
++    {
++        static const int hc16 = getenv("GGML_CUDA_MMB_HC16") ? atoi(getenv("GGML_CUDA_MMB_HC16")) : 0;
++        if (hc16 >= 1 && ggml_cuda_mmb_active() &&
++                GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
++            auto reads = [](const ggml_tensor * t, const ggml_tensor * x) {
++                for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (t->src[s] == x || t->src[s]->view_src == x) return true;
++                return false;
++            };
++            for (int i = 0; i < cgraph->n_nodes; ++i) {
++                const ggml_tensor * pre = cgraph->nodes[i];
++                if (pre->op != GGML_OP_DSV4_HC_PRE || pre->src[1] == nullptr) continue;
++                if (ggml_get_op_params_i32(pre, 1) == 0) continue;   // un-gated pre has no sigmoid gate
++                const ggml_tensor * gr = pre->src[1]->view_src ? pre->src[1]->view_src : pre->src[1];
++                if (gr->op != GGML_OP_MUL_MAT) continue;
++                // the gate weight is [K=320, M=10240]; gr itself is [M=10240, T]
++                if (gr->src[0]->ne[0] != 320 || gr->src[0]->ne[1] != 10240) continue;
++                if (ggml_nrows(gr) < 512) continue;
++                if (!ggml_cuda_mmb_supported_mm(gr->src[0], gr->src[1], gr)) continue;
++                int gi = -1;
++                for (int k = 0; k <= i; ++k) if (cgraph->nodes[k] == gr) { gi = k; break; }
++                if (gi < 0) continue;   // producer not in this split -- cannot guarantee the BF16 copy
++                bool ok = true; int nread = 0;
++                for (int n = gi + 1; n < cgraph->n_nodes && ok; ++n) {
++                    const ggml_tensor * t = cgraph->nodes[n];
++                    if (!reads(t, gr)) continue;
++                    ++nread;
++                    if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
++                    if (t == pre) continue;
++                    ok = false;
++                }
++                if (ok && nread > 0) {
++                    ggml_cuda_mmb_mark_bf16_only(gr);
++                    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_HC16 gate marked BF16-only: %s (M=%d K=%d T=%d)\n",
++                            gr->name, (int) gr->ne[1], (int) gr->ne[0], (int) (gr->ne[2] * gr->ne[3]));
++                }
++            }
++        }
++    }
++
+     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+     if (!disable_fusion) {
+         for (int i = 0; i < cgraph->n_nodes; ++i) {
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 31ea573f1..eb31df529 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -1140,6 +1140,22 @@ void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); }
+ size_t ggml_cuda_mmb_marks_count() { return g_mmb_bf16_only.size(); }
+ void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) { g_mmb_bf16_only.insert(t); }
+ bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return g_mmb_bf16_only.count(t) > 0; }
++
++// HC16 producer step 2: the fused rms_norm+mul of the HC normalized stream (a broadcast
++// [n_embd, hc] gamma over a 3D [n_embd, hc, nt] activation) may emit a BF16 copy of its output
++// into slot 0 in ADDITION to the F32 output.  The following MMB dense GEMM (the hc down
++// projection) then reads that copy instead of running its own mmb_cvt pass.  The BF16 value is
++// rounded exactly as mmb_cvt_f32_bf16 would, so the GEMM result is bit-identical.
++bool ggml_cuda_mmb_hc16_copy_ok(const ggml_tensor * mul_tensor, const ggml_tensor * mul_src) {
++    if (!mmb_enabled() || !mmb_hc16()) return false;
++    if (!mul_tensor || !mul_src) return false;
++    if (mul_tensor->type != GGML_TYPE_F32 || mul_src->type != GGML_TYPE_F32) return false;
++    if (mul_tensor->ne[0] != mul_src->ne[0]) return false;                                                                // [n_embd]
++    if (mul_src->ne[1] != mul_tensor->ne[1] || mul_src->ne[2] != 1 || mul_src->ne[3] != 1) return false;                  // broadcast [n_embd, hc]
++    if (mul_tensor->ne[1] <= 1 || mul_tensor->ne[2] <= 1 || mul_tensor->ne[3] != 1) return false;                          // 3D [n_embd, hc, nt]
++    if (mul_tensor->ne[2] < mmb_min_t()) return false;   // the GEMM's T = nt must reach the MMB prefill gate
++    return true;
++}
+ void ggml_cuda_mmb_begin_graph() { for (auto & e : g_mmb_cache) delete e.buf; g_mmb_cache.clear(); for (auto & e : g_mmb_slots) { e.root = nullptr; e.data = nullptr; e.n = 0; } }
+ void ggml_cuda_mmb_release_all() {
+     ggml_cuda_mmb_begin_graph();
+@@ -1246,7 +1262,12 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     const uint16_t * shadow_pre = ((src0->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || src0->type == GGML_TYPE_Q6_K) ? mmb_shadow_lookup(src0) : nullptr;
+     static const int tile_ov = getenv("GGML_CUDA_MMB_TILE") ? atoi(getenv("GGML_CUDA_MMB_TILE")) : -1;
+     const bool big = tile_ov >= 0 ? (tile_ov != 0) : ((M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096));
+-    uint16_t * Dh = (mmb_hc16() && K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
++    // HC gate (K=320, M=10240).  "producer slots ... 1 = HC gate" -- when the graph marks this
++    // output BF16-only, the gate is written ONCE into the pinned slot 1 and the dsv4_hc_pre
++    // consumer reads that BF16 copy instead of round-tripping the F32 tensor.  The mark alone is
++    // enough to allocate the slot; mmb_hc16() keeps the historical "always allocate" behaviour
++    // for A/B (with an F32 store left in place because the mark is what suppresses it).
++    uint16_t * Dh = ((mmb_hc16() || ggml_cuda_mmb_is_bf16_only(dst)) && K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
+     bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(dst));
+     if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0) {
+         Dh = (uint16_t *) dst->data; store_f32 = false;
+diff --git a/ggml/src/ggml-cuda/mmb.cuh b/ggml/src/ggml-cuda/mmb.cuh
+index 270cb0fc4..1e4a44f01 100644
+--- a/ggml/src/ggml-cuda/mmb.cuh
++++ b/ggml/src/ggml-cuda/mmb.cuh
+@@ -16,6 +16,9 @@ void ggml_cuda_mmb_marks_clear();
+ size_t ggml_cuda_mmb_marks_count();
+ void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t);
+ bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t);
++// HC16 producer step 2: true when the fused rms_norm+mul output is the HC normalized stream and a
++// BF16 copy should be emitted into slot 0 (see mmb.cu).
++bool ggml_cuda_mmb_hc16_copy_ok(const ggml_tensor * mul_tensor, const ggml_tensor * mul_src);
+ bool ggml_cuda_mmb_gatemix();
+ bool ggml_cuda_mmb_active();
+ // True iff MMB will actually take a dense MUL_MAT / a routed MUL_MAT_ID or its SWIGLU pair for this
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 4bf198077..ccd90ca0b 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -1,6 +1,15 @@
+ #include "norm.cuh"
++#include "mmb.cuh"
+ #include <cstdint>
+ 
++// RNE f32 -> bf16, bit-identical to mmb.cu's mmb_f2bf (used to emit the HC normalized stream's
++// BF16 copy from the producer so the following MMB GEMM can skip its own conversion pass).
++static __device__ __forceinline__ uint16_t norm_f2bf(float f) {
++    uint32_t u = __float_as_uint(f);
++    u += 0x7fffu + ((u >> 16) & 1u);
++    return (uint16_t)(u >> 16);
++}
++
+ template <int block_size>
+ static __global__ void norm_f32(
+         const float * x, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
+@@ -96,7 +105,8 @@ static __global__ void rms_norm_f32(const float * x,
+                                     const uint3   add_ncols_packed     = make_uint3(0, 0, 0),
+                                     const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
+                                     const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
+-                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0)) {
++                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
++                                    uint16_t *    dst16                = nullptr) {
+     ggml_cuda_pdl_lc();
+     const int nrows     = gridDim.x;
+     const int nchannels = gridDim.y;
+@@ -110,6 +120,9 @@ static __global__ void rms_norm_f32(const float * x,
+ 
+     x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+     dst += ((sample*nchannels + channel)*nrows + row)*ncols;
++    if (dst16 != nullptr) {
++        dst16 += ((sample*nchannels + channel)*nrows + row)*ncols;
++    }
+ 
+     if constexpr (do_multiply) {
+         const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+@@ -141,15 +154,20 @@ static __global__ void rms_norm_f32(const float * x,
+     const float scale = rsqrtf(mean + eps);
+ 
+     for (int col = tid; col < ncols; col += block_size) {
++        float v;
+         if constexpr (do_multiply && do_add) {
+             const int mul_col = fastmodulo(col, mul_ncols_packed);
+             const int add_col = fastmodulo(col, add_ncols_packed);
+-            dst[col]          = scale * x[col] * mul[mul_col] + add[add_col];
++            v = scale * x[col] * mul[mul_col] + add[add_col];
+         } else if constexpr (do_multiply) {
+             const int mul_col = fastmodulo(col, mul_ncols_packed);
+-            dst[col]          = scale * x[col] * mul[mul_col];
++            v = scale * x[col] * mul[mul_col];
+         } else {
+-            dst[col] = scale * x[col];
++            v = scale * x[col];
++        }
++        dst[col] = v;
++        if (dst16 != nullptr) {
++            dst16[col] = norm_f2bf(v);
+         }
+     }
+ }
+@@ -312,14 +330,14 @@ static void rms_norm_f32_cuda(
+             x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+         // underlying cudaLaunchKernelEx does not support default params
+         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+-        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), nullptr);
+     } else {
+         const dim3 block_dims(1024, 1, 1);
+         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+         ggml_cuda_kernel_launch(rms_norm_f32<1024, false>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+         // underlying cudaLaunchKernelEx does not support default params
+         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+-        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), nullptr);
+     }
+ }
+ 
+@@ -349,7 +367,8 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+                                   const uint32_t add_nchannels,
+                                   const uint32_t add_nsamples,
+                                   const float    eps,
+-                                  cudaStream_t   stream) {
++                                  cudaStream_t   stream,
++                                  uint16_t *     dst16 = nullptr) {
+     const dim3 blocks_num(nrows, nchannels, nsamples);
+     if (mul == nullptr) {
+         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
+@@ -367,7 +386,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                 // underlying cudaLaunchKernelEx does not support default params
+-            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), dst16);
+         } else {
+             const dim3 block_dims(1024, 1, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+@@ -375,7 +394,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                 // underlying cudaLaunchKernelEx does not support default params
+-            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), dst16);
+         }
+     } else {
+         const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+@@ -394,7 +413,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+-                add_nchannels_packed, add_nsamples_packed);
++                add_nchannels_packed, add_nsamples_packed, nullptr);
+         } else {
+             const dim3 block_dims(1024, 1, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+@@ -402,7 +421,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+-                add_nchannels_packed, add_nsamples_packed);
++                add_nchannels_packed, add_nsamples_packed, nullptr);
+         }
+     }
+ }
+@@ -742,6 +761,15 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+     GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
+     GGML_ASSERT(eps >= 0.0f);
+ 
++    // HC16: when the fused norm is the HC normalized stream (a broadcast [n_embd, hc] gamma over a
++    // 3D [n_embd, hc, nt] activation) also emit the BF16 copy the following MMB dense GEMM will
++    // read, so that GEMM skips its own mmb_cvt pass.  The BF16 value is RNE-rounded exactly as
++    // mmb_cvt_f32_bf16 would, so the GEMM's arithmetic (and the whole output) is bit-identical.
++    uint16_t * dst16 = nullptr;
++    if (ggml_cuda_mmb_hc16_copy_ok(mul_tensor, mul_src)) {
++        dst16 = ggml_cuda_mmb_slot_reserve(ctx, 0, mul_tensor, (size_t) ggml_nelements(mul_tensor));
++    }
++
+     const int64_t ne00 = rms_norm_src->ne[0];
+     const int64_t ne01 = rms_norm_src->ne[1];
+     const int64_t ne02 = rms_norm_src->ne[2];
+@@ -771,7 +799,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+                           mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                           /*add_s00*/ 0, 0, 0,
+                           0, 0, 0, 0,
+-                          eps, stream);
++                          eps, stream, dst16);
+ }
+ 
+ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+-- 
+2.55.0
+
