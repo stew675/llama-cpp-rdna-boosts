@@ -323,6 +323,8 @@ unilaterally** -- needs a beta window / go-ahead.
   the model-tensor `ple_embd`).
 * The `dsv4_hc_pre` "kernel-local residual" as a *tiling/ILP* problem (session 13: it is L2/MALL
   pollution; non-temporal hints are the fix, vec4/vec8 are worse in situ).
+* The `rms_norm_f32` second `x` read as a DRAM re-read (session 20: register-caching the per-thread
+  `x` is a **wash** -- `<1024>` -1.2 %, `<256>` +3.0 %, net +0.2 %; the read is cache-resident).
 
 ---
 
@@ -381,9 +383,9 @@ unilaterally** -- needs a beta window / go-ahead.
 | backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0032` + `commits.txt`, in this repo, pushed to `origin/wip-mmb-general` |
 | verify | `git am` of `patches/` on a fresh `8a2567e1e` — clean (32 commits, applied tree `fffc201e5bbfab8e9fef13bfd0d73936e662236c` == tip) |
 | build | §3 | run | §4 |
-| current numbers | the **session 19 UPDATE below** (indexer pass-1 per-block histogram atomics) -- indexer family pp8192 **71.7 ms** / pp32768 **1146.6 ms** -- plus the **session 18 UPDATE** (the block-level histogram + `blk_cells` src), the **session 15 UPDATE** (qsa3 compile-time gate + the rocprofiler-register profiling caveat), the **session 14/13 UPDATEs** (non-temporal) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
+| current numbers | the **session 20 UPDATE below** (the `rms_norm` register-cache **refutation** -- the session-19 tip `2da50418d` is unchanged) and the **session 19 UPDATE** (indexer pass-1 per-block histogram atomics + the block-pass warp reduction) -- indexer family pp8192 **71.7 ms** / pp32768 **1146.6 ms** -- plus the **session 18 UPDATE** (the block-level histogram + `blk_cells` src), the **session 15 UPDATE** (qsa3 compile-time gate + the rocprofiler-register profiling caveat), the **session 14/13 UPDATEs** (non-temporal) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
 
-**Historical ordering of the UPDATE sections:** 19 (newest, 2026-09-20, the indexer pass-1 per-block histogram atomics) → 18 (2026-09-20, the indexer block-level histogram path + the `blk_cells` op src) → 17 (2026-09-20, indexer block-key sharing) → 16 (2026-09-20, the indexer count-pass elimination + the "compact after pass 1" refutation) → 15 (2026-09-20, the qsa3 compile-time gate + the rocprofiler-register profiling caveat) → 14 (2026-09-20, the non-temporal load sweep: concat/moe/unary) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
+**Historical ordering of the UPDATE sections:** 20 (newest, 2026-09-20, the `rms_norm` register-cache refutation) → 19 (2026-09-20, the indexer pass-1 per-block histogram atomics + the block-pass warp reduction) → 18 (2026-09-20, the indexer block-level histogram path + the `blk_cells` op src) → 17 (2026-09-20, indexer block-key sharing) → 16 (2026-09-20, the indexer count-pass elimination + the "compact after pass 1" refutation) → 15 (2026-09-20, the qsa3 compile-time gate + the rocprofiler-register profiling caveat) → 14 (2026-09-20, the non-temporal load sweep: concat/moe/unary) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body and are correct except where
 an UPDATE says otherwise.
@@ -391,6 +393,43 @@ an UPDATE says otherwise.
 **Next work:** see the **"FOR THE NEXT SESSION"** brief at the very top of this file — its ordered
 list is the authoritative one, and the historical "next-work order" lists inside the UPDATE sections
 below are superseded.
+
+---
+
+## UPDATE — session 20 (2026-09-20): the `rms_norm` register-cache experiment is REFUTED (a wash);
+## the second `x` read is cache-resident
+
+Scope: the largest non-MMB kernel, `rms_norm_f32<1024, true, false>` (the HC normalized stream `xn`,
+**538 ms / 3.5 %** of pp8192), reads `x` twice -- once for the sum of squares, once for the output --
+and the session-19 note had listed it as the one moderate non-MMB candidate (its dismissal in item B
+was only about *non-temporal* loads, which would evict the second read).  The hypothesis was that the
+second read is a DRAM re-read, so caching this thread's `x` values in registers across the block
+reduction should cut it.
+
+**Implementation.** A new `int NX` template parameter on `rms_norm_f32`; the first loop stashes each
+thread's `x` into `float xr[NX]` and the second reads it from registers.  The index **must** be
+compile-time: a dynamically indexed local array spills to local memory, so the loop is written as
+`#pragma unroll for (k = 0; k < NX; ++k) { col = tid + k*block_size; if (col < ncols) ... }` and the
+launcher selects `NX = 4` only when `ncols <= block_size*NX` (4 covers `<256>` always, and `<1024>` up
+to ncols 4096 -- 2560 here).
+
+**Measured (gfx1151, bf16 KV, ub 2048, rocprofv3 kernel trace, pp8192):**
+
+| kernel | baseline (s19) | register-cache |
+|---|---:|---:|
+| `rms_norm_f32<1024,true,false>` | 538.4 ms | 531.7 ms (−1.2 %) |
+| `rms_norm_f32<256,true,false>` | 278.9 ms | 287.1 ms (+3.0 %) |
+| combined | 817.3 ms | 818.9 ms (+0.2 %) |
+| grand total | 15408 ms | 15439 ms |
+
+**Verdict: revert.**  The second `x` read is already cache-resident, so the kernel is not DRAM-bound
+at all; the `<1024>` gain is inside run noise, and the `<256>` case *loses* because the unrolled
+predicated loop always runs `NX` iterations while the dynamic loop ran only `ceil(ncols/block_size)`
+(2-3).  This closes the `x`-re-read line for good: `rms_norm_f32` is latency/occupancy-bound on its
+block reduction, not on the second read.  **Do not retry** (a shape-exact `NX` dispatch -- 2/3/4 --
+could recover the `<256>` loss, but the ceiling is a noise-level ~1 % of one 3.5 % kernel).
+
+The tree is back at the session-19 tip `2da50418d`; no record/backup change beyond this note.
 
 ---
 

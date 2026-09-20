@@ -138,6 +138,22 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 20 (2026-09-20): the `rms_norm` register-cache experiment is **refuted** (a wash)
+
+The largest non-MMB kernel, `rms_norm_f32<1024, true, false>` (the HC `xn` stream, 538 ms / 3.5 % at
+pp8192), reads `x` twice.  The hypothesis: the second read is a DRAM re-read, so caching each thread's
+`x` in registers across the block reduction should cut it.  Implemented (`int NX` template param; the
+index must be compile-time or the array spills, so the loop is unrolled `for k in 0..NX` with a
+`col < ncols` guard, and the launcher picks `NX = 4` only when `ncols <= block_size*NX`).
+
+Measured: `<1024,true,false>` 538.4 → **531.7 ms** (−1.2 %, noise), `<256,true,false>` 278.9 →
+**287.1 ms** (+3.0 %), combined **+0.2 %**.  **Reverted.**  The second `x` read is cache-resident, so
+the kernel is not DRAM-bound; the `<256>` loss is the unrolled predicated loop always running `NX`
+iterations vs the dynamic loop's `ceil(ncols/block_size)`.  Do not retry (a shape-exact 2/3/4 dispatch
+could recover the loss, but the ceiling is ~1 % of one 3.5 % kernel).  The tree stays at `2da50418d`.
+
+---
+
 ## UPDATE — session 19 (2026-09-20): indexer histogram atomics per cell → per block (pass 1) and
 ## per thread → per warp (block passes) (**family −16 % 8K / −7 % 32K** vs s18), bit-identically
 
