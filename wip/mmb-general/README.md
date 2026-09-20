@@ -163,9 +163,9 @@ membership mask), `qsa3_attn_kernel` (16x16x16 F16 WMMA, mask folded into the sc
 
 | KV type | pp4096 off -> on | pp8192 off -> on |
 |---|---:|---:|
-| f16 | 855.5 -> 870.5 (+1.8 %) | 819.4 -> 861.7 (+5.2 %) |
-| bf16 | 836.9 -> **874.8 (+4.5 %)** | 791.2 -> **854.5 (+8.0 %)** |
-| q8_0 | 817.5 -> **872.9 (+6.8 %)** | 780.5 -> **856.6 (+9.8 %)** |
+| f16 | 855.8 -> 893.8 (+4.4 %) | 816.0 -> 882.2 (+8.1 %) |
+| bf16 | 834.2 -> **899.8 (+7.9 %)** | 791.9 -> **884.3 (+11.7 %)** |
+| q8_0 | 827.1 -> **896.4 (+8.4 %)** | 784.6 -> **873.5 (+11.3 %)** |
 
 All three converge at depth - the kernel reads the same F16 packs, so the KV type no longer matters
 for the attention arithmetic.
@@ -186,10 +186,13 @@ All within +/-0.002 (the run's own error bar is +/-0.027).  Greedy text is coher
 
 | kernel | VEC | qsa3 |
 |---|---:|---:|
-| attention | 2944.4 ms (`flash_attn_qsa`) | **682.3 ms** (`qsa3_attn_kernel`) |
-| rows / sortedness | - | 441.0 ms (`qsa3_rows_kernel`) |
-| merge / union | - | 28.6 ms (`qsa3_merge_kernel`) |
-| **total** | **2944.4 ms** | **1151.9 ms (2.56x)** |
+| attention | 2944.4 ms (`flash_attn_qsa`) | **674.9 ms** (`qsa3_attn_kernel`) |
+| rows / sortedness | - | 25.5 ms (`qsa3_rows_kernel`) |
+| merge / union | - | 28.2 ms (`qsa3_merge_kernel`) |
+| **total** | **2944.4 ms** | **728.6 ms (4.04x)** |
+
+The rows figure is after the 2026-09-19 bitmap-sort rewrite below (it was 441.0 ms and the qsa3
+total 1151.9 ms / 2.56x before it).
 
 ### Two findings worth not re-deriving
 
@@ -199,25 +202,38 @@ All within +/-0.002 (the run's own error bar is +/-0.027).  Greedy text is coher
   startup region is a **pessimization** (pp2048 912.5 -> 903.2; pp8192 862.5 -> 856.9), so the
   shortcut stays.  **Consequence: qsa3 only engages at n_kv > 2051**, so a `-c 2048` PPL test proves
   nothing about it (it takes the dense arm silently).
-* **The top-k rows are UNSORTED**, so `qsa3_rows_kernel`'s rank-sort is on the critical path and is
-  the single largest remaining qsa3 cost (441 ms of 1152 ms).  Proven by disabling the sort: the
-  rows kernel drops 441 -> **8 ms** but the attn kernel explodes 682 -> **19593 ms** and throughput
-  collapses 866 -> 474 t/s (unsorted rows break the merge kernel's binary searches).  So the sort is
-  necessary and **the PPL parity above did exercise and validate it**.
+* **The top-k rows are UNSORTED**, so `qsa3_rows_kernel` must sort them.  Proven by disabling the
+  sort: the rows kernel drops 441 -> **8 ms** but the attn kernel explodes 682 -> **19593 ms** and
+  throughput collapses 866 -> 474 t/s (unsorted rows break the merge kernel's binary searches).  So
+  the sort is required and **the PPL parity above did exercise and validate it**.
 
-### Next qsa3 optimization (deferred)
+### `qsa3_rows_kernel` sort rewrite - DONE (2026-09-19)
 
-Make the sortedness path cheaper - either emit sorted rows from the indexer (`ggml_indexer_top_k`;
-but the `idx` order is shared with the VEC decode path, so a re-order there is a decode numerics
-change and must not be done casually), or replace the O(ns^2) rank-sort with a block-aware sort
-(the selection is by whole 4-key blocks, so sorting the ~ns/4 block ids and expanding is ~16x less
-work).  Target: ~441 ms -> ~30 ms, worth ~4 % of prefill.
+The rank sort was O(ns^2) and dominated qsa3 (441 ms of 1152 ms).  It is now a **bitmap counting
+sort**: the row is a *set* of cell ids, so a `nk`-bit presence bitmap + a popcount scan enumerates
+it in ascending order - **exactly the order the rank sort produced** - for O(ns + nk/32) per row.
+
+Get the data first: an early assumption that the row is a set of whole 4-key blocks was **wrong**.
+The real rows (dumped from a live run) are a handful of **long contiguous runs** - row0 is one run of
+2051 keys, row2 is runs of 436/1611/4, i.e. 1-6 runs per row - so the bitmap is dense and the
+popcount scan is cheap.  (This also explains why the row looks like "whole 4-key blocks" to an
+aligned-group scan: a long run of consecutive keys has `ent[i] == ent[i-1]+1` everywhere.)
+
+Implementation notes: the `nk`-bit bitmap plus 256 per-lane scan offsets share the rows kernel's
+dynamic smem after the key array (48 KiB budget, i.e. `nk` up to ~1.5M); the kernel takes
+`bitmap_words` and **falls back to the original rank sort when it is 0** (too large a cache).
+Sentinels are appended after every valid key, matching the rank sort's placement.
+
+**Result: rows 441.0 -> 25.5 ms (17x); qsa3 total 1151.9 -> 728.6 ms (4.04x vs VEC).**  PPL is
+**bit-identical** to the pre-rewrite build (c16384 3.3900, c32768 4.3353, q8_0 3.3879) - the sort is
+order-exact, not merely equivalent.
 
 ### Where the time goes now
 
 With qsa3 on, the pp8192 profile is led by **`mmb_*` kernels** (`mmb_f32split_kernel` 2164 ms,
 `mmb_routed_glu_kernel` 2085 + 1626 ms, `mmb_dense_kernel` 1904 + 1606 ms, `mmb_cvt_f32_bf16`
-648 ms) - QSA is no longer the #1 kernel.  The MMB follow-ups (SS 7-9) are now the bigger lever.
+648 ms) - QSA is now **728.6 ms (4th-ish)** and no longer the #1 kernel.  The MMB follow-ups
+(SS 7-9) are the bigger lever.
 
 ## Gates before this could be opt-in, let alone defaulted on (from the parked handover)
 

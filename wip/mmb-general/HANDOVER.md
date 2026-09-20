@@ -7,9 +7,36 @@ then `README.md` (the running record) beside it.
 > **One-line summary.** A general prefill weight-GEMM on the tensor cores (dequant-to-bf16 → WMMA)
 > is now implemented for **every** weight type the delivery's models use, validated PPL-parity, and
 > measured at up to **+68 % pp2048 / +56 % pp8192** on the Flash-Next Q4_K_M.  **QSA v3 (packed-block
-> WMMA sparse attention) was then delivered in session 2**: the QSA attention kernel went **2944 ms ->
-> 1152 ms (2.56x)** and prefill +5-10 % on every KV type, PPL-parity.  The next levers are the
-> `qsa3_rows_kernel` sort (441 ms) and the now-dominant `mmb_*` kernels.
+> WMMA sparse attention) was then delivered in session 2/3**: the QSA attention went **2944 ms ->
+> 728.6 ms (4.04x)** and prefill is now **+8-12 %** on every KV type, PPL bit-identical.  The next
+> levers are the now-dominant `mmb_*` kernels.
+
+---
+
+## UPDATE — session 3 (2026-09-19): the qsa3 sort is done too
+
+The `qsa3_rows_kernel` sort (session 2's remaining item, 441 ms of the 1152 ms qsa3 total) was
+rewritten as a **bitmap counting sort**: `O(ns + nk/32)` instead of `O(ns^2)`, **order-exact** (PPL
+bit-identical).  **Rows 441.0 -> 25.5 ms; qsa3 total 1151.9 -> 728.6 ms (4.04x vs the VEC kernel).**
+
+Two facts from getting there, so session 4 does not repeat the detour:
+
+1. **The index rows are NOT sets of 4-key blocks** (that was the natural guess from the source
+   comments) - they are a handful of **long contiguous runs** (row0 = one run of 2051 keys, row2 =
+   runs of 436/1611/4; 1-6 runs per row).  A block/group-based sort would have been *wrong*.  Always
+   dump the real data before choosing the algorithm (`GGML_CUDA_QSA3_DUMP` was removed again; the
+   procedure is in `README.md`).
+2. A host-side `cudaMemcpy` of op data **must be ordered on `ctx.stream()`**, not the default stream,
+   or it reads the tensor before the producing kernel has run.  The first dump was garbage for
+   exactly this reason.
+
+**Revised next-work order** (after session 3):
+
+1. The `mmb_*` kernels lead the profile (`mmb_f32split` 2164 ms, `mmb_routed_glu` 2085+1626,
+   `mmb_dense` 1904+1606, `mmb_cvt_f32_bf16` 648) - see §9/§10 for the Q8_0 IU8 and bf16-producer ideas.
+2. QSA v3 for **gfx1200/gfx1100** (needs an RDNA4/RDNA3_0 WMMA variant; the wrapper is currently a
+   deliberate no-op there, so only the VEC path runs).
+3. `qsa3_attn_kernel` itself (674.9 ms, now 93 % of qsa3) - the remaining qsa3 cost.
 
 ---
 
@@ -43,11 +70,11 @@ Three things session 3 must not re-derive - full detail in `README.md`:
    through F32 - the backend `dup` cannot permute a quantized tensor and only dequantizes to F32
    (otherwise: `ggml/src/ggml-cpu/ops.cpp:578` abort, once per QSA layer).
 
-**Revised next-work order** (after session 2):
+**Revised next-work order** (was: after session 2; superseded by the session-3 "UPDATE" above)
 
-1. `qsa3_rows_kernel` sort: 441 ms of the 1152 ms qsa3 total (~4 % of prefill).  A block-aware sort
-   (sort the ~ns/4 block ids, then expand) is ~16x less work.  **Do not** reorder `idx` at the
-   indexer: that tensor is shared with the VEC decode path, so it would be a decode numerics change.
+1. ~~`qsa3_rows_kernel` sort~~ **DONE in session 3** - bitmap counting sort, 441 -> 25.5 ms.  See the
+   session-3 UPDATE at the top.  **Do not** reorder `idx` at the indexer: that tensor is shared with
+   the VEC decode path, so it would be a decode numerics change.
 2. The `mmb_*` kernels now lead the profile (`mmb_f32split` 2164 ms, `mmb_routed_glu` 2085+1626,
    `mmb_dense` 1904+1606, `mmb_cvt_f32_bf16` 648) - see §9/§10 for the Q8_0 IU8 and bf16-producer ideas.
 3. QSA v3 for **gfx1200/gfx1100** (needs an RDNA4/RDNA3_0 WMMA variant; the wrapper is currently a

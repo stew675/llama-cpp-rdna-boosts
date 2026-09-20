@@ -50,10 +50,10 @@ index d44d06be9..2fae29ceb 100644
 +bool ggml_cuda_flash_attn_qsa3_supported(int device, const ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/fattn-qsa3.cu b/ggml/src/ggml-cuda/fattn-qsa3.cu
 new file mode 100644
-index 000000000..79cb62eb1
+index 000000000..f8e348551
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/fattn-qsa3.cu
-@@ -0,0 +1,540 @@
+@@ -0,0 +1,591 @@
 +#include "common.cuh"
 +#include "fattn-qsa.cuh"
 +#include <cstdio>
@@ -106,9 +106,15 @@ index 000000000..79cb62eb1
 +// rank-sort it into srow[q] and set sflag[q]. Sentinel 0x7FFFFFFF for invalid (-1 / >= nk) entries.
 +#define QSA3_SENT 0x7FFFFFFF
 +__global__ __launch_bounds__(256) void qsa3_rows_kernel(
-+        const int * __restrict__ ids, const size_t i1, const int ns, const int nk, int * __restrict__ srow, int * __restrict__ sflag) {
-+    extern __shared__ int ent[];
++        const int * __restrict__ ids, const size_t i1, const int ns, const int nk, const int bitmap_words,
++        int * __restrict__ srow, int * __restrict__ sflag) {
++    extern __shared__ int ent[];   // [ns] normalized keys (the sortedness check and the fallback sort)
++    // Bitmap path (only when bitmap_words > 0, see the launcher): a nk-bit cell presence map plus the
++    // 256 per-lane scan offsets, carved out of the same dynamic smem right after ent.
++    uint32_t * bitmap = reinterpret_cast<uint32_t *>(ent + ns);
++    int      * ssum   = reinterpret_cast<int *>(bitmap + bitmap_words);
 +    __shared__ int unsorted;
++    __shared__ int nvalid;
 +    const int q = blockIdx.x, tid = threadIdx.x;
 +    const int * row = reinterpret_cast<const int *>(reinterpret_cast<const char *>(ids) + (size_t) q * i1);
 +    for (int j = tid; j < ns; j += 256) { const int key = row[j]; ent[j] = (key >= 0 && key < nk) ? key : QSA3_SENT; }
@@ -118,11 +124,47 @@ index 000000000..79cb62eb1
 +    __syncthreads();
 +    if (unsorted) {
 +        int * dst = srow + (size_t) q * ns;
-+        for (int j = tid; j < ns; j += 256) {
-+            const int e = ent[j];
-+            int rank = 0;
-+            for (int k = 0; k < ns; ++k) { const int f = ent[k]; rank += (f < e) || (f == e && k < j); }
-+            dst[rank] = e;
++        if (bitmap_words > 0) {
++            // The row is the indexer's top-k selection, i.e. a SET of cell ids, so a presence bitmap
++            // enumerates it in ascending order - exactly the order the rank sort produces - for
++            // O(ns + nk/32) per row instead of O(ns^2).  The rows are long contiguous runs of a few
++            // ranges, so the bitmap is also dense and the popcount scan is cheap.
++            for (int i = tid; i < bitmap_words; i += 256) { bitmap[i] = 0u; }
++            __syncthreads();
++            for (int j = tid; j < ns; j += 256) {
++                const int v = ent[j];
++                if (v >= 0 && v < nk) { atomicOr(&bitmap[v >> 5], 1u << (v & 31)); }
++            }
++            __syncthreads();
++            const int per = (bitmap_words + 255) / 256;
++            const int w0  = tid * per, w1 = min(w0 + per, bitmap_words);
++            int cnt = 0;
++            for (int w = w0; w < w1; ++w) { cnt += __popc(bitmap[w]); }
++            ssum[tid] = cnt;
++            __syncthreads();
++            if (tid == 0) {
++                int run = 0;
++                for (int i = 0; i < 256; ++i) { const int v = ssum[i]; ssum[i] = run; run += v; }
++                nvalid = run;
++            }
++            __syncthreads();
++            int o = ssum[tid];
++            for (int w = w0; w < w1; ++w) {
++                uint32_t m = bitmap[w];
++                while (m) { const int b = __ffs(m) - 1; m &= m - 1; dst[o++] = (w << 5) + b; }
++            }
++            __syncthreads();
++            // sentinels sort after every valid key (the merge kernel binary-searches for the first
++            // entry >= QSA3_SENT to get a row's valid count)
++            if (tid == 0) { for (int i = nvalid; i < ns; ++i) { dst[i] = QSA3_SENT; } }
++        } else {
++            // nk is too large for the bitmap budget: the plain cell-level rank sort
++            for (int j = tid; j < ns; j += 256) {
++                const int e = ent[j];
++                int rank = 0;
++                for (int k = 0; k < ns; ++k) { const int f = ent[k]; rank += (f < e) || (f == e && k < j); }
++                dst[rank] = e;
++            }
 +        }
 +    }
 +    if (tid == 0) { sflag[q] = unsorted; }
@@ -564,14 +606,23 @@ index 000000000..79cb62eb1
 +    const int ngroups = (n_q + QSA3_G - 1) / QSA3_G;
 +    const int cap     = (QSA3_G * ns + 3) & ~3;
 +
++
 +    ggml_cuda_pool_alloc<uint16_t> ublk(ctx.pool(), (size_t) ngroups * cap);
 +    ggml_cuda_pool_alloc<uint16_t> umask(ctx.pool(), (size_t) ngroups * cap);
 +    ggml_cuda_pool_alloc<int>      ucount(ctx.pool(), (size_t) ngroups);
 +    ggml_cuda_pool_alloc<int>      srow(ctx.pool(), (size_t) n_q * ns);
 +    ggml_cuda_pool_alloc<int>      sflag(ctx.pool(), (size_t) n_q);
 +    {
-+        const ggml_cuda_kernel_launch_params launch(dim3(n_q), dim3(256), (size_t) ns * sizeof(int), ctx.stream());
-+        ggml_cuda_kernel_launch(qsa3_rows_kernel, launch, (const int *) ids->data, ids->nb[1], ns, nk, srow.get(), sflag.get());
++        // rows-kernel dynamic smem: [ns] keys + the nk-bit presence bitmap + 256 scan offsets.
++        // When that does not fit the 48 KiB budget (a very long cache) the kernel falls back to the
++        // rank sort and only the key array is allocated.
++        const int    bitmap_words = (nk + 31) / 32;
++        const size_t rows_smem_bm = (size_t) ns * sizeof(int) + (size_t) bitmap_words * sizeof(uint32_t) + 256 * sizeof(int);
++        const bool   rows_bitmap  = rows_smem_bm <= 48 * 1024;
++        const size_t rows_smem    = rows_bitmap ? rows_smem_bm : (size_t) ns * sizeof(int);
++        const ggml_cuda_kernel_launch_params launch(dim3(n_q), dim3(256), rows_smem, ctx.stream());
++        ggml_cuda_kernel_launch(qsa3_rows_kernel, launch, (const int *) ids->data, ids->nb[1], ns, nk,
++                                rows_bitmap ? bitmap_words : 0, srow.get(), sflag.get());
 +        CUDA_CHECK(cudaGetLastError());
 +        const ggml_cuda_kernel_launch_params launch2(dim3(ngroups), dim3(QSA3_MERGE_LANES), (size_t) QSA3_G * ns * sizeof(int), ctx.stream());
 +        ggml_cuda_kernel_launch(qsa3_merge_kernel, launch2, (const int *) ids->data, ids->nb[1], n_q, ns, nk,
