@@ -15,11 +15,12 @@ remain as known-good records for those upstream versions.
 
 > **Current baseline marker:** `baseline/d1d3c3396` was the previous (2026-09-15)
 > delivery baseline.  The current one is **`ebbb18522`** (2026-09-17), the fork point of
-> release **`v16-ebbb18522-r4`** (canonical tip
-> `ba9e18cacfa3f97f13a822dded971eeb2cce2480`, tree
-> `b84b1783f7207e25600403df5a8e98c183b9f80a`; r4 = the 2026-09-18 block-04 RDNA3_0 tensor-split
-> `ncols2` fix for issue #30, on top of r3's 2026-09-18 block-01 `--fit` fix for `draft-mtp-adaptive`,
-> issue #38 — base `ebbb18522` unchanged from r2).  `baseline/790cf51aa` remains the
+> release **`v16-ebbb18522-r10`** (canonical tip
+> `385e0c77cbc34a01707b2efc25adb684c0dcbbc1`, tree
+> `9f9602e6e5751ca1e065b80ec3764fdfe6ca6eba`; r10 = the 2026-09-20 block-11 pre-fill token-count
+> fix + the HIP `hipGraphExecUpdate` leak guard, issue #41, on top of r9's block-15 V3 tile-kernel
+> derived mask, which sits on r8/r7 (block 15), r6 (FA build time), r5 (block-04 head cap) and r4
+> (block-04 RDNA3_0 tensor-split `ncols2`) — base `ebbb18522` unchanged from r2).  `baseline/790cf51aa` remains the
 > (2026-09-13) marker.  None of these is one of the historical pre-block-12
 > checkpoints listed below; those remain frozen records.
 

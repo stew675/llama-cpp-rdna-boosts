@@ -9,7 +9,7 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`ebbb18522`** (re-based 2026-09-17;
-release `v16-ebbb18522-r9`, the 2026-09-19 block-15 V3 derived-kq-mask tile-kernel implementation (the mask was MMA-only, so every head above the per-arch WMMA cap - the whole gemma4 head-512 family on gfx1100/gfx1151 - and anything forcing `GGML_CUDA_FA_WMMA_256=0` lost it; the tile arm is bit-identical to the packed mask across the 8 KV types on gfx1201 and 4 on each of gfx1151/gfx1100, is a deep-prefill win on the tile path, and costs decode nothing because the derived branch is hoisted out of the KV loop - decode/verify *always* take the tile kernel, and the first per-iteration form cost -0.5..-0.8 % `tg128` at depth) on top of r8, the 2026-09-19 V3 derived-mask disable-path diagnostic (superseded by r9: the resolve probe's note no longer claims MMA-only, since the head-cap/tile cause is gone) on top of r7, the 2026-09-19 block-15 V3 derived-kq-mask kernel-shape fix (issue #30: the derived mask loader now does two cells per thread step with a `half2` store and hoists `cell_pos` out of the query-row loop; gfx1100 @98k -3.47 -> -0.15 %, gfx1201 27B 2GPU layer @98k -5.96 -> -1.62 %, output bit-identical) on top of r6, the 2026-09-18 FA instance build-time fix (blocks 06/13/15: MMA per-head + tile per-KV-type split, head-512 source order, fused-gate MMQ instances moved out of `mmq.cu`; clean `ggml-hip -j16` 323 -> 236 s, no runtime change) on top of r5's block-04 gfx1100 WMMA-FA head cap back at 256 (issue #30) on
+release `v16-ebbb18522-r10`, the 2026-09-20 block-11 amendment (issue #41: the pre-fill test is now `ggml_cuda_graph_is_multi_token()`, not `nodes[0]->ne[1]`, so a split-MoE `-ncmoe` one-token decode split - which starts on an expert tensor `[n_ff, n_expert_used, 1]` - is no longer misread as multi-token and decode replays HIP graphs again: 0 -> 50 warmups / 0 -> 687 replays, `tg` 10.6 -> 12.8 t/s on Qwen3.8-Flash-Next UD-Q4_K_XL, output bit-identical; and `ggml_cuda_graph_update_executable()` destroys/re-instantiates the exec on HIP to avoid the ROCm <= 10.0 `hipGraphExecUpdate` leak, `GGML_HIP_GRAPH_FORCE_UPDATE=1` opt-out) on top of r9, the 2026-09-19 block-15 V3 derived-kq-mask tile-kernel implementation (the mask was MMA-only, so every head above the per-arch WMMA cap - the whole gemma4 head-512 family on gfx1100/gfx1151 - and anything forcing `GGML_CUDA_FA_WMMA_256=0` lost it; the tile arm is bit-identical to the packed mask across the 8 KV types on gfx1201 and 4 on each of gfx1151/gfx1100, is a deep-prefill win on the tile path, and costs decode nothing because the derived branch is hoisted out of the KV loop - decode/verify *always* take the tile kernel, and the first per-iteration form cost -0.5..-0.8 % `tg128` at depth) on top of r8, the 2026-09-19 V3 derived-mask disable-path diagnostic (superseded by r9: the resolve probe's note no longer claims MMA-only, since the head-cap/tile cause is gone) on top of r7, the 2026-09-19 block-15 V3 derived-kq-mask kernel-shape fix (issue #30: the derived mask loader now does two cells per thread step with a `half2` store and hoists `cell_pos` out of the query-row loop; gfx1100 @98k -3.47 -> -0.15 %, gfx1201 27B 2GPU layer @98k -5.96 -> -1.62 %, output bit-identical) on top of r6, the 2026-09-18 FA instance build-time fix (blocks 06/13/15: MMA per-head + tile per-KV-type split, head-512 source order, fused-gate MMQ instances moved out of `mmq.cu`; clean `ggml-hip -j16` 323 -> 236 s, no runtime change) on top of r5's block-04 gfx1100 WMMA-FA head cap back at 256 (issue #30) on
 top of r4's block-04 RDNA3_0 tensor-split `ncols2` fix and r3's block-01 `--fit` fix for `draft-mtp-adaptive` + a minimal MTP head, issue #38; previously `d1d3c3396`, re-based 2026-09-15 from
 `790cf51aa`, re-based 2026-09-13
 from `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself
@@ -53,7 +53,15 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   index-stable bitonic argsort tie-break), so the address-overlap guard that selects
   the fusion no longer changes the model output (TODO item 19; the
   `GGML_CUDA_DISABLE_TOPK_MOE_FUSION` A/B kill-switch is kept).  See the block-08 notes in `patches/README.md`
-  and `GREEDY-PURITY.md` §20/§31.
+  and `GREEDY-PURITY.md` §20/§31.  **Block 11 amended 2026-09-20 (r10, issue #41)**: the pre-fill test is now
+  `ggml_cuda_graph_is_multi_token()` rather than `nodes[0]->ne[1]` — with `-ncmoe` a one-token
+  decode split starts on an expert tensor `[n_ff, n_expert_used, 1]` whose `ne[1]` is
+  `n_expert_used` (10), so every split-MoE decode split was skipped as multi-token and decode never
+  replayed a HIP graph (0 -> 50 warmups / 0 -> 687 replays, `tg` 10.6 -> 12.8 t/s on
+  Qwen3.8-Flash-Next UD-Q4_K_XL, output bit-identical).  The amendment also destroys/re-instantiates
+  the HIP exec instead of updating it (`GGML_HIP_GRAPH_FORCE_UPDATE=1` opt-out), because
+  `hipGraphExecUpdate` leaks kernarg slots under ROCm <= 10.0 once decode recaptures regularly.  See
+  the 2026-09-20 block-11 amendment in `patches/README.md`.
 - Block **12** (`patches/0012-rdna-boosts-block-12-hybrid-HIP-all-reduce-RDNA4-gat.patch`): the hybrid HIP
   all-reduce (custom internal AR for the small-tensor decode path +
   per-size hybrid dispatch vs RCCL), **RDNA4-only** (gfx1200/gfx1201; falls
@@ -236,8 +244,10 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `ebbb18522` is a rebuild of the delivery set
-(tip `76b10f1fb8391562e30364d6c307e6606100bc57`, net tree
-  `cfb2f966448da2b02d24f88a3d30666660949b1f` = r9, the 2026-09-19 block-15 V3 derived-kq-mask
+(tip `385e0c77cbc34a01707b2efc25adb684c0dcbbc1`, net tree
+  `9f9602e6e5751ca1e065b80ec3764fdfe6ca6eba` = r10, the 2026-09-20 block-11 amendment (issue #41:
+the pre-fill test reads the real token count, and the HIP exec is re-instantiated instead of updated),
+on top of r9's 2026-09-19 block-15 V3 derived-kq-mask
 tile-kernel implementation (with r8's disable-path note reworded, since its head-cap/tile cause is gone),
   on top of r7, the block-15 V3 derived-mask kernel-shape fix, issue #30, on top of r6,
   the 2026-09-18 FA instance build-time fix

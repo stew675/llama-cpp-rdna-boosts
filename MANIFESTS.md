@@ -12,13 +12,19 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release (2026-09-19) — `v16-ebbb18522-r9`:** a block-15 amendment on top of r8 — the V3
+**Current release (2026-09-20) — `v16-ebbb18522-r10`:** a block-11 amendment (issue #41) on top of r9:
+the pre-fill test now reads the real token count (`ggml_cuda_graph_is_multi_token()`), so the leading
+expert tensor (`[n_ff, n_expert_used, 1]`) of a split-MoE `-ncmoe` one-token decode split no longer
+misclassifies it as pre-fill and decode replays HIP graphs again (0 -> 50 warmups / 0 -> 687 replays,
+`tg` 10.6 -> 12.8 t/s on Qwen3.8-Flash-Next UD-Q4_K_XL, output bit-identical); on HIP the exec is
+destroyed/re-instantiated instead of updated to avoid the ROCm <= 10.0 `hipGraphExecUpdate` leak
+(`GGML_HIP_GRAPH_FORCE_UPDATE=1` opt-out).  Canonical tip
+`385e0c77cbc34a01707b2efc25adb684c0dcbbc1`, tree `9f9602e6e5751ca1e065b80ec3764fdfe6ca6eba`, strict
+16/16.  **r9** was a block-15 amendment on top of r8 — the V3
 derived kq mask is now implemented in the **tile** FA kernel as well, so the head-cap configurations
 (gemma4 head 512 on gfx1100/gfx1151) that r8 could only *report* now get it, as a deep-prefill win with
 decode unchanged (the derived branch is hoisted out of the KV loop, because decode/verify always take
-the tile kernel).  Canonical tip
-`76b10f1fb8391562e30364d6c307e6606100bc57`, tree `cfb2f966448da2b02d24f88a3d30666660949b1f`, strict
-16/16.  Earlier releases on this base: **r8** made the derived-mask disable self-explanatory (block 15;
+the tile kernel).  Earlier releases on this base: **r8** made the derived-mask disable self-explanatory (block 15;
 superseded by r9's fix for the cause it named); **r7** fixed V3's derived-mask kernel shape (issue #30,
 block 15); **r6** the FA instance build-time fix (blocks 06/13/15; clean `ggml-hip -j16` 323 -> 236 s);
 **r5** the block-04 gfx1100 WMMA FA head cap (issue #30); **r4** the block-04 RDNA3_0 tensor-split

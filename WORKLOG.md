@@ -1,5 +1,48 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-20 (r10) — `v16-ebbb18522-r10`: block 11 classifies MoE decode splits correctly, so HIP graphs replay again
+
+**Release** `v16-ebbb18522-r10`, canonical tip `385e0c77cbc34a01707b2efc25adb684c0dcbbc1`, net tree
+`9f9602e6e5751ca1e065b80ec3764fdfe6ca6eba`.  Only **block 11** changed; blocks 00-10 are
+content-identical to r9 (patch bodies unchanged, `From <sha>`/`index` lines move with the rebuild),
+and blocks 12-15 are unchanged in content but carry new commit SHAs because they sit above block 11.
+
+**The bug (issue #41).**  Block 11's pre-fill test was `cgraph->nodes[0]->ne[1] > 1`.  With expert
+offload (`-ncmoe`) the scheduler splits the graph around the CPU-resident experts, so a **one-token**
+decode split routinely starts on an expert-path tensor `[n_ff, n_expert_used, 1]` and
+`ne[1] == n_expert_used` (10) even at one token.  Every MoE decode split was therefore classified as
+pre-fill, `use_cuda_graph` was forced false, and decode never captured, warmed up or replayed a HIP
+graph.  This is present in the delivery as shipped and needs no upstream expert-cache PR to trigger
+(the reporter's #27861 stash is incidental to it).
+
+**Reproduced and fixed on the reporter's exact model** (gfx1201, Qwen3.8-Flash-Next UD-Q4_K_XL,
+`-ngl 99 -ncmoe 48 -b 2048 -ub 2048 -c 8192 -ctk q8_0 -ctv q8_0`, one GPU): the r9 tree logged **0**
+`CUDA graph warmup complete` and **0** `CUDA Graph id … reused` events for the whole run; the amended
+block 11 logs **50** warmups and **687** replays in a 16-token decode and takes `tg` **10.6 -> 12.8
+t/s** (~+20 %; a second pair 10.3 -> 12.9).  Greedy output is byte-identical old vs new, pre-fill is
+unchanged, and a dense 4B run is unchanged (1 warmup / 22 replays, same `tg`, same text).  The r9
+observation that `GGML_CUDA_DISABLE_GRAPHS=1` made no difference to MoE decode was this bug.
+
+**The fix** (block 11 only, `ggml/src/ggml-cuda/ggml-cuda.cu`): a new
+`ggml_cuda_graph_is_multi_token()` reads the token count from the first op that actually carries it —
+`MUL_MAT_ID`'s `ne[2]` (`[n_out, n_expert_used, n_tokens]`), or a weight `MUL_MAT`'s `src1->ne[1]`
+(the result is `[src0->ne[1], src1->ne[1], …]`) — with the old `nodes[0]->ne[1]` test kept as the
+fallback for a split with no weight matmul.  The `MUL_MAT` arm requires a constant, unbatched weight
+(`src0` op `NONE`, `ne[2] == 1`) so it is not fooled by attention-score matmuls.
+
+**The leak guard that must travel with it.**  Once decode recaptures regularly, the existing
+`hipGraphExecUpdate` call leaks device memory on ROCm <= 10.0: the driver's `GraphKernelArgManager`
+bump-allocates a kernarg slot per update and only reclaims slots on `hipGraphExecDestroy`
+(ROCm/rocm-systems#10713; the driver fix, PR #11434, is still unmerged).  `ggml_cuda_graph_update_executable()`
+now destroys and re-instantiates the exec on HIP instead of updating it; this runs only on the
+recapture path, and `GGML_HIP_GRAPH_FORCE_UPDATE=1` keeps the update path available for a ROCm that
+carries the driver fix.  The leak itself could not be independently measured on this host — ROCm
+7.14.1's `rocm-smi`/`amd-smi` counters here report ~57 MB while the process holds ~8.2 GB, so they are
+blind to the driver pool — but the workaround is the reporter's validated one and a 1500-token soak
+ran clean with it.
+
+See the 2026-09-20 block-11 amendment section in `patches/README.md` and the block-11 commit message.
+
 ## 2026-09-19 (r9) — `v16-ebbb18522-r9`: V3's derived kq mask reaches the tile FA kernel
 
 Follow-up to the r8 finding.  r8 *reported* the head-cap case (a head above the per-arch WMMA cap

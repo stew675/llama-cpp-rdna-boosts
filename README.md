@@ -328,8 +328,16 @@ for per-block verification and `BASELINE.md` for provenance.
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`ebbb18522`** (upstream master "openvino : Update OpenVINO to 2026.4", 2026-09-17 re-base).
-- Canonical 16-block chain: tip **`f1773dc84633e65cf631acbf691c4f9fba89ec14`**, net tree
-  **`4c7c4e641637797c66c8a6a1cd952533fdcbfa04`**; release **`v16-ebbb18522-r6`**.
+- Canonical 16-block chain: tip **`385e0c77cbc34a01707b2efc25adb684c0dcbbc1`**, net tree
+  **`9f9602e6e5751ca1e065b80ec3764fdfe6ca6eba`**; release **`v16-ebbb18522-r10`**.
+- **Block 11 replays HIP graphs for split-MoE decode again** (issue #41, 2026-09-20): the pre-fill
+  test keyed off `nodes[0]->ne[1]`, which is `n_expert_used` (10) on the expert tensor a one-token
+  decode split starts with under `-ncmoe`, so every decode split was skipped as multi-token.  A new
+  `ggml_cuda_graph_is_multi_token()` reads the real token count from `MUL_MAT_ID`'s `ne[2]` / a weight
+  `MUL_MAT`'s `src1->ne[1]` (0 -> 50 warmups / 0 -> 687 replays, `tg` 10.6 -> 12.8 t/s on
+  Qwen3.8-Flash-Next UD-Q4_K_XL, output bit-identical), and on HIP the exec is now
+  destroyed/re-instantiated instead of updated, avoiding the ROCm <= 10.0 `hipGraphExecUpdate` leak
+  (`GGML_HIP_GRAPH_FORCE_UPDATE=1` opt-out).
 - **FA instance build-time fix** (blocks 06/13/15, 2026-09-18): the MMA instances are generated per
   `(ncols1, ncols2, head size)` and the head-512 ones are listed first in the backend source order,
   the tile instances per `(head size, KV type)`, and the fused-gate MMQ instances moved out of
