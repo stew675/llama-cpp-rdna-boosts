@@ -1,0 +1,326 @@
+From 7c7e7fd64b14d2161819953612f11811be7b8b51 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 20 Sep 2026 18:34:11 -0500
+Subject: [PATCH 33/33] WIP mmb: A-panel double-buffered GLU tile (IQ3_S) --
+ the dequant overlaps WMMA
+
+mmb_tile_gemm / mmb_tile_gemm_glu gain DBUF: the next K-step's weight dequant
+writes the other A buffer (As/Ag/Au 2x, Bs single) so it overlaps the current
+step's WMMA instead of serializing behind the single-buffer barrier hazard.
+
+Measured on Flash-Next IQ4_XS (the IQ3_S GLU, 96 calls, fixed prompt):
+routed_glu<64,32,16,16,5> 1018.8 -> 942.0 ms (-7.5 %), mrg total 1318 -> 1229
+(-6.7 %), MMB family -2.6 %, total GPU kernel time -1.8 %.
+
+Enabled ONLY for WTYPE 5 (IQ3_S): DBUF regresses Q4_K (+5.8 % on the 35B GLU,
+287 -> 304 ms) and the dense Q8_0 tile (+37 %), so it stays off there.  The
+35B is bit-identical/unchanged with this build (mrg 287.3 vs 287.4 ms).
+
+DBUF2 (also double-buffer B -> one sync per K-step) is MEASURED REFUTED
+(mrg 1225 -> 1433 ms) and is kept guarded, disabled.
+
+Bit-identical: PPL c2048 10.6015, greedy sha 9c281c415082, width probe PASS.
+---
+ ggml/src/ggml-cuda/mmb.cu | 148 ++++++++++++++++++++++----------------
+ 1 file changed, 87 insertions(+), 61 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 056e9687a..141e3cefa 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -401,7 +401,7 @@ __device__ __forceinline__ void mmb_store_tile(const v8f & acc, float * __restri
+     }
+     __syncthreads();
+ }
+-template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, typename XRowFn, typename DRowFn>
++template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, bool DBUF, bool DBUF2, typename XRowFn, typename DRowFn>
+ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase, const size_t wrow_bytes, const int a_rows,
+         const uint16_t * __restrict__ Xh, const int K, XRowFn xrow, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, DRowFn drow, const int m0,
+         const int n_cols, uint16_t * As, uint16_t * Bs) {
+@@ -441,22 +441,24 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
+             bst[i] = (brow[i] >= 0) ? *(const uint4 *)(Xh + (size_t)brow[i] * K + ks * MMB_BK + off) : make_uint4(0,0,0,0);
+         }
+     };
+-    auto store_lds = [&](int ksh) {
++    auto store_lds_a = [&](int ksh, const int abo) {
+ #pragma unroll
+         for (int i = 0; i < A_ITEMS; ++i) { const int row = tid + i * MMB_NT; if (row < BM) {
+-            if constexpr (WTYPE == 0) mmb_dq_row36(a0[i], a1[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
+-            else if constexpr (WTYPE == 1) mmb_dq_row68(a0[i], a1[i], a3[i], a4[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
+-            else if constexpr (WTYPE == 3) mmb_dq_row_q4k(a0[i], a1[i], a3[i], ksh, (uint32_t *)(As + row * MMB_LDS_STRIDE));
+-            else if constexpr (WTYPE == 4) mmb_dq_row_q5_1(a0[i], a1[i], a3[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
+-            else if constexpr (WTYPE == 5) mmb_dq_row_iq3s(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(As + row * MMB_LDS_STRIDE));
+-            else if constexpr (WTYPE == 6) mmb_dq_row_q5k(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 176, ksh & 3, (uint32_t *)(As + row * MMB_LDS_STRIDE));
+-            else if constexpr (WTYPE == 7) mmb_dq_row_q6k(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 210, ksh & 3, (uint32_t *)(As + row * MMB_LDS_STRIDE));
+-            else if constexpr (WTYPE == 8) mmb_dq_row_iq4xs(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 136, ksh & 3, (uint32_t *)(As + row * MMB_LDS_STRIDE));
+-            else if constexpr (WTYPE == 9) mmb_dq_row_q3k(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(As + row * MMB_LDS_STRIDE));
+-            else if constexpr (WTYPE == 10) mmb_dq_row_iq3xxs(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 98, ksh & 3, (uint32_t *)(As + row * MMB_LDS_STRIDE));
+-            else { uint4 * d = (uint4 *)(As + row * MMB_LDS_STRIDE); d[0] = a0[i]; d[1] = a1[i]; d[2] = a3[i]; d[3] = a4[i]; d[4] = a5[i]; d[5] = a6[i]; d[6] = a7[i]; d[7] = a8[i]; } } }
++            if constexpr (WTYPE == 0) mmb_dq_row36(a0[i], a1[i], a2[i], (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 1) mmb_dq_row68(a0[i], a1[i], a3[i], a4[i], a2[i], (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 3) mmb_dq_row_q4k(a0[i], a1[i], a3[i], ksh, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 4) mmb_dq_row_q5_1(a0[i], a1[i], a3[i], (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 5) mmb_dq_row_iq3s(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 6) mmb_dq_row_q5k(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 176, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 7) mmb_dq_row_q6k(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 210, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 8) mmb_dq_row_iq4xs(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 136, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 9) mmb_dq_row_q3k(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 10) mmb_dq_row_iq3xxs(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 98, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else { uint4 * d = (uint4 *)(As + (abo + row) * MMB_LDS_STRIDE); d[0] = a0[i]; d[1] = a1[i]; d[2] = a3[i]; d[3] = a4[i]; d[4] = a5[i]; d[5] = a6[i]; d[6] = a7[i]; d[7] = a8[i]; } } }
++    };
++    auto store_lds_b = [&](const int bbo) {
+ #pragma unroll
+-        for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
++        for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (bbo + (c >> 3)) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
+     };
+ 
+     v8f acc[TM][TN];
+@@ -471,17 +473,26 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
+ #pragma unroll
+     for (int j = 0; j < TN; ++j) jact[j] = !TAIL || (wn * WTN + j * 16) < n_cols;   // whole fragments past the valid columns are never stored
+     const int nks = K / MMB_BK;
+-    load_regs(0); store_lds(0); __syncthreads();
++    load_regs(0); store_lds_a(0, 0); store_lds_b(0); __syncthreads();
+     for (int ks = 0; ks < nks; ++ks) {
+         if (ks + 1 < nks) load_regs(ks + 1);
++        // DBUF: the NEXT K-step's weight dequant writes the other A buffer, so it overlaps this
++        // step's WMMA instead of serializing behind the A single-buffer barrier hazard (this is the
++        // session-21 win; it requires As to be 2x).  DBUF2 additionally double-buffers B to drop the
++        // second barrier -- MEASURED REFUTED (GLU 1225 -> 1433 ms): the extra LDS traffic costs more
++        // than the removed barrier buys.  Kept guarded so it can be re-tested cheaply.
++        if (DBUF && ks + 1 < nks) store_lds_a(ks + 1, ((ks + 1) & 1) * BM);
++        if (DBUF2 && ks + 1 < nks) store_lds_b(((ks + 1) & 1) * BN);
++        const int ab = DBUF ? ((ks & 1) * BM) : 0;
++        const int bb = DBUF2 ? ((ks & 1) * BN) : 0;
+ #pragma unroll
+         for (int kk = 0; kk < MMB_BK; kk += 16) {
+             v16s a[TM], b[TN]; const int r = lane & 15;
+ #pragma unroll
+-            for (int i = 0; i < TM; ++i) { const uint16_t * p = As + (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
++            for (int i = 0; i < TM; ++i) { const uint16_t * p = As + (ab + wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
+                 const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); a[i] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
+ #pragma unroll
+-            for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
++            for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (bb + wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+                 const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); b[j] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
+ #pragma unroll
+             for (int i = 0; i < TM; ++i)
+@@ -489,8 +500,11 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
+                 for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } acc[i][j] = mmb_wmma_bf16(b[j], a[i], acc[i][j]); }
+         }
+         __syncthreads();
+-        if (ks + 1 < nks) store_lds(ks + 1);
+-        __syncthreads();
++        if constexpr (!DBUF2) {
++            if (!DBUF && ks + 1 < nks) store_lds_a(ks + 1, 0);
++            if (ks + 1 < nks) store_lds_b(0);
++            __syncthreads();
++        }
+     }
+     // epilogue through LDS (per-wave 1 KB stage in the now-free A/B tile area); tiles are 16 rows, a_rows is a
+     // multiple of 32 in this model, so whole tiles are either valid or beyond a_rows
+@@ -506,11 +520,11 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
+     }
+ }
+ 
+-template <int BM, int BN, int WTM, int WTN, int WTYPE>
++template <int BM, int BN, int WTM, int WTN, int WTYPE, bool DBUF = false, bool DBUF2 = false>
+ __global__ void __launch_bounds__(MMB_NT, 2)
+ mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ Xh, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, const int K, const int T) {
+-    __shared__ __align__(16) uint16_t As[BM * MMB_LDS_STRIDE];
+-    __shared__ __align__(16) uint16_t Bs[BN * MMB_LDS_STRIDE];
++    __shared__ __align__(16) uint16_t As[(DBUF ? 2 : 1) * BM * MMB_LDS_STRIDE];
++    __shared__ __align__(16) uint16_t Bs[(DBUF2 ? 2 : 1) * BN * MMB_LDS_STRIDE];
+     const int m0 = blockIdx.x * BM, t0 = blockIdx.y * BN;
+     const size_t wrow_bytes = WTYPE == 2 ? (size_t) K * 2 :
+                               WTYPE == 3 ? (size_t)(K / 256) * 144 :
+@@ -522,7 +536,7 @@ mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ X
+                               WTYPE == 9 ? (size_t)(K / 256) * 110 :
+                               WTYPE == 10 ? (size_t)(K / 256) * 98 :
+                               (size_t)(K / 32) * (WTYPE == 0 ? 18 : 34);
+-    mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, false>(W + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
++    mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, false, DBUF, DBUF2>(W + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
+         [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, D, Dh, store_f32, M, [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, m0, T - t0, As, Bs);
+ }
+ 
+@@ -618,25 +632,25 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
+     }
+ }
+ 
+-template <int BM, int BN, int WTM, int WTN, int WTYPE>
++template <int BM, int BN, int WTM, int WTN, int WTYPE, bool DBUF = false, bool DBUF2 = false>
+ __global__ void __launch_bounds__(MMB_NT, 2)
+ mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, const uint16_t * __restrict__ Xh, float * __restrict__ D,
+         uint16_t * __restrict__ Dh, const bool store_f32,
+         const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
+         const uint32_t * __restrict__ desc, const int M, const int K) {
+-    __shared__ __align__(16) uint16_t As[BM * MMB_LDS_STRIDE];
+-    __shared__ __align__(16) uint16_t Bs[BN * MMB_LDS_STRIDE];
++    __shared__ __align__(16) uint16_t As[(DBUF ? 2 : 1) * BM * MMB_LDS_STRIDE];
++    __shared__ __align__(16) uint16_t Bs[(DBUF2 ? 2 : 1) * BN * MMB_LDS_STRIDE];
+     const uint32_t dsc = desc[blockIdx.y];
+     if (dsc == UINT32_MAX) return;   // uniform across the block, before any barrier
+     const int e = dsc & 0xffff, jt = dsc >> 16;
+     const int r0 = bounds[e] + jt * BN, cnt = bounds[e + 1] - r0;
+     const int m0 = blockIdx.x * BM;
+     const size_t wrow_bytes = WTYPE == 3 ? (size_t)(K / 256) * 144 : WTYPE == 4 ? (size_t)(K / 32) * 24 : WTYPE == 5 ? (size_t)(K / 256) * 110 : WTYPE == 6 ? (size_t)(K / 256) * 176 : WTYPE == 7 ? (size_t)(K / 256) * 210 : WTYPE == 8 ? (size_t)(K / 256) * 136 : WTYPE == 9 ? (size_t)(K / 256) * 110 : WTYPE == 10 ? (size_t)(K / 256) * 98 : WTYPE == 1 ? (size_t)(K / 32) * 34 : (size_t)(K / 32) * 18;
+-    mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, true>(W + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
++    mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, true, DBUF, DBUF2>(W + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
+         [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, As, Bs);
+ }
+ 
+-template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, typename XRowFn, typename DRowFn>
++template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, bool DBUF, bool DBUF2, typename XRowFn, typename DRowFn>
+ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t wrow_bytes, const int a_rows,
+         const uint16_t * __restrict__ Xh, const int K, XRowFn xrow, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, DRowFn drow, const int m0,
+         const int n_cols, uint16_t * Ag, uint16_t * Au, uint16_t * Bs) {
+@@ -686,42 +700,44 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
+             bst[i] = (brow[i] >= 0) ? *(const uint4 *)(Xh + (size_t)brow[i] * K + ks * MMB_BK + off) : make_uint4(0,0,0,0);
+         }
+     };
+-    auto store_lds = [&](int ksh) {
++    auto store_lds_a = [&](int ksh, const int abo) {
+ #pragma unroll
+         for (int i = 0; i < A_ITEMS; ++i) { const int row = tid + i * MMB_NT; if (row < BM) {
+             if constexpr (WTYPE == 0) {
+-                mmb_dq_row36(g0[i], g1[i], g2[i], (uint32_t *)(Ag + row * MMB_LDS_STRIDE));
+-                mmb_dq_row36(u0[i], u1[i], u2[i], (uint32_t *)(Au + row * MMB_LDS_STRIDE));
++                mmb_dq_row36(g0[i], g1[i], g2[i], (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row36(u0[i], u1[i], u2[i], (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+             } else if constexpr (WTYPE == 1) {
+-                mmb_dq_row68(g0[i], g1[i], g3[i], g4[i], g2[i], (uint32_t *)(Ag + row * MMB_LDS_STRIDE));
+-                mmb_dq_row68(u0[i], u1[i], u3[i], u4[i], u2[i], (uint32_t *)(Au + row * MMB_LDS_STRIDE));
++                mmb_dq_row68(g0[i], g1[i], g3[i], g4[i], g2[i], (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row68(u0[i], u1[i], u3[i], u4[i], u2[i], (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+             } else if constexpr (WTYPE == 3) {
+-                mmb_dq_row_q4k(g0[i], g1[i], g3[i], ksh, (uint32_t *)(Ag + row * MMB_LDS_STRIDE));
+-                mmb_dq_row_q4k(u0[i], u1[i], u3[i], ksh, (uint32_t *)(Au + row * MMB_LDS_STRIDE));
++                mmb_dq_row_q4k(g0[i], g1[i], g3[i], ksh, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_q4k(u0[i], u1[i], u3[i], ksh, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+             } else if constexpr (WTYPE == 4) {
+-                mmb_dq_row_q5_1(g0[i], g1[i], g3[i], (uint32_t *)(Ag + row * MMB_LDS_STRIDE));
+-                mmb_dq_row_q5_1(u0[i], u1[i], u3[i], (uint32_t *)(Au + row * MMB_LDS_STRIDE));
++                mmb_dq_row_q5_1(g0[i], g1[i], g3[i], (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_q5_1(u0[i], u1[i], u3[i], (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+             } else if constexpr (WTYPE == 5) {
+-                mmb_dq_row_iq3s(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Ag + row * MMB_LDS_STRIDE));
+-                mmb_dq_row_iq3s(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Au + row * MMB_LDS_STRIDE));
++                mmb_dq_row_iq3s(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_iq3s(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+             } else if constexpr (WTYPE == 6) {
+-                mmb_dq_row_q5k(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 176, ksh & 3, (uint32_t *)(Ag + row * MMB_LDS_STRIDE));
+-                mmb_dq_row_q5k(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 176, ksh & 3, (uint32_t *)(Au + row * MMB_LDS_STRIDE));
++                mmb_dq_row_q5k(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 176, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_q5k(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 176, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+             } else if constexpr (WTYPE == 7) {
+-                mmb_dq_row_q6k(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 210, ksh & 3, (uint32_t *)(Ag + row * MMB_LDS_STRIDE));
+-                mmb_dq_row_q6k(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 210, ksh & 3, (uint32_t *)(Au + row * MMB_LDS_STRIDE));
++                mmb_dq_row_q6k(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 210, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_q6k(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 210, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+             } else if constexpr (WTYPE == 8) {
+-                mmb_dq_row_iq4xs(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 136, ksh & 3, (uint32_t *)(Ag + row * MMB_LDS_STRIDE));
+-                mmb_dq_row_iq4xs(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 136, ksh & 3, (uint32_t *)(Au + row * MMB_LDS_STRIDE));
++                mmb_dq_row_iq4xs(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 136, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_iq4xs(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 136, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+             } else if constexpr (WTYPE == 9) {
+-                mmb_dq_row_q3k(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Ag + row * MMB_LDS_STRIDE));
+-                mmb_dq_row_q3k(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Au + row * MMB_LDS_STRIDE));
++                mmb_dq_row_q3k(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_q3k(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+             } else if constexpr (WTYPE == 10) {
+-                mmb_dq_row_iq3xxs(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 98, ksh & 3, (uint32_t *)(Ag + row * MMB_LDS_STRIDE));
+-                mmb_dq_row_iq3xxs(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 98, ksh & 3, (uint32_t *)(Au + row * MMB_LDS_STRIDE));
++                mmb_dq_row_iq3xxs(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 98, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_iq3xxs(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 98, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+             } } }
++    };
++    auto store_lds_b = [&](const int bbo) {
+ #pragma unroll
+-        for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
++        for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (bbo + (c >> 3)) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
+     };
+     v8f accg[TM][TN], accu[TM][TN];
+ #pragma unroll
+@@ -734,18 +750,25 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
+ #pragma unroll
+     for (int j = 0; j < TN; ++j) jact[j] = !TAIL || (wn * WTN + j * 16) < n_cols;
+     const int nks = K / MMB_BK;
+-    load_regs(0); store_lds(0); __syncthreads();
++    load_regs(0); store_lds_a(0, 0); store_lds_b(0); __syncthreads();
+     for (int ks = 0; ks < nks; ++ks) {
+         if (ks + 1 < nks) load_regs(ks + 1);
++        // DBUF: the NEXT K-step's gate+up dequant writes the other A buffers, overlapping this step's
++        // WMMA.  Only enabled for WTYPE 5 (IQ3_S): it is a -6.7 % win on the Flash-Next IQ3_S GLU but
++        // a +5.8 % loss on the 35B Q4_K GLU.  DBUF2 (double-buffer B, one sync) is MEASURED REFUTED.
++        if (DBUF && ks + 1 < nks) store_lds_a(ks + 1, ((ks + 1) & 1) * BM);
++        if (DBUF2 && ks + 1 < nks) store_lds_b(((ks + 1) & 1) * BN);
++        const int ab = DBUF ? ((ks & 1) * BM) : 0;
++        const int bb = DBUF2 ? ((ks & 1) * BN) : 0;
+ #pragma unroll
+         for (int kk = 0; kk < MMB_BK; kk += 16) {
+             v16s ag[TM], au[TM], b[TN]; const int r = lane & 15;
+ #pragma unroll
+-            for (int i = 0; i < TM; ++i) { const int off = (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
++            for (int i = 0; i < TM; ++i) { const int off = (ab + wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
+                 ag[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
+                 au[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)}); }
+ #pragma unroll
+-            for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
++            for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (bb + wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+                 b[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
+ #pragma unroll
+             for (int i = 0; i < TM; ++i)
+@@ -757,8 +780,11 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
+                 }
+         }
+         __syncthreads();
+-        if (ks + 1 < nks) store_lds(ks + 1);
+-        __syncthreads();
++        if constexpr (!DBUF2) {
++            if (!DBUF && ks + 1 < nks) store_lds_a(ks + 1, 0);
++            if (ks + 1 < nks) store_lds_b(0);
++            __syncthreads();
++        }
+     }
+     float * stg = (float *)((BN * MMB_LDS_STRIDE * 2 >= MMB_NT / 32 * 1024) ? Bs : Ag) + wave * 256;
+ #pragma unroll
+@@ -776,22 +802,22 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
+     }
+ }
+ 
+-template <int BM, int BN, int WTM, int WTN, int WTYPE>
++template <int BM, int BN, int WTM, int WTN, int WTYPE, bool DBUF = false, bool DBUF2 = false>
+ __global__ void __launch_bounds__(MMB_NT, 2)
+ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t expert_bytes, const uint16_t * __restrict__ Xh,
+         float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32,
+         const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
+         const uint32_t * __restrict__ desc, const int M, const int K) {
+-    __shared__ __align__(16) uint16_t Ag[BM * MMB_LDS_STRIDE];
+-    __shared__ __align__(16) uint16_t Au[BM * MMB_LDS_STRIDE];
+-    __shared__ __align__(16) uint16_t Bs[BN * MMB_LDS_STRIDE];
++    __shared__ __align__(16) uint16_t Ag[(DBUF ? 2 : 1) * BM * MMB_LDS_STRIDE];
++    __shared__ __align__(16) uint16_t Au[(DBUF ? 2 : 1) * BM * MMB_LDS_STRIDE];
++    __shared__ __align__(16) uint16_t Bs[(DBUF2 ? 2 : 1) * BN * MMB_LDS_STRIDE];
+     const uint32_t dsc = desc[blockIdx.y];
+     if (dsc == UINT32_MAX) return;
+     const int e = dsc & 0xffff, jt = dsc >> 16;
+     const int r0 = bounds[e] + jt * BN, cnt = bounds[e + 1] - r0;
+     const int m0 = blockIdx.x * BM;
+     const size_t wrow_bytes = WTYPE == 3 ? (size_t)(K / 256) * 144 : WTYPE == 4 ? (size_t)(K / 32) * 24 : WTYPE == 5 ? (size_t)(K / 256) * 110 : WTYPE == 6 ? (size_t)(K / 256) * 176 : WTYPE == 7 ? (size_t)(K / 256) * 210 : WTYPE == 8 ? (size_t)(K / 256) * 136 : WTYPE == 9 ? (size_t)(K / 256) * 110 : WTYPE == 10 ? (size_t)(K / 256) * 98 : WTYPE == 1 ? (size_t)(K / 32) * 34 : (size_t)(K / 32) * 18;
+-    mmb_tile_gemm_glu<BM, BN, WTM, WTN, WTYPE, true>(Wg + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, Wu + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
++    mmb_tile_gemm_glu<BM, BN, WTM, WTN, WTYPE, true, DBUF, DBUF2>(Wg + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, Wu + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
+         [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, Ag, Au, Bs);
+ }
+ 
+@@ -1493,7 +1519,7 @@ static void mmb_routed_glu_kernel_dispatch(const ggml_tensor * gw, dim3 gbig, di
+         mmb_routed_glu_kernel<64,  32, 16, 16, 4><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
+     } else if (gw->type == GGML_TYPE_IQ3_S) {
+         mmb_routed_glu_kernel<64, 128, 32, 32, 5><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
+-        mmb_routed_glu_kernel<64,  32, 16, 16, 5><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 5, true><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
+     } else if (gw->type == GGML_TYPE_Q8_0) {
+         mmb_routed_glu_kernel<64, 128, 32, 32, 1><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
+         mmb_routed_glu_kernel<64,  32, 16, 16, 1><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
+-- 
+2.55.0
+

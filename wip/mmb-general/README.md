@@ -138,6 +138,88 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 21 (2026-09-20): the MMB restructure lands an **A-panel double-buffered GLU tile**
+## (IQ3_S): the weight dequant overlaps the WMMA (**−6.7 % GLU / −1.8 % total GPU time**), bit-identically
+
+The session-20 mandate.  The target model's MMB weight GEMMs are **61.8 % of pp8192** (9587 of
+15508 ms), the single largest lever left, and the brief's premise was "the dequant is serialized with
+the WMMA behind a barrier".  This session measured the geometry, confirmed the premise for the
+dequant-**heavy** GLU tile, and landed a targeted restructure.
+
+### What was measured first (recon)
+
+* **LDS is 65536 B/CU** (`hipDeviceProp_t`), so the 36864 B dense/GLU tiles give **1 block/CU = 8 of 64
+  waves** — very low occupancy.  Any restructure must fit in LDS to be worth anything.
+* **The dequant share is type-dependent, and the naive "no-dequant" A/B is invalid**: removing the
+  dequant changes the GEMM result, which changes the MoE router's expert selection, which changes the
+  routed/GLU workload itself (the small GLU tile collapsed 1038 → 4 ms — a workload change, not a
+  speedup).  Only output-preserving experiments can be trusted here (the fixed-token `llama-perplexity`
+  profiler was essential; `llama-bench`'s random prefill tokens also make the routed kernels
+  non-comparable run to run).
+* **ISA analysis (static, no measurement confound)** of the fully-unrolled body: the GLU
+  `routed_glu_kernel<64,128,32,32,5>` loop has **~3800 VALU vs 32 WMMA** per K-step; the dense Q8_0
+  `<128,128,32,64,1>` has ~1550 VALU vs 32 WMMA.  The GLU is dequant-issue bound; Q8_0 is not.
+* **No hardware bf16 pack on gfx1151** (`v_cvt_pk_bf16_f32` is gfx12-only) and the compiler's `__bf16`
+  conversion is *not* RNE (10/4096 values differ from `mmb_f2bf`), so the software RNE pack must stay.
+* **The warp-specialised producer/consumer + 2x LDS ring does NOT fit**: the big tiles are already
+  36864 B, and 2x is 72 KB > 64 KB.  A-panel-only double-buffering *does* fit.
+
+### What landed: `DBUF` (A-panel double buffering)
+
+`mmb_tile_gemm` / `mmb_tile_gemm_glu` gain a `DBUF` template flag: the next K-step's weight dequant
+writes the **other** A buffer (`As`/`Ag`/`Au` are 2x; `Bs` stays single), so `store_lds_a(ks+1)` is
+issued *before* the WMMA of `ks` and the dequant overlaps it, instead of being serialized behind the
+single-buffer LDS hazard.  The loop becomes
+`load_regs(k+1) → store_lds_a(k+1)→buf1 → WMMA(k) reads buf0 → sync → store_lds_b(k+1) → sync`.
+
+LDS fits for: dense `128x128` (55296), routed `128x128`/`128x32` (55296/41472), GLU `64x128`/`64x32`
+(55296/41472).  It does **not** fit for dense `128x256` (73728) or the tall `384x*` tiles.
+
+**Enabled for WTYPE 5 (IQ3_S) on the GLU small tile only** — that is the one measured win:
+
+| kernel (Flash-Next IQ4_XS, fixed prompt, min-of-N rocprofv3) | base | `DBUF` |
+|---|---:|---:|
+| `routed_glu_kernel<64,32,16,16,5>` (IQ3_S, 96 c) | 1018.8 ms | **942.0 ms (−7.5 %)** |
+| `mrg` total | 1318.2 | **1229 (−6.7 %)** |
+| MMB family | 2980 | **2902 (−2.6 %)** |
+| **total GPU kernel time** | 4409–4415 | **4330–4336 (−1.8 %)** |
+| perplexity `seconds per pass` | 2.40 | **2.34–2.37** |
+
+**It is deliberately type-gated**: `DBUF` *regresses* the other tiles, so it stays off there —
+
+* dense `128x128` (Q8_0, the dequant is only ~5 %): **+37 %** (491 → 671 ms);
+* routed (IQ4_NL, both tiles): **+16 %**; routed small only: **+10 %**;
+* GLU `64x128` big tile: **+14 %** (280 → 319 ms);
+* GLU small tile on the **35B Q4_K** model: **+5.8 %** (287 → 304 ms) — so Q4_K keeps `DBUF` off;
+  the 35B is completely unaffected by this build (mrg 287.3 vs 287.4, family 1008 vs 1008).
+
+**`DBUF2` (also double-buffer B, one sync per K-step instead of two) is REFUTED**: the GLU went
+1225 → **1433 ms** (+17 %) — the extra LDS read/write traffic costs more than the removed barrier
+buys.  The code is kept, guarded and disabled, so it can be re-tested cheaply.
+
+### Gates (all green, bit-identical)
+
+PPL c2048 **10.6015** (×3), greedy **`9c281c415082`** (624 chars), `test-logits-width-probe` **PASS**
+(worst maxdiff 0).  The change reorders the dequant but produces the same bf16 LDS values, so the WMMA
+inputs are identical.  The `DBUF=false` refactor alone (split `store_lds` into `_a`/`_b`, add the
+template flags) was verified bit-identical before any flag was enabled.
+
+### Where this leaves the MMB restructure
+
+The remaining ideas, ranked by the evidence:
+
+1. **Cheaper IQ3_S dequant instructions.**  It is dequant-issue bound (~3800 VALU/32 WMMA).  The
+   biggest single cost in the generated code is the per-value bf16 RNE pack (`v_bfe`/`v_add3`/`v_mov_b16`/
+   `v_and_or` ≈ 4 instr/value) and the 64-bit address math around each of the 16 `iq3s_grid` LUT lookups
+   (~5 instr each).  The LUT is a plain `static const` device array, so each lookup is a divergent global
+   load; moving it to LDS or a 32-bit-offset form is the most promising next step.
+2. **A fused gate+up dequant** that shares the IQ3_S grid-index/scale arithmetic between the gate and up
+   panels (they use the same indices, only the data differs) — would roughly halve the index ALU.  Needs
+   a per-type dual dequant.
+3. The warp-specialised / double-buffered pipeline beyond `DBUF` does not fit in LDS for the big tiles.
+
+---
+
 ## UPDATE — session 20 (2026-09-20): the `rms_norm` register-cache experiment is **refuted** (a wash)
 
 The largest non-MMB kernel, `rms_norm_f32<1024, true, false>` (the HC `xn` stream, 538 ms / 3.5 % at
