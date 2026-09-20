@@ -75,12 +75,25 @@ the per-kernel numbers, the measurement budget) are the reference for it.
   3. **Closed/refuted — do not redo:** "compact after pass 1" (cell tie groups are 50–60 % of the
      cache); a wider radix / fewer passes (the wider `select`/`hist_accum` reads offset the saved pass);
      pass 1's per-cell histogram atomics (session 19, now one per block).
-* **B. Non-temporal sweep remainder (small).**  qsa3 pack kernels (6.5 ms), the `rms_norm`/other unary
-  producers, and `ssm_conv` under a different shape.  Rule: **loads only, per-kernel, A/B load vs
-  store** (a non-temporal *store* evicts the next op's input).
+* **B. Non-temporal sweep remainder (small) -- ASSESSED AND CLOSED (session 19).**  The remaining
+  candidates were re-checked against the session-19 pp8192 profile: the qsa3 pack is **6.8 ms**
+  (0.04 %), `ssm_conv_long_token_f32` was measured in session 14 and is noise-dominated (and wins on
+  neither load nor store), `rms_norm_f32` must read `x` **twice** (a non-temporal load would evict the
+  second read -- it is the largest non-MMB kernel at 3.5 %, but not via this hint), and the remaining
+  unary producers (`unary_op_kernel<relu>` 31 ms, `scale_unary` 7 ms) are too small to matter.  The
+  rule if it is ever revisited: **loads only, per-kernel, A/B load vs store** (a non-temporal *store*
+  evicts the next op's input).
 * **C. Recorded follow-ups (not scheduled).**  `ple_embd` is the last `mmb_cvt` (its producer is the
-  GGUF loader, so it needs a load-time bf16 copy); `dsv4_hc`'s `mixed` as BF16-only would save ~21 MB/
+  GGUF loader, so it needs a load-time bf16 copy) -- now measured at **0.8 ms** per the session-11
+  trace, i.e. not worth the loader change; `dsv4_hc`'s `mixed` as BF16-only would save ~21 MB/
   call but changes the GDN recurrence and MoE-routing numerics (deliberately out of scope).
+* **F. MMB structural (the only large lever left).**  The MMB family is ~48 % of prefill.  Session 6
+  closed the tuning (tiles/BN/VDR/shadow are washes or worse) and the kernel is already
+  software-pipelined (`load_regs(ks+1)` / `store_lds(ks+1)` around the WMMA loop, session-19
+  re-read).  The remaining gap is dequant-issue contention with WMMA issue (dense ~54 % of the bf16
+  WMMA peak, GLU ~36 %, which pays the dequant twice).  Closing it needs a real restructure (e.g. a
+  warp-specialised dequant producer), not a knob -- large and risky, and the win upper bound is a few
+  percent.
 * **D. Delivery items to fold in at promotion (block 14).**  `GGML_OP_INDEXER_FILL` is missing from
   `GGML_OP_NAME` (one line; already fixed in the WIP by `d1463bff3`); and the new **`blk_cells`
   `src[7]`** on `GGML_OP_INDEXER_TOPK` (the session-18 interface change).
