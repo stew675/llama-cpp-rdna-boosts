@@ -50,7 +50,7 @@ the *porting* overlay; the group semantics stay as `GROUPS.md` describes.
 | ROCm | `/opt/rocm-7.14.1-gfx102X` (the build script's `ROCM_714`; supports `--offload-arch=gfx1201`); `/opt/rocm-7.14-gfx1201` is the older parallel install |
 | Delivery base | `~/llama.cpp` branch `rdna-boosts`, tip `c3ee45747` = the 16-block **r12** delivery (tree `8a80535e…`) |
 | WIP base | the same r12 applied tree; the 5 WIP patches apply **5/5 clean** onto it |
-| WIP working branch | `~/llama.cpp` branch **`rdna-boosts-mmb-port`** (created this session; do not push it) |
+| WIP working branch | `~/llama.cpp` is currently on **`mmb-5-ported`** (`e7cd749bc`, tree `c0f8ea75ba`) = the **delivered 5-patch set** (post-consolidation, G3a gate folded in).  Same tree as `rdna-boosts-mmb-port` (`bdf97a390`, the pre-consolidation tip).  Isolation branches `v-no-g5` / `v-no-g4` also exist locally (the A/B variants from S2).  **Do not push any of them.** |
 | Baseline worktree | `~/llama-base` (branch `rdna-boosts`, delivery only) — build the A/B baseline here |
 | Build | `cd ~/llama.cpp && BUILD_DIR=build-rocm ~/bin/build-llama-rocm-714` (ccache; see §3) |
 | Dense model | `/llm/models/Qwen3.8/27B/Q8_0/Qwen3.8-27B-Q8_0.gguf` |
@@ -59,8 +59,8 @@ the *porting* overlay; the group semantics stay as `GROUPS.md` describes.
 | Rule | all multi-GPU testing is **`-sm tensor`** (see the server invocation in `AGENTS.md` / the session brief) |
 
 **WARNING:** `mmb-general.patch` / `patches/*.patch` under `wip/` must never be folded into the
-delivery or applied to a *delivery* checkout.  This plan and the code on `rdna-boosts-mmb-port` are
-WIP only.  Promotion is maintainer-gated (`HANDOVER.md` §E).
+delivery or applied to a *delivery* checkout.  This plan and the local branches are WIP only.
+Promotion is maintainer-gated (`HANDOVER.md` §E).
 
 ---
 
@@ -156,11 +156,11 @@ only the lane bookkeeping differs.  (For qsa3 the shuffle block may force a smal
 |---|---|---|---|
 | G1 `mmb` | "RDNA4 no-op; new work" | **portable fragment port**; value must be measured | `GGML_CUDA_MMB=1` + arch gate |
 | G2 `qsa3` | "needs RDNA4 variant; new work" | **portable fragment port** (f16) | compile-time `LLAMA_QSA3_ENABLE` + arch gate |
-| G3a always-QSA flip | arch-neutral | **port directly** | env kill-switch only |
+| G3a always-QSA flip | arch-neutral | **NOT portable — arch-gated** (always-QSA only on gfx1151) | arch gate in patch 3 + `LLAMA_QSA_DENSE_SHORTCUT` env |
 | G3b/c F32/tiny-M | rides G1 | **port with G1** | `GGML_CUDA_MMB*` |
-| G4 non-temporal | portable | **port directly**, per-kernel A/B | none (code) |
+| G4 non-temporal | portable | **port directly**; gfx1201 verified win, kept | none (code) |
 | G4 HC16 producers | rides G1 | **port after G1**, measure | `GGML_CUDA_MMB_HC16=1` |
-| G5 indexer top-k | generic | **port directly** | none (op-driven) |
+| G5 indexer top-k | generic | **port directly**; gfx1201 verified win (deep) | none (op-driven) |
 
 ---
 
@@ -190,14 +190,22 @@ Notes:
 * ccache makes the A/B rebuild cheap (unchanged TUs are replayed).  Because the WIP touches the FA
   group (`fattn-*.cuh`) and `ggml-cuda.cu`, expect a partial recompile, not a pure cache hit.
 
-### 3.2 Apply the WIP (already done on `rdna-boosts-mmb-port`)
+### 3.2 Apply the WIP
+
+The **delivered** 5-patch set (with the G3a arch gate folded into patch 3) lives in
+`wip/mmb-general/patches/`.  It applies `git am` **5/5** onto a fresh r12 tree and yields applied
+tree **`c0f8ea75ba`**:
 
 ```sh
-cd ~/llama.cpp && git checkout rdna-boosts && git checkout -b rdna-boosts-mmb-port
+# fresh build / iteration branch from the r12 delivery
+cd ~/llama.cpp && git checkout rdna-boosts && git checkout -b mmb-port-work
 git am /home/stew675/llama-cpp-rdna-boosts/wip/mmb-general/patches/*.patch   # 5/5
 ```
 
-To reset to a clean base: `git checkout rdna-boosts && git branch -D rdna-boosts-mmb-port` and redo.
+The 2026-09-21 session's already-applied branches are kept for convenience: `mmb-5-ported`
+(`e7cd749bc`, tree `c0f8ea75ba`, the delivered set), `rdna-boosts-mmb-port` (`bdf97a390`, same tree),
+and the S2 isolation variants `v-no-g5` / `v-no-g4`.  `~/llama.cpp` is currently checked out on
+`mmb-5-ported`.  To reset: `git checkout rdna-boosts && git branch -D <branch>` and redo.
 
 ### 3.3 Run
 

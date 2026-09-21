@@ -21,6 +21,24 @@ file is the dated record.
 cold-start-limited (pp2048 moves by up to ~10 % between `r=3` and `r=5`).  Trust the deep
 (32768+) numbers and the `r=5` numbers; treat a single `r=3` pp2048 as indicative only.
 
+## Reproduce
+
+```sh
+export LD_LIBRARY_PATH=/opt/rocm-7.14.1-gfx102X/lib:$LD_LIBRARY_PATH
+M=/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
+ARGS="-m $M -ngl 99 -sm tensor -b 2048 -ub 2048 -ctk q8_0 -ctv q8_0 -fa auto -p 32768,65536,98304 -n 0 -r 3"
+
+# base (delivery r12)
+cd ~/llama-base && HIP_VISIBLE_DEVICES=0,1,2 GGML_CUDA_ALLREDUCE=hybrid ./build-rocm/bin/llama-bench $ARGS
+# WIP / a variant (rebuild first with BUILD_DIR=build-rocm ~/bin/build-llama-rocm-714)
+cd ~/llama.cpp && HIP_VISIBLE_DEVICES=0,1,2 GGML_CUDA_ALLREDUCE=hybrid ./build-rocm/bin/llama-bench $ARGS
+```
+
+The G4 interleaved A/B was run by copying the all-G4 build's `bin/` (rpath `$ORIGIN`, so the copied
+dir is self-contained) to `/tmp/allg-bin` and alternating the two executables in one warm session.
+That `/tmp` copy is **ephemeral** — recreate it by copying `build-rocm/bin/.` before rebuilding the
+other variant if the A/B is repeated.
+
 ## 1. Coherence / correctness (identical on Base and WIP)
 
 | gate | result |
