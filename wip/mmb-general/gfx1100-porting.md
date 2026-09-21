@@ -229,6 +229,11 @@ git rev-parse HEAD^{tree}    # -> 580db5174574f10cc92fb1cefa72281a65c77b12
 
 ### 3.3 Run
 
+* **Mask the iGPU: always `HIP_VISIBLE_DEVICES=0`.**  This box enumerates a second HIP device —
+  **gfx1036** (the Ryzen 7950X integrated GPU).  The build only targets gfx1100, so an unmasked
+  `test-backend-ops` (or any tool that picks all devices) runs the gfx1036 device and aborts with
+  `ROCm error: invalid kernel file` in the first kernel it launches.  Verified 2026-09-21.  Prefix
+  every GPU command with `HIP_VISIBLE_DEVICES=0`.
 * **Always** `llama-cli --single-turn` (and `--no-display-prompt` for scripted output) or it blocks.
   Wrap potentially-blocking commands in `timeout`.
 * **24 GB budget.**  `-ngl 99` always; keep `-b/-ub` modest (`512/512` or `1024/1024`) and choose
@@ -254,7 +259,7 @@ first on every text/PPL/op gate.  (The only expected deltas are where a group is
 | B4 | decode, dense | `llama-bench … -p 0 -n 128 -r 5`; a depth-16384 run (benchy protocol) where it fits | record t/s |
 | B5 | prefill MoE | `llama-bench -m <MoE> -p 2048,8192 -n 0 -r 5` | record t/s |
 | B6 | op oracles | `test-backend-ops -o FLASH_ATTN_EXT`, `-o FLASH_ATTN_QSA` (26/26 once G2 lands), `-o GATED_DELTA_NET`, **`-o TOPK_QSA`** | green |
-| B7 | width purity | `test-logits-width-probe <model> <prompt> 1024 512` | `width_purity=PASS (worst maxdiff 0)` for the pure types, f16 KV |
+| B7 | width purity | `HIP_VISIBLE_DEVICES=0 test-logits-width-probe <model> prompts/prose-rdna-boosts.txt 1024 512` | `width_purity=PASS (worst maxdiff 0)` for the pure types, f16 KV |
 | B8 | PPL | `llama-perplexity -m <model> -f prompts/prose-rdna-boosts.txt -c 2048 -b 2048 -ub 2048 -ngl 99 -fa 1` | record |
 | B9 | MTP | `benchmarks/mtp-adaptive-methodology.md` (gemma-12B + its `-MTP.gguf`) | acceptance > ~0.45 at pos 1; MTP ≥ plain at depth 3 |
 
@@ -265,6 +270,21 @@ first on every text/PPL/op gate.  (The only expected deltas are where a group is
 > test-case name differs.)
 
 **Important:** record every number in a new dated `gfx1100-sNN-results.md` (not in this plan).
+
+### 4.1 S1 groundwork already verified (2026-09-21)
+
+Done while writing this plan (the WIP build + the cheap unit gates); see `gfx1100-s1-results.md`.
+
+* WIP **builds green for gfx1100** (0 compiler errors).
+* `HIP_VISIBLE_DEVICES=0 test-backend-ops -o TOPK_QSA` → **4/4** (G5 indexer, generic).
+* `HIP_VISIBLE_DEVICES=0 test-backend-ops -o FLASH_ATTN_QSA` → **26/26**.  With the qsa3 predicate
+  still excluding `RDNA3_0`, the four packed cases fall back to the VEC kernel, so this only proves
+  the test is runnable here; **S4 re-runs it with the predicate changed and that is the real qsa3
+  coverage on gfx1100.**
+* `test-logits-width-probe` on gemma-12B Q8_0, `prompts/prose-rdna-boosts.txt` (5491 tokens, sha256
+  `fabdec65…`), `P=1024`, f16 KV → **`width_purity=PASS (worst maxdiff 0)`**.
+* The gfx1100 `mmb`/`qsa3` device paths compile from the **same gfx11 arm** as gfx1151 — no gfx12
+  work is needed, as `GROUPS.md` predicted.
 
 ---
 
@@ -493,7 +513,8 @@ claim* is deferred.
 ## 11. Live checklist
 
 - [x] gfx1100 record branch + code worktree created; WIP applies **6/6** (tree `580db5174574f10cc92fb1cefa72281a65c77b12`)
-- [ ] WIP builds for gfx1100 (S1)
+- [x] WIP builds for gfx1100 (S1 groundwork, 2026-09-21; 0 errors)
+- [x] cheap unit gates on gfx1100: `TOPK_QSA` 4/4, `FLASH_ATTN_QSA` 26/26 (VEC fallback), width probe PASS
 - [ ] baseline gates B1-B3/B5-B8 recorded on the delivery and the WIP (S1)
 - [ ] G5 indexer — `TOPK_QSA` green; `GGML_OP_NAME` fill fix (S2)
 - [ ] G4 non-temporal — per-kernel A/B on the MoE models (S2)
