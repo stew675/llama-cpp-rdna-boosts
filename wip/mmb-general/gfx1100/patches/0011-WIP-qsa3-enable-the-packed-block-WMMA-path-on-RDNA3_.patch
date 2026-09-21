@@ -1,0 +1,49 @@
+From 22c4ab13c7c124f8a5b065c4c8361fca5c7f0605 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Mon, 21 Sep 2026 08:55:36 -0500
+Subject: [PATCH 11/13] WIP qsa3: enable the packed-block WMMA path on RDNA3_0
+ (gfx1100)
+
+The gfx11 arm of the fragment shim is byte-identical to the validated
+gfx1151 code, but ggml_cuda_flash_attn_qsa3_supported() only accepted
+RDNA3_5 || RDNA4, so gfx1100 fell back to the VEC kernel.  Add RDNA3_0 to
+the predicate (and update the comment).
+
+Validated on a single RX 7900 XTX: test-backend-ops -o FLASH_ATTN_QSA
+26/26, and a rocprofv3 kernel trace confirms qsa3_attn_kernel +
+qsa3_pack/merge/rows are actually dispatched on gfx1100 (3 dispatches in
+the packed cases).  End-to-end qwen4exp prefill is untested here (no
+model fits 24 GB); the gfx11 kernel is the gfx1151-validated one, so the
+performance claim is trust-RDNA3_5 per gfx1100-porting.md section 9.
+---
+ ggml/src/ggml-cuda/fattn-qsa3.cu | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-qsa3.cu b/ggml/src/ggml-cuda/fattn-qsa3.cu
+index d78d75853..22a15f47e 100644
+--- a/ggml/src/ggml-cuda/fattn-qsa3.cu
++++ b/ggml/src/ggml-cuda/fattn-qsa3.cu
+@@ -58,8 +58,9 @@ static __device__ __forceinline__ uint16_t qsa3_f2h(const float f) { return __bu
+ static __device__ __forceinline__ float qsa3_h2f(const uint16_t h) { return (float) __builtin_bit_cast(_Float16, h); }
+ 
+ // Portable WMMA dispatch: gfx12 renamed the builtin and uses the 8-half fragment above; gfx11 keeps
+-// the first-gen builtin and its 16-half fragment.  The kernels are runtime-gated to RDNA3_5/RDNA4
+-// (ggml_cuda_flash_attn_qsa3_supported), so only the matching arm is ever launched.
++// the first-gen builtin and its 16-half fragment.  The kernels are runtime-gated to
++// RDNA3_0/RDNA3_5/RDNA4 (ggml_cuda_flash_attn_qsa3_supported), so only the matching arm is ever
++// launched.
+ static __device__ __forceinline__ v8f qsa3_wmma_f16(const qsa3_frag_t a, const qsa3_frag_t b, const v8f c) {
+ #if defined(RDNA4)
+     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+@@ -579,7 +580,7 @@ bool ggml_cuda_flash_attn_qsa3_supported(int device, const ggml_tensor * dst) {
+         return false;
+     }
+     const int cc = ggml_cuda_info().devices[device].cc;
+-    if (!(GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {
++    if (!(GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc))) {
+         return false;                                     // F16 WMMA: first-gen (gfx11) or _gfx12 builtin
+     }
+     if (q->ne[1] < 128) {                                 // prefill-only: the W=1..8 band keeps the VEC kernel
+-- 
+2.55.0
+

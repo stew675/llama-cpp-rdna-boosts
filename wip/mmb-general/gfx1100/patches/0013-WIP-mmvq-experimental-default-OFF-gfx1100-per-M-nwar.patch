@@ -1,0 +1,211 @@
+From 10b7c5c542afa6a1501526281a5cede5338b3696 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Mon, 21 Sep 2026 12:52:54 -0500
+Subject: [PATCH 13/13] WIP mmvq: (experimental, default-OFF) gfx1100 per-M
+ nwarps rule
+
+Adds an M-scoped nwarps choice for the dense mmvq weight (ksplit) path on
+RDNA3_0: wide types with M <= GGML_CUDA_MMVQ_RDNA3_SMALL_M use nwarps=1,
+the large-M dense shapes keep the per-type table.  The mechanism threads a
+small_m template axis through calc_nwarps/calc_nwarps_weight, the ksplit
+kernel and the host dispatch; fusion launches are excluded client-side.
+
+It is DEFAULT 0 = DISABLED: enabling it (M<=2048/4096) gives 35B-A3B
++2.1% draft-mtp and gemma-26B +2.1% decode, but BREAKS the W=1..8
+width-purity contract on the MoE models (35B maxdiff 0.150 at >=2048;
+gemma-26B maxdiff 3.35 at >=4096).  Only threshold <=1024 is pure, and
+that gives no measurable gain.  The width-invariant reduction mapping was
+derived for the delivery's per-type nwarps, so the rule must not be
+enabled until that mapping is re-derived for nwarps=1.
+
+Landed at the maintainer's request as a mergeable WIP scaffold; see
+wip/mmb-general/gfx1100-s9-nwarps-results.md.
+---
+ ggml/src/ggml-cuda/mmvq.cu | 86 ++++++++++++++++++++++++++------------
+ 1 file changed, 59 insertions(+), 27 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 436a72751..51c0a417d 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -450,7 +450,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
+ #endif
+ }
+ 
+-static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
++static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false, bool small_m = false) {
+     if (table_id == MMVQ_PARAMETERS_GENERIC) {
+         switch (ncols_dst) {
+             case 1:
+@@ -496,20 +496,24 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+         // speculative verify batch (n_draft+1 tokens) must use the same nwarps
+         // as decode so its per-row dot-product accumulation is bit-identical.
+         if (ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
++            // gfx1100 (2026-09-21): the wide block wins the large-M dense shapes
++            // (gemma-12B Q8_0 attn/ffn) but loses the small-M dense layers of a
++            // MoE (35B-A3B, gemma-26B); small_m (M <= GGML_CUDA_MMVQ_RDNA3_SMALL_M)
++            // keeps 1 there.  Band-uniform within a shape: M is a weight dim.
+             switch (type) {
+                 case GGML_TYPE_Q4_0:
+                 case GGML_TYPE_Q4_1:
+                 case GGML_TYPE_Q5_0:
+                 case GGML_TYPE_Q5_1:
+                 case GGML_TYPE_Q8_0:
+-                    return 8;
++                    return small_m ? 1 : 8;
+                 case GGML_TYPE_Q6_K:
+                     // gfx1100 sweep 2026-08-28 (rdna3-boosts R5): nwarps=8 beats
+                     // the old 2 by +0.8-1.0% decode; the other widened types
+                     // (Q2_K/Q4_K/Q5_K/IQ4_XS at 8) regressed -4..-7% and stay 1.
+-                    return 8;
++                    return small_m ? 1 : 8;
+                 case GGML_TYPE_IQ4_NL:
+-                    return 8;
++                    return small_m ? 1 : 8;
+                 default:
+                     return 1;
+             }
+@@ -592,11 +596,27 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+ // at 1.  The choice is per tensor shape (K is fixed for a weight), so W = 1..8 of the
+ // same tensor still agree.  Fusion ops (GDN/SSM, shared-expert, the gate fusions)
+ // MUST keep plain calc_nwarps -- their nwarps is a single-token reduction-order anchor.
+-static constexpr __host__ __device__ int calc_nwarps_weight(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool long_k) {
++static constexpr __host__ __device__ int calc_nwarps_weight(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool long_k, bool small_m = false) {
+     if (table_id == MMVQ_PARAMETERS_RDNA4 && type == GGML_TYPE_Q8_0 && !long_k && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
+         return 8;
+     }
+-    return calc_nwarps(type, ncols_dst, table_id);
++    return calc_nwarps(type, ncols_dst, table_id, false, false, small_m);
++}
++
++// gfx1100 (RDNA3_0) experimental nwarps knob.  The small-M MoE dense layers prefer
++// nwarps=1 (35B-A3B +2.1 % draft-mtp, gemma-26B +2.1 % decode at M<=2048/4096), but
++// changing nwarps for those shapes BREAKS the W=1..8 width-purity contract on the MoE
++// models (35B FAIL at threshold >= 2048; gemma-26B FAIL and a large 3.35 divergence at
++// >= 4096) -- the width-invariant reduction mapping was derived for the delivery's
++// per-type nwarps.  Only threshold <= 1024 is pure on the four gfx1100 models, and it
++// gives no measurable gain.
++//
++// DEFAULT 0 = DISABLED (byte-identical to the pre-change table).  A positive threshold
++// enables the M rule for experiments only; do NOT ship a non-zero default until the
++// width-invariant mapping is re-derived for nwarps=1.  See gfx1100-s9-nwarps-results.md.
++static int mmvq_rdna3_0_small_m() {
++    static const int v = getenv("GGML_CUDA_MMVQ_RDNA3_SMALL_M") ? atoi(getenv("GGML_CUDA_MMVQ_RDNA3_SMALL_M")) : 0;
++    return v;
+ }
+ 
+ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+@@ -912,8 +932,8 @@ static __global__ void mul_mat_vec_q(
+ // 12-block release kernel (same per-row chunk->group mapping as the old
+ // ncols_dst == 1 path).
+ // ---------------------------------------------------------------------------
+-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false>
+-__launch_bounds__(calc_nwarps_weight(type, ncols_dst, get_device_table_id(), long_k)*ggml_cuda_get_physical_warp_size(), 1)
++template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false, bool small_m = false>
++__launch_bounds__(calc_nwarps_weight(type, ncols_dst, get_device_table_id(), long_k, small_m)*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q_ksplit(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+@@ -930,7 +950,7 @@ static __global__ void mul_mat_vec_q_ksplit(
+     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+     constexpr int vdr = get_vdr_mmvq(type);
+     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+-    constexpr int nwarps = calc_nwarps_weight(type, ncols_dst, table_id, long_k);
++    constexpr int nwarps = calc_nwarps_weight(type, ncols_dst, table_id, long_k, small_m);
+     constexpr int rows_per_cuda_block = calc_rows_per_block_override(rows_per_block, ncols_dst, table_id, small_k, nwarps);
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+@@ -1369,8 +1389,8 @@ static __global__ void mul_mat_vec_q_moe(
+ template<ggml_type type, bool weight_rule = false>
+ static std::pair<dim3, dim3> calc_launch_params(
+         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
+-        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false, const bool long_k = false) {
+-    const int nwarps = weight_rule ? calc_nwarps_weight(type, ncols_dst, table_id, long_k) : calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
++        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false, const bool long_k = false, const bool small_m = false) {
++    const int nwarps = weight_rule ? calc_nwarps_weight(type, ncols_dst, table_id, long_k, small_m) : calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+     const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
+     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
+@@ -1411,7 +1431,7 @@ static void mul_mat_vec_q_switch_fusion(
+         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+ }
+ 
+-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false>
++template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false, bool small_m = false>
+ static void mul_mat_vec_q_switch_fusion_ksplit(
+         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
+@@ -1427,7 +1447,7 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
+     if constexpr (c_ncols_dst == 1) {
+         if (has_fusion) {
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+-            ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, true, small_k, halve_iters, rows_per_block, long_k>, launch_params,
++            ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, true, small_k, halve_iters, rows_per_block, long_k, small_m>, launch_params,
+                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+@@ -1438,7 +1458,7 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
+     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+ 
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+-    ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, false, small_k, halve_iters, rows_per_block, long_k>, launch_params,
++    ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, false, small_k, halve_iters, rows_per_block, long_k, small_m>, launch_params,
+         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+@@ -1685,27 +1705,39 @@ static void mul_mat_vec_q_switch_ncols_dst(
+                 }
+             };
+ 
+-            // Dense rows always use the ksplit kernel.  Its nwarps is chosen per
+-            // (type, K): a Q8_0 weight with K < 4096 (the MoE attention qkv/gate and
+-            // the lm_head) takes the wider block, K >= 4096 (the dense hybrid
+-            // attn_v/ssm_out) stays at 1 -- band-uniform within each shape.
++            // Dense rows always use the ksplit kernel.  On RDNA4 its nwarps is chosen
++            // per (type, K): a Q8_0 weight with K < 4096 takes the wider block.
++            // On gfx1100 (RDNA3_0, 2026-09-21) it is additionally chosen per shape
++            // M: the wide block wins the large-M dense shapes but loses the small-M
++            // dense layers of a MoE, so M <= GGML_CUDA_MMVQ_RDNA3_SMALL_M uses 1.
++            // Non-fusion MUL_MAT only -- fusion ops keep the plain table (the known
++            // single-token reduction-order anchor; see calc_nwarps_weight).
+             const bool long_k = ncols_x >= 4096;
++            // The host picks the effective small_m (excluded for fusion launches); the kernel
++            // must then use it verbatim -- an earlier host/kernel mismatch launched a 1-warp
++            // block for an 8-warp kernel and produced garbage on the 35B.
++            const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
++                                    fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
++                                    fusion.conv_input != nullptr;
++            const bool small_m = table_id == MMVQ_PARAMETERS_RDNA3_0 && !has_fusion && nrows_x <= mmvq_rdna3_0_small_m();
+             const auto launch_ksplit = [&](auto ncols_tag) {
+                 constexpr int c_ncols_dst = decltype(ncols_tag)::value;
+-                if (long_k) {
+-                    std::pair<dim3, dim3> dims = calc_launch_params<type, true>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, false, true);
+-                    mul_mat_vec_q_switch_fusion_ksplit<type, c_ncols_dst, false, false, 0, true>(
++                const auto go = [&](auto long_k_tag, auto small_m_tag) {
++                    constexpr bool c_long_k  = decltype(long_k_tag)::value;
++                    constexpr bool c_small_m = decltype(small_m_tag)::value;
++                    std::pair<dim3, dim3> dims = calc_launch_params<type, true>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, false, c_long_k, c_small_m);
++                    mul_mat_vec_q_switch_fusion_ksplit<type, c_ncols_dst, false, false, 0, c_long_k, c_small_m>(
+                         vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                         channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                         sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                         dims.first, dims.second, 0, ids_stride, stream);
++                };
++                if (long_k) {
++                    if (small_m) { go(std::true_type{},  std::true_type{});  }
++                    else         { go(std::true_type{},  std::false_type{}); }
+                 } else {
+-                    std::pair<dim3, dim3> dims = calc_launch_params<type, true>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, false, false, false);
+-                    mul_mat_vec_q_switch_fusion_ksplit<type, c_ncols_dst, false, false, 0, false>(
+-                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+-                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+-                        dims.first, dims.second, 0, ids_stride, stream);
++                    if (small_m) { go(std::false_type{}, std::true_type{});  }
++                    else         { go(std::false_type{}, std::false_type{}); }
+                 }
+             };
+ 
+-- 
+2.55.0
+

@@ -234,6 +234,12 @@ and keeps the full type set — the split only narrows what RDNA4 accepts.  Deta
 
 ## gfx1100 job (the next box)
 
+> **Porting to gfx1100?  Read [`gfx1100-porting.md`](gfx1100-porting.md) first.**  It is the live
+> multi-session overlay for a single RX 7900 XTX (24 GB): the branch/worktree split, the
+> re-examination of the prior gfx1100 decisions (§2), the per-group gfx1100 assessment, the session
+> breakdown and the explicit **trust-RDNA3_5** scoping for the qwen4exp groups that cannot fit a
+> 24 GB card.  The framing below is the summary; the overlay is the source of truth.
+
 gfx1100 (RDNA3_0, RX 7900 XTX) shares the **gfx11** WMMA builtin with gfx1151, so it needs **none of
 the gfx12 fragment work**.  Its job is the mirror image of gfx1201's:
 
