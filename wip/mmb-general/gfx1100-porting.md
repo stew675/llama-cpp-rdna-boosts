@@ -39,6 +39,24 @@ Raw data: **`gfx1100-s2s4-results.md`**.
 
 Next: **S5-S7 (G1 `mmb`)** — the headline re-tune/re-scope.  Live work is §6.5.
 
+**S5-S7 log (2026-09-21): `mmb` is a LARGE gfx1100 win.**  Raw data: **`gfx1100-s5s7-results.md`**.
+* **S5 (open):** `GGML_CUDA_MMB=1 GGML_CUDA_MMB_RDNA3=1` fires (`MMB_DENSE` + `MMB_GLU`); PPL parity
+  (27B −0.9 %, 35B +0.4 %).
+* **S6 (matrix):** with the gfx1151 default, the **quantized dense GEMM wins big** — 27B Q4_K_M
+  **+14.4 %**, gemma-12B Q8_0 **+11.3 %** at pp8192 — the opposite of gfx1201's dense regression.
+  The 35B MoE +2.4 %; gemma-26B-A4B **−3.1 %**.
+* **The one loser is the F32 MoE-router split.**  gemma-26B's regression vanishes with
+  `GGML_CUDA_MMB_F32SPLIT=0` (it only ever ran the f32 router; its quantized weights are Q4_0, not an
+  MMB type), and the 35B gains further (+3 % more).  **Patch `0008`** defaults the F32 split off on
+  RDNA3_0/RDNA4 (gfx1151 unchanged).  With that default: **27B +14.4 %, gemma-12B +11 %, 35B MoE
+  +5.6 %/+4.7 %, gemma-26B neutral.**
+* **Correctness:** decode unchanged (`mmb_min_t = 512`), width purity PASS, PPL parity; the 27B
+  long-context text re-baselines with MMB on (expected — a different GEMM contraction, the qsa3
+  class), 35B identical.  MTP 27B acceptance 0.80 (off 0.78), prefill 1154 t/s (off 1000).
+
+Next: **S8 (G3b/c + HC16)** — then S9 (the delivery re-examination + full matrix) and S10
+(freeze/merge).  See §6.6 and §8.
+
 ---
 
 ## 0. TL;DR
@@ -135,9 +153,13 @@ delivery work and the entire `mmb-general` WIP).  Each is therefore "re-open and
   the generic dense tile lost for *every* type on RDNA4 while the routed/HC paths won.  RDNA3_0 is a
   *tuned-differently* sibling (`GROUPS.md`), and its delivery already carries the block-13 fused MoE
   MMQ paths that MMB would compete with.
-* **Action (S6/S7).**  Measure MMB per **weight type** and per **path** on gfx1100 with the
-  `GGML_CUDA_MMB_TYPES=<csv>` and `GGML_CUDA_MMB_DENSE=0|1` overrides (already in patch 6), then set
-  a gfx1100 arm in the arch policy if it differs from gfx1151.  This is the headline gfx1100 work.
+* **Action (S6/S7) — DONE 2026-09-21.**  Measured per path: the quantized dense GEMM is a **large
+  win on gfx1100** (27B Q4_K_M +14.4 %, gemma-12B Q8_0 +11.3 % at pp8192), and the routed MoE path
+  wins too (~+4 %).  The **only** loser is the **F32 MoE-router split**; `mmb_dense_flag()` being ON
+  meant gfx1100 inherited gfx1151's f32split-on, which cost gemma-26B-A4B −3.1 % and 35B-A3B −3.0 %.
+  **Patch `0008`** now defaults the F32 split off on RDNA3_0/RDNA4 (gfx1151 unchanged), so a user
+  who sets `GGML_CUDA_MMB=1` on gfx1100 cannot lose.  The full type set is kept (no type narrowing
+  needed on gfx1100).  Data: `gfx1100-s5s7-results.md`.
 
 ### 2.3 The `mmvq` RDNA3_0 parameter table
 
@@ -401,6 +423,14 @@ The cheap highlights:
 
 This is the largest and most valuable item.  Split it into three steps:
 
+> **STATUS (S5-S7, 2026-09-21): DONE — and gfx1100 is the opposite of gfx1201.**  The quantized dense
+> GEMM is a **large win** (27B Q4_K_M **+14.4 %**, gemma-12B Q8_0 **+11.3 %** at pp8192), the routed
+> MoE path wins (~+4 % on the 35B), and the **only** loser is the **F32 MoE-router split**.  Patch
+> `0008` defaults the F32 split off on RDNA3_0/RDNA4, after which: 27B **+14.4 %**, gemma-12B
+> **+11 %**, 35B-A3B **+5.6 %/+4.7 %** (pp8192/32768), gemma-26B-A4B **neutral**.  Decode unchanged,
+> width purity PASS, PPL parity.  Full data: `gfx1100-s5s7-results.md`.  The priming below
+> ("expect a dense regression like gfx1201") **did not hold** — the dense tile is fine on RDNA3_0.
+
 **6.5.1 Open and confirm (S5).**  `GGML_CUDA_MMB=1 GGML_CUDA_MMB_RDNA3=1`.  Confirm MMB fires
 (`GGML_CUDA_MMB_LOG=1`) and PPL is at parity (a fragment-layout error is an exact-permutation error —
 it would move PPL by orders of magnitude, not 0.1 %).  The gfx11 shim is the **already-validated**
@@ -433,10 +463,13 @@ do not transfer them.  Sweep at least `mmb_glu_thresh` / `mmb_routed_thresh` (de
   process**, not just a new model load.
 
 **6.5.4 Purity / correctness gates for G1:** PPL parity, same-seed greedy, the width probe, and
-`test-backend-ops`.  The MMB stand-down is per-tensor, so an excluded (type,path) costs nothing (it
-keeps the delivery's MMQ path) — but any new gate must be added to **all** of `supported_mm`,
-`supported_mmid`, `supported_glu`, `dense_will_take`, `routed_will_take` or the graph and dispatch
-disagree (`gfx1201-porting.md` §13 trap 2).
+`test-backend-ops`.  **S5-S7 result:** all pass; the 27B long-context greedy text re-baselines with
+MMB on (a different GEMM contraction — the approved qsa3 class), the 35B is identical, and width
+purity is PASS.  Decode/verify are untouched by construction (`mmb_min_t = 512`).  The MMB stand-down
+is per-tensor, so an excluded (type,path) costs nothing (it keeps the delivery's MMQ path) — but any
+new gate must be added to **all** of `supported_mm`, `supported_mmid`, `supported_glu`,
+`dense_will_take`, `routed_will_take` or the graph and dispatch disagree (`gfx1201-porting.md` §13
+trap 2).
 
 ### 6.6 G3b/c + G4 HC16 (S8)
 
@@ -498,14 +531,15 @@ relevant gates, write a dated `gfx1100-sNN-results.md`, commit the record to the
 | **S2** | arch-neutral wins ✅ | G5 indexer + G4 non-temporal applied/A/B'd; `GGML_OP_NAME` fill fix | `TOPK_QSA` 4/4; G4 **neutral** (no change); `FLASH_ATTN_EXT` 5955/0-FAIL |
 | **S3** | G3a policy ✅ | gfx1100 always-QSA decision documented (trust-RDNA3_5) | shortcut stays ON (arch default); no code change |
 | **S4** | G2 `qsa3` RDNA3_0 ✅ | predicate gains `RDNA3_0`; oracle re-run; kernel-trace confirmed | `FLASH_ATTN_QSA` **26/26** + `qsa3_attn_kernel` dispatched; patch `0007` |
-| **S5** | G1 open | `MMB_RDNA3=1`; MMB fires; correctness | PPL parity; same-seed greedy; width probe |
-| **S6** | G1 per-type/path matrix + dense re-tune | the gfx1100 type/path scope; tile/threshold sweep | neutral where it loses, wins where it lands; kernel-time-backed |
-| **S7** | G1 routed/GLU re-tune + block-13 A/B | routed/GLU tuning; MMB-routed vs block-13 fused MoE | measured, purity-checked, defaulted |
+| **S5** | G1 open ✅ | `MMB_RDNA3=1`; MMB fires; correctness | PPL parity (−0.9 %/+0.4 %); width probe PASS |
+| **S6** | G1 per-type/path matrix + re-tune ✅ | **gfx1100 = dense wins big, F32 router loses**; patch `0008` | 27B +14.4 %, gemma-12B +11 %, 35B MoE +5.6 %, g26 neutral |
+| **S7** | G1 routed/GLU ✅ | routed isolate (the bulk of the MoE win, ~+4 %) | kernel-time-free but `DENSE=0` isolate-backed; finer knobs deferred |
 | **S8** | G3b/c + HC16 | F32 split / tiny-M / HC16 isolated and A/B'd | each knob measured + purity-checked |
 | **S9** | the delivery re-examination + full matrix | §2.3-§2.7 re-measured; B1-B9 re-run on the frozen tree | every gate green with numbers |
 | **S10** | freeze + regenerate + merge back | new WIP patch (likely patch 7 = gfx1100 scope/tuning); docs updated; `git am` N/N; merge record branch into `wip-mmb-general` | gfx1100 handed a clean state; branches reconciled |
 
-Sessions S1-S4 are done.  S5-S7 (G1 `mmb`) are the headline and the live work; S8-S10 follow.
+Sessions S1-S7 are done.  S8 (G3b/c + HC16), S9 (delivery re-examination + full matrix) and S10
+(freeze/merge) remain; see §13's successor log and the results files.
 
 ---
 
@@ -563,9 +597,10 @@ claim* is deferred.
 - [ ] G4 non-temporal — ✅ A/B'd: **neutral on gfx1100**, no code change (S2)
 - [ ] G3a always-QSA decision documented — ✅ shortcut stays ON (S3, trust-RDNA3_5)
 - [ ] G2 `qsa3` predicate gains `RDNA3_0` — ✅ **26/26** + kernel trace; patch `0007` (S4)
-- [ ] G1 `mmb` opened (`MMB_RDNA3=1`), fires, PPL parity (S5)
-- [ ] G1 gfx1100 per-type/per-path scope + tile/threshold re-tune (S6)
-- [ ] G1 routed/GLU vs block-13 fused MoE, kernel-time-backed (S7)
+- [x] G1 `mmb` opened (`MMB_RDNA3=1`), fires, PPL parity (S5)
+- [x] G1 gfx1100 per-type/per-path: **dense is a big win, F32 router loses**; patch `0008` (S6)
+- [x] G1 routed/GLU isolate: the routed path is the bulk of the MoE win (~+4 %) (S7)
+- [ ] G1 optional finer routed/GLU threshold + `DBUF` sweep (deferred)
 - [ ] G3b/c + HC16 measured and defaulted (S8)
 - [ ] delivery re-examination §2.3-§2.7 re-measured (S9)
 - [ ] B1-B9 green on the frozen tree, including MTP (S9)

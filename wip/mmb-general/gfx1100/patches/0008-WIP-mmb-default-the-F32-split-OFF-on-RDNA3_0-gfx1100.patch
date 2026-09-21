@@ -1,0 +1,51 @@
+From 1359b1c092039185f1aec8147c420d8fc9a61b21 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Mon, 21 Sep 2026 10:18:32 -0500
+Subject: [PATCH] WIP mmb: default the F32 split OFF on RDNA3_0 (gfx1100)
+
+Measured on a single RX 7900 XTX (2026-09-21): with the gfx1151 default
+(F32 split on) MMB regressed the MoE models because the F32 router is a
+loss there -- gemma-26B-A4B (an all-F32-router MoE; its quantized weights
+are Q4_0, not an MMB type) pp8192 3302 -> 3196 (-3.2 %), and 35B-A3B
+pp8192 3879 -> 3762 (-3.0 %) on top of its other MMB wins.
+
+mmb_f32split_mode() now defaults to 1 only on RDNA3_5 (the arch it was
+measured on) and 0 elsewhere; GGML_CUDA_MMB_F32SPLIT still overrides.
+RDNA4 is unchanged in practice (mmb_dense_flag() already suppresses the
+F32 candidate there).
+
+With this default, MMB on gfx1100 is: 27B Q4_K_M dense +14.4 %,
+gemma-12B Q8_0 dense +11 %, 35B-A3B MoE +5.6 %/+4.8 % at pp8192/32768,
+gemma-26B-A4B neutral.  Decode is untouched (mmb_min_t = 512).
+---
+ ggml/src/ggml-cuda/mmb.cu | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index f04cb2ea3..6a9c0ebc8 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -1305,9 +1305,17 @@ int  mmb_min_t()   { static const int v = getenv("GGML_CUDA_MMB_MIN_T") ? atoi(g
+ // traffic) and loses the 2.4x there; on M=4/K=10240 the 128-row MMB tile wastes WMMA rows and loses.
+ // Net with the M>=128 rule: 1947 -> ~1537 ms of F32 (about -3 % prefill).
+ //
+-// Modes: 0 = off (all rocBLAS), 1 = shape-aware (default), 2 = every F32 GEMM through MMB (the
+-// pre-2026-09-19 behaviour, kept for A/B).
+-int  mmb_f32split_mode(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : 1; return v; }
++// Modes: 0 = off (all rocBLAS), 1 = shape-aware (default on gfx1151), 2 = every F32 GEMM through MMB
++// (the pre-2026-09-19 behaviour, kept for A/B).
++// The shape-aware split is a gfx1151 win (the router measured ~2.4x better on MMB there), but it
++// measured a *loss* on gfx1100 (2026-09-21): gemma-26B-A4B (an all-F32-router MoE) pp8192
++// 3302 -> 3196 (-3.2 %) and 35B-A3B pp8192 3879 -> 3762 (-3.0 %) with it on.  Default it off on
++// RDNA3_0/RDNA4 and keep gfx1151's on; GGML_CUDA_MMB_F32SPLIT overrides (>= 0 wins).
++int  mmb_f32split_mode(){
++    static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : -1;
++    if (v >= 0) return v;
++    return GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[0].cc) ? 1 : 0;
++}
+ bool mmb_f32split() { return mmb_f32split_mode() != 0; }
+ // Defaults: MIN_M = 128 (the router; measured 2.4x better on MMB) and MIN_K = 0 (disabled -- the
+ // long-K hc inject pair is *worse* on MMB despite the WMMA path; see the table above).
+-- 
+2.55.0
+

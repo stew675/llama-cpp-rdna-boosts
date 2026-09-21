@@ -18,9 +18,12 @@ git rev-parse HEAD^{tree}                     # -> 580db5174574f10cc92fb1cefa722
 git am /home/stew675/llama-cpp-rdna-boosts/wip/mmb-general/gfx1100/patches/*.patch   # 0007
 ```
 
-`0007` applies clean on top of the 6-patch tree.  It changes one file
-(`ggml/src/ggml-cuda/fattn-qsa3.cu`): `ggml_cuda_flash_attn_qsa3_supported()` gains `RDNA3_0`, so the
-packed-block WMMA QSA path runs on gfx1100 (gfx11 fragment arm, identical to gfx1151).
+`0007` and `0008` apply clean, in order, on top of the 6-patch tree:
+
+* `0007` (`fattn-qsa3.cu`): `ggml_cuda_flash_attn_qsa3_supported()` gains `RDNA3_0`, so the
+  packed-block WMMA QSA path runs on gfx1100 (gfx11 fragment arm, identical to gfx1151).
+* `0008` (`mmb.cu`): `mmb_f32split_mode()` defaults the F32 split off on RDNA3_0/RDNA4 (gfx1151
+  keeps it on), because the F32 MoE-router split is a loss on gfx1100.
 
 ## Why a patch instead of folding it into the canonical patch 2
 
@@ -30,7 +33,11 @@ merge-back a clean replay.  If the maintainer prefers, it folds into patch 2 at 
 
 ## Status
 
-* `0007` is **validated** on gfx1100 at the unit level: `test-backend-ops -o FLASH_ATTN_QSA` 26/26,
-  and a `rocprofv3` kernel trace shows `qsa3_attn_kernel` + `qsa3_pack/merge/rows` dispatched.
+* `0007` (qsa3) is **validated** on gfx1100 at the unit level: `test-backend-ops -o FLASH_ATTN_QSA`
+  26/26, and a `rocprofv3` kernel trace shows `qsa3_attn_kernel` + `qsa3_pack/merge/rows` dispatched.
   End-to-end qwen4exp performance is trust-RDNA3_5 (no qwen4exp model fits 24 GB).
-* See `../gfx1100-s2s4-results.md` for the record.
+* `0008` (mmb) **defaults the F32 MoE-router split off on RDNA3_0/RDNA4** (gfx1151 unchanged).
+  With it, `GGML_CUDA_MMB=1 GGML_CUDA_MMB_RDNA3=1` is a large gfx1100 win: 27B Q4_K_M +14.4 %,
+  gemma-12B Q8_0 +11.3 %, 35B-A3B MoE +5.6 %/+4.7 %, gemma-26B-A4B neutral.  Decode unchanged,
+  width purity PASS, PPL parity.
+* See `../gfx1100-s2s4-results.md` and `../gfx1100-s5s7-results.md` for the records.
