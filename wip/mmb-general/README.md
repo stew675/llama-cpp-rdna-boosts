@@ -282,11 +282,54 @@ wherever MMB would lose, +3…+7 % where it wins**, and a qwen4exp user can opt 
 with `GGML_CUDA_MMB_DENSE=1`.  The open work is a **real gfx1201 dense tile geometry** — the current
 one is gfx1151-tuned and is where every RDNA4 loss lives.
 
-> **The remaining gfx1201 work is now scoped in `gfx1201-porting.md` §13 (S10-S15)** — read that
-together with `HANDOVER.md` when picking the WIP up: S10 the dense tile geometry (the headline win),
-S11 the arch-scoped `mmb_*` tuning constants, S12 the routed/GLU tuning with kernel-time evidence,
-S13 the F32/HC16 paths, S14 the B1-B9 matrix (**MTP has never been run on gfx1201**), S15 the freeze
-and hand-off.  S1-S7 are complete.
+> **The remaining gfx1201 work is now scoped in `gfx1201-porting.md` §13 (S11-S15)** — read that
+together with `HANDOVER.md` when picking the WIP up: S11 the arch-scoped `mmb_*` tuning constants,
+S12 the routed/GLU tuning with kernel-time evidence (**and the routed-MoE default re-decision, see
+session 30**), S13 the F32/HC16 paths, S14 the B1-B9 matrix (**MTP has never been run on gfx1201**),
+S15 the freeze and hand-off.  S1-S10 are complete.
+
+---
+
+## UPDATE — session 30 (2026-09-21): **the RDNA4 dense tile geometry — the dense path is a per-TYPE win**
+
+S10 of `gfx1201-porting.md` (the headline remaining win).  Full record:
+**`gfx1201-s10-dense-geometry.md`**.
+
+**The mechanism.**  `rocprofv3 --kernel-trace` carries `VGPR_Count`/`LDS_Block_Size` per launch, and
+that settled it: the gfx1151-tuned dense tile needs **55296 B of LDS**, so exactly **one** workgroup
+fits a CU (`sharedMemPerBlock` = 65536) — 8 warps, 2 per SIMD — while the delivery's MMQ uses **no
+LDS at all** (it dequantizes into registers) and gets **3 blocks**.  On top of that, with `BM=128`
+only **half** of the 256 threads dequantise the A (weight) panel (`A_ITEMS = ceil(BM/256)`), and that
+dequant is serialised with the WMMA work.
+
+**The fix.**  A **256x128** tile (WTM=64, WTN=64, TMxTN=4x4) keeps the same 55296 B but puts all 256
+threads on the A dequant, and it makes the IQ3_S dense GEMM **beat the delivery's MMQ for the first
+time**: 1.856 s vs 1.944 s = **−4.5 %** (27B UD-IQ3_S, pp4096, 1 GPU).  IQ4_XS still loses (+10.9 %)
+and IQ3_XXS/IQ4_NL are break-even, and the whole-model interleaved A/B agrees exactly (IQ3_S-only
++1.0 %, the whole IQ family +0.04 % — IQ4_XS cancels the win).  **So the dense path is a per-weight
+TYPE decision, not a per-arch one:** RDNA4 now enables it for **IQ3_S only**, via
+`mmb_dense_tmask()`/`mmb_dense_type_ok()` (`GGML_CUDA_MMB_DENSE_TYPES=<csv>` is the A/B override;
+`mmb_dense_flag()` still forces the whole path).  Landed as **patch 7** (`git am` 7/7, applied tree
+`9ef573e5d0`), because patches 1/3/4/6 all touch `mmb.cu`.
+
+**Result:** 27B UD-IQ3_S **+0.52 % pp8192 / +0.46 % pp32768** (interleaved r=5, two rounds agreeing
+to 0.02 %); 27B Q8_0 exactly neutral; Flash-Next IQ4_XS +3.2 / +2.2 % (the S7 qwen4exp win
+reproduces).  Same-seed greedy text is identical to the delivery **and to every valid geometry**, so
+the geometry is numerics-neutral — but the sweep still needs a hash gate, because a geometry whose
+declared `BN` is not `(8/(BM/WTM))*WTN` silently computes only part of the output and *looks* fast
+(a `256x192/WTN48` arm measured a fake **−39 %**).  **gfx1151 is instruction-identical** (79/79
+existing kernels, split on the `.size` delimiters; the 11 new 256x128 kernels are unreachable there).
+
+**Correction to the S7 record (important).**  The `35B-A3B UD-Q3_K_M` **+6.7 % MoE win does not
+reproduce**: the *unmodified S7 binary* now measures **−1.4 %** on this box.  The kernel breakdown
+says why — the routed MMB (0.875 s) only **matches** the delivery's `mul_mat_q_routed_compact` +
+`mul_mat_q<IQ3_XXS,64>` (0.880 s), and standing that fused kernel down costs an extra
+`mm_ids_helper` launch (+0.065 s).  So `GGML_CUDA_MMB=1` on RDNA4 is currently a clear win only for
+**qwen4exp (HC/QSA)** models and **IQ3_S-heavy dense** models; **the routed MoE default must be
+re-decided in S12** (along with the `mm_ids_helper` overhead).  Also still open: the
+`mmb_cvt_f32_bf16` activation conversion is a ~1 % tax whose 4-entry cache never hits
+(`GGML_CUDA_MMB_CACHE` is the untested knob), and `DBUF` remains unwired (the shapes where it fits
+are the small-BN ones where it does not pay — the code comment's −6.7 % is still unverified on RDNA4).
 
 ---
 

@@ -6,9 +6,10 @@ supersedes the "gfx1201 is a no-op / new work, not a port" notes in `GROUPS.md` 
 before the delivery's gfx1201 MMQ path was re-tuned).
 
 > **HANDING THIS FILE TO A NEW SESSION?  Read §13 first** — it is the brief for the remaining
-gfx1201 work (S10-S15): the **dense tile geometry**, the arch-scoped tuning constants, the routed
-GLU tuning, the F32/HC16 paths, and the B1-B9 gate matrix (*including MTP, which has never run on
-this box*).  S1-S7 below are done and are history; §13 is the live work.
+gfx1201 work (S11-S15): the arch-scoped tuning constants, the routed GLU tuning, the F32/HC16
+paths, and the B1-B9 gate matrix (*including MTP, which has never run on this box*).  **S1-S10 are
+done** and are history; §13 is the live work.  Note the S10 by-product: the **S7 MoE win does not
+reproduce** (§12 risk 7) — re-decide the routed default in S12.
 
 **Session 1-2 log (2026-09-21):** the WIP was applied to `~/llama.cpp` as branch `rdna-boosts-mmb-port`
 (`git am` **5/5**, clean) and **built green for gfx1201** with the delivery build script (`EXIT=0`,
@@ -444,7 +445,7 @@ checklist updated.
 | **S7** | G1 re-tune + target | measured the matrix; **split the switch** (arch-scoped weight types + path policy) | neutral where it loses, +3…+7 % where it wins; PPL parity on the active subset |
 | **S8** | G3b/c + HC16 + gates | F32/tiny-M/HC16; B1-B9 full matrix | all gates green; gating documented |
 | **S9** | handover to gfx1100 | update §10/§11; commit record | gfx1100 TODO list complete |
-| **S10** | **gfx1201 dense tile geometry** | a runtime geometry selector + a per-type sweep | the dense tile ≥ MMQ for ≥ 1 type, interleaved + kernel-time backed |
+| **S10** | **gfx1201 dense tile geometry** | **DONE** — 256x128 tile + a per-type dense policy (IQ3_S) | met: the dense tile beats MMQ for IQ3_S (-4.5 %, kernel-time + interleaved A/B, +0.5 % model) |
 | **S11** | arch-scoped tuning constants | `mmb_arch_defaults(cc)` for every `mmb_*` tunable | gfx1151 unchanged; RDNA4 defaults in one table |
 | **S12** | routed/GLU tuning + kernel time | threshold sweeps; `DBUF`; the IQ3_XXS GLU arm | the routed win ≥ S7 with kernel-time evidence |
 | **S13** | G3b/c F32/tiny-M + G4 HC16 | isolate and A/B each knob | measured, purity-checked, defaulted |
@@ -511,15 +512,20 @@ qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a g
       per `gfx1201-s5s7-mmb-results.md`; a per-type/gfx1201 dense tile geometry remains open)
 - [ ] G3b/c + HC16 + full gate matrix — **now S13/S14, see §13**
 - [ ] gfx1100 handover written — **now S15, see §13**
-- [ ] **gfx1201 dense tile geometry (S10)** — the headline remaining win
-- [ ] arch-scoped `mmb_*` tuning constants (S11)
-- [ ] routed/GLU tuning + kernel-time evidence (S12)
+- [x] **gfx1201 dense tile geometry (S10)** — **DONE 2026-09-21**: the 256x128 tile makes the IQ3_S
+      dense GEMM beat the delivery MMQ by 4.5 %; landed as per-arch geometry + a per-type dense
+      policy (IQ3_S only) -> +0.5 % prefill on 27B UD-IQ3_S; `gfx1201-s10-dense-geometry.md`
+- [ ] arch-scoped `mmb_*` tuning constants (S11) — the new geometry still selects by a runtime
+      `GGML_CUDA_CC_IS_RDNA4` check inside the dispatch and belongs in the S11 table
+- [ ] routed/GLU tuning + kernel-time evidence (S12) — **and the routed MoE default re-decision,
+      see §12 risk 7: the S7 +6.7 % MoE win does not reproduce (now -1.4 % on the same binary)**
 - [ ] B1-B9 on the final tree, incl. **MTP** — never run on gfx1201 (S14)
 
-**§13 is the brief for the remaining work (S10-S15).**  Start there.
+**§13 is the brief for the remaining work (S11-S15).**  Start there.
 
-**Patch layout (current): 6 patches, tree `580db5174…`** — 1 mmb, 2 qsa3, 3 F32/tiny-M +
-width-probe, 4 HC16, 5 indexer, 6 the `mmb` RDNA4 port + scope split.
+**Patch layout (current): 7 patches, tree `9ef573e5d0…`** — 1 mmb, 2 qsa3, 3 F32/tiny-M +
+width-probe, 4 HC16, 5 indexer, 6 the `mmb` RDNA4 port + scope split, 7 the S10 dense geometry +
+per-type dense policy.
 
 ---
 
@@ -559,6 +565,14 @@ gfx1100 (RDNA3_0) solves a **different** half of the same problem:
 6. **Don't judge routed/GLU on end-to-end t/s** (`GROUPS.md` §6): use `rocprofv3` kernel time and a
    fixed-token `llama-perplexity` for routed shapes.  **The S7 routed numbers are end-to-end** and
    should be re-backed with kernel time in S12 (§13).
+7. **The S7 MoE win does not reproduce (S10 finding).**  `35B-A3B UD-Q3_K_M` measured **+6.7 %** in
+   S7; the *unmodified S7 binary* now measures **-1.4 %** on this box, and the kernel breakdown says
+   why: the routed MMB (0.875 s) only **matches** the delivery's `mul_mat_q_routed_compact` +
+   `mul_mat_q<IQ3_XXS,64>` (0.880 s) and standing that fused kernel down costs an extra
+   `mm_ids_helper` launch (+0.065 s).  So `GGML_CUDA_MMB=1` on RDNA4 is currently a clear win only
+   for **qwen4exp (HC/QSA)** models (+3.2 / +2.2 %) and **IQ3_S-heavy dense** models (+0.5 %) -- **the
+   routed MoE default must be re-decided in S12**, together with the `mm_ids_helper` overhead.
+   Evidence: `gfx1201-s10-dense-geometry.md` §6.
 
 ---
 
@@ -579,6 +593,7 @@ in parallel).
 | S5 | G1 `mmb` gfx12 shim; gfx1151 asm bit-identical | `gfx1201-s5s7-mmb-results.md` §1 |
 | S6 | `mmb` correctness (PPL parity) | `gfx1201-s5s7-mmb-results.md` §2/§5 |
 | S7 | `mmb` **scoped** (arch-scoped weight types + dense/path policy) | `gfx1201-s5s7-mmb-results.md` §4/§6 |
+| S10 | **the RDNA4 dense tile geometry (256x128) + a per-type dense policy** — IQ3_S beats MMQ by 4.5 %, +0.5 % prefill on 27B UD-IQ3_S; and the **S7 MoE win does not reproduce** | `gfx1201-s10-dense-geometry.md` |
 
 **Protocol — apply to every measurement below.**
 
@@ -611,7 +626,33 @@ in parallel).
 5. All `mmb_*` tunables are read once into function-local statics: changing an env var needs a new
    **process**, not just a new model load.
 
-### S10 — the gfx1201 dense tile geometry  *(the headline remaining win)*
+### S10 — the gfx1201 dense tile geometry  — **DONE 2026-09-21**
+
+**Result:** `wip/mmb-general/gfx1201-s10-dense-geometry.md`.  The RDNA4 dense path lost for every
+weight type because of the geometry, not the architecture:
+
+* **Mechanism (rocprofv3, 27B UD-IQ3_S, pp8192, 1 GPU):** the gfx1151-tuned tile needs **55296 B of
+  LDS** -> **1 block/CU** (8 warps, 2 per SIMD) against the delivery MMQ's **0 LDS / 3 blocks**;
+  and with `BM=128` only **half** of the 256 threads dequantise the A panel (`A_ITEMS = 1`), which
+  is serialised with the WMMA work.
+* **A 256x128 tile** (WTM=64, WTN=64, TMxTN=4x4, same 55296 B) puts all 256 threads on the A dequant
+  and makes the IQ3_S dense GEMM **1.856 s vs MMQ's 1.944 s = -4.5 %**.  IQ4_XS still loses (+10.9 %)
+  and IQ3_XXS/IQ4_NL are break-even, so the dense path is a **per-TYPE** decision: RDNA4 enables it
+  for **IQ3_S only** (`mmb_dense_tmask()`/`mmb_dense_type_ok()`, `GGML_CUDA_MMB_DENSE_TYPES=<csv>`).
+* **27B UD-IQ3_S interleaved A/B, r=5:** **+0.52 % pp8192 / +0.46 % pp32768** (two rounds agreeing to
+  0.02 %).  27B Q8_0 exactly neutral; Flash-Next IQ4_XS +3.2 / +2.2 % (the S7 qwen4exp win
+  reproduces); **gfx1151 instruction-identical** (79/79 kernels, md5 `fc698705809822f4c821adb115367dc8`).
+* **Validity rule, easy to get wrong:** `BN` must equal `(8/(BM/WTM))*WTN`, else the kernel silently
+  computes only part of the output and *looks* fast (a 256x192/WTN48 arm measured a fake -39 %).
+  Gate every geometry candidate on a same-seed text hash; the geometry itself is numerics-neutral.
+* **Correction to S7 (§12 risk 7):** the `35B UD-Q3_K_M` "+6.7 % MoE" does **not** reproduce -- the
+  unmodified S7 binary now measures **-1.4 %** (the routed MMB only matches the delivery's
+  `mul_mat_q_routed_compact` and adds an `mm_ids_helper` launch).  The routed default needs a
+  re-decision in S12.
+
+The original brief follows (the runtime-selector recommendation was **not** taken: a real `mmb.cu`
+rebuild is 14 s and the A/B reference `MMB=0` is a runtime switch in the same binary, so an
+edit-and-rebuild sweep is simpler than a second instantiation set).
 
 **Why:** every RDNA4 `mmb` loss lives in the *generic quantized dense tile GEMM*
 (`gfx1201-s5s7-mmb-results.md` §3-§4): −3 % on an 82 %-IQ dense model, −6 % on Q8_0, −11 % on a
@@ -741,8 +782,9 @@ work as a new patch unless the touched files are owned by exactly one existing p
 
 ### 13.1 Definition of done for "the remaining gfx1201 work"
 
-- [ ] the dense tile geometry has a gfx1201 answer (win → density re-enabled per type; or a recorded,
-      kernel-time-backed "MMQ wins on RDNA4 for dense" so the decision is closed)
+- [x] the dense tile geometry has a gfx1201 answer (win → density re-enabled per type; or a recorded,
+      kernel-time-backed "MMQ wins on RDNA4 for dense" so the decision is closed) — **S10: both.
+      IQ3_S wins (-4.5 %) and is enabled; IQ4_XS/IQ3_XXS/IQ4_NL stay off, kernel-time backed**
 - [ ] every `mmb_*` tunable has an arch-scoped default with gfx1151 unchanged
 - [ ] the routed/GLU path is tuned and kernel-time-backed; the IQ3_XXS GLU arm re-decided
 - [ ] G3b/c and HC16 are measured, purity-checked and defaulted

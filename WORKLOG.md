@@ -1,5 +1,32 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-21 (WIP, not a delivery change) — gfx1201 port, session 30: the RDNA4 dense tile geometry
+
+`s10` of `wip/mmb-general/gfx1201-porting.md`.  **This is experimental WIP, not part of the delivered
+patch set**; the record lives in `wip/mmb-general/gfx1201-s10-dense-geometry.md`.
+
+**The RDNA4 `mmb` dense tile lost for every weight type because of the geometry, not the
+architecture.**  `rocprofv3 --kernel-trace` carries `VGPR_Count`/`LDS_Block_Size` per launch, which
+settled it: the gfx1151-tuned tile needs **55296 B of LDS** -> **1 workgroup per CU** (8 warps, 2 per
+SIMD) against the delivery MMQ's **0 LDS / 3 blocks**; and at `BM=128` only **half** the 256 threads
+dequantise the A (weight) panel.  A **256x128** tile (WTM=64, WTN=64, TMxTN=4x4) makes the IQ3_S
+dense GEMM beat the delivery MMQ **for the first time**: 1.856 s vs 1.944 s = **-4.5 %** (27B UD-IQ3_S,
+pp4096, 1 GPU).  IQ4_XS still loses (+10.9 %), IQ3_XXS/IQ4_NL are break-even, so the dense path is a
+**per-weight-TYPE** decision: RDNA4 enables it for IQ3_S only.
+
+* 27B UD-IQ3_S interleaved A/B (r=5, two rounds agreeing to 0.02 %): **+0.52 % pp8192 / +0.46 %
+  pp32768**.  27B Q8_0 exactly neutral.  Flash-Next IQ4_XS (qwen4exp, 3-GPU tensor) **+3.2 / +2.2 %**
+  (the S7 qwen4exp win reproduces).
+* Same-seed greedy text identical to the delivery **and to every valid geometry** (geometry is
+  numerics-neutral).  Validity rule: `BN` must equal `(8/(BM/WTM))*WTN`, else the kernel silently
+  computes only part of the output and *looks* fast (a 256x192/WTN48 arm measured a fake -39 %).
+* **gfx1151 instruction-identical**: 79/79 existing kernels, md5 `fc698705809822f4c821adb115367dc8`
+  (the 11 new 256x128 kernels are unreachable there).
+* **Correction to the S7 record:** the `35B-A3B UD-Q3_K_M` "+6.7 % MoE" does **not** reproduce -- the
+  *unmodified S7 binary* now measures **-1.4 %**, because the routed MMB only **matches** the
+  delivery's `mul_mat_q_routed_compact` + `mul_mat_q<IQ3_XXS,64>` and the stand-down costs an extra
+  `mm_ids_helper` launch.  The routed MoE default needs a re-decision.
+
 ## 2026-09-21 (r12) — `v16-ebbb18522-r12`: `--fit` supports `-sm tensor` (beta/tensor-fit-fix promoted, block 06)
 
 **Release** `v16-ebbb18522-r12`, canonical tip `54f8a57fc50344f738c363c13b243a0ad81f70da`, net tree

@@ -36,11 +36,15 @@ git am <this-repo>/wip/mmb-general/patches/*.patch   # 6/6, tree 580db5174...
 | 4 | `0004-WIP-HC16-…` | HC16 native-BF16 producers + non-temporal accesses | `GGML_CUDA_MMB_HC16=1` (producers) / none (NT hints) | mixed |
 | 5 | `0005-WIP-indexer-…` | the fused indexer top-k op | none (op-driven) | **yes** |
 | 6 | `0006-WIP-mmb-RDNA4-…` | the `mmb` RDNA4 (gfx12) fragment port **+ the arch-scoped weight-type/path split** | `GGML_CUDA_MMB=1` + the scope policy (`MMB_TYPES` / `MMB_DENSE`) | no |
+| 7 | `0007-WIP-mmb-RDNA4-…` | **the RDNA4 dense tile geometry (256x128) + the per-type dense policy** | `GGML_CUDA_MMB=1` (IQ3_S dense is now in the RDNA4 default); `MMB_DENSE_TYPES=<csv>` / `MMB_DENSE=0\|1` | no |
 
-> **Patch 6 and the theme split.**  S5-S7 (2026-09-21) landed as its own patch rather than folded:
-> patches 1, **3 and 4** all touch `mmb.cu`, so there is no single theme to fold it into without a full
-> re-cut.  Patch 6 is therefore the authoritative source for the RDNA4 scope policy
-> (`mmb_wtype_ok` / `mmb_dense_flag`) — see `gfx1201-s5s7-mmb-results.md` §4.
+> **Patches 6 and 7 and the theme split.**  S5-S7 (2026-09-21) landed as its own patch rather than
+> folded: patches 1, **3 and 4** all touch `mmb.cu`, so there is no single theme to fold it into
+> without a full re-cut.  Patch 6 is the authoritative source for the RDNA4 scope policy
+> (`mmb_wtype_ok` / `mmb_dense_flag`); **patch 7 (S10) adds the per-arch dense geometry and the
+> per-TYPE dense policy** (`mmb_dense_tmask` / `mmb_dense_type_ok`) — see
+> `gfx1201-s10-dense-geometry.md`.  Patch 7 follows the same rule for the same reason (it touches
+> `mmb.cu` too), so the set is now **7 patches, tree `9ef573e5d0…`**.
 
 ### 1 — `mmb`: the general-purpose bf16-WMMA dequant weight GEMM
 
@@ -159,7 +163,16 @@ Full data: `gfx1201-s1s2-results.md`; plan: `gfx1201-porting.md`.
 | **G4 non-temporal** | **small consistent win** at depth (+0.3–0.4 % at 32k/64k/98k) | keep, always-on |
 | **G3a always-QSA flip** | **regression** (pp2048 −18.9 %, pp8192 −6.7 %) | **gated off on RDNA4** (default shortcut ON except gfx1151) |
 | **G2 qsa3** | **win**: +7.6 / +11.5 / +10.4 % prefill at pp4096/16384/32768 (qsa3 vs VEC, same build) | **ported 2026-09-21** (`gfx1201-s4-qsa3-results.md`); folded into patch 2 |
-| **G1 mmb** | **ported 2026-09-21, scoped**: +3…+7 % on the routed MoE and qwen4exp HC paths; neutral elsewhere (scoped default) | enabling it unscoped is a −4…−13 % regression on dense/K-quant models — see `gfx1201-s5s7-mmb-results.md` |
+| **G1 mmb** | **ported 2026-09-21, scoped**: qwen4exp HC **+3.2 / +2.2 %**; IQ3_S-heavy dense **+0.5 %** (S10); the routed MoE is **break-even**, *not* the +6.7 % S7 recorded — see the correction below; neutral elsewhere (scoped default) | enabling it unscoped is a −4…−13 % regression on dense/K-quant models.  **The routed MoE default needs a re-decision (S12)** — `gfx1201-s10-dense-geometry.md` §6 |
+
+### The S7 → S10 correction (routed MoE)
+
+S7 recorded **+6.7 %** for `35B-A3B UD-Q3_K_M`.  S10 re-measured the **unmodified S7 binary** and got
+**−1.4 %**, reproducing identically with the S10 build (the model has no IQ3_S, so S10 cannot affect
+it).  The kernel breakdown: the routed MMB (0.875 s) only **matches** the delivery's
+`mul_mat_q_routed_compact` + `mul_mat_q<IQ3_XXS,64>` (0.880 s), and the stand-down costs an extra
+`mm_ids_helper` launch (+0.065 s).  **Do not rely on the S7 routed number.**  Evidence:
+`gfx1201-s10-dense-geometry.md` §6.
 
 Net gfx1201 prefill vs the delivery (Flash-Next IQ4_XS, q8_0 KV, 3-GPU tensor, `-b/-ub 2048`):
 **+3.2 % / +5.0 % / +6.6 %** at pp32768/65536/98304, no regression at any depth, same-seed greedy
@@ -168,6 +181,12 @@ and all op oracles bit-identical.  The patch set carries the G3a arch gate (patc
 `c0f8ea75ba`.
 
 **G2 `qsa3` is ported to RDNA4** (2026-09-21) and is the second-biggest gfx1201 win after the indexer.
+**S10 (2026-09-21) then made the dense path a per-TYPE win**: the `mmb` dense tile was losing because
+of the gfx1151-tuned geometry (55296 B of LDS -> 1 block/CU vs the delivery MMQ's 0 LDS / 3 blocks,
+plus a half-idle-thread weight dequant at `BM=128`), and a **256x128** tile makes the **IQ3_S** dense
+GEMM beat MMQ by **−4.5 %** (kernel-time backed).  IQ4_XS still loses, so RDNA4 enables the dense path
+per weight type (IQ3_S only): **+0.5 % prefill on 27B UD-IQ3_S**, neutral on Q8_0,
+gfx1151 instruction-identical.  Details: `gfx1201-s10-dense-geometry.md`.
 **G1 `mmb` is ported too, but scoped** — and the scoping is the interesting part: `GGML_CUDA_MMB`
 bundled **arch × weight-type × kernel-path × model-family** into one switch, and the measurement shows
 the four axes disagree on RDNA4 (a −4…−13 % regression with everything on, wins only on the routed
