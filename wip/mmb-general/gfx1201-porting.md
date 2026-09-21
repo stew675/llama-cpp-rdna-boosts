@@ -6,10 +6,10 @@ supersedes the "gfx1201 is a no-op / new work, not a port" notes in `GROUPS.md` 
 before the delivery's gfx1201 MMQ path was re-tuned).
 
 > **HANDING THIS FILE TO A NEW SESSION?  Read §13 first** — it is the brief for the remaining
-gfx1201 work (S11-S15): the arch-scoped tuning constants, the routed GLU tuning, the F32/HC16
-paths, and the B1-B9 gate matrix (*including MTP, which has never run on this box*).  **S1-S10 are
-done** and are history; §13 is the live work.  Note the S10 by-product: the **S7 MoE win does not
-reproduce** (§12 risk 7) — re-decide the routed default in S12.
+gfx1201 work (S12-S15): the routed GLU tuning, the F32/HC16 paths, and the B1-B9 gate matrix
+(*including MTP, which has never run on this box*).  **S1-S11 are done** and are history; §13 is the
+live work.  Note the S10 by-product: the **S7 MoE win does not reproduce** (§12 risk 7) — re-decide
+the routed default in S12, which is now the top item.
 
 **Session 1-2 log (2026-09-21):** the WIP was applied to `~/llama.cpp` as branch `rdna-boosts-mmb-port`
 (`git am` **5/5**, clean) and **built green for gfx1201** with the delivery build script (`EXIT=0`,
@@ -446,7 +446,7 @@ checklist updated.
 | **S8** | G3b/c + HC16 + gates | F32/tiny-M/HC16; B1-B9 full matrix | all gates green; gating documented |
 | **S9** | handover to gfx1100 | update §10/§11; commit record | gfx1100 TODO list complete |
 | **S10** | **gfx1201 dense tile geometry** | **DONE** — 256x128 tile + a per-type dense policy (IQ3_S) | met: the dense tile beats MMQ for IQ3_S (-4.5 %, kernel-time + interleaved A/B, +0.5 % model) |
-| **S11** | arch-scoped tuning constants | `mmb_arch_defaults(cc)` for every `mmb_*` tunable | gfx1151 unchanged; RDNA4 defaults in one table |
+| **S11** | arch-scoped tuning constants | **DONE** — `mmb_arch_cfg`/`mmb_arch_defaults(cc)` + a config dump; gfx1151 byte-unchanged, RDNA4 preserved | met |
 | **S12** | routed/GLU tuning + kernel time | threshold sweeps; `DBUF`; the IQ3_XXS GLU arm | the routed win ≥ S7 with kernel-time evidence |
 | **S13** | G3b/c F32/tiny-M + G4 HC16 | isolate and A/B each knob | measured, purity-checked, defaulted |
 | **S14** | B1-B9 on the final tree | re-run B1-B7; B8 long-context PPL; **B9 MTP** | every gate green with numbers recorded |
@@ -515,17 +515,20 @@ qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a g
 - [x] **gfx1201 dense tile geometry (S10)** — **DONE 2026-09-21**: the 256x128 tile makes the IQ3_S
       dense GEMM beat the delivery MMQ by 4.5 %; landed as per-arch geometry + a per-type dense
       policy (IQ3_S only) -> +0.5 % prefill on 27B UD-IQ3_S; `gfx1201-s10-dense-geometry.md`
-- [ ] arch-scoped `mmb_*` tuning constants (S11) — the new geometry still selects by a runtime
-      `GGML_CUDA_CC_IS_RDNA4` check inside the dispatch and belongs in the S11 table
+- [x] arch-scoped `mmb_*` tuning constants (S11) — **DONE 2026-09-21**: `mmb_arch_cfg` +
+      `mmb_arch_defaults(cc)`, every tunable now `env || arch default`, the dense geometry moved into
+      the table, `GGML_CUDA_MMB_CFG=1` dumps the resolved config; gfx1151 kernel set byte-unchanged;
+      `gfx1201-s11-arch-defaults.md`
 - [ ] routed/GLU tuning + kernel-time evidence (S12) — **and the routed MoE default re-decision,
-      see §12 risk 7: the S7 +6.7 % MoE win does not reproduce (now -1.4 % on the same binary)**
+      see §12 risk 7: the S7 +6.7 % MoE win does not reproduce (now -1.4 % on the same binary)**, plus
+      the `TODO(S12)` fields in `mmb_arch_defaults()`
 - [ ] B1-B9 on the final tree, incl. **MTP** — never run on gfx1201 (S14)
 
-**§13 is the brief for the remaining work (S11-S15).**  Start there.
+**§13 is the brief for the remaining work (S12-S15).**  Start there.
 
-**Patch layout (current): 7 patches, tree `9ef573e5d0…`** — 1 mmb, 2 qsa3, 3 F32/tiny-M +
+**Patch layout (current): 8 patches, tree `e5dc99b4d5…`** — 1 mmb, 2 qsa3, 3 F32/tiny-M +
 width-probe, 4 HC16, 5 indexer, 6 the `mmb` RDNA4 port + scope split, 7 the S10 dense geometry +
-per-type dense policy.
+per-type dense policy, 8 the S11 per-arch tuning table.  Patches 6-8 form a chain on `mmb.cu`.
 
 ---
 
@@ -594,6 +597,7 @@ in parallel).
 | S6 | `mmb` correctness (PPL parity) | `gfx1201-s5s7-mmb-results.md` §2/§5 |
 | S7 | `mmb` **scoped** (arch-scoped weight types + dense/path policy) | `gfx1201-s5s7-mmb-results.md` §4/§6 |
 | S10 | **the RDNA4 dense tile geometry (256x128) + a per-type dense policy** — IQ3_S beats MMQ by 4.5 %, +0.5 % prefill on 27B UD-IQ3_S; and the **S7 MoE win does not reproduce** | `gfx1201-s10-dense-geometry.md` |
+| S11 | **per-arch tuning defaults** — `mmb_arch_cfg` + `mmb_arch_defaults(cc)`, the dense geometry in the table, `GGML_CUDA_MMB_CFG=1` dump; gfx1151 kernel set byte-unchanged | `gfx1201-s11-arch-defaults.md` |
 
 **Protocol — apply to every measurement below.**
 
@@ -692,9 +696,18 @@ proven by an interleaved A/B **and** kernel time.  Then: purity check (PPL + sam
 `GREEDY-PURITY.md` contract), and flip `mmb_dense_flag()`'s RDNA4 default **for that type only**
 (the flag may need to become per-type rather than global — that is the natural shape of the fix).
 
-### S11 — arch-scoped tuning constants (§7 point 3)
+### S11 — arch-scoped tuning constants (§7 point 3)  — **DONE 2026-09-21**
 
-**Why:** §7.3 requires per-arch values selected by `ggml_cuda_info().devices[0].cc`.  Only
+**Result:** `wip/mmb-general/gfx1201-s11-arch-defaults.md`.  Every `mmb_*` tunable is now
+`env override || arch default` selected from the device cc by `mmb_arch_defaults(cc)` (one
+`mmb_arch_cfg` table), and the S10 dense geometry moved out of the dispatch into `c.dense_geom`.
+`GGML_CUDA_MMB_CFG=1` prints the resolved config once, which answers the §12.5 "a profiler cannot see
+the env gates" problem.  RDNA4's row carries only the *measured* value (the geometry); every other
+field keeps the gfx1151 value and is marked `TODO(S12)` — no invented tuning.  Verified: same-seed
+hash unchanged, **gfx1151 kernel set byte-unchanged** (90 kernels, 0 differing), RDNA4 win preserved
+(+0.45 / +0.46 %).  Landed as **patch 8** (`git am` 8/8).
+
+**Why (original brief):** §7.3 requires per-arch values selected by `ggml_cuda_info().devices[0].cc`.  Only
 `mmb_wtype_mask()` and `mmb_dense_flag()` do this today; every other tunable is env-only with a
 gfx1151 default, so `mmb_min_t`, `glu_thresh`, `routed_thresh`, `tall_mode`, `tiny_m_*`,
 `f32split_*`, `bf16w`, `hc16`, `down16`, `gatemix`, `iq3xxs_glu`, `shadow_*` cannot differ per arch

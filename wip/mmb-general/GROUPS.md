@@ -37,14 +37,17 @@ git am <this-repo>/wip/mmb-general/patches/*.patch   # 6/6, tree 580db5174...
 | 5 | `0005-WIP-indexer-…` | the fused indexer top-k op | none (op-driven) | **yes** |
 | 6 | `0006-WIP-mmb-RDNA4-…` | the `mmb` RDNA4 (gfx12) fragment port **+ the arch-scoped weight-type/path split** | `GGML_CUDA_MMB=1` + the scope policy (`MMB_TYPES` / `MMB_DENSE`) | no |
 | 7 | `0007-WIP-mmb-RDNA4-…` | **the RDNA4 dense tile geometry (256x128) + the per-type dense policy** | `GGML_CUDA_MMB=1` (IQ3_S dense is now in the RDNA4 default); `MMB_DENSE_TYPES=<csv>` / `MMB_DENSE=0\|1` | no |
+| 8 | `0008-WIP-mmb-per-arch-…` | **per-arch tuning defaults** (`mmb_arch_cfg` / `mmb_arch_defaults(cc)`) + the dense geometry in the table + the `GGML_CUDA_MMB_CFG=1` dump | none (host-side policy); the existing `GGML_CUDA_MMB_*` vars remain the overrides | no |
 
-> **Patches 6 and 7 and the theme split.**  S5-S7 (2026-09-21) landed as its own patch rather than
+> **Patches 6-8 and the theme split.**  S5-S7 (2026-09-21) landed as its own patch rather than
 > folded: patches 1, **3 and 4** all touch `mmb.cu`, so there is no single theme to fold it into
 > without a full re-cut.  Patch 6 is the authoritative source for the RDNA4 scope policy
 > (`mmb_wtype_ok` / `mmb_dense_flag`); **patch 7 (S10) adds the per-arch dense geometry and the
 > per-TYPE dense policy** (`mmb_dense_tmask` / `mmb_dense_type_ok`) — see
-> `gfx1201-s10-dense-geometry.md`.  Patch 7 follows the same rule for the same reason (it touches
-> `mmb.cu` too), so the set is now **7 patches, tree `9ef573e5d0…`**.
+> `gfx1201-s10-dense-geometry.md`; **patch 8 (S11) puts every tunable behind one per-arch table**
+> (`mmb_arch_cfg`, `GGML_CUDA_MMB_CFG=1` dump) — see `gfx1201-s11-arch-defaults.md`.  The same rule
+> forced the same choice for 7 and 8 (`mmb.cu` again), so the set is now **8 patches, tree
+> `e5dc99b4d5…`** and 6/7/8 are a chain on that one file.
 
 ### 1 — `mmb`: the general-purpose bf16-WMMA dequant weight GEMM
 

@@ -1,5 +1,24 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-21 (WIP, not a delivery change) — gfx1201 port, session 31: per-arch `mmb` tuning defaults
+
+`s11` of `wip/mmb-general/gfx1201-porting.md`.  **Experimental WIP, not part of the delivered patch
+set**; record in `wip/mmb-general/gfx1201-s11-arch-defaults.md`.
+
+Every `mmb_*` tunable was env-only with a hard-coded gfx1151 value, so no arch could differ without a
+wall of env vars -- and because the gates are lazy host `getenv`s, a `rocprofv3` trace could not say
+which policy produced it (the plan's §12.5 problem).  There is now one table, `struct mmb_arch_cfg`,
+selected once from `ggml_cuda_info().devices[0].cc` by `mmb_arch_defaults(cc)`, with the existing env
+var kept as the override on every accessor; the S10 dense geometry moved out of the dispatch into
+`c.dense_geom`.  New **`GGML_CUDA_MMB_CFG=1`** prints the resolved config once.
+
+RDNA4's row carries only the *measured* value (the geometry); every other field keeps the gfx1151
+value and is marked `TODO(S12)` -- no invented tuning.  Verified: same-seed hash unchanged; the
+**gfx1151 device asm kernel set is byte-unchanged** (90 kernels, 0 differing); the 27B UD-IQ3_S
+interleaved r=5 win is preserved (**+0.45 % pp8192 / +0.46 % pp32768**).  Landed as **patch 8**
+(`git am` 8/8, applied tree `e5dc99b4d59dc5244de879825d1e8aa025b76263`); patches 6-8 are a chain on
+`mmb.cu`.
+
 ## 2026-09-21 (WIP, not a delivery change) — gfx1201 port, session 30: the RDNA4 dense tile geometry
 
 `s10` of `wip/mmb-general/gfx1201-porting.md`.  **This is experimental WIP, not part of the delivered

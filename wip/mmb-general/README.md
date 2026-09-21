@@ -333,6 +333,36 @@ are the small-BN ones where it does not pay — the code comment's −6.7 % is s
 
 ---
 
+## UPDATE — session 31 (2026-09-21): **per-arch tuning defaults — every `mmb_*` knob is now cc-selected**
+
+S11 of `gfx1201-porting.md` (§7 point 3).  Host-side only.  Record:
+**`gfx1201-s11-arch-defaults.md`**.
+
+Every `mmb_*` tunable was env-only with a hard-coded gfx1151 value, so no arch could differ without
+a wall of env vars — and since the gates are lazy host `getenv`s, **a `rocprofv3` trace could not tell
+you which policy produced it** (the plan's §12.5 problem).  There is now one table,
+`struct mmb_arch_cfg`, selected once from `ggml_cuda_info().devices[0].cc` by
+`mmb_arch_defaults(cc)`, with the existing env var kept as the override on every accessor.  The S10
+dense geometry stops being an inline cc test in the dispatch and becomes `c.dense_geom`, so it sits in
+the same table as everything else.  New: **`GGML_CUDA_MMB_CFG=1`** prints the resolved config once —
+`MMB_CFG cc=0x1001201 dense_geom=1 min_t=512 glu_thresh=32 …`.
+
+**RDNA4's row carries only the measured value (the geometry); every other field keeps the gfx1151
+value and is marked `TODO(S12)`.**  Inventing unmeasured per-arch numbers would be worse than the
+env-only state — the table's job here is to make the mechanism exist and to name the fields that still
+need a per-arch measurement (routed/GLU thresholds, `tall_mode`, `tiny_m*`, `f32split_*`, `cache_max`).
+
+**Verified:** same-seed greedy hash `42cdf36d0633` unchanged (also with a threshold override in
+effect); the **gfx1151 device asm kernel set is byte-unchanged** (90 kernels, 0 differing — this change
+cannot touch device code); and the 27B UD-IQ3_S interleaved r=5 win is preserved (**+0.45 % pp8192 /
++0.46 % pp32768**, S10 measured +0.52 / +0.46).  Landed as **patch 8** (`git am` 8/8, applied tree
+`e5dc99b4d5`); patches 6-8 are a chain on `mmb.cu`.
+
+**Next: S12** — and its top item is now the **routed MoE default re-decision** (session 30: the S7
++6.7 % does not reproduce), not just the threshold sweep.
+
+---
+
 ## UPDATE — session 25 (2026-09-20): the indexer gather's **warp-shuffle scan** (−11.7 % on the gather),
 ## and the block-level gather/emit closed as unbuildable
 

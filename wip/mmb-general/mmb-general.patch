@@ -1995,10 +1995,10 @@ index 1b9e63516..390fc7a47 100644
  
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
 new file mode 100644
-index 000000000..e52fb34d8
+index 000000000..b240e676c
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -0,0 +1,1934 @@
+@@ -0,0 +1,2013 @@
 +#include "mmb.cuh"
 +#include "unary.cuh"
 +#include <unordered_map>
@@ -3182,7 +3182,85 @@ index 000000000..e52fb34d8
 +// BF16-only tensors that must not use the generic slot 0 (their copy has to outlive other producers).
 +static std::unordered_map<const ggml_tensor *, int> g_mmb_bf16_slot;
 +
-+static size_t mmb_cache_max() { static const int v = getenv("GGML_CUDA_MMB_CACHE") ? atoi(getenv("GGML_CUDA_MMB_CACHE")) : 4; return (size_t) v; }
++// ---------------------------------------------------------------------------------------------
++// Per-arch tuning defaults (S11 of wip/mmb-general/gfx1201-porting.md, §7 point 3).
++//
++// Every `mmb_*` tunable is now `env override || arch default`, and the arch default is selected from
++// the device cc -- so gfx1151 (RDNA3_5), gfx1201 (RDNA4) and gfx1100 (RDNA3_0) can hold *different*
++// values without the user setting anything.  The previous state was env-only with gfx1151 values, so
++// no arch could differ without a wall of env vars -- which also made profiler runs hard to trust
++// (the porting plan §12.5 env-flakiness note).
++//
++// The RDNA4 row carries only values that have been **measured** on gfx1201 (records under
++// wip/mmb-general/); every other field keeps the gfx1151 value, which is exactly the pre-S11
++// behaviour.  There is no invented per-arch tuning here -- this table is what makes the per-arch
++// tuning *possible* (and visible: `GGML_CUDA_MMB_CFG=1` dumps the resolved config once).
++//
++// The two weight-type policies (`mmb_wtype_mask`, `mmb_dense_tmask`) and the master gate
++// (`mmb_enabled`) already select on the cc and are left where they are; they are documented in the
++// same dump.
++enum mmb_geom_id { MMB_GEOM_GFX11_SPLIT = 0, MMB_GEOM_R4_256x128 = 1 };
++
++struct mmb_arch_cfg {
++    int  min_t          = 512;   // prefill-only: n_tokens >= this may use mmb
++    int  glu_thresh     = 32;    // expert rows >= this take the BN=128 routed-GLU tile
++    int  routed_thresh  = 32;    // expert rows >= this take the BN=128 routed tile
++    int  tall_mode      = 2;     // 0 off, 1 narrow tall-M tile, 2 wide (iq4_nl HC down/inject)
++    int  tiny_m         = 1;     // warp-per-token F32 kernel for M <= 8 (the hc *_inject pair)
++    int  tiny_tt        = 1;     // tokens per warp in that kernel
++    int  f32split_mode  = 1;     // 0 off, 1 shape-aware, 2 every F32 GEMM through mmb
++    int  f32split_min_k = 0;
++    int  f32split_min_m = 128;   // the MoE router (M=512) wins on mmb; the M=4 inject pair does not
++    int  cache_max      = 4;     // activation-conversion cache entries
++    int  shadow_mode    = 0;     // bf16 weight shadow
++    int  shadow_cap_mb  = 6144;
++    int  iq3xxs_glu     = 0;     // fused IQ3_XXS routed GLU (measured a net loss on gfx1151)
++    int  hc16           = 0, down16 = 0, gatemix = 0, blk16 = 0, res16 = 0;
++    int  glu            = 1;     // fused routed gate+up+GLU
++    int  bf16w          = 1;     // BF16 dense weights
++    int  dense_geom     = MMB_GEOM_GFX11_SPLIT;  // see mmb_geom_id
++};
++
++static mmb_arch_cfg mmb_arch_defaults(const int cc) {
++    mmb_arch_cfg c;   // the gfx1151 / pre-S11 values for every field
++    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
++        // S10: the gfx1151-tuned 128x256/128x128 dense split is LDS-bound (55296 B -> 1 workgroup
++        // per CU) and leaves half of the 256 threads idle in the A dequant; a single 256x128 tile
++        // (WTM=64, WTN=64, TM=TN=4, the same 55296 B) makes the IQ3_S dense GEMM beat the delivery
++        // MMQ by 4.5 %.  See wip/mmb-general/gfx1201-s10-dense-geometry.md.
++        c.dense_geom = MMB_GEOM_R4_256x128;
++    }
++    // TODO(S12): the routed/GLU thresholds, `tall_mode`, `tiny_m*`, `f32split_*` and `cache_max` are
++    // still the gfx1151 values on every arch.  Give RDNA4 its own once they are measured per arch.
++    return c;
++}
++
++static const mmb_arch_cfg & mmb_cfg() {
++    static const mmb_arch_cfg c = mmb_arch_defaults(ggml_cuda_info().devices[0].cc);
++    return c;
++}
++
++// Print the resolved per-arch config + every env override exactly once (GGML_CUDA_MMB_CFG=1, or
++// GGML_CUDA_MMB_LOG=1), so a profiler run records what was actually used.
++static void mmb_cfg_dump_once() {
++    static bool done = false;
++    if (done) return;
++    done = true;
++    const bool on = (getenv("GGML_CUDA_MMB_CFG") && atoi(getenv("GGML_CUDA_MMB_CFG")) != 0) ||
++                    (getenv("GGML_CUDA_MMB_LOG") && atoi(getenv("GGML_CUDA_MMB_LOG")) != 0);
++    if (!on) return;
++    const int cc = ggml_cuda_info().devices[0].cc;
++    const mmb_arch_cfg & c = mmb_cfg();
++    fprintf(stderr, "MMB_CFG cc=0x%x dense_geom=%d min_t=%d glu_thresh=%d routed_thresh=%d tall=%d "
++                    "tiny_m=%d/%d f32split=%d(min_m=%d,min_k=%d) cache=%d shadow=%d/%dMB "
++                    "hc16=%d down16=%d gatemix=%d blk16=%d res16=%d glu=%d bf16w=%d iq3xxs_glu=%d\n",
++            cc, c.dense_geom, c.min_t, c.glu_thresh, c.routed_thresh, c.tall_mode,
++            c.tiny_m, c.tiny_tt, c.f32split_mode, c.f32split_min_m, c.f32split_min_k, c.cache_max,
++            c.shadow_mode, c.shadow_cap_mb, c.hc16, c.down16, c.gatemix, c.blk16, c.res16,
++            c.glu, c.bf16w, c.iq3xxs_glu);
++}
++
++static size_t mmb_cache_max() { static const int v = getenv("GGML_CUDA_MMB_CACHE") ? atoi(getenv("GGML_CUDA_MMB_CACHE")) : mmb_cfg().cache_max; return (size_t) v; }
 +static const ggml_tensor * mmb_root(const ggml_tensor * t) { return t->view_src ? t->view_src : t; }
 +static uint16_t * mmb_cache_insert(ggml_backend_cuda_context & ctx, const ggml_tensor * t, const size_t n) {
 +    if (g_mmb_cache.size() >= mmb_cache_max()) { delete g_mmb_cache.front().buf; g_mmb_cache.erase(g_mmb_cache.begin()); }
@@ -3247,10 +3325,10 @@ index 000000000..e52fb34d8
 +static std::unordered_map<const void *, uint16_t *> g_mmb_shadow;
 +static std::map<std::pair<const void *, const void *>, uint16_t *> g_mmb_shadow_pair;   // concat(w0, w1) along rows -> BF16 copy
 +static size_t g_mmb_shadow_bytes = 0;
-+int    mmb_shadow_mode(){ static const int v = getenv("GGML_CUDA_MMB_SHADOW") ? atoi(getenv("GGML_CUDA_MMB_SHADOW")) : 0; return v; }
++int    mmb_shadow_mode(){ static const int v = getenv("GGML_CUDA_MMB_SHADOW") ? atoi(getenv("GGML_CUDA_MMB_SHADOW")) : mmb_cfg().shadow_mode; return v; }
 +bool   mmb_shadow()    { return mmb_shadow_mode() != 0; }
 +bool   mmb_shadow_q6k(){ return mmb_shadow_mode() >= 1; }
-+size_t mmb_shadow_cap(){ static const long v = getenv("GGML_CUDA_MMB_SHADOW_MB") ? atol(getenv("GGML_CUDA_MMB_SHADOW_MB")) : 6144; return (size_t) v << 20; }
++size_t mmb_shadow_cap(){ static const long v = getenv("GGML_CUDA_MMB_SHADOW_MB") ? atol(getenv("GGML_CUDA_MMB_SHADOW_MB")) : mmb_cfg().shadow_cap_mb; return (size_t) v << 20; }
 +static bool mmb_is_resident_q6k(const ggml_tensor * w) { return w && w->type == GGML_TYPE_Q6_K && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) && w->ne[0] % 256 == 0 && w->ne[1] <= 32768; }
 +static bool mmb_is_resident_iq4(const ggml_tensor * w) { return w && w->type == GGML_TYPE_IQ4_NL && w->op == GGML_OP_NONE && w->data && w->buffer && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w); }
 +static bool mmb_is_row_concat(const ggml_tensor * w) {
@@ -3278,11 +3356,12 @@ index 000000000..e52fb34d8
 +    // RDNA3_0 (gfx1100/1101/1102) shares the gfx11 path but is untested; GGML_CUDA_MMB_RDNA3=1 opens
 +    // it for a volunteer.
 +    const int cc = ggml_cuda_info().devices[0].cc;
-+    if (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) return true;
++    if (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) { mmb_cfg_dump_once(); return true; }
 +    static const bool allow_rdna3 = getenv("GGML_CUDA_MMB_RDNA3") && atoi(getenv("GGML_CUDA_MMB_RDNA3")) != 0;
-+    return allow_rdna3 && GGML_CUDA_CC_IS_RDNA3_0(cc);
++    if (allow_rdna3 && GGML_CUDA_CC_IS_RDNA3_0(cc)) { mmb_cfg_dump_once(); return true; }
++    return false;
 +}
-+int  mmb_min_t()   { static const int v = getenv("GGML_CUDA_MMB_MIN_T") ? atoi(getenv("GGML_CUDA_MMB_MIN_T")) : 512; return v; }
++int  mmb_min_t()   { static const int v = getenv("GGML_CUDA_MMB_MIN_T") ? atoi(getenv("GGML_CUDA_MMB_MIN_T")) : mmb_cfg().min_t; return v; }
 +// F32 dense weights: historically DEFAULT OFF (the 2026-09-19 session-4 note); SUPERSEDED by the
 +// shape-aware default below.  Kept only for the measured history: a 16x256 small-M tile was tried
 +// and is worse (870/847 vs 895/885 t/s -- BN=256 halves the block count).
@@ -3308,31 +3387,31 @@ index 000000000..e52fb34d8
 +//
 +// Modes: 0 = off (all rocBLAS), 1 = shape-aware (default), 2 = every F32 GEMM through MMB (the
 +// pre-2026-09-19 behaviour, kept for A/B).
-+int  mmb_f32split_mode(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : 1; return v; }
++int  mmb_f32split_mode(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : mmb_cfg().f32split_mode; return v; }
 +bool mmb_f32split() { return mmb_f32split_mode() != 0; }
 +// Defaults: MIN_M = 128 (the router; measured 2.4x better on MMB) and MIN_K = 0 (disabled -- the
 +// long-K hc inject pair is *worse* on MMB despite the WMMA path; see the table above).
-+int  mmb_f32split_min_k(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_K") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT_MIN_K")) : 0; return v; }
-+int  mmb_f32split_min_m(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_M") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT_MIN_M")) : 128; return v; }
++int  mmb_f32split_min_k(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_K") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT_MIN_K")) : mmb_cfg().f32split_min_k; return v; }
++int  mmb_f32split_min_m(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_M") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT_MIN_M")) : mmb_cfg().f32split_min_m; return v; }
 +// tiny-M F32 (the hc *_inject pair): M=hc=4, K=10240.  Neither tile suits it (see
 +// mmb_tiny_m_f32_kernel), so it gets its own warp-per-token kernel.  This has to be part of the
 +// *gate* as well as the launcher -- an M-based rule that only admits M >= 128 would reject the
 +// shape here and rocBLAS would run, silently, with the kernel never reached.
 +bool mmb_tiny_m_f32_ok(const int64_t K, const int64_t M) {
-+    static const int v = getenv("GGML_CUDA_MMB_TINY_M") ? atoi(getenv("GGML_CUDA_MMB_TINY_M")) : 1;
++    static const int v = getenv("GGML_CUDA_MMB_TINY_M") ? atoi(getenv("GGML_CUDA_MMB_TINY_M")) : mmb_cfg().tiny_m;
 +    return v != 0 && M >= 1 && M <= 8 && K % 4 == 0;
 +}
 +int mmb_tiny_m_f32_tt() {
-+    static const int v = getenv("GGML_CUDA_MMB_TINY_TT") ? atoi(getenv("GGML_CUDA_MMB_TINY_TT")) : 1;
++    static const int v = getenv("GGML_CUDA_MMB_TINY_TT") ? atoi(getenv("GGML_CUDA_MMB_TINY_TT")) : mmb_cfg().tiny_tt;
 +    return v;
 +}
-+bool mmb_bf16w()    { static const int v = getenv("GGML_CUDA_MMB_BF16W") ? atoi(getenv("GGML_CUDA_MMB_BF16W")) : 1; return v != 0; }
-+bool mmb_hc16()    { static const int v = getenv("GGML_CUDA_MMB_HC16") ? atoi(getenv("GGML_CUDA_MMB_HC16")) : 0; return v != 0; }
-+int  mmb_tall_mode(){ static const int v = getenv("GGML_CUDA_MMB_TALL") ? atoi(getenv("GGML_CUDA_MMB_TALL")) : 2; return v; }
++bool mmb_bf16w()    { static const int v = getenv("GGML_CUDA_MMB_BF16W") ? atoi(getenv("GGML_CUDA_MMB_BF16W")) : mmb_cfg().bf16w; return v != 0; }
++bool mmb_hc16()    { static const int v = getenv("GGML_CUDA_MMB_HC16") ? atoi(getenv("GGML_CUDA_MMB_HC16")) : mmb_cfg().hc16; return v != 0; }
++int  mmb_tall_mode(){ static const int v = getenv("GGML_CUDA_MMB_TALL") ? atoi(getenv("GGML_CUDA_MMB_TALL")) : mmb_cfg().tall_mode; return v; }
 +bool mmb_tall()    { return mmb_tall_mode() != 0; }
-+bool mmb_gatemix_flag() { static const int v = getenv("LLAMA_HC_GATEMIX") ? atoi(getenv("LLAMA_HC_GATEMIX")) : 0; return v != 0; }
-+bool mmb_down16_flag() { static const int v = getenv("GGML_CUDA_MMB_DOWN16") ? atoi(getenv("GGML_CUDA_MMB_DOWN16")) : 0; return v != 0; }
-+bool mmb_glu()     { static const int v = getenv("GGML_CUDA_MMB_GLU") ? atoi(getenv("GGML_CUDA_MMB_GLU")) : 1; return v != 0; }
++bool mmb_gatemix_flag() { static const int v = getenv("LLAMA_HC_GATEMIX") ? atoi(getenv("LLAMA_HC_GATEMIX")) : mmb_cfg().gatemix; return v != 0; }
++bool mmb_down16_flag() { static const int v = getenv("GGML_CUDA_MMB_DOWN16") ? atoi(getenv("GGML_CUDA_MMB_DOWN16")) : mmb_cfg().down16; return v != 0; }
++bool mmb_glu()     { static const int v = getenv("GGML_CUDA_MMB_GLU") ? atoi(getenv("GGML_CUDA_MMB_GLU")) : mmb_cfg().glu; return v != 0; }
 +// Path policy for the generic *quantized* dense tile GEMM (a plain MUL_MAT -- attention qkv/o and
 +// the dense MLP), as opposed to the routed MoE expert path and the qwen4exp HC paths (tall-M /
 +// tiny-M / gate-mix), which have their own knobs below.  Off by default on RDNA4: the measurements
@@ -3347,14 +3426,14 @@ index 000000000..e52fb34d8
 +// Tile-class threshold: experts with >= this many rows take the BN=128 tile, the rest the BN=32 one.
 +// The small tile re-dequantizes the same A panel once per jt tile (4x the weight dequant per output
 +// for a 128-row expert), so this is the knob that trades B-column padding against dequant volume.
-+int mmb_glu_thresh() { static const int v = getenv("GGML_CUDA_MMB_GLU_THRESH") ? atoi(getenv("GGML_CUDA_MMB_GLU_THRESH")) : 32; return v; }
-+int mmb_routed_thresh() { static const int v = getenv("GGML_CUDA_MMB_ROUTED_THRESH") ? atoi(getenv("GGML_CUDA_MMB_ROUTED_THRESH")) : 32; return v; }
++int mmb_glu_thresh() { static const int v = getenv("GGML_CUDA_MMB_GLU_THRESH") ? atoi(getenv("GGML_CUDA_MMB_GLU_THRESH")) : mmb_cfg().glu_thresh; return v; }
++int mmb_routed_thresh() { static const int v = getenv("GGML_CUDA_MMB_ROUTED_THRESH") ? atoi(getenv("GGML_CUDA_MMB_ROUTED_THRESH")) : mmb_cfg().routed_thresh; return v; }
 +// IQ3_XXS: implemented and correct.  Its MMB *routed* path (individual gate/up MUL_MAT_ID) is a
 +// win, but the MMB *fused GLU* path is a NET LOSS on the UD-Q3_K_M workload (the fused kernel's
 +// dequant/loop shape costs more than the bf16-WMMA gain): full-on 1921 vs routed-only 2121 t/s
 +// pp8192 (both vs 1942 off).  So the fused GLU arm is default-off; GGML_CUDA_MMB_IQ3XXS=1 enables it
 +// for re-measurement/tuning.
-+bool mmb_iq3xxs_glu() { static const int v = getenv("GGML_CUDA_MMB_IQ3XXS") ? atoi(getenv("GGML_CUDA_MMB_IQ3XXS")) : 0; return v != 0; }
++bool mmb_iq3xxs_glu() { static const int v = getenv("GGML_CUDA_MMB_IQ3XXS") ? atoi(getenv("GGML_CUDA_MMB_IQ3XXS")) : mmb_cfg().iq3xxs_glu; return v != 0; }
 +
 +// ---------------------------------------------------------------------------------------------
 +// Weight-type policy.  MMB's per-type kernels do NOT transfer between arches: on RDNA4 (gfx12)
@@ -3665,7 +3744,7 @@ index 000000000..e52fb34d8
 +    // (Validity rule, easy to get wrong: BN must equal (8/(BM/WTM))*WTN.  A NxM mismatch silently
 +    // computes only part of the output and *looks* fast; rocprofv3 grid + a same-seed hash catch it.)
 +    const ggml_type wtype = shadow ? GGML_TYPE_BF16 : src0->type;
-+    if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[0].cc)) {
++    if (mmb_cfg().dense_geom == MMB_GEOM_R4_256x128) {
 +        dim3 grid4((M + 255) / 256, (T + 127) / 128);
 +        mmb_dense_launch_t<256, 128, 64, 64>(wtype, grid4, stream, shadow ? (const uint8_t *) shadow : W, xhp, D, Dh, store_f32, M, K, T);
 +        CUDA_CHECK(cudaGetLastError());
@@ -3727,8 +3806,8 @@ index 000000000..e52fb34d8
 +    return mmb_wtype_ok(w->type);
 +}
 +bool ggml_cuda_mmb_down16() { return mmb_down16_flag(); }
-+bool ggml_cuda_mmb_blk16() { static const int v = getenv("LLAMA_HC_BLK16") ? atoi(getenv("LLAMA_HC_BLK16")) : 0; return v != 0; }
-+bool ggml_cuda_mmb_res16()  { static const int v = getenv("LLAMA_HC_RES16") ? atoi(getenv("LLAMA_HC_RES16")) : 0; return v != 0; }
++bool ggml_cuda_mmb_blk16() { static const int v = getenv("LLAMA_HC_BLK16") ? atoi(getenv("LLAMA_HC_BLK16")) : mmb_cfg().blk16; return v != 0; }
++bool ggml_cuda_mmb_res16()  { static const int v = getenv("LLAMA_HC_RES16") ? atoi(getenv("LLAMA_HC_RES16")) : mmb_cfg().res16; return v != 0; }
 +bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
 +        const int hc, const float scale, const float bias) {
 +    if (!mmb_gatemix_flag() || hc != 4 || w->type != GGML_TYPE_IQ4_NL || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
