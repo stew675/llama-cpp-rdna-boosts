@@ -1119,10 +1119,25 @@ index 224bdef92..358bc74d0 100644
  
      typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
 diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
-index a71838eaf..095086125 100644
+index a71838eaf..3a6e8d033 100644
 --- a/ggml/src/ggml-alloc.c
 +++ b/ggml/src/ggml-alloc.c
-@@ -760,6 +760,41 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
+@@ -493,6 +493,14 @@ struct ggml_gallocr {
+ 
+     struct leaf_alloc * leaf_allocs; // [n_leafs]
+     int n_leafs;
++
++    // true when node_allocs/leaf_allocs describe a layout that the currently allocated buffers can
++    // actually hold.  Cleared when a reserve fails to allocate one of the buffers, because the
++    // layout has already been rewritten for the (larger) new graph while some of the buffers are
++    // still the old size or gone entirely -- reusing it would point tensors outside their buffer
++    // (ggml_backend_tensor_alloc's bounds assert) or at a NULL vbuffer.  Whenever it is false,
++    // ggml_gallocr_needs_realloc() forces the next allocation to go through a fresh reserve.
++    bool layout_valid;
+ };
+ 
+ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
+@@ -760,6 +768,41 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
          }
      }
  
@@ -1164,7 +1179,7 @@ index a71838eaf..095086125 100644
      // allocate tensors
      for (int i = 0; i < graph->n_nodes; i++) {
          struct ggml_tensor * node = graph->nodes[i];
-@@ -823,7 +858,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
+@@ -823,7 +866,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
  }
  
  static bool ggml_gallocr_reserve_n_impl(
@@ -1173,20 +1188,30 @@ index a71838eaf..095086125 100644
      size_t min_hash_size = graph->n_nodes + graph->n_leafs;
      // add 25% margin to avoid hash collisions
      min_hash_size += min_hash_size / 4;
-@@ -923,6 +958,9 @@ static bool ggml_gallocr_reserve_n_impl(
+@@ -923,34 +966,51 @@ static bool ggml_gallocr_reserve_n_impl(
              }
          }
          if (realloc) {
+-#ifndef NDEBUG
+-            {
+-                size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+-                if (cur_size > 0) {
+-                    GGML_LOG_DEBUG("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
+-                        __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
+-                }
 +            if (buffers_grown != NULL) {
 +                *buffers_grown = true;
 +            }
- #ifndef NDEBUG
-             {
-                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
-@@ -932,10 +970,15 @@ static bool ggml_gallocr_reserve_n_impl(
-                 }
++            const size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
++            if (!no_alloc && cur_size > 0) {
++                // Growing an already-reserved compute buffer is rare (the reserve sizes for the
++                // worst-case graph) and is exactly what runs a nearly-full device out of memory, so
++                // keep the old size in the log at INFO level: this used to be a GGML_LOG_DEBUG inside
++                // `#ifndef NDEBUG`, so in a Release build a failed growth was unattributable.
++                GGML_LOG_INFO("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
++                    __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
              }
- #endif
+-#endif
 -            ggml_vbuffer_free(galloc->buffers[i]);
              if (no_alloc) {
 -                galloc->buffers[i] = NULL;
@@ -1201,7 +1226,23 @@ index a71838eaf..095086125 100644
                  galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                  if (galloc->buffers[i] == NULL) {
                      GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
-@@ -950,7 +993,7 @@ static bool ggml_gallocr_reserve_n_impl(
++                    // the layout was rewritten for this (larger) graph above, but this buffer is now
++                    // gone and the not-yet-processed ones still have their old size; invalidate it so
++                    // that a later ggml_gallocr_alloc_graph() cannot hand a tensor an address that
++                    // does not even fit its buffer (or a NULL vbuffer) -- it must reserve again.
++                    galloc->layout_valid = false;
+                     return false;
+                 }
+             }
+         }
+     }
+ 
++    // the layout matches the buffers that are now allocated (for the no_alloc/probe path this is
++    // only true when nothing had to grow, which is what *buffers_grown reports)
++    galloc->layout_valid = !(buffers_grown != NULL && *buffers_grown);
++
+     return true;
+ }
  
  void ggml_gallocr_reserve_n_size(
          ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, size_t * sizes) {
@@ -1210,7 +1251,7 @@ index a71838eaf..095086125 100644
      for (int i = 0; i < galloc->n_buffers; i++) {
          sizes[i] = 0;
          for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
-@@ -959,8 +1002,18 @@ void ggml_gallocr_reserve_n_size(
+@@ -959,8 +1019,18 @@ void ggml_gallocr_reserve_n_size(
      }
  }
  
@@ -1230,6 +1271,20 @@ index a71838eaf..095086125 100644
  }
  
  bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
+@@ -1007,6 +1077,13 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
+ }
+ 
+ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
++    if (!galloc->layout_valid) {
++#ifndef NDEBUG
++        GGML_LOG_DEBUG("%s: layout is not valid (a previous reserve failed)\n", __func__);
++#endif
++        return true;
++    }
++
+     if (galloc->n_nodes != graph->n_nodes) {
+ #ifndef NDEBUG
+         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
 index 3ec40fb1a..5ad0a5027 100644
 --- a/ggml/src/ggml-backend-meta.cpp
@@ -25046,7 +25101,7 @@ index af64f4ec5..3d1492553 100644
      LLM_TENSOR_MASKED_EMBD_ORDERING,
      LLM_TENSOR_HRM_Z_L_INIT,
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index ef53728d1..b765bf77c 100644
+index ef53728d1..85212a5e8 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -36,6 +36,18 @@ struct llm_fused_op_probe {
@@ -25344,7 +25399,146 @@ index ef53728d1..b765bf77c 100644
      if (cparams.auto_fgdn) {
          LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", func);
          resolve(llm_fused_op_gdn_ar_probe, cparams.fused_gdn_ar);
-@@ -3650,6 +3839,7 @@ llama_context_params llama_context_default_params() {
+@@ -579,6 +768,45 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+     }
+ }
+ 
++// The derived kq mask is a *per-batch* optimization, not a property of the context, but the reverse is
++// not true either: not every batch shape is reachable in every context.  This predicate answers the
++// reserve-time question "can a batch the derived form cannot serve actually be decoded here?" - if it
++// cannot, the reserve stays with the (much smaller) derived layout and keeps V3's memory win.
++//
++// The reserve's own measure batch is single-sequence and 1-D, so the runtime triggers have to be
++// reasoned about from the model/context, not from the ubatch:
++//   * 2-D (M-RoPE) batches - an image/audio chunk decode carries 2-D positions (mtmd), which is only
++//     possible for an M-RoPE model: llama_batch::is_pos_2d() is `n_pos >= 3`, and n_pos_per_embd() is
++//     4 only for MROPE/IMROPE.  The packed mask's ext-based causal clause cannot be derived.
++//   * multi-sequence batches (ubatch.n_seqs_unq != 1), e.g. `--kv-unified` with several slots, which
++//     kq_mask_derivable() rejects because the derived cell encoding is single-sequence.
++//   * alibi, which encodes a *value* (the distance) rather than a predicate.
++// Every other reason the derived form is skipped is already covered without this predicate:
++//   * the `allow_derived == false` builders (MLA / lightning-indexer / MSA) never take the derived
++//     branch at all, so their reserve graph already holds the packed mask;
++//   * alibi, a multi-stream KV cache and a disabled flash attention disable the derived form globally
++//     (resolve_fused_ops()'s probe), so those reserves are packed anyway - the alibi term above is
++//     belt-and-braces for that path;
++//   * `n_kv % LLM_KQ_MASK_DERIVED_KV_STRIDE == 0` is not a runtime variable: llama_kv_cache::get_n_kv()
++//     pads to at least 256 cells, so the stride gate always holds (verified on gfx1100 with a
++//     text-only append at an off-stride position: every prefill graph logged DERIVED);
++//   * a `n_tokens <= 8` batch takes a packed mask, but it is a few MiB and fits the reserved layout's
++//     slack (the same was true before the derived form existed).
++// If a new reason to reject the derived form is ever added to kq_mask_derivable(), it must be added
++// here too - otherwise a later batch can force the growth this predicate exists to prevent.  The
++// ggml-alloc layout invalidation + the compute-buffer growth log are the safety net if that happens.
++bool llama_context::kq_mask_packed_reachable() const {
++    if (model.hparams.n_pos_per_embd() > 1) {
++        return true;
++    }
++
++    if (cparams.n_seq_max > 1) {
++        return true;
++    }
++
++    return model.hparams.use_alibi;
++}
++
+ void llama_context::sched_reserve() {
+     if (!sched_need_reserve) {
+         return;
+@@ -595,6 +823,10 @@ void llama_context::sched_reserve() {
+     const uint32_t n_seqs = cparams.n_seq_max;
+     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+ 
++    // size the compute buffers for the packed kq mask when a batch the derived form cannot serve is
++    // reachable in this context - see kq_mask_packed_reachable()
++    const bool packed_kq_mask = kq_mask_packed_reachable();
++
+     const size_t max_nodes = this->graph_max_nodes(n_tokens);
+ 
+     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
+@@ -635,13 +867,14 @@ void llama_context::sched_reserve() {
+     // reserve pp (prompt processing) graph first so that buffers are only allocated once
+     {
+         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+-                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
++                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr,
++                packed_kq_mask);
+         if (!gf) {
+             if (cparams.pipeline_parallel) {
+                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
+                 cparams.pipeline_parallel = false;
+                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
++                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only =*/ false, nullptr, packed_kq_mask);
+             }
+             if (!gf) {
+                 throw std::runtime_error("failed to allocate compute pp buffers");
+@@ -654,7 +887,7 @@ void llama_context::sched_reserve() {
+ 
+     // reserve with tg (token generation) graph to get the number of splits and nodes
+     {
+-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
++        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc, nullptr, packed_kq_mask);
+         if (!gf) {
+             throw std::runtime_error("failed to allocate compute tg buffers");
+         }
+@@ -674,10 +907,10 @@ void llama_context::sched_reserve() {
+                 // [TAG_RESERVE_DIAG_DECAY]
+                 // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
+                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
+-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
++                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc, nullptr, packed_kq_mask);
+                 break;
+             default:
+-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
++                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc, nullptr, packed_kq_mask);
+         };
+ 
+         if (!gf) {
+@@ -845,7 +1078,7 @@ bool llama_context::memory_update(bool optimize) {
+ 
+         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+ 
+-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
++        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get(), /*split_only =*/ false, nullptr, kq_mask_packed_reachable());
+         if (!gf) {
+             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
+         }
+@@ -2437,7 +2670,8 @@ static void ubatch_prepare_reserve(
+ }
+ 
+ ggml_cgraph * llama_context::graph_reserve(
+-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
++        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
++        bool packed_kq_mask) {
+     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
+     GGML_ASSERT(n_outputs >= 1);
+ 
+@@ -2469,7 +2703,22 @@ ggml_cgraph * llama_context::graph_reserve(
+ 
+     auto * res = gf_res_reserve.get();
+ 
+-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
++    auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
++
++    // The derived kq mask is a *per-batch* optimization, so a batch it cannot serve allocates the
++    // packed mask, n_kv*n_tokens*2 bytes - and at a deep context that is hundreds of MiB, which a
++    // reserve measured with the derived form on does not contain.  The first such batch then has to
++    // *grow* the compute buffer mid-run, and on a --fit server whose target left less free memory than
++    // that the growth fails with cudaMalloc out of memory and the request dies
++    // (github.com/stew675/llama-cpp-rdna-boosts/issues/42).  Building the measure graph with the
++    // packed mask makes the reserve (and therefore --fit) account for it up front, so the growth
++    // cannot happen.  Callers pass kq_mask_packed_reachable(), which is true only when such a batch is
++    // actually reachable in this context - see its definition.  Only the *reserve* changes: every
++    // derivable batch still takes the derived path at runtime, and a non-derivable one takes the
++    // packed-mask kernel upstream ships for it anyway.
++    if (packed_kq_mask) {
++        gparams.cparams.kq_mask_derived = false;
++    }
+ 
+     res->reset();
+ 
+@@ -3650,6 +3899,7 @@ llama_context_params llama_context_default_params() {
          /*.n_ubatch                    =*/ 512,
          /*.n_seq_max                   =*/ 1,
          /*.n_rs_seq                    =*/ 0,
@@ -25352,7 +25546,7 @@ index ef53728d1..b765bf77c 100644
          /*.n_outputs_max               =*/ 0,
          /*.n_outputs_max_per_seq       =*/ 1,
          /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
-@@ -3687,6 +3877,26 @@ llama_context_params llama_context_default_params() {
+@@ -3687,6 +3937,26 @@ llama_context_params llama_context_default_params() {
      return result;
  }
  
@@ -25379,7 +25573,7 @@ index ef53728d1..b765bf77c 100644
  llama_context * llama_init_from_model(
                   llama_model * model,
          llama_context_params   params) {
-@@ -3722,10 +3932,49 @@ llama_context * llama_init_from_model(
+@@ -3722,10 +3992,49 @@ llama_context * llama_init_from_model(
          if (model->get_split_state_ud.n_devices == 1) {
              LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
          }
@@ -25430,6 +25624,29 @@ index ef53728d1..b765bf77c 100644
 +                __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
          return nullptr;
      }
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index b7a9db591..b745d61d1 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -249,8 +249,17 @@ public:
+     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+ 
+     // reserve a graph with a dummy ubatch of the specified size
++    // packed_kq_mask: build the measure graph with the packed kq mask even when the derived form is
++    //   enabled, so the reserved buffers cover a batch the derived form cannot serve (see the note in
++    //   graph_reserve).  Pass kq_mask_packed_reachable() for a worst-case reserve; the fused-op
++    //   support probes must NOT set it - they verify the derived form is present in the graph.
+     ggml_cgraph * graph_reserve(
+-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
++        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
++        bool packed_kq_mask = false);
++
++    // true when a batch the derived kq mask cannot serve is reachable at runtime, i.e. when the
++    // compute reserve must be sized for the packed mask - see the definition for the full reasoning
++    bool kq_mask_packed_reachable() const;
+ 
+     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
  
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
 index b592de18c..26ee97b1c 100644

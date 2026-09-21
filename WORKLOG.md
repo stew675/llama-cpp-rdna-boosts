@@ -1,5 +1,80 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-20 (r11) — `v16-ebbb18522-r11`: the compute reserve accounts for the reachable (packed) kq mask
+
+**Release** `v16-ebbb18522-r11`, canonical tip `eabb7418df317d1d1b45d65faf1b235c6b43643d`, net tree
+`865ded736155407c3a02f5249df356ed1a35fb56`.  Only **block 15** changed; blocks 00-14 are
+content-identical to r10 (their patch files are byte-identical, `From <sha>` included — only `0015`
+changes).
+
+**The bug (issue #42).**  `llama-server` with the reporter's settings (`--fit on --fit-target 256 -b 2048
+-ub 512 -fa on -ctk q8_0 -ctv q8_0 --spec-type draft-mtp --spec-draft-n-max 3 -np 1 --cache-ram 16384
+--cache-reuse 256`, model `ukisai/Swift-Qwen3.8-27B-GGUF:Q4_K_S` = `qwen35`, M-RoPE + mmproj), after
+~120k tokens of context, sent an image: `failed to decode image` / `failed to process mtmd chunk`, and
+the following request aborted in `ggml_backend_tensor_alloc`.  Root cause: **V3's derived kq mask is a
+per-*batch* decision**.  `kq_mask_derivable()` rejects 2-D (M-RoPE) batches and multi-sequence batches
+(the `n_kv % 256` gate is *not* a runtime variable — `get_n_kv()` pads to 256 cells, see below); for
+those the packed mask (`n_kv*n_tokens*2` bytes) is allocated — but `sched_reserve()` measured with the
+derived form on, so the reserved compute buffer did not contain it.  At depth that is hundreds of MiB,
+so the first such batch had to grow the buffer mid-run, and with the fit's 256 MiB headroom that growth
+failed.  The failed reserve also left `ggml_gallocr`'s layout describing buffers it no longer had, which
+is what asserted on the next request.
+
+**Reproduced on gfx1100 (RX 7900 XTX, 24 GiB)** with the reporter's exact model and settings — deep
+prefill (~152k tokens) then an image appended at depth: reserve **122.80 MiB**, the image batch needs
+**271.53 MiB** (the delta is exactly the packed mask, `152320 x 512 x 2`, i.e. the 152208-token prefix
+rounded up to the 256-cell padding — so the *image* batch is the one that cannot be derived),
+`cudaMalloc failed: out of memory`, HTTP 500; a following request asserted.
+
+**The fix (block 15).**  `llama_context::graph_reserve()` takes an explicit `packed_kq_mask` argument;
+when set, the measure graph is built with `cparams.kq_mask_derived = false`, so the reserved buffers
+contain the packed mask at its worst case (`n_ctx x n_ubatch x 2`) and the runtime growth cannot happen.
+Which reserves set it comes from the new `llama_context::kq_mask_packed_reachable()`, and that predicate
+is the interesting part: the mask only needs reserving where a batch the derived form cannot serve is
+actually **reachable** — 2-D M-RoPE (only an M-RoPE model can produce one: `is_pos_2d()` is `n_pos >= 3`
+and `n_pos_per_embd()` is 4 only for MROPE/IMROPE) or `n_seq_max > 1` (multi-sequence batches), plus
+alibi as belt-and-braces.  Every *other* packed-mask source already keeps the mask in the reserve, which
+is what makes the predicate narrow rather than a list: the `allow_derived == false` builders (MLA /
+lightning indexer / MSA) never take the derived branch, alibi / multi-stream / FA-off disable the derived
+form globally via `resolve_fused_ops()`'s probe, and `n_kv % 256 == 0` is guaranteed because
+`llama_kv_cache::get_n_kv()` pads with `GGML_PAD(cells.used_max_p1(), max(n_pad, 256))`.
+
+That last point was checked empirically, because an earlier hypothesis that a text batch at an
+off-256-stride append position also needs the packed mask turned out to be **wrong**: a text-only
+multi-turn probe on gfx1100 logged **380 DERIVED / 20 PACKED**, every PACKED one `n_tokens <= 8` (whose
+mask is a few MiB and fits the reserved slack), and every prefill graph DERIVED — including the appended
+chunk.  The fused-op support probes deliberately keep the derived form (the `LLM_FUSED_OP_FLASH_ATTN_DERIVED`
+probe requires the derived node to be *present* in its graph), and the public `llama_graph_reserve()` ext
+API is unchanged.  Per-batch runtime behaviour is untouched: derivable batches still take the derived
+kernel, non-derivable ones take the packed-mask kernel upstream already ships.
+
+**Measured.**  Pre-fix: image-at-depth -> `allocating 271.53 MiB ... cudaMalloc failed: out of memory`
++ `failed to process mtmd chunk` (HTTP 500).  Post-fix, the identical run: **zero** growth/OOM/assert
+events, image decoded in 1281 ms, HTTP 200, and text-only + image follow-up requests both succeed (the
+allocator is intact).  Same-seed greedy output is **byte-identical** pre vs post
+(`620cbe029ab2679408b591c73bde730a154a091361a80611e63374d850a64489`, with `-c 32768 --fit off` pinned
+so the changed fit cannot confound it), on both the derived (text) and packed/2-D (image) paths.
+Throughput unchanged: prompt eval **963.65 -> 963.57 t/s**, decode **38.81 -> 38.71 t/s**, 152k-token
+prefill **267.7 -> 267.9 s**.
+
+The cost is now paid only where the mask is reachable, not by everyone.  The reporter's M-RoPE model
+pays, as it must: `ROCm0` **122.80 -> 258.02 MiB**, `ROCm_Host` **20.80 -> 210.02 MiB**, and `--fit`
+gives up **8960 tokens of context** (`n_ctx` 203520 -> 194560, **-4.4 %**) on the 24 GiB card.  A
+non-M-RoPE single-sequence model does **not**: gemma4-E4B keeps the derived reserve at **113.94 MiB**,
+against **146.80 MiB** with `LLAMA_KQ_MASK_DERIVED=0` — so V3's *reserved*-memory win (`n_ubatch x n_ctx
+x 2`) stands wherever the packed mask is unreachable, and is only surrendered where it can appear.
+
+**Also in this release (block 15, `ggml-alloc.c`).**  A failed `ggml_gallocr_reserve_n_impl()` now
+clears a new `galloc->layout_valid`, so the next `ggml_gallocr_alloc_graph()` re-reserves instead of
+reusing a layout whose buffers are NULL/stale.  An out-of-memory therefore becomes a clean
+`GGML_STATUS_ALLOC_FAILED` (`failed to allocate graph`, the request fails and the server survives)
+instead of a NULL-vbuffer dereference or an out-of-bounds assert, and a retry after the memory is freed
+can succeed.  No steady-state cost.  The buffer-growth message was promoted from `GGML_LOG_DEBUG`
+(compiled out in Release, which made a failed growth unattributable) to `GGML_LOG_INFO`.
+
+`scripts/validate-set.sh` green (strict 16/16 `git am` on a fresh `ebbb18522`, applied tree
+`865ded73`).
+
 ## 2026-09-20 (r10) — `v16-ebbb18522-r10`: block 11 classifies MoE decode splits correctly, so HIP graphs replay again
 
 **Release** `v16-ebbb18522-r10`, canonical tip `385e0c77cbc34a01707b2efc25adb684c0dcbbc1`, net tree

@@ -3,9 +3,26 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`ebbb18522`**
 (re-based 2026-09-17 from `d1d3c3396`).
 
-**Current release: `v16-ebbb18522-r10`** — canonical tip
-`385e0c77cbc34a01707b2efc25adb684c0dcbbc1`, tree
-`9f9602e6e5751ca1e065b80ec3764fdfe6ca6eba`.  Strict 16/16 `git am`; clean build.  **r10
+**Current release: `v16-ebbb18522-r11`** — canonical tip
+`eabb7418df317d1d1b45d65faf1b235c6b43643d`, tree
+`865ded736155407c3a02f5249df356ed1a35fb56`.  Strict 16/16 `git am`; clean build.  **r11
+(2026-09-20, issue #42) makes the compute reserve account for the reachable (packed) kq mask**
+(only block 15 changed): V3's derived form is a per-*batch* decision, so a batch it cannot serve — 2-D
+M-RoPE (image/audio chunks) or a multi-sequence batch — allocates the packed mask at runtime, which the
+reserve (measured with the derived form on) did not contain.  At depth that mask is hundreds of MiB, so
+the first such batch had to **grow** the compute buffer mid-run; under `--fit on --fit-target 256` the
+growth fails (`cudaMalloc failed: out of memory`) and the request dies with `failed to process mtmd
+chunk`, and a following request then tripped a `ggml_backend_tensor_alloc` bounds assert on the
+allocator state the failed reserve left behind.  `sched_reserve()` now measures with the packed mask
+when — and only when — such a batch is reachable in that context (the new
+`kq_mask_packed_reachable()`: M-RoPE or `n_seq_max > 1`; every other packed-mask source already keeps
+the mask in the reserve), so `--fit` counts it where it can happen and the growth cannot occur.  On the
+reporter's M-RoPE model that costs **8960 tokens / -4.4 %** of fitted context; a non-M-RoPE
+single-sequence model keeps V3's reserve unchanged (gemma4-E4B 113.94 MiB derived vs 146.80 forced
+packed), and same-seed output is byte-identical with throughput unchanged everywhere.  An independent
+`ggml-alloc`
+hardening turns any remaining buffer-allocation failure into a clean `GGML_STATUS_ALLOC_FAILED`
+instead of the assert.  See the 2026-09-20 block-15 (r11) amendment section below.  **r10
 (2026-09-20, issue #41) fixes block 11's pre-fill test** (only block 11 changed):
 `cgraph->nodes[0]->ne[1] > 1` misread a split-MoE one-token decode split's leading expert tensor
 (`[n_ff, n_expert_used, 1]`, so `ne[1] == n_expert_used == 10`) as a multi-token batch, so with
@@ -85,6 +102,94 @@ The 2026-09-17 re-base resolved three blocks:
 
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
+
+## 2026-09-20 block-15 amendment (r11): the compute reserve accounts for the reachable (packed) kq mask (issue #42)
+
+**Release** `v16-ebbb18522-r11`, canonical tip `eabb7418df317d1d1b45d65faf1b235c6b43643d`, net tree
+`865ded736155407c3a02f5249df356ed1a35fb56`.  Only **block 15** changed; blocks 00-14 are
+content-identical to r10 (their patch files are byte-identical, `From <sha>` included).
+
+**The bug (issue #42).**  V3's derived kq mask is a per-*batch* decision, and the packed mask that a
+batch it cannot serve allocates is `n_kv*n_tokens*2` bytes -- hundreds of MiB at depth.  `sched_reserve()`
+measured with the derived form **on**, so the reserved compute buffer did not contain that mask: the first
+non-derivable batch at depth had to *grow* the buffer mid-run, and under `--fit on --fit-target 256` that
+growth fails with `cudaMalloc failed: out of memory`, the request dying with `failed to process mtmd
+chunk`.  The failed reserve also left `ggml_gallocr` describing buffers it no longer had, so the **next**
+request tripped `GGML_ASSERT(... addr + alloc_size <= base + size)` in `ggml_backend_tensor_alloc` -- the
+hard crash in the issue.
+
+**Reproduced** on gfx1100 (RX 7900 XTX, 24 GiB) with the reporter's exact model and settings
+(`ukisai/Swift-Qwen3.8-27B-GGUF:Q4_K_S` = `qwen35`, M-RoPE + mmproj; `--fit on --fit-target 256 -b 2048
+-ub 512 -fa on -ctk q8_0 -ctv q8_0 --spec-type draft-mtp --spec-draft-n-max 3 -np 1 --cache-ram 16384
+--cache-reuse 256`): ~152k-token prefill, then a request appending an image at depth.  Pre-fix the reserve
+is **122.80 MiB** and the 800-token image batch grows it to **271.53 MiB** -- the delta is exactly the
+packed mask, `152320 x 512 x 2` (152208 rounded up to the 256-cell padding), so the image batch is the one
+that cannot be derived.  HTTP 500, then an assert on the following request.
+
+**The fix.**  `llama_context::graph_reserve()` takes an explicit `packed_kq_mask` argument; when set, the
+measure graph is built with `cparams.kq_mask_derived = false`, so the reserved buffers contain the packed
+mask at its worst case and the runtime growth cannot happen.  Which reserves pass it is decided by the new
+`llama_context::kq_mask_packed_reachable()`, and that predicate is the interesting part: the mask has to be
+reserved only where a batch the derived form cannot serve is actually **reachable**:
+
+* **2-D (M-RoPE) batches** -- an image/audio chunk decode carries 2-D positions (mtmd), which only an
+  M-RoPE model can produce (`llama_batch::is_pos_2d()` is `n_pos >= 3`; `n_pos_per_embd()` is 4 only for
+  MROPE/IMROPE).  This is the reporter's case.  The packed mask's `ext`-based causal clause
+  (`set_input_kq_mask_impl`: when `p0 == p1`, drop if `p0_ext.is_2d_gt(p1_x, p1_y)`) is exactly what the
+  derived form cannot express, so the rejection is necessary, not conservative.
+* **multi-sequence batches** (`ubatch.n_seqs_unq != 1`), e.g. `--kv-unified` with several slots --
+  `kq_mask_derivable()` rejects them because the derived cell encoding is single-sequence.
+* **alibi**, which encodes a value rather than a predicate (belt-and-braces -- alibi already disables the
+  derived form globally through the probe).
+
+Everything else is already covered *without* the predicate, which is what keeps the cost narrow:
+
+* the `allow_derived == false` builders (MLA / lightning indexer / MSA) never take the derived branch, so
+  their reserve graph already holds the packed mask -- no arch list is needed;
+* alibi, a multi-stream KV cache and a disabled flash attention disable the derived form globally
+  (`resolve_fused_ops()`'s probe), so those reserves are packed anyway;
+* the `n_kv % 256` gate is not a runtime variable: `llama_kv_cache::get_n_kv()` pads to at least 256 cells
+  (`GGML_PAD(cells.used_max_p1(), max(n_pad, 256))`), so the stride condition always holds.  Verified
+  empirically on gfx1100 with a text-only multi-turn append at an off-stride position: **every** prefill
+  graph logged DERIVED (380 DERIVED / 20 PACKED, and every PACKED one was `n_tokens <= 8`, whose mask is a
+  few MiB and fits the reserved slack);
+* a `n_tokens <= 8` batch takes a packed mask, but it is tiny (the same was true before the derived form
+  existed).
+
+The predicate is the one place that enumerates the reasons `kq_mask_derivable()` can reject a *large*
+batch, so a new reason added there has to be added here too; the `ggml-alloc` invalidation and the
+compute-buffer growth log below are the safety net if that is ever missed.  The fused-op support probes
+deliberately keep the derived form (the `LLM_FUSED_OP_FLASH_ATTN_DERIVED` probe requires the derived node
+to be *present* in its graph), and the public `llama_graph_reserve()` ext API keeps the old default.
+
+**Cost, measured.**  The reporter's M-RoPE model pays, as it must: `ROCm0` **122.80 -> 258.02 MiB**,
+`ROCm_Host` **20.80 -> 210.02 MiB**, and `--fit` solves for `n_ctx` **203520 -> 194560** (**-8960 tokens,
+-4.4 %** of context on the 24 GiB card).  The common case does **not** pay: gemma4-E4B (not M-RoPE, single
+sequence) keeps the derived reserve at **113.94 MiB**, against **146.80 MiB** with the derived form forced
+off (`LLAMA_KQ_MASK_DERIVED=0`) -- i.e. V3's *reserved*-memory win stands for every configuration where the
+packed mask is unreachable.  Throughput is untouched anywhere (the reserve is not on the compute path):
+same-seed prompt eval **963.65 -> 963.57 t/s**, decode **38.81 -> 38.71 t/s**, 152k-token prefill
+**267.7 -> 267.9 s**.
+
+**Allocator hardening (same release, independent).**  `ggml_gallocr_reserve_n_impl()` now clears a new
+`galloc->layout_valid` when one of the buffers cannot be allocated, and `ggml_gallocr_needs_realloc()`
+forces a fresh reserve whenever it is clear.  Before this, the failure left `node_allocs`/`leaf_allocs`
+describing the new (larger) graph while the failed buffer was NULL and the not-yet-processed ones still had
+their old size, so the next `ggml_gallocr_alloc_graph()` reused that layout and either dereferenced a NULL
+vbuffer or pointed a tensor past the end of its buffer (the assert above).  With the flag, an out-of-memory
+becomes a clean `GGML_STATUS_ALLOC_FAILED` (`process_ubatch: failed to allocate graph`, the request fails,
+the server survives), and a retry after the memory is freed can succeed.  No steady-state cost.  The
+buffer-growth message was promoted from `GGML_LOG_DEBUG` (compiled out in Release, which made a failed
+growth unattributable) to `GGML_LOG_INFO`.
+
+**Validation.**  Pre-fix on fingon: image-at-depth -> `allocating 271.53 MiB ... cudaMalloc failed: out of
+memory` + `failed to process mtmd chunk` (HTTP 500).  Post-fix the identical run logs **zero**
+growth/OOM/assert events, the image decodes in 1281 ms, HTTP 200, and text-only and image follow-up
+requests both succeed -- the allocator is not left corrupted.  Same-seed greedy output is
+**byte-identical** pre- vs post-fix on both the derived (text) and packed/2-D (image) paths
+(`620cbe029ab2679408b591c73bde730a154a091361a80611e63374d850a64489`, with `-c 32768 --fit off` pinned so
+the changed fit cannot confound it).  `scripts/validate-set.sh` green (strict 16/16 `git am` on a fresh
+`ebbb18522`, applied tree `865ded736`), and only patch `0015` changed.
 
 ## 2026-09-20 block-11 amendment (r10): the pre-fill test reads the real token count, and the HIP exec is re-instantiated instead of updated
 
@@ -347,7 +452,7 @@ modifies it).
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split (block 13)** - prefill fused expert MMQ (RDNA4 + RDNA3.5 + RDNA3.0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K) + decode item-split; **amended 2026-09-02 with the two MTP regression fixes** (mmvq ksplit dispatch for verify batches; rms_norm-fold gate for multi-token MoE); **amended 2026-09-11 with the dense ncols==1 ksplit alignment** (dense `MUL_MAT` rows always ksplit for every K so single-token decode is row-identical to the 2..8-token verify batch; `MUL_MAT_ID`/MoE kept the item-split at that point — superseded by the second 2026-09-11 amendment below) — see the block-13 notes below; **amended again 2026-09-11 with the MoE `MUL_MAT_ID` dispatch fix** (all `MUL_MAT_ID` now use the dedicated MoE kernel, completing what the dense fix left open — `ncols_dst == 1` previously took the dense ksplit kernel with an ids gather; **+6.2% MoE decode**) **and the `GGML_CUDA_DISABLE_SHEXP_DOWN_GATE` kill-switch** (the decode-only fused shared-expert epilogue is not bit-exact with the unfused chain — the accepted MoE residual; see the block-13 notes); **amended 2026-09-05 with the RDNA3_5 gate relaxation** (gfx1151 validated; see the block-13 notes) and **with the RDNA3_0 gate relaxation** (gfx1100 validated; see the block-13 notes); see block 13 notes below | **amended 2026-09-06 with the model-neutral Strix MoE mmq folds** (fork 1da01fa67 routed-compact, 7a6a2e97b swiglu-input quantize, f33ffaca7 mwr float4, 6d457634e split_j+Q8_0 rows, 0a3a2b498 quantize chunk, 6a80b695c mul_mat_q_pair kernel, b31940a5e weighted-down mmvq kernel, f5ac11903 scale-unary window). Fold trail: archive/work/wip-archive/qwen4exp/README.md. | **amended 2026-09-08 with the moe_weighted_reduction float4 remainder fix (issue #19)**; **amended 2026-09-11 with the F2 cause-2 decode/verify band-uniformity fix** (upstream's per-type mmvq caps are floored at `MMVQ_MAX_BATCH_SIZE` and `mul_mat_vec_q_moe`'s launch bound is sized at the band, completing block 13's own "decode == verify" invariant for the whole band — `W=1..8` bit-identical, **+14-26 %** at the verify widths) — see the block-13 notes below; **amended 2026-09-11 with the fused shared-expert epilogue band** (the decode-only `ne[1] == 1` gate now serves the whole `n_tokens <= MMVQ_MAX_BATCH_SIZE` band, with the kernels made token-generic and `nwarps` pinned to the single-token reduction order — `W=1..8` bit-identical, MoE `draft-mtp` acceptance 0.51 -> 0.82 with 167.3 t/s vs plain 96.9 on Qwen3.6-35B-A3B; the asterisk is gone) — see the block-13 notes below; **amended 2026-09-12 with the column-blocked fused shared-expert epilogue** (the band amendment's `grid = (nrows, ncols)` launched one block per `(output row, token)`, re-reading the down-weight row per token and duplicating both barriers, the cross-warp reduction and the epilogue — for the 35B-A3B geometry only warp 0 of 8 did any work; the kernel is now templated on `ncols_dst` with the token loop inside the k-block loop and `grid = (nrows)`, the weight row read once per `(row, k-block)` for the whole band, `nwarps` still pinned and every token's reduction order unchanged, so the change is **bit-identical** — old-vs-new `libggml-hip.so` A/B: probe `W = 1..8` all `ac8825358d9adfda`, all `bd138ad2326fbbf2` with the kill-switch, the §5 matrix and the §19 `plain == n_max 3 == n_max 7` gate `68c0a24ed8d4` unchanged, MTP acceptance `0.87179` — while recovering the item-5 cost: `llama-batched-bench` `pl 8` 461.0 -> 475.4 t/s (+3.1 %), `pl 4` 299.1 -> 306.5 (+2.4 %), `pl 1` flat, i.e. the fused default now beats the unfused reference at every width); **amended 2026-09-12 with the RDNA3_5 (gfx1151) single-token-only mmvq fusion skip** (the dense gate+up+GLU fusion and the weighted-down MoE tail are single-token-only and do not reproduce the standalone mmvq arithmetic, so a 1-token decode and an n-token verify of the same layer are not bit-identical — the issue-25 "block-13 `n_q=1` short-K mmvq variance"; skipped on RDNA3_5 unless `GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS=1`, restoring `W=1..8` to one hash for qwen4exp f16/q8_0 and the MoE, at ~0.9 % tg128 on qwen4exp) — see the block-13 notes below; **amended 2026-09-12 (18) with the dense mmvq weight per-(type, K) nwarps** (the dense `mul_mat_vec_q_ksplit` kernel picks `nwarps` per `(type, K)` — a Q8_0 weight with `K < 4096` takes the pre-2026-09-11 wide block, every other shape stays at 1; the pinned fusion ops (GDN/SSM, shared-expert, the gate fusions) keep band-uniform `calc_nwarps`, so `W = 1..8` still agrees — see the 2026-09-12 (18) section below).
 | `0014` | **qwen4exp support (block 14)** - Qwen3.8-Flash-Next model support promoted from `beta/qwen4exp` (fork delta `c261553a1..dd4301fb4`, squashed + re-based to `050dde50c` 2026-09-07): QSA sparse FA (DEFAULT) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head support, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy; see block 14 notes below | **amended 2026-09-07 with the QSA quantized-KV decode gate** (the fused indexer ops read the raw cache natively in F32/BF16/F16 only; a quantized indexer-key cache, e.g. `--cache-type-k q8_0`, previously aborted `ggml_indexer_fill` at context init — those caches now fall back to the per-op chain) | **amended 2026-09-07 with the derived-cache pool gate** (the F32 block-vector pool is now allocated only when the derived cache is enabled *and* the indexer keys are unquantized — no more dead ~100 MiB buffer + no-op fill launches otherwise) | **amended 2026-09-08 with the MUL_MAT_ID pair-fusion layout gate (issue #18)** — see the block-14 notes below. | **amended 2026-09-08 with the compiler-warning cleanup** — see the block-14 notes below. | **amended 2026-09-08 with the tensor-split backend gate (HIP-only)** — see the block-14 notes below. | **amended 2026-09-08 with the quantized-KV tensor-split gate** — `q4_1`-family KV cache types (`q4_1`/`q5_0`/`q5_1`/`iq4_nl`) abort at graph reserve under multi-GPU `SPLIT_MODE_TENSOR` (upstream bug, also on vanilla `050dde50c`); now rejected at context creation with a clear error when the Meta device is in use — see the block-14 notes below. | **amended 2026-09-09 with the gfx1151-only freed-cell KV-zeroing gate** — the seq_rm/seq_keep/clear row zeroing (strix-port aad5adb08f masked-column guard for the gfx1151 WMMA f16 `x+(-0.0)` inexactness) now enables only when a KV buffer device is gfx1151 (env `LLAMA_KV_ZERO_FREED` overrides); everywhere else pre-block-14 behavior (no per-free GPU memsets) is restored — see the 2026-09-09 block-14 amendment section below. | **amended 2026-09-10: the freed-cell host zeroing is removed and the kernel-side masked-V fixes were re-homed** — `llama-kv-cache.{cpp,h}` are the upstream state (no `zero_freed`/env/GPU memsets); the Vulkan `flash_attn_cm1.comp`/`flash_attn.comp` fixes live in block 00 and the HIP `fattn-tile.cuh`/`fattn-mma-f16.cuh` fixes live in block 03, so block 14 carries none of them — see the 2026-09-10 block-00 section below. | **amended 2026-09-11 with the hyper-connection decode/verify band fix** — `ggml/src/ggml-cuda/hc-mix.cu` + the `src/models/qwen4exp.cpp` gates served `nt == 1` only, so a 1-token decode used the fused `HC_MIX`/`HC_COMBINE` chain while an n-token verify batch used the unfused chain (the "F2" divergence: plain decode != `draft-mtp`).  Both ops now serve the whole band `1 <= nt <= 8` (`HC_FUSED_MAX_TOKENS`), taking the token from `blockIdx.y` and reading `inject` with its own view stride, so every token in the band runs the per-token kernel sequence a single-token decode runs and W=1 is byte-identical to the pre-fix build.  qwen4exp is thereby width-pure for `--spec-draft-n-max <= 3` (f16/bf16 KV; plain == `draft-mtp` text, f16 acceptance 0.500 -> 0.76744, MTP generation 63.3 -> 79.9 t/s); the `W >= 5` grouping is **cause 2**, shared with the `q8_0`/`q4_0` KV impurity, and remains open — see `GREEDY-PURITY.md` §13 and `archive/work/kv-quant-purity-followups/README.md` (F2).  A `<= 8`-token *prefill* chunk also takes the fused path (indistinguishable from a verify batch). | **amended 2026-09-11 with the QSA decode-arm band** — the arch policy's dense decode arm was gated `n_tokens == 1`, so above the indexer selection width (`indexer_top_k + r - 1` = 2051 on qwen4exp, reached at `n_kv = 2304`) a W=1 decode ran dense while the n-token verify batch fell through to the sparse top-k selection, and `plain != draft-mtp` in text.  The arm now serves the whole decode/verify band (`QSA_DECODE_BAND = 8`, the `n_max <= 7` purity band); prefill keeps the sparse selection.  `plain == n_max 3 == n_max 7` = `804de0576868` (f16 KV) and `plain == n_max 3` = `75d8530c5bb1` (q8_0 KV); MTP `n_max 3` pos-1 acceptance 0.615 with 63.9 t/s vs plain 50.1.  Two width-dependences remain in the *sparse* regime (gfx1151 above 64K) — see `../GREEDY-PURITY.md` §16-18 and the 2026-09-11 block-14 amendment section below. | **amended 2026-09-11 with the QSA quantized-KV enablement + the K/V-head chunking fix** - `GGML_OP_FLASH_ATTN_QSA` now reads `q4_0`/`q4_1`/`q5_0`/`q5_1` (dequantized to F16 while a tile is staged) so every cache type takes the same attention path on qwen4exp (prefill 2368 -> 2384 t/s at 32k, uniform with f16), and the kernel's head chunking is now bounded by the GQA ratio: the old `head_base += QSA_MAX_HEADS` split a block across two K/V heads (qwen4exp is 24 q-heads / 2 kv-heads = gqa 12 < `QSA_MAX_HEADS` 16), so the one shared smem tile mixed both heads' rows for 16 of 24 heads - **a quality bug** (perplexity 7.33 -> 6.53, = the dense masked reference) that was perfectly width-pure and invisible to the probe; the CPU reference for the new types and a `FLASH_ATTN_QSA` backend-op test (18 cases) now gate it - see the 2026-09-11 block-14 amendment (fourth) section below and `../GREEDY-PURITY.md` §21. | **amended 2026-09-11 (fifth) with the `iq4_nl` entries** — the QSA kernel's `kv_dequant_f16` alias, its dispatch and its `kv_type_supported()` predicate, the CPU reference `read_kv` case (the oracle), `qsa_kv_native`/`qwen4exp_qsa_sparse()`, `llama_kv_type_has_native_fa()` (+ the error text) and the `test_flash_attn_qsa` case list (18 -> **22** cases, incl. the model geometry D=256/gqa=12) — see the `iq4_nl` section below. | **amended 2026-09-12 (sixth) with the configurable QSA prefill arm + the device-query arm gate** — the prefill axis is now depth-configurable (`qsa_dense_prefill_until`, env `LLAMA_QSA_DENSE_PREFILL_UNTIL`) with the documented arch policy preserved as its default: **0 = QSA prefill always, every arch and split** (Soar QSA wins prefill from ~8K to +181 % @160K, Halo from ~16K), so the delivery stays byte-identical to the pre-amendment build and the arm is an opt-in A/B; and `qsa_kv_native`'s hand-maintained type list is replaced by a `ggml_backend_dev_supports_op()` query on a shaped probe tensor (under `-sm tensor` that device is the Meta device, so the query is the meta-split safety condition itself) — see the 2026-09-12 block-14 amendment section below. | **amended 2026-09-12 (seventh) with the MTP-export logits-purity fix** — the unmasked `embeddings_nextn` export deferred the last layer's output-row gather, so the last layer's ffn tail ran on the full prefill ubatch and shifted the last-position logits by a ULP against `--spec-type none`; the last layer now always gathers its output rows (the plain path) and builds a separate full-row tail for `t_h_nextn` only when the chunk drops rows, so the logits are bit-identical (`mstep NEXTN=1` 0 mismatches, was 1) with MTP acceptance unchanged — closes TODO item 4(a); see the 2026-09-12 block-14 amendment (seventh) section below. | **amended 2026-09-12 (eighth) with the QSA indexer-score decode/verify band-uniformity fix** — the score flattens the indexer heads into its N dimension (`ne11 = n_idx_h * n_tps = 4 * n_tps` on qwen4exp), which crossed `MMVF_MAX_BATCH_SIZE` at `n_tps = 3`, so from W=3 the verify batch fell through to MMF while decode (`n_tps = 1`) stayed on MMVF; the ULP-different indexer score flipped a top-k near-tie (an **invisible**, logits-level `plain != draft-mtp` violation at W >= 3 with a q8_0 cache).  The block-08 guard now covers the whole flattened band (`MMVF_MAX_BATCH_SIZE_FLAT` = 32) and `mul_mat_vec_f` is instantiated for `ncols_dst` 9..32, so W = 1..8 is bit-identical with the W=1 `Thash` unchanged and dense/prefill paths untouched (gfx1151 cross-check validated 2026-09-12 (14): the forced-sparse text residual is cleared and all eight native KV types are pure at n_max 1/2/3/5/7) — see the 2026-09-12 block-14 amendment (eighth) section below. || **amended 2026-09-13 (ninth) with the pair-fusion `ncols_opt` fix** - the 2026-09-13 re-base merged upstream's new `mmq_args::ncols_opt` field, but `ggml_cuda_mul_mat_q_pair`'s two hand-built `mmq_args` left it 0, so the MMQ tile heuristic stopped at `J=8` (up to **2.2x** slower dense prefill; the buggy re-based build was 14-48 % below pre-rebase).  Both pair arms now set it like the standalone (dense: the token count; `MUL_MAT_ID`: the RDNA per-expert average) and the heuristic falls back to `ncols_max` when unset.  Fixed: 27B Q8_0 pp4096 623 -> **1363** (1 GPU) / 1718 -> **2176** (tensor); 27B UD-Q4_K_XL 905 -> **1264** / 1693 -> **2040**; 4B 5386 -> **7304**; qwen4exp unaffected.  Numerics unchanged (pair on == off, same-seed `d03d0bc727a8`) - see the 2026-09-13 block-14 amendment (ninth) section above. || **amended 2026-09-13 (issue #30) with the QSA decode-arm band-to-verify-width fix** — `QSA_DECODE_BAND = 8` covered the `n_max <= 7` verify, but a deeper draft makes the verify `W = n_max + 1 > 8` and the dense decode arm (`n_tokens <= 8`) no longer matched it: above the indexer selection width (2051) the W=1 decode stayed dense while the depth-8..15 verify fell through to the sparse top-k arm — measured on the real model (W=1..8 one logits hash, W=9..16 another, == the forced-sparse hash).  The arm band is now `max(QSA_DECODE_BAND, cparams.n_rs_batch)` so the whole verify band takes the W=1 decode's arm; default configs (`n_rs_batch <= 8`) are unaffected — see the 2026-09-13 issue-#30 section below. |
 
-| `0015` | **attention-memory wins (block 15)** — promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`: **V3** derived kq mask (`LLAMA_KQ_MASK_DERIVED`, default 1), **V4** native q8_0/q4_0 + **V5** native bf16 K/V in the FA kernels (one `GGML_CUDA_FA_KV_NATIVE` switch — **amended 2026-09-14**, issue #30: **unset = auto** → native q8_0/q4_0 **on** / bf16 off, `=1` force all on, `=0` force the pre-amendment F16-staging path; the policy is per type class and q4_0 gained a native arm), **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived QSA per-block bias + visibility (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), **W3** keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), **W4** ggml-alloc unused-view release (no gate; A/B revert `../archive/work/block-15-campaign-wins/ab/w4-revert.patch`); **amended 2026-09-15 (r3, issue #33)**: the deep-prefill staging arena's `cudaMalloc` failure is no longer fatal — `fattn_stage_try_get` returns null and the launcher falls back to the native K/V read for that launch, honoring an under-provisioned `--fit` target; see the block-15 promotion section below and the 2026-09-14, 2026-09-15 (r3) and **2026-09-19 (r7) derived-mask kernel-shape** amendment sections. |
+| `0015` | **attention-memory wins (block 15)** — promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`: **V3** derived kq mask (`LLAMA_KQ_MASK_DERIVED`, default 1), **V4** native q8_0/q4_0 + **V5** native bf16 K/V in the FA kernels (one `GGML_CUDA_FA_KV_NATIVE` switch — **amended 2026-09-14**, issue #30: **unset = auto** → native q8_0/q4_0 **on** / bf16 off, `=1` force all on, `=0` force the pre-amendment F16-staging path; the policy is per type class and q4_0 gained a native arm), **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived QSA per-block bias + visibility (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), **W3** keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), **W4** ggml-alloc unused-view release (no gate; A/B revert `../archive/work/block-15-campaign-wins/ab/w4-revert.patch`); **amended 2026-09-15 (r3, issue #33)**: the deep-prefill staging arena's `cudaMalloc` failure is no longer fatal — `fattn_stage_try_get` returns null and the launcher falls back to the native K/V read for that launch, honoring an under-provisioned `--fit` target; see the block-15 promotion section below and the 2026-09-14, 2026-09-15 (r3), **2026-09-19 (r7) derived-mask kernel-shape** and **2026-09-20 (r11) reachable-packed-mask reserve** amendment sections. |
 
 ## 2026-09-16 block-12 amendment (r4): the opt-in copy-engine (SDMA) all-reduce
 
@@ -1367,6 +1472,14 @@ Block 15 is the delivery's last patch since the 2026-09-12 promotion — see
 the promotion section above for the wins, the gates and the validation
 record (it was staged in `../archive/work/block-15-campaign-wins/`, which now carries
 the PROMOTED record).
+
+**Amended 2026-09-20 (r11, issue #42)**: `sched_reserve()` now measures with the packed kq mask when a
+batch V3's derived form cannot serve is *reachable* in the context (the new `kq_mask_packed_reachable()`:
+2-D M-RoPE or multi-sequence), so such a batch can no longer force a mid-run compute-buffer growth that
+fails under `--fit`.  Where the packed mask is unreachable the reserve is unchanged, so V3's
+**reserved**-memory win (`n_ubatch x n_ctx x 2`) stands for M-RoPE-free single-sequence models (gemma4-E4B
+113.94 MiB) and is only given up where the mask can actually appear (the reporter's M-RoPE 27B: 122.80 ->
+258.02 MiB) — see the 2026-09-20 block-15 (r11) amendment section above.
 
 ## 2026-09-12 block-14 amendment (eighth): the QSA indexer-score decode/verify band-uniformity fix
 

@@ -12,7 +12,23 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release (2026-09-20) — `v16-ebbb18522-r10`:** a block-11 amendment (issue #41) on top of r9:
+**Current release (2026-09-20) — `v16-ebbb18522-r11`:** a block-15 amendment (issue #42) on top of r10:
+the compute reserve now measures with the packed kq mask when one is **reachable**, because V3's derived
+form is a per-*batch* optimization — a 2-D M-RoPE image/audio batch or a multi-sequence batch allocates
+the packed mask (`n_kv*n_tokens*2`), which the reserve (measured with the derived form on) did not
+contain.  A deep-context image batch therefore grew the compute buffer mid-run and, under the default
+`--fit-target 256`, died with `cudaMalloc failed: out of memory` -> `failed to process mtmd chunk`; the
+next request then asserted on the state the failed reserve left behind.  `sched_reserve()` now measures
+with the packed mask only where such a batch is reachable (the new `kq_mask_packed_reachable()`: M-RoPE
+or `n_seq_max > 1`; every other packed-mask source already keeps the mask in the reserve), so `--fit`
+counts it exactly where it can happen.  Same-seed greedy output is byte-identical and throughput is
+unchanged; the reporter's M-RoPE model pays 8960 tokens / -4.4 % of fitted context, while a non-M-RoPE
+single-sequence model keeps V3's reserve untouched.  A failed buffer allocation additionally invalidates
+the allocator's layout, so a remaining OOM is a clean `GGML_STATUS_ALLOC_FAILED` rather than an assert.
+Canonical tip `eabb7418df317d1d1b45d65faf1b235c6b43643d`, tree
+`865ded736155407c3a02f5249df356ed1a35fb56`, strict 16/16 (only patch `0015` changed).
+
+**r10 (2026-09-20) — `v16-ebbb18522-r10`:** a block-11 amendment (issue #41) on top of r9:
 the pre-fill test now reads the real token count (`ggml_cuda_graph_is_multi_token()`), so the leading
 expert tensor (`[n_ff, n_expert_used, 1]`) of a split-MoE `-ncmoe` one-token decode split no longer
 misclassifies it as pre-fill and decode replays HIP graphs again (0 -> 50 warmups / 0 -> 687 replays,
@@ -20,8 +36,7 @@ misclassifies it as pre-fill and decode replays HIP graphs again (0 -> 50 warmup
 destroyed/re-instantiated instead of updated to avoid the ROCm <= 10.0 `hipGraphExecUpdate` leak
 (`GGML_HIP_GRAPH_FORCE_UPDATE=1` opt-out).  Canonical tip
 `385e0c77cbc34a01707b2efc25adb684c0dcbbc1`, tree `9f9602e6e5751ca1e065b80ec3764fdfe6ca6eba`, strict
-16/16.  **r9** was a block-15 amendment on top of r8 — the V3
-derived kq mask is now implemented in the **tile** FA kernel as well, so the head-cap configurations
+16/16.  **r9** was a block-15 amendment on top of r8 — the V3derived kq mask is now implemented in the **tile** FA kernel as well, so the head-cap configurations
 (gemma4 head 512 on gfx1100/gfx1151) that r8 could only *report* now get it, as a deep-prefill win with
 decode unchanged (the derived branch is hoisted out of the KV loop, because decode/verify always take
 the tile kernel).  Earlier releases on this base: **r8** made the derived-mask disable self-explanatory (block 15;

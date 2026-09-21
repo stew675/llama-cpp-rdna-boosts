@@ -15,9 +15,16 @@ remain as known-good records for those upstream versions.
 
 > **Current baseline marker:** `baseline/d1d3c3396` was the previous (2026-09-15)
 > delivery baseline.  The current one is **`ebbb18522`** (2026-09-17), the fork point of
-> release **`v16-ebbb18522-r10`** (canonical tip
-> `385e0c77cbc34a01707b2efc25adb684c0dcbbc1`, tree
-> `9f9602e6e5751ca1e065b80ec3764fdfe6ca6eba`; r10 = the 2026-09-20 block-11 pre-fill token-count
+> release **`v16-ebbb18522-r11`** (canonical tip
+> `eabb7418df317d1d1b45d65faf1b235c6b43643d`, tree
+> `865ded736155407c3a02f5249df356ed1a35fb56`; r11 = the 2026-09-20 block-15 amendment that makes the
+> compute reserve account for the *reachable* (packed) kq mask, issue #42 — V3's derived form is
+> per-*batch*, so a 2-D M-RoPE or multi-sequence batch allocates a mask the reserve did not contain,
+> and the growth died under the default `--fit-target 256`; `kq_mask_packed_reachable()` decides where
+> the mask is reserved (M-RoPE / `n_seq_max > 1`), so same-seed output stays byte-identical, throughput
+> is unchanged, non-M-RoPE single-sequence models keep V3's reserve, and the reporter's M-RoPE model
+> pays -8960 tokens (-4.4 %) — on top of
+> r10 = the 2026-09-20 block-11 pre-fill token-count
 > fix + the HIP `hipGraphExecUpdate` leak guard, issue #41, on top of r9's block-15 V3 tile-kernel
 > derived mask, which sits on r8/r7 (block 15), r6 (FA build time), r5 (block-04 head cap) and r4
 > (block-04 RDNA3_0 tensor-split `ncols2`) — base `ebbb18522` unchanged from r2).  `baseline/790cf51aa` remains the

@@ -328,8 +328,20 @@ for per-block verification and `BASELINE.md` for provenance.
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`ebbb18522`** (upstream master "openvino : Update OpenVINO to 2026.4", 2026-09-17 re-base).
-- Canonical 16-block chain: tip **`385e0c77cbc34a01707b2efc25adb684c0dcbbc1`**, net tree
-  **`9f9602e6e5751ca1e065b80ec3764fdfe6ca6eba`**; release **`v16-ebbb18522-r10`**.
+- Canonical 16-block chain: tip **`eabb7418df317d1d1b45d65faf1b235c6b43643d`**, net tree
+  **`865ded736155407c3a02f5249df356ed1a35fb56`**; release **`v16-ebbb18522-r11`**.
+- **The compute reserve accounts for the reachable (packed) kq mask** (issue #42, block 15,
+  2026-09-20): V3's derived kq mask is a per-*batch* optimization, so a 2-D M-RoPE image/audio batch or a
+  multi-sequence batch allocates the packed mask (`n_kv*n_tokens*2` bytes), which the reserve — measured
+  with the derived form on — did not contain.  At depth that mask is hundreds of MiB, so a deep-context
+  image batch grew the compute buffer mid-run; under the default `--fit-target 256` that growth failed
+  (`cudaMalloc failed: out of memory`, `failed to process mtmd chunk`) and the next request asserted.
+  `sched_reserve()` now measures with the packed mask **when such a batch is reachable** (the new
+  `kq_mask_packed_reachable()`: M-RoPE or `n_seq_max > 1`), so `--fit` counts it exactly where it can
+  happen.  Same-seed output is byte-identical and throughput is unchanged; the reporter's M-RoPE model
+  pays 8960 tokens / -4.4 % of fitted context, while a non-M-RoPE single-sequence model keeps V3's
+  reserve untouched.  A failed buffer allocation now also invalidates the allocator's layout instead of
+  asserting on a later graph.
 - **Block 11 replays HIP graphs for split-MoE decode again** (issue #41, 2026-09-20): the pre-fill
   test keyed off `nodes[0]->ne[1]`, which is `n_expert_used` (10) on the expert tensor a one-token
   decode split starts with under `-ncmoe`, so every decode split was skipped as multi-token.  A new
