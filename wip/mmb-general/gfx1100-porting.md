@@ -68,8 +68,19 @@ closed.**  Raw data: **`gfx1100-s8s9-results.md`**.
 * **S9 open:** the `mmvq` RDNA3_0 `nwarps` and `VDR_Q8_0` re-sweeps, the block-13-fused vs
   MMB-routed kernel-time A/B, and the consolidated B1-B9 on the frozen tree (S10).
 
-Next: **S10 (freeze, regenerate the overlay, merge back to `wip-mmb-general`)** — after the
-remaining decode-side re-sweeps if the maintainer wants them done first.
+**S9 continued (2026-09-21): the delivery re-examination is CLOSED.**  Raw data:
+**`gfx1100-s9-mmvq-results.md`**.
+* **§2.6 MMB kernel-time (35B pp8192):** total **8514.6 → 8051.4 ms (−5.4 %)**; the monolithic
+  `mul_mat_q` expert family is replaced by `mmb_routed_glu` + `mmb_routed`, dense by `mmb_dense`,
+  attention unchanged.
+* **§2.3 `mmvq` `nwarps`:** shape-dependent — `all-8` regresses (27B −3 %, 35B −3.3 %); the current
+  table wins dense Q8_0 (+1.9 % on gemma-12B) and ties the 27B; **`all-1` wins the MoE** (35B +2 %
+  decode, **+4.5 % MTP**, gemma-26B +4.7 %).  No clean `(type,K)` rule → **table kept**, `all-1`
+  recorded as a MoE-only candidate (needs an M-based dispatch).
+* **§2.4 VDR:** 4 vs 2 is a **wash** → keep 4.
+* **§2.7 native KV:** all 8 types width-pure on gfx1100.
+
+Next: **S10 (freeze, regenerate the overlay, merge back to `wip-mmb-general`)**.
 
 ---
 
@@ -187,9 +198,13 @@ delivery work and the entire `mmb-general` WIP).  Each is therefore "re-open and
   single-token-tuned values cost up to +35 % at the verify widths.  The gfx1100 table has **not**
   been re-validated against the verify widths or the new weight-kernel shape, and its per-type
   regressions (Q2_K/Q4_K/Q5_K/IQ4_XS at 1) may have moved.
-* **Action (S9).**  Re-run the per-type decode + verify-width sweep on gfx1100, and decide whether
-  `calc_nwarps_weight` should apply to RDNA3_0 (it currently applies to the RDNA4 table).  Keep the
-  pinned fusions (GDN/SSM, shared-expert, gate fusions) on plain `calc_nwarps` — the known trap.
+* **Action (S9) — DONE 2026-09-21: shape-dependent, table left as-is.**  Two variant builds (`all-1`,
+  `all-8`) vs the current table: `all-8` regresses (27B −3 %, 35B −3.3 %); `cur` wins dense Q8_0
+  (gemma-12B +1.9 %) and ties the 27B; **`all-1` wins the MoE models** (35B +2 % decode,
+  **+4.5 % MTP**; gemma-26B +4.7 %).  No clean `(type, K)` rule separates them (the 35B `shexp`
+  K=2048 wants 1, gemma-12B dense K=3840 wants 8), and the RDNA4 `calc_nwarps_weight` short-K→8
+  rule is the *opposite* of gfx1100's MoE preference.  **Keep the table; record `all-1` as a
+  MoE-only candidate** needing a per-shape (M-based) dispatch.  Data: `gfx1100-s9-mmvq-results.md`.
 
 ### 2.4 The `VDR_Q8_0_Q8_1_MMVQ_MOE` choice
 
@@ -200,7 +215,10 @@ delivery work and the entire `mmb-general` WIP).  Each is therefore "re-open and
   issue-#30 band-uniformity fix; the RDNA4 assignment (dense VDR reverted, MoE VDR=4, *per kernel*)
   is now the documented reference.  The interaction with MMB's routed path (which would replace the
   mmvq expert kernel on eligible weights) also did not exist then.
-* **Action (S9).**  Re-measure at the verify widths and with MMB on/off; confirm or revise.
+* **Action (S9) — DONE 2026-09-21: confirmed harmless (a wash).**  `VDR=2` vs `VDR=4` on the two MoE
+  models is within noise (35B 126.01 vs 125.88 tg128; MTP 148.7 vs 149.1); the 2026-08-28 +3 % does
+  not reproduce on these shapes, but VDR=4 does not hurt.  **Keep VDR=4.**  Data:
+  `gfx1100-s9-mmvq-results.md`.
 
 ### 2.5 The FA WMMA head cap and `ncols2` rule (block 04)
 
@@ -240,9 +258,11 @@ delivery work and the entire `mmb-general` WIP).  Each is therefore "re-open and
 * **Why it is stale.**  These were validated on gfx1151/gfx1201 more than gfx1100; the auto policy is
   a *global* default, not per-arch.  The WIP's G2/G4 changes (qsa3, non-temporal) touch the same
   attention/memory paths.
-* **Action (S9).**  Re-run the per-KV-type width purity + `FLASH_ATTN_EXT` oracle on gfx1100 with the
-  current tree, and confirm the native-type auto policy is right for gfx1100 (the mstep / deep-prefill
-  numbers in `AGENTS.md` are gfx1201/gfx1151).
+* **Action (S9) — DONE 2026-09-21: all 8 native KV types are width-pure on gfx1100.**  `KV=`
+  `f16/bf16/q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl` all `PASS (worst maxdiff 0)` on the 27B with MMB on,
+  and `FLASH_ATTN_EXT` is 5955/0-FAIL (it covers the new native arms).  The native auto policy is
+  right for gfx1100; the per-type deep-prefill numbers remain trust-RDNA3_5/RDNA4.  Data:
+  `gfx1100-s9-mmvq-results.md`.
 
 ### 2.8 Smaller per-arch delivery gates worth a sanity check
 
@@ -552,7 +572,7 @@ relevant gates, write a dated `gfx1100-sNN-results.md`, commit the record to the
 | **S6** | G1 per-type/path matrix + re-tune ✅ | **gfx1100 = dense wins big, F32 router loses**; patch `0008` | 27B +14.4 %, gemma-12B +11 %, 35B MoE +5.6 %, g26 neutral |
 | **S7** | G1 routed/GLU ✅ | routed isolate (the bulk of the MoE win, ~+4 %) | kernel-time-free but `DENSE=0` isolate-backed; finer knobs deferred |
 | **S8** | G3b/c + HC16 ✅ | F32 policy-off; HC16 hard-gated to RDNA3_5; tiny-M qwen4exp-only | **no measurable gfx1100 work by construction** |
-| **S9** | delivery re-examination + matrix ⏳ | FA head cap **validated** (keep 256); verify-width gate green; **mmvq/VDR re-sweeps + block-13-vs-MMB pending** | §9.2 green; §9.3 open |
+| **S9** | delivery re-examination + matrix ✅ | FA cap **keep 256**; verify-width green; `nwarps` shape-dependent (table kept, MoE candidate); VDR=4 keep; 8/8 native KV pure; MMB kernel-time −5.4 % | all §2 items re-measured; one documented candidate |
 | **S10** | freeze + regenerate + merge back | new WIP patch (likely patch 7 = gfx1100 scope/tuning); docs updated; `git am` N/N; merge record branch into `wip-mmb-general` | gfx1100 handed a clean state; branches reconciled |
 
 Sessions S1-S7 are done.  S8 (G3b/c + HC16), S9 (delivery re-examination + full matrix) and S10
@@ -619,7 +639,8 @@ claim* is deferred.
 - [x] G1 routed/GLU isolate: the routed path is the bulk of the MoE win (~+4 %) (S7)
 - [ ] G1 optional finer routed/GLU threshold + `DBUF` sweep (deferred)
 - [x] G3b/c + HC16 — **no-op on gfx1100** (F32 policy-off; HC16 RDNA3_5-gated; tiny-M qwen4exp-only) (S8)
-- [~] delivery re-examination: **FA cap 256 validated (keep)**, verify-width gate green; mmvq/VDR + block-13-vs-MMB **pending** (S9)
+- [x] delivery re-examination DONE: FA cap 256 **keep**; verify-width gate green; **`nwarps` shape-dependent (table kept, MoE `all-1` candidate)**; **VDR=4 keep**; **all 8 native KV pure**; MMB kernel-time −5.4 % (S9)
+- [ ] G1 optional finer routed/GLU threshold + `DBUF` sweep (deferred)
 - [ ] B1-B9 consolidated on the frozen tree, including MTP (S10)
 - [ ] patch set regenerated + `git am` N/N + merged back to `wip-mmb-general` (S10)
 
