@@ -1940,10 +1940,10 @@ index 1b9e63516..ae3b8210c 100644
  
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
 new file mode 100644
-index 000000000..3f13e41ca
+index 000000000..f0f9f1d16
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -0,0 +1,1681 @@
+@@ -0,0 +1,1686 @@
 +#include "mmb.cuh"
 +#include "unary.cuh"
 +#include <unordered_map>
@@ -3180,6 +3180,11 @@ index 000000000..3f13e41ca
 +bool mmb_gatemix_flag() { static const int v = getenv("LLAMA_HC_GATEMIX") ? atoi(getenv("LLAMA_HC_GATEMIX")) : 0; return v != 0; }
 +bool mmb_down16_flag() { static const int v = getenv("GGML_CUDA_MMB_DOWN16") ? atoi(getenv("GGML_CUDA_MMB_DOWN16")) : 0; return v != 0; }
 +bool mmb_glu()     { static const int v = getenv("GGML_CUDA_MMB_GLU") ? atoi(getenv("GGML_CUDA_MMB_GLU")) : 1; return v != 0; }
++// Tile-class threshold: experts with >= this many rows take the BN=128 tile, the rest the BN=32 one.
++// The small tile re-dequantizes the same A panel once per jt tile (4x the weight dequant per output
++// for a 128-row expert), so this is the knob that trades B-column padding against dequant volume.
++int mmb_glu_thresh() { static const int v = getenv("GGML_CUDA_MMB_GLU_THRESH") ? atoi(getenv("GGML_CUDA_MMB_GLU_THRESH")) : 32; return v; }
++int mmb_routed_thresh() { static const int v = getenv("GGML_CUDA_MMB_ROUTED_THRESH") ? atoi(getenv("GGML_CUDA_MMB_ROUTED_THRESH")) : 32; return v; }
 +// IQ3_XXS: implemented and correct.  Its MMB *routed* path (individual gate/up MUL_MAT_ID) is a
 +// win, but the MMB *fused GLU* path is a NET LOSS on the UD-Q3_K_M workload (the fused kernel's
 +// dequant/loop shape costs more than the bf16-WMMA gain): full-on 1921 vs routed-only 2121 t/s
@@ -3492,7 +3497,7 @@ index 000000000..3f13e41ca
 +    const int sis1 = (int) (src1->nb[2] / src1->nb[1]);
 +    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
 +        E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
-+    constexpr int BN_SMALL = 32, THRESH = 128;
++    constexpr int BN_SMALL = 32; const int THRESH = mmb_routed_thresh();
 +    const int nbig_max   = n_rows / BN + E + 1;
 +    const int nsmall_max = E * ((THRESH + BN_SMALL - 1) / BN_SMALL) + 1;
 +    ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);
@@ -3573,7 +3578,7 @@ index 000000000..3f13e41ca
 +    const int sis1 = (int) (src1->nb[2] / src1->nb[1]);
 +    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
 +        E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
-+    constexpr int BN_SMALL = 32, THRESH = 128;
++    constexpr int BN_SMALL = 32; const int THRESH = mmb_glu_thresh();
 +    const int nbig_max   = n_rows / BN + E + 1;
 +    const int nsmall_max = E * ((THRESH + BN_SMALL - 1) / BN_SMALL) + 1;
 +    ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);

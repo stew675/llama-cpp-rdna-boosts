@@ -138,6 +138,82 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 23 (2026-09-20): the **small GLU tile re-dequantized the A panel 4x** — tile-class
+## threshold 128 -> `BN_SMALL`, MMB family **2822 -> 2592 ms**, total GPU kernel **4254 -> 4015 ms
+## (−8.9 % vs the pre-session-21 baseline)**, pp8192 **+1.5 %**, bit-identical
+
+Tip `49eff7f18` (36th commit).  The session-22 follow-up.  Full record: HANDOVER "session 23".
+
+### The find: profile per *shape*, not per name
+
+The post-split profile named `mrg` (the routed GLU) as the #1 kernel, but the per-name view hides the
+shape.  Splitting it out:
+
+| kernel | ms | calls | share of the whole run |
+|---|---:|---:|---:|
+| `mmb_routed_glu_kernel<64, 32, 16, 16, 5>` | **903.1** | 94 | **21.3 %** |
+| `mmb_routed_glu_kernel<64, 128, 32, 32, 5>` | 242.5 | 94 | 5.7 % |
+| `mmb_routed_glu_kernel<64, 32, 16, 16, 8>` | 16.2 | 2 | 0.4 % |
+
+Reading `mmb_routed_glu_kernel` settles what the two classes are: **`BM` tiles `M` (the expert's output
+rows — the A panel / the weights), `BN` tiles the expert's token rows (the B panel)**.  `mmb_build_desc2`
+sent every expert with `cnt < THRESH(128)` rows to the **BN=32** class.  So a 128-row expert took
+`ceil(128/32) = 4` blocks — and **each of those 4 blocks re-dequantized the same 64-row A panel**.  Four
+times the weight dequant for the same WMMA work and the same B-column padding.  The B-panel padding is
+what the small class was *for*, and it is identical in both classes: `4 x 32 = 128` columns either way.
+
+### The sweep
+
+Flash-Next IQ4_XS, fixed prompt, min-of-2, the `mrg` (GLU) kernel:
+
+| `THRESH` | 0 | 16 | **32** | 48 | 64 | 128 (old default) |
+|---|---:|---:|---:|---:|---:|---:|
+| `mrg` ms | 1078.4 | 1028.6 | **992.0** | 1014.6 | 1031.4 | 1161.4 |
+
+The optimum is exactly `THRESH == BN_SMALL == 32` — which is also the analytic rule.  The small class
+only pays while **one** block covers the expert (then it does 1/4 the WMMA for the *same* dequant); past
+that the big class wins on dequant volume.  `THRESH=0` (all sizes on BN=128) is *worse* than 32, which
+is the confirmation that the small class is still right for genuinely tiny experts.
+
+The routed (non-GLU) tile has the same structure and the same fix: `mr` **395.9 -> 361.5 ms (−8.7 %)**.
+
+### Landed
+
+`mmb_glu_thresh()` / `mmb_routed_thresh()`, defaulting to `BN_SMALL` (32), each with an env A/B
+override (`GGML_CUDA_MMB_GLU_THRESH` / `GGML_CUDA_MMB_ROUTED_THRESH`).
+
+| | old | **new** |
+|---|---:|---:|
+| Flash-Next `mrg` (GLU) | 1161.4 | **990.4** |
+| Flash-Next `mr` (routed) | 401.2 | **361.5** |
+| Flash-Next MMB family | 2822 | **2592** |
+| **Flash-Next total GPU kernel** | 4254 | **4015** (vs 4409 pre-session-21: **−8.9 %**) |
+| 35B Q4_K: `mrg` / `mr` / family | 279.9 / 187.7 / 987 | **263.7 / 181.7 / 962** |
+| pp8192 / pp2048 (same binary, env A/B) | 1073.1 / 1086.3 t/s | **1089.1 / 1101.4 (+1.5 %)** |
+
+**Bit-identical, and it cannot be otherwise**: `BN` changes only *which* token rows a block covers —
+never the K reduction order of any output element, and the A-panel dequant is the same rows in the same
+`ksh` order.  Verified: PPL **10.6015**, greedy **`9c281c415082`** (624 chars), width probe **PASS**.
+
+### Also measured this session — two more rejections (do not redo)
+
+* **The `v_perm` pack for IQ3_S, re-tested after the split** (the register pressure and ILP had changed
+  since session 22 rejected it): still loses, **`mrg` 1166 -> 1297 ms**.  The `mmb_pack2_so` shift/or form
+  stays.  This is also the cleanest proof that **the kernel is latency-bound, not issue-bound** —
+  `mmb_pack2_so` has *more* instructions than the `v_perm` form and is 11 % faster.
+* **A mid BN=64 tile** (replace the BN=32 class with BN=64, `THRESH=64`): **990 -> 1048 ms**, worse.  The
+  three-point tile ladder is not worth it; the two-class split at `THRESH == BN_SMALL` is the optimum.
+
+### Read-through
+
+Before reaching for a kernel rewrite, **profile per shape**.  This 21 %-of-the-run kernel was invisible
+in the per-name profile (it is all just "mrg"), and the win was not in the dequant *body* at all — the
+handover brief had been pointing at the body for two sessions, and the actual defect was a **tile-class
+criterion**.  The body's remaining candidate (preload the fields in `load_regs`) is still open and ranked
+first in the HANDOVER §F brief.
+
+---
+
 ## UPDATE — session 22 (2026-09-20): the **bf16 RNE pack becomes one `v_perm_b32`** — the 35B MMB family
 ## **−2.3 %**, Flash-Next total GPU **−2.3 %** with session 21; IQ3_S dequant audited and re-derived
 
