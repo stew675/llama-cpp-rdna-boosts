@@ -1,5 +1,52 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-21 (WIP, not a delivery change) — gfx1100 merged: the combined 3-arch set
+
+**Experimental WIP.**  `origin/wip-mmb-general-gfx1100` (12 commits, branched from `c79d48f`) was
+merged into `wip-mmb-general` at `10fc552`, so one branch now carries **gfx1151 + gfx1201 + gfx1100**.
+Record: `wip/mmb-general/combined-set-verification.md`.
+
+**The merge was clean** — one auto-resolved `GROUPS.md` hunk (gfx1100 added a pointer at the top of
+the "gfx1100 job" section while the gfx1201 side rewrote the steps beneath it; git kept both).  gfx1100
+brought `gfx1100-porting.md` (889 lines), `gfx1100/README.md`, 8 dated result files, and an overlay of
+**3 patches numbered 0011-0013** — correctly continuing our `0001-0010`, so **no collision**.
+
+**The combined set is 13 patches and applies 13/13 from r12**, producing tree
+**`cd306e6b6093b63468289edac24fbea3d270dbe2`** — verified both on top of the existing 10-patch state
+and **fresh** from a detached worktree at `c3ee45747` (the gfx1201-frozen tree was `35fc853e63…`).
+
+**Why the overlay is safe for the other two arches (reviewed before accepting it):** 0011 adds
+`GGML_CUDA_CC_IS_RDNA3_0` to the qsa3 support predicate — purely additive, RDNA4/RDNA3_5 were already
+accepted; 0012 adds one `if (GGML_CUDA_CC_IS_RDNA3_0(cc))` arm to `mmb_arch_defaults(cc)` — RDNA4
+keeps S13's `f32split_mode = 1`, RDNA3_5 keeps the struct default; 0013's `small_m` is gated
+`table_id == MMVQ_PARAMETERS_RDNA3_0 && !has_fusion && nrows_x <= mmvq_rdna3_0_small_m()` with that
+accessor defaulting to **0**, so it is provably false on every arch unless explicitly enabled.
+
+**Verified on gfx1201, not assumed.**  Built the combined tree and re-ran the gates; every value is
+identical to the frozen 10-patch result: the `MMB_CFG` dump is **byte-identical** (the strongest check
+— it proves 0012's arm did not leak into the RDNA4 row), the three same-seed hashes are unchanged
+(`42cdf36d0633`, `461ca8cd0e88`, `d73f9238f6d6`), `FLASH_ATTN_QSA` 26 cases + `GATED_DELTA_NET` +
+`INDEXER_TOPK` are green, `test-logits-width-probe` still `PASS (worst maxdiff 0)`, and 27B UD-IQ3_S
+pp8192/32768 measures **934.86 / 856.71** against the frozen 932.8 / 856.7.
+
+**One cost, flagged for a decision.**  Patch 0013 is default-OFF and its own documentation says it is
+unshippable (it breaks the W=1..8 width-purity contract on MoE models; the only pure threshold gives no
+gain) — yet because it threads `small_m` as a *template* axis and the host branches on it at **runtime**,
+both variants are compiled on **every** arch, including the two where it can never fire:
+
+| `mmvq.cu.o` | 10-patch | combined | delta |
+|---|---:|---:|---:|
+| object size | 8.5 MiB | 12 MiB | **+41 %** |
+| `mul_mat_vec_q_ksplit` symbols | 828 | 1656 | **+100 %** |
+| all `mul_mat_vec_q*` symbols | 1851 | 2679 | +45 % |
+
+So the scaffold buys dead instantiations on gfx1201/gfx1151.  Whether it belongs in the default apply
+set or should be applied only for the nwarps experiment is a maintainer call — the work is preserved
+either way, because it is a separate patch.
+
+**Docs updated:** `GROUPS.md` (apply order now 13 patches + the completed gfx1100 section and the 0013
+decision point), `README.md` (session 35), and the new `combined-set-verification.md`.
+
 ## 2026-09-21 (WIP, not a delivery change) — gfx1201 port, session 34b: S15, the freeze and hand-off
 
 `S15` of `wip/mmb-general/gfx1201-porting.md`.  **Experimental WIP.**  S14 found nothing to fix, so no

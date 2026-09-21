@@ -410,6 +410,28 @@ HC/F32 paths that now carry the win.  **Next: S13** (HC16 producers) and **S14**
 
 ---
 
+## UPDATE — session 35 (2026-09-21): **gfx1100 merged — one branch now covers all three arches**
+
+`origin/wip-mmb-general-gfx1100` (12 commits) merged into `wip-mmb-general` at `10fc552`.  The merge
+was clean (one auto-resolved `GROUPS.md` hunk).  gfx1100 contributed its plan + 8 dated result files
+and an overlay of **3 patches numbered 0011-0013** — correctly continuing our `0001-0010`, so there is
+no collision.  **The combined set is 13 patches, `git am` 13/13 from r12, tree
+`cd306e6b6093b63468289edac24fbea3d270dbe2`.**
+
+The overlay was reviewed for cross-arch safety and then **verified, not assumed**, on gfx1201: the
+`MMB_CFG` dump is byte-identical (proving 0012's RDNA3_0 arm did not leak into the RDNA4 row), all
+three same-seed hashes are unchanged, the op oracles are green, the width probe still PASSes, and
+pp8192/32768 measures 934.86/856.71 against the frozen 932.8/856.7.  Full record:
+[`combined-set-verification.md`](combined-set-verification.md).
+
+**One cost to decide:** patch `0013` (the experimental per-M `nwarps` scaffold) is default-OFF and
+documented as unshippable (it breaks W=1..8 width purity on MoE models) but **doubles** the
+`mul_mat_vec_q_ksplit` instantiation set on every arch — `mmvq.cu.o` 8.5 -> 12 MiB (+41 %), 828 -> 1656
+ksplit symbols.  Whether that scaffold belongs in the default apply set is a maintainer call; the work
+is preserved either way because it is a separate patch.
+
+---
+
 ## UPDATE — session 34 (2026-09-21): **S14 — the B1-B9 gate matrix, all green, and MTP runs on gfx1201 for the first time**
 
 S14 of `gfx1201-porting.md`.  Record: **`gfx1201-s14-gates.md`**.  **No code changed** — this was the

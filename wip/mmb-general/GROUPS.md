@@ -17,14 +17,25 @@ corresponding subset; the original 38-commit history is still in this repo's git
 
 ## Apply order and base
 
+**The set is now the COMBINED one: 13 patches covering gfx1151 + gfx1201 + gfx1100.**
+
 ```sh
 # base = the r12 delivery tree (release.json: base ebbb18522, tree 8a80535e556bef57666d2eaa4d3eb4cf93fb83f5)
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout ebbb18522
 bash <this-repo>/scripts/apply-all.sh .        # -> branch rdna-boosts, tree 8a80535e... (r12)
 git checkout -b wip-mmb-general
-git am <this-repo>/wip/mmb-general/patches/*.patch   # 6/6, tree 580db5174...
+# 1. the canonical set (gfx1151 + gfx1201)
+git am <this-repo>/wip/mmb-general/patches/*.patch          # 10/10 -> tree 35fc853e63...
+# 2. the gfx1100 (RDNA3_0) overlay
+git am <this-repo>/wip/mmb-general/gfx1100/patches/*.patch  #  3/3 -> tree cd306e6b60...
 ```
+
+Verified 2026-09-21: **`git am` 13/13** from the r12 tree, producing
+**`cd306e6b6093b63468289edac24fbea3d270dbe2`** — confirmed both by applying on top of the 10-patch
+state and **fresh** from `c3ee45747`.  The merge-back of the gfx1100 branch and the cross-arch
+verification that the overlay does not disturb gfx1201 are in
+[`combined-set-verification.md`](combined-set-verification.md).
 
 ## The five groups
 
@@ -232,16 +243,25 @@ qwen4exp dense win with `GGML_CUDA_MMB_DENSE=1`.  The gfx11 (gfx1151/gfx1100) be
 and keeps the full type set — the split only narrows what RDNA4 accepts.  Details:
 `gfx1201-s5s7-mmb-results.md`.
 
-## gfx1100 job (the next box)
+## gfx1100 (the third box) — **DONE 2026-09-21, merged into the combined set**
 
-> **Porting to gfx1100?  Read [`gfx1100-porting.md`](gfx1100-porting.md) first.**  It is the live
-> multi-session overlay for a single RX 7900 XTX (24 GB): the branch/worktree split, the
-> re-examination of the prior gfx1100 decisions (§2), the per-group gfx1100 assessment, the session
-> breakdown and the explicit **trust-RDNA3_5** scoping for the qwen4exp groups that cannot fit a
-> 24 GB card.  The framing below is the summary; the overlay is the source of truth.
+> **The gfx1100 work is complete and merged.**  Its overlay is
+> [`gfx1100/patches/0011-0013`](gfx1100/README.md) and its record is
+> [`gfx1100-porting.md`](gfx1100-porting.md) plus the dated `gfx1100-s*-results.md` files.  The
+> combined 13-patch set applies **13/13** to tree `cd306e6b60…`, and the overlay was verified not to
+> disturb gfx1201 — see [`combined-set-verification.md`](combined-set-verification.md).
+>
+> **Live question for the maintainer:** patch **0013** (the experimental per-M `nwarps` scaffold) is
+> default-OFF and documented as unshippable (it breaks W=1..8 width purity on MoE models), yet it
+> **doubles** the `mul_mat_vec_q_ksplit` instantiation set on all three arches (object 8.5 -> 12 MiB,
+> +41 %; 828 -> 1656 ksplit symbols).  Decide whether it belongs in the default apply set or should be
+> applied only when running the nwarps experiment.
 
-gfx1100 (RDNA3_0, RX 7900 XTX) shares the **gfx11** WMMA builtin with gfx1151, so it needs **none of
-the gfx12 fragment work**.  Its job is the mirror image of gfx1201's:
+The job below is the **record of what gfx1100 was asked to do** — it is kept because the answers are
+now the result files, not because the work is outstanding.
+
+gfx1100 (RDNA3_0, RX 7900 XTX) shares the **gfx11** WMMA builtin with gfx1151, so it needed **none of
+the gfx12 fragment work**.  Its job was the mirror image of gfx1201's:
 
 1. **Apply and build the set** — `patches/*.patch` is **10 patches**, verified `git am` **10/10** onto
    r12 `c3ee45747` producing tree **`35fc853e6396cb0867e7e27c1e8e21093699db47`** (the tree gfx1201
