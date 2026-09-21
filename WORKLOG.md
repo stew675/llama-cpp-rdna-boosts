@@ -1,5 +1,67 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-21 (WIP, not a delivery change) — gfx1201 port, session 34: S14, the B1-B9 gate matrix
+
+`s14` of `wip/mmb-general/gfx1201-porting.md`.  **Experimental WIP**; record in
+`wip/mmb-general/gfx1201-s14-gates.md`.  **No code changed** — this was the campaign's biggest
+coverage gap: B1-B7 had only ever been recorded as a delivery-vs-WIP pair at S1, B8 was partial, and
+**B9 (MTP) had never been run on gfx1201 at all**.  Tree under test `35fc853e6396cb0867e7e27c1e8e21093699db47`
+(10 patches, `git am` 10/10).  **All gates green.**
+
+| gate | result |
+|---|---|
+| S14.3a config record | `MMB_CFG cc=0x1001201 dense_geom=1 ... routed=0` matched the expected string exactly |
+| B1/B2 coherence | **5/5 reference hashes identical** across delivery / WIP-MMB-off / WIP-MMB-on |
+| B3 dense 27B UD-IQ3_S | +0.44/+0.64 % pp8192, +0.61/+0.59 % pp32768 (reproduces S10) |
+| B4 decode | tg128 and tg128@d16384 **flat** (MMB is prefill-only) |
+| B5 MoE 35B UD-Q3_K_M | +0.43..+0.63 % (S12 had it neutral) |
+| B5 qwen4exp Flash-Next | **+21.9/+22.5/+22.7 %** at pp32768/65536/98304 |
+| B6 oracles | `FLASH_ATTN_QSA` 26 cases (incl. 3 `qsa3=1`), `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_EXT` **0 FAIL** |
+| B7 width purity | `PASS (worst maxdiff 0)` with MMB **on and off** |
+| B8 PPL | WIP-MMB-off **bit-identical** to the delivery (9.4293); MMB-on +0.022 % |
+| B9 MTP | **green on all three families** — dense 0.636, MoE 0.724, qwen4exp 0.644/0.701 acceptance; MTP +56..77 % over plain; purity byte-identical |
+| B9 rule 5 | verify-width (`-npl 1,4,8`) within noise of the delivery at every width |
+
+**MTP on gfx1201 for the first time.**  Dense 27B UD-IQ3_S: `draft-mtp` 50.0 t/s vs plain 28.2
+(+77 %), acceptance 0.63624 with pos-1 0.797, and `plain == draft-mtp` byte-identical.  MoE 35B
+UD-Q4_K_M: 146.1 vs 88.1 (+66 %), acceptance 0.72372, pos-1 0.856, purity byte-identical, and
+**ahead of the recorded 2026-09-02 MoE baseline** (125.8 t/s / 0.51) — with the delivery showing the
+same numbers, so that is the delivery's own tuning, not a WIP effect.  qwen4exp (needs the separate
+`-md` head): 80.7 vs 49.3 (+64 %), acceptance 0.70093.  **The dense and MoE MTP results are
+byte-identical to the delivery including acceptance** -- the port's decode-adjacent changes do not
+touch the MTP path at all.
+
+**The whole-WIP qwen4exp win at depth is +22 %, not +6 %.**  Interleaving the *same* WIP binary with
+`GGML_CUDA_MMB` toggled decomposes it: mmb alone is +6.5/+6.2/+6.0 % (which is exactly what S13
+recorded) and the arch-neutral groups + qsa3 are +14.4/+15.3/+16.3 %.  Both figures are real; they
+measure different things.
+
+**Two corrections to the S14 brief, both the same mistake in kind:** the delivery Flash-Next
+reference row (`2728/2591/2465`) was wrong -- those are *qsa3-on, mmb-off* WIP numbers (S4 recorded
+qsa3 pp32768 = 2724), and the real delivery is **2372/2213/2073**, reproducing the S1/S2 record
+(2379/2216/2074) to 0.3 %.  And the brief's "expected landed +6.7/+6.5/+6.2 %" is the **mmb-only**
+delta.  **"ON vs OFF" in S10-S13 always meant MMB-on vs MMB-off within the WIP binary, never WIP vs
+delivery** -- that distinction needs to be explicit in every report.
+
+Two findings worth carrying forward:
+
+* **A draft head cannot be loaded standalone.**  `-md <mtp-head>` with `--spec-type none` aborts: a
+  clean deliberate error on 1 GPU ("this model is an MTP draft head without a trunk; load it as a
+  draft of its target model, not on its own"), but on a `-sm tensor` split an
+  `GGML_ASSERT(!suffix_fallback.empty())` at `llama-model.cpp:470` in the meta-split graph builder,
+  and `-fit off` does not avoid it.  **Pre-existing and identical on the delivery r12** (maintainer
+  confirms upstream too) -- not a WIP regression.  Harness rule: the `plain` arm must not pass `-md`.
+* **Flash-Next IQ4_XS has no built-in `nextn` head** (the 27B and both 35B-A3B models do), so
+  qwen4exp must be given `-md` while the others must not.  Check for `'nextn' in t.name` first.
+
+Also: **`FLASH_ATTN_EXT`'s case count is randomised run-to-run** -- two runs of the *same* binary
+differed by 34 cases (symmetric difference) versus 40 for WIP-vs-delivery, so the OK counts are not
+comparable and only "0 FAIL" is a gate.  The brief's `5951/5951` came from a differently-configured
+build.
+
+**S15 remains**: freeze, regenerate the patch set, verify `git am` N/N on a fresh r12 worktree, update
+the docs and hand gfx1100 the tree.
+
 ## 2026-09-21 (WIP, not a delivery change) — gfx1201 port, session 33: the F32 split was never running
 
 `s13` of `wip/mmb-general/gfx1201-porting.md`.  **Experimental WIP**; record in

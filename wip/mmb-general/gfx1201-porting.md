@@ -5,11 +5,12 @@ supersedes the "gfx1201 is a no-op / new work, not a port" notes in `GROUPS.md` 
 (see §2 — those notes were written before the RDNA4 WMMA layout had an in-repo reference and
 before the delivery's gfx1201 MMQ path was re-tuned).
 
-> **HANDING THIS FILE TO A NEW SESSION?  Read the S14 section of §13 first** — it is self-contained
-(setup, protocol, models, per-gate commands, reference values, traps) and covers the whole of the
-remaining work: the **B1-B9 gate matrix, including MTP, which has never run on gfx1201**.  **S1-S13 are
-done** and are history.  The qwen4exp prefill win has gone +3.1/+3.4 (S7) -> +4.9/+5.2 (S12) ->
-**+6.7/+6.5 (S13)** by removing gates S7 had put in front of paths that actually win on RDNA4.
+> **HANDING THIS FILE TO A NEW SESSION?  Read the S15 section of §13.**  **S1-S14 are done** and are
+> history: the gfx1201 port is complete, every B1-B9 gate passes, and MTP has now been validated on
+> gfx1201 for the first time.  The only work left is **S15** — freeze, regenerate the patch set, verify
+> `git am` N/N, and hand gfx1100 the tree.  The qwen4exp prefill win went +3.1/+3.4 (S7) -> +4.9/+5.2
+> (S12) -> +6.7/+6.5 (S13) on the *mmb* axis, and **+22 % whole-WIP vs the delivery at depth** (S14),
+> by removing gates S7 had put in front of paths that actually win on RDNA4.
 
 **Session 1-2 log (2026-09-21):** the WIP was applied to `~/llama.cpp` as branch `rdna-boosts-mmb-port`
 (`git am` **5/5**, clean) and **built green for gfx1201** with the delivery build script (`EXIT=0`,
@@ -449,13 +450,12 @@ checklist updated.
 | **S11** | arch-scoped tuning constants | **DONE** — `mmb_arch_cfg`/`mmb_arch_defaults(cc)` + a config dump; gfx1151 byte-unchanged, RDNA4 preserved | met |
 | **S12** | routed/GLU tuning + kernel time | **DONE** — the routed path is a loss on every model; per-arch `routed` policy, RDNA4 default **off**; qwen4exp +4.9/+5.2 % | met (better than planned: a policy reversal, not a sweep) |
 | **S13** | G3b/c F32/tiny-M + G4 HC16 | **DONE** — F32 policies separated (the split tile was never running); it scales with depth; HC16 measured inert | met (better: +1.7 % more on qwen4exp) |
-| **S14** | B1-B9 on the final tree | re-run B1-B7; B8 long-context PPL; **B9 MTP** | every gate green with numbers recorded |
-| **S15** | freeze + regenerate + hand off | land any S14 fix, update the docs, `git am` N/N | gfx1100 handed a clean state |
+| **S14** | B1-B9 on the final tree | re-run B1-B7; B8 long-context PPL; **B9 MTP** | ✓ **DONE 2026-09-21 — every gate green, MTP validated on gfx1201** |
+| **S15** | freeze + regenerate + hand off | update the docs, `git am` N/N, gfx1100 hand-off | gfx1100 handed a clean state |
 
-> **S14's brief is now self-contained — see the S14 section below (§13), which carries the setup, the
-> protocol, the models, the per-gate commands, the reference values and the traps.**  **S1-S13 are DONE.**
-> The live work is **S14** (B1-B9, including MTP which has never run on gfx1201) and **S15** (freeze +
-> gfx1100 hand-off).
+> **S1-S14 are DONE.**  The live work is **S15** only (freeze + gfx1100 hand-off) — see §13's S15
+> section.  The S14 brief is kept below as the executed record; its results are in
+> `gfx1201-s14-gates.md` and its two bad reference numbers are corrected in §S14.3c.
 
 **S1+S2 status (2026-09-21): DONE.**  B1/B2 identical to the delivery; B6 oracles 2/2; B7 width purity
 PASS.  Deep sweep done (32k/64k/98k).  G5 and G4 verified as wins, the G3a gate is folded into the
@@ -531,9 +531,11 @@ qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a g
       qwen4exp to **+6.7 / +6.5 %** shallow and **+6.2 % at 64k/98k**.  HC16/BLK16/RES16/DOWN16 are
       **inert** (0.03 % spread where the conversion stream is live) -> stay default 0;
       `gfx1201-s13-f32-hc16.md`
-- [ ] **S14 — the B1-B9 gate matrix on the final tree** (see §13's S14 section; it is self-contained).
-      **B9/MTP has never run on gfx1201** and is the one gate that can still falsify something
-- [ ] S15 — freeze, regenerate, verify `git am` N/N, hand gfx1100 the tree
+- [x] **S14 — the B1-B9 gate matrix on the final tree** — **DONE 2026-09-21**: all green, no code changed.
+      **MTP runs on gfx1201 for the first time** (dense 0.636 / MoE 0.724 / qwen4exp 0.644-0.701
+      acceptance, MTP +56..77 % over plain, purity byte-identical); the whole-WIP qwen4exp win at depth
+      is **+22 %**; `gfx1201-s14-gates.md`
+- [ ] **S15 — freeze, regenerate, verify `git am` N/N, hand gfx1100 the tree** (see §13's S15 section)
 
 **§13 is the brief for the remaining work (S14-S15); its S14 section is written to be executed with no
 prior context.**  Start there.
@@ -595,9 +597,10 @@ gfx1100 (RDNA3_0) solves a **different** half of the same problem:
 ## 13. Remaining gfx1201 work — the next session's brief (S14-S15)
 
 **Read this section, not the session logs above.**  S1-S13 are done; this is everything that is
-still open on gfx1201 — **S14 (the B1-B9 gate matrix) and S15 (freeze + hand-off)**.  The **S14
-section below is written to be executed with no prior context.**  Nothing here blocks gfx1100 (it can
-start on G5/G4 and its own RDNA3_0 work in parallel).
+still open on gfx1201 — **S15 only (freeze + hand-off)**.  **S14 was executed and is green; its
+results are in `gfx1201-s14-gates.md`.**  The S14 section below is kept as the executed record (its
+two bad reference numbers are corrected in §S14.3c).  Nothing here blocks gfx1100 (it can start on
+G5/G4 and its own RDNA3_0 work in parallel).
 
 ### 13.0 Status and the measurement protocol
 
@@ -614,7 +617,7 @@ start on G5/G4 and its own RDNA3_0 work in parallel).
 | S11 | **per-arch tuning defaults** — `mmb_arch_cfg` + `mmb_arch_defaults(cc)`, the dense geometry in the table, `GGML_CUDA_MMB_CFG=1` dump; gfx1151 kernel set byte-unchanged | `gfx1201-s11-arch-defaults.md` |
 | S12 | **the routed MoE path is a loss on RDNA4** — per-arch `routed` policy, **default off**; qwen4exp +4.9/+5.2 % (was +2.3/+1.8), IQ-MoE neutral (was −1.4 %) | `gfx1201-s12-routed-policy.md` |
 | S13 | **the F32 policies separated** — the split tile was wrongly gated behind `mmb_dense_flag()`, so it never ran on RDNA4; it **scales with depth** (−0.3 % @8k → +1.22 % @98k) → qwen4exp **+6.7/+6.5 %**; **HC16 is inert** (0.03 %) | `gfx1201-s13-f32-hc16.md` |
-| S14 | **B1-B9 on the final tree — NOT STARTED.  This is the live work; see the S14 section below.** | — |
+| S14 | **B1-B9 on the final tree — DONE 2026-09-21.  All gates green; MTP works on gfx1201 for the first time (dense 0.636 / MoE 0.724 / qwen4exp 0.644-0.701 acceptance, MTP +56..77 % over plain); the whole-WIP qwen4exp prefill win at depth is **+22 %**, not +6 %** | `gfx1201-s14-gates.md` |
 
 **Protocol — apply to every measurement below.**
 
@@ -810,10 +813,33 @@ on them (routed the F32 router off, kept the tiny-M HC inject on) without isolat
 
 **Exit gate:** each knob A/B'd, purity-checked, and given an arch default in S11's table.
 
-### S14 — the B1-B9 gate matrix on the final tree  *(the live work — the biggest coverage gap)*
+### S14 — the B1-B9 gate matrix on the final tree  — **DONE 2026-09-21**
 
-**This section is written to be executed by a session with no prior context.  Everything it needs is
-here; §1-§12 above are history and are only referenced where a value must be compared against.**
+**Result:** `wip/mmb-general/gfx1201-s14-gates.md`.  Every gate green, **no code changed**.  Highlights:
+B1/B2 five same-seed hashes identical across delivery / WIP-MMB-off / WIP-MMB-on; B6 four oracles green
+(`FLASH_ATTN_QSA` 26 cases incl. the 3 `qsa3=1` arms); B7 width-pure with MMB on **and** off; B8
+WIP-MMB-off **bit-identical** to the delivery at 9.4293 and MMB-on +0.022 %; **B9 MTP green on all three
+model families** (the first time MTP has run on gfx1201), with the dense and MoE results byte-identical
+to the delivery including acceptance, and rule 5's verify-width gate within noise at B=1/4/8.
+The whole-WIP qwen4exp prefill win at depth is **+22 %** (of which mmb is +6.0-6.5 % and the arch-neutral
+groups + qsa3 are +14.4-16.3 %), and the delivery figures reproduce the S1/S2 record to 0.3 %.
+
+**Two errors in the brief below, both from reading S12/S13's *intra-WIP* "ON vs OFF" as
+*WIP vs delivery*:** the delivery Flash-Next reference row (pp32768/65536/98304) is **2372 / 2213 /
+2073**, not 2728 / 2591 / 2465 (those are qsa3-on, mmb-off WIP numbers); and the "expected landed
++6.7/+6.5/+6.2 %" is the **mmb-only** delta, not the delivery-vs-WIP one.  Both are corrected in
+§S14.3c.  Also: `FLASH_ATTN_EXT`'s case count is randomised run-to-run (two runs of the *same* binary
+differed by 34 cases), so only "0 FAIL" is a gate — not the brief's 5951.
+
+**Trap found:`-md <mtp-head>` with `--spec-type none` aborts.**  On 1 GPU it is a deliberate clean
+error ("this model is an MTP draft head without a trunk; load it as a draft of its target model, not on
+its own"); on a `-sm tensor` split it trips `GGML_ASSERT(!suffix_fallback.empty())` at
+`llama-model.cpp:470`, and `-fit off` does not avoid it.  **Pre-existing and identical on the delivery**
+(maintainer confirms upstream too) — not a WIP regression.  The harness rule: the `plain` arm must not
+pass `-md`.  Separately, **Flash-Next has no built-in `nextn` head** (the 27B and both 35B-A3B models
+do), so qwen4exp *must* be given `-md` while the others must not.
+
+The original brief follows (kept as the record of what was executed).
 
 #### S14.0 Where things stand
 
@@ -917,13 +943,31 @@ them first (they are cheap and catch a broken build immediately).
 
 **S14.3c — B3/B4/B5, throughput.**  `llama-bench -n 0 -b 2048 -ub 2048 -r 5` (deep: see the protocol).
 Compare against the delivery (`~/llama-base/build-rocm`) **interleaved**, and against the campaign's
-numbers in §2 of `gfx1201-s1s2-results.md` and in `GROUPS.md`.  A few known reference points on the
-delivery (3-GPU tensor, q8_0 KV, `-b/-ub 2048`): Flash-Next pp32768 ≈ 2728, pp65536 ≈ 2591,
-pp98304 ≈ 2465; 27B Q8_0 pp8192 ≈ 2302, tg128 ≈ 36.7; 27B UD-IQ3_S pp8192 ≈ 926 / pp32768 ≈ 851.
+numbers in §2 of `gfx1201-s1s2-results.md` and in `GROUPS.md`.
 
-The expected **landed** results (S12/S13, interleaved): qwen4exp **+6.7 / +6.5 %** at pp8192/32768 and
-**+6.2 %** at pp65536/98304; 27B UD-IQ3_S **+0.5 %**; 35B UD-Q3_K_M **neutral**; 27B Q8_0 **neutral**.
-A large deviation means something moved.
+**Measured delivery reference points** (3-GPU tensor, q8_0 KV, `-b/-ub 2048`) — use these, they are
+verified: **Flash-Next pp32768 = 2372, pp65536 = 2213, pp98304 = 2073** (reproducing the S1/S2 record
+of 2379 / 2216 / 2074 to 0.3 %); 27B Q8_0 pp8192 ≈ 2302, tg128 ≈ 36.7; 27B UD-IQ3_S pp8192 ≈ 929 /
+pp32768 ≈ 852; 35B UD-Q3_K_M pp8192 ≈ 5903 / pp32768 ≈ 4830.
+
+> **The `2728 / 2591 / 2465` figures that used to be here were wrong** — they are *qsa3-on, mmb-off
+> WIP* numbers (S4 recorded qsa3 pp32768 as 2724), not the delivery.  If a Flash-Next delivery number
+> looks like ~2700 at pp32768, the binary is not the delivery.
+
+**Expected deltas**, all interleaved delivery-vs-WIP(MMB=1), measured:
+
+| model | harness | measured |
+|---|---|---|
+| qwen4exp Flash-Next | **whole WIP** at pp32768/65536/98304 | **+21.9 / +22.5 / +22.7 %** |
+| qwen4exp Flash-Next | **mmb only** (same binary, `GGML_CUDA_MMB` toggled) | **+6.5 / +6.2 / +6.0 %** |
+| 27B UD-IQ3_S | pp8192 / pp32768 | +0.5 / +0.6 % |
+| 27B UD-IQ3_S | tg128, tg128@d16384 | flat |
+| 35B UD-Q3_K_M | pp8192 / pp32768 | +0.5 / +0.6 % |
+| 27B Q8_0 | pp8192 / tg128 | +0.3 % / flat |
+
+So the S13-recorded "+6.7/+6.5 % shallow and +6.2 % at 64k/98k" is the **mmb-only** delta, and the
+whole-WIP headline is an order of magnitude bigger.  Keep the two comparisons distinct in every report:
+**"ON vs OFF" in S10-S13 always meant MMB-on vs MMB-off within the WIP binary, never WIP vs delivery.**
 
 **B4 decode, do not skip it:** `-p 0 -n 128`, plus a **depth-16384** run (benchy protocol) — decode
 perf work must be validated at depth, and `tg` is *not* a correctness signal.
@@ -991,9 +1035,19 @@ the default depth 3.  Then the four-axis gate (prose/code/recall/reasoning) at `
   override).  The delivery's reference cells: **27B 0.76744**, **qwen4exp 0.44262** (the block-14
   baseline).  Numbers and the rejected variants: `benchmarks/2026-09-15-adaptive-mtp-tuning.md` and
   `archive/work/adaptive-mtp-ceiling-scaling/`.
-* Draft head: `mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf`, used with Flash-Next.  `--spec-type draft-mtp`
-  (and `draft-mtp-adaptive`); the default `--spec-draft-n-max` is 3, capped at 15 (`> 7` prints the
-  purity notice — the pure range is `n_max <= 7`).
+* Draft head: the models split two ways and this must be checked before wiring a gate —
+  **Qwen3.8-27B (Q8_0 and UD-IQ3_S) and both Qwen3.6-35B-A3B models carry a built-in `nextn` head**
+  (`qwen35.nextn_predict_layers` / `qwen35moe.nextn_predict_layers`, 4 tensors), used automatically:
+  **do not pass `-md`.**  **Qwen3.8-Flash-Next IQ4_XS has none** (`nextn tensors=0`), so qwen4exp
+  **must** be given `-md mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf` — that is the "separate-MTP-head" path
+  the r12 block-06 amendment covered.  Verify with `GGUFReader` for `'nextn' in t.name`.
+* **Trap: `-md <head>` with `--spec-type none` aborts.**  1 GPU gives a deliberate clean error ("this
+  model is an MTP draft head without a trunk; load it as a draft of its target model, not on its
+  own"); a `-sm tensor` split trips `GGML_ASSERT(!suffix_fallback.empty())` at `llama-model.cpp:470`
+  in the meta-split graph builder, and `-fit off` does **not** avoid it.  Pre-existing and identical on
+  the delivery (upstream too) — so **the `plain` arm must not pass `-md`.**
+* `--spec-type draft-mtp` (and `draft-mtp-adaptive`); the default `--spec-draft-n-max` is 3, capped at
+  15 (`> 7` prints the purity notice — the pure range is `n_max <= 7`).
 * **What to look for on RDNA4 specifically:** the controller's constants are gfx1151-tuned, and the
   block-13 mmvq band-uniformity rules (`nwarps=1` on RDNA4 dense, per-`(type,K)` weight kernel, the
   pinned fusion ops keeping plain `calc_nwarps`) are exactly what the MTP purity contract depends on.
