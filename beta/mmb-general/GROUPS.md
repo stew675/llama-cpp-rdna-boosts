@@ -17,25 +17,24 @@ corresponding subset; the original 38-commit history is still in this repo's git
 
 ## Apply order and base
 
-**The set is now the COMBINED one: 13 patches covering gfx1151 + gfx1201 + gfx1100.**
+**This is the BETA set: 12 patches covering gfx1151 + gfx1201 + gfx1100.**  Promoted from
+`wip/mmb-general` on 2026-09-21; the gfx1100 overlay patches are folded in as `0011`/`0012`, and the
+rejected per-M `nwarps` experiment now lives in [`../../wip/nwarps/`](../../wip/nwarps/).
 
 ```sh
 # base = the r12 delivery tree (release.json: base ebbb18522, tree 8a80535e556bef57666d2eaa4d3eb4cf93fb83f5)
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout ebbb18522
 bash <this-repo>/scripts/apply-all.sh .        # -> branch rdna-boosts, tree 8a80535e... (r12)
-git checkout -b wip-mmb-general
-# 1. the canonical set (gfx1151 + gfx1201)
-git am <this-repo>/wip/mmb-general/patches/*.patch          # 10/10 -> tree 35fc853e63...
-# 2. the gfx1100 (RDNA3_0) overlay
-git am <this-repo>/wip/mmb-general/gfx1100/patches/*.patch  #  3/3 -> tree cd306e6b60...
+git checkout -b mmb-beta
+git am <this-repo>/beta/mmb-general/patches/*.patch   # 12/12, tree bca69f23dd...
 ```
 
-Verified 2026-09-21: **`git am` 13/13** from the r12 tree, producing
-**`cd306e6b6093b63468289edac24fbea3d270dbe2`** — confirmed both by applying on top of the 10-patch
-state and **fresh** from `c3ee45747`.  The merge-back of the gfx1100 branch and the cross-arch
+Verified 2026-09-21: **`git am` 12/12** from the r12 tree, producing
+**`bca69f23dd29acef2d8898c6fd492104e078eef1`**.  The merge-back of the gfx1100 work and the cross-arch
 verification that the overlay does not disturb gfx1201 are in
-[`combined-set-verification.md`](combined-set-verification.md).
+[`combined-set-verification.md`](combined-set-verification.md); the gfx1151 re-validation checklist is
+[`BETA-TESTING.md`](BETA-TESTING.md).
 
 ## The five groups
 
@@ -251,11 +250,11 @@ and keeps the full type set — the split only narrows what RDNA4 accepts.  Deta
 > combined 13-patch set applies **13/13** to tree `cd306e6b60…`, and the overlay was verified not to
 > disturb gfx1201 — see [`combined-set-verification.md`](combined-set-verification.md).
 >
-> **Live question for the maintainer:** patch **0013** (the experimental per-M `nwarps` scaffold) is
-> default-OFF and documented as unshippable (it breaks W=1..8 width purity on MoE models), yet it
-> **doubles** the `mul_mat_vec_q_ksplit` instantiation set on all three arches (object 8.5 -> 12 MiB,
-> +41 %; 828 -> 1656 ksplit symbols).  Decide whether it belongs in the default apply set or should be
-> applied only when running the nwarps experiment.
+> **Live question for the maintainer — RESOLVED 2026-09-21:** patch **0013** (the experimental per-M
+> `nwarps` scaffold) was **moved out of the set** to [`../../wip/nwarps/`](../../wip/nwarps/).  It was
+> default-OFF and documented as unshippable (it breaks `W=1..8` width purity on MoE models), yet it
+> **doubled** the `mul_mat_vec_q_ksplit` instantiation set on all three arches (object 8.5 -> 12 MiB,
+> +41 %; 828 -> 1656 ksplit symbols).  The impurity is now the tracked open work in that directory.
 
 The job below is the **record of what gfx1100 was asked to do** — it is kept because the answers are
 now the result files, not because the work is outstanding.

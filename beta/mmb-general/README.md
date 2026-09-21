@@ -1,12 +1,36 @@
-# WIP: generalising `mmb` (bf16-WMMA dequant weight GEMM) beyond IQ4_NL
+# `beta/mmb-general` — the `mmb` (bf16-WMMA dequant weight GEMM) campaign, in beta
 
-**Status: ACTIVE (opened 2026-09-19).  Not part of the delivery.**  Code lives in the
-`~/llama-wip-mmb` worktree (branch `wip-mmb-general`, based on the `~/llama.cpp`
-delivery tree at `8a2567e1e`); nothing here is in `patches/`.
+**Status: BETA (promoted from `wip/mmb-general` on 2026-09-21).  Not part of the delivery.**  This is
+the beta patch set: **12 patches**, verified `git am` **12/12** from the r12 fork point, applied tree
+**`bca69f23dd29acef2d8898c6fd492104e078eef1`**.  It is staged for the ~4–5 day beta window, after
+which the maintainer decides whether it becomes a delivery block (the `AGENTS.md` promotion rule).
 
-> **New session?  Read [`HANDOVER.md`](HANDOVER.md) first** — its "FOR THE NEXT SESSION" brief at the
-top is the self-contained handoff (environment, build/run, gates, the prioritized remaining work).
-> This file is the running (dated) record.
+> **Tester: start with [`BETA-TESTING.md`](BETA-TESTING.md)** — the gfx1151 final re-validation
+> checklist (apply, build, the four gates, the reference numbers and the kill-switches).  The campaign
+> was developed on gfx1151, ported to gfx1201 and gfx1100, and the **combination has never been re-run
+> on gfx1151** — that is what the beta window is for.
+
+> **New session working the promotion: read [`HANDOVER.md`](HANDOVER.md)** — its "FOR THE NEXT
+> SESSION" brief is the self-contained handoff.  This file is the running (dated) record.
+
+**What is in the beta set.**  Patches `0001`–`0010` are the gfx1151-developed, gfx1201-portable core
+(the `mmb` GEMM, `qsa3`, the F32/tiny-M kernels, HC16, the indexer top-k, and the RDNA4 port + its
+per-arch policy table).  Patches `0011`–`0012` are the gfx1100 (RDNA3_0) deltas: enable `qsa3` on
+RDNA3_0, and default the F32 split tile off there.  A third gfx1100 patch — the experimental per-M
+`nwarps` rule — was **moved out** to [`../../wip/nwarps/`](../../wip/nwarps/) because it is
+default-OFF and breaks the `W=1..8` width-purity contract; that is the open impurity to investigate.
+
+**Per-arch state at promotion:** gfx1151 = the development target (needs the beta re-validation);
+gfx1201 = fully validated (B1–B9 green, MTP included — [`gfx1201-s14-gates.md`](gfx1201-s14-gates.md));
+gfx1100 = validated to pp32768 on a single 24 GB card, qwen4exp items trust-RDNA3_5
+([`gfx1100-porting.md`](gfx1100-porting.md)).
+
+---
+
+## Campaign record (as written while in `wip/`)
+
+The sections below are the original `wip/mmb-general` running record, kept verbatim; the
+`wip/mmb-general/...` paths they cite are now `beta/mmb-general/...`.
 
 ## Why
 

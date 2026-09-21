@@ -476,8 +476,8 @@ explicitly requests it.**
 | `rdna-boosts-all.patch` | the entire 16-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `prompts/` | versioned, hash-stable test prompts for the decode/MTP/coherence gates; each prompt's size + token count + **sha256** is recorded in `prompts/README.md`, and a shipped prompt is **never edited in place** (add a new file).  A reported throughput/acceptance/purity result is only valid against the prompt hash it names |
-| `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live work (currently `wip/iq4nl-prefill/` and `wip/mmb-general/`, on branch `wip-mmb-general`); completed trees are archived under `archive/work/` (see the WIP rule below) |
-| `beta/` | **promoted-from-WIP staging** - currently **empty**: every campaign staged here has been promoted and archived (`archive/work/block-15-campaign-wins/` = block 15, `archive/work/tensor-fit-fix/` = the r12 `--fit` for `-sm tensor` amendment, and the qwen4exp support = block 14).  Each record is the promotion/gate record and `BETA-TESTING.md` the tester checklist - see the WIP rule below |
+| `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live/unpromoted work (currently `wip/nwarps/` — the per-M `nwarps` impurity — plus `wip/bf16-native-prefill/`, `wip/q8-prefill-tuning/`, `wip/build-time-regression/` and the other live trees); completed trees are archived under `archive/work/` (see the WIP rule below) |
+| `beta/` | **promoted-from-WIP staging** — currently holds **`beta/mmb-general/`** (the `mmb`/`qsa3`/indexer campaign, promoted 2026-09-21: 12 patches, gfx1151 + gfx1201 + gfx1100, awaiting the gfx1151 re-validation in its `BETA-TESTING.md`).  Previously staged campaigns have been promoted and archived (`archive/work/block-15-campaign-wins/` = block 15, `archive/work/tensor-fit-fix/` = the r12 `--fit` for `-sm tensor` amendment, and the qwen4exp support = block 14).  Each record is the promotion/gate record and `BETA-TESTING.md` the tester checklist - see the WIP rule below |
 | `upstream/` | **upstream-PR candidates** — self-contained changes that could be filed against unadulterated `ggml-org/llama.cpp` master, each with a `UPSTREAM-PR-*.md` note + `.patch` (see its README for the double-apply caution and the status table) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
 | `archive/work/` | closed experiments, preserved for future re-evaluation (includes the completed `wip/` trees archived 2026-09-12) |
@@ -802,14 +802,15 @@ Consequences, so it is not re-litigated:
   re-evaluation only.  (2026-09-12: the completed `wip/` trees were moved to
   `archive/work/`; `wip/` now holds only the active `iq4nl-prefill/` and `mmb-general/` handoffs.)
 - **Promotion rule (the sanctioned way out of `wip/`):** a campaign's
-- **WIP branch (2026-09-20):** the active WIP lives on dedicated branches and is committed **there,
-  never to `main`** — the delivery-repo record on **`wip-mmb-general`** (cut from `main` at `1c2ec00`,
-  rebased onto **r12 `4e37fa6`** on 2026-09-20)
-  and the code in the `~/llama-wip-mmb` worktree on **`wip-mmb-general`**.  `main` is **frozen** for
-  that work until the maintainer calls the rebase; `git rebase --onto <new-main> 1c2ec00
-  wip-mmb-general` replays only the branch's own commits (done once, onto r12 — the code branch was
-  rebased the same way, from the old applied tree `8a2567e1e` onto the r12 applied tree).  New sessions: check
-  `git branch --show-current`, read `wip/mmb-general/HANDOVER.md`, and commit to the branch.
+- **WIP branch (updated 2026-09-21 — the campaign was promoted to beta):** the `mmb-general` campaign
+  is now **`beta/mmb-general/` on `main`** (12 patches, tree `bca69f23dd…`), staged for its beta
+  window; the gfx1151 re-validation checklist is `beta/mmb-general/BETA-TESTING.md` and a session
+  picking it up should read `beta/mmb-general/HANDOVER.md`.  The branch name `wip-mmb-general` (and
+  the code worktree branch of the same name) is kept as the campaign's working branch.  The
+  **`wip/nwarps/`** tree is the one piece deliberately left behind (default-OFF, breaks `W=1..8`
+  width purity — the open impurity to investigate).  Everything unpromoted stays on a branch and is
+  committed **there, never to `main`**; `main` is only advanced when the maintainer calls a
+  promotion or a rebase.
 - **Promotion rule (the sanctioned way out of `wip/`):** a campaign's
   *validated* wins are collected under `beta/` (for the memory campaign:
   `archive/work/block-15-campaign-wins/`), each win gets an environment kill-switch so

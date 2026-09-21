@@ -1,5 +1,57 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-21 (WIP, not a delivery change) — `wip/mmb-general` promoted to `beta/mmb-general`
+
+**No delivery change.**  The `mmb-general` campaign left `wip/` and entered its beta window: the
+directory moved to **`beta/mmb-general/`** on `main`, and the one patch that could not ship was
+extracted to a new **`wip/nwarps/`** tree.
+
+**The beta set is 12 patches**, `git am` **12/12** from the r12 fork point, applied tree
+**`bca69f23dd29acef2d8898c6fd492104e078eef1`**:
+
+* `0001`-`0010` — the gfx1151-developed, gfx1201-portable core (the `mmb` bf16-WMMA dequant weight
+  GEMM, `qsa3`, the F32/tiny-M kernels, HC16, the indexer top-k, and the RDNA4 fragment port with its
+  per-arch policy table).  These were the 10 canonical patches.
+* `0011`-`0012` — the gfx1100 (RDNA3_0) deltas, **folded in** at promotion: enable `qsa3` on RDNA3_0
+  (0021's predicate widening) and default the F32 split tile off there.  The overlay directory
+  `beta/mmb-general/gfx1100/` is kept for provenance and now says so.
+
+**`wip/nwarps/` is the extraction.**  The gfx1100 per-M `nwarps` patch was the third overlay patch; it
+was **removed from the set** and is now `wip/nwarps/patches/per-M-nwarps-rdna3-0.patch` with a
+self-contained README.  Two reasons:
+
+1. It **breaks the `W = 1..8` width-purity contract** on MoE models — the 35B fails at threshold 2048
+   (maxdiff 0.150), gemma-26B at 4096 (**maxdiff 3.35, a correctness red flag, not rounding**), and
+   the 27B at 6144+.  The largest *pure* threshold (1024) gives no measurable gain, while the impure
+   ones give +2.1 % (35B draft-mtp / gemma-26B decode) and a blanket `nwarps=1` gives +9 %.  Root
+   cause: the width-invariant reduction mapping was derived for the delivery's per-type `nwarps`, so
+   changing `nwarps` for those shapes invalidates it.  **That is the open impurity to investigate** —
+   essentially redoing the issue-#30 band-uniformity derivation for `nwarps=1`.
+2. It **doubled the `mul_mat_vec_q_ksplit` instantiation set on every architecture** — `mmvq.cu.o`
+   8.5 -> 12 MiB (+41 %), 828 -> 1656 ksplit symbols (+100 %), all `mul_mat_vec_q*` 1851 -> 2679 —
+   because `small_m` is a *template* axis while the host branches on it at *runtime*, so both variants
+   compile even on the two arches where the feature can never fire.
+
+**The gfx1151 re-validation is the next step.**  The campaign was developed and tuned on gfx1151, then
+ported to gfx1201 and gfx1100; the **combination has never been re-run on gfx1151** — the individual
+"gfx1151 unchanged" claims were made one step at a time (mostly by comparing device assembly), never
+once end-to-end on the final set.  `beta/mmb-general/BETA-TESTING.md` is the checklist: (1) MMB **off**
+must be byte-identical to r12, with `test-logits-width-probe` PASS; (2) `GGML_CUDA_MMB=1` must still
+recover the original **+32…+48 %** gfx1151 prefill win (the risk the per-arch table introduced);
+(3) the four op oracles, with the `FLASH_ATTN_EXT` counting trap called out; (4) MTP at `-n 3000` with
+acceptance > 0.45 and MTP ≥ plain.
+
+**Also recorded** (from the merge work this session): the gfx1100 branch merged clean, the combined set
+was verified on gfx1201 as unchanged (byte-identical `MMB_CFG`, all three same-seed hashes, oracles,
+width purity, pp8192/32768 934.86/856.71 vs the frozen 932.8/856.7), and the `FLASH_ATTN_EXT` "random
+matrix" claim from the S14 record was corrected — it is **5954 OK / 0 FAIL and fully deterministic**,
+and the apparent movement was a `2>&1` stream-interleaving parse trap.
+
+**Docs:** `AGENTS.md` (the `wip/`+`beta/` layout rows and the WIP-branch bullet, since `beta/` is no
+longer empty), `beta/mmb-general/README.md` (beta header + what is in the set), the new
+`BETA-TESTING.md`, `wip/nwarps/README.md`, `combined-set-verification.md` (postscript), `GROUPS.md`
+(apply order = 12 patches; the 0013 decision resolved), and the `gfx1100/README.md` fold note.
+
 ## 2026-09-21 (WIP, not a delivery change) — gfx1100 merged: the combined 3-arch set
 
 **Experimental WIP.**  `origin/wip-mmb-general-gfx1100` (12 commits, branched from `c79d48f`) was
