@@ -20,6 +20,11 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/mmb-general/gfx1100/patches/*.pat
 
 `0007` and `0008` apply clean, in order, on top of the 6-patch tree:
 
+```sh
+git am /home/stew675/llama-cpp-rdna-boosts/wip/mmb-general/gfx1100/patches/*.patch   # 2/2
+git rev-parse HEAD^{tree}   # -> 064a2ad65ebb970e7302d74ea5a285e6a2dd5352 (verified 2026-09-21)
+```
+
 * `0007` (`fattn-qsa3.cu`): `ggml_cuda_flash_attn_qsa3_supported()` gains `RDNA3_0`, so the
   packed-block WMMA QSA path runs on gfx1100 (gfx11 fragment arm, identical to gfx1151).
 * `0008` (`mmb.cu`): `mmb_f32split_mode()` defaults the F32 split off on RDNA3_0/RDNA4 (gfx1151
