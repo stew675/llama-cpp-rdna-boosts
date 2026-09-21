@@ -615,6 +615,13 @@ in parallel).
 * `llama-bench … -n 0 -r 5`; **the first prefill test of an invocation is cold-start-limited** (up to
   −9 % — this fooled S7 twice).  Decide only on `r=5` and on **interleaved back-to-back rounds**
   (run A, run B, run A, run B in one warm session).  Never run two benches at once.
+* **On the 3-GPU qwen4exp bench the variance is a clock ramp, not heat (S13):** temps stay at
+  43 °C edge / 70–83 °C junction, and repeating one config gives *rising* throughput.  The MMB path
+  varied **6.7 %** at pp8192 across a session against the delivery's 2.4 %, because MMB is the more
+  compute-dense configuration and so is the more `sclk`-sensitive one.  Agreement by depth: pp8192
+  ±3 %, pp32768 ±1.6 %, pp65536 ±0.1 %, pp98304 ±0.4 %.  **So a sustained (deep) run is the stable
+  instrument and the shallow numbers are the noisy ones** — which is also where a long-context
+  workload's time goes.  Prefer pp32768+ for a verdict; treat a shallow-only delta as ±2 %.
 * Warm the page cache first (`cat <model> >/dev/null`) for the multi-shard models.
 * For a *decision*, prefer `pp32768` over `pp8192`; `pp8192` is only trustworthy inside an
   interleaved pair.
