@@ -1,4 +1,4 @@
-From 542e8abb0602c7f06c18c550ece209b8b28f4459 Mon Sep 17 00:00:00 2001
+From 28f8d2398d0955e58f62aabf20d045a6d6027a2e Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 19 Sep 2026 17:09:59 -0500
 Subject: [PATCH 01/38] WIP mmb: generalize to dense Q4_K/Q5_1, RDNA3 arch
@@ -20,7 +20,7 @@ Subject: [PATCH 01/38] WIP mmb: generalize to dense Q4_K/Q5_1, RDNA3 arch
  create mode 100644 ggml/src/ggml-cuda/mmb.cuh
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index edccfba13..230d9fb68 100644
+index 071911a0c..ec05c628b 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -33,6 +33,7 @@
@@ -66,7 +66,7 @@ index edccfba13..230d9fb68 100644
          if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
              ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
              return;
-@@ -4004,7 +4019,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4053,7 +4068,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // rows (grid 262144x3); the pair runs it once and both muls read the same q8_1 buffer.
      static const bool pair_off        = getenv("GGML_PAIR_OFF") != nullptr;
      static const bool disable_pair_dense = getenv("GGML_PAIR_DENSE_OFF") != nullptr;
@@ -81,7 +81,7 @@ index edccfba13..230d9fb68 100644
          ggml_tensor * next = cgraph->nodes[i + 1];
          const ggml_tensor * src0 = node->src[0];
          const ggml_tensor * src0_next = next->src[0];
-@@ -4115,7 +4136,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4164,7 +4185,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // swiglu -> mul_mat_q: fold silu(gate)*up into the mmq activation quantize (the qwen4exp
      // MoE down feed; the GLU output is never materialized). mmq only engages at prefill, so
      // the decode MoE tails keep their own fusions.
@@ -95,7 +95,7 @@ index edccfba13..230d9fb68 100644
          ggml_tensor * next = cgraph->nodes[i + 1];
          const bool has_ids = next->op == GGML_OP_MUL_MAT_ID;
          if (has_ids || next->op == GGML_OP_MUL_MAT) {
-@@ -4704,6 +4730,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4753,6 +4779,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              const ggml_tensor * src1 = up->src[1];
              const ggml_tensor * ids  = up->src[2];
  
@@ -110,7 +110,7 @@ index edccfba13..230d9fb68 100644
              if (ggml_cuda_should_fuse_mul_mat_vec_f(up) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate->src[0];
-@@ -6054,6 +6088,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6103,6 +6137,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      // The Q8_1 input cache is only valid within one graph execution.
      cuda_ctx->q8_1_cache_clear();

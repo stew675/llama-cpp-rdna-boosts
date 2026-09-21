@@ -803,10 +803,12 @@ Consequences, so it is not re-litigated:
   `archive/work/`; `wip/` now holds only the active `iq4nl-prefill/` and `mmb-general/` handoffs.)
 - **Promotion rule (the sanctioned way out of `wip/`):** a campaign's
 - **WIP branch (2026-09-20):** the active WIP lives on dedicated branches and is committed **there,
-  never to `main`** — the delivery-repo record on **`wip-mmb-general`** (cut from `main` at `1c2ec00`)
+  never to `main`** — the delivery-repo record on **`wip-mmb-general`** (cut from `main` at `1c2ec00`,
+  rebased onto **r12 `4e37fa6`** on 2026-09-20)
   and the code in the `~/llama-wip-mmb` worktree on **`wip-mmb-general`**.  `main` is **frozen** for
   that work until the maintainer calls the rebase; `git rebase --onto <new-main> 1c2ec00
-  wip-mmb-general` replays only the branch's own commits.  New sessions: check
+  wip-mmb-general` replays only the branch's own commits (done once, onto r12 — the code branch was
+  rebased the same way, from the old applied tree `8a2567e1e` onto the r12 applied tree).  New sessions: check
   `git branch --show-current`, read `wip/mmb-general/HANDOVER.md`, and commit to the branch.
 - **Promotion rule (the sanctioned way out of `wip/`):** a campaign's
   *validated* wins are collected under `beta/` (for the memory campaign:

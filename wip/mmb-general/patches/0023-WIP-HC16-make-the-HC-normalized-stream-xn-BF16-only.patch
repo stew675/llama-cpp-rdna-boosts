@@ -1,4 +1,4 @@
-From dea321f4ab40a17dfb8a007af31748749868c5c9 Mon Sep 17 00:00:00 2001
+From 962fa8199f0281417873bca28ae3678fe8351479 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sun, 20 Sep 2026 12:09:48 -0500
 Subject: [PATCH 23/38] WIP HC16: make the HC normalized stream xn BF16-only
@@ -96,10 +96,10 @@ index d9658e78a..dc0f872f7 100644
              nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
              nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index c087d8415..aab997949 100644
+index 80402bd4a..58b7c0adb 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -6263,10 +6263,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6314,10 +6314,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                      for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (rootof(t->src[s]) == root) { uses = true; break; }
                      if (!uses) continue;
                      if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) continue;

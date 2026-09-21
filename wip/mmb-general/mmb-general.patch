@@ -937,7 +937,7 @@ index 000000000..d5764a798
 +    CUDA_CHECK(cudaGetLastError());
 +}
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index edccfba13..aab997949 100644
+index 071911a0c..58b7c0adb 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -33,6 +33,7 @@
@@ -983,7 +983,7 @@ index edccfba13..aab997949 100644
          if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
              ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
              return;
-@@ -4004,7 +4019,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4053,7 +4068,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // rows (grid 262144x3); the pair runs it once and both muls read the same q8_1 buffer.
      static const bool pair_off        = getenv("GGML_PAIR_OFF") != nullptr;
      static const bool disable_pair_dense = getenv("GGML_PAIR_DENSE_OFF") != nullptr;
@@ -998,7 +998,7 @@ index edccfba13..aab997949 100644
          ggml_tensor * next = cgraph->nodes[i + 1];
          const ggml_tensor * src0 = node->src[0];
          const ggml_tensor * src0_next = next->src[0];
-@@ -4115,7 +4136,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4164,7 +4185,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // swiglu -> mul_mat_q: fold silu(gate)*up into the mmq activation quantize (the qwen4exp
      // MoE down feed; the GLU output is never materialized). mmq only engages at prefill, so
      // the decode MoE tails keep their own fusions.
@@ -1012,7 +1012,7 @@ index edccfba13..aab997949 100644
          ggml_tensor * next = cgraph->nodes[i + 1];
          const bool has_ids = next->op == GGML_OP_MUL_MAT_ID;
          if (has_ids || next->op == GGML_OP_MUL_MAT) {
-@@ -4704,6 +4730,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4753,6 +4779,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              const ggml_tensor * src1 = up->src[1];
              const ggml_tensor * ids  = up->src[2];
  
@@ -1027,7 +1027,7 @@ index edccfba13..aab997949 100644
              if (ggml_cuda_should_fuse_mul_mat_vec_f(up) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate->src[0];
-@@ -6047,6 +6081,9 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+@@ -6096,6 +6130,9 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
  }
  #endif // USE_CUDA_GRAPH
  
@@ -1037,7 +1037,7 @@ index edccfba13..aab997949 100644
  static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
-@@ -6054,6 +6091,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6103,6 +6140,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      // The Q8_1 input cache is only valid within one graph execution.
      cuda_ctx->q8_1_cache_clear();
@@ -1045,7 +1045,7 @@ index edccfba13..aab997949 100644
  
      bool use_cuda_graph             = false;
      bool cuda_graph_update_required = false;
-@@ -6119,6 +6157,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6170,6 +6208,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
  
@@ -1055,7 +1055,7 @@ index edccfba13..aab997949 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -6150,6 +6191,109 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+@@ -6201,6 +6242,109 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
  static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  

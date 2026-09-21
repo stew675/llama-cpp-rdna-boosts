@@ -1,4 +1,4 @@
-From af2f7058005c06f5ff32711f72b78d5e09f49b3a Mon Sep 17 00:00:00 2001
+From 9274dcd66803a104b5c4ff42c2a071867dbdd4d5 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sun, 20 Sep 2026 11:48:15 -0500
 Subject: [PATCH 22/38] WIP HC16: skip the dead F32 store when every consumer
@@ -73,10 +73,10 @@ index db96b789e..d9658e78a 100644
  
  void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 110a41027..c087d8415 100644
+index a6b998d70..80402bd4a 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -6254,13 +6254,33 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6305,13 +6305,33 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          static const int hc16 = getenv("GGML_CUDA_MMB_HC16") ? atoi(getenv("GGML_CUDA_MMB_HC16")) : 0;
          if (hc16 >= 1 && ggml_cuda_mmb_active() &&
                  GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {

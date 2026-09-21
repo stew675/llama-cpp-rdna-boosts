@@ -1,4 +1,4 @@
-From ccf28bc655105e8da95d99c0b9d80db68ee94399 Mon Sep 17 00:00:00 2001
+From bf492761c024e10c5dd4e654f8966cef4d4cee35 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sun, 20 Sep 2026 10:45:56 -0500
 Subject: [PATCH 19/38] WIP HC16: native-BF16 producers for the HC gate and
@@ -103,10 +103,10 @@ index ca1d2dc8a..2ca168c07 100644
              nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
              nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 230d9fb68..e67e99c3f 100644
+index ec05c628b..6f026fb09 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -6081,6 +6081,9 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+@@ -6130,6 +6130,9 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
  }
  #endif // USE_CUDA_GRAPH
  
@@ -116,7 +116,7 @@ index 230d9fb68..e67e99c3f 100644
  static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
-@@ -6154,6 +6157,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6205,6 +6208,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
  
@@ -126,7 +126,7 @@ index 230d9fb68..e67e99c3f 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -6185,6 +6191,59 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+@@ -6236,6 +6242,59 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
  static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  

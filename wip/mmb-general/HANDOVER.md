@@ -17,8 +17,14 @@ The WIP lives on **two dedicated branches**.  **New work goes to those branches,
 | **code** | fork worktree `~/llama-wip-mmb` (a worktree of `~/llama.cpp`) | **`wip-mmb-general`** | `8a2567e1e` (the applied delivery tree) |
 | **record + backup** | this repo (`llama-cpp-rdna-boosts`) | **`wip-mmb-general`** | cut from `main` at `1c2ec00` |
 
-* The delivery-repo branch `wip-mmb-general` was cut from `main` at **`1c2ec00`** (2026-09-20) and is
-  pushed to `origin/wip-mmb-general` (tracking).  **`main` is frozen for this work** — it keeps all
+* The delivery-repo branch `wip-mmb-general` was cut from `main` at **`1c2ec00`**, **rebased onto
+  `main` r12 (`4e37fa6`) on 2026-09-20**, and is pushed to `origin/wip-mmb-general` (tracking).  The
+  code branch `wip-mmb-general` in `~/llama-wip-mmb` was rebased in the same pass: from the old
+  applied delivery tree `8a2567e1e` onto the **r12 applied tree
+  `8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`** (`git rebase --onto <r12> 8a2567e1e wip-mmb-general`,
+  38/38 clean, no conflicts).  The r12 delivery tree was rebuilt with
+  `RDNA_BRANCH=r12-verify scripts/apply-all.sh` on a fresh `ebbb18522` worktree (tree verified ==
+  `release.json`).  **All gates re-verified green on the rebased tree.**  **`main` is frozen for this work** — it keeps all
   the pre-existing WIP history exactly as it was, and is not committed to again until the maintainer
   calls the rebase.
 * **Every new session:** `git -C ~/llama-cpp-rdna-boosts switch wip-mmb-general` (check
@@ -26,10 +32,13 @@ The WIP lives on **two dedicated branches**.  **New work goes to those branches,
   the WIP record to `main`.
 * The fork worktree stays on `wip-mmb-general`; regenerate the backup (`mmb-general.patch` +
   `patches/` + `commits.txt`) from it as usual and commit that to `wip-mmb-general`.
-* **Rebase later, only on the maintainer's word.**  The branch point is `1c2ec00`, so
-  `git rebase --onto <new-main> 1c2ec00 wip-mmb-general` replays only the commits added after it, and
-  `git -C ~/llama-wip-mmb rebase --onto <new-delivery-base> 8a2567e1e wip-mmb-general` does the same
-  for the code; then regenerate the backup from the new base.
+* **Rebase later, only on the maintainer's word.**  **DONE 2026-09-20 (r12).**  The record branch was
+  `git rebase --onto 4e37fa6 1c2ec00 wip-mmb-general` (17/17; two AGENTS.md conflicts resolved by
+  regenerating the file from r12's content plus this branch's WIP-branch pointers) and the code branch
+  `git rebase --onto <r12 tree> 8a2567e1e wip-mmb-general` (38/38, no conflicts).  For the *next*
+  rebase the pattern is: `git rebase --onto <new-main> 4e37fa6 wip-mmb-general` for the record and
+  `git -C ~/llama-wip-mmb rebase --onto <new-delivery-base> <current-r12-base> wip-mmb-general` for
+  the code; then regenerate the backup from the new base and re-run the gates.
 
 ---
 
@@ -162,8 +171,8 @@ levers are the 3 block passes (472 ms at 32K, key-bound), the gather (259 ms) an
 | | |
 |---|---|
 | worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`49eff7f18`** (clean) |
-| base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0037` + `commits.txt` (37 commits), on branch **`wip-mmb-general`** (cut from `main` at `1c2ec00`), pushed to `origin/wip-mmb-general`; `git am` 37/37 verified on a fresh `8a2567e1e` (applied tree `9813fc8dcaed5b5d506650f5a711eb91fd6b5307` == tip) |
+| base | **r12 applied tree `8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`** (was `8a2567e1e` before the 2026-09-20 rebase) |
+| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/` + `commits.txt`, on branch **`wip-mmb-general`** (rebased onto `main` r12 `4e37fa6`), pushed to `origin/wip-mmb-general` |
 | target model | `/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf` (94 GiB; the only qwen4exp with HC + QSA) |
 | fast iteration model | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf` (21 GiB, `qwen35moe`; **no** HC/QSA — use it for `mmb_*` shapes) |
 | reference | `~/pwilkin-llama-cpp` @ `f5daaa3cf` (branch `strix-halo`) |
@@ -664,7 +673,7 @@ unilaterally** -- needs a beta window / go-ahead.
 | worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`aa55dfef8`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
 | backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0038` + `commits.txt`, in this repo, pushed to `origin/wip-mmb-general` |
-| verify | `git am` of `patches/` on a fresh `8a2567e1e` — clean (38 commits, applied tree `b310cc68d33ec3f93efaa16c6505c4db981794b1` == tip) |
+| verify | `git am` of `patches/` on a fresh `8a2567e1e` — clean (38 commits, applied tree `d365b43ddc87c472c33a121247931269f975aa43` == tip) |
 | build | §3 | run | §4 |
 | current numbers | the **session 24 UPDATE below** (the `load_regs` field preload -- routed_glu 990 -> **841 ms**, total GPU kernel 4015 -> **3879 ms**, pp8192 **1116 t/s**) then the **session 23 UPDATE** (the tile-class threshold) then the **session 20 UPDATE** (the `rms_norm` register-cache **refutation** -- the session-19 tip `2da50418d` is unchanged) and the **session 19 UPDATE** (indexer pass-1 per-block histogram atomics + the block-pass warp reduction) -- indexer family pp8192 **71.7 ms** / pp32768 **1146.6 ms** -- plus the **session 18 UPDATE** (the block-level histogram + `blk_cells` src), the **session 15 UPDATE** (qsa3 compile-time gate + the rocprofiler-register profiling caveat), the **session 14/13 UPDATEs** (non-temporal) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
 
