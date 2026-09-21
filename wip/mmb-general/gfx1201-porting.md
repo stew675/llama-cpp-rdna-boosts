@@ -16,6 +16,16 @@ The delivered patch set was regenerated to fold in the G3a arch gate (patch 3); 
 and the applied tree is `c0f8ea75ba` (byte-identical to the tested `bdf97a390` tip).  No WMMA porting
 code has been written yet — that is S4+ below.
 
+**S4 log (2026-09-21): G2 `qsa3` is PORTED to RDNA4 and validated.**  The gfx12 fragment shim landed
+(one `#if` block, 7 sites) and the kernel now has its **first unit oracle on any arch** — the
+`FLASH_ATTN_QSA` test never attached `src[7]/src[8]`, so it had only ever exercised the VEC kernel.
+26/26 on gfx1201; **+7.6 / +11.5 / +10.4 % prefill** at pp4096/16384/32768 (same build,
+`LLAMA_QSA3_ENABLE` 1 vs 0).  The G3a arch gate was re-tested with qsa3 active and stays.  Full data:
+**`gfx1201-s4-qsa3-results.md`**; the port is folded into patch 2 (tree `e9aa886ac`, `git am` 5/5
+verified).  The S1/S2 record also gained a missing long-context text gate: with qsa3 off the WIP is
+byte-identical to the delivery, so G5/G4 are text-pure and the qsa3 delta is the approved
+re-baseline.  Next: S5-S7 (G1 `mmb`).
+
 **Audience:** whoever picks this up next — first on gfx1201, then on gfx1100.  Read this with
 `GROUPS.md` (the 5-group triage) and `HANDOVER.md` (the gfx1151 development record).  This file is
 the *porting* overlay; the group semantics stay as `GROUPS.md` describes.
@@ -250,7 +260,7 @@ Record every number in a new dated section of `WORKLOG.md` at the end (not in th
 | G5 | indexer top-k op | **generic, always-on**, compiles+runs | none (apply) | qwen4exp long-context prefill: gfx1151 family 2.94 %→1.80 % of run | low |
 | G4 | non-temporal hints (dsv4_hc, concat, moe-weighted-reduction, fused gated-unary) | **generic**, `GGML_CUDA_MMB_HC16`-independent code paths | none (A/B per kernel, loads only) | `dsv4_hc_pre` was −18.6 % on gfx1151; unknown on gfx1201 | low (a bad hint = regression, easy to drop) |
 | G3a | always-QSA prefill flip (drop the dense shortcut) | policy, applies to gfx1201 | none | gfx1201 already prefers QSA prefill from ~8K; the flip mainly removes the `n_kv<=2051` seam — **but** without qsa3 the VEC kernel serves it, so it may be ~neutral | low |
-| G2 | `qsa3` packed-block WMMA | **arch-gated RDNA3_5**, gfx12 no-op | RDNA4 f16 fragment port (~4 sites) | qwen4exp prefill above ~2051; gfx1151 was +8-12 %; gfx1201 likely bigger (R9700 WMMA) | medium |
+| G2 | `qsa3` packed-block WMMA | **ported to RDNA4 2026-09-21** (was gfx11-only) | none left — re-measure/tune if wanted | qwen4exp prefill above ~2051; measured **+7.6..+11.5 %** on gfx1201 (`gfx1201-s4-qsa3-results.md`) | low (done) |
 | G1 | `mmb` bf16-WMMA dequant GEMM | **arch-gated RDNA3_5**, gfx12 no-op | RDNA4 bf16 fragment port (~7 sites) + re-tune | the big prize *if* baseline MMQ is weak; **unmeasured on gfx1201** | medium-high |
 | G3b/c | F32 shape split + tiny-M kernel | rides G1 | with G1 | router/hc-inject shapes | low once G1 works |
 | G4 | HC16 bf16 producers | rides G1 (`GGML_CUDA_MMB_HC16`, default 0) | after G1 | kills `mmb_cvt_f32_bf16`; +1-3 % on gfx1151 | low |
@@ -291,7 +301,12 @@ Record every number in a new dated section of `WORKLOG.md` at the end (not in th
 * Do not conflate this with the `qsa_dense_decode_until`/`qsa_dense_prefill_until` arch policy —
   those already encode "gfx1201 = QSA prefill always / dense decode always".
 
-### 6.4 G2 — `qsa3` on RDNA4 (f16 WMMA)
+### 6.4 G2 — `qsa3` on RDNA4 (f16 WMMA) — **DONE 2026-09-21**
+
+**Status:** ported, oracle-covered and measured — **+7.6 / +11.5 / +10.4 % prefill** at
+pp4096/16384/32768.  Folded into patch 2 (`c3724f627`, tree `e9aa886ac`); the gfx11 arm is a
+compile-time `#if`, so gfx1151 is byte-identical.  Data: `gfx1201-s4-qsa3-results.md`.  The original
+plan for the work follows.
 
 * **Files:** `fattn-qsa3.cu` (wrapper + fragments + acc map + PV shuffle), `fattn-qsa.cu`/`.cuh`,
   `ggml.h`/`ggml.c` (`ggml_flash_attn_qsa_set_packed`), `qwen4exp.cpp`.
@@ -299,7 +314,7 @@ Record every number in a new dated section of `WORKLOG.md` at the end (not in th
   cross-lane reduction are the delicate part: the gfx12 accumulator row is `8*hi + e`, so the
   `ph[2*e]/ph[2*e+1]` packing that assumes interleaved rows must be re-derived.
   `gdn_fragT` / `gdn_store_acc8_b16` in `gated_delta_net_chunked_bf16.cu` is the worked example.
-* **Gating:** extend `ggml_cuda_flash_attn_qsa3_supported()` from `RDNA3_5` to `RDNA3_5 || RDNA4`.
+* **Gating:** **DONE** — `ggml_cuda_flash_attn_qsa3_supported()` accepts `RDNA3_5 || RDNA4`.
   Keep the `q->ne[1] >= 128` prefill gate and the `n_stream == 1` graph gate.
 * **Validation:** `test-backend-ops -o FLASH_ATTN_QSA` 18/18 (the CPU oracle compares *the op*, which
   on gfx1201 now must exercise the WMMA kernel — add cases if the support predicate is what gates the
@@ -369,9 +384,9 @@ HC16 producer pass is host-side graph marking and only meaningful with MMB activ
 1. **Device code** stays behind the existing `#if defined(RDNA4)` compile guards; the gfx12 builtins
    are only compiled for gfx12 targets.  Do not remove the no-op arm — it is the multi-arch build
    guard until the port is proven.
-2. **Runtime arch gate:** extend `mmb_enabled()` and `ggml_cuda_flash_attn_qsa3_supported()` to
-   accept RDNA4.  Keep the env master switch (`GGML_CUDA_MMB=1`) and the compile-time
-   `LLAMA_QSA3_ENABLE` gate.  Do **not** default either on during porting.
+2. **Runtime arch gate:** extend `mmb_enabled()` to accept RDNA4 (`ggml_cuda_flash_attn_qsa3_supported()`
+   already accepts `RDNA3_5 || RDNA4` since S4).  Keep the env master switch (`GGML_CUDA_MMB=1`) and the
+   compile-time `LLAMA_QSA3_ENABLE` gate.  Do **not** default `mmb` on during porting.
 3. **Per-arch tuning constants** (`mmb_*_thresh`, `mmb_tall`, `mmb_min_t`, `qsa_dense_*`) must be
    **selected by `ggml_cuda_info().devices[0].cc`**, not compiled in, so gfx1151/gfx1201/gfx1100 can
    hold different values.  The WIP already uses env overrides with measured defaults — promote the
@@ -399,7 +414,7 @@ checklist updated.
 | **S1 (this)** | plan + build + baseline | this file; WIP build compiles for gfx1201; baseline worktree built | build green; baseline gates B1-B3 recorded |
 | **S2** | arch-neutral wins | G5 indexer + G4 non-temporal applied and A/B'd; `GGML_OP_NAME` fill fix | long-context same-seed A/B + `INDEXER_TOPK` op oracle; per-kernel NT A/B |
 | **S3** | G3a policy | always-QSA measured on gfx1201 (VEC path); decide RDNA4 default | pp2048/p2048-at-depth + `-c 2048` coherence; document the decision |
-| **S4** | G2 `qsa3` RDNA4 port | f16 fragment port; gate extended | `FLASH_ATTN_QSA` 18/18; long-context A/B; PPL vs dense oracle |
+| **S4** | G2 `qsa3` RDNA4 port | f16 fragment port; gate extended | `FLASH_ATTN_QSA` 26/26 (3 new packed cases + a VEC baseline); +7.6/11.5/10.4 % prefill; long-context text re-baseline documented |
 | **S5** | G1 shim | `mmb` fragment shim; gfx11 code bit-identical | width probe + same-seed text unchanged on gfx1151 path (compile-time only here) |
 | **S6** | G1 on RDNA4 | gate enabled; first correctness run on the fast model | PPL parity + same-seed greedy on 35B-A3B |
 | **S7** | G1 re-tune + target | sweep the knobs; run the 27B Q8_0 and Flash-Next gates | baseline-vs-MMB prefill A/B; decision: default on/off |
@@ -411,6 +426,12 @@ PASS.  Deep sweep done (32k/64k/98k).  G5 and G4 verified as wins, the G3a gate 
 patch set, and the 5-patch backup was regenerated (tree `c0f8ea75ba`, `git am` 5/5 verified).  Detail:
 `gfx1201-s1s2-results.md`.  The delivered set is now suitable for both gfx1151 and gfx1201 for the
 arch-neutral items; the WMMA port (S4+) remains future work.
+
+**S4 status (2026-09-21): DONE.**  `qsa3` runs on gfx1201 and is the second-biggest gfx1201 win
+(+7.6..+11.5 % prefill over the VEC kernel, same build).  The kernel now has its first unit-oracle
+coverage; the G3a gate is re-confirmed with qsa3 active; and the long-context text gate shows the WIP
+is byte-identical to the delivery with qsa3 off (G5/G4 pure) with the qsa3 delta being the approved
+re-baseline.  Detail: `gfx1201-s4-qsa3-results.md`.  G1 (`mmb`) is the remaining WMMA group.
 
 If G1 measures **no win** on gfx1201 (the baseline is already strong), stop at S4- and record it:
 qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a gfx1100-only item.
@@ -441,7 +462,9 @@ qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a g
 - [x] G4 non-temporal A/B'd — small consistent win, kept (S2; interleaved rounds)
 - [x] G3a always-QSA decided for RDNA4 — gated off (S2/S3; folded into patch 3)
 - [x] Patch set regenerated + `git am` 5/5 verified (tree `c0f8ea75ba`)
-- [ ] G2 qsa3 f16 RDNA4 port + gate (S4)
+- [x] G2 qsa3 f16 RDNA4 port + gate (S4 — DONE 2026-09-21, tree `e9aa886ac`; +7.6/11.5/10.4 % prefill;
+      `FLASH_ATTN_QSA` 26/26 incl. 3 new packed cases)
+- [x] G5/G4 long-context text purity (S4 — WIP with qsa3 off == delivery, byte-identical)
 - [ ] G1 mmb fragment shim, gfx11 bit-identical (S5)
 - [ ] G1 RDNA4 correctness (fast model) (S6)
 - [ ] G1 RDNA4 re-tune + baseline-vs-MMB decision (S7)

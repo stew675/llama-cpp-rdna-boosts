@@ -26,9 +26,9 @@ construction; gfx1201/gfx1100 keep the existing MMQ/QSA path.
 
 > **Re-examined 2026-09-21 (`gfx1201-porting.md` §2):** the builtin genuinely differs, but the RDNA4
 > fragment layout is already probed/validated in-repo, so the RDNA4 port is a bounded
-> *fragment-layout* port, not new algorithm.  It is **not** part of the delivered set (the 2026-09-21
-> gfx1201 session ported only the arch-neutral groups); it is the scoped follow-up.  The MMB/qsa3
-> gates stay gfx11-only for now.
+> *fragment-layout* port, not new algorithm.  **Status:** `qsa3` (group 2) was ported to RDNA4 in
+> session 28 (+7.6..+11.5 % prefill — `gfx1201-s4-qsa3-results.md`); **`mmb` (group 1) is still
+> gfx11-only** and is the remaining scoped follow-up (`gfx1201-porting.md` §6.5).
 
 ## Attribution — what is pwilkin's and what is ours (added 2026-09-20)
 
@@ -194,6 +194,47 @@ greedy and all op oracles bit-identical.
 fresh r12 tree and the applied tree is `c0f8ea75ba4037844affc396779e5307b2aafbfa` (byte-identical to
 the tested tip).  `commits.txt` refreshed.  The set is now suitable for **both gfx1151 and gfx1201**
 for the arch-neutral items; gfx1100 is next (see the gfx1100 job in `GROUPS.md`).
+
+---
+
+## UPDATE — session 28 (2026-09-21): **`qsa3` ported to RDNA4** — the second-biggest gfx1201 win
+
+The packed-block F16 WMMA sparse-attention path (`fattn-qsa3.cu`, group 2) was ported from RDNA3_5 to
+gfx12 and is the S4 milestone of `gfx1201-porting.md`.  Full data: **`gfx1201-s4-qsa3-results.md`**.
+
+**The port** is one arch-selected shim at the top of the file plus 7 call sites: gfx12 stores 8
+halfs/lane in the "two runs of four" layout (`k = 4*hi + {0..3}` and `4*hi + 8 + {0..3}`) and uses
+the `_f16_w32_gfx12` builtin with the accumulator `m = 8*hi + e`; gfx11 keeps the 16-half full row and
+`m = 2*e + hi`.  The gfx11 arm is a compile-time `#if`, so **gfx1151 is byte-identical**.  The
+support predicate gained `RDNA4`; the `ne[1] >= 128` prefill gate is unchanged, so the decode/verify
+band and its width purity are untouched by construction.  The two non-obvious parts: the value A
+operand's two runs come from key-blocks `hi` and `hi+2` (not a contiguous row), and the probability
+packing must still produce keys **0..15 in order** for the PV A operand.
+
+**The kernel had no unit oracle before this** — on any arch.  `test-backend-ops -o FLASH_ATTN_QSA`
+never attached `src[7]/src[8]`, and the qsa3 predicate requires both, so every run only ever
+exercised the VEC kernel (`fattn-qsa.cu`).  Patch 2 now adds three packed cases (f16 ×2, bf16, at
+`hsk=256`/`gqa=12`) plus the same shape on the VEC path as a baseline: **26/26 on gfx1201** (was 22).
+With the tolerance forced to 0 to read the errors, qsa3 is ~4.2e-8 NMSE vs the same-shape VEC ~4e-9 —
+f16-rounding level, not a layout error (a fragment-layout mistake is an exact permutation error, ~0.5×
+contractions).
+
+**Performance** (same build, only `LLAMA_QSA3_ENABLE` 0 vs 1, Flash-Next IQ4_XS, q8_0 KV, 3-GPU
+tensor): **+7.6 % pp4096, +11.5 % pp16384, +10.4 % pp32768**.  That is the largest gfx1201 prefill win
+after the G5 indexer.  The G3a arch gate was re-tested with qsa3 active — the dense shortcut is still
+equal-or-better at every point, so **the gate stays**.
+
+**Correctness note (important):** qsa3 changes the greedy text vs the VEC kernel at >2051-token
+contexts.  That is *not* a port artefact — it is the documented, approved qsa3 prefill re-baseline
+(`README.md` records `MMB=1 QSA3=1` → `bbd4bcb519e4` vs `MMB=0 QSA3=0` → `5120b28f2879`: "Hashes differ
+between configs — that is the approved prefill re-baseline").  The S4 session also closed the missing
+long-context text gate from S1/S2: with qsa3 off the WIP is **byte-identical to the delivery** on the
+5246-token prose prompt, so G5/G4 are text-pure and the qsa3 delta is attributed exactly.
+
+**Patch set regenerated:** the port and the new test coverage are folded into patch 2; the 5 patches
+apply `git am` 5/5 on a fresh r12 tree and the applied tree is
+`e9aa886ac06270f05a558be270069d7e7211a424`.  `commits.txt` refreshed; the local branch is
+`mmb-port-qsa3`.  Next: **S5–S7 (G1 `mmb`)** — the remaining WMMA group.
 
 ---
 

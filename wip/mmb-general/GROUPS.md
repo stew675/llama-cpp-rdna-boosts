@@ -74,10 +74,14 @@ counting sort in `qsa3_rows_kernel` (441 → 25.5 ms), the pack fused into one l
 **compile-time** gate (`LLAMA_QSA3_ENABLE`, default 1) that replaced an env gate because
 `rocprofiler-register` made env reads racy under the profiler.
 
-**Arch:** generic HIP/CUDA, no arch-specific path.  **Always-on** (compiles in at `LLAMA_QSA3_ENABLE=1`).
-It is the qwen4exp attention path, so it only matters for that model family.  Validate with the
-long-context gates (it is the attention kernel, not a micro-optimisation): same-seed text at
-`-c 16384`+, `test-backend-ops -o FLASH_ATTN_QSA` (18 cases incl. the CPU oracle).
+**Arch:** the F16 WMMA path is **per-arch**: gfx11 (RDNA3_0/RDNA3_5) uses the first-gen builtin and
+its 16-half full-row fragment; **gfx12 (RDNA4) uses `…_f16_w32_gfx12` with the 8-half "two runs of
+four" fragment** (one `#if` shim, 7 sites — ported 2026-09-21, `gfx1201-s4-qsa3-results.md`).
+**Always-on** (compiles in at `LLAMA_QSA3_ENABLE=1`); it is the qwen4exp attention path, so it only
+matters for that model family.  Validate with the long-context gates (it is the attention kernel, not
+a micro-optimisation): same-seed text at `-c 16384`+, `test-backend-ops -o FLASH_ATTN_QSA` (26 cases
+since 2026-09-21 — **the packed path had no oracle before that**: the old cases never attached
+`src[7]/src[8]`, so they only ever ran the VEC kernel).
 
 ### 3 — F32/tiny-M kernels, the default flips, and the W=1..8 probe
 
@@ -95,8 +99,10 @@ situation.  **The `always-QSA` flip is the one to A/B first** — it changes the
 arch, and on gfx1151 it was worth +10.6 % at pp4096 on its own.  **Updated 2026-09-21 (gfx1201 port):**
 the flip is **not** portable — it is now gated per arch: the default is always-QSA **only on gfx1151**
 (the arch it was measured on); every other arch keeps the delivery's dense shortcut.  On gfx1201 the
-flip cost pp2048 **−18.9 %**, pp8192 **−6.7 %**, because the VEC QSA path (qsa3 is still gfx11-gated)
-has no answer for the short-prefill band.  See `gfx1201-s1s2-results.md` §3a.
+flip cost pp2048 **−18.9 %**, pp8192 **−6.7 %**, because the VEC QSA path (qsa3 was still gfx11-gated)
+has no answer for the short-prefill band.  See `gfx1201-s1s2-results.md` §3a.  **Re-tested with qsa3
+ported (S4):** the shortcut is still equal-or-better at pp4096..32768 (−0.15..−0.70 % for
+always-QSA), so the gate stays — see `gfx1201-s4-qsa3-results.md` §3.1.
 
 ### 4 — HC16 native-BF16 producers + non-temporal accesses
 
@@ -136,8 +142,8 @@ Full data: `gfx1201-s1s2-results.md`; plan: `gfx1201-porting.md`.
 | **G5 indexer** | **win**, grows with depth: +2.1 % pp8192 → **+8.0 % pp98304** | keep, always-on |
 | **G4 non-temporal** | **small consistent win** at depth (+0.3–0.4 % at 32k/64k/98k) | keep, always-on |
 | **G3a always-QSA flip** | **regression** (pp2048 −18.9 %, pp8192 −6.7 %) | **gated off on RDNA4** (default shortcut ON except gfx1151) |
-| **G2 qsa3** | not usable (gfx11 f16 WMMA builtin only) | gfx11-gated; RDNA4 port is follow-up |
-| **G1 mmb** | not usable (gfx11 bf16 WMMA builtin only) | gfx11-gated; RDNA4 port is follow-up |
+| **G2 qsa3** | **win**: +7.6 / +11.5 / +10.4 % prefill at pp4096/16384/32768 (qsa3 vs VEC, same build) | **ported 2026-09-21** (`gfx1201-s4-qsa3-results.md`); folded into patch 2 |
+| **G1 mmb** | not usable (gfx11 bf16 WMMA builtin only) | gfx11-gated; RDNA4 port is follow-up (§6.5) |
 
 Net gfx1201 prefill vs the delivery (Flash-Next IQ4_XS, q8_0 KV, 3-GPU tensor, `-b/-ub 2048`):
 **+3.2 % / +5.0 % / +6.6 %** at pp32768/65536/98304, no regression at any depth, same-seed greedy
@@ -145,9 +151,10 @@ and all op oracles bit-identical.  The patch set carries the G3a arch gate (patc
 `bdf97a390` on the pre-consolidation branch); it applies clean 5/5 and the applied tree is
 `c0f8ea75ba`.
 
-**The WMMA groups stay gfx11-gated** — RDNA4 keeps the MMQ/QSA path.  Making `mmb`/`qsa3` run on
-RDNA4 is a *fragment-layout port* (not new algorithm) and is scoped session-by-session in
-`gfx1201-porting.md` §§6.4-6.5; it is deliberately **not** part of this delivered set.
+**G2 `qsa3` is ported to RDNA4** (2026-09-21) and is the second-biggest gfx1201 win after the indexer.
+**G1 `mmb` still stays gfx11-gated** — RDNA4 keeps the MMQ path for the weight GEMMs.  Making `mmb`
+run on RDNA4 is a *fragment-layout port* (not new algorithm) and is scoped session-by-session in
+`gfx1201-porting.md` §6.5; it is deliberately **not** part of this delivered set.
 
 ## gfx1100 job (the next box)
 
@@ -195,11 +202,12 @@ nothing about this group.
 ## Triage order for a new architecture
 
 1. **Build the base (r12) alone** and record the baseline gates.  Everything below is relative to that.
-2. **Group 5 is the arch-neutral, always-on item**; **group 2 works only on the gfx11 arches**
-   (RDNA3_0/RDNA3_5 — RDNA4 needs the fragment port).  Apply and gate them first; they are where a
-   new arch gets a win without touching the WMMA assumptions.  **Group 3(a) (always-QSA) is NOT
-   arch-neutral**: default the shortcut ON unless the arch is measured to prefer always-QSA (only
-   gfx1151 is, today) — see the group-3 note above.
+2. **Group 5 is the arch-neutral, always-on item.**  **Group 2 (`qsa3`) now serves gfx1151 *and*
+   gfx1201** (the RDNA4 fragment port landed 2026-09-21) and is gfx11-only for gfx1100 until its
+   support predicate gains `RDNA3_0`.  Apply and gate these first; they are where a new arch gets a win
+   without touching the WMMA assumptions.  **Group 3(a) (always-QSA) is NOT arch-neutral**: default the
+   shortcut ON unless the arch is measured to prefer always-QSA (only gfx1151 is, today) — see the
+   group-3 note above.
 3. **Group 4's non-temporal hints** next: per-kernel, A/B load vs store.  On gfx1201 they are a small
    consistent win at depth (+0.3–0.4 %); on another arch measure, do not assume.
 4. **Group 1 last** and only after checking `mmb_enabled()`'s arch gate on your box.  On RDNA4 it
@@ -218,9 +226,9 @@ nothing about this group.
 * **Not a delivery block.**  It is WIP on the `wip-mmb-general` branch; promotion needs the maintainer
   (see `HANDOVER.md` §E — rebase onto a canonical fork, regenerate `patches/`/`release.json`, and
   decide whether MMB rides as a **block-08 amendment**).
-* **Validated on gfx1151 (RDNA3_5) and — for the arch-neutral groups only — gfx1201 (RDNA4).**
-  gfx1201: G5/G4 win, the always-QSA flip is gated off, and `mmb`/`qsa3` stay gfx11-gated (their RDNA4
-  fragment port is future work — `gfx1201-porting.md`).  gfx1100 is next (see the gfx1100 job above).
-  Do not transfer tuning constants between arches.
+* **Validated on gfx1151 (RDNA3_5) and gfx1201 (RDNA4).**  gfx1201: G5/G4 win, `qsa3` wins
+  (+7.6..+11.5 % prefill), the always-QSA flip is gated off, and `mmb` stays gfx11-gated (its RDNA4
+  fragment port is future work — `gfx1201-porting.md` §6.5).  gfx1100 is next (see the gfx1100 job
+  above).  Do not transfer tuning constants between arches.
 * **Not a supported configuration.**  All WIP env gates (`GGML_CUDA_MMB`, `GGML_CUDA_MMB_HC16`, …)
   default off; the delivery runs with them off.
