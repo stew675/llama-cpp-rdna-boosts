@@ -23,7 +23,7 @@ git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout ebbb18522
 bash <this-repo>/scripts/apply-all.sh .        # -> branch rdna-boosts, tree 8a80535e... (r12)
 git checkout -b wip-mmb-general
-git am <this-repo>/wip/mmb-general/patches/*.patch   # 5/5, tree d365b43d...
+git am <this-repo>/wip/mmb-general/patches/*.patch   # 6/6, tree 580db5174...
 ```
 
 ## The five groups
@@ -35,6 +35,12 @@ git am <this-repo>/wip/mmb-general/patches/*.patch   # 5/5, tree d365b43d...
 | 3 | `0003-WIP-the-F32-tiny-M-…` | F32/tiny-M kernels, the default flips, the W=1..8 probe | `GGML_CUDA_MMB=1` (kernels) / none (flips) | mixed |
 | 4 | `0004-WIP-HC16-…` | HC16 native-BF16 producers + non-temporal accesses | `GGML_CUDA_MMB_HC16=1` (producers) / none (NT hints) | mixed |
 | 5 | `0005-WIP-indexer-…` | the fused indexer top-k op | none (op-driven) | **yes** |
+| 6 | `0006-WIP-mmb-RDNA4-…` | the `mmb` RDNA4 (gfx12) fragment port **+ the arch-scoped weight-type/path split** | `GGML_CUDA_MMB=1` + the scope policy (`MMB_TYPES` / `MMB_DENSE`) | no |
+
+> **Patch 6 and the theme split.**  S5-S7 (2026-09-21) landed as its own patch rather than folded:
+> patches 1, **3 and 4** all touch `mmb.cu`, so there is no single theme to fold it into without a full
+> re-cut.  Patch 6 is therefore the authoritative source for the RDNA4 scope policy
+> (`mmb_wtype_ok` / `mmb_dense_flag`) — see `gfx1201-s5s7-mmb-results.md` §4.
 
 ### 1 — `mmb`: the general-purpose bf16-WMMA dequant weight GEMM
 
@@ -48,13 +54,19 @@ double-buffered GLU tile, the `v_perm` bf16 RNE pack, the IQ3_S A-panel dequant 
 threshold (`THRESH == BN_SMALL`) and the `load_regs` IQ3_S field preload.
 
 **Arch note — this is the group that needs your attention.**  The kernels dispatch through
-`mmb_wmma_bf16` / `mmb_wmma_f16` (`mmb.cu` top), which use the **gfx11 `__builtin_amdgcn_wmma_*_w32`
-intrinsics and are deliberately no-ops under `RDNA4`** (so the multi-arch build compiles).
+`mmb_wmma_bf16` / `mmb_wmma_f16` (`mmb.cu` top), which select at compile time: gfx11 uses the
+`__builtin_amdgcn_wmma_*_w32` intrinsics with the 16-half row fragment, **gfx12 (RDNA4) the
+`..._w32_gfx12` intrinsics with the 8-half "two runs of four" fragment** (added 2026-09-21, S5).
 Consequences to test, not assume:
 
-* **gfx1201 (RDNA4):** `mmb_wmma_*` is a no-op there, so the GEMM cannot produce output and the host
-  gate is expected to keep MMB off.  Verify the gate refuses (no wrong output, no crash) — and if the
-  RDNA4 `v_wmma_*` path is wanted, that is new work, not a port.
+* **gfx1201 (RDNA4): PORTED 2026-09-21 — but it is NOT a blanket win, so RDNA4 defaults to a
+  *scoped* subset.**  With every weight type and the dense path enabled, MMB is a **−4…−13 %**
+  prefill regression on three models; the wins are confined to the **routed MoE** path and the
+  **qwen4exp HC** paths.  The gate was therefore split (see below) and RDNA4 defaults to
+  IQ-family weights + routed/HC paths only — neutral wherever it would lose, **+3…+7 %** where it
+  wins.  Full matrix: `gfx1201-s5s7-mmb-results.md`.  As a tune target this is the arch where the
+  dense tile geometry has *never* been right (every RDNA4 loss lives in the gfx1151-tuned dense
+  tile), so a genuine gfx1201 dense geometry is the open work, not a re-run.
 * **gfx1100 (RDNA3_0):** the same gfx11 WMMA instructions exist, so this is the arch where group 1 has
   a real chance.  The delivery's own block 04 carries an RDNA3_0-specific FA head cap and `ncols2`
   rule, i.e. gfx1100 is a *tuned-differently* sibling, not a copy of gfx1151.  **Measure, do not
@@ -143,7 +155,7 @@ Full data: `gfx1201-s1s2-results.md`; plan: `gfx1201-porting.md`.
 | **G4 non-temporal** | **small consistent win** at depth (+0.3–0.4 % at 32k/64k/98k) | keep, always-on |
 | **G3a always-QSA flip** | **regression** (pp2048 −18.9 %, pp8192 −6.7 %) | **gated off on RDNA4** (default shortcut ON except gfx1151) |
 | **G2 qsa3** | **win**: +7.6 / +11.5 / +10.4 % prefill at pp4096/16384/32768 (qsa3 vs VEC, same build) | **ported 2026-09-21** (`gfx1201-s4-qsa3-results.md`); folded into patch 2 |
-| **G1 mmb** | not usable (gfx11 bf16 WMMA builtin only) | gfx11-gated; RDNA4 port is follow-up (§6.5) |
+| **G1 mmb** | **ported 2026-09-21, scoped**: +3…+7 % on the routed MoE and qwen4exp HC paths; neutral elsewhere (scoped default) | enabling it unscoped is a −4…−13 % regression on dense/K-quant models — see `gfx1201-s5s7-mmb-results.md` |
 
 Net gfx1201 prefill vs the delivery (Flash-Next IQ4_XS, q8_0 KV, 3-GPU tensor, `-b/-ub 2048`):
 **+3.2 % / +5.0 % / +6.6 %** at pp32768/65536/98304, no regression at any depth, same-seed greedy
@@ -152,9 +164,22 @@ and all op oracles bit-identical.  The patch set carries the G3a arch gate (patc
 `c0f8ea75ba`.
 
 **G2 `qsa3` is ported to RDNA4** (2026-09-21) and is the second-biggest gfx1201 win after the indexer.
-**G1 `mmb` still stays gfx11-gated** — RDNA4 keeps the MMQ path for the weight GEMMs.  Making `mmb`
-run on RDNA4 is a *fragment-layout port* (not new algorithm) and is scoped session-by-session in
-`gfx1201-porting.md` §6.5; it is deliberately **not** part of this delivered set.
+**G1 `mmb` is ported too, but scoped** — and the scoping is the interesting part: `GGML_CUDA_MMB`
+bundled **arch × weight-type × kernel-path × model-family** into one switch, and the measurement shows
+the four axes disagree on RDNA4 (a −4…−13 % regression with everything on, wins only on the routed
+MoE and qwen4exp HC shapes).  It is now:
+
+* **arch-scoped weight types** — `mmb_wtype_ok()` (one mask, replacing five duplicated hard-coded
+  lists).  RDNA4 = the **IQ family** (`IQ4_NL`/`IQ3_S`/`IQ4_XS`/`IQ3_XXS`); RDNA3_5/RDNA3_0 keep the
+  full set, so **gfx1151 is unchanged**.  A/B with **`GGML_CUDA_MMB_TYPES=<csv>`**.
+* **path-scoped** — `mmb_dense_flag()` separates the generic quantized dense tile GEMM and the F32
+  router (the losers) from the routed MoE path and the HC/tall-M/tiny-M paths (the winners).
+  RDNA4 default: dense/router **off**; `GGML_CUDA_MMB_DENSE=0|1` overrides.
+
+A user who sets `GGML_CUDA_MMB=1` on gfx1201 therefore **cannot lose** on it, and can opt into the
+qwen4exp dense win with `GGML_CUDA_MMB_DENSE=1`.  The gfx11 (gfx1151/gfx1100) behaviour is unchanged
+and keeps the full type set — the split only narrows what RDNA4 accepts.  Details:
+`gfx1201-s5s7-mmb-results.md`.
 
 ## gfx1100 job (the next box)
 
@@ -170,7 +195,8 @@ the gfx12 fragment work**.  Its job is the mirror image of gfx1201's:
    win it can move into the gfx11 exception (the gate is one comparison in `qwen4exp.cpp`).
 3. **G1 `mmb` — the real gfx1100 prize.**  gfx11 WMMA works there, so `GGML_CUDA_MMB=1` +
    `GGML_CUDA_MMB_RDNA3=1` opens it (the delivery's block-04 work already shows gfx1100 is a
-   tuned-differently sibling).  **This is untested and needs a re-tune, not a transfer:** the tile
+   tuned-differently sibling), and gfx1100 keeps the **full** weight-type set (the RDNA4 scoping
+   above does not apply).  **This is untested and needs a re-tune, not a transfer:** the tile
    geometry / `THRESH` / `VAULT` / `min_t` constants are gfx1151-tuned.  Follow `gfx1201-porting.md`
    §5 (G1 row) and §6.5.3 for the sweep shape; start on the fast `Qwen3.6-35B-A3B Q4_K_M` model.
 4. **G2 `qsa3`** likewise: extend its support predicate from `RDNA3_5` to `RDNA3_0` and re-tune.

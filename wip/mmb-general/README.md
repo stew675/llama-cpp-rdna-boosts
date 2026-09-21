@@ -238,6 +238,52 @@ apply `git am` 5/5 on a fresh r12 tree and the applied tree is
 
 ---
 
+## UPDATE — session 29 (2026-09-21): **`mmb` ported to RDNA4 — and the `GGML_CUDA_MMB` switch split**
+
+S5–S7 of `gfx1201-porting.md` (group 1).  The gfx12 bf16 fragment shim is in and the gfx11 path is
+verified **bit-identical** — but the finding that matters is that `mmb` is **not** a blanket win on
+RDNA4, so the one switch became three axes.  Full matrix: **`gfx1201-s5s7-mmb-results.md`**.
+
+**The port (S5).**  One arch-selected shim, 7 sites: gfx12 needs `..._bf16_w32_gfx12` and the 8-half
+"two runs of four" fragment with the `m = 8*hi + e` accumulator; gfx11 keeps the 16-half row and
+`m = 2*e + hi`.  Verified by compiling `mmb.cu` for **gfx1151** and diffing the device assembly:
+**byte-identical except the `__hip_cuid_*` module-id symbol**, with every `codeLenInByte` and the
+opcode histogram md5 equal.  **The trap:** routing the gfx11 load through a `__device__` helper left a
+dead `lane >> 4` argument and perturbed the scheduler (semantics-preserving but not bit-identical);
+the gfx11 arm has to be a **macro** so the preprocessed source is the original expression.
+
+**Correctness (S6):** PPL parity — 14.3981 (off) vs 14.4087 (on) on the fast model, and 12.7378 vs
+12.7221 over 7 chunks on the MoE IQ path (MMB demonstrably running via `LLAMA_MMB_CVT_LOG`).
+
+**The finding (S7).**  With every weight type and the dense path enabled, MMB is a **−4…−13 %**
+prefill regression on three models (dense Q8_0 −6 %, dense mixed-K −11 %, dense IQ-heavy −3 %), while
+the wins are confined to the **routed MoE** path (+3.2 % on an 88.5 %-IQ MoE) and the **qwen4exp HC**
+paths (+2.7…+11.8 %).  The generic quantized dense tile GEMM loses on RDNA4 for *every* type measured;
+the F32 split router was the residual −1 % left on a K-quant model once the weights were already
+type-excluded.  A 27B UD-IQ3_S (82 % IQ, **dense**) losing −3 % is what proves it is **not** simply "IQ
+weights win" — the calling path matters at least as much as the type.
+
+**The split (the deliverable).**  `GGML_CUDA_MMB` bundled **arch × weight-type × kernel-path ×
+model-family**, and the type list was duplicated, arch-independent, in **five** places (drifted —
+IQ3_XXS was treated differently in different copies).  It is now:
+
+* **`mmb_wtype_ok()` / `mmb_wtype_mask()`** — one arch-scoped weight-type policy replacing all five
+  copies.  RDNA4 = **IQ family** (`IQ4_NL`/`IQ3_S`/`IQ4_XS`/`IQ3_XXS`); RDNA3_5/RDNA3_0 keep the full
+  set, so **gfx1151 is unchanged**.  Override: **`GGML_CUDA_MMB_TYPES=<csv>`**.
+* **`mmb_dense_flag()`** — separates the generic quantized dense tile GEMM + the F32 router (the
+  losers) from the routed MoE path and the qwen4exp HC paths (tall-M / tiny-M inject / gate-mix — the
+  winners).  RDNA4 default: dense/router **off**; **`GGML_CUDA_MMB_DENSE=0|1`** overrides.
+* `mmb_tall_shape()` keeps the qwen4exp HC tall-M tile out of the dense stand-down — without it the
+  dense flag silently kills the HC win.
+
+Because the graph's MMQ-fusion stand-down goes through these same predicates, an excluded type or
+path costs **nothing** (it keeps the delivery's MMQ path).  Net with the scoped default: **neutral
+wherever MMB would lose, +3…+7 % where it wins**, and a qwen4exp user can opt into the extra dense win
+with `GGML_CUDA_MMB_DENSE=1`.  The open work is a **real gfx1201 dense tile geometry** — the current
+one is gfx1151-tuned and is where every RDNA4 loss lives.
+
+---
+
 ## UPDATE — session 25 (2026-09-20): the indexer gather's **warp-shuffle scan** (−11.7 % on the gather),
 ## and the block-level gather/emit closed as unbuildable
 

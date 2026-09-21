@@ -1,0 +1,395 @@
+From 50b813085c38454ce711a63f401b54d6063f0f1c Mon Sep 17 00:00:00 2001
+From: Stew Forster <ci@rdna-boosts.invalid>
+Date: Mon, 21 Sep 2026 06:09:39 -0500
+Subject: [PATCH 6/6] WIP mmb: RDNA4 (gfx12) fragment port + the arch-scoped
+ weight-type/path split
+
+Ported to RDNA4 (S5-S7, 2026-09-21): one arch-selected shim (gfx12 8-half "two
+runs of four" A/B + accumulator m = 8*hi + e + the _gfx12 builtins; gfx11 keeps
+the 16-half row and m = 2*e + hi) at 7 sites, and mmb_enabled() accepts RDNA4.
+The gfx11 arm is a MACRO, not a __device__ function: a function left a dead
+`lane >> 4` argument that perturbed the scheduler and broke codegen identity
+(the gfx11 device asm is now byte-identical but for the __hip_cuid_* symbol,
+opcode histogram md5 equal).
+
+The switch was then SPLIT, because measurement says mmb is not a blanket win:
+  - un-scoped (all types, dense path on) it is a -4..-13 % prefill regression
+  - wins are confined to the routed-MoE path and the qwen4exp HC paths
+  - the generic quantized dense tile GEMM loses for every type measured
+  - a 27B UD-IQ3_S (82 % IQ, dense) losing -3 % proves the path matters as much
+    as the weight type
+So:
+  - mmb_wtype_ok()/mmb_wtype_mask(): ONE arch-scoped weight-type policy,
+    replacing five duplicated hard-coded copies (which had drifted).  RDNA4 =
+    the IQ family; RDNA3_5/RDNA3_0 keep the full set (gfx1151 unchanged).
+    GGML_CUDA_MMB_TYPES=<csv> overrides.
+  - mmb_dense_flag(): separates the generic dense tile GEMM + the F32 router
+    (the losers) from the routed/HC paths (the winners).  RDNA4 default: off.
+    GGML_CUDA_MMB_DENSE=0|1 overrides.
+  - mmb_tall_shape(): keeps the qwen4exp HC tall-M tile out of the dense
+    stand-down (otherwise the dense flag silently kills the HC win).
+
+The graph's MMQ-fusion stand-down goes through these same predicates, so an
+excluded type/path costs nothing.  Net with the scoped default: neutral
+wherever it would lose, +3..+7 % where it wins.  Correctness: PPL parity
+(7 chunks, 12.7378 vs 12.7221; fast model 14.3981 vs 14.4087).
+Matrix: wip/mmb-general/gfx1201-s5s7-mmb-results.md.
+---
+ ggml/src/ggml-cuda/mmb.cu | 194 +++++++++++++++++++++++++++-----------
+ 1 file changed, 141 insertions(+), 53 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 595068ce5..f04cb2ea3 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -5,13 +5,37 @@
+ #include <utility>
+ #include "mmid.cuh"
+ #include <cstdlib>
++#include <cstring>
+ #include <vector>
+ #include <unordered_set>
+ 
+ namespace {
+ 
+-typedef short v16s __attribute__((ext_vector_type(16)));
+ typedef float v8f  __attribute__((ext_vector_type(8)));
++
++// Fragment-layout shim.  Both gens compute a 16x16x16 tile with fp32 accumulation; only the lane
++// bookkeeping differs (gated_delta_net_chunked_bf16.cu vs ..._gfx11.cu):
++//   gfx11: 16 halfs/lane (the whole K row), accumulator m = 2*e + hi
++//   gfx12:  8 halfs/lane ("two runs of four": k = 4*hi + {0..3} and 4*hi + 8 + {0..3}), m = 8*hi + e
++#if defined(RDNA4)
++typedef short    mmb_frag_t      __attribute__((ext_vector_type(8)));
++typedef __bf16   mmb_bf16_frag_t __attribute__((ext_vector_type(8)));
++typedef _Float16 mmb_f16_frag_t  __attribute__((ext_vector_type(8)));
++#define MMB_ACC_M(e, hi) (8*(hi) + (e))
++// K-contiguous fragment from a 16-wide LDS row: this lane's two runs of four.
++__device__ __forceinline__ mmb_frag_t mmb_ld_frag(const uint16_t * p, const int hi) {
++    const uint16_t * q = p + 4 * hi;
++    return __builtin_bit_cast(mmb_frag_t, (uint2[2]){*reinterpret_cast<const uint2 *>(q), *reinterpret_cast<const uint2 *>(q + 8)});
++}
++#else
++typedef short mmb_frag_t      __attribute__((ext_vector_type(16)));
++typedef short mmb_bf16_frag_t __attribute__((ext_vector_type(16)));
++typedef short mmb_f16_frag_t  __attribute__((ext_vector_type(16)));
++#define MMB_ACC_M(e, hi) (2*(e) + (hi))
++// gfx11 keeps the whole 16-half row in one lane.  A macro (not a function) so the preprocessed
++// source at every call site is the original expression -- the gfx11 asm stays bit-identical.
++#define mmb_ld_frag(p, hi) (__builtin_bit_cast(mmb_frag_t, (uint4[2]){*reinterpret_cast<const uint4 *>(p), *reinterpret_cast<const uint4 *>((p) + 8)}))
++#endif
+ constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
+ 
+ __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
+@@ -35,19 +59,19 @@ __device__ __forceinline__ uint32_t mmb_pack2(float a, float b) {
+ __constant__ int8_t mmb_kv_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+ __device__ __forceinline__ float mmb_h2f(uint16_t h) { return (float) __builtin_bit_cast(_Float16, h); }
+ 
+-// Portable WMMA dispatch: gfx12 renamed the builtins and uses different fragment types.  The kernels
+-// are runtime-gated to RDNA3_5 (mmb_enabled), so on RDNA4 the wrappers are never launched -- they
+-// exist only so the multi-arch build compiles, and are deliberately no-ops there.
+-__device__ __forceinline__ v8f mmb_wmma_bf16(v16s a, v16s b, v8f c) {
++// Portable WMMA dispatch: gfx12 renamed the builtins and uses the 8-half fragment above; gfx11 keeps
++// the first-gen builtin and its 16-half fragment.  The kernels are runtime-gated to RDNA3_5/RDNA4
++// (mmb_enabled), so only the matching arm is ever launched.
++__device__ __forceinline__ v8f mmb_wmma_bf16(mmb_frag_t a, mmb_frag_t b, v8f c) {
+ #if defined(RDNA4)
+-    (void) a; (void) b; return c;
++    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(__builtin_bit_cast(mmb_bf16_frag_t, a), __builtin_bit_cast(mmb_bf16_frag_t, b), c);
+ #else
+     return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
+ #endif
+ }
+-__device__ __forceinline__ v8f mmb_wmma_f16(v16s a, v16s b, v8f c) {
++__device__ __forceinline__ v8f mmb_wmma_f16(mmb_frag_t a, mmb_frag_t b, v8f c) {
+ #if defined(RDNA4)
+-    (void) a; (void) b; return c;
++    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(__builtin_bit_cast(mmb_f16_frag_t, a), __builtin_bit_cast(mmb_f16_frag_t, b), c);
+ #else
+     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+ #endif
+@@ -493,7 +517,7 @@ __device__ __forceinline__ void mmb_store_tile(const v8f & acc, float * __restri
+         const bool store_f32, const int M, DRowFn drow, const int n_base, const int m_base, const int lane) {
+     const int cm = lane & 15, cn = lane >> 4;
+ #pragma unroll
+-    for (int e = 0; e < 8; ++e) { stg[(2 * e + cn) * 16 + cm] = acc[e]; }
++    for (int e = 0; e < 8; ++e) { stg[MMB_ACC_M(e, cn) * 16 + cm] = acc[e]; }
+     __syncthreads();
+     const int n = lane >> 1, half = lane & 1;
+     const int dr = drow(n_base + n);
+@@ -611,13 +635,13 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
+         const int bb = DBUF2 ? ((ks & 1) * BN) : 0;
+ #pragma unroll
+         for (int kk = 0; kk < MMB_BK; kk += 16) {
+-            v16s a[TM], b[TN]; const int r = lane & 15;
++            mmb_frag_t a[TM], b[TN]; const int r = lane & 15;
+ #pragma unroll
+             for (int i = 0; i < TM; ++i) { const uint16_t * p = As + (ab + wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
+-                const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); a[i] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
++                a[i] = mmb_ld_frag(p, lane >> 4); }
+ #pragma unroll
+             for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (bb + wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+-                const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); b[j] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
++                b[j] = mmb_ld_frag(p, lane >> 4); }
+ #pragma unroll
+             for (int i = 0; i < TM; ++i)
+ #pragma unroll
+@@ -717,13 +741,13 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
+         if (ks + 1 < nks) load_regs(ks + 1);
+ #pragma unroll
+         for (int kk = 0; kk < MMB_BK; kk += 16) {
+-            v16s a[HC], b[2]; const int r = lane & 15;
++            mmb_frag_t a[HC], b[2]; const int r = lane & 15;
+ #pragma unroll
+             for (int c = 0; c < HC; ++c) { const uint16_t * p = As + (c * CH + wm * 16 + r) * MMB_LDS_STRIDE + kk;
+-                const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); a[c] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
++                a[c] = mmb_ld_frag(p, lane >> 4); }
+ #pragma unroll
+             for (int j = 0; j < 2; ++j) { const uint16_t * p = Bs + (wn * 32 + j * 16 + r) * MMB_LDS_STRIDE + kk;
+-                const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); b[j] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
++                b[j] = mmb_ld_frag(p, lane >> 4); }
+ #pragma unroll
+             for (int c = 0; c < HC; ++c)
+ #pragma unroll
+@@ -739,7 +763,7 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
+     for (int j = 0; j < 2; ++j) {
+ #pragma unroll
+         for (int e = 0; e < 8; ++e) {
+-            const int t = t0 + wn * 32 + j * 16 + 2 * e + cn;
++            const int t = t0 + wn * 32 + j * 16 + MMB_ACC_M(e, cn);
+             if (t >= T) continue;
+             const uint16_t * xr = Xn + (size_t)t * ((size_t)HC * E) + ch;
+             float s = 0.f;
+@@ -905,14 +929,14 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
+         const int bb = DBUF2 ? ((ks & 1) * BN) : 0;
+ #pragma unroll
+         for (int kk = 0; kk < MMB_BK; kk += 16) {
+-            v16s ag[TM], au[TM], b[TN]; const int r = lane & 15;
++            mmb_frag_t ag[TM], au[TM], b[TN]; const int r = lane & 15;
+ #pragma unroll
+             for (int i = 0; i < TM; ++i) { const int off = (ab + wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
+-                ag[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
+-                au[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)}); }
++                ag[i] = mmb_ld_frag(Ag + off, lane >> 4);
++                au[i] = mmb_ld_frag(Au + off, lane >> 4); }
+ #pragma unroll
+             for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (bb + wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
+-                b[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
++                b[j] = mmb_ld_frag(p, lane >> 4); }
+ #pragma unroll
+             for (int i = 0; i < TM; ++i)
+ #pragma unroll
+@@ -1088,15 +1112,15 @@ mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X,
+         const int r = lane & 15;
+ #pragma unroll
+         for (int kk = 0; kk < BKs; kk += 16) {
+-            v16s ah[TM], al[TM], bh[TN], bl[TN];
++            mmb_frag_t ah[TM], al[TM], bh[TN], bl[TN];
+ #pragma unroll
+             for (int i = 0; i < TM; ++i) { const int off = (wm * WTM + i * 16 + r) * LS + kk;
+-                ah[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ah + off), *(const uint4 *)(Ah + off + 8)});
+-                al[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Al + off), *(const uint4 *)(Al + off + 8)}); }
++                ah[i] = mmb_ld_frag(Ah + off, lane >> 4);
++                al[i] = mmb_ld_frag(Al + off, lane >> 4); }
+ #pragma unroll
+             for (int j = 0; j < TN; ++j) { const int off = (wn * WTN + j * 16 + r) * LS + kk;
+-                bh[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Bh + off), *(const uint4 *)(Bh + off + 8)});
+-                bl[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Bl + off), *(const uint4 *)(Bl + off + 8)}); }
++                bh[j] = mmb_ld_frag(Bh + off, lane >> 4);
++                bl[j] = mmb_ld_frag(Bl + off, lane >> 4); }
+ #pragma unroll
+             for (int i = 0; i < TM; ++i)
+ #pragma unroll
+@@ -1114,7 +1138,7 @@ mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X,
+ #pragma unroll
+         for (int j = 0; j < TN; ++j)
+ #pragma unroll
+-            for (int e = 0; e < 8; ++e) { const int t = t0 + wn * WTN + j * 16 + 2 * e + cn; if (t < T) D[(size_t) t * M + m] = acc[i][j][e]; } }
++            for (int e = 0; e < 8; ++e) { const int t = t0 + wn * WTN + j * 16 + MMB_ACC_M(e, cn); if (t < T) D[(size_t) t * M + m] = acc[i][j][e]; } }
+ }
+ 
+ // two tile classes: experts with >= thresh rows get BN_BIG-row tiles, the rest BN_SMALL-row tiles (fewer wasted rows on tiny experts)
+@@ -1246,14 +1270,14 @@ static const uint16_t * mmb_shadow_lookup(const ggml_tensor * w) {
+ bool mmb_enabled() {
+     static const int v = getenv("GGML_CUDA_MMB") ? atoi(getenv("GGML_CUDA_MMB")) : 0;
+     if (v == 0) return false;
+-    // The kernels use the first-gen gfx11 WMMA builtin (__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32),
+-    // which does not exist on gfx12. Default gate: RDNA3_5 (gfx1150/gfx1151) only -- it is the arch the
+-    // path is validated on and whose small-die LDS/WMMA behaviour this tiling was tuned for. RDNA3_0
+-    // (gfx1100/1101/1102) shares the builtin but is untested; GGML_CUDA_MMB_RDNA3=1 opens it for a
+-    // volunteer. (A compile-time split like gated_delta_net_chunked_bf16_gfx11.cu is still required
+-    // before this can be built at all for gfx1200/gfx1201.)
++    // The kernels select the WMMA builtin + fragment layout at compile time: gfx11 uses the first-gen
++    // `..._bf16_w32` builtin and the 16-half row fragment, gfx12 `..._bf16_w32_gfx12` and the 8-half
++    // "two runs of four" fragment (see the shim at the top of the file).  Default gate: RDNA3_5
++    // (gfx1150/gfx1151) and RDNA4 (gfx1200/gfx1201) -- the arches this tiling has been validated on.
++    // RDNA3_0 (gfx1100/1101/1102) shares the gfx11 path but is untested; GGML_CUDA_MMB_RDNA3=1 opens
++    // it for a volunteer.
+     const int cc = ggml_cuda_info().devices[0].cc;
+-    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) return true;
++    if (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) return true;
+     static const bool allow_rdna3 = getenv("GGML_CUDA_MMB_RDNA3") && atoi(getenv("GGML_CUDA_MMB_RDNA3")) != 0;
+     return allow_rdna3 && GGML_CUDA_CC_IS_RDNA3_0(cc);
+ }
+@@ -1308,6 +1332,17 @@ bool mmb_tall()    { return mmb_tall_mode() != 0; }
+ bool mmb_gatemix_flag() { static const int v = getenv("LLAMA_HC_GATEMIX") ? atoi(getenv("LLAMA_HC_GATEMIX")) : 0; return v != 0; }
+ bool mmb_down16_flag() { static const int v = getenv("GGML_CUDA_MMB_DOWN16") ? atoi(getenv("GGML_CUDA_MMB_DOWN16")) : 0; return v != 0; }
+ bool mmb_glu()     { static const int v = getenv("GGML_CUDA_MMB_GLU") ? atoi(getenv("GGML_CUDA_MMB_GLU")) : 1; return v != 0; }
++// Path policy for the generic *quantized* dense tile GEMM (a plain MUL_MAT -- attention qkv/o and
++// the dense MLP), as opposed to the routed MoE expert path and the qwen4exp HC paths (tall-M /
++// tiny-M / gate-mix), which have their own knobs below.  Off by default on RDNA4: the measurements
++// in wip/mmb-general/gfx1201-s5s7-mmb-results.md put every RDNA4 win on a routed/HC shape and the
++// dense big-M shapes on the losing side, so the two are separable and are kept separate here.
++// GGML_CUDA_MMB_DENSE forces it on/off for either arch for A/B.
++bool mmb_dense_flag() {
++    static const int v = getenv("GGML_CUDA_MMB_DENSE") ? atoi(getenv("GGML_CUDA_MMB_DENSE")) : -1;
++    if (v >= 0) return v != 0;
++    return !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[0].cc);
++}
+ // Tile-class threshold: experts with >= this many rows take the BN=128 tile, the rest the BN=32 one.
+ // The small tile re-dequantizes the same A panel once per jt tile (4x the weight dequant per output
+ // for a 128-row expert), so this is the knob that trades B-column padding against dequant volume.
+@@ -1320,6 +1355,56 @@ int mmb_routed_thresh() { static const int v = getenv("GGML_CUDA_MMB_ROUTED_THRE
+ // for re-measurement/tuning.
+ bool mmb_iq3xxs_glu() { static const int v = getenv("GGML_CUDA_MMB_IQ3XXS") ? atoi(getenv("GGML_CUDA_MMB_IQ3XXS")) : 0; return v != 0; }
+ 
++// ---------------------------------------------------------------------------------------------
++// Weight-type policy.  MMB's per-type kernels do NOT transfer between arches: on RDNA4 (gfx12)
++// the delivery's MMQ path is far better tuned than it was on gfx1151, and the measurement
++// (wip/mmb-general/gfx1201-s5s7-mmb-results.md) is unambiguous about which side each type is on:
++//   IQ family (IQ4_NL / IQ3_S / IQ4_XS / IQ3_XXS)  ->  MMB WINS   (+2.7 .. +11.8 %)
++//   Q8_0, Q5_1, Q3_K, Q4_K, Q5_K, Q6_K             ->  MMB LOSES  (-4.5 .. -12.7 %)
++// So the accepted set is ARCH-SCOPED, and the five hardcoded copies of it (dense/routed/mm/mmid/glu)
++// collapse into one mask here.  The graph's MMQ-fusion stand-down goes through these same
++// predicates (ggml-cuda.cu), so a type this returns false for costs nothing -- it simply keeps the
++// delivery's MMQ path and nothing is stood down for it.
++//
++// GGML_CUDA_MMB_TYPES=<csv of type names, e.g. iq4_xs,iq3_xxs,q8_0> overrides the set, so a future
++// gfx1201 per-type re-tune is validated without a rebuild (and without re-cutting the patch).
++static uint64_t mmb_wtype_mask() {
++    static uint64_t mask = 0;
++    static bool init = false;
++    if (init) return mask;
++    init = true;
++    const uint64_t IQ_FAMILY = (1ull << GGML_TYPE_IQ4_NL) | (1ull << GGML_TYPE_IQ3_S) |
++                               (1ull << GGML_TYPE_IQ4_XS) | (1ull << GGML_TYPE_IQ3_XXS);
++    const uint64_t K_AND_Q8  = (1ull << GGML_TYPE_Q8_0) | (1ull << GGML_TYPE_Q5_1) |
++                               (1ull << GGML_TYPE_Q3_K) | (1ull << GGML_TYPE_Q4_K) |
++                               (1ull << GGML_TYPE_Q5_K) | (1ull << GGML_TYPE_Q6_K);
++    const char * e = getenv("GGML_CUDA_MMB_TYPES");
++    if (e && *e) {
++        static const struct { const char * n; ggml_type t; } tab[] = {
++            {"iq4_nl", GGML_TYPE_IQ4_NL}, {"iq3_s", GGML_TYPE_IQ3_S}, {"iq4_xs", GGML_TYPE_IQ4_XS}, {"iq3_xxs", GGML_TYPE_IQ3_XXS},
++            {"q8_0", GGML_TYPE_Q8_0}, {"q5_1", GGML_TYPE_Q5_1}, {"q3_k", GGML_TYPE_Q3_K},
++            {"q4_k", GGML_TYPE_Q4_K}, {"q5_k", GGML_TYPE_Q5_K}, {"q6_k", GGML_TYPE_Q6_K},
++        };
++        for (const char * p = e; *p; ) {
++            while (*p == ',' || *p == ' ') ++p;
++            const char * q = p;
++            while (*q && *q != ',' && *q != ' ') ++q;
++            const size_t n = (size_t) (q - p);
++            if (n) for (const auto & x : tab) if (strlen(x.n) == n && strncmp(x.n, p, n) == 0) mask |= 1ull << x.t;
++            p = q;
++        }
++        int cnt = 0; for (uint64_t m = mask; m; m &= m - 1) ++cnt;
++        fprintf(stderr, "MMB: GGML_CUDA_MMB_TYPES=%s -> %d weight type(s)\n", e, cnt);
++        return mask;
++    }
++    mask = GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[0].cc) ? IQ_FAMILY : (IQ_FAMILY | K_AND_Q8);
++    return mask;
++}
++static bool mmb_wtype_ok(const ggml_type t) { return (uint64_t) t < 64 && ((mmb_wtype_mask() >> t) & 1ull) != 0; }
++// IQ3_XXS: its *routed* path is a win but its fused GLU / dense arm is a net loss on the UD-Q3_K_M
++// workload (see the mmb_iq3xxs_glu note above), so those two callers additionally require the env.
++static bool mmb_wtype_ok_glu(const ggml_type t) { return mmb_wtype_ok(t) && (t != GGML_TYPE_IQ3_XXS || mmb_iq3xxs_glu()); }
++
+ } // namespace
+ 
+ const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t) {
+@@ -1369,29 +1454,35 @@ uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const gg
+     return ggml_cuda_mmb_slot_reserve(ctx, 0, t, n);
+ }
+ 
++// The qwen4exp HC down/inject "tall-M" tile (IQ4_NL, small M, long K) -- a model-specific path, not
++// the generic dense GEMM, so it survives mmb_dense_flag() (see the note at that flag).
++static bool mmb_tall_shape(const ggml_type t, const int64_t K, const int64_t M, const int64_t T) {
++    return mmb_tall() && t == GGML_TYPE_IQ4_NL && M <= 384 && K >= 4096 && T >= 2048;
++}
++
+ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+     if (!mmb_enabled()) return false;
+-    const bool quant = src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q8_0 ||
+-                       src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_1 ||
+-                       src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K ||
+-                       src0->type == GGML_TYPE_IQ4_XS ||
+-                       src0->type == GGML_TYPE_IQ3_S ||
+-                       src0->type == GGML_TYPE_Q3_K || (src0->type == GGML_TYPE_IQ3_XXS && mmb_iq3xxs_glu()) ||
+-                       (src0->type == GGML_TYPE_Q6_K && mmb_shadow_q6k() && mmb_is_resident_q6k(src0) &&
+-                        mmb_shadow_lookup(src0) != nullptr);
+-    const bool bf16w = src0->type == GGML_TYPE_BF16 && mmb_bf16w();
+-    const bool f32cand = src0->type == GGML_TYPE_F32 && mmb_f32split();
+-    if ((!quant && !bf16w && !f32cand) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
++    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+     if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
+     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
+     const int64_t K = src0->ne[0], M = src0->ne[1];
++    const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
++    // The quantized types go through the generic dense tile GEMM, which loses on RDNA4 for *every*
++    // type measured (see mmb_dense_flag); the HC tall-M tile is model-specific and keeps its path.
++    const bool quant   = mmb_wtype_ok_glu(src0->type) && (mmb_dense_flag() || mmb_tall_shape(src0->type, K, M, T));
++    const bool bf16w   = src0->type == GGML_TYPE_BF16 && mmb_bf16w() && mmb_dense_flag();
++    const bool f32cand = src0->type == GGML_TYPE_F32 && mmb_f32split();
++    if (!quant && !bf16w && !f32cand) return false;
+     // shape-aware F32 (mode 1, default): take only the shapes where MMB beat rocBLAS (see the
+     // F32SPLIT comment above).  Mode 2 forces every F32 GEMM here; mode 0 never gets this far.
+-    const bool f32w = f32cand && (mmb_f32split_mode() >= 2 || (M >= mmb_f32split_min_m() && K >= mmb_f32split_min_k()) || mmb_tiny_m_f32_ok(K, M));
++    // The split *tile* is the generic MoE-router GEMM and follows mmb_dense_flag() (it loses on
++    // RDNA4 like the other dense GEMMs); the warp-per-token tiny-M kernel is the qwen4exp HC inject
++    // pair, a model-specific path, and stays allowed.
++    const bool f32w = f32cand && (mmb_tiny_m_f32_ok(K, M) ||
++                       (mmb_dense_flag() && (mmb_f32split_mode() >= 2 || (M >= mmb_f32split_min_m() && K >= mmb_f32split_min_k()))));
+     if (f32cand && !f32w) return false;   // this F32 shape is better on rocBLAS -- no fusion stand-down either
+     if ((f32cand ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
+     if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS) && K % 256 != 0) return false;   // whole 256-value super-blocks
+-    const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
+     if (T < mmb_min_t() || T > INT32_MAX / 4) return false;
+     return ggml_nrows(dst) == T;
+ }
+@@ -1409,7 +1500,7 @@ bool ggml_cuda_mmb_reads_bf16_act(const ggml_tensor * src0, const ggml_tensor *
+ 
+ bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
+     if (!mmb_enabled()) return false;
+-    const bool wtype = src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ3_XXS;
++    const bool wtype = mmb_wtype_ok(src0->type);
+     if (!wtype || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
+     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
+     const int64_t K = src0->ne[0], M = src0->ne[1], E = src0->ne[2];
+@@ -1542,14 +1633,11 @@ bool ggml_cuda_mmb_gatemix() { return mmb_gatemix_flag(); }
+ bool ggml_cuda_mmb_active() { return mmb_enabled(); }
+ bool ggml_cuda_mmb_dense_will_take(const ggml_tensor * w) {
+     if (!mmb_enabled() || !w) return false;
+-    switch (w->type) {
+-        case GGML_TYPE_IQ4_NL: case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_1: case GGML_TYPE_IQ3_S: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q3_K: case GGML_TYPE_IQ3_XXS: return true;
+-        default: return false;
+-    }
++    return mmb_wtype_ok(w->type) && mmb_dense_flag();
+ }
+ bool ggml_cuda_mmb_routed_will_take(const ggml_tensor * w) {
+     if (!mmb_enabled() || !w) return false;
+-    return w->type == GGML_TYPE_IQ4_NL || w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q5_1 || w->type == GGML_TYPE_IQ3_S || w->type == GGML_TYPE_Q8_0 || w->type == GGML_TYPE_Q5_K || w->type == GGML_TYPE_Q6_K || w->type == GGML_TYPE_IQ4_XS || w->type == GGML_TYPE_Q3_K || w->type == GGML_TYPE_IQ3_XXS;
++    return mmb_wtype_ok(w->type);
+ }
+ bool ggml_cuda_mmb_down16() { return mmb_down16_flag(); }
+ bool ggml_cuda_mmb_blk16() { static const int v = getenv("LLAMA_HC_BLK16") ? atoi(getenv("LLAMA_HC_BLK16")) : 0; return v != 0; }
+@@ -1644,7 +1732,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
+ bool ggml_cuda_mmb_supported_glu(const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
+     if (!mmb_enabled() || !mmb_glu() || !gw || !uw || !src1 || !ids || !glu) return false;
+         if (gw->type != uw->type) return false;
+-    const bool wtype = gw->type == GGML_TYPE_IQ4_NL || gw->type == GGML_TYPE_Q4_K || gw->type == GGML_TYPE_Q5_1 || gw->type == GGML_TYPE_IQ3_S || gw->type == GGML_TYPE_Q8_0 || gw->type == GGML_TYPE_Q5_K || gw->type == GGML_TYPE_Q6_K || gw->type == GGML_TYPE_IQ4_XS || gw->type == GGML_TYPE_Q3_K || (gw->type == GGML_TYPE_IQ3_XXS && mmb_iq3xxs_glu());
++    const bool wtype = mmb_wtype_ok_glu(gw->type);
+     if (!wtype) return false;
+     if (!ggml_are_same_shape(gw, uw) || gw->nb[1] != uw->nb[1] || gw->nb[2] != uw->nb[2]) return false;
+     if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) return false;
+-- 
+2.55.0
+

@@ -26,6 +26,19 @@ verified).  The S1/S2 record also gained a missing long-context text gate: with 
 byte-identical to the delivery, so G5/G4 are text-pure and the qsa3 delta is the approved
 re-baseline.  Next: S5-S7 (G1 `mmb`).
 
+**S5-S7 log (2026-09-21): G1 `mmb` is PORTED, but it is NOT a blanket win — the switch was split.**
+The gfx12 bf16 fragment shim landed and the gfx11 device asm is verified **bit-identical** (only the
+`__hip_cuid_*` source hash differs; opcode histogram byte-equal) — with the lesson that the gfx11
+fragment load must expand via a **macro**, not a `__device__` function (the dead argument perturbed
+the scheduler and broke bit-identity).  Correctness is PPL-parity (12.7378 vs 12.7221 over 7 chunks
+on the MoE IQ path).  But the measurement is unambiguous: with all types and the dense path on, MMB
+is a **−4…−13 % regression** on three models, while the wins are confined to the **routed MoE** and
+**qwen4exp HC** shapes.  So `GGML_CUDA_MMB` (which bundled arch × weight-type × path × model) was
+split into an arch-scoped **weight-type** policy (`mmb_wtype_ok`, one mask replacing five duplicated
+hard-coded lists) plus a **path** policy (`mmb_dense_flag`), and RDNA4 now defaults to the safe
+subset: IQ-family weights, routed/HC paths only, dense/router off.  Result: **neutral wherever it
+would lose, +3…+7 % where it wins**.  Full matrix: **`gfx1201-s5s7-mmb-results.md`**.
+
 **Audience:** whoever picks this up next — first on gfx1201, then on gfx1100.  Read this with
 `GROUPS.md` (the 5-group triage) and `HANDOVER.md` (the gfx1151 development record).  This file is
 the *porting* overlay; the group semantics stay as `GROUPS.md` describes.
@@ -59,8 +72,8 @@ the *porting* overlay; the group semantics stay as `GROUPS.md` describes.
 | Host | this box: **3× AMD Radeon AI PRO R9700 (gfx1201, RDNA4)**, Ryzen 9 9950X3D2, 184 GiB RAM |
 | ROCm | `/opt/rocm-7.14.1-gfx102X` (the build script's `ROCM_714`; supports `--offload-arch=gfx1201`); `/opt/rocm-7.14-gfx1201` is the older parallel install |
 | Delivery base | `~/llama.cpp` branch `rdna-boosts`, tip `c3ee45747` = the 16-block **r12** delivery (tree `8a80535e…`) |
-| WIP base | the same r12 applied tree; the 5 WIP patches apply **5/5 clean** onto it |
-| WIP working branch | `~/llama.cpp` is currently on **`mmb-5-ported`** (`e7cd749bc`, tree `c0f8ea75ba`) = the **delivered 5-patch set** (post-consolidation, G3a gate folded in).  Same tree as `rdna-boosts-mmb-port` (`bdf97a390`, the pre-consolidation tip).  Isolation branches `v-no-g5` / `v-no-g4` also exist locally (the A/B variants from S2).  **Do not push any of them.** |
+| WIP base | the same r12 applied tree; the WIP patches apply **6/6 clean** onto it |
+| WIP working branch | `~/llama.cpp` is currently on **`mmb-port-qsa3`** (tip `50b813085`, tree `580db5174574f10cc92fb1cefa72281a65c77b12`) = the **delivered 6-patch set**.  The set grew from 5 to 6 in S5-S7: patch 6 is the `mmb` RDNA4 fragment port + the scope split, because patches 1, **3 and 4** all touch `mmb.cu` so the change cannot be folded into one theme without a full re-cut (see `gfx1201-s5s7-mmb-results.md`).  Older local branches `mmb-5-ported` / `rdna-boosts-mmb-port` (tree `c0f8ea75ba`) and the S2 isolation variants `v-no-g5` / `v-no-g4` also exist.  **Do not push any of them.** |
 | Baseline worktree | `~/llama-base` (branch `rdna-boosts`, delivery only) — build the A/B baseline here |
 | Build | `cd ~/llama.cpp && BUILD_DIR=build-rocm ~/bin/build-llama-rocm-714` (ccache; see §3) |
 | Dense model | `/llm/models/Qwen3.8/27B/Q8_0/Qwen3.8-27B-Q8_0.gguf` |
@@ -202,20 +215,20 @@ Notes:
 
 ### 3.2 Apply the WIP
 
-The **delivered** 5-patch set (with the G3a arch gate folded into patch 3) lives in
-`wip/mmb-general/patches/`.  It applies `git am` **5/5** onto a fresh r12 tree and yields applied
-tree **`c0f8ea75ba`**:
+The **delivered** 6-patch set lives in `wip/mmb-general/patches/`.  It applies `git am` **6/6** onto a
+fresh r12 tree and yields applied tree **`580db5174574f10cc92fb1cefa72281a65c77b12`** (verified):
 
 ```sh
 # fresh build / iteration branch from the r12 delivery
 cd ~/llama.cpp && git checkout rdna-boosts && git checkout -b mmb-port-work
-git am /home/stew675/llama-cpp-rdna-boosts/wip/mmb-general/patches/*.patch   # 5/5
+git am /home/stew675/llama-cpp-rdna-boosts/wip/mmb-general/patches/*.patch   # 6/6
 ```
 
-The 2026-09-21 session's already-applied branches are kept for convenience: `mmb-5-ported`
-(`e7cd749bc`, tree `c0f8ea75ba`, the delivered set), `rdna-boosts-mmb-port` (`bdf97a390`, same tree),
-and the S2 isolation variants `v-no-g5` / `v-no-g4`.  `~/llama.cpp` is currently checked out on
-`mmb-5-ported`.  To reset: `git checkout rdna-boosts && git branch -D <branch>` and redo.
+The 2026-09-21 session's already-applied branches are kept for convenience: `mmb-port-qsa3`
+(`50b813085`, tree `580db5174`, the delivered set — **the current one**), `mmb-5-ported`
+(`e7cd749bc`, tree `c0f8ea75ba`, the pre-S5-S7 5-patch state), `rdna-boosts-mmb-port`
+(`bdf97a390`) and the S2 isolation variants `v-no-g5` / `v-no-g4`.  To reset: `git checkout
+rdna-boosts && git branch -D <branch>` and redo.
 
 ### 3.3 Run
 
@@ -261,7 +274,7 @@ Record every number in a new dated section of `WORKLOG.md` at the end (not in th
 | G4 | non-temporal hints (dsv4_hc, concat, moe-weighted-reduction, fused gated-unary) | **generic**, `GGML_CUDA_MMB_HC16`-independent code paths | none (A/B per kernel, loads only) | `dsv4_hc_pre` was −18.6 % on gfx1151; unknown on gfx1201 | low (a bad hint = regression, easy to drop) |
 | G3a | always-QSA prefill flip (drop the dense shortcut) | policy, applies to gfx1201 | none | gfx1201 already prefers QSA prefill from ~8K; the flip mainly removes the `n_kv<=2051` seam — **but** without qsa3 the VEC kernel serves it, so it may be ~neutral | low |
 | G2 | `qsa3` packed-block WMMA | **ported to RDNA4 2026-09-21** (was gfx11-only) | none left — re-measure/tune if wanted | qwen4exp prefill above ~2051; measured **+7.6..+11.5 %** on gfx1201 (`gfx1201-s4-qsa3-results.md`) | low (done) |
-| G1 | `mmb` bf16-WMMA dequant GEMM | **arch-gated RDNA3_5**, gfx12 no-op | RDNA4 bf16 fragment port (~7 sites) + re-tune | the big prize *if* baseline MMQ is weak; **unmeasured on gfx1201** | medium-high |
+| G1 | `mmb` bf16-WMMA dequant GEMM | **ported to RDNA4 2026-09-21, but scoped** (IQ family + routed/HC paths only) | a real gfx1201 dense tile geometry, per-type (S7+) | qwen4exp HC + MoE routed: **+3…+7 %**; dense: neutral-by-default (was −4…−13 % unscoped) | measured (`gfx1201-s5s7-mmb-results.md`) |
 | G3b/c | F32 shape split + tiny-M kernel | rides G1 | with G1 | router/hc-inject shapes | low once G1 works |
 | G4 | HC16 bf16 producers | rides G1 (`GGML_CUDA_MMB_HC16`, default 0) | after G1 | kills `mmb_cvt_f32_bf16`; +1-3 % on gfx1151 | low |
 
@@ -321,7 +334,12 @@ plan for the work follows.
   test), long-context same-seed A/B, PPL vs the dense oracle (`LLAMA_QSA_SPARSE_FA=0`) within noise.
 * **W=1..8 purity is preserved by construction** (prefill-only).  Re-run B7 anyway.
 
-### 6.5 G1 — `mmb` on RDNA4 (bf16/f16 WMMA)
+### 6.5 G1 — `mmb` on RDNA4 (bf16/f16 WMMA) — **DONE 2026-09-21: ported, but opt-in by type/path**
+
+**Status:** the port is done and gfx11-bit-identical, but RDNA4 defaults to a **restricted subset**
+(IQ-family weights, routed/HC paths) because MMB is a *net regression* with everything on.  See
+`gfx1201-s5s7-mmb-results.md` §4/§6 for the scope split and §7 for what a re-tune should attack.  The
+original plan for the work follows.
 
 This is the largest item.  Split it into three sub-steps so a failure is isolated:
 
@@ -353,9 +371,10 @@ Then replace the five kernels' fragment loads / WMMA calls / acc maps with the s
 generated code must be **bit-identical** (verify by the width probe and same-seed text before/after
 the shim alone).
 
-**6.5.2 Enable RDNA4 in the gate.**  `mmb_enabled()` gains
-`if (GGML_CUDA_CC_IS_RDNA4(cc)) return true;` (keep `GGML_CUDA_MMB_RDNA3` for RDNA3_0).  Add
-`GGML_CUDA_MMB_GFX12=0` as a debug kill-switch if useful.
+**6.5.2 Enable RDNA4 in the gate — DONE, but *scoped*.**  `mmb_enabled()` gained RDNA4, and the
+blanket type list was replaced by an arch-scoped `mmb_wtype_ok()` plus `mmb_dense_flag()` — see
+`gfx1201-s5s7-mmb-results.md` §4.  RDNA4's default is the IQ family with the generic dense GEMM and
+the F32 router off; `GGML_CUDA_MMB_TYPES` / `GGML_CUDA_MMB_DENSE` are the A/B overrides.
 
 **6.5.3 Re-tune (the gfx1151 constants are not assumed).**  The WIP's own §6 conclusion: tile knobs
 were a wash *on gfx1151*; that says nothing here.  Sweep at least `mmb_glu_thresh`/`mmb_routed_thresh`
@@ -415,9 +434,10 @@ checklist updated.
 | **S2** | arch-neutral wins | G5 indexer + G4 non-temporal applied and A/B'd; `GGML_OP_NAME` fill fix | long-context same-seed A/B + `INDEXER_TOPK` op oracle; per-kernel NT A/B |
 | **S3** | G3a policy | always-QSA measured on gfx1201 (VEC path); decide RDNA4 default | pp2048/p2048-at-depth + `-c 2048` coherence; document the decision |
 | **S4** | G2 `qsa3` RDNA4 port | f16 fragment port; gate extended | `FLASH_ATTN_QSA` 26/26 (3 new packed cases + a VEC baseline); +7.6/11.5/10.4 % prefill; long-context text re-baseline documented |
-| **S5** | G1 shim | `mmb` fragment shim; gfx11 code bit-identical | width probe + same-seed text unchanged on gfx1151 path (compile-time only here) |
-| **S6** | G1 on RDNA4 | gate enabled; first correctness run on the fast model | PPL parity + same-seed greedy on 35B-A3B |
-| **S7** | G1 re-tune + target | sweep the knobs; run the 27B Q8_0 and Flash-Next gates | baseline-vs-MMB prefill A/B; decision: default on/off |
+| **S5** | G1 shim | `mmb` fragment shim; gfx11 code bit-identical | gfx1151 device asm **byte-identical** but for `__hip_cuid_*`; opcode histogram equal |
+| **S6** | G1 on RDNA4 | gate enabled; first correctness run on the fast model | PPL parity 14.3981 vs 14.4087 (+0.07 %), MMB demonstrably running |
+| **S7** | G1 re-tune + target | measured the matrix; **split the switch** (arch-scoped weight types + path policy) | neutral where it loses, +3…+7 % where it wins; PPL parity on the active subset |
+| **S8** | G3b/c + HC16 + gates | F32/tiny-M/HC16; B1-B9 full matrix | all gates green; gating documented |
 | **S8** | G3b/c + HC16 + gates | F32/tiny-M/HC16; B1-B9 full matrix | all gates green; gating documented |
 | **S9** | handover to gfx1100 | update §10/§11; commit record | gfx1100 TODO list complete |
 
@@ -440,15 +460,18 @@ qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a g
 
 ## 9. Per-session record convention
 
-* Code goes in `~/llama.cpp` branch `rdna-boosts-mmb-port`.  Do **not** commit it to `rdna-boosts`.
+* Code goes in `~/llama.cpp` (a disposable WIP branch; `mmb-port-qsa3` at the S5-S7 tip).  Do **not**
+  commit it to `rdna-boosts`.
 * Regenerate the WIP backup after each code change and commit it to
   `llama-cpp-rdna-boosts` branch **`wip-mmb-general`** (never `main`):
   ```sh
-  cd ~/llama.cpp && git format-patch --start-number 1 <r12-tip>..HEAD -o /tmp/mmb  # or the 5-patch layout
+  cd ~/llama.cpp && git format-patch --start-number 1 <r12-tip>..HEAD -o /tmp/mmb   # the 6-patch layout
   # then copy into wip/mmb-general/ and commit the record on branch wip-mmb-general
   ```
-  The current 5-thematic-patch backup stays valid until a code change; a new tree needs a re-cut
-  (follow the `GROUPS.md` "consolidate 38→5" recipe and re-verify `git am` 5/5).
+  **`git am` 6/6, applied tree `580db5174574f10cc92fb1cefa72281a65c77b12`** (verified).  A code change
+  lands as a **new patch** by default: fold it into a theme only when the files it touches are owned by
+  exactly one patch.  Patches 1, **3 and 4** all touch `mmb.cu`, which is why the S5-S7 `mmb` work is
+  patch 6 rather than a fold.
 * Never push out of `~/llama.cpp` (`AGENTS.md` Pushing policy).
 * New gate numbers go in `WORKLOG.md` (dated, newest first), not in this plan.
 
@@ -456,7 +479,7 @@ qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a g
 
 ## 10. Live checklist
 
-- [x] WIP applies 5/5 and builds for gfx1201 (S1 — verified 2026-09-21, EXIT=0)
+- [x] WIP applies (5/5 at S1; now **6/6**) and builds for gfx1201 (S1 — verified 2026-09-21, EXIT=0)
 - [x] Baseline gates B1/B2/B3/B5/B6/B7 recorded; B4 decode identical (S1)
 - [x] G5 indexer measured — win, scales with depth (S2; `gfx1201-s1s2-results.md` §3b)
 - [x] G4 non-temporal A/B'd — small consistent win, kept (S2; interleaved rounds)
@@ -465,11 +488,15 @@ qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a g
 - [x] G2 qsa3 f16 RDNA4 port + gate (S4 — DONE 2026-09-21, tree `e9aa886ac`; +7.6/11.5/10.4 % prefill;
       `FLASH_ATTN_QSA` 26/26 incl. 3 new packed cases)
 - [x] G5/G4 long-context text purity (S4 — WIP with qsa3 off == delivery, byte-identical)
-- [ ] G1 mmb fragment shim, gfx11 bit-identical (S5)
-- [ ] G1 RDNA4 correctness (fast model) (S6)
-- [ ] G1 RDNA4 re-tune + baseline-vs-MMB decision (S7)
+- [x] G1 mmb fragment shim, gfx11 bit-identical (S5 — DONE: gfx1151 asm byte-identical but for `__hip_cuid`)
+- [x] G1 RDNA4 correctness (fast model) (S6 — DONE: PPL parity +0.07 %)
+- [x] G1 RDNA4 re-tune + baseline-vs-MMB decision (S7 — DONE: **split the switch**; scoped default
+      per `gfx1201-s5s7-mmb-results.md`; a per-type/gfx1201 dense tile geometry remains open)
 - [ ] G3b/c + HC16 + full gate matrix (S8)
 - [ ] gfx1100 handover written (§11) (S9)
+
+**Patch layout (current): 6 patches, tree `580db5174…`** — 1 mmb, 2 qsa3, 3 F32/tiny-M +
+width-probe, 4 HC16, 5 indexer, 6 the `mmb` RDNA4 port + scope split.
 
 ---
 
