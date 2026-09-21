@@ -1,0 +1,459 @@
+From 95d0427ed48a09c52708350b02ea4c6af1535d62 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 20 Sep 2026 21:01:26 -0500
+Subject: [PATCH 3/5] WIP: the F32/tiny-M kernels, the default flips, and the
+ W=1..8 width-purity probe
+
+Squashed theme commit (5 originals): F32 dense weights off by default + the
+always-QSA prefill flip (drops the dense shortcut); the shape-aware F32 dense
+split (MMB for the MoE router only); the warp-per-token tiny-M F32 kernel for
+the hc *_inject GEMMs; its MMAX=4 specialisation + TT sweep; and the W=1..8
+logits width-purity probe (a tools/ harness, the last promotion gate).
+---
+ ggml/src/ggml-cuda/mmb.cu         | 147 +++++++++++++++++++++++-
+ src/models/qwen4exp.cpp           |  32 ++++--
+ tests/CMakeLists.txt              |   1 +
+ tests/test-logits-width-probe.cpp | 185 ++++++++++++++++++++++++++++++
+ 4 files changed, 351 insertions(+), 14 deletions(-)
+ create mode 100644 tests/test-logits-width-probe.cpp
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 792ed5e0f..dd366ce15 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -969,6 +969,80 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
+ __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo) {
+     hi = __builtin_bit_cast(uint16_t, (_Float16) x); lo = __builtin_bit_cast(uint16_t, (_Float16) (x - (float) __builtin_bit_cast(_Float16, hi)));
+ }
++
++// ---------------------------------------------------------------------------
++// tiny-M F32 (the hc *_inject pair: M = hc = 4, K = 10240, T = 2048).
++//
++// Neither existing tile can help here.  M=4 offers no M parallelism, so rocBLAS launches
++// ceil(T/32)=64 blocks and the 128-row MMB tile pads the A panel 32x -- and BOTH read the 84 MB
++// activation exactly once (the memory floor is ~0.33 ms) yet measure 1.332 / 1.825 ms, i.e. ~63
++// GB/s.  The same part sustains ~330 GB/s on rms_norm_f32 (5.9 % of prefill, 1044 ms for
++// 84 MB read + 84 MB write per launch), so this is a *parallelism* wall, not a bandwidth or
++// arithmetic one: 16-64 blocks cannot keep enough loads in flight.
++//
++// The fix is to make the threads the parallelism.  One warp per token; every lane accumulates a
++// k-strided partial *for all M rows*, so X is read once, coalesced (consecutive lanes read
++// consecutive float4), and reused across M in registers.  grid = ceil(T / (MMB_NT/32)) = 256
++// blocks at T=2048, a 4-16x increase.  W is [M][K] and tiny (164 KB), so its panel reads are L2.
++//
++// Not bit-identical to rocBLAS (different summation order, and plain fp32 FMA rather than the
++// f16 hi/lo split) -- a prefill numerics change like the rest of the F32 work, so it is PPL-gated.
++// TT tokens per warp, default **1** (measured best).  The motivation for TT>1 was W traffic: each
++// lane walks a k-strided slice, so a warp collectively covers all of W (164 KB), and at 2048 warps
++// that is 336 MB from L2 against X's 84 MB from DRAM.  Amortising it does not pay: TT=2 and TT=4
++// measured *worse* (pp8192 954.8 / 952.3 vs 957.4 at TT=1), so L2 serves the W panels well enough
++// that the extra live registers and reduced block count cost more than the traffic saved.  Kept as
++// a knob because the balance is a property of this cache, not of the algorithm.
++template<int MMAX, int TT>
++__global__ void __launch_bounds__(MMB_NT)
++mmb_tiny_m_f32_kernel(const float * __restrict__ W, const float * __restrict__ X,
++                      float * __restrict__ D, const int M, const int K, const int T) {
++    constexpr int NWARPS = MMB_NT / 32;
++    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
++    const int t0 = (blockIdx.x * NWARPS + w) * TT;
++    const int nk4 = K >> 2;   // caller guarantees K % 4 == 0
++    float4 acc[TT][MMAX];
++#pragma unroll
++    for (int i = 0; i < TT; ++i)
++#pragma unroll
++        for (int m = 0; m < MMAX; ++m) acc[i][m] = make_float4(0.f, 0.f, 0.f, 0.f);
++    const float4 * xrow[TT];
++#pragma unroll
++    for (int i = 0; i < TT; ++i) {
++        const int t = t0 + i;
++        // out-of-range tokens get a valid dummy row; their results are dropped on the way out
++        xrow[i] = (const float4 *) (X + (size_t) (t < T ? t : 0) * K);
++    }
++    for (int k4 = lane; k4 < nk4; k4 += 32) {
++        const int k = k4 << 2;
++        float4 xv[TT], wv[MMAX];
++#pragma unroll
++        for (int i = 0; i < TT; ++i) xv[i] = xrow[i][k4];
++#pragma unroll
++        for (int m = 0; m < MMAX; ++m) wv[m] = (m < M) ? *(const float4 *) (W + (size_t) m * K + k) : make_float4(0.f, 0.f, 0.f, 0.f);
++#pragma unroll
++        for (int i = 0; i < TT; ++i)
++#pragma unroll
++            for (int m = 0; m < MMAX; ++m) {
++                acc[i][m].x += wv[m].x * xv[i].x; acc[i][m].y += wv[m].y * xv[i].y;
++                acc[i][m].z += wv[m].z * xv[i].z; acc[i][m].w += wv[m].w * xv[i].w;
++            }
++    }
++    // lane partial -> warp total, one shuffle tree reused for every (token, row)
++#pragma unroll
++    for (int i = 0; i < TT; ++i) {
++        const int t = t0 + i;
++        if (t >= T) continue;
++#pragma unroll
++        for (int m = 0; m < MMAX; ++m) {
++            if (m >= M) break;
++            float s = (acc[i][m].x + acc[i][m].y) + (acc[i][m].z + acc[i][m].w);
++#pragma unroll
++            for (int off = 16; off > 0; off >>= 1) s += __shfl_down(s, off);
++            if (lane == 0) D[(size_t) t * M + m] = s;
++        }
++    }
++}
+ template <int BM, int BN, int WTM, int WTN, bool TWO>
+ __global__ void __launch_bounds__(MMB_NT, 2)
+ mmb_f32split_kernel(const float * __restrict__ W, const float * __restrict__ X, float * __restrict__ D, const int M, const int K, const int T) {
+@@ -1158,8 +1232,49 @@ bool mmb_enabled() {
+     return allow_rdna3 && GGML_CUDA_CC_IS_RDNA3_0(cc);
+ }
+ int  mmb_min_t()   { static const int v = getenv("GGML_CUDA_MMB_MIN_T") ? atoi(getenv("GGML_CUDA_MMB_MIN_T")) : 512; return v; }
+-int  mmb_f32split_mode(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : 2; return v; }
+-bool mmb_f32split() { static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : 2; return v != 0; }
++// F32 dense weights: historically DEFAULT OFF (the 2026-09-19 session-4 note); SUPERSEDED by the
++// shape-aware default below.  Kept only for the measured history: a 16x256 small-M tile was tried
++// and is worse (870/847 vs 895/885 t/s -- BN=256 halves the block count).
++// F32 dense weights: SHAPE-AWARE, default ON since 2026-09-19.  These GEMMs are tiny-M and both
++// paths cost ~2.1 s at pp8192, but they do not agree on WHICH shape each wins.  Measured per shape
++// (the launcher grid is ceil(M/128) x ceil(T/128) workgroups, so the launch identity is exact):
++//
++//   ffn_gate_inp        M=512 K=2560    rocBLAS 2.044 ms   MMB 0.846 ms   -> MMB 2.4x
++//   hc_attn/ffn_inject  M=4   K=10240   rocBLAS 1.332 ms   MMB 1.825 ms   -> rocBLAS 1.37x
++//   ssm_alpha/beta      M=48  K=2560    rocBLAS 0.359 ms   MMB (slower)   -> rocBLAS
++//
++// **The discriminator is M alone -- do not "improve" it with a K rule.**  An earlier version of
++// this gate also took MMB for long K (>= 4096), expecting the hc inject pair (K=10240) to benefit
++// from the WMMA path; profiling it showed the opposite (1.825 vs 1.332 ms/launch) and cost 375 ms.
++// The trap that hid it: a first pass bucketed launches by grid alone, and the M<=128 bucket mixed
++// hc_inject (760) + ssm (576) + others into one 1.065 ms average, which looked like a win for MMB.
++// Split the bucket before believing a per-shape number.
++//
++// Why rocBLAS wins the small-M/short-K shapes: its MT32x32x8 kernel split-Ks hard (M=512/K=2560
++// launches 262144 blocks for ~1.0M outputs, i.e. ~64 threads per output, so it pays partial-sum
++// traffic) and loses the 2.4x there; on M=4/K=10240 the 128-row MMB tile wastes WMMA rows and loses.
++// Net with the M>=128 rule: 1947 -> ~1537 ms of F32 (about -3 % prefill).
++//
++// Modes: 0 = off (all rocBLAS), 1 = shape-aware (default), 2 = every F32 GEMM through MMB (the
++// pre-2026-09-19 behaviour, kept for A/B).
++int  mmb_f32split_mode(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : 1; return v; }
++bool mmb_f32split() { return mmb_f32split_mode() != 0; }
++// Defaults: MIN_M = 128 (the router; measured 2.4x better on MMB) and MIN_K = 0 (disabled -- the
++// long-K hc inject pair is *worse* on MMB despite the WMMA path; see the table above).
++int  mmb_f32split_min_k(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_K") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT_MIN_K")) : 0; return v; }
++int  mmb_f32split_min_m(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT_MIN_M") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT_MIN_M")) : 128; return v; }
++// tiny-M F32 (the hc *_inject pair): M=hc=4, K=10240.  Neither tile suits it (see
++// mmb_tiny_m_f32_kernel), so it gets its own warp-per-token kernel.  This has to be part of the
++// *gate* as well as the launcher -- an M-based rule that only admits M >= 128 would reject the
++// shape here and rocBLAS would run, silently, with the kernel never reached.
++bool mmb_tiny_m_f32_ok(const int64_t K, const int64_t M) {
++    static const int v = getenv("GGML_CUDA_MMB_TINY_M") ? atoi(getenv("GGML_CUDA_MMB_TINY_M")) : 1;
++    return v != 0 && M >= 1 && M <= 8 && K % 4 == 0;
++}
++int mmb_tiny_m_f32_tt() {
++    static const int v = getenv("GGML_CUDA_MMB_TINY_TT") ? atoi(getenv("GGML_CUDA_MMB_TINY_TT")) : 1;
++    return v;
++}
+ bool mmb_bf16w()    { static const int v = getenv("GGML_CUDA_MMB_BF16W") ? atoi(getenv("GGML_CUDA_MMB_BF16W")) : 1; return v != 0; }
+ bool mmb_hc16()    { static const int v = getenv("GGML_CUDA_MMB_HC16") ? atoi(getenv("GGML_CUDA_MMB_HC16")) : 0; return v != 0; }
+ int  mmb_tall_mode(){ static const int v = getenv("GGML_CUDA_MMB_TALL") ? atoi(getenv("GGML_CUDA_MMB_TALL")) : 2; return v; }
+@@ -1228,12 +1343,16 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
+                        (src0->type == GGML_TYPE_Q6_K && mmb_shadow_q6k() && mmb_is_resident_q6k(src0) &&
+                         mmb_shadow_lookup(src0) != nullptr);
+     const bool bf16w = src0->type == GGML_TYPE_BF16 && mmb_bf16w();
+-    const bool f32w  = src0->type == GGML_TYPE_F32 && mmb_f32split();
+-    if ((!quant && !bf16w && !f32w) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
++    const bool f32cand = src0->type == GGML_TYPE_F32 && mmb_f32split();
++    if ((!quant && !bf16w && !f32cand) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+     if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
+     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
+     const int64_t K = src0->ne[0], M = src0->ne[1];
+-    if ((f32w ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
++    // shape-aware F32 (mode 1, default): take only the shapes where MMB beat rocBLAS (see the
++    // F32SPLIT comment above).  Mode 2 forces every F32 GEMM here; mode 0 never gets this far.
++    const bool f32w = f32cand && (mmb_f32split_mode() >= 2 || (M >= mmb_f32split_min_m() && K >= mmb_f32split_min_k()) || mmb_tiny_m_f32_ok(K, M));
++    if (f32cand && !f32w) return false;   // this F32 shape is better on rocBLAS -- no fusion stand-down either
++    if ((f32cand ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
+     if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS) && K % 256 != 0) return false;   // whole 256-value super-blocks
+     const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
+     if (T < mmb_min_t() || T > INT32_MAX / 4) return false;
+@@ -1264,6 +1383,24 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     { static const int lg = getenv("GGML_CUDA_MMB_LOG") ? atoi(getenv("GGML_CUDA_MMB_LOG")) : 0;
+       if (lg) { static unsigned cnt = 0; if (cnt++ < 80) fprintf(stderr, "MMB_DENSE %s type=%s M=%d K=%d T=%d\n", src0->name, ggml_type_name(src0->type), M, K, T); } }
+     if (src0->type == GGML_TYPE_F32) {
++        // tiny-M (the hc *_inject pair, M=hc=4): a warp-per-token kernel beats both tiles by a
++        // wide margin -- see the mmb_tiny_m_f32_kernel comment.  Wide-M F32 (the MoE router,
++        // M=512) keeps the WMMA f16-split tile, which is 2.4x faster than rocBLAS there.
++        if (mmb_tiny_m_f32_ok(K, M)) {
++            constexpr int NWARPS = MMB_NT / 32;
++            const int tt = mmb_tiny_m_f32_tt();
++            const bool wide = M > 4;   // M <= 4 fits TT accumulators with MMAX=4; above that, one token
++            const int eff  = wide ? 1 : (tt >= 4 ? 4 : (tt == 2 ? 2 : 1));
++            dim3 tg((T + NWARPS * eff - 1) / (NWARPS * eff));
++            const float * Wf = (const float *) src0->data;
++            const float * Xf = (const float *) src1->data;
++            float * Df = (float *) dst->data;
++            if (wide)      mmb_tiny_m_f32_kernel<8, 1><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++            else if (eff == 4) mmb_tiny_m_f32_kernel<4, 4><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++            else if (eff == 2) mmb_tiny_m_f32_kernel<4, 2><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++            else               mmb_tiny_m_f32_kernel<4, 1><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++            CUDA_CHECK(cudaGetLastError()); return;
++        }
+         dim3 grid((M + 127) / 128, (T + 127) / 128);
+         static const bool two = getenv("LLAMA_MMB_F32SPLIT") && atoi(getenv("LLAMA_MMB_F32SPLIT")) >= 2;
+         if (two) mmb_f32split_kernel<128, 128, 32, 64, true ><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index d61eac7ed..32dc271c0 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1798,9 +1798,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+         const int64_t r     = hparams.dsv4_compress_ratios[il];
+         const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
+         const int64_t width = (int64_t) hparams.indexer_top_k + r - 1;
+-        // LLAMA_QSA_DENSE_SHORTCUT: dense shortcut below the selection width, DEFAULT ON (B parity;
+-        // the env name matches B for cross-testing). It was opt-in default OFF while a llama-bench-
+-        // only multi-ubatch artifact (pp4096+@0 rows slower with the shortcut on) lacked a root
++        // LLAMA_QSA_DENSE_SHORTCUT: attend dense while every cell is still selected (n_kv <= the
++        // selection width).  **DEFAULT OFF as of 2026-09-19 = always QSA** (the env name matches B
++        // for cross-testing; LLAMA_QSA_DENSE_SHORTCUT=1 restores the dense shortcut).
++        //
++        // It was DEFAULT ON for B parity, on the reasoning that below the width the top-k selects
++        // every cell, so sparse attention saves no work while still paying the indexer + top-k.
++        // That stopped being true once qsa3 landed: measured at pp2048 (single ubatch, every cell
++        // selected, gfx1151) the qsa3 attention kernel is 137.8 ms vs 149.9 ms for the dense
++        // flash_attn_ext_f16 - i.e. qsa3 is already 8 % faster on the attention even when nothing
++        // is skipped.  The path only still lost because the indexer + top-k (20.9 ms) costs more
++        // than the kernel saves (12.1 ms), so the shortcut's net value had fallen to ~1 % at short
++        // prefill and ~0 at depth.  It also left a numerics discontinuity at n_kv == width and kept
++        // qsa3 out of every <= 2051-token validation (a `-c 2048` PPL exercise was silently dense).
++        // Removing the split makes the prefill attention path uniform and always exercised; the
++        // remaining gap is an indexer/top-k cost to attack, not a reason to keep two regimes.
++        //
++        // History (kept because it documents the alternative): the shortcut was once opt-in OFF
++        // while a llama-bench-only multi-ubatch artifact (pp4096+@0 slower with it on) lacked a root
+         // cause. Root-caused 2026-09-08/09: llama-bench's sync-free decode pipeline x ggml-gallocr's
+         // single-layout alloc-fallback doing an unconditional full-device sync on every dense/sparse
+         // topology flip (record: benchmarks/2026-09-10-*-shortcut-fix.md).  NOTE (2026-09-06): the
+@@ -1808,14 +1823,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+         // must grow) was UNSAFE across backends and has been reverted: a re-reserve re-points tensor
+         // addresses while the previous ubatch's kernels may still be in flight on other GPUs
+         // (cross-GPU race -> in-kernel spin / memory faults at multi-ubatch prefill, reproduced on
+-        // 3x R9700 gfx1201).  The per-flip full-device sync is back (upstream behavior) and the
+-        // shortcut stays DEFAULT ON on top of it.  Numerics below the width == the
+-        // LLAMA_QSA_SPARSE_FA=0 masked-dense path (the difference from the selection default is the
+-        // known dense-vs-sparse kernel signature, an env-selectable regime). =0 forces the selection
+-        // path (the pre-flip known-good numerics) either way.
++        // 3x R9700 gfx1201).  The per-flip full-device sync is back (upstream behavior).  Note the
++        // dense path's numerics below the width equal the LLAMA_QSA_SPARSE_FA=0 masked-dense path -
++        // useful as a cross-check, and still reachable with LLAMA_QSA_DENSE_SHORTCUT=1.  Decode is
++        // unaffected by this default either way: it stays dense via qsa_dense_decode_until below.
+         static const bool shortcut = [] {
+             const char * env = getenv("LLAMA_QSA_DENSE_SHORTCUT");
+-            return env == nullptr || atoi(env) != 0;
++            return env != nullptr && atoi(env) != 0;
+         }();
+         // ARCH POLICY (2026-09-07 crossover tables, pp2048/tg64 bf16 KV, discovery record):
+         // decode uses the plain dense attend while n_kv < the per-arch crossover depth and
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index e4a3846b7..da7fb5de4 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -150,6 +150,7 @@ endif ()
+ 
+ llama_build(test-recurrent-state-rollback.cpp)
+ llama_build(test-recurrent-state-depth.cpp)
++llama_build(test-logits-width-probe.cpp)
+ llama_build(test-save-load-state.cpp)
+ 
+ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+diff --git a/tests/test-logits-width-probe.cpp b/tests/test-logits-width-probe.cpp
+new file mode 100644
+index 000000000..9b6066f4f
+--- /dev/null
++++ b/tests/test-logits-width-probe.cpp
+@@ -0,0 +1,185 @@
++// W = 1..8 logits purity probe -- the delivery's §11 promotion gate item 1
++// ("`W = 1..8` logits matrix with GGML_CUDA_MMB=1 == off").
++//
++// Method (adapted from archive/work/strix-halo/issue25/logits-width.cpp): feed an
++// identical prefix as ONE prefill batch, then decode a W-token batch
++// [t_P .. t_{P+W-1}].  Row j of that batch sees exactly the same context for every
++// W (the tokens before it and its own position are identical), so its logits must
++// not depend on W.  Any difference is a verify-batch width dependence, isolated
++// from MTP/spec logic.
++//
++// Two things are checked:
++//   1. width purity  -- row 0 must hash the same for every W, and every row shared
++//      with the widest batch (W=8) must match it bit for bit.
++//   2. MMB on == off -- run the probe twice, with GGML_CUDA_MMB=0 and =1, and diff
++//      the per-W hashes.  MMB is gated T >= 512 and the band is W <= 8, so MMB
++//      must never be reachable here; this is the demonstration of that claim.
++//
++// Usage:
++//   test-logits-width-probe model.gguf text.txt [P=256] [ubatch=512]
++// Env: RS=0|from_w|<n>  pins llama_context_params.n_rs_seq (default 0 = plain decode)
++//      FA=0|1|auto     (default auto)
++//      KV=f16|bf16|q8_0|q4_0|... (default f16)
++// Exit: 0 all rows bit-identical across widths, 2 otherwise.
++
++#include "llama.h"
++#include "ggml-backend.h"
++#include "ggml.h"
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++static uint64_t fnv1a(const void * p, size_t n) {
++    const uint8_t * b = (const uint8_t *) p;
++    uint64_t h = 1469598103934665603ULL;
++    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ULL; }
++    return h;
++}
++
++static ggml_type kv_from_env() {
++    const char * s = getenv("KV");
++    if (!s) return GGML_TYPE_F16;
++    if (!strcmp(s, "f16"))   return GGML_TYPE_F16;
++    if (!strcmp(s, "bf16"))  return GGML_TYPE_BF16;
++    if (!strcmp(s, "q8_0"))  return GGML_TYPE_Q8_0;
++    if (!strcmp(s, "q4_0"))  return GGML_TYPE_Q4_0;
++    if (!strcmp(s, "q4_1"))  return GGML_TYPE_Q4_1;
++    if (!strcmp(s, "q5_0"))  return GGML_TYPE_Q5_0;
++    if (!strcmp(s, "q5_1"))  return GGML_TYPE_Q5_1;
++    if (!strcmp(s, "iq4_nl"))return GGML_TYPE_IQ4_NL;
++    fprintf(stderr, "unknown KV=%s\n", s);
++    exit(1);
++}
++
++static constexpr int NW = 8;   // widths 1..8
++
++typedef void (*llama_log_cb)(ggml_log_level, const char *, void *);
++static void quiet_log(ggml_log_level, const char *, void *) {}
++
++int main(int argc, char ** argv) {
++    if (argc < 3) {
++        fprintf(stderr, "usage: %s model.gguf text.txt [P=256] [ubatch=512]\n", argv[0]);
++        return 1;
++    }
++    const char * model_path = argv[1];
++    const char * text_path  = argv[2];
++    const int P      = argc > 3 ? atoi(argv[3]) : 256;
++    const int ubatch = argc > 4 ? atoi(argv[4]) : 512;
++
++    // this fork logs every tensor load at INFO; keep the probe's own output parseable
++    llama_log_set(quiet_log, nullptr);
++
++    ggml_backend_load_all();
++    llama_backend_init();
++
++    llama_model_params mp = llama_model_default_params();
++    mp.n_gpu_layers = 99;
++    llama_model * model = llama_model_load_from_file(model_path, mp);
++    if (!model) { fprintf(stderr, "model load failed\n"); return 1; }
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++
++    std::string text;
++    { FILE * f = fopen(text_path, "rb"); if (!f) { perror("text"); return 1; }
++      char buf[65536]; size_t r; while ((r = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, r); fclose(f); }
++
++    std::vector<llama_token> toks(8192);
++    int n = llama_tokenize(vocab, text.data(), (int) text.size(), toks.data(), (int) toks.size(), false, false);
++    if (n < 0) { fprintf(stderr, "tokenize failed (need %d)\n", -n); return 1; }
++    if (n < P + NW) { fprintf(stderr, "text too short: %d tokens, need %d\n", n, P + NW); return 1; }
++
++    const int n_vocab = llama_vocab_n_tokens(vocab);
++    const ggml_type kv_type = kv_from_env();
++    printf("tokens=%d P=%d ubatch=%d widths=1..%d KV=%s\n", n, P, ubatch, NW, ggml_type_name(kv_type));
++
++    // rows[w-1] = the logits of every row of the W-token batch, in row order
++    std::vector<std::vector<float>> rows[NW];
++
++    for (int W = 1; W <= NW; ++W) {
++        llama_context_params cp = llama_context_default_params();
++        // n_batch is the max tokens per llama_decode call (the whole prefill batch),
++        // n_ubatch the max per micro-batch -- they are NOT the same knob.
++        cp.n_ctx = 4096; cp.n_batch = P > ubatch ? P : ubatch; cp.n_ubatch = ubatch; cp.n_seq_max = 1;
++        // Replicate the MTP verify-batch recurrent-state snapshot count: common sets
++        // n_rs_seq = draft.n_max, so a W-token batch with n_max = W-1 uses n_rs_seq = W-1.
++        {
++            const char * rs = getenv("RS");
++            cp.n_rs_seq = (rs == nullptr) ? 0u
++                        : (strcmp(rs, "from_w") == 0) ? (uint32_t) (W - 1)
++                        : (uint32_t) atoi(rs);
++        }
++        {
++            const char * fa = getenv("FA");
++            cp.flash_attn_type = (fa && (!strcmp(fa, "0") || !strcmp(fa, "off"))) ? LLAMA_FLASH_ATTN_TYPE_DISABLED
++                                : (fa && (!strcmp(fa, "1") || !strcmp(fa, "on")))  ? LLAMA_FLASH_ATTN_TYPE_ENABLED
++                                : LLAMA_FLASH_ATTN_TYPE_AUTO;
++        }
++        cp.type_k = kv_type; cp.type_v = kv_type;
++        llama_context * ctx = llama_init_from_model(model, cp);
++        if (!ctx) { fprintf(stderr, "ctx init failed (W=%d)\n", W); return 1; }
++
++        // the prefill batch holds P tokens, so size the batch for P (not just n_ubatch)
++        llama_batch b = llama_batch_init(cp.n_batch, 0, 1);
++        b.n_tokens = 0;
++        for (int i = 0; i < P; ++i) {
++            b.token[b.n_tokens] = toks[i]; b.pos[b.n_tokens] = i;
++            b.n_seq_id[b.n_tokens] = 1; b.seq_id[b.n_tokens][0] = 0; b.logits[b.n_tokens] = 0;
++            b.n_tokens++;
++        }
++        if (llama_decode(ctx, b) != 0) { fprintf(stderr, "prefill decode failed (W=%d)\n", W); return 1; }
++
++        b.n_tokens = 0;
++        for (int j = 0; j < W; ++j) {
++            b.token[b.n_tokens] = toks[P + j]; b.pos[b.n_tokens] = P + j;
++            b.n_seq_id[b.n_tokens] = 1; b.seq_id[b.n_tokens][0] = 0; b.logits[b.n_tokens] = 1;
++            b.n_tokens++;
++        }
++        if (llama_decode(ctx, b) != 0) { fprintf(stderr, "batch decode failed (W=%d)\n", W); return 1; }
++
++        for (int j = 0; j < W; ++j) {
++            const float * l = llama_get_logits_ith(ctx, j);
++            if (!l) { fprintf(stderr, "no logits for row %d (W=%d)\n", j, W); return 1; }
++            rows[W - 1].push_back(std::vector<float>(l, l + n_vocab));
++        }
++        llama_batch_free(b);
++        llama_free(ctx);
++    }
++
++    // width purity: every row shared with the widest batch (W=8) must match it
++    int bad = 0;
++    float worst = 0.0f;
++    for (int W = 1; W <= NW; ++W) {
++        float wmax = 0.0f;
++        int   jmax = -1;
++        for (int j = 0; j < W; ++j) {
++            const std::vector<float> & a = rows[W - 1][j];
++            const std::vector<float> & b = rows[NW - 1][j];
++            for (size_t k = 0; k < a.size(); ++k) {
++                const float d = std::fabs(a[k] - b[k]);
++                if (d > wmax) { wmax = d; jmax = j; }
++            }
++        }
++        if (wmax != 0.0f) bad++;
++        if (wmax > worst) worst = wmax;
++        // hash the float bytes of every row, not the std::vector objects
++        uint64_t h = 1469598103934665603ULL;
++        for (int j = 0; j < W; ++j) h ^= fnv1a(rows[W - 1][j].data(), (size_t) n_vocab * sizeof(float));
++        printf("W=%d rows=%d hash=%016llx maxdiff_vs_W8=%.6g%s\n",
++               W, W, (unsigned long long) h, wmax, wmax == 0.0f ? "" : "   <-- DIFFERS");
++    }
++    printf("row0_row1_hashes: ");
++    for (int W = 1; W <= NW; ++W) {
++        uint64_t h0 = fnv1a(rows[W - 1][0].data(), (size_t) n_vocab * sizeof(float));
++        uint64_t h1 = W >= 2 ? fnv1a(rows[W - 1][1].data(), (size_t) n_vocab * sizeof(float)) : 0;
++        printf("%d:%016llx/%016llx ", W, (unsigned long long) h0, (unsigned long long) h1);
++    }
++    printf("\nwidth_purity=%s (worst maxdiff %.6g)\n", bad ? "FAIL" : "PASS", worst);
++
++    llama_model_free(model);
++    llama_backend_free();
++    return bad ? 2 : 0;
++}
+-- 
+2.55.0
+

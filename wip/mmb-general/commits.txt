@@ -1,38 +1,5 @@
-c1bda48d470f7fcedae6c65b4545cf5c6260dd29 WIP indexer: replace the gather's Hillis-Steele scan with a warp-shuffle one
-4d5b91b17decd63efe29d8003572156ec3e65cbd WIP mmb: preload the IQ3_S block fields into registers in load_regs (the GLU's dequant ran exposed)
-8a250cb0d2b8fcbfc64fb80f17c8153fc9ce0961 WIP mmb: tile-class threshold 128 -> BN_SMALL (the small tile re-dequantizes the A panel)
-7ecb1a078fe4a435af7a80dc15392ce99cc53430 WIP mmb: split the IQ3_S A-panel dequant across the threads sharing a row
-07eb5d4835aafc999f46888daaf785f1fff1f3ec WIP mmb: v_perm bf16 pack in the dequants (all but the IQ3 LUT paths)
-bb03c1965785a32466ef43f594a8dd2ffad25472 WIP mmb: A-panel double-buffered GLU tile (IQ3_S) -- the dequant overlaps WMMA
-8e8a55ac59d1b6e2da44d0ffe11c873d3c340a76 WIP indexer: warp-reduce the block-pass visible-count atomic
-a8280003d6223a274209704d1722e34102da5c24 WIP indexer: accumulate pass1 histogram bins per block instead of per cell
-2ae378e16e01a05131ffef000313885ecd823de1 WIP indexer: block-level histogram path (blk_cells src + block-aligned partition; bitmap-identical)
-c2e18340c3464efcdf328c166eb58c721e3b994c WIP indexer: block-key sharing in the histograms and gather (additive==null path; bitmap-identical)
-9edefb08d4d343fbee0d8befcde55009c55e84dd WIP indexer: drop the full-width count pass (derive the gather's per-block g/e counts from the radix histograms)
-c75a68a2b705db78ce7a0ef4412ef0c58164f0d7 WIP qsa3: gate the packed-block path at COMPILE time (LLAMA_QSA3_ENABLE, default 1)
-d0e0f833b8c1592b6b68a41a2ef62ef30823753a WIP HC16: non-temporal loads in the fused gated-unary producer (+ ggml_cuda_nt_load helper)
-a93db1dbb3a43d26e813a13d8b4723b7fc9de0bc WIP HC16: non-temporal LOADS in concat_transposed_src1_dim0 and moe_weighted_reduction
-fd06f9b436af3146513891d65e28458f5e054362 WIP HC16: non-temporal accesses in the dsv4_hc pre/post kernels
-962fa8199f0281417873bca28ae3678fe8351479 WIP HC16: make the HC normalized stream xn BF16-only
-9274dcd66803a104b5c4ff42c2a071867dbdd4d5 WIP HC16: skip the dead F32 store when every consumer reads the BF16 copy
-d0eaefc937296a68e55a0214f8e503507e6fc10d WIP HC16: native-bf16 producers for the remaining HC/attention activations
-e5bf7315772b15beed4c3e72ed174c808e457814 ggml: add the missing INDEXER_FILL entry to GGML_OP_NAME
-bf492761c024e10c5dd4e654f8966cef4d4cee35 WIP HC16: native-BF16 producers for the HC gate and normalized stream
-72d18ab71afecb006c43016f3c47ecba9e809976 WIP qsa3: fuse the pack into one launcher pass (session 7)
-ce5902636c28960c5dc8aa75ecc553a32718906f WIP: W=1..8 logits width-purity probe (the last promotion gate)
-9d8aad09af6cd6fdf6787c1bfd284e06f022a0ab WIP: tune the tiny-M F32 kernel (MMAX=4 specialisation + TT sweep)
-98b719b54e7733e8be4fc39b5a529c31c30e19ad WIP: warp-per-token tiny-M F32 kernel for the hc *_inject GEMMs
-6245f5471418a90595294f5af16d6c34966483dc WIP: shape-aware F32 dense-weight split (MMB for the MoE router only)
-48d2832754d3bf34f84d5f4b7b63bcdd02686335 WIP: default F32 dense weights off, and always-QSA prefill (drop the dense shortcut)
-0810e0a671a7a768b851fb8574e13f0f500960f7 WIP qsa3: bitmap counting sort in qsa3_rows_kernel (441 -> 25.5 ms)
-66b375d8b553ce498cf78719c50e201cffd28140 WIP qsa3: support every KV cache type, not just the native pair
-58129238dd1987017b1d18dfc4bcab22906a3fb6 WIP qsa3: packed-block WMMA prefill for the QSA sparse attention
-33f13d52b4760ae60b8774d4fc91ceefc516f775 WIP mmb: gated MMB diagnostics (shape log + big/small tile override)
-314beeef76612bfee5848a667cf1787c95ac9894 WIP mmb: Q3_K (WTYPE 9) and IQ3_XXS (WTYPE 10)
-22104e39bc8193f2086dd06a228447e174bdbf72 WIP mmb: on-the-fly IQ4_XS (WTYPE 8) for dense + routed/GLU
-88e912b32d7594fbd5d53ac149344f6fd5fb706b WIP mmb: on-the-fly Q5_K and Q6_K dequant (WTYPE 6/7) for dense + routed/GLU
-4fb7dec893f72d2f55fccc48855deaaf350af147 WIP mmb: Q8_0 in the routed/GLU expert path
-4c26f0d14901c8463b411c69c97770f319073fb7 WIP mmb: portable WMMA wrappers (RDNA4 no-op) so the multi-arch build compiles; gfx1201 TU verified
-723e5ff0395061c5151fd9a4ee15a5c8a742ca7c WIP mmb: IQ3_S routed experts (WTYPE 5, on-the-fly grid/sign dequant)
-ef2a49cd456434385dd2ba702451ce27c2311334 WIP mmb: routed Q4_K/Q5_1 (expert GLU + down), RDNA3_5-default gate
-28f8d2398d0955e58f62aabf20d045a6d6027a2e WIP mmb: generalize to dense Q4_K/Q5_1, RDNA3 arch gate, per-weight-type fusion stand-down
+90bf1299745b0bdffdcd23f2f6f4cb807a5ed69d WIP indexer: the fused indexer top-k op (radix + deterministic gather)
+dbf6e6951e13d0f8dd41485f9d95001948900f4f WIP HC16: native-BF16 producers for the HC/attention activations + non-temporal accesses
+95d0427ed48a09c52708350b02ea4c6af1535d62 WIP: the F32/tiny-M kernels, the default flips, and the W=1..8 width-purity probe
+160c157a8f66728ae1b081a492a8ba24d5261d67 WIP qsa3: the packed-block WMMA sparse-attention path for QSA
+5f522c1564161f653bf29a276006d32fb050b135 WIP mmb: the general-purpose bf16-WMMA dequant weight GEMM (all weight types)

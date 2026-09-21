@@ -1,35 +1,22 @@
-From 58129238dd1987017b1d18dfc4bcab22906a3fb6 Mon Sep 17 00:00:00 2001
+From 160c157a8f66728ae1b081a492a8ba24d5261d67 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
-Date: Sat, 19 Sep 2026 20:51:33 -0500
-Subject: [PATCH 10/38] WIP qsa3: packed-block WMMA prefill for the QSA sparse
- attention
+Date: Sun, 20 Sep 2026 21:01:26 -0500
+Subject: [PATCH 2/5] WIP qsa3: the packed-block WMMA sparse-attention path for
+ QSA
 
-Ports the Strix Halo branch's qsa-attn (rows/merge/attn kernels) onto the
-delivery's GGML_OP_FLASH_ATTN_QSA:
-
-- ggml.h/ggml.c: ggml_flash_attn_qsa_set_packed(src[7]=packed_keys,
-  src[8]=packed_values); the pack itself is a pure graph composition
-  (reshape+permute+cont), so no new ggml op.
-- qwen4exp.cpp: build the packs for the prefill band (n_tps>=128, n_stream==1,
-  F16/BF16 cache, n_kv%4==0) when GGML_CUDA_QSA3=1; a bf16 cache is cast to f16.
-- fattn-qsa3.cu: rows+merge union descriptor (4 queries/group), and the
-  16x16x16 F16 WMMA attn kernel (48 rows = 4 queries x 12 heads, 4 key blocks
-  per chunk).  Supports both the mask and the derived-visibility (cell_vis/
-  q_vis) paths.  Portable wrapper so gfx1201/gfx1100 still compile.
-- gated prefill-only (q->ne[1]>=128 + RDNA3_5), so the W=1..8 band keeps the
-  VEC kernel and width purity holds by construction.
-
-gfx1151, IQ4_XS, bf16 KV: pp4096 833->875 (+5.0%), pp8192 787->860 (+9.3%);
-wikitext PPL parity (c16384 3.3932/3.3900, c32768 4.3378/4.3353); greedy text
-coherent, ~40 tokens identical then the approved prefill re-baseline.
+Squashed theme commit (5 originals): packed-block WMMA prefill for the QSA
+sparse attention; support for every KV cache type (not just the native pair);
+the bitmap counting sort in qsa3_rows_kernel (441 -> 25.5 ms); the fused pack
+into one launcher pass; and the COMPILE-time gate (LLAMA_QSA3_ENABLE, default 1,
+which replaced the rocprofiler-register-racy env gate).
 ---
  ggml/include/ggml.h              |   8 +
  ggml/src/ggml-cuda/fattn-qsa.cu  |   8 +
  ggml/src/ggml-cuda/fattn-qsa.cuh |   4 +
- ggml/src/ggml-cuda/fattn-qsa3.cu | 540 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/fattn-qsa3.cu | 653 +++++++++++++++++++++++++++++++
  ggml/src/ggml.c                  |  26 ++
- src/models/qwen4exp.cpp          |  40 +++
- 6 files changed, 626 insertions(+)
+ src/models/qwen4exp.cpp          |  67 ++++
+ 6 files changed, 766 insertions(+)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa3.cu
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
@@ -84,10 +71,10 @@ index d44d06be9..2fae29ceb 100644
 +bool ggml_cuda_flash_attn_qsa3_supported(int device, const ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/fattn-qsa3.cu b/ggml/src/ggml-cuda/fattn-qsa3.cu
 new file mode 100644
-index 000000000..79cb62eb1
+index 000000000..d5764a798
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/fattn-qsa3.cu
-@@ -0,0 +1,540 @@
+@@ -0,0 +1,653 @@
 +#include "common.cuh"
 +#include "fattn-qsa.cuh"
 +#include <cstdio>
@@ -101,7 +88,8 @@ index 000000000..79cb62eb1
 +// (48 output rows) and runs the score and PV passes on the F16 WMMA tensor cores over a
 +// package of 4 key blocks (16 keys) at a time.
 +//
-+// It consumes the packed F16 layouts the graph builds in qwen4exp.cpp (op src[7]/src[8]):
++// It consumes the packed F16 layouts built by the launcher's fused pack kernels below from the natural
++// contiguous F16 cache view (op src[7]/src[8], `ggml_flash_attn_qsa_set_packed`):
 +//   pk  [16, 4, 16, n_kv/4*n_kvh]   F16   keys, 4-key blocks, (a, k, b, n) at a+16k+64b+1024n
 +//   pv  [ 4, 256, n_kv/4*n_kvh, 1]  F16   values, (k, d, n) at k+4d+1024n
 +// and derives the per-group block union here (rows/merge kernels), so the attention kernel
@@ -140,9 +128,15 @@ index 000000000..79cb62eb1
 +// rank-sort it into srow[q] and set sflag[q]. Sentinel 0x7FFFFFFF for invalid (-1 / >= nk) entries.
 +#define QSA3_SENT 0x7FFFFFFF
 +__global__ __launch_bounds__(256) void qsa3_rows_kernel(
-+        const int * __restrict__ ids, const size_t i1, const int ns, const int nk, int * __restrict__ srow, int * __restrict__ sflag) {
-+    extern __shared__ int ent[];
++        const int * __restrict__ ids, const size_t i1, const int ns, const int nk, const int bitmap_words,
++        int * __restrict__ srow, int * __restrict__ sflag) {
++    extern __shared__ int ent[];   // [ns] normalized keys (the sortedness check and the fallback sort)
++    // Bitmap path (only when bitmap_words > 0, see the launcher): a nk-bit cell presence map plus the
++    // 256 per-lane scan offsets, carved out of the same dynamic smem right after ent.
++    uint32_t * bitmap = reinterpret_cast<uint32_t *>(ent + ns);
++    int      * ssum   = reinterpret_cast<int *>(bitmap + bitmap_words);
 +    __shared__ int unsorted;
++    __shared__ int nvalid;
 +    const int q = blockIdx.x, tid = threadIdx.x;
 +    const int * row = reinterpret_cast<const int *>(reinterpret_cast<const char *>(ids) + (size_t) q * i1);
 +    for (int j = tid; j < ns; j += 256) { const int key = row[j]; ent[j] = (key >= 0 && key < nk) ? key : QSA3_SENT; }
@@ -152,11 +146,47 @@ index 000000000..79cb62eb1
 +    __syncthreads();
 +    if (unsorted) {
 +        int * dst = srow + (size_t) q * ns;
-+        for (int j = tid; j < ns; j += 256) {
-+            const int e = ent[j];
-+            int rank = 0;
-+            for (int k = 0; k < ns; ++k) { const int f = ent[k]; rank += (f < e) || (f == e && k < j); }
-+            dst[rank] = e;
++        if (bitmap_words > 0) {
++            // The row is the indexer's top-k selection, i.e. a SET of cell ids, so a presence bitmap
++            // enumerates it in ascending order - exactly the order the rank sort produces - for
++            // O(ns + nk/32) per row instead of O(ns^2).  The rows are long contiguous runs of a few
++            // ranges, so the bitmap is also dense and the popcount scan is cheap.
++            for (int i = tid; i < bitmap_words; i += 256) { bitmap[i] = 0u; }
++            __syncthreads();
++            for (int j = tid; j < ns; j += 256) {
++                const int v = ent[j];
++                if (v >= 0 && v < nk) { atomicOr(&bitmap[v >> 5], 1u << (v & 31)); }
++            }
++            __syncthreads();
++            const int per = (bitmap_words + 255) / 256;
++            const int w0  = tid * per, w1 = min(w0 + per, bitmap_words);
++            int cnt = 0;
++            for (int w = w0; w < w1; ++w) { cnt += __popc(bitmap[w]); }
++            ssum[tid] = cnt;
++            __syncthreads();
++            if (tid == 0) {
++                int run = 0;
++                for (int i = 0; i < 256; ++i) { const int v = ssum[i]; ssum[i] = run; run += v; }
++                nvalid = run;
++            }
++            __syncthreads();
++            int o = ssum[tid];
++            for (int w = w0; w < w1; ++w) {
++                uint32_t m = bitmap[w];
++                while (m) { const int b = __ffs(m) - 1; m &= m - 1; dst[o++] = (w << 5) + b; }
++            }
++            __syncthreads();
++            // sentinels sort after every valid key (the merge kernel binary-searches for the first
++            // entry >= QSA3_SENT to get a row's valid count)
++            if (tid == 0) { for (int i = nvalid; i < ns; ++i) { dst[i] = QSA3_SENT; } }
++        } else {
++            // nk is too large for the bitmap budget: the plain cell-level rank sort
++            for (int j = tid; j < ns; j += 256) {
++                const int e = ent[j];
++                int rank = 0;
++                for (int k = 0; k < ns; ++k) { const int f = ent[k]; rank += (f < e) || (f == e && k < j); }
++                dst[rank] = e;
++            }
 +        }
 +    }
 +    if (tid == 0) { sflag[q] = unsorted; }
@@ -285,6 +315,50 @@ index 000000000..79cb62eb1
 +        while (t & 3) { ob[t] = 0xFFFFu; om[t] = 0; ++t; }
 +        ucount[g] = t;
 +    }
++}
++
++// ------------------------------------------------------------------------------------------------------------
++// Fused qsa3 pack (session 7).  The graph used to build pk/pv as cast + permute + cont + reshape + permute +
++// cont - three passes over the cache, the two `cont`s element-scalar (`cpy_scalar<half,half>`).  These two
++// kernels do the whole re-layout in ONE pass from the natural contiguous F16 view `nat [D=256, H=n_head_kv,
++// N=n_kv]`, so the packs are bit-identical to the graph form (a pure permutation of the same F16 values):
++//   pk[a + 16*k + 64*b + 1024*m] = nat[(a + 16*b) + 256*h + 256*H*n],  m = n/4 + (N/4)*h, k = n&3
++//   pv[k + 4*d + 1024*m]         = nat[ d            + 256*h + 256*H*n]
++// (D = 16*16 fixes the two 16-wide dims `a` and `b`; both kernels write 32 B / 8 B per thread.)
++__global__ __launch_bounds__(256) void qsa3_pack_keys_kernel(
++        const uint16_t * __restrict__ nat, uint16_t * __restrict__ pk, const int H, const int N) {
++    const int q = N >> 2;                     // 4-key groups per head
++    const int total = H * q * 64;             // H * (N/4) * 16 (b) * 4 (k)
++    const int t = blockIdx.x * blockDim.x + threadIdx.x;
++    if (t >= total) return;
++    const int n0 = t & 3;                     // k = n & 3
++    const int j  = (t >> 2) & 15;             // b = d >> 4
++    const int r  = t >> 6;
++    const int qq = r % q;                     // n >> 2
++    const int h  = r / q;
++    const uint16_t * s = nat + (size_t) 16 * j + (size_t) 256 * h + (size_t) 256 * H * (4 * qq + n0);
++    uint16_t * d = pk + (size_t) 16 * n0 + (size_t) 64 * j + (size_t) 1024 * ((size_t) qq + (size_t) q * h);
++    *reinterpret_cast<uint4 *>(d)     = *reinterpret_cast<const uint4 *>(s);
++    *reinterpret_cast<uint4 *>(d + 8) = *reinterpret_cast<const uint4 *>(s + 8);
++}
++
++__global__ __launch_bounds__(256) void qsa3_pack_values_kernel(
++        const uint16_t * __restrict__ nat, uint16_t * __restrict__ pv, const int H, const int N) {
++    const int q = N >> 2;
++    const int total = 256 * q * H;
++    const int t = blockIdx.x * blockDim.x + threadIdx.x;
++    if (t >= total) return;
++    const int d  = t & 255;
++    const int r  = t >> 8;
++    const int qq = r % q;
++    const int h  = r / q;
++    const uint16_t * s = nat + d + (size_t) 256 * h + (size_t) 256 * H * (4 * qq);
++    uint16_t * o = pv + (size_t) 4 * d + (size_t) 1024 * ((size_t) qq + (size_t) q * h);
++    const size_t ks = (size_t) 256 * H;
++    uint16_t v[4];
++#pragma unroll
++    for (int k = 0; k < 4; ++k) { v[k] = s[(size_t) k * ks]; }
++    *reinterpret_cast<uint2 *>(o) = make_uint2((uint32_t) v[0] | ((uint32_t) v[1] << 16), (uint32_t) v[2] | ((uint32_t) v[3] << 16));
 +}
 +
 +struct qsa3_layout {
@@ -560,12 +634,15 @@ index 000000000..79cb62eb1
 +    if (ids->ne[0] < 1 || ids->ne[0] > 2560 || ids->ne[1] < q->ne[1] || ids->nb[1] % 4 || uintptr_t(ids->data) % 4) {
 +        return false;
 +    }
-+    if (pk->type != GGML_TYPE_F16 || !ggml_is_contiguous(pk) || pk->ne[0] != 16 || pk->ne[1] != 4 || pk->ne[2] != 16 ||
-+        pk->ne[3] != k->ne[1]/4*k->ne[2] || uintptr_t(pk->data) % 16) {
++    // src[7]/src[8] are the NATURAL contiguous F16 views [D=256, n_head_kv, n_kv] the launcher packs
++    // into the block layouts itself (session 7 fused pack).  k (src[1]) is the permuted
++    // [D, n_kv, n_head_kv] view, so the natural one swaps its dims 1 and 2.
++    if (pk->type != GGML_TYPE_F16 || !ggml_is_contiguous(pk) || pk->ne[0] != k->ne[0] ||
++        pk->ne[1] != k->ne[2] || pk->ne[2] != k->ne[1] || pk->ne[3] != 1 || uintptr_t(pk->data) % 16) {
 +        return false;
 +    }
-+    if (pv->type != GGML_TYPE_F16 || !ggml_is_contiguous(pv) || pv->ne[0] != 4 || pv->ne[1] != 256 ||
-+        pv->ne[2] != k->ne[1]/4*k->ne[2] || pv->ne[3] != 1 || uintptr_t(pv->data) % 8) {
++    if (pv->type != GGML_TYPE_F16 || !ggml_is_contiguous(pv) || pv->ne[0] != k->ne[0] ||
++        pv->ne[1] != k->ne[2] || pv->ne[2] != k->ne[1] || pv->ne[3] != 1 || uintptr_t(pv->data) % 16) {
 +        return false;
 +    }
 +    if (mask) {
@@ -586,7 +663,7 @@ index 000000000..79cb62eb1
 +    const ggml_tensor * mask = dst->src[4];
 +    const ggml_tensor * cell_vis = dst->src[5];
 +    const ggml_tensor * q_vis    = dst->src[6];
-+    const ggml_tensor * pk   = dst->src[7];
++    const ggml_tensor * pk   = dst->src[7];   // natural F16 [D, n_head_kv, n_kv]; packed below
 +    const ggml_tensor * pv   = dst->src[8];
 +
 +    float scale;
@@ -595,8 +672,23 @@ index 000000000..79cb62eb1
 +    const int n_q    = (int) q->ne[1];
 +    const int ns     = (int) ids->ne[0];
 +    const int nk     = (int) k->ne[1];
++    const int nh_kv  = (int) k->ne[2];
 +    const int ngroups = (n_q + QSA3_G - 1) / QSA3_G;
 +    const int cap     = (QSA3_G * ns + 3) & ~3;
++
++
++    // Fused pack (session 7): one pass per tensor from the natural [D, n_head_kv, n_kv] F16 view into the
++    // block layouts the attention kernel reads.  Replaces cast+permute+cont+reshape+permute+cont.
++    ggml_cuda_pool_alloc<uint16_t> pk16(ctx.pool(), (size_t) 256 * nk * nh_kv);
++    ggml_cuda_pool_alloc<uint16_t> pv16(ctx.pool(), (size_t) 256 * nk * nh_kv);
++    {
++        const int q4 = nk >> 2;
++        const int tk = nh_kv * q4 * 64;
++        const int tv = 256 * q4 * nh_kv;
++        if (tk > 0) qsa3_pack_keys_kernel  <<<(tk + 255) / 256, 256, 0, ctx.stream()>>>((const uint16_t *) pk->data, pk16.get(), nh_kv, nk);
++        if (tv > 0) qsa3_pack_values_kernel<<<(tv + 255) / 256, 256, 0, ctx.stream()>>>((const uint16_t *) pv->data, pv16.get(), nh_kv, nk);
++        CUDA_CHECK(cudaGetLastError());
++    }
 +
 +    ggml_cuda_pool_alloc<uint16_t> ublk(ctx.pool(), (size_t) ngroups * cap);
 +    ggml_cuda_pool_alloc<uint16_t> umask(ctx.pool(), (size_t) ngroups * cap);
@@ -604,8 +696,16 @@ index 000000000..79cb62eb1
 +    ggml_cuda_pool_alloc<int>      srow(ctx.pool(), (size_t) n_q * ns);
 +    ggml_cuda_pool_alloc<int>      sflag(ctx.pool(), (size_t) n_q);
 +    {
-+        const ggml_cuda_kernel_launch_params launch(dim3(n_q), dim3(256), (size_t) ns * sizeof(int), ctx.stream());
-+        ggml_cuda_kernel_launch(qsa3_rows_kernel, launch, (const int *) ids->data, ids->nb[1], ns, nk, srow.get(), sflag.get());
++        // rows-kernel dynamic smem: [ns] keys + the nk-bit presence bitmap + 256 scan offsets.
++        // When that does not fit the 48 KiB budget (a very long cache) the kernel falls back to the
++        // rank sort and only the key array is allocated.
++        const int    bitmap_words = (nk + 31) / 32;
++        const size_t rows_smem_bm = (size_t) ns * sizeof(int) + (size_t) bitmap_words * sizeof(uint32_t) + 256 * sizeof(int);
++        const bool   rows_bitmap  = rows_smem_bm <= 48 * 1024;
++        const size_t rows_smem    = rows_bitmap ? rows_smem_bm : (size_t) ns * sizeof(int);
++        const ggml_cuda_kernel_launch_params launch(dim3(n_q), dim3(256), rows_smem, ctx.stream());
++        ggml_cuda_kernel_launch(qsa3_rows_kernel, launch, (const int *) ids->data, ids->nb[1], ns, nk,
++                                rows_bitmap ? bitmap_words : 0, srow.get(), sflag.get());
 +        CUDA_CHECK(cudaGetLastError());
 +        const ggml_cuda_kernel_launch_params launch2(dim3(ngroups), dim3(QSA3_MERGE_LANES), (size_t) QSA3_G * ns * sizeof(int), ctx.stream());
 +        ggml_cuda_kernel_launch(qsa3_merge_kernel, launch2, (const int *) ids->data, ids->nb[1], n_q, ns, nk,
@@ -617,8 +717,8 @@ index 000000000..79cb62eb1
 +    const ggml_cuda_kernel_launch_params launch(dim3(ngroups, k->ne[2]), dim3(256), 0, ctx.stream());
 +    ggml_cuda_kernel_launch(qsa3_attn_kernel, launch,
 +            (const float    *) q->data,
-+            (const uint16_t *) pk->data,
-+            (const uint16_t *) pv->data,
++            (const uint16_t *) pk16.get(),
++            (const uint16_t *) pv16.get(),
 +            mask     ? (const uint16_t *) mask->data     : nullptr,
 +            cell_vis ? (const int      *) cell_vis->data : nullptr,
 +            q_vis    ? (const int      *) q_vis->data    : nullptr,
@@ -629,14 +729,15 @@ index 000000000..79cb62eb1
 +    CUDA_CHECK(cudaGetLastError());
 +}
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 2ce34caf0..452e30bc9 100644
+index 2ce34caf0..bd4e2aabb 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -5695,6 +5695,32 @@ struct ggml_tensor * ggml_flash_attn_qsa(
      return result;
  }
  
-+// attach (or clear) the packed-block K/V layouts consumed by the qsa3 prefill kernel
++// attach (or clear) the natural contiguous F16 K/V views the qsa3 prefill launcher packs into the
++// packed-block layouts it consumes (ggml/src/ggml-cuda/fattn-qsa3.cu)
 +void ggml_flash_attn_qsa_set_packed(
 +        struct ggml_tensor * a,
 +        struct ggml_tensor * packed_keys,
@@ -649,14 +750,13 @@ index 2ce34caf0..452e30bc9 100644
 +        return;
 +    }
 +
-+    const struct ggml_tensor * k = a->src[1];
++    const struct ggml_tensor * k = a->src[1];   // permuted [D, n_kv, n_head_kv]
 +    GGML_ASSERT(packed_keys->type   == GGML_TYPE_F16);
 +    GGML_ASSERT(packed_values->type == GGML_TYPE_F16);
 +    GGML_ASSERT(ggml_is_contiguous(packed_keys) && ggml_is_contiguous(packed_values));
-+    GGML_ASSERT(packed_keys->ne[0]   == 16 && packed_keys->ne[1]   == 4 && packed_keys->ne[2]   == 16);
-+    GGML_ASSERT(packed_keys->ne[3]   == k->ne[1]/4*k->ne[2]);
-+    GGML_ASSERT(packed_values->ne[0] == 4  && packed_values->ne[1] == 256 && packed_values->ne[3] == 1);
-+    GGML_ASSERT(packed_values->ne[2] == k->ne[1]/4*k->ne[2]);
++    // the natural view swaps k's dims 1 and 2: [D, n_head_kv, n_kv]
++    GGML_ASSERT(packed_keys->ne[0]   == k->ne[0] && packed_keys->ne[1]   == k->ne[2] && packed_keys->ne[2]   == k->ne[1] && packed_keys->ne[3]   == 1);
++    GGML_ASSERT(packed_values->ne[0] == k->ne[0] && packed_values->ne[1] == k->ne[2] && packed_values->ne[2] == k->ne[1] && packed_values->ne[3] == 1);
 +
 +    a->src[7] = packed_keys;
 +    a->src[8] = packed_values;
@@ -666,58 +766,99 @@ index 2ce34caf0..452e30bc9 100644
          struct ggml_tensor * a,
          enum ggml_prec       prec) {
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 874cf5bd5..7af4c7353 100644
+index 874cf5bd5..d61eac7ed 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -1571,6 +1571,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -14,6 +14,16 @@
+ #include <unistd.h> // dup
+ #endif
+ 
++// qsa3 (the packed-block WMMA QSA prefill path) is gated at COMPILE TIME, not by an environment
++// variable, on purpose.  The rocprofiler-register shipped with ROCm 7.14 calls setenv() during
++// early init (publishing GLOG_* vars), which can reallocate the process environment under a
++// concurrent getenv() in the target application and intermittently make an env gate read as unset
++// (ROCm issue #10196; fixed upstream 2026-09-15 in rocm-systems PR #11620).  An env gate therefore
++// makes qsa3 profiling non-reproducible.  Build with -DLLAMA_QSA3_ENABLE=0 to compile it out.
++#ifndef LLAMA_QSA3_ENABLE
++#define LLAMA_QSA3_ENABLE 1
++#endif
++
+ // Upper bound of the decode/verify band served by the fused hyper-connection ops
+ // (ggml_cuda_op_hc_mix / _hc_combine, which assert the same bound - HC_FUSED_MAX_TOKENS
+ // in ggml-cuda/hc-mix.cu). A verify batch is --spec-draft-n-max + 1 tokens and the
+@@ -1571,6 +1581,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      return top_k;
  }
  
 +// qsa3 packed-block layouts (the F16 layouts the WMMA prefill kernel reads, ggml/src/ggml-cuda/
-+// fattn-qsa3.cu).  The pack is a pure graph composition - reshape + permute + cont - so no new
-+// ggml op is needed.  Keys: [D, n_kv, n_kvh, 1] -> [16, 4, 16, n_kv/4*n_kvh]; Values:
-+// [D, n_kv, n_kvh, 1] -> [4, 256, n_kv/4*n_kvh, 1].  Both are built only for the prefill band and
-+// native F16/BF16 caches (see build_attn_qsa); anything else leaves the VEC kernel in charge.
-+static ggml_tensor * qsa_pack_keys_graph(ggml_context * ctx0, ggml_tensor * keys) {
-+    GGML_ASSERT(keys->ne[0] == 256 && keys->ne[1] % 4 == 0 && keys->ne[3] == 1);
-+    ggml_tensor * contiguous = ggml_is_contiguous(keys) ? keys : ggml_cont(ctx0, keys);
-+    ggml_tensor * blocks = ggml_reshape_4d(ctx0, contiguous, 16, 16, 4, keys->ne[1]/4*keys->ne[2]);
-+    ggml_tensor * packed = ggml_cont(ctx0, ggml_permute(ctx0, blocks, 0, 2, 1, 3));
-+    ggml_set_name(packed, "qsa_packed_keys");
-+    return packed;
++// fattn-qsa3.cu).  The pack itself is done by the launcher in one fused pass per tensor
++// (qsa3_pack_{keys,values}_kernel, session 7); the graph only materialises the natural contiguous F16
++// view [D, n_head_kv, n_kv] the launcher packs from.  Keys -> [16, 4, 16, n_kv/4*n_kvh]; Values ->
++// [4, 256, n_kv/4*n_kvh, 1].  Both are built only for the prefill band and any cache type the graph
++// can materialize as F16 (the native ones, or a quantized cache cast on the way in); anything else
++// leaves the VEC kernel in charge.
++// The cache types the qsa3 pack can consume: the native pair plus every type the VEC kernel can
++// dequantize (the cast below materializes them).  Kept in sync with the VEC kernel's type list.
++static bool qwen4exp_qsa3_kv_type(ggml_type type) {
++    switch (type) {
++        case GGML_TYPE_F16:
++        case GGML_TYPE_BF16:
++        case GGML_TYPE_Q8_0:
++        case GGML_TYPE_Q4_0:
++        case GGML_TYPE_Q4_1:
++        case GGML_TYPE_Q5_0:
++        case GGML_TYPE_Q5_1:
++        case GGML_TYPE_IQ4_NL:
++            return true;
++        default:
++            return false;
++    }
 +}
 +
-+static ggml_tensor * qsa_pack_values_graph(ggml_context * ctx0, ggml_tensor * values) {
-+    GGML_ASSERT(values->ne[0] == 256 && values->ne[1] % 4 == 0 && values->ne[3] == 1);
-+    ggml_tensor * contiguous = ggml_is_contiguous(values) ? values : ggml_cont(ctx0, values);
-+    ggml_tensor * blocks = ggml_reshape_3d(ctx0, contiguous, 256, 4, values->ne[1]/4*values->ne[2]);
-+    ggml_tensor * packed = ggml_cont(ctx0, ggml_permute(ctx0, blocks, 1, 0, 2, 3));
-+    ggml_set_name(packed, "qsa_packed_values");
-+    return packed;
++// qsa3 works on F16 packs.  Materialize the cache view as F16 from its *natural* (contiguous)
++// layout before any permute: a quantized tensor cannot be permuted, and the backend dup only
++// dequantizes to F32, so those route through an F32 intermediate.  The permute/cont that follows
++// is then a plain F16 copy.
++static ggml_tensor * qsa3_f16_cast(ggml_context * ctx0, ggml_tensor * raw) {
++    if (raw->type == GGML_TYPE_F16)  { return raw; }
++    if (raw->type == GGML_TYPE_BF16) { return ggml_cast(ctx0, raw, GGML_TYPE_F16); }
++    return ggml_cast(ctx0, ggml_cast(ctx0, raw, GGML_TYPE_F32), GGML_TYPE_F16);
++}
++
++static ggml_tensor * qsa3_f16_natural(ggml_context * ctx0, ggml_tensor * raw) {
++    ggml_tensor * t = qsa3_f16_cast(ctx0, raw);
++    if (!ggml_is_contiguous(t)) { t = ggml_cont(ctx0, t); }
++    return t;
 +}
 +
  // Dense GQA self-attention restricted to the cells that top_k names.
  // The mask build below copies the MLA sparse path in llm_graph_context::build_attn.
  ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
-@@ -1679,6 +1702,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1664,6 +1715,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+     ggml_tensor * q = q_cur;
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
++    // the natural cache views, kept for the qsa3 packs (which must cast before permuting)
++    ggml_tensor * k_raw = k;
++    ggml_tensor * v_raw = v;
+     ggml_tensor * cur;
+ 
+     if (qsa_sparse) {
+@@ -1679,6 +1733,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          // derives each cell's visibility from cell_vis/q_vis instead - see findings 2c
          cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f,
                  qsa_cell_vis, qsa_q_vis);
 +        // qsa3 (packed-block WMMA) needs the packed F16 layouts; it is prefill-only, so the whole
 +        // W=1..8 decode/verify band keeps the VEC kernel and width purity holds by construction.
-+        // Default OFF while it is validated - GGML_CUDA_QSA3=1 opts in.
-+        static const bool qsa3_pack = [] {
-+            const char * env = getenv("GGML_CUDA_QSA3");
-+            return env != nullptr && atoi(env) != 0;
-+        }();
-+        if (qsa3_pack && n_stream == 1 && q_p->ne[1] >= 128 && k->ne[0] == 256 && k->ne[1] % 4 == 0 &&
-+            (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16)) {
-+            // the pack wants the F16 layout; a bf16 cache is cast on the way in (one extra pass
-+            // over the cache).  Neither tensor is an explicit graph root - the QSA op's new srcs
-+            // pull them in when `cur` is expanded.
-+            ggml_tensor * kc = k->type == GGML_TYPE_F16 ? k : ggml_cast(ctx0, k, GGML_TYPE_F16);
-+            ggml_tensor * vc = v->type == GGML_TYPE_F16 ? v : ggml_cast(ctx0, v, GGML_TYPE_F16);
-+            ggml_flash_attn_qsa_set_packed(cur, qsa_pack_keys_graph(ctx0, kc), qsa_pack_values_graph(ctx0, vc));
++        // Compile-time gate (see LLAMA_QSA3_ENABLE at the top of this file, default 1).
++        constexpr bool qsa3_pack = LLAMA_QSA3_ENABLE != 0;
++        if (qsa3_pack && n_stream == 1 && q_p->ne[1] >= 128 && k_raw->ne[0] == 256 && k_raw->ne[2] % 4 == 0 &&
++            qwen4exp_qsa3_kv_type(k_raw->type)) {
++            // The launcher packs these into the block layouts itself (one fused pass, session 7);
++            // the graph only materialises the natural contiguous F16 view [D, n_head_kv, n_kv].
++            ggml_tensor * k16 = qsa3_f16_natural(ctx0, k_raw);
++            ggml_tensor * v16 = qsa3_f16_natural(ctx0, v_raw);
++            ggml_flash_attn_qsa_set_packed(cur, k16, v16);
 +        }
 +
          ggml_flash_attn_qsa_set_prec(cur, GGML_PREC_F32);

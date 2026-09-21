@@ -138,6 +138,28 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 26 (2026-09-20): rebased onto delivery **r12**, and the WIP consolidated **38 -> 5** thematic patches
+
+The delivery moved to r12 (`origin/main` `4e37fa6`).  Both rebases done and verified: the record branch
+17/17 (two `AGENTS.md` conflicts, resolved by regenerating from r12's content plus this branch's
+pointers) and the code branch **38/38 with no conflicts**, onto the r12 applied tree
+`8a80535e556bef57666d2eaa4d3eb4cf93fb83f5` (rebuilt with `RDNA_BRANCH=r12-verify scripts/apply-all.sh`
+on a fresh `ebbb18522` worktree).  All gates re-verified green.
+
+Then the 38 WIP commits were gathered into **5 "like items"** — `mmb`, `qsa3`, the F32/tiny-M +
+default-flips + probe, HC16 + non-temporal, and the indexer — because the other machines need a
+manageable set.  The commits were interleaved (the `mmb` line is 1-9 *and* 33-37), so this is a
+cherry-pick-and-squash; it is **content-preserving and verified**: the 5-patch result has tree
+`d365b43ddc87c472c33a121247931269f975aa43`, byte-identical to the 38-commit tip, and `git am` 5/5 on a
+fresh r12 tree.
+
+**`GROUPS.md` is the triage sheet** — per group: what it is, its env/compile gate, its arch note
+(including that `mmb_wmma_*` is a deliberate no-op on RDNA4, so group 1 needs care on gfx1201), the
+gates, and the recommended order for a new architecture.  Read it before applying anything on
+gfx1100/gfx1201.
+
+---
+
 ## UPDATE — session 25 (2026-09-20): the indexer gather's **warp-shuffle scan** (−11.7 % on the gather),
 ## and the block-level gather/emit closed as unbuildable
 

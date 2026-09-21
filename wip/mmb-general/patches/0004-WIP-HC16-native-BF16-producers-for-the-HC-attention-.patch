@@ -1,0 +1,1041 @@
+From dbf6e6951e13d0f8dd41485f9d95001948900f4f Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 20 Sep 2026 21:01:26 -0500
+Subject: [PATCH 4/5] WIP HC16: native-BF16 producers for the HC/attention
+ activations + non-temporal accesses
+
+Squashed theme commit (7 originals): native-BF16 producers for the HC gate and
+the normalized stream; for the remaining HC/attention activations; the dead-F32-
+store skip when every consumer reads the BF16 copy; the xn stream BF16-only; and
+the non-temporal accesses -- dsv4_hc pre/post, non-temporal LOADS in
+concat_transposed_src1_dim0 + moe_weighted_reduction, and the fused gated-unary
+producer (+ the ggml_cuda_nt_load helper).
+---
+ ggml/src/ggml-cuda/common.cuh                |  14 +++
+ ggml/src/ggml-cuda/concat.cu                 |   8 +-
+ ggml/src/ggml-cuda/dsv4-hc.cu                |  93 ++++++++++++++--
+ ggml/src/ggml-cuda/ggml-cuda.cu              | 109 +++++++++++++++++++
+ ggml/src/ggml-cuda/mmb.cu                    |  98 ++++++++++++++---
+ ggml/src/ggml-cuda/mmb.cuh                   |  11 ++
+ ggml/src/ggml-cuda/moe-weighted-reduction.cu |  33 ++++--
+ ggml/src/ggml-cuda/norm.cu                   |  58 ++++++++--
+ ggml/src/ggml-cuda/unary.cu                  | 100 +++++++++++++----
+ 9 files changed, 449 insertions(+), 75 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 934b9cffb..e23628d4b 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -143,6 +143,20 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
+ #endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+ }
+ 
++// Non-temporal (streaming) load for pure-streaming kernels: it keeps the access out of the L2/MALL
++// that the surrounding weight GEMMs need (see the WIP mmb-general notes).  __builtin_nontemporal_load
++// only accepts pointers to builtin scalar/vector types, so wrapper types (__half, bfloat16, float4,
++// ...) fall back to a normal access -- a templated kernel therefore takes the hint on its f32 path
++// only, which is the path these activations use.
++template <typename T>
++static __device__ __forceinline__ T ggml_cuda_nt_load(const T * p) {
++    if constexpr (std::is_same<T, float>::value) {
++        return __builtin_nontemporal_load(p);
++    } else {
++        return *p;
++    }
++}
++
+ #ifdef __CUDA_ARCH_LIST__
+ constexpr bool ggml_cuda_has_arch_impl(int) {
+     return false;
+diff --git a/ggml/src/ggml-cuda/concat.cu b/ggml/src/ggml-cuda/concat.cu
+index 408cbce3d..030d8f6de 100644
+--- a/ggml/src/ggml-cuda/concat.cu
++++ b/ggml/src/ggml-cuda/concat.cu
+@@ -86,6 +86,10 @@ static void concat_cont_cuda(const T * x,
+     concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+ }
+ 
++// The routed-expert concat is a pure streaming transpose (each element read once, written once), so
++// its global LOADS use non-temporal hints to stop it thrashing the L2/MALL the surrounding GEMM
++// weight streams need.  LOADS ONLY: the dst stays cached for its immediate consumer, and a
++// non-temporal store here measured +41 ms (session 13/14, gfx1151, pp8192).
+ template <typename T>
+ static __global__ void concat_transposed_src1_dim0(
+         const char * src0, const char * src1, char * dst,
+@@ -108,7 +112,7 @@ static __global__ void concat_transposed_src1_dim0(
+         const int64_t token = token0 + ty + j;
+         const int64_t channel = channel0 + tx;
+         if (token < ne10 && channel < ne11) {
+-            values[ty + j][tx] = *reinterpret_cast<const T *>(src1 + i2 * nb12 + channel * nb11 + token * nb10);
++            values[ty + j][tx] = __builtin_nontemporal_load(reinterpret_cast<const T *>(src1 + i2 * nb12 + channel * nb11 + token * nb10));
+         }
+     }
+     __syncthreads();
+@@ -127,7 +131,7 @@ static __global__ void concat_transposed_src1_dim0(
+             if (channel < ne11) {
+                 for (int64_t state = tx; state < ne00; state += tile) {
+                     *reinterpret_cast<T *>(dst + i2 * nb2 + channel * nb1 + state * nb0) =
+-                        *reinterpret_cast<const T *>(src0 + i2 * nb02 + channel * nb01 + state * nb00);
++                        __builtin_nontemporal_load(reinterpret_cast<const T *>(src0 + i2 * nb02 + channel * nb01 + state * nb00));
+                 }
+             }
+         }
+diff --git a/ggml/src/ggml-cuda/dsv4-hc.cu b/ggml/src/ggml-cuda/dsv4-hc.cu
+index ca1d2dc8a..6451de414 100644
+--- a/ggml/src/ggml-cuda/dsv4-hc.cu
++++ b/ggml/src/ggml-cuda/dsv4-hc.cu
+@@ -1,5 +1,13 @@
+ #include "common.cuh"
+ #include "dsv4-hc.cuh"
++#include "mmb.cuh"
++
++// RNE f32 -> bf16, bit-identical to mmb.cu's mmb_f2bf.
++static __device__ __forceinline__ uint16_t dsv4_f2bf(float f) {
++    uint32_t u = __float_as_uint(f);
++    u += 0x7fffu + ((u >> 16) & 1u);
++    return (uint16_t)(u >> 16);
++}
+ 
+ 
+ static constexpr int DSV4_HC = 4;
+@@ -100,7 +108,13 @@ static __global__ void dsv4_hc_comb_f32(
+     }
+ }
+ 
+-template <bool gated>
++// The HC pre/post kernels are pure streaming (every element is read/written once, no reuse), so the
++// bulk accesses use non-temporal loads/stores: they are value-preserving cache hints only (identical
++// results), but they stop these buffers from thrashing the L2/MALL that the surrounding GEMM weight
++// streams are using.  Measured in situ (gfx1151, IQ4_XS Flash-Next, pp8192): dsv4_hc_pre 605 -> 493
++// us/call (+18.6 %), dsv4_hc_post 691 -> 660 ms; the standalone microbench (no competing traffic)
++// shows no difference, which is why this was not visible before.
++template <bool gated, bool wbf16, bool xbf16>
+ static __global__ void dsv4_hc_pre_f32(
+         const float * x,
+         const float * weights,
+@@ -116,7 +130,9 @@ static __global__ void dsv4_hc_pre_f32(
+         int64_t sw2,
+         int64_t sd0,
+         int64_t sd1,
+-        float   scale) {
++        float   scale,
++        uint16_t * dst16 = nullptr,
++        bool    store_f32 = true) {
+     ggml_cuda_pdl_lc();
+     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+     const int64_t nr = n_embd * n_tokens;
+@@ -132,17 +148,40 @@ static __global__ void dsv4_hc_pre_f32(
+ 
+     float sum = 0.0f;
+     for (int64_t ih = 0; ih < hc; ++ih) {
+-        const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
++        float xv;
++        if constexpr (xbf16) {
++            // HC16: the xn producer skipped its F32 store; read the bf16 copy instead (exact
++            // expansion of the RNE-rounded value, so only the F32->bf16 rounding is new).
++            const uint16_t h = __builtin_nontemporal_load((const uint16_t *) x + i0*sx0 + ih*sx1 + it*sx2);
++            xv = __uint_as_float(((uint32_t) h) << 16);
++        } else {
++            xv = x[i0*sx0 + ih*sx1 + it*sx2];
++        }
+         float wv;
+         if constexpr (gated) {
+-            wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
++            float wr;
++            if constexpr (wbf16) {
++                // the producer (MMB dense) wrote the gate into its pinned BF16 slot; expand the
++                // bf16 back to f32 exactly (round-to-nearest-even on the way in, so this reproduces
++                // the value the producer rounded to -- a numerics change vs the F32 chain, approved
++                // as a prefill re-baseline).
++                const uint16_t h = __builtin_nontemporal_load((const uint16_t *) weights + i0*sw0 + ih*sw1 + it*sw2);
++                wr = __uint_as_float(((uint32_t) h) << 16);
++            } else {
++                wr = weights[i0*sw0 + ih*sw1 + it*sw2];
++            }
++            wv = 1.0f / (1.0f + expf(-wr));
+         } else {
+             wv = weights[ih*sw0 + it*sw1];
+         }
+         sum += xv * wv;
+     }
+ 
+-    dst[i0*sd0 + it*sd1] = scale * sum;
++    const float v = scale * sum;
++    if (store_f32) __builtin_nontemporal_store(v, dst + i0*sd0 + it*sd1);
++    if (dst16 != nullptr) {
++        __builtin_nontemporal_store(dsv4_f2bf(v), dst16 + i0*sd0 + it*sd1);
++    }
+ }
+ 
+ template <bool has_comb>
+@@ -182,16 +221,16 @@ static __global__ void dsv4_hc_post_f32(
+     const int64_t idst = (ir / n_embd) % hc;
+     const int64_t it   = ir / (n_embd * hc);
+ 
+-    float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
++    float sum = __builtin_nontemporal_load(x + i0*sx0 + it*sx1) * post[idst*sp0 + it*sp1];
+     if constexpr (has_comb) {
+         for (int64_t isrc = 0; isrc < hc; ++isrc) {
+-            sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
++            sum += __builtin_nontemporal_load(residual + i0*sr0 + isrc*sr1 + it*sr2) * comb[idst*sc0 + isrc*sc1 + it*sc2];
+         }
+     } else {
+-        sum += residual[i0*sr0 + idst*sr1 + it*sr2];
++        sum += __builtin_nontemporal_load(residual + i0*sr0 + idst*sr1 + it*sr2);
+     }
+ 
+-    dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
++    __builtin_nontemporal_store(sum, dst + i0*sd0 + idst*sd1 + it*sd2);
+ }
+ 
+ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -256,20 +295,50 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+     const float scale = ggml_get_op_params_f32(dst, 0);
+     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
+ 
++    // If the graph marked the gate producer BF16-only, the MMB dense kernel wrote the gate into its
++    // pinned BF16 slot; read that copy instead of the (not-written) F32 tensor.  The lookup is null
++    // when no BF16 copy exists (MMB off, producer not taken, or threshold not met), so the F32 path
++    // runs and the result is bit-identical to before.
++    const ggml_tensor * w_root = weights->view_src ? weights->view_src : weights;
++    const uint16_t * w16 = (gated && ggml_cuda_mmb_is_bf16_only(w_root)) ? ggml_cuda_mmb_cache_lookup(w_root) : nullptr;
++
++    // HC16: the normalized stream xn (src[0]) may have been marked BF16-only by the graph optimizer
++    // when every consumer (this op and the two F32 inject GEMMs) reads the bf16 copy.  Then its
++    // producer skipped the F32 store and only the bf16 slot holds data.  NOTE: x is a double view
++    // (mul -> reshape_2d -> reshape_3d) and the mark is on the mul root, so walk the whole view chain.
++    const ggml_tensor * x_root = x;
++    while (x_root->view_src) x_root = x_root->view_src;
++    const uint16_t * x16 = ggml_cuda_mmb_is_bf16_only(x_root) ? ggml_cuda_mmb_cache_lookup(x_root) : nullptr;
++
+     const int block_size = 256;
+     const int64_t nr = n_embd * n_tokens;
+     const dim3 block_dims(block_size, 1, 1);
+     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+ 
+-    auto kernel = gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
++    auto kernel = gated ? (w16 ? (x16 ? dsv4_hc_pre_f32<true, true, true>  : dsv4_hc_pre_f32<true, true, false>)
++                               : (x16 ? dsv4_hc_pre_f32<true, false, true> : dsv4_hc_pre_f32<true, false, false>))
++                        : (x16 ? dsv4_hc_pre_f32<false, false, true> : dsv4_hc_pre_f32<false, false, false>);
++    const float * xptr = x16 ? (const float *) x16 : (const float *) x->data;
++    const float * wptr = w16 ? (const float *) w16 : (const float *) weights->data;
++    // HC16: if this mixed stream is an MMB GEMM activation, also emit the BF16 copy the GEMM will
++    // read (RNE-rounded exactly as mmb_cvt_f32_bf16), so it skips its own conversion pass.  The F32
++    // output is still written, so every other consumer is unaffected (bit-identical).
++    uint16_t * dst16 = nullptr;
++    bool store_f32 = true;
++    if (ggml_cuda_mmb_is_bf16_only(dst)) {
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, dst, (size_t) ggml_nelements(dst));
++        store_f32 = false;
++    } else if (ggml_cuda_mmb_wants_bf16_copy(dst)) {
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, dst, (size_t) ggml_nelements(dst));
++    }
+     ggml_cuda_kernel_launch(kernel, launch_params,
+-            (const float *) x->data, (const float *) weights->data, (float *) dst->data,
++            xptr, wptr, (float *) dst->data,
+             n_embd, hc, n_tokens,
+             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
+             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
+             nbd0 / sizeof(float), nbd1 / sizeof(float),
+-            scale);
++            scale, dst16, store_f32);
+ }
+ 
+ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ec05c628b..58b7c0adb 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6130,6 +6130,9 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+ }
+ #endif // USE_CUDA_GRAPH
+ 
++static bool         g_mmb_marks_after_compute = true;
++static const void * g_mmb_marks_first_split   = nullptr;
++
+ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+@@ -6205,6 +6208,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+ 
++    // BF16-only marks live for the whole scheduled graph (all splits) and are cleared by the first
++    // optimize pass after this compute (see ggml_backend_cuda_graph_optimize).
++    g_mmb_marks_after_compute = true;
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+@@ -6236,6 +6242,109 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
++    // BF16-only mark lifetime: clear on the first optimize after a compute, or when the first split
++    // of a new graph is seen (the scheduler optimizes every split of one graph before computing any
++    // of them, so marks set below must survive the remaining splits' optimize calls).
++    {   const void * key = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
++        if (g_mmb_marks_after_compute || g_mmb_marks_first_split == nullptr || key == g_mmb_marks_first_split) {
++            ggml_cuda_mmb_marks_clear(); g_mmb_marks_first_split = key; g_mmb_marks_after_compute = false;
++        }
++    }
++
++    // MMB HC16 (step 1 of the bf16-producer port): mark the gate producer of a gated DSV4_HC_PRE as
++    // BF16-only when MMB will produce it and every consumer reads the BF16 copy.  The gate is a
++    // dense MUL_MAT [320 x 10240] whose only consumer is the fused pre op, so this is the contained
++    // first win.  STRUCTURE ONLY: inside graph_optimize the data pointers are not assigned yet, so
++    // the check must not look at alias/buffer state.  LLAMA_MMB_HC16>=1 (== GGML_CUDA_MMB_HC16).
++    {
++        static const int hc16 = getenv("GGML_CUDA_MMB_HC16") ? atoi(getenv("GGML_CUDA_MMB_HC16")) : 0;
++        if (hc16 >= 1 && ggml_cuda_mmb_active() &&
++                GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
++            auto reads = [](const ggml_tensor * t, const ggml_tensor * x) {
++                for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (t->src[s] == x || t->src[s]->view_src == x) return true;
++                return false;
++            };
++            for (int i = 0; i < cgraph->n_nodes; ++i) {
++                const ggml_tensor * pre = cgraph->nodes[i];
++                if (pre->op != GGML_OP_DSV4_HC_PRE || pre->src[1] == nullptr) continue;
++                if (ggml_get_op_params_i32(pre, 1) == 0) continue;   // un-gated pre has no sigmoid gate
++                const ggml_tensor * gr = pre->src[1]->view_src ? pre->src[1]->view_src : pre->src[1];
++                if (gr->op != GGML_OP_MUL_MAT) continue;
++                // the gate weight is [K=320, M=10240]; gr itself is [M=10240, T]
++                if (gr->src[0]->ne[0] != 320 || gr->src[0]->ne[1] != 10240) continue;
++                if (ggml_nrows(gr) < 512) continue;
++                if (!ggml_cuda_mmb_supported_mm(gr->src[0], gr->src[1], gr)) continue;
++                int gi = -1;
++                for (int k = 0; k <= i; ++k) if (cgraph->nodes[k] == gr) { gi = k; break; }
++                if (gi < 0) continue;   // producer not in this split -- cannot guarantee the BF16 copy
++                bool ok = true; int nread = 0;
++                for (int n = gi + 1; n < cgraph->n_nodes && ok; ++n) {
++                    const ggml_tensor * t = cgraph->nodes[n];
++                    if (!reads(t, gr)) continue;
++                    ++nread;
++                    if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
++                    if (t == pre) continue;
++                    ok = false;
++                }
++                if (ok && nread > 0) {
++                    ggml_cuda_mmb_mark_bf16_only(gr);
++                    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_HC16 gate marked BF16-only: %s (M=%d K=%d T=%d)\n",
++                            gr->name, (int) gr->ne[1], (int) gr->ne[0], (int) (gr->ne[2] * gr->ne[3]));
++                }
++            }
++        }
++    }
++
++    // MMB HC16 step 3: mark the activation (src1) of every MMB dense prefill GEMM "wants a BF16
++    // copy".  Producers that can emit one (the fused rms_norm+mul, the fused sigmoid+mul, and
++    // dsv4_hc_pre) write it into slot 0 in addition to the F32 output, and the GEMM's activation
++    // conversion finds and skips it.  The F32 output stays valid for every other consumer, and the
++    // copy is RNE-rounded exactly as mmb_cvt_f32_bf16, so the GEMM arithmetic is bit-identical.
++    // Dense MUL_MAT only; F32-weight GEMMs read the activation directly (tiny-M / f32split).
++    {
++        static const int hc16 = getenv("GGML_CUDA_MMB_HC16") ? atoi(getenv("GGML_CUDA_MMB_HC16")) : 0;
++        if (hc16 >= 1 && ggml_cuda_mmb_active() &&
++                GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
++            auto rootof = [](const ggml_tensor * t) { while (t->view_src) t = t->view_src; return t; };
++            // every consumer of `root` (through views) must read it via the MMB bf16 activation cache
++            auto all_bf16_consumers = [&](const ggml_tensor * root) {
++                for (int i = 0; i < cgraph->n_nodes; ++i) {
++                    const ggml_tensor * t = cgraph->nodes[i];
++                    bool uses = false;
++                    for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (rootof(t->src[s]) == root) { uses = true; break; }
++                    if (!uses) continue;
++                    if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) continue;
++                    if (t->op == GGML_OP_MUL_MAT && t->src[1] && rootof(t->src[1]) == root && t->src[0] &&
++                            ggml_cuda_mmb_reads_bf16_act(t->src[0], t->src[1], t)) continue;
++                    if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] && rootof(t->src[1]) == root &&
++                            ggml_cuda_mmb_supported_mmid(t->src[0], t->src[1], t->src[2], t)) continue;
++                    // dsv4_hc_pre reads src[0] (the HC normalized stream) through the bf16 cache when
++                    // the activation is marked BF16-only (dsv4-hc.cu's xbf16 arm).  It is the one
++                    // consumer that runs well after the producer, so give xn a dedicated slot: the
++                    // generic slot 0 is reused by every other activation copy in between (and
++                    // dsv4_hc_pre writes its own output there).
++                    if (t->op == GGML_OP_DSV4_HC_PRE && t->src[0] && rootof(t->src[0]) == root) {
++                        ggml_cuda_mmb_mark_bf16_slot(root, 4);
++                        continue;
++                    }
++                    return false;
++                }
++                return true;
++            };
++            for (int i = 0; i < cgraph->n_nodes; ++i) {
++                const ggml_tensor * t = cgraph->nodes[i];
++                if (t->op != GGML_OP_MUL_MAT || t->src[0] == nullptr || t->src[1] == nullptr) continue;
++                if (t->src[0]->type == GGML_TYPE_F32) continue;
++                if (!ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
++                const ggml_tensor * ar = rootof(t->src[1]);
++                // single-consumer (bf16-cache GEMM only) -> the F32 output is dead: emit BF16 only.
++                // otherwise keep the F32 output and add the BF16 copy for the GEMMs that want it.
++                if (all_bf16_consumers(ar)) ggml_cuda_mmb_mark_bf16_only(ar);
++                else                       ggml_cuda_mmb_mark_bf16_copy(ar);
++            }
++        }
++    }
++
+     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+     if (!disable_fusion) {
+         for (int i = 0; i < cgraph->n_nodes; ++i) {
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index dd366ce15..595068ce5 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -993,7 +993,7 @@ __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo
+ // measured *worse* (pp8192 954.8 / 952.3 vs 957.4 at TT=1), so L2 serves the W panels well enough
+ // that the extra live registers and reduced block count cost more than the traffic saved.  Kept as
+ // a knob because the balance is a property of this cache, not of the algorithm.
+-template<int MMAX, int TT>
++template<int MMAX, int TT, bool XBF16 = false>
+ __global__ void __launch_bounds__(MMB_NT)
+ mmb_tiny_m_f32_kernel(const float * __restrict__ W, const float * __restrict__ X,
+                       float * __restrict__ D, const int M, const int K, const int T) {
+@@ -1006,18 +1006,33 @@ mmb_tiny_m_f32_kernel(const float * __restrict__ W, const float * __restrict__ X
+     for (int i = 0; i < TT; ++i)
+ #pragma unroll
+         for (int m = 0; m < MMAX; ++m) acc[i][m] = make_float4(0.f, 0.f, 0.f, 0.f);
+-    const float4 * xrow[TT];
++    const float4   * xrow[TT];
++    const uint16_t * xhrow[TT];
+ #pragma unroll
+     for (int i = 0; i < TT; ++i) {
+         const int t = t0 + i;
+         // out-of-range tokens get a valid dummy row; their results are dropped on the way out
+-        xrow[i] = (const float4 *) (X + (size_t) (t < T ? t : 0) * K);
++        const int tr = t < T ? t : 0;
++        xrow[i]  = (const float4 *) (X + (size_t) tr * K);
++        xhrow[i] = (const uint16_t *) X + (size_t) tr * K;
+     }
+     for (int k4 = lane; k4 < nk4; k4 += 32) {
+         const int k = k4 << 2;
+         float4 xv[TT], wv[MMAX];
+ #pragma unroll
+-        for (int i = 0; i < TT; ++i) xv[i] = xrow[i][k4];
++        for (int i = 0; i < TT; ++i) {
++            if constexpr (XBF16) {
++                // HC16: the producer marked this activation BF16-only, so X is a bf16 buffer (the
++                // F32 tensor was never written).  RNE-rounded on the way in, so the value matches
++                // exactly what the old F32->bf16 conversion produced (a numerics change vs rocBLAS
++                // only in that the GEMM now consumes the same rounded activation as the bf16 path).
++                const uint2 p = *(const uint2 *) (xhrow[i] + k);
++                xv[i] = make_float4(gm_bf2f((uint16_t) p.x), gm_bf2f((uint16_t) (p.x >> 16)),
++                                    gm_bf2f((uint16_t) p.y), gm_bf2f((uint16_t) (p.y >> 16)));
++            } else {
++                xv[i] = xrow[i][k4];
++            }
++        }
+ #pragma unroll
+         for (int m = 0; m < MMAX; ++m) wv[m] = (m < M) ? *(const float4 *) (W + (size_t) m * K + k) : make_float4(0.f, 0.f, 0.f, 0.f);
+ #pragma unroll
+@@ -1128,8 +1143,19 @@ __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t *
+ 
+ struct mmb_cache_entry { const ggml_tensor * root; const void * data; size_t n; ggml_cuda_pool_alloc<uint16_t> * buf; };
+ static std::vector<mmb_cache_entry> g_mmb_cache;
+-static mmb_cache_entry g_mmb_slots[4] = {{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr}};
++// Pinned producer slots (pinned until the next producer of the same slot): 0 = generic MMB-GEMM
++// activation copies, 1 = HC gate, 2 = GLU, 3 = routed MoE output, 4 = HC normalized stream xn.
++// Slot 4 exists because xn is the one activation with *delayed* consumers (dsv4_hc_pre src[0] and
++// the tiny-M inject GEMMs), so its copy cannot share the aggressively-reused generic slot 0 -- and
++// dsv4_hc_pre itself reads x from the slot while writing its own output to slot 0.
++static constexpr int MMB_SLOT_COUNT = 5;
++static mmb_cache_entry g_mmb_slots[MMB_SLOT_COUNT] = {{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr}};
+ static std::unordered_set<const ggml_tensor *> g_mmb_bf16_only;
++// "also emit a BF16 copy" mark: the F32 output stays valid; producers that can emit a BF16 side copy
++// write it into slot 0 and the MMB activation conversion finds and skips it.
++static std::unordered_set<const ggml_tensor *> g_mmb_bf16_copy;
++// BF16-only tensors that must not use the generic slot 0 (their copy has to outlive other producers).
++static std::unordered_map<const ggml_tensor *, int> g_mmb_bf16_slot;
+ 
+ static size_t mmb_cache_max() { static const int v = getenv("GGML_CUDA_MMB_CACHE") ? atoi(getenv("GGML_CUDA_MMB_CACHE")) : 4; return (size_t) v; }
+ static const ggml_tensor * mmb_root(const ggml_tensor * t) { return t->view_src ? t->view_src : t; }
+@@ -1145,7 +1171,7 @@ static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, con
+     for (auto & e : g_mmb_cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+     uint16_t * buf = mmb_cache_insert(ctx, src1, n);
+     { static const int lg = getenv("LLAMA_MMB_CVT_LOG") ? atoi(getenv("LLAMA_MMB_CVT_LOG")) : 0; static unsigned cnt = 0;
+-      if (lg && cnt++ < 200) fprintf(stderr, "MMB_CVT %s op=%s ne=[%lld,%lld,%lld,%lld] view_src=%s n=%zu\n", src1->name, ggml_op_name(src1->op), (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3], src1->view_src ? src1->view_src->name : "-", n); }
++      if (lg && cnt++ < 200) fprintf(stderr, "MMB_CVT %s op=%s ne=[%lld,%lld,%lld,%lld] view_src=%s src0=%s(%s) n=%zu\n", src1->name, ggml_op_name(src1->op), (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3], src1->view_src ? src1->view_src->name : "-", src1->src[0] ? src1->src[0]->name : "-", src1->src[0] ? ggml_op_name(src1->src[0]->op) : "-", n); }
+     mmb_cvt_f32_bf16<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, buf, n);
+     return buf;
+ }
+@@ -1302,7 +1328,7 @@ const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t) {
+     for (auto & e : g_mmb_cache) if (e.root == root && e.data == t->data) return e.buf->get();
+     return nullptr;
+ }
+-static size_t g_mmb_slot_cap[4] = {0, 0, 0};
++static size_t g_mmb_slot_cap[MMB_SLOT_COUNT] = {0, 0, 0, 0, 0};
+ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot, const ggml_tensor * t, size_t n) {
+     mmb_cache_entry & e = g_mmb_slots[slot];
+     if (e.buf && g_mmb_slot_cap[slot] < n) { delete e.buf; e.buf = nullptr; }
+@@ -1310,14 +1336,25 @@ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot,
+     e.root = mmb_root(t); e.data = t->data; e.n = n;
+     return e.buf->get();
+ }
+-void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); }
++void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); g_mmb_bf16_copy.clear(); g_mmb_bf16_slot.clear(); }
+ size_t ggml_cuda_mmb_marks_count() { return g_mmb_bf16_only.size(); }
+ void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) { g_mmb_bf16_only.insert(t); }
+ bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return g_mmb_bf16_only.count(t) > 0; }
++void ggml_cuda_mmb_mark_bf16_copy(const ggml_tensor * t) { g_mmb_bf16_copy.insert(t); }
++bool ggml_cuda_mmb_wants_bf16_copy(const ggml_tensor * t) { return g_mmb_bf16_copy.count(t) > 0; }
++void ggml_cuda_mmb_mark_bf16_slot(const ggml_tensor * t, int slot) { g_mmb_bf16_slot[t] = slot; }
++int  ggml_cuda_mmb_bf16_slot(const ggml_tensor * t) { auto it = g_mmb_bf16_slot.find(t); return it == g_mmb_bf16_slot.end() ? -1 : it->second; }
++// Producer-side reserve for a BF16 copy: honours the graph-assigned dedicated slot (xn) so the copy
++// is not clobbered by the next generic producer, falling back to slot 0.
++uint16_t * ggml_cuda_mmb_reserve_auto(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
++    const int slot = ggml_cuda_mmb_bf16_slot(t);
++    return ggml_cuda_mmb_slot_reserve(ctx, slot >= 0 && slot < MMB_SLOT_COUNT ? slot : 0, t, n);
++}
++
+ void ggml_cuda_mmb_begin_graph() { for (auto & e : g_mmb_cache) delete e.buf; g_mmb_cache.clear(); for (auto & e : g_mmb_slots) { e.root = nullptr; e.data = nullptr; e.n = 0; } }
+ void ggml_cuda_mmb_release_all() {
+     ggml_cuda_mmb_begin_graph();
+-    for (int i = 0; i < 4; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; }
++    for (int i = 0; i < MMB_SLOT_COUNT; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; }
+     // the shadow weights are raw cudaMalloc, keyed by data pointer and held for the life of the
+     // process. A model has finitely many weights so this never mattered, but a long-lived process
+     // that sees many distinct tensors (test-backend-ops) keeps every one of them.
+@@ -1359,6 +1396,17 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
+     return ggml_nrows(dst) == T;
+ }
+ 
++// True when this MMB GEMM reads its activation through the bf16 activation cache (i.e. the
++// activation's F32 buffer is not required): every weight type except F32 does, and of the F32
++// weights only the tiny-M warp-per-token kernel (the hc *_inject pair) does -- the WMMA f32-split
++// tile reads the F32 tensor directly.  The graph optimizer uses this to decide whether an
++// activation can be marked BF16-only (producer skips its F32 store).
++bool ggml_cuda_mmb_reads_bf16_act(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    if (!ggml_cuda_mmb_supported_mm(src0, src1, dst)) return false;
++    if (src0->type != GGML_TYPE_F32) return true;
++    return mmb_tiny_m_f32_ok(src0->ne[0], src0->ne[1]);
++}
++
+ bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
+     if (!mmb_enabled()) return false;
+     const bool wtype = src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ3_XXS;
+@@ -1393,12 +1441,27 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+             const int eff  = wide ? 1 : (tt >= 4 ? 4 : (tt == 2 ? 2 : 1));
+             dim3 tg((T + NWARPS * eff - 1) / (NWARPS * eff));
+             const float * Wf = (const float *) src0->data;
+-            const float * Xf = (const float *) src1->data;
++            // HC16: if the producer marked this activation BF16-only, the F32 tensor was never
++            // written; read the bf16 copy out of the activation cache instead.  Walk the whole view
++            // chain: the mark is on the fully-rooted producer output.
++            const ggml_tensor * x_root = src1;
++            while (x_root->view_src) x_root = x_root->view_src;
++            const uint16_t * Xh = ggml_cuda_mmb_is_bf16_only(x_root) ? ggml_cuda_mmb_cache_lookup(x_root) : nullptr;
++            const float * Xf = Xh ? (const float *) Xh : (const float *) src1->data;
+             float * Df = (float *) dst->data;
+-            if (wide)      mmb_tiny_m_f32_kernel<8, 1><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+-            else if (eff == 4) mmb_tiny_m_f32_kernel<4, 4><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+-            else if (eff == 2) mmb_tiny_m_f32_kernel<4, 2><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+-            else               mmb_tiny_m_f32_kernel<4, 1><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++            if (wide) {
++                if (Xh)  mmb_tiny_m_f32_kernel<8, 1, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++                else     mmb_tiny_m_f32_kernel<8, 1, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++            } else if (eff == 4) {
++                if (Xh)  mmb_tiny_m_f32_kernel<4, 4, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++                else     mmb_tiny_m_f32_kernel<4, 4, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++            } else if (eff == 2) {
++                if (Xh)  mmb_tiny_m_f32_kernel<4, 2, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++                else     mmb_tiny_m_f32_kernel<4, 2, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++            } else {
++                if (Xh)  mmb_tiny_m_f32_kernel<4, 1, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++                else     mmb_tiny_m_f32_kernel<4, 1, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
++            }
+             CUDA_CHECK(cudaGetLastError()); return;
+         }
+         dim3 grid((M + 127) / 128, (T + 127) / 128);
+@@ -1420,7 +1483,12 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     const uint16_t * shadow_pre = ((src0->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || src0->type == GGML_TYPE_Q6_K) ? mmb_shadow_lookup(src0) : nullptr;
+     static const int tile_ov = getenv("GGML_CUDA_MMB_TILE") ? atoi(getenv("GGML_CUDA_MMB_TILE")) : -1;
+     const bool big = tile_ov >= 0 ? (tile_ov != 0) : ((M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096));
+-    uint16_t * Dh = (mmb_hc16() && K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
++    // HC gate (K=320, M=10240).  "producer slots ... 1 = HC gate" -- when the graph marks this
++    // output BF16-only, the gate is written ONCE into the pinned slot 1 and the dsv4_hc_pre
++    // consumer reads that BF16 copy instead of round-tripping the F32 tensor.  The mark alone is
++    // enough to allocate the slot; mmb_hc16() keeps the historical "always allocate" behaviour
++    // for A/B (with an F32 store left in place because the mark is what suppresses it).
++    uint16_t * Dh = ((mmb_hc16() || ggml_cuda_mmb_is_bf16_only(dst)) && K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
+     bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(dst));
+     if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0) {
+         Dh = (uint16_t *) dst->data; store_f32 = false;
+diff --git a/ggml/src/ggml-cuda/mmb.cuh b/ggml/src/ggml-cuda/mmb.cuh
+index 270cb0fc4..8d9c14539 100644
+--- a/ggml/src/ggml-cuda/mmb.cuh
++++ b/ggml/src/ggml-cuda/mmb.cuh
+@@ -3,6 +3,9 @@
+ // MMB: dequant-to-BF16 WMMA GEMM path for IQ4_NL weights on gfx1151 (RDNA3.5). Env-gated: LLAMA_MMB=1, LLAMA_MMB_MIN_T (default 512).
+ bool ggml_cuda_mmb_supported_mm  (const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+ bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst);
++// MMB takes this dense GEMM and reads its activation via the bf16 activation cache (so the
++// activation's F32 output is optional).
++bool ggml_cuda_mmb_reads_bf16_act(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+ void ggml_cuda_mul_mat_mmb   (ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+ void ggml_cuda_mmb_begin_graph();
+@@ -12,10 +15,18 @@ uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const gg
+ const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t);
+ // producer slots (pinned until the next producer of the same kind): 0 = HC normalized stream xn, 1 = HC gate
+ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot, const ggml_tensor * t, size_t n);
++// Producer-side BF16-copy reserve that honours a graph-assigned dedicated slot (xn).
++uint16_t * ggml_cuda_mmb_reserve_auto(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n);
++void ggml_cuda_mmb_mark_bf16_slot(const ggml_tensor * t, int slot);
++int  ggml_cuda_mmb_bf16_slot(const ggml_tensor * t);
+ void ggml_cuda_mmb_marks_clear();
+ size_t ggml_cuda_mmb_marks_count();
+ void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t);
+ bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t);
++// "also emit a BF16 copy" mark (the F32 output stays valid); set by the graph optimizer for MMB
++// dense GEMM activations, honoured by the fused rms_norm+mul, fused sigmoid+mul and dsv4_hc_pre.
++void ggml_cuda_mmb_mark_bf16_copy(const ggml_tensor * t);
++bool ggml_cuda_mmb_wants_bf16_copy(const ggml_tensor * t);
+ bool ggml_cuda_mmb_gatemix();
+ bool ggml_cuda_mmb_active();
+ // True iff MMB will actually take a dense MUL_MAT / a routed MUL_MAT_ID or its SWIGLU pair for this
+diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cu b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
+index a3f462271..f5ca12a1e 100644
+--- a/ggml/src/ggml-cuda/moe-weighted-reduction.cu
++++ b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
+@@ -1,5 +1,14 @@
+ #include "moe-weighted-reduction.cuh"
+ 
++// HIP's float4 is a struct, and __builtin_nontemporal_load/_store only accept builtin scalar or
++// vector types, so use an ext_vector_type view of the same 16 bytes for the streaming access.
++//
++// The expert-row read is the streaming bulk (each element read once), so it uses a non-temporal
++// LOAD; the small weights/expert_scale stay cached, and the dst STORE stays a normal store (a
++// non-temporal store here measured +32 ms: it evicts the output the next op wants).  Measured
++// -40 ms on this kernel at gfx1151 pp8192 (session 14).
++typedef float moe_nt_f4 __attribute__((ext_vector_type(4)));
++
+ // float4 quad variant: only valid when every expert row starts 16B-aligned, i.e. when
+ // n_embd % 4 == 0 (checked by the launcher). Real models have n_embd % 4 == 0, so the
+ // aligned path below covers them unchanged; the scalar kernel is the fallback for
+@@ -23,23 +32,23 @@ static __global__ void moe_weighted_reduction_f32_vec4(const float * __restrict_
+     const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
+     float4 sum;
+     {
+-        const float4 e = *reinterpret_cast<const float4 *>(experts + first_row * n_embd + col);
++        const moe_nt_f4 e = __builtin_nontemporal_load(reinterpret_cast<const moe_nt_f4 *>(experts + first_row * n_embd + col));
+         const float  w = weights[first_row];
+-        sum.x = (e.x * first_scale) * w;
+-        sum.y = (e.y * first_scale) * w;
+-        sum.z = (e.z * first_scale) * w;
+-        sum.w = (e.w * first_scale) * w;
++        sum.x = (e[0] * first_scale) * w;
++        sum.y = (e[1] * first_scale) * w;
++        sum.z = (e[2] * first_scale) * w;
++        sum.w = (e[3] * first_scale) * w;
+     }
+ 
+     for (int expert = 1; expert < n_expert_used; ++expert) {
+         const uint64_t row   = first_row + expert;
+         const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+-        const float4  e     = *reinterpret_cast<const float4 *>(experts + row * n_embd + col);
++        const moe_nt_f4 e   = __builtin_nontemporal_load(reinterpret_cast<const moe_nt_f4 *>(experts + row * n_embd + col));
+         const float   w     = weights[row];
+-        sum.x += (e.x * scale) * w;
+-        sum.y += (e.y * scale) * w;
+-        sum.z += (e.z * scale) * w;
+-        sum.w += (e.w * scale) * w;
++        sum.x += (e[0] * scale) * w;
++        sum.y += (e[1] * scale) * w;
++        sum.z += (e[2] * scale) * w;
++        sum.w += (e[3] * scale) * w;
+     }
+     reinterpret_cast<float4 *>(dst + token * n_embd + col)[0] = sum;
+ }
+@@ -59,12 +68,12 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
+ 
+     const uint64_t first_row   = (uint64_t) token * n_expert_used;
+     const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
+-    float          sum         = (experts[first_row * n_embd + col] * first_scale) * weights[first_row];
++    float          sum         = (__builtin_nontemporal_load(experts + first_row * n_embd + col) * first_scale) * weights[first_row];
+ 
+     for (int expert = 1; expert < n_expert_used; ++expert) {
+         const uint64_t row   = first_row + expert;
+         const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
+-        sum += (experts[row * n_embd + col] * scale) * weights[row];
++        sum += (__builtin_nontemporal_load(experts + row * n_embd + col) * scale) * weights[row];
+     }
+     dst[token * n_embd + col] = sum;
+ }
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 4bf198077..5a60a47d6 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -1,6 +1,15 @@
+ #include "norm.cuh"
++#include "mmb.cuh"
+ #include <cstdint>
+ 
++// RNE f32 -> bf16, bit-identical to mmb.cu's mmb_f2bf (used to emit the HC normalized stream's
++// BF16 copy from the producer so the following MMB GEMM can skip its own conversion pass).
++static __device__ __forceinline__ uint16_t norm_f2bf(float f) {
++    uint32_t u = __float_as_uint(f);
++    u += 0x7fffu + ((u >> 16) & 1u);
++    return (uint16_t)(u >> 16);
++}
++
+ template <int block_size>
+ static __global__ void norm_f32(
+         const float * x, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
+@@ -96,7 +105,9 @@ static __global__ void rms_norm_f32(const float * x,
+                                     const uint3   add_ncols_packed     = make_uint3(0, 0, 0),
+                                     const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
+                                     const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
+-                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0)) {
++                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
++                                    uint16_t *    dst16                = nullptr,
++                                    bool          store_f32            = true) {
+     ggml_cuda_pdl_lc();
+     const int nrows     = gridDim.x;
+     const int nchannels = gridDim.y;
+@@ -110,6 +121,9 @@ static __global__ void rms_norm_f32(const float * x,
+ 
+     x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+     dst += ((sample*nchannels + channel)*nrows + row)*ncols;
++    if (dst16 != nullptr) {
++        dst16 += ((sample*nchannels + channel)*nrows + row)*ncols;
++    }
+ 
+     if constexpr (do_multiply) {
+         const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+@@ -141,15 +155,20 @@ static __global__ void rms_norm_f32(const float * x,
+     const float scale = rsqrtf(mean + eps);
+ 
+     for (int col = tid; col < ncols; col += block_size) {
++        float v;
+         if constexpr (do_multiply && do_add) {
+             const int mul_col = fastmodulo(col, mul_ncols_packed);
+             const int add_col = fastmodulo(col, add_ncols_packed);
+-            dst[col]          = scale * x[col] * mul[mul_col] + add[add_col];
++            v = scale * x[col] * mul[mul_col] + add[add_col];
+         } else if constexpr (do_multiply) {
+             const int mul_col = fastmodulo(col, mul_ncols_packed);
+-            dst[col]          = scale * x[col] * mul[mul_col];
++            v = scale * x[col] * mul[mul_col];
+         } else {
+-            dst[col] = scale * x[col];
++            v = scale * x[col];
++        }
++        if (store_f32) dst[col] = v;
++        if (dst16 != nullptr) {
++            dst16[col] = norm_f2bf(v);
+         }
+     }
+ }
+@@ -312,14 +331,14 @@ static void rms_norm_f32_cuda(
+             x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+         // underlying cudaLaunchKernelEx does not support default params
+         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+-        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), nullptr, true);
+     } else {
+         const dim3 block_dims(1024, 1, 1);
+         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+         ggml_cuda_kernel_launch(rms_norm_f32<1024, false>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+         // underlying cudaLaunchKernelEx does not support default params
+         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+-        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), nullptr, true);
+     }
+ }
+ 
+@@ -349,7 +368,9 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+                                   const uint32_t add_nchannels,
+                                   const uint32_t add_nsamples,
+                                   const float    eps,
+-                                  cudaStream_t   stream) {
++                                  cudaStream_t   stream,
++                                  uint16_t *     dst16 = nullptr,
++                                  bool           store_f32 = true) {
+     const dim3 blocks_num(nrows, nchannels, nsamples);
+     if (mul == nullptr) {
+         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
+@@ -367,7 +388,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                 // underlying cudaLaunchKernelEx does not support default params
+-            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), dst16, store_f32);
+         } else {
+             const dim3 block_dims(1024, 1, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+@@ -375,7 +396,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                 // underlying cudaLaunchKernelEx does not support default params
+-            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), dst16, store_f32);
+         }
+     } else {
+         const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+@@ -394,7 +415,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+-                add_nchannels_packed, add_nsamples_packed);
++                add_nchannels_packed, add_nsamples_packed, nullptr, true);
+         } else {
+             const dim3 block_dims(1024, 1, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+@@ -402,7 +423,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+-                add_nchannels_packed, add_nsamples_packed);
++                add_nchannels_packed, add_nsamples_packed, nullptr, true);
+         }
+     }
+ }
+@@ -742,6 +763,19 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+     GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
+     GGML_ASSERT(eps >= 0.0f);
+ 
++    // HC16: when this norm+mul output is marked as an MMB GEMM activation, also emit the BF16 copy
++    // the GEMM will read, so it skips its own mmb_cvt pass.  The BF16 value is RNE-rounded exactly
++    // as mmb_cvt_f32_bf16 would, so the GEMM's arithmetic (and the whole output) is bit-identical.
++    uint16_t * dst16 = nullptr;
++    bool store_f32 = true;
++    if (ggml_cuda_mmb_is_bf16_only(mul_tensor)) {
++        // every consumer reads the BF16 copy -> the F32 output is dead
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, mul_tensor, (size_t) ggml_nelements(mul_tensor));
++        store_f32 = false;
++    } else if (ggml_cuda_mmb_wants_bf16_copy(mul_tensor)) {
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, mul_tensor, (size_t) ggml_nelements(mul_tensor));
++    }
++
+     const int64_t ne00 = rms_norm_src->ne[0];
+     const int64_t ne01 = rms_norm_src->ne[1];
+     const int64_t ne02 = rms_norm_src->ne[2];
+@@ -771,7 +805,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+                           mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                           /*add_s00*/ 0, 0, 0,
+                           0, 0, 0, 0,
+-                          eps, stream);
++                          eps, stream, dst16, store_f32);
+ }
+ 
+ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 55914e7a3..9b5a8d287 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -1,5 +1,13 @@
+ #include "unary.cuh"
+ #include "convert.cuh"
++#include "mmb.cuh"
++
++// RNE f32 -> bf16, bit-identical to mmb.cu's mmb_f2bf.
++static __device__ __forceinline__ uint16_t unary_f2bf(float f) {
++    uint32_t u = __float_as_uint(f);
++    u += 0x7fffu + ((u >> 16) & 1u);
++    return (uint16_t)(u >> 16);
++}
+ 
+ static __device__ __forceinline__ float op_abs(float x) {
+     return fabsf(x);
+@@ -115,7 +123,7 @@ static __device__ __forceinline__ float op_trunc(float x) {
+ }
+ 
+ template <float (*op)(float), typename T>
+-static __global__ void unary_op_kernel(const T * x, T * dst, const int k) {
++static __global__ void unary_op_kernel(const T * x, T * dst, const int k, uint16_t * dst16 = nullptr, bool store_f32 = true) {
+     ggml_cuda_pdl_lc();
+     const int i = blockDim.x*blockIdx.x + threadIdx.x;
+ 
+@@ -124,14 +132,18 @@ static __global__ void unary_op_kernel(const T * x, T * dst, const int k) {
+     }
+ 
+     ggml_cuda_pdl_sync();
+-    dst[i] = (T)op((float)x[i]);
++    const float v = op((float)x[i]);
++    if (store_f32) dst[i] = (T)v;
++    if (dst16 != nullptr) {
++        dst16[i] = unary_f2bf(v);
++    }
+ }
+ 
+ template <float (*op)(float), typename T>
+-static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
++static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream, uint16_t * dst16 = nullptr, bool store_f32 = true) {
+     const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
+-    ggml_cuda_kernel_launch(unary_op_kernel<op, T>, launch_params, x, dst, k);
++    ggml_cuda_kernel_launch(unary_op_kernel<op, T>, launch_params, x, dst, k, dst16, store_f32);
+ }
+ 
+ template <float (*op)(float)>
+@@ -147,10 +159,21 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
+     GGML_ASSERT(src0->type == dst->type);
+ 
++    // HC16: if this unary output is an MMB GEMM activation, also emit the BF16 copy the GEMM will
++    // read (RNE-rounded exactly as mmb_cvt_f32_bf16), so it skips its own conversion pass.  The F32
++    // output is still written, so every other consumer is unaffected (bit-identical).
++    uint16_t * dst16 = nullptr;
++    bool store_f32 = true;
++    if (ggml_cuda_mmb_is_bf16_only(dst)) {
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, dst, (size_t) ggml_nelements(dst));
++        store_f32 = false;
++    } else if (ggml_cuda_mmb_wants_bf16_copy(dst)) {
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, dst, (size_t) ggml_nelements(dst));
++    }
+     if (src0->type == GGML_TYPE_F16) {
+-        unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
++        unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream, dst16, store_f32);
+     } else {
+-        unary_cuda<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
++        unary_cuda<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream, dst16, store_f32);
+     }
+ }
+ 
+@@ -260,7 +283,7 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ /* gated ops */
+ 
+ template <float (*op)(float), typename T>
+-static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
++static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, uint16_t * dst16 = nullptr, bool store_f32 = true) {
+     ggml_cuda_pdl_lc();
+     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+ 
+@@ -273,7 +296,13 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst,
+     const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+ 
+     ggml_cuda_pdl_sync();
+-    dst[i] = (T)(op((float)x[j0]) * (float)g[j1]);
++    // streaming loads only (the dst is consumed immediately, so its store stays cached); -38 ms on
++    // this kernel in situ at gfx1151 pp8192.  `ggml_cuda_nt_load` no-ops for the non-f32 instantiations.
++    const float v = op((float)ggml_cuda_nt_load(x + j0)) * (float)ggml_cuda_nt_load(g + j1);
++    if (store_f32) dst[i] = (T)v;
++    if (dst16 != nullptr) {
++        dst16[i] = unary_f2bf(v);
++    }
+ }
+ 
+ // Same as unary_gated_op_kernel but writes the Q8_1 quantized product into the
+@@ -385,10 +414,10 @@ void ggml_cuda_op_unary_mul_q8_1(ggml_backend_cuda_context & ctx,
+ }
+ 
+ template <float (*op)(float), typename T>
+-static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
++static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream, uint16_t * dst16 = nullptr, bool store_f32 = true) {
+     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+-    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
++    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1, dst16, store_f32);
+ }
+ 
+ template <float (*op)(float)>
+@@ -758,7 +787,7 @@ void ggml_cuda_op_leaky_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+ /* fused unary + mul */
+ 
+ template <float (*op)(float)>
+-static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
++static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node, uint16_t * dst16, bool store_f32) {
+     // unary_node: UNARY op applied to unary_node->src[0]
+     // mul_node:   MUL(a, b) where one of a/b is unary_node
+     // Output goes to mul_node->data
+@@ -786,24 +815,35 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
+     if (unary_src->type == GGML_TYPE_F16) {
+         unary_gated_cuda<op>((const half *) unary_src->data, (const half *) other_src->data,
+                              (half *) mul_node->data, k, nc,
+-                             unary_stride / sizeof(half), other_stride / sizeof(half), stream);
++                             unary_stride / sizeof(half), other_stride / sizeof(half), stream, dst16, store_f32);
+     } else {
+         unary_gated_cuda<op>((const float *) unary_src->data, (const float *) other_src->data,
+                              (float *) mul_node->data, k, nc,
+-                             unary_stride / sizeof(float), other_stride / sizeof(float), stream);
++                             unary_stride / sizeof(float), other_stride / sizeof(float), stream, dst16, store_f32);
+     }
+ }
+ 
+ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
++    // HC16: if this gated product is an MMB GEMM activation, also emit the BF16 copy the GEMM will
++    // read (RNE-rounded exactly as mmb_cvt_f32_bf16), so it skips its own conversion pass.  When the
++    // graph marked it BF16-only the F32 output is dead and is not written at all.
++    uint16_t * dst16 = nullptr;
++    bool store_f32 = true;
++    if (ggml_cuda_mmb_is_bf16_only(mul_node)) {
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, mul_node, (size_t) ggml_nelements(mul_node));
++        store_f32 = false;
++    } else if (ggml_cuda_mmb_wants_bf16_copy(mul_node)) {
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, mul_node, (size_t) ggml_nelements(mul_node));
++    }
+     switch (ggml_get_unary_op(unary_node)) {
+         case GGML_UNARY_OP_SILU:
+-            ggml_cuda_op_unary_mul_impl<op_silu>(ctx, unary_node, mul_node);
++            ggml_cuda_op_unary_mul_impl<op_silu>(ctx, unary_node, mul_node, dst16, store_f32);
+             break;
+         case GGML_UNARY_OP_SIGMOID:
+-            ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node);
++            ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node, dst16, store_f32);
+             break;
+         case GGML_UNARY_OP_SOFTPLUS:
+-            ggml_cuda_op_unary_mul_impl<op_softplus>(ctx, unary_node, mul_node);
++            ggml_cuda_op_unary_mul_impl<op_softplus>(ctx, unary_node, mul_node, dst16, store_f32);
+             break;
+         default:
+             GGML_ABORT("Unsupported unary op for fused unary+mul");
+@@ -836,7 +876,7 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
+  */
+ 
+ template <float (*op)(float)>
+-static __global__ void scale_unary_kernel(const float * x, float * dst, const float scale, const float bias, const int k) {
++static __global__ void scale_unary_kernel(const float * x, float * dst, const float scale, const float bias, const int k, uint16_t * dst16 = nullptr, bool store_f32 = true) {
+     ggml_cuda_pdl_lc();
+     const int i = blockDim.x*blockIdx.x + threadIdx.x;
+ 
+@@ -845,14 +885,18 @@ static __global__ void scale_unary_kernel(const float * x, float * dst, const fl
+     }
+ 
+     ggml_cuda_pdl_sync();
+-    dst[i] = op(scale * x[i] + bias);
++    const float v = op(scale * x[i] + bias);
++    if (store_f32) dst[i] = v;
++    if (dst16 != nullptr) {
++        dst16[i] = unary_f2bf(v);
++    }
+ }
+ 
+ template <float (*op)(float)>
+-static void scale_unary_cuda(const float * x, float * dst, const float scale, const float bias, const int k, cudaStream_t stream) {
++static void scale_unary_cuda(const float * x, float * dst, const float scale, const float bias, const int k, cudaStream_t stream, uint16_t * dst16 = nullptr, bool store_f32 = true) {
+     const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
+-    ggml_cuda_kernel_launch(scale_unary_kernel<op>, launch_params, x, dst, scale, bias, k);
++    ggml_cuda_kernel_launch(scale_unary_kernel<op>, launch_params, x, dst, scale, bias, k, dst16, store_f32);
+ }
+ 
+ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * unary_node) {
+@@ -867,12 +911,24 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
+     const float bias  = ggml_get_op_params_f32(scale_node, 1);
+     const int   k     = ggml_nelements(src);
+ 
++    // HC16: if this fused scale+unary output is an MMB GEMM activation, also emit the BF16 copy the
++    // GEMM will read (RNE-rounded exactly as mmb_cvt_f32_bf16), so it skips its own conversion pass.
++    // The F32 output is still written, so every other consumer is unaffected (bit-identical).
++    uint16_t * dst16 = nullptr;
++    bool store_f32 = true;
++    if (ggml_cuda_mmb_is_bf16_only(unary_node)) {
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, unary_node, (size_t) ggml_nelements(unary_node));
++        store_f32 = false;
++    } else if (ggml_cuda_mmb_wants_bf16_copy(unary_node)) {
++        dst16 = ggml_cuda_mmb_reserve_auto(ctx, unary_node, (size_t) ggml_nelements(unary_node));
++    }
++
+     switch (ggml_get_unary_op(unary_node)) {
+         case GGML_UNARY_OP_SILU:
+-            scale_unary_cuda<op_silu>((const float *) src->data, (float *) unary_node->data, scale, bias, k, stream);
++            scale_unary_cuda<op_silu>((const float *) src->data, (float *) unary_node->data, scale, bias, k, stream, dst16, store_f32);
+             break;
+         case GGML_UNARY_OP_SIGMOID:
+-            scale_unary_cuda<op_sigmoid>((const float *) src->data, (float *) unary_node->data, scale, bias, k, stream);
++            scale_unary_cuda<op_sigmoid>((const float *) src->data, (float *) unary_node->data, scale, bias, k, stream, dst16, store_f32);
+             break;
+         default:
+             GGML_ABORT("unsupported unary op for fused scale+unary");
+-- 
+2.55.0
+

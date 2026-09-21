@@ -1,21 +1,23 @@
-From 28f8d2398d0955e58f62aabf20d045a6d6027a2e Mon Sep 17 00:00:00 2001
+From 5f522c1564161f653bf29a276006d32fb050b135 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
-Date: Sat, 19 Sep 2026 17:09:59 -0500
-Subject: [PATCH 01/38] WIP mmb: generalize to dense Q4_K/Q5_1, RDNA3 arch
- gate, per-weight-type fusion stand-down
+Date: Sun, 20 Sep 2026 21:01:26 -0500
+Subject: [PATCH 1/5] WIP mmb: the general-purpose bf16-WMMA dequant weight
+ GEMM (all weight types)
 
-- mmb_dq_row_q4k / mmb_dq_row_q5_1 on-the-fly bf16 LDS dequant (no shadow)
-- WTYPE 3 (Q4_K) + 4 (Q5_1) in mmb_tile_gemm and mmb_dense_kernel
-- supported_mm accepts Q4_K/Q5_1; K%256 guard for Q4_K
-- mmb_enabled() runtime-gated to RDNA3/RDNA3_5 (gfx11 WMMA builtin)
-- graph optimizer stands its pair/SWIGLU fusions down on per-weight-type
-  predicates (ggml_cuda_mmb_*_will_take) instead of the global gate
-- Q4_K_M: pp2048 604->631, pp8192 570->598 (+4.4/+4.9%); PPL 10.333->10.270
+Squashed theme commit (14 originals): dense Q4_K/Q5_1 + the RDNA3 arch gate +
+the per-weight-type fusion stand-down; routed Q4_K/Q5_1 (expert GLU + down) with
+the RDNA3_5-default gate; IQ3_S routed experts (WTYPE 5, on-the-fly grid/sign);
+the portable WMMA wrappers (RDNA4 no-op) so the multi-arch build compiles;
+Q8_0 in the routed/GLU path; on-the-fly Q5_K/Q6_K (WTYPE 6/7); IQ4_XS
+(WTYPE 8); Q3_K/IQ3_XXS (WTYPE 9/10); the gated MMB diagnostics; then the
+structural line -- the A-panel double-buffered GLU tile, the v_perm bf16 RNE
+pack, the IQ3_S A-panel dequant split, the tile-class threshold
+(THRESH == BN_SMALL) and the load_regs IQ3_S field preload.
 ---
- ggml/src/ggml-cuda/ggml-cuda.cu |  39 +-
- ggml/src/ggml-cuda/mmb.cu       | 981 ++++++++++++++++++++++++++++++++
- ggml/src/ggml-cuda/mmb.cuh      |  33 ++
- 3 files changed, 1051 insertions(+), 2 deletions(-)
+ ggml/src/ggml-cuda/ggml-cuda.cu |   39 +-
+ ggml/src/ggml-cuda/mmb.cu       | 1555 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmb.cuh      |   33 +
+ 3 files changed, 1625 insertions(+), 2 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/mmb.cu
  create mode 100644 ggml/src/ggml-cuda/mmb.cuh
 
@@ -120,10 +122,10 @@ index 071911a0c..ec05c628b 100644
      bool cuda_graph_update_required = false;
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
 new file mode 100644
-index 000000000..548f5abde
+index 000000000..792ed5e0f
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -0,0 +1,981 @@
+@@ -0,0 +1,1555 @@
 +#include "mmb.cuh"
 +#include "unary.cuh"
 +#include <unordered_map>
@@ -141,9 +143,43 @@ index 000000000..548f5abde
 +constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
 +
 +__device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
-+__device__ __forceinline__ uint32_t mmb_pack2(float a, float b) { return (uint32_t)mmb_f2bf(a) | ((uint32_t)mmb_f2bf(b) << 16); }
++// RNE float->bf16.  `v_cvt_pk_bf16_f32` does not exist on gfx11, and `__bf16` lowers to a
++// truncating convert (10/4096 values differ from RNE), so the rounding is done in integer and the
++// pair is assembled with `v_perm_b32` (bytes 2,3 of each rounded word) -- one instruction where the
++// shift/or form needed two, and no `>>16` per value.  Selector 0x03020706 = {ua.b2, ua.b3, ub.b2,
++// ub.b3}: v_perm's byte 0..3 come from its second operand, 4..7 from its first.  Bit-identical
++// (incl. +0/-0, `d == 0` weights) -- verified 1M random pairs, `PPL`/greedy/width gates.
++// The shift/or form.  Kept for the IQ3 dequants: they are LUT-latency bound and the v_perm form,
++// which needs all eight rounded words before it can start, is measurably slower there
++// (IQ3_S GLU 1318 -> 1355 ms without DBUF, 1225 -> 1258 with).  Every other dequant prefers perm.
++__device__ __forceinline__ uint32_t mmb_pack2_so(float a, float b) { return (uint32_t)mmb_f2bf(a) | ((uint32_t)mmb_f2bf(b) << 16); }
++
++__device__ __forceinline__ uint32_t mmb_pack2(float a, float b) {
++    uint32_t ua = __float_as_uint(a), ub = __float_as_uint(b);
++    ua += 0x7fffu + ((ua >> 16) & 1u);
++    ub += 0x7fffu + ((ub >> 16) & 1u);
++    return __builtin_amdgcn_perm(ua, ub, 0x03020706u);
++}
 +__constant__ int8_t mmb_kv_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 +__device__ __forceinline__ float mmb_h2f(uint16_t h) { return (float) __builtin_bit_cast(_Float16, h); }
++
++// Portable WMMA dispatch: gfx12 renamed the builtins and uses different fragment types.  The kernels
++// are runtime-gated to RDNA3_5 (mmb_enabled), so on RDNA4 the wrappers are never launched -- they
++// exist only so the multi-arch build compiles, and are deliberately no-ops there.
++__device__ __forceinline__ v8f mmb_wmma_bf16(v16s a, v16s b, v8f c) {
++#if defined(RDNA4)
++    (void) a; (void) b; return c;
++#else
++    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
++#endif
++}
++__device__ __forceinline__ v8f mmb_wmma_f16(v16s a, v16s b, v8f c) {
++#if defined(RDNA4)
++    (void) a; (void) b; return c;
++#else
++    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
++#endif
++}
 +
 +__global__ void mmb_cvt_f32_bf16(const float * __restrict__ x, uint16_t * __restrict__ y, const size_t n) {
 +    size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 8;
@@ -153,6 +189,116 @@ index 000000000..548f5abde
 +        *(uint4 *)(y + i) = o;
 +    } else {
 +        for (; i < n; ++i) y[i] = mmb_f2bf(x[i]);
++    }
++}
++
++// dequantize one weight row's 64-value quarter of an IQ4_XS super-block (136 B: half d, uint16
++// scales_h, uint8 scales_l[4], qs[128]).  Same nibble LUT as IQ4_NL; the 6-bit sub-block scale is
++// split scale = (scales_l[q4] nibble) | (scales_h bits 4*q4 .. +1) << 4, then value = d*(scale-32)*kv.
++__device__ __forceinline__ void mmb_dq_row_iq4xs(const uint8_t * base, const int q4, uint32_t * arow) {
++    const float dh = mmb_h2f(*(const uint16_t *) base);
++    const uint32_t sh = *(const uint16_t *)(base + 2);
++    const uint32_t sl = *(const uint8_t  *)(base + 4 + q4);
++    const uint32_t * qA = (const uint32_t *)(base + 8 + 32 * q4);
++    const uint32_t * qB = (const uint32_t *)(base + 8 + 32 * q4 + 16);
++    const int sA = (int)((sl & 0xf) | (((sh >> (4 * q4))     & 3) << 4));
++    const int sB = (int)((sl >> 4)  | (((sh >> (4 * q4 + 2)) & 3) << 4));
++    const float dA = dh * (float)(sA - 32), dB = dh * (float)(sB - 32);
++    const uint32_t L0 = 0x3f2d1801u, L1 = 0x766a5d4fu, L2 = 0xa6998d81u, L3 = 0xf1d9c5b5u;
++#pragma unroll
++    for (int blk = 0; blk < 2; ++blk) {
++        const float d = blk ? dB : dA; const float md = -128.0f * d; const uint32_t * q = blk ? qB : qA; uint32_t * out = arow + blk * 16;
++#pragma unroll
++        for (int w = 0; w < 4; ++w) {
++            const uint32_t v = q[w];
++            const uint32_t nib[2] = { v & 0x0F0F0F0Fu, (v >> 4) & 0x0F0F0F0Fu };
++            float x[2][4];
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const uint32_t n = nib[h];
++                const uint32_t sel = n & 0x07070707u;
++                const uint32_t pA = __builtin_amdgcn_perm(L1, L0, sel);
++                const uint32_t pB = __builtin_amdgcn_perm(L3, L2, sel);
++                const uint32_t m  = ((n >> 3) & 0x01010101u) * 0xFFu;
++                const uint32_t u  = (pA & ~m) | (pB & m);
++                x[h][0] = fmaf((float)(u & 0xFFu), d, md);
++                x[h][1] = fmaf((float)((u >> 8) & 0xFFu), d, md);
++                x[h][2] = fmaf((float)((u >> 16) & 0xFFu), d, md);
++                x[h][3] = fmaf((float)(u >> 24), d, md);
++            }
++            out[2*w]         = mmb_pack2(x[0][0], x[0][1]); out[2*w + 1]     = mmb_pack2(x[0][2], x[0][3]);
++            out[8 + 2*w]     = mmb_pack2(x[1][0], x[1][1]); out[8 + 2*w + 1] = mmb_pack2(x[1][2], x[1][3]);
++        }
++    }
++}
++
++// dequantize one weight row's 64-value quarter of a Q3_K super-block (110 B: hmask[32], qs[64],
++// scales[12], half d) into 64 bf16.  Quarter q4: half n = q4>>1; two 32-value groups at j =
++// 2*(q4&1)+jj, 2-bit field shift 2*j, high bit hmask bit (4n+j); 16-value sub-blocks is0 carry the
++// 6-bit scale.  value = d*(scale-32) * ((qs>>shift)&3 - (high ? 0 : 4)).
++__device__ __forceinline__ void mmb_dq_row_q3k(const uint8_t * base, const int q4, uint32_t * arow) {
++    const uint8_t * hm = base;
++    const uint8_t * qn = base + 32 + 32 * (q4 >> 1);
++    const uint8_t * sc = base + 96;
++    const float d = mmb_h2f(*(const uint16_t *)(base + 108));
++    const int n = q4 >> 1;
++#pragma unroll
++    for (int jj = 0; jj < 2; ++jj) {
++        const int j = 2 * (q4 & 1) + jj;
++        const int shift = 2 * j;
++        const uint32_t m = 1u << (4 * n + j);
++        uint32_t * out = arow + 16 * jj;
++#pragma unroll
++        for (int is0 = 0; is0 < 2; ++is0) {
++            const int is = 8 * n + 2 * j + is0;
++            int us;
++            if (is < 4)       us = (sc[is] & 0xF) | (((sc[is + 8] >> 0) & 3) << 4);
++            else if (is < 8)  us = (sc[is] & 0xF) | (((sc[is + 4] >> 2) & 3) << 4);
++            else if (is < 12) us = (sc[is - 8] >> 4) | (((sc[is]     >> 4) & 3) << 4);
++            else              us = (sc[is - 8] >> 4) | (((sc[is - 4] >> 6) & 3) << 4);
++            const float dl = d * (float)(us - 32);
++#pragma unroll
++            for (int l = 0; l < 16; l += 2) {
++                const int li = 16 * is0 + l;
++                const float v0 = dl * (float)((int)((qn[li]     >> shift) & 3) - ((hm[li]     & m) ? 0 : 4));
++                const float v1 = dl * (float)((int)((qn[li + 1] >> shift) & 3) - ((hm[li + 1] & m) ? 0 : 4));
++                out[li / 2] = mmb_pack2(v0, v1);
++            }
++        }
++    }
++}
++
++// dequantize one weight row's 64-value quarter of an IQ3_XXS super-block (98 B: half d, qs[96]) into
++// 64 bf16.  Quarter q4 = groups ib = 2*q4, 2*q4+1; each group is 4x8 values from the 256-entry grid
++// with signs + a 4-bit sub-scale packed into the gas word at qs[64 + 4*ib].
++__device__ __forceinline__ void mmb_dq_row_iq3xxs(const uint8_t * base, const int q4, uint32_t * arow) {
++    const float d0 = mmb_h2f(*(const uint16_t *) base);
++    const uint8_t * qs = base + 2;
++#pragma unroll
++    for (int g = 0; g < 2; ++g) {
++        const int ib = 2 * q4 + g;
++        const uint8_t * q3 = qs + 8 * ib;
++        const uint32_t aux32 = *(const uint32_t *)(qs + 64 + 4 * ib);
++        const float d = d0 * (0.5f + (float)(aux32 >> 28)) * 0.5f;
++        uint32_t * out = arow + 16 * g;
++#pragma unroll
++        for (int il = 0; il < 4; ++il) {
++            const uint32_t grid1 = iq3xxs_grid[q3[2 * il]];
++            const uint32_t grid2 = iq3xxs_grid[q3[2 * il + 1]];
++            const uint32_t signs = ksigns_iq2xs[(aux32 >> (7 * il)) & 127];
++            float v[8];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const float g1 = d * (float)((grid1 >> (8 * j)) & 0xFFu);
++                const float g2 = d * (float)((grid2 >> (8 * j)) & 0xFFu);
++                v[j]     = (signs >> j)       & 1u ? -g1 : g1;
++                v[4 + j] = (signs >> (4 + j)) & 1u ? -g2 : g2;
++            }
++            out[4 * il + 0] = mmb_pack2_so(v[0], v[1]);
++            out[4 * il + 1] = mmb_pack2_so(v[2], v[3]);
++            out[4 * il + 2] = mmb_pack2_so(v[4], v[5]);
++            out[4 * il + 3] = mmb_pack2_so(v[6], v[7]);
++        }
 +    }
 +}
 +
@@ -271,6 +417,205 @@ index 000000000..548f5abde
 +    }
 +}
 +
++// dequantize one weight row's 64-value quarter of an IQ3_S super-block (110 B: half d, qs[64],
++// qh[8], signs[32], scales[4]) into 64 bf16. q4 = ksh & 3 selects the 64-value quarter
++// (groups ib = 2*q4, 2*q4+1). Fields are non-contiguous, so this loads straight from the row base
++// (called from store_lds, not the register prefetch).  value = d*(1+2*scale_nibble) * grid[3-bit]*sign.
++__device__ __forceinline__ void mmb_dq_row_iq3s(const uint8_t * base, const int q4, uint32_t * arow) {
++    const float d = mmb_h2f(*(const uint16_t *) base);
++    const uint8_t sc = *(const uint8_t *)(base + 106 + q4);
++    const uint8_t * qs = base + 2 + 16 * q4;
++    const uint8_t * qh = base + 66 + 2 * q4;
++    const uint8_t * sg = base + 74 + 8 * q4;
++#pragma unroll
++    for (int g = 0; g < 2; ++g) {
++        const float dg = d * (float)(1 + 2 * ((sc >> (4 * g)) & 0xf));
++        uint32_t * out = arow + 16 * g;
++        const uint32_t qhg = qh[g];
++#pragma unroll
++        for (int il = 0; il < 4; ++il) {
++            const uint32_t grid1 = iq3s_grid[qs[8*g + 2*il    ] | ((qhg << (8 - 2*il)) & 256)];
++            const uint32_t grid2 = iq3s_grid[qs[8*g + 2*il + 1] | ((qhg << (7 - 2*il)) & 256)];
++            const uint32_t signs = sg[4*g + il];
++            float v[8];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const float g1 = dg * (float)((grid1 >> (8*j)) & 0xFFu);
++                const float g2 = dg * (float)((grid2 >> (8*j)) & 0xFFu);
++                v[j]     = (signs >> j)     & 1u ? -g1 : g1;
++                v[4 + j] = (signs >> (4+j)) & 1u ? -g2 : g2;
++            }
++            out[4*il + 0] = mmb_pack2_so(v[0], v[1]);
++            out[4*il + 1] = mmb_pack2_so(v[2], v[3]);
++            out[4*il + 2] = mmb_pack2_so(v[4], v[5]);
++            out[4*il + 3] = mmb_pack2_so(v[6], v[7]);
++        }
++    }
++}
++
++// PARTS-way split of the above across the threads that share one A row, so that a BM < MMB_NT tile
++// (the GLU's BM=64) does not run the A dequant on only MMB_NT/BM of the warps.  Thread `p` takes the
++// `il` groups {p, p+PARTS, ...} for both g, writing the same LDS dwords as the whole-row form.
++template <int PARTS>
++__device__ __forceinline__ void mmb_dq_row_iq3s_p(const uint8_t * base, const int q4, uint32_t * arow, const int p) {
++    const float d = mmb_h2f(*(const uint16_t *) base);
++    const uint8_t sc = *(const uint8_t *)(base + 106 + q4);
++    const uint8_t * qs = base + 2 + 16 * q4;
++    const uint8_t * qh = base + 66 + 2 * q4;
++    const uint8_t * sg = base + 74 + 8 * q4;
++#pragma unroll
++    for (int g = 0; g < 2; ++g) {
++        const float dg = d * (float)(1 + 2 * ((sc >> (4 * g)) & 0xf));
++        uint32_t * out = arow + 16 * g;
++        const uint32_t qhg = qh[g];
++#pragma unroll
++        for (int il = p; il < 4; il += PARTS) {
++            const uint32_t grid1 = iq3s_grid[qs[8*g + 2*il    ] | ((qhg << (8 - 2*il)) & 256)];
++            const uint32_t grid2 = iq3s_grid[qs[8*g + 2*il + 1] | ((qhg << (7 - 2*il)) & 256)];
++            const uint32_t signs = sg[4*g + il];
++            float v[8];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const float g1 = dg * (float)((grid1 >> (8*j)) & 0xFFu);
++                const float g2 = dg * (float)((grid2 >> (8*j)) & 0xFFu);
++                v[j]     = (signs >> j)     & 1u ? -g1 : g1;
++                v[4 + j] = (signs >> (4+j)) & 1u ? -g2 : g2;
++            }
++            out[4*il + 0] = mmb_pack2_so(v[0], v[1]);
++            out[4*il + 1] = mmb_pack2_so(v[2], v[3]);
++            out[4*il + 2] = mmb_pack2_so(v[4], v[5]);
++            out[4*il + 3] = mmb_pack2_so(v[6], v[7]);
++        }
++    }
++}
++
++// Register-resident form of the split dequant above.  `mmb_iq3s_preload` runs inside the
++// `load_regs` prefetch (which overlaps the previous K-step's WMMA) and `mmb_dq_iq3s_r` then works
++// purely out of registers, so the dequant phase that runs exposed between the WMMA phases issues no
++// global loads at all.  Only the `il` groups this thread owns are fetched (4/PARTS of them), and the
++// two `qs` bytes a grid lookup needs are adjacent, so they come back as one uint16.
++template <int PARTS>
++struct mmb_iq3s_r {
++    uint32_t d, sc, qh;
++    uint16_t qs[2][4 / PARTS];
++    uint8_t  sg[2][4 / PARTS];
++};
++
++template <int PARTS>
++__device__ __forceinline__ mmb_iq3s_r<PARTS> mmb_iq3s_preload(const uint8_t * base, const int q4, const int p) {
++    mmb_iq3s_r<PARTS> r;
++    r.d  = *(const uint16_t *) base;
++    r.sc = *(const uint8_t *)(base + 106 + q4);
++    r.qh = *(const uint16_t *)(base + 66 + 2 * q4);
++    const uint8_t * qs = base + 2 + 16 * q4;
++    const uint8_t * sg = base + 74 + 8 * q4;
++#pragma unroll
++    for (int g = 0; g < 2; ++g)
++#pragma unroll
++        for (int it = 0; it < 4 / PARTS; ++it) {
++            const int il = p + it * PARTS;
++            r.qs[g][it] = *(const uint16_t *)(qs + 8 * g + 2 * il);
++            r.sg[g][it] = sg[4 * g + il];
++        }
++    return r;
++}
++
++template <int PARTS>
++__device__ __forceinline__ void mmb_dq_iq3s_r(const mmb_iq3s_r<PARTS> & R, uint32_t * arow, const int p) {
++    const float d = mmb_h2f((uint16_t) R.d);
++    const uint8_t sc = (uint8_t) R.sc;
++#pragma unroll
++    for (int g = 0; g < 2; ++g) {
++        const float dg = d * (float)(1 + 2 * ((sc >> (4 * g)) & 0xf));
++        uint32_t * out = arow + 16 * g;
++        const uint32_t qhg = (R.qh >> (8 * g)) & 0xff;
++#pragma unroll
++        for (int it = 0; it < 4 / PARTS; ++it) {
++            const int il = p + it * PARTS;
++            const uint32_t qs2 = R.qs[g][it];
++            const uint32_t grid1 = iq3s_grid[(qs2 & 0xffu)     | ((qhg << (8 - 2*il)) & 256)];
++            const uint32_t grid2 = iq3s_grid[(qs2 >> 8)        | ((qhg << (7 - 2*il)) & 256)];
++            const uint32_t signs = R.sg[g][it];
++            float v[8];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const float g1 = dg * (float)((grid1 >> (8*j)) & 0xFFu);
++                const float g2 = dg * (float)((grid2 >> (8*j)) & 0xFFu);
++                v[j]     = (signs >> j)     & 1u ? -g1 : g1;
++                v[4 + j] = (signs >> (4+j)) & 1u ? -g2 : g2;
++            }
++            out[4*il + 0] = mmb_pack2_so(v[0], v[1]);
++            out[4*il + 1] = mmb_pack2_so(v[2], v[3]);
++            out[4*il + 2] = mmb_pack2_so(v[4], v[5]);
++            out[4*il + 3] = mmb_pack2_so(v[6], v[7]);
++        }
++    }
++}
++
++// dequantize one weight row's 64-value quarter of a Q5_K super-block (176 B: half2 dm, scales[12],
++// qh[32], qs[128]) into 64 bf16.  Same affine form as Q4_K plus the 5th bit from qh (bit 2*q4 for
++// the low nibbles, 2*q4+1 for the high nibbles).  Loaded from the row base in store_lds.
++__device__ __forceinline__ void mmb_dq_row_q5k(const uint8_t * base, const int q4, uint32_t * arow) {
++    const uint4 hdr = *(const uint4 *) base;
++    const float dall = mmb_h2f((uint16_t)(hdr.x & 0xffff));
++    const float dmin = mmb_h2f((uint16_t)(hdr.x >> 16));
++    auto sbyte = [&](const int i) -> uint32_t {
++        const uint32_t w = (i < 4) ? hdr.y : (i < 8) ? hdr.z : hdr.w;
++        return (w >> (8 * (i & 3))) & 0xFFu;
++    };
++    auto gsm = [&](const int j, float & dd, float & mm) {
++        const uint32_t q0b = sbyte(j), q4b = sbyte(j + 4);
++        uint32_t sc, mi;
++        if (j < 4) { sc = q0b & 63u; mi = q4b & 63u; }
++        else       { sc = (q4b & 0xFu) | ((sbyte(j - 4) >> 6) << 4); mi = (q4b >> 4) | ((q0b >> 6) << 4); }
++        dd = dall * (float) sc; mm = dmin * (float) mi;
++    };
++    const int is = 2 * q4;
++    float d1, m1, d2, m2; gsm(is, d1, m1); gsm(is + 1, d2, m2);
++    const uint8_t * qh = base + 16;
++    const uint8_t * qs = base + 48 + 32 * q4;
++    const int bit_lo = 2 * q4, bit_hi = 2 * q4 + 1;
++#pragma unroll
++    for (int j = 0; j < 32; j += 2) {
++        const uint8_t p0 = qs[j], p1 = qs[j+1], h0 = qh[j], h1 = qh[j+1];
++        const float lo0 = fmaf((float)((p0 & 0xF) + (((h0 >> bit_lo) & 1) ? 16 : 0)), d1, -m1);
++        const float lo1 = fmaf((float)((p1 & 0xF) + (((h1 >> bit_lo) & 1) ? 16 : 0)), d1, -m1);
++        const float hi0 = fmaf((float)((p0 >> 4) + (((h0 >> bit_hi) & 1) ? 16 : 0)), d2, -m2);
++        const float hi1 = fmaf((float)((p1 >> 4) + (((h1 >> bit_hi) & 1) ? 16 : 0)), d2, -m2);
++        arow[j/2]      = mmb_pack2(lo0, lo1);
++        arow[16 + j/2] = mmb_pack2(hi0, hi1);
++    }
++}
++
++// dequantize one weight row's 64-value quarter of a Q6_K super-block (210 B: ql[128], qh[64],
++// scales[16] int8, half d) into 64 bf16.  value = d * scales[..] * (q6 - 32); q6 = 4-bit ql |
++// (2-bit qh << 4).  Quarter q4: ip = q4>>1 (half), high = q4&1 (ql nibble), bit sh = high?4:0.
++__device__ __forceinline__ void mmb_dq_row_q6k(const uint8_t * base, const int q4, uint32_t * arow) {
++    const int ip = q4 >> 1, high = q4 & 1;
++    const float d = mmb_h2f(*(const uint16_t *)(base + 208));
++    const uint8_t * ql = base + 64 * ip;
++    const uint8_t * qh = base + 128 + 32 * ip;
++    const int8_t  * sc = (const int8_t *)(base + 192);
++    const int sh = high ? 4 : 0;
++    const int ib = 8 * ip + (high ? 4 : 0);
++#pragma unroll
++    for (int il = 0; il < 32; il += 2) {
++        float va[2], vb[2];
++#pragma unroll
++        for (int t = 0; t < 2; ++t) {
++            const int j = il + t;
++            const uint8_t qa = ql[j], qb = ql[32 + j], h = qh[j];
++            const int sa = ib + (j >> 4);
++            const int a6 = (high ? (qa >> 4) : (qa & 0xF)) | (((h >> sh)       & 3) << 4);
++            const int b6 = (high ? (qb >> 4) : (qb & 0xF)) | (((h >> (sh + 2)) & 3) << 4);
++            va[t] = d * (float) sc[sa]     * (float)(a6 - 32);
++            vb[t] = d * (float) sc[sa + 2] * (float)(b6 - 32);
++        }
++        arow[il/2]      = mmb_pack2(va[0], va[1]);
++        arow[16 + il/2] = mmb_pack2(vb[0], vb[1]);
++    }
++}
++
 +template <typename DRowFn>
 +__device__ __forceinline__ void mmb_store_tile(const v8f & acc, float * __restrict__ stg, float * __restrict__ D, uint16_t * __restrict__ Dh,
 +        const bool store_f32, const int M, DRowFn drow, const int n_base, const int m_base, const int lane) {
@@ -299,12 +644,16 @@ index 000000000..548f5abde
 +    }
 +    __syncthreads();
 +}
-+template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, typename XRowFn, typename DRowFn>
++template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, bool DBUF, bool DBUF2, typename XRowFn, typename DRowFn>
 +__device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase, const size_t wrow_bytes, const int a_rows,
 +        const uint16_t * __restrict__ Xh, const int K, XRowFn xrow, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, DRowFn drow, const int m0,
 +        const int n_cols, uint16_t * As, uint16_t * Bs) {
 +    constexpr int WAVES_M = BM / WTM, TM = WTM / 16, TN = WTN / 16;
 +    constexpr int A_ITEMS = (BM + MMB_NT - 1) / MMB_NT;
++    // WTYPE 5 (IQ3_S): when BM < MMB_NT the row-per-thread A mapping leaves warps idle, so the
++    // threads sharing a row split its 8 (g,il) groups instead (see mmb_dq_row_iq3s_p).
++    constexpr bool SPLIT_A = (WTYPE == 5 && MMB_NT > BM && MMB_NT % BM == 0);
++    constexpr int PARTS = SPLIT_A ? (MMB_NT / BM) : 1;
 +    constexpr int B_ITEMS = (BN * 8) / MMB_NT;
 +    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
 +    const int wm = wave % WAVES_M, wn = wave / WAVES_M;
@@ -327,6 +676,8 @@ index 000000000..548f5abde
 +                    a0[i] = *(const uint4 *)(p); a1[i] = *(const uint4 *)(p + 16 + (size_t)(ks & 3) * 32); a3[i] = *(const uint4 *)(p + 32 + (size_t)(ks & 3) * 32); }
 +                else if constexpr (WTYPE == 4) { const uint8_t * p = Wbase + (size_t)row * wrow_bytes + (size_t)ks * 48;
 +                    a0[i] = *(const uint4 *)(p); a1[i] = *(const uint4 *)(p + 16); a3[i] = *(const uint4 *)(p + 32); }
++                else if constexpr (WTYPE == 5) { /* IQ3_S: fields non-contiguous, store_lds loads from Wbase */ }
++                else if constexpr (WTYPE >= 6) { /* K-quant / i-quant: store_lds loads from Wbase */ }
 +                else { const uint4 * p = (const uint4 *)(Wbase + (size_t)row * wrow_bytes + (size_t)ks * 128);
 +                    a0[i] = p[0]; a1[i] = p[1]; a3[i] = p[2]; a4[i] = p[3]; a5[i] = p[4]; a6[i] = p[5]; a7[i] = p[6]; a8[i] = p[7]; }
 +            } else { a0[i] = make_uint4(0,0,0,0); a1[i] = make_uint4(0,0,0,0); a3[i] = make_uint4(0,0,0,0); a4[i] = make_uint4(0,0,0,0); a5[i] = a6[i] = a7[i] = a8[i] = make_uint4(0,0,0,0); a2[i] = 0; }
@@ -337,16 +688,29 @@ index 000000000..548f5abde
 +            bst[i] = (brow[i] >= 0) ? *(const uint4 *)(Xh + (size_t)brow[i] * K + ks * MMB_BK + off) : make_uint4(0,0,0,0);
 +        }
 +    };
-+    auto store_lds = [&](int ksh) {
++    auto store_lds_a = [&](int ksh, const int abo) {
 +#pragma unroll
-+        for (int i = 0; i < A_ITEMS; ++i) { const int row = tid + i * MMB_NT; if (row < BM) {
-+            if constexpr (WTYPE == 0) mmb_dq_row36(a0[i], a1[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
-+            else if constexpr (WTYPE == 1) mmb_dq_row68(a0[i], a1[i], a3[i], a4[i], a2[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
-+            else if constexpr (WTYPE == 3) mmb_dq_row_q4k(a0[i], a1[i], a3[i], ksh, (uint32_t *)(As + row * MMB_LDS_STRIDE));
-+            else if constexpr (WTYPE == 4) mmb_dq_row_q5_1(a0[i], a1[i], a3[i], (uint32_t *)(As + row * MMB_LDS_STRIDE));
-+            else { uint4 * d = (uint4 *)(As + row * MMB_LDS_STRIDE); d[0] = a0[i]; d[1] = a1[i]; d[2] = a3[i]; d[3] = a4[i]; d[4] = a5[i]; d[5] = a6[i]; d[6] = a7[i]; d[7] = a8[i]; } } }
++        for (int i = 0; i < A_ITEMS; ++i) { const int row = SPLIT_A ? (tid % BM) : (tid + i * MMB_NT); if (row < BM) {
++            if constexpr (WTYPE == 0) mmb_dq_row36(a0[i], a1[i], a2[i], (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 1) mmb_dq_row68(a0[i], a1[i], a3[i], a4[i], a2[i], (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 3) mmb_dq_row_q4k(a0[i], a1[i], a3[i], ksh, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 4) mmb_dq_row_q5_1(a0[i], a1[i], a3[i], (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (SPLIT_A) {
++                constexpr int PARTS = MMB_NT / BM;
++                mmb_dq_row_iq3s_p<PARTS>(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3,
++                                         (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE), tid / BM);
++            }
++            else if constexpr (WTYPE == 5) mmb_dq_row_iq3s(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 6) mmb_dq_row_q5k(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 176, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 7) mmb_dq_row_q6k(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 210, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 8) mmb_dq_row_iq4xs(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 136, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 9) mmb_dq_row_q3k(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 10) mmb_dq_row_iq3xxs(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 98, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else { uint4 * d = (uint4 *)(As + (abo + row) * MMB_LDS_STRIDE); d[0] = a0[i]; d[1] = a1[i]; d[2] = a3[i]; d[3] = a4[i]; d[4] = a5[i]; d[5] = a6[i]; d[6] = a7[i]; d[7] = a8[i]; } } }
++    };
++    auto store_lds_b = [&](const int bbo) {
 +#pragma unroll
-+        for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
++        for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (bbo + (c >> 3)) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
 +    };
 +
 +    v8f acc[TM][TN];
@@ -361,26 +725,38 @@ index 000000000..548f5abde
 +#pragma unroll
 +    for (int j = 0; j < TN; ++j) jact[j] = !TAIL || (wn * WTN + j * 16) < n_cols;   // whole fragments past the valid columns are never stored
 +    const int nks = K / MMB_BK;
-+    load_regs(0); store_lds(0); __syncthreads();
++    load_regs(0); store_lds_a(0, 0); store_lds_b(0); __syncthreads();
 +    for (int ks = 0; ks < nks; ++ks) {
 +        if (ks + 1 < nks) load_regs(ks + 1);
++        // DBUF: the NEXT K-step's weight dequant writes the other A buffer, so it overlaps this
++        // step's WMMA instead of serializing behind the A single-buffer barrier hazard (this is the
++        // session-21 win; it requires As to be 2x).  DBUF2 additionally double-buffers B to drop the
++        // second barrier -- MEASURED REFUTED (GLU 1225 -> 1433 ms): the extra LDS traffic costs more
++        // than the removed barrier buys.  Kept guarded so it can be re-tested cheaply.
++        if (DBUF && ks + 1 < nks) store_lds_a(ks + 1, ((ks + 1) & 1) * BM);
++        if (DBUF2 && ks + 1 < nks) store_lds_b(((ks + 1) & 1) * BN);
++        const int ab = DBUF ? ((ks & 1) * BM) : 0;
++        const int bb = DBUF2 ? ((ks & 1) * BN) : 0;
 +#pragma unroll
 +        for (int kk = 0; kk < MMB_BK; kk += 16) {
 +            v16s a[TM], b[TN]; const int r = lane & 15;
 +#pragma unroll
-+            for (int i = 0; i < TM; ++i) { const uint16_t * p = As + (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
++            for (int i = 0; i < TM; ++i) { const uint16_t * p = As + (ab + wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
 +                const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); a[i] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
 +#pragma unroll
-+            for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
++            for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (bb + wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
 +                const uint4 v0 = *(const uint4 *)p, v1 = *(const uint4 *)(p + 8); b[j] = __builtin_bit_cast(v16s, (uint4[2]){v0, v1}); }
 +#pragma unroll
 +            for (int i = 0; i < TM; ++i)
 +#pragma unroll
-+                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[i], acc[i][j]); }
++                for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } acc[i][j] = mmb_wmma_bf16(b[j], a[i], acc[i][j]); }
 +        }
 +        __syncthreads();
-+        if (ks + 1 < nks) store_lds(ks + 1);
-+        __syncthreads();
++        if constexpr (!DBUF2) {
++            if (!DBUF && ks + 1 < nks) store_lds_a(ks + 1, 0);
++            if (ks + 1 < nks) store_lds_b(0);
++            __syncthreads();
++        }
 +    }
 +    // epilogue through LDS (per-wave 1 KB stage in the now-free A/B tile area); tiles are 16 rows, a_rows is a
 +    // multiple of 32 in this model, so whole tiles are either valid or beyond a_rows
@@ -396,17 +772,23 @@ index 000000000..548f5abde
 +    }
 +}
 +
-+template <int BM, int BN, int WTM, int WTN, int WTYPE>
++template <int BM, int BN, int WTM, int WTN, int WTYPE, bool DBUF = false, bool DBUF2 = false>
 +__global__ void __launch_bounds__(MMB_NT, 2)
 +mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ Xh, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, const int K, const int T) {
-+    __shared__ __align__(16) uint16_t As[BM * MMB_LDS_STRIDE];
-+    __shared__ __align__(16) uint16_t Bs[BN * MMB_LDS_STRIDE];
++    __shared__ __align__(16) uint16_t As[(DBUF ? 2 : 1) * BM * MMB_LDS_STRIDE];
++    __shared__ __align__(16) uint16_t Bs[(DBUF2 ? 2 : 1) * BN * MMB_LDS_STRIDE];
 +    const int m0 = blockIdx.x * BM, t0 = blockIdx.y * BN;
 +    const size_t wrow_bytes = WTYPE == 2 ? (size_t) K * 2 :
 +                              WTYPE == 3 ? (size_t)(K / 256) * 144 :
 +                              WTYPE == 4 ? (size_t)(K / 32) * 24 :
++                              WTYPE == 5 ? (size_t)(K / 256) * 110 :
++                              WTYPE == 6 ? (size_t)(K / 256) * 176 :
++                              WTYPE == 7 ? (size_t)(K / 256) * 210 :
++                              WTYPE == 8 ? (size_t)(K / 256) * 136 :
++                              WTYPE == 9 ? (size_t)(K / 256) * 110 :
++                              WTYPE == 10 ? (size_t)(K / 256) * 98 :
 +                              (size_t)(K / 32) * (WTYPE == 0 ? 18 : 34);
-+    mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, false>(W + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
++    mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, false, DBUF, DBUF2>(W + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
 +        [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, D, Dh, store_f32, M, [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, m0, T - t0, As, Bs);
 +}
 +
@@ -473,7 +855,7 @@ index 000000000..548f5abde
 +#pragma unroll
 +            for (int c = 0; c < HC; ++c)
 +#pragma unroll
-+                for (int j = 0; j < 2; ++j) acc[c][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[c], acc[c][j]);
++                for (int j = 0; j < 2; ++j) acc[c][j] = mmb_wmma_bf16(b[j], a[c], acc[c][j]);
 +        }
 +        __syncthreads();
 +        if (ks + 1 < nks) store_lds();
@@ -502,48 +884,83 @@ index 000000000..548f5abde
 +    }
 +}
 +
-+template <int BM, int BN, int WTM, int WTN>
++template <int BM, int BN, int WTM, int WTN, int WTYPE, bool DBUF = false, bool DBUF2 = false>
 +__global__ void __launch_bounds__(MMB_NT, 2)
 +mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, const uint16_t * __restrict__ Xh, float * __restrict__ D,
 +        uint16_t * __restrict__ Dh, const bool store_f32,
 +        const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
 +        const uint32_t * __restrict__ desc, const int M, const int K) {
-+    __shared__ __align__(16) uint16_t As[BM * MMB_LDS_STRIDE];
-+    __shared__ __align__(16) uint16_t Bs[BN * MMB_LDS_STRIDE];
++    __shared__ __align__(16) uint16_t As[(DBUF ? 2 : 1) * BM * MMB_LDS_STRIDE];
++    __shared__ __align__(16) uint16_t Bs[(DBUF2 ? 2 : 1) * BN * MMB_LDS_STRIDE];
 +    const uint32_t dsc = desc[blockIdx.y];
 +    if (dsc == UINT32_MAX) return;   // uniform across the block, before any barrier
 +    const int e = dsc & 0xffff, jt = dsc >> 16;
 +    const int r0 = bounds[e] + jt * BN, cnt = bounds[e + 1] - r0;
 +    const int m0 = blockIdx.x * BM;
-+    const size_t wrow_bytes = (size_t)(K / 32) * 18;
-+    mmb_tile_gemm<BM, BN, WTM, WTN, 0, true>(W + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
++    const size_t wrow_bytes = WTYPE == 3 ? (size_t)(K / 256) * 144 : WTYPE == 4 ? (size_t)(K / 32) * 24 : WTYPE == 5 ? (size_t)(K / 256) * 110 : WTYPE == 6 ? (size_t)(K / 256) * 176 : WTYPE == 7 ? (size_t)(K / 256) * 210 : WTYPE == 8 ? (size_t)(K / 256) * 136 : WTYPE == 9 ? (size_t)(K / 256) * 110 : WTYPE == 10 ? (size_t)(K / 256) * 98 : WTYPE == 1 ? (size_t)(K / 32) * 34 : (size_t)(K / 32) * 18;
++    mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, true, DBUF, DBUF2>(W + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
 +        [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, As, Bs);
 +}
 +
-+template <int BM, int BN, int WTM, int WTN, bool TAIL, typename XRowFn, typename DRowFn>
++template <int BM, int BN, int WTM, int WTN, int WTYPE, bool TAIL, bool DBUF, bool DBUF2, typename XRowFn, typename DRowFn>
 +__device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t wrow_bytes, const int a_rows,
 +        const uint16_t * __restrict__ Xh, const int K, XRowFn xrow, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, DRowFn drow, const int m0,
 +        const int n_cols, uint16_t * Ag, uint16_t * Au, uint16_t * Bs) {
 +    constexpr int WAVES_M = BM / WTM, TM = WTM / 16, TN = WTN / 16;
 +    constexpr int A_ITEMS = (BM + MMB_NT - 1) / MMB_NT;
++    // WTYPE 5 (IQ3_S): when BM < MMB_NT the row-per-thread A mapping leaves warps idle, so the
++    // threads sharing a row split its 8 (g,il) groups instead (see mmb_dq_row_iq3s_p).
++    constexpr bool SPLIT_A = (WTYPE == 5 && MMB_NT > BM && MMB_NT % BM == 0);
++    constexpr int PARTS = SPLIT_A ? (MMB_NT / BM) : 1;
 +    constexpr int B_ITEMS = (BN * 8) / MMB_NT;
 +    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
 +    const int wm = wave % WAVES_M, wn = wave / WAVES_M;
-+    uint4 g0[A_ITEMS], g1[A_ITEMS], u0[A_ITEMS], u1[A_ITEMS]; uint32_t g2[A_ITEMS], u2[A_ITEMS];
++    uint4 g0[A_ITEMS], g1[A_ITEMS], g3[A_ITEMS], g4[A_ITEMS], u0[A_ITEMS], u1[A_ITEMS], u3[A_ITEMS], u4[A_ITEMS]; uint32_t g2[A_ITEMS], u2[A_ITEMS];
++    mmb_iq3s_r<PARTS> iqr[2];   // [0] = gate, [1] = up (WTYPE 5 split path only)
 +    uint4 bst[B_ITEMS];
 +    int brow[B_ITEMS];
 +#pragma unroll
 +    for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = xrow(c >> 3); }
 +    auto load_regs = [&](const int ks) {
++        if constexpr (SPLIT_A) {
++            // IQ3_S, split A: preload this thread's block fields for step `ks` into registers, where
++            // the loads overlap the previous K-step's WMMA, so store_lds_a becomes pure ALU.  NOTE the
++            // row is `tid % BM` (every thread is active) and NOT the A_ITEMS loop's `tid + i*MMB_NT`
++            // -- hoisting this out of that loop's `row < BM` guard is load-bearing (put it inside and
++            // only threads 0..BM-1 run it, all taking part 0, and the output is garbage).
++            const int prow = tid % BM;
++            const size_t off = (size_t)prow * wrow_bytes + (size_t)(ks >> 2) * 110;
++            iqr[0] = mmb_iq3s_preload<PARTS>(Wg + off, ks & 3, tid / BM);
++            iqr[1] = mmb_iq3s_preload<PARTS>(Wu + off, ks & 3, tid / BM);
++        }
 +#pragma unroll
 +        for (int i = 0; i < A_ITEMS; ++i) {
 +            const int row = tid + i * MMB_NT;
 +            if (row < BM && row < a_rows) {
-+                const uint8_t * pg = Wg + (size_t)row * wrow_bytes + (size_t)ks * 36;
-+                const uint8_t * pu = Wu + (size_t)row * wrow_bytes + (size_t)ks * 36;
-+                g0[i] = *(const uint4 *)(pg); g1[i] = *(const uint4 *)(pg + 16); g2[i] = *(const uint32_t *)(pg + 32);
-+                u0[i] = *(const uint4 *)(pu); u1[i] = *(const uint4 *)(pu + 16); u2[i] = *(const uint32_t *)(pu + 32);
-+            } else { g0[i] = g1[i] = u0[i] = u1[i] = make_uint4(0,0,0,0); g2[i] = u2[i] = 0; }
++                if constexpr (WTYPE == 0) {
++                    const uint8_t * pg = Wg + (size_t)row * wrow_bytes + (size_t)ks * 36;
++                    const uint8_t * pu = Wu + (size_t)row * wrow_bytes + (size_t)ks * 36;
++                    g0[i] = *(const uint4 *)(pg); g1[i] = *(const uint4 *)(pg + 16); g2[i] = *(const uint32_t *)(pg + 32);
++                    u0[i] = *(const uint4 *)(pu); u1[i] = *(const uint4 *)(pu + 16); u2[i] = *(const uint32_t *)(pu + 32);
++                } else if constexpr (WTYPE == 1) {
++                    const uint8_t * pg = Wg + (size_t)row * wrow_bytes + (size_t)ks * 68;
++                    const uint8_t * pu = Wu + (size_t)row * wrow_bytes + (size_t)ks * 68;
++                    g0[i] = *(const uint4 *)(pg); g1[i] = *(const uint4 *)(pg + 16); g3[i] = *(const uint4 *)(pg + 32); g4[i] = *(const uint4 *)(pg + 48); g2[i] = *(const uint32_t *)(pg + 64);
++                    u0[i] = *(const uint4 *)(pu); u1[i] = *(const uint4 *)(pu + 16); u3[i] = *(const uint4 *)(pu + 32); u4[i] = *(const uint4 *)(pu + 48); u2[i] = *(const uint32_t *)(pu + 64);
++                } else if constexpr (WTYPE == 3) {
++                    const uint8_t * pg = Wg + (size_t)row * wrow_bytes + (size_t)(ks >> 2) * 144;
++                    const uint8_t * pu = Wu + (size_t)row * wrow_bytes + (size_t)(ks >> 2) * 144;
++                    const size_t qo = 16 + (size_t)(ks & 3) * 32;
++                    g0[i] = *(const uint4 *)(pg); g1[i] = *(const uint4 *)(pg + qo); g3[i] = *(const uint4 *)(pg + qo + 16);
++                    u0[i] = *(const uint4 *)(pu); u1[i] = *(const uint4 *)(pu + qo); u3[i] = *(const uint4 *)(pu + qo + 16);
++                } else if constexpr (WTYPE == 4) {
++                    const uint8_t * pg = Wg + (size_t)row * wrow_bytes + (size_t)ks * 48;
++                    const uint8_t * pu = Wu + (size_t)row * wrow_bytes + (size_t)ks * 48;
++                    g0[i] = *(const uint4 *)(pg); g1[i] = *(const uint4 *)(pg + 16); g3[i] = *(const uint4 *)(pg + 32);
++                    u0[i] = *(const uint4 *)(pu); u1[i] = *(const uint4 *)(pu + 16); u3[i] = *(const uint4 *)(pu + 32);
++                } else if constexpr (WTYPE == 5) { /* IQ3_S: fields non-contiguous, store_lds loads from Wg/Wu */ }
++                else if constexpr (WTYPE >= 6) { /* K-quant / i-quant: store_lds loads from Wg/Wu */ }
++            } else { g0[i] = g1[i] = u0[i] = u1[i] = g3[i] = u3[i] = g4[i] = u4[i] = make_uint4(0,0,0,0); g2[i] = u2[i] = 0; }
 +        }
 +#pragma unroll
 +        for (int i = 0; i < B_ITEMS; ++i) {
@@ -551,13 +968,47 @@ index 000000000..548f5abde
 +            bst[i] = (brow[i] >= 0) ? *(const uint4 *)(Xh + (size_t)brow[i] * K + ks * MMB_BK + off) : make_uint4(0,0,0,0);
 +        }
 +    };
-+    auto store_lds = [&]() {
++    auto store_lds_a = [&](int ksh, const int abo) {
 +#pragma unroll
-+        for (int i = 0; i < A_ITEMS; ++i) { const int row = tid + i * MMB_NT; if (row < BM) {
-+            mmb_dq_row36(g0[i], g1[i], g2[i], (uint32_t *)(Ag + row * MMB_LDS_STRIDE));
-+            mmb_dq_row36(u0[i], u1[i], u2[i], (uint32_t *)(Au + row * MMB_LDS_STRIDE)); } }
++        for (int i = 0; i < A_ITEMS; ++i) { const int row = SPLIT_A ? (tid % BM) : (tid + i * MMB_NT); if (row < BM) {
++            if constexpr (WTYPE == 0) {
++                mmb_dq_row36(g0[i], g1[i], g2[i], (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row36(u0[i], u1[i], u2[i], (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 1) {
++                mmb_dq_row68(g0[i], g1[i], g3[i], g4[i], g2[i], (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row68(u0[i], u1[i], u3[i], u4[i], u2[i], (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 3) {
++                mmb_dq_row_q4k(g0[i], g1[i], g3[i], ksh, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_q4k(u0[i], u1[i], u3[i], ksh, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 4) {
++                mmb_dq_row_q5_1(g0[i], g1[i], g3[i], (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_q5_1(u0[i], u1[i], u3[i], (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (SPLIT_A) {
++                mmb_dq_iq3s_r<PARTS>(iqr[0], (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE), tid / BM);
++                mmb_dq_iq3s_r<PARTS>(iqr[1], (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE), tid / BM);
++            } else if constexpr (WTYPE == 5) {
++                mmb_dq_row_iq3s(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_iq3s(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 6) {
++                mmb_dq_row_q5k(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 176, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_q5k(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 176, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 7) {
++                mmb_dq_row_q6k(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 210, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_q6k(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 210, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 8) {
++                mmb_dq_row_iq4xs(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 136, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_iq4xs(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 136, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 9) {
++                mmb_dq_row_q3k(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_q3k(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 10) {
++                mmb_dq_row_iq3xxs(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 98, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_iq3xxs(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 98, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } } }
++    };
++    auto store_lds_b = [&](const int bbo) {
 +#pragma unroll
-+        for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (c >> 3) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
++        for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; *(uint4 *)(Bs + (bbo + (c >> 3)) * MMB_LDS_STRIDE + (c & 7) * 8) = bst[i]; }
 +    };
 +    v8f accg[TM][TN], accu[TM][TN];
 +#pragma unroll
@@ -570,31 +1021,41 @@ index 000000000..548f5abde
 +#pragma unroll
 +    for (int j = 0; j < TN; ++j) jact[j] = !TAIL || (wn * WTN + j * 16) < n_cols;
 +    const int nks = K / MMB_BK;
-+    load_regs(0); store_lds(); __syncthreads();
++    load_regs(0); store_lds_a(0, 0); store_lds_b(0); __syncthreads();
 +    for (int ks = 0; ks < nks; ++ks) {
 +        if (ks + 1 < nks) load_regs(ks + 1);
++        // DBUF: the NEXT K-step's gate+up dequant writes the other A buffers, overlapping this step's
++        // WMMA.  Only enabled for WTYPE 5 (IQ3_S): it is a -6.7 % win on the Flash-Next IQ3_S GLU but
++        // a +5.8 % loss on the 35B Q4_K GLU.  DBUF2 (double-buffer B, one sync) is MEASURED REFUTED.
++        if (DBUF && ks + 1 < nks) store_lds_a(ks + 1, ((ks + 1) & 1) * BM);
++        if (DBUF2 && ks + 1 < nks) store_lds_b(((ks + 1) & 1) * BN);
++        const int ab = DBUF ? ((ks & 1) * BM) : 0;
++        const int bb = DBUF2 ? ((ks & 1) * BN) : 0;
 +#pragma unroll
 +        for (int kk = 0; kk < MMB_BK; kk += 16) {
 +            v16s ag[TM], au[TM], b[TN]; const int r = lane & 15;
 +#pragma unroll
-+            for (int i = 0; i < TM; ++i) { const int off = (wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
++            for (int i = 0; i < TM; ++i) { const int off = (ab + wm * WTM + i * 16 + r) * MMB_LDS_STRIDE + kk;
 +                ag[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Ag + off), *(const uint4 *)(Ag + off + 8)});
 +                au[i] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)(Au + off), *(const uint4 *)(Au + off + 8)}); }
 +#pragma unroll
-+            for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
++            for (int j = 0; j < TN; ++j) { if constexpr (TAIL) { if (!jact[j]) continue; } const uint16_t * p = Bs + (bb + wn * WTN + j * 16 + r) * MMB_LDS_STRIDE + kk;
 +                b[j] = __builtin_bit_cast(v16s, (uint4[2]){*(const uint4 *)p, *(const uint4 *)(p + 8)}); }
 +#pragma unroll
 +            for (int i = 0; i < TM; ++i)
 +#pragma unroll
 +                for (int j = 0; j < TN; ++j) {
 +                    if constexpr (TAIL) { if (!jact[j]) continue; }
-+                    accg[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], ag[i], accg[i][j]);
-+                    accu[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], au[i], accu[i][j]);
++                    accg[i][j] = mmb_wmma_bf16(b[j], ag[i], accg[i][j]);
++                    accu[i][j] = mmb_wmma_bf16(b[j], au[i], accu[i][j]);
 +                }
 +        }
 +        __syncthreads();
-+        if (ks + 1 < nks) store_lds();
-+        __syncthreads();
++        if constexpr (!DBUF2) {
++            if (!DBUF && ks + 1 < nks) store_lds_a(ks + 1, 0);
++            if (ks + 1 < nks) store_lds_b(0);
++            __syncthreads();
++        }
 +    }
 +    float * stg = (float *)((BN * MMB_LDS_STRIDE * 2 >= MMB_NT / 32 * 1024) ? Bs : Ag) + wave * 256;
 +#pragma unroll
@@ -612,22 +1073,22 @@ index 000000000..548f5abde
 +    }
 +}
 +
-+template <int BM, int BN, int WTM, int WTN>
++template <int BM, int BN, int WTM, int WTN, int WTYPE, bool DBUF = false, bool DBUF2 = false>
 +__global__ void __launch_bounds__(MMB_NT, 2)
 +mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restrict__ Wu, const size_t expert_bytes, const uint16_t * __restrict__ Xh,
 +        float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32,
 +        const int32_t * __restrict__ ids_src, const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
 +        const uint32_t * __restrict__ desc, const int M, const int K) {
-+    __shared__ __align__(16) uint16_t Ag[BM * MMB_LDS_STRIDE];
-+    __shared__ __align__(16) uint16_t Au[BM * MMB_LDS_STRIDE];
-+    __shared__ __align__(16) uint16_t Bs[BN * MMB_LDS_STRIDE];
++    __shared__ __align__(16) uint16_t Ag[(DBUF ? 2 : 1) * BM * MMB_LDS_STRIDE];
++    __shared__ __align__(16) uint16_t Au[(DBUF ? 2 : 1) * BM * MMB_LDS_STRIDE];
++    __shared__ __align__(16) uint16_t Bs[(DBUF2 ? 2 : 1) * BN * MMB_LDS_STRIDE];
 +    const uint32_t dsc = desc[blockIdx.y];
 +    if (dsc == UINT32_MAX) return;
 +    const int e = dsc & 0xffff, jt = dsc >> 16;
 +    const int r0 = bounds[e] + jt * BN, cnt = bounds[e + 1] - r0;
 +    const int m0 = blockIdx.x * BM;
-+    const size_t wrow_bytes = (size_t)(K / 32) * 18;
-+    mmb_tile_gemm_glu<BM, BN, WTM, WTN, true>(Wg + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, Wu + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
++    const size_t wrow_bytes = WTYPE == 3 ? (size_t)(K / 256) * 144 : WTYPE == 4 ? (size_t)(K / 32) * 24 : WTYPE == 5 ? (size_t)(K / 256) * 110 : WTYPE == 6 ? (size_t)(K / 256) * 176 : WTYPE == 7 ? (size_t)(K / 256) * 210 : WTYPE == 8 ? (size_t)(K / 256) * 136 : WTYPE == 9 ? (size_t)(K / 256) * 110 : WTYPE == 10 ? (size_t)(K / 256) * 98 : WTYPE == 1 ? (size_t)(K / 32) * 34 : (size_t)(K / 32) * 18;
++    mmb_tile_gemm_glu<BM, BN, WTM, WTN, WTYPE, true, DBUF, DBUF2>(Wg + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, Wu + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
 +        [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, Ag, Au, Bs);
 +}
 +
@@ -679,9 +1140,9 @@ index 000000000..548f5abde
 +            for (int i = 0; i < TM; ++i)
 +#pragma unroll
 +                for (int j = 0; j < TN; ++j) {
-+                    acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], ah[i], acc[i][j]);
-+                    acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bl[j], ah[i], acc[i][j]);
-+                    if constexpr (!TWO) acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(bh[j], al[i], acc[i][j]);
++                    acc[i][j] = mmb_wmma_f16(bh[j], ah[i], acc[i][j]);
++                    acc[i][j] = mmb_wmma_f16(bl[j], ah[i], acc[i][j]);
++                    if constexpr (!TWO) acc[i][j] = mmb_wmma_f16(bh[j], al[i], acc[i][j]);
 +                }
 +        }
 +        __syncthreads();
@@ -814,11 +1275,15 @@ index 000000000..548f5abde
 +    static const int v = getenv("GGML_CUDA_MMB") ? atoi(getenv("GGML_CUDA_MMB")) : 0;
 +    if (v == 0) return false;
 +    // The kernels use the first-gen gfx11 WMMA builtin (__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32),
-+    // which does not exist on gfx12. Runtime gate to RDNA3/RDNA3_5; everything else falls back to the
-+    // existing MMQ/QSA path. (A compile-time split like gated_delta_net_chunked_bf16_gfx11.cu is still
-+    // required before this can be built for gfx1200/gfx1201.)
++    // which does not exist on gfx12. Default gate: RDNA3_5 (gfx1150/gfx1151) only -- it is the arch the
++    // path is validated on and whose small-die LDS/WMMA behaviour this tiling was tuned for. RDNA3_0
++    // (gfx1100/1101/1102) shares the builtin but is untested; GGML_CUDA_MMB_RDNA3=1 opens it for a
++    // volunteer. (A compile-time split like gated_delta_net_chunked_bf16_gfx11.cu is still required
++    // before this can be built at all for gfx1200/gfx1201.)
 +    const int cc = ggml_cuda_info().devices[0].cc;
-+    return GGML_CUDA_CC_IS_RDNA3(cc);
++    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) return true;
++    static const bool allow_rdna3 = getenv("GGML_CUDA_MMB_RDNA3") && atoi(getenv("GGML_CUDA_MMB_RDNA3")) != 0;
++    return allow_rdna3 && GGML_CUDA_CC_IS_RDNA3_0(cc);
 +}
 +int  mmb_min_t()   { static const int v = getenv("GGML_CUDA_MMB_MIN_T") ? atoi(getenv("GGML_CUDA_MMB_MIN_T")) : 512; return v; }
 +int  mmb_f32split_mode(){ static const int v = getenv("GGML_CUDA_MMB_F32SPLIT") ? atoi(getenv("GGML_CUDA_MMB_F32SPLIT")) : 2; return v; }
@@ -830,6 +1295,17 @@ index 000000000..548f5abde
 +bool mmb_gatemix_flag() { static const int v = getenv("LLAMA_HC_GATEMIX") ? atoi(getenv("LLAMA_HC_GATEMIX")) : 0; return v != 0; }
 +bool mmb_down16_flag() { static const int v = getenv("GGML_CUDA_MMB_DOWN16") ? atoi(getenv("GGML_CUDA_MMB_DOWN16")) : 0; return v != 0; }
 +bool mmb_glu()     { static const int v = getenv("GGML_CUDA_MMB_GLU") ? atoi(getenv("GGML_CUDA_MMB_GLU")) : 1; return v != 0; }
++// Tile-class threshold: experts with >= this many rows take the BN=128 tile, the rest the BN=32 one.
++// The small tile re-dequantizes the same A panel once per jt tile (4x the weight dequant per output
++// for a 128-row expert), so this is the knob that trades B-column padding against dequant volume.
++int mmb_glu_thresh() { static const int v = getenv("GGML_CUDA_MMB_GLU_THRESH") ? atoi(getenv("GGML_CUDA_MMB_GLU_THRESH")) : 32; return v; }
++int mmb_routed_thresh() { static const int v = getenv("GGML_CUDA_MMB_ROUTED_THRESH") ? atoi(getenv("GGML_CUDA_MMB_ROUTED_THRESH")) : 32; return v; }
++// IQ3_XXS: implemented and correct.  Its MMB *routed* path (individual gate/up MUL_MAT_ID) is a
++// win, but the MMB *fused GLU* path is a NET LOSS on the UD-Q3_K_M workload (the fused kernel's
++// dequant/loop shape costs more than the bf16-WMMA gain): full-on 1921 vs routed-only 2121 t/s
++// pp8192 (both vs 1942 off).  So the fused GLU arm is default-off; GGML_CUDA_MMB_IQ3XXS=1 enables it
++// for re-measurement/tuning.
++bool mmb_iq3xxs_glu() { static const int v = getenv("GGML_CUDA_MMB_IQ3XXS") ? atoi(getenv("GGML_CUDA_MMB_IQ3XXS")) : 0; return v != 0; }
 +
 +} // namespace
 +
@@ -873,6 +1349,10 @@ index 000000000..548f5abde
 +    if (!mmb_enabled()) return false;
 +    const bool quant = src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q8_0 ||
 +                       src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_1 ||
++                       src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K ||
++                       src0->type == GGML_TYPE_IQ4_XS ||
++                       src0->type == GGML_TYPE_IQ3_S ||
++                       src0->type == GGML_TYPE_Q3_K || (src0->type == GGML_TYPE_IQ3_XXS && mmb_iq3xxs_glu()) ||
 +                       (src0->type == GGML_TYPE_Q6_K && mmb_shadow_q6k() && mmb_is_resident_q6k(src0) &&
 +                        mmb_shadow_lookup(src0) != nullptr);
 +    const bool bf16w = src0->type == GGML_TYPE_BF16 && mmb_bf16w();
@@ -882,7 +1362,7 @@ index 000000000..548f5abde
 +    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
 +    const int64_t K = src0->ne[0], M = src0->ne[1];
 +    if ((f32w ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
-+    if (src0->type == GGML_TYPE_Q4_K && K % 256 != 0) return false;   // whole 256-value super-blocks
++    if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS) && K % 256 != 0) return false;   // whole 256-value super-blocks
 +    const int64_t T = src1->ne[1] * src1->ne[2] * src1->ne[3];
 +    if (T < mmb_min_t() || T > INT32_MAX / 4) return false;
 +    return ggml_nrows(dst) == T;
@@ -890,10 +1370,12 @@ index 000000000..548f5abde
 +
 +bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
 +    if (!mmb_enabled()) return false;
-+    if (src0->type != GGML_TYPE_IQ4_NL || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
++    const bool wtype = src0->type == GGML_TYPE_IQ4_NL || src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ3_XXS;
++    if (!wtype || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
 +    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
 +    const int64_t K = src0->ne[0], M = src0->ne[1], E = src0->ne[2];
 +    if (src0->ne[3] != 1 || K % 64 != 0 || E < 1 || E > 1024) return false;
++    if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS) && K % 256 != 0) return false;
 +    const int64_t n_used = ids->ne[0], T = ids->ne[1];
 +    if (src1->ne[0] != K || src1->ne[3] != 1 || src1->ne[2] != T) return false;
 +    if (src1->ne[1] != 1 && src1->ne[1] != n_used) return false;
@@ -907,6 +1389,8 @@ index 000000000..548f5abde
 +    cudaStream_t stream = ctx.stream();
 +    const int K = (int) src0->ne[0], M = (int) src0->ne[1];
 +    const int T = (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
++    { static const int lg = getenv("GGML_CUDA_MMB_LOG") ? atoi(getenv("GGML_CUDA_MMB_LOG")) : 0;
++      if (lg) { static unsigned cnt = 0; if (cnt++ < 80) fprintf(stderr, "MMB_DENSE %s type=%s M=%d K=%d T=%d\n", src0->name, ggml_type_name(src0->type), M, K, T); } }
 +    if (src0->type == GGML_TYPE_F32) {
 +        dim3 grid((M + 127) / 128, (T + 127) / 128);
 +        static const bool two = getenv("LLAMA_MMB_F32SPLIT") && atoi(getenv("LLAMA_MMB_F32SPLIT")) >= 2;
@@ -925,7 +1409,8 @@ index 000000000..548f5abde
 +        return;
 +    }
 +    const uint16_t * shadow_pre = ((src0->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || src0->type == GGML_TYPE_Q6_K) ? mmb_shadow_lookup(src0) : nullptr;
-+    const bool big = (M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096);
++    static const int tile_ov = getenv("GGML_CUDA_MMB_TILE") ? atoi(getenv("GGML_CUDA_MMB_TILE")) : -1;
++    const bool big = tile_ov >= 0 ? (tile_ov != 0) : ((M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096));
 +    uint16_t * Dh = (mmb_hc16() && K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
 +    bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(dst));
 +    if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0) {
@@ -934,7 +1419,6 @@ index 000000000..548f5abde
 +    }
 +    dim3 grid((M + 127) / 128, big ? (T + 255) / 256 : (T + 127) / 128);
 +    const uint16_t * shadow = shadow_pre;
-+    if (src0->type == GGML_TYPE_Q6_K && !shadow) { GGML_ABORT("MMB: Q6_K weight %s has no BF16 shadow", src0->name); }
 +    if (shadow) {
 +        if (big) mmb_dense_kernel<128, 256, 64, 64, 2><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) shadow, xhp, D, Dh, store_f32, M, K, T);
 +        else     mmb_dense_kernel<128, 128, 32, 64, 2><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) shadow, xhp, D, Dh, store_f32, M, K, T);
@@ -950,6 +1434,24 @@ index 000000000..548f5abde
 +    } else if (src0->type == GGML_TYPE_Q5_1) {
 +        if (big) mmb_dense_kernel<128, 256, 64, 64, 4><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
 +        else     mmb_dense_kernel<128, 128, 32, 64, 4><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++    } else if (src0->type == GGML_TYPE_IQ3_S) {
++        if (big) mmb_dense_kernel<128, 256, 64, 64, 5><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++        else     mmb_dense_kernel<128, 128, 32, 64, 5><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++    } else if (src0->type == GGML_TYPE_Q5_K) {
++        if (big) mmb_dense_kernel<128, 256, 64, 64, 6><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++        else     mmb_dense_kernel<128, 128, 32, 64, 6><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++    } else if (src0->type == GGML_TYPE_Q6_K) {
++        if (big) mmb_dense_kernel<128, 256, 64, 64, 7><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++        else     mmb_dense_kernel<128, 128, 32, 64, 7><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++    } else if (src0->type == GGML_TYPE_IQ4_XS) {
++        if (big) mmb_dense_kernel<128, 256, 64, 64, 8><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++        else     mmb_dense_kernel<128, 128, 32, 64, 8><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++    } else if (src0->type == GGML_TYPE_Q3_K) {
++        if (big) mmb_dense_kernel<128, 256, 64, 64, 9><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++        else     mmb_dense_kernel<128, 128, 32, 64, 9><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++    } else if (src0->type == GGML_TYPE_IQ3_XXS) {
++        if (big) mmb_dense_kernel<128, 256, 64, 64, 10><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++        else     mmb_dense_kernel<128, 128, 32, 64, 10><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
 +    } else {
 +        if (big) mmb_dense_kernel<128, 256, 64, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
 +        else     mmb_dense_kernel<128, 128, 32, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
@@ -964,13 +1466,13 @@ index 000000000..548f5abde
 +bool ggml_cuda_mmb_dense_will_take(const ggml_tensor * w) {
 +    if (!mmb_enabled() || !w) return false;
 +    switch (w->type) {
-+        case GGML_TYPE_IQ4_NL: case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_1: return true;
++        case GGML_TYPE_IQ4_NL: case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_1: case GGML_TYPE_IQ3_S: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q3_K: case GGML_TYPE_IQ3_XXS: return true;
 +        default: return false;
 +    }
 +}
 +bool ggml_cuda_mmb_routed_will_take(const ggml_tensor * w) {
 +    if (!mmb_enabled() || !w) return false;
-+    return w->type == GGML_TYPE_IQ4_NL;   // mmid/glu predicates are IQ4_NL-only until Q4_K is templated in
++    return w->type == GGML_TYPE_IQ4_NL || w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q5_1 || w->type == GGML_TYPE_IQ3_S || w->type == GGML_TYPE_Q8_0 || w->type == GGML_TYPE_Q5_K || w->type == GGML_TYPE_Q6_K || w->type == GGML_TYPE_IQ4_XS || w->type == GGML_TYPE_Q3_K || w->type == GGML_TYPE_IQ3_XXS;
 +}
 +bool ggml_cuda_mmb_down16() { return mmb_down16_flag(); }
 +bool ggml_cuda_mmb_blk16() { static const int v = getenv("LLAMA_HC_BLK16") ? atoi(getenv("LLAMA_HC_BLK16")) : 0; return v != 0; }
@@ -993,6 +1495,43 @@ index 000000000..548f5abde
 +    return true;
 +}
 +
++static void mmb_routed_kernel_dispatch(const ggml_tensor * w, dim3 gbig, dim3 gsmall, cudaStream_t stream,
++        const uint8_t * W, const size_t eb, const uint16_t * xhp, float * D, uint16_t * Dh, const bool store_f32,
++        const int32_t * ids_src, const int32_t * ids_dst, const int32_t * bounds,
++        const uint32_t * desc_big, const uint32_t * desc_small, const int M, const int K, const int, const int) {
++    if (w->type == GGML_TYPE_Q4_K) {
++        mmb_routed_kernel<128, 128, 32, 64, 3><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 3><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_Q5_1) {
++        mmb_routed_kernel<128, 128, 32, 64, 4><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 4><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_IQ3_S) {
++        mmb_routed_kernel<128, 128, 32, 64, 5><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 5><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_Q8_0) {
++        mmb_routed_kernel<128, 128, 32, 64, 1><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 1><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_Q5_K) {
++        mmb_routed_kernel<128, 128, 32, 64, 6><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 6><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_Q6_K) {
++        mmb_routed_kernel<128, 128, 32, 64, 7><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 7><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_IQ4_XS) {
++        mmb_routed_kernel<128, 128, 32, 64, 8><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 8><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_Q3_K) {
++        mmb_routed_kernel<128, 128, 32, 64, 9><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 9><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_IQ3_XXS) {
++        mmb_routed_kernel<128, 128, 32, 64, 10><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 10><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else {
++        mmb_routed_kernel<128, 128, 32, 64, 0><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 0><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    }
++}
++
 +void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
 +    cudaStream_t stream = ctx.stream();
 +    const int K = (int) src0->ne[0], M = (int) src0->ne[1], E = (int) src0->ne[2];
@@ -1009,7 +1548,7 @@ index 000000000..548f5abde
 +    const int sis1 = (int) (src1->nb[2] / src1->nb[1]);
 +    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
 +        E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
-+    constexpr int BN_SMALL = 32, THRESH = 128;
++    constexpr int BN_SMALL = 32; const int THRESH = mmb_routed_thresh();
 +    const int nbig_max   = n_rows / BN + E + 1;
 +    const int nsmall_max = E * ((THRESH + BN_SMALL - 1) / BN_SMALL) + 1;
 +    ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);
@@ -1021,14 +1560,15 @@ index 000000000..548f5abde
 +    const bool store_f32 = Dh == nullptr;
 +    if (Dh) { static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_DOWN16 routed down BF16 in place: M=%d K=%d rows=%d\n", M, K, n_rows); }
 +    dim3 gbig((M + 127) / 128, nbig_max), gsmall((M + 127) / 128, nsmall_max);
-+    mmb_routed_kernel<128, BN, 32, 64><<<gbig, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-+    mmb_routed_kernel<128, BN_SMALL, 32, 16><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
++    mmb_routed_kernel_dispatch(src0, gbig, gsmall, stream, W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), desc_small.get(), M, K, BN, BN_SMALL);
 +    CUDA_CHECK(cudaGetLastError());
 +}
 +
 +bool ggml_cuda_mmb_supported_glu(const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
 +    if (!mmb_enabled() || !mmb_glu() || !gw || !uw || !src1 || !ids || !glu) return false;
-+    if (gw->type != GGML_TYPE_IQ4_NL || uw->type != GGML_TYPE_IQ4_NL) return false;
++        if (gw->type != uw->type) return false;
++    const bool wtype = gw->type == GGML_TYPE_IQ4_NL || gw->type == GGML_TYPE_Q4_K || gw->type == GGML_TYPE_Q5_1 || gw->type == GGML_TYPE_IQ3_S || gw->type == GGML_TYPE_Q8_0 || gw->type == GGML_TYPE_Q5_K || gw->type == GGML_TYPE_Q6_K || gw->type == GGML_TYPE_IQ4_XS || gw->type == GGML_TYPE_Q3_K || (gw->type == GGML_TYPE_IQ3_XXS && mmb_iq3xxs_glu());
++    if (!wtype) return false;
 +    if (!ggml_are_same_shape(gw, uw) || gw->nb[1] != uw->nb[1] || gw->nb[2] != uw->nb[2]) return false;
 +    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) return false;
 +    if (glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || !glu->src[0] || !glu->src[1]) return false;
@@ -1036,6 +1576,43 @@ index 000000000..548f5abde
 +    if (glu->src[0]->src[0] != gw || glu->src[1]->src[0] != uw || glu->src[0]->src[1] != src1 || glu->src[1]->src[1] != src1 || glu->src[0]->src[2] != ids || glu->src[1]->src[2] != ids) return false;
 +    if (ggml_nelements(glu) != ggml_nelements(glu->src[0]) || glu->ne[0] != gw->ne[1]) return false;
 +    return ggml_cuda_mmb_supported_mmid(gw, src1, ids, glu->src[0]) && ggml_cuda_mmb_supported_mmid(uw, src1, ids, glu->src[1]);
++}
++
++static void mmb_routed_glu_kernel_dispatch(const ggml_tensor * gw, dim3 gbig, dim3 gsmall, cudaStream_t stream,
++        const uint8_t * Wg, const uint8_t * Wu, const size_t eb, const uint16_t * xhp, float * D, uint16_t * Dh, const bool store_f32,
++        const int32_t * ids_src, const int32_t * ids_dst, const int32_t * bounds,
++        const uint32_t * desc_big, const uint32_t * desc_small, const int M, const int K, const int, const int) {
++    if (gw->type == GGML_TYPE_Q4_K) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 3><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 3><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_Q5_1) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 4><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 4><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_IQ3_S) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 5><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 5><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_Q8_0) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 1><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 1><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_Q5_K) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 6><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 6><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_Q6_K) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 7><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 7><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_IQ4_XS) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 8><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 8><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_Q3_K) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 9><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 9><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_IQ3_XXS) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 10><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 10><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 0><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 0><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    }
 +}
 +
 +void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu) {
@@ -1052,7 +1629,7 @@ index 000000000..548f5abde
 +    const int sis1 = (int) (src1->nb[2] / src1->nb[1]);
 +    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
 +        E, T, n_used, ne11, si1, sis1, /*write_inverse=*/false, stream);
-+    constexpr int BN_SMALL = 32, THRESH = 128;
++    constexpr int BN_SMALL = 32; const int THRESH = mmb_glu_thresh();
 +    const int nbig_max   = n_rows / BN + E + 1;
 +    const int nsmall_max = E * ((THRESH + BN_SMALL - 1) / BN_SMALL) + 1;
 +    ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);
@@ -1063,8 +1640,7 @@ index 000000000..548f5abde
 +    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_GLU fused gate/up+swiglu: M=%d K=%d rows=%d store_f32=%d\n", M, K, n_rows, (int) store_f32);
 +    const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data; float * D = (float *) glu->data; const size_t eb = (size_t) gw->nb[2];
 +    dim3 gbig((M + 63) / 64, nbig_max), gsmall((M + 63) / 64, nsmall_max);
-+    mmb_routed_glu_kernel<64, BN, 32, 32><<<gbig, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), M, K);
-+    mmb_routed_glu_kernel<64, BN_SMALL, 16, 16><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_small.get(), M, K);
++    mmb_routed_glu_kernel_dispatch(gw, gbig, gsmall, stream, Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), desc_small.get(), M, K, BN, BN_SMALL);
 +    CUDA_CHECK(cudaGetLastError());
 +}
 +

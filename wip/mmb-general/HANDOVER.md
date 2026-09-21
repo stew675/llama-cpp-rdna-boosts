@@ -55,6 +55,9 @@ The WIP lives on **two dedicated branches**.  **New work goes to those branches,
    brief** (`### F. MMB restructure` → "Follow-up brief for a fresh session: the IQ3_S dequant body").
 5. Commit the record to `wip-mmb-general` and push (`origin/wip-mmb-general`).
 
+**Working from another machine / architecture?  Read `GROUPS.md` first** — it is the 5-group triage
+sheet (what each group is, which parts are gated, what to check on gfx1100/gfx1201, and the gates).
+
 **Mandate — the MMB line is DONE (session 24); what is left is promotion.**  The campaign's prefill
 work is complete.  Landed in order: the general-purpose `mmb` weight GEMM; the QSA v3 path; the
 bf16-producer port (incl. the `xn` stream); the `dsv4_hc`/concat/moe/unary non-temporal wins; the F32
@@ -172,7 +175,7 @@ levers are the 3 block passes (472 ms at 32K, key-bound), the gather (259 ms) an
 |---|---|
 | worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`49eff7f18`** (clean) |
 | base | **r12 applied tree `8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`** (was `8a2567e1e` before the 2026-09-20 rebase) |
-| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/` + `commits.txt`, on branch **`wip-mmb-general`** (rebased onto `main` r12 `4e37fa6`), pushed to `origin/wip-mmb-general` |
+| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/` (**5 thematic patches**, see `GROUPS.md`) + `commits.txt`, on branch **`wip-mmb-general`** (rebased onto `main` r12 `4e37fa6`), pushed to `origin/wip-mmb-general` |
 | target model | `/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf` (94 GiB; the only qwen4exp with HC + QSA) |
 | fast iteration model | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf` (21 GiB, `qwen35moe`; **no** HC/QSA — use it for `mmb_*` shapes) |
 | reference | `~/pwilkin-llama-cpp` @ `f5daaa3cf` (branch `strix-halo`) |
@@ -671,13 +674,13 @@ unilaterally** -- needs a beta window / go-ahead.
 | | |
 |---|---|
 | worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`aa55dfef8`** (clean) |
-| base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0038` + `commits.txt`, in this repo, pushed to `origin/wip-mmb-general` |
-| verify | `git am` of `patches/` on a fresh `8a2567e1e` — clean (38 commits, applied tree `d365b43ddc87c472c33a121247931269f975aa43` == tip) |
+| base | **r12 applied tree `8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`** |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/` (**5 thematic patches**) + `commits.txt`, in this repo, pushed to `origin/wip-mmb-general` |
+| verify | `git am` of `patches/` on the r12 tree — clean (**5/5**, applied tree `d365b43ddc87c472c33a121247931269f975aa43` == the 38-commit tree) |
 | build | §3 | run | §4 |
 | current numbers | the **session 24 UPDATE below** (the `load_regs` field preload -- routed_glu 990 -> **841 ms**, total GPU kernel 4015 -> **3879 ms**, pp8192 **1116 t/s**) then the **session 23 UPDATE** (the tile-class threshold) then the **session 20 UPDATE** (the `rms_norm` register-cache **refutation** -- the session-19 tip `2da50418d` is unchanged) and the **session 19 UPDATE** (indexer pass-1 per-block histogram atomics + the block-pass warp reduction) -- indexer family pp8192 **71.7 ms** / pp32768 **1146.6 ms** -- plus the **session 18 UPDATE** (the block-level histogram + `blk_cells` src), the **session 15 UPDATE** (qsa3 compile-time gate + the rocprofiler-register profiling caveat), the **session 14/13 UPDATEs** (non-temporal) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
 
-**Historical ordering of the UPDATE sections:** 25 (newest, 2026-09-20, the indexer gather's warp-shuffle scan; the block-gather closed) -> 24 (the `load_regs` IQ3_S field preload) -> 23 (the tile-class threshold: the small tile's 4x A-panel dequant) -> 22 (the `v_perm` bf16 pack + the A-panel split) -> 21 (the A-panel double-buffered GLU tile) -> 20 (the `rms_norm` register-cache refutation) → 19 (2026-09-20, the indexer pass-1 per-block histogram atomics + the block-pass warp reduction) → 18 (2026-09-20, the indexer block-level histogram path + the `blk_cells` op src) → 17 (2026-09-20, indexer block-key sharing) → 16 (2026-09-20, the indexer count-pass elimination + the "compact after pass 1" refutation) → 15 (2026-09-20, the qsa3 compile-time gate + the rocprofiler-register profiling caveat) → 14 (2026-09-20, the non-temporal load sweep: concat/moe/unary) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
+**Historical ordering of the UPDATE sections:** 26 (newest, 2026-09-20, the r12 rebase + the 38->5 consolidation) -> 25 ( 2026-09-20, the indexer gather's warp-shuffle scan; the block-gather closed) -> 24 (the `load_regs` IQ3_S field preload) -> 23 (the tile-class threshold: the small tile's 4x A-panel dequant) -> 22 (the `v_perm` bf16 pack + the A-panel split) -> 21 (the A-panel double-buffered GLU tile) -> 20 (the `rms_norm` register-cache refutation) → 19 (2026-09-20, the indexer pass-1 per-block histogram atomics + the block-pass warp reduction) → 18 (2026-09-20, the indexer block-level histogram path + the `blk_cells` op src) → 17 (2026-09-20, indexer block-key sharing) → 16 (2026-09-20, the indexer count-pass elimination + the "compact after pass 1" refutation) → 15 (2026-09-20, the qsa3 compile-time gate + the rocprofiler-register profiling caveat) → 14 (2026-09-20, the non-temporal load sweep: concat/moe/unary) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body and are correct except where
 an UPDATE says otherwise.
@@ -685,6 +688,45 @@ an UPDATE says otherwise.
 **Next work:** see the **"FOR THE NEXT SESSION"** brief at the very top of this file — its ordered
 list is the authoritative one, and the historical "next-work order" lists inside the UPDATE sections
 below are superseded.
+
+---
+
+## UPDATE — session 26 (2026-09-20): rebase onto **r12** + the WIP **consolidated 38 -> 5 thematic patches**
+
+Full record: `GROUPS.md` (the triage sheet) + README "session 26".
+
+**Rebase.**  The delivery moved to r12 (`origin/main` `4e37fa6`) while this branch was frozen.  Both
+rebases are done and verified:
+
+* **record branch** `git rebase --onto 4e37fa6 1c2ec00 wip-mmb-general` — 17/17; the two `AGENTS.md`
+  conflicts were resolved by regenerating the file from r12's content plus this branch's WIP-branch
+  pointers (r12's rewrite and our pointer both touch the layout table and the WIP-rule bullet);
+  `README.md` and this file auto-merged.
+* **code branch** — the r12 tree `8a80535e556bef57666d2eaa4d3eb4cf93fb83f5` was rebuilt with
+  `RDNA_BRANCH=r12-verify scripts/apply-all.sh` on a fresh `ebbb18522` worktree (tree verified ==
+  `release.json`), then `git rebase --onto <r12> 8a2567e1e wip-mmb-general` — **38/38, no conflicts**.
+  All gates re-verified green afterwards (PPL 10.6015, greedy `9c281c415082`, width PASS, the three
+  op tests 2/2).
+
+**Consolidation: 38 commits -> 5.**  The other machines need a manageable set, so the WIP is now five
+thematic patches (see `GROUPS.md`):
+
+| # | theme | originals |
+|---|---|---:|
+| 1 | `mmb` — the general-purpose bf16-WMMA dequant weight GEMM | 14 |
+| 2 | `qsa3` — the packed-block WMMA sparse-attention path | 5 |
+| 3 | the F32/tiny-M kernels + the default flips + the W=1..8 probe | 5 |
+| 4 | HC16 native-BF16 producers + non-temporal accesses | 7 |
+| 5 | the fused indexer top-k op | 7 |
+
+The commits were **interleaved** (the `mmb` line is commits 1-9 *and* 33-37), so this is a
+cherry-pick-and-squash, not a reorder.  **It is content-preserving and verified as such**: the 5-patch
+result has tree **`d365b43ddc87c472c33a121247931269f975aa43`**, byte-identical to the 38-commit tip it
+replaced, and `git am` of the 5 patches on a fresh r12 tree is clean.  The 38-commit history is still
+in this repo's git history if the fine-grained form is ever needed.
+
+**Not touched:** `~/llama.cpp`'s `rdna-boosts` branch (still at the pre-r12 `8a2567e1e`); the r12 tree
+was built in a throwaway worktree on a distinct `r12-verify` branch.
 
 ---
 
