@@ -57,6 +57,20 @@ Next: **S5-S7 (G1 `mmb`)** — the headline re-tune/re-scope.  Live work is §6.
 Next: **S8 (G3b/c + HC16)** — then S9 (the delivery re-examination + full matrix) and S10
 (freeze/merge).  See §6.6 and §8.
 
+**S8-S9 log (2026-09-21): S8 is a no-op on gfx1100 by construction; S9's FA re-examination is
+closed.**  Raw data: **`gfx1100-s8s9-results.md`**.
+* **S8:** the F32 split is policy-off (patch `0008`); **HC16 is hard-gated to `RDNA3_5`** in
+  `ggml-cuda.cu`, so `GGML_CUDA_MMB_HC16` is a no-op on gfx1100; the tiny-M kernel is qwen4exp-only.
+* **S9 FA head cap:** the block-04 RDNA3_0 cap 256 **holds and the margin is large** — forcing
+  head-512 WMMA (`GGML_CUDA_FA_WMMA_MAX_HEAD=576`) costs gemma-12B pp16384 **−9 %**, gemma-26B
+  pp32768 **−15 %**.  Keep the cap.
+* **S9 verify-width gate (rule 5):** green (B=4/B=8 equal delivery vs WIP on a dense K-quant gemma).
+* **S9 open:** the `mmvq` RDNA3_0 `nwarps` and `VDR_Q8_0` re-sweeps, the block-13-fused vs
+  MMB-routed kernel-time A/B, and the consolidated B1-B9 on the frozen tree (S10).
+
+Next: **S10 (freeze, regenerate the overlay, merge back to `wip-mmb-general`)** — after the
+remaining decode-side re-sweeps if the maintainer wants them done first.
+
 ---
 
 ## 0. TL;DR
@@ -198,8 +212,11 @@ delivery work and the entire `mmb-general` WIP).  Each is therefore "re-open and
   The gfx1100 head-512 case (gemma4) is exactly what the 12B Q8_0 probe exercises, and the tile
   kernel now has the derived-mask path (a deep-prefill win on gfx1100 per r9).  The cap may still be
   right, but the surrounding kernel choice has moved.
-* **Action (S9).**  Re-measure the gemma-4-12B (and, if available, a head-512 model) prefill/decode
-  with the cap at 256 vs the RDNA4/RDNA3_5 values, and re-check the V3 tile-mask interaction.
+* **Action (S9) — DONE 2026-09-21: the cap HOLDS.**  Forcing head-512 WMMA
+  (`GGML_CUDA_FA_WMMA_MAX_HEAD=576`) on the current tree costs gemma-12B pp8192/pp16384 **−5.6 % /
+  −9.1 %** and gemma-26B-A4B pp8192/pp32768 **−5.6 % / −14.6 %**.  The block-04 RDNA3_0 cap 256
+  (head 512 → tile) is correct, and the margin is larger now than in the 2026-09-18 measurement
+  (consistent with the r9 V3-on-tile improvement).  Data: `gfx1100-s8s9-results.md` §9.1.
 
 ### 2.6 The block-13 RDNA3_0 MoE fusion gate
 
@@ -534,8 +551,8 @@ relevant gates, write a dated `gfx1100-sNN-results.md`, commit the record to the
 | **S5** | G1 open ✅ | `MMB_RDNA3=1`; MMB fires; correctness | PPL parity (−0.9 %/+0.4 %); width probe PASS |
 | **S6** | G1 per-type/path matrix + re-tune ✅ | **gfx1100 = dense wins big, F32 router loses**; patch `0008` | 27B +14.4 %, gemma-12B +11 %, 35B MoE +5.6 %, g26 neutral |
 | **S7** | G1 routed/GLU ✅ | routed isolate (the bulk of the MoE win, ~+4 %) | kernel-time-free but `DENSE=0` isolate-backed; finer knobs deferred |
-| **S8** | G3b/c + HC16 | F32 split / tiny-M / HC16 isolated and A/B'd | each knob measured + purity-checked |
-| **S9** | the delivery re-examination + full matrix | §2.3-§2.7 re-measured; B1-B9 re-run on the frozen tree | every gate green with numbers |
+| **S8** | G3b/c + HC16 ✅ | F32 policy-off; HC16 hard-gated to RDNA3_5; tiny-M qwen4exp-only | **no measurable gfx1100 work by construction** |
+| **S9** | delivery re-examination + matrix ⏳ | FA head cap **validated** (keep 256); verify-width gate green; **mmvq/VDR re-sweeps + block-13-vs-MMB pending** | §9.2 green; §9.3 open |
 | **S10** | freeze + regenerate + merge back | new WIP patch (likely patch 7 = gfx1100 scope/tuning); docs updated; `git am` N/N; merge record branch into `wip-mmb-general` | gfx1100 handed a clean state; branches reconciled |
 
 Sessions S1-S7 are done.  S8 (G3b/c + HC16), S9 (delivery re-examination + full matrix) and S10
@@ -601,9 +618,9 @@ claim* is deferred.
 - [x] G1 gfx1100 per-type/per-path: **dense is a big win, F32 router loses**; patch `0008` (S6)
 - [x] G1 routed/GLU isolate: the routed path is the bulk of the MoE win (~+4 %) (S7)
 - [ ] G1 optional finer routed/GLU threshold + `DBUF` sweep (deferred)
-- [ ] G3b/c + HC16 measured and defaulted (S8)
-- [ ] delivery re-examination §2.3-§2.7 re-measured (S9)
-- [ ] B1-B9 green on the frozen tree, including MTP (S9)
+- [x] G3b/c + HC16 — **no-op on gfx1100** (F32 policy-off; HC16 RDNA3_5-gated; tiny-M qwen4exp-only) (S8)
+- [~] delivery re-examination: **FA cap 256 validated (keep)**, verify-width gate green; mmvq/VDR + block-13-vs-MMB **pending** (S9)
+- [ ] B1-B9 consolidated on the frozen tree, including MTP (S10)
 - [ ] patch set regenerated + `git am` N/N + merged back to `wip-mmb-general` (S10)
 
 ---
