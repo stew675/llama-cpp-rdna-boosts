@@ -18,17 +18,22 @@ git rev-parse HEAD^{tree}                     # -> 580db5174574f10cc92fb1cefa722
 git am /home/stew675/llama-cpp-rdna-boosts/wip/mmb-general/gfx1100/patches/*.patch   # 0007
 ```
 
-`0007` and `0008` apply clean, in order, on top of the 6-patch tree:
+`0007`, `0008` and `0009` apply clean, in order, on top of the 6-patch tree:
 
 ```sh
-git am /home/stew675/llama-cpp-rdna-boosts/wip/mmb-general/gfx1100/patches/*.patch   # 2/2
-git rev-parse HEAD^{tree}   # -> 064a2ad65ebb970e7302d74ea5a285e6a2dd5352 (verified 2026-09-21)
+git am /home/stew675/llama-cpp-rdna-boosts/wip/mmb-general/gfx1100/patches/*.patch   # 3/3
+git rev-parse HEAD^{tree}   # -> 2c89ce7219a993fa9c43c767f99b1e384db59656 (verified 2026-09-21)
 ```
 
 * `0007` (`fattn-qsa3.cu`): `ggml_cuda_flash_attn_qsa3_supported()` gains `RDNA3_0`, so the
   packed-block WMMA QSA path runs on gfx1100 (gfx11 fragment arm, identical to gfx1151).
 * `0008` (`mmb.cu`): `mmb_f32split_mode()` defaults the F32 split off on RDNA3_0/RDNA4 (gfx1151
   keeps it on), because the F32 MoE-router split is a loss on gfx1100.
+* `0009` (`mmvq.cu`): **experimental, DEFAULT-OFF** per-M `nwarps` rule for the dense weight ksplit
+  path (`GGML_CUDA_MMVQ_RDNA3_SMALL_M`, default 0).  The rule gains 35B-A3B +2.1 % draft-mtp /
+  gemma-26B +2.1 % decode at M<=2048/4096, but **breaks W=1..8 width purity on the MoE models**, and
+  the only pure threshold (<=1024) gives no gain — so it must not be enabled until the width-invariant
+  mapping is re-derived.  See `../gfx1100-s9-nwarps-results.md`.
 
 ## Why a patch instead of folding it into the canonical patch 2
 
@@ -45,4 +50,6 @@ merge-back a clean replay.  If the maintainer prefers, it folds into patch 2 at 
   With it, `GGML_CUDA_MMB=1 GGML_CUDA_MMB_RDNA3=1` is a large gfx1100 win: 27B Q4_K_M +14.4 %,
   gemma-12B Q8_0 +11.3 %, 35B-A3B MoE +5.6 %/+4.7 %, gemma-26B-A4B neutral.  Decode unchanged,
   width purity PASS, PPL parity.
+* `0009` (mmvq) is an **experimental, default-off** per-M `nwarps` scaffold; enabling it is a real
+  MoE win but breaks width purity, so it is not enabled.  See `../gfx1100-s9-nwarps-results.md`.
 * See `../gfx1100-s2s4-results.md` and `../gfx1100-s5s7-results.md` for the records.

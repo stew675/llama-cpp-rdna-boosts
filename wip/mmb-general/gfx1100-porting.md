@@ -93,6 +93,17 @@ Next: **S10 (freeze, regenerate the overlay, merge back to `wip-mmb-general`)**.
   reaches the verify body).  **Not landed** — recorded with the shape data and an `M >= 4096`
   hypothesis for a dedicated session.
 
+**`nwarps` candidate landed (default-OFF), 2026-09-21.**  Raw data:
+**`gfx1100-s9-nwarps-results.md`**.  The maintainer asked for it as a new WIP patch.  An M-scoped
+`nwarps` rule was implemented for the dense weight ksplit path (patch **`0009`**,
+`GGML_CUDA_MMVQ_RDNA3_SMALL_M`, default **0 = off**; fusion launches excluded).  It gains 35B-A3B
+**+2.1 % draft-mtp** and gemma-26B **+2.1 % decode** at M≤2048/4096 — but those settings **break the
+W=1..8 width-purity contract** on the MoE models (35B maxdiff 0.150; gemma-26B maxdiff **3.35**, a
+correctness red flag), and the only pure threshold (≤1024) gives **no gain**.  Landed default-off (a
+mergeable scaffold for the re-validation workflow), with the width-invariant-mapping re-derivation
+recorded as the condition for enabling it.  Overlay now `git am` **3/3**, applied tree
+`2c89ce7219a993fa9c43c767f99b1e384db59656`.
+
 ---
 
 ## 0. TL;DR
@@ -651,7 +662,7 @@ claim* is deferred.
 - [x] G3b/c + HC16 — **no-op on gfx1100** (F32 policy-off; HC16 RDNA3_5-gated; tiny-M qwen4exp-only) (S8)
 - [x] delivery re-examination DONE: FA cap 256 **keep**; verify-width gate green; **`nwarps` shape-dependent (table kept)**; **VDR=4 keep**; **all 8 native KV pure**; MMB kernel-time −5.4 % (S9)
 - [x] G1 optional routed/GLU threshold + DBUF sweep — **done: no change** (thresh 32 optimal; DBUF refuted/not-viable; IQ3_XXS wash) (S9)
-- [x] G1 `nwarps` MoE candidate — **investigated: real (+4.5 % MTP) but not expressible with the current dispatch axes**; deferred with data (S9)
+- [x] G1 `nwarps` MoE candidate — **landed as patch `0009` (DEFAULT-OFF)**: the mechanism exists, but every gaining threshold breaks W=1..8 width purity on the MoE models (35B FAIL 0.150 at >=2048; gemma-26B FAIL 3.35 at >=4096) and the pure threshold (<=1024) gives no gain.  Not enabled until the width-invariant mapping is re-derived (S9; `gfx1100-s9-nwarps-results.md`)
 - [ ] B1-B9 consolidated on the frozen tree, including MTP (S10)
 - [ ] patch set regenerated + `git am` N/N + merged back to `wip-mmb-general` (S10)
 
