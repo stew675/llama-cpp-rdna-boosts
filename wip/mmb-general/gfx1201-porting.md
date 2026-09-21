@@ -5,6 +5,12 @@ supersedes the "gfx1201 is a no-op / new work, not a port" notes in `GROUPS.md` 
 (see §2 — those notes were written before the RDNA4 WMMA layout had an in-repo reference and
 before the delivery's gfx1201 MMQ path was re-tuned).
 
+**Session 1 log (2026-09-21):** the WIP was applied to `~/llama.cpp` as branch `rdna-boosts-mmb-port`
+(`git am` **5/5**, clean) and **built green for gfx1201** with the delivery build script (`EXIT=0`,
+100%, `llama-cli`/`llama-bench`/`llama-perplexity`/`llama-server` present) — the RDNA4 no-op wrappers
+in `mmb.cu`/`fattn-qsa3.cu` do keep the multi-arch build compiling, as the WIP claimed.  The
+baseline worktree `~/llama-base` is staged.  No porting code has been written yet.
+
 **Audience:** whoever picks this up next — first on gfx1201, then on gfx1100.  Read this with
 `GROUPS.md` (the 5-group triage) and `HANDOVER.md` (the gfx1151 development record).  This file is
 the *porting* overlay; the group semantics stay as `GROUPS.md` describes.
@@ -410,8 +416,8 @@ qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a g
 
 ## 10. Live checklist
 
-- [ ] WIP applies 5/5 and builds for gfx1201 (S1)
-- [ ] Baseline gates B1-B9 recorded for both builds (S1)
+- [x] WIP applies 5/5 and builds for gfx1201 (S1 — verified 2026-09-21, EXIT=0)
+- [ ] Baseline gates B1-B9 recorded for both builds (S1 — in progress)
 - [ ] G5 indexer ported + validated (S2)
 - [ ] G4 non-temporal A/B'd per kernel (S2)
 - [ ] G3a always-QSA decided for RDNA4 (S3)
