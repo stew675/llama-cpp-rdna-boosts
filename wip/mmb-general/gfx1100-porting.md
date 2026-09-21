@@ -13,6 +13,15 @@ light of the substantial delivery + WIP changes since they were written — see 
 6-patch triage), `gfx1201-porting.md` (the RDNA4 port this is the sibling of) and `HANDOVER.md` (the
 gfx1151 development record).  The group semantics stay as `GROUPS.md` describes.
 
+**Session 1 log (2026-09-21):** the WIP was applied to the new `~/llama-wip-gfx1100` worktree
+(branch `mmb-gfx1100`, `git am` **6/6**, tree `580db5174574f10cc92fb1cefa72281a65c77b12`) and built
+green for gfx1100.  The full baseline matrix (B1-B9) was recorded on the delivery and the WIP: with
+the gates off / arch-gated the WIP is **byte-identical to the delivery** on every gate, MTP is
+healthy (27B 38→70.6 t/s, acceptance 0.78; MoE 113→151 t/s, 0.66), and the oracles are green.  Two
+environment finds: the box exposes a **gfx1036 iGPU** that must be masked with
+`HIP_VISIBLE_DEVICES=0`, and the G5 oracle is named **`TOPK_QSA`**, not `INDEXER_TOPK`.  Raw data:
+**`gfx1100-s1-results.md`**.  Live work is now **S2** (§6.1/§6.2).
+
 ---
 
 ## 0. TL;DR
@@ -271,9 +280,12 @@ first on every text/PPL/op gate.  (The only expected deltas are where a group is
 
 **Important:** record every number in a new dated `gfx1100-sNN-results.md` (not in this plan).
 
-### 4.1 S1 groundwork already verified (2026-09-21)
+### 4.1 S1 results (2026-09-21) — the baseline is recorded
 
-Done while writing this plan (the WIP build + the cheap unit gates); see `gfx1100-s1-results.md`.
+The full S1 matrix is in **`gfx1100-s1-results.md`**.  Headline: the WIP (gates off / arch-gated) is
+**byte-identical to the delivery on every gate**, so the S2+ A/Bs start from a trustworthy baseline.
+
+The cheap highlights:
 
 * WIP **builds green for gfx1100** (0 compiler errors).
 * `HIP_VISIBLE_DEVICES=0 test-backend-ops -o TOPK_QSA` → **4/4** (G5 indexer, generic).
@@ -281,8 +293,9 @@ Done while writing this plan (the WIP build + the cheap unit gates); see `gfx110
   still excluding `RDNA3_0`, the four packed cases fall back to the VEC kernel, so this only proves
   the test is runnable here; **S4 re-runs it with the predicate changed and that is the real qsa3
   coverage on gfx1100.**
-* `test-logits-width-probe` on gemma-12B Q8_0, `prompts/prose-rdna-boosts.txt` (5491 tokens, sha256
-  `fabdec65…`), `P=1024`, f16 KV → **`width_purity=PASS (worst maxdiff 0)`**.
+* `FLASH_ATTN_EXT` → **5955 cases, 0 FAIL**; `GATED_DELTA_NET` → 2/2.
+* `test-logits-width-probe` → **`PASS (worst maxdiff 0)`** on all four models, f16 KV.
+* MTP works and is a large win (27B 38→70.6 t/s, acceptance 0.78; MoE 113→151 t/s, acceptance 0.66).
 * The gfx1100 `mmb`/`qsa3` device paths compile from the **same gfx11 arm** as gfx1151 — no gfx12
   work is needed, as `GROUPS.md` predicted.
 
@@ -513,10 +526,9 @@ claim* is deferred.
 ## 11. Live checklist
 
 - [x] gfx1100 record branch + code worktree created; WIP applies **6/6** (tree `580db5174574f10cc92fb1cefa72281a65c77b12`)
-- [x] WIP builds for gfx1100 (S1 groundwork, 2026-09-21; 0 errors)
-- [x] cheap unit gates on gfx1100: `TOPK_QSA` 4/4, `FLASH_ATTN_QSA` 26/26 (VEC fallback), width probe PASS
-- [ ] baseline gates B1-B3/B5-B8 recorded on the delivery and the WIP (S1)
-- [ ] G5 indexer — `TOPK_QSA` green; `GGML_OP_NAME` fill fix (S2)
+- [x] WIP builds for gfx1100 (S1, 2026-09-21; 0 errors)
+- [x] **S1 baselines B1-B8 done** — WIP (gates off) byte-identical to the delivery on every gate; MTP healthy (27B 38->70.6 t/s acc 0.78; MoE 113->151 t/s acc 0.66); oracles green (`TOPK_QSA` 4/4, `FLASH_ATTN_QSA` 26/26, `GATED_DELTA_NET` 2/2, `FLASH_ATTN_EXT` 5955/0-FAIL); width purity PASS on all 4 models (`gfx1100-s1-results.md`)
+- [ ] G5 indexer — `TOPK_QSA` green (done); G5 perf is trust-RDNA3_5; `GGML_OP_NAME` fill fix (S2)
 - [ ] G4 non-temporal — per-kernel A/B on the MoE models (S2)
 - [ ] G3a always-QSA decision documented (S3, trust-RDNA3_5)
 - [ ] G2 `qsa3` predicate gains `RDNA3_0`; `FLASH_ATTN_QSA` **26/26** (S4)
