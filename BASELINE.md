@@ -15,9 +15,14 @@ remain as known-good records for those upstream versions.
 
 > **Current baseline marker:** `baseline/d1d3c3396` was the previous (2026-09-15)
 > delivery baseline.  The current one is **`ebbb18522`** (2026-09-17), the fork point of
-> release **`v16-ebbb18522-r11`** (canonical tip
-> `eabb7418df317d1d1b45d65faf1b235c6b43643d`, tree
-> `865ded736155407c3a02f5249df356ed1a35fb56`; r11 = the 2026-09-20 block-15 amendment that makes the
+> release **`v16-ebbb18522-r12`** (canonical tip
+> `3d27ae995f44b53cdcb9f9559cb785367bbe57c2`, tree
+> `8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`; r12 = the 2026-09-21 block-15 amendment that makes `--fit`
+> support `-sm tensor`, promoted from `beta/tensor-fit-fix/` - upstream threw "not implemented for
+> SPLIT_MODE_TENSOR" and swallowed it, so the default-on `--fit` was a silent no-op under tensor split.
+> Re-validated on r11 first: fit decisions, seven end-to-end loads with no out-of-memory and no
+> compute-buffer growth, byte-identical same-seed gate - on top of
+> r11 = the 2026-09-20 block-15 amendment that makes the
 > compute reserve account for the *reachable* (packed) kq mask, issue #42 — V3's derived form is
 > per-*batch*, so a 2-D M-RoPE or multi-sequence batch allocates a mask the reserve did not contain,
 > and the growth died under the default `--fit-target 256`; `kq_mask_packed_reachable()` decides where

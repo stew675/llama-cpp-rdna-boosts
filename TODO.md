@@ -307,18 +307,18 @@ enablement there and runs host-only/CPU.
   (cosmetic).
 
 ## Parked (not planned now)
-- **`--fit` for `-sm tensor` (raised 2026-09-18, issue #38 investigation).**  `common/fit.cpp`
-  (`common_params_fit_impl`) aborts for `LLAMA_SPLIT_MODE_TENSOR` and `common_fit_params` warns and
-  continues, so `--fit` is a no-op under tensor split — documented upstream in `docs/multi-gpu.md`
-  since the fit-params PR #22171, and **upstream code no delivery block touches**.  The algorithm is
-  layer-granular (`tensor_split[id] = ngl_per_device[id].n_layer`, whole-layer back-to-front fills,
-  whole-tensor CPU overflow via `tensor_buft_overrides`), which does not map onto the shard-every-layer
-  tensor split.  A fix is a new allocator over the `tensor_split` proportion vector + `n_ctx` (the
-  `n_ctx` reduction part is already split-agnostic), keeping whole-tensor MoE CPU spill and reducing
-  `n_gpu_layers` only for gross overflow, with its own multi-GPU dense/MoE validation.  Recommended home:
-  `upstream/UPSTREAM-PR-*.md` + `.patch` (or upstream itself), **not** a delivery block.  Workaround for
-  users: pass explicit `-c` / `--tensor-split` / `-ngl`, or use `-sm layer` where `--fit` works.  No work
-  started.
+- ~~**`--fit` for `-sm tensor` (raised 2026-09-18, issue #38 investigation).**~~  **DONE 2026-09-21, promoted
+  as the block-15 r12 amendment** from `beta/tensor-fit-fix/` (now `archive/work/tensor-fit-fix/`).  The
+  work existed as a beta patch all along; it was re-validated against r11 (the fit now has to size for the
+  reachable packed kq mask), promoted, and the campaign record archived.  `--fit` is no longer a no-op
+  under tensor split: per-device targets, proportional or honoured `-ts`, then auto-`n_ctx` and an `-ngl`
+  binary search, with an explicit `-c` never overridden.  Gates: the default fit cases reproduce the
+  2026-09-18 record exactly (auto-ctx 27B: 59899 -> `n_ctx 43264`), the `-ngl`-reduction cases are more
+  conservative than the beta (the fit sizes for the mask), seven end-to-end loads generate with zero
+  out-of-memory and zero compute-buffer growth (dense/MoE, 2 and 3 GPU, embedded and separate/adaptive
+  MTP), and the same-seed gate is byte-identical.  See `WORKLOG.md` 2026-09-21 (r12) and the block-15 (r12)
+  amendment in `patches/README.md`.  **Still worth an `upstream/UPSTREAM-PR-*` candidate** - the change is
+  generic llama.cpp; only the placement (block 15) is delivery-specific.
 - ~~**The `fattn-mma-f16` instance-set build cost (raised 2026-09-15, r5).**~~  **PARTLY DONE in r6
   (2026-09-18).**  Candidate (a) is delivered: `generate_cu_files.py` now emits one MMA TU per
   `(ncols1, ncols2, head size)` and the head-512 instances are listed **first** in the backend source

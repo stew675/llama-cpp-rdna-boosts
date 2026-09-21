@@ -1,5 +1,70 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-21 (r12) — `v16-ebbb18522-r12`: `--fit` supports `-sm tensor` (beta/tensor-fit-fix promoted)
+
+**Release** `v16-ebbb18522-r12`, canonical tip `3d27ae995f44b53cdcb9f9559cb785367bbe57c2`, net tree
+`8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`.  Only **block 15** changed; blocks 00-14 are
+content-identical to r11 (their patch files are byte-identical).
+
+**Promoted from `beta/tensor-fit-fix/`** (now `archive/work/tensor-fit-fix/`) on the maintainer's
+go-ahead, after the re-validation below.  The change is generic llama.cpp - `common/fit.cpp`,
+`ggml/include/ggml-backend.h` (two accessors de-static'd), `ggml/src/ggml-backend-meta.cpp` and
+`docs/multi-gpu.md` (the `tensor` caveat removed) - and it is still worth an `upstream/`
+`UPSTREAM-PR-*` candidate.
+
+**The gap.**  `--fit` is on by default, but under `-sm tensor` `common_params_fit_impl()` threw
+"llama_params_fit is not implemented for SPLIT_MODE_TENSOR" and `common_fit_params()` swallowed the
+exception, so the fit never ran and the user's `-c`/`-ngl`/`-ts` were left exactly as passed.  That is
+upstream behaviour, documented in `docs/multi-gpu.md`, from the original fit-params PR #22171.
+
+**Why it is not a one-liner.**  Under `-sm tensor` with more than one device every GPU is wrapped in a
+single Meta device, so the existing fit algorithm (layer-granular `tensor_split[id] = n_layer`,
+whole-tensor CPU overflow) cannot express "shard every layer", and the Meta row of
+`llama_get_memory_breakdown()` counts `model` once while `context`/`compute` are the largest *per-device*
+sub-buffer.  The fix expands the Meta device back into its simple devices and works per device:
+`target_i = free_i - margin_i`, `tensor_split[i] ∝ target_i` (or honour a user `-ts` as a constraint and
+log the `effective budget`), then reduce an auto `n_ctx` and binary-search `n_gpu_layers` down.  An
+explicit `-c` is never overridden.
+
+**Placement: block 15, not block 06.**  `common/fit.cpp`, `ggml/include/ggml-backend.h` and
+`docs/multi-gpu.md` are touched by **no** delivery block, and the Meta accessors already exist upstream
+(file-static), so the change depends on no block.  Its only overlap is `ggml/src/ggml-backend-meta.cpp`,
+which blocks 09/14/15 touch, block 15 last, at lines ~795/~1032 versus this change's ~83/~196.  Block 15
+is therefore both "the last block that touches the file" and the placement that cannot be invalidated by
+a later block.  Block 06 was considered and rejected: it is the host-buffer revert for discrete GPUs and
+does not touch that file at all.
+
+**Re-validated on r11 before promotion** (the patch was written against the r5/r6-era tree, and r11
+changed what the fit has to reserve, since the reachable packed kq mask now sits in the reserve for
+M-RoPE models):
+
+* **Fit decisions.**  The comfortable cases reproduce the 2026-09-18 record exactly: 27B Q8_0 2 GPU
+  `-c 4096` -> `-c 4096 -ngl -1 -ts 31254,31254`; 3 GPU -> `-ts 31254,31254,31254`; auto-ctx
+  `--fit-target 16000,16000` -> estimate 59899 vs 32556 target and `n_ctx` 262144 -> **43264**, against
+  the beta's 59901 -> 43264.  The `-ngl`-reduction cases land **lower** than the beta (3 GPU
+  `--fit-target 30000 x3`: 12 -> **4**; pinned `-ts 1,3 --fit-target 26000 x2`: 17 -> **7**; MoE 35B-A3B
+  `--fit-target 26000 x2`: 14 -> **11**) because the fit must now size for that mask; its internal trace
+  is monotonic and stays under budget in every case, so the change is in the conservative direction.
+* **End-to-end (7 configs, all `--fit on -sm tensor`).**  27B Q8_0 comfortable / auto-ctx / embedded MTP
+  (2 GPU) / 3 GPU, 27B + **separate** MTP head with `--spec-type draft-mtp-adaptive` (the issue #38
+  path), MoE 35B-A3B, and a pinned `-c 262144 --fit-target 16000,16000` (`-ngl` reduction).  Every one
+  loads, generates, and logs **zero** `out of memory`, **zero** `failed to allocate graph` and **zero**
+  compute-buffer growth.  MTP acceptance 1.0 (embedded) and 0.5 (adaptive + separate head).  The
+  load-time breakdown shows `compute` tracking context (126 MiB at `-c 4096` -> 378 MiB at
+  `n_ctx 48640`), i.e. the r11 mask is inside what the fit now counts.
+* **Coherence gate.**  With the fit deactivated (`--fit off`, explicit `-c 8192 -ngl 99 -ts 1,1`) and a
+  fixed seed, r11 and r11 + this patch are **byte-identical**
+  (`19ee51a93e6c9806b614b333cc0ef9ba64d60fbc9502565726bfdf51bd20b924`), as expected for a change confined
+  to `common/fit.cpp` plus two `static` removals.
+* `scripts/validate-set.sh` green (strict 16/16 `git am` on a fresh `ebbb18522`, applied tree
+  `8a80535e5`), and only patch `0015` changed.
+
+**Carried limitations** (from the campaign record): the estimate is deliberately conservative rather
+than exact, and the default 1 GiB/device margin absorbs the measured ~0.4 GiB/device error on 27B Q8_0;
+block 15's FA **prefill staging arena** is not counted by either fit (bounded, RDNA4/RDNA3_0 only, and
+issue #33's `fattn_stage_try_get` fallback degrades to the native K/V read instead of failing); and a
+user-pinned lopsided `-ts` lowers the effective budget, which the fit log makes visible.
+
 ## 2026-09-21 — docs pass: adaptive-MTP ceiling caveat, ROCm 7.2 toolchain caveat, generator idempotency verified
 
 No delivery block changed (`release.json` stays `v16-ebbb18522-r11`; `patches/` is untouched).

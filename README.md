@@ -328,8 +328,15 @@ for per-block verification and `BASELINE.md` for provenance.
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`ebbb18522`** (upstream master "openvino : Update OpenVINO to 2026.4", 2026-09-17 re-base).
-- Canonical 16-block chain: tip **`eabb7418df317d1d1b45d65faf1b235c6b43643d`**, net tree
-  **`865ded736155407c3a02f5249df356ed1a35fb56`**; release **`v16-ebbb18522-r11`**.
+- Canonical 16-block chain: tip **`3d27ae995f44b53cdcb9f9559cb785367bbe57c2`**, net tree
+  **`8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`**; release **`v16-ebbb18522-r12`**.
+- **`--fit` works under `-sm tensor`** (block 15, r12, promoted from `beta/tensor-fit-fix/`): upstream
+  threw `not implemented for SPLIT_MODE_TENSOR` and swallowed it, so the default-**on** `--fit` was a
+  silent no-op under tensor split.  The Meta device's accessors are now exposed and `common/fit.cpp`
+  has a dedicated tensor path (per-device targets from `--fit-target`, a proportional split or an
+  honoured `-ts`, then auto-`n_ctx` reduction and an `-ngl` binary search); an explicit `-c` is never
+  overridden.  Re-validated on r11 before promotion (fit decisions, 7 end-to-end loads with zero
+  out-of-memory and zero compute-buffer growth, byte-identical same-seed gate).
 - **The compute reserve accounts for the reachable (packed) kq mask** (issue #42, block 15,
   2026-09-20): V3's derived kq mask is a per-*batch* optimization, so a 2-D M-RoPE image/audio batch or a
   multi-sequence batch allocates the packed mask (`n_kv*n_tokens*2` bytes), which the reserve — measured

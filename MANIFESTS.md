@@ -12,7 +12,23 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release (2026-09-20) — `v16-ebbb18522-r11`:** a block-15 amendment (issue #42) on top of r10:
+**Current release (2026-09-21) — `v16-ebbb18522-r12`:** a block-15 amendment on top of r11, promoting
+`beta/tensor-fit-fix/`: **`--fit` now supports `-sm tensor`**.  Upstream threw
+`llama_params_fit is not implemented for SPLIT_MODE_TENSOR` and `common_fit_params()` swallowed the
+exception, so the default-**on** `--fit` never ran under tensor split and users had to size
+`-c`/`-ngl`/`-ts` by hand.  The Meta device's accessors are exposed (they existed upstream, file-static)
+and `common/fit.cpp` gained a dedicated tensor path: per-device targets from `--fit-target`, a
+proportional split or an honoured user `-ts` (with the binding `effective budget` logged), then an auto
+`n_ctx` reduction and an `-ngl` binary search, never overriding an explicit `-c`.  Block 15 is the home
+because it is the last block touching `ggml-backend-meta.cpp` and the change depends on no block; it
+remains a good `upstream/` PR candidate.  Re-validated on r11: the default fit cases reproduce the
+2026-09-18 record exactly, the `-ngl`-reduction cases are more conservative (the fit now sizes for the
+packed mask r11 restored for M-RoPE), seven end-to-end loads generate with zero out-of-memory and zero
+compute-buffer growth (including the separate-MTP-head `draft-mtp-adaptive` path), and the same-seed gate
+is byte-identical.  Canonical tip `3d27ae995f44b53cdcb9f9559cb785367bbe57c2`, tree
+`8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`, strict 16/16 (only patch `0015` changed).
+
+**r11 (2026-09-20) — `v16-ebbb18522-r11`:** a block-15 amendment (issue #42) on top of r10:
 the compute reserve now measures with the packed kq mask when one is **reachable**, because V3's derived
 form is a per-*batch* optimization — a 2-D M-RoPE image/audio batch or a multi-sequence batch allocates
 the packed mask (`n_kv*n_tokens*2`), which the reserve (measured with the derived form on) did not
