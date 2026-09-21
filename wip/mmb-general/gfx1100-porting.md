@@ -106,6 +106,22 @@ mergeable scaffold for the re-validation workflow), with the width-invariant-map
 recorded as the condition for enabling it.  Overlay now `git am` **3/3**, applied tree
 `2c89ce7219a993fa9c43c767f99b1e384db59656`.
 
+**S10 log (2026-09-21): the rebase onto the 10-patch `wip-mmb-general` is DONE and re-validated.**
+Raw data: **`gfx1100-s10-rebase-results.md`**.  The record branch rebased **clean** (§14.2's expected
+`GROUPS.md` conflict did not materialise), the overlay was re-cut for the gfx1201 S10-S13 `mmb.cu`
+rework — `0011` (qsa3) and `0013` (mmvq nwarps) re-applied clean, `0012` rewritten as the **`RDNA3_0`
+arm in `mmb_arch_defaults()`** (§14.4) — and the full set is **13/13 `git am`**, tree
+**`cd306e6b6093b63468289edac24fbea3d270dbe2`**.  Build green; `FLASH_ATTN_QSA` **26/26**,
+`FLASH_ATTN_EXT` 5953/5953, `GATED_DELTA_NET` 46/46, `TOPK_QSA` 4/4; `MMB_CFG` shows **`f32split=0`**
+with `routed=1`/`glu=1`/`bf16w=1`; the S5-S7 headline **reproduces** (27B +14.3 %, gemma-12B +11 %,
+35B MoE +5.5 %/+4.8 %, gemma-26B neutral); PPL parity (27B 10.0174→9.9258, 35B 14.8302→14.8248),
+width purity PASS ×4, the same-seed greedy hashes match S5-S7 exactly, and the WIP-off MTP arm is
+**byte-identical to the delivery** (27B 0.69076, 35B 0.73222).  The only code delta vs the pre-rebase
+tree is `mmb.cu` (`mmvq.cu`/`fattn-qsa3.cu` byte-identical), so §2.3/§2.4 cannot have moved; the FA
+head-cap re-probe still costs −8.1 % when forced (§2.5 holds).  **§14.5.6 CLOSED:** the F32 split is
+still a loss at pp65536 (−1.5 %) and pp98304 (−1.2 %) on gfx1100, so `f32split_mode = 0` for RDNA3_0
+is final (no depth rule).  Next: the gfx1201 system merges this branch back into `wip-mmb-general`.
+
 ---
 
 ## 0. TL;DR
@@ -141,8 +157,8 @@ recorded as the condition for enabling it.  Overlay now `git am` **3/3**, applie
 | GPU memory | **24 GB** — this is the hard constraint (no model sharding, no tensor parallel, no all-reduce) |
 | ROCm | `/opt/rocm-7.14-gfx1100` (`hipconfig` 7.14.60850); the build script's `ROCM_714` |
 | Delivery base | `~/llama.cpp` branch `rdna-boosts`, HEAD `c8dda33dd`, applied tree `8a80535e…` = the 16-block **r12** delivery |
-| WIP base | the same r12 tree; the 6 WIP patches apply **6/6 clean** (verified this session) |
-| **Code branch** | **`mmb-gfx1100`** in the worktree **`~/llama-wip-gfx1100`**, cut from `c8dda33dd`, the 6 WIP patches applied → **tree `580db5174574f10cc92fb1cefa72281a65c77b12`** (matches the documented WIP tree exactly) |
+| WIP base | the same r12 tree; the **10** WIP patches (post-S14 `wip-mmb-general`) apply **10/10 clean** |
+| **Code branch** | **`mmb-gfx1100`** in the worktree **`~/llama-wip-gfx1100`**, cut from `c8dda33dd`, the **10 canonical + 3 gfx1100 overlay** patches applied → **tree `cd306e6b6093b63468289edac24fbea3d270dbe2`** (post-rebase, 2026-09-21; the pre-rebase 6+3 tree was `580db5174574f10cc92fb1cefa72281a65c77b12`) |
 | **Record branch** | **`wip-mmb-general-gfx1100`** in this repo (`llama-cpp-rdna-boosts`), cut from `wip-mmb-general` at `1f2c92d` |
 | Baseline build | the delivery binary already exists at `~/llama.cpp/build-rocm/bin/` (built 2026-09-20); for a clean A/B keep it or copy its `bin/` aside (rpath `$ORIGIN`) |
 | Build | `cd ~/llama-wip-gfx1100 && ~/bin/build-llama-rocm-714` (note: the script `rm -rf build-rocm`, so the WIP build and the delivery build must live in **different worktrees** — one per directory) |
@@ -161,7 +177,11 @@ recorded as the condition for enabling it.  Overlay now `git am` **3/3**, applie
 (`AGENTS.md` WIP rule).  This plan, the worktree and the local branches are WIP only.  Promotion is
 maintainer-gated (`HANDOVER.md` §E).
 
-### WIP patch layout (6 patches, tree `580db5174…`)
+### WIP patch layout (10 canonical + 3 gfx1100 overlay, tree `cd306e6b6…`)
+
+> **Post-rebase (2026-09-21, §14).**  The six rows below are the original gfx1151/gfx1201 canonical
+> set; `wip-mmb-general` has since grown to **10** patches (S10-S14 added `0007`-`0010`, all in
+> `mmb.cu`).  The gfx1100 overlay is now **`0011`/`0012`/`0013`**.  See §14.
 
 | # | patch | theme | gate | always-on? |
 |---|---|---|---|---|
@@ -171,6 +191,10 @@ maintainer-gated (`HANDOVER.md` §E).
 | 4 | `0004-WIP-HC16-…` | HC16 native-BF16 producers + non-temporal accesses | `GGML_CUDA_MMB_HC16=1` (producers) / none (NT) | mixed |
 | 5 | `0005-WIP-indexer-…` | the fused indexer top-k op (`TOPK_QSA` oracle) | none (op-driven) | **yes** (qwen4exp) |
 | 6 | `0006-WIP-mmb-RDNA4-…` | the `mmb` gfx12 fragment port **+ the arch-scoped weight-type/path policy** | `GGML_CUDA_MMB=1` + scope policy | no |
+| 7-10 | `0007`-`0010` | RDNA4 S10-S13: dense tile geometry, `mmb_arch_defaults(cc)`, the per-arch `routed` policy, the split F32 policies | see `gfx1201-porting.md` | no (RDNA4) |
+| 11 | `0011-WIP-qsa3-…` | **gfx1100 overlay**: `RDNA3_0` in the qsa3 predicate | `LLAMA_QSA3_ENABLE` + arch gate | **yes** (qwen4exp) |
+| 12 | `0012-WIP-mmb-…` | **gfx1100 overlay**: `RDNA3_0` arm in `mmb_arch_defaults` → `f32split_mode = 0` | policy (`GGML_CUDA_MMB` + `_RDNA3`) | no |
+| 13 | `0013-WIP-mmvq-…` | **gfx1100 overlay**: per-M `nwarps` scaffold, **default off** | `GGML_CUDA_MMVQ_RDNA3_SMALL_M` (0) | no |
 
 ---
 
@@ -325,16 +349,21 @@ Notes:
 
 ### 3.2 Apply / reset the WIP
 
-The 6-patch set applies `git am` **6/6** onto a fresh r12 tree and yields applied tree
-**`580db5174574f10cc92fb1cefa72281a65c77b12`** (verified this session).  To re-create the worktree:
+**Post-rebase (2026-09-21, §14): the canonical set is 10 patches and the overlay is
+`0011`/`0012`/`0013`.**  The full **13/13** set applies `git am` onto a fresh r12 tree and yields
+applied tree **`cd306e6b6093b63468289edac24fbea3d270dbe2`** (verified in a fresh `/tmp` worktree).  To
+re-create the worktree:
 
 ```sh
 cd ~/llama.cpp
 git worktree add ~/llama-wip-gfx1100 -b mmb-gfx1100 rdna-boosts        # rdna-boosts is the r12 tree
 cd ~/llama-wip-gfx1100
-git am /home/stew675/llama-cpp-rdna-boosts/wip/mmb-general/patches/*.patch   # 6/6
-git rev-parse HEAD^{tree}    # -> 580db5174574f10cc92fb1cefa72281a65c77b12
+git am /home/stew675/llama-cpp-rdna-boosts/wip/mmb-general/patches/*.patch          # 10/10
+git am /home/stew675/llama-cpp-rdna-boosts/wip/mmb-general/gfx1100/patches/*.patch  # 3/3
+git rev-parse HEAD^{tree}    # -> cd306e6b6093b63468289edac24fbea3d270dbe2
 ```
+
+(Pre-rebase, the 6-patch set yielded `580db5174574f10cc92fb1cefa72281a65c77b12`.)
 
 ### 3.3 Run
 
@@ -667,6 +696,7 @@ claim* is deferred.
 - [x] G1 `nwarps` MoE candidate — **landed as patch `0009` (DEFAULT-OFF)**: the mechanism exists, but every gaining threshold breaks W=1..8 width purity on the MoE models (35B FAIL 0.150 at >=2048; gemma-26B FAIL 3.35 at >=4096) and the pure threshold (<=1024) gives no gain.  Not enabled until the width-invariant mapping is re-derived (S9; `gfx1100-s9-nwarps-results.md`)
 - [ ] B1-B9 consolidated on the frozen tree, including MTP (S10)
 - [ ] patch set regenerated + `git am` N/N + merged back to `wip-mmb-general` (S10)
+- [x] **Rebased onto the 10-patch `wip-mmb-general` (2026-09-21, §14)**: record branch rebased clean; overlay re-cut as `0011`/`0012`/`0013`; **13/13 `git am`**, applied tree `cd306e6b6093b63468289edac24fbea3d270dbe2`; §14.5 gates green; **§14.5.6 closed** (F32 split still a loss at pp65536/98304 → `f32split_mode = 0` final).  See `gfx1100-s10-rebase-results.md`.  MTP smoke done (WIP-off byte-identical to the delivery).
 
 ---
 
@@ -843,12 +873,17 @@ numbers must be re-confirmed on the rebased tree, not assumed:
   `2c89ce7219a993fa9c43c767f99b1e384db59656` (pre-rebase).  After the rebase the canonical tree is the
   new 10-patch tree and the overlay is renumbered (`0011`+).
 
-### 14.7 Definition of done for the rebase session
+### 14.7 Definition of done for the rebase session — **DONE 2026-09-21**
 
-- [ ] `wip-mmb-general` fast-forwarded locally; `wip-mmb-general-gfx1100` rebased onto it (GROUPS.md
-      resolved); branch pushed.
-- [ ] `0007` + `0009` re-applied clean; `0008` rewritten as the `RDNA3_0` arm in `mmb_arch_defaults`
-      and re-exported as `0011`/`0012`/`0013` in `wip/mmb-general/gfx1100/patches/`.
-- [ ] Overlay `git am` N/N on the new canonical tree; applied tree recorded in `gfx1100/README.md`.
-- [ ] §14.5 gates run; the F32-depth question (14.5.6) either closed or explicitly left open.
-- [ ] This is the branch the gfx1201 system then merges into `wip-mmb-general`.
+- [x] `wip-mmb-general` fast-forwarded locally; `wip-mmb-general-gfx1100` rebased onto it (**clean — no
+      `GROUPS.md` conflict**); branch pushed.
+- [x] `0007` (→`0011`) + `0009` (→`0013`) re-applied clean; `0008` (→`0012`) rewritten as the
+      `RDNA3_0` arm in `mmb_arch_defaults` and re-exported as `0011`/`0012`/`0013` in
+      `wip/mmb-general/gfx1100/patches/`.
+- [x] Overlay **13/13 `git am`** on the new canonical tree; applied tree
+      `cd306e6b6093b63468289edac24fbea3d270dbe2` recorded in `gfx1100/README.md`.
+- [x] §14.5 gates run; the F32-depth question (14.5.6) **closed** — the split is still a loss at
+      pp65536 (−1.5 %) / pp98304 (−1.2 %).
+- [x] This is the branch the gfx1201 system then merges into `wip-mmb-general`.
+
+Raw data: **`gfx1100-s10-rebase-results.md`**.

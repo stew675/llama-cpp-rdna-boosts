@@ -1,0 +1,47 @@
+From 69c8ff81443c181927dc1ca3a9c9ab13c126a04a Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Mon, 21 Sep 2026 13:07:36 -0500
+Subject: [PATCH 12/13] WIP mmb: default the F32 split OFF on RDNA3_0 (gfx1100)
+
+Measured on a single RX 7900 XTX (2026-09-21): with the gfx1151 default
+(F32 split on) MMB regressed the MoE models because the F32 router is a
+loss there -- gemma-26B-A4B (an all-F32-router MoE; its quantized weights
+are Q4_0, not an MMB type) pp8192 3302 -> 3196 (-3.2 %), and 35B-A3B
+pp8192 3879 -> 3762 (-3.0 %) on top of its other MMB wins.
+
+The gfx1201 S11/S13 rework moved every mmb_* tunable into
+mmb_arch_defaults(cc) (env || per-arch default), so this is now one arm
+of that function rather than an edit to mmb_f32split_mode(): RDNA3_5
+keeps the struct default 1 and RDNA4 keeps S13's 1; only RDNA3_0 becomes
+0.  GGML_CUDA_MMB_F32SPLIT still overrides (>= 0 wins).  Verify with
+GGML_CUDA_MMB=1 GGML_CUDA_MMB_RDNA3=1 GGML_CUDA_MMB_CFG=1 -> f32split=0.
+
+With this default, MMB on gfx1100 is: 27B Q4_K_M dense +14.4 %,
+gemma-12B Q8_0 dense +11 %, 35B-A3B MoE +5.6 %/+4.8 % at pp8192/32768,
+gemma-26B-A4B neutral.  Decode is untouched (mmb_min_t = 512).
+---
+ ggml/src/ggml-cuda/mmb.cu | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 899a2416b..566f3ed03 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -1250,6 +1250,14 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
+         c.f32split_mode = 1;
+         c.tiny_m       = 1;
+     }
++    if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
++        // gfx1100 S6/S7: the F32 MoE-router split TILE is a loss here (gemma-26B-A4B -3.1 %,
++        // 35B-A3B -3.0 % at pp8192 and -2.4 % at pp32768), unlike RDNA4 where it wins at depth.
++        // Disable the split tile on RDNA3_0; the tiny-M kernel is qwen4exp-only on gfx1100 and
++        // keeps its default.  NOTE: gfx1100 was only measured to pp32768 -- re-check pp65536+
++        // before finalising (see gfx1100-porting.md 14.5).
++        c.f32split_mode = 0;
++    }
+     // TODO(S12): the routed/GLU thresholds, `tall_mode`, `tiny_m*`, `f32split_*` and `cache_max` are
+     // still the gfx1151 values on every arch.  Give RDNA4 its own once they are measured per arch.
+     return c;
+-- 
+2.55.0
+
