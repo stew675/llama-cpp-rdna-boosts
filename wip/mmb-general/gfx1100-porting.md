@@ -20,7 +20,24 @@ the gates off / arch-gated the WIP is **byte-identical to the delivery** on ever
 healthy (27B 38→70.6 t/s, acceptance 0.78; MoE 113→151 t/s, 0.66), and the oracles are green.  Two
 environment finds: the box exposes a **gfx1036 iGPU** that must be masked with
 `HIP_VISIBLE_DEVICES=0`, and the G5 oracle is named **`TOPK_QSA`**, not `INDEXER_TOPK`.  Raw data:
-**`gfx1100-s1-results.md`**.  Live work is now **S2** (§6.1/§6.2).
+**`gfx1100-s1-results.md`**.
+
+**S2-S4 log (2026-09-21): the arch-neutral groups are decided and `qsa3` is ported to gfx1100.**
+Raw data: **`gfx1100-s2s4-results.md`**.
+* **G5 indexer:** always-on/generic, `TOPK_QSA` 4/4; performance is trust-RDNA3_5 (no model fits).
+  The `GGML_OP_NAME` fill fix is already in patch 5 — no action.
+* **G4 non-temporal:** a clean NT-off build (plain loads in `moe-weighted-reduction.cu`,
+  `concat.cu`, `unary.cu`) interleaved at `r=5` shows it is **neutral on gfx1100** (all deltas
+  ≤ ±0.23 %, sign model/depth-dependent) — unlike gfx1201's consistent +0.3-0.4 %.  **No code
+  change** (the hints stay arch-neutral).
+* **G3a always-QSA:** cannot be measured here; **the dense shortcut stays ON** on gfx1100 (the arch
+  default).  Trust-RDNA3_5.  No code change.
+* **G2 `qsa3` PORTED to gfx1100:** the predicate gained `RDNA3_0`; `FLASH_ATTN_QSA` **26/26**, and a
+  `rocprofv3` trace confirms `qsa3_attn_kernel` + the pack/merge/rows kernels actually dispatch.
+  Packaged as **patch `0007`** (`wip/mmb-general/gfx1100/patches/`).  End-to-end qwen4exp perf is
+  trust-RDNA3_5.
+
+Next: **S5-S7 (G1 `mmb`)** — the headline re-tune/re-scope.  Live work is §6.5.
 
 ---
 
@@ -327,6 +344,8 @@ The cheap highlights:
   trust-RDNA3_5 (§9).
 * **Also fold in the delivery item** `HANDOVER.md` §D: `GGML_OP_INDEXER_FILL` is missing from
   `GGML_OP_NAME` (one line).
+* **Status (S2, 2026-09-21): DONE.**  `TOPK_QSA` 4/4 on gfx1100; the `GGML_OP_NAME` fix is already
+  present (patch 5); performance is trust-RDNA3_5.  No code change.
 
 ### 6.2 G4 — non-temporal hints (S2)
 
@@ -337,6 +356,10 @@ The cheap highlights:
 * **What to test here:** the MoE-side hints (`concat`, `moe-weighted-reduction`, gated-unary) on the
   26B-A4B / 35B-A3B models; `dsv4_hc` is qwen4exp-only (trust-RDNA3_5).  Interleave rounds — the
   effect is small; a single noisy run decides nothing.
+* **Status (S2, 2026-09-21): DONE — neutral on gfx1100.**  A clean NT-off build interleaved at `r=5`
+  gives all deltas ≤ ±0.23 % with a model/depth-dependent sign (35B-A3B prefers off by ~0.2 % at
+  pp32768; gemma-26B prefers on by ~0.2 % at pp16384; the 27B dense is a flat wash).  **No code
+  change** — the hints stay arch-neutral.  Full table: `gfx1100-s2s4-results.md`.
 
 ### 6.3 G3a — always-QSA flip (S3)
 
@@ -346,6 +369,9 @@ The cheap highlights:
   trust-RDNA3_5 assumption.  If a future session gains access to qwen4exp on a multi-GPU box, the
   decision moves into the `qsa_arch_gfx()` policy alongside gfx1151.
 * Do not conflate this with `qsa_dense_decode_until` / `qsa_dense_prefill_until`.
+* **Status (S3, 2026-09-21): DONE — no code change.**  The shortcut stays **ON** on gfx1100 (the
+  `qsa_arch_gfx() != 0x1151` default); the reverse decision is deferred to a box that can run
+  qwen4exp.  Trust-RDNA3_5.
 
 ### 6.4 G2 — `qsa3` on RDNA3_0 (S4)
 
@@ -365,6 +391,11 @@ The cheap highlights:
   code is identical); note it in the results file.
 * **The delivery's `qwen4exp.cpp` policy already assumes gfx1100 = "QSA prefill always / dense
   decode"** (the 2026-09-07 crossover tables); qsa3 only makes the already-chosen QSA path faster.
+* **Status (S4, 2026-09-21): DONE — PORTED.**  The predicate gained `RDNA3_0`; `FLASH_ATTN_QSA`
+  **26/26**, and a `rocprofv3` kernel trace confirms `qsa3_attn_kernel` + the pack/merge/rows kernels
+  actually dispatch on gfx1100.  Packaged as patch `0007`
+  (`wip/mmb-general/gfx1100/patches/0007-WIP-qsa3-RDNA3_0-gfx1100.patch`).  End-to-end qwen4exp
+  performance is trust-RDNA3_5 — see `gfx1100-s2s4-results.md`.
 
 ### 6.5 G1 — `mmb` on RDNA3_0 (S5–S7, the headline)
 
@@ -464,9 +495,9 @@ relevant gates, write a dated `gfx1100-sNN-results.md`, commit the record to the
 | session | goal | deliverables | exit gate |
 |---|---|---|---|
 | **S1** | build + baselines | WIP branch applied + built for gfx1100; delivery baseline built/preserved | build green; **B1-B3, B5-B8 recorded** (B4/B9 as far as they fit) |
-| **S2** | arch-neutral wins | G5 indexer + G4 non-temporal applied/A/B'd; `GGML_OP_NAME` fill fix | `TOPK_QSA` green; MoE NT per-kernel A/B; `FLASH_ATTN_EXT` green |
-| **S3** | G3a policy | gfx1100 always-QSA decision documented (trust-RDNA3_5) | policy note + rationale in §9 |
-| **S4** | G2 `qsa3` RDNA3_0 | predicate gains `RDNA3_0`; oracle re-run | `FLASH_ATTN_QSA` **26/26** on gfx1100 |
+| **S2** | arch-neutral wins ✅ | G5 indexer + G4 non-temporal applied/A/B'd; `GGML_OP_NAME` fill fix | `TOPK_QSA` 4/4; G4 **neutral** (no change); `FLASH_ATTN_EXT` 5955/0-FAIL |
+| **S3** | G3a policy ✅ | gfx1100 always-QSA decision documented (trust-RDNA3_5) | shortcut stays ON (arch default); no code change |
+| **S4** | G2 `qsa3` RDNA3_0 ✅ | predicate gains `RDNA3_0`; oracle re-run; kernel-trace confirmed | `FLASH_ATTN_QSA` **26/26** + `qsa3_attn_kernel` dispatched; patch `0007` |
 | **S5** | G1 open | `MMB_RDNA3=1`; MMB fires; correctness | PPL parity; same-seed greedy; width probe |
 | **S6** | G1 per-type/path matrix + dense re-tune | the gfx1100 type/path scope; tile/threshold sweep | neutral where it loses, wins where it lands; kernel-time-backed |
 | **S7** | G1 routed/GLU re-tune + block-13 A/B | routed/GLU tuning; MMB-routed vs block-13 fused MoE | measured, purity-checked, defaulted |
@@ -474,7 +505,7 @@ relevant gates, write a dated `gfx1100-sNN-results.md`, commit the record to the
 | **S9** | the delivery re-examination + full matrix | §2.3-§2.7 re-measured; B1-B9 re-run on the frozen tree | every gate green with numbers |
 | **S10** | freeze + regenerate + merge back | new WIP patch (likely patch 7 = gfx1100 scope/tuning); docs updated; `git am` N/N; merge record branch into `wip-mmb-general` | gfx1100 handed a clean state; branches reconciled |
 
-Sessions S3/S4 are partly independent and can be done early; S5-S7 are sequential.
+Sessions S1-S4 are done.  S5-S7 (G1 `mmb`) are the headline and the live work; S8-S10 follow.
 
 ---
 
@@ -528,10 +559,10 @@ claim* is deferred.
 - [x] gfx1100 record branch + code worktree created; WIP applies **6/6** (tree `580db5174574f10cc92fb1cefa72281a65c77b12`)
 - [x] WIP builds for gfx1100 (S1, 2026-09-21; 0 errors)
 - [x] **S1 baselines B1-B8 done** — WIP (gates off) byte-identical to the delivery on every gate; MTP healthy (27B 38->70.6 t/s acc 0.78; MoE 113->151 t/s acc 0.66); oracles green (`TOPK_QSA` 4/4, `FLASH_ATTN_QSA` 26/26, `GATED_DELTA_NET` 2/2, `FLASH_ATTN_EXT` 5955/0-FAIL); width purity PASS on all 4 models (`gfx1100-s1-results.md`)
-- [ ] G5 indexer — `TOPK_QSA` green (done); G5 perf is trust-RDNA3_5; `GGML_OP_NAME` fill fix (S2)
-- [ ] G4 non-temporal — per-kernel A/B on the MoE models (S2)
-- [ ] G3a always-QSA decision documented (S3, trust-RDNA3_5)
-- [ ] G2 `qsa3` predicate gains `RDNA3_0`; `FLASH_ATTN_QSA` **26/26** (S4)
+- [ ] G5 indexer — ✅ `TOPK_QSA` 4/4; perf trust-RDNA3_5; `GGML_OP_NAME` already fixed (S2)
+- [ ] G4 non-temporal — ✅ A/B'd: **neutral on gfx1100**, no code change (S2)
+- [ ] G3a always-QSA decision documented — ✅ shortcut stays ON (S3, trust-RDNA3_5)
+- [ ] G2 `qsa3` predicate gains `RDNA3_0` — ✅ **26/26** + kernel trace; patch `0007` (S4)
 - [ ] G1 `mmb` opened (`MMB_RDNA3=1`), fires, PPL parity (S5)
 - [ ] G1 gfx1100 per-type/per-path scope + tile/threshold re-tune (S6)
 - [ ] G1 routed/GLU vs block-13 fused MoE, kernel-time-backed (S7)
