@@ -363,6 +363,54 @@ cannot touch device code); and the 27B UD-IQ3_S interleaved r=5 win is preserved
 
 ---
 
+## UPDATE — session 32 (2026-09-21): **the routed MoE path is a loss on RDNA4 — it was masking half the qwen4exp win**
+
+S12 of `gfx1201-porting.md`.  Record: **`gfx1201-s12-routed-policy.md`**.  This turned out not to be a
+threshold sweep but a policy re-decision.
+
+Session 30 left the S7 routed claim disproved (the unmodified S7 binary measures −1.4 % where S7
+recorded +6.7 %).  S12 needed a mechanism to act on that — `mmb_wtype_ok()` gated the routed, dense and
+HC paths together — so it added the counterpart of `mmb_dense_flag()`: a per-arch **`routed`** field in
+`mmb_arch_cfg` plus `mmb_routed_flag()` (`GGML_CUDA_MMB_ROUTED=0|1`), gating `supported_mmid`,
+`supported_glu` and `routed_will_take`.  Because the graph's fusion stand-down uses the same
+predicate, a disabled routed path keeps the delivery's fused kernel and costs nothing.
+
+**RDNA4 now defaults to `routed = 0`, and the routed path loses on every model measured** (interleaved
+back-to-back, two rounds, `pp8192 / pp32768`):
+
+| model | routed ON | routed OFF |
+|---|---|---|
+| `35B-A3B UD-Q3_K_M` (qwen35moe, 1 GPU) | −1.44 / −1.39 % | **−0.05 / −0.09 %** |
+| `Flash-Next IQ4_XS` (qwen4exp, 3-GPU tensor) | +2.3 / +1.8 % | **+6.6 / +5.4 %** |
+
+The cause is session 30's 1-GPU kernel breakdown: the delivery's block-13 `mul_mat_q_routed_compact` +
+`mul_mat_q` cost 0.880 s against mmb's routed kernels at 0.875 s (**a tie**), and standing the fused
+kernel down adds 0.065 s of `mm_ids_helper`.  The routed path replaces a *fused* expert kernel with a
+comparable one but loses the fusion.
+
+**Landed default vs the delivery** (interleaved r=3):
+
+| workload | result |
+|---|---|
+| **qwen4exp** (Flash-Next IQ4_XS, 3-GPU tensor) | **+4.9 % pp8192 / +5.2 % pp32768** (was +2.3 / +1.8) |
+| IQ3_S-heavy dense (27B UD-IQ3_S) | +0.5 % (S10's dense tile, unchanged) |
+| IQ-heavy MoE (35B UD-Q3_K_M) | **neutral** (was −1.4 %) |
+| Q8_0 / Q4_K_M / non-IQ dense | neutral (type-excluded) |
+| same-seed greedy text | **byte-identical to the delivery on every model tested** (`461ca8cd0e88`, `d73f9238f6d6`), routed on or off |
+
+So `routed = 0` turns MMB-on-RDNA4 from "a win on qwen4exp and a small loss on MoE" into "a win
+everywhere it does anything, nothing where it does not".  Landed as **patch 9** (`git am` 9/9, applied
+tree `4a78af6349`); gfx1151 is untouched (the arch default leaves `routed = 1` there, and the device
+kernel set is byte-unchanged).
+
+**Consequence for the plan:** with the routed path off on RDNA4, the routed/GLU **threshold sweep is
+moot** (`glu_thresh` / `routed_thresh` / `iq3xxs_glu` / `glu` are inert there).  The per-arch fields
+still worth measuring — `tall_mode`, `tiny_m`/`tiny_tt`, `f32split_*`, `cache_max` — belong to the
+HC/F32 paths that now carry the win.  **Next: S13** (HC16 producers) and **S14** (the B1-B9 matrix,
+**including MTP, which has still never run on gfx1201**).
+
+---
+
 ## UPDATE — session 25 (2026-09-20): the indexer gather's **warp-shuffle scan** (−11.7 % on the gather),
 ## and the block-level gather/emit closed as unbuildable
 

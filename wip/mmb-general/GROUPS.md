@@ -38,16 +38,18 @@ git am <this-repo>/wip/mmb-general/patches/*.patch   # 6/6, tree 580db5174...
 | 6 | `0006-WIP-mmb-RDNA4-…` | the `mmb` RDNA4 (gfx12) fragment port **+ the arch-scoped weight-type/path split** | `GGML_CUDA_MMB=1` + the scope policy (`MMB_TYPES` / `MMB_DENSE`) | no |
 | 7 | `0007-WIP-mmb-RDNA4-…` | **the RDNA4 dense tile geometry (256x128) + the per-type dense policy** | `GGML_CUDA_MMB=1` (IQ3_S dense is now in the RDNA4 default); `MMB_DENSE_TYPES=<csv>` / `MMB_DENSE=0\|1` | no |
 | 8 | `0008-WIP-mmb-per-arch-…` | **per-arch tuning defaults** (`mmb_arch_cfg` / `mmb_arch_defaults(cc)`) + the dense geometry in the table + the `GGML_CUDA_MMB_CFG=1` dump | none (host-side policy); the existing `GGML_CUDA_MMB_*` vars remain the overrides | no |
+| 9 | `0009-WIP-mmb-the-routed-…` | **the routed MoE path is a loss on RDNA4** — per-arch `routed` policy, **default off** | `GGML_CUDA_MMB_ROUTED=1` re-enables it | no |
 
-> **Patches 6-8 and the theme split.**  S5-S7 (2026-09-21) landed as its own patch rather than
+> **Patches 6-9 and the theme split.**  S5-S7 (2026-09-21) landed as its own patch rather than
 > folded: patches 1, **3 and 4** all touch `mmb.cu`, so there is no single theme to fold it into
 > without a full re-cut.  Patch 6 is the authoritative source for the RDNA4 scope policy
 > (`mmb_wtype_ok` / `mmb_dense_flag`); **patch 7 (S10) adds the per-arch dense geometry and the
 > per-TYPE dense policy** (`mmb_dense_tmask` / `mmb_dense_type_ok`) — see
 > `gfx1201-s10-dense-geometry.md`; **patch 8 (S11) puts every tunable behind one per-arch table**
-> (`mmb_arch_cfg`, `GGML_CUDA_MMB_CFG=1` dump) — see `gfx1201-s11-arch-defaults.md`.  The same rule
-> forced the same choice for 7 and 8 (`mmb.cu` again), so the set is now **8 patches, tree
-> `e5dc99b4d5…`** and 6/7/8 are a chain on that one file.
+> (`mmb_arch_cfg`, `GGML_CUDA_MMB_CFG=1` dump) — see `gfx1201-s11-arch-defaults.md`; **patch 9 (S12)
+> turns the routed path off on RDNA4** — see `gfx1201-s12-routed-policy.md`.  The same rule forced
+> the same choice each time (`mmb.cu` again), so the set is now **9 patches, tree `4a78af6349…`** and
+> 6-9 are a chain on that one file.
 
 ### 1 — `mmb`: the general-purpose bf16-WMMA dequant weight GEMM
 
@@ -166,16 +168,24 @@ Full data: `gfx1201-s1s2-results.md`; plan: `gfx1201-porting.md`.
 | **G4 non-temporal** | **small consistent win** at depth (+0.3–0.4 % at 32k/64k/98k) | keep, always-on |
 | **G3a always-QSA flip** | **regression** (pp2048 −18.9 %, pp8192 −6.7 %) | **gated off on RDNA4** (default shortcut ON except gfx1151) |
 | **G2 qsa3** | **win**: +7.6 / +11.5 / +10.4 % prefill at pp4096/16384/32768 (qsa3 vs VEC, same build) | **ported 2026-09-21** (`gfx1201-s4-qsa3-results.md`); folded into patch 2 |
-| **G1 mmb** | **ported 2026-09-21, scoped**: qwen4exp HC **+3.2 / +2.2 %**; IQ3_S-heavy dense **+0.5 %** (S10); the routed MoE is **break-even**, *not* the +6.7 % S7 recorded — see the correction below; neutral elsewhere (scoped default) | enabling it unscoped is a −4…−13 % regression on dense/K-quant models.  **The routed MoE default needs a re-decision (S12)** — `gfx1201-s10-dense-geometry.md` §6 |
+| **G1 mmb** | **ported 2026-09-21, scoped — the RDNA4 default is now a win everywhere it does anything**: qwen4exp **+4.9 / +5.2 %** (S12), IQ3_S-heavy dense **+0.5 %** (S10), IQ-heavy MoE **neutral** (S12) | enabling it unscoped is a −4…−13 % regression on dense/K-quant models; the routed path is **off** on RDNA4 (it was a −1.4 % MoE loss and masked half the qwen4exp win) — `gfx1201-s12-routed-policy.md` |
 
-### The S7 → S10 correction (routed MoE)
+### The S7 → S12 correction (the routed path)
 
-S7 recorded **+6.7 %** for `35B-A3B UD-Q3_K_M`.  S10 re-measured the **unmodified S7 binary** and got
-**−1.4 %**, reproducing identically with the S10 build (the model has no IQ3_S, so S10 cannot affect
-it).  The kernel breakdown: the routed MMB (0.875 s) only **matches** the delivery's
-`mul_mat_q_routed_compact` + `mul_mat_q<IQ3_XXS,64>` (0.880 s), and the stand-down costs an extra
-`mm_ids_helper` launch (+0.065 s).  **Do not rely on the S7 routed number.**  Evidence:
-`gfx1201-s10-dense-geometry.md` §6.
+S7 recorded **+6.7 %** for the routed MoE on `35B-A3B UD-Q3_K_M`.  S10 re-measured the **unmodified S7
+binary** and got **−1.4 %** (the model has no IQ3_S, so S10 could not affect it); S12 then measured the
+routed path on/off on two models and found it is a loss on both:
+
+| model | routed ON | routed OFF |
+|---|---|---|
+| `35B-A3B UD-Q3_K_M` (qwen35moe) | −1.44 / −1.39 % | **−0.05 / −0.09 %** |
+| `Flash-Next IQ4_XS` (qwen4exp, 3-GPU tensor) | +2.3 / +1.8 % | **+6.6 / +5.4 %** |
+
+The cause is in the S10 1-GPU kernel breakdown: the delivery's block-13 `mul_mat_q_routed_compact` +
+`mul_mat_q` cost 0.880 s against mmb's routed kernels at 0.875 s, and standing the fused kernel down
+adds 0.065 s of `mm_ids_helper`.  **Do not rely on the S7 routed number, and do not re-enable the
+routed path on RDNA4 without a fresh measurement.**  Evidence: `gfx1201-s10-dense-geometry.md` §6 and
+`gfx1201-s12-routed-policy.md`.
 
 Net gfx1201 prefill vs the delivery (Flash-Next IQ4_XS, q8_0 KV, 3-GPU tensor, `-b/-ub 2048`):
 **+3.2 % / +5.0 % / +6.6 %** at pp32768/65536/98304, no regression at any depth, same-seed greedy

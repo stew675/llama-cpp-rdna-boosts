@@ -6,10 +6,10 @@ supersedes the "gfx1201 is a no-op / new work, not a port" notes in `GROUPS.md` 
 before the delivery's gfx1201 MMQ path was re-tuned).
 
 > **HANDING THIS FILE TO A NEW SESSION?  Read §13 first** — it is the brief for the remaining
-gfx1201 work (S12-S15): the routed GLU tuning, the F32/HC16 paths, and the B1-B9 gate matrix
-(*including MTP, which has never run on this box*).  **S1-S11 are done** and are history; §13 is the
-live work.  Note the S10 by-product: the **S7 MoE win does not reproduce** (§12 risk 7) — re-decide
-the routed default in S12, which is now the top item.
+gfx1201 work (S13-S15): the F32/HC16 paths and the B1-B9 gate matrix (*including MTP, which has never
+run on this box*).  **S1-S12 are done** and are history; §13 is the live work.  The S10/S12
+by-products are both decided in code now: the **S7 MoE win does not reproduce** (§12 risk 7) and the
+routed path is **disabled on RDNA4** with the qwen4exp win nearly doubled as a result.
 
 **Session 1-2 log (2026-09-21):** the WIP was applied to `~/llama.cpp` as branch `rdna-boosts-mmb-port`
 (`git am` **5/5**, clean) and **built green for gfx1201** with the delivery build script (`EXIT=0`,
@@ -447,7 +447,7 @@ checklist updated.
 | **S9** | handover to gfx1100 | update §10/§11; commit record | gfx1100 TODO list complete |
 | **S10** | **gfx1201 dense tile geometry** | **DONE** — 256x128 tile + a per-type dense policy (IQ3_S) | met: the dense tile beats MMQ for IQ3_S (-4.5 %, kernel-time + interleaved A/B, +0.5 % model) |
 | **S11** | arch-scoped tuning constants | **DONE** — `mmb_arch_cfg`/`mmb_arch_defaults(cc)` + a config dump; gfx1151 byte-unchanged, RDNA4 preserved | met |
-| **S12** | routed/GLU tuning + kernel time | threshold sweeps; `DBUF`; the IQ3_XXS GLU arm | the routed win ≥ S7 with kernel-time evidence |
+| **S12** | routed/GLU tuning + kernel time | **DONE** — the routed path is a loss on every model; per-arch `routed` policy, RDNA4 default **off**; qwen4exp +4.9/+5.2 % | met (better than planned: a policy reversal, not a sweep) |
 | **S13** | G3b/c F32/tiny-M + G4 HC16 | isolate and A/B each knob | measured, purity-checked, defaulted |
 | **S14** | B1-B9 on the final tree | re-run B1-B7; B8 long-context PPL; **B9 MTP** | every gate green with numbers recorded |
 | **S15** | freeze + regenerate + hand off | land the policy, update the docs, `git am` N/N | gfx1100 handed a clean state |
@@ -519,16 +519,19 @@ qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a g
       `mmb_arch_defaults(cc)`, every tunable now `env || arch default`, the dense geometry moved into
       the table, `GGML_CUDA_MMB_CFG=1` dumps the resolved config; gfx1151 kernel set byte-unchanged;
       `gfx1201-s11-arch-defaults.md`
-- [ ] routed/GLU tuning + kernel-time evidence (S12) — **and the routed MoE default re-decision,
-      see §12 risk 7: the S7 +6.7 % MoE win does not reproduce (now -1.4 % on the same binary)**, plus
-      the `TODO(S12)` fields in `mmb_arch_defaults()`
+- [x] routed/GLU tuning + kernel-time evidence (S12) — **DONE 2026-09-21**: the routed MoE path is a
+      **loss on every model measured** (it was masking half the qwen4exp win), so RDNA4 now defaults
+      to `routed = 0`.  Landed default: qwen4exp **+4.9 / +5.2 %** (was +2.3/+1.8), IQ-MoE **neutral**
+      (was -1.4 %), IQ3_S dense +0.5 %, text byte-identical everywhere;
+      `gfx1201-s12-routed-policy.md`.  The threshold sweep is now moot on RDNA4.
 - [ ] B1-B9 on the final tree, incl. **MTP** — never run on gfx1201 (S14)
 
-**§13 is the brief for the remaining work (S12-S15).**  Start there.
+**§13 is the brief for the remaining work (S13-S15).**  Start there.
 
-**Patch layout (current): 8 patches, tree `e5dc99b4d5…`** — 1 mmb, 2 qsa3, 3 F32/tiny-M +
+**Patch layout (current): 9 patches, tree `4a78af6349…`** — 1 mmb, 2 qsa3, 3 F32/tiny-M +
 width-probe, 4 HC16, 5 indexer, 6 the `mmb` RDNA4 port + scope split, 7 the S10 dense geometry +
-per-type dense policy, 8 the S11 per-arch tuning table.  Patches 6-8 form a chain on `mmb.cu`.
+per-type dense policy, 8 the S11 per-arch tuning table, 9 the S12 routed policy.  Patches 6-9 form a
+chain on `mmb.cu`.
 
 ---
 
@@ -598,6 +601,7 @@ in parallel).
 | S7 | `mmb` **scoped** (arch-scoped weight types + dense/path policy) | `gfx1201-s5s7-mmb-results.md` §4/§6 |
 | S10 | **the RDNA4 dense tile geometry (256x128) + a per-type dense policy** — IQ3_S beats MMQ by 4.5 %, +0.5 % prefill on 27B UD-IQ3_S; and the **S7 MoE win does not reproduce** | `gfx1201-s10-dense-geometry.md` |
 | S11 | **per-arch tuning defaults** — `mmb_arch_cfg` + `mmb_arch_defaults(cc)`, the dense geometry in the table, `GGML_CUDA_MMB_CFG=1` dump; gfx1151 kernel set byte-unchanged | `gfx1201-s11-arch-defaults.md` |
+| S12 | **the routed MoE path is a loss on RDNA4** — per-arch `routed` policy, **default off**; qwen4exp +4.9/+5.2 % (was +2.3/+1.8), IQ-MoE neutral (was −1.4 %) | `gfx1201-s12-routed-policy.md` |
 
 **Protocol — apply to every measurement below.**
 
@@ -721,10 +725,24 @@ qwen4exp policy.
 **Exit gate:** gfx1151 numbers **unchanged** (re-run one gfx1151-known workload if possible, otherwise
 argue from the cc switch being a no-op there), and the RDNA4 defaults documented in one place.
 
-### S12 — routed / GLU path: tuning and kernel-time evidence
+### S12 — routed / GLU path: tuning and kernel-time evidence  — **DONE 2026-09-21**
 
-**Why:** the routed MoE path is the RDNA4 `mmb` win (+6.7 % on `UD-Q3_K_M`), but its tiling was never
-tuned here and the S7 comparison is end-to-end only (§12.6).
+**Result:** `wip/mmb-general/gfx1201-s12-routed-policy.md`.  This turned out not to be a threshold
+sweep but a **policy re-decision**: the routed `MUL_MAT_ID` path loses on **every** model measured.
+Added the counterpart of `mmb_dense_flag()` — a per-arch `routed` field in `mmb_arch_cfg` +
+`mmb_routed_flag()` (`GGML_CUDA_MMB_ROUTED=0|1`) gating `supported_mmid`/`supported_glu`/
+`routed_will_take` — and set **`routed = 0` on RDNA4**.  End-to-end interleaved (pp8192 / pp32768):
+`35B UD-Q3_K_M` −1.44/−1.39 % -> **−0.05/−0.09 %**; `Flash-Next IQ4_XS` +2.3/+1.8 % ->
+**+6.6/+5.4 %** — the routed path was *masking* most of the qwen4exp HC win.  Cause (S10 §6's 1-GPU
+kernel breakdown): the delivery's block-13 `mul_mat_q_routed_compact` + `mul_mat_q` cost 0.880 s vs
+mmb's 0.875 s, and the stand-down adds 0.065 s of `mm_ids_helper`.  Same-seed text is byte-identical
+to the delivery with routed on or off.  Landed as **patch 9** (`git am` 9/9).  **The threshold sweep
+is now moot on RDNA4** (it tunes a disabled path); the remaining per-arch fields that *are* worth
+measuring (`tall_mode`, `tiny_m*`, `f32split_*`, `cache_max`) belong to the paths that now carry the
+win.
+
+**Why (original brief):** the routed MoE path is the RDNA4 `mmb` win (+6.7 % on `UD-Q3_K_M`), but its
+tiling was never tuned here and the S7 comparison is end-to-end only (§12.6).
 
 **Do this:**
 1. Sweep `GGML_CUDA_MMB_ROUTED_THRESH` and `GGML_CUDA_MMB_GLU_THRESH` (both default 32) on

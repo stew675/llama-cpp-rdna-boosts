@@ -1,5 +1,33 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-21 (WIP, not a delivery change) — gfx1201 port, session 32: the routed MoE path is a loss on RDNA4
+
+`s12` of `wip/mmb-general/gfx1201-porting.md`.  **Experimental WIP, not part of the delivered patch
+set**; record in `wip/mmb-general/gfx1201-s12-routed-policy.md`.
+
+Session 30 disproved S7's routed claim (the unmodified S7 binary measures -1.4 % where S7 recorded
++6.7 %).  S12 acted on it: a per-arch `routed` field in `mmb_arch_cfg` + `mmb_routed_flag()`
+(`GGML_CUDA_MMB_ROUTED=0|1`), gating `supported_mmid`/`supported_glu`/`routed_will_take`, with
+**`routed = 0` as the RDNA4 default**.  The routed path loses on every model measured (interleaved,
+two rounds, pp8192 / pp32768):
+
+| model | routed ON | routed OFF |
+|---|---|---|
+| 35B-A3B UD-Q3_K_M (qwen35moe) | -1.44 / -1.39 % | **-0.05 / -0.09 %** |
+| Flash-Next IQ4_XS (qwen4exp, 3-GPU tensor) | +2.3 / +1.8 % | **+6.6 / +5.4 %** |
+
+Cause (session 30's 1-GPU kernel breakdown): the delivery's block-13 `mul_mat_q_routed_compact` +
+`mul_mat_q` cost 0.880 s vs mmb's routed kernels at 0.875 s -- a tie -- and the stand-down adds
+0.065 s of `mm_ids_helper`.  Landed default vs the delivery: qwen4exp **+4.9 / +5.2 %** (was +2.3 /
++1.8), IQ-heavy MoE **neutral** (was -1.4), IQ3_S dense +0.5 %, Q8_0/Q4_K_M neutral, same-seed text
+**byte-identical to the delivery everywhere**.  Landed as **patch 9** (`git am` 9/9, applied tree
+`4a78af6349df3fd92e747d223ea3b4b32817f592`); gfx1151 untouched (arch default keeps `routed = 1`,
+kernel set byte-unchanged).
+
+The second correction this work has produced to the S7 record (the first being session 30's -- the
+S7 routed +6.7 % does not reproduce).  With the routed path off, the routed/GLU threshold sweep is
+moot on RDNA4.
+
 ## 2026-09-21 (WIP, not a delivery change) — gfx1201 port, session 31: per-arch `mmb` tuning defaults
 
 `s11` of `wip/mmb-general/gfx1201-porting.md`.  **Experimental WIP, not part of the delivered patch

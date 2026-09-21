@@ -1995,10 +1995,10 @@ index 1b9e63516..390fc7a47 100644
  
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
 new file mode 100644
-index 000000000..b240e676c
+index 000000000..8083bce57
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -0,0 +1,2013 @@
+@@ -0,0 +1,2033 @@
 +#include "mmb.cuh"
 +#include "unary.cuh"
 +#include <unordered_map>
@@ -3218,6 +3218,7 @@ index 000000000..b240e676c
 +    int  hc16           = 0, down16 = 0, gatemix = 0, blk16 = 0, res16 = 0;
 +    int  glu            = 1;     // fused routed gate+up+GLU
 +    int  bf16w          = 1;     // BF16 dense weights
++    int  routed         = 1;     // the routed MoE (MUL_MAT_ID) path + its fused GLU
 +    int  dense_geom     = MMB_GEOM_GFX11_SPLIT;  // see mmb_geom_id
 +};
 +
@@ -3229,6 +3230,17 @@ index 000000000..b240e676c
 +        // (WTM=64, WTN=64, TM=TN=4, the same 55296 B) makes the IQ3_S dense GEMM beat the delivery
 +        // MMQ by 4.5 %.  See wip/mmb-general/gfx1201-s10-dense-geometry.md.
 +        c.dense_geom = MMB_GEOM_R4_256x128;
++        // S12: the routed MoE path LOSES on RDNA4 on every model measured, because the delivery's
++        // block-13 `mul_mat_q_routed_compact` is already a good fused expert kernel and standing it
++        // down costs an extra `mm_ids_helper` launch.  Interleaved r=3, two rounds (pp8192 /
++        // pp32768), routed ON -> OFF:
++        //   35B-A3B UD-Q3_K_M (qwen35moe)   -1.44 / -1.39 %  ->  -0.05 / -0.09 %
++        //   Flash-Next IQ4_XS (qwen4exp)    +2.3  / +1.8  %  ->  +6.6  / +5.4  %
++        // i.e. the routed path was *masking* most of the qwen4exp HC win.  This reverses S7's
++        // routed decision -- S7's +6.7 % MoE number does not reproduce on the unmodified S7 binary
++        // (it now measures -1.4 %), see gfx1201-s10-dense-geometry.md §6.  The sub-knobs below
++        // (glu/iq3xxs_glu/routed_thresh) are therefore inert on RDNA4.
++        c.routed = 0;
 +    }
 +    // TODO(S12): the routed/GLU thresholds, `tall_mode`, `tiny_m*`, `f32split_*` and `cache_max` are
 +    // still the gfx1151 values on every arch.  Give RDNA4 its own once they are measured per arch.
@@ -3253,11 +3265,11 @@ index 000000000..b240e676c
 +    const mmb_arch_cfg & c = mmb_cfg();
 +    fprintf(stderr, "MMB_CFG cc=0x%x dense_geom=%d min_t=%d glu_thresh=%d routed_thresh=%d tall=%d "
 +                    "tiny_m=%d/%d f32split=%d(min_m=%d,min_k=%d) cache=%d shadow=%d/%dMB "
-+                    "hc16=%d down16=%d gatemix=%d blk16=%d res16=%d glu=%d bf16w=%d iq3xxs_glu=%d\n",
++                    "hc16=%d down16=%d gatemix=%d blk16=%d res16=%d glu=%d bf16w=%d iq3xxs_glu=%d routed=%d\n",
 +            cc, c.dense_geom, c.min_t, c.glu_thresh, c.routed_thresh, c.tall_mode,
 +            c.tiny_m, c.tiny_tt, c.f32split_mode, c.f32split_min_m, c.f32split_min_k, c.cache_max,
 +            c.shadow_mode, c.shadow_cap_mb, c.hc16, c.down16, c.gatemix, c.blk16, c.res16,
-+            c.glu, c.bf16w, c.iq3xxs_glu);
++            c.glu, c.bf16w, c.iq3xxs_glu, c.routed);
 +}
 +
 +static size_t mmb_cache_max() { static const int v = getenv("GGML_CUDA_MMB_CACHE") ? atoi(getenv("GGML_CUDA_MMB_CACHE")) : mmb_cfg().cache_max; return (size_t) v; }
@@ -3426,6 +3438,14 @@ index 000000000..b240e676c
 +// Tile-class threshold: experts with >= this many rows take the BN=128 tile, the rest the BN=32 one.
 +// The small tile re-dequantizes the same A panel once per jt tile (4x the weight dequant per output
 +// for a 128-row expert), so this is the knob that trades B-column padding against dequant volume.
++// The routed MoE path (MUL_MAT_ID + its fused gate+up+GLU), the counterpart of mmb_dense_flag().
++// OFF makes every routed op keep the delivery's `mul_mat_q_routed_compact` / `mul_mat_q` path and
++// costs nothing (the graph's fusion stand-down goes through this predicate).  Measured on RDNA4:
++// `35B-A3B UD-Q3_K_M` routed-ON -1.4 %, routed-OFF +-0.0 % (two interleaved rounds).
++bool mmb_routed_flag() {
++    static const int v = getenv("GGML_CUDA_MMB_ROUTED") ? atoi(getenv("GGML_CUDA_MMB_ROUTED")) : mmb_cfg().routed;
++    return v != 0;
++}
 +int mmb_glu_thresh() { static const int v = getenv("GGML_CUDA_MMB_GLU_THRESH") ? atoi(getenv("GGML_CUDA_MMB_GLU_THRESH")) : mmb_cfg().glu_thresh; return v; }
 +int mmb_routed_thresh() { static const int v = getenv("GGML_CUDA_MMB_ROUTED_THRESH") ? atoi(getenv("GGML_CUDA_MMB_ROUTED_THRESH")) : mmb_cfg().routed_thresh; return v; }
 +// IQ3_XXS: implemented and correct.  Its MMB *routed* path (individual gate/up MUL_MAT_ID) is a
@@ -3647,7 +3667,7 @@ index 000000000..b240e676c
 +}
 +
 +bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
-+    if (!mmb_enabled()) return false;
++    if (!mmb_enabled() || !mmb_routed_flag()) return false;
 +    const bool wtype = mmb_wtype_ok(src0->type);
 +    if (!wtype || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
 +    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
@@ -3803,7 +3823,7 @@ index 000000000..b240e676c
 +}
 +bool ggml_cuda_mmb_routed_will_take(const ggml_tensor * w) {
 +    if (!mmb_enabled() || !w) return false;
-+    return mmb_wtype_ok(w->type);
++    return mmb_routed_flag() && mmb_wtype_ok(w->type);
 +}
 +bool ggml_cuda_mmb_down16() { return mmb_down16_flag(); }
 +bool ggml_cuda_mmb_blk16() { static const int v = getenv("LLAMA_HC_BLK16") ? atoi(getenv("LLAMA_HC_BLK16")) : mmb_cfg().blk16; return v != 0; }
@@ -3896,7 +3916,7 @@ index 000000000..b240e676c
 +}
 +
 +bool ggml_cuda_mmb_supported_glu(const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
-+    if (!mmb_enabled() || !mmb_glu() || !gw || !uw || !src1 || !ids || !glu) return false;
++    if (!mmb_enabled() || !mmb_routed_flag() || !mmb_glu() || !gw || !uw || !src1 || !ids || !glu) return false;
 +        if (gw->type != uw->type) return false;
 +    const bool wtype = mmb_wtype_ok_glu(gw->type);
 +    if (!wtype) return false;
