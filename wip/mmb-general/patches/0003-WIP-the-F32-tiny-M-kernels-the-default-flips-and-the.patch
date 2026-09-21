@@ -1,4 +1,4 @@
-From 95d0427ed48a09c52708350b02ea4c6af1535d62 Mon Sep 17 00:00:00 2001
+From 1ea49d28a0abfd63bcec48ff7a3ce87d528fefcd Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sun, 20 Sep 2026 21:01:26 -0500
 Subject: [PATCH 3/5] WIP: the F32/tiny-M kernels, the default flips, and the
@@ -11,10 +11,10 @@ the hc *_inject GEMMs; its MMAX=4 specialisation + TT sweep; and the W=1..8
 logits width-purity probe (a tools/ harness, the last promotion gate).
 ---
  ggml/src/ggml-cuda/mmb.cu         | 147 +++++++++++++++++++++++-
- src/models/qwen4exp.cpp           |  32 ++++--
+ src/models/qwen4exp.cpp           |  43 +++++--
  tests/CMakeLists.txt              |   1 +
  tests/test-logits-width-probe.cpp | 185 ++++++++++++++++++++++++++++++
- 4 files changed, 351 insertions(+), 14 deletions(-)
+ 4 files changed, 362 insertions(+), 14 deletions(-)
  create mode 100644 tests/test-logits-width-probe.cpp
 
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
@@ -200,7 +200,7 @@ index 792ed5e0f..dd366ce15 100644
          static const bool two = getenv("LLAMA_MMB_F32SPLIT") && atoi(getenv("LLAMA_MMB_F32SPLIT")) >= 2;
          if (two) mmb_f32split_kernel<128, 128, 32, 64, true ><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index d61eac7ed..32dc271c0 100644
+index d61eac7ed..2e57cfc94 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -1798,9 +1798,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
@@ -231,7 +231,7 @@ index d61eac7ed..32dc271c0 100644
          // cause. Root-caused 2026-09-08/09: llama-bench's sync-free decode pipeline x ggml-gallocr's
          // single-layout alloc-fallback doing an unconditional full-device sync on every dense/sparse
          // topology flip (record: benchmarks/2026-09-10-*-shortcut-fix.md).  NOTE (2026-09-06): the
-@@ -1808,14 +1823,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -1808,14 +1823,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
          // must grow) was UNSAFE across backends and has been reverted: a re-reserve re-points tensor
          // addresses while the previous ubatch's kernels may still be in flight on other GPUs
          // (cross-GPU race -> in-kernel spin / memory faults at multi-ubatch prefill, reproduced on
@@ -244,10 +244,21 @@ index d61eac7ed..32dc271c0 100644
 +        // dense path's numerics below the width equal the LLAMA_QSA_SPARSE_FA=0 masked-dense path -
 +        // useful as a cross-check, and still reachable with LLAMA_QSA_DENSE_SHORTCUT=1.  Decode is
 +        // unaffected by this default either way: it stays dense via qsa_dense_decode_until below.
++        //
++        // ARCH POLICY (2026-09-21, gfx1201 port): the WIP's always-QSA default (shortcut OFF) was
++        // measured on gfx1151, where qsa3 makes the sparse attention competitive below the
++        // selection width.  On gfx1201 the VEC QSA path is NOT: measured 2026-09-21, 3x R9700
++        // -sm tensor, IQ4_XS, -b/-ub 2048, restoring the shortcut took pp2048 1539.6 -> 2097.4,
++        // pp8192 2169.8 -> 2429.5, pp32768 2359.4 -> 2420.5 (+36 % / +12 % / +2.6 %).  The
++        // shortcut also gates the first ~2051 tokens of EVERY prefill, so it is not a pp2048-only
++        // effect.  Default the shortcut ON on every arch not measured to prefer always-QSA;
++        // gfx1151 keeps the WIP's measured always-QSA.  Revisit per arch once qsa3 (the
++        // packed-WMMA prefill) is ported - it is what made always-QSA viable on gfx1151.
          static const bool shortcut = [] {
              const char * env = getenv("LLAMA_QSA_DENSE_SHORTCUT");
 -            return env == nullptr || atoi(env) != 0;
-+            return env != nullptr && atoi(env) != 0;
++            if (env != nullptr) return atoi(env) != 0;
++            return qsa_arch_gfx() != 0x1151;
          }();
          // ARCH POLICY (2026-09-07 crossover tables, pp2048/tg64 bf16 KV, discovery record):
          // decode uses the plain dense attend while n_kv < the per-arch crossover depth and

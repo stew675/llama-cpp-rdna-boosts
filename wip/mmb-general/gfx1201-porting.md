@@ -5,11 +5,16 @@ supersedes the "gfx1201 is a no-op / new work, not a port" notes in `GROUPS.md` 
 (see §2 — those notes were written before the RDNA4 WMMA layout had an in-repo reference and
 before the delivery's gfx1201 MMQ path was re-tuned).
 
-**Session 1 log (2026-09-21):** the WIP was applied to `~/llama.cpp` as branch `rdna-boosts-mmb-port`
+**Session 1-2 log (2026-09-21):** the WIP was applied to `~/llama.cpp` as branch `rdna-boosts-mmb-port`
 (`git am` **5/5**, clean) and **built green for gfx1201** with the delivery build script (`EXIT=0`,
-100%, `llama-cli`/`llama-bench`/`llama-perplexity`/`llama-server` present) — the RDNA4 no-op wrappers
-in `mmb.cu`/`fattn-qsa3.cu` do keep the multi-arch build compiling, as the WIP claimed.  The
-baseline worktree `~/llama-base` is staged.  No porting code has been written yet.
+100%).  Baselines were recorded (B1/B2 same-seed hashes, B3-B5 prefill/decode, B6 op oracles, B7 width
+purity) and the arch-neutral groups were A/B'd, including deep sweeps to **pp65536 and pp98304**.
+Findings and raw numbers: **`gfx1201-s1s2-results.md`**.  In one line: **G5 (indexer) is a win that
+grows with depth (+2 % @8k → +8.0 % @98k), G4 (non-temporal) is a small consistent win (+0.3-0.4 %
+at depth), and the always-QSA flip (G3a) is a large regression** and is now gated off on non-gfx1151.
+The delivered patch set was regenerated to fold in the G3a arch gate (patch 3); it applies clean 5/5
+and the applied tree is `c0f8ea75ba` (byte-identical to the tested `bdf97a390` tip).  No WMMA porting
+code has been written yet — that is S4+ below.
 
 **Audience:** whoever picks this up next — first on gfx1201, then on gfx1100.  Read this with
 `GROUPS.md` (the 5-group triage) and `HANDOVER.md` (the gfx1151 development record).  This file is
@@ -393,6 +398,12 @@ checklist updated.
 | **S8** | G3b/c + HC16 + gates | F32/tiny-M/HC16; B1-B9 full matrix | all gates green; gating documented |
 | **S9** | handover to gfx1100 | update §10/§11; commit record | gfx1100 TODO list complete |
 
+**S1+S2 status (2026-09-21): DONE.**  B1/B2 identical to the delivery; B6 oracles 2/2; B7 width purity
+PASS.  Deep sweep done (32k/64k/98k).  G5 and G4 verified as wins, the G3a gate is folded into the
+patch set, and the 5-patch backup was regenerated (tree `c0f8ea75ba`, `git am` 5/5 verified).  Detail:
+`gfx1201-s1s2-results.md`.  The delivered set is now suitable for both gfx1151 and gfx1201 for the
+arch-neutral items; the WMMA port (S4+) remains future work.
+
 If G1 measures **no win** on gfx1201 (the baseline is already strong), stop at S4- and record it:
 qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a gfx1100-only item.
 
@@ -417,10 +428,11 @@ qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a g
 ## 10. Live checklist
 
 - [x] WIP applies 5/5 and builds for gfx1201 (S1 — verified 2026-09-21, EXIT=0)
-- [ ] Baseline gates B1-B9 recorded for both builds (S1 — in progress)
-- [ ] G5 indexer ported + validated (S2)
-- [ ] G4 non-temporal A/B'd per kernel (S2)
-- [ ] G3a always-QSA decided for RDNA4 (S3)
+- [x] Baseline gates B1/B2/B3/B5/B6/B7 recorded; B4 decode identical (S1)
+- [x] G5 indexer measured — win, scales with depth (S2; `gfx1201-s1s2-results.md` §3b)
+- [x] G4 non-temporal A/B'd — small consistent win, kept (S2; interleaved rounds)
+- [x] G3a always-QSA decided for RDNA4 — gated off (S2/S3; folded into patch 3)
+- [x] Patch set regenerated + `git am` 5/5 verified (tree `c0f8ea75ba`)
 - [ ] G2 qsa3 f16 RDNA4 port + gate (S4)
 - [ ] G1 mmb fragment shim, gfx11 bit-identical (S5)
 - [ ] G1 RDNA4 correctness (fast model) (S6)

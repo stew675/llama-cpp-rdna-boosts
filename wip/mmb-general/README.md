@@ -24,6 +24,12 @@ WMMA builtin `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32`.  gfx12 needs
 `gated_delta_net_chunked_bf16.cu` in the delivery).  So this is RDNA3-gated by
 construction; gfx1201/gfx1100 keep the existing MMQ/QSA path.
 
+> **Re-examined 2026-09-21 (`gfx1201-porting.md` §2):** the builtin genuinely differs, but the RDNA4
+> fragment layout is already probed/validated in-repo, so the RDNA4 port is a bounded
+> *fragment-layout* port, not new algorithm.  It is **not** part of the delivered set (the 2026-09-21
+> gfx1201 session ported only the arch-neutral groups); it is the scoped follow-up.  The MMB/qsa3
+> gates stay gfx11-only for now.
+
 ## Attribution — what is pwilkin's and what is ours (added 2026-09-20)
 
 Compared against the reference `~/pwilkin-llama-cpp` @ `f5daaa3cf` (branch `strix-halo`) by direct
@@ -157,6 +163,37 @@ fresh r12 tree.
 (including that `mmb_wmma_*` is a deliberate no-op on RDNA4, so group 1 needs care on gfx1201), the
 gates, and the recommended order for a new architecture.  Read it before applying anything on
 gfx1100/gfx1201.
+
+---
+
+## UPDATE — session 27 (2026-09-21): first **gfx1201 (RDNA4, 3× R9700)** porting session — the
+arch-neutral groups validated, and the always-QSA flip gated per arch
+
+The 5-patch set was applied and built on gfx1201 and the arch-neutral groups were measured.  Full
+detail: **`gfx1201-s1s2-results.md`**; the multi-session plan: **`gfx1201-porting.md`**.
+
+**Headline (Flash-Next IQ4_XS, q8_0 KV, 3-GPU `-sm tensor`, `-b/-ub 2048`, vs the r12 delivery):**
+prefill **+3.2 % / +5.0 % / +6.6 %** at pp32768/65536/98304, no regression at any depth, same-seed
+greedy and all op oracles bit-identical.
+
+**Per group:**
+
+* **G5 (indexer top-k) — win, grows with depth:** +2.1 % pp8192 → +3.1 % pp32768 → **+8.0 % pp98304**
+  (all-groups − no-G5).  This is the bulk of the deep win.  Same-seed text and `INDEXER_TOPK` 2/2.
+* **G4 (non-temporal) — small consistent win:** +0.3-0.4 % at 32k/64k/98k in interleaved A/B rounds
+  (the maintainer's rule: any win without a loss → keep it).  **Keep.**
+* **G3a (always-QSA flip) — large regression on gfx1201:** pp2048 **−18.9 %**, pp8192 **−6.7 %**,
+  because qsa3 is still gfx11-gated so the VEC QSA path serves the short-prefill band.  The flip is
+  now **arch-gated: always-QSA only on gfx1151**, dense shortcut everywhere else (folded into patch 3).
+* **G2 (qsa3) / G1 (mmb) — still gfx11-gated.**  The RDNA4 fragment-layout port is scoped (with the
+  exact gfx11-vs-gfx12 lane mapping) in `gfx1201-porting.md` §§6.4-6.5, but not done.  The prior
+  "RDNA4 is new work, not a port" note was re-examined: it is a bounded fragment port, the layout is
+  already validated in-repo (`gated_delta_net_chunked_bf16.cu`).
+
+**Patch set regenerated:** the G3a gate is folded into patch 3; the 5 patches apply `git am` 5/5 on a
+fresh r12 tree and the applied tree is `c0f8ea75ba4037844affc396779e5307b2aafbfa` (byte-identical to
+the tested tip).  `commits.txt` refreshed.  The set is now suitable for **both gfx1151 and gfx1201**
+for the arch-neutral items; gfx1100 is next (see the gfx1100 job in `GROUPS.md`).
 
 ---
 
