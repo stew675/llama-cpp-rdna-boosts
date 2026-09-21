@@ -282,11 +282,10 @@ wherever MMB would lose, +3…+7 % where it wins**, and a qwen4exp user can opt 
 with `GGML_CUDA_MMB_DENSE=1`.  The open work is a **real gfx1201 dense tile geometry** — the current
 one is gfx1151-tuned and is where every RDNA4 loss lives.
 
-> **The remaining gfx1201 work is now scoped in `gfx1201-porting.md` §13 (S11-S15)** — read that
-together with `HANDOVER.md` when picking the WIP up: S11 the arch-scoped `mmb_*` tuning constants,
-S12 the routed/GLU tuning with kernel-time evidence (**and the routed-MoE default re-decision, see
-session 30**), S13 the F32/HC16 paths, S14 the B1-B9 matrix (**MTP has never been run on gfx1201**),
-S15 the freeze and hand-off.  S1-S10 are complete.
+> **The gfx1201 work is COMPLETE (S1-S14) and the set is frozen; only the hand-off remains.**  Read
+> `gfx1201-porting.md` §13 together with `HANDOVER.md` when picking the WIP up.  The S14 record is
+> `gfx1201-s14-gates.md`; the frozen set is **10 patches**, verified `git am` 10/10 onto r12
+> `c3ee45747` producing tree `35fc853e6396cb0867e7e27c1e8e21093699db47`.
 
 ---
 
@@ -411,7 +410,59 @@ HC/F32 paths that now carry the win.  **Next: S13** (HC16 producers) and **S14**
 
 ---
 
+## UPDATE — session 34 (2026-09-21): **S14 — the B1-B9 gate matrix, all green, and MTP runs on gfx1201 for the first time**
+
+S14 of `gfx1201-porting.md`.  Record: **`gfx1201-s14-gates.md`**.  **No code changed** — this was the
+campaign's biggest coverage gap: B1-B7 had only ever been recorded as a delivery-vs-WIP pair at S1, B8
+was partial, and **B9 (MTP) had never been run on gfx1201 at all**.  Tree under test
+`35fc853e6396cb0867e7e27c1e8e21093699db47` (10 patches, `git am` 10/10).
+
+**MTP works, on all three model families.**  Protocol A per `benchmarks/mtp-adaptive-methodology.md`
+(`-n 3000`, seed 42, temp 0, reasoning pinned per axis):
+
+| model | plain | draft-mtp | acceptance | pos-1 | purity |
+|---|---:|---:|---:|---:|---|
+| 27B UD-IQ3_S (1 GPU) | 28.2 | **50.0** (+77 %) | 0.63624 | 0.797 | `plain == draft-mtp` byte-identical |
+| 35B UD-Q4_K_M (1 GPU, MoE) | 88.1 | **146.1** (+66 %) | 0.72372 | 0.856 | byte-identical |
+| Flash-Next + `-md` (3-GPU tensor) | 49.3 | **80.7** (+64 %) | 0.70093 | 0.815 | byte-identical |
+
+The dense and MoE rows are **byte-identical to the delivery including acceptance**, so the port's
+decode-adjacent changes do not touch the MTP path at all.  The MoE row also beats the recorded
+2026-09-02 baseline (125.8 t/s, acceptance 0.51) — and the delivery shows the same, so that is the
+delivery's own tuning.  The four-axis gate (P/C/K/R at `-n 3000`) has **C/K/R byte-identical** between
+builds; only the open-ended prose axis diverges, which is the approved qsa3 pre-baseline text change.
+Rule 5's verify-width gate (`llama-batched-bench -npl 1,4,8`) is within noise of the delivery.
+
+**The whole-WIP qwen4exp win at depth is +22 %, not +6 %.**  Interleaving the *same* WIP binary with
+`GGML_CUDA_MMB` toggled decomposes it: mmb alone is **+6.5/+6.2/+6.0 %** at 32k/65k/98k (exactly what
+S13 recorded) and the arch-neutral groups + qsa3 are **+14.4/+15.3/+16.3 %** — growing with depth,
+which is the campaign's thesis.
+
+**Two corrections to the brief, both the same mistake in kind:** the delivery Flash-Next reference row
+(`2728/2591/2465`) was wrong — those are *qsa3-on, mmb-off* WIP numbers (S4 recorded qsa3 pp32768 =
+2724) — and the real delivery is **2372/2213/2073**, reproducing the S1/S2 record (2379/2216/2074) to
+0.3 %.  And the brief's "expected landed +6.7/+6.5/+6.2 %" is the **mmb-only** delta.  **Lesson: "ON vs
+OFF" in sessions 30-33 always meant MMB-on vs MMB-off within the WIP binary, never WIP vs delivery** —
+that distinction needs to be explicit in every report.
+
+Two findings worth carrying forward.  **A draft head cannot be loaded standalone:** `-md <head>` with
+`--spec-type none` aborts — a clean deliberate error on 1 GPU ("this model is an MTP draft head without
+a trunk"), but on a `-sm tensor` split an `GGML_ASSERT(!suffix_fallback.empty())` at
+`llama-model.cpp:470`, and `-fit off` does not avoid it.  **Pre-existing and identical on the delivery**
+(maintainer confirms upstream too), so not a WIP regression — but the harness's `plain` arm must not
+pass `-md`.  And **Flash-Next has no built-in `nextn` head** while the 27B and both 35B-A3B models do,
+so only qwen4exp gets `-md`.  Also: `FLASH_ATTN_EXT`'s case count is randomised run-to-run (two runs of
+the *same* binary differed by 34 cases), so only "0 FAIL" is a gate — not the brief's 5951.
+
+**S15 remains** — freeze, regenerate, verify `git am` N/N (done, 10/10), and hand gfx1100 the tree.
+
+---
+
 ## UPDATE — session 33 (2026-09-21): **the F32 policies were entangled — the split tile was never running**
+
+> **Superseded in part by session 34:** the "+6.7/+6.5 % and +6.2 % at 64k/98k" below is the
+> **mmb-only** delta (MMB on vs off in the same WIP binary).  The whole-WIP prefill win against the
+> delivery at depth is **+22 %** — see session 34.
 
 S13 of `gfx1201-porting.md`.  Record: **`gfx1201-s13-f32-hc16.md`**.  Two things came out of it: a real
 gain on qwen4exp, and a correction in the same shape as sessions 30 and 32.

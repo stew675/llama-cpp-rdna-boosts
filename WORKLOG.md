@@ -1,5 +1,34 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-21 (WIP, not a delivery change) — gfx1201 port, session 34b: S15, the freeze and hand-off
+
+`S15` of `wip/mmb-general/gfx1201-porting.md`.  **Experimental WIP.**  S14 found nothing to fix, so no
+code changed and there is no patch 11 — the set was already final.  Frozen and verified:
+
+* `git format-patch --start-number 1 c3ee45747..mmb-port-qsa3` reproduces `patches/*` **byte-for-byte**
+  (no drift), and `git diff c3ee45747..mmb-port-qsa3` reproduces `mmb-general.patch` exactly.
+* `commits.txt` matches `git log --format='%H %s' c3ee45747..HEAD`.
+* **`git am` 10/10** on a fresh worktree at r12 `c3ee45747`, applied tree
+  **`35fc853e6396cb0867e7e27c1e8e21093699db47`** == the fork tree == the tree S14 validated.
+
+**The gfx1201 port is complete.**  Frozen set: **10 patches**, base r12 `c3ee45747`, tree
+`35fc853e6396cb0867e7e27c1e8e21093699db47`.  Whole-WIP prefill win vs the delivery on qwen4exp
+Flash-Next (3-GPU tensor, q8_0 KV): **+21.9/+22.5/+22.7 %** at pp32768/65536/98304, with B1-B9 all
+green including MTP (0.636 dense / 0.724 MoE / 0.701 qwen4exp acceptance).
+
+Docs updated: `gfx1201-porting.md` (§11 hand-off, §13.0 status, §13.1 definition-of-done all ticked,
+the S15 record, and the §6e corrections), `GROUPS.md` (the gfx1201 results incl. the whole-WIP vs
+mmb-only distinction, the frozen tree, and a gfx1100 job that now carries the three traps gfx1201 found
+the hard way), `README.md` (session 34 + 34b, with a supersede note on session 33's mmb-only numbers),
+and this log.
+
+**Handed to gfx1100:** the tree above, the patch set in `wip/mmb-general/patches/`, and `GROUPS.md`'s
+**gfx1100 job** section.  `~/llama.cpp`'s `mmb-port-qsa3` branch stays local — the patch set is the
+deliverable and nothing is pushed out of the fork checkout (AGENTS.md Pushing policy).  Per-arch
+constants now live in one table (`mmb_arch_cfg` / `mmb_arch_defaults(cc)`, S11), so gfx1100's job is a
+row edit plus a `GGML_CUDA_CC_IS_RDNA3_0` arm, with `GGML_CUDA_MMB_CFG=1` to prove which constants a
+run used.
+
 ## 2026-09-21 (WIP, not a delivery change) — gfx1201 port, session 34: S14, the B1-B9 gate matrix
 
 `s14` of `wip/mmb-general/gfx1201-porting.md`.  **Experimental WIP**; record in

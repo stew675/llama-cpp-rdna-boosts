@@ -451,11 +451,11 @@ checklist updated.
 | **S12** | routed/GLU tuning + kernel time | **DONE** — the routed path is a loss on every model; per-arch `routed` policy, RDNA4 default **off**; qwen4exp +4.9/+5.2 % | met (better than planned: a policy reversal, not a sweep) |
 | **S13** | G3b/c F32/tiny-M + G4 HC16 | **DONE** — F32 policies separated (the split tile was never running); it scales with depth; HC16 measured inert | met (better: +1.7 % more on qwen4exp) |
 | **S14** | B1-B9 on the final tree | re-run B1-B7; B8 long-context PPL; **B9 MTP** | ✓ **DONE 2026-09-21 — every gate green, MTP validated on gfx1201** |
-| **S15** | freeze + regenerate + hand off | update the docs, `git am` N/N, gfx1100 hand-off | gfx1100 handed a clean state |
+| **S15** | freeze + regenerate + hand off | update the docs, `git am` N/N, gfx1100 hand-off | ✓ **DONE 2026-09-21 — frozen at `35fc853e63…`, `git am` 10/10, gfx1100 handed the tree** |
 
-> **S1-S14 are DONE.**  The live work is **S15** only (freeze + gfx1100 hand-off) — see §13's S15
-> section.  The S14 brief is kept below as the executed record; its results are in
-> `gfx1201-s14-gates.md` and its two bad reference numbers are corrected in §S14.3c.
+> **S1-S15 are DONE — the gfx1201 port is complete and frozen.**  The S14/S15 briefs are kept below as
+> the executed record; results in `gfx1201-s14-gates.md`, and the S14 brief's two bad reference numbers
+> are corrected in §S14.3c.
 
 **S1+S2 status (2026-09-21): DONE.**  B1/B2 identical to the delivery; B6 oracles 2/2; B7 width purity
 PASS.  Deep sweep done (32k/64k/98k).  G5 and G4 verified as wins, the G3a gate is folded into the
@@ -470,7 +470,8 @@ is byte-identical to the delivery with qsa3 off (G5/G4 pure) with the qsa3 delta
 re-baseline.  Detail: `gfx1201-s4-qsa3-results.md`.  G1 (`mmb`) was then done in S5-S7 (`mmb` is
 ported but **scoped** — see `gfx1201-s5s7-mmb-results.md`).
 
-**S1-S7 are all DONE.  The live work is S10-S15 in §13.**
+**S1-S7 are all DONE.**  S10-S15 (the remainder) are also DONE and the set is frozen — see §13, and
+in particular §11 for the gfx1100 hand-off.
 
 If G1 measures **no win** on gfx1201 (the baseline is already strong), stop at S4- and record it:
 qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a gfx1100-only item.
@@ -535,10 +536,14 @@ qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a g
       **MTP runs on gfx1201 for the first time** (dense 0.636 / MoE 0.724 / qwen4exp 0.644-0.701
       acceptance, MTP +56..77 % over plain, purity byte-identical); the whole-WIP qwen4exp win at depth
       is **+22 %**; `gfx1201-s14-gates.md`
-- [ ] **S15 — freeze, regenerate, verify `git am` N/N, hand gfx1100 the tree** (see §13's S15 section)
+- [x] **S15 — freeze, regenerate, verify `git am` N/N, hand gfx1100 the tree** — **DONE 2026-09-21**:
+      no drift (`patches/*` and `mmb-general.patch` regenerate byte-for-byte), `git am` **10/10** onto a
+      fresh `c3ee45747` worktree producing tree `35fc853e6396cb0867e7e27c1e8e21093699db47` == the tested
+      tree; docs updated and gfx1100 handed `GROUPS.md`'s job section
 
-**§13 is the brief for the remaining work (S14-S15); its S14 section is written to be executed with no
-prior context.**  Start there.
+**S1-S15 are complete.  There is no remaining gfx1201 work.**  A new session picking this up should
+read §11 (the gfx1100 hand-off) and `gfx1201-s14-gates.md` §8 (the traps) — not §13's briefs, which are
+now history.
 
 **Patch layout (current): 10 patches, tree `35fc853e63…`** — 1 mmb, 2 qsa3, 3 F32/tiny-M +
 width-probe, 4 HC16, 5 indexer, 6 the `mmb` RDNA4 port + scope split, 7 the S10 dense geometry +
@@ -561,7 +566,20 @@ gfx1100 (RDNA3_0) solves a **different** half of the same problem:
   tuned-differently sibling.
 * Do the gfx1201 arch-neutral groups (G5, G4) first on gfx1100 too — they are free.
 * The gating in §7 must already support gfx1100 (env + per-arch constant selection) so gfx1100 does
-  not have to re-architect anything.
+  not have to re-architect anything.  **It now does**: S11's `mmb_arch_cfg` / `mmb_arch_defaults(cc)`
+  table holds the per-arch constants, so a gfx1100 row is a table edit plus a
+  `GGML_CUDA_CC_IS_RDNA3_0` arm — and `GGML_CUDA_MMB_CFG=1` dumps the resolved config so a run can be
+  proven to have used the constants it claims.
+
+**What gfx1201 hands over (S15, frozen 2026-09-21).**  The patch set is **10 patches**, verified
+`git am` **10/10** onto r12 `c3ee45747`, producing tree
+**`35fc853e6396cb0867e7e27c1e8e21093699db47`** — the exact tree S14 validated (B1-B9 all green, MTP
+included).  `GROUPS.md`'s "gfx1100 job" section is the work item; `gfx1201-s14-gates.md` is the gate
+record, and its §8 lists the traps a gfx1100 session will otherwise re-derive.  The three that matter
+most there: **sweep the weight types separately** (on RDNA4 the type axis turned G1 from a loss into
+three wins), **gate every tile geometry on a same-seed hash** (`BN = (8/(BM/WTM))*WTN` or the kernel
+silently computes part of the output and *looks* fast), and **prefer depth for a verdict** (the
+most compute-dense config is the one whose shallow numbers are most `sclk`-sensitive).
 
 ---
 
@@ -594,10 +612,11 @@ gfx1100 (RDNA3_0) solves a **different** half of the same problem:
 
 ---
 
-## 13. Remaining gfx1201 work — the next session's brief (S14-S15)
+## 13. The gfx1201 work record — S10-S15, all DONE (kept as the execution record)
 
 **Read this section, not the session logs above.**  S1-S13 are done; this is everything that is
-still open on gfx1201 — **S15 only (freeze + hand-off)**.  **S14 was executed and is green; its
+open on gfx1201 — **none: S14 and S15 are both DONE and the set is frozen** (tree
+`35fc853e6396cb0867e7e27c1e8e21093699db47`, `git am` 10/10).  **S14 was executed and is green; its
 results are in `gfx1201-s14-gates.md`.**  The S14 section below is kept as the executed record (its
 two bad reference numbers are corrected in §S14.3c).  Nothing here blocks gfx1100 (it can start on
 G5/G4 and its own RDNA3_0 work in parallel).
@@ -1075,10 +1094,24 @@ documented, and neither has been looked at since S1.  Report the failure with th
 RDNA4" verdicts turned out to be "was never enabled on RDNA4", and each was caught by overriding the
 flag and measuring deep.  The pattern and the two rules are in §13's S13 section and in `GROUPS.md`.
 
-### S15 — freeze the policy, regenerate, hand off
+### S15 — freeze the policy, regenerate, hand off  — **DONE 2026-09-21**
 
-**Prerequisite:** S14 green (or its misses root-caused).  As of S13 all the *policy* work is already in
-code — there is nothing left to "land" here unless S14 forces a change.
+**Result:** S14 found nothing to fix, so no code changed and there was no patch 11.  The set was frozen
+and verified:
+
+* `git format-patch --start-number 1 c3ee45747..mmb-port-qsa3` reproduces `patches/*` **byte-for-byte**
+  (no drift), and `git diff c3ee45747..mmb-port-qsa3` reproduces `mmb-general.patch` exactly.
+* `commits.txt` matches `git log --format='%H %s' c3ee45747..HEAD`.
+* **`git am` 10/10** on a fresh worktree at `c3ee45747`, and the applied tree is
+  **`35fc853e6396cb0867e7e27c1e8e21093699db47`** — identical to the tested fork tree.
+* Docs updated: this plan (§11, §13.0, the S14 corrections), `GROUPS.md` (the gfx1201 results,
+  the frozen tree, the gfx1100 job with the three traps), `README.md` (session 34), `WORKLOG.md`.
+* Handed to gfx1100: the tree above, the patch set in `patches/`, and `GROUPS.md`'s **gfx1100 job**
+  section.  `~/llama.cpp`'s branch stays local and is never pushed (AGENTS.md Pushing policy).
+
+The original brief follows.
+
+**Prerequisite:** S14 green (or its misses root-caused) — it was green, so nothing needed landing.
 
 * If S14 **found** something: land the fix as **patch 11** (the convention below), then re-run the
 affected gates.
@@ -1107,8 +1140,14 @@ patch unless the touched files are owned by exactly one existing patch.**
 - [x] the dense tile geometry has a gfx1201 answer (win → density re-enabled per type; or a recorded,
       kernel-time-backed "MMQ wins on RDNA4 for dense" so the decision is closed) — **S10: both.
       IQ3_S wins (-4.5 %) and is enabled; IQ4_XS/IQ3_XXS/IQ4_NL stay off, kernel-time backed**
-- [ ] every `mmb_*` tunable has an arch-scoped default with gfx1151 unchanged
-- [ ] the routed/GLU path is tuned and kernel-time-backed; the IQ3_XXS GLU arm re-decided
-- [ ] G3b/c and HC16 are measured, purity-checked and defaulted
-- [ ] B1-B9 green on the final tree, **including MTP**
-- [ ] gfx1100 has a clean, documented handoff (and its own `RDNA3_0` predicate work listed)
+- [x] every `mmb_*` tunable has an arch-scoped default with gfx1151 unchanged — **S11**
+- [x] the routed/GLU path is tuned and kernel-time-backed; the IQ3_XXS GLU arm re-decided — **S12:
+      the routed path is a loss on every model measured → per-arch `routed`, RDNA4 default off (the
+      threshold sweep is moot on a disabled path); the IQ3_XXS GLU arm stays default-off**
+- [x] G3b/c and HC16 are measured, purity-checked and defaulted — **S13: both F32 paths win and stay
+      on; HC16/BLK16/RES16/DOWN16 measured inert → stay 0 as an unused opt-in**
+- [x] B1-B9 green on the final tree, **including MTP** — **S14: all green; MTP validated on gfx1201
+      for the first time on all three model families, acceptance 0.636/0.724/0.701, purity
+      byte-identical, verify-width gate within noise**
+- [x] gfx1100 has a clean, documented handoff (and its own `RDNA3_0` predicate work listed) — **S15:
+      tree `35fc853e63…`, `git am` 10/10, `GROUPS.md`'s gfx1100 job section**

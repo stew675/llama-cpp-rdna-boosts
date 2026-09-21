@@ -160,9 +160,9 @@ visible nondeterminism).  Now **1117 ms at pp32768 = 1.80 %** of the run, from 2
 The 5-patch set was applied to a 3× R9700 (gfx1201) box, built, and measured against the delivery.
 Full data: `gfx1201-s1s2-results.md`; plan: `gfx1201-porting.md`.
 
-> **The remaining gfx1201 work is scoped in `gfx1201-porting.md` §13 (S10-S15)** — the dense tile
-> geometry, the arch-scoped `mmb_*` tuning constants, the routed/GLU tuning, the F32/HC16 paths, and
-> the B1-B9 gate matrix (incl. MTP).  Hand that file to the next gfx1201 session.
+> **The remaining gfx1201 work is scoped in `gfx1201-porting.md` §13.**  **S10-S14 are done**; only
+> **S15** (freeze + this hand-off) remains.  The gfx1201 port is complete and every gate passes —
+> `gfx1201-s14-gates.md` is the B1-B9 record.
 
 | group | gfx1201 verdict | action |
 |---|---|---|
@@ -170,7 +170,12 @@ Full data: `gfx1201-s1s2-results.md`; plan: `gfx1201-porting.md`.
 | **G4 non-temporal** | **small consistent win** at depth (+0.3–0.4 % at 32k/64k/98k) | keep, always-on |
 | **G3a always-QSA flip** | **regression** (pp2048 −18.9 %, pp8192 −6.7 %) | **gated off on RDNA4** (default shortcut ON except gfx1151) |
 | **G2 qsa3** | **win**: +7.6 / +11.5 / +10.4 % prefill at pp4096/16384/32768 (qsa3 vs VEC, same build) | **ported 2026-09-21** (`gfx1201-s4-qsa3-results.md`); folded into patch 2 |
-| **G1 mmb** | **ported 2026-09-21, scoped — the RDNA4 default is now a win everywhere it does anything**: qwen4exp **+6.7 / +6.5 %** shallow and **+6.2 %** at 64k/98k (S13; up from +3.1/+3.4 in S7), IQ3_S-heavy dense **+0.5 %** (S10), IQ-heavy MoE **neutral** (S12) | enabling it unscoped is a −4…−13 % regression on dense/K-quant models; the routed path is **off** on RDNA4; HC16 measured inert |
+| **G1 mmb** | **ported 2026-09-21, scoped — the RDNA4 default is now a win everywhere it does anything**: qwen4exp **mmb-only +6.0…6.5 %** at 32k/65k/98k (S13/S14), IQ3_S-heavy dense **+0.5 %** (S10), IQ-heavy MoE **+0.5 %** (S14) | enabling it unscoped is a −4…−13 % regression on dense/K-quant models; the routed path is **off** on RDNA4; HC16 measured inert |
+
+> **Read the *mmb-only* column carefully.**  S10-S13 reported "ON vs OFF", which always meant
+> **MMB-on vs MMB-off within the WIP binary** — never WIP vs delivery.  S14 measured both: on
+> Flash-Next the whole WIP is **+22 %** over the delivery at depth, of which mmb is +6.0-6.5 % and the
+> arch-neutral groups (G5/G4/G3a gate) + qsa3 are +14.4-16.3 %.
 
 ### The S7 → S13 correction (what S7 had gated off was mostly a win)
 
@@ -184,18 +189,24 @@ was the thing under test, not the kernel.  Re-measured with the gate overridden:
 | the routed MoE win (+6.7 %) | **does not reproduce** — the unmodified S7 binary measures −1.4 %, and routed on/off says it is a loss on both models (S10 §6, S12) |
 | gfx1151: router 2.4x on the split tile, hc-inject worse on tiny-M | on RDNA4 this is **inverted** — tiny-M is the bigger win, the tile is the depth-scaler |
 
-Net: qwen4exp has gone **+3.1/+3.4 % (S7) → +4.9/+5.2 % (S12) → +6.7/+6.5 % (S13)**.  Detail:
-`gfx1201-s10-dense-geometry.md`, `gfx1201-s12-routed-policy.md`, `gfx1201-s13-f32-hc16.md`.
+Net: qwen4exp has gone **+3.1/+3.4 % (S7) → +4.9/+5.2 % (S12) → +6.7/+6.5 % (S13)** on the mmb axis.
+Detail: `gfx1201-s10-dense-geometry.md`, `gfx1201-s12-routed-policy.md`, `gfx1201-s13-f32-hc16.md`.
 
 > **Two rules this produced:** (1) when a path is disabled by a policy flag, measure the path *with
 > the flag overridden* before concluding it loses; (2) **a shallow A/B is not a verdict** for a
 > long-context workload — the F32 split tile reads −0.3 % at pp8192 and +1.22 % at pp98304.
 
-Net gfx1201 prefill vs the delivery (Flash-Next IQ4_XS, q8_0 KV, 3-GPU tensor, `-b/-ub 2048`):
-**+3.2 % / +5.0 % / +6.6 %** at pp32768/65536/98304, no regression at any depth, same-seed greedy
-and all op oracles bit-identical.  The patch set carries the G3a arch gate (patch 3, commit
-`bdf97a390` on the pre-consolidation branch); it applies clean 5/5 and the applied tree is
-`c0f8ea75ba`.
+**S14 (2026-09-21) then froze and gate-checked the whole thing.**  Whole-WIP prefill vs the delivery
+(Flash-Next IQ4_XS, q8_0 KV, 3-GPU tensor, `-b/-ub 2048`, interleaved): **+21.9 / +22.5 / +22.7 %** at
+pp32768/65536/98304 — the gap *grows with depth*, which is the campaign's thesis.  No regression at
+any depth on any model; same-seed greedy and all four op oracles bit-identical; PPL parity
+(WIP-MMB-off **bit-identical** to the delivery at 9.4293, MMB-on +0.022 %); width purity PASS with MMB
+on **and** off; **MTP validated on gfx1201 for the first time** on all three model families (acceptance
+0.636 dense / 0.724 MoE / 0.644-0.701 qwen4exp, MTP +56..77 % over plain, purity byte-identical) and
+the verify-width gate within noise.  Full record: `gfx1201-s14-gates.md`.
+
+The frozen set is **10 patches**, verified `git am` **10/10** onto r12 `c3ee45747` producing tree
+**`35fc853e6396cb0867e7e27c1e8e21093699db47`**.
 
 **G2 `qsa3` is ported to RDNA4** (2026-09-21) and is the second-biggest gfx1201 win after the indexer.
 **S10 (2026-09-21) then made the dense path a per-TYPE win**: the `mmb` dense tile was losing because
@@ -226,9 +237,11 @@ and keeps the full type set — the split only narrows what RDNA4 accepts.  Deta
 gfx1100 (RDNA3_0, RX 7900 XTX) shares the **gfx11** WMMA builtin with gfx1151, so it needs **none of
 the gfx12 fragment work**.  Its job is the mirror image of gfx1201's:
 
-1. **Apply and build the set** (`scripts/apply-all.sh` + `patches/*.patch`; the tree is
-   `c0f8ea75ba`).  It should compile as-is — all three arches are covered by the existing
-   `#if defined(RDNA4)` no-op wrappers and the runtime gates.
+1. **Apply and build the set** — `patches/*.patch` is **10 patches**, verified `git am` **10/10** onto
+   r12 `c3ee45747` producing tree **`35fc853e6396cb0867e7e27c1e8e21093699db47`** (the tree gfx1201
+   validated in S14).  It compiles as-is — all three arches are covered by the existing
+   `#if defined(RDNA4)` wrappers and the runtime gates.  **Do not push the fork branch**; apply from
+   the patch set.
 2. **Arch-neutral groups first (G5 + G4):** apply, measure, gate.  Expect the G5 indexer to win and
    scale with depth like gfx1201 (it is the same generic kernel); the G4 hints are per-kernel A/B.
    **G3a:** the default is shortcut-ON on gfx1100 (non-gfx1151); if gfx1100 measures always-QSA as a
@@ -239,10 +252,22 @@ the gfx12 fragment work**.  Its job is the mirror image of gfx1201's:
    above does not apply).  **This is untested and needs a re-tune, not a transfer:** the tile
    geometry / `THRESH` / `VAULT` / `min_t` constants are gfx1151-tuned.  Follow `gfx1201-porting.md`
    §5 (G1 row) and §6.5.3 for the sweep shape; start on the fast `Qwen3.6-35B-A3B Q4_K_M` model.
+   **Three traps gfx1201 found the hard way, all of which will bite here:** (a) the tile geometry is
+   chosen by an LDS budget and a validity rule — `BN` must equal `(8/(BM/WTM))*WTN` or the kernel
+   silently computes part of the output and *looks* fast, so gate every candidate on a same-seed text
+   hash; (b) a geometry is *numerics-neutral*, so the hash passing does not mean it is fast — the
+   kernel-time attribution (1 GPU) is what picks the winner; (c) **prefer depth for a verdict** — the
+   per-type dense verdicts were only stable at pp32768+, and the most compute-dense config is the one
+   whose shallow numbers are most `sclk`-sensitive.  **Because the type axis dominates on RDNA4, sweep
+   the weight types separately rather than together** — that is what turned G1 from a loss into three
+   wins.
 4. **G2 `qsa3`** likewise: extend its support predicate from `RDNA3_5` to `RDNA3_0` and re-tune.
-5. **Record** into a `gfx1100-porting.md` results file (same shape as `gfx1201-s1s2-results.md`) and,
-   if the mmb constants need per-arch values, promote them to a `cc`-selected default (see
-   `gfx1201-porting.md` §7 point 3) so gfx1151 is not disturbed.
+5. **Record** into a `gfx1100-porting.md` results file (same shape as `gfx1201-s1s2-results.md`).
+   Per-arch constants now live in one table — `mmb_arch_cfg` / `mmb_arch_defaults(cc)` in `mmb.cu`,
+   added in S11 — so a gfx1100 row is an **edit to that table plus a `GGML_CUDA_CC_IS_RDNA3_0` arm**,
+   not a new mechanism.  `GGML_CUDA_MMB_CFG=1` dumps the resolved config once for any run, which is
+   how to prove which constants a measurement actually used.  S11 deliberately left the gfx1100 row
+   as a **copy of the gfx1151 row** rather than inventing values: **the row is the job.**
 
 **Do not** carry gfx1201's numbers to gfx1100 or vice-versa — they have different LDS budgets, WMMA
 rates and (for MMB) different tuning points.  Measure on the box.
