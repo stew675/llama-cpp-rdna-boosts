@@ -411,6 +411,45 @@ HC/F32 paths that now carry the win.  **Next: S13** (HC16 producers) and **S14**
 
 ---
 
+## UPDATE — session 33 (2026-09-21): **the F32 policies were entangled — the split tile was never running**
+
+S13 of `gfx1201-porting.md`.  Record: **`gfx1201-s13-f32-hc16.md`**.  Two things came out of it: a real
+gain on qwen4exp, and a correction in the same shape as sessions 30 and 32.
+
+**The bug-shaped finding.**  The two F32 paths shared one predicate, so `GGML_CUDA_MMB_F32SPLIT=0` also
+killed the tiny-M warp-per-token kernel; and the split **tile** was additionally gated behind
+`mmb_dense_flag()` — which is off on RDNA4 — so **neither had ever run there**.  They are now separate
+policies (`mmb_f32split_mode()` for the tile, `mmb_tiny_m_f32_ok()` for tiny-M).
+
+**The depth finding (the user's call).**  Measured against the delivery on Flash-Next IQ4_XS, 3-GPU
+tensor, interleaved r=3, the split tile reads **−0.3 % at pp8192, +0.9 % at pp32768, +1.00 % at
+pp65536, +1.22 % at pp98304** — it costs a fraction of a percent at the start of a run and pays >1 %
+once the context is deep, which is where a long-context session's time actually goes.  A shallow A/B
+had read it as "noise"; at 64k+ it is unambiguous.  The tiny-M kernel is the larger but flatter win
+(~+4.5 %, pp8192→32768, ~0 at 32k vs the tile's +0.9).
+
+**Landed: qwen4exp +6.7 % pp8192 / +6.5 % pp32768 / +6.2 % pp65536 / +6.2 % pp98304** (S12 was
++4.9/+5.2).  27B UD-IQ3_S +0.54/+0.49 %, IQ-heavy MoE neutral, and the same-seed text is byte-identical
+to the delivery on all three.  Mechanism (profile): rocBLAS `MT64x64x16` 1.923 → 0.242 s, taken up by
+`mmb_f32split_kernel` (0.306 s) and `mmb_tiny_m_f32_kernel` (0.429 s) — on qwen4exp those two are the
+*only* MMB device work at all (routed off, dense types IQ3_S-only).
+
+**HC16 is inert.**  `MMB_HC16`, `MMB_DOWN16`, `LLAMA_HC_BLK16`, `LLAMA_HC_RES16` move nothing: 0.03 %
+spread on 27B UD-IQ3_S — *where the conversion stream is live* (178 `MMB_CVT` lines) and the quantized
+dense path does run — and noise on qwen4exp at pp32768 and pp65536.  They stay default 0 as a measured,
+unused opt-in.  `TINY_TT` 2/4 and `CACHE=32` are likewise noise.
+
+The qwen4exp number has now gone **+3.1/+3.4 (S7) → +4.9/+5.2 (S12) → +6.7/+6.5 (S13)**, each step by
+removing a gate S7 had put in front of a path that wins on RDNA4.  The pattern is recorded in
+`GROUPS.md`: *when a path is disabled by a policy flag, measure the path with the flag overridden
+before concluding it loses* — and *a shallow A/B is not a verdict*.
+
+Landed as **patch 10** (`git am` 10/10, applied tree `35fc853e63`); gfx1151 device kernels
+byte-unchanged.  **Next: S14** — the B1-B9 gate matrix, **including MTP, which has still never run on
+gfx1201**.
+
+---
+
 ## UPDATE — session 25 (2026-09-20): the indexer gather's **warp-shuffle scan** (−11.7 % on the gather),
 ## and the block-level gather/emit closed as unbuildable
 

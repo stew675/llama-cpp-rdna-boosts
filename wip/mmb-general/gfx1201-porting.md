@@ -6,10 +6,10 @@ supersedes the "gfx1201 is a no-op / new work, not a port" notes in `GROUPS.md` 
 before the delivery's gfx1201 MMQ path was re-tuned).
 
 > **HANDING THIS FILE TO A NEW SESSION?  Read §13 first** — it is the brief for the remaining
-gfx1201 work (S13-S15): the F32/HC16 paths and the B1-B9 gate matrix (*including MTP, which has never
-run on this box*).  **S1-S12 are done** and are history; §13 is the live work.  The S10/S12
-by-products are both decided in code now: the **S7 MoE win does not reproduce** (§12 risk 7) and the
-routed path is **disabled on RDNA4** with the qwen4exp win nearly doubled as a result.
+gfx1201 work (S14-S15): the **B1-B9 gate matrix, including MTP, which has never run on this box**, and
+the gfx1100 hand-off.  **S1-S13 are done** and are history; §13 is the live work.  The qwen4exp win
+has gone +3.1/+3.4 (S7) -> +4.9/+5.2 (S12) -> **+6.7/+6.5 (S13)** by removing gates S7 had put in
+front of paths that actually win on RDNA4 -- see §13 S13's closing note on that pattern.
 
 **Session 1-2 log (2026-09-21):** the WIP was applied to `~/llama.cpp` as branch `rdna-boosts-mmb-port`
 (`git am` **5/5**, clean) and **built green for gfx1201** with the delivery build script (`EXIT=0`,
@@ -448,7 +448,7 @@ checklist updated.
 | **S10** | **gfx1201 dense tile geometry** | **DONE** — 256x128 tile + a per-type dense policy (IQ3_S) | met: the dense tile beats MMQ for IQ3_S (-4.5 %, kernel-time + interleaved A/B, +0.5 % model) |
 | **S11** | arch-scoped tuning constants | **DONE** — `mmb_arch_cfg`/`mmb_arch_defaults(cc)` + a config dump; gfx1151 byte-unchanged, RDNA4 preserved | met |
 | **S12** | routed/GLU tuning + kernel time | **DONE** — the routed path is a loss on every model; per-arch `routed` policy, RDNA4 default **off**; qwen4exp +4.9/+5.2 % | met (better than planned: a policy reversal, not a sweep) |
-| **S13** | G3b/c F32/tiny-M + G4 HC16 | isolate and A/B each knob | measured, purity-checked, defaulted |
+| **S13** | G3b/c F32/tiny-M + G4 HC16 | **DONE** — F32 policies separated (the split tile was never running); it scales with depth; HC16 measured inert | met (better: +1.7 % more on qwen4exp) |
 | **S14** | B1-B9 on the final tree | re-run B1-B7; B8 long-context PPL; **B9 MTP** | every gate green with numbers recorded |
 | **S15** | freeze + regenerate + hand off | land the policy, update the docs, `git am` N/N | gfx1100 handed a clean state |
 
@@ -524,14 +524,20 @@ qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a g
       to `routed = 0`.  Landed default: qwen4exp **+4.9 / +5.2 %** (was +2.3/+1.8), IQ-MoE **neutral**
       (was -1.4 %), IQ3_S dense +0.5 %, text byte-identical everywhere;
       `gfx1201-s12-routed-policy.md`.  The threshold sweep is now moot on RDNA4.
+- [x] G3b/c F32/tiny-M + G4-HC16 (S13) — **DONE 2026-09-21**: the two F32 paths were entangled and the
+      split *tile* was wrongly gated behind `mmb_dense_flag()`, so neither ran on RDNA4.  Separated,
+      both win and the split tile **scales with depth** (-0.3 % pp8192 -> **+1.22 % pp98304**), taking
+      qwen4exp to **+6.7 / +6.5 %** shallow and **+6.2 % at 64k/98k**.  HC16/BLK16/RES16/DOWN16 are
+      **inert** (0.03 % spread where the conversion stream is live) -> stay default 0;
+      `gfx1201-s13-f32-hc16.md`
 - [ ] B1-B9 on the final tree, incl. **MTP** — never run on gfx1201 (S14)
 
-**§13 is the brief for the remaining work (S13-S15).**  Start there.
+**§13 is the brief for the remaining work (S14-S15).**  Start there.
 
-**Patch layout (current): 9 patches, tree `4a78af6349…`** — 1 mmb, 2 qsa3, 3 F32/tiny-M +
+**Patch layout (current): 10 patches, tree `35fc853e63…`** — 1 mmb, 2 qsa3, 3 F32/tiny-M +
 width-probe, 4 HC16, 5 indexer, 6 the `mmb` RDNA4 port + scope split, 7 the S10 dense geometry +
-per-type dense policy, 8 the S11 per-arch tuning table, 9 the S12 routed policy.  Patches 6-9 form a
-chain on `mmb.cu`.
+per-type dense policy, 8 the S11 per-arch tuning table, 9 the S12 routed policy, 10 the S13 F32
+policy split.  Patches 6-10 form a chain on `mmb.cu`.
 
 ---
 
@@ -602,6 +608,7 @@ in parallel).
 | S10 | **the RDNA4 dense tile geometry (256x128) + a per-type dense policy** — IQ3_S beats MMQ by 4.5 %, +0.5 % prefill on 27B UD-IQ3_S; and the **S7 MoE win does not reproduce** | `gfx1201-s10-dense-geometry.md` |
 | S11 | **per-arch tuning defaults** — `mmb_arch_cfg` + `mmb_arch_defaults(cc)`, the dense geometry in the table, `GGML_CUDA_MMB_CFG=1` dump; gfx1151 kernel set byte-unchanged | `gfx1201-s11-arch-defaults.md` |
 | S12 | **the routed MoE path is a loss on RDNA4** — per-arch `routed` policy, **default off**; qwen4exp +4.9/+5.2 % (was +2.3/+1.8), IQ-MoE neutral (was −1.4 %) | `gfx1201-s12-routed-policy.md` |
+| S13 | **the F32 policies separated** — the split tile was wrongly gated behind `mmb_dense_flag()`, so it never ran on RDNA4; it **scales with depth** (−0.3 % @8k → +1.22 % @98k) → qwen4exp **+6.7/+6.5 %**; **HC16 is inert** (0.03 %) | `gfx1201-s13-f32-hc16.md` |
 
 **Protocol — apply to every measurement below.**
 
@@ -758,10 +765,23 @@ tiling was never tuned here and the S7 comparison is end-to-end only (§12.6).
 **Exit gate:** the routed win ≥ the S7 number with kernel-time evidence; the GLU/IQ3_XXS decisions
 re-stated on gfx1201.
 
-### S13 — G3b/c (F32/tiny-M) and G4-HC16 producers
+### S13 — G3b/c (F32/tiny-M) and G4-HC16 producers  — **DONE 2026-09-21**
 
-**Why:** both ride G1 and both are **unmeasured on gfx1201**.  S7 made two *policy* calls on them
-(routed the F32 router off, kept the tiny-M HC inject on) without isolating either.
+**Result:** `wip/mmb-general/gfx1201-s13-f32-hc16.md`.  The two F32 paths shared one predicate (so
+`F32SPLIT=0` also killed the tiny-M kernel) and the split **tile** was additionally gated behind
+`mmb_dense_flag()` — which is off on RDNA4 — so neither had ever run there.  Separated:
+`mmb_f32split_mode()` governs only the tile, `mmb_tiny_m_f32_ok()` only the tiny-M kernel.  Both are
+wins, and the split tile **scales with depth** on Flash-Next IQ4_XS (interleaved r=3, vs the delivery):
+**−0.3 % pp8192, +0.9 % pp32768, +1.00 % pp65536, +1.22 % pp98304** — a fraction of a percent at the
+start and >1 % once the context is deep, which is where a long run's time goes.  tiny-M is the bigger
+but flatter win (~+4.5 %, pp8192→32768).  Landed: **qwen4exp +6.7 / +6.5 % shallow, +6.2 % at 64k/98k**
+(was +4.9/+5.2), 27B IQ3_S +0.5 %, MoE neutral, text byte-identical.  **HC16 / BLK16 / RES16 / DOWN16
+are INERT** — 0.03 % spread on 27B UD-IQ3_S *where the conversion stream is live* (178 `MMB_CVT`
+lines) and noise on qwen4exp — so they stay default 0 as an unused opt-in.  `TINY_TT` 2/4 and
+`CACHE=32` are also noise.  Landed as **patch 10** (`git am` 10/10); gfx1151 byte-unchanged.
+
+**Why (original brief):** both ride G1 and both are **unmeasured on gfx1201**.  S7 made two *policy* calls
+on them (routed the F32 router off, kept the tiny-M HC inject on) without isolating either.
 
 **Do this:**
 * **F32 split (MoE router)** — currently off on RDNA4 via `mmb_dense_flag()`.  Sweep

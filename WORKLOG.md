@@ -1,5 +1,38 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-21 (WIP, not a delivery change) — gfx1201 port, session 33: the F32 split was never running
+
+`s13` of `wip/mmb-general/gfx1201-porting.md`.  **Experimental WIP**; record in
+`wip/mmb-general/gfx1201-s13-f32-hc16.md`.
+
+The two F32 paths shared one predicate, so `GGML_CUDA_MMB_F32SPLIT=0` also killed the tiny-M
+warp-per-token kernel; and the split *tile* was additionally gated behind `mmb_dense_flag()`, which is
+off on RDNA4 -- so **neither had ever run on gfx1201**.  Separated, both win, and the split tile scales
+with depth (Flash-Next IQ4_XS, 3-GPU tensor, interleaved r=3, vs the delivery):
+
+| depth | split OFF | split ON | delta |
+|---|---|---|---|
+| pp8192 | 2853.85 | 2844.97 | -0.3 % |
+| pp32768 | 2862.96 | 2889.61 | +0.9 % |
+| pp65536 | 2725.18 | 2752.31 | **+1.00 %** |
+| pp98304 | 2585.55 | 2616.95 | **+1.22 %** |
+
+So it costs a fraction of a percent at the start of a run and pays >1 % at depth -- a shallow A/B had
+read it as noise.  Landed: qwen4exp **+6.7 / +6.5 %** shallow and **+6.2 %** at 64k/98k (S12 was
++4.9/+5.2); 27B IQ3_S +0.5 %; IQ-heavy MoE neutral; same-seed text byte-identical on all three models.
+Mechanism: rocBLAS `MT64x64x16` 1.923 -> 0.242 s, taken by `mmb_f32split_kernel` (0.306 s) +
+`mmb_tiny_m_f32_kernel` (0.429 s).
+
+**HC16 / BLK16 / RES16 / DOWN16 are inert** on gfx1201: 0.03 % spread on 27B UD-IQ3_S *where the
+conversion stream is live* (178 `MMB_CVT` lines) and noise on qwen4exp -- stay default 0.  `TINY_TT`
+2/4 and `CACHE=32` are noise too.  Landed as **patch 10** (`git am` 10/10, applied tree
+`35fc853e6396cb0867e7e27c1e8e21093699db47`); gfx1151 device kernels byte-unchanged.
+
+The qwen4exp win has now gone +3.1/+3.4 (S7) -> +4.9/+5.2 (S12) -> **+6.7/+6.5 (S13)**, each step by
+removing a gate S7 had put in front of a path that wins on RDNA4.  Pattern recorded in GROUPS.md:
+*when a path is disabled by a policy flag, measure it with the flag overridden before concluding it
+loses*; and *a shallow A/B is not a verdict for a long-context workload*.
+
 ## 2026-09-21 (WIP, not a delivery change) — gfx1201 port, session 32: the routed MoE path is a loss on RDNA4
 
 `s12` of `wip/mmb-general/gfx1201-porting.md`.  **Experimental WIP, not part of the delivered patch

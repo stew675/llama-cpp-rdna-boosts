@@ -1995,10 +1995,10 @@ index 1b9e63516..390fc7a47 100644
  
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
 new file mode 100644
-index 000000000..8083bce57
+index 000000000..899a2416b
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -0,0 +1,2033 @@
+@@ -0,0 +1,2051 @@
 +#include "mmb.cuh"
 +#include "unary.cuh"
 +#include <unordered_map>
@@ -3241,6 +3241,15 @@ index 000000000..8083bce57
 +        // (it now measures -1.4 %), see gfx1201-s10-dense-geometry.md §6.  The sub-knobs below
 +        // (glu/iq3xxs_glu/routed_thresh) are therefore inert on RDNA4.
 +        c.routed = 0;
++        // S13: the F32 split tile had been gated behind mmb_dense_flag() (S7 bundled them), which is
++        // off on RDNA4 -- so it never ran.  It should: measured against the delivery at each depth it
++        // is -0.3 % at pp8192, +0.9 % at pp32768, +1.00 % at pp65536 and +1.22 % at pp98304 on
++        // Flash-Next IQ4_XS (interleaved r=3), i.e. it costs a fraction of a percent at the start and
++        // pays >1 % once the context is deep -- which is where the time actually goes.  The tiny-M
++        // kernel (below) is the bigger win but flatter.  See the f32w comment and
++        // wip/mmb-general/gfx1201-s13-f32-hc16.md.
++        c.f32split_mode = 1;
++        c.tiny_m       = 1;
 +    }
 +    // TODO(S12): the routed/GLU thresholds, `tall_mode`, `tiny_m*`, `f32split_*` and `cache_max` are
 +    // still the gfx1151 values on every arch.  Give RDNA4 its own once they are measured per arch.
@@ -3639,15 +3648,24 @@ index 000000000..8083bce57
 +    // keeps its path.
 +    const bool quant   = mmb_wtype_ok_glu(src0->type) && (mmb_dense_type_ok(src0->type) || mmb_tall_shape(src0->type, K, M, T));
 +    const bool bf16w   = src0->type == GGML_TYPE_BF16 && mmb_bf16w() && mmb_dense_flag();
-+    const bool f32cand = src0->type == GGML_TYPE_F32 && mmb_f32split();
++    const bool f32cand = src0->type == GGML_TYPE_F32;
 +    if (!quant && !bf16w && !f32cand) return false;
 +    // shape-aware F32 (mode 1, default): take only the shapes where MMB beat rocBLAS (see the
 +    // F32SPLIT comment above).  Mode 2 forces every F32 GEMM here; mode 0 never gets this far.
-+    // The split *tile* is the generic MoE-router GEMM and follows mmb_dense_flag() (it loses on
-+    // RDNA4 like the other dense GEMMs); the warp-per-token tiny-M kernel is the qwen4exp HC inject
-+    // pair, a model-specific path, and stays allowed.
++    // S13: the two F32 paths are INDEPENDENT policies.  `mmb_f32split_mode()` governs only the split
++    // *tile* and `mmb_tiny_m_f32_ok()` only the tiny-M warp-per-token kernel -- they used to share
++    // one predicate, so turning the split off silently killed the tiny-M kernel too (and S7 had
++    // gated the split behind mmb_dense_flag(), which is off on RDNA4, so neither ran there).
++    //
++    // On RDNA4 the two carry different amounts and scale differently with depth (Flash-Next IQ4_XS,
++    // 3-GPU tensor, interleaved r=3, vs the delivery):
++    //     tiny-M kernel   +4.5 % pp8192 .. +5.2 % pp32768, flat to depth
++    //     split tile      -0.3 % pp8192, +0.9 % pp32768, +1.00 % pp65536, +1.22 % pp98304
++    // so BOTH stay on.  On gfx1151 it was the other way round (the M=512 router won 2.4x on the split
++    // tile and the hc inject pair was worse on the tiny-M kernel -- see the F32SPLIT comment above);
++    // that is why these are per-arch defaults now.
 +    const bool f32w = f32cand && (mmb_tiny_m_f32_ok(K, M) ||
-+                       (mmb_dense_flag() && (mmb_f32split_mode() >= 2 || (M >= mmb_f32split_min_m() && K >= mmb_f32split_min_k()))));
++                       (mmb_f32split() && (mmb_f32split_mode() >= 2 || (M >= mmb_f32split_min_m() && K >= mmb_f32split_min_k()))));
 +    if (f32cand && !f32w) return false;   // this F32 shape is better on rocBLAS -- no fusion stand-down either
 +    if ((f32cand ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
 +    if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS) && K % 256 != 0) return false;   // whole 256-value super-blocks
