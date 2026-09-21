@@ -1,5 +1,45 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-21 (WIP, not a delivery change) — beta set waiting on gfx1151; next campaign starts there
+
+**No delivery change.**  State of play after the promotion, recorded so the next session does not have
+to reconstruct it:
+
+**The `beta/mmb-general` set is waiting on the gfx1151 box** for its final re-validation
+(`beta/mmb-general/BETA-TESTING.md`).  The campaign was developed and tuned on gfx1151, then ported to
+gfx1201 and gfx1100; that combination has never been re-run on gfx1151.  The branch to take over is
+**`beta/mmb-general`** (pushed; also `main` @ `3f2eaf8`), 12 patches, applied tree
+`bca69f23dd29acef2d8898c6fd492104e078eef1`.
+
+**The next campaign starts on the gfx1151 machine**, and will then be ported to this box.  The
+maintainer's read is that it is **largely architecture independent** — i.e. generic kernel/graph work
+of the same class as G5 (the indexer top-k) and G4 (the non-temporal hints), which needed no
+fragment-layout work and were pure apply-and-gate ports.  The target is a **+10-20 % qwen4exp
+speedup** (Qwen3.8-Flash-Next), which makes the gfx1201 qwen4exp baseline the one that matters for the
+port:
+
+| gfx1201 qwen4exp reference (3-GPU tensor, q8_0 KV, `-b/-ub 2048`) | t/s |
+|---|---:|
+| delivery (r12) pp32768 / pp65536 / pp98304 | 2372 / 2213 / 2073 |
+| **beta set (12 patches) pp32768 / pp65536 / pp98304** | **2897 / 2713 / 2557** |
+| the same, decomposed: mmb alone | +6.0-6.5 % |
+| the same, decomposed: arch-neutral groups (G5/G4/G3a) + qsa3 | +14.4-16.3 % |
+
+So a +10-20 % qwen4exp claim on gfx1151 should land as roughly **+10-20 % on top of 2897/2713/2557**
+here, and the acceptance/width/PPL gates are the ones that protect it (`beta/mmb-general/BETA-TESTING.md`
+§2, and `gfx1201-s14-gates.md` for the full B1-B9 runbook).
+
+**Instrumentation preserved rather than re-derived.**  The campaign's A/B harness had been rebuilt from
+scratch several times and lives in `/tmp` each time; it is now in **`beta/mmb-general/tools/`**:
+`ab-interleaved.sh` (interleaved delivery-vs-WIP benchmark with a per-test mean and the delivery's own
+spread) and `lbparse.py` (llama-bench **and** `test-backend-ops` output).  The parser deliberately
+encodes the two traps that cost time this campaign — llama-bench's `tg128 @ d16384` test naming, and
+the rule that `test-backend-ops` must never be counted from a `2>&1`-merged log (ANSI-wrapped status +
+stdout/stderr interleaving orphans it; the `--ops` mode pairs a status with its preceding name and so
+returns a stable `5953/5954 OK, 0 FAIL` from a merged *or* separated capture).  Both were tested
+against the real logs before being committed; the tools README states the depth/verdict rule
+(prefer pp32768+, the shallow end is clock-ramped, never run two benches at once).
+
 ## 2026-09-21 (WIP, not a delivery change) — `wip/mmb-general` promoted to `beta/mmb-general`
 
 **No delivery change.**  The `mmb-general` campaign left `wip/` and entered its beta window: the

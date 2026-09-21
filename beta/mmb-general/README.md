@@ -25,6 +25,15 @@ gfx1201 = fully validated (B1–B9 green, MTP included — [`gfx1201-s14-gates.m
 gfx1100 = validated to pp32768 on a single 24 GB card, qwen4exp items trust-RDNA3_5
 ([`gfx1100-porting.md`](gfx1100-porting.md)).
 
+**What is next (recorded 2026-09-21).**  (1) The **gfx1151 re-validation** of *this* set via
+[`BETA-TESTING.md`](BETA-TESTING.md).  (2) A **new campaign that starts on the gfx1151 box** and will
+then be ported to gfx1201; it is expected to be **largely architecture independent** (the same class as
+G5/G4 — generic kernels/graph work, no fragment-layout porting) and is aimed at a **+10–20 % qwen4exp
+speedup**.  Because it is arch-independent, the port is an apply-and-gate job: the gfx1201 qwen4exp
+baseline to beat is **2897 / 2713 / 2557 t/s** at pp32768/65536/98304 (3-GPU tensor, q8_0 KV,
+`-b/-ub 2048`), and the runbook is [`gfx1201-s14-gates.md`](gfx1201-s14-gates.md).  Use the preserved
+harness in [`tools/`](tools/README.md) — `ab-interleaved.sh` + `lbparse.py`.
+
 ---
 
 ## Campaign record (as written while in `wip/`)
