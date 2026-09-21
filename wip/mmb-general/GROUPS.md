@@ -5,6 +5,11 @@ one per theme, applied in order on top of the r12 delivery tree).  This is the t
 reviewer (or an agent) on **another architecture**: what each group is, which parts are gated, what is
 expected to apply on gfx1100 / gfx1201, and how to prove it.
 
+> **Porting to gfx1201 / gfx1100?  Read [`gfx1201-porting.md`](gfx1201-porting.md) first.**  It is the
+> multi-session porting overlay: it re-examines (and partly supersedes) the "RDNA4 is a no-op / new
+> work" framing below, gives the exact gfx11-vs-gfx12 WMMA fragment mapping, the per-group gfx1201
+> assessment and gate plan, and the session breakdown.  The group *semantics* below are unchanged.
+
 The consolidation is **content-preserving**: the 5-patch result has the **tree
 `d365b43ddc87c472c33a121247931269f975aa43`**, byte-identical to the 38-commit tip it replaced
 (`git am` 5/5 verified on a fresh r12 tree).  If a group is dropped, the remaining tree is simply the
