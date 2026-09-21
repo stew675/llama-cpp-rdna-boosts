@@ -81,8 +81,14 @@ The body pinned `f5daaa3cf` (2026-09-12). The branch tip is **`b0f31f587`** (202
 6. **MTP is not a missing optimisation in pwilkin's favour — it is a different axis.** He has upstream
    `draft-mtp` with a **fixed** `n_max` and only upstream's per-step `p_min`/`n_min` early stop; there
    is **no** cross-round adaptive controller in his tree. Our `draft-mtp-adaptive` controller is a
-   depth-policy advantage that composes with his per-step decode gains. Qualify it per §12 before
-   treating any of his MTP numbers as a gap.
+   depth-policy advantage that composes with his per-step decode gains. **Measured 2026-09-21** (see
+   [`2026-09-21-mtp-qualification.md`](2026-09-21-mtp-qualification.md) and §12): our plain decode is
+   ahead (+2–6 %), the fixed-depth MTP **speedup is at parity** (ours `n3` 1.90/1.78/2.05 vs his
+   1.91/1.79/2.02 on code/prose/recall), and our adaptive wins recall (2.40x) but over-drafts code and
+   prose on qwen4exp — a tuning item, not a structural one.  The one real MTP gap is
+   **`nextn_shared_target_tensors` support**: our build cannot load the shared MTP sidecar his IQ4_NL
+   model ships (every draft position past the first fails an M-RoPE `X < Y` check), so we fell back to
+   the `Q4_K_M` sidecar for the comparison.
 
 ### D. Body §6/§9 caveat
 
@@ -96,6 +102,15 @@ Applied and built on **gfx1151** on 2026-09-21 for the beta re-validation window
 (`beta/mmb-general/BETA-TESTING.md`). Build: `~/bin/build-llama-rocm-714` from the `mmb-beta` branch of
 `~/llama.cpp` (r12 + 12 patches, tree `bca69f23dd…`). The gfx1151 numbers in the body were measured on
 the pre-beta WIP; the beta re-run is what confirms they still hold.
+
+### F. Priority sequence (maintainer, 2026-09-21)
+
+**Recall speed + correctness → decode speed + correctness → MTP tuning + correctness.**  The MTP
+qualification is therefore **done to "is our MTP behind his?" depth only** and parked; its result and
+the one real MTP gap are in [`2026-09-21-mtp-qualification.md`](2026-09-21-mtp-qualification.md) and
+§12 below.  The headline: our plain decode is ahead, the fixed-depth MTP **speedup** is at parity, and
+the only MTP gap is **`nextn_shared_target_tensors` support** (we cannot load the shared MTP head
+pwilkin's own IQ4_NL model ships).  The body's prefill items 1–8 are the "recall" phase.
 
 ---
 
@@ -504,6 +519,25 @@ This is the MTP half of the gap analysis, added because pwilkin's newer commits 
 and it is easy to read his MTP t/s as a gap. It is **not** the same axis as our advantage, and the
 qualification below is what the 2026-09-21 plan asks for before either side is claimed.
 
+### 12.0 Result (measured 2026-09-21 — see [`2026-09-21-mtp-qualification.md`](2026-09-21-mtp-qualification.md))
+
+Two findings, and one correction to the premise:
+
+* **Our plain decode is ahead** of his on qwen4exp IQ4_NL (code 32.4 vs 31.1, prose 31.8 vs 29.9,
+  recall 32.4 vs 31.9 t/s).  Absolute MTP t/s therefore flatters his stack; the fair metric is the
+  **speedup over each tree's own plain decode**.
+* **At fixed depth the MTP speedup is at parity** — ours `n3` **1.90x / 1.78x / 2.05x** vs his fixed
+  **1.91x / 1.79x / 2.02x** (code / prose / recall).  He did **not** adopt our controller
+  (`common/speculative-adaptive.h` is absent from his tree) and he is not ahead.
+* **Our adaptive controller is mixed on qwen4exp** — the opposite of the 27B dense record.  It wins
+  **recall** (2.34–2.40x) but over-drafts code and prose at `n_max 9..12` (code `adaptive 12`
+  per-position acceptance falls 0.94 → 0.45 → 0.22 → 0.07); `adaptive 7` already beats `n3` on code
+  (63.1 vs 61.4 t/s).  So the qwen4exp adaptive **ceiling is a tuning item**, not a structural gap.
+* **The one real MTP gap is correctness/compat, not speed: `nextn_shared_target_tensors`.**  The sidecar
+  pwilkin's IQ4_NL model ships is a *shared* MTP head; our build fails every draft position past the
+  first on an M-RoPE `X < Y` check, so the head cannot be used at all.  The comparison above used the
+  non-shared `Q4_K_M` sidecar, which both trees run clean.
+
 ### 12.1 Structural standing
 
 | | pwilkin (`b0f31f587`) | ours (r12 + `beta/mmb-general`) |
@@ -572,46 +606,70 @@ lower. Decompose, do not compare totals:
   this prices the sparse-decode + incremental-indexer gap in milliseconds per step;
 * only the residual neither term explains is a genuine MTP gap.
 
-### 12.5 Expected result and the plan it implies
+### 12.5 Conclusion and the plan it implies
 
-Ours should lead on acceptance/throughput at depth (the controller) and trail by a roughly constant
-factor per step (his decode kernels). If that is what the A/B shows: keep `draft-mtp-adaptive` as the
-delivery's depth policy unchanged, and fold pwilkin's decode path in as **item 9** (sparse selected-cell
-decode + incremental indexer) so the per-step constant is repaid without touching the controller. The
-one case that changes the plan is the first falsifier — an adaptive ≤ fixed result on qwen4exp — which
-would make the qwen4exp depth policy itself the item.
+Measured, not predicted: our fixed-depth MTP is at parity with his, our plain decode is ahead, and our
+adaptive controller is a clear win on recall and a tuning problem on code/prose for this model.  The
+plan is therefore:
+
+* **do not** treat his MTP as a speed gap;
+* fold pwilkin's per-step decode path in as **item 9** (sparse selected-cell decode + incremental
+  indexer) — that is the term his absolute numbers get for free;
+* add **`nextn_shared_target_tensors` support** as a correctness/compat item (it gates his own model's
+  MTP head);
+* park the qwen4exp adaptive **ceiling sweep** (3/5/7/9/12) until the MTP phase, per the maintainer's
+  priority sequence.
 
 ### 12.6 What NOT to conclude
 
 * **Do not** read his 39.10 t/s as "our adaptive MTP is 39 t/s behind" — he is measuring a fixed-depth
   stack plus his decode kernels on a different tree.
+* **Do not** compare absolute MTP t/s without each build's own plain decode next to it.
 * **Do not** compare at `-n 256`: our controller's warm-up transient inverts the ranking there.
 * **Do not** use `none == draft-mtp` byte purity above `n_max 7` as the MTP gate; use acceptance and
   MTP-vs-plain throughput (rule 4).
 
 ---
 
-## 13. Revised action plan (2026-09-21)
+## 13. Revised action plan — phased (2026-09-21)
 
-The 2026-09-20 §10 order was: (1) HC combine_norm/gate-mix, (2) depthwise conv1d, (3) `-ub 16384`
-context bug, (4) norm-gated + idx-relu-sum, (5) MoE bf16 epilogue, (6) qsa3_attn body, (7) tall tile,
-(8) QSA graph flags. **Revised:**
+**Maintainer's priority sequence (2026-09-21): recall speed + correctness → decode speed + correctness
+→ MTP tuning + correctness.**  The 2026-09-20 §10 order was: (1) HC combine_norm/gate-mix, (2) depthwise
+conv1d, (3) `-ub 16384` context bug, (4) norm-gated + idx-relu-sum, (5) MoE bf16 epilogue, (6) qsa3_attn
+body, (7) tall tile, (8) QSA graph flags; items 1–9 survive, regrouped below.
+
+### Phase 1 — recall (long-context prefill/attention) speed + correctness
 
 | # | action | expected | effort | note |
 |---|---|---|---|---|
 | 1 | Make `hc_combine_norm` fire (debug the matcher) and **wire the existing `hc_gate_mix_kernel`** | large — `HC_*` ablation **−19.5 %** | 2–4 d | kernel already in beta; this is the call site + matcher, not a port |
 | 2 | Port `gdn-conv.cu` + `ple-conv.cu` + matches (now incl. **F32 PLE**) | **−10.5 %** | 2–3 d | pwilkin's `40a9f4d01` made the PLE half F32-aware |
 | 3 | Fix the `n_batch==n_ubatch==n_ctx` context creation | unlocks `-ub 16384` | 0.5–2 d | pre-existing delivery bug |
-| 3.5 | **Port the three correctness fixes** (`40c0b9c38`, `b0f31f587`, `14fff4f97`) | prevents long-session corruption | 0.5–1 d | cheap; independent of perf |
+| 3.5 | **Port the three correctness fixes** (`40c0b9c38`, `b0f31f587`, `14fff4f97`) | prevents long-session corruption | 0.5–1 d | cheap; includes the QSA decode non-determinism fix |
 | 4 | Port `norm-gated.cu` (`rms_rows`) + `idx-relu-sum.cu` | −2.9 % / −1.3 % | 1–2 d | |
 | 5 | MoE: bf16 epilogue + drop `concat_transposed` | ~+466 ms kernel (~3–4 %) | 1–2 d | beta has `MMB_DOWN16` gated off; wire it + the bf16 reduction |
 | 6 | Tune/port-align `qsa3_attn` body vs `qsa.cu` | ~+195 ms (~1.5 %) | 1–2 d | re-profile `b0f31f587` first |
 | 7 | Investigate the tall `384x64` 2× launch count | unknown (part of +809) | 0.5–1 d | |
 | 8 | Audit the 9 QSA graph-side flags vs block-14/15 | small / likely redundant | 0.5 d | |
-| **9** | **MTP/decode: port sparse QSA decode + incremental indexer state (`d67d58836`)** | **+11–20 % MTP decode** | 2–4 d | orthogonal to prefill; audit vs our derived cache first |
-| **10** | **MMB quant coverage: Q4_0/Q4_1/Q5_0/Q2_K/IQ1/IQ2/MXFP4/NVFP4** | completeness | 1–2 d | low priority for the delivery's models |
-| **11** | **Run the §12 MTP qualification (adaptive vs fixed, qwen4exp, 4 axes + long prompt)** | settles the MTP question | 0.5 d | run before or with item 9 |
 
-Items 1+2 remain ~30 % of end-to-end prefill on pwilkin's own ablations. Item 11 is cheap and guards
-against building item 9 on the wrong premise.
+Items 1+2 remain ~30 % of end-to-end prefill on pwilkin's own ablations.
+
+### Phase 2 — decode speed + correctness
+
+| # | action | expected | effort | note |
+|---|---|---|---|---|
+| 9 | **Port sparse QSA decode + incremental indexer state (`d67d58836`)** | **+11–20 % MTP/decode** | 2–4 d | this is the per-step term his absolute numbers get for free; audit vs our `GGML_CUDA_QSA_INDEXER_CACHE` (default on) first |
+| 10 | MMB quant coverage: Q4_0/Q4_1/Q5_0/Q2_K/IQ1/IQ2/MXFP4/NVFP4 | completeness | 1–2 d | low priority for the delivery's models |
+
+Our **plain decode is already ahead** of his (+2–6 % on qwen4exp, §12), so item 9 is a *hold/repay*
+item, not a catch-up.
+
+### Phase 3 — MTP tuning + correctness
+
+| # | action | expected | effort | note |
+|---|---|---|---|---|
+| 12 | **`nextn_shared_target_tensors` support** | gates pwilkin's own IQ4_NL MTP head | 1–2 d | our build fails every draft position past the first (M-RoPE `X < Y`); see §12.0 |
+| 11 | qwen4exp adaptive **ceiling sweep** (3/5/7/9/12) + a long-prompt run | recovers the recall win without over-drafting code/prose | 0.5–1 d | `adaptive 7` already beats `n3` on code; the 27B result does not transfer at `n_max 12` |
+
+Item 11/12 are parked until Phase 1–2 land, per the maintainer's sequence.
 
