@@ -5,9 +5,11 @@ multi-session porting overlay for **gfx1100**.  It mirrors `gfx1201-porting.md` 
 and re-examines the prior "gfx1100 needs an RDNA3_0 pass / MMB is untested there" decisions in the
 light of the substantial delivery + WIP changes since they were written — see **§2**.
 
-> **HANDING THIS FILE TO A NEW SESSION?  Read §13 first** — it is the brief for the next unit of
-> work (the session breakdown is §8).  This file is the *plan and record convention*; the raw numbers
-> from each session go into a dated results file (`gfx1100-sNN-results.md`), not in here.
+> **HANDING THIS FILE TO A NEW SESSION?  Read §14 first if the task is the rebase/merge onto the
+> updated `wip-mmb-general`** (the gfx1201 branch moved on — see §14 for the exact conflict map).
+> Otherwise **§13** is the brief for the S1-style porting work.  The session breakdown is §8.  This
+> file is the *plan and record convention*; the raw numbers from each session go into a dated results
+> file (`gfx1100-sNN-results.md`), not in here.
 
 **Audience:** whoever picks this up next, with **no prior context**.  Read this with `GROUPS.md` (the
 6-patch triage), `gfx1201-porting.md` (the RDNA4 port this is the sibling of) and `HANDOVER.md` (the
@@ -707,3 +709,146 @@ claim* is deferred.
 
 **Do not** default `mmb` on, do not edit the delivery patches from this branch, and do not push
 `~/llama-wip-gfx1100` anywhere.
+
+---
+
+## 14. Rebasing `wip-mmb-general-gfx1100` onto the updated `wip-mmb-general`
+
+The gfx1201 branch has moved on (S10-S14).  The maintainer's plan is: **this gfx1100 branch is
+rebased onto `wip-mmb-general` here, pushed, and then the gfx1201 system performs the merge of
+`wip-mmb-general-gfx1100` back into `wip-mmb-general`.**  This section is the complete brief for
+the rebase session — the work is small but has one real conflict (the code overlay's F32 patch).
+
+### 14.1 State when this was written (2026-09-21)
+
+| ref | tip | what |
+|---|---|---|
+| `wip-mmb-general` | `c79d48f` | the gfx1201 branch, now **10 patches** (S10-S14) |
+| `wip-mmb-general-gfx1100` | `c5c313d` | this branch (7 commits) |
+| merge base | `1f2c92d` | the old gfx1201 tip (6 patches) our branch was cut from |
+
+**What changed on `wip-mmb-general` since the merge base** (6 commits, all in
+`wip/mmb-general/**`): the four new patches **`0007`-`0010`**, which all touch
+`ggml/src/ggml-cuda/mmb.cu`:
+
+| patch | session | what |
+|---|---|---|
+| `0007` | S10 | RDNA4 dense tile geometry `256x128` + the per-type dense policy (`mmb_dense_type_ok`/`mmb_dense_tmask`) |
+| `0008` | S11 | **`mmb_arch_cfg` + `mmb_arch_defaults(cc)`** — every `mmb_*` tunable is now `env || per-arch default`; `GGML_CUDA_MMB_CFG=1` dumps the resolved config |
+| `0009` | S12 | per-arch `routed` field (`mmb_routed_flag()`), default **off on RDNA4** (routed is a loss there) |
+| `0010` | S13 | the two F32 policies split: tiny-M (`mmb_tiny_m_f32_ok()`) vs the split tile (`mmb_f32split*`); `f32split_mode` moved to the arch defaults |
+
+Plus doc churn (`GROUPS.md`, `README.md`, `gfx1201-porting.md`, new `gfx1201-s10..s13-*.md`,
+`WORKLOG.md`, `commits.txt`, `mmb-general.patch`) and `From`/series-count-only edits to the six
+canonical patches.  **No change to `fattn-qsa3.cu` or `mmvq.cu`.**
+
+### 14.2 Record-branch rebase (docs)
+
+```sh
+cd /home/stew675/llama-cpp-rdna-boosts
+git fetch origin
+git checkout wip-mmb-general && git merge --ff-only origin/wip-mmb-general
+git checkout wip-mmb-general-gfx1100
+git rebase --onto wip-mmb-general 1f2c92d wip-mmb-general-gfx1100
+```
+
+The **only expected conflict is `wip/mmb-general/GROUPS.md`** (both branches edited it): gfx1201
+rewrote the tables/§s, and this branch added a `> **Porting to gfx1100?  Read
+[`gfx1100-porting.md`]...**` pointer at the top of the *gfx1100 job* section.  Resolve by keeping the
+gfx1201 content and re-inserting that pointer (and, if gfx1201 restructured the section, adapt the
+pointer's position — the content is one blockquote).  Every `gfx1100-*.md`, `gfx1100/README.md` and
+`gfx1100/patches/*` is unique to this branch: no other conflicts.  After the rebase the results
+files are unchanged and still valid.
+
+### 14.3 Code-overlay rebase (verified conflict map)
+
+The overlay was generated against the old 6-patch tree, so it must be re-applied to the new
+**10-patch** tree.  This was tested empirically (scratch tree = r12 + the 6 canonical + the 4 new
+patches `0007`-`0010`), then each overlay patch `git apply --check`ed:
+
+| overlay | touches | result on the 10-patch tree |
+|---|---|---|
+| `0007` qsa3 RDNA3_0 | `fattn-qsa3.cu` | **applies clean** (the predicate context `RDNA3_5 || RDNA4` is unchanged) |
+| `0009` mmvq nwarps (default-off) | `mmvq.cu` | **applies clean** (S10-S13 never touch `mmvq.cu`) |
+| `0008` F32 split | `mmb.cu` | **CONFLICTS** at `ggml/src/ggml-cuda/mmb.cu:1305` (the one-line `mmb_f32split_mode()` it edited was replaced by the S11 per-arch accessor) |
+
+So `0007` and `0009` are applied as-is; **`0008` must be rewritten**.  The gfx1201 S13 already put
+the split tile behind `mmb_f32split_mode()`/`mmb_cfg().f32split_mode` — so the correct gfx1100
+expression is a new **`RDNA3_0` arm in `mmb_arch_defaults(cc)`**, not an edit to the accessor.
+
+### 14.4 The `0008` rewrite (exact edit)
+
+In `mmb_arch_defaults()` (after the `GGML_CUDA_CC_IS_RDNA4(cc)` block), add:
+
+```cpp
+    if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+        // gfx1100 S6/S7: the F32 MoE-router split TILE is a loss here (gemma-26B-A4B -3.1 %,
+        // 35B-A3B -3.0 % at pp8192 and -2.4 % at pp32768), unlike RDNA4 where it wins at depth.
+        // Disable the split tile on RDNA3_0; the tiny-M kernel is qwen4exp-only on gfx1100 and
+        // keeps its default.  NOTE: gfx1100 was only measured to pp32768 -- re-check pp65536+
+        // before finalising (see 14.5).
+        c.f32split_mode = 0;
+    }
+```
+
+RDNA3_5 keeps the struct default `f32split_mode = 1` and RDNA4 keeps S13's `= 1`; only RDNA3_0
+becomes 0.  (The old `0008` comment about `mmb_dense_flag()` is obsolete — S13 decoupled the split
+from the dense flag, and S10 replaced the dense predicate with `mmb_dense_type_ok()`.  RDNA3_0 still
+gets the full dense/routed type set via `mmb_dense_flag()`/`mmb_routed_flag()`, which are unchanged
+for non-RDNA4.)  Verify with the S11 dump: `GGML_CUDA_MMB=1 GGML_CUDA_MMB_RDNA3=1
+GGML_CUDA_MMB_CFG=1 <bin> …` must print **`f32split=0`** on gfx1100.
+
+After rewriting, re-export the overlay:
+
+```sh
+cd ~/llama-wip-gfx1100   # rebased by this point
+git format-patch <new-10-patch-tip>..HEAD --start-number 11 -o /tmp/gfx1100-overlay   # 0011/0012/0013
+# copy into wip/mmb-general/gfx1100/patches/ on this record branch, update gfx1100/README.md
+```
+
+(The canonical `patches/0001-0010`, `mmb-general.patch` and `commits.txt` are the **gfx1201 system's**
+to regenerate after it merges this branch back — do not rewrite them here.)
+
+### 14.5 Re-validation required after the rebase (the gfx1100 side)
+
+The gfx1201 `mmb.cu` is a substantial rework of the file our MMB patch touches, so the gfx1100 MMB
+numbers must be re-confirmed on the rebased tree, not assumed:
+
+1. **Build green for gfx1100** (`~/llama-wip-gfx1100`, `~/bin/build-llama-rocm-714`).
+2. `test-backend-ops -o FLASH_ATTN_QSA` → **26/26** (qsa3 now exercises the WMMA path on gfx1100).
+3. **MMB parity**: PPL (27B 10.0174, 35B 14.8302) and width purity PASS on all four models with
+   `GGML_CUDA_MMB=1 GGML_CUDA_MMB_RDNA3=1`; same-seed greedy re-baselines (a different GEMM), as
+   recorded in `gfx1100-s5s7-results.md`.
+4. **Re-run the S5-S7 headline** (27B Q4_K_M +14 %, gemma-12B Q8_0 +11 %, 35B-A3B +5.6 %/+4.7 %,
+   gemma-26B neutral) — the S10 dense-geometry rework is RDNA4-only, but confirm it did not disturb
+   the gfx1100 dense tile or the routed policy.
+5. **`GGML_CUDA_MMVQ_RDNA3_SMALL_M` must stay default 0** (patch `0009`); re-run its width probe with
+   a positive value is **not** needed — it is known impure (see `gfx1100-s9-nwarps-results.md`).
+6. **Open tuning question**: S13 measured RDNA4's F32 split tile as **winning at depth** (+1 % at
+   64k+).  gfx1100 was only measured to pp32768 (where off won by ~2.4 %).  **Re-measure the split
+   tile at pp65536/pp98304 on gfx1100** before finalising `f32split_mode = 0` for RDNA3_0 — if it
+   also flips to a win at depth, set RDNA3_0 to 1 (or a depth rule) and record it.
+7. Re-run the S9 re-examination spot checks that the rework could touch: the `mmvq` table is
+   untouched by S10-S13, and the FA head cap is untouched, so items §2.3/§2.4/§2.5 should be
+   unchanged — but a `FLASH_ATTN_EXT` + width-probe smoke is cheap insurance.
+
+### 14.6 Environment reminders (unchanged)
+
+* `HIP_VISIBLE_DEVICES=0` on **every** GPU command (the box exposes a gfx1036 iGPU that aborts
+  multi-device tools).
+* `llama-cli` always `--single-turn` (`--no-display-prompt` for scripts); extract text with
+  `scripts/extract-generated.py`.
+* The gfx1100 overlay tree/apply facts: 6 canonical patches → tree
+  `580db5174574f10cc92fb1cefa72281a65c77b12`; + overlay `0007`/`0008`/`0009` → tree
+  `2c89ce7219a993fa9c43c767f99b1e384db59656` (pre-rebase).  After the rebase the canonical tree is the
+  new 10-patch tree and the overlay is renumbered (`0011`+).
+
+### 14.7 Definition of done for the rebase session
+
+- [ ] `wip-mmb-general` fast-forwarded locally; `wip-mmb-general-gfx1100` rebased onto it (GROUPS.md
+      resolved); branch pushed.
+- [ ] `0007` + `0009` re-applied clean; `0008` rewritten as the `RDNA3_0` arm in `mmb_arch_defaults`
+      and re-exported as `0011`/`0012`/`0013` in `wip/mmb-general/gfx1100/patches/`.
+- [ ] Overlay `git am` N/N on the new canonical tree; applied tree recorded in `gfx1100/README.md`.
+- [ ] §14.5 gates run; the F32-depth question (14.5.6) either closed or explicitly left open.
+- [ ] This is the branch the gfx1201 system then merges into `wip-mmb-general`.

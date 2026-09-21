@@ -1,5 +1,10 @@
 # gfx1100 patch overlay
 
+> **Rebasing onto the updated `wip-mmb-general` (S10-S14, 10 patches)?**  Read
+> [`../gfx1100-porting.md`](../gfx1100-porting.md) **§14** — it has the verified conflict map and the
+> exact `0008` rewrite (`0007`/`0009` apply clean; `0008` becomes an `RDNA3_0` arm in
+> `mmb_arch_defaults`).
+
 The gfx1100 work is a **WIP overlay on top of the canonical 6-patch `mmb-general` set**.  Keep it
 separate so the record branch can be rebased/merged back into `wip-mmb-general` cleanly.
 
