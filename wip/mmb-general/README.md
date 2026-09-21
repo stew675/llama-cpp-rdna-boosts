@@ -282,6 +282,12 @@ wherever MMB would lose, +3…+7 % where it wins**, and a qwen4exp user can opt 
 with `GGML_CUDA_MMB_DENSE=1`.  The open work is a **real gfx1201 dense tile geometry** — the current
 one is gfx1151-tuned and is where every RDNA4 loss lives.
 
+> **The remaining gfx1201 work is now scoped in `gfx1201-porting.md` §13 (S10-S15)** — read that
+together with `HANDOVER.md` when picking the WIP up: S10 the dense tile geometry (the headline win),
+S11 the arch-scoped `mmb_*` tuning constants, S12 the routed/GLU tuning with kernel-time evidence,
+S13 the F32/HC16 paths, S14 the B1-B9 matrix (**MTP has never been run on gfx1201**), S15 the freeze
+and hand-off.  S1-S7 are complete.
+
 ---
 
 ## UPDATE — session 25 (2026-09-20): the indexer gather's **warp-shuffle scan** (−11.7 % on the gather),

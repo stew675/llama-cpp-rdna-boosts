@@ -149,6 +149,10 @@ visible nondeterminism).  Now **1117 ms at pp32768 = 1.80 %** of the run, from 2
 The 5-patch set was applied to a 3× R9700 (gfx1201) box, built, and measured against the delivery.
 Full data: `gfx1201-s1s2-results.md`; plan: `gfx1201-porting.md`.
 
+> **The remaining gfx1201 work is scoped in `gfx1201-porting.md` §13 (S10-S15)** — the dense tile
+> geometry, the arch-scoped `mmb_*` tuning constants, the routed/GLU tuning, the F32/HC16 paths, and
+> the B1-B9 gate matrix (incl. MTP).  Hand that file to the next gfx1201 session.
+
 | group | gfx1201 verdict | action |
 |---|---|---|
 | **G5 indexer** | **win**, grows with depth: +2.1 % pp8192 → **+8.0 % pp98304** | keep, always-on |

@@ -5,6 +5,11 @@ supersedes the "gfx1201 is a no-op / new work, not a port" notes in `GROUPS.md` 
 (see §2 — those notes were written before the RDNA4 WMMA layout had an in-repo reference and
 before the delivery's gfx1201 MMQ path was re-tuned).
 
+> **HANDING THIS FILE TO A NEW SESSION?  Read §13 first** — it is the brief for the remaining
+gfx1201 work (S10-S15): the **dense tile geometry**, the arch-scoped tuning constants, the routed
+GLU tuning, the F32/HC16 paths, and the B1-B9 gate matrix (*including MTP, which has never run on
+this box*).  S1-S7 below are done and are history; §13 is the live work.
+
 **Session 1-2 log (2026-09-21):** the WIP was applied to `~/llama.cpp` as branch `rdna-boosts-mmb-port`
 (`git am` **5/5**, clean) and **built green for gfx1201** with the delivery build script (`EXIT=0`,
 100%).  Baselines were recorded (B1/B2 same-seed hashes, B3-B5 prefill/decode, B6 op oracles, B7 width
@@ -438,20 +443,32 @@ checklist updated.
 | **S6** | G1 on RDNA4 | gate enabled; first correctness run on the fast model | PPL parity 14.3981 vs 14.4087 (+0.07 %), MMB demonstrably running |
 | **S7** | G1 re-tune + target | measured the matrix; **split the switch** (arch-scoped weight types + path policy) | neutral where it loses, +3…+7 % where it wins; PPL parity on the active subset |
 | **S8** | G3b/c + HC16 + gates | F32/tiny-M/HC16; B1-B9 full matrix | all gates green; gating documented |
-| **S8** | G3b/c + HC16 + gates | F32/tiny-M/HC16; B1-B9 full matrix | all gates green; gating documented |
 | **S9** | handover to gfx1100 | update §10/§11; commit record | gfx1100 TODO list complete |
+| **S10** | **gfx1201 dense tile geometry** | a runtime geometry selector + a per-type sweep | the dense tile ≥ MMQ for ≥ 1 type, interleaved + kernel-time backed |
+| **S11** | arch-scoped tuning constants | `mmb_arch_defaults(cc)` for every `mmb_*` tunable | gfx1151 unchanged; RDNA4 defaults in one table |
+| **S12** | routed/GLU tuning + kernel time | threshold sweeps; `DBUF`; the IQ3_XXS GLU arm | the routed win ≥ S7 with kernel-time evidence |
+| **S13** | G3b/c F32/tiny-M + G4 HC16 | isolate and A/B each knob | measured, purity-checked, defaulted |
+| **S14** | B1-B9 on the final tree | re-run B1-B7; B8 long-context PPL; **B9 MTP** | every gate green with numbers recorded |
+| **S15** | freeze + regenerate + hand off | land the policy, update the docs, `git am` N/N | gfx1100 handed a clean state |
+
+> **S8/S9 as originally written are superseded**: their content is now S13 (G3b/c + HC16), S14 (the
+> B1-B9 matrix) and S15 (the handoff).  S1-S7 are DONE and S10-S15 are the live work — see **§13**,
+> which is the brief to hand to the next session.
 
 **S1+S2 status (2026-09-21): DONE.**  B1/B2 identical to the delivery; B6 oracles 2/2; B7 width purity
 PASS.  Deep sweep done (32k/64k/98k).  G5 and G4 verified as wins, the G3a gate is folded into the
 patch set, and the 5-patch backup was regenerated (tree `c0f8ea75ba`, `git am` 5/5 verified).  Detail:
 `gfx1201-s1s2-results.md`.  The delivered set is now suitable for both gfx1151 and gfx1201 for the
-arch-neutral items; the WMMA port (S4+) remains future work.
+arch-neutral items; the WMMA port was S4-S7 and is also done (see below).
 
 **S4 status (2026-09-21): DONE.**  `qsa3` runs on gfx1201 and is the second-biggest gfx1201 win
 (+7.6..+11.5 % prefill over the VEC kernel, same build).  The kernel now has its first unit-oracle
 coverage; the G3a gate is re-confirmed with qsa3 active; and the long-context text gate shows the WIP
 is byte-identical to the delivery with qsa3 off (G5/G4 pure) with the qsa3 delta being the approved
-re-baseline.  Detail: `gfx1201-s4-qsa3-results.md`.  G1 (`mmb`) is the remaining WMMA group.
+re-baseline.  Detail: `gfx1201-s4-qsa3-results.md`.  G1 (`mmb`) was then done in S5-S7 (`mmb` is
+ported but **scoped** — see `gfx1201-s5s7-mmb-results.md`).
+
+**S1-S7 are all DONE.  The live work is S10-S15 in §13.**
 
 If G1 measures **no win** on gfx1201 (the baseline is already strong), stop at S4- and record it:
 qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a gfx1100-only item.
@@ -492,8 +509,14 @@ qsa3 + indexer + non-temporal may still be the gfx1201 delta, and G1 becomes a g
 - [x] G1 RDNA4 correctness (fast model) (S6 — DONE: PPL parity +0.07 %)
 - [x] G1 RDNA4 re-tune + baseline-vs-MMB decision (S7 — DONE: **split the switch**; scoped default
       per `gfx1201-s5s7-mmb-results.md`; a per-type/gfx1201 dense tile geometry remains open)
-- [ ] G3b/c + HC16 + full gate matrix (S8)
-- [ ] gfx1100 handover written (§11) (S9)
+- [ ] G3b/c + HC16 + full gate matrix — **now S13/S14, see §13**
+- [ ] gfx1100 handover written — **now S15, see §13**
+- [ ] **gfx1201 dense tile geometry (S10)** — the headline remaining win
+- [ ] arch-scoped `mmb_*` tuning constants (S11)
+- [ ] routed/GLU tuning + kernel-time evidence (S12)
+- [ ] B1-B9 on the final tree, incl. **MTP** — never run on gfx1201 (S14)
+
+**§13 is the brief for the remaining work (S10-S15).**  Start there.
 
 **Patch layout (current): 6 patches, tree `580db5174…`** — 1 mmb, 2 qsa3, 3 F32/tiny-M +
 width-probe, 4 HC16, 5 indexer, 6 the `mmb` RDNA4 port + scope split.
@@ -520,19 +543,208 @@ gfx1100 (RDNA3_0) solves a **different** half of the same problem:
 
 ## 12. Risks / open questions
 
-1. **G1 value on gfx1201 is unknown.**  The delivery's gfx1201 MMQ is much better than gfx1151's was.
-   If MMB is a wash, keep it gfx1100-only and ship qsa3+indexer+NT on gfx1201.
-2. **The gfx12 bf16 `_gfx12` builtin operand type.**  MMB uses `short` vectors; GDN uses `__bf16`
-   vectors.  Both should lower to `<8 x i16>`; confirm at first compile (S5).  If `short` is
-   rejected, switch the shim to `__bf16` + a `bitcast`.
-3. **The qsa3 PV shuffle** (§6.4) is the highest-risk single transform; budget S4 for it and keep the
-   `FLASH_ATTN_QSA` oracle as the arbiter.
-4. **Re-tuning is a time sink.**  The gfx1151 record shows tile knobs are mostly flat once the
-   geometry is right; timebox the sweep and default to the gfx1151 constants until a shape is
-   measured worse.
+1. ~~**G1 value on gfx1201 is unknown.**~~  **ANSWERED (S7):** it is not a blanket win — see §13 and
+   `gfx1201-s5s7-mmb-results.md`.  The remaining question is the dense tile geometry (§13 S10).
+2. ~~**The gfx12 bf16 `_gfx12` builtin operand type.**~~  **ANSWERED (S5):** `short` vectors are
+   rejected by the `_gfx12` builtins; the shim uses `__bf16` / `_Float16` vector typedefs and
+   `__builtin_bit_cast` at the wrapper.  It compiles and is correct.
+3. ~~**The qsa3 PV shuffle.**~~  **ANSWERED (S4):** done and oracle-covered (§6.4,
+   `gfx1201-s4-qsa3-results.md`).  `FLASH_ATTN_QSA` is the arbiter — keep it 26/26.
+4. **Re-tuning is a time sink.**  Still true.  Timebox every sweep; only `r=5` interleaved rounds
+   decide anything (§13.0 protocol).
 5. **`rocprofiler-register` env-gate flakiness** (`GROUPS.md` §5): never trust a gated path under
-   `rocprofv3` without confirming the kernel name in the trace; `LLAMA_QSA3_ENABLE` was made
-   compile-time for this reason.
+   `rocprofv3` without confirming the kernel name in the trace.  **The S5-S7 gates are affected:**
+   `GGML_CUDA_MMB_TYPES`, `GGML_CUDA_MMB_DENSE` and the `mmb_*` tunables are lazy host `getenv`s.
+   Prefer `llama-bench` A/B for `MMB=1` vs off, and use the trace only for *kernel-time attribution*.
 6. **Don't judge routed/GLU on end-to-end t/s** (`GROUPS.md` §6): use `rocprofv3` kernel time and a
-   fixed-token `llama-perplexity` for routed shapes (`llama-bench` random prefill is not comparable
-   run-to-run).
+   fixed-token `llama-perplexity` for routed shapes.  **The S7 routed numbers are end-to-end** and
+   should be re-backed with kernel time in S12 (§13).
+
+---
+
+## 13. Remaining gfx1201 work — the next session's brief (S10-S15)
+
+**Read this section, not the session logs above.**  S1-S7 are done; this is everything that is
+still open on gfx1201.  Nothing here blocks gfx1100 (it can start on G5/G4 and its own RDNA3_0 work
+in parallel).
+
+### 13.0 Status and the measurement protocol
+
+| done | what | evidence |
+|---|---|---|
+| S1 | baselines B1-B7, build green | `gfx1201-s1s2-results.md` §1 |
+| S2 | G5 indexer (+2.1→+8.0 % by depth), G4 non-temporal (+0.3-0.4 %) | `gfx1201-s1s2-results.md` §3b |
+| S3 | G3a always-QSA gated off on RDNA4 | patch 3; re-confirmed with qsa3 in S4 §3.1 |
+| S4 | G2 `qsa3` ported (+7.6/+11.5/+10.4 %), first oracle coverage | `gfx1201-s4-qsa3-results.md` |
+| S5 | G1 `mmb` gfx12 shim; gfx1151 asm bit-identical | `gfx1201-s5s7-mmb-results.md` §1 |
+| S6 | `mmb` correctness (PPL parity) | `gfx1201-s5s7-mmb-results.md` §2/§5 |
+| S7 | `mmb` **scoped** (arch-scoped weight types + dense/path policy) | `gfx1201-s5s7-mmb-results.md` §4/§6 |
+
+**Protocol — apply to every measurement below.**
+
+* `llama-bench … -n 0 -r 5`; **the first prefill test of an invocation is cold-start-limited** (up to
+  −9 % — this fooled S7 twice).  Decide only on `r=5` and on **interleaved back-to-back rounds**
+  (run A, run B, run A, run B in one warm session).  Never run two benches at once.
+* Warm the page cache first (`cat <model> >/dev/null`) for the multi-shard models.
+* For a *decision*, prefer `pp32768` over `pp8192`; `pp8192` is only trustworthy inside an
+  interleaved pair.
+* Routed/GLU shapes (MoE experts): attribute with `rocprofv3` kernel time (`-d /tmp/prof`; note that
+  `-o` alone writes under `./<host>/<pid>/` in this ROCm build) **and** a fixed-token
+  `llama-perplexity`, per §12.6.
+* Record every number in a dated section of the results file for that session (not in this plan).
+
+**Load-bearing traps (do not re-derive).**
+
+1. **The gfx11 arm of any shim must be a macro, not a `__device__` function.**  A function leaves a
+   dead argument that perturbs the scheduler and breaks codegen bit-identity.  Verify with the
+   `mmb.cu`-for-gfx1151 asm diff recipe (`/tmp/asmgen.py`-style: take the compile command from
+   `build-rocm/compile_commands.json`, swap `offload-arch`, add `-S --cuda-device-only`); the only
+   acceptable diff is `__hip_cuid_*`.
+2. **The MMQ-fusion stand-down is per-tensor**, driven by `ggml_cuda_mmb_supported_mm` /
+   `_dense_will_take`.  So an excluded (type, path) costs *nothing* — it keeps the delivery's MMQ
+   path.  Any new gate must be added to **all** of `supported_mm`, `supported_mmid`,
+   `supported_glu`, `dense_will_take`, `routed_will_take` or the graph and the dispatch disagree.
+3. **`MMB_BK = 64` is effectively fixed**: the `mmb_dq_row*` dequant helpers hard-code 64 values per
+   row and `MMB_LDS_STRIDE = MMB_BK + 8`.  Treat changing `BK` as a rewrite, not a knob.
+4. **No dispatch currently passes `DBUF`/`DBUF2 = true`** — the code comments claiming "DBUF is a
+   −6.7 % win for the IQ3_S GLU" are stale.  `DBUF` is a live, untried lever (it needs `As` at 2x).
+5. All `mmb_*` tunables are read once into function-local statics: changing an env var needs a new
+   **process**, not just a new model load.
+
+### S10 — the gfx1201 dense tile geometry  *(the headline remaining win)*
+
+**Why:** every RDNA4 `mmb` loss lives in the *generic quantized dense tile GEMM*
+(`gfx1201-s5s7-mmb-results.md` §3-§4): −3 % on an 82 %-IQ dense model, −6 % on Q8_0, −11 % on a
+mixed-K model — for **every** weight type.  If that tile can be made to beat the delivery's MMQ path
+on RDNA4, the dense path comes back and `mmb` becomes a win on dense models too, not just MoE/HC.
+
+**Where:**
+* geometry is chosen in `ggml_cuda_mmb_mul_mat` (`mmb.cu` ~1540-1630).  Today, with
+  `big = (M >= 6144 && K >= 2560) || (shadow && …)`, overridable by `GGML_CUDA_MMB_TILE`:
+  * dense big  `mmb_dense_kernel<128, 256, 64, 64, WTYPE>`
+  * dense small `mmb_dense_kernel<128, 128, 32, 64, WTYPE>`
+  * tall-M (HC, IQ4_NL) `mmb_dense_kernel<384, 64, 96, 32, 0>` / `<384, 32, 96, 16, 0>`
+* routed big `mmb_routed_kernel<128, 128, 32, 64, WTYPE>` / small `<128, 32, 32, 16, WTYPE>`
+* routed GLU big `mmb_routed_glu_kernel<64, 128, 32, 32, WTYPE>` / small `<64, 32, 16, 16, WTYPE>`
+* the tile body is `mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, TAIL, DBUF, DBUF2>` (~line 546);
+  `MMB_NT = 256` threads, `__launch_bounds__(MMB_NT, 2)`.
+
+**Do this:**
+1. Add a **runtime geometry selector** so the sweep needs no rebuild: extend the `MMB_TILE` idea into
+   `GGML_CUDA_MMB_GEOM=<bm>x<bn>x<wtm>x<wtn>[,<big variant>]` choosing from a small set of
+   pre-instantiated `mmb_dense_kernel<...>` arms under `#if defined(RDNA4)`.  Keep the counts small
+   (compile time in this file is already the reason it is one TU).
+2. Sweep, **for each dense weight type separately** (the type axis mattered in S7 — do not sweep them
+   together): `BM` 128/256, `BN` 64/128/256, `WTM`/`WTN` 16/32/64/96, `DBUF` on/off, the big/small
+   crossover (`MMB_TILE`, and the `M >= 6144 && K >= 2560` rule itself).
+3. Check the **LDS budget** first, it is the likely binding constraint: the dense big tile needs
+   `(BM + BN) * MMB_LDS_STRIDE * 2` bytes = `(128+256)*72*2` = **54 KiB**; confirm what the R9700's
+   LDS per WGP actually allows at 2 blocks and whether `__launch_bounds__(256, 2)` is even met.  A
+   larger `BN` may drop to 1 block and lose.
+4. Attribute with `rocprofv3` kernel time against the MMQ kernel for the same op (this is the only
+   way to see whether the tile is losing to MMQ or to something else), then back the winner with an
+   interleaved `llama-bench` round on a dense model (`27B UD-IQ3_S` and `27B Q8_0` are the two best
+   probes: 82 % IQ vs 100 % Q8_0, both 1 GPU).
+
+**Exit gate:** a geometry where `mmb`'s dense tile ≥ the MMQ path for at least one weight type,
+proven by an interleaved A/B **and** kernel time.  Then: purity check (PPL + same-seed greedy,
+`GREEDY-PURITY.md` contract), and flip `mmb_dense_flag()`'s RDNA4 default **for that type only**
+(the flag may need to become per-type rather than global — that is the natural shape of the fix).
+
+### S11 — arch-scoped tuning constants (§7 point 3)
+
+**Why:** §7.3 requires per-arch values selected by `ggml_cuda_info().devices[0].cc`.  Only
+`mmb_wtype_mask()` and `mmb_dense_flag()` do this today; every other tunable is env-only with a
+gfx1151 default, so `mmb_min_t`, `glu_thresh`, `routed_thresh`, `tall_mode`, `tiny_m_*`,
+`f32split_*`, `bf16w`, `hc16`, `down16`, `gatemix`, `iq3xxs_glu`, `shadow_*` cannot differ per arch
+without the user setting env vars (and cannot be profiled safely, §12.5).
+
+**Do this:** add `mmb_arch_defaults(cc)` (a small switch keyed on `GGML_CUDA_CC_IS_RDNA4` /
+`_RDNA3_5` / `_RDNA3_0`) and route every tunable through it, keeping the existing env var as the
+override.  Precedent in-tree: `mmb_wtype_mask()`, `mmb_dense_flag()`, and `qsa_arch_gfx()` for the
+qwen4exp policy.
+
+**Exit gate:** gfx1151 numbers **unchanged** (re-run one gfx1151-known workload if possible, otherwise
+argue from the cc switch being a no-op there), and the RDNA4 defaults documented in one place.
+
+### S12 — routed / GLU path: tuning and kernel-time evidence
+
+**Why:** the routed MoE path is the RDNA4 `mmb` win (+6.7 % on `UD-Q3_K_M`), but its tiling was never
+tuned here and the S7 comparison is end-to-end only (§12.6).
+
+**Do this:**
+1. Sweep `GGML_CUDA_MMB_ROUTED_THRESH` and `GGML_CUDA_MMB_GLU_THRESH` (both default 32) on
+   `35B-A3B UD-Q3_K_M` (the +6.7 % case) and `Flash-Next IQ3_XXS`.  These pick the BN=128 vs BN=32
+   expert tile class (`mmb_build_desc2`) and directly trade B-column padding against dequant volume.
+2. **Re-try `DBUF` for the GLU** (trap 4): no dispatch passes it today, yet the comment claims −6.7 %
+   for IQ3_S.  Wire it behind a knob and measure.
+3. **Re-measure the IQ3_XXS fused-GLU arm** (`GGML_CUDA_MMB_IQ3XXS=1`, default off).  It was defaulted
+   off on gfx1151/UD-Q3_K_M, but IQ3_XXS is one of the two RDNA4 winning types.
+4. Back the numbers with `rocprofv3` kernel time for `mmb_routed_kernel` / `mmb_routed_glu_kernel`
+   vs the MMQ/`mul_mat_id` kernel.
+
+**Exit gate:** the routed win ≥ the S7 number with kernel-time evidence; the GLU/IQ3_XXS decisions
+re-stated on gfx1201.
+
+### S13 — G3b/c (F32/tiny-M) and G4-HC16 producers
+
+**Why:** both ride G1 and both are **unmeasured on gfx1201**.  S7 made two *policy* calls on them
+(routed the F32 router off, kept the tiny-M HC inject on) without isolating either.
+
+**Do this:**
+* **F32 split (MoE router)** — currently off on RDNA4 via `mmb_dense_flag()`.  Sweep
+  `GGML_CUDA_MMB_F32SPLIT_MIN_M` / `_MIN_K` to see whether a gfx1201 shape wins; the gfx1151 rule was
+  `M >= 128` (the router) with `MIN_K = 0` disabled and the long-K hc-inject pair *worse* on MMB.
+* **tiny-M warp-per-token kernel** (the qwen4exp HC `*_inject` pair, `M <= 8`) — kept on; measure
+  `GGML_CUDA_MMB_TINY_TT` (default 1; TT>1 measured worse on gfx1151).
+* **HC16 bf16 producers** — `GGML_CUDA_MMB_HC16=1` (default 0) plus `GGML_CUDA_MMB_DOWN16`,
+  `LLAMA_HC_BLK16`, `LLAMA_HC_RES16`.  The point is to kill the `mmb_cvt_f32_bf16` conversions
+  (+1-3 % on gfx1151).  It is host-side graph marking, so it needs MMB enabled to mean anything.
+* **Purity for each**: PPL + same-seed greedy, and for HC16 also a check that the F32 tensor is
+  still produced where a consumer needs it.
+
+**Exit gate:** each knob A/B'd, purity-checked, and given an arch default in S11's table.
+
+### S14 — the B1-B9 gate matrix on the final build  *(the biggest coverage gap)*
+
+**Why:** B1-B7 were recorded at S1 (delivery-vs-WIP) and B6 at S4, but never re-run as a matrix on the
+current tree; B8 is only partly done; and **B9 (MTP) has never been run on gfx1201 at all** — the WIP
+carries decode-affecting changes (G4 non-temporal, G5 indexer) and a gfx1151-tuned adaptive-MTP
+controller.
+
+**Do this:**
+1. B1-B7 from §4 on the current tree (`~/.pi` note: always `llama-cli --single-turn`, and extract with
+   `scripts/extract-generated.py`).
+2. **B8** — `llama-perplexity -m Flash-Next … -c 2048 …` plus a long-context PPL (concatenate the
+   prose prompt 3x for a tight CI; 7 chunks took the S7 CI from ±0.98 to ±0.45).
+3. **B9** — `benchmarks/mtp-adaptive-methodology.md` in full: acceptance > ~0.45 at pos 1, MTP ≥ plain
+   at depth 3, and the four-axis gate at `-n 3000` (`benchmarks/2026-09-15-adaptive-mtp-tuning.md`).
+   This is the only gate that touches decode.
+4. `test-logits-width-probe` (`tests/test-logits-width-probe.cpp`, built by patch 3) with `MMB=1` and
+   off, on the pure KV types.
+
+**Exit gate:** every gate green with numbers recorded in a new results file.
+
+### S15 — freeze the policy, regenerate, hand off
+
+* Land the S11 defaults and the S10 dense decision as code (patch 6 or a new patch 7 — see the note
+  below on patch layout).
+* Update §10/§11, `GROUPS.md` (the gfx1100 job and the group-1 row) and `README.md`.
+* `git format-patch --start-number 1 <r12-tip>..HEAD` → regenerate `patches/`, `commits.txt`,
+  `mmb-general.patch`; verify `git am` **N/N** on a fresh r12 worktree and that the applied tree
+  matches the tip tree.
+* Commit + push `wip-mmb-general`.  Hand gfx1100 the tree and the `GROUPS.md` job.
+
+**Patch layout:** the set is **6 patches** today (tree `580db5174574f10cc92fb1cefa72281a65c77b12`), with
+S5-S7 as patch 6 because patches 1, 3 and 4 all touch `mmb.cu`.  Continue that convention: land new
+work as a new patch unless the touched files are owned by exactly one existing patch.
+
+### 13.1 Definition of done for "the remaining gfx1201 work"
+
+- [ ] the dense tile geometry has a gfx1201 answer (win → density re-enabled per type; or a recorded,
+      kernel-time-backed "MMQ wins on RDNA4 for dense" so the decision is closed)
+- [ ] every `mmb_*` tunable has an arch-scoped default with gfx1151 unchanged
+- [ ] the routed/GLU path is tuned and kernel-time-backed; the IQ3_XXS GLU arm re-decided
+- [ ] G3b/c and HC16 are measured, purity-checked and defaulted
+- [ ] B1-B9 green on the final tree, **including MTP**
+- [ ] gfx1100 has a clean, documented handoff (and its own `RDNA3_0` predicate work listed)
