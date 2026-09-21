@@ -19,14 +19,18 @@ exception, so the default-**on** `--fit` never ran under tensor split and users 
 `-c`/`-ngl`/`-ts` by hand.  The Meta device's accessors are exposed (they existed upstream, file-static)
 and `common/fit.cpp` gained a dedicated tensor path: per-device targets from `--fit-target`, a
 proportional split or an honoured user `-ts` (with the binding `effective budget` logged), then an auto
-`n_ctx` reduction and an `-ngl` binary search, never overriding an explicit `-c`.  Block 15 is the home
-because it is the last block touching `ggml-backend-meta.cpp` and the change depends on no block; it
+`n_ctx` reduction and an `-ngl` binary search, never overriding an explicit `-c`.  **Block 06** is the home:
+the delivery's general system-operations bucket (repurposed once the host-buffer revert lost its purpose
+upstream), and the change depends on no block - `common/fit.cpp`, `ggml/include/ggml-backend.h` and
+`docs/multi-gpu.md` are untouched by every block and the Meta accessors already exist upstream
+(file-static); it
 remains a good `upstream/` PR candidate.  Re-validated on r11: the default fit cases reproduce the
 2026-09-18 record exactly, the `-ngl`-reduction cases are more conservative (the fit now sizes for the
 packed mask r11 restored for M-RoPE), seven end-to-end loads generate with zero out-of-memory and zero
 compute-buffer growth (including the separate-MTP-head `draft-mtp-adaptive` path), and the same-seed gate
-is byte-identical.  Canonical tip `3d27ae995f44b53cdcb9f9559cb785367bbe57c2`, tree
-`8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`, strict 16/16 (only patch `0015` changed).
+is byte-identical.  Canonical tip `54f8a57fc50344f738c363c13b243a0ad81f70da`, tree
+`8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`, strict 16/16 (block 06 changed in content, patches 07-15 in
+`From`/`index` lines only).
 
 **r11 (2026-09-20) — `v16-ebbb18522-r11`:** a block-15 amendment (issue #42) on top of r10:
 the compute reserve now measures with the packed kq mask when one is **reachable**, because V3's derived

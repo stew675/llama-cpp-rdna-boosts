@@ -328,9 +328,9 @@ for per-block verification and `BASELINE.md` for provenance.
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`ebbb18522`** (upstream master "openvino : Update OpenVINO to 2026.4", 2026-09-17 re-base).
-- Canonical 16-block chain: tip **`3d27ae995f44b53cdcb9f9559cb785367bbe57c2`**, net tree
+- Canonical 16-block chain: tip **`54f8a57fc50344f738c363c13b243a0ad81f70da`**, net tree
   **`8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`**; release **`v16-ebbb18522-r12`**.
-- **`--fit` works under `-sm tensor`** (block 15, r12, promoted from `beta/tensor-fit-fix/`): upstream
+- **`--fit` works under `-sm tensor`** (block 6, r12, promoted from `beta/tensor-fit-fix/`): upstream
   threw `not implemented for SPLIT_MODE_TENSOR` and swallowed it, so the default-**on** `--fit` was a
   silent no-op under tensor split.  The Meta device's accessors are now exposed and `common/fit.cpp`
   has a dedicated tensor path (per-device targets from `--fit-target`, a proportional split or an

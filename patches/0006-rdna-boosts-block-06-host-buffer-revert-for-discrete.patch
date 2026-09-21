@@ -1,4 +1,4 @@
-From 34976f12161b88b8cba736c033b2211488bfb5b8 Mon Sep 17 00:00:00 2001
+From db7bbd455cf84556000ab84c65044692cf737974 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 06/15] rdna-boosts: block 06: host-buffer revert for discrete
@@ -22,153 +22,157 @@ listed first in the backend source order so they are not the tail of the build. 
 identical explicit instantiations, identical symbols.  Also mirrors the ordering in the CUDA
 backend's CMakeLists.txt.
 ---
- ggml/src/ggml-cuda/CMakeLists.txt             |  6 +++
- ggml/src/ggml-cuda/ggml-cuda.cu               |  6 +++
- ...stance-ncols1_1-ncols2_16-dkq192-dv128.cu} |  1 -
- ...nstance-ncols1_1-ncols2_16-dkq576-dv512.cu |  5 ++
- ...stance-ncols1_1-ncols2_32-dkq320-dv256.cu} |  1 -
- ...nstance-ncols1_1-ncols2_32-dkq576-dv512.cu |  5 ++
- ...instance-ncols1_1-ncols2_8-dkq112-dv112.cu |  5 ++
- ...instance-ncols1_1-ncols2_8-dkq128-dv128.cu |  5 ++
- ...instance-ncols1_1-ncols2_8-dkq192-dv128.cu |  5 ++
- ...instance-ncols1_1-ncols2_8-dkq256-dv256.cu |  5 ++
- ...instance-ncols1_1-ncols2_8-dkq512-dv512.cu |  5 ++
- ...6-instance-ncols1_1-ncols2_8-dkq64-dv64.cu |  5 ++
- ...6-instance-ncols1_1-ncols2_8-dkq80-dv80.cu |  5 ++
- ...6-instance-ncols1_1-ncols2_8-dkq96-dv96.cu |  5 ++
- ...attn-mma-f16-instance-ncols1_1-ncols2_8.cu | 12 -----
- ...nstance-ncols1_16-ncols2_1-dkq112-dv112.cu |  5 ++
- ...nstance-ncols1_16-ncols2_1-dkq128-dv128.cu |  5 ++
- ...nstance-ncols1_16-ncols2_1-dkq256-dv256.cu |  5 ++
- ...-instance-ncols1_16-ncols2_1-dkq64-dv64.cu |  5 ++
- ...-instance-ncols1_16-ncols2_1-dkq80-dv80.cu |  5 ++
- ...-instance-ncols1_16-ncols2_1-dkq96-dv96.cu |  5 ++
- ...ttn-mma-f16-instance-ncols1_16-ncols2_1.cu | 10 ----
- ...nstance-ncols1_16-ncols2_2-dkq112-dv112.cu |  5 ++
- ...nstance-ncols1_16-ncols2_2-dkq128-dv128.cu |  5 ++
- ...nstance-ncols1_16-ncols2_2-dkq256-dv256.cu |  5 ++
- ...nstance-ncols1_16-ncols2_2-dkq512-dv512.cu |  5 ++
- ...-instance-ncols1_16-ncols2_2-dkq64-dv64.cu |  5 ++
- ...-instance-ncols1_16-ncols2_2-dkq80-dv80.cu |  5 ++
- ...-instance-ncols1_16-ncols2_2-dkq96-dv96.cu |  5 ++
- ...ttn-mma-f16-instance-ncols1_16-ncols2_2.cu | 11 -----
- ...nstance-ncols1_16-ncols2_4-dkq112-dv112.cu |  5 ++
- ...nstance-ncols1_16-ncols2_4-dkq128-dv128.cu |  5 ++
- ...nstance-ncols1_16-ncols2_4-dkq256-dv256.cu |  5 ++
- ...nstance-ncols1_16-ncols2_4-dkq512-dv512.cu |  5 ++
- ...nstance-ncols1_16-ncols2_4-dkq576-dv512.cu |  5 ++
- ...-instance-ncols1_16-ncols2_4-dkq64-dv64.cu |  5 ++
- ...-instance-ncols1_16-ncols2_4-dkq80-dv80.cu |  5 ++
- ...-instance-ncols1_16-ncols2_4-dkq96-dv96.cu |  5 ++
- ...ttn-mma-f16-instance-ncols1_16-ncols2_4.cu | 12 -----
- ...stance-ncols1_2-ncols2_16-dkq192-dv128.cu} |  1 -
- ...nstance-ncols1_2-ncols2_16-dkq576-dv512.cu |  5 ++
- ...stance-ncols1_2-ncols2_32-dkq320-dv256.cu} |  1 -
- ...nstance-ncols1_2-ncols2_32-dkq576-dv512.cu |  5 ++
- ...instance-ncols1_2-ncols2_4-dkq112-dv112.cu |  5 ++
- ...instance-ncols1_2-ncols2_4-dkq128-dv128.cu |  5 ++
- ...instance-ncols1_2-ncols2_4-dkq256-dv256.cu |  5 ++
- ...instance-ncols1_2-ncols2_4-dkq512-dv512.cu |  5 ++
- ...instance-ncols1_2-ncols2_4-dkq576-dv512.cu |  5 ++
- ...6-instance-ncols1_2-ncols2_4-dkq64-dv64.cu |  5 ++
- ...6-instance-ncols1_2-ncols2_4-dkq80-dv80.cu |  5 ++
- ...6-instance-ncols1_2-ncols2_4-dkq96-dv96.cu |  5 ++
- ...attn-mma-f16-instance-ncols1_2-ncols2_4.cu | 12 -----
- ...instance-ncols1_2-ncols2_8-dkq112-dv112.cu |  5 ++
- ...instance-ncols1_2-ncols2_8-dkq128-dv128.cu |  5 ++
- ...instance-ncols1_2-ncols2_8-dkq192-dv128.cu |  5 ++
- ...instance-ncols1_2-ncols2_8-dkq256-dv256.cu |  5 ++
- ...instance-ncols1_2-ncols2_8-dkq512-dv512.cu |  5 ++
- ...6-instance-ncols1_2-ncols2_8-dkq64-dv64.cu |  5 ++
- ...6-instance-ncols1_2-ncols2_8-dkq80-dv80.cu |  5 ++
- ...6-instance-ncols1_2-ncols2_8-dkq96-dv96.cu |  5 ++
- ...attn-mma-f16-instance-ncols1_2-ncols2_8.cu | 12 -----
- ...nstance-ncols1_32-ncols2_1-dkq112-dv112.cu |  5 ++
- ...nstance-ncols1_32-ncols2_1-dkq128-dv128.cu |  5 ++
- ...nstance-ncols1_32-ncols2_1-dkq256-dv256.cu |  5 ++
- ...-instance-ncols1_32-ncols2_1-dkq64-dv64.cu |  5 ++
- ...-instance-ncols1_32-ncols2_1-dkq80-dv80.cu |  5 ++
- ...-instance-ncols1_32-ncols2_1-dkq96-dv96.cu |  5 ++
- ...ttn-mma-f16-instance-ncols1_32-ncols2_1.cu | 10 ----
- ...nstance-ncols1_32-ncols2_2-dkq112-dv112.cu |  5 ++
- ...nstance-ncols1_32-ncols2_2-dkq128-dv128.cu |  5 ++
- ...nstance-ncols1_32-ncols2_2-dkq256-dv256.cu |  5 ++
- ...nstance-ncols1_32-ncols2_2-dkq512-dv512.cu |  5 ++
- ...-instance-ncols1_32-ncols2_2-dkq64-dv64.cu |  5 ++
- ...-instance-ncols1_32-ncols2_2-dkq80-dv80.cu |  5 ++
- ...-instance-ncols1_32-ncols2_2-dkq96-dv96.cu |  5 ++
- ...ttn-mma-f16-instance-ncols1_32-ncols2_2.cu | 11 -----
- ...stance-ncols1_4-ncols2_16-dkq192-dv128.cu} |  1 -
- ...nstance-ncols1_4-ncols2_16-dkq576-dv512.cu |  5 ++
- ...instance-ncols1_4-ncols2_2-dkq112-dv112.cu |  5 ++
- ...instance-ncols1_4-ncols2_2-dkq128-dv128.cu |  5 ++
- ...instance-ncols1_4-ncols2_2-dkq256-dv256.cu |  5 ++
- ...instance-ncols1_4-ncols2_2-dkq512-dv512.cu |  5 ++
- ...6-instance-ncols1_4-ncols2_2-dkq64-dv64.cu |  5 ++
- ...6-instance-ncols1_4-ncols2_2-dkq80-dv80.cu |  5 ++
- ...6-instance-ncols1_4-ncols2_2-dkq96-dv96.cu |  5 ++
- ...attn-mma-f16-instance-ncols1_4-ncols2_2.cu | 11 -----
- ...instance-ncols1_4-ncols2_4-dkq112-dv112.cu |  5 ++
- ...instance-ncols1_4-ncols2_4-dkq128-dv128.cu |  5 ++
- ...instance-ncols1_4-ncols2_4-dkq256-dv256.cu |  5 ++
- ...instance-ncols1_4-ncols2_4-dkq512-dv512.cu |  5 ++
- ...instance-ncols1_4-ncols2_4-dkq576-dv512.cu |  5 ++
- ...6-instance-ncols1_4-ncols2_4-dkq64-dv64.cu |  5 ++
- ...6-instance-ncols1_4-ncols2_4-dkq80-dv80.cu |  5 ++
- ...6-instance-ncols1_4-ncols2_4-dkq96-dv96.cu |  5 ++
- ...attn-mma-f16-instance-ncols1_4-ncols2_4.cu | 12 -----
- ...instance-ncols1_4-ncols2_8-dkq112-dv112.cu |  5 ++
- ...instance-ncols1_4-ncols2_8-dkq128-dv128.cu |  5 ++
- ...instance-ncols1_4-ncols2_8-dkq192-dv128.cu |  5 ++
- ...instance-ncols1_4-ncols2_8-dkq256-dv256.cu |  5 ++
- ...instance-ncols1_4-ncols2_8-dkq512-dv512.cu |  5 ++
- ...6-instance-ncols1_4-ncols2_8-dkq64-dv64.cu |  5 ++
- ...6-instance-ncols1_4-ncols2_8-dkq80-dv80.cu |  5 ++
- ...6-instance-ncols1_4-ncols2_8-dkq96-dv96.cu |  5 ++
- ...attn-mma-f16-instance-ncols1_4-ncols2_8.cu | 12 -----
- ...nstance-ncols1_64-ncols2_1-dkq112-dv112.cu |  5 ++
- ...nstance-ncols1_64-ncols2_1-dkq128-dv128.cu |  5 ++
- ...nstance-ncols1_64-ncols2_1-dkq256-dv256.cu |  5 ++
- ...-instance-ncols1_64-ncols2_1-dkq64-dv64.cu |  5 ++
- ...-instance-ncols1_64-ncols2_1-dkq80-dv80.cu |  5 ++
- ...-instance-ncols1_64-ncols2_1-dkq96-dv96.cu |  5 ++
- ...ttn-mma-f16-instance-ncols1_64-ncols2_1.cu | 10 ----
- ...instance-ncols1_8-ncols2_1-dkq112-dv112.cu |  5 ++
- ...instance-ncols1_8-ncols2_1-dkq128-dv128.cu |  5 ++
- ...instance-ncols1_8-ncols2_1-dkq256-dv256.cu |  5 ++
- ...6-instance-ncols1_8-ncols2_1-dkq64-dv64.cu |  5 ++
- ...6-instance-ncols1_8-ncols2_1-dkq80-dv80.cu |  5 ++
- ...6-instance-ncols1_8-ncols2_1-dkq96-dv96.cu |  5 ++
- ...attn-mma-f16-instance-ncols1_8-ncols2_1.cu | 10 ----
- ...instance-ncols1_8-ncols2_2-dkq112-dv112.cu |  5 ++
- ...instance-ncols1_8-ncols2_2-dkq128-dv128.cu |  5 ++
- ...instance-ncols1_8-ncols2_2-dkq256-dv256.cu |  5 ++
- ...instance-ncols1_8-ncols2_2-dkq512-dv512.cu |  5 ++
- ...6-instance-ncols1_8-ncols2_2-dkq64-dv64.cu |  5 ++
- ...6-instance-ncols1_8-ncols2_2-dkq80-dv80.cu |  5 ++
- ...6-instance-ncols1_8-ncols2_2-dkq96-dv96.cu |  5 ++
- ...attn-mma-f16-instance-ncols1_8-ncols2_2.cu | 11 -----
- ...instance-ncols1_8-ncols2_4-dkq112-dv112.cu |  5 ++
- ...instance-ncols1_8-ncols2_4-dkq128-dv128.cu |  5 ++
- ...instance-ncols1_8-ncols2_4-dkq256-dv256.cu |  5 ++
- ...instance-ncols1_8-ncols2_4-dkq512-dv512.cu |  5 ++
- ...instance-ncols1_8-ncols2_4-dkq576-dv512.cu |  5 ++
- ...6-instance-ncols1_8-ncols2_4-dkq64-dv64.cu |  5 ++
- ...6-instance-ncols1_8-ncols2_4-dkq80-dv80.cu |  5 ++
- ...6-instance-ncols1_8-ncols2_4-dkq96-dv96.cu |  5 ++
- ...attn-mma-f16-instance-ncols1_8-ncols2_4.cu | 12 -----
- ...instance-ncols1_8-ncols2_8-dkq112-dv112.cu |  5 ++
- ...instance-ncols1_8-ncols2_8-dkq128-dv128.cu |  5 ++
- ...instance-ncols1_8-ncols2_8-dkq192-dv128.cu |  5 ++
- ...instance-ncols1_8-ncols2_8-dkq256-dv256.cu |  5 ++
- ...instance-ncols1_8-ncols2_8-dkq512-dv512.cu |  5 ++
- ...6-instance-ncols1_8-ncols2_8-dkq64-dv64.cu |  5 ++
- ...6-instance-ncols1_8-ncols2_8-dkq80-dv80.cu |  5 ++
- ...6-instance-ncols1_8-ncols2_8-dkq96-dv96.cu |  5 ++
- ...attn-mma-f16-instance-ncols1_8-ncols2_8.cu | 12 -----
- .../template-instances/generate_cu_files.py   | 46 +++++++++++--------
- ggml/src/ggml-hip/CMakeLists.txt              |  6 +++
- 146 files changed, 649 insertions(+), 205 deletions(-)
+ common/fit.cpp                                | 208 +++++++++++++++++-
+ docs/multi-gpu.md                             |   4 +-
+ ggml/include/ggml-backend.h                   |   9 +
+ ggml/src/ggml-backend-meta.cpp                |   8 +-
+ ggml/src/ggml-cuda/CMakeLists.txt             |   6 +
+ ggml/src/ggml-cuda/ggml-cuda.cu               |   6 +
+ ...stance-ncols1_1-ncols2_16-dkq192-dv128.cu} |   1 -
+ ...nstance-ncols1_1-ncols2_16-dkq576-dv512.cu |   5 +
+ ...stance-ncols1_1-ncols2_32-dkq320-dv256.cu} |   1 -
+ ...nstance-ncols1_1-ncols2_32-dkq576-dv512.cu |   5 +
+ ...instance-ncols1_1-ncols2_8-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_1-ncols2_8-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_1-ncols2_8-dkq192-dv128.cu |   5 +
+ ...instance-ncols1_1-ncols2_8-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_1-ncols2_8-dkq512-dv512.cu |   5 +
+ ...6-instance-ncols1_1-ncols2_8-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_1-ncols2_8-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_1-ncols2_8-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_1-ncols2_8.cu |  12 -
+ ...nstance-ncols1_16-ncols2_1-dkq112-dv112.cu |   5 +
+ ...nstance-ncols1_16-ncols2_1-dkq128-dv128.cu |   5 +
+ ...nstance-ncols1_16-ncols2_1-dkq256-dv256.cu |   5 +
+ ...-instance-ncols1_16-ncols2_1-dkq64-dv64.cu |   5 +
+ ...-instance-ncols1_16-ncols2_1-dkq80-dv80.cu |   5 +
+ ...-instance-ncols1_16-ncols2_1-dkq96-dv96.cu |   5 +
+ ...ttn-mma-f16-instance-ncols1_16-ncols2_1.cu |  10 -
+ ...nstance-ncols1_16-ncols2_2-dkq112-dv112.cu |   5 +
+ ...nstance-ncols1_16-ncols2_2-dkq128-dv128.cu |   5 +
+ ...nstance-ncols1_16-ncols2_2-dkq256-dv256.cu |   5 +
+ ...nstance-ncols1_16-ncols2_2-dkq512-dv512.cu |   5 +
+ ...-instance-ncols1_16-ncols2_2-dkq64-dv64.cu |   5 +
+ ...-instance-ncols1_16-ncols2_2-dkq80-dv80.cu |   5 +
+ ...-instance-ncols1_16-ncols2_2-dkq96-dv96.cu |   5 +
+ ...ttn-mma-f16-instance-ncols1_16-ncols2_2.cu |  11 -
+ ...nstance-ncols1_16-ncols2_4-dkq112-dv112.cu |   5 +
+ ...nstance-ncols1_16-ncols2_4-dkq128-dv128.cu |   5 +
+ ...nstance-ncols1_16-ncols2_4-dkq256-dv256.cu |   5 +
+ ...nstance-ncols1_16-ncols2_4-dkq512-dv512.cu |   5 +
+ ...nstance-ncols1_16-ncols2_4-dkq576-dv512.cu |   5 +
+ ...-instance-ncols1_16-ncols2_4-dkq64-dv64.cu |   5 +
+ ...-instance-ncols1_16-ncols2_4-dkq80-dv80.cu |   5 +
+ ...-instance-ncols1_16-ncols2_4-dkq96-dv96.cu |   5 +
+ ...ttn-mma-f16-instance-ncols1_16-ncols2_4.cu |  12 -
+ ...stance-ncols1_2-ncols2_16-dkq192-dv128.cu} |   1 -
+ ...nstance-ncols1_2-ncols2_16-dkq576-dv512.cu |   5 +
+ ...stance-ncols1_2-ncols2_32-dkq320-dv256.cu} |   1 -
+ ...nstance-ncols1_2-ncols2_32-dkq576-dv512.cu |   5 +
+ ...instance-ncols1_2-ncols2_4-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_2-ncols2_4-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_2-ncols2_4-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_2-ncols2_4-dkq512-dv512.cu |   5 +
+ ...instance-ncols1_2-ncols2_4-dkq576-dv512.cu |   5 +
+ ...6-instance-ncols1_2-ncols2_4-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_2-ncols2_4-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_2-ncols2_4-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_2-ncols2_4.cu |  12 -
+ ...instance-ncols1_2-ncols2_8-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_2-ncols2_8-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_2-ncols2_8-dkq192-dv128.cu |   5 +
+ ...instance-ncols1_2-ncols2_8-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_2-ncols2_8-dkq512-dv512.cu |   5 +
+ ...6-instance-ncols1_2-ncols2_8-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_2-ncols2_8-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_2-ncols2_8-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_2-ncols2_8.cu |  12 -
+ ...nstance-ncols1_32-ncols2_1-dkq112-dv112.cu |   5 +
+ ...nstance-ncols1_32-ncols2_1-dkq128-dv128.cu |   5 +
+ ...nstance-ncols1_32-ncols2_1-dkq256-dv256.cu |   5 +
+ ...-instance-ncols1_32-ncols2_1-dkq64-dv64.cu |   5 +
+ ...-instance-ncols1_32-ncols2_1-dkq80-dv80.cu |   5 +
+ ...-instance-ncols1_32-ncols2_1-dkq96-dv96.cu |   5 +
+ ...ttn-mma-f16-instance-ncols1_32-ncols2_1.cu |  10 -
+ ...nstance-ncols1_32-ncols2_2-dkq112-dv112.cu |   5 +
+ ...nstance-ncols1_32-ncols2_2-dkq128-dv128.cu |   5 +
+ ...nstance-ncols1_32-ncols2_2-dkq256-dv256.cu |   5 +
+ ...nstance-ncols1_32-ncols2_2-dkq512-dv512.cu |   5 +
+ ...-instance-ncols1_32-ncols2_2-dkq64-dv64.cu |   5 +
+ ...-instance-ncols1_32-ncols2_2-dkq80-dv80.cu |   5 +
+ ...-instance-ncols1_32-ncols2_2-dkq96-dv96.cu |   5 +
+ ...ttn-mma-f16-instance-ncols1_32-ncols2_2.cu |  11 -
+ ...stance-ncols1_4-ncols2_16-dkq192-dv128.cu} |   1 -
+ ...nstance-ncols1_4-ncols2_16-dkq576-dv512.cu |   5 +
+ ...instance-ncols1_4-ncols2_2-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_4-ncols2_2-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_4-ncols2_2-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_4-ncols2_2-dkq512-dv512.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_2-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_2-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_2-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_4-ncols2_2.cu |  11 -
+ ...instance-ncols1_4-ncols2_4-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_4-ncols2_4-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_4-ncols2_4-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_4-ncols2_4-dkq512-dv512.cu |   5 +
+ ...instance-ncols1_4-ncols2_4-dkq576-dv512.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_4-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_4-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_4-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_4-ncols2_4.cu |  12 -
+ ...instance-ncols1_4-ncols2_8-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_4-ncols2_8-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_4-ncols2_8-dkq192-dv128.cu |   5 +
+ ...instance-ncols1_4-ncols2_8-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_4-ncols2_8-dkq512-dv512.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_8-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_8-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_4-ncols2_8-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_4-ncols2_8.cu |  12 -
+ ...nstance-ncols1_64-ncols2_1-dkq112-dv112.cu |   5 +
+ ...nstance-ncols1_64-ncols2_1-dkq128-dv128.cu |   5 +
+ ...nstance-ncols1_64-ncols2_1-dkq256-dv256.cu |   5 +
+ ...-instance-ncols1_64-ncols2_1-dkq64-dv64.cu |   5 +
+ ...-instance-ncols1_64-ncols2_1-dkq80-dv80.cu |   5 +
+ ...-instance-ncols1_64-ncols2_1-dkq96-dv96.cu |   5 +
+ ...ttn-mma-f16-instance-ncols1_64-ncols2_1.cu |  10 -
+ ...instance-ncols1_8-ncols2_1-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_8-ncols2_1-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_8-ncols2_1-dkq256-dv256.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_1-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_1-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_1-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_8-ncols2_1.cu |  10 -
+ ...instance-ncols1_8-ncols2_2-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_8-ncols2_2-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_8-ncols2_2-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_8-ncols2_2-dkq512-dv512.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_2-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_2-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_2-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_8-ncols2_2.cu |  11 -
+ ...instance-ncols1_8-ncols2_4-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_8-ncols2_4-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_8-ncols2_4-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_8-ncols2_4-dkq512-dv512.cu |   5 +
+ ...instance-ncols1_8-ncols2_4-dkq576-dv512.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_4-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_4-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_4-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_8-ncols2_4.cu |  12 -
+ ...instance-ncols1_8-ncols2_8-dkq112-dv112.cu |   5 +
+ ...instance-ncols1_8-ncols2_8-dkq128-dv128.cu |   5 +
+ ...instance-ncols1_8-ncols2_8-dkq192-dv128.cu |   5 +
+ ...instance-ncols1_8-ncols2_8-dkq256-dv256.cu |   5 +
+ ...instance-ncols1_8-ncols2_8-dkq512-dv512.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_8-dkq64-dv64.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_8-dkq80-dv80.cu |   5 +
+ ...6-instance-ncols1_8-ncols2_8-dkq96-dv96.cu |   5 +
+ ...attn-mma-f16-instance-ncols1_8-ncols2_8.cu |  12 -
+ .../template-instances/generate_cu_files.py   |  46 ++--
+ ggml/src/ggml-hip/CMakeLists.txt              |   6 +
+ 150 files changed, 869 insertions(+), 214 deletions(-)
  rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_16.cu => fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq192-dv128.cu} (79%)
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq576-dv512.cu
  rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_32.cu => fattn-mma-f16-instance-ncols1_1-ncols2_32-dkq320-dv256.cu} (79%)
@@ -312,6 +316,308 @@ backend's CMakeLists.txt.
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8-dkq96-dv96.cu
  delete mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_8-ncols2_8.cu
 
+diff --git a/common/fit.cpp b/common/fit.cpp
+index faa595f84..e9462c579 100644
+--- a/common/fit.cpp
++++ b/common/fit.cpp
+@@ -180,9 +180,6 @@ static void common_params_fit_impl(
+         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
+         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
+         size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+-    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+-        throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
+-    }
+     constexpr int64_t MiB = 1024*1024;
+     typedef std::vector<llama_device_memory_data> dmds_t;
+     const llama_model_params default_mparams = llama_model_default_params();
+@@ -290,6 +287,211 @@ static void common_params_fit_impl(
+         }
+     }
+ 
++    // ===== tensor split (-sm tensor / LLAMA_SPLIT_MODE_TENSOR) =====
++    //
++    // Under tensor split every GPU wraps into a single Meta device, so the layer-granular algorithm
++    // below (whole layers per device, layer counts written into tensor_split) does not apply.  The
++    // measurement above therefore yields one Meta entry whose components have mixed meaning:
++    //   - model   is the whole offloaded tensor set, counted once (a per-device total once split)
++    //   - context and compute are per-device: the Meta buffer reports its largest sub-buffer
++    // The fit estimates total device memory as model + n_devices * (context + compute), assigns
++    // tensor_split proportional to each device's free memory minus its margin (so the loader's
++    // proportional sharding leaves every device at the same fill fraction), then reduces n_ctx and,
++    // if needed, n_gpu_layers until the estimate fits the summed targets.
++    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
++        std::vector<ggml_backend_dev_t> tdevs; // the "simple" devices behind the Meta wrapper
++        for (ggml_backend_dev_t dev : devs) {
++            if (ggml_backend_dev_is_meta(dev)) {
++                const size_t n_dev = ggml_backend_meta_dev_n_devs(dev);
++                for (size_t i = 0; i < n_dev; i++) {
++                    tdevs.push_back(ggml_backend_meta_dev_simple_dev(dev, i));
++                }
++            } else {
++                tdevs.push_back(dev);
++            }
++        }
++        if (tdevs.empty()) {
++            throw common_params_fit_exception("no devices behind the Meta device, abort");
++        }
++        const size_t ntd = tdevs.size();
++        if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
++            throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
++        }
++        if (!tensor_split) {
++            throw common_params_fit_exception("did not provide a buffer to write the tensor_split to, abort");
++        }
++        // per-device target = free memory minus the requested margin
++        std::vector<int64_t> ttarget(ntd);
++        int64_t target_sum = 0;
++        for (size_t id = 0; id < ntd; id++) {
++            size_t free = 0;
++            size_t total = 0;
++            ggml_backend_dev_memory(tdevs[id], &free, &total);
++            ttarget[id] = std::max<int64_t>(0, (int64_t) free - (int64_t) margins_s[id]);
++            target_sum += ttarget[id];
++            LOG_TRC("%s: tensor split: device %zu target %" PRId64 " MiB (free %" PRId64 " MiB, margin %zu MiB)\n",
++                __func__, id, ttarget[id]/MiB, (int64_t) free/MiB, margins_s[id]/MiB);
++        }
++
++        // A user-pinned -ts is honored: the fit keeps the requested balance and only chooses
++        // n_ctx / n_gpu_layers so that balance fits.  Without one, the split is pinned
++        // proportional to the targets.
++        bool ts_pinned = false;
++        std::vector<double> ratio(ntd, 0.0);
++        if (mparams->tensor_split) {
++            double sum = 0.0;
++            for (size_t id = 0; id < ntd; id++) {
++                ratio[id] = std::max(0.0, (double) mparams->tensor_split[id]);
++                sum += ratio[id];
++            }
++            if (sum > 0.0) {
++                ts_pinned = true;
++                for (size_t id = 0; id < ntd; id++) {
++                    ratio[id] /= sum;
++                }
++                LOG_TRC("%s: tensor split: honoring the user tensor_split ratios\n", __func__);
++            }
++        }
++        if (!ts_pinned) {
++            // tensor_split proportional to the target, so the loader shards the model in the same
++            // ratio.  Only the ratios matter; use MiB so the values stay small and print cleanly
++            // (llama-fit-params renders tensor_split as uint32_t).
++            double sum = 0.0;
++            for (size_t id = 0; id < ntd; id++) {
++                sum += (double) ttarget[id];
++            }
++            for (size_t id = 0; id < ntd; id++) {
++                tensor_split[id] = (float) (ttarget[id] / MiB);
++                ratio[id] = sum > 0.0 ? (double) ttarget[id] / sum : 0.0;
++            }
++            for (size_t id = ntd; id < llama_max_devices(); id++) {
++                tensor_split[id] = 0.0f;
++            }
++            mparams->tensor_split = tensor_split;
++        }
++
++        // The estimate is a per-device total: a device holding ratio r gets r * D, so the fit must
++        // satisfy r_i * D <= target_i for every used device, i.e. D <= min_i(target_i / r_i).
++        // With the auto split (r_i = target_i / sum(target)) that is exactly sum(target), so the
++        // two cases share one budget.
++        int64_t budget = target_sum;
++        for (size_t id = 0; id < ntd; id++) {
++            if (ratio[id] > 0.0) {
++                budget = std::min<int64_t>(budget, (int64_t) ((double) ttarget[id] / ratio[id]));
++            }
++        }
++
++        // total device memory estimate; the Meta buffer reports the largest sub-buffer for
++        // context/compute, so counting them once per device is the safe (slightly high) direction
++        auto estimate = [&](const dmds_t & dmds) -> int64_t {
++            int64_t model = 0;
++            int64_t ctx   = 0;
++            int64_t comp  = 0;
++            for (size_t id = 0; id < nd; id++) {
++                model += dmds[id].mb.model;
++                ctx   += dmds[id].mb.context;
++                comp  += dmds[id].mb.compute;
++            }
++            return model + (int64_t) ntd * (ctx + comp);
++        };
++        // the Meta devices of the main and extra models are distinct objects, so add_extra_memory()
++        // could not attribute the extra model to the main Meta entry -- do it here
++        auto extra_estimate = [&]() -> int64_t {
++            if (extra == nullptr) {
++                return 0;
++            }
++            extra->cparams->n_ctx = cparams->n_ctx;
++            std::vector<ggml_backend_dev_t> devs_extra;
++            uint32_t ngl_extra = 0;
++            uint32_t nct_extra = 0;
++            uint32_t nex_extra = 0;
++            dmds_t measured;
++            try {
++                measured = common_get_device_memory_data_impl(
++                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
++            } catch (const std::runtime_error & e) {
++                LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
++                return 0;
++            }
++            int64_t model = 0;
++            int64_t ctx   = 0;
++            int64_t comp  = 0;
++            for (size_t id = 0; id + 1 < measured.size(); id++) {
++                model += measured[id].mb.model;
++                ctx   += measured[id].mb.context;
++                comp  += measured[id].mb.compute;
++            }
++            if (extra->shares_model) {
++                model = 0; // the extra context runs on the main model's weights
++            }
++            return model + (int64_t) ntd * (ctx + comp);
++        };
++
++        int64_t used_total = estimate(dmds_full) + extra_estimate();
++        if (ts_pinned) {
++            LOG_TRC("%s: tensor split: %zu devices, estimated use %" PRId64 " MiB vs. %" PRId64 " MiB effective budget "
++                "(sum of targets %" PRId64 " MiB, pinned tensor_split)\n",
++                __func__, ntd, used_total/MiB, budget/MiB, target_sum/MiB);
++        } else {
++            LOG_TRC("%s: tensor split: %zu devices, estimated use %" PRId64 " MiB vs. %" PRId64 " MiB target\n",
++                __func__, ntd, used_total/MiB, budget/MiB);
++        }
++
++        if (used_total <= budget) {
++            LOG_TRC("%s: tensor split: no changes needed\n", __func__);
++            return;
++        }
++
++        // reduce the context size first
++        if (n_ctx_auto && n_ctx_max > n_ctx_min_total) {
++            const uint32_t n_ctx_save = cparams->n_ctx;
++            cparams->n_ctx = n_ctx_min_total;
++            dmds_t dmds_min = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
++            const int64_t used_min = estimate(dmds_min) + extra_estimate();
++            cparams->n_ctx = n_ctx_save;
++
++            if (used_min <= budget && used_total > used_min) {
++                const uint32_t n_ctx = n_ctx_min_total + (uint32_t) (
++                    (int64_t) (n_ctx_max - n_ctx_min_total) * (budget - used_min) / (used_total - used_min));
++                const uint32_t align = 256 * n_streams;
++                cparams->n_ctx = std::max(std::min(n_ctx, n_ctx_max) - std::min(n_ctx, n_ctx_max) % align, n_ctx_min_total);
++                LOG_TRC("%s: tensor split: context size reduced from %" PRIu32 " to %" PRIu32 "\n",
++                    __func__, n_ctx_max, cparams->n_ctx);
++                return;
++            }
++            LOG_TRC("%s: tensor split: context reduction alone is not enough (needs %" PRId64 " MiB at the minimum context), reducing the offloaded layers\n",
++                __func__, used_min/MiB);
++        } else if (!n_ctx_auto) {
++            LOG_TRC("%s: context size set by user to %" PRIu32 " -> no change\n", __func__, cparams->n_ctx);
++        }
++
++        // reduce the number of offloaded layers with a binary search over the estimate
++        uint32_t ngl_lo = 0;
++        uint32_t ngl_hi = hp_ngl + 1;
++        uint32_t ngl_best = 0;
++        int64_t  used_best = 0;
++        while (ngl_lo <= ngl_hi) {
++            const uint32_t ngl_mid = ngl_lo + (ngl_hi - ngl_lo) / 2;
++            mparams->n_gpu_layers = (int32_t) ngl_mid;
++            dmds_t dmds_ngl = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
++            const int64_t used = estimate(dmds_ngl) + extra_estimate();
++            LOG_TRC("%s: tensor split: n_gpu_layers=%" PRIu32 " -> %" PRId64 " MiB\n", __func__, ngl_mid, used/MiB);
++            if (used <= budget) {
++                ngl_best  = ngl_mid;
++                used_best = used;
++                ngl_lo    = ngl_mid + 1;
++            } else if (ngl_mid == 0) {
++                break;
++            } else {
++                ngl_hi = ngl_mid - 1;
++            }
++        }
++        mparams->n_gpu_layers = (int32_t) ngl_best;
++        LOG_TRC("%s: tensor split: offloading %" PRIu32 " layers, estimated use %" PRId64 " MiB\n",
++            __func__, ngl_best, used_best/MiB);
++        return;
++    }
++
+     std::vector<std::string> dev_names;
+     {
+         dev_names.reserve(nd);
+diff --git a/docs/multi-gpu.md b/docs/multi-gpu.md
+index 0d9eea7c2..25afa37b7 100644
+--- a/docs/multi-gpu.md
++++ b/docs/multi-gpu.md
+@@ -43,7 +43,7 @@ Set with `--split-mode` / `-sm`.
+ | `-fa` | `--flash-attn` | `on` \| `off` \| `auto` | `auto` | Required when using `--split-mode tensor` and/or quantized V cache. Supported (and therefore enabled by default) for most combinations of models and backends. |
+ | `-ctk` | `--cache-type-k` | `f32` \| `f16` \| `bf16` \| `q8_0` \| `q4_0` \| ... | `f16` | KV cache type for K. |
+ | `-ctv` | `--cache-type-v` | same as `-ctk` | `f16` | KV cache type for V. |
+-| `-fit` | `--fit` | `on` \| `off` | `on` | Auto-fit unset args to device memory. **Not supported with `tensor`. You may need to manually set the `--ctx-size` to make the model fit.**  |
++| `-fit` | `--fit` | `on` \| `off` | `on` | Auto-fit unset args to device memory. Supported in both `layer` and `tensor` split modes. In `tensor` split the fit assigns `--tensor-split` proportional to each device's free memory minus its target margin and reduces `--ctx-size` / `--n-gpu-layers` as needed. |
+ 
+ As for any CUDA program, the environment variable `CUDA_VISIBLE_DEVICES` can be used to control which GPUs to use for the CUDA backend: if you set it, llama.cpp only sees the specified GPUs. Use `--device` for selecting GPUs from among those visible to llama.cpp, this works for any backend.
+ 
+@@ -121,7 +121,7 @@ P2P requires driver support (usually restricted to workstation/datacenter GPUs)
+ | Startup error *"simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented"* | Use `-ctk f16 -ctv f16` (or `bf16`/`f32`) with `--split-mode tensor`. |
+ | Startup error *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'X'"* | Architecture not on the TENSOR allow-list. Use `--split-mode layer`. |
+ | Warning *"NCCL is unavailable, multi GPU performance will be suboptimal"* | llama.cpp wasn't built with NCCL. Either accept the lower performance or install NCCL and rebuild. |
+-| CUDA OOM at startup or during prefill in `--split-mode tensor` | Auto-fit is disabled in this mode, so reduce memory pressure yourself. In order from least to most disruptive: lower `--ctx-size` (`-c`) (KV cache is roughly proportional to `n_ctx`); for `llama-server`, lower `--parallel` (`-np`) (a slot KV cache is allocated per concurrent sequence); as a last resort, reduce `--n-gpu-layers` (`-ngl`) (the remaining layers run on CPU and inference will be much slower). |
++| CUDA OOM at startup or during prefill in `--split-mode tensor` | With `--fit` on (the default), raise `--fit-target` to reserve more headroom per device; the fit reduces `--ctx-size` and, if needed, `--n-gpu-layers`. With `--fit off`, reduce memory pressure yourself. In order from least to most disruptive: lower `--ctx-size` (`-c`) (KV cache is roughly proportional to `n_ctx`); for `llama-server`, lower `--parallel` (`-np`) (a slot KV cache is allocated per concurrent sequence); as a last resort, reduce `--n-gpu-layers` (`-ngl`) (the remaining layers run on CPU and inference will be much slower). |
+ | Performance is worse with multi-GPU than single-GPU | The performance is bottlenecked by GPU interconnect speed. For `--split-mode tensor`, verify that NCCL is being used. Try `--split-mode layer` (less communication than `tensor`). Increase GPU interconnect speed via more PCIe lanes or e.g. NVLink (if available). |
+ | GPU not used at all | `--n-gpu-layers` is `0` or too low - try explicitly setting `-ngl all`. Or you are accidentally hiding the GPUs via an environment variable like `CUDA_VISIBLE_DEVICES=-1`. Or your build doesn't include support for the relevant backend. |
+ | Crashes or corrupted outputs after setting `GGML_CUDA_P2P=1` | Some motherboards and BIOS settings (e.g. with IOMMU enabled) don't support CUDA peer-to-peer reliably. Unset `GGML_CUDA_P2P`. |
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index cc3f8cd36..5a9e96ea6 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -404,6 +404,15 @@ extern "C" {
+     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
+         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+ 
++    // returns true if the device was created by ggml_backend_meta_device()
++    GGML_API bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev);
++
++    // number of "simple" devices wrapped by a meta device
++    GGML_API size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t dev);
++
++    // the index-th "simple" device wrapped by a meta device
++    GGML_API ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t dev, size_t index);
++
+     //
+     // Utils
+     //
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 3ec40fb1a..79ff2a1b4 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -82,7 +82,7 @@ struct ggml_backend_meta_device_context {
+     }
+ };
+ 
+-static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev);
++bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev);
+ 
+ static const char * ggml_backend_meta_device_get_name(ggml_backend_dev_t dev) {
+     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+@@ -195,17 +195,17 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
+     /* .event_synchronize    = */ nullptr,
+ };
+ 
+-static bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
++bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
+     return dev != nullptr && dev->iface.get_name == ggml_backend_meta_device_iface.get_name;
+ }
+ 
+-static size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t meta_dev) {
++size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t meta_dev) {
+     GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
+     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
+     return meta_dev_ctx->simple_devs.size();
+ }
+ 
+-static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev, size_t index) {
++ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev, size_t index) {
+     GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
+     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
+     GGML_ASSERT(index < meta_dev_ctx->simple_devs.size());
 diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
 index 2254090cb..9fd309bbb 100644
 --- a/ggml/src/ggml-cuda/CMakeLists.txt

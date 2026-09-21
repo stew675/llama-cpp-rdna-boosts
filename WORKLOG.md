@@ -1,10 +1,12 @@
 # WORKLOG — dated delivery records
 
-## 2026-09-21 (r12) — `v16-ebbb18522-r12`: `--fit` supports `-sm tensor` (beta/tensor-fit-fix promoted)
+## 2026-09-21 (r12) — `v16-ebbb18522-r12`: `--fit` supports `-sm tensor` (beta/tensor-fit-fix promoted, block 06)
 
-**Release** `v16-ebbb18522-r12`, canonical tip `3d27ae995f44b53cdcb9f9559cb785367bbe57c2`, net tree
-`8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`.  Only **block 15** changed; blocks 00-14 are
-content-identical to r11 (their patch files are byte-identical).
+**Release** `v16-ebbb18522-r12`, canonical tip `54f8a57fc50344f738c363c13b243a0ad81f70da`, net tree
+`8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`.  Only **block 06** changed in content; blocks 07-15 sit above
+it and carry new `From <sha>`/`index` lines with unchanged bodies, and blocks 00-05 are byte-identical to
+r11.  The net `rdna-boosts-all.patch` is byte-identical to the block-15-placement cut, i.e. only the block
+*distribution* moved.
 
 **Promoted from `beta/tensor-fit-fix/`** (now `archive/work/tensor-fit-fix/`) on the maintainer's
 go-ahead, after the re-validation below.  The change is generic llama.cpp - `common/fit.cpp`,
@@ -26,13 +28,16 @@ sub-buffer.  The fix expands the Meta device back into its simple devices and wo
 log the `effective budget`), then reduce an auto `n_ctx` and binary-search `n_gpu_layers` down.  An
 explicit `-c` is never overridden.
 
-**Placement: block 15, not block 06.**  `common/fit.cpp`, `ggml/include/ggml-backend.h` and
-`docs/multi-gpu.md` are touched by **no** delivery block, and the Meta accessors already exist upstream
-(file-static), so the change depends on no block.  Its only overlap is `ggml/src/ggml-backend-meta.cpp`,
-which blocks 09/14/15 touch, block 15 last, at lines ~795/~1032 versus this change's ~83/~196.  Block 15
-is therefore both "the last block that touches the file" and the placement that cannot be invalidated by
-a later block.  Block 06 was considered and rejected: it is the host-buffer revert for discrete GPUs and
-does not touch that file at all.
+**Placement: block 06, the general system-operations bucket.**  `common/fit.cpp`,
+`ggml/include/ggml-backend.h` and `docs/multi-gpu.md` are touched by **no** delivery block, and the Meta
+accessors already exist upstream (file-static), so the change depends on no block and nothing later can
+invalidate it.  Block 06 already held that role (the host-buffer revert lost its purpose when upstream
+reverted #24233 in #28604, and the block took on the generic work, starting with the r6 FA instance
+build-time fix), which is where a standalone `--fit` fix belongs.  Its only overlap is
+`ggml-backend-meta.cpp`, which blocks 09/14/15 also touch but at lines ~790-2600 versus this change's
+~83/~196; replaying blocks 07-15 on the amended block 06 applies cleanly and yields a tree byte-identical
+to the earlier block-15 placement, which is the invariant that proves only the distribution moved.
+The alternative home is `upstream/` as an `UPSTREAM-PR-*` candidate, which remains worth doing.
 
 **Re-validated on r11 before promotion** (the patch was written against the r5/r6-era tree, and r11
 changed what the fit has to reserve, since the reachable packed kq mask now sits in the reserve for
@@ -56,8 +61,15 @@ M-RoPE models):
   fixed seed, r11 and r11 + this patch are **byte-identical**
   (`19ee51a93e6c9806b614b333cc0ef9ba64d60fbc9502565726bfdf51bd20b924`), as expected for a change confined
   to `common/fit.cpp` plus two `static` removals.
+* **Balance + single device.**  Asymmetric `--fit-target 1024,8000` (the fit chooses `-ts 31254,24278`):
+  peak per device by `rocm-smi` **15900 / 11994 MiB** against the 2026-09-18 record's 15925 / 12018
+  (within 0.2 %), ~3 % above the ideal proportional split (loader per-tensor rounding plus replicated
+  tensors), 0 OOM and 0 growth.  The loader's `Meta() model buffer size = 14893.51 MiB` agrees (the
+  larger device's share of a 25972 MiB model at ratio 0.5628).  The **single-device** case that block 07
+  creates (no Meta wrapper) also engages the tensor path: `tensor split: 1 devices, estimated use
+  26503 MiB vs. 31376 MiB target`, no changes needed, 19.2 t/s, 0 OOM and 0 growth.
 * `scripts/validate-set.sh` green (strict 16/16 `git am` on a fresh `ebbb18522`, applied tree
-  `8a80535e5`), and only patch `0015` changed.
+  `8a80535e5`), and patches `0006`-`0015` changed (block 06 in content, 07-15 in `From`/`index` lines only).
 
 **Carried limitations** (from the campaign record): the estimate is deliberately conservative rather
 than exact, and the default 1 GiB/device margin absorbs the measured ~0.4 GiB/device error on 27B Q8_0;

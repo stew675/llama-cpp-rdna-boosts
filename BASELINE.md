@@ -16,8 +16,8 @@ remain as known-good records for those upstream versions.
 > **Current baseline marker:** `baseline/d1d3c3396` was the previous (2026-09-15)
 > delivery baseline.  The current one is **`ebbb18522`** (2026-09-17), the fork point of
 > release **`v16-ebbb18522-r12`** (canonical tip
-> `3d27ae995f44b53cdcb9f9559cb785367bbe57c2`, tree
-> `8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`; r12 = the 2026-09-21 block-15 amendment that makes `--fit`
+> `54f8a57fc50344f738c363c13b243a0ad81f70da`, tree
+> `8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`; r12 = the 2026-09-21 block-06 amendment that makes `--fit`
 > support `-sm tensor`, promoted from `beta/tensor-fit-fix/` - upstream threw "not implemented for
 > SPLIT_MODE_TENSOR" and swallowed it, so the default-on `--fit` was a silent no-op under tensor split.
 > Re-validated on r11 first: fit decisions, seven end-to-end loads with no out-of-memory and no
