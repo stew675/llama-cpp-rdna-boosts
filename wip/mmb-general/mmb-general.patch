@@ -1166,7 +1166,7 @@ index edccfba13..aab997949 100644
      if (!disable_fusion) {
          for (int i = 0; i < cgraph->n_nodes; ++i) {
 diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
-index 1b9e63516..ae3b8210c 100644
+index 1b9e63516..390fc7a47 100644
 --- a/ggml/src/ggml-cuda/indexer-topk.cu
 +++ b/ggml/src/ggml-cuda/indexer-topk.cu
 @@ -54,6 +54,21 @@ struct indexer_topk_extra {
@@ -1383,7 +1383,7 @@ index 1b9e63516..ae3b8210c 100644
          const float * __restrict__ score,
          const int   * __restrict__ cell_blk,
          const kv_t  * __restrict__ additive,
-@@ -266,50 +361,349 @@ static __global__ void indexer_topk_deterministic_write(
+@@ -266,42 +361,353 @@ static __global__ void indexer_topk_deterministic_write(
      const int tid = threadIdx.x;
      const int t = row % n_tps;
      const int s = row / n_tps;
@@ -1535,16 +1535,29 @@ index 1b9e63516..ae3b8210c 100644
 +            lgpre[v] = lg; lepre[v] = le;
 +            lg += g; le += e;
 +        }
-+        sg[tid] = lg;
-+        se[tid] = le;
-+        for (int off = 1; off < BLOCK_SIZE; off <<= 1) {
-+            __syncthreads();
-+            const int vg = (tid >= off) ? sg[tid - off] : 0;
-+            const int ve = (tid >= off) ? se[tid - off] : 0;
-+            __syncthreads();
-+            if (tid >= off) { sg[tid] += vg; se[tid] += ve; }
++        // inclusive block scan of (g_count, e_count).  The Hillis-Steele form this replaces ran
++        // 8 steps x 2 __syncthreads (~19 barriers per 1024-cell tile) and dominated the kernel --
++        // an unselected-block skip in the cell loop measured NO gain, which is what pointed here.
++        // Warp-shuffle scan + a 2-barrier offset pass; integer sums are associative so the
++        // prefix values (and therefore the placement) are identical.
++        int wg = lg, we = le;
++#pragma unroll
++        for (int off = 1; off < 32; off <<= 1) {
++            const int vg = __shfl_up(wg, off);
++            const int ve = __shfl_up(we, off);
++            if ((tid & 31) >= off) { wg += vg; we += ve; }
++        }
++        __shared__ int swg[BLOCK_SIZE / 32], swe[BLOCK_SIZE / 32];
++        if ((tid & 31) == 31) { swg[tid >> 5] = wg; swe[tid >> 5] = we; }
++        __syncthreads();
++        if (tid < BLOCK_SIZE / 32) {
++            int ag = 0, ae = 0;
++            for (int i = 0; i < tid; ++i) { ag += swg[i]; ae += swe[i]; }
++            swg[tid] = ag; swe[tid] = ae;
 +        }
 +        __syncthreads();
++        sg[tid] = wg + swg[tid >> 5];
++        se[tid] = we + swe[tid >> 5];
 +        const int tex_g = sg[tid] - lg;
 +        const int tex_e = se[tid] - le;
 +        #pragma unroll
@@ -1566,11 +1579,11 @@ index 1b9e63516..ae3b8210c 100644
 +        if (tid == BLOCK_SIZE - 1) {
 +            carry_g += sg[BLOCK_SIZE - 1];
 +            carry_e += se[BLOCK_SIZE - 1];
-         }
++        }
 +        __syncthreads();
-     }
- }
- 
++    }
++}
++
 +// ---------------------------------------------------------------------------
 +// block-level histogram path (additive == nullptr, derived default).
 +//
@@ -1666,8 +1679,8 @@ index 1b9e63516..ae3b8210c 100644
 +            if (cur_match && cur_h > 0) {
 +                atomicAdd(&histogram[cur_bin], cur_h);
 +            }
-+        }
-+    }
+         }
+     }
 +    if (inf_pending > 0) {
 +        atomicAdd(&histogram[inf_bin], inf_pending);
 +    }
@@ -1746,11 +1759,10 @@ index 1b9e63516..ae3b8210c 100644
 +    __syncthreads();
 +    const size_t off = ((size_t) row * blocks_per_row + hb) * NBINS;
 +    block_histograms[off + tid] = histogram[tid];
-+}
-+
+ }
+ 
  template<typename kv_t>
- static void indexer_topk_radix_cuda(
-         ggml_cuda_pool & pool,
+@@ -310,6 +716,7 @@ static void indexer_topk_radix_cuda(
          const float * score, const int * cell_blk, const kv_t * additive,
          const indexer_topk_extra extra,
          int * dst, int ncols, int nrows, int n_tps, int n_blocks, int n_kv, int k,
@@ -1758,7 +1770,7 @@ index 1b9e63516..ae3b8210c 100644
          cudaStream_t stream) {
      constexpr int BLOCK_SIZE = 256;
      constexpr int RADIX_BITS = 8;
-@@ -318,43 +712,116 @@ static void indexer_topk_radix_cuda(
+@@ -318,43 +725,116 @@ static void indexer_topk_radix_cuda(
  
      ggml_cuda_pool_alloc<indexer_topk_radix_state> states_alloc(pool, nrows);
      ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
@@ -1891,7 +1903,7 @@ index 1b9e63516..ae3b8210c 100644
  }
  
  void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-@@ -365,6 +832,7 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+@@ -365,6 +845,7 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
      const ggml_tensor * q_pos    = dst->src[4];
      const ggml_tensor * blk_idx  = dst->src[5];
      const ggml_tensor * blk_tail = dst->src[6];
@@ -1899,7 +1911,7 @@ index 1b9e63516..ae3b8210c 100644
      const float * score_d    = (const float *) score->data;
      const int   * cell_blk_d = (const int  *) cell_blk->data;
      int *         dst_d      = (int *) dst->data;
-@@ -386,6 +854,7 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+@@ -386,6 +867,7 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
      GGML_ASSERT(additive == nullptr || ggml_is_contiguous(additive));
      GGML_ASSERT(cell_pos == nullptr || (ggml_is_contiguous(cell_pos) && ggml_is_contiguous(q_pos)));
      GGML_ASSERT(blk_idx  == nullptr || (ggml_is_contiguous(blk_idx)  && ggml_is_contiguous(blk_tail)));
@@ -1907,7 +1919,7 @@ index 1b9e63516..ae3b8210c 100644
      GGML_ASSERT(ggml_is_contiguous(dst));
  
      const int n_blocks = score->ne[0];
-@@ -397,12 +866,26 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+@@ -397,12 +879,26 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
      ggml_cuda_pool & pool = ctx.pool();
  
      if (additive == nullptr || additive->type == GGML_TYPE_F16) {

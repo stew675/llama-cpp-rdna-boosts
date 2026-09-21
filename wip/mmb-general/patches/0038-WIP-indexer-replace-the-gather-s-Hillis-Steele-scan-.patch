@@ -1,0 +1,76 @@
+From aa55dfef8d480baf303ee1edc2da51d72ec00e15 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 20 Sep 2026 20:49:25 -0500
+Subject: [PATCH 38/38] WIP indexer: replace the gather's Hillis-Steele scan
+ with a warp-shuffle one
+
+The gather ran a 256-thread Hillis-Steele inclusive scan of (g_count, e_count)
+with 8 steps x 2 __syncthreads, i.e. ~19 barriers per 1024-cell tile.  A
+warp-shuffle scan plus one 2-barrier offset pass replaces it; integer sums are
+associative so the prefix values -- and therefore the placement order -- are
+identical.
+
+pp32768 (target model): indexer_topk_write_blocks_grouped 259.9 -> 229.6 ms
+(-11.7 %), indexer family 1146.5 -> 1117.4 ms (-2.5 %, 1.86 -> 1.80 % of the run).
+
+Bit-identical: long-context same-seed (16k-token prefill, the regime where the
+sparse indexer actually runs) 9565ffa670c3 with and without the change;
+test-backend-ops -o INDEXER_TOPK 2/2 and -o FLASH_ATTN_QSA 2/2; PPL 10.6015;
+greedy 9c281c415082; width probe PASS.  (The short gates cannot reach this path --
+the indexer selection width is 2051, so the prose prompt at -c 8192 stays on the
+dense shortcut; the long-context A/B is the gate that matters here.)
+
+MEASURED NEGATIVE (recorded so it is not retried): skipping the per-cell key
+evaluation for blocks whose key cannot reach the prefix -- the handover's "skip
+the whole block" intermediate -- is provably output-preserving but gained
+NOTHING (259.9 -> 262.2 ms).  The gather is not memory-bound on cell_pos, which
+is what pointed at the barrier-heavy scan instead.
+---
+ ggml/src/ggml-cuda/indexer-topk.cu | 29 +++++++++++++++++++++--------
+ 1 file changed, 21 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
+index ae3b8210c..390fc7a47 100644
+--- a/ggml/src/ggml-cuda/indexer-topk.cu
++++ b/ggml/src/ggml-cuda/indexer-topk.cu
+@@ -484,16 +484,29 @@ static __global__ void indexer_topk_write_blocks_grouped(
+             lgpre[v] = lg; lepre[v] = le;
+             lg += g; le += e;
+         }
+-        sg[tid] = lg;
+-        se[tid] = le;
+-        for (int off = 1; off < BLOCK_SIZE; off <<= 1) {
+-            __syncthreads();
+-            const int vg = (tid >= off) ? sg[tid - off] : 0;
+-            const int ve = (tid >= off) ? se[tid - off] : 0;
+-            __syncthreads();
+-            if (tid >= off) { sg[tid] += vg; se[tid] += ve; }
++        // inclusive block scan of (g_count, e_count).  The Hillis-Steele form this replaces ran
++        // 8 steps x 2 __syncthreads (~19 barriers per 1024-cell tile) and dominated the kernel --
++        // an unselected-block skip in the cell loop measured NO gain, which is what pointed here.
++        // Warp-shuffle scan + a 2-barrier offset pass; integer sums are associative so the
++        // prefix values (and therefore the placement) are identical.
++        int wg = lg, we = le;
++#pragma unroll
++        for (int off = 1; off < 32; off <<= 1) {
++            const int vg = __shfl_up(wg, off);
++            const int ve = __shfl_up(we, off);
++            if ((tid & 31) >= off) { wg += vg; we += ve; }
++        }
++        __shared__ int swg[BLOCK_SIZE / 32], swe[BLOCK_SIZE / 32];
++        if ((tid & 31) == 31) { swg[tid >> 5] = wg; swe[tid >> 5] = we; }
++        __syncthreads();
++        if (tid < BLOCK_SIZE / 32) {
++            int ag = 0, ae = 0;
++            for (int i = 0; i < tid; ++i) { ag += swg[i]; ae += swe[i]; }
++            swg[tid] = ag; swe[tid] = ae;
+         }
+         __syncthreads();
++        sg[tid] = wg + swg[tid >> 5];
++        se[tid] = we + swe[tid >> 5];
+         const int tex_g = sg[tid] - lg;
+         const int tex_e = se[tid] - le;
+         #pragma unroll
+-- 
+2.55.0
+

@@ -138,6 +138,63 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 25 (2026-09-20): the indexer gather's **warp-shuffle scan** (−11.7 % on the gather),
+## and the block-level gather/emit closed as unbuildable
+
+Tip `aa55dfef8` (38th commit).  Full record: HANDOVER "session 25".
+
+### The block-level gather/emit is DEAD — and that closes the indexer line
+
+This was the handover's "one real remaining optimisation".  `llama-memory-hybrid-idx.cpp:743`:
+
+```c
+cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;   // idx = ranked ? rank[j] : cells.pos_get(j)
+```
+
+* a block's cells are in **`idx % r` slot order**, not column order (the ranked path would need a
+  per-block sort);
+* and the write is inside `if (blk_of[j] >= 0)`, so **every unpooled cell — including the tail, which
+  `blk_tail` makes always visible and therefore likely selected — is not in `blk_cells` at all.** A
+  block walk therefore still needs a full `n_kv` scan to find them, which removes the entire point.
+
+The ideal outcome was ~0.4 % of the run.  **Do not build it.**
+
+### The useful negative: the block is not the cost, the barrier-heavy scan is
+
+The handover's suggested intermediate — skip the per-cell key evaluation for blocks whose key cannot
+reach the prefix — is provably output-preserving, so it was implemented and A/B'd:
+**`259.9 -> 262.2 ms`, nothing.**  That says the gather is *not* memory-bound on `cell_pos`, which
+pointed at what was: a 256-thread **Hillis-Steele** scan of (g_count, e_count) with 8 steps × 2
+`__syncthreads` = **~19 barriers per 1024-cell tile**.
+
+### What landed
+
+Warp-shuffle inclusive scan + one 2-barrier offset pass.  Integer sums are associative, so the prefix
+values — and therefore the ascending-column placement — are identical.
+
+| pp32768, target model | before | after |
+|---|---:|---:|
+| `indexer_topk_write_blocks_grouped` (gather) | 259.9 ms | **229.6 ms (−11.7 %)** |
+| indexer family | 1146.5 ms (1.86 %) | **1117.4 ms (1.80 %)** |
+
+### The gate that matters here
+
+The indexer selection width is 2051, so a prose prompt at `-c 8192` **never leaves the dense shortcut**
+— the normal PPL/greedy/width gates cannot reach this path at all.  The gate that does is a
+**long-context same-seed A/B** (16k-token prefill): `9565ffa670c3` with and without.  Plus
+`test-backend-ops -o INDEXER_TOPK` / `-o FLASH_ATTN_QSA` (2/2 each), PPL 10.6015, greedy
+`9c281c415082`, width PASS.
+
+### Left, deliberately (each < 0.2 % of the run)
+
+`histogram_blocks` is the biggest remaining indexer kernel (**462 ms = 41 % of the family**) and
+recomputes the per-`(row,block)` key in each of its 3 passes, and re-sums `wvis` per range.  Caching the
+key (or a compact per-block bin) from pass 1 and a per-`(row,hb)` visible-count total would remove
+~2 loads + 6 ALU per block-visit.  Real, but neither is order-sensitive and neither is worth the
+complexity today.
+
+---
+
 ## UPDATE — session 24 (2026-09-20): the **`load_regs` field preload** — the GLU's dequant ran exposed.
 ## `routed_glu` **990 -> 841 ms (−15.1 %)**, total GPU kernel **4015 -> 3879 ms**, pp8192 **1116 t/s**
 

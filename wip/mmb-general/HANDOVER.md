@@ -39,7 +39,7 @@ The WIP lives on **two dedicated branches**.  **New work goes to those branches,
 
 1. `git -C ~/llama-cpp-rdna-boosts switch wip-mmb-general` — verify with `git branch --show-current`
    (must be **`wip-mmb-general`**, never `main`).
-2. `cd ~/llama-wip-mmb`; confirm `git status` clean and `git log --oneline -1` = **`94251003e`**.
+2. `cd ~/llama-wip-mmb`; confirm `git status` clean and `git log --oneline -1` = **`aa55dfef8`**.
 3. Build with the §3 command; run the **§Gates** before/after any numerics-touching change (all
    currently green: PPL **10.6015**, greedy **`9c281c415082`**, width probe **PASS**).
 4. Pick an item from **Remaining work** below.  The current mandate is the **IQ3_S dequant follow-up
@@ -72,18 +72,32 @@ LDS budget — the `BM=32` route in the follow-up brief in `### F. MMB restructu
 and it is speculative.  Everything else below is at its practical floor, and the remaining work is
 **promotion (item E), which needs the maintainer**.
 
-* **A. Indexer (at its practical floor; the active lever is now F).**
-  1. **Block-level gather/emit — the one real remaining optimisation.**  The gather is still
-     cell-level (`indexer_topk_write_blocks_grouped`, **259 ms at 32K = 23 % of the family**); emitting
-     each selected block's cells directly would take it to ~60 ms (~1.2x on the family).  Blocked on
-     making it **order-exact**: `blk_cells` lists a block's cells in `idx % r` order, which equals
-     ascending **column** order only when the cache cell index is the position (single sequence, no
-     ranked/mrope reorder) — otherwise the block's cells need a small sort — and the **dead/spare
-     block** (`blk_idx == INT32_MAX`, the unpooled incomplete tail + empty cells) is **not** in
-     `blk_cells` at all and still needs a scan.  It must preserve the deterministic ascending-column
-     order (gate 7) and be checked with the same-seed text gate, not just t/s.  (The `wvis` the block
-     path already computes could drive a cheap "skip the whole block" test in the cell-level gather
-     as a smaller, order-preserving intermediate step.)
+* **A. Indexer — CLOSED (session 25): at its practical floor.**  The family is now **1117 ms at
+  pp32768 = 1.80 %** of the run (from 2.94 % at the start of this work).  Session 25 measured the
+  remaining ideas and closed them:
+  1. **Block-level gather/emit — investigated, DEAD.**  Reading how `blk_cells` is built settles it:
+     `llama-memory-hybrid-idx.cpp:743` writes `cur_blk_cells[blk_of[j]*r + (idx%r)] = j` with
+     `idx = ranked ? rank[j] : cells.pos_get(j)` — so a block's cells sit in **`idx%r` slot order**,
+     which is ascending column order only in the unranked, contiguous-pool case (the ranked path needs
+     a per-block sort of `r` cells).  Worse, the **dead/spare block is unfixable**: the `if
+     (blk_of[j] >= 0)` guard means every unpooled cell (`cell_blk[j] == dead_bid`, incl. the tail,
+     which `blk_tail` makes *always visible* and therefore likely selected) is **absent from
+     `blk_cells`**, so a block walk still needs a full `n_kv` scan to find them.  That removes the
+     entire point, and the ideal outcome was only ~0.4 % of the run.  **Do not build it.**
+  2. **The "skip the whole block" intermediate — measured, NO GAIN.**  Skipping the per-cell key
+     evaluation for blocks whose key cannot reach the prefix is provably output-preserving (a block
+     below the prefix emits nothing and contributes nothing to the carry) and was implemented and
+     A/B'd: `259.9 -> 262.2 ms` — nothing.  **The gather is not memory-bound on `cell_pos`.**
+  3. **What DID pay: the scan.**  Acting on (2) pointed at the barrier-heavy Hillis-Steele scan
+     (8 steps x 2 `__syncthreads` = ~19 barriers per 1024-cell tile).  A warp-shuffle scan + a
+     2-barrier offset pass: **gather 259.9 -> 229.6 ms (-11.7 %)**, family -2.5 %, bit-identical.
+  4. **Still open but not worth it** (each <0.2 % of the run for real complexity): `histogram_blocks`
+     is the biggest remaining indexer kernel at **462 ms / 41 % of the family** — it recomputes the
+     per-`(row,block)` key in each of the 3 passes and re-sums `wvis` per range.  Caching the key (or a
+     compact per-block bin) from pass 1 would trade ~2 loads + 6 ALU per block-visit for 1 load; and
+     a per-`(row,hb)` visible-count total from pass 1 would let passes 2-4 skip the `wvis` load.  Both
+     are real but small, and neither is order-sensitive — the low-risk place to look if the indexer
+     is ever revisited.
   2. Small polish: template the `indexer_topk_extra` branches (`blk_idx`/`cell_pos` are run-time checks
      in the hot loop); optionally fuse `hist_accum` into `select` (blocked on `select` being per-row
      while the suffix counts are per-(row, block)).  Also open: the block passes' key-bound cost
@@ -647,14 +661,14 @@ unilaterally** -- needs a beta window / go-ahead.
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`94251003e`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`aa55dfef8`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0037` + `commits.txt`, in this repo, pushed to `origin/wip-mmb-general` |
-| verify | `git am` of `patches/` on a fresh `8a2567e1e` — clean (37 commits, applied tree `9813fc8dcaed5b5d506650f5a711eb91fd6b5307` == tip) |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0038` + `commits.txt`, in this repo, pushed to `origin/wip-mmb-general` |
+| verify | `git am` of `patches/` on a fresh `8a2567e1e` — clean (38 commits, applied tree `b310cc68d33ec3f93efaa16c6505c4db981794b1` == tip) |
 | build | §3 | run | §4 |
 | current numbers | the **session 24 UPDATE below** (the `load_regs` field preload -- routed_glu 990 -> **841 ms**, total GPU kernel 4015 -> **3879 ms**, pp8192 **1116 t/s**) then the **session 23 UPDATE** (the tile-class threshold) then the **session 20 UPDATE** (the `rms_norm` register-cache **refutation** -- the session-19 tip `2da50418d` is unchanged) and the **session 19 UPDATE** (indexer pass-1 per-block histogram atomics + the block-pass warp reduction) -- indexer family pp8192 **71.7 ms** / pp32768 **1146.6 ms** -- plus the **session 18 UPDATE** (the block-level histogram + `blk_cells` src), the **session 15 UPDATE** (qsa3 compile-time gate + the rocprofiler-register profiling caveat), the **session 14/13 UPDATEs** (non-temporal) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
 
-**Historical ordering of the UPDATE sections:** 24 (newest, 2026-09-20, the `load_regs` IQ3_S field preload) -> 23 (the tile-class threshold: the small tile's 4x A-panel dequant) -> 22 (the `v_perm` bf16 pack + the A-panel split) -> 21 (the A-panel double-buffered GLU tile) -> 20 (the `rms_norm` register-cache refutation) → 19 (2026-09-20, the indexer pass-1 per-block histogram atomics + the block-pass warp reduction) → 18 (2026-09-20, the indexer block-level histogram path + the `blk_cells` op src) → 17 (2026-09-20, indexer block-key sharing) → 16 (2026-09-20, the indexer count-pass elimination + the "compact after pass 1" refutation) → 15 (2026-09-20, the qsa3 compile-time gate + the rocprofiler-register profiling caveat) → 14 (2026-09-20, the non-temporal load sweep: concat/moe/unary) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
+**Historical ordering of the UPDATE sections:** 25 (newest, 2026-09-20, the indexer gather's warp-shuffle scan; the block-gather closed) -> 24 (the `load_regs` IQ3_S field preload) -> 23 (the tile-class threshold: the small tile's 4x A-panel dequant) -> 22 (the `v_perm` bf16 pack + the A-panel split) -> 21 (the A-panel double-buffered GLU tile) -> 20 (the `rms_norm` register-cache refutation) → 19 (2026-09-20, the indexer pass-1 per-block histogram atomics + the block-pass warp reduction) → 18 (2026-09-20, the indexer block-level histogram path + the `blk_cells` op src) → 17 (2026-09-20, indexer block-key sharing) → 16 (2026-09-20, the indexer count-pass elimination + the "compact after pass 1" refutation) → 15 (2026-09-20, the qsa3 compile-time gate + the rocprofiler-register profiling caveat) → 14 (2026-09-20, the non-temporal load sweep: concat/moe/unary) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body and are correct except where
 an UPDATE says otherwise.
@@ -662,6 +676,58 @@ an UPDATE says otherwise.
 **Next work:** see the **"FOR THE NEXT SESSION"** brief at the very top of this file — its ordered
 list is the authoritative one, and the historical "next-work order" lists inside the UPDATE sections
 below are superseded.
+
+---
+
+## UPDATE — session 25 (2026-09-20): the **indexer gather's block scan** — warp shuffle instead of
+## Hillis-Steele, gather **-11.7 %**; and the block-level gather/emit is CLOSED as unbuildable
+
+Tip `aa55dfef8` (38th commit).  The session-24 follow-up ("look into the indexer block-gather").
+Full record: README "session 25".
+
+**Verdict first: the block-level gather/emit (the handover's item A.1) is DEAD, and the whole indexer
+line is CLOSED.**  The handover had it as "the one real remaining optimisation"; reading
+`llama-memory-hybrid-idx.cpp:743` shows why it cannot be built:
+
+```c
+cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;   // idx = ranked ? rank[j] : cells.pos_get(j)
+```
+
+* the cells of a block sit in **`idx % r` slot order**, not column order, so the ranked path needs a
+  per-block sort of `r` cells;
+* and decisively, the write is inside `if (blk_of[j] >= 0)`, so **every unpooled cell — including the
+  tail, which `blk_tail` makes *always visible* and therefore likely selected — is absent from
+  `blk_cells`**.  A block walk still needs a full `n_kv` scan to find them, which removes the entire
+  point.  The ideal outcome was ~0.4 % of the run.  Do not build it.
+
+**The "skip the whole block" intermediate was implemented, A/B'd and gained NOTHING.**  Skipping the
+per-cell key evaluation for blocks whose key cannot reach the prefix is provably output-preserving
+(a sub-prefix block emits nothing and contributes nothing to the carry): measured `259.9 -> 262.2 ms`.
+**That is the useful signal** — the gather is *not* memory-bound on `cell_pos`.
+
+**What that pointed at, and what landed.**  The gather ran a 256-thread **Hillis-Steele** inclusive
+scan of (g_count, e_count): 8 steps x 2 `__syncthreads` = **~19 barriers per 1024-cell tile**.  It is
+now a warp-shuffle scan plus one 2-barrier offset pass (integer sums are associative, so the prefix
+values and the placement order are identical).
+
+| pp32768, target model | before | after |
+|---|---:|---:|
+| `indexer_topk_write_blocks_grouped` (the gather) | 259.9 ms | **229.6 ms (−11.7 %)** |
+| indexer family | 1146.5 ms (1.86 %) | **1117.4 ms (1.80 %)** |
+| `indexer_topk_histogram_blocks` (×3) | 462.1 | 462.1 |
+| `indexer_topk_histogram_pass1` | 265.6 | 265.6 |
+
+**Bit-identical.**  Note which gate matters: the indexer selection width is 2051, so a prose prompt at
+`-c 8192` never leaves the dense shortcut and the **normal PPL/greedy/width gates cannot reach this
+path at all**.  The gate that does is a **long-context same-seed A/B** (16k-token prefill):
+`9565ffa670c3` with and without.  Plus `test-backend-ops -o INDEXER_TOPK` and `-o FLASH_ATTN_QSA`
+(2/2 each), PPL 10.6015, greedy `9c281c415082`, width PASS.
+
+**Still open, not worth it** (each < 0.2 % of the run): `histogram_blocks` is the biggest remaining
+indexer kernel (**462 ms = 41 % of the family**) and recomputes the per-`(row,block)` key in each of
+its 3 passes and re-sums `wvis` per range.  Caching the key (or a compact per-block bin) from pass 1,
+and a per-`(row,hb)` visible-count total to let passes 2-4 skip the `wvis` load, are both real.  Neither
+is order-sensitive — the low-risk place to look if the indexer is ever revisited.
 
 ---
 
