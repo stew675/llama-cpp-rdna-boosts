@@ -138,6 +138,100 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 22 (2026-09-20): the **bf16 RNE pack becomes one `v_perm_b32`** — the 35B MMB family
+## **−2.3 %**, Flash-Next total GPU **−2.3 %** with session 21; IQ3_S dequant audited and re-derived
+
+The session-21 follow-up (the "cheaper IQ3_S dequant").  The first thing to establish was **what had
+actually been optimised**: see the audit below — IQ3_S was *not*.
+
+### Dequant audit (the answer to "did we already do this?")
+
+| WTYPE | type | shape of the helper | optimised? |
+|---|---|---|---|
+| 0 | IQ4_NL | `mmb_dq_row36` | **yes** — 16-entry LUT held in 4 registers, applied with `v_perm_b32` (the `(kv+128)`/`fma(...,-128*d)` trick keeps it bit-exact) |
+| 8 | IQ4_XS | `mmb_dq_row_iq4xs` | **yes** — same register LUT (IQ4_XS shares the IQ4_NL codebook) |
+| 1 | Q8_0 | `mmb_dq_row68` | arithmetic, no LUT |
+| 3,4,6,7,9 | Q4_K, Q5_1, Q5_K, Q6_K, Q3_K | `mmb_dq_row_q4k`/`_q5_1`/`_q5k`/`_q6k`/`_q3k` | arithmetic (affine `fma(v,d,±m)`), no LUT |
+| **5** | **IQ3_S** | `mmb_dq_row_iq3s` | **no** — 16 divergent `iq3s_grid[512]` **global** lookups, a direct port of upstream's `dequantize_iq3_s` |
+| **10** | **IQ3_XXS** | `mmb_dq_row_iq3xxs` | **no** — same, `iq3xxs_grid[256]` + `ksigns_iq2xs` |
+
+So the two i-quants with a 512/256-entry grid were added as naive ports (the register-LUT trick cannot
+apply at that size — it needs 4 registers, i.e. 16 entries), while the two 16-entry codebooks got the
+register treatment.  Upstream (`dequantize.cuh`, `vecdotq.cuh`, `mmq-load-tiles.cuh`) uses the same
+global grid for IQ3_S, so this is upstream-wide, not an MMB regression.
+
+### How much does it cost?  (a standalone harness, because the in-situ A/B is confounded)
+
+`roofline`: the Flash-Next GLU dequantizes `20490 tiles x 64 rows x 40 ks x 2 panels x 64 values =
+6.71e9` values per call.  A standalone `mmb_dq_row_iq3s` harness (`/tmp/dqbench`, the helper copied
+verbatim + `iq3s_grid.h` extracted from `ggml-common.h`) measures **1.36 Tval/s**, i.e. **~5.0 ms of
+the 9.81 ms** GLU call — **the dequant is ~51 % of the GLU kernel**, matching the session-21 ISA count
+(~3800 VALU vs 32 WMMA per K-step).  The harness is also the bit-identity oracle (it catches `+0/-0`).
+
+### What landed: one-instruction bf16 RNE pack
+
+`v_cvt_pk_bf16_f32` does not exist on gfx11 and the compiler's `__bf16` **truncates** (10/4096 values
+differ from RNE), so the pack was `mmb_f2bf(a) | (mmb_f2bf(b) << 16)` = round each word, `>>16`, then
+shift/or.  It is now:
+
+```
+ua += 0x7fff + ((ua>>16)&1);  ub += 0x7fff + ((ub>>16)&1);
+return __builtin_amdgcn_perm(ua, ub, 0x03020706u);
+```
+
+`v_perm_b32` bytes 0..3 come from its **second** operand and 4..7 from its first, so `0x03020706` picks
+`{ua.b2, ua.b3, ub.b2, ub.b3}` = `{bf16(a), bf16(b)}` — one instruction replacing the per-value `>>16`
+plus the shift/or.  Bit-identity was proven on 1M random float pairs (0 diffs) and on `d == 0` weights
+(where `+0/-0` would otherwise differ), then by the gates.
+
+Isolated IQ3_S dequant body: **765 → 616 SASS instructions**, **1364 → 1701 Gval/s**.
+
+| workload | metric | before | after |
+|---|---|---:|---:|
+| 35B Q4_K_M (fixed prompt, min-of-3) | MMB family | 1008 ms | **985 (−2.3 %)** |
+| | `mr` (Q5_K/Q6_K routed) | 203.6 | **187.4 (−7.9 %)** |
+| | `mrg` (Q4_K GLU) | 287.4 | **278.5 (−3.0 %)** |
+| Flash-Next IQ4_XS | Q6_K dense | 169.2 | **156.4 (−7.6 %)** |
+| | Q8_0 dense / IQ4_NL routed | 491.3 / 387.5 | 488.7 / 384.6 (−0.5 / −0.8 %) |
+| | **total GPU kernel (with session 21's DBUF)** | 4409 (no DBUF, no perm) | **4309 (−2.3 %)** |
+
+**The IQ3_S dequant itself does not take the perm pack** — it *regresses* there (1318 → 1355 ms without
+DBUF, 1225 → 1258 with; a clean 2x2 was run).  The LUT-latency-bound path apparently wants the shift/or
+form, which can start as soon as its own two words are rounded rather than waiting on all eight.  So
+`mmb_pack2_so` (the shift/or form) is kept and used by `mmb_dq_row_iq3s` / `_iq3xxs` only.
+
+### Rejected this session (measured)
+
+* **An LDS-resident `iq3s_grid`** (2 KB `__shared__`, loaded once per block, 32-bit `ds_load` instead of a
+  64-bit-addressed global load): **+0.6 %** on the isolated dequant — i.e. nothing.  The ablation that
+  *does* move the needle is "grid const (keep the index math)" (+10 %) and "no index math at all"
+  (+36 %), so the cost is the **index/address computation (~26 %)**, not the LUT load.
+* **Sign-by-XOR** (flip the float sign bit instead of `? -g1 : g1`): **NOT bit-identical.**  With a zero
+  product the current ternary yields `+0.0` while XOR yields `-0.0`, and `mmb_f2bf(-0.0) = 0x8000` ≠
+  `mmb_f2bf(+0.0) = 0x0000`.  (The harness caught this on explicitly zero-`d` rows; it would have been a
+  silent weight corruption.)
+
+### Next (ranked)
+
+1. **The A-panel dequant only uses 64 of 256 threads.**  For every MMB tile `A_ITEMS = ceil(BM/256)` and
+   the row is `tid + i*256`, so with `BM = 64` (both GLU tiles) only threads 0..63 dequantize while
+   192 idle; the dense `BM = 128` tiles use 128/256.  Splitting each 64-value row across the 8 `il`
+   groups (`PARTS = 256/BM` threads per row) would put all 8 warps on the dequant.  This is the largest
+   identified structural item left — but with `DBUF` on, the idle warps already run ahead into the WMMA
+   (there is no barrier between `store_lds_a` and the WMMA in the DBUF path), so the gain is bounded by
+   how much of the dequant is still exposed.  Measure before building.
+2. A **fused gate+up dequant** sharing the grid-index/scale arithmetic between the two panels.
+3. Index/address arithmetic: precompute the 8 index-high-bits per `qhg` once, or preload the block's
+   `qs`/`qh`/`sg` fields as wide vectors in `load_regs` (as `WTYPE 0/1/3/4` already do).
+4. Nothing else fits in LDS; the warp-specialised 2x ring does not.
+
+### Gates
+
+PPL c2048 **10.6015**, greedy **`9c281c415082`** (624 chars), width probe **PASS** (maxdiff 0) — all
+bit-identical.  34th commit `16c0fe07c`; backup regenerated and `git am` 34/34 verified.
+
+---
+
 ## UPDATE — session 21 (2026-09-20): the MMB restructure lands an **A-panel double-buffered GLU tile**
 ## (IQ3_S): the weight dequant overlaps the WMMA (**−6.7 % GLU / −1.8 % total GPU time**), bit-identically
 

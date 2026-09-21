@@ -1,0 +1,97 @@
+From 16c0fe07cadb369cb816b29e6fe9fb8fc97b2550 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 20 Sep 2026 19:05:24 -0500
+Subject: [PATCH 34/34] WIP mmb: v_perm bf16 pack in the dequants (all but the
+ IQ3 LUT paths)
+
+mmb_pack2 now rounds in integer and assembles the pair with one v_perm_b32
+(bytes 2,3 of each rounded word; v_perm's bytes 0..3 come from its second
+operand, so the selector is 0x03020706).  That removes the per-value >>16 and
+the shift/or chain: the isolated IQ3_S dequant body drops 765 -> 616 SASS
+instructions and its isolated throughput rises 1364 -> 1701 Gval/s.
+
+The scale is type-dependent, so it is gated:
+  * 35B (Q4_K GLU, Q5_K/Q6_K routed): MMB family 1008 -> 985 ms (-2.3 %),
+    mr (Q5_K/Q6_K) 203.6 -> 187.4 (-7.9 %), mrg (Q4_K) 287.4 -> 278.5 (-3.0 %).
+  * Flash-Next IQ4_XS: Q6_K dense 169.2 -> 156.4 (-7.6 %), Q8_0 dense -0.5 %,
+    IQ4_NL routed -0.8 %; total GPU kernel 4330 -> 4309 ms with DBUF on.
+  * IQ3_S GLU REGRESSES (1318 -> 1355 ms without DBUF, 1225 -> 1258 with): the
+    LUT-latency-bound path waits on all eight rounded words before the perm can
+    start.  mmb_dq_row_iq3s / _iq3xxs therefore keep the shift/or form
+    (mmb_pack2_so).
+
+Bit-identical: PPL c2048 10.6015, greedy 9c281c415082, width probe PASS.  The
+perm form was also checked against the shift/or form on 1M random float pairs
+(0 diffs) and on d == 0 weights, where +0/-0 would otherwise differ.
+
+Also measured and REJECTED this session (recorded in the handover):
+  * an LDS-resident iq3s_grid (2 KB shared): +0.6 % on the isolated dequant, so
+    the global LUT load is not the cost -- the index/addressing math is (~26 %).
+  * sign-by-XOR (float sign bit): NOT bit-identical -- the current ternary
+    yields +0.0 for a zero product, XOR yields -0.0.
+---
+ ggml/src/ggml-cuda/mmb.cu | 34 +++++++++++++++++++++++++---------
+ 1 file changed, 25 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 141e3cefa..573196dfd 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -15,7 +15,23 @@ typedef float v8f  __attribute__((ext_vector_type(8)));
+ constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
+ 
+ __device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
+-__device__ __forceinline__ uint32_t mmb_pack2(float a, float b) { return (uint32_t)mmb_f2bf(a) | ((uint32_t)mmb_f2bf(b) << 16); }
++// RNE float->bf16.  `v_cvt_pk_bf16_f32` does not exist on gfx11, and `__bf16` lowers to a
++// truncating convert (10/4096 values differ from RNE), so the rounding is done in integer and the
++// pair is assembled with `v_perm_b32` (bytes 2,3 of each rounded word) -- one instruction where the
++// shift/or form needed two, and no `>>16` per value.  Selector 0x03020706 = {ua.b2, ua.b3, ub.b2,
++// ub.b3}: v_perm's byte 0..3 come from its second operand, 4..7 from its first.  Bit-identical
++// (incl. +0/-0, `d == 0` weights) -- verified 1M random pairs, `PPL`/greedy/width gates.
++// The shift/or form.  Kept for the IQ3 dequants: they are LUT-latency bound and the v_perm form,
++// which needs all eight rounded words before it can start, is measurably slower there
++// (IQ3_S GLU 1318 -> 1355 ms without DBUF, 1225 -> 1258 with).  Every other dequant prefers perm.
++__device__ __forceinline__ uint32_t mmb_pack2_so(float a, float b) { return (uint32_t)mmb_f2bf(a) | ((uint32_t)mmb_f2bf(b) << 16); }
++
++__device__ __forceinline__ uint32_t mmb_pack2(float a, float b) {
++    uint32_t ua = __float_as_uint(a), ub = __float_as_uint(b);
++    ua += 0x7fffu + ((ua >> 16) & 1u);
++    ub += 0x7fffu + ((ub >> 16) & 1u);
++    return __builtin_amdgcn_perm(ua, ub, 0x03020706u);
++}
+ __constant__ int8_t mmb_kv_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+ __device__ __forceinline__ float mmb_h2f(uint16_t h) { return (float) __builtin_bit_cast(_Float16, h); }
+ 
+@@ -150,10 +166,10 @@ __device__ __forceinline__ void mmb_dq_row_iq3xxs(const uint8_t * base, const in
+                 v[j]     = (signs >> j)       & 1u ? -g1 : g1;
+                 v[4 + j] = (signs >> (4 + j)) & 1u ? -g2 : g2;
+             }
+-            out[4 * il + 0] = mmb_pack2(v[0], v[1]);
+-            out[4 * il + 1] = mmb_pack2(v[2], v[3]);
+-            out[4 * il + 2] = mmb_pack2(v[4], v[5]);
+-            out[4 * il + 3] = mmb_pack2(v[6], v[7]);
++            out[4 * il + 0] = mmb_pack2_so(v[0], v[1]);
++            out[4 * il + 1] = mmb_pack2_so(v[2], v[3]);
++            out[4 * il + 2] = mmb_pack2_so(v[4], v[5]);
++            out[4 * il + 3] = mmb_pack2_so(v[6], v[7]);
+         }
+     }
+ }
+@@ -301,10 +317,10 @@ __device__ __forceinline__ void mmb_dq_row_iq3s(const uint8_t * base, const int
+                 v[j]     = (signs >> j)     & 1u ? -g1 : g1;
+                 v[4 + j] = (signs >> (4+j)) & 1u ? -g2 : g2;
+             }
+-            out[4*il + 0] = mmb_pack2(v[0], v[1]);
+-            out[4*il + 1] = mmb_pack2(v[2], v[3]);
+-            out[4*il + 2] = mmb_pack2(v[4], v[5]);
+-            out[4*il + 3] = mmb_pack2(v[6], v[7]);
++            out[4*il + 0] = mmb_pack2_so(v[0], v[1]);
++            out[4*il + 1] = mmb_pack2_so(v[2], v[3]);
++            out[4*il + 2] = mmb_pack2_so(v[4], v[5]);
++            out[4*il + 3] = mmb_pack2_so(v[6], v[7]);
+         }
+     }
+ }
+-- 
+2.55.0
+

@@ -1940,10 +1940,10 @@ index 1b9e63516..ae3b8210c 100644
  
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
 new file mode 100644
-index 000000000..141e3cefa
+index 000000000..573196dfd
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -0,0 +1,1612 @@
+@@ -0,0 +1,1628 @@
 +#include "mmb.cuh"
 +#include "unary.cuh"
 +#include <unordered_map>
@@ -1961,7 +1961,23 @@ index 000000000..141e3cefa
 +constexpr int MMB_BK = 64, MMB_NT = 256, MMB_LDS_STRIDE = MMB_BK + 8;
 +
 +__device__ __forceinline__ uint16_t mmb_f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7fffu + ((u >> 16) & 1u); return (uint16_t)(u >> 16); }
-+__device__ __forceinline__ uint32_t mmb_pack2(float a, float b) { return (uint32_t)mmb_f2bf(a) | ((uint32_t)mmb_f2bf(b) << 16); }
++// RNE float->bf16.  `v_cvt_pk_bf16_f32` does not exist on gfx11, and `__bf16` lowers to a
++// truncating convert (10/4096 values differ from RNE), so the rounding is done in integer and the
++// pair is assembled with `v_perm_b32` (bytes 2,3 of each rounded word) -- one instruction where the
++// shift/or form needed two, and no `>>16` per value.  Selector 0x03020706 = {ua.b2, ua.b3, ub.b2,
++// ub.b3}: v_perm's byte 0..3 come from its second operand, 4..7 from its first.  Bit-identical
++// (incl. +0/-0, `d == 0` weights) -- verified 1M random pairs, `PPL`/greedy/width gates.
++// The shift/or form.  Kept for the IQ3 dequants: they are LUT-latency bound and the v_perm form,
++// which needs all eight rounded words before it can start, is measurably slower there
++// (IQ3_S GLU 1318 -> 1355 ms without DBUF, 1225 -> 1258 with).  Every other dequant prefers perm.
++__device__ __forceinline__ uint32_t mmb_pack2_so(float a, float b) { return (uint32_t)mmb_f2bf(a) | ((uint32_t)mmb_f2bf(b) << 16); }
++
++__device__ __forceinline__ uint32_t mmb_pack2(float a, float b) {
++    uint32_t ua = __float_as_uint(a), ub = __float_as_uint(b);
++    ua += 0x7fffu + ((ua >> 16) & 1u);
++    ub += 0x7fffu + ((ub >> 16) & 1u);
++    return __builtin_amdgcn_perm(ua, ub, 0x03020706u);
++}
 +__constant__ int8_t mmb_kv_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 +__device__ __forceinline__ float mmb_h2f(uint16_t h) { return (float) __builtin_bit_cast(_Float16, h); }
 +
@@ -2096,10 +2112,10 @@ index 000000000..141e3cefa
 +                v[j]     = (signs >> j)       & 1u ? -g1 : g1;
 +                v[4 + j] = (signs >> (4 + j)) & 1u ? -g2 : g2;
 +            }
-+            out[4 * il + 0] = mmb_pack2(v[0], v[1]);
-+            out[4 * il + 1] = mmb_pack2(v[2], v[3]);
-+            out[4 * il + 2] = mmb_pack2(v[4], v[5]);
-+            out[4 * il + 3] = mmb_pack2(v[6], v[7]);
++            out[4 * il + 0] = mmb_pack2_so(v[0], v[1]);
++            out[4 * il + 1] = mmb_pack2_so(v[2], v[3]);
++            out[4 * il + 2] = mmb_pack2_so(v[4], v[5]);
++            out[4 * il + 3] = mmb_pack2_so(v[6], v[7]);
 +        }
 +    }
 +}
@@ -2247,10 +2263,10 @@ index 000000000..141e3cefa
 +                v[j]     = (signs >> j)     & 1u ? -g1 : g1;
 +                v[4 + j] = (signs >> (4+j)) & 1u ? -g2 : g2;
 +            }
-+            out[4*il + 0] = mmb_pack2(v[0], v[1]);
-+            out[4*il + 1] = mmb_pack2(v[2], v[3]);
-+            out[4*il + 2] = mmb_pack2(v[4], v[5]);
-+            out[4*il + 3] = mmb_pack2(v[6], v[7]);
++            out[4*il + 0] = mmb_pack2_so(v[0], v[1]);
++            out[4*il + 1] = mmb_pack2_so(v[2], v[3]);
++            out[4*il + 2] = mmb_pack2_so(v[4], v[5]);
++            out[4*il + 3] = mmb_pack2_so(v[6], v[7]);
 +        }
 +    }
 +}
