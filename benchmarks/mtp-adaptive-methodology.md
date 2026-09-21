@@ -205,6 +205,15 @@ block-01 amendment); the [2026-09-13 four-axis
 record](2026-09-13-adaptive-mtp-4-axis-n12.md) is the pre-tuning **table** measurement, not the
 delivery's bucket.
 
+> **Ceiling 12 is shape-dependent (2026-09-18).**  The 12 was measured on UD-Q4_K_XL on **one card**
+> ([2026-09-13-adaptive-mtp-4-axis-n12.md](2026-09-13-adaptive-mtp-4-axis-n12.md)).  On a **Q8_0
+> 27B with a 2-card `-sm tensor` split** the ceiling *loses* to 7 on the code prompt (n7 95.1 -> n12
+> 89.6 t/s, -5.8 %; depth 10 sits between the two but is still below 7).  1-card Q8_0 still wins from
+> 12, and Q4/Q6 on 2 cards still win, so the loss is specific to Q8_0 x tensor split.  Practical
+> guidance: **single card ~9, multi-GPU 6-7** (the same shape split as `README.md`'s
+> "Recommended configuration" *Cap* bullet).  Full data:
+> [`wip/mtp-journey-2026-09-17/SUMMARY.md`](../wip/mtp-journey-2026-09-17/SUMMARY.md); issue #35.
+
 ## Baselines
 
 ### Dense — Qwen3.8-27B Q8_0, 2-GPU tensor split (0,2), f16 KV

@@ -43,7 +43,10 @@ reasoning pinned per axis (`--reasoning off` for P/C/K).  Against fixed `n3` it 
 code ranking.  It supersedes all earlier adaptive records -- both the `n_max <= 7` clamp and the
 `-n 256` / default-reasoning protocol were artifacts.  **Beware (2026-09-17):** its prose acceptance
 (0.50654) is the *table's*; the delivery credit bucket's is 0.60232, so cite this record as the table
-arm, **not** as "the delivery".  The gate protocol (length, reasoning,
+arm, **not** as "the delivery".  **Beware (2026-09-18):** its ceiling 12 is for **UD-Q4_K_XL on one
+card** -- on a Q8_0 27B with a 2-card `-sm tensor` split, 12 *loses* to 7 (-5.8 % on the code prompt),
+so treat the ceiling as shape-dependent (single card ~9, multi-GPU 6-7) and see the caveat in
+[mtp-adaptive-methodology.md](mtp-adaptive-methodology.md).  The gate protocol (length, reasoning,
 baselines) lives in [mtp-adaptive-methodology.md](mtp-adaptive-methodology.md).
 
 ## Block 12 — hybrid all-reduce env matrix (2026-08-30)

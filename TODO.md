@@ -182,10 +182,18 @@ real defect was a **stale record pointer** (the 2026-09-13 four-axis record used
 corrected.  Cap guidance: single card ~9, multi-GPU 6-7.  Full data:
 `wip/mtp-journey-2026-09-17/SUMMARY.md`.
   Fallback if a shape regresses: the reporter's cap (7 when `n_gpu > 1` or the dominant weight is Q8_0).
-- Interim: the `ceiling 12` recommendation needs a caveat in `benchmarks/README.md`,
-  `benchmarks/mtp-adaptive-methodology.md` and `README.md` (7 is the default on Q8_0 / tensor split).
-- Separate, untriaged, in the same report: ROCm **7.2.4** breaks purity (clean on 7.14) — a
-  supported-toolchain note, not this item.
+- **DONE 2026-09-21 (docs only).**  The `ceiling 12` caveat is now in
+  [benchmarks/mtp-adaptive-methodology.md](benchmarks/mtp-adaptive-methodology.md) (a blockquote after the
+  ceiling paragraph) and [benchmarks/README.md](benchmarks/README.md) (in the four-axis record's
+  "Beware" list): 12 was measured on UD-Q4_K_XL on **one card**, and on a Q8_0 27B with a 2-card
+  `-sm tensor` split it loses to 7 (n7 95.1 -> n12 89.6 t/s on the code prompt); guidance is single card
+  ~9, multi-GPU 6-7.  `README.md`'s "Recommended configuration" *Cap* bullet already carried the shape
+  split, so no change was needed there.
+- **Toolchain note (documented 2026-09-21).**  ROCm **7.2.4** reported to break purity (clean on 7.14).
+  Still untriaged, so it is recorded as a caveat rather than a claim, in `CONTAINERS.md`'s image
+  section: 7.14.1 is the toolchain the delivery's claims are measured on, `rocm-7.2` is published but
+  suspect for speculative decoding and for hash comparisons.  Promote it to a real finding only if it
+  reproduces here.
 
 ### 1. Adapt/implement Tiled Gated Delta Net
 
@@ -520,6 +528,13 @@ the real feature would be a bias/scale-aware MMQ fused gate, worth doing only if
 appears.  Experiment reverted (no delivery change).  Side finding to fix before adding any gate type:
 `generate_cu_files.py`'s `SOURCE_MMQ_GATE` re-emits the file header when appending, so re-running the
 generator mutates the 5 committed gate instance files.
+  **Re-checked 2026-09-21: no longer reproduces, CLOSED.**  `SOURCE_MMQ_GATE` is now the single line
+  `DECL_MMQ_CASE_GATE({type});\n` (the header comes from the earlier `'w'` pass over `TYPES_MMQ`), so
+  the `'a'` pass appends only that declaration.  Verified by running `generate_cu_files.py` in a
+  throwaway copy of `template-instances/` and diffing: **0 changed files, 0 new files**, i.e. the
+  generator is idempotent against the committed instance set (which is what the r6 build-time split
+  requires, since those files are part of block 13/15's patches).  Keep the check in mind if the
+  generator is edited again: it is cheap and it guards a delivery-critical invariant.
 
 **Item 14 — canonical-fork hygiene: closed, verified (2026-09-12 (8)).**  The policy (never regenerate
 from a drifted `~/llama.cpp`; rebuild at `9113cc188` via `scripts/apply-all.sh`) lives in `AGENTS.md` and

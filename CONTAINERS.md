@@ -40,6 +40,14 @@ RDNA3.5 / RDNA4) with runtime dispatch, so one image serves every supported
 GPU family. `server` exposes the HTTP API on `8080`, `light` is CLI-only,
 `full` adds the Python conversion tooling.
 
+> **Toolchain caveat (7.2).**  ROCm 7.14.1 is the toolchain the delivery's claims
+> and validation records are measured on.  The `rocm-7.2` line is built and
+> published, but it has been **reported** (not yet reproduced here) to break
+> greedy purity where 7.14 is clean, see the "Separate, untriaged" note in
+> `TODO.md` item 22.  Prefer `rocm-7.14` (or `rocm-10.0`) for speculative decoding
+> and for anything compared against the recorded hashes; if a 7.2 run disagrees
+> with a 7.14 run, suspect the toolchain before the delivery.
+
 The ROCm `>= 7.14` `-full` base images do not register `/opt/rocm/lib` with the
 dynamic loader (no `/etc/ld.so.conf.d` entry, no `LD_LIBRARY_PATH`), so the
 image sets `LD_LIBRARY_PATH=/opt/rocm/lib` in its `base` stage — without it the

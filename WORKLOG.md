@@ -1,5 +1,35 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-21 — docs pass: adaptive-MTP ceiling caveat, ROCm 7.2 toolchain caveat, generator idempotency verified
+
+No delivery block changed (`release.json` stays `v16-ebbb18522-r11`; `patches/` is untouched).
+
+**Adaptive-MTP `ceiling 12` is shape-dependent, and the benchmark docs said otherwise.**  The two
+benchmark documents recommended ceiling 12 unconditionally, but that number was measured on UD-Q4_K_XL
+on **one card**; on a Q8_0 27B with a 2-card `-sm tensor` split it *loses* to 7 (n7 95.1 -> n12 89.6
+t/s, -5.8 % on the code prompt, depth 10 between the two but still below 7).  A caveat now sits after
+the ceiling paragraph in `benchmarks/mtp-adaptive-methodology.md` and in the four-axis record's
+"Beware" list in `benchmarks/README.md`, with the practical split (single card ~9, multi-GPU 6-7) that
+`README.md`'s "Recommended configuration" *Cap* bullet already carried.  This closes TODO item 22's
+"Interim" action; the underlying per-shape tuning stays rejected as not Pareto-safe (the 2026-09-18
+resolution), so this is guidance, not a controller change.
+
+**Toolchain caveat recorded.**  A report that ROCm **7.2.4** breaks greedy purity where 7.14 is clean is
+still untriaged, so it is recorded as a caveat rather than a claim: `CONTAINERS.md` now states that
+7.14.1 is the toolchain the delivery's claims are measured on and that `rocm-7.2` is published but
+suspect for speculative decoding and for hash comparisons.  Promote to a finding only if it reproduces
+here.
+
+**`generate_cu_files.py` is idempotent; the TODO note claiming otherwise is stale.**  TODO item 11's side
+finding said `SOURCE_MMQ_GATE` "re-emits the file header when appending", so re-running the generator
+would mutate the 5 committed gate instance files.  It now does not: `SOURCE_MMQ_GATE` is the single line
+`DECL_MMQ_CASE_GATE({type});\n` and the header comes from the earlier `'w'` pass over `TYPES_MMQ`, so the
+`'a'` pass appends only that declaration.  Verified by running the generator in a throwaway copy of
+`ggml/src/ggml-cuda/template-instances/` and diffing against the committed set: **0 changed files, 0 new
+files**.  That invariant matters more than it looks, because the r6 build-time split made those instance
+files part of block 13/15's patches, so a non-idempotent generator would produce spurious delivery diffs
+on the next regeneration.  The check is cheap and is now noted in TODO item 11 as a regression guard.
+
 ## 2026-09-20 (r11) — `v16-ebbb18522-r11`: the compute reserve accounts for the reachable (packed) kq mask
 
 **Release** `v16-ebbb18522-r11`, canonical tip `eabb7418df317d1d1b45d65faf1b235c6b43643d`, net tree
