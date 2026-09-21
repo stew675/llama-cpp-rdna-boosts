@@ -1,0 +1,161 @@
+From 94251003e00de32498decf31ff8b4d19036c56ec Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 20 Sep 2026 20:21:49 -0500
+Subject: [PATCH 37/37] WIP mmb: preload the IQ3_S block fields into registers
+ in load_regs (the GLU's dequant ran exposed)
+
+Measured first, with a legitimate oracle: duplicating the IQ3_S dequant (behind an asm memory
+barrier so it is not CSE'd) took the GLU 990 -> 1338 ms, so the dequant's MARGINAL cost is 348 ms
+(35 % of the GLU) and the other 642 ms is WMMA/LDS/barriers.  Two consequences: the dequant is on
+the critical path, and it is not the majority of the kernel.
+
+The exposed half of it was the loads.  store_lds_a runs between the WMMA phases with no DBUF
+(DBUF is off for this tile), so its d/sc/qs/qh/sg globals were issued and waited on inside the
+exposed phase.  mmb_iq3s_preload now fetches only the thread's own il groups (4/PARTS of them, and
+the two qs bytes a grid lookup needs are adjacent so they come back as one uint16) into a small
+register struct in the load_regs prefetch, which already overlaps the previous K-step's WMMA;
+mmb_dq_iq3s_r then runs purely out of registers.
+
+Flash-Next IQ4_XS (fixed prompt, min-of-3, two runs): routed_glu 990.4 -> 840.8 / 840.9 ms
+(-15.1 %), MMB family 2592 -> 2453, total GPU kernel 4015 -> 3882 / 3879 ms.  End to end:
+pp8192 1089.1 -> 1116.0 t/s (+2.5 %), pp2048 1101.4 -> 1128.3.  35B unchanged (IQ3_S-only path).
+
+Bit-identical: PPL 10.6015, greedy 9c281c415082, width probe PASS.
+
+TRAP (the session-22 guard bug again, and this time I walked into it): the first cut had the
+preload INSIDE load_regs' A_ITEMS loop under `if (row < BM && row < a_rows)` with
+row = tid + i*MMB_NT -- so only threads 0..63 ran it and they all took tid/BM = 0, leaving parts
+1..3 stale and producing 146-char garbage.  The split row is `tid % BM` for EVERY thread, so the
+preload must be HOISTED OUT of that guard.  There is now a comment on it.
+---
+ ggml/src/ggml-cuda/mmb.cu | 84 ++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 79 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index f0f9f1d16..595068ce5 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -361,6 +361,69 @@ __device__ __forceinline__ void mmb_dq_row_iq3s_p(const uint8_t * base, const in
+     }
+ }
+ 
++// Register-resident form of the split dequant above.  `mmb_iq3s_preload` runs inside the
++// `load_regs` prefetch (which overlaps the previous K-step's WMMA) and `mmb_dq_iq3s_r` then works
++// purely out of registers, so the dequant phase that runs exposed between the WMMA phases issues no
++// global loads at all.  Only the `il` groups this thread owns are fetched (4/PARTS of them), and the
++// two `qs` bytes a grid lookup needs are adjacent, so they come back as one uint16.
++template <int PARTS>
++struct mmb_iq3s_r {
++    uint32_t d, sc, qh;
++    uint16_t qs[2][4 / PARTS];
++    uint8_t  sg[2][4 / PARTS];
++};
++
++template <int PARTS>
++__device__ __forceinline__ mmb_iq3s_r<PARTS> mmb_iq3s_preload(const uint8_t * base, const int q4, const int p) {
++    mmb_iq3s_r<PARTS> r;
++    r.d  = *(const uint16_t *) base;
++    r.sc = *(const uint8_t *)(base + 106 + q4);
++    r.qh = *(const uint16_t *)(base + 66 + 2 * q4);
++    const uint8_t * qs = base + 2 + 16 * q4;
++    const uint8_t * sg = base + 74 + 8 * q4;
++#pragma unroll
++    for (int g = 0; g < 2; ++g)
++#pragma unroll
++        for (int it = 0; it < 4 / PARTS; ++it) {
++            const int il = p + it * PARTS;
++            r.qs[g][it] = *(const uint16_t *)(qs + 8 * g + 2 * il);
++            r.sg[g][it] = sg[4 * g + il];
++        }
++    return r;
++}
++
++template <int PARTS>
++__device__ __forceinline__ void mmb_dq_iq3s_r(const mmb_iq3s_r<PARTS> & R, uint32_t * arow, const int p) {
++    const float d = mmb_h2f((uint16_t) R.d);
++    const uint8_t sc = (uint8_t) R.sc;
++#pragma unroll
++    for (int g = 0; g < 2; ++g) {
++        const float dg = d * (float)(1 + 2 * ((sc >> (4 * g)) & 0xf));
++        uint32_t * out = arow + 16 * g;
++        const uint32_t qhg = (R.qh >> (8 * g)) & 0xff;
++#pragma unroll
++        for (int it = 0; it < 4 / PARTS; ++it) {
++            const int il = p + it * PARTS;
++            const uint32_t qs2 = R.qs[g][it];
++            const uint32_t grid1 = iq3s_grid[(qs2 & 0xffu)     | ((qhg << (8 - 2*il)) & 256)];
++            const uint32_t grid2 = iq3s_grid[(qs2 >> 8)        | ((qhg << (7 - 2*il)) & 256)];
++            const uint32_t signs = R.sg[g][it];
++            float v[8];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const float g1 = dg * (float)((grid1 >> (8*j)) & 0xFFu);
++                const float g2 = dg * (float)((grid2 >> (8*j)) & 0xFFu);
++                v[j]     = (signs >> j)     & 1u ? -g1 : g1;
++                v[4 + j] = (signs >> (4+j)) & 1u ? -g2 : g2;
++            }
++            out[4*il + 0] = mmb_pack2_so(v[0], v[1]);
++            out[4*il + 1] = mmb_pack2_so(v[2], v[3]);
++            out[4*il + 2] = mmb_pack2_so(v[4], v[5]);
++            out[4*il + 3] = mmb_pack2_so(v[6], v[7]);
++        }
++    }
++}
++
+ // dequantize one weight row's 64-value quarter of a Q5_K super-block (176 B: half2 dm, scales[12],
+ // qh[32], qs[128]) into 64 bf16.  Same affine form as Q4_K plus the 5th bit from qh (bit 2*q4 for
+ // the low nibbles, 2*q4+1 for the high nibbles).  Loaded from the row base in store_lds.
+@@ -462,6 +525,7 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
+     // WTYPE 5 (IQ3_S): when BM < MMB_NT the row-per-thread A mapping leaves warps idle, so the
+     // threads sharing a row split its 8 (g,il) groups instead (see mmb_dq_row_iq3s_p).
+     constexpr bool SPLIT_A = (WTYPE == 5 && MMB_NT > BM && MMB_NT % BM == 0);
++    constexpr int PARTS = SPLIT_A ? (MMB_NT / BM) : 1;
+     constexpr int B_ITEMS = (BN * 8) / MMB_NT;
+     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+     const int wm = wave % WAVES_M, wn = wave / WAVES_M;
+@@ -719,15 +783,28 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
+     // WTYPE 5 (IQ3_S): when BM < MMB_NT the row-per-thread A mapping leaves warps idle, so the
+     // threads sharing a row split its 8 (g,il) groups instead (see mmb_dq_row_iq3s_p).
+     constexpr bool SPLIT_A = (WTYPE == 5 && MMB_NT > BM && MMB_NT % BM == 0);
++    constexpr int PARTS = SPLIT_A ? (MMB_NT / BM) : 1;
+     constexpr int B_ITEMS = (BN * 8) / MMB_NT;
+     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+     const int wm = wave % WAVES_M, wn = wave / WAVES_M;
+     uint4 g0[A_ITEMS], g1[A_ITEMS], g3[A_ITEMS], g4[A_ITEMS], u0[A_ITEMS], u1[A_ITEMS], u3[A_ITEMS], u4[A_ITEMS]; uint32_t g2[A_ITEMS], u2[A_ITEMS];
++    mmb_iq3s_r<PARTS> iqr[2];   // [0] = gate, [1] = up (WTYPE 5 split path only)
+     uint4 bst[B_ITEMS];
+     int brow[B_ITEMS];
+ #pragma unroll
+     for (int i = 0; i < B_ITEMS; ++i) { const int c = tid + i * MMB_NT; brow[i] = xrow(c >> 3); }
+     auto load_regs = [&](const int ks) {
++        if constexpr (SPLIT_A) {
++            // IQ3_S, split A: preload this thread's block fields for step `ks` into registers, where
++            // the loads overlap the previous K-step's WMMA, so store_lds_a becomes pure ALU.  NOTE the
++            // row is `tid % BM` (every thread is active) and NOT the A_ITEMS loop's `tid + i*MMB_NT`
++            // -- hoisting this out of that loop's `row < BM` guard is load-bearing (put it inside and
++            // only threads 0..BM-1 run it, all taking part 0, and the output is garbage).
++            const int prow = tid % BM;
++            const size_t off = (size_t)prow * wrow_bytes + (size_t)(ks >> 2) * 110;
++            iqr[0] = mmb_iq3s_preload<PARTS>(Wg + off, ks & 3, tid / BM);
++            iqr[1] = mmb_iq3s_preload<PARTS>(Wu + off, ks & 3, tid / BM);
++        }
+ #pragma unroll
+         for (int i = 0; i < A_ITEMS; ++i) {
+             const int row = tid + i * MMB_NT;
+@@ -779,11 +856,8 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
+                 mmb_dq_row_q5_1(g0[i], g1[i], g3[i], (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
+                 mmb_dq_row_q5_1(u0[i], u1[i], u3[i], (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+             } else if constexpr (SPLIT_A) {
+-                constexpr int PARTS = MMB_NT / BM;
+-                mmb_dq_row_iq3s_p<PARTS>(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3,
+-                                         (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE), tid / BM);
+-                mmb_dq_row_iq3s_p<PARTS>(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3,
+-                                         (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE), tid / BM);
++                mmb_dq_iq3s_r<PARTS>(iqr[0], (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE), tid / BM);
++                mmb_dq_iq3s_r<PARTS>(iqr[1], (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE), tid / BM);
+             } else if constexpr (WTYPE == 5) {
+                 mmb_dq_row_iq3s(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
+                 mmb_dq_row_iq3s(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+-- 
+2.55.0
+

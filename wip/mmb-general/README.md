@@ -138,6 +138,75 @@ IQ3_S 56 % + IQ4_XS 35 % + Q8_0 + Q6_K — now fully covered.
 `mmb_cvt` 0.65 s, `mmb_f32split` 0.65 s.  Our VEC QSA already uses `v_dot2_f32_f16`, so its gap is
 algorithmic (per-token gather + VEC vs packed-block WMMA), not instruction selection.
 
+## UPDATE — session 24 (2026-09-20): the **`load_regs` field preload** — the GLU's dequant ran exposed.
+## `routed_glu` **990 -> 841 ms (−15.1 %)**, total GPU kernel **4015 -> 3879 ms**, pp8192 **1116 t/s**
+
+Tip `94251003e` (37th commit).  The session-23 follow-up.  Full record: HANDOVER "session 24".
+
+### Sizing the prize first
+
+The in-situ "remove the dequant" A/B is invalid (it changes the router -> the workload changes), so
+instead **duplicate** the IQ3_S dequant — same values, idempotent, so the output *and* the routing are
+unchanged — behind `asm volatile("" ::: "memory")` so the compiler cannot CSE it.  Without the barrier
+the duplicate is silently folded away (3943 vs 4540 SASS instructions); with it:
+
+| | `mrg` |
+|---|---:|
+| baseline | 990.4 ms |
+| dequant duplicated (barrier-guarded) | **1338.5 ms** |
+
+So the dequant's **marginal cost is 348 ms = 35 % of the GLU**, and the other **642 ms is
+WMMA/LDS/barriers**.  The session-22 "~51 %" figure was an isolated-harness extrapolation; this is the
+measured in-situ number, and it says the dequant is on the critical path but is *not* the majority.
+
+### The fix
+
+`store_lds_a` runs **exposed** between the WMMA phases (DBUF is off for this tile), so its
+`d`/`sc`/`qs`/`qh`/`sg` global loads were issued *and waited on* inside that exposed phase.
+`mmb_iq3s_preload<PARTS>` now fetches only this thread's own `il` groups (4/PARTS of them; the two `qs`
+bytes a grid lookup needs are adjacent, so they come back as one `uint16`) into a small register struct
+**inside `load_regs`** — which already overlaps the previous K-step's WMMA.  `mmb_dq_iq3s_r` then runs
+purely out of registers.
+
+| Flash-Next IQ4_XS | before | **after** |
+|---|---:|---:|
+| `routed_glu` (`mrg`) | 990.4 ms | **840.8 / 840.9** (two runs) |
+| MMB family | 2592 | **2453** |
+| **total GPU kernel** | 4015 | **3882 / 3879** (vs 4409 pre-session-21: **−12.0 %**) |
+| pp8192 / pp2048 | 1089.1 / 1101.4 t/s | **1116.0 / 1128.3 (+2.5 %)** |
+
+35B unchanged (the preload is on the IQ3_S path only).  Bit-identical: PPL **10.6015**, greedy
+**`9c281c415082`** (624 chars), width probe **PASS**.
+
+### Trap — the session-22 guard bug, walked into again
+
+The first cut put the preload *inside* `load_regs`' `A_ITEMS` loop under
+`if (row < BM && row < a_rows)` with `row = tid + i*MMB_NT`: only threads 0..63 ran it, and they all
+took `tid/BM = 0`, so parts 1..3 stayed stale and greedy collapsed to **146 chars**.  The split row is
+`tid % BM` for *every* thread, so the preload must be **hoisted out of that guard**.  It now sits above
+the loop with a comment saying why.  **When you change the A row mapping, the guard and every consumer
+of it must move together.**
+
+### Negative results (measured — do not redo)
+
+* **`MMB_LDS_STRIDE` 72 -> 64 is catastrophic** (`mrg` 990 -> 2538 ms; the dense Q8_0 485 -> 2078).  The
+  +8 padding breaks LDS bank aliasing: a compact panel has a **128 B row stride**, which aliases every
+  row onto the same banks for the row-parallel WMMA fragment reads.
+* **The 1-block/CU occupancy ceiling is inherent.**  `rocprofv3`'s `LDS_Block_Size` — a column worth
+  reading — shows `mmb_routed_glu<64,128>` and `mmb_dense<128,128>` at **36864 B**, i.e. **1 block/CU =
+  8 warps** (registers would allow 3; LDS is binding at 64 KB/CU, and `<128,256>`/the tall tile are
+  worse still).  Reaching 2 blocks/CU needs <= 32 KB, which needs stride 64 — the bullet above.
+
+### Next
+
+The dequant is now preloaded; what is left is the **642 ms of WMMA/LDS/barrier time**.  The one idea
+that could move it: **halve `BM`** — dequant-per-output is `K/BN`, independent of `BM`, so `BM=32` costs
+nothing in dequant terms while halving the LDS and giving 2 blocks/CU.  Blocker: `BM=32` needs
+`PARTS = MMB_NT/BM = 8` but there are only 4 `il` groups, so it needs a different split axis.  See the
+HANDOVER §F follow-up brief.
+
+---
+
 ## UPDATE — session 23 (2026-09-20): the **small GLU tile re-dequantized the A panel 4x** — tile-class
 ## threshold 128 -> `BN_SMALL`, MMB family **2822 -> 2592 ms**, total GPU kernel **4254 -> 4015 ms
 ## (−8.9 % vs the pre-session-21 baseline)**, pp8192 **+1.5 %**, bit-identical

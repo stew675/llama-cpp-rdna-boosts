@@ -39,36 +39,37 @@ The WIP lives on **two dedicated branches**.  **New work goes to those branches,
 
 1. `git -C ~/llama-cpp-rdna-boosts switch wip-mmb-general` — verify with `git branch --show-current`
    (must be **`wip-mmb-general`**, never `main`).
-2. `cd ~/llama-wip-mmb`; confirm `git status` clean and `git log --oneline -1` = **`49eff7f18`**.
+2. `cd ~/llama-wip-mmb`; confirm `git status` clean and `git log --oneline -1` = **`94251003e`**.
 3. Build with the §3 command; run the **§Gates** before/after any numerics-touching change (all
    currently green: PPL **10.6015**, greedy **`9c281c415082`**, width probe **PASS**).
 4. Pick an item from **Remaining work** below.  The current mandate is the **IQ3_S dequant follow-up
    brief** (`### F. MMB restructure` → "Follow-up brief for a fresh session: the IQ3_S dequant body").
 5. Commit the record to `wip-mmb-general` and push (`origin/wip-mmb-general`).
 
-**Mandate — the MMB line is DONE (session 23); what is left is promotion.**  The campaign's prefill
+**Mandate — the MMB line is DONE (session 24); what is left is promotion.**  The campaign's prefill
 work is complete.  Landed in order: the general-purpose `mmb` weight GEMM; the QSA v3 path; the
 bf16-producer port (incl. the `xn` stream); the `dsv4_hc`/concat/moe/unary non-temporal wins; the F32
 split and the tiny-M kernel; the sessions 16–18 **indexer top-k** (2.94 % -> **1.47 %** of pp32768);
 the sessions 21–22 **MMB structural** work (the A-panel double-buffered IQ3_S GLU tile, the
-one-instruction `v_perm` bf16 RNE pack, the **A-panel dequant split**); and session 23's
-**tile-class threshold** fix (**the small tile re-dequantized the A panel 4x**) — together **MMB family
-2980 -> 2592 ms** and **total GPU kernel 4409 -> 4015 ms (−8.9 %)** on the target model, plus
-**pp8192 1037 -> 1089 t/s** end to end, all **bit-identical**.  End-to-end prefill is now **~+32 % at
-pp2048 / +54 % at pp8192** against the true delivery base
-(`benchmarks/2026-09-20-qwen4exp-iq4xs-prefill-wip-vs-base.md`).  All §Gates are green.
-**The one remaining lever is the IQ3_S dequant body** (`mmb_dq_row_iq3s`, still the #1 MMB helper) —
-see the follow-up brief at the top of `### F. MMB restructure`; everything else below is at its
-practical floor.  The other open item is **promotion (item E), which is maintainer-gated**.
+one-instruction `v_perm` bf16 RNE pack, the **A-panel dequant split**); session 23's
+**tile-class threshold** fix (the small tile re-dequantized the A panel 4x); and session 24's
+**`load_regs` field preload** (the GLU's dequant ran exposed) — together **MMB family 2980 -> 2453 ms**
+and **total GPU kernel 4409 -> 3879 ms (−12.0 %)** on the target model, plus **pp8192 1037 -> 1116 t/s**
+end to end, all **bit-identical**.  End-to-end prefill is now **~+40 % at pp2048 / +58 % at pp8192**
+against the true delivery base (`benchmarks/2026-09-20-qwen4exp-iq4xs-prefill-wip-vs-base.md`).  All
+§Gates are green.  **The only lever left inside MMB is the 642 ms of non-dequant GLU time** (WMMA +
+LDS + barriers, pinned at 1 block/CU by the LDS budget) — the `BM=32` route in the follow-up brief;
+everything else below is at its practical floor.  The other open item is **promotion (item E), which
+is maintainer-gated**.
 
-**Remaining work (prioritized — the whole list as of session 23).**  **Sessions 21-23 finished the MMB
+**Remaining work (prioritized — the whole list as of session 24).**  **Sessions 21-24 finished the MMB
 line: the A-panel double-buffered GLU tile, the one-instruction `v_perm` bf16 RNE pack, the A-panel
-dequant split, and the tile-class threshold — Flash-Next MMB family 2980 → 2592 ms, total GPU kernel
-4409 → 4015 ms (−8.9 %), pp8192 +5 %, all bit-identical.**  The only technical item left is the
-follow-up brief in `### F. MMB restructure` → "Follow-up brief for a fresh session: the IQ3_S dequant
-body"** (`mmb_dq_row_iq3s` is still the #1 helper; preloading the block fields in `load_regs` is the
-ranked candidate — the fused gate+up dequant and the mid-N tile are both **measured and rejected**,
-session 23).  Everything else below is at its practical floor, and the remaining work is
+dequant split, the tile-class threshold, and the `load_regs` IQ3_S field preload — Flash-Next MMB
+family 2980 → 2453 ms, total GPU kernel 4409 → 3879 ms (−12.0 %), pp8192 1037 → 1116 t/s, all
+bit-identical.**  The dequant is now preloaded and its remaining ALU is ~200 ms of the 841 ms GLU; the
+larger remaining block is the **642 ms of WMMA/LDS/barrier time**, which is pinned at 1 block/CU by the
+LDS budget — the `BM=32` route in the follow-up brief in `### F. MMB restructure` is the only idea left,
+and it is speculative.  Everything else below is at its practical floor, and the remaining work is
 **promotion (item E), which needs the maintainer**.
 
 * **A. Indexer (at its practical floor; the active lever is now F).**
@@ -108,16 +109,17 @@ session 23).  Everything else below is at its practical floor, and the remaining
 * **E. Promotion (maintainer-gated).**  Rebase onto a canonical fork rebuilt at `ebbb18522` +
   `scripts/apply-all.sh`, regenerate `patches/` + `release.json`, and decide whether MMB rides as a
   **block-08 amendment**.  Every gate passes; it needs the maintainer's go-ahead + a beta window.
-* **F. MMB structural (DONE; only the IQ3_S dequant body is left, and it is a long shot).**
+* **F. MMB structural (DONE; what is left is the GLU's non-dequant 642 ms).**
   **Session 21** landed the A-panel double-buffered (IQ3_S) GLU tile; **session 22** the one-instruction
   `v_perm` bf16 RNE pack (all but the IQ3 paths) **and the A-panel dequant split** (`mmb_dq_row_iq3s_p<PARTS>`,
   which supersedes `DBUF` for that tile); **session 23** the **tile-class threshold** (`THRESH` was 128,
   so a sub-128-row expert took `ceil(cnt/32)` BN=32 tiles, **each re-running the same A-panel dequant** —
-  4x the weight dequant for the same WMMA; the optimum is `THRESH == BN_SMALL == 32`).  Together: `mrg`
-  1318 → 987 ms, `mr` 383 → 361 ms, MMB family **2980 → 2592 ms**, total GPU kernel **4409 → 4015 ms
-  (−8.9 %)**, 35B family 1008 → 962 ms, pp8192 +5 %, bit-identical.  **What is left is the IQ3_S dequant
-  body** (still the #1 helper): preload the block fields in `load_regs` is the only candidate that has
-  not been refuted.  **See the follow-up brief at the top of `### F. MMB restructure` below.**
+  4x the weight dequant for the same WMMA; the optimum is `THRESH == BN_SMALL == 32`); and **session 24**
+  the **`load_regs` IQ3_S field preload** (measured marginal dequant cost **348 ms = 35 %** via a
+  barrier-guarded duplicate; the fix moved the exposed loads into the prefetch).  Together: `mrg`
+  1318 → 841 ms, `mr` 383 → 361 ms, MMB family **2980 → 2453 ms**, total GPU kernel **4409 → 3879 ms
+  (−12.0 %)**, 35B family 1008 → 962 ms, pp8192 1037 → **1116 t/s**, bit-identical.  **What is left is
+  the GLU's 642 ms of WMMA/LDS/barrier time at 1 block/CU** — see the follow-up brief below.
 
   (Original framing, for context: the MMB weight GEMMs are **61.8 % of pp8192** on the target model.
   Session 6 closed the tuning — tiles/BN/VDR/shadow/int8 are all washes or worse — and the kernel is
@@ -147,7 +149,7 @@ levers are the 3 block passes (472 ms at 32K, key-bound), the gather (259 ms) an
 |---|---|
 | worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`49eff7f18`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0036` + `commits.txt` (36 commits), on branch **`wip-mmb-general`** (cut from `main` at `1c2ec00`), pushed to `origin/wip-mmb-general`; `git am` 36/36 verified on a fresh `8a2567e1e` (applied tree `7194f5dd4bde41d9d2d85424eeed1da5c9cb0556` == tip) |
+| backup | this repo: `wip/mmb-general/mmb-general.patch` + `patches/0001..0037` + `commits.txt` (37 commits), on branch **`wip-mmb-general`** (cut from `main` at `1c2ec00`), pushed to `origin/wip-mmb-general`; `git am` 37/37 verified on a fresh `8a2567e1e` (applied tree `9813fc8dcaed5b5d506650f5a711eb91fd6b5307` == tip) |
 | target model | `/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf` (94 GiB; the only qwen4exp with HC + QSA) |
 | fast iteration model | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf` (21 GiB, `qwen35moe`; **no** HC/QSA — use it for `mmb_*` shapes) |
 | reference | `~/pwilkin-llama-cpp` @ `f5daaa3cf` (branch `strix-halo`) |
@@ -340,15 +342,16 @@ a **structural** change to how the dequant and the WMMA share the warps.  This s
 self-contained start-up for that work; read it with the session-6 UPDATE (the ceiling measurements)
 and §5-§6 (the per-model tables + env knobs).
 
-> **RESULT (sessions 21-23, `49eff7f18`): the restructure is DONE and landed FOUR wins.**
+> **RESULT (sessions 21-24, `94251003e`): the restructure is DONE and landed FIVE wins.**
 > A-panel double buffering (`DBUF`), the one-instruction `v_perm` bf16 RNE pack, the **A-panel
-de-quant split**, and the **tile-class threshold** (the small tile re-dequantized the A panel 4x).
-> Flash-Next MMB family **2980 → 2592 ms**, total GPU kernel **4409 → 4015 ms (−8.9 %)**, 35B family
-> 1008 → 962 ms, pp8192 **1037 → 1089 t/s**, all **bit-identical**.  `DBUF` is now *off* for the IQ3_S
-> GLU — the split supersedes it (with the split, `DBUF` costs +80 ms).  **What remains is the IQ3_S
-dequant body itself**, which is still the
-dominant cost of the GLU; see the follow-up brief immediately below.  Full record: README
-> "session 21"/"session 22"/"session 23".
+de-quant split**, the **tile-class threshold** (the small tile re-dequantized the A panel 4x), and the
+> **`load_regs` field preload**.  Flash-Next MMB family **2980 → 2453 ms**, total GPU kernel
+> **4409 → 3879 ms (−12.0 %)**, 35B family 1008 → 962 ms, pp8192 **1037 → 1116 t/s**, all
+> **bit-identical**.  `DBUF` is now *off* for the IQ3_S
+> GLU — the split supersedes it (with the split, `DBUF` costs +80 ms).  **What remains is the GLU's
+642 ms of WMMA/LDS/barrier time** (the dequant's own remaining ALU is ~200 ms and is preloaded); see the
+follow-up brief immediately below.  Full record: README
+> "session 21"/"session 22"/"session 23"/"session 24".
 
 #### Follow-up brief for a fresh session: the IQ3_S dequant body
 
@@ -366,14 +369,17 @@ math)" **+10 %**.
 
 **Ranked candidates.**
 
-1. **Preload the block fields in `load_regs`** — the ONLY candidate left that has not been refuted.
-   `WTYPE 0/1/3/4` load the quant fields into registers in the prefetch and dequantize from registers;
-   `WTYPE 5..10` read `Wbase` directly inside `store_lds`.  The kernel is **latency-bound, not
-   issue-bound** (proved by the pack result: `mmb_pack2_so` has *more* instructions than the `v_perm`
-   form yet is 11 % faster), so issuing the `d`/`sc`/`qs`/`qh`/`sg` loads a full K-step early — where
-   they overlap the WMMA — is the right shape of fix.  Costs: with `SPLIT_A` the row mapping in
-   `load_regs` must move with its guard (`row = tid % BM`), and the byte offsets become part-dependent
-   (`2*p`, `4*p`, …).  *Bounded; try it, then measure.*
+1. **DONE in session 24: the `load_regs` field preload** (`mmb_iq3s_preload` / `mmb_dq_iq3s_r`) —
+   `routed_glu` 990 → 841 ms.  The same shape of fix is still UNPORTED to the GLU's other
+   `store_lds`-loaded types (WTYPE 6/7/8/9/10), which read `Wbase` directly inside `store_lds`.  On the
+   current models that is small (the IQ4_XS GLU is ~18 ms), so it is only worth it if a model puts a
+   k-quant/IQ4_XS in the MoE gate/up.
+2. **Attack the other 642 ms: the GLU runs at 1 block/CU.**  `rocprofv3`'s `LDS_Block_Size` is 36864 B
+   for `<64,128>`; the 64 KB/CU budget allows one block (registers allow 3).  Halving `BM` halves the
+   LDS **and** the dequant-per-output is `K/BN` — independent of `BM` — so `BM=32` is free in dequant
+   terms and would give 2 blocks/CU.  **Blocker:** `BM=32` needs `PARTS = MMB_NT/BM = 8` but there are
+   only 4 `il` groups, so it needs a different split axis (split the `g` pair and the `il` pair, or
+   split the `j` values instead).  *Speculative; the biggest remaining lever.*
 2. **A fused gate+up dequant — reasoned DOWN, not measured.**  The gate and up weights share the *index
    expressions* but not the *values*: `qs`/`qh`/`sg`/`sc` are read from different tensors, so the LUT
    indices, the LUT loads and the scale math are all distinct — only the loop/setup structure could be
@@ -638,14 +644,14 @@ unilaterally** -- needs a beta window / go-ahead.
 
 | | |
 |---|---|
-| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`49eff7f18`** (clean) |
+| worktree | `~/llama-wip-mmb`, branch `wip-mmb-general`, tip **`94251003e`** (clean) |
 | base | `8a2567e1e` (the maintainer's applied delivery tree; **not** canonical r9) |
-| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0036` + `commits.txt`, in this repo, pushed to `origin/wip-mmb-general` |
-| verify | `git am` of `patches/` on a fresh `8a2567e1e` — clean (36 commits, applied tree `7194f5dd4bde41d9d2d85424eeed1da5c9cb0556` == tip) |
+| backup | `wip/mmb-general/mmb-general.patch` + `patches/0001..0037` + `commits.txt`, in this repo, pushed to `origin/wip-mmb-general` |
+| verify | `git am` of `patches/` on a fresh `8a2567e1e` — clean (37 commits, applied tree `9813fc8dcaed5b5d506650f5a711eb91fd6b5307` == tip) |
 | build | §3 | run | §4 |
-| current numbers | the **session 23 UPDATE below** (the tile-class threshold -- MMB family 2822 -> 2592 ms, total GPU kernel 4254 -> **4015 ms**) then the **session 20 UPDATE** (the `rms_norm` register-cache **refutation** -- the session-19 tip `2da50418d` is unchanged) and the **session 19 UPDATE** (indexer pass-1 per-block histogram atomics + the block-pass warp reduction) -- indexer family pp8192 **71.7 ms** / pp32768 **1146.6 ms** -- plus the **session 18 UPDATE** (the block-level histogram + `blk_cells` src), the **session 15 UPDATE** (qsa3 compile-time gate + the rocprofiler-register profiling caveat), the **session 14/13 UPDATEs** (non-temporal) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
+| current numbers | the **session 24 UPDATE below** (the `load_regs` field preload -- routed_glu 990 -> **841 ms**, total GPU kernel 4015 -> **3879 ms**, pp8192 **1116 t/s**) then the **session 23 UPDATE** (the tile-class threshold) then the **session 20 UPDATE** (the `rms_norm` register-cache **refutation** -- the session-19 tip `2da50418d` is unchanged) and the **session 19 UPDATE** (indexer pass-1 per-block histogram atomics + the block-pass warp reduction) -- indexer family pp8192 **71.7 ms** / pp32768 **1146.6 ms** -- plus the **session 18 UPDATE** (the block-level histogram + `blk_cells` src), the **session 15 UPDATE** (qsa3 compile-time gate + the rocprofiler-register profiling caveat), the **session 14/13 UPDATEs** (non-temporal) and the **session 12 UPDATE** (`xn` BF16-only); plus the **delivery `GGML_OP_NAME` fix** |
 
-**Historical ordering of the UPDATE sections:** 23 (newest, 2026-09-20, the tile-class threshold: the small tile's 4x A-panel dequant) -> 22 (the `v_perm` bf16 pack + the A-panel split) -> 21 (the A-panel double-buffered GLU tile) -> 20 (the `rms_norm` register-cache refutation) → 19 (2026-09-20, the indexer pass-1 per-block histogram atomics + the block-pass warp reduction) → 18 (2026-09-20, the indexer block-level histogram path + the `blk_cells` op src) → 17 (2026-09-20, indexer block-key sharing) → 16 (2026-09-20, the indexer count-pass elimination + the "compact after pass 1" refutation) → 15 (2026-09-20, the qsa3 compile-time gate + the rocprofiler-register profiling caveat) → 14 (2026-09-20, the non-temporal load sweep: concat/moe/unary) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
+**Historical ordering of the UPDATE sections:** 24 (newest, 2026-09-20, the `load_regs` IQ3_S field preload) -> 23 (the tile-class threshold: the small tile's 4x A-panel dequant) -> 22 (the `v_perm` bf16 pack + the A-panel split) -> 21 (the A-panel double-buffered GLU tile) -> 20 (the `rms_norm` register-cache refutation) → 19 (2026-09-20, the indexer pass-1 per-block histogram atomics + the block-pass warp reduction) → 18 (2026-09-20, the indexer block-level histogram path + the `blk_cells` op src) → 17 (2026-09-20, indexer block-key sharing) → 16 (2026-09-20, the indexer count-pass elimination + the "compact after pass 1" refutation) → 15 (2026-09-20, the qsa3 compile-time gate + the rocprofiler-register profiling caveat) → 14 (2026-09-20, the non-temporal load sweep: concat/moe/unary) → 13 (2026-09-20, the `dsv4_hc` non-temporal fix) → 12 (2026-09-20, the `xn` BF16-only stream) → 11 (2026-09-20, the dead-F32-store skip in the producer port) → 10 (2026-09-20, `ssm_alpha/beta` profiled — rocBLAS stays) → 9 (2026-09-20, the full bf16-producer port) → 8 (2026-09-20, the HC gate + xn bf16 producers) → 7 (2026-09-20, the pack measurement) → 6 (2026-09-20, the
 `mmb_*` ceiling) → 5e (dsv4_hc) → 5d (W=1..8 probe) → 5c (gates) → 5b (tiny-M) → 5 (profile + F32
 split) → 4 → 3 → 2.**  §0-§14 after them are the original (session-1) body and are correct except where
 an UPDATE says otherwise.
@@ -653,6 +659,59 @@ an UPDATE says otherwise.
 **Next work:** see the **"FOR THE NEXT SESSION"** brief at the very top of this file — its ordered
 list is the authoritative one, and the historical "next-work order" lists inside the UPDATE sections
 below are superseded.
+
+---
+
+## UPDATE — session 24 (2026-09-20): the **`load_regs` field preload** — the GLU's dequant ran exposed.
+## `routed_glu` **990 -> 841 ms (−15.1 %)**, total GPU kernel **4015 -> 3879 ms**, pp8192 **1116 t/s**
+
+Tip `94251003e` (37th commit).  The session-23 follow-up (the ranked candidate in the §F brief).  Full
+record: README "session 24".
+
+**First, size the prize with a legitimate oracle.**  The in-situ "remove the dequant" A/B is invalid
+(routing), so instead **duplicate** the IQ3_S dequant -- same values, idempotent, so the output and the
+routing are unchanged -- behind an `asm volatile("" ::: "memory")` barrier so the compiler cannot CSE
+it (without the barrier the duplicate is folded away: 3943 vs 4540 SASS instrs).  Result:
+**`mrg` 990 -> 1338 ms**, so the dequant's marginal cost is **348 ms = 35 % of the GLU**, and the other
+**642 ms is WMMA/LDS/barriers**.  Two consequences: the dequant IS on the critical path, and it is NOT
+the majority of the kernel (the session-22 "~51 %" figure was an isolated-harness extrapolation).
+
+**The fix: hoist the loads into the prefetch.**  `store_lds_a` runs *exposed* between the WMMA phases
+(DBUF is off for this tile), so its `d`/`sc`/`qs`/`qh`/`sg` globals were issued and waited on inside
+that exposed phase.  `mmb_iq3s_preload<PARTS>` now fetches only this thread's own `il` groups
+(4/PARTS of them; the two `qs` bytes a grid lookup needs are adjacent, so they come back as one
+`uint16`) into a small register struct **inside `load_regs`**, which already overlaps the previous
+K-step's WMMA; `mmb_dq_iq3s_r` then runs purely out of registers.
+
+| Flash-Next IQ4_XS | before | **after** |
+|---|---:|---:|
+| `routed_glu` (`mrg`) | 990.4 ms | **840.8 / 840.9** (two runs) |
+| MMB family | 2592 | **2453** |
+| **total GPU kernel** | 4015 | **3882 / 3879** (vs 4409 pre-session-21: **−12.0 %**) |
+| pp8192 / pp2048 | 1089.1 / 1101.4 t/s | **1116.0 / 1128.3 (+2.5 %)** |
+
+35B unchanged (the preload is on the IQ3_S path only).  Bit-identical: PPL **10.6015**, greedy
+**`9c281c415082`**, width probe **PASS**.
+
+**TRAP — the session-22 guard bug, walked into again.**  The first cut put the preload *inside*
+`load_regs`' `A_ITEMS` loop under `if (row < BM && row < a_rows)` with `row = tid + i*MMB_NT`: only
+threads 0..63 ran it and they all took `tid/BM = 0`, so parts 1..3 stayed stale and greedy collapsed to
+**146 chars**.  The split row is `tid % BM` for *every* thread, so the preload must be **hoisted out of
+that guard** — it now sits above the loop with a comment saying why.  **When you change the A row
+mapping, the guard and every consumer of it must move together.**
+
+**Also measured this session (negative results, do not redo):**
+
+* **`MMB_LDS_STRIDE` 72 -> 64 is catastrophic** (`mrg` 990 -> 2538 ms, the dense Q8_0 485 -> 2078).  The
+  +8 padding exists to break LDS bank aliasing: a compact panel has a 128 B row stride, which aliases
+  every row onto the same banks for the row-parallel WMMA fragment reads.
+* **The occupancy ceiling is inherent.**  `rocprofv3`'s `LDS_Block_Size` shows `mmb_routed_glu<64,128>`
+  and `mmb_dense<128,128>` at **36864 B => 1 block/CU = 8 warps** (registers allow 3; LDS is binding,
+  64 KB/CU).  Getting 2 blocks/CU needs <= 32 KB, which needs stride 64, which is the bullet above.
+  **The only way to 2 blocks without conflicts is a smaller `BM`** (dequant-per-output is `K/BN`,
+  independent of `BM`, so halving `BM` is free in dequant terms) — but `BM=32` needs `PARTS=8 > 4`
+  `il` groups, so it needs a different split axis.  Parked as the next candidate (it attacks the
+  642 ms non-dequant part, not the 348 ms dequant).
 
 ---
 
