@@ -374,12 +374,15 @@ math)" **+10 %**.
    `store_lds`-loaded types (WTYPE 6/7/8/9/10), which read `Wbase` directly inside `store_lds`.  On the
    current models that is small (the IQ4_XS GLU is ~18 ms), so it is only worth it if a model puts a
    k-quant/IQ4_XS in the MoE gate/up.
-2. **Attack the other 642 ms: the GLU runs at 1 block/CU.**  `rocprofv3`'s `LDS_Block_Size` is 36864 B
-   for `<64,128>`; the 64 KB/CU budget allows one block (registers allow 3).  Halving `BM` halves the
-   LDS **and** the dequant-per-output is `K/BN` — independent of `BM` — so `BM=32` is free in dequant
-   terms and would give 2 blocks/CU.  **Blocker:** `BM=32` needs `PARTS = MMB_NT/BM = 8` but there are
-   only 4 `il` groups, so it needs a different split axis (split the `g` pair and the `il` pair, or
-   split the `j` values instead).  *Speculative; the biggest remaining lever.*
+2. **DONE/REFUTED in session 24: the `BM=32` occupancy route is dead.**  The GLU *is* pinned at
+   1 block/CU (`hipOccupancyMaxActiveBlocksPerMultiprocessor`: `glu_big=1`, `glu_small=2`;
+   `rocprofv3`'s `LDS_Block_Size` only reports *static* smem and cannot see the dynamic pad), and the
+   dequant-per-output is `K/BN` — independent of `BM` — so `BM=32` looked like a free route to 2
+   blocks/CU.  **Measured and refuted:** launching the small tile with 12 KB of dynamic smem forced it
+   from 2 -> 1 blocks/CU and changed `mrg` by **nothing** (842.9 -> 838.7 ms, inside run noise).
+   **This kernel is not occupancy-limited**, so halving `BM` would gain ~0 and cost a new split axis.
+   Do not build it.  (Corollary: `1 block/CU` is *not* a defect here.  The GLU is limited by WMMA + LDS
+   fragment traffic + 2 barriers per K-step contending on the same ports.)
 2. **A fused gate+up dequant — reasoned DOWN, not measured.**  The gate and up weights share the *index
    expressions* but not the *values*: `qs`/`qh`/`sg`/`sc` are read from different tensors, so the LUT
    indices, the LUT loads and the scale math are all distinct — only the loop/setup structure could be
@@ -700,18 +703,43 @@ threads 0..63 ran it and they all took `tid/BM = 0`, so parts 1..3 stayed stale 
 that guard** — it now sits above the loop with a comment saying why.  **When you change the A row
 mapping, the guard and every consumer of it must move together.**
 
+**Where the pp8192 time actually goes (measured, `rocprofv3`, one `-p 8192 -n 0 -r 1` run = 2 passes;
+divide by 2).  GPU kernel total 14396 ms = ~7198 ms per pass against a 7315 ms wall, i.e. the GPU is
+~98 % busy — there is no launch-gap slack left to reclaim, kernel time IS the whole story:**
+
+| per pass | ms | share | |
+|---|---:|---:|---|
+| `mmb_dense` | 1798 | **25.0 %** | Q8_0/Q6_K/BF16 dense GEMMs |
+| `mmb_routed_glu` | 1399 | **19.4 %** | the IQ3_S/IQ4_XS MoE gate+up+swiglu |
+| `mmb_routed` | 631 | 8.8 % | IQ4_NL MoE down |
+| `qsa3_attn` | 408 | 5.7 % | |
+| `dsv4_hc_post` | 334 | 4.6 % | |
+| `gdn_bf16_scan` | 310 | 4.3 % | |
+| `rms_norm_f32<1024>` | 270 | 3.8 % | session 20 refuted the register-cache |
+| `mmb_tiny_m_f32` | 224 | 3.1 % | hc inject M=4/8 |
+| `mmb_f32split` | 190 | 2.6 % | MoE router |
+| `dsv4_hc_pre` | 189 | 2.6 % | |
+| `moe_weighted_reduction` | 172 | 2.4 % | |
+| `concat_transposed_src1_dim0` | 166 | 2.3 % | |
+| `ssm_conv_long_token` | 157 | 2.2 % | |
+| `k_bin_bcast` | 123 | 1.7 % | **the indexer (item A)** |
+
+**MMB is 58.9 % of the pp8192 run**; `mmb_dense` is now the single largest kernel (25 %), and its Q8_0
+dequant is cheap arithmetic, so it is the WMMA/LDS-bound one.
+
 **Also measured this session (negative results, do not redo):**
 
 * **`MMB_LDS_STRIDE` 72 -> 64 is catastrophic** (`mrg` 990 -> 2538 ms, the dense Q8_0 485 -> 2078).  The
   +8 padding exists to break LDS bank aliasing: a compact panel has a 128 B row stride, which aliases
   every row onto the same banks for the row-parallel WMMA fragment reads.
-* **The occupancy ceiling is inherent.**  `rocprofv3`'s `LDS_Block_Size` shows `mmb_routed_glu<64,128>`
-  and `mmb_dense<128,128>` at **36864 B => 1 block/CU = 8 warps** (registers allow 3; LDS is binding,
-  64 KB/CU).  Getting 2 blocks/CU needs <= 32 KB, which needs stride 64, which is the bullet above.
-  **The only way to 2 blocks without conflicts is a smaller `BM`** (dequant-per-output is `K/BN`,
-  independent of `BM`, so halving `BM` is free in dequant terms) — but `BM=32` needs `PARTS=8 > 4`
-  `il` groups, so it needs a different split axis.  Parked as the next candidate (it attacks the
-  642 ms non-dequant part, not the 348 ms dequant).
+* **The 1-block/CU ceiling is real but IRRELEVANT — occupancy is not the limiter.**  `rocprofv3`'s
+  `LDS_Block_Size` (static only) shows `mmb_routed_glu<64,128>` and `mmb_dense<128,128>` at 36864 B =>
+  1 block/CU (registers allow 3; LDS binds at 64 KB/CU), and
+  `hipOccupancyMaxActiveBlocksPerMultiprocessor` confirms it (`glu_big=1`, `glu_small=2`).  But forcing
+  the small tile 2 -> 1 blocks/CU with 12 KB of dynamic smem changed `mrg` by **nothing** (842.9 ->
+  838.7).  **So the `BM=32` route to 2 blocks/CU is refuted by measurement** — do not spend the
+  split-axis rewrite on it.  (Technique note: `rocprofv3`'s LDS column excludes dynamic shared memory,
+  so a dynamic pad is invisible to it; a hardcoded pad plus the HIP occupancy API is the reliable check.)
 
 ---
 

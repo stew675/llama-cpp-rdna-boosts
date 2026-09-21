@@ -197,13 +197,21 @@ of it must move together.**
   8 warps** (registers would allow 3; LDS is binding at 64 KB/CU, and `<128,256>`/the tall tile are
   worse still).  Reaching 2 blocks/CU needs <= 32 KB, which needs stride 64 — the bullet above.
 
-### Next
+### Occupancy is NOT the limiter — the `BM=32` follow-up is refuted
 
-The dequant is now preloaded; what is left is the **642 ms of WMMA/LDS/barrier time**.  The one idea
-that could move it: **halve `BM`** — dequant-per-output is `K/BN`, independent of `BM`, so `BM=32` costs
-nothing in dequant terms while halving the LDS and giving 2 blocks/CU.  Blocker: `BM=32` needs
-`PARTS = MMB_NT/BM = 8` but there are only 4 `il` groups, so it needs a different split axis.  See the
-HANDOVER §F follow-up brief.
+What is left in the GLU is the **642 ms of WMMA/LDS/barrier time** (~36 % of the WMMA peak, session-6
+figure).  The obvious suspect was occupancy: the tile is pinned at 1 block/CU by LDS, and halving `BM`
+would halve the LDS while leaving dequant-per-output (`K/BN`) untouched — i.e. a free route to
+2 blocks/CU.
+
+**Measured and refuted.**  `hipOccupancyMaxActiveBlocksPerMultiprocessor` gives `glu_big=1,
+glu_small=2`; so the small tile already *has* the 2 blocks/CU that halving `BM` would buy.  Forcing the
+small tile 2 -> 1 blocks/CU with 12 KB of dynamic smem changed `mrg` by **nothing** (842.9 -> 838.7 ms,
+inside run noise).  **Halving `BM` would gain ~0**, and `BM=32` would need `PARTS=8` with only 4 `il`
+groups.  Do not build it.
+
+*Technique note:* `rocprofv3`'s `LDS_Block_Size` reports **static** smem only — it read 23040 B both
+padded and unpadded, which nearly produced a false conclusion.  Use the HIP occupancy API.
 
 ---
 
