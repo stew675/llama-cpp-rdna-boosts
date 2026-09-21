@@ -195,6 +195,38 @@ Isolated IQ3_S dequant body: **765 → 616 SASS instructions**, **1364 → 1701 
 | | Q8_0 dense / IQ4_NL routed | 491.3 / 387.5 | 488.7 / 384.6 (−0.5 / −0.8 %) |
 | | **total GPU kernel (with session 21's DBUF)** | 4409 (no DBUF, no perm) | **4309 (−2.3 %)** |
 
+**Plus the A-panel split (part 2 below): `mrg` 1318 → 1166 ms, total GPU kernel 4409 → 4254 ms
+(−3.4 %), bit-identical.**
+
+### Part 2: the A-panel dequant was running on 2 of 8 warps — now split across all of them
+
+A structural find while looking for what was left: `A_ITEMS = ceil(BM/256)` and the A row is
+`tid + i*256`, so with the GLU's `BM = 64` **only threads 0..63 (warps 0-1 of 8) ran the A dequant**
+(and the dense `BM = 128` tiles used 128/256).  Isolated measurement of the consequence: **2 active
+warps reach 348 Gval/s vs 691 for 8** — i.e. 50 %, not 25 %, so the CU had spare issue capacity and
+the split was worth up to ~2x on the dequant.
+
+`mmb_dq_row_iq3s_p<PARTS>` has the `PARTS = MMB_NT/BM` threads sharing a row take the `il` groups
+`{p, p+PARTS, ...}` for both `g`, writing exactly the same LDS dwords (disjoint offsets, no race).
+The row mapping in `store_lds_a` becomes `SPLIT_A ? tid % BM : tid + i*MMB_NT` so the threads that
+would have skipped (`row >= BM`) now participate.
+
+| Flash-Next IQ4_XS | baseline | session 21 `DBUF` | **`DBUF` + split** | **split, no `DBUF`** |
+|---|---:|---:|---:|---:|
+| `mrg` (IQ3_S GLU) | 1318.2 ms | 1224.5 | 1246.3 | **1166.4 / 1165.4** |
+| total GPU kernel | 4409 | 4330 | — | **4269 / 4254** |
+
+**The split SUPERSEDES `DBUF` for this tile.**  With the split the dequant no longer leaves warps idle
+for the WMMA to run ahead into, so `DBUF` becomes a regression (+80 ms) — it is switched off for the
+IQ3_S GLU (the plumbing stays, guarded and disabled).  `mrg` **−11.6 %**, total GPU kernel **−3.4 %**
+vs the pre-session-21 baseline; the 35B is unaffected (`SPLIT_A` is false there, family 987 vs 985 ms).
+
+**Trap (cost a full debug cycle):** the first cut put the split *inside* the existing `if (row < BM)`
+guard, where `row = tid` — so only `tid < 64` ran and they all took `part = tid/64 = 0`; the other
+three `il` groups were never written and greedy output collapsed to 146 chars.  **Any change to the
+row mapping must move with its guard.**  The gates caught it; the harness did not (it had its own
+flawed oracle).
+
 **The IQ3_S dequant itself does not take the perm pack** — it *regresses* there (1318 → 1355 ms without
 DBUF, 1225 → 1258 with; a clean 2x2 was run).  The LUT-latency-bound path apparently wants the shift/or
 form, which can start as soon as its own two words are rounded rather than waiting on all eight.  So

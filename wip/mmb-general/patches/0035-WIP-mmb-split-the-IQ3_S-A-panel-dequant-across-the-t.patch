@@ -1,0 +1,153 @@
+From e8806686758cbd2fe50c86f94bc5eef9fa750ca1 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 20 Sep 2026 19:28:05 -0500
+Subject: [PATCH 35/35] WIP mmb: split the IQ3_S A-panel dequant across the
+ threads sharing a row
+
+The A mapping was one row per thread (row = tid + i*256), so with the GLU's
+BM=64 only threads 0..63 (2 of 8 warps) ran the A dequant while 192 idled.
+mmb_dq_row_iq3s_p<PARTS> has the PARTS = MMB_NT/BM threads sharing a row take
+the il groups {p, p+PARTS, ...} for both g, writing the same LDS dwords; the
+row mapping in store_lds_a becomes SPLIT_A ? tid % BM : tid + i*MMB_NT so the
+threads that would have skipped (row >= BM) now participate.
+
+Isolated: 2 active warps reach 348 Gval/s vs 691 for 8 (50 %, not 25 %), so the
+CU had spare issue capacity -- the split is worth up to ~2x on the dequant.
+
+Flash-Next IQ4_XS (IQ3_S GLU 64x32; fixed prompt, min-of-3, two runs):
+  routed_glu total  1318.2 (baseline) -> 1166.4 / 1165.4 ms  (-11.6 %)
+  total GPU kernel  4409 -> 4269 / 4254 ms                    (-3.4 %)
+and it SUPERSEDES the session-21 DBUF for this tile: with the split, DBUF is
+now a regression (mrg 1166 -> 1246 ms) because the dequant no longer leaves
+warps idle for the WMMA to run ahead into.  DBUF is therefore switched off for
+the IQ3_S GLU (the plumbing stays, guarded and disabled).
+
+35B unchanged (no IQ3_S; SPLIT_A is false there): family 987 vs 985 ms.
+
+Bit-identical: PPL c2048 10.6015 (x2), greedy 9c281c415082, width probe PASS.
+Trap for the next person: the first cut put the split INSIDE the 'if (row < BM)'
+guard (row = tid), so only tid < 64 ran and they all took part 0 -- the other
+three il groups were never written and the output was garbage.
+---
+ ggml/src/ggml-cuda/mmb.cu | 59 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 56 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 573196dfd..3f13e41ca 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -325,6 +325,42 @@ __device__ __forceinline__ void mmb_dq_row_iq3s(const uint8_t * base, const int
+     }
+ }
+ 
++// PARTS-way split of the above across the threads that share one A row, so that a BM < MMB_NT tile
++// (the GLU's BM=64) does not run the A dequant on only MMB_NT/BM of the warps.  Thread `p` takes the
++// `il` groups {p, p+PARTS, ...} for both g, writing the same LDS dwords as the whole-row form.
++template <int PARTS>
++__device__ __forceinline__ void mmb_dq_row_iq3s_p(const uint8_t * base, const int q4, uint32_t * arow, const int p) {
++    const float d = mmb_h2f(*(const uint16_t *) base);
++    const uint8_t sc = *(const uint8_t *)(base + 106 + q4);
++    const uint8_t * qs = base + 2 + 16 * q4;
++    const uint8_t * qh = base + 66 + 2 * q4;
++    const uint8_t * sg = base + 74 + 8 * q4;
++#pragma unroll
++    for (int g = 0; g < 2; ++g) {
++        const float dg = d * (float)(1 + 2 * ((sc >> (4 * g)) & 0xf));
++        uint32_t * out = arow + 16 * g;
++        const uint32_t qhg = qh[g];
++#pragma unroll
++        for (int il = p; il < 4; il += PARTS) {
++            const uint32_t grid1 = iq3s_grid[qs[8*g + 2*il    ] | ((qhg << (8 - 2*il)) & 256)];
++            const uint32_t grid2 = iq3s_grid[qs[8*g + 2*il + 1] | ((qhg << (7 - 2*il)) & 256)];
++            const uint32_t signs = sg[4*g + il];
++            float v[8];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const float g1 = dg * (float)((grid1 >> (8*j)) & 0xFFu);
++                const float g2 = dg * (float)((grid2 >> (8*j)) & 0xFFu);
++                v[j]     = (signs >> j)     & 1u ? -g1 : g1;
++                v[4 + j] = (signs >> (4+j)) & 1u ? -g2 : g2;
++            }
++            out[4*il + 0] = mmb_pack2_so(v[0], v[1]);
++            out[4*il + 1] = mmb_pack2_so(v[2], v[3]);
++            out[4*il + 2] = mmb_pack2_so(v[4], v[5]);
++            out[4*il + 3] = mmb_pack2_so(v[6], v[7]);
++        }
++    }
++}
++
+ // dequantize one weight row's 64-value quarter of a Q5_K super-block (176 B: half2 dm, scales[12],
+ // qh[32], qs[128]) into 64 bf16.  Same affine form as Q4_K plus the 5th bit from qh (bit 2*q4 for
+ // the low nibbles, 2*q4+1 for the high nibbles).  Loaded from the row base in store_lds.
+@@ -423,6 +459,9 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
+         const int n_cols, uint16_t * As, uint16_t * Bs) {
+     constexpr int WAVES_M = BM / WTM, TM = WTM / 16, TN = WTN / 16;
+     constexpr int A_ITEMS = (BM + MMB_NT - 1) / MMB_NT;
++    // WTYPE 5 (IQ3_S): when BM < MMB_NT the row-per-thread A mapping leaves warps idle, so the
++    // threads sharing a row split its 8 (g,il) groups instead (see mmb_dq_row_iq3s_p).
++    constexpr bool SPLIT_A = (WTYPE == 5 && MMB_NT > BM && MMB_NT % BM == 0);
+     constexpr int B_ITEMS = (BN * 8) / MMB_NT;
+     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+     const int wm = wave % WAVES_M, wn = wave / WAVES_M;
+@@ -459,11 +498,16 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
+     };
+     auto store_lds_a = [&](int ksh, const int abo) {
+ #pragma unroll
+-        for (int i = 0; i < A_ITEMS; ++i) { const int row = tid + i * MMB_NT; if (row < BM) {
++        for (int i = 0; i < A_ITEMS; ++i) { const int row = SPLIT_A ? (tid % BM) : (tid + i * MMB_NT); if (row < BM) {
+             if constexpr (WTYPE == 0) mmb_dq_row36(a0[i], a1[i], a2[i], (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+             else if constexpr (WTYPE == 1) mmb_dq_row68(a0[i], a1[i], a3[i], a4[i], a2[i], (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+             else if constexpr (WTYPE == 3) mmb_dq_row_q4k(a0[i], a1[i], a3[i], ksh, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+             else if constexpr (WTYPE == 4) mmb_dq_row_q5_1(a0[i], a1[i], a3[i], (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (SPLIT_A) {
++                constexpr int PARTS = MMB_NT / BM;
++                mmb_dq_row_iq3s_p<PARTS>(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3,
++                                         (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE), tid / BM);
++            }
+             else if constexpr (WTYPE == 5) mmb_dq_row_iq3s(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+             else if constexpr (WTYPE == 6) mmb_dq_row_q5k(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 176, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+             else if constexpr (WTYPE == 7) mmb_dq_row_q6k(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 210, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+@@ -672,6 +716,9 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
+         const int n_cols, uint16_t * Ag, uint16_t * Au, uint16_t * Bs) {
+     constexpr int WAVES_M = BM / WTM, TM = WTM / 16, TN = WTN / 16;
+     constexpr int A_ITEMS = (BM + MMB_NT - 1) / MMB_NT;
++    // WTYPE 5 (IQ3_S): when BM < MMB_NT the row-per-thread A mapping leaves warps idle, so the
++    // threads sharing a row split its 8 (g,il) groups instead (see mmb_dq_row_iq3s_p).
++    constexpr bool SPLIT_A = (WTYPE == 5 && MMB_NT > BM && MMB_NT % BM == 0);
+     constexpr int B_ITEMS = (BN * 8) / MMB_NT;
+     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+     const int wm = wave % WAVES_M, wn = wave / WAVES_M;
+@@ -718,7 +765,7 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
+     };
+     auto store_lds_a = [&](int ksh, const int abo) {
+ #pragma unroll
+-        for (int i = 0; i < A_ITEMS; ++i) { const int row = tid + i * MMB_NT; if (row < BM) {
++        for (int i = 0; i < A_ITEMS; ++i) { const int row = SPLIT_A ? (tid % BM) : (tid + i * MMB_NT); if (row < BM) {
+             if constexpr (WTYPE == 0) {
+                 mmb_dq_row36(g0[i], g1[i], g2[i], (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
+                 mmb_dq_row36(u0[i], u1[i], u2[i], (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+@@ -731,6 +778,12 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
+             } else if constexpr (WTYPE == 4) {
+                 mmb_dq_row_q5_1(g0[i], g1[i], g3[i], (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
+                 mmb_dq_row_q5_1(u0[i], u1[i], u3[i], (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (SPLIT_A) {
++                constexpr int PARTS = MMB_NT / BM;
++                mmb_dq_row_iq3s_p<PARTS>(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3,
++                                         (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE), tid / BM);
++                mmb_dq_row_iq3s_p<PARTS>(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3,
++                                         (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE), tid / BM);
+             } else if constexpr (WTYPE == 5) {
+                 mmb_dq_row_iq3s(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
+                 mmb_dq_row_iq3s(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+@@ -1535,7 +1588,7 @@ static void mmb_routed_glu_kernel_dispatch(const ggml_tensor * gw, dim3 gbig, di
+         mmb_routed_glu_kernel<64,  32, 16, 16, 4><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
+     } else if (gw->type == GGML_TYPE_IQ3_S) {
+         mmb_routed_glu_kernel<64, 128, 32, 32, 5><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
+-        mmb_routed_glu_kernel<64,  32, 16, 16, 5, true><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 5><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
+     } else if (gw->type == GGML_TYPE_Q8_0) {
+         mmb_routed_glu_kernel<64, 128, 32, 32, 1><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
+         mmb_routed_glu_kernel<64,  32, 16, 16, 1><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
+-- 
+2.55.0
+
