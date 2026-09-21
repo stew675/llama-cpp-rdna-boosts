@@ -82,6 +82,17 @@ closed.**  Raw data: **`gfx1100-s8s9-results.md`**.
 
 Next: **S10 (freeze, regenerate the overlay, merge back to `wip-mmb-general`)**.
 
+**Deferred-tuning pass (2026-09-21, maintainer request): no code changes.**  Raw data:
+**`gfx1100-s9-mmb-tuning-results.md`**.
+* **MMB routed/GLU thresholds:** default **32 is optimal** (128 is −3.7..−3.9 %, 8 is −0.6..−1.5 %).
+* **DBUF:** the big dense tile **cannot compile** (72 KB LDS > gfx1100's 64 KB) — why no dispatch
+  passes it; the routed big tile fits but is neutral-to-slightly-negative → **refuted**.
+* **IQ3_XXS GLU:** a wash → keep off.
+* **`nwarps` MoE candidate:** the +4.5 % MTP win is real, but the shapes do **not** separate by
+  `(type, K)` (or `M` alone), and the decode path uses the plain table (the `(type,K)` rule only
+  reaches the verify body).  **Not landed** — recorded with the shape data and an `M >= 4096`
+  hypothesis for a dedicated session.
+
 ---
 
 ## 0. TL;DR
@@ -637,10 +648,10 @@ claim* is deferred.
 - [x] G1 `mmb` opened (`MMB_RDNA3=1`), fires, PPL parity (S5)
 - [x] G1 gfx1100 per-type/per-path: **dense is a big win, F32 router loses**; patch `0008` (S6)
 - [x] G1 routed/GLU isolate: the routed path is the bulk of the MoE win (~+4 %) (S7)
-- [ ] G1 optional finer routed/GLU threshold + `DBUF` sweep (deferred)
 - [x] G3b/c + HC16 — **no-op on gfx1100** (F32 policy-off; HC16 RDNA3_5-gated; tiny-M qwen4exp-only) (S8)
-- [x] delivery re-examination DONE: FA cap 256 **keep**; verify-width gate green; **`nwarps` shape-dependent (table kept, MoE `all-1` candidate)**; **VDR=4 keep**; **all 8 native KV pure**; MMB kernel-time −5.4 % (S9)
-- [ ] G1 optional finer routed/GLU threshold + `DBUF` sweep (deferred)
+- [x] delivery re-examination DONE: FA cap 256 **keep**; verify-width gate green; **`nwarps` shape-dependent (table kept)**; **VDR=4 keep**; **all 8 native KV pure**; MMB kernel-time −5.4 % (S9)
+- [x] G1 optional routed/GLU threshold + DBUF sweep — **done: no change** (thresh 32 optimal; DBUF refuted/not-viable; IQ3_XXS wash) (S9)
+- [x] G1 `nwarps` MoE candidate — **investigated: real (+4.5 % MTP) but not expressible with the current dispatch axes**; deferred with data (S9)
 - [ ] B1-B9 consolidated on the frozen tree, including MTP (S10)
 - [ ] patch set regenerated + `git am` N/N + merged back to `wip-mmb-general` (S10)
 
