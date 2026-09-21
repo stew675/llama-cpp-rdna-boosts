@@ -451,8 +451,11 @@ a trunk"), but on a `-sm tensor` split an `GGML_ASSERT(!suffix_fallback.empty())
 `llama-model.cpp:470`, and `-fit off` does not avoid it.  **Pre-existing and identical on the delivery**
 (maintainer confirms upstream too), so not a WIP regression — but the harness's `plain` arm must not
 pass `-md`.  And **Flash-Next has no built-in `nextn` head** while the 27B and both 35B-A3B models do,
-so only qwen4exp gets `-md`.  Also: `FLASH_ATTN_EXT`'s case count is randomised run-to-run (two runs of
-the *same* binary differed by 34 cases), so only "0 FAIL" is a gate — not the brief's 5951.
+so only qwen4exp gets `-md`.  And one correction to that session's own first analysis: `FLASH_ATTN_EXT`
+is **5954 OK / 0 FAIL and fully deterministic** (the delivery's 5951 is the same count on a slightly
+different build) — the apparent run-to-run movement was a **log-parsing trap**, not a randomised matrix:
+the status is ANSI-wrapped and `2>&1` stderr interleaving orphans it from its test name.  Separate the
+streams; never count that op from a merged log.
 
 **S15 remains** — freeze, regenerate, verify `git am` N/N (done, 10/10), and hand gfx1100 the tree.
 

@@ -83,10 +83,19 @@ Two findings worth carrying forward:
 * **Flash-Next IQ4_XS has no built-in `nextn` head** (the 27B and both 35B-A3B models do), so
   qwen4exp must be given `-md` while the others must not.  Check for `'nextn' in t.name` first.
 
-Also: **`FLASH_ATTN_EXT`'s case count is randomised run-to-run** -- two runs of the *same* binary
-differed by 34 cases (symmetric difference) versus 40 for WIP-vs-delivery, so the OK counts are not
-comparable and only "0 FAIL" is a gate.  The brief's `5951/5951` came from a differently-configured
-build.
+**Correction to this entry's own first analysis (same day).**  It initially concluded that
+`FLASH_ATTN_EXT`'s case count was "randomised run-to-run", because counting `(...): OK` lines from the
+usual `2>&1`-merged log gave 1947/1949/1951 with ~34 cases moving between runs.  **That was wrong.**
+`-j` defaults to 1 and the run loop visits every case once, in order, in one thread; the case list is
+deterministic (every run printed exactly 8090 name lines).  The real mechanism is a **log-parsing
+trap**: the status is ANSI-wrapped (`printf("\033[1;32mOK\033[0m\n")`), and `print_test_console`
+writes the name to stdout while the test emits CUDA-graph-warmup/allocation notices to stderr -- so
+merging `2>&1` into a file (stdout block-buffered, stderr not) orphans the status onto its own line.
+Paired-parsing all five captures gives **5953/5954 OK and 0 FAIL in every run**, on the delivery and
+the WIP alike -- and **the brief's `5951/5951` was right** all along (the small delta is a build
+difference).  Two captures of the same run: merged = 1951 attached + 4003 orphaned = 5954; stdout-only
+= 5953 attached + 1 orphaned = 5954.  Identical total.  **Never count `test-backend-ops` results from a
+merged `2>&1` log -- separate the streams, and strip ANSI.**
 
 **S15 remains**: freeze, regenerate the patch set, verify `git am` N/N on a fresh r12 worktree, update
 the docs and hand gfx1100 the tree.

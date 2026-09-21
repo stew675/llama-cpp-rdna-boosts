@@ -147,24 +147,50 @@ The `qsa3=1` arms passing is the important one: `FLASH_ATTN_QSA` is the *only* o
 kernel has, and those three cases are the S4 addition that closed the "the kernel had no oracle on
 any arch" gap.
 
-### `FLASH_ATTN_EXT`, and why the brief's "5951/5951" is not reproducible
+### `FLASH_ATTN_EXT` — 5954 OK, 0 FAIL, and a parsing trap that nearly fooled me
 
-Four runs (three WIP, one delivery), all `exit=0`, `2/2 backends passed`, **zero FAIL**:
+The delivery's records quote `5951/5951`.  Measured here: **5954 OK, 0 FAIL**, on the delivery and on
+the WIP, stable across five runs.
 
-| run | OK | not supported (ROCm0) |
-|---|---:|---:|
-| delivery | 1949 | 2125 |
-| WIP run 1 | 1947 | 2126 |
-| WIP run 2 | 1951 | 2126 |
-| WIP run 3 (same binary as run 1) | 1951 | 2126 |
+Getting there required noticing that the first analysis was **wrong**.  Counting `FLASH_ATTN_EXT(...): OK`
+lines from the usual `2>&1`-merged log gave 1947/1949/1951 across runs, with ~34 cases moving between
+runs — which looked like a randomised test matrix.  It is not.  The mechanism:
 
-The `±2-4` OK-count difference looked like a backend regression until the decisive control: **two
-runs of the identical binary differ by 34 cases** (symmetric difference), while WIP-vs-delivery
-differs by 40.  The case list is deterministic in the source, but `test-backend-ops` randomises part
-of each case's parameters (`std::random_device`-seeded), so the OK/unsupported split moves between
-runs and the counts are not comparable.  **The gate is "no FAIL", and it passes.**  The brief's
-`5951/5951` came from a differently-configured build (more KV types supported rather than
-"not supported") and must not be used as an expected count.
+* `-j` defaults to **1**, and the run loop visits every case exactly once, in order, in the main thread
+  (`tests/test-backend-ops.cpp` ~12010-12040) — there is no race and no seed to set.
+* The case list is deterministic: **every run printed exactly 8090 `FLASH_ATTN_EXT(` name lines**, and
+  the *generator* is plain nested loops over fixed lists.
+* **The status is ANSI-wrapped** (`printf("\033[1;32mOK\033[0m\n")`), so any parse that does not strip
+  ANSI sees nothing.
+* `print_test_console` writes the name and the status to **stdout**, but the test itself emits
+  CUDA-graph-warmup and allocation notices to **stderr**.  With `2>&1` into a *file*, stdout is
+  block-buffered while stderr is unbuffered, so stderr lands *between* the name and the status and the
+  status is orphaned onto its own line.
+
+Two captures of the same binary, same run:
+
+| capture | `: OK` attached to its name | orphaned `OK` on its own line | total |
+|---|---:|---:|---:|
+| merged `2>&1` | 1951 | 4003 | **5954** |
+| stdout only | 5953 | 1 | **5954** |
+
+The total is **identical** — the interleaving only moves the status.  With a paired parse (a name line
+followed by its status, attached or orphaned) all five logs agree exactly:
+
+| run | OK | not supported | FAIL |
+|---|---:|---:|---:|
+| delivery | 5953 | 12 | **0** |
+| WIP run 1 | 5953 | 11 | **0** |
+| WIP run 2 | 5953 | 11 | **0** |
+| WIP run 3 (separated streams, ANSI stripped) | 5954 | 2137* | **0** |
+
+\* the separated capture counts `not supported` differently because in the merged log those statuses are
+orphaned too; the OK total is the comparable number, and it does not move.
+
+**So the brief's `5951/5951` was right**, the matrix is fully deterministic, and the gate is simply
+"5954 OK, 0 FAIL".  **The lesson generalises: never count `test-backend-ops` results from a merged
+`2>&1` log — separate the streams (or pair the statuses), and strip ANSI.**  The delivery-vs-WIP
+`not supported` delta (12 vs 11) is a single test-case difference and is harmless.
 
 ## 5. B7 — width purity (S14.3e)
 
@@ -320,7 +346,10 @@ tree that carries the whole port.
 4. **The brief's Flash-Next delivery reference row was wrong** (it quoted mmb-off WIP numbers).  The
    correct delivery values are in §2e, and the S1/S2 record is the corroboration.  This is the
    second time in this campaign that "ON vs OFF" (intra-WIP) numbers were read as "WIP vs delivery".
-5. **`FLASH_ATTN_EXT`'s case count is randomised run-to-run**; only "0 FAIL" is a gate.
+5. **`FLASH_ATTN_EXT` is 5954 OK / 0 FAIL and fully deterministic** — but do not count its results from
+   a merged `2>&1` log: the status is ANSI-wrapped and gets orphaned from its test name by stderr
+   interleaving.  Separate the streams and strip ANSI, or pair name+status.  An earlier version of this
+   record wrongly concluded the matrix was randomised.
 6. **The 3-GPU qwen4exp bench drifts ±3 % at pp8192 but only ±0.1-0.4 % at 64k/98k** (S13).  The
    delivery-vs-WIP ratios here agree between rounds to 0.2 % at every depth, which is why the deep
    numbers are the ones to quote.

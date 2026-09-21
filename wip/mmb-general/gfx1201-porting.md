@@ -847,8 +847,9 @@ groups + qsa3 are +14.4-16.3 %), and the delivery figures reproduce the S1/S2 re
 *WIP vs delivery*:** the delivery Flash-Next reference row (pp32768/65536/98304) is **2372 / 2213 /
 2073**, not 2728 / 2591 / 2465 (those are qsa3-on, mmb-off WIP numbers); and the "expected landed
 +6.7/+6.5/+6.2 %" is the **mmb-only** delta, not the delivery-vs-WIP one.  Both are corrected in
-§S14.3c.  Also: `FLASH_ATTN_EXT`'s case count is randomised run-to-run (two runs of the *same* binary
-differed by 34 cases), so only "0 FAIL" is a gate — not the brief's 5951.
+§S14.3c.  `FLASH_ATTN_EXT` is **5954 OK / 0 FAIL** and fully deterministic — but do not count its
+results from a merged `2>&1` log: the status is ANSI-wrapped and stderr interleaving orphans it from the
+test name, which makes the counts *look* like they move between runs.  The brief's `5951` was right.
 
 **Trap found:`-md <mtp-head>` with `--spec-type none` aborts.**  On 1 GPU it is a deliberate clean
 error ("this model is an MTP draft head without a trunk; load it as a draft of its target model, not on
@@ -996,7 +997,9 @@ perf work must be validated at depth, and `tg` is *not* a correctness signal.
 ~/llama.cpp/build-rocm/bin/test-backend-ops -o FLASH_ATTN_QSA    # now 26/26 (S4 added 3 packed qsa3 cases; it was 18/18)
 ~/llama.cpp/build-rocm/bin/test-backend-ops -o GATED_DELTA_NET   # 46/46
 ~/llama.cpp/build-rocm/bin/test-backend-ops -o INDEXER_TOPK      # the G5 oracle
-~/llama.cpp/build-rocm/bin/test-backend-ops -o FLASH_ATTN_EXT   # 5951/5951 per the delivery record
+~/llama.cpp/build-rocm/bin/test-backend-ops -o FLASH_ATTN_EXT   # 5954 OK / 0 FAIL (delivery: 5951)
+#   ^ DO NOT count this one from a 2>&1-merged log -- the status is ANSI-wrapped and stderr
+#     interleaving orphans it onto its own line; separate the streams or pair name+status
 ```
 `FLASH_ATTN_QSA` is the *only* oracle the qsa3 kernel has and it now exercises the WMMA path on RDNA4
 — if it regresses, qsa3 is suspect.  `INDEXER_TOPK` is the G5 oracle.  A fragment-layout error is an
