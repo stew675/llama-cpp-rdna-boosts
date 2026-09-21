@@ -9,6 +9,7 @@ moved here and updated 2026-09-21.
 |---|---|
 | [`closing-the-gap.md`](closing-the-gap.md) | the living analysis. §0–11 are the **2026-09-20 snapshot** (dated measurements); the **Update 2026-09-21** block, **§12** (MTP qualification) and **§13** (phased plan) are current. |
 | [`2026-09-21-mtp-qualification.md`](2026-09-21-mtp-qualification.md) | the MTP qualification record: plain-vs-MTP on qwen4exp IQ4_NL, ours vs pwilkin's, and the `nextn_shared_target_tensors` finding. |
+| [`2026-09-21-hc-combine-norm.md`](2026-09-21-hc-combine-norm.md) | Phase-1 item 1 start: the `hc_combine_norm` matcher root cause (three bugs) and the +1.5 % prefill prototype on fork branch `gap-closing`. |
 
 ## The two moving references this file tracks
 
@@ -45,7 +46,8 @@ MTP tuning + correctness.**
 **Phase 1 — recall / long-context prefill + correctness**
 
 1. Wire the existing `hc_gate_mix_kernel` + make `hc_combine_norm` fire (matcher) — the `HC_*`
-   ablation is −19.5 % on pwilkin's own model.
+   ablation is −19.5 % on pwilkin's own model. **Combine+norm half started 2026-09-21** (matcher
+   revived, +1.5 % prefill — see the record); the `hc_gate_mix` half is still open.
 2. Port `gdn-conv.cu` + `ple-conv.cu` (now F32-aware for Flash-Next PLE) — −10.5 %.
 3. Fix the `n_batch == n_ubatch == n_ctx` context-creation bug (unlocks `-ub 16384`).
 3.5. Port pwilkin's three correctness fixes (`40c0b9c38`, `b0f31f587`, `14fff4f97`).

@@ -642,7 +642,7 @@ body, (7) tall tile, (8) QSA graph flags; items 1–9 survive, regrouped below.
 
 | # | action | expected | effort | note |
 |---|---|---|---|---|
-| 1 | Make `hc_combine_norm` fire (debug the matcher) and **wire the existing `hc_gate_mix_kernel`** | large — `HC_*` ablation **−19.5 %** | 2–4 d | kernel already in beta; this is the call site + matcher, not a port |
+| 1 | Make `hc_combine_norm` fire (debug the matcher) and **wire the existing `hc_gate_mix_kernel`** | large — `HC_*` ablation **−19.5 %** | 2–4 d | **started 2026-09-21**: matcher revived (+1.5 % prefill, [`2026-09-21-hc-combine-norm.md`](2026-09-21-hc-combine-norm.md)); `hc_gate_mix` still unwired |
 | 2 | Port `gdn-conv.cu` + `ple-conv.cu` + matches (now incl. **F32 PLE**) | **−10.5 %** | 2–3 d | pwilkin's `40a9f4d01` made the PLE half F32-aware |
 | 3 | Fix the `n_batch==n_ubatch==n_ctx` context creation | unlocks `-ub 16384` | 0.5–2 d | pre-existing delivery bug |
 | 3.5 | **Port the three correctness fixes** (`40c0b9c38`, `b0f31f587`, `14fff4f97`) | prevents long-session corruption | 0.5–1 d | cheap; includes the QSA decode non-determinism fix |
