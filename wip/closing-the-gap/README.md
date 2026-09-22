@@ -19,7 +19,8 @@ moved here and updated 2026-09-21.
 | [`2026-09-22-qsa3-visibility-fold.md`](2026-09-22-qsa3-visibility-fold.md) | Phase-1 item 6: fold the per-cell QSA visibility into `umask` at merge time (drops the hot-loop check), **bit-identical**, **+2.4 % pp8192 / +1.7 % pp32768**; the QSA pipeline is now 50 ms ahead of the reference's. |
 | [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md) | Phase-1 item 7: keep the `M=4` HC inject out of the 384-row tall MMB tile (the tall kernel ran 2× the dispatches), **bit-identical**, **+0.8 % pp8192 / +1.1 % pp32768**. |
 | [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md) | Phase-1 item 8 (**closed**): 7/9 QSA graph flags are present/superseded in our block-14/15 QSA; **2 are un-ported prefill-score optimizations** (`QSA_SCORE_BOUNDS`+`QSA_QUERY_STRIP`, `QSA_SCORE_WMMA`) — the next follow-ups. |
-| [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..1004c65db`) exported as patches, so the code work survives a fork reset. |
+| [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md) | Phase-1 item 16: the HC BF16 streams (`blk16`/`res16`) ported **default OFF**, default byte-identical, **+4.9 % pp8192 / +4.8 % pp32768** at `-b/-ub 4096`; `res16` is the dominant half.  The MoE-merge `ffn_out` ADD stays F32 in our graph (not adjacent to the reduction chain). |
+| [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..37e8b1751`, `0001..0011`) exported as patches, so the code work survives a fork reset. |
 
 ## The two moving references this file tracks
 
@@ -32,15 +33,17 @@ moved here and updated 2026-09-21.
 
 ## Current "our side" build state
 
-* `~/llama.cpp` branch **`gap-closing`** @ **`4a75744fa`** = `mmb-beta` (r12 `72176ae8a` + the 12
+* `~/llama.cpp` branch **`gap-closing`** @ **`37e8b1751`** = `mmb-beta` (r12 `72176ae8a` + the 12
   `beta/mmb-general/patches/*.patch`, tree `bca69f23dd…`) + the 2026-09-21/22 changes: **default-on
   policy** (MMB/HC16/matcher), the `hc_combine_norm` matcher revival, the **`hc_gate_mix` fusion**
   (session 2), the **depthwise conv1d fusions** (session 3), the **QSA block-window fix** (session 3,
   `b0f31f587`), the **narrow-row RMS norm fusion** (session 4), the **QSA visibility fold**
-  (session 4, item 6), and the **tall-tile min-M** fix (session 4, item 7), plus env-gated debug traces.
+  (session 4, item 6), the **tall-tile min-M** fix (session 4, item 7), the **`-lzm auto` semantics**
+  + managed PLE reader gated OFF (session 5), the **MoE BF16 epilogue** gated OFF (session 5), and the
+  **HC BF16 streams** gated OFF (session 6, item 16), plus env-gated debug traces.
 * Built on this box (gfx1151) with `~/bin/build-llama-rocm-714`.  **All beneficial features are on by
   default** (see the `AGENTS.md` default-on policy); env vars only disable.
-* The ten `gap-closing` commits (`0001..0010`) are exported to [`patches/`](patches/) in case the local
+* The ten `gap-closing` commits (`0001..0011`) are exported to [`patches/`](patches/) in case the local
   fork branch is lost.
 
 To reproduce:
@@ -72,16 +75,16 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch  
    reserve (15.5 GiB, shared with the other solution) plus qwen4exp's HC `block_out` pin (~18 GiB)
    against the resident PLE table (~27 GiB host).  ubatch 8192 runs clean and is the reproducible
    head-to-head baseline (ours 1212.6 vs its 1346.5 at pp8192, ~10 % behind before items 1+2).
-3. **Next code item — the HC BF16 streams (`blk16`/`res16`), default OFF.**  **This is a new session's
-   target** (the biggest remaining prefill item, ~1.8 s / ~3.8 % at depth, lossy).  The full scoping —
-   reference files, our files, the marking block, the order of work, the gates and the traps — is the
-   **"NEXT SESSION"** block at the top of [`closing-the-gap.md`](closing-the-gap.md).  The MoE half
-   (`MMB_DOWN16`, `patches/0010`) is already landed as the worked template.
-   Remaining queue after that, in order:
-   1. **`mmb_cvt_f32_bf16` (+1478 ms)** — non-lossy; our calls convert far larger tensors than the
-      reference's (activation cache / `mmb_root` keying).
-   2. **Prefill indexer relu-sum (+590 ms)** — non-lossy; the audit wrongly marked `idx-relu-sum` as
-      banked (our fused score op is `n_tokens == 1` only).
+3. **Item 16 (HC BF16 streams `blk16`/`res16`) is DONE 2026-09-22 (session 6, `patches/0011`),
+   default OFF** — +4.9 % pp8192 / +4.8 % pp32768 at `-b/-ub 4096`, default build byte-identical —
+   [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md).  The MoE-merge `ffn_out`
+   `block_out` is the one piece left on the table (not adjacent to the reduction chain in our graph).
+   **Next code items, in order** (both non-lossy, land default-ON):
+   1. **`mmb_cvt_f32_bf16` (+1478 ms)** — our calls convert far larger tensors than the reference's
+      (activation cache / `mmb_root` keying).
+   2. **Prefill indexer relu-sum (+590 ms)** — our fused score op is `n_tokens == 1` only, so prefill
+      runs a separate `unary_op<relu>` (559 ms) + head-sum adds; the reference matcher cannot port
+      verbatim because our graph applies relu *before* the 4-D reshape.
    3. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` — the item-8 follow-ups.
    The full session-5 finding (throughput A/B, memory accounting, family diff) is in
    [`closing-the-gap.md`](closing-the-gap.md#session-5-finding-2026-09-22--fresh-target-ubatch-profile-memory-accounting-refined-tasks).
@@ -140,9 +143,10 @@ MTP tuning + correctness.**
     applies relu *before* the 4-D reshape (the L2a win), so the reference matcher cannot port verbatim.
 15. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` — the item-8 follow-ups; the trim is
     coupled to the reference's complete-block selection, which our fused cell top-k lacks.
-16. **BF16 HC streams** (`blk16`/`res16`) — **~1.8 s, ~3.8 % at depth, the biggest remaining item;
-    NOT STARTED (scoped 2026-09-22 session 5)**, default OFF like item 5.  Consumer arms +
-    `ggml_cuda_hc_combine_norm_args` fields + the ~120-line HC stream marking block.
+16. **BF16 HC streams** (`blk16`/`res16`) — **DONE 2026-09-22 (session 6, `patches/0011`),
+    default OFF**: +4.9 % pp8192 / +4.8 % pp32768 at `-b/-ub 4096`, default build byte-identical —
+    [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md).  `res16` is the dominant half;
+    the MoE-merge `ffn_out` `block_out` stays F32 (not adjacent to the reduction chain in our graph).
 
 **Phase 2 — decode speed + correctness**
 

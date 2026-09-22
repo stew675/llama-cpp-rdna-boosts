@@ -1,6 +1,6 @@
 # Closing the gap — `beta/mmb-general` vs the other solution's `strix-halo` prefill
 
-**Date:** 2026-09-20 (snapshot) · **updated:** 2026-09-22 (end of session 5)
+**Date:** 2026-09-20 (snapshot) · **updated:** 2026-09-22 (end of session 6)
 **Box:** `halo` — Strix Halo, Radeon 8060S (gfx1151, RDNA3_5), ROCm 7.14 (`/opt/rocm-7.14-gfx1151`), 123 GiB RAM / 124 GB unified VRAM
 **Scope:** a 1:1 prefill comparison on **the other solution's uniform-IQ4_NL model** (not just our mixed UD-IQ4_XS), a kernel-level profile diff on the uniform model, and a gate-ablation of the other solution's stack on this box to price the still-missing families. This is an investigation record, not a delivery change.
 
@@ -81,11 +81,36 @@
   lossy path).  Kernel **1479 -> 846 ms** at pp32768 (matches the reference's 846.5), `plain == n3`
   text and width probe PASS with it on at `-b 2048 -ub 2048`.  This is the **template** for the HC
   port below.
-* **Next: see "NEXT SESSION" immediately below** — the HC `blk16`/`res16` BF16 port (item 16), the
-  biggest remaining prefill item.  The session-5 profile/memory findings and the corrected gate
-  semantics are further down; read them too.
+* **Phase-1 item 16 (HC BF16 streams) DONE** (session 6, **`patches/0011`**): the `blk16`/`res16`
+  BF16 hyper-connection streams are ported **default OFF** (`LLAMA_HC_BLK16=1` / `LLAMA_HC_RES16=1`),
+  the default build is byte-identical, and the arm is **+4.9 % pp8192 / +4.8 % pp32768** at
+  `-b/-ub 4096` — [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md).  `res16` is the
+  dominant half (+4.7 %/+4.6 % alone); `blk16` adds +3.2 %/+2.5 % alone.  The MoE-merge `ffn_out`
+  ADD is not adjacent to the reduction chain in our graph, so only the attention-path `block_out`
+  takes `blk16`.
+* **Next: see "NEXT SESSION" immediately below** — the non-lossy `mmb_cvt_f32_bf16` investigation
+  (+1478 ms), then the prefill indexer relu-sum (item 14).  The session-5 profile/memory findings and
+  the corrected gate semantics are further down; read them too.
 
-### NEXT SESSION — the HC BF16 streams (`blk16`/`res16`), default OFF
+### NEXT SESSION — the non-lossy `mmb_cvt_f32_bf16` gap, then the indexer relu-sum
+
+**Item 16 (HC BF16 streams) is DONE** — see [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md).
+It shipped default **OFF** (`LLAMA_HC_BLK16` / `LLAMA_HC_RES16`, +4.9 %/+4.8 % at depth) with a
+byte-identical default; the `ffn_out` MoE-merge `block_out` is the one piece left on the table.
+
+**The next two items are the non-lossy half of the session-5 profile** (they do not need a default-OFF
+gate — verify width probe + same-seed text and land them default-ON):
+
+1. **`mmb_cvt_f32_bf16` (+1478 ms)** — identical kernel, but our calls convert far larger tensors
+   than the reference's (1040 calls vs 1544, per-call 5× bigger): the activation cache / `mmb_root`
+   keying is converting redundant or larger-than-needed tensors.  Find which activation(s) and skip
+   or shrink the conversion.
+2. **Prefill indexer relu-sum (item 14, +590 ms)** — our fused indexer score is `n_tokens == 1`
+   only, so prefill runs a separate `unary_op<relu>` (559 ms) + head-sum adds.  Our graph applies
+   relu *before* the 4-D reshape (the L2a win), so the reference matcher cannot port verbatim — use
+   a fused op or an order-aware matcher.
+
+Then the deferred `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` (item 15).
 
 **Target:** implement the reference's BF16 hyper-connection stream (`res_in_bf16`/`blk_in_bf16`/
 `res_out_bf16`/`out_xn_bf16`/`store_xn_f32`) so the fused `hc_combine_norm` reads/writes BF16, cutting
@@ -414,7 +439,7 @@ Both are recall-speed (Phase-1) items; the audit record has the full flag table 
 
 | what | where / value |
 |---|---|
-| fork `~/llama.cpp` | branch **`gap-closing`** @ **`4a75744fa`** = r12 + the 12 `beta/mmb-general` patches + the 10 gap-closing commits |
+| fork `~/llama.cpp` | branch **`gap-closing`** @ **`37e8b1751`** = r12 + the 12 `beta/mmb-general` patches + the 11 gap-closing commits (session 6 = the HC BF16 streams, `patches/0011`) |
 | fork build | `~/llama.cpp/build-rocm` (gfx1151, ROCm 7.14), full feature set **default** |
 | this repo | branch `gap-closing` (published to `origin`), `wip/closing-the-gap/patches/0001..0010` |
 | the other solution | `~/pwilkin-llama-cpp` @ `b0f31f587`, `build-rocm` |
@@ -1354,7 +1379,7 @@ body, (7) tall tile, (8) QSA graph flags; items 1–9 survive, regrouped below.
 | 13 | **`-lzm auto` semantics + managed PLE reader perf** | memory: ~28 GB; `-ub 16384` unlock | 0.5–1 d (semantics **DONE**, reader **gated OFF**) | session-5: `on`=mmap, `off`=resident, `auto`=upstream auto, managed LRU **opt-in** via `LLAMA_LAZY_BUF_MB` and **off by default** because it is the slowest arm (1090/1184 vs mmap 1219/1217 vs resident 1285/1232 at pp8192/32768).  `--lazy-buffer-size` dropped.  **Discriminator (2026-09-22):** the cost is *not* only page-cache pressure — with the table fully cached (`-ub 2048`) the reader is still **−4.0 % vs mmap** (vs −9.7 % under pressure), so the arena has an intrinsic streaming overhead; the fix is a no-cache parallel-pread fast path like the reference's `on-direct`, then reconsider defaulting it on.  It already enables `-b/-ub 16384` (1125.5 t/s) |
 | 14 | Port the prefill indexer **relu+head-sum** fusion (`idx-relu-sum`) | ~+590 ms (~1.1 %) | 0.5–1 d | non-lossy; reference `idx_relu_sum_f32` (1536 calls / 364 ms) vs our `unary_op<relu>` 559 ms + adds.  Our graph applies relu *before* the 4-D reshape (the L2a win), so the reference matcher cannot port verbatim — use a fused op or an order-aware matcher |
 | 15 | `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` | low-single-digit % | 2–3 d | item-8 follow-ups; the bounds trim is coupled to the reference's complete-block selection (`compact`/`maskless`), which our fused cell top-k does not have, so scope carefully |
-| 16 | **BF16 HC streams** (`blk16`/`res16`) | **~1.8 s, ~3.8 % at depth** — biggest remaining item | 2–3 d | **NOT STARTED (scoped 2026-09-22 session 5).**  Consumer: the reference's `res_in_bf16`/`blk_in_bf16`/`res_out_bf16`/`out_xn_bf16`/`store_xn_f32` arms in `hyperconn.cu` + the `ggml_cuda_hc_combine_norm_args` fields; graph: the ~120-line marking of the HC `block_out`/`residual`/`xn` streams bf16-only (our `mmb.cu` producers already honour `ggml_cuda_mmb_is_bf16_only`, and `LLAMA_HC_BLK16`/`RES16` gates already exist).  Also needs the reference's `moe_weighted_reduction_bf16_v4_out` (bf16-in/bf16-out with merge) for the block_out path.  Gate default OFF like item 5 |
+| 16 | **BF16 HC streams** (`blk16`/`res16`) | **DONE 2026-09-22 (session 6): +4.9 % pp8192 / +4.8 % pp32768 at `-b/-ub 4096`, default OFF** | done | **DONE** — [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md), `patches/0011`.  BF16 arms in both combine+norm kernels, the structure-only combine identifier + blk16/res16 marking in `graph_optimize`, the MoE bf16-out reduction variants.  Default byte-identical.  `res16` is the dominant half (+4.7 %/+4.6 %); `blk16` alone +3.2 %/+2.5 %.  Limit: the qwen4exp `ffn_out` MoE-merge ADD is not adjacent to the reduction chain, so only the attention-path `block_out` takes `blk16` |
 
 **Session-5 re-rank (2026-09-22, `-b 8192 -ub 8192 -p 32768` profile):** the remaining gap is the BF16
 intermediate traffic — **HC combine (`blk16`/`res16`) + MoE epilogue ≈ 2.4 s, ~4.6 %** — plus the
