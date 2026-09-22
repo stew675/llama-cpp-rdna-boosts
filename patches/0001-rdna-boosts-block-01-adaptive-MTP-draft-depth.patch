@@ -1,4 +1,4 @@
-From 5617fd59879995b3cbe996e3f0f9bade563c7128 Mon Sep 17 00:00:00 2001
+From 99c54f82624cfc8001afa4eca91573c2f8d57c96 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Wed, 9 Sep 2026 05:29:21 -0500
 Subject: [PATCH 01/15] rdna-boosts: block 01: adaptive MTP draft depth
@@ -509,7 +509,7 @@ index 000000000..1f8e8a6b5
 +    }
 +};
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 77dfe9535..d74dbf5fb 100644
+index 16c33b258..d01456035 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -9,6 +9,7 @@
@@ -568,8 +568,8 @@ index 77dfe9535..d74dbf5fb 100644
          SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
          SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
          SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
-@@ -1423,6 +1440,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
-         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+@@ -1431,6 +1448,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
          chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
  
 +        // remember the user n_max: chain_heads caps it at the model MTP layer
@@ -578,7 +578,7 @@ index 77dfe9535..d74dbf5fb 100644
          if (chain_heads) {
              this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
  
-@@ -1433,6 +1453,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1441,6 +1461,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
          this->n_max = this->params.n_max;
  
@@ -613,7 +613,7 @@ index 77dfe9535..d74dbf5fb 100644
          pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
  
          i_last.assign(n_seq, -1);
-@@ -1464,6 +1512,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1472,6 +1520,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      }
  
      void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -627,7 +627,7 @@ index 77dfe9535..d74dbf5fb 100644
          const int32_t N = (int32_t) prompt.size();
          if (N <= 0) {
              return;
-@@ -1621,6 +1676,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1629,6 +1684,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              drafting[seq_id] = true;
              common_sampler_reset(smpls[seq_id].get());
  
@@ -641,7 +641,7 @@ index 77dfe9535..d74dbf5fb 100644
              common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
              std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
  
-@@ -1697,7 +1759,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1705,7 +1767,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
  
                  result.push_back(id);
  
@@ -650,7 +650,7 @@ index 77dfe9535..d74dbf5fb 100644
                      drafting[seq_id] = false;
                      n_drafting--;
                      continue;
-@@ -1744,17 +1806,52 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1752,17 +1814,52 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                  continue;
              }
  
@@ -705,7 +705,7 @@ index 77dfe9535..d74dbf5fb 100644
          const int32_t n_rows = verify_h_rows[seq_id];
          if (n_rows <= 0) {
              return;
-@@ -1764,6 +1861,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1772,6 +1869,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          const size_t row_bytes = (size_t) n_embd * sizeof(float);
          std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
      }
@@ -723,7 +723,7 @@ index 77dfe9535..d74dbf5fb 100644
  };
  
  // state of self-speculation (simple implementation, not ngram-map)
-@@ -2249,6 +2357,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
+@@ -2257,6 +2365,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
          case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
          case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
          case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
@@ -731,7 +731,7 @@ index 77dfe9535..d74dbf5fb 100644
          case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
          case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
          case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
-@@ -2340,6 +2449,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
+@@ -2348,6 +2457,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
              case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
              case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
@@ -739,7 +739,7 @@ index 77dfe9535..d74dbf5fb 100644
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
              case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                  n_max = std::max(n_max, std::max(0, spec->draft.n_max));
-@@ -2535,9 +2645,7 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2543,9 +2653,7 @@ common_speculative_init_result::common_speculative_init_result(
      llama_context * ctx_tgt) :
      pimpl(new impl{}) {
      const bool has_draft = params.speculative.has_dft();
@@ -750,7 +750,7 @@ index 77dfe9535..d74dbf5fb 100644
  
      auto mparams = common_model_params_to_llama(params);
      auto cparams = common_context_params_to_llama(params);
-@@ -2629,7 +2737,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2637,7 +2745,14 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          };
  
          // when adding a new type - update here the logic above
@@ -766,7 +766,7 @@ index 77dfe9535..d74dbf5fb 100644
  
          // this list here defines the priority of the speculators
          // the one with highest priority are listed first
-@@ -2642,6 +2757,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2650,6 +2765,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
@@ -774,7 +774,7 @@ index 77dfe9535..d74dbf5fb 100644
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
          add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
      }
-@@ -2661,7 +2777,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
+@@ -2669,7 +2785,11 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
@@ -787,7 +787,7 @@ index 77dfe9535..d74dbf5fb 100644
                  break;
              }
              case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
-@@ -2925,6 +3045,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+@@ -2933,6 +3053,17 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
      }
  }
  

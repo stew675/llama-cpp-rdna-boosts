@@ -3,9 +3,17 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`ebbb18522`**
 (re-based 2026-09-17 from `d1d3c3396`).
 
-**Current release: `v16-ebbb18522-r12`** — canonical tip
-`54f8a57fc50344f738c363c13b243a0ad81f70da`, tree
-`8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`.  Strict 16/16 `git am`; clean build.  **r12
+**Current release: `v16-ebbb18522-r13`** — canonical tip
+`8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`, tree
+`bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`.  Strict 16/16 `git am`; clean build.  **r13
+(2026-09-22) folds the shared-NextN MTP fix into block 00** (only block 00 changed): the MTP draft
+driver inferred KV sharing from `ctx_other` alone, but a `nextn_shared_target_tensors` head only
+*borrows* the target's `token_embd`/`output` and keeps its own KV, so it took the gemma4 same-position
+arm and every draft round past the first died on the M-RoPE `X < Y` check (upstream bug `04eb4c446`,
+#23398).  `is_mem_shared` is now gated on the `gemma4-assistant` arch, so shared-NextN heads stay on
+the incrementing-position path.  It is a **block-00** fix because it is a fundamental correctness fix
+every later block builds on, and upstream is not ours to change.  See the 2026-09-22 block-00 (r13)
+section below.  **r12
 (2026-09-21) makes `--fit` work under `-sm tensor`** (only block 15 changed; promoted from
 `beta/tensor-fit-fix/`): upstream throws "llama_params_fit is not implemented for SPLIT_MODE_TENSOR"
 and the exception is swallowed by `common_fit_params()`, so `--fit` (default **on**) was a silent no-op
@@ -114,6 +122,55 @@ The 2026-09-17 re-base resolved three blocks:
 
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
+
+## 2026-09-22 block-00 amendment (r13): shared-NextN MTP heads keep their own KV
+
+**Release** `v16-ebbb18522-r13`, canonical tip `8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`, net tree
+`bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`.  Only **block 00** changed in content; every later block sits
+unchanged on top and its patch differs only in the `From <sha>` line and the rebased context.
+
+**Problem.**  A *shared*-NextN MTP head (`nextn_shared_target_tensors=true`, e.g. the qwen4exp
+`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` sidecar) ships no `token_embd.weight`/`output.weight` and
+borrows the target's, so `llama_context` sets `cparams.ctx_other = ctx_tgt` to satisfy the
+EAGLE3/DFLASH/QWEN4EXP tensor-sharing path.  The MTP draft driver then inferred **KV sharing** from the
+same pointer:
+
+```cpp
+is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;   // wrong
+```
+
+and took the gemma4-assistant arm, which uses the same position for every draft token and skips the
+catch-up decode.  The second draft step therefore re-added the position the target had already stored
+and M-RoPE rejected the batch:
+
+```
+init: ... last position ... X = N ... starting position Y = N
+      for M-RoPE, it is required that the position satisfies: X < Y
+spec draft: llama_decode[1] returned -1
+```
+
+so a draft never exceeded one token and the adaptive controller was inert.
+
+**Fix.**  `ctx_other` is set for two different reasons; only gemma4 actually shares the target KV.  Gate
+`is_mem_shared` on the architecture as well:
+
+```cpp
+char arch[64] = {0};
+llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
+is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
+```
+
+**Why block 00, not block 01.**  The line is **upstream** (`04eb4c446 "llama : add Gemma4 MTP
+(#23398)"`, present at the fork point); block 01 only carries it as hunk context.  Since upstream is not
+ours to change and this is a fundamental correctness fix that must precede every later block, block 00
+(the structural/architecture base) is its delivery home.  It is also the `upstream/` PR candidate
+`UPSTREAM-PR-mtp-shared-nextn` for when upstream fixes it themselves.
+
+**Measured** (gfx1151, qwen4exp IQ4_NL + the shared Q8_0 head, `-n 256`): before, 78 `X < Y` errors and
+one-token drafts; after, **0 errors** and acceptance 0.287 (per-position 0.679/0.462/0.333…), the
+`draft-mtp-adaptive` path 35.4 t/s with real depth transitions.  The non-shared `Q4_K_M` sidecar is
+unchanged (it never sets `ctx_other`).  See the campaign record
+`wip/closing-the-gap/2026-09-22-mtp-shared-nextn-fix.md`.
 
 ## 2026-09-21 block-06 amendment (r12): `--fit` supports `-sm tensor` (promoted from `beta/tensor-fit-fix/`)
 
@@ -1556,6 +1613,13 @@ everything else.  It holds baseline-level fixes that later blocks build on:
 2. **Vulkan masked-V / freed-cell fixes** — `flash_attn_cm1.comp` and
    `flash_attn.comp` never read V for dead columns.  These are baseline
    shaders, hence the structural block.
+3. **Shared-NextN MTP heads keep their own KV (r13, 2026-09-22)** — the MTP draft driver inferred
+   KV sharing from `ctx_other` alone, but a `nextn_shared_target_tensors` head only borrows the
+   target's `token_embd`/`output` and keeps its own KV, so it took the gemma4 same-position arm and
+   every draft round past the first failed the M-RoPE `X < Y` check.  `is_mem_shared` is now gated on
+   the `gemma4-assistant` arch.  Upstream bug (`04eb4c446`, #23398), not a block-01 one — added to
+   block 00 because it must precede every later block and upstream is not ours to change.  See the
+   2026-09-22 block-00 (r13) amendment section above.
 
 The **HIP** masked-V fixes are **not** here: the `fattn-tile.cuh` half uses
 the native-bf16 PV staging (`V_k0`/`KQ_k`/`nv_bfloat162`) introduced by

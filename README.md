@@ -336,8 +336,13 @@ for per-block verification and `BASELINE.md` for provenance.
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`ebbb18522`** (upstream master "openvino : Update OpenVINO to 2026.4", 2026-09-17 re-base).
-- Canonical 16-block chain: tip **`54f8a57fc50344f738c363c13b243a0ad81f70da`**, net tree
-  **`8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`**; release **`v16-ebbb18522-r12`**.
+- Canonical 16-block chain: tip **`8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`**, net tree
+  **`bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`**; release **`v16-ebbb18522-r13`**.
+- **Shared-NextN MTP heads are usable** (block 00, r13, 2026-09-22): a head with
+  `nextn_shared_target_tensors` (no `token_embd`/`output` of its own, e.g. the qwen4exp
+  `mtp-…-shared-Q8_0.gguf` sidecar) died every draft round on the M-RoPE `X < Y` check because the
+  MTP driver inferred KV sharing from `ctx_other` alone.  `is_mem_shared` is now gated on the
+  `gemma4-assistant` arch; it is an upstream bug (`04eb4c446`, #23398) folded into the block-00 base.
 - **`--fit` works under `-sm tensor`** (block 6, r12, promoted from `beta/tensor-fit-fix/`): upstream
   threw `not implemented for SPLIT_MODE_TENSOR` and swallowed it, so the default-**on** `--fit` was a
   silent no-op under tensor split.  The Meta device's accessors are now exposed and `common/fit.cpp`

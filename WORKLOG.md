@@ -1,5 +1,101 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-22 (r13) — `v16-ebbb18522-r13`: block 00 gains the shared-NextN MTP fix
+
+**Release** `v16-ebbb18522-r13`, canonical tip `8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`, net tree
+`bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`.  Strict 16/16 `git am` on a fresh `ebbb18522` tarball
+(`scripts/validate-set.sh` green: checksums, base tree, applied tree).
+
+* **Problem.**  A `nextn_shared_target_tensors` MTP head (no `token_embd`/`output` of its own — e.g. the
+  qwen4exp `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` sidecar) borrows the target's tensors, so
+  `llama_context` sets `cparams.ctx_other = ctx_tgt`.  `common/speculative.cpp` inferred **KV sharing**
+  from that pointer and took the gemma4 same-position arm, so the second draft step re-added the
+  position the target had already stored and M-RoPE rejected every round (`X < Y`), capping a draft at
+  one token and leaving the adaptive controller inert.
+* **Fix.**  Gate `is_mem_shared` on `general.architecture == "gemma4-assistant"` (the reference's
+  approach).  The line is **upstream** (`04eb4c446 "llama : add Gemma4 MTP (#23398)"`, present at the
+  fork point); block 01 only carries it as hunk context.
+* **Home.**  **Block 00** (the structural/architecture base): a fundamental correctness fix that must
+  precede every later block, and upstream is not ours to change.  It is also the
+  `upstream/UPSTREAM-PR-mtp-shared-nextn` candidate for when upstream fixes it themselves.
+* **Only block 00 changed in content.**  Blocks 01-15 rebased unchanged; their patches differ only in
+  the `From <sha>` line and hunk context.  Block 00's commit message gained item 2.
+* **Measured** (gfx1151, qwen4exp IQ4_NL + the shared Q8_0 head, `-n 256`): before, 78 `X < Y` errors
+  and one-token drafts; after, **0 errors**, acceptance 0.287 (per-position 0.679/0.462/0.333…), the
+  `draft-mtp-adaptive` path 35.4 t/s with real depth transitions.  The non-shared `Q4_K_M` head is
+  unchanged (it never sets `ctx_other`).  Campaign record:
+  `wip/closing-the-gap/2026-09-22-mtp-shared-nextn-fix.md`.
+* **Regenerated.**  `scripts/make-patches.sh` + `make-release.sh`, `rdna-boosts-all.patch`; the rebuilt
+  fork chain is `rdna-boosts-r13` (`8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`).  The WIP campaign's
+  `patches/0015` is superseded by this (do not fold it again when rebuilding the campaign on r13).
+
+## 2026-09-22 (WIP/dev, not a delivery change) — session-5 profile + `-lzm` semantics; managed PLE reader gated OFF
+
+**No delivery change.**  Fork `gap-closing` tip **`9904c347d`** (9 gap-closing commits, exported as
+`wip/closing-the-gap/patches/0009`).
+
+* **Fresh target-ubatch profile** (qwen4exp IQ4_NL, gfx1151, `-b 8192 -ub 8192 -p 32768`): ours 52994 ms
+  vs the reference 46737 ms (+13.4 %).  The remaining gap is **BF16 intermediate traffic** —
+  `hc_combine_norm` +1811 ms (its `blk16`/`res16` vs our F32), MoE epilogue +633 ms
+  (`MMB_DOWN16`) — plus the non-lossy `mmb_cvt` (+1478 ms), indexer relu-sum (+590 ms) and the dense
+  GEMM call-count difference.  Full table + the memory accounting (28 GB PLE residency + 9 GB HC pins)
+  in `wip/closing-the-gap/closing-the-gap.md` (session-5 finding).
+* **`-lzm` semantics redefined** (was: `auto` = upstream auto only, `--lazy-buffer-size` selected a
+  managed reader): now `on` = classic mmap lazy, `off` = full preload, `auto` = upstream auto with the
+  **managed LRU PLE reader opt-in via `LLAMA_LAZY_BUF_MB=<MiB>`**; the `--lazy-buffer-size` CLI argument
+  and `llama_model_params.n_lazy_buf_size` are removed.  The managed reader measured **slowest**
+  (1090/1184 vs mmap 1219/1217 vs resident 1285/1232 t/s at pp8192/32768) so it is **OFF by default**
+  (code kept for later perf work).  It does unlock the previously failing `-b/-ub 16384` context
+  (1125.5 t/s at pp16384).  All lazy modes produce identical greedy text (`7e4a6a4e66fb`).
+* Op oracles re-run green on the default gfx1151 build (`GATED_DELTA_NET`, `INDEXER_TOPK`,
+  `FLASH_ATTN_QSA`, `FLASH_ATTN_EXT` 5955 OK / 0 FAIL); qwen4exp `plain == n3 == n7` (`61cebc1d31a9`),
+  width probe PASS.
+
+## 2026-09-22 (WIP/dev, not a delivery change) — retracted the cross-build `MMB=0 == r12` gate
+
+**No delivery change.**  The "`MMB=0` must be byte-identical to r12" Gate 1 was the beta's opt-in-era
+bisection check (while `GGML_CUDA_MMB` was `getenv ? atoi : 0`, "MMB unset" was literally r12 + the
+arch-neutral groups).  It is **not** the purity contract: `GREEDY-PURITY.md` §5/§6 guarantee
+*intra-build* agreement (the W=1..8 decode/verify band, `plain == draft-mtp`, the width probe), and
+`beta/mmb-general/README.md` calls the MMB on/off logit change the **"approved prefill re-baseline"**.
+Under the default-on policy `MMB=0` is also no longer "the default minus MMB".
+
+Corrected references: `wip/closing-the-gap/closing-the-gap.md` (START HERE item 1, the session-3
+"gates owed" line, + a new dated correction record), `wip/closing-the-gap/README.md` ("Do first" item
+1) and `beta/mmb-general/BETA-TESTING.md` §0 + Gate 1.  Measured for the record (dense 27B Q8, 128-token
+greedy, `prompts/prose-rdna-boosts.txt`, seed 42 / temp 0): r12 = `gap-closing MMB=0` = `2eb597253646`;
+`gap-closing` default = `efad2aa9a83e` (the re-baseline).  Op oracles re-run green on the default
+gfx1151 build: `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA`, `FLASH_ATTN_EXT` 5955 OK / 0 FAIL.
+
+## 2026-09-21 (WIP, not a delivery change) — `beta/mmb-general` built on gfx1151; closing-the-gap plan + MTP qualification
+
+**No delivery change.**  Session on the gfx1151 box (`halo`), after the gfx1201 agent's housekeeping
+push (`830770a`, merged).
+
+**Beta on gfx1151.**  The 12 `beta/mmb-general` patches were applied to `~/llama.cpp` (r12 +
+patches, branch `mmb-beta`, tree `bca69f23dd…`) and built with `~/bin/build-llama-rocm-714`; clean
+build, no errors.  This is the tree the `BETA-TESTING.md` re-validation runs against.
+
+**New WIP: `wip/closing-the-gap/`.**  The 2026-09-20 `~/closing-the-gap.md` moved there and was
+refreshed:  our reference is now the 12-patch `beta/mmb-general` (not the pre-promotion 5-patch gfx1151
+WIP); pwilkin's branch moved `f5daaa3cf` → `b0f31f587` (10 commits — MMB quant coverage 10→23 types +
+Flash-Next F32 PLE fusion; maskless-only-where-qsa3, also a prefill win; sparse QSA decode +
+incremental indexer state, +11–20 % MTP decode; three cheap correctness fixes; and his tuned defaults
+now compiled in with the `LLAMA_*` experiment switches deleted).  The beta set still does **not** close
+gdn-conv/ple-conv, norm-gated, idx-relu-sum or hc-cn, and `hc_gate_mix_kernel` exists but is unwired.
+
+**MTP qualification (`2026-09-21-mtp-qualification.md`).**  On qwen4exp IQ4_NL, gfx1151, `-n 3000`,
+against his rebuilt `b0f31f587`:  our **plain** decode is ahead (+2–6 %); at fixed depth the MTP
+**speedup is at parity** (ours `n3` 1.90/1.78/2.05x vs his 1.91/1.79/2.02x on code/prose/recall), so
+his MTP is not a speed gap; our `draft-mtp-adaptive` wins recall (2.40x) but over-drafts code/prose at
+`n_max 12` (a tuning item — `adaptive 7` beats `n3` on code).  **The one real MTP gap is
+correctness/compat: `nextn_shared_target_tensors`.**  The shared MTP sidecar pwilkin's own IQ4_NL model
+ships fails every draft position past the first on our build (M-RoPE `X < Y` consistency check), while
+the non-shared `Q4_K_M` sidecar runs clean on both trees.
+
+**Priority sequence set (maintainer):** recall speed + correctness → decode speed + correctness → MTP
+tuning + correctness.  §13 of the closing-the-gap doc is regrouped into those three phases (MTP parked).
+
 ## 2026-09-21 (WIP, not a delivery change) — beta set waiting on gfx1151; next campaign starts there
 
 **No delivery change.**  State of play after the promotion, recorded so the next session does not have

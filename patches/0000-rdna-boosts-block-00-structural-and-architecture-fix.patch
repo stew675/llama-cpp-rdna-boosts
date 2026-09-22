@@ -1,4 +1,4 @@
-From c830e33b4270595e559c9dd456afa499ec501cdd Mon Sep 17 00:00:00 2001
+From 74582e9338b81a478cb36ce6fe3dacdd93c67500 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 19:09:06 -0500
 Subject: [PATCH 00/15] rdna-boosts: block 00: structural and architecture
@@ -15,12 +15,43 @@ Baseline-level fixes that every later block builds on.
    non-stream-K heuristic as if n_q == 1 for every n_q <= 8; decode and all
    verify widths now group identically and the streams match.  n_q > 8
    (prefill) is unchanged.
+
+2. MTP shared-NextN heads (nextn_shared_target_tensors): the draft driver
+   inferred KV sharing from ctx_other alone, but ctx_other is also set when a
+   NextN head has no token_embd/output of its own and borrows the target's
+   (qwen4exp/eagle3/dflash) while keeping its own KV.  Gate is_mem_shared on
+   the gemma4-assistant arch so a shared head stays on the incrementing-
+   position path; otherwise it takes the gemma4 same-position arm and every
+   draft round past the first dies on the M-RoPE X < Y check (upstream bug
+   04eb4c446, #23398 -- the qwen4exp shared sidecar was unusable).
 ---
+ common/speculative.cpp                        | 10 +++-
  ggml/src/ggml-cuda/fattn-common.cuh           | 10 +++-
  .../vulkan-shaders/flash_attn.comp            | 29 ++++++++++-
  .../vulkan-shaders/flash_attn_cm1.comp        | 49 +++++++++++++++++--
- 3 files changed, 81 insertions(+), 7 deletions(-)
+ 4 files changed, 90 insertions(+), 8 deletions(-)
 
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 77dfe9535..16c33b258 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1420,7 +1420,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+ 
+-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
++        // ctx_other is set for two different reasons: gemma4 assistants share the target KV, while
++        // shared-NextN MTP heads (nextn_shared_target_tensors, e.g. the qwen4exp shared sidecar,
++        // eagle3, dflash) only borrow the target's token_embd/output and keep their own KV.  Only
++        // the former may reuse the target position for every draft token and skip the catch-up
++        // decode; without the arch guard a shared-NextN head takes that arm and every draft round
++        // past the first dies on the M-RoPE X < Y check.  Upstream bug (04eb4c446, #23398).
++        char arch[64] = {0};
++        llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
++        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
+         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+ 
+         if (chain_heads) {
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
 index 48b631e60..9852a7439 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh

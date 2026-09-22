@@ -12,7 +12,16 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release (2026-09-21) — `v16-ebbb18522-r12`:** a block-15 amendment on top of r11, promoting
+**Current release (2026-09-22) — `v16-ebbb18522-r13`:** a block-00 amendment on top of r12 that folds
+in the shared-NextN MTP fix.  A `nextn_shared_target_tensors` head (no `token_embd`/`output` of its
+own, e.g. the qwen4exp `mtp-…-shared-Q8_0.gguf` sidecar) borrows the target's tensors, which sets
+`ctx_other`; the MTP draft driver inferred KV sharing from that pointer and took the gemma4
+same-position arm, so every draft round past the first died on the M-RoPE `X < Y` check.  `is_mem_shared`
+is now gated on the `gemma4-assistant` arch.  Upstream bug (`04eb4c446`, #23398); block 00 is the home
+because it must precede every later block.  Canonical tip
+`8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`, tree `bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`.
+
+**r12 (2026-09-21) — `v16-ebbb18522-r12`:** a block-15 amendment on top of r11, promoting
 `beta/tensor-fit-fix/`: **`--fit` now supports `-sm tensor`**.  Upstream threw
 `llama_params_fit is not implemented for SPLIT_MODE_TENSOR` and `common_fit_params()` swallowed the
 exception, so the default-**on** `--fit` never ran under tensor split and users had to size

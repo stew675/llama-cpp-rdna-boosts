@@ -15,9 +15,13 @@ remain as known-good records for those upstream versions.
 
 > **Current baseline marker:** `baseline/d1d3c3396` was the previous (2026-09-15)
 > delivery baseline.  The current one is **`ebbb18522`** (2026-09-17), the fork point of
-> release **`v16-ebbb18522-r12`** (canonical tip
-> `54f8a57fc50344f738c363c13b243a0ad81f70da`, tree
-> `8a80535e556bef57666d2eaa4d3eb4cf93fb83f5`; r12 = the 2026-09-21 block-06 amendment that makes `--fit`
+> release **`v16-ebbb18522-r13`** (canonical tip
+> `8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`, tree
+> `bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`; r13 = the 2026-09-22 block-00 amendment that gates the
+> MTP `is_mem_shared` inference on the `gemma4-assistant` arch, so shared-NextN heads
+> (`nextn_shared_target_tensors`, e.g. the qwen4exp shared sidecar) keep their own KV instead of
+> dying on the M-RoPE `X < Y` check - upstream bug `04eb4c446`, #23398 - on top of
+> r12 = the 2026-09-21 block-06 amendment that makes `--fit`
 > support `-sm tensor`, promoted from `beta/tensor-fit-fix/` - upstream threw "not implemented for
 > SPLIT_MODE_TENSOR" and swallowed it, so the default-on `--fit` was a silent no-op under tensor split.
 > Re-validated on r11 first: fit decisions, seven end-to-end loads with no out-of-memory and no
