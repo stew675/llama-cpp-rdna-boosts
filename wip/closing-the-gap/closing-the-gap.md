@@ -1,6 +1,6 @@
 # Closing the gap — `beta/mmb-general` vs the other solution's `strix-halo` prefill
 
-**Date:** 2026-09-20 (snapshot) · **updated:** 2026-09-22 (end of session 4)
+**Date:** 2026-09-20 (snapshot) · **updated:** 2026-09-22 (end of session 5)
 **Box:** `halo` — Strix Halo, Radeon 8060S (gfx1151, RDNA3_5), ROCm 7.14 (`/opt/rocm-7.14-gfx1151`), 123 GiB RAM / 124 GB unified VRAM
 **Scope:** a 1:1 prefill comparison on **the other solution's uniform-IQ4_NL model** (not just our mixed UD-IQ4_XS), a kernel-level profile diff on the uniform model, and a gate-ablation of the other solution's stack on this box to price the still-missing families. This is an investigation record, not a delivery change.
 
@@ -18,10 +18,12 @@
   ~844 t/s, while `-ub 4096` stays pegged at 100 % and runs **1093 t/s** (maintainer, 2026-09-22).
   `-ub 16384` is root-caused and parked (below); do not spend time on it unless the PLE-lazy fix is
   picked up.
-* At a **matched** ubatch we started **~10 % behind at pp8192 / ~15 % behind at pp16384** on the uniform
-  IQ4_NL model.  After sessions 2–4 (items 1, 2, 6, 7) the **QSA path is now ahead** of the reference
-  (761 vs 812 ms) and we are ahead on the IQ4_XS model (1244 vs 967 t/s); the **residual IQ4_NL prefill
-gap** is the still-missing dense/HC/conversion families priced in §13, not the QSA/attention path.
+* At a **matched** ubatch the picture moved the right way after sessions 2–4 (items 1, 2, 6, 7): at the
+  clean `-b/-ub 4096` protocol we are **ahead at pp8192** (1255 vs 1200 t/s, +4.6 %) and ~1.5 % behind at
+  pp32768; at the absolute `-b 8192 -ub 8192` target we are −3.2 % at pp8192 and **−10.6 % at pp32768**.
+  The remaining gap is no longer the QSA/attention path (that is now ahead) — it is the **BF16
+  intermediate-traffic families** plus two non-lossy kernel items, profiled in the session-5 finding
+  below.
 * **Phase-1 item 1 (HC fusions) DONE** (session 2, **`patches/0003`**): `hc_combine_norm` matcher
   revived (+1.5 %) and `hc_gate_mix` wired default-on (+1.2–1.5 %) — width-pure, same-seed-text
   identical.
@@ -67,28 +69,167 @@ gap** is the still-missing dense/HC/conversion families priced in §13, not the 
   `QSA_QUERY_STRIP` (score the prefill in 512-token strips, each trimmed to its visible blocks; ~half
   the indexer score work) and `QSA_SCORE_WMMA` (a fused WMMA prefill score; our fused op is gated to
   `n_tokens == 1`) — [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md).
-* **Next: the QSA prefill-score follow-up** above, then the two owed gates (MMB-off byte check, MTP
-  gate) before promoting `beta/mmb-general`.  This is a good fresh-session start point.
+* **Session-5 item: lazy-mode semantics DONE + managed reader gated OFF** (2026-09-22, `patches/0009`):
+  `-lzm on` = mmap, `-lzm off` = resident, `-lzm auto` = upstream auto (managed LRU opt-in via
+  `LLAMA_LAZY_BUF_MB`), `--lazy-buffer-size` dropped.  The managed reader measured **slowest**
+  (1090/1184 vs mmap 1219/1217 vs resident 1285/1232 t/s) so it is **off by default**; it does unlock
+  `-b/-ub 16384` (1125.5 t/s).  All modes are text-identical (`7e4a6a4e66fb`).  See the session-5
+  finding below.
+* **Next: see the 2026-09-22 session-5 finding below** — the re-profiled task list supersedes the
+  item-8-first ordering.  The gates (item 1) still apply before any promotion.
+
+### Session-5 finding (2026-09-22) — fresh target-ubatch profile, memory accounting, refined tasks
+
+**Throughput** (qwen4exp IQ4_NL, gfx1151, `-ctk/-ctv f16`, `-n 0`, our full default set vs the
+reference's launcher env):
+
+| config | pp | ours | reference | delta |
+|---|---:|---:|---:|---:|
+| `-b/-ub 4096` (A/B protocol) | 8192 | 1255.5 | 1200.1 | **+4.6 %** |
+| `-b/-ub 4096` | 32768 | 1206.4 | 1224.5 | −1.5 % |
+| `-b 8192 -ub 8192` (target) | 8192 | 1280.8 | 1323.7 | −3.2 % |
+| `-b 8192 -ub 8192` | 32768 | 1228.4 | 1374.4 | **−10.6 %** |
+
+So at the clean `-b/-ub 4096` protocol we are **ahead at pp8192** and ~1.5 % behind at depth; the
+`-ub 8192` depth point is where the gap reopens.  The reference gains +12 % from `-ub 4096 → 8192` at
+pp32768, we gain +1.8 %.
+
+**Memory accounting** (`-ub 8192`).  Peak system used: ours `-lzm auto` **102 GB**, ours `-lzm on`
+**74 GB**, the reference `-lzm off` **112 GB**, the reference `on-direct` **86 GB**.  Two terms explain
+it:
+
+* **~28 GB = the PLE residency.**  Our default is `-lzm auto`, but on gfx1151 the ROCm device reports
+  `mmap_support = false` (`ggml-cuda.cu`: `props->type != IGPU`), so `llama-model.cpp` resolves
+  `AUTO → OFF` and `per_layer_token_embd.weight` stays resident in `ROCm_Host`.  The reference's
+  `on-direct` is its own managed-lazy mode, so it never has this.
+* **~9 GB = the qwen4exp HC `block_out`/`inject` graph-output pins** that make the `hc_combine_norm`
+  matcher possible (~1.1 MiB/token; ≈9 GB at 8192, ≈18 GB at 16384 — the session-2 record).  The
+  reference has no pin.
+
+**Neither is the throughput cause**: the reference scores **1378.7 t/s** with `-lzm on-direct` and
+**1381.8 t/s** with `-lzm off` at `-b8192 -ub8192 -p32768`.  They are a *product-quality* regression
+(wasted memory) and a `-ub 16384` enabler, not a speed one.
+
+**Kernel family diff** (ours − reference, ms; `-b 8192 -ub 8192 -p 32768 -n 0 -r 1`; total
+**52994 vs 46737 = +13.4 %**, matching the ~11 % t/s gap):
+
+| family | ours | ref | Δ | what it is |
+|---|---:|---:|---:|---|
+| **hc_combine_norm** | 3888.0 | 2076.9 | **+1811** | ours F32 1024t; its `_b256` reads **BF16** `blk16`/`res16` |
+| **mmb_cvt_f32_bf16** | 2088.7 | 610.3 | **+1478** | identical kernel + launch; ours 1040 calls vs its 1544 (per-call 5× bigger) |
+| mmb_dense | 14533.8 | 13898.6 | +635 | 4304 vs 3920 calls (`<128,128,32,64>` +384) |
+| **moe_reduce** | 1479.5 | 846.5 | **+633** | ours `f32_vec4` vs its `bf16_v4` (`MMB_DOWN16`) |
+| **indexer** | 1254.6 | 664.5 | **+590** | ours histogram passes; its `idx_relu_sum` + `qsa_expand_complete_blocks_512` |
+| elementwise | 3179.4 | 2756.9 | +423 | |
+| mmq/mmvf | 595.2 | 211.4 | +384 | |
+| mmb_f32split | 1653.6 | 1329.6 | +324 | |
+| mmb_routed_glu | 7326.2 | 7827.4 | **−501** | we win |
+| hc_gate_mix / rms | 1577.7 / 1819.6 | 1665.3 / 1831.5 | −88 / −12 | we win |
+
+**Read:** at depth the gap is now dominated by **BF16 intermediate traffic** (HC combine + MoE epilogue
+≈ 2.4 s, ~4.6 %) — the same "larger decision for the maintainer" the `_b256` rejection record flagged
+(the class matches the MMB bf16 WMMA we already ship default-on).  The two non-lossy targets are
+`mmb_cvt` (+1.5 s, identical kernel, so our activation cache / `mmb_root` keying must be converting
+redundant/large tensors) and the prefill **indexer relu-sum** (+0.6 s; the audit's "already banked"
+line is wrong for prefill — our fused score op is `n_tokens == 1`, so prefill runs a separate
+`unary_op<relu>` (559 ms) + head-sum adds, while the reference fuses them).
+
+**`-lzm auto` semantics (maintainer, 2026-09-22).**  `AUTO` resolving to `OFF` on the iGPU is what
+hides the PLE memory win from every default run.  The agreed semantics for our branch:
+
+| mode | meaning |
+|---|---|
+| `-lzm off` | full preload (PLE resident) |
+| `-lzm on`  | classic mmap-lazy |
+| `-lzm auto` | upstream `auto`; the managed LRU PLE reader is **opt-in** via `LLAMA_LAZY_BUF_MB=<MiB>` |
+
+`--lazy-buffer-size` is dropped as a CLI argument; the managed reader's buffer is the env var.
+
+**Measured the same day** (qwen4exp IQ4_NL, `-b 8192 -ub 8192`, pp8192/32768, t/s):
+
+| arm | pp8192 | pp32768 | peak used |
+|---|---:|---:|---:|
+| `-lzm off` (resident) | **1284.7** | **1232.3** | ~102 GB |
+| `-lzm on` (mmap) | 1219.3 | 1216.8 | ~74 GB |
+| `-lzm auto` + `LLAMA_LAZY_BUF_MB=4096` (managed) | 1090.5 | 1183.5 | ~76 GB |
+| `-lzm auto` + `LLAMA_LAZY_BUF_MB=16384` (managed) | 1098.0 | 1187.0 | — |
+
+The managed LRU is the **slowest** of the three — its arena adds a per-row copy + clock-eviction on a
+table whose prefill access pattern is streaming, and a 16 GB budget does not help — so it is **gated
+OFF by default** (env opt-in, source kept for later work; it measured slower than both alternatives).
+`-lzm off` stays the throughput default.  `-lzm on` is the memory-freeing option at ~1.3 % depth cost
+(and ~5 % at pp8192).  The managed reader **does** enable the parked `-b/-ub 16384` context
+(1118.7 t/s at pp16384, where the resident build fails to create the context), so it is a candidate
+for item 3 once its cost is reduced.  All three lazy modes produce **identical greedy text**
+(`7e4a6a4e66fb`, 322 chars, prose prompt) — the mode is a memory/latency choice, not a numerics one.
 
 ### Do these in order
 
 1. **Run the full `beta/mmb-general` BETA-TESTING gate suite on the current default build**
-   ([`../../beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md)).  Gate semantics:
-   **Gate 1 = `GGML_CUDA_MMB=0`** (byte-identical to r12), **Gate 2 = the default** (no env).  Plus the
-   width probe and the MTP gate.  Green before any promotion, and do not trust performance numbers as
-   "the product" until then.  **Still owed: the MTP gate (Gate 4) and the MMB-off byte check (Gate 1).**
-   Already green (sessions 2-3): `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA` 26/26,
-   `FLASH_ATTN_EXT` 5955/0, width probe PASS on 27B + qwen4exp + 35B-A3B, conv fused==unfused row-0
-   hashes.
-2. **Next code item — the QSA prefill-score follow-up from item 8's audit** (`QSA_SCORE_BOUNDS` +
-   `QSA_QUERY_STRIP` first, then `QSA_SCORE_WMMA`) —
-   [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md).  Phase-1 items 1–8 are
-   otherwise done.
+   ([`../../beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md)).  **Purity is an
+   intra-build contract** (`GREEDY-PURITY.md`): the decode/verify band `W=1..8` must take one reduction
+   path (`plain == draft-mtp` greedy text, byte-identical), `test-logits-width-probe` must print
+   `width_purity=PASS (worst maxdiff 0)`, and the output must be coherent.  **Cross-build bit-identity
+   (vs r12, or MMB on vs off) is NOT a gate** - a prefill kernel swap (MMB's dequant->bf16 WMMA) is the
+   "approved prefill re-baseline", so its greedy text legitimately differs; see the 2026-09-22
+   correction record below.  Green before any promotion, and do not trust performance numbers as "the
+   product" until then.  **Still owed: the MTP gate (Gate 4).**  Already green: the op oracles
+   (`GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA` 26/26, `FLASH_ATTN_EXT` 5955 OK / 0 FAIL,
+   re-run 2026-09-22), width probe PASS on 27B + qwen4exp + 35B-A3B, conv fused==unfused row-0 hashes.
+2. **Next code items, in this order** (session-5 profile; the item-8 follow-ups are now deferred behind
+   the bigger families):
+   1. **`-lzm auto` semantics + managed PLE reader** — done as the semantics table above; the managed
+      LRU is measured slower than resident/mmap, so it ships **gated OFF** (env `LLAMA_LAZY_BUF_MB`
+      opt-in) with the source kept.  It does unlock the parked `-b/-ub 16384` context (1118.7 t/s);
+      the perf work before it can default-on is in item 13.
+   2. **BF16 HC + MoE streams** (`blk16`/`res16`, `MMB_DOWN16`) — ~2.4 s, ~+4.5 % at depth, but lossy
+      (greedy text changes) → **maintainer's call**.  Gate: width probe + `plain == draft-mtp` +
+      same-seed coherence.
+   3. **`mmb_cvt_f32_bf16` (+1478 ms)** — non-lossy, identical kernel; find why our calls convert far
+      larger tensors (activation cache / `mmb_root` keying).
+   4. **Prefill indexer relu-sum (+590 ms)** — non-lossy; port the fused relu+head-sum (`idx-relu-sum`),
+      which the audit wrongly marked as banked (our fused score op is `n_tokens == 1` only).
+   5. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` — the item-8 follow-ups.
 3. **Use `-b/-ub 4096` for perf A/Bs** (session-4 methodology finding).  The `-ub 8192` absolute target
    is fine for a single number, but an A/B whose arms change the graph's memory footprint compares two
    pressure regimes there.  Record the min free memory with any `-ub 8192` result.
 4. Keep the **default-on policy**: every beneficial feature is ON; its env var only *disables* it.  Never
    run a benchmark with a feature left off.
+
+### Correction 2026-09-22 (session 5) — the `MMB=0 == r12` gate is retracted
+
+The "Gate 1" copied into this handover (and its `README.md`) was the beta's **opt-in-era** regression
+check: while `GGML_CUDA_MMB` was `getenv ? atoi : 0`, "MMB unset" *literally was* "r12 + the beta's
+arch-neutral always-on groups", so diffing greedy text against r12 caught a neutral group with a numeric
+side effect.  It was a bisection aid, not the purity doctrine.
+
+**The contract is intra-build** (`GREEDY-PURITY.md` §5: *"Bit-identical to stock is a reproducibility
+requirement, not a correctness requirement"*; §6: the verify batch and the one-at-a-time decode must
+take the **same** association order **within a build**).  Different builds are expected to produce
+different greedy text: `beta/mmb-general/README.md` calls the MMB on/off difference the **"approved
+prefill re-baseline"** and its own width-probe table shows row-0 hashes differing above
+`MMB_MIN_T=512` while `width_purity` stays PASS.
+
+Under the default-on policy the gate's premise is gone anyway: MMB is default-on and four other
+gap-closing features are default-on, so `MMB=0` is not "the default minus MMB".
+
+Measured 2026-09-22 (dense 27B Q8, 128-token greedy, `prompts/prose-rdna-boosts.txt`, seed 42 / temp 0):
+
+| build / env | text |
+|---|---|
+| r12 base | `2eb597253646` |
+| `gap-closing`, `GGML_CUDA_MMB=0` | `2eb597253646` (== r12) |
+| `gap-closing`, default (MMB on) | `efad2aa9a83e` (the approved prefill re-baseline) |
+
+So the legacy check happens to pass, but it says nothing about the product.  **The gate set that matches
+the contract is:** `test-logits-width-probe` PASS (worst maxdiff 0) on f16/bf16/q8_0, `plain ==
+draft-mtp` greedy text within the build, the MTP acceptance gate, coherence, and the op oracles.  A
+*cross-build* comparison is legitimate only as a **targeted** assertion (e.g. "MMB is prefill-only, so
+W=1 decode logits are unchanged from r12"), never as a blanket equality gate.
+
+References corrected in the same change: this file's START HERE and session-3 record, `README.md`'s
+"Do first" item 1, and `beta/mmb-general/BETA-TESTING.md` §0/Gate 1.  See the 2026-09-22 `WORKLOG.md`
+entry.
 
 ### Rebuild / run (copy-paste)
 
@@ -185,9 +326,9 @@ Both are recall-speed (Phase-1) items; the audit record has the full flag table 
 
 | what | where / value |
 |---|---|
-| fork `~/llama.cpp` | branch **`gap-closing`** @ **`6e5f34ebf`** = r12 + the 12 `beta/mmb-general` patches + the 8 gap-closing commits |
+| fork `~/llama.cpp` | branch **`gap-closing`** @ **`9904c347d`** = r12 + the 12 `beta/mmb-general` patches + the 9 gap-closing commits |
 | fork build | `~/llama.cpp/build-rocm` (gfx1151, ROCm 7.14), full feature set **default** |
-| this repo | branch `gap-closing` (published to `origin`), `wip/closing-the-gap/patches/0001..0008` |
+| this repo | branch `gap-closing` (published to `origin`), `wip/closing-the-gap/patches/0001..0009` |
 | the other solution | `~/pwilkin-llama-cpp` @ `b0f31f587`, `build-rocm` |
 | model | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (93 GiB, qwen4exp) |
 | MoE test model | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf` |
@@ -195,7 +336,7 @@ Both are recall-speed (Phase-1) items; the audit record has the full flag table 
 
 Rebuild: `cd ~/llama.cpp && ~/bin/build-llama-rocm-714`.  Runtime:
 `export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH; export HIP_VISIBLE_DEVICES=0`.
-The eight `gap-closing` fork commits are exported to [`patches/`](patches/) so the code survives a fork
+The nine `gap-closing` fork commits are exported to [`patches/`](patches/) so the code survives a fork
 reset.
 
 ### What NOT to redo (sessions 3–4)
@@ -273,7 +414,8 @@ source is a 3-column view of the concat (covered by `tail_from`) and rejects any
 
 ### Gates still owed (unchanged from session 2, plus the conv fusion)
 
-* The **MMB-off byte-identity** check and the **MTP** gate (Gate 1/Gate 4).
+* The **MTP** gate (Gate 4).  (The **MMB-off byte-identity** check was retracted 2026-09-22 - cross-build
+  identity is not the purity contract; see the 2026-09-22 correction record above.)
 * The **27B dense** width-probe run (session 2/3 ran qwen4exp + 35B-A3B).
 * Re-check the delivery's **MoE/general GDN prefill records** now that the GDN fusion also fires on
 qwen35moe/qwen35/qwen3next (the snapshot-cpy adaptation); the 35B-A3B numbers above are the first
@@ -1116,11 +1258,19 @@ body, (7) tall tile, (8) QSA graph flags; items 1–9 survive, regrouped below.
 | 2 | Port `gdn-conv.cu` + `ple-conv.cu` + matches (now incl. **F32 PLE**) | **−10.5 %** | 2–3 d | **DONE 2026-09-21 (session 3)**: ported default-on, bit-identical, +3.0/+3.2 % qwen4exp IQ4_NL and +6.5/+7.1 % 35B-A3B (**measured at `-ub 8192` — the sign is robust, the magnitude carries the memory confound; re-measure at `-ub 4096` if a precise number is needed**) — [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md), `patches/0004`.  Two adaptations (3-D `grouped_norm` root + the shared-builder snapshot cpy) |
 | 3 | Fix the `n_batch==n_ubatch==n_ctx` context creation | unlocks `-ub 16384` | 0.5–2 d | pre-existing delivery bug |
 | 3.5 | **Port the three correctness fixes** (`40c0b9c38`, `b0f31f587`, `14fff4f97`) | prevents long-session corruption | 0.5–1 d | **CLOSED 2026-09-22**: `b0f31f587` (QSA block window by highest stored position) **ported**, `patches/0005` — [`2026-09-22-qsa-block-window-fix.md`](2026-09-22-qsa-block-window-fix.md); the other two audited **N/A** (no maskless path; top-k output carries no sentinels) — [`2026-09-22-qsa-item-3.5-audit.md`](2026-09-22-qsa-item-3.5-audit.md) |
-| 4 | Port `norm-gated.cu` (`rms_rows`) + `idx-relu-sum.cu` | −2.9 % / −1.3 % | 1–2 d | **DONE 2026-09-22 (session 4)**: `rms_rows` ported default-on, bit-identical, ~+0.3 % at `-ub 4096` — [`2026-09-22-norm-rows-fusion.md`](2026-09-22-norm-rows-fusion.md), `patches/0006`.  `idx-relu-sum` was already banked by our fused indexer score |
-| 5 | MoE: bf16 epilogue + drop `concat_transposed` | ~+466 ms kernel (~3–4 %) | 1–2 d | beta has `MMB_DOWN16` gated off; wire it + the bf16 reduction |
+| 4 | Port `norm-gated.cu` (`rms_rows`) + `idx-relu-sum.cu` | −2.9 % / −1.3 % | 1–2 d | **`rms_rows` DONE 2026-09-22 (session 4)**: ported default-on, bit-identical, ~+0.3 % at `-ub 4096` — [`2026-09-22-norm-rows-fusion.md`](2026-09-22-norm-rows-fusion.md), `patches/0006`.  **`idx-relu-sum` is NOT banked (corrected 2026-09-22 session 5):** our fused indexer score is `n_tokens == 1` only, so prefill still runs `unary_op<relu>` 559 ms + head-sum adds — see the new item 14 |
+| 5 | MoE: bf16 epilogue + drop `concat_transposed` | **re-priced 2026-09-22 (session 5): ~+633 ms (~1.2 %)** | 1–2 d | the `concat_transposed` materialisation is already gone at `-ub 8192`; what remains is the **BF16 MoE epilogue** (`moe_weighted_reduction_bf16_v4` 846 vs our `f32_vec4` 1480 ms).  Lossy — pair it with the HC BF16 decision (new item 13) |
 | 6 | Tune/port-align `qsa3_attn` body vs `qsa.cu` | ~+195 ms (~1.5 %) | 1–2 d | **DONE 2026-09-22 (session 4)**: the gap was the per-cell `cell_vis` check, not geometry; folded into `umask` at merge time, bit-identical, `qsa3_attn` 809.6 -> 672.9 ms, +2.4 %/+1.7 % — [`2026-09-22-qsa3-visibility-fold.md`](2026-09-22-qsa3-visibility-fold.md), `patches/0007` |
 | 7 | Investigate the tall `384x64` 2× launch count | unknown (part of +809) | 0.5–1 d | **DONE 2026-09-22 (session 4)**: the 2× was the M=4 HC inject admitted by the tall gate; a min-M bound keeps it on the dense tile, bit-identical, +0.8 %/+1.1 % — [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md), `patches/0008` |
-| 8 | Audit the 9 QSA graph-side flags vs block-14/15 | low-single-digit % (2 un-ported) | 0.5 d | **DONE 2026-09-22 (session 4)**: 7/9 present/superseded; the 2 un-ported (`QSA_SCORE_BOUNDS`+`_QUERY_STRIP`, `QSA_SCORE_WMMA`) become the next follow-up — [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md) |
+| 8 | Audit the 9 QSA graph-side flags vs block-14/15 | low-single-digit % (2 un-ported) | 0.5 d | **DONE 2026-09-22 (session 4)**: 7/9 present/superseded; the 2 un-ported (`QSA_SCORE_BOUNDS`+`_QUERY_STRIP`, `QSA_SCORE_WMMA`) are now **item 15**, deferred behind the bigger families |
+| 13 | **`-lzm auto` semantics + managed PLE reader perf** | memory: ~28 GB; `-ub 16384` unlock | 0.5–1 d (semantics **DONE**, reader **gated OFF**) | session-5: `on`=mmap, `off`=resident, `auto`=upstream auto, managed LRU **opt-in** via `LLAMA_LAZY_BUF_MB` and **off by default** because it is the slowest arm (1090/1184 vs mmap 1219/1217 vs resident 1285/1232 at pp8192/32768).  `--lazy-buffer-size` dropped.  **TODO:** make the managed reader beat mmap (streaming prefill access pattern — the LRU arena adds a copy per row), then reconsider defaulting it on; it already enables `-b/-ub 16384` (1118.7 t/s) |
+| 14 | Port the prefill indexer **relu+head-sum** fusion (`idx-relu-sum`) | ~+590 ms (~1.1 %) | 0.5–1 d | non-lossy; reference `idx_relu_sum_f32` (1536 calls / 364 ms) vs our `unary_op<relu>` 559 ms + adds.  Our graph applies relu *before* the 4-D reshape (the L2a win), so the reference matcher cannot port verbatim — use a fused op or an order-aware matcher |
+| 15 | `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` | low-single-digit % | 2–3 d | item-8 follow-ups; the bounds trim is coupled to the reference's complete-block selection (`compact`/`maskless`), which our fused cell top-k does not have, so scope carefully |
+
+**Session-5 re-rank (2026-09-22, `-b 8192 -ub 8192 -p 32768` profile):** the remaining gap is the BF16
+intermediate traffic — **HC combine (`blk16`/`res16`) + MoE epilogue ≈ 2.4 s, ~4.6 %** — plus the
+non-lossy `mmb_cvt` (new, +1478 ms, investigate) and indexer relu-sum (item 14).  The `HC_*` ablation's
+−19.5 % is therefore **not** closed by the item-1 fusions alone; the residual is the BF16 streams.
 
 Items 1+2 remain ~30 % of end-to-end prefill on the other solution's ablations.
 

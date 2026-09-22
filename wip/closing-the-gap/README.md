@@ -32,7 +32,7 @@ moved here and updated 2026-09-21.
 
 ## Current "our side" build state
 
-* `~/llama.cpp` branch **`gap-closing`** @ **`6e5f34ebf`** = `mmb-beta` (r12 `72176ae8a` + the 12
+* `~/llama.cpp` branch **`gap-closing`** @ **`9904c347d`** = `mmb-beta` (r12 `72176ae8a` + the 12
   `beta/mmb-general/patches/*.patch`, tree `bca69f23dd…`) + the 2026-09-21/22 changes: **default-on
   policy** (MMB/HC16/matcher), the `hc_combine_norm` matcher revival, the **`hc_gate_mix` fusion**
   (session 2), the **depthwise conv1d fusions** (session 3), the **QSA block-window fix** (session 3,
@@ -40,7 +40,7 @@ moved here and updated 2026-09-21.
   (session 4, item 6), and the **tall-tile min-M** fix (session 4, item 7), plus env-gated debug traces.
 * Built on this box (gfx1151) with `~/bin/build-llama-rocm-714`.  **All beneficial features are on by
   default** (see the `AGENTS.md` default-on policy); env vars only disable.
-* The eight `gap-closing` commits (`0001..0008`) are exported to [`patches/`](patches/) in case the local
+* The nine `gap-closing` commits (`0001..0009`) are exported to [`patches/`](patches/) in case the local
   fork branch is lost.
 
 To reproduce:
@@ -50,16 +50,21 @@ cd ~/llama.cpp
 git checkout rdna-boosts && git branch -D mmb-beta gap-closing 2>/dev/null
 git checkout -b gap-closing
 git am /home/stew675/llama-cpp-rdna-boosts/beta/mmb-general/patches/*.patch
-git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 6e5f34ebf
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 9904c347d
 ~/bin/build-llama-rocm-714
 ```
 
 ## Do first (fresh session, in order)
 
 1. **Run the full BETA-TESTING gate suite** on the current default build —
-   [`beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md).  Gate semantics changed:
-   **Gate 1 = `GGML_CUDA_MMB=0`** (byte-identical to r12), **Gate 2 = the default** (no env).  Plus the
-   width probe and the MTP gate.  Green before any promotion.
+   [`beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md).  **Purity is an
+   intra-build contract**, not cross-build: the decode/verify band `W=1..8` must agree with itself
+   (`plain == draft-mtp` greedy text) and `test-logits-width-probe` must print
+   `width_purity=PASS (worst maxdiff 0)`.  **Do NOT gate on `MMB=0 == r12`** (or on any MMB on/off
+   equality) — that was the beta's opt-in-era bisection aid, and a prefill re-baseline legitimately
+   changes the greedy text; see the 2026-09-22 correction record in
+   [`closing-the-gap.md`](closing-the-gap.md#correction-2026-09-22-session-5--the-mmb0--r12-gate-is-retracted).
+   Plus the MTP gate (Gate 4).  Green before any promotion.
 2. **Target `-b 8192 -ub 8192`** — decision 2026-09-21.  For **long-context (pp65536+)** use
    **`-b/-ub 4096`**: at `-ub 8192` that point memory-thrashes (GPU oscillating, ~844 t/s), while
    `-ub 4096` stays pegged at 100 % (~1093 t/s) — maintainer, 2026-09-22.  The `-ub 16384` failure is
@@ -67,11 +72,22 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch  
    reserve (15.5 GiB, shared with the other solution) plus qwen4exp's HC `block_out` pin (~18 GiB)
    against the resident PLE table (~27 GiB host).  ubatch 8192 runs clean and is the reproducible
    head-to-head baseline (ours 1212.6 vs its 1346.5 at pp8192, ~10 % behind before items 1+2).
-3. **Phase-1 item 2 — depthwise conv1d — DONE 2026-09-21 (session 3)**; **item 3.5 QSA correctness
-   — CLOSED 2026-09-22 (session 4)**: `b0f31f587` ported (`patches/0005`), the other two fixes audited
-   **N/A**.  The **next code item** is the **QSA prefill-score follow-up** from item 8's audit
-   (`QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA`) —
-   [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md).
+3. **Next code items, in this order** (session-5 profile, 2026-09-22):
+   1. **`-lzm auto` semantics + managed PLE reader** — **DONE 2026-09-22 (partial)**: `on`=mmap,
+      `off`=resident, `auto`=upstream auto, `--lazy-buffer-size` dropped, managed LRU reader
+      **opt-in via `LLAMA_LAZY_BUF_MB`** and **OFF by default** (it measured slowest: 1090/1184 vs mmap
+      1219/1217 vs resident 1285/1232).  It does unlock `-b/-ub 16384` (1118.7 t/s).  Making it beat
+      mmap is the remaining work (item 13).
+   2. **BF16 HC + MoE streams** (`blk16`/`res16`, `MMB_DOWN16`) — ~2.4 s, ~+4.5 % at depth, but lossy
+      (greedy text changes) → **maintainer's call**.
+   3. **`mmb_cvt_f32_bf16` (+1478 ms)** — non-lossy; our calls convert far larger tensors than the
+      reference's (activation cache / `mmb_root` keying).
+   4. **Prefill indexer relu-sum (+590 ms)** — non-lossy; the audit wrongly marked `idx-relu-sum` as
+      banked (our fused score op is `n_tokens == 1` only).
+   5. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` — the item-8 follow-ups, now below
+      the bigger families.
+   The full session-5 finding (throughput A/B, memory accounting, family diff) is in
+   [`closing-the-gap.md`](closing-the-gap.md#session-5-finding-2026-09-22--fresh-target-ubatch-profile-memory-accounting-refined-tasks).
 
 ## The current open list (see §13 of the doc)
 
@@ -89,8 +105,10 @@ MTP tuning + correctness.**
    (session 3)**: default-on, bit-identical, +3.0/+3.2 % qwen4exp IQ4_NL, +6.5/+7.1 % 35B-A3B —
    `2026-09-21-gdn-ple-conv-fusions.md`, `patches/0004`.
 3. **`-ub 16384` is deferred** (target is `-ub 8192`).  Root cause in the “Session-2 record”
-   section: result_output reserve + HC pin + resident PLE.  Candidate fixes: default the PLE to
-   mmap-lazy (fix the `-lzm auto` propagation), or expose `--lazy-buffer-size` in `llama-bench`.
+   section: result_output reserve + HC pin + resident PLE.  **Update 2026-09-22 (session 5):** two terms
+   now measured — ~28 GB PLE residency (`-lzm auto` → AUTO → OFF on the gfx1151 IGPU) and ~9 GB HC
+   `block_out` pins.  The chosen fix is the **new item 13** (`-lzm auto` = managed PLE loader); the
+   old `--lazy-buffer-size` idea is dropped in favour of that env-tunable default.
 3.5. Port the other solution's three correctness fixes — **CLOSED 2026-09-22**: `b0f31f587` (size the
    QSA block window by the highest stored position) **ported** —
    [`2026-09-22-qsa-block-window-fix.md`](2026-09-22-qsa-block-window-fix.md), `patches/0005`; the other
@@ -99,8 +117,9 @@ MTP tuning + correctness.**
 4. `norm-gated.cu` (`rms_rows`) — **DONE 2026-09-22 (session 4)**: the narrow-row RMS norm ported,
    default-on, **bit-identical**, ~+0.3 % at the clean `-b/-ub 4096` protocol (it read +0.5–1.1 % at
    `-ub 8192`, which is the memory-pressure confound — see the methodology record) —
-   [`2026-09-22-norm-rows-fusion.md`](2026-09-22-norm-rows-fusion.md), `patches/0006`.  `idx-relu-sum`
-   was already banked by our fused indexer score.  **Item 6 (`qsa3_attn` body) is DONE 2026-09-22
+   [`2026-09-22-norm-rows-fusion.md`](2026-09-22-norm-rows-fusion.md), `patches/0006`.  **`idx-relu-sum`
+   is NOT banked — corrected 2026-09-22 (session 5):** our fused indexer score is `n_tokens == 1` only,
+   so prefill still runs a separate `unary_op<relu>` (559 ms) + head-sum adds (see the new item 14).  **Item 6 (`qsa3_attn` body) is DONE 2026-09-22
    (session 4)** — bit-identical, +2.4 %/+1.7 % — [`2026-09-22-qsa3-visibility-fold.md`](2026-09-22-qsa3-visibility-fold.md),
    `patches/0007`; **item 7 (tall-tile min-M) is DONE 2026-09-22 (session 4)** — bit-identical,
    +0.8 %/+1.1 % — [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md), `patches/0008`;
@@ -109,7 +128,21 @@ MTP tuning + correctness.**
    **Item 1's `hc_combine_norm_f32` `_b256` swap stays CLOSED NEGATIVE** — not bit-identical (it changes
    the greedy text, deterministically), so the rejection does not rest on timing; see
    [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md).
-5. MoE bf16 epilogue + drop `concat_transposed` (beta's `MMB_DOWN16` is gated off).
+5. MoE bf16 epilogue + drop `concat_transposed` — **re-priced 2026-09-22 (session 5):** the
+   `concat_transposed` materialisation is already gone at `-ub 8192`; what remains is the **BF16 MoE
+   epilogue** (~+633 ms, ~1.2 %, `moe_weighted_reduction_bf16_v4` 846 vs our `f32_vec4` 1480 ms).
+   Lossy — decide with the HC BF16 streams (item 13's sibling, new item 16).
+13. **`-lzm auto` semantics + managed PLE reader perf** — **semantics DONE, reader gated OFF**
+    2026-09-22: `on` = mmap-lazy, `off` = preload, `auto` = upstream auto, `--lazy-buffer-size` dropped,
+    managed LRU **opt-in via `LLAMA_LAZY_BUF_MB`** and off by default (slowest arm).  **TODO:** make the
+    managed reader beat mmap (streaming prefill access — the LRU arena adds a copy per row), then
+    reconsider defaulting it on; it already enables the parked `-b/-ub 16384` (item 3, 1118.7 t/s).
+14. Port the prefill indexer **relu+head-sum** fusion (`idx-relu-sum`, ~+590 ms, non-lossy).  Our graph
+    applies relu *before* the 4-D reshape (the L2a win), so the reference matcher cannot port verbatim.
+15. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` — the item-8 follow-ups; the trim is
+    coupled to the reference's complete-block selection, which our fused cell top-k lacks.
+16. **BF16 HC streams** (`blk16`/`res16`) — ~1.8 s, ~3.4 % at depth, lossy → maintainer's call;
+    pair with item 5.
 
 **Phase 2 — decode speed + correctness**
 

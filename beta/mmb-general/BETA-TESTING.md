@@ -13,7 +13,7 @@ assembly), never once end-to-end on the final set.
 
 | | |
 |---|---|
-| **With `GGML_CUDA_MMB` unset (the default)** | **byte-identical to the delivery r12** on every gate.  MMB is **opt-in** (`getenv("GGML_CUDA_MMB") ? atoi : 0`), so the default state is r12 plus only the arch-neutral groups — which were measured numerically neutral (on gfx1201 the WIP with MMB off was *bit-identical* to the delivery at PPL 9.4293 and on all five same-seed hashes). |
+| **With `GGML_CUDA_MMB` unset (the default in this beta tree)** | **byte-identical to the delivery r12** in *this opt-in beta tree*.  MMB is **opt-in** (`getenv("GGML_CUDA_MMB") ? atoi : 0`), so the default state is r12 plus only the arch-neutral groups — which were measured numerically neutral (on gfx1201 the WIP with MMB off was *bit-identical* to the delivery at PPL 9.4293 and on all five same-seed hashes).  **This is a regression aid, not the purity contract** — see the note under Gate 1 and `GREEDY-PURITY.md` §5: once a feature is defaulted on (as on the `gap-closing` branch) cross-build equality is expected to break, and the gate is the *intra-build* set. |
 | **With `GGML_CUDA_MMB=1`** | the original gfx1151 `mmb` win, **unchanged by the RDNA4/RDNA3_0 scoping**.  gfx1151 keeps the **full** weight-type set and the original tile/threshold constants. |
 | Never | a regression at depth, a width-purity change, or an MTP acceptance change. |
 
@@ -47,20 +47,35 @@ the dump prints is `0x1000000 + <gfx number>`: `cc=0x1001201` was observed on gf
 
 ## 2. The four gates
 
-### Gate 1 — MMB **off** must be byte-identical to r12 (the purity check)
+### Gate 1 — the *intra-build* purity gate
+
+**This is the real contract; do not use cross-build equality as a gate.**  `GREEDY-PURITY.md` §5:
+*"Bit-identical to stock [or to r12, or MMB on vs off] is a reproducibility requirement, not a
+correctness requirement."*  A prefill kernel swap changes the prefill logits legitimately — this beta's
+own `README.md` calls it the **"approved prefill re-baseline"**, and its width-probe table shows row-0
+hashes differing above `MMB_MIN_T = 512` while `width_purity` stays PASS.
+
+The intra-build gate is that the decode/verify band agrees with itself and that widths agree:
 
 ```sh
-# same seed, temp 0; compare ONLY the extracted generated text
+# same build, same state: one-token greedy vs the n+1 verify batch.  Compare ONLY the extracted text.
+#   --spec-type none            vs   --spec-type draft-mtp --spec-draft-n-max 3
 python3 <repo>/scripts/extract-generated.py <log>
-```
-Run it on a dense model, a MoE model and (if it fits) qwen4exp, with `GGML_CUDA_MMB` **unset**, and
-diff against a r12 build.  gfx1201 measured these identical, and this is the check that would catch an
-arch-neutral group having a numeric side effect.
+# must be byte-identical (the W=1..8 band takes one reduction path)
 
-Also: `test-logits-width-probe <model> prompts/prose-rdna-boosts.txt 1024 512` must print
-**`width_purity=PASS (worst maxdiff 0)`** — with MMB off *and* with `GGML_CUDA_MMB=1`.  The guaranteed
-pure KV types are **f16, bf16, q5_0, q5_1, iq4_nl** (`q4_0`/`q4_1`/`q8_0` relax the *logits* level per
-`GREEDY-PURITY.md` §36 — text purity still holds).
+test-logits-width-probe <model> prompts/prose-rdna-boosts.txt 1024 512
+# must print: width_purity=PASS (worst maxdiff 0)
+```
+
+Run both on a dense model, a MoE model and (if it fits) qwen4exp.  The guaranteed pure KV types are
+**f16, bf16, q5_0, q5_1, iq4_nl** (`q4_0`/`q4_1`/`q8_0` relax the *logits* level per `GREEDY-PURITY.md`
+§36 — text purity still holds).  Gate 4 (MTP) is the decode half of the same contract.
+
+**Optional regression aid (opt-in beta tree only).**  While MMB is *unset* it is r12 plus the
+arch-neutral groups, and *for this beta tree* those measured bit-identical to r12 on gfx1201 (PPL
+9.4293, all five same-seed hashes).  That comparison is a useful bisection tool — which neutral group
+has a numeric side effect? — but it is **not** a gate: it is meaningless once MMB is defaulted on.  See
+the 2026-09-22 correction record in `wip/closing-the-gap/closing-the-gap.md`.
 
 ### Gate 2 — `GGML_CUDA_MMB=1` must recover the original gfx1151 win
 
