@@ -1,0 +1,228 @@
+From 121ad79356b2cf6db6991c81008b8d05a968c54b Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Mon, 21 Sep 2026 17:55:50 -0500
+Subject: [PATCH 1/2] gap-closing WIP: revive the hc_combine_norm prefill
+ fusion (matcher + 3-D out_xn)
+
+Prototype for closing-the-gap item 1 (HC combine+norm).  The delivery's
+hc_combine_norm graph-optimizer matcher had been dormant: it never fired on
+qwen4exp.  Root-caused and fixed:
+
+* build_hc_combine emitted the scatter-weight VIEW after the block_out REPEAT,
+  so the fusion window [repeat, mul, add, rms, mul(gamma)] had a RESHAPE with an
+  external view_src between the repeat and the mul; ggml_can_fuse_subgraph_ext
+  rejected it.  Emit the w view before the repeat so the window is contiguous.
+* the matcher's ok_f required the pre-rebase 2-D gamma-mul shape; the current
+  graph's gamma-mul is 3-D [n_embd, hc, n_tok].  Accept either shape.
+* ggml_cuda_op_hc_combine_norm asserted out_xn->ne[0] == n_embd*hc; relax to the
+  element count (the kernel's row-major addressing is layout-identical).
+* add LLAMA_FUSED_DSV4_HC_PRE/_POST env toggles + LLAMA_HC_CN_DEBUG traces so the
+  matcher arm can be A/B'd against the DSV4_HC_POST op.
+
+Measured on gfx1151, qwen4exp IQ4_NL, prefill-only, matcher arm
+(LLAMA_FUSED_DSV4_HC_POST=0) vs the DSV4_HC_POST arm:
+  pp2048 834.5 vs 822.1, pp8192 835.0 vs 827.7, pp32768 811.5 vs 797.1 (+1-2%).
+Same-seed greedy text identical on a smoke prompt; full purity gate not yet run.
+Default is unchanged (fused_dsv4_hc_post still true) - the matcher is inert
+unless the env disables the op.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 43 ++++++++++++++++++++++++++++++---
+ ggml/src/ggml-cuda/hyperconn.cu |  6 ++++-
+ ggml/src/ggml.c                 |  7 ++++++
+ src/llama-context.cpp           | 14 +++++++++++
+ src/models/qwen4exp.cpp         |  6 +++++
+ 5 files changed, 71 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 58b7c0adb..8e57acc1c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5438,6 +5438,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             while (base_root != nullptr && base_root->view_src != nullptr) {
+                 base_root = base_root->view_src;
+             }
++            if (getenv("LLAMA_HC_CN_DEBUG")) {
++                static unsigned d = 0;
++                if (d++ < 24) fprintf(stderr, "HC_CN[repeat] anchor n_embd=%lld hc=%lld n_tok=%lld root=%s out=%d\n",
++                    (long long) n_embd, (long long) hc, (long long) n_tok,
++                    base_root ? ggml_type_name(base_root->type) : "null",
++                    base_root ? (int) (base_root->flags & GGML_TENSOR_FLAG_OUTPUT) : -1);
++            }
+             if (base_root != nullptr && base_root->type == GGML_TYPE_F32 &&
+                     (base_root->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                 const int limit = std::min(cgraph->n_nodes, i + 24);
+@@ -5506,10 +5513,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                                 const bool ok_d = ggml_are_same_shape(mul, add) && ggml_are_same_shape(res, add) && ggml_are_same_shape(rms, add);
+                                 const bool ok_e = ggml_is_contiguous(res) && ggml_is_contiguous(add) && ggml_is_contiguous(rms) &&
+                                     ggml_is_contiguous(mulg) && ggml_is_contiguous(gamma);
+-                                const bool ok_f = gamma->ne[0] == hc_dim && ggml_nelements(gamma) == hc_dim && mulg->ne[0] == hc_dim &&
+-                                    mulg->ne[1] == n_tok && mulg->ne[2] == 1 && mulg->ne[3] == 1 &&
++                                const bool shape3 = mulg->ne[0] == n_embd && mulg->ne[1] == hc && mulg->ne[2] == n_tok && mulg->ne[3] == 1 &&
++                                    gamma->ne[0] == n_embd && gamma->ne[1] == hc;
++                                const bool shape2 = mulg->ne[0] == hc_dim && mulg->ne[1] == n_tok && mulg->ne[2] == 1 && mulg->ne[3] == 1 &&
++                                    gamma->ne[0] == hc_dim;
++                                const bool ok_f = (shape3 || shape2) && ggml_nelements(gamma) == hc_dim &&
+                                     ggml_nelements(mulg) == hc_dim * n_tok && w_ok && b_ok;
+                                 const bool ok = ok_a && ok_b && ok_c && ok_d && ok_e && ok_f;
++                                if (!ok && getenv("LLAMA_HC_CN_DEBUG")) {
++                                    static unsigned dbg = 0;
++                                    if (dbg++ < 40) fprintf(stderr, "HC_CN[repeat] ok=%d abcdef=%d%d%d%d%d%d n_embd=%lld hc=%lld n_tok=%lld mulg=[%lld,%lld,%lld,%lld] gamma=[%lld,%lld] out=%d\n",
++                                        (int) ok, ok_a, ok_b, ok_c, ok_d, ok_e, ok_f,
++                                        (long long) n_embd, (long long) hc, (long long) n_tok,
++                                        (long long) mulg->ne[0], (long long) mulg->ne[1], (long long) mulg->ne[2], (long long) mulg->ne[3],
++                                        (long long) gamma->ne[0], (long long) gamma->ne[1], (int) (base_root->flags & GGML_TENSOR_FLAG_OUTPUT));
++                                }
+                                 if (ok) {
+                                     ggml_cuda_hc_combine_norm_args args;
+                                     args.inject       = inject;
+@@ -5548,6 +5566,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                                     const int out_nodes[] = { m, g };
+                                     const bool supp = ggml_cuda_hc_combine_norm_supported(args, ggml_cuda_info().devices[cuda_ctx->device].warp_size);
+                                     const bool canf = ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2);
++                                    if (!(alias_ok && supp && canf) && getenv("LLAMA_HC_CN_DEBUG")) {
++                                        static unsigned d2 = 0;
++                                        if (d2++ < 24) fprintf(stderr, "HC_CN[repeat] dispatch alias=%d supp=%d canf=%d n_tok=%lld hc=%lld %s\n",
++                                            (int) alias_ok, (int) supp, (int) canf, (long long) n_tok, (long long) hc,
++                                            ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2) ? "" : "(canf)");
++                                    }
+                                     if (alias_ok && supp && canf) {
+                                         ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
+                                         return g - i;
+@@ -5669,10 +5693,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                         const bool ok_d = ggml_are_same_shape(mul, add) && ggml_are_same_shape(res, add) && ggml_are_same_shape(rms, add);
+                         const bool ok_e = ggml_is_contiguous(res) && ggml_is_contiguous(add) && ggml_is_contiguous(rms) &&
+                             ggml_is_contiguous(mulg) && ggml_is_contiguous(gamma);
+-                        const bool ok_f = gamma->ne[0] == hc_dim && ggml_nelements(gamma) == hc_dim && mulg->ne[0] == hc_dim &&
+-                            mulg->ne[1] == n_tok && mulg->ne[2] == 1 && mulg->ne[3] == 1 &&
++                        const bool shape3 = mulg->ne[0] == n_embd && mulg->ne[1] == hc && mulg->ne[2] == n_tok && mulg->ne[3] == 1 &&
++                            gamma->ne[0] == n_embd && gamma->ne[1] == hc;
++                        const bool shape2 = mulg->ne[0] == hc_dim && mulg->ne[1] == n_tok && mulg->ne[2] == 1 && mulg->ne[3] == 1 &&
++                            gamma->ne[0] == hc_dim;
++                        const bool ok_f = (shape3 || shape2) && ggml_nelements(gamma) == hc_dim &&
+                             ggml_nelements(mulg) == hc_dim * n_tok && w_ok && b_ok;
+                         const bool ok = ok_a && ok_b && ok_c && ok_d && ok_e && ok_f;
++                        if (!ok && getenv("LLAMA_HC_CN_DEBUG")) {
++                            static unsigned dbg = 0;
++                            if (dbg++ < 40) fprintf(stderr, "HC_CN[chain] ok=%d abcdef=%d%d%d%d%d%d n_embd=%lld hc=%lld n_tok=%lld mulg=[%lld,%lld,%lld,%lld] gamma=[%lld,%lld]\n",
++                                (int) ok, ok_a, ok_b, ok_c, ok_d, ok_e, ok_f,
++                                (long long) n_embd, (long long) hc, (long long) n_tok,
++                                (long long) mulg->ne[0], (long long) mulg->ne[1], (long long) mulg->ne[2], (long long) mulg->ne[3],
++                                (long long) gamma->ne[0], (long long) gamma->ne[1]);
++                        }
+                         if (ok) {
+                             ggml_cuda_hc_combine_norm_args args;
+                             args.inject    = inject;
+diff --git a/ggml/src/ggml-cuda/hyperconn.cu b/ggml/src/ggml-cuda/hyperconn.cu
+index 21db01dee..d95db3046 100644
+--- a/ggml/src/ggml-cuda/hyperconn.cu
++++ b/ggml/src/ggml-cuda/hyperconn.cu
+@@ -350,7 +350,11 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
+     // identically via row = (t*hc + c).
+     GGML_ASSERT(a.out_xn->type == GGML_TYPE_F32 && ggml_is_contiguous(a.out_xn));
+     GGML_ASSERT(ggml_nelements(a.out_xn) == ggml_nelements(a.out_res));
+-    GGML_ASSERT(a.out_xn->ne[0] == n_embd * hc);
++    // out_xn is the gamma-MUL result: either [n_embd*hc, T] (2D, pre-rebase graphs) or
++    // [n_embd, hc, T] (3D, the current qwen4exp graph). Both are contiguous F32 with the same
++    // row-major layout, which is all the kernel addresses (row = t*hc + c).
++    GGML_ASSERT((a.out_xn->ne[0] == n_embd * hc) ||
++                (a.out_xn->ne[0] == n_embd && a.out_xn->ne[1] == hc));
+     GGML_ASSERT(ggml_are_same_shape(a.out_res, a.residual));
+     GGML_ASSERT(ggml_nelements(a.block_out) == n_embd * n_tokens || ggml_nelements(a.block_out) == n_embd * hc * n_tokens);
+     GGML_ASSERT(ggml_nelements(a.gamma) == n_embd * hc && ggml_nelements(a.inject) == hc * n_tokens);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index af73d7c7e..130760f7a 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -8225,19 +8225,23 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
+                                 const int *                outputs,
+                                 int                        num_outputs) {
+     GGML_ASSERT(outputs && num_outputs > 0);
++    const bool dbg = getenv("LLAMA_HC_CN_DEBUG") != NULL;
+ 
+     for (int i = 0; i < count; ++i) {
+         if (node_idxs[i] >= cgraph->n_nodes) {
++            if (dbg) fprintf(stderr, "canf: i=%d idx>=n_nodes\n", i);
+             return false;
+         }
+ 
+         const struct ggml_tensor * node = cgraph->nodes[node_idxs[i]];
+ 
+         if (node->op != ops[i]) {
++            if (dbg) fprintf(stderr, "canf: i=%d op mismatch %s vs %s\n", i, ggml_op_name(node->op), ggml_op_name(ops[i]));
+             return false;
+         }
+ 
+         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            if (dbg) fprintf(stderr, "canf: i=%d %s not COMPUTE\n", i, ggml_op_name(node->op));
+             return false;
+         }
+ 
+@@ -8246,6 +8250,7 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
+         }
+ 
+         if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
++            if (dbg) fprintf(stderr, "canf: i=%d %s is OUTPUT but not declared\n", i, ggml_op_name(node->op));
+             return false;
+         }
+ 
+@@ -8260,6 +8265,7 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
+         }
+ 
+         if (subgraph_uses != ggml_node_get_use_count(cgraph, node_idxs[i])) {
++            if (dbg) fprintf(stderr, "canf: i=%d %s uses %d != count %d\n", i, ggml_op_name(node->op), subgraph_uses, ggml_node_get_use_count(cgraph, node_idxs[i]));
+             return false;
+         }
+ 
+@@ -8268,6 +8274,7 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
+         struct ggml_tensor * view_src = node->view_src;
+         while (view_src) {
+             if (ggml_node_list_find_tensor(cgraph, node_idxs, count, view_src) == -1 && !ggml_is_constant(view_src)) {
++                if (dbg) fprintf(stderr, "canf: i=%d %s external view_src %s\n", i, ggml_op_name(node->op), view_src->name);
+                 return false;
+             }
+             view_src = view_src->view_src;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 85212a5e8..34a580ebb 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -344,6 +344,20 @@ llama_context::llama_context(
+     cparams.fused_dsv4_hc_comb = true;
+     cparams.fused_dsv4_hc_post = true;
+     cparams.auto_fhc           = true;
++    {
++        // gap-closing WIP: allow A/B of the fused DSV4 HC ops against the graph-optimizer fusions
++        // (hc_combine_norm / hc_mix_reduce) that the plain chain enables.
++        const char * env_pre = getenv("LLAMA_FUSED_DSV4_HC_PRE");
++        if (env_pre) {
++            cparams.fused_dsv4_hc_pre = atoi(env_pre) != 0;
++            LLAMA_LOG_INFO("%s: fused dsv4_hc_pre = %d (env)\n", __func__, cparams.fused_dsv4_hc_pre);
++        }
++        const char * env_post = getenv("LLAMA_FUSED_DSV4_HC_POST");
++        if (env_post) {
++            cparams.fused_dsv4_hc_post = atoi(env_post) != 0;
++            LLAMA_LOG_INFO("%s: fused dsv4_hc_post = %d (env)\n", __func__, cparams.fused_dsv4_hc_post);
++        }
++    }
+ 
+     cparams.fused_hc_mix = true;
+     {
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index da8f8288f..73a7fed1f 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -633,6 +633,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, cur, il});
+     } else {
+         w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
++        // Emit the scatter-weight VIEW before the block_out REPEAT so the fusion window
++        // repeat -> mul -> add -> rms -> mul(gamma) is contiguous.  Otherwise the w view lands
++        // between the repeat and the mul (mul expands src[0]=repeat before src[1]=w) and
++        // ggml_can_fuse_subgraph_ext rejects the window on its external view_src, so the
++        // hc_combine_norm matcher never fires.
++        ggml_build_forward_expand(gf, w);
+ 
+         ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
+         b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
+-- 
+2.55.0
+

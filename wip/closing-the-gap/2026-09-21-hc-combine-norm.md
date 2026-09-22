@@ -52,9 +52,9 @@ The repeated `k_bin_bcast op_repeat` and the separate `rms_norm_f32<1024>` are a
 `hc_combine_norm_f32`. Same-seed greedy text was identical on a short smoke prompt; the full purity gate
 has **not** been run.
 
-## Why pwilkin is still faster here
+## Why the other solution is still faster here
 
-The delivery's `hc_combine_norm_f32` is the 1024-thread/3-column variant; pwilkin's `_b256` uses 256
+The delivery's `hc_combine_norm_f32` is the 1024-thread/3-column variant; the other solution's `_b256` uses 256
 threads, two elements per thread and packed 32-bit accesses (`hc-cn.cu`, 554 ms/190 calls in the
 2026-09-20 profile). Porting the `_b256` kernel is the obvious next step; it is a pure kernel swap
 behind the same matcher.
