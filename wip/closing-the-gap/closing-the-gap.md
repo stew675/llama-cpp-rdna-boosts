@@ -20,24 +20,30 @@
 * **Phase-1 item 1 (HC fusions) is DONE** (session 2): `hc_combine_norm` matcher revived (+1.5 %) and
   `hc_gate_mix` wired, default-on (+1.2–1.5 %) — both width-pure and same-seed-text identical.  Fork tip
   **`94694a38e`**, exported as **`patches/0003`**.
-* **Next: Phase-1 item 2 — the depthwise conv1d** (`gdn-conv.cu` + `ple-conv.cu`, worth **−10.5 %** on
-  the other solution's ablation).  Scoping notes below.
+* **Phase-1 item 2 (depthwise conv1d) is DONE** (session 3): `gdn-conv.cu` + `ple-conv.cu` ported,
+  default-on, **bit-identical** (fused == unfused row-0 logits hash + width probe PASS) and
+  **+3.0/+3.2 %** on qwen4exp IQ4_NL, **+6.5/+7.1 %** on 35B-A3B (pp8192/32768, `-ub 8192`).  Fork tip
+  **`1004c65db`**, exported as **`patches/0004`** — [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md).
+* **Next: Phase-1 item 3.5 (the three correctness fixes) + item 4** (`norm-gated.cu` + `idx-relu-sum.cu`,
+  −2.9 % / −1.3 %), then item 5 (MoE bf16 epilogue) and item 6 (`qsa3_attn` body).
 
 ### Do these in order
 
 1. **Run the full `beta/mmb-general` BETA-TESTING gate suite on the current default build.**  The default
-   now also has `hc_gate_mix` on (new in session 2), so the gates must be re-run against the real
-   product.  See [`../../beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md);
+   now also has `hc_gate_mix` on (session 2) and the conv fusions on (session 3), so the gates must be
+   re-run against the real product.  See [`../../beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md);
    semantics changed — **Gate 1 is `GGML_CUDA_MMB=0`** (MMB off byte-identical to r12), **Gate 2 is the
    default** (no env).  Also run the width probe and the MTP gate.  Until every gate is green, do not
-   promote and do not trust performance numbers as "the product".  (Session 2 already ran the
-   deterministic oracles and the width probe: `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA` 26/26,
-   `FLASH_ATTN_EXT` 5955/0, width probe PASS on 27B + qwen4exp; the MTP gate and the MMB-off byte check
-   are still owed.)
-2. **Reproduce the ubatch-8192 baseline** (below) before changing anything, so the item-2 delta is
-   measurable.
-3. **Start Phase-1 item 2** (depthwise conv1d).  Everything else in the phase plan is smaller; see the
-   §13 table for the ranking.
+   promote and do not trust performance numbers as "the product".  (Sessions 2-3 have run the
+   deterministic oracles and the width probe: `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA`
+   26/26, `FLASH_ATTN_EXT` 5955/0, width probe PASS on 27B + qwen4exp + 35B-A3B, conv fused==unfused
+   row-0 hashes; the MTP gate and the MMB-off byte check are still owed.)
+2. **Reproduce the ubatch-8192 baseline** (below) before changing anything, so the item deltas are
+   measurable.  Reproduced 2026-09-21 (session 3): qwen4exp IQ4_NL pre-conv 1223.1 / 1158.4
+   (pp8192/32768, `-ub 8192`), post-conv 1259.9 / 1195.6.
+3. **Start Phase-1 item 2** (depthwise conv1d) — **DONE 2026-09-21 (session 3)**, see the item-1/2 bullets
+   above and [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md).  The next item is
+   §13's item 3.5 (port the three correctness fixes) + item 4 (`norm-gated` + `idx-relu-sum`).
 
 ### Rebuild / run (copy-paste)
 
@@ -75,6 +81,46 @@ Their ablation prices `GDN_CONV`+`PLE_CONV` at **−10.5 %** end-to-end (Appendi
 3. Port the kernels + matchers, enable default-on (per policy), then gate it: width probe
    (`test-logits-width-probe` must stay `PASS`, worst maxdiff 0), same-seed greedy text, and the ubatch
    8192/32768 A/B.  The PLE half is now F32-aware in the reference (its `40a9f4d01`).
+
+---
+
+## Session-3 record (2026-09-21): Phase-1 item 2 — the depthwise conv1d is DONE
+
+### Result
+
+The other solution's `gdn-conv.{cu,cuh}` + `ple-conv.{cu,cuh}` are ported into the delivery, default
+**ON** (`GGML_CUDA_DISABLE_CONV_FUSION=1` disables).  Fork tip **`1004c65db`**, exported as
+[`patches/0004`](patches/0004-gap-closing-WIP-port-the-depthwise-conv1d-fusions-GD.patch).  Full record:
+[`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md).
+
+| model | pp | off | default (fused) | delta |
+|---|---:|---:|---:|---:|
+| qwen4exp IQ4_NL | 8192 | 1223.1 | **1259.9** | +3.0 % |
+| qwen4exp IQ4_NL | 32768 | 1158.4 | **1195.6** | +3.2 % |
+| qwen35moe 35B-A3B Q4_K_M | 8192 | 2128.1 | **2265.9** | +6.5 % |
+| qwen35moe 35B-A3B Q4_K_M | 32768 | 1561.9 | **1672.5** | +7.1 % |
+
+**Bit-identical**: the width-probe row-0 logits hash is identical fused vs disabled
+(qwen4exp `268e0673300b7a33`, 35B-A3B `e97c9e304ce1ca8f`), `width_purity=PASS (worst maxdiff 0)` on
+both, and same-seed greedy text is identical (`bb820cccf620`, 637 chars).
+
+### Two adaptations our tree needed
+
+1. `ple_conv_check`: our post-re-base `grouped_norm` emits a **3-D** `[n_embd, hc, T]` MUL, so the
+transpose's view root has `ne[2] = hc`; the reference's `x->ne[2] == 1` test rejected every PLE layer.
+The check now derives `C`/`T` from the transpose and only requires a contiguous F32 root of `C*T`
+elements (the flat layout is the same `[hc_dim, T]` buffer either way).
+2. `gdn_conv_check`: the shared `build_conv_state` (qwen35moe/qwen35/qwen3next) writes the snapshot
+`cpy(view(concat), dst)` with a raw view; the sweep rejected that CPY.  It now accepts a CPY whose
+source is a 3-column view of the concat (covered by `tail_from`) and rejects any other concat reader.
+
+### Gates still owed (unchanged from session 2, plus the conv fusion)
+
+* The **MMB-off byte-identity** check and the **MTP** gate (Gate 1/Gate 4).
+* The **27B dense** width-probe run (session 2/3 ran qwen4exp + 35B-A3B).
+* Re-check the delivery's **MoE/general GDN prefill records** now that the GDN fusion also fires on
+qwen35moe/qwen35/qwen3next (the snapshot-cpy adaptation); the 35B-A3B numbers above are the first
+signal.
 
 ---
 
@@ -910,7 +956,7 @@ body, (7) tall tile, (8) QSA graph flags; items 1–9 survive, regrouped below.
 | # | action | expected | effort | note |
 |---|---|---|---|---|
 | 1 | Make `hc_combine_norm` fire (debug the matcher) and **wire the existing `hc_gate_mix_kernel`** | large — `HC_*` ablation **−19.5 %** | 2–4 d | **DONE 2026-09-21**: matcher revived (+1.5 % prefill) and `hc_gate_mix` wired + default-on on gfx1151 (+1.2–1.5 % at pp8192/32768, width-pure, text-identical) — [`2026-09-21-hc-combine-norm.md`](2026-09-21-hc-combine-norm.md), `patches/0003`. Follow-up: IQ4_NL-only kernel (mixed UD model unchanged) |
-| 2 | Port `gdn-conv.cu` + `ple-conv.cu` + matches (now incl. **F32 PLE**) | **−10.5 %** | 2–3 d | the other solution's `40a9f4d01` made the PLE half F32-aware |
+| 2 | Port `gdn-conv.cu` + `ple-conv.cu` + matches (now incl. **F32 PLE**) | **−10.5 %** | 2–3 d | **DONE 2026-09-21 (session 3)**: ported default-on, bit-identical, +3.0/+3.2 % qwen4exp IQ4_NL and +6.5/+7.1 % 35B-A3B at `-ub 8192` — [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md), `patches/0004`.  Two adaptations (3-D `grouped_norm` root + the shared-builder snapshot cpy) |
 | 3 | Fix the `n_batch==n_ubatch==n_ctx` context creation | unlocks `-ub 16384` | 0.5–2 d | pre-existing delivery bug |
 | 3.5 | **Port the three correctness fixes** (`40c0b9c38`, `b0f31f587`, `14fff4f97`) | prevents long-session corruption | 0.5–1 d | cheap; includes the QSA decode non-determinism fix |
 | 4 | Port `norm-gated.cu` (`rms_rows`) + `idx-relu-sum.cu` | −2.9 % / −1.3 % | 1–2 d | |

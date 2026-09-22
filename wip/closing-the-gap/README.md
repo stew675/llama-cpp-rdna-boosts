@@ -9,8 +9,9 @@ moved here and updated 2026-09-21.
 |---|---|
 | [`closing-the-gap.md`](closing-the-gap.md) | the living analysis. §0–11 are the **2026-09-20 snapshot** (dated measurements); the **Update 2026-09-21** block, **§12** (MTP qualification) and **§13** (phased plan) are current. |
 | [`2026-09-21-mtp-qualification.md`](2026-09-21-mtp-qualification.md) | the MTP qualification record: plain-vs-MTP on qwen4exp IQ4_NL, ours vs the other solution's, and the `nextn_shared_target_tensors` finding. |
-| [`2026-09-21-hc-combine-norm.md`](2026-09-21-hc-combine-norm.md) | Phase-1 item 1 start: the `hc_combine_norm` matcher root cause (three bugs) and the +1.5 % prefill prototype on fork branch `gap-closing`. |
-| [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..94694a38e`) exported as patches, so the code work survives a fork reset. |
+| [`2026-09-21-hc-combine-norm.md`](2026-09-21-hc-combine-norm.md) | Phase-1 item 1: the `hc_combine_norm` matcher root cause (three bugs) + the `hc_gate_mix` wire-up; +1.5 % / +1.2–1.5 % prefill on fork branch `gap-closing`. |
+| [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md) | Phase-1 item 2: the depthwise conv1d (`gdn-conv.cu` + `ple-conv.cu`) port, default-on, bit-identical, +3.0/+3.2 % qwen4exp IQ4_NL and +6.5/+7.1 % 35B-A3B at `-ub 8192`. |
+| [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..1004c65db`) exported as patches, so the code work survives a fork reset. |
 
 ## The two moving references this file tracks
 
@@ -23,13 +24,13 @@ moved here and updated 2026-09-21.
 
 ## Current "our side" build state
 
-* `~/llama.cpp` branch **`gap-closing`** @ **`94694a38e`** = `mmb-beta` (r12 `72176ae8a` + the 12
+* `~/llama.cpp` branch **`gap-closing`** @ **`1004c65db`** = `mmb-beta` (r12 `72176ae8a` + the 12
   `beta/mmb-general/patches/*.patch`, tree `bca69f23dd…`) + the 2026-09-21 changes: **default-on policy**
-  (MMB/HC16/matcher), the `hc_combine_norm` matcher revival, and the **`hc_gate_mix` fusion** (session 2,
-  default-on on gfx1151), plus env-gated debug traces.
+  (MMB/HC16/matcher), the `hc_combine_norm` matcher revival, the **`hc_gate_mix` fusion** (session 2),
+  and the **depthwise conv1d fusions** (session 3), plus env-gated debug traces.
 * Built on this box (gfx1151) with `~/bin/build-llama-rocm-714`.  **All beneficial features are on by
   default** (see the `AGENTS.md` default-on policy); env vars only disable.
-* The three `gap-closing` commits (`0001..0003`) are exported to [`patches/`](patches/) in case the local
+* The four `gap-closing` commits (`0001..0004`) are exported to [`patches/`](patches/) in case the local
   fork branch is lost.
 
 To reproduce:
@@ -39,7 +40,7 @@ cd ~/llama.cpp
 git checkout rdna-boosts && git branch -D mmb-beta gap-closing 2>/dev/null
 git checkout -b mmb-beta
 git am /home/stew675/llama-cpp-rdna-boosts/beta/mmb-general/patches/*.patch
-git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 94694a38e
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 1004c65db
 ~/bin/build-llama-rocm-714
 ```
 
@@ -54,8 +55,10 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch  
    `result_output` reserve (15.5 GiB, shared with the other solution) plus qwen4exp's HC `block_out`
    pin (~18 GiB) against the resident PLE table (~27 GiB host).  ubatch 8192 runs clean and is the
    reproducible head-to-head baseline (ours 1212.6 vs its 1346.5 at pp8192, ~10 % behind).
-3. **Start Phase 1 item 2 — the depthwise conv1d** (`gdn-conv.cu` + `ple-conv.cu`, −10.5 %).  Item 1 is
-   done; see the doc's START HERE scoping notes.
+3. **Phase-1 item 2 — the depthwise conv1d** (`gdn-conv.cu` + `ple-conv.cu`) — **DONE 2026-09-21
+   (session 3)**: default-on, bit-identical, +3.0/+3.2 % qwen4exp IQ4_NL and +6.5/+7.1 % 35B-A3B at
+   `-ub 8192`; see [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md).  The next
+   item is **3.5** (the three correctness fixes) + **4** (`norm-gated` + `idx-relu-sum`).
 
 ## The current open list (see §13 of the doc)
 
@@ -69,7 +72,9 @@ MTP tuning + correctness.**
    matcher was revived (+1.5 % prefill) and `hc_gate_mix` is wired and default-on on gfx1151
    (+1.2–1.5 % at pp8192/32768, width-pure, text-identical) — see the record and `patches/0003`.
    Follow-up: the gate-mix kernel is IQ4_NL-only, so the mixed UD-IQ4_XS model is unchanged.
-2. Port `gdn-conv.cu` + `ple-conv.cu` (now F32-aware for Flash-Next PLE) — −10.5 %.
+2. Port `gdn-conv.cu` + `ple-conv.cu` (now F32-aware for Flash-Next PLE) — **DONE 2026-09-21
+   (session 3)**: default-on, bit-identical, +3.0/+3.2 % qwen4exp IQ4_NL, +6.5/+7.1 % 35B-A3B —
+   `2026-09-21-gdn-ple-conv-fusions.md`, `patches/0004`.
 3. **`-ub 16384` is deferred** (target is `-ub 8192`).  Root cause in the “Session-2 record”
    section: result_output reserve + HC pin + resident PLE.  Candidate fixes: default the PLE to
    mmap-lazy (fix the `-lzm auto` propagation), or expose `--lazy-buffer-size` in `llama-bench`.
