@@ -100,8 +100,9 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch  
    design (cell range clamped to `n_blocks*ratio`), default strip 1024, bit-identical, **+0.5 %
    pp8192 / neutral pp32768** at `-b/-ub 8192` —
    [`2026-09-22-qsa-score-bounds.md`](2026-09-22-qsa-score-bounds.md).
-   **Next code item — `QSA_SCORE_WMMA`** (see the NEXT SESSION block of
-   [`closing-the-gap.md`](closing-the-gap.md)).
+   **Next session's two focus items — `QSA_SCORE_WMMA` (prefill) and MMB quant coverage
+   (Q4_0/Q4_1/Q5_0/MXFP4/NVFP4)**; prerequisite: rebuild the campaign on delivery r13 and drop WIP
+   `patches/0015` — see the NEXT SESSION block of [`closing-the-gap.md`](closing-the-gap.md).
    The full session-5 finding (throughput A/B, memory accounting, family diff) is in
    [`closing-the-gap.md`](closing-the-gap.md#session-5-finding-2026-09-22--fresh-target-ubatch-profile-memory-accounting-refined-tasks).
 
@@ -165,8 +166,11 @@ MTP tuning + correctness.**
     fused cell top-k lacks, so it is delivered by clamping the fused top-k's cell range to
     `n_blocks*ratio` instead of trimming the block map.  Default strip 1024, +0.5 % pp8192 / neutral
     pp32768 at `-b/-ub 8192`.  The `-inf`-padded first cut (no kernel change) was a wash —
-    [`2026-09-22-qsa-score-bounds.md`](2026-09-22-qsa-score-bounds.md).  **Remaining: `QSA_SCORE_WMMA`
-    (the item-8 follow-up), a numerics change with its own width-probe/same-seed gate.**
+    [`2026-09-22-qsa-score-bounds.md`](2026-09-22-qsa-score-bounds.md).  **Remaining (next-session
+    focus): `QSA_SCORE_WMMA`** — fuse the prefill score with the existing `ggml_lightning_indexer`
+    WMMA op (all-ones weights + zero F16 mask), composed with the trim; a numerics change with its own
+    width-probe/same-seed gate.  Full scoping in the NEXT SESSION block of
+    [`closing-the-gap.md`](closing-the-gap.md).
 16. **BF16 HC streams** (`blk16`/`res16`) — **DONE 2026-09-22 (session 6, `patches/0011`),
     default OFF**: +4.9 % pp8192 / +4.8 % pp32768 at `-b/-ub 4096`, default build byte-identical —
     [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md).  `res16` is the dominant half;
@@ -177,7 +181,11 @@ MTP tuning + correctness.**
 
 9. Port sparse QSA decode + incremental indexer state (`d67d58836`) — its +11–20 %; our plain decode is
    already ahead, so this is a hold/repay item.
-10. MMB quant coverage (Q4_0/Q4_1/Q5_0/Q2_K/IQ1/IQ2/MXFP4/NVFP4) — completeness.
+10. MMB quant coverage — **next-session focus (with `QSA_SCORE_WMMA`)**: port **Q4_0, Q4_1, Q5_0,
+    MXFP4, NVFP4** to `mmb.cu` (Q2_K/IQ1_*/IQ2_* stay out of scope for quality).  Per-type checklist
+    and the closest existing templates are scoped in the NEXT SESSION block of
+    [`closing-the-gap.md`](closing-the-gap.md); gate on PPL parity + a throughput A/B, and default ON.
+    Currently supported: IQ4_NL, Q8_0, Q4_K, Q5_1, IQ3_S, Q5_K, Q6_K, IQ4_XS, Q3_K, IQ3_XXS.
 
 **Phase 3 — MTP tuning + correctness** (parked)
 

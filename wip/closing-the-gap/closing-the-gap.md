@@ -109,12 +109,14 @@
   in graph order (the matcher accepts our L2a relu-before-reshape form), pp32768 **+1.8 %** at
   `-b/-ub 4096` — [`2026-09-22-idx-relu-sum.md`](2026-09-22-idx-relu-sum.md).  RDNA3_5-gated like the
   reference; the kernel is arch-neutral.
-* **Next: see "NEXT SESSION" immediately below** — Phase 1 is done; the only remaining prefill item is
-  `QSA_SCORE_WMMA` (the `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` trim landed 2026-09-22, session 7).
+* **Next: see "NEXT SESSION" immediately below** — the next session's two focus items are
+  `QSA_SCORE_WMMA` (the last Phase-1 prefill item) and **MMB quant coverage** (Q4_0/Q4_1/Q5_0/
+  MXFP4/NVFP4); the prerequisite is rebuilding the campaign on delivery r13 and dropping WIP
+  `patches/0015`.  The `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` trim landed 2026-09-22 (session 7).
   The session-5 profile/memory findings and the corrected gate semantics are further down; read them
   too.
 
-### NEXT SESSION — Phase 1 is done except `QSA_SCORE_WMMA`
+### NEXT SESSION — focus: `QSA_SCORE_WMMA` (prefill) + MMB quant coverage
 
 **Session 7 landed the QSA prefill scorer trim and the shared-NextN MTP fix** (fork `gap-closing`
 `00d8bbbc9`, exported to [`patches/0014`](patches/) and [`patches/0015`](patches/)): the reference's `QSA_SCORE_BOUNDS` +
@@ -146,21 +148,88 @@ The measured product is the table at the top of this handover (1379 / 1320 t/s a
 target with the BF16 rounding path on; 1308 / 1270 on the default build).  The session-5 BF16-traffic and
 conversion gaps are closed.
 
-**Do first — run the full `beta/mmb-general` BETA-TESTING suite once** (still owed since session 5):
-Gate 4 (MTP acceptance) + the op oracles.  Purity is an **intra-build** contract (`GREEDY-PURITY.md`):
+#### Prerequisite (cheap, first) — rebuild the campaign on delivery r13
+
+The shared-NextN MTP fix now lives in **delivery block 00, release `v16-ebbb18522-r13`** (`main`
+`ae076ab`; canonical tip `8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`, tree
+`bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`).  Rebuild this campaign against r13 and **drop
+`wip/closing-the-gap/patches/0015`** (block 00 already carries that fix; applying 0015 on r13 would
+conflict).  `patches/0001..0014` should apply unchanged — none touch `common/speculative.cpp`.  Then
+run the full `beta/mmb-general` BETA-TESTING gate suite once — still owed since session 5: Gate 4 (MTP
+acceptance) + the op oracles.  Purity is an **intra-build** contract (`GREEDY-PURITY.md`):
 `test-logits-width-probe` PASS (worst maxdiff 0) on f16/bf16/q8_0, `plain == draft-mtp` greedy text,
-acceptance > ~0.45 at pos 1, coherence.  Re-run `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA`,
-`FLASH_ATTN_EXT`.  Green before any promotion; do not trust perf numbers as "the product" until then.
+acceptance > ~0.45 at pos 1, coherence.  The MTP gate can now use the shared-NextN sidecar (fixed).
+This is housekeeping; the two focus items below are the session's real work.
 
-#### Next code item — `QSA_SCORE_WMMA`
+#### Focus 1 — `QSA_SCORE_WMMA` (prefill indexer score → fused WMMA)
 
-The `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` trim is **done** (session 7, `patches/0014`,
-[`2026-09-22-qsa-score-bounds.md`](2026-09-22-qsa-score-bounds.md)).  The remaining prefill-score
-item is `QSA_SCORE_WMMA`: extend a fused WMMA score to `n_tps >= 128`, `idx_dim == 128`,
-`n_idx_h == 4`.  Ours is `n_tokens == 1` only (the decode fused score).  It is a **numerics change**,
-so read the reference's op first and gate it with the width probe + same-seed text — and it composes
-with the trim (the WMMA arm would run on the trimmed width).  Full flag table and port scoping:
+Our prefill indexer score is the per-op chain (`mul_mat` → L2a relu → head-sum); the fused decode
+score op (`ggml_indexer_score`) is `n_tokens == 1` only.  **`ggml_lightning_indexer`** — the DSA WMMA
+op we already ship for deepseek32/deepseek4/glm-dsa/hy-v4
+(`ggml/src/ggml-cuda/lightning-indexer.cu`) — computes exactly `sum_h w[h] * relu(q_h · k) + mask`, so
+with **all-ones weights** and a **zero F16 mask** it is a drop-in for the prefill chain, for the band
+`n_tps >= 128 && idx_dim == 128 && n_idx_h == 4` (qwen4exp is exactly 128/4).
+
+Reference recipe (`~/pwilkin-llama-cpp` `ddaf5214b`, `qwen4exp.cpp` ~line 1150; the env flag was
+`LLAMA_QSA_SCORE_WMMA` and later compiled in):
+* per graph, build shared tensors (named, so layers sharing a ratio reuse them):
+  `weights = ggml_fill(F32, [n_idx_h, strip, 1, n_stream], 1.0f)` and
+  `zero_mask = ggml_fill(F16, [n_blocks, strip, 1, n_stream], 0.0f)`;
+* per strip: `query = view(q, [idx_dim, n_idx_h, n_query, n_stream])`,
+  `key = reshape(pooled, [idx_dim, 1, n_blocks, n_stream])`,
+  `weights_v = view(weights, [n_idx_h, n_query, 1, n_stream])`,
+  `mask_v = view(zero_mask, [n_blocks, n_query, 1, n_stream])`,
+  `score = reshape(ggml_lightning_indexer(query, key, weights_v, mask_v), [n_blocks, n_query, n_stream])`.
+
+**Compose with the score-bounds trim (our improvement over the reference).**  The reference's fused arm
+*opts out* of `QSA_SCORE_BOUNDS` ("the fused WMMA scorer sizes its shared zero mask from `n_blocks`,
+so it opts out"), which would regress the `+0.5 %` trim we just landed in the `n_tps >= 128` band.  The
+mask is all zeros — the kernel reads its `ne0` rows contiguously and uses the tensor's `nb[1]` for the
+query stride — so a leading-rows view `[score_blocks, n_query]` of the shared `[n_blocks, strip]` mask
+is valid and satisfies the op's `mask->ne[0] == k->ne[2]` assert.  Trim `key`/`mask` together per strip.
+
+**Gate (numerics change).**  WMMA half q/k vs the F32 matmul is not bit-identical, so this is an
+approved *prefill* re-baseline: width probe PASS on f16/bf16/q8_0, `plain == draft-mtp` greedy text
+(the MTP gate can now use the shared head), plus an A/B at `-b 8192 -ub 8192`.  Env
+`LLAMA_QSA_SCORE_WMMA`, default ON once green.  The audit prices it as the other half of the indexer
+score work ("low-single-digit % prefill"); full flag table in
 [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md).
+
+#### Focus 2 — MMB quant coverage: Q4_0 / Q4_1 / Q5_0 / MXFP4 / NVFP4
+
+`ggml_cuda_mmb_supported_mm/_mmid/_glu` (`mmb.cu`, `beta/mmb-general/patches/0001`) currently accept
+**IQ4_NL, Q8_0, Q4_K, Q5_1, IQ3_S, Q5_K, Q6_K, IQ4_XS, Q3_K, IQ3_XXS** (IQ3_XXS routed-only and
+default-off).  The completeness gap is the five types above.
+
+| type | shape | closest existing template | notes |
+|---|---|---|---|
+| Q4_0 | 32 vals, half scale | `Q8_0` (2 blocks/64) | simplest; no min |
+| Q4_1 | 32 vals, half2 d/m | `Q5_1` | same dm pair layout |
+| Q5_0 | 32 vals, half d + qh | `Q5_1` minus the min | 5th bit in `qh` |
+| MXFP4 | 32 vals, E2M1 + E8M0 shared exp | new | 4-bit float; ggml has `dequantize.cuh` helpers |
+| NVFP4 | E2M1 + E4M3 per-4-block scale | new | ggml has `dequantize.cuh` helpers |
+
+Per-type checklist: (1) a bf16-to-LDS dequantizer in `mmb.cu`/`mmb.cuh` (the Q8_0/Q5_1 pairs are the
+templates for Q4_0/Q4_1/Q5_0; MXFP4/NVFP4 need new exponent handling), (2) the
+`mmb_supported_mm/_mmid/_glu` predicate, (3) the graph-optimizer `mmb_dense_will_take` /
+`_routed_will_take` gate so the fusions stand down only when MMB will take the type, (4) **PPL parity**
+with the MMQ path (the beta's rule: "PPL parity everywhere says the dequants are correct") plus a
+throughput A/B, (5) the default-on policy (a win → ON; the env var only disables).  **`Q2_K`, `IQ1_*`,
+`IQ2_*` stay deliberately out of scope** (quality — documented in the beta README).
+
+Models: Q4_0/Q4_1/Q5_0 are common local quants; MXFP4 = gpt-oss; NVFP4 = recent NVIDIA-quantized
+models.  Record PPL + pp2048/pp8192 (`-ub 2048` bf16 KV) per type in the beta README table.
+
+#### After the two focus items — deferred housekeeping + tuning
+
+* Full `beta/mmb-general` BETA-TESTING suite (Gate 4 MTP acceptance + op oracles) if not already done
+  with the r13 rebuild.
+* **Phase 2:** sparse QSA decode + incremental indexer state (`d67d58836`, +11–20 %; a hold/repay item
+  since our plain decode is already ahead).
+* **Phase 3:** qwen4exp adaptive ceiling sweep (3/5/7/9/12) — tuning; adaptive wins recall but
+  over-drafts code/prose at `n_max 12`.
+* **Parked:** `-ub 16384` (item 3) — needs item 13's managed PLE reader fast path (a no-cache
+  parallel-pread reader like the reference's `on-direct`; the LRU arena measured intrinsically slower).
 
 #### What is deliberately NOT being done
 
