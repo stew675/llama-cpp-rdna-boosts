@@ -1,9 +1,7 @@
 # Phase-1 item 15 (follow-up) — QSA prefill scorer fusion (`QSA_SCORE_WMMA`), ported 2026-09-22
 
-**Status:** code complete + op oracle green; **end-to-end qwen4exp gate PENDING** (the box's live
-`llama-server` holds ~88 GB of the 124 GB unified VRAM, so the 93 GiB model cannot load).  Default
-**OFF** (`LLAMA_QSA_SCORE_WMMA=1` enables) until that gate runs.  Fork `~/llama.cpp` branch
-`gap-closing-r13` (r13 + `beta/mmb-general` + gap-closing `0001..0014`), commit `fed70bb36`.
+**Status:** ported and validated, **default ON**, small depth win (`patches/0016`).  Fork `~/llama.cpp`
+branch `gap-closing-r13` (r13 + `beta/mmb-general` + gap-closing `0001..0014`), commit `ef6985a39`.
 Patch: [`patches/0016-…`](patches/).
 
 ## What it is
@@ -47,19 +45,14 @@ and needs no materialisation.
 | **Op oracle** `test-backend-ops -o LIGHTNING_INDEXER` | **225/225**, including **81 new `nh=4` cases** (`kv` 64/256/1024, `nb` 1/16/512, `ns` 1/4, `nm` 4/1, `type_K` F32/F16/BF16).  The `nh=4` F32/F16 cases take the WMMA kernel; the BF16 cases take the new generic vec fallback. |
 | **Cross-backend consistency** | `n_head == 4` now resolves for every `type_K` in the generic predicate, with vec cases for all 8 types. |
 | Build | `llama-cli` / `llama-bench` / `test-backend-ops` green, no warnings. |
-| **End-to-end qwen4exp** (`LLAMA_QSA_SCORE_WMMA=1` vs `=0`) | **PENDING** — width probe, same-seed greedy text, coherence, and a `-b/-ub 8192` A/B.  Blocked by the live `llama-server` (PID 3792130, ~88 GB VRAM). |
-| decode/verify width purity | untouched by construction: the fused path is gated `n_tps >= 128`, so the `W=1..8` band keeps the per-op reduction order. |
-
-**Why the end-to-end gate matters:** the WMMA kernel loads q/k as F16, so the prefill logits shift
-by an F16-rounding ULP versus the F32 matmul — an **approved prefill re-baseline**, not bit-identical.
-The op oracle proves the kernel is *correct* against the CPU reference; the pending gate proves the
-graph wiring is right and prices the win.  Until then it is default OFF.
+| **Width purity** `test-logits-width-probe <IQ4_NL> prompts/prose-rdna-boosts.txt 1024 512` | **`width_purity=PASS (worst maxdiff 0)`** on the default build, and the per-W hashes (`row0=268e0673300b7a33`) are **byte-identical** to `LLAMA_QSA_SCORE_WMMA=0` — the fused path is prefill-only (`n_tps >= 128`), so the `W=1..8` decode/verify band keeps the per-op reduction order. |
+| **Coherence / same-seed text** | coherent thinking trace on both arms; the same-seed greedy text differs only in wording (`3ecdbd2c7a7e` vs `ebe4efe88609`, both coherent) — the approved **prefill re-baseline** of the F16 q/k WMMA cast. |
+| **Prefill A/B** (interleaved, `-ctk/-ctv f16`, `-p 8192,32768 -n 0`) | `-b 8192 -ub 8192`: pp8192 **1363.6 → 1362.0** (flat), pp32768 **1311.5 → 1324.9 (+1.0 %)**.  `-b/-ub 4096`: pp8192 1301.2 → 1297.3 (−0.3 %, noise), pp32768 **1265.9 → 1277.2 (+0.9 %)**. |
 
 ## Kill switches
 
-* `LLAMA_QSA_SCORE_WMMA=1` — enables the fused prefill scorer (default OFF pending the gate).
-* Flip the default to ON in `build_qsa_top_k` (`return env == nullptr || …`) once the gate is green,
-  per the default-on policy.
+* `LLAMA_QSA_SCORE_WMMA=0` — restores the per-op `mul_mat + relu + head-sum` prefill chain (A/B arm).
+* Default ON since the 2026-09-22 gate above (default-on policy).
 
 ## Files
 

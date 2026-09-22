@@ -136,20 +136,20 @@ This is an **upstream bug (#23398)** now **delivered in the delivery set as bloc
 `v16-ebbb18522-r13`)** — an `upstream/` PR candidate for when upstream fixes it, and the WIP
 `patches/0015` is superseded (do not apply it on a campaign rebuilt on r13).
 
-**Session 8 (2026-09-22) did the rebuild + Focus 1's code.**  The campaign is rebuilt on **r13**
-(fork branch `gap-closing-r13`, tip `fed70bb36` = r13 + 12 `beta/mmb-general` patches + gap-closing
-`0001..0014`, dropping the superseded `0015`), built clean.  **`QSA_SCORE_WMMA` is code complete**
+**Session 8 (2026-09-22) did the rebuild + Focus 1.**  The campaign is rebuilt on **r13** (fork
+branch `gap-closing-r13`, tip `ef6985a39` = r13 + 12 `beta/mmb-general` patches + gap-closing
+`0001..0014`, dropping the superseded `0015`), built clean.  **`QSA_SCORE_WMMA` is DONE, default ON**
 (`patches/0016`): the reference's AMD RDNA3_5 4-head/128-dim `qsa_indexer_wmma16_keyreg` WMMA kernel
 is ported into `lightning-indexer.cu` (with a generic `n_head == 4` vec fallback so the op is legal
 on every backend), `build_qsa_top_k` builds the prefill score as one `ggml_lightning_indexer`
 (all-ones weights + zero F16 mask, shared per graph by name) composed with the `QSA_SCORE_BOUNDS`
 causal trim (leading-rows views), and the op oracle is green —
-`test-backend-ops -o LIGHTNING_INDEXER` **225/225 including 81 new `nh=4` cases** —
-[`2026-09-22-qsa-score-wmma.md`](2026-09-22-qsa-score-wmma.md).  It is **default OFF**
-(`LLAMA_QSA_SCORE_WMMA=1`) pending the **end-to-end qwen4exp gate** (width probe + same-seed
-coherence + A/B), which could not run because the gfx1151 box's live `llama-server` holds ~88 GB of
-the 124 GB unified VRAM.  **Next: run that gate and flip the default ON, then start Focus 2 (MMB
-quant coverage).**
+`test-backend-ops -o LIGHTNING_INDEXER` **225/225 including 81 new `nh=4` cases**.  Gated on gfx1151
+qwen4exp IQ4_NL: `width_purity=PASS (worst maxdiff 0)` with the per-W hashes **byte-identical** to
+`LLAMA_QSA_SCORE_WMMA=0`, coherent same-seed text (the approved prefill re-baseline), and pp32768
+**1311.5 → 1324.9 t/s (+1.0 %, `-b/-ub 8192`)** / **1265.9 → 1277.2 (+0.9 %, `-b/-ub 4096`)**, pp8192
+flat — [`2026-09-22-qsa-score-wmma.md`](2026-09-22-qsa-score-wmma.md).  **Next: Focus 2 (MMB quant
+coverage).**
 
 **Session 6 landed three items** (fork `gap-closing`, exported to [`patches/`](patches/)):
 
