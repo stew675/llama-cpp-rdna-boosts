@@ -163,6 +163,22 @@ OFF by default** (env opt-in, source kept for later work; it measured slower tha
 for item 3 once its cost is reduced.  All three lazy modes produce **identical greedy text**
 (`7e4a6a4e66fb`, 322 chars, prose prompt) — the mode is a memory/latency choice, not a numerics one.
 
+**Cache discriminator (2026-09-22).**  To separate the managed reader's intrinsic cost from page-cache
+shortfall, the three arms were compared at two levels of our own memory pressure (page warmed before
+each arm; the managed arm's own footprint leaves free = 123 − used for page cache):
+
+| config | resident (`off`) | mmap (`on`) | managed (`auto`+4 GB) | managed vs mmap |
+|---|---:|---:|---:|---:|
+| `-ub 2048 -p 8192` (used 106/79/81 GB → ~42 GB cache free) | 1236.7 | 1204.7 | 1157.2 | **−4.0 %** |
+| `-ub 8192 -p 8192` (used 120/93/95 GB → ~28 GB cache free) | 1284.5 | 1216.9 | 1098.4 | **−9.7 %** |
+
+So the shortfall is **not** the whole story: even with the whole 27 GB PLE table comfortably in page
+cache (`-ub 2048`), the managed reader is still ~4 % slower than mmap vs ~10 % under pressure.  **Two
+independent causes:** (1) the LRU arena has an intrinsic overhead on a streaming prefill access pattern
+(the reference's `on-direct` is a *no-cache* parallel-pread reader, not an LRU arena — that is why its`on-direct` ≈ `off`);  and (2) page-cache pressure adds a further ~6 % to the managed arm (and ~2.7 % to
+mmap).  The PLE task's fix is therefore the **reader design** (streaming/no-cache fast path), not only a
+smaller footprint.  Source kept, gated OFF; item 13.
+
 ### Do these in order
 
 1. **Run the full `beta/mmb-general` BETA-TESTING gate suite on the current default build**
@@ -1263,7 +1279,7 @@ body, (7) tall tile, (8) QSA graph flags; items 1–9 survive, regrouped below.
 | 6 | Tune/port-align `qsa3_attn` body vs `qsa.cu` | ~+195 ms (~1.5 %) | 1–2 d | **DONE 2026-09-22 (session 4)**: the gap was the per-cell `cell_vis` check, not geometry; folded into `umask` at merge time, bit-identical, `qsa3_attn` 809.6 -> 672.9 ms, +2.4 %/+1.7 % — [`2026-09-22-qsa3-visibility-fold.md`](2026-09-22-qsa3-visibility-fold.md), `patches/0007` |
 | 7 | Investigate the tall `384x64` 2× launch count | unknown (part of +809) | 0.5–1 d | **DONE 2026-09-22 (session 4)**: the 2× was the M=4 HC inject admitted by the tall gate; a min-M bound keeps it on the dense tile, bit-identical, +0.8 %/+1.1 % — [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md), `patches/0008` |
 | 8 | Audit the 9 QSA graph-side flags vs block-14/15 | low-single-digit % (2 un-ported) | 0.5 d | **DONE 2026-09-22 (session 4)**: 7/9 present/superseded; the 2 un-ported (`QSA_SCORE_BOUNDS`+`_QUERY_STRIP`, `QSA_SCORE_WMMA`) are now **item 15**, deferred behind the bigger families |
-| 13 | **`-lzm auto` semantics + managed PLE reader perf** | memory: ~28 GB; `-ub 16384` unlock | 0.5–1 d (semantics **DONE**, reader **gated OFF**) | session-5: `on`=mmap, `off`=resident, `auto`=upstream auto, managed LRU **opt-in** via `LLAMA_LAZY_BUF_MB` and **off by default** because it is the slowest arm (1090/1184 vs mmap 1219/1217 vs resident 1285/1232 at pp8192/32768).  `--lazy-buffer-size` dropped.  **TODO:** make the managed reader beat mmap (streaming prefill access pattern — the LRU arena adds a copy per row), then reconsider defaulting it on; it already enables `-b/-ub 16384` (1118.7 t/s) |
+| 13 | **`-lzm auto` semantics + managed PLE reader perf** | memory: ~28 GB; `-ub 16384` unlock | 0.5–1 d (semantics **DONE**, reader **gated OFF**) | session-5: `on`=mmap, `off`=resident, `auto`=upstream auto, managed LRU **opt-in** via `LLAMA_LAZY_BUF_MB` and **off by default** because it is the slowest arm (1090/1184 vs mmap 1219/1217 vs resident 1285/1232 at pp8192/32768).  `--lazy-buffer-size` dropped.  **Discriminator (2026-09-22):** the cost is *not* only page-cache pressure — with the table fully cached (`-ub 2048`) the reader is still **−4.0 % vs mmap** (vs −9.7 % under pressure), so the arena has an intrinsic streaming overhead; the fix is a no-cache parallel-pread fast path like the reference's `on-direct`, then reconsider defaulting it on.  It already enables `-b/-ub 16384` (1125.5 t/s) |
 | 14 | Port the prefill indexer **relu+head-sum** fusion (`idx-relu-sum`) | ~+590 ms (~1.1 %) | 0.5–1 d | non-lossy; reference `idx_relu_sum_f32` (1536 calls / 364 ms) vs our `unary_op<relu>` 559 ms + adds.  Our graph applies relu *before* the 4-D reshape (the L2a win), so the reference matcher cannot port verbatim — use a fused op or an order-aware matcher |
 | 15 | `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` | low-single-digit % | 2–3 d | item-8 follow-ups; the bounds trim is coupled to the reference's complete-block selection (`compact`/`maskless`), which our fused cell top-k does not have, so scope carefully |
 

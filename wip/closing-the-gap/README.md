@@ -134,9 +134,10 @@ MTP tuning + correctness.**
    Lossy — decide with the HC BF16 streams (item 13's sibling, new item 16).
 13. **`-lzm auto` semantics + managed PLE reader perf** — **semantics DONE, reader gated OFF**
     2026-09-22: `on` = mmap-lazy, `off` = preload, `auto` = upstream auto, `--lazy-buffer-size` dropped,
-    managed LRU **opt-in via `LLAMA_LAZY_BUF_MB`** and off by default (slowest arm).  **TODO:** make the
-    managed reader beat mmap (streaming prefill access — the LRU arena adds a copy per row), then
-    reconsider defaulting it on; it already enables the parked `-b/-ub 16384` (item 3, 1118.7 t/s).
+    managed LRU **opt-in via `LLAMA_LAZY_BUF_MB`** and off by default (slowest arm).  **Discriminator:**
+    the cost is both an intrinsic streaming overhead (still −4.0 % vs mmap with the table fully cached)
+    and page-cache pressure (−9.7 % at the target); the fix is a no-cache parallel-pread fast path like
+    the reference's `on-direct`.  It already enables the parked `-b/-ub 16384` (item 3, 1125.5 t/s).
 14. Port the prefill indexer **relu+head-sum** fusion (`idx-relu-sum`, ~+590 ms, non-lossy).  Our graph
     applies relu *before* the 4-D reshape (the L2a win), so the reference matcher cannot port verbatim.
 15. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` — the item-8 follow-ups; the trim is
