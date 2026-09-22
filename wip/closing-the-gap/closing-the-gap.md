@@ -109,11 +109,30 @@
   in graph order (the matcher accepts our L2a relu-before-reshape form), pp32768 **+1.8 %** at
   `-b/-ub 4096` — [`2026-09-22-idx-relu-sum.md`](2026-09-22-idx-relu-sum.md).  RDNA3_5-gated like the
   reference; the kernel is arch-neutral.
-* **Next: see "NEXT SESSION" immediately below** — the `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` item-8
-  follow-up, then `QSA_SCORE_WMMA`.  The session-5 profile/memory findings and the corrected gate
-  semantics are further down; read them too.
+* **Next: see "NEXT SESSION" immediately below** — Phase 1 is done; the only remaining prefill item is
+  `QSA_SCORE_WMMA` (the `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` trim landed 2026-09-22, session 7).
+  The session-5 profile/memory findings and the corrected gate semantics are further down; read them
+  too.
 
-### NEXT SESSION — Phase 1 is done except the QSA prefill-score trim
+### NEXT SESSION — Phase 1 is done except `QSA_SCORE_WMMA`
+
+**Session 7 landed the QSA prefill scorer trim and the shared-NextN MTP fix** (fork `gap-closing`
+`00d8bbbc9`, exported to [`patches/0014`](patches/) and [`patches/0015`](patches/)): the reference's `QSA_SCORE_BOUNDS` +
+`QSA_QUERY_STRIP` ported to the fused-top-k design.  `qsa_score_key_limits` in
+`llama-memory-hybrid-idx.*` bounds each query strip to the complete blocks fully inside its causal
+prefix, and `build_qsa_top_k` scores each strip at that width; the fused `ggml_indexer_top_k`'s cell
+range is clamped to `n_blocks*ratio` in the CUDA and CPU paths so the trimmed cells are never read.
+Default strip **1024** (`LLAMA_QSA_SCORE_STRIP`), `LLAMA_QSA_SCORE_BOUNDS=0` isolates the trim.
+**+0.5 % pp8192 / neutral pp32768** at `-b/-ub 8192`, bit-identical width probe on f16/bf16/q8_0 and
+same-seed text `61cebc1d31a9` — [`2026-09-22-qsa-score-bounds.md`](2026-09-22-qsa-score-bounds.md).
+The `-inf`-padded first cut (no kernel change) was a measured **wash**; the clamp + trim is what pays.
+The same session fixed the **shared-NextN MTP head** (`nextn_shared_target_tensors`): the MTP driver
+inferred KV sharing from `ctx_other` alone, so the other solution's IQ4_NL shared sidecar died every
+round on the M-RoPE `X < Y` check.  Gated on the `gemma4-assistant` arch it now runs with 0 draft
+errors and acceptance 0.287 — [`2026-09-22-mtp-shared-nextn-fix.md`](2026-09-22-mtp-shared-nextn-fix.md).
+This is an **upstream bug (#23398)** now **delivered in the delivery set as block 00 (release
+`v16-ebbb18522-r13`)** — an `upstream/` PR candidate for when upstream fixes it, and the WIP
+`patches/0015` is superseded (do not apply it on a campaign rebuilt on r13).
 
 **Session 6 landed three items** (fork `gap-closing`, exported to [`patches/`](patches/)):
 
@@ -133,23 +152,15 @@ Gate 4 (MTP acceptance) + the op oracles.  Purity is an **intra-build** contract
 acceptance > ~0.45 at pos 1, coherence.  Re-run `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA`,
 `FLASH_ATTN_EXT`.  Green before any promotion; do not trust perf numbers as "the product" until then.
 
-#### Next code item — `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA`
+#### Next code item — `QSA_SCORE_WMMA`
 
-The reference scores the prefill in `min(n_tokens, 512)`-token strips and, per strip, trims the scorer
-to the first `(max_query_pos+1)/ratio` blocks — safe because the trimmed blocks are `-inf` in the
-visibility metadata, so the selection cannot change.  Our chain scores the full `n_blocks` every time;
-the indexer score/top-k chain is ~185 ms + the score matmul at pp8192, and the bound roughly halves it.
-
-Port needs:
-* `qsa_position_prefix(ubatch)` + `qsa_prefix_limits(...)` in `llama-memory-hybrid-idx.*`;
-* a `qwen4exp_query_strip()` in `qwen4exp.cpp`;
-* the strip/limits threaded through the QSA graph input + `can_reuse` (the reserve-time synthetic
-  ubatch must stay **unbounded**).
-
-Gate: width probe PASS + same-seed text + A/B at `-b/-ub 4096`.  Then `QSA_SCORE_WMMA` (extend a fused
-score to `n_tps >= 128`, `idx_dim==128`, `n_idx_h==4`; ours is `n_tokens == 1` only — a numerics change,
-so read the reference's op first and gate the width probe + same-seed text).  Full flag table and port
-scoping: [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md).
+The `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` trim is **done** (session 7, `patches/0014`,
+[`2026-09-22-qsa-score-bounds.md`](2026-09-22-qsa-score-bounds.md)).  The remaining prefill-score
+item is `QSA_SCORE_WMMA`: extend a fused WMMA score to `n_tps >= 128`, `idx_dim == 128`,
+`n_idx_h == 4`.  Ours is `n_tokens == 1` only (the decode fused score).  It is a **numerics change**,
+so read the reference's op first and gate it with the width probe + same-seed text — and it composes
+with the trim (the WMMA arm would run on the trimmed width).  Full flag table and port scoping:
+[`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md).
 
 #### What is deliberately NOT being done
 
@@ -818,10 +829,15 @@ The body pinned `f5daaa3cf` (2026-09-12). The branch tip is **`b0f31f587`** (202
    [`2026-09-21-mtp-qualification.md`](2026-09-21-mtp-qualification.md) and §12): our plain decode is
    ahead (+2–6 %), the fixed-depth MTP **speedup is at parity** (ours `n3` 1.90/1.78/2.05 vs its
    1.91/1.79/2.02 on code/prose/recall), and our adaptive wins recall (2.40x) but over-drafts code and
-   prose on qwen4exp — a tuning item, not a structural one.  The one real MTP gap is
-   **`nextn_shared_target_tensors` support**: our build cannot load the shared MTP sidecar its IQ4_NL
-   model ships (every draft position past the first fails an M-RoPE `X < Y` check), so we fell back to
-   the `Q4_K_M` sidecar for the comparison.
+   prose on qwen4exp — a tuning item, not a structural one.  The one real MTP gap was
+   **`nextn_shared_target_tensors` support** — **FIXED 2026-09-22 (session 7, `patches/0015`)**: the
+   MTP driver inferred KV sharing from `ctx_other` alone, but a shared-NextN head only *borrows* the
+   target's `token_embd`/`output`; gated on the `gemma4-assistant` arch, the shared sidecar now runs
+   with 0 draft errors and acceptance 0.287 (previously every draft round past the first failed an
+   M-RoPE `X < Y` check) —
+   [`2026-09-22-mtp-shared-nextn-fix.md`](2026-09-22-mtp-shared-nextn-fix.md).  It is an **upstream
+   bug (#23398)** now delivered in block 00 (release `v16-ebbb18522-r13`); the WIP `patches/0015` is
+   superseded.
 
 ### D. Body §6/§9 caveat
 
@@ -1290,10 +1306,13 @@ Two findings, and one correction to the premise:
   **recall** (2.34–2.40x) but over-drafts code and prose at `n_max 9..12` (code `adaptive 12`
   per-position acceptance falls 0.94 → 0.45 → 0.22 → 0.07); `adaptive 7` already beats `n3` on code
   (63.1 vs 61.4 t/s).  So the qwen4exp adaptive **ceiling is a tuning item**, not a structural gap.
-* **The one real MTP gap is correctness/compat, not speed: `nextn_shared_target_tensors`.**  The sidecar
-  the other solution's IQ4_NL model ships is a *shared* MTP head; our build fails every draft position past the
-  first on an M-RoPE `X < Y` check, so the head cannot be used at all.  The comparison above used the
-  non-shared `Q4_K_M` sidecar, which both trees run clean.
+* **The one real MTP gap was correctness/compat, not speed: `nextn_shared_target_tensors`.**
+  **FIXED 2026-09-22 (session 7, `patches/0015`)**: the sidecar the other solution's IQ4_NL model ships
+  is a *shared* MTP head; the MTP driver inferred KV sharing from `ctx_other` alone, took the gemma4
+  arm, re-used one position for every draft token and died on the M-RoPE `X < Y` check on the second
+  step.  Gating `is_mem_shared` on the `gemma4-assistant` arch fixes it (0 draft errors, acceptance
+  0.287) — [`2026-09-22-mtp-shared-nextn-fix.md`](2026-09-22-mtp-shared-nextn-fix.md).  The comparison
+  above used the non-shared `Q4_K_M` sidecar, which both trees run clean.
 
 ### 12.1 Structural standing
 

@@ -18,11 +18,13 @@ moved here and updated 2026-09-21.
 | [`2026-09-22-ubatch-8192-memory-confound.md`](2026-09-22-ubatch-8192-memory-confound.md) | **Methodology finding:** `-ub 8192` runs at 2–3 GB free with ~40 % more reclaim, which can bias an A/B whose arms differ in graph-shape memory; use **`-b/-ub 4096`** for A/B.  The prior rejections audited (the shipped wins are unaffected). |
 | [`2026-09-22-qsa3-visibility-fold.md`](2026-09-22-qsa3-visibility-fold.md) | Phase-1 item 6: fold the per-cell QSA visibility into `umask` at merge time (drops the hot-loop check), **bit-identical**, **+2.4 % pp8192 / +1.7 % pp32768**; the QSA pipeline is now 50 ms ahead of the reference's. |
 | [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md) | Phase-1 item 7: keep the `M=4` HC inject out of the 384-row tall MMB tile (the tall kernel ran 2× the dispatches), **bit-identical**, **+0.8 % pp8192 / +1.1 % pp32768**. |
-| [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md) | Phase-1 item 8 (**closed**): 7/9 QSA graph flags are present/superseded in our block-14/15 QSA; **2 are un-ported prefill-score optimizations** (`QSA_SCORE_BOUNDS`+`QSA_QUERY_STRIP`, `QSA_SCORE_WMMA`) — the next follow-ups. |
+| [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md) | Phase-1 item 8 (**closed**): 7/9 QSA graph flags are present/superseded in our block-14/15 QSA; `QSA_SCORE_BOUNDS`+`QSA_QUERY_STRIP` is now ported (session 7), leaving `QSA_SCORE_WMMA` — the last follow-up. |
 | [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md) | Phase-1 item 16: the HC BF16 streams (`blk16`/`res16`) ported **default OFF**, default byte-identical, **+4.9 % pp8192 / +4.8 % pp32768** at `-b/-ub 4096`; `res16` is the dominant half.  The MoE-merge `ffn_out` ADD stays F32 because it is not adjacent to the reduction chain — and the reference's merge path is equally dormant on qwen4exp (same builder), so it is not a gap against it. |
 | [`2026-09-22-mmb-cvt-out-xn.md`](2026-09-22-mmb-cvt-out-xn.md) | The `mmb_cvt_f32_bf16` gap: the fused combine now emits the BF16 `out_xn` copy the graph already marks (81 % of the traffic; the allocator reuses one `hc_norm` buffer so the cache cannot dedupe), **bit-identical**, **+3.3 % pp8192 / +3.2 % pp32768** at `-b/-ub 4096`. |
 | [`2026-09-22-idx-relu-sum.md`](2026-09-22-idx-relu-sum.md) | The prefill indexer relu+head-sum fusion (`idx-relu-sum`): one kernel replaces the relu + CONT + ADD chain (our L2a relu-before-reshape form), **bit-identical**, **+1.8 % pp32768** at `-b/-ub 4096`. |
-| [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..ac391cf4f`, `0001..0013`) exported as patches, so the code work survives a fork reset. |
+| [`2026-09-22-qsa-score-bounds.md`](2026-09-22-qsa-score-bounds.md) | Phase-1 item 15: the QSA prefill scorer trim (`QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`) ported to the fused top-k (cell range clamped to `n_blocks*ratio`), default strip 1024, **bit-identical**, **+0.5 % pp8192 / neutral pp32768** at `-b/-ub 8192`; the `-inf`-padded first cut was a wash. |
+| [`2026-09-22-mtp-shared-nextn-fix.md`](2026-09-22-mtp-shared-nextn-fix.md) | **Correctness fix, delivered in block 00 (r13)**: a shared-NextN MTP head (`nextn_shared_target_tensors`, the IQ4_NL shared Q8_0 sidecar) died every round on the M-RoPE `X < Y` check because `is_mem_shared` was inferred from `ctx_other` alone; gated on the `gemma4-assistant` arch.  0 errors, acceptance 0.287.  Upstream bug (#23398) folded into the block-00 base; the WIP `patches/0015` is superseded. |
+| [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..00d8bbbc9`, `0001..0015`) exported as patches, so the code work survives a fork reset.  **`0015` (the shared-NextN MTP fix) is superseded by delivery r13 block 00** — skip it when rebuilding this campaign on the r13 delivery. |
 
 ## The two moving references this file tracks
 
@@ -35,7 +37,7 @@ moved here and updated 2026-09-21.
 
 ## Current "our side" build state
 
-* `~/llama.cpp` branch **`gap-closing`** @ **`ac391cf4f`** = `mmb-beta` (r12 `72176ae8a` + the 12
+* `~/llama.cpp` branch **`gap-closing`** @ **`00d8bbbc9`** = `mmb-beta` (r12 `72176ae8a` + the 12
   `beta/mmb-general/patches/*.patch`, tree `bca69f23dd…`) + the 2026-09-21/22 changes: **default-on
   policy** (MMB/HC16/matcher), the `hc_combine_norm` matcher revival, the **`hc_gate_mix` fusion**
   (session 2), the **depthwise conv1d fusions** (session 3), the **QSA block-window fix** (session 3,
@@ -43,13 +45,14 @@ moved here and updated 2026-09-21.
   (session 4, item 6), the **tall-tile min-M** fix (session 4, item 7), the **`-lzm auto` semantics**
   + managed PLE reader gated OFF (session 5), the **MoE BF16 epilogue** gated OFF (session 5), the
   **HC BF16 streams** gated OFF (session 6, item 16), the **`mmb_cvt`/`out_xn` fix** default ON
-  (session 6, `patches/0012`), and the **prefill indexer relu-sum** default ON (session 6,
-  `patches/0013`), plus env-gated debug traces.  **Current product:** qwen4exp IQ4_NL, gfx1151,
-  `-b 8192 -ub 8192` with `LLAMA_HC_BLK16=1 LLAMA_HC_RES16=1` = **1379 / 1320 t/s** (pp8192 /
-  pp32768); the default build at `-b/-ub 4096` = 1308 / 1270.
+  (session 6, `patches/0012`), the **prefill indexer relu-sum** default ON (session 6,
+  `patches/0013`), and the **QSA prefill scorer trim** default ON (session 7, `patches/0014`), plus
+  env-gated debug traces.  **Current product:** qwen4exp IQ4_NL, gfx1151,
+  `-b 8192 -ub 8192` with `LLAMA_HC_BLK16=1 LLAMA_HC_RES16=1` = **~1379 / 1320 t/s** (pp8192 /
+  pp32768, plus the trim's ~+0.5 % pp8192); the default build at `-b/-ub 4096` = ~1308 / 1270.
 * Built on this box (gfx1151) with `~/bin/build-llama-rocm-714`.  **All beneficial features are on by
   default** (see the `AGENTS.md` default-on policy); env vars only disable.
-* The thirteen `gap-closing` commits (`0001..0013`) are exported to [`patches/`](patches/) in case the
+* The fourteen `gap-closing` commits (`0001..0014`) are exported to [`patches/`](patches/) in case the
   local fork branch is lost.
 
 To reproduce:
@@ -59,7 +62,8 @@ cd ~/llama.cpp
 git checkout rdna-boosts && git branch -D mmb-beta gap-closing 2>/dev/null
 git checkout -b gap-closing
 git am /home/stew675/llama-cpp-rdna-boosts/beta/mmb-general/patches/*.patch
-git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip ac391cf4f
+# NOTE: 0015 (shared-NextN MTP fix) is in delivery r13 block 00; drop it when rebuilding on r13
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 00d8bbbc9
 ~/bin/build-llama-rocm-714
 ```
 
@@ -91,8 +95,13 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch  
    [`2026-09-22-mmb-cvt-out-xn.md`](2026-09-22-mmb-cvt-out-xn.md).
    **The prefill indexer relu-sum is DONE too (session 6, `patches/0013`)** — bit-identical, pp32768
    **+1.8 %** — [`2026-09-22-idx-relu-sum.md`](2026-09-22-idx-relu-sum.md).
-   **Next code item — the `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` prefill-score trim**, then
-   `QSA_SCORE_WMMA` (see the NEXT SESSION block of [`closing-the-gap.md`](closing-the-gap.md)).
+   **The `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` prefill-score trim is DONE (session 7,
+   `patches/0014`, default ON)** — the reference's causal scorer bound ported to the fused top-k
+   design (cell range clamped to `n_blocks*ratio`), default strip 1024, bit-identical, **+0.5 %
+   pp8192 / neutral pp32768** at `-b/-ub 8192` —
+   [`2026-09-22-qsa-score-bounds.md`](2026-09-22-qsa-score-bounds.md).
+   **Next code item — `QSA_SCORE_WMMA`** (see the NEXT SESSION block of
+   [`closing-the-gap.md`](closing-the-gap.md)).
    The full session-5 finding (throughput A/B, memory accounting, family diff) is in
    [`closing-the-gap.md`](closing-the-gap.md#session-5-finding-2026-09-22--fresh-target-ubatch-profile-memory-accounting-refined-tasks).
 
@@ -151,8 +160,13 @@ MTP tuning + correctness.**
     [`2026-09-22-idx-relu-sum.md`](2026-09-22-idx-relu-sum.md).  The matcher anchors at the relu and
     accepts our L2a relu-before-the-4-D-reshape form (the head views' `view_src` is the relu while
     their strides come from the reshape).  RDNA3_5-gated like the reference.
-15. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` — the item-8 follow-ups; the trim is
-    coupled to the reference's complete-block selection, which our fused cell top-k lacks.
+15. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` — **DONE 2026-09-22 (session 7, `patches/0014`), default
+    ON, bit-identical**: the trim is coupled to the reference's complete-block selection, which our
+    fused cell top-k lacks, so it is delivered by clamping the fused top-k's cell range to
+    `n_blocks*ratio` instead of trimming the block map.  Default strip 1024, +0.5 % pp8192 / neutral
+    pp32768 at `-b/-ub 8192`.  The `-inf`-padded first cut (no kernel change) was a wash —
+    [`2026-09-22-qsa-score-bounds.md`](2026-09-22-qsa-score-bounds.md).  **Remaining: `QSA_SCORE_WMMA`
+    (the item-8 follow-up), a numerics change with its own width-probe/same-seed gate.**
 16. **BF16 HC streams** (`blk16`/`res16`) — **DONE 2026-09-22 (session 6, `patches/0011`),
     default OFF**: +4.9 % pp8192 / +4.8 % pp32768 at `-b/-ub 4096`, default build byte-identical —
     [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md).  `res16` is the dominant half;
@@ -167,8 +181,15 @@ MTP tuning + correctness.**
 
 **Phase 3 — MTP tuning + correctness** (parked)
 
-12. Add `nextn_shared_target_tensors` support — we currently cannot load the shared MTP sidecar
-    the other solution's IQ4_NL model ships (draft decode fails on an M-RoPE `X < Y` check).
+12. Add `nextn_shared_target_tensors` support — **DONE 2026-09-22 (session 7, `patches/0015`), a
+    correctness fix**: the shared-NextN MTP sidecar (the other solution's IQ4_NL model ships
+    `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`) failed every draft round on an M-RoPE `X < Y` check
+    because the MTP driver inferred KV sharing from `ctx_other` alone; the guard is now gated on the
+    `gemma4-assistant` arch (tensor sharing and memory sharing are different).  0 draft errors,
+    acceptance 0.287, adaptive depth transitions restored —
+    [`2026-09-22-mtp-shared-nextn-fix.md`](2026-09-22-mtp-shared-nextn-fix.md).  **The bug is upstream
+    (#23398) and is now delivered in the delivery set as block 00 (release `v16-ebbb18522-r13`)** — the
+    WIP `patches/0015` is superseded, so a campaign rebuilt on r13 must not apply it.
 11. qwen4exp adaptive ceiling sweep (3/5/7/9/12) — fixed-depth MTP is at parity with its, adaptive wins
     recall but over-drafts code/prose at `n_max 12`.
 

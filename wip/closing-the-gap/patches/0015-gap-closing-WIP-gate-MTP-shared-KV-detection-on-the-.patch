@@ -1,0 +1,55 @@
+From 00d8bbbc9c5c436ac7734f3c9c22081051f792ef Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 22 Sep 2026 13:10:57 -0500
+Subject: [PATCH] gap-closing WIP: gate MTP shared-KV detection on the
+ gemma4-assistant arch
+
+A shared-NextN MTP head (nextn_shared_target_tensors, e.g. the qwen4exp
+mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf sidecar) ships no token_embd/output and
+borrows the target's, so llama_init_from_model sets cparams.ctx_other = ctx_tgt
+to satisfy the EAGLE3/DFLASH/QWEN4EXP tensor-sharing path.  The MTP draft driver
+inferred is_mem_shared purely from ctx_other == ctx_tgt, so it took the gemma4
+shared-KV arm: it re-added every draft token at the same position and skipped the
+catch-up decode, and the second draft step died every round with
+
+  init: ... last position ... X = N ... starting position Y = N
+        for M-RoPE, it is required that the position satisfies: X < Y
+  spec draft: llama_decode[1] returned -1
+
+so a draft never exceeded one token and acceptance was ~0.
+
+ctx_other is set for two different reasons; only gemma4-assistant actually shares
+the target KV.  Gate is_mem_shared on the arch as well (the reference's fix).
+Fixes the shared-NextN MTP head on qwen4exp: 0 errors, qwen4exp IQ4_NL +
+shared-Q8_0 head acceptance 0.287 (acc per pos 0.679/0.462/0.333...), and the
+adaptive path reports real depth transitions.
+
+This is a delivery bug in block 01 (rdna-boosts has the same one-line inference);
+it should be backported there.
+---
+ common/speculative.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index c711c30d0..145ffa9b1 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1437,7 +1437,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+ 
+-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
++        // ctx_other is set for two different reasons: gemma4 assistants share the target KV, while
++        // qwen4exp/eagle3/dflash shared-NextN heads only borrow the target's token_embd/output
++        // (nextn_shared_target_tensors) and keep their own KV.  Only the former may reuse the target
++        // position for every draft token and skip the catch-up decode; gating on the arch (not just
++        // ctx_other) is what keeps a shared MTP head on the normal incrementing-position path.
++        char arch[64] = {0};
++        llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
++        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
+         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+ 
+         // remember the user n_max: chain_heads caps it at the model MTP layer
+-- 
+2.55.0
+
