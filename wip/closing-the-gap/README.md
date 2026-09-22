@@ -17,6 +17,7 @@ moved here and updated 2026-09-21.
 | [`2026-09-22-norm-rows-fusion.md`](2026-09-22-norm-rows-fusion.md) | Phase-1 item 4: the narrow-row RMS norm (`norm-gated.cu::rms_rows_f32`, 8 rows/block) ported default-on, **bit-identical** (width probe PASS, same-seed text `f61199ba5644`), ~+0.3 % at `-ub 4096`. |
 | [`2026-09-22-ubatch-8192-memory-confound.md`](2026-09-22-ubatch-8192-memory-confound.md) | **Methodology finding:** `-ub 8192` runs at 2–3 GB free with ~40 % more reclaim, which can bias an A/B whose arms differ in graph-shape memory; use **`-b/-ub 4096`** for A/B.  The prior rejections audited (the shipped wins are unaffected). |
 | [`2026-09-22-qsa3-visibility-fold.md`](2026-09-22-qsa3-visibility-fold.md) | Phase-1 item 6: fold the per-cell QSA visibility into `umask` at merge time (drops the hot-loop check), **bit-identical**, **+2.4 % pp8192 / +1.7 % pp32768**; the QSA pipeline is now 50 ms ahead of the reference's. |
+| [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md) | Phase-1 item 7: keep the `M=4` HC inject out of the 384-row tall MMB tile (the tall kernel ran 2× the dispatches), **bit-identical**, **+0.8 % pp8192 / +1.1 % pp32768**. |
 | [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..1004c65db`) exported as patches, so the code work survives a fork reset. |
 
 ## The two moving references this file tracks
@@ -30,15 +31,15 @@ moved here and updated 2026-09-21.
 
 ## Current "our side" build state
 
-* `~/llama.cpp` branch **`gap-closing`** @ **`565a56dbc`** = `mmb-beta` (r12 `72176ae8a` + the 12
+* `~/llama.cpp` branch **`gap-closing`** @ **`6e5f34ebf`** = `mmb-beta` (r12 `72176ae8a` + the 12
   `beta/mmb-general/patches/*.patch`, tree `bca69f23dd…`) + the 2026-09-21/22 changes: **default-on
   policy** (MMB/HC16/matcher), the `hc_combine_norm` matcher revival, the **`hc_gate_mix` fusion**
   (session 2), the **depthwise conv1d fusions** (session 3), the **QSA block-window fix** (session 3,
-  `b0f31f587`), the **narrow-row RMS norm fusion** (session 4), and the **QSA visibility fold**
-  (session 4, item 6), plus env-gated debug traces.
+  `b0f31f587`), the **narrow-row RMS norm fusion** (session 4), the **QSA visibility fold**
+  (session 4, item 6), and the **tall-tile min-M** fix (session 4, item 7), plus env-gated debug traces.
 * Built on this box (gfx1151) with `~/bin/build-llama-rocm-714`.  **All beneficial features are on by
   default** (see the `AGENTS.md` default-on policy); env vars only disable.
-* The seven `gap-closing` commits (`0001..0007`) are exported to [`patches/`](patches/) in case the local
+* The eight `gap-closing` commits (`0001..0008`) are exported to [`patches/`](patches/) in case the local
   fork branch is lost.
 
 To reproduce:
@@ -48,7 +49,7 @@ cd ~/llama.cpp
 git checkout rdna-boosts && git branch -D mmb-beta gap-closing 2>/dev/null
 git checkout -b gap-closing
 git am /home/stew675/llama-cpp-rdna-boosts/beta/mmb-general/patches/*.patch
-git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 565a56dbc
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 6e5f34ebf
 ~/bin/build-llama-rocm-714
 ```
 
@@ -67,8 +68,7 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch  
    head-to-head baseline (ours 1212.6 vs its 1346.5 at pp8192, ~10 % behind before items 1+2).
 3. **Phase-1 item 2 — depthwise conv1d — DONE 2026-09-21 (session 3)**; **item 3.5 QSA correctness
    — CLOSED 2026-09-22 (session 4)**: `b0f31f587` ported (`patches/0005`), the other two fixes audited
-   **N/A**.  The **next code item** is **item 7** (the tall `384x64` 2× launch count), then **item 8**
-   (audit the QSA graph-side flags).
+   **N/A**.  The **next code item** is **item 8** (audit the QSA graph-side flags vs block-14/15).
 
 ## The current open list (see §13 of the doc)
 
@@ -99,7 +99,9 @@ MTP tuning + correctness.**
    [`2026-09-22-norm-rows-fusion.md`](2026-09-22-norm-rows-fusion.md), `patches/0006`.  `idx-relu-sum`
    was already banked by our fused indexer score.  **Item 6 (`qsa3_attn` body) is DONE 2026-09-22
    (session 4)** — bit-identical, +2.4 %/+1.7 % — [`2026-09-22-qsa3-visibility-fold.md`](2026-09-22-qsa3-visibility-fold.md),
-   `patches/0007`; **the next kernel item is item 7** (tall tile) / item 8 (QSA flags).
+   `patches/0007`; **item 7 (tall-tile min-M) is DONE 2026-09-22 (session 4)** — bit-identical,
+   +0.8 %/+1.1 % — [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md), `patches/0008`;
+   **the next kernel item is item 8** (audit the QSA graph-side flags).
    **Item 1's `hc_combine_norm_f32` `_b256` swap stays CLOSED NEGATIVE** — not bit-identical (it changes
    the greedy text, deterministically), so the rejection does not rest on timing; see
    [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md).

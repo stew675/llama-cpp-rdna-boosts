@@ -56,8 +56,11 @@
   (width probe PASS, text `f61199ba5644`), `qsa3_attn_kernel` 809.6 -> 672.9 ms, **+2.4 % pp8192 /
   +1.7 % pp32768** at `-ub 4096`; the QSA pipeline is now 50 ms ahead of the reference's —
   [`2026-09-22-qsa3-visibility-fold.md`](2026-09-22-qsa3-visibility-fold.md).
-* **Next: Phase-1 item 7** (the tall `384x64` 2× launch count, part of the +809 ms dense gap), then
-  item 8 (audit the 9 QSA graph-side flags vs block-14/15).
+* **Phase-1 item 7 (tall-tile min-M) DONE** (session 4, `patches/0008`): the M=4 HC inject no longer
+  takes the 384-row tall tile (it ran 2× the dispatches of the reference); **bit-identical** (text
+  `f61199ba5644`), tall `384,64` 1030/380 -> 540/190 ms, **+0.8 % pp8192 / +1.1 % pp32768** at `-ub 4096`
+  — [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md).
+* **Next: Phase-1 item 8** — audit the 9 QSA graph-side flags vs block-14/15 (small / likely redundant).
 
 ### Do these in order
 
@@ -69,8 +72,8 @@
    Already green (sessions 2-3): `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA` 26/26,
    `FLASH_ATTN_EXT` 5955/0, width probe PASS on 27B + qwen4exp + 35B-A3B, conv fused==unfused row-0
    hashes.
-2. **Next code item — Phase-1 item 7** (the tall `384x64` 2× launch count; items 3.5, 4 and 6 are done).
-   Then item 8 (audit the QSA graph-side flags).
+2. **Next code item — Phase-1 item 8** (audit the QSA graph-side flags vs block-14/15; items 3.5, 4, 6
+   and 7 are done).
 3. **Use `-b/-ub 4096` for perf A/Bs** (session-4 methodology finding).  The `-ub 8192` absolute target
    is fine for a single number, but an A/B whose arms change the graph's memory footprint compares two
    pressure regimes there.  Record the min free memory with any `-ub 8192` result.
@@ -131,7 +134,7 @@ re-checking.  One defensive note for a future change: the VEC QSA kernel derefer
 `cell_vis` is null, so a change that could make both null would fault — add the reference's assert (or
 enforce `mask || cell_vis` in `ggml_cuda_flash_attn_qsa`) at that point.
 
-### Next item — Phase-1 item 4 (DONE) and item 6 (DONE); item 7 is next
+### Next item — item 4, 6, 7 DONE; item 8 is next
 
 **Item 4 is DONE (session 4, `patches/0006`).**  The narrow-row RMS norm (`norm-gated.cu::rms_rows_f32`,
 8 rows/block) is ported, default-on and bit-identical; ~+0.3 % at the clean `-b/-ub 4096` protocol —
@@ -143,18 +146,22 @@ does not.  Folding it into `umask` at merge time (where the bit already exists a
 is bit-identical and drops the check from the hot loop: `qsa3_attn_kernel` 809.6 -> 672.9 ms, +2.4 %/+1.7 %
 end-to-end — [`2026-09-22-qsa3-visibility-fold.md`](2026-09-22-qsa3-visibility-fold.md).
 
-**Item 7 is next.**  The tall `384x64` dense MMB tile launches twice as often as the reference's (the
-+809 ms dense family gap).  Profile both builds' `mmb_dense_kernel<384,64,96,32,0>` launch counts and
-geometry at the same config, then port the launch-count difference **keeping the MMB bit-identity gate**
-(width probe + same-seed text + an A/B at `-ub 4096`).
+**Item 7 is DONE (session 4, `patches/0008`).**  The tall `384x64` tile's 2× launch count was the `M=4`
+HC inject sharing the tile with the `M=320` down; the gate is now `M >= 16`, so the inject takes the dense
+tile — bit-identical, +0.8 %/+1.1 % — [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md).
+
+**Item 8 is next.**  Audit the reference's 9 QSA graph-side flags (`LLAMA_QSA_*`) against what our
+block-14/15 QSA already does, and record each as present / superseded / N/A.  This is an audit, not a
+port; the QSA correctness work (item 3.5) already showed our derived-visibility design subsumes several
+of them.
 
 ### Current state (exact)
 
 | what | where / value |
 |---|---|
-| fork `~/llama.cpp` | branch **`gap-closing`** @ **`565a56dbc`** = r12 + the 12 `beta/mmb-general` patches + the 7 gap-closing commits |
+| fork `~/llama.cpp` | branch **`gap-closing`** @ **`6e5f34ebf`** = r12 + the 12 `beta/mmb-general` patches + the 8 gap-closing commits |
 | fork build | `~/llama.cpp/build-rocm` (gfx1151, ROCm 7.14), full feature set **default** |
-| this repo | branch `gap-closing` (published to `origin`), `wip/closing-the-gap/patches/0001..0007` |
+| this repo | branch `gap-closing` (published to `origin`), `wip/closing-the-gap/patches/0001..0008` |
 | the other solution | `~/pwilkin-llama-cpp` @ `b0f31f587`, `build-rocm` |
 | model | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (93 GiB, qwen4exp) |
 | MoE test model | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf` |
@@ -162,7 +169,7 @@ geometry at the same config, then port the launch-count difference **keeping the
 
 Rebuild: `cd ~/llama.cpp && ~/bin/build-llama-rocm-714`.  Runtime:
 `export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH; export HIP_VISIBLE_DEVICES=0`.
-The seven `gap-closing` fork commits are exported to [`patches/`](patches/) so the code survives a fork
+The eight `gap-closing` fork commits are exported to [`patches/`](patches/) so the code survives a fork
 reset.
 
 ### What NOT to redo (session-3 conclusions)
@@ -1054,7 +1061,7 @@ body, (7) tall tile, (8) QSA graph flags; items 1–9 survive, regrouped below.
 | 4 | Port `norm-gated.cu` (`rms_rows`) + `idx-relu-sum.cu` | −2.9 % / −1.3 % | 1–2 d | **DONE 2026-09-22 (session 4)**: `rms_rows` ported default-on, bit-identical, ~+0.3 % at `-ub 4096` — [`2026-09-22-norm-rows-fusion.md`](2026-09-22-norm-rows-fusion.md), `patches/0006`.  `idx-relu-sum` was already banked by our fused indexer score |
 | 5 | MoE: bf16 epilogue + drop `concat_transposed` | ~+466 ms kernel (~3–4 %) | 1–2 d | beta has `MMB_DOWN16` gated off; wire it + the bf16 reduction |
 | 6 | Tune/port-align `qsa3_attn` body vs `qsa.cu` | ~+195 ms (~1.5 %) | 1–2 d | **DONE 2026-09-22 (session 4)**: the gap was the per-cell `cell_vis` check, not geometry; folded into `umask` at merge time, bit-identical, `qsa3_attn` 809.6 -> 672.9 ms, +2.4 %/+1.7 % — [`2026-09-22-qsa3-visibility-fold.md`](2026-09-22-qsa3-visibility-fold.md), `patches/0007` |
-| 7 | Investigate the tall `384x64` 2× launch count | unknown (part of +809) | 0.5–1 d | |
+| 7 | Investigate the tall `384x64` 2× launch count | unknown (part of +809) | 0.5–1 d | **DONE 2026-09-22 (session 4)**: the 2× was the M=4 HC inject admitted by the tall gate; a min-M bound keeps it on the dense tile, bit-identical, +0.8 %/+1.1 % — [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md), `patches/0008` |
 | 8 | Audit the 9 QSA graph-side flags vs block-14/15 | small / likely redundant | 0.5 d | |
 
 Items 1+2 remain ~30 % of end-to-end prefill on the other solution's ablations.
