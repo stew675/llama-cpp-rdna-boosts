@@ -24,12 +24,14 @@
   default-on, **bit-identical** (fused == unfused row-0 logits hash + width probe PASS) and
   **+3.0/+3.2 %** on qwen4exp IQ4_NL, **+6.5/+7.1 %** on 35B-A3B (pp8192/32768, `-ub 8192`).  Fork tip
   **`1004c65db`**, exported as **`patches/0004`** — [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md).
-* **Next: the `hc_combine_norm_f32` `_b256` kernel swap** (item 1's follow-up) — the faster form of the
-  matcher we revived, worth closing most of the `rms_norm_f32<1024,true> 622 ms + dsv4_hc_post 739 ms`
-  gap.  Then Phase-1 item 3.5 (the three QSA correctness fixes — now scoped as an **audit**, see
-  [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md)) and item 4
-  (`norm-gated.cu`, ~1.2 % on our tree; `idx-relu-sum` is already banked by our fused indexer score).
-  Items 5 (MoE bf16 epilogue) and 6 (`qsa3_attn` body) follow.
+* **Phase-1 item 1's `_b256` follow-up is CLOSED NEGATIVE** (session 3): the reference's
+  `hc_combine_norm_f32_b256` was ported and gated, but it is **not bit-identical** (the 256-thread
+  reduction changes the greedy text: `1b59d651f2c3` → `fc7c8a10ea45`) and **0.7–0.8 % slower** on
+  gfx1151/qwen4exp, so it was reverted — [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md).
+* **Next: Phase-1 item 5** (MoE bf16 epilogue + drop `concat_transposed`, ~3–4 %; beta's `MMB_DOWN16`
+  is gated off) or **item 4** (`norm-gated.cu`, ~1.2 %; `idx-relu-sum` is already banked by our fused
+  indexer score) — the same "does it replay our reduction order?" gate applies to `rms_rows`.  Item 3.5
+  (the three QSA correctness fixes) stays an **audit**.
 
 ### Do these in order
 

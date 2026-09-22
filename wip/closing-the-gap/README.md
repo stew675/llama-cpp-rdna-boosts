@@ -81,8 +81,10 @@ MTP tuning + correctness.**
 3.5. Port the other solution's three correctness fixes (`40c0b9c38`, `b0f31f587`, `14fff4f97`).
 4. `norm-gated.cu` (~1.2 % on our tree) + `idx-relu-sum.cu` (**already banked** by our fused indexer
    score — see the item-4 assessment in [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md)).
-   The highest-value next kernel item is the **`hc_combine_norm_f32` `_b256` swap** (item 1's
-   follow-up).
+   **Item 1's `hc_combine_norm_f32` `_b256` swap is CLOSED NEGATIVE** — not bit-identical (it changes
+   the greedy text) and 0.7–0.8 % slower on gfx1151/qwen4exp, so it was reverted; see
+   [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md).  The next kernel item is
+   therefore **item 5** (MoE bf16 epilogue + drop `concat_transposed`).
 5. MoE bf16 epilogue + drop `concat_transposed` (beta's `MMB_DOWN16` is gated off).
 
 **Phase 2 — decode speed + correctness**

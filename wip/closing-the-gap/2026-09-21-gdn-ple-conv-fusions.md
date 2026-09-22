@@ -92,12 +92,11 @@ profile).  The qwen35moe win is larger because every layer carries a GDN conv th
   `rms_norm_f32<256,{true,false}>` (288.8 + 148.8 ms), while the reference's `rms_rows_f32` pair is
   220.0 + 82.7 ms — about 135 ms (~1.2 %) on the whole process.  Worth doing, but behind the
   `hc_combine_norm_f32` kernel swap below.
-* **The obvious next kernel item is the `hc_combine_norm_f32` `_b256` swap** (item 1's follow-up):
-  the reference's `hc-cn.cu::hc_combine_norm_f32_b256` (256 threads, two packed elements/thread) is
-  the faster form of the same matcher we revived; it is the concrete difference behind the profile's
-  `rms_norm_f32<1024,true> 622 ms + dsv4_hc_post 739 ms` vs the reference's `hc_combine_norm_f32_b256
-  554 ms + hc_gate_mix 408 ms`.  It must be checked for bit-identity against the current
-  `hc_combine_norm_f32` before it can be defaulted.
+* **Item 1's `hc_combine_norm_f32` `_b256` swap is CLOSED NEGATIVE** (session 3, after this record was
+  written): the reference's `_b256` was ported and gated, but it is **not bit-identical** (the
+  256-thread RMS reduction changes the greedy text `1b59d651f2c3` → `fc7c8a10ea45`) and **0.7–0.8 %
+  slower** on gfx1151/qwen4exp, so it was reverted — [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md).
+  The next kernel item is **item 5** (MoE bf16 epilogue).
 * **Item 3.5 (the three QSA correctness fixes) is an audit, not a cherry-pick.**  `40c0b9c38`
   (maskless only where qsa3 consumes it) and `14fff4f97` (-1 sentinel) are about the reference's
   `qwen4exp_select_complete_blocks` / qsa3-cell selection; `b0f31f587` sizes the block window by the
