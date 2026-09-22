@@ -1,6 +1,6 @@
 # Closing the gap — `beta/mmb-general` vs the other solution's `strix-halo` prefill
 
-**Date:** 2026-09-20 (snapshot) · **updated:** 2026-09-21
+**Date:** 2026-09-20 (snapshot) · **updated:** 2026-09-21 (end of session 2)
 **Box:** `halo` — Strix Halo, Radeon 8060S (gfx1151, RDNA3_5), ROCm 7.14 (`/opt/rocm-7.14-gfx1151`), 123 GiB RAM / 124 GB unified VRAM
 **Scope:** a 1:1 prefill comparison on **the other solution's uniform-IQ4_NL model** (not just our mixed UD-IQ4_XS), a kernel-level profile diff on the uniform model, and a gate-ablation of the other solution's stack on this box to price the still-missing families. This is an investigation record, not a delivery change.
 
@@ -9,30 +9,78 @@
 
 ---
 
-## START HERE — fresh-session handover (state as of 2026-09-21, end of session)
+## START HERE — fresh-session handover (end of session 2, 2026-09-21)
+
+### Where we are, in four lines
+
+* **Target is `-b 8192 -ub 8192`** — not 16384.  `-ub 16384` is root-caused and parked (below); do not
+  spend time on it unless the PLE-lazy fix is picked up.
+* At a **matched** ubatch we are **~10 % behind at pp8192 / ~15 % behind at pp16384** on the uniform
+  IQ4_NL model.  That is the number the §13 phase plan exists to close.
+* **Phase-1 item 1 (HC fusions) is DONE** (session 2): `hc_combine_norm` matcher revived (+1.5 %) and
+  `hc_gate_mix` wired, default-on (+1.2–1.5 %) — both width-pure and same-seed-text identical.  Fork tip
+  **`94694a38e`**, exported as **`patches/0003`**.
+* **Next: Phase-1 item 2 — the depthwise conv1d** (`gdn-conv.cu` + `ple-conv.cu`, worth **−10.5 %** on
+  the other solution's ablation).  Scoping notes below.
 
 ### Do these in order
 
-1. **Run the full `beta/mmb-general` BETA-TESTING gate suite on the current default build.**  The build
-   now has every beneficial feature **on by default**, so the gates run against the real product, not an
-   under-enabled binary.  See [`../../beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md);
-   the semantics changed — **Gate 1 is now `GGML_CUDA_MMB=0`** (MMB off byte-identical to r12), **Gate 2 is
-   the default** (no env).  Also run the width probe and the MTP gate.  Until every gate is green, do not
-   promote and do not trust performance numbers as "the product".
-2. **Target `-ub 8192`, not `-ub 16384` (decision 2026-09-21, see the section below).**  The `-ub 16384`
-   context-creation failure is **root-caused and deferred** — it is a fundamental clash between the
-   compute reserve (the full-vocab `result_output` plus qwen4exp's HC `block_out`/`inject` pin, ~33 GiB)
-   and the resident PLE table (~27 GiB host), not an MMB/HC bug.  `-b 8192 -ub 8192` runs clean and is
-   the reproducible target; use it for all head-to-head work and reserve the 16k regime for a later
-   session.  Root cause + the two candidate fixes are in the section below.
-3. **Only then** resume the "where are we still slower" investigation (body §13 phase plan) against the
-   **ubatch-8192** baseline established below.
+1. **Run the full `beta/mmb-general` BETA-TESTING gate suite on the current default build.**  The default
+   now also has `hc_gate_mix` on (new in session 2), so the gates must be re-run against the real
+   product.  See [`../../beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md);
+   semantics changed — **Gate 1 is `GGML_CUDA_MMB=0`** (MMB off byte-identical to r12), **Gate 2 is the
+   default** (no env).  Also run the width probe and the MTP gate.  Until every gate is green, do not
+   promote and do not trust performance numbers as "the product".  (Session 2 already ran the
+   deterministic oracles and the width probe: `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA` 26/26,
+   `FLASH_ATTN_EXT` 5955/0, width probe PASS on 27B + qwen4exp; the MTP gate and the MMB-off byte check
+   are still owed.)
+2. **Reproduce the ubatch-8192 baseline** (below) before changing anything, so the item-2 delta is
+   measurable.
+3. **Start Phase-1 item 2** (depthwise conv1d).  Everything else in the phase plan is smaller; see the
+   §13 table for the ranking.
+
+### Rebuild / run (copy-paste)
+
+```sh
+cd ~/llama.cpp && ~/bin/build-llama-rocm-714                      # full build (ccache; ~4 min warm)
+# fast loop:  cmake --build build-rocm --target llama-bench llama-cli -j 16
+export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH; export HIP_VISIBLE_DEVICES=0
+MU=/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf
+MM=/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
+for f in ${MU%/*}/*-0000*.gguf; do cat "$f" >/dev/null; done   # warm page cache first
+# ubatch-8192 baseline (ours, full default set, no env):
+~/llama.cpp/build-rocm/bin/llama-bench -m "$MU" -ngl 99 -fa 1 -ctk f16 -ctv f16 \
+  -b 8192 -ub 8192 -p 2048,8192,16384 -n 0 -r 2
+# the other solution's same-config reference (its launcher env):
+( set -a; . archive/work/wip-archive/iq4nl-prefill/launcher-env.txt; set +a; \
+  ~/pwilkin-llama-cpp/build-rocm/bin/llama-bench -m "$MU" -dev ROCm0 -ngl 999 -fa on \
+  -lm none -lzm on-direct -ctk f16 -ctv f16 -b 8192 -ub 8192 -p 2048,8192,16384 -n 0 -r 2 )
+```
+
+### Phase-1 item 2 scoping (the next task)
+
+The other solution has `ggml/src/ggml-cuda/gdn-conv.cu` (111 lines) and `ple-conv.cu` (182 lines), each
+with a `*_conv_match_at_concat` / `*_conv_match_at_conv` / `*_conv_match_at_tap` matcher plus a
+`*_conv_write_tail` / `*_conv_direct` launcher.  They replace our `build_conv_state` CONCAT +
+`ggml_ssm_conv` (`ssm_conv_long_token_f32`, 303 ms) with a direct kernel that reads `state`+`x` and
+writes the conv output (+ optional silu), and the surrounding concat/transpose/copy traffic disappears.
+Their ablation prices `GDN_CONV`+`PLE_CONV` at **−10.5 %** end-to-end (Appendix B).  Work to do:
+
+1. Read the other solution's `gdn-conv.cu` + `ple-conv.cu` and its `ggml_cuda_try_fuse` call sites
+   (the `GGML_OP_CONCAT` / `GGML_OP_SSM_CONV` / `GGML_OP_CONT` branches at the top of its
+   `ggml_cuda_try_fuse`) — the files are self-contained.
+2. Match **our** graph: our `build_conv_state`/`build_ple` may not present the exact CONCAT/SSM_CONV
+   shape the reference matcher expects; a graph dump (or `LLAMA_DEBUG`-style matcher traces) is the
+   first step.
+3. Port the kernels + matchers, enable default-on (per policy), then gate it: width probe
+   (`test-logits-width-probe` must stay `PASS`, worst maxdiff 0), same-seed greedy text, and the ubatch
+   8192/32768 A/B.  The PLE half is now F32-aware in the reference (its `40a9f4d01`).
 
 ---
 
-## Update 2026-09-21 (later) — ubatch 8192 is the target; the 16k reserve diagnosed and deferred
+## Session-2 record (2026-09-21): ubatch 8192 target, the 16k diagnosis, and the gatemix win
 
-### Decision
+### Decision — ubatch 8192 is the target
 
 Target **`-b 8192 -ub 8192`** for the head-to-head and all further prefill work.  The `-b 16384 -ub 16384`
 regime is parked for a later session.
@@ -40,16 +88,38 @@ regime is parked for a later session.
 Uniform IQ4_NL (the other solution's checkpoint), gfx1151, `-ctk f16 -ctv f16`, `-n 0 -r 2`, ours with
 **no env** (full default set), the other solution with its full launcher env:
 
-| pp | ours, `-ub 8192` | other, `-ub 8192` | ours, `-ub 2048` (old) | other, `-ub 16384` |
+| pp | ours, `-ub 8192` (pre-gatemix) | other, `-ub 8192` | ours, `-ub 2048` (old) | other, `-ub 16384` |
 |---:|---:|---:|---:|---:|
 | 2048  | 1159.1 | 1233.6 | 1181.5 | 1233.0 |
 | 8192  | 1212.6 | 1346.5 | 1149.3 | 1338.8 |
 | 16384 | 1179.0 | 1387.5 | 1129.2 | 1399.3 |
 
 So ubatch 8192 is itself a real gain over our ubatch 2048 (+5.5 % at pp8192) and gives a stable,
-reproducible baseline: at a **matched** ubatch we are **~10 % behind at pp8192 / ~15 % at pp16384**, which
-is the number the §13 phase plan exists to close.  It also confirms the old "~4 % behind" was partly the
-ubatch mismatch (ours ub2048 vs its ub16384).
+reproducible baseline: at a **matched** ubatch we are **~10 % behind at pp8192 / ~15 % behind at
+pp16384**, which is the number the §13 phase plan exists to close.  It also confirms the old "~4 %
+behind" was partly the ubatch mismatch (ours ub2048 vs its ub16384).  Session 2 then added gatemix
+(+1.2–1.5 % at pp8192/32768); re-measure the baseline with the current default before comparing.
+
+### Gatemix — Phase-1 item 1's second half, DONE
+
+The `hc_gate_mix_kernel` + `ggml_cuda_hc_gate_mix` existed in `mmb.cu` with no call site, so the HC gate
+GEMM (`w_up @ lo`, `[320 -> 10240]`) dispatched standalone and the mix ran in the `dsv4_hc_pre` op.
+Session 2 wired the matcher/call site in `ggml_cuda_try_fuse` (`94694a38e`, `patches/0003`):
+`ggml_cuda_hc_mix_closed()` plus a branch at the gate `MUL_MAT` that handles **both** the unfused chain
+and our delivery's explicit `ggml_dsv4_hc_pre` op (recovering the `[hc*n_embd, T]` activation the bf16
+cache is keyed on from the gate GEMM's own activation input).  Default **on** on gfx1151
+(`LLAMA_HC_GATEMIX=0` disables); RDNA4/RDNA3_0 stay off.
+
+| pp | `LLAMA_HC_GATEMIX=0` | default | delta |
+|---:|---:|---:|---:|
+| 8192  | 1198.8 | **1212.6** | +1.2 % |
+| 32768 | 1138.6 | **1155.6** | +1.5 % |
+
+Width probe **PASS** (worst maxdiff 0) and same-seed greedy text **identical** (`471d102e7b7d`).  The
+fusion shifts prefill logits by a bf16-epilogue ULP (three width-pure variants; the text is stable) and
+is prefill-only, so the decode/verify band is untouched.  Full detail:
+[`2026-09-21-hc-combine-norm.md`](2026-09-21-hc-combine-norm.md).  Caveat: the kernel is **IQ4_NL-only**,
+so the mixed UD-IQ4_XS model is unchanged (Q8_0 gate) — a follow-up.
 
 ### Why `-ub 16384` fails (root cause, deferred not fixed)
 
@@ -101,18 +171,15 @@ remaining `token_embd.weight` 644 MiB).  Findings:
   the pinned 16384 reserve fit without touching the HC matcher); (b) expose `--lazy-buffer-size` in
   `llama-bench` and use the managed ~5 GiB reader; (c) keep the `nt <= 8192` pin guard as a fallback.
   (a)/(b) preserve the HC design, which is the point.
-3. **Only then** resume the "where are we still slower" investigation (body §13 phase plan).  The goal is
-   to meet the other solution **head to head on the same runtime setup first** — matched `-ub 16384` included — before
-   attributing any remaining gap to a kernel.
 
 ### Current state (exact)
 
 | what | where / value |
 |---|---|
 | this repo, `main` | `== origin/main == 830770a` (clean) |
-| this repo, `gap-closing` | `== origin/gap-closing == 7792473` (pushed) — **the WIP branch; all this work lives here** |
+| this repo, `gap-closing` | **the WIP branch; all session-2 work is committed here** (`b8aeaa1`, `c1c0b33`) |
 | fork `~/llama.cpp` | branch **`gap-closing`** @ **`94694a38e`** (local; based on `mmb-beta` = r12 + the 12 `beta/mmb-general` patches + the three gap-closing WIP commits) |
-| fork build | `~/llama.cpp/build-rocm` (gfx1151, ROCm 7.14), built 2026-09-21; full feature set **default** |
+| fork build | `~/llama.cpp/build-rocm` (gfx1151, ROCm 7.14), built 2026-09-21; full feature set **default** (incl. `hc_gate_mix`) |
 | pre-port WIP (reference) | `~/llama-wip-mmb` @ `90bf12997` (`wip-mmb-general`), build at `build-rocm` |
 | the other solution | `~/pwilkin-llama-cpp` @ `b0f31f587`, **rebuilt** (`build-rocm`) |
 | model | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (93 GiB, qwen4exp) |
@@ -120,15 +187,16 @@ remaining `token_embd.weight` 644 MiB).  Findings:
 
 Rebuild: `cd ~/llama.cpp && ~/bin/build-llama-rocm-714`.  Runtime:
 `export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH; export HIP_VISIBLE_DEVICES=0`.
-The two `gap-closing` fork commits are also exported to [`patches/`](patches/) so the code survives a
-fork reset.
+The **three** `gap-closing` fork commits are also exported to [`patches/`](patches/) (`0001..0003`, tip
+`94694a38e`) so the code survives a fork reset.
 
 ### The policy (also in `AGENTS.md`)
 
 **A beneficial feature that has passed the gates is ON by default; its env var only DISABLES it.**  Applied
 in `0c860fe77`: `GGML_CUDA_MMB` default **on** (`=0` disables; RDNA3_0 included, `GGML_CUDA_MMB_RDNA3=0`
 disables that arm); MMB `hc16` default **on** (`GGML_CUDA_MMB_HC16=0` disables); the HC `hc_combine_norm`
-matcher default **on** (`LLAMA_FUSED_DSV4_HC_POST=1` forces the slower `DSV4_HC_POST` op).  **Never** run a
+matcher default **on** (`LLAMA_FUSED_DSV4_HC_POST=1` forces the slower `DSV4_HC_POST` op); the HC
+**`hc_gate_mix`** default **on** on gfx1151 (`LLAMA_HC_GATEMIX=0` disables; session 2).  **Never** run a
 benchmark with a feature left off — if you type `FOO=1 <bench>`, ask why the default is not already `1`.
 
 ### What changed this session (vs the 2026-09-20 snapshot)
@@ -141,11 +209,18 @@ benchmark with a feature left off — if you type `FOO=1 <bench>`, ask why the d
 * **Revived the `hc_combine_norm` prefill matcher** (fork `121ad7935`): three bugs — see
   [`2026-09-21-hc-combine-norm.md`](2026-09-21-hc-combine-norm.md).  The matcher default now beats
   `DSV4_HC_POST` by ~+1.5 % prefill.
+* **Session 2: wired the `hc_gate_mix` fusion and made it default-on** (fork `94694a38e`, `patches/0003`)
+  — +1.2–1.5 % at pp8192/32768, width-pure, text-identical.  See `2026-09-21-hc-combine-norm.md`
+  and the session-2 record above.  Phase-1 item 1 is therefore done.  Caveat: the kernel is IQ4_NL-only,
+  so the mixed UD-IQ4_XS model is unchanged.
+* **Session 2: ubatch 8192 adopted as the target** and the `-ub 16384` failure root-caused and deferred
+  (see the session-2 record above).
 * **MTP qualified** (parked): see [`2026-09-21-mtp-qualification.md`](2026-09-21-mtp-qualification.md).
   Our plain decode is ahead, fixed-depth MTP speedup is at parity, and the only real MTP gap is
   `nextn_shared_target_tensors` support.
 
-### Numbers to reproduce (gfx1151, qwen4exp IQ4_NL, prefill, `-b/-ub 2048`)
+### Numbers to reproduce (gfx1151, qwen4exp IQ4_NL, prefill, `-b/-ub 2048` — session-1 record, superseded
+by the ubatch-8192 table above)
 
 | pp | **default (full set)** | `GGML_CUDA_MMB=0` | pre-port WIP (full set) |
 |---:|---:|---:|---:|
@@ -165,13 +240,22 @@ relu-sum, the MoE bf16 epilogue, the sparse QSA decode + incremental indexer) an
 
 * The fork branch `gap-closing` carries **env-gated debug traces** (`LLAMA_HC_CN_DEBUG` in `ggml-cuda.cu`
   and `ggml.c`); they are inert by default but should be removed before any patch is cut.
-* The revived matcher path is **not yet through the purity gate** — same-seed smoke only.
+* The revived `hc_combine_norm` matcher and the `hc_gate_mix` fusion have passed the **width probe and
+  same-seed text** gates (uniform IQ4_NL) but not the full BETA-TESTING suite; the MMB-off byte check and
+  the MTP gate are still owed.
 * `LLAMA_FUSED_DSV4_HC_PRE`/`_POST` env toggles are WIP A/B knobs.
-* The `-ub 16384` bug is **out of scope for MMB**; it is a delivery graph/allocator issue.
+* **Follow-up:** the delivery's `hc_combine_norm_f32` is the 1024-thread/3-column variant; the reference's
+  `hc_combine_norm_f32_b256` (256 threads, two packed elements/thread) is the obvious kernel swap behind
+  the same matcher.  Also `hc_gate_mix_kernel` is IQ4_NL-only (Q8_0 for the mixed models is a follow-up).
+* The `-ub 16384` bug is **out of scope for MMB**; it is a delivery graph/allocator issue (see the
+  session-2 record).
 
 ---
 
-## Update 2026-09-21 — current state of play (read first)
+## Update 2026-09-21 (session 1) — current state of play
+
+> Session-1 record; the session-2 handoff is the START HERE block at the top.  This section still has
+> the reference inventory (what each side has, commit deltas, priorities) that the phase plan builds on.
 
 This section supersedes the stale references in the body. The body's measurements remain valid as
 **dated, gated-tree** evidence, but two references have moved and the plan needs five additions.
@@ -187,11 +271,10 @@ reference is **`beta/mmb-general`** — **12 patches**, applied tree
   (0011–0012). They are arch-scoped; on **gfx1151** the code is the core the body measured, so the body's
   gfx1151 numbers carry over except where §C says otherwise.
 * **What the 12-patch beta still does NOT add** (grep of the applied tree, not inference):
-  `gdn-conv.cu`, `ple-conv.cu`, `norm-gated.cu`, `idx-relu-sum.cu` and `hc-cn.cu` are still **absent**.
-  `hc_gate_mix_kernel` **exists** in `mmb.cu` but has **no call site** — it is dead code behind
-  `LLAMA_HC_GATEMIX` / `mmb_cfg().gatemix` (per-arch default `0`). So body §8.2 items **1–6 remain
-  open**; item 1 is “present but unwired”, not “absent”, and the work is the *matcher/call site*, not
-  porting the kernel.
+  `gdn-conv.cu`, `ple-conv.cu`, `norm-gated.cu`, `idx-relu-sum.cu` and `hc-cn.cu` are still **absent**
+  (items 2–6 below).  **Item 1 is done in session 2**: `hc_gate_mix_kernel` was wired (the matcher/call
+  site, not the kernel) and is default-on on gfx1151 — see the session-2 record at the top.  So body
+  §8.2 **items 2–6 remain open**, item 1 is closed.
 
 ### B. The other solution's side: `f5daaa3cf` → `b0f31f587`, 10 new commits
 

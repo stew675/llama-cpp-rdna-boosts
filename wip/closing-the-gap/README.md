@@ -25,11 +25,12 @@ moved here and updated 2026-09-21.
 
 * `~/llama.cpp` branch **`gap-closing`** @ **`94694a38e`** = `mmb-beta` (r12 `72176ae8a` + the 12
   `beta/mmb-general/patches/*.patch`, tree `bca69f23dd…`) + the 2026-09-21 changes: **default-on policy**
-  (MMB/HC16/matcher), the `hc_combine_norm` matcher revival, and env-gated debug traces.
+  (MMB/HC16/matcher), the `hc_combine_norm` matcher revival, and the **`hc_gate_mix` fusion** (session 2,
+  default-on on gfx1151), plus env-gated debug traces.
 * Built on this box (gfx1151) with `~/bin/build-llama-rocm-714`.  **All beneficial features are on by
   default** (see the `AGENTS.md` default-on policy); env vars only disable.
-* The two `gap-closing` commits are exported to [`patches/`](patches/) in case the local fork branch is
-  lost.
+* The three `gap-closing` commits (`0001..0003`) are exported to [`patches/`](patches/) in case the local
+  fork branch is lost.
 
 To reproduce:
 
@@ -49,11 +50,12 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch  
    **Gate 1 = `GGML_CUDA_MMB=0`** (byte-identical to r12), **Gate 2 = the default** (no env).  Plus the
    width probe and the MTP gate.  Green before any promotion.
 2. **Target `-b 8192 -ub 8192`** — decision 2026-09-21.  The `-ub 16384` failure is root-caused and
-   **deferred** (see the “Update 2026-09-21 (later)” section of the doc): it is the full-vocab
+   **deferred** (see the “Session-2 record” section of the doc): it is the full-vocab
    `result_output` reserve (15.5 GiB, shared with the other solution) plus qwen4exp's HC `block_out`
    pin (~18 GiB) against the resident PLE table (~27 GiB host).  ubatch 8192 runs clean and is the
    reproducible head-to-head baseline (ours 1212.6 vs its 1346.5 at pp8192, ~10 % behind).
-3. Then resume the phased investigation below against that baseline.
+3. **Start Phase 1 item 2 — the depthwise conv1d** (`gdn-conv.cu` + `ple-conv.cu`, −10.5 %).  Item 1 is
+   done; see the doc's START HERE scoping notes.
 
 ## The current open list (see §13 of the doc)
 
@@ -68,7 +70,7 @@ MTP tuning + correctness.**
    (+1.2–1.5 % at pp8192/32768, width-pure, text-identical) — see the record and `patches/0003`.
    Follow-up: the gate-mix kernel is IQ4_NL-only, so the mixed UD-IQ4_XS model is unchanged.
 2. Port `gdn-conv.cu` + `ple-conv.cu` (now F32-aware for Flash-Next PLE) — −10.5 %.
-3. **`-ub 16384` is deferred** (target is `-ub 8192`).  Root cause in the “Update 2026-09-21 (later)”
+3. **`-ub 16384` is deferred** (target is `-ub 8192`).  Root cause in the “Session-2 record”
    section: result_output reserve + HC pin + resident PLE.  Candidate fixes: default the PLE to
    mmap-lazy (fix the `-lzm auto` propagation), or expose `--lazy-buffer-size` in `llama-bench`.
 3.5. Port the other solution's three correctness fixes (`40c0b9c38`, `b0f31f587`, `14fff4f97`).
