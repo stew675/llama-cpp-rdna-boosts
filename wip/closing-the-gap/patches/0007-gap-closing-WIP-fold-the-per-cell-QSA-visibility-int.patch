@@ -1,0 +1,135 @@
+From 565a56dbc2c74f2b0914177653df0150a0f6f124 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 22 Sep 2026 04:24:00 -0500
+Subject: [PATCH] gap-closing WIP: fold the per-cell QSA visibility into umask
+ at merge time (item 6)
+
+The qsa3 attention kernel applied the derived per-cell visibility (cell_vis/q_vis) in
+its hot loop, one load+compare per (chunk, element).  The merge kernel already builds
+umask as a per-(query,cell) 4-bit mask, and the attention kernel's block-level kv test
+reads exactly that bit for the same cell (4*block + cc).  So the predicate is folded
+into umask where the umask bits are set, and the attention kernel drops the per-cell
+branch entirely - bit-identically (the umask bit already turns into -INFINITY).
+
+The mask path is unchanged: when a mask is present the merge kernel is passed
+cell_vis == nullptr and the attention kernel keeps its mask add.
+
+gfx1151, qwen4exp IQ4_NL, pp8192 -ub 8192 (kernel profile, 24 dispatches):
+  qsa3_attn_kernel  809.6 -> 672.9 ms   (ref build: 629.2;  same VGPR/LDS/grid)
+  qsa3_merge_kernel  36.8 ->  53.9 ms   (the visibility check moved here)
+  QSA pipeline total 881.0 -> 761.4 ms  (ref: 811.7 -> we are now 50 ms ahead)
+End-to-end -b/-ub 4096, r=6:  pp8192 1226.09 -> 1255.23 (+2.4 %),
+                             pp32768 1169.37 -> 1189.42 (+1.7 %)
+
+Bit-identical: width probe PASS (worst maxdiff 0), row0 8949d53f635c18c3 unchanged,
+same-seed greedy text 765 chars sha=f61199ba5644 unchanged.
+
+Exported to wip/closing-the-gap/patches/0007.
+---
+ ggml/src/ggml-cuda/fattn-qsa3.cu | 40 ++++++++++++++++++++++----------
+ 1 file changed, 28 insertions(+), 12 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-qsa3.cu b/ggml/src/ggml-cuda/fattn-qsa3.cu
+index 22a15f47e..8fe1b0c7a 100644
+--- a/ggml/src/ggml-cuda/fattn-qsa3.cu
++++ b/ggml/src/ggml-cuda/fattn-qsa3.cu
+@@ -147,14 +147,32 @@ static __device__ __forceinline__ int qsa3_get(const int * __restrict__ p, const
+     const int key = p[j];
+     return raw ? ((key >= 0 && key < nk) ? key : QSA3_SENT) : key;
+ }
++
++// Per-cell visibility (the derived-visibility predicate the VEC kernel applies): a cell is visible
++// for a query iff 0 <= cell_vis[c] <= q_vis[q].  It is folded into the per-(query,cell) `umask` bit
++// here, at merge time, so the attention kernel needs no per-cell load/branch in its hot loop: the
++// block-level `kv` test it already does then carries the same -inf.  Bit-identical to applying the
++// predicate in the attention kernel (the umask bit indexes the same cell: 4*block + cc).
++static __device__ __forceinline__ bool qsa3_cell_visible(const int * cell_vis, const int qv, const int c) {
++    if (cell_vis == nullptr) { return true; }
++    const int cv = cell_vis[c];
++    return cv >= 0 && cv <= qv;
++}
+ __global__ __launch_bounds__(QSA3_MERGE_LANES) void qsa3_merge_kernel(
+         const int * __restrict__ ids, const size_t i1, const int n_q, const int ns, const int nk,
+         const int * __restrict__ srow, const int * __restrict__ sflag,
++        const int * __restrict__ cell_vis, const int * __restrict__ q_vis,
+         uint16_t * __restrict__ ublk, uint16_t * __restrict__ umask, int * __restrict__ ucount, const int cap) {
+     extern __shared__ int rows_s[];
+     __shared__ int scan_s[QSA3_MERGE_LANES];
+     const int lane = threadIdx.x;
+     const int g = blockIdx.x;
++    // per-query visibility key (only when the derived-visibility predicate is in force; the mask path
++    // passes cell_vis == nullptr and is applied by the attention kernel)
++    const int * cvis = cell_vis;
++    int qvv[QSA3_G];
++#pragma unroll
++    for (int qi = 0; qi < QSA3_G; ++qi) { qvv[qi] = (cvis != nullptr && q_vis != nullptr) ? q_vis[QSA3_G*g + qi] : 0; }
+ #pragma unroll
+     for (int qi = 0; qi < QSA3_G; ++qi) {
+         const int q = QSA3_G * g + qi;
+@@ -248,8 +266,11 @@ __global__ __launch_bounds__(QSA3_MERGE_LANES) void qsa3_merge_kernel(
+                 if (head[qi] != QSA3_SENT && (head[qi] >> 2) == b) {
+                     const int * rr = rp[qi];
+                     int pn = p[qi];
+-                    if ((head[qi] & 3) == 0 && pn + 3 < pe[qi] && rr[pn+3] == head[qi] + 3 && rr[pn+1] == head[qi] + 1 && rr[pn+2] == head[qi] + 2) { mk |= 0xFu << (4*qi); pn += 4; }
+-                    else { do { mk |= 1u << (4*qi + (rr[pn] & 3)); ++pn; } while (pn < pe[qi] && (rr[pn] >> 2) == b); }
++                    if ((head[qi] & 3) == 0 && pn + 3 < pe[qi] && rr[pn+3] == head[qi] + 3 && rr[pn+1] == head[qi] + 1 && rr[pn+2] == head[qi] + 2) {
++                        for (int k2 = 0; k2 < 4; ++k2) { if (qsa3_cell_visible(cvis, qvv[qi], head[qi] + k2)) { mk |= 1u << (4*qi + k2); } }
++                        pn += 4;
++                    }
++                    else { do { const int c2 = rr[pn]; if (qsa3_cell_visible(cvis, qvv[qi], c2)) { mk |= 1u << (4*qi + (c2 & 3)); } ++pn; } while (pn < pe[qi] && (rr[pn] >> 2) == b); }
+                     p[qi] = pn; head[qi] = pn < pe[qi] ? rr[pn] : QSA3_SENT;
+                 }
+             }
+@@ -315,7 +336,7 @@ struct qsa3_layout {
+ 
+ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
+         const float * __restrict__ q, const uint16_t * __restrict__ pk, const uint16_t * __restrict__ pv,
+-        const uint16_t * __restrict__ mask, const int * __restrict__ cell_vis, const int * __restrict__ q_vis,
++        const uint16_t * __restrict__ mask,
+         const uint16_t * __restrict__ ublk, const uint16_t * __restrict__ umask,
+         const int * __restrict__ ucount, float * __restrict__ out, const qsa3_layout s) {
+     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, r = lane & 15, hi = lane >> 4;
+@@ -367,9 +388,6 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
+             for (int e = 0; e < 8; ++e) { O[i][t][e] = 0.f; }
+     float m = -INFINITY, l = 0.f;                       // owner state (waves 0..2): row 16w + r
+     const int own_row = 16*w + r, own_qi = own_row / QSA3_HQ;
+-    const int own_query = QSA3_G * g + own_qi;
+-    const int own_q_vis = (cell_vis && w < 3 && own_query < s.n_q) ? q_vis[own_query] : 0;
+-    const int * cellvis = cell_vis;
+ 
+     auto load_desc = [&](const int c, uint32_t & b01, uint32_t & b23, uint32_t & m01, uint32_t & m23) {
+         const uint2 bb = *reinterpret_cast<const uint2 *>(gblk + 4*c);
+@@ -457,9 +475,6 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
+                     scf[e] = -INFINITY;
+                 } else if (mask) {
+                     scf[e] += qsa3_h2f(mask[4 * blk_of(b01, b23, j) + cc]);
+-                } else if (cellvis) {
+-                    const int cv = cellvis[4 * blk_of(b01, b23, j) + cc];
+-                    if (!(cv >= 0 && cv <= own_q_vis)) { scf[e] = -INFINITY; }
+                 }
+             }
+             float mloc = scf[0];
+@@ -676,7 +691,10 @@ void ggml_cuda_flash_attn_qsa3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+         CUDA_CHECK(cudaGetLastError());
+         const ggml_cuda_kernel_launch_params launch2(dim3(ngroups), dim3(QSA3_MERGE_LANES), (size_t) QSA3_G * ns * sizeof(int), ctx.stream());
+         ggml_cuda_kernel_launch(qsa3_merge_kernel, launch2, (const int *) ids->data, ids->nb[1], n_q, ns, nk,
+-                                (const int *) srow.get(), (const int *) sflag.get(), ublk.get(), umask.get(), ucount.get(), cap);
++                                (const int *) srow.get(), (const int *) sflag.get(),
++                                (mask == nullptr && cell_vis != nullptr) ? (const int *) cell_vis->data : nullptr,
++                                (mask == nullptr && q_vis    != nullptr) ? (const int *) q_vis->data    : nullptr,
++                                ublk.get(), umask.get(), ucount.get(), cap);
+         CUDA_CHECK(cudaGetLastError());
+     }
+ 
+@@ -687,8 +705,6 @@ void ggml_cuda_flash_attn_qsa3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+             (const uint16_t *) pk16.get(),
+             (const uint16_t *) pv16.get(),
+             mask     ? (const uint16_t *) mask->data     : nullptr,
+-            cell_vis ? (const int      *) cell_vis->data : nullptr,
+-            q_vis    ? (const int      *) q_vis->data    : nullptr,
+             (const uint16_t *) ublk.get(),
+             (const uint16_t *) umask.get(),
+             (const int      *) ucount.get(),
+-- 
+2.55.0
+
