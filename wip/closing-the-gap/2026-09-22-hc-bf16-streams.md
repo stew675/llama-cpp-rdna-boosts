@@ -35,9 +35,13 @@ BF16 instead of F32 for the two large HC tensors:
    nothing is marked and the flags stay inert.  Only the repeat-anchored form is recognised.
 2. **The MoE shared-expert ADD is not adjacent to the reduction chain.**  In our graph
    `ffn_out = ADD(ffn_moe_out, ffn_shexp_gated)` and `ffn_moe_out` is followed by `ffn_gate`, not by
-   the ADD, so the reference's merge fusion (`nadd = i + node_count`) cannot fire and the `ffn_out`
-   block_out is left F32.  The reduction/merge arm is kept in the marking for trees where they are
-   adjacent; on qwen4exp only the 48 attention-path `MUL_MAT` block_outs take blk16.
+   the ADD: `build_moe_ffn` expands the reduction chain into the graph (`ggml_build_forward_expand`)
+   and the shared-expert branch is built after it, so node `i + match.node_count` is the first shexp
+   op.  The reference's merge fusion (`nadd = i + node_count`) therefore cannot fire; the `ffn_out`
+   block_out is left F32.  **The reference's `build_layer_ffn` and `build_moe_ffn` are the same, so its
+   merge path does not fire on qwen4exp either** — the `moe_weighted_reduction_*_out` variants are
+   effectively dormant on this model.  The reduction/merge arm is kept in the marking for trees where
+   they are adjacent; on qwen4exp only the 48 attention-path `MUL_MAT` block_outs take blk16.
 3. **`blk_in_bf16` is independent of `res16`.**  The reference nests it inside its `res16` block; we
    test `ggml_cuda_mmb_blk16()` on its own so `blk16` alone is a coherent configuration.
 4. **`blk16`/`res16` are gated together at the fusion site.**  `out_xn` is already marked BF16-only
@@ -75,10 +79,18 @@ The residual stream is the dominant half.  This is larger than the session-5 est
 3.8 %) which priced only the `hc_combine_norm` kernel; the residual also removes traffic from the
 combine's neighbours.
 
+**Final product (after `patches/0012` + `0013` landed).**  On the same box, the BF16 rounding path on
+now runs **1379.2 / 1320.0 t/s** at the `-b 8192 -ub 8192` target (pp8192 / pp32768), versus
+**1308.2 / 1269.6** on the default build at `-b/-ub 4096`; the other solution's session-5 cells were
+1323.7 / 1374.4 at the target.  We are ahead at pp8192 on both protocols.
+
 ## Follow-ups / limits
 
-* The `ffn_out` (MoE-merge) block_out stays F32 on our graph (see adaptation 2).  Capturing it
-  would need either an adjacent ADD or a separate bf16-aware ADD path.
+* The `ffn_out` (MoE-merge) block_out stays F32 on our graph (see adaptation 2).  **This is not a gap
+  against the reference** — its merge path is equally dormant on qwen4exp.  Capturing it would need a
+  builder reorder (graph-topology / allocator / meta-split / CUDA-graph re-validation) or a separate
+  dataflow bf16-merge op, for ~1/5 of the HC stream traffic (`ffn_out` is `[n_embd,T]`; the residual
+  `res16` already covers is `[n_embd,hc,T]` = 4×).  Left deliberately; do not re-litigate.
 * `out_xn_bf16` is wired but inert on qwen4exp because the mark already exists and the flags are
   what enables it; a future default-on decision there is a separate numerics change (verify with the
   width probe + same-seed text).

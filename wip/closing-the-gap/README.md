@@ -19,7 +19,7 @@ moved here and updated 2026-09-21.
 | [`2026-09-22-qsa3-visibility-fold.md`](2026-09-22-qsa3-visibility-fold.md) | Phase-1 item 6: fold the per-cell QSA visibility into `umask` at merge time (drops the hot-loop check), **bit-identical**, **+2.4 % pp8192 / +1.7 % pp32768**; the QSA pipeline is now 50 ms ahead of the reference's. |
 | [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md) | Phase-1 item 7: keep the `M=4` HC inject out of the 384-row tall MMB tile (the tall kernel ran 2× the dispatches), **bit-identical**, **+0.8 % pp8192 / +1.1 % pp32768**. |
 | [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md) | Phase-1 item 8 (**closed**): 7/9 QSA graph flags are present/superseded in our block-14/15 QSA; **2 are un-ported prefill-score optimizations** (`QSA_SCORE_BOUNDS`+`QSA_QUERY_STRIP`, `QSA_SCORE_WMMA`) — the next follow-ups. |
-| [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md) | Phase-1 item 16: the HC BF16 streams (`blk16`/`res16`) ported **default OFF**, default byte-identical, **+4.9 % pp8192 / +4.8 % pp32768** at `-b/-ub 4096`; `res16` is the dominant half.  The MoE-merge `ffn_out` ADD stays F32 in our graph (not adjacent to the reduction chain). |
+| [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md) | Phase-1 item 16: the HC BF16 streams (`blk16`/`res16`) ported **default OFF**, default byte-identical, **+4.9 % pp8192 / +4.8 % pp32768** at `-b/-ub 4096`; `res16` is the dominant half.  The MoE-merge `ffn_out` ADD stays F32 because it is not adjacent to the reduction chain — and the reference's merge path is equally dormant on qwen4exp (same builder), so it is not a gap against it. |
 | [`2026-09-22-mmb-cvt-out-xn.md`](2026-09-22-mmb-cvt-out-xn.md) | The `mmb_cvt_f32_bf16` gap: the fused combine now emits the BF16 `out_xn` copy the graph already marks (81 % of the traffic; the allocator reuses one `hc_norm` buffer so the cache cannot dedupe), **bit-identical**, **+3.3 % pp8192 / +3.2 % pp32768** at `-b/-ub 4096`. |
 | [`2026-09-22-idx-relu-sum.md`](2026-09-22-idx-relu-sum.md) | The prefill indexer relu+head-sum fusion (`idx-relu-sum`): one kernel replaces the relu + CONT + ADD chain (our L2a relu-before-reshape form), **bit-identical**, **+1.8 % pp32768** at `-b/-ub 4096`. |
 | [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..ac391cf4f`, `0001..0013`) exported as patches, so the code work survives a fork reset. |
@@ -41,12 +41,16 @@ moved here and updated 2026-09-21.
   (session 2), the **depthwise conv1d fusions** (session 3), the **QSA block-window fix** (session 3,
   `b0f31f587`), the **narrow-row RMS norm fusion** (session 4), the **QSA visibility fold**
   (session 4, item 6), the **tall-tile min-M** fix (session 4, item 7), the **`-lzm auto` semantics**
-  + managed PLE reader gated OFF (session 5), the **MoE BF16 epilogue** gated OFF (session 5), and the
-  **HC BF16 streams** gated OFF (session 6, item 16), plus env-gated debug traces.
+  + managed PLE reader gated OFF (session 5), the **MoE BF16 epilogue** gated OFF (session 5), the
+  **HC BF16 streams** gated OFF (session 6, item 16), the **`mmb_cvt`/`out_xn` fix** default ON
+  (session 6, `patches/0012`), and the **prefill indexer relu-sum** default ON (session 6,
+  `patches/0013`), plus env-gated debug traces.  **Current product:** qwen4exp IQ4_NL, gfx1151,
+  `-b 8192 -ub 8192` with `LLAMA_HC_BLK16=1 LLAMA_HC_RES16=1` = **1379 / 1320 t/s** (pp8192 /
+  pp32768); the default build at `-b/-ub 4096` = 1308 / 1270.
 * Built on this box (gfx1151) with `~/bin/build-llama-rocm-714`.  **All beneficial features are on by
   default** (see the `AGENTS.md` default-on policy); env vars only disable.
-* The ten `gap-closing` commits (`0001..0013`) are exported to [`patches/`](patches/) in case the local
-  fork branch is lost.
+* The thirteen `gap-closing` commits (`0001..0013`) are exported to [`patches/`](patches/) in case the
+  local fork branch is lost.
 
 To reproduce:
 
@@ -55,7 +59,7 @@ cd ~/llama.cpp
 git checkout rdna-boosts && git branch -D mmb-beta gap-closing 2>/dev/null
 git checkout -b gap-closing
 git am /home/stew675/llama-cpp-rdna-boosts/beta/mmb-general/patches/*.patch
-git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 4a75744fa
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip ac391cf4f
 ~/bin/build-llama-rocm-714
 ```
 
@@ -80,7 +84,8 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch  
 3. **Item 16 (HC BF16 streams `blk16`/`res16`) is DONE 2026-09-22 (session 6, `patches/0011`),
    default OFF** — +4.9 % pp8192 / +4.8 % pp32768 at `-b/-ub 4096`, default build byte-identical —
    [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md).  The MoE-merge `ffn_out`
-   `block_out` is the one piece left on the table (not adjacent to the reduction chain in our graph).
+   `block_out` stays F32: it is not adjacent to the reduction chain, and the reference's merge path is
+   equally dormant on qwen4exp (same builder), so it is **not** a gap against the reference.
    **The `mmb_cvt_f32_bf16` item is also DONE (session 6, `patches/0012`)** — the fused combine now
    emits the BF16 `out_xn` copy the graph already marks, bit-identical, **+3.3 %/+3.2 %** —
    [`2026-09-22-mmb-cvt-out-xn.md`](2026-09-22-mmb-cvt-out-xn.md).
@@ -151,7 +156,8 @@ MTP tuning + correctness.**
 16. **BF16 HC streams** (`blk16`/`res16`) — **DONE 2026-09-22 (session 6, `patches/0011`),
     default OFF**: +4.9 % pp8192 / +4.8 % pp32768 at `-b/-ub 4096`, default build byte-identical —
     [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md).  `res16` is the dominant half;
-    the MoE-merge `ffn_out` `block_out` stays F32 (not adjacent to the reduction chain in our graph).
+    the MoE-merge `ffn_out` `block_out` stays F32 — not adjacent to the reduction chain, and the
+    reference's merge path is equally dormant on qwen4exp (same builder), so not a gap against it.
 
 **Phase 2 — decode speed + correctness**
 

@@ -9,7 +9,7 @@
 
 ---
 
-## START HERE — fresh-session handover (end of session 5, 2026-09-22)
+## START HERE — fresh-session handover (end of session 6, 2026-09-22)
 
 ### Where we are
 
@@ -18,12 +18,19 @@
   ~844 t/s, while `-ub 4096` stays pegged at 100 % and runs **1093 t/s** (maintainer, 2026-09-22).
   `-ub 16384` is root-caused and parked (below); do not spend time on it unless the PLE-lazy fix is
   picked up.
-* At a **matched** ubatch the picture moved the right way after sessions 2–4 (items 1, 2, 6, 7): at the
-  clean `-b/-ub 4096` protocol we are **ahead at pp8192** (1255 vs 1200 t/s, +4.6 %) and ~1.5 % behind at
-  pp32768; at the absolute `-b 8192 -ub 8192` target we are −3.2 % at pp8192 and **−10.6 % at pp32768**.
-  The remaining gap is no longer the QSA/attention path (that is now ahead) — it is the **BF16
-  intermediate-traffic families** plus two non-lossy kernel items, profiled in the session-5 finding
-  below.
+* **Throughput after session 6** (qwen4exp IQ4_NL, gfx1151, `-ctk/-ctv f16`, `pp… -n 0`):
+
+  | config | pp8192 | pp32768 |
+  |---|---:|---:|
+  | `-b 8192 -ub 8192` (target), `LLAMA_HC_BLK16=1 LLAMA_HC_RES16=1` | **1379.2** | **1320.0** |
+  | `-b/-ub 4096` (A/B protocol), BF16 rounding path ON | 1324.8 | 1287.2 |
+  | `-b/-ub 4096`, BF16 path OFF (the default build) | 1308.2 | 1269.6 |
+
+  The other solution's session-5 cells were 1323.7 / 1374.4 at `-b 8192 -ub 8192` and 1200.1 / 1224.5 at
+  `-b/-ub 4096`, i.e. we are now **ahead at pp8192 on both protocols** and ~4 % behind at pp32768 (was
+  −10.6 %).  The old “BF16 intermediate-traffic families plus two non-lossy kernel items” gap is
+  **closed** (items 16 / `mmb_cvt` / 14, session 6).  The BF16 rounding path is still the maintainer's
+  default-OFF exception (lossy), exactly like `MMB_DOWN16`.
 * **Phase-1 item 1 (HC fusions) DONE** (session 2, **`patches/0003`**): `hc_combine_norm` matcher
   revived (+1.5 %) and `hc_gate_mix` wired default-on (+1.2–1.5 %) — width-pure, same-seed-text
   identical.
@@ -85,9 +92,11 @@
   BF16 hyper-connection streams are ported **default OFF** (`LLAMA_HC_BLK16=1` / `LLAMA_HC_RES16=1`),
   the default build is byte-identical, and the arm is **+4.9 % pp8192 / +4.8 % pp32768** at
   `-b/-ub 4096` — [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md).  `res16` is the
-  dominant half (+4.7 %/+4.6 % alone); `blk16` adds +3.2 %/+2.5 % alone.  The MoE-merge `ffn_out`
-  ADD is not adjacent to the reduction chain in our graph, so only the attention-path `block_out`
-  takes `blk16`.
+  dominant half (+4.7 %/+4.6 % alone); `blk16` adds +3.2 %/+2.5 % alone.  Only the attention-path
+  `block_out` takes `blk16`: the FFN `ADD(moe_reduce, shexp)` is not adjacent to the reduction chain
+  (the shared-expert branch is expanded between them) and the merge fusion requires adjacency — the
+  reference's `build_layer_ffn`/`build_moe_ffn` are the same, so **its merge path is equally dormant
+  on qwen4exp**.  Left on the table deliberately (the full note is below the NEXT SESSION block).
 * **`mmb_cvt_f32_bf16` gap CLOSED** (session 6, **`patches/0012`**, default ON, **bit-identical**): the
   fused `hc_combine_norm` now emits the BF16 `out_xn` copy the graph already asked for, so every
   consumer stops reconverting the F32 (81 % of the `mmb_cvt` traffic); `mmb_cvt` 520 -> 148 calls /
@@ -104,39 +113,97 @@
   follow-up, then `QSA_SCORE_WMMA`.  The session-5 profile/memory findings and the corrected gate
   semantics are further down; read them too.
 
-### NEXT SESSION — the `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` prefill-score trim
+### NEXT SESSION — Phase 1 is done except the QSA prefill-score trim
 
-**Items 16 (HC BF16 streams), `mmb_cvt`, and 14 (indexer relu-sum) are all DONE** —
-[`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md) (`patches/0011`, default OFF),
-[`2026-09-22-mmb-cvt-out-xn.md`](2026-09-22-mmb-cvt-out-xn.md) (`patches/0012`, default ON),
-[`2026-09-22-idx-relu-sum.md`](2026-09-22-idx-relu-sum.md) (`patches/0013`, default ON).  The session-5
-profile's BF16-traffic and conversion gaps are closed; what is left of Phase 1 is the item-8 QSA
-prefill-score work.
+**Session 6 landed three items** (fork `gap-closing`, exported to [`patches/`](patches/)):
 
-1. **`QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` (do this first).**  The reference scores the prefill in
-   `min(n_tokens, 512)`-token strips and, per strip, trims the scorer to the first
-   `(max_query_pos+1)/ratio` blocks — safe because the trimmed blocks are `-inf` in the visibility
-   metadata, so the selection cannot change.  Our chain scores the full `n_blocks` every time; the
-   indexer score/top-k chain is ~185 ms + the score matmul at pp8192, and the bound roughly halves it.
-   Port needs `qsa_position_prefix(ubatch)` + `qsa_prefix_limits(...)` in `llama-memory-hybrid-idx.*`,
-   a `qwen4exp_query_strip()` in `qwen4exp.cpp`, and the strip/limits threaded through the QSA graph
-   input + `can_reuse` (the reserve-time synthetic ubatch must stay unbounded).  Gate: width probe PASS
-   + same-seed text + A/B at `-b/-ub 4096`.
-2. **`QSA_SCORE_WMMA`** — extend a fused score to the prefill band (`n_tps >= 128`, `idx_dim==128`,
-   `n_idx_h==4`); ours (`GGML_CUDA_QSA_INDEXER_SCORE`) is `n_tokens == 1` only.  This is a numerics
-   change if the fused reduction order differs, so it needs the width probe + same-seed text and a
-   careful read of the reference's op before porting.
+| item | patch | default | result | record |
+|---|---|---|---|---|
+| HC BF16 streams (`blk16`/`res16`) | `0011` | **OFF** (lossy) | +4.9 %/+4.8 % at `-b/-ub 4096` | [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md) |
+| `mmb_cvt` / fused `out_xn` BF16 copy | `0012` | **ON** (bit-identical) | +3.3 %/+3.2 % | [`2026-09-22-mmb-cvt-out-xn.md`](2026-09-22-mmb-cvt-out-xn.md) |
+| prefill indexer relu-sum | `0013` | **ON** (bit-identical) | +1.8 % pp32768 | [`2026-09-22-idx-relu-sum.md`](2026-09-22-idx-relu-sum.md) |
 
-Both are recall-speed (Phase-1) items; the audit record has the full flag table and the port scoping —
-[`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md).
+The measured product is the table at the top of this handover (1379 / 1320 t/s at the `-b 8192 -ub 8192`
+target with the BF16 rounding path on; 1308 / 1270 on the default build).  The session-5 BF16-traffic and
+conversion gaps are closed.
 
-**Item-16 scoping (kept for reference; the port is DONE — [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md)):**
-the reference's BF16 HC stream hangs off `hc-cn.cu`/`hc-cn.cuh`/`hc-match.inc` (args, consumer arms,
-matcher), the args setup + the marking block in `ggml-cuda.cu`, and `moe_weighted_reduction_bf16_v4_out`
-/ `_f32in_bf16out_v4`.  Our adaptations: a structure-only identifier (our combine matcher is inline and
-runs in `try_fuse`, so marking needs its own walk), `blk_in_bf16` independent of `res16`, and the
-MoE-merge `ffn_out` ADD left F32 (in our graph it is not adjacent to the reduction chain).  Keep the
-`ggml_nrows >= 512` prefill guard.
+**Do first — run the full `beta/mmb-general` BETA-TESTING suite once** (still owed since session 5):
+Gate 4 (MTP acceptance) + the op oracles.  Purity is an **intra-build** contract (`GREEDY-PURITY.md`):
+`test-logits-width-probe` PASS (worst maxdiff 0) on f16/bf16/q8_0, `plain == draft-mtp` greedy text,
+acceptance > ~0.45 at pos 1, coherence.  Re-run `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA`,
+`FLASH_ATTN_EXT`.  Green before any promotion; do not trust perf numbers as "the product" until then.
+
+#### Next code item — `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA`
+
+The reference scores the prefill in `min(n_tokens, 512)`-token strips and, per strip, trims the scorer
+to the first `(max_query_pos+1)/ratio` blocks — safe because the trimmed blocks are `-inf` in the
+visibility metadata, so the selection cannot change.  Our chain scores the full `n_blocks` every time;
+the indexer score/top-k chain is ~185 ms + the score matmul at pp8192, and the bound roughly halves it.
+
+Port needs:
+* `qsa_position_prefix(ubatch)` + `qsa_prefix_limits(...)` in `llama-memory-hybrid-idx.*`;
+* a `qwen4exp_query_strip()` in `qwen4exp.cpp`;
+* the strip/limits threaded through the QSA graph input + `can_reuse` (the reserve-time synthetic
+  ubatch must stay **unbounded**).
+
+Gate: width probe PASS + same-seed text + A/B at `-b/-ub 4096`.  Then `QSA_SCORE_WMMA` (extend a fused
+score to `n_tps >= 128`, `idx_dim==128`, `n_idx_h==4`; ours is `n_tokens == 1` only — a numerics change,
+so read the reference's op first and gate the width probe + same-seed text).  Full flag table and port
+scoping: [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md).
+
+#### What is deliberately NOT being done
+
+* **The FFN `block_out` in `blk16`.**  `ffn_out = ADD(ffn_moe_out, ffn_shexp_gated)` is not adjacent to
+  the MoE reduction chain: `build_moe_ffn` expands the reduction into the graph and the shared-expert
+  branch is built after it, so the first node after the reduction is `ffn_gate`.  The reference's merge
+  detection requires `nodes[i + node_count] == add`, and its `build_layer_ffn`/`build_moe_ffn` are the
+  same, so **its merge path does not fire on qwen4exp either** — the `moe_weighted_reduction_*_out`
+  variants are dormant.  Capturing it would need a builder reorder (graph-topology, allocator,
+  meta-split and CUDA-graph re-validation) or a separate dataflow bf16-merge op, for ~1/5 of the HC
+  stream traffic (`ffn_out` is `[n_embd,T]`; the residual the `res16` arm already covers is
+  `[n_embd,hc,T]` = 4×).  Not worth it — do not re-litigate.
+* **The parked items stay parked:** `-ub 16384` (needs the PLE-lazy reader), the managed PLE reader
+  perf (item 13), the qwen4exp adaptive-MTP ceiling sweep and `nextn_shared_target_tensors` (Phase 3),
+  and the sparse QSA decode + incremental indexer (Phase 2, `d67d58836`).
+
+#### Reproduce (copy-paste)
+
+```sh
+cd ~/llama.cpp && ~/bin/build-llama-rocm-714                       # full build (ccache; ~4 min warm)
+export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH; export HIP_VISIBLE_DEVICES=0
+MU=/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf
+for f in ${MU%/*}/*-0000*.gguf; do cat "$f" >/dev/null; done   # warm page cache first
+# default build at the A/B protocol:
+~/llama.cpp/build-rocm/bin/llama-bench -m "$MU" -ngl 99 -fa 1 -ctk f16 -ctv f16 -b 4096 -ub 4096 -p 8192,32768 -n 0 -r 3
+# the BF16 rounding path on, at the target ubatch:
+LLAMA_HC_BLK16=1 LLAMA_HC_RES16=1 ~/llama.cpp/build-rocm/bin/llama-bench -m "$MU" -ngl 99 -fa 1 \
+  -ctk f16 -ctv f16 -b 8192 -ub 8192 -p 8192,32768 -n 0 -r 2
+# purity gate (expect width_purity=PASS, worst maxdiff 0):
+~/llama.cpp/build-rocm/bin/test-logits-width-probe "$MU" prompts/prose-rdna-boosts.txt 1024 512
+```
+
+### Session-6 record (2026-09-22): items 16, `mmb_cvt`, 14 — the BF16/conversion gap closed
+
+Three items, all gated and documented:
+
+| item | patch | default | delta (`-b/-ub 4096`) | record |
+|---|---|---|---|---|
+| HC BF16 streams (`blk16`/`res16`) | `0011` | OFF (lossy) | +4.9 % pp8192 / +4.8 % pp32768 | [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md) |
+| `mmb_cvt` / fused `out_xn` BF16 copy | `0012` | ON (bit-identical) | +3.3 % / +3.2 % | [`2026-09-22-mmb-cvt-out-xn.md`](2026-09-22-mmb-cvt-out-xn.md) |
+| prefill indexer relu-sum | `0013` | ON (bit-identical) | flat pp8192 / +1.8 % pp32768 | [`2026-09-22-idx-relu-sum.md`](2026-09-22-idx-relu-sum.md) |
+
+**Final product:** qwen4exp IQ4_NL, gfx1151, `-b 8192 -ub 8192`, BF16 rounding path on:
+**1379.2 / 1320.0 t/s** (pp8192 / pp32768); default build at `-b/-ub 4096`: 1308.2 / 1269.6.  The other
+solution's session-5 cells were 1323.7 / 1374.4 at the target — we are ahead at pp8192 and ~4 % behind
+at pp32768 (was −10.6 %).
+
+**Two facts for the next session:**
+* The `mmb_cvt` win is a **consistency fix**: the graph already marked `out_xn` BF16-only and the fused
+  combine was the one producer that did not emit the copy.  The unfused `norm.cu` path already did, and
+  fused-before / fused-after / unfused all produce the same text — bit-identical, not a re-baseline.
+* `ffn_out`/`blk16` is **not** a gap against the reference: its `build_layer_ffn`/`build_moe_ffn` are the
+  same, so its merge path is equally dormant on qwen4exp.  See the handover note above; do not
+  re-litigate.
 
 ### Session-5 finding (2026-09-22) — fresh target-ubatch profile, memory accounting, refined tasks
 
@@ -406,7 +473,7 @@ Both are recall-speed (Phase-1) items; the audit record has the full flag table 
 |---|---|
 | fork `~/llama.cpp` | branch **`gap-closing`** @ **`ac391cf4f`** = r12 + the 12 `beta/mmb-general` patches + the 13 gap-closing commits (session 6 = the HC BF16 streams `patches/0011`, the `mmb_cvt`/`out_xn` fix `patches/0012`, and the prefill indexer relu-sum `patches/0013`) |
 | fork build | `~/llama.cpp/build-rocm` (gfx1151, ROCm 7.14), full feature set **default** |
-| this repo | branch `gap-closing` (published to `origin`), `wip/closing-the-gap/patches/0001..0010` |
+| this repo | branch `gap-closing` (published to `origin`), `wip/closing-the-gap/patches/0001..0013` |
 | the other solution | `~/pwilkin-llama-cpp` @ `b0f31f587`, `build-rocm` |
 | model | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (93 GiB, qwen4exp) |
 | MoE test model | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf` |
@@ -414,8 +481,8 @@ Both are recall-speed (Phase-1) items; the audit record has the full flag table 
 
 Rebuild: `cd ~/llama.cpp && ~/bin/build-llama-rocm-714`.  Runtime:
 `export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH; export HIP_VISIBLE_DEVICES=0`.
-The ten `gap-closing` fork commits are exported to [`patches/`](patches/) so the code survives a fork
-reset.
+The thirteen `gap-closing` fork commits (`0001..0013`) are exported to [`patches/`](patches/) so the
+code survives a fork reset.
 
 ### What NOT to redo (sessions 3–4)
 
@@ -1344,7 +1411,7 @@ body, (7) tall tile, (8) QSA graph flags; items 1–9 survive, regrouped below.
 | 13 | **`-lzm auto` semantics + managed PLE reader perf** | memory: ~28 GB; `-ub 16384` unlock | 0.5–1 d (semantics **DONE**, reader **gated OFF**) | session-5: `on`=mmap, `off`=resident, `auto`=upstream auto, managed LRU **opt-in** via `LLAMA_LAZY_BUF_MB` and **off by default** because it is the slowest arm (1090/1184 vs mmap 1219/1217 vs resident 1285/1232 at pp8192/32768).  `--lazy-buffer-size` dropped.  **Discriminator (2026-09-22):** the cost is *not* only page-cache pressure — with the table fully cached (`-ub 2048`) the reader is still **−4.0 % vs mmap** (vs −9.7 % under pressure), so the arena has an intrinsic streaming overhead; the fix is a no-cache parallel-pread fast path like the reference's `on-direct`, then reconsider defaulting it on.  It already enables `-b/-ub 16384` (1125.5 t/s) |
 | 14 | Port the prefill indexer **relu+head-sum** fusion (`idx-relu-sum`) | **DONE 2026-09-22 (session 6): +1.8 % pp32768 at `-b/-ub 4096`, bit-identical, default ON** | done | **DONE** — [`2026-09-22-idx-relu-sum.md`](2026-09-22-idx-relu-sum.md), `patches/0013`.  `ggml_cuda_match_idx_relu_sum` anchors at the RELU and accepts our L2a relu-before-the-4-D-reshape form (`idx_relu_sum_f32`), reading the block scores once instead of H times.  RDNA3_5-gated like the reference.  Kill switch `GGML_CUDA_DISABLE_IDX_RELU_SUM=1` |
 | 15 | `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` | low-single-digit % | 2–3 d | item-8 follow-ups; the bounds trim is coupled to the reference's complete-block selection (`compact`/`maskless`), which our fused cell top-k does not have, so scope carefully |
-| 16 | **BF16 HC streams** (`blk16`/`res16`) | **DONE 2026-09-22 (session 6): +4.9 % pp8192 / +4.8 % pp32768 at `-b/-ub 4096`, default OFF** | done | **DONE** — [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md), `patches/0011`.  BF16 arms in both combine+norm kernels, the structure-only combine identifier + blk16/res16 marking in `graph_optimize`, the MoE bf16-out reduction variants.  Default byte-identical.  `res16` is the dominant half (+4.7 %/+4.6 %); `blk16` alone +3.2 %/+2.5 %.  Limit: the qwen4exp `ffn_out` MoE-merge ADD is not adjacent to the reduction chain, so only the attention-path `block_out` takes `blk16` |
+| 16 | **BF16 HC streams** (`blk16`/`res16`) | **DONE 2026-09-22 (session 6): +4.9 % pp8192 / +4.8 % pp32768 at `-b/-ub 4096`, default OFF** | done | **DONE** — [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md), `patches/0011`.  BF16 arms in both combine+norm kernels, the structure-only combine identifier + blk16/res16 marking in `graph_optimize`, the MoE bf16-out reduction variants.  Default byte-identical.  `res16` is the dominant half (+4.7 %/+4.6 %); `blk16` alone +3.2 %/+2.5 %.  Limit: the qwen4exp `ffn_out` MoE-merge ADD is not adjacent to the reduction chain, so only the attention-path `block_out` takes `blk16` — **the reference's merge path is equally dormant on qwen4exp** (same builder), so this is not a gap against it; see the handover's "What is deliberately NOT being done" |
 
 **Session-5 re-rank (2026-09-22, `-b 8192 -ub 8192 -p 32768` profile):** the remaining gap is the BF16
 intermediate traffic — **HC combine (`blk16`/`res16`) + MoE epilogue ≈ 2.4 s, ~4.6 %** — plus the
