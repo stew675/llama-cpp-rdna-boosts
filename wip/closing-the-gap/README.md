@@ -10,7 +10,7 @@ moved here and updated 2026-09-21.
 | [`closing-the-gap.md`](closing-the-gap.md) | the living analysis. §0–11 are the **2026-09-20 snapshot** (dated measurements); the **Update 2026-09-21** block, **§12** (MTP qualification) and **§13** (phased plan) are current. |
 | [`2026-09-21-mtp-qualification.md`](2026-09-21-mtp-qualification.md) | the MTP qualification record: plain-vs-MTP on qwen4exp IQ4_NL, ours vs the other solution's, and the `nextn_shared_target_tensors` finding. |
 | [`2026-09-21-hc-combine-norm.md`](2026-09-21-hc-combine-norm.md) | Phase-1 item 1 start: the `hc_combine_norm` matcher root cause (three bugs) and the +1.5 % prefill prototype on fork branch `gap-closing`. |
-| [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..0c860fe77`) exported as patches, so the code work survives a fork reset. |
+| [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..94694a38e`) exported as patches, so the code work survives a fork reset. |
 
 ## The two moving references this file tracks
 
@@ -23,7 +23,7 @@ moved here and updated 2026-09-21.
 
 ## Current "our side" build state
 
-* `~/llama.cpp` branch **`gap-closing`** @ **`0c860fe77`** = `mmb-beta` (r12 `72176ae8a` + the 12
+* `~/llama.cpp` branch **`gap-closing`** @ **`94694a38e`** = `mmb-beta` (r12 `72176ae8a` + the 12
   `beta/mmb-general/patches/*.patch`, tree `bca69f23dd…`) + the 2026-09-21 changes: **default-on policy**
   (MMB/HC16/matcher), the `hc_combine_norm` matcher revival, and env-gated debug traces.
 * Built on this box (gfx1151) with `~/bin/build-llama-rocm-714`.  **All beneficial features are on by
@@ -38,7 +38,7 @@ cd ~/llama.cpp
 git checkout rdna-boosts && git branch -D mmb-beta gap-closing 2>/dev/null
 git checkout -b mmb-beta
 git am /home/stew675/llama-cpp-rdna-boosts/beta/mmb-general/patches/*.patch
-git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 0c860fe77
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 94694a38e
 ~/bin/build-llama-rocm-714
 ```
 
@@ -63,8 +63,10 @@ MTP tuning + correctness.**
 **Phase 1 — recall / long-context prefill + correctness**
 
 1. Wire the existing `hc_gate_mix_kernel` + make `hc_combine_norm` fire (matcher) — the `HC_*`
-   ablation is −19.5 % on the other solution's model. **Combine+norm half started 2026-09-21** (matcher
-   revived, +1.5 % prefill — see the record); the `hc_gate_mix` half is still open.
+   ablation is −19.5 % on the other solution's model. **Both halves done 2026-09-21**: the combine+norm
+   matcher was revived (+1.5 % prefill) and `hc_gate_mix` is wired and default-on on gfx1151
+   (+1.2–1.5 % at pp8192/32768, width-pure, text-identical) — see the record and `patches/0003`.
+   Follow-up: the gate-mix kernel is IQ4_NL-only, so the mixed UD-IQ4_XS model is unchanged.
 2. Port `gdn-conv.cu` + `ple-conv.cu` (now F32-aware for Flash-Next PLE) — −10.5 %.
 3. **`-ub 16384` is deferred** (target is `-ub 8192`).  Root cause in the “Update 2026-09-21 (later)”
    section: result_output reserve + HC pin + resident PLE.  Candidate fixes: default the PLE to

@@ -69,3 +69,51 @@ behind the same matcher.
 3. The other half of item 1 — wire the beta's existing `hc_gate_mix_kernel` (`mmb.cu`,
    `ggml_cuda_hc_gate_mix`, currently no call site) or extend `DSV4_HC_PRE` to fold the gate GEMM — is
    untouched.
+
+---
+
+## 2026-09-21 (later) — the gate-mix half: wired and default-on
+
+Phase-1 item 1's second half is done. Fork `gap-closing` @ `94694a38e` (exported as
+`patches/0003`).
+
+### What was missing
+
+`hc_gate_mix_kernel` + `ggml_cuda_hc_gate_mix` existed in `mmb.cu` (ported from the halo-box
+reference) with **no call site**, and `mmb_cfg().gatemix` defaulted **0**. So the HC gate GEMM
+(`w_up @ lo`, `[320 -> 10240]`) dispatched standalone and the mix ran in the `dsv4_hc_pre` op, where
+the reference folds the GEMM + sigmoid + mix into one kernel.
+
+### The port
+
+Two things, both in the backend graph optimizer (`ggml_cuda_try_fuse`):
+
+1. `ggml_cuda_hc_mix_closed()` — the closed-window wrapper around the existing `hc_mix` matcher
+   (identical to the reference's helper). The unfused chain case.
+2. At the gate `MUL_MAT`, when its only consumer opens an hc_mix window, call
+   `ggml_cuda_hc_gate_mix`. The delivery's default graph does **not** build the unfused chain — it
+   builds the explicit `ggml_dsv4_hc_pre` op — so the matcher also handles
+   `MUL_MAT -> RESHAPE(view) -> DSV4_HC_PRE`. That path needs the `[hc*n_embd, T]` activation the bf16
+   cache is keyed on; it is recovered from the gate GEMM's own activation input
+   (`silu(scale(MUL_MAT(w_down, xn)))`), because the pre op's `src[0]` reshape chain does not expose it.
+3. `gatemix = 1` in `mmb_arch_defaults` (RDNA4/RDNA3_0 explicitly 0; the kernel is IQ4_NL + RDNA3_5
+   WMMA). Kill switch `LLAMA_HC_GATEMIX=0`.
+
+### Result — gfx1151, qwen4exp IQ4_NL, `-b/-ub 8192`, r=3
+
+| pp | `LLAMA_HC_GATEMIX=0` | default (gatemix on) | delta |
+|---:|---:|---:|---:|
+| 8192  | 1198.8 | **1212.6** | +1.2 % |
+| 32768 | 1138.6 | **1155.6** | +1.5 % |
+
+Purity: width probe **PASS** (worst maxdiff 0, W=1..8) and same-seed greedy text **identical**
+(`471d102e7b7d`). The fusion shifts the prefill logits by a bf16-epilogue ULP (three width-pure
+variants exist: pre-op-only `02ece229`, unfused+gatemix `e9171924`, pre-op+gatemix `32eb09c3`) but the
+greedy text is stable; it is prefill-only (`T >= mmb_min_t`), so the decode/verify band is untouched.
+
+### Caveat / follow-up
+
+The kernel dequantizes **IQ4_NL** only. The uniform IQ4_NL checkpoint is the gap target, so it wins
+there; the delivery's mixed UD-IQ4_XS model keeps its HC gate at Q8_0 (measured flat 1170.5 -> 1173.2,
+within noise), so it sees no change. Generalizing `hc_gate_mix_kernel` to the other MMB weight types
+(its dequant is the IQ4_NL row-18 path) is the follow-up if the mixed models matter.
