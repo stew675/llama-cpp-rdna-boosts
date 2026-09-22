@@ -112,6 +112,30 @@ the one real MTP gap are in [`2026-09-21-mtp-qualification.md`](2026-09-21-mtp-q
 the only MTP gap is **`nextn_shared_target_tensors` support** (we cannot load the shared MTP head
 pwilkin's own IQ4_NL model ships).  The body's prefill items 1–8 are the "recall" phase.
 
+### G. Default-on policy + the recovered full-set numbers (2026-09-21)
+
+**Policy (now in `AGENTS.md`):** a beneficial feature that has passed the gates is **ON by default**; the
+env var only **disables** it.  Applied on fork branch `gap-closing`:
+
+* `GGML_CUDA_MMB` default **ON** (`=0` disables), RDNA3_0 included (`GGML_CUDA_MMB_RDNA3=0` disables that arm);
+* MMB `hc16` default **ON** (`GGML_CUDA_MMB_HC16=0` disables) — the two graph-optimizer HC16 marking
+  sites in `ggml-cuda.cu` had a hardcoded env default of 0 and ignored the arch config, so HC16 never
+  engaged without an explicit env (this is why the earlier full-set A/B looked flat);
+* the HC `hc_combine_norm` matcher default **ON** (`LLAMA_FUSED_DSV4_HC_POST=1` forces the slower op).
+
+gfx1151, qwen4exp IQ4_NL, `-b/-ub 2048`, prefill, **no env at all**:
+
+| pp | default (full set) | `GGML_CUDA_MMB=0` | delta |
+|---:|---:|---:|---:|
+| 2048 | 1158.6 | — | |
+| 8192 | 1136.2 | 835.1 | **+36 %** |
+| 32768 | 1070.9 | 811.1 | +32 % |
+
+Parity with the pre-port WIP at pp8192 (1136.4), i.e. the gfx1201/gfx1100 port did **not** strand the
+win.  The earlier search for “1180–1220” was the `-ub 16384` regime (blocked by the context bug, item 3),
+run/thermal variance, and ~1 % port cost — not a lost kernel.  Same-seed default run reproducible
+(`extract-generated 01509ffcc688` twice); full `BETA-TESTING` gates still pending.
+
 ---
 
 ## 0. TL;DR (2026-09-20 snapshot)

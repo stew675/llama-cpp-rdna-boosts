@@ -519,6 +519,30 @@ Consequences, so it is not re-litigated:
   block-08 notes) — that is correctness, not scope creep.
 * "Not validated on NVIDIA" is an acceptable, documented state — never a blocker for an RDNA win.
 
+## Default-on policy — beneficial features are ON; env vars only disable (2026-09-21)
+
+A feature that improves performance (or correctness) and has passed the relevant QA gates is
+**enabled by default**.  An environment variable for such a feature exists **only to disable it** — for
+A/B testing, bisection or debugging — never to enable it.
+
+**Why:** the maintainer's validation boxes (Strix Halo / gfx1151 in particular) are much slower than
+gfx1201, so a benchmark or gate that silently runs without a beneficial opt-in wastes real wall-clock
+time and reports 2/3-speed numbers as if they were the product.  The worked example is the `mmb`/HC16
+campaign: for an entire session the prefill A/Bs ran with `GGML_CUDA_MMB` unset at ~835 t/s when the
+full set is ~1136 t/s (**+36 %**), and the first `hc_combine_norm` win was left default-off.
+
+**Consequences:**
+
+* When a gate passes, flip the default **in the same change** (or immediately after) and turn the old
+  opt-in into an opt-out (`FEATURE=0`).  Keep reading the env var; just invert the default.
+* A feature that is beneficial but not yet fully gated is a reason to **gate it**, not to keep it
+  default-off.  Default-on with the risk documented, then run the gate.
+* A kill-switch for a *correctness* risk (a bisect knob, a workaround for a known-bad state) is a
+  different thing and may stay default-off — the distinction is “on because it helps” vs “off because
+  it is known-risky”.
+* Before running any benchmark, use the full feature set (once this policy is applied, the defaults are
+  the full set).  If you catch yourself writing `FOO=1 <bench>`, ask why the default is not already `1`.
+
 ## Critical facts (do not re-derive)
 
 - **`llama-cli` MUST always be invoked with `--single-turn`** (plus
