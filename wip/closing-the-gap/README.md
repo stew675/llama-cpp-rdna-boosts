@@ -32,7 +32,7 @@ moved here and updated 2026-09-21.
 
 ## Current "our side" build state
 
-* `~/llama.cpp` branch **`gap-closing`** @ **`9904c347d`** = `mmb-beta` (r12 `72176ae8a` + the 12
+* `~/llama.cpp` branch **`gap-closing`** @ **`4a75744fa`** = `mmb-beta` (r12 `72176ae8a` + the 12
   `beta/mmb-general/patches/*.patch`, tree `bca69f23dd…`) + the 2026-09-21/22 changes: **default-on
   policy** (MMB/HC16/matcher), the `hc_combine_norm` matcher revival, the **`hc_gate_mix` fusion**
   (session 2), the **depthwise conv1d fusions** (session 3), the **QSA block-window fix** (session 3,
@@ -40,7 +40,7 @@ moved here and updated 2026-09-21.
   (session 4, item 6), and the **tall-tile min-M** fix (session 4, item 7), plus env-gated debug traces.
 * Built on this box (gfx1151) with `~/bin/build-llama-rocm-714`.  **All beneficial features are on by
   default** (see the `AGENTS.md` default-on policy); env vars only disable.
-* The nine `gap-closing` commits (`0001..0009`) are exported to [`patches/`](patches/) in case the local
+* The ten `gap-closing` commits (`0001..0010`) are exported to [`patches/`](patches/) in case the local
   fork branch is lost.
 
 To reproduce:
@@ -50,7 +50,7 @@ cd ~/llama.cpp
 git checkout rdna-boosts && git branch -D mmb-beta gap-closing 2>/dev/null
 git checkout -b gap-closing
 git am /home/stew675/llama-cpp-rdna-boosts/beta/mmb-general/patches/*.patch
-git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 9904c347d
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 4a75744fa
 ~/bin/build-llama-rocm-714
 ```
 
@@ -128,10 +128,11 @@ MTP tuning + correctness.**
    **Item 1's `hc_combine_norm_f32` `_b256` swap stays CLOSED NEGATIVE** — not bit-identical (it changes
    the greedy text, deterministically), so the rejection does not rest on timing; see
    [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md).
-5. MoE bf16 epilogue + drop `concat_transposed` — **re-priced 2026-09-22 (session 5):** the
-   `concat_transposed` materialisation is already gone at `-ub 8192`; what remains is the **BF16 MoE
-   epilogue** (~+633 ms, ~1.2 %, `moe_weighted_reduction_bf16_v4` 846 vs our `f32_vec4` 1480 ms).
-   Lossy — decide with the HC BF16 streams (item 13's sibling, new item 16).
+5. MoE bf16 epilogue + drop `concat_transposed` — **MoE bf16 epilogue DONE 2026-09-22 (session 5,
+   `patches/0010`), default OFF** via `GGML_CUDA_MMB_DOWN16=1` (lossy): the IQ4_NL routed-down GEMM
+   output is marked bf16-only, the producer stores BF16 in place and `moe_weighted_reduction_bf16_v4`
+   reads it — kernel 1479 -> 846 ms at pp32768, `plain == draft-mtp` and width probe PASS.  The
+   `concat_transposed` materialisation is already gone at `-ub 8192`.
 13. **`-lzm auto` semantics + managed PLE reader perf** — **semantics DONE, reader gated OFF**
     2026-09-22: `on` = mmap-lazy, `off` = preload, `auto` = upstream auto, `--lazy-buffer-size` dropped,
     managed LRU **opt-in via `LLAMA_LAZY_BUF_MB`** and off by default (slowest arm).  **Discriminator:**
@@ -142,8 +143,9 @@ MTP tuning + correctness.**
     applies relu *before* the 4-D reshape (the L2a win), so the reference matcher cannot port verbatim.
 15. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` — the item-8 follow-ups; the trim is
     coupled to the reference's complete-block selection, which our fused cell top-k lacks.
-16. **BF16 HC streams** (`blk16`/`res16`) — ~1.8 s, ~3.4 % at depth, lossy → maintainer's call;
-    pair with item 5.
+16. **BF16 HC streams** (`blk16`/`res16`) — **~1.8 s, ~3.8 % at depth, the biggest remaining item;
+    NOT STARTED (scoped 2026-09-22 session 5)**, default OFF like item 5.  Consumer arms +
+    `ggml_cuda_hc_combine_norm_args` fields + the ~120-line HC stream marking block.
 
 **Phase 2 — decode speed + correctness**
 

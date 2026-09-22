@@ -342,9 +342,9 @@ Both are recall-speed (Phase-1) items; the audit record has the full flag table 
 
 | what | where / value |
 |---|---|
-| fork `~/llama.cpp` | branch **`gap-closing`** @ **`9904c347d`** = r12 + the 12 `beta/mmb-general` patches + the 9 gap-closing commits |
+| fork `~/llama.cpp` | branch **`gap-closing`** @ **`4a75744fa`** = r12 + the 12 `beta/mmb-general` patches + the 10 gap-closing commits |
 | fork build | `~/llama.cpp/build-rocm` (gfx1151, ROCm 7.14), full feature set **default** |
-| this repo | branch `gap-closing` (published to `origin`), `wip/closing-the-gap/patches/0001..0009` |
+| this repo | branch `gap-closing` (published to `origin`), `wip/closing-the-gap/patches/0001..0010` |
 | the other solution | `~/pwilkin-llama-cpp` @ `b0f31f587`, `build-rocm` |
 | model | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (93 GiB, qwen4exp) |
 | MoE test model | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf` |
@@ -352,7 +352,7 @@ Both are recall-speed (Phase-1) items; the audit record has the full flag table 
 
 Rebuild: `cd ~/llama.cpp && ~/bin/build-llama-rocm-714`.  Runtime:
 `export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH; export HIP_VISIBLE_DEVICES=0`.
-The nine `gap-closing` fork commits are exported to [`patches/`](patches/) so the code survives a fork
+The ten `gap-closing` fork commits are exported to [`patches/`](patches/) so the code survives a fork
 reset.
 
 ### What NOT to redo (sessions 3–4)
@@ -1275,13 +1275,14 @@ body, (7) tall tile, (8) QSA graph flags; items 1–9 survive, regrouped below.
 | 3 | Fix the `n_batch==n_ubatch==n_ctx` context creation | unlocks `-ub 16384` | 0.5–2 d | pre-existing delivery bug |
 | 3.5 | **Port the three correctness fixes** (`40c0b9c38`, `b0f31f587`, `14fff4f97`) | prevents long-session corruption | 0.5–1 d | **CLOSED 2026-09-22**: `b0f31f587` (QSA block window by highest stored position) **ported**, `patches/0005` — [`2026-09-22-qsa-block-window-fix.md`](2026-09-22-qsa-block-window-fix.md); the other two audited **N/A** (no maskless path; top-k output carries no sentinels) — [`2026-09-22-qsa-item-3.5-audit.md`](2026-09-22-qsa-item-3.5-audit.md) |
 | 4 | Port `norm-gated.cu` (`rms_rows`) + `idx-relu-sum.cu` | −2.9 % / −1.3 % | 1–2 d | **`rms_rows` DONE 2026-09-22 (session 4)**: ported default-on, bit-identical, ~+0.3 % at `-ub 4096` — [`2026-09-22-norm-rows-fusion.md`](2026-09-22-norm-rows-fusion.md), `patches/0006`.  **`idx-relu-sum` is NOT banked (corrected 2026-09-22 session 5):** our fused indexer score is `n_tokens == 1` only, so prefill still runs `unary_op<relu>` 559 ms + head-sum adds — see the new item 14 |
-| 5 | MoE: bf16 epilogue + drop `concat_transposed` | **re-priced 2026-09-22 (session 5): ~+633 ms (~1.2 %)** | 1–2 d | the `concat_transposed` materialisation is already gone at `-ub 8192`; what remains is the **BF16 MoE epilogue** (`moe_weighted_reduction_bf16_v4` 846 vs our `f32_vec4` 1480 ms).  Lossy — pair it with the HC BF16 decision (new item 13) |
+| 5 | MoE: bf16 epilogue + drop `concat_transposed` | **+633 ms kernel** | 1–2 d | **MoE bf16 epilogue DONE 2026-09-22 (session 5, `patches/0010`), default OFF** via `GGML_CUDA_MMB_DOWN16=1` (lossy): the IQ4_NL routed-down GEMM output is marked bf16-only, the producer stores BF16 in place and `moe_weighted_reduction_bf16_v4` reads it — kernel 1479 -> 846 ms at pp32768 (matches the reference's 846.5), `plain == draft-mtp` and width probe PASS with it on.  The `concat_transposed` materialisation is already gone at `-ub 8192` |
 | 6 | Tune/port-align `qsa3_attn` body vs `qsa.cu` | ~+195 ms (~1.5 %) | 1–2 d | **DONE 2026-09-22 (session 4)**: the gap was the per-cell `cell_vis` check, not geometry; folded into `umask` at merge time, bit-identical, `qsa3_attn` 809.6 -> 672.9 ms, +2.4 %/+1.7 % — [`2026-09-22-qsa3-visibility-fold.md`](2026-09-22-qsa3-visibility-fold.md), `patches/0007` |
 | 7 | Investigate the tall `384x64` 2× launch count | unknown (part of +809) | 0.5–1 d | **DONE 2026-09-22 (session 4)**: the 2× was the M=4 HC inject admitted by the tall gate; a min-M bound keeps it on the dense tile, bit-identical, +0.8 %/+1.1 % — [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md), `patches/0008` |
 | 8 | Audit the 9 QSA graph-side flags vs block-14/15 | low-single-digit % (2 un-ported) | 0.5 d | **DONE 2026-09-22 (session 4)**: 7/9 present/superseded; the 2 un-ported (`QSA_SCORE_BOUNDS`+`_QUERY_STRIP`, `QSA_SCORE_WMMA`) are now **item 15**, deferred behind the bigger families |
 | 13 | **`-lzm auto` semantics + managed PLE reader perf** | memory: ~28 GB; `-ub 16384` unlock | 0.5–1 d (semantics **DONE**, reader **gated OFF**) | session-5: `on`=mmap, `off`=resident, `auto`=upstream auto, managed LRU **opt-in** via `LLAMA_LAZY_BUF_MB` and **off by default** because it is the slowest arm (1090/1184 vs mmap 1219/1217 vs resident 1285/1232 at pp8192/32768).  `--lazy-buffer-size` dropped.  **Discriminator (2026-09-22):** the cost is *not* only page-cache pressure — with the table fully cached (`-ub 2048`) the reader is still **−4.0 % vs mmap** (vs −9.7 % under pressure), so the arena has an intrinsic streaming overhead; the fix is a no-cache parallel-pread fast path like the reference's `on-direct`, then reconsider defaulting it on.  It already enables `-b/-ub 16384` (1125.5 t/s) |
 | 14 | Port the prefill indexer **relu+head-sum** fusion (`idx-relu-sum`) | ~+590 ms (~1.1 %) | 0.5–1 d | non-lossy; reference `idx_relu_sum_f32` (1536 calls / 364 ms) vs our `unary_op<relu>` 559 ms + adds.  Our graph applies relu *before* the 4-D reshape (the L2a win), so the reference matcher cannot port verbatim — use a fused op or an order-aware matcher |
 | 15 | `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` | low-single-digit % | 2–3 d | item-8 follow-ups; the bounds trim is coupled to the reference's complete-block selection (`compact`/`maskless`), which our fused cell top-k does not have, so scope carefully |
+| 16 | **BF16 HC streams** (`blk16`/`res16`) | **~1.8 s, ~3.8 % at depth** — biggest remaining item | 2–3 d | **NOT STARTED (scoped 2026-09-22 session 5).**  Consumer: the reference's `res_in_bf16`/`blk_in_bf16`/`res_out_bf16`/`out_xn_bf16`/`store_xn_f32` arms in `hyperconn.cu` + the `ggml_cuda_hc_combine_norm_args` fields; graph: the ~120-line marking of the HC `block_out`/`residual`/`xn` streams bf16-only (our `mmb.cu` producers already honour `ggml_cuda_mmb_is_bf16_only`, and `LLAMA_HC_BLK16`/`RES16` gates already exist).  Also needs the reference's `moe_weighted_reduction_bf16_v4_out` (bf16-in/bf16-out with merge) for the block_out path.  Gate default OFF like item 5 |
 
 **Session-5 re-rank (2026-09-22, `-b 8192 -ub 8192 -p 32768` profile):** the remaining gap is the BF16
 intermediate traffic — **HC combine (`blk16`/`res16`) + MoE epilogue ≈ 2.4 s, ~4.6 %** — plus the
