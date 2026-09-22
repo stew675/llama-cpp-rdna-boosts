@@ -18,8 +18,10 @@
   ~844 t/s, while `-ub 4096` stays pegged at 100 % and runs **1093 t/s** (maintainer, 2026-09-22).
   `-ub 16384` is root-caused and parked (below); do not spend time on it unless the PLE-lazy fix is
   picked up.
-* At a **matched** ubatch we were **~10 % behind at pp8192 / ~15 % behind at pp16384** on the uniform
-  IQ4_NL model — the number the §13 phase plan closes; items 1+2 have since narrowed it.
+* At a **matched** ubatch we started **~10 % behind at pp8192 / ~15 % behind at pp16384** on the uniform
+  IQ4_NL model.  After sessions 2–4 (items 1, 2, 6, 7) the **QSA path is now ahead** of the reference
+  (761 vs 812 ms) and we are ahead on the IQ4_XS model (1244 vs 967 t/s); the **residual IQ4_NL prefill
+gap** is the still-missing dense/HC/conversion families priced in §13, not the QSA/attention path.
 * **Phase-1 item 1 (HC fusions) DONE** (session 2, **`patches/0003`**): `hc_combine_norm` matcher
   revived (+1.5 %) and `hc_gate_mix` wired default-on (+1.2–1.5 %) — width-pure, same-seed-text
   identical.
@@ -60,7 +62,13 @@
   takes the 384-row tall tile (it ran 2× the dispatches of the reference); **bit-identical** (text
   `f61199ba5644`), tall `384,64` 1030/380 -> 540/190 ms, **+0.8 % pp8192 / +1.1 % pp32768** at `-ub 4096`
   — [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md).
-* **Next: Phase-1 item 8** — audit the 9 QSA graph-side flags vs block-14/15 (small / likely redundant).
+* **Phase-1 item 8 (QSA graph flags) DONE** (session 4, audit): 7/9 are present or superseded in our
+  block-14/15 QSA; **2 are un-ported prefill-score optimizations** — `QSA_SCORE_BOUNDS`+
+  `QSA_QUERY_STRIP` (score the prefill in 512-token strips, each trimmed to its visible blocks; ~half
+  the indexer score work) and `QSA_SCORE_WMMA` (a fused WMMA prefill score; our fused op is gated to
+  `n_tokens == 1`) — [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md).
+* **Next: the QSA prefill-score follow-up** above, then the two owed gates (MMB-off byte check, MTP
+  gate) before promoting `beta/mmb-general`.  This is a good fresh-session start point.
 
 ### Do these in order
 
@@ -72,8 +80,10 @@
    Already green (sessions 2-3): `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA` 26/26,
    `FLASH_ATTN_EXT` 5955/0, width probe PASS on 27B + qwen4exp + 35B-A3B, conv fused==unfused row-0
    hashes.
-2. **Next code item — Phase-1 item 8** (audit the QSA graph-side flags vs block-14/15; items 3.5, 4, 6
-   and 7 are done).
+2. **Next code item — the QSA prefill-score follow-up from item 8's audit** (`QSA_SCORE_BOUNDS` +
+   `QSA_QUERY_STRIP` first, then `QSA_SCORE_WMMA`) —
+   [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md).  Phase-1 items 1–8 are
+   otherwise done.
 3. **Use `-b/-ub 4096` for perf A/Bs** (session-4 methodology finding).  The `-ub 8192` absolute target
    is fine for a single number, but an A/B whose arms change the graph's memory footprint compares two
    pressure regimes there.  Record the min free memory with any `-ub 8192` result.
@@ -134,7 +144,7 @@ re-checking.  One defensive note for a future change: the VEC QSA kernel derefer
 `cell_vis` is null, so a change that could make both null would fault — add the reference's assert (or
 enforce `mask || cell_vis` in `ggml_cuda_flash_attn_qsa`) at that point.
 
-### Next item — item 4, 6, 7 DONE; item 8 is next
+### Next item — items 4, 6, 7 DONE; item 8 DONE (audit); the QSA prefill-score follow-up is next
 
 **Item 4 is DONE (session 4, `patches/0006`).**  The narrow-row RMS norm (`norm-gated.cu::rms_rows_f32`,
 8 rows/block) is ported, default-on and bit-identical; ~+0.3 % at the clean `-b/-ub 4096` protocol —
@@ -150,10 +160,26 @@ end-to-end — [`2026-09-22-qsa3-visibility-fold.md`](2026-09-22-qsa3-visibility
 HC inject sharing the tile with the `M=320` down; the gate is now `M >= 16`, so the inject takes the dense
 tile — bit-identical, +0.8 %/+1.1 % — [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md).
 
-**Item 8 is next.**  Audit the reference's 9 QSA graph-side flags (`LLAMA_QSA_*`) against what our
-block-14/15 QSA already does, and record each as present / superseded / N/A.  This is an audit, not a
-port; the QSA correctness work (item 3.5) already showed our derived-visibility design subsumes several
-of them.
+**Item 8 is DONE (session 4, audit).**  The reference deleted its 9 QSA graph flags in `ac1ebb4e0`
+("compile in the tuned defaults"); 7 are present/superseded on our tree (whole-attn / block-selection /
+compact-metadata / direct-indices / maskless→derived-vis / token-embd, and the fused score we have for
+decode).  **Two are genuine un-ported prefill-score optimizations** and are the next work:
+
+1. **`QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`** (do this first).  The reference scores the prefill in
+   `min(n_tokens, 512)`-token strips and, per strip, trims the scorer to the first
+   `(max_query_pos+1)/ratio` blocks — safe because the trimmed blocks are `-inf` in the visibility
+   metadata, so the selection cannot change.  Our chain scores the full `n_blocks` every time; the
+   indexer score/top-k chain is ~185 ms + the score matmul at pp8192, and the bound roughly halves it.
+   Port needs `qsa_position_prefix(ubatch)` + `qsa_prefix_limits(...)` in `llama-memory-hybrid-idx.*`,
+   a `qwen4exp_query_strip()` in `qwen4exp.cpp`, and the strip/limits threaded through the QSA graph
+   input + `can_reuse` (the reserve-time synthetic ubatch must stay unbounded).  Gate: width probe PASS
+   + same-seed text + A/B at `-b/-ub 4096`.
+2. **`QSA_SCORE_WMMA`** — extend a fused score to the prefill band (`n_tps >= 128`, `idx_dim==128`,
+   `n_idx_h==4`); ours (`GGML_CUDA_QSA_INDEXER_SCORE`) is `n_tokens == 1` only.  This is a numerics
+   change if the fused reduction order differs, so it needs the width probe + same-seed text and a
+   careful read of the reference's op before porting.
+
+Both are recall-speed (Phase-1) items; the audit record has the full flag table and the port scoping.
 
 ### Current state (exact)
 
@@ -172,7 +198,7 @@ Rebuild: `cd ~/llama.cpp && ~/bin/build-llama-rocm-714`.  Runtime:
 The eight `gap-closing` fork commits are exported to [`patches/`](patches/) so the code survives a fork
 reset.
 
-### What NOT to redo (session-3 conclusions)
+### What NOT to redo (sessions 3–4)
 
 * **`hc_combine_norm_f32_b256`** — not bit-identical, slower; the reference's speed is its BF16 HC
   traffic.  If HC-combine speed is revisited, the change is the **BF16** `blk16`/`res16` path (lossy,
@@ -180,6 +206,38 @@ reset.
 * **`concat_transposed` drop (item 5)** — already gone at `-ub 8192`.
 * **`-ub 16384`** — parked; the `-ub 8192` long-context point memory-thrashes, so use `-ub 4096` there.
 * **MMB-off byte-identity and the MTP gate** — still owed, not yet done.
+* **Don't trust an ad-hoc GGUF type parser** (2026-09-22): a session's parser used the wrong ggml enum
+  and reported the IQ4_XS model's types as IQ2_XS when they are **IQ4_NL**.  The IQ4_XS model has **no
+  IQ2_XS/IQ1_S at all** (IQ4_NL 45.7 GiB, IQ3_S 31.6, Q8_0 8.3, IQ4_XS 0.8, Q6_K 0.5, small F32/BF16) —
+  all MMB-covered.  Its **PLE is IQ4_NL, 26.8 GiB** (not IQ2_XS), so a "PLE→Q4_0" swap cannot shrink
+  it (both are 4.5 bpw).  Use `llama-gguf`/`llama-bench`'s own type output, never a hand-rolled enum.
+
+---
+
+## Session-4 record (2026-09-22): items 3.5 (audit), 4, 6, 7, 8 — and the ubatch confound
+
+Five items closed, four records + one methodology finding.  All performance changes were gated
+**bit-identical** (width probe PASS, same-seed greedy text unchanged) and **default ON**.
+
+| item | result | record |
+|---|---|---|
+| 3.5 (audit) | `40c0b9c38` + `14fff4f97` are **N/A** — no maskless path, no sentinels in the top-k output | [`2026-09-22-qsa-item-3.5-audit.md`](2026-09-22-qsa-item-3.5-audit.md) |
+| 4 narrow-row RMS norm | `patches/0006`, ~+0.3 % at `-ub 4096` | [`2026-09-22-norm-rows-fusion.md`](2026-09-22-norm-rows-fusion.md) |
+| 6 QSA visibility fold | `patches/0007`, **+2.4 %/+1.7 %**, qsa3 809.6→672.9 ms | [`2026-09-22-qsa3-visibility-fold.md`](2026-09-22-qsa3-visibility-fold.md) |
+| 7 tall-tile min-M | `patches/0008`, **+0.8 %/+1.1 %**, tall 1030/380→540/190 ms | [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md) |
+| 8 QSA graph flags | audit: 7/9 present/superseded; **2 un-ported prefill-score items** hand to the next session | [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md) |
+
+**Methodology finding (important for every future A/B):** `-ub 8192` on this box bottoms at 2–3 GB free
+with ~40 % more kswapd reclaim, and a fusion whose arms change the graph's memory footprint run their
+arms in **different pressure regimes** — item 4 read +1.05 % at `-ub 8192` but +0.27 % at `-ub 4096`.
+Use **`-b/-ub 4096`** for perf A/Bs — [`2026-09-22-ubatch-8192-memory-confound.md`](2026-09-22-ubatch-8192-memory-confound.md).
+The prior rejections were re-audited; the shipped wins stand (their sign was positive under the harsher
+protocol), and `hc_combine_norm_f32_b256` still fails on **correctness** (deterministic text change), so
+its rejection never rested on timing.
+
+**Reference status after session 4** (qwen4exp): we are now **ahead** of `b0f31f587` on the QSA pipeline
+(761 vs 812 ms) and on the IQ4_XS model (1244 vs 967 t/s); the residual IQ4_NL prefill gap is the
+still-missing families priced in §13 (the dense/HC/conversion kernels), not the QSA path.
 
 ---
 
@@ -774,7 +832,7 @@ So on the uniform model the WIP's MMB and bf16-producer work are doing exactly w
 | 5 | **indexer relu-sum** | `idx-relu-sum.cu`; `LLAMA_IDX_RELU_SUM` | **absent** | −1.3% |
 | 6 | **MoE bf16 epilogue / concat elimination** | `moe_weighted_reduction_bf16_v4` + `LLAMA_MMB_DOWN16` | F32 epilogue + concat still materialised | ~+466 ms kernel time |
 | 7 | **`hc_combine_norm` b256 variant** | `hc-cn.cu` | only the 1024-block form exists | — |
-| 8 | QSA graph-side options | `qwen4exp.cpp`: `QSA_WHOLE_ATTN`, `_BLOCK_SELECTION`, `_COMPACT_METADATA`, `_DIRECT_INDICES`, `_NO_DENSE_MASK`, `_QUERY_STRIP`, `_SCORE_BOUNDS`, `_SCORE_WMMA`, `_TOKEN_EMBD` | not ported; **partly redundant** with delivery block-14/15 derived-visibility / keys-only / fused indexer score (never audited 1:1) | small |
+| 8 | QSA graph-side options | `qwen4exp.cpp`: `QSA_WHOLE_ATTN`, `_BLOCK_SELECTION`, `_COMPACT_METADATA`, `_DIRECT_INDICES`, `_NO_DENSE_MASK`, `_QUERY_STRIP`, `_SCORE_BOUNDS`, `_SCORE_WMMA`, `_TOKEN_EMBD` | **audited 2026-09-22**: 7/9 present/superseded on our block-14/15 QSA; **2 un-ported** (`QSA_SCORE_BOUNDS`+`_QUERY_STRIP`, `QSA_SCORE_WMMA`) — [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md) | low-single-digit % (prefill score) |
 | 9 | HC knobs `HC_CN_SHAPE`/`HC_MIX_FUSE`/`HC_BLK16`/`HC_RES16`/`HC_PACK_DI` | HC variants | partial (we have the bf16 `xn` stream but not the variants) | inside −19.5% |
 | 10 | depthwise conv2d | `conv2d-dw.cu` | absent | 0 on these models |
 | 11 | MTP-side QSA | `LLAMA_MTP_QSA`, `_MTP_QSA_MIN_T`, `LLAMA_MTP_EH_FLATTEN` | absent | **decode/MTP, not prefill** |
@@ -821,7 +879,7 @@ Pre-existing delivery (base r12 fails, WIP fails, the other solution works), all
 | 5 | MoE: bf16 epilogue + drop `concat_transposed` (its `moe_weighted_reduction_bf16_v4`, `MMB_DOWN16`) | ~+466 ms kernel (~3–4%) | 1–2 days |
 | 6 | Tune/port-align `qsa3_attn` body against `qsa.cu` | ~+195 ms (~1.5%) | 1–2 days |
 | 7 | Investigate the tall `384x64` 2× launch count | unknown (part of +809) | 0.5–1 day |
-| 8 | Audit the 9 QSA graph-side flags vs block-14/15 equivalents | small / likely redundant | 0.5 day |
+| 8 | Audit the 9 QSA graph-side flags vs block-14/15 equivalents | low-single-digit % (2 un-ported) | 0.5 day | **DONE 2026-09-22 (session 4)**: 7/9 present/superseded; 2 un-ported prefill-score items — [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md) |
 
 Items 1+2 alone are ~30% of end-to-end prefill on the other solution's ablations — comfortably the difference between our 1221 and 1300+.
 
@@ -1062,7 +1120,7 @@ body, (7) tall tile, (8) QSA graph flags; items 1–9 survive, regrouped below.
 | 5 | MoE: bf16 epilogue + drop `concat_transposed` | ~+466 ms kernel (~3–4 %) | 1–2 d | beta has `MMB_DOWN16` gated off; wire it + the bf16 reduction |
 | 6 | Tune/port-align `qsa3_attn` body vs `qsa.cu` | ~+195 ms (~1.5 %) | 1–2 d | **DONE 2026-09-22 (session 4)**: the gap was the per-cell `cell_vis` check, not geometry; folded into `umask` at merge time, bit-identical, `qsa3_attn` 809.6 -> 672.9 ms, +2.4 %/+1.7 % — [`2026-09-22-qsa3-visibility-fold.md`](2026-09-22-qsa3-visibility-fold.md), `patches/0007` |
 | 7 | Investigate the tall `384x64` 2× launch count | unknown (part of +809) | 0.5–1 d | **DONE 2026-09-22 (session 4)**: the 2× was the M=4 HC inject admitted by the tall gate; a min-M bound keeps it on the dense tile, bit-identical, +0.8 %/+1.1 % — [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md), `patches/0008` |
-| 8 | Audit the 9 QSA graph-side flags vs block-14/15 | small / likely redundant | 0.5 d | |
+| 8 | Audit the 9 QSA graph-side flags vs block-14/15 | low-single-digit % (2 un-ported) | 0.5 d | **DONE 2026-09-22 (session 4)**: 7/9 present/superseded; the 2 un-ported (`QSA_SCORE_BOUNDS`+`_QUERY_STRIP`, `QSA_SCORE_WMMA`) become the next follow-up — [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md) |
 
 Items 1+2 remain ~30 % of end-to-end prefill on the other solution's ablations.
 
