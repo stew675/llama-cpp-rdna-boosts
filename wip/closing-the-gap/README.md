@@ -48,9 +48,12 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch  
    [`beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md).  Gate semantics changed:
    **Gate 1 = `GGML_CUDA_MMB=0`** (byte-identical to r12), **Gate 2 = the default** (no env).  Plus the
    width probe and the MTP gate.  Green before any promotion.
-2. **Fix the `-ub 16384` context-creation bug** (body §4/§9.5) so we can meet the other solution head-to-head at its
-   best config.
-3. Then resume the phased investigation below.
+2. **Target `-b 8192 -ub 8192`** — decision 2026-09-21.  The `-ub 16384` failure is root-caused and
+   **deferred** (see the “Update 2026-09-21 (later)” section of the doc): it is the full-vocab
+   `result_output` reserve (15.5 GiB, shared with the other solution) plus qwen4exp's HC `block_out`
+   pin (~18 GiB) against the resident PLE table (~27 GiB host).  ubatch 8192 runs clean and is the
+   reproducible head-to-head baseline (ours 1212.6 vs its 1346.5 at pp8192, ~10 % behind).
+3. Then resume the phased investigation below against that baseline.
 
 ## The current open list (see §13 of the doc)
 
@@ -63,7 +66,9 @@ MTP tuning + correctness.**
    ablation is −19.5 % on the other solution's model. **Combine+norm half started 2026-09-21** (matcher
    revived, +1.5 % prefill — see the record); the `hc_gate_mix` half is still open.
 2. Port `gdn-conv.cu` + `ple-conv.cu` (now F32-aware for Flash-Next PLE) — −10.5 %.
-3. Fix the `n_batch == n_ubatch == n_ctx` context-creation bug (unlocks `-ub 16384`).
+3. **`-ub 16384` is deferred** (target is `-ub 8192`).  Root cause in the “Update 2026-09-21 (later)”
+   section: result_output reserve + HC pin + resident PLE.  Candidate fixes: default the PLE to
+   mmap-lazy (fix the `-lzm auto` propagation), or expose `--lazy-buffer-size` in `llama-bench`.
 3.5. Port the other solution's three correctness fixes (`40c0b9c38`, `b0f31f587`, `14fff4f97`).
 4. `norm-gated.cu` + `idx-relu-sum.cu` — −2.9 % / −1.3 %.
 5. MoE bf16 epilogue + drop `concat_transposed` (beta's `MMB_DOWN16` is gated off).

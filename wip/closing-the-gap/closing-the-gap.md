@@ -19,12 +19,88 @@
    the semantics changed — **Gate 1 is now `GGML_CUDA_MMB=0`** (MMB off byte-identical to r12), **Gate 2 is
    the default** (no env).  Also run the width probe and the MTP gate.  Until every gate is green, do not
    promote and do not trust performance numbers as "the product".
-2. **Fix the `-ub 16384` regime.**  `llama-bench -b 16384 -ub 16384 -c 16384` cannot create a context
-   (silent `llama_init_from_model` → null), while the other solution runs it at ~1220 t/s.  This is a **pre-existing
-   delivery bug**, independent of MMB/HC.  `llama-cli` with the same cparams works because its init
-   reserve builds for `n_tokens = 64`; `llama-bench` reserves the full-ubatch graph and dies there.
-   Next step: a debug print / gdb on the reserve failure in `llama_init_from_model` (or a debug build) to
-   identify the tensor/allocation that fails.  Details + the bisect matrix: body §4 and §9.5.
+2. **Target `-ub 8192`, not `-ub 16384` (decision 2026-09-21, see the section below).**  The `-ub 16384`
+   context-creation failure is **root-caused and deferred** — it is a fundamental clash between the
+   compute reserve (the full-vocab `result_output` plus qwen4exp's HC `block_out`/`inject` pin, ~33 GiB)
+   and the resident PLE table (~27 GiB host), not an MMB/HC bug.  `-b 8192 -ub 8192` runs clean and is
+   the reproducible target; use it for all head-to-head work and reserve the 16k regime for a later
+   session.  Root cause + the two candidate fixes are in the section below.
+3. **Only then** resume the "where are we still slower" investigation (body §13 phase plan) against the
+   **ubatch-8192** baseline established below.
+
+---
+
+## Update 2026-09-21 (later) — ubatch 8192 is the target; the 16k reserve diagnosed and deferred
+
+### Decision
+
+Target **`-b 8192 -ub 8192`** for the head-to-head and all further prefill work.  The `-b 16384 -ub 16384`
+regime is parked for a later session.
+
+Uniform IQ4_NL (the other solution's checkpoint), gfx1151, `-ctk f16 -ctv f16`, `-n 0 -r 2`, ours with
+**no env** (full default set), the other solution with its full launcher env:
+
+| pp | ours, `-ub 8192` | other, `-ub 8192` | ours, `-ub 2048` (old) | other, `-ub 16384` |
+|---:|---:|---:|---:|---:|
+| 2048  | 1159.1 | 1233.6 | 1181.5 | 1233.0 |
+| 8192  | 1212.6 | 1346.5 | 1149.3 | 1338.8 |
+| 16384 | 1179.0 | 1387.5 | 1129.2 | 1399.3 |
+
+So ubatch 8192 is itself a real gain over our ubatch 2048 (+5.5 % at pp8192) and gives a stable,
+reproducible baseline: at a **matched** ubatch we are **~10 % behind at pp8192 / ~15 % at pp16384**, which
+is the number the §13 phase plan exists to close.  It also confirms the old "~4 % behind" was partly the
+ubatch mismatch (ours ub2048 vs its ub16384).
+
+### Why `-ub 16384` fails (root cause, deferred not fixed)
+
+`llama-bench -b 16384 -ub 16384 -p 16384` fails at `llama_init_from_model` because the single pp-graph
+reserve needs a **33794 MiB** compute buffer and `cudaMalloc` returns OOM.  Measured breakdown at
+`n_tokens = 16384` (allocator trace):
+
+| term | size | notes |
+|---|---:|---|
+| `result_output` | 15520 MiB | `[n_vocab=248320, n_tokens]` f32 — the reserve uses `n_outputs = n_tokens` |
+| qwen4exp HC pin | ~18114 MiB | every layer's `block_out` pinned as a graph output (~1.1 MiB/token) |
+| graph working set | ~160 MiB | reused heavily |
+
+* **The other solution allocates the same 15520 MiB `result_output`** (verified by enabling
+  `GGML_ALLOCATOR_DEBUG` in its tree and running the same config) — its pp reserve is
+  `n_outputs = 16384` too.  So this term is **not** something they solved and we did not; it is
+  upstream's worst-case logits reserve.  Its total is 16980 MiB because it has **no HC pin**; our
+  unpinned total is 15680 MiB — i.e. our graph is already ~1.3 GiB *smaller* than theirs (block-15
+  W4/V3 work), and the entire 18 GiB excess is the pins.
+* The pin lives in `src/models/qwen4exp.cpp::build_hc_combine` (`ggml_set_output(block_out)` /
+  `ggml_set_output(inject)`) and exists so the fused `hc_combine_norm` matcher can read the **narrow**
+  `block_out` base without the allocator reusing its buffer for the norm output.  It is what lets the
+  matcher run at all; without the pin the matcher declines and the unfused (bit-identical but ~8 %
+  slower) chain runs.  At `n_tokens <= 8192` the pin is affordable (~9 GiB); at 16384 it is not.
+* A `nt <= 8192` guard on the pin **does** make 16384 create a context and run (verified: mixed IQ4_XS
+  `-b/-ub 16384 -p 16384` -> 1069 t/s, compute reserve 15.68 GiB), and is bit-identical to the pinned
+  path (`test-logits-width-probe` W=1..8 worst maxdiff 0).  It was **reverted** with the rest of the
+  experiments because it is a workaround that costs the fusion above 8192; not needed for the 8192 target.
+* **Do not ship the "matcher without the pin" path unverified.**  With the flag requirement removed and
+  the pin off, the matcher fires but the logits differ from both the pinned fusion and the unfused chain
+  (width probe W1 hash `5b7861bc` vs `02ece229`) — the alias check missed a real overlap.  The pin/flag
+  gate is load-bearing.
+
+### The PLE residency (the other half of the memory picture)
+
+The 27.45 GiB `ROCm_Host` model buffer is **entirely `per_layer_token_embd.weight`** (27466 MiB; the
+remaining `token_embd.weight` 644 MiB).  Findings:
+
+* With **`-lzm on`** the PLE is mmap-lazy: it moves to a 26.8 GiB **CPU** mapping and `ROCm_Host` drops to
+  0.63 GiB.  This is exactly what the other solution's launcher gets from `-lzm on-direct` (its summary:
+  `ROCm0 67591 / ROCm_Host 341 / CPU_Mapped 27465` MiB).
+* With the **default `-lzm auto`** our `llama-bench` does **not** lazy-load it: the loader sees
+  `lazy_read::mode == 0 (OFF)`.  `params.lazy_mode` is parsed as AUTO (1) in `llama-bench`
+  (`LAZYPARSE v0=1`) but `lazy_read::add` sees 0, so the value is lost between `to_llama_mparams()` and
+  `llama_model_load()`.  `llama-bench` also has no `--lazy-buffer-size`, so the managed ~5 GiB capped
+  reader is unreachable from it.
+* **Candidate fixes for the later 16k session** (in order of preference): (a) fix the lazy-mode
+  propagation so the PLE is mmap-lazy by default (frees ~27 GiB of pinned host memory and likely makes
+  the pinned 16384 reserve fit without touching the HC matcher); (b) expose `--lazy-buffer-size` in
+  `llama-bench` and use the managed ~5 GiB reader; (c) keep the `nt <= 8192` pin guard as a fallback.
+  (a)/(b) preserve the HC design, which is the point.
 3. **Only then** resume the "where are we still slower" investigation (body §13 phase plan).  The goal is
    to meet the other solution **head to head on the same runtime setup first** — matched `-ub 16384` included — before
    attributing any remaining gap to a kernel.
