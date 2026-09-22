@@ -155,6 +155,12 @@ This is an **upstream bug (#23398)** now **delivered in the delivery set as bloc
   **+19.5/+22.4/+25.4 %** pp8192 (3B), **35B-A3B Q4_1 pp4096 1500 → 2449 (+63 %)** (routed+GLU),
   **gpt-oss-20b MXFP4 pp4096 +5.2 %** — [`2026-09-22-mmb-quant-coverage.md`](2026-09-22-mmb-quant-coverage.md).
   NVFP4 has no local model (oracles gate it).
+* **IQ2 family added too** (`patches/0018`, after a header-only scan of all 132 `*.gguf` in
+  `/llm/models` — `tools/gguf-types.py`): only **IQ2_S** was present (MiniMax-M2.7-IQ3_S 124 tensors,
+  DeepSeek-V4-Flash-UD-IQ3_XXS 84); the whole family **IQ2_S / IQ2_XS / IQ2_XXS** (WTYPE 16–18) is
+  ported and default ON on non-RDNA4.  Oracles 14/14/46 (`MUL_MAT`) and 4/15/75 (`MUL_MAT_ID`); real
+  MiniMax iq2_s **pp4096 +4.9 %** (PPL +1.07 %), dense IQ2_XS **pp8192 +16.5 %** (PPL +0.22 %) —
+  [`2026-09-22-mmb-iq2-coverage.md`](2026-09-22-mmb-iq2-coverage.md).
 
 **Remaining from the handover:** the parked items (Phase 2 sparse QSA decode `d67d58836`, Phase 3
 adaptive ceiling sweep, `-ub 16384` PLE reader) are unchanged.  **The owed `beta/mmb-general`

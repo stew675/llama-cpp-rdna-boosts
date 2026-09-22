@@ -25,8 +25,10 @@ moved here and updated 2026-09-21.
 | [`2026-09-22-qsa-score-bounds.md`](2026-09-22-qsa-score-bounds.md) | Phase-1 item 15: the QSA prefill scorer trim (`QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`) ported to the fused top-k (cell range clamped to `n_blocks*ratio`), default strip 1024, **bit-identical**, **+0.5 % pp8192 / neutral pp32768** at `-b/-ub 8192`; the `-inf`-padded first cut was a wash. |
 | [`2026-09-22-qsa-score-wmma.md`](2026-09-22-qsa-score-wmma.md) | Phase-1 item 15 (follow-up): `QSA_SCORE_WMMA` — the AMD RDNA3_5 4-head/128-dim lightning-indexer WMMA kernel ported + the qwen4exp prefill score fused into one `ggml_lightning_indexer` (all-ones weights, zero F16 mask) composed with the causal trim.  **Op oracle 225/225 (81 new `nh=4` cases)**; **width probe PASS, per-W hashes byte-identical to off**; coherent re-baseline text; **pp32768 +1.0 % / +0.9 %**, pp8192 flat.  **default ON** (`LLAMA_QSA_SCORE_WMMA=0` disables), `patches/0016`. |
 | [`2026-09-22-mmb-quant-coverage.md`](2026-09-22-mmb-quant-coverage.md) | Phase-2 item 10: five more MMB weight types — **Q4_0 / Q4_1 / Q5_0 / MXFP4 / NVFP4** (WTYPE 11–15), dequant-vs-CPU oracles green (`MUL_MAT` 48/47/14/46/45, `MUL_MAT_ID` 74/75/3/74/73), PPL parity, pp8192 **+19.5/+22.4/+25.4 %**, 35B-A3B Q4_1 **+63 %**, gpt-oss MXFP4 **+5.2 %**.  **default ON on non-RDNA4**, `patches/0017`. |
+| [`2026-09-22-mmb-iq2-coverage.md`](2026-09-22-mmb-iq2-coverage.md) | Model-tree scan (`tools/gguf-types.py`, 132 files) + the **IQ2 family** — **IQ2_S / IQ2_XS / IQ2_XXS** (WTYPE 16–18): oracles 14/14/46 and 4/15/75, real MiniMax IQ2_S **pp4096 +4.9 %** (PPL +1.07 %), dense IQ2_XS **pp8192 +16.5 %** (PPL +0.22 %).  **default ON on non-RDNA4**, `patches/0018`. |
 | [`2026-09-22-mtp-shared-nextn-fix.md`](2026-09-22-mtp-shared-nextn-fix.md) | **Correctness fix, delivered in block 00 (r13)**: a shared-NextN MTP head (`nextn_shared_target_tensors`, the IQ4_NL shared Q8_0 sidecar) died every round on the M-RoPE `X < Y` check because `is_mem_shared` was inferred from `ctx_other` alone; gated on the `gemma4-assistant` arch.  0 errors, acceptance 0.287.  Upstream bug (#23398) folded into the block-00 base; the WIP `patches/0015` is superseded. |
-| [`patches/`](patches/) | the fork `gap-closing` commits exported as patches, so the code work survives a fork reset.  On the **r13 rebuild** the campaign is `0001..0014`; **`0015` (the shared-NextN MTP fix) is superseded by delivery r13 block 00** — skip it.  `0016` = `QSA_SCORE_WMMA` (default ON), `0017` = MMB quant coverage Q4_0/Q4_1/Q5_0/MXFP4/NVFP4 (default ON on non-RDNA4). |
+| [`patches/`](patches/) | the fork `gap-closing` commits exported as patches, so the code work survives a fork reset.  On the **r13 rebuild** the campaign is `0001..0014`; **`0015` (the shared-NextN MTP fix) is superseded by delivery r13 block 00** — skip it.  `0016` = `QSA_SCORE_WMMA` (default ON), `0017` = MMB quant coverage Q4_0/Q4_1/Q5_0/MXFP4/NVFP4, `0018` = MMB IQ2_S/IQ2_XS/IQ2_XXS (both default ON on non-RDNA4). |
+| [`tools/`](tools/) | `gguf-types.py` — header-only GGUF tensor-type scanner (no tensor data read); used for the Q2_*/IQ2_* model-tree sweep. |
 
 ## The two moving references this file tracks
 
@@ -195,12 +197,15 @@ MTP tuning + correctness.**
 
 9. Port sparse QSA decode + incremental indexer state (`d67d58836`) — its +11–20 %; our plain decode is
    already ahead, so this is a hold/repay item.
-10. MMB quant coverage — **DONE 2026-09-22 (session 8, `patches/0017`), default ON on non-RDNA4**:
-    **Q4_0, Q4_1, Q5_0, MXFP4, NVFP4** ported to `mmb.cu` (WTYPE 11–15).  `MUL_MAT` oracles
-    48/47/14/46/45, `MUL_MAT_ID` 74/75/3/74/73 (dequant vs CPU, MMB forced on), PPL parity, pp8192
-    +19.5/+22.4/+25.4 %, 35B-A3B Q4_1 +63 %, gpt-oss-20b MXFP4 +5.2 % —
-    [`2026-09-22-mmb-quant-coverage.md`](2026-09-22-mmb-quant-coverage.md).  NVFP4 has no local model
-    (oracle-only).  Q2_K/IQ1_*/IQ2_* stay out of scope for quality.
+10. MMB quant coverage — **DONE 2026-09-22 (session 8, `patches/0017` + `0018`), default ON on non-RDNA4**:
+    **Q4_0, Q4_1, Q5_0, MXFP4, NVFP4** (WTYPE 11–15) and **IQ2_S, IQ2_XS, IQ2_XXS** (WTYPE 16–18)
+    ported to `mmb.cu`.  `MUL_MAT`/`MUL_MAT_ID` dequant-vs-CPU oracles green for all eight, PPL parity,
+    pp8192 +19.5/+22.4/+25.4 % (Q4/Q5), 35B-A3B Q4_1 +63 %, gpt-oss MXFP4 +5.2 %, real MiniMax IQ2_S
+    +4.9 % pp, dense IQ2_XS +16.5 % pp —
+    [`2026-09-22-mmb-quant-coverage.md`](2026-09-22-mmb-quant-coverage.md),
+    [`2026-09-22-mmb-iq2-coverage.md`](2026-09-22-mmb-iq2-coverage.md).  NVFP4 and IQ2_XXS are
+    oracle-only (no local model).  `Q2_K`/`Q1_0` stay out of scope for quality; the model tree has
+    none of the former and one `Q1_0` model (`Bonsai-8B`).
 
 **Phase 3 — MTP tuning + correctness** (parked)
 
