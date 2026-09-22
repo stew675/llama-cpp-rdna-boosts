@@ -1,6 +1,6 @@
 # Closing the gap — `beta/mmb-general` vs the other solution's `strix-halo` prefill
 
-**Date:** 2026-09-20 (snapshot) · **updated:** 2026-09-22 (end of session 6)
+**Date:** 2026-09-20 (snapshot) · **updated:** 2026-09-22 (end of session 8)
 **Box:** `halo` — Strix Halo, Radeon 8060S (gfx1151, RDNA3_5), ROCm 7.14 (`/opt/rocm-7.14-gfx1151`), 123 GiB RAM / 124 GB unified VRAM
 **Scope:** a 1:1 prefill comparison on **the other solution's uniform-IQ4_NL model** (not just our mixed UD-IQ4_XS), a kernel-level profile diff on the uniform model, and a gate-ablation of the other solution's stack on this box to price the still-missing families. This is an investigation record, not a delivery change.
 
@@ -9,7 +9,7 @@
 
 ---
 
-## START HERE — fresh-session handover (end of session 6, 2026-09-22)
+## START HERE — fresh-session handover (end of session 8, 2026-09-22)
 
 ### Where we are
 
@@ -18,7 +18,8 @@
   ~844 t/s, while `-ub 4096` stays pegged at 100 % and runs **1093 t/s** (maintainer, 2026-09-22).
   `-ub 16384` is root-caused and parked (below); do not spend time on it unless the PLE-lazy fix is
   picked up.
-* **Throughput after session 6** (qwen4exp IQ4_NL, gfx1151, `-ctk/-ctv f16`, `pp… -n 0`):
+* **Throughput (session-6 snapshot; session 8's `QSA_SCORE_WMMA` adds ~+1 % at pp32768 on this model)**
+  (qwen4exp IQ4_NL, gfx1151, `-ctk/-ctv f16`, `pp… -n 0`):
 
   | config | pp8192 | pp32768 |
   |---|---:|---:|
@@ -109,14 +110,56 @@
   in graph order (the matcher accepts our L2a relu-before-reshape form), pp32768 **+1.8 %** at
   `-b/-ub 4096` — [`2026-09-22-idx-relu-sum.md`](2026-09-22-idx-relu-sum.md).  RDNA3_5-gated like the
   reference; the kernel is arch-neutral.
-* **Next: see "NEXT SESSION" immediately below** — the next session's two focus items are
-  `QSA_SCORE_WMMA` (the last Phase-1 prefill item) and **MMB quant coverage** (Q4_0/Q4_1/Q5_0/
-  MXFP4/NVFP4); the prerequisite is rebuilding the campaign on delivery r13 and dropping WIP
-  `patches/0015`.  The `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` trim landed 2026-09-22 (session 7).
-  The session-5 profile/memory findings and the corrected gate semantics are further down; read them
-  too.
+* **Session 8 status: BOTH focus items DONE + the owed gate suite closed.**
+  `QSA_SCORE_WMMA` (prefill, `patches/0016`) and MMB quant coverage
+  (Q4_0/Q4_1/Q5_0/MXFP4/NVFP4 = `patches/0017`; IQ2_S/IQ2_XS/IQ2_XXS = `patches/0018`) are ported,
+  default ON, validated; the r13 rebuild and the `beta/mmb-general` BETA-TESTING gate suite (Gate 4
+  MTP + oracles) are GREEN.  **The next work is Phase-2 decode + one correctness bug — see the NEW
+  "NEXT SESSION" block immediately below.**  The `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` trim landed
+  session 7.  Read the session-5 profile/memory findings and the corrected gate semantics further
+  down too.
 
-### NEXT SESSION — focus: `QSA_SCORE_WMMA` (prefill) + MMB quant coverage
+### NEXT SESSION (end of session 8) — focus: Phase-2 decode + correctness
+
+Phase-1 (recall/prefill) is essentially closed: items 1–8, 13–16 and the two session-8 focus items are
+all DONE and the campaign is `gap-closing-r13` (r13 + 12 `beta/mmb-general` + gap-closing
+`0001..0014`/`0016`/`0017`/`0018`).  The maintainer's priority sequence now points at **decode**.
+
+**1. Port the sparse QSA decode + incremental indexer state (Phase-2 item 9, reference `d67d58836`).**
+This is the big remaining decode item and the term the reference's absolute MTP t/s gets for free:
+
+* the reference adds `qsa-decode.cuh` (SIMT) + `qsa-decode-wmma.cuh` (WMMA) **selected-cell decode**
+  kernels that read the selected F16 K/V cells directly instead of the dense QSA walk, plus an
+  **incremental indexer-key cache** (`src/qsa-prefix-state.h`, `llama-memory-hybrid-idx.*`).
+* Measured on its tree: serial depth-40000 **25.85 → 28.82 t/s**, MTP 40680-token **31.17 → 35.57**
+  (first) / **32.69 → 39.10** (repeat), for 104 MiB @65k / ~416 MiB @256k of cache.
+* **Audit first:** our tree has a *different* QSA-sparse-FA decode path plus an incremental
+  **derived-block-vector** cache (`GGML_CUDA_QSA_INDEXER_CACHE`, default on).  1:1 audit vs the
+  reference's design before porting (overlapping, not equivalent).
+* It is a **hold/repay** item: our plain decode is already ahead (+2–6 % on qwen4exp, §12), so land it
+  only if it holds that lead.  Gate: `plain == draft-mtp` greedy text, MTP acceptance at pos 1, and
+  depth throughput (`benchmarks/mtp-adaptive-methodology.md`).
+
+**2. Fix the pre-existing BF16-MMB non-finite bug (found session 8).**  `llama-imatrix` on
+`Nanbeige4.2-3B-BF16` emits *"non-finite values detected in blk.21.attn_output.weight"* with the
+default MMB build; `GGML_CUDA_MMB=0` **or** `GGML_CUDA_MMB_BF16W=0` fixes it — i.e. the pre-existing
+**BF16-weight MMB dense path** (`bf16w`) produces non-finite activations on that model.  Small to
+diagnose (a BF16 dense GEMM compared against the delivery path) and a real correctness bug.  Detail:
+[`2026-09-22-mmb-iq2-coverage.md`](2026-09-22-mmb-iq2-coverage.md) §4.
+
+**3. Housekeeping: gfx1100 / gfx1201 validation of the session-8 additions.**  The new MMB quant types
+(Q4_0/Q4_1/Q5_0/MXFP4/NVFP4 + the IQ2 family) and `QSA_SCORE_WMMA` are **gfx1151-validated only**; the
+beta requires the gfx1201 port/validation (`beta/mmb-general/gfx1201-s14-gates.md`, 3-GPU `-sm tensor`,
+q8_0 KV, `-b/-ub 2048`).  The dequant code is arch-neutral and gfx1201 keeps its per-type dense policy
+(inert), so this is an apply-and-gate job, not a port.
+
+**Parked (do not start):** `-ub 16384` needs the managed PLE reader's no-cache parallel-pread fast path
+(item 13); the qwen4exp adaptive-MTP ceiling sweep (3/5/7/9/12) is a tuning item.  Both stay parked
+until decode lands.
+
+---
+
+### Session-7/8 record (2026-09-22): QSA scorer trim, `QSA_SCORE_WMMA`, MMB quant coverage
 
 **Session 7 landed the QSA prefill scorer trim and the shared-NextN MTP fix** (fork `gap-closing`
 `00d8bbbc9`, exported to [`patches/0014`](patches/) and [`patches/0015`](patches/)): the reference's `QSA_SCORE_BOUNDS` +
@@ -184,7 +227,7 @@ The measured product is the table at the top of this handover (1379 / 1320 t/s a
 target with the BF16 rounding path on; 1308 / 1270 on the default build).  The session-5 BF16-traffic and
 conversion gaps are closed.
 
-#### Prerequisite (cheap, first) — rebuild the campaign on delivery r13
+#### Historical: the session-8 prerequisite — rebuild the campaign on delivery r13 (DONE)
 
 The shared-NextN MTP fix now lives in **delivery block 00, release `v16-ebbb18522-r13`** (`main`
 `ae076ab`; canonical tip `8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`, tree
@@ -195,9 +238,9 @@ run the full `beta/mmb-general` BETA-TESTING gate suite once — still owed sinc
 acceptance) + the op oracles.  Purity is an **intra-build** contract (`GREEDY-PURITY.md`):
 `test-logits-width-probe` PASS (worst maxdiff 0) on f16/bf16/q8_0, `plain == draft-mtp` greedy text,
 acceptance > ~0.45 at pos 1, coherence.  The MTP gate can now use the shared-NextN sidecar (fixed).
-This is housekeeping; the two focus items below are the session's real work.
+This was housekeeping; the two focus items below were the session's real work — both are now DONE.
 
-#### Focus 1 — `QSA_SCORE_WMMA` (prefill indexer score → fused WMMA)
+#### Historical: Focus 1 — `QSA_SCORE_WMMA` (prefill indexer score → fused WMMA) — DONE in session 8
 
 Our prefill indexer score is the per-op chain (`mul_mat` → L2a relu → head-sum); the fused decode
 score op (`ggml_indexer_score`) is `n_tokens == 1` only.  **`ggml_lightning_indexer`** — the DSA WMMA
@@ -231,7 +274,7 @@ approved *prefill* re-baseline: width probe PASS on f16/bf16/q8_0, `plain == dra
 score work ("low-single-digit % prefill"); full flag table in
 [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md).
 
-#### Focus 2 — MMB quant coverage: Q4_0 / Q4_1 / Q5_0 / MXFP4 / NVFP4
+#### Historical: Focus 2 — MMB quant coverage — DONE in session 8
 
 `ggml_cuda_mmb_supported_mm/_mmid/_glu` (`mmb.cu`, `beta/mmb-general/patches/0001`) currently accept
 **IQ4_NL, Q8_0, Q4_K, Q5_1, IQ3_S, Q5_K, Q6_K, IQ4_XS, Q3_K, IQ3_XXS** (IQ3_XXS routed-only and
@@ -256,7 +299,7 @@ throughput A/B, (5) the default-on policy (a win → ON; the env var only disabl
 Models: Q4_0/Q4_1/Q5_0 are common local quants; MXFP4 = gpt-oss; NVFP4 = recent NVIDIA-quantized
 models.  Record PPL + pp2048/pp8192 (`-ub 2048` bf16 KV) per type in the beta README table.
 
-#### After the two focus items — deferred housekeeping + tuning
+#### After session 8 — deferred housekeeping + tuning
 
 * Full `beta/mmb-general` BETA-TESTING suite (Gate 4 MTP acceptance + op oracles) if not already done
   with the r13 rebuild.
@@ -279,8 +322,10 @@ models.  Record PPL + pp2048/pp8192 (`-ub 2048` bf16 KV) per type in the beta RE
   stream traffic (`ffn_out` is `[n_embd,T]`; the residual the `res16` arm already covers is
   `[n_embd,hc,T]` = 4×).  Not worth it — do not re-litigate.
 * **The parked items stay parked:** `-ub 16384` (needs the PLE-lazy reader), the managed PLE reader
-  perf (item 13), the qwen4exp adaptive-MTP ceiling sweep and `nextn_shared_target_tensors` (Phase 3),
-  and the sparse QSA decode + incremental indexer (Phase 2, `d67d58836`).
+  perf (item 13), and the qwen4exp adaptive-MTP ceiling sweep (Phase 3 tuning).  **Not parked anymore:**
+  the sparse QSA decode + incremental indexer (Phase 2, `d67d58836`) is the *next* work — see the new
+  NEXT SESSION block at the top — and `nextn_shared_target_tensors` is **DONE** (delivery r13 block 00,
+  session 7).
 
 #### Reproduce (copy-paste)
 
@@ -424,6 +469,9 @@ mmap).  The PLE task's fix is therefore the **reader design** (streaming/no-cach
 smaller footprint.  Source kept, gated OFF; item 13.
 
 ### Do these in order
+
+> **Superseded (end of session 8): this is the session-5-era list, kept for its gate rationale.  The
+> live handoff is the START HERE / NEXT SESSION block at the top of this file.**
 
 1. **Run the full `beta/mmb-general` BETA-TESTING gate suite on the current default build**
    ([`../../beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md)).  **Purity is an
@@ -587,18 +635,22 @@ Both are recall-speed (Phase-1) items; the audit record has the full flag table 
 
 | what | where / value |
 |---|---|
-| fork `~/llama.cpp` | branch **`gap-closing`** @ **`ac391cf4f`** = r12 + the 12 `beta/mmb-general` patches + the 13 gap-closing commits (session 6 = the HC BF16 streams `patches/0011`, the `mmb_cvt`/`out_xn` fix `patches/0012`, and the prefill indexer relu-sum `patches/0013`) |
+| fork `~/llama.cpp` | branch **`gap-closing-r13`** @ **`bd984385e`** (`git rev-parse HEAD^{tree}` = `de22ff89ec860b50bd3d8611fae4c8e09bcd2562`) = r13 + the 12 `beta/mmb-general` patches + gap-closing `0001..0014`/`0016`/`0017`/`0018` (**`0015` dropped** — it is in delivery r13 block 00) |
 | fork build | `~/llama.cpp/build-rocm` (gfx1151, ROCm 7.14), full feature set **default** |
-| this repo | branch `gap-closing` (published to `origin`), `wip/closing-the-gap/patches/0001..0013` |
+| this repo | branch `gap-closing` (pushed to `origin` @ `dc1a5c9`), `wip/closing-the-gap/patches/0001..0014` + `0016..0018` |
 | the other solution | `~/pwilkin-llama-cpp` @ `b0f31f587`, `build-rocm` |
 | model | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (93 GiB, qwen4exp) |
 | MoE test model | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf` |
-| MTP sidecar | `/llm/models/Qwen3.8/Flash-Next/Q4_K_XL/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf` (the IQ4_NL `shared-Q8_0` head does **not** load — see §12) |
+| MTP sidecar | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (the shared-NextN head — **loads now** that r13 block 00 carries the fix; acceptance 0.855) |
 
-Rebuild: `cd ~/llama.cpp && ~/bin/build-llama-rocm-714`.  Runtime:
+Rebuild the campaign from scratch (the verified flow): `git checkout rdna-boosts-r13 && git checkout -b
+gap-closing-r13 && git am <repo>/beta/mmb-general/patches/*.patch && git am
+<repo>/wip/closing-the-gap/patches/00{01..14}-*.patch <repo>/wip/closing-the-gap/patches/0016-*.patch
+<repo>/wip/closing-the-gap/patches/0017-*.patch <repo>/wip/closing-the-gap/patches/0018-*.patch` (skip
+`0015`).  Build: `cd ~/llama.cpp && ~/bin/build-llama-rocm-714`.  Runtime:
 `export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH; export HIP_VISIBLE_DEVICES=0`.
-The thirteen `gap-closing` fork commits (`0001..0013`) are exported to [`patches/`](patches/) so the
-code survives a fork reset.
+The exports are the fork commits so the code survives a fork reset; the applied tree is verified to
+match (`scripts`-free check in the session-8 records).
 
 ### What NOT to redo (sessions 3–4)
 
@@ -607,7 +659,9 @@ code survives a fork reset.
   needs the maintainer's call), not the thread count.
 * **`concat_transposed` drop (item 5)** — already gone at `-ub 8192`.
 * **`-ub 16384`** — parked; the `-ub 8192` long-context point memory-thrashes, so use `-ub 4096` there.
-* **MMB-off byte-identity and the MTP gate** — still owed, not yet done.
+* **MMB-off byte-identity and the MTP gate** — the MTP gate is **DONE** (session 8: acceptance
+  0.85541, 56.5 vs plain 31.7 t/s) and the MMB-off **cross-build** byte check is **retracted** (it is
+  not the purity contract; see the 2026-09-22 correction record).
 * **Don't trust an ad-hoc GGUF type parser** (2026-09-22): a session's parser used the wrong ggml enum
   and reported the IQ4_XS model's types as IQ2_XS when they are **IQ4_NL**.  The IQ4_XS model has **no
   IQ2_XS/IQ1_S at all** (IQ4_NL 45.7 GiB, IQ3_S 31.6, Q8_0 8.3, IQ4_XS 0.8, Q6_K 0.5, small F32/BF16) —

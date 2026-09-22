@@ -56,8 +56,8 @@ moved here and updated 2026-09-21.
   pp32768, plus the trim's ~+0.5 % pp8192); the default build at `-b/-ub 4096` = ~1308 / 1270.
 * Built on this box (gfx1151) with `~/bin/build-llama-rocm-714`.  **All beneficial features are on by
   default** (see the `AGENTS.md` default-on policy); env vars only disable.
-* The fourteen `gap-closing` commits (`0001..0014`) are exported to [`patches/`](patches/) in case the
-  local fork branch is lost.
+* The seventeen `gap-closing` patches (`0001..0014` + `0016..0018`; `0015` is superseded by r13
+  block 00) are exported to [`patches/`](patches/) in case the local fork branch is lost.
 
 To reproduce (the **r13 rebuild**):
 
@@ -67,25 +67,32 @@ git checkout rdna-boosts-r13 && git branch -D mmb-beta gap-closing-r13 2>/dev/nu
 git checkout -b gap-closing-r13
 git am /home/stew675/llama-cpp-rdna-boosts/beta/mmb-general/patches/*.patch
 git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/00{01,02,03,04,05,06,07,08,09,10,11,12,13,14}-*.patch   # 0015 is in r13 block 00
-git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/0016-*.patch   # QSA_SCORE_WMMA, default OFF
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/0016-*.patch   # QSA_SCORE_WMMA, default ON
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/0017-*.patch   # MMB Q4_0/Q4_1/Q5_0/MXFP4/NVFP4
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/0018-*.patch   # MMB IQ2_S/IQ2_XS/IQ2_XXS
 ~/bin/build-llama-rocm-714
 ```
 
-Fork tip after the rebuild + this session: **`fed70bb36`** (`gap-closing-r13`).  The five-segment
-scratch build above (first built 2026-09-22) is the tree the rebuild was verified on (`git am`
-12/12 + 14/14 + 1/1, no conflicts).
+Fork tip after the rebuild + session 8: **`bd984385e`** (`gap-closing-r13`, tree
+`de22ff89ec860b50bd3d8611fae4c8e09bcd2562`).  The scratch build above is the tree the rebuild was
+verified on (`git am` 12/12 + 14/14 + 1/1 + 1/1 + 1/1, no conflicts; applied tree == fork tree).
 
 ## Do first (fresh session, in order)
 
-1. **Run the full BETA-TESTING gate suite** on the current default build —
-   [`beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md).  **Purity is an
-   intra-build contract**, not cross-build: the decode/verify band `W=1..8` must agree with itself
-   (`plain == draft-mtp` greedy text) and `test-logits-width-probe` must print
-   `width_purity=PASS (worst maxdiff 0)`.  **Do NOT gate on `MMB=0 == r12`** (or on any MMB on/off
-   equality) — that was the beta's opt-in-era bisection aid, and a prefill re-baseline legitimately
-   changes the greedy text; see the 2026-09-22 correction record in
-   [`closing-the-gap.md`](closing-the-gap.md#correction-2026-09-22-session-5--the-mmb0--r12-gate-is-retracted).
-   Plus the MTP gate (Gate 4).  Green before any promotion.
+> **Updated end of session 8.**  Items 1–3 below are historical; the campaign now starts at
+> “Next” — see the **NEXT SESSION** block of [`closing-the-gap.md`](closing-the-gap.md).
+
+**Next (session 9):** (a) port the **sparse QSA decode + incremental indexer** (Phase-2 item 9,
+reference `d67d58836`) after auditing it against our `GGML_CUDA_QSA_INDEXER_CACHE`; (b) fix the
+**pre-existing BF16-MMB non-finite** bug (`Nanbeige` imatrix,
+[`2026-09-22-mmb-iq2-coverage.md`](2026-09-22-mmb-iq2-coverage.md) §4); (c) the **gfx1100/gfx1201
+validation** of the session-8 additions.  Detail in [`closing-the-gap.md`](closing-the-gap.md)'s new
+NEXT SESSION block.
+
+1. **Run the full BETA-TESTING gate suite** — **DONE (session 8)** on gfx1151: Gate 4 MTP
+   qwen4exp acceptance **0.85541** (56.5 vs plain 31.7 t/s), `LIGHTNING_INDEXER` 225/225,
+   `GATED_DELTA_NET` 46/46, `FLASH_ATTN_QSA` 26/26, width probe PASS.  See
+   [`../../beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md) §5.
 2. **Target `-b 8192 -ub 8192`** — decision 2026-09-21.  For **long-context (pp65536+)** use
    **`-b/-ub 4096`**: at `-ub 8192` that point memory-thrashes (GPU oscillating, ~844 t/s), while
    `-ub 4096` stays pegged at 100 % (~1093 t/s) — maintainer, 2026-09-22.  The `-ub 16384` failure is
