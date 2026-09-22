@@ -14,6 +14,8 @@ moved here and updated 2026-09-21.
 | [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md) | Phase-1 item 1's `_b256` follow-up: ported, gated, **closed negative** (not bit-identical, slower); the reference's 554 ms is its BF16 HC traffic, not the thread count.  Also notes item 5's `concat_transposed` is already gone at `-ub 8192`. |
 | [`2026-09-22-qsa-block-window-fix.md`](2026-09-22-qsa-block-window-fix.md) | Phase-1 item 3.5 (first fix): the QSA block window is now sized by the highest stored position (`b0f31f587`), for the M-RoPE-image + MTP crash. |
 | [`2026-09-22-qsa-item-3.5-audit.md`](2026-09-22-qsa-item-3.5-audit.md) | Phase-1 item 3.5 (**closed**): the other two correctness fixes (`40c0b9c38` maskless, `14fff4f97` −1 sentinels) are **N/A** in our tree — we have no maskless path and our top-k output never carries sentinels; the invariants they protect are already held. |
+| [`2026-09-22-norm-rows-fusion.md`](2026-09-22-norm-rows-fusion.md) | Phase-1 item 4: the narrow-row RMS norm (`norm-gated.cu::rms_rows_f32`, 8 rows/block) ported default-on, **bit-identical** (width probe PASS, same-seed text `f61199ba5644`), ~+0.3 % at `-ub 4096`. |
+| [`2026-09-22-ubatch-8192-memory-confound.md`](2026-09-22-ubatch-8192-memory-confound.md) | **Methodology finding:** `-ub 8192` runs at 2–3 GB free with ~40 % more reclaim, which can bias an A/B whose arms differ in graph-shape memory; use **`-b/-ub 4096`** for A/B.  The prior rejections audited (the shipped wins are unaffected). |
 | [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..1004c65db`) exported as patches, so the code work survives a fork reset. |
 
 ## The two moving references this file tracks
@@ -27,14 +29,14 @@ moved here and updated 2026-09-21.
 
 ## Current "our side" build state
 
-* `~/llama.cpp` branch **`gap-closing`** @ **`9449f3446`** = `mmb-beta` (r12 `72176ae8a` + the 12
+* `~/llama.cpp` branch **`gap-closing`** @ **`59bfcd719`** = `mmb-beta` (r12 `72176ae8a` + the 12
   `beta/mmb-general/patches/*.patch`, tree `bca69f23dd…`) + the 2026-09-21/22 changes: **default-on
   policy** (MMB/HC16/matcher), the `hc_combine_norm` matcher revival, the **`hc_gate_mix` fusion**
-  (session 2), the **depthwise conv1d fusions** (session 3), and the **QSA block-window fix** (session 3,
-  `b0f31f587`), plus env-gated debug traces.
+  (session 2), the **depthwise conv1d fusions** (session 3), the **QSA block-window fix** (session 3,
+  `b0f31f587`), and the **narrow-row RMS norm fusion** (session 4), plus env-gated debug traces.
 * Built on this box (gfx1151) with `~/bin/build-llama-rocm-714`.  **All beneficial features are on by
   default** (see the `AGENTS.md` default-on policy); env vars only disable.
-* The five `gap-closing` commits (`0001..0005`) are exported to [`patches/`](patches/) in case the local
+* The six `gap-closing` commits (`0001..0006`) are exported to [`patches/`](patches/) in case the local
   fork branch is lost.
 
 To reproduce:
@@ -44,7 +46,7 @@ cd ~/llama.cpp
 git checkout rdna-boosts && git branch -D mmb-beta gap-closing 2>/dev/null
 git checkout -b gap-closing
 git am /home/stew675/llama-cpp-rdna-boosts/beta/mmb-general/patches/*.patch
-git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 9449f3446
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 59bfcd719
 ~/bin/build-llama-rocm-714
 ```
 
@@ -89,12 +91,14 @@ MTP tuning + correctness.**
    [`2026-09-22-qsa-block-window-fix.md`](2026-09-22-qsa-block-window-fix.md), `patches/0005`; the other
    two (`40c0b9c38` maskless-only-where-qsa3-consumes, `14fff4f97` −1 sentinels) audited **N/A** against
    our derived-visibility QSA — [`2026-09-22-qsa-item-3.5-audit.md`](2026-09-22-qsa-item-3.5-audit.md).
-4. `norm-gated.cu` (~1.2 % on our tree) + `idx-relu-sum.cu` (**already banked** by our fused indexer
-   score — see the item-4 assessment in [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md)).
-   **Item 1's `hc_combine_norm_f32` `_b256` swap is CLOSED NEGATIVE** — not bit-identical (it changes
-   the greedy text) and 0.7–0.8 % slower on gfx1151/qwen4exp, so it was reverted; see
-   [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md).  **This is the next
-   kernel item** (verify the `rms_rows` reduction order against our `rms_norm_f32<256>` first).
+4. `norm-gated.cu` (`rms_rows`) — **DONE 2026-09-22 (session 4)**: the narrow-row RMS norm ported,
+   default-on, **bit-identical**, ~+0.3 % at the clean `-b/-ub 4096` protocol (it read +0.5–1.1 % at
+   `-ub 8192`, which is the memory-pressure confound — see the methodology record) —
+   [`2026-09-22-norm-rows-fusion.md`](2026-09-22-norm-rows-fusion.md), `patches/0006`.  `idx-relu-sum`
+   was already banked by our fused indexer score.  **The next kernel item is item 6** (`qsa3_attn` body).
+   **Item 1's `hc_combine_norm_f32` `_b256` swap stays CLOSED NEGATIVE** — not bit-identical (it changes
+   the greedy text, deterministically), so the rejection does not rest on timing; see
+   [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md).
 5. MoE bf16 epilogue + drop `concat_transposed` (beta's `MMB_DOWN16` is gated off).
 
 **Phase 2 — decode speed + correctness**

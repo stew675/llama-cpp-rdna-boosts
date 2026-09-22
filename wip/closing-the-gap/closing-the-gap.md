@@ -1,6 +1,6 @@
 # Closing the gap — `beta/mmb-general` vs the other solution's `strix-halo` prefill
 
-**Date:** 2026-09-20 (snapshot) · **updated:** 2026-09-22 (end of session 3)
+**Date:** 2026-09-20 (snapshot) · **updated:** 2026-09-22 (end of session 4)
 **Box:** `halo` — Strix Halo, Radeon 8060S (gfx1151, RDNA3_5), ROCm 7.14 (`/opt/rocm-7.14-gfx1151`), 123 GiB RAM / 124 GB unified VRAM
 **Scope:** a 1:1 prefill comparison on **the other solution's uniform-IQ4_NL model** (not just our mixed UD-IQ4_XS), a kernel-level profile diff on the uniform model, and a gate-ablation of the other solution's stack on this box to price the still-missing families. This is an investigation record, not a delivery change.
 
@@ -9,7 +9,7 @@
 
 ---
 
-## START HERE — fresh-session handover (end of session 3, 2026-09-22)
+## START HERE — fresh-session handover (end of session 4, 2026-09-22)
 
 ### Where we are
 
@@ -42,9 +42,17 @@
   has no maskless path and its top-k output carries no sentinels; the invariants each protects are
   already held (see the audit section below) —
   [`2026-09-22-qsa-item-3.5-audit.md`](2026-09-22-qsa-item-3.5-audit.md).
-* **Next: Phase-1 item 4** (`norm-gated.cu`/`rms_rows`, ~1.2 % on our tree; `idx-relu-sum` is already
-  banked by our fused indexer score), then **item 6** (`qsa3_attn` body, 817 vs the reference's 618 ms),
-  item 7 (tall tile), item 8 (QSA graph flags).
+* **Phase-1 item 4 (narrow-row RMS norm) DONE** (session 4, `patches/0006`): `norm-gated.cu::rms_rows_f32`
+  ported, default-on (`GGML_CUDA_DISABLE_NORM_ROWS=1` disables), **bit-identical** (width probe PASS,
+  same-seed text `f61199ba5644`), ~+0.3 % at the clean `-b/-ub 4096` protocol —
+  [`2026-09-22-norm-rows-fusion.md`](2026-09-22-norm-rows-fusion.md).
+* **METHODOLOGY (2026-09-22): use `-b/-ub 4096` for perf A/Bs.**  At `-ub 8192` the box bottoms at
+  2–3 GB free with ~40 % more kswapd reclaim, and a fusion whose arms differ in graph-shape memory runs
+  its arms in different pressure regimes — item 4 read +1.05 % at `-ub 8192` but +0.27 % at `-ub 4096`.
+  Correctness gates are unaffected; only the timing.  The prior rejections were audited and the shipped
+  wins stand — [`2026-09-22-ubatch-8192-memory-confound.md`](2026-09-22-ubatch-8192-memory-confound.md).
+* **Next: Phase-1 item 6** (`qsa3_attn` body, 817 vs the reference's 618 ms), then item 7 (tall tile),
+  item 8 (QSA graph flags).
 
 ### Do these in order
 
@@ -56,9 +64,12 @@
    Already green (sessions 2-3): `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA` 26/26,
    `FLASH_ATTN_EXT` 5955/0, width probe PASS on 27B + qwen4exp + 35B-A3B, conv fused==unfused row-0
    hashes.
-2. **Next code item — Phase-1 item 4** (`norm-gated.cu`/`rms_rows`, scoping below; **item 3.5 is
-   closed**).  Then item 6 (`qsa3_attn`).
-3. Keep the **default-on policy**: every beneficial feature is ON; its env var only *disables* it.  Never
+2. **Next code item — Phase-1 item 6** (`qsa3_attn` body, scoping below; items 3.5 and 4 are done).
+   Then item 7 (tall tile) / item 8 (QSA graph flags).
+3. **Use `-b/-ub 4096` for perf A/Bs** (session-4 methodology finding).  The `-ub 8192` absolute target
+   is fine for a single number, but an A/B whose arms change the graph's memory footprint compares two
+   pressure regimes there.  Record the min free memory with any `-ub 8192` result.
+4. Keep the **default-on policy**: every beneficial feature is ON; its env var only *disables* it.  Never
    run a benchmark with a feature left off.
 
 ### Rebuild / run (copy-paste)
@@ -70,9 +81,14 @@ export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH; export HIP_V
 MU=/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf
 MM=/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf
 for f in ${MU%/*}/*-0000*.gguf; do cat "$f" >/dev/null; done   # warm page cache first
-# ubatch-8192 baseline (ours, full default set, no env):
+# ubatch-8192 baseline (ours, full default set, no env) -- the campaign's absolute target:
 ~/llama.cpp/build-rocm/bin/llama-bench -m "$MU" -ngl 99 -fa 1 -ctk f16 -ctv f16 \
   -b 8192 -ub 8192 -p 8192,32768 -n 0 -r 2
+# A/B protocol: use -b/-ub 4096 (memory-safe; see the 2026-09-22 methodology record).
+# At -ub 8192 the box bottoms at 2-3 GB free and the two arms of a graph-shape change run in
+# different pressure regimes, so a <2 % delta there is not trustworthy.
+~/llama.cpp/build-rocm/bin/llama-bench -m "$MU" -ngl 99 -fa 1 -ctk f16 -ctv f16 \
+  -b 4096 -ub 4096 -p 8192,32768 -n 0 -r 3
 # long context: use -ub 4096 (at -ub 8192 the pp65536 point memory-thrashes at ~844 t/s;
 # -ub 4096 is clean and pegged at 100 %, ~1093 t/s):
 ~/llama.cpp/build-rocm/bin/llama-bench -m "$MU" -ngl 99 -fa 1 -ctk f16 -ctv f16 \
@@ -110,24 +126,28 @@ re-checking.  One defensive note for a future change: the VEC QSA kernel derefer
 `cell_vis` is null, so a change that could make both null would fault — add the reference's assert (or
 enforce `mask || cell_vis` in `ggml_cuda_flash_attn_qsa`) at that point.
 
-### Next item — Phase-1 item 4 (`norm-gated` / `rms_rows`)
+### Next item — Phase-1 item 4 (DONE) and item 6 (`qsa3_attn` body)
 
-The reference's `norm-gated.cu::rms_rows_f32` is a wave-per-row RMS norm for narrow rows
-(`ncols <= 256`) with an optional sigmoid gate, worth ~1.2 % on our tree (our narrow-row norms already
-run as `rms_norm_f32<256,{true,false}>`; the reference's pair is ~135 ms less).  It claims to be
-**bitwise identical** to `norm.cu`'s `rms_norm_f32<256,...>` (per-warp xor trees + a xor tree over the
-8 partials).  **Gate it the same way item 2 was gated:** verify the reduction order against our
-`rms_norm_f32<256>` first (the `_b256` lesson: a reduction-order mismatch changes the greedy text and is
-not shippable), then width probe + same-seed text + an A/B.  `idx-relu-sum` is **already banked** (our
-fused `GGML_CUDA_QSA_INDEXER_SCORE` computes `bias + sum_h relu(dot_h)` in one kernel).
+**Item 4 is DONE (session 4, `patches/0006`).**  The narrow-row RMS norm (`norm-gated.cu::rms_rows_f32`,
+8 rows/block) is ported, default-on and bit-identical; ~+0.3 % at the clean `-b/-ub 4096` protocol —
+[`2026-09-22-norm-rows-fusion.md`](2026-09-22-norm-rows-fusion.md).  `idx-relu-sum` was already banked.
+
+**Item 6 is next.**  `qsa3_attn_kernel` is 817 ms vs the reference's ~618 ms on the uniform-model
+profile (~1.5 % of the process).  Both trees run a packed-block WMMA QSA prefill kernel, so this is a
+**body/geometry diff** (tile shape, `QSA3_G` group width, the K/V staging or the pack), not a missing
+kernel.  The scoping work is: **re-profile `b0f31f587` first** (its tree is 10 commits ahead of the
+pinned one and gained `mmb_quant` and other changes), diff its `qsa3_attn_kernel` launch geometry and
+`qsa3.cu` body against ours, then port the difference **keeping the width-purity contract** (the
+`q->ne[1] >= 128` prefill-only gate must stay; the W=1..8 decode/verify band takes the VEC kernel and
+must remain bit-identical).  Gate as item 4 was: width probe + same-seed text + an A/B at `-ub 4096`.
 
 ### Current state (exact)
 
 | what | where / value |
 |---|---|
-| fork `~/llama.cpp` | branch **`gap-closing`** @ **`9449f3446`** = r12 + the 12 `beta/mmb-general` patches + the 5 gap-closing commits |
+| fork `~/llama.cpp` | branch **`gap-closing`** @ **`59bfcd719`** = r12 + the 12 `beta/mmb-general` patches + the 6 gap-closing commits |
 | fork build | `~/llama.cpp/build-rocm` (gfx1151, ROCm 7.14), full feature set **default** |
-| this repo | branch `gap-closing` (published to `origin`), `wip/closing-the-gap/patches/0001..0005` |
+| this repo | branch `gap-closing` (published to `origin`), `wip/closing-the-gap/patches/0001..0006` |
 | the other solution | `~/pwilkin-llama-cpp` @ `b0f31f587`, `build-rocm` |
 | model | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (93 GiB, qwen4exp) |
 | MoE test model | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf` |
@@ -135,7 +155,7 @@ fused `GGML_CUDA_QSA_INDEXER_SCORE` computes `bias + sum_h relu(dot_h)` in one k
 
 Rebuild: `cd ~/llama.cpp && ~/bin/build-llama-rocm-714`.  Runtime:
 `export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH; export HIP_VISIBLE_DEVICES=0`.
-The five `gap-closing` fork commits are exported to [`patches/`](patches/) so the code survives a fork
+The six `gap-closing` fork commits are exported to [`patches/`](patches/) so the code survives a fork
 reset.
 
 ### What NOT to redo (session-3 conclusions)
@@ -1021,10 +1041,10 @@ body, (7) tall tile, (8) QSA graph flags; items 1–9 survive, regrouped below.
 | # | action | expected | effort | note |
 |---|---|---|---|---|
 | 1 | Make `hc_combine_norm` fire (debug the matcher) and **wire the existing `hc_gate_mix_kernel`** | large — `HC_*` ablation **−19.5 %** | 2–4 d | **DONE 2026-09-21**: matcher revived (+1.5 % prefill) and `hc_gate_mix` wired + default-on on gfx1151 (+1.2–1.5 % at pp8192/32768, width-pure, text-identical) — [`2026-09-21-hc-combine-norm.md`](2026-09-21-hc-combine-norm.md), `patches/0003`. Follow-up: IQ4_NL-only kernel (mixed UD model unchanged) |
-| 2 | Port `gdn-conv.cu` + `ple-conv.cu` + matches (now incl. **F32 PLE**) | **−10.5 %** | 2–3 d | **DONE 2026-09-21 (session 3)**: ported default-on, bit-identical, +3.0/+3.2 % qwen4exp IQ4_NL and +6.5/+7.1 % 35B-A3B at `-ub 8192` — [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md), `patches/0004`.  Two adaptations (3-D `grouped_norm` root + the shared-builder snapshot cpy) |
+| 2 | Port `gdn-conv.cu` + `ple-conv.cu` + matches (now incl. **F32 PLE**) | **−10.5 %** | 2–3 d | **DONE 2026-09-21 (session 3)**: ported default-on, bit-identical, +3.0/+3.2 % qwen4exp IQ4_NL and +6.5/+7.1 % 35B-A3B (**measured at `-ub 8192` — the sign is robust, the magnitude carries the memory confound; re-measure at `-ub 4096` if a precise number is needed**) — [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md), `patches/0004`.  Two adaptations (3-D `grouped_norm` root + the shared-builder snapshot cpy) |
 | 3 | Fix the `n_batch==n_ubatch==n_ctx` context creation | unlocks `-ub 16384` | 0.5–2 d | pre-existing delivery bug |
 | 3.5 | **Port the three correctness fixes** (`40c0b9c38`, `b0f31f587`, `14fff4f97`) | prevents long-session corruption | 0.5–1 d | **CLOSED 2026-09-22**: `b0f31f587` (QSA block window by highest stored position) **ported**, `patches/0005` — [`2026-09-22-qsa-block-window-fix.md`](2026-09-22-qsa-block-window-fix.md); the other two audited **N/A** (no maskless path; top-k output carries no sentinels) — [`2026-09-22-qsa-item-3.5-audit.md`](2026-09-22-qsa-item-3.5-audit.md) |
-| 4 | Port `norm-gated.cu` (`rms_rows`) + `idx-relu-sum.cu` | −2.9 % / −1.3 % | 1–2 d | |
+| 4 | Port `norm-gated.cu` (`rms_rows`) + `idx-relu-sum.cu` | −2.9 % / −1.3 % | 1–2 d | **DONE 2026-09-22 (session 4)**: `rms_rows` ported default-on, bit-identical, ~+0.3 % at `-ub 4096` — [`2026-09-22-norm-rows-fusion.md`](2026-09-22-norm-rows-fusion.md), `patches/0006`.  `idx-relu-sum` was already banked by our fused indexer score |
 | 5 | MoE: bf16 epilogue + drop `concat_transposed` | ~+466 ms kernel (~3–4 %) | 1–2 d | beta has `MMB_DOWN16` gated off; wire it + the bf16 reduction |
 | 6 | Tune/port-align `qsa3_attn` body vs `qsa.cu` | ~+195 ms (~1.5 %) | 1–2 d | re-profile `b0f31f587` first |
 | 7 | Investigate the tall `384x64` 2× launch count | unknown (part of +809) | 0.5–1 d | |
