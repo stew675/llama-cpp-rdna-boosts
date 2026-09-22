@@ -1,6 +1,6 @@
 # Closing the gap — `beta/mmb-general` vs the other solution's `strix-halo` prefill
 
-**Date:** 2026-09-20 (snapshot) · **updated:** 2026-09-21 (end of session 2)
+**Date:** 2026-09-20 (snapshot) · **updated:** 2026-09-22 (end of session 3)
 **Box:** `halo` — Strix Halo, Radeon 8060S (gfx1151, RDNA3_5), ROCm 7.14 (`/opt/rocm-7.14-gfx1151`), 123 GiB RAM / 124 GB unified VRAM
 **Scope:** a 1:1 prefill comparison on **the other solution's uniform-IQ4_NL model** (not just our mixed UD-IQ4_XS), a kernel-level profile diff on the uniform model, and a gate-ablation of the other solution's stack on this box to price the still-missing families. This is an investigation record, not a delivery change.
 
@@ -9,49 +9,54 @@
 
 ---
 
-## START HERE — fresh-session handover (end of session 2, 2026-09-21)
+## START HERE — fresh-session handover (end of session 3, 2026-09-22)
 
-### Where we are, in four lines
+### Where we are
 
-* **Target is `-b 8192 -ub 8192`** — not 16384.  `-ub 16384` is root-caused and parked (below); do not
-  spend time on it unless the PLE-lazy fix is picked up.
-* At a **matched** ubatch we are **~10 % behind at pp8192 / ~15 % behind at pp16384** on the uniform
-  IQ4_NL model.  That is the number the §13 phase plan exists to close.
-* **Phase-1 item 1 (HC fusions) is DONE** (session 2): `hc_combine_norm` matcher revived (+1.5 %) and
-  `hc_gate_mix` wired, default-on (+1.2–1.5 %) — both width-pure and same-seed-text identical.  Fork tip
-  **`94694a38e`**, exported as **`patches/0003`**.
-* **Phase-1 item 2 (depthwise conv1d) is DONE** (session 3): `gdn-conv.cu` + `ple-conv.cu` ported,
-  default-on, **bit-identical** (fused == unfused row-0 logits hash + width probe PASS) and
-  **+3.0/+3.2 %** on qwen4exp IQ4_NL, **+6.5/+7.1 %** on 35B-A3B (pp8192/32768, `-ub 8192`).  Fork tip
-  **`1004c65db`**, exported as **`patches/0004`** — [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md).
-* **Phase-1 item 1's `_b256` follow-up is CLOSED NEGATIVE** (session 3): the reference's
-  `hc_combine_norm_f32_b256` was ported and gated, but it is **not bit-identical** (the 256-thread
-  reduction changes the greedy text: `1b59d651f2c3` → `fc7c8a10ea45`) and **0.7–0.8 % slower** on
-  gfx1151/qwen4exp, so it was reverted — [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md).
-* **Next: the two remaining item-3.5 QSA correctness fixes** (`40c0b9c38` maskless-only-where-qsa3-
-  consumes, `14fff4f97` −1 sentinels) — an **audit** against our derived-visibility QSA (the first fix,
-  `b0f31f587`, landed 2026-09-22 as `patches/0005`), or **Phase-1 item 4** (`norm-gated.cu`, ~1.2 %).
-  Item 5 turned out to be mostly stale: at `-ub 8192` the `concat_transposed` is already gone, and the
-  remaining BF16 MoE epilogue is a lossy/memory candidate, not a 3-4 % win
-  ([`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md)).
+* **Target is `-b 8192 -ub 8192`.**  For **long-context** (pp65536+) use **`-b/-ub 4096`**: at
+  `-ub 8192` that point is right at the memory limit and the GPU oscillates (memory shortfall) at
+  ~844 t/s, while `-ub 4096` stays pegged at 100 % and runs **1093 t/s** (maintainer, 2026-09-22).
+  `-ub 16384` is root-caused and parked (below); do not spend time on it unless the PLE-lazy fix is
+  picked up.
+* At a **matched** ubatch we were **~10 % behind at pp8192 / ~15 % behind at pp16384** on the uniform
+  IQ4_NL model — the number the §13 phase plan closes; items 1+2 have since narrowed it.
+* **Phase-1 item 1 (HC fusions) DONE** (session 2, **`patches/0003`**): `hc_combine_norm` matcher
+  revived (+1.5 %) and `hc_gate_mix` wired default-on (+1.2–1.5 %) — width-pure, same-seed-text
+  identical.
+* **Phase-1 item 2 (depthwise conv1d) DONE** (session 3, **`patches/0004`**): `gdn-conv.{cu,cuh}` +
+  `ple-conv.{cu,cuh}` ported, default-on (`GGML_CUDA_DISABLE_CONV_FUSION=1` disables), **bit-identical**
+  (fused == unfused row-0 hash + width probe PASS), **+3.0/+3.2 %** qwen4exp IQ4_NL and **+6.5/+7.1 %**
+  35B-A3B (pp8192/32768, `-ub 8192`) —
+  [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md).
+* **Phase-1 item 3.5 first fix DONE** (session 3, **`patches/0005`**): the QSA block window is sized by
+  the highest stored position (`b0f31f587`), fixing the M-RoPE-image + MTP assert —
+  [`2026-09-22-qsa-block-window-fix.md`](2026-09-22-qsa-block-window-fix.md).
+* **CLOSED NEGATIVE — do not redo:** item 1's `hc_combine_norm_f32_b256` swap (not bit-identical — it
+  changes the greedy text `1b59d651f2c3` → `fc7c8a10ea45` — and 0.7–0.8 % slower; the reference's
+  554 ms is its **BF16** HC traffic (`hc16`/`blk16`/`res16` compiled in), not the thread count) and
+  item 5's `concat_transposed` drop (already gone at `-ub 8192`; the remaining BF16 MoE epilogue is a
+  lossy/memory candidate, not a 3–4 % win) —
+  [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md).
+* **Next:** the **two remaining item-3.5 QSA correctness fixes** (`40c0b9c38` maskless-only-where-qsa3-
+  consumes, `14fff4f97` −1 sentinels) — an **audit** against our derived-visibility QSA (scoping below)
+  — or **Phase-1 item 4** (`norm-gated.cu`/`rms_rows`, ~1.2 % on our tree; `idx-relu-sum` is already
+  banked by our fused indexer score), then **item 6** (`qsa3_attn` body, 817 vs the reference's 618 ms),
+  item 7 (tall tile), item 8 (QSA graph flags).
 
 ### Do these in order
 
-1. **Run the full `beta/mmb-general` BETA-TESTING gate suite on the current default build.**  The default
-   now also has `hc_gate_mix` on (session 2) and the conv fusions on (session 3), so the gates must be
-   re-run against the real product.  See [`../../beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md);
-   semantics changed — **Gate 1 is `GGML_CUDA_MMB=0`** (MMB off byte-identical to r12), **Gate 2 is the
-   default** (no env).  Also run the width probe and the MTP gate.  Until every gate is green, do not
-   promote and do not trust performance numbers as "the product".  (Sessions 2-3 have run the
-   deterministic oracles and the width probe: `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA`
-   26/26, `FLASH_ATTN_EXT` 5955/0, width probe PASS on 27B + qwen4exp + 35B-A3B, conv fused==unfused
-   row-0 hashes; the MTP gate and the MMB-off byte check are still owed.)
-2. **Reproduce the ubatch-8192 baseline** (below) before changing anything, so the item deltas are
-   measurable.  Reproduced 2026-09-21 (session 3): qwen4exp IQ4_NL pre-conv 1223.1 / 1158.4
-   (pp8192/32768, `-ub 8192`), post-conv 1259.9 / 1195.6.
-3. **Start Phase-1 item 2** (depthwise conv1d) — **DONE 2026-09-21 (session 3)**, see the item-1/2 bullets
-   above and [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md).  The next item is
-   §13's item 3.5 (port the three correctness fixes) + item 4 (`norm-gated` + `idx-relu-sum`).
+1. **Run the full `beta/mmb-general` BETA-TESTING gate suite on the current default build**
+   ([`../../beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md)).  Gate semantics:
+   **Gate 1 = `GGML_CUDA_MMB=0`** (byte-identical to r12), **Gate 2 = the default** (no env).  Plus the
+   width probe and the MTP gate.  Green before any promotion, and do not trust performance numbers as
+   "the product" until then.  **Still owed: the MTP gate (Gate 4) and the MMB-off byte check (Gate 1).**
+   Already green (sessions 2-3): `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA` 26/26,
+   `FLASH_ATTN_EXT` 5955/0, width probe PASS on 27B + qwen4exp + 35B-A3B, conv fused==unfused row-0
+   hashes.
+2. **Next code item** — either the remaining item-3.5 QSA audit (scoping below) or item 4
+   (`norm-gated`).  Then item 6 (`qsa3_attn`).
+3. Keep the **default-on policy**: every beneficial feature is ON; its env var only *disables* it.  Never
+   run a benchmark with a feature left off.
 
 ### Rebuild / run (copy-paste)
 
@@ -64,31 +69,89 @@ MM=/llm/models/Qwen3.8/Flash-Next/IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-0
 for f in ${MU%/*}/*-0000*.gguf; do cat "$f" >/dev/null; done   # warm page cache first
 # ubatch-8192 baseline (ours, full default set, no env):
 ~/llama.cpp/build-rocm/bin/llama-bench -m "$MU" -ngl 99 -fa 1 -ctk f16 -ctv f16 \
-  -b 8192 -ub 8192 -p 2048,8192,16384 -n 0 -r 2
+  -b 8192 -ub 8192 -p 8192,32768 -n 0 -r 2
+# long context: use -ub 4096 (at -ub 8192 the pp65536 point memory-thrashes at ~844 t/s;
+# -ub 4096 is clean and pegged at 100 %, ~1093 t/s):
+~/llama.cpp/build-rocm/bin/llama-bench -m "$MU" -ngl 99 -fa 1 -ctk f16 -ctv f16 \
+  -b 4096 -ub 4096 -p 65536 -n 0 -r 1
+# gates used repeatedly (qwen4exp IQ4_NL):
+#   width probe:   ~/llama.cpp/build-rocm/bin/test-logits-width-probe "$MU" \
+#                    prompts/prose-rdna-boosts.txt 1024 512     (expect width_purity=PASS, worst maxdiff 0)
+#   op oracles:    test-backend-ops -o GATED_DELTA_NET / INDEXER_TOPK / FLASH_ATTN_QSA / FLASH_ATTN_EXT
 # the other solution's same-config reference (its launcher env):
 ( set -a; . archive/work/wip-archive/iq4nl-prefill/launcher-env.txt; set +a; \
   ~/pwilkin-llama-cpp/build-rocm/bin/llama-bench -m "$MU" -dev ROCm0 -ngl 999 -fa on \
   -lm none -lzm on-direct -ctk f16 -ctv f16 -b 8192 -ub 8192 -p 2048,8192,16384 -n 0 -r 2 )
 ```
 
-### Phase-1 item 2 scoping (the next task)
+### Next-task scoping — the two remaining item-3.5 QSA correctness fixes (audit)
 
-The other solution has `ggml/src/ggml-cuda/gdn-conv.cu` (111 lines) and `ple-conv.cu` (182 lines), each
-with a `*_conv_match_at_concat` / `*_conv_match_at_conv` / `*_conv_match_at_tap` matcher plus a
-`*_conv_write_tail` / `*_conv_direct` launcher.  They replace our `build_conv_state` CONCAT +
-`ggml_ssm_conv` (`ssm_conv_long_token_f32`, 303 ms) with a direct kernel that reads `state`+`x` and
-writes the conv output (+ optional silu), and the surrounding concat/transpose/copy traffic disappears.
-Their ablation prices `GDN_CONV`+`PLE_CONV` at **−10.5 %** end-to-end (Appendix B).  Work to do:
+Our tree was at the **pre-fix** state for all three of the reference's correctness commits, so item 3.5
+is a port, not a mere audit.  The **first is done** (`b0f31f587`, `patches/0005`).  The other two target
+the reference's `tail_idxs` / `compact` / `maskless` design, which our QSA does **not** share (ours has
+`cell_vis`/`q_vis` derived visibility + `blk_idx`/`blk_tail`), so each has to be mapped to our
+equivalent first:
 
-1. Read the other solution's `gdn-conv.cu` + `ple-conv.cu` and its `ggml_cuda_try_fuse` call sites
-   (the `GGML_OP_CONCAT` / `GGML_OP_SSM_CONV` / `GGML_OP_CONT` branches at the top of its
-   `ggml_cuda_try_fuse`) — the files are self-contained.
-2. Match **our** graph: our `build_conv_state`/`build_ple` may not present the exact CONCAT/SSM_CONV
-   shape the reference matcher expects; a graph dump (or `LLAMA_DEBUG`-style matcher traces) is the
-   first step.
-3. Port the kernels + matchers, enable default-on (per policy), then gate it: width probe
-   (`test-logits-width-probe` must stay `PASS`, worst maxdiff 0), same-seed greedy text, and the ubatch
-   8192/32768 A/B.  The PLE half is now F32-aware in the reference (its `40a9f4d01`).
+* **`40c0b9c38` — maskless only where the qsa3 kernel consumes it.**  The reference's `LLAMA_QSA_NO_DENSE_MASK`
+  made decode non-deterministic (10/10 → 1/10 identical greedy outputs) because maskless was decided
+  from the graph input alone, while qsa3 also needs both packed layouts and `>= 128` queries (true in
+  prefill, false in decode), so every decode step attended unmasked over stale cells.  The fix decides
+  maskless at the use site and asserts the invariant in the dispatcher.  **Audit question for us:** our
+  maskless/derived path is `LLAMA_KQ_MASK_DERIVED` + `GGML_QSA_DERIVED_VIS`; check where our derived
+  visibility is decided vs where the kernel that consumes it is chosen, and whether a decode step can
+  take a maskless path over stale cells.  The instrument is **greedy determinism over N identical
+  requests** (the reference's 10/10 → 1/10), not throughput.
+* **`14fff4f97` — keep the −1 selection sentinels out of the masked attention path.**  In the reference,
+  complete-block selection lists selected cells with −1 for invisible blocks / empty tail slots, which
+  only the maskless selected-key kernel understands; the tails were allocated whenever block selection
+  applied, so a non-scalar visibility (2-D image positions, several sequences) sent the selection to
+  the **masked** path, whose `set_rows` wrote row −1 (illegal memory access on gfx1151, reproduced with
+  an image after 12k tokens of text).  The fix gates the tail allocation on `scalar` and uses the
+  block-expanded top-k otherwise.  **Audit question for us:** our `blk_idx` uses −1 (incomplete block)
+  and `INT32_MAX` (spare tail block) sentinels — find every consumer that could reach a `set_rows` or a
+  masked path and confirm the sentinels are only ever consumed by the derived/maskless path.
+
+Read the reference diffs with `git -C ~/pwilkin-llama-cpp show 40c0b9c38` / `14fff4f97`; the files to
+map are `src/models/qwen4exp.cpp` (`qwen4exp_use_block_selection`, `qwen4exp_select_complete_blocks`)
+and `src/llama-memory-hybrid-idx.{h,cpp}`.  If a port is not directly applicable, record the audit
+result (present / N/A + why) in the item-3.5 record rather than forcing a change.
+
+### Alternative next item — Phase-1 item 4 (`norm-gated` / `rms_rows`)
+
+The reference's `norm-gated.cu::rms_rows_f32` is a wave-per-row RMS norm for narrow rows
+(`ncols <= 256`) with an optional sigmoid gate, worth ~1.2 % on our tree (our narrow-row norms already
+run as `rms_norm_f32<256,{true,false}>`; the reference's pair is ~135 ms less).  It claims to be
+**bitwise identical** to `norm.cu`'s `rms_norm_f32<256,...>` (per-warp xor trees + a xor tree over the
+8 partials).  **Gate it the same way item 2 was gated:** verify the reduction order against our
+`rms_norm_f32<256>` first (the `_b256` lesson: a reduction-order mismatch changes the greedy text and is
+not shippable), then width probe + same-seed text + an A/B.  `idx-relu-sum` is **already banked** (our
+fused `GGML_CUDA_QSA_INDEXER_SCORE` computes `bias + sum_h relu(dot_h)` in one kernel).
+
+### Current state (exact)
+
+| what | where / value |
+|---|---|
+| fork `~/llama.cpp` | branch **`gap-closing`** @ **`9449f3446`** = r12 + the 12 `beta/mmb-general` patches + the 5 gap-closing commits |
+| fork build | `~/llama.cpp/build-rocm` (gfx1151, ROCm 7.14), full feature set **default** |
+| this repo | branch `gap-closing` (published to `origin`), `wip/closing-the-gap/patches/0001..0005` |
+| the other solution | `~/pwilkin-llama-cpp` @ `b0f31f587`, `build-rocm` |
+| model | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (93 GiB, qwen4exp) |
+| MoE test model | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf` |
+| MTP sidecar | `/llm/models/Qwen3.8/Flash-Next/Q4_K_XL/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf` (the IQ4_NL `shared-Q8_0` head does **not** load — see §12) |
+
+Rebuild: `cd ~/llama.cpp && ~/bin/build-llama-rocm-714`.  Runtime:
+`export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH; export HIP_VISIBLE_DEVICES=0`.
+The five `gap-closing` fork commits are exported to [`patches/`](patches/) so the code survives a fork
+reset.
+
+### What NOT to redo (session-3 conclusions)
+
+* **`hc_combine_norm_f32_b256`** — not bit-identical, slower; the reference's speed is its BF16 HC
+  traffic.  If HC-combine speed is revisited, the change is the **BF16** `blk16`/`res16` path (lossy,
+  needs the maintainer's call), not the thread count.
+* **`concat_transposed` drop (item 5)** — already gone at `-ub 8192`.
+* **`-ub 16384`** — parked; the `-ub 8192` long-context point memory-thrashes, so use `-ub 4096` there.
+* **MMB-off byte-identity and the MTP gate** — still owed, not yet done.
 
 ---
 

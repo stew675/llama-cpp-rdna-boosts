@@ -26,13 +26,14 @@ moved here and updated 2026-09-21.
 
 ## Current "our side" build state
 
-* `~/llama.cpp` branch **`gap-closing`** @ **`1004c65db`** = `mmb-beta` (r12 `72176ae8a` + the 12
-  `beta/mmb-general/patches/*.patch`, tree `bca69f23dd…`) + the 2026-09-21 changes: **default-on policy**
-  (MMB/HC16/matcher), the `hc_combine_norm` matcher revival, the **`hc_gate_mix` fusion** (session 2),
-  and the **depthwise conv1d fusions** (session 3), plus env-gated debug traces.
+* `~/llama.cpp` branch **`gap-closing`** @ **`9449f3446`** = `mmb-beta` (r12 `72176ae8a` + the 12
+  `beta/mmb-general/patches/*.patch`, tree `bca69f23dd…`) + the 2026-09-21/22 changes: **default-on
+  policy** (MMB/HC16/matcher), the `hc_combine_norm` matcher revival, the **`hc_gate_mix` fusion**
+  (session 2), the **depthwise conv1d fusions** (session 3), and the **QSA block-window fix** (session 3,
+  `b0f31f587`), plus env-gated debug traces.
 * Built on this box (gfx1151) with `~/bin/build-llama-rocm-714`.  **All beneficial features are on by
   default** (see the `AGENTS.md` default-on policy); env vars only disable.
-* The four `gap-closing` commits (`0001..0004`) are exported to [`patches/`](patches/) in case the local
+* The five `gap-closing` commits (`0001..0005`) are exported to [`patches/`](patches/) in case the local
   fork branch is lost.
 
 To reproduce:
@@ -40,9 +41,9 @@ To reproduce:
 ```sh
 cd ~/llama.cpp
 git checkout rdna-boosts && git branch -D mmb-beta gap-closing 2>/dev/null
-git checkout -b mmb-beta
+git checkout -b gap-closing
 git am /home/stew675/llama-cpp-rdna-boosts/beta/mmb-general/patches/*.patch
-git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 1004c65db
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 9449f3446
 ~/bin/build-llama-rocm-714
 ```
 
@@ -52,15 +53,17 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch  
    [`beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md).  Gate semantics changed:
    **Gate 1 = `GGML_CUDA_MMB=0`** (byte-identical to r12), **Gate 2 = the default** (no env).  Plus the
    width probe and the MTP gate.  Green before any promotion.
-2. **Target `-b 8192 -ub 8192`** — decision 2026-09-21.  The `-ub 16384` failure is root-caused and
-   **deferred** (see the “Session-2 record” section of the doc): it is the full-vocab
-   `result_output` reserve (15.5 GiB, shared with the other solution) plus qwen4exp's HC `block_out`
-   pin (~18 GiB) against the resident PLE table (~27 GiB host).  ubatch 8192 runs clean and is the
-   reproducible head-to-head baseline (ours 1212.6 vs its 1346.5 at pp8192, ~10 % behind).
-3. **Phase-1 item 2 — the depthwise conv1d** (`gdn-conv.cu` + `ple-conv.cu`) — **DONE 2026-09-21
-   (session 3)**: default-on, bit-identical, +3.0/+3.2 % qwen4exp IQ4_NL and +6.5/+7.1 % 35B-A3B at
-   `-ub 8192`; see [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md).  The next
-   item is **3.5** (the three correctness fixes) + **4** (`norm-gated` + `idx-relu-sum`).
+2. **Target `-b 8192 -ub 8192`** — decision 2026-09-21.  For **long-context (pp65536+)** use
+   **`-b/-ub 4096`**: at `-ub 8192` that point memory-thrashes (GPU oscillating, ~844 t/s), while
+   `-ub 4096` stays pegged at 100 % (~1093 t/s) — maintainer, 2026-09-22.  The `-ub 16384` failure is
+   root-caused and **deferred** (see the “Session-2 record” section): the full-vocab `result_output`
+   reserve (15.5 GiB, shared with the other solution) plus qwen4exp's HC `block_out` pin (~18 GiB)
+   against the resident PLE table (~27 GiB host).  ubatch 8192 runs clean and is the reproducible
+   head-to-head baseline (ours 1212.6 vs its 1346.5 at pp8192, ~10 % behind before items 1+2).
+3. **Phase-1 item 2 — depthwise conv1d — DONE 2026-09-21 (session 3)**; **item 3.5 first QSA fix —
+   DONE 2026-09-22 (session 3)** (`b0f31f587`, `patches/0005`).  The **next code item** is the remaining
+   **item-3.5 QSA audit** (`40c0b9c38`, `14fff4f97`; scoping in
+   [`closing-the-gap.md`](closing-the-gap.md)'s START HERE) or **item 4** (`norm-gated`).
 
 ## The current open list (see §13 of the doc)
 
