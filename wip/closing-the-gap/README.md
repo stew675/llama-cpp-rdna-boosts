@@ -72,20 +72,17 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch  
    reserve (15.5 GiB, shared with the other solution) plus qwen4exp's HC `block_out` pin (~18 GiB)
    against the resident PLE table (~27 GiB host).  ubatch 8192 runs clean and is the reproducible
    head-to-head baseline (ours 1212.6 vs its 1346.5 at pp8192, ~10 % behind before items 1+2).
-3. **Next code items, in this order** (session-5 profile, 2026-09-22):
-   1. **`-lzm auto` semantics + managed PLE reader** — **DONE 2026-09-22 (partial)**: `on`=mmap,
-      `off`=resident, `auto`=upstream auto, `--lazy-buffer-size` dropped, managed LRU reader
-      **opt-in via `LLAMA_LAZY_BUF_MB`** and **OFF by default** (it measured slowest: 1090/1184 vs mmap
-      1219/1217 vs resident 1285/1232).  It does unlock `-b/-ub 16384` (1118.7 t/s).  Making it beat
-      mmap is the remaining work (item 13).
-   2. **BF16 HC + MoE streams** (`blk16`/`res16`, `MMB_DOWN16`) — ~2.4 s, ~+4.5 % at depth, but lossy
-      (greedy text changes) → **maintainer's call**.
-   3. **`mmb_cvt_f32_bf16` (+1478 ms)** — non-lossy; our calls convert far larger tensors than the
+3. **Next code item — the HC BF16 streams (`blk16`/`res16`), default OFF.**  **This is a new session's
+   target** (the biggest remaining prefill item, ~1.8 s / ~3.8 % at depth, lossy).  The full scoping —
+   reference files, our files, the marking block, the order of work, the gates and the traps — is the
+   **"NEXT SESSION"** block at the top of [`closing-the-gap.md`](closing-the-gap.md).  The MoE half
+   (`MMB_DOWN16`, `patches/0010`) is already landed as the worked template.
+   Remaining queue after that, in order:
+   1. **`mmb_cvt_f32_bf16` (+1478 ms)** — non-lossy; our calls convert far larger tensors than the
       reference's (activation cache / `mmb_root` keying).
-   4. **Prefill indexer relu-sum (+590 ms)** — non-lossy; the audit wrongly marked `idx-relu-sum` as
+   2. **Prefill indexer relu-sum (+590 ms)** — non-lossy; the audit wrongly marked `idx-relu-sum` as
       banked (our fused score op is `n_tokens == 1` only).
-   5. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` — the item-8 follow-ups, now below
-      the bigger families.
+   3. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` — the item-8 follow-ups.
    The full session-5 finding (throughput A/B, memory accounting, family diff) is in
    [`closing-the-gap.md`](closing-the-gap.md#session-5-finding-2026-09-22--fresh-target-ubatch-profile-memory-accounting-refined-tasks).
 

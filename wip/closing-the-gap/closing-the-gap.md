@@ -9,7 +9,7 @@
 
 ---
 
-## START HERE — fresh-session handover (end of session 4, 2026-09-22)
+## START HERE — fresh-session handover (end of session 5, 2026-09-22)
 
 ### Where we are
 
@@ -75,8 +75,78 @@
   (1090/1184 vs mmap 1219/1217 vs resident 1285/1232 t/s) so it is **off by default**; it does unlock
   `-b/-ub 16384` (1125.5 t/s).  All modes are text-identical (`7e4a6a4e66fb`).  See the session-5
   finding below.
-* **Next: see the 2026-09-22 session-5 finding below** — the re-profiled task list supersedes the
-  item-8-first ordering.  The gates (item 1) still apply before any promotion.
+* **Session-5 item done: MoE BF16 epilogue** (2026-09-22, **`patches/0010`**): the reference's
+  `moe_weighted_reduction_bf16_v4` + the `down16` graph marking are ported, **default OFF** via
+  `GGML_CUDA_MMB_DOWN16=1` (the maintainer's explicit exception to the default-on policy for this
+  lossy path).  Kernel **1479 -> 846 ms** at pp32768 (matches the reference's 846.5), `plain == n3`
+  text and width probe PASS with it on at `-b 2048 -ub 2048`.  This is the **template** for the HC
+  port below.
+* **Next: see "NEXT SESSION" immediately below** — the HC `blk16`/`res16` BF16 port (item 16), the
+  biggest remaining prefill item.  The session-5 profile/memory findings and the corrected gate
+  semantics are further down; read them too.
+
+### NEXT SESSION — the HC BF16 streams (`blk16`/`res16`), default OFF
+
+**Target:** implement the reference's BF16 hyper-connection stream (`res_in_bf16`/`blk_in_bf16`/
+`res_out_bf16`/`out_xn_bf16`/`store_xn_f32`) so the fused `hc_combine_norm` reads/writes BF16, cutting
+`hc_combine_norm` from **3888 -> ~2077 ms** at pp32768 (~**1.8 s, ~3.8 %** end-to-end) - the largest
+single remaining prefill item.  **Gated OFF by default** per the maintainer (2026-09-22): enabled with
+`LLAMA_HC_BLK16=1` and/or `LLAMA_HC_RES16=1`; the default (env unset) path must stay exactly as it is
+now.
+
+**Reference (`~/pwilkin-llama-cpp`, branch `strix-halo` @ `b0f31f587`):**
+
+| what | where |
+|---|---|
+| consumer arms + `hc_bf2f32`/`hc_f2bf32` | `ggml/src/ggml-cuda/hc-cn.cu` (`hc_combine_norm_f32`, `_b256`) |
+| args struct | `ggml/src/ggml-cuda/hc-cn.cuh` (`ggml_cuda_hc_combine_norm_args`) |
+| matcher | `ggml/src/ggml-cuda/hc-match.inc` |
+| args setup | `ggml/src/ggml-cuda/ggml-cuda.cu` ~line 3878-3930 |
+| **marking block** (`xn`, `block_out`/blk16, `residual`/res16) | `ggml/src/ggml-cuda/ggml-cuda.cu` ~line 4960-5071 |
+| bf16-in/bf16-out reduction with merge (for the block_out path) | `ggml/src/ggml-cuda/moe-weighted-reduction.cu` (`_bf16_v4_out`, `_f32in_bf16out_v4`) |
+
+**Our files to change:**
+
+* `ggml/src/ggml-cuda/hyperconn.cu` — add the bf16 arms to `hc_combine_norm_f32` **and**
+  `hc_combine_norm_single_f32` (read residual/block_out as bf16; write out_res/out_xn as bf16 when the
+  mark says so; honour `store_xn_f32`).
+* `ggml/src/ggml-cuda/hyperconn.cuh` — extend `ggml_cuda_hc_combine_norm_args`.
+* `ggml/src/ggml-cuda/ggml-cuda.cu` — set the bf16 pointers at the **two** match sites
+  (`~5663` REPEAT block_out, `~5843` normal), and add the marking block after the existing HC16
+  marking (~`6515`, right where the MoE `down16` block landed).
+* `ggml/src/ggml-cuda/moe-weighted-reduction.cu` — port the `_out` (bf16-in/bf16-out + merge)
+  variants (the plain `down16` half is already there).
+
+**Already in place (from the beta + `patches/0010`):** `ggml_cuda_mmb_blk16()`/`res16()`/
+`mark_bf16_only()`/`is_bf16_only()`; the `LLAMA_HC_BLK16`/`LLAMA_HC_RES16` env gates (arch defaults 0);
+our `mmb.cu` producers already honour `is_bf16_only(dst)` (lines ~1784, ~1873); and the MoE `down16`
+change is the worked template (mark in `ggml_cuda_try_fuse`, dispatch in the consumer, gate default
+OFF).
+
+**Order of work:** (1) extend the args + both kernels behind the flags, default path untouched; (2) add
+the marking block; (3) port the `_out` reduction variants; (4) confirm each producer honours the mark;
+(5) validate.  Do not simplify the reference's marking predicates - they exist to guarantee **every**
+consumer of a marked tensor can read BF16.
+
+**Gates:**
+
+* Default (both env unset) must be **unchanged**: same-seed greedy text and width probe identical to
+  the current default build (`4a75744fa`).  This is the regression gate.
+* With `LLAMA_HC_BLK16=1` / `RES16=1`: coherent output; `plain == draft-mtp` greedy text (intra-build);
+  `test-logits-width-probe` prints `width_purity=PASS (worst maxdiff 0)`; A/B at `-b/-ub 4096`.
+* The greedy text **will differ** from the default (lossy) - that is expected; do not gate on
+  cross-build equality.
+* Record `hc_combine_norm` kernel ms (expect ~3888 -> ~2077 at pp32768) and the end-to-end delta.
+
+**Traps:**
+
+* Keep the reference's `ggml_nrows >= 512` prefill guard so decode/verify (`W <= 8`) is untouched -
+  that keeps `plain == draft-mtp` pure by construction.
+* `block_out` can be a MUL_MAT output, a MoE-reduction output, or an ADD of the two; handle all three
+  (the matcher's `producer_ok` does).
+* `residual` is BF16 **in place** over the same buffer (`res_in_bf16`/`res_out_bf16`); the alias check
+  in the matcher is load-bearing.
+* `store_xn_f32=false` means the F32 `out_xn` is dead - make sure the graph/slot assignment agrees.
 
 ### Session-5 finding (2026-09-22) — fresh target-ubatch profile, memory accounting, refined tasks
 
@@ -128,11 +198,12 @@ it:
 
 **Read:** at depth the gap is now dominated by **BF16 intermediate traffic** (HC combine + MoE epilogue
 ≈ 2.4 s, ~4.6 %) — the same "larger decision for the maintainer" the `_b256` rejection record flagged
-(the class matches the MMB bf16 WMMA we already ship default-on).  The two non-lossy targets are
-`mmb_cvt` (+1.5 s, identical kernel, so our activation cache / `mmb_root` keying must be converting
-redundant/large tensors) and the prefill **indexer relu-sum** (+0.6 s; the audit's "already banked"
-line is wrong for prefill — our fused score op is `n_tokens == 1`, so prefill runs a separate
-`unary_op<relu>` (559 ms) + head-sum adds, while the reference fuses them).
+(the class matches the MMB bf16 WMMA we already ship default-on).  **The MoE half is now DONE**
+(`patches/0010`, default OFF); the **HC half is the next session's target** (see NEXT SESSION above).
+The two non-lossy targets are `mmb_cvt` (+1.5 s, identical kernel, so our activation cache / `mmb_root`
+keying must be converting redundant/large tensors) and the prefill **indexer relu-sum** (+0.6 s; the
+audit's "already banked" line is wrong for prefill — our fused score op is `n_tokens == 1`, so prefill
+runs a separate `unary_op<relu>` (559 ms) + head-sum adds, while the reference fuses them).
 
 **`-lzm auto` semantics (maintainer, 2026-09-22).**  `AUTO` resolving to `OFF` on the iGPU is what
 hides the PLE memory win from every default run.  The agreed semantics for our branch:
@@ -194,18 +265,19 @@ smaller footprint.  Source kept, gated OFF; item 13.
    re-run 2026-09-22), width probe PASS on 27B + qwen4exp + 35B-A3B, conv fused==unfused row-0 hashes.
 2. **Next code items, in this order** (session-5 profile; the item-8 follow-ups are now deferred behind
    the bigger families):
-   1. **`-lzm auto` semantics + managed PLE reader** — done as the semantics table above; the managed
-      LRU is measured slower than resident/mmap, so it ships **gated OFF** (env `LLAMA_LAZY_BUF_MB`
-      opt-in) with the source kept.  It does unlock the parked `-b/-ub 16384` context (1118.7 t/s);
-      the perf work before it can default-on is in item 13.
-   2. **BF16 HC + MoE streams** (`blk16`/`res16`, `MMB_DOWN16`) — ~2.4 s, ~+4.5 % at depth, but lossy
-      (greedy text changes) → **maintainer's call**.  Gate: width probe + `plain == draft-mtp` +
-      same-seed coherence.
-   3. **`mmb_cvt_f32_bf16` (+1478 ms)** — non-lossy, identical kernel; find why our calls convert far
+   1. **HC BF16 streams (`blk16`/`res16`), default OFF** — the next session's target; full scoping in
+      the NEXT SESSION block above (item 16).  ~1.8 s / ~3.8 % at depth, lossy.
+   2. **BF16 MoE epilogue (`down16`)** — **DONE** (`patches/0010`, default OFF; kernel 1479 -> 846 ms).
+      Kept as the worked template for the HC port.
+   3. **`-lzm auto` semantics + managed PLE reader** — semantics DONE; the managed LRU is measured
+      slower than resident/mmap, so it ships **gated OFF** (env `LLAMA_LAZY_BUF_MB` opt-in) with the
+      source kept.  It does unlock the parked `-b/-ub 16384` context (1125.5 t/s); the perf work before
+      it can default-on is in item 13.
+   4. **`mmb_cvt_f32_bf16` (+1478 ms)** — non-lossy, identical kernel; find why our calls convert far
       larger tensors (activation cache / `mmb_root` keying).
-   4. **Prefill indexer relu-sum (+590 ms)** — non-lossy; port the fused relu+head-sum (`idx-relu-sum`),
+   5. **Prefill indexer relu-sum (+590 ms)** — non-lossy; port the fused relu+head-sum (`idx-relu-sum`),
       which the audit wrongly marked as banked (our fused score op is `n_tokens == 1` only).
-   5. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` — the item-8 follow-ups.
+   6. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` — the item-8 follow-ups.
 3. **Use `-b/-ub 4096` for perf A/Bs** (session-4 methodology finding).  The `-ub 8192` absolute target
    is fine for a single number, but an A/B whose arms change the graph's memory footprint compares two
    pressure regimes there.  Record the min free memory with any `-ub 8192` result.
