@@ -1,0 +1,86 @@
+From de5689d945333801bde17425cb111446569f7130 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 22 Sep 2026 08:39:43 -0500
+Subject: [PATCH] gap-closing WIP: produce the BF16 out_xn copy in the fused
+ hc_combine_norm (mmb_cvt win)
+
+The graph optimizer already marks out_xn BF16-only (all consumers read a BF16 copy:
+the MMB GEMMs through the activation cache, dsv4_hc_pre through its x16 arm), but
+the fused combine was the one producer that did not emit the copy.  Every consumer
+therefore reconverted the F32, and because the graph allocator reuses one hc_norm
+buffer across layers (each layer a distinct root) the activation cache could not
+dedupe: 372 conversions of hc_norm / 1.56e10 elements per pp8192 prefill, 81% of
+all mmb_cvt_f32_bf16 traffic.
+
+Emit the copy with ggml_cuda_mmb_reserve_auto (honouring the graph-assigned slot)
+and drop the F32 store.  hc_f2bf32 is the exact RNE formula as mmb_f2bf, so the
+MMB GEMM consumers are provably bit-identical; the unfused norm.cu producer already
+does this.
+
+qwen4exp IQ4_NL gfx1151, -b/-ub 4096 -p 8192,32768 -n 0 -r 3:
+  1252.4 / 1206.5  ->  1294.1 / 1244.7  (+3.3% / +3.2%)
+mmb_cvt: 520 -> 148 calls, 1.93e10 -> 3.67e9 elements.
+
+Gates: width probe W=1..8 + row0 268e0673300b7a33 unchanged; same-seed text
+b639e324753d unchanged; the unfused combine (GGML_CUDA_DISABLE_HC_COMB=1) gives
+the same text; plain == draft-mtp byte-identical (984263fb8e0f).
+
+Also: LLAMA_MMB_CVT_LOG now takes the cap from its value (>1) and logs the data
+pointer + root, which is what identified the redundant conversion.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 20 +++++++++++---------
+ ggml/src/ggml-cuda/mmb.cu       |  2 +-
+ 2 files changed, 12 insertions(+), 10 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 56056d3ed..615414bfd 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4095,20 +4095,22 @@ static bool ggml_cuda_hc_combine_norm_identify(const ggml_cgraph * cgraph, const
+     return true;
+ }
+ 
+-// Fill the BF16 HC-stream pointers for a matched combine+norm window.  Every pointer is left null
+-// when the graph did not mark the matching tensor, so the default path (both flags off) is a no-op.
++// Fill the BF16 HC-stream pointers for a matched combine+norm window.  Each pointer is left null when
++// the graph did not mark the matching tensor, so an unmarked stream keeps its F32 read/write.
+ static void ggml_cuda_hc_combine_norm_set_bf16(ggml_backend_cuda_context & ctx, ggml_cuda_hc_combine_norm_args & args) {
+-    // The BF16 HC streams are gated experiments (LLAMA_HC_BLK16 / LLAMA_HC_RES16, default OFF).
+-    // NOTE: args.out_xn is already marked BF16-only by the HC16 activation marking even in the
+-    // default build, but its F32 store is kept there for compatibility; only the two flags make the
+-    // fused kernel emit the BF16 copy and drop the F32 one, so the default path is unchanged.
+-    if (!ggml_cuda_mmb_blk16() && !ggml_cuda_mmb_res16()) {
+-        return;
+-    }
++    // HC16 completion: the graph optimizer already marks out_xn BF16-only (all its consumers read a
++    // BF16 copy: the MMB GEMMs through the activation cache, dsv4_hc_pre through its x16 arm).  The
++    // fused combine is the one producer that did not emit the copy, so every consumer reconverted the
++    // F32 (the hc_norm half of the mmb_cvt_f32_bf16 traffic).  Writing it here is bit-identical to
++    // the on-the-fly conversion (same RNE rounding) and lets the F32 store be dropped.
+     if (ggml_cuda_mmb_active() && ggml_cuda_mmb_is_bf16_only(args.out_xn)) {
+         args.out_xn_bf16  = ggml_cuda_mmb_reserve_auto(ctx, args.out_xn, (size_t) ggml_nelements(args.out_xn));
+         args.store_xn_f32 = args.out_xn_bf16 == nullptr;
+     }
++    // BF16 HC streams (LLAMA_HC_BLK16 / LLAMA_HC_RES16, both default OFF).
++    if (!ggml_cuda_mmb_blk16() && !ggml_cuda_mmb_res16()) {
++        return;
++    }
+     const ggml_tensor * rblk = args.block_out->view_src ? args.block_out->view_src : args.block_out;
+     if (ggml_cuda_mmb_blk16() && !args.block_out_hc && args.block_out->view_offs == 0 &&
+             ggml_cuda_mmb_is_bf16_only(rblk)) {
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index d94fdab77..162e63992 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -1304,7 +1304,7 @@ static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, con
+     for (auto & e : g_mmb_cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+     uint16_t * buf = mmb_cache_insert(ctx, src1, n);
+     { static const int lg = getenv("LLAMA_MMB_CVT_LOG") ? atoi(getenv("LLAMA_MMB_CVT_LOG")) : 0; static unsigned cnt = 0;
+-      if (lg && cnt++ < 200) fprintf(stderr, "MMB_CVT %s op=%s ne=[%lld,%lld,%lld,%lld] view_src=%s src0=%s(%s) n=%zu\n", src1->name, ggml_op_name(src1->op), (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3], src1->view_src ? src1->view_src->name : "-", src1->src[0] ? src1->src[0]->name : "-", src1->src[0] ? ggml_op_name(src1->src[0]->op) : "-", n); }
++      if (lg && (int) cnt++ < (lg > 1 ? lg : 200)) fprintf(stderr, "MMB_CVT %s op=%s ne=[%lld,%lld,%lld,%lld] view_src=%s src0=%s(%s) n=%zu data=%p root=%p\n", src1->name, ggml_op_name(src1->op), (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3], src1->view_src ? src1->view_src->name : "-", src1->src[0] ? src1->src[0]->name : "-", src1->src[0] ? ggml_op_name(src1->src[0]->op) : "-", n, src1->data, (const void *) root); }
+     mmb_cvt_f32_bf16<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, buf, n);
+     return buf;
+ }
+-- 
+2.55.0
+

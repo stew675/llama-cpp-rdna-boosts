@@ -88,9 +88,16 @@
   dominant half (+4.7 %/+4.6 % alone); `blk16` adds +3.2 %/+2.5 % alone.  The MoE-merge `ffn_out`
   ADD is not adjacent to the reduction chain in our graph, so only the attention-path `block_out`
   takes `blk16`.
-* **Next: see "NEXT SESSION" immediately below** — the non-lossy `mmb_cvt_f32_bf16` investigation
-  (+1478 ms), then the prefill indexer relu-sum (item 14).  The session-5 profile/memory findings and
-  the corrected gate semantics are further down; read them too.
+* **`mmb_cvt_f32_bf16` gap CLOSED** (session 6, **`patches/0012`**, default ON, **bit-identical**): the
+  fused `hc_combine_norm` now emits the BF16 `out_xn` copy the graph already asked for, so every
+  consumer stops reconverting the F32 (81 % of the `mmb_cvt` traffic); `mmb_cvt` 520 -> 148 calls /
+  1.93e10 -> 3.67e9 elements and **+3.3 % pp8192 / +3.2 % pp32768** at `-b/-ub 4096` —
+  [`2026-09-22-mmb-cvt-out-xn.md`](2026-09-22-mmb-cvt-out-xn.md).  The width probe row0, same-seed
+  text and the **unfused** combine (`GGML_CUDA_DISABLE_HC_COMB=1`) all agree, so it is a
+  consistency fix, not a re-baseline.
+* **Next: see "NEXT SESSION" immediately below** — the prefill indexer relu-sum (item 14, +590 ms,
+  non-lossy), then the deferred `QSA_SCORE_BOUNDS`/`QSA_QUERY_STRIP` follow-ups.  The session-5
+  profile/memory findings and the corrected gate semantics are further down; read them too.
 
 ### NEXT SESSION — the non-lossy `mmb_cvt_f32_bf16` gap, then the indexer relu-sum
 
@@ -98,80 +105,27 @@
 It shipped default **OFF** (`LLAMA_HC_BLK16` / `LLAMA_HC_RES16`, +4.9 %/+4.8 % at depth) with a
 byte-identical default; the `ffn_out` MoE-merge `block_out` is the one piece left on the table.
 
-**The next two items are the non-lossy half of the session-5 profile** (they do not need a default-OFF
-gate — verify width probe + same-seed text and land them default-ON):
+**The next two non-lossy session-5 items:**
 
-1. **`mmb_cvt_f32_bf16` (+1478 ms)** — identical kernel, but our calls convert far larger tensors
-   than the reference's (1040 calls vs 1544, per-call 5× bigger): the activation cache / `mmb_root`
-   keying is converting redundant or larger-than-needed tensors.  Find which activation(s) and skip
-   or shrink the conversion.
-2. **Prefill indexer relu-sum (item 14, +590 ms)** — our fused indexer score is `n_tokens == 1`
+1. **`mmb_cvt_f32_bf16` — DONE (session 6, `patches/0012`).**  The graph already marks the fused
+   combine's `out_xn` BF16-only; the fused producer just did not emit the copy, so every consumer
+   reconverted the F32 (81 % of the `mmb_cvt` traffic, and the activation cache cannot dedupe because
+   the allocator reuses one `hc_norm` buffer across layers).  Emitting it is bit-identical (same RNE)
+   and **+3.3 %/+3.2 %** at depth — [`2026-09-22-mmb-cvt-out-xn.md`](2026-09-22-mmb-cvt-out-xn.md).
+2. **Prefill indexer relu-sum (item 14, +590 ms) — NEXT.**  Our fused indexer score is `n_tokens == 1`
    only, so prefill runs a separate `unary_op<relu>` (559 ms) + head-sum adds.  Our graph applies
    relu *before* the 4-D reshape (the L2a win), so the reference matcher cannot port verbatim — use
    a fused op or an order-aware matcher.
 
 Then the deferred `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` (item 15).
 
-**Target:** implement the reference's BF16 hyper-connection stream (`res_in_bf16`/`blk_in_bf16`/
-`res_out_bf16`/`out_xn_bf16`/`store_xn_f32`) so the fused `hc_combine_norm` reads/writes BF16, cutting
-`hc_combine_norm` from **3888 -> ~2077 ms** at pp32768 (~**1.8 s, ~3.8 %** end-to-end) - the largest
-single remaining prefill item.  **Gated OFF by default** per the maintainer (2026-09-22): enabled with
-`LLAMA_HC_BLK16=1` and/or `LLAMA_HC_RES16=1`; the default (env unset) path must stay exactly as it is
-now.
-
-**Reference (`~/pwilkin-llama-cpp`, branch `strix-halo` @ `b0f31f587`):**
-
-| what | where |
-|---|---|
-| consumer arms + `hc_bf2f32`/`hc_f2bf32` | `ggml/src/ggml-cuda/hc-cn.cu` (`hc_combine_norm_f32`, `_b256`) |
-| args struct | `ggml/src/ggml-cuda/hc-cn.cuh` (`ggml_cuda_hc_combine_norm_args`) |
-| matcher | `ggml/src/ggml-cuda/hc-match.inc` |
-| args setup | `ggml/src/ggml-cuda/ggml-cuda.cu` ~line 3878-3930 |
-| **marking block** (`xn`, `block_out`/blk16, `residual`/res16) | `ggml/src/ggml-cuda/ggml-cuda.cu` ~line 4960-5071 |
-| bf16-in/bf16-out reduction with merge (for the block_out path) | `ggml/src/ggml-cuda/moe-weighted-reduction.cu` (`_bf16_v4_out`, `_f32in_bf16out_v4`) |
-
-**Our files to change:**
-
-* `ggml/src/ggml-cuda/hyperconn.cu` — add the bf16 arms to `hc_combine_norm_f32` **and**
-  `hc_combine_norm_single_f32` (read residual/block_out as bf16; write out_res/out_xn as bf16 when the
-  mark says so; honour `store_xn_f32`).
-* `ggml/src/ggml-cuda/hyperconn.cuh` — extend `ggml_cuda_hc_combine_norm_args`.
-* `ggml/src/ggml-cuda/ggml-cuda.cu` — set the bf16 pointers at the **two** match sites
-  (`~5663` REPEAT block_out, `~5843` normal), and add the marking block after the existing HC16
-  marking (~`6515`, right where the MoE `down16` block landed).
-* `ggml/src/ggml-cuda/moe-weighted-reduction.cu` — port the `_out` (bf16-in/bf16-out + merge)
-  variants (the plain `down16` half is already there).
-
-**Already in place (from the beta + `patches/0010`):** `ggml_cuda_mmb_blk16()`/`res16()`/
-`mark_bf16_only()`/`is_bf16_only()`; the `LLAMA_HC_BLK16`/`LLAMA_HC_RES16` env gates (arch defaults 0);
-our `mmb.cu` producers already honour `is_bf16_only(dst)` (lines ~1784, ~1873); and the MoE `down16`
-change is the worked template (mark in `ggml_cuda_try_fuse`, dispatch in the consumer, gate default
-OFF).
-
-**Order of work:** (1) extend the args + both kernels behind the flags, default path untouched; (2) add
-the marking block; (3) port the `_out` reduction variants; (4) confirm each producer honours the mark;
-(5) validate.  Do not simplify the reference's marking predicates - they exist to guarantee **every**
-consumer of a marked tensor can read BF16.
-
-**Gates:**
-
-* Default (both env unset) must be **unchanged**: same-seed greedy text and width probe identical to
-  the current default build (`4a75744fa`).  This is the regression gate.
-* With `LLAMA_HC_BLK16=1` / `RES16=1`: coherent output; `plain == draft-mtp` greedy text (intra-build);
-  `test-logits-width-probe` prints `width_purity=PASS (worst maxdiff 0)`; A/B at `-b/-ub 4096`.
-* The greedy text **will differ** from the default (lossy) - that is expected; do not gate on
-  cross-build equality.
-* Record `hc_combine_norm` kernel ms (expect ~3888 -> ~2077 at pp32768) and the end-to-end delta.
-
-**Traps:**
-
-* Keep the reference's `ggml_nrows >= 512` prefill guard so decode/verify (`W <= 8`) is untouched -
-  that keeps `plain == draft-mtp` pure by construction.
-* `block_out` can be a MUL_MAT output, a MoE-reduction output, or an ADD of the two; handle all three
-  (the matcher's `producer_ok` does).
-* `residual` is BF16 **in place** over the same buffer (`res_in_bf16`/`res_out_bf16`); the alias check
-  in the matcher is load-bearing.
-* `store_xn_f32=false` means the F32 `out_xn` is dead - make sure the graph/slot assignment agrees.
+**Item-16 scoping (kept for reference; the port is DONE — [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md)):**
+the reference's BF16 HC stream hangs off `hc-cn.cu`/`hc-cn.cuh`/`hc-match.inc` (args, consumer arms,
+matcher), the args setup + the marking block in `ggml-cuda.cu`, and `moe_weighted_reduction_bf16_v4_out`
+/ `_f32in_bf16out_v4`.  Our adaptations: a structure-only identifier (our combine matcher is inline and
+runs in `try_fuse`, so marking needs its own walk), `blk_in_bf16` independent of `res16`, and the
+MoE-merge `ffn_out` ADD left F32 (in our graph it is not adjacent to the reduction chain).  Keep the
+`ggml_nrows >= 512` prefill guard.
 
 ### Session-5 finding (2026-09-22) — fresh target-ubatch profile, memory accounting, refined tasks
 
@@ -439,7 +393,7 @@ Both are recall-speed (Phase-1) items; the audit record has the full flag table 
 
 | what | where / value |
 |---|---|
-| fork `~/llama.cpp` | branch **`gap-closing`** @ **`37e8b1751`** = r12 + the 12 `beta/mmb-general` patches + the 11 gap-closing commits (session 6 = the HC BF16 streams, `patches/0011`) |
+| fork `~/llama.cpp` | branch **`gap-closing`** @ **`de5689d94`** = r12 + the 12 `beta/mmb-general` patches + the 12 gap-closing commits (session 6 = the HC BF16 streams `patches/0011` + the `mmb_cvt`/`out_xn` fix `patches/0012`) |
 | fork build | `~/llama.cpp/build-rocm` (gfx1151, ROCm 7.14), full feature set **default** |
 | this repo | branch `gap-closing` (published to `origin`), `wip/closing-the-gap/patches/0001..0010` |
 | the other solution | `~/pwilkin-llama-cpp` @ `b0f31f587`, `build-rocm` |
@@ -1383,8 +1337,9 @@ body, (7) tall tile, (8) QSA graph flags; items 1–9 survive, regrouped below.
 
 **Session-5 re-rank (2026-09-22, `-b 8192 -ub 8192 -p 32768` profile):** the remaining gap is the BF16
 intermediate traffic — **HC combine (`blk16`/`res16`) + MoE epilogue ≈ 2.4 s, ~4.6 %** — plus the
-non-lossy `mmb_cvt` (new, +1478 ms, investigate) and indexer relu-sum (item 14).  The `HC_*` ablation's
-−19.5 % is therefore **not** closed by the item-1 fusions alone; the residual is the BF16 streams.
+`mmb_cvt` (closed session 6, `patches/0012`) and indexer relu-sum (item 14, the next item).  The
+`HC_*` ablation's −19.5 % is therefore **not** closed by the item-1 fusions alone; the residual is the
+BF16 streams.
 
 Items 1+2 remain ~30 % of end-to-end prefill on the other solution's ablations.
 

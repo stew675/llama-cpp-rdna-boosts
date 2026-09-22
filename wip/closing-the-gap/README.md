@@ -20,7 +20,8 @@ moved here and updated 2026-09-21.
 | [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md) | Phase-1 item 7: keep the `M=4` HC inject out of the 384-row tall MMB tile (the tall kernel ran 2× the dispatches), **bit-identical**, **+0.8 % pp8192 / +1.1 % pp32768**. |
 | [`2026-09-22-qsa-graph-flags-audit.md`](2026-09-22-qsa-graph-flags-audit.md) | Phase-1 item 8 (**closed**): 7/9 QSA graph flags are present/superseded in our block-14/15 QSA; **2 are un-ported prefill-score optimizations** (`QSA_SCORE_BOUNDS`+`QSA_QUERY_STRIP`, `QSA_SCORE_WMMA`) — the next follow-ups. |
 | [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md) | Phase-1 item 16: the HC BF16 streams (`blk16`/`res16`) ported **default OFF**, default byte-identical, **+4.9 % pp8192 / +4.8 % pp32768** at `-b/-ub 4096`; `res16` is the dominant half.  The MoE-merge `ffn_out` ADD stays F32 in our graph (not adjacent to the reduction chain). |
-| [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..37e8b1751`, `0001..0011`) exported as patches, so the code work survives a fork reset. |
+| [`2026-09-22-mmb-cvt-out-xn.md`](2026-09-22-mmb-cvt-out-xn.md) | The `mmb_cvt_f32_bf16` gap: the fused combine now emits the BF16 `out_xn` copy the graph already marks (81 % of the traffic; the allocator reuses one `hc_norm` buffer so the cache cannot dedupe), **bit-identical**, **+3.3 % pp8192 / +3.2 % pp32768** at `-b/-ub 4096`. |
+| [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..de5689d94`, `0001..0012`) exported as patches, so the code work survives a fork reset. |
 
 ## The two moving references this file tracks
 
@@ -33,7 +34,7 @@ moved here and updated 2026-09-21.
 
 ## Current "our side" build state
 
-* `~/llama.cpp` branch **`gap-closing`** @ **`37e8b1751`** = `mmb-beta` (r12 `72176ae8a` + the 12
+* `~/llama.cpp` branch **`gap-closing`** @ **`de5689d94`** = `mmb-beta` (r12 `72176ae8a` + the 12
   `beta/mmb-general/patches/*.patch`, tree `bca69f23dd…`) + the 2026-09-21/22 changes: **default-on
   policy** (MMB/HC16/matcher), the `hc_combine_norm` matcher revival, the **`hc_gate_mix` fusion**
   (session 2), the **depthwise conv1d fusions** (session 3), the **QSA block-window fix** (session 3,
@@ -43,7 +44,7 @@ moved here and updated 2026-09-21.
   **HC BF16 streams** gated OFF (session 6, item 16), plus env-gated debug traces.
 * Built on this box (gfx1151) with `~/bin/build-llama-rocm-714`.  **All beneficial features are on by
   default** (see the `AGENTS.md` default-on policy); env vars only disable.
-* The ten `gap-closing` commits (`0001..0011`) are exported to [`patches/`](patches/) in case the local
+* The ten `gap-closing` commits (`0001..0012`) are exported to [`patches/`](patches/) in case the local
   fork branch is lost.
 
 To reproduce:
@@ -79,13 +80,14 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch  
    default OFF** — +4.9 % pp8192 / +4.8 % pp32768 at `-b/-ub 4096`, default build byte-identical —
    [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md).  The MoE-merge `ffn_out`
    `block_out` is the one piece left on the table (not adjacent to the reduction chain in our graph).
-   **Next code items, in order** (both non-lossy, land default-ON):
-   1. **`mmb_cvt_f32_bf16` (+1478 ms)** — our calls convert far larger tensors than the reference's
-      (activation cache / `mmb_root` keying).
-   2. **Prefill indexer relu-sum (+590 ms)** — our fused score op is `n_tokens == 1` only, so prefill
+   **The `mmb_cvt_f32_bf16` item is also DONE (session 6, `patches/0012`)** — the fused combine now
+   emits the BF16 `out_xn` copy the graph already marks, bit-identical, **+3.3 %/+3.2 %** —
+   [`2026-09-22-mmb-cvt-out-xn.md`](2026-09-22-mmb-cvt-out-xn.md).
+   **Next code item — the prefill indexer relu-sum (+590 ms)**, then the QSA-score follow-ups:
+   1. **Prefill indexer relu-sum (+590 ms)** — our fused score op is `n_tokens == 1` only, so prefill
       runs a separate `unary_op<relu>` (559 ms) + head-sum adds; the reference matcher cannot port
       verbatim because our graph applies relu *before* the 4-D reshape.
-   3. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` — the item-8 follow-ups.
+   2. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` — the item-8 follow-ups.
    The full session-5 finding (throughput A/B, memory accounting, family diff) is in
    [`closing-the-gap.md`](closing-the-gap.md#session-5-finding-2026-09-22--fresh-target-ubatch-profile-memory-accounting-refined-tasks).
 
@@ -139,7 +141,8 @@ MTP tuning + correctness.**
     the cost is both an intrinsic streaming overhead (still −4.0 % vs mmap with the table fully cached)
     and page-cache pressure (−9.7 % at the target); the fix is a no-cache parallel-pread fast path like
     the reference's `on-direct`.  It already enables the parked `-b/-ub 16384` (item 3, 1125.5 t/s).
-14. Port the prefill indexer **relu+head-sum** fusion (`idx-relu-sum`, ~+590 ms, non-lossy).  Our graph
+14. Port the prefill indexer **relu+head-sum** fusion (`idx-relu-sum`, ~+590 ms, non-lossy) — **the
+    next item**.  Our graph
     applies relu *before* the 4-D reshape (the L2a win), so the reference matcher cannot port verbatim.
 15. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`, then `QSA_SCORE_WMMA` — the item-8 follow-ups; the trim is
     coupled to the reference's complete-block selection, which our fused cell top-k lacks.
