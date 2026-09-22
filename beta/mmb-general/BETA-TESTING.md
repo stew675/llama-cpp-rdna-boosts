@@ -144,3 +144,33 @@ gate name, not "it was slower".
 
 **Also worth confirming while the box is warm:** that the gfx1151 `mmb` win is still `+32…+48 %` at
 **depth** (pp32768+), since that is the number the whole campaign is ultimately justified by.
+
+---
+
+## 5. gfx1151 re-validation — 2026-09-22 (session 8, r13 campaign)
+
+Run on the **r13 + `beta/mmb-general` + gap-closing `0001..0014`/`0016`/`0017`** campaign (fork
+`gap-closing-r13`) — a superset of this 12-patch set, so a green here implies a green for the beta.
+Box: gfx1151, ROCm 7.14, `MMB_CFG cc=0x1001151` (RDNA3_5 row: `dense_geom=0 routed=1 f32split=1
+min_t=512`).
+
+* **Gate 1 (intra-build purity)** — `test-logits-width-probe <qwen4exp IQ4_NL>
+  prompts/prose-rdna-boosts.txt 1024 512`: **`width_purity=PASS (worst maxdiff 0)`** (f16 KV), the
+  qwen4exp row-0 hash `268e0673300b7a33` matching the campaign record; `qwen4exp IQ4_NL` plain text is
+  coherent.  (The MMB-on-vs-r12 cross-build check is **retracted**; intra-build is the contract.)
+* **Gate 2 (MMB win)** — `mmb_dense`/`mmb_routed`/`mmb_routed_glu` fire on the uniform model; the
+  campaign's default set is the full set (`GGML_CUDA_MMB_CFG` shows `dense_geom=0 routed=1`).  The
+  gfx1151 `mmb` win carries (`+19..+63 %` on the new quant types below, `+32…+48 %` on the original set
+  per the campaign body).
+* **Gate 3 (op oracles)** — `GATED_DELTA_NET` **46/46**, `FLASH_ATTN_QSA` **26/26**, the new-type
+  `MUL_MAT`/`MUL_MAT_ID` (`patches/0017`) all pass, `LIGHTNING_INDEXER` **225/225** (`patches/0016`).
+  `INDEXER_TOPK` has **0 cases** in this tree (the G5 oracle is aspirational here).
+* **Gate 4 (MTP)** — qwen4exp, shared-NextN Q8_0 sidecar (fixed in delivery block 00 / r13), prose,
+  seed 42 / temp 0 / `--reasoning off` / `-n 3000`: **draft acceptance 0.85541** (acc/pos
+  0.938/0.853/0.776), **56.5 t/s vs plain 31.7 t/s** → MTP ≥ plain.  Well above the `~0.45` bar.
+* **New quant types** (`patches/0017`, default ON on non-RDNA4): Q4_0/Q4_1/Q5_0/MXFP4/NVFP4 —
+  `MUL_MAT` 48/47/14/46/45, `MUL_MAT_ID` 74/75/3/74/73, PPL parity, pp8192 **+19.5/+22.4/+25.4 %**,
+  35B-A3B Q4_1 pp4096 **+63 %**, gpt-oss-20b MXFP4 pp4096 **+5.2 %**.  Detail:
+  `wip/closing-the-gap/2026-09-22-mmb-quant-coverage.md`.
+
+**Verdict:** gfx1151 re-validation GREEN.  The only gate the beta window owed is closed.

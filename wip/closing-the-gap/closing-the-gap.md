@@ -156,9 +156,15 @@ This is an **upstream bug (#23398)** now **delivered in the delivery set as bloc
   **gpt-oss-20b MXFP4 pp4096 +5.2 %** — [`2026-09-22-mmb-quant-coverage.md`](2026-09-22-mmb-quant-coverage.md).
   NVFP4 has no local model (oracles gate it).
 
-**Remaining from the handover:** the full `beta/mmb-general` BETA-TESTING suite (Gate 4 MTP
-acceptance) is still owed; the parked items (Phase 2 sparse QSA decode `d67d58836`, Phase 3 adaptive
-ceiling sweep, `-ub 16384` PLE reader) are unchanged.
+**Remaining from the handover:** the parked items (Phase 2 sparse QSA decode `d67d58836`, Phase 3
+adaptive ceiling sweep, `-ub 16384` PLE reader) are unchanged.  **The owed `beta/mmb-general`
+BETA-TESTING gate suite is now GREEN on gfx1151** (session 8, on this r13+beta+gap-closing campaign):
+Gate 4 MTP on qwen4exp prose `-n 3000` — **draft acceptance 0.85541** (pos 0.938/0.853/0.776),
+**56.5 t/s vs plain 31.7 t/s** (>= plain); op oracles **LIGHTNING_INDEXER 225/225**,
+**GATED_DELTA_NET 46/46**, **FLASH_ATTN_QSA 26/26**, the new-type `MUL_MAT`/`MUL_MAT_ID` oracles (see
+[`2026-09-22-mmb-quant-coverage.md`](2026-09-22-mmb-quant-coverage.md)); width probe PASS on qwen4exp.
+(`INDEXER_TOPK` has 0 cases in this tree; the MMB-on-vs-r12 byte-identity check is retracted — see the
+2026-09-22 correction record.)
 
 **Session 6 landed three items** (fork `gap-closing`, exported to [`patches/`](patches/)):
 
