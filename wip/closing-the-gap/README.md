@@ -23,8 +23,9 @@ moved here and updated 2026-09-21.
 | [`2026-09-22-mmb-cvt-out-xn.md`](2026-09-22-mmb-cvt-out-xn.md) | The `mmb_cvt_f32_bf16` gap: the fused combine now emits the BF16 `out_xn` copy the graph already marks (81 % of the traffic; the allocator reuses one `hc_norm` buffer so the cache cannot dedupe), **bit-identical**, **+3.3 % pp8192 / +3.2 % pp32768** at `-b/-ub 4096`. |
 | [`2026-09-22-idx-relu-sum.md`](2026-09-22-idx-relu-sum.md) | The prefill indexer relu+head-sum fusion (`idx-relu-sum`): one kernel replaces the relu + CONT + ADD chain (our L2a relu-before-reshape form), **bit-identical**, **+1.8 % pp32768** at `-b/-ub 4096`. |
 | [`2026-09-22-qsa-score-bounds.md`](2026-09-22-qsa-score-bounds.md) | Phase-1 item 15: the QSA prefill scorer trim (`QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`) ported to the fused top-k (cell range clamped to `n_blocks*ratio`), default strip 1024, **bit-identical**, **+0.5 % pp8192 / neutral pp32768** at `-b/-ub 8192`; the `-inf`-padded first cut was a wash. |
+| [`2026-09-22-qsa-score-wmma.md`](2026-09-22-qsa-score-wmma.md) | Phase-1 item 15 (follow-up): `QSA_SCORE_WMMA` — the AMD RDNA3_5 4-head/128-dim lightning-indexer WMMA kernel ported + the qwen4exp prefill score fused into one `ggml_lightning_indexer` (all-ones weights, zero F16 mask) composed with the causal trim.  **Op oracle 225/225 (81 new `nh=4` cases)**; **default OFF** (`LLAMA_QSA_SCORE_WMMA=1`) pending the end-to-end qwen4exp gate (the live server holds the VRAM).  `patches/0016`. |
 | [`2026-09-22-mtp-shared-nextn-fix.md`](2026-09-22-mtp-shared-nextn-fix.md) | **Correctness fix, delivered in block 00 (r13)**: a shared-NextN MTP head (`nextn_shared_target_tensors`, the IQ4_NL shared Q8_0 sidecar) died every round on the M-RoPE `X < Y` check because `is_mem_shared` was inferred from `ctx_other` alone; gated on the `gemma4-assistant` arch.  0 errors, acceptance 0.287.  Upstream bug (#23398) folded into the block-00 base; the WIP `patches/0015` is superseded. |
-| [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..00d8bbbc9`, `0001..0015`) exported as patches, so the code work survives a fork reset.  **`0015` (the shared-NextN MTP fix) is superseded by delivery r13 block 00** — skip it when rebuilding this campaign on the r13 delivery. |
+| [`patches/`](patches/) | the fork `gap-closing` commits exported as patches, so the code work survives a fork reset.  On the **r13 rebuild** the campaign is `0001..0014`; **`0015` (the shared-NextN MTP fix) is superseded by delivery r13 block 00** — skip it.  `0016` is the **`QSA_SCORE_WMMA`** prefill-score fusion (default OFF pending the end-to-end gate). |
 
 ## The two moving references this file tracks
 
@@ -55,17 +56,21 @@ moved here and updated 2026-09-21.
 * The fourteen `gap-closing` commits (`0001..0014`) are exported to [`patches/`](patches/) in case the
   local fork branch is lost.
 
-To reproduce:
+To reproduce (the **r13 rebuild**):
 
 ```sh
 cd ~/llama.cpp
-git checkout rdna-boosts && git branch -D mmb-beta gap-closing 2>/dev/null
-git checkout -b gap-closing
+git checkout rdna-boosts-r13 && git branch -D mmb-beta gap-closing-r13 2>/dev/null
+git checkout -b gap-closing-r13
 git am /home/stew675/llama-cpp-rdna-boosts/beta/mmb-general/patches/*.patch
-# NOTE: 0015 (shared-NextN MTP fix) is in delivery r13 block 00; drop it when rebuilding on r13
-git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch   # tip 00d8bbbc9
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/00{01,02,03,04,05,06,07,08,09,10,11,12,13,14}-*.patch   # 0015 is in r13 block 00
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/0016-*.patch   # QSA_SCORE_WMMA, default OFF
 ~/bin/build-llama-rocm-714
 ```
+
+Fork tip after the rebuild + this session: **`fed70bb36`** (`gap-closing-r13`).  The five-segment
+scratch build above (first built 2026-09-22) is the tree the rebuild was verified on (`git am`
+12/12 + 14/14 + 1/1, no conflicts).
 
 ## Do first (fresh session, in order)
 
@@ -100,9 +105,15 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch  
    design (cell range clamped to `n_blocks*ratio`), default strip 1024, bit-identical, **+0.5 %
    pp8192 / neutral pp32768** at `-b/-ub 8192` —
    [`2026-09-22-qsa-score-bounds.md`](2026-09-22-qsa-score-bounds.md).
-   **Next session's two focus items — `QSA_SCORE_WMMA` (prefill) and MMB quant coverage
-   (Q4_0/Q4_1/Q5_0/MXFP4/NVFP4)**; prerequisite: rebuild the campaign on delivery r13 and drop WIP
-   `patches/0015` — see the NEXT SESSION block of [`closing-the-gap.md`](closing-the-gap.md).
+   **The `QSA_SCORE_WMMA` prefill-score fusion is CODE COMPLETE (session 8, `patches/0016`), default
+   OFF pending the end-to-end qwen4exp gate** — the AMD RDNA3_5 4-head/128-dim lightning-indexer
+   WMMA kernel ported, the qwen4exp prefill score fused into one `ggml_lightning_indexer` (all-ones
+   weights, zero F16 mask) composed with the causal trim, op oracle **225/225 (81 new `nh=4` cases)**
+   — [`2026-09-22-qsa-score-wmma.md`](2026-09-22-qsa-score-wmma.md).  **Next: run the end-to-end gate
+   (width probe + same-seed text + A/B on qwen4exp) and flip the default ON; then continue with MMB
+   quant coverage (Q4_0/Q4_1/Q5_0/MXFP4/NVFP4).**  The end-to-end gate is blocked while the gfx1151
+   box's `llama-server` holds ~88 GB VRAM.  See the NEXT SESSION block of
+   [`closing-the-gap.md`](closing-the-gap.md).
    The full session-5 finding (throughput A/B, memory accounting, family diff) is in
    [`closing-the-gap.md`](closing-the-gap.md#session-5-finding-2026-09-22--fresh-target-ubatch-profile-memory-accounting-refined-tasks).
 
@@ -161,16 +172,16 @@ MTP tuning + correctness.**
     [`2026-09-22-idx-relu-sum.md`](2026-09-22-idx-relu-sum.md).  The matcher anchors at the relu and
     accepts our L2a relu-before-the-4-D-reshape form (the head views' `view_src` is the relu while
     their strides come from the reshape).  RDNA3_5-gated like the reference.
-15. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` — **DONE 2026-09-22 (session 7, `patches/0014`), default
-    ON, bit-identical**: the trim is coupled to the reference's complete-block selection, which our
+15. `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` — **DONE 2026-09-22 (session 7, `patches/0014`)**, default
+    ON, bit-identical: the trim is coupled to the reference's complete-block selection, which our
     fused cell top-k lacks, so it is delivered by clamping the fused top-k's cell range to
     `n_blocks*ratio` instead of trimming the block map.  Default strip 1024, +0.5 % pp8192 / neutral
     pp32768 at `-b/-ub 8192`.  The `-inf`-padded first cut (no kernel change) was a wash —
-    [`2026-09-22-qsa-score-bounds.md`](2026-09-22-qsa-score-bounds.md).  **Remaining (next-session
-    focus): `QSA_SCORE_WMMA`** — fuse the prefill score with the existing `ggml_lightning_indexer`
-    WMMA op (all-ones weights + zero F16 mask), composed with the trim; a numerics change with its own
-    width-probe/same-seed gate.  Full scoping in the NEXT SESSION block of
-    [`closing-the-gap.md`](closing-the-gap.md).
+    [`2026-09-22-qsa-score-bounds.md`](2026-09-22-qsa-score-bounds.md).  **`QSA_SCORE_WMMA` is CODE
+    COMPLETE (session 8, `patches/0016`), default OFF pending the end-to-end qwen4exp gate**: the
+    AMD RDNA3_5 4-head/128-dim lightning-indexer WMMA kernel + the fused prefill score (all-ones
+    weights, zero F16 mask) composed with the trim; op oracle 225/225 (81 new `nh=4` cases) —
+    [`2026-09-22-qsa-score-wmma.md`](2026-09-22-qsa-score-wmma.md).
 16. **BF16 HC streams** (`blk16`/`res16`) — **DONE 2026-09-22 (session 6, `patches/0011`),
     default OFF**: +4.9 % pp8192 / +4.8 % pp32768 at `-b/-ub 4096`, default build byte-identical —
     [`2026-09-22-hc-bf16-streams.md`](2026-09-22-hc-bf16-streams.md).  `res16` is the dominant half;
