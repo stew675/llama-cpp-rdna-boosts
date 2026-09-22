@@ -136,20 +136,29 @@ This is an **upstream bug (#23398)** now **delivered in the delivery set as bloc
 `v16-ebbb18522-r13`)** — an `upstream/` PR candidate for when upstream fixes it, and the WIP
 `patches/0015` is superseded (do not apply it on a campaign rebuilt on r13).
 
-**Session 8 (2026-09-22) did the rebuild + Focus 1.**  The campaign is rebuilt on **r13** (fork
-branch `gap-closing-r13`, tip `ef6985a39` = r13 + 12 `beta/mmb-general` patches + gap-closing
-`0001..0014`, dropping the superseded `0015`), built clean.  **`QSA_SCORE_WMMA` is DONE, default ON**
-(`patches/0016`): the reference's AMD RDNA3_5 4-head/128-dim `qsa_indexer_wmma16_keyreg` WMMA kernel
-is ported into `lightning-indexer.cu` (with a generic `n_head == 4` vec fallback so the op is legal
-on every backend), `build_qsa_top_k` builds the prefill score as one `ggml_lightning_indexer`
-(all-ones weights + zero F16 mask, shared per graph by name) composed with the `QSA_SCORE_BOUNDS`
-causal trim (leading-rows views), and the op oracle is green —
-`test-backend-ops -o LIGHTNING_INDEXER` **225/225 including 81 new `nh=4` cases**.  Gated on gfx1151
-qwen4exp IQ4_NL: `width_purity=PASS (worst maxdiff 0)` with the per-W hashes **byte-identical** to
-`LLAMA_QSA_SCORE_WMMA=0`, coherent same-seed text (the approved prefill re-baseline), and pp32768
-**1311.5 → 1324.9 t/s (+1.0 %, `-b/-ub 8192`)** / **1265.9 → 1277.2 (+0.9 %, `-b/-ub 4096`)**, pp8192
-flat — [`2026-09-22-qsa-score-wmma.md`](2026-09-22-qsa-score-wmma.md).  **Next: Focus 2 (MMB quant
-coverage).**
+**Session 8 (2026-09-22) did the rebuild + BOTH focus items.**  The campaign is rebuilt on **r13**
+(fork branch `gap-closing-r13`, tip `abf3bff76` = r13 + 12 `beta/mmb-general` patches + gap-closing
+`0001..0014` + `0016`/`0017`, dropping the superseded `0015`), built clean.
+
+* **`QSA_SCORE_WMMA` DONE, default ON** (`patches/0016`): the reference's AMD RDNA3_5 4-head/128-dim
+  `qsa_indexer_wmma16_keyreg` WMMA kernel is ported into `lightning-indexer.cu` (with a generic
+  `n_head == 4` vec fallback so the op is legal on every backend), `build_qsa_top_k` builds the
+  prefill score as one `ggml_lightning_indexer` (all-ones weights + zero F16 mask, shared per graph by
+  name) composed with the `QSA_SCORE_BOUNDS` causal trim (leading-rows views).  Op oracle `-o
+  LIGHTNING_INDEXER` **225/225 including 81 new `nh=4` cases**; gated on qwen4exp IQ4_NL
+  (`width_purity=PASS` with per-W hashes **byte-identical** to `=0`, coherent same-seed text) with
+  pp32768 **1311.5 → 1324.9 t/s (+1.0 %, `-b/-ub 8192`)** / **1265.9 → 1277.2 (+0.9 %, `-b/-ub 4096`)**,
+  pp8192 flat — [`2026-09-22-qsa-score-wmma.md`](2026-09-22-qsa-score-wmma.md).
+* **MMB quant coverage DONE, default ON on non-RDNA4** (`patches/0017`): five more weight types —
+  **Q4_0 / Q4_1 / Q5_0 / MXFP4 / NVFP4** (WTYPE 11–15) — with dequant-vs-CPU oracles
+  (`MUL_MAT` 48/47/14/46/45, `MUL_MAT_ID` 74/75/3/74/73 with MMB forced on), PPL parity, and
+  **+19.5/+22.4/+25.4 %** pp8192 (3B), **35B-A3B Q4_1 pp4096 1500 → 2449 (+63 %)** (routed+GLU),
+  **gpt-oss-20b MXFP4 pp4096 +5.2 %** — [`2026-09-22-mmb-quant-coverage.md`](2026-09-22-mmb-quant-coverage.md).
+  NVFP4 has no local model (oracles gate it).
+
+**Remaining from the handover:** the full `beta/mmb-general` BETA-TESTING suite (Gate 4 MTP
+acceptance) is still owed; the parked items (Phase 2 sparse QSA decode `d67d58836`, Phase 3 adaptive
+ceiling sweep, `-ub 16384` PLE reader) are unchanged.
 
 **Session 6 landed three items** (fork `gap-closing`, exported to [`patches/`](patches/)):
 

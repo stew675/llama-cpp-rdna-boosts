@@ -24,8 +24,9 @@ moved here and updated 2026-09-21.
 | [`2026-09-22-idx-relu-sum.md`](2026-09-22-idx-relu-sum.md) | The prefill indexer relu+head-sum fusion (`idx-relu-sum`): one kernel replaces the relu + CONT + ADD chain (our L2a relu-before-reshape form), **bit-identical**, **+1.8 % pp32768** at `-b/-ub 4096`. |
 | [`2026-09-22-qsa-score-bounds.md`](2026-09-22-qsa-score-bounds.md) | Phase-1 item 15: the QSA prefill scorer trim (`QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP`) ported to the fused top-k (cell range clamped to `n_blocks*ratio`), default strip 1024, **bit-identical**, **+0.5 % pp8192 / neutral pp32768** at `-b/-ub 8192`; the `-inf`-padded first cut was a wash. |
 | [`2026-09-22-qsa-score-wmma.md`](2026-09-22-qsa-score-wmma.md) | Phase-1 item 15 (follow-up): `QSA_SCORE_WMMA` — the AMD RDNA3_5 4-head/128-dim lightning-indexer WMMA kernel ported + the qwen4exp prefill score fused into one `ggml_lightning_indexer` (all-ones weights, zero F16 mask) composed with the causal trim.  **Op oracle 225/225 (81 new `nh=4` cases)**; **width probe PASS, per-W hashes byte-identical to off**; coherent re-baseline text; **pp32768 +1.0 % / +0.9 %**, pp8192 flat.  **default ON** (`LLAMA_QSA_SCORE_WMMA=0` disables), `patches/0016`. |
+| [`2026-09-22-mmb-quant-coverage.md`](2026-09-22-mmb-quant-coverage.md) | Phase-2 item 10: five more MMB weight types — **Q4_0 / Q4_1 / Q5_0 / MXFP4 / NVFP4** (WTYPE 11–15), dequant-vs-CPU oracles green (`MUL_MAT` 48/47/14/46/45, `MUL_MAT_ID` 74/75/3/74/73), PPL parity, pp8192 **+19.5/+22.4/+25.4 %**, 35B-A3B Q4_1 **+63 %**, gpt-oss MXFP4 **+5.2 %**.  **default ON on non-RDNA4**, `patches/0017`. |
 | [`2026-09-22-mtp-shared-nextn-fix.md`](2026-09-22-mtp-shared-nextn-fix.md) | **Correctness fix, delivered in block 00 (r13)**: a shared-NextN MTP head (`nextn_shared_target_tensors`, the IQ4_NL shared Q8_0 sidecar) died every round on the M-RoPE `X < Y` check because `is_mem_shared` was inferred from `ctx_other` alone; gated on the `gemma4-assistant` arch.  0 errors, acceptance 0.287.  Upstream bug (#23398) folded into the block-00 base; the WIP `patches/0015` is superseded. |
-| [`patches/`](patches/) | the fork `gap-closing` commits exported as patches, so the code work survives a fork reset.  On the **r13 rebuild** the campaign is `0001..0014`; **`0015` (the shared-NextN MTP fix) is superseded by delivery r13 block 00** — skip it.  `0016` is the **`QSA_SCORE_WMMA`** prefill-score fusion (default OFF pending the end-to-end gate). |
+| [`patches/`](patches/) | the fork `gap-closing` commits exported as patches, so the code work survives a fork reset.  On the **r13 rebuild** the campaign is `0001..0014`; **`0015` (the shared-NextN MTP fix) is superseded by delivery r13 block 00** — skip it.  `0016` = `QSA_SCORE_WMMA` (default ON), `0017` = MMB quant coverage Q4_0/Q4_1/Q5_0/MXFP4/NVFP4 (default ON on non-RDNA4). |
 
 ## The two moving references this file tracks
 
@@ -110,9 +111,12 @@ scratch build above (first built 2026-09-22) is the tree the rebuild was verifie
    into one `ggml_lightning_indexer` (all-ones weights, zero F16 mask) composed with the causal trim,
    op oracle **225/225 (81 new `nh=4` cases)**, width probe PASS with the per-W hashes byte-identical
    to `=0`, pp32768 **+1.0 % / +0.9 %** —
-   [`2026-09-22-qsa-score-wmma.md`](2026-09-22-qsa-score-wmma.md).  **Next: Focus 2, MMB quant
-   coverage (Q4_0/Q4_1/Q5_0/MXFP4/NVFP4).**  The campaign was rebuilt on delivery **r13** (fork
-   `gap-closing-r13`, tip `ef6985a39`), dropping the superseded WIP `patches/0015`.
+   [`2026-09-22-qsa-score-wmma.md`](2026-09-22-qsa-score-wmma.md).  **MMB quant coverage is DONE
+too (session 8, `patches/0017`)**: Q4_0/Q4_1/Q5_0/MXFP4/NVFP4, oracles green, PPL parity, pp8192
+   +19.5/+22.4/+25.4 %, 35B-A3B Q4_1 +63 %, gpt-oss MXFP4 +5.2 % —
+   [`2026-09-22-mmb-quant-coverage.md`](2026-09-22-mmb-quant-coverage.md).  The campaign was rebuilt
+   on delivery **r13** (fork `gap-closing-r13`, tip `abf3bff76`), dropping the superseded WIP
+   `patches/0015`.
    The full session-5 finding (throughput A/B, memory accounting, family diff) is in
    [`closing-the-gap.md`](closing-the-gap.md#session-5-finding-2026-09-22--fresh-target-ubatch-profile-memory-accounting-refined-tasks).
 
@@ -191,11 +195,12 @@ MTP tuning + correctness.**
 
 9. Port sparse QSA decode + incremental indexer state (`d67d58836`) — its +11–20 %; our plain decode is
    already ahead, so this is a hold/repay item.
-10. MMB quant coverage — **next-session focus (with `QSA_SCORE_WMMA`)**: port **Q4_0, Q4_1, Q5_0,
-    MXFP4, NVFP4** to `mmb.cu` (Q2_K/IQ1_*/IQ2_* stay out of scope for quality).  Per-type checklist
-    and the closest existing templates are scoped in the NEXT SESSION block of
-    [`closing-the-gap.md`](closing-the-gap.md); gate on PPL parity + a throughput A/B, and default ON.
-    Currently supported: IQ4_NL, Q8_0, Q4_K, Q5_1, IQ3_S, Q5_K, Q6_K, IQ4_XS, Q3_K, IQ3_XXS.
+10. MMB quant coverage — **DONE 2026-09-22 (session 8, `patches/0017`), default ON on non-RDNA4**:
+    **Q4_0, Q4_1, Q5_0, MXFP4, NVFP4** ported to `mmb.cu` (WTYPE 11–15).  `MUL_MAT` oracles
+    48/47/14/46/45, `MUL_MAT_ID` 74/75/3/74/73 (dequant vs CPU, MMB forced on), PPL parity, pp8192
+    +19.5/+22.4/+25.4 %, 35B-A3B Q4_1 +63 %, gpt-oss-20b MXFP4 +5.2 % —
+    [`2026-09-22-mmb-quant-coverage.md`](2026-09-22-mmb-quant-coverage.md).  NVFP4 has no local model
+    (oracle-only).  Q2_K/IQ1_*/IQ2_* stay out of scope for quality.
 
 **Phase 3 — MTP tuning + correctness** (parked)
 
