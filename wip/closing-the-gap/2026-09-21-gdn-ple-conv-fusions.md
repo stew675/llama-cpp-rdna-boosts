@@ -77,3 +77,31 @@ profile).  The qwen35moe win is larger because every layer carries a GDN conv th
 * The one-shot `GGML_CUDA_CONV_DEBUG=1` trace prints a resolved match per process
   (`GDN_CONV_DIRECT …` / `PLE_CONV_DIRECT …`); it is inert by default and kept for the next
   matcher-debug session.
+
+## Where item 4 stands (assessed 2026-09-21, not started)
+
+* **`idx-relu-sum` is already covered on our tree.**  The reference's `LLAMA_IDX_RELU_SUM` fuses a
+  graph-level `RELU -> VIEW(0) -> CONT -> (VIEW(h) -> ADD)*` head-reduction chain.  Our delivery's
+  `GGML_CUDA_QSA_INDEXER_SCORE` (default on) is a single fused indexer-score kernel that already
+  computes `bias + sum_h relu(dot_h)` in h order (`indexer-score.cu` line ~232), so the chain the
+  reference fuses does not exist in our graph.  Item 4's `-1.3 %` is therefore already banked; the
+  profile's `indexer 156 ms vs its 63.6 ms` is our fused kernel being slower, not a missing fusion
+  (a separate tuning item).
+* **`norm-gated.cu` (`rms_rows`) is lower-ROI here than the doc's `-2.9 %`.**  Its target is the
+  narrow-row (`ncols <= 256`) norms.  In the 2026-09-20 profile ours already run as the block-per-row
+  `rms_norm_f32<256,{true,false}>` (288.8 + 148.8 ms), while the reference's `rms_rows_f32` pair is
+  220.0 + 82.7 ms — about 135 ms (~1.2 %) on the whole process.  Worth doing, but behind the
+  `hc_combine_norm_f32` kernel swap below.
+* **The obvious next kernel item is the `hc_combine_norm_f32` `_b256` swap** (item 1's follow-up):
+  the reference's `hc-cn.cu::hc_combine_norm_f32_b256` (256 threads, two packed elements/thread) is
+  the faster form of the same matcher we revived; it is the concrete difference behind the profile's
+  `rms_norm_f32<1024,true> 622 ms + dsv4_hc_post 739 ms` vs the reference's `hc_combine_norm_f32_b256
+  554 ms + hc_gate_mix 408 ms`.  It must be checked for bit-identity against the current
+  `hc_combine_norm_f32` before it can be defaulted.
+* **Item 3.5 (the three QSA correctness fixes) is an audit, not a cherry-pick.**  `40c0b9c38`
+  (maskless only where qsa3 consumes it) and `14fff4f97` (-1 sentinel) are about the reference's
+  `qwen4exp_select_complete_blocks` / qsa3-cell selection; `b0f31f587` sizes the block window by the
+  highest stored position in `llama-memory-hybrid-idx.*`.  Our delivery has its own derived-visibility
+  / keys-only / fused-indexer QSA and its own indexer cache, so each fix has to be checked against
+  our equivalent before it is ported (the long-session non-determinism the first one fixes is the
+  reason this stays a Phase-1 correctness item).

@@ -79,7 +79,10 @@ MTP tuning + correctness.**
    section: result_output reserve + HC pin + resident PLE.  Candidate fixes: default the PLE to
    mmap-lazy (fix the `-lzm auto` propagation), or expose `--lazy-buffer-size` in `llama-bench`.
 3.5. Port the other solution's three correctness fixes (`40c0b9c38`, `b0f31f587`, `14fff4f97`).
-4. `norm-gated.cu` + `idx-relu-sum.cu` — −2.9 % / −1.3 %.
+4. `norm-gated.cu` (~1.2 % on our tree) + `idx-relu-sum.cu` (**already banked** by our fused indexer
+   score — see the item-4 assessment in [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md)).
+   The highest-value next kernel item is the **`hc_combine_norm_f32` `_b256` swap** (item 1's
+   follow-up).
 5. MoE bf16 epilogue + drop `concat_transposed` (beta's `MMB_DOWN16` is gated off).
 
 **Phase 2 — decode speed + correctness**

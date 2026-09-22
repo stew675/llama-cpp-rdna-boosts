@@ -24,8 +24,12 @@
   default-on, **bit-identical** (fused == unfused row-0 logits hash + width probe PASS) and
   **+3.0/+3.2 %** on qwen4exp IQ4_NL, **+6.5/+7.1 %** on 35B-A3B (pp8192/32768, `-ub 8192`).  Fork tip
   **`1004c65db`**, exported as **`patches/0004`** — [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md).
-* **Next: Phase-1 item 3.5 (the three correctness fixes) + item 4** (`norm-gated.cu` + `idx-relu-sum.cu`,
-  −2.9 % / −1.3 %), then item 5 (MoE bf16 epilogue) and item 6 (`qsa3_attn` body).
+* **Next: the `hc_combine_norm_f32` `_b256` kernel swap** (item 1's follow-up) — the faster form of the
+  matcher we revived, worth closing most of the `rms_norm_f32<1024,true> 622 ms + dsv4_hc_post 739 ms`
+  gap.  Then Phase-1 item 3.5 (the three QSA correctness fixes — now scoped as an **audit**, see
+  [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md)) and item 4
+  (`norm-gated.cu`, ~1.2 % on our tree; `idx-relu-sum` is already banked by our fused indexer score).
+  Items 5 (MoE bf16 epilogue) and 6 (`qsa3_attn` body) follow.
 
 ### Do these in order
 
