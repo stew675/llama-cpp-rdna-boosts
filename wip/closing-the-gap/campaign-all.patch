@@ -1216,7 +1216,7 @@ index 000000000..a843b460a
 +void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
 +void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 071911a0c..615414bfd 100644
+index 071911a0c..55ce474f0 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -30,14 +30,18 @@
@@ -1273,7 +1273,7 @@ index 071911a0c..615414bfd 100644
          if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
              ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
              return;
-@@ -3981,6 +3999,136 @@ static int ggml_cuda_match_hc_mix(const ggml_cgraph * cgraph, const int i, ggml_
+@@ -3981,6 +3999,224 @@ static int ggml_cuda_match_hc_mix(const ggml_cgraph * cgraph, const int i, ggml_
      args.bias  = ggml_get_op_params_f32(scale, 1);
      return n_ops;
  }
@@ -1407,13 +1407,111 @@ index 071911a0c..615414bfd 100644
 +    }
 +}
 +
++// Prefill indexer head reduction: relu + head-sum.  Anchored at the RELU.  Our qwen4exp graph (the
++// L2a memory win) puts the relu BEFORE the 4-D reshape, so an optional RESHAPE between the relu and
++// the head views is accepted; the reference's relu-on-4-D form matches with no reshape.  The fused
++// kernel recomputes the relu from the pre-relu scores and sums in graph order, so it is bit-identical.
++static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_idx_relu_sum_args & a) {
++    if (!ggml_cuda_idx_relu_sum_enabled() || i + 4 >= g->n_nodes) {
++        return 0;
++    }
++    const ggml_tensor * relu = g->nodes[i];
++    if (relu->op != GGML_OP_UNARY || ggml_get_unary_op(relu) != GGML_UNARY_OP_RELU) {
++        return 0;
++    }
++    if (relu->type != GGML_TYPE_F32 || !ggml_is_contiguous(relu)) {
++        return 0;
++    }
++    const ggml_tensor * src = relu->src[0];
++    if (!src || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src)) {
++        return 0;
++    }
++    // our L2a form: RELU([nb, H*nt, ns]) -> RESHAPE_4D([nb, H, nt, ns]) -> head views.  ggml
++    // collapses a view-of-a-view, so the head views' view_src is the RELU root while their strides
++    // come from the reshape (`sc`).
++    const ggml_tensor * sc = relu;
++    int j = i + 1;
++    if (g->nodes[j]->op == GGML_OP_RESHAPE && g->nodes[j]->src[0] == relu &&
++            g->nodes[j]->view_src == relu && g->nodes[j]->type == GGML_TYPE_F32 && ggml_is_contiguous(g->nodes[j])) {
++        sc = g->nodes[j];
++        ++j;
++    }
++    const int64_t nb = sc->ne[0], H = sc->ne[1], nt = sc->ne[2], ns = sc->ne[3];
++    if (H < 2 || H > 32 || nb < 64 || nt * ns < 64 || j + 1 >= g->n_nodes) {
++        return 0;
++    }
++    auto is_slice = [&](const ggml_tensor * v, int64_t h) {
++        return v->op == GGML_OP_VIEW && v->view_src == relu && v->type == GGML_TYPE_F32 &&
++               v->ne[0] == nb && v->ne[1] == nt && v->ne[2] == ns && v->ne[3] == 1 &&
++               v->nb[0] == sizeof(float) && v->nb[1] == sc->nb[2] && v->nb[2] == sc->nb[3] &&
++               v->view_offs == (size_t) h * sc->nb[1];
++    };
++    const ggml_tensor * cont = g->nodes[j + 1];
++    if (!is_slice(g->nodes[j], 0) || cont->op != GGML_OP_CONT || cont->src[0] != g->nodes[j]) {
++        return 0;
++    }
++    const ggml_tensor * prev = cont;
++    int k = j + 2;
++    for (int64_t h = 1; h < H; ++h) {
++        if (k + 1 >= g->n_nodes) {
++            return 0;
++        }
++        const ggml_tensor * v = g->nodes[k];
++        const ggml_tensor * add = g->nodes[k + 1];
++        if (!is_slice(v, h) || add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32) {
++            return 0;
++        }
++        if (add->src[0] != prev || add->src[1] != v || !ggml_are_same_shape(add, cont) || !ggml_is_contiguous(add)) {
++            return 0;
++        }
++        prev = add;
++        k += 2;
++    }
++    const int count = k - i;
++    if (count > 32) {
++        return 0;
++    }
++    int indices[32];
++    enum ggml_op ops[32];
++    for (int q = 0; q < count; ++q) {
++        indices[q] = i + q;
++        ops[q] = g->nodes[i + q]->op;
++    }
++    const int output = i + count - 1;
++    if (!ggml_can_fuse_subgraph_ext(g, indices, count, ops, &output, 1)) {
++        return 0;
++    }
++    if (src->data && prev->data) {
++        const uintptr_t av = (uintptr_t) src->data, bv = (uintptr_t) prev->data;
++        const bool overlap = av <= bv ? bv - av < ggml_nbytes(src) : av - bv < ggml_nbytes(prev);
++        if (overlap) {
++            return 0;
++        }
++    }
++    a.score = src;
++    a.dst   = (ggml_tensor *) prev;
++    a.heads = (int) H;
++    a.rows  = nt * ns;
++    return count;
++}
++
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-@@ -3999,6 +4147,61 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3999,6 +4235,71 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      ggml_tensor * node = cgraph->nodes[i];
  
++    // Prefill indexer head reduction (relu + head-sum) for the qwen4exp sparse-attention graph.
++    if (node->op == GGML_OP_UNARY && GGML_CUDA_CC_IS_RDNA3_5(cc)) {
++        ggml_cuda_idx_relu_sum_args args;
++        const int count = ggml_cuda_match_idx_relu_sum(cgraph, i, args);
++        if (count > 0) {
++            ggml_cuda_op_idx_relu_sum(*cuda_ctx, args);
++            return count - 1;
++        }
++    }
++
 +    // Depthwise causal conv1d fusions (qwen4exp GDN + PLE), ported from the halo-box
 +    // reference: the CONCAT(state, x) materialization and the SSM_CONV / tap-mul-add
 +    // chain are replaced by a direct kernel that reads state+x and writes the conv
@@ -1472,7 +1570,7 @@ index 071911a0c..615414bfd 100644
      // qwen4exp IQ4_NL/Q8_0 routed down projection followed by the 10-expert weighted sum (ported
      // from halo-box/strix-llama.cpp): compute all selected experts for one output row in a wave and
      // apply their routing weights immediately, avoiding the [n_embd, n_used] intermediate and its
-@@ -4053,7 +4256,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4053,7 +4354,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // rows (grid 262144x3); the pair runs it once and both muls read the same q8_1 buffer.
      static const bool pair_off        = getenv("GGML_PAIR_OFF") != nullptr;
      static const bool disable_pair_dense = getenv("GGML_PAIR_DENSE_OFF") != nullptr;
@@ -1487,7 +1585,7 @@ index 071911a0c..615414bfd 100644
          ggml_tensor * next = cgraph->nodes[i + 1];
          const ggml_tensor * src0 = node->src[0];
          const ggml_tensor * src0_next = next->src[0];
-@@ -4095,12 +4304,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4095,12 +4402,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          ggml_moe_weighted_reduction_match match;
          static const bool mwr_dbg2 = getenv("GGML_CUDA_MWR_DEBUG") != nullptr;
          if (ggml_match_moe_weighted_reduction(cgraph, i, match)) {
@@ -1524,7 +1622,7 @@ index 071911a0c..615414bfd 100644
              }
          }
      }
-@@ -4164,7 +4393,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4164,7 +4491,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // swiglu -> mul_mat_q: fold silu(gate)*up into the mmq activation quantize (the qwen4exp
      // MoE down feed; the GLU output is never materialized). mmq only engages at prefill, so
      // the decode MoE tails keep their own fusions.
@@ -1538,7 +1636,7 @@ index 071911a0c..615414bfd 100644
          ggml_tensor * next = cgraph->nodes[i + 1];
          const bool has_ids = next->op == GGML_OP_MUL_MAT_ID;
          if (has_ids || next->op == GGML_OP_MUL_MAT) {
-@@ -4753,6 +4987,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4753,6 +5085,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              const ggml_tensor * src1 = up->src[1];
              const ggml_tensor * ids  = up->src[2];
  
@@ -1553,7 +1651,7 @@ index 071911a0c..615414bfd 100644
              if (ggml_cuda_should_fuse_mul_mat_vec_f(up) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate->src[0];
-@@ -5352,6 +5594,62 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5352,6 +5692,62 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      static const bool hc_optin  = !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_FUSION") || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_FUSION")));
      static const bool hc_mix_on  = hc_optin && !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_MIX")  || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_MIX")));
      static const bool hc_comb_on = hc_optin && !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_COMB") || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_COMB")));
@@ -1616,7 +1714,7 @@ index 071911a0c..615414bfd 100644
      if (hc_mix_on) {
      // qwen4exp hyper-connection stream mix:
      //     sigmoid(gate) -> mul(xn, .) -> reshape -> view(stream 0) -> cont -> (view(stream c) -> add) x (hc-1) -> scale
-@@ -5404,6 +5702,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5404,6 +5800,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              while (base_root != nullptr && base_root->view_src != nullptr) {
                  base_root = base_root->view_src;
              }
@@ -1630,7 +1728,7 @@ index 071911a0c..615414bfd 100644
              if (base_root != nullptr && base_root->type == GGML_TYPE_F32 &&
                      (base_root->flags & GGML_TENSOR_FLAG_OUTPUT)) {
                  const int limit = std::min(cgraph->n_nodes, i + 24);
-@@ -5472,10 +5777,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5472,10 +5875,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                                  const bool ok_d = ggml_are_same_shape(mul, add) && ggml_are_same_shape(res, add) && ggml_are_same_shape(rms, add);
                                  const bool ok_e = ggml_is_contiguous(res) && ggml_is_contiguous(add) && ggml_is_contiguous(rms) &&
                                      ggml_is_contiguous(mulg) && ggml_is_contiguous(gamma);
@@ -1654,7 +1752,7 @@ index 071911a0c..615414bfd 100644
                                  if (ok) {
                                      ggml_cuda_hc_combine_norm_args args;
                                      args.inject       = inject;
-@@ -5514,7 +5830,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5514,7 +5928,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                                      const int out_nodes[] = { m, g };
                                      const bool supp = ggml_cuda_hc_combine_norm_supported(args, ggml_cuda_info().devices[cuda_ctx->device].warp_size);
                                      const bool canf = ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2);
@@ -1669,7 +1767,7 @@ index 071911a0c..615414bfd 100644
                                          ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
                                          return g - i;
                                      }
-@@ -5635,10 +5958,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5635,10 +6056,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                          const bool ok_d = ggml_are_same_shape(mul, add) && ggml_are_same_shape(res, add) && ggml_are_same_shape(rms, add);
                          const bool ok_e = ggml_is_contiguous(res) && ggml_is_contiguous(add) && ggml_is_contiguous(rms) &&
                              ggml_is_contiguous(mulg) && ggml_is_contiguous(gamma);
@@ -1693,7 +1791,7 @@ index 071911a0c..615414bfd 100644
                          if (ok) {
                              ggml_cuda_hc_combine_norm_args args;
                              args.inject    = inject;
-@@ -5686,6 +6020,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5686,6 +6118,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                              const bool supp = ggml_cuda_hc_combine_norm_supported(args, ggml_cuda_info().devices[cuda_ctx->device].warp_size);
                              const bool canf = ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2);
                              if (alias_ok && supp && canf) {
@@ -1701,7 +1799,7 @@ index 071911a0c..615414bfd 100644
                                  ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
                                  return g - i;
                              }
-@@ -6096,6 +6431,9 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+@@ -6096,6 +6529,9 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
  }
  #endif // USE_CUDA_GRAPH
  
@@ -1711,7 +1809,7 @@ index 071911a0c..615414bfd 100644
  static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
-@@ -6103,6 +6441,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6103,6 +6539,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      // The Q8_1 input cache is only valid within one graph execution.
      cuda_ctx->q8_1_cache_clear();
@@ -1719,7 +1817,7 @@ index 071911a0c..615414bfd 100644
  
      bool use_cuda_graph             = false;
      bool cuda_graph_update_required = false;
-@@ -6170,6 +6509,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6170,6 +6607,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
  
@@ -1729,7 +1827,7 @@ index 071911a0c..615414bfd 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -6201,9 +6543,263 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+@@ -6201,9 +6641,276 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
  static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
@@ -1962,6 +2060,19 @@ index 071911a0c..615414bfd 100644
 +        }
 +    }
 +
++    // Prefill indexer relu-sum: keep the pre-relu scores alive until the summed output, so the
++    // allocator cannot reuse that buffer for the fused destination.
++    {
++        for (int i = 0; i < cgraph->n_nodes; ++i) {
++            if (cgraph->nodes[i]->op != GGML_OP_UNARY) continue;
++            ggml_cuda_idx_relu_sum_args ia;
++            if (ggml_cuda_match_idx_relu_sum(cgraph, i, ia) > 0 && ia.score && ia.dst) {
++                ggml_tensor * root = ia.score->view_src ? ia.score->view_src : const_cast<ggml_tensor *>(ia.score);
++                params->add_alloc_dep(params->user_data, root, ia.dst);
++            }
++        }
++    }
++
      static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
      if (!disable_fusion) {
          for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -2149,6 +2260,77 @@ index 2a8782a28..274419a73 100644
  };
  
  bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & args, int warp_size);
+diff --git a/ggml/src/ggml-cuda/indexer-score.cu b/ggml/src/ggml-cuda/indexer-score.cu
+index 436e80deb..21cc83991 100644
+--- a/ggml/src/ggml-cuda/indexer-score.cu
++++ b/ggml/src/ggml-cuda/indexer-score.cu
+@@ -559,3 +559,46 @@ bool ggml_cuda_indexer_fill_supported(int device, const ggml_tensor * dst) {
+            POS->type == GGML_TYPE_I32 && W->type == GGML_TYPE_F32 && RNG->type == GGML_TYPE_I32 &&
+            dst->type == GGML_TYPE_F32;
+ }
++
++// -------------------------------------------------------------------------------------------------
++// Prefill indexer head reduction: relu each head's block score, then sum the heads in graph order.
++// Replaces the RELU (+ optional RESHAPE in our L2a layout) -> CONT -> ADD chain, reading the scores
++// once instead of H times.  `src` is the physical [n_blocks, H, nt, ns] F32 block score (the relu's
++// input, so the relu is recomputed here); `dst` is [n_blocks, nt*ns] contiguous.
++//
++// ggml_reshape_4d() reinterprets the [n_blocks, H*nt, ns] mul_mat output as [n_blocks, H, nt, ns]
++// with the head dimension fastest, so the physical head stride is n_blocks and the token stride is
++// H*n_blocks -- exactly the indexing below.  fmaxf() is the relu and the add order is graph order, so
++// the result is bitwise identical to the elementwise chain.
++static __global__ void idx_relu_sum_f32(const float * __restrict__ src, float * __restrict__ dst,
++                                        const int n_blocks, const int heads) {
++    const int b = blockIdx.x * blockDim.x + threadIdx.x;
++    if (b >= n_blocks) return;
++    const int64_t tt = blockIdx.y;                        // token*stream, streams stacked
++    const float * p  = src + tt * (int64_t) heads * n_blocks + b;
++    float acc = fmaxf(p[0], 0.0f);
++    for (int h = 1; h < heads; ++h) {
++        acc = acc + fmaxf(p[(int64_t) h * n_blocks], 0.0f);
++    }
++    dst[tt * (int64_t) n_blocks + b] = acc;
++}
++
++bool ggml_cuda_idx_relu_sum_enabled() {
++    static const bool v = getenv("GGML_CUDA_DISABLE_IDX_RELU_SUM") == nullptr ||
++                          atoi(getenv("GGML_CUDA_DISABLE_IDX_RELU_SUM")) == 0;
++    return v;
++}
++
++void ggml_cuda_op_idx_relu_sum(ggml_backend_cuda_context & ctx, const ggml_cuda_idx_relu_sum_args & args) {
++    const ggml_tensor * s = args.score;
++    GGML_ASSERT(s->type == GGML_TYPE_F32 && ggml_is_contiguous(s));
++    GGML_ASSERT(args.dst->type == GGML_TYPE_F32 && ggml_is_contiguous(args.dst));
++    GGML_ASSERT(args.heads >= 2 && args.rows >= 1);
++    { static const int lg = getenv("GGML_CUDA_IDX_RELU_SUM_LOG") ? atoi(getenv("GGML_CUDA_IDX_RELU_SUM_LOG")) : 0; static unsigned cnt = 0;
++      if (lg && cnt++ < 4) fprintf(stderr, "IDX_RELU_SUM score=%s nb=%lld heads=%d rows=%lld\n", s->name, (long long) s->ne[0], args.heads, (long long) args.rows); }
++    const int n_blocks = (int) s->ne[0];
++    constexpr int threads = 256;
++    const dim3 grid((n_blocks + threads - 1) / threads, (unsigned) args.rows, 1);
++    const ggml_cuda_kernel_launch_params lp(grid, threads, 0, ctx.stream());
++    ggml_cuda_kernel_launch(idx_relu_sum_f32, lp, (const float *) s->data, (float *) args.dst->data, n_blocks, args.heads);
++}
+diff --git a/ggml/src/ggml-cuda/indexer-score.cuh b/ggml/src/ggml-cuda/indexer-score.cuh
+index 6bb680f8e..c209747bb 100644
+--- a/ggml/src/ggml-cuda/indexer-score.cuh
++++ b/ggml/src/ggml-cuda/indexer-score.cuh
+@@ -8,3 +8,15 @@ void ggml_cuda_indexer_score(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+ bool ggml_cuda_indexer_score_supported(int device, const ggml_tensor * dst);
+ void ggml_cuda_indexer_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ bool ggml_cuda_indexer_fill_supported(int device, const ggml_tensor * dst);
++
++// Prefill indexer head reduction: relu each head's block score, then sum the heads in graph order.
++// Replaces the RELU (+ optional RESHAPE) + CONT + ADD chain the qwen4exp prefill emits, reading the
++// scores once instead of H times.  Bit-identical (fmaxf + the same left-to-right add order).
++struct ggml_cuda_idx_relu_sum_args {
++    const ggml_tensor * score = nullptr;   // pre-relu block scores, physical [n_blocks, H, nt, ns] layout
++    ggml_tensor *       dst   = nullptr;   // [n_blocks, nt*ns] F32 contiguous
++    int                 heads = 0;
++    int64_t             rows  = 0;         // nt * ns
++};
++bool ggml_cuda_idx_relu_sum_enabled();
++void ggml_cuda_op_idx_relu_sum(ggml_backend_cuda_context & ctx, const ggml_cuda_idx_relu_sum_args & args);
 diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
 index 1b9e63516..390fc7a47 100644
 --- a/ggml/src/ggml-cuda/indexer-topk.cu
