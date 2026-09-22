@@ -28,10 +28,12 @@
   `hc_combine_norm_f32_b256` was ported and gated, but it is **not bit-identical** (the 256-thread
   reduction changes the greedy text: `1b59d651f2c3` → `fc7c8a10ea45`) and **0.7–0.8 % slower** on
   gfx1151/qwen4exp, so it was reverted — [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md).
-* **Next: Phase-1 item 5** (MoE bf16 epilogue + drop `concat_transposed`, ~3–4 %; beta's `MMB_DOWN16`
-  is gated off) or **item 4** (`norm-gated.cu`, ~1.2 %; `idx-relu-sum` is already banked by our fused
-  indexer score) — the same "does it replay our reduction order?" gate applies to `rms_rows`.  Item 3.5
-  (the three QSA correctness fixes) stays an **audit**.
+* **Next: the two remaining item-3.5 QSA correctness fixes** (`40c0b9c38` maskless-only-where-qsa3-
+  consumes, `14fff4f97` −1 sentinels) — an **audit** against our derived-visibility QSA (the first fix,
+  `b0f31f587`, landed 2026-09-22 as `patches/0005`), or **Phase-1 item 4** (`norm-gated.cu`, ~1.2 %).
+  Item 5 turned out to be mostly stale: at `-ub 8192` the `concat_transposed` is already gone, and the
+  remaining BF16 MoE epilogue is a lossy/memory candidate, not a 3-4 % win
+  ([`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md)).
 
 ### Do these in order
 
@@ -964,7 +966,7 @@ body, (7) tall tile, (8) QSA graph flags; items 1–9 survive, regrouped below.
 | 1 | Make `hc_combine_norm` fire (debug the matcher) and **wire the existing `hc_gate_mix_kernel`** | large — `HC_*` ablation **−19.5 %** | 2–4 d | **DONE 2026-09-21**: matcher revived (+1.5 % prefill) and `hc_gate_mix` wired + default-on on gfx1151 (+1.2–1.5 % at pp8192/32768, width-pure, text-identical) — [`2026-09-21-hc-combine-norm.md`](2026-09-21-hc-combine-norm.md), `patches/0003`. Follow-up: IQ4_NL-only kernel (mixed UD model unchanged) |
 | 2 | Port `gdn-conv.cu` + `ple-conv.cu` + matches (now incl. **F32 PLE**) | **−10.5 %** | 2–3 d | **DONE 2026-09-21 (session 3)**: ported default-on, bit-identical, +3.0/+3.2 % qwen4exp IQ4_NL and +6.5/+7.1 % 35B-A3B at `-ub 8192` — [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md), `patches/0004`.  Two adaptations (3-D `grouped_norm` root + the shared-builder snapshot cpy) |
 | 3 | Fix the `n_batch==n_ubatch==n_ctx` context creation | unlocks `-ub 16384` | 0.5–2 d | pre-existing delivery bug |
-| 3.5 | **Port the three correctness fixes** (`40c0b9c38`, `b0f31f587`, `14fff4f97`) | prevents long-session corruption | 0.5–1 d | cheap; includes the QSA decode non-determinism fix |
+| 3.5 | **Port the three correctness fixes** (`40c0b9c38`, `b0f31f587`, `14fff4f97`) | prevents long-session corruption | 0.5–1 d | **first one DONE 2026-09-22**: `b0f31f587` (QSA block window by highest stored position), `patches/0005` — [`2026-09-22-qsa-block-window-fix.md`](2026-09-22-qsa-block-window-fix.md).  The other two target the reference's `tail_idxs`/`compact`/`maskless` design and remain an **audit** against our derived-visibility QSA |
 | 4 | Port `norm-gated.cu` (`rms_rows`) + `idx-relu-sum.cu` | −2.9 % / −1.3 % | 1–2 d | |
 | 5 | MoE: bf16 epilogue + drop `concat_transposed` | ~+466 ms kernel (~3–4 %) | 1–2 d | beta has `MMB_DOWN16` gated off; wire it + the bf16 reduction |
 | 6 | Tune/port-align `qsa3_attn` body vs `qsa.cu` | ~+195 ms (~1.5 %) | 1–2 d | re-profile `b0f31f587` first |

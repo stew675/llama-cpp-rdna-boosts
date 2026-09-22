@@ -1,0 +1,120 @@
+From 9449f34460c51efc23b4f665de102b5807b36741 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 22 Sep 2026 03:21:37 -0500
+Subject: [PATCH] gap-closing WIP: size the QSA block window by the highest
+ stored position (item 3.5)
+
+Port of the other solution's b0f31f587.  The QSA block metadata (block ids per
+cell, member cells, positions, per-block bias, derived-cache blocks) was sized
+from the KV view, which counts OCCUPIED cells, but blocks are keyed by POSITION:
+a cache whose positions run ahead of its cells has blocks past that view.  The
+MTP draft context never receives the cells an M-RoPE image pins to one position,
+so after an image its positions lead its cell count by the image's grid size and
+once generation carried the highest position past the padded view the fill walk
+ran off the end (assert / corrupt read).
+
+Add llama_memory_hybrid_idx_context::qsa_n_kv_window() = max(get_n_kv(),
+PAD(highest stored position + 1, 256)) and use it for the per-block n_blocks in
+the graph input's can_reuse() and build_qsa_top_k() (the derived-cache pool
+sizing follows from the latter).  The per-cell tensors (cell_blk/cell_vis) stay
+get_n_kv()-sized.  The seq sweep is bounded by the KV stream count, because
+seq_to_stream is LLAMA_MAX_SEQ-sized only in the unified case and get_cells()
+asserts otherwise (the reference's bare LLAMA_MAX_SEQ loop would trip it).
+
+Normal contiguous runs are unchanged (positions == cells -> window == get_n_kv()).
+gfx1151, qwen4exp IQ4_NL:
+  width probe (P=1024) PASS, row-0 hash 268e0673300b7a33 unchanged;
+  pp65536 -ub 4096 clean at 1093 t/s (note: -ub 8192 at pp65536 is memory-bound
+  and thrashes at ~844 t/s, so ub 4096 is the correct long-context ubatch).
+
+This is the first of item 3.5's three correctness fixes; the other two
+(40c0b9c38 maskless-only-where-qsa3-consumes, 14fff4f97 -1 sentinels) target the
+reference's tail_idxs/compact/maskless design, which our derived-visibility QSA
+does not share, and remain an audit.
+
+Exported to wip/closing-the-gap/patches/0005.
+---
+ src/llama-memory-hybrid-idx.cpp | 21 +++++++++++++++++++++
+ src/llama-memory-hybrid-idx.h   |  9 +++++++++
+ src/models/qwen4exp.cpp         |  6 ++++--
+ 3 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index 8c71fe7b0..fec7ad0e0 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -938,6 +938,27 @@ uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
+     return ns_ubatch[i_cur];
+ }
+ 
++uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
++    const uint32_t n_kv = get_idx() ? get_idx()->get_n_kv() : 0;
++    const llama_kv_cache * idx = mem ? mem->get_mem_idx() : nullptr;
++    if (idx == nullptr) {
++        return n_kv;
++    }
++    // seq_to_stream is LLAMA_MAX_SEQ-sized in the unified (n_stream == 1) case and n_stream-sized
++    // otherwise, and get_cells() asserts, so bound the seq sweep to what that vector holds.
++    const uint32_t n_stream = idx->get_n_stream();
++    const llama_seq_id n_seq = n_stream > 1 ? (llama_seq_id) n_stream : (llama_seq_id) LLAMA_MAX_SEQ;
++    llama_pos pos_max = -1;
++    for (llama_seq_id s = 0; s < n_seq; ++s) {
++        pos_max = std::max(pos_max, idx->get_cells(s).seq_pos_max(s));
++    }
++    if (pos_max < 0) {
++        return n_kv;
++    }
++    const uint32_t window = ((uint32_t) pos_max + 1 + 255) / 256 * 256;
++    return std::max(n_kv, window);
++}
++
+ void llama_memory_hybrid_idx_context::set_input_qsa(
+         ggml_tensor * cell_blk,
+         ggml_tensor * blk_cells,
+diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
+index e18c76399..d1bea3ab1 100644
+--- a/src/llama-memory-hybrid-idx.h
++++ b/src/llama-memory-hybrid-idx.h
+@@ -197,6 +197,15 @@ public:
+     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
+     uint32_t get_n_stream() const;
+ 
++    // Cells the QSA block metadata must cover.  The KV view is sized by OCCUPIED cells, but blocks
++    // are keyed by POSITION, and a cache whose positions run ahead of its cells has blocks past that
++    // view: the MTP draft context never receives the cells an M-RoPE image pins to one position, so
++    // after an image its highest position leads its cell count by the image's grid size.  Sizing the
++    // block tensors from get_n_kv() then makes the fill walk past the window (assert / corrupt read);
++    // use max(get_n_kv(), highest stored position + 1), padded to 256 like get_n_kv() so graph reuse
++    // keeps its cadence.  (Ported from the other solution's b0f31f587.)
++    uint32_t qsa_n_kv_window() const;
++
+     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                        ggml_tensor * bias, ggml_tensor * blk_idx, ggml_tensor * blk_tail,
+                        ggml_tensor * cell_vis, ggml_tensor * q_vis,
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 73a7fed1f..fb8e4f074 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1204,7 +1204,8 @@ public:
+ 
+         const int64_t n_kv     = idx->get_n_kv();
+         const int64_t n_stream = mctx->get_n_stream();
+-        const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
++        // blocks are keyed by position, which can run ahead of the occupied cells (M-RoPE image + MTP)
++        const int64_t n_blocks = ((int64_t) mctx->qsa_n_kv_window() + ratio - 1)/ratio;
+ 
+         bool res = true;
+ 
+@@ -1290,7 +1291,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+ 
+     GGML_ASSERT(r > 0);
+ 
+-    const int64_t n_blocks = (n_kv + r - 1)/r;
++    // blocks are keyed by position, which can run ahead of the occupied cells (see qsa_n_kv_window)
++    const int64_t n_blocks = ((int64_t) mctx_hyb->qsa_n_kv_window() + r - 1)/r;
+     // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
+     const int64_t n_stream = mctx_hyb->get_n_stream();
+     GGML_ASSERT(n_tokens % n_stream == 0);
+-- 
+2.55.0
+

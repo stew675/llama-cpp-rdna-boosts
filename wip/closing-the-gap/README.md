@@ -11,6 +11,8 @@ moved here and updated 2026-09-21.
 | [`2026-09-21-mtp-qualification.md`](2026-09-21-mtp-qualification.md) | the MTP qualification record: plain-vs-MTP on qwen4exp IQ4_NL, ours vs the other solution's, and the `nextn_shared_target_tensors` finding. |
 | [`2026-09-21-hc-combine-norm.md`](2026-09-21-hc-combine-norm.md) | Phase-1 item 1: the `hc_combine_norm` matcher root cause (three bugs) + the `hc_gate_mix` wire-up; +1.5 % / +1.2–1.5 % prefill on fork branch `gap-closing`. |
 | [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md) | Phase-1 item 2: the depthwise conv1d (`gdn-conv.cu` + `ple-conv.cu`) port, default-on, bit-identical, +3.0/+3.2 % qwen4exp IQ4_NL and +6.5/+7.1 % 35B-A3B at `-ub 8192`. |
+| [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md) | Phase-1 item 1's `_b256` follow-up: ported, gated, **closed negative** (not bit-identical, slower); the reference's 554 ms is its BF16 HC traffic, not the thread count.  Also notes item 5's `concat_transposed` is already gone at `-ub 8192`. |
+| [`2026-09-22-qsa-block-window-fix.md`](2026-09-22-qsa-block-window-fix.md) | Phase-1 item 3.5 (first fix): the QSA block window is now sized by the highest stored position (`b0f31f587`), for the M-RoPE-image + MTP crash. |
 | [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..1004c65db`) exported as patches, so the code work survives a fork reset. |
 
 ## The two moving references this file tracks
@@ -78,7 +80,11 @@ MTP tuning + correctness.**
 3. **`-ub 16384` is deferred** (target is `-ub 8192`).  Root cause in the “Session-2 record”
    section: result_output reserve + HC pin + resident PLE.  Candidate fixes: default the PLE to
    mmap-lazy (fix the `-lzm auto` propagation), or expose `--lazy-buffer-size` in `llama-bench`.
-3.5. Port the other solution's three correctness fixes (`40c0b9c38`, `b0f31f587`, `14fff4f97`).
+3.5. Port the other solution's three correctness fixes — **first one DONE 2026-09-22**: `b0f31f587`
+   (size the QSA block window by the highest stored position) —
+   [`2026-09-22-qsa-block-window-fix.md`](2026-09-22-qsa-block-window-fix.md), `patches/0005`.  The
+   other two (`40c0b9c38` maskless-only-where-qsa3-consumes, `14fff4f97` −1 sentinels) remain an
+   **audit** against our derived-visibility QSA.
 4. `norm-gated.cu` (~1.2 % on our tree) + `idx-relu-sum.cu` (**already banked** by our fused indexer
    score — see the item-4 assessment in [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md)).
    **Item 1's `hc_combine_norm_f32` `_b256` swap is CLOSED NEGATIVE** — not bit-identical (it changes

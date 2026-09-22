@@ -63,8 +63,40 @@ divergence disqualifies it regardless.)
 * A bit-identical `_b256` would have to reproduce the 1024-thread reduction tree, which means
   discarding the pair-wise packed layout that is the only reason `_b256` is fast.  Given the base is
   already faster, that work has no payoff.
-* **Do not re-attempt this swap**; if a future session wants HC-combine speed on a different arch,
-  measure the base first (it may already win there too), and keep the bit-identity gate.
+* **Do not re-attempt the pure-F32 swap**; if a future session wants HC-combine speed on a different
+  arch, measure the base first (it may already win there too), and keep the bit-identity gate.
+
+## Correction (2026-09-21, session 3, from the ubatch-8192 profile)
+
+The 2026-09-20 profile's `hc_combine_norm_f32_b256` **554 ms / 190** vs our `hc_combine_norm_f32`
+**974 ms / 188** is **not** a thread-count difference and does not contradict the rejection above.
+The reference's `ggml_cuda_mmb_hc16()` / `mmb_down16()` / `ggml_cuda_mmb_blk16()` /
+`ggml_cuda_mmb_res16()` are **compiled in as `true`** (`ac1ebb4e0`), so its `_b256` kernel reads the
+`residual` and `block_out` as **BF16** and writes `out_res` as BF16 (`hc-cn.cu`'s `res_in_bf16` /
+`blk_in_bf16` / `res_out_bf16` arms) - roughly half the memory traffic.  Our delivery has `hc16=1`
+but `blk16=0` and `res16=0`, and `hc_combine_norm_f32` has no BF16 path at all.
+
+Re-profiled on gfx1151, qwen4exp IQ4_NL, `-b/-ub 8192`, pp8192, r=1:
+
+| kernel | ours | note |
+|---|---:|---|
+| `hc_combine_norm_f32` (1024, F32) | **973.8 ms / 188** | the delivery default |
+| `hc_combine_norm_f32_b256` (256, F32) | **1002.0 ms / 188** | the port - slower |
+
+The real 974 -> ~554 gap is therefore the **HC BF16 traffic** (`blk16`/`res16`), which is a
+numerically lossy change (BF16 rounding of the residual/block_out/xn stream), not a kernel-shape
+swap.  That is a separate, larger decision for the maintainer; it is not item 1's follow-up.
+
+## Item 5 note (same profile)
+
+At `-b/-ub 8192` (the adopted target) the profile shows **no `concat_transposed_src1_dim0` kernel at
+all** - only `gdn_concat_tail` (0.4 ms) / `ple_concat_tail` (0.0 ms).  So item 5's "drop the
+`concat_transposed` materialisation" is **already realised** at the target ubatch (the 375 ms figure
+was the 2026-09-20 `-ub 16384`/QSA-score-assembly profile).  What remains of item 5 is the BF16 MoE
+epilogue: `moe_weighted_reduction_f32_vec4` 369.5 ms / 96 (2.8 % of the profiled total), which the
+reference's BF16 variant would roughly halve - but that is the same lossy BF16-intermediate change,
+and the reference's own `NO MMB_DOWN16` ablation was **nil (+0.1 %)**.  Treat item 5 as a
+memory/lossy-epilogue candidate, not a 3-4 % prefill win.
 
 ## Next item after this
 
