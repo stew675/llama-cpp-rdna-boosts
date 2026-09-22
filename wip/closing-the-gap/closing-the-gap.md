@@ -37,9 +37,12 @@
   item 5's `concat_transposed` drop (already gone at `-ub 8192`; the remaining BF16 MoE epilogue is a
   lossy/memory candidate, not a 3–4 % win) —
   [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md).
-* **Next:** the **two remaining item-3.5 QSA correctness fixes** (`40c0b9c38` maskless-only-where-qsa3-
-  consumes, `14fff4f97` −1 sentinels) — an **audit** against our derived-visibility QSA (scoping below)
-  — or **Phase-1 item 4** (`norm-gated.cu`/`rms_rows`, ~1.2 % on our tree; `idx-relu-sum` is already
+* **Phase-1 item 3.5 CLOSED** (session 4): the first fix is ported (`patches/0005`); the other two
+  (`40c0b9c38` maskless-only-where-qsa3-consumes, `14fff4f97` −1 sentinels) audited **N/A** — our tree
+  has no maskless path and its top-k output carries no sentinels; the invariants each protects are
+  already held (see the audit section below) —
+  [`2026-09-22-qsa-item-3.5-audit.md`](2026-09-22-qsa-item-3.5-audit.md).
+* **Next: Phase-1 item 4** (`norm-gated.cu`/`rms_rows`, ~1.2 % on our tree; `idx-relu-sum` is already
   banked by our fused indexer score), then **item 6** (`qsa3_attn` body, 817 vs the reference's 618 ms),
   item 7 (tall tile), item 8 (QSA graph flags).
 
@@ -53,8 +56,8 @@
    Already green (sessions 2-3): `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA` 26/26,
    `FLASH_ATTN_EXT` 5955/0, width probe PASS on 27B + qwen4exp + 35B-A3B, conv fused==unfused row-0
    hashes.
-2. **Next code item** — either the remaining item-3.5 QSA audit (scoping below) or item 4
-   (`norm-gated`).  Then item 6 (`qsa3_attn`).
+2. **Next code item — Phase-1 item 4** (`norm-gated.cu`/`rms_rows`, scoping below; **item 3.5 is
+   closed**).  Then item 6 (`qsa3_attn`).
 3. Keep the **default-on policy**: every beneficial feature is ON; its env var only *disables* it.  Never
    run a benchmark with a feature left off.
 
@@ -84,39 +87,30 @@ for f in ${MU%/*}/*-0000*.gguf; do cat "$f" >/dev/null; done   # warm page cache
   -lm none -lzm on-direct -ctk f16 -ctv f16 -b 8192 -ub 8192 -p 2048,8192,16384 -n 0 -r 2 )
 ```
 
-### Next-task scoping — the two remaining item-3.5 QSA correctness fixes (audit)
+### Reference scoping — the item-3.5 QSA correctness fixes (CLOSED 2026-09-22)
 
-Our tree was at the **pre-fix** state for all three of the reference's correctness commits, so item 3.5
-is a port, not a mere audit.  The **first is done** (`b0f31f587`, `patches/0005`).  The other two target
-the reference's `tail_idxs` / `compact` / `maskless` design, which our QSA does **not** share (ours has
-`cell_vis`/`q_vis` derived visibility + `blk_idx`/`blk_tail`), so each has to be mapped to our
-equivalent first:
+**Result: `b0f31f587` ported (`patches/0005`); `40c0b9c38` and `14fff4f97` audited N/A.**  See
+[`2026-09-22-qsa-item-3.5-audit.md`](2026-09-22-qsa-item-3.5-audit.md) for the full mapping.  The
+short version, kept here because it is the mapping a future QSA change will need:
 
-* **`40c0b9c38` — maskless only where the qsa3 kernel consumes it.**  The reference's `LLAMA_QSA_NO_DENSE_MASK`
-  made decode non-deterministic (10/10 → 1/10 identical greedy outputs) because maskless was decided
-  from the graph input alone, while qsa3 also needs both packed layouts and `>= 128` queries (true in
-  prefill, false in decode), so every decode step attended unmasked over stale cells.  The fix decides
-  maskless at the use site and asserts the invariant in the dispatcher.  **Audit question for us:** our
-  maskless/derived path is `LLAMA_KQ_MASK_DERIVED` + `GGML_QSA_DERIVED_VIS`; check where our derived
-  visibility is decided vs where the kernel that consumes it is chosen, and whether a decode step can
-  take a maskless path over stale cells.  The instrument is **greedy determinism over N identical
-  requests** (the reference's 10/10 → 1/10), not throughput.
-* **`14fff4f97` — keep the −1 selection sentinels out of the masked attention path.**  In the reference,
-  complete-block selection lists selected cells with −1 for invisible blocks / empty tail slots, which
-  only the maskless selected-key kernel understands; the tails were allocated whenever block selection
-  applied, so a non-scalar visibility (2-D image positions, several sequences) sent the selection to
-  the **masked** path, whose `set_rows` wrote row −1 (illegal memory access on gfx1151, reproduced with
-  an image after 12k tokens of text).  The fix gates the tail allocation on `scalar` and uses the
-  block-expanded top-k otherwise.  **Audit question for us:** our `blk_idx` uses −1 (incomplete block)
-  and `INT32_MAX` (spare tail block) sentinels — find every consumer that could reach a `set_rows` or a
-  masked path and confirm the sentinels are only ever consumed by the derived/maskless path.
+* `40c0b9c38` (maskless only where qsa3 consumes it): **N/A** — we have no `maskless`/
+  `NO_DENSE_MASK` path.  The derived path passes `mask=nullptr` **only** to `ggml_flash_attn_qsa`, and
+  **both** QSA kernels honour `cell_vis`/`q_vis` (`fattn-qsa.cu:122-131`, `fattn-qsa3.cu:371-462`);
+  qsa3 refuses a maskless op without derived vis (`fattn-qsa3.cu:620-621`), so the decode band falls
+  to the VEC kernel that also honours them.  The V3 derived kq mask on `FLASH_ATTN_EXT` is guarded by
+  `ggml_cuda_flash_attn_ext_supported` (`fattn.cu:853`: false unless MMA/TILE).
+* `14fff4f97` (−1 sentinels into the masked path): **N/A** — our selection list is a radix top-k of
+  real cell indices (`indexer-topk.cu` writes `col`/`c` in `[0, n_kv)`; the `-INF` bin is filled with
+  a real index).  The `-1`/`INT32_MAX` sentinels live only in the kernel **inputs**
+  `blk_idx`/`blk_tail`, and `cell_blk` is mapped to a valid `dead_bid` (`llama-memory-hybrid-idx.cpp:750`).
+  So `ggml_set_rows(kq_mask_all, zeros, top_k_3d)` (`qwen4exp.cpp:1714`) indexes rows in `[0, n_kv)`.
 
-Read the reference diffs with `git -C ~/pwilkin-llama-cpp show 40c0b9c38` / `14fff4f97`; the files to
-map are `src/models/qwen4exp.cpp` (`qwen4exp_use_block_selection`, `qwen4exp_select_complete_blocks`)
-and `src/llama-memory-hybrid-idx.{h,cpp}`.  If a port is not directly applicable, record the audit
-result (present / N/A + why) in the item-3.5 record rather than forcing a change.
+`git -C ~/pwilkin-llama-cpp show 40c0b9c38` / `14fff4f97` remain the reference diffs if this needs
+re-checking.  One defensive note for a future change: the VEC QSA kernel dereferences `maskh` when
+`cell_vis` is null, so a change that could make both null would fault — add the reference's assert (or
+enforce `mask || cell_vis` in `ggml_cuda_flash_attn_qsa`) at that point.
 
-### Alternative next item — Phase-1 item 4 (`norm-gated` / `rms_rows`)
+### Next item — Phase-1 item 4 (`norm-gated` / `rms_rows`)
 
 The reference's `norm-gated.cu::rms_rows_f32` is a wave-per-row RMS norm for narrow rows
 (`ncols <= 256`) with an optional sigmoid gate, worth ~1.2 % on our tree (our narrow-row norms already
@@ -1029,7 +1023,7 @@ body, (7) tall tile, (8) QSA graph flags; items 1–9 survive, regrouped below.
 | 1 | Make `hc_combine_norm` fire (debug the matcher) and **wire the existing `hc_gate_mix_kernel`** | large — `HC_*` ablation **−19.5 %** | 2–4 d | **DONE 2026-09-21**: matcher revived (+1.5 % prefill) and `hc_gate_mix` wired + default-on on gfx1151 (+1.2–1.5 % at pp8192/32768, width-pure, text-identical) — [`2026-09-21-hc-combine-norm.md`](2026-09-21-hc-combine-norm.md), `patches/0003`. Follow-up: IQ4_NL-only kernel (mixed UD model unchanged) |
 | 2 | Port `gdn-conv.cu` + `ple-conv.cu` + matches (now incl. **F32 PLE**) | **−10.5 %** | 2–3 d | **DONE 2026-09-21 (session 3)**: ported default-on, bit-identical, +3.0/+3.2 % qwen4exp IQ4_NL and +6.5/+7.1 % 35B-A3B at `-ub 8192` — [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md), `patches/0004`.  Two adaptations (3-D `grouped_norm` root + the shared-builder snapshot cpy) |
 | 3 | Fix the `n_batch==n_ubatch==n_ctx` context creation | unlocks `-ub 16384` | 0.5–2 d | pre-existing delivery bug |
-| 3.5 | **Port the three correctness fixes** (`40c0b9c38`, `b0f31f587`, `14fff4f97`) | prevents long-session corruption | 0.5–1 d | **first one DONE 2026-09-22**: `b0f31f587` (QSA block window by highest stored position), `patches/0005` — [`2026-09-22-qsa-block-window-fix.md`](2026-09-22-qsa-block-window-fix.md).  The other two target the reference's `tail_idxs`/`compact`/`maskless` design and remain an **audit** against our derived-visibility QSA |
+| 3.5 | **Port the three correctness fixes** (`40c0b9c38`, `b0f31f587`, `14fff4f97`) | prevents long-session corruption | 0.5–1 d | **CLOSED 2026-09-22**: `b0f31f587` (QSA block window by highest stored position) **ported**, `patches/0005` — [`2026-09-22-qsa-block-window-fix.md`](2026-09-22-qsa-block-window-fix.md); the other two audited **N/A** (no maskless path; top-k output carries no sentinels) — [`2026-09-22-qsa-item-3.5-audit.md`](2026-09-22-qsa-item-3.5-audit.md) |
 | 4 | Port `norm-gated.cu` (`rms_rows`) + `idx-relu-sum.cu` | −2.9 % / −1.3 % | 1–2 d | |
 | 5 | MoE: bf16 epilogue + drop `concat_transposed` | ~+466 ms kernel (~3–4 %) | 1–2 d | beta has `MMB_DOWN16` gated off; wire it + the bf16 reduction |
 | 6 | Tune/port-align `qsa3_attn` body vs `qsa.cu` | ~+195 ms (~1.5 %) | 1–2 d | re-profile `b0f31f587` first |

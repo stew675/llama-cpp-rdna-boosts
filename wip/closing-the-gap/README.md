@@ -13,6 +13,7 @@ moved here and updated 2026-09-21.
 | [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md) | Phase-1 item 2: the depthwise conv1d (`gdn-conv.cu` + `ple-conv.cu`) port, default-on, bit-identical, +3.0/+3.2 % qwen4exp IQ4_NL and +6.5/+7.1 % 35B-A3B at `-ub 8192`. |
 | [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md) | Phase-1 item 1's `_b256` follow-up: ported, gated, **closed negative** (not bit-identical, slower); the reference's 554 ms is its BF16 HC traffic, not the thread count.  Also notes item 5's `concat_transposed` is already gone at `-ub 8192`. |
 | [`2026-09-22-qsa-block-window-fix.md`](2026-09-22-qsa-block-window-fix.md) | Phase-1 item 3.5 (first fix): the QSA block window is now sized by the highest stored position (`b0f31f587`), for the M-RoPE-image + MTP crash. |
+| [`2026-09-22-qsa-item-3.5-audit.md`](2026-09-22-qsa-item-3.5-audit.md) | Phase-1 item 3.5 (**closed**): the other two correctness fixes (`40c0b9c38` maskless, `14fff4f97` −1 sentinels) are **N/A** in our tree — we have no maskless path and our top-k output never carries sentinels; the invariants they protect are already held. |
 | [`patches/`](patches/) | the fork `gap-closing` commits (`90f081550..1004c65db`) exported as patches, so the code work survives a fork reset. |
 
 ## The two moving references this file tracks
@@ -60,10 +61,10 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/*.patch  
    reserve (15.5 GiB, shared with the other solution) plus qwen4exp's HC `block_out` pin (~18 GiB)
    against the resident PLE table (~27 GiB host).  ubatch 8192 runs clean and is the reproducible
    head-to-head baseline (ours 1212.6 vs its 1346.5 at pp8192, ~10 % behind before items 1+2).
-3. **Phase-1 item 2 — depthwise conv1d — DONE 2026-09-21 (session 3)**; **item 3.5 first QSA fix —
-   DONE 2026-09-22 (session 3)** (`b0f31f587`, `patches/0005`).  The **next code item** is the remaining
-   **item-3.5 QSA audit** (`40c0b9c38`, `14fff4f97`; scoping in
-   [`closing-the-gap.md`](closing-the-gap.md)'s START HERE) or **item 4** (`norm-gated`).
+3. **Phase-1 item 2 — depthwise conv1d — DONE 2026-09-21 (session 3)**; **item 3.5 QSA correctness
+   — CLOSED 2026-09-22 (session 4)**: `b0f31f587` ported (`patches/0005`), the other two fixes audited
+   **N/A**.  The **next code item** is **item 4** (`norm-gated.cu`/`rms_rows`), then **item 6**
+   (`qsa3_attn` body).
 
 ## The current open list (see §13 of the doc)
 
@@ -83,17 +84,17 @@ MTP tuning + correctness.**
 3. **`-ub 16384` is deferred** (target is `-ub 8192`).  Root cause in the “Session-2 record”
    section: result_output reserve + HC pin + resident PLE.  Candidate fixes: default the PLE to
    mmap-lazy (fix the `-lzm auto` propagation), or expose `--lazy-buffer-size` in `llama-bench`.
-3.5. Port the other solution's three correctness fixes — **first one DONE 2026-09-22**: `b0f31f587`
-   (size the QSA block window by the highest stored position) —
-   [`2026-09-22-qsa-block-window-fix.md`](2026-09-22-qsa-block-window-fix.md), `patches/0005`.  The
-   other two (`40c0b9c38` maskless-only-where-qsa3-consumes, `14fff4f97` −1 sentinels) remain an
-   **audit** against our derived-visibility QSA.
+3.5. Port the other solution's three correctness fixes — **CLOSED 2026-09-22**: `b0f31f587` (size the
+   QSA block window by the highest stored position) **ported** —
+   [`2026-09-22-qsa-block-window-fix.md`](2026-09-22-qsa-block-window-fix.md), `patches/0005`; the other
+   two (`40c0b9c38` maskless-only-where-qsa3-consumes, `14fff4f97` −1 sentinels) audited **N/A** against
+   our derived-visibility QSA — [`2026-09-22-qsa-item-3.5-audit.md`](2026-09-22-qsa-item-3.5-audit.md).
 4. `norm-gated.cu` (~1.2 % on our tree) + `idx-relu-sum.cu` (**already banked** by our fused indexer
    score — see the item-4 assessment in [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md)).
    **Item 1's `hc_combine_norm_f32` `_b256` swap is CLOSED NEGATIVE** — not bit-identical (it changes
    the greedy text) and 0.7–0.8 % slower on gfx1151/qwen4exp, so it was reverted; see
-   [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md).  The next kernel item is
-   therefore **item 5** (MoE bf16 epilogue + drop `concat_transposed`).
+   [`2026-09-21-hc-cn-b256-rejected.md`](2026-09-21-hc-cn-b256-rejected.md).  **This is the next
+   kernel item** (verify the `rms_rows` reduction order against our `rms_norm_f32<256>` first).
 5. MoE bf16 epilogue + drop `concat_transposed` (beta's `MMB_DOWN16` is gated off).
 
 **Phase 2 — decode speed + correctness**
