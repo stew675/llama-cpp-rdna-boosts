@@ -7,7 +7,8 @@ moved here and updated 2026-09-21.
 
 | file | what |
 |---|---|
-| [`closing-the-gap.md`](closing-the-gap.md) | the living analysis. §0–11 are the **2026-09-20 snapshot** (dated measurements); the **Update 2026-09-21** block, **§12** (MTP qualification) and **§13** (phased plan) are current. |
+| [`closing-the-gap.md`](closing-the-gap.md) | **the live handover — read this first.**  The open items (starting with the MMB **HC16** F32-elision fix), one-line "done" entries and the reproduce/gate commands. |
+| [`closed-the-gap.md`](closed-the-gap.md) | **the completed-work history** (sessions 1–10 + the 2026-09-20 snapshot body + appendices + MTP qualification).  Expands the one-line done entries in `closing-the-gap.md`. |
 | [`2026-09-21-mtp-qualification.md`](2026-09-21-mtp-qualification.md) | the MTP qualification record: plain-vs-MTP on qwen4exp IQ4_NL, ours vs the other solution's, and the `nextn_shared_target_tensors` finding. |
 | [`2026-09-21-hc-combine-norm.md`](2026-09-21-hc-combine-norm.md) | Phase-1 item 1: the `hc_combine_norm` matcher root cause (three bugs) + the `hc_gate_mix` wire-up; +1.5 % / +1.2–1.5 % prefill on fork branch `gap-closing`. |
 | [`2026-09-21-gdn-ple-conv-fusions.md`](2026-09-21-gdn-ple-conv-fusions.md) | Phase-1 item 2: the depthwise conv1d (`gdn-conv.cu` + `ple-conv.cu`) port, default-on, bit-identical, +3.0/+3.2 % qwen4exp IQ4_NL and +6.5/+7.1 % 35B-A3B at `-ub 8192`. |
@@ -95,7 +96,10 @@ verified on (`git am` 12/12 + 14/14 + 1/1 + 1/1 + 1/1 + 1/1 + 1/1 + 1/1 + 1/1, n
 ## Do first (fresh session, in order)
 
 > **Updated end of session 10.**  Items 1–3 below are historical; the campaign now starts at
-> “Next” — see the **NEXT SESSION** block of [`closing-the-gap.md`](closing-the-gap.md).
+> the **Open items** section of [`closing-the-gap.md`](closing-the-gap.md), whose first item is the
+> **MMB HC16 F32-elision fix** (the blocker behind both the MTP depth nondeterminism and the
+> sparse-draft purity failure).  Everything marked DONE is expanded in
+> [`closed-the-gap.md`](closed-the-gap.md).
 
 **Session 9:** (a) the **sparse QSA decode + incremental indexer** (Phase-2 item 9, reference
 `d67d58836`) — **AUDIT DONE 2026-09-22**: no port, both halves are already in our tree
@@ -104,17 +108,15 @@ follow-up ([`2026-09-22-phase2-sparse-qsa-audit.md`](2026-09-22-phase2-sparse-qs
 **pre-existing BF16-MMB non-finite** bug — **DONE**, the MMB **HC16** F32-elision under an eval
 callback, fixed by `patches/0019` ([`2026-09-22-mmb-eval-callback-f32.md`](2026-09-22-mmb-eval-callback-f32.md)).
 
-**Session 10 — the sparse MTP draft is IMPLEMENTED, `patches/0020`, OPT-IN.**
+**Session 10 — sparse MTP draft IMPLEMENTED (`patches/0020`, opt-in) + two decode fixes.**
 [`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md): the three plan edits plus two
-memory fixes the plan missed (the empty MTP recurrent child aborts a partial `seq_rm` and spams the
-non-consecutive warning).  **Prefill pp150K +6.9 %** with a 32K depth gate (927.0 → 990.8 t/s),
-**decode a loss** at every measured depth, so the decode arm is off.  **Default OFF** because at 40K
-the sparse prefill changes the greedy text while the dense draft matches plain; the target is
-logit-width-pure there and even dense MTP diverges at 150K, so the blocker is the iterative
-target verify/rollback (a pre-existing MTP-at-depth purity gap), not the memory change.  Remaining
-next items: the **gfx1100/gfx1201 validation** of the session-8 additions, and root-causing the
-depth verify/rollback divergence (then the sparse draft can be defaulted on).  Detail in
-[`closing-the-gap.md`](closing-the-gap.md)'s NEXT SESSION block.
+memory fixes the plan missed.  **Prefill pp150K +6.9 %** (32K depth gate); the incremental QSA
+indexer was **OFF by default** despite the graph expecting it on — `patches/0021` flips it ON
+(byte-identical, **+9.1 % @80K / +14.6 % @150K** decode); with it on the gfx1151 **decode crossover
+moves 64K → 32K** (`patches/0022`).  The sparse-draft/MTP depth-purity blocker was then **root-caused
+to the campaign's `GGML_CUDA_MMB_HC16` F32-elision, not the draft** (with `HC16=0` everything is
+byte-identical and depth MTP is deterministic).  **Remaining: fix HC16 (the #1 open item), then the
+draft can be defaulted on.**
 
 1. **Run the full BETA-TESTING gate suite** — **DONE (session 8)** on gfx1151: Gate 4 MTP
    qwen4exp acceptance **0.85541** (56.5 vs plain 31.7 t/s), `LIGHTNING_INDEXER` 225/225,
@@ -154,9 +156,9 @@ too (session 8, `patches/0017`)**: Q4_0/Q4_1/Q5_0/MXFP4/NVFP4, oracles green, PP
    on delivery **r13** (fork `gap-closing-r13`, tip `abf3bff76`), dropping the superseded WIP
    `patches/0015`.
    The full session-5 finding (throughput A/B, memory accounting, family diff) is in
-   [`closing-the-gap.md`](closing-the-gap.md#session-5-finding-2026-09-22--fresh-target-ubatch-profile-memory-accounting-refined-tasks).
+   [`closed-the-gap.md`](closed-the-gap.md).
 
-## The current open list (see §13 of the doc)
+## The current open list (see [`closing-the-gap.md`](closing-the-gap.md))
 
 **Priority sequence (maintainer, 2026-09-21): recall speed + correctness → decode speed + correctness →
 MTP tuning + correctness.**
