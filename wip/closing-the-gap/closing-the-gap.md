@@ -148,8 +148,13 @@ The body below is the pre-audit scoping, kept for the mapping:
   The reference's measured +11–20 % table is sparse-**recompute** vs sparse-**incremental**, which we
   already hold.  **No port recommended.**
 * **The one real gap:** our `graph_mtp` attends **dense** (the reference enables `build_qsa_top_k` for
-  the MTP draft at `n_tokens <= 8`).  The experiment to schedule is a targeted MTP-draft sparse A/B
-  reusing our existing top-k + `flash_attn_qsa`, not a kernel port.
+  the MTP draft at `n_tokens <= 8`).  **Measured: the single dense draft layer costs 2.1× all twelve
+  sparse trunk layers during prefill and 5.6× during decode at ~150K, and the ratio grows with
+  depth** (draft is `O(n_q·n_kv)`, trunk is capped at `top_k + r - 1`).  **IMPLEMENTATION PLAN:
+  [`PLAN-mtp-sparse-draft.md`](PLAN-mtp-sparse-draft.md)** — hand it to the next session.  It is
+  **three edits** (nextn compress-ratio fallback, MTP-context hybrid-idx memory, `graph_mtp` QSA
+  routing), not a one-line change: our MTP context currently gets a **plain KV cache**, not
+  hybrid-idx.
 * It is still a **hold/repay** item: our plain decode is already ahead (+2–6 % on qwen4exp, §12), so land
   it only if it holds that lead.  Gate: `plain == draft-mtp` greedy text, MTP acceptance at pos 1, and
   depth throughput (`benchmarks/mtp-adaptive-methodology.md`).  The reference's WMMA decode variant
