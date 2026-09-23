@@ -26,8 +26,9 @@ moved here and updated 2026-09-21.
 | [`2026-09-22-qsa-score-wmma.md`](2026-09-22-qsa-score-wmma.md) | Phase-1 item 15 (follow-up): `QSA_SCORE_WMMA` — the AMD RDNA3_5 4-head/128-dim lightning-indexer WMMA kernel ported + the qwen4exp prefill score fused into one `ggml_lightning_indexer` (all-ones weights, zero F16 mask) composed with the causal trim.  **Op oracle 225/225 (81 new `nh=4` cases)**; **width probe PASS, per-W hashes byte-identical to off**; coherent re-baseline text; **pp32768 +1.0 % / +0.9 %**, pp8192 flat.  **default ON** (`LLAMA_QSA_SCORE_WMMA=0` disables), `patches/0016`. |
 | [`2026-09-22-mmb-quant-coverage.md`](2026-09-22-mmb-quant-coverage.md) | Phase-2 item 10: five more MMB weight types — **Q4_0 / Q4_1 / Q5_0 / MXFP4 / NVFP4** (WTYPE 11–15), dequant-vs-CPU oracles green (`MUL_MAT` 48/47/14/46/45, `MUL_MAT_ID` 74/75/3/74/73), PPL parity, pp8192 **+19.5/+22.4/+25.4 %**, 35B-A3B Q4_1 **+63 %**, gpt-oss MXFP4 **+5.2 %**.  **default ON on non-RDNA4**, `patches/0017`. |
 | [`2026-09-22-mmb-iq2-coverage.md`](2026-09-22-mmb-iq2-coverage.md) | Model-tree scan (`tools/gguf-types.py`, 132 files) + the **IQ2 family** — **IQ2_S / IQ2_XS / IQ2_XXS** (WTYPE 16–18): oracles 14/14/46 and 4/15/75, real MiniMax IQ2_S **pp4096 +4.9 %** (PPL +1.07 %), dense IQ2_XS **pp8192 +16.5 %** (PPL +0.22 %).  **default ON on non-RDNA4**, `patches/0018`. |
+| [`2026-09-22-mmb-eval-callback-f32.md`](2026-09-22-mmb-eval-callback-f32.md) | **Correctness fix, session 9** (NEW-SESSION item 2), `patches/0019`: the MMB **HC16** F32-elision is invalid under an **eval callback** (llama-imatrix, `common/debug`) — the scheduler splits the graph at callback nodes and `mmb_begin_graph()` clears the BF16 cache between producer and GEMM, so the GEMM re-converted the never-written F32 (`non-finite values detected in blk.21.attn_output.weight`, 19M PPL).  Fixed by plumbing `has_eval_callback` through `ggml_backend_graph_optimize_params` and standing the elision down in that mode.  imatrix `in_sum2` **byte-identical** to `HC16=0`; width probe PASS on NanBeige BF16 + qwen4exp; serving perplexity unchanged. |
 | [`2026-09-22-mtp-shared-nextn-fix.md`](2026-09-22-mtp-shared-nextn-fix.md) | **Correctness fix, delivered in block 00 (r13)**: a shared-NextN MTP head (`nextn_shared_target_tensors`, the IQ4_NL shared Q8_0 sidecar) died every round on the M-RoPE `X < Y` check because `is_mem_shared` was inferred from `ctx_other` alone; gated on the `gemma4-assistant` arch.  0 errors, acceptance 0.287.  Upstream bug (#23398) folded into the block-00 base; the WIP `patches/0015` is superseded. |
-| [`patches/`](patches/) | the fork `gap-closing` commits exported as patches, so the code work survives a fork reset.  On the **r13 rebuild** the campaign is `0001..0014`; **`0015` (the shared-NextN MTP fix) is superseded by delivery r13 block 00** — skip it.  `0016` = `QSA_SCORE_WMMA` (default ON), `0017` = MMB quant coverage Q4_0/Q4_1/Q5_0/MXFP4/NVFP4, `0018` = MMB IQ2_S/IQ2_XS/IQ2_XXS (both default ON on non-RDNA4). |
+| [`patches/`](patches/) | the fork `gap-closing` commits exported as patches, so the code work survives a fork reset.  On the **r13 rebuild** the campaign is `0001..0014`; **`0015` (the shared-NextN MTP fix) is superseded by delivery r13 block 00** — skip it.  `0016` = `QSA_SCORE_WMMA` (default ON), `0017` = MMB quant coverage Q4_0/Q4_1/Q5_0/MXFP4/NVFP4, `0018` = MMB IQ2_S/IQ2_XS/IQ2_XXS (both default ON on non-RDNA4), `0019` = the HC16 F32-elision correctness fix under an eval callback. |
 | [`tools/`](tools/) | `gguf-types.py` — header-only GGUF tensor-type scanner (no tensor data read); used for the Q2_*/IQ2_* model-tree sweep. |
 
 ## The two moving references this file tracks
@@ -70,12 +71,13 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/00{01,02,
 git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/0016-*.patch   # QSA_SCORE_WMMA, default ON
 git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/0017-*.patch   # MMB Q4_0/Q4_1/Q5_0/MXFP4/NVFP4
 git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/0018-*.patch   # MMB IQ2_S/IQ2_XS/IQ2_XXS
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/0019-*.patch   # HC16 F32-elision under an eval callback
 ~/bin/build-llama-rocm-714
 ```
 
-Fork tip after the rebuild + session 8: **`bd984385e`** (`gap-closing-r13`, tree
-`de22ff89ec860b50bd3d8611fae4c8e09bcd2562`).  The scratch build above is the tree the rebuild was
-verified on (`git am` 12/12 + 14/14 + 1/1 + 1/1 + 1/1, no conflicts; applied tree == fork tree).
+Fork tip after the rebuild + session 9: **`575c4c091`** (`gap-closing-r13`, tree
+`dadc99000db4472056be920d3f73e3308eef3f3a`).  The scratch build above is the tree the rebuild was
+verified on (`git am` 12/12 + 14/14 + 1/1 + 1/1 + 1/1 + 1/1, no conflicts; applied tree == fork tree).
 
 ## Do first (fresh session, in order)
 
@@ -83,11 +85,11 @@ verified on (`git am` 12/12 + 14/14 + 1/1 + 1/1 + 1/1, no conflicts; applied tre
 > “Next” — see the **NEXT SESSION** block of [`closing-the-gap.md`](closing-the-gap.md).
 
 **Next (session 9):** (a) port the **sparse QSA decode + incremental indexer** (Phase-2 item 9,
-reference `d67d58836`) after auditing it against our `GGML_CUDA_QSA_INDEXER_CACHE`; (b) fix the
-**pre-existing BF16-MMB non-finite** bug (`Nanbeige` imatrix,
-[`2026-09-22-mmb-iq2-coverage.md`](2026-09-22-mmb-iq2-coverage.md) §4); (c) the **gfx1100/gfx1201
-validation** of the session-8 additions.  Detail in [`closing-the-gap.md`](closing-the-gap.md)'s new
-NEXT SESSION block.
+reference `d67d58836`) after auditing it against our `GGML_CUDA_QSA_INDEXER_CACHE`; (b) the
+**pre-existing BF16-MMB non-finite** bug — **DONE 2026-09-22**, it was the MMB **HC16** F32-elision
+under an eval callback, fixed by `patches/0019` ([`2026-09-22-mmb-eval-callback-f32.md`](2026-09-22-mmb-eval-callback-f32.md));
+(c) the **gfx1100/gfx1201 validation** of the session-8 additions.  Detail in
+[`closing-the-gap.md`](closing-the-gap.md)'s NEXT SESSION block.
 
 1. **Run the full BETA-TESTING gate suite** — **DONE (session 8)** on gfx1151: Gate 4 MTP
    qwen4exp acceptance **0.85541** (56.5 vs plain 31.7 t/s), `LIGHTNING_INDEXER` 225/225,

@@ -1,6 +1,6 @@
 # Closing the gap — `beta/mmb-general` vs the other solution's `strix-halo` prefill
 
-**Date:** 2026-09-20 (snapshot) · **updated:** 2026-09-22 (end of session 8)
+**Date:** 2026-09-20 (snapshot) · **updated:** 2026-09-22 (session 9 — NEXT-SESSION item 2 fixed)
 **Box:** `halo` — Strix Halo, Radeon 8060S (gfx1151, RDNA3_5), ROCm 7.14 (`/opt/rocm-7.14-gfx1151`), 123 GiB RAM / 124 GB unified VRAM
 **Scope:** a 1:1 prefill comparison on **the other solution's uniform-IQ4_NL model** (not just our mixed UD-IQ4_XS), a kernel-level profile diff on the uniform model, and a gate-ablation of the other solution's stack on this box to price the still-missing families. This is an investigation record, not a delivery change.
 
@@ -114,10 +114,14 @@
   `QSA_SCORE_WMMA` (prefill, `patches/0016`) and MMB quant coverage
   (Q4_0/Q4_1/Q5_0/MXFP4/NVFP4 = `patches/0017`; IQ2_S/IQ2_XS/IQ2_XXS = `patches/0018`) are ported,
   default ON, validated; the r13 rebuild and the `beta/mmb-general` BETA-TESTING gate suite (Gate 4
-  MTP + oracles) are GREEN.  **The next work is Phase-2 decode + one correctness bug — see the NEW
-  "NEXT SESSION" block immediately below.**  The `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` trim landed
-  session 7.  Read the session-5 profile/memory findings and the corrected gate semantics further
-  down too.
+  MTP + oracles) are GREEN.  **Session 9 fixed the Phase-2 correctness bug (`patches/0019`): the MMB
+  HC16 F32-elision is invalid under an eval callback (llama-imatrix/`common/debug`), because the
+  scheduler splits the graph at callback nodes and `mmb_begin_graph()` clears the BF16 cache between
+  the producer and the GEMM → imatrix read the never-written F32, `non-finite values detected in
+  blk.21.attn_output.weight`.**  The remaining work is Phase-2 decode (sparse QSA + incremental
+  indexer) plus the gfx1100/gfx1201 validation — see the NEW "NEXT SESSION" block immediately below.
+  The `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` trim landed session 7.  Read the session-5
+  profile/memory findings and the corrected gate semantics further down too.
 
 ### NEXT SESSION (end of session 8) — focus: Phase-2 decode + correctness
 
@@ -140,12 +144,18 @@ This is the big remaining decode item and the term the reference's absolute MTP 
   only if it holds that lead.  Gate: `plain == draft-mtp` greedy text, MTP acceptance at pos 1, and
   depth throughput (`benchmarks/mtp-adaptive-methodology.md`).
 
-**2. Fix the pre-existing BF16-MMB non-finite bug (found session 8).**  `llama-imatrix` on
-`Nanbeige4.2-3B-BF16` emits *"non-finite values detected in blk.21.attn_output.weight"* with the
-default MMB build; `GGML_CUDA_MMB=0` **or** `GGML_CUDA_MMB_BF16W=0` fixes it — i.e. the pre-existing
-**BF16-weight MMB dense path** (`bf16w`) produces non-finite activations on that model.  Small to
-diagnose (a BF16 dense GEMM compared against the delivery path) and a real correctness bug.  Detail:
-[`2026-09-22-mmb-iq2-coverage.md`](2026-09-22-mmb-iq2-coverage.md) §4.
+**2. Fix the pre-existing BF16-MMB non-finite bug (found session 8) — DONE 2026-09-22 (session 9,
+`patches/0019`).**  `llama-imatrix` on `Nanbeige4.2-3B-BF16` emitted *"non-finite values detected in
+blk.21.attn_output.weight"* with the default MMB build.  The misattribution in the find (`bf16w`)
+is because `GGML_CUDA_MMB_BF16W=0` happens to disable the **HC16** marking as a side effect; the real
+switch is `GGML_CUDA_MMB_HC16=0`.  The scheduler splits the graph at every eval-callback node
+(imatrix asks for each `MUL_MAT`), so `mmb_begin_graph()` clears the per-graph BF16 activation cache
+between the producer's sub-graph and the GEMM's — which then re-converted the F32 activation that the
+`bf16_only` mark had told the producer to skip.  The fix plumbs `has_eval_callback` through
+`ggml_backend_graph_optimize_params` and stands the F32 elision down in that mode (inert for serving).
+`imatrix` now reports PPL 18.4558 and its `in_sum2` tensors are **byte-identical** to `HC16=0`; width
+probe PASS on NanBeige BF16 + qwen4exp; serving perplexity unchanged (19.5126) —
+[`2026-09-22-mmb-eval-callback-f32.md`](2026-09-22-mmb-eval-callback-f32.md).
 
 **3. Housekeeping: gfx1100 / gfx1201 validation of the session-8 additions.**  The new MMB quant types
 (Q4_0/Q4_1/Q5_0/MXFP4/NVFP4 + the IQ2 family) and `QSA_SCORE_WMMA` are **gfx1151-validated only**; the
@@ -205,8 +215,11 @@ This is an **upstream bug (#23398)** now **delivered in the delivery set as bloc
   MiniMax iq2_s **pp4096 +4.9 %** (PPL +1.07 %), dense IQ2_XS **pp8192 +16.5 %** (PPL +0.22 %) —
   [`2026-09-22-mmb-iq2-coverage.md`](2026-09-22-mmb-iq2-coverage.md).
 
-**Remaining from the handover:** the parked items (Phase 2 sparse QSA decode `d67d58836`, Phase 3
-adaptive ceiling sweep, `-ub 16384` PLE reader) are unchanged.  **The owed `beta/mmb-general`
+**Remaining from the handover:** the Phase-2 sparse QSA decode (`d67d58836`), the gfx1100/gfx1201
+validation of the session-8 additions, and the parked items (Phase 3 adaptive ceiling sweep,
+`-ub 16384` PLE reader) are unchanged.  The Phase-2 correctness bug (BF16-MMB eval-callback F32
+elision) is **DONE** — [`2026-09-22-mmb-eval-callback-f32.md`](2026-09-22-mmb-eval-callback-f32.md),
+`patches/0019`.  **The owed `beta/mmb-general`
 BETA-TESTING gate suite is now GREEN on gfx1151** (session 8, on this r13+beta+gap-closing campaign):
 Gate 4 MTP on qwen4exp prose `-n 3000` — **draft acceptance 0.85541** (pos 0.938/0.853/0.776),
 **56.5 t/s vs plain 31.7 t/s** (>= plain); op oracles **LIGHTNING_INDEXER 225/225**,
@@ -635,9 +648,9 @@ Both are recall-speed (Phase-1) items; the audit record has the full flag table 
 
 | what | where / value |
 |---|---|
-| fork `~/llama.cpp` | branch **`gap-closing-r13`** @ **`bd984385e`** (`git rev-parse HEAD^{tree}` = `de22ff89ec860b50bd3d8611fae4c8e09bcd2562`) = r13 + the 12 `beta/mmb-general` patches + gap-closing `0001..0014`/`0016`/`0017`/`0018` (**`0015` dropped** — it is in delivery r13 block 00) |
+| fork `~/llama.cpp` | branch **`gap-closing-r13`** @ **`575c4c091`** (`git rev-parse HEAD^{tree}` = `dadc99000db4472056be920d3f73e3308eef3f3a`) = r13 + the 12 `beta/mmb-general` patches + gap-closing `0001..0014`/`0016`/`0017`/`0018`/`0019` (**`0015` dropped** — it is in delivery r13 block 00) |
 | fork build | `~/llama.cpp/build-rocm` (gfx1151, ROCm 7.14), full feature set **default** |
-| this repo | branch `gap-closing` (pushed to `origin` @ `dc1a5c9`), `wip/closing-the-gap/patches/0001..0014` + `0016..0018` |
+| this repo | branch `gap-closing`, `wip/closing-the-gap/patches/0001..0014` + `0016..0019` |
 | the other solution | `~/pwilkin-llama-cpp` @ `b0f31f587`, `build-rocm` |
 | model | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (93 GiB, qwen4exp) |
 | MoE test model | `/llm/models/Qwen3.6/35B-A3B/Q4_K_M/Qwen3.6-35B-A3B-Q4_K_M.gguf` |
@@ -646,8 +659,8 @@ Both are recall-speed (Phase-1) items; the audit record has the full flag table 
 Rebuild the campaign from scratch (the verified flow): `git checkout rdna-boosts-r13 && git checkout -b
 gap-closing-r13 && git am <repo>/beta/mmb-general/patches/*.patch && git am
 <repo>/wip/closing-the-gap/patches/00{01..14}-*.patch <repo>/wip/closing-the-gap/patches/0016-*.patch
-<repo>/wip/closing-the-gap/patches/0017-*.patch <repo>/wip/closing-the-gap/patches/0018-*.patch` (skip
-`0015`).  Build: `cd ~/llama.cpp && ~/bin/build-llama-rocm-714`.  Runtime:
+<repo>/wip/closing-the-gap/patches/0017-*.patch <repo>/wip/closing-the-gap/patches/0018-*.patch
+<repo>/wip/closing-the-gap/patches/0019-*.patch` (skip `0015`).  Build: `cd ~/llama.cpp && ~/bin/build-llama-rocm-714`.  Runtime:
 `export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH; export HIP_VISIBLE_DEVICES=0`.
 The exports are the fork commits so the code survives a fork reset; the applied tree is verified to
 match (`scripts`-free check in the session-8 records).
