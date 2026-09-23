@@ -129,20 +129,31 @@ Phase-1 (recall/prefill) is essentially closed: items 1–8, 13–16 and the two
 all DONE and the campaign is `gap-closing-r13` (r13 + 12 `beta/mmb-general` + gap-closing
 `0001..0014`/`0016`/`0017`/`0018`).  The maintainer's priority sequence now points at **decode**.
 
-**1. Port the sparse QSA decode + incremental indexer state (Phase-2 item 9, reference `d67d58836`).**
-This is the big remaining decode item and the term the reference's absolute MTP t/s gets for free:
+**1. Port the sparse QSA decode + incremental indexer state (Phase-2 item 9, reference `d67d58836`)
+— AUDIT DONE 2026-09-22 (session 9): no port, both halves are already in the tree; only the
+MTP-draft sparse attention is uncovered.**  [`2026-09-22-phase2-sparse-qsa-audit.md`](2026-09-22-phase2-sparse-qsa-audit.md).
+The body below is the pre-audit scoping, kept for the mapping:
 
 * the reference adds `qsa-decode.cuh` (SIMT) + `qsa-decode-wmma.cuh` (WMMA) **selected-cell decode**
   kernels that read the selected F16 K/V cells directly instead of the dense QSA walk, plus an
   **incremental indexer-key cache** (`src/qsa-prefix-state.h`, `llama-memory-hybrid-idx.*`).
 * Measured on its tree: serial depth-40000 **25.85 → 28.82 t/s**, MTP 40680-token **31.17 → 35.57**
   (first) / **32.69 → 39.10** (repeat), for 104 MiB @65k / ~416 MiB @256k of cache.
-* **Audit first:** our tree has a *different* QSA-sparse-FA decode path plus an incremental
-  **derived-block-vector** cache (`GGML_CUDA_QSA_INDEXER_CACHE`, default on).  1:1 audit vs the
-  reference's design before porting (overlapping, not equivalent).
-* It is a **hold/repay** item: our plain decode is already ahead (+2–6 % on qwen4exp, §12), so land it
-  only if it holds that lead.  Gate: `plain == draft-mtp` greedy text, MTP acceptance at pos 1, and
-  depth throughput (`benchmarks/mtp-adaptive-methodology.md`).
+* **Audit DONE 2026-09-22 (session 9)** — [`2026-09-22-phase2-sparse-qsa-audit.md`](2026-09-22-phase2-sparse-qsa-audit.md).
+  Both headline mechanisms are **already in our tree**: the selected-cell decode is
+  `fattn-qsa.cu::flash_attn_qsa` (`LLAMA_QSA_SPARSE_FA`, default on, and more general than the
+  reference's SIMT arm), and the incremental indexer is the derived block-vector cache
+  (`GGML_CUDA_QSA_INDEXER_CACHE`, `pool_layers`/`pool_wm`, default on) — the reference's
+  `qsa_keys[il] = [idx_dim, n_blocks]` is the same block-key cache with a cell-prefix update tracker.
+  The reference's measured +11–20 % table is sparse-**recompute** vs sparse-**incremental**, which we
+  already hold.  **No port recommended.**
+* **The one real gap:** our `graph_mtp` attends **dense** (the reference enables `build_qsa_top_k` for
+  the MTP draft at `n_tokens <= 8`).  The experiment to schedule is a targeted MTP-draft sparse A/B
+  reusing our existing top-k + `flash_attn_qsa`, not a kernel port.
+* It is still a **hold/repay** item: our plain decode is already ahead (+2–6 % on qwen4exp, §12), so land
+  it only if it holds that lead.  Gate: `plain == draft-mtp` greedy text, MTP acceptance at pos 1, and
+  depth throughput (`benchmarks/mtp-adaptive-methodology.md`).  The reference's WMMA decode variant
+  has no measured win over our SIMT path; only revisit on a width sweep.
 
 **2. Fix the pre-existing BF16-MMB non-finite bug (found session 8) — DONE 2026-09-22 (session 9,
 `patches/0019`).**  `llama-imatrix` on `Nanbeige4.2-3B-BF16` emitted *"non-finite values detected in
