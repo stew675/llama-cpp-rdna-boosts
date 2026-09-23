@@ -8,122 +8,104 @@ appendices, the MTP qualification).  This file is what a fresh session reads fir
 123 GiB unified.
 **Model:** `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf`
 + MTP sidecar `/llm/models/Qwen3.8/Flash-Next/Q4_K_XL/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf`.
-**Fork:** `~/llama.cpp`, branch **`gap-closing-r13`**, tip **`d8334f929`**, tree **`fa185bbb…`**
-= delivery r13 + the 12 `beta/mmb-general` patches + gap-closing `0001..0014`/`0016..0022`.
-**Updated:** 2026-09-22 (session 10).
+**Fork:** `~/llama.cpp`, branch **`gap-closing-hostbuf-integrated`**, tip **`78320aaa6`**
+= delivery r13 + the 12 `beta/mmb-general` patches + gap-closing `0001..0014`/`0016..0025`
+(`0023` = the MMB HC16 per-context fix; `0024` = the input-layer GPU offload stopgap;
+`0025` = the host-buffer input layer that **supersedes `0024`**, below).  The `0024` tip
+`73a391aba` on branch `gap-closing-r13` is the pre-`0025` baseline kept for A/B.
+**Updated:** 2026-09-23 (session 12).
 
-> **Rule 0: fix the HC16 bug below before promoting anything else.**  The campaign's default build
-> (`GGML_CUDA_MMB_HC16=1` on RDNA3_5) produces wrong/nondeterministic output under any MTP at depth.
-> Interim workaround for any gate: `GGML_CUDA_MMB_HC16=0`.
+> **No open blockers.**  The HC16-under-MTP bug that gated the campaign is **fixed**
+> ([`patches/0023`](patches/0023-mmb-hc16-per-context.patch),
+> [`2026-09-23-mmb-hc16-mtp-per-context.md`](2026-09-23-mmb-hc16-mtp-per-context.md)); the MTP/plain
+> purity gate is green at 8K/40K/128K and `llama-imatrix` is clean.  The input-embedding CPU burn is
+> fixed by the reference's **zero-copy host-buffer path**
+> ([`patches/0025`](patches/0025-host-buffer-input-layer.patch),
+> [`2026-09-23-host-buffer-input-layer.md`](2026-09-23-host-buffer-input-layer.md)): `integrated =
+> prop.integrated` on HIP plus a scheduler guard that keeps host-resident graph inputs off the compute
+> backend.  The `GET_ROWS` runs on ROCm0, the ~28 GiB `per_layer_token_embd` stays in host RAM, and
+> the 8K/40K/128K output is byte-identical to the pre-`0025` baseline.  **`0025` supersedes
+> `0024`** (the single-device heuristic), which is kept on `gap-closing-r13` only as the A/B
+> baseline.  See the **Host-buffer input layer** section below.
 
 ---
 
-## The blocking bug — FIX THIS FIRST: MMB **HC16** F32-elision under MTP/speculation
+## The blocker — **FIXED 2026-09-23**: MMB **HC16** F32-elision under MTP/speculation
 
-### Symptom
+The campaign default (MMB on, HC16 on) produced nondeterministic greedy text under MTP at depth
+(128K MTP `n_max 1`: five runs -> five hashes) and a 40K draft that diverged from plain; `HC16=0` was
+deterministic and pure.  Root cause: HC16's BF16 activation cache/slots and its `bf16_only`/`bf16_copy`
+marks were **file-scope, shared by every CUDA backend context**, so the MTP target and its draft head
+(the two `llama_context`s) freed each other's activation buffers and leaked each other's marks.  A
+second hole: the per-split step-3 marking pass treated "no consumer in this split" as "all consumers
+are BF16 readers" and elided a producer whose consumer lived in the other split.
 
-With the campaign default (MMB on, HC16 on):
+Fix (`patches/0023`): make the whole MMB BF16 state per backend context (an "active context" pointer
+set at graph optimize/compute), give the marks an explicit per-context per-graph lifetime, and classify
+a producer's consumers over the **whole** scheduled graph (new `full_graph` in
+`ggml_backend_graph_optimize_params`) so a cross-split consumer forbids the elision.
 
-* **128K MTP is nondeterministic**: the same command produces a different greedy text every run
-  (5 runs → 5 hashes), so `plain == draft-mtp` fails.
-* **40K sparse-draft diverges** from plain deterministically (draft MTP with `LLAMA_MTP_SPARSE=1`).
-* The **plain** path is always deterministic; at 120K/136K the MTP also happened to be stable, so it
-  is intermittent and allocator/depth dependent — a **race**, not a monotonic depth effect.
+Gates: **128K MTP 5/5 one hash `770e770ae7d6` == plain == HC16=0**; **40K plain == dense/sparse
+`n1/n3/n5` == `8285d12d40ca`** deterministic; 8K pure (`3553e76d3a9e`); width probe PASS;
+`llama-imatrix` NanBeige BF16 clean with the imatrix file byte-identical to HC16=0;
+`FLASH_ATTN_QSA`/`GATED_DELTA_NET` 2/2.  40K `-n 200` `n_max 3`: plain 28.4, dense MTP 33.4 t/s with
+HC16 on and off identical, so the win is kept.
 
-### Reproduction
+Full detail, mechanism and the original reproduction recipe:
+[`2026-09-23-mmb-hc16-mtp-per-context.md`](2026-09-23-mmb-hc16-mtp-per-context.md).
 
-```sh
-cd ~/llama.cpp
-export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH
-export HIP_VISIBLE_DEVICES=0
-MU=/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf
-MD=/llm/models/Qwen3.8/Flash-Next/Q4_K_XL/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf
-head -c 528000 /llm/models/wikitext-2-raw/wiki.train.raw > /tmp/p128k.txt
+---
 
-run_once() {  # $1 = extra env assignments (string)
-    env $1 timeout 3000 ./build-rocm/bin/llama-cli -m "$MU" -md "$MD" -ngl 99 -fa auto \
-      -ctk f16 -ctv f16 -c 160000 -b 2048 -ub 2048 -n 100 --seed 42 --temp 0 \
-      --single-turn --no-display-prompt --reasoning off --ctx-checkpoints 0 \
-      --spec-type draft-mtp --spec-draft-n-max 1 -f /tmp/p128k.txt > /tmp/race.out 2>/dev/null
-    python3 /home/stew675/llama-cpp-rdna-boosts/scripts/extract-generated.py /tmp/race.out
-}
+## Host-buffer input layer — **RESOLVED 2026-09-23**
 
-# FAIL: run 3-5x, get a different hash each time
-for i in 1 2 3 4 5; do run_once ""; done
-# PASS: deterministic, and == the plain (--spec-type none) hash
-for i in 1 2 3; do run_once "GGML_CUDA_MMB_HC16=0"; done
-# PASS (whole MMB off; exonerates everything but HC16)
-for i in 1 2 3; do run_once "GGML_CUDA_MMB=0"; done
-# STILL FAILS (exonerates the BF16 weight copy)
-for i in 1 2 3; do run_once "GGML_CUDA_MMB_BF16W=0"; done
-```
+The stopgap `patches/0024` is **superseded by [`patches/0025`](patches/0025-host-buffer-input-layer.patch)**
+— see [`2026-09-23-host-buffer-input-layer.md`](2026-09-23-host-buffer-input-layer.md) for the full
+record.  Summary:
 
-40K equivalent (sparse-draft purity), `prompts`-free, `--ctx-checkpoints 0`, `-n 200`, prompt
-`/tmp/p40k.txt` from the same `head -c 165000`:
+* The crashing op is the **KV cache store** (`cpy_k`): `k_set_rows<float, long, __half>` = f32 source,
+  **I64** indices, f16 destination.  The QSA mask store uses I32 indices (`ggml_indexer_top_k` returns
+  `GGML_TYPE_I32`), so the handover's QSA-indexer guess was wrong.
+* Root cause: with `integrated = true` the APU accepts the `ROCm_Host` buffer for ROCm0, so the
+  scheduler elides the split-input copy and the compute backend reads a **host** graph input in place;
+  the host's next-ubatch `set_inputs` then races the in-flight compute (**a view-reached input, e.g.
+  the recurrent-state copy, is the one a naive `GGML_TENSOR_FLAG_INPUT` check misses**) and a torn I64
+  index turns into an out-of-bounds `k_set_rows` store.  This is the documented #15034 class.
+* Fix: report `prop.integrated` again on HIP and add a scheduler guard that forces the split-input
+  copy for a host-resident graph input (view chains resolved) while `n_copies <= 1`.  Weights are
+  unaffected, so the input embeddings stay zero-copy in `ROCm_Host` and their `GET_ROWS` runs on
+  ROCm0 — `0024`'s `n_devices() == 1` heuristic and its ~28 GiB VRAM cost are gone.
+* The reference's full input **ring** (`83e8382ba` + `1f2e34819` + hardening, ~500 lines) is the
+  follow-up optimisation: it avoids the per-ubatch copy that this guard keeps.  `n_copies <= 1` in the
+  guard makes the two compose.
+* Multi-GPU: the flag follows `prop.integrated` **per device**, so the policy is per-device with no
+  `n_devices()` branch; untested here (single-GPU box) — re-gate `-sm layer`/`-sm tensor` first.
+* Acceptance met: CPU 818 % -> 122 %; 8K/40K/128K plain == dense/sparse MTP == the pre-`0025`
+  baseline (`3553e76d3a9e` / `8285d12d40ca` / `d140b40f0eee`); width probe PASS at P=1024 and P=32768;
+  QSA/GDN/INDEXER_TOPK oracles green; `per_layer_token_embd` (27.8 GiB) in the host buffer.
 
-| config | plain | default draft | sparse draft (`LLAMA_MTP_SPARSE=1`) |
-|---|---|---|---|
-| MMB default | `8285d12d40ca` | `8285d12d40ca` | **`c0a3bda5dff4` (wrong)** |
-| `GGML_CUDA_MMB=0` | `a40528f24f2d` | `a40528f24f2d` | `a40528f24f2d` |
-| `GGML_CUDA_MMB_HC16=0` | `8285d12d40ca` | `8285d12d40ca` | `8285d12d40ca` |
+The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and the new
+`GGML_FORCE_NO_INTEGRATED=1` A/B kill-switch — are documented in the session record.
 
-### Mechanism (what was established)
-
-* HC16 marks a producer tensor **BF16-only** (`g_mmb_bf16_only`, file-scope in
-  `ggml/src/ggml-cuda/mmb.cu:1435`) so the producer elides its F32 output, and every consumer re-reads
-  a BF16 copy from the per-graph activation cache (`g_mmb_bf16_copy`/`_slot`, `ggml_cuda_mmb_cache_lookup`
-  `mmb.cu:1865`).  The marking pass is in `ggml_backend_cuda_graph_optimize` (`ggml/src/ggml-cuda/ggml-cuda.cu`
-  ~6640–6760, `elide_f32 = params == nullptr || !params->has_eval_callback`, line ~6661).
-* The actual BF16 buffers/cache are cleared at the **start of every compute**
-  (`ggml_cuda_mmb_begin_graph()` at `ggml-cuda.cu:6542`, impl `mmb.cu:1899`), but the **marks** are
-  cleared only on the **next `graph_optimize`** — `ggml-cuda.cu:6648-6650`, keyed on
-  `g_mmb_marks_first_split = cgraph->nodes[0]` (an allocator-reused pointer) plus
-  `g_mmb_marks_after_compute` (set at `ggml-cuda.cu:6612`, end of each compute).
-* The scheduler calls `graph_optimize` **per split** (`ggml/src/ggml-backend.cpp:1472`,
-  `&split->graph`) for **all** splits, then computes all splits.  A mark set while optimizing one
-  split therefore lives in a global set and is visible to the next split's compute — where the
-  producer did not run (its F32 was elided in the earlier split) and the cache was re-cleared, so the
-  consumer reads a never-written/stale F32.  The MTP loop's alternating target/draft decodes (and the
-  sparse draft's extra nodes/splits) change the split boundaries and the allocator layout, which is
-  why it is intermittent.
-* This is the **same class** as the session-9 eval-callback bug, which `patches/0019` fixed by adding
-  `has_eval_callback` to `ggml_backend_graph_optimize_params` (set at `ggml-backend.cpp:1465`) and
-  standing the elision down (`ggml-cuda.cu:6661`).  The eval-callback fix is **not sufficient** for
-  MTP.
-
-### Fix direction (pick one, then gate)
-
-1. **Per-split / per-compute mark scoping (root fix).**  The marks are only valid for the compute of
-   the split that set them.  Make the mark set scoped to the current split graph (e.g. key on the
-   split's `cgraph` pointer and clear on split change), or move the marking into `graph_compute` for
-   the split being computed.  Confirm first whether `graph_optimize` under MTP is called with whole
-   graphs or splits (the symptom says splits) and whether the scheduler reuses an optimized graph
-   (skipping optimize on a reused split is the other leak path — then the marks are stale from a
-   previous compute).
-2. **Stand-down (minimal, mirrors `patches/0019`).**  Plumb a "speculation / MTP active" flag
-   (or a generic "this graph may be split and reused across computes") into
-   `ggml_backend_graph_optimize_params` and force `elide_f32 = false` for the MTP target/draft
-   context.  Cheapest, loses the HC16 win only under MTP.
-3. **Interim only:** `GGML_CUDA_MMB_HC16=0`.
-
-### Gates after the fix
-
-* The 128K reproduction above: **5 runs, one hash, == plain**.
-* 40K: plain == default draft == sparse draft (`8285d12d40ca` with HC16 on).
-* `llama-imatrix` on `Nanbeige4.2-3B-BF16` still clean (the `patches/0019` gate) and `in_sum2`
-  byte-identical to `HC16=0`.
-* Byte-identity of the plain path vs the pre-fix build at the depths the fix touches; width probe
-  PASS; the usual oracles.
 
 ---
 
 ## Open items (priority order)
 
-1. **Fix the HC16 F32-elision under MTP/speculation** (above).  This is the only true blocker.
-2. **Promote the sparse MTP draft to default-on** once (1) is fixed: it is already pure with
-   `HC16=0` (40K plain == sparse) and the decode is parity/slight-win with the pool on.  Flip
-   `qwen4exp_mtp_sparse_enabled()` / the `mtp_sparse` default in `llama-model.cpp`; re-run the gates.
-   Detail: [`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md).
+1. **~~Resolve the input-layer placement fully (host-buffer path)~~ — DONE 2026-09-23**
+   (`patches/0025`, superseding `0024`).  `integrated = prop.integrated` on HIP plus a scheduler
+   guard that forces the split-input copy for a host-resident graph input (view chains resolved)
+   while the input ring is off: zero-copy `ROCm_Host` input weights, `GET_ROWS` on ROCm0, ~28 GiB
+   out of VRAM, byte-identical to the `0024` baseline at 8K/40K/128K.  Full record:
+   [`2026-09-23-host-buffer-input-layer.md`](2026-09-23-host-buffer-input-layer.md).  The reference's
+   input ring (`83e8382ba`/`1f2e34819`) remains a follow-up optimisation — the guard's
+   `n_copies <= 1` condition composes with it.  Multi-GPU is stated but untested here.
+2. **Promote the sparse MTP draft to default-on** — now unblocked: the HC16 bug is fixed in
+   `patches/0023`, so the sparse draft is pure with **HC16 on**.  `qwen4exp_mtp_sparse_enabled()`
+   / the `mtp_sparse` default in `llama-model.cpp` can be flipped.  **Caveat** (2026-09-23): at 40K the
+   sparse draft decode is **29.6 t/s** vs **33.4** for the dense draft — its win is the deep-prefill arm
+   (pp150K +6.9 %), so keep `LLAMA_MTP_SPARSE_MIN_KV` high (or raise it) and re-measure the crossover;
+   do not enable the sparse decode arm shallow.  Detail:
+   [`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md).
 3. **gfx1100 / gfx1201 validation** of the session-8+10 additions: the new MMB quant types
    (Q4_0/Q4_1/Q5_0/MXFP4/NVFP4 + the IQ2 family), `QSA_SCORE_WMMA`, the derived-indexer default
    (`patches/0021`) and the 32K decode crossover (`patches/0022`).  `beta/mmb-general/gfx1201-s14-gates.md`
@@ -134,9 +116,9 @@ for i in 1 2 3; do run_once "GGML_CUDA_MMB_BF16W=0"; done
 4. **`-ub 16384`** — parked until the managed PLE reader's no-cache parallel-pread fast path is picked
    up (item 13 in the closed record).  Root cause in `closed-the-gap.md` (the full-vocab
    `result_output` reserve + the HC `block_out` pin + the resident PLE table).
-5. **qwen4exp adaptive-MTP ceiling sweep** (3/5/7/9/12) — a tuning item, parked until 1–2 land.  The
-   draft-mtp ceiling and the `--spec-draft-n-max` purity band are separate; see
-   `benchmarks/mtp-adaptive-methodology.md`.
+5. **qwen4exp adaptive-MTP ceiling sweep** (3/5/7/9/12) — a tuning item, parked until the sparse-draft
+   default is settled.  The draft-mtp ceiling and the `--spec-draft-n-max` purity band are separate;
+   see `benchmarks/mtp-adaptive-methodology.md`.
 
 ### Parked / do not restart without a reason
 
@@ -151,6 +133,9 @@ for i in 1 2 3; do run_once "GGML_CUDA_MMB_BF16W=0"; done
 
 | item | patch(es) | result |
 |---|---|---|
+| input embedding on the GPU (host-buffer path) | `0025` | restores `integrated=prop.integrated` + a host-input scheduler guard; GET_ROWS on ROCm0, ~28 GiB `per_layer_token_embd` in host RAM, CPU 818 % -> 122 %, 8K/40K/128K byte-identical |
+| input embedding on the GPU (single device) — **superseded by `0025`** | `0024` | token_embd/mtp_tok_embd GET_ROWS -> ROCm0; MTP decode CPU 1090 % -> 155 %, byte-identical |
+| MMB HC16 under MTP | `0023` | per-context activation state + whole-graph consumer scan; 128K MTP 5/5 one hash == plain == HC16=0 |
 | sparse MTP draft (opt-in) | `0020` | pp150K +6.9 %, memory fixes the plan missed |
 | QSA derived indexer default ON | `0021` | +9.1 % @80K / +14.6 % @150K decode, byte-identical |
 | gfx1151 decode crossover 64K→32K | `0022` | 48K +1.8 %, 64K +4.6 % |
@@ -199,6 +184,16 @@ done
 ./build-rocm/bin/test-backend-ops -o INDEXER_TOPK
 ./build-rocm/bin/test-backend-ops -o FLASH_ATTN_EXT
 
+# --- depth prompts (the previous sessions' hash gates use these exact files) ---
+head -c 165000 /llm/models/wikitext-2-raw/wiki.train.raw > /tmp/p40k.txt    # 40K gate
+head -c 528000 /llm/models/wikitext-2-raw/wiki.train.raw > /tmp/p128k.txt   # 128K gate
+# 40K: add -c 40000 --ctx-checkpoints 0 -f /tmp/p40k.txt ; plain==dense/sparse n1/n3 == 8285d12d40ca
+# 128K: add -c 131072 --ctx-checkpoints 0 -f /tmp/p128k.txt ; plain==mtp n1 == d140b40f0eee
+
+# --- host-buffer input layer A/B (patches/0025) ---
+# CPU during sparse MTP decode: ~122 % default vs ~818 % with GGML_FORCE_NO_INTEGRATED=1
+GGML_FORCE_NO_INTEGRATED=1 /usr/bin/time -v ./build-rocm/bin/llama-cli ... # 16384/n1500
+
 # --- MTP acceptance (Gate 4, -n 3000, reasoning pinned) ---
 # see benchmarks/mtp-adaptive-methodology.md; qwen4exp reference cell 0.44262
 ```
@@ -215,12 +210,15 @@ and the HC16 bug above makes depth MTP nondeterministic until fixed.
 
 ## References
 
-* Records: [`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md) (session 10),
+* Records: [`2026-09-23-host-buffer-input-layer.md`](2026-09-23-host-buffer-input-layer.md) (session 12, the host-buffer input layer, `0025`),
+  [`2026-09-23-input-layer-gpu-single-device.md`](2026-09-23-input-layer-gpu-single-device.md) (session 11, the input-embedding CPU burn, `0024` — superseded),
+  [`2026-09-23-mmb-hc16-mtp-per-context.md`](2026-09-23-mmb-hc16-mtp-per-context.md) (session 11, the HC16 fix),
+  [`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md) (session 10),
   [`2026-09-22-phase2-sparse-qsa-audit.md`](2026-09-22-phase2-sparse-qsa-audit.md),
   [`PLAN-mtp-sparse-draft.md`](PLAN-mtp-sparse-draft.md),
   [`2026-09-22-mmb-eval-callback-f32.md`](2026-09-22-mmb-eval-callback-f32.md),
   and the rest of this directory's `2026-09-*` files.
 * History: [`closed-the-gap.md`](closed-the-gap.md).
-* Patches: [`patches/`](patches/) (`0001..0014`, `0016..0022`; `0015` superseded by r13 block 00).
+* Patches: [`patches/`](patches/) (`0001..0014`, `0016..0025`; `0015` superseded by r13 block 00; `0024` superseded by `0025`).
 * Delivery policy: `AGENTS.md` (default-on policy, purity rules, pushing policy — **never push the
   `~/llama.cpp` fork**).

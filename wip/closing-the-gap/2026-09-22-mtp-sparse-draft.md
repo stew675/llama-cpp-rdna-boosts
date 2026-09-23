@@ -3,6 +3,16 @@
 **Status:** implemented and measured; **default OFF** (opt-in `LLAMA_MTP_SPARSE=1`) only because the
 campaign's MMB **HC16** F32-elision breaks purity at depth (see the root-cause section — the sparse
 draft itself is pure with `GGML_CUDA_MMB_HC16=0`, and would be promotable once that is fixed).
+
+> **Update 2026-09-23 (session 11): the HC16 blocker is fixed.**  HC16's activation cache/marks are now
+> per backend context and its marking pass scans the whole graph for cross-split consumers
+> ([`patches/0023`](patches/0023-mmb-hc16-per-context.patch),
+> [`2026-09-23-mmb-hc16-mtp-per-context.md`](2026-09-23-mmb-hc16-mtp-per-context.md)).  The sparse draft
+> is **pure with HC16 on** (40K plain == sparse == `8285d12d40ca`; 128K MTP 5/5 one hash == plain),
+> so it is **promotion-eligible**.  The default decision now turns on the perf trade, not on
+> correctness: at 40K the sparse draft decode is **29.6 t/s** vs **33.4** for the dense draft, so its
+> win stays the deep-prefill arm (pp150K +6.9 %) — keep the `LLAMA_MTP_SPARSE_MIN_KV` depth gate high.
+> The root-cause section below is retained as the 2026-09-22 record.
 Fork `~/llama.cpp` branch `gap-closing-r13`
 (r13 + `beta/mmb-general` + gap-closing `0001..0014`/`0016`/`0017`/`0018`/`0019`), commit
 **`1bb1d794e`** (the draft) + **`94a1aa38e`** (the derived-indexer default fix, below).

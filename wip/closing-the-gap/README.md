@@ -7,7 +7,7 @@ moved here and updated 2026-09-21.
 
 | file | what |
 |---|---|
-| [`closing-the-gap.md`](closing-the-gap.md) | **the live handover — read this first.**  The open items (starting with the MMB **HC16** F32-elision fix), one-line "done" entries and the reproduce/gate commands. |
+| [`closing-the-gap.md`](closing-the-gap.md) | **the live handover — read this first.**  The open items, one-line "done" entries and the reproduce/gate commands.  No open blockers (the HC16-under-MTP fix landed 2026-09-23). |
 | [`closed-the-gap.md`](closed-the-gap.md) | **the completed-work history** (sessions 1–10 + the 2026-09-20 snapshot body + appendices + MTP qualification).  Expands the one-line done entries in `closing-the-gap.md`. |
 | [`2026-09-21-mtp-qualification.md`](2026-09-21-mtp-qualification.md) | the MTP qualification record: plain-vs-MTP on qwen4exp IQ4_NL, ours vs the other solution's, and the `nextn_shared_target_tensors` finding. |
 | [`2026-09-21-hc-combine-norm.md`](2026-09-21-hc-combine-norm.md) | Phase-1 item 1: the `hc_combine_norm` matcher root cause (three bugs) + the `hc_gate_mix` wire-up; +1.5 % / +1.2–1.5 % prefill on fork branch `gap-closing`. |
@@ -32,7 +32,8 @@ moved here and updated 2026-09-21.
 | [`2026-09-22-phase2-sparse-qsa-audit.md`](2026-09-22-phase2-sparse-qsa-audit.md) | **Phase-2 item 9 audit, session 9 — no port.**  `d67d58836`'s selected-cell decode is already our `fattn-qsa.cu::flash_attn_qsa` (`LLAMA_QSA_SPARSE_FA`, default ON, more general) and its incremental indexer is already our derived block-vector cache (`GGML_CUDA_QSA_INDEXER_CACHE`, `pool_layers`/`pool_wm`, default ON); the reference's `qsa_keys[il]=[idx_dim,n_blocks]` is the same block-key cache.  The measured +11–20 % is sparse-recompute vs sparse-incremental, which we hold.  The **one real gap** is the MTP-draft sparse attention (our `graph_mtp` is dense); schedule it as a targeted A/B, not a port. |
 | [`2026-09-22-mmb-eval-callback-f32.md`](2026-09-22-mmb-eval-callback-f32.md) | **Correctness fix, session 9** (NEW-SESSION item 2), `patches/0019`: the MMB **HC16** F32-elision is invalid under an **eval callback** (llama-imatrix, `common/debug`) — the scheduler splits the graph at callback nodes and `mmb_begin_graph()` clears the BF16 cache between producer and GEMM, so the GEMM re-converted the never-written F32 (`non-finite values detected in blk.21.attn_output.weight`, 19M PPL).  Fixed by plumbing `has_eval_callback` through `ggml_backend_graph_optimize_params` and standing the elision down in that mode.  imatrix `in_sum2` **byte-identical** to `HC16=0`; width probe PASS on NanBeige BF16 + qwen4exp; serving perplexity unchanged. |
 | [`2026-09-22-mtp-shared-nextn-fix.md`](2026-09-22-mtp-shared-nextn-fix.md) | **Correctness fix, delivered in block 00 (r13)**: a shared-NextN MTP head (`nextn_shared_target_tensors`, the IQ4_NL shared Q8_0 sidecar) died every round on the M-RoPE `X < Y` check because `is_mem_shared` was inferred from `ctx_other` alone; gated on the `gemma4-assistant` arch.  0 errors, acceptance 0.287.  Upstream bug (#23398) folded into the block-00 base; the WIP `patches/0015` is superseded. |
-| [`patches/`](patches/) | the fork `gap-closing` commits exported as patches, so the code work survives a fork reset.  On the **r13 rebuild** the campaign is `0001..0014`; **`0015` (the shared-NextN MTP fix) is superseded by delivery r13 block 00** — skip it.  `0016` = `QSA_SCORE_WMMA` (default ON), `0017` = MMB quant coverage Q4_0/Q4_1/Q5_0/MXFP4/NVFP4, `0018` = MMB IQ2_S/IQ2_XS/IQ2_XXS (both default ON on non-RDNA4), `0019` = the HC16 F32-elision correctness fix under an eval callback, `0020` = the sparse MTP draft (**OPT-IN**, `LLAMA_MTP_SPARSE=1`), `0021` = the QSA derived-indexer default ON (byte-identical, +9-15 % deep decode), `0022` = the gfx1151 QSA decode crossover 64K → 32K (a 32K-64K decode re-baseline). |
+| [`2026-09-23-host-buffer-input-layer.md`](2026-09-23-host-buffer-input-layer.md) | **Session 12 — the host-buffer input layer, `patches/0025` (supersedes `0024`).**  `integrated = prop.integrated` on HIP proven safe once the scheduler stops reading a host-resident graph input in place; the crashing kernel is the **KV cache store** (`cpy_k`, `k_set_rows<float, long, __half>`), not the QSA mask (I32 indices).  The missing half is view-reached inputs (the recurrent-state copy): a naive `GGML_TENSOR_FLAG_INPUT` guard still corrupted 40K (`80f92dbc955d` vs `8285d12d40ca`).  `ggml_backend_sched_buffer_supported` now forces the split-input copy for any host graph input (view chains resolved) while `n_copies <= 1`; weights stay zero-copy.  CPU 818 % -> 122 %, `per_layer_token_embd` 27.8 GiB in host RAM, 8K/40K/128K byte-identical to `0024`, width probe PASS, oracles green. |
+| [`patches/`](patches/) | the fork `gap-closing` commits exported as patches, so the code work survives a fork reset.  On the **r13 rebuild** the campaign is `0001..0014`; **`0015` (the shared-NextN MTP fix) is superseded by delivery r13 block 00** — skip it.  `0016` = `QSA_SCORE_WMMA` (default ON), `0017` = MMB quant coverage Q4_0/Q4_1/Q5_0/MXFP4/NVFP4, `0018` = MMB IQ2_S/IQ2_XS/IQ2_XXS (both default ON on non-RDNA4), `0019` = the HC16 F32-elision correctness fix under an eval callback, `0020` = the sparse MTP draft (**OPT-IN**, `LLAMA_MTP_SPARSE=1`), `0021` = the QSA derived-indexer default ON (byte-identical, +9-15 % deep decode), `0022` = the gfx1151 QSA decode crossover 64K → 32K (a 32K-64K decode re-baseline), `0023` = the MMB HC16 per-backend-context activation state + whole-graph consumer scan (fixes nondeterministic MTP at depth; 128K MTP 5/5 one hash == plain), `0024` = the input layer moved to the GPU on a single device (token_embd/mtp_tok_embd GET_ROWS on ROCm0; MTP decode CPU 1090 % -> 155 %, byte-identical; **superseded by `0025`**), `0025` = the host-buffer input layer (restores `integrated = prop.integrated` on HIP + the host-input scheduler guard; `0024`'s `n_devices()==1` heuristic and its ~28 GiB VRAM cost are gone; 8K/40K/128K byte-identical to `0024`). |
 | [`tools/`](tools/) | `gguf-types.py` — header-only GGUF tensor-type scanner (no tensor data read); used for the Q2_*/IQ2_* model-tree sweep. |
 
 ## The two moving references this file tracks
@@ -46,6 +47,11 @@ moved here and updated 2026-09-21.
 
 ## Current "our side" build state
 
+* **Current (end of session 12):** `~/llama.cpp` branch **`gap-closing-hostbuf-integrated`** @
+  **`78320aaa6`** = delivery r13 + the 12 `beta/mmb-general/patches/*.patch` + gap-closing
+  `0001..0025` (`0023` = the HC16 fix, `0024` = the input-layer stopgap, `0025` = the host-buffer
+  input layer that **supersedes `0024`**).  The pre-`0025` baseline is branch `gap-closing-r13` @
+  `73a391aba`.  Details: [`2026-09-23-host-buffer-input-layer.md`](2026-09-23-host-buffer-input-layer.md).
 * **Current (end of session 10):** `~/llama.cpp` branch **`gap-closing-r13`** @ **`1bb1d794e`**
   (tree `ad7fb9bc…`) = delivery r13 + the 12 `beta/mmb-general/patches/*.patch` + gap-closing
   `0001..0014`/`0016`/`0017`/`0018`/`0019`/`0020`: session 8's `QSA_SCORE_WMMA` + MMB quant coverage,
@@ -95,11 +101,14 @@ verified on (`git am` 12/12 + 14/14 + 1/1 + 1/1 + 1/1 + 1/1 + 1/1 + 1/1 + 1/1, n
 
 ## Do first (fresh session, in order)
 
-> **Updated end of session 10.**  Items 1–3 below are historical; the campaign now starts at
-> the **Open items** section of [`closing-the-gap.md`](closing-the-gap.md), whose first item is the
-> **MMB HC16 F32-elision fix** (the blocker behind both the MTP depth nondeterminism and the
-> sparse-draft purity failure).  Everything marked DONE is expanded in
-> [`closed-the-gap.md`](closed-the-gap.md).
+> **Updated end of session 11.**  Items 1–3 below are historical; the campaign now starts at
+> the **Open items** section of [`closing-the-gap.md`](closing-the-gap.md).  The previous #1 blocker,
+> the **MMB HC16 F32-elision under MTP**, is **fixed** (`patches/0023`,
+> [`2026-09-23-mmb-hc16-mtp-per-context.md`](2026-09-23-mmb-hc16-mtp-per-context.md)), and the
+> **input-embedding CPU burn** is fixed too (`patches/0024`,
+> [`2026-09-23-input-layer-gpu-single-device.md`](2026-09-23-input-layer-gpu-single-device.md)): a
+> single GPU now runs the `token_embd`/`mtp_tok_embd` `GET_ROWS` on ROCm0 (MTP decode CPU 1090 % ->
+> 155 %).  Everything marked DONE is expanded in [`closed-the-gap.md`](closed-the-gap.md).
 
 **Session 9:** (a) the **sparse QSA decode + incremental indexer** (Phase-2 item 9, reference
 `d67d58836`) — **AUDIT DONE 2026-09-22**: no port, both halves are already in our tree
@@ -113,10 +122,12 @@ callback, fixed by `patches/0019` ([`2026-09-22-mmb-eval-callback-f32.md`](2026-
 memory fixes the plan missed.  **Prefill pp150K +6.9 %** (32K depth gate); the incremental QSA
 indexer was **OFF by default** despite the graph expecting it on — `patches/0021` flips it ON
 (byte-identical, **+9.1 % @80K / +14.6 % @150K** decode); with it on the gfx1151 **decode crossover
-moves 64K → 32K** (`patches/0022`).  The sparse-draft/MTP depth-purity blocker was then **root-caused
-to the campaign's `GGML_CUDA_MMB_HC16` F32-elision, not the draft** (with `HC16=0` everything is
-byte-identical and depth MTP is deterministic).  **Remaining: fix HC16 (the #1 open item), then the
-draft can be defaulted on.**
+moves 64K → 32K** (`patches/0022`).  The sparse-draft/MTP depth-purity blocker was root-caused
+to the campaign's `GGML_CUDA_MMB_HC16` F32-elision, not the draft (with `HC16=0` everything was
+byte-identical and depth MTP was deterministic) and **FIXED in session 11** (`patches/0023`, see
+[`2026-09-23-mmb-hc16-mtp-per-context.md`](2026-09-23-mmb-hc16-mtp-per-context.md)): the MTP/plain
+contract holds with HC16 on at 8K/40K/128K.  **Next: decide the sparse-draft default** (its win is the
+deep-prefill arm; at 40K the sparse decode is ~29.6 vs ~33.4 t/s dense, so keep the depth gate high).
 
 1. **Run the full BETA-TESTING gate suite** — **DONE (session 8)** on gfx1151: Gate 4 MTP
    qwen4exp acceptance **0.85541** (56.5 vs plain 31.7 t/s), `LIGHTNING_INDEXER` 225/225,
