@@ -12,15 +12,18 @@
 ## START HERE — fresh-session handover (end of session 10, 2026-09-22)
 
 > **Session 10 (latest):** the **sparse MTP draft** is implemented (`patches/0020`, fork tip
-> `94a1aa38e`, tree `ee7ebb61…`), **OPT-IN** (`LLAMA_MTP_SPARSE=1`).  **Prefill pp150K +6.9 %** with a
+> `d8334f929`, tree `fa185bbb…`), **OPT-IN** (`LLAMA_MTP_SPARSE=1`).  **Prefill pp150K +6.9 %** with a
 > 32K depth gate.  **Decode root-caused:** the incremental QSA indexer
 > (`GGML_CUDA_QSA_INDEXER_CACHE`) was **OFF by default** even though the graph expects it on;
 > `patches/0021` flips it ON — **byte-identical** and **+9.1 % @80K / +14.6 % @150K** plain decode
 > (f16, +8.7 % bf16), after which the sparse draft decode is **parity / a slight win** (the
 > selected-cell `flash_attn_qsa` is 0.05 ms/call vs the dense `flash_attn_tile` 1.03 ms — it was the
-> per-step indexer, not the attention kernel, that ate the saving).  At 5K all arms byte-identical
-> (`3553e76d3a9e`), width probe PASS, MTP acceptance unchanged (0.85035), oracles green.  **Draft kept
-> OFF** because at 40K the sparse prefill changes the greedy text while the dense draft matches plain
+> per-step indexer, not the attention kernel, that ate the saving).  With the cache ON the gfx1151
+> **decode crossover moves 64K → 32K** (`patches/0022`; 16K dense +3.4 %, 32K parity, 48K sparse
+> +1.8 %, 64K sparse +4.6 % — a 32K-64K decode re-baseline).  At 5K all arms byte-identical
+> (`3553e76d3a9e`), width probe PASS (P=32768 sparse decode included), MTP acceptance unchanged
+> (0.85035), oracles green.  **Draft kept OFF** because at 40K the sparse prefill changes the greedy
+> text while the dense draft matches plain
 > — a pre-existing iterative target verify/rollback divergence at depth (the target is logit-width-pure
 > there, and even dense MTP diverges from plain at 150K), not a memory-change bug.  Full record:
 > [`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md).  **Use `--ctx-checkpoints 0`

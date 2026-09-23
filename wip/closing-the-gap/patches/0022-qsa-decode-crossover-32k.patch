@@ -1,0 +1,67 @@
+From d8334f929fd17fa06db1850a0e038e1ab19687d7 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Wed, 23 Sep 2026 06:31:25 -0500
+Subject: [PATCH] gap-closing WIP: gfx1151 QSA decode crossover 64K -> 32K
+
+With the derived indexer cache ON (patches/0021) the sparse decode no longer
+re-pools the raw indexer cache every step, so it wins earlier.  Re-measured
+qwen4exp IQ4_NL f16, plain decode, interleaved forced-dense vs forced-sparse,
+-n 200 --ctx-checkpoints 0:
+  16K  dense 30.4 / sparse 29.4  (dense +3.4 %)
+  32K  dense 28.7 / sparse 28.6  (parity)
+  48K  dense 27.4 / sparse 27.9  (sparse +1.8 %)
+  64K  dense 26.1 / sparse 27.3  (sparse +4.6 %)
+The gfx1151 threshold moves to 32768 (gfx1201 stays dense-always).  This is a
+decode re-baseline for the 32K-64K band (the decode arm changes); the
+"plain == draft-mtp" contract still holds (40K plain == default draft =
+8285d12d40ca), and the width probe at P=32768 now exercises the sparse decode
+and passes (RS=0 and RS=from_w).
+
+LLAMA_QSA_DENSE_DECODE_UNTIL still overrides.
+---
+ src/models/qwen4exp.cpp | 21 ++++++++++++---------
+ 1 file changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index bf144f8cd..bf176aff4 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -2170,15 +2170,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+             if (env != nullptr) return atoi(env) != 0;
+             return qsa_arch_gfx() != 0x1151;
+         }();
+-        // ARCH POLICY (2026-09-07 crossover tables, pp2048/tg64 bf16 KV, discovery record):
++        // ARCH POLICY (re-measured 2026-09-22, fork `gap-closing-r13`, qwen4exp IQ4_NL f16 KV):
+         // decode uses the plain dense attend while n_kv < the per-arch crossover depth and
+-        // QSA (sparse) at/above it.  Measured: gfx1151 (Strix Halo, 1 GPU) - dense wins below
+-        // ~64K (32K A/B: dense +2.5%, three pairs, 2026-09-07), QSA at/above (the
+-        // earlier +6.6% @64K table reading sits at parity under a controlled power
+-        // protocol); the threshold is set at 64K; gfx1201 (3x R9700) - dense wins at every
+-        // measured depth (8K-160K, flat ~8%), so it never switches.  PREFILL has its own
+-        // crossover (qsa_dense_prefill_until, below).  The indexer keys are stored as the
+-        // width-shortcut does, so the sparse path takes over seamlessly above the depth.
++        // QSA (sparse) at/above it.  gfx1151 (Strix Halo, 1 GPU) - interleaved forced-dense vs
++        // forced-sparse, `-n 200 --ctx-checkpoints 0`: 16K dense 30.4 / sparse 29.4 (dense +3.4 %),
++        // 32K 28.7 / 28.6 (parity), 48K 27.4 / 27.9 (sparse +1.8 %), 64K 26.1 / 27.3 (sparse
++        // +4.6 %) -> the gfx1151 crossover is now **32K**, down from the 64K of the 2026-09-07
++        // tables.  The move is the derived indexer cache (patches/0021): with it ON the sparse
++        // decode stops re-pooling the raw indexer cache every step, which is what the old 64K
++        // threshold was sized around.  gfx1201 (3x R9700) - dense wins at every measured depth
++        // (8K-160K, flat ~8 %), so it never switches.  PREFILL has its own crossover
++        // (qsa_dense_prefill_until, below).  The indexer keys are stored as the width-shortcut
++        // does, so the sparse path takes over seamlessly above the depth.
+         // LLAMA_QSA_DENSE_DECODE_UNTIL overrides the threshold in tokens (0 disables the
+         // gate = QSA decode always, for A/B).
+         static const int64_t qsa_dense_decode_until = []() -> int64_t {
+@@ -2186,7 +2189,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+             if (env >= 0) {
+                 return env;
+             }
+-            return qsa_arch_gfx() == 0x1151 ? 65536 : ((int64_t) 1 << 62);  // gfx1151 crossover ~64K; else dense always
++            return qsa_arch_gfx() == 0x1151 ? 32768 : ((int64_t) 1 << 62);  // gfx1151 crossover ~32K; else dense always
+         }();
+         // the prefill counterpart: dense below `qsa_dense_prefill_until`, sparse above.  DEFAULT 0 =
+         // **QSA prefill always**, the documented ARCH POLICY (2026-09-07 crossover tables;
+-- 
+2.55.0
+

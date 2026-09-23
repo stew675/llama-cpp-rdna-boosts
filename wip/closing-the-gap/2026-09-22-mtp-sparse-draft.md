@@ -121,6 +121,26 @@ the recompute path.  With the pool on, the sparse MTP draft decode is **parity /
 (dense 30.7/30.9, sparse 30.7/31.5 t/s; acceptance 0.792 vs 0.812) - i.e. with the reference's
 incremental indexer the sparse draft is no longer the losing arm.
 
+## Crossover re-measurement: gfx1151 decode 64K → 32K (`patches/0022`)
+
+The 64K gfx1151 decode crossover was sized around the **slow recompute** sparse decode: below it the
+trunk attended dense, above it sparse.  With the derived indexer cache ON the sparse decode wins
+earlier.  Re-measured plain (non-MTP) qwen4exp IQ4_NL f16, interleaved forced-dense
+(`LLAMA_QSA_DENSE_DECODE_UNTIL=10^12`) vs forced-sparse (`=0`), `-n 200 --ctx-checkpoints 0`:
+
+| depth | dense | sparse | winner |
+|---:|---:|---:|---|
+| 16K | 30.4 | 29.4 | dense +3.4 % |
+| 32K | 28.7 | 28.6 | parity |
+| 48K | 27.4 | 27.9 | sparse +1.8 % |
+| 64K | 26.1 | 27.3 | sparse +4.6 % |
+
+The gfx1151 threshold moves to **32768** (gfx1201 stays dense-always: it never switches).  This is a
+decode re-baseline for the 32K-64K band (the arm changes, so near-ties can flip; the 40K plain text
+moved `687cec808661` → `8285d12d40ca`), but the intra-build `plain == draft-mtp` contract still holds
+(40K plain == default draft == `8285d12d40ca`) and the width probe at P=32768 now exercises the
+sparse decode and **passes** (`RS=0` and `RS=from_w`).  `LLAMA_QSA_DENSE_DECODE_UNTIL` still overrides.
+
 ## The blocker — depth text purity
 
 At **40K** (wikitext prompt, `--ctx-checkpoints 0`, `-n 200`), the arms are deterministic but the
