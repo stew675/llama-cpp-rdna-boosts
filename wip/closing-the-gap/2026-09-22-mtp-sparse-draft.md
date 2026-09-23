@@ -2,9 +2,13 @@
 
 **Status:** implemented and measured; **default OFF** (opt-in `LLAMA_MTP_SPARSE=1`) because the
 text-purity gate fails at the depth where the arm pays.  Fork `~/llama.cpp` branch `gap-closing-r13`
-(r13 + `beta/mmb-general` + gap-closing `0001..0014`/`0016`/`0017`/`0018`/`0019`), commit **`1bb1d794e`**.
-Patch: [`patches/0020-mtp-sparse-draft.patch`](patches/0020-mtp-sparse-draft.patch).  This is the
-implementation session for [`PLAN-mtp-sparse-draft.md`](PLAN-mtp-sparse-draft.md).
+(r13 + `beta/mmb-general` + gap-closing `0001..0014`/`0016`/`0017`/`0018`/`0019`), commit
+**`1bb1d794e`** (the draft) + **`94a1aa38e`** (the derived-indexer default fix, below).
+Patches: [`patches/0020-mtp-sparse-draft.patch`](patches/0020-mtp-sparse-draft.patch) and
+[`patches/0021-qsa-indexer-cache-default-on.patch`](patches/0021-qsa-indexer-cache-default-on.patch) -
+the latter is a **delivery-level** default fix (all qwen4exp QSA decode above the crossover, not just
+the draft).  This is the implementation session for
+[`PLAN-mtp-sparse-draft.md`](PLAN-mtp-sparse-draft.md).
 
 ## Goal
 
@@ -76,9 +80,46 @@ direction but a different magnitude):
 
 **Reading.**  The depth gate is essential: the indexer score + top-k is a **fixed per-query** cost,
 while the dense attention it replaces is `O(n_q·n_kv)`, so at shallow ubatches (n_kv 2K–32K) sparse
-is a *loss* (697 vs 927 at 150K if enabled from 2K), and only above ~32K does it pay.  The decode arm
-is a loss at every measured depth on this geometry (the SIMT selected-cell `flash_attn_qsa` plus the
-per-step indexer costs more than the craft's dense `flash_attn_tile` over a 1-layer draft).
+is a *loss* (697 vs 927 at 150K if enabled from 2K), and only above ~32K does it pay.  The decode-arm
+numbers below were taken with the derived indexer cache still OFF (the old default) and at short
+generation, so they overstate the loss; with the cache ON (`patches/0021`) the sparse decode is at
+**parity / a slight win** - see the root-cause section.
+
+## Decode root cause (2026-09-22, follow-up): the incremental indexer was OFF by default
+
+The "decode is slower" reading above is a **measurement + configuration artifact**, not the
+selected-cell attention.  Kernel profile at 40K (`rocprofv3 --kernel-trace`, sparse decode arm):
+
+| kernel | calls | total | per call |
+|---|---:|---:|---:|
+| draft sparse attention `flash_attn_qsa` | 76 | 3.76 ms | **0.05 ms** |
+| draft dense attention `flash_attn_tile` (dense arm) | 38 extra | ~39 ms | **~1.03 ms** |
+| draft fused indexer score `indexer_score_kernel` | 28 | 11.52 ms | 0.41 ms |
+| draft top-k (`indexer_topk_*` extras) | ~200 | ~21 ms | — |
+
+The sparse attention is **20× cheaper** than the dense one it replaces; the per-step indexer
+(score + top-k) is what eats the saving, so at 40K the two arms are parity (clean interleaved A/B:
+dense 30.5 t/s, sparse 30.1 t/s; the earlier −13/−15/−16 % table mixed the plain-KV vs hybrid-idx
+memory type and used very short, noisy generations).
+
+**Why the reference's sparse decode is faster: its incremental indexer is always on, ours was not.**
+The graph side (`build_qsa_top_k`) has always defaulted its `idx_cache` to ON, but the memory layer set
+`derived_enabled = env != nullptr && atoi(env)` - **default OFF** - so the derived block-vector pool was
+never created and the fused decode score re-pooled/rotated/scored the whole raw indexer cache every
+step.  (Both `AGENTS.md` and the Phase-2 audit describe the cache as default ON, so the code and the
+docs disagreed.)  `patches/0021` flips the default ON; `GGML_CUDA_QSA_INDEXER_CACHE=0` restores the old
+path.  Plain (non-MTP) decode, byte-identical text in every pair:
+
+| depth | KV | pool OFF | pool ON |
+|---:|---|---:|---:|
+| 80K | f16 | 24.3 t/s | **26.5 (+9.1 %)** |
+| 150K | f16 | 20.6 t/s | **23.6 (+14.6 %)** |
+| 80K | bf16 | 24.2 t/s | **26.3 (+8.7 %)** |
+
+The pool only engages for F32/BF16/F16 indexer keys; a quantized indexer cache (`-ctk q8_0`) keeps
+the recompute path.  With the pool on, the sparse MTP draft decode is **parity / a slight win** at 80K
+(dense 30.7/30.9, sparse 30.7/31.5 t/s; acceptance 0.792 vs 0.812) - i.e. with the reference's
+incremental indexer the sparse draft is no longer the losing arm.
 
 ## The blocker — depth text purity
 

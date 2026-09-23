@@ -12,12 +12,17 @@
 ## START HERE — fresh-session handover (end of session 10, 2026-09-22)
 
 > **Session 10 (latest):** the **sparse MTP draft** is implemented (`patches/0020`, fork tip
-> `1bb1d794e`, tree `ad7fb9bc…`), **OPT-IN** (`LLAMA_MTP_SPARSE=1`).  **Prefill pp150K +6.9 %** with a
-> 32K depth gate; decode a loss at every depth; at 5K all arms byte-identical (`3553e76d3a9e`), width
-> probe PASS, MTP acceptance unchanged (0.85035), oracles green.  **Default OFF** because at 40K the
-> sparse prefill changes the greedy text while the dense draft matches plain — a pre-existing
-> iterative target verify/rollback divergence at depth (the target is logit-width-pure there, and even
-> dense MTP diverges from plain at 150K), not a memory-change bug.  Full record:
+> `94a1aa38e`, tree `ee7ebb61…`), **OPT-IN** (`LLAMA_MTP_SPARSE=1`).  **Prefill pp150K +6.9 %** with a
+> 32K depth gate.  **Decode root-caused:** the incremental QSA indexer
+> (`GGML_CUDA_QSA_INDEXER_CACHE`) was **OFF by default** even though the graph expects it on;
+> `patches/0021` flips it ON — **byte-identical** and **+9.1 % @80K / +14.6 % @150K** plain decode
+> (f16, +8.7 % bf16), after which the sparse draft decode is **parity / a slight win** (the
+> selected-cell `flash_attn_qsa` is 0.05 ms/call vs the dense `flash_attn_tile` 1.03 ms — it was the
+> per-step indexer, not the attention kernel, that ate the saving).  At 5K all arms byte-identical
+> (`3553e76d3a9e`), width probe PASS, MTP acceptance unchanged (0.85035), oracles green.  **Draft kept
+> OFF** because at 40K the sparse prefill changes the greedy text while the dense draft matches plain
+> — a pre-existing iterative target verify/rollback divergence at depth (the target is logit-width-pure
+> there, and even dense MTP diverges from plain at 150K), not a memory-change bug.  Full record:
 > [`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md).  **Use `--ctx-checkpoints 0`
 > for any depth purity test** (the checkpoint save/restore makes depth MTP runs nondeterministic).
 
@@ -149,9 +154,13 @@ the three edits + two memory fixes the plan missed.  Results:
 * **Prefill pp150K 927.0 → 990.8 t/s (+6.9 %)** with the 32K depth gate (`LLAMA_MTP_SPARSE_MIN_KV`);
   enabling it from `n_kv > 2051` is a 25 % *loss* (697.3) — the indexer cost is fixed per query while
   the dense attention it replaces is `O(n_kv)`.
-* **Decode is a loss at every measured depth** (16K −13 %, 40K −15 %, 150K −16 %), so the decode arm
-  is off (`LLAMA_MTP_SPARSE_DECODE=1` opts in).  The SIMT selected-cell decode is not a win at the
-  draft's 1-layer geometry.
+* **Decode root cause found (`patches/0021`):** the "decode is slower" reading was the incremental
+  QSA indexer being **OFF by default** (`llama-memory-hybrid-idx.cpp` `derived_enabled`, while the
+  graph's `idx_cache` defaults ON — the AGENTS/audit say default ON).  With `GGML_CUDA_QSA_INDEXER_CACHE=1`
+  plain decode is byte-identical and **+9.1 % @80K / +14.6 % @150K** (f16; +8.7 % bf16); the sparse
+  MTP draft decode then reaches **parity / a slight win** at 80K (dense 30.7-30.9 vs sparse
+  30.7-31.5 t/s, acceptance 0.792 vs 0.812).  Kernel profile: `flash_attn_qsa` 0.05 ms/call vs
+  `flash_attn_tile` 1.03 ms/call; the per-step indexer score/top-k is the overhead the pool removes.
 * Gates: 5K purity **PASS** (`3553e76d3a9e` on plain/off/sparse), width probe **PASS**, MTP acceptance
   **0.85035** unchanged, `FLASH_ATTN_QSA` 26/26 / `GATED_DELTA_NET` 46/46.
 * **Blocker / default OFF:** at 40K the sparse prefill changes the greedy text (`c0a3bda5dff4`) while
