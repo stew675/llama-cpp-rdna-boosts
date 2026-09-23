@@ -1,7 +1,9 @@
 # Sparse MTP-draft attention (QSA) for qwen4exp — implemented 2026-09-22, **opt-in**
 
-**Status:** implemented and measured; **default OFF** (opt-in `LLAMA_MTP_SPARSE=1`) because the
-text-purity gate fails at the depth where the arm pays.  Fork `~/llama.cpp` branch `gap-closing-r13`
+**Status:** implemented and measured; **default OFF** (opt-in `LLAMA_MTP_SPARSE=1`) only because the
+campaign's MMB **HC16** F32-elision breaks purity at depth (see the root-cause section — the sparse
+draft itself is pure with `GGML_CUDA_MMB_HC16=0`, and would be promotable once that is fixed).
+Fork `~/llama.cpp` branch `gap-closing-r13`
 (r13 + `beta/mmb-general` + gap-closing `0001..0014`/`0016`/`0017`/`0018`/`0019`), commit
 **`1bb1d794e`** (the draft) + **`94a1aa38e`** (the derived-indexer default fix, below).
 Patches: [`patches/0020-mtp-sparse-draft.patch`](patches/0020-mtp-sparse-draft.patch) and
@@ -141,7 +143,41 @@ moved `687cec808661` → `8285d12d40ca`), but the intra-build `plain == draft-mt
 (40K plain == default draft == `8285d12d40ca`) and the width probe at P=32768 now exercises the
 sparse decode and **passes** (`RS=0` and `RS=from_w`).  `LLAMA_QSA_DENSE_DECODE_UNTIL` still overrides.
 
-## The blocker — depth text purity
+## The blocker root-caused (2026-09-22): the campaign's MMB **HC16** F32-elision, not the draft
+
+Both purity symptoms — the 40K sparse-draft divergence *and* the 128K/150K MTP nondeterminism — are
+the **`GGML_CUDA_MMB_HC16`** path (`patches/0017`-era MMB, default ON on RDNA3_5), i.e. the *same*
+F32-elision mechanism as the session-9 eval-callback bug (`patches/0019`).  Evidence:
+
+| config (qwen4exp IQ4_NL f16) | result |
+|---|---|
+| 40K, MMB default ON | plain = draft = `8285d12d40ca`, **sparse draft = `c0a3bda5dff4`** (diverges) |
+| 40K, `GGML_CUDA_MMB=0` | plain = draft = sparse = **`a40528f24f2d`** (all identical) |
+| 40K, `GGML_CUDA_MMB_HC16=0` | plain = draft = sparse = **`8285d12d40ca`** (all identical, same as MMB-on plain) |
+| 128K MTP `n_max 1`, MMB default ON | **5 runs, 5 hashes** (`9230a59d9116`, `770e770ae7d6`, `36b818fb2985`, `7217d66ed477`, `6f3a284c98cc`) |
+| 128K MTP `n_max 1`, `GGML_CUDA_MMB=0` | deterministic, and `== plain` (`8ab6e5057578` ×3) |
+| 128K MTP `n_max 1`, `GGML_CUDA_MMB_HC16=0` | deterministic, **and `== plain`** (`770e770ae7d6` ×3) |
+| 128K MTP `n_max 1`, `GGML_CUDA_MMB_BF16W=0` | still nondeterministic (3 runs, 3 hashes) |
+
+So: **the sparse draft is pure.**  With HC16 off it is byte-identical to plain at 40K, and the whole
+MTP-at-depth nondeterminism disappears.  The delivery r13 (no MMB) is unaffected.
+
+Mechanism: HC16 marks a producer "BF16-only" in `ggml_backend_cuda_graph_optimize` so it elides its
+F32 output, and every consumer re-reads a BF16 copy from the per-graph activation cache
+(`g_mmb_bf16_only` / `g_mmb_bf16_copy` / `g_mmb_bf16_slot`, file-scope in `mmb.cu`).  The cache is
+cleared per compute (`ggml_cuda_mmb_begin_graph`), but the **marks** are cleared only on the next
+`graph_optimize` (via `g_mmb_marks_after_compute` / `g_mmb_marks_first_split`, keyed on
+`cgraph->nodes[0]` — a pointer the allocator reuses).  With the MTP loop alternating target and draft
+decodes (and the sparse draft adding graph nodes/splits), a reused graph can skip the optimize that
+would refresh the marks, so a producer elides the F32 that a consumer in another split then reads as
+never-written/stale — nondeterministically, depending on the allocator layout.  This is the same
+class `patches/0019` fixed for eval callbacks (`has_eval_callback` → stand the elision down); the
+MTP case needs an equivalent guard (or a graph-scoped mark token) before HC16 can be trusted.
+
+**Interim:** `GGML_CUDA_MMB_HC16=0` (or `GGML_CUDA_MMB=0`) restores byte-identical purity; the
+campaign's default build should not run MTP at depth with HC16 on until that is fixed.
+
+## The blocker (original observation) — depth text purity
 
 At **40K** (wikitext prompt, `--ctx-checkpoints 0`, `-n 200`), the arms are deterministic but the
 sparse prefill changes the target's greedy text while the dense draft does not:

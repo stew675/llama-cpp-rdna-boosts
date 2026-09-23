@@ -22,10 +22,11 @@
 > **decode crossover moves 64K → 32K** (`patches/0022`; 16K dense +3.4 %, 32K parity, 48K sparse
 > +1.8 %, 64K sparse +4.6 % — a 32K-64K decode re-baseline).  At 5K all arms byte-identical
 > (`3553e76d3a9e`), width probe PASS (P=32768 sparse decode included), MTP acceptance unchanged
-> (0.85035), oracles green.  **Draft kept OFF** because at 40K the sparse prefill changes the greedy
-> text while the dense draft matches plain
-> — a pre-existing iterative target verify/rollback divergence at depth (the target is logit-width-pure
-> there, and even dense MTP diverges from plain at 150K), not a memory-change bug.  Full record:
+> (0.85035), oracles green.  **Draft kept OFF only because the campaign's `GGML_CUDA_MMB_HC16`
+> F32-elision** breaks purity under MTP/speculation at depth (root-caused 2026-09-22: with
+> `GGML_CUDA_MMB_HC16=0` the sparse draft is byte-identical to plain at 40K and the 128K MTP is
+> deterministic and == plain; it is the same mechanism as the session-9 eval-callback fix,
+> `patches/0019`).  The sparse draft itself is pure; fix HC16 and it can be promoted.  Full record:
 > [`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md).  **Use `--ctx-checkpoints 0`
 > for any depth purity test** (the checkpoint save/restore makes depth MTP runs nondeterministic).
 
@@ -147,8 +148,12 @@ Phase-1 (recall/prefill) is closed; session 9 closed the BF16-MMB eval-callback 
 implemented the sparse MTP draft (`patches/0020`, **opt-in**).  The campaign is `gap-closing-r13`
 (r13 + 12 `beta/mmb-general` + gap-closing `0001..0014`/`0016`/`0017`/`0018`/`0019`/`0020`).
 
-**1. The sparse MTP draft is IMPLEMENTED, `patches/0020`, OPT-IN — the remaining item is the depth
-verify/rollback divergence it exposed.**  [`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md).
+**1. The sparse MTP draft is IMPLEMENTED, `patches/0020`, OPT-IN — and the "depth purity" blocker is
+root-caused to the campaign's MMB HC16 F32-elision, not the draft.**
+[`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md).  The FIX ITEM is now: make HC16
+safe under MTP/alternating graphs (the `g_mmb_marks_*` lifetime keyed on `cgraph->nodes[0]`), as
+`patches/0019` did for eval callbacks; then the sparse draft is byte-identical and can be defaulted
+on.  Interim workaround `GGML_CUDA_MMB_HC16=0`.
 The audit ([`2026-09-22-phase2-sparse-qsa-audit.md`](2026-09-22-phase2-sparse-qsa-audit.md)) found the
 selected-cell decode and the incremental indexer already in our tree; only the MTP-draft attention was
 missing, and the plan ([`PLAN-mtp-sparse-draft.md`](PLAN-mtp-sparse-draft.md)) was implemented as
