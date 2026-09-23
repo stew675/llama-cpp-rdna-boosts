@@ -13,6 +13,13 @@ draft itself is pure with `GGML_CUDA_MMB_HC16=0`, and would be promotable once t
 > correctness: at 40K the sparse draft decode is **29.6 t/s** vs **33.4** for the dense draft, so its
 > win stays the deep-prefill arm (pp150K +6.9 %) — keep the `LLAMA_MTP_SPARSE_MIN_KV` depth gate high.
 > The root-cause section below is retained as the 2026-09-22 record.
+>
+> **Update 2026-09-23 (session 12): promoted to default ON**
+> ([`patches/0026`](patches/0026-mtp-sparse-default-on.patch),
+> [`2026-09-23-mtp-sparse-default-on.md`](2026-09-23-mtp-sparse-default-on.md)).  A/B: pp150K
+> **937.1 -> 1007.9 t/s (+7.6 %)**, pp16K −0.3 %, 8K decode parity, 40K text byte-identical,
+> acceptance 0.85035 unchanged.  `LLAMA_MTP_SPARSE=0` is now the opt-out; the decode/verify arm stays
+> opt-in (`LLAMA_MTP_SPARSE_DECODE=1`) and the depth gate stays `LLAMA_MTP_SPARSE_MIN_KV=32768`.
 Fork `~/llama.cpp` branch `gap-closing-r13`
 (r13 + `beta/mmb-general` + gap-closing `0001..0014`/`0016`/`0017`/`0018`/`0019`), commit
 **`1bb1d794e`** (the draft) + **`94a1aa38e`** (the derived-indexer default fix, below).

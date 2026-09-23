@@ -8,11 +8,12 @@ appendices, the MTP qualification).  This file is what a fresh session reads fir
 123 GiB unified.
 **Model:** `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf`
 + MTP sidecar `/llm/models/Qwen3.8/Flash-Next/Q4_K_XL/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf`.
-**Fork:** `~/llama.cpp`, branch **`gap-closing-hostbuf-integrated`**, tip **`78320aaa6`**
-= delivery r13 + the 12 `beta/mmb-general` patches + gap-closing `0001..0014`/`0016..0025`
+**Fork:** `~/llama.cpp`, branch **`gap-closing-hostbuf-integrated`**, tip **`df67fd133`**
+= delivery r13 + the 12 `beta/mmb-general` patches + gap-closing `0001..0014`/`0016..0026`
 (`0023` = the MMB HC16 per-context fix; `0024` = the input-layer GPU offload stopgap;
-`0025` = the host-buffer input layer that **supersedes `0024`**, below).  The `0024` tip
-`73a391aba` on branch `gap-closing-r13` is the pre-`0025` baseline kept for A/B.
+`0025` = the host-buffer input layer that **supersedes `0024`**; `0026` = the sparse MTP draft
+**default ON**).  The `0024` tip `73a391aba` on branch `gap-closing-r13` is the pre-`0025` baseline
+kept for A/B.
 **Updated:** 2026-09-23 (session 12).
 
 > **No open blockers.**  The HC16-under-MTP bug that gated the campaign is **fixed**
@@ -26,7 +27,11 @@ appendices, the MTP qualification).  This file is what a fresh session reads fir
 > backend.  The `GET_ROWS` runs on ROCm0, the ~28 GiB `per_layer_token_embd` stays in host RAM, and
 > the 8K/40K/128K output is byte-identical to the pre-`0025` baseline.  **`0025` supersedes
 > `0024`** (the single-device heuristic), which is kept on `gap-closing-r13` only as the A/B
-> baseline.  See the **Host-buffer input layer** section below.
+> baseline.  See the **Host-buffer input layer** section below.  The **sparse MTP draft prefill is
+> now default ON** ([`patches/0026`](patches/0026-mtp-sparse-default-on.patch),
+> [`2026-09-23-mtp-sparse-default-on.md`](2026-09-23-mtp-sparse-default-on.md)): the HC16 fix made
+> it pure, and the A/B is pp150K **+7.6 %** for −0.3 % at 16K / decode parity.  `LLAMA_MTP_SPARSE=0`
+> is the opt-out; the decode/verify arm stays opt-in.
 
 ---
 
@@ -99,13 +104,12 @@ The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and t
    [`2026-09-23-host-buffer-input-layer.md`](2026-09-23-host-buffer-input-layer.md).  The reference's
    input ring (`83e8382ba`/`1f2e34819`) remains a follow-up optimisation — the guard's
    `n_copies <= 1` condition composes with it.  Multi-GPU is stated but untested here.
-2. **Promote the sparse MTP draft to default-on** — now unblocked: the HC16 bug is fixed in
-   `patches/0023`, so the sparse draft is pure with **HC16 on**.  `qwen4exp_mtp_sparse_enabled()`
-   / the `mtp_sparse` default in `llama-model.cpp` can be flipped.  **Caveat** (2026-09-23): at 40K the
-   sparse draft decode is **29.6 t/s** vs **33.4** for the dense draft — its win is the deep-prefill arm
-   (pp150K +6.9 %), so keep `LLAMA_MTP_SPARSE_MIN_KV` high (or raise it) and re-measure the crossover;
-   do not enable the sparse decode arm shallow.  Detail:
-   [`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md).
+2. **~~Promote the sparse MTP draft to default-on~~ — DONE 2026-09-23** (`patches/0026`).  The
+   HC16 fix (`patches/0023`) made the sparse draft pure; the default is flipped with
+   `LLAMA_MTP_SPARSE=0` as the opt-out.  A/B: pp150K **937.1 -> 1007.9 t/s (+7.6 %)**, pp16K −0.3 %,
+   8K decode parity, 40K text byte-identical; acceptance 0.85035 unchanged; the `LLAMA_MTP_SPARSE_MIN_KV`
+   depth gate (32768) and the opt-in decode arm (`LLAMA_MTP_SPARSE_DECODE=1`) are unchanged.  Full
+   record: [`2026-09-23-mtp-sparse-default-on.md`](2026-09-23-mtp-sparse-default-on.md).
 3. **gfx1100 / gfx1201 validation** of the session-8+10 additions: the new MMB quant types
    (Q4_0/Q4_1/Q5_0/MXFP4/NVFP4 + the IQ2 family), `QSA_SCORE_WMMA`, the derived-indexer default
    (`patches/0021`) and the 32K decode crossover (`patches/0022`).  `beta/mmb-general/gfx1201-s14-gates.md`
@@ -136,7 +140,7 @@ The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and t
 | input embedding on the GPU (host-buffer path) | `0025` | restores `integrated=prop.integrated` + a host-input scheduler guard; GET_ROWS on ROCm0, ~28 GiB `per_layer_token_embd` in host RAM, CPU 818 % -> 122 %, 8K/40K/128K byte-identical |
 | input embedding on the GPU (single device) — **superseded by `0025`** | `0024` | token_embd/mtp_tok_embd GET_ROWS -> ROCm0; MTP decode CPU 1090 % -> 155 %, byte-identical |
 | MMB HC16 under MTP | `0023` | per-context activation state + whole-graph consumer scan; 128K MTP 5/5 one hash == plain == HC16=0 |
-| sparse MTP draft (opt-in) | `0020` | pp150K +6.9 %, memory fixes the plan missed |
+| sparse MTP draft prefill — **default ON** | `0020`,`0026` | pp150K +7.6 %, 16K −0.3 %, 8K parity, acceptance 0.85035 |
 | QSA derived indexer default ON | `0021` | +9.1 % @80K / +14.6 % @150K decode, byte-identical |
 | gfx1151 decode crossover 64K→32K | `0022` | 48K +1.8 %, 64K +4.6 % |
 | HC16 eval-callback fix | `0019` | imatrix clean, `in_sum2` byte-identical |
@@ -210,7 +214,8 @@ and the HC16 bug above makes depth MTP nondeterministic until fixed.
 
 ## References
 
-* Records: [`2026-09-23-host-buffer-input-layer.md`](2026-09-23-host-buffer-input-layer.md) (session 12, the host-buffer input layer, `0025`),
+* Records: [`2026-09-23-mtp-sparse-default-on.md`](2026-09-23-mtp-sparse-default-on.md) (session 12, sparse MTP default ON, `0026`),
+  [`2026-09-23-host-buffer-input-layer.md`](2026-09-23-host-buffer-input-layer.md) (session 12, the host-buffer input layer, `0025`),
   [`2026-09-23-input-layer-gpu-single-device.md`](2026-09-23-input-layer-gpu-single-device.md) (session 11, the input-embedding CPU burn, `0024` — superseded),
   [`2026-09-23-mmb-hc16-mtp-per-context.md`](2026-09-23-mmb-hc16-mtp-per-context.md) (session 11, the HC16 fix),
   [`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md) (session 10),
@@ -219,6 +224,6 @@ and the HC16 bug above makes depth MTP nondeterministic until fixed.
   [`2026-09-22-mmb-eval-callback-f32.md`](2026-09-22-mmb-eval-callback-f32.md),
   and the rest of this directory's `2026-09-*` files.
 * History: [`closed-the-gap.md`](closed-the-gap.md).
-* Patches: [`patches/`](patches/) (`0001..0014`, `0016..0025`; `0015` superseded by r13 block 00; `0024` superseded by `0025`).
+* Patches: [`patches/`](patches/) (`0001..0014`, `0016..0026`; `0015` superseded by r13 block 00; `0024` superseded by `0025`).
 * Delivery policy: `AGENTS.md` (default-on policy, purity rules, pushing policy — **never push the
   `~/llama.cpp` fork**).
