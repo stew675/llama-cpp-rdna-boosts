@@ -26,11 +26,12 @@ moved here and updated 2026-09-21.
 | [`2026-09-22-qsa-score-wmma.md`](2026-09-22-qsa-score-wmma.md) | Phase-1 item 15 (follow-up): `QSA_SCORE_WMMA` — the AMD RDNA3_5 4-head/128-dim lightning-indexer WMMA kernel ported + the qwen4exp prefill score fused into one `ggml_lightning_indexer` (all-ones weights, zero F16 mask) composed with the causal trim.  **Op oracle 225/225 (81 new `nh=4` cases)**; **width probe PASS, per-W hashes byte-identical to off**; coherent re-baseline text; **pp32768 +1.0 % / +0.9 %**, pp8192 flat.  **default ON** (`LLAMA_QSA_SCORE_WMMA=0` disables), `patches/0016`. |
 | [`2026-09-22-mmb-quant-coverage.md`](2026-09-22-mmb-quant-coverage.md) | Phase-2 item 10: five more MMB weight types — **Q4_0 / Q4_1 / Q5_0 / MXFP4 / NVFP4** (WTYPE 11–15), dequant-vs-CPU oracles green (`MUL_MAT` 48/47/14/46/45, `MUL_MAT_ID` 74/75/3/74/73), PPL parity, pp8192 **+19.5/+22.4/+25.4 %**, 35B-A3B Q4_1 **+63 %**, gpt-oss MXFP4 **+5.2 %**.  **default ON on non-RDNA4**, `patches/0017`. |
 | [`2026-09-22-mmb-iq2-coverage.md`](2026-09-22-mmb-iq2-coverage.md) | Model-tree scan (`tools/gguf-types.py`, 132 files) + the **IQ2 family** — **IQ2_S / IQ2_XS / IQ2_XXS** (WTYPE 16–18): oracles 14/14/46 and 4/15/75, real MiniMax IQ2_S **pp4096 +4.9 %** (PPL +1.07 %), dense IQ2_XS **pp8192 +16.5 %** (PPL +0.22 %).  **default ON on non-RDNA4**, `patches/0018`. |
-| [`PLAN-mtp-sparse-draft.md`](PLAN-mtp-sparse-draft.md) | **Implementation plan for the next session (not yet implemented).**  Make the qwen4exp MTP draft attend **sparse** (QSA) like the trunk: the memory change (MTP context hybrid-idx), the nextn compress-ratio fallback, and the `graph_mtp` QSA routing, with gates + traps.  Justified by the measured draft dense-attention share: **2.1× all twelve sparse trunk layers at ~150K prefill, 5.6× decode**, growing with depth. |
+| [`PLAN-mtp-sparse-draft.md`](PLAN-mtp-sparse-draft.md) | **The plan for the sparse MTP draft — IMPLEMENTED 2026-09-22; see the record below.**  Make the qwen4exp MTP draft attend **sparse** (QSA) like the trunk: the memory change (MTP context hybrid-idx), the nextn compress-ratio fallback, and the `graph_mtp` QSA routing, with gates + traps.  Justified by the measured draft dense-attention share: **2.1× all twelve sparse trunk layers at ~150K prefill, 5.6× decode**, growing with depth. |
+| [`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md) | **Sparse MTP-draft attention, implemented 2026-09-22, `patches/0020`, OPT-IN** (`LLAMA_MTP_SPARSE=1`).  The three plan edits + two memory fixes the plan missed (the empty MTP recurrent child aborts a partial `seq_rm` and spams the non-consecutive warning).  **Prefill pp150K`+6.9 %`** with a 32K depth gate (927.0 → 990.8 t/s), **decode a loss** at every measured depth (16K −13 %, 40K −15 %, 150K −16 %) so the decode arm is off.  5K purity PASS (`3553e76d3a9e`), width probe PASS, MTP acceptance unchanged (0.85035), oracles green (QSA 26/26, GDN 46/46).  **Default OFF because at 40K the sparse prefill changes the greedy text while the dense draft matches plain** (`c0a3bda5dff4` vs `687cec808661`, first diff byte 613) — the draft's different proposals expose a target verify/rollback near-tie; the target is logit-width-pure there, and even dense MTP diverges from plain at 150K. |
 | [`2026-09-22-phase2-sparse-qsa-audit.md`](2026-09-22-phase2-sparse-qsa-audit.md) | **Phase-2 item 9 audit, session 9 — no port.**  `d67d58836`'s selected-cell decode is already our `fattn-qsa.cu::flash_attn_qsa` (`LLAMA_QSA_SPARSE_FA`, default ON, more general) and its incremental indexer is already our derived block-vector cache (`GGML_CUDA_QSA_INDEXER_CACHE`, `pool_layers`/`pool_wm`, default ON); the reference's `qsa_keys[il]=[idx_dim,n_blocks]` is the same block-key cache.  The measured +11–20 % is sparse-recompute vs sparse-incremental, which we hold.  The **one real gap** is the MTP-draft sparse attention (our `graph_mtp` is dense); schedule it as a targeted A/B, not a port. |
 | [`2026-09-22-mmb-eval-callback-f32.md`](2026-09-22-mmb-eval-callback-f32.md) | **Correctness fix, session 9** (NEW-SESSION item 2), `patches/0019`: the MMB **HC16** F32-elision is invalid under an **eval callback** (llama-imatrix, `common/debug`) — the scheduler splits the graph at callback nodes and `mmb_begin_graph()` clears the BF16 cache between producer and GEMM, so the GEMM re-converted the never-written F32 (`non-finite values detected in blk.21.attn_output.weight`, 19M PPL).  Fixed by plumbing `has_eval_callback` through `ggml_backend_graph_optimize_params` and standing the elision down in that mode.  imatrix `in_sum2` **byte-identical** to `HC16=0`; width probe PASS on NanBeige BF16 + qwen4exp; serving perplexity unchanged. |
 | [`2026-09-22-mtp-shared-nextn-fix.md`](2026-09-22-mtp-shared-nextn-fix.md) | **Correctness fix, delivered in block 00 (r13)**: a shared-NextN MTP head (`nextn_shared_target_tensors`, the IQ4_NL shared Q8_0 sidecar) died every round on the M-RoPE `X < Y` check because `is_mem_shared` was inferred from `ctx_other` alone; gated on the `gemma4-assistant` arch.  0 errors, acceptance 0.287.  Upstream bug (#23398) folded into the block-00 base; the WIP `patches/0015` is superseded. |
-| [`patches/`](patches/) | the fork `gap-closing` commits exported as patches, so the code work survives a fork reset.  On the **r13 rebuild** the campaign is `0001..0014`; **`0015` (the shared-NextN MTP fix) is superseded by delivery r13 block 00** — skip it.  `0016` = `QSA_SCORE_WMMA` (default ON), `0017` = MMB quant coverage Q4_0/Q4_1/Q5_0/MXFP4/NVFP4, `0018` = MMB IQ2_S/IQ2_XS/IQ2_XXS (both default ON on non-RDNA4), `0019` = the HC16 F32-elision correctness fix under an eval callback. |
+| [`patches/`](patches/) | the fork `gap-closing` commits exported as patches, so the code work survives a fork reset.  On the **r13 rebuild** the campaign is `0001..0014`; **`0015` (the shared-NextN MTP fix) is superseded by delivery r13 block 00** — skip it.  `0016` = `QSA_SCORE_WMMA` (default ON), `0017` = MMB quant coverage Q4_0/Q4_1/Q5_0/MXFP4/NVFP4, `0018` = MMB IQ2_S/IQ2_XS/IQ2_XXS (both default ON on non-RDNA4), `0019` = the HC16 F32-elision correctness fix under an eval callback, `0020` = the sparse MTP draft (**OPT-IN**, `LLAMA_MTP_SPARSE=1`). |
 | [`tools/`](tools/) | `gguf-types.py` — header-only GGUF tensor-type scanner (no tensor data read); used for the Q2_*/IQ2_* model-tree sweep. |
 
 ## The two moving references this file tracks
@@ -44,6 +45,11 @@ moved here and updated 2026-09-21.
 
 ## Current "our side" build state
 
+* **Current (end of session 10):** `~/llama.cpp` branch **`gap-closing-r13`** @ **`1bb1d794e`**
+  (tree `ad7fb9bc…`) = delivery r13 + the 12 `beta/mmb-general/patches/*.patch` + gap-closing
+  `0001..0014`/`0016`/`0017`/`0018`/`0019`/`0020`: session 8's `QSA_SCORE_WMMA` + MMB quant coverage,
+  session 9's HC16 eval-callback fix, and session 10's **sparse MTP draft (OPT-IN)**.  The historical
+  summary below (branch `gap-closing` @ `00d8bbbc9`) is kept for the session 1-7 record:
 * `~/llama.cpp` branch **`gap-closing`** @ **`00d8bbbc9`** = `mmb-beta` (r12 `72176ae8a` + the 12
   `beta/mmb-general/patches/*.patch`, tree `bca69f23dd…`) + the 2026-09-21/22 changes: **default-on
   policy** (MMB/HC16/matcher), the `hc_combine_norm` matcher revival, the **`hc_gate_mix` fusion**
@@ -59,8 +65,9 @@ moved here and updated 2026-09-21.
   pp32768, plus the trim's ~+0.5 % pp8192); the default build at `-b/-ub 4096` = ~1308 / 1270.
 * Built on this box (gfx1151) with `~/bin/build-llama-rocm-714`.  **All beneficial features are on by
   default** (see the `AGENTS.md` default-on policy); env vars only disable.
-* The seventeen `gap-closing` patches (`0001..0014` + `0016..0018`; `0015` is superseded by r13
-  block 00) are exported to [`patches/`](patches/) in case the local fork branch is lost.
+* The campaign's patches are exported to [`patches/`](patches/) in case the local fork branch is
+  lost: `0001..0014` + `0016..0018` + `0019` (HC16 eval-callback fix) + **`0020` (sparse MTP draft,
+  opt-in)**; `0015` is superseded by r13 block 00.
 
 To reproduce (the **r13 rebuild**):
 
@@ -74,25 +81,36 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/0016-*.pa
 git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/0017-*.patch   # MMB Q4_0/Q4_1/Q5_0/MXFP4/NVFP4
 git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/0018-*.patch   # MMB IQ2_S/IQ2_XS/IQ2_XXS
 git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/0019-*.patch   # HC16 F32-elision under an eval callback
+git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/0020-*.patch   # sparse MTP draft (OPT-IN: LLAMA_MTP_SPARSE=1)
 ~/bin/build-llama-rocm-714
 ```
 
-Fork tip after the rebuild + session 9: **`575c4c091`** (`gap-closing-r13`, tree
-`dadc99000db4472056be920d3f73e3308eef3f3a`).  The scratch build above is the tree the rebuild was
-verified on (`git am` 12/12 + 14/14 + 1/1 + 1/1 + 1/1 + 1/1, no conflicts; applied tree == fork tree).
+Fork tip after session 10: **`1bb1d794e`** (`gap-closing-r13`, tree
+`ad7fb9bcf633923433d865c1122b8aea6546474b`).  The scratch build above is the tree the rebuild was
+verified on (`git am` 12/12 + 14/14 + 1/1 + 1/1 + 1/1 + 1/1 + 1/1, no conflicts; applied tree == fork tree).
 
 ## Do first (fresh session, in order)
 
-> **Updated end of session 8.**  Items 1–3 below are historical; the campaign now starts at
+> **Updated end of session 10.**  Items 1–3 below are historical; the campaign now starts at
 > “Next” — see the **NEXT SESSION** block of [`closing-the-gap.md`](closing-the-gap.md).
 
-**Next (session 9):** (a) the **sparse QSA decode + incremental indexer** (Phase-2 item 9,
-reference `d67d58836`) — **AUDIT DONE 2026-09-22**: no port, both halves are already in our tree
+**Session 9:** (a) the **sparse QSA decode + incremental indexer** (Phase-2 item 9, reference
+`d67d58836`) — **AUDIT DONE 2026-09-22**: no port, both halves are already in our tree
 (`flash_attn_qsa` + the derived block-vector cache); only the MTP-draft sparse attention is a targeted
 follow-up ([`2026-09-22-phase2-sparse-qsa-audit.md`](2026-09-22-phase2-sparse-qsa-audit.md)); (b) the
-**pre-existing BF16-MMB non-finite** bug — **DONE 2026-09-22**, it was the MMB **HC16** F32-elision
-under an eval callback, fixed by `patches/0019` ([`2026-09-22-mmb-eval-callback-f32.md`](2026-09-22-mmb-eval-callback-f32.md));
-(c) the **gfx1100/gfx1201 validation** of the session-8 additions.  Detail in
+**pre-existing BF16-MMB non-finite** bug — **DONE**, the MMB **HC16** F32-elision under an eval
+callback, fixed by `patches/0019` ([`2026-09-22-mmb-eval-callback-f32.md`](2026-09-22-mmb-eval-callback-f32.md)).
+
+**Session 10 — the sparse MTP draft is IMPLEMENTED, `patches/0020`, OPT-IN.**
+[`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md): the three plan edits plus two
+memory fixes the plan missed (the empty MTP recurrent child aborts a partial `seq_rm` and spams the
+non-consecutive warning).  **Prefill pp150K +6.9 %** with a 32K depth gate (927.0 → 990.8 t/s),
+**decode a loss** at every measured depth, so the decode arm is off.  **Default OFF** because at 40K
+the sparse prefill changes the greedy text while the dense draft matches plain; the target is
+logit-width-pure there and even dense MTP diverges at 150K, so the blocker is the iterative
+target verify/rollback (a pre-existing MTP-at-depth purity gap), not the memory change.  Remaining
+next items: the **gfx1100/gfx1201 validation** of the session-8 additions, and root-causing the
+depth verify/rollback divergence (then the sparse draft can be defaulted on).  Detail in
 [`closing-the-gap.md`](closing-the-gap.md)'s NEXT SESSION block.
 
 1. **Run the full BETA-TESTING gate suite** — **DONE (session 8)** on gfx1151: Gate 4 MTP

@@ -9,7 +9,17 @@
 
 ---
 
-## START HERE — fresh-session handover (end of session 8, 2026-09-22)
+## START HERE — fresh-session handover (end of session 10, 2026-09-22)
+
+> **Session 10 (latest):** the **sparse MTP draft** is implemented (`patches/0020`, fork tip
+> `1bb1d794e`, tree `ad7fb9bc…`), **OPT-IN** (`LLAMA_MTP_SPARSE=1`).  **Prefill pp150K +6.9 %** with a
+> 32K depth gate; decode a loss at every depth; at 5K all arms byte-identical (`3553e76d3a9e`), width
+> probe PASS, MTP acceptance unchanged (0.85035), oracles green.  **Default OFF** because at 40K the
+> sparse prefill changes the greedy text while the dense draft matches plain — a pre-existing
+> iterative target verify/rollback divergence at depth (the target is logit-width-pure there, and even
+> dense MTP diverges from plain at 150K), not a memory-change bug.  Full record:
+> [`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md).  **Use `--ctx-checkpoints 0`
+> for any depth purity test** (the checkpoint save/restore makes depth MTP runs nondeterministic).
 
 ### Where we are
 
@@ -123,42 +133,35 @@
   The `QSA_SCORE_BOUNDS` + `QSA_QUERY_STRIP` trim landed session 7.  Read the session-5
   profile/memory findings and the corrected gate semantics further down too.
 
-### NEXT SESSION (end of session 8) — focus: Phase-2 decode + correctness
+### NEXT SESSION (end of session 10) — focus: the depth verify/rollback divergence
 
-Phase-1 (recall/prefill) is essentially closed: items 1–8, 13–16 and the two session-8 focus items are
-all DONE and the campaign is `gap-closing-r13` (r13 + 12 `beta/mmb-general` + gap-closing
-`0001..0014`/`0016`/`0017`/`0018`).  The maintainer's priority sequence now points at **decode**.
+Phase-1 (recall/prefill) is closed; session 9 closed the BF16-MMB eval-callback bug and session 10
+implemented the sparse MTP draft (`patches/0020`, **opt-in**).  The campaign is `gap-closing-r13`
+(r13 + 12 `beta/mmb-general` + gap-closing `0001..0014`/`0016`/`0017`/`0018`/`0019`/`0020`).
 
-**1. Port the sparse QSA decode + incremental indexer state (Phase-2 item 9, reference `d67d58836`)
-— AUDIT DONE 2026-09-22 (session 9): no port, both halves are already in the tree; only the
-MTP-draft sparse attention is uncovered.**  [`2026-09-22-phase2-sparse-qsa-audit.md`](2026-09-22-phase2-sparse-qsa-audit.md).
-The body below is the pre-audit scoping, kept for the mapping:
+**1. The sparse MTP draft is IMPLEMENTED, `patches/0020`, OPT-IN — the remaining item is the depth
+verify/rollback divergence it exposed.**  [`2026-09-22-mtp-sparse-draft.md`](2026-09-22-mtp-sparse-draft.md).
+The audit ([`2026-09-22-phase2-sparse-qsa-audit.md`](2026-09-22-phase2-sparse-qsa-audit.md)) found the
+selected-cell decode and the incremental indexer already in our tree; only the MTP-draft attention was
+missing, and the plan ([`PLAN-mtp-sparse-draft.md`](PLAN-mtp-sparse-draft.md)) was implemented as
+the three edits + two memory fixes the plan missed.  Results:
 
-* the reference adds `qsa-decode.cuh` (SIMT) + `qsa-decode-wmma.cuh` (WMMA) **selected-cell decode**
-  kernels that read the selected F16 K/V cells directly instead of the dense QSA walk, plus an
-  **incremental indexer-key cache** (`src/qsa-prefix-state.h`, `llama-memory-hybrid-idx.*`).
-* Measured on its tree: serial depth-40000 **25.85 → 28.82 t/s**, MTP 40680-token **31.17 → 35.57**
-  (first) / **32.69 → 39.10** (repeat), for 104 MiB @65k / ~416 MiB @256k of cache.
-* **Audit DONE 2026-09-22 (session 9)** — [`2026-09-22-phase2-sparse-qsa-audit.md`](2026-09-22-phase2-sparse-qsa-audit.md).
-  Both headline mechanisms are **already in our tree**: the selected-cell decode is
-  `fattn-qsa.cu::flash_attn_qsa` (`LLAMA_QSA_SPARSE_FA`, default on, and more general than the
-  reference's SIMT arm), and the incremental indexer is the derived block-vector cache
-  (`GGML_CUDA_QSA_INDEXER_CACHE`, `pool_layers`/`pool_wm`, default on) — the reference's
-  `qsa_keys[il] = [idx_dim, n_blocks]` is the same block-key cache with a cell-prefix update tracker.
-  The reference's measured +11–20 % table is sparse-**recompute** vs sparse-**incremental**, which we
-  already hold.  **No port recommended.**
-* **The one real gap:** our `graph_mtp` attends **dense** (the reference enables `build_qsa_top_k` for
-  the MTP draft at `n_tokens <= 8`).  **Measured: the single dense draft layer costs 2.1× all twelve
-  sparse trunk layers during prefill and 5.6× during decode at ~150K, and the ratio grows with
-  depth** (draft is `O(n_q·n_kv)`, trunk is capped at `top_k + r - 1`).  **IMPLEMENTATION PLAN:
-  [`PLAN-mtp-sparse-draft.md`](PLAN-mtp-sparse-draft.md)** — hand it to the next session.  It is
-  **three edits** (nextn compress-ratio fallback, MTP-context hybrid-idx memory, `graph_mtp` QSA
-  routing), not a one-line change: our MTP context currently gets a **plain KV cache**, not
-  hybrid-idx.
-* It is still a **hold/repay** item: our plain decode is already ahead (+2–6 % on qwen4exp, §12), so land
-  it only if it holds that lead.  Gate: `plain == draft-mtp` greedy text, MTP acceptance at pos 1, and
-  depth throughput (`benchmarks/mtp-adaptive-methodology.md`).  The reference's WMMA decode variant
-  has no measured win over our SIMT path; only revisit on a width sweep.
+* **Prefill pp150K 927.0 → 990.8 t/s (+6.9 %)** with the 32K depth gate (`LLAMA_MTP_SPARSE_MIN_KV`);
+  enabling it from `n_kv > 2051` is a 25 % *loss* (697.3) — the indexer cost is fixed per query while
+  the dense attention it replaces is `O(n_kv)`.
+* **Decode is a loss at every measured depth** (16K −13 %, 40K −15 %, 150K −16 %), so the decode arm
+  is off (`LLAMA_MTP_SPARSE_DECODE=1` opts in).  The SIMT selected-cell decode is not a win at the
+  draft's 1-layer geometry.
+* Gates: 5K purity **PASS** (`3553e76d3a9e` on plain/off/sparse), width probe **PASS**, MTP acceptance
+  **0.85035** unchanged, `FLASH_ATTN_QSA` 26/26 / `GATED_DELTA_NET` 46/46.
+* **Blocker / default OFF:** at 40K the sparse prefill changes the greedy text (`c0a3bda5dff4`) while
+  the dense draft and the hybrid-memory-dense arm both match plain (`687cec808661`).  The hybrid
+  memory is innocent; the target is **logit-width-pure** at 40K (the width probe extended to P=32768,
+  `RS=0` and `RS=from_w`, both PASS), so the divergence is in the **iterative target
+  verify/rollback** path — and even **dense** MTP diverges from plain at 150K.  **Root-cause the
+  depth verify/rollback divergence, then the sparse draft can be defaulted on.**  Related confound:
+  without `--ctx-checkpoints 0` the depth MTP runs are nondeterministic; use that flag for depth
+  purity tests.
 
 **2. Fix the pre-existing BF16-MMB non-finite bug (found session 8) — DONE 2026-09-22 (session 9,
 `patches/0019`).**  `llama-imatrix` on `Nanbeige4.2-3B-BF16` emitted *"non-finite values detected in
