@@ -116,7 +116,12 @@ The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and t
    is the checklist (3-GPU `-sm tensor`, q8_0 KV, `-b/-ub 2048`); gfx1100 notes in
    `beta/mmb-general/gfx1100-porting.md`.  The dequant code is arch-neutral and gfx1201 keeps its
    per-type dense policy, so this is apply-and-gate, not a port.  Re-check the crossover claim on
-   gfx1201 (it stays dense-always there) and the pool default on both.
+   gfx1201 (it stays dense-always there) and the pool default on both.  **Hand-off briefs for the two
+   target machines:** [`gfx1201-closing.md`](gfx1201-closing.md) and
+   [`gfx1100-closing.md`](gfx1100-closing.md) — each has the full apply order (r13 + `beta/mmb-general`
+   + `wip/closing-the-gap`), the per-patch arch-sensitive inventory, the gate commands, the expected
+   `MMB_CFG` row and the port candidates.  Extend `beta/mmb-general/gfx1201-s14-gates.md` /
+   `gfx1100-porting.md` with the session results.
 4. **`-ub 16384`** — parked until the managed PLE reader's no-cache parallel-pread fast path is picked
    up (item 13 in the closed record).  Root cause in `closed-the-gap.md` (the full-vocab
    `result_output` reserve + the HC `block_out` pin + the resident PLE table).
