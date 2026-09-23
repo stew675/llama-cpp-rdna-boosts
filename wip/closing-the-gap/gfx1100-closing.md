@@ -423,6 +423,9 @@ Matches the expected gfx1100 row exactly (`hc16=1` is the `0002` flip but inert;
 | purity plain == draft-mtp n3 (`-n 96`) | `e7ff203db696` == | `81d218ce9f5b` == | — | — |
 | width probe (P=1024, ub=512) | PASS (0) | PASS (0) | PASS (0) | PASS (0) |
 
+Depth purity (27B, `-c 40000 --ctx-checkpoints 0`, p40k prompt): plain == draft-mtp n3 =
+`758fe22a91d9` (957 ch) byte-identical.
+
 ### 9.4 §6.8 PPL parity (MMB off → on, prose `-c 2048`)
 
 | model | MMB off | MMB on | prior S10 |
