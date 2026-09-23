@@ -1,0 +1,92 @@
+From 16865b36d9c5c1432b22ae87d46a051b1ed730e9 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Wed, 23 Sep 2026 18:56:07 -0500
+Subject: [PATCH] gfx1100 port: extend QSA_SCORE_WMMA (0016) and hc_gate_mix
+ (0003) predicates to RDNA3_0 (opt-in, default OFF)
+
+- lightning-indexer.cu: indexer4_arch_enabled() accepts RDNA3_0 behind
+  GGML_CUDA_LIGHTNING_INDEXER4_GFX1100=1 (default off); RDNA3_5 stays the
+  shipped arm.  The qsa_indexer_wmma16_keyreg kernel compiles for gfx11 and
+  LIGHTNING_INDEXER 225/225 passes on gfx1100 with the opt-in set.
+- ggml-cuda.cu: the hc_gate_mix call-site predicate is now RDNA3 (gfx1100 +
+  gfx1151) instead of RDNA3_5; gatemix stays default OFF on RDNA3_0
+  (mmb_arch_defaults) so the port is opt-in via LLAMA_HC_GATEMIX=1.
+- mmb.cu: update the RDNA3_0 gatemix comment.
+
+End-to-end (qwen4exp prefill) not testable on gfx1100 (model does not fit in
+24 GiB); deferred to gfx1151/gfx1201.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu         |  7 +++++--
+ ggml/src/ggml-cuda/lightning-indexer.cu | 16 +++++++++++++++-
+ ggml/src/ggml-cuda/mmb.cu               |  6 +++++-
+ 3 files changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7e3dd715d..c05282294 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5706,10 +5706,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     // qwen4exp hyper-connection gate GEMM + sigmoid + stream mix: when the HC gate MUL_MAT's only
+     // consumer is the sigmoid that opens an hc_mix window, fold the GEMM into the mix kernel - it
+-    // removes the gate tensor materialization and one launch per layer.  RDNA3_5 (gfx1151) only; the
++    // removes the gate tensor materialization and one launch per layer.  RDNA3 (gfx1100/gfx1151); the
+     // kernel dequantizes the IQ4_NL gate weight and replays the GEMM's BF16 epilogue rounding, so the
+     // fusion is bit-identical to the GEMM + sigmoid + mix chain.  A/B / bisect: LLAMA_HC_GATEMIX=0.
+-    if (hc_mix_on && ggml_cuda_mmb_gatemix() && GGML_CUDA_CC_IS_RDNA3_5(cc) &&
++    // gfx1100 is a port candidate: the gfx11 WMMA builtin is shared with gfx1151, but `gatemix` stays
++    // default OFF on RDNA3_0 (mmb_arch_defaults) until a gfx1151/gfx1201 session A/Bs qwen4exp
++    // end-to-end; LLAMA_HC_GATEMIX=1 is the opt-in on gfx1100.
++    if (hc_mix_on && ggml_cuda_mmb_gatemix() && GGML_CUDA_CC_IS_RDNA3(cc) &&
+             node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes) {
+         const ggml_tensor * w  = node->src[0];
+         const ggml_tensor * lo = node->src[1];
+diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
+index b7722a5e2..a90fd1f88 100644
+--- a/ggml/src/ggml-cuda/lightning-indexer.cu
++++ b/ggml/src/ggml-cuda/lightning-indexer.cu
+@@ -692,9 +692,23 @@ __global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
+ #endif
+ }
+ 
++// The 4-head WMMA kernel is the RDNA3_5 (gfx1151) shipped arm.  RDNA3_0 (gfx1100) shares the gfx11
++// WMMA builtin, so the kernel compiles there; it is a port candidate gated OPT-IN via
++// GGML_CUDA_LIGHTNING_INDEXER4_GFX1100 until a gfx1151/gfx1201 session A/Bs qwen4exp prefill
++// end-to-end (the kernel is prefill-only, n_tps >= 128).
++static bool indexer4_arch_enabled(int cc) {
++    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) { return true; }
++    if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
++        static const int v = getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1100")
++            ? atoi(getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1100")) : 0;
++        return v != 0;
++    }
++    return false;
++}
++
+ static bool supports_indexer4(int device, const ggml_tensor * dst) {
+     const auto * q=dst->src[0], * k=dst->src[1], * w=dst->src[2], * m=dst->src[3];
+-    if (!q || !k || !w || !m || !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc)) { return false; }
++    if (!q || !k || !w || !m || !indexer4_arch_enabled(ggml_cuda_info().devices[device].cc)) { return false; }
+     if (q->type != GGML_TYPE_F32 || (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) ||
+             w->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 ||
+             q->ne[0] != 128 || q->ne[1] != 4 || k->ne[0] != 128 || k->ne[1] != 1 ||
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 9a3470d6a..dd89852d5 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -1540,7 +1540,11 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
+         // keeps its default.  NOTE: gfx1100 was only measured to pp32768 -- re-check pp65536+
+         // before finalising (see gfx1100-porting.md 14.5).
+         c.f32split_mode = 0;
+-        c.gatemix       = 0;   // the gate-mix kernel is IQ4_NL + RDNA3_5 WMMA; not ported to RDNA3_0 yet
++        // gatemix: the kernel's gfx11 WMMA builtin is shared with gfx1151 (ported 2026-09-23, the
++        // call site now accepts RDNA3), but it stays default OFF on RDNA3_0 -- qwen4exp (the only
++        // model with IQ4_NL HC gates) does not fit on gfx1100, so end-to-end A/B must be done on
++        // gfx1151/gfx1201 first.  LLAMA_HC_GATEMIX=1 is the opt-in.
++        c.gatemix       = 0;
+     }
+     // TODO(S12): the routed/GLU thresholds, `tall_mode`, `tiny_m*`, `f32split_*` and `cache_max` are
+     // still the gfx1151 values on every arch.  Give RDNA4 its own once they are measured per arch.
+-- 
+2.55.0
+

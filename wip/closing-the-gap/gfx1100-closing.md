@@ -318,23 +318,157 @@ has A/B'd it end-to-end; land it as a patch on the WIP branch and record it in
 Everything else that is RDNA3_5-only (`HC16`, `gatemix` as shipped) stays inert — record that with
 the predicate.
 
+### 7.1 Port result (2026-09-23)
+
+Both candidates are **ported and landed as `wip/closing-the-gap/gfx1100/0001-gfx1100-port-…patch`**
+(commit `16865b36d` on the fork's `closing-gfx1100` branch).  Neither is enabled by default on
+gfx1100:
+
+* **`0016` `QSA_SCORE_WMMA`** — `supports_indexer4()` now uses `indexer4_arch_enabled(cc)`:
+  RDNA3_5 stays the shipped arm; RDNA3_0 (gfx1100) is **opt-in** via
+  `GGML_CUDA_LIGHTNING_INDEXER4_GFX1100=1` (default off).  The kernel compiles for gfx11 and
+  **`LIGHTNING_INDEXER` 225/225 passes on gfx1100 with the opt-in set** (the WMMA arm, not the
+  generic vec fallback).  End-to-end (qwen4exp prefill) is **not testable on gfx1100** (no model
+  fits in 24 GiB) — deferred to gfx1151/gfx1201.
+* **`0003` `hc_gate_mix`** — the call-site predicate is now `GGML_CUDA_CC_IS_RDNA3(cc)`
+  (gfx1100 + gfx1151).  `gatemix` **stays default OFF on RDNA3_0** (`mmb_arch_defaults`), so the
+  port is **opt-in via `LLAMA_HC_GATEMIX=1`**.  The kernel (`hc_gate_mix_kernel<4>`, IQ4_NL +
+  gfx11 WMMA) compiles for gfx1100 (verified by the clean build), but there is **no op-level
+  oracle** (it is a graph fusion) and qwen4exp does not fit, so the unit test is compile-only —
+  end-to-end deferred to gfx1151/gfx1201.
+
+Record the predicates that keep everything else inert: `HC16`/`blk16`/`res16` are
+`GGML_CUDA_CC_IS_RDNA3_5`-gated at their call sites; `0022` is `qsa_arch_gfx() == 0x1151` only
+(gfx1100 = dense-always `1<<62`).
+
 ---
 
 ## 8. Per-patch verdict table (fill this in)
 
 | patch | end-to-end on gfx1100? | verdict | evidence / why inert |
 |---|---|---|---|
-| `0001` | no (qwen4exp) |  |  |
-| `0002` | **yes** |  |  |
-| … |  |  |  |
-| `0026` | no (qwen4exp) |  |  |
+| `0001` | no (qwen4exp) | compile-only | `hc_combine_norm` matcher revival; no gfx1100 dispatch (HC-only); clean build |
+| `0002` | **yes** | **PASS** | MMB default ON + RDNA3_0 arm; `MMB_CFG` row confirmed; S5-S10 wins recovered **with no env** (§9) |
+| `0003` | no (qwen4exp) | **PORTED (opt-in)** | call-site predicate extended to RDNA3; `gatemix=0` stays default on RDNA3_0; kernel compiles for gfx11 (§7.1) |
+| `0004` | **yes** | **PASS** | `gdn-conv.cu`/`ple-conv.cu` compiled for gfx11; 27B/35B coherence green; prefill win folded into the MMB A/B |
+| `0005` | no (qwen4exp) | compile-only | host-side only (`llama-memory-hybrid-idx`); clean build |
+| `0006` | **yes** | **PASS** | `norm-gated.cu::rms_rows_f32`; width purity PASS on all four models; coherence green |
+| `0007` | no (qwen4exp) | **PASS (oracle)** | `FLASH_ATTN_QSA` **26/26** (the qsa3 arm runs on gfx1100; S10 verified) |
+| `0008` | no (qwen4exp) | compile-only | M=4 HC inject out of the tall MMB tile; HC shapes only |
+| `0009` | **yes** | **PASS** | lazy-mode text identity: `-lm auto/none × -lzm auto/on/off` all = `533172aeb7ab` |
+| `0010` | **yes** (MoE) | **PASS** | default OFF (`down16=0`); enabled (`GGML_CUDA_MMB_DOWN16=1`): 35B coherence `81d218ce9f5b` identical, PPL 14.8248 |
+| `0011` | no (qwen4exp) | compile-only | default OFF (`blk16=0`/`res16=0`); compiles |
+| `0012` | no (qwen4exp) | compile-only | `mmb_cvt` BF16 `out_xn`; HC-combine only |
+| `0013` | no (qwen4exp) | compile-only (oracle) | `LIGHTNING_INDEXER` generic path exercised |
+| `0014` | no (qwen4exp) | **PASS (oracle)** | `TOPK_QSA` **4/4** (the qwen4exp top-k oracle; S10 verified) |
+| `0016` | no (qwen4exp) | **PORTED (opt-in)** | `supports_indexer4` extended to RDNA3_0; `LIGHTNING_INDEXER` **225/225** with the WMMA kernel on gfx1100 (§7.1) |
+| `0017` | **yes** | **PASS** | `MUL_MAT` **1297/1297**, `MUL_MAT_ID` **913/913**; gemma-26B-A4B +11.4 % (new Q4_0 coverage) |
+| `0018` | **yes** | **PASS** | same oracles; IQ2 family covered |
+| `0019` | **yes** | **PASS** | `llama-imatrix` clean (no non-finite), file byte-identical to `GGML_CUDA_MMB_HC16=0` |
+| `0020` | no (qwen4exp) | compile-only | sparse MTP-draft attention; memory/graph side |
+| `0021` | no (qwen4exp) | compile-only | QSA derived indexer cache; qwen4exp only |
+| `0022` | no (qwen4exp) | inert | `qsa_arch_gfx() == 0x1151` only; on gfx1100 `1<<62` (dense-always) → N/A |
+| `0023` | **yes** | **PASS** | MTP determinism + width purity unchanged; `hc16=1` inert (RDNA3_5-gated); scheduler change live; imatrix clean |
+| `0024` | **yes** (no-op) | superseded | input-layer heuristic; superseded by `0025` (kept as A/B baseline) |
+| `0025` | **yes** | **PASS (no-op)** | discrete GPU → `prop.integrated=0` → no-op; `GGML_FORCE_NO_INTEGRATED=1` identical (`533172aeb7ab`) |
+| `0026` | no (qwen4exp) | compile-only | sparse MTP draft prefill default ON; qwen4exp only |
 
 For each qwen4exp-only patch, state the **predicate** that makes it inert and the oracle/host-gate
 you ran instead.
 
 ---
 
-## 9. Report template
+## 9. Session results (gfx1100, 2026-09-23)
+
+**Box:** 1× RX 7900 XTX (gfx1100, 24 GiB), ROCm 7.14, `HIP_VISIBLE_DEVICES=0` on every command.
+**Trees:** closing = `~/llama.cpp` `closing-gfx1100` (r13 + beta + 25 closing patches, applied tree
+`2b15ecd26c97afb4dbe2f58566def2180949df82`; plus the §7.1 port commit `16865b36d`).  Baseline =
+`~/llama-r13beta` (r13 + beta, applied tree `79136a15cac1920c0dd334b4c119a9cb42f9143b`).  Both built
+with 0 errors.  Models available on this box: 27B UD-Q4_K_M, 35B-A3B Q3_K_M, gemma-12B Q8_0,
+gemma-26B-A4B qat-UD-Q4_K_XL, Ornith-1.0-9B-BF16.  **Missing:** 27B IQ3_S (§6.1) and NanBeige BF16
+(§6.9) — the imatrix gate used Ornith-1.0-9B-BF16 as the BF16 substitute.
+
+### 9.0 §5 build-time instantiation check
+
+`fattn-tile.cu.o` (dispatch TU) shows **96 `U`** tile_case externs; instance TUs define them.  No
+type axis left implicit in the dispatch TU.  Clean `-j16` build green (closing + baseline).
+
+### 9.1 §6.6 op oracles (closing tree, fresh build)
+
+| op | result |
+|---|---|
+| `FLASH_ATTN_QSA` | **26/26** |
+| `GATED_DELTA_NET` | **46/46** |
+| `TOPK_QSA` | **4/4** |
+| `FLASH_ATTN_EXT` | **5953/5953** |
+| `LIGHTNING_INDEXER` | **225/225** (generic path; WMMA arm see §7.1) |
+| `MUL_MAT` | **1297/1297** |
+| `MUL_MAT_ID` | **913/913** |
+
+### 9.2 §6.5 MMB config dump
+
+```
+MMB_CFG cc=0x1001100 dense_geom=0 min_t=512 glu_thresh=32 routed_thresh=32 tall=2 tiny_m=1/1
+        f32split=0(min_m=128,min_k=0) cache=4 shadow=0/6144MB hc16=1 down16=0 gatemix=0
+        blk16=0 res16=0 glu=1 bf16w=1 iq3xxs_glu=0 routed=1
+```
+Matches the expected gfx1100 row exactly (`hc16=1` is the `0002` flip but inert; `f32split=0`,
+`dense_geom=0`, `routed=1`, `gatemix=0` are the RDNA3_0 row).  `GGML_CUDA_MMB=0` prints no row.
+
+### 9.3 §6.2/§6.3/§6.4 correctness (closing tree, MMB default ON)
+
+| gate | 27B UD-Q4_K_M | 35B-A3B Q3_K_M | gemma-12B Q8_0 | gemma-26B-A4B |
+|---|---|---|---|---|
+| coherence (`-n 48`, c=8192) | `533172aeb7ab` | `80aab0c0c53a` | `1b46f381feea` | `d21969fddd83` |
+| purity plain == draft-mtp n3 (`-n 96`) | `e7ff203db696` == | `81d218ce9f5b` == | — | — |
+| width probe (P=1024, ub=512) | PASS (0) | PASS (0) | PASS (0) | PASS (0) |
+
+### 9.4 §6.8 PPL parity (MMB off → on, prose `-c 2048`)
+
+| model | MMB off | MMB on | prior S10 |
+|---|---|---|---|
+| 27B UD-Q4_K_M | 10.0174 ± 0.62345 | 9.9258 ± 0.61417 | **identical** |
+| 35B-A3B Q3_K_M | 14.8302 ± 1.00741 | 14.8248 ± 1.00481 | **identical** |
+
+### 9.5 §6.0 A/B prefill (closing tree, `-b 4096 -ub 4096 -r 5`, MMB off vs on)
+
+| model | point | MMB off | MMB on | Δ | S5-S10 prior Δ |
+|---|---:|---:|---:|---:|---:|
+| 27B UD-Q4_K_M | pp8192 | 1107.66 | 1321.32 | **+19.3 %** | +14.3 % |
+| 27B UD-Q4_K_M | pp16384 | 1064.03 | 1257.94 | **+18.2 %** | +13.7 % |
+| gemma-12B Q8_0 | pp8192 | 1900.35 | 2140.28 | **+12.6 %** | +11.0 % |
+| 35B-A3B Q3_K_M | pp8192 | 5456.12 | 6406.97 | **+17.4 %** | +5.5 % |
+| 35B-A3B Q3_K_M | pp32768 | 4281.18 | 4848.20 | **+13.2 %** | +4.8 % |
+| gemma-26B-A4B | pp8192 | 3994.11 | 4451.20 | **+11.4 %** | neutral (new Q4_0 coverage) |
+
+Decode parity: tg128 27B MMB off 40.01 → on 40.00 (untouched, `mmb_min_t=512`).
+**Every S5-S10 win is recovered with no env (MMB default ON); the closing patches (GDN `0004`,
+MMB quant coverage `0017`/`0018`) widen the wins beyond the beta-only figures.**
+
+### 9.6 §6.7 MTP acceptance (`-n 3000`, draft-mtp n3, `-lv 4`)
+
+| model | draft acceptance | prior S10 smoke |
+|---|---|---|
+| 27B UD-Q4_K_M | **0.82030** (1762/2148, mean len 3.46) | 0.78070 |
+| 35B-A3B Q3_K_M | **0.75073** (1286/1713, mean len 3.25) | 0.72917 |
+
+### 9.7 §6.9 `llama-imatrix` (Ornith-1.0-9B-BF16, `-c 512 -b 512 --chunks 4`)
+
+Clean (no non-finite), PPL 7.2865 both arms; imatrix file **byte-identical**
+(sha256 `e7c16342829553f66835b3d0747270cfc8a9d4adeca70246720a27e9fa132cdb`) for default vs
+`GGML_CUDA_MMB_HC16=0` (HC16 is inert on gfx1100, so this is the scheduler/split regression check).
+
+### 9.8 §4a patch-specific checks
+
+* `0009` lazy mode: `-lm auto/none × -lzm auto/on/off` all byte-identical `533172aeb7ab`.
+* `0010` MoE BF16 epilogue: default OFF (`down16=0`); enabled → 35B coherence identical
+  (`81d218ce9f5b`), PPL 14.8248.
+* `0025` host-buffer input layer: discrete GPU → `prop.integrated=0` → no-op;
+  `GGML_FORCE_NO_INTEGRATED=1` identical `533172aeb7ab`.
+
+---
+
+## 10. Report template
 
 For each gate: the exact command, the build/tree, the `MMB_CFG` line, the numbers (interleaved order
 for A/Bs), and the extracted hash where a text gate applies.  For a port candidate, the patch, the
@@ -343,7 +477,7 @@ Use `benchmarks/mtp-adaptive-methodology.md` rule 0 for MTP and `-b/-ub 4096` fo
 
 ---
 
-## 10. Traps
+## 11. Traps
 
 1. **Mask the iGPU: `HIP_VISIBLE_DEVICES=0` on every command** (the gfx1036 device aborts
    multi-device tools).
