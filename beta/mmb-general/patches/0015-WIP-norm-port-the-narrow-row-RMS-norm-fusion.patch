@@ -1,0 +1,263 @@
+From 63ffe12f301868e96cbf88b808762f3a4e347744 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 22 Sep 2026 04:02:20 -0500
+Subject: [PATCH 15/28] WIP norm: port the narrow-row RMS norm fusion
+
+Ports the other solution's norm-gated.cu: a wave-per-row RMS norm for narrow
+rows (ncols <= 256, >= 4096 rows) that processes 8 rows per 256-thread block
+instead of the one-block-per-row rms_norm_f32<256>, which is block-scheduling
+bound for the model's per-head norms.  Two matchers, wired in ggml_cuda_try_fuse
+before the generic RMS_NORM+MUL fusion, plus the gated-variant alloc deps:
+  * norm_gated: RMS_NORM -> MUL(w) -> [view*|MUL_MAT] -> SIGMOID -> MUL, one
+    kernel (also fuses the gate arithmetic the separate sigmoid+mul did);
+  * norm_rows:  plain RMS_NORM -> MUL(w).
+
+The reduction order is identical to rms_norm_f32<256,...> + block_reduce (per-warp
+xor trees over 32 consecutive columns, then a xor tree over the 8 partials padded
+with zeros) and the gate is the same 1/(1+expf(-z)), so the result is bit-identical.
+
+Default ON (per the default-on policy); GGML_CUDA_DISABLE_NORM_ROWS=1 is the A/B
+kill switch.
+
+gfx1151, qwen4exp IQ4_NL:
+  * width probe PASS (worst maxdiff 0); row0 logits hash identical on/off;
+    same-seed greedy text identical (765 chars sha=f61199ba5644) on/off.
+  * kernel profile (pp8192, ub8192): rms_norm_f32<256,true> 282.8 + the gated
+    sigmoid/mul -> rms_rows_f32<true> 210.5 + rms_rows_f32<false> 77.4 ms.
+  * A/B at -b/-ub 4096 (the memory-safe protocol; see the ubatch note in
+    wip/closing-the-gap): pp8192 1222.74 -> 1226.09, pp32768 1166.13 -> 1169.37
+    (+~0.3 %, consistent sign).
+
+Exported to wip/closing-the-gap/patches/0006.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu   |  36 +++++++++
+ ggml/src/ggml-cuda/norm-gated.cu  | 128 ++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/norm-gated.cuh |  20 +++++
+ 3 files changed, 184 insertions(+)
+ create mode 100644 ggml/src/ggml-cuda/norm-gated.cu
+ create mode 100644 ggml/src/ggml-cuda/norm-gated.cuh
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c86cebf6b..adffc38a5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -41,6 +41,7 @@
+ #include "ggml-cuda/mmvq.cuh"
+ #include "ggml-cuda/moe-weighted-reduction.cuh"
+ #include "ggml-cuda/norm.cuh"
++#include "ggml-cuda/norm-gated.cuh"
+ #include "ggml-cuda/opt-step-adamw.cuh"
+ #include "ggml-cuda/opt-step-sgd.cuh"
+ #include "ggml-cuda/out-prod.cuh"
+@@ -4063,6 +4064,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    // Narrow-row RMS norm (ncols <= 256, >= 4096 rows) and its sigmoid-gated form, ported from the
++    // halo-box reference (Phase-1 item 4): 8 rows per 256-thread block instead of one block per row,
++    // which is block-scheduling bound for the model's per-head norms.  Bit-identical to
++    // rms_norm_f32<256,{true,false}> (same per-warp xor trees + 8-partial xor tree).
++    // A/B / bisect kill switch: GGML_CUDA_DISABLE_NORM_ROWS=1.
++    static const bool disable_norm_rows = getenv("GGML_CUDA_DISABLE_NORM_ROWS") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_NORM_ROWS"));
++    if (!disable_norm_rows && node->op == GGML_OP_RMS_NORM) {
++        ggml_cuda_norm_gated_match nm;
++        int sk = ggml_cuda_norm_gated_match_at(cgraph, i, nm);
++        if (sk > 0) {
++            if (nm.pre >= 0) {
++                if (!ggml_cuda_compute_forward(*cuda_ctx, cgraph->nodes[nm.pre])) {
++                    GGML_ABORT("norm-gated: gate MUL_MAT dispatch failed");
++                }
++            }
++            ggml_cuda_op_norm_gated(*cuda_ctx, nm);
++            return sk;
++        }
++        sk = ggml_cuda_norm_rows_match_at(cgraph, i, nm);
++        if (sk > 0) {
++            ggml_cuda_op_norm_gated(*cuda_ctx, nm);
++            return sk;
++        }
++    }
++
+     // qwen4exp IQ4_NL/Q8_0 routed down projection followed by the 10-expert weighted sum (ported
+     // from halo-box/strix-llama.cpp): compute all selected experts for one output row in a wave and
+     // apply their routing weights immediately, avoiding the [n_embd, n_used] intermediate and its
+@@ -6542,6 +6568,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                 }
+                 continue;
+             }
++            if (cgraph->nodes[i]->op == GGML_OP_RMS_NORM) {
++                ggml_cuda_norm_gated_match nm;
++                const int sk = ggml_cuda_norm_gated_match_at(cgraph, i, nm);
++                if (sk > 0 && nm.pre >= 0) {
++                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(nm.x), nm.dst);
++                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(nm.w), nm.dst);
++                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(nm.z->view_src ? nm.z->view_src : nm.z), nm.dst);
++                }
++                continue;
++            }
+             if (cgraph->nodes[i]->op != GGML_OP_MUL) {
+                 continue;
+             }
+diff --git a/ggml/src/ggml-cuda/norm-gated.cu b/ggml/src/ggml-cuda/norm-gated.cu
+new file mode 100644
+index 000000000..d7d4bc9b6
+--- /dev/null
++++ b/ggml/src/ggml-cuda/norm-gated.cu
+@@ -0,0 +1,128 @@
++#include "norm-gated.cuh"
++#include "ggml-impl.h"
++
++// Wave-per-row RMS norm for narrow rows (ncols <= 256): 8 rows per 256-thread block instead of one
++// block per row (the model's per-head norms have ~786k rows of <= 256 -> the upstream launch is
++// block-scheduling bound).  The sum reproduces norm.cu's rms_norm_f32<256,...> + block_reduce order
++// exactly: per-warp xor trees over 32 consecutive columns, then a xor tree over the 8 partials
++// padded with zeros -> bitwise identical results.
++// Optional sigmoid gate: dst = (scale * x * w) * (1 / (1 + expf(-z)))  (== op_sigmoid then binbcast mul).
++//
++// Ported from the other solution's norm-gated.cu for wip/closing-the-gap Phase-1 item 4.
++// Default ON (per the default-on policy); GGML_CUDA_DISABLE_NORM_ROWS=1 is the A/B kill switch.
++
++static __device__ __forceinline__ float norm_rows_xor_tree(float v) {
++#pragma unroll
++    for (int off = 16; off > 0; off >>= 1) { v += __shfl_xor(v, off); }
++    return v;
++}
++
++template <bool GATE>
++static __global__ void __launch_bounds__(256) rms_rows_f32(const float * x, const float * w, const float * z, float * dst,
++        const int ncols, const int64_t nrows, const int64_t nchannels, const int64_t total_rows,
++        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps) {
++    const int lane = threadIdx.x & 31;
++    const int64_t g = (int64_t) blockIdx.x * 8 + (threadIdx.x >> 5);
++    if (g >= total_rows) return;
++    const int64_t row = g % nrows, channel = (g / nrows) % nchannels, sample = g / (nrows * nchannels);
++    x += sample * stride_sample + channel * stride_channel + row * stride_row;
++    dst += g * ncols; if (GATE) z += g * ncols;
++    float part[8];
++#pragma unroll
++    for (int wv = 0; wv < 8; ++wv) {
++        const int col = 32 * wv + lane;
++        const float xi = col < ncols ? x[col] : 0.0f;
++        part[wv] = norm_rows_xor_tree(xi * xi);
++    }
++    float v = 0.0f;
++#pragma unroll
++    for (int wv = 0; wv < 8; ++wv) { v = lane == wv ? part[wv] : v; }
++    const float tmp = norm_rows_xor_tree(v);
++    const float mean = tmp / ncols;
++    const float scale = rsqrtf(mean + eps);
++#pragma unroll
++    for (int wv = 0; wv < 8; ++wv) {
++        const int col = 32 * wv + lane;
++        if (col < ncols) {
++            const float t = scale * x[col] * w[col];
++            if (GATE) { const float s = 1.0f / (1.0f + expf(-z[col])); dst[col] = t * s; } else { dst[col] = t; }
++        }
++    }
++}
++
++static bool norm_rows_enabled() {
++    static const bool enabled = []() {
++        const char * env = getenv("GGML_CUDA_DISABLE_NORM_ROWS");
++        return env == nullptr || std::atoi(env) == 0;
++    }();
++    return enabled;
++}
++
++static bool rows_shape_ok(const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * out) {
++    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32) return false;
++    if (x->ne[0] > 256 || x->ne[0] % 32 != 0 || x->nb[0] != 4 || !ggml_is_contiguous(w) || !ggml_is_contiguous(out)) return false;
++    if (w->ne[0] != x->ne[0] || w->ne[1] != 1 || w->ne[2] != 1 || w->ne[3] != 1) return false;
++    if (x->ne[1] * x->ne[2] * x->ne[3] < 4096) return false;
++    return ggml_nelements(out) == ggml_nelements(x);
++}
++
++int ggml_cuda_norm_gated_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_norm_gated_match & m) {
++    if (!norm_rows_enabled() || i + 3 >= cgraph->n_nodes) return 0;
++    const ggml_tensor * rms = cgraph->nodes[i], * mul = cgraph->nodes[i+1];
++    if (rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) return 0;
++    int k = i + 2; m.pre = -1;
++    while (k + 1 < cgraph->n_nodes && k < i + 6) {
++        const ggml_op op = cgraph->nodes[k]->op;
++        if (op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE) { ++k; continue; }
++        if (op == GGML_OP_MUL_MAT && m.pre < 0) { m.pre = k; ++k; continue; }
++        break;
++    }
++    if (k + 1 >= cgraph->n_nodes) return 0;
++    const ggml_tensor * sig = cgraph->nodes[k]; ggml_tensor * out = cgraph->nodes[k+1];
++    if (sig->op != GGML_OP_UNARY || out->op != GGML_OP_MUL) return 0;
++    if (ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID) return 0;
++    const ggml_tensor * x = rms->src[0];
++    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : (mul->src[1] == rms ? mul->src[0] : nullptr);
++    if (!w) return 0;
++    const ggml_tensor * z = sig->src[0];
++    if (m.pre >= 0) { const ggml_tensor * zr = z->view_src ? z->view_src : z; if (zr != cgraph->nodes[m.pre]) return 0; }
++    if (!((out->src[0] == mul && out->src[1] == sig) || (out->src[0] == sig && out->src[1] == mul))) return 0;
++    if (!ggml_node_has_n_uses(cgraph, i, 1) || !ggml_node_has_n_uses(cgraph, i+1, 1) || !ggml_node_has_n_uses(cgraph, k, 1)) return 0;
++    if (!rows_shape_ok(x, w, out) || z->type != GGML_TYPE_F32 || !ggml_is_contiguous(z) || !ggml_is_contiguous(mul)) return 0;
++    if (!ggml_are_same_shape(z, out) || !ggml_are_same_shape(mul, out) || !ggml_are_same_shape(rms, out)) return 0;
++    float eps; memcpy(&eps, rms->op_params, sizeof(float)); if (eps < 0.0f) return 0;
++    m.x = x; m.w = w; m.z = z; m.dst = out; m.eps = eps;
++    return (k + 1) - i;
++}
++
++// plain RMS_NORM -> MUL(w) on narrow rows
++int ggml_cuda_norm_rows_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_norm_gated_match & m) {
++    if (!norm_rows_enabled() || i + 1 >= cgraph->n_nodes) return 0;
++    const ggml_tensor * rms = cgraph->nodes[i]; ggml_tensor * mul = cgraph->nodes[i+1];
++    if (rms->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL) return 0;
++    const ggml_tensor * x = rms->src[0];
++    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : (mul->src[1] == rms ? mul->src[0] : nullptr);
++    if (!w || !ggml_node_has_n_uses(cgraph, i, 1)) return 0;
++    if (!rows_shape_ok(x, w, mul) || !ggml_are_same_shape(rms, mul)) return 0;
++    float eps; memcpy(&eps, rms->op_params, sizeof(float)); if (eps < 0.0f) return 0;
++    m.x = x; m.w = w; m.z = nullptr; m.dst = mul; m.eps = eps;
++    return 1;
++}
++
++void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_gated_match & m) {
++    const ggml_tensor * x = m.x;
++    const int64_t total = x->ne[1] * x->ne[2] * x->ne[3];
++    const dim3 grid((unsigned) ((total + 7) / 8)), block(256);
++    const ggml_cuda_kernel_launch_params lp(grid, block, 0, ctx.stream());
++    if (m.z) {
++        ggml_cuda_kernel_launch(rms_rows_f32<true>, lp,
++            (const float *) x->data, (const float *) m.w->data, (const float *) m.z->data, (float *) m.dst->data,
++            (int) x->ne[0], x->ne[1], x->ne[2], total,
++            (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps);
++    } else {
++        ggml_cuda_kernel_launch(rms_rows_f32<false>, lp,
++            (const float *) x->data, (const float *) m.w->data, (const float *) nullptr, (float *) m.dst->data,
++            (int) x->ne[0], x->ne[1], x->ne[2], total,
++            (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps);
++    }
++}
+diff --git a/ggml/src/ggml-cuda/norm-gated.cuh b/ggml/src/ggml-cuda/norm-gated.cuh
+new file mode 100644
+index 000000000..e8b5888dc
+--- /dev/null
++++ b/ggml/src/ggml-cuda/norm-gated.cuh
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include "common.cuh"
++
++// Narrow-row RMS norm (and its sigmoid-gated form), ported from the other solution's
++// norm-gated.cu (Phase-1 item 4 of wip/closing-the-gap).  The kernel processes 8 rows per
++// 256-thread block instead of the one-block-per-row rms_norm_f32<256>, which is
++// block-scheduling bound for the model's per-head norms (~786k rows of <= 256 columns).
++struct ggml_cuda_norm_gated_match {
++    const ggml_tensor * x;
++    const ggml_tensor * w;
++    const ggml_tensor * z;
++    ggml_tensor * dst;
++    float eps;
++    int pre = -1;   // node index of the gate MUL_MAT to compute first (or -1)
++};
++
++int  ggml_cuda_norm_gated_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_norm_gated_match & m);
++int  ggml_cuda_norm_rows_match_at (const ggml_cgraph * cgraph, int i, ggml_cuda_norm_gated_match & m);
++void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_gated_match & m);
+-- 
+2.55.0
+

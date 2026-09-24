@@ -1,8 +1,9 @@
 # `beta/mmb-general` — the `mmb` (bf16-WMMA dequant weight GEMM) campaign, in beta
 
-**Status: BETA (promoted from `wip/mmb-general` on 2026-09-21).  Not part of the delivery.**  This is
-the beta patch set: **12 patches**, verified `git am` **12/12** from the r12 fork point, applied tree
-**`bca69f23dd29acef2d8898c6fd492104e078eef1`**.  It is staged for the ~4–5 day beta window, after
+**Status: BETA (promoted from `wip/mmb-general` on 2026-09-21; consolidated with the `closing-the-gap`
+campaign on 2026-09-25).  Not part of the delivery.**  This is the beta patch set: **28 patches**,
+verified `git am` **28/28** from the **r13** delivery tree (`bb7b6d07…`), applied tree
+**`468c64963ae45e72367c73809efa7cc038217e8a`**.  It is staged for the ~4–5 day beta window, after
 which the maintainer decides whether it becomes a delivery block (the `AGENTS.md` promotion rule).
 
 > **Tester: start with [`BETA-TESTING.md`](BETA-TESTING.md)** — the gfx1151 final re-validation
@@ -13,12 +14,18 @@ which the maintainer decides whether it becomes a delivery block (the `AGENTS.md
 > **New session working the promotion: read [`HANDOVER.md`](HANDOVER.md)** — its "FOR THE NEXT
 > SESSION" brief is the self-contained handoff.  This file is the running (dated) record.
 
-**What is in the beta set.**  Patches `0001`–`0010` are the gfx1151-developed, gfx1201-portable core
-(the `mmb` GEMM, `qsa3`, the F32/tiny-M kernels, HC16, the indexer top-k, and the RDNA4 port + its
-per-arch policy table).  Patches `0011`–`0012` are the gfx1100 (RDNA3_0) deltas: enable `qsa3` on
-RDNA3_0, and default the F32 split tile off there.  A third gfx1100 patch — the experimental per-M
-`nwarps` rule — was **moved out** to [`../../wip/nwarps/`](../../wip/nwarps/) because it is
-default-OFF and breaks the `W=1..8` width-purity contract; that is the open impurity to investigate.
+**What is in the beta set.**  Patches `0001`–`0012` are the original gfx1151-developed,
+gfx1201/gfx1100-portable `mmb` core (the `mmb` GEMM, `qsa3`, the F32/tiny-M kernels, HC16, the
+indexer top-k, the RDNA4 fragment port + per-arch policy table, and the gfx1100 deltas).  Patches
+`0013`–`0028` are the `closing-the-gap` campaign work, folded into the set on 2026-09-25: the
+`hc_gate_mix` fusion, the GDN/PLE depthwise conv1d fusions, the narrow-row RMS norm fusion, the
+`-lzm auto` semantics, the HC BF16 streams, the indexer score fusions, the F32 eval-callback fix,
+the sparse MTP-draft attention, the QSA derived-indexer/crossover defaults, the per-context HC16
+state, the host-buffer input layer, the meta `graph_optimize` fix, the extended MMVQ band, and the
+tiny-CPU split-graph fix.  Ten of the closing patches were **folded into** the core patches whose
+code they extend (`0002`, `0004`, `0005`, `0007`, `0008`); the rest are appended in original order.
+The experimental per-M `nwarps` rule stays **moved out** in [`../../wip/nwarps/`](../../wip/nwarps/)
+because it is default-OFF and breaks the `W=1..8` width-purity contract.
 
 **Per-arch state at promotion:** gfx1151 = the development target (needs the beta re-validation);
 gfx1201 = fully validated (B1–B9 green, MTP included — [`gfx1201-s14-gates.md`](gfx1201-s14-gates.md));
@@ -33,6 +40,28 @@ speedup**.  Because it is arch-independent, the port is an apply-and-gate job: t
 baseline to beat is **2897 / 2713 / 2557 t/s** at pp32768/65536/98304 (3-GPU tensor, q8_0 KV,
 `-b/-ub 2048`), and the runbook is [`gfx1201-s14-gates.md`](gfx1201-s14-gates.md).  Use the preserved
 harness in [`tools/`](tools/README.md) — `ab-interleaved.sh` + `lbparse.py`.
+
+## Consolidation with `closing-the-gap` (2026-09-25)
+
+The set was **re-built on the r13 delivery** (`bb7b6d07…`) as the single consolidated campaign set:
+r13 + these 28 patches reproduces the combined tree that previously required r13 + the 12 beta
+patches + the 30 `wip/closing-the-gap/patches/` patches.  The applied tree is
+**`468c64963ae45e72367c73809efa7cc038217e8a`**, verified strict `git am` **28/28** on a fresh r13
+worktree (`wip/closing-the-gap/consolidation.md` is the full record).
+
+* Ten closing patches are folded into the core patch whose code they extend — `c0005`/`c0007` →
+  `0002`, `c0001`/`c0010` → `0004`, `c0014`/`c0016` → `0005`, `c0008`/`c0017`/`c0018` → `0007`,
+  `c0002` → `0008`; the rest are appended in original order as `0013`–`0028` (the input-layer,
+  sparse-MTP and MMVQ pairs are net-folded into one patch each).
+* The 28-patch set is **tree-identical** to the combined `gap-closing-denseband` tree
+  (`468c6496…`), so every campaign measurement carries over unchanged.
+* Re-gated on gfx1151 2026-09-25 (bit-identical tree): width probe `PASS` (row-0
+  `268e0673300b7a33`), `FLASH_ATTN_QSA` / `GATED_DELTA_NET` oracles OK, `plain == draft-mtp n3`
+  byte-identical.
+
+> **Beta window note.**  The original beta set was r12-based (`bca69f23…`); the consolidated set is
+> **r13-based**.  The apply recipe below (and in `BETA-TESTING.md` / `GROUPS.md`) now names the r13
+> delivery tree.  The gfx1151 re-validation of the *consolidated* set is still the beta-window task.
 
 ---
 

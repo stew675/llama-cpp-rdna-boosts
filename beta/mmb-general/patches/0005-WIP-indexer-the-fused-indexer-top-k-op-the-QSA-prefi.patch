@@ -1,0 +1,1692 @@
+From c548a6bb23128f184740e9a89f37a67f9840d307 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Sun, 20 Sep 2026 21:01:26 -0500
+Subject: [PATCH 05/28] WIP indexer: the fused indexer top-k op + the QSA
+ prefill score fusions
+
+Squashed theme commit (7 originals): the missing INDEXER_FILL entry in
+GGML_OP_NAME; the full-width count pass dropped (the gather's per-block g/e
+counts derive from the radix histograms); block-key sharing in the histograms
+and gather (additive==null); the block-level histogram path (blk_cells src +
+block-aligned partition); pass1 histogram bins accumulated per block instead of
+per cell; the block-pass visible-count atomic warp-reduced; and the gather's
+Hillis-Steele scan replaced by a warp-shuffle one.
+---
+ ggml/include/ggml.h                     |   1 +
+ ggml/src/ggml-cpu/ops.cpp               |  17 +-
+ ggml/src/ggml-cuda/indexer-topk.cu      | 671 +++++++++++++++++++++---
+ ggml/src/ggml-cuda/lightning-indexer.cu | 177 ++++++-
+ ggml/src/ggml.c                         |  11 +
+ src/llama-memory-hybrid-idx.cpp         | 111 ++++
+ src/llama-memory-hybrid-idx.h           |  14 +
+ src/models/qwen4exp.cpp                 | 300 +++++++++--
+ tests/test-backend-ops.cpp              |  11 +
+ 9 files changed, 1168 insertions(+), 145 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 2ba751eba..ef24629ce 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2588,6 +2588,7 @@ extern "C" {
+             struct ggml_tensor  * q_pos,
+             struct ggml_tensor  * blk_idx,
+             struct ggml_tensor  * blk_tail,
++            struct ggml_tensor  * blk_cells,
+             int                   k);
+ 
+     // Fused indexer block-pool + rms-norm (qwen4exp QSA): replaces the per-op chain
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 4dbf72e6f..cd34a30ed 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12656,6 +12656,7 @@ static void ggml_compute_forward_indexer_topk_impl(
+     const ggml_tensor * q_pos    = dst->src[4];
+     const ggml_tensor * blk_idx  = dst->src[5];
+     const ggml_tensor * blk_tail = dst->src[6];
++    const ggml_tensor * blk_cells = dst->src[7];
+ 
+     GGML_ASSERT(score->type    == GGML_TYPE_F32);
+     GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
+@@ -12669,11 +12670,17 @@ static void ggml_compute_forward_indexer_topk_impl(
+     const int64_t n_stream = score->ne[2];
+     const int64_t n_kv     = cell_blk->ne[0];
+ 
++    // [QSA_SCORE_BOUNDS] a trimmed score holds only the visible prefix, so cells of trimmed
++    // blocks (cell_blk[c] >= n_blocks) must not index it.  Under the bound's single-sequence
++    // precondition the cache is contiguous, so those cells are exactly c >= n_blocks*r.
++    const int64_t r_cells = (blk_cells != nullptr && n_blocks > 0) ? blk_cells->ne[0]/n_blocks : 0;
++    const int64_t n_cells = r_cells > 0 ? std::min<int64_t>(n_kv, n_blocks*r_cells) : n_kv;
++
+     const float  * score_d   = (const float  *) score->data;
+     const int    * cell_d    = (const int    *) cell_blk->data;
+     int          * dst_d     = (int          *) dst->data;
+ 
+-    std::vector<float> vals(n_kv);
++    std::vector<float> vals(n_cells);
+ 
+     // cell_blk is [n_kv, n_stream]: stream s rows at c + s*n_kv, s = row/n_tps
+     const int64_t s0 = 0;
+@@ -12713,24 +12720,24 @@ static void ggml_compute_forward_indexer_topk_impl(
+     // dst is [k, n_tps, 1, n_stream]; cell_blk is [n_kv, n_stream], so the
+     // stream stride of cell_blk matches a dst row stride of k cells
+     for (int64_t row = 0; row < n_tps*n_stream; ++row) {
+-        for (int64_t c = 0; c < n_kv; ++c) {
++        for (int64_t c = 0; c < n_cells; ++c) {
+             vals[c] = cell_value(c, row);
+         }
+ 
+         // the k-th largest value is the selection threshold
+-        const int64_t kn = std::min<int64_t>(k, n_kv);
++        const int64_t kn = std::min<int64_t>(k, n_cells);
+         std::nth_element(vals.begin(), vals.begin() + kn - 1, vals.end(),
+                 [](float a, float b) { return a > b; });
+         const float thr = vals[kn - 1];
+ 
+         int * row_dst = dst_d + row*k;
+         int pos = 0;
+-        for (int64_t c = 0; c < n_kv && pos < kn; ++c) {
++        for (int64_t c = 0; c < n_cells && pos < kn; ++c) {
+             if (cell_value(c, row) > thr) {
+                 row_dst[pos++] = (int) c;
+             }
+         }
+-        for (int64_t c = 0; c < n_kv && pos < kn; ++c) {
++        for (int64_t c = 0; c < n_cells && pos < kn; ++c) {
+             if (cell_value(c, row) == thr) {
+                 row_dst[pos++] = (int) c;
+             }
+diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
+index 1b9e63516..7a9bae5fa 100644
+--- a/ggml/src/ggml-cuda/indexer-topk.cu
++++ b/ggml/src/ggml-cuda/indexer-topk.cu
+@@ -54,6 +54,21 @@ struct indexer_topk_extra {
+     const int * blk_tail;   // I32 [n_tps, n_stream]
+ };
+ 
++// ordered key of a whole block when the additive is null: value = score[block] + derived bias.
++// every cell of the block shares it, so the histogram/gather evaluate it once per block.
++static __device__ __forceinline__ uint32_t indexer_topk_block_key(
++        const float * __restrict__ score,
++        const indexer_topk_extra extra,
++        int b, int t, int s, int n_blocks, int n_tps) {
++    float sc = score[b + t*n_blocks + s*n_blocks*n_tps];
++    if (extra.blk_idx != nullptr) {
++        const int bi = extra.blk_idx[b + s*n_blocks];
++        const int tail = extra.blk_tail[t + s*n_tps];
++        sc += bi < 0 ? -INFINITY : (bi >= tail ? 1e9f : 0.0f);
++    }
++    return indexer_topk_float_to_ordered(sc);
++}
++
+ template<typename kv_t>
+ static __device__ __forceinline__ float indexer_topk_value(
+         const float * __restrict__ score,
+@@ -109,9 +124,13 @@ static __global__ void indexer_topk_radix_histogram(
+     __syncthreads();
+ 
+     const indexer_topk_radix_state state = states[row];
+-    for (int col = row_block * BLOCK_SIZE + tid;
+-         col < ncols;
+-         col += blocks_per_row * BLOCK_SIZE) {
++    // contiguous column range per block (instead of the old interleaved stride): this lets the
++    // per-block histograms yield the gather's per-block greater/equal counts directly, so the
++    // old full-width count pass is gone (see indexer_topk_hist_accum)
++    const int chunk = (ncols + blocks_per_row - 1) / blocks_per_row;
++    const int col0 = row_block * chunk;
++    const int col1 = min(col0 + chunk, ncols);
++    for (int col = col0 + tid; col < col1; col += BLOCK_SIZE) {
+         const uint32_t key = indexer_topk_float_to_ordered(
+                 indexer_topk_value(score, cell_blk, additive, extra, col, t, s, n_blocks, n_tps, n_kv));
+         if ((key & state.prefix_mask) == state.prefix) {
+@@ -125,6 +144,77 @@ static __global__ void indexer_topk_radix_histogram(
+     block_histograms[histogram_offset + tid] = histogram[tid];
+ }
+ 
++// block-granularity histogram: with no additive the per-cell value is
++// `score[cell_blk[c]] + derived-bias` and the visibility is a per-cell predicate, so every cell of
++// one block shares one ordered key.  each thread walks a contiguous run of VEC cells and recomputes
++// the block key only when the block changes (the common `ratio == 4` case: once per thread step),
++// which removes the per-cell score gather.  bit-identical to the cell-level kernel -- only the
++// integer bin counts matter, and they are the same.
++template<int BLOCK_SIZE, int RADIX_BITS, int VEC>
++static __global__ void indexer_topk_radix_histogram_grouped(
++        const float * __restrict__ score,
++        const int   * __restrict__ cell_blk,
++        const indexer_topk_extra extra,
++        const indexer_topk_radix_state * __restrict__ states,
++        int * __restrict__ block_histograms,
++        int ncols, int n_tps, int n_blocks, int n_kv,
++        int blocks_per_row,
++        int shift) {
++    constexpr int NBINS = 1 << RADIX_BITS;
++
++    const int row = blockIdx.x / blocks_per_row;
++    const int row_block = blockIdx.x % blocks_per_row;
++    const int tid = threadIdx.x;
++    const int t = row % n_tps;
++    const int s = row / n_tps;
++    __shared__ int histogram[NBINS];
++
++    for (int i = tid; i < NBINS; i += BLOCK_SIZE) {
++        histogram[i] = 0;
++    }
++    __syncthreads();
++
++    const indexer_topk_radix_state state = states[row];
++    const uint32_t key_inf = indexer_topk_float_to_ordered(-INFINITY);
++    const int q    = extra.q_pos    != nullptr ? extra.q_pos[t + s*n_tps]    : 0;
++    const int nskv = s*n_kv;
++
++    const int chunk = (ncols + blocks_per_row - 1) / blocks_per_row;
++    const int col0 = row_block * chunk;
++    const int col1 = min(col0 + chunk, ncols);
++    for (int base = col0 + tid*VEC; base < col1; base += BLOCK_SIZE*VEC) {
++        int      cur_b   = -1;
++        uint32_t cur_key = key_inf;
++        #pragma unroll
++        for (int v = 0; v < VEC; ++v) {
++            const int c = base + v;
++            if (c >= col1) {
++                break;
++            }
++            const int b = cell_blk[c + nskv];
++            if (b != cur_b) {
++                cur_b = b;
++                cur_key = indexer_topk_block_key(score, extra, b, t, s, n_blocks, n_tps);
++            }
++            uint32_t key = cur_key;
++            if (extra.cell_pos != nullptr) {
++                const int cp = extra.cell_pos[c + nskv];
++                if (cp < 0 || cp > q) {
++                    key = key_inf;
++                }
++            }
++            if ((key & state.prefix_mask) == state.prefix) {
++                atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
++            }
++        }
++    }
++    __syncthreads();
++
++    const size_t histogram_offset =
++        ((size_t) row * blocks_per_row + row_block) * NBINS;
++    block_histograms[histogram_offset + tid] = histogram[tid];
++}
++
+ template<int BLOCK_SIZE, int RADIX_BITS>
+ static __global__ void indexer_topk_radix_select(
+         const int * __restrict__ block_histograms,
+@@ -166,46 +256,48 @@ static __global__ void indexer_topk_radix_select(
+ // (and, at the rank boundary, which tied cells made it) varied run to run.  the
+ // QSA kernel's online softmax is order-sensitive at the ulp level, and this
+ // model's f16-state recurrences amplify that into llama-cli-visible
+-// nondeterminism.  Instead, cells are written in ascending column order:
+-// per (row, block-of-256-cols) counts, an exclusive prefix scan over the
+-// blocks, then a deterministic per-thread placement (warp ballot + block scan).
+-
+-template<typename kv_t>
+-static __global__ void indexer_topk_count(
+-        const float * __restrict__ score,
+-        const int   * __restrict__ cell_blk,
+-        const kv_t  * __restrict__ additive,
+-        const indexer_topk_extra extra,
++// nondeterminism.  Instead, cells are written in ascending column order.
++//
++// The gather's per-block greater/equal counts no longer need a second full-width
++// key-evaluation pass: a cell with key > the final prefix is greater exactly at
++// the first byte where it differs, so it lands in a bin above the selected one in
++// exactly one radix pass, and the equal cells are the selected bin of the last
++// pass.  Accumulating each pass's suffix counts into g_cnt (and the last pass's
++// selected bin into e_cnt) removes the old `indexer_topk_count` pass entirely.
++
++template<int RADIX_BITS>
++static __global__ void indexer_topk_hist_accum(
++        const int * __restrict__ block_histograms,
+         const indexer_topk_radix_state * __restrict__ states,
+         int * __restrict__ g_cnt, int * __restrict__ e_cnt,
+-        int ncols, int n_tps, int n_blocks, int n_kv,
+-        int blocks_per_row) {
+-    constexpr int BLOCK_SIZE = 256;
+-    const int row = blockIdx.x / blocks_per_row;
+-    const int b   = blockIdx.x % blocks_per_row;
+-    const int tid = threadIdx.x;
+-    const int t = row % n_tps;
+-    const int s = row / n_tps;
+-    const int col = b*BLOCK_SIZE + tid;
+-
+-    int g = 0, e = 0;
+-    if (col < ncols) {
+-        const uint32_t key = indexer_topk_float_to_ordered(
+-                indexer_topk_value(score, cell_blk, additive, extra, col, t, s, n_blocks, n_tps, n_kv));
+-        g = (key >  states[row].prefix) ? 1 : 0;
+-        e = (key == states[row].prefix) ? 1 : 0;
++        int nrows, int blocks_per_row, int shift) {
++    constexpr int NBINS = 1 << RADIX_BITS;   // == blockDim.x
++    const int idx = blockIdx.x;
++    const int row = idx / blocks_per_row;
++    const int bin = threadIdx.x;
++    const int sel = (int) ((states[row].prefix >> shift) & (NBINS - 1));
++    const int * hist = block_histograms + (size_t) idx * NBINS;
++
++    // coalesced read of the block's bins, summed with a warp shuffle reduction
++    const int v = (bin > sel) ? hist[bin] : 0;
++    __shared__ int warpsum[NBINS / 32];
++    int s = v;
++    for (int off = 16; off > 0; off >>= 1) {
++        s += __shfl_down(s, off);
+     }
+-    __shared__ int sg[BLOCK_SIZE], se[BLOCK_SIZE];
+-    sg[tid] = g;
+-    se[tid] = e;
+-    for (int off = BLOCK_SIZE/2; off > 0; off >>= 1) {
+-        __syncthreads();
+-        if (tid < off) { sg[tid] += sg[tid + off]; se[tid] += se[tid + off]; }
++    if ((bin & 31) == 0) {
++        warpsum[bin >> 5] = s;
+     }
+     __syncthreads();
+-    if (tid == 0) {
+-        g_cnt[row*blocks_per_row + b] = sg[0];
+-        e_cnt[row*blocks_per_row + b] = se[0];
++    if (bin == 0) {
++        int total = 0;
++        for (int w = 0; w < NBINS / 32; ++w) {
++            total += warpsum[w];
++        }
++        g_cnt[idx] += total;
++        if (shift == 0) {
++            e_cnt[idx] = hist[sel];
++        }
+     }
+ }
+ 
+@@ -249,8 +341,11 @@ static __global__ void indexer_topk_base_scan(
+     }
+ }
+ 
++// one block per (row, coarse column range).  the per-block greater/equal counts
++// (from indexer_topk_hist_accum) give the base, and a running carry over the
++// range's 256-column tiles keeps the ascending-column placement exact.
+ template<typename kv_t>
+-static __global__ void indexer_topk_deterministic_write(
++static __global__ void indexer_topk_write_blocks(
+         const float * __restrict__ score,
+         const int   * __restrict__ cell_blk,
+         const kv_t  * __restrict__ additive,
+@@ -266,42 +361,353 @@ static __global__ void indexer_topk_deterministic_write(
+     const int tid = threadIdx.x;
+     const int t = row % n_tps;
+     const int s = row / n_tps;
+-    const int col = b*BLOCK_SIZE + tid;
+ 
+-    int g = 0, e = 0;
+-    if (col < ncols) {
+-        const uint32_t key = indexer_topk_float_to_ordered(
+-                indexer_topk_value(score, cell_blk, additive, extra, col, t, s, n_blocks, n_tps, n_kv));
+-        g = (key >  states[row].prefix) ? 1 : 0;
+-        e = (key == states[row].prefix) ? 1 : 0;
+-    }
+-    // inclusive prefix over the whole block in shared: gives each selected cell a
+-    // deterministic position (thread order = ascending column order within the block)
++    const int chunk = (ncols + blocks_per_row - 1) / blocks_per_row;
++    const int col0  = b * chunk;
++    const int col1  = min(col0 + chunk, ncols);
++
++    int * row_dst = dst + (size_t) row*k;
++    const int g_base_b = g_base[row*blocks_per_row + b];
++    const int e_base_b = e_base[row*blocks_per_row + b];
++    const int rank = states[row].rank;
++
+     __shared__ int sg[BLOCK_SIZE], se[BLOCK_SIZE];
+-    sg[tid] = g;
+-    se[tid] = e;
+-    for (int off = 1; off < BLOCK_SIZE; off <<= 1) {
++    __shared__ int carry_g, carry_e;
++    if (tid == 0) { carry_g = 0; carry_e = 0; }
++    __syncthreads();
++    for (int c0 = col0; c0 < col1; c0 += BLOCK_SIZE) {
++        // read the carry through shared memory: a per-thread register would not be visible
++        // to the other threads after the previous tile's update
++        const int running_g = carry_g;
++        const int running_e = carry_e;
++        const int col = c0 + tid;
++        int g = 0, e = 0;
++        if (col < col1) {
++            const uint32_t key = indexer_topk_float_to_ordered(
++                    indexer_topk_value(score, cell_blk, additive, extra, col, t, s, n_blocks, n_tps, n_kv));
++            g = (key >  states[row].prefix) ? 1 : 0;
++            e = (key == states[row].prefix) ? 1 : 0;
++        }
++        sg[tid] = g;
++        se[tid] = e;
++        for (int off = 1; off < BLOCK_SIZE; off <<= 1) {
++            __syncthreads();
++            const int vg = (tid >= off) ? sg[tid - off] : 0;
++            const int ve = (tid >= off) ? se[tid - off] : 0;
++            __syncthreads();
++            if (tid >= off) { sg[tid] += vg; se[tid] += ve; }
++        }
+         __syncthreads();
+-        const int vg = (tid >= off) ? sg[tid - off] : 0;
+-        const int ve = (tid >= off) ? se[tid - off] : 0;
++        if (g) {
++            row_dst[g_base_b + running_g + sg[tid] - 1] = col;
++        } else if (e) {
++            const int pos = se[tid] - 1;
++            if (e_base_b + running_e + pos < rank) {
++                row_dst[k - rank + e_base_b + running_e + pos] = col;
++            }
++        }
++        __syncthreads();
++        if (tid == BLOCK_SIZE - 1) {
++            carry_g += sg[BLOCK_SIZE - 1];
++            carry_e += se[BLOCK_SIZE - 1];
++        }
+         __syncthreads();
+-        if (tid >= off) { sg[tid] += vg; se[tid] += ve; }
+     }
+-    __syncthreads();
++}
++
++// block-key-sharing gather for the additive==null case.  each thread walks VEC contiguous cells
++// and caches the block key; the block scan then runs over the per-thread totals (the cells stay in
++// ascending column order across threads) so the placement is identical to indexer_topk_write_blocks.
++template<int VEC>
++static __global__ void indexer_topk_write_blocks_grouped(
++        const float * __restrict__ score,
++        const int   * __restrict__ cell_blk,
++        const indexer_topk_extra extra,
++        const indexer_topk_radix_state * __restrict__ states,
++        const int * __restrict__ g_base, const int * __restrict__ e_base,
++        int * __restrict__ dst,
++        int ncols, int n_tps, int n_blocks, int n_kv, int k,
++        int blocks_per_row, int chunk_in) {
++    constexpr int BLOCK_SIZE = 256;
++    const int row = blockIdx.x / blocks_per_row;
++    const int b   = blockIdx.x % blocks_per_row;
++    const int tid = threadIdx.x;
++    const int t = row % n_tps;
++    const int s = row / n_tps;
++
++    const int chunk = chunk_in > 0 ? chunk_in : (ncols + blocks_per_row - 1) / blocks_per_row;
++    const int col0  = b * chunk;
++    const int col1  = min(col0 + chunk, ncols);
+ 
+     int * row_dst = dst + (size_t) row*k;
+     const int g_base_b = g_base[row*blocks_per_row + b];
+     const int e_base_b = e_base[row*blocks_per_row + b];
+-    if (g) {
+-        // exclusive position within this block's greater cells = inclusive - 1
+-        row_dst[g_base_b + sg[tid] - 1] = col;
+-    } else if (e) {
+-        const int pos = se[tid] - 1;   // exclusive position within this block's equal cells
+-        const int rank = states[row].rank;
+-        if (e_base_b + pos < rank) {
+-            row_dst[k - rank + e_base_b + pos] = col;
++    const int rank = states[row].rank;
++    const uint32_t prefix  = states[row].prefix;
++    const uint32_t key_inf = indexer_topk_float_to_ordered(-INFINITY);
++    const int q    = extra.q_pos != nullptr ? extra.q_pos[t + s*n_tps] : 0;
++    const int nskv = s*n_kv;
++
++    __shared__ int sg[BLOCK_SIZE], se[BLOCK_SIZE];
++    __shared__ int carry_g, carry_e;
++    if (tid == 0) { carry_g = 0; carry_e = 0; }
++    __syncthreads();
++    for (int t0 = col0; t0 < col1; t0 += BLOCK_SIZE*VEC) {
++        const int running_g = carry_g;
++        const int running_e = carry_e;
++        const int c0 = t0 + tid*VEC;
++        int lg = 0, le = 0;
++        int gv[VEC], ev[VEC], lgpre[VEC], lepre[VEC];
++        int cur_b = -1;
++        uint32_t cur_key = key_inf;
++        #pragma unroll
++        for (int v = 0; v < VEC; ++v) {
++            const int c = c0 + v;
++            int g = 0, e = 0;
++            if (c < col1) {
++                const int bb = cell_blk[c + nskv];
++                if (bb != cur_b) {
++                    cur_b = bb;
++                    cur_key = indexer_topk_block_key(score, extra, bb, t, s, n_blocks, n_tps);
++                }
++                uint32_t key = cur_key;
++                if (extra.cell_pos != nullptr) {
++                    const int cp = extra.cell_pos[c + nskv];
++                    if (cp < 0 || cp > q) {
++                        key = key_inf;
++                    }
++                }
++                g = (key >  prefix) ? 1 : 0;
++                e = (key == prefix) ? 1 : 0;
++            }
++            gv[v] = g; ev[v] = e;
++            lgpre[v] = lg; lepre[v] = le;
++            lg += g; le += e;
+         }
++        // inclusive block scan of (g_count, e_count).  The Hillis-Steele form this replaces ran
++        // 8 steps x 2 __syncthreads (~19 barriers per 1024-cell tile) and dominated the kernel --
++        // an unselected-block skip in the cell loop measured NO gain, which is what pointed here.
++        // Warp-shuffle scan + a 2-barrier offset pass; integer sums are associative so the
++        // prefix values (and therefore the placement) are identical.
++        int wg = lg, we = le;
++#pragma unroll
++        for (int off = 1; off < 32; off <<= 1) {
++            const int vg = __shfl_up(wg, off);
++            const int ve = __shfl_up(we, off);
++            if ((tid & 31) >= off) { wg += vg; we += ve; }
++        }
++        __shared__ int swg[BLOCK_SIZE / 32], swe[BLOCK_SIZE / 32];
++        if ((tid & 31) == 31) { swg[tid >> 5] = wg; swe[tid >> 5] = we; }
++        __syncthreads();
++        if (tid < BLOCK_SIZE / 32) {
++            int ag = 0, ae = 0;
++            for (int i = 0; i < tid; ++i) { ag += swg[i]; ae += swe[i]; }
++            swg[tid] = ag; swe[tid] = ae;
++        }
++        __syncthreads();
++        sg[tid] = wg + swg[tid >> 5];
++        se[tid] = we + swe[tid >> 5];
++        const int tex_g = sg[tid] - lg;
++        const int tex_e = se[tid] - le;
++        #pragma unroll
++        for (int v = 0; v < VEC; ++v) {
++            const int c = c0 + v;
++            if (c >= col1) {
++                continue;
++            }
++            if (gv[v]) {
++                row_dst[g_base_b + running_g + tex_g + lgpre[v]] = c;
++            } else if (ev[v]) {
++                const int pos = tex_e + lepre[v];
++                if (e_base_b + running_e + pos < rank) {
++                    row_dst[k - rank + e_base_b + running_e + pos] = c;
++                }
++            }
++        }
++        __syncthreads();
++        if (tid == BLOCK_SIZE - 1) {
++            carry_g += sg[BLOCK_SIZE - 1];
++            carry_e += se[BLOCK_SIZE - 1];
++        }
++        __syncthreads();
++    }
++}
++
++// ---------------------------------------------------------------------------
++// block-level histogram path (additive == nullptr, derived default).
++//
++// A block-aligned partition: hist-block h covers blocks [h*bchunk, (h+1)*bchunk) and the cells
++// [h*bchunk*r, min((h+1)*bchunk*r, n_kv)).  Pass 1 is cell-level (it must see every cell to count
++// per-block visibility) and accumulates wvis[row*n_blocks + b] = the block's visible-cell count.
++// Passes 2..4 are block-level: they walk blocks, read wvis, and bin the count at the block key, so
++// three of the four radix passes do ~n_blocks work instead of ~n_kv.  The gather stays cell-level
++// (so its ascending-column output order is unchanged); its partition uses the same chunk.
++
++template<int BLOCK_SIZE, int RADIX_BITS, int VEC>
++static __global__ void indexer_topk_histogram_pass1(
++        const float * __restrict__ score,
++        const int   * __restrict__ cell_blk,
++        const indexer_topk_extra extra,
++        const indexer_topk_radix_state * __restrict__ states,
++        int * __restrict__ block_histograms,
++        int * __restrict__ wvis,
++        int ncols, int n_tps, int n_blocks, int n_kv,
++        int blocks_per_row, int bchunk, int r,
++        int shift) {
++    constexpr int NBINS = 1 << RADIX_BITS;
++    const int row = blockIdx.x / blocks_per_row;
++    const int hb  = blockIdx.x % blocks_per_row;
++    const int tid = threadIdx.x;
++    const int t = row % n_tps;
++    const int s = row / n_tps;
++    __shared__ int histogram[NBINS];
++    for (int i = tid; i < NBINS; i += BLOCK_SIZE) {
++        histogram[i] = 0;
+     }
++    __syncthreads();
++
++    const indexer_topk_radix_state state = states[row];
++    const uint32_t key_inf = indexer_topk_float_to_ordered(-INFINITY);
++    const int q    = extra.q_pos != nullptr ? extra.q_pos[t + s*n_tps] : 0;
++    const int nskv = s*n_kv;
++    int * row_wvis = wvis + (size_t) row * n_blocks;
++
++    // every cell of a block shares the block key, and every invisible cell shares key_inf, so a
++    // whole run bins into at most two bins.  accumulate per block (and one per-thread pending
++    // counter for the invisible key_inf bin) and flush with one atomic per block instead of one
++    // atomic per cell.  the integer bin counts are identical -- only the atomic traffic shrinks.
++    const int inf_bin = ((key_inf & state.prefix_mask) == state.prefix)
++            ? (int) ((key_inf >> shift) & (NBINS - 1)) : -1;
++    int inf_pending = 0;
++
++    const int col0 = hb * bchunk * r;
++    const int col1 = min(col0 + bchunk * r, ncols);
++    for (int base = col0 + tid*VEC; base < col1; base += BLOCK_SIZE*VEC) {
++        int      cur_b   = -1;
++        int      cur_w   = 0;
++        int      cur_h   = 0;
++        int      cur_bin = 0;
++        bool     cur_match = false;
++        #pragma unroll
++        for (int v = 0; v < VEC; ++v) {
++            const int c = base + v;
++            if (c >= col1) {
++                break;
++            }
++            const int b = cell_blk[c + nskv];
++            if (b != cur_b) {
++                if (cur_b >= 0) {
++                    atomicAdd(&row_wvis[cur_b], cur_w);
++                    if (cur_match && cur_h > 0) {
++                        atomicAdd(&histogram[cur_bin], cur_h);
++                    }
++                }
++                cur_b     = b;
++                cur_w     = 0;
++                cur_h     = 0;
++                const uint32_t cur_key = indexer_topk_block_key(score, extra, b, t, s, n_blocks, n_tps);
++                cur_match = (cur_key & state.prefix_mask) == state.prefix;
++                cur_bin   = (int) ((cur_key >> shift) & (NBINS - 1));
++            }
++            bool vis = true;
++            if (extra.cell_pos != nullptr) {
++                const int cp = extra.cell_pos[c + nskv];
++                vis = (cp >= 0 && cp <= q);
++            }
++            if (vis) {
++                cur_w += 1;
++                if (cur_match) {
++                    cur_h += 1;
++                }
++            } else if (inf_bin >= 0) {
++                inf_pending += 1;
++            }
++        }
++        if (cur_b >= 0) {
++            atomicAdd(&row_wvis[cur_b], cur_w);
++            if (cur_match && cur_h > 0) {
++                atomicAdd(&histogram[cur_bin], cur_h);
++            }
++        }
++    }
++    if (inf_pending > 0) {
++        atomicAdd(&histogram[inf_bin], inf_pending);
++    }
++    __syncthreads();
++    const size_t off = ((size_t) row * blocks_per_row + hb) * NBINS;
++    block_histograms[off + tid] = histogram[tid];
++}
++
++template<int BLOCK_SIZE, int RADIX_BITS>
++static __global__ void indexer_topk_histogram_blocks(
++        const float * __restrict__ score,
++        const indexer_topk_extra extra,
++        const indexer_topk_radix_state * __restrict__ states,
++        const int * __restrict__ wvis,
++        int * __restrict__ block_histograms,
++        int ncols, int n_tps, int n_blocks, int n_kv,
++        int blocks_per_row, int bchunk, int r,
++        int shift) {
++    constexpr int NBINS = 1 << RADIX_BITS;
++    const int row = blockIdx.x / blocks_per_row;
++    const int hb  = blockIdx.x % blocks_per_row;
++    const int tid = threadIdx.x;
++    const int t = row % n_tps;
++    const int s = row / n_tps;
++    __shared__ int histogram[NBINS];
++    __shared__ int s_sumw;
++    for (int i = tid; i < NBINS; i += BLOCK_SIZE) {
++        histogram[i] = 0;
++    }
++    if (tid == 0) {
++        s_sumw = 0;
++    }
++    __syncthreads();
++
++    const indexer_topk_radix_state state = states[row];
++    const uint32_t key_inf = indexer_topk_float_to_ordered(-INFINITY);
++    const int nsblk = s*n_blocks;
++    const int * row_wvis = wvis + (size_t) row * n_blocks;
++
++    const int B0 = hb * bchunk;
++    const int B1 = min(B0 + bchunk, n_blocks);
++    int mysum = 0;
++    for (int b = B0 + tid; b < B1; b += BLOCK_SIZE) {
++        if (extra.blk_idx[b + nsblk] == -1) {
++            continue;   // incomplete block: no cells
++        }
++        const int w = row_wvis[b];
++        mysum += w;
++        if (w > 0) {
++            const uint32_t key = indexer_topk_block_key(score, extra, b, t, s, n_blocks, n_tps);
++            if ((key & state.prefix_mask) == state.prefix) {
++                atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], w);
++            }
++        }
++    }
++    // warp-reduce mysum, then one atomic per warp: a same-address atomicAdd from every thread
++    // serializes (256 per CU per pass) and dominated this kernel.  integer sum is order-free.
++    int ws = mysum;
++    #pragma unroll
++    for (int off = 16; off > 0; off >>= 1) {
++        ws += __shfl_down(ws, off);
++    }
++    if ((tid & 31) == 0) {
++        atomicAdd(&s_sumw, ws);
++    }
++    __syncthreads();
++    if (tid == 0) {
++        // every cell in [B0*r, min(B1*r, n_kv)) belongs to one of this range's blocks; those not
++        // in `wvis` are invisible and carry the -inf key
++        const int range_cells = max(0, min(B1 * r, n_kv) - B0 * r);
++        const int inv = range_cells - s_sumw;
++        if (inv > 0 && (key_inf & state.prefix_mask) == state.prefix) {
++            atomicAdd(&histogram[(key_inf >> shift) & (NBINS - 1)], inv);
++        }
++    }
++    __syncthreads();
++    const size_t off = ((size_t) row * blocks_per_row + hb) * NBINS;
++    block_histograms[off + tid] = histogram[tid];
+ }
+ 
+ template<typename kv_t>
+@@ -310,6 +716,7 @@ static void indexer_topk_radix_cuda(
+         const float * score, const int * cell_blk, const kv_t * additive,
+         const indexer_topk_extra extra,
+         int * dst, int ncols, int nrows, int n_tps, int n_blocks, int n_kv, int k,
++        bool grouped,
+         cudaStream_t stream) {
+     constexpr int BLOCK_SIZE = 256;
+     constexpr int RADIX_BITS = 8;
+@@ -318,43 +725,123 @@ static void indexer_topk_radix_cuda(
+ 
+     ggml_cuda_pool_alloc<indexer_topk_radix_state> states_alloc(pool, nrows);
+     ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
++    ggml_cuda_pool_alloc<int> gc_alloc(pool, (size_t) nrows * blocks_per_row);
++    ggml_cuda_pool_alloc<int> ec_alloc(pool, (size_t) nrows * blocks_per_row);
++    ggml_cuda_pool_alloc<int> gb_alloc(pool, (size_t) nrows * blocks_per_row);
++    ggml_cuda_pool_alloc<int> eb_alloc(pool, (size_t) nrows * blocks_per_row);
+     indexer_topk_radix_state * states = states_alloc.get();
+     int * histograms = histograms_alloc.get();
++    int * g_cnt  = gc_alloc.get();
++    int * e_cnt  = ec_alloc.get();
++    int * g_base = gb_alloc.get();
++    int * e_base = eb_alloc.get();
+ 
+     indexer_topk_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows, k);
++    (void) cudaMemsetAsync(g_cnt, 0, (size_t) nrows * blocks_per_row * sizeof(int), stream);
+ 
+     const dim3 row_grid(blocks_per_row * nrows);
+     for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+-        indexer_topk_radix_histogram<BLOCK_SIZE, RADIX_BITS, kv_t>
+-            <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+-                score, cell_blk, additive, extra, states, histograms,
+-                ncols, n_tps, n_blocks, n_kv, blocks_per_row, shift);
++        if (grouped) {
++            indexer_topk_radix_histogram_grouped<BLOCK_SIZE, RADIX_BITS, 4>
++                <<<row_grid, BLOCK_SIZE, 0, stream>>>(
++                    score, cell_blk, extra, states, histograms,
++                    ncols, n_tps, n_blocks, n_kv, blocks_per_row, shift);
++        } else {
++            indexer_topk_radix_histogram<BLOCK_SIZE, RADIX_BITS, kv_t>
++                <<<row_grid, BLOCK_SIZE, 0, stream>>>(
++                    score, cell_blk, additive, extra, states, histograms,
++                    ncols, n_tps, n_blocks, n_kv, blocks_per_row, shift);
++        }
+         indexer_topk_radix_select<BLOCK_SIZE, RADIX_BITS>
+             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
++        indexer_topk_hist_accum<RADIX_BITS>
++            <<<(size_t) nrows * blocks_per_row, NBINS, 0, stream>>>(
++                histograms, states, g_cnt, e_cnt, nrows, blocks_per_row, shift);
+     }
+ 
+     // deterministic gather: ascending column order, no atomics (see kernels above)
+     if (k <= 0 || nrows == 0) {
+         return;
+     }
+-    const int cbpr = (ncols + BLOCK_SIZE - 1) / BLOCK_SIZE;   // count/write blocks per row
+-    ggml_cuda_pool_alloc<int> gc_alloc(pool, (size_t) nrows * cbpr);
+-    ggml_cuda_pool_alloc<int> ec_alloc(pool, (size_t) nrows * cbpr);
+-    ggml_cuda_pool_alloc<int> gb_alloc(pool, (size_t) nrows * cbpr);
+-    ggml_cuda_pool_alloc<int> eb_alloc(pool, (size_t) nrows * cbpr);
++    indexer_topk_base_scan<<<nrows, BLOCK_SIZE, 0, stream>>>(
++            g_cnt, e_cnt, g_base, e_base, nrows, blocks_per_row);
++    if (grouped) {
++        indexer_topk_write_blocks_grouped<4><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
++                score, cell_blk, extra, states, g_base, e_base, dst,
++                ncols, n_tps, n_blocks, n_kv, k, blocks_per_row, 0);
++    } else {
++        indexer_topk_write_blocks<kv_t><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
++                score, cell_blk, additive, extra, states, g_base, e_base, dst,
++                ncols, n_tps, n_blocks, n_kv, k, blocks_per_row);
++    }
++}
++
++static void indexer_topk_radix_cuda_blocks(
++        ggml_cuda_pool & pool,
++        const float * score, const int * cell_blk,
++        const indexer_topk_extra extra,
++        int * dst, int ncols, int nrows, int n_tps, int n_blocks, int n_kv, int k,
++        int r, cudaStream_t stream) {
++    constexpr int BLOCK_SIZE = 256;
++    constexpr int RADIX_BITS = 8;
++    constexpr int NBINS = 1 << RADIX_BITS;
++    const int blocks_per_row = std::min((n_blocks + 1023) / 1024, 8);
++    const int bchunk = (n_blocks + blocks_per_row - 1) / blocks_per_row;
++
++    // [QSA_SCORE_BOUNDS] a trimmed score holds only the visible prefix, so cells of trimmed blocks
++    // (cell_blk[c] >= n_blocks) must not be read.  Under the bound's single-sequence precondition
++    // the cache is contiguous, so those cells are exactly c >= n_blocks*r; clamping the cell range
++    // keeps pass1, the block passes and the gather inside the valid prefix.  When nothing is
++    // trimmed n_blocks*r >= n_kv, so this is the identity.
++    const int n_cells = std::min(n_kv, n_blocks*r);
++
++    ggml_cuda_pool_alloc<indexer_topk_radix_state> states_alloc(pool, nrows);
++    ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
++    ggml_cuda_pool_alloc<int> wvis_alloc(pool, (size_t) nrows * n_blocks);
++    ggml_cuda_pool_alloc<int> gc_alloc(pool, (size_t) nrows * blocks_per_row);
++    ggml_cuda_pool_alloc<int> ec_alloc(pool, (size_t) nrows * blocks_per_row);
++    ggml_cuda_pool_alloc<int> gb_alloc(pool, (size_t) nrows * blocks_per_row);
++    ggml_cuda_pool_alloc<int> eb_alloc(pool, (size_t) nrows * blocks_per_row);
++    indexer_topk_radix_state * states = states_alloc.get();
++    int * histograms = histograms_alloc.get();
++    int * wvis = wvis_alloc.get();
+     int * g_cnt  = gc_alloc.get();
+     int * e_cnt  = ec_alloc.get();
+     int * g_base = gb_alloc.get();
+     int * e_base = eb_alloc.get();
+ 
+-    indexer_topk_count<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
+-            score, cell_blk, additive, extra, states, g_cnt, e_cnt,
+-            ncols, n_tps, n_blocks, n_kv, cbpr);
++    indexer_topk_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows, k);
++    (void) cudaMemsetAsync(wvis,  0, (size_t) nrows * n_blocks * sizeof(int), stream);
++    (void) cudaMemsetAsync(g_cnt, 0, (size_t) nrows * blocks_per_row * sizeof(int), stream);
++
++    const dim3 row_grid((size_t) blocks_per_row * nrows);
++    for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
++        if (shift == 32 - RADIX_BITS) {
++            indexer_topk_histogram_pass1<BLOCK_SIZE, RADIX_BITS, 4>
++                <<<row_grid, BLOCK_SIZE, 0, stream>>>(
++                    score, cell_blk, extra, states, histograms, wvis,
++                    n_cells, n_tps, n_blocks, n_cells, blocks_per_row, bchunk, r, shift);
++        } else {
++            indexer_topk_histogram_blocks<BLOCK_SIZE, RADIX_BITS>
++                <<<row_grid, BLOCK_SIZE, 0, stream>>>(
++                    score, extra, states, wvis, histograms,
++                    n_cells, n_tps, n_blocks, n_cells, blocks_per_row, bchunk, r, shift);
++        }
++        indexer_topk_radix_select<BLOCK_SIZE, RADIX_BITS>
++            <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
++        indexer_topk_hist_accum<RADIX_BITS>
++            <<<(size_t) nrows * blocks_per_row, NBINS, 0, stream>>>(
++                histograms, states, g_cnt, e_cnt, nrows, blocks_per_row, shift);
++    }
++
++    if (k <= 0 || nrows == 0) {
++        return;
++    }
+     indexer_topk_base_scan<<<nrows, BLOCK_SIZE, 0, stream>>>(
+-            g_cnt, e_cnt, g_base, e_base, nrows, cbpr);
+-    indexer_topk_deterministic_write<kv_t><<<(size_t) cbpr * nrows, BLOCK_SIZE, 0, stream>>>(
+-            score, cell_blk, additive, extra, states, g_base, e_base, dst,
+-            ncols, n_tps, n_blocks, n_kv, k, cbpr);
++            g_cnt, e_cnt, g_base, e_base, nrows, blocks_per_row);
++    indexer_topk_write_blocks_grouped<4><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
++            score, cell_blk, extra, states, g_base, e_base, dst,
++            n_cells, n_tps, n_blocks, n_cells, k, blocks_per_row, bchunk * r);
+ }
+ 
+ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+@@ -365,6 +852,7 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     const ggml_tensor * q_pos    = dst->src[4];
+     const ggml_tensor * blk_idx  = dst->src[5];
+     const ggml_tensor * blk_tail = dst->src[6];
++    const ggml_tensor * blk_cells = dst->src[7];
+     const float * score_d    = (const float *) score->data;
+     const int   * cell_blk_d = (const int  *) cell_blk->data;
+     int *         dst_d      = (int *) dst->data;
+@@ -386,6 +874,7 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     GGML_ASSERT(additive == nullptr || ggml_is_contiguous(additive));
+     GGML_ASSERT(cell_pos == nullptr || (ggml_is_contiguous(cell_pos) && ggml_is_contiguous(q_pos)));
+     GGML_ASSERT(blk_idx  == nullptr || (ggml_is_contiguous(blk_idx)  && ggml_is_contiguous(blk_tail)));
++    GGML_ASSERT(blk_cells == nullptr || blk_cells->type == GGML_TYPE_I32);
+     GGML_ASSERT(ggml_is_contiguous(dst));
+ 
+     const int n_blocks = score->ne[0];
+@@ -397,12 +886,26 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     ggml_cuda_pool & pool = ctx.pool();
+ 
+     if (additive == nullptr || additive->type == GGML_TYPE_F16) {
+-        indexer_topk_radix_cuda(pool, score_d, cell_blk_d,
+-                additive != nullptr ? (const half *) additive->data : nullptr, extra,
+-                dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++        // the additive is null on the default derived path: the value is per-block, so the
++        // grouped histogram can share the key across a block's cells (A/B: LLAMA_INDEXER_NOGROUP)
++        static const bool nogroup = []() { return getenv("LLAMA_INDEXER_NOGROUP") != nullptr; }();
++        static const bool noblock = []() { return getenv("LLAMA_INDEXER_NOBLOCK") != nullptr; }();
++        const int r = blk_cells != nullptr ? (int) (blk_cells->ne[0] / n_blocks) : 0;
++        const bool block_path = additive == nullptr && !noblock && !nogroup &&
++                blk_cells != nullptr && blk_tail != nullptr && blk_idx != nullptr &&
++                cell_pos != nullptr && r > 0 && r * n_blocks == (int) blk_cells->ne[0];
++        if (block_path) {
++            indexer_topk_radix_cuda_blocks(pool, score_d, cell_blk_d, extra,
++                    dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, r, stream);
++        } else {
++            const bool grouped = additive == nullptr && !nogroup;
++            indexer_topk_radix_cuda(pool, score_d, cell_blk_d,
++                    additive != nullptr ? (const half *) additive->data : nullptr, extra,
++                    dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, grouped, stream);
++        }
+     } else {
+         indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const float *) additive->data, extra,
+-                dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, stream);
++                dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, false, stream);
+     }
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
+index 5edc967e0..278b4f5bf 100644
+--- a/ggml/src/ggml-cuda/lightning-indexer.cu
++++ b/ggml/src/ggml-cuda/lightning-indexer.cu
+@@ -1,5 +1,6 @@
+ #include "common.cuh"
+ #include "lightning-indexer.cuh"
++#include "mma.cuh"
+ #include "fattn-common.cuh"
+ #include "convert.cuh"
+ 
+@@ -397,7 +398,7 @@ static __global__ void lightning_indexer_kernel_vec(
+         );                                                                                  \
+     } else
+ 
+-void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++static void ggml_cuda_lightning_indexer_generic(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * q = dst->src[0];
+     const ggml_tensor * k = dst->src[1];
+     const ggml_tensor * w = dst->src[2]; // weights
+@@ -528,12 +529,34 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor *
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_F32)
+             GGML_ABORT("fatal error");
+         }
++    } else if (n_embd == 128 && n_head == 4) {
++        // qwen4exp's QSA indexer scorer shape.  The RDNA3_5 WMMA kernel (supports_indexer4) is the
++        // fast path; this vec fallback keeps the op legal on every other backend/arch.
++        {
++            constexpr int K_VECS_PER_WARP = 8;
++            constexpr int WARPS_PER_BLOCK = 8;
++            constexpr int K_VECS_PER_BLOCK = K_VECS_PER_WARP * WARPS_PER_BLOCK;
++
++            dim3 block(32, WARPS_PER_BLOCK);
++            int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
++            dim3 grid(num_kv_blocks, n_batch, n_stream);
++
++            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F16)
++            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_0)
++            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_1)
++            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_0)
++            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_1)
++            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q8_0)
++            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_BF16)
++            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F32)
++            GGML_ABORT("fatal error");
++        }
+     } else {
+         GGML_ABORT("fatal error");
+     }
+ }
+ 
+-bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) {
++static bool ggml_cuda_lightning_indexer_generic_supported(int device, const ggml_tensor * dst) {
+     GGML_UNUSED(device);
+ 
+     const ggml_tensor * q = dst->src[0];
+@@ -556,7 +579,7 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst)
+         return false;
+     }
+ 
+-    if (neq1 != 64 && neq1 != 32) {
++    if (neq1 != 64 && neq1 != 32 && neq1 != 4) {
+         return false;
+     }
+ 
+@@ -586,3 +609,151 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst)
+             return false;
+     }
+ }
++
++// AMD (gfx1151, RDNA3_5) fused lightning-indexer kernel for the 4-head / 128-dim case.  The generic
++// path above only instantiates n_head 32/64, but qwen4exp's QSA indexer scores with 4 heads, so the
++// prefill score chain would otherwise run as mul_mat + relu + head-sum.  This kernel computes
++// sum_h relu(q_h . k) * w_h + mask in one WMMA pass (weights all-ones / mask zero reproduces the
++// chain), which is the fused op the QSA prefill scorer wants.
++struct indexer_layout {
++    size_t q1, q2, q3, k2, k3, w1, w3, m1, m3, d1, d3;
++    int nq, nk, nm;
++};
++
++template <typename K>
++__global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
++        const char * q, const char * k, const char * w, const char * mask,
++        char * dst, indexer_layout s) {
++#if defined(AMD_WMMA_AVAILABLE) && (defined(RDNA3) || defined(RDNA4))
++    using namespace ggml_cuda_mma;
++#if defined(RDNA3)
++    using AB=tile<16,8,half2,DATA_LAYOUT_I_MAJOR_MIRRORED>;
++#else
++    // RDNA4 (gfx12): A/B use the plain I_MAJOR layout ("two runs of four" per lane); the
++    // MIRRORED layout is a gfx11 builtin only and has no RDNA4 device code.
++    using AB=tile<16,8,half2,DATA_LAYOUT_I_MAJOR>;
++#endif
++    using C=tile<16,16,float,DATA_LAYOUT_J_MAJOR>;
++    const int warp=threadIdx.y,lane=threadIdx.x,tid=warp*32+lane;
++    const int qfirst=int(blockIdx.y)*16,kfirst=int(blockIdx.x)*64,stream=blockIdx.z;
++    __shared__ half2 query_tile[16][260];
++#pragma unroll 1
++    for(int i=tid;i<16*128;i+=128) {
++        const int row=i/128,col=4*(i%128),token=qfirst+row;
++        float4 value=make_float4(0,0,0,0);
++        if(token<s.nq) {
++            const float * src=(const float *)(q+size_t(stream)*s.q3+size_t(token)*s.q2+size_t(col/128)*s.q1);
++            const int d=col%128;
++            value=make_float4(src[d],src[d+1],src[d+2],src[d+3]);
++        }
++        query_tile[row][col/2]=__float22half2_rn(make_float2(value.x,value.y));
++        query_tile[row][col/2+1]=__float22half2_rn(make_float2(value.z,value.w));
++    }
++    AB keys[8];
++#pragma unroll
++    for(int part=0;part<8;++part) {
++#pragma unroll
++        for(int l=0;l<AB::ne;++l) {
++            const int key=kfirst+warp*16+AB::get_i(l),d=part*16+2*AB::get_j(l);
++            float2 value=make_float2(0,0);
++            if(key<s.nk) {
++                const K * src=(const K *)(k+size_t(stream)*s.k3+size_t(key)*s.k2);
++                value=make_float2(float(src[d]),float(src[d+1]));
++            }
++            keys[part].x[l]=__float22half2_rn(value);
++        }
++    }
++    __syncthreads();
++    C acc[4];
++#pragma unroll
++    for(int head=0;head<4;++head) {
++#pragma unroll
++        for(int l=0;l<C::ne;++l) acc[head].x[l]=0.0f;
++    }
++#pragma unroll
++    for(int part=0;part<8;++part) {
++#pragma unroll
++        for(int head=0;head<4;++head) {
++            AB query;
++#pragma unroll
++            for(int l=0;l<AB::ne;++l) query.x[l]=query_tile[AB::get_i(l)][head*64+part*8+AB::get_j(l)];
++            mma(acc[head],query,keys[part]);
++        }
++    }
++#pragma unroll
++    for(int l=0;l<C::ne;++l) {
++        const int token=qfirst+C::get_i(l),key=kfirst+warp*16+C::get_j(l);
++        if(token<s.nq && key<s.nk) {
++            const float * wr=(const float *)(w+size_t(stream)*s.w3+size_t(token)*s.w1);
++            float value=0.0f;
++#pragma unroll
++            for(int head=0;head<4;++head) value+=fmaxf(acc[head].x[l],0.0f)*wr[head];
++            const half * mr=(const half *)(mask+size_t(stream%s.nm)*s.m3+size_t(token)*s.m1);
++            float * out=(float *)(dst+size_t(stream)*s.d3+size_t(token)*s.d1);
++            out[key]=value+float(mr[key]);
++        }
++    }
++#else
++    NO_DEVICE_CODE;
++#endif
++}
++
++// The 4-head WMMA kernel is the RDNA3_5 (gfx1151) shipped arm.  RDNA3_0 (gfx1100) shares the gfx11
++// WMMA builtin, so the kernel compiles there; it is gated OPT-IN via
++// GGML_CUDA_LIGHTNING_INDEXER4_GFX1100 until a gfx1151 session A/Bs qwen4exp prefill end-to-end.
++// RDNA4 (gfx1201) uses the same ggml_cuda_mma tile abstraction but the gfx12 fragment layout
++// (DATA_LAYOUT_I_MAJOR A/B instead of the gfx11 MIRRORED one) -- ported 2026-09-23, default ON;
++// GGML_CUDA_LIGHTNING_INDEXER4_GFX1201=0 forces the generic vec fallback for an A/B.
++static bool indexer4_arch_enabled(int cc) {
++    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) { return true; }
++    if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
++        static const int v = getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1100")
++            ? atoi(getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1100")) : 0;
++        return v != 0;
++    }
++    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
++        static const int v = getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1201")
++            ? atoi(getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1201")) : 1;
++        return v != 0;
++    }
++    return false;
++}
++
++static bool supports_indexer4(int device, const ggml_tensor * dst) {
++    const auto * q=dst->src[0], * k=dst->src[1], * w=dst->src[2], * m=dst->src[3];
++    if (!q || !k || !w || !m || !indexer4_arch_enabled(ggml_cuda_info().devices[device].cc)) { return false; }
++    if (q->type != GGML_TYPE_F32 || (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) ||
++            w->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 ||
++            q->ne[0] != 128 || q->ne[1] != 4 || k->ne[0] != 128 || k->ne[1] != 1 ||
++            q->ne[2] < 1 || q->ne[2] > 262140 || q->ne[3] > 65535 || k->ne[2] > INT_MAX ||
++            q->ne[3] != k->ne[3] || w->ne[0] != 4 || w->ne[1] != q->ne[2] ||
++            w->ne[2] != 1 || w->ne[3] != q->ne[3] || m->ne[0] != k->ne[2] ||
++            m->ne[1] != q->ne[2] || m->ne[2] != 1 || m->ne[3] < 1 || q->ne[3] % m->ne[3] != 0) { return false; }
++    for (const auto * t : {q, k, w, m, dst}) {
++        const size_t ts=ggml_type_size(t->type);
++        if (t->nb[0] != ts) { return false; }
++        for (int j=1;j<4;++j) { if (t->nb[j]%ts != 0) { return false; } }
++    }
++    return dst->ne[0]==k->ne[2] && dst->ne[1]==q->ne[2] && dst->ne[2]==1 && dst->ne[3]==q->ne[3];
++}
++
++void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (!supports_indexer4(ctx.device, dst)) {
++        ggml_cuda_lightning_indexer_generic(ctx, dst);
++        return;
++    }
++    const auto * q=dst->src[0], * k=dst->src[1], * w=dst->src[2], * m=dst->src[3];
++    indexer_layout s{q->nb[1],q->nb[2],q->nb[3],k->nb[2],k->nb[3],w->nb[1],w->nb[3],
++        m->nb[1],m->nb[3],dst->nb[1],dst->nb[3],int(q->ne[2]),int(k->ne[2]),int(m->ne[3])};
++    const dim3 grid((s.nk+63)/64,(s.nq+15)/16,q->ne[3]), block(32,4);
++    ggml_cuda_kernel_launch_params launch(grid,block,0,ctx.stream());
++    if (k->type==GGML_TYPE_F32) {
++        ggml_cuda_kernel_launch(qsa_indexer_wmma16_keyreg<float>,launch,(const char*)q->data,(const char*)k->data,(const char*)w->data,(const char*)m->data,(char*)dst->data,s);
++    } else {
++        ggml_cuda_kernel_launch(qsa_indexer_wmma16_keyreg<half>,launch,(const char*)q->data,(const char*)k->data,(const char*)w->data,(const char*)m->data,(char*)dst->data,s);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) {
++    return supports_indexer4(device, dst) || ggml_cuda_lightning_indexer_generic_supported(device, dst);
++}
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index e773cd89e..130760f7a 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1087,6 +1087,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "FLASH_ATTN_QSA",
+     "INDEXER_TOPK",
+     "INDEXER_SCORE",
++    "INDEXER_FILL",
+     "HC_MIX",
+     "HC_COMBINE",
+ 
+@@ -5750,6 +5751,7 @@ struct ggml_tensor * ggml_indexer_top_k(
+         struct ggml_tensor  * q_pos,
+         struct ggml_tensor  * blk_idx,
+         struct ggml_tensor  * blk_tail,
++        struct ggml_tensor  * blk_cells,
+         int                   k) {
+     GGML_ASSERT(score->type   == GGML_TYPE_F32);
+     GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
+@@ -5785,6 +5787,14 @@ struct ggml_tensor * ggml_indexer_top_k(
+         GGML_ASSERT(blk_tail->ne[1] == score->ne[2]);
+     }
+ 
++    // the block -> cell map: [ratio*n_blocks, n_stream].  optional (the block-level fast
++    // path); when present it must divide evenly into per-block slots so ratio = ne[0]/n_blocks.
++    if (blk_cells != NULL) {
++        GGML_ASSERT(blk_cells->type == GGML_TYPE_I32);
++        GGML_ASSERT(blk_cells->ne[1] == score->ne[2]);
++        GGML_ASSERT(blk_cells->ne[0] > 0 && blk_cells->ne[0] % score->ne[0] == 0);
++    }
++
+     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, k, score->ne[1], 1, score->ne[2]);
+ 
+     result->op     = GGML_OP_INDEXER_TOPK;
+@@ -5795,6 +5805,7 @@ struct ggml_tensor * ggml_indexer_top_k(
+     result->src[4] = q_pos;
+     result->src[5] = blk_idx;
+     result->src[6] = blk_tail;
++    result->src[7] = blk_cells;
+     ggml_set_op_params_i32(result, 0, k);
+ 
+     return result;
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index fec7ad0e0..b91235128 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -959,6 +959,117 @@ uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
+     return std::max(n_kv, window);
+ }
+ 
++// [QSA_SCORE_BOUNDS] true when the occupied cells of `seq` hold a unique set of non-negative
++// positions, one sequence only.  Complete blocks are enumerated in ascending logical block order
++// (see set_input_qsa's grouping), so under this precondition a complete block's ordinal cannot
++// exceed its logical block number and the scorer can be trimmed to a strip's visible prefix.
++static bool qsa_single_sequence_prefix(const llama_kv_cells & cells, uint32_t count, llama_seq_id seq) {
++    if (count > cells.size()) {
++        return false;
++    }
++
++    std::vector<llama_pos> positions;
++    positions.reserve(count);
++
++    for (uint32_t i = 0; i < count; ++i) {
++        if (cells.is_empty(i)) {
++            continue;
++        }
++        // the scorer trim is by cell index, so the cell index must equal the position (no
++        // permutation); a hole keeps the check valid, an empty cell contributes nothing
++        if (cells.seq_get_all(i).count() != 1 || !cells.seq_has(i, seq) || cells.pos_get(i) != (llama_pos) i) {
++            return false;
++        }
++        positions.push_back(cells.pos_get(i));
++    }
++
++    std::sort(positions.begin(), positions.end());
++    return std::adjacent_find(positions.begin(), positions.end()) == positions.end();
++}
++
++bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & ubatch) const {
++    if (get_n_stream() != 1 || !get_idx() || mem == nullptr) {
++        return false;
++    }
++    if (!ubatch.token || !ubatch.pos || !ubatch.n_tokens || !ubatch.n_pos ||
++        !ubatch.seq_id || !ubatch.n_seq_id) {
++        return false;
++    }
++    if (ubatch.n_seq_id[0] < 1 || !ubatch.seq_id[0]) {
++        return false;
++    }
++
++    const llama_seq_id seq = ubatch.seq_id[0][0];
++
++    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++        if (ubatch.n_seq_id[i] < 1 || !ubatch.seq_id[i] || ubatch.seq_id[i][0] != seq ||
++            ubatch.pos[i] < 0 || ubatch.pos[i] >= 16777216) {
++            return false;
++        }
++        // M-RoPE repeats a position across an image, which breaks the unique-position ordering
++        for (uint32_t axis = 1; axis < ubatch.n_pos; ++axis) {
++            if (ubatch.pos[i + axis*ubatch.n_tokens] != ubatch.pos[i]) {
++                return false;
++            }
++        }
++    }
++
++    const llama_kv_cache * idx = mem->get_mem_idx();
++    if (idx == nullptr) {
++        return false;
++    }
++
++    return qsa_single_sequence_prefix(idx->get_cells(seq), get_idx()->get_n_kv(), seq);
++}
++
++std::vector<int64_t> llama_memory_hybrid_idx_context::qsa_score_key_limits(
++        const llama_ubatch & ubatch, int64_t n_blocks, int64_t strip, uint32_t ratio, int64_t budget) const {
++    const int64_t n_tokens = ubatch.n_tokens;
++
++    if (!ubatch.pos || n_tokens <= 0 || strip <= 0 || ratio == 0 || budget <= 0 || n_blocks < budget) {
++        return {};
++    }
++
++    // llama_context::graph_reserve builds a worst-case graph from a synthetic ubatch whose positions
++    // are all 0.  Bounding that graph would reserve compute buffers for a 4%-wide scorer and then
++    // execute full-width ones, so a many-token ubatch whose positions are all identical is treated
++    // as synthetic and left unbounded.
++    bool degenerate_pos = n_tokens > 1;
++    for (int64_t i = 1; degenerate_pos && i < n_tokens; ++i) {
++        if (ubatch.pos[i] != ubatch.pos[0]) {
++            degenerate_pos = false;
++        }
++    }
++    if (degenerate_pos || !qsa_position_prefix(ubatch)) {
++        return {};
++    }
++
++    std::vector<int64_t> limits;
++    limits.reserve((n_tokens + strip - 1)/strip);
++
++    for (int64_t first = 0; first < n_tokens; first += strip) {
++        int64_t maximum = -1;
++        for (int64_t i = first; i < std::min(n_tokens, first + strip); ++i) {
++            if (ubatch.pos[i] < 0 || ubatch.pos[i] >= 16777216) {
++                return {};
++            }
++            maximum = std::max(maximum, (int64_t) ubatch.pos[i]);
++        }
++        // (maximum+1)/ratio complete blocks lie fully inside the strip's causal prefix.  The +1
++        // keeps the incomplete tail block - the fused top-k carries it as ordinary cells, whereas
++        // the reference appends it separately - inside the scored prefix.
++        limits.push_back(std::min(n_blocks, std::max(budget, (maximum + 1)/ratio) + 1));
++    }
++
++    if (getenv("LLAMA_QSA_SCORE_STRIP_DEBUG") != nullptr) {
++        fprintf(stderr, "QSA score bounds: n_tokens=%lld n_blocks=%lld strip=%lld ratio=%u budget=%lld limits=[%lld, %lld]\n",
++                (long long) n_tokens, (long long) n_blocks, (long long) strip, ratio, (long long) budget,
++                (long long) limits.front(), (long long) limits.back());
++    }
++
++    return limits;
++}
++
+ void llama_memory_hybrid_idx_context::set_input_qsa(
+         ggml_tensor * cell_blk,
+         ggml_tensor * blk_cells,
+diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
+index d1bea3ab1..71aacc6a6 100644
+--- a/src/llama-memory-hybrid-idx.h
++++ b/src/llama-memory-hybrid-idx.h
+@@ -206,6 +206,20 @@ public:
+     // keeps its cadence.  (Ported from the other solution's b0f31f587.)
+     uint32_t qsa_n_kv_window() const;
+ 
++    // [QSA_SCORE_BOUNDS] precondition for trimming the indexer scorer to the columns a query strip
++    // can actually see: one sequence whose occupied cache cells carry unique non-negative positions
++    // (so the complete blocks are enumerated in ascending logical block order and a block's ordinal
++    // cannot exceed its logical block number).  M-RoPE images pin several cells to one position, so
++    // they fail the uniqueness check and stay unbounded.
++    bool qsa_position_prefix(const llama_ubatch & ubatch) const;
++
++    // [QSA_SCORE_BOUNDS] per query strip, the number of leading score columns the strip can see
++    // (the complete-block ordinals that are fully inside its causal prefix, plus the incomplete
++    // tail block the fused top-k carries as cells), or an empty vector when the bound does not
++    // apply.  `strip` is in tokens, `budget` = indexer_top_k / ratio.
++    std::vector<int64_t> qsa_score_key_limits(const llama_ubatch & ubatch, int64_t n_blocks,
++            int64_t strip, uint32_t ratio, int64_t budget) const;
++
+     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                        ggml_tensor * bias, ggml_tensor * blk_idx, ggml_tensor * blk_tail,
+                        ggml_tensor * cell_vis, ggml_tensor * q_vis,
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 0a4624462..2d3b4acab 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1168,6 +1168,48 @@ static bool qwen4exp_want_derived_vis(const llama_model & model, const llama_hpa
+             n_tokens > 1 && cparams.causal_attn && !hparams.use_alibi;
+ }
+ 
++// [QSA_SCORE_BOUNDS] prefill queries are scored in strips of at most this many tokens; each strip is
++// then trimmed to the blocks it can actually see (qsa_score_key_limits), so the indexer scorer runs
++// on roughly half its columns.  Only the single-sequence prefill case is stripped; anything else
++// (decode, verify, multi-stream, M-RoPE images) keeps the whole batch and stays bit-identical.
++// LLAMA_QSA_SCORE_STRIP=0 disables the strip + bound for A/B.
++static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
++    static const int64_t env_strip = []() -> int64_t {
++        const char * env = getenv("LLAMA_QSA_SCORE_STRIP");
++        // 1024 measured best on gfx1151 at -b/-ub 8192 (pp8192 +0.7 %, pp32768 neutral):
++        // smaller strips multiply the per-strip matmul/top-k launches, larger ones trim less
++        return env == nullptr ? 1024 : atoll(env);
++    }();
++    if (env_strip <= 0) {
++        return n_tokens;
++    }
++    return n_stream == 1 ? std::min<int64_t>(n_tokens, env_strip) : n_tokens;
++}
++
++// The bound is only meaningful where the score columns are complete-block ordinals and the tail is
++// carried as cells - the derived-bias path.  n_tokens < 128 keeps the whole decode/verify band on
++// the unbounded graph, so W = 1..8 stays byte-identical by construction.
++// LLAMA_QSA_SCORE_BOUNDS=0 keeps the strips but scores every strip at full width (isolates the
++// strip/launch overhead from the trim savings in an A/B).
++static std::vector<int64_t> qwen4exp_score_key_limits(const llama_memory_hybrid_idx_context * mctx,
++        const llama_ubatch & ubatch, bool derived_bias, bool derived_vis, int64_t n_blocks,
++        int64_t strip, uint32_t ratio, int64_t budget) {
++    static const bool enabled = []() {
++        const char * env = getenv("LLAMA_QSA_SCORE_STRIP");
++        if (env != nullptr && atoll(env) <= 0) {
++            return false;
++        }
++        const char * bounds = getenv("LLAMA_QSA_SCORE_BOUNDS");
++        return bounds == nullptr || atoi(bounds) != 0;
++    }();
++    // the fused top-k skips trimmed blocks by cell index, which needs the derived-visibility
++    // cell-clamped kernel path - keep the bound there only
++    if (!enabled || !derived_bias || !derived_vis || ubatch.n_tokens < 128 || strip <= 0) {
++        return {};
++    }
++    return mctx->qsa_score_key_limits(ubatch, n_blocks, strip, ratio, budget);
++}
++
+ class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
+ public:
+     llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool derived_bias, bool derived_vis) :
+@@ -1240,6 +1282,14 @@ public:
+             res &= bias->ne[1] == params.ubatch.n_tokens/n_stream;
+         }
+ 
++        // [QSA_SCORE_BOUNDS] the trimmed scorer widths are baked into the graph, so a reused graph
++        // must agree on the strip size and the per-strip column limits.
++        const int64_t next_strip  = qwen4exp_query_strip(params.ubatch.n_tokens/n_stream, n_stream);
++        const auto    next_limits = qwen4exp_score_key_limits(mctx, params.ubatch, derived_bias, derived_vis, n_blocks,
++                next_strip, ratio, (int64_t) params.hparams.indexer_top_k/ratio);
++        res &= score_strip == next_strip;
++        res &= score_key_limits == next_limits;
++
+         return res;
+     }
+ 
+@@ -1273,6 +1323,10 @@ public:
+ 
+     // ... and the per-cell half is derived from the visibility keys
+     const bool derived_vis;
++
++    // [QSA_SCORE_BOUNDS] strip size and per-strip score column limits baked into this graph
++    int64_t score_strip = 0;
++    std::vector<int64_t> score_key_limits;
+ };
+ 
+ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1340,6 +1394,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         const char * env = getenv("GGML_CUDA_QSA_INDEXER_CACHE");
+         return env == nullptr ? 1 : std::atoi(env);
+     }();
++    // [QSA_SCORE_WMMA] prefill indexer score -> one fused lightning-indexer op (all-ones weights,
++    // zero mask) instead of the mul_mat + relu + head-sum chain.  RDNA3_5's 4-head WMMA kernel is
++    // the fast path; elsewhere the generic vec kernel backs it.  The fused op casts q/k to F16, so
++    // this is a *prefill re-baseline* (decode/verify width purity is untouched: the band is
++    // n_tps >= 128).  Default ON; =0 restores the per-op chain for A/B.
++    static const bool idx_score_wmma = [] {
++        const char * env = getenv("LLAMA_QSA_SCORE_WMMA");
++        return env == nullptr || std::atoi(env) != 0;
++    }();
+ 
+     // nothing above depends on the layer, so the layers sharing a ratio share one input set
+     llm_graph_input_qsa * inp = nullptr;
+@@ -1388,6 +1451,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+             ggml_set_input(qsa->rng);
+         }
+ 
++        // [QSA_SCORE_BOUNDS] the prefill scorer is striped and causally trimmed; the widths are
++        // baked into this graph and re-checked by can_reuse above.
++        qsa->score_strip      = qwen4exp_query_strip(n_tps, n_stream);
++        qsa->score_key_limits = qwen4exp_score_key_limits(mctx_hyb, ubatch, derived_bias, derived_vis, n_blocks,
++                qsa->score_strip, (uint32_t) r, (int64_t) hparams.indexer_top_k/r);
++
+         inp = qsa.get();
+         res->add_input(std::move(qsa));
+         qsa_inps.emplace((uint32_t) r, inp);
+@@ -1422,6 +1491,53 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+                                k_all->type == GGML_TYPE_BF16 ||
+                                k_all->type == GGML_TYPE_F16;
+ 
++    // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
++    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
++    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
++
++    // fused expand + mask + top-k: value[c] = score[cell_blk[c]] + additive[c]
++    // avoids materializing the [n_kv, n_tps] F32 expanded tensor (512MB at 64K) per layer
++    // the mask is [n_kv, n_tps, 1, n_stream]; the size-1 dim is a no-op stride, so the
++    // kernel reads it as [n_kv, n_tps, n_stream] and no per-layer copy is needed
++    ggml_tensor * additive = blk_bias ? kq_mask : inp->bias;
++
++    // [QSA_SCORE_BOUNDS] the query-indexed inputs (additive, q_vis, blk_tail) are sliced to the
++    // strip so each per-strip top-k sees the same shapes the whole-batch decode call does.
++    auto run_top_k = [&](ggml_tensor * sc, int64_t first, int64_t n_query, int64_t score_blocks) -> ggml_tensor * {
++        ggml_tensor * add_s = nullptr;
++        if (additive != nullptr) {
++            add_s = ggml_n_dims(additive) == 4
++                    ? ggml_view_4d(ctx0, additive, additive->ne[0], n_query, 1, n_stream,
++                            additive->nb[1], additive->nb[2], additive->nb[3], first*additive->nb[1])
++                    : ggml_view_3d(ctx0, additive, additive->ne[0], n_query, n_stream,
++                            additive->nb[1], additive->nb[2], first*additive->nb[1]);
++        }
++        ggml_tensor * qpos_s = derived_vis ? ggml_view_2d(ctx0, inp->q_vis, n_query, n_stream,
++                inp->q_vis->nb[1], first*inp->q_vis->nb[0]) : nullptr;
++        ggml_tensor * tail_s = derived_bias ? ggml_view_2d(ctx0, inp->blk_tail, n_query, n_stream,
++                inp->blk_tail->nb[1], first*inp->blk_tail->nb[0]) : nullptr;
++        // [QSA_SCORE_BOUNDS] a trimmed score holds only the visible prefix; the block fast path
++        // then skips the trimmed blocks by cell index.  The bound only applies with n_stream == 1,
++        // so these views stay contiguous even though the source's stream stride is the full width.
++        ggml_tensor * blk_idx_s = derived_bias
++                ? (score_blocks < n_blocks
++                        ? ggml_view_2d(ctx0, inp->blk_idx, score_blocks, n_stream, inp->blk_idx->nb[1], 0)
++                        : inp->blk_idx)
++                : nullptr;
++        ggml_tensor * blk_cells_s = score_blocks < n_blocks
++                ? ggml_view_2d(ctx0, inp->blk_cells, (int64_t) r*score_blocks, n_stream, inp->blk_cells->nb[1], 0)
++                : inp->blk_cells;
++        return ggml_indexer_top_k(ctx0, sc, inp->cell_blk, add_s,
++                derived_vis ? inp->cell_vis : nullptr,
++                qpos_s,
++                blk_idx_s,
++                tail_s,
++                blk_cells_s,
++                (int) width);
++    };
++
++    ggml_tensor * top_k = nullptr;
++
+     ggml_tensor * score = nullptr;
+     if (idx_score_fused && idx_key_float && n_tokens == 1 && blk_bias && n_idx_h <= 8 &&
+             rope_type == GGML_ROPE_TYPE_IMROPE) {
+@@ -1514,77 +1630,155 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         //        arithmetic untouched; the slices are assembled with ggml_concat (a produced tensor
+         //        frees normally, unlike cpy into a view of an allocator-owned tensor, which leaks).
+         //        The threshold is internal policy, not the A/B knob.
+-        const int64_t score_bytes = n_blocks * n_idx_h * n_tps * n_stream * 4;
+-        const bool    score_mem   = qwen4exp_score_mem_enabled();
++        //
++        // [QSA_SCORE_BOUNDS] prefill is additionally scored in `strip`-token query strips, each
++        // trimmed to the blocks it can see (qwen4exp_score_key_limits): a complete block's ordinal
++        // cannot exceed its logical block number, so columns past (max_query_pos+1)/ratio are
++        // invisible.  The trimmed score is handed straight to the fused top-k, whose cell range is
++        // clamped to n_blocks*ratio so the trimmed cells (cell_blk[c] >= n_blocks) are never read;
++        // the padded-blocks variant was measured slower because it re-materialises the full score.
++        // A strip that is not trimmed (decode/verify, no bound) builds exactly the pre-strip graph,
++        // so W = 1..8 stays byte-identical.
++        const bool    score_mem = qwen4exp_score_mem_enabled();
++        const int64_t strip     = inp->score_strip > 0 ? inp->score_strip : n_tps;
+ 
+         // sum the indexer heads: ne[1] holds them side by side and there are only a few
+-        auto head_sum = [&](ggml_tensor * sc) {
++        auto head_sum = [&](ggml_tensor * sc, int64_t nb, int64_t n_query) {
+             ggml_tensor * summed = nullptr;
+             for (int64_t h = 0; h < n_idx_h; ++h) {
+-                ggml_tensor * slice = ggml_view_3d(ctx0, sc, sc->ne[0], n_tps, n_stream,
++                ggml_tensor * slice = ggml_view_3d(ctx0, sc, nb, n_query, n_stream,
+                         sc->nb[2], sc->nb[3], h*sc->nb[1]);
+                 summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+             }
+             return summed;
+         };
+ 
+-        if (score_mem && score_bytes > 128*1024*1024) {
+-            const int64_t chunk = std::max<int64_t>(4096, (n_blocks + 15)/16);
+-            ggml_tensor * acc = nullptr;
+-            for (int64_t b0 = 0; b0 < n_blocks; b0 += chunk) {
+-                const int64_t cb = std::min<int64_t>(chunk, n_blocks - b0);
++        auto compute_score = [&](int64_t first, int64_t n_query, int64_t score_blocks) {
++            ggml_tensor * pooled_s = score_blocks == n_blocks ? pooled :
++                    ggml_view_3d(ctx0, pooled, idx_dim, score_blocks, n_stream,
++                            pooled->nb[1], pooled->nb[2], 0);
++            ggml_tensor * q_s = (first == 0 && n_query == n_tps) ? q3 :
++                    ggml_view_3d(ctx0, q, idx_dim, n_idx_h*n_query, n_stream,
++                            q->nb[1], q->nb[2]*n_tps, first*q->nb[2]);
++
++            // [QSA_SCORE_WMMA] the fused op needs 128 dims and exactly 4 heads (the AMD WMMA
++            // kernel's shape), and only pays in the prefill band; decode/verify keep the per-op
++            // chain so the W=1..8 reduction order is unchanged.
++            const bool use_wmma = idx_score_wmma && n_tps >= 128 && idx_dim == 128 && n_idx_h == 4;
++
++            // ones-weights / zero-mask, shared across layers by name (the graph context outlives a
++            // layer build); the mask is sized by the untrimmed block count and viewed per strip.
++            auto score_wmma_weights = [&]() -> ggml_tensor * {
++                char name[64];
++                snprintf(name, sizeof(name), "qsa_score_w_%lld_%lld_%lld",
++                        (long long) n_idx_h, (long long) strip, (long long) n_stream);
++                ggml_tensor * t = ggml_get_tensor(ctx0, name);
++                if (t == nullptr) {
++                    t = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_idx_h, strip, 1, n_stream), 1.0f);
++                    ggml_set_name(t, name);
++                }
++                return t;
++            };
++            auto score_wmma_mask = [&]() -> ggml_tensor * {
++                char name[64];
++                snprintf(name, sizeof(name), "qsa_score_m_%lld_%lld_%lld",
++                        (long long) n_blocks, (long long) strip, (long long) n_stream);
++                ggml_tensor * t = ggml_get_tensor(ctx0, name);
++                if (t == nullptr) {
++                    t = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_blocks, strip, 1, n_stream), 0.0f);
++                    ggml_set_name(t, name);
++                }
++                return t;
++            };
++
++            const int64_t score_bytes = score_blocks * n_idx_h * n_query * n_stream * 4;
++            ggml_tensor * strip_score = nullptr;
++            if (use_wmma) {
++                ggml_tensor * w_full = score_wmma_weights();
++                ggml_tensor * m_full = score_wmma_mask();
++                ggml_tensor * query = ggml_view_4d(ctx0, q, idx_dim, n_idx_h, n_query, n_stream,
++                        q->nb[1], q->nb[2], q->nb[2]*n_tps, first*q->nb[2]);
++                ggml_tensor * key = ggml_view_4d(ctx0, pooled, idx_dim, 1, score_blocks, n_stream,
++                        pooled->nb[1], pooled->nb[1], pooled->nb[2], 0);
++                ggml_tensor * weights_v = ggml_view_4d(ctx0, w_full, n_idx_h, n_query, 1, n_stream,
++                        w_full->nb[1], w_full->nb[2], w_full->nb[3], 0);
++                // leading-rows view: the all-zero mask's ne0 is n_blocks, the op needs score_blocks
++                ggml_tensor * mask_v = ggml_view_4d(ctx0, m_full, score_blocks, n_query, 1, n_stream,
++                        m_full->nb[1], m_full->nb[2], m_full->nb[3], 0);
++                strip_score = ggml_reshape_3d(ctx0,
++                        ggml_lightning_indexer(ctx0, query, key, weights_v, mask_v),
++                        score_blocks, n_query, n_stream);
++            } else if (score_mem && score_bytes > 128*1024*1024) {
++                const int64_t chunk = std::max<int64_t>(4096, (score_blocks + 15)/16);
++                ggml_tensor * acc = nullptr;
++                for (int64_t b0 = 0; b0 < score_blocks; b0 += chunk) {
++                    const int64_t cb = std::min<int64_t>(chunk, score_blocks - b0);
++
++                    ggml_tensor * pooled_c = ggml_view_3d(ctx0, pooled_s, idx_dim, cb, n_stream,
++                            pooled_s->nb[1], pooled_s->nb[2], b0*pooled_s->nb[1]);
++
++                    ggml_tensor * sc = ggml_mul_mat(ctx0, pooled_c, q_s);
++                    sc = ggml_relu(ctx0, sc);
++                    sc = ggml_reshape_4d(ctx0, sc, cb, n_idx_h, n_query, n_stream);
++
++                    ggml_tensor * summed = head_sum(sc, cb, n_query);
++
++                    acc = acc ? ggml_concat(ctx0, acc, summed, 0) : summed;
++                }
++                strip_score = acc;
++            } else if (score_mem) {
++                strip_score = ggml_mul_mat(ctx0, pooled_s, q_s);
++                strip_score = ggml_relu(ctx0, strip_score);
++                strip_score = ggml_reshape_4d(ctx0, strip_score, score_blocks, n_idx_h, n_query, n_stream);
++                strip_score = head_sum(strip_score, score_blocks, n_query);
++            } else {
++                strip_score = ggml_mul_mat(ctx0, pooled_s, q_s);
++                strip_score = ggml_reshape_4d(ctx0, strip_score, score_blocks, n_idx_h, n_query, n_stream);
++                strip_score = ggml_relu(ctx0, strip_score);
++                strip_score = head_sum(strip_score, score_blocks, n_query);
++            }
+ 
+-                ggml_tensor * pooled_c = ggml_view_3d(ctx0, pooled, idx_dim, cb, n_stream,
+-                        pooled->nb[1], pooled->nb[2], b0*pooled->nb[1]);
++            // one value per block, so it is cheaper to bias here than after the cells are expanded
++            // (the derived path drops this tensor and lets the top-k add the bias in-kernel instead)
++            if (blk_bias && !derived_bias) {
++                ggml_tensor * bias_s = ggml_view_3d(ctx0, inp->bias, n_blocks, n_query, n_stream,
++                        inp->bias->nb[1], inp->bias->nb[2], first*inp->bias->nb[1]);
++                strip_score = ggml_add(ctx0, strip_score, bias_s);
++            }
+ 
+-                ggml_tensor * sc = ggml_mul_mat(ctx0, pooled_c, q3);
+-                sc = ggml_relu(ctx0, sc);
+-                sc = ggml_reshape_4d(ctx0, sc, cb, n_idx_h, n_tps, n_stream);
++            return strip_score;
++        };
+ 
+-                ggml_tensor * summed = head_sum(sc);
++        std::vector<ggml_tensor *> strips;
++        for (int64_t first = 0; first < n_tps; first += strip) {
++            const int64_t n_query = std::min(strip, n_tps - first);
++            const int64_t score_blocks = inp->score_key_limits.empty()
++                    ? n_blocks : inp->score_key_limits[first/strip];
++            GGML_ASSERT(score_blocks > 0 && score_blocks <= n_blocks);
+ 
+-                acc = acc ? ggml_concat(ctx0, acc, summed, 0) : summed;
+-            }
+-            score = acc;
+-        } else if (score_mem) {
+-            score = ggml_mul_mat(ctx0, pooled, q3);
+-            score = ggml_relu(ctx0, score);
+-            score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+-            score = head_sum(score);
+-        } else {
+-            score = ggml_mul_mat(ctx0, pooled, q3);
+-            score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+-            score = ggml_relu(ctx0, score);
+-            score = head_sum(score);
++            ggml_tensor * sc = compute_score(first, n_query, score_blocks);
++            cb(sc, "indexer_score", il);
++
++            ggml_tensor * tk = run_top_k(sc, first, n_query, score_blocks);
++            cb(tk, "indexer_top_k", il);
++            strips.push_back(tk);
+         }
+ 
+-        // one value per block, so it is cheaper to bias here than after the cells are expanded
+-        // (the derived path drops this tensor and lets the top-k add the bias in-kernel instead)
+-        if (blk_bias && !derived_bias) {
+-            score = ggml_add(ctx0, score, inp->bias);
++        // balanced concatenation along the query dimension keeps the strips in order
++        while (strips.size() > 1) {
++            ggml_tensor * right = strips.back(); strips.pop_back();
++            ggml_tensor * left  = strips.back(); strips.pop_back();
++            ggml_tensor * joined = ggml_concat(ctx0, left, right, 1);
++            ggml_build_forward_expand(gf, joined);
++            strips.push_back(joined);
+         }
++        top_k = strips.front();
++    }
++    if (score != nullptr) {
++        cb(score, "indexer_score", il);
++        top_k = run_top_k(score, 0, n_tps, n_blocks);
++        cb(top_k, "indexer_top_k", il);
+     }
+-    cb(score, "indexer_score", il);
+-
+-    // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
+-    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
+-    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+-
+-    // fused expand + mask + top-k: value[c] = score[cell_blk[c]] + additive[c]
+-    // avoids materializing the [n_kv, n_tps] F32 expanded tensor (512MB at 64K) per layer
+-    // the mask is [n_kv, n_tps, 1, n_stream]; the size-1 dim is a no-op stride, so the
+-    // kernel reads it as [n_kv, n_tps, n_stream] and no per-layer copy is needed
+-    ggml_tensor * additive = blk_bias ? kq_mask : inp->bias;
+-
+-    // compact per-block bias state (derived path); the derived *visibility* (cell_pos/q_pos)
+-    // is a later step, so src3/src4 stay null for now
+-    ggml_tensor * top_k = ggml_indexer_top_k(ctx0, score, inp->cell_blk, additive,
+-            derived_vis ? inp->cell_vis : nullptr,
+-            derived_vis ? inp->q_vis    : nullptr,
+-            derived_bias ? inp->blk_idx  : nullptr,
+-            derived_bias ? inp->blk_tail : nullptr,
+-            (int) width);
+-    cb(top_k, "indexer_top_k", il);
+ 
+     return top_k;
+ }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 5c3528f1a..1de277bbd 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11245,6 +11245,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // 4-head / 128-dim: the qwen4exp QSA prefill scorer shape (the AMD RDNA3_5 WMMA arm)
++    for (int kv : { 64, 256, 1024 }) {
++        for (int bs : { 1, 16, 512 }) {
++            for (auto [ns, nm] : { std::pair{1, 1}, std::pair{4, 4}, std::pair{4, 1} }) {
++                for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
++                    test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, ns, nm, type_K));
++                }
++            }
++        }
++    }
++
+     return test_cases;
+ }
+ #ifdef _MSC_VER
+-- 
+2.55.0
+

@@ -1,6 +1,6 @@
 # `closing-the-gap` → `beta/mmb-general` patch consolidation — plan
 
-**Status:** PLAN — not started.  Created 2026-09-25.
+**Status:** **EXECUTED 2026-09-25** — see the "Executed record" below.  Created 2026-09-25.
 **Branches:** delivery repo `gap-consolidation` (this file + the regenerated beta patches); fork
 `~/llama.cpp` `gap-consolidation` (disposable mechanical branch, currently parked at `rdna-boosts-r13`).
 
@@ -11,6 +11,47 @@ patches.  The closing patches then remain only as the historical/research record
 
 > Session-continuation note: everything needed is in §1 (immutable reference state), §2 (the mapping)
 > and §4 (validation).  Read the "Execution checklist" (§7) last.
+
+---
+
+## Executed record (2026-09-25)
+
+**Result: the beta set is now the 28-patch consolidated set; r13 + `git am
+beta/mmb-general/patches/*.patch` reproduces T_final.**
+
+* **Fork branch:** `~/llama.cpp` `gap-consolidation` @ `c2b46c814` (28 commits on `rdna-boosts-r13`),
+  tree **`468c64963ae45e72367c73809efa7cc038217e8a`** = T_final.  Reference tags `ref-beta`
+  (`aa1e87b8f`) / `ref-combined` (`e72c2a17d`) were set first.
+* **Method:** fresh linear rebuild (`git cherry-pick -n`), **try-fold-else-demote**.  Each beta is
+  applied in order, then its mapped closings are cherry-picked and amended in; a conflict demotes the
+  closing to a NEW patch appended after beta12 in original order.  The **base mismatch** (a closing
+  authored atop beta12 replays against an early beta) is what caused most demotions.
+* **Folds (10):** `c0005`/`c0007` → beta02; `c0001`/`c0010` → beta04; `c0014`/`c0016` → beta05;
+  `c0008`/`c0017`/`c0018` → beta07; `c0002` → beta08.
+* **Demoted to NEW (20), appended as 16 commits** (`0013`–`0028`; the input-layer, sparse-MTP and
+  MMVQ pairs net-folded): `c0003`, `c0004`, `c0006`, `c0009`, `c0011`, `c0012`, `c0013`, `c0019`,
+  `c0020`+`c0026`, `c0021`, `c0022`, `c0023`, `c0024`+`c0025`+`c0030`, `c0027`, `c0028`+`c0031`,
+  `c0029`.  Folded-beta subjects were reworded; appended subjects dropped the `gap-closing WIP:`
+  prefix.
+* **Validation:**
+  * tip tree == `468c6496…` (**TREE-OK**).
+  * `git range-diff rdna-boosts-r13..ref-combined rdna-boosts-r13..gap-consolidation` — every old
+    commit maps to a new one; the `!` (content-changed) lines are exactly the five folded betas, no
+    unexplained deltas.
+  * Fresh **strict** `git am` of the 28 exported patches on a clean `rdna-boosts-r13` worktree →
+    tree `468c6496…` (**STRICT-AM-TREE-OK**), no 3-way.
+  * Build clean (gfx1151, `build-rocm`, EXIT 0).
+  * Gates (bit-identical tree): width probe `PASS` (row-0 `268e0673300b7a33`); `FLASH_ATTN_QSA` /
+    `GATED_DELTA_NET` oracles OK; `plain == draft-mtp n3` byte-identical (`434 chars
+    sha=984263fb8e0f`).
+* **Delivered:** `beta/mmb-general/patches/` (28), `mmb-general.patch`, `commits.txt`, and the
+  README / BETA-TESTING / GROUPS / combined-set-verification / HANDOVER updates.
+  `wip/closing-the-gap/patches/` is kept as history.
+* **Deliberate deviation from §2:** the plan's fold targets assumed pure code ownership; the blame
+  audit showed most closings modify base code or need later-beta context, so clean folds were limited
+  to the ten above and the rest appended — the §3 "demote rather than force" path.
+
+---
 
 ---
 

@@ -27,15 +27,17 @@ per-arch table or arch-neutral.  Re-validating confirms that reasoning.
 ```sh
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout ebbb18522                                   # the fork point
-bash <repo>/scripts/apply-all.sh .                       # -> r12 delivery, tree 8a80535e...
+bash <repo>/scripts/apply-all.sh .                       # -> r13 delivery, tree bb7b6d07...
 git checkout -b mmb-beta
-git am <repo>/beta/mmb-general/patches/*.patch           # 12/12
-git rev-parse HEAD^{tree}                                # expect bca69f23dd29acef2d8898c6fd492104e078eef1
+git am <repo>/beta/mmb-general/patches/*.patch           # 28/28
+git rev-parse HEAD^{tree}                                # expect 468c64963ae45e72367c73809efa7cc038217e8a
 ```
 
-Verified on gfx1201 2026-09-21: **12/12**, applied tree `bca69f23dd29acef2d8898c6fd492104e078eef1`
-(fresh worktree at `c3ee45747`).  Build with the usual gfx1151 script; the runtime env is
-`export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH`.
+Consolidated 2026-09-25 (the `closing-the-gap` campaign folded in).  Verified strict `git am`
+**28/28** from the r13 tree, producing `468c64963ae45e72367c73809efa7cc038217e8a`; the set is
+**tree-identical** to the combined `gap-closing-denseband` tree, so the gfx1201/gfx1100 results
+carry over and the gfx1151 re-validation below is the beta-window task.  Build with the usual gfx1151
+script; the runtime env is `export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH`.
 
 `GGML_CUDA_MMB_CFG=1` prints the resolved per-arch config once — gfx1151 should read
 `cc=0x1001151 dense_geom=0 min_t=512 glu_thresh=32 routed_thresh=32 tall=2 tiny_m=1/1

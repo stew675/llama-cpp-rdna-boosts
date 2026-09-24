@@ -1,0 +1,152 @@
+From 36a44137fd159a4cfa2a1204420f98fd8ac92ee5 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Wed, 23 Sep 2026 15:42:50 -0500
+Subject: [PATCH 25/28] WIP: host-buffer input layer + opt-in device input
+ placement
+
+The input layer (token_embd + per_layer_token_embd) was always left on the CPU
+("there is very little benefit to offloading the input layer").  With a single
+GPU that meant the token-embedding GET_ROWS was dispatched to the CPU backend,
+and on an APU (gfx1151) the CPU backend's OpenMP thread pool spun every core on
+every step.  The MTP draft is the visible case: its mtp_tok_embd gather runs
+every speculative step, and the hybrid-idx draft graph also puts the
+recurrent-state zeroing ops in the same CPU split, so the pool never sleeps
+(~11 cores at 100%, ~1060% CPU).
+
+Place the input layer on the output layer's device when the model has a single
+GPU, so the GET_ROWS runs on the GPU; multi-GPU setups keep the stock CPU
+placement (a host-buffer/device policy per split is a follow-up).
+
+Measured (gfx1151, qwen4exp IQ4_NL + MTP sidecar, -c 16384):
+  sparse MTP decode 1068-1090% CPU / 17 busy threads -> 155% / 2 (the ROCm
+  runtime's own wait threads), matching the reference fork.
+Byte-identical at every gate: 8K 3553e76d3a9e, 40K 8285d12d40ca, 128K
+MTP == plain 770e770ae7d6; width probe PASS; imatrix NanBeige BF16 clean and
+byte-identical to HC16=0; FLASH_ATTN_QSA/GATED_DELTA_NET green.
+---
+ ggml/src/ggml-backend.cpp       | 27 +++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 15 +++++++++++++--
+ src/llama-model-loader.cpp      |  5 ++++-
+ src/llama-model.cpp             | 18 +++++++++++++++---
+ 4 files changed, 59 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index e6ae7cd3f..0e7f22631 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1043,6 +1043,18 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
+     }
+ }
+ 
++// the graph input a tensor ultimately refers to, following view chains, or NULL if it is not (a
++// view of) a graph input.  The recurrent-state copy, for one, is only ever read through views.
++static struct ggml_tensor * ggml_backend_sched_graph_input(struct ggml_tensor * t) {
++    while (t != NULL) {
++        if (t->flags & GGML_TENSOR_FLAG_INPUT) {
++            return t;
++        }
++        t = t->view_src;
++    }
++    return NULL;
++}
++
+ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
+     ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+     ggml_backend_buffer_type_t buft = NULL;
+@@ -1061,6 +1073,21 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
+         }
+     }
+ 
++    if (buft != NULL && ggml_backend_buft_is_host(buft) && sched->n_copies <= 1 &&
++            ggml_backend_sched_graph_input(t) != NULL) {
++        // A graph input that lives in host memory is written by the host thread.  On a device
++        // that accepts host buffers (an APU with info.devices[].integrated set), the scheduler
++        // would otherwise let the compute backend read it in place: the next ubatch's
++        // set_inputs then races the in-flight compute and a torn value can turn an index into an
++        // out-of-bounds store (k_set_rows MEMORY_APERTURE_VIOLATION on gfx1151, and the #15034
++        // corrupted output before that).  Force the split-input copy so the device reads a
++        // stream-ordered device buffer.  Weights are unaffected: they are never
++        // GGML_TENSOR_FLAG_INPUT, so zero-copy host weights (the input embeddings) keep working.
++        // The view chain is resolved because an input can be reached only through a view - the
++        // recurrent-state copy, for one, is.
++        return false;
++    }
++
+     return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 4c28f94de..c17981dc0 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -319,9 +319,20 @@ static ggml_cuda_device_info ggml_cuda_init() {
+         // host-buffer path (zero-copy UMA weights) it enables on APUs corrupts full-model
+         // results under async execution on this box (PPL 5.9243 -> 8.51+ without
+         // HIP_LAUNCH_BLOCKING).  Upstream reverted #24233 in #28604 (2026-09-08), making
+-        // forced-integrated-false the upstream default again; this marker guards against
+-        // re-landing prop.integrated without re-testing that box.
++        // forced-integrated-false the upstream default again.
++        //
++        // Re-tested 2026-09-23 (closing-the-gap host-buffer investigation): the corruption was
++        // the scheduler reading a host-resident graph input in place; see the host-input guard
++        // in ggml_backend_sched_buffer_supported().  With that guard the real flag is stable on
++        // this box, and it is what lets an APU gather the input embeddings on the GPU (no CPU
++        // backend dispatch) while the embedding weights stay in zero-copy host memory.
++        // GGML_FORCE_NO_INTEGRATED=1 restores the previous default for A/B and bisection.
++#if defined(GGML_USE_HIP)
++        static const bool force_no_integrated = getenv("GGML_FORCE_NO_INTEGRATED") != nullptr;
++        info.devices[id].integrated = force_no_integrated ? false : prop.integrated;
++#else
+         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
++#endif
+         info.devices[id].nsm        = prop.multiProcessorCount;
+         info.devices[id].smpb       = prop.sharedMemPerBlock;
+         info.devices[id].warp_size  = prop.warpSize;
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index b68a48734..ff4e1cd08 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1226,7 +1226,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         const buft_list_t * buft_list;
+         switch (info.layer) {
+             case LLM_TENSOR_LAYER_INPUT:
+-                buft_list = buft_list_input;
++                // the per-layer token embedding is a huge table that the model gathers on the host
++                // (qwen4exp/gemma build_inp_ple), so it must stay host-resident even when the rest
++                // of the input layer is offloaded with LLAMA_DEVICE_INPUT=1; give it the CPU list.
++                buft_list = tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD ? buft_list_cpu : buft_list_input;
+                 break;
+             case LLM_TENSOR_LAYER_OUTPUT:
+                 buft_list = buft_list_output;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index e7c24838f..334c91aaf 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1532,9 +1532,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         return {dev, &pimpl->gpu_buft_list.at(dev)};
+     };
+ 
+-    // assign the input layer
+-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
+-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
++    // assign the input layer.  Default: the upstream host placement.  On a discrete multi-GPU box
++    // the input embedding then lives in host memory and the scheduler peels a CPU split off every
++    // graph; the 0029 single-thread heuristic keeps that split from spinning the OpenMP pool, and
++    // on gfx1201 it measures faster than the alternatives (see the OP-1 structural record).
++    // LLAMA_DEVICE_INPUT=1 places the input layer on the output layer's device instead, so the
++    // token-embedding GET_ROWS runs inside the GPU graph (on a tensor-split build, on the Meta
++    // device) and there is no CPU split at all.  It is opt-in because the Meta-split GPU gather is
++    // ~2.6% slower for MTP than the single-threaded CPU gather; the huge per-layer token embedding
++    // stays host-resident either way (see create_tensor).
++    static const bool dev_input_on = getenv("LLAMA_DEVICE_INPUT") != nullptr;
++    if (dev_input_on) {
++        pimpl->dev_input = get_layer_buft_list(n_layer_all);
++    } else {
++        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
++    }
+ 
+     // assign the repeating layers to the devices according to the splits
+     pimpl->dev_layer.resize(n_layer_all);
+-- 
+2.55.0
+
