@@ -11,11 +11,21 @@ assembly), never once end-to-end on the final set.
 
 ## 0. What the set promises on gfx1151
 
+> **2026-09-25 consolidation — the set is now default-ON and r13-based.**  The `closing-the-gap`
+> campaign was folded in and its "beneficial features default ON" patch flipped the campaign on:
+> **`GGML_CUDA_MMB` defaults to `1`** (env only *disables*), as do `GGML_CUDA_MMB_HC16` and
+> `GGML_CUDA_MMB_RDNA3`, and the `hc_gate_mix` fusion.  The promise table below is re-stated for the
+> **default-on 28-patch set**.  (The pre-consolidation beta was MMB-opt-in on r12; that is historical.)
+
 | | |
 |---|---|
-| **With `GGML_CUDA_MMB` unset (the default in this beta tree)** | **byte-identical to the delivery r12** in *this opt-in beta tree*.  MMB is **opt-in** (`getenv("GGML_CUDA_MMB") ? atoi : 0`), so the default state is r12 plus only the arch-neutral groups — which were measured numerically neutral (on gfx1201 the WIP with MMB off was *bit-identical* to the delivery at PPL 9.4293 and on all five same-seed hashes).  **This is a regression aid, not the purity contract** — see the note under Gate 1 and `GREEDY-PURITY.md` §5: once a feature is defaulted on (as on the `gap-closing` branch) cross-build equality is expected to break, and the gate is the *intra-build* set. |
-| **With `GGML_CUDA_MMB=1`** | the original gfx1151 `mmb` win, **unchanged by the RDNA4/RDNA3_0 scoping**.  gfx1151 keeps the **full** weight-type set and the original tile/threshold constants. |
+| **Default build (`GGML_CUDA_MMB` unset → `1`)** | the full campaign: the gfx1151 `mmb` win, HC16, `hc_gate_mix`, the closing-the-gap prefill fusions, the MMVQ band policy, etc. |
+| **`GGML_CUDA_MMB=0`** | the campaign off — the r13 delivery plus the default-on, arch-neutral closing features. |
 | Never | a regression at depth, a width-purity change, or an MTP acceptance change. |
+
+**The purity contract is the *intra-build* one** (Gate 1), not cross-build equality: with the features
+defaulted on, cross-build equality against the delivery no longer holds by design (`GREEDY-PURITY.md`
+§5).
 
 The three patches added by the gfx1100 port cannot reach gfx1151 by construction (0011 is an additive
 predicate widening; 0012 is an `if (GGML_CUDA_CC_IS_RDNA3_0(cc))` arm; the per-M `nwarps` experiment
@@ -41,7 +51,7 @@ script; the runtime env is `export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$L
 
 `GGML_CUDA_MMB_CFG=1` prints the resolved per-arch config once — gfx1151 should read
 `cc=0x1001151 dense_geom=0 min_t=512 glu_thresh=32 routed_thresh=32 tall=2 tiny_m=1/1
-f32split=1(min_m=128,min_k=0) cache=4 shadow=0/6144MB hc16=0 down16=0 gatemix=0 blk16=0 res16=0
+f32split=1(min_m=128,min_k=0) cache=4 shadow=0/6144MB hc16=1 down16=0 gatemix=1 blk16=0 res16=0
 glu=1 bf16w=1 iq3xxs_glu=0 routed=1`.  **Note `dense_geom=0` and `routed=1`** (the gfx1201 line reads
 `dense_geom=1 … routed=0`) — the RDNA4 scoping must NOT have leaked into the RDNA3_5 row.  The `cc`
 the dump prints is `0x1000000 + <gfx number>`: `cc=0x1001201` was observed on gfx1201, so gfx1151 is
@@ -73,11 +83,10 @@ Run both on a dense model, a MoE model and (if it fits) qwen4exp.  The guarantee
 **f16, bf16, q5_0, q5_1, iq4_nl** (`q4_0`/`q4_1`/`q8_0` relax the *logits* level per `GREEDY-PURITY.md`
 §36 — text purity still holds).  Gate 4 (MTP) is the decode half of the same contract.
 
-**Optional regression aid (opt-in beta tree only).**  While MMB is *unset* it is r12 plus the
-arch-neutral groups, and *for this beta tree* those measured bit-identical to r12 on gfx1201 (PPL
-9.4293, all five same-seed hashes).  That comparison is a useful bisection tool — which neutral group
-has a numeric side effect? — but it is **not** a gate: it is meaningless once MMB is defaulted on.  See
-the 2026-09-22 correction record in `wip/closing-the-gap/closing-the-gap.md`.
+**Cross-build comparison (historical).**  The pre-consolidation beta was MMB-opt-in on r12, and with
+MMB unset it measured bit-identical to r12 on gfx1201 (PPL 9.4293, all five same-seed hashes).  That is
+**not** a gate — and it no longer applies, since the consolidated set defaults MMB on.  See the
+2026-09-22 correction record in `wip/closing-the-gap/closing-the-gap.md`.
 
 ### Gate 2 — `GGML_CUDA_MMB=1` must recover the original gfx1151 win
 
@@ -127,13 +136,13 @@ measured 0.63624 (dense 27B), 0.72372 (MoE 35B) and 0.70093/0.64372 (qwen4exp, v
 
 | knob | default | effect when changed |
 |---|---|---|
-| `GGML_CUDA_MMB` | **0 (off)** | the master switch; off = the delivery's MMQ paths |
+| `GGML_CUDA_MMB` | **1 (on)** | the master switch; `=0` = the delivery's MMQ paths |
 | `GGML_CUDA_MMB_CFG=1` | — | dump the resolved per-arch config (`env || arch default`) once |
 | `GGML_CUDA_MMB_TYPES=<csv>` | arch mask | restrict the MMB weight types (gfx1151 = the full set) |
 | `GGML_CUDA_MMB_DENSE_TYPES=<csv>` | arch mask | the dense-path types (gfx1151 = the full set) |
 | `GGML_CUDA_MMB_DENSE` / `_ROUTED` / `_GLU` | per arch | force a path on/off |
 | `GGML_CUDA_MMB_MIN_T` / `_TALL` / `_TINY_M` / `_TINY_TT` / `_F32SPLIT` / `_CACHE` | per arch | the tuning knobs |
-| `GGML_CUDA_MMB_HC16` / `_DOWN16` | **0** | the bf16 producers (measured inert on RDNA4; +1-3 % on gfx1151 per the original record) |
+| `GGML_CUDA_MMB_HC16` / `_DOWN16` | **1** / **0** | the bf16 producers (HC16 default ON since the consolidation; DOWN16 still opt-in; measured inert on RDNA4, +1-3 % on gfx1151 in the original record) |
 | `GGML_CUDA_FA_KV_NATIVE` | auto | the native q8_0/q4_0 (on) and bf16 (off) FA cache paths |
 | `LLAMA_QSA3_ENABLE` | compile-time | the packed-block WMMA QSA path |
 
@@ -152,7 +161,8 @@ gate name, not "it was slower".
 ## 5. gfx1151 re-validation — 2026-09-22 (session 8, r13 campaign)
 
 Run on the **r13 + `beta/mmb-general` + gap-closing `0001..0014`/`0016`/`0017`** campaign (fork
-`gap-closing-r13`) — a superset of this 12-patch set, so a green here implies a green for the beta.
+`gap-closing-r13`) — the tree the 28-patch set now reproduces exactly (the consolidation is
+tree-identical), so a green here is a green for the set.
 Box: gfx1151, ROCm 7.14, `MMB_CFG cc=0x1001151` (RDNA3_5 row: `dense_geom=0 routed=1 f32split=1
 min_t=512`).
 
@@ -176,3 +186,33 @@ min_t=512`).
   `wip/closing-the-gap/2026-09-22-mmb-quant-coverage.md`.
 
 **Verdict:** gfx1151 re-validation GREEN.  The only gate the beta window owed is closed.
+
+---
+
+## 6. 2026-09-25 — consolidated 28-patch set, full reproduction
+
+Ran the *shipped* `scripts/apply-beta.sh` flow end-to-end on a fresh upstream clone (the user path),
+then the standard gates, to confirm the consolidation did not change behaviour.  The applied tree is
+`468c64963ae45e72367c73809efa7cc038217e8a` (identical to the 2026-09-22 tree), so the numbers carry.
+
+```sh
+git clone https://github.com/ggml-org/llama.cpp /tmp/llama-beta-verify && cd /tmp/llama-beta-verify
+git checkout ebbb18522
+bash <repo>/scripts/apply-beta.sh . <repo>      # apply-all + 28/28, tree 468c6496...
+~/bin/build-llama-rocm-714                      # clean -j16 build, EXIT 0
+```
+
+* **Apply** — `apply-beta.sh` auto-ran `apply-all.sh` (16/16) then `28/28`; tree asserted
+  `468c6496…`.
+* **Build** — clean `-j16`, EXIT 0 (6 m 38 s cold; ccache warm on repeat).
+* **Config** — `MMB_CFG cc=0x1001151 dense_geom=0 … hc16=1 … gatemix=1 … routed=1`.
+* **Width probe** — `test-logits-width-probe <qwen4exp IQ4_NL> prose 1024 512`:
+  `width_purity=PASS (worst maxdiff 0)`, row-0 `268e0673300b7a33` — matches.
+* **Oracles** — `FLASH_ATTN_QSA` OK, `GATED_DELTA_NET` OK.
+* **Coherence** — `plain == draft-mtp n3` byte-identical (`434 chars sha=984263fb8e0f`).
+* **MTP** — qwen4exp, `-n 3000`, `draft-mtp n3`: acceptance **0.84281** (acc/pos
+  0.924/0.842/0.762), **55.7 t/s vs plain 31.5 t/s** → MTP ≥ plain.
+* **llama-bench** — qwen4exp IQ4_NL q8_0 KV: pp512 **1007.1 t/s**, tg128 **32.56 t/s**.
+
+**Verdict:** GREEN.  The consolidation is behaviour-preserving (bare tree identity), and the shipped
+`apply-beta.sh` reproduces it from a clean clone.
