@@ -2,12 +2,10 @@
 
 **Audience:** the agent continuing the campaign on the **3× Radeon AI PRO R9700 (gfx1201, RDNA4)** box,
 `soar`.
-**Goal:** pick up the **open items** below.  OP-1/OP-2/OP-3 are **closed** (`0029` shipped
-default-on, `0030` opt-in, `0016`/`0027`/`0028` done, no per-type MoE band) and only three items remain,
-in priority order: **OP-4** the unrun gates (`llama-imatrix`, the isolated `0001`/`0008` A/Bs, the
-M-RoPE image case), **OP-5.2** the `0011` HC BF16-stream re-test (now that `0027` lets its markings run
-under `-sm tensor`), and **OP-6** the `fattn-mma-f16` build-time duplication.  **§0.5 is the
-next-session run plan (start there);** §2.4-§2.6 is the detail.
+**Goal:** pick up the **open items** below.  OP-1/OP-2/OP-3/OP-4/OP-5 are **closed** (`0029` shipped
+default-on, `0030` opt-in, `0016`/`0027`/`0028` done, no per-type MoE band; the `llama-imatrix` +
+`0001`/`0008` A/Bs are run, OP-5.2 is parked) and only **OP-6** remains — the `fattn-mma-f16`
+build-time duplication.  **§0.5 is the run plan (start there);** §2.6 is the detail.
 
 **Companion files:**
 | file | what |
@@ -16,6 +14,7 @@ next-session run plan (start there);** §2.4-§2.6 is the detail.
 | [`gfx1151-closing.md`](gfx1151-closing.md) | the gfx1151 revalidation/port brief (the MMVQ band halves and the `n7`/`n8` matrix are handed there). |
 | [`gfx1100-closing.md`](gfx1100-closing.md) | the single-7900-XTX brief. |
 | [`2026-09-24-op3-per-type-moe-band.md`](2026-09-24-op3-per-type-moe-band.md) | OP-3: the per-type MoE band measurement + the launch-bound trap (closed, no per-type band). |
+| [`2026-09-24-op4-imatrix-and-hc-gates.md`](2026-09-24-op4-imatrix-and-hc-gates.md) | OP-4 (`llama-imatrix` smoke + the pre-existing `-sm tensor` imatrix corruption, the `0001`/`0008` A/Bs) and OP-5.2 (`0011` under `-sm tensor`). |
 | [`closing-the-gap.md`](closing-the-gap.md) · [`README.md`](README.md) | the campaign handover + patch inventory. |
 **Delivery policy:** `AGENTS.md` — default-on policy (a beneficial feature ships on, an env var only
 **disables**), purity rules, and **never push the `~/llama.cpp` fork**.  Push the delivery repo only if
@@ -33,12 +32,10 @@ negative, the `0028` W=9 verify-cliff fix, and (2026-09-24) all of **OP-1** — 
 fix (`0029`), the opt-in structural input placement (`0030`), the OP-2/OP-3 four-axis re-baseline, the
 OP-5.1 `0013` redundancy verdict, and OP-1.4 (draft sampler, won't-fix).
 
-**Open** (this file) — the three remaining items:
+**Open** (this file) — the one remaining item:
 
 | id | item | priority | effort | where |
 |---|---|---|---|---|
-| **OP-4** | unrun gates: `llama-imatrix` BF16 split check, isolated `0001`/`0008` A/Bs, M-RoPE image (`0005`) | medium | ~3-4 h | §2.4 / §0.5 |
-| **OP-5.2** | `0011` HC BF16 streams: re-test under `-sm tensor` now that `0027` runs the markings (expected flat) → park | low | ~1 h | §2.5 / §0.5 |
 | **OP-6** | `fattn-mma-f16` per-TU native-arm duplication (7.26 MB / 229 s per instance TU) — build-time only, choose finer generated-file granularity | low / parked in `TODO.md` | ~1 day | §2.6 / §0.5 |
 
 ---
@@ -84,7 +81,13 @@ at B=9, -0.2% at B=12, -2.2% at B=13.  If the relevant ceiling is ever raised pa
 kernel split (two 8-warp blocks along the token axis), **not** a per-type cap.  The gfx1151 per-type
 mitigation shape is [`gfx1151-closing.md`](gfx1151-closing.md) §4.5.
 
-### OP-4 — the unrun gates
+### OP-4 — the unrun gates: **CLOSED 2026-09-24** (d deferred)
+
+(a) the imatrix smoke check, (b) the `0001` A/B and (c) the `0008` A/B are done.  Headline: the
+imatrix smoke check passes, but `-sm tensor` `llama-imatrix` is corrupt (**pre-existing**;
+`llama-perplexity` is fine) — new follow-up lead, out of scope.  `0001` / `0008` both validated.
+(d) M-RoPE image not run (tooling).  Record:
+[`2026-09-24-op4-imatrix-and-hc-gates.md`](2026-09-24-op4-imatrix-and-hc-gates.md).  Harnesses below.
 
 **(a) `llama-imatrix` (`0019`/`0023`) - a split/scheduler smoke check.**  HC16 is RDNA3_5-gated, so on
 RDNA4 this only proves the 3-GPU `-sm tensor` forward survives a long calibration run.
@@ -115,16 +118,12 @@ text to ~12k tokens then an image, and check for the M-RoPE `X < Y` / cell-windo
 `llama-mtmd-cli` or `llama-server` + an image request.  If the tooling isn't ready, note it as not-run
 rather than blocking on it.
 
-### OP-5.2 — `0011` under `-sm tensor` (expected flat -> park)
+### OP-5.2 — `0011` under `-sm tensor`: **CLOSED 2026-09-24, parked**
 
-`0027` now forwards the CUDA `graph_optimize` markings under `-sm tensor`, so `0011`'s
-`LLAMA_HC_BLK16`/`LLAMA_HC_RES16` markings fire there (before `0027` they never ran - see
-[`2026-09-23-gfx1201-lossy-prefill-transfer.md`](2026-09-23-gfx1201-lossy-prefill-transfer.md)
-Finding 1).  Re-run the `-sm tensor` A/B and confirm with `GGML_CUDA_MMB_MARK_LOG=2` that
-`HC_BLK16 comb=` is > 0, then measure; expect flat (the `-sm layer` result was 3427 vs 3444 at pp8192,
-and the effect is an APU/unified-memory bandwidth one that does not apply on three discrete cards).
-Flat -> keep default-OFF and park.  `0023` HC16 stays RDNA3_5-gated -> park unless a 48 GB single-GPU
-RDNA4 box appears.
+`0027` closes the gap: the HC marking pass now runs under `-sm tensor` (`HC_BLK16 comb=` 582×).  The
+A/B is **+1.3 %**, all from `LLAMA_HC_RES16` (`blk16` is inert — `prod=0` on every candidate).  Lossy
+→ stays default-OFF.  Record:
+[`2026-09-24-op4-imatrix-and-hc-gates.md`](2026-09-24-op4-imatrix-and-hc-gates.md).
 
 ### OP-6 — `fattn-mma-f16` build-time (parked)
 
@@ -166,6 +165,8 @@ type, instance TUs `T`/`W`).  Evidence + tools: `wip/build-time-regression/`; th
 | **OP-2** MTP re-baseline | **DONE** — four-axis + `n7`/`n8`/adaptive, no env, CPU quiet every arm; `n8` near-tied with `n7` and wins recall (the old gap was `0028`) | `2026-09-24-mtp-cpu-spin-automatic.md` §4 |
 | **OP-3** matrix half | **DONE** — the full `n7`/`n8`/adaptive matrix with the fix | `2026-09-24-mtp-cpu-spin-automatic.md` §4 |
 | **OP-3** per-type MoE band | **CLOSED, no per-type band** — the unconditional floor at 16 wins for every routed-expert type in the relevant `B <= 13` range (k-quants +26%, IQ4_NL +13% at B=9); only IQ3_XXS/IQ4_XS regress and only from `B=13`.  The `__launch_bounds__` widening has no `B <= 8` cost (138-way register-identical, ±0.6% runtime) | `2026-09-24-op3-per-type-moe-band.md` |
+| **OP-4** gates | **DONE** — (a) imatrix smoke passes but `-sm tensor` imatrix is corrupt (**pre-existing**, perplexity fine); (b) `0001` default fusion +5 % over the op; (c) `0008` default `TALL_MIN_M=16` ahead; (d) M-RoPE image not run | `2026-09-24-op4-imatrix-and-hc-gates.md` |
+| **OP-5.2** `0011` `-sm tensor` | **PARKED** — `0027` closes the marking gap (`comb=` 582×); A/B +1.3 %, all from `LLAMA_HC_RES16` (`blk16` inert); lossy → default-OFF | `2026-09-24-op4-imatrix-and-hc-gates.md` |
 | **OP-5.1** `0013` on RDNA4 | **REDUNDANT** — matcher fires 0× with `0016` ON, 4× with `LLAMA_QSA_SCORE_WMMA=0`; no port | `2026-09-24-mtp-cpu-spin-automatic.md` §5 |
 | **OP-1** structural input placement | **INVESTIGATED, opt-in (`0030`)** — `LLAMA_DEVICE_INPUT=1` moves the input layer to the output/Meta device (0 CPU splits, byte-identical) but the Meta-split GPU gather is ~2.6 % slower MTP than host input + `0029`, so it is not defaulted | `2026-09-24-mtp-cpu-spin-structural.md` |
 | **OP-1.4** draft sampler under `-sm tensor` | **CLOSED, won't fix** — blocked by the Meta backend (`handle_per_row` asserts on the vocab-split logits; needs a distributed top-k) and not a measurable win even under `-sm layer` (75.6 vs 75.1 t/s, noise) | `2026-09-24-mtp-draft-sampler-tensor-split.md` |
@@ -365,12 +366,13 @@ near-tied everywhere and **wins recall** — the `n_max 8` question is workload-
   → **DONE 2026-09-24** (OP-2, all five axes incl. the phase-switch prompt).
 * `llama-imatrix` (`0019`/`0023`) — the NanBeige model is absent here; substitute another BF16 model.
   Note HC16 is RDNA3_5-gated, so on RDNA4 this is really a scheduler/split regression check.
-  **← open; command in §0.5(a).**
+  → **DONE 2026-09-24: clean run, but `-sm tensor` imatrix is corrupt (pre-existing; perplexity fine).**
+  See [`2026-09-24-op4-imatrix-and-hc-gates.md`](2026-09-24-op4-imatrix-and-hc-gates.md).
 * `0001` (`hc_combine_norm`) / `0008` (M=4 HC inject) **isolated** A/Bs — they are exercised by the
   qwen4exp gates but never singled out.
-  **← open; gates in §0.5(b)/(c)** (`LLAMA_FUSED_DSV4_HC_POST=1` / `GGML_CUDA_MMB_TALL_MIN_M=0`).
+  → **DONE 2026-09-24: `0001` default fusion +5 %; `0008` default `TALL_MIN_M=16` ahead (interleaved).**
 * §6.6 **M-RoPE image case** (`0005`) — needs the vision projector; the gfx1151 repro was an image after
-  ~12k tokens of text.  **← open, lowest priority; §0.5(d).**
+  ~12k tokens of text.  **← not run (tooling); the only OP-4 item still open.**
 
 ### 2.5 OP-5 — remaining RDNA3_5-gated kernels (low priority)
 
@@ -384,9 +386,10 @@ near-tied everywhere and **wins recall** — the `n_max 8` question is workload-
   `LLAMA_QSA_SCORE_WMMA=0`.  `0016` removes the chain; the port would be dead code.  Gate change
   reverted.  Detail: the OP-1 record §5.
 * **`0011` HC BF16 streams / `0023` HC16**: `0011` needs the meta `graph_optimize` path (`0027`, done)
-  to run under `-sm tensor`; **← the only OP-5 item still open; run plan in §0.5.**  `0023`'s HC16 is
-  RDNA3_5-gated and not bandwidth-bound on discrete RDNA4 → **park** unless a 48 GB single-GPU RDNA4
-  box appears.
+  to run under `-sm tensor`; **← DONE 2026-09-24**: `0027` closes the gap (`comb=` 582×), the A/B is
+  +1.3 % all from `LLAMA_HC_RES16` (`blk16` inert), lossy so it stays default-OFF → **parked**.  `0023`'s
+  HC16 is RDNA3_5-gated and not bandwidth-bound on discrete RDNA4 → **park** unless a 48 GB single-GPU
+  RDNA4 box appears.
 
 ### 2.6 OP-6 — build-time critical path (parked in `TODO.md`)
 
