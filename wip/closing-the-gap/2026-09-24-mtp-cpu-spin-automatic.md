@@ -135,6 +135,14 @@ controller keeps reasoning/phase-switch.  The `gfx1201` `n_max 8` question is th
 on this box**, not an artefact of the gfx1151 box; the depth choice is workload-dependent, which is
 exactly what the adaptive ceiling-8 controller exploits on R/X.
 
+**OP-3 odd-row dense model — none available; controls confirmed clean.**  A GGUF header scan (all 2-D
+tensors) shows 27B IQ3_S / 35B-A3B Q3_K_M / gemma-4-12B have **zero** weights with `ne[1] >= 128 &&
+ne[1] % 128 != 0` (their only odd rows are `ssm_alpha`/`ssm_beta`, ne1 32/48).  qwen4exp's odd-row
+dense weight is `output_hc_down.weight` (**ne1 = 320**, 97 layers); every other qwen4exp weight with
+ne1 ≥ 128 is `% 128 == 0`.  So `0028`'s RDNA4 dense band is qwen4exp/`output_hc_down`-specific by
+construction and there is no other box model with an odd-row dense weight to A/B.  (The per-type MoE
+band floor remains open — see §6.)
+
 ## 5. OP-5.1 — `0013` (`idx_relu_sum`) is redundant on RDNA4
 
 Temporarily widened the `0013` call-site gate to RDNA4 (`ggml-cuda.cu`, `GGML_CUDA_CC_IS_RDNA3_5(cc)

@@ -34,7 +34,7 @@ negative, the `0028` W=9 verify-cliff fix, and (2026-09-24) the **OP-1 automatic
 |---|---|---|---|
 | **OP-1** | MTP CPU-spin: runtime half **DONE** (`0029`, no env vars needed); **structural half** (input/PLE `GET_ROWS` on a device) + **OP-1.4** draft-sampler offload still open | ~~highest~~ medium | §2.1 |
 | **OP-2** | re-baseline the gfx1201 qwen4exp MTP throughput — **DONE** (four-axis + `n7`/`n8`/adaptive, no env) | ~~high~~ DONE | §2.2 |
-| **OP-3** | `0028` follow-ups: matrix **DONE**; per-type MoE band tuning + another odd-row dense model open | medium | §2.3 |
+| **OP-3** | `0028` follow-ups: matrix **DONE** (odd-row dense model: none available, controls confirmed clean); per-type MoE band tuning open | medium | §2.3 |
 | **OP-4** | validation gates not run: four-axis MTP with the fix (**DONE** as OP-2), `llama-imatrix`, `0001`/`0008` isolated A/Bs, the M-RoPE image case | medium | §2.4 |
 | **OP-5** | remaining RDNA3_5-gated kernels (`0013` = **redundant, DONE**; `0011`/`0023` parked) | low | §2.5 |
 | **OP-6** | build-time critical path (the `fattn-mma-f16` per-type instance blow-up) | low / parked in `TODO.md` | §2.6 |
@@ -226,6 +226,13 @@ near-tied everywhere and **wins recall** — the `n_max 8` question is workload-
   afterwards).
 * **another odd-row dense model** — the RDNA4 dense rule (`nrows_x % 128 != 0`) was only exercised on
   qwen4exp; 27B/35B are the clean controls.  If one is available, A/B a dense model with odd rows.
+  → **DONE 2026-09-24: none available, and the controls are confirmed clean.**  A GGUF header scan
+  (`gguf` reader, all 2-D tensors) shows 27B IQ3_S / 35B-A3B Q3_K_M / gemma-4-12B have **zero**
+  weights with `ne[1] >= 128 && ne[1] % 128 != 0` (their only odd rows are `ssm_alpha`/`ssm_beta`,
+  ne1 32/48).  qwen4exp's odd-row dense weight is `output_hc_down.weight` (**ne1 = 320**, one per
+  layer, 97 total); every other qwen4exp weight with ne1 ≥ 128 is `% 128 == 0`.  So the RDNA4 dense
+  band is qwen4exp/`output_hc_down`-specific by construction and the 27B/35B controls carry no such
+  weight — there is no other box model to A/B.
 * **gfx1151/gfx1100 revalidation/port** is handed off — see [`gfx1151-closing.md`](gfx1151-closing.md).
 
 ### 2.4 OP-4 — validation gates not yet run
