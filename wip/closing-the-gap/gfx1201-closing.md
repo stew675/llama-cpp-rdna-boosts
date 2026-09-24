@@ -533,3 +533,20 @@ and width purity is untouched.  A RDNA4 WMMA port remains a candidate (§8).
 | `0024` input layer GPU | **no** | superseded by `0025` | — |
 | `0025` host-buffer input | **no-op** (discrete GPU) | `prop.integrated = 0`; scheduler guard not reached | `GGML_FORCE_NO_INTEGRATED=1` matched default |
 | `0026` sparse MTP default ON | qwen4exp | exercised | 40K/128K purity |
+
+**Rule-5 batched verify-width gate (§6.7/S14.7f)** — 27B UD-Q4_K_XL, q8_0 KV, 1 GPU,
+`llama-batched-bench -npp 16 -ntg 32 -npl 1,4,8`, three interleaved rounds (`S_TG = TG*B/T_TG`):
+
+| width | closing (r1/r2/r3) | r13+beta (r1/r2/r3) |
+|---|---|---|
+| B=1 | 28.67 / 28.67 / 28.70 | 28.70 / 28.70 / 28.74 |
+| B=4 | 76.46 / 76.53 / 76.84 | 76.65 / 76.65 / 76.90 |
+| B=8 | 90.36 / 90.46 / 90.90 | 90.81 / 90.82 / 90.87 |
+
+Within noise at every width (≤0.5 %, both directions across rounds).  **PASS** — the check that
+caught the 2026-09-12 mmvq regression.
+
+**Still open / not run this session:** the qwen4exp four-axis MTP set (only the prose axis was
+measured), the `llama-imatrix` `0019`/`0023` gate (the NanBeige model is absent on this box — note
+HC16 is RDNA3_5-gated, so the gate is a no-op on RDNA4 anyway), and the `0001`/`0008` isolated
+fusion A/Bs (they are exercised by the qwen4exp gates but not singled out).
