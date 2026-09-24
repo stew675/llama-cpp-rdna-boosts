@@ -2,9 +2,12 @@
 
 **Audience:** the agent continuing the campaign on the **3× Radeon AI PRO R9700 (gfx1201, RDNA4)** box,
 `soar`.
-**Goal:** pick up the **open items** below.  The campaign's validation/porting pass on this box is
-largely done — what is left is the MTP CPU-spin automatic path selection (OP-1, the big one), a
-throughput re-baseline, the `0028` follow-ups, a few unrun gates, and two low-priority/parked items.
+**Goal:** pick up the **open items** below.  OP-1/OP-2 are **closed** (`0029` shipped default-on,
+`0030` opt-in, `0016`/`0027`/`0028` done) and only four items remain, in priority order:
+**OP-3** the per-type MoE band floor, **OP-4** the unrun gates (`llama-imatrix`, the isolated
+`0001`/`0008` A/Bs, the M-RoPE image case), **OP-5.2** the `0011` HC BF16-stream re-test (now that
+`0027` lets its markings run under `-sm tensor`), and **OP-6** the `fattn-mma-f16` build-time
+duplication.  **§0.5 is the next-session run plan (start there);** §2.3-§2.6 is the detail.
 
 **Companion files:**
 | file | what |
@@ -25,19 +28,117 @@ the maintainer asks.
 pass (build, oracles, width purity, same-seed coherence, intra-build `plain == draft-mtp`, qwen4exp
 prefill A/B, PPL parity, the rule-5 batched gate), the four RDNA4 ports/enablements (`0003`,
 `0016`, `0017`, `0027`), the `0004` conv-fusion `-sm tensor` purity fix, the `0010`/`0011` lossy-transfer
-negative, the `0028` W=9 verify-cliff fix, and (2026-09-24) the **OP-1 automatic MTP CPU-spin fix**
-(`0029`) with the OP-2/OP-3 four-axis re-baseline and the OP-5.1 `0013` redundancy verdict.
+negative, the `0028` W=9 verify-cliff fix, and (2026-09-24) all of **OP-1** — the automatic MTP CPU-spin
+fix (`0029`), the opt-in structural input placement (`0030`), the OP-2/OP-3 four-axis re-baseline, the
+OP-5.1 `0013` redundancy verdict, and OP-1.4 (draft sampler, won't-fix).
 
-**Open** (this file):
+**Open** (this file) — the four remaining items:
 
-| id | item | priority | where |
-|---|---|---|---|
-| **OP-1** | MTP CPU-spin: runtime half **DONE** (`0029`, no env vars needed); structural half **investigated, opt-in** (`0030`, `LLAMA_DEVICE_INPUT=1` — works, 0 CPU splits, but ~2.6 % slower so not defaulted); **OP-1.4** draft-sampler offload **CLOSED, won't fix** (Meta-backend top-k blocker + no measurable win) | ~~highest~~ CLOSED | §2.1 |
-| **OP-2** | re-baseline the gfx1201 qwen4exp MTP throughput — **DONE** (four-axis + `n7`/`n8`/adaptive, no env) | ~~high~~ DONE | §2.2 |
-| **OP-3** | `0028` follow-ups: matrix **DONE** (odd-row dense model: none available, controls confirmed clean); per-type MoE band tuning open | medium | §2.3 |
-| **OP-4** | validation gates not run: four-axis MTP with the fix (**DONE** as OP-2), `llama-imatrix`, `0001`/`0008` isolated A/Bs, the M-RoPE image case | medium | §2.4 |
-| **OP-5** | remaining RDNA3_5-gated kernels (`0013` = **redundant, DONE**; `0011`/`0023` parked) | low | §2.5 |
-| **OP-6** | build-time critical path (the `fattn-mma-f16` per-type instance blow-up) | low / parked in `TODO.md` | §2.6 |
+| id | item | priority | effort | where |
+|---|---|---|---|---|
+| **OP-3** | **per-type MoE band floor** — is `MMVQ_MOE_MAX_BATCH_SIZE=16` a win for *every* routed expert type at W=9..16, or does one need a per-type cap?  (the rest of OP-3 is DONE: matrix + odd-row-dense closed) | **high** | ~2 h, 1 A/B | §2.3 / §0.5 |
+| **OP-4** | unrun gates: `llama-imatrix` BF16 split check, isolated `0001`/`0008` A/Bs, M-RoPE image (`0005`) | medium | ~3-4 h | §2.4 / §0.5 |
+| **OP-5.2** | `0011` HC BF16 streams: re-test under `-sm tensor` now that `0027` runs the markings (expected flat) → park | low | ~1 h | §2.5 / §0.5 |
+| **OP-6** | `fattn-mma-f16` per-TU native-arm duplication (7.26 MB / 229 s per instance TU) — build-time only, choose finer generated-file granularity | low / parked in `TODO.md` | ~1 day | §2.6 / §0.5 |
+
+---
+
+## 0.5 Next session — the run plan (start here)
+
+**State.**  `~/llama.cpp` branch `closing-gfx1201` = delivery r13 + `beta/mmb-general` + closing
+`0001..0014`/`0016..0030`, tip tree **`99b429a60d441f814c84737cfa57803bc15a2f6d`** (29 patches);
+campaign repo `gap-closing` @ `4be503f`.
+
+```sh
+cd ~/llama.cpp && BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714
+export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib:$LD_LIBRARY_PATH
+# fast loop: cmake --build build-rocm --target llama-cli llama-bench llama-batched-bench llama-imatrix test-backend-ops -j 16
+```
+
+### OP-3 (do first) — per-type MoE band
+
+**Question.**  `0028` floors the routed-expert MMVQ band at `MMVQ_MOE_MAX_BATCH_SIZE=16`
+unconditionally on AMD.  The per-arch `get_mmvq_mmid_max_batch_rdna3` table caps types at 4-6 and the
+floor overrides all of them.  Is W=9..16 a win for **every** expert type, or does one regress?
+(rationale + the mitigation shape: [`gfx1151-closing.md`](gfx1151-closing.md) §4.5.)
+
+```sh
+cd ~/llama.cpp
+M=/llm/models/Qwen3.6/35B-A3B/Q3_K_M/Qwen3.6-35B-A3B-UD-Q3_K_M.gguf    # then Q4_K_M
+for arm in on off on off; do
+  if [ $arm = off ]; then export GGML_CUDA_DISABLE_MMVQ_MOE_BAND=1; else unset GGML_CUDA_DISABLE_MMVQ_MOE_BAND; fi
+  timeout 900 build-rocm/bin/llama-batched-bench -m "$M" -ngl 99 -sm tensor -c 8192 -b 2048 -ub 2048 \
+    -npp 16 -ntg 32 -npl 1,4,8,9,10,12,16 > /tmp/bb_${arm}_$RANDOM.out 2>/dev/null
+done
+grep -E '^\| *16 \| *32 ' /tmp/bb_*.out      # B=9..16 rows are the band; B<=8 is the control
+
+# and the qwen4exp cliff itself (IQ4_NL, the model 0028 was cut on; the w9-record harness):
+#   ... -ctk q8_0 -ctv q8_0 -npp 16 -ntg 32 -npl 6,7,8,9,10,11,12
+```
+
+**Decision.**  Band wins at every width for every type on both MoE models -> **close as a no-op** (the
+unconditional floor is right).  A specific expert type regresses at 9..16 -> implement a **per-type
+band** (a helper/exception list; narrowing `get_mmvq_mmid_max_batch_rdna3` alone does nothing because
+the floor clamps up afterwards).  The kernel is one-warp-per-token, so a per-type cap cannot
+re-introduce a width impurity below the cap - but re-run the W=1..8 purity hash anyway.
+
+**Traps.**  `--ctx-checkpoints 0`; interleave the arms; also watch the **W<=8** decode band (the
+`__launch_bounds__` widening 8->16 warps can cost occupancy there - the templated mitigation is
+[`gfx1151-closing.md`](gfx1151-closing.md) §5.1).  References:
+[`2026-09-24-qwen4exp-w9-verify-cliff.md`](2026-09-24-qwen4exp-w9-verify-cliff.md), `patches/0028`.
+
+### OP-4 — the unrun gates
+
+**(a) `llama-imatrix` (`0019`/`0023`) - a split/scheduler smoke check.**  HC16 is RDNA3_5-gated, so on
+RDNA4 this only proves the 3-GPU `-sm tensor` forward survives a long calibration run.
+`/llm/models/Qwen3.8/27B/BF16/…-00001-of-00002.gguf` is the only full BF16 model (54 GiB, 2 shards;
+fits 3x32 GiB).
+
+```sh
+build-rocm/bin/llama-imatrix -m /llm/models/Qwen3.8/27B/BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf \
+  -f prompts/prose-rdna-boosts.txt -ngl 99 -sm tensor -o /tmp/imatrix-bf16.dat
+```
+Require: no abort / no meta-split assert, a written imatrix, no NaN.  A build prefix is needed
+(`cmake --build build-rocm --target llama-imatrix -j 16`).
+
+**(b) `0001` `hc_combine_norm` isolated A/B.**  By default (`fused_dsv4_hc_post=false`) the plain HC
+chain is built and the graph optimizer's `hc_combine_norm` matcher — the one `0001` revived — fuses
+it; `LLAMA_FUSED_DSV4_HC_POST=1` forces the alternative `DSV4_HC_POST` op (the slower arm per the §7
+verdict).  A/B the two on qwen4exp IQ4_NL `pp8192,32768` (`llama-bench -r 3`, interleaved), confirm
+with `LLAMA_HC_CN_DEBUG=1` that the matcher fires, and record the delta + the greedy text at the gate.
+Prior art: [`2026-09-21-hc-combine-norm.md`](2026-09-21-hc-combine-norm.md).
+
+**(c) `0008` M=4 HC inject isolated A/B.**  `GGML_CUDA_MMB_TALL_MIN_M=0` restores the M=4 inject into
+the 384-row tall tile; A/B qwen4exp IQ4_NL `pp8192,32768`.  Expect the default (`16`) to win.  Prior
+art: [`2026-09-22-mmb-tall-min-m.md`](2026-09-22-mmb-tall-min-m.md) (the `0008` record).
+
+**(d) M-RoPE image case (`0005`) - lowest priority.**  Needs the vision projector
+(`/llm/models/Qwen3.8/Flash-Next/Q4_K_M/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf`): 3-GPU `-sm tensor`,
+text to ~12k tokens then an image, and check for the M-RoPE `X < Y` / cell-window abort.
+`llama-mtmd-cli` or `llama-server` + an image request.  If the tooling isn't ready, note it as not-run
+rather than blocking on it.
+
+### OP-5.2 — `0011` under `-sm tensor` (expected flat -> park)
+
+`0027` now forwards the CUDA `graph_optimize` markings under `-sm tensor`, so `0011`'s
+`LLAMA_HC_BLK16`/`LLAMA_HC_RES16` markings fire there (before `0027` they never ran - see
+[`2026-09-23-gfx1201-lossy-prefill-transfer.md`](2026-09-23-gfx1201-lossy-prefill-transfer.md)
+Finding 1).  Re-run the `-sm tensor` A/B and confirm with `GGML_CUDA_MMB_MARK_LOG=2` that
+`HC_BLK16 comb=` is > 0, then measure; expect flat (the `-sm layer` result was 3427 vs 3444 at pp8192,
+and the effect is an APU/unified-memory bandwidth one that does not apply on three discrete cards).
+Flat -> keep default-OFF and park.  `0023` HC16 stays RDNA3_5-gated -> park unless a 48 GB single-GPU
+RDNA4 box appears.
+
+### OP-6 — `fattn-mma-f16` build-time (parked)
+
+Each `fattn-mma-f16` instance TU instantiates the whole WMMA kernel **once per KV type** (0.90 -> 7.26
+MB, 6.7 -> 229 s per TU).  Option (b) - a runtime KV-type dispatch / `__noinline__` loader - was tried
+and **rejected** (build slower; -1.5-2.5 % prefill; the force-inlined loaders are what makes the native
+staging fast).  The remaining candidate is **finer generated-file granularity**: one MMA TU per
+`(ncols1, ncols2, head, KV type)` instead of per `(ncols1, ncols2, head)`.  Gate = a clean
+`cmake --build build-rocm --target ggml-hip -j16` timing vs the current ~236 s **plus** a same-seed +
+`pp/tg` runtime A/B.  After the build check the `nm -C` discipline (`AGENTS.md`: dispatch TU `U` per
+type, instance TUs `T`/`W`).  Evidence + tools: `wip/build-time-regression/`; the `TODO.md` entry.
 
 ---
 
@@ -245,7 +346,7 @@ near-tied everywhere and **wins recall** — the `n_max 8` question is workload-
 * **per-type MoE band** — the routed-expert band floor is currently unconditional 16 on AMD; if a
   specific expert type is slower on `mul_mat_vec_q_moe` at 9..16, the floor has to become per-type (see
   the gfx1151 brief §4.5 — narrowing the per-arch table alone does nothing because the floor clamps up
-  afterwards).
+  afterwards).  **← the only OP-3 item still open; run plan in §0.5.**
 * **another odd-row dense model** — the RDNA4 dense rule (`nrows_x % 128 != 0`) was only exercised on
   qwen4exp; 27B/35B are the clean controls.  If one is available, A/B a dense model with odd rows.
   → **DONE 2026-09-24: none available, and the controls are confirmed clean.**  A GGUF header scan
@@ -263,10 +364,12 @@ near-tied everywhere and **wins recall** — the `n_max 8` question is workload-
   → **DONE 2026-09-24** (OP-2, all five axes incl. the phase-switch prompt).
 * `llama-imatrix` (`0019`/`0023`) — the NanBeige model is absent here; substitute another BF16 model.
   Note HC16 is RDNA3_5-gated, so on RDNA4 this is really a scheduler/split regression check.
+  **← open; command in §0.5(a).**
 * `0001` (`hc_combine_norm`) / `0008` (M=4 HC inject) **isolated** A/Bs — they are exercised by the
   qwen4exp gates but never singled out.
+  **← open; gates in §0.5(b)/(c)** (`LLAMA_FUSED_DSV4_HC_POST=1` / `GGML_CUDA_MMB_TALL_MIN_M=0`).
 * §6.6 **M-RoPE image case** (`0005`) — needs the vision projector; the gfx1151 repro was an image after
-  ~12k tokens of text.
+  ~12k tokens of text.  **← open, lowest priority; §0.5(d).**
 
 ### 2.5 OP-5 — remaining RDNA3_5-gated kernels (low priority)
 
@@ -280,16 +383,17 @@ near-tied everywhere and **wins recall** — the `n_max 8` question is workload-
   `LLAMA_QSA_SCORE_WMMA=0`.  `0016` removes the chain; the port would be dead code.  Gate change
   reverted.  Detail: the OP-1 record §5.
 * **`0011` HC BF16 streams / `0023` HC16**: `0011` needs the meta `graph_optimize` path (`0027`, done)
-  to run under `-sm tensor`; `0023`'s HC16 is RDNA3_5-gated and not bandwidth-bound on discrete RDNA4 →
-  **park** unless a 48 GB single-GPU RDNA4 box appears.
+  to run under `-sm tensor`; **← the only OP-5 item still open; run plan in §0.5.**  `0023`'s HC16 is
+  RDNA3_5-gated and not bandwidth-bound on discrete RDNA4 → **park** unless a 48 GB single-GPU RDNA4
+  box appears.
 
 ### 2.6 OP-6 — build-time critical path (parked in `TODO.md`)
 
 The `fattn-mma-f16` per-type instance set is the remaining clean-build critical path (0.90 → 7.26 MB
 per instance TU, 6.7 → 229 s; each instance file carries one WMMA kernel copy per KV type).  The tile
-half was fixed in r5; the MMA half needs a code-path change (finer generated-file granularity, or a
-runtime KV-type dispatch in the loader) with its own A/B.  Not gfx1201-specific, but measured here —
-see `wip/build-time-regression/` and `TODO.md`.
+half was fixed in r5; the MMA half needs a code-path change (finer generated-file granularity) with its
+own A/B — **the concrete plan (and why the runtime-dispatch option is out) is §0.5 / OP-6.**  Not
+gfx1201-specific, but measured here — see `wip/build-time-regression/` and `TODO.md`.
 
 ---
 
@@ -434,6 +538,15 @@ name, not "it was slower".  For MTP use `benchmarks/mtp-adaptive-methodology.md`
 
 ## 4. Session log (open-work sessions, newest first)
 
+### 2026-09-24 — session 9d: handover for the remaining OP-3/OP-4/OP-5.2/OP-6
+
+No measurements.  The brief was rewritten for a fresh session: **§0.5 is now the run plan** with the
+build/state header for every remaining item and the exact commands/gates for
+OP-3 (per-type MoE band), OP-4 (`llama-imatrix`, isolated `0001`/`0008` A/Bs, M-RoPE image),
+OP-5.2 (`0011` under `-sm tensor`, expected flat) and OP-6 (`fattn-mma-f16` build time), and §2.3-§2.6
+now point at it.  State at handover: `closing-gfx1201` tree `99b429a6…` (29 patches), campaign
+`gap-closing` @ `4be503f`.
+
 ### 2026-09-24 — session 9c: OP-1.4 closed (won't fix) + the qwen4exp prefill re-check
 
 **OP-1.4 — draft sampler backend offload under `-sm tensor`: CLOSED, won't fix.**  Lifting the upstream
@@ -473,9 +586,9 @@ rejects host buffers).  Full detail:
 `pp2048` 2475 t/s, fresh apply 29/29 → tree
 `99b429a60d441f814c84737cfa57803bc15a2f6d`.
 
-**Still open:** OP-3 per-type MoE band, OP-4 (`llama-imatrix`, isolated `0001`/`0008` A/Bs, M-RoPE
-image), OP-5.2 `0011`, OP-6 build time.  (OP-1 is fully closed: `0029` shipped, `0030` opt-in, 1.4 won't
-fix.)
+**Still open (next-session plan in §0.5):** OP-3 per-type MoE band, OP-4 (`llama-imatrix`, isolated
+`0001`/`0008` A/Bs, M-RoPE image), OP-5.2 `0011`, OP-6 build time.  (OP-1 is fully closed: `0029`
+shipped, `0030` opt-in, 1.4 won't fix.)
 
 ### 2026-09-24 — session 9: OP-1 automatic CPU-spin fix (`0029`) + OP-2/OP-3 re-baseline + OP-5.1
 
