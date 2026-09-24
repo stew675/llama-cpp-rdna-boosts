@@ -1,4 +1,4 @@
-From 2af88bc06bec07ff2e6bee354a771377d9f153b6 Mon Sep 17 00:00:00 2001
+From 03857e4c686999e713143059e91325beee00b976 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 24 Sep 2026 04:46:07 -0500
 Subject: [PATCH] gap-closing WIP: run the child graph_optimize markings under
@@ -136,10 +136,10 @@ index 06147cd72..0e1ea43e6 100644
  
      size_t iga = 0; // i graph aux
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index c05282294..3d5c3275e 100644
+index c17981dc0..003be2475 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -6651,6 +6651,19 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+@@ -6653,6 +6653,19 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
  static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
@@ -159,7 +159,7 @@ index c05282294..3d5c3275e 100644
      // BF16-only mark lifetime: clear on the first optimize after a compute, or when the first split
      // of a new graph is seen (the scheduler optimizes every split of one graph before computing any
      // of them, so marks set below must survive the remaining splits' optimize calls).
-@@ -6903,8 +6916,23 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6905,8 +6918,23 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  }
                  if (ok && nread > 0 && elide_f32) ggml_cuda_mmb_mark_bf16_only(r);
              }
@@ -185,7 +185,7 @@ index c05282294..3d5c3275e 100644
                  ggml_tensor * rr = const_cast<ggml_tensor *>(ca.residual->view_src ? ca.residual->view_src : ca.residual);
                  params->add_alloc_dep(params->user_data, rr, ca.out_res);
                  params->add_alloc_dep(params->user_data, rr, ca.out_xn);
-@@ -6972,6 +7000,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6974,6 +7002,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  

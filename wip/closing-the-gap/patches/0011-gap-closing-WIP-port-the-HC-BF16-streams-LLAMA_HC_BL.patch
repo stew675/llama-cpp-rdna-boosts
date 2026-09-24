@@ -1,4 +1,4 @@
-From 37e8b175194bc1e339c2a612098731d6b5312f60 Mon Sep 17 00:00:00 2001
+From 9e38a49e9b5893d5e48069b8bc2f6d1a8e56d561 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 22 Sep 2026 08:16:39 -0500
 Subject: [PATCH] gap-closing WIP: port the HC BF16 streams (LLAMA_HC_BLK16 /
@@ -35,7 +35,7 @@ greedy text byte-identical (984263fb8e0f, 434 chars).
  6 files changed, 401 insertions(+), 15 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e9056d991..56056d3ed 100644
+index adffc38a5..9da704f56 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -4016,6 +4016,117 @@ static int ggml_cuda_hc_mix_closed(const ggml_cgraph * cgraph, const int i, ggml
@@ -193,7 +193,7 @@ index e9056d991..56056d3ed 100644
              }
          }
      }
-@@ -5704,6 +5835,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5709,6 +5840,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                                              ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2) ? "" : "(canf)");
                                      }
                                      if (alias_ok && supp && canf) {
@@ -201,7 +201,7 @@ index e9056d991..56056d3ed 100644
                                          ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
                                          return g - i;
                                      }
-@@ -5886,6 +6018,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5891,6 +6023,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                              const bool supp = ggml_cuda_hc_combine_norm_supported(args, ggml_cuda_info().devices[cuda_ctx->device].warp_size);
                              const bool canf = ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2);
                              if (alias_ok && supp && canf) {
@@ -209,7 +209,7 @@ index e9056d991..56056d3ed 100644
                                  ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
                                  return g - i;
                              }
-@@ -6545,6 +6678,98 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6550,6 +6683,98 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -452,10 +452,10 @@ index 2a8782a28..274419a73 100644
  
  bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & args, int warp_size);
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
-index 185ef6b4e..d94fdab77 100644
+index 8c5a83511..22dca1501 100644
 --- a/ggml/src/ggml-cuda/mmb.cu
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -1608,7 +1608,12 @@ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot,
+@@ -1616,7 +1616,12 @@ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot,
  }
  void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); g_mmb_bf16_copy.clear(); g_mmb_bf16_slot.clear(); }
  size_t ggml_cuda_mmb_marks_count() { return g_mmb_bf16_only.size(); }

@@ -1,4 +1,4 @@
-From 59bfcd7191c83e2f972cc1ab79867a4833317035 Mon Sep 17 00:00:00 2001
+From c81fa7301fda467b0fd3c3ad337942ee1c1d6b01 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 22 Sep 2026 04:02:20 -0500
 Subject: [PATCH] gap-closing WIP: port the narrow-row RMS norm fusion (Phase-1
@@ -39,7 +39,7 @@ Exported to wip/closing-the-gap/patches/0006.
  create mode 100644 ggml/src/ggml-cuda/norm-gated.cuh
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 38d2de6bb..f21577cb3 100644
+index 37edc39c1..cdd56ce88 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -41,6 +41,7 @@
@@ -82,7 +82,7 @@ index 38d2de6bb..f21577cb3 100644
      // qwen4exp IQ4_NL/Q8_0 routed down projection followed by the 10-expert weighted sum (ported
      // from halo-box/strix-llama.cpp): compute all selected experts for one output row in a wave and
      // apply their routing weights immediately, avoiding the [n_embd, n_used] intermediate and its
-@@ -6503,6 +6529,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6508,6 +6534,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  }
                  continue;
              }

@@ -141,7 +141,7 @@ branch or a gfx1151-tuned constant; "neutral" = no arch branch (verify only).
 |---|---|---|---|
 | `0001` hc_combine_norm matcher revival | qwen4exp HC prefill fusion | **qwen4exp-only**, not arch-gated | verify the fusion fires on Flash-Next IQ4_XS and is a win; A/B `LLAMA_FUSED_DSV4_HC_POST=1` (forces the slower op) |
 | `0002` default beneficial features ON | MMB default ON, RDNA3_0 arm ON, HC16 default 1 | **the main arch-sensitive flip** | verify `MMB_CFG` shows the gfx1201 row (§6.4); A/B `GGML_CUDA_MMB=0` |
-| `0003` hc_gate_mix fusion | gate GEMM+sigmoid+mix | **RDNA3_5-only** (`GGML_CUDA_CC_IS_RDNA3_5` at the call site; `gatemix=0` on RDNA4) | verify it is **inert** on gfx1201 (`MMB_CFG gatemix=0`); a port is future work, not a blocker |
+| `0003` hc_gate_mix fusion | gate GEMM+sigmoid+mix | **ported to RDNA4 2026-09-24** (the call site now accepts RDNA4; `gatemix=1` on RDNA4) | fires on gfx1201; +5.3…5.8 % prefill; bit-identical text |
 | `0004` depthwise conv1d (GDN + PLE) | `gdn-conv.cu` + `ple-conv.cu` | arch-neutral | must compile/instantiate on gfx12; coherence + oracles; qwen4exp (PLE) and 27B GDN |
 | `0005` QSA block window by highest position | `llama-memory-hybrid-idx` | qwen4exp-only, neutral | qwen4exp long-context coherence (the image/2-D-position case on gfx1201 uses the same path) |
 | `0006` narrow-row RMS norm | `norm-gated.cu::rms_rows_f32` | arch-neutral | width purity + coherence on a dense + MoE model |
@@ -335,7 +335,7 @@ For anything that does **not** fire (e.g. `0003`, `0016`, `0017`/`0018`, `0022`,
 
 | item | status | note |
 |---|---|---|
-| `hc_gate_mix` (`0003`) | **not ported to RDNA4** | IQ4_NL + RDNA3_5 WMMA; `gatemix=0` on RDNA4.  Candidate port (the IQ4_NL WMMA is gfx11-shaped) |
+| `hc_gate_mix` (`0003`) | **PORTED to RDNA4 (2026-09-24, default ON)** | +5.3…5.8 % qwen4exp IQ4_NL prefill, bit-identical text.  gfx1100 stays opt-in pending an end-to-end A/B on a qwen4exp-capable box |
 | `QSA_SCORE_WMMA` (`0016`) | **RDNA3_5-only kernel**; generic fallback on RDNA4 | candidate port to RDNA4 WMMA; not a correctness blocker |
 | MMB new quant types (`0017`/`0018`) | **Q4_1 + Q5_0 ported (2026-09-23); Q4_0/MXFP4/NVFP4/IQ2 stay out** | RDNA4 dense now `IQ3_S + Q4_1 + Q5_0`; Q4_1/Q5_0 beat the delivery MMQ by +6..+14 % on 4B/9B/27B, Q4_0 loses.  MXFP4/NVFP4 cannot be produced by this box's quantizer; IQ2 needs an unmatched imatrix |
 | gfx1151 decode crossover (`0022`) | intentionally gfx1151-only | gfx1201 stays dense-always (measured flat ~8 % worse for sparse decode) |
@@ -371,6 +371,27 @@ MTP verdict, and the `-b/-ub 4096` protocol for A/Bs.
 ## 11. Session log
 
 Newest first.  Each session appends its state, what it changed, and the next action.
+
+### 2026-09-24 — session 5: `0003` gate-mix ported to RDNA4 (item 2 done)
+
+**Did:** work item 2 of §12.2, unblocked by the IQ4_NL Qwen3.8-Flash-Next download.  Widened the
+`hc_gate_mix` call site to RDNA4 and flipped the RDNA4 `gatemix` policy to default ON.  The kernel
+needed no change: its `mmb_frag_t`/`mmb_ld_frag`/`mmb_wmma_bf16`/`MMB_ACC_M` shim already has the
+gfx12 arm, and there is no HC16 dependency — the `xn` BF16 cache is warmed by the `w_down` MMB GEMM
+(not by the HC16 marks), which is why it fires on RDNA4 where HC16 is gated.
+
+**Evidence (qwen4exp IQ4_NL, 3-GPU `-sm tensor`, q8_0 KV, `-b/-ub 2048`):** 285 `FIRED` (debug);
+**byte-identical** greedy text default/on vs `LLAMA_HC_GATEMIX=0` (`471d102e7b7d`) and
+`plain == draft-mtp`; width probe PASS; `MUL_MAT` 1297/1297; **+5.8 / +5.4 / +5.3 %** prefill at
+pp8192 / 32768 / 65536 (warm, `-r 5`, 3 rounds).  Record:
+[`2026-09-24-hc-gate-mix-rdna4.md`](2026-09-24-hc-gate-mix-rdna4.md).
+
+**Set:** folded into `0003` (`c421c12ae`); 26/26 apply reproduces tree
+**`ec54ad65f425c69b4dec4279efa68b0573e4afc8`**.
+
+**Next:** nothing left in `gfx1201-closing.md` §12 except item 4 (`-ub 16384`); the gfx1100 §7.2.2
+end-to-end `0003`/`0016` A/B needs a qwen4exp-capable box, and the `halo` HC16-under-`-sm tensor`
+re-gate with `0027` is the gfx1151 follow-up.
 
 ### 2026-09-23 — session 4: the meta-backend `graph_optimize` gap closed (`0027`)
 
@@ -647,7 +668,7 @@ hand-rolled fragments), so the port was three small changes: select
 |---|---|---|---|
 | `0001` hc_combine_norm | yes (qwen4exp HC prefill) | not isolated this session; exercised by the qwen4exp gates | qwen4exp purity 8K/40K/128K |
 | `0002` default flips | yes | MMB default on; RDNA4 row correct | `MMB_CFG`; MMB on/off PPL |
-| `0003` hc_gate_mix | **no** | inert — call site RDNA3_5-gated | `MMB_CFG gatemix=0` |
+| `0003` hc_gate_mix | **yes — RDNA4 ported this session, default ON** | **+5.8/+5.4/+5.3 % prefill** pp8192/32768/65536 (qwen4exp IQ4_NL); bit-identical text; width probe PASS | [`2026-09-24-hc-gate-mix-rdna4.md`](2026-09-24-hc-gate-mix-rdna4.md) |
 | `0004` conv1d fusions | yes | **fixed** — gated to single-device graphs | [`2026-09-23-gfx1201-conv-fusion-tensor-split.md`](2026-09-23-gfx1201-conv-fusion-tensor-split.md) |
 | `0005` QSA block window | qwen4exp-only | exercised | 40K/128K purity |
 | `0006` narrow-row RMS | arch-neutral | width purity + coherence | §6.3 |
@@ -693,7 +714,8 @@ fusion A/Bs (they are exercised by the qwen4exp gates but not singled out).
 ## 12. Remaining RDNA4 porting work — handover for the next session
 
 **Updated:** 2026-09-23 (session 4).  §11 holds the gate results; this section is the **open** work.
-Items 1 (MMB quant coverage) and 3 (the meta `graph_optimize` gap) are now DONE; 2 and 4 remain.
+Items 1 (MMB quant coverage), 2 (`0003` gate-mix) and 3 (the meta `graph_optimize` gap) are now
+DONE; 4 remains.
 The campaign's arch-scoped features are one of three shapes — classify before touching one:
 
 1. **Wrong-arch predicate over a working kernel.**  The port is usually small (a layout / enable
@@ -758,7 +780,17 @@ only.  Do **not** flip the mask wholesale; measure **per (type, path, shape)**.
    the losers excluded.  `MXFP4`/`NVFP4` are the most likely RDNA4 dense candidates (weakest MMQ
    path); `Q4_0`/`Q4_1`/`Q5_0` the least (the beta's regression finding); IQ2 unknown.
 
-### 12.2 Work item 2 — `0003` `hc_gate_mix` RDNA4 port
+### 12.2 Work item 2 — `0003` `hc_gate_mix` RDNA4 port  ← **DONE 2026-09-24**
+
+**Result:** ported and default ON (folded into `0003`, `c421c12ae`).  The gate-mix fusion is
+**bit-identical** to the unfused chain (`471d102e7b7d` default/on == off; `plain == draft-mtp`) and a
+**+5.8 / +5.4 / +5.3 % prefill win** at pp8192 / 32768 / 65536 on qwen4exp **IQ4_NL** (3-GPU
+`-sm tensor`, q8_0 KV, `-b/-ub 2048`, `-r 5`, warm, 3 rounds).  It fires 285 times; width probe
+PASS; `MUL_MAT` 1297/1297.  The kernel itself needed **no** change (the `mmb_frag_t`/`mmb_wmma_bf16`/
+`MMB_ACC_M` shim is already arch-aware) and there is **no HC16 dependency** (the `xn` BF16 cache is
+warmed by the `w_down` MMB GEMM, not by the HC16 marks).  Full record:
+[`2026-09-24-hc-gate-mix-rdna4.md`](2026-09-24-hc-gate-mix-rdna4.md); 26/26 apply reproduces tree
+`ec54ad65f425c69b4dec4279efa68b0573e4afc8`.
 
 **What.**  The fused HC gate GEMM+sigmoid+mix.  Call site `GGML_CUDA_CC_IS_RDNA3(cc)`
 (`ggml-cuda.cu:5715`); `mmb_arch_defaults` sets `gatemix=0` on RDNA4 (`mmb.cu:1534`), and RDNA3_0 is
@@ -841,7 +873,7 @@ this for the `moe_weighted_reduction` alloc deps.
   `GIT_SEQUENCE_EDITOR=true GIT_EDITOR=true git rebase --autosquash <commit>~1`; regenerate with
   `git format-patch -1 <sha> --stdout --no-numbered`; replace the patch file and re-verify a fresh
   worktree at `r13-beta-baseline` + the 26 patches reproduces the branch tip tree.
-* The verified handover state at the end of session 4: branch `closing-gfx1201`, tip tree
-  **`803e6d908ade68b02a71af9d5d0cf605aec1382a`** (26/26 apply: r13 + beta + closing; `0017` carries
-  the Q4_1/Q5_0 RDNA4 enablement, `0027` the meta `graph_optimize` forwarding).  Session 2's tree
-  was `95f916a8e015efd68ee44bcea7620187ebc70019`.
+* The verified handover state at the end of session 5: branch `closing-gfx1201`, tip tree
+  **`ec54ad65f425c69b4dec4279efa68b0573e4afc8`** (26/26 apply: r13 + beta + closing; `0003` carries
+  the RDNA4 gate-mix port, `0017` the Q4_1/Q5_0 RDNA4 enablement, `0027` the meta `graph_optimize`
+  forwarding).  Session 2's tree was `95f916a8e015efd68ee44bcea7620187ebc70019`.

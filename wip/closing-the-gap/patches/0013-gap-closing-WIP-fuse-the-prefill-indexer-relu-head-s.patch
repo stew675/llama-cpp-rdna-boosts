@@ -1,4 +1,4 @@
-From ac391cf4f3b56d830a35f7ef031d1f40fe92fc4d Mon Sep 17 00:00:00 2001
+From e2c8d7c8a167f776a87c03b03af4893d5ce33331 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 22 Sep 2026 08:59:46 -0500
 Subject: [PATCH] gap-closing WIP: fuse the prefill indexer relu + head-sum
@@ -26,7 +26,7 @@ reference.
  3 files changed, 166 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 615414bfd..55ce474f0 100644
+index d18c27980..7403140ff 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -4129,6 +4129,94 @@ static void ggml_cuda_hc_combine_norm_set_bf16(ggml_backend_cuda_context & ctx,
@@ -141,7 +141,7 @@ index 615414bfd..55ce474f0 100644
      // Depthwise causal conv1d fusions (qwen4exp GDN + PLE), ported from the halo-box
      // reference: the CONCAT(state, x) materialization and the SSM_CONV / tap-mul-add
      // chain are replaced by a direct kernel that reads state+x and writes the conv
-@@ -6772,6 +6870,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6777,6 +6875,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  

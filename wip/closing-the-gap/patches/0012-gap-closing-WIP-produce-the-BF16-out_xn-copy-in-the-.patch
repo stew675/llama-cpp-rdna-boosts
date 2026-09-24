@@ -1,4 +1,4 @@
-From de5689d945333801bde17425cb111446569f7130 Mon Sep 17 00:00:00 2001
+From 15993435b406ade48e91f38cf48b95ef27ef433d Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 22 Sep 2026 08:39:43 -0500
 Subject: [PATCH] gap-closing WIP: produce the BF16 out_xn copy in the fused
@@ -33,7 +33,7 @@ pointer + root, which is what identified the redundant conversion.
  2 files changed, 12 insertions(+), 10 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 56056d3ed..615414bfd 100644
+index 9da704f56..d18c27980 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -4095,20 +4095,22 @@ static bool ggml_cuda_hc_combine_norm_identify(const ggml_cgraph * cgraph, const
@@ -69,10 +69,10 @@ index 56056d3ed..615414bfd 100644
      if (ggml_cuda_mmb_blk16() && !args.block_out_hc && args.block_out->view_offs == 0 &&
              ggml_cuda_mmb_is_bf16_only(rblk)) {
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
-index d94fdab77..162e63992 100644
+index 22dca1501..19c4eb497 100644
 --- a/ggml/src/ggml-cuda/mmb.cu
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -1304,7 +1304,7 @@ static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, con
+@@ -1312,7 +1312,7 @@ static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, con
      for (auto & e : g_mmb_cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
      uint16_t * buf = mmb_cache_insert(ctx, src1, n);
      { static const int lg = getenv("LLAMA_MMB_CVT_LOG") ? atoi(getenv("LLAMA_MMB_CVT_LOG")) : 0; static unsigned cnt = 0;

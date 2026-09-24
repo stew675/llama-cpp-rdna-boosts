@@ -1,4 +1,4 @@
-From 5c3bb41c51e4081aae82f112872aae8a5432aa2d Mon Sep 17 00:00:00 2001
+From 26a6a2fce81ad0fd8f93451e6b2b412fd1570f61 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 22 Sep 2026 15:15:53 -0500
 Subject: [PATCH] gap-closing WIP: MMB quant coverage -- Q4_0, Q4_1, Q5_0,
@@ -29,7 +29,7 @@ its throughput is unmeasured -- the MUL_MAT/MUL_MAT_ID oracles are its gate.
  1 file changed, 212 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
-index ade2f5f76..68baada3e 100644
+index 19c4eb497..09f0109a3 100644
 --- a/ggml/src/ggml-cuda/mmb.cu
 +++ b/ggml/src/ggml-cuda/mmb.cu
 @@ -313,6 +313,123 @@ __device__ __forceinline__ void mmb_dq_row_q5_1(const uint4 w0, const uint4 w1,
@@ -220,7 +220,7 @@ index ade2f5f76..68baada3e 100644
      mmb_tile_gemm_glu<BM, BN, WTM, WTN, WTYPE, true, DBUF, DBUF2>(Wg + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, Wu + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
          [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, Ag, Au, Bs);
  }
-@@ -1483,6 +1625,14 @@ bool mmb_iq3xxs_glu() { static const int v = getenv("GGML_CUDA_MMB_IQ3XXS") ? at
+@@ -1487,6 +1629,14 @@ bool mmb_iq3xxs_glu() { static const int v = getenv("GGML_CUDA_MMB_IQ3XXS") ? at
  // (wip/mmb-general/gfx1201-s5s7-mmb-results.md) is unambiguous about which side each type is on:
  //   IQ family (IQ4_NL / IQ3_S / IQ4_XS / IQ3_XXS)  ->  MMB WINS   (+2.7 .. +11.8 %)
  //   Q8_0, Q5_1, Q3_K, Q4_K, Q5_K, Q6_K             ->  MMB LOSES  (-4.5 .. -12.7 %)
@@ -235,7 +235,7 @@ index ade2f5f76..68baada3e 100644
  // So the accepted set is ARCH-SCOPED, and the five hardcoded copies of it (dense/routed/mm/mmid/glu)
  // collapse into one mask here.  The graph's MMQ-fusion stand-down goes through these same
  // predicates (ggml-cuda.cu), so a type this returns false for costs nothing -- it simply keeps the
-@@ -1500,12 +1650,14 @@ static uint64_t mmb_wtype_mask() {
+@@ -1504,12 +1654,14 @@ static uint64_t mmb_wtype_mask() {
      const uint64_t K_AND_Q8  = (1ull << GGML_TYPE_Q8_0) | (1ull << GGML_TYPE_Q5_1) |
                                 (1ull << GGML_TYPE_Q3_K) | (1ull << GGML_TYPE_Q4_K) |
                                 (1ull << GGML_TYPE_Q5_K) | (1ull << GGML_TYPE_Q6_K);
@@ -250,7 +250,7 @@ index ade2f5f76..68baada3e 100644
          };
          for (const char * p = e; *p; ) {
              while (*p == ',' || *p == ' ') ++p;
-@@ -1519,7 +1671,8 @@ static uint64_t mmb_wtype_mask() {
+@@ -1523,7 +1675,8 @@ static uint64_t mmb_wtype_mask() {
          fprintf(stderr, "MMB: GGML_CUDA_MMB_TYPES=%s -> %d weight type(s)\n", e, cnt);
          return mask;
      }
@@ -260,7 +260,7 @@ index ade2f5f76..68baada3e 100644
      return mask;
  }
  static bool mmb_wtype_ok(const ggml_type t) { return (uint64_t) t < 64 && ((mmb_wtype_mask() >> t) & 1ull) != 0; }
-@@ -1532,6 +1685,10 @@ static bool mmb_wtype_ok(const ggml_type t) { return (uint64_t) t < 64 && ((mmb_
+@@ -1536,6 +1689,10 @@ static bool mmb_wtype_ok(const ggml_type t) { return (uint64_t) t < 64 && ((mmb_
  //   IQ3_XXS, IQ4_NL                    break-even at the same geometry     (not enabled)
  //   IQ4_XS  mmb_dense 0.919 s  vs  delivery MMQ 0.829 s   -> MMB LOSES +10.9 %  (not enabled)
  //
@@ -271,7 +271,7 @@ index ade2f5f76..68baada3e 100644
  // and the whole-model interleaved A/B agrees (27B UD-IQ3_S: IQ3_S-only +0.5..+1.0 % prefill, the
  // whole IQ family +0.04 % -- IQ4_XS cancels the win).  So RDNA4 enables only the measured winner;
  // every other type keeps the delivery's MMQ path and costs nothing (the graph's fusion stand-down
-@@ -1548,6 +1705,7 @@ static uint64_t mmb_dense_tmask() {
+@@ -1552,6 +1709,7 @@ static uint64_t mmb_dense_tmask() {
              {"iq4_nl", GGML_TYPE_IQ4_NL}, {"iq3_s", GGML_TYPE_IQ3_S}, {"iq4_xs", GGML_TYPE_IQ4_XS}, {"iq3_xxs", GGML_TYPE_IQ3_XXS},
              {"q8_0", GGML_TYPE_Q8_0}, {"q5_1", GGML_TYPE_Q5_1}, {"q3_k", GGML_TYPE_Q3_K},
              {"q4_k", GGML_TYPE_Q4_K}, {"q5_k", GGML_TYPE_Q5_K}, {"q6_k", GGML_TYPE_Q6_K},
@@ -279,7 +279,7 @@ index ade2f5f76..68baada3e 100644
          };
          for (const char * p = e; *p; ) {
              while (*p == ',' || *p == ' ') ++p;
-@@ -1559,7 +1717,7 @@ static uint64_t mmb_dense_tmask() {
+@@ -1563,7 +1721,7 @@ static uint64_t mmb_dense_tmask() {
          }
          return mask;
      }
@@ -288,7 +288,7 @@ index ade2f5f76..68baada3e 100644
      else mask = ~0ull;   // elsewhere the pre-S10 behaviour stands: mmb_dense_flag() alone gates it
      return mask;
  }
-@@ -1587,6 +1745,11 @@ static void mmb_dense_launch_t(const ggml_type t, dim3 grid, cudaStream_t stream
+@@ -1591,6 +1749,11 @@ static void mmb_dense_launch_t(const ggml_type t, dim3 grid, cudaStream_t stream
          case GGML_TYPE_IQ4_XS:  mmb_dense_kernel<BM,BN,WTM,WTN, 8><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
          case GGML_TYPE_Q3_K:    mmb_dense_kernel<BM,BN,WTM,WTN, 9><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
          case GGML_TYPE_IQ3_XXS: mmb_dense_kernel<BM,BN,WTM,WTN,10><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
@@ -300,7 +300,7 @@ index ade2f5f76..68baada3e 100644
          default:                mmb_dense_kernel<BM,BN,WTM,WTN, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
      }
  }
-@@ -1844,6 +2007,21 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+@@ -1848,6 +2011,21 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
      } else if (src0->type == GGML_TYPE_IQ3_XXS) {
          if (big) mmb_dense_kernel<128, 256, 64, 64, 10><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
          else     mmb_dense_kernel<128, 128, 32, 64, 10><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
@@ -322,7 +322,7 @@ index ade2f5f76..68baada3e 100644
      } else {
          if (big) mmb_dense_kernel<128, 256, 64, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
          else     mmb_dense_kernel<128, 128, 32, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
-@@ -1917,6 +2095,21 @@ static void mmb_routed_kernel_dispatch(const ggml_tensor * w, dim3 gbig, dim3 gs
+@@ -1933,6 +2111,21 @@ static void mmb_routed_kernel_dispatch(const ggml_tensor * w, dim3 gbig, dim3 gs
      } else if (w->type == GGML_TYPE_IQ3_XXS) {
          mmb_routed_kernel<128, 128, 32, 64, 10><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
          mmb_routed_kernel<128,  32, 32, 16, 10><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
@@ -344,7 +344,7 @@ index ade2f5f76..68baada3e 100644
      } else {
          mmb_routed_kernel<128, 128, 32, 64, 0><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
          mmb_routed_kernel<128,  32, 32, 16, 0><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
-@@ -2000,6 +2193,21 @@ static void mmb_routed_glu_kernel_dispatch(const ggml_tensor * gw, dim3 gbig, di
+@@ -2016,6 +2209,21 @@ static void mmb_routed_glu_kernel_dispatch(const ggml_tensor * gw, dim3 gbig, di
      } else if (gw->type == GGML_TYPE_IQ3_XXS) {
          mmb_routed_glu_kernel<64, 128, 32, 32, 10><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
          mmb_routed_glu_kernel<64,  32, 16, 16, 10><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);

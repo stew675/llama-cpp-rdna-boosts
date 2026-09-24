@@ -1,4 +1,4 @@
-From 4bdaee1ed0f31956496da012508433cefbb84489 Mon Sep 17 00:00:00 2001
+From 26c5a0f98867d416a9c6501839618b78f5d51f70 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 22 Sep 2026 15:52:31 -0500
 Subject: [PATCH] gap-closing WIP: MMB quant coverage -- IQ2_S, IQ2_XS, IQ2_XXS
@@ -24,7 +24,7 @@ Validated on gfx1151:
  1 file changed, 154 insertions(+), 7 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
-index 68baada3e..ec71e9626 100644
+index 09f0109a3..6e1afdf5d 100644
 --- a/ggml/src/ggml-cuda/mmb.cu
 +++ b/ggml/src/ggml-cuda/mmb.cu
 @@ -466,6 +466,107 @@ __device__ __forceinline__ void mmb_dq_row_iq3s(const uint8_t * base, const int
@@ -189,7 +189,7 @@ index 68baada3e..ec71e9626 100644
      mmb_tile_gemm_glu<BM, BN, WTM, WTN, WTYPE, true, DBUF, DBUF2>(Wg + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, Wu + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
          [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, Ag, Au, Bs);
  }
-@@ -1651,13 +1767,14 @@ static uint64_t mmb_wtype_mask() {
+@@ -1655,13 +1771,14 @@ static uint64_t mmb_wtype_mask() {
                                 (1ull << GGML_TYPE_Q3_K) | (1ull << GGML_TYPE_Q4_K) |
                                 (1ull << GGML_TYPE_Q5_K) | (1ull << GGML_TYPE_Q6_K);
      const uint64_t Q4Q5      = (1ull << GGML_TYPE_Q4_0) | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_0) | (1ull << GGML_TYPE_MXFP4) | (1ull << GGML_TYPE_NVFP4);
@@ -205,7 +205,7 @@ index 68baada3e..ec71e9626 100644
          };
          for (const char * p = e; *p; ) {
              while (*p == ',' || *p == ' ') ++p;
-@@ -1672,7 +1789,7 @@ static uint64_t mmb_wtype_mask() {
+@@ -1676,7 +1793,7 @@ static uint64_t mmb_wtype_mask() {
          return mask;
      }
      const uint64_t RDNA4_SET = IQ_FAMILY | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_0);
@@ -214,7 +214,7 @@ index 68baada3e..ec71e9626 100644
      return mask;
  }
  static bool mmb_wtype_ok(const ggml_type t) { return (uint64_t) t < 64 && ((mmb_wtype_mask() >> t) & 1ull) != 0; }
-@@ -1705,7 +1822,7 @@ static uint64_t mmb_dense_tmask() {
+@@ -1709,7 +1826,7 @@ static uint64_t mmb_dense_tmask() {
              {"iq4_nl", GGML_TYPE_IQ4_NL}, {"iq3_s", GGML_TYPE_IQ3_S}, {"iq4_xs", GGML_TYPE_IQ4_XS}, {"iq3_xxs", GGML_TYPE_IQ3_XXS},
              {"q8_0", GGML_TYPE_Q8_0}, {"q5_1", GGML_TYPE_Q5_1}, {"q3_k", GGML_TYPE_Q3_K},
              {"q4_k", GGML_TYPE_Q4_K}, {"q5_k", GGML_TYPE_Q5_K}, {"q6_k", GGML_TYPE_Q6_K},
@@ -223,7 +223,7 @@ index 68baada3e..ec71e9626 100644
          };
          for (const char * p = e; *p; ) {
              while (*p == ',' || *p == ' ') ++p;
-@@ -1750,6 +1867,9 @@ static void mmb_dense_launch_t(const ggml_type t, dim3 grid, cudaStream_t stream
+@@ -1754,6 +1871,9 @@ static void mmb_dense_launch_t(const ggml_type t, dim3 grid, cudaStream_t stream
          case GGML_TYPE_Q5_0:    mmb_dense_kernel<BM,BN,WTM,WTN,13><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
          case GGML_TYPE_MXFP4:   mmb_dense_kernel<BM,BN,WTM,WTN,14><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
          case GGML_TYPE_NVFP4:   mmb_dense_kernel<BM,BN,WTM,WTN,15><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
@@ -233,7 +233,7 @@ index 68baada3e..ec71e9626 100644
          default:                mmb_dense_kernel<BM,BN,WTM,WTN, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
      }
  }
-@@ -1849,7 +1969,7 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
+@@ -1853,7 +1973,7 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
                         (mmb_f32split() && (mmb_f32split_mode() >= 2 || (M >= mmb_f32split_min_m() && K >= mmb_f32split_min_k()))));
      if (f32cand && !f32w) return false;   // this F32 shape is better on rocBLAS -- no fusion stand-down either
      if ((f32cand ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
@@ -242,7 +242,7 @@ index 68baada3e..ec71e9626 100644
      if (T < mmb_min_t() || T > INT32_MAX / 4) return false;
      return ggml_nrows(dst) == T;
  }
-@@ -1872,7 +1992,7 @@ bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor *
+@@ -1876,7 +1996,7 @@ bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor *
      if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
      const int64_t K = src0->ne[0], M = src0->ne[1], E = src0->ne[2];
      if (src0->ne[3] != 1 || K % 64 != 0 || E < 1 || E > 1024) return false;
@@ -251,7 +251,7 @@ index 68baada3e..ec71e9626 100644
      const int64_t n_used = ids->ne[0], T = ids->ne[1];
      if (src1->ne[0] != K || src1->ne[3] != 1 || src1->ne[2] != T) return false;
      if (src1->ne[1] != 1 && src1->ne[1] != n_used) return false;
-@@ -2022,6 +2142,15 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+@@ -2026,6 +2146,15 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
      } else if (src0->type == GGML_TYPE_NVFP4) {
          if (big) mmb_dense_kernel<128, 256, 64, 64, 15><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
          else     mmb_dense_kernel<128, 128, 32, 64, 15><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
@@ -267,7 +267,7 @@ index 68baada3e..ec71e9626 100644
      } else {
          if (big) mmb_dense_kernel<128, 256, 64, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
          else     mmb_dense_kernel<128, 128, 32, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
-@@ -2110,6 +2239,15 @@ static void mmb_routed_kernel_dispatch(const ggml_tensor * w, dim3 gbig, dim3 gs
+@@ -2126,6 +2255,15 @@ static void mmb_routed_kernel_dispatch(const ggml_tensor * w, dim3 gbig, dim3 gs
      } else if (w->type == GGML_TYPE_NVFP4) {
          mmb_routed_kernel<128, 128, 32, 64, 15><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
          mmb_routed_kernel<128,  32, 32, 16, 15><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
@@ -283,7 +283,7 @@ index 68baada3e..ec71e9626 100644
      } else {
          mmb_routed_kernel<128, 128, 32, 64, 0><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
          mmb_routed_kernel<128,  32, 32, 16, 0><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
-@@ -2208,6 +2346,15 @@ static void mmb_routed_glu_kernel_dispatch(const ggml_tensor * gw, dim3 gbig, di
+@@ -2224,6 +2362,15 @@ static void mmb_routed_glu_kernel_dispatch(const ggml_tensor * gw, dim3 gbig, di
      } else if (gw->type == GGML_TYPE_NVFP4) {
          mmb_routed_glu_kernel<64, 128, 32, 32, 15><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
          mmb_routed_glu_kernel<64,  32, 16, 16, 15><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);

@@ -133,9 +133,12 @@ The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and t
    **`0016` `QSA_SCORE_WMMA` is now PORTED to RDNA4 (2026-09-23, default ON)** — the 4-head
    indexer WMMA kernel gives **+1.7…+12.3 % qwen4exp prefill** at pp8192…65536; oracle 225/225,
    purity holds.  See [`2026-09-23-qsa-score-wmma-rdna4.md`](2026-09-23-qsa-score-wmma-rdna4.md).
-   The remaining RDNA4 port candidate is `0003` (gate-mix) — the generic fallback is in use and
-   gated.  **gfx1100 §7.2 done (2026-09-24):** the new 26-patch set applies to tree
-   `803e6d908a…` and all headline gates reproduce; **MMB quant coverage (`0017`/`0018`) is a win for
+   **`0003` `hc_gate_mix` is now PORTED to RDNA4 (2026-09-24, default ON)** — bit-identical and
+   **+5.3…5.8 % qwen4exp IQ4_NL prefill** (pp8192…65536); see
+   [`2026-09-24-hc-gate-mix-rdna4.md`](2026-09-24-hc-gate-mix-rdna4.md).
+   **gfx1100 §7.2 done (2026-09-24):** the 26-patch set applied on the session-4 tree
+   (`803e6d908a…`; the current tip is `ec54ad65f…` after the `0003` port) and all headline gates
+   reproduce; **MMB quant coverage (`0017`/`0018`) is a win for
    *every* type on gfx1100** (Q4_0 **+15.7…+20.6 %**, Q4_1 **+19.7…+24.5 %**, Q5_0
    **+16.0…+20.6 %** dense; gemma-26B Q4_0 MoE **+10.7 %** routed) — `Q4_0` wins here but *loses* on
    RDNA4 (weak gfx11 MMQ), and gfx1100's mask already enables them, so **no change needed**; the
