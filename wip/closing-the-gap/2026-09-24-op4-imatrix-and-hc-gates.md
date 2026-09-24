@@ -48,6 +48,28 @@ matches the plain `llama-perplexity` logits path.  **Verdict: pre-existing, imat
 scope for the closing set — filed as a follow-up lead, not fixed here.**  A user who quantizes on a
 3-GPU `-sm tensor` box with `llama-imatrix` gets a corrupt imatrix and should use `-sm layer` instead.
 
+**Root-cause localization (2026-09-24, `IMATRIX_DBG_NAME`/`META_GET_DBG` instrumentation, since
+reverted).**  The failure is the **activation read**, not the forward:
+
+* `-sm none` (single device) and `-sm layer` produce a **byte-identical** imatrix (`755cc20a…`, PPL
+  9.0808 at `--chunks 2`); `-sm tensor` is `b44e8249…` / PPL 57734.  So the reference is solid and the
+  split is the only broken arm.
+* Dumped `src1` for `blk.8.ffn_down.weight`: shapes match (`[9216,512]`), no NaN/zeros, but the
+  `-sm tensor` values are **uncorrelated** with the reference (corr 0.012; sign agreement 50.5 %; not a
+  scale, permutation or fold), and the file's `in_sum2` is faithfully derived from that read
+  (corr 0.99995) — so the **read**, not the accumulation, is the culprit.
+* The Meta gather **layout is correct**: `ggml_backend_meta_buffer_get_tensor` reports
+  `axis=0 n_seg=1 nr0=1 nbufs=3 ne_seg=[3072,3072,3072]` and copies device *j*'s `[3072,512]` slice to
+  `data[j*3072 …]` (verified in the loop).
+* Replicated-input projections read back **mostly** right (`attn_qkv`/`ffn_up` `in_sum2` corr 0.92-0.97)
+  while the split-input `ffn_down` is off — i.e. the reader returns plausible-but-wrong activation
+  values under the Meta backend, strongest for the non-mirrored (split) tensors.
+* `llama-perplexity` under `-sm tensor` is fine (8.1120 vs 8.1107), so the forward is correct; the
+  defect is the imatrix eval-callback read under the Meta backend.
+
+Not fixed: it is a Meta-backend + eval-callback interaction, not RDNA- or closing-specific.  Minimal
+repro: 4B Q8_0, `-sm tensor` vs `-sm layer`, `--chunks 1`, seconds.
+
 ## OP-4(b) — `0001` `hc_combine_norm` isolated A/B: **validated (default fusion is the fast one)**
 
 qwen4exp IQ4_NL `-p 8192,32768 -n 0 -b 2048 -ub 2048 -r 3`, interleaved, 2 reps (`S_PP t/s`):
@@ -68,11 +90,31 @@ So the default fusion is ~5 % faster than the op alternative on both depths.  `0
 
 The default is (marginally) ahead, consistent with the `0008` record.  `0008` stands.
 
-## OP-4(d) — M-RoPE image case (`0005`): **NOT RUN (tooling), deferred**
+## OP-4(d) — M-RoPE image case (`0005`): **RUN 2026-09-24 — clean on both builds (not reproduced)**
 
-Needs the vision projector (`mmproj-Qwen3.8-Flash-Next-Q8_0.gguf`) + a text-then-image request on
-3-GPU `-sm tensor`.  Left for a session with the mtmd tooling prepped; the `0005` M-RoPE guard is not
-otherwise exercised here.  Mark as not-run rather than block.
+The vision projector and the shared MTP head are both available, and r13's shared-NextN fix means the
+shared head loads, so the gfx1151 repro was attempted with a purpose-built harness
+(`tools/mrope-image-mtp.sh`: `llama-server` + qwen4exp IQ4_XS + mmproj, `-md` the shared Q8_0 head,
+`--spec-type draft-mtp --spec-draft-n-max 3`, `-ngl 99 -sm tensor -ctk/-ctv q8_0`; then a
+`/v1/chat/completions` with the text first and the image second).
+
+| build | prompt | image | generated | MTP | result |
+|---|---|---|---|---|---|
+| **closing** (with `0005`) | 6347 tok | 1024-tok | 400 | 258/422 accepted | clean |
+| **baseline** (r13+beta, **no** `0005`) | 6347 tok | 1024-tok | 400 | 262/410 accepted | clean |
+| **closing** | 19949 tok | 4096-tok | 1000 | 657/1022 accepted | clean |
+| **baseline** | 19949 tok | 4096-tok | 1000 | 657/1022 accepted | clean |
+
+No abort, assert, `X < Y` or block-fill overrun in any arm.  The baseline was confirmed pre-fix
+(`qsa_n_kv_window` absent; block sizing still `idx->get_n_kv()`), so the A/B is valid — the gfx1151
+trigger simply **does not reproduce on gfx1201** with the shared MTP head.  Most likely reason: r13's
+shared-NextN fix (block 00) gives the shared head its **own** KV, so the draft context builds its own
+cells and the image position/cell divergence `0005` targets no longer arises; the gfx1151 crash was on
+a build where the shared head reused the target's KV.
+
+**Verdict:** `0005` stays in the delivery as a faithful port of the reference `b0f31f587` and a
+correctness guard; the gfx1201 gate is **"runs clean"**, not a FAIL→PASS.  Harness kept for
+re-use if a non-shared qwen4exp head ever lands on the box.
 
 ---
 
@@ -112,8 +154,8 @@ look if the lossy prefill is ever revisited, but it is not a closing regression.
 
 | item | result |
 |---|---|
-| OP-4(a) imatrix smoke | **PASS** (clean run) — but `-sm tensor` imatrix is corrupt, **pre-existing**, out of scope (new lead) |
+| OP-4(a) imatrix smoke | **PASS** (clean run) — but `-sm tensor` imatrix is corrupt, **pre-existing**, out of scope (new lead; root cause = the Meta eval-callback activation read) |
 | OP-4(b) `0001` | **validated** — default fusion +5 % over the op |
 | OP-4(c) `0008` | **validated** — default `TALL_MIN_M=16` ahead |
-| OP-4(d) M-RoPE image | **not run** (tooling), deferred |
+| OP-4(d) M-RoPE image | **run** — clean on closing **and** baseline (pre-fix) with the shared MTP head; trigger not reproduced on gfx1201; `0005` retained as a port |
 | OP-5.2 `0011` `-sm tensor` | **`0027` gap closed, +1.3 % (res16 only), `blk16` inert → park** |

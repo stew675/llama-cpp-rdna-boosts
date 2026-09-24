@@ -38,12 +38,12 @@ OP-5.1 `0013` redundancy verdict, and OP-1.4 (draft sampler, won't-fix) — plus
 **All campaign items are closed** — the per-item outcomes are in §0.5 and §1; the per-patch verdicts
 and full history are in `gfx1201-closed.md`.
 
-**Follow-up leads** (discovered here, not campaign gaps, no owner yet):
+**Follow-up leads** (discovered here, not campaign gaps):
 
-| lead | what | where |
+| lead | status | where |
 |---|---|---|
-| `-sm tensor` `llama-imatrix` | imatrix reports a garbage PPL and a corrupt `ffn_down` `in_sum2` under `-sm tensor` (`llama-perplexity` is fine).  Pre-existing (byte-identical r13+beta), deterministic, reproduces on the 4B in seconds.  Workaround: `-sm layer` | `2026-09-24-op4-imatrix-and-hc-gates.md` |
-| M-RoPE image case (`0005`) | the text-then-image repro was **not run** (mtmd tooling not prepped) | `2026-09-24-op4-imatrix-and-hc-gates.md` |
+| `-sm tensor` `llama-imatrix` | **root-caused, open** — the imatrix's activation read under the Meta backend returns wrong values (the gather layout is correct; `llama-perplexity` is fine, so the forward is fine).  Pre-existing (byte-identical r13+beta), deterministic, 4B repro in seconds.  Workaround: `-sm layer`.  A Meta-backend + eval-callback bug, not RDNA-specific | `2026-09-24-op4-imatrix-and-hc-gates.md` |
+| M-RoPE image case (`0005`) | **run, clean** — closing and baseline (pre-fix) both pass the image+MTP repro (up to 19949-token prompt + 4096-token image + 1000 generated); the gfx1151 trigger does not reproduce on gfx1201 with the shared head.  `0005` retained as a port.  Harness: `tools/mrope-image-mtp.sh` | `2026-09-24-op4-imatrix-and-hc-gates.md` |
 
 ---
 
@@ -90,10 +90,11 @@ mitigation shape is [`gfx1151-closing.md`](gfx1151-closing.md) §4.5.
 
 ### OP-4 — the unrun gates: **CLOSED 2026-09-24** (d deferred)
 
-(a) the imatrix smoke check, (b) the `0001` A/B and (c) the `0008` A/B are done.  Headline: the
-imatrix smoke check passes, but `-sm tensor` `llama-imatrix` is corrupt (**pre-existing**;
-`llama-perplexity` is fine) — new follow-up lead, out of scope.  `0001` / `0008` both validated.
-(d) M-RoPE image not run (tooling).  Record:
+(a) the imatrix smoke check, (b) the `0001` A/B, (c) the `0008` A/B and (d) the M-RoPE image + MTP
+repro are all **run** (2026-09-24).  Headline: the imatrix smoke check passes, but `-sm tensor`
+`llama-imatrix` is corrupt (**pre-existing**; `llama-perplexity` is fine) — new follow-up lead, out of
+scope.  `0001` / `0008` both validated.  (d) runs clean on the closing build **and** the pre-fix
+baseline (the gfx1151 trigger does not reproduce on gfx1201 with the shared head).  Record:
 [`2026-09-24-op4-imatrix-and-hc-gates.md`](2026-09-24-op4-imatrix-and-hc-gates.md).  Harnesses below.
 
 **(a) `llama-imatrix` (`0019`/`0023`) - a split/scheduler smoke check.**  HC16 is RDNA3_5-gated, so on
@@ -169,7 +170,7 @@ runtime-dispatch / `__noinline__` options were tried and rejected in r6; ccache 
 | **OP-2** MTP re-baseline | **DONE** — four-axis + `n7`/`n8`/adaptive, no env, CPU quiet every arm; `n8` near-tied with `n7` and wins recall (the old gap was `0028`) | `2026-09-24-mtp-cpu-spin-automatic.md` §4 |
 | **OP-3** matrix half | **DONE** — the full `n7`/`n8`/adaptive matrix with the fix | `2026-09-24-mtp-cpu-spin-automatic.md` §4 |
 | **OP-3** per-type MoE band | **CLOSED, no per-type band** — the unconditional floor at 16 wins for every routed-expert type in the relevant `B <= 13` range (k-quants +26%, IQ4_NL +13% at B=9); only IQ3_XXS/IQ4_XS regress and only from `B=13`.  The `__launch_bounds__` widening has no `B <= 8` cost (138-way register-identical, ±0.6% runtime) | `2026-09-24-op3-per-type-moe-band.md` |
-| **OP-4** gates | **DONE** — (a) imatrix smoke passes but `-sm tensor` imatrix is corrupt (**pre-existing**, perplexity fine); (b) `0001` default fusion +5 % over the op; (c) `0008` default `TALL_MIN_M=16` ahead; (d) M-RoPE image not run | `2026-09-24-op4-imatrix-and-hc-gates.md` |
+| **OP-4** gates | **DONE** — (a) imatrix smoke passes but `-sm tensor` imatrix is corrupt (**pre-existing**, perplexity fine; root cause = the Meta eval-callback activation read); (b) `0001` default fusion +5 % over the op; (c) `0008` default `TALL_MIN_M=16` ahead; (d) M-RoPE image+MTP runs clean on closing **and** pre-fix baseline | `2026-09-24-op4-imatrix-and-hc-gates.md` |
 | **OP-5.2** `0011` `-sm tensor` | **PARKED** — `0027` closes the marking gap (`comb=` 582×); A/B +1.3 %, all from `LLAMA_HC_RES16` (`blk16` inert); lossy → default-OFF | `2026-09-24-op4-imatrix-and-hc-gates.md` |
 | **OP-6** build time | **CLOSED, no change** — the "7.26 MB / 229 s" premise is pre-r6; the largest MMA TU is now 2.9 MB / 82 s vs a 236 s `-j16` makespan (throughput-bound), so the per-KV-type split cannot help; ccache is the answer | `2026-09-24-op6-build-time-closure.md` |
 | **OP-5.1** `0013` on RDNA4 | **REDUNDANT** — matcher fires 0× with `0016` ON, 4× with `LLAMA_QSA_SCORE_WMMA=0`; no port | `2026-09-24-mtp-cpu-spin-automatic.md` §5 |
@@ -377,7 +378,9 @@ near-tied everywhere and **wins recall** — the `n_max 8` question is workload-
   qwen4exp gates but never singled out.
   → **DONE 2026-09-24: `0001` default fusion +5 %; `0008` default `TALL_MIN_M=16` ahead (interleaved).**
 * §6.6 **M-RoPE image case** (`0005`) — needs the vision projector; the gfx1151 repro was an image after
-  ~12k tokens of text.  **← not run (tooling); the only OP-4 item still open.**
+  ~12k tokens of text.  **→ DONE 2026-09-24: ran clean on the closing build AND the pre-fix baseline
+  (the trigger does not reproduce on gfx1201 with the shared MTP head); `0005` retained as a port.**
+  Harness: `tools/mrope-image-mtp.sh`.
 
 ### 2.5 OP-5 — remaining RDNA3_5-gated kernels (low priority)
 
