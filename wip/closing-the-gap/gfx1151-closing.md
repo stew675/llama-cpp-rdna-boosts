@@ -427,6 +427,14 @@ Inputs stay zero-copy and the per-ubatch copy disappears.
    degrade to the copy, never back to the fault.  This is also a clean **upstream-PR candidate**
    (the reference commits are upstream), so mirror it under `upstream/` if it lands.
 
+> **RESULT 2026-09-24 (step 1): STOP — do not port the ring.**  Measured the stopgap's copy directly
+> (`GGML_SPLIT_COPY_STATS` instrumentation): **prefill 0.03–0.05 %, decode ~0.5–0.9 % (≈140 µs/token)**, and the
+> copied bytes are ubatch-independent.  Deterministic in the accounting but at/below the end-to-end
+> noise floor and below the campaign's ~1 % win bar, for a ~500-line upstream scheduler port.  Keep
+> the stopgap; the ring is a nicety, not a win, on this box.  Full data and the reproduce recipe:
+> [`2026-09-24-gfx1151-input-copy-cost.md`](2026-09-24-gfx1151-input-copy-cost.md).  (`0030` does **not**
+> change these copies — it moves the input layer, not the graph inputs.)
+
 ---
 
 ## 10. Session log
@@ -460,6 +468,14 @@ default-OFF), `0005` M-RoPE+image+MTP clean on current **and** pre-fix (trigger 
 KV).  Full tables and commands: [`2026-09-24-gfx1151-p3-carryover.md`](2026-09-24-gfx1151-p3-carryover.md).
 **Remaining (parked, not blockers):** `0011` default (lossy), the inert `blk16` producer check, §9
 (measure the `0025` copy before porting the input ring).  RDNA3_0 stays with `gfx1100-closing.md`.
+
+### 2026-09-24 — §9 step 1 DONE: the input-ring go/no-go
+
+Instrumented the split-input copies (`GGML_SPLIT_COPY_STATS`): **prefill 0.03–0.05 %**, **decode
+~0.5–0.9 % (≈140 µs/token)**, ubatch-independent.  **Verdict: STOP — do not port the ring** (sub-1 %
+for a ~500-line scheduler port).  Record: [`2026-09-24-gfx1151-input-copy-cost.md`](2026-09-24-gfx1151-input-copy-cost.md).
+`0030` does not change the copies.  **Remaining gfx1151 items are now only the parked ones** (`0011`
+default, the inert `blk16` check) and the maintainer-flagged `n8`-prose look.
 
 ### 2026-09-24/25 — brief expanded for the final wrap-up (from the gfx1201 campaign close)
 

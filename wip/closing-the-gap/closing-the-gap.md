@@ -112,6 +112,10 @@ The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and t
    [`2026-09-23-host-buffer-input-layer.md`](2026-09-23-host-buffer-input-layer.md).  The reference's
    input ring (`83e8382ba`/`1f2e34819`) remains a follow-up optimisation — the guard's
    `n_copies <= 1` condition composes with it.  Multi-GPU is stated but untested here.
+   **The ring follow-up is CLOSED (gfx1151 §9 step 1, 2026-09-24):**  the per-ubatch host-input copy
+   measures **prefill 0.03–0.05 %, decode ~0.5–0.9 % (≈140 µs/token)**, ubatch-independent — **stop,
+   do not port the ring** (sub-1 % for a ~500-line scheduler port).  Record:
+   [`2026-09-24-gfx1151-input-copy-cost.md`](2026-09-24-gfx1151-input-copy-cost.md).
 2. **~~Promote the sparse MTP draft to default-on~~ — DONE 2026-09-23** (`patches/0026`).  The
    HC16 fix (`patches/0023`) made the sparse draft pure; the default is flipped with
    `LLAMA_MTP_SPARSE=0` as the opt-out.  A/B: pp150K **937.1 -> 1007.9 t/s (+7.6 %)**, pp16K −0.3 %,
