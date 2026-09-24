@@ -1,3 +1,39 @@
+From 6b230ad5920838de846979d019fbff671be6c600 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Thu, 24 Sep 2026 08:33:41 -0500
+Subject: [PATCH] gap-closing WIP: extend the routed-expert MMVQ band and the
+ RDNA4 dense fallback rows to W=16
+
+The qwen4exp draft-mtp n_max 7->8 drop is the n_tokens 8->9 MMVQ->MMQ family
+boundary (MMVQ_MAX_BATCH_SIZE=8), not the mmq_rdna3_5_id_get_J tile (J=16 in
+both arms).  At 9 columns the routed experts leave mul_mat_vec_q_moe for
+mul_mat_q_routed_compact/mul_mat_q and the dense weights leave
+mul_mat_vec_q_ksplit for mul_mat_q.  A weight whose output-row count is not a
+multiple of 128 (qwen4exp: 4/15/18/256/320) then takes MMQ's generic
+non-128-row "fallback" config (mul_mat_q_case), ~3x the per-launch cost of the
+ksplit kernel, while a multiple of 128 keeps the fast config (the 27B upward
+jump at the same boundary).
+
+Routed experts: the dedicated one-warp-per-token MoE kernel's per-token
+reduction does not depend on the column count, so MMVQ_MOE_MAX_BATCH_SIZE=16
+covers the whole supported verify range (--spec-draft-n-max <= 15) on one
+accumulation order.  Dense: keep the ksplit MMVQ kernel for RDNA4 rows with
+nrows_x % 128 != 0 at 9..16.
+
+GGML_CUDA_DISABLE_MMVQ_MOE_BAND / GGML_CUDA_DISABLE_MMVQ_DENSE_BAND are the
+A/B kill-switches (both default on).  qwen4exp IQ4_NL 3-GPU tensor B=9
+202.6 -> 270.0 t/s (B<=8 unchanged, B=10..12 +5..+23 %); n_max 8 MTP
+94.3 -> 102.7 t/s at acceptance 0.63; plain == n3 byte-identical; 27B/35B
+unchanged.  The arch-independent routed-expert half already fires on
+gfx1151/gfx1100; the dense half is RDNA4-gated.
+
+gfx1151 revalidation/port brief: wip/closing-the-gap/gfx1151-closing.md
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 53 ++++++++++++++++++++-------------
+ ggml/src/ggml-cuda/mmvq.cu      | 37 +++++++++++++++++++----
+ ggml/src/ggml-cuda/mmvq.cuh     |  5 ++++
+ 3 files changed, 69 insertions(+), 26 deletions(-)
+
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index 003be2475..89da8b8f5 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
@@ -194,3 +230,6 @@ index 4140f681a..292fb255e 100644
  
  bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
  
+-- 
+2.55.0
+

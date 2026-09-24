@@ -126,8 +126,9 @@ The dense/experts weights whose `nrows_x % 128 != 0` (qwen4exp: 4/15/18/256/320)
 **`fallback`** config (`mul_mat_q_case`), 3× the cost of the ksplit MMVQ kernel.  27B's rows are all
 ÷128, so MMQ takes the fast config and it *gains* — that is the upward jump in the same table.
 
-**Fix (uncommitted 3-file edit in the `closing-gfx1201` checkout; 69 insertions; saved as
-[`2026-09-24-mmvq-band-boundary.patch`](2026-09-24-mmvq-band-boundary.patch)):**
+**Fix (folded into the WIP set as
+[`patches/0028`](patches/0028-gap-closing-WIP-extend-the-MMVQ-routed-expert-band-and-RDNA4-dense-fallback.patch);
+69 insertions over 3 files):**
 
 * `ggml/src/ggml-cuda/mmvq.cuh` — `#define MMVQ_MOE_MAX_BATCH_SIZE 16`.
 * `ggml/src/ggml-cuda/mmvq.cu` — the `mmvq_mmid_max_batch_band` floor, the `mul_mat_vec_q_moe`

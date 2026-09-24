@@ -17,7 +17,7 @@ fork**).  Push the delivery repo only if the maintainer asks.
 
 ## 0. The one-paragraph summary
 
-The campaign is 26 patches (`wip/closing-the-gap/patches/0001..0014`, `0016..0027`) on top of the
+The campaign is 27 patches (`wip/closing-the-gap/patches/0001..0014`, `0016..0028`) on top of the
 **r13 delivery (16 blocks)** + the **12 `beta/mmb-general` patches**.  It was developed and tuned
 on **gfx1151 (RDNA3_5)**, and a few pieces are explicitly **RDNA3_5-only or gfx1151-tuned**.  Your
 job is to prove that on **gfx1201 (RDNA4)** the tree is *correct and not a regression*, and to
@@ -383,7 +383,9 @@ selects `mul_mat_q_case`'s generic non-128-row **`fallback`** config (~3× the p
 ksplit kernel); 27B's rows are all ÷128, so MMQ is the *fast* config and it gains at the same
 boundary — the jump and the dip are the same mechanism.
 
-**The fix** (uncommitted 3-file edit, 69 insertions): `MMVQ_MOE_MAX_BATCH_SIZE = 16` for the
+**The fix** (folded into the WIP set as
+[`patches/0028`](patches/0028-gap-closing-WIP-extend-the-MMVQ-routed-expert-band-and-RDNA4-dense-fallback.patch),
+commit `6b230ad59208`, 69 insertions): `MMVQ_MOE_MAX_BATCH_SIZE = 16` for the
 routed-expert path (arch-independent AMD, whole supported verify range W ≤ 16), plus an RDNA4 rule
 keeping ksplit MMVQ for `nrows % 128 != 0` dense shapes at 9..16.  Kill-switches
 `GGML_CUDA_DISABLE_MMVQ_MOE_BAND=1` / `GGML_CUDA_DISABLE_MMVQ_DENSE_BAND=1`.
@@ -1160,8 +1162,9 @@ non-128-row **`fallback`** config (~3× the per-launch cost), while 27B's ÷128 
 choice (hence the 27B *upward* jump at the same boundary).  Fix: `MMVQ_MOE_MAX_BATCH_SIZE = 16` for
 routed experts (arch-independent AMD) + an RDNA4 dense rule that keeps ksplit MMVQ for
 `nrows % 128 != 0` shapes at 9..16, each with a kill-switch (`GGML_CUDA_DISABLE_MMVQ_MOE_BAND`,
-`GGML_CUDA_DISABLE_MMVQ_DENSE_BAND`; the diff is saved as
-[`2026-09-24-mmvq-band-boundary.patch`](2026-09-24-mmvq-band-boundary.patch)).  qwen4exp B=9
+`GGML_CUDA_DISABLE_MMVQ_DENSE_BAND`; folded into the WIP set as
+[`patches/0028`](patches/0028-gap-closing-WIP-extend-the-MMVQ-routed-expert-band-and-RDNA4-dense-fallback.patch)).
+qwen4exp B=9
 **202.6 → 270.0**, B=10..12 +5…+23 %, B≤8
 unchanged, `n_max 8` MTP 94.3 → **102.7 t/s**, `plain == n3` byte-identical.  Full record:
 [`2026-09-24-qwen4exp-w9-verify-cliff.md`](2026-09-24-qwen4exp-w9-verify-cliff.md).  **gfx1151

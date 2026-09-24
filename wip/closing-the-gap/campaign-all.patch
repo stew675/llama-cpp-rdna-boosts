@@ -551,7 +551,7 @@ index 000000000..a843b460a
 +void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
 +void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 58b7c0adb..003be2475 100644
+index 58b7c0adb..89da8b8f5 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -30,6 +30,8 @@
@@ -594,7 +594,75 @@ index 58b7c0adb..003be2475 100644
          info.devices[id].nsm        = prop.multiProcessorCount;
          info.devices[id].smpb       = prop.sharedMemPerBlock;
          info.devices[id].warp_size  = prop.warpSize;
-@@ -3996,6 +4010,224 @@ static int ggml_cuda_match_hc_mix(const ggml_cgraph * cgraph, const int i, ggml_
+@@ -2350,7 +2364,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+         return;
+     }
+-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
++    bool use_mmvq = ggml_cuda_should_use_mmvq(src0->type, cc, ne11);
++    // RDNA4: a dense weight whose output-row count is not a multiple of 128 takes MMQ's slow
++    // non-128-row "fallback" config (~3x per launch versus the ksplit MMVQ kernel at these small
++    // column counts; the qwen4exp n_tokens = 9 verify step).  Keep the ksplit band for those rows.
++    // GGML_CUDA_DISABLE_MMVQ_DENSE_BAND=1 is the bisect/A-B kill-switch (default on).
++    static const bool dense_band_off = getenv("GGML_CUDA_DISABLE_MMVQ_DENSE_BAND") != nullptr;
++    if (!use_mmvq && !dense_band_off && GGML_CUDA_CC_IS_RDNA4(cc) && ne11 <= MMVQ_MOE_MAX_BATCH_SIZE && src0->ne[1] % 128 != 0) {
++        use_mmvq = true;
++    }
++    if (use_mmvq) {
+         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+         return;
+     }
+@@ -2371,14 +2394,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+         return true;
+     }
+ 
+-    if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
+-        if (ggml_is_quantized(src0->type)) {
+-            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+-                return false;
+-            }
+-        } else if (GGML_CUDA_CC_IS_AMD(cc)) {
++    if (ggml_is_quantized(src0->type)) {
++        if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+             return false;
+         }
++    } else if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
++        return false;
+     }
+ 
+     if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
+@@ -2407,18 +2428,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+-            if (ggml_is_quantized(src0->type)) {
+-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+-                if (ne2 <= mmvq_mmid_max) {
+-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+-                    return;
+-                }
+-            } else {
+-                if (GGML_CUDA_CC_IS_AMD(cc)) {
+-                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+-                    return;
+-                }
++        // Quantized routed experts take the dedicated MoE MMVQ kernel over the whole verify band
++        // (MMVQ_MOE_MAX_BATCH_SIZE); the F32/F16 expert path keeps the 8-column MMVF band.
++        if (ggml_is_quantized(src0->type)) {
++            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
++            if (ne2 <= mmvq_mmid_max) {
++                ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
++                return;
++            }
++        } else if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
++            if (GGML_CUDA_CC_IS_AMD(cc)) {
++                ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
++                return;
+             }
+         }
+ 
+@@ -3996,6 +4017,224 @@ static int ggml_cuda_match_hc_mix(const ggml_cgraph * cgraph, const int i, ggml_
      args.bias  = ggml_get_op_params_f32(scale, 1);
      return n_ops;
  }
@@ -819,7 +887,7 @@ index 58b7c0adb..003be2475 100644
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-@@ -4014,6 +4246,71 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4014,6 +4253,71 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      ggml_tensor * node = cgraph->nodes[i];
  
@@ -891,7 +959,22 @@ index 58b7c0adb..003be2475 100644
      // qwen4exp IQ4_NL/Q8_0 routed down projection followed by the 10-expert weighted sum (ported
      // from halo-box/strix-llama.cpp): compute all selected experts for one output row in a wave and
      // apply their routing weights immediately, avoiding the [n_embd, n_used] intermediate and its
-@@ -4116,12 +4413,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4103,7 +4407,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         // single-token/gathered (mmvq territory, e.g. the blk.47 gather in prefill) must keep the
+         // per-node decode path: the merged mmq kernels would change numerics there (B's !use_mmvq).
+         const int64_t ncols_dst = has_ids ? node->ne[2] : node->ne[1];
+-        const bool use_mmvq = ncols_dst <= MMVQ_MAX_BATCH_SIZE &&
++        // The routed-expert (MUL_MAT_ID) path takes the dedicated MoE MMVQ kernel over the whole
++        // verify band; RDNA4 dense rows that MMQ would run in its non-128-row fallback config do
++        // the same.  The pair fusion stands down so the per-node MMVQ dispatch handles them.
++        static const bool dense_band_off = getenv("GGML_CUDA_DISABLE_MMVQ_DENSE_BAND") != nullptr;
++        const bool mmvq_extended_rows = !dense_band_off && !has_ids && GGML_CUDA_CC_IS_RDNA4(cc) && src0->ne[1] % 128 != 0;
++        const int64_t mmvq_band = (has_ids || mmvq_extended_rows) ? MMVQ_MOE_MAX_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE;
++        const bool use_mmvq = ncols_dst <= mmvq_band &&
+             (!has_ids || ncols_dst <= get_mmvq_mmid_max_batch(src0->type, cc) ||
+                          ncols_dst <= get_mmvq_mmid_max_batch(src0_next->type, cc));
+         if (use_mmq && !use_mmvq) {
+@@ -4116,12 +4426,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          ggml_moe_weighted_reduction_match match;
          static const bool mwr_dbg2 = getenv("GGML_CUDA_MWR_DEBUG") != nullptr;
          if (ggml_match_moe_weighted_reduction(cgraph, i, match)) {
@@ -928,7 +1011,7 @@ index 58b7c0adb..003be2475 100644
              }
          }
      }
-@@ -5386,6 +5703,67 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5386,6 +5716,67 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      static const bool hc_optin  = !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_FUSION") || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_FUSION")));
      static const bool hc_mix_on  = hc_optin && !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_MIX")  || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_MIX")));
      static const bool hc_comb_on = hc_optin && !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_COMB") || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_COMB")));
@@ -996,7 +1079,7 @@ index 58b7c0adb..003be2475 100644
      if (hc_mix_on) {
      // qwen4exp hyper-connection stream mix:
      //     sigmoid(gate) -> mul(xn, .) -> reshape -> view(stream 0) -> cont -> (view(stream c) -> add) x (hc-1) -> scale
-@@ -5438,6 +5816,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5438,6 +5829,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              while (base_root != nullptr && base_root->view_src != nullptr) {
                  base_root = base_root->view_src;
              }
@@ -1010,7 +1093,7 @@ index 58b7c0adb..003be2475 100644
              if (base_root != nullptr && base_root->type == GGML_TYPE_F32 &&
                      (base_root->flags & GGML_TENSOR_FLAG_OUTPUT)) {
                  const int limit = std::min(cgraph->n_nodes, i + 24);
-@@ -5506,10 +5891,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5506,10 +5904,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                                  const bool ok_d = ggml_are_same_shape(mul, add) && ggml_are_same_shape(res, add) && ggml_are_same_shape(rms, add);
                                  const bool ok_e = ggml_is_contiguous(res) && ggml_is_contiguous(add) && ggml_is_contiguous(rms) &&
                                      ggml_is_contiguous(mulg) && ggml_is_contiguous(gamma);
@@ -1034,7 +1117,7 @@ index 58b7c0adb..003be2475 100644
                                  if (ok) {
                                      ggml_cuda_hc_combine_norm_args args;
                                      args.inject       = inject;
-@@ -5548,7 +5944,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5548,7 +5957,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                                      const int out_nodes[] = { m, g };
                                      const bool supp = ggml_cuda_hc_combine_norm_supported(args, ggml_cuda_info().devices[cuda_ctx->device].warp_size);
                                      const bool canf = ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2);
@@ -1049,7 +1132,7 @@ index 58b7c0adb..003be2475 100644
                                          ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
                                          return g - i;
                                      }
-@@ -5669,10 +6072,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5669,10 +6085,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                          const bool ok_d = ggml_are_same_shape(mul, add) && ggml_are_same_shape(res, add) && ggml_are_same_shape(rms, add);
                          const bool ok_e = ggml_is_contiguous(res) && ggml_is_contiguous(add) && ggml_is_contiguous(rms) &&
                              ggml_is_contiguous(mulg) && ggml_is_contiguous(gamma);
@@ -1073,7 +1156,7 @@ index 58b7c0adb..003be2475 100644
                          if (ok) {
                              ggml_cuda_hc_combine_norm_args args;
                              args.inject    = inject;
-@@ -5720,6 +6134,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5720,6 +6147,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                              const bool supp = ggml_cuda_hc_combine_norm_supported(args, ggml_cuda_info().devices[cuda_ctx->device].warp_size);
                              const bool canf = ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2);
                              if (alias_ok && supp && canf) {
@@ -1081,7 +1164,7 @@ index 58b7c0adb..003be2475 100644
                                  ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
                                  return g - i;
                              }
-@@ -6130,9 +6545,6 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+@@ -6130,9 +6558,6 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
  }
  #endif // USE_CUDA_GRAPH
  
@@ -1091,7 +1174,7 @@ index 58b7c0adb..003be2475 100644
  static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
-@@ -6140,6 +6552,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6140,6 +6565,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      // The Q8_1 input cache is only valid within one graph execution.
      cuda_ctx->q8_1_cache_clear();
@@ -1099,7 +1182,7 @@ index 58b7c0adb..003be2475 100644
      ggml_cuda_mmb_begin_graph();
  
      bool use_cuda_graph             = false;
-@@ -6208,9 +6621,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6208,9 +6634,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
  
@@ -1110,7 +1193,7 @@ index 58b7c0adb..003be2475 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -6242,14 +6653,43 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+@@ -6242,14 +6666,43 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
  static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
@@ -1159,7 +1242,7 @@ index 58b7c0adb..003be2475 100644
  
      // MMB HC16 (step 1 of the bf16-producer port): mark the gate producer of a gated DSV4_HC_PRE as
      // BF16-only when MMB will produce it and every consumer reads the BF16 copy.  The gate is a
-@@ -6257,7 +6697,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6257,7 +6710,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // first win.  STRUCTURE ONLY: inside graph_optimize the data pointers are not assigned yet, so
      // the check must not look at alias/buffer state.  LLAMA_MMB_HC16>=1 (== GGML_CUDA_MMB_HC16).
      {
@@ -1168,7 +1251,7 @@ index 58b7c0adb..003be2475 100644
          if (hc16 >= 1 && ggml_cuda_mmb_active() &&
                  GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
              auto reads = [](const ggml_tensor * t, const ggml_tensor * x) {
-@@ -6286,7 +6726,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6286,7 +6739,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                      if (t == pre) continue;
                      ok = false;
                  }
@@ -1177,7 +1260,7 @@ index 58b7c0adb..003be2475 100644
                      ggml_cuda_mmb_mark_bf16_only(gr);
                      static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_HC16 gate marked BF16-only: %s (M=%d K=%d T=%d)\n",
                              gr->name, (int) gr->ne[1], (int) gr->ne[0], (int) (gr->ne[2] * gr->ne[3]));
-@@ -6302,18 +6742,31 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6302,18 +6755,31 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // copy is RNE-rounded exactly as mmb_cvt_f32_bf16, so the GEMM arithmetic is bit-identical.
      // Dense MUL_MAT only; F32-weight GEMMs read the activation directly (tiny-M / f32split).
      {
@@ -1214,7 +1297,7 @@ index 58b7c0adb..003be2475 100644
                      if (t->op == GGML_OP_MUL_MAT && t->src[1] && rootof(t->src[1]) == root && t->src[0] &&
                              ggml_cuda_mmb_reads_bf16_act(t->src[0], t->src[1], t)) continue;
                      if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] && rootof(t->src[1]) == root &&
-@@ -6327,9 +6780,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6327,9 +6793,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                          ggml_cuda_mmb_mark_bf16_slot(root, 4);
                          continue;
                      }
@@ -1226,7 +1309,7 @@ index 58b7c0adb..003be2475 100644
              };
              for (int i = 0; i < cgraph->n_nodes; ++i) {
                  const ggml_tensor * t = cgraph->nodes[i];
-@@ -6337,10 +6790,167 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6337,10 +6803,167 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  if (t->src[0]->type == GGML_TYPE_F32) continue;
                  if (!ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
                  const ggml_tensor * ar = rootof(t->src[1]);
@@ -1398,7 +1481,7 @@ index 58b7c0adb..003be2475 100644
              }
          }
      }
-@@ -6348,6 +6958,31 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6348,6 +6971,31 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
      if (!disable_fusion) {
          for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -1430,7 +1513,7 @@ index 58b7c0adb..003be2475 100644
              if (cgraph->nodes[i]->op != GGML_OP_MUL) {
                  continue;
              }
-@@ -6367,6 +7002,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6367,6 +7015,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -2731,6 +2814,115 @@ index 8d9c14539..d4dd67707 100644
  size_t ggml_cuda_mmb_marks_count();
  void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t);
  bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t);
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 436a72751..1c7bfcf90 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -295,11 +295,11 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+ // bit-identical, and MUL_MAT_ID mmvq (mul_mat_vec_q_moe, one warp per token) and MMQ reduce in
+ // different orders, so no cap may split the band.  The cap still applies above the band.
+ static constexpr __host__ __device__ int mmvq_mmid_max_batch_band(int cap) {
+-    return cap > MMVQ_MAX_BATCH_SIZE ? cap : MMVQ_MAX_BATCH_SIZE;
++    return cap > MMVQ_MOE_MAX_BATCH_SIZE ? cap : MMVQ_MOE_MAX_BATCH_SIZE;
+ }
+ 
+ // Host function: returns the max batch size for the current arch+type at runtime.
+-int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
++static int get_mmvq_mmid_max_batch_impl(ggml_type type, int cc) {
+     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
+     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+@@ -332,6 +332,15 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+     return MMVQ_MAX_BATCH_SIZE;
+ }
+ 
++// Kill-switch for the extended routed-expert band (bisect / A-B only; the extended band is the
++// default).  Setting it clamps every MUL_MAT_ID mmvq cap back to the dense MMVQ band, i.e. the
++// pre-extension behaviour (routed MoE falls back to MMQ above 8 columns).
++int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
++    const int cap = get_mmvq_mmid_max_batch_impl(type, cc);
++    static const bool legacy_band = getenv("GGML_CUDA_DISABLE_MMVQ_MOE_BAND") != nullptr;
++    return (legacy_band && cap > MMVQ_MAX_BATCH_SIZE) ? MMVQ_MAX_BATCH_SIZE : cap;
++}
++
+ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+     if (!ggml_is_quantized(type)) {
+         return false;
+@@ -1211,7 +1220,7 @@ static __global__ void mul_mat_vec_q_ksplit(
+ // mul_mat_vec_q_switch_ncols_dst), so its launch bound must cover the band rather than the per-type
+ // cap -- otherwise a launch with ncols_dst > cap fails outright.
+ template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
+-__launch_bounds__(MMVQ_MAX_BATCH_SIZE*ggml_cuda_get_physical_warp_size(), 1)
++__launch_bounds__(MMVQ_MOE_MAX_BATCH_SIZE*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q_moe(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
+         float * dst_ptr,
+@@ -1504,7 +1513,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         const int ids_stride, cudaStream_t stream) {
+ 
+     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
+-    GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
++    // The MUL_MAT_ID routed-expert kernel is token-generic and covers the whole verify range; the
++    // RDNA4 dense fallback-row band is extended to the same width (see ggml_cuda_mul_mat).
++    GGML_ASSERT(ncols_dst <= MMVQ_MOE_MAX_BATCH_SIZE);
+ 
+     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
+     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
+@@ -1601,7 +1612,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
+     }
+ 
+     switch (ncols_dst) {
+-        case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: {
++        case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8:
++        case 9: case 10: case 11: case 12: case 13: case 14: case 15: case 16: {
+             // dispatch per ncols with a compile-time tag
+             const auto dispatch = [&](auto ncols_tag) {
+                 constexpr int c_ncols_dst = decltype(ncols_tag)::value;
+@@ -1777,6 +1789,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
+             // item-split accumulator layout is register-bound at ncols_dst > 1.
+             launch_ksplit(std::integral_constant<int, 8>{});
+         } break;
++        // Dense rows at ncols_dst 9..16 keep the same ksplit kernel as the 2..8 band.  The RDNA4
++        // dense dispatch only reaches these when the MMQ path would take its slow non-128-row
++        // "fallback" config (see ggml_cuda_mul_mat), so the reduction-order band 2..16 matches.
++        case 9:  launch_ksplit(std::integral_constant<int, 9>{});  break;
++        case 10: launch_ksplit(std::integral_constant<int, 10>{}); break;
++        case 11: launch_ksplit(std::integral_constant<int, 11>{}); break;
++        case 12: launch_ksplit(std::integral_constant<int, 12>{}); break;
++        case 13: launch_ksplit(std::integral_constant<int, 13>{}); break;
++        case 14: launch_ksplit(std::integral_constant<int, 14>{}); break;
++        case 15: launch_ksplit(std::integral_constant<int, 15>{}); break;
++        case 16: launch_ksplit(std::integral_constant<int, 16>{}); break;
+                 default: GGML_ABORT("fatal error"); break;
+             }
+         } break;
+@@ -1958,7 +1981,9 @@ void ggml_cuda_mul_mat_vec_q(
+     GGML_ASSERT(        nb0        == ts_dst);
+     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
+ 
+-    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
++    // Dense ncols_dst is ne1, MUL_MAT_ID ncols_dst is ne2 (== ne12); both now cover the full
++    // verify band (MMVQ_MOE_MAX_BATCH_SIZE), so assert on whichever one is the column count.
++    GGML_ASSERT((ids ? ne12 : ne1) <= MMVQ_MOE_MAX_BATCH_SIZE);
+ 
+     const float   * src1_d =       (const float   *) src1->data;
+     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index 4140f681a..292fb255e 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -1,6 +1,11 @@
+ #include "common.cuh"
+ 
+ #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
++// Dedicated MUL_MAT_ID MoE kernel band (mul_mat_vec_q_moe).  That kernel is one warp per token and
++// its per-token reduction does not depend on the column count, so it covers the whole speculative
++// verify range (--spec-draft-n-max <= 15 -> n_tokens <= 16) on a single accumulation order.  The
++// dense MMVQ band above stays at 8; only the MUL_MAT_ID (routed expert) path uses this one.
++#define MMVQ_MOE_MAX_BATCH_SIZE 16
+ 
+ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
+ 
 diff --git a/ggml/src/ggml-cuda/moe-weighted-reduction.cu b/ggml/src/ggml-cuda/moe-weighted-reduction.cu
 index f5ca12a1e..45eb1a2c1 100644
 --- a/ggml/src/ggml-cuda/moe-weighted-reduction.cu

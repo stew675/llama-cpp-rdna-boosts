@@ -167,9 +167,11 @@ The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and t
    `MMVQ_MOE_MAX_BATCH_SIZE = 16` for routed experts (arch-independent AMD) and an RDNA4 dense
    `nrows % 128 != 0` rule.  qwen4exp B=9 **202.6 → 270.0 t/s**, `n_max 8` MTP 94.3 → 102.7 t/s on
    gfx1201.  **The routed-expert band already fires on gfx1151** (arch-independent), so it must be
-   revalidated on `halo`; the dense band is RDNA4-gated and needs a port/reject decision.  Handover
-   brief: [`gfx1151-closing.md`](gfx1151-closing.md); diff:
-   [`2026-09-24-mmvq-band-boundary.patch`](2026-09-24-mmvq-band-boundary.patch); record:
+   revalidated on `halo`; the dense band is RDNA4-gated and needs a port/reject decision.  Folded
+   into the WIP set as [`patches/0028`](patches/0028-gap-closing-WIP-extend-the-MMVQ-routed-expert-band-and-RDNA4-dense-fallback.patch)
+   (27-patch campaign, fresh r13+beta + 27/27 apply reproduces tree
+   `533eee3188ab7df9b6cf394adeaa31b46bd13ff2`).  Handover brief:
+   [`gfx1151-closing.md`](gfx1151-closing.md); record:
    [`2026-09-24-qwen4exp-w9-verify-cliff.md`](2026-09-24-qwen4exp-w9-verify-cliff.md).
 
 ### Parked / do not restart without a reason

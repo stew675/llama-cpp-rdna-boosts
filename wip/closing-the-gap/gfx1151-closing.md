@@ -56,7 +56,7 @@ to gfx1151.
 | GPU | **Strix Halo, Radeon 8060S (gfx1151, RDNA3_5)**, 123 GiB unified |
 | ROCm | `/opt/rocm-7.14-gfx1151` (runtime `LD_LIBRARY_PATH`) |
 | Build | `cd ~/llama.cpp && BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (ccache); fast loop `cmake --build build-rocm --target llama-cli llama-bench llama-batched-bench test-backend-ops -j 16` |
-| Typical fork branch | `gap-closing-hostbuf-integrated` = r13 + `beta/mmb-general` + `0001..0014`/`0016..0027` |
+| Typical fork branch | `gap-closing-hostbuf-integrated` = r13 + `beta/mmb-general` + `0001..0014`/`0016..0028` |
 | **Every command** | `export HIP_VISIBLE_DEVICES=0` (single device) |
 | Headline model | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` + MTP sidecar `/llm/models/Qwen3.8/Flash-Next/Q4_K_XL/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf` |
 | Other models | 35B-A3B UD-Q3_K_M / Q4_K_M, 27B UD-Q4_K_M / UD-Q4_K_XL / UD-IQ3_S / Q8_0, gemma-4-12B, gemma-4-26B-A4B, NanBeige BF16 |
@@ -69,10 +69,12 @@ kernel-family-dispatch change and the gates that matter are §4.2–§4.5 below.
 
 ## 2. The fix, precisely (what to build)
 
-The change is **not yet folded into a closing patch** — it currently lives as an uncommitted edit in
-`~/llama.cpp` on the gfx1201 session, saved as
-[`2026-09-24-mmvq-band-boundary.patch`](2026-09-24-mmvq-band-boundary.patch) (`git apply` against the
-closing tree).  Three files, 69 insertions:
+The change is **folded into the WIP campaign as
+[`patches/0028`](patches/0028-gap-closing-WIP-extend-the-MMVQ-routed-expert-band-and-RDNA4-dense-fallback.patch)
+(commit `6b230ad59208`; the campaign is now 27 patches: `0001..0014` + `0016..0028`, still skipping
+`0015`).  Apply it on top of the 26-patch tree with `git am`, or apply the whole set fresh — a fresh
+r13+beta worktree + 27/27 reproduces tree `533eee3188ab7df9b6cf394adeaa31b46bd13ff2`.  Three files,
+69 insertions:
 
 ### 2a. `ggml/src/ggml-cuda/mmvq.cuh`
 
@@ -320,10 +322,10 @@ Newest first.  Append state, what changed, the tree/`From <sha>`, and the next a
 
 ### 2026-09-24 — opened (from the gfx1201 W=9-cliff session)
 
-Handover created.  **Nothing measured on gfx1151 yet.**  The gfx1201 fix is an uncommitted 3-file
-edit (`ggml/src/ggml-cuda/{mmvq.cuh,mmvq.cu,ggml-cuda.cu}`, 69 insertions) in the `closing-gfx1201`
-checkout; the first job here is to apply it on top of `gap-closing-hostbuf-integrated` (or port the
-functional hunks), build, and run §4.2/§4.3.  Open decisions: §3 (revalidate the MoE band that
-already fires here), §4.6 (widen the dense odd-row gate?), §5.1 (launch-bounds occupancy).
+Handover created.  **Nothing measured on gfx1151 yet.**  The gfx1201 fix is now
+[`patches/0028`](patches/0028-gap-closing-WIP-extend-the-MMVQ-routed-expert-band-and-RDNA4-dense-fallback.patch)
+(commit `6b230ad59208`); the first job here is to apply the 27-patch closing set on top of
+`gap-closing-hostbuf-integrated`, build, and run §4.2/§4.3.  Open decisions: §3 (revalidate the MoE
+band that already fires here), §4.6 (widen the dense odd-row gate?), §5.1 (launch-bounds occupancy).
 Full gfx1201 evidence: [`2026-09-24-qwen4exp-w9-verify-cliff.md`](2026-09-24-qwen4exp-w9-verify-cliff.md)
 and [`gfx1201-closing.md`](gfx1201-closing.md) §13.7.
