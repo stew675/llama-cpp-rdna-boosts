@@ -122,8 +122,9 @@ The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and t
    + `wip/closing-the-gap`), the per-patch arch-sensitive inventory, the gate commands, the expected
    `MMB_CFG` row and the port candidates.  Extend `beta/mmb-general/gfx1201-s14-gates.md` /
    `gfx1100-porting.md` with the session results.
-   **gfx1201 status (2026-09-23): DONE.**  The full stack applies **25/25** on RDNA4 (no port
-   needed); oracles, width purity, `plain == draft-mtp` at 8K/40K/128K, MTP acceptance (0.81388),
+   **gfx1201 status (2026-09-23): DONE.**  The full stack applies **25/25** on RDNA4 with no
+   apply-time port (the RDNA4 **qsa3**/**mmb** WMMA kernel ports are in the `beta/mmb-general`
+   prerequisite, not the closing set); oracles, width purity, `plain == draft-mtp` at 8K/40K/128K, MTP acceptance (0.81388),
    the rule-5 batched gate and PPL parity are all green; closing adds **+1.0…+4.4 %** prefill over
    r13+beta at depth.  One correctness fix was folded into `patches/0004` (the GDN/PLE conv1d
    fusion is not bit-identical under `-sm tensor`; it is now gated to single-device graphs).  See

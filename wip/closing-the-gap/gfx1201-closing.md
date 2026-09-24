@@ -377,7 +377,7 @@ Newest first.  Each session appends its state, what it changed, and the next act
 **Box:** 3× Radeon AI PRO R9700 (gfx1201), Ryzen 9 9950X3D2, 184 GiB, ROCm
 `/opt/rocm-7.14.1-gfx102X` (build) + `/opt/rocm-7.14-gfx1201` (runtime).
 
-**Integration — done, no port needed for the apply.**  The brief's §2 order was followed exactly:
+**Integration — done; the r13+beta prerequisites carry the RDNA4 kernel ports.**  The brief's §2 order was followed exactly:
 delivery r13 from `main` (16 blocks, applied tree `bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`), then
 the 12 `beta/mmb-general` patches (`79136a15cac1920c0dd334b4c119a9cb42f9143b`), then the 25 closing
 patches skipping `0015` (`1f09fd97d916ca080f7f65cdc422a3d6c425baa7`).  The closing set applied
@@ -438,6 +438,8 @@ All on branch `closing-gfx1201` = delivery r13 + `beta/mmb-general` + the 25 clo
 (post-fix tree `1be654fa71167e470ffcce70456bef7a23e6de25`), unless noted.  `MMB` default (on), 1 GPU
 unless a split is stated.  Builds: campaign `~/llama.cpp/build-rocm`, baseline
 `~/llama-baseline/build-rocm`.
+
+**Build-time instantiation (§5) — PASS.**  `nm -C` on the FA dispatch TUs: `fattn-tile.cu.o` has **96 `tile_case` symbols, 0 defined / 96 `U`** (every KV type is instantiated in `template-instances/*.cu`, not the dispatch TU), `fattn-mma-f16.cu.o` defines **0**; the heaviest object is 33 KB and `ggml-hip` reached 50 % with no blown-up TU.  The closing kernels did **not** reintroduce the implicit-instantiation build trap.
 
 **Op oracles (§6.5) — green.** `FLASH_ATTN_QSA` **26/26**, `GATED_DELTA_NET` **46/46**, `TOPK_QSA`
 **4/4**, `LIGHTNING_INDEXER` **225/225**, `FLASH_ATTN_EXT` **5954 OK / 0 FAIL** (summary
@@ -504,6 +506,49 @@ RDNA3_5 WMMA kernel is not taken (`supports_indexer4` = `GGML_CUDA_CC_IS_RDNA3_5
 `GGML_CUDA_LIGHTNING_INDEXER4_GFX1100` for gfx1100), the `LIGHTNING_INDEXER` oracle passes 225/225,
 and width purity is untouched.  A RDNA4 WMMA port remains a candidate (§8).
 
+#### 2026-09-23 — porting layers: what actually needed RDNA4 kernel work
+
+The campaign runs on RDNA4 because **two layers** of RDNA4 work are present, and only one of them
+is in the 25 closing patches:
+
+1. **`beta/mmb-general` — the big WMMA ports (12 patches, a prerequisite).**  This is where the
+   substantial new kernel work for RDNA4 lives, done in the beta's own gfx1201 sessions
+   ([`gfx1201-porting.md`](../../beta/mmb-general/gfx1201-porting.md) S4–S13):
+   * **qsa3** (packed-block sparse-attention WMMA): the gfx12 fragment shim + the first oracle the
+     kernel ever had on any arch, `FLASH_ATTN_QSA` 26/26, **+7.6/+11.5/+10.4 % prefill** (S4);
+   * **mmb** (general-purpose bf16-WMMA dequant GEMM): the gfx12 bf16 fragment shim, the gfx11 asm
+     verified bit-identical, the arch × weight-type × path policy split (S5–S7), then RDNA4 dense
+     tile geometry (S10), per-arch tuning defaults (S11), routed policy (S12), F32 policy split
+     (S13).
+
+   So "the campaign builds on RDNA4 with nothing ported in the closing set" is true **only because
+   the closing set sits on top of a beta that *is* the RDNA4 port**.  The qsa3 kernel the closing
+   `0007` touches is the beta's RDNA4-ported one; `FLASH_ATTN_QSA` 26/26 and the qwen4exp prefill A/B
+   are its gfx1201 witness.
+
+2. **The closing set — new kernels, and several are NOT active on RDNA4.**  These are the ones that
+   would need a *new* RDNA4 port before they fire:
+
+   | closing kernel | RDNA4 status |
+   |---|---|
+   | `0003` `hc_gate_mix` (`mmb.cu`) | **not ported** — IQ4_NL + RDNA3_5 WMMA; `gatemix=0`, call site RDNA3_5-gated |
+   | `0013` prefill indexer relu-sum | **inert** — call site `GGML_CUDA_CC_IS_RDNA3_5` (`ggml-cuda.cu:4250`) |
+   | `0016` `QSA_SCORE_WMMA` (`lightning-indexer.cu`) | **not ported** — `supports_indexer4` is RDNA3_5; the generic vec fallback is used |
+   | `0017`/`0018` MMB new quant types | **not enabled** — RDNA4 mask is `IQ_FAMILY` only; the dequant is arch-neutral but unreachable |
+   | `0011` HC BF16 streams | default OFF; HC16 is RDNA3_5-gated |
+   | `0010` MoE BF16 epilogue | default OFF |
+   | `0023` MMB HC16 per-context | inert on RDNA4 (HC16 gated) |
+   | `0001`/`0004`/`0006`/`0008`/`0012`/`0014`/`0019`/`0020`/`0021`/`0026` | arch-neutral and active (see the verdict table) |
+
+   The new quant types are the sharpest case: **no porting is needed to make them *compile***, but
+   *enabling* them on RDNA4 is the optional port the brief names — it needs an RDNA4 per-type
+   geometry and measurements.  This box has **no** MXFP4/NVFP4/IQ2 model and the mask has no env
+   override, so they could not be exercised even as a forced A/B; they are simply unreachable.
+
+**Consequence for the summary:** "no port needed" meant *no fix was needed to make the 25 patches
+apply and build*; it did **not** mean the campaign is port-free.  The qsa3/mmb RDNA4 kernel work is
+in the beta prerequisite, and the closing set's own RDNA3_5-only kernels remain un-ported (see §8).
+
 #### 2026-09-23 — per-patch verdict table (§7)
 
 | patch | fires on gfx1201? | verdict | evidence |
@@ -520,11 +565,11 @@ and width purity is untouched.  A RDNA4 WMMA port remains a candidate (§8).
 | `0010` MoE BF16 epilogue | **no** (default OFF) | no-op unless enabled | not enabled |
 | `0011` HC BF16 streams | **no** (default OFF) | no-op unless enabled | not enabled |
 | `0012` mmb_cvt `out_xn` | yes (MMB on) | exercised | qwen4exp prefill A/B |
-| `0013` indexer relu-sum | qwen4exp-only | exercised | qwen4exp gates |
+| `0013` indexer relu-sum | **no** | **inert on RDNA4** — call site is `GGML_CUDA_CC_IS_RDNA3_5(cc)` (`ggml-cuda.cu:4250`) | call-site gate; our tree already banks the reduction via the fused `GGML_CUDA_QSA_INDEXER_SCORE` |
 | `0014` QSA scorer trim | qwen4exp-only | exercised | qwen4exp gates |
 | `0016` `QSA_SCORE_WMMA` | yes, **generic fallback** | RDNA3_5 WMMA not taken; `=0` is a re-baseline (brief correction) | `supports_indexer4`; `LIGHTNING_INDEXER` 225/225; A/B above |
-| `0017` MMB quant coverage | **masked off on RDNA4** | no regression | `MMB_CFG` weight-type mask |
-| `0018` MMB IQ2 coverage | **masked off on RDNA4** | no regression | `MMB_CFG` weight-type mask |
+| `0017` MMB quant coverage | **not enabled** | **not ported** — RDNA4 mask is `IQ_FAMILY` only; the dequant compiles but is unreachable | `mmb.cu` mask; no matching model/env to force it this session |
+| `0018` MMB IQ2 coverage | **not enabled** | **not ported** — same | same |
 | `0019` HC16 eval-callback fix | **no** (HC16 is RDNA3_5-gated) | inert on RDNA4 | `MMB_CFG hc16=1` but call site gated |
 | `0020` sparse MTP draft | qwen4exp | exercised | 40K/128K purity; acceptance 0.81388 |
 | `0021` derived indexer cache | yes (default on) | byte-identical A/B | `=0` text identical |
