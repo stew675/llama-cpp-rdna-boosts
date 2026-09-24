@@ -77,8 +77,15 @@ thread-count invariant, so the output is bit-identical.
 | MTP `n3`, prose, `-n 1500`, kill-switch | 85.1 t/s | 14.9 cores | 0.84791 |
 | plain decode `-n 800` | 52.9 t/s (vs 53.0 kill-switch) | 1.4 / 1.4 cores | — |
 
-So the fix **beats the passive-wait reference** (111.7 vs 108.5) with the CPU quiet, and plain decode
-is unchanged.
+**`llama-server` (the acceptance config, no env, `-t 15`, `/completion` `n_predict 800`, prose):**
+
+| arm | predicted t/s | CPU |
+|---|---:|---|
+| default (fix) | **108.8** | 1.4 cores |
+| `GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1` | 98.2 | 12.0 cores |
+
+So the fix **beats the passive-wait reference** (111.7 vs 108.5 on the CLI) with the CPU quiet, the
+server path behaves the same, and plain decode is unchanged.
 
 ## 3. Purity and regressions
 
@@ -162,4 +169,6 @@ change was reverted (build restored).  `0023`/`0011` stay parked as before.
 * `tools/mtp-run.sh <tag> <outdir> [env…] -- <cmd…>` — runs a command under the sampler and writes
   `<tag>.log` + `<tag>.cpu`.
 * `tools/matrix-axis.sh <axis> <prompt> <reasoning>` — the four-mode axis comparison above.
+* `tools/server-mtp.sh <tag> <outdir> [env…]` — the `llama-server` health-wait + `/completion` MTP
+  check under the same sampler (used for the acceptance-config A/B above).
 * Raw logs under `tools/runs/` (git-ignored).

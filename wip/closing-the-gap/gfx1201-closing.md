@@ -160,7 +160,8 @@ composes with 2.1.2/2.1.3.
   reproduces the passive-wait throughput (**~107 t/s**, qwen4exp IQ4_NL `draft-mtp n3`, prose) with
   **byte-identical output and identical acceptance** (0.84791 / the session-6 0.83204).
   → **111.7 t/s at 1.2 cores, acceptance 0.84791, text `a79d0d14855b`** (fix build, no env; the
-  passive reference on the same build was 108.5 t/s).
+  passive reference on the same build was 108.5 t/s).  `llama-server` itself (the acceptance config,
+  `-t 15`, `/completion n_predict 800`): **108.8 t/s / 1.4 cores** vs 98.2 / 12.0 with the kill-switch.
 * Plain decode and prefill unregressed; CPU-only builds unaffected; the `qwen35`/`qwen35moe` models
   (no PLE) stay on their current numbers (already clean, §11 session 6).
   → plain 52.9 vs 53.0 t/s; CPU-only 4B `tg64` 9.69 vs 9.60; `pp2048` 2448 vs 2467 (noise).
