@@ -1,11 +1,11 @@
-# gfx1201 — closing-the-gap: **remaining work** (live brief)
+# gfx1201 — closing-the-gap: **closure record** (all campaign items closed)
 
 **Audience:** the agent continuing the campaign on the **3× Radeon AI PRO R9700 (gfx1201, RDNA4)** box,
 `soar`.
-**Goal:** pick up the **open items** below.  OP-1/OP-2/OP-3/OP-4/OP-5 are **closed** (`0029` shipped
-default-on, `0030` opt-in, `0016`/`0027`/`0028` done, no per-type MoE band; the `llama-imatrix` +
-`0001`/`0008` A/Bs are run, OP-5.2 is parked) and only **OP-6** remains — the `fattn-mma-f16`
-build-time duplication.  **§0.5 is the run plan (start there);** §2.6 is the detail.
+**Goal:** pick up the **open items** below.  **Every campaign item is now closed** — OP-1 (`0029`
+default-on, `0030` opt-in), OP-2, OP-3 (no per-type MoE band), OP-4 (`llama-imatrix` + the
+`0001`/`0008` A/Bs), OP-5.1/OP-5.2, and OP-6 (build time: no change, ccache).  This file is now a
+closure record.  **§0.5 lists the outcomes; §0 the two follow-up leads** (not campaign gaps).
 
 **Companion files:**
 | file | what |
@@ -15,6 +15,7 @@ build-time duplication.  **§0.5 is the run plan (start there);** §2.6 is the d
 | [`gfx1100-closing.md`](gfx1100-closing.md) | the single-7900-XTX brief. |
 | [`2026-09-24-op3-per-type-moe-band.md`](2026-09-24-op3-per-type-moe-band.md) | OP-3: the per-type MoE band measurement + the launch-bound trap (closed, no per-type band). |
 | [`2026-09-24-op4-imatrix-and-hc-gates.md`](2026-09-24-op4-imatrix-and-hc-gates.md) | OP-4 (`llama-imatrix` smoke + the pre-existing `-sm tensor` imatrix corruption, the `0001`/`0008` A/Bs) and OP-5.2 (`0011` under `-sm tensor`). |
+| [`2026-09-24-op6-build-time-closure.md`](2026-09-24-op6-build-time-closure.md) | OP-6 build time: closure (the largest MMA TU is 82 s vs a 236 s makespan; no change). |
 | [`closing-the-gap.md`](closing-the-gap.md) · [`README.md`](README.md) | the campaign handover + patch inventory. |
 **Delivery policy:** `AGENTS.md` — default-on policy (a beneficial feature ships on, an env var only
 **disables**), purity rules, and **never push the `~/llama.cpp` fork**.  Push the delivery repo only if
@@ -30,13 +31,19 @@ prefill A/B, PPL parity, the rule-5 batched gate), the four RDNA4 ports/enableme
 `0016`, `0017`, `0027`), the `0004` conv-fusion `-sm tensor` purity fix, the `0010`/`0011` lossy-transfer
 negative, the `0028` W=9 verify-cliff fix, and (2026-09-24) all of **OP-1** — the automatic MTP CPU-spin
 fix (`0029`), the opt-in structural input placement (`0030`), the OP-2/OP-3 four-axis re-baseline, the
-OP-5.1 `0013` redundancy verdict, and OP-1.4 (draft sampler, won't-fix).
+OP-5.1 `0013` redundancy verdict, and OP-1.4 (draft sampler, won't-fix) — plus the 2026-09-24 closures:
+**OP-3** (no per-type MoE band), **OP-4** (`llama-imatrix` smoke + the `0001`/`0008` A/Bs), **OP-5.2**
+(`0011` parked) and **OP-6** (build time, no change).
 
-**Open** (this file) — the one remaining item:
+**All campaign items are closed** — the per-item outcomes are in §0.5 and §1; the per-patch verdicts
+and full history are in `gfx1201-closed.md`.
 
-| id | item | priority | effort | where |
-|---|---|---|---|---|
-| **OP-6** | `fattn-mma-f16` per-TU native-arm duplication (7.26 MB / 229 s per instance TU) — build-time only, choose finer generated-file granularity | low / parked in `TODO.md` | ~1 day | §2.6 / §0.5 |
+**Follow-up leads** (discovered here, not campaign gaps, no owner yet):
+
+| lead | what | where |
+|---|---|---|
+| `-sm tensor` `llama-imatrix` | imatrix reports a garbage PPL and a corrupt `ffn_down` `in_sum2` under `-sm tensor` (`llama-perplexity` is fine).  Pre-existing (byte-identical r13+beta), deterministic, reproduces on the 4B in seconds.  Workaround: `-sm layer` | `2026-09-24-op4-imatrix-and-hc-gates.md` |
+| M-RoPE image case (`0005`) | the text-then-image repro was **not run** (mtmd tooling not prepped) | `2026-09-24-op4-imatrix-and-hc-gates.md` |
 
 ---
 
@@ -125,16 +132,13 @@ A/B is **+1.3 %**, all from `LLAMA_HC_RES16` (`blk16` is inert — `prod=0` on e
 → stays default-OFF.  Record:
 [`2026-09-24-op4-imatrix-and-hc-gates.md`](2026-09-24-op4-imatrix-and-hc-gates.md).
 
-### OP-6 — `fattn-mma-f16` build-time (parked)
+### OP-6 — `fattn-mma-f16` build-time: **CLOSED 2026-09-24, no further change**
 
-Each `fattn-mma-f16` instance TU instantiates the whole WMMA kernel **once per KV type** (0.90 -> 7.26
-MB, 6.7 -> 229 s per TU).  Option (b) - a runtime KV-type dispatch / `__noinline__` loader - was tried
-and **rejected** (build slower; -1.5-2.5 % prefill; the force-inlined loaders are what makes the native
-staging fast).  The remaining candidate is **finer generated-file granularity**: one MMA TU per
-`(ncols1, ncols2, head, KV type)` instead of per `(ncols1, ncols2, head)`.  Gate = a clean
-`cmake --build build-rocm --target ggml-hip -j16` timing vs the current ~236 s **plus** a same-seed +
-`pp/tg` runtime A/B.  After the build check the `nm -C` discipline (`AGENTS.md`: dispatch TU `U` per
-type, instance TUs `T`/`W`).  Evidence + tools: `wip/build-time-regression/`; the `TODO.md` entry.
+The OP-6 premise is the **pre-r6** state: r6's per-head split already took the largest MMA instance TU
+to **2.9 MB / 81.8 s**, and the clean `ggml-hip -j16` build is ~236 s — **throughput-bound, not
+tail-bound** — so the remaining per-KV-type split (same total instantiation work) cannot help.  The
+runtime-dispatch / `__noinline__` options were tried and rejected in r6; ccache is the answer.  Record:
+[`2026-09-24-op6-build-time-closure.md`](2026-09-24-op6-build-time-closure.md).
 
 ---
 
@@ -167,6 +171,7 @@ type, instance TUs `T`/`W`).  Evidence + tools: `wip/build-time-regression/`; th
 | **OP-3** per-type MoE band | **CLOSED, no per-type band** — the unconditional floor at 16 wins for every routed-expert type in the relevant `B <= 13` range (k-quants +26%, IQ4_NL +13% at B=9); only IQ3_XXS/IQ4_XS regress and only from `B=13`.  The `__launch_bounds__` widening has no `B <= 8` cost (138-way register-identical, ±0.6% runtime) | `2026-09-24-op3-per-type-moe-band.md` |
 | **OP-4** gates | **DONE** — (a) imatrix smoke passes but `-sm tensor` imatrix is corrupt (**pre-existing**, perplexity fine); (b) `0001` default fusion +5 % over the op; (c) `0008` default `TALL_MIN_M=16` ahead; (d) M-RoPE image not run | `2026-09-24-op4-imatrix-and-hc-gates.md` |
 | **OP-5.2** `0011` `-sm tensor` | **PARKED** — `0027` closes the marking gap (`comb=` 582×); A/B +1.3 %, all from `LLAMA_HC_RES16` (`blk16` inert); lossy → default-OFF | `2026-09-24-op4-imatrix-and-hc-gates.md` |
+| **OP-6** build time | **CLOSED, no change** — the "7.26 MB / 229 s" premise is pre-r6; the largest MMA TU is now 2.9 MB / 82 s vs a 236 s `-j16` makespan (throughput-bound), so the per-KV-type split cannot help; ccache is the answer | `2026-09-24-op6-build-time-closure.md` |
 | **OP-5.1** `0013` on RDNA4 | **REDUNDANT** — matcher fires 0× with `0016` ON, 4× with `LLAMA_QSA_SCORE_WMMA=0`; no port | `2026-09-24-mtp-cpu-spin-automatic.md` §5 |
 | **OP-1** structural input placement | **INVESTIGATED, opt-in (`0030`)** — `LLAMA_DEVICE_INPUT=1` moves the input layer to the output/Meta device (0 CPU splits, byte-identical) but the Meta-split GPU gather is ~2.6 % slower MTP than host input + `0029`, so it is not defaulted | `2026-09-24-mtp-cpu-spin-structural.md` |
 | **OP-1.4** draft sampler under `-sm tensor` | **CLOSED, won't fix** — blocked by the Meta backend (`handle_per_row` asserts on the vocab-split logits; needs a distributed top-k) and not a measurable win even under `-sm layer` (75.6 vs 75.1 t/s, noise) | `2026-09-24-mtp-draft-sampler-tensor-split.md` |
@@ -393,11 +398,13 @@ near-tied everywhere and **wins recall** — the `n_max 8` question is workload-
 
 ### 2.6 OP-6 — build-time critical path (parked in `TODO.md`)
 
-The `fattn-mma-f16` per-type instance set is the remaining clean-build critical path (0.90 → 7.26 MB
-per instance TU, 6.7 → 229 s; each instance file carries one WMMA kernel copy per KV type).  The tile
-half was fixed in r5; the MMA half needs a code-path change (finer generated-file granularity) with its
-own A/B — **the concrete plan (and why the runtime-dispatch option is out) is §0.5 / OP-6.**  Not
-gfx1201-specific, but measured here — see `wip/build-time-regression/` and `TODO.md`.
+The `fattn-mma-f16` per-type instance set is the remaining clean-build critical path.  → **CLOSED
+2026-09-24: no change.**  The "7.26 MB / 229 s per TU" premise is the pre-r6 state; r6's per-head split
+leaves the largest TU at **2.9 MB / 82 s** against a ~236 s `-j16` makespan, so the build is
+**throughput-bound** and a per-KV-type split cannot help.  The runtime-dispatch / `__noinline__`
+options were rejected in r6 (build worse / -1.5-2.5 % prefill); ccache is the answer.  See
+[`2026-09-24-op6-build-time-closure.md`](2026-09-24-op6-build-time-closure.md), `wip/build-time-regression/`
+and `TODO.md`.
 
 ---
 
