@@ -457,7 +457,12 @@ needed**: the beta's non-RDNA4 policy was already right, and this confirms it.
   gfx1201 record (`GREEDY-PURITY.md` §36, the coarse-quant near-tie relaxation; *not* a kernel error,
   which the oracle + text + PPL all support).
 * **Unreachable** (same tooling limits as gfx1201): `MXFP4` only via `MXFP4_MOE` (a MoE layout, no
-  dense test model), no `NVFP4` path at all; `IQ2_*` needs a matching imatrix this box lacks.
+  dense test model), no `NVFP4` path at all; `IQ2_*` — a matching 4B imatrix *was* generated
+  (`--chunks 16` and `64`, both `gguf` and `--output-format dat`) and `--allow-requantize` used, but
+  `llama-quantize` still refuses with `Missing importance matrix for tensor blk.32.attn_k.weight in a
+  very low-bit quantization` — that tensor is not exposed as an imatrix-instrumented `MUL_MAT`, the
+  same wall the gfx1201 record hit.  (Every *reachable* type wins, so IQ2 is expected to follow; it
+  stays untested/unenabled rather than assumed.)
 
 #### §7.2.3 — single-GPU lossy-marking path healthy
 
