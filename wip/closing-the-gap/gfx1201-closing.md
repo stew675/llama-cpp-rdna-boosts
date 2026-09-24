@@ -372,6 +372,103 @@ MTP verdict, and the `-b/-ub 4096` protocol for A/Bs.
 
 Newest first.  Each session appends its state, what it changed, and the next action.
 
+### 2026-09-24 — session 6: MTP revalidation on IQ4_NL + the MTP CPU-spin root cause
+
+**Did:** the missing MTP acceptance revalidation (post-`0003`/`0017`/`0027`) on the newly downloaded
+qwen4exp **IQ4_NL** model (3-GPU `-sm tensor`, q8_0 KV), a fixed-depth comparison across the four
+axes + the phase-switch prompt, and — while measuring — the diagnosis of why MTP pins every CPU core.
+
+**Acceptance revalidation (the gate that was missing):** `draft-mtp n3`, prose, `-c 16384 -n 3000`,
+seed 42, reasoning off → **acceptance 0.83995** (1333/1587), mean len 3.52, acc per pos
+(0.922, 0.841, 0.756), 78.4 t/s.  Healthy (gate: > ~0.45 at pos 1).  Session 2's IQ4_XS number was
+0.81388; IQ4_NL is a different model, so the difference is expected.
+
+**Depth comparison** (`-n 3000`; `--reasoning on` for R, off for C/P/K/X; `none` = plain decode).
+Values are Generation t/s, parenthesised = draft acceptance:
+
+| axis | prompt | none | fixed n7 | fixed n8 | adaptive cap 8 |
+|---|---|---:|---:|---:|---:|
+| R reasoning | `reasoning.txt` | 55.5 | 60.0 (0.363) | 45.5 (0.331) | 65.5 (0.594) |
+| C code | `code-python.txt` | 56.2 | 104.1 (0.749) | 79.2 (0.744) | 87.4 (0.741) |
+| P prose | `prose-rdna-boosts.txt` | 55.7 | 95.9 (0.690) | 78.7 (0.656) | 81.5 (0.717) |
+| K recall | `recall.txt` | 53.2 | 127.8 (0.980) | 97.9 (0.957) | 97.3 (0.967) |
+| X phase-switch | `code-reasoning-mixed.txt` | 55.9 | 73.2 (0.479) | 49.3 (0.380) | 72.5 (0.651) |
+
+On this box **`n7` beat `n8` on every axis** and the adaptive controller (ceiling 8) was best or
+near-best on R/X.  **Caveat:** these ran with the OpenMP spin below active (all arms equally
+confounded), and `n8` runs ~1 more CPU graph per token than `n7`, so part of its penalty here is the
+spin, not the numerics — re-measure after the fix.  The user's gfx1151 `n_max 8` observation, and its
+"depth 8 sits on the purity boundary" reasoning, still need their own unconfounded gate (the boundary
+is on the **verify width**: `n_max 7` = W=8 is the last pure depth, `n_max 8` = W=9 is the first that
+can diverge; above 7 use acceptance + MTP-vs-plain, never `plain == draft-mtp`).
+
+**The CPU-spin root cause (the important find):** MTP decode pins **all 16 cores at 100 %**; plain
+decode uses ~2.  `gdb` on the busy process:
+
+```
+ggml_graph_compute (OpenMP)
+ <- ggml_backend_cpu_graph_compute
+ <- ggml_backend_sched_graph_compute_async
+ <- llama_context::graph_compute <- process_ubatch <- decode
+ <- llama_decode
+ <- common_speculative_impl_draft_mtp::draft
+```
+
+and `GGML_SCHED_DEBUG=1` shows **every** graph — including the 1-token draft graphs — as
+
+```
+## SPLIT #0: CPU  # 0 inputs
+## SPLIT #1: Meta(ROCm0,ROCm1,ROCm2) # N inputs  [model.input_embed] [ple_embd] [mtp_tok_embd-48] ...
+```
+
+i.e. a small **CPU split** (the input / PLE `GET_ROWS`; on a discrete multi-GPU box those weights are
+host-mapped) in front of every graph.  Each CPU graph compute forks the OpenMP pool, and the default
+**active** wait policy makes the 15 idle workers spin in the barrier.  Plain decode does ~55 such
+graphs/s (the pool settles between them → ~2 cores); MTP calls `llama_decode` **`n_max+1` times per
+token** (target verify + each draft step), ~250–350 graphs/s, so the threads never sleep → all 16
+cores pinned.  It is **not** the draft forward (offloaded 50/50) and not the sampler.
+
+**Cost + mitigation** (same prompt/seed, `draft-mtp n3`, `-n 1500`):
+
+| | CPU | acceptance | Generation |
+|---|---:|---|---:|
+| default | 15.8 cores | 0.83204 (1070/1286) | 78.9 t/s |
+| `OMP_WAIT_POLICY=PASSIVE KMP_BLOCKTIME=0` | 1.4 cores | 0.83204 (1070/1286) | **106.3 t/s** |
+
+Identical acceptance/output ⇒ the same work; **~35 % of MTP throughput and 14 cores** go to the spin.
+(`-n 2000` prose: 76.3 → 107.7 t/s.)  Do **not** ship this as a required env var — see §13: the
+delivery must detect and pick the fast path itself.
+
+**Related, smaller:** `W set_sampler: backend sampling not supported with SPLIT_MODE_TENSOR; using
+CPU` — the draft `top_k(10)` sampler also falls back to the CPU under `-sm tensor` (a per-draft-step
+round-trip).  Separate cost; §13.
+
+**Not done:** the `n7`/`n8` comparison needs re-running with the spin disabled; the gfx1151 gate is
+the box where the `n_max 8` observation was made.
+
+**Scope of the confound — NOT all MTP (session 6 follow-up).**  The spin needs the input/PLE embedding
+to be **host-mapped**, so the scheduler emits a *non-empty* CPU split.  Same-config pairs measured the
+same way:
+
+| model | input table | active | passive | verdict |
+|---|---|---:|---:|---|
+| qwen4exp IQ4_NL (27 GiB PLE, host-mapped on 3× 32 GB) | host | 78.9 t/s / 15.8 cores | 106.3 / 1.4 | **−35 % confounded** |
+| 27B UD-Q4_K_XL (`qwen35`, no PLE, `token_embd` in VRAM, 3-GPU tensor) | VRAM | 97.4 | 97.0 | clean |
+| 4B Q4_1 (`qwen35`, 3-GPU tensor) | VRAM | 184.0 | 180.0 | clean |
+| 4B Q4_1 (`qwen35`, 1 GPU) | VRAM | 195.2 | 193.9 | clean |
+
+All pairs have byte-identical acceptance.  So the **delivery's dense/MoE MTP baselines (27B/35B, no
+PLE) are not affected**, and **acceptance is unaffected everywhere**.  What *is* low is the **gfx1201
+qwen4exp MTP throughput** — session 2's 57.5 t/s reading and any campaign qwen4exp t/s figure measured
+on this discrete box are ~35 % below the true value and must be re-measured with the spin removed (or
+the fixed build).  Reason it is qwen4exp-specific here: the 27 GiB `per_layer_token_embd` cannot fit
+in the 96 GiB of VRAM alongside the 89 GiB of weights, so it is host-mapped; `qwen35`/`qwen35moe` have
+no PLE and their `token_embd` fits, so their CPU split is empty.
+
+**Practical stopgap for the harness/reporting:** any MTP t/s for a model with a host-mapped input/PLE
+(qwen4exp on a discrete box) must be recorded with `OMP_WAIT_POLICY=PASSIVE KMP_BLOCKTIME=0` (or the
+fixed build) until §13 lands.  Do not carry forward the pre-fix numbers.
+
 ### 2026-09-24 — session 5: `0003` gate-mix ported to RDNA4 (item 2 done)
 
 **Did:** work item 2 of §12.2, unblocked by the IQ4_NL Qwen3.8-Flash-Next download.  Widened the
@@ -713,9 +810,11 @@ fusion A/Bs (they are exercised by the qwen4exp gates but not singled out).
 
 ## 12. Remaining RDNA4 porting work — handover for the next session
 
-**Updated:** 2026-09-23 (session 4).  §11 holds the gate results; this section is the **open** work.
+**Updated:** 2026-09-24 (session 6).  §11 holds the gate results; this section is the **open** work.
 Items 1 (MMB quant coverage), 2 (`0003` gate-mix) and 3 (the meta `graph_optimize` gap) are now
-DONE; 4 remains.
+DONE; 4 remains.  **§13 is the new main task for the next session** — remove the MTP CPU spin
+without requiring `OMP_*`/`KMP_*` environment variables (auto-detect the degenerate scheduling and
+pick the high-performance path).
 The campaign's arch-scoped features are one of three shapes — classify before touching one:
 
 1. **Wrong-arch predicate over a working kernel.**  The port is usually small (a layout / enable
@@ -877,3 +976,92 @@ this for the `moe_weighted_reduction` alloc deps.
   **`ec54ad65f425c69b4dec4279efa68b0573e4afc8`** (26/26 apply: r13 + beta + closing; `0003` carries
   the RDNA4 gate-mix port, `0017` the Q4_1/Q5_0 RDNA4 enablement, `0027` the meta `graph_optimize`
   forwarding).  Session 2's tree was `95f916a8e015efd68ee44bcea7620187ebc70019`.
+
+---
+
+## 13. Next session — automatic path selection: keep the MTP input off the CPU (no env vars)
+
+**Goal (maintainer, 2026-09-24):** a user must be able to run a typical `llama-server` config with
+**no** `OMP_*`/`KMP_*` environment variables and get the fast path.  The delivery has to **detect**
+the degenerate scheduling and choose the high-performance path itself, default-on.
+
+**Background:** §11 session 6 root-caused the MTP CPU burn — under `-sm tensor` the scheduler puts a
+CPU split (the input / PLE `GET_ROWS`) at the front of every graph; MTP multiplies those graphs
+~`n_max+1`× and the OpenMP active-wait pool spins all 16 cores, costing ~35 % of MTP throughput.
+The env mitigation exists but must not be a user requirement.
+
+### 13.1 The structural fix — get the input embeddings off the CPU
+
+If there is no CPU split there is nothing to spin.  The input embedding is the only CPU graph, and
+`0024` (single-device input-on-GPU) / `0025` (host-buffer input + scheduler guard) already cover the
+**APU / 1-device** cases.  On a **discrete multi-GPU** box `n_devices() != 1` and
+`prop.integrated == 0`, so neither applies and the host-mapped `token_embd` / `per_layer_token_embd` /
+`mtp_tok_embd` `GET_ROWS` stays on the CPU.
+
+Candidates, cheapest first:
+1. **draft `mtp_tok_embd`** — one small table, a per-draft-step cost; put its `GET_ROWS` on a device.
+2. **target `token_embd`** — one table.
+3. **`per_layer_token_embd`** (~27 GiB) — the hard one: a `GET_ROWS` is **row-parallel**, so the table
+   shards cleanly across the tensor-split devices (each device holds a row range; indices are routed
+   to the owning shard, or every shard gathers with a masked add).  Investigate whether the meta
+   backend's split machinery can carry the embedding table + `GET_ROWS`, or whether the existing
+   `-sm tensor` `ncols2`/`GET_ROWS` split-state handlers already do (see
+   `ggml_backend_meta_*` `handle_get_rows`).
+4. Alternative to sharding the table: keep it host-resident but run the `GET_ROWS` **on the device**
+   over a host-mapped pointer — this is the `0025` idea generalised past `integrated`.  Cheaper VRAM,
+   but needs the device to read host memory (discrete GPUs can via HMM/`hipHostMalloc`-mapped, at a
+   bandwidth cost; only the gathered rows are read).
+
+The **structural** option is the right one if it validates; it removes the CPU graph rather than
+hiding it.
+
+### 13.2 The runtime fix — automatic spin mitigation (the detection half)
+
+Even with a CPU split, the active-wait spin is pure waste.  Explore, in order:
+* **Per-split thread count**, not per-process: the CPU split here is tiny.  Find where the scheduler /
+  CPU backend picks the split's thread count and make **small CPU splits run single-thread**
+  (`n_threads = 1` → no OpenMP fork → no barrier to spin on).  This is the most surgical and is
+  automatic by construction.  Check `ggml_backend_cpu_graph_compute` / the threadpool wiring
+  (`ggml_backend_cpu_set_n_threads`, `set_n_threads` list in `llama_context`).
+* **Passive/low-spin pool**: detect the shape (GPU backend present + CPU split is input-only) and set
+  the pool's wait policy / `KMP_BLOCKTIME` equivalent programmatically (check whether `kmp_set_blocktime(0)`
+  or a `ggml_threadpool` pause/priority mode is reachable from the CPU backend; if not, whether the
+  pool can be created with the right mode).
+* A startup heuristic that logs one clear line when it engages, plus an env **kill-switch** (default-on
+  per AGENTS.md, disable-only env).
+
+Whatever is chosen: **automatic, default-on, arch-neutral, an env kill-switch for bisection only** —
+not an env opt-in.  It must not regress plain decode, prefill, or CPU-only runs.
+
+### 13.3 Also fix — draft sampler backend offload under `-sm tensor`
+
+`llama_context::set_sampler` rejects the backend sampler outright when
+`model.split_mode() == LLAMA_SPLIT_MODE_TENSOR` (`"backend sampling not supported with
+SPLIT_MODE_TENSOR; using CPU"`), so the draft `top_k(10)` chain runs on the CPU every draft step.
+Make the backend sampler tensor-split-aware (or keep it on a device) so no per-step CPU round-trip is
+needed.  Small, but it composes with 13.1/13.2.
+
+### 13.4 Acceptance criteria
+
+* A plain `llama-server` with **no** `OMP_*`/`KMP_*` env keeps MTP decode at ~1–2 CPU cores on the
+  3-GPU box and reproduces the passive-wait throughput (**~106 t/s**, qwen4exp IQ4_NL `draft-mtp n3`,
+  prose) with **byte-identical output and identical acceptance** (0.83204).
+* Plain decode and prefill unregressed; CPU-only builds unaffected; the `qwen35`/`qwen35moe` models
+  (no PLE) stay on their current numbers (verified already clean, §11 session 6).
+* **Re-baseline the gfx1201 qwen4exp MTP t/s** figures (they are ~35 % low, §11 session 6) and make
+  the harness robust: the MTP gate should not depend on an env var being set.  Consider teaching the
+  reporting harness to assert the CPU is quiet (e.g., a core-count sanity check) so a future
+  degenerate-scheduling regression cannot silently poison the numbers again.
+* Re-run the four-axis + mixed `n7`/`n8`/adaptive comparison **without** the spin confound (the session
+  6 table is confounded), then extend it to gfx1151 (the `n_max 8` observation) and gfx1100.
+
+### 13.5 Tools / harness carried over
+
+* `/tmp/mon.py` — per-thread CPU sampler (`/proc/<pid>/task/*/stat` deltas); the instrument that made
+  the spin visible (2 cores → 16 cores).
+* `gdb -p <pid> -batch -ex "thread apply all bt"` — the stack that located the draft `llama_decode`.
+* `GGML_SCHED_DEBUG=1` (with `-lv 5`) — per-graph split/backend assignment; showed the `CPU` split
+  ahead of the `Meta` split and its `model.input_embed`/`ple_embd`/`mtp_tok_embd` inputs.
+* `OMP_WAIT_POLICY=PASSIVE KMP_BLOCKTIME=0` — the A/B that proved the spin was idle-wait, not work.
+* Reuse the session-6 command shape: IQ4_NL 9-shard + `mtp-...-shared-Q8_0.gguf`, `-sm tensor`,
+  q8_0 KV, `-b/-ub 2048`, `-c 16384`, `-n 1500..3000`, seed 42, temp 0.

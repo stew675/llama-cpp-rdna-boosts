@@ -16,6 +16,21 @@ post-fix). All runs on 3x R9700 (gfx1201), ROCm 7.14
 (GOLDEN RULE 1: without the pin llama.cpp layer-splits and decode drops
 ~97 -> ~81 t/s on the MoE model).
 
+**2026-09-24 — MTP throughput confound on host-mapped-input models (gfx1201).**  A model whose input
+embedding / `per_layer_token_embd` does not fit VRAM gets it **host-mapped**; the scheduler then emits
+a small **CPU split** at the front of every graph, and OpenMP's default active-wait makes the idle
+pool spin in the barrier.  Plain decode runs ~55 such graphs/s and the pool settles (~2 cores), but MTP
+calls `llama_decode` **`n_max+1` times per token**, so ~250–350 graphs/s keep all cores pinned and
+**MTP t/s reads ~35 % low**.  Measured (qwen4exp IQ4_NL, 3-GPU `-sm tensor`, `draft-mtp n3`):
+**78.9 t/s / 15.8 cores** default vs **106.3 t/s / 1.4 cores** with `OMP_WAIT_POLICY=PASSIVE
+KMP_BLOCKTIME=0` — identical acceptance (0.83204), identical output.  Scope: it needs a *non-empty*
+CPU input split, i.e. a host-mapped table.  `qwen35`/`qwen35moe` (27B/35B, `token_embd` fits in VRAM)
+measured clean (27B UD-Q4_K_XL 3-GPU tensor: 97.4 vs 97.0; 4B: 195/194 and 184/180), so **the
+dense/MoE baselines above are not affected and acceptance is unaffected everywhere**.  Until the
+automatic fix lands, any **qwen4exp-on-discrete** MTP t/s in this file is ~35 % low — re-measure with
+the env set (or the fixed build).  Root cause, harness and the planned automatic fix:
+`wip/closing-the-gap/gfx1201-closing.md` §11 session 6 and §13.
+
 **2026-09-17 update:** the re-base onto `ebbb18522` picked up upstream #28549 ("Enable CUDA graph for
 MTP draft"), which the isolated A/B now shows is worth **+0.3-1.4 %** on the four-axis adaptive gate
 (scaling with draft depth) for free — see `2026-09-17-mtp-pr28549-ab.md`.  The MTP reference cell for
