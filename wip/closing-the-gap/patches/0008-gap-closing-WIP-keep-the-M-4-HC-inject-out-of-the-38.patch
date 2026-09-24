@@ -1,0 +1,50 @@
+From ad4ddc94567054b69a29e7bacbdc570c7c22d3d2 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 22 Sep 2026 04:48:57 -0500
+Subject: [PATCH] gap-closing WIP: keep the M=4 HC inject out of the 384-row
+ tall MMB tile (item 7)
+
+The tall MMB dense tile is a 384-row panel (BM=384).  qwen4exp emits two IQ4_NL
+GEMMs that satisfy the tall-M gate (M <= 384, K=10240, T >= 2048): the HC down
+(M=320, the intended user) and the HC inject (M=4).  Routing the M=4 inject through
+a 384-row tile computes 4 rows per 384-row panel and, because the tile's N is 64, it
+also launches twice the blocks of the dense 128-row tile for the same T - the
+reference keeps it out of the tall path for that reason.
+
+Add a lower bound (default M >= 16, GGML_CUDA_MMB_TALL_MIN_M overrides; 0 restores
+the old behaviour) so the M=4 inject falls through to the normal dense 128x128 tile.
+Bit-identical: both tiles accumulate over K in the same order, so the same-seed text
+is unchanged (765 chars sha=f61199ba5644) and the width probe stays PASS.
+
+gfx1151, qwen4exp IQ4_NL:
+  kernel profile (pp8192, ub8192): tall <384,64,96,32,0> 1030/380 -> 540/190;
+    dense <128,128,32,64,0> 1182/404 -> 1448/594 (picks up the 190 M=4 dispatches).
+  -b/-ub 4096, r=6:  pp8192 1246.72 -> 1256.56 (+0.8 %),
+                     pp32768 1192.07 -> 1205.03 (+1.1 %).
+
+Exported to wip/closing-the-gap/patches/0008.
+---
+ ggml/src/ggml-cuda/mmb.cu | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 2031e9693..8c5a83511 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -1766,7 +1766,12 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     }
+     const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) T * K, stream);
+     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data;
+-    if (mmb_tall() && src0->type == GGML_TYPE_IQ4_NL && M <= 384 && K >= 4096 && T >= 2048) {   // tall-M tile: HC down|inject [10240 -> 324], activations read once
++    // The tall tile is a 384-row panel, so an M below this wastes most of it.  The model emits an M=4
++    // (HC inject) GEMM that otherwise takes the tall tile for 4 of 384 rows; the reference routes it
++    // outside the tall path and is faster for it.  Default 16 keeps every real tall-M shape (M=320
++    // here) and sends the M=4 inject to the dense path.  Overridable for A/B (0 = old behaviour).
++    static const int tall_min_m = []() { const char * e = getenv("GGML_CUDA_MMB_TALL_MIN_M"); return e ? atoi(e) : 16; }();
++    if (mmb_tall() && src0->type == GGML_TYPE_IQ4_NL && M <= 384 && M >= tall_min_m && K >= 4096 && T >= 2048) {   // tall-M tile: HC down|inject [10240 -> 324], activations read once
+         static const int wide = mmb_tall_mode() >= 2;
+         if (wide) { dim3 grid(1, (T + 63) / 64); mmb_dense_kernel<384, 64, 96, 32, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
+         else      { dim3 grid(1, (T + 31) / 32); mmb_dense_kernel<384, 32, 96, 16, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
+-- 
+2.55.0
+

@@ -9,7 +9,9 @@ support, and an attention-memory campaign that frees several GiB of VRAM.
 It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp
 checkout at the fork point **`ebbb18522`** (upstream master, 2026-09-17
 re-base).  Each block is a self-contained `git am` commit, so you can apply
-the whole set or pick the ones you want:
+the whole set or pick the ones you want.  An optional, **opt-in beta set**
+(`beta/mmb-general/`, 28 patches) layers the `mmb` (bf16-WMMA weight GEMM)
+campaign on top — see the [Beta addendum](#beta-addendum-the-mmb-beta-set).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -18,6 +20,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 ```
 
 - One-line summary of each block: [The 16 blocks](#the-16-blocks)
+- Optional opt-in beta set (`mmb` campaign): [Beta addendum](#beta-addendum-the-mmb-beta-set)
 - Apply details, env knobs, server config: [`patches/README.md`](patches/README.md)
 - What changed recently: [`WORKLOG.md`](WORKLOG.md)
 - Current status and validation: [Current state](#current-state)
@@ -99,12 +102,13 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 │   └── README.md          # apply instructions + block-12 env knobs + server config
 ├── scripts/
 │   ├── apply-all.sh       # the verified apply flow (git am; automatic -3 fallback on drift)
+│   ├── apply-beta.sh      # base-aware: applies the opt-in beta set on top of the delivery
 │   └── make-patches.sh    # regenerates the set from the fork (~/llama.cpp)
 ├── benchmarks/            # benchy methodology + v1/v2 results + graphs (dated records)
 ├── prompts/               # versioned, hash-stable test prompts (sha256-recorded; never edited in place)
 ├── wiki/                  # source for the GitHub wiki (Home, MTP & Adaptive MTP, Quick Reference); see wiki/README.md
 ├── wip/                   # ACTIVE exploration docs / handoffs (currently: iq4nl-prefill/)
-├── beta/                  # promotion staging (currently: beta/qwen4exp/); promoted campaigns move on
+├── beta/                  # promotion staging (currently: beta/mmb-general/, the 28-patch mmb campaign)
 ├── upstream/              # upstream-PR candidates (UPSTREAM-PR-*.md + .patch) + their index
 └── archive/               # the rest: archive/work/ (closed experiments + the archived wip/ trees) + archive/docs/ (history)
 ```
@@ -202,6 +206,33 @@ cmake --build build -j
 git am patches/000[1-9]-*.patch patches/001[0-5]-*.patch   # blocks 01-15
 git add -A && git commit -m "rdna-boosts: block 15: campaign memory wins"
 ```
+
+### Beta addendum: the `mmb` beta set
+
+The workflow above applies the **16 delivery blocks only**.  The `mmb` (bf16-WMMA dequant weight
+GEMM) campaign is a separate, **opt-in 28-patch beta set** in
+[`beta/mmb-general/`](beta/mmb-general/) — it is **not part of the delivery** and is still in its
+beta window (see [`beta/mmb-general/README.md`](beta/mmb-general/README.md)).  To apply the delivery
+**and** the beta set in one step:
+
+```bash
+# from a llama.cpp checkout (a fresh clone, or one with the delivery already applied):
+bash <path-to-this-repo>/scripts/apply-beta.sh .
+#   1. if the 16 delivery blocks are not applied yet, runs scripts/apply-all.sh first
+#      (creates branch `rdna-boosts`);
+#   2. applies beta/mmb-general/patches/*.patch (strict 28/28) on a new `mmb-beta` branch.
+#   result: applied tree 468c64963ae45e72367c73809efa7cc038217e8a
+```
+
+`scripts/apply-beta.sh` is **base-aware**: it detects an already-applied delivery (the current
+tree, or a `rdna-boosts` branch, matches `release.json.tree`) and skips straight to the beta
+patches; otherwise it runs `scripts/apply-all.sh` first.  Overrides: `RDNA_BETA_BRANCH=<name>`
+(default `mmb-beta`) and `RDNA_BETA_TREE=<hash>` (the recorded beta tree the strict apply must
+produce; set to empty to skip the assertion).
+
+> The beta set is a **research campaign, not a delivery release**: its gfx1151 beta-window
+> re-validation is pending.  Read [`beta/mmb-general/BETA-TESTING.md`](beta/mmb-general/BETA-TESTING.md)
+> and its kill-switch list before building or shipping it.
 
 ## Recommended configuration — adaptive MTP + `ngram-mod`
 

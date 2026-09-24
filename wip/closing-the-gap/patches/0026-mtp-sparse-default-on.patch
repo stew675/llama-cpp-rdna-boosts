@@ -1,0 +1,80 @@
+From 1b1174a274e2315c34c7074436956148f9985865 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Wed, 23 Sep 2026 18:01:50 -0500
+Subject: [PATCH] qwen4exp: default the sparse MTP draft prefill ON
+
+The HC16 F32-elision that forced LLAMA_MTP_SPARSE off (it made the sparse
+draft's depth text diverge) is fixed by the per-context HC16 state +
+whole-graph consumer scan (patches/0023), so the feature is pure with HC16
+on.  Flip the default and keep LLAMA_MTP_SPARSE=0 as the opt-out.
+
+A/B, gfx1151 qwen4exp IQ4_NL + Q4_K_XL sidecar, f16 KV, MTP n3:
+  pp150K prefill-only n1   937.1 -> 1007.9 t/s  (+7.6 %)
+  pp16K  prefill-only n1  1119.2 -> 1115.6 t/s  (-0.3 %)
+  8K decode (n1000)         56.5 ->   56.4 t/s   (parity)
+  40K full (-b/-ub 4096)   prompt 1106.6 -> 1116.8, gen 35.7 -> 35.9, text identical
+Gates: 8K plain == default == LLAMA_MTP_SPARSE=0 (3553e76d3a9e), 40K all
+8285d12d40ca, 128K plain == MTP n1 (d140b40f0eee), draft acceptance 0.85035
+(1199/1410) unchanged.  The decode/verify sparse arm stays opt-in
+(LLAMA_MTP_SPARSE_DECODE=1); the depth gate LLAMA_MTP_SPARSE_MIN_KV is still
+32768.
+---
+ src/llama-model.cpp     | 11 ++++++-----
+ src/models/qwen4exp.cpp | 14 +++++++++-----
+ 2 files changed, 15 insertions(+), 10 deletions(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 9d3bce7a7..e7c24838f 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2536,13 +2536,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+         default:
+             {
+                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
+-                // With LLAMA_MTP_SPARSE=1 the qwen4exp MTP draft attends sparsely (QSA) like the
+-                // trunk, so its MTP context gets an indexer cache instead of a plain KV cache.
+-                // Default OFF (see the switch's note in qwen4exp.cpp); graph_mtp reads the same
+-                // env, so the memory type and the graph routing cannot disagree.
++                // The qwen4exp MTP draft attends sparsely (QSA) like the trunk by default, so
++                // its MTP context gets an indexer cache instead of a plain KV cache.
++                // LLAMA_MTP_SPARSE=0 restores the plain cache + dense draft attention;
++                // graph_mtp reads the same env, so the memory type and the graph routing cannot
++                // disagree.
+                 static const bool mtp_sparse = [] {
+                     const char * env = getenv("LLAMA_MTP_SPARSE");
+-                    return env != nullptr && std::atoi(env) != 0;
++                    return env == nullptr || std::atoi(env) != 0;
+                 }();
+                 const bool mtp_on_hybrid_qwen =
+                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index bf176aff4..7b5ddd763 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -93,14 +93,18 @@ static int qsa_arch_gfx() {
+ // The qwen4exp MTP draft can attend sparsely (QSA) like the trunk.  The memory type
+ // (create_memory) and the graph routing (graph_mtp) must agree, so both read this one switch.
+ //
+-// **OFF by default**: the sparse prefill is a real win at depth (+6.9 % pp150K, see the
+-// 2026-09-22 record), but at 40K it changes the greedy text while the dense draft does not (the
+-// draft's different proposals expose a target-side verify/rollback near-tie), so the "plain ==
+-// draft-mtp" contract is not met where the arm pays.  Opt in with LLAMA_MTP_SPARSE=1 for the A/B.
++// **ON by default**: the MTP draft uses the trunk's hybrid-idx memory and attends its prefill
++// sparsely (QSA) above the depth gate (LLAMA_MTP_SPARSE_MIN_KV, default 32768).  Measured on
++// gfx1151 (qwen4exp IQ4_NL, f16 KV, MTP n3, -b/-ub 2048 unless noted): pp150K 937.1 -> 1007.9 t/s
++// (+7.6 %), pp16K -0.3 %, 8K decode parity (56.5 -> 56.4 t/s), 40K text byte-identical with
++// -b/-ub 4096.  The old default-OFF reason -- the HC16 F32-elision making the sparse draft's
++// depth text diverge -- was fixed by the per-context HC16 state + whole-graph consumer scan
++// (patches/0023), so the feature is pure with HC16 on.  LLAMA_MTP_SPARSE=0 disables it (plain KV
++// cache + dense draft attention); the decode/verify arm stays opt-in (LLAMA_MTP_SPARSE_DECODE=1).
+ static bool qwen4exp_mtp_sparse_enabled() {
+     static const bool enabled = [] {
+         const char * env = getenv("LLAMA_MTP_SPARSE");
+-        return env != nullptr && std::atoi(env) != 0;
++        return env == nullptr || std::atoi(env) != 0;
+     }();
+     return enabled;
+ }
+-- 
+2.55.0
+

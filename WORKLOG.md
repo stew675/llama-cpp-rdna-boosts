@@ -172,7 +172,8 @@ self-contained README.  Two reasons:
 ported to gfx1201 and gfx1100; the **combination has never been re-run on gfx1151** — the individual
 "gfx1151 unchanged" claims were made one step at a time (mostly by comparing device assembly), never
 once end-to-end on the final set.  `beta/mmb-general/BETA-TESTING.md` is the checklist: (1) MMB **off**
-must be byte-identical to r12, with `test-logits-width-probe` PASS; (2) `GGML_CUDA_MMB=1` must still
+must be byte-identical to r12 (**retracted 2026-09-22** — that was the opt-in-era bisection aid, not the
+purity contract; `GREEDY-PURITY.md` §5/§6 make the guarantee *intra-build*), with `test-logits-width-probe` PASS; (2) `GGML_CUDA_MMB=1` must still
 recover the original **+32…+48 %** gfx1151 prefill win (the risk the per-arch table introduced);
 (3) the four op oracles, with the `FLASH_ATTN_EXT` counting trap called out; (4) MTP at `-n 3000` with
 acceptance > 0.45 and MTP ≥ plain.

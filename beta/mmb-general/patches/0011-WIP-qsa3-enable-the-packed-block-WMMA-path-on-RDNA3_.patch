@@ -1,7 +1,7 @@
-From f247b6eaedfffd072974f2d3836d9824a7e5b182 Mon Sep 17 00:00:00 2001
+From c5f71384e2b4e66b9758da332a082e2b3b4cebe5 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 21 Sep 2026 08:55:36 -0500
-Subject: [PATCH 11/12] WIP qsa3: enable the packed-block WMMA path on RDNA3_0
+Subject: [PATCH 11/28] WIP qsa3: enable the packed-block WMMA path on RDNA3_0
  (gfx1100)
 
 The gfx11 arm of the fragment shim is byte-identical to the validated
@@ -20,7 +20,7 @@ performance claim is trust-RDNA3_5 per gfx1100-porting.md section 9.
  1 file changed, 4 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/fattn-qsa3.cu b/ggml/src/ggml-cuda/fattn-qsa3.cu
-index d78d75853..22a15f47e 100644
+index 3964d704d..8fe1b0c7a 100644
 --- a/ggml/src/ggml-cuda/fattn-qsa3.cu
 +++ b/ggml/src/ggml-cuda/fattn-qsa3.cu
 @@ -58,8 +58,9 @@ static __device__ __forceinline__ uint16_t qsa3_f2h(const float f) { return __bu
@@ -35,7 +35,7 @@ index d78d75853..22a15f47e 100644
  static __device__ __forceinline__ v8f qsa3_wmma_f16(const qsa3_frag_t a, const qsa3_frag_t b, const v8f c) {
  #if defined(RDNA4)
      return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
-@@ -579,7 +580,7 @@ bool ggml_cuda_flash_attn_qsa3_supported(int device, const ggml_tensor * dst) {
+@@ -594,7 +595,7 @@ bool ggml_cuda_flash_attn_qsa3_supported(int device, const ggml_tensor * dst) {
          return false;
      }
      const int cc = ggml_cuda_info().devices[device].cc;

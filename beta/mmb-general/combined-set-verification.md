@@ -2,11 +2,17 @@
 
 > **POSTSCRIPT — one patch was removed after this verification.**  The maintainer had the experimental
 > per-M `nwarps` patch (`0013`) **moved out** of the set to [`../../wip/nwarps/`](../../wip/nwarps/),
-> because it is default-OFF and breaks the `W=1..8` width-purity contract.  The **shipped beta set is
-> therefore 12 patches**, tree **`bca69f23dd29acef2d8898c6fd492104e078eef1`** (this file's §2-§4
-> describe the intermediate 13-patch state, tree `cd306e6b60…`, which is also verified).  Removing a
-> default-OFF patch that no gfx1201 code path could reach cannot change the gfx1201 results in §4, and
-> dropping it also removes the build cost measured in §5.
+> because it is default-OFF and breaks the `W=1..8` width-purity contract.  The 12-patch beta set was
+> then `bca69f23dd…` on r12 (this file's §2-§4 describe the intermediate 13-patch state, tree
+> `cd306e6b60…`, which is also verified).  Removing a default-OFF patch that no gfx1201 code path
+> could reach cannot change the gfx1201 results in §4, and dropping it also removes the build cost
+> measured in §5.
+>
+> **2026-09-25 — consolidated with `closing-the-gap` and re-based on r13.**  The shipped beta set is
+> now **28 patches** (12 core + 16 appended, ten closing patches folded into the core), strict
+> `git am` **28/28** from the **r13** tree (`bb7b6d07…`) to applied tree **`468c6496…`** —
+> **tree-identical** to the combined `gap-closing-denseband` tree, so the gfx1201 cross-arch results
+> below carry over unchanged.  The r12-era `bca69f23dd…` hash above is the pre-consolidation set.
 
 One branch now carries all three architectures.  This file records the merge and the **cross-arch
 verification** that the gfx1100 overlay does not disturb gfx1201 (or gfx1151).

@@ -1,8 +1,8 @@
-From c3724f6270a2019d3da9d053fe8d668a5843e340 Mon Sep 17 00:00:00 2001
+From a7ce1a7f48b1f4b77afadc817e784a733157a85f Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sun, 20 Sep 2026 21:01:26 -0500
-Subject: [PATCH 02/12] WIP qsa3: the packed-block WMMA sparse-attention path
- for QSA
+Subject: [PATCH 02/28] WIP qsa3: the packed-block WMMA sparse-attention path
+ for QSA + block-window sizing and the visibility fold
 
 Squashed theme commit (5 originals): packed-block WMMA prefill for the QSA
 sparse attention; support for every KV cache type (not just the native pair);
@@ -25,11 +25,13 @@ the VEC path.  26/26 on gfx1201; qsa3 ~4.2e-8 NMSE vs VEC ~4e-9 (f16 floor).
  ggml/include/ggml.h              |   8 +
  ggml/src/ggml-cuda/fattn-qsa.cu  |   8 +
  ggml/src/ggml-cuda/fattn-qsa.cuh |   4 +
- ggml/src/ggml-cuda/fattn-qsa3.cu | 696 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/fattn-qsa3.cu | 712 +++++++++++++++++++++++++++++++
  ggml/src/ggml.c                  |  26 ++
- src/models/qwen4exp.cpp          |  67 +++
+ src/llama-memory-hybrid-idx.cpp  |  21 +
+ src/llama-memory-hybrid-idx.h    |   9 +
+ src/models/qwen4exp.cpp          |  73 +++-
  tests/test-backend-ops.cpp       |  33 +-
- 7 files changed, 837 insertions(+), 5 deletions(-)
+ 9 files changed, 887 insertions(+), 7 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa3.cu
 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
@@ -84,10 +86,10 @@ index d44d06be9..2fae29ceb 100644
 +bool ggml_cuda_flash_attn_qsa3_supported(int device, const ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/fattn-qsa3.cu b/ggml/src/ggml-cuda/fattn-qsa3.cu
 new file mode 100644
-index 000000000..d78d75853
+index 000000000..3964d704d
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/fattn-qsa3.cu
-@@ -0,0 +1,696 @@
+@@ -0,0 +1,712 @@
 +#include "common.cuh"
 +#include "fattn-qsa.cuh"
 +#include <cstdio>
@@ -236,14 +238,32 @@ index 000000000..d78d75853
 +    const int key = p[j];
 +    return raw ? ((key >= 0 && key < nk) ? key : QSA3_SENT) : key;
 +}
++
++// Per-cell visibility (the derived-visibility predicate the VEC kernel applies): a cell is visible
++// for a query iff 0 <= cell_vis[c] <= q_vis[q].  It is folded into the per-(query,cell) `umask` bit
++// here, at merge time, so the attention kernel needs no per-cell load/branch in its hot loop: the
++// block-level `kv` test it already does then carries the same -inf.  Bit-identical to applying the
++// predicate in the attention kernel (the umask bit indexes the same cell: 4*block + cc).
++static __device__ __forceinline__ bool qsa3_cell_visible(const int * cell_vis, const int qv, const int c) {
++    if (cell_vis == nullptr) { return true; }
++    const int cv = cell_vis[c];
++    return cv >= 0 && cv <= qv;
++}
 +__global__ __launch_bounds__(QSA3_MERGE_LANES) void qsa3_merge_kernel(
 +        const int * __restrict__ ids, const size_t i1, const int n_q, const int ns, const int nk,
 +        const int * __restrict__ srow, const int * __restrict__ sflag,
++        const int * __restrict__ cell_vis, const int * __restrict__ q_vis,
 +        uint16_t * __restrict__ ublk, uint16_t * __restrict__ umask, int * __restrict__ ucount, const int cap) {
 +    extern __shared__ int rows_s[];
 +    __shared__ int scan_s[QSA3_MERGE_LANES];
 +    const int lane = threadIdx.x;
 +    const int g = blockIdx.x;
++    // per-query visibility key (only when the derived-visibility predicate is in force; the mask path
++    // passes cell_vis == nullptr and is applied by the attention kernel)
++    const int * cvis = cell_vis;
++    int qvv[QSA3_G];
++#pragma unroll
++    for (int qi = 0; qi < QSA3_G; ++qi) { qvv[qi] = (cvis != nullptr && q_vis != nullptr) ? q_vis[QSA3_G*g + qi] : 0; }
 +#pragma unroll
 +    for (int qi = 0; qi < QSA3_G; ++qi) {
 +        const int q = QSA3_G * g + qi;
@@ -337,8 +357,11 @@ index 000000000..d78d75853
 +                if (head[qi] != QSA3_SENT && (head[qi] >> 2) == b) {
 +                    const int * rr = rp[qi];
 +                    int pn = p[qi];
-+                    if ((head[qi] & 3) == 0 && pn + 3 < pe[qi] && rr[pn+3] == head[qi] + 3 && rr[pn+1] == head[qi] + 1 && rr[pn+2] == head[qi] + 2) { mk |= 0xFu << (4*qi); pn += 4; }
-+                    else { do { mk |= 1u << (4*qi + (rr[pn] & 3)); ++pn; } while (pn < pe[qi] && (rr[pn] >> 2) == b); }
++                    if ((head[qi] & 3) == 0 && pn + 3 < pe[qi] && rr[pn+3] == head[qi] + 3 && rr[pn+1] == head[qi] + 1 && rr[pn+2] == head[qi] + 2) {
++                        for (int k2 = 0; k2 < 4; ++k2) { if (qsa3_cell_visible(cvis, qvv[qi], head[qi] + k2)) { mk |= 1u << (4*qi + k2); } }
++                        pn += 4;
++                    }
++                    else { do { const int c2 = rr[pn]; if (qsa3_cell_visible(cvis, qvv[qi], c2)) { mk |= 1u << (4*qi + (c2 & 3)); } ++pn; } while (pn < pe[qi] && (rr[pn] >> 2) == b); }
 +                    p[qi] = pn; head[qi] = pn < pe[qi] ? rr[pn] : QSA3_SENT;
 +                }
 +            }
@@ -404,7 +427,7 @@ index 000000000..d78d75853
 +
 +__global__ __launch_bounds__(256) void qsa3_attn_kernel(
 +        const float * __restrict__ q, const uint16_t * __restrict__ pk, const uint16_t * __restrict__ pv,
-+        const uint16_t * __restrict__ mask, const int * __restrict__ cell_vis, const int * __restrict__ q_vis,
++        const uint16_t * __restrict__ mask,
 +        const uint16_t * __restrict__ ublk, const uint16_t * __restrict__ umask,
 +        const int * __restrict__ ucount, float * __restrict__ out, const qsa3_layout s) {
 +    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, r = lane & 15, hi = lane >> 4;
@@ -456,9 +479,6 @@ index 000000000..d78d75853
 +            for (int e = 0; e < 8; ++e) { O[i][t][e] = 0.f; }
 +    float m = -INFINITY, l = 0.f;                       // owner state (waves 0..2): row 16w + r
 +    const int own_row = 16*w + r, own_qi = own_row / QSA3_HQ;
-+    const int own_query = QSA3_G * g + own_qi;
-+    const int own_q_vis = (cell_vis && w < 3 && own_query < s.n_q) ? q_vis[own_query] : 0;
-+    const int * cellvis = cell_vis;
 +
 +    auto load_desc = [&](const int c, uint32_t & b01, uint32_t & b23, uint32_t & m01, uint32_t & m23) {
 +        const uint2 bb = *reinterpret_cast<const uint2 *>(gblk + 4*c);
@@ -546,9 +566,6 @@ index 000000000..d78d75853
 +                    scf[e] = -INFINITY;
 +                } else if (mask) {
 +                    scf[e] += qsa3_h2f(mask[4 * blk_of(b01, b23, j) + cc]);
-+                } else if (cellvis) {
-+                    const int cv = cellvis[4 * blk_of(b01, b23, j) + cc];
-+                    if (!(cv >= 0 && cv <= own_q_vis)) { scf[e] = -INFINITY; }
 +                }
 +            }
 +            float mloc = scf[0];
@@ -765,7 +782,10 @@ index 000000000..d78d75853
 +        CUDA_CHECK(cudaGetLastError());
 +        const ggml_cuda_kernel_launch_params launch2(dim3(ngroups), dim3(QSA3_MERGE_LANES), (size_t) QSA3_G * ns * sizeof(int), ctx.stream());
 +        ggml_cuda_kernel_launch(qsa3_merge_kernel, launch2, (const int *) ids->data, ids->nb[1], n_q, ns, nk,
-+                                (const int *) srow.get(), (const int *) sflag.get(), ublk.get(), umask.get(), ucount.get(), cap);
++                                (const int *) srow.get(), (const int *) sflag.get(),
++                                (mask == nullptr && cell_vis != nullptr) ? (const int *) cell_vis->data : nullptr,
++                                (mask == nullptr && q_vis    != nullptr) ? (const int *) q_vis->data    : nullptr,
++                                ublk.get(), umask.get(), ucount.get(), cap);
 +        CUDA_CHECK(cudaGetLastError());
 +    }
 +
@@ -776,8 +796,6 @@ index 000000000..d78d75853
 +            (const uint16_t *) pk16.get(),
 +            (const uint16_t *) pv16.get(),
 +            mask     ? (const uint16_t *) mask->data     : nullptr,
-+            cell_vis ? (const int      *) cell_vis->data : nullptr,
-+            q_vis    ? (const int      *) q_vis->data    : nullptr,
 +            (const uint16_t *) ublk.get(),
 +            (const uint16_t *) umask.get(),
 +            (const int      *) ucount.get(),
@@ -821,8 +839,60 @@ index 2ce34caf0..bd4e2aabb 100644
  void ggml_flash_attn_qsa_set_prec(
          struct ggml_tensor * a,
          enum ggml_prec       prec) {
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index 8c71fe7b0..fec7ad0e0 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -938,6 +938,27 @@ uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
+     return ns_ubatch[i_cur];
+ }
+ 
++uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
++    const uint32_t n_kv = get_idx() ? get_idx()->get_n_kv() : 0;
++    const llama_kv_cache * idx = mem ? mem->get_mem_idx() : nullptr;
++    if (idx == nullptr) {
++        return n_kv;
++    }
++    // seq_to_stream is LLAMA_MAX_SEQ-sized in the unified (n_stream == 1) case and n_stream-sized
++    // otherwise, and get_cells() asserts, so bound the seq sweep to what that vector holds.
++    const uint32_t n_stream = idx->get_n_stream();
++    const llama_seq_id n_seq = n_stream > 1 ? (llama_seq_id) n_stream : (llama_seq_id) LLAMA_MAX_SEQ;
++    llama_pos pos_max = -1;
++    for (llama_seq_id s = 0; s < n_seq; ++s) {
++        pos_max = std::max(pos_max, idx->get_cells(s).seq_pos_max(s));
++    }
++    if (pos_max < 0) {
++        return n_kv;
++    }
++    const uint32_t window = ((uint32_t) pos_max + 1 + 255) / 256 * 256;
++    return std::max(n_kv, window);
++}
++
+ void llama_memory_hybrid_idx_context::set_input_qsa(
+         ggml_tensor * cell_blk,
+         ggml_tensor * blk_cells,
+diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
+index e18c76399..d1bea3ab1 100644
+--- a/src/llama-memory-hybrid-idx.h
++++ b/src/llama-memory-hybrid-idx.h
+@@ -197,6 +197,15 @@ public:
+     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
+     uint32_t get_n_stream() const;
+ 
++    // Cells the QSA block metadata must cover.  The KV view is sized by OCCUPIED cells, but blocks
++    // are keyed by POSITION, and a cache whose positions run ahead of its cells has blocks past that
++    // view: the MTP draft context never receives the cells an M-RoPE image pins to one position, so
++    // after an image its highest position leads its cell count by the image's grid size.  Sizing the
++    // block tensors from get_n_kv() then makes the fill walk past the window (assert / corrupt read);
++    // use max(get_n_kv(), highest stored position + 1), padded to 256 like get_n_kv() so graph reuse
++    // keeps its cadence.  (Ported from the other solution's b0f31f587.)
++    uint32_t qsa_n_kv_window() const;
++
+     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                        ggml_tensor * bias, ggml_tensor * blk_idx, ggml_tensor * blk_tail,
+                        ggml_tensor * cell_vis, ggml_tensor * q_vis,
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index 874cf5bd5..d61eac7ed 100644
+index 874cf5bd5..5adf84e66 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
 @@ -14,6 +14,16 @@
@@ -842,7 +912,27 @@ index 874cf5bd5..d61eac7ed 100644
  // Upper bound of the decode/verify band served by the fused hyper-connection ops
  // (ggml_cuda_op_hc_mix / _hc_combine, which assert the same bound - HC_FUSED_MAX_TOKENS
  // in ggml-cuda/hc-mix.cu). A verify batch is --spec-draft-n-max + 1 tokens and the
-@@ -1571,6 +1581,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1188,7 +1198,8 @@ public:
+ 
+         const int64_t n_kv     = idx->get_n_kv();
+         const int64_t n_stream = mctx->get_n_stream();
+-        const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
++        // blocks are keyed by position, which can run ahead of the occupied cells (M-RoPE image + MTP)
++        const int64_t n_blocks = ((int64_t) mctx->qsa_n_kv_window() + ratio - 1)/ratio;
+ 
+         bool res = true;
+ 
+@@ -1274,7 +1285,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+ 
+     GGML_ASSERT(r > 0);
+ 
+-    const int64_t n_blocks = (n_kv + r - 1)/r;
++    // blocks are keyed by position, which can run ahead of the occupied cells (see qsa_n_kv_window)
++    const int64_t n_blocks = ((int64_t) mctx_hyb->qsa_n_kv_window() + r - 1)/r;
+     // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
+     const int64_t n_stream = mctx_hyb->get_n_stream();
+     GGML_ASSERT(n_tokens % n_stream == 0);
+@@ -1571,6 +1583,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
      return top_k;
  }
  
@@ -890,7 +980,7 @@ index 874cf5bd5..d61eac7ed 100644
  // Dense GQA self-attention restricted to the cells that top_k names.
  // The mask build below copies the MLA sparse path in llm_graph_context::build_attn.
  ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
-@@ -1664,6 +1715,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1664,6 +1717,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
      ggml_tensor * q = q_cur;
      ggml_tensor * k = mctx_cur->get_k(ctx0, il);
      ggml_tensor * v = mctx_cur->get_v(ctx0, il);
@@ -900,7 +990,7 @@ index 874cf5bd5..d61eac7ed 100644
      ggml_tensor * cur;
  
      if (qsa_sparse) {
-@@ -1679,6 +1733,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+@@ -1679,6 +1735,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
          // derives each cell's visibility from cell_vis/q_vis instead - see findings 2c
          cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f,
                  qsa_cell_vis, qsa_q_vis);

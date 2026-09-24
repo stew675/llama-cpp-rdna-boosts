@@ -1,7 +1,7 @@
-From 7663d8d5476f2f30b0edfcae13c8c5dad83cbfcd Mon Sep 17 00:00:00 2001
+From c8f1709fe4c833712f6c81707777f55d272e7cf6 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 21 Sep 2026 13:07:36 -0500
-Subject: [PATCH 12/12] WIP mmb: default the F32 split OFF on RDNA3_0 (gfx1100)
+Subject: [PATCH 12/28] WIP mmb: default the F32 split OFF on RDNA3_0 (gfx1100)
 
 Measured on a single RX 7900 XTX (2026-09-21): with the gfx1151 default
 (F32 split on) MMB regressed the MoE models because the F32 router is a
@@ -24,10 +24,10 @@ gemma-26B-A4B neutral.  Decode is untouched (mmb_min_t = 512).
  1 file changed, 8 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
-index 899a2416b..566f3ed03 100644
+index 0ce405561..422451c6f 100644
 --- a/ggml/src/ggml-cuda/mmb.cu
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -1250,6 +1250,14 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
+@@ -1508,6 +1508,14 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
          c.f32split_mode = 1;
          c.tiny_m       = 1;
      }

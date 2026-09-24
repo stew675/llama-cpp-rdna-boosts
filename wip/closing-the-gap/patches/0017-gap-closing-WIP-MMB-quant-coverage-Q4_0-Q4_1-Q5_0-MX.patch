@@ -1,0 +1,371 @@
+From 26a6a2fce81ad0fd8f93451e6b2b412fd1570f61 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 22 Sep 2026 15:15:53 -0500
+Subject: [PATCH] gap-closing WIP: MMB quant coverage -- Q4_0, Q4_1, Q5_0,
+ MXFP4, NVFP4
+
+Add five more GGUF weight types to the MMB (dequant->bf16 WMMA) path: new
+WTYPE codes 11=Q4_0, 12=Q4_1, 13=Q5_0, 14=MXFP4, 15=NVFP4, with exact-size byte
+dequantizers (mmb_dq_row_q4_0/_q4_1/_q5_0/_mxfp4/_nvfp4) wired through the
+dense, routed (MUL_MAT_ID) and fused gate+up+GLU launches + the type masks.
+
+Validated on gfx1151:
+- test-backend-ops MUL_MAT with MMB forced on (GGML_CUDA_MMB_MIN_T=1):
+  q4_0 48/48, q4_1 47/47, q5_0 14/14, mxfp4 46/46, nvfp4 45/45.
+- test-backend-ops MUL_MAT_ID: q4_0 74/74, q4_1 75/75, q5_0 3/3, mxfp4 74/74,
+  nvfp4 73/73.
+- PPL (16 chunks) off->on: Q4_0 27.59->27.54, Q4_1 25.74->25.16, Q5_0
+  22.02->21.69; gpt-oss-20b MXFP4 (8 chunks) 677.0->670.4.
+- pp throughput off->on: Nanbeige-3B pp8192 Q4_0 +19.5 %, Q4_1 +22.4 %,
+  Q5_0 +25.4 %; 35B-A3B Q4_1 pp4096 1500 -> 2449 (+63 %, routed+GLU);
+  gpt-oss-20b MXFP4 pp4096 2156 -> 2267 (+5.2 %).
+- existing types unregressed (iq4_nl 14/14, q8_0 50/50).
+
+Default-enable the new types on non-RDNA4 (the Q4Q5 mask arm); RDNA4 keeps its
+per-type dense policy, so they stay inert there.  NVFP4 has no local model, so
+its throughput is unmeasured -- the MUL_MAT/MUL_MAT_ID oracles are its gate.
+---
+ ggml/src/ggml-cuda/mmb.cu | 216 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 212 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 19c4eb497..09f0109a3 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -313,6 +313,123 @@ __device__ __forceinline__ void mmb_dq_row_q5_1(const uint4 w0, const uint4 w1,
+     }
+ }
+ 
++// dequantize one weight row's two consecutive Q4_0 blocks (36 B: per 32 values, half d + qs[16])
++// into 64 bf16. value = d * (nibble - 8).  Same 18-byte footprint as IQ4_NL, so the load shape and
++// output ordering match mmb_dq_row36; only the value map differs.
++__device__ __forceinline__ void mmb_dq_row_q4_0(const uint8_t * base, uint32_t * arow) {
++#pragma unroll
++    for (int blk = 0; blk < 2; ++blk) {
++        const uint8_t * b = base + blk * 18;
++        const float d = mmb_h2f(*(const uint16_t *) b), md = -8.0f * d;
++        const uint32_t * q = (const uint32_t *)(b + 2);
++        uint32_t * out = arow + blk * 16;
++#pragma unroll
++        for (int w = 0; w < 4; ++w) {
++            const uint32_t v = q[w];
++            const uint32_t lo = v & 0x0F0F0F0Fu, hi = (v >> 4) & 0x0F0F0F0Fu;
++            out[2*w]         = mmb_pack2(fmaf((float)( lo        & 0xFFu), d, md), fmaf((float)((lo >>  8) & 0xFFu), d, md));
++            out[2*w + 1]     = mmb_pack2(fmaf((float)((lo >> 16) & 0xFFu), d, md), fmaf((float)((lo >> 24)      ), d, md));
++            out[8 + 2*w]     = mmb_pack2(fmaf((float)( hi        & 0xFFu), d, md), fmaf((float)((hi >>  8) & 0xFFu), d, md));
++            out[8 + 2*w + 1] = mmb_pack2(fmaf((float)((hi >> 16) & 0xFFu), d, md), fmaf((float)((hi >> 24)      ), d, md));
++        }
++    }
++}
++
++// dequantize one weight row's two consecutive Q4_1 blocks (40 B: per 32 values, half2 dm + qs[16])
++// into 64 bf16. value = d * nibble + m.
++__device__ __forceinline__ void mmb_dq_row_q4_1(const uint8_t * base, uint32_t * arow) {
++#pragma unroll
++    for (int blk = 0; blk < 2; ++blk) {
++        const uint8_t * b = base + blk * 20;
++        const uint32_t dm = *(const uint32_t *) b;
++        const float d = mmb_h2f((uint16_t)(dm & 0xffff)), m = mmb_h2f((uint16_t)(dm >> 16));
++        const uint32_t * q = (const uint32_t *)(b + 4);
++        uint32_t * out = arow + blk * 16;
++#pragma unroll
++        for (int w = 0; w < 4; ++w) {
++            const uint32_t v = q[w];
++            const uint32_t lo = v & 0x0F0F0F0Fu, hi = (v >> 4) & 0x0F0F0F0Fu;
++            out[2*w]         = mmb_pack2(fmaf((float)( lo        & 0xFFu), d, m), fmaf((float)((lo >>  8) & 0xFFu), d, m));
++            out[2*w + 1]     = mmb_pack2(fmaf((float)((lo >> 16) & 0xFFu), d, m), fmaf((float)((lo >> 24)      ), d, m));
++            out[8 + 2*w]     = mmb_pack2(fmaf((float)( hi        & 0xFFu), d, m), fmaf((float)((hi >>  8) & 0xFFu), d, m));
++            out[8 + 2*w + 1] = mmb_pack2(fmaf((float)((hi >> 16) & 0xFFu), d, m), fmaf((float)((hi >> 24)      ), d, m));
++        }
++    }
++}
++
++// dequantize one weight row's two consecutive Q5_0 blocks (44 B: per 32 values, half d + qh[4] +
++// qs[16]) into 64 bf16. value = d * ((qs nibble) | (qh 5th bit << 4) - 16).  Same field layout as
++// Q5_1; the 5th bit selection mirrors mmb_dq_row_q5_1 exactly (qh bit e in both halves).
++__device__ __forceinline__ void mmb_dq_row_q5_0(const uint8_t * base, uint32_t * arow) {
++#pragma unroll
++    for (int blk = 0; blk < 2; ++blk) {
++        const uint8_t * b = base + blk * 22;
++        const float d = mmb_h2f(*(const uint16_t *) b), md = -16.0f * d;
++        const uint32_t qh = *(const uint32_t *)(b + 2);
++        const uint32_t * q = (const uint32_t *)(b + 6);
++        uint32_t * out = arow + blk * 16;
++#pragma unroll
++        for (int w = 0; w < 4; ++w) {
++            const uint32_t v = q[w];
++            const uint32_t lo = v & 0x0F0F0F0Fu, hi = (v >> 4) & 0x0F0F0F0Fu;
++            const uint32_t bl = (qh >> (4 * w))      & 0xFu;
++            const uint32_t bh = (qh >> (4 * w + 16)) & 0xFu;
++            const uint32_t sl = (bl & 1 ? 0x10u : 0u) | (bl & 2 ? 0x1000u : 0u) | (bl & 4 ? 0x100000u : 0u) | (bl & 8 ? 0x10000000u : 0u);
++            const uint32_t sh = (bh & 1 ? 0x10u : 0u) | (bh & 2 ? 0x1000u : 0u) | (bh & 4 ? 0x100000u : 0u) | (bh & 8 ? 0x10000000u : 0u);
++            const uint32_t vl = lo | sl, vh = hi | sh;
++            out[2*w]         = mmb_pack2(fmaf((float)( vl        & 0xFFu), d, md), fmaf((float)((vl >>  8) & 0xFFu), d, md));
++            out[2*w + 1]     = mmb_pack2(fmaf((float)((vl >> 16) & 0xFFu), d, md), fmaf((float)((vl >> 24)      ), d, md));
++            out[8 + 2*w]     = mmb_pack2(fmaf((float)( vh        & 0xFFu), d, md), fmaf((float)((vh >>  8) & 0xFFu), d, md));
++            out[8 + 2*w + 1] = mmb_pack2(fmaf((float)((vh >> 16) & 0xFFu), d, md), fmaf((float)((vh >> 24)      ), d, md));
++        }
++    }
++}
++
++// dequantize one weight row's two consecutive MXFP4 blocks (34 B: per 32 values, uint8 e (E8M0)
++// shared exponent + qs[16]) into 64 bf16. value = 2^(e-127) * kvalues_mxfp4[nibble] * 0.5 (the
++// table holds the doubled E2M1 values).  Same nibble positions as Q4_0, so the output ordering
++// mirrors mmb_dq_row_q4_0.
++__device__ __forceinline__ void mmb_dq_row_mxfp4(const uint8_t * base, uint32_t * arow) {
++#pragma unroll
++    for (int blk = 0; blk < 2; ++blk) {
++        const uint8_t * b = base + blk * 17;
++        const float d = ggml_cuda_e8m0_to_fp32(b[0]) * 0.5f;
++        const uint32_t * q = (const uint32_t *)(b + 1);
++        uint32_t * out = arow + blk * 16;
++#pragma unroll
++        for (int w = 0; w < 4; ++w) {
++            const uint32_t v = q[w];
++            const uint32_t lo = v & 0x0F0F0F0Fu, hi = (v >> 4) & 0x0F0F0F0Fu;
++            out[2*w]         = mmb_pack2(d * (float)kvalues_mxfp4[ lo        & 0xFu], d * (float)kvalues_mxfp4[(lo >>  8) & 0xFu]);
++            out[2*w + 1]     = mmb_pack2(d * (float)kvalues_mxfp4[(lo >> 16) & 0xFu], d * (float)kvalues_mxfp4[(lo >> 24)      & 0xFu]);
++            out[8 + 2*w]     = mmb_pack2(d * (float)kvalues_mxfp4[ hi        & 0xFu], d * (float)kvalues_mxfp4[(hi >>  8) & 0xFu]);
++            out[8 + 2*w + 1] = mmb_pack2(d * (float)kvalues_mxfp4[(hi >> 16) & 0xFu], d * (float)kvalues_mxfp4[(hi >> 24)      & 0xFu]);
++        }
++    }
++}
++
++// dequantize one weight row's NVFP4 block (36 B: 64 values, uint8 d[4] UE4M3 per-16-element scales
++// + qs[32]) into 64 bf16.  value = ue4m3(d[sub]) * kvalues_mxfp4[nibble] (the UE4M3 scale is halved
++// and the E2M1 table doubled, so the product is exact).  One 64-value block per K-step.
++__device__ __forceinline__ void mmb_dq_row_nvfp4(const uint8_t * base, uint32_t * arow) {
++    const uint8_t * sc = base;
++    const uint32_t * q = (const uint32_t *)(base + 4);
++#pragma unroll
++    for (int s = 0; s < 4; ++s) {
++        const float d = ggml_cuda_ue4m3_to_fp32(sc[s]);
++        uint32_t * out = arow + s * 8;
++#pragma unroll
++        for (int w = 0; w < 2; ++w) {
++            const uint32_t v = q[s * 2 + w];
++            const uint32_t lo = v & 0x0F0F0F0Fu, hi = (v >> 4) & 0x0F0F0F0Fu;
++            out[2*w]     = mmb_pack2(d * (float)kvalues_mxfp4[ lo        & 0xFu], d * (float)kvalues_mxfp4[(lo >>  8) & 0xFu]);
++            out[2*w + 1] = mmb_pack2(d * (float)kvalues_mxfp4[(lo >> 16) & 0xFu], d * (float)kvalues_mxfp4[(lo >> 24)      & 0xFu]);
++            out[4 + 2*w]     = mmb_pack2(d * (float)kvalues_mxfp4[ hi        & 0xFu], d * (float)kvalues_mxfp4[(hi >>  8) & 0xFu]);
++            out[4 + 2*w + 1] = mmb_pack2(d * (float)kvalues_mxfp4[(hi >> 16) & 0xFu], d * (float)kvalues_mxfp4[(hi >> 24)      & 0xFu]);
++        }
++    }
++}
++
+ // dequantize one weight row's 64-value quarter of an IQ3_S super-block (110 B: half d, qs[64],
+ // qh[8], signs[32], scales[4]) into 64 bf16. q4 = ksh & 3 selects the 64-value quarter
+ // (groups ib = 2*q4, 2*q4+1). Fields are non-contiguous, so this loads straight from the row base
+@@ -602,6 +719,11 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
+             else if constexpr (WTYPE == 8) mmb_dq_row_iq4xs(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 136, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+             else if constexpr (WTYPE == 9) mmb_dq_row_q3k(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 110, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+             else if constexpr (WTYPE == 10) mmb_dq_row_iq3xxs(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 98, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 11) mmb_dq_row_q4_0(Wbase + (size_t)row * wrow_bytes + (size_t)ksh * 36, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 12) mmb_dq_row_q4_1(Wbase + (size_t)row * wrow_bytes + (size_t)ksh * 40, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 13) mmb_dq_row_q5_0(Wbase + (size_t)row * wrow_bytes + (size_t)ksh * 44, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 14) mmb_dq_row_mxfp4(Wbase + (size_t)row * wrow_bytes + (size_t)ksh * 34, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 15) mmb_dq_row_nvfp4(Wbase + (size_t)row * wrow_bytes + (size_t)ksh * 36, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+             else { uint4 * d = (uint4 *)(As + (abo + row) * MMB_LDS_STRIDE); d[0] = a0[i]; d[1] = a1[i]; d[2] = a3[i]; d[3] = a4[i]; d[4] = a5[i]; d[5] = a6[i]; d[6] = a7[i]; d[7] = a8[i]; } } }
+     };
+     auto store_lds_b = [&](const int bbo) {
+@@ -683,6 +805,11 @@ mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ X
+                               WTYPE == 8 ? (size_t)(K / 256) * 136 :
+                               WTYPE == 9 ? (size_t)(K / 256) * 110 :
+                               WTYPE == 10 ? (size_t)(K / 256) * 98 :
++                              WTYPE == 11 ? (size_t)(K / 32) * 18 :
++                              WTYPE == 12 ? (size_t)(K / 32) * 20 :
++                              WTYPE == 13 ? (size_t)(K / 32) * 22 :
++                              WTYPE == 14 ? (size_t)(K / 32) * 17 :
++                              WTYPE == 15 ? (size_t)(K / 64) * 36 :
+                               (size_t)(K / 32) * (WTYPE == 0 ? 18 : 34);
+     mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, false, DBUF, DBUF2>(W + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
+         [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, D, Dh, store_f32, M, [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, m0, T - t0, As, Bs);
+@@ -793,7 +920,7 @@ mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, con
+     const int e = dsc & 0xffff, jt = dsc >> 16;
+     const int r0 = bounds[e] + jt * BN, cnt = bounds[e + 1] - r0;
+     const int m0 = blockIdx.x * BM;
+-    const size_t wrow_bytes = WTYPE == 3 ? (size_t)(K / 256) * 144 : WTYPE == 4 ? (size_t)(K / 32) * 24 : WTYPE == 5 ? (size_t)(K / 256) * 110 : WTYPE == 6 ? (size_t)(K / 256) * 176 : WTYPE == 7 ? (size_t)(K / 256) * 210 : WTYPE == 8 ? (size_t)(K / 256) * 136 : WTYPE == 9 ? (size_t)(K / 256) * 110 : WTYPE == 10 ? (size_t)(K / 256) * 98 : WTYPE == 1 ? (size_t)(K / 32) * 34 : (size_t)(K / 32) * 18;
++    const size_t wrow_bytes = WTYPE == 3 ? (size_t)(K / 256) * 144 : WTYPE == 4 ? (size_t)(K / 32) * 24 : WTYPE == 5 ? (size_t)(K / 256) * 110 : WTYPE == 6 ? (size_t)(K / 256) * 176 : WTYPE == 7 ? (size_t)(K / 256) * 210 : WTYPE == 8 ? (size_t)(K / 256) * 136 : WTYPE == 9 ? (size_t)(K / 256) * 110 : WTYPE == 10 ? (size_t)(K / 256) * 98 : WTYPE == 11 ? (size_t)(K / 32) * 18 : WTYPE == 12 ? (size_t)(K / 32) * 20 : WTYPE == 13 ? (size_t)(K / 32) * 22 : WTYPE == 14 ? (size_t)(K / 32) * 17 : WTYPE == 15 ? (size_t)(K / 64) * 36 : WTYPE == 1 ? (size_t)(K / 32) * 34 : (size_t)(K / 32) * 18;
+     mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, true, DBUF, DBUF2>(W + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
+         [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, As, Bs);
+ }
+@@ -900,6 +1027,21 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
+             } else if constexpr (WTYPE == 10) {
+                 mmb_dq_row_iq3xxs(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 98, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
+                 mmb_dq_row_iq3xxs(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 98, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 11) {
++                mmb_dq_row_q4_0(Wg + (size_t)row * wrow_bytes + (size_t)ksh * 36, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_q4_0(Wu + (size_t)row * wrow_bytes + (size_t)ksh * 36, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 12) {
++                mmb_dq_row_q4_1(Wg + (size_t)row * wrow_bytes + (size_t)ksh * 40, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_q4_1(Wu + (size_t)row * wrow_bytes + (size_t)ksh * 40, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 13) {
++                mmb_dq_row_q5_0(Wg + (size_t)row * wrow_bytes + (size_t)ksh * 44, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_q5_0(Wu + (size_t)row * wrow_bytes + (size_t)ksh * 44, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 14) {
++                mmb_dq_row_mxfp4(Wg + (size_t)row * wrow_bytes + (size_t)ksh * 34, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_mxfp4(Wu + (size_t)row * wrow_bytes + (size_t)ksh * 34, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 15) {
++                mmb_dq_row_nvfp4(Wg + (size_t)row * wrow_bytes + (size_t)ksh * 36, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_nvfp4(Wu + (size_t)row * wrow_bytes + (size_t)ksh * 36, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+             } } }
+     };
+     auto store_lds_b = [&](const int bbo) {
+@@ -983,7 +1125,7 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
+     const int e = dsc & 0xffff, jt = dsc >> 16;
+     const int r0 = bounds[e] + jt * BN, cnt = bounds[e + 1] - r0;
+     const int m0 = blockIdx.x * BM;
+-    const size_t wrow_bytes = WTYPE == 3 ? (size_t)(K / 256) * 144 : WTYPE == 4 ? (size_t)(K / 32) * 24 : WTYPE == 5 ? (size_t)(K / 256) * 110 : WTYPE == 6 ? (size_t)(K / 256) * 176 : WTYPE == 7 ? (size_t)(K / 256) * 210 : WTYPE == 8 ? (size_t)(K / 256) * 136 : WTYPE == 9 ? (size_t)(K / 256) * 110 : WTYPE == 10 ? (size_t)(K / 256) * 98 : WTYPE == 1 ? (size_t)(K / 32) * 34 : (size_t)(K / 32) * 18;
++    const size_t wrow_bytes = WTYPE == 3 ? (size_t)(K / 256) * 144 : WTYPE == 4 ? (size_t)(K / 32) * 24 : WTYPE == 5 ? (size_t)(K / 256) * 110 : WTYPE == 6 ? (size_t)(K / 256) * 176 : WTYPE == 7 ? (size_t)(K / 256) * 210 : WTYPE == 8 ? (size_t)(K / 256) * 136 : WTYPE == 9 ? (size_t)(K / 256) * 110 : WTYPE == 10 ? (size_t)(K / 256) * 98 : WTYPE == 11 ? (size_t)(K / 32) * 18 : WTYPE == 12 ? (size_t)(K / 32) * 20 : WTYPE == 13 ? (size_t)(K / 32) * 22 : WTYPE == 14 ? (size_t)(K / 32) * 17 : WTYPE == 15 ? (size_t)(K / 64) * 36 : WTYPE == 1 ? (size_t)(K / 32) * 34 : (size_t)(K / 32) * 18;
+     mmb_tile_gemm_glu<BM, BN, WTM, WTN, WTYPE, true, DBUF, DBUF2>(Wg + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, Wu + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
+         [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, Ag, Au, Bs);
+ }
+@@ -1487,6 +1629,14 @@ bool mmb_iq3xxs_glu() { static const int v = getenv("GGML_CUDA_MMB_IQ3XXS") ? at
+ // (wip/mmb-general/gfx1201-s5s7-mmb-results.md) is unambiguous about which side each type is on:
+ //   IQ family (IQ4_NL / IQ3_S / IQ4_XS / IQ3_XXS)  ->  MMB WINS   (+2.7 .. +11.8 %)
+ //   Q8_0, Q5_1, Q3_K, Q4_K, Q5_K, Q6_K             ->  MMB LOSES  (-4.5 .. -12.7 %)
++// 2026-09-23 (gfx1201, wip/closing-the-gap): the S5-S7 Q4Q5 group is NOT uniform.  Q4_1 and Q5_0
++// are large DENSE wins on RDNA4 -- interleaved r=3, pp8192/pp32768 (ub 4096), MMB vs the delivery
++// MMQ: 27B Q4_1 +6.9 %/+6.1 %, 27B Q5_0 +14.1 %/+12.7 %; 9B +8.0 %/+7.1 % and +14.4 %/+12.8 %;
++// 4B +5.1 %/+4.2 % and +10.4 %/+8.7 %.  Q4_0 is the odd one out and LOSES (4B -2.9 %/-1.9 %,
++// 9B -0.6 %/-0.3 %, 27B -2.4 %/-1.6 %).  So RDNA4 accepts the IQ family plus Q4_1 + Q5_0 only
++// (Q4_0/MXFP4/NVFP4 stay excluded; the Q4_1/Q5_0 result is the delivery's MMQ path being weak on
++// those two, not the MMB kernel being better in general).  See the 2026-09-23 record in
++// wip/closing-the-gap/.
+ // So the accepted set is ARCH-SCOPED, and the five hardcoded copies of it (dense/routed/mm/mmid/glu)
+ // collapse into one mask here.  The graph's MMQ-fusion stand-down goes through these same
+ // predicates (ggml-cuda.cu), so a type this returns false for costs nothing -- it simply keeps the
+@@ -1504,12 +1654,14 @@ static uint64_t mmb_wtype_mask() {
+     const uint64_t K_AND_Q8  = (1ull << GGML_TYPE_Q8_0) | (1ull << GGML_TYPE_Q5_1) |
+                                (1ull << GGML_TYPE_Q3_K) | (1ull << GGML_TYPE_Q4_K) |
+                                (1ull << GGML_TYPE_Q5_K) | (1ull << GGML_TYPE_Q6_K);
++    const uint64_t Q4Q5      = (1ull << GGML_TYPE_Q4_0) | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_0) | (1ull << GGML_TYPE_MXFP4) | (1ull << GGML_TYPE_NVFP4);
+     const char * e = getenv("GGML_CUDA_MMB_TYPES");
+     if (e && *e) {
+         static const struct { const char * n; ggml_type t; } tab[] = {
+             {"iq4_nl", GGML_TYPE_IQ4_NL}, {"iq3_s", GGML_TYPE_IQ3_S}, {"iq4_xs", GGML_TYPE_IQ4_XS}, {"iq3_xxs", GGML_TYPE_IQ3_XXS},
+             {"q8_0", GGML_TYPE_Q8_0}, {"q5_1", GGML_TYPE_Q5_1}, {"q3_k", GGML_TYPE_Q3_K},
+             {"q4_k", GGML_TYPE_Q4_K}, {"q5_k", GGML_TYPE_Q5_K}, {"q6_k", GGML_TYPE_Q6_K},
++            {"q4_0", GGML_TYPE_Q4_0}, {"q4_1", GGML_TYPE_Q4_1}, {"q5_0", GGML_TYPE_Q5_0}, {"mxfp4", GGML_TYPE_MXFP4}, {"nvfp4", GGML_TYPE_NVFP4},
+         };
+         for (const char * p = e; *p; ) {
+             while (*p == ',' || *p == ' ') ++p;
+@@ -1523,7 +1675,8 @@ static uint64_t mmb_wtype_mask() {
+         fprintf(stderr, "MMB: GGML_CUDA_MMB_TYPES=%s -> %d weight type(s)\n", e, cnt);
+         return mask;
+     }
+-    mask = GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[0].cc) ? IQ_FAMILY : (IQ_FAMILY | K_AND_Q8);
++    const uint64_t RDNA4_SET = IQ_FAMILY | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_0);
++    mask = GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[0].cc) ? RDNA4_SET : (IQ_FAMILY | K_AND_Q8 | Q4Q5);
+     return mask;
+ }
+ static bool mmb_wtype_ok(const ggml_type t) { return (uint64_t) t < 64 && ((mmb_wtype_mask() >> t) & 1ull) != 0; }
+@@ -1536,6 +1689,10 @@ static bool mmb_wtype_ok(const ggml_type t) { return (uint64_t) t < 64 && ((mmb_
+ //   IQ3_XXS, IQ4_NL                    break-even at the same geometry     (not enabled)
+ //   IQ4_XS  mmb_dense 0.919 s  vs  delivery MMQ 0.829 s   -> MMB LOSES +10.9 %  (not enabled)
+ //
++// 2026-09-23 (gfx1201): Q4_1 and Q5_0 are added to the RDNA4 dense set (the Q4_1/Q5_0 dense tile
++// beats the delivery MMQ by +6..+14 % on 4B/9B/27B -- see the wtype-mask note above).  IQ3_S keeps
++// its S10 slot; Q4_0/MXFP4/NVFP4/IQ2 stay out.
++//
+ // and the whole-model interleaved A/B agrees (27B UD-IQ3_S: IQ3_S-only +0.5..+1.0 % prefill, the
+ // whole IQ family +0.04 % -- IQ4_XS cancels the win).  So RDNA4 enables only the measured winner;
+ // every other type keeps the delivery's MMQ path and costs nothing (the graph's fusion stand-down
+@@ -1552,6 +1709,7 @@ static uint64_t mmb_dense_tmask() {
+             {"iq4_nl", GGML_TYPE_IQ4_NL}, {"iq3_s", GGML_TYPE_IQ3_S}, {"iq4_xs", GGML_TYPE_IQ4_XS}, {"iq3_xxs", GGML_TYPE_IQ3_XXS},
+             {"q8_0", GGML_TYPE_Q8_0}, {"q5_1", GGML_TYPE_Q5_1}, {"q3_k", GGML_TYPE_Q3_K},
+             {"q4_k", GGML_TYPE_Q4_K}, {"q5_k", GGML_TYPE_Q5_K}, {"q6_k", GGML_TYPE_Q6_K},
++            {"q4_0", GGML_TYPE_Q4_0}, {"q4_1", GGML_TYPE_Q4_1}, {"q5_0", GGML_TYPE_Q5_0}, {"mxfp4", GGML_TYPE_MXFP4}, {"nvfp4", GGML_TYPE_NVFP4},
+         };
+         for (const char * p = e; *p; ) {
+             while (*p == ',' || *p == ' ') ++p;
+@@ -1563,7 +1721,7 @@ static uint64_t mmb_dense_tmask() {
+         }
+         return mask;
+     }
+-    if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[0].cc)) mask = 1ull << GGML_TYPE_IQ3_S;
++    if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[0].cc)) mask = (1ull << GGML_TYPE_IQ3_S) | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_0);
+     else mask = ~0ull;   // elsewhere the pre-S10 behaviour stands: mmb_dense_flag() alone gates it
+     return mask;
+ }
+@@ -1591,6 +1749,11 @@ static void mmb_dense_launch_t(const ggml_type t, dim3 grid, cudaStream_t stream
+         case GGML_TYPE_IQ4_XS:  mmb_dense_kernel<BM,BN,WTM,WTN, 8><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
+         case GGML_TYPE_Q3_K:    mmb_dense_kernel<BM,BN,WTM,WTN, 9><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
+         case GGML_TYPE_IQ3_XXS: mmb_dense_kernel<BM,BN,WTM,WTN,10><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
++        case GGML_TYPE_Q4_0:    mmb_dense_kernel<BM,BN,WTM,WTN,11><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
++        case GGML_TYPE_Q4_1:    mmb_dense_kernel<BM,BN,WTM,WTN,12><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
++        case GGML_TYPE_Q5_0:    mmb_dense_kernel<BM,BN,WTM,WTN,13><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
++        case GGML_TYPE_MXFP4:   mmb_dense_kernel<BM,BN,WTM,WTN,14><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
++        case GGML_TYPE_NVFP4:   mmb_dense_kernel<BM,BN,WTM,WTN,15><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
+         default:                mmb_dense_kernel<BM,BN,WTM,WTN, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
+     }
+ }
+@@ -1848,6 +2011,21 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     } else if (src0->type == GGML_TYPE_IQ3_XXS) {
+         if (big) mmb_dense_kernel<128, 256, 64, 64, 10><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+         else     mmb_dense_kernel<128, 128, 32, 64, 10><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++    } else if (src0->type == GGML_TYPE_Q4_0) {
++        if (big) mmb_dense_kernel<128, 256, 64, 64, 11><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++        else     mmb_dense_kernel<128, 128, 32, 64, 11><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++    } else if (src0->type == GGML_TYPE_Q4_1) {
++        if (big) mmb_dense_kernel<128, 256, 64, 64, 12><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++        else     mmb_dense_kernel<128, 128, 32, 64, 12><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++    } else if (src0->type == GGML_TYPE_Q5_0) {
++        if (big) mmb_dense_kernel<128, 256, 64, 64, 13><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++        else     mmb_dense_kernel<128, 128, 32, 64, 13><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++    } else if (src0->type == GGML_TYPE_MXFP4) {
++        if (big) mmb_dense_kernel<128, 256, 64, 64, 14><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++        else     mmb_dense_kernel<128, 128, 32, 64, 14><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++    } else if (src0->type == GGML_TYPE_NVFP4) {
++        if (big) mmb_dense_kernel<128, 256, 64, 64, 15><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++        else     mmb_dense_kernel<128, 128, 32, 64, 15><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+     } else {
+         if (big) mmb_dense_kernel<128, 256, 64, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+         else     mmb_dense_kernel<128, 128, 32, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+@@ -1933,6 +2111,21 @@ static void mmb_routed_kernel_dispatch(const ggml_tensor * w, dim3 gbig, dim3 gs
+     } else if (w->type == GGML_TYPE_IQ3_XXS) {
+         mmb_routed_kernel<128, 128, 32, 64, 10><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
+         mmb_routed_kernel<128,  32, 32, 16, 10><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_Q4_0) {
++        mmb_routed_kernel<128, 128, 32, 64, 11><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 11><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_Q4_1) {
++        mmb_routed_kernel<128, 128, 32, 64, 12><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 12><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_Q5_0) {
++        mmb_routed_kernel<128, 128, 32, 64, 13><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 13><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_MXFP4) {
++        mmb_routed_kernel<128, 128, 32, 64, 14><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 14><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_NVFP4) {
++        mmb_routed_kernel<128, 128, 32, 64, 15><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 15><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
+     } else {
+         mmb_routed_kernel<128, 128, 32, 64, 0><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
+         mmb_routed_kernel<128,  32, 32, 16, 0><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
+@@ -2016,6 +2209,21 @@ static void mmb_routed_glu_kernel_dispatch(const ggml_tensor * gw, dim3 gbig, di
+     } else if (gw->type == GGML_TYPE_IQ3_XXS) {
+         mmb_routed_glu_kernel<64, 128, 32, 32, 10><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
+         mmb_routed_glu_kernel<64,  32, 16, 16, 10><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_Q4_0) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 11><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 11><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_Q4_1) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 12><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 12><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_Q5_0) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 13><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 13><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_MXFP4) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 14><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 14><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_NVFP4) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 15><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 15><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
+     } else {
+         mmb_routed_glu_kernel<64, 128, 32, 32, 0><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
+         mmb_routed_glu_kernel<64,  32, 16, 16, 0><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
+-- 
+2.55.0
+

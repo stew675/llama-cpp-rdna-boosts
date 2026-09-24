@@ -1,0 +1,388 @@
+From dc5e1ae2b9651ed265aeb4cc1295e2ffc1c54d29 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Wed, 23 Sep 2026 12:17:51 -0500
+Subject: [PATCH 24/28] WIP HC16: scope the BF16 activation state per backend
+ context
+
+The HC16 F32-elision keeps each producer's BF16 activation copy in a
+file-scope cache/slot set and the "BF16-only" marks in file-scope sets
+(ggml/src/ggml-cuda/mmb.cu).  Both were shared by every CUDA backend
+context in the process, so the MTP target and its draft head (two
+llama_contexts with separate schedulers) corrupted each other:
+
+  - the draft's ggml_cuda_mmb_begin_graph() freed the target's cache
+    buffers at the start of every draft compute, so a target producer that
+    had elided its F32 output left its consumer reading a never-written
+    buffer once the cache entry was gone;
+  - the marks leaked across contexts, so a context could elide a producer
+    based on another context's marks.
+
+The symptom was nondeterministic greedy text under MTP at depth (128K MTP
+n_max 1 gave five different hashes in five runs; the 40K draft diverged
+from plain), while GGML_CUDA_MMB_HC16=0 was deterministic and pure.
+
+Fix:
+  * move the whole MMB BF16 state (per-graph activation cache, pinned
+    producer slots, BF16-only/copy marks and their lifetime) into a
+    per-backend-context mmb_ctx_state selected by an "active context"
+    pointer set at the start of ggml_backend_cuda_graph_optimize and
+    _graph_compute;
+  * rebuild the marks per graph with an explicit per-context
+    after-compute / first-node lifetime (ggml_cuda_mmb_optimize_begin and
+    _compute_done) instead of the global key hack;
+  * the step-3 marking pass now classifies a producer's consumers over the
+    whole scheduled graph (new ggml_backend_graph_optimize_params.full_graph)
+    and refuses to elide a tensor that has a consumer in another split --
+    the per-compute activation cache does not span splits.
+
+Gates (gfx1151, qwen4exp IQ4_NL + Q4_K_M MTP sidecar, f16 KV):
+  - 128K MTP n_max 1: 5 runs, one hash == plain == HC16=0 (770e770ae7d6);
+  - 40K: plain == dense n1/n3 == sparse n1/n3/n5 (8285d12d40ca),
+    deterministic over repeats;
+  - 8192 plain == dense == sparse (3553e76d3a9e); width probe PASS;
+  - llama-imatrix NanBeige4.2-3B-BF16 clean, imatrix file byte-identical
+    to HC16=0; FLASH_ATTN_QSA 2/2, GATED_DELTA_NET 2/2;
+  - 40K -n 200 n_max 3: plain 28.4 t/s, dense MTP 33.4 t/s (HC16 on and
+    off identical), so HC16 is preserved under MTP.
+---
+ ggml/src/ggml-backend-impl.h    |   5 ++
+ ggml/src/ggml-backend.cpp       |   1 +
+ ggml/src/ggml-cuda/ggml-cuda.cu |  60 +++++++++++------
+ ggml/src/ggml-cuda/mmb.cu       | 111 ++++++++++++++++++++++++--------
+ ggml/src/ggml-cuda/mmb.cuh      |   7 ++
+ 5 files changed, 135 insertions(+), 49 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index 448054401..03f302c85 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -120,6 +120,11 @@ extern "C" {
+         // backend optimisation that relies on state living for one whole compute (e.g. eliding a
+         // producer's F32 output and re-reading it from a per-graph cache) must stand down
+         bool has_eval_callback;
++        // the *whole* scheduled graph.  graph_optimize is called per split, but a consumer of a
++        // tensor may live in another split (the per-compute activation cache does not span splits),
++        // so a backend optimisation that elides a producer's output must consult the whole graph to
++        // find every consumer.  NULL means the graph is not split (full_graph == the split graph).
++        const struct ggml_cgraph * full_graph;
+     };
+ 
+     struct ggml_backend_i {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index abca08e3d..e6ae7cd3f 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1463,6 +1463,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         },
+         /* .user_data     = */ &alloc_deps,
+         /* .has_eval_callback = */ sched->callback_eval != nullptr,
++        /* .full_graph    = */ graph,
+     };
+ 
+     for (int i = 0; i < sched->n_splits; i++) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f8f109e69..4c28f94de 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6534,9 +6534,6 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+ }
+ #endif // USE_CUDA_GRAPH
+ 
+-static bool         g_mmb_marks_after_compute = true;
+-static const void * g_mmb_marks_first_split   = nullptr;
+-
+ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+@@ -6544,6 +6541,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     // The Q8_1 input cache is only valid within one graph execution.
+     cuda_ctx->q8_1_cache_clear();
++    ggml_cuda_mmb_set_active_ctx(cuda_ctx);
+     ggml_cuda_mmb_begin_graph();
+ 
+     bool use_cuda_graph             = false;
+@@ -6612,9 +6610,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+ 
+-    // BF16-only marks live for the whole scheduled graph (all splits) and are cleared by the first
+-    // optimize pass after this compute (see ggml_backend_cuda_graph_optimize).
+-    g_mmb_marks_after_compute = true;
++    ggml_cuda_mmb_compute_done();
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+@@ -6649,11 +6645,17 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+     // BF16-only mark lifetime: clear on the first optimize after a compute, or when the first split
+     // of a new graph is seen (the scheduler optimizes every split of one graph before computing any
+     // of them, so marks set below must survive the remaining splits' optimize calls).
+-    {   const void * key = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
+-        if (g_mmb_marks_after_compute || g_mmb_marks_first_split == nullptr || key == g_mmb_marks_first_split) {
+-            ggml_cuda_mmb_marks_clear(); g_mmb_marks_first_split = key; g_mmb_marks_after_compute = false;
+-        }
+-    }
++    const int mark_log = getenv("GGML_CUDA_MMB_MARK_LOG") ? atoi(getenv("GGML_CUDA_MMB_MARK_LOG")) : 0;
++    ggml_cuda_mmb_set_active_ctx(cuda_ctx);
++    // BF16-only marks are per backend context and (re)built for the graph being optimised.  The
++    // scheduler optimises every split of one graph before computing any of them, so the first
++    // optimize pass of a graph clears and the remaining splits add to the same set.  Cleared when a
++    // compute happened since the last optimize, or when the same graph's first split is seen again.
++    const void * opt_key = cgraph->n_nodes ? cgraph->nodes[0] : nullptr;
++    const bool do_clear = ggml_cuda_mmb_optimize_begin(opt_key);
++    if (mark_log >= 2) fprintf(stderr, "MMB_OPT backend=%p key=%s n_nodes=%d clear=%d marks=%zu\n",
++            (void *) backend, opt_key ? ((const ggml_tensor *) opt_key)->name : "-", cgraph->n_nodes,
++            (int) do_clear, ggml_cuda_mmb_marks_count());
+ 
+     // The HC16 "BF16-only" marks below let a producer elide its F32 output and have every consumer
+     // re-read a BF16 copy out of the per-graph activation cache.  That contract only holds while the
+@@ -6720,14 +6722,27 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+         if (hc16 >= 1 && ggml_cuda_mmb_active() &&
+                 GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+             auto rootof = [](const ggml_tensor * t) { while (t->view_src) t = t->view_src; return t; };
+-            // every consumer of `root` (through views) must read it via the MMB bf16 activation cache
+-            auto all_bf16_consumers = [&](const ggml_tensor * root) {
+-                for (int i = 0; i < cgraph->n_nodes; ++i) {
+-                    const ggml_tensor * t = cgraph->nodes[i];
++            // The marking pass runs per split, but a tensor's consumers may live in another split,
++            // where the per-compute BF16 activation cache (cleared by ggml_cuda_mmb_begin_graph at
++            // the start of every backend compute) is not populated.  Scan the whole scheduled graph
++            // and treat any consumer outside this split as a non-BF16 consumer.
++            const ggml_cgraph * full = (params && params->full_graph) ? params->full_graph : cgraph;
++            const ptrdiff_t split_off = (full->nodes && cgraph->nodes) ? (cgraph->nodes - full->nodes) : 0;
++            const ptrdiff_t split_end = split_off + cgraph->n_nodes;
++            // classify the consumers of `root` (through views), looking at the whole graph:
++            //  0 = no consumer at all, 1 = every consumer is an in-split BF16 reader, 2 = otherwise
++            // (a non-BF16 consumer, or any consumer in another split) -- 2 means the F32 output must
++            // be kept (mark copy), 0 means nothing to do.
++            auto classify_consumers = [&](const ggml_tensor * root) -> int {
++                bool any = false;
++                for (int i = 0; i < full->n_nodes; ++i) {
++                    const ggml_tensor * t = full->nodes[i];
+                     bool uses = false;
+                     for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (rootof(t->src[s]) == root) { uses = true; break; }
+                     if (!uses) continue;
+                     if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE) continue;
++                    any = true;
++                    if (i < split_off || i >= split_end) return 2;   // consumer in another split
+                     if (t->op == GGML_OP_MUL_MAT && t->src[1] && rootof(t->src[1]) == root && t->src[0] &&
+                             ggml_cuda_mmb_reads_bf16_act(t->src[0], t->src[1], t)) continue;
+                     if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] && rootof(t->src[1]) == root &&
+@@ -6741,9 +6756,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                         ggml_cuda_mmb_mark_bf16_slot(root, 4);
+                         continue;
+                     }
+-                    return false;
++                    return 2;
+                 }
+-                return true;
++                return any ? 1 : 0;
+             };
+             for (int i = 0; i < cgraph->n_nodes; ++i) {
+                 const ggml_tensor * t = cgraph->nodes[i];
+@@ -6751,10 +6766,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                 if (t->src[0]->type == GGML_TYPE_F32) continue;
+                 if (!ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
+                 const ggml_tensor * ar = rootof(t->src[1]);
+-                // single-consumer (bf16-cache GEMM only) -> the F32 output is dead: emit BF16 only.
+-                // otherwise keep the F32 output and add the BF16 copy for the GEMMs that want it.
+-                if (all_bf16_consumers(ar) && elide_f32) ggml_cuda_mmb_mark_bf16_only(ar);
+-                else                                  ggml_cuda_mmb_mark_bf16_copy(ar);
++                // every consumer in this split reading through the BF16 cache (and none elsewhere)
++                // -> the F32 output is dead: emit BF16 only.  otherwise keep the F32 output and add
++                // the BF16 copy for the GEMMs that want it (a tensor with no in-split consumer at
++                // all is left alone).
++                const int c = classify_consumers(ar);
++                if (c == 1 && elide_f32) ggml_cuda_mmb_mark_bf16_only(ar);
++                else if (c != 0)         ggml_cuda_mmb_mark_bf16_copy(ar);
+             }
+         }
+     }
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 6e1afdf5d..a2fa52fcb 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -1424,20 +1424,44 @@ __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t *
+ }
+ 
+ struct mmb_cache_entry { const ggml_tensor * root; const void * data; size_t n; ggml_cuda_pool_alloc<uint16_t> * buf; };
+-static std::vector<mmb_cache_entry> g_mmb_cache;
+ // Pinned producer slots (pinned until the next producer of the same slot): 0 = generic MMB-GEMM
+ // activation copies, 1 = HC gate, 2 = GLU, 3 = routed MoE output, 4 = HC normalized stream xn.
+ // Slot 4 exists because xn is the one activation with *delayed* consumers (dsv4_hc_pre src[0] and
+ // the tiny-M inject GEMMs), so its copy cannot share the aggressively-reused generic slot 0 -- and
+ // dsv4_hc_pre itself reads x from the slot while writing its own output to slot 0.
+ static constexpr int MMB_SLOT_COUNT = 5;
+-static mmb_cache_entry g_mmb_slots[MMB_SLOT_COUNT] = {{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr}};
+-static std::unordered_set<const ggml_tensor *> g_mmb_bf16_only;
+-// "also emit a BF16 copy" mark: the F32 output stays valid; producers that can emit a BF16 side copy
+-// write it into slot 0 and the MMB activation conversion finds and skips it.
+-static std::unordered_set<const ggml_tensor *> g_mmb_bf16_copy;
+-// BF16-only tensors that must not use the generic slot 0 (their copy has to outlive other producers).
+-static std::unordered_map<const ggml_tensor *, int> g_mmb_bf16_slot;
++// All state the MMB BF16-activation machinery needs for one backend context: the per-graph activation
++// cache, the pinned producer slots, the BF16-only/copy marks and their lifetime.  It is per context
++// because two llama_contexts (the MTP target and its draft head, say) interleave their
++// optimise/compute calls; sharing the cache or the marks across them let one context free the
++// other's activation buffers mid-compute or see its marks.  The op implementations run synchronously
++// inside a backend compute, so a single "active context" pointer set by
++// ggml_backend_cuda_graph_optimize / _graph_compute selects the right state without threading ctx
++// through every call site.
++struct mmb_ctx_state {
++    std::vector<mmb_cache_entry> cache;
++    mmb_cache_entry slots[MMB_SLOT_COUNT] = {};
++    size_t slot_cap[MMB_SLOT_COUNT] = {0, 0, 0, 0, 0};
++    std::unordered_set<const ggml_tensor *> bf16_only;
++    // "also emit a BF16 copy" mark: the F32 output stays valid; producers that can emit a BF16 side
++    // copy write it into slot 0 and the MMB activation conversion finds and skips it.
++    std::unordered_set<const ggml_tensor *> bf16_copy;
++    // BF16-only tensors that must not use the generic slot 0 (their copy has to outlive other producers).
++    std::unordered_map<const ggml_tensor *, int> bf16_slot;
++    // Mark lifetime: set after every backend compute, so the next optimize pass for this context
++    // clears and rebuilds the marks.  `first_split` is the first node of the graph whose marks are
++    // current, so re-optimizing the same graph (without an intervening compute, e.g. reserve then
++    // alloc) clears as well.
++    bool after_compute = true;
++    const void * first_split = nullptr;
++};
++static std::unordered_map<const ggml_backend_cuda_context *, mmb_ctx_state> g_mmb_state;
++static const ggml_backend_cuda_context * g_mmb_active_ctx = nullptr;
++static mmb_ctx_state & mmb_state() {
++    static mmb_ctx_state empty;
++    if (g_mmb_active_ctx == nullptr) { return empty; }
++    return g_mmb_state[g_mmb_active_ctx];
++}
+ 
+ // ---------------------------------------------------------------------------------------------
+ // Per-arch tuning defaults (S11 of wip/mmb-general/gfx1201-porting.md, §7 point 3).
+@@ -1559,15 +1583,16 @@ static void mmb_cfg_dump_once() {
+ static size_t mmb_cache_max() { static const int v = getenv("GGML_CUDA_MMB_CACHE") ? atoi(getenv("GGML_CUDA_MMB_CACHE")) : mmb_cfg().cache_max; return (size_t) v; }
+ static const ggml_tensor * mmb_root(const ggml_tensor * t) { return t->view_src ? t->view_src : t; }
+ static uint16_t * mmb_cache_insert(ggml_backend_cuda_context & ctx, const ggml_tensor * t, const size_t n) {
+-    if (g_mmb_cache.size() >= mmb_cache_max()) { delete g_mmb_cache.front().buf; g_mmb_cache.erase(g_mmb_cache.begin()); }
++    std::vector<mmb_cache_entry> & cache = mmb_state().cache;
++    if (cache.size() >= mmb_cache_max()) { delete cache.front().buf; cache.erase(cache.begin()); }
+     auto * buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n);
+-    g_mmb_cache.push_back({mmb_root(t), t->data, n, buf});
++    cache.push_back({mmb_root(t), t->data, n, buf});
+     return buf->get();
+ }
+ static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, cudaStream_t stream) {
+     const ggml_tensor * root = mmb_root(src1);
+-    for (auto & e : g_mmb_slots) if (e.buf && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+-    for (auto & e : g_mmb_cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
++    for (auto & e : mmb_state().slots) if (e.buf && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
++    for (auto & e : mmb_state().cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+     uint16_t * buf = mmb_cache_insert(ctx, src1, n);
+     { static const int lg = getenv("LLAMA_MMB_CVT_LOG") ? atoi(getenv("LLAMA_MMB_CVT_LOG")) : 0; static unsigned cnt = 0;
+       if (lg && (int) cnt++ < (lg > 1 ? lg : 200)) fprintf(stderr, "MMB_CVT %s op=%s ne=[%lld,%lld,%lld,%lld] view_src=%s src0=%s(%s) n=%zu data=%p root=%p\n", src1->name, ggml_op_name(src1->op), (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3], src1->view_src ? src1->view_src->name : "-", src1->src[0] ? src1->src[0]->name : "-", src1->src[0] ? ggml_op_name(src1->src[0]->op) : "-", n, src1->data, (const void *) root); }
+@@ -1885,31 +1910,48 @@ static bool mmb_wtype_ok_glu(const ggml_type t) { return mmb_wtype_ok(t) && (t !
+ 
+ const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t) {
+     const ggml_tensor * root = mmb_root(t);
+-    for (auto & e : g_mmb_slots) if (e.buf && e.root == root && e.data == t->data) return e.buf->get();
+-    for (auto & e : g_mmb_cache) if (e.root == root && e.data == t->data) return e.buf->get();
++    for (auto & e : mmb_state().slots) if (e.buf && e.root == root && e.data == t->data) return e.buf->get();
++    for (auto & e : mmb_state().cache) if (e.root == root && e.data == t->data) return e.buf->get();
+     return nullptr;
+ }
+-static size_t g_mmb_slot_cap[MMB_SLOT_COUNT] = {0, 0, 0, 0, 0};
+ uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot, const ggml_tensor * t, size_t n) {
+-    mmb_cache_entry & e = g_mmb_slots[slot];
+-    if (e.buf && g_mmb_slot_cap[slot] < n) { delete e.buf; e.buf = nullptr; }
+-    if (!e.buf) { e.buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n); g_mmb_slot_cap[slot] = n; }
++    mmb_cache_entry & e = mmb_state().slots[slot];
++    size_t & cap = mmb_state().slot_cap[slot];
++    if (e.buf && cap < n) { delete e.buf; e.buf = nullptr; }
++    if (!e.buf) { e.buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n); cap = n; }
+     e.root = mmb_root(t); e.data = t->data; e.n = n;
+     return e.buf->get();
+ }
+-void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); g_mmb_bf16_copy.clear(); g_mmb_bf16_slot.clear(); }
+-size_t ggml_cuda_mmb_marks_count() { return g_mmb_bf16_only.size(); }
++void ggml_cuda_mmb_set_active_ctx(const ggml_backend_cuda_context * ctx) { g_mmb_active_ctx = ctx; }
++// returns true (and clears the marks) when the active context starts a new graph's optimize pass.
++bool ggml_cuda_mmb_optimize_begin(const void * graph_key) {
++    mmb_ctx_state & m = mmb_state();
++    const bool clear = m.after_compute || m.first_split == nullptr || graph_key == m.first_split;
++    if (clear) {
++        m.bf16_only.clear(); m.bf16_copy.clear(); m.bf16_slot.clear();
++        m.first_split = graph_key; m.after_compute = false;
++    }
++    return clear;
++}
++void ggml_cuda_mmb_compute_done() {
++    mmb_state().after_compute = true;
++}
++void ggml_cuda_mmb_marks_clear() {
++    mmb_ctx_state & m = mmb_state();
++    m.bf16_only.clear(); m.bf16_copy.clear(); m.bf16_slot.clear();
++}
++size_t ggml_cuda_mmb_marks_count() { return mmb_state().bf16_only.size(); }
+ void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) {
+     static const int lg = getenv("GGML_CUDA_MMB_MARK_LOG") ? atoi(getenv("GGML_CUDA_MMB_MARK_LOG")) : 0;
+     if (lg) fprintf(stderr, "MMB mark bf16_only: %-40s op=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n", t->name, ggml_op_name(t->op),
+         (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], t->nb[0], t->nb[1], t->nb[2], t->nb[3]);
+-    g_mmb_bf16_only.insert(t);
++    mmb_state().bf16_only.insert(t);
+ }
+-bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return g_mmb_bf16_only.count(t) > 0; }
+-void ggml_cuda_mmb_mark_bf16_copy(const ggml_tensor * t) { g_mmb_bf16_copy.insert(t); }
+-bool ggml_cuda_mmb_wants_bf16_copy(const ggml_tensor * t) { return g_mmb_bf16_copy.count(t) > 0; }
+-void ggml_cuda_mmb_mark_bf16_slot(const ggml_tensor * t, int slot) { g_mmb_bf16_slot[t] = slot; }
+-int  ggml_cuda_mmb_bf16_slot(const ggml_tensor * t) { auto it = g_mmb_bf16_slot.find(t); return it == g_mmb_bf16_slot.end() ? -1 : it->second; }
++bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return mmb_state().bf16_only.count(t) > 0; }
++void ggml_cuda_mmb_mark_bf16_copy(const ggml_tensor * t) { mmb_state().bf16_copy.insert(t); }
++bool ggml_cuda_mmb_wants_bf16_copy(const ggml_tensor * t) { return mmb_state().bf16_copy.count(t) > 0; }
++void ggml_cuda_mmb_mark_bf16_slot(const ggml_tensor * t, int slot) { mmb_state().bf16_slot[t] = slot; }
++int  ggml_cuda_mmb_bf16_slot(const ggml_tensor * t) { auto & m = mmb_state(); auto it = m.bf16_slot.find(t); return it == m.bf16_slot.end() ? -1 : it->second; }
+ // Producer-side reserve for a BF16 copy: honours the graph-assigned dedicated slot (xn) so the copy
+ // is not clobbered by the next generic producer, falling back to slot 0.
+ uint16_t * ggml_cuda_mmb_reserve_auto(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
+@@ -1917,10 +1959,23 @@ uint16_t * ggml_cuda_mmb_reserve_auto(ggml_backend_cuda_context & ctx, const ggm
+     return ggml_cuda_mmb_slot_reserve(ctx, slot >= 0 && slot < MMB_SLOT_COUNT ? slot : 0, t, n);
+ }
+ 
+-void ggml_cuda_mmb_begin_graph() { for (auto & e : g_mmb_cache) delete e.buf; g_mmb_cache.clear(); for (auto & e : g_mmb_slots) { e.root = nullptr; e.data = nullptr; e.n = 0; } }
++void ggml_cuda_mmb_begin_graph() {
++    mmb_ctx_state & s = mmb_state();
++    for (auto & e : s.cache) delete e.buf;
++    s.cache.clear();
++    for (auto & e : s.slots) { e.root = nullptr; e.data = nullptr; e.n = 0; }
++}
+ void ggml_cuda_mmb_release_all() {
+     ggml_cuda_mmb_begin_graph();
+-    for (int i = 0; i < MMB_SLOT_COUNT; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; }
++    // free every context's cache/slots, including any that is not the active one
++    for (auto & kv : g_mmb_state) {
++        mmb_ctx_state & s = kv.second;
++        for (auto & e : s.cache) delete e.buf;
++        s.cache.clear();
++        for (int i = 0; i < MMB_SLOT_COUNT; ++i) { if (s.slots[i].buf) delete s.slots[i].buf; s.slots[i].buf = nullptr; s.slot_cap[i] = 0; }
++    }
++    g_mmb_state.clear();
++    g_mmb_active_ctx = nullptr;
+     // the shadow weights are raw cudaMalloc, keyed by data pointer and held for the life of the
+     // process. A model has finitely many weights so this never mattered, but a long-lived process
+     // that sees many distinct tensors (test-backend-ops) keeps every one of them.
+diff --git a/ggml/src/ggml-cuda/mmb.cuh b/ggml/src/ggml-cuda/mmb.cuh
+index 8d9c14539..d4dd67707 100644
+--- a/ggml/src/ggml-cuda/mmb.cuh
++++ b/ggml/src/ggml-cuda/mmb.cuh
+@@ -20,6 +20,13 @@ uint16_t * ggml_cuda_mmb_reserve_auto(ggml_backend_cuda_context & ctx, const ggm
+ void ggml_cuda_mmb_mark_bf16_slot(const ggml_tensor * t, int slot);
+ int  ggml_cuda_mmb_bf16_slot(const ggml_tensor * t);
+ void ggml_cuda_mmb_marks_clear();
++// select the mark set used by the mark/lookup helpers below (per backend context; set at the start
++// of ggml_backend_cuda_graph_optimize and _graph_compute before any op runs)
++void ggml_cuda_mmb_set_active_ctx(const ggml_backend_cuda_context * ctx);
++// per-context mark lifecycle: call optimize_begin(key) at the start of graph_optimize (it clears the
++// marks when a new graph starts) and compute_done() at the end of graph_compute
++bool ggml_cuda_mmb_optimize_begin(const void * graph_key);
++void ggml_cuda_mmb_compute_done();
+ size_t ggml_cuda_mmb_marks_count();
+ void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t);
+ bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t);
+-- 
+2.55.0
+

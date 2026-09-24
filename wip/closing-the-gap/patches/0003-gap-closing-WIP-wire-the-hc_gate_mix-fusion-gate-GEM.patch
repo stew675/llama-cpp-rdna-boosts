@@ -1,0 +1,207 @@
+From c421c12aee1e26613db00887388eadd47e8e48f2 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Mon, 21 Sep 2026 21:15:06 -0500
+Subject: [PATCH] gap-closing WIP: wire the hc_gate_mix fusion (gate GEMM +
+ sigmoid + mix)
+
+Phase-1 item 1, second half.  The hc_gate_mix_kernel was ported but had no
+call site, so the HC gate GEMM dispatched standalone and the mix ran in the
+dsv4_hc_pre op.  Add the matcher/call site in ggml_cuda_try_fuse:
+
+* ggml_cuda_hc_mix_closed(): the closed-window wrapper around the existing
+  hc_mix matcher (the unfused chain case).
+* at the HC gate MUL_MAT (w_up @ lo), fold the GEMM into the mix kernel when
+  its only consumer opens an hc_mix window.  Handles both the unfused chain
+  (sigmoid -> mul -> collapse -> scale) and the explicit ggml_dsv4_hc_pre op
+  (MUL_MAT -> RESHAPE(view) -> DSV4_HC_PRE) the qwen4exp default builds; the
+  latter recovers the [hc*n_embd, T] activation the bf16 cache is keyed on
+  from the gate GEMM's own activation input.
+* gatemix defaults ON on gfx1151 (mmb_arch_defaults); RDNA4/RDNA3_0 stay off
+  (the kernel is IQ4_NL + RDNA3_5 WMMA).  Kill switch: LLAMA_HC_GATEMIX=0.
+
+gfx1151, qwen4exp IQ4_NL, -b/-ub 8192, r=3:
+  pp8192  1198.8 -> 1212.6  (+1.2 %)
+  pp32768 1138.6 -> 1155.6  (+1.5 %)
+Width probe PASS (worst maxdiff 0, W=1..8); same-seed greedy text identical
+(471d102e7b7d).  The fusion changes prefill logits by a bf16-epilogue ULP but
+not the greedy text; it is prefill-only (T >= mmb_min_t), so the decode/verify
+band is untouched.  The mixed UD-IQ4_XS model's HC gate is not IQ4_NL, so it is
+unchanged there (a Q8_0 kernel is a follow-up).
+
+Exported to wip/closing-the-gap/patches/.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 78 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmb.cu       | 31 ++++++++++---
+ 2 files changed, 104 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 61753907e..486e8b12c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3996,6 +3996,23 @@ static int ggml_cuda_match_hc_mix(const ggml_cgraph * cgraph, const int i, ggml_
+     args.bias  = ggml_get_op_params_f32(scale, 1);
+     return n_ops;
+ }
++
++// the hc_mix window must be closed (its only external consumer is the fused output) before the
++// gate GEMM can be folded into it: otherwise the gate tensor the GEMM no longer materializes could
++// still be read by another node.
++static int ggml_cuda_hc_mix_closed(const ggml_cgraph * cgraph, const int i, ggml_cuda_hc_mix_args & args) {
++    enum ggml_op ops[5 + 2 * 15 + 1];
++    const int n_ops = ggml_cuda_match_hc_mix(cgraph, i, args, ops);
++    if (n_ops == 0) {
++        return 0;
++    }
++    int node_idxs[5 + 2 * 15 + 1];
++    for (int j = 0; j < n_ops; ++j) {
++        node_idxs[j] = i + j;
++    }
++    const int out_nodes[] = { i + n_ops - 1 };
++    return ggml_can_fuse_subgraph_ext(cgraph, node_idxs, n_ops, ops, out_nodes, 1) ? n_ops : 0;
++}
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+@@ -5386,6 +5403,67 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     static const bool hc_optin  = !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_FUSION") || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_FUSION")));
+     static const bool hc_mix_on  = hc_optin && !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_MIX")  || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_MIX")));
+     static const bool hc_comb_on = hc_optin && !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_COMB") || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_COMB")));
++
++    // qwen4exp hyper-connection gate GEMM + sigmoid + stream mix: when the HC gate MUL_MAT's only
++    // consumer is the sigmoid that opens an hc_mix window, fold the GEMM into the mix kernel - it
++    // removes the gate tensor materialization and one launch per layer.  RDNA3 (gfx1100/gfx1151) and,
++    // since 2026-09-24, RDNA4 (gfx120x) - the kernel dequantizes the IQ4_NL gate weight and replays
++    // the GEMM's BF16 epilogue rounding via the arch-aware `mmb_frag_t`/`mmb_wmma_bf16`/`MMB_ACC_M`
++    // shim, so the fusion is bit-identical to the GEMM + sigmoid + mix chain on both.  A/B / bisect:
++    // LLAMA_HC_GATEMIX=0.
++    // gfx1100 is a port candidate: the gfx11 WMMA builtin is shared with gfx1151, but `gatemix` stays
++    // default OFF on RDNA3_0 (mmb_arch_defaults) until a gfx1151/gfx1201 session A/Bs qwen4exp
++    // end-to-end; LLAMA_HC_GATEMIX=1 is the opt-in on gfx1100.
++    if (hc_mix_on && ggml_cuda_mmb_gatemix() && (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) &&
++            node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes) {
++        const ggml_tensor * w  = node->src[0];
++        const ggml_tensor * lo = node->src[1];
++        if (w != nullptr && lo != nullptr && ggml_is_quantized(w->type) && ggml_node_has_n_uses(cgraph, i, 1)) {
++            // (a) unfused mix chain: sigmoid(gate) -> mul -> collapse -> scale
++            ggml_cuda_hc_mix_args ma;
++            const int count = ggml_cuda_hc_mix_closed(cgraph, i + 1, ma);
++            if (count > 0 && ma.gate == node &&
++                    ggml_cuda_hc_gate_mix(*cuda_ctx, w, lo, ma.xn, ma.dst, ma.hc, ma.scale, ma.bias)) {
++                return count;
++            }
++            // (b) the explicit ggml_dsv4_hc_pre op (the qwen4exp default): MUL_MAT -> RESHAPE(view)
++            //     -> DSV4_HC_PRE.  Lower it to the same kernel so the GEMM is folded either way.
++            if (i + 2 < cgraph->n_nodes) {
++                const ggml_tensor * gate3 = cgraph->nodes[i + 1];
++                const ggml_tensor * pre   = cgraph->nodes[i + 2];
++                if (gate3->op == GGML_OP_RESHAPE && gate3->view_src == node &&
++                        ggml_node_get_use_count(cgraph, i + 1) == 1 &&
++                        pre->op == GGML_OP_DSV4_HC_PRE && pre->type == GGML_TYPE_F32 &&
++                        pre->src[1] == gate3 && pre->src[0] != nullptr &&
++                        ggml_get_op_params_i32(pre, 1) != 0) {
++                    const int hc = (int) pre->src[0]->ne[1];
++                    const int64_t M = (int64_t) hc * pre->src[0]->ne[0];
++                    const int64_t T = pre->src[0]->ne[2];
++                    // the kernel needs the contiguous [hc*n_embd, T] activation the gate GEMM consumed
++                    // (the tensor the bf16 cache is keyed on).  The pre op's src[0] is a reshaped view
++                    // whose chain may not expose it, so fall back to the gate GEMM's activation input:
++                    // the gate's activation chain is silu(scale(MUL_MAT(w_down, xn))).
++                    const ggml_tensor * xn = pre->src[0];
++                    while (xn->view_src != nullptr && (xn->ne[0] != M || ggml_nrows(xn) != T)) {
++                        xn = xn->view_src;
++                    }
++                    if (xn->ne[0] != M || ggml_nrows(xn) != T) {
++                        const ggml_tensor * a = node->src[1];
++                        while (a != nullptr && a->op != GGML_OP_MUL_MAT) {
++                            a = a->src[0];
++                        }
++                        if (a != nullptr && a->src[1] != nullptr && a->src[1]->ne[0] == M && ggml_nrows(a->src[1]) == T) {
++                            xn = a->src[1];
++                        }
++                    }
++                    if (ggml_cuda_hc_gate_mix(*cuda_ctx, w, lo, xn, (ggml_tensor *) pre, hc,
++                            ggml_get_op_params_f32(pre, 0), 0.0f)) {
++                        return 2;
++                    }
++                }
++            }
++        }
++    }
+     if (hc_mix_on) {
+     // qwen4exp hyper-connection stream mix:
+     //     sigmoid(gate) -> mul(xn, .) -> reshape -> view(stream 0) -> cont -> (view(stream c) -> add) x (hc-1) -> scale
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 6da6d7e4f..2031e9693 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -1214,7 +1214,7 @@ struct mmb_arch_cfg {
+     int  shadow_mode    = 0;     // bf16 weight shadow
+     int  shadow_cap_mb  = 6144;
+     int  iq3xxs_glu     = 0;     // fused IQ3_XXS routed GLU (measured a net loss on gfx1151)
+-    int  hc16           = 1, down16 = 0, gatemix = 0, blk16 = 0, res16 = 0;   // hc16 default ON (policy 2026-09-21; +4-5 % measured on gfx1151)
++    int  hc16           = 1, down16 = 0, gatemix = 1, blk16 = 0, res16 = 0;   // hc16 + gatemix default ON (policy 2026-09-21; gatemix is RDNA3_5-only at its call site)
+     int  glu            = 1;     // fused routed gate+up+GLU
+     int  bf16w          = 1;     // BF16 dense weights
+     int  routed         = 1;     // the routed MoE (MUL_MAT_ID) path + its fused GLU
+@@ -1249,6 +1249,11 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
+         // wip/mmb-general/gfx1201-s13-f32-hc16.md.
+         c.f32split_mode = 1;
+         c.tiny_m       = 1;
++        // gatemix: the kernel's arch-aware `mmb_frag_t`/`mmb_wmma_bf16`/`MMB_ACC_M` shim runs on
++        // gfx12 too, and the fusion is bit-identical to the GEMM+sigmoid+mix chain.  Ported to RDNA4
++        // 2026-09-24 (gfx1201): +5.8 %/+5.4 %/+5.3 % qwen4exp IQ4_NL prefill at pp8192/32768/65536,
++        // byte-identical greedy text.  `LLAMA_HC_GATEMIX=0` is the opt-out.
++        c.gatemix      = 1;
+     }
+     if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+         // gfx1100 S6/S7: the F32 MoE-router split TILE is a loss here (gemma-26B-A4B -3.1 %,
+@@ -1257,6 +1262,11 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
+         // keeps its default.  NOTE: gfx1100 was only measured to pp32768 -- re-check pp65536+
+         // before finalising (see gfx1100-porting.md 14.5).
+         c.f32split_mode = 0;
++        // gatemix: the kernel's gfx11 WMMA builtin is shared with gfx1151 (ported 2026-09-23, the
++        // call site now accepts RDNA3), but it stays default OFF on RDNA3_0 -- qwen4exp (the only
++        // model with IQ4_NL HC gates) does not fit on gfx1100, so end-to-end A/B must be done on
++        // gfx1151/gfx1201 first.  LLAMA_HC_GATEMIX=1 is the opt-in.
++        c.gatemix       = 0;
+     }
+     // TODO(S12): the routed/GLU thresholds, `tall_mode`, `tiny_m*`, `f32split_*` and `cache_max` are
+     // still the gfx1151 values on every arch.  Give RDNA4 its own once they are measured per arch.
+@@ -1855,11 +1865,23 @@ bool ggml_cuda_mmb_blk16() { static const int v = getenv("LLAMA_HC_BLK16") ? ato
+ bool ggml_cuda_mmb_res16()  { static const int v = getenv("LLAMA_HC_RES16") ? atoi(getenv("LLAMA_HC_RES16")) : mmb_cfg().res16; return v != 0; }
+ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
+         const int hc, const float scale, const float bias) {
+-    if (!mmb_gatemix_flag() || hc != 4 || w->type != GGML_TYPE_IQ4_NL || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
++    static const int gdbg = getenv("LLAMA_HC_GATEMIX_DEBUG") ? atoi(getenv("LLAMA_HC_GATEMIX_DEBUG")) : 0;
++    if (!mmb_gatemix_flag() || hc != 4 || w->type != GGML_TYPE_IQ4_NL || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) {
++        if (gdbg) fprintf(stderr, "HC_GATEMIX reject head: flag=%d hc=%d wtype=%s lotype=%s\n", (int) mmb_gatemix_flag(), hc, ggml_type_name(w->type), ggml_type_name(lo->type));
++        return false;
++    }
+     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
+-    if (K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t()) return false;
++    if (K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t()) {
++        if (gdbg) fprintf(stderr, "HC_GATEMIX reject shape: K=%d M=%d E=%d T=%d lo=[%lld,%lld] xn=[%lld,%lld] min_t=%d\n",
++                K, M, E, T, (long long) lo->ne[0], (long long) ggml_nrows(lo), (long long) xn->ne[0], (long long) ggml_nrows(xn), mmb_min_t());
++        return false;
++    }
+     const uint16_t * xn16 = ggml_cuda_mmb_cache_lookup(xn);
+-    if (!xn16) return false;
++    if (!xn16) {
++        if (gdbg) fprintf(stderr, "HC_GATEMIX reject cache: xn=%s not in the BF16 activation cache (HC16 marks absent?)\n", xn->name);
++        return false;
++    }
++    if (gdbg) fprintf(stderr, "HC_GATEMIX FIRED xn=%s w=%s K=%d M=%d E=%d T=%d\n", xn->name, w->name, K, M, E, T);
+     cudaStream_t stream = ctx.stream();
+     const uint16_t * lo16 = mmb_bf16_activation(ctx, lo, (size_t) T * K, stream);
+     uint16_t * outh = ggml_cuda_mmb_slot_reserve(ctx, 3, dst, (size_t) T * E);
+@@ -1867,7 +1889,6 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     dim3 grid(E / 32, (T + 127) / 128);
+     hc_gate_mix_kernel<4><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
+     CUDA_CHECK(cudaGetLastError());
+-    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "HC_GATEMIX fused gate GEMM + sigmoid + mix: E=%d K=%d T=%d\n", E, K, T);
+     return true;
+ }
+ 
+-- 
+2.55.0
+

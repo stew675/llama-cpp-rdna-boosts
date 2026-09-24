@@ -1,7 +1,7 @@
-From 7c2ba2822b6625854a577990dfd3b22640870958 Mon Sep 17 00:00:00 2001
+From d5598a5eedd9814904efa7c8290eff86f96c4e50 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sun, 20 Sep 2026 21:01:26 -0500
-Subject: [PATCH 03/12] WIP: the F32/tiny-M kernels, the default flips, and the
+Subject: [PATCH 03/28] WIP: the F32/tiny-M kernels, the default flips, and the
  W=1..8 width-purity probe
 
 Squashed theme commit (5 originals): F32 dense weights off by default + the
@@ -200,10 +200,10 @@ index 792ed5e0f..dd366ce15 100644
          static const bool two = getenv("LLAMA_MMB_F32SPLIT") && atoi(getenv("LLAMA_MMB_F32SPLIT")) >= 2;
          if (two) mmb_f32split_kernel<128, 128, 32, 64, true ><<<grid, MMB_NT, 0, stream>>>((const float *) src0->data, (const float *) src1->data, (float *) dst->data, M, K, T);
 diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
-index d61eac7ed..2e57cfc94 100644
+index 5adf84e66..aed6b7f57 100644
 --- a/src/models/qwen4exp.cpp
 +++ b/src/models/qwen4exp.cpp
-@@ -1798,9 +1798,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -1800,9 +1800,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
          const int64_t r     = hparams.dsv4_compress_ratios[il];
          const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
          const int64_t width = (int64_t) hparams.indexer_top_k + r - 1;
@@ -231,7 +231,7 @@ index d61eac7ed..2e57cfc94 100644
          // cause. Root-caused 2026-09-08/09: llama-bench's sync-free decode pipeline x ggml-gallocr's
          // single-layout alloc-fallback doing an unconditional full-device sync on every dense/sparse
          // topology flip (record: benchmarks/2026-09-10-*-shortcut-fix.md).  NOTE (2026-09-06): the
-@@ -1808,14 +1823,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+@@ -1810,14 +1825,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
          // must grow) was UNSAFE across backends and has been reverted: a re-reserve re-points tensor
          // addresses while the previous ubatch's kernels may still be in flight on other GPUs
          // (cross-GPU race -> in-kernel spin / memory faults at multi-ubatch prefill, reproduced on

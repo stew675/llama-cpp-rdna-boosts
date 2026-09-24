@@ -1,0 +1,124 @@
+From 76ae2945982093a3d836d8e3bef3b5a9513717a7 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 22 Sep 2026 19:07:42 -0500
+Subject: [PATCH] gap-closing WIP: keep the F32 activations when an eval
+ callback splits the graph
+
+The MMB HC16 marking elides a producer's F32 output when every consumer reads
+the BF16 activation cache for the whole scheduled graph.  The cache is reset by
+ggml_cuda_mmb_begin_graph() at the start of EVERY backend compute, so with an
+eval callback (llama-imatrix, common/debug) the scheduler runs each MUL_MAT as
+its own sub-graph and the cache no longer spans the producer and the GEMM: the
+GEMM re-converts the never-written F32 buffer and reads garbage.  imatrix then
+reports 'non-finite values detected in blk.21.attn_output.weight' and a 19M PPL.
+
+Plumb the eval-callback fact to the backends via
+ggml_backend_graph_optimize_params.has_eval_callback (set by the scheduler) and
+stand the F32-elision down in the CUDA HC16/DOWN16/blk16/res16 marking when it
+is set; the bf16 'wants a copy' hint is kept, so the GEMM still reads BF16.
+Serving has no eval callback, so elide_f32 stays true and the F32-skip path is
+untouched.
+---
+ ggml/src/ggml-backend-impl.h    |  4 ++++
+ ggml/src/ggml-backend.cpp       |  1 +
+ ggml/src/ggml-cuda/ggml-cuda.cu | 22 ++++++++++++++++------
+ 3 files changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index ef05905cf..448054401 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -116,6 +116,10 @@ extern "C" {
+         // can be called multiple times for the same tensor: the longest lifetime applies
+         void (*add_alloc_dep)(void * user_data, struct ggml_tensor * tensor, struct ggml_tensor * until);
+         void * user_data;
++        // the scheduler will run the graph in sub-graphs split at every eval-callback node, so a
++        // backend optimisation that relies on state living for one whole compute (e.g. eliding a
++        // producer's F32 output and re-reading it from a per-graph cache) must stand down
++        bool has_eval_callback;
+     };
+ 
+     struct ggml_backend_i {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index a398c3063..abca08e3d 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1462,6 +1462,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+             }
+         },
+         /* .user_data     = */ &alloc_deps,
++        /* .has_eval_callback = */ sched->callback_eval != nullptr,
+     };
+ 
+     for (int i = 0; i < sched->n_splits; i++) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7403140ff..f8f109e69 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6655,6 +6655,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+         }
+     }
+ 
++    // The HC16 "BF16-only" marks below let a producer elide its F32 output and have every consumer
++    // re-read a BF16 copy out of the per-graph activation cache.  That contract only holds while the
++    // whole graph runs as one backend compute: ggml_cuda_mmb_begin_graph() resets the cache at the
++    // start of EVERY compute, so with an eval callback (llama-imatrix, common/debug) the scheduler
++    // runs each MUL_MAT as its own sub-graph and the cache is cleared between the producer and the
++    // GEMM -- which then re-converts the never-written F32 buffer and reads garbage (imatrix:
++    // "non-finite values detected in blk.N.*.weight").  Keep the F32 outputs (downgrade to the
++    // "wants a BF16 copy" mark) whenever the scheduler will split at callback nodes.
++    const bool elide_f32 = params == nullptr || !params->has_eval_callback;
++
+     // MMB HC16 (step 1 of the bf16-producer port): mark the gate producer of a gated DSV4_HC_PRE as
+     // BF16-only when MMB will produce it and every consumer reads the BF16 copy.  The gate is a
+     // dense MUL_MAT [320 x 10240] whose only consumer is the fused pre op, so this is the contained
+@@ -6690,7 +6700,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                     if (t == pre) continue;
+                     ok = false;
+                 }
+-                if (ok && nread > 0) {
++                if (ok && nread > 0 && elide_f32) {
+                     ggml_cuda_mmb_mark_bf16_only(gr);
+                     static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_HC16 gate marked BF16-only: %s (M=%d K=%d T=%d)\n",
+                             gr->name, (int) gr->ne[1], (int) gr->ne[0], (int) (gr->ne[2] * gr->ne[3]));
+@@ -6743,8 +6753,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                 const ggml_tensor * ar = rootof(t->src[1]);
+                 // single-consumer (bf16-cache GEMM only) -> the F32 output is dead: emit BF16 only.
+                 // otherwise keep the F32 output and add the BF16 copy for the GEMMs that want it.
+-                if (all_bf16_consumers(ar)) ggml_cuda_mmb_mark_bf16_only(ar);
+-                else                       ggml_cuda_mmb_mark_bf16_copy(ar);
++                if (all_bf16_consumers(ar) && elide_f32) ggml_cuda_mmb_mark_bf16_only(ar);
++                else                                  ggml_cuda_mmb_mark_bf16_copy(ar);
+             }
+         }
+     }
+@@ -6779,7 +6789,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+             if (ex->ne[0] % 8 != 0 || ggml_nrows(ex) < 512) {
+                 continue;
+             }
+-            ggml_cuda_mmb_mark_bf16_only(ex);
++            if (elide_f32) ggml_cuda_mmb_mark_bf16_only(ex);
+         }
+     }
+ 
+@@ -6837,7 +6847,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                     if (t->op == GGML_OP_MUL || t->op == GGML_OP_ADD) continue;
+                     ok = false;
+                 }
+-                if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(b);
++                if (ok && nread > 0 && elide_f32) ggml_cuda_mmb_mark_bf16_only(b);
+             }
+         }
+         if (ggml_cuda_mmb_res16()) {   // residual stream: readers are the fused norm and the next combine
+@@ -6864,7 +6874,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                     if (next_combine) continue;
+                     ok = false;
+                 }
+-                if (ok && nread > 0) ggml_cuda_mmb_mark_bf16_only(r);
++                if (ok && nread > 0 && elide_f32) ggml_cuda_mmb_mark_bf16_only(r);
+             }
+             // the in-place residual stream needs the producer/consumer on different buffers
+             for (const ggml_cuda_hc_combine_norm_args & ca : comb) {
+-- 
+2.55.0
+

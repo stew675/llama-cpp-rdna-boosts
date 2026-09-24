@@ -1,0 +1,84 @@
+From afeff09ef1ae07c3fd04137bb2a7b51009469e68 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 22 Sep 2026 23:11:14 -0500
+Subject: [PATCH] gap-closing WIP: default the QSA derived indexer cache ON
+
+The graph side (build_qsa_top_k) has always defaulted idx_cache to ON, but
+the memory layer's derived_enabled defaulted OFF, so the pool was never
+created and the fused decode score re-pooled/rotated/scored the whole raw
+indexer cache every step.  The AGENTS/audit both describe the derived cache
+as default ON, so this restores the documented behaviour.
+
+Measured on gfx1151 qwen4exp IQ4_NL, plain (non-MTP) decode, byte-identical
+text in every pair:
+  80K  f16  24.3 -> 26.5 t/s (+9.1 %)
+  150K f16  20.6 -> 23.6 t/s (+14.6 %)
+  80K  bf16 24.2 -> 26.3 t/s (+8.7 %)
+The pool only engages for F32/BF16/F16 indexer keys, so a quantized indexer
+cache (--cache-type-k q8_0/...) keeps the recompute path unchanged.
+
+With the pool on, the sparse MTP draft decode is at parity or a slight win
+at 80K (30.7-31.5 vs 30.7-30.9 t/s, acceptance 0.812 vs 0.792), so the
+per-step indexer - not the selected-cell attention kernel - was the reason
+the draft looked slower than dense.
+
+GGML_CUDA_QSA_INDEXER_CACHE=0 restores the old path.
+---
+ src/llama-memory-hybrid-idx.cpp | 18 +++++++++++++-----
+ src/llama-memory-hybrid-idx.h   |  3 ++-
+ 2 files changed, 15 insertions(+), 6 deletions(-)
+
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index d85d7e439..e9a82fef9 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -96,9 +96,16 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+             kv_size, n_seq_max, n_pad, n_swa, swa_type,
+             nullptr, filter_idx, nullptr, nullptr, "idx_", /* v_enabled */ !qwen4exp_keys_only_enabled());
+     }()) {
+-    // incremental block-vector cache (env-gated, default OFF; decode waste fix)
++    // incremental block-vector cache (default ON; GGML_CUDA_QSA_INDEXER_CACHE=0 disables)
++    //
++    // The graph side (build_qsa_top_k) has always defaulted its idx_cache to ON, so the pool is the
++    // only piece that was off - and with it off the fused decode score re-pools/rotates/scores the
++    // WHOLE raw indexer cache every step.  Measured on gfx1151 qwen4exp IQ4_NL f16, plain (non-MTP)
++    // decode with the pool ON vs OFF: pp80K **24.3 -> 26.5 t/s (+9.1 %)** and pp150K **20.6 ->
++    // 23.6 t/s (+14.6 %)**, byte-identical text at both (6e1e56284fc9 / 1e871dd70a62).  The pool is
++    // only allocated for the fused decode path (F32/BF16/F16 indexer keys) - see pool_create.
+     const char * env_cache = getenv("GGML_CUDA_QSA_INDEXER_CACHE");
+-    derived_enabled = env_cache != nullptr && std::atoi(env_cache) != 0;
++    derived_enabled = env_cache == nullptr || std::atoi(env_cache) != 0;
+ 
+     if (mem_idx) {
+         pool_create(model, filter_idx);
+@@ -119,9 +126,10 @@ void llama_memory_hybrid_idx::pool_create(
+     // only when that path can actually run:
+     //  - the fused ops read the raw indexer keys natively (F32/BF16/F16 only - quantized
+     //    indexer-key caches, e.g. --cache-type-k q8_0, always take the per-op chain), and
+-    //  - the memory-layer derived cache is engaged (GGML_CUDA_QSA_INDEXER_CACHE=1/2):
+-    //    otherwise qsa_derived_limits emits an empty fill range every step and the pool is
+-    //    never written or read (each decode step would launch an empty fill for nothing).
++    //  - the memory-layer derived cache is engaged (GGML_CUDA_QSA_INDEXER_CACHE, default ON;
++    //    =0 restores the raw-cache re-pool).  With it off, qsa_derived_limits emits an empty fill
++    //    range every step and the pool is never written or read (each decode step would launch an
++    //    empty fill for nothing).
+     // Skip the allocation otherwise - get_pool() then returns nullptr and build_qsa_top_k
+     // runs the fused score with no pool (pools the raw cache: the same F32 arithmetic and
+     // byte-identical output, minus the dead buffer) or the per-op chain for quantized keys.
+diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
+index 71aacc6a6..fd9585609 100644
+--- a/src/llama-memory-hybrid-idx.h
++++ b/src/llama-memory-hybrid-idx.h
+@@ -148,7 +148,8 @@ private:
+     // mutable: set_input_qsa (const) advances it on the decode append path
+     mutable std::vector<uint32_t> pool_wm;
+ 
+-    // the derived path is decode-only + env-gated (GGML_CUDA_QSA_INDEXER_CACHE)
++    // the derived path is decode-only; ON by default, GGML_CUDA_QSA_INDEXER_CACHE=0 disables
++    // (the constructor overwrites this from the env)
+     bool derived_enabled = false;
+ 
+     void pool_invalidate_all();
+-- 
+2.55.0
+

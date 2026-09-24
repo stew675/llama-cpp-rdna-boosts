@@ -480,6 +480,7 @@ explicitly requests it.**
 | `patches/` | **the delivery set** (0000-0015: block 00 + blocks 01-15) + apply README |
 | `release.json` | **delivery single source of truth** (fork point, canonical tip/tree, block count, per-artifact sha256) — read by `apply-all.sh`, `validate-set.sh` and CI; regenerate with `scripts/make-release.sh`, never hand-edit the hashes |
 | `scripts/apply-all.sh` | the verified apply flow (`git am` block 00 + blocks 01-15, automatic `git am -3` fallback on a drifted base); on the strict path it asserts the applied tree == `release.json.tree` |
+| `scripts/apply-beta.sh` | base-aware apply of the opt-in `beta/mmb-general` set **on top of** the delivery: if the delivery is already applied it goes straight to the beta patches, else it runs `apply-all.sh` first; applies on a new `mmb-beta` branch with strict `git am` + the beta-tree assertion (`RDNA_BETA_BRANCH`/`RDNA_BETA_TREE` overrides) |
 | `scripts/make-patches.sh` | regenerates the set from the fork (then run `scripts/make-release.sh`) |
 | `scripts/make-release.sh` | regenerates `release.json` (patch hashes + metadata; metadata is inherited unless `--base`/`--tip`/`--tree` are given) |
 | `scripts/validate-set.sh` | cheap delivery gate: checksums + strict apply on a fresh tarball of `release.json.base` + base/applied tree match (runs in `validate.yml`; ~1 min, no Docker) |
@@ -488,7 +489,7 @@ explicitly requests it.**
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `prompts/` | versioned, hash-stable test prompts for the decode/MTP/coherence gates; each prompt's size + token count + **sha256** is recorded in `prompts/README.md`, and a shipped prompt is **never edited in place** (add a new file).  A reported throughput/acceptance/purity result is only valid against the prompt hash it names |
 | `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live/unpromoted work (currently `wip/nwarps/` — the per-M `nwarps` impurity — plus `wip/bf16-native-prefill/`, `wip/q8-prefill-tuning/`, `wip/build-time-regression/` and the other live trees); completed trees are archived under `archive/work/` (see the WIP rule below) |
-| `beta/` | **promoted-from-WIP staging** — currently holds **`beta/mmb-general/`** (the `mmb`/`qsa3`/indexer campaign, promoted 2026-09-21: 12 patches, gfx1151 + gfx1201 + gfx1100, awaiting the gfx1151 re-validation in its `BETA-TESTING.md`).  Previously staged campaigns have been promoted and archived (`archive/work/block-15-campaign-wins/` = block 15, `archive/work/tensor-fit-fix/` = the r12 `--fit` for `-sm tensor` amendment, and the qwen4exp support = block 14).  Each record is the promotion/gate record and `BETA-TESTING.md` the tester checklist - see the WIP rule below |
+| `beta/` | **promoted-from-WIP staging** — currently holds **`beta/mmb-general/`** (the `mmb`/`qsa3`/indexer campaign, promoted 2026-09-21 and **consolidated with the `closing-the-gap` campaign 2026-09-25: 28 patches**, r13-based, gfx1151 + gfx1201 + gfx1100, awaiting the gfx1151 re-validation in its `BETA-TESTING.md`; apply with `scripts/apply-beta.sh`).  Previously staged campaigns have been promoted and archived (`archive/work/block-15-campaign-wins/` = block 15, `archive/work/tensor-fit-fix/` = the r12 `--fit` for `-sm tensor` amendment, and the qwen4exp support = block 14).  Each record is the promotion/gate record and `BETA-TESTING.md` the tester checklist - see the WIP rule below |
 | `upstream/` | **upstream-PR candidates** — self-contained changes that could be filed against unadulterated `ggml-org/llama.cpp` master, each with a `UPSTREAM-PR-*.md` note + `.patch` (see its README for the double-apply caution and the status table) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
 | `archive/work/` | closed experiments, preserved for future re-evaluation (includes the completed `wip/` trees archived 2026-09-12) |
@@ -518,6 +519,30 @@ Consequences, so it is not re-litigated:
   inconsistent set is a crash on whichever backend reaches it (see `GREEDY-PURITY.md` §20 and the
   block-08 notes) — that is correctness, not scope creep.
 * "Not validated on NVIDIA" is an acceptable, documented state — never a blocker for an RDNA win.
+
+## Default-on policy — beneficial features are ON; env vars only disable (2026-09-21)
+
+A feature that improves performance (or correctness) and has passed the relevant QA gates is
+**enabled by default**.  An environment variable for such a feature exists **only to disable it** — for
+A/B testing, bisection or debugging — never to enable it.
+
+**Why:** the maintainer's validation boxes (Strix Halo / gfx1151 in particular) are much slower than
+gfx1201, so a benchmark or gate that silently runs without a beneficial opt-in wastes real wall-clock
+time and reports 2/3-speed numbers as if they were the product.  The worked example is the `mmb`/HC16
+campaign: for an entire session the prefill A/Bs ran with `GGML_CUDA_MMB` unset at ~835 t/s when the
+full set is ~1136 t/s (**+36 %**), and the first `hc_combine_norm` win was left default-off.
+
+**Consequences:**
+
+* When a gate passes, flip the default **in the same change** (or immediately after) and turn the old
+  opt-in into an opt-out (`FEATURE=0`).  Keep reading the env var; just invert the default.
+* A feature that is beneficial but not yet fully gated is a reason to **gate it**, not to keep it
+  default-off.  Default-on with the risk documented, then run the gate.
+* A kill-switch for a *correctness* risk (a bisect knob, a workaround for a known-bad state) is a
+  different thing and may stay default-off — the distinction is “on because it helps” vs “off because
+  it is known-risky”.
+* Before running any benchmark, use the full feature set (once this policy is applied, the defaults are
+  the full set).  If you catch yourself writing `FOO=1 <bench>`, ask why the default is not already `1`.
 
 ## Critical facts (do not re-derive)
 

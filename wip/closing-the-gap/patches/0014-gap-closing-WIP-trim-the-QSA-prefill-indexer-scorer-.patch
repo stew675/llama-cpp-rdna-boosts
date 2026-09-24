@@ -1,0 +1,596 @@
+From 5f3fb616e04bde2ef794332eb72e6229606bfba5 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 22 Sep 2026 12:38:43 -0500
+Subject: [PATCH] gap-closing WIP: trim the QSA prefill indexer scorer to the
+ visible prefix (qsa-score-bounds)
+
+Score the prefill indexer in LLAMA_QSA_SCORE_STRIP-token query strips and, per
+strip, only the complete-block columns fully inside its causal prefix.  Complete
+blocks are enumerated in ascending logical block order (llama-memory-hybrid-idx
+qsa_score_key_limits), so a block's ordinal cannot exceed its logical block
+number and columns past (max_query_pos+1)/ratio are invisible; the +1 keeps the
+incomplete tail block, which the fused top-k carries as cells.
+
+Default strip 1024.  Measured gfx1151 -b/-ub 8192, qwen4exp IQ4_NL, f16 KV:
+pp8192 +0.5 %, pp32768 neutral (3 interleaved rounds; 1024 and 2048 both beat
+off, 512 is too many strips at pp8192 -0.2 %, 256 and 128 are worse).
+
+The fused indexer top-k reads score[cell_blk[c]], so a trimmed score needs the
+cell range clamped to n_blocks*ratio in the CUDA radix path and the CPU oracle
+(the trimmed cells are never read).  With no trim n_blocks*ratio >= n_kv, so the
+clamp is the identity.  The earlier -inf-padded variant (no kernel change) was a
+measured wash.
+
+Bit-identical: width_purity=PASS (worst maxdiff 0) on f16/bf16/q8_0 at
+P=3072/ub=2048, and bounds-on == bounds-off == strip-only logits and same-seed
+greedy text (61cebc1d31a9).
+---
+ ggml/src/ggml-cpu/ops.cpp          |  17 +-
+ ggml/src/ggml-cuda/indexer-topk.cu |  13 +-
+ src/llama-memory-hybrid-idx.cpp    | 111 +++++++++++++
+ src/llama-memory-hybrid-idx.h      |  14 ++
+ src/models/qwen4exp.cpp            | 245 ++++++++++++++++++++++-------
+ 5 files changed, 339 insertions(+), 61 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 4dbf72e6f..cd34a30ed 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12656,6 +12656,7 @@ static void ggml_compute_forward_indexer_topk_impl(
+     const ggml_tensor * q_pos    = dst->src[4];
+     const ggml_tensor * blk_idx  = dst->src[5];
+     const ggml_tensor * blk_tail = dst->src[6];
++    const ggml_tensor * blk_cells = dst->src[7];
+ 
+     GGML_ASSERT(score->type    == GGML_TYPE_F32);
+     GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
+@@ -12669,11 +12670,17 @@ static void ggml_compute_forward_indexer_topk_impl(
+     const int64_t n_stream = score->ne[2];
+     const int64_t n_kv     = cell_blk->ne[0];
+ 
++    // [QSA_SCORE_BOUNDS] a trimmed score holds only the visible prefix, so cells of trimmed
++    // blocks (cell_blk[c] >= n_blocks) must not index it.  Under the bound's single-sequence
++    // precondition the cache is contiguous, so those cells are exactly c >= n_blocks*r.
++    const int64_t r_cells = (blk_cells != nullptr && n_blocks > 0) ? blk_cells->ne[0]/n_blocks : 0;
++    const int64_t n_cells = r_cells > 0 ? std::min<int64_t>(n_kv, n_blocks*r_cells) : n_kv;
++
+     const float  * score_d   = (const float  *) score->data;
+     const int    * cell_d    = (const int    *) cell_blk->data;
+     int          * dst_d     = (int          *) dst->data;
+ 
+-    std::vector<float> vals(n_kv);
++    std::vector<float> vals(n_cells);
+ 
+     // cell_blk is [n_kv, n_stream]: stream s rows at c + s*n_kv, s = row/n_tps
+     const int64_t s0 = 0;
+@@ -12713,24 +12720,24 @@ static void ggml_compute_forward_indexer_topk_impl(
+     // dst is [k, n_tps, 1, n_stream]; cell_blk is [n_kv, n_stream], so the
+     // stream stride of cell_blk matches a dst row stride of k cells
+     for (int64_t row = 0; row < n_tps*n_stream; ++row) {
+-        for (int64_t c = 0; c < n_kv; ++c) {
++        for (int64_t c = 0; c < n_cells; ++c) {
+             vals[c] = cell_value(c, row);
+         }
+ 
+         // the k-th largest value is the selection threshold
+-        const int64_t kn = std::min<int64_t>(k, n_kv);
++        const int64_t kn = std::min<int64_t>(k, n_cells);
+         std::nth_element(vals.begin(), vals.begin() + kn - 1, vals.end(),
+                 [](float a, float b) { return a > b; });
+         const float thr = vals[kn - 1];
+ 
+         int * row_dst = dst_d + row*k;
+         int pos = 0;
+-        for (int64_t c = 0; c < n_kv && pos < kn; ++c) {
++        for (int64_t c = 0; c < n_cells && pos < kn; ++c) {
+             if (cell_value(c, row) > thr) {
+                 row_dst[pos++] = (int) c;
+             }
+         }
+-        for (int64_t c = 0; c < n_kv && pos < kn; ++c) {
++        for (int64_t c = 0; c < n_cells && pos < kn; ++c) {
+             if (cell_value(c, row) == thr) {
+                 row_dst[pos++] = (int) c;
+             }
+diff --git a/ggml/src/ggml-cuda/indexer-topk.cu b/ggml/src/ggml-cuda/indexer-topk.cu
+index 390fc7a47..7a9bae5fa 100644
+--- a/ggml/src/ggml-cuda/indexer-topk.cu
++++ b/ggml/src/ggml-cuda/indexer-topk.cu
+@@ -788,6 +788,13 @@ static void indexer_topk_radix_cuda_blocks(
+     const int blocks_per_row = std::min((n_blocks + 1023) / 1024, 8);
+     const int bchunk = (n_blocks + blocks_per_row - 1) / blocks_per_row;
+ 
++    // [QSA_SCORE_BOUNDS] a trimmed score holds only the visible prefix, so cells of trimmed blocks
++    // (cell_blk[c] >= n_blocks) must not be read.  Under the bound's single-sequence precondition
++    // the cache is contiguous, so those cells are exactly c >= n_blocks*r; clamping the cell range
++    // keeps pass1, the block passes and the gather inside the valid prefix.  When nothing is
++    // trimmed n_blocks*r >= n_kv, so this is the identity.
++    const int n_cells = std::min(n_kv, n_blocks*r);
++
+     ggml_cuda_pool_alloc<indexer_topk_radix_state> states_alloc(pool, nrows);
+     ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
+     ggml_cuda_pool_alloc<int> wvis_alloc(pool, (size_t) nrows * n_blocks);
+@@ -813,12 +820,12 @@ static void indexer_topk_radix_cuda_blocks(
+             indexer_topk_histogram_pass1<BLOCK_SIZE, RADIX_BITS, 4>
+                 <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+                     score, cell_blk, extra, states, histograms, wvis,
+-                    ncols, n_tps, n_blocks, n_kv, blocks_per_row, bchunk, r, shift);
++                    n_cells, n_tps, n_blocks, n_cells, blocks_per_row, bchunk, r, shift);
+         } else {
+             indexer_topk_histogram_blocks<BLOCK_SIZE, RADIX_BITS>
+                 <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+                     score, extra, states, wvis, histograms,
+-                    ncols, n_tps, n_blocks, n_kv, blocks_per_row, bchunk, r, shift);
++                    n_cells, n_tps, n_blocks, n_cells, blocks_per_row, bchunk, r, shift);
+         }
+         indexer_topk_radix_select<BLOCK_SIZE, RADIX_BITS>
+             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
+@@ -834,7 +841,7 @@ static void indexer_topk_radix_cuda_blocks(
+             g_cnt, e_cnt, g_base, e_base, nrows, blocks_per_row);
+     indexer_topk_write_blocks_grouped<4><<<(size_t) blocks_per_row * nrows, BLOCK_SIZE, 0, stream>>>(
+             score, cell_blk, extra, states, g_base, e_base, dst,
+-            ncols, n_tps, n_blocks, n_kv, k, blocks_per_row, bchunk * r);
++            n_cells, n_tps, n_blocks, n_cells, k, blocks_per_row, bchunk * r);
+ }
+ 
+ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index fec7ad0e0..b91235128 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -959,6 +959,117 @@ uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
+     return std::max(n_kv, window);
+ }
+ 
++// [QSA_SCORE_BOUNDS] true when the occupied cells of `seq` hold a unique set of non-negative
++// positions, one sequence only.  Complete blocks are enumerated in ascending logical block order
++// (see set_input_qsa's grouping), so under this precondition a complete block's ordinal cannot
++// exceed its logical block number and the scorer can be trimmed to a strip's visible prefix.
++static bool qsa_single_sequence_prefix(const llama_kv_cells & cells, uint32_t count, llama_seq_id seq) {
++    if (count > cells.size()) {
++        return false;
++    }
++
++    std::vector<llama_pos> positions;
++    positions.reserve(count);
++
++    for (uint32_t i = 0; i < count; ++i) {
++        if (cells.is_empty(i)) {
++            continue;
++        }
++        // the scorer trim is by cell index, so the cell index must equal the position (no
++        // permutation); a hole keeps the check valid, an empty cell contributes nothing
++        if (cells.seq_get_all(i).count() != 1 || !cells.seq_has(i, seq) || cells.pos_get(i) != (llama_pos) i) {
++            return false;
++        }
++        positions.push_back(cells.pos_get(i));
++    }
++
++    std::sort(positions.begin(), positions.end());
++    return std::adjacent_find(positions.begin(), positions.end()) == positions.end();
++}
++
++bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & ubatch) const {
++    if (get_n_stream() != 1 || !get_idx() || mem == nullptr) {
++        return false;
++    }
++    if (!ubatch.token || !ubatch.pos || !ubatch.n_tokens || !ubatch.n_pos ||
++        !ubatch.seq_id || !ubatch.n_seq_id) {
++        return false;
++    }
++    if (ubatch.n_seq_id[0] < 1 || !ubatch.seq_id[0]) {
++        return false;
++    }
++
++    const llama_seq_id seq = ubatch.seq_id[0][0];
++
++    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++        if (ubatch.n_seq_id[i] < 1 || !ubatch.seq_id[i] || ubatch.seq_id[i][0] != seq ||
++            ubatch.pos[i] < 0 || ubatch.pos[i] >= 16777216) {
++            return false;
++        }
++        // M-RoPE repeats a position across an image, which breaks the unique-position ordering
++        for (uint32_t axis = 1; axis < ubatch.n_pos; ++axis) {
++            if (ubatch.pos[i + axis*ubatch.n_tokens] != ubatch.pos[i]) {
++                return false;
++            }
++        }
++    }
++
++    const llama_kv_cache * idx = mem->get_mem_idx();
++    if (idx == nullptr) {
++        return false;
++    }
++
++    return qsa_single_sequence_prefix(idx->get_cells(seq), get_idx()->get_n_kv(), seq);
++}
++
++std::vector<int64_t> llama_memory_hybrid_idx_context::qsa_score_key_limits(
++        const llama_ubatch & ubatch, int64_t n_blocks, int64_t strip, uint32_t ratio, int64_t budget) const {
++    const int64_t n_tokens = ubatch.n_tokens;
++
++    if (!ubatch.pos || n_tokens <= 0 || strip <= 0 || ratio == 0 || budget <= 0 || n_blocks < budget) {
++        return {};
++    }
++
++    // llama_context::graph_reserve builds a worst-case graph from a synthetic ubatch whose positions
++    // are all 0.  Bounding that graph would reserve compute buffers for a 4%-wide scorer and then
++    // execute full-width ones, so a many-token ubatch whose positions are all identical is treated
++    // as synthetic and left unbounded.
++    bool degenerate_pos = n_tokens > 1;
++    for (int64_t i = 1; degenerate_pos && i < n_tokens; ++i) {
++        if (ubatch.pos[i] != ubatch.pos[0]) {
++            degenerate_pos = false;
++        }
++    }
++    if (degenerate_pos || !qsa_position_prefix(ubatch)) {
++        return {};
++    }
++
++    std::vector<int64_t> limits;
++    limits.reserve((n_tokens + strip - 1)/strip);
++
++    for (int64_t first = 0; first < n_tokens; first += strip) {
++        int64_t maximum = -1;
++        for (int64_t i = first; i < std::min(n_tokens, first + strip); ++i) {
++            if (ubatch.pos[i] < 0 || ubatch.pos[i] >= 16777216) {
++                return {};
++            }
++            maximum = std::max(maximum, (int64_t) ubatch.pos[i]);
++        }
++        // (maximum+1)/ratio complete blocks lie fully inside the strip's causal prefix.  The +1
++        // keeps the incomplete tail block - the fused top-k carries it as ordinary cells, whereas
++        // the reference appends it separately - inside the scored prefix.
++        limits.push_back(std::min(n_blocks, std::max(budget, (maximum + 1)/ratio) + 1));
++    }
++
++    if (getenv("LLAMA_QSA_SCORE_STRIP_DEBUG") != nullptr) {
++        fprintf(stderr, "QSA score bounds: n_tokens=%lld n_blocks=%lld strip=%lld ratio=%u budget=%lld limits=[%lld, %lld]\n",
++                (long long) n_tokens, (long long) n_blocks, (long long) strip, ratio, (long long) budget,
++                (long long) limits.front(), (long long) limits.back());
++    }
++
++    return limits;
++}
++
+ void llama_memory_hybrid_idx_context::set_input_qsa(
+         ggml_tensor * cell_blk,
+         ggml_tensor * blk_cells,
+diff --git a/src/llama-memory-hybrid-idx.h b/src/llama-memory-hybrid-idx.h
+index d1bea3ab1..71aacc6a6 100644
+--- a/src/llama-memory-hybrid-idx.h
++++ b/src/llama-memory-hybrid-idx.h
+@@ -206,6 +206,20 @@ public:
+     // keeps its cadence.  (Ported from the other solution's b0f31f587.)
+     uint32_t qsa_n_kv_window() const;
+ 
++    // [QSA_SCORE_BOUNDS] precondition for trimming the indexer scorer to the columns a query strip
++    // can actually see: one sequence whose occupied cache cells carry unique non-negative positions
++    // (so the complete blocks are enumerated in ascending logical block order and a block's ordinal
++    // cannot exceed its logical block number).  M-RoPE images pin several cells to one position, so
++    // they fail the uniqueness check and stay unbounded.
++    bool qsa_position_prefix(const llama_ubatch & ubatch) const;
++
++    // [QSA_SCORE_BOUNDS] per query strip, the number of leading score columns the strip can see
++    // (the complete-block ordinals that are fully inside its causal prefix, plus the incomplete
++    // tail block the fused top-k carries as cells), or an empty vector when the bound does not
++    // apply.  `strip` is in tokens, `budget` = indexer_top_k / ratio.
++    std::vector<int64_t> qsa_score_key_limits(const llama_ubatch & ubatch, int64_t n_blocks,
++            int64_t strip, uint32_t ratio, int64_t budget) const;
++
+     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                        ggml_tensor * bias, ggml_tensor * blk_idx, ggml_tensor * blk_tail,
+                        ggml_tensor * cell_vis, ggml_tensor * q_vis,
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 7568cabb9..df10237e5 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1168,6 +1168,48 @@ static bool qwen4exp_want_derived_vis(const llama_model & model, const llama_hpa
+             n_tokens > 1 && cparams.causal_attn && !hparams.use_alibi;
+ }
+ 
++// [QSA_SCORE_BOUNDS] prefill queries are scored in strips of at most this many tokens; each strip is
++// then trimmed to the blocks it can actually see (qsa_score_key_limits), so the indexer scorer runs
++// on roughly half its columns.  Only the single-sequence prefill case is stripped; anything else
++// (decode, verify, multi-stream, M-RoPE images) keeps the whole batch and stays bit-identical.
++// LLAMA_QSA_SCORE_STRIP=0 disables the strip + bound for A/B.
++static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
++    static const int64_t env_strip = []() -> int64_t {
++        const char * env = getenv("LLAMA_QSA_SCORE_STRIP");
++        // 1024 measured best on gfx1151 at -b/-ub 8192 (pp8192 +0.7 %, pp32768 neutral):
++        // smaller strips multiply the per-strip matmul/top-k launches, larger ones trim less
++        return env == nullptr ? 1024 : atoll(env);
++    }();
++    if (env_strip <= 0) {
++        return n_tokens;
++    }
++    return n_stream == 1 ? std::min<int64_t>(n_tokens, env_strip) : n_tokens;
++}
++
++// The bound is only meaningful where the score columns are complete-block ordinals and the tail is
++// carried as cells - the derived-bias path.  n_tokens < 128 keeps the whole decode/verify band on
++// the unbounded graph, so W = 1..8 stays byte-identical by construction.
++// LLAMA_QSA_SCORE_BOUNDS=0 keeps the strips but scores every strip at full width (isolates the
++// strip/launch overhead from the trim savings in an A/B).
++static std::vector<int64_t> qwen4exp_score_key_limits(const llama_memory_hybrid_idx_context * mctx,
++        const llama_ubatch & ubatch, bool derived_bias, bool derived_vis, int64_t n_blocks,
++        int64_t strip, uint32_t ratio, int64_t budget) {
++    static const bool enabled = []() {
++        const char * env = getenv("LLAMA_QSA_SCORE_STRIP");
++        if (env != nullptr && atoll(env) <= 0) {
++            return false;
++        }
++        const char * bounds = getenv("LLAMA_QSA_SCORE_BOUNDS");
++        return bounds == nullptr || atoi(bounds) != 0;
++    }();
++    // the fused top-k skips trimmed blocks by cell index, which needs the derived-visibility
++    // cell-clamped kernel path - keep the bound there only
++    if (!enabled || !derived_bias || !derived_vis || ubatch.n_tokens < 128 || strip <= 0) {
++        return {};
++    }
++    return mctx->qsa_score_key_limits(ubatch, n_blocks, strip, ratio, budget);
++}
++
+ class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
+ public:
+     llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool derived_bias, bool derived_vis) :
+@@ -1240,6 +1282,14 @@ public:
+             res &= bias->ne[1] == params.ubatch.n_tokens/n_stream;
+         }
+ 
++        // [QSA_SCORE_BOUNDS] the trimmed scorer widths are baked into the graph, so a reused graph
++        // must agree on the strip size and the per-strip column limits.
++        const int64_t next_strip  = qwen4exp_query_strip(params.ubatch.n_tokens/n_stream, n_stream);
++        const auto    next_limits = qwen4exp_score_key_limits(mctx, params.ubatch, derived_bias, derived_vis, n_blocks,
++                next_strip, ratio, (int64_t) params.hparams.indexer_top_k/ratio);
++        res &= score_strip == next_strip;
++        res &= score_key_limits == next_limits;
++
+         return res;
+     }
+ 
+@@ -1273,6 +1323,10 @@ public:
+ 
+     // ... and the per-cell half is derived from the visibility keys
+     const bool derived_vis;
++
++    // [QSA_SCORE_BOUNDS] strip size and per-strip score column limits baked into this graph
++    int64_t score_strip = 0;
++    std::vector<int64_t> score_key_limits;
+ };
+ 
+ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+@@ -1388,6 +1442,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+             ggml_set_input(qsa->rng);
+         }
+ 
++        // [QSA_SCORE_BOUNDS] the prefill scorer is striped and causally trimmed; the widths are
++        // baked into this graph and re-checked by can_reuse above.
++        qsa->score_strip      = qwen4exp_query_strip(n_tps, n_stream);
++        qsa->score_key_limits = qwen4exp_score_key_limits(mctx_hyb, ubatch, derived_bias, derived_vis, n_blocks,
++                qsa->score_strip, (uint32_t) r, (int64_t) hparams.indexer_top_k/r);
++
+         inp = qsa.get();
+         res->add_input(std::move(qsa));
+         qsa_inps.emplace((uint32_t) r, inp);
+@@ -1422,6 +1482,53 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+                                k_all->type == GGML_TYPE_BF16 ||
+                                k_all->type == GGML_TYPE_F16;
+ 
++    // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
++    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
++    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
++
++    // fused expand + mask + top-k: value[c] = score[cell_blk[c]] + additive[c]
++    // avoids materializing the [n_kv, n_tps] F32 expanded tensor (512MB at 64K) per layer
++    // the mask is [n_kv, n_tps, 1, n_stream]; the size-1 dim is a no-op stride, so the
++    // kernel reads it as [n_kv, n_tps, n_stream] and no per-layer copy is needed
++    ggml_tensor * additive = blk_bias ? kq_mask : inp->bias;
++
++    // [QSA_SCORE_BOUNDS] the query-indexed inputs (additive, q_vis, blk_tail) are sliced to the
++    // strip so each per-strip top-k sees the same shapes the whole-batch decode call does.
++    auto run_top_k = [&](ggml_tensor * sc, int64_t first, int64_t n_query, int64_t score_blocks) -> ggml_tensor * {
++        ggml_tensor * add_s = nullptr;
++        if (additive != nullptr) {
++            add_s = ggml_n_dims(additive) == 4
++                    ? ggml_view_4d(ctx0, additive, additive->ne[0], n_query, 1, n_stream,
++                            additive->nb[1], additive->nb[2], additive->nb[3], first*additive->nb[1])
++                    : ggml_view_3d(ctx0, additive, additive->ne[0], n_query, n_stream,
++                            additive->nb[1], additive->nb[2], first*additive->nb[1]);
++        }
++        ggml_tensor * qpos_s = derived_vis ? ggml_view_2d(ctx0, inp->q_vis, n_query, n_stream,
++                inp->q_vis->nb[1], first*inp->q_vis->nb[0]) : nullptr;
++        ggml_tensor * tail_s = derived_bias ? ggml_view_2d(ctx0, inp->blk_tail, n_query, n_stream,
++                inp->blk_tail->nb[1], first*inp->blk_tail->nb[0]) : nullptr;
++        // [QSA_SCORE_BOUNDS] a trimmed score holds only the visible prefix; the block fast path
++        // then skips the trimmed blocks by cell index.  The bound only applies with n_stream == 1,
++        // so these views stay contiguous even though the source's stream stride is the full width.
++        ggml_tensor * blk_idx_s = derived_bias
++                ? (score_blocks < n_blocks
++                        ? ggml_view_2d(ctx0, inp->blk_idx, score_blocks, n_stream, inp->blk_idx->nb[1], 0)
++                        : inp->blk_idx)
++                : nullptr;
++        ggml_tensor * blk_cells_s = score_blocks < n_blocks
++                ? ggml_view_2d(ctx0, inp->blk_cells, (int64_t) r*score_blocks, n_stream, inp->blk_cells->nb[1], 0)
++                : inp->blk_cells;
++        return ggml_indexer_top_k(ctx0, sc, inp->cell_blk, add_s,
++                derived_vis ? inp->cell_vis : nullptr,
++                qpos_s,
++                blk_idx_s,
++                tail_s,
++                blk_cells_s,
++                (int) width);
++    };
++
++    ggml_tensor * top_k = nullptr;
++
+     ggml_tensor * score = nullptr;
+     if (idx_score_fused && idx_key_float && n_tokens == 1 && blk_bias && n_idx_h <= 8 &&
+             rope_type == GGML_ROPE_TYPE_IMROPE) {
+@@ -1514,78 +1621,110 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
+         //        arithmetic untouched; the slices are assembled with ggml_concat (a produced tensor
+         //        frees normally, unlike cpy into a view of an allocator-owned tensor, which leaks).
+         //        The threshold is internal policy, not the A/B knob.
+-        const int64_t score_bytes = n_blocks * n_idx_h * n_tps * n_stream * 4;
+-        const bool    score_mem   = qwen4exp_score_mem_enabled();
++        //
++        // [QSA_SCORE_BOUNDS] prefill is additionally scored in `strip`-token query strips, each
++        // trimmed to the blocks it can see (qwen4exp_score_key_limits): a complete block's ordinal
++        // cannot exceed its logical block number, so columns past (max_query_pos+1)/ratio are
++        // invisible.  The trimmed score is handed straight to the fused top-k, whose cell range is
++        // clamped to n_blocks*ratio so the trimmed cells (cell_blk[c] >= n_blocks) are never read;
++        // the padded-blocks variant was measured slower because it re-materialises the full score.
++        // A strip that is not trimmed (decode/verify, no bound) builds exactly the pre-strip graph,
++        // so W = 1..8 stays byte-identical.
++        const bool    score_mem = qwen4exp_score_mem_enabled();
++        const int64_t strip     = inp->score_strip > 0 ? inp->score_strip : n_tps;
+ 
+         // sum the indexer heads: ne[1] holds them side by side and there are only a few
+-        auto head_sum = [&](ggml_tensor * sc) {
++        auto head_sum = [&](ggml_tensor * sc, int64_t nb, int64_t n_query) {
+             ggml_tensor * summed = nullptr;
+             for (int64_t h = 0; h < n_idx_h; ++h) {
+-                ggml_tensor * slice = ggml_view_3d(ctx0, sc, sc->ne[0], n_tps, n_stream,
++                ggml_tensor * slice = ggml_view_3d(ctx0, sc, nb, n_query, n_stream,
+                         sc->nb[2], sc->nb[3], h*sc->nb[1]);
+                 summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+             }
+             return summed;
+         };
+ 
+-        if (score_mem && score_bytes > 128*1024*1024) {
+-            const int64_t chunk = std::max<int64_t>(4096, (n_blocks + 15)/16);
+-            ggml_tensor * acc = nullptr;
+-            for (int64_t b0 = 0; b0 < n_blocks; b0 += chunk) {
+-                const int64_t cb = std::min<int64_t>(chunk, n_blocks - b0);
++        auto compute_score = [&](int64_t first, int64_t n_query, int64_t score_blocks) {
++            ggml_tensor * pooled_s = score_blocks == n_blocks ? pooled :
++                    ggml_view_3d(ctx0, pooled, idx_dim, score_blocks, n_stream,
++                            pooled->nb[1], pooled->nb[2], 0);
++            ggml_tensor * q_s = (first == 0 && n_query == n_tps) ? q3 :
++                    ggml_view_3d(ctx0, q, idx_dim, n_idx_h*n_query, n_stream,
++                            q->nb[1], q->nb[2]*n_tps, first*q->nb[2]);
++
++            const int64_t score_bytes = score_blocks * n_idx_h * n_query * n_stream * 4;
++            ggml_tensor * strip_score = nullptr;
++            if (score_mem && score_bytes > 128*1024*1024) {
++                const int64_t chunk = std::max<int64_t>(4096, (score_blocks + 15)/16);
++                ggml_tensor * acc = nullptr;
++                for (int64_t b0 = 0; b0 < score_blocks; b0 += chunk) {
++                    const int64_t cb = std::min<int64_t>(chunk, score_blocks - b0);
+ 
+-                ggml_tensor * pooled_c = ggml_view_3d(ctx0, pooled, idx_dim, cb, n_stream,
+-                        pooled->nb[1], pooled->nb[2], b0*pooled->nb[1]);
++                    ggml_tensor * pooled_c = ggml_view_3d(ctx0, pooled_s, idx_dim, cb, n_stream,
++                            pooled_s->nb[1], pooled_s->nb[2], b0*pooled_s->nb[1]);
+ 
+-                ggml_tensor * sc = ggml_mul_mat(ctx0, pooled_c, q3);
+-                sc = ggml_relu(ctx0, sc);
+-                sc = ggml_reshape_4d(ctx0, sc, cb, n_idx_h, n_tps, n_stream);
++                    ggml_tensor * sc = ggml_mul_mat(ctx0, pooled_c, q_s);
++                    sc = ggml_relu(ctx0, sc);
++                    sc = ggml_reshape_4d(ctx0, sc, cb, n_idx_h, n_query, n_stream);
+ 
+-                ggml_tensor * summed = head_sum(sc);
++                    ggml_tensor * summed = head_sum(sc, cb, n_query);
+ 
+-                acc = acc ? ggml_concat(ctx0, acc, summed, 0) : summed;
++                    acc = acc ? ggml_concat(ctx0, acc, summed, 0) : summed;
++                }
++                strip_score = acc;
++            } else if (score_mem) {
++                strip_score = ggml_mul_mat(ctx0, pooled_s, q_s);
++                strip_score = ggml_relu(ctx0, strip_score);
++                strip_score = ggml_reshape_4d(ctx0, strip_score, score_blocks, n_idx_h, n_query, n_stream);
++                strip_score = head_sum(strip_score, score_blocks, n_query);
++            } else {
++                strip_score = ggml_mul_mat(ctx0, pooled_s, q_s);
++                strip_score = ggml_reshape_4d(ctx0, strip_score, score_blocks, n_idx_h, n_query, n_stream);
++                strip_score = ggml_relu(ctx0, strip_score);
++                strip_score = head_sum(strip_score, score_blocks, n_query);
+             }
+-            score = acc;
+-        } else if (score_mem) {
+-            score = ggml_mul_mat(ctx0, pooled, q3);
+-            score = ggml_relu(ctx0, score);
+-            score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+-            score = head_sum(score);
+-        } else {
+-            score = ggml_mul_mat(ctx0, pooled, q3);
+-            score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+-            score = ggml_relu(ctx0, score);
+-            score = head_sum(score);
+-        }
+ 
+-        // one value per block, so it is cheaper to bias here than after the cells are expanded
+-        // (the derived path drops this tensor and lets the top-k add the bias in-kernel instead)
+-        if (blk_bias && !derived_bias) {
+-            score = ggml_add(ctx0, score, inp->bias);
+-        }
+-    }
+-    cb(score, "indexer_score", il);
++            // one value per block, so it is cheaper to bias here than after the cells are expanded
++            // (the derived path drops this tensor and lets the top-k add the bias in-kernel instead)
++            if (blk_bias && !derived_bias) {
++                ggml_tensor * bias_s = ggml_view_3d(ctx0, inp->bias, n_blocks, n_query, n_stream,
++                        inp->bias->nb[1], inp->bias->nb[2], first*inp->bias->nb[1]);
++                strip_score = ggml_add(ctx0, strip_score, bias_s);
++            }
+ 
+-    // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
+-    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
+-    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
++            return strip_score;
++        };
+ 
+-    // fused expand + mask + top-k: value[c] = score[cell_blk[c]] + additive[c]
+-    // avoids materializing the [n_kv, n_tps] F32 expanded tensor (512MB at 64K) per layer
+-    // the mask is [n_kv, n_tps, 1, n_stream]; the size-1 dim is a no-op stride, so the
+-    // kernel reads it as [n_kv, n_tps, n_stream] and no per-layer copy is needed
+-    ggml_tensor * additive = blk_bias ? kq_mask : inp->bias;
++        std::vector<ggml_tensor *> strips;
++        for (int64_t first = 0; first < n_tps; first += strip) {
++            const int64_t n_query = std::min(strip, n_tps - first);
++            const int64_t score_blocks = inp->score_key_limits.empty()
++                    ? n_blocks : inp->score_key_limits[first/strip];
++            GGML_ASSERT(score_blocks > 0 && score_blocks <= n_blocks);
+ 
+-    // compact per-block bias state (derived path); the derived *visibility* (cell_pos/q_pos)
+-    // is a later step, so src3/src4 stay null for now
+-    ggml_tensor * top_k = ggml_indexer_top_k(ctx0, score, inp->cell_blk, additive,
+-            derived_vis ? inp->cell_vis : nullptr,
+-            derived_vis ? inp->q_vis    : nullptr,
+-            derived_bias ? inp->blk_idx  : nullptr,
+-            derived_bias ? inp->blk_tail : nullptr,
+-            inp->blk_cells,
+-            (int) width);
+-    cb(top_k, "indexer_top_k", il);
++            ggml_tensor * sc = compute_score(first, n_query, score_blocks);
++            cb(sc, "indexer_score", il);
++
++            ggml_tensor * tk = run_top_k(sc, first, n_query, score_blocks);
++            cb(tk, "indexer_top_k", il);
++            strips.push_back(tk);
++        }
++
++        // balanced concatenation along the query dimension keeps the strips in order
++        while (strips.size() > 1) {
++            ggml_tensor * right = strips.back(); strips.pop_back();
++            ggml_tensor * left  = strips.back(); strips.pop_back();
++            ggml_tensor * joined = ggml_concat(ctx0, left, right, 1);
++            ggml_build_forward_expand(gf, joined);
++            strips.push_back(joined);
++        }
++        top_k = strips.front();
++    }
++    if (score != nullptr) {
++        cb(score, "indexer_score", il);
++        top_k = run_top_k(score, 0, n_tps, n_blocks);
++        cb(top_k, "indexer_top_k", il);
++    }
+ 
+     return top_k;
+ }
+-- 
+2.55.0
+

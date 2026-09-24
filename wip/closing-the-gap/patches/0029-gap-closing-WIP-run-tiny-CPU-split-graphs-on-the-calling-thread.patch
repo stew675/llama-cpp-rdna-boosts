@@ -1,0 +1,115 @@
+From 13afbe822a64b9136d7e4e708a2a643931487ed5 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Thu, 24 Sep 2026 08:59:57 -0500
+Subject: [PATCH] gap-closing WIP: run tiny CPU split graphs on the calling
+ thread
+
+A GPU graph with a host-resident input embedding (the discrete multi-GPU
+qwen4exp case: the 27 GiB per_layer_token_embd cannot fit in VRAM, so
+token_embd/per_layer_token_embd/mtp_tok_embd are host-mapped) gets a small
+CPU split - one GET_ROWS (plus a few state copies on the MTP draft graph) -
+peeled off its front by the scheduler.
+
+Each of those graphs is an OpenMP parallel region.  With the default
+active wait the runtime keeps the idle workers spinning for KMP_BLOCKTIME,
+so at plain decode's ~55 graphs/s the pool settles between graphs (~2 cores),
+but MTP calls llama_decode n_max+1 times per token (~250-350 graphs/s), the
+pool never sleeps, and all 16 threads spin: measured 81.0 t/s / ~15 cores vs
+108.5 t/s / ~0.4 cores with OMP_WAIT_POLICY=PASSIVE (acceptance identical
+0.84791), i.e. ~25% of qwen4exp MTP throughput is lost to idle-wait spin.
+
+Run a tiny CPU graph (<= 32 nodes and <= 16 MiB of node outputs) inline on
+the calling thread instead.  Widths through the whole spec-decode verify band
+(<= 16 tokens) stay inside the bounds; an ordinary model graph (CPU-only
+inference, or any prefill-sized gather) is far above them and keeps its
+threads.  The affected ops (GET_ROWS/CPY/SCALE) are thread-count invariant,
+so output is bit-identical.
+
+gfx1201, qwen4exp IQ4_NL + mtp-shared-Q8_0, 3-GPU tensor, q8_0 KV, prose,
+-c 16384 -n 1500, seed 42:
+  default         81.0 t/s / 15.0 cores  -> 111.7 t/s / 1.2 cores
+  passive env    108.5 t/s /  0.4 cores
+  kill-switch    85.1 t/s / 14.9 cores   (GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1)
+acceptance 0.84791 identical in every arm; same-seed generated text
+be68... identical with and without the heuristic.  Plain decode unchanged
+(52.9 vs 53.0 t/s), CPU-only 4B tg64 unchanged (9.69 vs 9.60), qwen4exp
+pp2048 unchanged within noise (2448 vs 2467, fix arm +/-27).
+---
+ ggml/src/ggml-cpu/ggml-cpu.cpp | 51 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 8cece71f1..cee0c0341 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -7,6 +7,7 @@
+ #include "amx/amx.h"
+ 
+ #include <cctype>
++#include <cstdlib>
+ #include <string>
+ #include <vector>
+ 
+@@ -167,10 +168,58 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
+     GGML_UNUSED(backend);
+ }
+ 
++// Choose the number of threads for a CPU graph compute.
++//
++// A very small CPU graph - typically the input/PLE embedding GET_ROWS (and a handful of
++// state copies) that the scheduler peels off the front of a GPU graph - gains nothing
++// from an OpenMP fork, and paying for it once per graph is actively harmful at the graph
++// rates speculative decoding reaches: every parallel region re-arms the runtime's active
++// wait (KMP_BLOCKTIME), so the idle workers spin instead of sleeping and a spec-decode
++// workload (n_max + 1 back-to-back graphs per token) pins every core for the whole run.
++// Run such graphs inline on the calling thread instead; a real (prefill-sized) gather or
++// any larger graph keeps the configured thread count.  Disable the heuristic with
++// GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1 for A/B and bisection.
++static int ggml_backend_cpu_graph_n_threads(const struct ggml_cgraph * cgraph, int n_threads) {
++    if (n_threads <= 1) {
++        return n_threads;
++    }
++
++    static const bool disabled = getenv("GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD") != nullptr;
++    if (disabled) {
++        return n_threads;
++    }
++
++    // bounds chosen so an ordinary model graph (CPU-only inference, or a large prefill
++    // gather on a CPU split) never qualifies; the split graphs this targets are 1-7 nodes
++    // of a few hundred KiB each
++    constexpr int    max_nodes = 32;
++    constexpr size_t max_bytes = 16ull*1024*1024;
++
++    if (cgraph->n_nodes > max_nodes) {
++        return n_threads;
++    }
++
++    size_t total_bytes = 0;
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        const struct ggml_tensor * node = cgraph->nodes[i];
++        if (ggml_is_view(node)) {
++            continue;
++        }
++        total_bytes += ggml_nbytes(node);
++        if (total_bytes > max_bytes) {
++            return n_threads;
++        }
++    }
++
++    return 1;
++}
++
+ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+ 
+-    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
++    const int n_threads = ggml_backend_cpu_graph_n_threads(cgraph, cpu_ctx->n_threads);
++
++    struct ggml_cplan cplan = ggml_graph_plan(cgraph, n_threads, cpu_ctx->threadpool);
+ 
+     if (cpu_ctx->work_size < cplan.work_size) {
+         delete[] cpu_ctx->work_data;
+-- 
+2.55.0
+

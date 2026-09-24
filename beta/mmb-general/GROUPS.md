@@ -17,24 +17,25 @@ corresponding subset; the original 38-commit history is still in this repo's git
 
 ## Apply order and base
 
-**This is the BETA set: 12 patches covering gfx1151 + gfx1201 + gfx1100.**  Promoted from
-`wip/mmb-general` on 2026-09-21; the gfx1100 overlay patches are folded in as `0011`/`0012`, and the
-rejected per-M `nwarps` experiment now lives in [`../../wip/nwarps/`](../../wip/nwarps/).
+**This is the BETA set: 28 patches covering gfx1151 + gfx1201 + gfx1100.**  Promoted from
+`wip/mmb-general` on 2026-09-21; the gfx1100 overlay patches are folded in as `0011`/`0012`, the
+`closing-the-gap` campaign was consolidated in as `0013`–`0028` (ten of its patches folded into the
+core), and the rejected per-M `nwarps` experiment lives in [`../../wip/nwarps/`](../../wip/nwarps/).
 
 ```sh
-# base = the r12 delivery tree (release.json: base ebbb18522, tree 8a80535e556bef57666d2eaa4d3eb4cf93fb83f5)
+# base = the r13 delivery tree (release.json: base ebbb18522, tree bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12)
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout ebbb18522
-bash <this-repo>/scripts/apply-all.sh .        # -> branch rdna-boosts, tree 8a80535e... (r12)
+bash <this-repo>/scripts/apply-all.sh .        # -> branch rdna-boosts, tree bb7b6d07... (r13)
 git checkout -b mmb-beta
-git am <this-repo>/beta/mmb-general/patches/*.patch   # 12/12, tree bca69f23dd...
+git am <this-repo>/beta/mmb-general/patches/*.patch   # 28/28, tree 468c6496...
 ```
 
-Verified 2026-09-21: **`git am` 12/12** from the r12 tree, producing
-**`bca69f23dd29acef2d8898c6fd492104e078eef1`**.  The merge-back of the gfx1100 work and the cross-arch
-verification that the overlay does not disturb gfx1201 are in
-[`combined-set-verification.md`](combined-set-verification.md); the gfx1151 re-validation checklist is
-[`BETA-TESTING.md`](BETA-TESTING.md).
+Verified 2026-09-25: strict **`git am` 28/28** from the r13 tree, producing
+**`468c64963ae45e72367c73809efa7cc038217e8a`** (tree-identical to the combined `gap-closing-denseband`
+tree).  The merge-back of the gfx1100 work and the cross-arch verification that the overlay does not
+disturb gfx1201 are in [`combined-set-verification.md`](combined-set-verification.md); the gfx1151
+re-validation checklist is [`BETA-TESTING.md`](BETA-TESTING.md).
 
 ## The five groups
 

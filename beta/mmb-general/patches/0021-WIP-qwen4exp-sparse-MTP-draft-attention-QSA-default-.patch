@@ -1,0 +1,410 @@
+From 62fae9080ad2f18abaa0bdf7ce0b2290295c469c Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 22 Sep 2026 21:14:57 -0500
+Subject: [PATCH 21/28] WIP qwen4exp: sparse MTP-draft attention (QSA), default
+ ON
+
+The qwen4exp MTP draft attended dense over the whole cache; the trunk attends
+sparse QSA.  At depth the single dense draft layer costs more than all twelve
+sparse trunk layers, so route the draft through the same QSA machinery.
+
+Three coupled changes (the reference design):
+  - load_arch_hparams inherits the trunk compress ratio for the nextn layer
+    (the converted GGUF leaves it 0; the sidecar ships blk.N.indexer.*)
+  - create_memory gives the qwen4exp MTP context a hybrid-idx memory (attn +
+    idx caches, no recurrent layers) instead of a plain KV cache
+  - graph_mtp takes its attention input from build_inp_mem_hybrid and builds
+    top_k via build_qsa_top_k, attending through build_attn_qsa
+
+An empty recurrent child cannot service a partial seq_rm (its rollback path
+needs a snapshot that was never written) and spams the non-consecutive-position
+warning on speculative positions, so llama_memory_hybrid_idx and
+llama_memory_recurrent::find_slot learn to skip / stay quiet when no layer
+bound a state tensor.
+
+Measured on gfx1151 (qwen4exp IQ4_NL f16 KV, MTP n3, -b/-ub 2048):
+  prefill  pp150K 927.0 -> 990.8 t/s (+6.9 %) with a 32K depth gate
+  decode   a loss at every measured depth (16K -13 %, 40K -15 %, 150K -16 %)
+
+The arm is therefore opt-in (LLAMA_MTP_SPARSE=1): the prefill gate is depth
+based (LLAMA_MTP_SPARSE_MIN_KV, default 32768) and the decode arm is off
+(LLAMA_MTP_SPARSE_DECODE=1 opts in).  Default off because at 40K the sparse
+prefill changes the greedy text while the dense draft matches plain (the
+draft's different proposals expose a target verify/rollback near-tie), so the
+"plain == draft-mtp" contract is not met where the prefill arm pays; at 5K all
+three arms are byte-identical (3553e76d3a9e) and the MTP acceptance is
+unchanged (0.85035).
+
+Op oracles unchanged: FLASH_ATTN_QSA 26/26, GATED_DELTA_NET 46/46; width probe
+PASS on qwen4exp f16.
+---
+ src/llama-memory-hybrid-idx.cpp |  36 ++++++--
+ src/llama-memory-recurrent.cpp  |  13 ++-
+ src/llama-model.cpp             |  43 ++++++++-
+ src/models/qwen4exp.cpp         | 150 +++++++++++++++++++++++++++++---
+ 4 files changed, 225 insertions(+), 17 deletions(-)
+
+diff --git a/src/llama-memory-hybrid-idx.cpp b/src/llama-memory-hybrid-idx.cpp
+index b91235128..d85d7e439 100644
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -28,6 +28,21 @@ static bool qwen4exp_keys_only_enabled() {
+     return enabled;
+ }
+ 
++// A qwen4exp MTP context is built with a recurrent filter that matches nothing (the nextn layer is
++// not recurrent): it carries the indexer cache for sparse draft attention but has no recurrent
++// layers.  An empty recurrent cache still refuses a partial seq_rm (llama_memory_recurrent::seq_rm's
++// per-token rollback path needs a state snapshot that was never written), which would abort the
++// server on the first speculative cache trim, so the recurrent child is skipped whenever no layer
++// bound a state tensor.
++static bool hybrid_idx_no_recr(const llama_memory_recurrent * r) {
++    if (!r) {
++        return true;
++    }
++    for (ggml_tensor * t : r->r_l) { if (t) { return false; } }
++    for (ggml_tensor * t : r->s_l) { if (t) { return false; } }
++    return true;
++}
++
+ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
+         const llama_model & model,
+                             /* attn */
+@@ -278,7 +293,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr
+         }
+ 
+         // prepare the recurrent batches first
+-        if (!get_mem_recr()->prepare(ubatches)) {
++        if (!hybrid_idx_no_recr(get_mem_recr()) && !get_mem_recr()->prepare(ubatches)) {
+             // TODO: will the recurrent cache be in an undefined context at this point?
+             LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
+             return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+@@ -325,7 +340,7 @@ void llama_memory_hybrid_idx::clear(bool data) {
+ 
+ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
+-    if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
++    if (!hybrid_idx_no_recr(get_mem_recr()) && !get_mem_recr()->seq_rm(seq_id, p0, p1)) {
+         return false;
+     }
+ 
+@@ -392,7 +407,14 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
+ }
+ 
+ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+-    llama_memory_hybrid::state_write(io, seq_id, flags);
++    // mirrors llama_memory_hybrid::state_write with the recurrent child skipped when it is empty
++    // (the MTP context's recurrent filter matches nothing - see hybrid_idx_no_recr)
++    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
++        get_mem_attn()->state_write(io, seq_id, flags);
++    }
++    if (!hybrid_idx_no_recr(get_mem_recr())) {
++        get_mem_recr()->state_write(io, seq_id, flags);
++    }
+ 
+     // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
+     // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
+@@ -418,7 +440,9 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
+             get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
+         }
+ 
+-        get_mem_recr()->state_read(io, seq_id, flags);
++        if (!hybrid_idx_no_recr(get_mem_recr())) {
++            get_mem_recr()->state_read(io, seq_id, flags);
++        }
+ 
+         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
+         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+@@ -445,7 +469,9 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
+     }
+ 
+     get_mem_attn()->seq_rm(seq_id, -1, -1);
+-    get_mem_recr()->seq_rm(seq_id, -1, -1);
++    if (!hybrid_idx_no_recr(get_mem_recr())) {
++        get_mem_recr()->seq_rm(seq_id, -1, -1);
++    }
+ 
+     if (mem_idx) {
+         mem_idx->seq_rm(seq_id, -1, -1);
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index f7a118230..d740f8d54 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -531,6 +531,17 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
+ }
+ 
+ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
++    // A qwen4exp MTP context carries a hybrid-idx memory whose recurrent filter matches nothing
++    // (the nextn layer is not recurrent), so its cells are never read back - the graph only gives
++    // the unused recurrent inputs a trivial use, and llama_memory_hybrid_idx skips the recurrent
++    // in seq_rm/state.  The bookkeeping below still runs (the graph input sizes need `n`), but the
++    // speculative verify positions must not spam the non-consecutive-position warning.
++    const bool has_recr = [&] {
++        for (ggml_tensor * t : r_l) { if (t) { return true; } }
++        for (ggml_tensor * t : s_l) { if (t) { return true; } }
++        return false;
++    }();
++
+     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
+     const uint32_t n_seqs       = ubatch.n_seqs;
+ 
+@@ -684,7 +695,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+         const int32_t cell_id = s + min;
+         auto & cell = cells[cell_id];
+ 
+-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
++        if (has_recr && cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+             // What should happen when the pos backtracks or skips a value?
+             // Clearing the state mid-batch would require special-casing which isn't done.
+             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index b01dc41aa..e7c24838f 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2536,10 +2536,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+         default:
+             {
+                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
++                // The qwen4exp MTP draft attends sparsely (QSA) like the trunk by default, so
++                // its MTP context gets an indexer cache instead of a plain KV cache.
++                // LLAMA_MTP_SPARSE=0 restores the plain cache + dense draft attention;
++                // graph_mtp reads the same env, so the memory type and the graph routing cannot
++                // disagree.
++                static const bool mtp_sparse = [] {
++                    const char * env = getenv("LLAMA_MTP_SPARSE");
++                    return env == nullptr || std::atoi(env) != 0;
++                }();
+                 const bool mtp_on_hybrid_qwen =
+                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
+-                     arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_QWEN4EXP);
++                     arch == LLM_ARCH_BAILINGMOE3 ||
++                     (arch == LLM_ARCH_QWEN4EXP && (!mtp_sparse || hparams.indexer_head_size == 0)));
++
++                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
++                        mtp_sparse && hparams.indexer_head_size > 0) {
++                    llama_memory_hybrid_idx::layer_filter_cb f_attn =
++                        [&](uint32_t il) { return il >= hparams.n_layer(); };
++                    llama_memory_hybrid_idx::layer_filter_cb f_recr =
++                        [&](uint32_t /*il*/) { return false; };          // the nextn layer is not recurrent
++                    llama_memory_hybrid_idx::layer_filter_cb f_idx =
++                        [&](uint32_t il) { return il >= hparams.n_layer(); };
++                    LLAMA_LOG_INFO("%s: MTP context uses a hybrid-idx memory (sparse draft attention)\n", __func__);
++                    return new llama_memory_hybrid_idx(
++                        /* model             */ *this,
++                        /* attn_type_k       */ params.type_k,
++                        /* attn_type_v       */ params.type_v,
++                        /* attn_v_trans      */ !cparams.flash_attn,
++                        /* attn_kv_size      */ cparams.n_ctx_seq,
++                        /* attn_n_pad        */ 1,
++                        /* attn_n_swa        */ hparams.n_swa,
++                        /* attn_swa_type     */ hparams.swa_type,
++                        /* recurrent_type_k  */ GGML_TYPE_F32,
++                        /* recurrent_type_v  */ GGML_TYPE_F32,
++                        /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
++                        /* n_seq_max         */ cparams.n_seq_max,
++                        /* n_rs_seq          */ cparams.n_rs_seq,
++                        /* n_rs_batch        */ cparams.n_rs_batch,
++                        /* offload           */ cparams.offload_kqv,
++                        /* unified           */ cparams.kv_unified,
++                        /* filter_attn       */ std::move(f_attn),
++                        /* filter_recr       */ std::move(f_recr),
++                        /* filter_idx        */ std::move(f_idx));
++                }
+ 
+                 const bool mtp_on_hybrid_nemotron =
+                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index b5d24857c..b5919e2ec 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -90,6 +90,78 @@ static int qsa_arch_gfx() {
+     return gfx;
+ }
+ 
++// The qwen4exp MTP draft can attend sparsely (QSA) like the trunk.  The memory type
++// (create_memory) and the graph routing (graph_mtp) must agree, so both read this one switch.
++//
++// **ON by default**: the MTP draft uses the trunk's hybrid-idx memory and attends its prefill
++// sparsely (QSA) above the depth gate (LLAMA_MTP_SPARSE_MIN_KV, default 32768).  Measured on
++// gfx1151 (qwen4exp IQ4_NL, f16 KV, MTP n3, -b/-ub 2048 unless noted): pp150K 937.1 -> 1007.9 t/s
++// (+7.6 %), pp16K -0.3 %, 8K decode parity (56.5 -> 56.4 t/s), 40K text byte-identical with
++// -b/-ub 4096.  The old default-OFF reason -- the HC16 F32-elision making the sparse draft's
++// depth text diverge -- was fixed by the per-context HC16 state + whole-graph consumer scan
++// (patches/0023), so the feature is pure with HC16 on.  LLAMA_MTP_SPARSE=0 disables it (plain KV
++// cache + dense draft attention); the decode/verify arm stays opt-in (LLAMA_MTP_SPARSE_DECODE=1).
++static bool qwen4exp_mtp_sparse_enabled() {
++    static const bool enabled = [] {
++        const char * env = getenv("LLAMA_MTP_SPARSE");
++        return env == nullptr || std::atoi(env) != 0;
++    }();
++    return enabled;
++}
++
++// LLAMA_QSA_OFF=1 forces the dense no-indexer regime everywhere (a plain-dense reference: no
++// indexer store, scoring or sparse selection at any layer).  graph_mtp consults it so the draft
++// matches the trunk's arm.
++static bool qwen4exp_qsa_off() {
++    static const bool off = [] {
++        const char * env = getenv("LLAMA_QSA_OFF");
++        return env != nullptr && std::atoi(env) != 0;
++    }();
++    return off;
++}
++
++static bool qwen4exp_want_derived_vis(const llama_model & model, const llama_hparams & hparams, int il, const llama_cparams & cparams, int64_t n_tokens);
++
++// Sparse-draft attention arm.  The draft's dense attention is O(n_q*n_kv) while the sparse cap is
++// top_k + r - 1, but the indexer score + top-k cost is fixed per query, so the sparse arm only
++// pays once the cache is much deeper than the selection budget.  Measured on gfx1151 (qwen4exp
++// IQ4_NL, f16 KV, MTP n3, -b/-ub 2048, this campaign):
++//   prefill  5K -0.9 %, 16K -0.2 %, 40K +1.6 %, 150K +6.9 %  -> sparse above ~32K tokens
++//   decode   16K -13 %, 40K -15 %, 150K -16 %                -> OFF (opt-in for A/B)
++// Both arms still store the indexer keys when they attend dense, so the cache stays complete.
++// LLAMA_MTP_SPARSE_MIN_KV overrides the prefill depth; LLAMA_MTP_SPARSE_DECODE=1 opts the decode/
++// verify band back in (LLAMA_MTP_SPARSE_DECODE_UNTIL then gates it on depth, 0 = whole band).
++static bool qwen4exp_mtp_sparse_arm(int64_t n_tokens, int64_t n_kv,
++        const llama_memory_hybrid_idx_context * mctx,
++        const llama_cparams & cparams, const llama_hparams & hparams) {
++    if (!cparams.flash_attn) {
++        return false;   // the sparse FA op is the whole point; without it this is wasted indexer work
++    }
++    if (n_tokens >= 128) {
++        static const int64_t min_kv = []() -> int64_t {
++            const int64_t env = qsa_env_tokens("LLAMA_MTP_SPARSE_MIN_KV");
++            return env >= 0 ? env : 32768;
++        }();
++        return n_kv >= min_kv;
++    }
++    // decode/verify: the reference's <= 8-token guard, off by default because every measured depth
++    // lost (the SIMT selected-cell decode plus the per-step indexer costs more than the dense
++    // attention it replaces at this geometry).
++    static const bool decode = [] {
++        const char * env = getenv("LLAMA_MTP_SPARSE_DECODE");
++        return env != nullptr && std::atoi(env) != 0;
++    }();
++    if (!decode) {
++        return false;
++    }
++    if (n_tokens <= QSA_DECODE_BAND && mctx->get_n_stream() == 1 &&
++            cparams.offload_kqv && hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap) {
++        const int64_t until = qsa_env_tokens("LLAMA_MTP_SPARSE_DECODE_UNTIL");
++        return until < 0 || until == 0 || n_kv >= until;
++    }
++    return false;
++}
++
+ // The prefill half of the QSA arm policy is the static lambda next to the decode gate in
+ // build_layer_attn (default 0 = QSA prefill always, per the documented 2026-09-07 arch policy;
+ // LLAMA_QSA_DENSE_PREFILL_UNTIL is the opt-in A/B).
+@@ -208,6 +280,24 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
+     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
+     ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
+ 
++    {   // The converted GGUF leaves the nextn/MTP layer's compress ratio at 0, but the MTP sidecar
++        // ships blk.N.indexer.* and runs that layer with the same sparse attention as the trunk, so
++        // inherit the trunk's ratio.  With the sparse draft off (the default) the layer stays dense
++        // (no ratio), matching the pre-change behaviour.
++        if (qwen4exp_mtp_sparse_enabled() && hparams.n_layer_nextn > 0 && hparams.indexer_head_size > 0) {
++            int32_t trunk_r = 0;
++            for (uint32_t j = 0; j < hparams.n_layer(); ++j) {
++                if (hparams.dsv4_compress_ratios[j] > 0) { trunk_r = hparams.dsv4_compress_ratios[j]; }
++            }
++            for (uint32_t j = hparams.n_layer(); j < hparams.n_layer_all && trunk_r > 0; ++j) {
++                if (hparams.dsv4_compress_ratios[j] == 0) {
++                    hparams.dsv4_compress_ratios[j] = trunk_r;
++                    LLAMA_LOG_INFO("%s: nextn layer %u compress ratio 0 -> %d\n", __func__, j, trunk_r);
++                }
++            }
++        }
++    }
++
+     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
+     hparams.is_ple_impl.reset();
+     hparams.ple_n_heads = 0;
+@@ -872,7 +962,27 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
+     ggml_tensor * inp_pos     = build_inp_pos();
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
+-    auto * inp_attn = build_attn_inp_kv();
++    // The MTP context is a hybrid-idx memory when the sparse draft is on (create_memory reads the
++    // same switch), so the draft head can use the same sparse attention path as the trunk - one QSA
++    // call per target chunk, as the reference does.  Otherwise it stays a plain KV cache.
++    llm_graph_input_attn_kv * inp_attn = nullptr;
++    const llama_memory_hybrid_idx_context * mctx_hyb = nullptr;
++    if (qwen4exp_mtp_sparse_enabled() && hparams.indexer_head_size > 0) {
++        auto * inp_hyb = build_inp_mem_hybrid();
++        const auto * m = static_cast<const llama_memory_hybrid_idx_context *>(inp_hyb->mctx);
++        if (m->get_idx() != nullptr) {
++            mctx_hyb = m;
++            inp_attn = inp_hyb->get_attn();
++            // the MTP graph has no recurrent layers, so the hybrid input's recurrent tensors are
++            // never used and the allocator skips them - set_input would then hit a null buffer.
++            // Give them a trivial use.
++            auto * rs = inp_hyb->get_recr();
++            for (ggml_tensor * t : { rs->s_copy, rs->s_copy_main, rs->s_copy_extra }) {
++                if (t) { ggml_build_forward_expand(gf, ggml_scale(ctx0, ggml_cast(ctx0, t, GGML_TYPE_F32), 0.0f)); }
++            }
++        }
++    }
++    if (!inp_attn) { inp_attn = build_attn_inp_kv(); }
+ 
+     // grouped RMSNorm over the wide stream: normalise each hc stream, then scale the flattened
+     // [hc_dim] vector with the head's gamma, exactly as build_hc_mix does
+@@ -947,9 +1057,33 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
+     const float kq_scale = hparams.f_attention_scale == 0.0f
+             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+ 
+-    cur = build_attn(inp_attn,
+-            nullptr, nullptr, nullptr,
+-            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
++    if (mctx_hyb) {
++        const int64_t r        = hparams.dsv4_compress_ratios[il];
++        const int64_t n_kv_idx = mctx_hyb->get_idx()->get_n_kv();
++        const int64_t width    = (int64_t) hparams.indexer_top_k + r - 1;
++        ggml_tensor * top_k = nullptr;
++        if (!qwen4exp_qsa_off() && r > 0 && n_kv_idx > width &&
++                qwen4exp_mtp_sparse_arm(n_tokens, n_kv_idx, mctx_hyb, cparams, hparams)) {
++            // the mask may be dropped when the sparse FA derives the cell visibility (the same
++            // n_ubatch*n_ctx*2 win the trunk takes); build_qsa_top_k expects nullptr exactly there
++            const bool want_derived_vis = qwen4exp_want_derived_vis(model, hparams, il, cparams, n_tokens);
++            top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos,
++                    want_derived_vis ? nullptr : inp_attn->get_kq_mask(), sections, il);
++        } else if (!qwen4exp_qsa_off() && r > 0) {
++            // keep the indexer cache complete for the first selective ubatch
++            build_qsa_store_k(mctx_hyb, cur, il);
++        }
++        if (top_k) {
++            cur = build_attn_qsa(inp_attn, Qcur, Kcur, Vcur, top_k, kq_scale, il);
++        } else {
++            cur = build_attn(inp_attn, nullptr, nullptr, nullptr,
++                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
++        }
++    } else {
++        cur = build_attn(inp_attn,
++                nullptr, nullptr, nullptr,
++                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
++    }
+     cb(cur, "mtp_attn_pregate", il);
+ 
+     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
+@@ -1981,14 +2115,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
+     const int64_t n_embd_head = hparams.n_embd_head_v();
+     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+ 
+-    // indexer reads the same block input as q/k/v; no context (the MTP draft attends dense,
+-    // see build_layer_attn's caller in graph_mtp), no cache, or no ratio means dense.
++    // indexer reads the same block input as q/k/v; no context, no cache, or no ratio means dense.
+     // LLAMA_QSA_OFF=1 forces the dense no-indexer regime everywhere (a plain-dense reference:
+     // no indexer store, scoring or sparse selection at any layer) - a gate knob, default OFF.
+-    static const bool qsa_off = [] {
+-        const char * env = getenv("LLAMA_QSA_OFF");
+-        return env != nullptr && std::atoi(env) != 0;
+-    }();
++    const bool qsa_off = qwen4exp_qsa_off();
+     const bool qsa = !qsa_off && mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
+ 
+     ggml_tensor * top_k = nullptr;
+-- 
+2.55.0
+

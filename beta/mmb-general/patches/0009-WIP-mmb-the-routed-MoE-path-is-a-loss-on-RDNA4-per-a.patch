@@ -1,7 +1,7 @@
-From 1629dc00167694ef5648116c869e2378961204b9 Mon Sep 17 00:00:00 2001
+From 6e6d8d48cae54dee8e498c9e813dc6882a4cda15 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Mon, 21 Sep 2026 09:25:41 -0500
-Subject: [PATCH 09/12] WIP mmb: the routed MoE path is a loss on RDNA4 --
+Subject: [PATCH 09/28] WIP mmb: the routed MoE path is a loss on RDNA4 --
  per-arch `routed` policy, default off
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -54,18 +54,18 @@ routed off they are inert on RDNA4, so measuring them is now optional.
  1 file changed, 25 insertions(+), 5 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
-index b240e676c..8083bce57 100644
+index e06313aa0..d7a0ec76a 100644
 --- a/ggml/src/ggml-cuda/mmb.cu
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -1217,6 +1217,7 @@ struct mmb_arch_cfg {
-     int  hc16           = 0, down16 = 0, gatemix = 0, blk16 = 0, res16 = 0;
+@@ -1475,6 +1475,7 @@ struct mmb_arch_cfg {
+     int  hc16           = 1, down16 = 0, gatemix = 0, blk16 = 0, res16 = 0;   // hc16 default ON (policy 2026-09-21; +4-5 % measured on gfx1151)
      int  glu            = 1;     // fused routed gate+up+GLU
      int  bf16w          = 1;     // BF16 dense weights
 +    int  routed         = 1;     // the routed MoE (MUL_MAT_ID) path + its fused GLU
      int  dense_geom     = MMB_GEOM_GFX11_SPLIT;  // see mmb_geom_id
  };
  
-@@ -1228,6 +1229,17 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
+@@ -1486,6 +1487,17 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
          // (WTM=64, WTN=64, TM=TN=4, the same 55296 B) makes the IQ3_S dense GEMM beat the delivery
          // MMQ by 4.5 %.  See wip/mmb-general/gfx1201-s10-dense-geometry.md.
          c.dense_geom = MMB_GEOM_R4_256x128;
@@ -83,7 +83,7 @@ index b240e676c..8083bce57 100644
      }
      // TODO(S12): the routed/GLU thresholds, `tall_mode`, `tiny_m*`, `f32split_*` and `cache_max` are
      // still the gfx1151 values on every arch.  Give RDNA4 its own once they are measured per arch.
-@@ -1252,11 +1264,11 @@ static void mmb_cfg_dump_once() {
+@@ -1510,11 +1522,11 @@ static void mmb_cfg_dump_once() {
      const mmb_arch_cfg & c = mmb_cfg();
      fprintf(stderr, "MMB_CFG cc=0x%x dense_geom=%d min_t=%d glu_thresh=%d routed_thresh=%d tall=%d "
                      "tiny_m=%d/%d f32split=%d(min_m=%d,min_k=%d) cache=%d shadow=%d/%dMB "
@@ -97,7 +97,7 @@ index b240e676c..8083bce57 100644
  }
  
  static size_t mmb_cache_max() { static const int v = getenv("GGML_CUDA_MMB_CACHE") ? atoi(getenv("GGML_CUDA_MMB_CACHE")) : mmb_cfg().cache_max; return (size_t) v; }
-@@ -1425,6 +1437,14 @@ bool mmb_dense_flag() {
+@@ -1683,6 +1695,14 @@ bool mmb_dense_flag() {
  // Tile-class threshold: experts with >= this many rows take the BN=128 tile, the rest the BN=32 one.
  // The small tile re-dequantizes the same A panel once per jt tile (4x the weight dequant per output
  // for a 128-row expert), so this is the knob that trades B-column padding against dequant volume.
@@ -112,7 +112,7 @@ index b240e676c..8083bce57 100644
  int mmb_glu_thresh() { static const int v = getenv("GGML_CUDA_MMB_GLU_THRESH") ? atoi(getenv("GGML_CUDA_MMB_GLU_THRESH")) : mmb_cfg().glu_thresh; return v; }
  int mmb_routed_thresh() { static const int v = getenv("GGML_CUDA_MMB_ROUTED_THRESH") ? atoi(getenv("GGML_CUDA_MMB_ROUTED_THRESH")) : mmb_cfg().routed_thresh; return v; }
  // IQ3_XXS: implemented and correct.  Its MMB *routed* path (individual gate/up MUL_MAT_ID) is a
-@@ -1646,7 +1666,7 @@ bool ggml_cuda_mmb_reads_bf16_act(const ggml_tensor * src0, const ggml_tensor *
+@@ -1929,7 +1949,7 @@ bool ggml_cuda_mmb_reads_bf16_act(const ggml_tensor * src0, const ggml_tensor *
  }
  
  bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
@@ -121,7 +121,7 @@ index b240e676c..8083bce57 100644
      const bool wtype = mmb_wtype_ok(src0->type);
      if (!wtype || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
      if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
-@@ -1802,7 +1822,7 @@ bool ggml_cuda_mmb_dense_will_take(const ggml_tensor * w) {
+@@ -2114,7 +2134,7 @@ bool ggml_cuda_mmb_dense_will_take(const ggml_tensor * w) {
  }
  bool ggml_cuda_mmb_routed_will_take(const ggml_tensor * w) {
      if (!mmb_enabled() || !w) return false;
@@ -130,7 +130,7 @@ index b240e676c..8083bce57 100644
  }
  bool ggml_cuda_mmb_down16() { return mmb_down16_flag(); }
  bool ggml_cuda_mmb_blk16() { static const int v = getenv("LLAMA_HC_BLK16") ? atoi(getenv("LLAMA_HC_BLK16")) : mmb_cfg().blk16; return v != 0; }
-@@ -1895,7 +1915,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -2231,7 +2251,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
  }
  
  bool ggml_cuda_mmb_supported_glu(const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {

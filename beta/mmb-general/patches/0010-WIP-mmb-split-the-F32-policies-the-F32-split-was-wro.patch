@@ -1,7 +1,7 @@
-From 8c686d9efaabe271cc0cb3ebdcb134534f0affb9 Mon Sep 17 00:00:00 2001
+From f86ef69979ba8341f3dc8439e1ca652ae92bf432 Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Mon, 21 Sep 2026 12:37:31 -0500
-Subject: [PATCH 10/12] WIP mmb: split the F32 policies -- the F32 split was
+Subject: [PATCH 10/28] WIP mmb: split the F32 policies -- the F32 split was
  wrongly gated off on RDNA4
 
 S13 of wip/mmb-general/gfx1201-porting.md.  Host-side only.
@@ -53,10 +53,10 @@ gfx1151: the device kernel set is byte-unchanged (host-side change).
  1 file changed, 23 insertions(+), 5 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
-index 8083bce57..899a2416b 100644
+index d7a0ec76a..0ce405561 100644
 --- a/ggml/src/ggml-cuda/mmb.cu
 +++ b/ggml/src/ggml-cuda/mmb.cu
-@@ -1240,6 +1240,15 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
+@@ -1498,6 +1498,15 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
          // (it now measures -1.4 %), see gfx1201-s10-dense-geometry.md §6.  The sub-knobs below
          // (glu/iq3xxs_glu/routed_thresh) are therefore inert on RDNA4.
          c.routed = 0;
@@ -72,7 +72,7 @@ index 8083bce57..899a2416b 100644
      }
      // TODO(S12): the routed/GLU thresholds, `tall_mode`, `tiny_m*`, `f32split_*` and `cache_max` are
      // still the gfx1151 values on every arch.  Give RDNA4 its own once they are measured per arch.
-@@ -1638,15 +1647,24 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
+@@ -1921,15 +1930,24 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
      // keeps its path.
      const bool quant   = mmb_wtype_ok_glu(src0->type) && (mmb_dense_type_ok(src0->type) || mmb_tall_shape(src0->type, K, M, T));
      const bool bf16w   = src0->type == GGML_TYPE_BF16 && mmb_bf16w() && mmb_dense_flag();
@@ -101,7 +101,7 @@ index 8083bce57..899a2416b 100644
 +                       (mmb_f32split() && (mmb_f32split_mode() >= 2 || (M >= mmb_f32split_min_m() && K >= mmb_f32split_min_k()))));
      if (f32cand && !f32w) return false;   // this F32 shape is better on rocBLAS -- no fusion stand-down either
      if ((f32cand ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
-     if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS) && K % 256 != 0) return false;   // whole 256-value super-blocks
+     if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ2_XXS) && K % 256 != 0) return false;   // whole 256-value super-blocks
 -- 
 2.55.0
 

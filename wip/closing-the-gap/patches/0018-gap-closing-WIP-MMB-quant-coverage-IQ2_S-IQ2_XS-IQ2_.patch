@@ -1,0 +1,304 @@
+From 26c5a0f98867d416a9c6501839618b78f5d51f70 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Tue, 22 Sep 2026 15:52:31 -0500
+Subject: [PATCH] gap-closing WIP: MMB quant coverage -- IQ2_S, IQ2_XS, IQ2_XXS
+
+A header-only scan of all 132 .gguf files under /llm/models found IQ2_S
+weights in MiniMax-M2.7-IQ3_S (124 tensors, ffn_gate/up_exps) and
+DeepSeek-V4-Flash-0731-UD-IQ3_XXS (84), and no Q2_K/Q2_0/IQ2_XS/IQ2_XXS.
+This adds the whole IQ2 family anyway (llama-quantize IQ2_S emits IQ2_XS on
+this box): WTYPE 16=IQ2_S (82 B), 17=IQ2_XS (74 B), 18=IQ2_XXS (66 B),
+dequantizers reading the 256-value super-block quarters (iq2s_grid[1024],
+iq2xs_grid[512], iq2xxs_grid[256] + ksigns_iq2xs), wired through dense,
+routed and fused gate+up+GLU + masks/tables, default ON on non-RDNA4.
+
+Validated on gfx1151:
+- oracles (MMB forced on): MUL_MAT iq2_s 14/14, iq2_xs 14/14, iq2_xxs 46/46;
+  MUL_MAT_ID 4/4, 15/15, 75/75.
+- real MiniMax IQ3_S model, isolated iq2_s (MMB_TYPES=iq2_s vs MMB=0):
+  pp4096 435.1 -> 456.6 (+4.9 %); PPL 9.2623 -> 9.3616 (+1.07 %).
+- Nanbeige-3B requantized IQ2_S (actually IQ2_XS): PPL 32.9266 -> 32.9997
+  (+0.22 %), pp8192 737.1 -> 859.0 (+16.5 %).
+---
+ ggml/src/ggml-cuda/mmb.cu | 161 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 154 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
+index 09f0109a3..6e1afdf5d 100644
+--- a/ggml/src/ggml-cuda/mmb.cu
++++ b/ggml/src/ggml-cuda/mmb.cu
+@@ -466,6 +466,107 @@ __device__ __forceinline__ void mmb_dq_row_iq3s(const uint8_t * base, const int
+     }
+ }
+ 
++// dequantize one weight row's 64-value quarter of an IQ2_S super-block (82 B: half d, qs[64],
++// qh[8], scales[8]) into 64 bf16.  q4 = ksh & 3 selects the 64-value quarter (sub-blocks
++// ib = 2*q4, 2*q4+1); each 32-value sub-block is 4 groups of 8.  Fields are non-contiguous, so this
++// loads straight from the row base.  value = d*(0.5 + scale_nibble)*0.25 * iq2s_grid[idx][j] * sign,
++// idx = qs[4*ib+l] | ((qh[ib] << (8-2*l)) & 0x300).
++__device__ __forceinline__ void mmb_dq_row_iq2s(const uint8_t * base, const int q4, uint32_t * arow) {
++    const float d = mmb_h2f(*(const uint16_t *) base);
++    const uint8_t * qs     = base + 2;    // [0..31] grid-index low byte, [32..63] signs
++    const uint8_t * qh     = base + 66;   // 8 x 2-bit index highs
++    const uint8_t * scales = base + 74;   // 8 x 2 x 4-bit
++#pragma unroll
++    for (int g = 0; g < 2; ++g) {
++        const int ib = 2*q4 + g;
++        const uint8_t sc = scales[ib];
++        uint32_t * out = arow + 16*g;
++#pragma unroll
++        for (int l = 0; l < 4; ++l) {
++            const float dl = d * (0.5f + (float)((sc >> (4*(l/2))) & 0xf)) * 0.25f;
++            const uint64_t grid = iq2s_grid[qs[4*ib + l] | ((qh[ib] << (8 - 2*l)) & 0x300)];
++            const uint8_t signs = qs[32 + 4*ib + l];
++            float v[8];
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++                const float gv = dl * (float)((grid >> (8*j)) & 0xFFu);
++                v[j] = (signs >> j) & 1u ? -gv : gv;
++            }
++            out[4*l + 0] = mmb_pack2_so(v[0], v[1]);
++            out[4*l + 1] = mmb_pack2_so(v[2], v[3]);
++            out[4*l + 2] = mmb_pack2_so(v[4], v[5]);
++            out[4*l + 3] = mmb_pack2_so(v[6], v[7]);
++        }
++    }
++}
++
++// dequantize one weight row's 64-value quarter of an IQ2_XS super-block (74 B: half d, qs[64],
++// scales[8]) into 64 bf16.  q4 = ksh & 3 selects the quarter (sub-blocks ib = 2*q4, 2*q4+1); each
++// sub-block is 4 uint16 = 4 groups of 8.  idx = q2[l]: low 9 bits -> iq2xs_grid[512], bits 9..15 ->
++// ksigns_iq2xs[128]; value = d*(0.5 + scales[ib] nibble)*0.25 * grid[j] * sign.
++__device__ __forceinline__ void mmb_dq_row_iq2xs(const uint8_t * base, const int q4, uint32_t * arow) {
++    const float d = mmb_h2f(*(const uint16_t *) base);
++    const uint16_t * qs = (const uint16_t *)(base + 2);   // QK_K/8 uint16
++    const uint8_t  * scales = base + 66;                  // QK_K/32
++#pragma unroll
++    for (int g = 0; g < 2; ++g) {
++        const int ib = 2*q4 + g;
++        const uint16_t * q2 = qs + 4*ib;
++        const uint8_t sc = scales[ib];
++        uint32_t * out = arow + 16*g;
++#pragma unroll
++        for (int l = 0; l < 4; ++l) {
++            const uint32_t idx  = q2[l];
++            const uint64_t grid = iq2xs_grid[idx & 511];
++            const float    dl   = d * (0.5f + (float)((sc >> (4*(l/2))) & 0xf)) * 0.25f;
++            const uint8_t signs = ksigns_iq2xs[idx >> 9];
++            float v[8];
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++                const float gv = dl * (float)((grid >> (8*j)) & 0xFFu);
++                v[j] = (signs >> j) & 1u ? -gv : gv;
++            }
++            out[4*l + 0] = mmb_pack2_so(v[0], v[1]);
++            out[4*l + 1] = mmb_pack2_so(v[2], v[3]);
++            out[4*l + 2] = mmb_pack2_so(v[4], v[5]);
++            out[4*l + 3] = mmb_pack2_so(v[6], v[7]);
++        }
++    }
++}
++
++// dequantize one weight row's 64-value quarter of an IQ2_XXS super-block (66 B: half d, qs[32] as
++// uint16) into 64 bf16.  q4 = ksh & 3 selects the quarter (sub-blocks ib = 2*q4, 2*q4+1); each
++// sub-block is 8 bytes = 2 uint32: bytes 0..3 are four 8-bit iq2xxs_grid[256] indices, the second
++// uint32 holds the 4-bit scale (bits 28..31) and four 7-bit ksigns_iq2xs indices (bits 0,7,14,21).
++__device__ __forceinline__ void mmb_dq_row_iq2xxs(const uint8_t * base, const int q4, uint32_t * arow) {
++    const float d = mmb_h2f(*(const uint16_t *) base);
++    const uint8_t * qs = base + 2;
++#pragma unroll
++    for (int g = 0; g < 2; ++g) {
++        const int ib = 2*q4 + g;
++        const uint32_t a0 = *(const uint32_t *)(qs + 8*ib);
++        const uint32_t a1 = *(const uint32_t *)(qs + 8*ib + 4);
++        const uint8_t * aux8 = (const uint8_t *) &a0;
++        const float db = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
++        uint32_t * out = arow + 16*g;
++#pragma unroll
++        for (int l = 0; l < 4; ++l) {
++            const uint64_t grid = iq2xxs_grid[aux8[l]];
++            const uint8_t signs = ksigns_iq2xs[(a1 >> (7*l)) & 127];
++            float v[8];
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++                const float gv = db * (float)((grid >> (8*j)) & 0xFFu);
++                v[j] = (signs >> j) & 1u ? -gv : gv;
++            }
++            out[4*l + 0] = mmb_pack2_so(v[0], v[1]);
++            out[4*l + 1] = mmb_pack2_so(v[2], v[3]);
++            out[4*l + 2] = mmb_pack2_so(v[4], v[5]);
++            out[4*l + 3] = mmb_pack2_so(v[6], v[7]);
++        }
++    }
++}
++
+ // PARTS-way split of the above across the threads that share one A row, so that a BM < MMB_NT tile
+ // (the GLU's BM=64) does not run the A dequant on only MMB_NT/BM of the warps.  Thread `p` takes the
+ // `il` groups {p, p+PARTS, ...} for both g, writing the same LDS dwords as the whole-row form.
+@@ -724,6 +825,9 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
+             else if constexpr (WTYPE == 13) mmb_dq_row_q5_0(Wbase + (size_t)row * wrow_bytes + (size_t)ksh * 44, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+             else if constexpr (WTYPE == 14) mmb_dq_row_mxfp4(Wbase + (size_t)row * wrow_bytes + (size_t)ksh * 34, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+             else if constexpr (WTYPE == 15) mmb_dq_row_nvfp4(Wbase + (size_t)row * wrow_bytes + (size_t)ksh * 36, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 16) mmb_dq_row_iq2s(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 82, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 17) mmb_dq_row_iq2xs(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 74, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
++            else if constexpr (WTYPE == 18) mmb_dq_row_iq2xxs(Wbase + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 66, ksh & 3, (uint32_t *)(As + (abo + row) * MMB_LDS_STRIDE));
+             else { uint4 * d = (uint4 *)(As + (abo + row) * MMB_LDS_STRIDE); d[0] = a0[i]; d[1] = a1[i]; d[2] = a3[i]; d[3] = a4[i]; d[4] = a5[i]; d[5] = a6[i]; d[6] = a7[i]; d[7] = a8[i]; } } }
+     };
+     auto store_lds_b = [&](const int bbo) {
+@@ -810,6 +914,9 @@ mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ X
+                               WTYPE == 13 ? (size_t)(K / 32) * 22 :
+                               WTYPE == 14 ? (size_t)(K / 32) * 17 :
+                               WTYPE == 15 ? (size_t)(K / 64) * 36 :
++                              WTYPE == 16 ? (size_t)(K / 256) * 82 :
++                              WTYPE == 17 ? (size_t)(K / 256) * 74 :
++                              WTYPE == 18 ? (size_t)(K / 256) * 66 :
+                               (size_t)(K / 32) * (WTYPE == 0 ? 18 : 34);
+     mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, false, DBUF, DBUF2>(W + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
+         [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, D, Dh, store_f32, M, [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, m0, T - t0, As, Bs);
+@@ -920,7 +1027,7 @@ mmb_routed_kernel(const uint8_t * __restrict__ W, const size_t expert_bytes, con
+     const int e = dsc & 0xffff, jt = dsc >> 16;
+     const int r0 = bounds[e] + jt * BN, cnt = bounds[e + 1] - r0;
+     const int m0 = blockIdx.x * BM;
+-    const size_t wrow_bytes = WTYPE == 3 ? (size_t)(K / 256) * 144 : WTYPE == 4 ? (size_t)(K / 32) * 24 : WTYPE == 5 ? (size_t)(K / 256) * 110 : WTYPE == 6 ? (size_t)(K / 256) * 176 : WTYPE == 7 ? (size_t)(K / 256) * 210 : WTYPE == 8 ? (size_t)(K / 256) * 136 : WTYPE == 9 ? (size_t)(K / 256) * 110 : WTYPE == 10 ? (size_t)(K / 256) * 98 : WTYPE == 11 ? (size_t)(K / 32) * 18 : WTYPE == 12 ? (size_t)(K / 32) * 20 : WTYPE == 13 ? (size_t)(K / 32) * 22 : WTYPE == 14 ? (size_t)(K / 32) * 17 : WTYPE == 15 ? (size_t)(K / 64) * 36 : WTYPE == 1 ? (size_t)(K / 32) * 34 : (size_t)(K / 32) * 18;
++    const size_t wrow_bytes = WTYPE == 3 ? (size_t)(K / 256) * 144 : WTYPE == 4 ? (size_t)(K / 32) * 24 : WTYPE == 5 ? (size_t)(K / 256) * 110 : WTYPE == 6 ? (size_t)(K / 256) * 176 : WTYPE == 7 ? (size_t)(K / 256) * 210 : WTYPE == 8 ? (size_t)(K / 256) * 136 : WTYPE == 9 ? (size_t)(K / 256) * 110 : WTYPE == 10 ? (size_t)(K / 256) * 98 : WTYPE == 11 ? (size_t)(K / 32) * 18 : WTYPE == 12 ? (size_t)(K / 32) * 20 : WTYPE == 13 ? (size_t)(K / 32) * 22 : WTYPE == 14 ? (size_t)(K / 32) * 17 : WTYPE == 15 ? (size_t)(K / 64) * 36 : WTYPE == 16 ? (size_t)(K / 256) * 82 : WTYPE == 17 ? (size_t)(K / 256) * 74 : WTYPE == 18 ? (size_t)(K / 256) * 66 : WTYPE == 1 ? (size_t)(K / 32) * 34 : (size_t)(K / 32) * 18;
+     mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, true, DBUF, DBUF2>(W + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
+         [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, As, Bs);
+ }
+@@ -1042,6 +1149,15 @@ __device__ __forceinline__ void mmb_tile_gemm_glu(const uint8_t * __restrict__ W
+             } else if constexpr (WTYPE == 15) {
+                 mmb_dq_row_nvfp4(Wg + (size_t)row * wrow_bytes + (size_t)ksh * 36, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
+                 mmb_dq_row_nvfp4(Wu + (size_t)row * wrow_bytes + (size_t)ksh * 36, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 16) {
++                mmb_dq_row_iq2s(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 82, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_iq2s(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 82, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 17) {
++                mmb_dq_row_iq2xs(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 74, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_iq2xs(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 74, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
++            } else if constexpr (WTYPE == 18) {
++                mmb_dq_row_iq2xxs(Wg + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 66, ksh & 3, (uint32_t *)(Ag + (abo + row) * MMB_LDS_STRIDE));
++                mmb_dq_row_iq2xxs(Wu + (size_t)row * wrow_bytes + (size_t)(ksh >> 2) * 66, ksh & 3, (uint32_t *)(Au + (abo + row) * MMB_LDS_STRIDE));
+             } } }
+     };
+     auto store_lds_b = [&](const int bbo) {
+@@ -1125,7 +1241,7 @@ mmb_routed_glu_kernel(const uint8_t * __restrict__ Wg, const uint8_t * __restric
+     const int e = dsc & 0xffff, jt = dsc >> 16;
+     const int r0 = bounds[e] + jt * BN, cnt = bounds[e + 1] - r0;
+     const int m0 = blockIdx.x * BM;
+-    const size_t wrow_bytes = WTYPE == 3 ? (size_t)(K / 256) * 144 : WTYPE == 4 ? (size_t)(K / 32) * 24 : WTYPE == 5 ? (size_t)(K / 256) * 110 : WTYPE == 6 ? (size_t)(K / 256) * 176 : WTYPE == 7 ? (size_t)(K / 256) * 210 : WTYPE == 8 ? (size_t)(K / 256) * 136 : WTYPE == 9 ? (size_t)(K / 256) * 110 : WTYPE == 10 ? (size_t)(K / 256) * 98 : WTYPE == 11 ? (size_t)(K / 32) * 18 : WTYPE == 12 ? (size_t)(K / 32) * 20 : WTYPE == 13 ? (size_t)(K / 32) * 22 : WTYPE == 14 ? (size_t)(K / 32) * 17 : WTYPE == 15 ? (size_t)(K / 64) * 36 : WTYPE == 1 ? (size_t)(K / 32) * 34 : (size_t)(K / 32) * 18;
++    const size_t wrow_bytes = WTYPE == 3 ? (size_t)(K / 256) * 144 : WTYPE == 4 ? (size_t)(K / 32) * 24 : WTYPE == 5 ? (size_t)(K / 256) * 110 : WTYPE == 6 ? (size_t)(K / 256) * 176 : WTYPE == 7 ? (size_t)(K / 256) * 210 : WTYPE == 8 ? (size_t)(K / 256) * 136 : WTYPE == 9 ? (size_t)(K / 256) * 110 : WTYPE == 10 ? (size_t)(K / 256) * 98 : WTYPE == 11 ? (size_t)(K / 32) * 18 : WTYPE == 12 ? (size_t)(K / 32) * 20 : WTYPE == 13 ? (size_t)(K / 32) * 22 : WTYPE == 14 ? (size_t)(K / 32) * 17 : WTYPE == 15 ? (size_t)(K / 64) * 36 : WTYPE == 16 ? (size_t)(K / 256) * 82 : WTYPE == 17 ? (size_t)(K / 256) * 74 : WTYPE == 18 ? (size_t)(K / 256) * 66 : WTYPE == 1 ? (size_t)(K / 32) * 34 : (size_t)(K / 32) * 18;
+     mmb_tile_gemm_glu<BM, BN, WTM, WTN, WTYPE, true, DBUF, DBUF2>(Wg + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, Wu + (size_t)e * expert_bytes + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
+         [&](int i) { return (i < cnt) ? ids_src[r0 + i] : -1; }, D, Dh, store_f32, M, [&](int i) { return (i < cnt) ? ids_dst[r0 + i] : -1; }, m0, cnt, Ag, Au, Bs);
+ }
+@@ -1655,13 +1771,14 @@ static uint64_t mmb_wtype_mask() {
+                                (1ull << GGML_TYPE_Q3_K) | (1ull << GGML_TYPE_Q4_K) |
+                                (1ull << GGML_TYPE_Q5_K) | (1ull << GGML_TYPE_Q6_K);
+     const uint64_t Q4Q5      = (1ull << GGML_TYPE_Q4_0) | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_0) | (1ull << GGML_TYPE_MXFP4) | (1ull << GGML_TYPE_NVFP4);
++    const uint64_t IQ2       = (1ull << GGML_TYPE_IQ2_S) | (1ull << GGML_TYPE_IQ2_XS) | (1ull << GGML_TYPE_IQ2_XXS);
+     const char * e = getenv("GGML_CUDA_MMB_TYPES");
+     if (e && *e) {
+         static const struct { const char * n; ggml_type t; } tab[] = {
+             {"iq4_nl", GGML_TYPE_IQ4_NL}, {"iq3_s", GGML_TYPE_IQ3_S}, {"iq4_xs", GGML_TYPE_IQ4_XS}, {"iq3_xxs", GGML_TYPE_IQ3_XXS},
+             {"q8_0", GGML_TYPE_Q8_0}, {"q5_1", GGML_TYPE_Q5_1}, {"q3_k", GGML_TYPE_Q3_K},
+             {"q4_k", GGML_TYPE_Q4_K}, {"q5_k", GGML_TYPE_Q5_K}, {"q6_k", GGML_TYPE_Q6_K},
+-            {"q4_0", GGML_TYPE_Q4_0}, {"q4_1", GGML_TYPE_Q4_1}, {"q5_0", GGML_TYPE_Q5_0}, {"mxfp4", GGML_TYPE_MXFP4}, {"nvfp4", GGML_TYPE_NVFP4},
++            {"q4_0", GGML_TYPE_Q4_0}, {"q4_1", GGML_TYPE_Q4_1}, {"q5_0", GGML_TYPE_Q5_0}, {"mxfp4", GGML_TYPE_MXFP4}, {"nvfp4", GGML_TYPE_NVFP4}, {"iq2_s", GGML_TYPE_IQ2_S}, {"iq2_xs", GGML_TYPE_IQ2_XS}, {"iq2_xxs", GGML_TYPE_IQ2_XXS},
+         };
+         for (const char * p = e; *p; ) {
+             while (*p == ',' || *p == ' ') ++p;
+@@ -1676,7 +1793,7 @@ static uint64_t mmb_wtype_mask() {
+         return mask;
+     }
+     const uint64_t RDNA4_SET = IQ_FAMILY | (1ull << GGML_TYPE_Q4_1) | (1ull << GGML_TYPE_Q5_0);
+-    mask = GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[0].cc) ? RDNA4_SET : (IQ_FAMILY | K_AND_Q8 | Q4Q5);
++    mask = GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[0].cc) ? RDNA4_SET : (IQ_FAMILY | K_AND_Q8 | Q4Q5 | IQ2);
+     return mask;
+ }
+ static bool mmb_wtype_ok(const ggml_type t) { return (uint64_t) t < 64 && ((mmb_wtype_mask() >> t) & 1ull) != 0; }
+@@ -1709,7 +1826,7 @@ static uint64_t mmb_dense_tmask() {
+             {"iq4_nl", GGML_TYPE_IQ4_NL}, {"iq3_s", GGML_TYPE_IQ3_S}, {"iq4_xs", GGML_TYPE_IQ4_XS}, {"iq3_xxs", GGML_TYPE_IQ3_XXS},
+             {"q8_0", GGML_TYPE_Q8_0}, {"q5_1", GGML_TYPE_Q5_1}, {"q3_k", GGML_TYPE_Q3_K},
+             {"q4_k", GGML_TYPE_Q4_K}, {"q5_k", GGML_TYPE_Q5_K}, {"q6_k", GGML_TYPE_Q6_K},
+-            {"q4_0", GGML_TYPE_Q4_0}, {"q4_1", GGML_TYPE_Q4_1}, {"q5_0", GGML_TYPE_Q5_0}, {"mxfp4", GGML_TYPE_MXFP4}, {"nvfp4", GGML_TYPE_NVFP4},
++            {"q4_0", GGML_TYPE_Q4_0}, {"q4_1", GGML_TYPE_Q4_1}, {"q5_0", GGML_TYPE_Q5_0}, {"mxfp4", GGML_TYPE_MXFP4}, {"nvfp4", GGML_TYPE_NVFP4}, {"iq2_s", GGML_TYPE_IQ2_S}, {"iq2_xs", GGML_TYPE_IQ2_XS}, {"iq2_xxs", GGML_TYPE_IQ2_XXS},
+         };
+         for (const char * p = e; *p; ) {
+             while (*p == ',' || *p == ' ') ++p;
+@@ -1754,6 +1871,9 @@ static void mmb_dense_launch_t(const ggml_type t, dim3 grid, cudaStream_t stream
+         case GGML_TYPE_Q5_0:    mmb_dense_kernel<BM,BN,WTM,WTN,13><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
+         case GGML_TYPE_MXFP4:   mmb_dense_kernel<BM,BN,WTM,WTN,14><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
+         case GGML_TYPE_NVFP4:   mmb_dense_kernel<BM,BN,WTM,WTN,15><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
++        case GGML_TYPE_IQ2_S:   mmb_dense_kernel<BM,BN,WTM,WTN,16><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
++        case GGML_TYPE_IQ2_XS:  mmb_dense_kernel<BM,BN,WTM,WTN,17><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
++        case GGML_TYPE_IQ2_XXS: mmb_dense_kernel<BM,BN,WTM,WTN,18><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
+         default:                mmb_dense_kernel<BM,BN,WTM,WTN, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T); break;
+     }
+ }
+@@ -1853,7 +1973,7 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
+                        (mmb_f32split() && (mmb_f32split_mode() >= 2 || (M >= mmb_f32split_min_m() && K >= mmb_f32split_min_k()))));
+     if (f32cand && !f32w) return false;   // this F32 shape is better on rocBLAS -- no fusion stand-down either
+     if ((f32cand ? K % 32 : K % 64) != 0 || src1->ne[0] != K || dst->ne[0] != M) return false;
+-    if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS) && K % 256 != 0) return false;   // whole 256-value super-blocks
++    if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ2_XXS) && K % 256 != 0) return false;   // whole 256-value super-blocks
+     if (T < mmb_min_t() || T > INT32_MAX / 4) return false;
+     return ggml_nrows(dst) == T;
+ }
+@@ -1876,7 +1996,7 @@ bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor *
+     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
+     const int64_t K = src0->ne[0], M = src0->ne[1], E = src0->ne[2];
+     if (src0->ne[3] != 1 || K % 64 != 0 || E < 1 || E > 1024) return false;
+-    if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS) && K % 256 != 0) return false;
++    if ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K || src0->type == GGML_TYPE_Q3_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ2_XXS) && K % 256 != 0) return false;
+     const int64_t n_used = ids->ne[0], T = ids->ne[1];
+     if (src1->ne[0] != K || src1->ne[3] != 1 || src1->ne[2] != T) return false;
+     if (src1->ne[1] != 1 && src1->ne[1] != n_used) return false;
+@@ -2026,6 +2146,15 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     } else if (src0->type == GGML_TYPE_NVFP4) {
+         if (big) mmb_dense_kernel<128, 256, 64, 64, 15><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+         else     mmb_dense_kernel<128, 128, 32, 64, 15><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++    } else if (src0->type == GGML_TYPE_IQ2_S) {
++        if (big) mmb_dense_kernel<128, 256, 64, 64, 16><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++        else     mmb_dense_kernel<128, 128, 32, 64, 16><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++    } else if (src0->type == GGML_TYPE_IQ2_XS) {
++        if (big) mmb_dense_kernel<128, 256, 64, 64, 17><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++        else     mmb_dense_kernel<128, 128, 32, 64, 17><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++    } else if (src0->type == GGML_TYPE_IQ2_XXS) {
++        if (big) mmb_dense_kernel<128, 256, 64, 64, 18><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
++        else     mmb_dense_kernel<128, 128, 32, 64, 18><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+     } else {
+         if (big) mmb_dense_kernel<128, 256, 64, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+         else     mmb_dense_kernel<128, 128, 32, 64, 2><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, Dh, store_f32, M, K, T);
+@@ -2126,6 +2255,15 @@ static void mmb_routed_kernel_dispatch(const ggml_tensor * w, dim3 gbig, dim3 gs
+     } else if (w->type == GGML_TYPE_NVFP4) {
+         mmb_routed_kernel<128, 128, 32, 64, 15><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
+         mmb_routed_kernel<128,  32, 32, 16, 15><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_IQ2_S) {
++        mmb_routed_kernel<128, 128, 32, 64, 16><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 16><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_IQ2_XS) {
++        mmb_routed_kernel<128, 128, 32, 64, 17><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 17><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (w->type == GGML_TYPE_IQ2_XXS) {
++        mmb_routed_kernel<128, 128, 32, 64, 18><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_kernel<128,  32, 32, 16, 18><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
+     } else {
+         mmb_routed_kernel<128, 128, 32, 64, 0><<<gbig,   MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
+         mmb_routed_kernel<128,  32, 32, 16, 0><<<gsmall, MMB_NT, 0, stream>>>(W, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
+@@ -2224,6 +2362,15 @@ static void mmb_routed_glu_kernel_dispatch(const ggml_tensor * gw, dim3 gbig, di
+     } else if (gw->type == GGML_TYPE_NVFP4) {
+         mmb_routed_glu_kernel<64, 128, 32, 32, 15><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
+         mmb_routed_glu_kernel<64,  32, 16, 16, 15><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_IQ2_S) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 16><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 16><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_IQ2_XS) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 17><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 17><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
++    } else if (gw->type == GGML_TYPE_IQ2_XXS) {
++        mmb_routed_glu_kernel<64, 128, 32, 32, 18><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
++        mmb_routed_glu_kernel<64,  32, 16, 16, 18><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
+     } else {
+         mmb_routed_glu_kernel<64, 128, 32, 32, 0><<<gbig,   MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_big,   M, K);
+         mmb_routed_glu_kernel<64,  32, 16, 16, 0><<<gsmall, MMB_NT, 0, stream>>>(Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src, ids_dst, bounds, desc_small, M, K);
+-- 
+2.55.0
+

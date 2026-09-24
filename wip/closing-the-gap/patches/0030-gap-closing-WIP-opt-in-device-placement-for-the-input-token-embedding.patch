@@ -1,0 +1,83 @@
+From e16dbe06e70705cdbf1776690b68d6162d41c1b1 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Thu, 24 Sep 2026 09:54:43 -0500
+Subject: [PATCH] gap-closing WIP: opt-in device placement for the input token
+ embedding
+
+OP-1 structural.  By default the input layer stays host-resident (upstream
+placement): on a discrete multi-GPU box the token-embedding GET_ROWS is then
+peeled into a CPU split, which the 0029 single-thread heuristic keeps from
+spinning the OpenMP pool.  LLAMA_DEVICE_INPUT=1 places the input layer on the
+output layer's device instead, so the GET_ROWS runs inside the GPU graph (on a
+-sm tensor build, on the Meta device) and there is no CPU split at all.  The
+per-layer token embedding (qwen4exp/gemma, ~27 GiB) is special-cased to the CPU
+list and stays host-resident/host-gathered.
+
+Validated on gfx1201 qwen4exp IQ4_NL + mtp-shared-Q8_0, 3-GPU -sm tensor:
+  default (host)   110.2 t/s / 1.3 cores
+  LLAMA_DEVICE_INPUT=1  107.6 t/s / 1.0 cores
+acceptance 0.85417 and same-seed text a79d0d14855b identical in both arms, and
+0 CPU splits with the opt-in (so the CPU is quiet even with 0029 disabled).
+27B IQ3_S coherence 6073add19dac (1 GPU and 3-GPU tensor), 35B-A3B plain ==
+draft-mtp, -sm layer plain == draft-mtp, qwen4exp pp2048 2475 t/s.
+
+Opt-in, not default-on: the Meta-split GPU gather measures ~2.6% slower MTP
+than the single-threaded CPU gather (interleaved A/B: host 111.4/111.4/111.4,
+device 108.7/107.5/108.8), and it replicates the table in VRAM.  The runtime
+fix (0029) is the shipped path; this is the structural alternative and a
+bisection knob.  A host-mapped device read (no VRAM) is not reachable under
+-sm tensor because the Meta backend is the only GPU backend and rejects host
+buffers.
+---
+ src/llama-model-loader.cpp |  5 ++++-
+ src/llama-model.cpp        | 18 +++++++++++++++---
+ 2 files changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index b68a48734..ff4e1cd08 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1226,7 +1226,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         const buft_list_t * buft_list;
+         switch (info.layer) {
+             case LLM_TENSOR_LAYER_INPUT:
+-                buft_list = buft_list_input;
++                // the per-layer token embedding is a huge table that the model gathers on the host
++                // (qwen4exp/gemma build_inp_ple), so it must stay host-resident even when the rest
++                // of the input layer is offloaded with LLAMA_DEVICE_INPUT=1; give it the CPU list.
++                buft_list = tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD ? buft_list_cpu : buft_list_input;
+                 break;
+             case LLM_TENSOR_LAYER_OUTPUT:
+                 buft_list = buft_list_output;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index e7c24838f..334c91aaf 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1532,9 +1532,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         return {dev, &pimpl->gpu_buft_list.at(dev)};
+     };
+ 
+-    // assign the input layer
+-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
+-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
++    // assign the input layer.  Default: the upstream host placement.  On a discrete multi-GPU box
++    // the input embedding then lives in host memory and the scheduler peels a CPU split off every
++    // graph; the 0029 single-thread heuristic keeps that split from spinning the OpenMP pool, and
++    // on gfx1201 it measures faster than the alternatives (see the OP-1 structural record).
++    // LLAMA_DEVICE_INPUT=1 places the input layer on the output layer's device instead, so the
++    // token-embedding GET_ROWS runs inside the GPU graph (on a tensor-split build, on the Meta
++    // device) and there is no CPU split at all.  It is opt-in because the Meta-split GPU gather is
++    // ~2.6% slower for MTP than the single-threaded CPU gather; the huge per-layer token embedding
++    // stays host-resident either way (see create_tensor).
++    static const bool dev_input_on = getenv("LLAMA_DEVICE_INPUT") != nullptr;
++    if (dev_input_on) {
++        pimpl->dev_input = get_layer_buft_list(n_layer_all);
++    } else {
++        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
++    }
+ 
+     // assign the repeating layers to the devices according to the splits
+     pimpl->dev_layer.resize(n_layer_all);
+-- 
+2.55.0
+
