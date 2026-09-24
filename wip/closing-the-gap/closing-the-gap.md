@@ -14,12 +14,15 @@ appendices, the MTP qualification).  This file is what a fresh session reads fir
 `0025` = the host-buffer input layer that **supersedes `0024`**; `0026` = the sparse MTP draft
 **default ON**).  The `0024` tip `73a391aba` on branch `gap-closing-r13` is the pre-`0025` baseline
 kept for A/B.
-**Updated:** 2026-09-24 (session 9).  **Session 9 (`gfx1201`): the automatic MTP CPU-spin fix
+**Updated:** 2026-09-24 (session 9 + 9b).  **Session 9 (`gfx1201`): the automatic MTP CPU-spin fix
 ([`patches/0029`](patches/0029-gap-closing-WIP-run-tiny-CPU-split-graphs-on-the-calling-thread.patch),
-28-patch campaign, tip tree `fa9cf6d1e654333d458ade3655c4a0d540225827`) plus the OP-2/OP-3 four-axis
+29-patch campaign, tip tree `99b429a60d441f814c84737cfa57803bc15a2f6d`) plus the OP-2/OP-3 four-axis
 re-baseline and the OP-5.1 `0013`-redundant verdict — see
 [`2026-09-24-mtp-cpu-spin-automatic.md`](2026-09-24-mtp-cpu-spin-automatic.md) and the
-`gfx1201-closing.md` session log.**
+`gfx1201-closing.md` session log.  Session 9b rebased `gap-closing` onto r13 and added the **opt-in**
+structural input placement ([`patches/0030`](patches/0030-gap-closing-WIP-opt-in-device-placement-for-the-input-token-embedding.patch),
+`LLAMA_DEVICE_INPUT=1`: 0 CPU splits, byte-identical, but ~2.6 % slower MTP so not defaulted) — see
+[`2026-09-24-mtp-cpu-spin-structural.md`](2026-09-24-mtp-cpu-spin-structural.md).**
 
 > **No open blockers.**  The HC16-under-MTP bug that gated the campaign is **fixed**
 > ([`patches/0023`](patches/0023-mmb-hc16-per-context.patch),

@@ -4028,6 +4028,22 @@ index f7a118230..d740f8d54 100644
              // What should happen when the pos backtracks or skips a value?
              // Clearing the state mid-batch would require special-casing which isn't done.
              LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index b68a48734..ff4e1cd08 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1226,7 +1226,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         const buft_list_t * buft_list;
+         switch (info.layer) {
+             case LLM_TENSOR_LAYER_INPUT:
+-                buft_list = buft_list_input;
++                // the per-layer token embedding is a huge table that the model gathers on the host
++                // (qwen4exp/gemma build_inp_ple), so it must stay host-resident even when the rest
++                // of the input layer is offloaded with LLAMA_DEVICE_INPUT=1; give it the CPU list.
++                buft_list = tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD ? buft_list_cpu : buft_list_input;
+                 break;
+             case LLM_TENSOR_LAYER_OUTPUT:
+                 buft_list = buft_list_output;
 diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
 index bc60f759b..27ff56107 100644
 --- a/src/llama-model-loader.h
@@ -4047,10 +4063,35 @@ index bc60f759b..27ff56107 100644
          // decide whether this tensor is read lazily
          // pass w to also record it, or nullptr to only ask
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index af1937b33..e7c24838f 100644
+index af1937b33..334c91aaf 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -2536,10 +2536,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -1532,9 +1532,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         return {dev, &pimpl->gpu_buft_list.at(dev)};
+     };
+ 
+-    // assign the input layer
+-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
+-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
++    // assign the input layer.  Default: the upstream host placement.  On a discrete multi-GPU box
++    // the input embedding then lives in host memory and the scheduler peels a CPU split off every
++    // graph; the 0029 single-thread heuristic keeps that split from spinning the OpenMP pool, and
++    // on gfx1201 it measures faster than the alternatives (see the OP-1 structural record).
++    // LLAMA_DEVICE_INPUT=1 places the input layer on the output layer's device instead, so the
++    // token-embedding GET_ROWS runs inside the GPU graph (on a tensor-split build, on the Meta
++    // device) and there is no CPU split at all.  It is opt-in because the Meta-split GPU gather is
++    // ~2.6% slower for MTP than the single-threaded CPU gather; the huge per-layer token embedding
++    // stays host-resident either way (see create_tensor).
++    static const bool dev_input_on = getenv("LLAMA_DEVICE_INPUT") != nullptr;
++    if (dev_input_on) {
++        pimpl->dev_input = get_layer_buft_list(n_layer_all);
++    } else {
++        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
++    }
+ 
+     // assign the repeating layers to the devices according to the splits
+     pimpl->dev_layer.resize(n_layer_all);
+@@ -2536,10 +2548,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
          default:
              {
                  // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
@@ -4103,7 +4144,7 @@ index af1937b33..e7c24838f 100644
  
                  const bool mtp_on_hybrid_nemotron =
                      params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
-@@ -2796,7 +2837,6 @@ llama_model_params llama_model_default_params() {
+@@ -2796,7 +2849,6 @@ llama_model_params llama_model_default_params() {
          /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
          /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
          /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,

@@ -32,7 +32,7 @@ negative, the `0028` W=9 verify-cliff fix, and (2026-09-24) the **OP-1 automatic
 
 | id | item | priority | where |
 |---|---|---|---|
-| **OP-1** | MTP CPU-spin: runtime half **DONE** (`0029`, no env vars needed); **structural half** (input/PLE `GET_ROWS` on a device) + **OP-1.4** draft-sampler offload still open | ~~highest~~ medium | §2.1 |
+| **OP-1** | MTP CPU-spin: runtime half **DONE** (`0029`, no env vars needed); structural half **investigated, opt-in** (`0030`, `LLAMA_DEVICE_INPUT=1` — works, 0 CPU splits, but ~2.6 % slower so not defaulted) + **OP-1.4** draft-sampler offload open | ~~highest~~ medium | §2.1 |
 | **OP-2** | re-baseline the gfx1201 qwen4exp MTP throughput — **DONE** (four-axis + `n7`/`n8`/adaptive, no env) | ~~high~~ DONE | §2.2 |
 | **OP-3** | `0028` follow-ups: matrix **DONE** (odd-row dense model: none available, controls confirmed clean); per-type MoE band tuning open | medium | §2.3 |
 | **OP-4** | validation gates not run: four-axis MTP with the fix (**DONE** as OP-2), `llama-imatrix`, `0001`/`0008` isolated A/Bs, the M-RoPE image case | medium | §2.4 |
@@ -68,6 +68,7 @@ negative, the `0028` W=9 verify-cliff fix, and (2026-09-24) the **OP-1 automatic
 | **OP-2** MTP re-baseline | **DONE** — four-axis + `n7`/`n8`/adaptive, no env, CPU quiet every arm; `n8` near-tied with `n7` and wins recall (the old gap was `0028`) | `2026-09-24-mtp-cpu-spin-automatic.md` §4 |
 | **OP-3** matrix half | **DONE** — the full `n7`/`n8`/adaptive matrix with the fix | `2026-09-24-mtp-cpu-spin-automatic.md` §4 |
 | **OP-5.1** `0013` on RDNA4 | **REDUNDANT** — matcher fires 0× with `0016` ON, 4× with `LLAMA_QSA_SCORE_WMMA=0`; no port | `2026-09-24-mtp-cpu-spin-automatic.md` §5 |
+| **OP-1** structural input placement | **INVESTIGATED, opt-in (`0030`)** — `LLAMA_DEVICE_INPUT=1` moves the input layer to the output/Meta device (0 CPU splits, byte-identical) but the Meta-split GPU gather is ~2.6 % slower MTP than host input + `0029`, so it is not defaulted | `2026-09-24-mtp-cpu-spin-structural.md` |
 | per-patch verdict table | filled for every closing patch | §7 |
 | porting layers | "no port needed" = only the beta prerequisite carried the RDNA4 kernel ports; the closing set's own RDNA3_5-only kernels are OP-5 | §11 porting layers |
 
@@ -113,12 +114,22 @@ Re-confirmed on the current tree (with the `0028` fix), qwen4exp IQ4_NL + `mtp-�
 **+35 %** and 14 cores recovered, acceptance **byte-identical**.  The env mitigation must not remain a
 user requirement.
 
-#### 2.1.2 The structural fix — get the input embeddings off the CPU
+#### 2.1.2 The structural fix — get the input embeddings off the CPU  ← **INVESTIGATED, opt-in (`0030`)**
+
+> **Result (2026-09-24): the structural fix works but is ~2.6 % slower for MTP, so it is opt-in
+> (`LLAMA_DEVICE_INPUT=1`) and the default stays host input + `0029`.**  Detail:
+> [`2026-09-24-mtp-cpu-spin-structural.md`](2026-09-24-mtp-cpu-spin-structural.md).  Interleaved A/B
+> (`-n 1500`): host input + `0029` **111.4/111.4/111.4** t/s vs `LLAMA_DEVICE_INPUT=1`
+> **108.7/107.5/108.8** t/s; acceptance and same-seed text identical.**  The opt-in gives **0 CPU
+> splits / 1.0 cores**.  Candidate 4 (device reads the host-mapped table) is **not reachable under
+> `-sm tensor`** — the Meta backend is the only scheduler GPU backend and rejects host buffers.
 
 If there is no CPU split there is nothing to spin.  `0024` (single-device input-on-GPU) / `0025`
 (host-buffer input + scheduler guard) already cover the **APU / 1-device** cases.  On a **discrete
-multi-GPU** box `n_devices() != 1` and `prop.integrated == 0`, so neither applies and the host-mapped
-`token_embd` / `per_layer_token_embd` / `mtp_tok_embd` `GET_ROWS` stays on the CPU.
+multi-GPU** box `prop.integrated == 0`, so they do not apply and the host-mapped `token_embd` /
+`mtp_tok_embd` `GET_ROWS` stays on the CPU.  (Note `n_devices()` under `-sm tensor` is **1** — the Meta
+device — so the old `n_devices() != 1` framing is wrong; and `per_layer_token_embd` is not a graph op
+at all: the model host-gathers it in `set_input`.)  Only the small `token_embd` table needs moving.
 
 Candidates, cheapest first:
 1. **draft `mtp_tok_embd`** — one small table, a per-draft-step cost; put its `GET_ROWS` on a device.
@@ -299,11 +310,11 @@ see `wip/build-time-regression/` and `TODO.md`.
 
 (Paths are the ones the records used — `ls` to confirm the layout.)
 
-### 3.2 Apply the full stack (28-patch closing set)
+### 3.2 Apply the full stack (29-patch closing set)
 
 The delivery repo is `~/llama-cpp-rdna-boosts`.  The current `~/llama.cpp` checkout is branch
-`closing-gfx1201` = delivery r13 + `beta/mmb-general` + closing `0001..0014`/`0016..0029` (tip tree
-**`fa9cf6d1e654333d458ade3655c4a0d540225827`**).  A fresh apply:
+`closing-gfx1201` = delivery r13 + `beta/mmb-general` + closing `0001..0014`/`0016..0030` (tip tree
+**`99b429a60d441f814c84737cfa57803bc15a2f6d`**).  A fresh apply:
 
 ```sh
 WORK=$HOME/llama-cpp-rdna-boosts
@@ -317,13 +328,13 @@ for p in "$WORK"/wip/closing-the-gap/patches/0*.patch; do
   case "$p" in *0015-*) echo "skip 0015 (superseded by r13 block 00)"; continue;; esac
   git am "$p"
 done
-git rev-parse HEAD^{tree}                                # expect fa9cf6d1e654333d458ade3655c4a0d540225827
+git rev-parse HEAD^{tree}                                # expect 99b429a60d441f814c84737cfa57803bc15a2f6d
 ```
 
 > **Base (2026-09-24): the repo is now on delivery r13.**  `gap-closing` was rebased onto `main`, so
 > `patches/` + `release.json` are the **r13** set (`bb7b6d07…`) and a fresh apply reproduces the branch
-> tip tree `fa9cf6d1…` exactly (28/28 `git am`, verified: block `bb7b6d07`, beta `79136a15`, closing
-> `fa9cf6d1`).
+> tip tree `99b429a6…` exactly (29/29 `git am`, verified: block `bb7b6d07`, beta `79136a15`, closing
+> `99b429a6`).
 
 **Traps:** `0015` must be **skipped**; `0024` must be applied **before** `0025` (the loop order handles
 this).  The single-patch alternative is `git apply` of `wip/closing-the-gap/campaign-all.patch` on the
@@ -395,7 +406,7 @@ Oracles expected: `FLASH_ATTN_QSA` 26/26, `GATED_DELTA_NET` 46/46, `TOPK_QSA` 4/
 * **Fold a fix** into an existing patch with `git commit --fixup=<commit>` then
   `GIT_SEQUENCE_EDITOR=true GIT_EDITOR=true git rebase --autosquash <commit>~1`; regenerate with
   `git format-patch -1 <sha> --stdout --no-numbered`; replace the patch file and re-verify a fresh
-  r13+beta worktree + the **28** patches reproduces the branch tip tree.  A **new** change is a new
+  r13+beta worktree + the **29** patches reproduces the branch tip tree.  A **new** change is a new
   numbered patch (`git format-patch -1 <sha> --stdout --no-numbered > patches/00NN-…patch`) and the
   `campaign-all.patch` `git diff <r13+beta tree>..<tip>` is regenerated too.
 * **Do not push the `~/llama.cpp` fork**; push the delivery repo only on explicit request.
@@ -411,6 +422,28 @@ name, not "it was slower".  For MTP use `benchmarks/mtp-adaptive-methodology.md`
 ---
 
 ## 4. Session log (open-work sessions, newest first)
+
+### 2026-09-24 — session 9b: OP-1 structural (opt-in `0030`) + the r13 rebase
+
+**Rebase.**  `gap-closing` was rebased onto `main` (r13); the repo's `patches/`/`release.json` are now
+r13 and the documented fresh apply reproduces the branch tip tree exactly.  Only `WORKLOG.md`
+conflicted (main's r13 entry vs the campaign's 2026-09-22/21 entries); both sides kept, r13 first.
+
+**OP-1 structural — investigated, folded as opt-in `0030` (`LLAMA_DEVICE_INPUT=1`).**  The structural
+fix works: it moves the small `token_embd` table to the output/Meta device and the `GET_ROWS` runs in
+the GPU graph, giving **0 CPU splits** and ~1.0 cores even with `0029` disabled.  But the Meta-split
+GPU gather is **~2.6 % slower** MTP than the host input + `0029` single-thread gather (interleaved A/B
+`-n 1500`: host **111.4/111.4/111.4**, device **108.7/107.5/108.8**), so it is **not** defaulted.
+Acceptance and same-seed text are identical (`0.85417` / `a79d0d14855b`).  Candidate 4 (device reads the
+host-mapped table) is not reachable under `-sm tensor` (the Meta backend is the only GPU backend and
+rejects host buffers).  Full detail:
+[`2026-09-24-mtp-cpu-spin-structural.md`](2026-09-24-mtp-cpu-spin-structural.md).  Validated: 27B IQ3_S
+`6073add19dac` (1 GPU + 3-GPU tensor), 35B-A3B plain == `draft-mtp`, `-sm layer` plain == `draft-mtp`,
+`pp2048` 2475 t/s, fresh apply 29/29 → tree
+`99b429a60d441f814c84737cfa57803bc15a2f6d`.
+
+**Still open:** OP-1.4 draft-sampler offload, OP-3 per-type MoE band, OP-4 (`llama-imatrix`, isolated
+`0001`/`0008` A/Bs, M-RoPE image), OP-5.2 `0011`, OP-6 build time.
 
 ### 2026-09-24 — session 9: OP-1 automatic CPU-spin fix (`0029`) + OP-2/OP-3 re-baseline + OP-5.1
 
