@@ -128,8 +128,10 @@ The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and t
    the rule-5 batched gate and PPL parity are all green; closing adds **+1.0…+4.4 %** prefill over
    r13+beta at depth.  One correctness fix was folded into `patches/0004` (the GDN/PLE conv1d
    fusion is not bit-identical under `-sm tensor`; it is now gated to single-device graphs).  See
-   [`gfx1201-closing.md`](gfx1201-closing.md) §11 and
+   [`gfx1201-closed.md`](gfx1201-closed.md) §11 and
    [`2026-09-23-gfx1201-conv-fusion-tensor-split.md`](2026-09-23-gfx1201-conv-fusion-tensor-split.md).
+   **The gfx1201 open work is [`gfx1201-closing.md`](gfx1201-closing.md)** (OP-1 the MTP CPU-spin fix, …);
+   the closed validation/porting history is [`gfx1201-closed.md`](gfx1201-closed.md).
    **`0016` `QSA_SCORE_WMMA` is now PORTED to RDNA4 (2026-09-23, default ON)** — the 4-head
    indexer WMMA kernel gives **+1.7…+12.3 % qwen4exp prefill** at pp8192…65536; oracle 225/225,
    purity holds.  See [`2026-09-23-qsa-score-wmma-rdna4.md`](2026-09-23-qsa-score-wmma-rdna4.md).

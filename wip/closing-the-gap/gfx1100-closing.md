@@ -379,7 +379,7 @@ mask, and **both are default-ON on non-RDNA4** — so gfx1100 already runs them 
 `MUL_MAT`/`MUL_MAT_ID` oracle work and the `gemma-26B-A4B +11.4 %` row in §9.5).  This is *gfx1100's*
 WMMA-quant work, not gfx1201's (RDNA4's mask is deliberately narrow).
 
-Remaining: the same **per-(type, path, shape)** question the gfx1201 handover (`gfx1201-closing.md`
+Remaining: the same **per-(type, path, shape)** question the gfx1201 handover (`gfx1201-closed.md`
 §12.1) lays out — the beta's RDNA4 numbers do **not** predict gfx1100 (the gfx11 MMQ path is much
 weaker here, which is why MMB wins on gfx1100).  Concretely: for each of the eight types,
 `llama-bench -p 8192,32768 -n 0 -b 4096 -ub 4096 -r 5` with `GGML_CUDA_MMB=0` vs default, dense
@@ -408,7 +408,7 @@ they are not end-to-end testable on a 24 GiB gfx1100 — same "no model fits" ru
 measurable gfx1100 action is: keep the `graph_optimize` marking path healthy (the `0019`/`0023`
 scheduler+imatrix gates, §9.7) and, on a 2× W7900 box, re-check that the markings still run under
 `-sm tensor` — they will **not**, per the gfx1201 meta-backend finding, so a W7900 qwen4exp run
-would silently lose them unless Work item 3 of `gfx1201-closing.md` §12.3 is done.
+would silently lose them unless Work item 3 of `gfx1201-closed.md` §12.3 is done.
 
 ### 7.2.4 Commands + traps
 

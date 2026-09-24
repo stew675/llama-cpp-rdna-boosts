@@ -1,6 +1,6 @@
 # 2026-09-24 — `0003` `hc_gate_mix` ported to RDNA4: **+5.3…5.8 % qwen4exp prefill**
 
-**Work item 2 of [`gfx1201-closing.md`](gfx1201-closing.md) §12.2**, unblocked by the IQ4_NL
+**Work item 2 of [`gfx1201-closed.md`](gfx1201-closed.md) §12.2**, unblocked by the IQ4_NL
 Qwen3.8-Flash-Next download (`/llm/models/Qwen3.8/Flash-Next/IQ4_NL/`).  Box: 3× Radeon AI PRO
 R9700 (gfx1201); campaign branch `closing-gfx1201`; 3-GPU `-sm tensor`.
 

@@ -1,6 +1,6 @@
 # 2026-09-23 — the meta-backend `graph_optimize` gap: markings now run under `-sm tensor`
 
-**Work item 3 of [`gfx1201-closing.md`](gfx1201-closing.md) §12.3.**  Box: 3× Radeon AI PRO R9700
+**Work item 3 of [`gfx1201-closed.md`](gfx1201-closed.md) §12.3.**  Box: 3× Radeon AI PRO R9700
 (gfx1201), ROCm 7.14; campaign branch `closing-gfx1201` (r13 + `beta/mmb-general` + the closing set).
 
 ## TL;DR

@@ -29,7 +29,8 @@ measured clean (27B UD-Q4_K_XL 3-GPU tensor: 97.4 vs 97.0; 4B: 195/194 and 184/1
 dense/MoE baselines above are not affected and acceptance is unaffected everywhere**.  Until the
 automatic fix lands, any **qwen4exp-on-discrete** MTP t/s in this file is ~35 % low — re-measure with
 the env set (or the fixed build).  Root cause, harness and the planned automatic fix:
-`wip/closing-the-gap/gfx1201-closing.md` §11 session 6 and §13.
+`wip/closing-the-gap/gfx1201-closed.md` §11 session 6 (the root cause) and
+`wip/closing-the-gap/gfx1201-closing.md` §2.1 (the open automatic fix).
 
 **2026-09-17 update:** the re-base onto `ebbb18522` picked up upstream #28549 ("Enable CUDA graph for
 MTP draft"), which the isolated A/B now shows is worth **+0.3-1.4 %** on the four-axis adaptive gate

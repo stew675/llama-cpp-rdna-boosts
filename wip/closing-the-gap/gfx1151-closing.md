@@ -204,8 +204,9 @@ done
 
 ### 4.4 The `n7/n8/adaptive` MTP matrix (the §13.6 follow-up belongs to this box)
 
-`gfx1201-closing.md` §13.6/§13.7 explicitly left the `n_max 8` question to **gfx1151** (it is where
-the original `n8 > n7` observation was made).  With the boundary fix in place, run the full matrix:
+`gfx1201-closed.md` §13.6/§13.7 explicitly left the `n_max 8` question to **gfx1151** (it is where
+the original `n8 > n7` observation was made); the follow-up is tracked as `gfx1201-closing.md` §2.3
+(OP-3).  With the boundary fix in place, run the full matrix:
 R/C/K/P/X × `none`/`n7`/`n8`/`adaptive cap 8`, `-n 3000`, reasoning pinned per axis
 (`benchmarks/mtp-adaptive-methodology.md` rule 0).  Compare against the **off_both** arm.
 The gfx1201 unconfounded result is `n7` beats `n8` on every axis (session 6) — if gfx1151 shows the
@@ -328,4 +329,4 @@ Handover created.  **Nothing measured on gfx1151 yet.**  The gfx1201 fix is now
 `gap-closing-hostbuf-integrated`, build, and run §4.2/§4.3.  Open decisions: §3 (revalidate the MoE
 band that already fires here), §4.6 (widen the dense odd-row gate?), §5.1 (launch-bounds occupancy).
 Full gfx1201 evidence: [`2026-09-24-qwen4exp-w9-verify-cliff.md`](2026-09-24-qwen4exp-w9-verify-cliff.md)
-and [`gfx1201-closing.md`](gfx1201-closing.md) §13.7.
+and [`gfx1201-closed.md`](gfx1201-closed.md) §13.7 (session 8).
