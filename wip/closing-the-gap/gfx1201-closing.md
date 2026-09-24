@@ -365,3 +365,69 @@ MTP verdict, and the `-b/-ub 4096` protocol for A/Bs.
 6. **`--ctx-checkpoints 0` for anything at depth** — otherwise depth MTP is nondeterministic.
 7. **Never benchmark in parallel**; interleave arms in one warm session.
 8. **Do not push the `~/llama.cpp` fork.**  Push the delivery repo only on explicit request.
+
+---
+
+## 11. Session log
+
+Newest first.  Each session appends its state, what it changed, and the next action.
+
+### 2026-09-23 — integration + first validation pass (gfx1201 / `soar`)
+
+**Box:** 3× Radeon AI PRO R9700 (gfx1201), Ryzen 9 9950X3D2, 184 GiB, ROCm
+`/opt/rocm-7.14.1-gfx102X` (build) + `/opt/rocm-7.14-gfx1201` (runtime).
+
+**Integration — done, no port needed for the apply.**  The brief's §2 order was followed exactly:
+delivery r13 from `main` (16 blocks, applied tree `bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`), then
+the 12 `beta/mmb-general` patches (`79136a15cac1920c0dd334b4c119a9cb42f9143b`), then the 25 closing
+patches skipping `0015` (`1f09fd97d916ca080f7f65cdc422a3d6c425baa7`).  The closing set applied
+**25/25 clean** on gfx1201 — the gfx12 shim is already in `beta/mmb-general`, so nothing needed
+porting to make it build.  Baselines kept: `~/llama-baseline` (r13+beta, tree `79136a15…`),
+campaign `~/llama.cpp` branch `closing-gfx1201`.
+
+**Fix folded into the set (this session).**  `0004`'s GDN/PLE conv1d fusion is **not bit-identical
+under `-sm tensor`** on 27B/35B — the direct kernel diverges from both the raw ops and upstream's
+`SSM_CONV+SILU` fusion; on 1 GPU / `-sm layer` it is bit-identical.  The fusion is now gated to
+single-device graphs (`GGML_CUDA_CONV_FUSION_MULTI=1` forces it back on).  Full record:
+[`2026-09-23-gfx1201-conv-fusion-tensor-split.md`](2026-09-23-gfx1201-conv-fusion-tensor-split.md).
+The `0004` patch was regenerated and the 25-patch set re-applied to tree
+**`1be654fa71167e470ffcce70456bef7a23e6de25`** (25/25).  *(Root cause still open; see the record's
+follow-up.)*
+
+**Gates run so far:**
+
+* `MMB_CFG` (default MMB on, 1 GPU) — exact expected gfx1201 row:
+  `cc=0x1001201 dense_geom=1 … hc16=1 down16=0 gatemix=0 blk16=0 res16=0 glu=1 bf16w=1 iq3xxs_glu=0 routed=0`.
+  `hc16=1` (the `0002` flip, inert on RDNA4), `gatemix=0`/`routed=0` (RDNA4 policy).  ✔
+* Same-seed coherence (`-c 8192`, prose, `-n 24`, seed 42, temp 0, `--reasoning off`), campaign
+  (post-fix) vs r13+beta baseline:
+
+  | model | campaign | baseline |
+  |---|---|---|
+  | 4B Q8_0 (1 GPU) | `9f9f41270c70` (101) | `9f9f41270c70` |
+  | 27B UD-IQ3_S (1 GPU) | `6073add19dac` (114) | `6073add19dac` |
+  | 27B UD-IQ3_S (3 GPU tensor) | `6073add19dac` | `6073add19dac` |
+  | 27B Q8_0 (3 GPU tensor, `-lm none -lzm on`) | `4d28938cbe05` (98) | `6073add19dac` (114) |
+  | 35B-A3B UD-Q3_K_M (1 GPU) | `211639f7037d` (106) | `054353ad27ff` (105) |
+
+  4B and 27B UD-IQ3_S are byte-identical to the baseline (a good first sign: the campaign's
+  re-baselining is confined to where MMB/the new kernels actually fire).  27B Q8_0 and 35B differ
+  — the expected prefill re-baseline (MMB is excluded for Q8_0, so this is the arch-neutral groups
+  on the 3-GPU path / the MoE path).  **Do not treat the cross-tree hashes as gates**; the contract
+  is intra-build purity (§6.2), not yet run.
+
+* Conv-fusion A/B (27B/35B, tensor vs layer vs 1 GPU) — see the record above.  ✔
+
+**Next actions (priority order):**
+
+1. Finish the §6.1/§6.2 gates on the campaign tree: intra-build `plain == draft-mtp` at 8K/40K/128K
+   (`--ctx-checkpoints 0`), and the per-model coherence at depth.  *(The Q8_0/35B cross-tree deltas
+   above must be shown to be re-baselines, not impurities.)*
+2. §6.3 width probe (P=1024 stock; extend for P=32768), §6.5 op oracles (`FLASH_ATTN_QSA` 26/26,
+   `GATED_DELTA_NET`, `TOPK_QSA`, `LIGHTNING_INDEXER`, `FLASH_ATTN_EXT` from **separate** streams).
+3. §6.6 qwen4exp headline: Flash-Next IQ4_XS + `-md mtp-…`, 3-GPU `-sm tensor`, pp8192…98304 vs the
+   r13+beta baseline (S14 expectation +22 % at depth), then the `0021`/`0022`/`0016` A/Bs and the
+   `0020`/`0026` sparse-MTP acceptance gate (`-n 3000`, reasoning pinned).
+4. Per-patch verdict table (§7) and the port candidates' status (§8).  The known-inert ones
+   (`0003`, `0016`, `0017`/`0018`, `0022`, `0025`) still need their "why inert" predicate recorded.
+5. Re-check the conv-fusion root cause; if it is a real fixable bug, remove the multi-device gate.
