@@ -122,6 +122,15 @@ The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and t
    + `wip/closing-the-gap`), the per-patch arch-sensitive inventory, the gate commands, the expected
    `MMB_CFG` row and the port candidates.  Extend `beta/mmb-general/gfx1201-s14-gates.md` /
    `gfx1100-porting.md` with the session results.
+   **gfx1201 status (2026-09-23): DONE.**  The full stack applies **25/25** on RDNA4 (no port
+   needed); oracles, width purity, `plain == draft-mtp` at 8K/40K/128K, MTP acceptance (0.81388),
+   the rule-5 batched gate and PPL parity are all green; closing adds **+1.0…+4.4 %** prefill over
+   r13+beta at depth.  One correctness fix was folded into `patches/0004` (the GDN/PLE conv1d
+   fusion is not bit-identical under `-sm tensor`; it is now gated to single-device graphs).  See
+   [`gfx1201-closing.md`](gfx1201-closing.md) §11 and
+   [`2026-09-23-gfx1201-conv-fusion-tensor-split.md`](2026-09-23-gfx1201-conv-fusion-tensor-split.md).
+   gfx1100 is still open; the RDNA4 port candidates (`0003` gate-mix, `0016` `QSA_SCORE_WMMA` WMMA,
+   `0017`/`0018` MMB quant types) remain future work — the generic fallbacks are in use and gated.
 4. **`-ub 16384`** — parked until the managed PLE reader's no-cache parallel-pread fast path is picked
    up (item 13 in the closed record).  Root cause in `closed-the-gap.md` (the full-vocab
    `result_output` reserve + the HC `block_out` pin + the resident PLE table).
