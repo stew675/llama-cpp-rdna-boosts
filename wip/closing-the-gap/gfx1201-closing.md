@@ -533,7 +533,7 @@ is in the 25 closing patches:
    |---|---|
    | `0003` `hc_gate_mix` (`mmb.cu`) | **not ported** — IQ4_NL + RDNA3_5 WMMA; `gatemix=0`, call site RDNA3_5-gated |
    | `0013` prefill indexer relu-sum | **inert** — call site `GGML_CUDA_CC_IS_RDNA3_5` (`ggml-cuda.cu:4250`) |
-   | `0016` `QSA_SCORE_WMMA` (`lightning-indexer.cu`) | **not ported** — `supports_indexer4` is RDNA3_5; the generic vec fallback is used |
+   | `0016` `QSA_SCORE_WMMA` (`lightning-indexer.cu`) | **PORTED 2026-09-23** — gfx12 `I_MAJOR` A/B layout + RDNA4 enable, **default ON**, **+1.7…+12.3 % prefill** |
    | `0017`/`0018` MMB new quant types | **not enabled** — RDNA4 mask is `IQ_FAMILY` only; the dequant is arch-neutral but unreachable |
    | `0011` HC BF16 streams | default OFF; inert under `-sm tensor` (meta-backend `graph_optimize` gap); tested `-sm layer` — no gfx1201 win |
    | `0010` MoE BF16 epilogue | default OFF; same meta gap; tested `-sm layer` — no gfx1201 win |
@@ -572,6 +572,25 @@ under `-sm tensor` needs the meta backend to run the CUDA markings on the per-de
 before allocation (marks are keyed by tensor pointer; residual marks add alloc deps).  That is the
 concrete gfx1201 (multi-GPU) port — but per point 2 it is not worth it for these two features.
 
+#### 2026-09-23 — `0016` `QSA_SCORE_WMMA` **ported to RDNA4 — a real gfx1201 win**
+
+Following the lossy-prefill negative, the first *positive* transfer: `0016`'s 4-head/128-dim indexer
+WMMA kernel was RDNA3_5-only.  It uses the `ggml_cuda_mma` `tile`/`mma()` abstraction (not
+hand-rolled fragments), so the port was three small changes: select
+`DATA_LAYOUT_I_MAJOR` A/B for RDNA4 (`MIRRORED` is gfx11-only), widen the compile gate to
+`(RDNA3 || RDNA4)`, and enable RDNA4 in `indexer4_arch_enabled` (default ON,
+`GGML_CUDA_LIGHTNING_INDEXER4_GFX1201=0` for the A/B).
+
+* **Correctness:** `LIGHTNING_INDEXER` **225/225** (the 4-head cases now take the WMMA path vs the
+  CPU oracle); width purity PASS; `plain == draft-mtp` byte-identical (`90069b3ed9c4`).
+* **Prefill (qwen4exp IQ4_XS, 3-GPU `-sm tensor`, q8_0 KV, `-b/-ub 4096`, `-r 5`, interleaved):**
+  +1.7 % @pp8192, +3.2 % @pp16384, +6.5 % @pp32768, **+12.3 % @pp65536** vs the generic fallback.
+  (The first cold run showed a spurious −21 % at pp8192 with ±121 t/s noise; the warm `-r 5` run
+  is clean at every depth.)
+* Folded into the `0016` commit; the 25-patch set re-applies to tree
+  **`95f916a8e015efd68ee44bcea7620187ebc70019`**.  Full record:
+  [`2026-09-23-qsa-score-wmma-rdna4.md`](2026-09-23-qsa-score-wmma-rdna4.md).
+
 #### 2026-09-23 — per-patch verdict table (§7)
 
 | patch | fires on gfx1201? | verdict | evidence |
@@ -590,7 +609,7 @@ concrete gfx1201 (multi-GPU) port — but per point 2 it is not worth it for the
 | `0012` mmb_cvt `out_xn` | yes (MMB on) | exercised | qwen4exp prefill A/B |
 | `0013` indexer relu-sum | **no** | **inert on RDNA4** — call site is `GGML_CUDA_CC_IS_RDNA3_5(cc)` (`ggml-cuda.cu:4250`) | call-site gate; our tree already banks the reduction via the fused `GGML_CUDA_QSA_INDEXER_SCORE` |
 | `0014` QSA scorer trim | qwen4exp-only | exercised | qwen4exp gates |
-| `0016` `QSA_SCORE_WMMA` | yes, **generic fallback** | RDNA3_5 WMMA not taken; `=0` is a re-baseline (brief correction) | `supports_indexer4`; `LIGHTNING_INDEXER` 225/225; A/B above |
+| `0016` `QSA_SCORE_WMMA` | yes, **RDNA4 WMMA (ported this session, default ON)** | **+1.7/+3.2/+6.5/+12.3 % prefill** @pp8192/16384/32768/65536; oracle 225/225; purity holds | [`2026-09-23-qsa-score-wmma-rdna4.md`](2026-09-23-qsa-score-wmma-rdna4.md) |
 | `0017` MMB quant coverage | **not enabled** | **not ported** — RDNA4 mask is `IQ_FAMILY` only; the dequant compiles but is unreachable | `mmb.cu` mask; no matching model/env to force it this session |
 | `0018` MMB IQ2 coverage | **not enabled** | **not ported** — same | same |
 | `0019` HC16 eval-callback fix | **no** (HC16 is RDNA3_5-gated) | inert on RDNA4 | `MMB_CFG hc16=1` but call site gated |

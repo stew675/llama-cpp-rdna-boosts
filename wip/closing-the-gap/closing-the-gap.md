@@ -130,8 +130,11 @@ The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and t
    fusion is not bit-identical under `-sm tensor`; it is now gated to single-device graphs).  See
    [`gfx1201-closing.md`](gfx1201-closing.md) §11 and
    [`2026-09-23-gfx1201-conv-fusion-tensor-split.md`](2026-09-23-gfx1201-conv-fusion-tensor-split.md).
-   gfx1100 is still open; the RDNA4 port candidates (`0003` gate-mix, `0016` `QSA_SCORE_WMMA` WMMA,
-   `0017`/`0018` MMB quant types) remain future work — the generic fallbacks are in use and gated.
+   **`0016` `QSA_SCORE_WMMA` is now PORTED to RDNA4 (2026-09-23, default ON)** — the 4-head
+   indexer WMMA kernel gives **+1.7…+12.3 % qwen4exp prefill** at pp8192…65536; oracle 225/225,
+   purity holds.  See [`2026-09-23-qsa-score-wmma-rdna4.md`](2026-09-23-qsa-score-wmma-rdna4.md).
+   gfx1100 is still open; the remaining RDNA4 port candidates are `0003` (gate-mix) and
+   `0017`/`0018` (MMB quant types) — the generic fallbacks are in use and gated.
    **gfx1151 lossy-prefill transfer (`0010`/`0011`) — NEGATIVE 2026-09-23:** the maintainer's
    `LLAMA_HC_BLK16=1 LLAMA_HC_RES16=1 GGML_CUDA_MMB_DOWN16=1` config was tested on gfx1201 and shows
    **no measurable win** (flat at pp8192/32768 under `-sm layer`; under `-sm tensor` the markings do

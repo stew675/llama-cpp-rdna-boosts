@@ -1581,7 +1581,7 @@ index 390fc7a47..7a9bae5fa 100644
  
  void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
-index 5edc967e0..a90fd1f88 100644
+index 5edc967e0..278b4f5bf 100644
 --- a/ggml/src/ggml-cuda/lightning-indexer.cu
 +++ b/ggml/src/ggml-cuda/lightning-indexer.cu
 @@ -1,5 +1,6 @@
@@ -1645,7 +1645,7 @@ index 5edc967e0..a90fd1f88 100644
          return false;
      }
  
-@@ -586,3 +609,138 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst)
+@@ -586,3 +609,151 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst)
              return false;
      }
  }
@@ -1664,9 +1664,15 @@ index 5edc967e0..a90fd1f88 100644
 +__global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
 +        const char * q, const char * k, const char * w, const char * mask,
 +        char * dst, indexer_layout s) {
-+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
++#if defined(AMD_WMMA_AVAILABLE) && (defined(RDNA3) || defined(RDNA4))
 +    using namespace ggml_cuda_mma;
++#if defined(RDNA3)
 +    using AB=tile<16,8,half2,DATA_LAYOUT_I_MAJOR_MIRRORED>;
++#else
++    // RDNA4 (gfx12): A/B use the plain I_MAJOR layout ("two runs of four" per lane); the
++    // MIRRORED layout is a gfx11 builtin only and has no RDNA4 device code.
++    using AB=tile<16,8,half2,DATA_LAYOUT_I_MAJOR>;
++#endif
 +    using C=tile<16,16,float,DATA_LAYOUT_J_MAJOR>;
 +    const int warp=threadIdx.y,lane=threadIdx.x,tid=warp*32+lane;
 +    const int qfirst=int(blockIdx.y)*16,kfirst=int(blockIdx.x)*64,stream=blockIdx.z;
@@ -1733,14 +1739,21 @@ index 5edc967e0..a90fd1f88 100644
 +}
 +
 +// The 4-head WMMA kernel is the RDNA3_5 (gfx1151) shipped arm.  RDNA3_0 (gfx1100) shares the gfx11
-+// WMMA builtin, so the kernel compiles there; it is a port candidate gated OPT-IN via
-+// GGML_CUDA_LIGHTNING_INDEXER4_GFX1100 until a gfx1151/gfx1201 session A/Bs qwen4exp prefill
-+// end-to-end (the kernel is prefill-only, n_tps >= 128).
++// WMMA builtin, so the kernel compiles there; it is gated OPT-IN via
++// GGML_CUDA_LIGHTNING_INDEXER4_GFX1100 until a gfx1151 session A/Bs qwen4exp prefill end-to-end.
++// RDNA4 (gfx1201) uses the same ggml_cuda_mma tile abstraction but the gfx12 fragment layout
++// (DATA_LAYOUT_I_MAJOR A/B instead of the gfx11 MIRRORED one) -- ported 2026-09-23, default ON;
++// GGML_CUDA_LIGHTNING_INDEXER4_GFX1201=0 forces the generic vec fallback for an A/B.
 +static bool indexer4_arch_enabled(int cc) {
 +    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) { return true; }
 +    if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
 +        static const int v = getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1100")
 +            ? atoi(getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1100")) : 0;
++        return v != 0;
++    }
++    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
++        static const int v = getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1201")
++            ? atoi(getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1201")) : 1;
 +        return v != 0;
 +    }
 +    return false;
