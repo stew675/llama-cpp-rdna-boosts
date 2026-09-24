@@ -224,6 +224,13 @@ R/C/K/P/X × `none`/`n7`/`n8`/`adaptive cap 8`, `-n 3000`, reasoning pinned per 
 The gfx1201 unconfounded result is `n7` beats `n8` on every axis (session 6) — if gfx1151 shows the
 opposite, the boundary path is the first thing to check.
 
+**RESULT 2026-09-24 (gfx1151): DONE.**  With `0031`, `n8` beats `n7` on R (+7 %), C (+3.6 %), K
+(+4.0 %) and P (+7.4 %); the only `n7` win is **X (phase-switching)**, where the `n8` acceptance drops
+(0.382 vs 0.457).  The `n8denseoff` attribution arm is slower on every axis (R −19 %, P −9 %, K
+−7 %, C −5 %, X −2 %) with acceptance essentially unchanged → the `0031` dense band is the cause, not
+the acceptance curve.  Adaptive wins R (44.2) / X (47.5), fixed `n8` wins C/K/P.  Record:
+[`2026-09-24-gfx1151-mtp-n7-n8.md`](2026-09-24-gfx1151-mtp-n7-n8.md).
+
 ### 4.5 Per-type question for the MoE band (only if §4.2 shows a regression)
 
 `get_mmvq_mmid_max_batch_rdna3` caps routed types at 4–6 (`IQ4_NL`/`IQ4_XS` 6, `Q3_K`/`IQ3_*` 4,
@@ -429,6 +436,14 @@ routed MoE band→16 is a **loss** (floor RDNA3_5 back at `MMVQ_MAX_BATCH_SIZE`)
 PASS (row-0 `268e0673300b7a33`), `plain == n3`, dense on/off identical text, QSA 26/26, GDN 46/46.
 **Next:** §8 carry-over items (notably §8#6 M-RoPE image + MTP, the box the crash was found on) and
 §9 (measure the `0025` copy before porting the input ring); RDNA3_0 remains with `gfx1100-closing.md`.
+
+### 2026-09-24 — §4.4 `n7`/`n8`/adaptive matrix DONE on gfx1151
+
+Ran the full R/C/K/P/X × {none, n7, n8, adaptive cap 8} matrix (+ an `n8` dense-off attribution arm)
+at `-n 3000` on `0031`.  **With `0031`, `n8` beats `n7` on R/C/K/P and the only `n7` win is X
+(phase-switching); the dense-off arm is slower on every axis with acceptance unchanged — the `0031`
+dense band is what makes `n8` work.**  Record: [`2026-09-24-gfx1151-mtp-n7-n8.md`](2026-09-24-gfx1151-mtp-n7-n8.md).
+**Next:** §8 carry-over (start with §8#6, the M-RoPE image + MTP FAIL→PASS — this box found the crash).
 
 ### 2026-09-24/25 — brief expanded for the final wrap-up (from the gfx1201 campaign close)
 
