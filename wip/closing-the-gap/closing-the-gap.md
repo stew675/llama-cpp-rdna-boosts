@@ -132,6 +132,13 @@ The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and t
    [`2026-09-23-gfx1201-conv-fusion-tensor-split.md`](2026-09-23-gfx1201-conv-fusion-tensor-split.md).
    gfx1100 is still open; the RDNA4 port candidates (`0003` gate-mix, `0016` `QSA_SCORE_WMMA` WMMA,
    `0017`/`0018` MMB quant types) remain future work — the generic fallbacks are in use and gated.
+   **gfx1151 lossy-prefill transfer (`0010`/`0011`) — NEGATIVE 2026-09-23:** the maintainer's
+   `LLAMA_HC_BLK16=1 LLAMA_HC_RES16=1 GGML_CUDA_MMB_DOWN16=1` config was tested on gfx1201 and shows
+   **no measurable win** (flat at pp8192/32768 under `-sm layer`; under `-sm tensor` the markings do
+   not run at all — the meta backend bypasses the CUDA child's `graph_optimize`).  Do not enable
+   them on RDNA4.  See [`2026-09-23-gfx1201-lossy-prefill-transfer.md`](2026-09-23-gfx1201-lossy-prefill-transfer.md).
+   The **meta-backend `graph_optimize` gap** is the reusable finding: any `graph_optimize`-based
+   marking is inert under `-sm tensor`.
 4. **`-ub 16384`** — parked until the managed PLE reader's no-cache parallel-pread fast path is picked
    up (item 13 in the closed record).  Root cause in `closed-the-gap.md` (the full-vocab
    `result_output` reserve + the HC `block_out` pin + the resident PLE table).

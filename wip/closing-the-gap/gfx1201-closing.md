@@ -535,8 +535,8 @@ is in the 25 closing patches:
    | `0013` prefill indexer relu-sum | **inert** — call site `GGML_CUDA_CC_IS_RDNA3_5` (`ggml-cuda.cu:4250`) |
    | `0016` `QSA_SCORE_WMMA` (`lightning-indexer.cu`) | **not ported** — `supports_indexer4` is RDNA3_5; the generic vec fallback is used |
    | `0017`/`0018` MMB new quant types | **not enabled** — RDNA4 mask is `IQ_FAMILY` only; the dequant is arch-neutral but unreachable |
-   | `0011` HC BF16 streams | default OFF; HC16 is RDNA3_5-gated |
-   | `0010` MoE BF16 epilogue | default OFF |
+   | `0011` HC BF16 streams | default OFF; inert under `-sm tensor` (meta-backend `graph_optimize` gap); tested `-sm layer` — no gfx1201 win |
+   | `0010` MoE BF16 epilogue | default OFF; same meta gap; tested `-sm layer` — no gfx1201 win |
    | `0023` MMB HC16 per-context | inert on RDNA4 (HC16 gated) |
    | `0001`/`0004`/`0006`/`0008`/`0012`/`0014`/`0019`/`0020`/`0021`/`0026` | arch-neutral and active (see the verdict table) |
 
@@ -548,6 +548,29 @@ is in the 25 closing patches:
 **Consequence for the summary:** "no port needed" meant *no fix was needed to make the 25 patches
 apply and build*; it did **not** mean the campaign is port-free.  The qsa3/mmb RDNA4 kernel work is
 in the beta prerequisite, and the closing set's own RDNA3_5-only kernels remain un-ported (see §8).
+
+#### 2026-09-23 — do the gfx1151 lossy-prefill wins transfer? (`0010`/`0011`) — **No**
+
+The maintainer's gfx1151 high-speed prefill config (`LLAMA_HC_BLK16=1 LLAMA_HC_RES16=1
+GGML_CUDA_MMB_DOWN16=1`) was tested on gfx1201.  Full record:
+[`2026-09-23-gfx1201-lossy-prefill-transfer.md`](2026-09-23-gfx1201-lossy-prefill-transfer.md).
+
+1. **Under `-sm tensor` the three markings never run.**  HC16/DOWN16/blk16/res16 are
+   `ggml_backend_cuda_graph_optimize` markings; under tensor split the **meta backend** owns the
+   graph and the CUDA child's `graph_optimize` is never called (`MMB_OPT=0` under `-sm tensor` vs
+   `60` under `-sm layer`, same binary/model; see the meta backend's own comment).  So on this
+   box's qwen4exp mode these features are **inert** — which is why the first tensor A/B was neutral
+   and text-identical.
+2. **Under `-sm layer` (markings run), the win is not there.**  IQ4_XS, f16 KV, `-b/-ub 4096`,
+   `-r 3`: default pp8192/32768 = 3444/4963; `0011` 3427/4960; `0010` 3486/4947; all three
+   3444/4952 — **flat/noisy**.  `0011` fires (same-seed text moves `551425b9758e` -> `07f7d16a144a`).
+   The gfx1151 +4.9 % was an APU/unified-memory bandwidth effect.
+
+**Portability finding for the set:** a `graph_optimize` marking (HC16/DOWN16/blk16/res16 or any
+future one) is a *single-backend* feature; the tensor-split meta path bypasses it.  Making it apply
+under `-sm tensor` needs the meta backend to run the CUDA markings on the per-device shard graphs
+before allocation (marks are keyed by tensor pointer; residual marks add alloc deps).  That is the
+concrete gfx1201 (multi-GPU) port — but per point 2 it is not worth it for these two features.
 
 #### 2026-09-23 — per-patch verdict table (§7)
 
@@ -562,8 +585,8 @@ in the beta prerequisite, and the closing set's own RDNA3_5-only kernels remain 
 | `0007` QSA visibility fold | qwen4exp-only | exercised | 40K/128K purity |
 | `0008` M=4 HC inject | MMB geometry | exercised | qwen4exp prefill A/B |
 | `0009` `lzm auto` | yes | text-identical (`-lm none -lzm on`) | 27B Q8_0 coherence |
-| `0010` MoE BF16 epilogue | **no** (default OFF) | no-op unless enabled | not enabled |
-| `0011` HC BF16 streams | **no** (default OFF) | no-op unless enabled | not enabled |
+| `0010` MoE BF16 epilogue | **only `-sm layer`** | **transfer tested — no gfx1201 win**; inert under `-sm tensor` (meta-backend `graph_optimize` gap) | [`2026-09-23-gfx1201-lossy-prefill-transfer.md`](2026-09-23-gfx1201-lossy-prefill-transfer.md) |
+| `0011` HC BF16 streams | **only `-sm layer`** | **transfer tested — no gfx1201 win**; inert under `-sm tensor`; fires under `-sm layer` (text moves) | same |
 | `0012` mmb_cvt `out_xn` | yes (MMB on) | exercised | qwen4exp prefill A/B |
 | `0013` indexer relu-sum | **no** | **inert on RDNA4** — call site is `GGML_CUDA_CC_IS_RDNA3_5(cc)` (`ggml-cuda.cu:4250`) | call-site gate; our tree already banks the reduction via the fused `GGML_CUDA_QSA_INDEXER_SCORE` |
 | `0014` QSA scorer trim | qwen4exp-only | exercised | qwen4exp gates |
