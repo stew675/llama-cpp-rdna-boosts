@@ -719,8 +719,10 @@ only.  Do **not** flip the mask wholesale; measure **per (type, path, shape)**.
    `NVFP4` need the newer quantizer).  A 4B/9B dense model is enough for a first pass; the 35B-A3B
    Q3_K_M is the routed-MoE shape.
 2. **Baseline** = the delivery path (`GGML_CUDA_MMB=0`); **arm** = MMB with the type force-enabled.
-   There is **no per-type env** — add a temporary `GGML_CUDA_MMB_WTYPE=<type>` override (or flip the
-   mask in a scratch build) to measure, then land only the winners.
+   The set already carries the per-type env overrides `GGML_CUDA_MMB_TYPES` (whole wtype mask) and
+   `GGML_CUDA_MMB_DENSE_TYPES` (dense tmask) from `0017`, so no rebuild is needed — e.g.
+   `GGML_CUDA_MMB_TYPES=iq4_nl,iq3_s,iq4_xs,iq3_xxs,q4_1 GGML_CUDA_MMB_DENSE_TYPES=iq3_s,q4_1`.
+   Land only the winners.
 3. Per type: `llama-bench -p 8192,32768 -n 0 -b 4096 -ub 4096 -r 5`, warm, interleaved, dense
    (`MUL_MAT`) **and** routed (`MUL_MAT_ID`, MoE model); plus the `MUL_MAT`/`MUL_MAT_ID` oracle for
    the type (expected counts in `gfx1100-closing.md` §6.6) and `test-logits-width-probe`.
