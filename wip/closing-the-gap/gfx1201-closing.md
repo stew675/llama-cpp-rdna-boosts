@@ -25,17 +25,18 @@ the maintainer asks.
 pass (build, oracles, width purity, same-seed coherence, intra-build `plain == draft-mtp`, qwen4exp
 prefill A/B, PPL parity, the rule-5 batched gate), the four RDNA4 ports/enablements (`0003`,
 `0016`, `0017`, `0027`), the `0004` conv-fusion `-sm tensor` purity fix, the `0010`/`0011` lossy-transfer
-negative, and the `0028` W=9 verify-cliff fix.
+negative, the `0028` W=9 verify-cliff fix, and (2026-09-24) the **OP-1 automatic MTP CPU-spin fix**
+(`0029`) with the OP-2/OP-3 four-axis re-baseline and the OP-5.1 `0013` redundancy verdict.
 
 **Open** (this file):
 
 | id | item | priority | where |
 |---|---|---|---|
-| **OP-1** | MTP CPU-spin: **automatic path selection, no `OMP_*`/`KMP_*` env vars** (~35 % of qwen4exp MTP lost; confirmed live) | **highest** | §2.1 |
-| **OP-2** | re-baseline the gfx1201 qwen4exp MTP throughput (all pre-fix numbers are ~35 % low) + make the harness assert the CPU is quiet | high (composes with OP-1) | §2.2 |
-| **OP-3** | `0028` follow-ups: full `n7`/`n8`/adaptive matrix *with* the fix, per-type MoE band tuning, another odd-row dense model | medium | §2.3 |
-| **OP-4** | validation gates not run: four-axis MTP with the fix, `llama-imatrix`, `0001`/`0008` isolated A/Bs, the M-RoPE image case | medium | §2.4 |
-| **OP-5** | remaining RDNA3_5-gated kernels (`0013` redundancy check; `0011`/`0023` parked) | low | §2.5 |
+| **OP-1** | MTP CPU-spin: runtime half **DONE** (`0029`, no env vars needed); **structural half** (input/PLE `GET_ROWS` on a device) + **OP-1.4** draft-sampler offload still open | ~~highest~~ medium | §2.1 |
+| **OP-2** | re-baseline the gfx1201 qwen4exp MTP throughput — **DONE** (four-axis + `n7`/`n8`/adaptive, no env) | ~~high~~ DONE | §2.2 |
+| **OP-3** | `0028` follow-ups: matrix **DONE**; per-type MoE band tuning + another odd-row dense model open | medium | §2.3 |
+| **OP-4** | validation gates not run: four-axis MTP with the fix (**DONE** as OP-2), `llama-imatrix`, `0001`/`0008` isolated A/Bs, the M-RoPE image case | medium | §2.4 |
+| **OP-5** | remaining RDNA3_5-gated kernels (`0013` = **redundant, DONE**; `0011`/`0023` parked) | low | §2.5 |
 | **OP-6** | build-time critical path (the `fattn-mma-f16` per-type instance blow-up) | low / parked in `TODO.md` | §2.6 |
 
 ---
@@ -63,6 +64,10 @@ negative, and the `0028` W=9 verify-cliff fix.
 | `0025` host-buffer input | no-op on a discrete GPU (`prop.integrated=0`) | §7 verdict table |
 | rule-5 batched verify gate | PASS (within noise at B=1/4/8) | §11 |
 | `0028` W=9 verify cliff | **FIXED** — MMVQ band boundary; qwen4exp B=9 202.6 → 270.0 t/s, `n_max 8` MTP +8.9 % | §11 session 8 / `2026-09-24-qwen4exp-w9-verify-cliff.md` |
+| **OP-1** MTP CPU-spin | **DONE (runtime half, `0029`)** — tiny CPU split graphs run single-threaded; default 81.0 → 111.7 t/s, ~15 → 1.2 cores, acceptance/text byte-identical; env **kill-switch only** | `2026-09-24-mtp-cpu-spin-automatic.md` |
+| **OP-2** MTP re-baseline | **DONE** — four-axis + `n7`/`n8`/adaptive, no env, CPU quiet every arm; `n8` near-tied with `n7` and wins recall (the old gap was `0028`) | `2026-09-24-mtp-cpu-spin-automatic.md` §4 |
+| **OP-3** matrix half | **DONE** — the full `n7`/`n8`/adaptive matrix with the fix | `2026-09-24-mtp-cpu-spin-automatic.md` §4 |
+| **OP-5.1** `0013` on RDNA4 | **REDUNDANT** — matcher fires 0× with `0016` ON, 4× with `LLAMA_QSA_SCORE_WMMA=0`; no port | `2026-09-24-mtp-cpu-spin-automatic.md` §5 |
 | per-patch verdict table | filled for every closing patch | §7 |
 | porting layers | "no port needed" = only the beta prerequisite carried the RDNA4 kernel ports; the closing set's own RDNA3_5-only kernels are OP-5 | §11 porting layers |
 
@@ -72,10 +77,22 @@ negative, and the `0028` W=9 verify-cliff fix.
 
 ### 2.1 OP-1 — MTP CPU-spin: **automatic** path selection, no env vars  ← the headline
 
+> **RUNTIME HALF DONE 2026-09-24 (`patches/0029`).**  `ggml_backend_cpu_graph_compute` now runs a
+> tiny CPU split graph (≤ 32 nodes / ≤ 16 MiB of node outputs — i.e. the host-mapped input/PLE
+> `GET_ROWS` and the MTP draft's state copies) inline on the calling thread, so no OpenMP region is
+> entered and nothing spins.  Default run (no env): qwen4exp IQ4_NL `draft-mtp n3` prose `-n 1500`
+> **81.0 → 111.7 t/s**, **~15 → 1.2 cores**, acceptance **0.84791** and same-seed text
+> **`a79d0d14855b`** identical (also identical with the heuristic forced off).  The delivery is
+> **default-on with a disable-only kill-switch** (`GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1`).
+> Detail: [`2026-09-24-mtp-cpu-spin-automatic.md`](2026-09-24-mtp-cpu-spin-automatic.md).
+>
+> **Still open:** 2.1.2 (the structural fix — remove the CPU split rather than serialise it; now
+> optional) and 2.1.4 (draft sampler backend offload under `-sm tensor`).
+
 **Goal (maintainer, 2026-09-24):** a user must be able to run a typical `llama-server` config with
 **no** `OMP_*`/`KMP_*` environment variables and get the fast path.  The delivery has to **detect** the
 degenerate scheduling and choose the high-performance path itself, **default-on** (an env var may only
-*disable* it, per `AGENTS.md`).
+*disable* it, per `AGENTS.md`).  **This is now satisfied by `0029`** (see the note above).
 
 #### 2.1.1 The problem, and the fresh reproduction (2026-09-24, current tree = 0028)
 
@@ -119,23 +136,15 @@ Candidates, cheapest first:
 The **structural** option is the right one if it validates; it removes the CPU graph rather than hiding
 it.
 
-#### 2.1.3 The runtime fix — automatic spin mitigation (the detection half)
+#### 2.1.3 The runtime fix — automatic spin mitigation (the detection half)  ← **DONE (`0029`)**
 
-Even with a CPU split, the active-wait spin is pure waste.  Explore, in order:
-* **Per-split thread count**, not per-process: the CPU split here is tiny.  Find where the
-  scheduler / CPU backend picks the split's thread count and make **small CPU splits run single-thread**
-  (`n_threads = 1` → no OpenMP fork → no barrier to spin on).  Most surgical and automatic by
-  construction.  Check `ggml_backend_cpu_graph_compute` / the threadpool wiring
-  (`ggml_backend_cpu_set_n_threads`, the `set_n_threads` list in `llama_context`).
-* **Passive/low-spin pool**: detect the shape (GPU backend present + CPU split is input-only) and set
-  the pool's wait policy / `KMP_BLOCKTIME` equivalent programmatically (check whether
-  `kmp_set_blocktime(0)` or a `ggml_threadpool` pause/priority mode is reachable from the CPU backend;
-  if not, whether the pool can be created with the right mode).
-* A startup heuristic that logs **one clear line** when it engages, plus an env **kill-switch**
-  (default-on, disable-only).
-
-Whatever is chosen: **automatic, default-on, arch-neutral, env kill-switch for bisection only** — not an
-env opt-in.  It must not regress plain decode, prefill, or CPU-only runs.
+The chosen option was the first candidate — **per-graph thread count in the CPU backend**, no
+scheduler surgery: [`patches/0029`](patches/0029-gap-closing-WIP-run-tiny-CPU-split-graphs-on-the-calling-thread.patch)
+adds `ggml_backend_cpu_graph_n_threads()` (≤ 32 nodes **and** ≤ 16 MiB of node outputs →
+`n_threads = 1`).  No OpenMP region is entered for the split, so the active-wait pool is never re-armed
+and the spin is gone.  Default-on, disable-only kill-switch
+`GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1`.  The passive-`KMP_BLOCKTIME` option was not needed.
+See the note at the top of §2.1 and [`2026-09-24-mtp-cpu-spin-automatic.md`](2026-09-24-mtp-cpu-spin-automatic.md).
 
 #### 2.1.4 Also fix — draft sampler backend offload under `-sm tensor`
 
@@ -145,17 +154,23 @@ using CPU"`), so the draft `top_k(10)` chain runs on the CPU every draft step.  
 tensor-split-aware (or keep it on a device) so no per-step CPU round-trip is needed.  Small, but it
 composes with 2.1.2/2.1.3.
 
-#### 2.1.5 Acceptance criteria
+#### 2.1.5 Acceptance criteria  ← **MET 2026-09-24**
 
 * A plain `llama-server` with **no** `OMP_*`/`KMP_*` env keeps MTP decode at ~1–2 CPU cores and
   reproduces the passive-wait throughput (**~107 t/s**, qwen4exp IQ4_NL `draft-mtp n3`, prose) with
   **byte-identical output and identical acceptance** (0.84791 / the session-6 0.83204).
+  → **111.7 t/s at 1.2 cores, acceptance 0.84791, text `a79d0d14855b`** (fix build, no env; the
+  passive reference on the same build was 108.5 t/s).
 * Plain decode and prefill unregressed; CPU-only builds unaffected; the `qwen35`/`qwen35moe` models
   (no PLE) stay on their current numbers (already clean, §11 session 6).
+  → plain 52.9 vs 53.0 t/s; CPU-only 4B `tg64` 9.69 vs 9.60; `pp2048` 2448 vs 2467 (noise).
 * **Re-baseline the gfx1201 qwen4exp MTP t/s** (see OP-2) and make the harness robust: the MTP gate
   should not depend on an env var being set.  Consider teaching the reporting harness to assert the CPU
   is quiet (a core-count sanity check) so a future degenerate-scheduling regression cannot silently
   poison the numbers.
+  → **done**: `tools/mtp-run.sh` + `tools/mon.py` always sample per-thread CPU and report
+  `SUMMARY cpu_cores … busy_threads(last)=…` next to every run; `tools/matrix-axis.sh` is the
+  four-mode axis driver.
 
 #### 2.1.6 Tools / harness carried over (from the session-6 record)
 
@@ -172,7 +187,7 @@ composes with 2.1.2/2.1.3.
 > and §11 session 6.  The `qwen35`/`qwen35moe` models have **no PLE** and their `token_embd` fits in
 > VRAM, so their CPU split is empty — they are the clean control (they must stay unchanged).
 
-### 2.2 OP-2 — re-baseline the gfx1201 qwen4exp MTP throughput
+### 2.2 OP-2 — re-baseline the gfx1201 qwen4exp MTP throughput  ← **DONE 2026-09-24**
 
 Every qwen4exp MTP t/s figure measured on this box **without** the passive-wait env is ~35 % low
 (session 2's 57.5 t/s, session 6's pre-fix table, …).  The session-8 numbers use
@@ -182,12 +197,28 @@ Every qwen4exp MTP t/s figure measured on this box **without** the passive-wait 
 * correct/annotate the stale records so a future session does not cite the confounded numbers;
 * add the CPU-quiet assertion to the harness (§2.1.5).
 
+**Done** (fixed build, **no** env; table and the old→new delta in
+[`2026-09-24-mtp-cpu-spin-automatic.md`](2026-09-24-mtp-cpu-spin-automatic.md) §4):
+
+| axis | none | n7 | n8 | adaptive |
+|---|---:|---:|---:|---:|
+| R reasoning | 54.6 | 79.6 (0.365) | 78.1 (0.352) | **86.8 (0.592)** |
+| C code | 54.8 | **139.2 (0.764)** | 138.8 (0.732) | 136.6 (0.743) |
+| P prose | 53.8 | **128.1 (0.706)** | 124.1 (0.655) | 123.0 (0.685) |
+| K recall | 52.4 | 163.6 (0.963) | **167.4 (0.957)** | 154.3 (0.967) |
+| X phase-switch | 54.7 | **99.2 (0.490)** | 84.6 (0.390) | 98.8 (0.661) |
+
+CPU quiet in every arm.  The old `n7 >> n8` collapse was `0028`'s W=9 cliff: with it fixed `n8` is
+near-tied everywhere and **wins recall** — the `n_max 8` question is workload-dependent on gfx1201 too.
+
 ### 2.3 OP-3 — `0028` follow-ups (the MMVQ band boundary)
 
 `0028` is verified for the cliff itself but not exhaustively:
 * **full `n7`/`n8`/adaptive matrix with the fix** — session 6 covered the matrix *before* the fix; only
   the prose axis + one `n8` pair were re-measured after.  Use the same protocol (`-n 3000`, reasoning
   pinned) and the `OMP_WAIT_POLICY=PASSIVE` (or OP-1) build.
+  → **DONE 2026-09-24** (all five axes, fixed build, no env — see §2.2 / the OP-1 record §4).  The old
+  `n7 >> n8` gap was `0028`'s W=9 cliff; `n8` is now near-tied and wins recall.
 * **per-type MoE band** — the routed-expert band floor is currently unconditional 16 on AMD; if a
   specific expert type is slower on `mul_mat_vec_q_moe` at 9..16, the floor has to become per-type (see
   the gfx1151 brief §4.5 — narrowing the per-arch table alone does nothing because the floor clamps up
@@ -199,6 +230,7 @@ Every qwen4exp MTP t/s figure measured on this box **without** the passive-wait 
 ### 2.4 OP-4 — validation gates not yet run
 
 * qwen4exp **four-axis MTP set with the fix** (only prose re-measured in session 8).
+  → **DONE 2026-09-24** (OP-2, all five axes incl. the phase-switch prompt).
 * `llama-imatrix` (`0019`/`0023`) — the NanBeige model is absent here; substitute another BF16 model.
   Note HC16 is RDNA3_5-gated, so on RDNA4 this is really a scheduler/split regression check.
 * `0001` (`hc_combine_norm`) / `0008` (M=4 HC inject) **isolated** A/Bs — they are exercised by the
@@ -213,6 +245,10 @@ Every qwen4exp MTP t/s figure measured on this box **without** the passive-wait 
   `bias + sum_h relu(dot_h)`), so a separate enablement is likely redundant on RDNA4.  Verify by
   diffing `GGML_CUDA_IDX_RELU_SUM` on/off **after** the `0016` port — if the graph no longer contains
   that chain, there is nothing to port (this is a 10-minute check).
+  → **DONE 2026-09-24: REDUNDANT.**  Widened the gate to RDNA4, rebuilt, ran qwen4exp `pp8192` with
+  `GGML_CUDA_IDX_RELU_SUM_LOG=1`: **0 matches** with `0016` ON (default) and **4 matches** with
+  `LLAMA_QSA_SCORE_WMMA=0`.  `0016` removes the chain; the port would be dead code.  Gate change
+  reverted.  Detail: the OP-1 record §5.
 * **`0011` HC BF16 streams / `0023` HC16**: `0011` needs the meta `graph_optimize` path (`0027`, done)
   to run under `-sm tensor`; `0023`'s HC16 is RDNA3_5-gated and not bandwidth-bound on discrete RDNA4 →
   **park** unless a 48 GB single-GPU RDNA4 box appears.
@@ -255,11 +291,11 @@ see `wip/build-time-regression/` and `TODO.md`.
 
 (Paths are the ones the records used — `ls` to confirm the layout.)
 
-### 3.2 Apply the full stack (27-patch closing set)
+### 3.2 Apply the full stack (28-patch closing set)
 
 The delivery repo is `~/llama-cpp-rdna-boosts`.  The current `~/llama.cpp` checkout is branch
-`closing-gfx1201` = delivery r13 + `beta/mmb-general` + closing `0001..0014`/`0016..0028` (tip tree
-**`533eee3188ab7df9b6cf394adeaa31b46bd13ff2`**).  A fresh apply:
+`closing-gfx1201` = delivery r13 + `beta/mmb-general` + closing `0001..0014`/`0016..0029` (tip tree
+**`fa9cf6d1e654333d458ade3655c4a0d540225827`**).  A fresh apply:
 
 ```sh
 WORK=$HOME/llama-cpp-rdna-boosts
@@ -273,8 +309,17 @@ for p in "$WORK"/wip/closing-the-gap/patches/0*.patch; do
   case "$p" in *0015-*) echo "skip 0015 (superseded by r13 block 00)"; continue;; esac
   git am "$p"
 done
-git rev-parse HEAD^{tree}                                # expect 533eee3188ab7df9b6cf394adeaa31b46bd13ff2
+git rev-parse HEAD^{tree}                                # expect fa9cf6d1e654333d458ade3655c4a0d540225827
 ```
+
+> **Base drift (2026-09-24, pre-existing).**  The repo's `patches/` + `release.json` are still the
+> **r12** delivery (`8a80535e…`), while this campaign branch is built on **r13** (16-block tree
+> `bb7b6d07…`, r13+beta `79136a15…`).  A fresh apply through the block commands above therefore lands
+> on r13+beta `bca69f23…` / closing tip `cb937fe4ca60d5e2df561d133f550de886edf52a`, differing from
+> the branch by **one hunk in `common/speculative.cpp`** (the `gemma4-assistant` `is_mem_shared`
+> guard that r13 adds) — verified with `git diff`.  `0029` applies cleanly on both.  If the r13
+> delivery patches are not yet in `patches/`, regenerate the block set first, or read the campaign
+> tip as the r13-based branch tree.
 
 **Traps:** `0015` must be **skipped**; `0024` must be applied **before** `0025` (the loop order handles
 this).  The single-patch alternative is `git apply` of `wip/closing-the-gap/campaign-all.patch` on the
@@ -317,10 +362,14 @@ for op in FLASH_ATTN_QSA GATED_DELTA_NET TOPK_QSA LIGHTNING_INDEXER FLASH_ATTN_E
 done
 
 # MTP (qwen4exp must pass -md mtp-…-shared-Q8_0.gguf; 27B/35B have built-in heads — no -md)
-OMP_WAIT_POLICY=PASSIVE KMP_BLOCKTIME=0 build-rocm/bin/llama-cli -m "$M" -md "$MD" \
+# With 0029 the passive-wait env is NO LONGER NEEDED for the fast path — keep it only as the A/B
+# reference (add `GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1` for the other arm).
+build-rocm/bin/llama-cli -m "$M" -md "$MD" \
   -ngl 99 -sm tensor -c 16384 -b 2048 -ub 2048 -ctk q8_0 -ctv q8_0 -fa auto \
   -n 3000 --seed 42 --temp 0 --single-turn --no-display-prompt --reasoning off -f "$P" \
   --spec-type draft-mtp --spec-draft-n-max 3 --ctx-checkpoints 0 -lv 4
+# CPU-quiet gate: `bash tools/mtp-run.sh <tag> <outdir> -- <the same cmd>` reports
+# `SUMMARY cpu_cores … busy_threads(last)=…` next to the run (expect steady ~1.2 cores).
 ```
 
 Oracles expected: `FLASH_ATTN_QSA` 26/26, `GATED_DELTA_NET` 46/46, `TOPK_QSA` 4/4,
@@ -339,10 +388,12 @@ Oracles expected: `FLASH_ATTN_QSA` 26/26, `GATED_DELTA_NET` 46/46, `TOPK_QSA` 4/
 * **`-md` on a `plain` arm aborts** (a draft head without a trunk); qwen4exp must pass the sidecar, the
   dense/MoE models must not.
 * **`FLASH_ATTN_EXT` cannot be counted from a merged `2>&1` log** (ANSI + stream interleaving).
-* **Fold a fix** with `git commit --fixup=<commit>` then
+* **Fold a fix** into an existing patch with `git commit --fixup=<commit>` then
   `GIT_SEQUENCE_EDITOR=true GIT_EDITOR=true git rebase --autosquash <commit>~1`; regenerate with
   `git format-patch -1 <sha> --stdout --no-numbered`; replace the patch file and re-verify a fresh
-  r13+beta worktree + the 27 patches reproduces the branch tip tree.
+  r13+beta worktree + the **28** patches reproduces the branch tip tree.  A **new** change is a new
+  numbered patch (`git format-patch -1 <sha> --stdout --no-numbered > patches/00NN-…patch`) and the
+  `campaign-all.patch` `git diff <r13+beta tree>..<tip>` is regenerated too.
 * **Do not push the `~/llama.cpp` fork**; push the delivery repo only on explicit request.
 
 ### 3.6 Report template
@@ -356,6 +407,35 @@ name, not "it was slower".  For MTP use `benchmarks/mtp-adaptive-methodology.md`
 ---
 
 ## 4. Session log (open-work sessions, newest first)
+
+### 2026-09-24 — session 9: OP-1 automatic CPU-spin fix (`0029`) + OP-2/OP-3 re-baseline + OP-5.1
+
+Full detail: [`2026-09-24-mtp-cpu-spin-automatic.md`](2026-09-24-mtp-cpu-spin-automatic.md).
+
+**OP-1 runtime half DONE.**  `ggml_backend_cpu_graph_compute` now runs a tiny CPU split graph
+(≤ 32 nodes / ≤ 16 MiB of node outputs — the host-mapped input/PLE `GET_ROWS` and the MTP draft's
+state copies) inline on the calling thread, so no OpenMP region is entered and the active-wait pool
+never spins.  Automatic, default-on, arch-neutral, disable-only kill-switch
+`GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1`; folded as
+[`patches/0029`](patches/0029-gap-closing-WIP-run-tiny-CPU-split-graphs-on-the-calling-thread.patch)
+(tip tree `fa9cf6d1e654333d458ade3655c4a0d540225827`, `campaign-all.patch` regenerated).
+
+* qwen4exp IQ4_NL, 3-GPU `-sm tensor`, q8_0 KV, prose, `-c 16384 -n 1500`, seed 42:
+  default **81.0 t/s / ~15 cores → 111.7 t/s / 1.2 cores**, passive-wait reference 108.5 / 0.4 cores,
+  kill-switch 85.1 / 14.9.  Acceptance **0.84791** in every arm.
+* Purity: `plain == draft-mtp n3` text **`a79d0d14855b`**, and the heuristic on/off gives the same
+  hash.  Plain decode 52.9 vs 53.0 t/s; CPU-only 4B `tg64` 9.69 vs 9.60; `pp2048` 2448 vs 2467.
+* **OP-2 / OP-3 matrix DONE** (fixed build, **no** env): five axes × `none`/`n7`/`n8`/adaptive cap 8,
+  `-n 3000`, reasoning pinned, CPU quiet everywhere.  The old `n7 >> n8` gap was `0028`'s W=9 cliff —
+  with it fixed `n8` is near-tied on R/C/P and **wins recall** (167.4 vs 163.6); adaptive keeps R
+  (86.8) and X (98.8).
+* **OP-5.1 DONE: `0013` is redundant on RDNA4** — with the gate widened to RDNA4 the matcher fires
+  0× with `0016` ON and 4× with `LLAMA_QSA_SCORE_WMMA=0`; gate change reverted.
+* Harness added: `tools/mon.py` (per-thread CPU sampler), `tools/mtp-run.sh`, `tools/matrix-axis.sh`;
+  every run now reports `SUMMARY cpu_cores … busy_threads`.
+* **Still open:** OP-1.2 structural (input/PLE off the CPU), OP-1.4 draft-sampler offload, OP-3
+  per-type MoE band + odd-row dense model, OP-4 `llama-imatrix` / `0001`+`0008` A/Bs / M-RoPE image,
+  OP-5.2 `0011`, OP-6 build time.
 
 ### 2026-09-24 — brief split
 

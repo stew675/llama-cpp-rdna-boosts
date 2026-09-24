@@ -226,6 +226,78 @@ index a398c3063..0e7f22631 100644
      };
  
      for (int i = 0; i < sched->n_splits; i++) {
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 8cece71f1..cee0c0341 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -7,6 +7,7 @@
+ #include "amx/amx.h"
+ 
+ #include <cctype>
++#include <cstdlib>
+ #include <string>
+ #include <vector>
+ 
+@@ -167,10 +168,58 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
+     GGML_UNUSED(backend);
+ }
+ 
++// Choose the number of threads for a CPU graph compute.
++//
++// A very small CPU graph - typically the input/PLE embedding GET_ROWS (and a handful of
++// state copies) that the scheduler peels off the front of a GPU graph - gains nothing
++// from an OpenMP fork, and paying for it once per graph is actively harmful at the graph
++// rates speculative decoding reaches: every parallel region re-arms the runtime's active
++// wait (KMP_BLOCKTIME), so the idle workers spin instead of sleeping and a spec-decode
++// workload (n_max + 1 back-to-back graphs per token) pins every core for the whole run.
++// Run such graphs inline on the calling thread instead; a real (prefill-sized) gather or
++// any larger graph keeps the configured thread count.  Disable the heuristic with
++// GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1 for A/B and bisection.
++static int ggml_backend_cpu_graph_n_threads(const struct ggml_cgraph * cgraph, int n_threads) {
++    if (n_threads <= 1) {
++        return n_threads;
++    }
++
++    static const bool disabled = getenv("GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD") != nullptr;
++    if (disabled) {
++        return n_threads;
++    }
++
++    // bounds chosen so an ordinary model graph (CPU-only inference, or a large prefill
++    // gather on a CPU split) never qualifies; the split graphs this targets are 1-7 nodes
++    // of a few hundred KiB each
++    constexpr int    max_nodes = 32;
++    constexpr size_t max_bytes = 16ull*1024*1024;
++
++    if (cgraph->n_nodes > max_nodes) {
++        return n_threads;
++    }
++
++    size_t total_bytes = 0;
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        const struct ggml_tensor * node = cgraph->nodes[i];
++        if (ggml_is_view(node)) {
++            continue;
++        }
++        total_bytes += ggml_nbytes(node);
++        if (total_bytes > max_bytes) {
++            return n_threads;
++        }
++    }
++
++    return 1;
++}
++
+ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+ 
+-    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
++    const int n_threads = ggml_backend_cpu_graph_n_threads(cgraph, cpu_ctx->n_threads);
++
++    struct ggml_cplan cplan = ggml_graph_plan(cgraph, n_threads, cpu_ctx->threadpool);
+ 
+     if (cpu_ctx->work_size < cplan.work_size) {
+         delete[] cpu_ctx->work_data;
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
 index 4dbf72e6f..cd34a30ed 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
