@@ -365,6 +365,13 @@ Most of it is arch-independent; this is the subset **this box** should re-check,
 the APU where the path differs, or because the A/B was gfx1201-only.  **Do not re-run everything** —
 the band-boundary gates (§4) stay the priority; this is the delta since the brief was opened.
 
+> **RESULT 2026-09-24 (gfx1151): all §8 items resolved — see [`2026-09-24-gfx1151-p3-carryover.md`](2026-09-24-gfx1151-p3-carryover.md).**  `0029` and
+> `0030` are **no-ops** here (byte-identical text, CPU 1.36 cores, host input); `0019` imatrix is
+> **byte-identical** default vs `HC16=0`; `0001`/`0008` defaults **hold**; `0011` `res16` is a real
+> **+2.5 %/+2.0 %** win (`blk16` inert, stays default-OFF); `0005` M-RoPE+image+MTP is **clean on both**
+> the current and the pre-`0005` build (trigger needs the pre-r13 shared KV → guard retained); `#3`
+> was resolved in P1 (`0031`); `#8`/`#9` no action.
+
 | # | item | why gfx1151 / what to check | reference |
 |---|---|---|---|
 | 1 | **`0029` tiny CPU graph → single thread** (default-on) | On gfx1201 the host-mapped input `GET_ROWS` runs as a tiny CPU split graph whose OpenMP region spins (~15 cores).  Here `0025` keeps `token_embd`/`per_layer_token_embd` zero-copy in `ROCm_Host` with the `GET_ROWS` on `ROCm0`, so that CPU split graph may not exist at all.  Confirm `0029` is a no-op (or a win), does not change output, and does not regress `tg`. | `2026-09-24-mtp-cpu-spin-automatic.md`; kill-switch `GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1` |
@@ -444,6 +451,15 @@ at `-n 3000` on `0031`.  **With `0031`, `n8` beats `n7` on R/C/K/P and the only 
 (phase-switching); the dense-off arm is slower on every axis with acceptance unchanged — the `0031`
 dense band is what makes `n8` work.**  Record: [`2026-09-24-gfx1151-mtp-n7-n8.md`](2026-09-24-gfx1151-mtp-n7-n8.md).
 **Next:** §8 carry-over (start with §8#6, the M-RoPE image + MTP FAIL→PASS — this box found the crash).
+
+### 2026-09-24 — §8 carry-over DONE (P3)
+
+Resolved every actionable §8 item on gfx1151: `0029`/`0030` no-ops (byte-identical), `0019` imatrix
+byte-identical default-vs-`HC16=0`, `0001`/`0008` defaults hold, `0011` `res16` +2.5 %/+2.0 % (stays
+default-OFF), `0005` M-RoPE+image+MTP clean on current **and** pre-fix (trigger needs pre-r13 shared
+KV).  Full tables and commands: [`2026-09-24-gfx1151-p3-carryover.md`](2026-09-24-gfx1151-p3-carryover.md).
+**Remaining (parked, not blockers):** `0011` default (lossy), the inert `blk16` producer check, §9
+(measure the `0025` copy before porting the input ring).  RDNA3_0 stays with `gfx1100-closing.md`.
 
 ### 2026-09-24/25 — brief expanded for the final wrap-up (from the gfx1201 campaign close)
 
