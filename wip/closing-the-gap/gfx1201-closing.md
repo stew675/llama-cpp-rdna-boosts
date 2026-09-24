@@ -372,6 +372,32 @@ MTP verdict, and the `-b/-ub 4096` protocol for A/Bs.
 
 Newest first.  Each session appends its state, what it changed, and the next action.
 
+### 2026-09-24 — session 7: the qwen4exp W=9 verify cliff (the n7→n8 drop) root-caused (≈half)
+
+**The observation (maintainer):** `draft-mtp n_max` 7→8 is an anomalously **sharp** drop
+(t8/t7 ≈ 1.33–1.36 on every axis, constant) — the signature of a **path change**, not an
+acceptance-curve effect.  Confirmed acceptance-free with `llama-batched-bench` (verify shape,
+`OMP_WAIT_POLICY=PASSIVE`): qwen4exp `S_TG` B=8 **255.7** → B=9 **202.6**, recovering to 264.7 by
+B=12; per-step time 32 ms at B=8 and a flat ~44 ms at B≥9 (a **fixed ~+12 ms/step once W≥9**).
+**qwen4exp-specific**: 27B (`qwen35`) jumps *up* at B=9 (91.6→141.1) and 35B (`qwen35moe`) is flat
+(433→430), so it is not the generic mmvq→mmq / FA switch.  Not acceptance (the spin pair was
+byte-identical, and n8's mean accepted length is *higher*).
+
+**Ruled out** (all with the verify shape): the QSA sparse top-k arm (the `N_KV<=2051` shortcut
+covers it; `LLAMA_QSA_DENSE_PREFILL_UNTIL=1e9` is a no-op), the HC mixer (`LLAMA_FUSED_HC_MIX=0`
+no-op — IQ4_NL's HC weights aren't Q8_0 so the fusion is off anyway), the FA tile→WMMA switch
+(`GGML_CUDA_FA_WMMA_MAX_HEAD=0` leaves B=9 **bit-identical** at 1.422 s), the MoE fused GLU MMQ,
+MMB, and fusions in general (`DISABLE_FUSION` shrinks both widths, ratio 0.848 vs 0.812).
+
+**Found (≈half):** the routed-compact MoE MMQ dispatch (`mul_mat_q_routed_compact` /
+`mmq_rdna3_5_id_use_compact(type,J)`) — `GGML_CUDA_DISABLE_MMQ_ROUTED=1` recovers B=9 202.5 →
+**220.6 t/s** (step 1.422 → 1.306 s), B=8 unchanged.  The width-dependent
+`mmq_rdna3_5_id_get_J(type, rows_per_expert)` tile choice is the prime suspect.  The remaining ~12 %
+is another path (dense / routed-plain MMQ at `ncols=9`).
+
+Full evidence, the ruled-out table and the next-session plan:
+[`2026-09-24-qwen4exp-w9-verify-cliff.md`](2026-09-24-qwen4exp-w9-verify-cliff.md).
+
 ### 2026-09-24 — session 6: MTP revalidation on IQ4_NL + the MTP CPU-spin root cause
 
 **Did:** the missing MTP acceptance revalidation (post-`0003`/`0017`/`0027`) on the newly downloaded
@@ -1094,3 +1120,15 @@ adaptive) on **gfx1151** — the box where the `n_max 8` observation was actuall
 purity-boundary reasoning (first non-pure verify width) explains it rather than the acceptance curve.
 Contract reminder: above `n_max 7` use acceptance + MTP-vs-plain throughput, **not**
 `plain == draft-mtp`.
+
+### 13.7 The qwen4exp W=9 verify cliff (`n_max` 7→8) — the sharp n8 drop
+
+**Significant, open (session 7).**  The n7→n8 MTP drop is not the acceptance curve: it is a sharp,
+**qwen4exp-only** step-cost cliff once the verify width reaches 9 (acceptance-free
+`llama-batched-bench`: B=8 255.7 → B=9 202.6, a fixed ~+12 ms/step; 27B/35B are flat or *faster* at
+B=9).  ≈half is the **routed-compact MoE MMQ dispatch** (`GGML_CUDA_DISABLE_MMQ_ROUTED=1` recovers
+202.5 → 220.6); the width-dependent `mmq_rdna3_5_id_get_J(type, rows_per_expert)` tile choice is the
+prime suspect; the remaining ~12 % is unresolved.  Full record + plan:
+[`2026-09-24-qwen4exp-w9-verify-cliff.md`](2026-09-24-qwen4exp-w9-verify-cliff.md).  **This must be
+fixed before the `n7`/`n8` matrix (§13.6) is final** — the n8 penalty is partly this path, not the
+depth/acceptance trade-off.
