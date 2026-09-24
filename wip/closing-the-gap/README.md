@@ -101,18 +101,21 @@ git am /home/stew675/llama-cpp-rdna-boosts/wip/closing-the-gap/patches/0022-*.pa
 ~/bin/build-llama-rocm-714
 ```
 
-> **Current set (2026-09-24, session 9b): the campaign is now 29 patches** (`0001..0014` +
-> `0016..0030`; the superseded `0015` was removed 2026-09-24).  `0027` = the meta-backend `graph_optimize` forwarding;
+> **Current set (2026-09-24, session 13): the campaign is now 30 patches** (`0001..0014` +
+> `0016..0031`; the superseded `0015` was removed 2026-09-24).  `0027` = the meta-backend `graph_optimize` forwarding;
 > `0028` = the MMVQ↔MMQ band boundary (the qwen4exp `n_max` 7→8 fix), see
 > [`gfx1151-closing.md`](gfx1151-closing.md); `0029` = the **automatic MTP CPU-spin fix** (tiny CPU
 > split graphs run single-threaded; default-on, disable-only
 > `GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1`), see
 > [`2026-09-24-mtp-cpu-spin-automatic.md`](2026-09-24-mtp-cpu-spin-automatic.md); `0030` = the **opt-in**
 > structural input placement (`LLAMA_DEVICE_INPUT=1`; 0 CPU splits but ~2.6 % slower MTP, so not
-> defaulted), see [`2026-09-24-mtp-cpu-spin-structural.md`](2026-09-24-mtp-cpu-spin-structural.md).  A
-> fresh r13+beta worktree + all 29 in order (`for p in .../patches/0*.patch; do git am "$p"; done`)
-> applies **29/29** and reproduces tree
-> `99b429a60d441f814c84737cfa57803bc15a2f6d`.
+> defaulted), see [`2026-09-24-mtp-cpu-spin-structural.md`](2026-09-24-mtp-cpu-spin-structural.md);
+> `0031` = the **gfx1151 MMVQ band policy** (widen the dense odd-row band to RDNA3_5, keep the routed
+> MoE band at 8 there; +10.0/+9.9/+7.6/+8.7 % at B9/10/11/12 on qwen4exp, no W≤8 change), see
+> [`2026-09-24-gfx1151-mm-band.md`](2026-09-24-gfx1151-mm-band.md).  A
+> fresh r13+beta worktree + all 30 in order (`for p in .../patches/0*.patch; do git am "$p"; done`)
+> applies **30/30** and reproduces tree
+> `468c64963ae45e72367c73809efa7cc038217e8a`.
 
 Fork tip after session 10: **`d8334f929`** (`gap-closing-r13`, tree
 `fa185bbb453d6de627427ae4f8d868127fa72535`).  The scratch build above is the tree the rebuild was

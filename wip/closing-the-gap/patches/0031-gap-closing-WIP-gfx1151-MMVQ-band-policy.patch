@@ -1,0 +1,145 @@
+From e72c2a17d2f0c89ba9ff4e0bbd193ce21ec3e20a Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Thu, 24 Sep 2026 13:49:39 -0500
+Subject: [PATCH] gap-closing WIP: gfx1151 MMVQ band policy (dense odd-row band
+ on, routed MoE stays 8)
+
+0028 was found and tuned on gfx1201.  On gfx1151 the two arms behave
+differently, measured with the llama-batched-bench cliff detector on the
+qwen4exp IQ4_NL headline model (S_TG t/s, interleaved):
+
+  B        baseline   dense-on   dense-on+MoE-on
+  8          95.5       95.2         95.8
+  9          89.4       98.0         93.5     (baseline/dense +9.6 %)
+  10         96.0      104.9         98.4     (+9.3 %)
+  11         96.7      104.1         97.1     (+7.7 %)
+  12        102.1      109.4        100.0     (+7.1 %)
+
+* The arm-independent B=8->9 step-down is the DENSE odd-row MMQ
+  fallback: qwen4exp's dense weights have rows 4/15/18/256/320
+  (nrows % 128 != 0).  Widening 0028's dense gate to RDNA3_5 removes it
+  (+7..10 % at B>=9, B<=8 unchanged; 27B dense control unaffected, the
+  35B-A3B Q3_K_M MoE control unchanged).
+* The routed MoE band->16 is a LOSS on gfx1151: the gfx1151-tuned
+  routed-compact MMQ (mmq_rdna3_5_id_get_J) beats the one-warp-per-token
+  MoE MMVQ kernel at n_tokens 9..16 for every routed type measured
+  (Q3_K/Q4_K/Q4_1/Q5_K/IQ4_NL/IQ4_XS, -2..-8 % at B=9..12; only 35B-A3B
+  UD-Q3_K_M was neutral).  Floor the RDNA3_5 band at MMVQ_MAX_BATCH_SIZE
+  (pre-extension); RDNA4 keeps MMVQ_MOE_MAX_BATCH_SIZE.
+
+Correctness: width probe PASS (worst maxdiff 0, row-0 268e0673300b7a33),
+plain == n3 byte-identical, dense-band on/off identical text, QSA 26/26,
+GDN 46/46.  Kill-switches unchanged (GGML_CUDA_DISABLE_MMVQ_DENSE_BAND;
+the MoE band is now arch-decided, so GGML_CUDA_DISABLE_MMVQ_MOE_BAND is a
+no-op on RDNA3_5).
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 10 +++++-----
+ ggml/src/ggml-cuda/mmvq.cu      | 33 +++++++++++++++++++++------------
+ 2 files changed, 26 insertions(+), 17 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 89da8b8f5..70ab9e865 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2365,12 +2365,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         return;
+     }
+     bool use_mmvq = ggml_cuda_should_use_mmvq(src0->type, cc, ne11);
+-    // RDNA4: a dense weight whose output-row count is not a multiple of 128 takes MMQ's slow
++    // RDNA4/RDNA3_5: a dense weight whose output-row count is not a multiple of 128 takes MMQ's slow
+     // non-128-row "fallback" config (~3x per launch versus the ksplit MMVQ kernel at these small
+     // column counts; the qwen4exp n_tokens = 9 verify step).  Keep the ksplit band for those rows.
+     // GGML_CUDA_DISABLE_MMVQ_DENSE_BAND=1 is the bisect/A-B kill-switch (default on).
+     static const bool dense_band_off = getenv("GGML_CUDA_DISABLE_MMVQ_DENSE_BAND") != nullptr;
+-    if (!use_mmvq && !dense_band_off && GGML_CUDA_CC_IS_RDNA4(cc) && ne11 <= MMVQ_MOE_MAX_BATCH_SIZE && src0->ne[1] % 128 != 0) {
++    if (!use_mmvq && !dense_band_off && (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) && ne11 <= MMVQ_MOE_MAX_BATCH_SIZE && src0->ne[1] % 128 != 0) {
+         use_mmvq = true;
+     }
+     if (use_mmvq) {
+@@ -4408,10 +4408,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         // per-node decode path: the merged mmq kernels would change numerics there (B's !use_mmvq).
+         const int64_t ncols_dst = has_ids ? node->ne[2] : node->ne[1];
+         // The routed-expert (MUL_MAT_ID) path takes the dedicated MoE MMVQ kernel over the whole
+-        // verify band; RDNA4 dense rows that MMQ would run in its non-128-row fallback config do
+-        // the same.  The pair fusion stands down so the per-node MMVQ dispatch handles them.
++        // verify band; RDNA4/RDNA3_5 dense rows that MMQ would run in its non-128-row fallback
++        // config do the same.  The pair fusion stands down so the per-node MMVQ dispatch handles them.
+         static const bool dense_band_off = getenv("GGML_CUDA_DISABLE_MMVQ_DENSE_BAND") != nullptr;
+-        const bool mmvq_extended_rows = !dense_band_off && !has_ids && GGML_CUDA_CC_IS_RDNA4(cc) && src0->ne[1] % 128 != 0;
++        const bool mmvq_extended_rows = !dense_band_off && !has_ids && (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) && src0->ne[1] % 128 != 0;
+         const int64_t mmvq_band = (has_ids || mmvq_extended_rows) ? MMVQ_MOE_MAX_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE;
+         const bool use_mmvq = ncols_dst <= mmvq_band &&
+             (!has_ids || ncols_dst <= get_mmvq_mmid_max_batch(src0->type, cc) ||
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 1c7bfcf90..094596779 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -294,8 +294,14 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+ // 1-token decode and an (n_draft + 1)-token speculative verify batch of the same MoE matmul to be
+ // bit-identical, and MUL_MAT_ID mmvq (mul_mat_vec_q_moe, one warp per token) and MMQ reduce in
+ // different orders, so no cap may split the band.  The cap still applies above the band.
+-static constexpr __host__ __device__ int mmvq_mmid_max_batch_band(int cap) {
+-    return cap > MMVQ_MOE_MAX_BATCH_SIZE ? cap : MMVQ_MOE_MAX_BATCH_SIZE;
++//
++// The extended (16-wide) band is an RDNA4 win.  On RDNA3_5 (gfx1151) the gfx1151-tuned
++// routed-compact MMQ (mmq_rdna3_5_id_get_J) beats the one-warp-per-token MoE MMVQ kernel for
++// n_tokens 9..16 on every routed type measured (Q3_K/Q4_K/Q4_1/Q5_K/IQ4_NL/IQ4_XS, -2..-8 % at
++// B = 9..12), so there the floor stays at the pre-extension 8-wide band and routed MoE returns to
++// MMQ above it.  `floor_band` carries the arch decision at the call site.
++static constexpr __host__ __device__ int mmvq_mmid_max_batch_band(int cap, int floor_band) {
++    return cap > floor_band ? cap : floor_band;
+ }
+ 
+ // Host function: returns the max batch size for the current arch+type at runtime.
+@@ -314,19 +320,20 @@ static int get_mmvq_mmid_max_batch_impl(ggml_type type, int cc) {
+     // AMD
+     if (GGML_CUDA_CC_IS_AMD(cc)) {
+         if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type));
++            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type), MMVQ_MOE_MAX_BATCH_SIZE);
+         }
+         if (GGML_CUDA_CC_IS_RDNA3(cc)) {
+-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type));
++            const int floor_band = GGML_CUDA_CC_IS_RDNA3_5(cc) ? MMVQ_MAX_BATCH_SIZE : MMVQ_MOE_MAX_BATCH_SIZE;
++            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type), floor_band);
+         }
+         if (GGML_CUDA_CC_IS_RDNA1(cc) || GGML_CUDA_CC_IS_RDNA2(cc)) {
+-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna1_rdna2(type));
++            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna1_rdna2(type), MMVQ_MOE_MAX_BATCH_SIZE);
+         }
+         if (GGML_CUDA_CC_IS_CDNA(cc)) {
+-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_cdna(type));
++            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_cdna(type), MMVQ_MOE_MAX_BATCH_SIZE);
+         }
+         if (GGML_CUDA_CC_IS_GCN(cc)) {
+-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_gcn(type));
++            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_gcn(type), MMVQ_MOE_MAX_BATCH_SIZE);
+         }
+     }
+     return MMVQ_MAX_BATCH_SIZE;
+@@ -441,15 +448,17 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+ template <ggml_type type>
+ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
+ #if defined(RDNA4)
+-    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type));
++    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type), MMVQ_MOE_MAX_BATCH_SIZE);
++#elif defined(RDNA3_5)
++    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type), MMVQ_MAX_BATCH_SIZE);
+ #elif defined(RDNA3)
+-    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type));
++    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type), MMVQ_MOE_MAX_BATCH_SIZE);
+ #elif defined(RDNA2) || defined(RDNA1)
+-    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna1_rdna2(type));
++    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna1_rdna2(type), MMVQ_MOE_MAX_BATCH_SIZE);
+ #elif defined(CDNA)
+-    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_cdna(type));
++    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_cdna(type), MMVQ_MOE_MAX_BATCH_SIZE);
+ #elif defined(GCN)
+-    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_gcn(type));
++    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_gcn(type), MMVQ_MOE_MAX_BATCH_SIZE);
+ #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == GGML_CUDA_CC_VOLTA || __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE)
+     return MMVQ_MAX_BATCH_SIZE;
+ #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
+-- 
+2.55.0
+

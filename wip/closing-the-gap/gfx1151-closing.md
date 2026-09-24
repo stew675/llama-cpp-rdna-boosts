@@ -46,6 +46,15 @@ gfx1201 result (qwen4exp IQ4_NL, 3-GPU `-sm tensor`): the B=8→9 step is **gone
 **202.6 → 270.0 t/s** (+33 %, now *above* B=8's 256), B=10..12 gain +5…+23 %.  This file hands that
 to gfx1151.
 
+**gfx1151 result (2026-09-24, [§5 of `2026-09-24-gfx1151-mm-band.md`](2026-09-24-gfx1151-mm-band.md),
+folded into [`patches/0031`](patches/0031-gap-closing-WIP-gfx1151-MMVQ-band-policy.patch)):** the two
+arms split.  The arm-independent B=8→9 step-down **is the dense arm**, not the MoE band — widening
+the dense gate to RDNA3_5 removes it (**+10.0 % B9, +9.9 % B10, +7.6 % B11, +8.7 % B12**, B≤8
+unchanged; 27B dense rises as before, 35B-A3B neutral).  The routed MoE band→16 is a **loss** on
+gfx1151 across nearly every routed type (−2…−8 % at B=9..12), so `0031` floors the RDNA3_5 band at
+`MMVQ_MAX_BATCH_SIZE` and leaves RDNA4 (`0028`) as measured.  **gfx1151 default is now dense band ON,
+MoE band OFF**; RDNA3_0 is still open (`gfx1100-closing.md`).
+
 > **Do not target the gfx1201/gfx1151 hash values across boxes.**  The gates are **intra-build**
 > (`plain == draft-mtp`, width purity, acceptance) plus the A/B of the two kill-switches.
 
@@ -116,10 +125,10 @@ r13+beta worktree + 27/27 reproduces tree `533eee3188ab7df9b6cf394adeaa31b46bd13
 
 | piece | gfx1151 effect | job |
 |---|---|---|
-| `mmvq_mmid_max_batch_band` floor = 16 | **fires** — routed `MUL_MAT_ID` at `n_tokens 9..16` now takes `mul_mat_vec_q_moe` instead of the RDNA3_5 routed-compact MMQ (`mul_mat_q_routed_compact` / `mmq_rdna3_5_id_get_J`).  This is exactly the gfx1151-tuned code path the campaign ported. | **revalidate** (§4.2 / §4.4); if a type/path regresses, narrow the per-type `get_mmvq_mmid_max_batch_rdna3` table rather than reverting the band |
+| `mmvq_mmid_max_batch_band` floor = 16 | **fires** — routed `MUL_MAT_ID` at `n_tokens 9..16` now takes `mul_mat_vec_q_moe` instead of the RDNA3_5 routed-compact MMQ (`mul_mat_q_routed_compact` / `mmq_rdna3_5_id_get_J`).  This is exactly the gfx1151-tuned code path the campaign ported. | **DONE 2026-09-24** — it is a **loss** on gfx1151 for nearly every routed type (−2…−8 % at B=9..12; only 35B-A3B UD-Q3_K_M neutral).  `0031` floors the RDNA3_5 band back at `MMVQ_MAX_BATCH_SIZE` (per-arch, not per-type — a per-type table would have to exclude almost everything) |
 | `mul_mat_vec_q_moe` launch bound 8→16 warps | **fires** and can change register allocation / occupancy for the *existing* `n_tokens ≤ 8` decode band | **measure decode (`tg`) before/after** on the same model/build.  If W ≤ 8 regresses, take the templated mitigation in §5.1 |
 | pair-fusion `use_mmvq` with `has_ids` | **fires** (MoE pair no longer merged into MMQ at 9..16) | covered by §4.2 |
-| dense odd-row band | **does not fire** (`GGML_CUDA_CC_IS_RDNA4`) | **measure and decide** whether to widen to RDNA3_5 (§4.6) |
+| dense odd-row band | **does not fire** (`GGML_CUDA_CC_IS_RDNA4`) | **DONE 2026-09-24** — measured and **widened to RDNA3_5** (`0031`): it removes qwen4exp's arm-independent B=8→9 step (+7..10 % at B≥9).  RDNA3_0 still open |
 | `case 9..16` ksplit instantiations | **compiles** (build-time cost, see §5.2) | §5.2 build check |
 
 **Why it matters here:** gfx1151 has its own `mmq_rdna3_5_id_get_J` tile table (rows-per-expert →
@@ -237,6 +246,12 @@ here (the `_rdna3` table and `mmq_rdna3_5_id_get_J` differ); only add a per-type
 regresses at **B ≤ 13**.  Record:
 [`2026-09-24-op3-per-type-moe-band.md`](2026-09-24-op3-per-type-moe-band.md).
 
+**gfx1151 answered differently (2026-09-24): no per-type band either, but the band itself is
+dropped.**  The extension regresses nearly every routed type here (−2…−8 % at B=9..12:
+Q4_K/Q4_1/Q5_K/True-Q3/IQ4_NL/IQ4_XS; only 35B-A3B UD-Q3_K_M neutral), so `0031` floors the RDNA3_5
+band at `MMVQ_MAX_BATCH_SIZE` per **arch** rather than carving a per-type table that would exclude
+almost everything.  Record: [`2026-09-24-gfx1151-mm-band.md`](2026-09-24-gfx1151-mm-band.md).
+
 ### 4.6 Dense odd-row band — port/reject decision (gfx1151 does not get it as written)
 
 The RDNA4 rule is `src0->ne[1] % 128 != 0`.  Widening it to RDNA3_5 is a **new arch gate**, so it
@@ -249,6 +264,12 @@ needs its own measurement:
    RDNA3_0 separately per `gfx1100-closing.md`) and re-run §4.2.
 3. Gate on the same `GGML_CUDA_DISABLE_MMVQ_DENSE_BAND` kill-switch; keep the per-arch predicate so
    a box that does not need it is unaffected.
+
+**RESULT 2026-09-24 (gfx1151): WIDEN.**  Step 1 confirmed the dip with `off_moe`, step 2 done: the
+widening removes it (**+10.0 % B9, +9.9 % B10, +7.6 % B11, +8.7 % B12** on qwen4exp IQ4_NL, B≤8
+unchanged; 27B Q8_0 dense control unchanged, 35B-A3B UD-Q3_K_M unchanged).  Folded into
+[`patches/0031`](patches/0031-gap-closing-WIP-gfx1151-MMVQ-band-policy.patch); record
+[`2026-09-24-gfx1151-mm-band.md`](2026-09-24-gfx1151-mm-band.md).
 
 **Rationale for the `% 128` test:** it is not a guess about qwen4exp — it is the *actual* condition
 `mul_mat_q_case` uses to select the fast vs `fallback` MMQ config
@@ -397,6 +418,17 @@ Inputs stay zero-copy and the per-ubatch copy disappears.
 ## 10. Session log
 
 Newest first.  Append state, what changed, the tree/`From <sha>`, and the next action.
+
+### 2026-09-24 — the gfx1151 band-boundary result (this box): dense arm fixed, MoE arm reverted
+
+Ran §4.2-§4.6 on `gap-closing-final` + `0031` (tree `468c64963ae45e72367c73809efa7cc038217e8a`).
+Full record: [`2026-09-24-gfx1151-mm-band.md`](2026-09-24-gfx1151-mm-band.md).  **Verdict:** the
+gfx1201-found `0028` splits on gfx1151 — the strong B=8→9 step-down is the **dense odd-row fallback**
+(widen `GGML_CUDA_CC_IS_RDNA4` to `|| RDNA3_5`: **+10.0/+9.9/+7.6/+8.7 %** at B9/10/11/12), and the
+routed MoE band→16 is a **loss** (floor RDNA3_5 back at `MMVQ_MAX_BATCH_SIZE`).  Gates: width probe
+PASS (row-0 `268e0673300b7a33`), `plain == n3`, dense on/off identical text, QSA 26/26, GDN 46/46.
+**Next:** §8 carry-over items (notably §8#6 M-RoPE image + MTP, the box the crash was found on) and
+§9 (measure the `0025` copy before porting the input ring); RDNA3_0 remains with `gfx1100-closing.md`.
 
 ### 2026-09-24/25 — brief expanded for the final wrap-up (from the gfx1201 campaign close)
 
