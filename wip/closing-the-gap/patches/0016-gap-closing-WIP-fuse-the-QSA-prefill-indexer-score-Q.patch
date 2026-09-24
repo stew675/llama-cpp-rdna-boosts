@@ -1,4 +1,4 @@
-From ef6985a391df958bee91cce4e6ee4fde2c79d512 Mon Sep 17 00:00:00 2001
+From eede54ce2b2eefe315d91e695a7c5e68e01036e8 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 22 Sep 2026 14:32:54 -0500
 Subject: [PATCH] gap-closing WIP: fuse the QSA prefill indexer score
@@ -23,13 +23,13 @@ coherent same-seed text (a prefill re-baseline, wording-only difference);
 pp32768 1311.5 -> 1324.9 t/s (+1.0 %, -b/-ub 8192) and 1265.9 -> 1277.2
 (+0.9 %, -b/-ub 4096), pp8192 flat/within noise.  =0 restores the per-op chain.
 ---
- ggml/src/ggml-cuda/lightning-indexer.cu | 150 +++++++++++++++++++++++-
- src/models/qwen4exp.cpp                 |  56 ++++++++-
+ ggml/src/ggml-cuda/lightning-indexer.cu | 164 +++++++++++++++++++++++-
+ src/models/qwen4exp.cpp                 |  56 +++++++-
  tests/test-backend-ops.cpp              |  11 ++
- 3 files changed, 213 insertions(+), 4 deletions(-)
+ 3 files changed, 227 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/lightning-indexer.cu b/ggml/src/ggml-cuda/lightning-indexer.cu
-index 5edc967e0..b7722a5e2 100644
+index 5edc967e0..a90fd1f88 100644
 --- a/ggml/src/ggml-cuda/lightning-indexer.cu
 +++ b/ggml/src/ggml-cuda/lightning-indexer.cu
 @@ -1,5 +1,6 @@
@@ -93,7 +93,7 @@ index 5edc967e0..b7722a5e2 100644
          return false;
      }
  
-@@ -586,3 +609,124 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst)
+@@ -586,3 +609,138 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst)
              return false;
      }
  }
@@ -180,9 +180,23 @@ index 5edc967e0..b7722a5e2 100644
 +#endif
 +}
 +
++// The 4-head WMMA kernel is the RDNA3_5 (gfx1151) shipped arm.  RDNA3_0 (gfx1100) shares the gfx11
++// WMMA builtin, so the kernel compiles there; it is a port candidate gated OPT-IN via
++// GGML_CUDA_LIGHTNING_INDEXER4_GFX1100 until a gfx1151/gfx1201 session A/Bs qwen4exp prefill
++// end-to-end (the kernel is prefill-only, n_tps >= 128).
++static bool indexer4_arch_enabled(int cc) {
++    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) { return true; }
++    if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
++        static const int v = getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1100")
++            ? atoi(getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1100")) : 0;
++        return v != 0;
++    }
++    return false;
++}
++
 +static bool supports_indexer4(int device, const ggml_tensor * dst) {
 +    const auto * q=dst->src[0], * k=dst->src[1], * w=dst->src[2], * m=dst->src[3];
-+    if (!q || !k || !w || !m || !GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[device].cc)) { return false; }
++    if (!q || !k || !w || !m || !indexer4_arch_enabled(ggml_cuda_info().devices[device].cc)) { return false; }
 +    if (q->type != GGML_TYPE_F32 || (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) ||
 +            w->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 ||
 +            q->ne[0] != 128 || q->ne[1] != 4 || k->ne[0] != 128 || k->ne[1] != 1 ||

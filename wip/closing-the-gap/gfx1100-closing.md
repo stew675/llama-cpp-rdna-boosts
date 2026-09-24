@@ -87,14 +87,16 @@ for p in /tmp/closing-patches/0*.patch; do
   case "$p" in *0015-*) echo "skipping $(basename "$p") (superseded by r13 block 00)"; continue;; esac
   git am "$p"
 done
-git rev-parse HEAD^{tree}                    # expect 2b15ecd26c97afb4dbe2f58566def2180949df82
+git rev-parse HEAD^{tree}                    # expect 1f09fd97d916ca080f7f65cdc422a3d6c425baa7
 ```
 
 Notes:
 
 * **`0015` must be skipped** (the shared-NextN MTP fix is in the r13 block-00 base).
 * **`0024` must be applied before `0025`** — `0025` reverts `0024`'s `src/llama-model.cpp` heuristic.
-* The applied tree is `2b15ecd26c97afb4dbe2f58566def2180949df82`.  Record the actual `From <sha>`/tree.
+* The applied tree is `1f09fd97d916ca080f7f65cdc422a3d6c425baa7` (the gfx1100 RDNA3_0 arms are
+  folded into `0016`/`0003`, so this is the arch-complete 25-patch set — no separate overlay).
+  Record the actual `From <sha>`/tree.
 * Keep a **second worktree at r13+beta** (step 2, before the closing patches) as the local
   pre-closing baseline for §6.0.  Build it once and keep it warm.
 * `HIP_VISIBLE_DEVICES=0` on **every** model/bench command.
@@ -318,11 +320,12 @@ has A/B'd it end-to-end; land it as a patch on the WIP branch and record it in
 Everything else that is RDNA3_5-only (`HC16`, `gatemix` as shipped) stays inert — record that with
 the predicate.
 
-### 7.1 Port result (2026-09-23)
+### 7.1 Port result (2026-09-23, folded into the 25-patch set 2026-09-23)
 
-Both candidates are **ported and landed as `wip/closing-the-gap/gfx1100/0001-gfx1100-port-…patch`**
-(commit `16865b36d` on the fork's `closing-gfx1100` branch).  Neither is enabled by default on
-gfx1100:
+Both candidates are **ported and folded into the canonical `0016` and `0003` patches** (the
+25-patch set is now arch-complete: gfx1100/gfx1151/gfx1201).  The fork commits are `eede54ce2`
+(`0016`) and `8b7c5fad3` (`0003`); the separate gfx1100 overlay patch was removed.  Neither arm is
+enabled by default on gfx1100:
 
 * **`0016` `QSA_SCORE_WMMA`** — `supports_indexer4()` now uses `indexer4_arch_enabled(cc)`:
   RDNA3_5 stays the shipped arm; RDNA3_0 (gfx1100) is **opt-in** via
@@ -332,7 +335,7 @@ gfx1100:
   fits in 24 GiB) — deferred to gfx1151/gfx1201.
 * **`0003` `hc_gate_mix`** — the call-site predicate is now `GGML_CUDA_CC_IS_RDNA3(cc)`
   (gfx1100 + gfx1151).  `gatemix` **stays default OFF on RDNA3_0** (`mmb_arch_defaults`), so the
-  port is **opt-in via `LLAMA_HC_GATEMIX=1`**.  The kernel (`hc_gate_mix_kernel<4>`, IQ4_NL +
+  arm is **opt-in via `LLAMA_HC_GATEMIX=1`**.  The kernel (`hc_gate_mix_kernel<4>`, IQ4_NL +
   gfx11 WMMA) compiles for gfx1100 (verified by the clean build), but there is **no op-level
   oracle** (it is a graph fusion) and qwen4exp does not fit, so the unit test is compile-only —
   end-to-end deferred to gfx1151/gfx1201.
@@ -381,8 +384,9 @@ you ran instead.
 ## 9. Session results (gfx1100, 2026-09-23)
 
 **Box:** 1× RX 7900 XTX (gfx1100, 24 GiB), ROCm 7.14, `HIP_VISIBLE_DEVICES=0` on every command.
-**Trees:** closing = `~/llama.cpp` `closing-gfx1100` (r13 + beta + 25 closing patches, applied tree
-`2b15ecd26c97afb4dbe2f58566def2180949df82`; plus the §7.1 port commit `16865b36d`).  Baseline =
+**Trees:** closing = `~/llama.cpp` `rdna-boosts` (r13 + beta + 25 closing patches, applied tree
+`1f09fd97d916ca080f7f65cdc422a3d6c425baa7`, with the gfx1100 RDNA3_0 arms folded into `0016`/`0003`).
+Baseline =
 `~/llama-r13beta` (r13 + beta, applied tree `79136a15cac1920c0dd334b4c119a9cb42f9143b`).  Both built
 with 0 errors.  Models available on this box: 27B UD-Q4_K_M, 35B-A3B Q3_K_M, gemma-12B Q8_0,
 gemma-26B-A4B qat-UD-Q4_K_XL, Ornith-1.0-9B-BF16.  **Missing:** 27B IQ3_S (§6.1) and NanBeige BF16

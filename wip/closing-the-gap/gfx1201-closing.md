@@ -100,7 +100,7 @@ for p in /tmp/closing-patches/0*.patch; do
   case "$p" in *0015-*) echo "skipping $(basename "$p") (superseded by r13 block 00)"; continue;; esac
   git am "$p"
 done
-git rev-parse HEAD^{tree}                    # expect 2b15ecd26c97afb4dbe2f58566def2180949df82
+git rev-parse HEAD^{tree}                    # expect 1f09fd97d916ca080f7f65cdc422a3d6c425baa7
 ```
 
 Notes:
@@ -109,8 +109,9 @@ Notes:
   r13 block-00 base, so the WIP patch is superseded.
 * **`0024` must be applied before `0025`** — `0025` reverts `0024`'s `src/llama-model.cpp` heuristic
   and takes the host-buffer path instead.  Do not drop `0024`.
-* The applied tree at the end is `2b15ecd26c97afb4dbe2f58566def2180949df82`.  Record the actual
-  `From <sha>`/tree in your report.
+* The applied tree at the end is `1f09fd97d916ca080f7f65cdc422a3d6c425baa7` (the gfx1100 RDNA3_0
+  arms are folded into `0016`/`0003`, so the 25-patch set is arch-complete — no separate overlay).
+  Record the actual `From <sha>`/tree in your report.
 * Keep a **second worktree at r13+beta** (§2 step 2, before the closing patches).  It is the local
   pre-closing baseline for §6.0.  Build it once and keep it warm.
 

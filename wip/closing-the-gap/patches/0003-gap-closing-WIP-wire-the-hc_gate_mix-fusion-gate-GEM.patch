@@ -1,4 +1,4 @@
-From 94694a38ed374faa59ab4e95c4bacdf97a15dbeb Mon Sep 17 00:00:00 2001
+From 8b7c5fad39c6f0d4777d4000cd55d26d5797eb5a Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 21 Sep 2026 21:15:06 -0500
 Subject: [PATCH] gap-closing WIP: wire the hc_gate_mix fusion (gate GEMM +
@@ -30,12 +30,12 @@ unchanged there (a Q8_0 kernel is a follow-up).
 
 Exported to wip/closing-the-gap/patches/.
 ---
- ggml/src/ggml-cuda/ggml-cuda.cu | 73 +++++++++++++++++++++++++++++++++
- ggml/src/ggml-cuda/mmb.cu       |  5 ++-
- 2 files changed, 76 insertions(+), 2 deletions(-)
+ ggml/src/ggml-cuda/ggml-cuda.cu | 76 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmb.cu       |  9 +++-
+ 2 files changed, 83 insertions(+), 2 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 61753907e..777255364 100644
+index 61753907e..dc04c9c1c 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -3996,6 +3996,23 @@ static int ggml_cuda_match_hc_mix(const ggml_cgraph * cgraph, const int i, ggml_
@@ -62,17 +62,20 @@ index 61753907e..777255364 100644
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-@@ -5386,6 +5403,62 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5386,6 +5403,65 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      static const bool hc_optin  = !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_FUSION") || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_FUSION")));
      static const bool hc_mix_on  = hc_optin && !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_MIX")  || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_MIX")));
      static const bool hc_comb_on = hc_optin && !disable_hc_fusion && (!getenv("GGML_CUDA_DISABLE_HC_COMB") || !std::atoi(getenv("GGML_CUDA_DISABLE_HC_COMB")));
 +
 +    // qwen4exp hyper-connection gate GEMM + sigmoid + stream mix: when the HC gate MUL_MAT's only
 +    // consumer is the sigmoid that opens an hc_mix window, fold the GEMM into the mix kernel - it
-+    // removes the gate tensor materialization and one launch per layer.  RDNA3_5 (gfx1151) only; the
++    // removes the gate tensor materialization and one launch per layer.  RDNA3 (gfx1100/gfx1151); the
 +    // kernel dequantizes the IQ4_NL gate weight and replays the GEMM's BF16 epilogue rounding, so the
 +    // fusion is bit-identical to the GEMM + sigmoid + mix chain.  A/B / bisect: LLAMA_HC_GATEMIX=0.
-+    if (hc_mix_on && ggml_cuda_mmb_gatemix() && GGML_CUDA_CC_IS_RDNA3_5(cc) &&
++    // gfx1100 is a port candidate: the gfx11 WMMA builtin is shared with gfx1151, but `gatemix` stays
++    // default OFF on RDNA3_0 (mmb_arch_defaults) until a gfx1151/gfx1201 session A/Bs qwen4exp
++    // end-to-end; LLAMA_HC_GATEMIX=1 is the opt-in on gfx1100.
++    if (hc_mix_on && ggml_cuda_mmb_gatemix() && GGML_CUDA_CC_IS_RDNA3(cc) &&
 +            node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes) {
 +        const ggml_tensor * w  = node->src[0];
 +        const ggml_tensor * lo = node->src[1];
@@ -126,7 +129,7 @@ index 61753907e..777255364 100644
      // qwen4exp hyper-connection stream mix:
      //     sigmoid(gate) -> mul(xn, .) -> reshape -> view(stream 0) -> cont -> (view(stream c) -> add) x (hc-1) -> scale
 diff --git a/ggml/src/ggml-cuda/mmb.cu b/ggml/src/ggml-cuda/mmb.cu
-index 6da6d7e4f..de0f83e97 100644
+index 6da6d7e4f..297115812 100644
 --- a/ggml/src/ggml-cuda/mmb.cu
 +++ b/ggml/src/ggml-cuda/mmb.cu
 @@ -1214,7 +1214,7 @@ struct mmb_arch_cfg {
@@ -146,15 +149,19 @@ index 6da6d7e4f..de0f83e97 100644
      }
      if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
          // gfx1100 S6/S7: the F32 MoE-router split TILE is a loss here (gemma-26B-A4B -3.1 %,
-@@ -1257,6 +1258,7 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
+@@ -1257,6 +1258,11 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
          // keeps its default.  NOTE: gfx1100 was only measured to pp32768 -- re-check pp65536+
          // before finalising (see gfx1100-porting.md 14.5).
          c.f32split_mode = 0;
-+        c.gatemix       = 0;   // the gate-mix kernel is IQ4_NL + RDNA3_5 WMMA; not ported to RDNA3_0 yet
++        // gatemix: the kernel's gfx11 WMMA builtin is shared with gfx1151 (ported 2026-09-23, the
++        // call site now accepts RDNA3), but it stays default OFF on RDNA3_0 -- qwen4exp (the only
++        // model with IQ4_NL HC gates) does not fit on gfx1100, so end-to-end A/B must be done on
++        // gfx1151/gfx1201 first.  LLAMA_HC_GATEMIX=1 is the opt-in.
++        c.gatemix       = 0;
      }
      // TODO(S12): the routed/GLU thresholds, `tall_mode`, `tiny_m*`, `f32split_*` and `cache_max` are
      // still the gfx1151 values on every arch.  Give RDNA4 its own once they are measured per arch.
-@@ -1867,7 +1869,6 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor *
+@@ -1867,7 +1873,6 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor *
      dim3 grid(E / 32, (T + 127) / 128);
      hc_gate_mix_kernel<4><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
      CUDA_CHECK(cudaGetLastError());
