@@ -161,6 +161,16 @@ The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and t
 5. **qwen4exp adaptive-MTP ceiling sweep** (3/5/7/9/12) — a tuning item, parked until the sparse-draft
    default is settled.  The draft-mtp ceiling and the `--spec-draft-n-max` purity band are separate;
    see `benchmarks/mtp-adaptive-methodology.md`.
+6. **MMVQ↔MMQ band-boundary fixes — gfx1151 revalidation/port (NEW 2026-09-24).**  The gfx1201
+   session root-caused the qwen4exp `n_max` 7→8 drop to the `n_tokens = 8 → 9` matmul *family*
+   boundary (`MMVQ_MAX_BATCH_SIZE = 8`), not the MMQ J tile, and fixed it with two default-on bands:
+   `MMVQ_MOE_MAX_BATCH_SIZE = 16` for routed experts (arch-independent AMD) and an RDNA4 dense
+   `nrows % 128 != 0` rule.  qwen4exp B=9 **202.6 → 270.0 t/s**, `n_max 8` MTP 94.3 → 102.7 t/s on
+   gfx1201.  **The routed-expert band already fires on gfx1151** (arch-independent), so it must be
+   revalidated on `halo`; the dense band is RDNA4-gated and needs a port/reject decision.  Handover
+   brief: [`gfx1151-closing.md`](gfx1151-closing.md); diff:
+   [`2026-09-24-mmvq-band-boundary.patch`](2026-09-24-mmvq-band-boundary.patch); record:
+   [`2026-09-24-qwen4exp-w9-verify-cliff.md`](2026-09-24-qwen4exp-w9-verify-cliff.md).
 
 ### Parked / do not restart without a reason
 

@@ -372,6 +372,34 @@ MTP verdict, and the `-b/-ub 4096` protocol for A/Bs.
 
 Newest first.  Each session appends its state, what it changed, and the next action.
 
+### 2026-09-24 — session 8: the W=9 cliff is the MMVQ→MMQ family boundary, and it is fixed
+
+**The correction.**  Session 7's J-selection hypothesis was wrong.  `rocprofv3 --kernel-trace` on
+B=8 vs B=9 plus a `(type, J, ncols_dst, nchannels_y, ids)` dump proved the routed experts use
+**J=16 in both arms** — the change is `MMVQ_MAX_BATCH_SIZE = 8`: at `n_tokens = 9` the routed
+experts leave `mul_mat_vec_q_moe` for `mul_mat_q_routed_compact`/`mul_mat_q`, and the dense weights
+leave `mul_mat_vec_q_ksplit` for `mul_mat_q`.  qwen4exp's weights have `nrows_x % 128 != 0`, so MMQ
+selects `mul_mat_q_case`'s generic non-128-row **`fallback`** config (~3× the per-launch cost of the
+ksplit kernel); 27B's rows are all ÷128, so MMQ is the *fast* config and it gains at the same
+boundary — the jump and the dip are the same mechanism.
+
+**The fix** (uncommitted 3-file edit, 69 insertions): `MMVQ_MOE_MAX_BATCH_SIZE = 16` for the
+routed-expert path (arch-independent AMD, whole supported verify range W ≤ 16), plus an RDNA4 rule
+keeping ksplit MMVQ for `nrows % 128 != 0` dense shapes at 9..16.  Kill-switches
+`GGML_CUDA_DISABLE_MMVQ_MOE_BAND=1` / `GGML_CUDA_DISABLE_MMVQ_DENSE_BAND=1`.
+
+**Result (qwen4exp IQ4_NL, 3-GPU `-sm tensor`, q8_0 KV, `-b/-ub 2048`, S_TG t/s, two interleaved
+rounds):** B=8 unchanged (256.3/255.4 vs 255.7); **B=9 202.6 → 270.0/268.7**, B=10 226.1 →
+289.0/288.2, B=11 245.0 → 302.0/301.7, B=12 264.7 → 324.5/324.0.  The B=8→9 dip is gone (B=9 is now
+above B=8).  `n_max 8` MTP 94.3 → **102.7 t/s** at acceptance 0.6285; `n7` and `plain == n3`
+(`3553e76d3a9e`) unchanged.  27B UD-Q4_K_XL keeps its pre-existing B=9 upward jump and is otherwise
+unchanged; 35B-A3B Q3_K_M neutral.
+
+**Not done:** the full `n7`/`n8`/adaptive matrix with the fix, per-type MoE-band tuning, and the
+gfx1151/gfx1100 revalidation+port — the MoE band already fires on gfx1151 (arch-independent), the
+dense band is RDNA4-gated.  Handover: [`gfx1151-closing.md`](gfx1151-closing.md).  Full evidence:
+[`2026-09-24-qwen4exp-w9-verify-cliff.md`](2026-09-24-qwen4exp-w9-verify-cliff.md).
+
 ### 2026-09-24 — session 7: the qwen4exp W=9 verify cliff (the n7→n8 drop) root-caused (≈half)
 
 **The observation (maintainer):** `draft-mtp n_max` 7→8 is an anomalously **sharp** drop
@@ -1123,12 +1151,20 @@ Contract reminder: above `n_max 7` use acceptance + MTP-vs-plain throughput, **n
 
 ### 13.7 The qwen4exp W=9 verify cliff (`n_max` 7→8) — the sharp n8 drop
 
-**Significant, open (session 7).**  The n7→n8 MTP drop is not the acceptance curve: it is a sharp,
-**qwen4exp-only** step-cost cliff once the verify width reaches 9 (acceptance-free
-`llama-batched-bench`: B=8 255.7 → B=9 202.6, a fixed ~+12 ms/step; 27B/35B are flat or *faster* at
-B=9).  ≈half is the **routed-compact MoE MMQ dispatch** (`GGML_CUDA_DISABLE_MMQ_ROUTED=1` recovers
-202.5 → 220.6); the width-dependent `mmq_rdna3_5_id_get_J(type, rows_per_expert)` tile choice is the
-prime suspect; the remaining ~12 % is unresolved.  Full record + plan:
-[`2026-09-24-qwen4exp-w9-verify-cliff.md`](2026-09-24-qwen4exp-w9-verify-cliff.md).  **This must be
-fixed before the `n7`/`n8` matrix (§13.6) is final** — the n8 penalty is partly this path, not the
-depth/acceptance trade-off.
+**Significant, open (session 7) — root-caused and FIXED (session 8, 2026-09-24).**  The n7→n8 MTP drop was not the acceptance curve: it is a sharp,
+**qwen4exp-only** step-cost cliff once the verify width reaches 9.  **Session 8 corrects the cause**:
+it is the `n_tokens = 8 → 9` **MMVQ→MMQ family boundary** (`MMVQ_MAX_BATCH_SIZE = 8`), not the
+`mmq_rdna3_5_id_get_J` tile (J is 16 in both arms).  Routing experts *and* dense weights leave the
+vector kernels at 9 columns; qwen4exp's weights have `nrows_x % 128 != 0`, so MMQ selects its generic
+non-128-row **`fallback`** config (~3× the per-launch cost), while 27B's ÷128 rows make MMQ the fast
+choice (hence the 27B *upward* jump at the same boundary).  Fix: `MMVQ_MOE_MAX_BATCH_SIZE = 16` for
+routed experts (arch-independent AMD) + an RDNA4 dense rule that keeps ksplit MMVQ for
+`nrows % 128 != 0` shapes at 9..16, each with a kill-switch (`GGML_CUDA_DISABLE_MMVQ_MOE_BAND`,
+`GGML_CUDA_DISABLE_MMVQ_DENSE_BAND`; the diff is saved as
+[`2026-09-24-mmvq-band-boundary.patch`](2026-09-24-mmvq-band-boundary.patch)).  qwen4exp B=9
+**202.6 → 270.0**, B=10..12 +5…+23 %, B≤8
+unchanged, `n_max 8` MTP 94.3 → **102.7 t/s**, `plain == n3` byte-identical.  Full record:
+[`2026-09-24-qwen4exp-w9-verify-cliff.md`](2026-09-24-qwen4exp-w9-verify-cliff.md).  **gfx1151
+revalidation/port is the new brief [`gfx1151-closing.md`](gfx1151-closing.md)** — the MoE band
+already fires there (arch-independent), the dense band is RDNA4-gated and needs a decision.  The
+`n7`/`n8` matrix (§13.6) still stands and is now the gfx1151 job.
