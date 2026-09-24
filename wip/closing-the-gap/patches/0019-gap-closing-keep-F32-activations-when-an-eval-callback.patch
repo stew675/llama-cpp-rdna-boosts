@@ -1,4 +1,4 @@
-From 575c4c09166871f79890b770b3febba5a113f3f8 Mon Sep 17 00:00:00 2001
+From d5961fd71b8c91836aae44f61093f945842ee880 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 22 Sep 2026 19:07:42 -0500
 Subject: [PATCH] gap-closing WIP: keep the F32 activations when an eval
@@ -52,10 +52,10 @@ index a398c3063..abca08e3d 100644
  
      for (int i = 0; i < sched->n_splits; i++) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 55ce474f0..7f2354991 100644
+index b1d3fc2d7..b58a852be 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -6650,6 +6650,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6653,6 +6653,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -72,7 +72,7 @@ index 55ce474f0..7f2354991 100644
      // MMB HC16 (step 1 of the bf16-producer port): mark the gate producer of a gated DSV4_HC_PRE as
      // BF16-only when MMB will produce it and every consumer reads the BF16 copy.  The gate is a
      // dense MUL_MAT [320 x 10240] whose only consumer is the fused pre op, so this is the contained
-@@ -6685,7 +6695,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6688,7 +6698,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                      if (t == pre) continue;
                      ok = false;
                  }
@@ -81,7 +81,7 @@ index 55ce474f0..7f2354991 100644
                      ggml_cuda_mmb_mark_bf16_only(gr);
                      static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_HC16 gate marked BF16-only: %s (M=%d K=%d T=%d)\n",
                              gr->name, (int) gr->ne[1], (int) gr->ne[0], (int) (gr->ne[2] * gr->ne[3]));
-@@ -6738,8 +6748,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6741,8 +6751,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  const ggml_tensor * ar = rootof(t->src[1]);
                  // single-consumer (bf16-cache GEMM only) -> the F32 output is dead: emit BF16 only.
                  // otherwise keep the F32 output and add the BF16 copy for the GEMMs that want it.
@@ -92,7 +92,7 @@ index 55ce474f0..7f2354991 100644
              }
          }
      }
-@@ -6774,7 +6784,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6777,7 +6787,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
              if (ex->ne[0] % 8 != 0 || ggml_nrows(ex) < 512) {
                  continue;
              }
@@ -101,7 +101,7 @@ index 55ce474f0..7f2354991 100644
          }
      }
  
-@@ -6832,7 +6842,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6835,7 +6845,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                      if (t->op == GGML_OP_MUL || t->op == GGML_OP_ADD) continue;
                      ok = false;
                  }
@@ -110,7 +110,7 @@ index 55ce474f0..7f2354991 100644
              }
          }
          if (ggml_cuda_mmb_res16()) {   // residual stream: readers are the fused norm and the next combine
-@@ -6859,7 +6869,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6862,7 +6872,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                      if (next_combine) continue;
                      ok = false;
                  }
@@ -119,3 +119,6 @@ index 55ce474f0..7f2354991 100644
              }
              // the in-place residual stream needs the producer/consumer on different buffers
              for (const ggml_cuda_hc_combine_norm_args & ca : comb) {
+-- 
+2.55.0
+

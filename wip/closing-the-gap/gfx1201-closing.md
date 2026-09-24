@@ -337,7 +337,7 @@ For anything that does **not** fire (e.g. `0003`, `0016`, `0017`/`0018`, `0022`,
 |---|---|---|
 | `hc_gate_mix` (`0003`) | **not ported to RDNA4** | IQ4_NL + RDNA3_5 WMMA; `gatemix=0` on RDNA4.  Candidate port (the IQ4_NL WMMA is gfx11-shaped) |
 | `QSA_SCORE_WMMA` (`0016`) | **RDNA3_5-only kernel**; generic fallback on RDNA4 | candidate port to RDNA4 WMMA; not a correctness blocker |
-| MMB new quant types (`0017`/`0018`) | **masked off on RDNA4** | the RDNA4 dense per-type policy enables only IQ3_S; enabling Q4_0/… needs a per-type RDNA4 geometry + measurements (see `gfx1201-s10-dense-geometry.md`) |
+| MMB new quant types (`0017`/`0018`) | **Q4_1 + Q5_0 ported (2026-09-23); Q4_0/MXFP4/NVFP4/IQ2 stay out** | RDNA4 dense now `IQ3_S + Q4_1 + Q5_0`; Q4_1/Q5_0 beat the delivery MMQ by +6..+14 % on 4B/9B/27B, Q4_0 loses.  MXFP4/NVFP4 cannot be produced by this box's quantizer; IQ2 needs an unmatched imatrix |
 | gfx1151 decode crossover (`0022`) | intentionally gfx1151-only | gfx1201 stays dense-always (measured flat ~8 % worse for sparse decode) |
 | host-buffer input (`0025`) | **APU-only** | on a discrete GPU the flag stays false; the scheduler guard is not reached.  Nothing to port; just prove the no-op |
 
@@ -371,6 +371,31 @@ MTP verdict, and the `-b/-ub 4096` protocol for A/Bs.
 ## 11. Session log
 
 Newest first.  Each session appends its state, what it changed, and the next action.
+
+### 2026-09-23 — session 3: MMB quant coverage — Q4_1/Q5_0 ported to RDNA4 (item 1 done)
+
+**Did:** work item 1 of §12.1.  Requantized Qwen3.5-4B/9B and Qwen3.8-27B to `--pure` Q4_0/Q4_1/Q5_0
+and ran the interleaved pp8192/pp32768 A/B against the delivery MMQ (`GGML_CUDA_MMB=0`).  Result:
+**Q4_1 wins** (+5.1/+4.2 % 4B, +8.0/+7.1 % 9B, +6.9/+6.1 % 27B) and **Q5_0 wins bigger** (+10.4/+8.7,
++14.4/+12.8, +14.1/+12.7); **Q4_0 loses** (−2.9/−1.9, −0.6/−0.3, −2.4/−1.6).  So RDNA4 now enables
+`IQ_FAMILY | Q4_1 | Q5_0` (dense `IQ3_S | Q4_1 | Q5_0`); Q4_0 stays out.  `MXFP4`/`NVFP4` cannot be
+produced by this box's quantizer and `IQ2_*` needs an unmatched imatrix — all three stay untested
+and unenabled.
+
+**Gates:** MUL_MAT oracle q4_1 47/47, q5_0 14/14 (MMB forced `MIN_T=1`); PPL parity 27B Q4_1
++0.19 %, Q5_0 −0.03 %; 27B greedy text **byte-identical MMB off↔on** for both (`plain ==
+draft-mtp` holds for Q4_1; Q5_0's divergence is pre-existing with MMB off).  Width probe: MMB only
+ever fires `T=512` (prefill), the `W=1..8` band never takes it; the logits-level probe divergence is
+the documented coarse-quant relaxation (9B qwen35 fails with MMB off too; gemma4-12B fails both arms
+at ~1e-6).  Full record: [`2026-09-23-mmb-q41-q50-rdna4.md`](2026-09-23-mmb-q41-q50-rdna4.md).
+
+**Set:** folded into `0017` (new sha `5c3bb41c5`); `0018` regenerated (same mask line).  A fresh
+`r13-beta-baseline` worktree applies the 25 patches **25/25** and reproduces tree
+**`b8700a6c2dcda216adb14cb215839c4e5d5f2b20`** (was `95f916a8e…`).
+
+**Next:** §12.2 `hc_gate_mix` RDNA4 port (needs an IQ4_NL qwen4exp model — this box has only
+IQ4_XS/Q4_K, whose HC gate is Q8_0, so it can only be code-checked here); §12.3 `graph_optimize`
+markings under `-sm tensor` (infrastructure, low priority).
 
 ### 2026-09-23 — integration + first validation pass (gfx1201 / `soar`)
 
@@ -610,8 +635,8 @@ hand-rolled fragments), so the port was three small changes: select
 | `0013` indexer relu-sum | **no** | **inert on RDNA4** — call site is `GGML_CUDA_CC_IS_RDNA3_5(cc)` (`ggml-cuda.cu:4250`) | call-site gate; our tree already banks the reduction via the fused `GGML_CUDA_QSA_INDEXER_SCORE` |
 | `0014` QSA scorer trim | qwen4exp-only | exercised | qwen4exp gates |
 | `0016` `QSA_SCORE_WMMA` | yes, **RDNA4 WMMA (ported this session, default ON)** | **+1.7/+3.2/+6.5/+12.3 % prefill** @pp8192/16384/32768/65536; oracle 225/225; purity holds | [`2026-09-23-qsa-score-wmma-rdna4.md`](2026-09-23-qsa-score-wmma-rdna4.md) |
-| `0017` MMB quant coverage | **not enabled** | **not ported** — RDNA4 mask is `IQ_FAMILY` only; the dequant compiles but is unreachable | `mmb.cu` mask; no matching model/env to force it this session |
-| `0018` MMB IQ2 coverage | **not enabled** | **not ported** — same | same |
+| `0017` MMB quant coverage | **Q4_1 + Q5_0 ported (default ON); Q4_0 stays out** | **done** — RDNA4 mask now `IQ_FAMILY | Q4_1 | Q5_0`, dense `IQ3_S | Q4_1 | Q5_0`; Q4_1 +6.9/+6.1 %, Q5_0 +14.1/+12.7 % (27B pp8192/pp32768), Q4_0 −2.4/−1.6 %; oracle 47/47 + 14/14, PPL parity, greedy text byte-identical off↔on | [`2026-09-23-mmb-q41-q50-rdna4.md`](2026-09-23-mmb-q41-q50-rdna4.md) |
+| `0018` MMB IQ2 coverage | **not enabled** | not ported — `llama-quantize` requires an imatrix this box has no matching copy of; IQ2 dense is rare and RDNA4 routed is off anyway | same |
 | `0019` HC16 eval-callback fix | **no** (HC16 is RDNA3_5-gated) | inert on RDNA4 | `MMB_CFG hc16=1` but call site gated |
 | `0020` sparse MTP draft | qwen4exp | exercised | 40K/128K purity; acceptance 0.81388 |
 | `0021` derived indexer cache | yes (default on) | byte-identical A/B | `=0` text identical |
@@ -660,7 +685,17 @@ then the only gate is end-to-end text + `plain == draft-mtp`) and width purity; 
 `llama-bench -p 8192,32768,65536 -n 0 -b 4096 -ub 4096 -r 5 -sm tensor`, **warm page cache**,
 interleaved vs the fallback, quote the deep point; (d) fold into the owning patch.
 
-### 12.1 Work item 1 — MMB WMMA quant coverage on RDNA4 (`0017`/`0018`)  ← the main ask
+### 12.1 Work item 1 — MMB WMMA quant coverage on RDNA4 (`0017`/`0018`)  ← **DONE 2026-09-23**
+
+**Result:** Q4_1 and Q5_0 ported (default ON).  RDNA4 `mmb_wtype_mask()` = `IQ_FAMILY | Q4_1 |
+Q5_0`; `mmb_dense_tmask()` = `IQ3_S | Q4_1 | Q5_0`.  Q4_1 **+5–8 %**, Q5_0 **+9–14 %** pp8192/32768
+on 4B/9B/27B (27B: +6.9/+6.1 and +14.1/+12.7); Q4_0 **−0.3…−2.9 %** and stays out.  Op oracle
+47/47 + 14/14, PPL parity, greedy text byte-identical MMB off↔on.  MXFP4/NVFP4 unreachable (no
+quantizer path), IQ2 needs an unmatched imatrix.  Full record:
+[`2026-09-23-mmb-q41-q50-rdna4.md`](2026-09-23-mmb-q41-q50-rdna4.md).  Folded into `0017`;
+25/25 apply reproduces tree `b8700a6c2dcda216adb14cb215839c4e5d5f2b20`.
+
+The measurement campaign (below) is the method and context.
 
 **What.**  `0017` adds Q4_0/Q4_1/Q5_0/MXFP4/NVFP4 and `0018` adds IQ2_S/IQ2_XS/IQ2_XXS to the MMB
 weight-type mask.  The dequant + WMMA (`mmb_tile_gemm`) is **already RDNA4-ported** by the beta, and
@@ -707,9 +742,20 @@ arm), so the MMA is gfx12-ready.  **But its epilogue hand-rolls the gfx11 accumu
 row are the whole change.
 
 **Model requirement.**  The kernel requires `w->type == GGML_TYPE_IQ4_NL` (`mmb.cu:2223`).  This
-box's qwen4exp is **UD-IQ4_XS** — confirm the HC gate weight is IQ4_NL on it (the gfx1151 reference
-was an IQ4_NL model).  If not, the port can only be unit-checked here; the end-to-end needs an
-IQ4_NL qwen4exp model.
+box's qwen4exp is **UD-IQ4_XS**, and its HC gate weight (`blk.N.hc_attn_up.weight`, the `w_up` the
+gate GEMM consumes) is **Q8_0**, not IQ4_NL — so the fusion is unreachable here even with the
+predicate widened.  (`hc_attn_down.weight` is Q8_0 too; the IQ4_NL reference was the gfx1151
+campaign's IQ4_NL model, which is not on this box.)  Confirm with:
+`python3 -c "from gguf import GGUFReader; ..."` on shard 2, or `gguf-dump`.  Without an IQ4_NL
+qwen4exp model the port can only be code-checked here; the end-to-end gate needs that model.
+
+**Session 3 correction (2026-09-23) — the epilogue map is ALREADY arch-aware.**  The brief's
+"epilogue hand-rolls the gfx11 accumulator map" is stale: `hc_gate_mix_kernel`'s epilogue uses
+`MMB_ACC_M(e, cn)` (`mmb.cu:1000`), which is the arch-aware shim — on RDNA4 it is `8*cn + e`, on
+gfx11 `2*e + cn` (the stale comment above it still says `2e + (lane>>4)`).  The kernel also uses
+`mmb_frag_t` / `mmb_ld_frag` / `mmb_wmma_bf16`, all of which have the gfx12 arm, so the only edits
+left are the **call-site predicate** (`GGML_CUDA_CC_IS_RDNA3(cc)` → `RDNA3 || RDNA4`) and the
+**policy row** (`c.gatemix`).  Do NOT enable it default-on until an IQ4_NL model gates it.
 
 **Gate.**  No op-level oracle (graph fusion) → correctness is `plain == draft-mtp` + coherence, and
 the A/B is `LLAMA_HC_GATEMIX=1` vs `=0` (or the RDNA4 policy row).  Target is prefill.  The `0016`
@@ -754,5 +800,6 @@ this for the `moe_weighted_reduction` alloc deps.
   `GIT_SEQUENCE_EDITOR=true GIT_EDITOR=true git rebase --autosquash <commit>~1`; regenerate with
   `git format-patch -1 <sha> --stdout --no-numbered`; replace the patch file and re-verify a fresh
   worktree at `r13-beta-baseline` + the 25 patches reproduces the branch tip tree.
-* The verified handover state at the end of session 2: branch `closing-gfx1201`, tip tree
-  **`95f916a8e015efd68ee44bcea7620187ebc70019`** (25/25 apply: r13 + beta + closing).
+* The verified handover state at the end of session 3: branch `closing-gfx1201`, tip tree
+  **`b8700a6c2dcda216adb14cb215839c4e5d5f2b20`** (25/25 apply: r13 + beta + closing; `0017` carries
+  the Q4_1/Q5_0 RDNA4 enablement).  Session 2's tree was `95f916a8e015efd68ee44bcea7620187ebc70019`.
