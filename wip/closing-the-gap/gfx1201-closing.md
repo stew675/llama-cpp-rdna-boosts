@@ -17,7 +17,7 @@ fork**).  Push the delivery repo only if the maintainer asks.
 
 ## 0. The one-paragraph summary
 
-The campaign is 25 patches (`wip/closing-the-gap/patches/0001..0014`, `0016..0026`) on top of the
+The campaign is 26 patches (`wip/closing-the-gap/patches/0001..0014`, `0016..0027`) on top of the
 **r13 delivery (16 blocks)** + the **12 `beta/mmb-general` patches**.  It was developed and tuned
 on **gfx1151 (RDNA3_5)**, and a few pieces are explicitly **RDNA3_5-only or gfx1151-tuned**.  Your
 job is to prove that on **gfx1201 (RDNA4)** the tree is *correct and not a regression*, and to
@@ -372,6 +372,31 @@ MTP verdict, and the `-b/-ub 4096` protocol for A/Bs.
 
 Newest first.  Each session appends its state, what it changed, and the next action.
 
+### 2026-09-23 — session 4: the meta-backend `graph_optimize` gap closed (`0027`)
+
+**Did:** work item 3 of §12.3 — make the child `graph_optimize` markings run under `-sm tensor`.
+The meta backend owns the graph, so the scheduler never called the CUDA child's pass: the MMB
+HC16/DOWN16/blk16/res16 marks were inert and only the MoE reduction's alloc dep was registered.
+The child pass is now split into `marks_only`/`allocs_only` modes and forwarded twice by the meta
+backend — alloc deps over the whole graph before allocation, markings per per-device subgraph after
+the simple tensors exist (the marks must be keyed by the tensors the child compute sees).  The
+res16 residual alloc dep moved into the alloc-deps half; the meta's own MoE loop stays as the
+non-CUDA fallback.
+
+**Evidence:** `MMB_OPT` **0 → 390** (4B q4_1) / **5418** (27B IQ3_S) under `-sm tensor`; **837**
+MMB marks on qwen4exp IQ4_XS (was 0); default output unregressed (27B IQ3_S `-sm tensor`
+`6073add19dac`, 4B `9f9f41270c70`, 35B `plain == draft-mtp` `5f6f93dd9b62`, MUL_MAT 1297/1297).
+Record: [`2026-09-23-meta-graph-optimize-tensor-split.md`](2026-09-23-meta-graph-optimize-tensor-split.md).
+This is **infrastructure, not a gfx1201 win** — HC16 is the gfx1151 feature and DOWN16/blk16/res16
+were already measured neutral/negative here; but the mechanism is the prerequisite for HC16 under
+`-sm tensor` on `halo`.
+
+**Set:** new patch `0027` (`2af88bc06`); 26/26 apply reproduces tree
+**`803e6d908ade68b02a71af9d5d0cf605aec1382a`**.
+
+**Next:** §12.2 `hc_gate_mix` (needs an IQ4_NL qwen4exp model — not on this box); the gfx1100
+brief `gfx1100-closing.md`; a gfx1151 `halo` re-gate of HC16 under `-sm tensor` with `0027`.
+
 ### 2026-09-23 — session 3: MMB quant coverage — Q4_1/Q5_0 ported to RDNA4 (item 1 done)
 
 **Did:** work item 1 of §12.1.  Requantized Qwen3.5-4B/9B and Qwen3.8-27B to `--pure` Q4_0/Q4_1/Q5_0
@@ -390,8 +415,8 @@ the documented coarse-quant relaxation (9B qwen35 fails with MMB off too; gemma4
 at ~1e-6).  Full record: [`2026-09-23-mmb-q41-q50-rdna4.md`](2026-09-23-mmb-q41-q50-rdna4.md).
 
 **Set:** folded into `0017` (new sha `5c3bb41c5`); `0018` regenerated (same mask line).  A fresh
-`r13-beta-baseline` worktree applies the 25 patches **25/25** and reproduces tree
-**`b8700a6c2dcda216adb14cb215839c4e5d5f2b20`** (was `95f916a8e…`).
+`r13-beta-baseline` worktree applies the 26 patches **26/26** and reproduces tree
+**`803e6d908ade68b02a71af9d5d0cf605aec1382a`** (was `b8700a6c2…`, before that `95f916a8e…`).
 
 **Next:** §12.2 `hc_gate_mix` RDNA4 port (needs an IQ4_NL qwen4exp model — this box has only
 IQ4_XS/Q4_K, whose HC gate is Q8_0, so it can only be code-checked here); §12.3 `graph_optimize`
@@ -629,8 +654,8 @@ hand-rolled fragments), so the port was three small changes: select
 | `0007` QSA visibility fold | qwen4exp-only | exercised | 40K/128K purity |
 | `0008` M=4 HC inject | MMB geometry | exercised | qwen4exp prefill A/B |
 | `0009` `lzm auto` | yes | text-identical (`-lm none -lzm on`) | 27B Q8_0 coherence |
-| `0010` MoE BF16 epilogue | **only `-sm layer`** | **transfer tested — no gfx1201 win**; inert under `-sm tensor` (meta-backend `graph_optimize` gap) | [`2026-09-23-gfx1201-lossy-prefill-transfer.md`](2026-09-23-gfx1201-lossy-prefill-transfer.md) |
-| `0011` HC BF16 streams | **only `-sm layer`** | **transfer tested — no gfx1201 win**; inert under `-sm tensor`; fires under `-sm layer` (text moves) | same |
+| `0010` MoE BF16 epilogue | **`-sm layer` and `-sm tensor` (since `0027`)** | **transfer tested — no gfx1201 win** | [`2026-09-23-gfx1201-lossy-prefill-transfer.md`](2026-09-23-gfx1201-lossy-prefill-transfer.md), [`2026-09-23-meta-graph-optimize-tensor-split.md`](2026-09-23-meta-graph-optimize-tensor-split.md) |
+| `0011` HC BF16 streams | **`-sm layer` and `-sm tensor` (since `0027`)** | **transfer tested — no gfx1201 win**; `0027` makes the markings run under `-sm tensor` too | same |
 | `0012` mmb_cvt `out_xn` | yes (MMB on) | exercised | qwen4exp prefill A/B |
 | `0013` indexer relu-sum | **no** | **inert on RDNA4** — call site is `GGML_CUDA_CC_IS_RDNA3_5(cc)` (`ggml-cuda.cu:4250`) | call-site gate; our tree already banks the reduction via the fused `GGML_CUDA_QSA_INDEXER_SCORE` |
 | `0014` QSA scorer trim | qwen4exp-only | exercised | qwen4exp gates |
@@ -641,7 +666,7 @@ hand-rolled fragments), so the port was three small changes: select
 | `0020` sparse MTP draft | qwen4exp | exercised | 40K/128K purity; acceptance 0.81388 |
 | `0021` derived indexer cache | yes (default on) | byte-identical A/B | `=0` text identical |
 | `0022` gfx1151 crossover | **no** — gfx1201 dense-always | inert | `LLAMA_QSA_DENSE_DECODE_UNTIL=0` moves text |
-| `0023` MMB HC16 per-context | **no** on RDNA4 (HC16 gated) | inert; gate still worth running | 40K/128K purity |
+| `0023` MMB HC16 per-context | **no** on RDNA4 (HC16 gated); markings now run under `-sm tensor` (`0027`) | inert on RDNA4; gate still worth running | 40K/128K purity; [`2026-09-23-meta-graph-optimize-tensor-split.md`](2026-09-23-meta-graph-optimize-tensor-split.md) |
 | `0024` input layer GPU | **no** | superseded by `0025` | — |
 | `0025` host-buffer input | **no-op** (discrete GPU) | `prop.integrated = 0`; scheduler guard not reached | `GGML_FORCE_NO_INTEGRATED=1` matched default |
 | `0026` sparse MTP default ON | qwen4exp | exercised | 40K/128K purity |
@@ -667,15 +692,18 @@ fusion A/Bs (they are exercised by the qwen4exp gates but not singled out).
 
 ## 12. Remaining RDNA4 porting work — handover for the next session
 
-**Updated:** 2026-09-23 (session 2).  §11 holds the gate results; this section is the **open** work.
+**Updated:** 2026-09-23 (session 4).  §11 holds the gate results; this section is the **open** work.
+Items 1 (MMB quant coverage) and 3 (the meta `graph_optimize` gap) are now DONE; 2 and 4 remain.
 The campaign's arch-scoped features are one of three shapes — classify before touching one:
 
 1. **Wrong-arch predicate over a working kernel.**  The port is usually small (a layout / enable
    change) and the gfx1151 win transfers if the hardware bottleneck is the same.  *Worked example:
    `0016` `QSA_SCORE_WMMA` — ported this session, **+1.7/+3.2/+6.5/+12.3 %** qwen4exp prefill.*
 2. **A marking that does not run at all.**  `graph_optimize`-based markings (HC16/DOWN16/
-   blk16/res16) are inert under `-sm tensor` because the **meta backend** owns the graph and the
-   CUDA child's `graph_optimize` never runs (`MMB_OPT=0`).  Inert regardless of hardware.
+   blk16/res16) were inert under `-sm tensor` because the **meta backend** owns the graph and the
+   CUDA child's `graph_optimize` never runs (`MMB_OPT=0`).  **FIXED (session 4, patch `0027`)** — the
+   meta now forwards the child pass twice (alloc deps before allocation, marks per per-device
+   subgraph after); the features themselves are still not gfx1201 wins.
 3. **A platform-specific win.**  APU/unified-memory bandwidth (`0010`/`0011`) — measured, does not
    transfer; park it.
 
@@ -693,7 +721,7 @@ on 4B/9B/27B (27B: +6.9/+6.1 and +14.1/+12.7); Q4_0 **−0.3…−2.9 %** and st
 47/47 + 14/14, PPL parity, greedy text byte-identical MMB off↔on.  MXFP4/NVFP4 unreachable (no
 quantizer path), IQ2 needs an unmatched imatrix.  Full record:
 [`2026-09-23-mmb-q41-q50-rdna4.md`](2026-09-23-mmb-q41-q50-rdna4.md).  Folded into `0017`;
-25/25 apply reproduces tree `b8700a6c2dcda216adb14cb215839c4e5d5f2b20`.
+26/26 apply reproduces tree `803e6d908ade68b02a71af9d5d0cf605aec1382a`.
 
 The measurement campaign (below) is the method and context.
 
@@ -763,7 +791,18 @@ left are the **call-site predicate** (`GGML_CUDA_CC_IS_RDNA3(cc)` → `RDNA3 || 
 the A/B is `LLAMA_HC_GATEMIX=1` vs `=0` (or the RDNA4 policy row).  Target is prefill.  The `0016`
 result says a correct WMMA enablement here can be a several-percent win — worth doing.
 
-### 12.3 Work item 3 — make the `graph_optimize` markings run under `-sm tensor`
+### 12.3 Work item 3 — make the `graph_optimize` markings run under `-sm tensor`  ← **DONE 2026-09-23 (patch `0027`)**
+
+**Result:** the meta backend now forwards the child `graph_optimize` in two modes
+(`marks_only`/`allocs_only`): alloc deps over the whole graph before allocation, markings per
+per-device subgraph after the simple tensors exist.  `MMB_OPT` goes **0 → 390 / 5418** under
+`-sm tensor` (4B / 27B), 837 MMB marks land on qwen4exp (was 0), and the default output is
+unchanged (27B IQ3_S `-sm tensor` `6073add19dac`, 4B `9f9f41270c70`, MUL_MAT 1297/1297).  All the
+fused kernels' alloc deps are registered, not just the MoE reduction.  Full record:
+[`2026-09-23-meta-graph-optimize-tensor-split.md`](2026-09-23-meta-graph-optimize-tensor-split.md)
+— including the finding that the enabled features are still **not** gfx1201 wins (that is gfx1151
+work) and that the `hc_combine_norm` fused window was rejected on the tested qwen4exp graph on both
+splits.
 
 **What.**  HC16 (`0023`), DOWN16 (`0010`), blk16/res16 (`0011`) are pre-allocation markings in
 `ggml_backend_cuda_graph_optimize`, which **never runs** when the meta backend owns the graph
@@ -801,7 +840,8 @@ this for the `moe_weighted_reduction` alloc deps.
 * **Fold a port** with `git commit --fixup=<commit>` then
   `GIT_SEQUENCE_EDITOR=true GIT_EDITOR=true git rebase --autosquash <commit>~1`; regenerate with
   `git format-patch -1 <sha> --stdout --no-numbered`; replace the patch file and re-verify a fresh
-  worktree at `r13-beta-baseline` + the 25 patches reproduces the branch tip tree.
-* The verified handover state at the end of session 3: branch `closing-gfx1201`, tip tree
-  **`b8700a6c2dcda216adb14cb215839c4e5d5f2b20`** (25/25 apply: r13 + beta + closing; `0017` carries
-  the Q4_1/Q5_0 RDNA4 enablement).  Session 2's tree was `95f916a8e015efd68ee44bcea7620187ebc70019`.
+  worktree at `r13-beta-baseline` + the 26 patches reproduces the branch tip tree.
+* The verified handover state at the end of session 4: branch `closing-gfx1201`, tip tree
+  **`803e6d908ade68b02a71af9d5d0cf605aec1382a`** (26/26 apply: r13 + beta + closing; `0017` carries
+  the Q4_1/Q5_0 RDNA4 enablement, `0027` the meta `graph_optimize` forwarding).  Session 2's tree
+  was `95f916a8e015efd68ee44bcea7620187ebc70019`.

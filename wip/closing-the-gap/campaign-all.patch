@@ -67,10 +67,10 @@ index ac21d6b4e..c2e09784c 100644
      common_cpu_params cpuparams_batch;
  
 diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
-index ef05905cf..03f302c85 100644
+index ef05905cf..ff0910739 100644
 --- a/ggml/src/ggml-backend-impl.h
 +++ b/ggml/src/ggml-backend-impl.h
-@@ -116,6 +116,15 @@ extern "C" {
+@@ -116,6 +116,23 @@ extern "C" {
          // can be called multiple times for the same tensor: the longest lifetime applies
          void (*add_alloc_dep)(void * user_data, struct ggml_tensor * tensor, struct ggml_tensor * until);
          void * user_data;
@@ -83,9 +83,95 @@ index ef05905cf..03f302c85 100644
 +        // so a backend optimisation that elides a producer's output must consult the whole graph to
 +        // find every consumer.  NULL means the graph is not split (full_graph == the split graph).
 +        const struct ggml_cgraph * full_graph;
++        // Two-pass mode used by the meta (tensor-split) backend.  The meta owns the whole graph, so
++        // the scheduler never calls a child backend's graph_optimize; the meta forwards it twice
++        // instead -- once over the whole graph before allocation (alloc-deps only) and once per
++        // per-device subgraph of simple tensors after allocation (markings only), because the marks
++        // must be keyed by the tensor pointers the child's compute actually sees.  Both default to
++        // false (the single-backend scheduler runs the complete pass in one call).
++        bool marks_only;
++        bool allocs_only;
      };
  
      struct ggml_backend_i {
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 06147cd72..0e1ea43e6 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1889,6 +1889,10 @@ struct ggml_backend_meta_context {
+     size_t                      max_subgraphs = 0;
+     size_t                      n_subgraphs   = 0;
+     uint64_t                    uid           = 0;
++    // the scheduler's eval-callback flag, stashed by graph_optimize and replayed into the child
++    // backends' per-device marking pass (graph_compute) so a callback-split graph stands the F32
++    // elision down exactly as the single-backend path does
++    bool                        opt_has_eval_callback = false;
+ 
+     void *                               comm_ctx       = nullptr;
+     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+@@ -2059,7 +2063,27 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
+ static void ggml_backend_meta_graph_optimize(ggml_backend_t backend,
+                                              struct ggml_cgraph * cgraph,
+                                              struct ggml_backend_graph_optimize_params * params) {
+-    GGML_UNUSED(backend);
++    ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
++    backend_ctx->opt_has_eval_callback = params != nullptr && params->has_eval_callback;
++
++    // The scheduler never calls a child backend's graph_optimize for a graph this backend owns, so
++    // forward its alloc-deps half here, over the whole scheduled graph (original tensors), while the
++    // scheduler's collector is still live and before allocation.  A child's full pass also sets its
++    // MMB markings, but those must be keyed by the per-device *simple* tensors the child compute
++    // sees; that half is deferred to graph_compute (`marks_only`).  `allocs_only` here keeps the two
++    // halves from clobbering each other (the marks would otherwise be built for the original tensor
++    // pointers and then never found at compute time).
++    if (params != nullptr) {
++        struct ggml_backend_graph_optimize_params alloc_params = *params;
++        alloc_params.marks_only  = false;
++        alloc_params.allocs_only = true;
++        for (size_t j = 0; j < backend_ctx->backend_configs.size(); j++) {
++            ggml_backend_t b = backend_ctx->backend_configs[j].backend;
++            if (b->iface.graph_optimize != nullptr) {
++                b->iface.graph_optimize(b, cgraph, &alloc_params);
++            }
++        }
++    }
+ 
+     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+     if (disable_fusion) {
+@@ -2415,6 +2439,33 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                 cgraph_ij->uid = ggml_graph_next_uid();
+             }
+         }
++
++        // The child backends' marking half.  The scheduler never calls their graph_optimize under
++        // this backend, so the MMB HC16 / DOWN16 / blk16 / res16 markings would be inert.  Run them
++        // on the per-device subgraphs now, before any of them is computed (the mark lifetime assumes
++        // every subgraph of a graph is optimized before any is computed).  `marks_only` skips the
++        // alloc-deps half, which graph_optimize already registered before allocation, and
++        // `full_graph == NULL` treats each subgraph as self-contained: a marked producer and every
++        // consumer reading through its BF16 activation cache are always on the same device.
++        {
++            struct ggml_backend_graph_optimize_params mark_params = {
++                /* .add_alloc_dep     = */ [](void *, ggml_tensor *, ggml_tensor *) {},
++                /* .user_data         = */ nullptr,
++                /* .has_eval_callback = */ backend_ctx->opt_has_eval_callback,
++                /* .full_graph        = */ nullptr,
++                /* .marks_only        = */ true,
++                /* .allocs_only       = */ false,
++            };
++            for (size_t j = 0; j < n_backends; j++) {
++                auto & bcj = backend_ctx->backend_configs[j];
++                if (bcj.backend->iface.graph_optimize == nullptr) {
++                    continue;
++                }
++                for (size_t i_graph = 0; i_graph < n_subgraphs; i_graph++) {
++                    bcj.backend->iface.graph_optimize(bcj.backend, bcj.cgraphs[i_graph].cgraph_main, &mark_params);
++                }
++            }
++        }
+     }
+ 
+     size_t iga = 0; // i graph aux
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 index a398c3063..0e7f22631 100644
 --- a/ggml/src/ggml-backend.cpp
@@ -465,7 +551,7 @@ index 000000000..a843b460a
 +void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
 +void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 58b7c0adb..c05282294 100644
+index 58b7c0adb..3d5c3275e 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -30,6 +30,8 @@
@@ -1022,7 +1108,23 @@ index 58b7c0adb..c05282294 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -6245,11 +6654,27 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6242,14 +6651,43 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
++    // Two-pass mode for the meta (tensor-split) backend.  The scheduler calls this pass once per
++    // split before allocation, but under the meta backend the graph a child actually computes is a
++    // per-device subgraph of *simple* tensors built inside the meta graph_compute, so the marks this
++    // pass sets must be keyed by those simple tensors, while the fusion alloc deps must still be
++    // registered here, before allocation.  The meta therefore forwards the pass twice:
++    //   - allocs_only: only the add_alloc_dep part (whole graph / original tensors, `params` carries
++    //     the scheduler's collector);
++    //   - marks_only:  only the marking part (per-device subgraph / simple tensors).
++    // The single-backend scheduler leaves both false and runs the complete pass once.
++    const bool marks_only  = params != nullptr && params->marks_only;
++    const bool allocs_only = params != nullptr && params->allocs_only;
++
++    if (!allocs_only) {
      // BF16-only mark lifetime: clear on the first optimize after a compute, or when the first split
      // of a new graph is seen (the scheduler optimizes every split of one graph before computing any
      // of them, so marks set below must survive the remaining splits' optimize calls).
@@ -1055,7 +1157,7 @@ index 58b7c0adb..c05282294 100644
  
      // MMB HC16 (step 1 of the bf16-producer port): mark the gate producer of a gated DSV4_HC_PRE as
      // BF16-only when MMB will produce it and every consumer reads the BF16 copy.  The gate is a
-@@ -6257,7 +6682,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6257,7 +6695,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // first win.  STRUCTURE ONLY: inside graph_optimize the data pointers are not assigned yet, so
      // the check must not look at alias/buffer state.  LLAMA_MMB_HC16>=1 (== GGML_CUDA_MMB_HC16).
      {
@@ -1064,7 +1166,7 @@ index 58b7c0adb..c05282294 100644
          if (hc16 >= 1 && ggml_cuda_mmb_active() &&
                  GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
              auto reads = [](const ggml_tensor * t, const ggml_tensor * x) {
-@@ -6286,7 +6711,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6286,7 +6724,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                      if (t == pre) continue;
                      ok = false;
                  }
@@ -1073,7 +1175,7 @@ index 58b7c0adb..c05282294 100644
                      ggml_cuda_mmb_mark_bf16_only(gr);
                      static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_HC16 gate marked BF16-only: %s (M=%d K=%d T=%d)\n",
                              gr->name, (int) gr->ne[1], (int) gr->ne[0], (int) (gr->ne[2] * gr->ne[3]));
-@@ -6302,18 +6727,31 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6302,18 +6740,31 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // copy is RNE-rounded exactly as mmb_cvt_f32_bf16, so the GEMM arithmetic is bit-identical.
      // Dense MUL_MAT only; F32-weight GEMMs read the activation directly (tiny-M / f32split).
      {
@@ -1110,7 +1212,7 @@ index 58b7c0adb..c05282294 100644
                      if (t->op == GGML_OP_MUL_MAT && t->src[1] && rootof(t->src[1]) == root && t->src[0] &&
                              ggml_cuda_mmb_reads_bf16_act(t->src[0], t->src[1], t)) continue;
                      if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] && rootof(t->src[1]) == root &&
-@@ -6327,9 +6765,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6327,9 +6778,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                          ggml_cuda_mmb_mark_bf16_slot(root, 4);
                          continue;
                      }
@@ -1122,7 +1224,7 @@ index 58b7c0adb..c05282294 100644
              };
              for (int i = 0; i < cgraph->n_nodes; ++i) {
                  const ggml_tensor * t = cgraph->nodes[i];
-@@ -6337,10 +6775,152 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6337,10 +6788,167 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  if (t->src[0]->type == GGML_TYPE_F32) continue;
                  if (!ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
                  const ggml_tensor * ar = rootof(t->src[1]);
@@ -1258,8 +1360,23 @@ index 58b7c0adb..c05282294 100644
 +                }
 +                if (ok && nread > 0 && elide_f32) ggml_cuda_mmb_mark_bf16_only(r);
 +            }
-+            // the in-place residual stream needs the producer/consumer on different buffers
-+            for (const ggml_cuda_hc_combine_norm_args & ca : comb) {
++        }
++    }
++    }   // !allocs_only (marking passes)
++
++    if (marks_only) {
++        return;
++    }
++
++    // The in-place residual stream (LLAMA_HC_RES16) needs the producer/consumer on different
++    // buffers.  It is a *marking* dependency, so it must be registered by the alloc-deps pass the
++    // meta backend runs before allocation -- the marking pass alone cannot reach the graft
++    // allocator.  Re-run the structural matcher here so it lands in the same place as the other
++    // fusion deps.
++    if (ggml_cuda_mmb_res16()) {
++        for (int i = 0; i < cgraph->n_nodes; ++i) {
++            ggml_cuda_hc_combine_norm_args ca;
++            if (ggml_cuda_hc_combine_norm_identify(cgraph, i, ca)) {
 +                ggml_tensor * rr = const_cast<ggml_tensor *>(ca.residual->view_src ? ca.residual->view_src : ca.residual);
 +                params->add_alloc_dep(params->user_data, rr, ca.out_res);
 +                params->add_alloc_dep(params->user_data, rr, ca.out_xn);
@@ -1279,7 +1396,7 @@ index 58b7c0adb..c05282294 100644
              }
          }
      }
-@@ -6348,6 +6928,31 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6348,6 +6956,31 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
      if (!disable_fusion) {
          for (int i = 0; i < cgraph->n_nodes; ++i) {
@@ -1311,6 +1428,17 @@ index 58b7c0adb..c05282294 100644
              if (cgraph->nodes[i]->op != GGML_OP_MUL) {
                  continue;
              }
+@@ -6367,6 +7000,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+         }
+     }
+ 
++    if (allocs_only) {
++        return;
++    }
++
+ #ifdef USE_CUDA_GRAPH
+     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 diff --git a/ggml/src/ggml-cuda/hyperconn.cu b/ggml/src/ggml-cuda/hyperconn.cu
 index 21db01dee..403fb659d 100644
 --- a/ggml/src/ggml-cuda/hyperconn.cu

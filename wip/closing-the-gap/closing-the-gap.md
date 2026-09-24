@@ -9,7 +9,7 @@ appendices, the MTP qualification).  This file is what a fresh session reads fir
 **Model:** `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf`
 + MTP sidecar `/llm/models/Qwen3.8/Flash-Next/Q4_K_XL/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf`.
 **Fork:** `~/llama.cpp`, branch **`gap-closing-hostbuf-integrated`**, tip **`df67fd133`**
-= delivery r13 + the 12 `beta/mmb-general` patches + gap-closing `0001..0014`/`0016..0026`
+= delivery r13 + the 12 `beta/mmb-general` patches + gap-closing `0001..0014`/`0016..0027`
 (`0023` = the MMB HC16 per-context fix; `0024` = the input-layer GPU offload stopgap;
 `0025` = the host-buffer input layer that **supersedes `0024`**; `0026` = the sparse MTP draft
 **default ON**).  The `0024` tip `73a391aba` on branch `gap-closing-r13` is the pre-`0025` baseline
@@ -140,8 +140,12 @@ The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and t
    **no measurable win** (flat at pp8192/32768 under `-sm layer`; under `-sm tensor` the markings do
    not run at all — the meta backend bypasses the CUDA child's `graph_optimize`).  Do not enable
    them on RDNA4.  See [`2026-09-23-gfx1201-lossy-prefill-transfer.md`](2026-09-23-gfx1201-lossy-prefill-transfer.md).
-   The **meta-backend `graph_optimize` gap** is the reusable finding: any `graph_optimize`-based
-   marking is inert under `-sm tensor`.
+   The **meta-backend `graph_optimize` gap** was the reusable finding (any `graph_optimize`-based
+   marking was inert under `-sm tensor`) and is now **FIXED by closing patch `0027`**: the meta
+   backend forwards the child pass twice (alloc deps over the whole graph before allocation, marks
+   per per-device subgraph after the simple tensors exist).  gfx1201 is verified unregressed; the
+   gfx1151/HC16 re-gate on `halo` is the remaining step.  See
+   [`2026-09-23-meta-graph-optimize-tensor-split.md`](2026-09-23-meta-graph-optimize-tensor-split.md).
 4. **`-ub 16384`** — parked until the managed PLE reader's no-cache parallel-pread fast path is picked
    up (item 13 in the closed record).  Root cause in `closed-the-gap.md` (the full-vocab
    `result_output` reserve + the HC `block_out` pin + the resident PLE table).
@@ -249,6 +253,6 @@ and the HC16 bug above makes depth MTP nondeterministic until fixed.
   [`2026-09-22-mmb-eval-callback-f32.md`](2026-09-22-mmb-eval-callback-f32.md),
   and the rest of this directory's `2026-09-*` files.
 * History: [`closed-the-gap.md`](closed-the-gap.md).
-* Patches: [`patches/`](patches/) (`0001..0014`, `0016..0026`; `0015` superseded by r13 block 00; `0024` superseded by `0025`).
+* Patches: [`patches/`](patches/) (`0001..0014`, `0016..0027`; `0015` superseded by r13 block 00; `0024` superseded by `0025`).
 * Delivery policy: `AGENTS.md` (default-on policy, purity rules, pushing policy — **never push the
   `~/llama.cpp` fork**).
