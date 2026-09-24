@@ -67,8 +67,20 @@ reverted).**  The failure is the **activation read**, not the forward:
 * `llama-perplexity` under `-sm tensor` is fine (8.1120 vs 8.1107), so the forward is correct; the
   defect is the imatrix eval-callback read under the Meta backend.
 
-Not fixed: it is a Meta-backend + eval-callback interaction, not RDNA- or closing-specific.  Minimal
-repro: 4B Q8_0, `-sm tensor` vs `-sm layer`, `--chunks 1`, seconds.
+**Confirmed upstream (2026-09-24).**  A pure `ebbb18522` worktree (no rdna-boosts, no beta, no closing)
+reproduces it **identically** — same 4B Q8_0, same config (`--chunks 2`):
+
+| build | PPL | imatrix md5 | `ffn_up` / `ffn_down` / `attn_qkv` corr |
+|---|---|---|---|
+| upstream `ebbb18522` `-sm layer` | 9.1272 | `75c667bd…` | — |
+| upstream `ebbb18522` `-sm tensor` | **54210.91** | `4ab0d493…` | 0.9155 / **0.0370** / 0.9690 |
+| delivery `-sm layer`/`none` | 9.0808 | `755cc20a…` | — |
+| delivery `-sm tensor` | **57733.81** | `b44e8249…` | 0.9152 / **0.0370** / 0.9689 |
+
+The corruption pattern matches to 3-4 decimals, so this is an **upstream llama.cpp** bug (the Meta
+tensor-split backend / scheduler eval-callback / imatrix collector), not a fork or delivery one.  It
+is an upstream-PR candidate once the exact stale/aliased buffer is pinned down.  Minimal repro: 4B
+Q8_0, `-sm tensor` vs `-sm layer`, `--chunks 1`, seconds.
 
 ## OP-4(b) — `0001` `hc_combine_norm` isolated A/B: **validated (default fusion is the fast one)**
 

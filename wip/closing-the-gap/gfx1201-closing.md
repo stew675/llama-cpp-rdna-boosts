@@ -42,7 +42,7 @@ and full history are in `gfx1201-closed.md`.
 
 | lead | status | where |
 |---|---|---|
-| `-sm tensor` `llama-imatrix` | **root-caused, open** — the imatrix's activation read under the Meta backend returns wrong values (the gather layout is correct; `llama-perplexity` is fine, so the forward is fine).  Pre-existing (byte-identical r13+beta), deterministic, 4B repro in seconds.  Workaround: `-sm layer`.  A Meta-backend + eval-callback bug, not RDNA-specific | `2026-09-24-op4-imatrix-and-hc-gates.md` |
+| `-sm tensor` `llama-imatrix` | **confirmed upstream, open** — the imatrix's activation read under the Meta backend returns wrong values (the gather layout is correct; `llama-perplexity` is fine).  A **pure `ebbb18522`** worktree reproduces the exact corruption (`ffn_down` corr 0.0370; PPL 54211 vs 9.13), so it is an **upstream llama.cpp** bug, not the fork/delivery.  Workaround: `-sm layer`.  Upstream-PR candidate once the stale/aliased buffer is pinned | `2026-09-24-op4-imatrix-and-hc-gates.md` |
 | M-RoPE image case (`0005`) | **run, clean** — closing and baseline (pre-fix) both pass the image+MTP repro (up to 19949-token prompt + 4096-token image + 1000 generated); the gfx1151 trigger does not reproduce on gfx1201 with the shared head.  `0005` retained as a port.  Harness: `tools/mrope-image-mtp.sh` | `2026-09-24-op4-imatrix-and-hc-gates.md` |
 
 ---
