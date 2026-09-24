@@ -1,10 +1,12 @@
 # gfx1151 — closing-the-gap: the MMVQ↔MMQ **band-boundary fixes** (validation & port brief)
 
 **Audience:** the agent working on the **Strix Halo / Radeon 8060S (gfx1151, RDNA3_5)** box, `halo`.
-**Goal:** the closing campaign was *developed here*, so most of it is already validated.  This file is
-the **one new open item**: the two **band-boundary fixes** found on `soar` (gfx1201, RDNA4) on
-2026-09-24.  One of them **already fires on gfx1151** (it is arch-independent AMD code), so it needs a
-**revalidation here**; the other is **RDNA4-gated** and needs a **port/reject decision** on gfx1151.
+**Goal:** this is the **final wrap-up brief** for gfx1151, after the gfx1100/gfx1201 work.  It has
+three parts: (1) the **band-boundary fixes** found on `soar` (gfx1201) on 2026-09-24 — one already
+fires here (arch-independent), one is RDNA4-gated and needs a port/reject decision (§0-§7);
+(2) the **gfx1201/gfx1100 carry-over** — the rest of the gfx1201 campaign (OP-1..OP-6, closed
+2026-09-24) reduced to the subset this box should re-check (§8); and (3) the **input ring** follow-up
+(§9) — replace `0025`'s per-ubatch host-input copy with the reference's rotated input ring.
 
 **Companion briefs:** [`gfx1201-closing.md`](gfx1201-closing.md) (3× R9700 — where the fixes were
 found and measured), [`gfx1100-closing.md`](gfx1100-closing.md) (1× 7900 XTX).
@@ -56,7 +58,7 @@ to gfx1151.
 | GPU | **Strix Halo, Radeon 8060S (gfx1151, RDNA3_5)**, 123 GiB unified |
 | ROCm | `/opt/rocm-7.14-gfx1151` (runtime `LD_LIBRARY_PATH`) |
 | Build | `cd ~/llama.cpp && BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (ccache); fast loop `cmake --build build-rocm --target llama-cli llama-bench llama-batched-bench test-backend-ops -j 16` |
-| Typical fork branch | `gap-closing-hostbuf-integrated` = r13 + `beta/mmb-general` + `0001..0014`/`0016..0028` |
+| Typical fork branch | `gap-closing-hostbuf-integrated` = r13 + `beta/mmb-general` + `0001..0014`/`0016..0028`.  **The final wrap-up tree is the full closing set — `0001..0014`/`0016..0030` (29 patches) — which adds `0029` (default-on) and `0030` (opt-in); see §8.** |
 | **Every command** | `export HIP_VISIBLE_DEVICES=0` (single device) |
 | Headline model | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` + MTP sidecar `/llm/models/Qwen3.8/Flash-Next/Q4_K_XL/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf` |
 | Other models | 35B-A3B UD-Q3_K_M / Q4_K_M, 27B UD-Q4_K_M / UD-Q4_K_XL / UD-IQ3_S / Q8_0, gemma-4-12B, gemma-4-26B-A4B, NanBeige BF16 |
@@ -71,8 +73,9 @@ kernel-family-dispatch change and the gates that matter are §4.2–§4.5 below.
 
 The change is **folded into the WIP campaign as
 [`patches/0028`](patches/0028-gap-closing-WIP-extend-the-MMVQ-routed-expert-band-and-RDNA4-dense-fallback.patch)
-(commit `6b230ad59208`; the campaign is now 27 patches: `0001..0014` + `0016..0028`, still skipping
-`0015`).  Apply it on top of the 26-patch tree with `git am`, or apply the whole set fresh — a fresh
+(commit `6b230ad59208`; the campaign was 27 patches when this brief was opened: `0001..0014` +
+`0016..0028`, still skipping `0015` — it has since grown to 29, see §1).  Apply it on top of the
+26-patch tree with `git am`, or apply the whole set fresh — a fresh
 r13+beta worktree + 27/27 reproduces tree `533eee3188ab7df9b6cf394adeaa31b46bd13ff2`.  Three files,
 69 insertions:
 
@@ -224,6 +227,16 @@ measured width for that type and 16 for the rest.  The kernel is one-warp-per-to
 reduction order is per-token and a per-type cap does not re-introduce a width impurity below the
 cap.  Test with the model of that type (35B Q3_K_M / Q4_K_M, and a Q4_1/Q5_0 requant if needed).
 
+**gfx1201 already answered this (2026-09-24, closed as "no per-type band"):** band-on vs band-off
+across 8 routed-expert types (35B True-Q3/Q3/Q4/Q5, qwen4exp IQ4_NL/IQ4_XS) — k-quants win big
+(+26 % at B=9 for Q4_K/Q5_K), IQ4_NL wins at every width (+13 % at B=9), and only **IQ3_XXS/IQ4_XS**
+regress, only from **B=13** (−2.2 % → −6.3 % at B=16) — the price of the decode/verify purity the band
+gives, and a per-type cap would break that purity at the cap boundary.  The `__launch_bounds__`
+widening was also cleared there (138-way register-identical, ±0.6 % at B ≤ 8).  Re-run the same matrix
+here (the `_rdna3` table and `mmq_rdna3_5_id_get_J` differ); only add a per-type cap if a type actually
+regresses at **B ≤ 13**.  Record:
+[`2026-09-24-op3-per-type-moe-band.md`](2026-09-24-op3-per-type-moe-band.md).
+
 ### 4.6 Dense odd-row band — port/reject decision (gfx1151 does not get it as written)
 
 The RDNA4 rule is `src0->ne[1] % 128 != 0`.  Widening it to RDNA3_5 is a **new arch gate**, so it
@@ -317,9 +330,80 @@ both arms (W=8 unaffected); `n8` **94.3 (off) → 102.7 (on) t/s (+8.9 %)**, acc
 
 ---
 
-## 8. Session log
+## 8. gfx1201/gfx1100 carry-over — what to re-check on gfx1151 (closed 2026-09-24)
+
+The gfx1201 campaign closed OP-1..OP-6 on 2026-09-24 ([`gfx1201-closing.md`](gfx1201-closing.md)).
+Most of it is arch-independent; this is the subset **this box** should re-check, either because it is
+the APU where the path differs, or because the A/B was gfx1201-only.  **Do not re-run everything** —
+the band-boundary gates (§4) stay the priority; this is the delta since the brief was opened.
+
+| # | item | why gfx1151 / what to check | reference |
+|---|---|---|---|
+| 1 | **`0029` tiny CPU graph → single thread** (default-on) | On gfx1201 the host-mapped input `GET_ROWS` runs as a tiny CPU split graph whose OpenMP region spins (~15 cores).  Here `0025` keeps `token_embd`/`per_layer_token_embd` zero-copy in `ROCm_Host` with the `GET_ROWS` on `ROCm0`, so that CPU split graph may not exist at all.  Confirm `0029` is a no-op (or a win), does not change output, and does not regress `tg`. | `2026-09-24-mtp-cpu-spin-automatic.md`; kill-switch `GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1` |
+| 2 | **`0030` device input placement** (opt-in `LLAMA_DEVICE_INPUT=1`) | gfx1201: works (0 CPU splits) but ~2.6 % slower, so opt-in.  On an APU the input is *already* host-resident zero-copy — moving it to the device adds a copy.  Expect a no-op or a loss → keep the default (host input) and record it. | `2026-09-24-mtp-cpu-spin-structural.md` |
+| 3 | **OP-3 per-type MoE band** (§4.5) | gfx1201 closed it: no per-type band within `n_max ≤ 12`.  Re-run the same matrix here (different `_rdna3` table + `mmq_rdna3_5_id_get_J`); a per-type cap only if a type regresses at **B ≤ 13**. | `2026-09-24-op3-per-type-moe-band.md` |
+| 4 | **OP-4(a) `llama-imatrix`** | Single device here, so the gfx1201 corruption (`-sm tensor`) does not apply — and it is confirmed an **upstream** bug (pure `ebbb18522`).  Still run the BF16 imatrix smoke (the `0019` MMB/HC16 eval-callback gate), already green on NanBeige BF16 here. | `2026-09-24-op4-imatrix-and-hc-gates.md` |
+| 5 | **OP-4(b)/(c) `0001` / `0008` isolated A/Bs** | gfx1201: the default `hc_combine_norm` fusion is **+5 %** over `LLAMA_FUSED_DSV4_HC_POST=1`; the default `GGML_CUDA_MMB_TALL_MIN_M=16` is ahead of `=0`.  qwen4exp is here → confirm both defaults (interleaved, warm cache). | `2026-09-24-op4-imatrix-and-hc-gates.md` |
+| 6 | **OP-4(d) M-RoPE image + MTP (`0005`)** | **This is the box the crash was found on.**  gfx1201 could not reproduce it (r13 gives the shared head its own KV).  Build the harness here and get the **FAIL→PASS** on the pre-fix tree. | harness `tools/mrope-image-mtp.sh`; `2026-09-22-qsa-block-window-fix.md`, `2026-09-22-qsa-item-3.5-audit.md` |
+| 7 | **OP-5.2 `0011` HC BF16 streams** | The APU is where `0011` measured its big win (~+4.9 %, `2026-09-22-hc-bf16-streams.md`); gfx1201 only got +1.3 % under `-sm tensor` and its `blk16` half was inert.  Re-confirm on the current tree; it stays default-OFF (lossy). | `2026-09-22-hc-bf16-streams.md`, `2026-09-24-op4-imatrix-and-hc-gates.md` |
+| 8 | **OP-6 build time** | No action: the MMA instance set is throughput-bound (largest TU 82 s vs a 236 s `-j16` makespan); ccache is the answer. | `2026-09-24-op6-build-time-closure.md` |
+| 9 | **`0027` meta `graph_optimize`** | N/A here (single-device, no Meta backend) — listed only so it is marked *not* a gfx1151 item. | `gfx1201-closed.md` §12.3 |
+
+`gfx1100-closing.md` carries the single-7900-XTX side (the `0028` dense arm's RDNA3_0 decision and the
+MMVQ band) — cross-check it before calling the campaign done.
+
+---
+
+## 9. The input ring (`0025` stopgap → the reference ring) — follow-up
+
+**What `0025` did.**  `0025` restores `info.devices[].integrated = prop.integrated` on HIP (the
+reference's zero-copy APU path).  On an APU the input embeddings (`token_embd`, and the ~28 GiB
+`per_layer_token_embd`) live zero-copy in the host buffer (`ROCm_Host`) and their `GET_ROWS` runs on
+`ROCm0` — no CPU dispatch, and the PLE stays in system RAM.  The same flag also lets the scheduler
+treat host-resident graph inputs (the arrays the host rewrites every ubatch in `set_inputs`) as
+readable in place by the GPU.
+
+**Why the flag needed a stopgap.**  Reading a host-resident graph input in place elides the
+split-input copy, and then the host's next-ubatch `set_inputs` store races the in-flight kernel —
+the `MEMORY_APERTURE_VIOLATION` in `k_set_rows` (the KV-cache store with I64 indices), the documented
+#15034 class.  `0025`'s stopgap is a scheduler guard: `ggml_backend_sched_buffer_supported()` forces
+the stream-ordered device copy for any host-resident graph input (walking `view_src` chains, since the
+recurrent-state copy is reached only through a view).  It is safe, but it **pays one copy of the input
+tensors per ubatch**.  `0025`'s own comment says it: *"no input ring on this base."*
+
+**The real fix (the follow-up).**  The reference replaces the copy with an **input ring**: upstream
+`83e8382ba` (ring allocation) + `1f2e34819` (`ggml_backend_sched_prepare_inputs()` rotation) + ~3
+hardening commits, ~500 lines across `ggml-backend.cpp` / `llama-context.cpp` /
+`ggml-backend-impl.h`.  Instead of one input buffer that must be copied every ubatch, it allocates a
+ring of input slots and rotates them, so `set_inputs` writes into a slot no in-flight work is using.
+Inputs stay zero-copy and the per-ubatch copy disappears.
+
+**What to do here.**
+
+1. **Measure the stopgap's cost first** — is the per-ubatch host-input copy actually visible?  Run
+   qwen4exp IQ4_NL `llama-bench -p 8192,32768` and the MTP `tg` with `0025` as-is (the copy in
+   place).  If the copy is not measurable on the APU, the ring is a nicety, not a win — stop there.
+2. If it is measurable, **port the ring** (the three upstream commits) as a **new closing patch**,
+   gated behind the same `integrated` flag, and re-run the `0025` correctness gates: 8K/40K/128K
+   `plain == dense n1/n3 == sparse n1/n3` byte-identical (`3553e76d3a9e` / `8285d12d40ca` /
+   `d140b40f0eee`), the `k_set_rows` fault does not return under long MTP, and the `--fit` memory
+   numbers are unchanged.
+3. **Keep the stopgap as the fallback** — the ring subsumes it, but a failed ring allocation must
+   degrade to the copy, never back to the fault.  This is also a clean **upstream-PR candidate**
+   (the reference commits are upstream), so mirror it under `upstream/` if it lands.
+
+---
+
+## 10. Session log
 
 Newest first.  Append state, what changed, the tree/`From <sha>`, and the next action.
+
+### 2026-09-24/25 — brief expanded for the final wrap-up (from the gfx1201 campaign close)
+
+Added **§8** (the gfx1201/gfx1100 carry-over re-validation list) and **§9** (the input-ring follow-up),
+and **§4.5** now carries the gfx1201 per-type-band verdict.  The `0028` band-boundary work (§0-§7)
+stays the priority; §8/§9 are the delta since this brief was opened.  gfx1201 closed OP-1..OP-6 on
+2026-09-24 — see [`gfx1201-closing.md`](gfx1201-closing.md) and the `2026-09-24-*.md` records.
 
 ### 2026-09-24 — opened (from the gfx1201 W=9-cliff session)
 
