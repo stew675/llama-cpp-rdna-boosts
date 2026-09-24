@@ -431,3 +431,105 @@ follow-up.)*
 4. Per-patch verdict table (§7) and the port candidates' status (§8).  The known-inert ones
    (`0003`, `0016`, `0017`/`0018`, `0022`, `0025`) still need their "why inert" predicate recorded.
 5. Re-check the conv-fusion root cause; if it is a real fixable bug, remove the multi-device gate.
+
+#### 2026-09-23 — gate results
+
+All on branch `closing-gfx1201` = delivery r13 + `beta/mmb-general` + the 25 closing patches
+(post-fix tree `1be654fa71167e470ffcce70456bef7a23e6de25`), unless noted.  `MMB` default (on), 1 GPU
+unless a split is stated.  Builds: campaign `~/llama.cpp/build-rocm`, baseline
+`~/llama-baseline/build-rocm`.
+
+**Op oracles (§6.5) — green.** `FLASH_ATTN_QSA` **26/26**, `GATED_DELTA_NET` **46/46**, `TOPK_QSA`
+**4/4**, `LIGHTNING_INDEXER` **225/225**, `FLASH_ATTN_EXT` **5954 OK / 0 FAIL** (summary
+5953/5953; counted from stdout-only, ANSI-stripped — §10 trap 4).
+
+**Width purity (§6.3) — PASS.** 27B UD-IQ3_S P=1024 `width_purity=PASS (worst maxdiff 0)`, row-0
+`3e870a40c63d3f2e` (MMB on) / `04f8b6a575db6e32` (MMB=0) — both reproduce the S14 gfx1201 record
+exactly; 35B UD-Q3_K_M `d4d00b0661db280d`, PASS.
+
+**Intra-build purity `plain == draft-mtp` (§6.2) — PURE everywhere tested** (bf16 KV unless noted,
+prose prompt, seed 42 temp 0, `--ctx-checkpoints 0` at depth):
+
+| model / arm | text |
+|---|---|
+| 27B UD-IQ3_S, 1 GPU, 8K | `857a25612912` |
+| 35B UD-Q3_K_M, 1 GPU, 8K | `5f6f93dd9b62` |
+| 27B UD-IQ3_S, 3 GPU `tensor`, 8K | `857a25612912` |
+| 27B Q8_0, 3 GPU `tensor`, 8K (`-lm none -lzm on`) | `33ae8d598e7e` |
+| 35B UD-Q3_K_M, 3 GPU `tensor`, 8K | `a6eba1d1350b` |
+| 27B UD-IQ3_S, 3 GPU `tensor`, 40K | `b8b767d508a0` |
+| qwen4exp IQ4_XS, 3 GPU `layer`, 8K, q8_0 KV | `79b90fcbcf98` |
+| qwen4exp IQ4_XS, 3 GPU `tensor`, 40K, q8_0 KV | `db7d30353cd2` |
+| qwen4exp IQ4_XS, 3 GPU `tensor`, 128K `n_max 1`, q8_0 KV | `a4017846f4cd` |
+
+**qwen4exp MTP acceptance (§6.6/§6.7)** — 3 GPU `tensor`, q8_0 KV, `-c 16384 -n 3000`,
+`draft-mtp n3`, prose, reasoning off: **acceptance 0.81388** (1360/1671, mean len 3.44), **57.5 t/s**
+(HF-relevant threshold ~0.45 at pos 1 is comfortably met).  For reference the gfx1151 gate was
+0.85035; the number is content-dependent, so this is healthy, not compared byte-for-byte.
+
+**qwen4exp prefill A/B (§6.6)** — closing vs r13+beta, 3 GPU `tensor`, q8_0 KV, `-b/-ub 2048`,
+`llama-bench -p …,98304 -n 0`, three interleaved rounds (only r=1 shown; the deep numbers are stable
+to <0.5 %):
+
+| depth | r13+beta | closing | Δ |
+|---|---:|---:|---:|
+| pp8192  | 2663.3 | 2645.2 | −0.7 % |
+| pp32768 | 2685.2 | 2803.8 | **+4.4 %** |
+| pp65536 | 2546.1 | 2625.7 | **+3.1 %** |
+| pp98304 | 2408.0 | 2433.0 | **+1.0 %** |
+
+The baseline *already* carries the `beta/mmb-general` +22 %-at-depth port, so this is what the
+closing set adds on top.  The `0004` conv-fusion gate (this session) removes the PLE fusion from
+this multi-GPU run; forcing it on (`GGML_CUDA_CONV_FUSION_MULTI=1`) should recover a little more
+prefill at the cost of the purity bug — re-measure when the root cause is fixed.
+
+**PPL parity (§6.8)** — `llama-perplexity -c 512 -b 512 --chunks 4`, MMB on vs off:
+35B UD-Q3_K_M 5.2694 vs 5.2424 (**+0.51 %**, within CI ±0.40) and 27B UD-IQ3_S 5.8338 vs 5.8363
+(**−0.04 %**).  Parity holds; a fragment-layout error would move this by orders of magnitude.
+
+**Arch-scoped A/Bs (qwen4exp, 3 GPU `tensor`, 8K, `-n 200`):**
+
+| knob | text | reading |
+|---|---|---|
+| default | `36019732357e` | — |
+| `0021` `GGML_CUDA_QSA_INDEXER_CACHE=0` | `36019732357e` | **byte-identical** — derived indexer cache is a text no-op ✔ |
+| `0022` `LLAMA_QSA_DENSE_DECODE_UNTIL=0` | `c99b4682b5d1` | text moves — proves gfx1201's default decode arm is *dense-always* ✔ |
+| `0016` `LLAMA_QSA_SCORE_WMMA=0` | `5d920e5f715e` | **differs** — see correction below |
+
+**Brief correction — `0016` on RDNA4.**  The brief (§6.6) expects `LLAMA_QSA_SCORE_WMMA=0` to be
+byte-identical on gfx1201.  It is **not**: the default builds the fused lightning-indexer op on every
+arch and the *generic* fallback still casts q/k to F16, which the patch itself documents as a
+prefill re-baseline (`src/models/qwen4exp.cpp:1531-1542`).  The arch claim that *is* true: the
+RDNA3_5 WMMA kernel is not taken (`supports_indexer4` = `GGML_CUDA_CC_IS_RDNA3_5`, plus the opt-in
+`GGML_CUDA_LIGHTNING_INDEXER4_GFX1100` for gfx1100), the `LIGHTNING_INDEXER` oracle passes 225/225,
+and width purity is untouched.  A RDNA4 WMMA port remains a candidate (§8).
+
+#### 2026-09-23 — per-patch verdict table (§7)
+
+| patch | fires on gfx1201? | verdict | evidence |
+|---|---|---|---|
+| `0001` hc_combine_norm | yes (qwen4exp HC prefill) | not isolated this session; exercised by the qwen4exp gates | qwen4exp purity 8K/40K/128K |
+| `0002` default flips | yes | MMB default on; RDNA4 row correct | `MMB_CFG`; MMB on/off PPL |
+| `0003` hc_gate_mix | **no** | inert — call site RDNA3_5-gated | `MMB_CFG gatemix=0` |
+| `0004` conv1d fusions | yes | **fixed** — gated to single-device graphs | [`2026-09-23-gfx1201-conv-fusion-tensor-split.md`](2026-09-23-gfx1201-conv-fusion-tensor-split.md) |
+| `0005` QSA block window | qwen4exp-only | exercised | 40K/128K purity |
+| `0006` narrow-row RMS | arch-neutral | width purity + coherence | §6.3 |
+| `0007` QSA visibility fold | qwen4exp-only | exercised | 40K/128K purity |
+| `0008` M=4 HC inject | MMB geometry | exercised | qwen4exp prefill A/B |
+| `0009` `lzm auto` | yes | text-identical (`-lm none -lzm on`) | 27B Q8_0 coherence |
+| `0010` MoE BF16 epilogue | **no** (default OFF) | no-op unless enabled | not enabled |
+| `0011` HC BF16 streams | **no** (default OFF) | no-op unless enabled | not enabled |
+| `0012` mmb_cvt `out_xn` | yes (MMB on) | exercised | qwen4exp prefill A/B |
+| `0013` indexer relu-sum | qwen4exp-only | exercised | qwen4exp gates |
+| `0014` QSA scorer trim | qwen4exp-only | exercised | qwen4exp gates |
+| `0016` `QSA_SCORE_WMMA` | yes, **generic fallback** | RDNA3_5 WMMA not taken; `=0` is a re-baseline (brief correction) | `supports_indexer4`; `LIGHTNING_INDEXER` 225/225; A/B above |
+| `0017` MMB quant coverage | **masked off on RDNA4** | no regression | `MMB_CFG` weight-type mask |
+| `0018` MMB IQ2 coverage | **masked off on RDNA4** | no regression | `MMB_CFG` weight-type mask |
+| `0019` HC16 eval-callback fix | **no** (HC16 is RDNA3_5-gated) | inert on RDNA4 | `MMB_CFG hc16=1` but call site gated |
+| `0020` sparse MTP draft | qwen4exp | exercised | 40K/128K purity; acceptance 0.81388 |
+| `0021` derived indexer cache | yes (default on) | byte-identical A/B | `=0` text identical |
+| `0022` gfx1151 crossover | **no** — gfx1201 dense-always | inert | `LLAMA_QSA_DENSE_DECODE_UNTIL=0` moves text |
+| `0023` MMB HC16 per-context | **no** on RDNA4 (HC16 gated) | inert; gate still worth running | 40K/128K purity |
+| `0024` input layer GPU | **no** | superseded by `0025` | — |
+| `0025` host-buffer input | **no-op** (discrete GPU) | `prop.integrated = 0`; scheduler guard not reached | `GGML_FORCE_NO_INTEGRATED=1` matched default |
+| `0026` sparse MTP default ON | qwen4exp | exercised | 40K/128K purity |
