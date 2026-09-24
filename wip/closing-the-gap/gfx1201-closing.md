@@ -320,14 +320,10 @@ done
 git rev-parse HEAD^{tree}                                # expect fa9cf6d1e654333d458ade3655c4a0d540225827
 ```
 
-> **Base drift (2026-09-24, pre-existing).**  The repo's `patches/` + `release.json` are still the
-> **r12** delivery (`8a80535e…`), while this campaign branch is built on **r13** (16-block tree
-> `bb7b6d07…`, r13+beta `79136a15…`).  A fresh apply through the block commands above therefore lands
-> on r13+beta `bca69f23…` / closing tip `cb937fe4ca60d5e2df561d133f550de886edf52a`, differing from
-> the branch by **one hunk in `common/speculative.cpp`** (the `gemma4-assistant` `is_mem_shared`
-> guard that r13 adds) — verified with `git diff`.  `0029` applies cleanly on both.  If the r13
-> delivery patches are not yet in `patches/`, regenerate the block set first, or read the campaign
-> tip as the r13-based branch tree.
+> **Base (2026-09-24): the repo is now on delivery r13.**  `gap-closing` was rebased onto `main`, so
+> `patches/` + `release.json` are the **r13** set (`bb7b6d07…`) and a fresh apply reproduces the branch
+> tip tree `fa9cf6d1…` exactly (28/28 `git am`, verified: block `bb7b6d07`, beta `79136a15`, closing
+> `fa9cf6d1`).
 
 **Traps:** `0015` must be **skipped**; `0024` must be applied **before** `0025` (the loop order handles
 this).  The single-patch alternative is `git apply` of `wip/closing-the-gap/campaign-all.patch` on the

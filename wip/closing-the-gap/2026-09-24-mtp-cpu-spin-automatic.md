@@ -7,15 +7,12 @@ CPU at ~1.2 cores and beats the passive-wait reference.  Campaign branch tip tre
 `closing-gfx1201`): **`fa9cf6d1e654333d458ade3655c4a0d540225827`** (28 patches; `campaign-all.patch`
 regenerated).
 
-> **Pre-existing base drift (not caused by `0029`).**  The campaign's base is **delivery r13**
-> (16-block tree `bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`, r13+beta `79136a15…`) but this repo's
-> `patches/` + `release.json` are still **r12** (`8a80535e…`), so a *fresh* apply through
-> `scripts/apply-all.sh` + `beta/` lands on r13+beta `bca69f23…` and closing tip `cb937fe4…`.  The
-> **only** delta is one hunk in `common/speculative.cpp` (the `gemma4-assistant` `is_mem_shared`
-> guard, r13), verified by `git diff`; `0029` is orthogonal (it touches only
-> `ggml/src/ggml-cpu/ggml-cpu.cpp`) and applies cleanly on both.  Both trees were checked:
-> *fresh r12-based apply* 28/28 `git am`, tree `cb937fe4ca60d5e2df561d133f550de886edf52a`;
-> *campaign r13 branch* tree `fa9cf6d1…`.
+> **Base:** the campaign sits on **delivery r13** (16-block tree
+> `bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`, r13+beta `79136a15cac1920c0dd334b4c119a9cb42f9143b`).
+> `gap-closing` was rebased onto `main` (r13) on 2026-09-24, so a fresh `scripts/apply-all.sh` +
+> `beta/mmb-general` + the closing patches (skipping `0015`) reproduces the branch tip tree
+> `fa9cf6d1e654333d458ade3655c4a0d540225827` exactly (28/28 `git am`, verified).  `0029` touches only
+> `ggml/src/ggml-cpu/ggml-cpu.cpp`, so it is independent of the delivery base.
 
 The structural half (get the input/PLE embedding off the CPU entirely) and the draft-sampler offload
 (OP-1.4) are **still open** — see the end.
