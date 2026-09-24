@@ -32,7 +32,7 @@ negative, the `0028` W=9 verify-cliff fix, and (2026-09-24) the **OP-1 automatic
 
 | id | item | priority | where |
 |---|---|---|---|
-| **OP-1** | MTP CPU-spin: runtime half **DONE** (`0029`, no env vars needed); structural half **investigated, opt-in** (`0030`, `LLAMA_DEVICE_INPUT=1` — works, 0 CPU splits, but ~2.6 % slower so not defaulted) + **OP-1.4** draft-sampler offload open | ~~highest~~ medium | §2.1 |
+| **OP-1** | MTP CPU-spin: runtime half **DONE** (`0029`, no env vars needed); structural half **investigated, opt-in** (`0030`, `LLAMA_DEVICE_INPUT=1` — works, 0 CPU splits, but ~2.6 % slower so not defaulted); **OP-1.4** draft-sampler offload **CLOSED, won't fix** (Meta-backend top-k blocker + no measurable win) | ~~highest~~ CLOSED | §2.1 |
 | **OP-2** | re-baseline the gfx1201 qwen4exp MTP throughput — **DONE** (four-axis + `n7`/`n8`/adaptive, no env) | ~~high~~ DONE | §2.2 |
 | **OP-3** | `0028` follow-ups: matrix **DONE** (odd-row dense model: none available, controls confirmed clean); per-type MoE band tuning open | medium | §2.3 |
 | **OP-4** | validation gates not run: four-axis MTP with the fix (**DONE** as OP-2), `llama-imatrix`, `0001`/`0008` isolated A/Bs, the M-RoPE image case | medium | §2.4 |
@@ -69,6 +69,7 @@ negative, the `0028` W=9 verify-cliff fix, and (2026-09-24) the **OP-1 automatic
 | **OP-3** matrix half | **DONE** — the full `n7`/`n8`/adaptive matrix with the fix | `2026-09-24-mtp-cpu-spin-automatic.md` §4 |
 | **OP-5.1** `0013` on RDNA4 | **REDUNDANT** — matcher fires 0× with `0016` ON, 4× with `LLAMA_QSA_SCORE_WMMA=0`; no port | `2026-09-24-mtp-cpu-spin-automatic.md` §5 |
 | **OP-1** structural input placement | **INVESTIGATED, opt-in (`0030`)** — `LLAMA_DEVICE_INPUT=1` moves the input layer to the output/Meta device (0 CPU splits, byte-identical) but the Meta-split GPU gather is ~2.6 % slower MTP than host input + `0029`, so it is not defaulted | `2026-09-24-mtp-cpu-spin-structural.md` |
+| **OP-1.4** draft sampler under `-sm tensor` | **CLOSED, won't fix** — blocked by the Meta backend (`handle_per_row` asserts on the vocab-split logits; needs a distributed top-k) and not a measurable win even under `-sm layer` (75.6 vs 75.1 t/s, noise) | `2026-09-24-mtp-draft-sampler-tensor-split.md` |
 | per-patch verdict table | filled for every closing patch | §7 |
 | porting layers | "no port needed" = only the beta prerequisite carried the RDNA4 kernel ports; the closing set's own RDNA3_5-only kernels are OP-5 | §11 porting layers |
 
@@ -157,7 +158,17 @@ and the spin is gone.  Default-on, disable-only kill-switch
 `GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1`.  The passive-`KMP_BLOCKTIME` option was not needed.
 See the note at the top of §2.1 and [`2026-09-24-mtp-cpu-spin-automatic.md`](2026-09-24-mtp-cpu-spin-automatic.md).
 
-#### 2.1.4 Also fix — draft sampler backend offload under `-sm tensor`
+#### 2.1.4 Also fix — draft sampler backend offload under `-sm tensor`  ← **CLOSED, won't fix**
+
+> **Closed 2026-09-24 (not small, and not measurable).**  (1) **Blocked structurally:** under
+> `-sm tensor` `output.weight` is vocab-split so the logits are `GGML_BACKEND_SPLIT_AXIS_0`, and the
+> sampler's `TOP_K`/`ARGSORT` dispatch to `handle_per_row()`, which asserts on AXIS_0 — lifting the
+> guard aborts at `ggml-backend-meta.cpp:544`.  Fixing it needs a **Meta-backend distributed top-k**
+> (per-shard top-k + merge, or a MIRRORED logits all-gather).  (2) **Not worth it even where it
+> works:** under `-sm layer` the backend-sampling A/B is within noise (75.6 vs 75.1 t/s, ON vs
+> `--no-spec-draft-backend-sampling` — the same-arm spread, 70.8→75.6, is larger).  The upstream guard
+> (PR #23287) is deliberate.  Detail:
+> [`2026-09-24-mtp-draft-sampler-tensor-split.md`](2026-09-24-mtp-draft-sampler-tensor-split.md).
 
 `llama_context::set_sampler` rejects the backend sampler outright when
 `model.split_mode() == LLAMA_SPLIT_MODE_TENSOR` (`"backend sampling not supported with SPLIT_MODE_TENSOR;
@@ -423,6 +434,26 @@ name, not "it was slower".  For MTP use `benchmarks/mtp-adaptive-methodology.md`
 
 ## 4. Session log (open-work sessions, newest first)
 
+### 2026-09-24 — session 9c: OP-1.4 closed (won't fix) + the qwen4exp prefill re-check
+
+**OP-1.4 — draft sampler backend offload under `-sm tensor`: CLOSED, won't fix.**  Lifting the upstream
+guard aborts in the Meta backend (`ggml-backend-meta.cpp:544 handle_per_row: src_ss[0].axis !=
+AXIS_0`), because `output.weight` is vocab-split so the logits are AXIS_0 and a global top-k cannot be
+expressed; it needs a Meta-backend distributed top-k.  And the win is not there anyway: under `-sm
+layer` (where it works) the backend-sampling A/B is within noise (**75.6 vs 75.1 t/s**, ON vs
+`--no-spec-draft-backend-sampling`; same-arm spread 70.8→75.6).  Detail:
+[`2026-09-24-mtp-draft-sampler-tensor-split.md`](2026-09-24-mtp-draft-sampler-tensor-split.md).  No code
+change (the temporary `LLAMA_BACKEND_SAMPLING_TENSOR` probe was reverted).
+
+**Prefill re-check (user request).**  The ~3350 t/s recollection is **qwen4exp IQ4_NL pp8192** (the
+`0003` hc_gate_mix record: 3346.9/3345.8/3340.2).  On the current build: **pp8192 3381.0 ± 13.6**,
+pp32768 3280.8, pp65536 3130.3 — **no regression** (slightly better).  IQ4_XS pp8192 was ~3083 in the
+2026-09-23 `0016` record; the current build measures higher than the r13+beta baseline there too
+(pp8192 2920 vs 2571, pp32768 3172 vs 2858; both climbing with page-cache warmth), so no regression
+there either.  The shallow-pp numbers are dominated by page-cache state for these near-VRAM-limit
+models (switching between the two qwen4exp models evicts the other's ~27 GiB host PLE), not by the
+closing patches.
+
 ### 2026-09-24 — session 9b: OP-1 structural (opt-in `0030`) + the r13 rebase
 
 **Rebase.**  `gap-closing` was rebased onto `main` (r13); the repo's `patches/`/`release.json` are now
@@ -442,8 +473,9 @@ rejects host buffers).  Full detail:
 `pp2048` 2475 t/s, fresh apply 29/29 → tree
 `99b429a60d441f814c84737cfa57803bc15a2f6d`.
 
-**Still open:** OP-1.4 draft-sampler offload, OP-3 per-type MoE band, OP-4 (`llama-imatrix`, isolated
-`0001`/`0008` A/Bs, M-RoPE image), OP-5.2 `0011`, OP-6 build time.
+**Still open:** OP-3 per-type MoE band, OP-4 (`llama-imatrix`, isolated `0001`/`0008` A/Bs, M-RoPE
+image), OP-5.2 `0011`, OP-6 build time.  (OP-1 is fully closed: `0029` shipped, `0030` opt-in, 1.4 won't
+fix.)
 
 ### 2026-09-24 — session 9: OP-1 automatic CPU-spin fix (`0029`) + OP-2/OP-3 re-baseline + OP-5.1
 
