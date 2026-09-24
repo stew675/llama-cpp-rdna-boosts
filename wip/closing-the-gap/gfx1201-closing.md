@@ -2,12 +2,12 @@
 
 **Audience:** the agent continuing the campaign on the **3× Radeon AI PRO R9700 (gfx1201, RDNA4)** box,
 `soar`.
-**Goal:** pick up the **open items** below.  OP-1/OP-2 are **closed** (`0029` shipped default-on,
-`0030` opt-in, `0016`/`0027`/`0028` done) and only four items remain, in priority order:
-**OP-3** the per-type MoE band floor, **OP-4** the unrun gates (`llama-imatrix`, the isolated
-`0001`/`0008` A/Bs, the M-RoPE image case), **OP-5.2** the `0011` HC BF16-stream re-test (now that
-`0027` lets its markings run under `-sm tensor`), and **OP-6** the `fattn-mma-f16` build-time
-duplication.  **§0.5 is the next-session run plan (start there);** §2.3-§2.6 is the detail.
+**Goal:** pick up the **open items** below.  OP-1/OP-2/OP-3 are **closed** (`0029` shipped
+default-on, `0030` opt-in, `0016`/`0027`/`0028` done, no per-type MoE band) and only three items remain,
+in priority order: **OP-4** the unrun gates (`llama-imatrix`, the isolated `0001`/`0008` A/Bs, the
+M-RoPE image case), **OP-5.2** the `0011` HC BF16-stream re-test (now that `0027` lets its markings run
+under `-sm tensor`), and **OP-6** the `fattn-mma-f16` build-time duplication.  **§0.5 is the
+next-session run plan (start there);** §2.4-§2.6 is the detail.
 
 **Companion files:**
 | file | what |
@@ -15,6 +15,7 @@ duplication.  **§0.5 is the next-session run plan (start there);** §2.3-§2.6 
 | [`gfx1201-closed.md`](gfx1201-closed.md) | **the full history and details of everything CLOSED** on this box — session log §11, gate results, per-patch verdict table §7, DONE work items §12.1-§12.3, `0016` port, lossy-transfer result, the §13.7 cliff fix.  Cite it for anything marked DONE here. |
 | [`gfx1151-closing.md`](gfx1151-closing.md) | the gfx1151 revalidation/port brief (the MMVQ band halves and the `n7`/`n8` matrix are handed there). |
 | [`gfx1100-closing.md`](gfx1100-closing.md) | the single-7900-XTX brief. |
+| [`2026-09-24-op3-per-type-moe-band.md`](2026-09-24-op3-per-type-moe-band.md) | OP-3: the per-type MoE band measurement + the launch-bound trap (closed, no per-type band). |
 | [`closing-the-gap.md`](closing-the-gap.md) · [`README.md`](README.md) | the campaign handover + patch inventory. |
 **Delivery policy:** `AGENTS.md` — default-on policy (a beneficial feature ships on, an env var only
 **disables**), purity rules, and **never push the `~/llama.cpp` fork**.  Push the delivery repo only if
@@ -32,11 +33,10 @@ negative, the `0028` W=9 verify-cliff fix, and (2026-09-24) all of **OP-1** — 
 fix (`0029`), the opt-in structural input placement (`0030`), the OP-2/OP-3 four-axis re-baseline, the
 OP-5.1 `0013` redundancy verdict, and OP-1.4 (draft sampler, won't-fix).
 
-**Open** (this file) — the four remaining items:
+**Open** (this file) — the three remaining items:
 
 | id | item | priority | effort | where |
 |---|---|---|---|---|
-| **OP-3** | **per-type MoE band floor** — is `MMVQ_MOE_MAX_BATCH_SIZE=16` a win for *every* routed expert type at W=9..16, or does one need a per-type cap?  (the rest of OP-3 is DONE: matrix + odd-row-dense closed) | **high** | ~2 h, 1 A/B | §2.3 / §0.5 |
 | **OP-4** | unrun gates: `llama-imatrix` BF16 split check, isolated `0001`/`0008` A/Bs, M-RoPE image (`0005`) | medium | ~3-4 h | §2.4 / §0.5 |
 | **OP-5.2** | `0011` HC BF16 streams: re-test under `-sm tensor` now that `0027` runs the markings (expected flat) → park | low | ~1 h | §2.5 / §0.5 |
 | **OP-6** | `fattn-mma-f16` per-TU native-arm duplication (7.26 MB / 229 s per instance TU) — build-time only, choose finer generated-file granularity | low / parked in `TODO.md` | ~1 day | §2.6 / §0.5 |
@@ -55,12 +55,14 @@ export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1201/lib:$LD_LIBRARY_PATH
 # fast loop: cmake --build build-rocm --target llama-cli llama-bench llama-batched-bench llama-imatrix test-backend-ops -j 16
 ```
 
-### OP-3 (do first) — per-type MoE band
+### OP-3 — per-type MoE band: **CLOSED 2026-09-24, no per-type band**
 
-**Question.**  `0028` floors the routed-expert MMVQ band at `MMVQ_MOE_MAX_BATCH_SIZE=16`
-unconditionally on AMD.  The per-arch `get_mmvq_mmid_max_batch_rdna3` table caps types at 4-6 and the
-floor overrides all of them.  Is W=9..16 a win for **every** expert type, or does one regress?
-(rationale + the mitigation shape: [`gfx1151-closing.md`](gfx1151-closing.md) §4.5.)
+The unconditional floor at 16 is a net win for every expert type in the relevant range (`n_max <= 12`,
+`B <= 13`); only IQ3_XXS/IQ4_XS regress, and only from `B=13` (`-2.2%`), which is the price of the
+decode/verify purity the band exists to give.  The `__launch_bounds__` widening trap is also cleared
+(no `B <= 8` regression).  Record + full data:
+[`2026-09-24-op3-per-type-moe-band.md`](2026-09-24-op3-per-type-moe-band.md).  The harness that
+produced it is kept below for reference.
 
 ```sh
 cd ~/llama.cpp
@@ -76,16 +78,11 @@ grep -E '^\| *16 \| *32 ' /tmp/bb_*.out      # B=9..16 rows are the band; B<=8 i
 #   ... -ctk q8_0 -ctv q8_0 -npp 16 -ntg 32 -npl 6,7,8,9,10,11,12
 ```
 
-**Decision.**  Band wins at every width for every type on both MoE models -> **close as a no-op** (the
-unconditional floor is right).  A specific expert type regresses at 9..16 -> implement a **per-type
-band** (a helper/exception list; narrowing `get_mmvq_mmid_max_batch_rdna3` alone does nothing because
-the floor clamps up afterwards).  The kernel is one-warp-per-token, so a per-type cap cannot
-re-introduce a width impurity below the cap - but re-run the W=1..8 purity hash anyway.
-
-**Traps.**  `--ctx-checkpoints 0`; interleave the arms; also watch the **W<=8** decode band (the
-`__launch_bounds__` widening 8->16 warps can cost occupancy there - the templated mitigation is
-[`gfx1151-closing.md`](gfx1151-closing.md) §5.1).  References:
-[`2026-09-24-qwen4exp-w9-verify-cliff.md`](2026-09-24-qwen4exp-w9-verify-cliff.md), `patches/0028`.
+**Result (band ON vs OFF, `S_TG t/s`):** Q4_K/Q5_K +26% at B=9 tapering to +10% at B=16; Q5_K/Q6_K
++16% at B=12; IQ4_NL +13% at B=9; Q3_K +2.5% at B=12 then negative from B=14; IQ3_XXS/IQ4_XS +2.8%
+at B=9, -0.2% at B=12, -2.2% at B=13.  If the relevant ceiling is ever raised past 12, the fix is a
+kernel split (two 8-warp blocks along the token axis), **not** a per-type cap.  The gfx1151 per-type
+mitigation shape is [`gfx1151-closing.md`](gfx1151-closing.md) §4.5.
 
 ### OP-4 — the unrun gates
 
@@ -168,6 +165,7 @@ type, instance TUs `T`/`W`).  Evidence + tools: `wip/build-time-regression/`; th
 | **OP-1** MTP CPU-spin | **DONE (runtime half, `0029`)** — tiny CPU split graphs run single-threaded; default 81.0 → 111.7 t/s, ~15 → 1.2 cores, acceptance/text byte-identical; env **kill-switch only** | `2026-09-24-mtp-cpu-spin-automatic.md` |
 | **OP-2** MTP re-baseline | **DONE** — four-axis + `n7`/`n8`/adaptive, no env, CPU quiet every arm; `n8` near-tied with `n7` and wins recall (the old gap was `0028`) | `2026-09-24-mtp-cpu-spin-automatic.md` §4 |
 | **OP-3** matrix half | **DONE** — the full `n7`/`n8`/adaptive matrix with the fix | `2026-09-24-mtp-cpu-spin-automatic.md` §4 |
+| **OP-3** per-type MoE band | **CLOSED, no per-type band** — the unconditional floor at 16 wins for every routed-expert type in the relevant `B <= 13` range (k-quants +26%, IQ4_NL +13% at B=9); only IQ3_XXS/IQ4_XS regress and only from `B=13`.  The `__launch_bounds__` widening has no `B <= 8` cost (138-way register-identical, ±0.6% runtime) | `2026-09-24-op3-per-type-moe-band.md` |
 | **OP-5.1** `0013` on RDNA4 | **REDUNDANT** — matcher fires 0× with `0016` ON, 4× with `LLAMA_QSA_SCORE_WMMA=0`; no port | `2026-09-24-mtp-cpu-spin-automatic.md` §5 |
 | **OP-1** structural input placement | **INVESTIGATED, opt-in (`0030`)** — `LLAMA_DEVICE_INPUT=1` moves the input layer to the output/Meta device (0 CPU splits, byte-identical) but the Meta-split GPU gather is ~2.6 % slower MTP than host input + `0029`, so it is not defaulted | `2026-09-24-mtp-cpu-spin-structural.md` |
 | **OP-1.4** draft sampler under `-sm tensor` | **CLOSED, won't fix** — blocked by the Meta backend (`handle_per_row` asserts on the vocab-split logits; needs a distributed top-k) and not a measurable win even under `-sm layer` (75.6 vs 75.1 t/s, noise) | `2026-09-24-mtp-draft-sampler-tensor-split.md` |
@@ -346,7 +344,10 @@ near-tied everywhere and **wins recall** — the `n_max 8` question is workload-
 * **per-type MoE band** — the routed-expert band floor is currently unconditional 16 on AMD; if a
   specific expert type is slower on `mul_mat_vec_q_moe` at 9..16, the floor has to become per-type (see
   the gfx1151 brief §4.5 — narrowing the per-arch table alone does nothing because the floor clamps up
-  afterwards).  **← the only OP-3 item still open; run plan in §0.5.**
+  afterwards).
+  → **DONE 2026-09-24: no per-type band needed** — the unconditional floor at 16 wins for every type
+  in the relevant `B <= 13` range; only IQ3_XXS/IQ4_XS regress (from `B=13`), which is the purity
+  trade.  See [`2026-09-24-op3-per-type-moe-band.md`](2026-09-24-op3-per-type-moe-band.md).
 * **another odd-row dense model** — the RDNA4 dense rule (`nrows_x % 128 != 0`) was only exercised on
   qwen4exp; 27B/35B are the clean controls.  If one is available, A/B a dense model with odd rows.
   → **DONE 2026-09-24: none available, and the controls are confirmed clean.**  A GGUF header scan
