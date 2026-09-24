@@ -427,7 +427,7 @@ Inputs stay zero-copy and the per-ubatch copy disappears.
    degrade to the copy, never back to the fault.  This is also a clean **upstream-PR candidate**
    (the reference commits are upstream), so mirror it under `upstream/` if it lands.
 
-> **RESULT 2026-09-24 (step 1): STOP — do not port the ring.**  Measured the stopgap's copy directly
+> **RESULT 2026-09-24 (step 1): STOP — do not port the ring (maintainer-confirmed).**  Measured the stopgap's copy directly
 > (`GGML_SPLIT_COPY_STATS` instrumentation): **prefill 0.03–0.05 %, decode ~0.5–0.9 % (≈140 µs/token)**, and the
 > copied bytes are ubatch-independent.  Deterministic in the accounting but at/below the end-to-end
 > noise floor and below the campaign's ~1 % win bar, for a ~500-line upstream scheduler port.  Keep

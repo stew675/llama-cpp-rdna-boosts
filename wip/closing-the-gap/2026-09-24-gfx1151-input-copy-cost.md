@@ -47,9 +47,9 @@ ub 2048 and ub 8192) — the cost is the fixed per-graph input/state set, not th
 workload makes the per-ubatch host input materially larger (e.g. a much larger host-resident input
 tensor set) or if the copy becomes a measurable end-to-end decode regression.
 
-> This is a maintainer call: the brief's literal rule ("if measurable → port") would say *go*; the
-> measured magnitude (<1 % decode, ~0 % prefill) says *stop*.  The data is recorded here for the
-> decision either way.
+> **Maintainer decision (2026-09-24): confirmed — do not port the ring.**  The brief's literal rule
+> ("if measurable → port") would say *go*, but the measured magnitude (<1 % decode, ~0 % prefill)
+> does not justify the ~500-line scheduler port.  §9 is closed with the stopgap retained.
 
 ## Reproduce
 
