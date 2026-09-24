@@ -416,7 +416,70 @@ would silently lose them unless Work item 3 of `gfx1201-closing.md` §12.3 is do
 * Warm the model in page cache before A/Bs; capture stdout/stderr to files (a piped bench can hang —
   §9.10); `pkill -9 -x llama-bench` between harnesses.
 * Fold a port into its patch (`git commit --fixup` + `GIT_SEQUENCE_EDITOR=true git rebase
-  --autosquash`), regenerate it, and re-verify the 25-patch apply tree.
+  --autosquash`), regenerate it, and re-verify the 26-patch apply tree.
+
+### 7.2.5 Results (gfx1100, 2026-09-24) — §7.2.1 + §7.2.3 done
+
+Built on the **new 26-patch set** (r13 + beta + `0001..0014`/`0016..0027`): fresh apply reproduces
+tree **`803e6d908ade68b02a71af9d5d0cf605aec1382a`** (matches the gfx1201 §12.1 tree), 0 build errors.
+The gfx1201 changes are **inert on single-GPU gfx1100** (`0004` single-device gate: fusion still
+fires; `0016` RDNA4 arm: gfx11 path unchanged; `0017`/`0018` RDNA4 mask: gfx1100 mask unchanged;
+`0027` meta pass: no meta backend) — all headline gates reproduce the §9 numbers.
+
+#### §7.2.1 — MMB WMMA quant coverage (the gfx1100 asymmetry, confirmed)
+
+`--pure` requantized models (`llama-quantize --allow-requantize --pure <Q8_0> out <TYPE> 16`),
+`llama-bench -p 8192,32768 -n 0 -b 4096 -ub 4096 -r 3`, `GGML_CUDA_MMB=0` vs default:
+
+| model | type | MMB off pp8192/pp32768 | MMB on | Δ | RDNA4 Δ (gfx1201 §12.1) |
+|---|---|---:|---:|---:|---:|
+| Qwen3.5-4B | Q4_0 | 6413.5 / 5077.9 | 7418.6 / 5701.3 | **+15.7 % / +12.3 %** | −2.9 % / −1.9 % |
+| Qwen3.5-4B | Q4_1 | 6194.4 / 4940.6 | 7416.6 / 5687.1 | **+19.7 % / +15.1 %** | +5.1 % / +4.2 % |
+| Qwen3.5-4B | Q5_0 | 6166.6 / 4925.4 | 7150.3 / 5527.6 | **+16.0 % / +12.2 %** | +10.4 % / +8.7 % |
+| Qwen3.5-9B | Q4_0 | 3861.5 / 3302.4 | 4656.7 / 3910.3 | **+20.6 % / +18.4 %** | — |
+| Qwen3.5-9B | Q4_1 | 3698.4 / 3208.8 | 4602.9 / 3874.6 | **+24.5 % / +20.7 %** | — |
+| Qwen3.5-9B | Q5_0 | 3684.6 / 3203.9 | 4441.7 / 3758.4 | **+20.6 % / +17.3 %** | — |
+| gemma-26B-A4B (Q4_0 **MoE**, routed) | Q4_0 | 4047.6 / 2746.3 | 4481.1 / 2951.9 | **+10.7 % / +7.5 %** | — |
+
+**Every type wins on gfx1100**, including `Q4_0` — which *loses* on RDNA4 and is deliberately kept
+out of RDNA4's dense mask.  The reason is the one §7.2 named: the **gfx11 MMQ path is much weaker**,
+so MMB's WMMA wins for all three.  gfx1100 already enables all of them (routed mask
+`IQ_FAMILY | K_AND_Q8 | Q4Q5 | IQ2`, dense mask `~0` — `mmb.cu:1817`/`1863`), so **no mask change is
+needed**: the beta's non-RDNA4 policy was already right, and this confirms it.
+
+* **Oracles** (`GGML_CUDA_MMB_MIN_T=1`, forces the MMB path at every shape): `MUL_MAT` **q4_0 48/48,
+  q4_1 47/47, q5_0 14/14**; `MUL_MAT_ID` **q4_0 74/74, q4_1 75/75, q5_0 3/3** — the §6.6 counts.
+* **Text gate** (the real contract): MMB off ↔ on is **byte-identical** (`ea43b94ecff1`, 96 ch) for all
+  three types.
+* **Width probe** at P=1024 shows the documented **coarse-quant relaxation** on the `--pure` models
+  (4B Q4_0/Q4_1/Q5_0: MMB-off PASS/PASS/FAIL, MMB-on FAIL/FAIL/FAIL; worst 0.26–0.42).  MMB is gated
+  `T >= 512`, the decode band `W=1..8` never takes it, and the text gate holds — same reading as the
+  gfx1201 record (`GREEDY-PURITY.md` §36, the coarse-quant near-tie relaxation; *not* a kernel error,
+  which the oracle + text + PPL all support).
+* **Unreachable** (same tooling limits as gfx1201): `MXFP4` only via `MXFP4_MOE` (a MoE layout, no
+  dense test model), no `NVFP4` path at all; `IQ2_*` needs a matching imatrix this box lacks.
+
+#### §7.2.3 — single-GPU lossy-marking path healthy
+
+`graph_optimize` runs on this box, so the markings engage.  The `0019`/`0023` gate holds on the new
+set: `llama-imatrix` Ornith-1.0-9B-BF16 `-c 512 -b 512 --chunks 4` is clean (PPL 7.2865, no
+non-finite) and the imatrix file is **byte-identical** to `GGML_CUDA_MMB_HC16=0`.  `0010` DOWN16 was
+already tested (§9.8).  `HC16`/`blk16`/`res16` stay qwen4exp-only (no model fits).
+
+#### §7.2.2 — `0016`/`0003` end-to-end stays **deferred** (correctly)
+
+Both remain **opt-in** on gfx1100 (`GGML_CUDA_LIGHTNING_INDEXER4_GFX1100=1`, `LLAMA_HC_GATEMIX=1`).
+The gfx1201 session flipped **RDNA4** `0016` to default-ON on its own measurements; per §7.2.2 the
+gfx1100 flip needs an **gfx1100** end-to-end A/B (a 2× W7900 box), which this 24 GiB box cannot do
+(qwen4exp does not fit).  No flip made.
+
+#### Standard gates re-verified on the 26-patch set
+
+Oracles all green (`FLASH_ATTN_QSA` 26/26, `GATED_DELTA_NET` 46/46, `TOPK_QSA` 4/4,
+`FLASH_ATTN_EXT` 5953/5953, `LIGHTNING_INDEXER` 225/225, `MUL_MAT` 1297/1297, `MUL_MAT_ID`
+913/913); 27B MMB **+18.7 % / +18.3 %** pp8192/16384 (off 1113.7/1064.0 → on 1321.5/1259.0), width
+`PASS`, purity `e7ff203db696`; 35B purity `81d218ce9f5b`; PPL parity 27B 10.0174→9.9258, 35B
+14.8302→14.8248 (all identical to the §9/§9.4/§9.5 numbers).
 
 ---
 

@@ -133,8 +133,14 @@ The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and t
    **`0016` `QSA_SCORE_WMMA` is now PORTED to RDNA4 (2026-09-23, default ON)** — the 4-head
    indexer WMMA kernel gives **+1.7…+12.3 % qwen4exp prefill** at pp8192…65536; oracle 225/225,
    purity holds.  See [`2026-09-23-qsa-score-wmma-rdna4.md`](2026-09-23-qsa-score-wmma-rdna4.md).
-   gfx1100 is still open; the remaining RDNA4 port candidates are `0003` (gate-mix) and
-   `0017`/`0018` (MMB quant types) — the generic fallbacks are in use and gated.
+   The remaining RDNA4 port candidate is `0003` (gate-mix) — the generic fallback is in use and
+   gated.  **gfx1100 §7.2 done (2026-09-24):** the new 26-patch set applies to tree
+   `803e6d908a…` and all headline gates reproduce; **MMB quant coverage (`0017`/`0018`) is a win for
+   *every* type on gfx1100** (Q4_0 **+15.7…+20.6 %**, Q4_1 **+19.7…+24.5 %**, Q5_0
+   **+16.0…+20.6 %** dense; gemma-26B Q4_0 MoE **+10.7 %** routed) — `Q4_0` wins here but *loses* on
+   RDNA4 (weak gfx11 MMQ), and gfx1100's mask already enables them, so **no change needed**; the
+   `0019`/`0023` imatrix gate is clean+byte-identical.  The `0016`/`0003` gfx1100 arms stay opt-in
+   (end-to-end needs a qwen4exp-capable box).  See [`gfx1100-closing.md`](gfx1100-closing.md) §7.2.5.
    **gfx1151 lossy-prefill transfer (`0010`/`0011`) — NEGATIVE 2026-09-23:** the maintainer's
    `LLAMA_HC_BLK16=1 LLAMA_HC_RES16=1 GGML_CUDA_MMB_DOWN16=1` config was tested on gfx1201 and shows
    **no measurable win** (flat at pp8192/32768 under `-sm layer`; under `-sm tensor` the markings do
