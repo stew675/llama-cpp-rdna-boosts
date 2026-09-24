@@ -303,15 +303,27 @@ index 22a15f47e..8fe1b0c7a 100644
              (const int      *) ucount.get(),
 diff --git a/ggml/src/ggml-cuda/gdn-conv.cu b/ggml/src/ggml-cuda/gdn-conv.cu
 new file mode 100644
-index 000000000..ad72d88d0
+index 000000000..07380a061
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/gdn-conv.cu
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,135 @@
 +#include "gdn-conv.cuh"
 +#include "unary.cuh"
 +#include <cstdlib>
 +
-+static bool gdn_conv_enabled() { return getenv("GGML_CUDA_DISABLE_CONV_FUSION") == nullptr; }
++// The direct kernel is bit-identical to the CONCAT+SSM_CONV+SILU reference on a single-device graph
++// (same 4-tap reduction order, same silu, `gdn_concat_tail` still materializes the snapshot tail).
++// Under a multi-device tensor split it is NOT: with the fusion off, the raw ops and the upstream
++// SSM_CONV+SILU fusion agree byte for byte, while the direct kernel produces a different greedy
++// continuation (27B/35B, 3x R9700, -sm tensor; gfx1201 2026-09-23).  The sharded inputs themselves
++// are consistent, so the divergence is still open; until it is root-caused keep the fusion on
++// single-device graphs only.  GGML_CUDA_CONV_FUSION_MULTI=1 forces it back on (A/B / fix validation)
++// and GGML_CUDA_DISABLE_CONV_FUSION=1 is the explicit off switch.
++static bool gdn_conv_enabled() {
++    if (getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr) return false;
++    static const bool multi_ok = getenv("GGML_CUDA_CONV_FUSION_MULTI") != nullptr;
++    return multi_ok || ggml_backend_cuda_get_device_count() <= 1;
++}
 +
 +// tail-only materialization of the concat: columns [tail_from, T+3) of every channel row
 +static __global__ void gdn_concat_tail(const float * __restrict__ state, const float * __restrict__ x, float * __restrict__ out,
@@ -2894,17 +2906,23 @@ index 000000000..e8b5888dc
 +void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_gated_match & m);
 diff --git a/ggml/src/ggml-cuda/ple-conv.cu b/ggml/src/ggml-cuda/ple-conv.cu
 new file mode 100644
-index 000000000..9821d6cbb
+index 000000000..65f7ba070
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/ple-conv.cu
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,195 @@
 +#include "ple-conv.cuh"
 +#include "unary.cuh"
 +#include "convert.cuh"
 +#include <vector>
 +#include <algorithm>
 +#include <cstdlib>
-+static bool ple_conv_enabled() { return getenv("GGML_CUDA_DISABLE_CONV_FUSION") == nullptr; }
++// See gdn-conv.cu: the direct conv kernel diverges from the reference under a multi-device tensor
++// split, so keep the fusion on single-device graphs only until that is root-caused.
++static bool ple_conv_enabled() {
++    if (getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr) return false;
++    static const bool multi_ok = getenv("GGML_CUDA_CONV_FUSION_MULTI") != nullptr;
++    return multi_ok || ggml_backend_cuda_get_device_count() <= 1;
++}
 +#if defined(__HIP_PLATFORM_AMD__)
 +static __device__ __forceinline__ float ple_mul_rn(const float a, const float b) { float r; asm("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
 +static __device__ __forceinline__ float ple_add_rn(const float a, const float b) { float r; asm("v_add_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
