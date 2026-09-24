@@ -637,3 +637,122 @@ caught the 2026-09-12 mmvq regression.
 measured), the `llama-imatrix` `0019`/`0023` gate (the NanBeige model is absent on this box — note
 HC16 is RDNA3_5-gated, so the gate is a no-op on RDNA4 anyway), and the `0001`/`0008` isolated
 fusion A/Bs (they are exercised by the qwen4exp gates but not singled out).
+
+---
+
+## 12. Remaining RDNA4 porting work — handover for the next session
+
+**Updated:** 2026-09-23 (session 2).  §11 holds the gate results; this section is the **open** work.
+The campaign's arch-scoped features are one of three shapes — classify before touching one:
+
+1. **Wrong-arch predicate over a working kernel.**  The port is usually small (a layout / enable
+   change) and the gfx1151 win transfers if the hardware bottleneck is the same.  *Worked example:
+   `0016` `QSA_SCORE_WMMA` — ported this session, **+1.7/+3.2/+6.5/+12.3 %** qwen4exp prefill.*
+2. **A marking that does not run at all.**  `graph_optimize`-based markings (HC16/DOWN16/
+   blk16/res16) are inert under `-sm tensor` because the **meta backend** owns the graph and the
+   CUDA child's `graph_optimize` never runs (`MMB_OPT=0`).  Inert regardless of hardware.
+3. **A platform-specific win.**  APU/unified-memory bandwidth (`0010`/`0011`) — measured, does not
+   transfer; park it.
+
+Checklist per candidate: (a) `grep` the predicate + `MMB_CFG` the policy row; (b) **correctness** —
+op oracle (`test-backend-ops -o <OP>`, separate stdout/stderr; a graph fusion may have **no oracle**,
+then the only gate is end-to-end text + `plain == draft-mtp`) and width purity; (c) **perf** —
+`llama-bench -p 8192,32768,65536 -n 0 -b 4096 -ub 4096 -r 5 -sm tensor`, **warm page cache**,
+interleaved vs the fallback, quote the deep point; (d) fold into the owning patch.
+
+### 12.1 Work item 1 — MMB WMMA quant coverage on RDNA4 (`0017`/`0018`)  ← the main ask
+
+**What.**  `0017` adds Q4_0/Q4_1/Q5_0/MXFP4/NVFP4 and `0018` adds IQ2_S/IQ2_XS/IQ2_XXS to the MMB
+weight-type mask.  The dequant + WMMA (`mmb_tile_gemm`) is **already RDNA4-ported** by the beta, and
+the new types **compile** for gfx1201 — but the RDNA4 masks exclude them:
+
+* routed mask (`mmb.cu:1808`):  `RDNA4 ? IQ_FAMILY : (IQ_FAMILY | K_AND_Q8 | Q4Q5 | IQ2)`
+* dense mask  (`mmb.cu:1849`):  `RDNA4 ? (1 << IQ3_S) : ~0`
+
+So on RDNA4 the **only** MMB dense type is IQ3_S, and the routed set is IQ4_NL/IQ3_S/IQ4_XS/IQ3_XXS.
+Enabling the new types is a **policy + measurement** task, not new kernel code.
+
+**Why the default is narrow.**  The beta's S5-S7 (`gfx1201-s5s7-mmb-results.md`,
+`gfx1201-s10-dense-geometry.md`) found MMB **dense** with the k-quants was a **−4…−13 % regression**
+on RDNA4 (the delivery's RDNA4 MMQ path is already tuned) — that is why the dense mask is IQ3_S
+only.  Do **not** flip the mask wholesale; measure **per (type, path, shape)**.
+
+**How (a measurement campaign — budget a session).**
+
+1. **Get models.**  This box has **no** Q4_0/Q4_1/Q5_0/MXFP4/NVFP4/IQ2 GGUF (only IQ4_XS/IQ3_XXS/
+   Q4_K/Q8_0/Q6_K).  Quantize one: `llama-quantize <27B-Q8/BF16> <out> Q4_0` (and Q5_0; `MXFP4`/
+   `NVFP4` need the newer quantizer).  A 4B/9B dense model is enough for a first pass; the 35B-A3B
+   Q3_K_M is the routed-MoE shape.
+2. **Baseline** = the delivery path (`GGML_CUDA_MMB=0`); **arm** = MMB with the type force-enabled.
+   There is **no per-type env** — add a temporary `GGML_CUDA_MMB_WTYPE=<type>` override (or flip the
+   mask in a scratch build) to measure, then land only the winners.
+3. Per type: `llama-bench -p 8192,32768 -n 0 -b 4096 -ub 4096 -r 5`, warm, interleaved, dense
+   (`MUL_MAT`) **and** routed (`MUL_MAT_ID`, MoE model); plus the `MUL_MAT`/`MUL_MAT_ID` oracle for
+   the type (expected counts in `gfx1100-closing.md` §6.6) and `test-logits-width-probe`.
+4. **Land** the winning types in the RDNA4 routed mask and/or the S10 dense per-type policy; leave
+   the losers excluded.  `MXFP4`/`NVFP4` are the most likely RDNA4 dense candidates (weakest MMQ
+   path); `Q4_0`/`Q4_1`/`Q5_0` the least (the beta's regression finding); IQ2 unknown.
+
+### 12.2 Work item 2 — `0003` `hc_gate_mix` RDNA4 port
+
+**What.**  The fused HC gate GEMM+sigmoid+mix.  Call site `GGML_CUDA_CC_IS_RDNA3(cc)`
+(`ggml-cuda.cu:5715`); `mmb_arch_defaults` sets `gatemix=0` on RDNA4 (`mmb.cu:1534`), and RDNA3_0 is
+opt-in (`LLAMA_HC_GATEMIX=1`).
+
+**The port is one map + two predicate edits.**  `hc_gate_mix_kernel<4>` already uses the
+**arch-aware MMB shim** (`mmb_frag_t`, `mmb_ld_frag`, `mmb_wmma_bf16` — the latter has the `_gfx12`
+arm), so the MMA is gfx12-ready.  **But its epilogue hand-rolls the gfx11 accumulator map**
+(`token = 2*e + (lane>>4)` — see the comment in `hc_gate_mix_kernel`); RDNA4 needs
+`8*(lane>>4) + e`.  That map, the call-site predicate (`RDNA3` → `RDNA3 || RDNA4`), and the policy
+row are the whole change.
+
+**Model requirement.**  The kernel requires `w->type == GGML_TYPE_IQ4_NL` (`mmb.cu:2223`).  This
+box's qwen4exp is **UD-IQ4_XS** — confirm the HC gate weight is IQ4_NL on it (the gfx1151 reference
+was an IQ4_NL model).  If not, the port can only be unit-checked here; the end-to-end needs an
+IQ4_NL qwen4exp model.
+
+**Gate.**  No op-level oracle (graph fusion) → correctness is `plain == draft-mtp` + coherence, and
+the A/B is `LLAMA_HC_GATEMIX=1` vs `=0` (or the RDNA4 policy row).  Target is prefill.  The `0016`
+result says a correct WMMA enablement here can be a several-percent win — worth doing.
+
+### 12.3 Work item 3 — make the `graph_optimize` markings run under `-sm tensor`
+
+**What.**  HC16 (`0023`), DOWN16 (`0010`), blk16/res16 (`0011`) are pre-allocation markings in
+`ggml_backend_cuda_graph_optimize`, which **never runs** when the meta backend owns the graph
+(§11).  To apply them under tensor split the meta backend must run the CUDA markings on the
+per-device shard graphs **before allocation** — the marks are keyed by `const ggml_tensor *` and the
+residual marks add gallocr alloc deps.  Precedent: `ggml_backend_meta_graph_optimize` already does
+this for the `moe_weighted_reduction` alloc deps.
+
+**Priority: low for `0010`/`0011`** (measured no transfer, §11), but it is the **only** way any
+`graph_optimize`-based marking (including a future one that *is* bandwidth-bound here) works under
+`-sm tensor`.  Infrastructure item, not a win.
+
+### 12.4 Work item 4 — the remaining RDNA3_5-gated kernels (lower priority)
+
+* **`0013` prefill indexer relu+head-sum** (`idx_relu_sum`, call-site `GGML_CUDA_CC_IS_RDNA3_5`):
+  `0016`'s port already banks this reduction (the fused lightning-indexer computes
+  `bias + sum_h relu(dot_h)`), so a separate enablement is likely redundant on RDNA4.  Verify by
+  diffing `GGML_CUDA_IDX_RELU_SUM` on/off **after** the `0016` port — if the graph no longer
+  contains that chain, there is nothing to port.
+* **`0011` HC BF16 streams / `0023` HC16**: `0011` needs Work item 3 to run under `-sm tensor`;
+  `0023`'s HC16 is RDNA3_5-gated and not bandwidth-bound on discrete RDNA4 → park unless a
+  48 GB single-GPU RDNA4 box appears.
+
+### 12.5 Harness + traps (copy these into the next session)
+
+* **Warm the page cache** for the multi-shard 87 GiB model before any A/B — the first cold pp8192
+  read ±121 t/s (a spurious −21 %) while the warm re-run was clean.
+* **Kill leftover benches**: `pkill -9 -x llama-bench` — an orphan from a timed-out harness holds
+  ~22 GiB/GPU and the next load dies with
+  `ggml-backend-meta.cpp:1848 GGML_ASSERT(meta_buf_ctx->bufs[i])`.
+* **Capture stdout/stderr to files and parse after** — never `| grep | head` a bench (it can hang).
+* Use `pgrep -x llama-bench` (not `-f`; `-f` matches your own shell).
+* Build loop: `cmake --build build-rocm --target llama-cli llama-bench test-backend-ops -j 16`
+  (a `ggml-cuda` TU is ~2-4 min; the FA instances are the long pole, ccache covers the rest).
+* **Fold a port** with `git commit --fixup=<commit>` then
+  `GIT_SEQUENCE_EDITOR=true GIT_EDITOR=true git rebase --autosquash <commit>~1`; regenerate with
+  `git format-patch -1 <sha> --stdout --no-numbered`; replace the patch file and re-verify a fresh
+  worktree at `r13-beta-baseline` + the 25 patches reproduces the branch tip tree.
+* The verified handover state at the end of session 2: branch `closing-gfx1201`, tip tree
+  **`95f916a8e015efd68ee44bcea7620187ebc70019`** (25/25 apply: r13 + beta + closing).

@@ -346,6 +346,80 @@ Record the predicates that keep everything else inert: `HC16`/`blk16`/`res16` ar
 
 ---
 
+## 7.2 Remaining gfx1100 port / transfer work (2026-09-23 handover)
+
+**Framing.**  The point of the gfx1100 pass is not "make the gfx1151-gated stuff not break" — it is
+"**a feature gated to gfx1151 because it wins there: does it also win on gfx1100, and if so, port
+and enable it**".  Classify each arch-scoped item as (1) a wrong-arch predicate over a working
+kernel, (2) a marking that does not run, or (3) a platform-specific win.  Then run the four gates:
+predicate (`grep` + `MMB_CFG`), **correctness** (oracle + `plain == draft-mtp`; a graph fusion has no
+oracle), **perf** (`-b/-ub 4096`, warm, interleaved), fold into the owning patch.
+
+**The gfx1100 asymmetry (good news).**  gfx1100 **shares the gfx11 WMMA builtin** with gfx1151, so:
+
+* there is **no gfx12 fragment port** to do — `mmb.cu`, `fattn-qsa3.cu` and `lightning-indexer.cu`
+  already have gfx11 device code;
+* gfx1100 is **single-GPU**, so the CUDA backend's `graph_optimize` **does run** — the HC16 /
+  DOWN16 / blk16 / res16 markings are *measurable here*, unlike on the gfx1201 box's required
+  `-sm tensor` mode where the meta backend bypasses them (that is the gfx1201 finding; it does not
+  apply to a single-GPU gfx1100 box, only to a hypothetical 2× W7900 `-sm tensor` run).
+
+**Reference results from the gfx1201 session (2026-09-23)** — the transfer lens in action:
+
+| feature | gfx1201 result | implication for gfx1100 |
+|---|---|---|
+| `0016` `QSA_SCORE_WMMA` (4-head indexer WMMA) | **ported to RDNA4, +1.7/+3.2/+6.5/+12.3 %** qwen4exp prefill | gfx1100 shares the gfx11 WMMA — the equivalent port is the §7.1 opt-in; it should pay similarly if a box can run qwen4exp |
+| `0010` DOWN16 + `0011` blk16/res16 | **no transfer** (flat under `-sm layer`; inert under `-sm tensor`) — APU/unified-memory bandwidth effect | single-GPU gfx1100 *can* run the markings; measure, do not assume either way |
+| `0003` `hc_gate_mix` | RDNA4 epilogue needs the gfx12 acc map; not yet done | gfx1100's gfx11 kernel is the shipped one → the §7.1 opt-in is the end-to-end candidate |
+
+### 7.2.1 Work item — MMB WMMA quant coverage (`0017`/`0018`) on gfx1100
+
+`0017` adds Q4_0/Q4_1/Q5_0/MXFP4/NVFP4 and `0018` adds IQ2_S/IQ2_XS/IQ2_XXS to the MMB weight-type
+mask, and **both are default-ON on non-RDNA4** — so gfx1100 already runs them (that is the
+`MUL_MAT`/`MUL_MAT_ID` oracle work and the `gemma-26B-A4B +11.4 %` row in §9.5).  This is *gfx1100's*
+WMMA-quant work, not gfx1201's (RDNA4's mask is deliberately narrow).
+
+Remaining: the same **per-(type, path, shape)** question the gfx1201 handover (`gfx1201-closing.md`
+§12.1) lays out — the beta's RDNA4 numbers do **not** predict gfx1100 (the gfx11 MMQ path is much
+weaker here, which is why MMB wins on gfx1100).  Concretely: for each of the eight types,
+`llama-bench -p 8192,32768 -n 0 -b 4096 -ub 4096 -r 5` with `GGML_CUDA_MMB=0` vs default, dense
+(`MUL_MAT`) and routed (`MUL_MAT_ID`, 35B-A3B), warm, interleaved; then the type oracle
+(`MUL_MAT`/`MUL_MAT_ID`, expected counts in §6.6) and width purity.  Land any type that wins and is
+not already covered.  `MXFP4`/`NVFP4`/IQ2 need a model of that type (quantize one).
+
+### 7.2.2 Work item — finish the `0016`/`0003` ports end-to-end
+
+§7.1 landed both as **opt-in** (`GGML_CUDA_LIGHTNING_INDEXER4_GFX1100=1`, `LLAMA_HC_GATEMIX=1`);
+`LIGHTNING_INDEXER` 225/225 passes on gfx1100 with the WMMA arm, but **qwen4exp does not fit in
+24 GiB**, so the end-to-end prefill A/B was never run.  Finish it on a box that can load qwen4exp:
+
+* **A 2× W7900 (48 GiB each, gfx1100)** box is the natural target — qwen4exp has 2 KV heads so a
+  pair is exactly right for `-sm tensor` (§9.9).  Run the gfx1201 `0016` A/B protocol there
+  (`llama-bench -p 8192,32768,65536 -n 0 -b 4096 -ub 4096 -r 5`, WMMA vs fallback, warm) and, if it
+  wins, flip the gfx1100 default (the gfx1201 session flipped RDNA4 to default-ON).
+* Or finish it on the gfx1201/gfx1151 boxes with the gfx1100 kernel unmodified — but the win is
+  hardware-specific, so the gfx1100 measurement should be made on gfx1100.
+
+### 7.2.3 Work item — single-GPU lossy features (HC16 / blk16 / res16 / down16)
+
+Because `graph_optimize` runs on this box, these engage here.  `0010` DOWN16 was already tested
+(§9.8: 35B coherence identical, PPL 14.8248).  `0011` blk16/res16 and HC16 are **qwen4exp-only**, so
+they are not end-to-end testable on a 24 GiB gfx1100 — same "no model fits" rule as the rest.  The
+measurable gfx1100 action is: keep the `graph_optimize` marking path healthy (the `0019`/`0023`
+scheduler+imatrix gates, §9.7) and, on a 2× W7900 box, re-check that the markings still run under
+`-sm tensor` — they will **not**, per the gfx1201 meta-backend finding, so a W7900 qwen4exp run
+would silently lose them unless Work item 3 of `gfx1201-closing.md` §12.3 is done.
+
+### 7.2.4 Commands + traps
+
+* `HIP_VISIBLE_DEVICES=0` on **every** command (the gfx1036 iGPU aborts multi-device tools).
+* Warm the model in page cache before A/Bs; capture stdout/stderr to files (a piped bench can hang —
+  §9.10); `pkill -9 -x llama-bench` between harnesses.
+* Fold a port into its patch (`git commit --fixup` + `GIT_SEQUENCE_EDITOR=true git rebase
+  --autosquash`), regenerate it, and re-verify the 25-patch apply tree.
+
+---
+
 ## 8. Per-patch verdict table (fill this in)
 
 | patch | end-to-end on gfx1100? | verdict | evidence / why inert |
