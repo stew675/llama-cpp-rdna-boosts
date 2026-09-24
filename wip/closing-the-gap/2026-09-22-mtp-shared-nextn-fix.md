@@ -2,8 +2,9 @@
 
 **Status:** fixed and **delivered in the delivery set as block 00, release `v16-ebbb18522-r13`**
 (2026-09-22; canonical tip `8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`, tree
-`bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`).  The WIP export `wip/closing-the-gap/patches/0015` is
-**superseded** — a campaign rebuilt on r13 must not apply it (it is already in block 00).  The bug is
+`bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`).  The WIP export `0015` was **removed 2026-09-24** — it
+is **superseded** by the r13 block-00 base and cannot apply on r13 (a campaign rebuilt on r13 must not
+apply it; it is already in block 00).  The bug is
 **upstream** (`04eb4c446 "llama : add Gemma4 MTP (#23398)"`, present at the fork point); upstream is not
 ours to change, so the fundamental fix lives in block 00 (the structural base every later block builds
 on).  It is also the `upstream/UPSTREAM-PR-mtp-shared-nextn` candidate.

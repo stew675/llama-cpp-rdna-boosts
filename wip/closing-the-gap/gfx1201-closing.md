@@ -454,7 +454,6 @@ git checkout -b closing-gfx1201
 bash "$WORK"/scripts/apply-all.sh .                      # delivery r13 (16 blocks)  -> tree bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12
 git am "$WORK"/beta/mmb-general/patches/*.patch          # 12 beta patches          -> tree 79136a15cac1920c0dd334b4c119a9cb42f9143b
 for p in "$WORK"/wip/closing-the-gap/patches/0*.patch; do
-  case "$p" in *0015-*) echo "skip 0015 (superseded by r13 block 00)"; continue;; esac
   git am "$p"
 done
 git rev-parse HEAD^{tree}                                # expect 99b429a60d441f814c84737cfa57803bc15a2f6d
@@ -465,7 +464,7 @@ git rev-parse HEAD^{tree}                                # expect 99b429a60d441f
 > tip tree `99b429a6…` exactly (29/29 `git am`, verified: block `bb7b6d07`, beta `79136a15`, closing
 > `99b429a6`).
 
-**Traps:** `0015` must be **skipped**; `0024` must be applied **before** `0025` (the loop order handles
+**Traps:** the superseded `0015` was removed (it is r13 block 00), so the `0*.patch` glob no longer includes it; `0024` must be applied **before** `0025` (the loop order handles
 this).  The single-patch alternative is `git apply` of `wip/closing-the-gap/campaign-all.patch` on the
 r13+beta tree.
 

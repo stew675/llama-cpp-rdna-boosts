@@ -79,12 +79,11 @@ git rev-parse HEAD^{tree}                    # expect bb7b6d07b05ad8e23ab6e77017
 git am "$WORK"/beta/mmb-general/patches/*.patch
 git rev-parse HEAD^{tree}                    # expect 79136a15cac1920c0dd334b4c119a9cb42f9143b
 
-# --- 3. wip/closing-the-gap (25; SKIP 0015 which r13 block 00 supersedes) -----------------
+# --- 3. wip/closing-the-gap (0015 removed; it is r13 block 00) ----------------------------
 git fetch origin gap-closing
 mkdir -p /tmp/closing-patches
 git archive origin/gap-closing wip/closing-the-gap/patches | tar -x -C /tmp --strip-components=3
 for p in /tmp/closing-patches/0*.patch; do
-  case "$p" in *0015-*) echo "skipping $(basename "$p") (superseded by r13 block 00)"; continue;; esac
   git am "$p"
 done
 git rev-parse HEAD^{tree}                    # expect 1f09fd97d916ca080f7f65cdc422a3d6c425baa7
@@ -92,7 +91,7 @@ git rev-parse HEAD^{tree}                    # expect 1f09fd97d916ca080f7f65cdc4
 
 Notes:
 
-* **`0015` must be skipped** (the shared-NextN MTP fix is in the r13 block-00 base).
+* **`0015` was removed** (the shared-NextN MTP fix is in the r13 block-00 base).
 * **`0024` must be applied before `0025`** — `0025` reverts `0024`'s `src/llama-model.cpp` heuristic.
 * The applied tree is `1f09fd97d916ca080f7f65cdc422a3d6c425baa7` (the gfx1100 RDNA3_0 arms are
   folded into `0016`/`0003`, so this is the arch-complete 25-patch set — no separate overlay).
@@ -699,7 +698,7 @@ Use `benchmarks/mtp-adaptive-methodology.md` rule 0 for MTP and `-b/-ub 4096` fo
 1. **Mask the iGPU: `HIP_VISIBLE_DEVICES=0` on every command** (the gfx1036 device aborts
    multi-device tools).
 2. **`gap-closing`'s `release.json` is r12** — apply the delivery from `main` (§2).
-3. **Skip `0015`; apply `0024` then `0025`.**
+3. **Apply `0024` then `0025`** (`0015` was removed; it is r13 block 00).
 4. **gfx1151 hashes are not targets here.**  Use the gfx1100 S1-S10 records + a local
    pre-closing-vs-closing A/B.
 5. **`MMB` is now default-ON** — an A/B must set `GGML_CUDA_MMB=0` explicitly (the old "unset = off"

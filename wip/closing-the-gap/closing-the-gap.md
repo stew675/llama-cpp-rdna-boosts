@@ -284,6 +284,6 @@ and the HC16 bug above makes depth MTP nondeterministic until fixed.
   [`2026-09-22-mmb-eval-callback-f32.md`](2026-09-22-mmb-eval-callback-f32.md),
   and the rest of this directory's `2026-09-*` files.
 * History: [`closed-the-gap.md`](closed-the-gap.md).
-* Patches: [`patches/`](patches/) (`0001..0014`, `0016..0027`; `0015` superseded by r13 block 00; `0024` superseded by `0025`).
+* Patches: [`patches/`](patches/) (`0001..0014`, `0016..0030`; `0015` removed 2026-09-24 — it is r13 block 00; `0024` superseded by `0025`).
 * Delivery policy: `AGENTS.md` (default-on policy, purity rules, pushing policy — **never push the
   `~/llama.cpp` fork**).

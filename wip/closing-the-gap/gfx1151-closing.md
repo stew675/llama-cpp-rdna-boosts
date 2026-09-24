@@ -74,7 +74,7 @@ kernel-family-dispatch change and the gates that matter are §4.2–§4.5 below.
 The change is **folded into the WIP campaign as
 [`patches/0028`](patches/0028-gap-closing-WIP-extend-the-MMVQ-routed-expert-band-and-RDNA4-dense-fallback.patch)
 (commit `6b230ad59208`; the campaign was 27 patches when this brief was opened: `0001..0014` +
-`0016..0028`, still skipping `0015` — it has since grown to 29, see §1).  Apply it on top of the
+`0016..0028` — it has since grown to 29, see §1; the superseded `0015` was removed 2026-09-24).  Apply it on top of the
 26-patch tree with `git am`, or apply the whole set fresh — a fresh
 r13+beta worktree + 27/27 reproduces tree `533eee3188ab7df9b6cf394adeaa31b46bd13ff2`.  Three files,
 69 insertions:
