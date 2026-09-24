@@ -469,6 +469,74 @@ Clean (no non-finite), PPL 7.2865 both arms; imatrix file **byte-identical**
 * `0025` host-buffer input layer: discrete GPU → `prop.integrated=0` → no-op;
   `GGML_FORCE_NO_INTEGRATED=1` identical `533172aeb7ab`.
 
+### 9.9 qwen4exp gfx1100 static review (best-guess; end-to-end not runnable here)
+
+A static pass over the qwen4exp-only path for a hypothetical **2× W7900 (48 GiB each, gfx1100)**
+box that *can* load qwen4exp.  Verdict: **nothing correctness-untoward**; the arch-specific pieces
+are performance tuning, and two things deserve an explicit flag.
+
+**Arch policy (what a W7900 gets):** `qsa_arch_gfx()` reads the device gfx id, so on gfx1100 every
+`qsa_arch_gfx() == 0x1151` branch is false and qwen4exp inherits the **gfx1201 policy**, not gfx1151:
+
+| policy | gfx1151 (shipped) | gfx1100 (W7900) |
+|---|---|---|
+| `LLAMA_QSA_DENSE_SHORTCUT` | off (always-QSA) | **on** (first ~2051 tokens dense) |
+| decode crossover (`0022`) | sparse ≥32K | **dense always** (`1<<62`) |
+| prefill | QSA always | QSA always (same) |
+
+**Flag 1 — qsa3 is ported but the policy wasn't re-measured.** `fattn-qsa3.cu` is gated
+`RDNA3_0 || RDNA3_5 || RDNA4` (beta `0011`), and `FLASH_ATTN_QSA` 26/26 passes here — but the
+`qwen4exp.cpp` arch-policy comment still says the dense-shortcut default was chosen because qsa3
+wasn't ported, ending "**Revisit per arch once qsa3 is ported** — it is what made always-QSA viable
+on gfx1151".  That revisit is now overdue: qsa3 *is* enabled on gfx1100, so always-QSA + sparse
+decode (the gfx1151 winners) are plausibly wins here too but unmeasured.  **Recommend re-measuring
+`LLAMA_QSA_DENSE_SHORTCUT=0` / `LLAMA_QSA_DENSE_DECODE_UNTIL=0` on gfx1100** — the only spot where
+the gfx1100 default is a guess, not a measurement.
+
+**RDNA3_5-gated → inert on gfx1100 (perf only, correct fallback):**
+
+| item | gate | gfx1100 effect |
+|---|---|---|
+| HC16 (beta `0004`) | `GGML_CUDA_CC_IS_RDNA3_5` at both marking passes | inert → +4-5 % gfx1151 win lost |
+| hc_gate_mix (`0003`) | now `RDNA3` (ported §7.1) but `gatemix=0` on RDNA3_0 | off; `LLAMA_HC_GATEMIX=1` opt-in |
+| QSA_SCORE_WMMA (`0016`) | `RDNA3_5` shipped; §7.1 port opt-in | generic vec fallback; `GGML_CUDA_LIGHTNING_INDEXER4_GFX1100=1` opt-in |
+| HC BF16 streams (`0011` blk16/res16) | default off on all arch | opt-in only |
+| MoE BF16 epilogue (`0010` down16) | default off on all arch | opt-in only |
+
+**Arch-neutral (fire on gfx1100, oracle-backed):** hc_mix / hc_combine_norm (`0001`),
+indexer top-k/score/fill (`0013`/`0014`/`0021`), mmb_cvt `out_xn` (`0012`), M=4 HC inject (`0008`),
+sparse MTP draft (`0020`/`0026`), QSA block window (`0005`) — all shape/type predicates, no
+gfx1151-specific gating.
+
+**Multi-GPU (2× W7900):** `llm_arch_supports_sm_tensor(QWEN4EXP)` returns **true under
+`GGML_USE_HIP`** (validated on 3× R9700).  qwen4exp has **2 KV heads**, so 2 GPUs is the natural
+`-sm tensor` split (the "2 KV heads < 3 devices" meta-splitter abort only bites 3+ GPUs; a pair is
+exactly right).  No single-device hardcoding in the QSA/indexer/hyperconn path — the `n_stream == 1`
+gates are KV *sequence* streams (M-RoPE/multi-seq), not device count; `devices[0].cc` reads are
+harmless on a homogeneous pair.
+
+### 9.10 Cross-tree A/B (baseline `~/llama-r13beta` vs closing `~/llama.cpp`)
+
+Same protocol (`-b 4096 -ub 4096 -r 5`); baseline MMB toggled with
+`GGML_CUDA_MMB=1 GGML_CUDA_MMB_RDNA3=1` (beta default off), closing with `GGML_CUDA_MMB=0`
+(closing default on).
+
+| model | point | baseline MMB off | closing MMB off | baseline MMB on | closing MMB on |
+|---|---|---:|---:|---:|---:|
+| 27B UD-Q4_K_M | pp8192 | 1102.77 | 1107.66 | 1306.30 | 1321.32 |
+| 27B UD-Q4_K_M | pp16384 | 1053.67 | 1064.03 | 1242.06 | 1257.94 |
+| 35B-A3B Q3_K_M | pp8192 | 5332.20 | 5456.12 | 6249.50 | 6406.97 |
+
+**No regression anywhere; the closing patches add +0.4…+1.3 % (27B) / +2.3…+2.5 % (35B) on top of
+the beta baseline**, on top of the MMB default flip.  Coherence cross-check (27B, `-n 48`):
+baseline MMB off == closing MMB off == **`3dc4df7edbf5` (215 ch)** byte-identical (the non-MMB
+closing patches are bit-transparent); closing MMB on = `533172aeb7ab` (the approved MMB
+re-baseline, a different GEMM contraction).
+
+*Trap:* one baseline 35B run hung (no CPU/GPU activity) under the `2>/dev/null | grep | head`
+pipeline; the same command with stdout/stderr captured to files completed in ~40 s.  Prefer
+file-captured stdout/stderr for these benches so a stall is debuggable rather than silent.
+
 ---
 
 ## 10. Report template
