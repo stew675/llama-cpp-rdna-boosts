@@ -395,12 +395,28 @@ Values are Generation t/s, parenthesised = draft acceptance:
 | X phase-switch | `code-reasoning-mixed.txt` | 55.9 | 73.2 (0.479) | 49.3 (0.380) | 72.5 (0.651) |
 
 On this box **`n7` beat `n8` on every axis** and the adaptive controller (ceiling 8) was best or
-near-best on R/X.  **Caveat:** these ran with the OpenMP spin below active (all arms equally
-confounded), and `n8` runs ~1 more CPU graph per token than `n7`, so part of its penalty here is the
-spin, not the numerics — re-measure after the fix.  The user's gfx1151 `n_max 8` observation, and its
-"depth 8 sits on the purity boundary" reasoning, still need their own unconfounded gate (the boundary
-is on the **verify width**: `n_max 7` = W=8 is the last pure depth, `n_max 8` = W=9 is the first that
-can diverge; above 7 use acceptance + MTP-vs-plain, never `plain == draft-mtp`).
+near-best on R/X.
+
+**Re-run with the spin removed (same protocol, `OMP_WAIT_POLICY=PASSIVE KMP_BLOCKTIME=0`):**
+
+| axis | none | fixed n7 | fixed n8 | adaptive cap 8 |
+|---|---:|---:|---:|---:|
+| R reasoning | 55.4 | 75.4 | 57.1 | 83.8 |
+| C code | 56.1 | 131.1 | 107.3 | 108.8 |
+| P prose | 55.5 | 119.3 | 95.1 | 107.1 |
+| K recall | 53.2 | 156.4 | 129.2 | 129.1 |
+| X phase-switch | 55.7 | 92.2 | 62.9 | 95.4 |
+
+Draft acceptance is **byte-identical** to the confounded run (the spin changes only timing) — e.g.
+C n7 0.74918, P n7 0.69018, X n8 0.38008.  So the spin cost **~22–26 % of throughput per arm** (35 %
+for the n3 prose pair) but **uniformly**, and it did **not** change the ranking: **`n7` still beats
+`n8` on every axis on gfx1201**, and `n8`'s lower acceptance (C 0.744 vs 0.749, P 0.656 vs 0.690,
+X 0.380 vs 0.479) shows the 8th draft token is mostly rejected — the extra verify width is not repaid.
+So the session-6 table's *relative* conclusions were valid all along; only its absolute t/s were low.
+The user's gfx1151 `n_max 8` observation does **not** transfer to gfx1201 and needs its own gate on
+**gfx1151** (and gfx1100) before any conclusion.  Note also the purity boundary is on the **verify
+width**: `n_max 7` = W=8 is the last pure depth, `n_max 8` = W=9 is the first that can diverge; above 7
+use acceptance + MTP-vs-plain, never `plain == draft-mtp`.
 
 **The CPU-spin root cause (the important find):** MTP decode pins **all 16 cores at 100 %**; plain
 decode uses ~2.  `gdb` on the busy process:
@@ -1065,3 +1081,16 @@ needed.  Small, but it composes with 13.1/13.2.
 * `OMP_WAIT_POLICY=PASSIVE KMP_BLOCKTIME=0` — the A/B that proved the spin was idle-wait, not work.
 * Reuse the session-6 command shape: IQ4_NL 9-shard + `mtp-...-shared-Q8_0.gguf`, `-sm tensor`,
   q8_0 KV, `-b/-ub 2048`, `-c 16384`, `-n 1500..3000`, seed 42, temp 0.
+
+### 13.6 Re-run the depth matrix (`n7`/`n8`/adaptive) — the `n_max 8` question
+
+**Explicit follow-up** (maintainer, 2026-09-24): all `n7`/`n8` results must be re-measured on the
+spin-free path, not just the one pair.  The **gfx1201 matrix is DONE** (session 6 re-run, §11): with
+`OMP_WAIT_POLICY=PASSIVE`, **`n7` beats `n8` on every axis** (C 131.1 vs 107.3, P 119.3 vs 95.1,
+K 156.4 vs 129.2, R 75.4 vs 57.1, X 92.2 vs 62.9), acceptance byte-identical, and the adaptive
+ceiling-8 controller wins on R/X.  **Remaining:** run the same matrix (R/C/K/P/X × `none`/`n7`/`n8`/
+adaptive) on **gfx1151** — the box where the `n_max 8` observation was actually made — and on
+**gfx1100**, then, only if a box shows `n8 > n7` with healthy acceptance, investigate whether the
+purity-boundary reasoning (first non-pure verify width) explains it rather than the acceptance curve.
+Contract reminder: above `n_max 7` use acceptance + MTP-vs-plain throughput, **not**
+`plain == draft-mtp`.
