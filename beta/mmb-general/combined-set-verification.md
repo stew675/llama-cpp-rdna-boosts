@@ -13,6 +13,13 @@
 > `git am` **28/28** from the **r13** tree (`bb7b6d07…`) to applied tree **`468c6496…`** —
 > **tree-identical** to the combined `gap-closing-denseband` tree, so the gfx1201 cross-arch results
 > below carry over unchanged.  The r12-era `bca69f23dd…` hash above is the pre-consolidation set.
+>
+> **2026-09-24 — re-based onto `84e76d8a2`.**  The delivery baseline moved to upstream master
+> `84e76d8a2` (release `v16-84e76d8a2-r1`); the 28-patch set was re-based onto it and its applied
+> tree is now **`2e4e8004…`** (previously `468c6496…` on r13).  Only patches `0014`/`0015` needed a
+> conflict resolution (upstream's restructured `ggml_backend_cuda_graph_optimize` loop).  The
+> gfx1201/gfx1100 cross-arch results below were measured on the r13-based tree; they carry over as
+> behaviour claims, but re-measure on `2e4e8004` before quoting numbers.
 
 One branch now carries all three architectures.  This file records the merge and the **cross-arch
 verification** that the gfx1100 overlay does not disturb gfx1201 (or gfx1151).

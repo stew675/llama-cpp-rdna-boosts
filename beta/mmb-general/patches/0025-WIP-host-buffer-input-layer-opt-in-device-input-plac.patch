@@ -1,4 +1,4 @@
-From 36a44137fd159a4cfa2a1204420f98fd8ac92ee5 Mon Sep 17 00:00:00 2001
+From 7b6fd9672a3a37342d30fee17e35df9675a293ed Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Wed, 23 Sep 2026 15:42:50 -0500
 Subject: [PATCH 25/28] WIP: host-buffer input layer + opt-in device input
@@ -31,7 +31,7 @@ byte-identical to HC16=0; FLASH_ATTN_QSA/GATED_DELTA_NET green.
  4 files changed, 59 insertions(+), 6 deletions(-)
 
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index e6ae7cd3f..0e7f22631 100644
+index 2c34193a9..7c58de195 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -1043,6 +1043,18 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
@@ -76,10 +76,10 @@ index e6ae7cd3f..0e7f22631 100644
  }
  
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 4c28f94de..c17981dc0 100644
+index 89cf9fa7b..c4f580da7 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -319,9 +319,20 @@ static ggml_cuda_device_info ggml_cuda_init() {
+@@ -320,9 +320,20 @@ static ggml_cuda_device_info ggml_cuda_init() {
          // host-buffer path (zero-copy UMA weights) it enables on APUs corrupts full-model
          // results under async execution on this box (PPL 5.9243 -> 8.51+ without
          // HIP_LAUNCH_BLOCKING).  Upstream reverted #24233 in #28604 (2026-09-08), making
@@ -119,7 +119,7 @@ index b68a48734..ff4e1cd08 100644
              case LLM_TENSOR_LAYER_OUTPUT:
                  buft_list = buft_list_output;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index e7c24838f..334c91aaf 100644
+index 2d388fa28..81ff94e4a 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1532,9 +1532,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {

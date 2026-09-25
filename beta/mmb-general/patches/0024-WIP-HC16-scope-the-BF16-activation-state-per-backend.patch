@@ -1,4 +1,4 @@
-From dc5e1ae2b9651ed265aeb4cc1295e2ffc1c54d29 Mon Sep 17 00:00:00 2001
+From 6432fbe5457d6a00e3080e7d774f2283edccfa69 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Wed, 23 Sep 2026 12:17:51 -0500
 Subject: [PATCH 24/28] WIP HC16: scope the BF16 activation state per backend
@@ -69,7 +69,7 @@ index 448054401..03f302c85 100644
  
      struct ggml_backend_i {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index abca08e3d..e6ae7cd3f 100644
+index b882637c2..2c34193a9 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -1463,6 +1463,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
@@ -81,10 +81,10 @@ index abca08e3d..e6ae7cd3f 100644
  
      for (int i = 0; i < sched->n_splits; i++) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index f8f109e69..4c28f94de 100644
+index bcb4265e7..89cf9fa7b 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -6534,9 +6534,6 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
+@@ -6539,9 +6539,6 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
  }
  #endif // USE_CUDA_GRAPH
  
@@ -94,7 +94,7 @@ index f8f109e69..4c28f94de 100644
  static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
-@@ -6544,6 +6541,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6549,6 +6546,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      // The Q8_1 input cache is only valid within one graph execution.
      cuda_ctx->q8_1_cache_clear();
@@ -102,7 +102,7 @@ index f8f109e69..4c28f94de 100644
      ggml_cuda_mmb_begin_graph();
  
      bool use_cuda_graph             = false;
-@@ -6612,9 +6610,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6617,9 +6615,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
  
@@ -113,7 +113,7 @@ index f8f109e69..4c28f94de 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -6649,11 +6645,17 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6654,11 +6650,17 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // BF16-only mark lifetime: clear on the first optimize after a compute, or when the first split
      // of a new graph is seen (the scheduler optimizes every split of one graph before computing any
      // of them, so marks set below must survive the remaining splits' optimize calls).
@@ -136,7 +136,7 @@ index f8f109e69..4c28f94de 100644
  
      // The HC16 "BF16-only" marks below let a producer elide its F32 output and have every consumer
      // re-read a BF16 copy out of the per-graph activation cache.  That contract only holds while the
-@@ -6720,14 +6722,27 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6725,14 +6727,27 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          if (hc16 >= 1 && ggml_cuda_mmb_active() &&
                  GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
              auto rootof = [](const ggml_tensor * t) { while (t->view_src) t = t->view_src; return t; };
@@ -168,7 +168,7 @@ index f8f109e69..4c28f94de 100644
                      if (t->op == GGML_OP_MUL_MAT && t->src[1] && rootof(t->src[1]) == root && t->src[0] &&
                              ggml_cuda_mmb_reads_bf16_act(t->src[0], t->src[1], t)) continue;
                      if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] && rootof(t->src[1]) == root &&
-@@ -6741,9 +6756,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6746,9 +6761,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                          ggml_cuda_mmb_mark_bf16_slot(root, 4);
                          continue;
                      }
@@ -180,7 +180,7 @@ index f8f109e69..4c28f94de 100644
              };
              for (int i = 0; i < cgraph->n_nodes; ++i) {
                  const ggml_tensor * t = cgraph->nodes[i];
-@@ -6751,10 +6766,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6756,10 +6771,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  if (t->src[0]->type == GGML_TYPE_F32) continue;
                  if (!ggml_cuda_mmb_supported_mm(t->src[0], t->src[1], t)) continue;
                  const ggml_tensor * ar = rootof(t->src[1]);

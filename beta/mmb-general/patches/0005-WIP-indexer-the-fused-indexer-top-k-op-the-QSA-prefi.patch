@@ -1,4 +1,4 @@
-From c548a6bb23128f184740e9a89f37a67f9840d307 Mon Sep 17 00:00:00 2001
+From fc745d24e5cdd7236d2789fe243ce67d253abe42 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sun, 20 Sep 2026 21:01:26 -0500
 Subject: [PATCH 05/28] WIP indexer: the fused indexer top-k op + the QSA
@@ -36,10 +36,10 @@ index 2ba751eba..ef24629ce 100644
  
      // Fused indexer block-pool + rms-norm (qwen4exp QSA): replaces the per-op chain
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 4dbf72e6f..cd34a30ed 100644
+index 0fb05c9cb..1299efdaf 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -12656,6 +12656,7 @@ static void ggml_compute_forward_indexer_topk_impl(
+@@ -12670,6 +12670,7 @@ static void ggml_compute_forward_indexer_topk_impl(
      const ggml_tensor * q_pos    = dst->src[4];
      const ggml_tensor * blk_idx  = dst->src[5];
      const ggml_tensor * blk_tail = dst->src[6];
@@ -47,7 +47,7 @@ index 4dbf72e6f..cd34a30ed 100644
  
      GGML_ASSERT(score->type    == GGML_TYPE_F32);
      GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
-@@ -12669,11 +12670,17 @@ static void ggml_compute_forward_indexer_topk_impl(
+@@ -12683,11 +12684,17 @@ static void ggml_compute_forward_indexer_topk_impl(
      const int64_t n_stream = score->ne[2];
      const int64_t n_kv     = cell_blk->ne[0];
  
@@ -66,7 +66,7 @@ index 4dbf72e6f..cd34a30ed 100644
  
      // cell_blk is [n_kv, n_stream]: stream s rows at c + s*n_kv, s = row/n_tps
      const int64_t s0 = 0;
-@@ -12713,24 +12720,24 @@ static void ggml_compute_forward_indexer_topk_impl(
+@@ -12727,24 +12734,24 @@ static void ggml_compute_forward_indexer_topk_impl(
      // dst is [k, n_tps, 1, n_stream]; cell_blk is [n_kv, n_stream], so the
      // stream stride of cell_blk matches a dst row stride of k cells
      for (int64_t row = 0; row < n_tps*n_stream; ++row) {
@@ -1105,7 +1105,7 @@ index 5edc967e0..278b4f5bf 100644
 +    return supports_indexer4(device, dst) || ggml_cuda_lightning_indexer_generic_supported(device, dst);
 +}
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index e773cd89e..130760f7a 100644
+index 8bb98125f..ceb0be1d3 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1087,6 +1087,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -1666,10 +1666,10 @@ index 0a4624462..2d3b4acab 100644
      return top_k;
  }
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 5c3528f1a..1de277bbd 100644
+index c4b1bc502..c96c71daf 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -11245,6 +11245,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11392,6 +11392,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  

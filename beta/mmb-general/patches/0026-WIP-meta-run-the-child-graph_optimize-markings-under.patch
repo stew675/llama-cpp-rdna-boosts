@@ -1,4 +1,4 @@
-From d7d4a02bda7e0bea6650206e6ba93b3aea47ed38 Mon Sep 17 00:00:00 2001
+From 0f8870c37e0e11d2beb1a5dfbf5b81efd73a9423 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 24 Sep 2026 04:46:07 -0500
 Subject: [PATCH 26/28] WIP meta: run the child graph_optimize markings under
@@ -58,10 +58,10 @@ index 03f302c85..ff0910739 100644
  
      struct ggml_backend_i {
 diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
-index 06147cd72..0e1ea43e6 100644
+index da82173be..bc1402abc 100644
 --- a/ggml/src/ggml-backend-meta.cpp
 +++ b/ggml/src/ggml-backend-meta.cpp
-@@ -1889,6 +1889,10 @@ struct ggml_backend_meta_context {
+@@ -1895,6 +1895,10 @@ struct ggml_backend_meta_context {
      size_t                      max_subgraphs = 0;
      size_t                      n_subgraphs   = 0;
      uint64_t                    uid           = 0;
@@ -72,7 +72,7 @@ index 06147cd72..0e1ea43e6 100644
  
      void *                               comm_ctx       = nullptr;
      ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
-@@ -2059,7 +2063,27 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
+@@ -2065,7 +2069,27 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
  static void ggml_backend_meta_graph_optimize(ggml_backend_t backend,
                                               struct ggml_cgraph * cgraph,
                                               struct ggml_backend_graph_optimize_params * params) {
@@ -101,7 +101,7 @@ index 06147cd72..0e1ea43e6 100644
  
      static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
      if (disable_fusion) {
-@@ -2415,6 +2439,33 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+@@ -2421,6 +2445,33 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
                  cgraph_ij->uid = ggml_graph_next_uid();
              }
          }
@@ -136,10 +136,10 @@ index 06147cd72..0e1ea43e6 100644
  
      size_t iga = 0; // i graph aux
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index c17981dc0..003be2475 100644
+index c4f580da7..54953c1f7 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -6653,6 +6653,19 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+@@ -6658,6 +6658,19 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
  static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
      ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
  
@@ -159,7 +159,7 @@ index c17981dc0..003be2475 100644
      // BF16-only mark lifetime: clear on the first optimize after a compute, or when the first split
      // of a new graph is seen (the scheduler optimizes every split of one graph before computing any
      // of them, so marks set below must survive the remaining splits' optimize calls).
-@@ -6905,8 +6918,23 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6910,8 +6923,23 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  }
                  if (ok && nread > 0 && elide_f32) ggml_cuda_mmb_mark_bf16_only(r);
              }
@@ -185,7 +185,7 @@ index c17981dc0..003be2475 100644
                  ggml_tensor * rr = const_cast<ggml_tensor *>(ca.residual->view_src ? ca.residual->view_src : ca.residual);
                  params->add_alloc_dep(params->user_data, rr, ca.out_res);
                  params->add_alloc_dep(params->user_data, rr, ca.out_xn);
-@@ -6974,6 +7002,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -7048,6 +7076,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  

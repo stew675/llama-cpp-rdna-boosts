@@ -6,6 +6,10 @@ the next session; the "FOR THE NEXT SESSION" brief below is the whole handoff, a
 sections after it are the dated history (newest first).  `README.md` is the running record and
 `BF16-PRODUCER-PORT.md` the producer-port reference map.
 
+> **2026-09-24 re-base:** the beta set is now re-based onto upstream master `84e76d8a2` (delivery
+> `v16-84e76d8a2-r1`), applied tree `2e4e8004…`; see `README.md` and `BETA-TESTING.md`.  The r12/r13
+> hashes in this handoff are the historical record.
+
 > **2026-09-25 — the set is now consolidated and r13-based.**  The `closing-the-gap` campaign was
 > folded into `patches/` (28 patches: the 12 core + 16 appended, ten closing patches folded into the
 > core), and the whole set was re-based on the **r13** delivery tree (`bb7b6d07…`).  The apply recipe

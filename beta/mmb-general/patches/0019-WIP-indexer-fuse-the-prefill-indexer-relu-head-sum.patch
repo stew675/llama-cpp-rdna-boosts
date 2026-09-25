@@ -1,4 +1,4 @@
-From e2d6f582b6ae0929694cb6788f86b1690298cd42 Mon Sep 17 00:00:00 2001
+From 78c2cf64f57461328204d23ae732e9b21b77f5c6 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 22 Sep 2026 08:59:46 -0500
 Subject: [PATCH 19/28] WIP indexer: fuse the prefill indexer relu + head-sum
@@ -25,10 +25,10 @@ reference.
  3 files changed, 166 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index d18c27980..7403140ff 100644
+index 41685e996..28695a227 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4129,6 +4129,94 @@ static void ggml_cuda_hc_combine_norm_set_bf16(ggml_backend_cuda_context & ctx,
+@@ -4133,6 +4133,94 @@ static void ggml_cuda_hc_combine_norm_set_bf16(ggml_backend_cuda_context & ctx,
      }
  }
  
@@ -123,7 +123,7 @@ index d18c27980..7403140ff 100644
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-@@ -4147,6 +4235,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4151,6 +4239,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      ggml_tensor * node = cgraph->nodes[i];
  
@@ -140,7 +140,7 @@ index d18c27980..7403140ff 100644
      // Depthwise causal conv1d fusions (qwen4exp GDN + PLE), ported from the halo-box
      // reference: the CONCAT(state, x) materialization and the SSM_CONV / tap-mul-add
      // chain are replaced by a direct kernel that reads state+x and writes the conv
-@@ -6777,6 +6875,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6782,6 +6880,19 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -158,8 +158,8 @@ index d18c27980..7403140ff 100644
 +    }
 +
      static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-     if (!disable_fusion) {
-         for (int i = 0; i < cgraph->n_nodes; ++i) {
+ 
+     auto add_alloc_deps = [&](size_t start, size_t last_node) {
 diff --git a/ggml/src/ggml-cuda/indexer-score.cu b/ggml/src/ggml-cuda/indexer-score.cu
 index 436e80deb..21cc83991 100644
 --- a/ggml/src/ggml-cuda/indexer-score.cu

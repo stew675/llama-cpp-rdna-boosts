@@ -36,18 +36,17 @@ per-arch table or arch-neutral.  Re-validating confirms that reasoning.
 
 ```sh
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout ebbb18522                                   # the fork point
-bash <repo>/scripts/apply-all.sh .                       # -> r13 delivery, tree bb7b6d07...
-git checkout -b mmb-beta
-git am <repo>/beta/mmb-general/patches/*.patch           # 28/28
-git rev-parse HEAD^{tree}                                # expect 468c64963ae45e72367c73809efa7cc038217e8a
+git checkout 84e76d8a2                                   # the fork point
+bash <repo>/scripts/apply-beta.sh . <repo>               # apply-all + 28/28, tree 2e4e8004...
+git rev-parse HEAD^{tree}                                # expect 2e4e8004f0562485a3b7ba179cd4781a227989ad
 ```
 
-Consolidated 2026-09-25 (the `closing-the-gap` campaign folded in).  Verified strict `git am`
-**28/28** from the r13 tree, producing `468c64963ae45e72367c73809efa7cc038217e8a`; the set is
-**tree-identical** to the combined `gap-closing-denseband` tree, so the gfx1201/gfx1100 results
-carry over and the gfx1151 re-validation below is the beta-window task.  Build with the usual gfx1151
-script; the runtime env is `export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH`.
+Re-based 2026-09-24 onto upstream master `84e76d8a2` (release `v16-84e76d8a2-r1`); the previous r13
+tree was `468c6496…`.  Verified strict `git am` **28/28** on a fresh `84e76d8a2` worktree with the
+delivery set applied first (delivery tree `336d0f43…`), producing `2e4e8004…`; only `0014` (GDN/PLE
+conv1d) and `0015` (narrow-row RMS norm) needed a conflict resolution (upstream's restructured
+`ggml_backend_cuda_graph_optimize` loop).  Build with the usual gfx1151 script; the runtime env is
+`export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH`.
 
 `GGML_CUDA_MMB_CFG=1` prints the resolved per-arch config once — gfx1151 should read
 `cc=0x1001151 dense_geom=0 min_t=512 glu_thresh=32 routed_thresh=32 tall=2 tiny_m=1/1
@@ -216,3 +215,20 @@ bash <repo>/scripts/apply-beta.sh . <repo>      # apply-all + 28/28, tree 468c64
 
 **Verdict:** GREEN.  The consolidation is behaviour-preserving (bare tree identity), and the shipped
 `apply-beta.sh` reproduces it from a clean clone.
+
+---
+
+## 7. 2026-09-24 re-base smoke (gfx1151)
+
+The set was re-based onto upstream master `84e76d8a2` (delivery `v16-84e76d8a2-r1`) and smoke-tested on
+gfx1151 (ROCm 7.14, `~/bin/build-llama-rocm-714`, clean build 6 m 41 s):
+
+* `GGML_CUDA_MMB_CFG=1` → `cc=0x1001151 dense_geom=0 … routed=1` (the RDNA3_5 row, unchanged).
+* `test-backend-ops -o FLASH_ATTN_QSA` **26/26**; `-o GATED_DELTA_NET` **46/46**.
+* `test-logits-width-probe` **PASS (worst maxdiff 0)** on Qwen3.5-4B, qwen4exp Q4_K_M and
+  Qwen3.6-35B-A3B Q4_K_M (prose prompt, 512/512).
+* qwen4exp Q4_K_M + Q4_K_M MTP sidecar, prose, seed 42 / temp 0 / `--reasoning off`, `-n 1500`:
+  **draft acceptance 0.80091** (`acc per pos = 0.916, 0.785, 0.698`), 33.2 t/s vs plain 23.7 t/s.
+
+This is a smoke pass on the new base, not a replacement for the full gfx1151 beta-window
+re-validation above.

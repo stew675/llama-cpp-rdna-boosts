@@ -1,4 +1,4 @@
-From 1770172c2bb1088cc8383ed86afda8f69cd6df99 Mon Sep 17 00:00:00 2001
+From c0aa6f07e6bf4bf29f97893bdf554646c0d1f877 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 21 Sep 2026 21:37:36 -0500
 Subject: [PATCH 14/28] WIP GDN/PLE: port the depthwise conv1d prefill fusions
@@ -31,10 +31,10 @@ Exported to wip/closing-the-gap/patches/0004.
 ---
  ggml/src/ggml-cuda/gdn-conv.cu  | 135 ++++++++++++++++++++++
  ggml/src/ggml-cuda/gdn-conv.cuh |  16 +++
- ggml/src/ggml-cuda/ggml-cuda.cu |  47 ++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu |  48 ++++++++
  ggml/src/ggml-cuda/ple-conv.cu  | 195 ++++++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/ple-conv.cuh |  16 +++
- 5 files changed, 409 insertions(+)
+ 5 files changed, 410 insertions(+)
  create mode 100644 ggml/src/ggml-cuda/gdn-conv.cu
  create mode 100644 ggml/src/ggml-cuda/gdn-conv.cuh
  create mode 100644 ggml/src/ggml-cuda/ple-conv.cu
@@ -204,10 +204,10 @@ index 000000000..a843b460a
 +void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
 +void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 21b6cf80c..c86cebf6b 100644
+index c79b407e7..f5c80e9ca 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -30,6 +30,8 @@
+@@ -31,6 +31,8 @@
  #include "ggml-cuda/indexer-topk.cuh"
  #include "ggml-cuda/indexer-score.cuh"
  #include "ggml-cuda/fwht.cuh"
@@ -216,7 +216,7 @@ index 21b6cf80c..c86cebf6b 100644
  #include "ggml-cuda/getrows.cuh"
  #include "ggml-cuda/im2col.cuh"
  #include "ggml-cuda/mmf.cuh"
-@@ -4031,6 +4033,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4035,6 +4037,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      ggml_tensor * node = cgraph->nodes[i];
  
@@ -253,9 +253,9 @@ index 21b6cf80c..c86cebf6b 100644
      // qwen4exp IQ4_NL/Q8_0 routed down projection followed by the 10-expert weighted sum (ported
      // from halo-box/strix-llama.cpp): compute all selected experts for one output row in a wave and
      // apply their routing weights immediately, avoiding the [n_embd, n_used] intermediate and its
-@@ -6495,6 +6527,21 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
-     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-     if (!disable_fusion) {
+@@ -6516,6 +6548,22 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
+         // TODO: consolidate fusion paths in graph_optimize and graph_compute
          for (int i = 0; i < cgraph->n_nodes; ++i) {
 +            if (cgraph->nodes[i]->op == GGML_OP_CONCAT) {
 +                ggml_cuda_ple_conv_match pm;
@@ -272,9 +272,10 @@ index 21b6cf80c..c86cebf6b 100644
 +                }
 +                continue;
 +            }
-             if (cgraph->nodes[i]->op != GGML_OP_MUL) {
-                 continue;
-             }
++
+             ggml_moe_weighted_reduction_match match;
+             if (ggml_match_moe_weighted_reduction(cgraph, i, match)) {
+                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
 diff --git a/ggml/src/ggml-cuda/ple-conv.cu b/ggml/src/ggml-cuda/ple-conv.cu
 new file mode 100644
 index 000000000..65f7ba070

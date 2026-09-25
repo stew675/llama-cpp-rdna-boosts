@@ -1,4 +1,4 @@
-From a7ce1a7f48b1f4b77afadc817e784a733157a85f Mon Sep 17 00:00:00 2001
+From e9954aa01b0d3202bb5833f58416488ff5317547 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sun, 20 Sep 2026 21:01:26 -0500
 Subject: [PATCH 02/28] WIP qsa3: the packed-block WMMA sparse-attention path
@@ -803,7 +803,7 @@ index 000000000..3964d704d
 +    CUDA_CHECK(cudaGetLastError());
 +}
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 2ce34caf0..bd4e2aabb 100644
+index 0cf71f899..44fed05ef 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -5695,6 +5695,32 @@ struct ggml_tensor * ggml_flash_attn_qsa(
@@ -1011,10 +1011,10 @@ index 874cf5bd5..5adf84e66 100644
          cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
          cb(cur, "kqv_out", il);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index bef5c6bd0..5c3528f1a 100644
+index b8e7aee7d..c4b1bc502 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -7906,9 +7906,10 @@ struct test_flash_attn_qsa : public test_case {
+@@ -8008,9 +8008,10 @@ struct test_flash_attn_qsa : public test_case {
      const int64_t n_tps; // query tokens (the decode/verify width)
      const int64_t n_top_k; // cells the indexer selects (the top-k list length)
      const ggml_type type_KV; // K and V share the cache type
@@ -1026,7 +1026,7 @@ index bef5c6bd0..5c3528f1a 100644
      }
  
      double max_nmse_err() override {
-@@ -7922,8 +7923,8 @@ struct test_flash_attn_qsa : public test_case {
+@@ -8024,8 +8025,8 @@ struct test_flash_attn_qsa : public test_case {
      }
  
      test_flash_attn_qsa(int64_t hsk = 128, int64_t nh = 16, int64_t nh_kv = 2, int64_t n_kv = 512, int64_t n_tps = 1,
@@ -1037,7 +1037,7 @@ index bef5c6bd0..5c3528f1a 100644
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_KV));
-@@ -7951,6 +7952,18 @@ struct test_flash_attn_qsa : public test_case {
+@@ -8053,6 +8054,18 @@ struct test_flash_attn_qsa : public test_case {
          ggml_prec_set_acc(out, GGML_PREC_F32);
          ggml_set_name(out, "out");
  
@@ -1056,7 +1056,7 @@ index bef5c6bd0..5c3528f1a 100644
          return out;
      }
  
-@@ -7960,11 +7973,13 @@ struct test_flash_attn_qsa : public test_case {
+@@ -8062,11 +8075,13 @@ struct test_flash_attn_qsa : public test_case {
                  // the kernel and the reference both index the mask/K/V through this list, so every
                  // entry must be a valid cell; a cyclic walk with a per-column offset repeats cells
                  // (a real indexer's top-k list is not a permutation) and, being consecutive over
@@ -1072,7 +1072,7 @@ index bef5c6bd0..5c3528f1a 100644
                      }
                  }
              } else if (strcmp(t->name, "m") == 0) {
-@@ -11203,6 +11218,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11350,6 +11365,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_qsa(256, 24, 2, 512, 1, 128, GGML_TYPE_IQ4_NL));
      test_cases.emplace_back(new test_flash_attn_qsa(256,  4, 1, 256, 2,  96, GGML_TYPE_IQ4_NL));
  

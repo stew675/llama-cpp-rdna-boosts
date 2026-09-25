@@ -1,4 +1,4 @@
-From 38229a105187a178836c5f36d6901301b62d8b3d Mon Sep 17 00:00:00 2001
+From dcf4ebed31f362e8666f4a609432b93325b035bb Mon Sep 17 00:00:00 2001
 From: Stew Forster <ci@rdna-boosts.invalid>
 Date: Mon, 21 Sep 2026 08:46:35 -0500
 Subject: [PATCH 08/28] WIP mmb: per-arch tuning defaults + the beneficial
@@ -52,10 +52,10 @@ S10 measured +0.52/+0.46).
  3 files changed, 116 insertions(+), 34 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 44e96ea1e..87eeda241 100644
+index 99485d582..7459bfcc0 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -6292,7 +6292,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6297,7 +6297,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // first win.  STRUCTURE ONLY: inside graph_optimize the data pointers are not assigned yet, so
      // the check must not look at alias/buffer state.  LLAMA_MMB_HC16>=1 (== GGML_CUDA_MMB_HC16).
      {
@@ -64,7 +64,7 @@ index 44e96ea1e..87eeda241 100644
          if (hc16 >= 1 && ggml_cuda_mmb_active() &&
                  GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
              auto reads = [](const ggml_tensor * t, const ggml_tensor * x) {
-@@ -6337,7 +6337,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6342,7 +6342,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
      // copy is RNE-rounded exactly as mmb_cvt_f32_bf16, so the GEMM arithmetic is bit-identical.
      // Dense MUL_MAT only; F32-weight GEMMs read the activation directly (tiny-M / f32split).
      {
@@ -290,10 +290,10 @@ index 252b1fef6..e06313aa0 100644
          const int hc, const float scale, const float bias) {
      if (!mmb_gatemix_flag() || hc != 4 || w->type != GGML_TYPE_IQ4_NL || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 34a580ebb..2ca633227 100644
+index c5c6922a0..d333b1d90 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -342,11 +342,14 @@ llama_context::llama_context(
+@@ -343,11 +343,14 @@ llama_context::llama_context(
  
      cparams.fused_dsv4_hc_pre  = true;
      cparams.fused_dsv4_hc_comb = true;

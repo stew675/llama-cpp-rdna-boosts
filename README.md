@@ -11,9 +11,9 @@ checkout at the fork point **`84e76d8a2`** (upstream master, 2026-09-24
 re-base).  Each block is a self-contained `git am` commit, so you can apply
 the whole set or pick the ones you want.  An optional, **opt-in beta set**
 (`beta/mmb-general/`, 28 patches) layers the `mmb` (bf16-WMMA weight GEMM)
-campaign on top — see the [Beta addendum](#beta-addendum-the-mmb-beta-set);
-**that set is still cut against the previous `ebbb18522` baseline and must be
-re-cut before it is applied on top of this one.**
+campaign on top — see the [Beta addendum](#beta-addendum-the-mmb-beta-set).
+That set is re-based onto this baseline and its `apply-beta.sh` tree assertion
+is updated (applied tree `2e4e8004…`).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -223,7 +223,7 @@ bash <path-to-this-repo>/scripts/apply-beta.sh .
 #   1. if the 16 delivery blocks are not applied yet, runs scripts/apply-all.sh first
 #      (creates branch `rdna-boosts`);
 #   2. applies beta/mmb-general/patches/*.patch (strict 28/28) on a new `mmb-beta` branch.
-#   result: applied tree 468c64963ae45e72367c73809efa7cc038217e8a
+#   result: applied tree 2e4e8004f0562485a3b7ba179cd4781a227989ad
 ```
 
 `scripts/apply-beta.sh` is **base-aware**: it detects an already-applied delivery (the current

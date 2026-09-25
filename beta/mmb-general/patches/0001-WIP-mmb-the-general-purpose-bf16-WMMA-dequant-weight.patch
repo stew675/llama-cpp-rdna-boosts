@@ -1,4 +1,4 @@
-From d1ab5bfb33459f68e22ef8c1807985459230522d Mon Sep 17 00:00:00 2001
+From 39d2604d396ca0f9e3650cd37fa7ee75a20646d1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sun, 20 Sep 2026 21:01:26 -0500
 Subject: [PATCH 01/28] WIP mmb: the general-purpose bf16-WMMA dequant weight
@@ -22,10 +22,10 @@ pack, the IQ3_S A-panel dequant split, the tile-class threshold
  create mode 100644 ggml/src/ggml-cuda/mmb.cuh
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 071911a0c..ec05c628b 100644
+index 2d6dd6b1c..bea195bde 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -33,6 +33,7 @@
+@@ -34,6 +34,7 @@
  #include "ggml-cuda/getrows.cuh"
  #include "ggml-cuda/im2col.cuh"
  #include "ggml-cuda/mmf.cuh"
@@ -33,7 +33,7 @@ index 071911a0c..ec05c628b 100644
  #include "ggml-cuda/mmq.cuh"
  #include "ggml-cuda/mmvf.cuh"
  #include "ggml-cuda/mmvq.cuh"
-@@ -712,6 +713,7 @@ static std::condition_variable ggml_cuda_lock_cv;
+@@ -713,6 +714,7 @@ static std::condition_variable ggml_cuda_lock_cv;
  static std::atomic<int> ggml_cuda_lock_counter;
  
  ggml_backend_cuda_context::~ggml_backend_cuda_context() {
@@ -41,7 +41,7 @@ index 071911a0c..ec05c628b 100644
      std::unique_lock<std::mutex> lock(ggml_cuda_lock);
      ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
  
-@@ -2307,6 +2309,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -2308,6 +2310,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
      const int cc        = ggml_cuda_info().devices[ctx.device].cc;
      const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
  
@@ -56,7 +56,7 @@ index 071911a0c..ec05c628b 100644
      // Speculative verify batches (ne11 = n_q <= 8) must run the same kernel as
      // decode (ne11 = 1): decode uses the MMVF kernel, while a larger batch can
      // fall through to MMF, which accumulates differently and produces different
-@@ -2412,6 +2422,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+@@ -2413,6 +2423,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
              }
          }
  
@@ -68,7 +68,7 @@ index 071911a0c..ec05c628b 100644
          if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
              ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
              return;
-@@ -4053,7 +4068,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4057,7 +4072,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // rows (grid 262144x3); the pair runs it once and both muls read the same q8_1 buffer.
      static const bool pair_off        = getenv("GGML_PAIR_OFF") != nullptr;
      static const bool disable_pair_dense = getenv("GGML_PAIR_DENSE_OFF") != nullptr;
@@ -83,7 +83,7 @@ index 071911a0c..ec05c628b 100644
          ggml_tensor * next = cgraph->nodes[i + 1];
          const ggml_tensor * src0 = node->src[0];
          const ggml_tensor * src0_next = next->src[0];
-@@ -4164,7 +4185,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4168,7 +4189,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
      // swiglu -> mul_mat_q: fold silu(gate)*up into the mmq activation quantize (the qwen4exp
      // MoE down feed; the GLU output is never materialized). mmq only engages at prefill, so
      // the decode MoE tails keep their own fusions.
@@ -97,7 +97,7 @@ index 071911a0c..ec05c628b 100644
          ggml_tensor * next = cgraph->nodes[i + 1];
          const bool has_ids = next->op == GGML_OP_MUL_MAT_ID;
          if (has_ids || next->op == GGML_OP_MUL_MAT) {
-@@ -4753,6 +4779,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4758,6 +4784,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              const ggml_tensor * src1 = up->src[1];
              const ggml_tensor * ids  = up->src[2];
  
@@ -112,7 +112,7 @@ index 071911a0c..ec05c628b 100644
              if (ggml_cuda_should_fuse_mul_mat_vec_f(up) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate->src[0];
-@@ -6103,6 +6137,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -6108,6 +6142,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      // The Q8_1 input cache is only valid within one graph execution.
      cuda_ctx->q8_1_cache_clear();

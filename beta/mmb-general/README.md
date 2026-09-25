@@ -1,10 +1,12 @@
 # `beta/mmb-general` — the `mmb` (bf16-WMMA dequant weight GEMM) campaign, in beta
 
 **Status: BETA (promoted from `wip/mmb-general` on 2026-09-21; consolidated with the `closing-the-gap`
-campaign on 2026-09-25).  Not part of the delivery.**  This is the beta patch set: **28 patches**,
-verified `git am` **28/28** from the **r13** delivery tree (`bb7b6d07…`), applied tree
-**`468c64963ae45e72367c73809efa7cc038217e8a`**.  It is staged for the ~4–5 day beta window, after
-which the maintainer decides whether it becomes a delivery block (the `AGENTS.md` promotion rule).
+campaign on 2026-09-25; re-based onto upstream master `84e76d8a2` on 2026-09-24).  Not part of the
+delivery.**  This is the beta patch set: **28 patches**, verified `git am` **28/28** from the delivery
+tree, applied tree **`2e4e8004f0562485a3b7ba179cd4781a227989ad`** on the current baseline `84e76d8a2`
+(2026-09-24 re-base; previously r13 `bb7b6d07…` → `468c6496…`).  It is staged for the ~4–5 day beta
+window, after which the maintainer decides whether it becomes a delivery block (the `AGENTS.md`
+promotion rule).
 
 > **Tester: start with [`BETA-TESTING.md`](BETA-TESTING.md)** — the gfx1151 final re-validation
 > checklist (apply, build, the four gates, the reference numbers and the kill-switches).  The campaign
@@ -14,11 +16,14 @@ which the maintainer decides whether it becomes a delivery block (the `AGENTS.md
 > **New session working the promotion: read [`HANDOVER.md`](HANDOVER.md)** — its "FOR THE NEXT
 > SESSION" brief is the self-contained handoff.  This file is the running (dated) record.
 
-> **2026-09-24 — PENDING RE-BASE WARNING.**  The delivery baseline has moved to upstream master
-> `84e76d8a2` (release `v16-84e76d8a2-r1`, delivery tree `336d0f43…`).  This beta set is still cut
-> against the previous r13 tree (`bb7b6d07…`) and **does not apply on the new baseline yet**; its
-> `apply-beta.sh` tree assertion (`468c6496…`) is therefore stale.  Do not run
-> `scripts/apply-beta.sh` on the new baseline until the 28 patches are re-based and re-validated.
+> **2026-09-24 — RE-BASED onto `84e76d8a2`.**  The delivery baseline moved to upstream master
+> `84e76d8a2` (release `v16-84e76d8a2-r1`, delivery tree `336d0f43…`) and these 28 patches were
+> re-based onto it (applied tree `2e4e8004…`, `apply-beta.sh` assertion updated, strict 28/28 on a
+> fresh worktree).  Only two patches needed conflict resolution (`0014` GDN/PLE conv1d and `0015`
+> narrow-row RMS norm): upstream's restructured `ggml_backend_cuda_graph_optimize` loop dropped the
+> old early `if (op != GGML_MUL) continue;`, so each fusion's alloc-dep block is now inserted at the
+> top of the loop and upstream's `topk_moe` handling is kept.  gfx1151 smoke gates green (config row,
+> oracles, width probes, MTP acceptance 0.80).
 
 **What is in the beta set.**  Patches `0001`–`0012` are the original gfx1151-developed,
 gfx1201/gfx1100-portable `mmb` core (the `mmb` GEMM, `qsa3`, the F32/tiny-M kernels, HC16, the
@@ -68,6 +73,8 @@ worktree (`wip/closing-the-gap/consolidation.md` is the full record).
 > **Beta window note.**  The original beta set was r12-based (`bca69f23…`); the consolidated set is
 > **r13-based**.  The apply recipe below (and in `BETA-TESTING.md` / `GROUPS.md`) now names the r13
 > delivery tree.  The gfx1151 re-validation of the *consolidated* set is still the beta-window task.
+> **Update 2026-09-24:** the set has since been re-based onto `84e76d8a2` (see the note at the top of
+> this file); the r13 hashes in this dated section are the historical record.
 
 ---
 

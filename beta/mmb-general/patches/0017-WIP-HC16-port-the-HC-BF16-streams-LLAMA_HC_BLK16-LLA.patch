@@ -1,4 +1,4 @@
-From fa72dd799b8e7078d954ec645ebd44242dd75c46 Mon Sep 17 00:00:00 2001
+From 14292593d44575ae31751e98c1ac08d45f1af197 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 22 Sep 2026 08:16:39 -0500
 Subject: [PATCH 17/28] WIP HC16: port the HC BF16 streams (LLAMA_HC_BLK16 /
@@ -35,10 +35,10 @@ greedy text byte-identical (984263fb8e0f, 434 chars).
  6 files changed, 401 insertions(+), 15 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index adffc38a5..9da704f56 100644
+index e3f7df5b7..6d431eb81 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4016,6 +4016,117 @@ static int ggml_cuda_hc_mix_closed(const ggml_cgraph * cgraph, const int i, ggml
+@@ -4020,6 +4020,117 @@ static int ggml_cuda_hc_mix_closed(const ggml_cgraph * cgraph, const int i, ggml
      const int out_nodes[] = { i + n_ops - 1 };
      return ggml_can_fuse_subgraph_ext(cgraph, node_idxs, n_ops, ops, out_nodes, 1) ? n_ops : 0;
  }
@@ -156,7 +156,7 @@ index adffc38a5..9da704f56 100644
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
      static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-@@ -4191,12 +4302,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4195,12 +4306,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          ggml_moe_weighted_reduction_match match;
          static const bool mwr_dbg2 = getenv("GGML_CUDA_MWR_DEBUG") != nullptr;
          if (ggml_match_moe_weighted_reduction(cgraph, i, match)) {
@@ -193,7 +193,7 @@ index adffc38a5..9da704f56 100644
              }
          }
      }
-@@ -5709,6 +5840,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5714,6 +5845,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                                              ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2) ? "" : "(canf)");
                                      }
                                      if (alias_ok && supp && canf) {
@@ -201,7 +201,7 @@ index adffc38a5..9da704f56 100644
                                          ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
                                          return g - i;
                                      }
-@@ -5891,6 +6023,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5896,6 +6028,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                              const bool supp = ggml_cuda_hc_combine_norm_supported(args, ggml_cuda_info().devices[cuda_ctx->device].warp_size);
                              const bool canf = ggml_can_fuse_subgraph_ext(cgraph, idxs, count, ops, out_nodes, 2);
                              if (alias_ok && supp && canf) {
@@ -209,7 +209,7 @@ index adffc38a5..9da704f56 100644
                                  ggml_cuda_op_hc_combine_norm(*cuda_ctx, args);
                                  return g - i;
                              }
-@@ -6550,6 +6683,98 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -6555,6 +6688,98 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
          }
      }
  
@@ -306,8 +306,8 @@ index adffc38a5..9da704f56 100644
 +    }
 +
      static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-     if (!disable_fusion) {
-         for (int i = 0; i < cgraph->n_nodes; ++i) {
+ 
+     auto add_alloc_deps = [&](size_t start, size_t last_node) {
 diff --git a/ggml/src/ggml-cuda/hyperconn.cu b/ggml/src/ggml-cuda/hyperconn.cu
 index d95db3046..403fb659d 100644
 --- a/ggml/src/ggml-cuda/hyperconn.cu
