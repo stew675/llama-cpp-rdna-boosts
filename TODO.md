@@ -6,19 +6,23 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (2026-09-25, r2):** the delivery is the **16-patch set** against fork point
+**Current state (2026-09-25, r3):** the delivery is the **16-patch set** against fork point
 **`84e76d8a2`** (block 00 + blocks 01-15), canonical 16-block tip
-**`6d420c5257c822d1606f9a5982297524198fd021`** (tree `ea7acf2d3e18b0da01e00a3fcce0d770c430fa98`),
-release **`v16-84e76d8a2-r2`** — r1 = the re-base onto upstream master `84e76d8a2` (149 upstream
+**`9d094a3c3a5013396596f862630a15ff24701b38`** (tree `08fe2b77c5f79d69225c11fc293d452f4503cffd`),
+release **`v16-84e76d8a2-r3`** — r1 = the re-base onto upstream master `84e76d8a2` (149 upstream
 commits past `ebbb18522`; blocks 00-09 replayed without textual conflict, blocks 10/14/15 resolved
 manually), r2 = the block-10 MoE-VDR arch-scope fix (the wide-VDR `mul_mat_vec_q_moe` entry points now
 apply to RDNA4/RDNA3_0 only via one gate; RDNA3_5/gfx115x uses the dense VDR, recovering the base-16
-MoE `draft-mtp n3` 0.73967 -> 0.76484 and 87.5 -> 89.6 t/s); gfx1151 build + coherence + op oracles +
-width probes green.  The beta set
-(`beta/mmb-general`, 28 patches) is re-based on the same base (tree `e00275ff…`, with the `0027`
-`MUL_MAT_ID` F32 dense-band guard folded in) and its **full gfx1151 beta-window re-validation is
-GREEN** (2026-09-25 — Gate 1 purity, Gate 2 MMB +19–29 %, Gate 3 oracles incl. `MUL_MAT_ID` 929/929,
-Gate 4 acceptance 0.75–0.84, recurrent rollback `max diff 0`).  Full record: `WORKLOG.md` 2026-09-25.
+MoE `draft-mtp n3` 0.73967 -> 0.76484 and 87.5 -> 89.6 t/s), r3 = the block-14 `hc_combine`
+CPU-reference stride fix (issue #44: the CPU reference used `t*ne[1]`/`t*hc` instead of the tensors'
+own `nb[1]`, corrupting every multi-token fused ubatch on a CPU-resident qwen4exp layer; now mirrors
+the CUDA kernel, nt == 1 bit-identical; op-level CPU-vs-HIP oracle 7/8 FAIL pre-fix, 8/8 PASS
+post-fix).  The beta set
+(`beta/mmb-general`, 28 patches) is re-based onto r3 (tree `0daefe22…`); patch 0027 now restricts the
+16-wide routed `mul_mat_vec_q_moe` band to RDNA4 because on gfx1100 it failed `MUL_MAT_ID` 23/929 and
+on gfx1151 it is a measured loss.  gfx1100 build + coherence + op oracles + width probes green; the
+gfx1151 beta-window re-validation was GREEN on r2 and must be re-run on r3.  Full record:
+`WORKLOG.md` 2026-09-25.
 
 **Previous state (2026-09-18, r5):** the delivery is the **16-patch set** against fork point
 **`ebbb18522`** (block 00 + blocks 01-15), canonical 16-block tip

@@ -1,4 +1,4 @@
-From a5121934333ec582933d9eae470baca143162ea0 Mon Sep 17 00:00:00 2001
+From a13e42c100c5e1297fd0f70492d181ab4528e8a3 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -150,7 +150,7 @@ back to the full token count.
  ggml/src/ggml-backend-meta.cpp         |  129 ++-
  ggml/src/ggml-backend.cpp              |   48 +-
  ggml/src/ggml-cpu/ggml-cpu.c           |   37 +
- ggml/src/ggml-cpu/ops.cpp              |  496 +++++++++++
+ ggml/src/ggml-cpu/ops.cpp              |  501 +++++++++++
  ggml/src/ggml-cpu/ops.h                |    4 +
  ggml/src/ggml-cuda/common.cuh          |    1 +
  ggml/src/ggml-cuda/concat.cu           |   73 ++
@@ -195,7 +195,7 @@ back to the full token count.
  tests/test-backend-ops.cpp             |  110 +++
  tests/test-lazy-reader.cpp             |  264 ++++++
  tests/test-llama-archs.cpp             |    7 +-
- 55 files changed, 7291 insertions(+), 329 deletions(-)
+ 55 files changed, 7296 insertions(+), 329 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
@@ -907,7 +907,7 @@ index 8bb0ff7bc..f4e3236de 100644
                      {
                          GGML_ABORT("fatal error");
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index ba00a0a73..0a78b44a5 100644
+index ba00a0a73..57706ccec 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -1,8 +1,15 @@
@@ -1097,7 +1097,7 @@ index ba00a0a73..0a78b44a5 100644
  // ggml_compute_forward_flash_attn_back
  
  static void ggml_compute_forward_flash_attn_back_f32(
-@@ -12204,3 +12375,328 @@ void ggml_compute_forward_lightning_indexer(
+@@ -12204,3 +12375,333 @@ void ggml_compute_forward_lightning_indexer(
          }
      }
  }
@@ -1297,7 +1297,12 @@ index ba00a0a73..0a78b44a5 100644
 +    const int64_t hc       = ggml_get_op_params_i32(dst, 0);
 +    const int64_t n_embd   = residual->ne[0];
 +    const int64_t n_tokens = residual->ne[2];
-+    const int64_t bo_str   = block_out->ne[1];
++
++    // block_out and inject may be broadcast (ne[1] == 1) and inject is often a
++    // view into the mix output, whose row stride is the mix dst stride (n_embd+hc)
++    // rather than hc*4; use the tensors' own nb[1] steps (mirrors the CUDA kernel)
++    const int64_t bo_str  = block_out->ne[1] == 1 ? 0 : block_out->nb[1] / sizeof(float);
++    const int64_t inj_str = inject->ne[1]    == 1 ? 0 : inject->nb[1]    / sizeof(float);
 +
 +    const int ith = params->ith;
 +    const int nth = params->nth;
@@ -1319,7 +1324,7 @@ index ba00a0a73..0a78b44a5 100644
 +        const int64_t c = (i / n_embd) % hc;
 +        const int64_t t = i / (n_embd * hc);
 +        // 2*sigmoid(inject/hc): the 1/hc and 2.0 scales are exact in f32
-+        const float w = 2.0f / (1.0f + expf(-inject_d[c + t*hc] * inv_hc));
++        const float w = 2.0f / (1.0f + expf(-inject_d[c + t*inj_str] * inv_hc));
 +        const float b = block_d[r + t*bo_str] * w;
 +        dst_d[i] = residual_d[i] + b;
 +    }

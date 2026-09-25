@@ -37,16 +37,18 @@ per-arch table or arch-neutral.  Re-validating confirms that reasoning.
 ```sh
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 84e76d8a2                                   # the fork point
-bash <repo>/scripts/apply-beta.sh . <repo>               # apply-all + 28/28, tree e00275ff...
-git rev-parse HEAD^{tree}                                # expect e00275ffd011a7cadf7ebfda009d85ea1cb9b431
+bash <repo>/scripts/apply-beta.sh . <repo>               # apply-all + 28/28, tree 0daefe22...
+git rev-parse HEAD^{tree}                                # expect 0daefe229e60bdb721034ee282959e8f15269365
 ```
 
-Re-based 2026-09-24 onto upstream master `84e76d8a2` (delivery release `v16-84e76d8a2-r2`); the
-previous r13 tree was `468c6496…`.  Verified strict `git am` **28/28** on a fresh `84e76d8a2`
-worktree with the delivery set applied first (delivery tree `ea7acf2d…`), producing `e00275ff…`; only
-`0014` (GDN/PLE conv1d) and `0015` (narrow-row RMS norm) needed a conflict resolution (upstream's
-restructured `ggml_backend_cuda_graph_optimize` loop).  Build with the usual gfx1151 script; the
-runtime env is `export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH`.
+Re-based 2026-09-25 onto the delivery's `v16-84e76d8a2-r3` (delivery tree `08fe2b77…`, the block-14
+`hc_combine` CPU-reference fix), producing `0daefe22…`; the previous r2 delivery tree was
+`e00275ff…` and before that r13's was `468c6496…`.  Verified strict `git am` **28/28** on a fresh
+`84e76d8a2` worktree with the delivery set applied first; only `0014` (GDN/PLE conv1d) and `0015`
+(narrow-row RMS norm) needed a conflict resolution at the 2026-09-24 re-base (upstream's restructured
+`ggml_backend_cuda_graph_optimize` loop).  The 2026-09-25 re-base is a straight replay.  Build with
+the usual gfx1151 script; the runtime env is
+`export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH`.
 
 `GGML_CUDA_MMB_CFG=1` prints the resolved per-arch config once — gfx1151 should read
 `cc=0x1001151 dense_geom=0 min_t=512 glu_thresh=32 routed_thresh=32 tall=2 tiny_m=1/1

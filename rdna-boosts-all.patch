@@ -1986,7 +1986,7 @@ index 99b7d5afa..73e582acd 100644
  #endif
  
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index ba00a0a73..0fb05c9cb 100644
+index ba00a0a73..824295ad4 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -1,8 +1,15 @@
@@ -2254,7 +2254,7 @@ index ba00a0a73..0fb05c9cb 100644
  // ggml_compute_forward_flash_attn_back
  
  static void ggml_compute_forward_flash_attn_back_f32(
-@@ -12204,3 +12407,353 @@ void ggml_compute_forward_lightning_indexer(
+@@ -12204,3 +12407,358 @@ void ggml_compute_forward_lightning_indexer(
          }
      }
  }
@@ -2454,7 +2454,12 @@ index ba00a0a73..0fb05c9cb 100644
 +    const int64_t hc       = ggml_get_op_params_i32(dst, 0);
 +    const int64_t n_embd   = residual->ne[0];
 +    const int64_t n_tokens = residual->ne[2];
-+    const int64_t bo_str   = block_out->ne[1];
++
++    // block_out and inject may be broadcast (ne[1] == 1) and inject is often a
++    // view into the mix output, whose row stride is the mix dst stride (n_embd+hc)
++    // rather than hc*4; use the tensors' own nb[1] steps (mirrors the CUDA kernel)
++    const int64_t bo_str  = block_out->ne[1] == 1 ? 0 : block_out->nb[1] / sizeof(float);
++    const int64_t inj_str = inject->ne[1]    == 1 ? 0 : inject->nb[1]    / sizeof(float);
 +
 +    const int ith = params->ith;
 +    const int nth = params->nth;
@@ -2476,7 +2481,7 @@ index ba00a0a73..0fb05c9cb 100644
 +        const int64_t c = (i / n_embd) % hc;
 +        const int64_t t = i / (n_embd * hc);
 +        // 2*sigmoid(inject/hc): the 1/hc and 2.0 scales are exact in f32
-+        const float w = 2.0f / (1.0f + expf(-inject_d[c + t*hc] * inv_hc));
++        const float w = 2.0f / (1.0f + expf(-inject_d[c + t*inj_str] * inv_hc));
 +        const float b = block_d[r + t*bo_str] * w;
 +        dst_d[i] = residual_d[i] + b;
 +    }

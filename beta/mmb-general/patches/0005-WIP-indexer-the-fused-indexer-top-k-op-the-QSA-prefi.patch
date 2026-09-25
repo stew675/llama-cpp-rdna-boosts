@@ -1,4 +1,4 @@
-From 05565c18694b195bb3d8e5ff705158cde70a9fb4 Mon Sep 17 00:00:00 2001
+From b35fa07cab285cd79a1f331f054c969570d10ab1 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sun, 20 Sep 2026 21:01:26 -0500
 Subject: [PATCH 05/28] WIP indexer: the fused indexer top-k op + the QSA
@@ -36,10 +36,10 @@ index 2ba751eba..ef24629ce 100644
  
      // Fused indexer block-pool + rms-norm (qwen4exp QSA): replaces the per-op chain
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 0fb05c9cb..1299efdaf 100644
+index 824295ad4..59433f5c4 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -12670,6 +12670,7 @@ static void ggml_compute_forward_indexer_topk_impl(
+@@ -12675,6 +12675,7 @@ static void ggml_compute_forward_indexer_topk_impl(
      const ggml_tensor * q_pos    = dst->src[4];
      const ggml_tensor * blk_idx  = dst->src[5];
      const ggml_tensor * blk_tail = dst->src[6];
@@ -47,7 +47,7 @@ index 0fb05c9cb..1299efdaf 100644
  
      GGML_ASSERT(score->type    == GGML_TYPE_F32);
      GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
-@@ -12683,11 +12684,17 @@ static void ggml_compute_forward_indexer_topk_impl(
+@@ -12688,11 +12689,17 @@ static void ggml_compute_forward_indexer_topk_impl(
      const int64_t n_stream = score->ne[2];
      const int64_t n_kv     = cell_blk->ne[0];
  
@@ -66,7 +66,7 @@ index 0fb05c9cb..1299efdaf 100644
  
      // cell_blk is [n_kv, n_stream]: stream s rows at c + s*n_kv, s = row/n_tps
      const int64_t s0 = 0;
-@@ -12727,24 +12734,24 @@ static void ggml_compute_forward_indexer_topk_impl(
+@@ -12732,24 +12739,24 @@ static void ggml_compute_forward_indexer_topk_impl(
      // dst is [k, n_tps, 1, n_stream]; cell_blk is [n_kv, n_stream], so the
      // stream stride of cell_blk matches a dst row stride of k cells
      for (int64_t row = 0; row < n_tps*n_stream; ++row) {

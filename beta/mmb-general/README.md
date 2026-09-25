@@ -2,10 +2,10 @@
 
 **Status: BETA (promoted from `wip/mmb-general` on 2026-09-21; consolidated with the `closing-the-gap`
 campaign on 2026-09-25; re-based onto upstream master `84e76d8a2` on 2026-09-24, re-ported on delivery
-r2 (2026-09-25)).  Not part of the
+r2 (2026-09-25), re-based onto r3 and gfx1100-fixed on 2026-09-25).  Not part of the
 delivery.**  This is the beta patch set: **28 patches**, verified `git am` **28/28** from the delivery
-tree, applied tree **`e00275ffd011a7cadf7ebfda009d85ea1cb9b431`** on the current baseline `84e76d8a2`
-(2026-09-24 re-base; previously r13 `bb7b6d07…` → `468c6496…`).  It is staged for the ~4–5 day beta
+tree, applied tree **`0daefe229e60bdb721034ee282959e8f15269365`** on the current baseline `84e76d8a2`
+(r3 delivery tree `08fe2b77…`; previously r2 delivery / `e00275ff…`, r13 `bb7b6d07…` → `468c6496…`).  It is staged for the ~4–5 day beta
 window, after which the maintainer decides whether it becomes a delivery block (the `AGENTS.md`
 promotion rule).
 
@@ -16,6 +16,18 @@ promotion rule).
 
 > **New session working the promotion: read [`HANDOVER.md`](HANDOVER.md)** — its "FOR THE NEXT
 > SESSION" brief is the self-contained handoff.  This file is the running (dated) record.
+
+> **2026-09-25 (r3) — RE-BASED onto the r3 delivery + the gfx1100 routed-band fix.**  The delivery
+> moved to `v16-84e76d8a2-r3` (tree `08fe2b77…`, the block-14 `hc_combine` CPU-reference fix) and the
+> 28 patches were re-based onto it (applied tree `0daefe22…`, strict 28/28).  The first gfx1100
+> beta-window run then found a real patch-`0027` regression: the extended 16-wide routed
+> `mul_mat_vec_q_moe` band was enabled on RDNA3_0 (the `0031` arch floor only split out RDNA3_5), and
+> `test-backend-ops -o MUL_MAT_ID` failed **23/929** cases on gfx1100 (all `n = 16`, every routed
+> type/K).  Patch `0027` now floors the RDNA3 band at `MMVQ_MAX_BATCH_SIZE` (8) for both RDNA3_0 and
+> RDNA3_5, so the 16-wide band is RDNA4-only.  gfx1100: `MUL_MAT_ID` **929/929** (MMB on/off),
+> `width_purity=PASS`, MMB prefill +18 %/+17 % at pp2048/8192, QSA 26/26, GDN 46/46; `MMB_CFG` prints
+> `f32split=0 routed=1`.  The full gfx1151 four-gate re-validation must be re-run on `0daefe22` (it
+> was GREEN on `e00275ff`).
 
 > **2026-09-24 — RE-BASED onto `84e76d8a2`.**  The delivery baseline moved to upstream master
 > `84e76d8a2` (release `v16-84e76d8a2-r2`, delivery tree `ea7acf2d…`) and these 28 patches were

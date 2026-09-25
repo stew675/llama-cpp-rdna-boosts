@@ -15,14 +15,19 @@ numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
 > **Current baseline marker:** the current delivery baseline is **`84e76d8a2`** (2026-09-24),
-> the fork point of release **`v16-84e76d8a2-r2`** (canonical tip
-> `6d420c5257c822d1606f9a5982297524198fd021`, tree
-> `ea7acf2d3e18b0da01e00a3fcce0d770c430fa98`; r2 = the 2026-09-25 block-10 amendment that scopes the
-> wide-VDR MoE expert entry points to RDNA4/RDNA3_0 with one arch gate, so RDNA3_5 (gfx115x) uses the
-> dense VDR as the block-10 comment intended - the per-quant gate had let the Q4_K/Q6_K experts leak.
-> On top of r1 = the 2026-09-24 re-base onto upstream master
-> `84e76d8a2`, 149 upstream commits past `ebbb18522`, blocks 10/14/15 resolved manually - see
-> `WORKLOG.md`).  `baseline/ebbb18522` was the previous (2026-09-17) delivery baseline, last
+> the fork point of release **`v16-84e76d8a2-r3`** (canonical tip
+> `9d094a3c3a5013396596f862630a15ff24701b38`, tree
+> `08fe2b77c5f79d69225c11fc293d452f4503cffd`; r3 = the 2026-09-25 block-14 `hc_combine`
+> CPU-reference fix (issue #44: the CPU reference used `t*ne[1]`/`t*hc` row strides instead of the
+> tensors' own `nb[1]`, corrupting every multi-token fused ubatch on a CPU-resident qwen4exp layer -
+> now mirrors the CUDA kernel, bit-identical at nt == 1) plus the 28-patch `beta/mmb-general` re-base
+> onto r3 (applied tree `0daefe22…`) and its gfx1100 routed-band fix (the 16-wide `mul_mat_vec_q_moe`
+> band is now RDNA4-only - it failed `MUL_MAT_ID` 23/929 on RDNA3_0 and is a measured loss on
+> RDNA3_5).  On top of r2 = the 2026-09-25 block-10 amendment that scopes the wide-VDR MoE expert
+> entry points to RDNA4/RDNA3_0 with one arch gate, so RDNA3_5 (gfx115x) uses the dense VDR as the
+> block-10 comment intended - the per-quant gate had let the Q4_K/Q6_K experts leak.  On top of r1 =
+> the 2026-09-24 re-base onto upstream master `84e76d8a2`, 149 upstream commits past `ebbb18522`,
+> blocks 10/14/15 resolved manually - see `WORKLOG.md`).  `baseline/ebbb18522` was the previous (2026-09-17) delivery baseline, last
 > released as **`v16-ebbb18522-r13`** (canonical tip
 > `8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`, tree
 > `bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`; r13 = the 2026-09-22 block-00 amendment that gates the

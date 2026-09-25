@@ -14,7 +14,20 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release (2026-09-25) — `v16-84e76d8a2-r2`:** a block-10 amendment.  The wide-VDR MoE expert
+**Current release (2026-09-25) — `v16-84e76d8a2-r3`:** a block-14 amendment + beta re-base.  The
+qwen4exp CPU `hc_combine` reference (`ggml_compute_forward_hc_combine_f32`) indexed `block_out` with
+`t*ne[1]` and `inject` with `t*hc` instead of each tensor's own `nb[1]` row stride, so every
+multi-token fused ubatch read the wrong rows; a CPU-resident qwen4exp decoder layer then emitted EOS
+as its first generated token (issue #44, gfx1100).  The reference now mirrors the CUDA kernel's
+stride semantics (0 for a broadcast `ne[1] == 1`) and is bit-identical at nt == 1.  Validated with
+an op-level CPU-vs-HIP oracle (7/8 multi-token cases FAIL pre-fix, 8/8 PASS post-fix).  Strict 16/16
+`git am` on a fresh `84e76d8a2` tarball (applied tree `08fe2b77…`).  The 28-patch beta set is re-based
+onto r3 (applied tree `0daefe22…`), and beta patch 0027 now restricts the 16-wide routed
+`mul_mat_vec_q_moe` band to RDNA4 (RDNA3_0 failed `MUL_MAT_ID` 23/929, RDNA3_5 is a measured loss).
+Canonical tip `9d094a3c3a5013396596f862630a15ff24701b38`, tree
+`08fe2b77c5f79d69225c11fc293d452f4503cffd`.  Full record: `WORKLOG.md` (2026-09-25 r3).
+
+**Previous release (2026-09-25) — `v16-84e76d8a2-r2`:** a block-10 amendment.  The wide-VDR MoE expert
 entry points (`VDR_Q4_K/Q5_K/Q6_K_Q8_1_MMVQ_MOE` = 4/4/2) were unconditional while only the Q8_0 MoE
 VDR was arch-gated, so RDNA3_5 (gfx115x) - where the block-10 comment says it "keeps VDR=2 pending
 verification" - ran the Q4_K/Q6_K experts (the Q4_K_M expert types) with the wide chunk.

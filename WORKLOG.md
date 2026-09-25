@@ -1,5 +1,49 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-25 (r3) — `v16-84e76d8a2-r3`: the qwen4exp HC_COMBINE CPU-reference fix (block 14, issue #44) + beta re-base
+
+**Release** `v16-84e76d8a2-r3`, base `84e76d8a2` (tree `5112eedbce0548ab9547d883e8aa54e993852e94`),
+canonical block-15 tip `9d094a3c3a5013396596f862630a15ff24701b38`, net tree
+`08fe2b77c5f79d69225c11fc293d452f4503cffd`.  `scripts/validate-set.sh` green on a fresh `84e76d8a2`
+tarball (strict **16/16** `git am`).  Folded into block 14 (no new block), because it is the last block
+owned by the fused HC ops and no later block depends on the change.
+
+**The bug (issue #44).**  `ggml_compute_forward_hc_combine_f32` (the CPU reference for the fused
+qwen4exp hyper-connection residual combine) computed `block_out`'s row stride as `ne[1]` and indexed
+`inject` as `c + t*hc`.  But `build_hc_combine` hands `block_out` over as a contiguous `[n_embd, nt]`
+(so its row stride is `ne[0]`, not `nt`) and `inject` over as a strided **view** into the mix output
+whose row stride is `n_embd + hc`.  Every token `t >= 1` therefore read the wrong rows; `nt == 1` was
+accidentally correct.  A CPU-resident qwen4exp decoder layer (`-ngl` below the full decoder count, a
+short prompt -> the hybrid memory splits the prefill into `nt <= HC_FUSED_MAX_TOKENS = 8` ubatches)
+emitted EOS as its first generated token.  The reporter's root cause is exact: the CUDA kernel
+(`ggml_cuda_op_hc_combine`) was already stride-aware, the CPU reference was not.
+
+**The fix.**  The CPU reference now uses each tensor's own `nb[1]` row step, 0 for a broadcast
+`ne[1] == 1`, exactly mirroring the CUDA kernel.  `nt == 1` (decode) is bit-identical.
+
+**Validation (gfx1100).**  A standalone op-level oracle (`wip/issue-44-hc-combine-oracle/hctest.cpp`,
+links `ggml`/`ggml-cpu`/`ggml-hip`) builds `GGML_OP_HC_COMBINE` with the real layouts (`block_out`
+contiguous `[n_embd, nt]`, `inject` a view with row stride `n_embd+hc`), runs CPU and HIP, and
+compares both to a host reference: **pre-fix 7 of 8 cases FAIL on CPU (nt = 2/4/7 and the broadcast
+variants, up to 1.06 max abs diff) while HIP is exact; post-fix 8/8 PASS.**  The nt = 1 case passes
+both.  Delivery full rebuild (`~/bin/build-llama-rocm-714`) succeeds; `Qwen3.5-4B-Q8_0` coherence
+smoke clean.  No qwen4exp model is present on the gfx1100 box (the large Flash-Next does not fit one
+24 GB card), so the end-to-end model path was not runnable; the op oracle covers the exact defective
+arithmetic.
+
+**Beta re-base + gfx1100 routed-band fix.**  The 28 `beta/mmb-general` patches were re-based onto r3
+(`git am` strict **28/28** on a fresh delivery, applied tree **`0daefe22…`**, previously `e00275ff…`).
+The first gfx1100 beta-window run found a real regression in patch 0027: the extended 16-wide routed
+`mul_mat_vec_q_moe` band (`MMVQ_MOE_MAX_BATCH_SIZE`) was enabled on RDNA3_0 (the `0031` arch floor
+only split out RDNA3_5), and `test-backend-ops -o MUL_MAT_ID` failed **23/929** cases on gfx1100 (all
+`n = 16`, every routed type/K) - the campaign's own note had left gfx1100 "still open".  Patch 0027
+now floors the RDNA3 band at `MMVQ_MAX_BATCH_SIZE` (8) for both RDNA3_0 and RDNA3_5, so the 16-wide
+band is RDNA4-only; `MUL_MAT_ID` is **929/929** on gfx1100 (MMB on and off) and the width probe is
+`width_purity=PASS (worst maxdiff 0)`.  gfx1100 beta sanity: `MMB_CFG cc=0x1001100 … f32split=0
+routed=1`, MMB prefill **+18 % pp2048 / +17 % pp8192** (4B Q8_0), `FLASH_ATTN_QSA` 26/26,
+`GATED_DELTA_NET` 46/46.  The gfx1151 four-gate re-validation remains GREEN on r2 and must be re-run
+on r3.
+
 ## 2026-09-25 (r2) — `v16-84e76d8a2-r2`: the wide-VDR MoE expert leak fixed (block 10)
 
 **Release** `v16-84e76d8a2-r2`, base `84e76d8a2` (tree `5112eedbce0548ab9547d883e8aa54e993852e94`),

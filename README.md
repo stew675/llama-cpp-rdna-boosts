@@ -13,7 +13,7 @@ the whole set or pick the ones you want.  An optional, **opt-in beta set**
 (`beta/mmb-general/`, 28 patches) layers the `mmb` (bf16-WMMA weight GEMM)
 campaign on top — see the [Beta addendum](#beta-addendum-the-mmb-beta-set).
 That set is re-based onto this baseline and its `apply-beta.sh` tree assertion
-is updated (applied tree `e00275ff…`).
+is updated (applied tree `0daefe22…`).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -39,7 +39,8 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
 (the tag is the release identity: `v16-<fork-point>-r<N>`, e.g.
-**`v16-84e76d8a2-r2`**, where `r1` is the re-base, `r2` the block-10 MoE-VDR arch-scope fix, and each later release on the
+**`v16-84e76d8a2-r3`**, where `r1` is the re-base, `r2` the block-10 MoE-VDR arch-scope fix, `r3` the
+block-14 `hc_combine` CPU-reference fix (issue #44) + the beta re-base, and each later release on the
 same base increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
@@ -223,7 +224,7 @@ bash <path-to-this-repo>/scripts/apply-beta.sh .
 #   1. if the 16 delivery blocks are not applied yet, runs scripts/apply-all.sh first
 #      (creates branch `rdna-boosts`);
 #   2. applies beta/mmb-general/patches/*.patch (strict 28/28) on a new `mmb-beta` branch.
-#   result: applied tree e00275ffd011a7cadf7ebfda009d85ea1cb9b431
+#   result: applied tree 0daefe229e60bdb721034ee282959e8f15269365
 ```
 
 `scripts/apply-beta.sh` is **base-aware**: it detects an already-applied delivery (the current
@@ -371,8 +372,17 @@ for per-block verification and `BASELINE.md` for provenance.
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
-- Canonical 16-block chain: tip **`6d420c5257c822d1606f9a5982297524198fd021`**, net tree
-  **`ea7acf2d3e18b0da01e00a3fcce0d770c430fa98`**; release **`v16-84e76d8a2-r2`**.
+- Canonical 16-block chain: tip **`9d094a3c3a5013396596f862630a15ff24701b38`**, net tree
+  **`08fe2b77c5f79d69225c11fc293d452f4503cffd`**; release **`v16-84e76d8a2-r3`**.
+- **The qwen4exp CPU `hc_combine` reference is correct** (block 14, r3, 2026-09-25, issue #44):
+  `ggml_compute_forward_hc_combine_f32` read `block_out` with a `t*ne[1]` row stride and `inject`
+  with `t*hc`, but the model hands both over as multi-token tensors whose own `nb[1]` differs
+  (`block_out` is a contiguous `[n_embd, nt]`, `inject` a view into the mix output with row stride
+  `n_embd+hc`).  Every fused multi-token ubatch therefore read the wrong rows and a CPU-resident
+  qwen4exp decoder layer emitted EOS as its first generated token; nt == 1 was accidentally correct.
+  The reference now uses each tensor's own `nb[1]` (0 for a broadcast `ne[1] == 1`), mirroring the
+  CUDA kernel, and is bit-identical at nt == 1.  Validated with an op-level CPU-vs-HIP oracle that
+  fails 7/8 multi-token cases pre-fix and passes all 8 post-fix (gfx1100).
 - **The wide-VDR MoE expert path is RDNA4/RDNA3_0-only** (block 10, r2, 2026-09-25): the
   `VDR_Q4_K/Q5_K/Q6_K_Q8_1_MMVQ_MOE` entry points were unconditional while only Q8_0 was arch-gated,
   so RDNA3_5 (gfx115x) ran the Q4_K/Q6_K experts — the Q4_K_M expert types — with the wide chunk the

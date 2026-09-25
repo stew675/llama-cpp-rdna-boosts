@@ -3,9 +3,17 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**Current release: `v16-84e76d8a2-r2`** — canonical (rebased) tip
-`6d420c5257c822d1606f9a5982297524198fd021`, tree
-`ea7acf2d3e18b0da01e00a3fcce0d770c430fa98`.  Strict 16/16 `git am`; clean build.  **r2
+**Current release: `v16-84e76d8a2-r3`** — canonical (rebased) tip
+`9d094a3c3a5013396596f862630a15ff24701b38`, tree
+`08fe2b77c5f79d69225c11fc293d452f4503cffd`.  Strict 16/16 `git am`; clean build.  **r3
+(2026-09-25) is a block-14 amendment (issue #44) + beta re-base**: the qwen4exp CPU `hc_combine`
+reference used `t*ne[1]`/`t*hc` row strides instead of the tensors' own `nb[1]`, so every multi-token
+fused ubatch read the wrong rows and a CPU-resident qwen4exp layer emitted EOS as its first token
+(nt == 1 was accidentally correct); the reference now mirrors the CUDA kernel and is bit-identical at
+nt == 1.  Op-level CPU-vs-HIP oracle: 7/8 multi-token cases FAIL pre-fix, 8/8 PASS post-fix.  The
+28-patch `beta/mmb-general` set is re-based onto r3 (applied tree `0daefe22…`) and patch 0027 now
+restricts the 16-wide routed `mul_mat_vec_q_moe` band to RDNA4 (gfx1100 failed `MUL_MAT_ID` 23/929;
+gfx1151 it is a measured loss).  See `WORKLOG.md` (2026-09-25 r3).  **r2
 (2026-09-25) is a block-10 amendment**: the wide-VDR `mul_mat_vec_q_moe` entry points
 (`VDR_Q4_K/Q5_K/Q6_K_Q8_1_MMVQ_MOE`) were unconditional while only Q8_0 was arch-gated, so RDNA3_5
 (gfx115x) ran the Q4_K/Q6_K experts - the Q4_K_M expert types - with the wide chunk the block-10

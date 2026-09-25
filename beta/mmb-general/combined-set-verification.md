@@ -14,6 +14,14 @@
 > **tree-identical** to the combined `gap-closing-denseband` tree, so the gfx1201 cross-arch results
 > below carry over unchanged.  The r12-era `bca69f23dd…` hash above is the pre-consolidation set.
 >
+> **2026-09-25 (r3) — re-based onto `v16-84e76d8a2-r3` + gfx1100 routed-band fix.**  The delivery
+> moved to r3 (tree `08fe2b77…`, the block-14 `hc_combine` CPU-reference fix) and the 28-patch set was
+> re-based onto it (applied tree **`0daefe22…`**, strict 28/28).  The first gfx1100 run found that
+> patch `0027`'s 16-wide routed `mul_mat_vec_q_moe` band was enabled on RDNA3_0 (the `0031` arch floor
+> only split out RDNA3_5); `test-backend-ops -o MUL_MAT_ID` failed **23/929** on gfx1100.  Patch `0027`
+> now floors the RDNA3 band at `MMVQ_MAX_BATCH_SIZE` (8) for both RDNA3_0 and RDNA3_5, so the 16-wide
+> band is RDNA4-only.  Re-measure the r3 tree before quoting numbers.
+>
 > **2026-09-24 — re-based onto `84e76d8a2`.**  The delivery baseline moved to upstream master
 > `84e76d8a2` (release `v16-84e76d8a2-r2`); the 28-patch set was re-based onto it and its applied
 > tree is now **`e00275ff…`** (previously `468c6496…` on r13).  Only patches `0014`/`0015` needed a
