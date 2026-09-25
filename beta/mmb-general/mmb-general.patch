@@ -6381,10 +6381,10 @@ index 000000000..d4dd67707
 +void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
 +void ggml_cuda_mmb_release_all();
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 7a81c9825..c70c31d44 100644
+index 131934112..df8d6320f 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -294,12 +294,18 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
+@@ -310,12 +310,18 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
  // 1-token decode and an (n_draft + 1)-token speculative verify batch of the same MoE matmul to be
  // bit-identical, and MUL_MAT_ID mmvq (mul_mat_vec_q_moe, one warp per token) and MMQ reduce in
  // different orders, so no cap may split the band.  The cap still applies above the band.
@@ -6406,7 +6406,7 @@ index 7a81c9825..c70c31d44 100644
      // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
      if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
          if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-@@ -314,24 +320,34 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+@@ -330,24 +336,34 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
      // AMD
      if (GGML_CUDA_CC_IS_AMD(cc)) {
          if (GGML_CUDA_CC_IS_RDNA4(cc)) {
@@ -6446,7 +6446,7 @@ index 7a81c9825..c70c31d44 100644
  bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
      if (!ggml_is_quantized(type)) {
          return false;
-@@ -448,15 +464,17 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+@@ -464,15 +480,17 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
  template <ggml_type type>
  static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
  #if defined(RDNA4)
@@ -6469,7 +6469,7 @@ index 7a81c9825..c70c31d44 100644
  #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == GGML_CUDA_CC_VOLTA || __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE)
      return MMVQ_MAX_BATCH_SIZE;
  #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
-@@ -1227,7 +1245,7 @@ static __global__ void mul_mat_vec_q_ksplit(
+@@ -1243,7 +1261,7 @@ static __global__ void mul_mat_vec_q_ksplit(
  // mul_mat_vec_q_switch_ncols_dst), so its launch bound must cover the band rather than the per-type
  // cap -- otherwise a launch with ncols_dst > cap fails outright.
  template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
@@ -6478,7 +6478,7 @@ index 7a81c9825..c70c31d44 100644
  static __global__ void mul_mat_vec_q_moe(
          const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
          float * dst_ptr,
-@@ -1520,7 +1538,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1536,7 +1554,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
          const int ids_stride, cudaStream_t stream) {
  
      GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
@@ -6489,7 +6489,7 @@ index 7a81c9825..c70c31d44 100644
  
      const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
      const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
-@@ -1617,7 +1637,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1633,7 +1653,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
      }
  
      switch (ncols_dst) {
@@ -6499,7 +6499,7 @@ index 7a81c9825..c70c31d44 100644
              // dispatch per ncols with a compile-time tag
              const auto dispatch = [&](auto ncols_tag) {
                  constexpr int c_ncols_dst = decltype(ncols_tag)::value;
-@@ -1793,6 +1814,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1809,6 +1830,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
              // item-split accumulator layout is register-bound at ncols_dst > 1.
              launch_ksplit(std::integral_constant<int, 8>{});
          } break;
@@ -6517,7 +6517,7 @@ index 7a81c9825..c70c31d44 100644
                  default: GGML_ABORT("fatal error"); break;
              }
          } break;
-@@ -1974,7 +2006,9 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1990,7 +2022,9 @@ void ggml_cuda_mul_mat_vec_q(
      GGML_ASSERT(        nb0        == ts_dst);
      GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
  

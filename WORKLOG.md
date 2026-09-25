@@ -1,5 +1,35 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-25 (r2) — `v16-84e76d8a2-r2`: the wide-VDR MoE expert leak fixed (block 10)
+
+**Release** `v16-84e76d8a2-r2`, base `84e76d8a2` (tree `5112eedbce0548ab9547d883e8aa54e993852e94`),
+canonical block-15 tip `6d420c5257c822d1606f9a5982297524198fd021`, net tree
+`ea7acf2d3e18b0da01e00a3fcce0d770c430fa98`.  `scripts/validate-set.sh` green on a fresh `84e76d8a2`
+tarball (strict **16/16** `git am`).
+
+**The bug.**  The 2026-09-25 beta-window re-validation (`beta/mmb-general/BETA-TESTING.md` §8)
+measured the base-16 MoE `draft-mtp n3` acceptance at 0.73967 vs upstream's 0.78844 and attributed it
+to a MoE reduction-order "accepted trade".  That was premature.  The cause was concrete: in block 10,
+`VDR_Q4_K/Q5_K/Q6_K_Q8_1_MMVQ_MOE` were unconditional (4/4/2) while **only the Q8_0** MoE VDR carried
+the `#if defined(RDNA4) || defined(RDNA3_0)` gate, whose comment says RDNA3_5 (gfx115x) "keeps VDR=2
+pending verification".  On gfx1151 the Q4_K/Q6_K experts (the Q4_K_M expert types) therefore ran the
+wide VDR=4 chunk the comment reserved for RDNA4/RDNA3_0, and the fused-MoE kill-switches / beta mmvq
+bands could not see it because they do not touch `mul_mat_vec_q_moe`'s compile-time `vec_dot`/`vdr`.
+
+**The fix.**  `get_vec_dot_q_cuda()` and `get_vdr_mmvq()` now ignore `moe` on every target that is not
+RDNA4/RDNA3_0 - one gate (`GGML_CUDA_MMVQ_MOE_DENSE`) for the whole MoE expert selection, instead of a
+per-quant gate (the per-quant style is exactly how the Q4_K/Q6_K arms leaked; the now-redundant Q8_0
+macro gate is removed).  The `_MOE` macros keep their measured 4/4/2; only *reachability* is gated, so
+RDNA4/RDNA3_0 keep the wide chunk.  Block 10 amended; blocks 11-15 replayed.
+
+**Validation (gfx1151).**  Base-16 MoE `draft-mtp n3` **0.73967 -> 0.76484** (halves the gap to
+upstream) and decode **87.5 -> 89.1 t/s**; dense 27B / qwen4exp unchanged; MoE `width_purity=PASS`;
+`MUL_MAT_ID` **929/929**; `FLASH_ATTN_EXT` **5956/5956**.  **Beta re-port:** the 28 patches re-based
+onto the fixed base (`git rebase --onto`, no conflicts; applied tree **`e00275ff…`**) and re-validated -
+Gate 1 (dense/MoE/qwen4exp `none == draft-mtp n3` + `width_purity=PASS`), Gate 2 (dense +29/+25/+22 %,
+MoE +26/+24/+19 %), Gate 3 (all oracles incl. `MUL_MAT_ID` 929/929), Gate 4 (dense 0.82188, MoE
+0.75225, qwen4exp 0.82151, shared 0.82356).  Full record: `beta/mmb-general/BETA-TESTING.md` §9.
+
 ## 2026-09-25 — full gfx1151 beta-window re-validation + the `0027` `MUL_MAT_ID` fix + the MoE MTP gap root-caused
 
 **Scope.** The `beta/mmb-general` 28-patch set re-based on `84e76d8a2` (tree `7f339b10`, delivery

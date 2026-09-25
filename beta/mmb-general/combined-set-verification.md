@@ -15,11 +15,11 @@
 > below carry over unchanged.  The r12-era `bca69f23dd…` hash above is the pre-consolidation set.
 >
 > **2026-09-24 — re-based onto `84e76d8a2`.**  The delivery baseline moved to upstream master
-> `84e76d8a2` (release `v16-84e76d8a2-r1`); the 28-patch set was re-based onto it and its applied
-> tree is now **`7f339b10…`** (previously `468c6496…` on r13).  Only patches `0014`/`0015` needed a
+> `84e76d8a2` (release `v16-84e76d8a2-r2`); the 28-patch set was re-based onto it and its applied
+> tree is now **`e00275ff…`** (previously `468c6496…` on r13).  Only patches `0014`/`0015` needed a
 > conflict resolution (upstream's restructured `ggml_backend_cuda_graph_optimize` loop).  The
 > gfx1201/gfx1100 cross-arch results below were measured on the r13-based tree; they carry over as
-> behaviour claims, but re-measure on `7f339b10` before quoting numbers.
+> behaviour claims, but re-measure on `e00275ff` before quoting numbers.
 
 One branch now carries all three architectures.  This file records the merge and the **cross-arch
 verification** that the gfx1100 overlay does not disturb gfx1201 (or gfx1151).

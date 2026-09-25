@@ -30,7 +30,7 @@ PATCHES="$RDNA/patches"
 BETA_PATCHES="$RDNA/beta/mmb-general/patches"
 
 BETA_BRANCH="${RDNA_BETA_BRANCH:-mmb-beta}"
-BETA_TREE="${RDNA_BETA_TREE-7f339b10fdde414700cbc6e82acb103d2ad24da8}"
+BETA_TREE="${RDNA_BETA_TREE-e00275ffd011a7cadf7ebfda009d85ea1cb9b431}"
 
 RELEASE_JSON="$RDNA/release.json"
 RELEASE_TREE=""

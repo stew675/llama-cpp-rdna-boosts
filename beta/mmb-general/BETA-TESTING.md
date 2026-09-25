@@ -37,16 +37,16 @@ per-arch table or arch-neutral.  Re-validating confirms that reasoning.
 ```sh
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 84e76d8a2                                   # the fork point
-bash <repo>/scripts/apply-beta.sh . <repo>               # apply-all + 28/28, tree 7f339b10...
-git rev-parse HEAD^{tree}                                # expect 7f339b10fdde414700cbc6e82acb103d2ad24da8
+bash <repo>/scripts/apply-beta.sh . <repo>               # apply-all + 28/28, tree e00275ff...
+git rev-parse HEAD^{tree}                                # expect e00275ffd011a7cadf7ebfda009d85ea1cb9b431
 ```
 
-Re-based 2026-09-24 onto upstream master `84e76d8a2` (release `v16-84e76d8a2-r1`); the previous r13
-tree was `468c6496…`.  Verified strict `git am` **28/28** on a fresh `84e76d8a2` worktree with the
-delivery set applied first (delivery tree `336d0f43…`), producing `7f339b10…`; only `0014` (GDN/PLE
-conv1d) and `0015` (narrow-row RMS norm) needed a conflict resolution (upstream's restructured
-`ggml_backend_cuda_graph_optimize` loop).  Build with the usual gfx1151 script; the runtime env is
-`export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH`.
+Re-based 2026-09-24 onto upstream master `84e76d8a2` (delivery release `v16-84e76d8a2-r2`); the
+previous r13 tree was `468c6496…`.  Verified strict `git am` **28/28** on a fresh `84e76d8a2`
+worktree with the delivery set applied first (delivery tree `ea7acf2d…`), producing `e00275ff…`; only
+`0014` (GDN/PLE conv1d) and `0015` (narrow-row RMS norm) needed a conflict resolution (upstream's
+restructured `ggml_backend_cuda_graph_optimize` loop).  Build with the usual gfx1151 script; the
+runtime env is `export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH`.
 
 `GGML_CUDA_MMB_CFG=1` prints the resolved per-arch config once — gfx1151 should read
 `cc=0x1001151 dense_geom=0 min_t=512 glu_thresh=32 routed_thresh=32 tall=2 tiny_m=1/1
@@ -370,3 +370,48 @@ MTP ≥ plain, not cross-build equality).  The ~4 % acceptance / ~3 % MTP-throug
 +48–62 % MoE prefill and ~+4 % decode; acceptance stays well above the bar and MTP ≥ plain on every cell.
 Pinning the exact kernel would need a delivery block bisect (build base-16 minus block 10 / 13), which
 was not warranted for a known-trade result.
+
+---
+
+## 9. 2026-09-25 — delivery `r2`: the wide-VDR MoE expert leak (found and fixed)
+
+§8 concluded the base-16 MoE MTP-acceptance gap was "accepted trade, no code change".  That conclusion
+was **wrong**: the residual was a concrete arch-scope bug, found on the follow-up.
+
+**Root cause.**  `VDR_Q4_K/Q5_K/Q6_K_Q8_1_MMVQ_MOE` were defined unconditionally (4/4/2) while only
+the **Q8_0** MoE VDR was arch-gated, and the Q8_0 comment literally says *"RDNA3_5 (gfx115x) keeps
+VDR=2 pending verification on those GPUs."*  So on gfx1151 the Q4_K/Q6_K experts (exactly the Q4_K_M
+expert types) ran the wide VDR=4 chunk that block 10 had scoped to RDNA4/RDNA3_0.  §8's per-switch
+A/B could not see it because neither the fused-MoE kill-switches nor the beta mmvq bands touch
+`mul_mat_vec_q_moe`'s compile-time `vec_dot`/`vdr`.
+
+**Fix (one gate, block 10).**  `get_vec_dot_q_cuda()` and `get_vdr_mmvq()` now ignore the `moe`
+argument on every target that is not RDNA4/RDNA3_0 (`#if !(defined(RDNA4) || defined(RDNA3_0)) moe =
+false;`), so the whole MoE expert selection is arch-scoped in one place instead of per quant - the
+per-quant style is exactly how the Q4_K/Q6_K arms leaked.  The `_MOE` macros keep their measured 4/4/2
+(RDNA4/RDNA3_0 keep the wide chunk); only the *reachability* is gated.
+
+**Base-16 result (gfx1151, the same Protocol A as §8).**  MoE `draft-mtp n3` acceptance **0.73967 ->
+0.76484** (halves the gap to upstream's 0.78844) and decode **87.5 -> 89.1 t/s**; dense 27B 0.82188 and
+qwen4exp 0.82151 unchanged (their experts are not Q4_K/Q5_K/Q6_K); MoE `width_purity=PASS` (worst
+maxdiff 0); `MUL_MAT_ID` **929/929**, `FLASH_ATTN_EXT` **5956/5956**.  `scripts/validate-set.sh` green on
+a fresh `84e76d8a2` tarball (strict 16/16, applied tree `ea7acf2d…`); release **`v16-84e76d8a2-r2`**.
+
+**Beta re-port.**  The 28 beta patches re-based onto the fixed base (`git rebase --onto`, no conflicts;
+patch `0027` touches `mmvq.cu` in a different region) -> applied tree **`e00275ff…`**; `apply-beta.sh`
+strict 16/16 + 28/28 on a fresh worktree.  Full re-validation:
+
+| gate | result |
+|---|---|
+| Gate 1 | dense `90686d1edf24` (unchanged), MoE `904bfc375b2e`, qwen4exp `b746fb3e77ff` - all `none == draft-mtp n3`; `width_purity=PASS` on all three |
+| Gate 2 | dense pp2048/8192/32768 +29/+25/+22 %; MoE +26/+24/+19 % |
+| Gate 3 | `FLASH_ATTN_EXT` 5956/5956, `MUL_MAT_ID` 929/929, `FLASH_ATTN_QSA` 26/26, `GATED_DELTA_NET` 46/46, `LIGHTNING_INDEXER` 225/225, `INDEXER_TOPK` 0/0; `MMB_CFG cc=0x1001151 dense_geom=0 … routed=1` |
+| Gate 4 | reference command: dense 0.82188, MoE 0.75225, qwen4exp 0.82151, shared 0.82356 - all > 0.45, MTP ≥ plain |
+
+The beta MoE acceptance (0.75225) moves with the target's decode numerics (acceptance is a chaotic
+function of the continuation), so it is not a quality signal; what matters is the base-16 fix itself,
+which is now upstream-aligned.
+
+**Note for the next reader.**  The §8 gap was real and had a one-line cause; "accepted trade" was
+premature.  The lesson is the one the delivery keeps relearning: **a wide-VDR/perf override must be
+arch-scoped at the selector, not per quant** - the Q8_0-only gate was the tell.

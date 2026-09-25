@@ -14,7 +14,18 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release (2026-09-24) — `v16-84e76d8a2-r1`:** the re-base of the 16-block set onto upstream
+**Current release (2026-09-25) — `v16-84e76d8a2-r2`:** a block-10 amendment.  The wide-VDR MoE expert
+entry points (`VDR_Q4_K/Q5_K/Q6_K_Q8_1_MMVQ_MOE` = 4/4/2) were unconditional while only the Q8_0 MoE
+VDR was arch-gated, so RDNA3_5 (gfx115x) - where the block-10 comment says it "keeps VDR=2 pending
+verification" - ran the Q4_K/Q6_K experts (the Q4_K_M expert types) with the wide chunk.
+`get_vec_dot_q_cuda()`/`get_vdr_mmvq()` now ignore `moe` on every target that is not RDNA4/RDNA3_0,
+one gate for both selectors; RDNA4/RDNA3_0 keep the measured VDR=4.  Base-16 MoE `draft-mtp n3`
+acceptance 0.73967 -> 0.76484 and 87.5 -> 89.6 t/s; dense/qwen4exp unchanged; `width_purity=PASS`,
+`MUL_MAT_ID` 929/929, `FLASH_ATTN_EXT` 5956/5956.  Strict 16/16 `git am` on a fresh `84e76d8a2`
+tarball.  Canonical tip `6d420c5257c822d1606f9a5982297524198fd021`, tree
+`ea7acf2d3e18b0da01e00a3fcce0d770c430fa98`.  Full record: `WORKLOG.md` (2026-09-25 r2).
+
+**Previous release (2026-09-24) — `v16-84e76d8a2-r1`:** the re-base of the 16-block set onto upstream
 master `84e76d8a2`, 149 commits past the previous `ebbb18522` base.  Blocks 00-09 replayed without
 textual conflict; blocks 10/14/15 were resolved manually (the MoE-test-matrix union; upstream's
 allocator reserve-failure check inside our reserve probe; upstream's unified MoE + `topk_moe`

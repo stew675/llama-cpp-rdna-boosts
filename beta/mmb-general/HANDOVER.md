@@ -7,7 +7,7 @@ sections after it are the dated history (newest first).  `README.md` is the runn
 `BF16-PRODUCER-PORT.md` the producer-port reference map.
 
 > **2026-09-24 re-base:** the beta set is now re-based onto upstream master `84e76d8a2` (delivery
-> `v16-84e76d8a2-r1`), applied tree `7f339b10…`; see `README.md` and `BETA-TESTING.md`.  The r12/r13
+> `v16-84e76d8a2-r2`), applied tree `e00275ff…`; see `README.md` and `BETA-TESTING.md`.  The r12/r13
 > hashes in this handoff are the historical record.
 
 > **2026-09-25 — the set is now consolidated and r13-based.**  The `closing-the-gap` campaign was

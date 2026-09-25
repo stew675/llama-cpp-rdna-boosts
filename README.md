@@ -13,7 +13,7 @@ the whole set or pick the ones you want.  An optional, **opt-in beta set**
 (`beta/mmb-general/`, 28 patches) layers the `mmb` (bf16-WMMA weight GEMM)
 campaign on top — see the [Beta addendum](#beta-addendum-the-mmb-beta-set).
 That set is re-based onto this baseline and its `apply-beta.sh` tree assertion
-is updated (applied tree `7f339b10…`).
+is updated (applied tree `e00275ff…`).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -39,7 +39,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
 (the tag is the release identity: `v16-<fork-point>-r<N>`, e.g.
-**`v16-84e76d8a2-r1`**, where `r1` is the re-base and each later release on the
+**`v16-84e76d8a2-r2`**, where `r1` is the re-base, `r2` the block-10 MoE-VDR arch-scope fix, and each later release on the
 same base increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
@@ -223,7 +223,7 @@ bash <path-to-this-repo>/scripts/apply-beta.sh .
 #   1. if the 16 delivery blocks are not applied yet, runs scripts/apply-all.sh first
 #      (creates branch `rdna-boosts`);
 #   2. applies beta/mmb-general/patches/*.patch (strict 28/28) on a new `mmb-beta` branch.
-#   result: applied tree 7f339b10fdde414700cbc6e82acb103d2ad24da8
+#   result: applied tree e00275ffd011a7cadf7ebfda009d85ea1cb9b431
 ```
 
 `scripts/apply-beta.sh` is **base-aware**: it detects an already-applied delivery (the current
@@ -371,8 +371,13 @@ for per-block verification and `BASELINE.md` for provenance.
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
-- Canonical 16-block chain: tip **`ad858dee1057da63b8d81b883675de82ba60b2d9`**, net tree
-  **`336d0f4318002409ed8ad5b04ae5bf344238c8ca`**; release **`v16-84e76d8a2-r1`**.
+- Canonical 16-block chain: tip **`6d420c5257c822d1606f9a5982297524198fd021`**, net tree
+  **`ea7acf2d3e18b0da01e00a3fcce0d770c430fa98`**; release **`v16-84e76d8a2-r2`**.
+- **The wide-VDR MoE expert path is RDNA4/RDNA3_0-only** (block 10, r2, 2026-09-25): the
+  `VDR_Q4_K/Q5_K/Q6_K_Q8_1_MMVQ_MOE` entry points were unconditional while only Q8_0 was arch-gated,
+  so RDNA3_5 (gfx115x) ran the Q4_K/Q6_K experts — the Q4_K_M expert types — with the wide chunk the
+  block-10 comment reserved for RDNA4/RDNA3_0.  `get_vec_dot_q_cuda()`/`get_vdr_mmvq()` now ignore
+  `moe` on every other target in one place; base-16 MoE `draft-mtp n3` 0.73967 → 0.76484, 87.5 → 89.6 t/s.
 - **Shared-NextN MTP heads are usable** (block 00, r13, 2026-09-22): a head with
   `nextn_shared_target_tensors` (no `token_embd`/`output` of its own, e.g. the qwen4exp
   `mtp-…-shared-Q8_0.gguf` sidecar) died every draft round on the M-RoPE `X < Y` check because the

@@ -3,9 +3,15 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**Current release: `v16-84e76d8a2-r1`** — canonical (rebased) tip
-`ad858dee1057da63b8d81b883675de82ba60b2d9`, tree
-`336d0f4318002409ed8ad5b04ae5bf344238c8ca`.  Strict 16/16 `git am`; clean build.  **r1
+**Current release: `v16-84e76d8a2-r2`** — canonical (rebased) tip
+`6d420c5257c822d1606f9a5982297524198fd021`, tree
+`ea7acf2d3e18b0da01e00a3fcce0d770c430fa98`.  Strict 16/16 `git am`; clean build.  **r2
+(2026-09-25) is a block-10 amendment**: the wide-VDR `mul_mat_vec_q_moe` entry points
+(`VDR_Q4_K/Q5_K/Q6_K_Q8_1_MMVQ_MOE`) were unconditional while only Q8_0 was arch-gated, so RDNA3_5
+(gfx115x) ran the Q4_K/Q6_K experts - the Q4_K_M expert types - with the wide chunk the block-10
+comment reserved for RDNA4/RDNA3_0.  `get_vec_dot_q_cuda()`/`get_vdr_mmvq()` now ignore `moe` on every
+other target, in one gate.  Base-16 MoE `draft-mtp n3` 0.73967 -> 0.76484, 87.5 -> 89.6 t/s; dense and
+qwen4exp unchanged; width purity and all oracles green.  **r1
 (2026-09-24) is the re-base onto upstream master `84e76d8a2`** (149 upstream commits); blocks 00-09
 replayed without textual conflict and blocks 10/14/15 were resolved manually, preserving every block's
 work while folding in the upstream rewrites (the MoE-test-matrix union; the allocator reserve-failure

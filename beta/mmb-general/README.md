@@ -1,9 +1,10 @@
 # `beta/mmb-general` — the `mmb` (bf16-WMMA dequant weight GEMM) campaign, in beta
 
 **Status: BETA (promoted from `wip/mmb-general` on 2026-09-21; consolidated with the `closing-the-gap`
-campaign on 2026-09-25; re-based onto upstream master `84e76d8a2` on 2026-09-24).  Not part of the
+campaign on 2026-09-25; re-based onto upstream master `84e76d8a2` on 2026-09-24, re-ported on delivery
+r2 (2026-09-25)).  Not part of the
 delivery.**  This is the beta patch set: **28 patches**, verified `git am` **28/28** from the delivery
-tree, applied tree **`7f339b10fdde414700cbc6e82acb103d2ad24da8`** on the current baseline `84e76d8a2`
+tree, applied tree **`e00275ffd011a7cadf7ebfda009d85ea1cb9b431`** on the current baseline `84e76d8a2`
 (2026-09-24 re-base; previously r13 `bb7b6d07…` → `468c6496…`).  It is staged for the ~4–5 day beta
 window, after which the maintainer decides whether it becomes a delivery block (the `AGENTS.md`
 promotion rule).
@@ -17,8 +18,8 @@ promotion rule).
 > SESSION" brief is the self-contained handoff.  This file is the running (dated) record.
 
 > **2026-09-24 — RE-BASED onto `84e76d8a2`.**  The delivery baseline moved to upstream master
-> `84e76d8a2` (release `v16-84e76d8a2-r1`, delivery tree `336d0f43…`) and these 28 patches were
-> re-based onto it (applied tree `7f339b10…`, `apply-beta.sh` assertion updated, strict 28/28 on a
+> `84e76d8a2` (release `v16-84e76d8a2-r2`, delivery tree `ea7acf2d…`) and these 28 patches were
+> re-based onto it (applied tree `e00275ff…`, `apply-beta.sh` assertion updated, strict 28/28 on a
 > fresh worktree).  Only two patches needed conflict resolution (`0014` GDN/PLE conv1d and `0015`
 > narrow-row RMS norm): upstream's restructured `ggml_backend_cuda_graph_optimize` loop dropped the
 > old early `if (op != GGML_MUL) continue;`, so each fusion's alloc-dep block is now inserted at the
@@ -26,7 +27,7 @@ promotion rule).
 > oracles, width probes, MTP acceptance 0.80).  A one-line guard was also folded into patch `0027`
 > (`ggml_is_quantized(src0->type)` on the gfx1151 dense-band force), fixing a full `MUL_MAT_ID` oracle
 > abort on non-quantized weights (`type_a=f32`); the oracle is now **929/929** — see `BETA-TESTING.md` §7.
-> The **full four-gate gfx1151 beta-window re-validation is now GREEN** on `7f339b10` (Gate 1:
+> The **full four-gate gfx1151 beta-window re-validation is now GREEN** on `e00275ff` (Gate 1:
 > `plain == draft-mtp n3` byte-identical on dense/MoE/qwen4exp + `width_purity=PASS`; Gate 2: MMB
 > +19–29 % prefill; Gate 3: all oracles incl. `MUL_MAT_ID` 929/929; Gate 4: acceptance 0.75–0.84, MTP
 > ≥ plain; recurrent rollback `max diff 0`) — see `BETA-TESTING.md` §8, including the MoE MTP-acceptance

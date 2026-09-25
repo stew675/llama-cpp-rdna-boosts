@@ -15,9 +15,12 @@ numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
 > **Current baseline marker:** the current delivery baseline is **`84e76d8a2`** (2026-09-24),
-> the fork point of release **`v16-84e76d8a2-r1`** (canonical tip
-> `ad858dee1057da63b8d81b883675de82ba60b2d9`, tree
-> `336d0f4318002409ed8ad5b04ae5bf344238c8ca`; r1 = the 2026-09-24 re-base onto upstream master
+> the fork point of release **`v16-84e76d8a2-r2`** (canonical tip
+> `6d420c5257c822d1606f9a5982297524198fd021`, tree
+> `ea7acf2d3e18b0da01e00a3fcce0d770c430fa98`; r2 = the 2026-09-25 block-10 amendment that scopes the
+> wide-VDR MoE expert entry points to RDNA4/RDNA3_0 with one arch gate, so RDNA3_5 (gfx115x) uses the
+> dense VDR as the block-10 comment intended - the per-quant gate had let the Q4_K/Q6_K experts leak.
+> On top of r1 = the 2026-09-24 re-base onto upstream master
 > `84e76d8a2`, 149 upstream commits past `ebbb18522`, blocks 10/14/15 resolved manually - see
 > `WORKLOG.md`).  `baseline/ebbb18522` was the previous (2026-09-17) delivery baseline, last
 > released as **`v16-ebbb18522-r13`** (canonical tip
