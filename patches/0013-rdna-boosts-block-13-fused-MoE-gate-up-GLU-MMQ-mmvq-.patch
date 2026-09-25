@@ -1,4 +1,4 @@
-From 444bb9c39283065cd937407d1d664023249ca62b Mon Sep 17 00:00:00 2001
+From 6a4a81e77abb26b640bb0e76e18d4113d5341bbe Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Tue, 1 Sep 2026 06:50:35 -0500
 Subject: [PATCH 13/15] rdna-boosts: block 13: fused MoE gate+up+GLU MMQ + mmvq
@@ -68,10 +68,10 @@ gate case line (re-running the generator is now idempotent).  Build-time only.
  17 files changed, 1904 insertions(+), 294 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index cbeed32e9..6fddddb82 100644
+index 96db36bd8..89dae0d03 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -813,6 +813,24 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
+@@ -814,6 +814,24 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
      ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
  
      ggml_cuda_set_device(ctx->device);
@@ -96,7 +96,7 @@ index cbeed32e9..6fddddb82 100644
      CUDA_CHECK(cudaMemcpy2DAsync(
          (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
      CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
-@@ -2182,6 +2200,24 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+@@ -2183,6 +2201,24 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
      return true;
  }
  
@@ -121,7 +121,7 @@ index cbeed32e9..6fddddb82 100644
  static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
      ggml_tensor *       src0 = tensor->src[0];
      ggml_tensor *       src1 = tensor->src[1];
-@@ -3993,6 +4029,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3997,6 +4033,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 0;
      }
  
@@ -133,7 +133,7 @@ index cbeed32e9..6fddddb82 100644
      ggml_tensor * node = cgraph->nodes[i];
  
      if (node->op == GGML_OP_MUL) {
-@@ -4032,8 +4073,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4036,8 +4077,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  if (!consumes_mul) {
                      continue;
                  }
@@ -151,7 +151,7 @@ index cbeed32e9..6fddddb82 100644
                      ggml_cuda_op_rms_norm_q8_1(*cuda_ctx, node, mul);
                      return 1;
                  }
-@@ -4055,6 +4104,44 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4059,6 +4108,44 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -196,7 +196,7 @@ index cbeed32e9..6fddddb82 100644
      //topk-moe
      if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
              cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
-@@ -4423,7 +4510,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4428,7 +4515,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  fusion_data.glu_op     = ggml_get_glu_op(glu);
                  fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
  
@@ -205,7 +205,7 @@ index cbeed32e9..6fddddb82 100644
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                      fused_mul_mat_vec = true;
                      fused_node_count  = n_ops;
-@@ -4517,7 +4604,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4522,7 +4609,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  fusion_data.glu_op     = ggml_get_glu_op(glu);
                  fusion_data.glu_limit  = ggml_get_op_params_f32(glu, 3);
  
@@ -214,7 +214,7 @@ index cbeed32e9..6fddddb82 100644
                      ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                      fused_mul_mat_vec = true;
                      fused_node_count  = n_ops;
-@@ -4566,7 +4653,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4571,7 +4658,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              const ggml_tensor * src1 = up_n->src[1];
              const ggml_tensor * ids  = up_n->src[2];
  
@@ -223,7 +223,7 @@ index cbeed32e9..6fddddb82 100644
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate_n->src[0];
                  fusion_data.x_bias    = up_bias_tensor;
-@@ -4580,7 +4667,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4585,7 +4672,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  break;
              }
  
@@ -232,7 +232,7 @@ index cbeed32e9..6fddddb82 100644
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate_n->src[0];
                  fusion_data.x_bias    = up_bias_tensor;
-@@ -4609,7 +4696,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4614,7 +4701,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              const ggml_tensor * src1 = up->src[1];
              const ggml_tensor * ids  = up->src[2];
  
@@ -241,7 +241,7 @@ index cbeed32e9..6fddddb82 100644
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate->src[0];
                  fusion_data.glu_op    = ggml_get_glu_op(glu);
-@@ -4621,7 +4708,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4626,7 +4713,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  break;
              }
  
@@ -250,7 +250,7 @@ index cbeed32e9..6fddddb82 100644
                  ggml_cuda_mm_fusion_args_host fusion_data{};
                  fusion_data.gate      = gate->src[0];
                  fusion_data.glu_op    = ggml_get_glu_op(glu);
-@@ -4632,6 +4719,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4637,6 +4724,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  fused_node_count  = 3;
                  break;
              }
@@ -288,7 +288,7 @@ index cbeed32e9..6fddddb82 100644
          }
      }
  
-@@ -4768,6 +4886,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4773,6 +4891,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          ggml_tensor * mul_node = cgraph->nodes[i + 1];
  
          const int out_nodes[] = { i + 1 };
@@ -297,7 +297,7 @@ index cbeed32e9..6fddddb82 100644
          if (mul_node->op == GGML_OP_MUL &&
                  mul_node->src[0] == mm_node &&
                  (mm_node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
-@@ -4776,12 +4896,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4781,12 +4901,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
              const ggml_tensor * weights = mul_node->src[1];
              if (weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights) &&
                      weights->ne[0] == 1 && weights->ne[1] == mm_node->ne[1] &&
@@ -311,7 +311,7 @@ index cbeed32e9..6fddddb82 100644
                  ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
                  return 1;
              }
-@@ -4884,7 +5004,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4889,7 +5009,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
      // Shared-expert output chain: down projection + gate + gating + residual
      // adds. dst = down(swiglu) * sigmoid(gate(x)) + moe_out + ffn_residual.
@@ -333,7 +333,7 @@ index cbeed32e9..6fddddb82 100644
          const ggml_op ops[6] = {
              GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD
          };
-@@ -4920,7 +5053,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4925,7 +5058,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  down_mm->src[1]->type == GGML_TYPE_F32 &&
                  gate_mm->src[0]->type == GGML_TYPE_F32 &&
                  gate_mm->src[1]->type == GGML_TYPE_F32 &&
@@ -348,7 +348,7 @@ index cbeed32e9..6fddddb82 100644
  
              if (wiring_ok && type_ok) {
                  ggml_cuda_op_shexp_down_gate(*cuda_ctx,
-@@ -5174,6 +5313,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5179,6 +5318,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 2;
      }
  
@@ -383,7 +383,7 @@ index cbeed32e9..6fddddb82 100644
      return 0;
  }
  
-@@ -5184,7 +5351,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5189,7 +5356,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
      const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
      std::vector<cudaEvent_t> op_ev0;
      std::vector<cudaEvent_t> op_ev1;
@@ -392,7 +392,7 @@ index cbeed32e9..6fddddb82 100644
      if (op_timing) {
          op_ev0.resize(cgraph->n_nodes);
          op_ev1.resize(cgraph->n_nodes);
-@@ -5337,9 +5504,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5342,9 +5509,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue;
                  }
  
@@ -412,7 +412,7 @@ index cbeed32e9..6fddddb82 100644
  #ifdef GGML_CUDA_DEBUG
                      const int last_fused = i + nodes_to_skip;
                      GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
-@@ -5349,6 +5526,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5354,6 +5531,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      i += nodes_to_skip;
                      continue;
                  }
@@ -420,7 +420,7 @@ index cbeed32e9..6fddddb82 100644
  #ifndef NDEBUG
                  // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                  // node's output on the host-visible buffer, which the compute path
-@@ -5378,7 +5556,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5383,7 +5561,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
                  if (op_timing) {
                      CUDA_CHECK(cudaEventRecord(op_ev1[i], cuda_ctx->stream()));
@@ -429,7 +429,7 @@ index cbeed32e9..6fddddb82 100644
                  }
  
                  if (!is_concurrent_event_active) {
-@@ -5441,14 +5619,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5446,14 +5624,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          static std::map<std::string, int>    op_cnt_total;
          std::map<std::string, double> op_ms;
          std::map<std::string, int>    op_cnt;
@@ -1426,7 +1426,7 @@ index 9f6198523..f2c89b3a3 100644
  
  bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 951893a9d..436a72751 100644
+index fdd81abe1..7a81c9825 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -287,6 +287,17 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
@@ -1472,7 +1472,7 @@ index 951893a9d..436a72751 100644
          }
      }
      return MMVQ_MAX_BATCH_SIZE;
-@@ -421,15 +432,15 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+@@ -437,15 +448,15 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
  template <ggml_type type>
  static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
  #if defined(RDNA4)
@@ -1493,7 +1493,7 @@ index 951893a9d..436a72751 100644
  #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == GGML_CUDA_CC_VOLTA || __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE)
      return MMVQ_MAX_BATCH_SIZE;
  #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
-@@ -472,11 +483,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+@@ -488,11 +499,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
      }
      if (table_id == MMVQ_PARAMETERS_RDNA4) {
          // Band-uniform nwarps=1 for the whole mmvq band (ncols_dst 1..8).
@@ -1509,7 +1509,7 @@ index 951893a9d..436a72751 100644
          return 1;
      }
      if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
-@@ -575,6 +585,20 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+@@ -591,6 +601,20 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
      return 1;
  }
  
@@ -1530,7 +1530,7 @@ index 951893a9d..436a72751 100644
  static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
      if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
          switch (ncols_dst) {
-@@ -626,6 +650,292 @@ static __global__ void mul_mat_vec_q(
+@@ -642,6 +666,292 @@ static __global__ void mul_mat_vec_q(
  
      constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
  
@@ -1823,7 +1823,7 @@ index 951893a9d..436a72751 100644
      const     int tid = warp_size*threadIdx.y + threadIdx.x;
      const     int row0 = rows_per_cuda_block*blockIdx.x;
      const     int blocks_per_row_x = ncols_x / qk;
-@@ -896,15 +1206,19 @@ static __global__ void mul_mat_vec_q(
+@@ -912,15 +1222,19 @@ static __global__ void mul_mat_vec_q(
  // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
  // Block: (warp_size, ncols_dst) - each warp handles one token independently.
  // No shared memory reduction needed since each warp works alone.
@@ -1845,7 +1845,7 @@ index 951893a9d..436a72751 100644
      const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
      const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
      const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
-@@ -938,12 +1252,16 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -954,12 +1268,16 @@ static __global__ void mul_mat_vec_q_moe(
              x_scale    = (const float *) fusion.x_scale;
              gate_scale = (const float *) fusion.gate_scale;
          }
@@ -1863,7 +1863,7 @@ index 951893a9d..436a72751 100644
  
      const uint32_t channel_dst = blockIdx.y;
  
-@@ -962,17 +1280,19 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -978,17 +1296,19 @@ static __global__ void mul_mat_vec_q_moe(
      float tmp[c_rows_per_block] = {0.0f};
      float tmp_gate[c_rows_per_block] = {0.0f};
  
@@ -1893,7 +1893,7 @@ index 951893a9d..436a72751 100644
              }
          }
      }
-@@ -1001,6 +1321,9 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -1017,6 +1337,9 @@ static __global__ void mul_mat_vec_q_moe(
                      result *= x_scale[channel_x];
                  }
              }
@@ -1903,7 +1903,7 @@ index 951893a9d..436a72751 100644
              if (x_bias) {
                  result += x_bias[bias_idx];
              }
-@@ -1043,11 +1366,11 @@ static __global__ void mul_mat_vec_q_moe(
+@@ -1059,11 +1382,11 @@ static __global__ void mul_mat_vec_q_moe(
      }
  }
  
@@ -1918,7 +1918,7 @@ index 951893a9d..436a72751 100644
      const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
      const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
      const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
-@@ -1088,6 +1411,39 @@ static void mul_mat_vec_q_switch_fusion(
+@@ -1104,6 +1427,39 @@ static void mul_mat_vec_q_switch_fusion(
          sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
  }
  
@@ -1958,7 +1958,7 @@ index 951893a9d..436a72751 100644
  template <ggml_type type>
  static void mul_mat_vec_q_moe_launch(
          const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
-@@ -1097,27 +1453,43 @@ static void mul_mat_vec_q_moe_launch(
+@@ -1113,27 +1469,43 @@ static void mul_mat_vec_q_moe_launch(
          const uint32_t ncols_dst, const uint32_t ids_stride,
          const int warp_size, const int nchannels_dst, cudaStream_t stream) {
  
@@ -2014,7 +2014,7 @@ index 951893a9d..436a72751 100644
      }
  }
  
-@@ -1211,8 +1583,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1227,8 +1599,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
          return idle * 8 <= iters_wide * 2;
      };
  
@@ -2032,7 +2032,7 @@ index 951893a9d..436a72751 100644
          mul_mat_vec_q_moe_launch<type>(
              vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
              stride_row_x, stride_col_y, stride_col_dst,
-@@ -1222,109 +1601,184 @@ static void mul_mat_vec_q_switch_ncols_dst(
+@@ -1238,109 +1617,184 @@ static void mul_mat_vec_q_switch_ncols_dst(
      }
  
      switch (ncols_dst) {
@@ -2299,7 +2299,7 @@ index 951893a9d..436a72751 100644
          } break;
          default:
              GGML_ABORT("fatal error");
-@@ -1541,7 +1995,7 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1557,7 +2011,7 @@ void ggml_cuda_mul_mat_vec_q(
              GGML_ASSERT(ggml_is_contiguous(fusion->x_scale));
              if (fusion->x_scale_channel_dst) {
                  GGML_ASSERT(ids);
@@ -2308,7 +2308,7 @@ index 951893a9d..436a72751 100644
              } else {
                  GGML_ASSERT(ggml_nelements(fusion->x_scale) == (ids ? src0->ne[2] : 1));
              }
-@@ -1956,30 +2410,39 @@ void ggml_cuda_op_ssm_conv_l2_gatebeta(
+@@ -1972,30 +2426,39 @@ void ggml_cuda_op_ssm_conv_l2_gatebeta(
  
  // Fused shared-expert output: down projection plus the gate and residual adds.
  // dst = down(swiglu) * sigmoid(gate(x)) + moe_out + ffn_residual.
@@ -2356,7 +2356,7 @@ index 951893a9d..436a72751 100644
      const int row = blockIdx.x;
      constexpr int warp_size = 32;
      const int tid = warp_size*threadIdx.y + threadIdx.x;
-@@ -1990,29 +2453,55 @@ static __global__ void shexp_down_gated_q8_0(
+@@ -2006,29 +2469,55 @@ static __global__ void shexp_down_gated_q8_0(
      const int blocks_per_row_x = k_down / qk;
      const block_q8_0 * wd = (const block_q8_0 *) vx_down + (int64_t) row * blocks_per_row_x;
  
@@ -2421,7 +2421,7 @@ index 951893a9d..436a72751 100644
      }
  }
  
-@@ -2030,8 +2519,7 @@ void ggml_cuda_op_shexp_down_gate(
+@@ -2046,8 +2535,7 @@ void ggml_cuda_op_shexp_down_gate(
  
      // Quantize the swiglu to Q8_1 once per graph.
      const int64_t ne10_padded = GGML_PAD(swiglu->ne[0], MATRIX_ROW_PADDING);
@@ -2431,7 +2431,7 @@ index 951893a9d..436a72751 100644
      while (src1_key->view_src != nullptr) {
          src1_key = src1_key->view_src;
      }
-@@ -2048,37 +2536,65 @@ void ggml_cuda_op_shexp_down_gate(
+@@ -2064,37 +2552,65 @@ void ggml_cuda_op_shexp_down_gate(
                                 swiglu->ne[1], swiglu->ne[2], swiglu->ne[3], stream);
      }
  
@@ -2510,7 +2510,7 @@ index 951893a9d..436a72751 100644
          default: GGML_ASSERT(false); break;
      }
  }
-@@ -2113,3 +2629,159 @@ void ggml_cuda_op_mul_mat_vec_q(
+@@ -2129,3 +2645,159 @@ void ggml_cuda_op_mul_mat_vec_q(
  
      GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
  }
@@ -3187,10 +3187,10 @@ index 974477bbb..7c2a01d8c 100644
  DECL_MMQ_CASE(GGML_TYPE_Q8_0);
 +DECL_MMQ_CASE_GATE(GGML_TYPE_Q8_0);
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 022ebdd70..354e3cae6 100644
+index a9ba0faad..9693ded04 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10214,7 +10214,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10350,7 +10350,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      }
  
      for (int bs : {1, 4, 512}) {

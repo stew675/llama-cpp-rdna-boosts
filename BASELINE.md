@@ -2,7 +2,8 @@
 
 Current state: `main` is the delivery branch carrying the **16-patch set**
 (block 00 + blocks 01-15) generated against the fork
-point **llama.cpp master `ebbb18522`** (re-based **2026-09-17** from
+point **llama.cpp master `84e76d8a2`** (re-based **2026-09-24** from
+`ebbb18522`, itself re-based 2026-09-17 from
 `d1d3c3396`, itself re-based 2026-09-15 from
 `790cf51aa`, itself re-based 2026-09-13 from
 `9113cc188`, itself re-based 2026-09-08 from `050dde50c`, itself re-based
@@ -13,9 +14,13 @@ are HISTORICAL checkpoints of the old pre-block-12 structure (patch
 numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
-> **Current baseline marker:** `baseline/d1d3c3396` was the previous (2026-09-15)
-> delivery baseline.  The current one is **`ebbb18522`** (2026-09-17), the fork point of
-> release **`v16-ebbb18522-r13`** (canonical tip
+> **Current baseline marker:** the current delivery baseline is **`84e76d8a2`** (2026-09-24),
+> the fork point of release **`v16-84e76d8a2-r1`** (canonical tip
+> `ad858dee1057da63b8d81b883675de82ba60b2d9`, tree
+> `336d0f4318002409ed8ad5b04ae5bf344238c8ca`; r1 = the 2026-09-24 re-base onto upstream master
+> `84e76d8a2`, 149 upstream commits past `ebbb18522`, blocks 10/14/15 resolved manually - see
+> `WORKLOG.md`).  `baseline/ebbb18522` was the previous (2026-09-17) delivery baseline, last
+> released as **`v16-ebbb18522-r13`** (canonical tip
 > `8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`, tree
 > `bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`; r13 = the 2026-09-22 block-00 amendment that gates the
 > MTP `is_mem_shared` inference on the `gemma4-assistant` arch, so shared-NextN heads

@@ -1,5 +1,79 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-24 (r1) — `v16-84e76d8a2-r1`: the 16-block set re-based onto upstream master `84e76d8a2`
+
+**Release** `v16-84e76d8a2-r1`, new fork point **`84e76d8a2`** (upstream master, 2026-09-24, tree
+`5112eedbce0548ab9547d883e8aa54e993852e94`), canonical (rebased) block-15 tip
+`ad858dee1057da63b8d81b883675de82ba60b2d9`, net tree `336d0f4318002409ed8ad5b04ae5bf344238c8ca`.
+`scripts/validate-set.sh` green on a fresh `84e76d8a2` tarball: checksums, base tree, strict **16/16**
+`git am`, applied tree == `336d0f43…`.  `rdna-boosts-all.patch` and `release.json` regenerated.
+
+The previous baseline was `ebbb18522` (release `v16-ebbb18522-r13`, tree `bb7b6d07…`); this moves the
+set forward **149 upstream commits**.  The re-base was done by replaying the real block commits (not
+`git format-patch` + `git apply`) with `git rebase --onto 84e76d8a2 ebbb18522`, so the three-way merges
+had the canonical blobs available; blocks 00-09 replayed without textual conflict (**some hunks
+auto-merged**), blocks 10/14/15 needed manual resolution.  (A `git am` of the old patch set onto the
+new base cannot 3-way-merge at all where upstream rewrote the same file — the canonical pre-image
+blobs are absent from a fresh clone — which is why the re-base uses the fork commits and not the
+patches.)
+
+### Conflicts resolved (all preserving our work; upstream folded in where it is independent)
+
+* **Block 10, `tests/test-backend-ops.cpp`** — the `MUL_MAT_ID` / `MUL_MAT_ID_FUSION` MoE test matrix.
+  Our block 10 added `GGML_TYPE_Q5_K` and verify widths `5,6,7`; upstream `b1ff4ca23` (#28415) added
+  `GGML_TYPE_IQ4_XS`.  Resolved as the **union**: `{F32,F16,Q4_0,Q8_0,Q4_K,Q5_K,Q6_K,IQ2_XS,IQ4_XS}`
+  and `bs {1,4,5,6,7,8,32,64,128,256,512}`.
+* **Block 14, `ggml/src/ggml-backend.cpp`** — upstream `911f6cdc8` (#26070) added the
+  `ggml_gallocr_reserve_n()` failure check; our block 14 wraps that call in the
+  `ggml_gallocr_reserve_n_probe()` growth test (`buffers_grown || n_async_devices > 1`).  Kept **our
+  probe-gated structure** and adopted upstream's `"failed to reserve graph buffers"` diagnostic.
+* **Block 14, `ggml/src/ggml-cuda/ggml-cuda.cu`** — upstream `1a679828f` (#28432) merged the MoE
+  weighted-reduction and `topk_moe` visits into one `ggml_backend_cuda_graph_optimize` loop.  Took
+  **upstream's loop** and applied our block-14 rename (`ggml_moe_weighted_reduction_match` /
+  `ggml_match_moe_weighted_reduction`, now in `ggml-moe-weighted-reduction.h`).
+* **Block 14, `src/models/qwen4exp.cpp`** — upstream `3cf03257f` (#28770) enabled the *generic* CUDA
+  sparse FA for qwen4 by passing `top_k->ne[0]` as `build_attn_mha`'s `n_kv_max`.  Our block 14 keeps
+  the **fused `GGML_OP_FLASH_ATTN_QSA` arm as the default**; the dense-mask fallback (`LLAMA_QSA_SPARSE_FA=0`
+  or a non-native KV type) is unchanged at `n_kv_max = 0`.  Upstream's enablement is therefore shadowed
+  by the more advanced fused op on the default path.
+* **Block 14, `tests/test-llama-archs.cpp`** — union of upstream `161755f29`'s `stdev` parameter and
+  our block-14 `lazy_buf_size` parameter (and the corresponding call site carries both).
+* **Block 15, `ggml/src/ggml-cuda/fattn-mma-f16.cuh`** — the large one.  Upstream `1884824fd` (#28536)
+  removed `fattn-swizzle.cuh` and collapsed the two swizzle booleans `swz_K`/`swz_V` into a single
+  `swz` (`ggml_cuda_fattn_mma_get_swizzled`), and `3cf03257f`/`dc9879cf6` reworked the sparse `KV_max`
+  path.  Kept our native-KV arguments (V4/V5) and the V3 derived mask, converted every call to the
+  single `swz`, and pointed the block-15 native loaders at upstream's `swizzle_bytes<swz, half2>(i,
+  k*h2_per_chunk, stride_tile)` (the `ggml_cuda_fattn_smem_swizzle::bytes_rc` helper is gone).
+* **Block 15, `src/llama-context.cpp`** — upstream `965506136` (#26625) added
+  `llama_graph_n_input_tensors()`; our block-15 amendment added `llama_context::kq_mask_packed_reachable()`.
+  Both coexist (upstream's function feeds `sched_reserve`'s `n_input_tensors` report; ours feeds the
+  worst-case packed-mask reserve).
+* **Post-rebase compile fix (folded into block 15).**  block 15's two native loaders still referenced
+  the removed `ggml_cuda_fattn_smem_swizzle::bytes_rc` helper, which only surfaced at build time; the
+  block-15 commit was amended to use `swizzle_bytes`.  The surviving commits keep the `rdna-boosts:
+  block NN:` subjects, so the patch filenames and the 16-block structure are unchanged.
+
+### Validation (gfx1151 / Strix Halo, ROCm 7.14, `~/bin/build-llama-rocm-714`, ccache)
+
+* Build green in ~6m30s (clean `rm -rf build-rocm`).
+* Coherence: `Qwen3.5-4B-Q8_0` (the AGENTS.md gate) and `Qwen3.5-9B-UD-Q8_K_XL` both emit sensible
+  greedy continuations (41.5 / 18.6 t/s).
+* `test-backend-ops`: `FLASH_ATTN_EXT` **5956/5956**, `GATED_DELTA_NET` **46/46**,
+  `FLASH_ATTN_QSA` **22/22**.
+* `test-speculative-adaptive`: all tests OK.  `test-recurrent-state-rollback` (Qwen3.6-35B-A3B
+  Q4_K_M): max diff 0, nmse 0 for both cache fills.
+* `test-recurrent-state-depth`: **153 Phase-B failures** at large `n_rs_batch` — but the *pre-rebase*
+  `mmb-beta` build produces the **identical 153 failures with identical max diffs**, so it is a
+  pre-existing condition of the r13 line, **not** a re-base regression.  (The model used,
+  `Qwen3.6-35B-A3B`, has no MTP head in this test's configuration; the Phase-A verify-band sweep is
+  green.)
+
+### Beta set status
+
+The `beta/mmb-general/` set (28 patches) is **not** re-based here and still targets the old r13 tree
+(`bb7b6d07…` / `468c6496…`); do not `apply-beta.sh` on this baseline until it is re-cut.  That is the
+next task, deliberately staged after the base patch set is frozen.
+
 ## 2026-09-22 (r13) — `v16-ebbb18522-r13`: block 00 gains the shared-NextN MTP fix
 
 **Release** `v16-ebbb18522-r13`, canonical tip `8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`, net tree

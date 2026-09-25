@@ -1,12 +1,19 @@
 # rdna-boosts patch set (delivery)
 
-16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`ebbb18522`**
-(re-based 2026-09-17 from `d1d3c3396`).
+16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
+(re-based 2026-09-24 from `ebbb18522`).
 
-**Current release: `v16-ebbb18522-r13`** — canonical tip
-`8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`, tree
-`bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`.  Strict 16/16 `git am`; clean build.  **r13
-(2026-09-22) folds the shared-NextN MTP fix into block 00** (only block 00 changed): the MTP draft
+**Current release: `v16-84e76d8a2-r1`** — canonical (rebased) tip
+`ad858dee1057da63b8d81b883675de82ba60b2d9`, tree
+`336d0f4318002409ed8ad5b04ae5bf344238c8ca`.  Strict 16/16 `git am`; clean build.  **r1
+(2026-09-24) is the re-base onto upstream master `84e76d8a2`** (149 upstream commits); blocks 00-09
+replayed without textual conflict and blocks 10/14/15 were resolved manually, preserving every block's
+work while folding in the upstream rewrites (the MoE-test-matrix union; the allocator reserve-failure
+check inside our reserve probe; the unified graph-optimize loop with our matcher rename; qwen4's generic
+sparse FA shadowed by the fused QSA default; the FA single-`swz` swizzle refactor with our native-KV
+args and derived mask; and `llama_context::kq_mask_packed_reachable()` coexisting with upstream's
+graph-input report).  See `WORKLOG.md` (2026-09-24) for the full list and the gfx1151 validation.
+**r13 (2026-09-22) folds the shared-NextN MTP fix into block 00** (only block 00 changed): the MTP draft
 driver inferred KV sharing from `ctx_other` alone, but a `nextn_shared_target_tensors` head only
 *borrows* the target's `token_embd`/`output` and keeps its own KV, so it took the gemma4 same-position
 arm and every draft round past the first died on the M-RoPE `X < Y` check (upstream bug `04eb4c446`,
@@ -122,6 +129,38 @@ The 2026-09-17 re-base resolved three blocks:
 
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
+
+## 2026-09-24 re-base (r1): onto upstream master `84e76d8a2`
+
+**Release** `v16-84e76d8a2-r1`, new fork point **`84e76d8a2`** (2026-09-24, tree
+`5112eedbce0548ab9547d883e8aa54e993852e94`), block-15 tip `ad858dee1057da63b8d81b883675de82ba60b2d9`,
+net tree `336d0f4318002409ed8ad5b04ae5bf344238c8ca`.  Strict 16/16 `git am` on a fresh `84e76d8a2`
+tarball (`scripts/validate-set.sh` green).  The set now carries **149 upstream commits** since the
+previous `ebbb18522` base.  Only blocks 10, 14 and 15 needed manual conflict resolution:
+
+* **block 10 / `tests/test-backend-ops.cpp`** — keep both our `Q5_K` + widths `5,6,7` and upstream's
+  `IQ4_XS` in the MoE test matrix (union).
+* **block 14 / `ggml-backend.cpp`** — upstream's reserve-failure check now lives inside our
+  `ggml_gallocr_reserve_n_probe()` growth gate, with upstream's diagnostic.
+* **block 14 / `ggml-cuda.cu`** — upstream's unified MoE + `topk_moe` graph-optimize loop plus our
+  `ggml_moe_weighted_reduction_match` rename (moved to `ggml-moe-weighted-reduction.h`).
+* **block 14 / `qwen4exp.cpp`** — our fused `GGML_OP_FLASH_ATTN_QSA` stays the default; the dense
+  fallback keeps `n_kv_max = 0`.  Upstream's generic qwen4 sparse FA (`top_k->ne[0]`) is shadowed by the
+  fused op on the default path.
+* **block 14 / `test-llama-archs.cpp`** — union of upstream's `stdev` and our `lazy_buf_size`.
+* **block 15 / `fattn-mma-f16.cuh`** — upstream removed `fattn-swizzle.cuh` and collapsed `swz_K`/`swz_V`
+  into one `swz`; our native-KV loaders use `swizzle_bytes<swz, half2>(…)`, and our native args, derived
+  mask and upstream's sparse `KV_max` path all coexist.
+* **block 15 / `llama-context.cpp`** — upstream's `llama_graph_n_input_tensors()` alongside our
+  `kq_mask_packed_reachable()`.
+* A build-surfaced fallout (the removed `ggml_cuda_fattn_smem_swizzle` helper in block 15's native
+  loaders) was folded back into block 15 before the freeze.
+
+Validation (gfx1151, ROCm 7.14): clean build; 4B/9B coherence; `FLASH_ATTN_EXT` 5956/5956,
+`GATED_DELTA_NET` 46/46, `FLASH_ATTN_QSA` 22/22; `test-speculative-adaptive` OK;
+`test-recurrent-state-rollback` max diff 0.  `test-recurrent-state-depth`'s large-`n_rs_batch` Phase-B
+failures are **pre-existing** (the pre-rebase `mmb-beta` build shows the identical 153 failures with
+identical max diffs).  Full record: `WORKLOG.md` 2026-09-24.
 
 ## 2026-09-22 block-00 amendment (r13): shared-NextN MTP heads keep their own KV
 

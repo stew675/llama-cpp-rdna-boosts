@@ -1,4 +1,4 @@
-From 3451335d025b8cffe00e9edf666def9c9cbeb56b Mon Sep 17 00:00:00 2001
+From 7238356e01ab0ad5d2a8416ca5daefae411977ce Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 11/15] rdna-boosts: block 11: skip CUDA graphs for multi-token
@@ -29,10 +29,10 @@ keeps the update path available for a ROCm that carries the driver fix.
  1 file changed, 61 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 21b69be47..2a5f2a86f 100644
+index edc6c7544..0f2c6b287 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2608,6 +2608,33 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+@@ -2612,6 +2612,33 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
      return cgraph->nodes[0];
  }
  
@@ -66,7 +66,7 @@ index 21b69be47..2a5f2a86f 100644
  static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
      bool res = false;
  
-@@ -2653,6 +2680,28 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
+@@ -2657,6 +2684,28 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
  static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
      ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
  
@@ -95,7 +95,7 @@ index 21b69be47..2a5f2a86f 100644
  #if CUDART_VERSION >= 12000
      cudaGraphExecUpdateResultInfo result_info;
      cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &result_info);
-@@ -5061,6 +5110,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -5066,6 +5115,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      if (!op_timing && graph->is_enabled()) {
          const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
          if (graph_compatible) {
@@ -113,7 +113,7 @@ index 21b69be47..2a5f2a86f 100644
              const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
  
              if (!graph->warmup_complete) {
-@@ -5083,6 +5143,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -5088,6 +5148,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
                      cuda_graph_update_required = graph->instance == nullptr;
                  }
              }

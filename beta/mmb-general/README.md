@@ -14,6 +14,12 @@ which the maintainer decides whether it becomes a delivery block (the `AGENTS.md
 > **New session working the promotion: read [`HANDOVER.md`](HANDOVER.md)** — its "FOR THE NEXT
 > SESSION" brief is the self-contained handoff.  This file is the running (dated) record.
 
+> **2026-09-24 — PENDING RE-BASE WARNING.**  The delivery baseline has moved to upstream master
+> `84e76d8a2` (release `v16-84e76d8a2-r1`, delivery tree `336d0f43…`).  This beta set is still cut
+> against the previous r13 tree (`bb7b6d07…`) and **does not apply on the new baseline yet**; its
+> `apply-beta.sh` tree assertion (`468c6496…`) is therefore stale.  Do not run
+> `scripts/apply-beta.sh` on the new baseline until the 28 patches are re-based and re-validated.
+
 **What is in the beta set.**  Patches `0001`–`0012` are the original gfx1151-developed,
 gfx1201/gfx1100-portable `mmb` core (the `mmb` GEMM, `qsa3`, the F32/tiny-M kernels, HC16, the
 indexer top-k, the RDNA4 fragment port + per-arch policy table, and the gfx1100 deltas).  Patches

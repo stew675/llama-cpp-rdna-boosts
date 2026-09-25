@@ -5,14 +5,28 @@ work from the [llama.cpp fork](https://github.com/stew675/llama.cpp)
 (`rdna-boosts` branch), packaged for easy application to mainline llama.cpp.
 
 The **current delivery** is a **16-patch set** (block 00 + blocks 01-15) against upstream master
-**`ebbb18522`** ("openvino : Update OpenVINO to 2026.4", 2026-09-17 re-base from `d1d3c3396`,
+**`84e76d8a2`** ("metal : fix graph capture and handle empty graphs", 2026-09-24 re-base from
+`ebbb18522`,
+itself re-based 2026-09-17 from `d1d3c3396`,
 itself re-based 2026-09-15 from `790cf51aa`,
 itself re-based
 2026-09-13 from `9113cc188`; previously re-based 2026-09-08 from `050dde50c`, itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release (2026-09-22) — `v16-ebbb18522-r13`:** a block-00 amendment on top of r12 that folds
+**Current release (2026-09-24) — `v16-84e76d8a2-r1`:** the re-base of the 16-block set onto upstream
+master `84e76d8a2`, 149 commits past the previous `ebbb18522` base.  Blocks 00-09 replayed without
+textual conflict; blocks 10/14/15 were resolved manually (the MoE-test-matrix union; upstream's
+allocator reserve-failure check inside our reserve probe; upstream's unified MoE + `topk_moe`
+graph-optimize loop with our matcher rename; qwen4's generic sparse FA shadowed by the fused QSA
+default; the FA single-`swz` swizzle refactor with our native-KV args and derived mask;
+`llama_graph_n_input_tensors()` alongside our `kq_mask_packed_reachable()`).  Strict 16/16 `git am`
+on a fresh `84e76d8a2` tarball; clean gfx1151 build and coherence, `FLASH_ATTN_EXT` 5956/5956,
+`GATED_DELTA_NET` 46/46, `FLASH_ATTN_QSA` 22/22.  Canonical tip
+`ad858dee1057da63b8d81b883675de82ba60b2d9`, tree `336d0f4318002409ed8ad5b04ae5bf344238c8ca`.
+Full record: `WORKLOG.md` (2026-09-24).
+
+**Previous release (2026-09-22) — `v16-ebbb18522-r13`:** a block-00 amendment on top of r12 that folds
 in the shared-NextN MTP fix.  A `nextn_shared_target_tensors` head (no `token_embd`/`output` of its
 own, e.g. the qwen4exp `mtp-…-shared-Q8_0.gguf` sidecar) borrows the target's tensors, which sets
 `ctx_other`; the MTP draft driver inferred KV sharing from that pointer and took the gemma4

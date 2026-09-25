@@ -7,15 +7,17 @@ k-quant decode paths, a hybrid all-reduce, qwen4exp (Qwen3.8-Flash-Next)
 support, and an attention-memory campaign that frees several GiB of VRAM.
 
 It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp
-checkout at the fork point **`ebbb18522`** (upstream master, 2026-09-17
+checkout at the fork point **`84e76d8a2`** (upstream master, 2026-09-24
 re-base).  Each block is a self-contained `git am` commit, so you can apply
 the whole set or pick the ones you want.  An optional, **opt-in beta set**
 (`beta/mmb-general/`, 28 patches) layers the `mmb` (bf16-WMMA weight GEMM)
-campaign on top — see the [Beta addendum](#beta-addendum-the-mmb-beta-set).
+campaign on top — see the [Beta addendum](#beta-addendum-the-mmb-beta-set);
+**that set is still cut against the previous `ebbb18522` baseline and must be
+re-cut before it is applied on top of this one.**
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout ebbb18522
+git checkout 84e76d8a2
 bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 ```
 
@@ -37,7 +39,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
 (the tag is the release identity: `v16-<fork-point>-r<N>`, e.g.
-**`v16-ebbb18522-r1`**, where `r1` is the re-base and each later release on the
+**`v16-84e76d8a2-r1`**, where `r1` is the re-base and each later release on the
 same base increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
@@ -366,9 +368,9 @@ for per-block verification and `BASELINE.md` for provenance.
 ## Current state
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
-  **`ebbb18522`** (upstream master "openvino : Update OpenVINO to 2026.4", 2026-09-17 re-base).
-- Canonical 16-block chain: tip **`8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`**, net tree
-  **`bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`**; release **`v16-ebbb18522-r13`**.
+  **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
+- Canonical 16-block chain: tip **`ad858dee1057da63b8d81b883675de82ba60b2d9`**, net tree
+  **`336d0f4318002409ed8ad5b04ae5bf344238c8ca`**; release **`v16-84e76d8a2-r1`**.
 - **Shared-NextN MTP heads are usable** (block 00, r13, 2026-09-22): a head with
   `nextn_shared_target_tensors` (no `token_embd`/`output` of its own, e.g. the qwen4exp
   `mtp-…-shared-Q8_0.gguf` sidecar) died every draft round on the M-RoPE `X < Y` check because the

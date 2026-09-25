@@ -1,4 +1,4 @@
-From 1964222d2791c683397eeb92c086d480cacce81c Mon Sep 17 00:00:00 2001
+From 621ee9a756719b514d3596d029caf0e02bbb5fca Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net
@@ -36,7 +36,7 @@ Subject: [PATCH 02/15] rdna-boosts: block 02: fused chunked gated-delta-net
  create mode 100644 ggml/src/ggml-cuda/gated_delta_net_chunked_bf16_gfx11.cu
 
 diff --git a/common/common.cpp b/common/common.cpp
-index fd3392c27..5f6a1ad22 100644
+index 65c28ec0c..3c6952a76 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1790,6 +1790,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
@@ -50,10 +50,10 @@ index fd3392c27..5f6a1ad22 100644
      cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
      cparams.n_batch           = params.n_batch;
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index d01456035..5bd426058 100644
+index f450ca9dd..d842adda0 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -2668,6 +2668,7 @@ common_speculative_init_result::common_speculative_init_result(
+@@ -2666,6 +2666,7 @@ common_speculative_init_result::common_speculative_init_result(
      // note: for small models maybe we can set this to the maximum possible draft from all speculative types
      //       the extra memory for small models is likely negligible?
      cparams.n_rs_seq  = 0;
@@ -3004,7 +3004,7 @@ index 15abd5468..2338a61df 100644
              src_clone[0]->flags = tensor->src[0]->flags;
              tensor_clone = ggml_opt_step_adamw(ggml_ctx, src_clone[0], src_clone[1],
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 175281409..579b9b2cb 100644
+index cdc10a759..e5d99f2d6 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -6371,7 +6371,8 @@ struct ggml_tensor * ggml_gated_delta_net(
@@ -3026,10 +3026,10 @@ index 175281409..579b9b2cb 100644
      result->op     = GGML_OP_GATED_DELTA_NET;
      result->src[0] = q;
 diff --git a/include/llama.h b/include/llama.h
-index ac2215dc7..8626caa2d 100644
+index 1805ed055..72412668f 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -362,6 +362,7 @@ extern "C" {
+@@ -368,6 +368,7 @@ extern "C" {
          uint32_t n_ubatch;              // physical maximum batch size
          uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
          uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
@@ -3038,10 +3038,10 @@ index ac2215dc7..8626caa2d 100644
          uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
          int32_t  n_threads;             // number of threads to use for generation
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index ef53728d1..cddfc1a1d 100644
+index da9c558d2..7d1f509bf 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -108,6 +108,10 @@ llama_context::llama_context(
+@@ -109,6 +109,10 @@ llama_context::llama_context(
          cparams.n_rs_seq = 0;
      }
  
@@ -3052,7 +3052,7 @@ index ef53728d1..cddfc1a1d 100644
      cparams.n_threads               = params.n_threads;
      cparams.n_threads_batch         = params.n_threads_batch;
      cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
-@@ -314,6 +318,7 @@ llama_context::llama_context(
+@@ -315,6 +319,7 @@ llama_context::llama_context(
      LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
      LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
      LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
@@ -3060,7 +3060,7 @@ index ef53728d1..cddfc1a1d 100644
      LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
      LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
  
-@@ -3650,6 +3655,7 @@ llama_context_params llama_context_default_params() {
+@@ -3699,6 +3704,7 @@ llama_context_params llama_context_default_params() {
          /*.n_ubatch                    =*/ 512,
          /*.n_seq_max                   =*/ 1,
          /*.n_rs_seq                    =*/ 0,
@@ -3273,7 +3273,7 @@ index 4abb3f5cf..8420c2152 100644
  
      // computed before each graph build
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 3607bacd6..ec3995803 100644
+index 3801e5cbe..a394c2e6e 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -2553,6 +2553,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
@@ -3364,10 +3364,10 @@ index a29d8b89c..6c5defb4b 100644
          res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
      } else {
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index dc529a352..bfaae7340 100644
+index 917faabfa..9f2e8d68c 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -1496,14 +1496,64 @@ struct test_case {
+@@ -1535,14 +1535,64 @@ struct test_case {
                  }
              }
  
@@ -3437,7 +3437,7 @@ index dc529a352..bfaae7340 100644
                  ud->ok = false;
              }
              return true;
-@@ -4608,6 +4658,24 @@ struct test_gated_delta_net : public test_case {
+@@ -4688,6 +4738,24 @@ struct test_gated_delta_net : public test_case {
          return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
      }
  
@@ -3462,7 +3462,7 @@ index dc529a352..bfaae7340 100644
      test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
              int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
              int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
-@@ -4641,7 +4709,7 @@ struct test_gated_delta_net : public test_case {
+@@ -4721,7 +4789,7 @@ struct test_gated_delta_net : public test_case {
          // q/k are L2-normalised in qwen35/kimi-linear before delta_net
          q = ggml_l2_norm(ctx, q, 1e-6f);
          k = ggml_l2_norm(ctx, k, 1e-6f);
@@ -3471,7 +3471,7 @@ index dc529a352..bfaae7340 100644
          return out;
      }
  
-@@ -4705,7 +4773,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
+@@ -4785,7 +4853,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
          q = ggml_l2_norm(ctx, q, 1e-6f);
          k = ggml_l2_norm(ctx, k, 1e-6f);
  
@@ -3480,7 +3480,7 @@ index dc529a352..bfaae7340 100644
          ggml_set_name(gdn_out, "gdn_out");
  
          // attn scores view (first part of the gdn output)
-@@ -10902,6 +10970,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -11049,6 +11117,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
@@ -3499,7 +3499,7 @@ index dc529a352..bfaae7340 100644
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
-@@ -11423,6 +11503,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -11573,6 +11653,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
      test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
  

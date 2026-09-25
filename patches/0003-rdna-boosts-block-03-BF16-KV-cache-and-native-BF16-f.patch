@@ -1,4 +1,4 @@
-From f490860c6d24548fab350c0b4966d6c2c833a576 Mon Sep 17 00:00:00 2001
+From 45d53cdc0e87c8ad4c0ea4199ba49aae0cabd01b Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 03/15] rdna-boosts: block 03: BF16 KV cache and native-BF16
@@ -80,10 +80,10 @@ index 2e78ae4fa..96d859123 100644
  #ifdef FAST_FP16_AVAILABLE
      acc += v*u;
 diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-index a29065577..863fa36e7 100644
+index 449a77c5b..1eff94da8 100644
 --- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
 +++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
-@@ -1006,6 +1006,36 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
+@@ -1020,6 +1020,36 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                      cp_async_wait_all();
                  }
                  __syncthreads();
@@ -1170,10 +1170,10 @@ index 8981ab804..46d26a723 100644
 +EXTERN_DECL_FATTN_TILE_CASES(512, 512);
 +EXTERN_DECL_FATTN_TILE_CASES(576, 512);
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index ceb472793..882fe5d91 100644
+index d1fcf58cb..bff2ad9bb 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
-@@ -703,7 +703,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+@@ -732,7 +732,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
      bool need_f16_V = false;
  
      switch (kernel) {
@@ -1190,10 +1190,10 @@ index ceb472793..882fe5d91 100644
              need_f16_K = true;
              need_f16_V = true;
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index a9038f1f4..5178bbd9b 100644
+index 38b8714d5..904478cac 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -2675,7 +2675,7 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
+@@ -2679,7 +2679,7 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
          return false;
      }
  
@@ -1202,7 +1202,7 @@ index a9038f1f4..5178bbd9b 100644
          return false;
      }
  
-@@ -2688,9 +2688,9 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
+@@ -2692,9 +2692,9 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
          return false;
      }
  
@@ -1367,10 +1367,10 @@ index e546fb655..76ff68450 100644
              GGML_ABORT("fatal error");
          }
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index bfaae7340..364d69d43 100644
+index 9f2e8d68c..a35cccdda 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10715,8 +10715,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10853,8 +10853,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
          }
      }
  
@@ -1381,7 +1381,7 @@ index bfaae7340..364d69d43 100644
              if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;
              if (hsk ==  96 && (hsv !=  64 && hsv !=  96)) continue; // MiniCPM3
              if (hsk == 192 && (hsv != 128 && hsv != 192)) continue;
-@@ -10746,7 +10746,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10884,7 +10884,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                  for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
                                                      if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
                                                      for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL}) {
