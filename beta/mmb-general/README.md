@@ -2,13 +2,23 @@
 
 **Status: BETA (promoted from `wip/mmb-general` on 2026-09-21; consolidated with the `closing-the-gap`
 campaign on 2026-09-25; re-based onto upstream master `84e76d8a2` on 2026-09-24, re-ported on delivery
-r2 (2026-09-25), re-based onto r3 and gfx1100-fixed on 2026-09-25).  Not part of the
+r2 (2026-09-25), re-based onto r3 and gfx1100-fixed on 2026-09-25, re-cut onto r4 then r5 on
+2026-09-25).  Not part of the
 delivery.**  This is the beta patch set: **28 patches**, verified `git am` **28/28** from the delivery
-tree, applied tree **`70cc895a0745f9b1a9290bc6b49906ed8bed02ae`** on the current r4 delivery tree
-`5938da09…` (`84e76d8a2` base; r3 `08fe2b77…` / `0daefe22…`, r2 `ea7acf2d…` / `e00275ff…`,
-r13 `bb7b6d07…` / `468c6496…`).  It is staged for the ~4–5 day beta
+tree, applied tree **`469082e4111974570be204e0c007d7ecbfeb7e73`** on the current r5 delivery tree
+`de86c5e1…` (`84e76d8a2` base; r4 `5938da09…` / `70cc895a…`, r3 `08fe2b77…` / `0daefe22…`,
+r2 `ea7acf2d…` / `e00275ff…`, r13 `bb7b6d07…` / `468c6496…`).  It is staged for the ~4–5 day beta
 window, after which the maintainer decides whether it becomes a delivery block (the `AGENTS.md`
 promotion rule).
+
+> **2026-09-25 (r5) — RE-CUT onto the r5 delivery.**  The delivery moved to `v16-84e76d8a2-r5`
+> (`de86c5e1…`, the block-15 follow-up that puts f16/bf16 on the RDNA4 GQA-6 decode/verify FA band,
+> issue #45) and the 28 patches were re-cut onto it (applied tree `469082e4…`, **strict 28/28** on a
+> fresh r5 worktree).  As with r4 the beta set does not touch the dense `GGML_OP_FLASH_ATTN_EXT`
+> files r5 changes, so **the patch bodies are byte-identical** to the r4-based set - only the `From
+> <sha>` lines and `commits.txt` changed.  The measured gfx1201/gfx1100 beta behaviour therefore
+> carries over, and the gfx1151 four-gate re-validation on `469082e4` remains pending (as it was on
+> `70cc895a`).
 
 > **Tester: start with [`BETA-TESTING.md`](BETA-TESTING.md)** — the gfx1151 final re-validation
 > checklist (apply, build, the four gates, the reference numbers and the kill-switches).  The campaign

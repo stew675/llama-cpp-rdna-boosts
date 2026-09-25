@@ -15,11 +15,16 @@ numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
 > **Current baseline marker:** the current delivery baseline is **`84e76d8a2`** (2026-09-24),
-> the fork point of release **`v16-84e76d8a2-r4`** (canonical tip
-> `f744c11e6ee452d7cdc2786a9b9290b62c8fc5be`, tree
-> `5938da09d294a01e0862c2d561b0c7ca154de90a`; r4 = the 2026-09-25 block-15 RDNA4 head-256 GQA-6
+> the fork point of release **`v16-84e76d8a2-r5`** (canonical tip
+> `62eaaec3e41bbefeda2f3625ecd6e6f7e814e2f0`, tree
+> `de86c5e11f8dbebedec42be16c00cda7f68853a2`; r5 = the 2026-09-25 block-15 follow-up that extends the
+> RDNA4 head-256 GQA-6 decode/verify FA band (issue #45) to f16 (and, through its opt-in native arm,
+> bf16) with a per-K/V-element-size config - 2-byte types `ncols1 = 2` / `P = max(2, 3*nsm/4)`,
+> native-quantized `ncols1 = 4` / `P = nsm`; f16 verify widths 2.1-3.2x faster, +13 % `draft-mtp n3`
+> at ~30k, plain f16 decode -2.5..-4.2 %; 28-patch beta re-cut onto r5, applied tree `469082e4…`)
+> on top of r4 = the 2026-09-25 block-15 RDNA4 head-256 GQA-6
 > decode/verify FA band (issue #45: the whole `n_q <= 8` band runs the WMMA kernel with the GQA group
-> folded into `ncols2 = 8` and a round-robin KV split over a fixed `P = nsm` blocks, so decode and
+> folded into `ncols2 = 8` and a round-robin KV split over a fixed `P` blocks, so decode and
 > every verify width reduce identically; all native quantized K/V types, default on, prefill untouched)
 > on top of r3 = the 2026-09-25 block-14 `hc_combine`
 > CPU-reference fix (issue #44: the CPU reference used `t*ne[1]`/`t*hc` row strides instead of the

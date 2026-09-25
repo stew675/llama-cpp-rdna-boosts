@@ -14,7 +14,20 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release (2026-09-25) — `v16-84e76d8a2-r4`:** a block-15 amendment.  The RDNA4 head-256
+**Current release (2026-09-25) — `v16-84e76d8a2-r5`:** a block-15 follow-up (issue #45 comment,
+@DanoPTT).  The RDNA4 head-256 GQA-6 decode/verify FA band now also covers f16 (and, through its
+opt-in native arm, bf16), with a per-K/V-element-size config: native-quantized keeps `ncols1 = 4` /
+`P = nsm`, the 2-byte types take `ncols1 = 2` / `P = max(2, 3*nsm/4)`.  The gate no longer asks "has a
+native read": at verify widths the F1 purity pin makes the whole `n_q <= 8` band use the `n_q = 1`
+tile config, so f16 re-reads and re-stages every K/V element three times (gfx1201 kv 102400: `n_q` 1
+~604 GB/s vs `n_q` 4 ~180 GB/s).  f16 kv 102400 `n_q` 1 678 -> 744, 3 1802 -> 848, 4 2230 -> 811,
+8 3979 -> 1249 us; 27B `draft-mtp n3` at ~30k 48.9 -> 55.4 t/s (+13 %), plain decode -2.5..-4.2 %.
+`test-backend-ops -o FLASH_ATTN_EXT` 6340/6340 and f16/q8_0 `plain == draft-mtp` byte-identical; the
+28-patch beta set is re-cut onto r5 (strict 28/28, tree `469082e4…`).  Canonical tip
+`62eaaec3e41bbefeda2f3625ecd6e6f7e814e2f0`, tree `de86c5e11f8dbebedec42be16c00cda7f68853a2`.  Full
+record: `WORKLOG.md` (2026-09-25 r5).
+
+**Previous release (2026-09-25) — `v16-84e76d8a2-r4`:** a block-15 amendment.  The RDNA4 head-256
 GQA-6 decode/verify FA band (`n_q <= 8`) now runs the WMMA kernel with the GQA group folded into one
 block (`ncols2 = 8`) and the KV split round-robin over a fixed `P = nsm` blocks, instead of the tile
 kernel's `ncols2 = 2`, which fetched and dequantized every K/V element once per head pair (3x at GQA

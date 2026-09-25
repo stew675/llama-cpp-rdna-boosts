@@ -6,6 +6,13 @@ the next session; the "FOR THE NEXT SESSION" brief below is the whole handoff, a
 sections after it are the dated history (newest first).  `README.md` is the running record and
 `BF16-PRODUCER-PORT.md` the producer-port reference map.
 
+> **2026-09-25 (r5) re-base:** the beta set is now re-cut onto delivery `v16-84e76d8a2-r5`
+> (`de86c5e1…`, the block-15 follow-up that puts f16/bf16 on the RDNA4 GQA-6 decode/verify FA band),
+> applied tree `469082e4…`.  The patch bodies are byte-identical to the r4-based set; only the `From`
+> lines and `commits.txt` changed.  It was on r4's `70cc895a…` before, on r3's `0daefe22…` before
+> that, and on upstream master `84e76d8a2` before that.  See `README.md` and `BETA-TESTING.md`; the
+> r12/r13 hashes in this handoff are the historical record.
+
 > **2026-09-25 (r4) re-base:** the beta set is now re-based onto delivery `v16-84e76d8a2-r4`
 > (`5938da09…`, the block-15 RDNA4 GQA-6 decode/verify FA band), applied tree `70cc895a…` (no conflict
 > resolution; the beta set does not touch the dense FA files r4 changed).  It was on r3's `0daefe22…`

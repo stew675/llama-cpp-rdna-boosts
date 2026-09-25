@@ -1,4 +1,4 @@
-From f744c11e6ee452d7cdc2786a9b9290b62c8fc5be Mon Sep 17 00:00:00 2001
+From 62eaaec3e41bbefeda2f3625ecd6e6f7e814e2f0 Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 10 Sep 2026 11:34:03 -0500
 Subject: [PATCH 15/15] rdna-boosts: block 15: campaign memory wins
@@ -331,13 +331,13 @@ perf cases added to tests/test-backend-ops.cpp.
  ggml/src/ggml-backend-meta.cpp                |  18 +-
  ggml/src/ggml-cpu/ops.cpp                     |  71 +-
  ggml/src/ggml-cuda/common.cuh                 |  49 ++
- ggml/src/ggml-cuda/fattn-common.cuh           | 746 +++++++++++++++++-
- ggml/src/ggml-cuda/fattn-mma-f16.cuh          | 413 +++++++++-
+ ggml/src/ggml-cuda/fattn-common.cuh           | 785 +++++++++++++++++-
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh          | 413 ++++++++-
  ggml/src/ggml-cuda/fattn-qsa.cu               |  47 +-
  ggml/src/ggml-cuda/fattn-tile.cu              |  29 +
  ggml/src/ggml-cuda/fattn-tile.cuh             | 284 +++++--
  ggml/src/ggml-cuda/fattn-vec.cuh              |   8 +-
- ggml/src/ggml-cuda/fattn.cu                   |  91 ++-
+ ggml/src/ggml-cuda/fattn.cu                   |  91 +-
  ggml/src/ggml-cuda/ggml-cuda.cu               |   6 +
  ggml/src/ggml-cuda/indexer-topk.cu            |  74 +-
  .../fattn-tile-instance-dkq112-dv112-bf16.cu  |   5 +
@@ -450,7 +450,7 @@ perf cases added to tests/test-backend-ops.cpp.
  src/llama-context.cpp                         | 234 +++++-
  src/llama-context.h                           |  11 +-
  src/llama-cparams.h                           |   5 +
- src/llama-graph.cpp                           | 183 +++--
+ src/llama-graph.cpp                           | 183 ++--
  src/llama-graph.h                             |  60 ++
  src/llama-kv-cache.cpp                        | 189 ++++-
  src/llama-kv-cache.h                          |  20 +-
@@ -458,7 +458,7 @@ perf cases added to tests/test-backend-ops.cpp.
  src/llama-memory-hybrid-idx.h                 |  17 +-
  src/models/qwen4exp.cpp                       | 338 ++++++--
  tests/test-backend-ops.cpp                    |  75 +-
- 132 files changed, 3443 insertions(+), 355 deletions(-)
+ 132 files changed, 3482 insertions(+), 355 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-bf16.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-f16.cu
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-tile-instance-dkq112-dv112-iq4_nl.cu
@@ -981,7 +981,7 @@ index a35de2cbf..934b9cffb 100644
  
      cudaStream_t stream(int device, int stream) {
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 4da92ccd4..77b7e9b79 100644
+index 4da92ccd4..91224be2c 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -18,6 +18,17 @@
@@ -1509,47 +1509,78 @@ index 4da92ccd4..77b7e9b79 100644
  template <int D, int nthreads>
  static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
      const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
-@@ -1061,10 +1563,97 @@ static __global__ void flash_attn_combine_results(
+@@ -1061,10 +1563,134 @@ static __global__ void flash_attn_combine_results(
      dst[tid] = VKQ_numerator / VKQ_denominator;
  }
  
 +// Decode/verify band (n_q <= 8) on RDNA4: the whole GQA group is folded into one block
 +// (ncols2 = 8) via the WMMA kernel instead of the tile kernel's ncols2 = 2, which fetches and
 +// dequantizes every K/V element once per head pair (3x for GQA 6).  This is the default; the env var
-+// is the opt-out (maintainer policy: a beneficial feature is on by default).  GGML_HIP_FA_BAND_WMMA=0
-+// disables the band, =2 selects ncols1 = 2 (otherwise ncols1 = 4, the verify-width optimum).  One
-+// ncols1 for the whole band keeps a single kernel config, and launch_fattn fixes the round-robin KV
-+// split per output tile (see there), so n_q = 1 and every verify width reduce identically
-+// (GREEDY-PURITY band invariant).
-+static inline int ggml_cuda_fattn_band_wmma_ncols1() {
-+    static const int ncols1 = []() {
++// is the opt-out (maintainer policy: a beneficial feature is on by default).  One ncols1 for the whole
++// band keeps a single kernel config, and launch_fattn fixes the round-robin KV split per output tile
++// (see there), so n_q = 1 and every verify width reduce identically (GREEDY-PURITY band invariant).
++// GGML_HIP_FA_BAND_WMMA=0 disables the band, 2/4 force ncols1 (any other non-zero value means 4).
++//
++// The band's ncols1: the wide 4-column tile is the verify-width optimum for the native-quantized
++// K/V types, whose dequantization dominates and hides the columns an n_q = 1 decode leaves unused.
++// The 2-byte types (f16, and bf16 when its native arm is on) have no dequantization, so those
++// unused columns are a much larger fraction of the n_q = 1 cost: measured on gfx1201 (head 256,
++// GQA 6, kv 102400) the 2-column tile is 747 us at n_q = 1 vs 967 for 4 columns (and 861 vs 970 at
++// n_q = 4) while the verify widths stay within noise.
++static inline int ggml_cuda_fattn_band_wmma_ncols1_env() {
++    static const int v = []() {
 +        const char * env = getenv("GGML_HIP_FA_BAND_WMMA");
-+        const int v = env != nullptr ? atoi(env) : -1;
-+        if (v == 0) {
-+            return 0;
-+        }
-+        return v == 2 ? 2 : 4;
++        return env != nullptr ? atoi(env) : -1;
 +    }();
-+    return ncols1;
++    return v; // -1 = unset, 0 = disabled, otherwise the forced value
++}
++
++static inline bool ggml_cuda_fattn_band_wmma_enabled() {
++    return ggml_cuda_fattn_band_wmma_ncols1_env() != 0;
++}
++
++// The 2-byte K/V types share the band's light per-iteration variant (see the ncols1 and split
++// helpers).  bf16 only reaches the band through its opt-in native arm, where K->type is BF16.
++static inline bool ggml_cuda_fattn_band_wmma_two_byte(const ggml_tensor * dst) {
++    const ggml_tensor * K = dst != nullptr ? dst->src[1] : nullptr;
++    return K != nullptr && (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_BF16);
++}
++
++static inline int ggml_cuda_fattn_band_wmma_ncols1(const ggml_tensor * dst) {
++    const int v = ggml_cuda_fattn_band_wmma_ncols1_env();
++    if (v > 0) {
++        return v == 2 ? 2 : 4;
++    }
++    return ggml_cuda_fattn_band_wmma_two_byte(dst) ? 2 : 4;
 +}
 +
 +// Blocks per output tile in the band (the interleave period P, see launch_fattn).  0 = one block per
 +// CU (nsm); GGML_HIP_FA_BAND_WMMA_SPLIT overrides it for tuning.  Whatever the source, it must not
-+// depend on n_q or on the KV length, or decode and verify would split differently.
-+static inline int ggml_cuda_fattn_band_wmma_split() {
-+    static const int split = []() {
++// depend on n_q or on the KV length, or decode and verify would split differently.  The 2-byte types
++// do less work per KV iteration, so the P partials' fixup is a larger fraction of their cost; a
++// smaller P measured best for them on gfx1201 (nsm 32) across 16k..200k, while the quantized types
++// keep nsm.  Expressed as a fraction of nsm so a smaller RDNA4 part scales down with it.
++static inline int ggml_cuda_fattn_band_wmma_split(const ggml_tensor * dst) {
++    static const int env_split = []() {
 +        const char * env = getenv("GGML_HIP_FA_BAND_WMMA_SPLIT");
 +        const int v = env ? atoi(env) : 0;
 +        return v > 0 ? v : 0;
 +    }();
-+    return split;
++    if (env_split > 0) {
++        return env_split;
++    }
++    if (!ggml_cuda_fattn_band_wmma_two_byte(dst)) {
++        return 0;
++    }
++    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
++    return std::max(2, (3*nsm)/4);
 +}
 +
 +// Self-contained band predicate shared by the kernel chooser, the ncols dispatcher and launch_fattn,
 +// so the three can never disagree (a disagreement would launch the WMMA kernel with ncols2 != 8,
 +// whose band fast path is compiled out and whose stream-k split is query-width dependent).
 +static inline bool ggml_cuda_fattn_band_wmma_applies(const int cc, const ggml_tensor * dst) {
-+    if (ggml_cuda_fattn_band_wmma_ncols1() == 0) {
++    if (!ggml_cuda_fattn_band_wmma_enabled()) {
 +        return false;
 +    }
 +    if (!GGML_CUDA_CC_IS_RDNA4(cc) || !amd_wmma_available(cc)) {
@@ -1583,10 +1614,16 @@ index 4da92ccd4..77b7e9b79 100644
 +
 +    const int gqa_ratio = Q->ne[2] / K->ne[2];
 +    // Every K/V type the MMA kernel can read natively (q8_0, bf16, q4_0/q4_1/q5_0/q5_1/iq4_nl) is
-+    // instruction-issue bound in the tile kernel, so the 3x re-fetch matters for all of them; F16 is
-+    // DRAM bound and has no native read (NONE), so it stays on the tile kernel.
++    // instruction-issue bound in the tile kernel, so the 3x re-fetch matters for all of them.  F16
++    // has no native read (NONE), but it is only DRAM bound at n_q = 1: at verify widths the pinned
++    // tile config (ncols2 = 2 for GQA 6) re-reads and re-stages every K/V element three times per
++    // query row, so the band's single fold is the width-pure answer there too (issue #45 follow-up,
++    // reported by @DanoPTT).  bf16 reaches the band through its opt-in native arm (kv_native = BF16)
++    // and is deliberately NOT banded while it is staged, where the whole-cache conversion dominates.
 +    const int  kv_native = ggml_cuda_fattn_kv_native_type(K);
-+    const bool kv_ok     = kv_native != FATTN_KV_NATIVE_NONE && kv_native == ggml_cuda_fattn_kv_native_type(V);
++    const bool kv_quant  = kv_native != FATTN_KV_NATIVE_NONE && kv_native == ggml_cuda_fattn_kv_native_type(V);
++    const bool kv_f16    = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
++    const bool kv_ok     = kv_quant || kv_f16;
 +
 +    return gqa_opt && Q->ne[1] <= 8 && Q->ne[3] == 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
 +        gqa_ratio > 4 && gqa_ratio <= 8 && logit_softcap == 0.0f && kv_ok;
@@ -1607,7 +1644,7 @@ index 4da92ccd4..77b7e9b79 100644
      const int warp_size = WARP_SIZE
  ) {
      constexpr int ncols = ncols1 * ncols2;
-@@ -1078,6 +1667,11 @@ void launch_fattn(
+@@ -1078,6 +1704,11 @@ void launch_fattn(
      const ggml_tensor * mask  = dst->src[3];
      const ggml_tensor * sinks = dst->src[4];
  
@@ -1619,7 +1656,7 @@ index 4da92ccd4..77b7e9b79 100644
      ggml_tensor * KQV = dst;
  
      GGML_ASSERT(Q->type == GGML_TYPE_F32);
-@@ -1095,8 +1689,94 @@ void launch_fattn(
+@@ -1095,8 +1726,94 @@ void launch_fattn(
      const int cc  = ggml_cuda_info().devices[id].cc;
      const int nsm = ggml_cuda_info().devices[id].nsm;
  
@@ -1715,7 +1752,7 @@ index 4da92ccd4..77b7e9b79 100644
  
      ggml_cuda_pool_alloc<int>    KV_max(pool);
      ggml_cuda_pool_alloc<float>  dst_tmp(pool);
-@@ -1112,12 +1792,17 @@ void launch_fattn(
+@@ -1112,12 +1829,17 @@ void launch_fattn(
      size_t nb22 = V->nb[2];
      size_t nb23 = V->nb[3];
  
@@ -1736,7 +1773,7 @@ index 4da92ccd4..77b7e9b79 100644
          if (ggml_is_contiguously_allocated(K)) {
              to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
              to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
-@@ -1140,7 +1825,7 @@ void launch_fattn(
+@@ -1140,7 +1862,7 @@ void launch_fattn(
          K_data = (char *) K_f16;
      }
  
@@ -1745,7 +1782,7 @@ index 4da92ccd4..77b7e9b79 100644
          if (V_is_K_view) {
              V_data = K_data;
              nb21   = nb11;
-@@ -1150,8 +1835,13 @@ void launch_fattn(
+@@ -1150,8 +1872,13 @@ void launch_fattn(
              const size_t bs = ggml_blck_size(V->type);
              const size_t ts = ggml_type_size(V->type);
  
@@ -1761,7 +1798,7 @@ index 4da92ccd4..77b7e9b79 100644
              if (ggml_is_contiguously_allocated(V)) {
                  to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                  to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
-@@ -1246,7 +1936,27 @@ void launch_fattn(
+@@ -1246,7 +1973,29 @@ void launch_fattn(
          blocks_num.y = 1;
          blocks_num.z = 1;
  
@@ -1780,9 +1817,11 @@ index 4da92ccd4..77b7e9b79 100644
 +        const bool band_wmma = ncols2 == 8 && ggml_cuda_fattn_band_wmma_applies(cc, dst);
 +
 +        if (band_wmma) {
-+            // P = nsm: measured on gfx1201 (64 CUs, head 256, GQA 6, 4 KV heads) the verify cost is flat
-+            // for P = 48..96 at kv 20K..200K and degrades below 32 or above 128.
-+            const int split_env = ggml_cuda_fattn_band_wmma_split();
++            // P = nsm for the native-quantized types: measured on gfx1201 (head 256, GQA 6, 4 KV heads)
++            // the verify cost is flat for P = 48..96 at kv 20K..200K and degrades below 32 or above 128.
++            // The 2-byte types do less work per KV iteration, so the P partials' fixup is a larger
++            // fraction of their cost; the split helper returns a smaller fixed P for them.
++            const int split_env = ggml_cuda_fattn_band_wmma_split(dst);
 +            const int P         = split_env > 0 ? split_env : std::max(2, nsm);
 +            blocks_num.x = ntiles_dst;
 +            blocks_num.y = P;
@@ -1790,7 +1829,7 @@ index 4da92ccd4..77b7e9b79 100644
              const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
              // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
              // Only do this if the occupancy loss from rounding is acceptable.
-@@ -1262,8 +1972,9 @@ void launch_fattn(
+@@ -1262,8 +2011,9 @@ void launch_fattn(
              blocks_num.x = nblocks_stream_k;
          }
  
@@ -1802,7 +1841,7 @@ index 4da92ccd4..77b7e9b79 100644
          }
      } else {
          // parallel_blocks must not be larger than what the tensor size allows:
-@@ -1346,14 +2057,19 @@ void launch_fattn(
+@@ -1346,14 +2096,19 @@ void launch_fattn(
          K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
          nb21, nb22, nb23,
          mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
@@ -1825,7 +1864,7 @@ index 4da92ccd4..77b7e9b79 100644
              const int bpt         = nblocks_sk / ntiles_dst;
  
              const uint3 fd0 = init_fastdiv_values(ntiles_x * ntiles_z_gqa * K->ne[2]);
-@@ -1368,7 +2084,7 @@ void launch_fattn(
+@@ -1368,7 +2123,7 @@ void launch_fattn(
                  (float *) KQV->data, dst_tmp_meta.ptr,
                   Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                   gqa_ratio, bpt, fd0, fd1, fd2);
@@ -3163,7 +3202,7 @@ index 57a285565..f2bf120e0 100644
  
  template <int D, ggml_type type_K, ggml_type type_V>
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 1443756fd..16268d716 100644
+index 1443756fd..15bf56aa5 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -190,6 +190,17 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
@@ -3199,7 +3238,7 @@ index 1443756fd..16268d716 100644
  
 +    if constexpr (DKQ == 256 && DV == 256) {
 +        if (ggml_cuda_fattn_band_wmma_applies(cc, dst)) {
-+            if (ggml_cuda_fattn_band_wmma_ncols1() == 4) {
++            if (ggml_cuda_fattn_band_wmma_ncols1(dst) == 4) {
 +                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 4, 8>(ctx, dst);
 +            } else {
 +                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 2, 8>(ctx, dst);

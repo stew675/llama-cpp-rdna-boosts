@@ -1,5 +1,62 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-25 (r5) — `v16-84e76d8a2-r5`: f16 (and bf16) on the RDNA4 GQA-6 FA band (block 15, issue #45 follow-up)
+
+**Release** `v16-84e76d8a2-r5`, base `84e76d8a2` (tree `5112eedbce0548ab9547d883e8aa54e993852e94`),
+tip `62eaaec3e41bbefeda2f3625ecd6e6f7e814e2f0`, net tree
+`de86c5e11f8dbebedec42be16c00cda7f68853a2`.  `scripts/validate-set.sh` green on a fresh `84e76d8a2`
+tarball (strict **16/16** `git am`).  Folded into block 15 (the band's home, r4); blocks 00-14 are
+byte-identical and only `patches/0015` changes.
+
+**The report (issue #45 comment, @DanoPTT).**  r4's band is quantized-KV-only: f16 has no native read
+(`ggml_cuda_fattn_kv_native_type == NONE`), so `ggml_cuda_fattn_band_wmma_applies` kept it on the tile
+kernel.  But the F1 purity pin (`fattn-tile.cuh`, block 08: `cols_per_block = ncols2 > 2 ? ncols2 : 2`)
+makes the whole `n_q <= 8` band use the `n_q = 1` tile config, and at GQA 6 with `ncols2 = 2` every
+query row re-reads and re-stages every K/V element three times.  On gfx1201, f16 kv 102400: `n_q = 1`
+reads ~604 GB/s but `n_q = 4` only ~180 GB/s, so the verify width is ~50 % slower than an older tree
+that used a wider tile config (and was not width-pure).  The reporter asked whether the band could
+cover f16/bf16.
+
+**The fix.**  The band gate now also accepts f16 (K and V both `GGML_TYPE_F16`); the native-quantized
+set is unchanged.  bf16 already reaches the band through its opt-in native arm (`kv_native == BF16`)
+and is deliberately **not** banded while staged, where the whole-cache conversion dominates (measured
+3x the tile cost).  The band's config is now chosen per K/V element size because the two classes have
+different optima:
+
+* **native-quantized** (`q8_0`/`q4_0`/`q4_1`/`q5_0`/`q5_1`/`iq4_nl`): `ncols1 = 4`, `P = nsm`
+  (**unchanged r4 tuning**; dequantization dominates and hides the columns an `n_q = 1` decode leaves
+  unused).
+* **2-byte** (`f16`, and bf16 when native): `ncols1 = 2`, `P = max(2, 3*nsm/4)` (24 on this `nsm` 32
+  device).  With no dequantization the unused columns are a large fraction of the `n_q = 1` cost, and
+  the lighter per-iteration work makes the `P`-partials fixup dominate, so a smaller `P` wins.
+
+`ggml_cuda_fattn_band_wmma_applies` is still shared by the chooser, the ncols dispatcher and
+`launch_fattn`; the helpers now take the op tensor so they can key off `K->type`. 
+`GGML_HIP_FA_BAND_WMMA` (0 off, 2/4 force ncols1) and `GGML_HIP_FA_BAND_WMMA_SPLIT` still override.  `P`
+is still independent of `n_q` and the KV length, so the round-robin split keeps the GREEDY-PURITY band
+invariant (one config per K/V type for the whole band).
+
+**Measurements (gfx1201 R9700, 27B qwen35 head 256 GQA 6, f16 KV).**  Op level, graph exported at kv
+102400, `test-backend-ops perf --test-file`, tile (band off) -> band, us/run: `n_q` 1 678 -> 744,
+3 1802 -> 848, 4 2230 -> 811, 8 3979 -> 1249 (**2.1-3.2x** at every verify width).  Built-in perf at
+kv 16384: 1 94 -> 119, 3 246 -> 141, 5 393 -> 224, 8 603 -> 241.  End to end, 27B UD-Q4_K_XL
+`draft-mtp` n3, 1 GPU, `-n 256`: ~30k ctx 48.9 -> 55.4 t/s (**+13 %**), ~5k ctx 58.2 -> 57.8 (flat);
+plain decode (`--spec-type none`) 28.5 -> 27.8 (~5k, -2.5 %) and 26.1 -> 25.0 (~30k, -4.2 %).  bf16 with
+its native arm on (`GGML_CUDA_FA_KV_NATIVE=1`), same deep shape: 49.3 -> 56.0 t/s (**+14 %**), prefill
+flat (1023 vs 1023 t/s at ~30k); the bf16 native default is left opt-in (its prefill trade is
+unchanged).
+
+**Purity.**  `test-backend-ops -o FLASH_ATTN_EXT` **6340/6340 on ROCm0** (the 389-case qwen35 subset is
+green on the final build); f16 `--spec-type none == draft-mtp` byte-identical at ~5k (`3c31df680ac1`)
+and ~30k (`32f533498f84`), q8_0 identical at ~5k (`50ca5b987f85`).  The quantized band is unregressed
+(op level within noise: q8_0 kv 16384 147/148/222/227 -> 150/152/227/232 us).
+
+**Beta re-base.**  The 28 `beta/mmb-general` patches were re-cut onto r5 (strict **28/28** on a fresh
+delivery, applied tree **`469082e4…`**, previously `70cc895a…`).  The patch bodies are byte-identical to
+the r4-based set - only their `From <sha>` lines and `commits.txt` changed - so the measured
+gfx1201/gfx1100 beta behaviour carries over; `scripts/apply-beta.sh`'s recorded tree is updated.  The
+gfx1151 four-gate re-validation on `469082e4` remains pending (as it was on `70cc895a`).
+
 ## 2026-09-25 (r4) — `v16-84e76d8a2-r4`: the RDNA4 GQA-6 decode/verify FA band (block 15, issue #45)
 
 **Release** `v16-84e76d8a2-r4`, base `84e76d8a2` (tree `5112eedbce0548ab9547d883e8aa54e993852e94`),

@@ -6,12 +6,16 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (2026-09-25, r4):** the delivery is the **16-patch set** against fork point
+**Current state (2026-09-25, r5):** the delivery is the **16-patch set** against fork point
 **`84e76d8a2`** (block 00 + blocks 01-15), canonical 16-block tip
-**`f744c11e6ee452d7cdc2786a9b9290b62c8fc5be`** (tree `5938da09d294a01e0862c2d561b0c7ca154de90a`),
-release **`v16-84e76d8a2-r4`** — r4 = the block-15 RDNA4 head-256 GQA-6 decode/verify FA band (issue
+**`62eaaec3e41bbefeda2f3625ecd6e6f7e814e2f0`** (tree `de86c5e11f8dbebedec42be16c00cda7f68853a2`),
+release **`v16-84e76d8a2-r5`** — r5 = the block-15 follow-up that extends the RDNA4 head-256 GQA-6
+decode/verify FA band (issue #45) to f16 (and, through its opt-in native arm, bf16) with a
+per-K/V-element-size config (2-byte: `ncols1 = 2`, `P = max(2, 3*nsm/4)`; native-quantized unchanged:
+`ncols1 = 4`, `P = nsm`); f16 verify widths 2.1-3.2x faster, +13 % `draft-mtp n3` at ~30k, plain f16
+decode -2.5..-4.2 %; r4 = the original block-15 RDNA4 head-256 GQA-6 decode/verify FA band (issue
 #45: the whole `n_q <= 8` band runs the WMMA kernel with the GQA group folded into `ncols2 = 8` and a
-round-robin KV split over a fixed `P = nsm` blocks, default on, all native quantized K/V types, prefill
+round-robin KV split over a fixed `P` blocks, default on, all native quantized K/V types, prefill
 untouched), r1 = the re-base onto upstream master `84e76d8a2` (149 upstream
 commits past `ebbb18522`; blocks 00-09 replayed without textual conflict, blocks 10/14/15 resolved
 manually), r2 = the block-10 MoE-VDR arch-scope fix (the wide-VDR `mul_mat_vec_q_moe` entry points now
@@ -21,10 +25,11 @@ CPU-reference stride fix (issue #44: the CPU reference used `t*ne[1]`/`t*hc` ins
 own `nb[1]`, corrupting every multi-token fused ubatch on a CPU-resident qwen4exp layer; now mirrors
 the CUDA kernel, nt == 1 bit-identical; op-level CPU-vs-HIP oracle 7/8 FAIL pre-fix, 8/8 PASS
 post-fix).  The beta set
-(`beta/mmb-general`, 28 patches) is re-based onto r3 (tree `0daefe22…`); patch 0027 now restricts the
+(`beta/mmb-general`, 28 patches) is re-cut onto r5 (tree `469082e4…`, patch bodies byte-identical to
+the r4-based set); patch 0027 restricts the
 16-wide routed `mul_mat_vec_q_moe` band to RDNA4 because on gfx1100 it failed `MUL_MAT_ID` 23/929 and
 on gfx1151 it is a measured loss.  gfx1100 build + coherence + op oracles + width probes green; the
-gfx1151 beta-window re-validation was GREEN on r2 and must be re-run on r3.  Full record:
+gfx1151 beta-window re-validation was GREEN on r2 and must be re-run on r5.  Full record:
 `WORKLOG.md` 2026-09-25.
 
 **Previous state (2026-09-18, r5):** the delivery is the **16-patch set** against fork point

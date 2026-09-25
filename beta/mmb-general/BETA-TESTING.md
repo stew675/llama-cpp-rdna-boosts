@@ -37,17 +37,17 @@ per-arch table or arch-neutral.  Re-validating confirms that reasoning.
 ```sh
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 84e76d8a2                                   # the fork point
-bash <repo>/scripts/apply-beta.sh . <repo>               # apply-all + 28/28, tree 70cc895a...
-git rev-parse HEAD^{tree}                                # expect 70cc895a0745f9b1a9290bc6b49906ed8bed02ae
+bash <repo>/scripts/apply-beta.sh . <repo>               # apply-all + 28/28, tree 469082e4...
+git rev-parse HEAD^{tree}                                # expect 469082e4111974570be204e0c007d7ecbfeb7e73
 ```
 
-Re-based 2026-09-25 onto the delivery's `v16-84e76d8a2-r4` (delivery tree `5938da09…`, the block-15
-RDNA4 GQA-6 decode/verify FA band, issue #45), producing `70cc895a…`.  This re-base needed **no
-conflict resolution**: the beta set does not touch the dense `GGML_OP_FLASH_ATTN_EXT` files that r4
-changed (`fattn.cu`/`fattn-common.cuh`/`fattn-mma-f16.cuh`); the only patch-body change is a 12-line
-`tests/test-backend-ops.cpp` hunk offset.  Before that, r3 (`0daefe22…`, the block-14 `hc_combine`
-CPU-reference fix) and r2 (`e00275ff…`), and before that r13's was `468c6496…`.  Verified strict `git am`
-**28/28** on a fresh `84e76d8a2` worktree with the delivery set applied first; only `0014` (GDN/PLE
+Re-cut 2026-09-25 onto the delivery's `v16-84e76d8a2-r5` (delivery tree `de86c5e1…`, the block-15
+follow-up that puts f16/bf16 on the RDNA4 GQA-6 decode/verify FA band, issue #45), producing
+`469082e4…`.  The patch bodies are **byte-identical** to the r4-based set (only the `From` lines and
+`commits.txt` changed), because the beta set does not touch the dense `GGML_OP_FLASH_ATTN_EXT` files
+r5 changes.  Before that, r4's was `70cc895a…` (delivery tree `5938da09…`), r3's `0daefe22…`, r2's
+`e00275ff…` and r13's `468c6496…`.  Verified strict `git am` **28/28** on a fresh `84e76d8a2` worktree
+with the delivery set applied first; only `0014` (GDN/PLE
 conv1d) and `0015` (narrow-row RMS norm) needed a conflict resolution at the 2026-09-24 re-base
 (upstream's restructured `ggml_backend_cuda_graph_optimize` loop).  The 2026-09-25 re-bases are
 straight replays.  Build with

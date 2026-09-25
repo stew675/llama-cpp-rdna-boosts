@@ -9,12 +9,16 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`84e76d8a2`** (upstream master, 2026-09-24
-re-base; release `v16-84e76d8a2-r4`, canonical tip `f744c11e6ee452d7cdc2786a9b9290b62c8fc5be`, tree
-`5938da09d294a01e0862c2d561b0c7ca154de90a` — r4's block-15 amendment (issue #45) sends the RDNA4
+re-base; release `v16-84e76d8a2-r5`, canonical tip `62eaaec3e41bbefeda2f3625ecd6e6f7e814e2f0`, tree
+`de86c5e11f8dbebedec42be16c00cda7f68853a2` — r4's block-15 amendment (issue #45) sends the RDNA4
 head-256 GQA-6 decode/verify band (`n_q <= 8`, every native quantized K/V type) to the WMMA kernel
 with the GQA group folded into one block (ncols2 = 8) and the KV split round-robin over a fixed
 P = nsm blocks, so decode and every verify width reduce identically; default ON, prefill untouched,
-+13-18 % `draft-mtp n3` at ~40k, r1's 149-upstream-commit re-base (only blocks
++13-18 % `draft-mtp n3` at ~40k, and r5's follow-up (issue #45 comment, @DanoPTT) extends the same
+band to f16 (and, through its opt-in native arm, bf16) with a per-K/V-element-size config (2-byte:
+ncols1 = 2, P = max(2, 3*nsm/4); native-quantized unchanged), so f16 verify widths are 2.1-3.2x
+faster and 27B `draft-mtp n3` at ~30k gains +13 % (f16) / +14 % (bf16 native) for a 2.5-4.2 % plain
+f16-decode cost; r1's 149-upstream-commit re-base (only blocks
 10/14/15 resolved manually), r2's block-10 MoE-VDR arch-scope fix (the wide-VDR
 `mul_mat_vec_q_moe` entry points now apply to RDNA4/RDNA3_0 only, via one gate in
 `get_vec_dot_q_cuda()`/`get_vdr_mmvq()`; RDNA3_5/gfx115x uses the dense VDR, recovering the base-16
@@ -23,8 +27,8 @@ MoE `draft-mtp n3` 0.73967 -> 0.76484 and 87.5 -> 89.6 t/s), gfx1151-validated, 
 with `t*ne[1]` and `inject` with `t*hc` instead of the tensors' own `nb[1]` row strides, so every
 multi-token ubatch in the fused band read the wrong rows and a CPU-resident qwen4exp layer emitted
 EOS as the first token; the CPU reference now mirrors the CUDA kernel's stride semantics and is
-bit-identical at nt == 1) plus the 28-patch `beta/mmb-general` re-base onto r3 then r4 (r4 applied tree
-`70cc895a…`, r3 `0daefe22…`) and its gfx1100 routed-band fix (patch 0027: the 16-wide `mul_mat_vec_q_moe` band is now
+bit-identical at nt == 1) plus the 28-patch `beta/mmb-general` re-base onto r3, r4 then r5 (r5 applied tree
+`469082e4…`, r4 `70cc895a…`, r3 `0daefe22…`) and its gfx1100 routed-band fix (patch 0027: the 16-wide `mul_mat_vec_q_moe` band is now
 RDNA4-only, because on RDNA3_0 it failed `MUL_MAT_ID` 23/929 and on RDNA3_5 it is a measured loss) -
 see `WORKLOG.md` 2026-09-25 (r3)).  The previous baseline was
 **`ebbb18522`**, last released as `v16-ebbb18522-r13`, the 2026-09-22 block-00 amendment (the shared-NextN MTP fix: a head with `nextn_shared_target_tensors` only borrows the target's `token_embd`/`output` and keeps its own KV, so the MTP driver must not infer KV sharing from `ctx_other` alone; `is_mem_shared` is now gated on the `gemma4-assistant` arch, fixing the M-RoPE `X < Y` draft crash - upstream bug `04eb4c446`/#23398.  Block 00 because it is a fundamental correctness fix every later block builds on, and upstream is not ours to change) on top of r12, the 2026-09-21 block-06 amendment (`--fit` now supports `-sm tensor`, promoted from `beta/tensor-fit-fix/`, now `archive/work/tensor-fit-fix/`: upstream threw `llama_params_fit is not implemented for SPLIT_MODE_TENSOR` and `common_fit_params()` swallowed the exception, so the default-**on** `--fit` never ran under tensor split.  The Meta device's accessors are exposed (they existed upstream, file-static) and `common/fit.cpp` gained a dedicated tensor path - per-device targets from `--fit-target`, a proportional split or an honoured user `-ts` with the binding `effective budget` logged, then an auto `n_ctx` reduction and an `-ngl` binary search, never overriding an explicit `-c`.  Block 15 is the home because it is the last block touching `ggml-backend-meta.cpp` and the change depends on no block; it is still a good `upstream/` PR candidate.  Re-validated on r11 before promotion: the default fit cases reproduce the 2026-09-18 record exactly, the `-ngl`-reduction cases are more conservative because the fit now sizes for the packed mask r11 restored for M-RoPE, seven end-to-end loads generate with zero out-of-memory and zero compute-buffer growth (including the separate-MTP-head `draft-mtp-adaptive` path), and the same-seed gate is byte-identical) on top of r11, the 2026-09-20 block-15 amendment (issue #42: the compute reserve now measures with the packed kq mask where one is *reachable*, because V3's derived form is a *per-batch* decision - a 2-D M-RoPE image/audio chunk or a multi-sequence batch allocates the packed mask (`n_kv*n_tokens*2` bytes), which the reserve - measured with the derived form on - did not contain; a deep-context image batch therefore grew the compute buffer mid-run and, under the default `--fit-target 256`, died with `cudaMalloc failed: out of memory` / `failed to process mtmd chunk`, and the next request then asserted in `ggml_backend_tensor_alloc` on the state the failed reserve left behind.  `llama_context::graph_reserve()` gained a `packed_kq_mask` argument, set from the new `llama_context::kq_mask_packed_reachable()` (M-RoPE, i.e. `n_pos_per_embd() > 1`, or `n_seq_max > 1`; alibi as belt-and-braces), so the reserve contains the worst-case packed mask exactly where such a batch can occur - every other packed-mask source already keeps the mask in the reserve, so a non-M-RoPE single-sequence model keeps V3's reserve unchanged (gemma4-E4B 113.94 vs 146.80 MiB forced-packed); same-seed greedy output is byte-identical and throughput is unchanged, and the reporter's M-RoPE model pays -8960 tokens / -4.4 % of fitted context on the gfx1100 reproduction.  Independently, a failed `ggml_gallocr_reserve_n_impl()` now clears a new `layout_valid` flag so the next `ggml_gallocr_alloc_graph()` re-reserves, turning any remaining buffer-allocation failure into a clean `GGML_STATUS_ALLOC_FAILED` instead of a NULL-vbuffer deref / out-of-bounds assert) on top of r10, the 2026-09-20 block-11 amendment (issue #41: the pre-fill test is now `ggml_cuda_graph_is_multi_token()`, not `nodes[0]->ne[1]`, so a split-MoE `-ncmoe` one-token decode split - which starts on an expert tensor `[n_ff, n_expert_used, 1]` - is no longer misread as multi-token and decode replays HIP graphs again: 0 -> 50 warmups / 0 -> 687 replays, `tg` 10.6 -> 12.8 t/s on Qwen3.8-Flash-Next UD-Q4_K_XL, output bit-identical; and `ggml_cuda_graph_update_executable()` destroys/re-instantiates the exec on HIP to avoid the ROCm <= 10.0 `hipGraphExecUpdate` leak, `GGML_HIP_GRAPH_FORCE_UPDATE=1` opt-out) on top of r9, the 2026-09-19 block-15 V3 derived-kq-mask tile-kernel implementation (the mask was MMA-only, so every head above the per-arch WMMA cap - the whole gemma4 head-512 family on gfx1100/gfx1151 - and anything forcing `GGML_CUDA_FA_WMMA_256=0` lost it; the tile arm is bit-identical to the packed mask across the 8 KV types on gfx1201 and 4 on each of gfx1151/gfx1100, is a deep-prefill win on the tile path, and costs decode nothing because the derived branch is hoisted out of the KV loop - decode/verify *always* take the tile kernel, and the first per-iteration form cost -0.5..-0.8 % `tg128` at depth) on top of r8, the 2026-09-19 V3 derived-mask disable-path diagnostic (superseded by r9: the resolve probe's note no longer claims MMA-only, since the head-cap/tile cause is gone) on top of r7, the 2026-09-19 block-15 V3 derived-kq-mask kernel-shape fix (issue #30: the derived mask loader now does two cells per thread step with a `half2` store and hoists `cell_pos` out of the query-row loop; gfx1100 @98k -3.47 -> -0.15 %, gfx1201 27B 2GPU layer @98k -5.96 -> -1.62 %, output bit-identical) on top of r6, the 2026-09-18 FA instance build-time fix (blocks 06/13/15: MMA per-head + tile per-KV-type split, head-512 source order, fused-gate MMQ instances moved out of `mmq.cu`; clean `ggml-hip -j16` 323 -> 236 s, no runtime change) on top of r5's block-04 gfx1100 WMMA-FA head cap back at 256 (issue #30) on
@@ -269,9 +273,10 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `84e76d8a2` is a rebuild of the delivery set
-(tip `f744c11e6ee452d7cdc2786a9b9290b62c8fc5be`, net tree
-  `5938da09d294a01e0862c2d561b0c7ca154de90a` = r4, the 2026-09-25 block-15 RDNA4 GQA-6
-decode/verify FA band (issue #45), on top of r3's 2026-09-25 block-14 `hc_combine` CPU-reference
+(tip `62eaaec3e41bbefeda2f3625ecd6e6f7e814e2f0`, net tree
+  `de86c5e11f8dbebedec42be16c00cda7f68853a2` = r5, the 2026-09-25 block-15 f16/bf16 coverage of the
+RDNA4 GQA-6 decode/verify FA band (issue #45 follow-up), on top of r4's 2026-09-25 block-15 RDNA4
+GQA-6 decode/verify FA band (issue #45), on top of r3's 2026-09-25 block-14 `hc_combine` CPU-reference
   fix (issue #44) plus the 28-patch `beta/mmb-general` re-base and its gfx1100 routed-band fix, on
   top of r2's 2026-09-25 block-10 MoE-VDR arch-scope fix and r1's 2026-09-24 re-base onto upstream
   master `84e76d8a2` - 149 upstream commits, blocks 10/14/15 resolved manually; see `WORKLOG.md`).  The
@@ -1052,7 +1057,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults are read from `release.json`: base
-`84e76d8a2`, blocks tip `f744c11e6ee452d7cdc2786a9b9290b62c8fc5be`): `git format-patch --start-number 0` the block
+`84e76d8a2`, blocks tip `62eaaec3e41bbefeda2f3625ecd6e6f7e814e2f0`): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working
