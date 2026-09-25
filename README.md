@@ -489,7 +489,7 @@ following users for the assistance in finding issues and offering solutions!
 - https://github.com/overdoingism  (issue #45: the RDNA4 head-256 GQA-6 decode/verify flash-attention band, reported with the diagnosis, op-level data, the round-robin KV split idea and a working opt-in patch; the r4 block-15 band is built on that submission)
 - https://github.com/pwilkin  (the `strix-halo` fork at https://github.com/pwilkin/llama.cpp/commits/strix-halo/, heavily adapted for the MMB bf16-WMMA dequant-weight GEMM work in `beta/mmb-general/`)
 - https://github.com/tungel
-- https://github.com/DanoPTT  (block-08 mul_mat+add through-view shape guard, PR #15)
+- https://github.com/DanoPTT  (block-08 mul_mat+add through-view shape guard, PR #15; and issue #45 follow-up: the f16 verify-width diagnosis / the f16 + bf16 band coverage folded into block 15 in r5/r6, measured on their R9700)
 
 I, and everyone else who benefits from this work, really appreciate you!
 
