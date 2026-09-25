@@ -23,18 +23,19 @@ corresponding subset; the original 38-commit history is still in this repo's git
 core), and the rejected per-M `nwarps` experiment lives in [`../../wip/nwarps/`](../../wip/nwarps/).
 
 ```sh
-# base = the r13 delivery tree (release.json: base ebbb18522, tree bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12)
+# base = the current r4 delivery tree (release.json: base 84e76d8a2, tree 5938da09d294a01e0862c2d561b0c7ca154de90a)
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
-git checkout ebbb18522
-bash <this-repo>/scripts/apply-all.sh .        # -> branch rdna-boosts, tree bb7b6d07... (r13)
+git checkout 84e76d8a2
+bash <this-repo>/scripts/apply-all.sh .        # -> branch rdna-boosts, tree 5938da09... (r4)
 git checkout -b mmb-beta
-git am <this-repo>/beta/mmb-general/patches/*.patch   # 28/28, tree 468c6496...
+git am <this-repo>/beta/mmb-general/patches/*.patch   # 28/28, tree 70cc895a...
 ```
 
-Verified 2026-09-25: strict **`git am` 28/28** from the r13 tree, producing
-**`468c64963ae45e72367c73809efa7cc038217e8a`** (tree-identical to the combined `gap-closing-denseband`
-tree).  The merge-back of the gfx1100 work and the cross-arch verification that the overlay does not
-disturb gfx1201 are in [`combined-set-verification.md`](combined-set-verification.md); the gfx1151
+Verified 2026-09-25: strict **`git am` 28/28** from the r4 tree, producing
+**`70cc895a0745f9b1a9290bc6b49906ed8bed02ae`** (the r13-based overlay was `468c6496…`; the r4 re-base
+needed no conflict resolution -- see `README.md`).  The merge-back of the gfx1100 work and the
+cross-arch verification that the overlay does not disturb gfx1201 are in
+[`combined-set-verification.md`](combined-set-verification.md); the gfx1151
 re-validation checklist is [`BETA-TESTING.md`](BETA-TESTING.md).
 
 ## The five groups

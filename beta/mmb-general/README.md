@@ -4,8 +4,9 @@
 campaign on 2026-09-25; re-based onto upstream master `84e76d8a2` on 2026-09-24, re-ported on delivery
 r2 (2026-09-25), re-based onto r3 and gfx1100-fixed on 2026-09-25).  Not part of the
 delivery.**  This is the beta patch set: **28 patches**, verified `git am` **28/28** from the delivery
-tree, applied tree **`0daefe229e60bdb721034ee282959e8f15269365`** on the current baseline `84e76d8a2`
-(r3 delivery tree `08fe2b77…`; previously r2 delivery / `e00275ff…`, r13 `bb7b6d07…` → `468c6496…`).  It is staged for the ~4–5 day beta
+tree, applied tree **`70cc895a0745f9b1a9290bc6b49906ed8bed02ae`** on the current r4 delivery tree
+`5938da09…` (`84e76d8a2` base; r3 `08fe2b77…` / `0daefe22…`, r2 `ea7acf2d…` / `e00275ff…`,
+r13 `bb7b6d07…` / `468c6496…`).  It is staged for the ~4–5 day beta
 window, after which the maintainer decides whether it becomes a delivery block (the `AGENTS.md`
 promotion rule).
 
@@ -16,6 +17,18 @@ promotion rule).
 
 > **New session working the promotion: read [`HANDOVER.md`](HANDOVER.md)** — its "FOR THE NEXT
 > SESSION" brief is the self-contained handoff.  This file is the running (dated) record.
+
+> **2026-09-25 (r4) — RE-BASED onto the r4 delivery.**  The delivery moved to `v16-84e76d8a2-r4`
+> (`5938da09…`, the block-15 RDNA4 GQA-6 decode/verify FA band, issue #45) and the 28 patches were
+> re-based onto it (applied tree `70cc895a…`, **strict 28/28** on a fresh r4 worktree).  The re-base
+> needed **no conflict resolution**: the beta set touches `fattn-qsa*.cu`/`fattn-qsa3.cu` and the
+> QSA/MMB code paths, while r4 only changed the dense `GGML_OP_FLASH_ATTN_EXT` files
+> (`fattn.cu`/`fattn-common.cuh`/`fattn-mma-f16.cuh`).  The only change to the patch bodies is a
+> 12-line hunk offset in `tests/test-backend-ops.cpp` (r4 added its qwen35 band cases ahead of the
+> beta's QSA cases); the r4 band and the beta campaign therefore compose without any performance
+> trade.  `scripts/apply-beta.sh`'s `RDNA_BETA_TREE` default and `mmb-general.patch` are updated.
+> Re-run the gfx1151 four-gate re-validation on `70cc895a` before shipping (the tree changes only by
+> the r4 band, so the r3 GREEN record carries over unless a gate disagrees).
 
 > **2026-09-25 (r3) — RE-BASED onto the r3 delivery + the gfx1100 routed-band fix.**  The delivery
 > moved to `v16-84e76d8a2-r3` (tree `08fe2b77…`, the block-14 `hc_combine` CPU-reference fix) and the

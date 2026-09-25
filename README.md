@@ -13,7 +13,7 @@ the whole set or pick the ones you want.  An optional, **opt-in beta set**
 (`beta/mmb-general/`, 28 patches) layers the `mmb` (bf16-WMMA weight GEMM)
 campaign on top — see the [Beta addendum](#beta-addendum-the-mmb-beta-set).
 That set is re-based onto this baseline and its `apply-beta.sh` tree assertion
-is updated (applied tree `0daefe22…`).
+is updated (r4 applied tree `70cc895a…`, after r3's `0daefe22…`).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -225,7 +225,7 @@ bash <path-to-this-repo>/scripts/apply-beta.sh .
 #   1. if the 16 delivery blocks are not applied yet, runs scripts/apply-all.sh first
 #      (creates branch `rdna-boosts`);
 #   2. applies beta/mmb-general/patches/*.patch (strict 28/28) on a new `mmb-beta` branch.
-#   result: applied tree 0daefe229e60bdb721034ee282959e8f15269365
+#   result: applied tree 70cc895a0745f9b1a9290bc6b49906ed8bed02ae
 ```
 
 `scripts/apply-beta.sh` is **base-aware**: it detects an already-applied delivery (the current
