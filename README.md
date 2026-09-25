@@ -216,8 +216,10 @@ git add -A && git commit -m "rdna-boosts: block 15: campaign memory wins"
 The workflow above applies the **16 delivery blocks only**.  The `mmb` (bf16-WMMA dequant weight
 GEMM) campaign is a separate, **opt-in 28-patch beta set** in
 [`beta/mmb-general/`](beta/mmb-general/) — it is **not part of the delivery** and is still in its
-beta window (see [`beta/mmb-general/README.md`](beta/mmb-general/README.md)).  To apply the delivery
-**and** the beta set in one step:
+beta window (see [`beta/mmb-general/README.md`](beta/mmb-general/README.md)).  Much of the MMB
+kernel work is heavily adapted from **[pwilkin](https://github.com/pwilkin)**'s
+[`strix-halo` fork](https://github.com/pwilkin/llama.cpp/commits/strix-halo/), with thanks.  To apply
+the delivery **and** the beta set in one step:
 
 ```bash
 # from a llama.cpp checkout (a fresh clone, or one with the delivery already applied):
@@ -375,8 +377,9 @@ for per-block verification and `BASELINE.md` for provenance.
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
 - Canonical 16-block chain: tip **`f744c11e6ee452d7cdc2786a9b9290b62c8fc5be`**, net tree
   **`5938da09d294a01e0862c2d561b0c7ca154de90a`**; release **`v16-84e76d8a2-r4`**.
-- **The RDNA4 GQA-6 decode/verify FA band is folded (block 15, r4, 2026-09-25, issue #45):** the
-  head-256 GQA-6 `n_q <= 8` band no longer pays the tile kernel's 3x K/V re-fetch/dequantization --
+- **The RDNA4 GQA-6 decode/verify FA band is folded (block 15, r4, 2026-09-25, issue #45, reported by
+  [@overdoingism](https://github.com/overdoingism)):** the
+  head-256 GQA-6 `n_q <= 8` band no longer pays the tile kernel's 3x K/V re-fetch/dequantization;
   the whole band runs the WMMA kernel with the GQA group folded into one block (`ncols2 = 8`) and the
   KV split round-robin over a fixed `P = nsm` blocks, so decode and every verify width reduce
   identically.  Covers every native quantized K/V type; default on (`GGML_HIP_FA_BAND_WMMA=0` opts
@@ -474,6 +477,8 @@ following users for the assistance in finding issues and offering solutions!
 - https://github.com/bakon11
 - https://github.com/briansp2020  (block-13 moe_weighted_reduction float4 remainder fix + block-14 MUL_MAT_ID pair-fusion layout gate, issues #19 and #18)
 - https://github.com/eoprede
+- https://github.com/overdoingism  (issue #45: the RDNA4 head-256 GQA-6 decode/verify flash-attention band, reported with the diagnosis, op-level data, the round-robin KV split idea and a working opt-in patch; the r4 block-15 band is built on that submission)
+- https://github.com/pwilkin  (the `strix-halo` fork at https://github.com/pwilkin/llama.cpp/commits/strix-halo/, heavily adapted for the MMB bf16-WMMA dequant-weight GEMM work in `beta/mmb-general/`)
 - https://github.com/tungel
 - https://github.com/DanoPTT  (block-08 mul_mat+add through-view shape guard, PR #15)
 
