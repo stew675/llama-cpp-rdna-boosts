@@ -1,4 +1,4 @@
-From aac1ad73b93a5fe940af23b3136d531d40b56cd5 Mon Sep 17 00:00:00 2001
+From 918b0c4b5485ff229834ae33e76bd71910d843be Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Thu, 24 Sep 2026 08:33:41 -0500
 Subject: [PATCH 27/28] WIP MMVQ: extend the routed band to W=16 + the gfx1151
@@ -35,7 +35,7 @@ gfx1151 revalidation/port brief: wip/closing-the-gap/gfx1151-closing.md
  3 files changed, 89 insertions(+), 37 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 54953c1f7..bc6de8bd6 100644
+index 54953c1f7..d90c1a841 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -2365,7 +2365,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
@@ -49,7 +49,7 @@ index 54953c1f7..bc6de8bd6 100644
 +    // column counts; the qwen4exp n_tokens = 9 verify step).  Keep the ksplit band for those rows.
 +    // GGML_CUDA_DISABLE_MMVQ_DENSE_BAND=1 is the bisect/A-B kill-switch (default on).
 +    static const bool dense_band_off = getenv("GGML_CUDA_DISABLE_MMVQ_DENSE_BAND") != nullptr;
-+    if (!use_mmvq && !dense_band_off && (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) && ne11 <= MMVQ_MOE_MAX_BATCH_SIZE && src0->ne[1] % 128 != 0) {
++    if (!use_mmvq && !dense_band_off && (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) && ggml_is_quantized(src0->type) && ne11 <= MMVQ_MOE_MAX_BATCH_SIZE && src0->ne[1] % 128 != 0) {
 +        use_mmvq = true;
 +    }
 +    if (use_mmvq) {

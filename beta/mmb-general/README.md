@@ -3,7 +3,7 @@
 **Status: BETA (promoted from `wip/mmb-general` on 2026-09-21; consolidated with the `closing-the-gap`
 campaign on 2026-09-25; re-based onto upstream master `84e76d8a2` on 2026-09-24).  Not part of the
 delivery.**  This is the beta patch set: **28 patches**, verified `git am` **28/28** from the delivery
-tree, applied tree **`2e4e8004f0562485a3b7ba179cd4781a227989ad`** on the current baseline `84e76d8a2`
+tree, applied tree **`7f339b10fdde414700cbc6e82acb103d2ad24da8`** on the current baseline `84e76d8a2`
 (2026-09-24 re-base; previously r13 `bb7b6d07…` → `468c6496…`).  It is staged for the ~4–5 day beta
 window, after which the maintainer decides whether it becomes a delivery block (the `AGENTS.md`
 promotion rule).
@@ -18,12 +18,14 @@ promotion rule).
 
 > **2026-09-24 — RE-BASED onto `84e76d8a2`.**  The delivery baseline moved to upstream master
 > `84e76d8a2` (release `v16-84e76d8a2-r1`, delivery tree `336d0f43…`) and these 28 patches were
-> re-based onto it (applied tree `2e4e8004…`, `apply-beta.sh` assertion updated, strict 28/28 on a
+> re-based onto it (applied tree `7f339b10…`, `apply-beta.sh` assertion updated, strict 28/28 on a
 > fresh worktree).  Only two patches needed conflict resolution (`0014` GDN/PLE conv1d and `0015`
 > narrow-row RMS norm): upstream's restructured `ggml_backend_cuda_graph_optimize` loop dropped the
 > old early `if (op != GGML_MUL) continue;`, so each fusion's alloc-dep block is now inserted at the
 > top of the loop and upstream's `topk_moe` handling is kept.  gfx1151 smoke gates green (config row,
-> oracles, width probes, MTP acceptance 0.80).
+> oracles, width probes, MTP acceptance 0.80).  A one-line guard was also folded into patch `0027`
+> (`ggml_is_quantized(src0->type)` on the gfx1151 dense-band force), fixing a full `MUL_MAT_ID` oracle
+> abort on non-quantized weights (`type_a=f32`); the oracle is now **929/929** — see `BETA-TESTING.md` §7.
 
 **What is in the beta set.**  Patches `0001`–`0012` are the original gfx1151-developed,
 gfx1201/gfx1100-portable `mmb` core (the `mmb` GEMM, `qsa3`, the F32/tiny-M kernels, HC16, the

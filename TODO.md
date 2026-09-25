@@ -12,7 +12,7 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
 release **`v16-84e76d8a2-r1`** — the re-base onto upstream master `84e76d8a2` (149 upstream commits
 past `ebbb18522`; blocks 00-09 replayed without textual conflict, blocks 10/14/15 resolved manually;
 gfx1151 build + coherence + op oracles + width probes green).  The beta set
-(`beta/mmb-general`, 28 patches) is re-based on the same base (tree `2e4e8004…`).  Full record:
+(`beta/mmb-general`, 28 patches) is re-based on the same base (tree `7f339b10…`).  Full record:
 `WORKLOG.md` 2026-09-24.
 
 **Previous state (2026-09-18, r5):** the delivery is the **16-patch set** against fork point

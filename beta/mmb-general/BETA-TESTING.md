@@ -37,13 +37,13 @@ per-arch table or arch-neutral.  Re-validating confirms that reasoning.
 ```sh
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 84e76d8a2                                   # the fork point
-bash <repo>/scripts/apply-beta.sh . <repo>               # apply-all + 28/28, tree 2e4e8004...
-git rev-parse HEAD^{tree}                                # expect 2e4e8004f0562485a3b7ba179cd4781a227989ad
+bash <repo>/scripts/apply-beta.sh . <repo>               # apply-all + 28/28, tree 7f339b10...
+git rev-parse HEAD^{tree}                                # expect 7f339b10fdde414700cbc6e82acb103d2ad24da8
 ```
 
 Re-based 2026-09-24 onto upstream master `84e76d8a2` (release `v16-84e76d8a2-r1`); the previous r13
 tree was `468c6496…`.  Verified strict `git am` **28/28** on a fresh `84e76d8a2` worktree with the
-delivery set applied first (delivery tree `336d0f43…`), producing `2e4e8004…`; only `0014` (GDN/PLE
+delivery set applied first (delivery tree `336d0f43…`), producing `7f339b10…`; only `0014` (GDN/PLE
 conv1d) and `0015` (narrow-row RMS norm) needed a conflict resolution (upstream's restructured
 `ggml_backend_cuda_graph_optimize` loop).  Build with the usual gfx1151 script; the runtime env is
 `export LD_LIBRARY_PATH=/opt/rocm-7.14-gfx1151/lib:$LD_LIBRARY_PATH`.
@@ -221,14 +221,28 @@ bash <repo>/scripts/apply-beta.sh . <repo>      # apply-all + 28/28, tree 468c64
 ## 7. 2026-09-24 re-base smoke (gfx1151)
 
 The set was re-based onto upstream master `84e76d8a2` (delivery `v16-84e76d8a2-r1`) and smoke-tested on
-gfx1151 (ROCm 7.14, `~/bin/build-llama-rocm-714`, clean build 6 m 41 s):
+gfx1151 (ROCm 7.14, `~/bin/build-llama-rocm-714`):
 
 * `GGML_CUDA_MMB_CFG=1` → `cc=0x1001151 dense_geom=0 … routed=1` (the RDNA3_5 row, unchanged).
-* `test-backend-ops -o FLASH_ATTN_QSA` **26/26**; `-o GATED_DELTA_NET` **46/46**.
-* `test-logits-width-probe` **PASS (worst maxdiff 0)** on Qwen3.5-4B, qwen4exp Q4_K_M and
-  Qwen3.6-35B-A3B Q4_K_M (prose prompt, 512/512).
-* qwen4exp Q4_K_M + Q4_K_M MTP sidecar, prose, seed 42 / temp 0 / `--reasoning off`, `-n 1500`:
-  **draft acceptance 0.80091** (`acc per pos = 0.916, 0.785, 0.698`), 33.2 t/s vs plain 23.7 t/s.
+* `test-backend-ops -o FLASH_ATTN_EXT` **5956/5956**, `-o FLASH_ATTN_QSA` **26/26**,
+  `-o GATED_DELTA_NET` **46/46**, `-o LIGHTNING_INDEXER` **225/225**, `-o INDEXER_TOPK` 0/0.
+* `test-logits-width-probe … 1024 512` **PASS (worst maxdiff 0)** on Qwen3.5-4B, Qwen3.6-35B-A3B Q4_K_M
+  and qwen4exp IQ4_XS; `plain == draft-mtp n3` text **byte-identical** on dense 27B Q8_0, the MoE and
+  qwen4exp.
+* `test-recurrent-state-rollback` max diff 0.
+* MTP Protocol A (`-n 2000`, seed 42, temp 0, `--reasoning off`): dense 27B 0.82188 (20.2 vs 7.6 t/s),
+  MoE 0.76164 (87.3 vs 53.7), qwen4exp 0.82151 (41.2 vs 25.1), shared sidecar 0.81962 with 0 `X < Y`.
+* Cross-checkpoint parity against the old `~/llama.cpp` r13+beta build is within ~2 % (qwen4exp
+  prefill/deep-decode and MoE prefill/decode).
 
-This is a smoke pass on the new base, not a replacement for the full gfx1151 beta-window
-re-validation above.
+### 2026-09-24 — `MUL_MAT_ID` abort fixed in patch `0027`
+
+`test-backend-ops -o MUL_MAT_ID` **aborted** (`mmvq.cu` default) on a `type_a=f32` case.  Patch `0027`'s
+gfx1151 dense-band force in `ggml_cuda_mul_mat` enabled MMVQ for *any* small batch with
+`src0->ne[1] % 128 != 0`, including non-quantized weights; the F32 `MUL_MAT_ID` fallback slice then
+reached the MMVQ type switch, which has no F32 case.  The base delivery and upstream do not have the
+force.  A one-line guard (`ggml_is_quantized(src0->type)`) was folded into patch `0027`; the full
+`MUL_MAT_ID` oracle is now **929/929** (matching upstream), and the quantized MoE `tg128/tg512`
+(56.33 / 56.63) is unchanged.  Applied tree after the fix: **`7f339b10…`**.
+
+The full gfx1151 beta-window re-validation above is still owed on this tree.
