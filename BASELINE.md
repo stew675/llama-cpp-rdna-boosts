@@ -15,13 +15,17 @@ numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
 > **Current baseline marker:** the current delivery baseline is **`84e76d8a2`** (2026-09-24),
-> the fork point of release **`v16-84e76d8a2-r5`** (canonical tip
-> `62eaaec3e41bbefeda2f3625ecd6e6f7e814e2f0`, tree
-> `de86c5e11f8dbebedec42be16c00cda7f68853a2`; r5 = the 2026-09-25 block-15 follow-up that extends the
-> RDNA4 head-256 GQA-6 decode/verify FA band (issue #45) to f16 (and, through its opt-in native arm,
-> bf16) with a per-K/V-element-size config - 2-byte types `ncols1 = 2` / `P = max(2, 3*nsm/4)`,
+> the fork point of release **`v16-84e76d8a2-r6`** (canonical tip
+> `b3c3051a72df21f600f5ae13b244c8212210ca2e`, tree
+> `504894e61e17c6616b54871abee9fb23beda38bd`; r6 = the 2026-09-25 block-15 bf16 native default flip,
+> which makes native bf16 the default so a bf16 cache takes the RDNA4 GQA-6 decode/verify band
+> (`GGML_CUDA_FA_KV_NATIVE=0` is the single kill-switch; bf16 kv 16384 verify widths 1.5-2.3x faster,
+> +14 % `draft-mtp n3` at ~30k; 28-patch beta re-cut onto r6, applied tree `1df5769c…`)
+> on top of r5 = the 2026-09-25 block-15 follow-up that extends the
+> RDNA4 head-256 GQA-6 decode/verify FA band (issue #45) to f16 (and bf16 through its native arm)
+> with a per-K/V-element-size config - 2-byte types `ncols1 = 2` / `P = max(2, 3*nsm/4)`,
 > native-quantized `ncols1 = 4` / `P = nsm`; f16 verify widths 2.1-3.2x faster, +13 % `draft-mtp n3`
-> at ~30k, plain f16 decode -2.5..-4.2 %; 28-patch beta re-cut onto r5, applied tree `469082e4…`)
+> at ~30k, plain f16 decode -2.5..-4.2 %
 > on top of r4 = the 2026-09-25 block-15 RDNA4 head-256 GQA-6
 > decode/verify FA band (issue #45: the whole `n_q <= 8` band runs the WMMA kernel with the GQA group
 > folded into `ncols2 = 8` and a round-robin KV split over a fixed `P` blocks, so decode and

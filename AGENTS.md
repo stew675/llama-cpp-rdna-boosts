@@ -9,16 +9,19 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`84e76d8a2`** (upstream master, 2026-09-24
-re-base; release `v16-84e76d8a2-r5`, canonical tip `62eaaec3e41bbefeda2f3625ecd6e6f7e814e2f0`, tree
-`de86c5e11f8dbebedec42be16c00cda7f68853a2` — r4's block-15 amendment (issue #45) sends the RDNA4
+re-base; release `v16-84e76d8a2-r6`, canonical tip `b3c3051a72df21f600f5ae13b244c8212210ca2e`, tree
+`504894e61e17c6616b54871abee9fb23beda38bd` — r4's block-15 amendment (issue #45) sends the RDNA4
 head-256 GQA-6 decode/verify band (`n_q <= 8`, every native quantized K/V type) to the WMMA kernel
 with the GQA group folded into one block (ncols2 = 8) and the KV split round-robin over a fixed
 P = nsm blocks, so decode and every verify width reduce identically; default ON, prefill untouched,
-+13-18 % `draft-mtp n3` at ~40k, and r5's follow-up (issue #45 comment, @DanoPTT) extends the same
-band to f16 (and, through its opt-in native arm, bf16) with a per-K/V-element-size config (2-byte:
++13-18 % `draft-mtp n3` at ~40k, r5's follow-up (issue #45 comment, @DanoPTT) extends the same
+band to f16 (and bf16 through its native arm) with a per-K/V-element-size config (2-byte:
 ncols1 = 2, P = max(2, 3*nsm/4); native-quantized unchanged), so f16 verify widths are 2.1-3.2x
 faster and 27B `draft-mtp n3` at ~30k gains +13 % (f16) / +14 % (bf16 native) for a 2.5-4.2 % plain
-f16-decode cost; r1's 149-upstream-commit re-base (only blocks
+f16-decode cost, and r6 (2026-09-25) flips the bf16 native K/V arm to default ON
+(`ggml_cuda_fattn_kv_native_bf16_enabled()` now matches q8_0/q4_0; `GGML_CUDA_FA_KV_NATIVE=0` is the
+single kill-switch) since r5 made native bf16 the path to that band and the incoming beta prefill
+boosts outweigh its small prefill cost; r1's 149-upstream-commit re-base (only blocks
 10/14/15 resolved manually), r2's block-10 MoE-VDR arch-scope fix (the wide-VDR
 `mul_mat_vec_q_moe` entry points now apply to RDNA4/RDNA3_0 only, via one gate in
 `get_vec_dot_q_cuda()`/`get_vdr_mmvq()`; RDNA3_5/gfx115x uses the dense VDR, recovering the base-16
@@ -213,7 +216,9 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   default), **V4** native q8_0/q4_0 K/V and **V5** native bf16 K/V in the FA
   kernels (one `GGML_CUDA_FA_KV_NATIVE` switch; **amended 2026-09-14**,
   issue #30: unset = auto → native q8_0/q4_0 **on** / bf16 off, `=1` force
-  all on, `=0` force the F16-staging path).  The beta patch was cut 2026-09-10 and **amended twice on
+  all on, `=0` force the F16-staging path; **amended again 2026-09-25 (r6):
+  bf16 flipped to default-**on** in auto mode**, so `=0` is the one
+  kill-switch for every native arm).  The beta patch was cut 2026-09-10 and **amended twice on
   2026-09-10: V5, then the RDNA3_5/gfx1151 fix** (the gfx1151
   amendment enables V3 on a HIP iGPU -- the probe had rejected
   `GGML_BACKEND_DEVICE_TYPE_IGPU` -- and requires a single KV stream in
@@ -273,8 +278,9 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `84e76d8a2` is a rebuild of the delivery set
-(tip `62eaaec3e41bbefeda2f3625ecd6e6f7e814e2f0`, net tree
-  `de86c5e11f8dbebedec42be16c00cda7f68853a2` = r5, the 2026-09-25 block-15 f16/bf16 coverage of the
+(tip `b3c3051a72df21f600f5ae13b244c8212210ca2e`, net tree
+  `504894e61e17c6616b54871abee9fb23beda38bd` = r6, the 2026-09-25 block-15 bf16 native default flip,
+on top of r5's f16/bf16 coverage of the
 RDNA4 GQA-6 decode/verify FA band (issue #45 follow-up), on top of r4's 2026-09-25 block-15 RDNA4
 GQA-6 decode/verify FA band (issue #45), on top of r3's 2026-09-25 block-14 `hc_combine` CPU-reference
   fix (issue #44) plus the 28-patch `beta/mmb-general` re-base and its gfx1100 routed-band fix, on
@@ -901,15 +907,18 @@ full set is ~1136 t/s (**+36 %**), and the first `hc_combine_norm` win was left 
   dsv4 lightning indexer), **V4** native q8_0/q4_0 and **V5** native bf16
   K/V in the FA kernels (one `GGML_CUDA_FA_KV_NATIVE` switch; **amended
   2026-09-14**, issue #30: **unset = auto → native q8_0/q4_0 on / bf16
-  off**, `=1` force all on, `=0` force the F16-staging path).  The F16
+  off**, `=1` force all on, `=0` force the F16-staging path; **amended
+  again 2026-09-25 (r6): bf16 flipped to default-on**, so in auto mode every
+  native arm is on and `=0` disables them all).  The F16
   whole-cache staging pass is a *decode-depth* cost for the sub-F16 quants
   (q8_0 `tg64` d65536 18.92 → **23.29**, q4_0 19.72 → **22.82**, ~1.2-1.3 %
   prefill, bit-identical and `W=1..8`-pure), and removing it also **fixes
   the adaptive-MTP high-context load failure** (`--spec-draft-n-max 12
   -c 196608 q8_0`: the ~744 MiB scratch was the 260 MiB the draft context
   was short).  V4's original ~1.7 % figure stands for the opt-in era; V5
-  (bf16) stays opt-in at 0.2-2.4 % for a bf16 cache to cost exactly what an
-  f16 one does; the per-operand staging source is one shared type code
+  (bf16) was opt-in at 0.2-2.4 % for a bf16 cache to cost exactly what an
+  f16 one does, and **r6 (2026-09-25) flips it default-on** because r5 made
+  native bf16 the path onto the RDNA4 GQA-6 decode/verify band; the per-operand staging source is one shared type code
   `FATTN_KV_NATIVE_{NONE,Q8_0,Q4_0,BF16}`, so the launcher, the alloc-size
   query and the kernels cannot disagree).  **Amended 2026-09-15 (r3)**: the prefill staging arena is
   grown outside the compute-graph reserve, so `--fit` / `llama_get_memory_breakdown` never counted
@@ -1057,7 +1066,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults are read from `release.json`: base
-`84e76d8a2`, blocks tip `62eaaec3e41bbefeda2f3625ecd6e6f7e814e2f0`): `git format-patch --start-number 0` the block
+`84e76d8a2`, blocks tip `b3c3051a72df21f600f5ae13b244c8212210ca2e`): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working

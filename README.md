@@ -13,7 +13,7 @@ the whole set or pick the ones you want.  An optional, **opt-in beta set**
 (`beta/mmb-general/`, 28 patches) layers the `mmb` (bf16-WMMA weight GEMM)
 campaign on top — see the [Beta addendum](#beta-addendum-the-mmb-beta-set).
 That set is re-based onto this baseline and its `apply-beta.sh` tree assertion
-is updated (r5 applied tree `469082e4…`, after r4's `70cc895a…` and r3's `0daefe22…`).
+is updated (r6 applied tree `1df5769c…`, after r5's `469082e4…`, r4's `70cc895a…` and r3's `0daefe22…`).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -39,10 +39,10 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
 (the tag is the release identity: `v16-<fork-point>-r<N>`, e.g.
-**`v16-84e76d8a2-r5`**, where `r1` is the re-base, `r2` the block-10 MoE-VDR arch-scope fix, `r3` the
+**`v16-84e76d8a2-r6`**, where `r1` is the re-base, `r2` the block-10 MoE-VDR arch-scope fix, `r3` the
 block-14 `hc_combine` CPU-reference fix (issue #44) + the beta re-base, `r4` the block-15 RDNA4
 GQA-6 decode/verify flash-attention band (issue #45), `r5` the block-15 f16/bf16 band coverage
-(issue #45 follow-up), and each later release on the
+(issue #45 follow-up), `r6` the block-15 bf16 native default flip, and each later release on the
 same base increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
@@ -228,7 +228,7 @@ bash <path-to-this-repo>/scripts/apply-beta.sh .
 #   1. if the 16 delivery blocks are not applied yet, runs scripts/apply-all.sh first
 #      (creates branch `rdna-boosts`);
 #   2. applies beta/mmb-general/patches/*.patch (strict 28/28) on a new `mmb-beta` branch.
-#   result: applied tree 469082e4111974570be204e0c007d7ecbfeb7e73
+#   result: applied tree 1df5769ccbf9510c0740fda497b56bde10a28398
 ```
 
 `scripts/apply-beta.sh` is **base-aware**: it detects an already-applied delivery (the current
@@ -376,8 +376,8 @@ for per-block verification and `BASELINE.md` for provenance.
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
-- Canonical 16-block chain: tip **`62eaaec3e41bbefeda2f3625ecd6e6f7e814e2f0`**, net tree
-  **`de86c5e11f8dbebedec42be16c00cda7f68853a2`**; release **`v16-84e76d8a2-r5`**.
+- Canonical 16-block chain: tip **`b3c3051a72df21f600f5ae13b244c8212210ca2e`**, net tree
+  **`504894e61e17c6616b54871abee9fb23beda38bd`**; release **`v16-84e76d8a2-r6`**.
 - **The RDNA4 GQA-6 decode/verify FA band covers f16 (and, through its native arm, bf16) too
   (block 15, r5, 2026-09-25, issue #45 follow-up, reported by
   [@DanoPTT](https://github.com/DanoPTT)):** the
@@ -388,9 +388,12 @@ for per-block verification and `BASELINE.md` for provenance.
   [@overdoingism](https://github.com/overdoingism)) and r5 extends it to the 2-byte types with a
   per-element-size config: native-quantized keeps `ncols1 = 4` / `P = nsm`, the 2-byte types take
   `ncols1 = 2` / `P = max(2, 3*nsm/4)`.  f16 kv 102400 verify widths 2.1-3.2x faster; 27B
-  `draft-mtp n3` at ~30k +13 % (f16) / +14 % (bf16 native); plain f16 decode -2.5..-4.2 %.  Default on
+  `draft-mtp n3` at ~30k +13 % (f16) / +14 % (bf16 native); plain f16 decode -2.5..-4.2 %.  **r6
+  (2026-09-25) flips the bf16 native K/V arm to default ON** (`GGML_CUDA_FA_KV_NATIVE` unset now
+  enables it, `=0` disables every native arm), since r5 made native bf16 the path to the band and the
+  incoming beta prefill boosts outweigh its small prefill cost.  Default on
   (`GGML_HIP_FA_BAND_WMMA=0` opts out); prefill untouched.  See `patches/README.md`
-  (2026-09-25 block-15 r4 and r5) and `WORKLOG.md`.
+  (2026-09-25 block-15 r4/r5/r6) and `WORKLOG.md`.
 - **The qwen4exp CPU `hc_combine` reference is correct** (block 14, r3, 2026-09-25, issue #44):
   `ggml_compute_forward_hc_combine_f32` read `block_out` with a `t*ne[1]` row stride and `inject`
   with `t*hc`, but the model hands both over as multi-token tensors whose own `nb[1]` differs

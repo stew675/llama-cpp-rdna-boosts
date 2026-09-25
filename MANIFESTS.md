@@ -14,7 +14,19 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release (2026-09-25) — `v16-84e76d8a2-r5`:** a block-15 follow-up (issue #45 comment,
+**Current release (2026-09-25) — `v16-84e76d8a2-r6`:** a block-15 policy flip.  The bf16 native K/V
+arm is now default-ON in auto mode (`ggml_cuda_fattn_kv_native_bf16_enabled()` matches
+q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl; `GGML_CUDA_FA_KV_NATIVE=0` is the single kill-switch, `=1` forces all
+on).  r5 made native bf16 the path to the RDNA4 GQA-6 decode/verify band, so the original opt-in
+reason no longer applied; the maintainer weighted the incoming beta prefill boosts against its small
+prefill cost.  bf16 kv 16384 `n_q` 1/3/5/8: band 145/164/264/285 vs staged tile 104/276/428/655 us;
+27B `draft-mtp n3` at ~30k 49.3 -> 56.1 t/s, prefill flat; `test-backend-ops -o FLASH_ATTN_EXT`
+6340/6340 and bf16 `plain == draft-mtp` byte-identical.  The 28-patch beta set is re-cut onto r6
+(strict 28/28, tree `1df5769c…`; bodies byte-identical).  Canonical tip
+`b3c3051a72df21f600f5ae13b244c8212210ca2e`, tree `504894e61e17c6616b54871abee9fb23beda38bd`.  Full
+record: `WORKLOG.md` (2026-09-25 r6).
+
+**Previous release (2026-09-25) — `v16-84e76d8a2-r5`:** a block-15 follow-up (issue #45 comment,
 @DanoPTT).  The RDNA4 head-256 GQA-6 decode/verify FA band now also covers f16 (and, through its
 opt-in native arm, bf16), with a per-K/V-element-size config: native-quantized keeps `ncols1 = 4` /
 `P = nsm`, the 2-byte types take `ncols1 = 2` / `P = max(2, 3*nsm/4)`.  The gate no longer asks "has a

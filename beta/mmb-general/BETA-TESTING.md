@@ -37,15 +37,16 @@ per-arch table or arch-neutral.  Re-validating confirms that reasoning.
 ```sh
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 84e76d8a2                                   # the fork point
-bash <repo>/scripts/apply-beta.sh . <repo>               # apply-all + 28/28, tree 469082e4...
-git rev-parse HEAD^{tree}                                # expect 469082e4111974570be204e0c007d7ecbfeb7e73
+bash <repo>/scripts/apply-beta.sh . <repo>               # apply-all + 28/28, tree 1df5769c...
+git rev-parse HEAD^{tree}                                # expect 1df5769ccbf9510c0740fda497b56bde10a28398
 ```
 
-Re-cut 2026-09-25 onto the delivery's `v16-84e76d8a2-r5` (delivery tree `de86c5e1…`, the block-15
-follow-up that puts f16/bf16 on the RDNA4 GQA-6 decode/verify FA band, issue #45), producing
-`469082e4…`.  The patch bodies are **byte-identical** to the r4-based set (only the `From` lines and
-`commits.txt` changed), because the beta set does not touch the dense `GGML_OP_FLASH_ATTN_EXT` files
-r5 changes.  Before that, r4's was `70cc895a…` (delivery tree `5938da09…`), r3's `0daefe22…`, r2's
+Re-cut 2026-09-25 onto the delivery's `v16-84e76d8a2-r6` (delivery tree `504894e6…`, the block-15
+bf16 native default flip), producing `1df5769c…`.  The patch bodies are **byte-identical** to the
+r5-based set (only the `From` lines and `commits.txt` changed), because the beta set does not touch
+the dense `GGML_OP_FLASH_ATTN_EXT` files the delivery changes.  Before that, r5's was `469082e4…`
+(delivery tree `de86c5e1…`, f16/bf16 on the RDNA4 GQA-6 decode/verify FA band, issue #45), r4's
+`70cc895a…` (delivery tree `5938da09…`), r3's `0daefe22…`, r2's
 `e00275ff…` and r13's `468c6496…`.  Verified strict `git am` **28/28** on a fresh `84e76d8a2` worktree
 with the delivery set applied first; only `0014` (GDN/PLE
 conv1d) and `0015` (narrow-row RMS norm) needed a conflict resolution at the 2026-09-24 re-base

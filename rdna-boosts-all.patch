@@ -4726,7 +4726,7 @@ index 651524be7..a8cf54eb5 100644
      const block_q4_1 * x = (const block_q4_1 *) vx;
  
 diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
-index 6d1ce52db..91224be2c 100644
+index 6d1ce52db..4f2660787 100644
 --- a/ggml/src/ggml-cuda/fattn-common.cuh
 +++ b/ggml/src/ggml-cuda/fattn-common.cuh
 @@ -18,6 +18,17 @@
@@ -4764,7 +4764,7 @@ index 6d1ce52db..91224be2c 100644
  
  typedef float (*vec_dot_KQ_t)(
      const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
-@@ -84,6 +103,489 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
+@@ -84,6 +103,492 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
      return data;
  }
  
@@ -4787,17 +4787,20 @@ index 6d1ce52db..91224be2c 100644
 +
 +static constexpr int GGML_CUDA_FA_Q8_CHUNK = 8; // elements staged per 16-byte shared-memory chunk
 +
-+// ACTIVATION POLICY (amended 2026-09-14, issue #30 — refinement uncovered by the reporter):
-+// native staging is the DEFAULT for the sub-F16 quantized K/V types (q8_0): the F16 scratch's
++// ACTIVATION POLICY (amended 2026-09-14, issue #30 — refinement uncovered by the reporter; bf16
++// flipped to default-ON 2026-09-25, the r6 block-15 amendment): native staging is the DEFAULT for the
++// sub-F16 quantized K/V types (q8_0): the F16 scratch's
 +// per-ubatch conversion pass is proportional to n_kv and runs on every decode step, so removing it is
 +// worth +23 % decode at d = 65536 on gfx1201 (18.92 -> 23.29 tg64, ahead of stock's 22.43) while
 +// costing only ~1.2 % prefill, and it drops ~744 MiB of scratch at a 200k context.  A q8_0 cache is
 +// itself the memory-constrained configuration, so the scratch it removes matters there too.  bf16 (V5,
-+// below) stays opt-in: bf16 already has a native tile/vec path, so native staging only removes the MMA
-+// scratch, at ~1-2 % prefill with no equivalent decode win.
-+//   GGML_CUDA_FA_KV_NATIVE unset -> auto: q8_0 native ON, bf16 native OFF
-+//   GGML_CUDA_FA_KV_NATIVE=1     -> force both ON
-+//   GGML_CUDA_FA_KV_NATIVE=0     -> force both OFF (the pre-2026-09-14 behavior; the F16 scratch path)
++// below) is now default-ON for the same class of reason: it removes the MMA scratch, and since r5's
++// band coverage the native arm is what puts bf16 on the RDNA4 GQA-6 decode/verify band (+14 %
++// `draft-mtp n3` at ~30k on gfx1201), so it has the equivalent decode win the original opt-in note
++// was waiting for.  The prefill cost it pays (0.2-2.4 % on the MMA path) is the trade.
++//   GGML_CUDA_FA_KV_NATIVE unset -> auto: q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl native ON, bf16 native ON
++//   GGML_CUDA_FA_KV_NATIVE=1     -> force all ON
++//   GGML_CUDA_FA_KV_NATIVE=0     -> force all OFF (the pre-2026-09-14 behavior; the F16 scratch path)
 +enum fattn_kv_native_policy : int {
 +    FATTN_KV_NATIVE_AUTO = -1,
 +    FATTN_KV_NATIVE_OFF  =  0,
@@ -4827,9 +4830,9 @@ index 6d1ce52db..91224be2c 100644
 +    return ggml_cuda_fattn_kv_native_policy() != (int) FATTN_KV_NATIVE_OFF;
 +}
 +
-+// bf16 native staging (V5): opt-in only.
++// bf16 native staging (V5): default on in auto mode (r6, 2026-09-25), same policy as q8_0/q4_0.
 +static inline bool ggml_cuda_fattn_kv_native_bf16_enabled() {
-+    return ggml_cuda_fattn_kv_native_policy() == (int) FATTN_KV_NATIVE_ON;
++    return ggml_cuda_fattn_kv_native_policy() != (int) FATTN_KV_NATIVE_OFF;
 +}
 +
 +// `t` is the K or V operand of a FLASH_ATTN_EXT node.
@@ -5254,7 +5257,7 @@ index 6d1ce52db..91224be2c 100644
  template <int D, int nthreads>
  static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_f16(
      const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds_v) {
-@@ -300,6 +802,48 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_1(
+@@ -300,6 +805,48 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_1(
      return sum;
  }
  
@@ -5303,7 +5306,7 @@ index 6d1ce52db..91224be2c 100644
  template <int D, int nthreads>
  static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
      const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
-@@ -584,6 +1128,49 @@ static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict
+@@ -584,6 +1131,49 @@ static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict
      }
  }
  
@@ -5353,7 +5356,7 @@ index 6d1ce52db..91224be2c 100644
  template <typename T, int ne>
  static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
      const block_q8_0 * x = (const block_q8_0 *) vx;
-@@ -631,6 +1218,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
+@@ -631,6 +1221,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
          return vec_dot_fattn_vec_KQ_q5_1<D, nthreads>;
      } else if constexpr (type_K == GGML_TYPE_Q8_0) {
          return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
@@ -5362,7 +5365,7 @@ index 6d1ce52db..91224be2c 100644
      } else if constexpr (type_K == GGML_TYPE_BF16) {
          return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
      } else {
-@@ -653,6 +1242,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
+@@ -653,6 +1245,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
          return dequantize_V_q5_1<T, ne>;
      } else if constexpr (type_V == GGML_TYPE_Q8_0) {
          return dequantize_V_q8_0<T, ne>;
@@ -5371,7 +5374,7 @@ index 6d1ce52db..91224be2c 100644
      } else if constexpr (type_V == GGML_TYPE_BF16) {
          return dequantize_V_bf16<float, ne>;
      } else {
-@@ -972,10 +1563,134 @@ static __global__ void flash_attn_combine_results(
+@@ -972,10 +1566,135 @@ static __global__ void flash_attn_combine_results(
      dst[tid] = VKQ_numerator / VKQ_denominator;
  }
  
@@ -5480,8 +5483,9 @@ index 6d1ce52db..91224be2c 100644
 +    // has no native read (NONE), but it is only DRAM bound at n_q = 1: at verify widths the pinned
 +    // tile config (ncols2 = 2 for GQA 6) re-reads and re-stages every K/V element three times per
 +    // query row, so the band's single fold is the width-pure answer there too (issue #45 follow-up,
-+    // reported by @DanoPTT).  bf16 reaches the band through its opt-in native arm (kv_native = BF16)
-+    // and is deliberately NOT banded while it is staged, where the whole-cache conversion dominates.
++    // reported by @DanoPTT).  bf16 reaches the band through its native arm (kv_native = BF16), which
++    // is the default since the r6 flip; it is deliberately NOT banded while it is staged, where the
++    // whole-cache conversion dominates (that staged case only appears under GGML_CUDA_FA_KV_NATIVE=0).
 +    const int  kv_native = ggml_cuda_fattn_kv_native_type(K);
 +    const bool kv_quant  = kv_native != FATTN_KV_NATIVE_NONE && kv_native == ggml_cuda_fattn_kv_native_type(V);
 +    const bool kv_f16    = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
@@ -5506,7 +5510,7 @@ index 6d1ce52db..91224be2c 100644
      const int warp_size = WARP_SIZE
  ) {
      constexpr int ncols = ncols1 * ncols2;
-@@ -989,6 +1704,11 @@ void launch_fattn(
+@@ -989,6 +1708,11 @@ void launch_fattn(
      const ggml_tensor * mask  = dst->src[3];
      const ggml_tensor * sinks = dst->src[4];
  
@@ -5518,7 +5522,7 @@ index 6d1ce52db..91224be2c 100644
      ggml_tensor * KQV = dst;
  
      GGML_ASSERT(Q->type == GGML_TYPE_F32);
-@@ -1006,8 +1726,94 @@ void launch_fattn(
+@@ -1006,8 +1730,94 @@ void launch_fattn(
      const int cc  = ggml_cuda_info().devices[id].cc;
      const int nsm = ggml_cuda_info().devices[id].nsm;
  
@@ -5614,7 +5618,7 @@ index 6d1ce52db..91224be2c 100644
  
      ggml_cuda_pool_alloc<int>    KV_max(pool);
      ggml_cuda_pool_alloc<float>  dst_tmp(pool);
-@@ -1023,12 +1829,17 @@ void launch_fattn(
+@@ -1023,12 +1833,17 @@ void launch_fattn(
      size_t nb22 = V->nb[2];
      size_t nb23 = V->nb[3];
  
@@ -5635,7 +5639,7 @@ index 6d1ce52db..91224be2c 100644
          if (ggml_is_contiguously_allocated(K)) {
              to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
              to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
-@@ -1051,7 +1862,7 @@ void launch_fattn(
+@@ -1051,7 +1866,7 @@ void launch_fattn(
          K_data = (char *) K_f16;
      }
  
@@ -5644,7 +5648,7 @@ index 6d1ce52db..91224be2c 100644
          if (V_is_K_view) {
              V_data = K_data;
              nb21   = nb11;
-@@ -1061,8 +1872,13 @@ void launch_fattn(
+@@ -1061,8 +1876,13 @@ void launch_fattn(
              const size_t bs = ggml_blck_size(V->type);
              const size_t ts = ggml_type_size(V->type);
  
@@ -5660,7 +5664,7 @@ index 6d1ce52db..91224be2c 100644
              if (ggml_is_contiguously_allocated(V)) {
                  to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                  to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
-@@ -1157,7 +1973,29 @@ void launch_fattn(
+@@ -1157,7 +1977,29 @@ void launch_fattn(
          blocks_num.y = 1;
          blocks_num.z = 1;
  
@@ -5691,7 +5695,7 @@ index 6d1ce52db..91224be2c 100644
              const int nblocks_stream_k_raw = std::min(max_blocks, ntiles_KV*ntiles_dst);
              // Round down to a multiple of ntiles_dst so that each output tile gets the same number of blocks (avoids fixup).
              // Only do this if the occupancy loss from rounding is acceptable.
-@@ -1173,20 +2011,29 @@ void launch_fattn(
+@@ -1173,20 +2015,29 @@ void launch_fattn(
              blocks_num.x = nblocks_stream_k;
          }
  
@@ -5724,7 +5728,7 @@ index 6d1ce52db..91224be2c 100644
              const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
              const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
  
-@@ -1249,14 +2096,19 @@ void launch_fattn(
+@@ -1249,14 +2100,19 @@ void launch_fattn(
          K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
          nb21, nb22, nb23,
          mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
@@ -5747,7 +5751,7 @@ index 6d1ce52db..91224be2c 100644
              const int bpt         = nblocks_sk / ntiles_dst;
  
              const uint3 fd0 = init_fastdiv_values(ntiles_x * ntiles_z_gqa * K->ne[2]);
-@@ -1271,7 +2123,7 @@ void launch_fattn(
+@@ -1271,7 +2127,7 @@ void launch_fattn(
                  (float *) KQV->data, dst_tmp_meta.ptr,
                   Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                   gqa_ratio, bpt, fd0, fd1, fd2);

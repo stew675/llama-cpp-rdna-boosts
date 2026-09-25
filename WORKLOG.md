@@ -1,5 +1,37 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-25 (r6) — `v16-84e76d8a2-r6`: bf16 native K/V staging is on by default (block 15)
+
+**Release** `v16-84e76d8a2-r6`, base `84e76d8a2` (tree `5112eedbce0548ab9547d883e8aa54e993852e94`),
+tip `b3c3051a72df21f600f5ae13b244c8212210ca2e`, net tree
+`504894e61e17c6616b54871abee9fb23beda38bd`.  `scripts/validate-set.sh` green on a fresh `84e76d8a2`
+tarball (strict **16/16** `git am`).  Only block 15 changed; blocks 00-14 are byte-identical.
+
+**The change.**  `ggml_cuda_fattn_kv_native_bf16_enabled()` now returns `policy != OFF` instead of
+`policy == ON`, so `GGML_CUDA_FA_KV_NATIVE` unset (auto) enables the bf16 native arm exactly like the
+q8_0/q4_0/Q4_1/Q5_0/Q5_1/iq4_nl arms; `GGML_CUDA_FA_KV_NATIVE=0` disables them all (the single
+existing kill-switch), `=1` forces all on.  One line of policy plus its comment.
+
+**Why.**  The V5 bf16 native arm was left opt-in on 2026-09-15 with the reasoning "it only removes the
+MMA scratch, at ~1-2 % prefill with no equivalent decode win".  r5 removed the second half: the band
+gate follows `ggml_cuda_fattn_kv_native_type`, so native bf16 is what puts a bf16 cache on the RDNA4
+GQA-6 decode/verify band.  Maintainer call (2026-09-25): the beta prefill boosts being integrated soon
+easily outweigh the small prefill cost, so bf16 gets the same treatment as the other types.
+
+**Measured (gfx1201 R9700, 27B qwen35 head 256 GQA 6, `test-backend-ops perf` @ kv 16384, bf16 KV,
+us/run).**  Default (band) 145/164/264/285 at `n_q` 1/3/5/8 vs `GGML_CUDA_FA_KV_NATIVE=0` (staged
+tile) 104/276/428/655 -- the default is 1.5-2.3x faster at every verify width, and the `n_q = 1` cost
+(+40 %) is the same trade f16 already pays.  End to end, 27B UD-Q4_K_XL `draft-mtp` n3 at ~30k ctx,
+1 GPU: default **56.1 t/s** vs `=0` **49.3 t/s** (the opt-in arm, now the default); prefill flat
+(1026.7/1024.4 vs 1021.2/1021.5 t/s).
+
+**Purity.**  `test-backend-ops -o FLASH_ATTN_EXT` **6340/6340 on ROCm0**; bf16 `--spec-type none ==
+draft-mtp` byte-identical at ~5k (`904d905c8c29`) and ~30k (`d515c9f933ea`).
+
+**Beta re-base.**  The 28 `beta/mmb-general` patches were re-cut onto r6 (strict **28/28** on a fresh
+delivery, applied tree **`1df5769c…`**, previously `469082e4…` on r5).  The patch bodies are
+byte-identical to the r5-based set - only the `From <sha>` lines and `commits.txt` changed.
+
 ## 2026-09-25 (r5) — `v16-84e76d8a2-r5`: f16 (and bf16) on the RDNA4 GQA-6 FA band (block 15, issue #45 follow-up)
 
 **Release** `v16-84e76d8a2-r5`, base `84e76d8a2` (tree `5112eedbce0548ab9547d883e8aa54e993852e94`),
@@ -43,8 +75,9 @@ kv 16384: 1 94 -> 119, 3 246 -> 141, 5 393 -> 224, 8 603 -> 241.  End to end, 27
 `draft-mtp` n3, 1 GPU, `-n 256`: ~30k ctx 48.9 -> 55.4 t/s (**+13 %**), ~5k ctx 58.2 -> 57.8 (flat);
 plain decode (`--spec-type none`) 28.5 -> 27.8 (~5k, -2.5 %) and 26.1 -> 25.0 (~30k, -4.2 %).  bf16 with
 its native arm on (`GGML_CUDA_FA_KV_NATIVE=1`), same deep shape: 49.3 -> 56.0 t/s (**+14 %**), prefill
-flat (1023 vs 1023 t/s at ~30k); the bf16 native default is left opt-in (its prefill trade is
-unchanged).
+flat (1023 vs 1023 t/s at ~30k); the bf16 native default is left opt-in in r5 (its prefill trade is
+unchanged), then **flipped ON in r6** (2026-09-25) once the maintainer weighted the incoming beta
+prefill boosts against it.
 
 **Purity.**  `test-backend-ops -o FLASH_ATTN_EXT` **6340/6340 on ROCm0** (the 389-case qwen35 subset is
 green on the final build); f16 `--spec-type none == draft-mtp` byte-identical at ~5k (`3c31df680ac1`)
