@@ -8,7 +8,7 @@ It does **not** rebuild or ship the patches themselves; it re-creates the
 patched tree the same way the consumer workflow does:
 
 1. download upstream `ggml-org/llama.cpp` at the fork point (read from
-   `release.json`; currently `ebbb18522`)
+   `release.json`; currently `84e76d8a2`)
    as a tarball (no full history),
 2. `git init` + one base commit (`git add -A -f`, so upstream-tracked files
    that match `.gitignore` are kept and the base tree is canonical), then
@@ -31,8 +31,8 @@ Registry path: `ghcr.io/<owner>/<repo>` (here
 | 10.0 | `rocm/dev-ubuntu-24.04:10.0.0-full`     | `rocm-10.0`, `server-rocm-10.0`, `light-rocm-10.0`, `full-rocm-10.0`, `latest` |
 
 Each tag also has an immutable `<tag>-<fork-point>` variant pinned to the fork
-point (currently `<tag>-ebbb18522`; earlier releases used
-`<tag>-d1d3c3396` and `<tag>-790cf51aa`). `rocm-<version>` is an alias of `server-rocm-<version>` (the serving
+point (currently `<tag>-84e76d8a2`; earlier releases used
+`<tag>-ebbb18522`, `<tag>-d1d3c3396` and `<tag>-790cf51aa`). `rocm-<version>` is an alias of `server-rocm-<version>` (the serving
 image); `latest` points at the newest ROCm (10.0) server image.
 
 The binaries are built for `gfx1100;gfx1151;gfx1200;gfx1201` (RDNA3 /

@@ -6,7 +6,16 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (2026-09-18, r5):** the delivery is the **16-patch set** against fork point
+**Current state (2026-09-24, r1):** the delivery is the **16-patch set** against fork point
+**`84e76d8a2`** (block 00 + blocks 01-15), canonical 16-block tip
+**`ad858dee1057da63b8d81b883675de82ba60b2d9`** (tree `336d0f4318002409ed8ad5b04ae5bf344238c8ca`),
+release **`v16-84e76d8a2-r1`** — the re-base onto upstream master `84e76d8a2` (149 upstream commits
+past `ebbb18522`; blocks 00-09 replayed without textual conflict, blocks 10/14/15 resolved manually;
+gfx1151 build + coherence + op oracles + width probes green).  The beta set
+(`beta/mmb-general`, 28 patches) is re-based on the same base (tree `2e4e8004…`).  Full record:
+`WORKLOG.md` 2026-09-24.
+
+**Previous state (2026-09-18, r5):** the delivery is the **16-patch set** against fork point
 **`ebbb18522`** (block 00 + blocks 01-15), canonical 16-block tip
 **`d82d07a312dbc3d5df945b36cbb893784f0f31cf`** (tree `06b89471790c52d7afa32f75755fb1b3b22edada`),
 release **`v16-ebbb18522-r5`** — a second block-04 gfx1100 amendment on top of r4: the RDNA3_0 WMMA FA

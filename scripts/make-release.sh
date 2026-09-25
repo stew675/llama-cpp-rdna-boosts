@@ -31,11 +31,11 @@
 # component is a prefix of the recorded base -- but the short form is the
 # convention in the tag history.
 #   e.g.  ./scripts/make-release.sh \
-#           --base ebbb18522 \
-#           --base-tree "$(git -C ~/llama.cpp rev-parse ebbb18522^{tree})" \
+#           --base 84e76d8a2 \
+#           --base-tree "$(git -C ~/llama.cpp rev-parse 84e76d8a2^{tree})" \
 #           --tip <canonical-block-15-tip> \
 #           --tree "$(git -C ~/llama.cpp rev-parse <canonical-block-15-tip>^{tree})" \
-#           --release v16-ebbb18522-r1
+#           --release v16-84e76d8a2-r1
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

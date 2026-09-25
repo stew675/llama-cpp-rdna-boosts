@@ -36,12 +36,12 @@ FORK="${1:-$REPO_DIR/../llama.cpp}"
 # Defaults come from release.json (the delivery's single source of truth), so
 # a fresh checkout re-cuts the set without a re-base edit.  Fall back to the
 # current known values when release.json is absent.
-_def_base="ebbb18522"
+_def_base="84e76d8a2"
 _def_tip="6b1e9ffd1"
 if command -v jq >/dev/null 2>&1 && [ -f "$REPO_DIR/release.json" ]; then
     _def_base="$(jq -r '.base // empty' "$REPO_DIR/release.json" 2>/dev/null || true)"
     _def_tip="$(jq -r '.tip  // empty' "$REPO_DIR/release.json" 2>/dev/null || true)"
-    _def_base="${_def_base:-ebbb18522}"
+    _def_base="${_def_base:-84e76d8a2}"
     _def_tip="${_def_tip:-6b1e9ffd1}"
 fi
 
