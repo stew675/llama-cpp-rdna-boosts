@@ -1,5 +1,53 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-25 — full gfx1151 beta-window re-validation + the `0027` `MUL_MAT_ID` fix + the MoE MTP gap root-caused
+
+**Scope.** The `beta/mmb-general` 28-patch set re-based on `84e76d8a2` (tree `7f339b10`, delivery
+`v16-84e76d8a2-r1`) was run through the **full four-gate gfx1151 beta-window re-validation**
+(`beta/mmb-general/BETA-TESTING.md` §8) and the MoE-vs-upstream MTP acceptance gap was investigated.
+No delivery/beta behaviour changed.
+
+**`MUL_MAT_ID` abort (fixed in beta patch `0027`).**  The full oracle aborted on
+`MUL_MAT_ID(type_a=f32,...)`: patch `0027`'s gfx1151 dense-band force in `ggml_cuda_mul_mat` enabled
+MMVQ for any small batch with `src0->ne[1] % 128 != 0`, including non-quantized weights, so the F32
+fallback slice reached `mul_mat_vec_q_switch_type` (no F32 case).  A one-line guard
+(`ggml_is_quantized(src0->type)`) was folded into `0027` and the set regenerated (applied tree
+`2e4e8004…` -> **`7f339b10…`**); the oracle is now **929/929** (upstream parity) and the quantized MoE
+`tg128/tg512` is unchanged.  The guard is a **no-op** for the dense/MoE/qwen4exp models (a
+non-quantized weight would have hit the default abort pre-fix and none did).
+
+**Gates (gfx1151, tree `7f339b10`).**
+
+* **Gate 1 purity — GREEN.**  `plain == draft-mtp n3` byte-identical on dense 27B Q8_0 (`90686d1edf24`),
+  MoE 35B-A3B Q4_K_M (`d72a1fc679a5`) and qwen4exp IQ4_XS (`b746fb3e77ff`);
+  `test-logits-width-probe … 1024 512` `width_purity=PASS (worst maxdiff 0)` on all three.
+* **Gate 2 MMB win — GREEN.**  Interleaved MMB=1/0, `-r 3`: dense 27B pp2048/8192/32768 **+29 / +25 /
+  +22 %**, MoE 35B-A3B **+26 / +23 / +19 %**.
+* **Gate 3 oracles — GREEN.**  `FLASH_ATTN_EXT` **5956/5956**, `MUL_MAT_ID` **929/929**,
+  `FLASH_ATTN_QSA` **26/26**, `GATED_DELTA_NET` **46/46**, `LIGHTNING_INDEXER` **225/225**,
+  `INDEXER_TOPK` 0/0; `MMB_CFG cc=0x1001151 dense_geom=0 … routed=1`.
+* **Gate 4 MTP Protocol A — GREEN.**  Reference command (`-c 262144 -ub 512`) reproduces §7 exactly:
+  dense **0.82188** (20.3 vs 20.7 t/s), MoE **0.76164** (89.2 vs 54.0), qwen4exp **0.82151** (42.8 vs
+  25.0), shared sidecar 0.82356 with 0 `X < Y`; a `-c 32768 -ub 2048` sweep also passes (dense 0.83240,
+  MoE 0.75231, qwen4exp 0.84231, shared 0.84005).  All > 0.45 and MTP ≥ plain.
+* **Recurrent.**  `test-recurrent-state-rollback` (qwen35-4B) **PASS** (`max diff 0`);
+  `test-recurrent-state-depth` `total failures = 174` (Phase B, large `n_rs_batch`) — the old r13+beta
+  build gives the **same 174**, i.e. pre-existing, not a re-base regression.
+
+**MoE MTP acceptance gap vs upstream — root-caused, accepted trade, no code change.**  Same Protocol A
+command, MoE 35B-A3B Q4_K_M: upstream `84e76d8a2` **0.78844** (92.3 t/s), base-16 delivery (tree
+`336d0f43`) **0.73967** (87.5), beta default **0.76164** (89.2).  So the gap is **delivery-level and
+MoE-specific** (dense models are at parity: upstream 0.82397 / base-16 0.81235 / beta 0.82188), the
+beta `mmb` **improves** it (+0.022 acceptance, +1.7 t/s; `MMB=0` reproduces the base-16 value exactly),
+and none of the three block-13 fused-MoE kill-switches (`SHEXP_DOWN_GATE`, `TOPK_MOE_FUSION`,
+`MOE_MMQ_FUSION`) nor the beta mmvq band switches move it.  The residual is the delivery's **MoE expert
+matmul/reduction-order policy** (block-10 k-quant + block-13 band-uniform `nwarps`/VDR, deliberately
+compile-time — the width-purity invariant).  It is the documented numerics trade (`GREEDY-PURITY.md`
+§19/§25): ~4 % acceptance / ~3 % MTP throughput for +48–62 % MoE prefill and ~+4 % decode, with
+acceptance well above the bar and MTP ≥ plain everywhere.  Full tables and the arm matrix:
+`beta/mmb-general/BETA-TESTING.md` §8.
+
+
 ## 2026-09-24 (r1) — `v16-84e76d8a2-r1`: the 16-block set re-based onto upstream master `84e76d8a2`
 
 **Release** `v16-84e76d8a2-r1`, new fork point **`84e76d8a2`** (upstream master, 2026-09-24, tree

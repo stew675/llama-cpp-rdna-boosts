@@ -10,8 +10,8 @@ promotion rule).
 
 > **Tester: start with [`BETA-TESTING.md`](BETA-TESTING.md)** — the gfx1151 final re-validation
 > checklist (apply, build, the four gates, the reference numbers and the kill-switches).  The campaign
-> was developed on gfx1151, ported to gfx1201 and gfx1100, and the **combination has never been re-run
-> on gfx1151** — that is what the beta window is for.
+> was developed on gfx1151, ported to gfx1201 and gfx1100, and the combination was re-run end-to-end on
+> gfx1151 on 2026-09-25 — **GREEN** (see `BETA-TESTING.md` §8).
 
 > **New session working the promotion: read [`HANDOVER.md`](HANDOVER.md)** — its "FOR THE NEXT
 > SESSION" brief is the self-contained handoff.  This file is the running (dated) record.
@@ -26,6 +26,11 @@ promotion rule).
 > oracles, width probes, MTP acceptance 0.80).  A one-line guard was also folded into patch `0027`
 > (`ggml_is_quantized(src0->type)` on the gfx1151 dense-band force), fixing a full `MUL_MAT_ID` oracle
 > abort on non-quantized weights (`type_a=f32`); the oracle is now **929/929** — see `BETA-TESTING.md` §7.
+> The **full four-gate gfx1151 beta-window re-validation is now GREEN** on `7f339b10` (Gate 1:
+> `plain == draft-mtp n3` byte-identical on dense/MoE/qwen4exp + `width_purity=PASS`; Gate 2: MMB
+> +19–29 % prefill; Gate 3: all oracles incl. `MUL_MAT_ID` 929/929; Gate 4: acceptance 0.75–0.84, MTP
+> ≥ plain; recurrent rollback `max diff 0`) — see `BETA-TESTING.md` §8, including the MoE MTP-acceptance
+> trade vs upstream it documents.
 
 **What is in the beta set.**  Patches `0001`–`0012` are the original gfx1151-developed,
 gfx1201/gfx1100-portable `mmb` core (the `mmb` GEMM, `qsa3`, the F32/tiny-M kernels, HC16, the

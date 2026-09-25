@@ -233,8 +233,10 @@ patches; otherwise it runs `scripts/apply-all.sh` first.  Overrides: `RDNA_BETA_
 produce; set to empty to skip the assertion).
 
 > The beta set is a **research campaign, not a delivery release**: its gfx1151 beta-window
-> re-validation is pending.  Read [`beta/mmb-general/BETA-TESTING.md`](beta/mmb-general/BETA-TESTING.md)
-> and its kill-switch list before building or shipping it.
+> re-validation is **GREEN** (2026-09-25 — the four gates + the recurrent rollback; see
+> [`beta/mmb-general/BETA-TESTING.md`](beta/mmb-general/BETA-TESTING.md) §8), and the maintainer's
+> promotion decision is what remains.  Read that checklist and its kill-switch list before building
+> or shipping it.
 
 ## Recommended configuration — adaptive MTP + `ngram-mod`
 

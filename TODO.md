@@ -6,14 +6,16 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (2026-09-24, r1):** the delivery is the **16-patch set** against fork point
+**Current state (2026-09-25, r1):** the delivery is the **16-patch set** against fork point
 **`84e76d8a2`** (block 00 + blocks 01-15), canonical 16-block tip
 **`ad858dee1057da63b8d81b883675de82ba60b2d9`** (tree `336d0f4318002409ed8ad5b04ae5bf344238c8ca`),
 release **`v16-84e76d8a2-r1`** — the re-base onto upstream master `84e76d8a2` (149 upstream commits
 past `ebbb18522`; blocks 00-09 replayed without textual conflict, blocks 10/14/15 resolved manually;
 gfx1151 build + coherence + op oracles + width probes green).  The beta set
-(`beta/mmb-general`, 28 patches) is re-based on the same base (tree `7f339b10…`).  Full record:
-`WORKLOG.md` 2026-09-24.
+(`beta/mmb-general`, 28 patches) is re-based on the same base (tree `7f339b10…`, with the `0027`
+`MUL_MAT_ID` F32 dense-band guard folded in) and its **full gfx1151 beta-window re-validation is
+GREEN** (2026-09-25 — Gate 1 purity, Gate 2 MMB +19–29 %, Gate 3 oracles incl. `MUL_MAT_ID` 929/929,
+Gate 4 acceptance 0.75–0.84, recurrent rollback `max diff 0`).  Full record: `WORKLOG.md` 2026-09-25.
 
 **Previous state (2026-09-18, r5):** the delivery is the **16-patch set** against fork point
 **`ebbb18522`** (block 00 + blocks 01-15), canonical 16-block tip

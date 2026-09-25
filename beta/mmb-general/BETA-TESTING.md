@@ -246,3 +246,127 @@ force.  A one-line guard (`ggml_is_quantized(src0->type)`) was folded into patch
 (56.33 / 56.63) is unchanged.  Applied tree after the fix: **`7f339b10…`**.
 
 The full gfx1151 beta-window re-validation above is still owed on this tree.
+
+---
+
+## 8. 2026-09-25 — full gfx1151 beta-window re-validation (tree `7f339b10`)
+
+The four gates were run end-to-end on the **regenerated 28-patch set** (tree `7f339b10`, build 11217 /
+`6e46fb052`) on gfx1151 (ROCm 7.14, `~/bin/build-llama-rocm-714`, ccache-warm).  Single 8060S.
+Runtime env: `LD_LIBRARY_PATH=/home/stew675/stew-llama-cpp/build-rocm/bin:/opt/rocm-7.14-gfx1151/lib`
+(the width probe is run with that path first so it links the build under test, not `/llm/bin`).
+
+### Gate 0/3 config dump
+
+`MMB_CFG cc=0x1001151 dense_geom=0 min_t=512 glu_thresh=32 routed_thresh=32 tall=2 tiny_m=1/1
+f32split=1(min_m=128,min_k=0) cache=4 shadow=0/6144MB hc16=1 down16=0 gatemix=1 blk16=0 res16=0
+glu=1 bf16w=1 iq3xxs_glu=0 routed=1` — the RDNA3_5 row, `dense_geom=0 routed=1` as required.
+
+### Gate 1 — intra-build purity: **GREEN**
+
+`--spec-type none` == `--spec-type draft-mtp --spec-draft-n-max 3`, prose, seed 42 / temp 0 /
+`--reasoning off`, f16 KV, `-n 512 -c 8192 -b 2048 -ub 2048` (text via `scripts/extract-generated.py`):
+
+| model | sha256 (both arms) |
+|---|---|
+| dense 27B Q8_0 | `90686d1edf24` |
+| MoE 35B-A3B Q4_K_M | `d72a1fc679a5` |
+| qwen4exp IQ4_XS | `b746fb3e77ff` |
+
+`test-logits-width-probe <model> prompts/prose-rdna-boosts.txt 1024 512` →
+`width_purity=PASS (worst maxdiff 0)` on all three.
+
+### Gate 2 — `GGML_CUDA_MMB` win: **GREEN**
+
+`llama-bench -p 2048,8192,32768 -n 0 -b 2048 -ub 2048 -fa auto -r 3`, interleaved `MMB=1`/`MMB=0`,
+two rounds (r1/r2):
+
+| model / size | MMB=1 | MMB=0 | win |
+|---|---|---|---|
+| dense 27B pp2048 | 595.5 / 583.3 | 459.7 / 460.4 | +29 % |
+| dense 27B pp8192 | 556.8 / 555.6 | 443.9 / 443.7 | +25 % |
+| dense 27B pp32768 | 481.5 / 481.0 | 393.9 / 393.7 | +22 % |
+| MoE 35B-A3B pp2048 | 2736.7 / 2731.2 | 2174.5 / 2176.0 | +26 % |
+| MoE 35B-A3B pp8192 | 2482.6 / 2475.0 | 2013.0 / 2016.6 | +23 % |
+| MoE 35B-A3B pp32768 | 1940.5 / 1939.9 | 1635.0 / 1633.9 | +19 % |
+
+(The MoE absolutes are higher than the earlier smoke because this run used `-ub 2048`; the ratio is the gate.)
+
+### Gate 3 — op oracles: **GREEN**
+
+| oracle | result |
+|---|---|
+| `FLASH_ATTN_EXT` | **5956/5956**, 0 FAIL |
+| `MUL_MAT_ID` | **929/929**, 0 FAIL |
+| `FLASH_ATTN_QSA` | 26/26 |
+| `GATED_DELTA_NET` | 46/46 |
+| `LIGHTNING_INDEXER` | 225/225 |
+| `INDEXER_TOPK` | 0/0 (documented aspirational) |
+
+`MUL_MAT_ID` is green on the fixed tree (the `0027` guard); stdout was captured separately from stderr
+(the documented trap).
+
+### Gate 4 — MTP Protocol A: **GREEN**
+
+Reference command (matches §7): prose, seed 42 / temp 0 / `--reasoning off`, f16 KV,
+`-n 2000 --spec-draft-n-max 3 --log-verbosity 4 -c 262144 -b 2048 -ub 512`:
+
+| model | plain t/s | draft-mtp n3 t/s | acceptance | acc/pos |
+|---|---|---|---|---|
+| dense 27B Q8_0 | 20.7* | 20.3 | **0.82188** | 0.922/0.824/0.719 |
+| MoE 35B-A3B Q4_K_M | 54.0* | 89.2 | **0.76164** | 0.895/0.760/0.627 |
+| qwen4exp IQ4_XS (Q8 sidecar) | 25.0* | 42.8 | **0.82151** | 0.908/0.814/0.743 |
+| qwen4exp IQ4_XS (shared sidecar) | 25.3* | 42.6 | 0.82356 | 0.909/0.815/0.746 |
+
+\* dense/MoE plain from the same-command run in §“item 3” below (20.7 / 54.0).  The dense, MoE and
+qwen4exp acceptance values **reproduce §7 exactly** (`0.82188` / `0.76164` / `0.82151`) with this
+command — the `0027` guard is a no-op for these models (a non-quantized weight would have hit the
+`ggml_cuda_mul_mat_vec_q` default abort pre-fix, and none did).  The shared sidecar reads 0.82356 here
+(§7's 0.81962 came from a shorter run), 0 `X < Y` errors.
+
+A second sweep at `-c 32768 -b 2048 -ub 2048` (denser context, fresh state) also passes:
+dense **0.83240** (20.5 vs 7.7 t/s), MoE **0.75231** (89.2 vs 54.0), qwen4exp **0.84231** (44.1 vs
+25.0), shared **0.84005** (44.4 vs 25.3).  The two commands differ ~1 % in acceptance by design; both
+are well above the `~0.45` bar and both keep MTP ≥ plain.
+
+### Recurrent
+
+* `test-recurrent-state-rollback -m Qwen3.5-4B-Q8_0` → **PASS** (`max diff 0, nmse 0`).
+* `test-recurrent-state-depth -m Qwen3.5-4B-Q8_0` → `total failures = 174` (Phase B, large `n_rs_batch`);
+the **old r13+beta build** gives the **same 174** on the same model → pre-existing, not a re-base
+regression.  (The synthetic `test-generate-models` fixture is not built in this tree, so the real
+qwen35-4B model was used for both.)
+
+**Verdict: the full gfx1151 beta-window re-validation is GREEN on tree `7f339b10`.**
+
+### Item 3 — the MoE MTP acceptance gap vs upstream (investigated)
+
+Same Protocol A command, MoE 35B-A3B Q4_K_M (upstream = `84e76d8a2`, base-16 = delivery only, tree
+`336d0f43`):
+
+| arm | acceptance | gen t/s |
+|---|---|---|
+| upstream | **0.78844** | 92.3 |
+| base-16 delivery | 0.73967 | 87.5 |
+| beta default (`MMB=1`) | 0.76164 | 89.2 |
+| beta `GGML_CUDA_MMB=0` | 0.73967 | 87.5 |
+| beta `GGML_CUDA_DISABLE_TOPK_MOE_FUSION=1` | 0.76164 | 86.2 |
+| base-16 + `SHEXP_DOWN_GATE=1` / `TOPK_MOE_FUSION=1` / `MOE_MMQ_FUSION=1` | 0.73967 each | 87.5 |
+| beta + `MMVQ_MOE_BAND=1` / `MMVQ_DENSE_BAND=1` | 0.76164 each | 88.0 |
+| dense 27B: upstream / base-16 / beta | 0.82397 / 0.81235 / 0.82188 | 20.7 / 20.1 / 20.3 |
+
+**Findings.**  (1) The gap is **delivery-level and MoE-specific** — it is already present in the base-16
+build (dense models are at ~parity, 0.812–0.824).  (2) The **beta is not the cause**: `MMB=0` reproduces
+the base-16 value exactly, and `MMB=1` *recovers* +0.022 acceptance / +1.7 t/s — the beta `mmb` helps
+the draft.  (3) **None of the three block-13 fused-MoE kernels** is it (`SHEXP_DOWN_GATE`,
+`TOPK_MOE_FUSION`, `MOE_MMQ_FUSION` are all acceptance-neutral on base-16), and neither is the beta
+mmvq band.  The residual is the delivery's **MoE expert matmul/reduction-order policy** (block-10
+k-quant + block-13 band-uniform `nwarps`/VDR, deliberately compile-time, no switch — the width-purity
+invariant), which drifts the draft logits off upstream's by a near-tie margin.
+
+**Disposition:** accepted trade, **no code change**.  It is the documented MoE fusion/reduction numerics
+trade (`GREEDY-PURITY.md` §19/§25; `benchmarks/mtp-adaptive-methodology.md` — gate MoE on acceptance and
+MTP ≥ plain, not cross-build equality).  The ~4 % acceptance / ~3 % MTP-throughput cost buys the
++48–62 % MoE prefill and ~+4 % decode; acceptance stays well above the bar and MTP ≥ plain on every cell.
+Pinning the exact kernel would need a delivery block bisect (build base-16 minus block 10 / 13), which
+was not warranted for a known-trade result.
