@@ -14,7 +14,18 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release (2026-09-25) — `v16-84e76d8a2-r3`:** a block-14 amendment + beta re-base.  The
+**Current release (2026-09-25) — `v16-84e76d8a2-r4`:** a block-15 amendment.  The RDNA4 head-256
+GQA-6 decode/verify FA band (`n_q <= 8`) now runs the WMMA kernel with the GQA group folded into one
+block (`ncols2 = 8`) and the KV split round-robin over a fixed `P = nsm` blocks, instead of the tile
+kernel's `ncols2 = 2`, which fetched and dequantized every K/V element once per head pair (3x at GQA
+6).  Covers every native quantized K/V type (q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl), is default on
+(`GGML_HIP_FA_BAND_WMMA=0` opts out) and leaves prefill untouched.  Op level kv 16384 q8_0: `n_q` 3
+326 -> 150, `n_q` 8 814 -> 230 us/run; end-to-end 27B `draft-mtp n3` at ~40k +13-18 % across 1/2/3 GPUs.
+`test-backend-ops -o FLASH_ATTN_EXT` 6340/6340, and `plain == draft-mtp` pure on all eight KV types
+and every verify width (issue #45).  Canonical tip `f744c11e6ee452d7cdc2786a9b9290b62c8fc5be`, tree
+`5938da09d294a01e0862c2d561b0c7ca154de90a`.  Full record: `WORKLOG.md` (2026-09-25 r4).
+
+**Previous release (2026-09-25) — `v16-84e76d8a2-r3`:** a block-14 amendment + beta re-base.  The
 qwen4exp CPU `hc_combine` reference (`ggml_compute_forward_hc_combine_f32`) indexed `block_out` with
 `t*ne[1]` and `inject` with `t*hc` instead of each tensor's own `nb[1]` row stride, so every
 multi-token fused ubatch read the wrong rows; a CPU-resident qwen4exp decoder layer then emitted EOS

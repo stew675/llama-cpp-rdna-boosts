@@ -15,9 +15,13 @@ numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
 > **Current baseline marker:** the current delivery baseline is **`84e76d8a2`** (2026-09-24),
-> the fork point of release **`v16-84e76d8a2-r3`** (canonical tip
-> `9d094a3c3a5013396596f862630a15ff24701b38`, tree
-> `08fe2b77c5f79d69225c11fc293d452f4503cffd`; r3 = the 2026-09-25 block-14 `hc_combine`
+> the fork point of release **`v16-84e76d8a2-r4`** (canonical tip
+> `f744c11e6ee452d7cdc2786a9b9290b62c8fc5be`, tree
+> `5938da09d294a01e0862c2d561b0c7ca154de90a`; r4 = the 2026-09-25 block-15 RDNA4 head-256 GQA-6
+> decode/verify FA band (issue #45: the whole `n_q <= 8` band runs the WMMA kernel with the GQA group
+> folded into `ncols2 = 8` and a round-robin KV split over a fixed `P = nsm` blocks, so decode and
+> every verify width reduce identically; all native quantized K/V types, default on, prefill untouched)
+> on top of r3 = the 2026-09-25 block-14 `hc_combine`
 > CPU-reference fix (issue #44: the CPU reference used `t*ne[1]`/`t*hc` row strides instead of the
 > tensors' own `nb[1]`, corrupting every multi-token fused ubatch on a CPU-resident qwen4exp layer -
 > now mirrors the CUDA kernel, bit-identical at nt == 1) plus the 28-patch `beta/mmb-general` re-base

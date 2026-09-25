@@ -39,8 +39,9 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
 (the tag is the release identity: `v16-<fork-point>-r<N>`, e.g.
-**`v16-84e76d8a2-r3`**, where `r1` is the re-base, `r2` the block-10 MoE-VDR arch-scope fix, `r3` the
-block-14 `hc_combine` CPU-reference fix (issue #44) + the beta re-base, and each later release on the
+**`v16-84e76d8a2-r4`**, where `r1` is the re-base, `r2` the block-10 MoE-VDR arch-scope fix, `r3` the
+block-14 `hc_combine` CPU-reference fix (issue #44) + the beta re-base, `r4` the block-15 RDNA4
+GQA-6 decode/verify flash-attention band (issue #45), and each later release on the
 same base increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
@@ -372,8 +373,15 @@ for per-block verification and `BASELINE.md` for provenance.
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
-- Canonical 16-block chain: tip **`9d094a3c3a5013396596f862630a15ff24701b38`**, net tree
-  **`08fe2b77c5f79d69225c11fc293d452f4503cffd`**; release **`v16-84e76d8a2-r3`**.
+- Canonical 16-block chain: tip **`f744c11e6ee452d7cdc2786a9b9290b62c8fc5be`**, net tree
+  **`5938da09d294a01e0862c2d561b0c7ca154de90a`**; release **`v16-84e76d8a2-r4`**.
+- **The RDNA4 GQA-6 decode/verify FA band is folded (block 15, r4, 2026-09-25, issue #45):** the
+  head-256 GQA-6 `n_q <= 8` band no longer pays the tile kernel's 3x K/V re-fetch/dequantization --
+  the whole band runs the WMMA kernel with the GQA group folded into one block (`ncols2 = 8`) and the
+  KV split round-robin over a fixed `P = nsm` blocks, so decode and every verify width reduce
+  identically.  Covers every native quantized K/V type; default on (`GGML_HIP_FA_BAND_WMMA=0` opts
+  out); prefill untouched; +13-18 % `draft-mtp n3` at ~40k across 1/2/3 GPUs.  See `patches/README.md`
+  (2026-09-25 block-15 r4) and `WORKLOG.md`.
 - **The qwen4exp CPU `hc_combine` reference is correct** (block 14, r3, 2026-09-25, issue #44):
   `ggml_compute_forward_hc_combine_f32` read `block_out` with a `t*ne[1]` row stride and `inject`
   with `t*hc`, but the model hands both over as multi-token tensors whose own `nb[1]` differs

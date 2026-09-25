@@ -9,8 +9,12 @@ A **delivery repo**: it packages the RDNA/ROCm work of the
 [`stew675/llama.cpp`](https://github.com/stew675/llama.cpp) fork
 (`rdna-boosts` branch) as a **16-patch set** (block 00 + blocks 01-15) that
 applies to a clean llama.cpp checkout at the fork point **`84e76d8a2`** (upstream master, 2026-09-24
-re-base; release `v16-84e76d8a2-r3`, canonical tip `9d094a3c3a5013396596f862630a15ff24701b38`, tree
-`08fe2b77c5f79d69225c11fc293d452f4503cffd` — r1's 149-upstream-commit re-base (only blocks
+re-base; release `v16-84e76d8a2-r4`, canonical tip `f744c11e6ee452d7cdc2786a9b9290b62c8fc5be`, tree
+`5938da09d294a01e0862c2d561b0c7ca154de90a` — r4's block-15 amendment (issue #45) sends the RDNA4
+head-256 GQA-6 decode/verify band (`n_q <= 8`, every native quantized K/V type) to the WMMA kernel
+with the GQA group folded into one block (ncols2 = 8) and the KV split round-robin over a fixed
+P = nsm blocks, so decode and every verify width reduce identically; default ON, prefill untouched,
++13-18 % `draft-mtp n3` at ~40k, r1's 149-upstream-commit re-base (only blocks
 10/14/15 resolved manually), r2's block-10 MoE-VDR arch-scope fix (the wide-VDR
 `mul_mat_vec_q_moe` entry points now apply to RDNA4/RDNA3_0 only, via one gate in
 `get_vec_dot_q_cuda()`/`get_vdr_mmvq()`; RDNA3_5/gfx115x uses the dense VDR, recovering the base-16
@@ -265,8 +269,9 @@ The repo is NOT the fork: the fork (source of truth for the block commits)
 lives at `~/llama.cpp`, branch `rdna-boosts`.  **Fork-state warning (read
 before any regeneration):** the **canonical** 16-block
 chain for the current base `84e76d8a2` is a rebuild of the delivery set
-(tip `9d094a3c3a5013396596f862630a15ff24701b38`, net tree
-  `08fe2b77c5f79d69225c11fc293d452f4503cffd` = r3, the 2026-09-25 block-14 `hc_combine` CPU-reference
+(tip `f744c11e6ee452d7cdc2786a9b9290b62c8fc5be`, net tree
+  `5938da09d294a01e0862c2d561b0c7ca154de90a` = r4, the 2026-09-25 block-15 RDNA4 GQA-6
+decode/verify FA band (issue #45), on top of r3's 2026-09-25 block-14 `hc_combine` CPU-reference
   fix (issue #44) plus the 28-patch `beta/mmb-general` re-base and its gfx1100 routed-band fix, on
   top of r2's 2026-09-25 block-10 MoE-VDR arch-scope fix and r1's 2026-09-24 re-base onto upstream
   master `84e76d8a2` - 149 upstream commits, blocks 10/14/15 resolved manually; see `WORKLOG.md`).  The
@@ -1047,7 +1052,7 @@ AR backend is then never reached.
 ### Regenerate the patches (after fork changes)
 
 `scripts/make-patches.sh` (defaults are read from `release.json`: base
-`84e76d8a2`, blocks tip `9d094a3c3a5013396596f862630a15ff24701b38`): `git format-patch --start-number 0` the block
+`84e76d8a2`, blocks tip `f744c11e6ee452d7cdc2786a9b9290b62c8fc5be`): `git format-patch --start-number 0` the block
 commits (all 16 blocks are committed fork commits; block 00 keeps the file
 prefix `0000`; `git diff <base>..<tip>` yields
 `rdna-boosts-all.patch`).  NOTE on the fork topology: **the working

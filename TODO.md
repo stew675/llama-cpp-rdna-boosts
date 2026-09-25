@@ -6,10 +6,13 @@ keeps closed work as a one-liner with a pointer to the dated record.  Details ne
 live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-PURITY.md`, `beta/*`,
 `wip/*` and `benchmarks/`.
 
-**Current state (2026-09-25, r3):** the delivery is the **16-patch set** against fork point
+**Current state (2026-09-25, r4):** the delivery is the **16-patch set** against fork point
 **`84e76d8a2`** (block 00 + blocks 01-15), canonical 16-block tip
-**`9d094a3c3a5013396596f862630a15ff24701b38`** (tree `08fe2b77c5f79d69225c11fc293d452f4503cffd`),
-release **`v16-84e76d8a2-r3`** — r1 = the re-base onto upstream master `84e76d8a2` (149 upstream
+**`f744c11e6ee452d7cdc2786a9b9290b62c8fc5be`** (tree `5938da09d294a01e0862c2d561b0c7ca154de90a`),
+release **`v16-84e76d8a2-r4`** — r4 = the block-15 RDNA4 head-256 GQA-6 decode/verify FA band (issue
+#45: the whole `n_q <= 8` band runs the WMMA kernel with the GQA group folded into `ncols2 = 8` and a
+round-robin KV split over a fixed `P = nsm` blocks, default on, all native quantized K/V types, prefill
+untouched), r1 = the re-base onto upstream master `84e76d8a2` (149 upstream
 commits past `ebbb18522`; blocks 00-09 replayed without textual conflict, blocks 10/14/15 resolved
 manually), r2 = the block-10 MoE-VDR arch-scope fix (the wide-VDR `mul_mat_vec_q_moe` entry points now
 apply to RDNA4/RDNA3_0 only via one gate; RDNA3_5/gfx115x uses the dense VDR, recovering the base-16

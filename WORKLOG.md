@@ -1,5 +1,50 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-25 (r4) — `v16-84e76d8a2-r4`: the RDNA4 GQA-6 decode/verify FA band (block 15, issue #45)
+
+**Release** `v16-84e76d8a2-r4`, base `84e76d8a2` (tree `5112eedbce0548ab9547d883e8aa54e993852e94`),
+tip `f744c11e6ee452d7cdc2786a9b9290b62c8fc5be`, net tree
+`5938da09d294a01e0862c2d561b0c7ca154de90a`.  `scripts/validate-set.sh` green on a fresh `84e76d8a2`
+tarball (strict **16/16** `git am`).  Folded into block 15 (no new block), because the band fast path
+uses the block's native-KV descriptor and derived-mask symbols; block 15 is the tip, so no later block
+is disturbed.
+
+**The bug (issue #45, reported by @overdoingism).**  At head 256 with GQA 6 (Qwen3.8-27B: 24 Q / 4 KV
+heads) the tile kernel can only fold `ncols2 = 2`, because its `ncols2` must divide the GQA ratio, so
+the whole `n_q <= 8` decode/verify band fetched and dequantized every K/V element once per head pair —
+three times per query row.  On gfx1201 a q8_0 cache at `n_q = 1`, kv 102400 reads K/V at ~276 GB/s
+versus ~615 GB/s for f16, i.e. the path is instruction-issue bound, and the fused fold is the fix.
+
+**The fix.**  The whole band (`n_q = 1` included) now routes to the existing WMMA instances
+`(256, ncols1 4|2, ncols2 8)` with the GQA group folded (2 masked columns at GQA 6); no new
+instantiations.  The KV is split round-robin over a fixed `P = nsm` blocks per output tile
+(`launch_fattn`, `GGML_HIP_FA_BAND_WMMA_SPLIT` override).  `P` depends on neither `n_q` nor the KV
+length, so decode and every verify width accumulate the same partials in the same order — the
+round-robin form is what keeps the GREEDY-PURITY band invariant; the reporter's first, contiguous
+stream-k version moved its split points with the 256-padded KV length and diverged at KV position
+18944 = 74×256.  The kernel chooser, the ncols dispatcher and `launch_fattn` share one self-contained
+predicate (`ggml_cuda_fattn_band_wmma_applies`), and `launch_fattn` also requires the `ncols2 == 8`
+template parameter, so a disagreement can never launch the 2-D grid into a kernel whose fast path is
+compiled out.  Coverage follows `ggml_cuda_fattn_kv_native_type` rather than a hand-written type list,
+so it is not q8_0-only: **q8_0, q4_0, q4_1, q5_0, q5_1 and iq4_nl all win** (f16 is DRAM-bound and has
+no native read; bf16 stays on tile while its native arm is opt-in).  Default **ON** (maintainer
+policy); `GGML_HIP_FA_BAND_WMMA=0` opts out, `=2` picks `ncols1 = 2`; `GGML_CUDA_FA_WMMA_256=0` and
+`GGML_CUDA_FA_WMMA_MAX_HEAD<256` still disable it, exactly like the generic head>128 WMMA band.
+
+**Measurements (gfx1201 R9700, 27B qwen35 head 256 GQA 6, q8_0 KV, kv 16384, `test-backend-ops perf`,
+tile -> band µs/run):** `n_q` 3 326 -> 150, `n_q` 5 524 -> 225, `n_q` 8 814 -> 230; `n_q` 1 141 -> 148
+(q4_0/q4_1/iq4_nl are *faster* at `n_q` 1 too; q5_1 is +11 %).  End to end, 27B UD-Q4_K_XL
+`draft-mtp` n3 at ~40k ctx, band off -> on: 1 GPU layer 43.3 -> 51.3, 2 GPU tensor 67.9 -> 76.6, 3 GPU
+tensor 77.6 -> 88.8 t/s (**+13-18 %**).  Prefill is flat: `llama-bench` pp512/2048/4096 2049/2060/2056
+vs 2056/2059/2054 t/s (3-GPU tensor, q8_0), because the band is gated to `n_q <= 8` by construction.
+
+**Purity (band on).**  `test-backend-ops -o FLASH_ATTN_EXT` **6340/6340 on ROCm0**, including 389 new
+qwen35 GQA-6 cases across all eight KV types and both layouts; `plain == draft-mtp` byte-identical on
+all eight KV types at ~40k ctx, 3-GPU tensor (acceptance 0.83-0.86); q8_0/q4_0 text identical across
+`--spec-draft-n-max 3/5/7` (verify widths 4/6/8); 1 GPU layer, 2/3 GPU tensor (including the uneven
+4-KV-head 2/1/1 split) and 3 GPU layer are all pure.  New qwen35-band eval and perf cases live in
+`tests/test-backend-ops.cpp`.
+
 ## 2026-09-25 (r3) — `v16-84e76d8a2-r3`: the qwen4exp HC_COMBINE CPU-reference fix (block 14, issue #44) + beta re-base
 
 **Release** `v16-84e76d8a2-r3`, base `84e76d8a2` (tree `5112eedbce0548ab9547d883e8aa54e993852e94`),
