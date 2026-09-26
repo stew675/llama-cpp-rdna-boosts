@@ -1,0 +1,1553 @@
+From 748d52e0fb519586321093ca9a86bd983aba165f Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Wed, 5 Aug 2026 06:57:38 -0500
+Subject: [PATCH 03/23] llama : direct safetensors loading (M3) + fp8 perf
+ fixes
+
+- new src/llama-safetensors.h/.cpp: parse config.json + safetensors
+  headers, mmap weights, synthesize gguf metadata, tensor data callback
+- llama_model_load_from_file auto-detects safetensors dirs/files
+- D3 hardware gate: fp8 requires a native-FP8 device, full offload
+- transforms ported from conversion/qwen.py (V-head reorder, fp8
+  re-blocking, +1 norms, A_log -exp, MTP mapping); F32 output types
+  for 1D/norm/conv1d tensors per conversion/base.py
+- llama-model-loader: metadata-only path fixes (get_weight fallback,
+  NOT_REQUIRED skip semantics, TENSOR_SKIP handling)
+- fp8.cu: host-side RDNA4 dispatch was compiled out by a device-only
+  #if guard (silent scalar fallback); dot4 GEMV path for n <= 16;
+  GLU fusion excludes F8 (mmvq abort)
+- perf: generation 3.2 -> 72.5 t/s on 1x R9700 (Q8_0 baseline 91.7)
+
+Assisted-by: pi
+---
+ ggml/src/ggml-cuda/fp8.cu       |  17 +-
+ ggml/src/ggml-cuda/fp8.cuh      |  43 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu |   3 +-
+ handoff.md                      | 153 ++++++
+ implementation-plan.md          |  50 +-
+ src/CMakeLists.txt              |   2 +
+ src/llama-model-loader.cpp      |  16 +-
+ src/llama-model-loader.h        |   9 +-
+ src/llama-safetensors.cpp       | 890 ++++++++++++++++++++++++++++++++
+ src/llama-safetensors.h         | 127 +++++
+ src/llama.cpp                   |  37 ++
+ 11 files changed, 1311 insertions(+), 36 deletions(-)
+ create mode 100644 handoff.md
+ create mode 100644 src/llama-safetensors.cpp
+ create mode 100644 src/llama-safetensors.h
+
+diff --git a/ggml/src/ggml-cuda/fp8.cu b/ggml/src/ggml-cuda/fp8.cu
+index 71e831d8e..d8d0231cc 100644
+--- a/ggml/src/ggml-cuda/fp8.cu
++++ b/ggml/src/ggml-cuda/fp8.cu
+@@ -53,15 +53,22 @@ void ggml_cuda_mul_mat_fp8(
+         CUDA_CHECK(cudaGetLastError());
+     }
+ 
+-#if defined(GGML_USE_HIP) && defined(RDNA4)
++    // the fp8 kernels are compiled for the RDNA4 device pass only; on the host
++    // side the launch stubs always exist, so dispatch on the runtime cc
+     if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+         const dim3 block_dims(GGML_FP8_NTHREADS, 1, 1);
+-        const dim3 grid_dims((n + (GGML_FP8_NWARPS * GGML_FP8_TILE_N) - 1) / (GGML_FP8_NWARPS * GGML_FP8_TILE_N), (m + GGML_FP8_TILE_M - 1) / GGML_FP8_TILE_M, 1);
+-        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+-        ggml_cuda_kernel_launch(mul_mat_fp8_wmma, launch_params, src0_d, src1_q_d, src1_s_d, dst_d, k, m, n, n_col_blocks, n_pad);
++        if (n <= GGML_FP8_GEMV_MAX_N) {
++            // dot4 GEMV: one warp per output row, one CTA per 4 rows and token
++            const dim3 grid_dims((m + 3) / 4, n, 1);
++            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
++            ggml_cuda_kernel_launch(mul_mat_fp8_gemv, launch_params, src0_d, src1_q_d, src1_s_d, dst_d, k, m, n, n_col_blocks, n_pad);
++        } else {
++            const dim3 grid_dims((n + (GGML_FP8_NWARPS * GGML_FP8_TILE_N) - 1) / (GGML_FP8_NWARPS * GGML_FP8_TILE_N), (m + GGML_FP8_TILE_M - 1) / GGML_FP8_TILE_M, 1);
++            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
++            ggml_cuda_kernel_launch(mul_mat_fp8_wmma, launch_params, src0_d, src1_q_d, src1_s_d, dst_d, k, m, n, n_col_blocks, n_pad);
++        }
+         return;
+     }
+-#endif
+ 
+     // Scalar fallback (CUDA sm_89+)
+     const dim3 block_dims(32, 8, 1);
+diff --git a/ggml/src/ggml-cuda/fp8.cuh b/ggml/src/ggml-cuda/fp8.cuh
+index b4b210759..9b2838197 100644
+--- a/ggml/src/ggml-cuda/fp8.cuh
++++ b/ggml/src/ggml-cuda/fp8.cuh
+@@ -17,6 +17,7 @@
+ #define GGML_FP8_TILE_K 128
+ #define GGML_FP8_NWARPS 4
+ #define GGML_FP8_NTHREADS (32 * GGML_FP8_NWARPS) // 128
++#define GGML_FP8_GEMV_MAX_N 16 // use the dot4 GEMV below this token count
+ 
+ // fp8 e4m3fn (OCP) decode: value = (-1)^s * 2^(e-7) * (1.m), max 448, NaN = 0x7F/0xFF
+ __device__ __forceinline__ float fp8_e4m3_to_f32(uint8_t x) {
+@@ -220,6 +221,48 @@ __global__ void mul_mat_fp8_wmma(
+ #endif
+ }
+ 
++// dot4-based GEMV for small token batches (n <= GGML_FP8_GEMV_MAX_N), used during
++// generation. One warp per output row; the 32 lanes read the 128 fp8 bytes of a
++// weight block coalesced (4 bytes each) and dot4 them with the shared activation
++// block. This avoids the wmma tile waste (16-token tiles) at batch 1.
++__global__ void mul_mat_fp8_gemv(
++        const char * __restrict__ src0, const uint8_t * __restrict__ src1_q, const float * __restrict__ src1_s, float * __restrict__ dst,
++        const int64_t k, const int64_t m, const int64_t n, const int64_t n_col_blocks, const int64_t n_pad) {
++#if defined(GGML_USE_HIP) && defined(RDNA4)
++    (void) n_pad;
++    const int warp = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++
++    const int64_t mi = blockIdx.x * 4 + warp;
++    if (mi >= m) {
++        return;
++    }
++    const int64_t ni = blockIdx.y;
++
++    float acc = 0.0f;
++    const int64_t row_stride = n_col_blocks * (int64_t) sizeof(block_f8_e4m3);
++    const uint8_t * x = src1_q + ni * k;
++
++    for (int64_t cb = 0; cb < n_col_blocks; ++cb) {
++        const block_f8_e4m3 * wblk = (const block_f8_e4m3 *) (src0 + mi * row_stride + cb * sizeof(block_f8_e4m3));
++        const uint32_t w4 = *reinterpret_cast<const uint32_t *>(wblk->qs + lane * 4);
++        const uint32_t x4 = *reinterpret_cast<const uint32_t *>(x + cb * GGML_FP8_TILE_K + lane * 4);
++
++        float dot = __builtin_amdgcn_dot4_f32_fp8_fp8(w4, x4, 0.0f);
++#pragma unroll
++        for (int o = 16; o > 0; o >>= 1) {
++            dot += __shfl_xor_sync(0xffffffff, dot, o, 32);
++        }
++        acc += wblk->d * src1_s[ni * n_col_blocks + cb] * dot;
++    }
++
++    dst[ni * m + mi] = acc;
++#else
++    (void) src0; (void) src1_q; (void) src1_s; (void) dst;
++    (void) k; (void) m; (void) n; (void) n_col_blocks; (void) n_pad;
++#endif
++}
++
+ // Scalar fallback (CUDA, and any device without the RDNA4 WMMA path).
+ // One thread per output element, consumes the pre-quantized staging.
+ __global__ void mul_mat_fp8_scalar(
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 835f05447..18b3536dd 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1791,7 +1791,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                    src0->view_src;
+ 
+-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
++    // fp8 uses its own kernel (mul_mat_fp8), not the mmvq path
++    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_F8_E4M3 && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+ 
+     // fusion is not universally faster on Pascal
+diff --git a/handoff.md b/handoff.md
+new file mode 100644
+index 000000000..d7605673c
+--- /dev/null
++++ b/handoff.md
+@@ -0,0 +1,153 @@
++# Handoff — FP8 E4M3 + Direct Safetensors Loading for llama.cpp
++
++Last updated: 2026-08-05, end of session. Working tree state captured below.
++
++## 1. Project overview
++
++Extending the `stew675/llama.cpp` fork (branch `cllm`, commit `6ea215d17` + local changes) to:
++
++1. **Run FP8_E4M3 weights natively** (`GGML_TYPE_F8_E4M3`, QK=128, f32 block scale), hardware-gated: **only** native-FP8 devices (RDNA4 gfx1201, CUDA sm_89+). NO CPU kernels, NO software emulation — by explicit user decision (FP8 has zero advantage without native HW; users without it should use an integer GGUF).
++2. **Load vanilla HuggingFace safetensors directly** (no GGUF conversion), using the existing `llama_model_init_from_user()` API + synthesized in-memory gguf_context.
++3. Target model: `/llm/models/Qwen3.5/4B/StewFP8/` (Qwen3.5-4B, multimodal, FP8 E4M3, official Qwen 128x128-block convention). Format spec in `/llm/models/Qwen3.5/4B/StewFP8/FORMAT.md`.
++4. Multimodal via existing mmproj.gguf + mtmd flow (converter already registers Qwen3_5ForConditionalGeneration for mmproj).
++5. Full plan: `implementation-plan.md` in repo root (read it first; M1 marked DONE).
++
++Personal fork, no upstream submission. Follow AGENTS.md style (ASCII only, concise comments).
++
++## 2. Environment (all verified)
++
++- **CPU**: AMD Ryzen 9 9950X3D (16 cores, Zen 5).
++- **GPUs**: 3x AMD Radeon AI PRO R9700, **gfx1201** (RDNA4), wave32, 32GB VRAM each (total ~95GB), + 1x gfx1036 (RDNA2, no FP8). `rocm_agent_enumerator` confirms.
++- **ROCm**: System ROCm 7.1.1 (Fedora 44): hipcc/clang at `/usr/lib64/rocm/llvm/bin`, hipblas/rocblas installed as packages (`/usr/lib64/cmake/hipblas`). Also `/opt/rocm-7.14` (ROCm 7.15, clang 23) — both work for FP8 WMMA. **The build script uses the system one.**
++- **Build script**: `/home/stew675/bin/build-llama-rocm` — uses `hipconfig -l` (system ROCm), `-DGGML_HIP=ON -DGPU_TARGETS="gfx1200;gfx1201" -DGGML_HIP_GRAPHS=ON -DGGML_HIP_RCCL=1 -DGGML_CUDA_NO_PEER_COPY=1 -DGGML_RPC=1`, clang/clang++.
++- `/home/stew675/rocm-libraries/` — ROCm math libs source (hipblas/rocblas/rocwmma) — NOT needed to build (system packages suffice).
++- Python: torch 2.12.0 (CPU build), safetensors available.
++
++## 3. Completed milestones
++
++### M0 (environment) — verified
++- HIP build works; 3562 MUL_MAT tests pass on the 3 R9700 GPUs (baseline).
++- Both clang 20 (system) and clang 23 (/opt/rocm-7.14) emit native FP8 instructions for gfx1201:
++  `v_wmma_f32_16x16x16_fp8_fp8` and `v_dot4_f32_fp8_fp8`.
++- Builtin spellings (wave32): `__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12` with A/B fragments `v2i32` (8 fp8/lane = 8 bytes), acc `v8f32`; `__builtin_amdgcn_dot4_f32_fp8_fp8(i32, i32, float)`. w64 variants need `wavefrontsize64` — unused (llama.cpp uses wave32).
++
++### M1 (FP8 type registration) — DONE and COMMITTED (commit `d56412c8c`)
++- `ggml/include/ggml.h`: `GGML_TYPE_F8_E4M3 = 43`, `GGML_TYPE_COUNT = 44`.
++- `ggml/src/ggml-common.h`: `block_f8_e4m3 { float d; uint8_t qs[128]; }` (132B, static_assert).
++- `ggml/src/ggml.c`: type_traits (name "f8_e4m3", blck 128, size 132, is_quantized, NO to_float/from_float/vec_dot) + `ggml_quantize_chunk` case calling `quantize_f8_e4m3`.
++- `ggml/src/ggml-quants.c/.h`: fp8 e4m3fn encode (RNE, saturating to ±448) + decode helpers, `quantize_row_f8_e4m3_ref`, `dequantize_row_f8_e4m3`, `quantize_f8_e4m3`, `ggml_validate_row_data` case (rejects NaN bytes 0x7F/0xFF + non-finite scales).
++- `ggml/src/ggml-cpu/ggml-cpu.cpp`: `ggml_backend_cpu_device_supports_op` returns false for any op with an F8_E4M3 operand.
++- `tests/test-backend-ops.cpp`: F8_E4M3 added to `all_types`.
++- Verified: quantize-fns passes; CPU rejects fp8 mul_mat; all 207 StewFP8 fp8 tensors (3.7B values) decode **bit-exact vs torch.float8_e4m3fn** (script pattern in session: numpy decode formula + `torch` cross-check; dequant rule `w = fp8_to_f32(q) * scale_inv[m/128,k/128]`).
++
++## 4. M2 (GPU kernels) — IN PROGRESS, current state
++
++### Files (uncommitted)
++- `ggml/src/ggml-cuda/fp8.cuh` (new): device fp8 encode/decode, `quantize_fp8` kernel, `mul_mat_fp8_wmma` kernel (RDNA4), `mul_mat_fp8_scalar` fallback (CUDA).
++- `ggml/src/ggml-cuda/fp8.cu` (new): host launcher `ggml_cuda_mul_mat_fp8` — pre-quantizes activations via pool alloc, launches wmma kernel via `ggml_cuda_kernel_launch`.
++- `ggml/src/ggml-cuda/ggml-cuda.cu`: dispatch branch in `ggml_cuda_mul_mat` (after mmf check) + `supports_op` MUL_MAT case for F8_E4M3 (gated: `GGML_CUDA_CC_IS_RDNA4(cc) || (NVIDIA && cc >= GGML_CUDA_CC_ADA_LOVELACE)`, F32 src1, k%128==0, non-batched) + extern decl.
++- `ggml/src/ggml-quants.c/.h` + `ggml.c` also have uncommitted M2 additions (host quantize/dequantize — needed for test data init and llama-quantize later).
++
++### Design (follows llama.cpp launcher patterns — CRITICAL per user advice)
++Read `ggml/src/ggml-cuda/mmq.cu` + `mmq.cuh` + `quantize.cu` for the pattern:
++1. **Separate pre-quantization kernel** (`quantize_fp8`): F32 activations [k,n] → fp8 staging `[k][n_pad]` (k-major, token-minor, transposed!) + scales `[n][k/128]` f32. One CTA of 128 threads per (token, 128-col block), block-reduce amax → scale = amax/448, inverse for encode. **Verified byte-exact vs host quantization.**
++2. **Hot wmma kernel** (`mul_mat_fp8_wmma`): weights = `block_f8_e4m3` rows [m][k/128]; activations from staging. 128 threads (4 wave32 warps), each warp = 16x16 output tile, grid (ceil(n/64), ceil(m/16)). Per 128-col block (cb): 8 wmma k-steps of 16 accumulate into acc_cb (unscaled), then scale-and-accumulate: `acc[s] += wd * ad * acc_cb[s]` where wd = weight block d (per m-row), ad = staging scale (per token). Uses `__launch_bounds__(128,1)` and `ggml_cuda_kernel_launch` (PDL-aware).
++3. Launcher pads tokens to multiple of 64 (zeroed) so OOB wmma reads are safe; guards m-boundary via warp-uniform `row_valid`.
++
++### THE gfx12 fp8 wmma fragment layout (DEFINITIVELY VERIFIED on gfx1201, 2026-08-05)
++**The original probe-derived layout was WRONG.** The earlier probes used identity B, which is symmetric under transpose and CANNOT distinguish the B fragment's k-major vs n-major layout; and the probe4 matcher reported HOST-array byte positions instead of true fragment positions. The empirical probes on real data (single wmma with random fp8 data, checked 256/256 slots) plus TileLang/composablekernel documentation converge on:
++
++- **A fragment** (weights): lane l byte e = `A[l%16][(l//16)*8 + e]` — lane l holds weight row (l%16); lanes 0-15 carry k=0..7 of each row, lanes 16-31 carry k=8..15.
++- **B fragment** (activations): lane l byte e = `B[(l//16)*8 + e][l%16]` — lane l holds the 8 k-values of token (l%16), k-contiguous. Hence staging MUST be `[n][k]` (token-major, k-minor) so each lane's fragment is one contiguous 8-byte load.
++- **C fragment** (output store): slot s of lane l = `C[(l//16)*8 + s][l%16]` — lane l owns column (l%16), 8 rows (l//16)*8..+7.
++
++Row/col helpers in fp8.cuh: `fp8_wmma_row(l,s) = (l/16)*8 + s`, `fp8_wmma_col(l,s) = l%16`. Kernel locals: `row_lane = lane%16`, `k_half = (lane/16)*8`. A load: `wblk->qs + kk*16 + k_half` (8 contiguous bytes) of block `(m0+row_lane, cb)`. B load: `src1_q + (n0+row_lane)*k + cb*128 + kk*16 + k_half` (8 contiguous bytes; note the `cb*128` k-offset — a missing cb offset was a second bug).
++
++### Bugs fixed this session (all in fp8.cuh)
++1. **B fragment transposed layout**: staging was [k][n]; changed to [n][k] (token-major) + quantize write `y_q[token*k + col0 + tid]`.
++2. **A fragment row mapping**: old code used `lane/2` rows / `(lane&1)*8` cols; true mapping is `lane%16` row, k half `(lane/16)*8`.
++3. **C store/scale mapping**: old `fp8_wmma_row/col` (odd-lane formula) was wrong for 56/128 odd-lane slots; replaced by the true (l/16)*8+s, l%16.
++4. **B fragment cb offset**: kk loop must add `cb*128` to the staging k index.
++5. `mul_mat_fp8_scalar` (CUDA fallback) updated for the [n][k] staging (`src1_q[ni*k + cb*128 + c]`).
++
++### Verification status
++- Standalone HIP test `/tmp/fp8_correctness.cpp` (k=256 m=64 n=32 random data): **PASS** (0/2048 bad, max rel err ~7e-6).
++- Stress test `/tmp/fp8_stress.cpp`: 12 configs, k=128..1024 / m=16..128 / n=16..256, all PASS (max rel err <= 3.4e-3, pure fp8 accumulation-order noise).
++- Full HIP build + test-backend-ops rebuild OK. **NOTE: must re-run `cmake .` in the build dir to re-evaluate `file(GLOB "*.cu")` now that fp8.cu exists** (the dir was configured before fp8.cu was added). test-backend-ops: f8_e4m3 MUL_MAT shows "not supported [CPU]" (correct skip; CPU reference can't compute fp8) and runs on ROCm0/1/2; 0 FAILs.
++- Probe/verification files in /tmp: `wmma_probe4.cpp` (definitive bijective-A map), `verify_layout.cpp` (real-data 256/256 slot check), `verify_chain.cpp` (full 8-kk chain), `fp8_stress.cpp`, `fp8_correctness.cpp`. Analysis: `convert_probe4.py` (host→true position conversion), `brute*.py`.
++
++### Remaining M2 work
++- Perf check (t/s vs f16 baseline, memory ~2.6GB) — needs a runnable model; blocked until M3 (safetensors loader) or a quick synthetic benchmark.
++- Optional: CUDA sm_89/sm_90 path is compile-guarded + scalar fallback only (untested on NVIDIA).
++
++## 5. Next steps (in order)
++
++1. ~~Fix the C-fragment mapping~~ **DONE (2026-08-05)**: root cause was the gfx12 fp8 wmma fragment layout itself (A and B fragment loads wrong; staging needed the [n][k] transpose; see section 4). `fp8_correctness` + stress suite PASS. If test-backend-ops was built before fp8.cu existed, re-run `cmake .` first (GLOB re-eval).
++2. ~~Perf check~~ **DONE (2026-08-06)**: see section 4. Generation on 1x R9700: Q8_0 GGUF 91.7 t/s, BF16 safetensors 59-72 t/s, **FP8 safetensors 72.5 t/s** (was 3.2 t/s after the fixes below). Prompt: FP8 143 t/s vs Q8_0 348 t/s. M2 kernel work is DONE except the CUDA sm_89/sm_90 mma path (compile-guarded, untested).
++3. **M3 — direct safetensors loader: DONE (2026-08-06)** for the qwen35 text path. See section 9 for the full writeup. Remaining M3 items: mmproj/vision companion verification (mtmd-cli + server with --mmproj), edge cases (single-file no-index, non-128 dims, E5M2 rejection, corrupt headers).
++4. **M4**: parity vs HF greedy (parity_llama.cpp in /tmp + parity_check.py in model dir) — mostly done: llama.cpp-BF16-via-loader == HF-BF16 byte-exact over 20 tokens; llama.cpp-FP8 matches BF16/HF for the first 9 tokens then diverges on a True/False near-tie (expected activation-quantization divergence; fp8 matches HF farther than Q8_0 does). Remaining: PPL sanity, multi-GPU row-split parity, memory footprint check (~5.3GB expected on 1 GPU: 1319+1319+2092 MiB split across 3 in the default split).
++5. **M5 (optional)**: gguf-py F8_E4M3 constants + `--preserve-fp8` in conversion/base.py.
++
++## 6. Key references
++- `implementation-plan.md` (repo root) — full plan, M1 marked done, M2 spike results documented.
++- `/llm/models/Qwen3.5/4B/StewFP8/FORMAT.md` — byte-level format spec (authoritative).
++- StewFP8 dir: 945 tensors, 207 fp8+scale_inv pairs, layers-0..31.safetensors + outside.safetensors (299: embeds/norms/vision) + mtp.safetensors (22). All dims multiples of 128.
++- llama.cpp patterns: `ggml/src/ggml-cuda/mmq.cu` (launcher), `mmq.cuh`, `quantize.cu` (`quantize_mmq_q8_1_cuda`), `common.cuh` (`ggml_cuda_kernel_launch`, `ggml_cuda_pool_alloc`, arch macros `GGML_CUDA_CC_IS_RDNA4`), `vendors/hip.h` (RDNA4 define).
++- Original probe files in /tmp: `wmma_probe*.cpp`, `fp8_correctness.cpp` (may be cleaned; recreate from session history if needed).
++
++## 7. Gotchas
++- HIP `__shfl_xor_sync` macro requires a 4th `width` argument (unlike CUDA).
++- `__global__` kernel definitions must be visible to the HOST pass (for device-stub generation) — put RDNA4-only types/builtins inside `#if defined(GGML_USE_HIP) && defined(RDNA4)` WITHIN the kernel body, and give the `#else` branch a trivial `(void)` body. Forward declarations alone do NOT generate the stub (link error `__device_stub__`).
++- `ext_vector_type` is clang-only (fine for HIP; nvcc CUDA would need different types — CUDA path is compile-verified only, scalar fallback kernel).
++- ggml-cuda CMakeLists uses `file(GLOB "*.cu")` — new .cu files are picked up automatically, but only after re-running `cmake .` in the build dir (the GLOB is evaluated at configure time; a build dir configured before fp8.cu existed will silently miss it).
++- `RDNA4` macro comes from `vendors/hip.h` when `__GFX12__` defined (device pass only).
++- supports_op gets `dev_ctx->device` for the per-device cc — needed to exclude the gfx1036 from fp8.
++- The `ggml_cuda_mul_mat` dispatch requires src1 F32 + dst F32 for custom kernels (else cublas → dequant → fails for fp8); supports_op gates this.
++
++## 8. Session state at handoff
++- Working tree: M1 changes committed (`d56412c8c`). Uncommitted: fp8.cuh, fp8.cu (new, kernel CORRECTED — fragment layout fixed), ggml-cuda.cu (dispatch+supports_op), ggml-quants.c/.h + ggml.c (host quantize additions).
++- `/tmp/llama-hip-build` — configured HIP build (targets: ggml-hip, test-backend-ops); re-ran `cmake .` so fp8.cu is included; both targets build.
++- The earlier `wmma_probe3` "hang" was a host-side infinite loop in its byte-assignment `while (used[b])` (all 256 bytes exhausted) — NOT a GPU wedge; the GPUs were never stuck. probe4 replaced probe3 as the definitive mapping probe.
++- **Do NOT commit/push without explicit user approval.**
++
++## 9. M3 — direct safetensors loader (DONE 2026-08-06, qwen35 text path)
++
++### Files
++- `src/llama-safetensors.h/.cpp` (new): path detection, config.json + index.json + per-file header parsing (nlohmann), mmap via llama_mmap, HF->GGUF tensor mapping with per-tensor transforms, gguf metadata synthesis, tensor data callback.
++- `src/llama.cpp`: `llama_model_load_from_file` auto-detects safetensors (dir with config.json + *.safetensors, or a *.safetensors file), builds metadata, runs the D3 hardware gates, calls `llama_model_load_from_file_impl(metadata, set_tensor_data, &loader, ...)` with load_mode NONE.
++- `src/llama-model-loader.h/.cpp`: 3 small fixes to the metadata-only (files.empty) path: (a) `get_weight` reports tensors present in the gguf metadata (dummy_weight) so the mtp_only checks work; (b) `create_tensor` returns nullptr for TENSOR_SKIP and for NOT_REQUIRED tensors missing from metadata (matches the file-backed semantics — output/nextn.embed_tokens fall back to duplicated/absent); (c) buft_for_tensor nullptr handled instead of asserted.
++- `src/CMakeLists.txt`: added llama-safetensors.cpp + `../vendor` include dir.
++- `ggml/src/ggml-cuda/fp8.cu/.cuh`, `ggml-cuda.cu`: see perf fixes in section 4.
++
++### Transforms (all validated byte-exact vs an independent Python reference, 14/14)
++- fp8 re-blocking: per output row r and 128-col block cb, write [f32 scale][128 fp8 bytes], scale = bf16(scale_inv[src_r/128][src_cb]) promoted to f32. Row/column V-head reorders applied in the same pass (permutation is block-preserving for head_dim 128).
++- V-head reorder (16 K-heads != 32 V-heads, num_v_per_k=2): applied to in_proj_qkv rows, in_proj_z rows, in_proj_a/b rows, A_log/dt_bias elements, conv1d V channels, out_proj columns — and to the fp8 scale tensors in lockstep. Permutations verified against conversion/qwen.py `_reorder_v_heads`.
++- `A_log` -> `-exp` (rounded through bf16 when the HF source is bf16; direct f32 for F32 sources), `dt_bias` -> `ssm_dt.bias`, conv1d squeeze [C,1,K]->[K,C], norms `+1` (bf16-rounded) except linear_attn.norm, MTP mapping mtp.* -> blk.32.* (fc->nextn.eh_proj, pre_fc_norm_embedding->enorm, pre_fc_norm_hidden->hnorm, norm->shared_head_norm).
++- Output types mirror conversion/base.py: 1D tensors, `*_norm.weight` and ssm_conv1d are F32; 2D .weight are BF16 (or F8_E4M3). CRITICAL: the GPU binary ops (mul) do not support BF16 operands, so norms MUST be F32.
++- Source dtype awareness: the ORIGINAL model stores A_log and linear_attn.norm as F32 (mamba_ssm_dtype float32); StewFP8 converted them to BF16. The loader reads the per-tensor dtype from the safetensors header.
++- tie_word_embeddings: output.weight is absent; the loader fix makes the model fall back to the duplicated token_embd (same as the GGUF flow).
++- Tokenizer: `convert_hf_to_gguf.py <dir> --vocab-only` -> `<dir>/tokenizer.gguf` (already generated for StewFP8 and SafeTensors); the loader copies all `tokenizer.*` KV pairs into the synthesized context; clear one-liner error if missing.
++
++### D3 hardware gate
++- `has_fp8_device()`: probes every registered device with a dummy F8 mul_mat op (ggml_backend_dev_supports_op). Fires when the model has fp8 tensors and no fp8-capable device: "FP8_E4M3 weights require a device with native FP8 support (RDNA4, or NVIDIA Ada/Hopper+); this system has none. Use an integer GGUF (e.g. Q8_0) instead."
++- Partial offload: fp8 tensors live in every decoder block, so --n-gpu-layers must cover all of them (n_layer_all + 1 = 34): "FP8_E4M3 weights must be fully offloaded to the GPU - increase --n-gpu-layers to at least 34". Verified on CPU-only build and with -ngl 10.
++- The natural buffer-selection error ("failed to find a compatible buffer type") is a further backstop.
++
++### Perf fixes discovered while measuring (M2)
++- **CRITICAL launcher bug**: the RDNA4 dispatch block in ggml_cuda_mul_mat_fp8 was wrapped in `#if defined(GGML_USE_HIP) && defined(RDNA4)` — RDNA4 is a DEVICE-pass macro, so the host build compiled the whole dispatch out and silently used the scalar fallback (3.2 t/s!). The dispatch is now an unguarded runtime `if (GGML_CUDA_CC_IS_RDNA4(cc))` (kernel bodies keep their #if guard for the device pass).
++- **dot4 GEMV path** (`mul_mat_fp8_gemv`): for n <= 16 the wmma kernel wasted the 16-token tiles (batch 1 = 1/64 useful). One warp per output row, 32 lanes read the 128 weight bytes coalesced + dot4 with the shared activation block, warp-reduce, per-block scale. Verified correct (max rel err <= 2.2e-3) and it fixed the batch-1 efficiency.
++- **GLU fusion gate**: `ggml_cuda_should_fuse_mul_mat_vec_q` now excludes F8_E4M3 (the fused-mmvq path has no F8 case and aborted at generation).
++- Result: 3.2 -> 72.5 t/s generation (vs 91.7 Q8_0 baseline, 59-72 BF16).
++
++### Verification status
++- Loader transform validation: 14/14 byte-exact vs Python reference (fp8 re-blocks, V-reorders, +1, -exp, conv1d, F32 types, MTP, token_embd). Also validated the BF16 model's reorders.
++- End-to-end: `llama-cli -m <StewFP8 dir>` generates coherent text on 1 GPU (72 t/s) and 3 GPUs (58 t/s); --spec-type draft-mtp works (38 t/s); BF16 SafeTensors dir loads and runs (59-72 t/s).
++- Parity: llama.cpp-BF16-via-loader == HF-BF16 greedy, byte-exact over 20 tokens ("Paris.\nA. True\nB. False\nAnswer:\nA\n\n"); llama.cpp-FP8 matches through 9 tokens then flips a True/False near-tie; Q8_0 diverges at token 10. HF-side parity_check.py (BF16 vs FP8-dequant in torch): PASS, byte-identical.
++- Negative tests: CPU-only build -> exact D3 error; -ngl 10 -> exact partial-offload error.
++
++### Known gaps / next
++- mmproj/vision companion not verified (text loader skips model.visual.*; need convert_hf_to_gguf.py --mmproj + mtmd-cli/server run).
++- --vocab-file override not plumbed (loader auto-detects <dir>/tokenizer.gguf only).
++- Edge cases untested: single-file no-index safetensors, non-128 dims, E5M2 rejection, corrupt headers.
++- CUDA sm_89/sm_90 fp8 mma path still compile-guarded/untested (scalar fallback).
++- ~1-ulp expf differences vs numpy for F32-source A_log (numerically irrelevant; the bf16-sourced StewFP8 path rounds through bf16 and matches byte-exact).
+diff --git a/implementation-plan.md b/implementation-plan.md
+index 55c0d2277..811d9995a 100644
+--- a/implementation-plan.md
++++ b/implementation-plan.md
+@@ -266,36 +266,36 @@ Tasks:
+ - [ ] CUDA side: `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` for sm_89/sm_90 behind `#if !defined(__HIPCC__)` (compile-verified only; scalar fallback kernel exists).
+ - [x] Backend registration: HIP backend `supports_op` for f8_e4m3 mul_mat (RDNA4 gate); host-side launcher `ggml_cuda_mul_mat_fp8` pre-quantizes activations (fp8 staging + scales).
+ - [x] `tests/test-backend-ops` builds; f8_e4m3 MUL_MAT shows "not supported [CPU]" (correct skip) and runs on the ROCm devices; no FAILs. (NOTE: re-run `cmake .` in the build dir so the GLOB picks up fp8.cu.)
+-- [ ] Perf: prompt/generation t/s vs BF16 baseline; memory footprint check (~2.6GB). Blocked on M3 (loader) or a synthetic benchmark.
++- [x] Perf: 1x R9700 generation: FP8 safetensors 72.5 t/s vs Q8_0 GGUF 91.7 t/s vs BF16 safetensors 59-72 t/s. Prompt: FP8 143 t/s vs Q8_0 348 t/s. (Two fixes were needed: the host-side RDNA4 dispatch was compiled out by a device-only #if guard -> scalar fallback; and a dot4 GEMV path for n <= 16 avoids the wmma batch-1 waste.)
+ 
+ ### M3. Direct safetensors loader (text model) + hardware gate
+-- [ ] `src/llama-safetensors.h/.cpp` (new): safetensors file parse (u64 header len +
++- [x] `src/llama-safetensors.h/.cpp` (new): safetensors file parse (u64 header len +
+       JSON header; mmap via `llama_mmap`; dtype/shape/data_offsets), index.json
+       `weight_map`, single-file fallback, config.json parse (nlohmann).
+-- [ ] Arch dispatch: `architectures[0]` -> llm_arch. qwen35 first; table-driven for
+-      others later. `text_config`/`quantization_config` -> hparams.
+-- [ ] Tensor name map HF -> GGUF for qwen35 (port from `gguf-py/gguf/tensor_mapping.py`
+-      + `conversion/qwen.py` special cases; include MTP names, skip `model.visual.*`).
+-- [ ] gguf_context synthesis (see D4; all hparams keys + tensor list via
+-      `gguf_add_tensor` from a scratch ggml context).
+-- [ ] `set_tensor_data` implementation: per-tensor transforms (D4 list), fp8 re-blocking,
+-      BF16/F32 passthrough, V-head reorder, tie_word_embeddings (loader's
+-      TENSOR_DUPLICATED handles output reuse), check_tensors validation.
+-- [ ] **Hardware gate** (D3): detect FP8-capable devices among registered backends;
+-      abort load with the user-facing error if any fp8 tensor cannot be placed on one,
+-      or if no fp8-capable device exists. Gate also fires for `--n-gpu-layers` partial
+-      offload and for CPU-only builds.
+-- [ ] Vocab merge from `tokenizer.gguf` (D5) with clear error if absent.
+-- [ ] Integration: in `llama_model_load_from_file` (`src/llama.cpp:445`), detect
+-      safetensors input (path is a dir containing `config.json` + `*.safetensors`, or
+-      `*.safetensors` file) and route to the new loader. All tools inherit it via
++- [x] Arch dispatch: `architectures[0]` -> qwen35 only (rejects others with a clear
++      message). `text_config` -> hparams.
++- [x] Tensor name map HF -> GGUF for qwen35 (port from `conversion/qwen.py`;
++      MTP names, skip `model.visual.*`).
++- [x] gguf_context synthesis (all hparams keys + tensor list via `gguf_add_tensor`
++      from a scratch ggml context).
++- [x] `set_tensor_data` implementation: per-tensor transforms (D4 list), fp8 re-blocking,
++      BF16/F32 passthrough, V-head reorder, tie_word_embeddings. Output types mirror
++      conversion/base.py (1D + *_norm.weight + conv1d are F32 - required, the GPU mul
++      op does not support BF16). Source dtype awareness (A_log/norm are F32 in the
++      original model, BF16 in StewFP8).
++- [x] **Hardware gate** (D3): `has_fp8_device()` probes registered devices with a dummy
++      F8 mul_mat; fires for CPU-only builds and for `--n-gpu-layers` partial offload
++      (< n_layer_all + 1) with clear messages.
++- [x] Vocab merge from `tokenizer.gguf` (D5) with clear one-liner error if absent.
++- [x] Integration: in `llama_model_load_from_file` (`src/llama.cpp:445`), auto-detect
++      safetensors input and route to the new loader. All tools inherit it via
+       `common/common.cpp:1250`.
+-- [ ] `llama-cli -m /llm/models/Qwen3.5/4B/StewFP8/ -p "..."` works on the 3 GPUs;
+-      model info printed correctly (arch qwen35, 4B, f8_e4m3 layers listed),
+-      `--mtp` works (fp8 MTP projections offloaded and executing on GPU),
+-      `--no-mmap` works, `--vocab-only`/`--no-alloc` paths sane.
+-- [ ] Negative test: CPU-only build loading the fp8 dir -> exact "no hardware support"
+-      error, clean exit. `--n-gpu-layers` partial offload -> same error.
++- [x] `llama-cli -m /llm/models/Qwen3.5/4B/StewFP8/ -p "..."` works on 1 and 3 GPUs
++      (58-72 t/s generation); `--spec-type draft-mtp` works (MTP block offloaded and
++      executing on GPU, 38 t/s).
++- [x] Negative test: CPU-only build loading the fp8 dir -> exact "no hardware support"
++      error, clean exit. `--n-gpu-layers 10` -> exact partial-offload error.
++      NOTE: `--no-alloc` / `--vocab-only` skip tensor loading entirely (verified sane).
+ - [ ] mmproj companion: text loader ignores vision; document + verify
+       `convert_hf_to_gguf.py ... --mmproj` produces a working `mmproj.gguf` for qwen3.5
+       vision (check `tools/mtmd/clip.cpp` accepts it; config dims: depth 24, hidden 1024,
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 24f05cc91..5efd2adda 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -36,6 +36,7 @@ add_library(llama
+             llama-model-saver.cpp
+             llama-model.cpp
+             llama-quant.cpp
++            llama-safetensors.cpp
+             llama-sampler.cpp
+             llama-vocab.cpp
+             unicode-data.cpp
+@@ -51,6 +52,7 @@ set_target_properties(llama PROPERTIES
+ )
+ 
+ target_include_directories(llama PRIVATE .)
++target_include_directories(llama PRIVATE ../vendor)
+ target_include_directories(llama PUBLIC ../include)
+ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
+ 
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index b31e92e2d..04b362286 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -830,6 +830,12 @@ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(c
+         return &pos->second;
+     }
+ 
++    // metadata-only models (llama_model_init_from_user): the tensors are not loaded from files,
++    // but the gguf metadata still lists them - report them as present
++    if (files.empty() && gguf_find_tensor(metadata, name) != -1) {
++        return &dummy_weight;
++    }
++
+     return nullptr;
+ }
+ 
+@@ -1225,7 +1231,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     };
+ 
+     if (files.empty()) {
+-        if (flags & TENSOR_SKIP_IF_VIRTUAL) {
++        if (flags & TENSOR_SKIP_IF_VIRTUAL || flags & TENSOR_SKIP) {
+             return nullptr;
+         }
+         ggml_type type = GGML_TYPE_F32;
+@@ -1241,6 +1247,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+                     return nullptr;
+                 }
+             }
++            if (tid == -1) {
++                // same semantics as the file-backed path: a missing tensor that is not required is skipped
++                return nullptr;
++            }
+         }
+ 
+         ggml_tensor t_meta;
+@@ -1255,7 +1265,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         ggml_set_name(&t_meta, tn.str().c_str());
+ 
+         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+-        GGML_ASSERT(buft != nullptr);
++        if (buft == nullptr) {
++            return nullptr;
++        }
+         ggml_context * ctx = ctx_for_buft(buft);
+         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
+         ggml_set_name(ret, tn.str().c_str());
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index d6b31c231..32f4acc75 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -31,10 +31,12 @@ const char * llama_file_version_name(llama_fver version);
+ struct llama_model_loader {
+     // Holds information on a model weight
+     struct llama_tensor_weight {
+-        uint16_t  idx; // source file index
+-        size_t   offs; // tensor data offset in the original file
++        uint16_t  idx = 0; // source file index
++        size_t   offs = 0; // tensor data offset in the original file
+ 
+-        ggml_tensor * tensor;
++        ggml_tensor * tensor = nullptr;
++
++        llama_tensor_weight() = default;
+ 
+         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
+             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
+@@ -89,6 +91,7 @@ struct llama_model_loader {
+     llama_mmaps mappings;
+ 
+     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
++    mutable llama_tensor_weight dummy_weight; // metadata-only models: marks tensors that exist in the gguf metadata
+     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
+     const llama_model_tensor_buft_override * tensor_buft_overrides;
+ 
+diff --git a/src/llama-safetensors.cpp b/src/llama-safetensors.cpp
+new file mode 100644
+index 000000000..6ad7d1d96
+--- /dev/null
++++ b/src/llama-safetensors.cpp
+@@ -0,0 +1,890 @@
++// Direct loading of vanilla HuggingFace safetensors models.
++//
++// See llama-safetensors.h for the design. Only the qwen35 architecture is
++// supported (the tensor name map below mirrors conversion/qwen.py).
++
++#include "llama-safetensors.h"
++
++#include "llama-impl.h"
++#include "llama-mmap.h"
++#include "llama.h"
++
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++#include "ggml.h"
++#include "gguf.h"
++
++#include "nlohmann/json.hpp"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <stdexcept>
++#include <sstream>
++
++namespace fs = std::filesystem;
++using json = nlohmann::json;
++
++static const size_t MIB = 1024 * 1024;
++
++// ---------------------------------------------------------------------------
++// helpers
++
++static std::string read_file(const std::string & path) {
++    std::ifstream in(path, std::ios::binary);
++    if (!in) {
++        throw std::runtime_error(format("cannot open file: %s", path.c_str()));
++    }
++    std::ostringstream ss;
++    ss << in.rdbuf();
++    return ss.str();
++}
++
++static json read_json(const std::string & path) {
++    try {
++        return json::parse(read_file(path));
++    } catch (const std::exception & err) {
++        throw std::runtime_error(format("failed to parse %s: %s", path.c_str(), err.what()));
++    }
++}
++
++// ---------------------------------------------------------------------------
++// path detection
++
++bool llama_safetensors_loader::is_safetensors_path(const char * path) {
++    const std::string p = path;
++    std::error_code ec;
++    if (fs::is_directory(p, ec)) {
++        if (!fs::exists(p + "/config.json", ec)) {
++            return false;
++        }
++        for (const auto & entry : fs::directory_iterator(p, ec)) {
++            if (entry.path().extension() == ".safetensors") {
++                return true;
++            }
++        }
++        return false;
++    }
++    return p.size() > 12 && p.compare(p.size() - 12, 12, ".safetensors") == 0;
++}
++
++// probe every registered device with a dummy fp8 mul_mat
++bool llama_safetensors_loader::has_fp8_device() {
++    ggml_init_params ip = { ggml_tensor_overhead() * 8, nullptr, true };
++    ggml_context * ctx = ggml_init(ip);
++    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, 256, 16);
++    ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 1);
++    ggml_tensor * y = ggml_mul_mat(ctx, w, x);
++
++    bool ok = false;
++    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++        if (ggml_backend_dev_supports_op(ggml_backend_dev_get(i), y)) {
++            ok = true;
++            break;
++        }
++    }
++    ggml_free(ctx);
++    return ok;
++}
++
++bool llama_safetensors_loader::has_fp8_tensors() const {
++    for (const auto & [gname, m] : gguf_map) {
++        (void) gname;
++        if (m.type == GGML_TYPE_F8_E4M3) {
++            return true;
++        }
++    }
++    return false;
++}
++
++// ---------------------------------------------------------------------------
++// construction
++
++llama_safetensors_loader::llama_safetensors_loader(const char * path) {
++    std::string p = path;
++    if (fs::is_directory(p)) {
++        dir_path = p;
++        if (dir_path.back() != '/') {
++            dir_path += '/';
++        }
++    } else {
++        // single .safetensors file: use its parent dir as the model dir
++        dir_path = fs::path(p).parent_path().string();
++        if (!dir_path.empty() && dir_path.back() != '/') {
++            dir_path += '/';
++        }
++    }
++    vocab_path = dir_path + "tokenizer.gguf";
++
++    parse_config();
++    parse_files();
++    build_permutations();
++    build_mapping();
++}
++
++llama_safetensors_loader::~llama_safetensors_loader() = default;
++
++void llama_safetensors_loader::parse_config() {
++    const json cfg = read_json(dir_path + "config.json");
++
++    const auto & archs = cfg.value("architectures", json::array());
++    const bool ok_arch = !archs.empty() &&
++        (archs[0] == "Qwen3_5ForConditionalGeneration" || archs[0] == "Qwen3_5ForCausalLM");
++    if (!ok_arch) {
++        throw std::runtime_error(format("unsupported model architecture '%s' - the direct safetensors loader supports qwen35 only",
++                archs.empty() ? "?" : archs[0].get<std::string>().c_str()));
++    }
++
++    const json tc = cfg.value("text_config", cfg);
++
++    n_embd        = tc.at("hidden_size");
++    n_layer       = tc.at("num_hidden_layers");
++    n_ff          = tc.at("intermediate_size");
++    n_head        = tc.at("num_attention_heads");
++    n_head_kv     = tc.at("num_key_value_heads");
++    n_ctx         = tc.at("max_position_embeddings");
++    n_vocab       = tc.at("vocab_size");
++    rms_eps       = tc.at("rms_norm_eps");
++
++    ssm_d_conv    = tc.at("linear_conv_kernel_dim");
++    ssm_d_state   = tc.at("linear_key_head_dim");
++    ssm_n_group   = tc.at("linear_num_key_heads");
++    ssm_dt_rank   = tc.at("linear_num_value_heads");
++    ssm_d_inner   = tc.at("linear_value_head_dim").get<int64_t>() * ssm_dt_rank;
++
++    n_layer_nextn = tc.value("mtp_num_hidden_layers", 0);
++
++    const int64_t head_dim = tc.value("head_dim", 0) != 0 ? tc.value("head_dim", 0) : n_embd / n_head;
++    n_embd_head_k = head_dim;
++
++    const json rp = tc.value("rope_parameters", json::object());
++    rope_freq_base = rp.value("rope_theta", 1.0e7f);
++    const float partial_rotary_factor = rp.value("partial_rotary_factor", 0.25f);
++    rope_dim = (int64_t) (head_dim * partial_rotary_factor);
++
++    // Qwen3.5 always uses interleaved MRoPE with the default [11, 11, 10] section
++    std::array<int32_t, 4> section = { 11, 11, 10, 0 };
++    if (rp.contains("mrope_section")) {
++        const auto & ms = rp["mrope_section"];
++        for (size_t i = 0; i < ms.size() && i < 3; ++i) {
++            section[i] = ms[i];
++        }
++    }
++    memcpy(mrope_section, section.data(), sizeof(mrope_section));
++}
++
++void llama_safetensors_loader::parse_files() {
++    // list the safetensors files: from the index, or a single file
++    std::vector<std::string> names;
++    const std::string index_path = dir_path + "model.safetensors.index.json";
++    if (fs::exists(index_path)) {
++        const json idx = read_json(index_path);
++        if (!idx.contains("weight_map")) {
++            throw std::runtime_error(format("invalid safetensors index: %s", index_path.c_str()));
++        }
++        for (const auto & [name, file] : idx["weight_map"].items()) {
++            (void) name;
++            const std::string fname = file.get<std::string>();
++            if (std::find(names.begin(), names.end(), fname) == names.end()) {
++                names.push_back(fname);
++            }
++        }
++    } else {
++        for (const auto & entry : fs::directory_iterator(dir_path)) {
++            if (entry.path().extension() == ".safetensors") {
++                names.push_back(entry.path().filename().string());
++            }
++        }
++        if (names.empty()) {
++            throw std::runtime_error(format("no .safetensors files found in %s", dir_path.c_str()));
++        }
++    }
++    std::sort(names.begin(), names.end());
++
++    for (const auto & name : names) {
++        const std::string path = dir_path + name;
++
++        auto file = std::make_unique<llama_file>(path.c_str(), "rb");
++        uint8_t len_buf[8];
++        file->read_raw(len_buf, 8);
++        uint64_t header_len;
++        memcpy(&header_len, len_buf, 8);
++
++        std::string header_str(header_len, '\0');
++        file->read_raw(&header_str[0], header_len);
++
++        const json header = json::parse(header_str);
++        const size_t data_off = 8 + header_len;
++
++        auto f = std::make_unique<st_file>();
++        f->path = path;
++
++        ll_mmaps.emplace_back(std::make_unique<llama_mmap>(file.get(), -1, false));
++        f->addr = (const uint8_t *) ll_mmaps.back()->addr();
++        ll_files.emplace_back(std::move(file));
++        files[name] = std::move(f);
++
++        for (const auto & [tname, tinfo] : header.items()) {
++            if (tname == "__metadata__") {
++                continue;
++            }
++            st_tensor t;
++            t.file   = name;
++            t.off    = data_off + (size_t) tinfo.at("data_offsets")[0].get<int64_t>();
++            t.nbytes = (size_t) (tinfo.at("data_offsets")[1].get<int64_t>() - tinfo.at("data_offsets")[0].get<int64_t>());
++            t.dtype  = tinfo.at("dtype");
++            t.shape  = tinfo.at("shape").get<std::vector<int64_t>>();
++            if (t.off + t.nbytes > ll_mmaps.back()->size()) {
++                throw std::runtime_error(format("tensor '%s' in %s is out of file bounds", tname.c_str(), name.c_str()));
++            }
++            hf_tensors[tname] = std::move(t);
++        }
++    }
++}
++
++void llama_safetensors_loader::build_permutations() {
++    // linear attention has num_k_heads < num_v_heads; the HF weights store the
++    // V heads grouped by K head [G0_v0..v{r-1}, G1_v0..], ggml needs them
++    // tiled [v0_G0, v0_G1, ..., v1_G0, ...]. See conversion/qwen.py.
++    const int64_t nk   = ssm_n_group;              // 16
++    const int64_t nvpk = ssm_dt_rank / ssm_n_group; // 2
++
++    // head_dim = 1 (A_log, dt_bias, in_proj_a/b rows)
++    v_perm_1.resize(ssm_dt_rank);
++    for (int64_t k = 0; k < nk; ++k) {
++        for (int64_t vp = 0; vp < nvpk; ++vp) {
++            v_perm_1[vp * nk + k] = k * nvpk + vp;
++        }
++    }
++
++    // head_dim = 128 (qkv/z rows, out_proj columns, conv1d channels)
++    const int64_t hd = ssm_d_state;
++    v_perm_128.resize(ssm_dt_rank * hd);
++    for (int64_t k = 0; k < nk; ++k) {
++        for (int64_t vp = 0; vp < nvpk; ++vp) {
++            for (int64_t h = 0; h < hd; ++h) {
++                v_perm_128[vp * (nk * hd) + k * hd + h] = k * (nvpk * hd) + vp * hd + h;
++            }
++        }
++    }
++
++    // qkv/conv1d rows: q and k rows are unchanged, only the v rows are reordered
++    const int64_t qk_rows = 2 * nk * hd;
++    v_perm_128_v.resize(qk_rows + ssm_dt_rank * hd);
++    for (int64_t r = 0; r < qk_rows; ++r) {
++        v_perm_128_v[r] = r;
++    }
++    for (int64_t r = 0; r < (int64_t) v_perm_128.size(); ++r) {
++        v_perm_128_v[qk_rows + r] = qk_rows + v_perm_128[r];
++    }
++}
++
++// ---------------------------------------------------------------------------
++// HF -> GGUF tensor mapping (mirrors conversion/qwen.py)
++
++bool llama_safetensors_loader::map_weight(const std::string & hf, const st_tensor & t, std::string & gname, st_mapping & m) const {
++    // V-head reorder applies to linear-attention tensors when K-heads != V-heads;
++    // the fp8 path re-blocks and reorders in one pass (fill_fp8), the float paths
++    // reorder rows/columns (TF_REORDER)
++    auto set_reorder = [&](const std::vector<int64_t> * rows, const std::vector<int64_t> * cols) {
++        if (t.dtype == "F8_E4M3") {
++            m.transform = TF_FP8;
++            m.type = GGML_TYPE_F8_E4M3;
++        } else {
++            m.transform = TF_REORDER;
++            m.type = GGML_TYPE_BF16;
++        }
++        m.row_perm = rows;
++        m.col_perm = cols;
++    };
++    auto set_plain = [&](int transform = TF_NONE) {
++        m.transform = transform;
++        m.type = t.dtype == "F8_E4M3" ? GGML_TYPE_F8_E4M3 : GGML_TYPE_BF16;
++    };
++    auto set_fp8 = [&]() {
++        m.transform = TF_FP8;
++        m.type = GGML_TYPE_F8_E4M3;
++    };
++
++    const std::string pfx = "model.language_model.";
++    if (hf.rfind(pfx, 0) == 0) {
++        // handled below
++    } else if (hf.rfind("mtp.", 0) == 0) {
++        // MTP tensors have no model.language_model. prefix
++        const int64_t il = n_layer; // MTP block is appended after the trunk
++        char buf[128];
++        const std::string s = hf.substr(4);
++        if (s == "fc.weight") {
++            snprintf(buf, sizeof(buf), "blk.%lld.nextn.eh_proj.weight", (long long) il);
++            gname = buf; set_plain(); return true;
++        }
++        if (s == "pre_fc_norm_embedding.weight") {
++            snprintf(buf, sizeof(buf), "blk.%lld.nextn.enorm.weight", (long long) il);
++            gname = buf; set_plain(TF_NORM_P1); return true;
++        }
++        if (s == "pre_fc_norm_hidden.weight") {
++            snprintf(buf, sizeof(buf), "blk.%lld.nextn.hnorm.weight", (long long) il);
++            gname = buf; set_plain(TF_NORM_P1); return true;
++        }
++        if (s == "norm.weight") {
++            snprintf(buf, sizeof(buf), "blk.%lld.nextn.shared_head_norm.weight", (long long) il);
++            gname = buf; set_plain(TF_NORM_P1); return true;
++        }
++        if (s.rfind("layers.", 0) == 0) {
++            const size_t p1 = 7;
++            const size_t p2 = s.find('.', p1);
++            const int64_t i = atoll(s.substr(p1, p2 - p1).c_str());
++            const std::string rest = s.substr(p2 + 1);
++            if (i != 0) {
++                return false;
++            }
++            if (rest == "input_layernorm.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.attn_norm.weight", (long long) il);
++                gname = buf; set_plain(TF_NORM_P1); return true;
++            }
++            if (rest == "post_attention_layernorm.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.post_attention_norm.weight", (long long) il);
++                gname = buf; set_plain(TF_NORM_P1); return true;
++            }
++            if (rest == "mlp.gate_proj.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.ffn_gate.weight", (long long) il);
++                gname = buf; set_plain(); return true;
++            }
++            if (rest == "mlp.up_proj.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.ffn_up.weight", (long long) il);
++                gname = buf; set_plain(); return true;
++            }
++            if (rest == "mlp.down_proj.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.ffn_down.weight", (long long) il);
++                gname = buf; set_plain(); return true;
++            }
++            if (rest.rfind("self_attn.", 0) == 0) {
++                const std::string st = rest.substr(10);
++                if (st == "q_proj.weight") {
++                    snprintf(buf, sizeof(buf), "blk.%lld.attn_q.weight", (long long) il);
++                    gname = buf; set_plain(); return true;
++                }
++                if (st == "k_proj.weight" || st == "v_proj.weight") {
++                    snprintf(buf, sizeof(buf), "blk.%lld.attn_%s.weight", (long long) il, st[0] == 'k' ? "k" : "v");
++                    gname = buf; set_plain(); return true;
++                }
++                if (st == "o_proj.weight") {
++                    snprintf(buf, sizeof(buf), "blk.%lld.attn_output.weight", (long long) il);
++                    gname = buf; set_plain(); return true;
++                }
++                if (st == "q_norm.weight" || st == "k_norm.weight") {
++                    snprintf(buf, sizeof(buf), "blk.%lld.attn_%c_norm.weight", (long long) il, st[0]);
++                    gname = buf; set_plain(TF_NORM_P1); return true;
++                }
++                return false;
++            }
++        }
++        return false;
++    } else {
++        return false; // vision and any other prefixes are skipped
++    }
++    const std::string rel = hf.substr(pfx.size());
++
++    if (rel == "embed_tokens.weight") {
++        gname = "token_embd.weight";
++        set_plain();
++        return true;
++    }
++    if (rel == "norm.weight") {
++        gname = "output_norm.weight";
++        set_plain(TF_NORM_P1);
++        return true;
++    }
++
++    if (rel.rfind("layers.", 0) == 0) {
++        const size_t p1 = 7;
++        const size_t p2 = rel.find('.', p1);
++        const int64_t i = atoll(rel.substr(p1, p2 - p1).c_str());
++        const std::string rest = rel.substr(p2 + 1);
++
++        char buf[128];
++        if (i >= n_layer) {
++            return false;
++        }
++        // shared tensors
++        if (rest == "input_layernorm.weight") {
++            snprintf(buf, sizeof(buf), "blk.%lld.attn_norm.weight", (long long) i);
++            gname = buf; set_plain(TF_NORM_P1); return true;
++        }
++        if (rest == "post_attention_layernorm.weight") {
++            snprintf(buf, sizeof(buf), "blk.%lld.post_attention_norm.weight", (long long) i);
++            gname = buf; set_plain(TF_NORM_P1); return true;
++        }
++        if (rest == "mlp.gate_proj.weight") {
++            snprintf(buf, sizeof(buf), "blk.%lld.ffn_gate.weight", (long long) i);
++            gname = buf; set_plain(); return true;
++        }
++        if (rest == "mlp.up_proj.weight") {
++            snprintf(buf, sizeof(buf), "blk.%lld.ffn_up.weight", (long long) i);
++            gname = buf; set_plain(); return true;
++        }
++        if (rest == "mlp.down_proj.weight") {
++            snprintf(buf, sizeof(buf), "blk.%lld.ffn_down.weight", (long long) i);
++            gname = buf; set_plain(); return true;
++        }
++        if (rest.rfind("self_attn.", 0) == 0) {
++            const std::string s = rest.substr(10);
++            if (s == "q_proj.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.attn_q.weight", (long long) i);
++                gname = buf; set_plain(); return true;
++            }
++            if (s == "k_proj.weight" || s == "v_proj.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.attn_%s.weight", (long long) i, s[0] == 'k' ? "k" : "v");
++                gname = buf; set_plain(); return true;
++            }
++            if (s == "o_proj.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.attn_output.weight", (long long) i);
++                gname = buf; set_plain(); return true;
++            }
++            if (s == "q_norm.weight" || s == "k_norm.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.attn_%c_norm.weight", (long long) i, s[0]);
++                gname = buf; set_plain(TF_NORM_P1); return true;
++            }
++            return false;
++        }
++        if (rest.rfind("linear_attn.", 0) == 0) {
++            const std::string s = rest.substr(12);
++            if (s == "in_proj_qkv.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.attn_qkv.weight", (long long) i);
++                gname = buf; set_reorder(&v_perm_128_v, nullptr); return true;
++            }
++            if (s == "in_proj_z.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.attn_gate.weight", (long long) i);
++                gname = buf; set_reorder(&v_perm_128, nullptr); return true;
++            }
++            if (s == "out_proj.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.ssm_out.weight", (long long) i);
++                gname = buf; set_reorder(nullptr, &v_perm_128); return true;
++            }
++            if (s == "in_proj_a.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.ssm_alpha.weight", (long long) i);
++                gname = buf; set_reorder(&v_perm_1, nullptr); return true;
++            }
++            if (s == "in_proj_b.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.ssm_beta.weight", (long long) i);
++                gname = buf; set_reorder(&v_perm_1, nullptr); return true;
++            }
++            if (s == "conv1d.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.ssm_conv1d.weight", (long long) i);
++                gname = buf; set_reorder(&v_perm_128_v, nullptr); return true;
++            }
++            if (s == "A_log") {
++                snprintf(buf, sizeof(buf), "blk.%lld.ssm_a", (long long) i);
++                gname = buf; m.transform = TF_A_LOG; m.row_perm = &v_perm_1; m.type = GGML_TYPE_F32;
++                return true;
++            }
++            if (s == "dt_bias") {
++                snprintf(buf, sizeof(buf), "blk.%lld.ssm_dt.bias", (long long) i);
++                gname = buf; set_reorder(&v_perm_1, nullptr); return true;
++            }
++            if (s == "norm.weight") {
++                snprintf(buf, sizeof(buf), "blk.%lld.ssm_norm.weight", (long long) i);
++                gname = buf; set_plain(); return true;
++            }
++            return false;
++        }
++        return false;
++    }
++
++    return false;
++}
++
++void llama_safetensors_loader::build_mapping() {
++    for (const auto & [hf, t] : hf_tensors) {
++        // scale_inv tensors are consumed by their fp8 companions
++        const std::string suffix = ".weight_scale_inv";
++        if (hf.size() > suffix.size() && hf.compare(hf.size() - suffix.size(), suffix.size(), suffix) == 0) {
++            continue;
++        }
++        std::string gname;
++        st_mapping m;
++        m.hf = hf;
++        m.src_f32 = t.dtype == "F32";
++        if (!map_weight(hf, t, gname, m)) {
++            continue;
++        }
++
++        // ggml dims: fastest dim first (HF stores [out, in] row-major)
++        if (t.shape.size() == 1) {
++            m.ne = { t.shape[0] };
++        } else if (t.shape.size() == 2) {
++            m.ne = { t.shape[1], t.shape[0] };
++        } else if (t.shape.size() == 3) {
++            // conv1d [C, 1, K] -> [K, C]
++            m.ne = { t.shape[2], t.shape[0] };
++        } else {
++            throw std::runtime_error(format("unsupported tensor rank %zu for '%s'", t.shape.size(), hf.c_str()));
++        }
++
++        // mirror conversion/base.py: 1D tensors, *_norm.weight and conv1d are always F32
++        if (m.type == GGML_TYPE_BF16) {
++            const bool is_1d     = m.ne.size() == 1;
++            const bool is_norm   = gname.size() >= 12 && gname.compare(gname.size() - 12, 12, "_norm.weight") == 0;
++            const bool is_conv1d = gname.find("ssm_conv1d") != std::string::npos;
++            if (is_1d || is_norm || is_conv1d) {
++                m.type = GGML_TYPE_F32;
++            }
++        }
++
++        if (m.type == GGML_TYPE_F8_E4M3) {
++            // the companion scale is stored as <name>.weight_scale_inv
++            m.hf_scale = hf.substr(0, hf.size() - 7) + ".weight_scale_inv";
++            if (hf_tensors.find(m.hf_scale) == hf_tensors.end()) {
++                throw std::runtime_error(format("missing fp8 scale tensor '%s'", m.hf_scale.c_str()));
++            }
++        }
++
++        gguf_map[gname] = std::move(m);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// metadata synthesis
++
++static void copy_kv(struct gguf_context * dst, struct gguf_context * src, int64_t kid) {
++    const char * key = gguf_get_key(src, kid);
++    switch (gguf_get_kv_type(src, kid)) {
++        case GGUF_TYPE_UINT8:   gguf_set_val_u8  (dst, key, gguf_get_val_u8  (src, kid)); break;
++        case GGUF_TYPE_INT8:    gguf_set_val_i8  (dst, key, gguf_get_val_i8  (src, kid)); break;
++        case GGUF_TYPE_UINT16:  gguf_set_val_u16 (dst, key, gguf_get_val_u16 (src, kid)); break;
++        case GGUF_TYPE_INT16:   gguf_set_val_i16 (dst, key, gguf_get_val_i16 (src, kid)); break;
++        case GGUF_TYPE_UINT32:  gguf_set_val_u32 (dst, key, gguf_get_val_u32 (src, kid)); break;
++        case GGUF_TYPE_INT32:   gguf_set_val_i32 (dst, key, gguf_get_val_i32 (src, kid)); break;
++        case GGUF_TYPE_FLOAT32: gguf_set_val_f32 (dst, key, gguf_get_val_f32 (src, kid)); break;
++        case GGUF_TYPE_UINT64:  gguf_set_val_u64 (dst, key, gguf_get_val_u64 (src, kid)); break;
++        case GGUF_TYPE_INT64:   gguf_set_val_i64 (dst, key, gguf_get_val_i64 (src, kid)); break;
++        case GGUF_TYPE_FLOAT64: gguf_set_val_f64 (dst, key, gguf_get_val_f64 (src, kid)); break;
++        case GGUF_TYPE_BOOL:    gguf_set_val_bool(dst, key, gguf_get_val_bool(src, kid)); break;
++        case GGUF_TYPE_STRING:  gguf_set_val_str (dst, key, gguf_get_val_str (src, kid)); break;
++        case GGUF_TYPE_ARRAY:
++            {
++                const enum gguf_type at = gguf_get_arr_type(src, kid);
++                const int64_t n = gguf_get_arr_n(src, kid);
++                if (at == GGUF_TYPE_STRING) {
++                    std::vector<const char *> strs(n);
++                    for (int64_t i = 0; i < n; ++i) {
++                        strs[i] = gguf_get_arr_str(src, kid, i);
++                    }
++                    gguf_set_arr_str(dst, key, strs.data(), n);
++                } else {
++                    gguf_set_arr_data(dst, key, at, gguf_get_arr_data(src, kid), n);
++                }
++            } break;
++        default:
++            break;
++    }
++}
++
++void llama_safetensors_loader::load_vocab_kv(struct gguf_context * ctx) {
++    if (!fs::exists(vocab_path)) {
++        throw std::runtime_error(format(
++            "tokenizer file '%s' not found - regenerate it with: python3 convert_hf_to_gguf.py %s --vocab-only --outfile %s",
++            vocab_path.c_str(), dir_path.c_str(), vocab_path.c_str()));
++    }
++    gguf_init_params ip = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
++    gguf_context_ptr vctx { gguf_init_from_file(vocab_path.c_str(), ip) };
++    if (!vctx) {
++        throw std::runtime_error(format("failed to load tokenizer file '%s'", vocab_path.c_str()));
++    }
++    for (int64_t i = 0; i < gguf_get_n_kv(vctx.get()); ++i) {
++        const char * key = gguf_get_key(vctx.get(), i);
++        if (strncmp(key, "tokenizer.", 10) == 0) {
++            copy_kv(ctx, vctx.get(), i);
++        }
++    }
++}
++
++struct gguf_context * llama_safetensors_loader::build_metadata() {
++    gguf_context_ptr ctx { gguf_init_empty() };
++
++    gguf_set_val_str(ctx.get(), "general.architecture", "qwen35");
++    {
++        std::string dir = dir_path;
++        if (!dir.empty() && dir.back() == '/') {
++            dir.pop_back();
++        }
++        gguf_set_val_str(ctx.get(), "general.name", fs::path(dir).filename().string().c_str());
++    }
++
++    gguf_set_val_u32(ctx.get(), "qwen35.context_length",       n_ctx);
++    gguf_set_val_u32(ctx.get(), "qwen35.embedding_length",     n_embd);
++    gguf_set_val_u32(ctx.get(), "qwen35.block_count",          n_layer + n_layer_nextn);
++    gguf_set_val_u32(ctx.get(), "qwen35.feed_forward_length",  n_ff);
++    gguf_set_val_u32(ctx.get(), "qwen35.attention.head_count",       n_head);
++    gguf_set_val_u32(ctx.get(), "qwen35.attention.head_count_kv",    n_head_kv);
++    gguf_set_val_u32(ctx.get(), "qwen35.attention.key_length",       n_embd_head_k);
++    gguf_set_val_u32(ctx.get(), "qwen35.attention.value_length",     n_embd_head_k);
++    gguf_set_val_f32(ctx.get(), "qwen35.attention.layer_norm_rms_epsilon", rms_eps);
++    gguf_set_val_u32(ctx.get(), "qwen35.rope.dimension_count", rope_dim);
++    gguf_set_val_f32(ctx.get(), "qwen35.rope.freq_base", rope_freq_base);
++    gguf_set_arr_data(ctx.get(), "qwen35.rope.dimension_sections", GGUF_TYPE_INT32, mrope_section, 4);
++    gguf_set_val_u32(ctx.get(), "qwen35.ssm.conv_kernel",    ssm_d_conv);
++    gguf_set_val_u32(ctx.get(), "qwen35.ssm.state_size",     ssm_d_state);
++    gguf_set_val_u32(ctx.get(), "qwen35.ssm.group_count",    ssm_n_group);
++    gguf_set_val_u32(ctx.get(), "qwen35.ssm.time_step_rank", ssm_dt_rank);
++    gguf_set_val_u32(ctx.get(), "qwen35.ssm.inner_size",     ssm_d_inner);
++    gguf_set_val_u32(ctx.get(), "qwen35.full_attention_interval", 4);
++    if (n_layer_nextn > 0) {
++        gguf_set_val_u32(ctx.get(), "qwen35.nextn_predict_layers", n_layer_nextn);
++    }
++    gguf_set_val_u32(ctx.get(), "qwen35.vocab_size", n_vocab);
++
++    load_vocab_kv(ctx.get());
++
++    ggml_init_params ip = { ggml_tensor_overhead() * (gguf_map.size() + 8), nullptr, true };
++    ggml_context_ptr gctx { ggml_init(ip) };
++    if (!gctx) {
++        throw std::runtime_error("failed to allocate ggml context for tensor metadata");
++    }
++    for (const auto & [gname, m] : gguf_map) {
++        ggml_tensor * t = ggml_new_tensor(gctx.get(), m.type, m.ne.size(), m.ne.data());
++        ggml_set_name(t, gname.c_str());
++        gguf_add_tensor(ctx.get(), t);
++    }
++
++    return ctx.release();
++}
++
++// ---------------------------------------------------------------------------
++// tensor data
++
++const uint8_t * llama_safetensors_loader::tensor_data(const st_tensor & t) const {
++    const auto it = files.find(t.file);
++    if (it == files.end() || it->second->addr == nullptr) {
++        throw std::runtime_error(format("file '%s' is not mapped", t.file.c_str()));
++    }
++    return it->second->addr + t.off;
++}
++
++void llama_safetensors_loader::fill_fp8(const st_mapping & m, const uint8_t * w, const uint16_t * s, uint8_t * dst) const {
++    const int64_t n_in  = m.ne[0];
++    const int64_t n_out = m.ne[1];
++    const int64_t ncb = n_in / 128;
++    const int64_t ncb_s = (n_in + 127) / 128;
++
++    for (int64_t r = 0; r < n_out; ++r) {
++        const int64_t sr = m.row_perm ? (*m.row_perm)[r] : r;
++        const uint8_t * wrow = w + sr * n_in;
++        const uint16_t * srow = s + (sr / 128) * ncb_s;
++        uint8_t * drow = dst + r * ncb * 132;
++        for (int64_t cb = 0; cb < ncb; ++cb) {
++            // the column permutation preserves 128-column blocks (head_dim == 128)
++            const int64_t scb = m.col_perm ? (*m.col_perm)[cb * 128] / 128 : cb;
++            const float scale = ggml_bf16_to_fp32(ggml_bf16_t{ srow[scb] });
++            memcpy(drow + cb * 132, &scale, 4);
++            memcpy(drow + cb * 132 + 4, wrow + scb * 128, 128);
++        }
++    }
++}
++
++// copy/reorder src (bf16) into dst, converting to the output element size
++void llama_safetensors_loader::fill_bf16(const st_mapping & m, const uint8_t * src, uint8_t * dst) const {
++    int64_t n_elements = 1;
++    for (int64_t d : m.ne) {
++        n_elements *= d;
++    }
++
++    switch (m.transform) {
++        case TF_NONE:
++            memcpy(dst, src, n_elements * 2);
++            return;
++        case TF_NORM_P1:
++            for (int64_t i = 0; i < n_elements; ++i) {
++                uint16_t v;
++                memcpy(&v, src + i * 2, 2);
++                const ggml_bf16_t b = ggml_fp32_to_bf16(ggml_bf16_to_fp32(ggml_bf16_t{ v }) + 1.0f);
++                memcpy(dst + i * 2, &b.bits, 2);
++            }
++            return;
++        case TF_A_LOG: // -exp then reorder (head_dim = 1)
++            {
++                std::vector<ggml_bf16_t> tmp(n_elements);
++                for (int64_t i = 0; i < n_elements; ++i) {
++                    uint16_t v;
++                    memcpy(&v, src + i * 2, 2);
++                    tmp[i] = ggml_fp32_to_bf16(-expf(ggml_bf16_to_fp32(ggml_bf16_t{ v })));
++                }
++                for (int64_t i = 0; i < n_elements; ++i) {
++                    memcpy(dst + i * 2, &tmp[(*m.row_perm)[i]].bits, 2);
++                }
++            }
++            return;
++        case TF_REORDER:
++            {
++                const int64_t n_cols = m.ne[0];
++                const int64_t n_rows = m.ne.size() > 1 ? m.ne[1] : 1;
++                if (m.row_perm) {
++                    if (n_rows == 1) {
++                        for (int64_t i = 0; i < n_cols; ++i) {
++                            memcpy(dst + i * 2, src + (*m.row_perm)[i] * 2, 2);
++                        }
++                    } else {
++                        for (int64_t r = 0; r < n_rows; ++r) {
++                            memcpy(dst + r * n_cols * 2, src + (*m.row_perm)[r] * n_cols * 2, n_cols * 2);
++                        }
++                    }
++                } else if (m.col_perm) {
++                    for (int64_t r = 0; r < n_rows; ++r) {
++                        const uint8_t * srow = src + r * n_cols * 2;
++                        uint8_t * drow = dst + r * n_cols * 2;
++                        for (int64_t c = 0; c < n_cols; ++c) {
++                            memcpy(drow + c * 2, srow + (*m.col_perm)[c] * 2, 2);
++                        }
++                    }
++                } else {
++                    memcpy(dst, src, n_elements * 2);
++                }
++            }
++            return;
++        default:
++            throw std::runtime_error(format("unhandled bf16 transform %d", m.transform));
++    }
++}
++
++float llama_safetensors_loader::src_val(const st_mapping & m, const uint8_t * src, int64_t i) const {
++    if (m.src_f32) {
++        float f;
++        memcpy(&f, src + i * 4, 4);
++        return f;
++    }
++    uint16_t v;
++    memcpy(&v, src + i * 2, 2);
++    return ggml_bf16_to_fp32(ggml_bf16_t{ v });
++}
++
++void llama_safetensors_loader::fill_f32(const st_mapping & m, const uint8_t * src, uint8_t * dst) const {
++    int64_t n_elements = 1;
++    for (int64_t d : m.ne) {
++        n_elements *= d;
++    }
++
++    // the reference converter computes the arithmetic in the HF dtype (bf16 or
++    // f32), so round through it when the source is bf16 to stay byte-exact
++    auto round_src = [&](float f) {
++        return m.src_f32 ? f : ggml_bf16_to_fp32(ggml_fp32_to_bf16(f));
++    };
++
++    switch (m.transform) {
++        case TF_NONE:
++            for (int64_t i = 0; i < n_elements; ++i) {
++                const float f = src_val(m, src, i);
++                memcpy(dst + i * 4, &f, 4);
++            }
++            return;
++        case TF_NORM_P1:
++            for (int64_t i = 0; i < n_elements; ++i) {
++                const float f = round_src(src_val(m, src, i) + 1.0f);
++                memcpy(dst + i * 4, &f, 4);
++            }
++            return;
++        case TF_A_LOG: // -exp then reorder (head_dim = 1)
++            {
++                std::vector<float> tmp(n_elements);
++                for (int64_t i = 0; i < n_elements; ++i) {
++                    tmp[i] = round_src(-expf(src_val(m, src, i)));
++                }
++                for (int64_t i = 0; i < n_elements; ++i) {
++                    memcpy(dst + i * 4, &tmp[(*m.row_perm)[i]], 4);
++                }
++            }
++            return;
++        case TF_REORDER:
++            {
++                const int64_t n_cols = m.ne[0];
++                const int64_t n_rows = m.ne.size() > 1 ? m.ne[1] : 1;
++                auto conv = [&](int64_t se, uint8_t * de) {
++                    const float f = src_val(m, src, se);
++                    memcpy(de, &f, 4);
++                };
++                if (m.row_perm) {
++                    if (n_rows == 1) {
++                        for (int64_t i = 0; i < n_cols; ++i) {
++                            conv((*m.row_perm)[i], dst + i * 4);
++                        }
++                    } else {
++                        for (int64_t r = 0; r < n_rows; ++r) {
++                            for (int64_t c = 0; c < n_cols; ++c) {
++                                conv((*m.row_perm)[r] * n_cols + c, dst + (r * n_cols + c) * 4);
++                            }
++                        }
++                    }
++                } else if (m.col_perm) {
++                    for (int64_t r = 0; r < n_rows; ++r) {
++                        for (int64_t c = 0; c < n_cols; ++c) {
++                            conv(r * n_cols + (*m.col_perm)[c], dst + (r * n_cols + c) * 4);
++                        }
++                    }
++                } else {
++                    for (int64_t i = 0; i < n_elements; ++i) {
++                        conv(i, dst + i * 4);
++                    }
++                }
++            }
++            return;
++        default:
++            throw std::runtime_error(format("unhandled f32 transform %d", m.transform));
++    }
++}
++
++void llama_safetensors_loader::fill_tensor(struct ggml_tensor * tensor) {
++    const auto it = gguf_map.find(tensor->name);
++    if (it == gguf_map.end()) {
++        throw std::runtime_error(format("missing safetensors source for tensor '%s'", tensor->name));
++    }
++    const st_mapping & m = it->second;
++
++    const auto ht = hf_tensors.find(m.hf);
++    if (ht == hf_tensors.end()) {
++        throw std::runtime_error(format("tensor '%s': safetensors tensor '%s' not found", tensor->name, m.hf.c_str()));
++    }
++    const uint8_t * data = tensor_data(ht->second);
++    const size_t nbytes = ggml_nbytes(tensor);
++
++    // a null buffer means the tensor data is host memory (only possible in tests)
++    const bool is_host = tensor->buffer == nullptr || ggml_backend_buffer_is_host(tensor->buffer);
++
++    // plain bf16 copy: no staging needed
++    if (m.transform == 0 && m.type == GGML_TYPE_BF16) {
++        const size_t chunk = 64 * MIB;
++        for (size_t off = 0; off < nbytes; off += chunk) {
++            const size_t sz = std::min(chunk, nbytes - off);
++            if (is_host) {
++                memcpy((uint8_t *) tensor->data + off, data + off, sz);
++            } else {
++                ggml_backend_tensor_set(tensor, data + off, off, sz);
++            }
++        }
++        return;
++    }
++
++    std::vector<uint8_t> staging(nbytes);
++    if (m.type == GGML_TYPE_F8_E4M3) {
++        const auto st = hf_tensors.find(m.hf_scale);
++        if (st == hf_tensors.end()) {
++            throw std::runtime_error(format("tensor '%s': fp8 scale tensor '%s' not found", tensor->name, m.hf_scale.c_str()));
++        }
++        fill_fp8(m, data, (const uint16_t *) tensor_data(st->second), staging.data());
++    } else if (m.type == GGML_TYPE_F32) {
++        fill_f32(m, data, staging.data());
++    } else {
++        fill_bf16(m, data, staging.data());
++    }
++
++    if (is_host) {
++        memcpy(tensor->data, staging.data(), nbytes);
++    } else {
++        ggml_backend_tensor_set(tensor, staging.data(), 0, nbytes);
++    }
++}
++
++void llama_safetensors_loader::set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
++    ((llama_safetensors_loader *) userdata)->fill_tensor(tensor);
++}
+diff --git a/src/llama-safetensors.h b/src/llama-safetensors.h
+new file mode 100644
+index 000000000..dba7232ff
+--- /dev/null
++++ b/src/llama-safetensors.h
+@@ -0,0 +1,127 @@
++// Direct loading of vanilla HuggingFace safetensors models, no GGUF conversion.
++//
++// The loader parses config.json + model.safetensors.index.json + the per-file
++// headers, mmaps the weight files, synthesizes an in-memory gguf_context with
++// the model hyperparameters and tensor list, and serves tensor data through
++// llama_model_init_from_user().
++//
++// Only the qwen35 architecture is supported for now (see the tensor name map
++// in llama-safetensors.cpp).
++
++#pragma once
++
++#include "ggml.h"
++
++#include <cstdint>
++#include <map>
++#include <memory>
++#include <string>
++#include <vector>
++
++struct gguf_context;
++struct ggml_context;
++struct ggml_tensor;
++struct llama_file;
++struct llama_mmap;
++
++class llama_safetensors_loader {
++public:
++    // true if the path is a safetensors model (a dir with config.json + *.safetensors, or a *.safetensors file)
++    static bool is_safetensors_path(const char * path);
++    // true if at least one registered device can run F8_E4M3 mul_mat natively
++    static bool has_fp8_device();
++
++    // throws std::runtime_error on any parse/mmap failure
++    llama_safetensors_loader(const char * path);
++    ~llama_safetensors_loader();
++
++    llama_safetensors_loader(const llama_safetensors_loader &) = delete;
++    llama_safetensors_loader & operator=(const llama_safetensors_loader &) = delete;
++
++    // builds the synthesized gguf metadata context; the caller frees it
++    struct gguf_context * build_metadata();
++
++    // true if the model contains F8_E4M3 tensors (drives the hardware gate)
++    bool has_fp8_tensors() const;
++    // total decoder blocks including the MTP block
++    int64_t n_layer_all() const { return n_layer + n_layer_nextn; }
++
++    // data callback for llama_model_init_from_user()
++    static void set_tensor_data(struct ggml_tensor * tensor, void * userdata);
++
++private:
++    struct st_file {
++        std::string path;    // absolute path of the safetensors file
++        const uint8_t * addr = nullptr; // mmap base of the whole file
++    };
++
++    // one tensor as described by a safetensors header
++    struct st_tensor {
++        std::string file;    // file name within the model dir
++        size_t off = 0;      // tensor data offset within the file
++        size_t nbytes = 0;   // tensor data size
++        std::string dtype;   // "F8_E4M3" or "BF16"
++        std::vector<int64_t> shape;
++    };
++
++    // how a gguf tensor maps back to the safetensors data
++    struct st_mapping {
++        std::string hf;        // HF tensor name
++        std::string hf_scale;  // companion *_scale_inv tensor (fp8 only)
++        enum ggml_type type = GGML_TYPE_F32;
++        int transform = 0;
++        bool src_f32 = false;  // the HF tensor is stored as F32 (not BF16)
++        const std::vector<int64_t> * row_perm = nullptr; // V-head reorder over rows
++        const std::vector<int64_t> * col_perm = nullptr; // V-head reorder over columns
++        std::vector<int64_t> ne; // ggml dims, fastest first
++    };
++
++    enum st_transform {
++        TF_NONE     = 0, // plain copy
++        TF_FP8,         // re-block fp8 bytes + bf16 scale into block_f8_e4m3
++        TF_NORM_P1,     // + 1.0 (f32, rounded through bf16)
++        TF_A_LOG,       // -exp + V-head reorder (head_dim = 1)
++        TF_REORDER,     // V-head row/column reorder (row_perm/col_perm)
++    };
++
++    // HF -> GGUF name mapping; fills the mapping (transform, perms, type)
++    bool map_weight(const std::string & hf, const st_tensor & t, std::string & gname, st_mapping & m) const;
++
++    std::string dir_path;
++    std::string vocab_path;    // <dir>/tokenizer.gguf (required, converter-assisted)
++
++    std::map<std::string, st_tensor> hf_tensors;          // HF name -> tensor
++    std::map<std::string, st_mapping> gguf_map;           // gguf name -> mapping
++    std::map<std::string, std::unique_ptr<st_file>> files;
++
++    std::vector<std::unique_ptr<llama_file>> ll_files;    // keep the fds alive
++    std::vector<std::unique_ptr<llama_mmap>> ll_mmaps;
++
++    // hyperparameters (from config.json, text_config)
++    int64_t n_embd = 0, n_layer = 0, n_ff = 0, n_head = 0, n_head_kv = 0, n_ctx = 0;
++    int64_t ssm_d_conv = 0, ssm_d_inner = 0, ssm_d_state = 0, ssm_dt_rank = 0, ssm_n_group = 0;
++    int64_t n_embd_head_k = 0, n_layer_nextn = 0, n_vocab = 0;
++    int64_t rope_dim = 0;
++    float rms_eps = 0.0f, rope_freq_base = 0.0f;
++    int32_t mrope_section[4] = { 0, 0, 0, 0 };
++
++    // V-head reorder permutations (linear attention has 16 K-heads and 32 V-heads)
++    std::vector<int64_t> v_perm_1;    // 32 elements, head_dim = 1
++    std::vector<int64_t> v_perm_128;  // 4096 elements, head_dim = 128
++    std::vector<int64_t> v_perm_128_v; // 4096 elements offset by the q/k rows (in_proj_qkv)
++
++    void parse_config();
++    void parse_files();
++    void build_mapping();
++    void build_permutations();
++
++    void load_vocab_kv(struct gguf_context * ctx);
++
++    void fill_tensor(struct ggml_tensor * tensor);
++    const uint8_t * tensor_data(const st_tensor & t) const;
++
++    void fill_fp8(const st_mapping & m, const uint8_t * w, const uint16_t * s, uint8_t * dst) const;
++    void fill_bf16(const st_mapping & m, const uint8_t * src, uint8_t * dst) const;
++    void fill_f32(const st_mapping & m, const uint8_t * src, uint8_t * dst) const;
++    float src_val(const st_mapping & m, const uint8_t * src, int64_t i) const;
++};
+diff --git a/src/llama.cpp b/src/llama.cpp
+index d6e0bbfef..14510bdd3 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -9,6 +9,7 @@
+ #include "llama-model-loader.h"
+ #include "llama-model-saver.h"
+ #include "llama-model.h"
++#include "llama-safetensors.h"
+ 
+ #include "ggml.h"
+ #include "ggml-cpp.h"
+@@ -452,6 +453,42 @@ struct llama_model * llama_model_load_from_file(
+         const char * path_model,
+         struct llama_model_params params) {
+     std::vector<std::string> splits = {};
++
++    // direct loading of vanilla HuggingFace safetensors (no GGUF conversion)
++    if (llama_safetensors_loader::is_safetensors_path(path_model)) {
++        std::unique_ptr<llama_safetensors_loader> loader;
++        gguf_context * metadata = nullptr;
++        try {
++            loader  = std::make_unique<llama_safetensors_loader>(path_model);
++            metadata = loader->build_metadata();
++        } catch (const std::exception & err) {
++            LLAMA_LOG_ERROR("%s: failed to load safetensors model: %s\n", __func__, err.what());
++            return nullptr;
++        }
++
++        if (!params.vocab_only && loader->has_fp8_tensors()) {
++            if (!llama_safetensors_loader::has_fp8_device()) {
++                gguf_free(metadata);
++                LLAMA_LOG_ERROR("%s: FP8_E4M3 weights require a device with native FP8 support (RDNA4, or NVIDIA Ada/Hopper+); this system has none. Use an integer GGUF (e.g. Q8_0) instead.\n", __func__);
++                return nullptr;
++            }
++            // fp8 tensors live in every decoder block (including the MTP block),
++            // so all of them must be offloaded to GPU
++            if (params.n_gpu_layers >= 0 && (int64_t) params.n_gpu_layers < loader->n_layer_all() + 1) {
++                gguf_free(metadata);
++                LLAMA_LOG_ERROR("%s: FP8_E4M3 weights must be fully offloaded to the GPU - increase --n-gpu-layers to at least %lld\n",
++                        __func__, (long long) loader->n_layer_all() + 1);
++                return nullptr;
++            }
++        }
++
++        params.load_mode = LLAMA_LOAD_MODE_NONE;
++        params.use_extra_bufts = false;
++        auto * model = llama_model_load_from_file_impl(metadata, llama_safetensors_loader::set_tensor_data, loader.get(), "", splits, /*file*/ nullptr, params);
++        gguf_free(metadata);
++        return model;
++    }
++
+     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params);
+ }
+ 
+-- 
+2.55.0
+

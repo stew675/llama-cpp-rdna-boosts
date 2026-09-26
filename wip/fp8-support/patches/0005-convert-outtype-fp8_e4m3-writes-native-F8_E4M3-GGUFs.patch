@@ -1,0 +1,559 @@
+From 533abf443fbe9b1b3c1d91b51009652b9eb42ad5 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Wed, 5 Aug 2026 09:33:49 -0500
+Subject: [PATCH 05/23] convert : --outtype fp8_e4m3 writes native F8_E4M3
+ GGUFs (M5)
+
+- gguf-py: GGMLQuantizationType.F8_E4M3 = 43, GGML_QUANT_SIZES (128, 132),
+  LlamaFileType.MOSTLY_F8_E4M3 = 42; quantize() passes packed blocks through.
+- llama.h: LLAMA_FTYPE_MOSTLY_F8_E4M3 = 42 (same integer as gguf-py so the
+  GGUF file type round-trips); ftype name + type->ftype guess mapping in
+  llama-model-loader.cpp.
+- conversion/base.py: _generate_fp8_tensors() reblocks weight +
+  weight_scale_inv pairs into block_f8_e4m3 rows (NVFP4-style, before
+  dequant_model), runs when ftype == MOSTLY_F8_E4M3; non-fp8 tensors default
+  to BF16; E5M2 rejected; warns when no fp8 weights found; GUESSED heuristic
+  detects float8_e4m3fn; index discovery falls back to any
+  *.safetensors.index.json weight map (nonstandard part naming).
+- conversion/qwen.py: transform_fp8_weight hook applies the V-head reorder to
+  fp8 weight + scale grid in 128-row/col units.
+- convert_hf_to_gguf.py: --outtype fp8_e4m3 choice (replaces --preserve-fp8).
+- D3 gate extended to the plain GGUF path in llama_model_load (fp8 tensors +
+  no fp8 device -> clear error, same as the safetensors path).
+- safetensors loader writes general.file_type = 42 for fp8 models.
+
+Verified: GGUF blocks byte-identical to source, 20-token parity exact vs the
+safetensors path and bf16, PPL 8.715 (GGUF) == 8.716 (safetensors) vs 8.602
+(bf16), gen 73-75 t/s, MTP 101 t/s, llama-server batched OK, CPU-only build
+rejects with the fp8-device error.
+
+Assisted-by: pi
+---
+ conversion/base.py         | 108 +++++++++++++++++++++++++++++++++++--
+ conversion/qwen.py         |  59 ++++++++++++++++++++
+ convert_hf_to_gguf.py      |   3 +-
+ gguf-py/gguf/constants.py  |   3 ++
+ gguf-py/gguf/quants.py     |   2 +
+ handoff.md                 |  50 +++++++++++++++++
+ implementation-plan.md     |  76 +++++++++++++++++++-------
+ include/llama.h            |   1 +
+ src/llama-model-loader.cpp |   2 +
+ src/llama-safetensors.cpp  |   3 ++
+ src/llama.cpp              |  16 ++++++
+ 11 files changed, 298 insertions(+), 25 deletions(-)
+
+diff --git a/conversion/base.py b/conversion/base.py
+index a7cd3fd90..c2e173248 100644
+--- a/conversion/base.py
++++ b/conversion/base.py
+@@ -172,6 +172,10 @@ class ModelBase:
+                     self.ftype = gguf.LlamaFileType.MOSTLY_F16
+                     logger.info("heuristics detected float16 tensor dtype, setting --outtype f16")
+                     break
++                elif tensor.dtype == torch.float8_e4m3fn:
++                    self.ftype = gguf.LlamaFileType.MOSTLY_F8_E4M3
++                    logger.info("heuristics detected float8_e4m3fn tensor dtype, setting --outtype fp8_e4m3")
++                    break
+             else:
+                 self.ftype = gguf.LlamaFileType.MOSTLY_F16
+                 logger.info("heuristics unable to detect tensor dtype, defaulting to --outtype f16")
+@@ -237,8 +241,24 @@ class ModelBase:
+                     tensor_names_from_index.update(weight_map.keys())
+                     part_dict: dict[str, None] = dict.fromkeys(weight_map.values(), None) # ty: ignore[invalid-assignment]
+                     part_names = sorted(part_dict.keys())
++                    is_safetensors = any(p.endswith(".safetensors") for p in part_names)
+             else:
+-                weight_map = {}
++                # nonstandard part naming (e.g. layers-*.safetensors): take any index
++                index_candidates = sorted(self.dir_model.glob("*.safetensors.index.json"))
++                if index_candidates:
++                    index_file = index_candidates[0]
++                    logger.info(f"gguf: loading model weight map from '{index_file.name}'")
++                    with open(index_file, "r", encoding="utf-8") as f:
++                        index = json.load(f)
++                        weight_map = index.get("weight_map")
++                        if weight_map is None or not isinstance(weight_map, dict):
++                            raise ValueError(f"Can't load 'weight_map' from {index_file.name!r}")
++                        tensor_names_from_index.update(weight_map.keys())
++                        part_dict = dict.fromkeys(weight_map.values(), None) # ty: ignore[invalid-assignment]
++                        part_names = sorted(part_dict.keys())
++                        is_safetensors = any(p.endswith(".safetensors") for p in part_names)
++                else:
++                    weight_map = {}
+         else:
+             weight_map = {}
+ 
+@@ -652,6 +672,80 @@ class ModelBase:
+     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+         return ()
+ 
++    def transform_fp8_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
++        """Hook for arch-specific reordering of FP8 weights (e.g. V-head reorder).
++        Must move rows/columns in units of 128 (the block size) so the scale grid
++        stays aligned. Default: no reorder."""
++        del name
++        return weight, scale
++
++    def _reblock_fp8(self, name: str, weight: Tensor, scale: Tensor) -> np.ndarray:
++        """Pack FP8 weights into ggml block_f8_e4m3 rows: [out, in/128 * 132] uint8.
++        Each block is [f32 scale][128 fp8] with the stored scale_inv value as d
++        (dequant = fp8 * d, matching the loader and the fp8 mul_mat kernel)."""
++        if weight.dtype == torch.float8_e5m2:
++            raise ValueError(f"{name}: E5M2 FP8 weights are not supported by llama.cpp block_f8_e4m3")
++        if weight.dtype != torch.float8_e4m3fn:
++            raise ValueError(f"{name}: expected FP8 weight, got {weight.dtype}")
++        if weight.dim() != 2:
++            raise ValueError(f"{name}: expected 2D FP8 weight, got shape {tuple(weight.shape)}")
++        if weight.shape[1] % 128 != 0:
++            raise ValueError(
++                f"{name}: FP8 column count {weight.shape[1]} must be a multiple of 128 "
++                "(llama.cpp block_f8_e4m3 requirement)")
++
++        n_out, n_in = weight.shape
++        n_blocks = n_in // 128
++        if scale.shape != (n_out // 128, n_blocks):
++            raise ValueError(
++                f"{name}: unexpected scale shape {tuple(scale.shape)}, "
++                f"expected {(n_out // 128, n_blocks)}")
++
++        weight = LazyTorchTensor.to_eager(weight).contiguous()
++        scale = LazyTorchTensor.to_eager(scale).float().contiguous()
++
++        w_bytes = weight.view(torch.uint8).numpy()  # [out, in] raw fp8 values
++        d = scale.numpy().astype(np.float32)        # [out/128, blocks]
++
++        out = np.empty((n_out, n_blocks, 132), dtype=np.uint8)
++        out[:, :, 0:4] = np.repeat(d, 128, axis=0).view(np.uint8).reshape(n_out, n_blocks, 4)
++        out[:, :, 4:] = w_bytes.reshape(n_out, n_blocks, 128)
++        return out.reshape(n_out, n_blocks * 132)
++
++    def _generate_fp8_tensors(self):
++        """Repack FP8 weights into ggml block_f8_e4m3 and write them directly,
++        before dequant_model (mirrors the NVFP4 pack flow). Runs before
++        dequant_model so the fp8 tensors are never dequantized and the
++        scale_inv companions are consumed."""
++        consumed: list[str] = []
++
++        for name in list(self.model_tensors.keys()):
++            if not name.endswith("_scale_inv"):
++                continue
++            weight_name = name.removesuffix("_scale_inv")
++            if weight_name not in self.model_tensors:
++                continue
++
++            weight = LazyTorchTensor.to_eager(self.model_tensors[weight_name]())
++            scale = LazyTorchTensor.to_eager(self.model_tensors[name]())
++            if weight.dtype != torch.float8_e4m3fn:
++                continue  # not an fp8 weight (e.g. plain bf16 with a stray scale)
++
++            weight, scale = self.transform_fp8_weight(weight_name, weight, scale)
++            blocks = self._reblock_fp8(weight_name, weight, scale)
++            new_name = self.map_tensor_name(weight_name)
++            logger.info(f"Repacked {new_name} with quantization F8_E4M3")
++            self.gguf_writer.add_tensor(new_name, blocks, raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
++            consumed.append(weight_name)
++            consumed.append(name)
++
++        for name in consumed:
++            self.model_tensors.pop(name, None)
++
++        if not consumed:
++            logger.warning(
++                "--outtype fp8_e4m3: no FP8 weights found, the file will contain no F8_E4M3 tensors")
++
+     @staticmethod
+     def _nvfp4_pack(weight: Tensor, scale: Tensor) -> tuple[np.ndarray, list[int]]:
+         """Repack NVFP4 ModelOpt tensors into ggml super-block layout.
+@@ -826,9 +920,12 @@ class ModelBase:
+         self._is_nvfp4 = quant_algo == "NVFP4"
+         self._is_mxfp4 = quant_method == "mxfp4"
+ 
+-        # NVFP4 weights are repacked and written directly to gguf_writer.
+-        # This must run before dequant_model so NVFP4 tensors are removed
+-        # from model_tensors, leaving only non-NVFP4 (e.g. FP8) for dequant.
++        # FP8 weights are repacked and written directly to gguf_writer.
++        # This must run before dequant_model so FP8 tensors are removed
++        # from model_tensors, leaving only non-FP8 for dequant.
++        if self.ftype == gguf.LlamaFileType.MOSTLY_F8_E4M3:
++            self._generate_fp8_tensors()
++
+         if self._is_nvfp4:
+             if nvfp4_compressed_tensors:
+                 # Convert compressed-tensors 'global' scales into the reciprocal
+@@ -954,6 +1051,9 @@ class ModelBase:
+                         data_qtype = gguf.GGMLQuantizationType.F16
+                     elif self.ftype == gguf.LlamaFileType.MOSTLY_BF16:
+                         data_qtype = gguf.GGMLQuantizationType.BF16
++                    elif self.ftype == gguf.LlamaFileType.MOSTLY_F8_E4M3:
++                        # FP8 weights are written directly; the rest default to BF16
++                        data_qtype = gguf.GGMLQuantizationType.BF16
+                     elif self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0:
+                         data_qtype = gguf.GGMLQuantizationType.Q8_0
+                     elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ1_0:
+diff --git a/conversion/qwen.py b/conversion/qwen.py
+index b4ae528bf..143b1c559 100644
+--- a/conversion/qwen.py
++++ b/conversion/qwen.py
+@@ -551,6 +551,65 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
+         weight, scale = self._transform_nvfp4_weight(name, weight, scale)
+         super()._repack_nvfp4(name, weight, scale, scale2, input_scale)
+ 
++    def transform_fp8_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
++        """FP8 variant of the V-head reorder. The scale grid rows/columns are
++        per 128 rows/columns (block_f8_e4m3), so the permutations are applied
++        in units of 128 to keep the block correspondence."""
++        if not name.endswith((
++            ".linear_attn.in_proj_qkv.weight",
++            ".linear_attn.in_proj_z.weight",
++            ".linear_attn.in_proj_a.weight",
++            ".linear_attn.in_proj_b.weight",
++            ".linear_attn.out_proj.weight",
++        )):
++            return weight, scale
++
++        num_k_heads = self.hparams["linear_num_key_heads"]
++        num_v_heads = self.hparams["linear_num_value_heads"]
++        head_k_dim = self.hparams["linear_key_head_dim"]
++        head_v_dim = self.hparams["linear_value_head_dim"]
++        num_v_per_k = num_v_heads // num_k_heads
++
++        def apply_col_perm(qs: Tensor, scales: Tensor, col_perm: Tensor) -> tuple[Tensor, Tensor]:
++            qs = qs.index_select(1, col_perm.to(device=qs.device))
++            scales = scales.index_select(1, (col_perm[::128] // 128).to(device=scales.device))
++            return qs, scales
++
++        def reorder_rows(qs: Tensor, scales: Tensor, head_dim: int) -> tuple[Tensor, Tensor]:
++            row_perm = self._reorder_v_heads(
++                torch.arange(num_v_heads * head_dim, dtype=torch.long).unsqueeze(-1),
++                0, num_k_heads, num_v_per_k, head_dim,
++            ).squeeze(-1)
++            return (
++                qs.index_select(0, row_perm.to(device=qs.device)),
++                scales.index_select(0, (row_perm[::128] // 128).to(device=scales.device)),
++            )
++
++        if name.endswith(".linear_attn.in_proj_qkv.weight"):
++            q_dim = head_k_dim * num_k_heads
++            k_dim = head_k_dim * num_k_heads
++            q = weight[:q_dim]
++            k = weight[q_dim:q_dim + k_dim]
++            v = weight[q_dim + k_dim:]
++            q_scale = scale[:q_dim // 128]
++            k_scale = scale[q_dim // 128:(q_dim + k_dim) // 128]
++            v_scale = scale[(q_dim + k_dim) // 128:]
++            v, v_scale = reorder_rows(v, v_scale, head_v_dim)
++            return torch.cat([q, k, v], dim=0), torch.cat([q_scale, k_scale, v_scale], dim=0)
++
++        if name.endswith(".linear_attn.in_proj_z.weight"):
++            return reorder_rows(weight, scale, head_v_dim)
++        elif name.endswith((".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight")):
++            return reorder_rows(weight, scale, 1)
++        elif name.endswith(".linear_attn.out_proj.weight"):
++            col_perm = self._reorder_v_heads(
++                torch.arange(num_v_heads * head_v_dim, dtype=torch.long).unsqueeze(0),
++                1, num_k_heads, num_v_per_k, head_v_dim,
++            ).squeeze(0)
++            return apply_col_perm(weight, scale, col_perm)
++
++        return weight, scale
++
+     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+         num_k_heads = self.hparams.get("linear_num_key_heads", 0)
+         num_v_heads = self.hparams.get("linear_num_value_heads", 0)
+diff --git a/convert_hf_to_gguf.py b/convert_hf_to_gguf.py
+index 78ad26c65..14ee9ad26 100755
+--- a/convert_hf_to_gguf.py
++++ b/convert_hf_to_gguf.py
+@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
+         help="path to write to; default: based on input. {ftype} will be replaced by the outtype.",
+     )
+     parser.add_argument(
+-        "--outtype", type=str, choices=["f32", "f16", "bf16", "q8_0", "tq1_0", "tq2_0", "auto"], default="auto",
++        "--outtype", type=str, choices=["f32", "f16", "bf16", "q8_0", "tq1_0", "tq2_0", "fp8_e4m3", "auto"], default="auto",
+         help="output format - use f32 for float32, f16 for float16, bf16 for bfloat16, q8_0 for Q8_0, tq1_0 or tq2_0 for ternary, and auto for the highest-fidelity 16-bit float type",
+     )
+     parser.add_argument(
+@@ -212,6 +212,7 @@ def main() -> None:
+         "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
+         "tq1_0": gguf.LlamaFileType.MOSTLY_TQ1_0,
+         "tq2_0": gguf.LlamaFileType.MOSTLY_TQ2_0,
++        "fp8_e4m3": gguf.LlamaFileType.MOSTLY_F8_E4M3,
+         "auto": gguf.LlamaFileType.GUESSED,
+     }
+ 
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 8516222cc..0fc9e23f3 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -4989,6 +4989,7 @@ class GGMLQuantizationType(IntEnum):
+     NVFP4   = 40
+     Q1_0    = 41
+     Q2_0    = 42
++    F8_E4M3 = 43
+ 
+ 
+ class ExpertGatingFuncType(IntEnum):
+@@ -5045,6 +5046,7 @@ class LlamaFileType(IntEnum):
+     MOSTLY_NVFP4         = 39  # except 1d tensors
+     MOSTLY_Q1_0          = 40  # except 1d tensors
+     MOSTLY_Q2_0          = 41  # except 1d tensors
++    MOSTLY_F8_E4M3       = 42  # except 1d tensors
+ 
+     GUESSED              = 1024  # not specified in the model file
+ 
+@@ -5176,6 +5178,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
+     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
+     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
+     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
++    GGMLQuantizationType.F8_E4M3: (128, 4 + 128),
+ }
+ 
+ 
+diff --git a/gguf-py/gguf/quants.py b/gguf-py/gguf/quants.py
+index 80966b6ef..378009e1f 100644
+--- a/gguf-py/gguf/quants.py
++++ b/gguf-py/gguf/quants.py
+@@ -59,6 +59,8 @@ def quantize(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
+         return data.astype(np.float32, copy=False)
+     elif qtype == GGMLQuantizationType.F16:
+         return data.astype(np.float16, copy=False)
++    elif qtype == GGMLQuantizationType.F8_E4M3:
++        return data  # already packed as block_f8_e4m3 (f32 scale + 128 fp8)
+     elif (q := _type_traits.get(qtype)) is not None:
+         return q.quantize(data)
+     else:
+diff --git a/handoff.md b/handoff.md
+index 9eac75b37..5f64367d2 100644
+--- a/handoff.md
++++ b/handoff.md
+@@ -192,3 +192,53 @@ parity EXACT over 20 tokens. The test harnesses' host encode copies were fixed t
+ - mtmd-cli direct binary not run (llama-cli/server + API verified instead).
+ - CUDA sm_89/sm_90 fp8 mma path compile-guarded, untested (scalar fallback).
+ - M5 (gguf-py F8_E4M3 constants, --preserve-fp8) not started.
++
++
++## 11. M5 - GGUF-side FP8 preservation (DONE 2026-08-06)
++
++`--outtype fp8_e4m3` now produces a standard GGUF with native F8_E4M3 tensors
++(block_f8_e4m3), so fp8 models work through the regular GGUF path (no safetensors
++loader). Summary of the changes:
++
++- gguf-py: `GGMLQuantizationType.F8_E4M3 = 43`, `GGML_QUANT_SIZES` entry
++  `(128, 132)`, `LlamaFileType.MOSTLY_F8_E4M3 = 42`; `quantize()` passes the
++  already-packed blocks through.
++- llama.cpp: `LLAMA_FTYPE_MOSTLY_F8_E4M3 = 42` in llama.h (the GGUF metadata
++  value; matching integer in gguf-py so the file type round-trips), ftype name +
++  type->ftype guess mapping in llama-model-loader.cpp.
++- converter: `_generate_fp8_tensors()` reblocks weight + weight_scale_inv into
++  `[out, in/128 * 132]` uint8 rows (d = stored scale_inv as f32, 128 fp8 bytes
++  verbatim) and writes them NVFP4-style before dequant_model. The qwen35 mixin's
++  `transform_fp8_weight` applies the V-head reorder to weight + scale grid in
++  128-row/col units. Non-fp8 tensors default to BF16. E5M2 rejected, 2D-only,
++  warns when a non-fp8 model is given the fp8_e4m3 outtype. The GUESSED
++  heuristic also detects float8_e4m3fn.
++- D3 gate extended to the plain GGUF path (llama_model_load): fp8 tensors +
++  no fp8-capable device -> the same clear error as the safetensors path.
++- The converter's index discovery now falls back to any `*.safetensors.index.json`
++  weight map, so nonstandard part naming (StewFP8 `layers-*.safetensors`) converts.
++- The safetensors loader writes `general.file_type = 42` so `ftype: F8_E4M3`
++  displays there too.
++
++Verification (Qwen3.5-4B, 1x R9700):
++- GGUF has 207 F8_E4M3 + 234 F32/BF16 tensors; block bytes byte-identical to the
++  source safetensors (d == scale_inv, qs == weight bytes).
++- 20-token greedy parity: fp8 GGUF == fp8 safetensors == bf16 (exact).
++- PPL: 8.7152 (fp8 GGUF) vs 8.7164 (fp8 safetensors) vs 8.6024 (bf16) vs 8.6126
++  (Q8_0) - the two fp8 paths agree to 4 digits, bf16 gap ~1.3%.
++- Perf: gen 73-75 t/s, prompt 140 t/s; MTP drafting 101 t/s; llama-server
++  (4-seq batched) serves the fp8 GGUF fine (output in reasoning_content, as
++  always with Qwen3.5 thinking mode).
++- CPU-only build: "FP8_E4M3 weights require a device with native FP8 support
++  (RDNA4, or NVIDIA Ada/Hopper+); this system has none. Use an integer GGUF
++  (e.g. Q8_0) instead."
++
++## 12. CUDA sm_89/sm_90 fp8 path (DONE 2026-08-06 - documented)
++
++Not implemented. On CUDA the unguarded `mul_mat_fp8_scalar` fallback runs
++(correct, slow); the RDNA4 WMMA kernels are AMD-builtin only. An sm_89
++mma.m16n8k8 PTX implementation would be unverifiable here (no NVIDIA HW on this
++box, and the wmma fragment saga proved how easy these are to get wrong), so it
++is documented rather than shipped untested. CUDA Ada/Hopper loads fp8 models
++fine and runs them on the scalar kernel; the D3 gate message already reflects
++that.
+diff --git a/implementation-plan.md b/implementation-plan.md
+index 15f3fca46..b239dfdd1 100644
+--- a/implementation-plan.md
++++ b/implementation-plan.md
+@@ -210,10 +210,13 @@ Environment facts (verified):
+   FP8 work (see M2 spike) but available.
+ 
+ Tasks:
+-- [ ] Baseline: run the build script as-is; confirm `ggml-hip` builds and the 3 GPUs
+-      are usable (run a small GGUF with `--split-mode layer`/`row`).
+-- [ ] Record baseline perplexity/generation for later FP8 comparison.
+-- [ ] Confirm `rocm_agent_enumerator` (3x gfx1201 + 1x gfx1036) matches the build targets.
++- [x] Baseline: the HIP build (`-DGPU_TARGETS="gfx1200;gfx1201"`) builds and all 3
++      gfx1201 GPUs are usable with `--split-mode layer` and `row` (verified during
++      M4 multi-GPU parity).
++- [x] Baselines recorded: Q8_0 GGUF gen 91.7 t/s / prompt 348 t/s; BF16 dir
++      gen 57-71 t/s; PPL (Pride & Prejudice, 512-ctx): bf16 8.60, Q8_0 8.61,
++      fp8 8.72 (both paths).
++- [x] `rocm_agent_enumerator` = 3x gfx1201 + 1x gfx1036, matches the build targets.
+ 
+ ### M1. `GGML_TYPE_FP8_E4M3` core type (serialization/validation only, NO CPU kernels)
+ 
+@@ -262,8 +265,13 @@ Spike result (already done, verified by compiling a test kernel):
+ 
+ Tasks:
+ - [x] fp8 tile-load + mmq-style mul_mat kernel (WMMA path): `v_wmma_f32_16x16x16_fp8_fp8` with the verified gfx12 fragment layout. **Fragment layout (empirically verified on gfx1201 + TileLang/CK docs): A lane l byte e = A[l%16][(l//16)*8+e]; B lane l byte e = B[(l//16)*8+e][l%16]; C slot s = C[(l//16)*8+s][l%16].** Staging is [n][k] (token-major, k-minor) so B fragments are contiguous 8-byte loads. Correctness: standalone test + 12-config stress suite PASS (max rel err <= 3.4e-3).
+-- [ ] Non-WMMA dot path: `v_dot4_f32_fp8_fp8` (not yet implemented; WMMA is the primary path).
+-- [ ] CUDA side: `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` for sm_89/sm_90 behind `#if !defined(__HIPCC__)` (compile-verified only; scalar fallback kernel exists).
++- [x] dot4 path (GEMV only): `mul_mat_fp8_gemv` uses `__builtin_amdgcn_dot4_f32_fp8_fp8`
++      for n <= 16 tokens (avoids the wmma 16-token tile waste at batch 1). A full
++      dot4 matmul for large n is not needed - WMMA covers it.
++- [x] CUDA side: NOT implemented - documented instead (see section "CUDA sm_89/sm_90
++      fp8 path"). The unguarded scalar fallback runs on CUDA (correct, slow); the
++      sm_89 mma PTX fragment layout cannot be verified without NVIDIA hardware, so
++      it is deliberately not shipped untested.
+ - [x] Backend registration: HIP backend `supports_op` for f8_e4m3 mul_mat (RDNA4 gate); host-side launcher `ggml_cuda_mul_mat_fp8` pre-quantizes activations (fp8 staging + scales).
+ - [x] `tests/test-backend-ops` builds; f8_e4m3 MUL_MAT shows "not supported [CPU]" (correct skip) and runs on the ROCm devices; no FAILs. (NOTE: re-run `cmake .` in the build dir so the GLOB picks up fp8.cu.)
+ - [x] Perf: 1x R9700 generation: FP8 safetensors 72.5 t/s vs Q8_0 GGUF 91.7 t/s vs BF16 safetensors 59-72 t/s. Prompt: FP8 143 t/s vs Q8_0 348 t/s. (Two fixes were needed: the host-side RDNA4 dispatch was compiled out by a device-only #if guard -> scalar fallback; and a dot4 GEMV path for n <= 16 avoids the wmma batch-1 waste.)
+@@ -339,20 +347,48 @@ Tasks:
+       `common_params_model.vocab_file` + `--vocab-file FILE` (default
+       `<model-dir>/tokenizer.gguf`).
+ 
+-### M5. (Optional, low priority) GGUF-side FP8 preservation
+-- [ ] `gguf-py/gguf/constants.py`: `F8_E4M3 = 43`, `GGML_QUANT_SIZES[F8_E4M3] = (128, 132)`.
+-- [ ] `gguf-py/gguf/quants.py`: quantize/dequantize for the type (re-block from
+-      weight+weight_scale_inv pairs; host-side Python, no C++ kernels needed).
+-- [ ] `conversion/base.py` fp8 branch: `--preserve-fp8` flag writes the type instead of
+-      dequantizing (uses `weight_block_size` 128).
+-- [ ] `convert_hf_to_gguf.py` round-trip: safetensors -> GGUF(f8_e4m3) -> direct loader
+-      output parity. Note: running such a GGUF still requires FP8-capable hardware
+-      (D3 gate applies to GGUF loads too).
+-- [ ] `llama-quantize --type f8_e4m3` (quantizing BF16 -> fp8) is NOT planned; it needs
+-      a from_float implementation and has no value without native fp8 hardware anyway.
+-      Defer unless explicitly wanted.
+-
+----
++### M5. (DONE 2026-08-06) GGUF-side FP8 preservation
++
++`--outtype fp8_e4m3` writes FP8 weights as native `block_f8_e4m3` GGUF tensors
++instead of dequantizing them. The safetensors loader (M3) remains for direct HF
++dirs; M5 adds the GGUF round trip so fp8 models can also be distributed as a
++single standard GGUF file.
++
++- [x] `gguf-py/gguf/constants.py`: `GGMLQuantizationType.F8_E4M3 = 43` (matches
++      ggml.h), `GGML_QUANT_SIZES[F8_E4M3] = (128, 132)`,
++      `LlamaFileType.MOSTLY_F8_E4M3 = 42`.
++- [x] `include/llama.h`: `LLAMA_FTYPE_MOSTLY_F8_E4M3 = 42`; `llama-model-loader.cpp`
++      ftype name + type->ftype guess map.
++- [x] `conversion/base.py`: `_generate_fp8_tensors()` reblocks `weight` +
++      `weight_scale_inv` pairs into block_f8_e4m3 rows `[out, in/128 * 132]`
++      (d = stored scale_inv value, fp8 bytes verbatim) and writes them directly
++      (NVFP4-style, before dequant_model). Runs when
++      `ftype == MOSTLY_F8_E4M3`. Non-fp8 tensors default to BF16. `transform_fp8_weight`
++      hook for arch-specific reorders; E5M2 rejected; 2D-only; warns when no fp8
++      tensors found. GUESSED heuristic detects float8_e4m3fn.
++- [x] `conversion/qwen.py`: `transform_fp8_weight` V-head reorder with the scale
++      grid in 128-row/col units (`row_perm[::128] // 128`).
++- [x] `convert_hf_to_gguf.py`: `--outtype fp8_e4m3` choice (replaces the earlier
++      `--preserve-fp8` flag per review feedback).
++- [x] index fallback: dirs with nonstandard part naming (StewFP8 `layers-*.safetensors`)
++      now load via any `*.safetensors.index.json` weight map.
++- [x] D3 gate extended to the plain GGUF path in `llama_model_load` (fp8 tensors +
++      no fp8 device -> same clear error as the safetensors path).
++- [x] Loader: `general.file_type = 42` written for fp8 safetensors models.
++- [x] Verified: 207 F8_E4M3 tensors in the GGUF, block bytes byte-identical to the
++      source safetensors; tokens identical to the safetensors path and bf16;
++      PPL 8.715 (fp8 GGUF) == 8.716 (fp8 safetensors) vs 8.602 (bf16);
++      gen 73-75 t/s, MTP 101 t/s, llama-server works (batched fp8); CPU-only
++      build -> the D3 error message.
++
++## CUDA sm_89/sm_90 fp8 path (DONE 2026-08-06 - documented)
++The RDNA4 WMMA kernels are AMD-builtin only; on CUDA the unguarded
++`mul_mat_fp8_scalar` fallback runs (correct, slow). Implementing the sm_89
++`mma.sync.m16n8k8.f32.e4m3.e4m3` PTX path without NVIDIA hardware to verify the
++fragment layout is exactly the class of untestable code AGENTS.md forbids, so it
++is documented as supported-but-scalar rather than shipped untested. The D3 gate
++message ("RDNA4, or NVIDIA Ada/Hopper+") matches reality: CUDA Ada/Hopper can
++load fp8 models, they just run the scalar kernel.
+ 
+ ## 4. Files touched (summary)
+ 
+diff --git a/include/llama.h b/include/llama.h
+index a6e0af9ed..fe0b1c252 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -156,6 +156,7 @@ extern "C" {
+         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
+         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
+         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
++        LLAMA_FTYPE_MOSTLY_F8_E4M3       = 42, // except 1d tensors
+ 
+         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
+     };
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 04b362286..1fb0e084c 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -39,6 +39,7 @@ const char * llama_ftype_name(llama_ftype ftype) {
+         case LLAMA_FTYPE_MOSTLY_BF16:      name = LLAMA_FTYPE_PREFIX "BF16"; break;
+         case LLAMA_FTYPE_MOSTLY_Q1_0:      name = LLAMA_FTYPE_PREFIX "Q1_0"; break;
+         case LLAMA_FTYPE_MOSTLY_Q2_0:      name = LLAMA_FTYPE_PREFIX "Q2_0"; break;
++        case LLAMA_FTYPE_MOSTLY_F8_E4M3:   name = LLAMA_FTYPE_PREFIX "F8_E4M3"; break;
+         case LLAMA_FTYPE_MOSTLY_Q4_0:      name = LLAMA_FTYPE_PREFIX "Q4_0"; break;
+         case LLAMA_FTYPE_MOSTLY_Q4_1:      name = LLAMA_FTYPE_PREFIX "Q4_1"; break;
+         case LLAMA_FTYPE_MOSTLY_Q5_0:      name = LLAMA_FTYPE_PREFIX "Q5_0"; break;
+@@ -759,6 +760,7 @@ llama_model_loader::llama_model_loader(
+             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
+             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
+             case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
++            case GGML_TYPE_F8_E4M3: ftype = LLAMA_FTYPE_MOSTLY_F8_E4M3; break;
+             default:
+                 {
+                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
+diff --git a/src/llama-safetensors.cpp b/src/llama-safetensors.cpp
+index 3a7fb07fc..235805b9c 100644
+--- a/src/llama-safetensors.cpp
++++ b/src/llama-safetensors.cpp
+@@ -618,6 +618,9 @@ struct gguf_context * llama_safetensors_loader::build_metadata() {
+     gguf_context_ptr ctx { gguf_init_empty() };
+ 
+     gguf_set_val_str(ctx.get(), "general.architecture", "qwen35");
++    if (has_fp8_tensors()) {
++        gguf_set_val_u32(ctx.get(), "general.file_type", LLAMA_FTYPE_MOSTLY_F8_E4M3);
++    }
+     {
+         std::string dir = dir_path;
+         if (!dir.empty() && dir.back() == '/') {
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 1d75839f5..f33c49d7d 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -309,6 +309,22 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+ 
+         ml.print_info();
++
++        // FP8_E4M3 requires native FP8 hardware (same gate as the direct safetensors path)
++        if (!params.vocab_only) {
++            bool has_fp8 = false;
++            for (size_t i = 0; i < gguf_get_n_tensors(ml.metadata); ++i) {
++                if (gguf_get_tensor_type(ml.metadata, i) == GGML_TYPE_F8_E4M3) {
++                    has_fp8 = true;
++                    break;
++                }
++            }
++            if (has_fp8 && !llama_safetensors_loader::has_fp8_device()) {
++                LLAMA_LOG_ERROR("%s: FP8_E4M3 weights require a device with native FP8 support (RDNA4, or NVIDIA Ada/Hopper+); this system has none. Use an integer GGUF (e.g. Q8_0) instead.\n", __func__);
++                return {-1, nullptr};
++            }
++        }
++
+         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
+ 
+         bool ok = llama_prepare_model_devices(params, model_ptr.get());
+-- 
+2.55.0
+

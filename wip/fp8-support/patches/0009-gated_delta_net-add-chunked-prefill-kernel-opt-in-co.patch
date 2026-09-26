@@ -1,0 +1,529 @@
+From bb31b45d5d19fdd54a1500e96459b9b32c98610c Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Wed, 5 Aug 2026 23:28:25 -0500
+Subject: [PATCH 09/23] gated_delta_net : add chunked prefill kernel (opt-in,
+ correct but slow)
+
+Implement the chunked gated delta rule for prefill (S_v=128, scalar gates,
+K=1): phase A builds the per-chunk closure matrix, k_cumsum/k_cumdecay and
+attn_causal; phase B propagates the state chunk by chunk over V-slices.
+
+aiter's chunk_gated_delta_rule_fwd_h.cu does not run on gfx1201 (its own test
+skips gfx12), so this is our own f32 implementation, validated in python
+against the op recurrence. Enabled via GGML_CUDA_GDN_CHUNKED=1 only: it is
+correct (45/45 backend-ops tests on both paths, PPL 6.30 vs 6.26, generation
+matches) but currently slower than the sequential kernel (pp512 4200 vs 5925)
+because the phase-A matmuls are untiled. Add 4 S_v=128 prefill cases to the
+test-backend-ops eval set.
+
+Assisted-by: Claude Sonnet
+---
+ PERF_HANDOVER.md                      |  53 +++-
+ ggml/src/ggml-cuda/gated_delta_net.cu | 371 +++++++++++++++++++++++++-
+ tests/test-backend-ops.cpp            |   9 +
+ 3 files changed, 424 insertions(+), 9 deletions(-)
+
+diff --git a/PERF_HANDOVER.md b/PERF_HANDOVER.md
+index 8d3272d1e..7017b33af 100644
+--- a/PERF_HANDOVER.md
++++ b/PERF_HANDOVER.md
+@@ -160,11 +160,11 @@ rocprofv3 -r -d /tmp/rocp -f csv -- /tmp/llama-hip-full/bin/llama-bench -m /llm/
+ 
+ ## 9. Next-session suggested order
+ 
+-1. Confirm working tree matches this doc (git log, re-bench pp512 ~ 5914).
+-2. L1 (delta-net): port aiter's chunked gated-delta-rule kernel
+-   (`/home/stew675/aiter/csrc/kernels/chunk_gated_delta_rule_fwd_h.cu`, gfx1201
+-   path) into ggml-cuda; verify the gfx1201 dispatch fires; f32 intermediate
+-   precision parity (PPL check); bench pp512.
++1. Confirm working tree matches this doc (git log, re-bench pp512 ~ 5925).
++2. L1 (delta-net): the chunked kernel exists but is SLOWER than the sequential
++   (pp512 4200 vs 5925) - its phase A/B matmuls are naive (untiled, global
++   reads). Optimize: smem-stage k/v/q, tile the [64x64]@[64x128] matmuls, cut
++   the closure's 126 barriers, then re-enable by default (see section 11).
+ 3. L2 (weight repack): re-profile the staging share first; implement the
+    in-memory repack; vectorize sA staging; PPL + bench.
+ 4. Re-evaluate the +50% target with both in; then decide if L3/L4/L5 are worth it.
+@@ -195,3 +195,46 @@ New GGUF: /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf (5.36 GiB, 442
+ Left on the table (decode): gemv 496 -> ~520 GB/s (vectorized x loads, 8-block
+ ILP), fuse quantize_fp8 into the gemv (226 launches/step), delta-net 0.41
+ ms/step. Roughly +4% if all taken.
++
++## 11. Delta-net chunked session log (2026-08-05 night)
++
++Goal: speed up gated_delta_net_cuda (17% of pp512) by replacing the sequential
++per-token loop with a chunked formulation.
++
++KEY FINDING: aiter's chunk_gated_delta_rule_fwd_h.cu does NOT run on gfx1201 -
++op_tests/test_gated_delta_rule.py skips it on gfx12
++("kernel does not support gfx12!"). The handover's "aiter has a gfx1201 port"
++premise was wrong. The __gfx1201__ guard there is only for a buffer-resource
++constant. So no port; we implemented our own chunked kernel.
++
++Status: CORRECT but SLOWER. ggml-cuda/gated_delta_net.cu has gdn_chunk_prepare
++(phase A: per head x seq x chunk of 64 - decay cumsum, closure (I-A)^-1 via
++forward substitution, k_cumsum = attn @ (beta v), k_cumdecay = attn @ (beta k P),
++attn_causal = L .* (q^T k)) and gdn_chunk_state (phase B: per head x seq x
++V-slice of 8 - v_new = k_cumsum - k_cumdecay @ S, o = P .* (q @ S) + attn_causal
++@ v_new, S = P_last S + (k .* delta) @ v_new). Opt-in via GGML_CUDA_GDN_CHUNKED=1;
++off by default because pp512 = 4200 vs 5925 sequential.
++
++Math: validated in python (/tmp/validate_chunked.py) against the op recurrence
++(aiter's chunk_gated_delta_rule_ref structure, decay kept inside via
++L[i][j] = exp(decay_i - decay_j)). All 45 GATED_DELTA_NET backend-ops tests pass
++on BOTH paths (add 4 S_v=128 prefill cases to the eval set). PPL 6.30 vs 6.26
++baseline; generation matches.
++
++Bugs found and fixed (do not rediscover):
++- P = exp(cumsum(gate)) underflows to 0 for strong decay (cumsum < -88) ->
++  P_i/P_j = 0/0 = NaN. Keep the cumsum and always take exp(diff).
++- Phase-A scratch was indexed per chunk only, not per (head, seq): heads raced
++  on the same scratch (outputs looked like adjacent heads' data).
++- The decay_scratch store used tid = 0..127 over a 64-float per-head region:
++  threads 64-127 wrote garbage into the next head's region (nondeterministic
++  per-head corruption; single-head tests passed, multi-head flaky).
++- cudaStreamSynchronize / cudaEventCreate between the two kernels is ILLEGAL
++  during CUDA graph capture ("operation not permitted when stream is
++  capturing"). The kernels are on the same stream; no sync needed.
++
++Why it is slow: ~2x the FLOPs of the sequential kernel (closure + materialized
++k_cumsum/k_cumdecay/attn_causal) with untiled matmuls reading global memory and
++126 barriers in the closure. Next session: tile the matmuls with smem staging
++(phase A smem budget: s_attn 16.6 KB + s_k 32 KB fits one CTA/CU), reduce the
++closure barrier count, then re-enable by default.
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 1b431a724..c75eab121 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1,6 +1,319 @@
+ #include "gated_delta_net.cuh"
+ #include "ggml-cuda/common.cuh"
+ 
++// ================= chunked gated delta rule (prefill path) =================
++//
++// For n_tokens > 1 the per-token sequential loop of gated_delta_net_cuda is
++// replaced by a chunked formulation (chunk size GDN_CHUNK = 64, K = V = 128):
++//
++//   phase A (gdn_chunk_prepare, one CTA per head x seq x chunk):
++//     P_t      = exp(cumsum(gate))            per-chunk prefix products
++//     L[i][j]  = P_i / P_j                    causal decay factors
++//     w[i][j]  = -beta_i * L[i][j] * <k_i,k_j>
++//     attn     = (I - w_lo)^{-1}              closure via forward substitution
++//     k_cumsum   = attn @ (beta*v)
++//     k_cumdecay = attn @ (beta*k*P)
++//     attn_causal = L .* (q^T k)
++//
++//   phase B (gdn_chunk_state, one CTA per head x seq x V-slice):
++//     v_prime = k_cumdecay @ S
++//     v_new   = k_cumsum - v_prime
++//     o       = P .* (q @ S) + attn_causal @ v_new
++//     S       = P_last * S + (k * (P_last / P)) @ v_new
++//
++// Matches gated_delta_net_cuda<128,false,false> numerically (validated in
++// python, < 3e-4 relative on random K=V=128, T up to 512). Enabled only for
++// scalar gates (KDA=false), K=1, K=V=128, n_tokens > 1; everything else keeps
++// the sequential kernel.
++
++#define GDN_CHUNK 64
++#define GDN_CHUNK_VSLICE 8
++
++// phase A: per (head, seq, chunk). Block = 128 threads.
++__global__ void gdn_chunk_prepare(
++        const float * __restrict__ q,
++        const float * __restrict__ k,
++        const float * __restrict__ v,
++        const float * __restrict__ gate,
++        const float * __restrict__ beta,
++        float * __restrict__ k_cumsum,     // [n_chunks][GDN_CHUNK][V]
++        float * __restrict__ k_cumdecay,   // [n_chunks][GDN_CHUNK][K]
++        float * __restrict__ attn_causal,  // [n_chunks][GDN_CHUNK][GDN_CHUNK]
++        float * __restrict__ decay_scratch, // [n_chunks][GDN_CHUNK]  cumsum(gate)
++        float * __restrict__ delta_scratch,// [n_chunks][GDN_CHUNK]  exp(decay_last - decay_t)
++        float * __restrict__ P_last_scratch, // [n_chunks] exp(decay_last)
++        const int64_t n_tokens, const int64_t n_seqs, const int64_t H,
++        const int64_t n_chunks,
++        const int64_t sq1, const int64_t sq2, const int64_t sq3,
++        const int64_t sv1, const int64_t sv2, const int64_t sv3,
++        const int64_t sb1, const int64_t sb2, const int64_t sb3,
++        const int64_t neqk1) {
++    const int hs    = blockIdx.x;
++    const int h     = (int) (hs % H);
++    const int seq   = (int) (hs / H);
++    const int chunk = (int) blockIdx.y;
++    const int tid   = threadIdx.x;
++    const int iq    = (int) (h % neqk1); // GQA: q/k head
++    const int64_t hsc = (int64_t) hs * n_chunks; // per (head, seq) scratch base
++
++    const int t0     = chunk * GDN_CHUNK;
++    const int n_real = min((int) GDN_CHUNK, (int) n_tokens - t0);
++
++    __shared__ float s_attn[GDN_CHUNK][GDN_CHUNK + 1]; // padded: column reads stay conflict-free
++    __shared__ float s_decay[GDN_CHUNK];
++
++    const float * qb = q    + (int64_t) seq * sq3 + (int64_t) iq * sq1;
++    const float * kb = k    + (int64_t) seq * sq3 + (int64_t) iq * sq1;
++    const float * vb = v    + (int64_t) seq * sv3 + (int64_t) h  * sv1;
++    const float * gb = gate + (int64_t) seq * sb3 + (int64_t) h  * sb1;
++    const float * bb = beta + (int64_t) seq * sb3 + (int64_t) h  * sb1;
++
++    // per-chunk prefix sums of the log-gates; decay factors are always taken
++    // as exp(diff) so strong decay (cumsum < -88) underflows to 0 instead of
++    // producing 0/0 NaN. Padded gates are 0.
++    {
++        const float gv = (tid < n_real) ? gb[(int64_t) (t0 + tid) * sb2] : 0.0f;
++        s_decay[tid] = gv;
++        __syncthreads();
++        for (int s = 1; s < GDN_CHUNK; s <<= 1) {
++            const float d = (tid >= s) ? s_decay[tid - s] : 0.0f;
++            __syncthreads();
++            s_decay[tid] += d;
++            __syncthreads();
++        }
++        if (tid < GDN_CHUNK) {
++            decay_scratch[(hsc + chunk) * GDN_CHUNK + tid] = s_decay[tid];
++        }
++    }
++
++    // w[i][j] = -beta_i * exp(decay_i - decay_j) * <k_i, k_j> for i > j
++    // triangular entry index e = i(i+1)/2 + j; 2080 entries total
++    {
++        for (int e = tid; e < GDN_CHUNK * (GDN_CHUNK + 1) / 2; e += 128) {
++            const int i = (int) ((sqrtf(8.0f * e + 1.0f) - 1.0f) * 0.5f);
++            const int j = e - i * (i + 1) / 2;
++            const bool ok = (i < n_real) && (j < n_real) && (j < i); // strict coupling: zero diagonal
++            const float bi = (i < n_real) ? bb[(int64_t) (t0 + i) * sb2] : 0.0f;
++            const float Li = expf(s_decay[i] - s_decay[j]);
++            float dot = 0.0f;
++            if (ok) {
++                const float * ki = kb + (int64_t) (t0 + i) * sq2;
++                const float * kj = kb + (int64_t) (t0 + j) * sq2;
++                for (int d = 0; d < 128; ++d) {
++                    dot += ki[d] * kj[d];
++                }
++            }
++            s_attn[i][j] = ok ? (-bi * Li * dot) : 0.0f;
++        }
++        // upper triangle stays zero (initialized by the full-coverage write below)
++        for (int e = tid; e < GDN_CHUNK * GDN_CHUNK; e += 128) {
++            const int i = e / GDN_CHUNK;
++            const int j = e % GDN_CHUNK;
++            if (j > i) {
++                s_attn[i][j] = 0.0f;
++            }
++        }
++    }
++
++    // closure: attn[i][:] += sum_{j<i} attn[i][j] * attn[j][:] (forward substitution)
++    for (int i = 1; i < GDN_CHUNK; ++i) {
++        __syncthreads();
++        float acc = 0.0f;
++        if (tid <= i) {
++            for (int j = 0; j < i; ++j) {
++                acc += s_attn[i][j] * s_attn[j][tid];
++            }
++        }
++        __syncthreads();
++        if (tid <= i) {
++            s_attn[i][tid] += acc;
++        }
++    }
++    __syncthreads();
++    if (tid < GDN_CHUNK) {
++        s_attn[tid][tid] += 1.0f;
++    }
++    __syncthreads();
++
++    // k_cumsum[t][v] = sum_j attn[t][j] * (v[j][v] * beta[j])
++    // k_cumdecay[t][k] = sum_j attn[t][j] * (k[j][k] * beta[j] * P[j])
++    {
++        const int V = 128;
++        for (int idx = tid; idx < GDN_CHUNK * V; idx += 128) {
++            const int t = idx / V;
++            const int v = idx % V;
++            const float * at = s_attn[t];
++            float acc_v = 0.0f;
++            float acc_k = 0.0f;
++            for (int j = 0; j < GDN_CHUNK; ++j) {
++                const bool ok = j < n_real;
++                const float bj = ok ? bb[(int64_t) (t0 + j) * sb2] : 0.0f;
++                const float vj = ok ? vb[(int64_t) (t0 + j) * sv2 + v] : 0.0f;
++                const float kj = ok ? kb[(int64_t) (t0 + j) * sq2 + v] : 0.0f;
++                acc_v += at[j] * (bj * vj);
++                acc_k += at[j] * (bj * kj * expf(s_decay[j]));
++            }
++            k_cumsum[((hsc + chunk) * GDN_CHUNK + t) * V + v]   = acc_v;
++            k_cumdecay[((hsc + chunk) * GDN_CHUNK + t) * 128 + v] = acc_k;
++        }
++    }
++
++    // attn_causal[i][j] = (P_i / P_j) * <q_i, k_j> for i >= j (reuse s_attn)
++    __syncthreads();
++    {
++        for (int e = tid; e < GDN_CHUNK * (GDN_CHUNK + 1) / 2; e += 128) {
++            const int i = (int) ((sqrtf(8.0f * e + 1.0f) - 1.0f) * 0.5f);
++            const int j = e - i * (i + 1) / 2;
++            const bool ok = (i < n_real) && (j < n_real);
++            const float Li = expf(s_decay[i] - s_decay[j]);
++            float dot = 0.0f;
++            if (ok) {
++                const float * qi = qb + (int64_t) (t0 + i) * sq2;
++                const float * kj = kb + (int64_t) (t0 + j) * sq2;
++                for (int d = 0; d < 128; ++d) {
++                    dot += qi[d] * kj[d];
++                }
++            }
++            s_attn[i][j] = ok ? (Li * dot) : 0.0f;
++        }
++        for (int e = tid; e < GDN_CHUNK * GDN_CHUNK; e += 128) {
++            const int i = e / GDN_CHUNK;
++            const int j = e % GDN_CHUNK;
++            if (j > i) {
++                s_attn[i][j] = 0.0f;
++            }
++        }
++        __syncthreads();
++        for (int e = tid; e < GDN_CHUNK * GDN_CHUNK; e += 128) {
++            attn_causal[((hsc + chunk) * GDN_CHUNK + e / GDN_CHUNK) * GDN_CHUNK + e % GDN_CHUNK] =
++                s_attn[e / GDN_CHUNK][e % GDN_CHUNK];
++        }
++    }
++
++    // delta[t] = exp(decay_last - decay_t) for the phase-B state update
++    {
++        const int last = n_real - 1;
++        const float d_last = s_decay[max(0, last)];
++        if (tid == 0) {
++            P_last_scratch[hsc + chunk] = expf(d_last);
++        }
++        for (int t = tid; t < GDN_CHUNK; t += 128) {
++            delta_scratch[(hsc + chunk) * GDN_CHUNK + t] = expf(d_last - s_decay[t]);
++        }
++    }
++}
++
++// phase B: per (head, seq, V-slice). Block = 128 threads. V-slices are
++// independent: each keeps its S columns resident across the chunk loop.
++__global__ void gdn_chunk_state(
++        const float * __restrict__ q,
++        const float * __restrict__ k,
++        const float * __restrict__ curr_state,
++        const float * __restrict__ k_cumsum,     // [n_chunks][GDN_CHUNK][V]
++        const float * __restrict__ k_cumdecay,   // [n_chunks][GDN_CHUNK][K]
++        const float * __restrict__ attn_causal,  // [n_chunks][GDN_CHUNK][GDN_CHUNK]
++        const float * __restrict__ decay_scratch,// [n_chunks][GDN_CHUNK]  cumsum(gate)
++        const float * __restrict__ delta_scratch,// [n_chunks][GDN_CHUNK]  exp(decay_last - decay_t)
++        const float * __restrict__ P_last_scratch, // [n_chunks] exp(decay_last)
++        float * __restrict__ dst,
++        float * __restrict__ state_out,
++        const int64_t n_tokens, const int64_t n_seqs, const int64_t H,
++        const int64_t n_chunks, const int64_t V, const int64_t K,
++        const int64_t sq1, const int64_t sq2, const int64_t sq3,
++        const int64_t neqk1, const float scale) {
++    const int n_slices = (int) (V / GDN_CHUNK_VSLICE);
++    const int vslice   = (int) (blockIdx.x % n_slices);
++    const int hs       = (int) (blockIdx.x / n_slices);
++    const int h        = (int) (hs % H);
++    const int seq      = (int) (hs / H);
++    const int iq       = (int) (h % neqk1);
++    const int tid      = threadIdx.x;
++    const int v0       = vslice * GDN_CHUNK_VSLICE;
++    const int64_t hsc = (int64_t) hs * n_chunks; // per (head, seq) scratch base
++
++    __shared__ float s_S[128][GDN_CHUNK_VSLICE];
++    __shared__ float s_vnew[GDN_CHUNK][GDN_CHUNK_VSLICE];
++
++    const float * qb = q + (int64_t) seq * sq3 + (int64_t) iq * sq1;
++    const float * kb = k + (int64_t) seq * sq3 + (int64_t) iq * sq1;
++    const float * sbase = curr_state + ((int64_t) seq * H + h) * (K * V);
++
++    // load this slice of the incoming state: S[k][v], flat k + v*K
++    for (int idx = tid; idx < 128 * GDN_CHUNK_VSLICE; idx += 128) {
++        const int kk = idx / GDN_CHUNK_VSLICE;
++        const int vv = idx % GDN_CHUNK_VSLICE;
++        s_S[kk][vv] = sbase[(v0 + vv) * K + kk];
++    }
++    __syncthreads();
++
++    for (int c = 0; c < n_chunks; ++c) {
++        const int t0     = (int) (c * GDN_CHUNK);
++        const int n_real = min((int) GDN_CHUNK, (int) n_tokens - t0);
++        const int64_t cc = hsc + c;
++        const float * kc = k_cumsum    + cc * GDN_CHUNK * V;
++        const float * kd = k_cumdecay  + cc * GDN_CHUNK * K;
++        const float * ac = attn_causal + cc * GDN_CHUNK * GDN_CHUNK;
++        const float * dc = decay_scratch + cc * GDN_CHUNK;
++        const float * dlt = delta_scratch + cc * GDN_CHUNK;
++        const float P_last = P_last_scratch[cc];
++
++        // v_new[t][v] = k_cumsum[t][v] - sum_k k_cumdecay[t][k] * S[k][v]
++        for (int idx = tid; idx < GDN_CHUNK * GDN_CHUNK_VSLICE; idx += 128) {
++            const int t = idx / GDN_CHUNK_VSLICE;
++            const int v = idx % GDN_CHUNK_VSLICE;
++            float acc = 0.0f;
++            for (int kk = 0; kk < 128; ++kk) {
++                acc += kd[t * 128 + kk] * s_S[kk][v];
++            }
++            s_vnew[t][v] = kc[t * V + (v0 + v)] - acc;
++        }
++        __syncthreads();
++
++        // o[t][v] = P[t] * (q_t @ S) + sum_j attn_causal[t][j] * v_new[j][v]
++        for (int idx = tid; idx < GDN_CHUNK * GDN_CHUNK_VSLICE; idx += 128) {
++            const int t = idx / GDN_CHUNK_VSLICE;
++            const int v = idx % GDN_CHUNK_VSLICE;
++            if (t < n_real) {
++                const float * qt = qb + (int64_t) (t0 + t) * sq2;
++                float acc = 0.0f;
++                for (int kk = 0; kk < 128; ++kk) {
++                    acc += qt[kk] * s_S[kk][v];
++                }
++                float o = expf(dc[t]) * acc;
++                const float * act = ac + t * GDN_CHUNK;
++                float acc2 = 0.0f;
++                for (int j = 0; j < GDN_CHUNK; ++j) {
++                    acc2 += act[j] * s_vnew[j][v];
++                }
++                o += acc2;
++                dst[((int64_t) (seq * n_tokens + t0 + t) * H + h) * V + (v0 + v)] = scale * o;
++            }
++        }
++        __syncthreads();
++
++        // S[k][v] = P_last * S[k][v] + sum_t (k[t][k] * delta[t]) * v_new[t][v]
++        for (int idx = tid; idx < 128 * GDN_CHUNK_VSLICE; idx += 128) {
++            const int kk = idx / GDN_CHUNK_VSLICE;
++            const int v  = idx % GDN_CHUNK_VSLICE;
++            float acc = 0.0f;
++            const float * kt = kb + (int64_t) t0 * sq2 + kk;
++            for (int t = 0; t < n_real; ++t) {
++                acc += kt[(int64_t) t * sq2] * dlt[t] * s_vnew[t][v];
++            }
++            s_S[kk][v] = s_S[kk][v] * P_last + acc;
++        }
++        __syncthreads();
++    }
++
++    // write the final state slice
++    float * sbase_out = state_out + ((int64_t) seq * H + h) * (K * V);
++    for (int idx = tid; idx < 128 * GDN_CHUNK_VSLICE; idx += 128) {
++        const int kk = idx / GDN_CHUNK_VSLICE;
++        const int vv = idx % GDN_CHUNK_VSLICE;
++        sbase_out[(v0 + vv) * K + kk] = s_S[kk][vv];
++    }
++}
++
+ template <int S_v, bool KDA, bool keep_rs_t>
+ __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+ gated_delta_net_cuda(const float * q,
+@@ -171,12 +484,62 @@ static void launch_gated_delta_net(
+         const float * q_d, const float * k_d, const float * v_d,
+         const float * g_d, const float * b_d, const float * s_d,
+         float * dst_d, float * state_d,
++        ggml_cuda_pool & pool,
+         int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
+         int64_t sq1,   int64_t sq2, int64_t sq3,
+         int64_t sv1,   int64_t sv2, int64_t sv3,
+         int64_t sb1,   int64_t sb2, int64_t sb3,
+         int64_t neqk1, int64_t rq3,
+         float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
++    // chunked path: prefill only, scalar gates, K=1, K=V=128. For K=1 the state
++    // write layout is the same whether the gdn->cpy fusion fired (slot_stride 0)
++    // or not (slot_stride = S_v*S_v*H*n_seqs).
++    // Correct and test-validated but currently slower than the sequential kernel
++    // (naive phase-A matmuls); opt-in until the matmuls are tiled.
++    static const bool gdn_chunked_enabled = []() {
++        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
++        return env != nullptr && std::atoi(env) != 0;
++    }();
++    if (gdn_chunked_enabled && !KDA && !keep_rs_t && S_v == 128 && n_tokens > 1 &&
++        (state_slot_stride == 0 || state_slot_stride == S_v * S_v * H * n_seqs)) {
++        const int64_t V = S_v;
++        const int64_t KK = S_v;
++        const int64_t n_chunks = (n_tokens + GDN_CHUNK - 1) / GDN_CHUNK;
++        const int64_t n_slices = V / GDN_CHUNK_VSLICE;
++        const int64_t per_hs = n_chunks * (GDN_CHUNK * (V + KK + GDN_CHUNK) + 2 * GDN_CHUNK) + n_chunks;
++        const int64_t scratch_elems = H * n_seqs * per_hs;
++
++        ggml_cuda_pool_alloc<float> scratch(pool, scratch_elems);
++        float * k_cumsum    = scratch.get();
++        float * k_cumdecay  = k_cumsum    + H * n_seqs * n_chunks * GDN_CHUNK * V;
++        float * attn_causal = k_cumdecay  + H * n_seqs * n_chunks * GDN_CHUNK * KK;
++        float * decay_scratch = attn_causal + H * n_seqs * n_chunks * GDN_CHUNK * GDN_CHUNK;
++        float * delta_scratch = decay_scratch + H * n_seqs * n_chunks * GDN_CHUNK;
++        float * P_last_scratch = delta_scratch + H * n_seqs * n_chunks * GDN_CHUNK;
++        {
++            const dim3 grid_a(H * n_seqs, n_chunks, 1);
++            const dim3 block_a(128, 1, 1);
++            const ggml_cuda_kernel_launch_params lp_a(grid_a, block_a, 0, stream);
++            ggml_cuda_kernel_launch(gdn_chunk_prepare, lp_a,
++                q_d, k_d, v_d, g_d, b_d,
++                k_cumsum, k_cumdecay, attn_causal, decay_scratch, delta_scratch, P_last_scratch,
++                n_tokens, n_seqs, H, n_chunks,
++                sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1);
++        }
++        {
++            const dim3 grid_b(H * n_seqs * n_slices, 1, 1);
++            const dim3 block_b(128, 1, 1);
++            const ggml_cuda_kernel_launch_params lp_b(grid_b, block_b, 0, stream);
++            ggml_cuda_kernel_launch(gdn_chunk_state, lp_b,
++                q_d, k_d, s_d,
++                k_cumsum, k_cumdecay, attn_causal, decay_scratch, delta_scratch, P_last_scratch,
++                dst_d, state_d,
++                n_tokens, n_seqs, H, n_chunks, V, KK,
++                sq1, sq2, sq3, neqk1, scale);
++        }
++        return;
++    }
++
+     //TODO: Add chunked kernel for even faster pre-fill
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+     const int num_warps = 4;
+@@ -296,21 +659,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
+ 
+     if (kda) {
+         if (keep_rs) {
+-            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, ctx.pool(),
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         } else {
+-            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, ctx.pool(),
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         }
+     } else {
+         if (keep_rs) {
+-            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, ctx.pool(),
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         } else {
+-            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, ctx.pool(),
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f40be5b5e..99eb62174 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9674,6 +9674,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 1, 128, 2, 1));    // chunked 2 tokens (tail)
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 2, 1));   // chunked 2 tokens 32 heads
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1));    // chunked 4 heads full chunk
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 1, 128, 3, 1));    // chunked 3 tokens (tail)
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 1, 128, 64, 1));   // chunked full chunk
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1));   // chunked prefill PP-64
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 127, 1));  // chunked prefill PP-127 (tail)
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1));  // chunked prefill PP-256
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));   // chunked prefill PP-512 4 heads
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
+     // KDA (vector gate)
+-- 
+2.55.0
+

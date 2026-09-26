@@ -1,0 +1,337 @@
+From 56e7cb0c952f3bd32020d21cda3a30904a03a212 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Thu, 6 Aug 2026 11:54:59 -0500
+Subject: [PATCH 11/23] gated_delta_net : rewrite chunked phase B, 33.8ms ->
+ 12.8ms
+
+The old phase B (128 threads, 16 V-slices of 8) was latency-bound: serial
+128-iteration reductions, shared inputs re-read per slice, and stride-8KB
+global k loads in the state update. Rewrite with 256 threads and V-slices
+of 32, one state column per thread so the 32 columns of a warp share every
+kd/q/k/ac load as a warp broadcast (no L2 amplification):
+
+- steps 1+2a merged: v_new = kcsum - kd @ S, o_q = q @ S, 8 token rows/thread
+- step 3: S = P_last*S + (k .* delta)^T @ v_new, 16 state rows/thread with
+  contiguous float2 k reads (k[t][k] is k-major; no transpose needed)
+- s_S (16 KB) + s_vnew (8 KB) smem, 2 CTAs/CU, 1 wave (was 2)
+- register-tiled 16x16 grid with smem staging was tried first: 192 VGPRs +
+  spills (274 scratch instructions vs 308 FMAs in the ISA), 675us/launch;
+  thread-per-column keeps live registers ~40 and hits 267us/launch
+
+pp512 5436 -> 6068-6072 (sequential 5878); PPL 6.2426 (sequential 6.2572);
+47/47 GATED_DELTA_NET tests. Docs: PERF_HANDOVER.md section 12.
+
+Assisted-by: pi
+---
+ GDN_DEBUG_HANDOVER.md                 |  16 ++-
+ PERF_HANDOVER.md                      |  43 +++++++
+ ggml/src/ggml-cuda/gated_delta_net.cu | 158 +++++++++++++++++---------
+ 3 files changed, 160 insertions(+), 57 deletions(-)
+
+diff --git a/GDN_DEBUG_HANDOVER.md b/GDN_DEBUG_HANDOVER.md
+index 8fa2e8f54..5679061e5 100644
+--- a/GDN_DEBUG_HANDOVER.md
++++ b/GDN_DEBUG_HANDOVER.md
+@@ -197,12 +197,16 @@ the file after the bisect), chunked default-ON, closure fix, dump/dbg instrument
+ (phase A tiling + closure fix + default-on are the intended direction; phase B rewrites need re-validation;
+ dump/dbg must be removed).
+ 
+-## 11. Performance context (if correctness gets fixed)
+-
+-- Phase A tiling took gdn_chunk_prepare from 76ms -> 12ms per 48 launches (2 passes of 24 layers).
+-- 4-slice phase B: 16.4ms -> 15.5ms (barely moved; L2-latency-bound on scratch streams).
+-- Chunked pp512 = 6059 (4-slice era) vs sequential 5925. Once correct, the chunked should be re-benched.
+-- Decode (tg64 ~89-90) is untouched by all this (sequential path for n_tokens=1).
++## 11. Performance context (RESOLVED 2026-08-06: chunked now beats sequential)
++
++- Phase A tiling took gdn_chunk_prepare from 76ms -> 12-14ms per 48 launches.
++- Phase B was rewritten (128 threads/16 slices -> 256 threads/4 slices, thread-per-column
++  with warp-broadcast loads, see PERF_HANDOVER.md section 12): 33.8ms -> 12.8ms.
++- Chunked pp512 = 6068-6072 vs sequential 5878 (chunked WINS). PPL 6.2426, 47/47 tests.
++- The lost 4-slice phase B (15.5ms) is superseded: the new kernel (12.8ms) is simpler
++  and validated. The dump infrastructure for re-validation lives in /tmp/validate_gdn_dump.py.
++- Decode (tg64 ~89-90) is untouched (sequential path for n_tokens=1).
++- Next perf target: phase A (14.2ms, closure-barrier-bound at 1 CTA/CU).
+ 
+ ## 12. Files
+ 
+diff --git a/PERF_HANDOVER.md b/PERF_HANDOVER.md
+index 7017b33af..b3f268cf7 100644
+--- a/PERF_HANDOVER.md
++++ b/PERF_HANDOVER.md
+@@ -238,3 +238,46 @@ k_cumsum/k_cumdecay/attn_causal) with untiled matmuls reading global memory and
+ 126 barriers in the closure. Next session: tile the matmuls with smem staging
+ (phase A smem budget: s_attn 16.6 KB + s_k 32 KB fits one CTA/CU), reduce the
+ closure barrier count, then re-enable by default.
++
++## 12. Delta-net chunked: correctness fixed + phase B rewrite (2026-08-06)
++
++The chunked GDN is now BOTH correct and faster than the sequential kernel.
++Committed ef41a940a fixed the phase A closure (block forward substitution,
++see GDN_DEBUG_HANDOVER.md). This session rewrote phase B.
++
++Phase B before: gdn_chunk_state, 128 threads, V-slices of 8 (16 slices),
++scalar serial reductions, stride-8KB global k loads in the S update.
++33.82 ms per pp512 bench (48 launches x 704us, grid 32x16=512 CTAs).
++
++Phase B now: 256 threads, V-slices of 32 (4 slices), one state column per
++thread (32 cols per warp -> kd/q/k/ac loads are warp broadcasts, no L2
++amplification), 8 token rows per thread (steps 1/2) or 16 state rows
++(step 3). s_S (16 KB) + s_vnew (8 KB) smem -> 2 CTAs/CU, 1 wave (grid 128).
++12.82 ms per pp512 bench (48 x 267us). VGPR 160, scratch 0, LDS 24.6 KB.
++
++Scoreboard (pp512, stewfp8-ow, -p 512 -n 64 -r 5):
++- chunked before this session: 5436 (broken-ish phase B)
++- chunked now:               6068-6072  (sequential was 5878)
++- tg64 unchanged:            89.8
++PPL 6.2426 (sequential 6.2572), 47/47 GATED_DELTA_NET tests.
++
++Failed experiments this session (do not retry without a reason):
++- 16x16 thread grid with 4x2 register tiles + smem-staged kd/q/ac/k blocks:
++  192 VGPRs + 764-1028 B scratch spills -> 274 scratch instructions vs 308
++  FMAs in the ISA; 675-704us/launch. The register-tiled layout spreads the
++  V dimension across threads, which both amplifies shared-input L2 reads 16x
++  and blows the register budget.
++- 16x16 grid, no staging (direct L2 float4): 591-644us/launch (L2-bound).
++- __launch_bounds__(256,2) forcing 128 VGPRs: worse (more spills, 644us).
++Lesson: for this kernel shape (64x128x32 matmuls, S resident), thread-per-
++column with 32 cols/warp is the right layout - it makes every shared-input
++load a warp broadcast and keeps live registers near 40.
++
++Remaining perf (next session, in order):
++1. phase A (gdn_chunk_prepare) is now the bigger kernel: 14.2 ms vs phase B
++   12.8 ms. It runs 295us/launch at 1 CTA/CU (50 KB LDS), ~8x its FMA floor;
++   the closure's ~200 barriers and the serial M1/M2/M3 stages are the cost.
++2. phase B is still ~10x its FMA floor (267us for 4 chunks vs ~7us/chunk
++   theoretical); chunk-loop latency, not L2 bandwidth (61 MB/launch).
++   Candidates: prefetch next-chunk kd/q/ac/k during current-chunk compute
++   (needs smem or reg staging), 8 slices of 16 for more CTAs.
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 4a1ea89a1..a1a820802 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -16,7 +16,7 @@
+ //     k_cumdecay = attn @ (beta*k*P)
+ //     attn_causal = L .* (q^T k)
+ //
+-//   phase B (gdn_chunk_state, one CTA per head x seq x V-slice):
++//   phase B (gdn_chunk_state, one CTA per head x seq x V-slice of 32):
+ //     v_prime = k_cumdecay @ S
+ //     v_new   = k_cumsum - v_prime
+ //     o       = P .* (q @ S) + attn_causal @ v_new
+@@ -28,7 +28,7 @@
+ // the sequential kernel.
+ 
+ #define GDN_CHUNK 64
+-#define GDN_CHUNK_VSLICE 8
++#define GDN_CHUNK_VSLICE 32
+ 
+ // phase A: per (head, seq, chunk). Block = 256 threads.
+ __global__ void gdn_chunk_prepare(
+@@ -326,9 +326,14 @@ __global__ void gdn_chunk_prepare(
+     }
+ }
+ 
+-// phase B: per (head, seq, V-slice). Block = 128 threads. V-slices are
+-// independent: each keeps its S columns resident across the chunk loop.
+-__global__ void gdn_chunk_state(
++// phase B: per (head, seq, V-slice of 32). Block = 256 threads, one state
++// column per thread (32 cols per warp) so kd/q/k/ac loads are warp broadcasts:
++//   v_new = k_cumsum - k_cumdecay @ S
++//   o     = P .* (q @ S) + attn_causal @ v_new
++//   S     = P_last * S + (k .* delta)^T @ v_new
++// S stays resident in smem across the chunk chain. Thread (row8, v) owns 8
++// token rows (steps 1/2) or 16 state rows (step 3) of column v.
++__global__ void __launch_bounds__(256, 2) gdn_chunk_state(
+         const float * __restrict__ q,
+         const float * __restrict__ k,
+         const float * __restrict__ curr_state,
+@@ -352,7 +357,10 @@ __global__ void gdn_chunk_state(
+     const int iq       = (int) (h % neqk1);
+     const int tid      = threadIdx.x;
+     const int v0       = vslice * GDN_CHUNK_VSLICE;
+-    const int64_t hsc = (int64_t) hs * n_chunks; // per (head, seq) scratch base
++    const int64_t hsc  = (int64_t) hs * n_chunks;
++
++    const int row8 = tid / GDN_CHUNK_VSLICE; // 8-row block, 0..7
++    const int v    = tid % GDN_CHUNK_VSLICE; // state column within the slice
+ 
+     __shared__ float s_S[128][GDN_CHUNK_VSLICE];
+     __shared__ float s_vnew[GDN_CHUNK][GDN_CHUNK_VSLICE];
+@@ -361,11 +369,15 @@ __global__ void gdn_chunk_state(
+     const float * kb = k + (int64_t) seq * sq3 + (int64_t) iq * sq1;
+     const float * sbase = curr_state + ((int64_t) seq * H + h) * (K * V);
+ 
+-    // load this slice of the incoming state: S[k][v], flat k + v*K
+-    for (int idx = tid; idx < 128 * GDN_CHUNK_VSLICE; idx += 128) {
+-        const int kk = idx / GDN_CHUNK_VSLICE;
+-        const int vv = idx % GDN_CHUNK_VSLICE;
+-        s_S[kk][vv] = sbase[(v0 + vv) * K + kk];
++    // load this slice of the incoming state: S[k][v], stored flat v*K + k
++    for (int e = tid; e < 128 * GDN_CHUNK_VSLICE / 4; e += 256) {
++        const int vv  = e % GDN_CHUNK_VSLICE;
++        const int kk4 = 4 * (e / GDN_CHUNK_VSLICE);
++        const float4 sv = *reinterpret_cast<const float4 *>(sbase + (v0 + vv) * K + kk4);
++        s_S[kk4 + 0][vv] = sv.x;
++        s_S[kk4 + 1][vv] = sv.y;
++        s_S[kk4 + 2][vv] = sv.z;
++        s_S[kk4 + 3][vv] = sv.w;
+     }
+     __syncthreads();
+ 
+@@ -380,60 +392,104 @@ __global__ void gdn_chunk_state(
+         const float * dlt = delta_scratch + cc * GDN_CHUNK;
+         const float P_last = P_last_scratch[cc];
+ 
+-        // v_new[t][v] = k_cumsum[t][v] - sum_k k_cumdecay[t][k] * S[k][v]
+-        for (int idx = tid; idx < GDN_CHUNK * GDN_CHUNK_VSLICE; idx += 128) {
+-            const int t = idx / GDN_CHUNK_VSLICE;
+-            const int v = idx % GDN_CHUNK_VSLICE;
+-            float acc = 0.0f;
+-            for (int kk = 0; kk < 128; ++kk) {
+-                acc += kd[t * 128 + kk] * s_S[kk][v];
++        // v_new = k_cumsum - k_cumdecay @ S ; o_q = q @ S. Merged K loop: the
++        // s_S column is shared by the thread's 8 token rows.
++        float acc_v[8], acc_q[8];
++#pragma unroll
++        for (int r = 0; r < 8; ++r) {
++            acc_v[r] = 0.0f;
++            acc_q[r] = 0.0f;
++        }
++        for (int kq = 0; kq < 128; kq += 4) {
++            float sS[4];
++#pragma unroll
++            for (int k2 = 0; k2 < 4; ++k2) {
++                sS[k2] = s_S[kq + k2][v];
+             }
+-            s_vnew[t][v] = kc[t * V + (v0 + v)] - acc;
++#pragma unroll
++            for (int r = 0; r < 8; ++r) {
++                const float4 kdv = *reinterpret_cast<const float4 *>(kd + (8 * row8 + r) * K + kq);
++                float4 qv;
++                if (8 * row8 + r < n_real) {
++                    qv = *reinterpret_cast<const float4 *>(qb + (int64_t) (t0 + 8 * row8 + r) * sq2 + kq);
++                } else {
++                    qv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++                }
++                acc_v[r] += kdv.x * sS[0] + kdv.y * sS[1] + kdv.z * sS[2] + kdv.w * sS[3];
++                acc_q[r] += qv.x  * sS[0] + qv.y  * sS[1] + qv.z  * sS[2] + qv.w  * sS[3];
++            }
++        }
++
++        // v_new[t][v] = k_cumsum[t][v] - (k_cumdecay @ S)[t][v]
++#pragma unroll
++        for (int r = 0; r < 8; ++r) {
++            s_vnew[8 * row8 + r][v] = kc[(8 * row8 + r) * V + v0 + v] - acc_v[r];
+         }
+         __syncthreads();
+ 
+-        // o[t][v] = P[t] * (q_t @ S) + sum_j attn_causal[t][j] * v_new[j][v]
+-        for (int idx = tid; idx < GDN_CHUNK * GDN_CHUNK_VSLICE; idx += 128) {
+-            const int t = idx / GDN_CHUNK_VSLICE;
+-            const int v = idx % GDN_CHUNK_VSLICE;
++        // o = P .* (q @ S) + attn_causal @ v_new
++        float acc_o[8];
++#pragma unroll
++        for (int r = 0; r < 8; ++r) {
++            acc_o[r] = expf(dc[8 * row8 + r]) * acc_q[r];
++        }
++        for (int jq = 0; jq < GDN_CHUNK; jq += 4) {
++            float vn[4];
++#pragma unroll
++            for (int k2 = 0; k2 < 4; ++k2) {
++                vn[k2] = s_vnew[jq + k2][v];
++            }
++#pragma unroll
++            for (int r = 0; r < 8; ++r) {
++                const float4 av = *reinterpret_cast<const float4 *>(ac + (8 * row8 + r) * GDN_CHUNK + jq);
++                acc_o[r] += av.x * vn[0] + av.y * vn[1] + av.z * vn[2] + av.w * vn[3];
++            }
++        }
++
++        // write o to dst
++#pragma unroll
++        for (int r = 0; r < 8; ++r) {
++            const int t = 8 * row8 + r;
+             if (t < n_real) {
+-                const float * qt = qb + (int64_t) (t0 + t) * sq2;
+-                float acc = 0.0f;
+-                for (int kk = 0; kk < 128; ++kk) {
+-                    acc += qt[kk] * s_S[kk][v];
+-                }
+-                float o = expf(dc[t]) * acc;
+-                const float * act = ac + t * GDN_CHUNK;
+-                float acc2 = 0.0f;
+-                for (int j = 0; j < GDN_CHUNK; ++j) {
+-                    acc2 += act[j] * s_vnew[j][v];
+-                }
+-                o += acc2;
+-                dst[((int64_t) (seq * n_tokens + t0 + t) * H + h) * V + (v0 + v)] = scale * o;
++                dst[((int64_t) (seq * n_tokens + t0 + t) * H + h) * V + v0 + v] = scale * acc_o[r];
+             }
+         }
+-        __syncthreads();
+ 
+-        // S[k][v] = P_last * S[k][v] + sum_t (k[t][k] * delta[t]) * v_new[t][v]
+-        for (int idx = tid; idx < 128 * GDN_CHUNK_VSLICE; idx += 128) {
+-            const int kk = idx / GDN_CHUNK_VSLICE;
+-            const int v  = idx % GDN_CHUNK_VSLICE;
+-            float acc = 0.0f;
+-            const float * kt = kb + (int64_t) t0 * sq2 + kk;
+-            for (int t = 0; t < n_real; ++t) {
+-                acc += kt[(int64_t) t * sq2] * dlt[t] * s_vnew[t][v];
++        // S = P_last * S + (k .* delta)^T @ v_new. k[t][k] is contiguous in k
++        // (float2 per 2 rows), v_new[t][v] shared by the thread's 16 k rows.
++        float acc_S[16];
++#pragma unroll
++        for (int r = 0; r < 16; ++r) {
++            acc_S[r] = 0.0f;
++        }
++        for (int t = 0; t < GDN_CHUNK; ++t) {
++            if (t < n_real) {
++                const float d = dlt[t];
++                const float vn = s_vnew[t][v];
++#pragma unroll
++                for (int r = 0; r < 8; ++r) {
++                    const float2 kv = *reinterpret_cast<const float2 *>(kb + (int64_t) (t0 + t) * sq2 + 16 * row8 + 2 * r);
++                    acc_S[2 * r + 0] += d * kv.x * vn;
++                    acc_S[2 * r + 1] += d * kv.y * vn;
++                }
+             }
+-            s_S[kk][v] = s_S[kk][v] * P_last + acc;
++        }
++
++        // in-place S update; the barrier below publishes it to the next chunk
++#pragma unroll
++        for (int r = 0; r < 16; ++r) {
++            s_S[16 * row8 + r][v] = P_last * s_S[16 * row8 + r][v] + acc_S[r];
+         }
+         __syncthreads();
+     }
+ 
+     // write the final state slice
+     float * sbase_out = state_out + ((int64_t) seq * H + h) * (K * V);
+-    for (int idx = tid; idx < 128 * GDN_CHUNK_VSLICE; idx += 128) {
+-        const int kk = idx / GDN_CHUNK_VSLICE;
+-        const int vv = idx % GDN_CHUNK_VSLICE;
+-        sbase_out[(v0 + vv) * K + kk] = s_S[kk][vv];
++    for (int e = tid; e < 128 * GDN_CHUNK_VSLICE / 4; e += 256) {
++        const int vv  = e % GDN_CHUNK_VSLICE;
++        const int kk4 = 4 * (e / GDN_CHUNK_VSLICE);
++        const float4 sv = make_float4(s_S[kk4 + 0][vv], s_S[kk4 + 1][vv], s_S[kk4 + 2][vv], s_S[kk4 + 3][vv]);
++        *reinterpret_cast<float4 *>(sbase_out + (v0 + vv) * K + kk4) = sv;
+     }
+ }
+ 
+@@ -650,7 +706,7 @@ static void launch_gated_delta_net(
+         }
+         {
+             const dim3 grid_b(H * n_seqs * n_slices, 1, 1);
+-            const dim3 block_b(128, 1, 1);
++            const dim3 block_b(256, 1, 1);
+             const ggml_cuda_kernel_launch_params lp_b(grid_b, block_b, 0, stream);
+             ggml_cuda_kernel_launch(gdn_chunk_state, lp_b,
+                 q_d, k_d, s_d,
+-- 
+2.55.0
+

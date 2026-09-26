@@ -20,6 +20,7 @@ cllm kernel's 77-98) to close the rest.
 | `FP8-PRIOR-ART.md` | the inventory of `origin/cllm` + AITER — the actual path forward |
 | `HANDOVER.md` | cold-start brief + next-session prompt |
 | `tools/` | the rocprofv3 fold + repro scripts |
+| **`../fp8-support/`** | **the execution campaign** — the FP8 E4M3 port vendored ready to re-base (this tree diagnoses, that one revives) |
 
 ---
 

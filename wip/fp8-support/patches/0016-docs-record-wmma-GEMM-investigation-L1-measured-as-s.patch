@@ -1,0 +1,203 @@
+From 290e3f610ae42545abf4b84709f68a4e01d00717 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Thu, 6 Aug 2026 14:01:50 -0500
+Subject: [PATCH 16/23] docs : record wmma GEMM investigation, L1 measured as
+ spent
+
+Stage-elimination on mul_mat_fp8_wmma: fragment LDS chain ~free, scale pass
+~13% (FMA-bound, irreducible), staging/barriers ~85%. aiter kpack/2-stage do
+not port (lane-half fragment split, smem doubling). Found a new LLVM
+miscompile: a 2-k-step fragment lookahead with register rotation folds the
+copies and reuses step-0 operands (PPL 183142; caught only after fixing the
+check - random fp8 data false-passes because NaN payloads make every element
+comparison NaN). Documented the check template (/tmp/check_wmma.cu) and the
+do-not-retry rule. Tree unchanged perf-wise.
+
+Assisted-by: Claude Sonnet
+---
+ LEVERS.md        | 89 +++++++++++++++++++++++++++++++++++-------------
+ PERF_HANDOVER.md | 60 ++++++++++++++++++++++++++++++++
+ 2 files changed, 126 insertions(+), 23 deletions(-)
+
+diff --git a/LEVERS.md b/LEVERS.md
+index ad4da0019..73b60b56a 100644
+--- a/LEVERS.md
++++ b/LEVERS.md
+@@ -68,22 +68,47 @@ ac+k loads ~62 us, FMA/sync floor ~206 us).
+ 
+ ## 2. Ranked levers
+ 
+-### L1. mul_mat_fp8_wmma: 2 CTAs/CU via 24 KB smem tiles (biggest pp512 lever)
+-
+-- Kernel: mul_mat_fp8_wmma, ~41 ms/pp512 (~48%), ~77 TFLOP/s.
+-- Why slow: CTA tile 128x64 with 8 warps (4m x 2n, 2x2 register tiles),
+-  single-buffered smem 26.4 KB, register-staged k-block pipelining,
+-  grouped-M swizzle. 8 warps/CU = 58 TFLOP/s, 16 warps/CU = 77. The aiter
+-  triton kernel hits 121 TFLOP/s on gfx1201 via a 24 KB smem tile running
+-  2 CTAs/CU (16 warps) - NOT via double-buffering (61 KB = 1 CTA/CU = 55).
+-- Approach: shrink the smem tile so 2 CTAs fit (16 warps/CU) while keeping
+-  the fragment-reuse ratio (1.0 LDS/wmma). 64x64 tile with 8 warps forces
+-  2 accs/warp (regression risk, see section 4). 128x64 with 16 warps and
+-  2x1 tiles per warp also regressed (fragment reuse 1.5 LDS/wmma).
+-  Re-measure the fragment-reuse cost before committing to a shape.
+-- Expected: +8-11% pp512 if 2 CTAs/CU is reached without fragment-reuse loss.
+-- Validation: llama-bench pp512, tg64 must stay ~90, generation parity
+-  check (llama-cli --single-turn, see section 3), PPL gate.
++### L1. mul_mat_fp8_wmma - measured 2026-08-06 evening, mostly spent; revisit only with a new idea
++
++- Kernel: mul_mat_fp8_wmma, ~40.6 ms/pp512 (~48%), ~77 TFLOP/s effective (92-98 on the big shapes in a hot-loop rig).
++- The 2-CTA/CU premise is DONE (single-buffered 26.4 KB, register-staged). The
++  residual gap to the aiter triton kernel (121-137 TFLOP/s at the SAME 2
++  CTAs/CU) was investigated with a standalone rig (/tmp/bench_wmma.cu, hot
++  loop, min of 3) + stage-elimination stubs:
++  * fragment LDS chain: ~4 us/launch of the gate GEMM (250 us) - nearly free,
++    the 2addr loads + 2-CTA occupancy hide it.
++  * scale pass (16 wd + 2 ad LDS + 32 FMA per warp per k-block, serialized
++    between the wmma chain and the barrier): ~33 us (13%). Restructuring the
++    per-row scales into a contiguous smem array (2 float4 broadcast loads
++    instead of 16 scattered reads) did NOT recover it - the cost is the 32
++    FMAs + the serial position, not the LDS. The FMA count is irreducible
++    (32 acc elements/thread/k-block) and the wd (weight block scale) varies
++    per k-block, so the multiply cannot be deferred to the epilogue.
++  * staging loads + barriers + wmma issue: the ~85% floor. The 4-B weight
++    staging loads coalesce fine; a 2-k-block staging lookahead (double-buffered
++    registers, +26 VGPR) REGRESSED ~4% (scheduling).
++  * L2: ~280 MB/launch of weight+activation traffic (8x weight re-reads) is
++    NOT the limiter (measured 1.1-1.6 TB/s of a 3 TB/s budget).
++- aiter's kpack=2 does not port cleanly: it needs the wmma operand smem layout
++  rearranged (the 16-k fragment is split across lane halves, so a single wider
++  LDS load cannot cover 2 k-steps without a swizzled store side) and the
++  triton num_stages=2 doubles the smem (48 KB = 1 CTA/CU, the measured 58
++  TFLOP/s config).
++- COMPILER MISCOMPILE (new, do not retry): a 2-k-step fragment lookahead with
++  a rotate (named fp8x8_t variables, a0_1/a0_2 rotation) MISCOMPILES under the
++  single-buffer loop - LLVM folds the rotation copies, reusing the step-0
++  operand registers for step 1 (SASS shows 8 v_wmma with identical operands;
++  PPL 183142). This is the same class as the burst-array bug in section 4.
++  The 1-k-step lookahead (a0_n) is the deepest pipeline that compiles right.
++- Expected: nothing cheap left. The aiter numbers came from triton codegen we
++  cannot reproduce by hand on this compiler. L1 is spent unless a new
++  structural idea appears (e.g. a swizzled kpacked smem layout for A).
++- Measurement rig: /tmp/bench_wmma.cu (kernel-only hot loop) + /tmp/check_wmma.cu
++  (CPU-reference correctness). CHECK LESSON: random fp8 payload bytes contain
++  NaN encodings (0x7F/0xFF) that make fabs(ref-out) NaN on EVERY element -
++  the check false-passes (maxerr stays 0, bad stays 0). The check must use
++  realistically-quantized data (host-side fp8 encoder); with proper data the
++  miscompiled kernel scores maxerr 34 / 7991-of-8192 wrong.
+ - Depends on: nothing. Independent of L2.
+ 
+ ### L2. wmma weight repack at load time (second GEMM lever)
+@@ -237,6 +262,19 @@ GGML_CUDA_GDN_CHUNKED=0 <same bench>   # sequential GDN for comparison
+ - wmma experiments that failed: 16 warps/CTA with 2x1 tiles (fragment reuse
+   1.5 LDS/wmma, 4936 t/s), double-buffered smem 61 KB (1 CTA/CU, 5110 t/s),
+   burst fragment arrays (LLVM miscompile). GROUP_SIZE_M=8 was noise.
++- LLVM wmma fragment-pipeline miscompiles (do NOT retry either shape): (1) the
++  burst array fp8x8_t fa[4][4] (16/32 v_wmma get v[0:1] operands); (2) a
++  2-k-step lookahead with a named-variable rotate (a0_1/a0_2) - the allocator
++  folds the rotation copies and step 1 reuses step 0's operand registers
++  (verified in SASS; PPL 183142; the check catches it ONLY with
++  realistically-quantized data, see below). The 1-k-step lookahead (a0_n)
++  compiles correctly. Rule: never let a fragment value be rotated/reused
++  across k-steps via register copies in the single-buffer loop.
++- fp8 correctness checks false-pass with random payload bytes: the fp8 byte
++  space contains NaN encodings (0x7F/0xFF) and random f32 scales are mostly
++  NaN/inf, so fabs(ref - out) is NaN on every element, maxerr/bad stay 0.
++  Any fp8 kernel check must feed realistically-quantized values (host-side
++  encoder, sane scales). /tmp/check_wmma.cu has the working template.
+ - The chunked GDN closure bug history is in GDN_DEBUG_HANDOVER.md; the
+   current closure (4x4-blocked forward substitution, 2026-08-06) is verified
+   exact (numpy diff ~1e-15, /tmp/validate_closure_4x4.py). Do NOT simplify
+@@ -257,10 +295,15 @@ GGML_CUDA_GDN_CHUNKED=0 <same bench>   # sequential GDN for comparison
+ 
+ 1. Re-bench to confirm the working tree matches section 0 (expect ~6100-6200
+    pp512, the box is noisy - prefer rocprof kernel times for A/B).
+-2. L1 (wmma 2 CTAs/CU) is now the only big untapped lever: the GDN levers are
+-   mostly spent (phase A -24%, phase B -8.5% this session) and the remaining
+-   GDN ideas (phase A 2 CTAs/CU via fp16 s_k, phase B pipelining) are
+-   documented as risky/measured-failed above. L1's fragment-reuse cost needs
+-   re-measuring before committing to a shape.
+-3. L2 (repack) after L1's staging share is re-measured.
+-4. L5 (concat) if a fresh profile still shows it hot; L6/L7 only after L1/L2.
++2. L1 (wmma GEMM) is now measured as spent (2026-08-06 evening session): the
++   2-CTA/CU premise was already done, the residual 92-98 vs aiter 121-137
++   TFLOP/s gap is triton codegen that does not port (kpack layout, 2-stage
++   smem = 1 CTA/CU), and the kernel's own structure is near its floor
++   (scale pass 13%, staging/barriers 85%, fragments free). Do NOT re-attempt
++   the kpack/2-deep-pipeline shapes without a new idea.
++3. L2 (repack at load time) is the only GEMM lever left with a real,
++   unmeasured headroom: it fixes the 4-B weight staging AND would allow the
++   kpacked smem layout for A. Re-measure the staging share first (remove the
++   staging loop in /tmp/bench_wmma.cu).
++4. L5 (concat) if a fresh profile still shows it hot; L6/L7 only after L2.
++   The GDN levers (phase A/B) are spent (see L3/L4).
+diff --git a/PERF_HANDOVER.md b/PERF_HANDOVER.md
+index 519047577..6d1f42dbd 100644
+--- a/PERF_HANDOVER.md
++++ b/PERF_HANDOVER.md
+@@ -317,3 +317,63 @@ regressed (349 us). No cheap remaining lever; revisit with a fresh profile.
+ Also learned: the box got noisy late 2026-08-06 (pp512 +/-60-170, one run
+ +/-1000). rocprof kernel times are the reliable A/B signal. fp8 gemv traffic
+ in the trace stays at ~40 us avg regardless (not affected by these changes).
++
++## 14. wmma GEMM investigation (2026-08-06 evening) - L1 measured as spent
++
++Goal: LEVERS.md L1 (mul_mat_fp8_wmma 2 CTAs/CU, the last big pp512 lever).
++Outcome: the lever's premise was already satisfied (2 CTAs/CU since 823f70a3);
++the residual gap to the aiter triton kernel (121-137 vs our 92-98 TFLOP/s at
++the same occupancy) was investigated and measured as NOT reachable by the
++obvious ports. No perf change committed - the tree is unchanged.
++
++Method: standalone rig /tmp/bench_wmma.cu (kernel-only hot loop on the exact
++model shapes, min of 3, +/-1%) + /tmp/check_wmma.cu (CPU-reference
++correctness). Stage-elimination stubs on the gate GEMM (9216x512x2560, 250 us):
++
++| stub | gate us | TFLOP/s | meaning |
++|---|---|---|---|
++| none (baseline) | 262.6 | 92.0 | |
++| fragment LDS removed | ~258 | ~94 | fragment chain nearly free (~4 us) |
++| scale pass removed | 216.8 | 111.5 | scale pass ~33 us (13%) |
++| strided scale staging removed | 250.7 | 96.4 | rD/sS loads free (L1 handles) |
++| scale pass, sA_d restructure | 245.8* | 98.3 | float4 wd loads: no real gain |
++
++* = with the (later reverted) fragment pipeline; the sA_d-only restructure
++measured 261.6 - neutral.
++
++Findings:
++1. The scale pass (~13%) is FMA/serialization-bound, not LDS-bound: moving the
++   per-row scales to a contiguous smem array (18 -> 6 LDS per warp per
++   k-block) did not help. The 32 FMAs/thread/k-block are irreducible and the
++   per-k-block weight scale cannot be deferred to the epilogue (it varies per
++   k-block).
++2. The staging/barrier/wmma floor is ~85%. A 2-k-block staging lookahead
++   (double-buffered registers) regressed ~4% (scheduling). The 4-B weight
++   staging loads coalesce fine; L2 traffic (~280 MB/launch) is not the
++   limiter (1.1-1.6 TB/s used of ~3).
++3. aiter's kpack=2 does not port: the 16-k wmma fragment is split across lane
++   halves, so no single wider LDS load covers 2 k-steps without a swizzled
++   smem store side; triton's num_stages=2 doubles smem (48 KB = 1 CTA/CU =
++   the measured 58 TFLOP/s config).
++
++NEW COMPILER MISCOMPILE (do not retry): a 2-k-step fragment lookahead with a
++named-variable rotation (a0_1/a0_2) miscompiles under the single-buffer loop -
++LLVM folds the rotation copies and step 1 reuses step 0's operand registers
++(verified in SASS: 8 v_wmma with identical v[30:31]/v[26:27]/v[34:35]/v[38:39]
++operands; PPL 183142). The 1-k-step lookahead (a0_n) compiles correctly. Same
++class as the burst-array bug; rule: no register rotation of fragments across
++k-steps in the single-buffer loop.
++
++CHECK LESSON (important for the project): the pre-existing assumption that
++"standalone fp8 correctness passes" was FALSE for random data - random fp8
++payload bytes contain NaN encodings (0x7F/0xFF) and random f32 scales are
++mostly NaN/inf, so fabs(ref-out) is NaN everywhere and maxerr/bad stay 0.
++A false pass nearly shipped a miscompiled kernel. /tmp/check_wmma.cu now uses
++realistically-quantized data (host fp8 encoder, sane scales) and correctly
++flags the miscompile (maxerr 34, 7991/8192 bad). Any future fp8 kernel change
++must run this check (or the PPL gate) with proper data.
++
++Conclusion for LEVERS.md: L1 is spent unless a new structural idea appears
++(e.g. a swizzled kpacked smem layout for A, which the L2 repack would enable).
++The remaining GEMM lever with real headroom is L2 (weight repack at load
++time): 16-B staging loads + it unblocks the kpacked layout.
+-- 
+2.55.0
+

@@ -1,0 +1,449 @@
+From b678f8a4d2372be809658994955087f6f0cbaeed Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Wed, 5 Aug 2026 08:34:57 -0500
+Subject: [PATCH 04/23] fp8 : fix activation encoder saturation + M3/M4
+ completion
+
+- fp8.cuh: fp8_e4m3_from_f32 saturated all E>=15 values (the 256-448
+  top range of each 128-block) to 448, inflating activations; fix
+  saturates only for E>=16 or the E=15/man3=7 NaN pattern. This was
+  the root cause of PPL 23.8 vs 9.89 bf16 (2.4x), ~2.0 logit shifts,
+  and generation divergence at token 10. After the fix: PPL 9.99
+  (< 1% of bf16), 20-token greedy parity exact.
+- fp8.cu: batched mul_mat (loop over ne12*ne13) so llama-server's
+  4-sequence batches work; supports_op drops the b->ne[2]*ne[3]==1
+  restriction.
+- --vocab-file override: llama_model_params.vocab_file +
+  common_params_model.vocab_file + arg.cpp (env LLAMA_ARG_VOCAB_FILE).
+- llama-safetensors: edge-case hardening (E5M2/unknown dtype rejection,
+  non-128 fp8 k-dim rejection, corrupt-header wrap, missing scale_inv).
+- M3: mmproj verified end-to-end (llama-cli + llama-server + image API);
+  llama-server loads the fp8 dir + mmproj.
+- M4: PPL, greedy parity, 3-GPU row-split parity, memory footprint
+  (14.3GB vs 17.8GB bf16 on 1 GPU at full 262144 context).
+
+Assisted-by: pi
+---
+ common/arg.cpp                  |  7 ++++
+ common/common.cpp               |  2 ++
+ common/common.h                 |  1 +
+ ggml/src/ggml-cuda/fp8.cu       | 60 ++++++++++++++++++---------------
+ ggml/src/ggml-cuda/fp8.cuh      | 10 +++---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  4 +--
+ handoff.md                      | 51 +++++++++++++++++++++++++---
+ implementation-plan.md          | 56 +++++++++++++++++++++---------
+ include/llama.h                 |  3 ++
+ src/llama-model.cpp             |  1 +
+ src/llama-safetensors.cpp       | 14 +++++++-
+ src/llama-safetensors.h         |  3 ++
+ src/llama.cpp                   |  3 ++
+ 13 files changed, 159 insertions(+), 56 deletions(-)
+
+diff --git a/common/arg.cpp b/common/arg.cpp
+index da4087474..8565d0dec 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2968,6 +2968,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.model.hf_file = value;
+         }
+     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_HF_FILE"));
++    add_opt(common_arg(
++        {"--vocab-file"}, "FILE",
++        "external tokenizer GGUF file to use when loading a safetensors model (default: <model-dir>/tokenizer.gguf)",
++        [](common_params & params, const std::string & value) {
++            params.model.vocab_file = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_VOCAB_FILE"));
+     add_opt(common_arg(
+         {"-hft", "--hf-token"}, "TOKEN",
+         "Hugging Face access token (default: value from HF_TOKEN environment variable)",
+diff --git a/common/common.cpp b/common/common.cpp
+index ffe3e7761..beb45adfc 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1617,6 +1617,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+         mparams.kv_overrides = params.kv_overrides.data();
+     }
+ 
++    mparams.vocab_file = params.model.vocab_file.empty() ? NULL : params.model.vocab_file.c_str();
++
+     if (params.tensor_buft_overrides.empty()) {
+         mparams.tensor_buft_overrides = NULL;
+     } else {
+diff --git a/common/common.h b/common/common.h
+index 2e15ec3f8..a2b2a70d4 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -303,6 +303,7 @@ struct common_params_model {
+     std::string url         = ""; // model url to download
+     std::string hf_repo     = ""; // HF repo
+     std::string hf_file     = ""; // HF file
++    std::string vocab_file  = ""; // external tokenizer GGUF (safetensors loading only)
+     std::string docker_repo = ""; // Docker repo
+ 
+     std::string get_name() const {
+diff --git a/ggml/src/ggml-cuda/fp8.cu b/ggml/src/ggml-cuda/fp8.cu
+index d8d0231cc..f9857406d 100644
+--- a/ggml/src/ggml-cuda/fp8.cu
++++ b/ggml/src/ggml-cuda/fp8.cu
+@@ -17,11 +17,12 @@ void ggml_cuda_mul_mat_fp8(
+     GGML_TENSOR_BINARY_OP_LOCALS;
+ 
+     GGML_ASSERT(ne00 % GGML_FP8_TILE_K == 0);
+-    GGML_ASSERT(ne02 == 1 && ne12 == 1 && ne03 == 1 && ne13 == 1); // non-batched for now
++    GGML_ASSERT(ne02 == 1 && ne03 == 1); // weights are unbatched (broadcast over src1 batches)
+ 
+     const int64_t k = ne00;
+     const int64_t m = ne01;
+     const int64_t n = ne1;
++    const int64_t n_batch = ne12 * ne13;
+ 
+     cudaStream_t stream = ctx.stream();
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+@@ -46,33 +47,38 @@ void ggml_cuda_mul_mat_fp8(
+         CUDA_CHECK(cudaMemsetAsync(src1_s_d + n * n_col_blocks, 0, (n_pad - n) * n_col_blocks * sizeof(float), stream));
+     }
+ 
+-    {
+-        const dim3 num_blocks(n_col_blocks, n, 1);
+-        const dim3 block_size(GGML_FP8_NTHREADS, 1, 1);
+-        quantize_fp8<<<num_blocks, block_size, 0, stream>>>(src1_d, src1_q_d, src1_s_d, k, n, n_col_blocks, n_pad);
+-        CUDA_CHECK(cudaGetLastError());
+-    }
++    for (int64_t ib = 0; ib < n_batch; ++ib) {
++        const float * src1_b = src1_d + ib * k * n;
++        float       * dst_b  = dst_d  + ib * m * n;
+ 
+-    // the fp8 kernels are compiled for the RDNA4 device pass only; on the host
+-    // side the launch stubs always exist, so dispatch on the runtime cc
+-    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+-        const dim3 block_dims(GGML_FP8_NTHREADS, 1, 1);
+-        if (n <= GGML_FP8_GEMV_MAX_N) {
+-            // dot4 GEMV: one warp per output row, one CTA per 4 rows and token
+-            const dim3 grid_dims((m + 3) / 4, n, 1);
+-            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+-            ggml_cuda_kernel_launch(mul_mat_fp8_gemv, launch_params, src0_d, src1_q_d, src1_s_d, dst_d, k, m, n, n_col_blocks, n_pad);
+-        } else {
+-            const dim3 grid_dims((n + (GGML_FP8_NWARPS * GGML_FP8_TILE_N) - 1) / (GGML_FP8_NWARPS * GGML_FP8_TILE_N), (m + GGML_FP8_TILE_M - 1) / GGML_FP8_TILE_M, 1);
+-            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+-            ggml_cuda_kernel_launch(mul_mat_fp8_wmma, launch_params, src0_d, src1_q_d, src1_s_d, dst_d, k, m, n, n_col_blocks, n_pad);
++        {
++            const dim3 num_blocks(n_col_blocks, n, 1);
++            const dim3 block_size(GGML_FP8_NTHREADS, 1, 1);
++            quantize_fp8<<<num_blocks, block_size, 0, stream>>>(src1_b, src1_q_d, src1_s_d, k, n, n_col_blocks, n_pad);
++            CUDA_CHECK(cudaGetLastError());
+         }
+-        return;
+-    }
+ 
+-    // Scalar fallback (CUDA sm_89+)
+-    const dim3 block_dims(32, 8, 1);
+-    const dim3 grid_dims((n + 31) / 32, (m + 7) / 8, 1);
+-    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+-    ggml_cuda_kernel_launch(mul_mat_fp8_scalar, launch_params, src0_d, src1_q_d, src1_s_d, dst_d, k, m, n, n_col_blocks, n_pad);
++        // the fp8 kernels are compiled for the RDNA4 device pass only; on the host
++        // side the launch stubs always exist, so dispatch on the runtime cc
++        if (GGML_CUDA_CC_IS_RDNA4(cc)) {
++            const dim3 block_dims(GGML_FP8_NTHREADS, 1, 1);
++            if (n <= GGML_FP8_GEMV_MAX_N) {
++                // dot4 GEMV: one warp per output row, one CTA per 4 rows and token
++                const dim3 grid_dims((m + 3) / 4, n, 1);
++                const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
++                ggml_cuda_kernel_launch(mul_mat_fp8_gemv, launch_params, src0_d, src1_q_d, src1_s_d, dst_b, k, m, n, n_col_blocks, n_pad);
++            } else {
++                const dim3 grid_dims((n + (GGML_FP8_NWARPS * GGML_FP8_TILE_N) - 1) / (GGML_FP8_NWARPS * GGML_FP8_TILE_N), (m + GGML_FP8_TILE_M - 1) / GGML_FP8_TILE_M, 1);
++                const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
++                ggml_cuda_kernel_launch(mul_mat_fp8_wmma, launch_params, src0_d, src1_q_d, src1_s_d, dst_b, k, m, n, n_col_blocks, n_pad);
++            }
++            continue;
++        }
++
++        // Scalar fallback (CUDA sm_89+)
++        const dim3 block_dims(32, 8, 1);
++        const dim3 grid_dims((n + 31) / 32, (m + 7) / 8, 1);
++        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
++        ggml_cuda_kernel_launch(mul_mat_fp8_scalar, launch_params, src0_d, src1_q_d, src1_s_d, dst_b, k, m, n, n_col_blocks, n_pad);
++    }
+ }
+diff --git a/ggml/src/ggml-cuda/fp8.cuh b/ggml/src/ggml-cuda/fp8.cuh
+index 9b2838197..da4059b94 100644
+--- a/ggml/src/ggml-cuda/fp8.cuh
++++ b/ggml/src/ggml-cuda/fp8.cuh
+@@ -58,8 +58,8 @@ __device__ __forceinline__ uint8_t fp8_e4m3_from_f32(float x) {
+     }
+ 
+     int E = (int) exp - 120;
+-    if (E >= 15) {
+-        return sign ? 0xFE : 0x7E; // saturate to 448
++    if (E >= 16) {
++        return sign ? 0xFE : 0x7E; // well beyond e4m3 range
+     }
+     if (E <= 0) {
+         // subnormal range: M = rne(value * 512), 0..7, 8 carries to E=1
+@@ -80,7 +80,7 @@ __device__ __forceinline__ uint8_t fp8_e4m3_from_f32(float x) {
+         return (uint8_t)((sign << 7) | M);
+     }
+ 
+-    // normal: E in 1..14, round mantissa to 3 bits (RNE)
++    // normal: E in 1..15, round mantissa to 3 bits (RNE)
+     uint32_t man_3 = man >> 20;
+     const uint32_t frac = man & 0xFFFFF;
+     if (frac > 0x80000 || (frac == 0x80000 && (man_3 & 1))) {
+@@ -91,9 +91,9 @@ __device__ __forceinline__ uint8_t fp8_e4m3_from_f32(float x) {
+         E++;
+     }
+     if (E == 15 && man_3 == 7) {
+-        man_3 = 6; // 480 would overflow -> clamp to 448
++        man_3 = 6; // 480 is NaN in e4m3 -> clamp to 448
+     }
+-    if (E >= 15) {
++    if (E >= 16) {
+         return sign ? 0xFE : 0x7E; // saturate to 448
+     }
+     return (uint8_t)((sign << 7) | (E << 3) | man_3);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 18b3536dd..b8d533c35 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4849,8 +4849,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_BF16:
+                         return true;
+                     case GGML_TYPE_F8_E4M3:
+-                        // native FP8 hardware only (RDNA4, or NVIDIA Ada/Hopper+); F32 activations, non-batched
+-                        if (b->type != GGML_TYPE_F32 || a->ne[0] % 128 != 0 || a->ne[2]*a->ne[3] != 1 || b->ne[2]*b->ne[3] != 1) {
++                        // native FP8 hardware only (RDNA4, or NVIDIA Ada/Hopper+); F32 activations, unbatched weights
++                        if (b->type != GGML_TYPE_F32 || a->ne[0] % 128 != 0 || a->ne[2]*a->ne[3] != 1) {
+                             return false;
+                         }
+                         {
+diff --git a/handoff.md b/handoff.md
+index d7605673c..9eac75b37 100644
+--- a/handoff.md
++++ b/handoff.md
+@@ -82,11 +82,11 @@ Row/col helpers in fp8.cuh: `fp8_wmma_row(l,s) = (l/16)*8 + s`, `fp8_wmma_col(l,
+ 
+ ## 5. Next steps (in order)
+ 
+-1. ~~Fix the C-fragment mapping~~ **DONE (2026-08-05)**: root cause was the gfx12 fp8 wmma fragment layout itself (A and B fragment loads wrong; staging needed the [n][k] transpose; see section 4). `fp8_correctness` + stress suite PASS. If test-backend-ops was built before fp8.cu existed, re-run `cmake .` first (GLOB re-eval).
+-2. ~~Perf check~~ **DONE (2026-08-06)**: see section 4. Generation on 1x R9700: Q8_0 GGUF 91.7 t/s, BF16 safetensors 59-72 t/s, **FP8 safetensors 72.5 t/s** (was 3.2 t/s after the fixes below). Prompt: FP8 143 t/s vs Q8_0 348 t/s. M2 kernel work is DONE except the CUDA sm_89/sm_90 mma path (compile-guarded, untested).
+-3. **M3 — direct safetensors loader: DONE (2026-08-06)** for the qwen35 text path. See section 9 for the full writeup. Remaining M3 items: mmproj/vision companion verification (mtmd-cli + server with --mmproj), edge cases (single-file no-index, non-128 dims, E5M2 rejection, corrupt headers).
+-4. **M4**: parity vs HF greedy (parity_llama.cpp in /tmp + parity_check.py in model dir) — mostly done: llama.cpp-BF16-via-loader == HF-BF16 byte-exact over 20 tokens; llama.cpp-FP8 matches BF16/HF for the first 9 tokens then diverges on a True/False near-tie (expected activation-quantization divergence; fp8 matches HF farther than Q8_0 does). Remaining: PPL sanity, multi-GPU row-split parity, memory footprint check (~5.3GB expected on 1 GPU: 1319+1319+2092 MiB split across 3 in the default split).
+-5. **M5 (optional)**: gguf-py F8_E4M3 constants + `--preserve-fp8` in conversion/base.py.
++1. ~~Fix the C-fragment mapping~~ **DONE (2026-08-05)**: root cause was the gfx12 fp8 wmma fragment layout itself. `fp8_correctness` + stress suite PASS.
++2. ~~Perf check~~ **DONE (2026-08-06)**: 1x R9700: FP8 safetensors 72 t/s generation vs Q8_0 GGUF 91.7 t/s vs BF16 57-71 t/s. Prompt: FP8 139-148 t/s.
++3. ~~M3 - direct safetensors loader~~ **DONE (2026-08-06)** for the qwen35 text path + mmproj. See section 9. Remaining minor: mtmd-cli direct run (llama-cli + llama-server + API verified instead), non-128-rows fp8 (guard rejects non-128 k only - rows are fine), E5M2 (rejected).
++4. ~~M4 - validation & parity~~ **DONE (2026-08-06)**: greedy parity exact (20 tokens), PPL 9.99 vs 9.89 bf16 (< 1%), row-split parity exact, memory measured (14.3GB peak 1-GPU full-ctx). See section 9 for the critical encode bug found via PPL.
++5. **Remaining**: M5 (optional gguf-py fp8 preservation) - not started, low priority. CUDA sm_89/sm_90 mma path still compile-guarded/untested (scalar fallback).
+ 
+ ## 6. Key references
+ - `implementation-plan.md` (repo root) — full plan, M1 marked done, M2 spike results documented.
+@@ -151,3 +151,44 @@ Row/col helpers in fp8.cuh: `fp8_wmma_row(l,s) = (l/16)*8 + s`, `fp8_wmma_col(l,
+ - Edge cases untested: single-file no-index safetensors, non-128 dims, E5M2 rejection, corrupt headers.
+ - CUDA sm_89/sm_90 fp8 mma path still compile-guarded/untested (scalar fallback).
+ - ~1-ulp expf differences vs numpy for F32-source A_log (numerically irrelevant; the bf16-sourced StewFP8 path rounds through bf16 and matches byte-exact).
++
++## 10. M3 completion + M4 results (DONE 2026-08-06)
++
++### Critical bug found via PPL (the big one)
++The fp8 kernel's activation encoder `fp8_e4m3_from_f32` had `if (E >= 15) return 0x7E`
++- saturating EVERY value in the top exponent range (256..448, i.e. the top ~43% of
++each 128-block's dynamic range) to 448. Activations were systematically inflated to
++their block max, distorting the hidden states: logits shifted ~2.0, PPL = 23.8 (2.4x
++vs bf16's 9.89), generation diverged at token 10. The self-consistent stress tests
++missed it (host reference shared the same buggy encode). Fix in fp8.cuh: saturate only
++for E >= 16, or the E=15/man3=7 NaN pattern (man3=7 clamped to 6 = 448). After the
++fix: logits track bf16 within 0.1-0.25, **PPL 9.9907 vs 9.8881 (< 1%)**, generation
++parity EXACT over 20 tokens. The test harnesses' host encode copies were fixed too.
++
++### New features this session
++- **Batched fp8 mul_mat** (needed by llama-server, which batches 4 sequences):
++  `ggml_cuda_mul_mat_fp8` loops over ne12*ne13; the supports_op check dropped the
++  `b->ne[2]*b->ne[3] != 1` restriction. Verified with a 4-batch correctness test
++  (bad=1/16384, max_rel 3.9e-3 - the residual is the ULP-scale tie-flip noise).
++- **llama-server works** with the fp8 dir + mmproj: text + image chat via the API
++  (image content read correctly; output goes to reasoning_content = Qwen3.5 thinking).
++- **--vocab-file override**: `llama_model_params.vocab_file` + common_params_model +
++  arg.cpp (env LLAMA_ARG_VOCAB_FILE). Default remains <model-dir>/tokenizer.gguf.
++- **mmproj verified**: `convert_hf_to_gguf.py --mmproj` on the ORIGINAL dir
++  (`model.safetensors-*.safetensors` naming - the StewFP8 `layers-*` layout is
++  invisible to the converter's get_model_part_names) -> 298 tensors, 675MB.
++  llama-cli + llama-server + image work end-to-end.
++
++### M4 results
++- Greedy parity: llama.cpp fp8 == llama.cpp bf16 for all 20 tokens (after the fix).
++- PPL (Pride and Prejudice, 512-token windows): FP8 9.9907, BF16 9.8881, Q8_0 9.8881.
++- Row-split parity: default 3-GPU layer split == single GPU, identical output.
++- Memory (1x R9700, n_ctx=262144 default): model 4730 MiB + KV 8192 MiB + RS 50 MiB +
++  compute 320+266 MiB = ~14.3GB peak. BF16 same setup: ~17.8GB.
++- Edge cases verified with synthetic dirs: single-file no-index, E5M2 rejection,
++  non-128 k rejection, missing scale_inv, corrupt header, missing tokenizer one-liner.
++
++### Known gaps / next
++- mtmd-cli direct binary not run (llama-cli/server + API verified instead).
++- CUDA sm_89/sm_90 fp8 mma path compile-guarded, untested (scalar fallback).
++- M5 (gguf-py F8_E4M3 constants, --preserve-fp8) not started.
+diff --git a/implementation-plan.md b/implementation-plan.md
+index 811d9995a..15f3fca46 100644
+--- a/implementation-plan.md
++++ b/implementation-plan.md
+@@ -296,24 +296,48 @@ Tasks:
+ - [x] Negative test: CPU-only build loading the fp8 dir -> exact "no hardware support"
+       error, clean exit. `--n-gpu-layers 10` -> exact partial-offload error.
+       NOTE: `--no-alloc` / `--vocab-only` skip tensor loading entirely (verified sane).
+-- [ ] mmproj companion: text loader ignores vision; document + verify
+-      `convert_hf_to_gguf.py ... --mmproj` produces a working `mmproj.gguf` for qwen3.5
+-      vision (check `tools/mtmd/clip.cpp` accepts it; config dims: depth 24, hidden 1024,
+-      pos 2304, spatial_merge 2, temporal_patch 2 - qwen3vl-shaped).
+-- [ ] `tools/mtmd/mtmd-cli` + `tools/server` multimodal run with `-m <safetensors dir>`
+-      + `--mmproj <mmproj.gguf>` + an image.
++- [x] mmproj companion: `convert_hf_to_gguf.py <orig-dir> --mmproj` produces a
++      298-tensor 675MB mmproj.gguf (NOTE: must use the standard-named original dir,
++      `model.safetensors-*.safetensors`; the StewFP8 `layers-*.safetensors` layout is
++      invisible to `get_model_part_names("model", ...)`).
++- [x] `llama-cli -m <safetensors dir> --mmproj <mmproj.gguf> --image <img>` works:
++      vision tower reads the actual image content (NYT "MEN WALK ON MOON" front page
++      correctly identified). `llama-server` + mmproj + image via the chat API works too
++      (content went to reasoning_content - normal Qwen3.5 thinking mode).
++      CRITICAL FIX discovered: llama-server batches 4 sequences (ne12=4) and the fp8
++      mul_mat launcher asserted ne12==1 - added a batch loop over ne12*ne13 in
++      `ggml_cuda_mul_mat_fp8` and dropped the `b->ne[2]*b->ne[3] != 1` support check.
+ 
+ ### M4. Validation & parity (GPU)
+-- [ ] Greedy parity: FP8-direct-load vs HF reference greedy output on the
+-      `parity_check.py` prompts. Target: identical or near-identical logits
+-      (activation quantization in llama.cpp differs from HF's per-token fp8; expect
+-      tiny divergence, not bit-exact - document).
+-- [ ] PPL sanity on a text corpus (FP8 vs BF16 GGUF baseline, both on GPU).
+-- [ ] Multi-GPU: tensor split across 3x gfx1201 (`--split-mode row`), compare output
+-      parity vs single GPU.
+-- [ ] Memory: VRAM footprint for the 5.3GB dir (~2.6GB fp8 weights + KV/act).
+-- [ ] Edge cases: single-file safetensors (no index), non-128 dims (ceil scale guard),
+-      missing scale_inv, E5M2 tensors (reject with clear message), corrupt header.
++- [x] Greedy parity: llama.cpp-BF16-via-loader == HF-BF16 greedy, byte-exact over 20
++      tokens; **llama.cpp-FP8 == llama.cpp-BF16 for all 20 tokens** after the encode
++      fix below (before the fix it diverged at token 10 on a True/False near-tie).
++      `parity_check.py` (torch): fp8-dequant weights == bf16 weights greedy-identical.
++- [x] PPL sanity (Pride and Prejudice, 512-token windows, n_ctx=512, n_batch=2048):
++      FP8 9.9907 vs BF16 9.8881 vs Q8_0 9.8881 - fp8 within 1% of baseline.
++      **CRITICAL BUG FOUND+FIXED**: `fp8_e4m3_from_f32` had `if (E >= 15) return 0x7E`
++      which saturated ALL values in the top exponent range (256-448, the top ~43% of
++      each 128-block's dynamic range) to 448. Activations got systematically inflated
++      -> logits shifted ~2.0, PPL 23.8 (2.4x). Fix: only saturate for E >= 16 (or the
++      E=15/man3=7 NaN pattern). The self-consistent stress tests missed it because the
++      host reference shared the same buggy encode. After the fix: logits track bf16
++      within ~0.1-0.25, PPL 9.99, generation parity exact. Also fixed the encode copy
++      in the test harnesses.
++- [x] Multi-GPU: default layer split across 3x gfx1201 == single GPU output, identical
++      (tested with 40-token greedy, temp 0).
++- [x] Memory (1x R9700, default n_ctx=262144 from the model): fp8 model buffer
++      4730 MiB + KV cache 8192 MiB + RS 50 MiB + compute 320+266 MiB = ~14.3GB peak
++      on the GPU during generation (rocm-smi confirmed). BF16 model: ~17.8GB peak.
++      The fp8 weight savings show in the model buffer (4.7GB vs 7+GB incl. the tied
++      token_embd); the KV cache at full context dominates both.
++- [x] Edge cases: single-file safetensors (no index) loads; non-128 fp8 k-dim rejected
++      with a clear message ("must be a multiple of 128"); missing scale_inv rejected;
++      E5M2 tensors rejected ("unsupported tensor dtype"); corrupt header wrapped with
++      the file name; missing tokenizer.gguf gives the regenerate one-liner. All
++      verified with synthetic model dirs.
++- [x] `--vocab-file` override plumbed: `llama_model_params.vocab_file` +
++      `common_params_model.vocab_file` + `--vocab-file FILE` (default
++      `<model-dir>/tokenizer.gguf`).
+ 
+ ### M5. (Optional, low priority) GGUF-side FP8 preservation
+ - [ ] `gguf-py/gguf/constants.py`: `F8_E4M3 = 43`, `GGML_QUANT_SIZES[F8_E4M3] = (128, 132)`.
+diff --git a/include/llama.h b/include/llama.h
+index a14498925..a6e0af9ed 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -331,6 +331,9 @@ extern "C" {
+         // override key-value pairs of the model meta data
+         const struct llama_model_kv_override * kv_overrides;
+ 
++        // path to an external tokenizer GGUF file (direct safetensors loading only; NULL = <model-dir>/tokenizer.gguf)
++        const char * vocab_file;
++
+         // Keep the booleans together to avoid misalignment during copy-by-value.
+         bool vocab_only;      // only load the vocabulary, no weights
+         bool check_tensors;   // validate model tensor data
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index dda311c47..e9d7bf4a4 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2448,6 +2448,7 @@ llama_model_params llama_model_default_params() {
+         /*.progress_callback           =*/ nullptr,
+         /*.progress_callback_user_data =*/ nullptr,
+         /*.kv_overrides                =*/ nullptr,
++        /*.vocab_file                  =*/ nullptr,
+         /*.vocab_only                  =*/ false,
+         /*.check_tensors               =*/ false,
+         /*.use_extra_bufts             =*/ true,
+diff --git a/src/llama-safetensors.cpp b/src/llama-safetensors.cpp
+index 6ad7d1d96..3a7fb07fc 100644
+--- a/src/llama-safetensors.cpp
++++ b/src/llama-safetensors.cpp
+@@ -216,7 +216,12 @@ void llama_safetensors_loader::parse_files() {
+         std::string header_str(header_len, '\0');
+         file->read_raw(&header_str[0], header_len);
+ 
+-        const json header = json::parse(header_str);
++        json header;
++        try {
++            header = json::parse(header_str);
++        } catch (const std::exception & err) {
++            throw std::runtime_error(format("corrupt safetensors header in %s: %s", path.c_str(), err.what()));
++        }
+         const size_t data_off = 8 + header_len;
+ 
+         auto f = std::make_unique<st_file>();
+@@ -237,6 +242,9 @@ void llama_safetensors_loader::parse_files() {
+             t.nbytes = (size_t) (tinfo.at("data_offsets")[1].get<int64_t>() - tinfo.at("data_offsets")[0].get<int64_t>());
+             t.dtype  = tinfo.at("dtype");
+             t.shape  = tinfo.at("shape").get<std::vector<int64_t>>();
++            if (t.dtype != "F8_E4M3" && t.dtype != "BF16" && t.dtype != "F32") {
++                throw std::runtime_error(format("unsupported tensor dtype '%s' for '%s' - supported: F8_E4M3, BF16, F32", t.dtype.c_str(), tname.c_str()));
++            }
+             if (t.off + t.nbytes > ll_mmaps.back()->size()) {
+                 throw std::runtime_error(format("tensor '%s' in %s is out of file bounds", tname.c_str(), name.c_str()));
+             }
+@@ -535,6 +543,10 @@ void llama_safetensors_loader::build_mapping() {
+         }
+ 
+         if (m.type == GGML_TYPE_F8_E4M3) {
++            // the fp8 kernel consumes 128-column blocks; ggml asserts ne[0] % 128
++            if (m.ne[0] % 128 != 0) {
++                throw std::runtime_error(format("fp8 tensor '%s' has %lld columns, must be a multiple of 128", gname.c_str(), (long long) m.ne[0]));
++            }
+             // the companion scale is stored as <name>.weight_scale_inv
+             m.hf_scale = hf.substr(0, hf.size() - 7) + ".weight_scale_inv";
+             if (hf_tensors.find(m.hf_scale) == hf_tensors.end()) {
+diff --git a/src/llama-safetensors.h b/src/llama-safetensors.h
+index dba7232ff..cd1beced6 100644
+--- a/src/llama-safetensors.h
++++ b/src/llama-safetensors.h
+@@ -35,6 +35,9 @@ public:
+     llama_safetensors_loader(const char * path);
+     ~llama_safetensors_loader();
+ 
++    // override the tokenizer file (default: <model-dir>/tokenizer.gguf)
++    void set_vocab_path(const char * path) { vocab_path = path; }
++
+     llama_safetensors_loader(const llama_safetensors_loader &) = delete;
+     llama_safetensors_loader & operator=(const llama_safetensors_loader &) = delete;
+ 
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 14510bdd3..1d75839f5 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -460,6 +460,9 @@ struct llama_model * llama_model_load_from_file(
+         gguf_context * metadata = nullptr;
+         try {
+             loader  = std::make_unique<llama_safetensors_loader>(path_model);
++            if (params.vocab_file) {
++                loader->set_vocab_path(params.vocab_file);
++            }
+             metadata = loader->build_metadata();
+         } catch (const std::exception & err) {
+             LLAMA_LOG_ERROR("%s: failed to load safetensors model: %s\n", __func__, err.what());
+-- 
+2.55.0
+

@@ -1,0 +1,652 @@
+From ef41a940abb44e88d10d2803cd91dc1f11cfea84 Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Thu, 6 Aug 2026 10:55:20 -0500
+Subject: [PATCH 10/23] gated_delta_net : fix chunked phase A closure, enable
+ by default
+
+The tiled phase A closure (attn = I + A + A^2 + A^3) is wrong for a
+64x64 strictly-lower A: the diagonal 16x16 blocks are themselves
+strictly lower, so A^4 != 0 (nilpotency index 64, not 4). The missing
+block products only vanish when A is tiny, which hid the bug in tests
+(small beta, strong decay). On real model data (L2-normalized k,
+beta up to 0.94, near-zero gates) A is dense with |A| up to 0.81 and
+the error propagated into k_cumsum/k_cumdecay, producing garbage
+output (PPL 359971 vs 6.2572 sequential).
+
+Replace the closure with exact 16x16 block forward substitution:
+  D_r = (I - A(r,r))^{-1} by row substitution
+  X(r,c) = D_r * sum_{m=c}^{r-1} A(r,m) * X(m,c)
+Verified against numpy (1e-7) and the sequential kernel (5.6e-8).
+PPL with the chunked path is now 6.2352 (sequential 6.2572).
+
+Also: make the chunked path the default (GGML_CUDA_GDN_CHUNKED=0 to
+disable) and add multi-seq backend-ops cases (32,128,64,2) and
+(32,128,512,4).
+
+Assisted-by: pi
+---
+ GDN_DEBUG_HANDOVER.md                 | 214 +++++++++++++++++++
+ ggml/src/ggml-cuda/gated_delta_net.cu | 294 ++++++++++++++++++--------
+ tests/test-backend-ops.cpp            |   2 +
+ 3 files changed, 424 insertions(+), 86 deletions(-)
+ create mode 100644 GDN_DEBUG_HANDOVER.md
+
+diff --git a/GDN_DEBUG_HANDOVER.md b/GDN_DEBUG_HANDOVER.md
+new file mode 100644
+index 000000000..8fa2e8f54
+--- /dev/null
++++ b/GDN_DEBUG_HANDOVER.md
+@@ -0,0 +1,214 @@
++# GDN CHUNKED DEBUGGING HANDOVER (session 2026-08-06, mid-debug)
++
++## STATUS 2026-08-06 (LATE): BUG FOUND AND FIXED - PPL 359971 -> 6.2352
++
++ROOT CAUSE: the tiled phase A closure (attn = I+A+A^2+A^3 via 16x16 block
++products) is mathematically WRONG for a 64x64 strictly-lower A. The claim
++"A^4 = 0" only holds if the diagonal 16x16 blocks are zero, but they are NOT:
++a strictly-lower matrix has nonzero sub-diagonal entries inside every diagonal
++block, so the nilpotency index is 64 (not 4). Missing terms (e.g. A(2,2)*A(2,0)
++in A^2(2,0), and all A^3 terms that stay inside diagonal blocks) are zero only
++when A is tiny.
++
++Why the model exposed it and tests/debug did not:
++- model: L2-normalized k (gram~1), beta up to 0.94, gates near 0 (gate[0] ~
++  -0.0007) -> A is a DENSE strictly-lower matrix with |A| up to 0.81; the
++  closure error propagates into k_cumsum/k_cumdecay -> garbage output (PPL
++  359971).
++- tests use gates -20..-1e-4 / -2..-0.5 with small beta -> A tiny -> the
++  missing block terms ~0 -> tests pass.
++- the T=2 warmup dump validated because a 2-token chunk has A^2=0 (never
++  exercises the block products).
++- the handover's "python closure validation" used strong-decay data (A^4 ~
++  4e-10) -> validated the wrong claim.
++
++FIX (in gated_delta_net.cu, uncommitted): replaced the closure with EXACT 16x16
++block forward substitution (still 256 threads, keeps the tiling):
++  D_r = (I - A(r,r))^{-1} via row substitution D_r(i,:) = e_i + sum_{k<i} B(i,k) D_r(k,:)
++  X(r,c) = D_r * sum_{m=c}^{r-1} A(r,m) * X(m,c)   for c < r
++(plus __shared__ float s_acc[16][16]). Verified in numpy against np.linalg.inv
++on the model's dumped data (maxdiff ~1e-7) before building.
++
++VERIFICATION (all on stewfp8-ow.gguf, /tmp/corpus_pride.txt, -c 512 -b 2048 -n 4):
++- chunked (default, graphs ON): PPL 6.2352  (sequential baseline 6.2572)
++- 47/47 GATED_DELTA_NET backend tests pass (incl. multi-seq cases)
++- layer-consistent dump (see below) now fully matches numpy: phase A scratch
++  k_cumsum 2.3e-6 / k_cumdecay 7e-8 / attn_causal 2.8e-6, phase B dst 1.1e-7,
++  state_out 2.8e-7, sequential cross-check 5.6e-8.
++- generation works: llama-cli --single-turn --no-conversation gives coherent
++  text (needs those flags in this fork, see HANDOVER.md).
++
++ALSO LEARNED THIS SESSION:
++- GGML_HIP_GRAPHS=0 is a CMAKE OPTION, NOT a runtime env var. The runtime
++  disable is GGML_CUDA_DISABLE_GRAPHS=1. All previous "graphs off" runs were
++  actually graphs ON. CUDA graphs are NOT the cause of the garbage anyway
++  (PPL 359971 reproduces with graphs properly disabled).
++- the old GDN_DUMP was layer-misaligned because the context streams are
++  cudaStreamNonBlocking and the blocking cudaMemcpy (legacy default stream)
++  does not wait for them. Fixed dump: all copies via cudaMemcpyAsync/
++  cudaMemcpy2DAsync on `stream` + one cudaStreamSynchronize AFTER phase B
++  launch, then write files. First gdn call in perplexity is T=2 (warmup); the
++  real calls are T=128 n_seqs=4 n_chunks=2 (batch 2048 split into 4 seqs).
++
++REMAINING (perf): chunked pp512 = 5335 t/s vs sequential 5878 t/s (~9%
++slower). gdn kernels per pp512: phase A 14.1ms (293us x 48) + phase B 33.9ms
++(705us x 48) = 48ms vs sequential 31.8ms (120us x 264). Phase B (128-thread
++original) is the bottleneck; the 4-slice 256-thread phase B rewrite (was
++15.5ms) is LOST (never committed, no stash) and must be re-derived + re-
++validated against the sequential kernel before it can land. The dump
++infrastructure (GDN_DUMP + /tmp/validate_gdn_dump.py) is exactly what to use
++for that re-validation.
++
++---
++
++## ORIGINAL STATUS: THE CHUNKED DELTA-NET IS CORRECT IN ALL TESTS/DEBUG BUT PRODUCES GARBAGE ON THE REAL MODEL (PPL 359971 vs sequential 6.2572)
++
++DO NOT continue from memory. Read this whole file, then re-establish state from the sections below.
++
++---
++
++## 1. What the code is supposed to do
++
++Chunked gated delta rule in `ggml/src/ggml-cuda/gated_delta_net.cu`:
++- phase A `gdn_chunk_prepare` (256 threads/CTA, grid (H*n_seqs, n_chunks)): per (head, seq, chunk of 64):
++  gates cumsum (Hillis-Steele) -> s_decay; stage k into smem s_k[64][129]; gram = k@k^T (4x4 tiles);
++  w[i][j] = -beta_i*exp(decay_i-decay_j)*gram (strictly lower, diag/upper zeroed); closure attn = I+A+A^2+A^3
++  via 16x16 block products (FIXED to accumulate a20+a30+a31, see bug list); k_cumsum = attn@(beta*v);
++  k_cumdecay = attn@(beta*k*exp(decay)); attn_causal = L.*(q@k^T) strictly causal (j<=i); delta, P_last.
++- phase B `gdn_chunk_state` (128 threads, grid H*n_seqs*16): per (head, seq, V-slice of 8): sequential over chunks:
++  v_new = k_cumsum - k_cumdecay@S; o = exp(decay)*(q@S) + attn_causal@v_new; S = P_last*S + (k*delta)@v_new.
++- Dispatch (default ON since a few builds ago): `!KDA && !keep_rs_t && S_v==128 && n_tokens>1 &&
++  (state_slot_stride==0 || state_slot_stride==S_v*S_v*H*n_seqs)`.
++  Disable for sequential comparison: `GGML_CUDA_GDN_CHUNKED=0` (env, default-on: env absent OR nonzero -> chunked).
++- Scratch (pool): k_cumsum [H*n_seqs*n_chunks*64*128] + k_cumdecay [same] + attn_causal [H*n_seqs*n_chunks*64*64]
++  + decay [H*n_seqs*n_chunks*64] + delta [same] + P_last [H*n_seqs*n_chunks]. FLAT OFFSETS (per-HS contiguous
++  within each array, NOT interleaved per-HS):
++  k_cumsum=0, k_cumdecay=2097152 (for 32 heads x 8 chunks), attn_causal=4194304, decay=5242880,
++  delta=5259264, P_last=5275648, total=5275904 (for H=32, n_chunks=8).
++  The phase A indexes each array with (hsc+chunk) where hsc=hs*n_chunks (this is CORRECT).
++
++## 2. Verified-correct building blocks (do not re-debug these)
++
++- All 47/47 GATED_DELTA_NET backend-ops tests PASS (I added multi-seq cases (32,128,64,2) and (32,128,512,4)
++  to tests/test-backend-ops.cpp).
++- Standalone debug `/tmp/gdn_debug.cpp` (H=32, S=128, T=64 or 512, CPU sequential reference) passes with
++  maxerr ~1.27e-4 for: strong decay (gates -20..-1e-4), weak decay (-2..-0.5), zero state, random state,
++  T=64 and T=512, graphs ON and OFF.
++- In-kernel DBG prints (env GDN_DBG=1, passed as kernel arg `dbg`) show for hs=0 chunk=0 of the model:
++  - s_decay (smem) = correct cumsum of gates read from the tensor (e.g. -2.17, -4.19, -6.27...; d31~-54, d63~-108).
++  - decay_scratch write = s_decay, at flat offset 5242880+tid (readback in kernel matches).
++  - M2 (k_cumsum) computes accv00 = b0*v00 exactly.
++  - closure values: w[32][0]=0, attn[32][0]=0 (blocks ~0 because decay per chunk is strong: exp(d32-d0)=exp(-52)=0;
++    the closure is effectively I+A for this model).
++- The closure block-LU math was validated in python against forward substitution (identical to ~1e-10, A^4~4e-10).
++
++## 3. THE CRITICAL TRAP (read twice)
++
++The GDN_DUMP instrumentation (`env GDN_DUMP=1`, dumps scratch + inputs to /tmp/gdn_scratch_model.bin +
++/tmp/gdn_inputs_model.bin from inside the launch function) is LAYER-MISALIGNED: the CPU comparison
++(computed from the dumped inputs) does NOT match the dumped scratch, e.g.:
++
++- dumped inputs gate[0] = -1.72853 (some layer)
++- dumped scratch decay[0] = -0.20981 (a DIFFERENT layer)
++- the same-run DBG shows BOTH gate[0]=-0.20981 (one layer) and gate[0]=-1.72853 (next layer) prints.
++
++So the dump-based comparisons ("k_cumsum maxdiff 3.97", "decay maxdiff 54.8") are MEANINGLESS until the
++dump is made layer-consistent. The dump runs per layer (file overwritten each time); something about the
++graph-capture / async-launch / printf-flush ordering causes the scratch file and the input file to come from
++different layers even with GGML_HIP_GRAPHS=0. The phase A's in-kernel readbacks (DBG) are the only trustworthy
++evidence, and they show the phase A computing CORRECT intermediate values.
++
++NEXT STEP: fix the dump to be layer-consistent. Simplest: print the layer's gate[0] to stderr alongside each
++file write (same fprintf), or dump the scratch AND inputs to a per-layer filename (e.g. append the gate[0] value),
++or disable the dump except for a specific layer (compare the DBG's gate[0] with the file's gate[0]).
++
++## 4. Bugs found and fixed THIS session (in gated_delta_net.cu, uncommitted)
++
++1. (EARLIER session, committed) decay_scratch write raced across heads: tid 0..127 wrote into 64-float per-head
++   regions -> fixed with `if (tid < GDN_CHUNK)`.
++2. (THIS session) closure block products p0/p12/p3 OVERWROTE the original A[2][0]/A[3][0]/A[3][1] blocks instead
++   of accumulating -> fixed by saving a20/a30/a31 in registers before the product writes, computing a3 from the
++   isolated A^2[2][0], then writing a20+p0, a30+p12+a3, a31+p3. Effect on this model is ~0 (blocks ~0) but it is
++   a real math bug for weaker decay.
++3. (THIS session) `getenv()` cannot be called inside a __global__ kernel on HIP -> pass debug flag as kernel arg.
++4. Debugging lesson: cudaMemcpy/cudaStreamSynchronize/cudaEvent* inside the launch during CUDA graph capture are
++   unreliable ("operation not permitted when stream is capturing" for sync/event; memcpy reads stale memory).
++
++## 5. Current PPL/generation state (model stewfp8-ow.gguf, corpus /tmp/corpus_pride.txt, -c 512 -b 2048 -n 4)
++
++- sequential (GGML_CUDA_GDN_CHUNKED=0): PPL 6.2572 (baseline, good).
++- chunked (default): PPL 359971.4813 (garbage).
++- Earlier during session: 18057 (2-slice phase B era), 16502 (HEAD 128-thread phase B + tiled phase A, broken
++  closure), 359971 (same + fixed closure). All garbage; numbers changed with each phase-B/closure change, so the
++  bug is REAL and in the chunked path, but NOT reproduced by tests/debug.
++
++## 6. What changed since the last GOOD PPL (6.2996, which was: tiled phase A + ORIGINAL 128-thread phase B)
++
++Sequence: phase A tiling (build52 era, PPL 6.2996 verified) -> 2-slice 256-thread phase B -> 4-slice 256-thread
++phase B (bench 6059) -> chunked default-on -> PPL garbage from here on -> dumped/debugged -> closure fix.
++NOTE: the 6.2996 was measured BEFORE the phase B rewrites; the phase B rewrites may contain the bug, OR the
++tiled phase A has a bug that the debug doesn't catch (tests/debug use random q/k/v and gates -20..-1e-4 or -2..-0.5;
++the model's exact data may expose something else).
++
++## 7. Outstanding hypotheses for the model-only failure
++
++- The phase A writes are correct in-kernel but something OVERWRITES the scratch between phase A and phase B
++  (e.g. another op's scratch on the same pool buffer, or the phase A of the next layer racing the phase B of the
++  current layer in the graph). CHECK: the launch frees `scratch` (ggml_cuda_pool_alloc destructor) at the end of
++  the launch; the phase B launch is a SEPARATE pool alloc that may REUSE the same buffer - verify the phase B's
++  alloc does not alias the phase A's scratch while phase B still needs it. THIS IS THE STRONGEST HYPOTHESIS:
++  the phase A's scratch is freed at the end of the phase-A block before the phase B launch block allocates its own
++  (possibly aliasing) scratch.
++- The model's actual data (fp8-dequantized q/k/v, softplus gates, L2-normalized q/k) exposes an edge case:
++  e.g. s_bp = beta*exp(decay) where decay can be near 0 (gate ~ -0.0009) making L ~ 1 and w entries non-negligible
++  for FAR pairs in chunks where decay span is small; the block products then matter and the closure (even fixed)
++  may be wrong. VALIDATE: python-compute the chunked path on the model's dumped inputs (once the dump is
++  layer-consistent) and compare against the sequential reference.
++- Phase B multi-chunk chain state accumulation differs from sequential in a way the tests' tolerance hides.
++  The debug's maxerr 1.27e-4 at T=512 is suspiciously constant across gate ranges - investigate whether the debug
++  reference itself is subtly wrong (compare debug CPU reference against the sequential kernel's output at
++  GGML_CUDA_GDN_CHUNKED=0 with identical inputs).
++
++## 8. How to reproduce and debug
++
++Build: `/tmp/llama-hip-full` (cmake, GGML_HIP=ON, gfx1201). Rebuild targets: `cmake --build /tmp/llama-hip-full -j16 --target llama-bench llama-cli llama-perplexity test-backend-ops`.
++Model: `/llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf`.
++PPL: `./llama-perplexity -m <model> -f /tmp/corpus_pride.txt -c 512 -b 2048 -n 4 -dev ROCm0` (chunked by default; `GGML_CUDA_GDN_CHUNKED=0` for sequential).
++Tests: `test-backend-ops test -b ROCm0 -o GATED_DELTA_NET` (47 cases now).
++Debug prints: `env GDN_DBG=1 ./llama-bench -m <model> -p 512 -n 1 -r 1 -dev ROCm0 | grep "DBG"`.
++Standalone: `/tmp/gdn_debug.cpp` (edit H/S/T/gate ranges/state, rebuild with the g++ command in its header comment).
++Perf profile: `rocprofv3 -r -d /tmp/rocp_x -f csv -- ./llama-bench -m <model> -p 512 -n 8 -r 1 -dev ROCm0`, then parse the kernel_trace.csv.
++Bench: chunked pp512 ~6008-6059 (was 5925 sequential; the chunked currently wins on speed but is WRONG on output).
++
++## 9. Debug instrumentation currently in the code (remove before any commit)
++
++- GDN_DUMP block in the launch (scratch + inputs dump, layer-misaligned, see section 3).
++- GDN_DBG prints in phase A (s_decay, M2 accv, closure values) gated by kernel arg `dbg` (passed from
++  getenv("GDN_DBG") in the launch). Plus a stale "DBG gram" print placed BEFORE the M1 (reads uninitialized smem -
++  ignore its values).
++- `#include <cstdlib>` added at the top.
++- tests/test-backend-ops.cpp: added (32,128,64,2) and (32,128,512,4) cases (KEEP these - they are useful).
++
++## 10. Uncommitted changes in the working tree (git status shows gated_delta_net.cu + tests)
++
++Last commit: bb31b45d5 (chunked kernel opt-in, correct but slow). The current working tree has: phase A tiling
++(256 threads, block-LU closure), phase B 2-slice/4-slice experiments (currently HEAD's 128-thread phase B is in
++the file after the bisect), chunked default-ON, closure fix, dump/dbg instrumentation. Decide what to keep
++(phase A tiling + closure fix + default-on are the intended direction; phase B rewrites need re-validation;
++dump/dbg must be removed).
++
++## 11. Performance context (if correctness gets fixed)
++
++- Phase A tiling took gdn_chunk_prepare from 76ms -> 12ms per 48 launches (2 passes of 24 layers).
++- 4-slice phase B: 16.4ms -> 15.5ms (barely moved; L2-latency-bound on scratch streams).
++- Chunked pp512 = 6059 (4-slice era) vs sequential 5925. Once correct, the chunked should be re-benched.
++- Decode (tg64 ~89-90) is untouched by all this (sequential path for n_tokens=1).
++
++## 12. Files
++
++- ggml/src/ggml-cuda/gated_delta_net.cu (main work area)
++- tests/test-backend-ops.cpp (added multi-seq cases)
++- /tmp/gdn_debug.cpp (standalone debug, uses the built libs)
++- /tmp/gdn_scratch_model.bin, /tmp/gdn_inputs_model.bin (dumps - layer-misaligned, see section 3)
++- /tmp/validate_chunked.py (original python chunked-math validation, from earlier session)
++- PERF_HANDOVER.md (session logs; section 11 covers the chunked kernel design)
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index c75eab121..4a1ea89a1 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1,5 +1,6 @@
+ #include "gated_delta_net.cuh"
+ #include "ggml-cuda/common.cuh"
++#include <cstdlib>
+ 
+ // ================= chunked gated delta rule (prefill path) =================
+ //
+@@ -29,7 +30,7 @@
+ #define GDN_CHUNK 64
+ #define GDN_CHUNK_VSLICE 8
+ 
+-// phase A: per (head, seq, chunk). Block = 128 threads.
++// phase A: per (head, seq, chunk). Block = 256 threads.
+ __global__ void gdn_chunk_prepare(
+         const float * __restrict__ q,
+         const float * __restrict__ k,
+@@ -48,19 +49,22 @@ __global__ void gdn_chunk_prepare(
+         const int64_t sv1, const int64_t sv2, const int64_t sv3,
+         const int64_t sb1, const int64_t sb2, const int64_t sb3,
+         const int64_t neqk1) {
++    const int chunk = blockIdx.y;
+     const int hs    = blockIdx.x;
+-    const int h     = (int) (hs % H);
+-    const int seq   = (int) (hs / H);
+-    const int chunk = (int) blockIdx.y;
++    const int h     = hs % H;
++    const int seq   = hs / H;
++    const int iq    = h % neqk1;
+     const int tid   = threadIdx.x;
+-    const int iq    = (int) (h % neqk1); // GQA: q/k head
+-    const int64_t hsc = (int64_t) hs * n_chunks; // per (head, seq) scratch base
+ 
+     const int t0     = chunk * GDN_CHUNK;
+     const int n_real = min((int) GDN_CHUNK, (int) n_tokens - t0);
++    const int64_t hsc = (int64_t) hs * n_chunks;
+ 
+-    __shared__ float s_attn[GDN_CHUNK][GDN_CHUNK + 1]; // padded: column reads stay conflict-free
++    __shared__ float s_attn[GDN_CHUNK][GDN_CHUNK + 1]; // padded: column reads conflict-free
++    __shared__ float s_k[GDN_CHUNK][128 + 1];          // padded row for conflict-free column reads
++    __shared__ float s_bp[GDN_CHUNK];                  // beta_j * exp(decay_j)
+     __shared__ float s_decay[GDN_CHUNK];
++    __shared__ float s_acc[16][16];                    // closure block-product accumulator
+ 
+     const float * qb = q    + (int64_t) seq * sq3 + (int64_t) iq * sq1;
+     const float * kb = k    + (int64_t) seq * sq3 + (int64_t) iq * sq1;
+@@ -86,107 +90,226 @@ __global__ void gdn_chunk_prepare(
+         }
+     }
+ 
+-    // w[i][j] = -beta_i * exp(decay_i - decay_j) * <k_i, k_j> for i > j
+-    // triangular entry index e = i(i+1)/2 + j; 2080 entries total
++    // stage k into smem; padded rows are zero (never read from the tensor)
++    {
++        for (int e = tid; e < GDN_CHUNK * (128 / 4); e += 256) {
++            const int t  = e / 32;
++            const int d4 = e % 32;
++            if (t < n_real) {
++                const float4 kv = *reinterpret_cast<const float4 *>(kb + (int64_t) (t0 + t) * sq2 + 4 * d4);
++                s_k[t][4 * d4 + 0] = kv.x;
++                s_k[t][4 * d4 + 1] = kv.y;
++                s_k[t][4 * d4 + 2] = kv.z;
++                s_k[t][4 * d4 + 3] = kv.w;
++            } else {
++                s_k[t][4 * d4 + 0] = 0.0f;
++                s_k[t][4 * d4 + 1] = 0.0f;
++                s_k[t][4 * d4 + 2] = 0.0f;
++                s_k[t][4 * d4 + 3] = 0.0f;
++            }
++        }
++        if (tid < GDN_CHUNK) {
++            s_bp[tid] = (tid < n_real) ? bb[(int64_t) (t0 + tid) * sb2] * expf(s_decay[tid]) : 0.0f;
++        }
++        __syncthreads();
++    }
++
++    // gram = k @ k^T into s_attn; one 4x4 output tile per thread
+     {
+-        for (int e = tid; e < GDN_CHUNK * (GDN_CHUNK + 1) / 2; e += 128) {
+-            const int i = (int) ((sqrtf(8.0f * e + 1.0f) - 1.0f) * 0.5f);
+-            const int j = e - i * (i + 1) / 2;
+-            const bool ok = (i < n_real) && (j < n_real) && (j < i); // strict coupling: zero diagonal
+-            const float bi = (i < n_real) ? bb[(int64_t) (t0 + i) * sb2] : 0.0f;
+-            const float Li = expf(s_decay[i] - s_decay[j]);
+-            float dot = 0.0f;
+-            if (ok) {
+-                const float * ki = kb + (int64_t) (t0 + i) * sq2;
+-                const float * kj = kb + (int64_t) (t0 + j) * sq2;
+-                for (int d = 0; d < 128; ++d) {
+-                    dot += ki[d] * kj[d];
++        const int i0 = 4 * (tid / 16);
++        const int j0 = 4 * (tid % 16);
++        float acc[4][4];
++#pragma unroll
++        for (int ii = 0; ii < 4; ++ii) {
++#pragma unroll
++            for (int jj = 0; jj < 4; ++jj) {
++                acc[ii][jj] = 0.0f;
++            }
++        }
++        for (int d = 0; d < 128; ++d) {
++            float kr[4], kc[4];
++#pragma unroll
++            for (int ii = 0; ii < 4; ++ii) {
++                kr[ii] = s_k[i0 + ii][d];
++            }
++#pragma unroll
++            for (int jj = 0; jj < 4; ++jj) {
++                kc[jj] = s_k[j0 + jj][d];
++            }
++#pragma unroll
++            for (int ii = 0; ii < 4; ++ii) {
++#pragma unroll
++                for (int jj = 0; jj < 4; ++jj) {
++                    acc[ii][jj] += kr[ii] * kc[jj];
+                 }
+             }
+-            s_attn[i][j] = ok ? (-bi * Li * dot) : 0.0f;
+         }
+-        // upper triangle stays zero (initialized by the full-coverage write below)
+-        for (int e = tid; e < GDN_CHUNK * GDN_CHUNK; e += 128) {
++#pragma unroll
++        for (int ii = 0; ii < 4; ++ii) {
++#pragma unroll
++            for (int jj = 0; jj < 4; ++jj) {
++                s_attn[i0 + ii][j0 + jj] = acc[ii][jj];
++            }
++        }
++        __syncthreads();
++    }
++
++    // w[i][j] = -beta_i * exp(decay_i - decay_j) * gram[i][j] for i > j
++    // (zero diagonal and upper triangle: the closure treats A as strictly lower)
++    {
++        for (int e = tid; e < GDN_CHUNK * (GDN_CHUNK - 1) / 2; e += 256) {
++            const int i = (int) ((sqrtf(8.0f * e + 1.0f) + 1.0f) * 0.5f);
++            const int j = e - i * (i - 1) / 2;
++            const bool ok = (i < n_real) && (j < n_real);
++            s_attn[i][j] = ok ? (-bb[(int64_t) (t0 + i) * sb2] * expf(s_decay[i] - s_decay[j]) * s_attn[i][j]) : 0.0f;
++        }
++        for (int e = tid; e < GDN_CHUNK * GDN_CHUNK; e += 256) {
+             const int i = e / GDN_CHUNK;
+             const int j = e % GDN_CHUNK;
+-            if (j > i) {
++            if (j >= i) {
+                 s_attn[i][j] = 0.0f;
+             }
+         }
++        __syncthreads();
+     }
+ 
+-    // closure: attn[i][:] += sum_{j<i} attn[i][j] * attn[j][:] (forward substitution)
+-    for (int i = 1; i < GDN_CHUNK; ++i) {
+-        __syncthreads();
+-        float acc = 0.0f;
+-        if (tid <= i) {
+-            for (int j = 0; j < i; ++j) {
+-                acc += s_attn[i][j] * s_attn[j][tid];
++    // closure: attn = (I - A)^{-1} by 16x16 block forward substitution. Exact:
++    // a 64x64 strictly-lower A has nilpotency index 64, so I+A+A^2+A^3 is NOT the
++    // inverse in general (the diagonal 16x16 blocks are themselves strictly lower).
++    //   D_r      = (I - A(r,r))^{-1}, rows i: D_r(i,:) = e_i + sum_{k<i} A(r,r)(i,k) D_r(k,:)
++    //   X(r,c)   = D_r * sum_{m=c}^{r-1} A(r,m) * X(m,c)   for c < r
++    {
++        const int r = tid / 16;
++        const int c = tid % 16;
++        // diagonal blocks: D_br over block (br,br), in place
++        for (int br = 0; br < 4; ++br) {
++            for (int i = 0; i < 16; ++i) {
++                float v = 0.0f;
++                if (r == i) {
++                    v = (c == i) ? 1.0f : 0.0f;
++                    for (int k = 0; k < i; ++k) {
++                        v += s_attn[16 * br + i][16 * br + k] * s_attn[16 * br + k][16 * br + c];
++                    }
++                }
++                __syncthreads();
++                if (r == i) {
++                    s_attn[16 * br + i][16 * br + c] = v;
++                }
++                __syncthreads();
+             }
+         }
+-        __syncthreads();
+-        if (tid <= i) {
+-            s_attn[i][tid] += acc;
++        // off-diagonal blocks: X(br,bc) = D_br * sum_{m=bc}^{br-1} A(br,m) * X(m,bc)
++        for (int br = 1; br < 4; ++br) {
++            for (int bc = 0; bc < br; ++bc) {
++                float acc = 0.0f;
++                for (int m = bc; m < br; ++m) {
++                    for (int k = 0; k < 16; ++k) {
++                        acc += s_attn[16 * br + r][16 * m + k] * s_attn[16 * m + k][16 * bc + c];
++                    }
++                }
++                s_acc[r][c] = acc;
++                __syncthreads();
++                float x = 0.0f;
++                for (int k = 0; k < 16; ++k) {
++                    x += s_attn[16 * br + r][16 * br + k] * s_acc[k][c];
++                }
++                __syncthreads();
++                s_attn[16 * br + r][16 * bc + c] = x;
++                __syncthreads();
++            }
+         }
+     }
+-    __syncthreads();
+-    if (tid < GDN_CHUNK) {
+-        s_attn[tid][tid] += 1.0f;
+-    }
+-    __syncthreads();
+ 
+-    // k_cumsum[t][v] = sum_j attn[t][j] * (v[j][v] * beta[j])
+-    // k_cumdecay[t][k] = sum_j attn[t][j] * (k[j][k] * beta[j] * P[j])
++    // k_cumsum[t][v]   = sum_j attn[t][j] * beta_j * v[j][v]
++    // k_cumdecay[t][k] = sum_j attn[t][j] * beta_j * exp(decay_j) * k[j][k]
++    // one 4x8 output tile per thread (4 token rows x 8 v/k columns)
+     {
+-        const int V = 128;
+-        for (int idx = tid; idx < GDN_CHUNK * V; idx += 128) {
+-            const int t = idx / V;
+-            const int v = idx % V;
+-            const float * at = s_attn[t];
+-            float acc_v = 0.0f;
+-            float acc_k = 0.0f;
+-            for (int j = 0; j < GDN_CHUNK; ++j) {
+-                const bool ok = j < n_real;
+-                const float bj = ok ? bb[(int64_t) (t0 + j) * sb2] : 0.0f;
+-                const float vj = ok ? vb[(int64_t) (t0 + j) * sv2 + v] : 0.0f;
+-                const float kj = ok ? kb[(int64_t) (t0 + j) * sq2 + v] : 0.0f;
+-                acc_v += at[j] * (bj * vj);
+-                acc_k += at[j] * (bj * kj * expf(s_decay[j]));
++        const int t0t = 4 * (tid / 16);
++        const int v0  = 8 * (tid % 16);
++        float accv[4][8], acck[4][8];
++#pragma unroll
++        for (int ii = 0; ii < 4; ++ii) {
++#pragma unroll
++            for (int vv = 0; vv < 8; ++vv) {
++                accv[ii][vv] = 0.0f;
++                acck[ii][vv] = 0.0f;
+             }
+-            k_cumsum[((hsc + chunk) * GDN_CHUNK + t) * V + v]   = acc_v;
+-            k_cumdecay[((hsc + chunk) * GDN_CHUNK + t) * 128 + v] = acc_k;
+         }
++        for (int j = 0; j < GDN_CHUNK; ++j) {
++            const bool okj = j < n_real;
++            const float bj  = okj ? bb[(int64_t) (t0 + j) * sb2] : 0.0f;
++            const float bpj = okj ? s_bp[j] : 0.0f;
++            const float * vj = vb + (int64_t) (t0 + j) * sv2 + v0;
++#pragma unroll
++            for (int ii = 0; ii < 4; ++ii) {
++                const float a = s_attn[t0t + ii][j];
++#pragma unroll
++                for (int vv = 0; vv < 8; ++vv) {
++                    const float vval = okj ? vj[vv] : 0.0f;
++                    accv[ii][vv] += a * (bj * vval);
++                    acck[ii][vv] += a * (bpj * s_k[j][v0 + vv]);
++                }
++            }
++        }
++        float * kc = k_cumsum   + ((hsc + chunk) * GDN_CHUNK + t0t) * 128 + v0;
++        float * kd = k_cumdecay + ((hsc + chunk) * GDN_CHUNK + t0t) * 128 + v0;
++#pragma unroll
++        for (int ii = 0; ii < 4; ++ii) {
++#pragma unroll
++            for (int vv = 0; vv < 8; ++vv) {
++                kc[ii * 128 + vv] = accv[ii][vv];
++                kd[ii * 128 + vv] = acck[ii][vv];
++            }
++        }
++        __syncthreads();
+     }
+ 
+-    // attn_causal[i][j] = (P_i / P_j) * <q_i, k_j> for i >= j (reuse s_attn)
+-    __syncthreads();
++    // attn_causal = L .* (q @ k^T), reusing s_attn (strictly causal: j <= i)
+     {
+-        for (int e = tid; e < GDN_CHUNK * (GDN_CHUNK + 1) / 2; e += 128) {
+-            const int i = (int) ((sqrtf(8.0f * e + 1.0f) - 1.0f) * 0.5f);
+-            const int j = e - i * (i + 1) / 2;
+-            const bool ok = (i < n_real) && (j < n_real);
+-            const float Li = expf(s_decay[i] - s_decay[j]);
+-            float dot = 0.0f;
+-            if (ok) {
+-                const float * qi = qb + (int64_t) (t0 + i) * sq2;
+-                const float * kj = kb + (int64_t) (t0 + j) * sq2;
+-                for (int d = 0; d < 128; ++d) {
+-                    dot += qi[d] * kj[d];
++        const int i0 = 4 * (tid / 16);
++        const int j0 = 4 * (tid % 16);
++        float acc[4][4];
++#pragma unroll
++        for (int ii = 0; ii < 4; ++ii) {
++#pragma unroll
++            for (int jj = 0; jj < 4; ++jj) {
++                acc[ii][jj] = 0.0f;
++            }
++        }
++        const float * qr0 = qb + (int64_t) (t0 + i0) * sq2;
++        for (int d = 0; d < 128; ++d) {
++            float qv[4], kv[4];
++#pragma unroll
++            for (int ii = 0; ii < 4; ++ii) {
++                qv[ii] = (i0 + ii < n_real) ? qr0[ii * sq2 + d] : 0.0f;
++            }
++#pragma unroll
++            for (int jj = 0; jj < 4; ++jj) {
++                kv[jj] = s_k[j0 + jj][d];
++            }
++#pragma unroll
++            for (int ii = 0; ii < 4; ++ii) {
++#pragma unroll
++                for (int jj = 0; jj < 4; ++jj) {
++                    acc[ii][jj] += qv[ii] * kv[jj];
+                 }
+             }
+-            s_attn[i][j] = ok ? (Li * dot) : 0.0f;
+         }
+-        for (int e = tid; e < GDN_CHUNK * GDN_CHUNK; e += 128) {
+-            const int i = e / GDN_CHUNK;
+-            const int j = e % GDN_CHUNK;
+-            if (j > i) {
+-                s_attn[i][j] = 0.0f;
++#pragma unroll
++        for (int ii = 0; ii < 4; ++ii) {
++#pragma unroll
++            for (int jj = 0; jj < 4; ++jj) {
++                const int i = i0 + ii;
++                const int j = j0 + jj;
++                const float L = (j <= i && i < n_real) ? expf(s_decay[i] - s_decay[j]) : 0.0f;
++                s_attn[i][j] = L * acc[ii][jj];
+             }
+         }
+         __syncthreads();
+-        for (int e = tid; e < GDN_CHUNK * GDN_CHUNK; e += 128) {
+-            attn_causal[((hsc + chunk) * GDN_CHUNK + e / GDN_CHUNK) * GDN_CHUNK + e % GDN_CHUNK] =
+-                s_attn[e / GDN_CHUNK][e % GDN_CHUNK];
++        for (int e = tid; e < GDN_CHUNK * GDN_CHUNK; e += 256) {
++            const int i = e / GDN_CHUNK;
++            const int j = e % GDN_CHUNK;
++            attn_causal[((hsc + chunk) * GDN_CHUNK + i) * GDN_CHUNK + j] = s_attn[i][j];
+         }
+     }
+ 
+@@ -197,7 +320,7 @@ __global__ void gdn_chunk_prepare(
+         if (tid == 0) {
+             P_last_scratch[hsc + chunk] = expf(d_last);
+         }
+-        for (int t = tid; t < GDN_CHUNK; t += 128) {
++        for (int t = tid; t < GDN_CHUNK; t += 256) {
+             delta_scratch[(hsc + chunk) * GDN_CHUNK + t] = expf(d_last - s_decay[t]);
+         }
+     }
+@@ -493,12 +616,11 @@ static void launch_gated_delta_net(
+         float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
+     // chunked path: prefill only, scalar gates, K=1, K=V=128. For K=1 the state
+     // write layout is the same whether the gdn->cpy fusion fired (slot_stride 0)
+-    // or not (slot_stride = S_v*S_v*H*n_seqs).
+-    // Correct and test-validated but currently slower than the sequential kernel
+-    // (naive phase-A matmuls); opt-in until the matmuls are tiled.
++    // or not (slot_stride = S_v*S_v*H*n_seqs). Default; the sequential kernel
++    // stays for decode (n_tokens=1), KDA and keep_rs_t.
+     static const bool gdn_chunked_enabled = []() {
+         const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
+-        return env != nullptr && std::atoi(env) != 0;
++        return env == nullptr || std::atoi(env) != 0;
+     }();
+     if (gdn_chunked_enabled && !KDA && !keep_rs_t && S_v == 128 && n_tokens > 1 &&
+         (state_slot_stride == 0 || state_slot_stride == S_v * S_v * H * n_seqs)) {
+@@ -518,7 +640,7 @@ static void launch_gated_delta_net(
+         float * P_last_scratch = delta_scratch + H * n_seqs * n_chunks * GDN_CHUNK;
+         {
+             const dim3 grid_a(H * n_seqs, n_chunks, 1);
+-            const dim3 block_a(128, 1, 1);
++            const dim3 block_a(256, 1, 1);
+             const ggml_cuda_kernel_launch_params lp_a(grid_a, block_a, 0, stream);
+             ggml_cuda_kernel_launch(gdn_chunk_prepare, lp_a,
+                 q_d, k_d, v_d, g_d, b_d,
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 99eb62174..a0a3a87b8 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9683,6 +9683,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 127, 1));  // chunked prefill PP-127 (tail)
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1));  // chunked prefill PP-256
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));   // chunked prefill PP-512 4 heads
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 2));   // chunked multi-seq
++    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 4));  // chunked multi-seq PP-512
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
+     // KDA (vector gate)
+-- 
+2.55.0
+

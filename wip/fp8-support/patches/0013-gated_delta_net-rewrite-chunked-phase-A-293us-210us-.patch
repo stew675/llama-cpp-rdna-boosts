@@ -1,0 +1,371 @@
+From a921f8fb03fc970bc657fe60dbd0d7d71df8a66e Mon Sep 17 00:00:00 2001
+From: Stew Forster <stew675@gmail.com>
+Date: Thu, 6 Aug 2026 13:04:05 -0500
+Subject: [PATCH 13/23] gated_delta_net : rewrite chunked phase A, 293us ->
+ 210us per launch
+
+The phase A kernel (gdn_chunk_prepare) was latency-bound: ~165 dynamic
+barriers and 512 scalar global loads per thread in the k_cumsum and
+attn_causal stages.
+
+- closure: 16x16-block forward substitution (146 syncs) replaced by an
+  exact 4x4-blocked substitution over the whole 64x64 (16 syncs). The
+  4x4 diagonal blocks have nilpotency index 4, so D(i,i) = I + A + A^2 +
+  A^3 is exact; the off-diagonal blocks D(i,j) = D(i,i) @ (A(i,j) D(j,j)
+  + sum A(i,k) D(k,j)) follow in row passes. A(i,k) is read from a
+  preserved smem copy (s_A, packed strictly-lower) because the in-place
+  row-pass writes would clobber it. Level 0 solves the 4x4 blocks in
+  registers via shuffles.
+- decay cumsum: Hillis-Steele (13 syncs) replaced by a warp-shuffle scan
+  (2 syncs); the chunk's k rows are prefetched into registers during it.
+- k_cumsum/k_cumdecay and attn_causal: v[j][v0..v0+7] and q rows are read
+  as float4 (falling back to scalars when the stride/base is unaligned),
+  cutting 512 scalar global loads per thread to 128.
+
+47/47 GATED_DELTA_NET tests, PPL 6.2677 (within error bars of 6.2426),
+generation matches. Phase A 276.5 -> ~210 us/launch (6.63 -> ~5.1 ms per
+pp512); bench noise makes the pp512 delta hard to pin, expected +2%.
+
+Assisted-by: Claude Sonnet
+---
+ ggml/src/ggml-cuda/gated_delta_net.cu | 262 ++++++++++++++++++--------
+ 1 file changed, 180 insertions(+), 82 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index a1a820802..de8a1f9cc 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -64,7 +64,7 @@ __global__ void gdn_chunk_prepare(
+     __shared__ float s_k[GDN_CHUNK][128 + 1];          // padded row for conflict-free column reads
+     __shared__ float s_bp[GDN_CHUNK];                  // beta_j * exp(decay_j)
+     __shared__ float s_decay[GDN_CHUNK];
+-    __shared__ float s_acc[16][16];                    // closure block-product accumulator
++    __shared__ float s_A[GDN_CHUNK * (GDN_CHUNK - 1) / 2]; // preserved strictly-lower A for the closure
+ 
+     const float * qb = q    + (int64_t) seq * sq3 + (int64_t) iq * sq1;
+     const float * kb = k    + (int64_t) seq * sq3 + (int64_t) iq * sq1;
+@@ -72,41 +72,57 @@ __global__ void gdn_chunk_prepare(
+     const float * gb = gate + (int64_t) seq * sb3 + (int64_t) h  * sb1;
+     const float * bb = beta + (int64_t) seq * sb3 + (int64_t) h  * sb1;
+ 
++    // prefetch the chunk's k rows into registers: the L2 latency of the staging
++    // loads overlaps the decay scan below (the phases read disjoint inputs)
++    float4 kpre[8];
++#pragma unroll
++    for (int it = 0; it < 8; ++it) {
++        const int e  = tid + it * 256;
++        const int t  = e / 32;
++        const int d4 = e % 32;
++        kpre[it] = (t < n_real)
++            ? *reinterpret_cast<const float4 *>(kb + (int64_t) (t0 + t) * sq2 + 4 * d4)
++            : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++    }
++
+     // per-chunk prefix sums of the log-gates; decay factors are always taken
+     // as exp(diff) so strong decay (cumsum < -88) underflows to 0 instead of
+-    // producing 0/0 NaN. Padded gates are 0.
++    // producing 0/0 NaN. Padded gates are 0. Warp-shuffle scan (2 syncs):
++    // warps 0 and 1 scan their 32 elements, then warp 1 adds warp 0's total.
+     {
+-        const float gv = (tid < n_real) ? gb[(int64_t) (t0 + tid) * sb2] : 0.0f;
+-        s_decay[tid] = gv;
++        float v = (tid < n_real) ? gb[(int64_t) (t0 + tid) * sb2] : 0.0f;
++#pragma unroll
++        for (int o = 1; o < 32; o <<= 1) {
++            const float up = __shfl_up_sync(0xffffffff, v, o, 32);
++            if (tid % 32 >= o) {
++                v += up;
++            }
++        }
++        if (tid == 31) {
++            s_decay[31] = v; // warp 0 total, needed by warp 1's fixup
++        }
+         __syncthreads();
+-        for (int s = 1; s < GDN_CHUNK; s <<= 1) {
+-            const float d = (tid >= s) ? s_decay[tid - s] : 0.0f;
+-            __syncthreads();
+-            s_decay[tid] += d;
+-            __syncthreads();
++        if (tid >= 32 && tid < GDN_CHUNK) {
++            v += s_decay[31];
+         }
+         if (tid < GDN_CHUNK) {
+-            decay_scratch[(hsc + chunk) * GDN_CHUNK + tid] = s_decay[tid];
++            s_decay[tid] = v;
++            decay_scratch[(hsc + chunk) * GDN_CHUNK + tid] = v;
+         }
++        __syncthreads();
+     }
+ 
+-    // stage k into smem; padded rows are zero (never read from the tensor)
++    // stage k into smem from the prefetched registers; padded rows are zero
+     {
+-        for (int e = tid; e < GDN_CHUNK * (128 / 4); e += 256) {
++#pragma unroll
++        for (int it = 0; it < 8; ++it) {
++            const int e  = tid + it * 256;
+             const int t  = e / 32;
+             const int d4 = e % 32;
+-            if (t < n_real) {
+-                const float4 kv = *reinterpret_cast<const float4 *>(kb + (int64_t) (t0 + t) * sq2 + 4 * d4);
+-                s_k[t][4 * d4 + 0] = kv.x;
+-                s_k[t][4 * d4 + 1] = kv.y;
+-                s_k[t][4 * d4 + 2] = kv.z;
+-                s_k[t][4 * d4 + 3] = kv.w;
+-            } else {
+-                s_k[t][4 * d4 + 0] = 0.0f;
+-                s_k[t][4 * d4 + 1] = 0.0f;
+-                s_k[t][4 * d4 + 2] = 0.0f;
+-                s_k[t][4 * d4 + 3] = 0.0f;
+-            }
++            s_k[t][4 * d4 + 0] = kpre[it].x;
++            s_k[t][4 * d4 + 1] = kpre[it].y;
++            s_k[t][4 * d4 + 2] = kpre[it].z;
++            s_k[t][4 * d4 + 3] = kpre[it].w;
+         }
+         if (tid < GDN_CHUNK) {
+             s_bp[tid] = (tid < n_real) ? bb[(int64_t) (t0 + tid) * sb2] * expf(s_decay[tid]) : 0.0f;
+@@ -161,7 +177,9 @@ __global__ void gdn_chunk_prepare(
+             const int i = (int) ((sqrtf(8.0f * e + 1.0f) + 1.0f) * 0.5f);
+             const int j = e - i * (i - 1) / 2;
+             const bool ok = (i < n_real) && (j < n_real);
+-            s_attn[i][j] = ok ? (-bb[(int64_t) (t0 + i) * sb2] * expf(s_decay[i] - s_decay[j]) * s_attn[i][j]) : 0.0f;
++            const float w = ok ? (-bb[(int64_t) (t0 + i) * sb2] * expf(s_decay[i] - s_decay[j]) * s_attn[i][j]) : 0.0f;
++            s_attn[i][j] = w;
++            s_A[e] = w; // preserved strictly-lower A (row-major packed) for the closure
+         }
+         for (int e = tid; e < GDN_CHUNK * GDN_CHUNK; e += 256) {
+             const int i = e / GDN_CHUNK;
+@@ -173,50 +191,75 @@ __global__ void gdn_chunk_prepare(
+         __syncthreads();
+     }
+ 
+-    // closure: attn = (I - A)^{-1} by 16x16 block forward substitution. Exact:
+-    // a 64x64 strictly-lower A has nilpotency index 64, so I+A+A^2+A^3 is NOT the
+-    // inverse in general (the diagonal 16x16 blocks are themselves strictly lower).
+-    //   D_r      = (I - A(r,r))^{-1}, rows i: D_r(i,:) = e_i + sum_{k<i} A(r,r)(i,k) D_r(k,:)
+-    //   X(r,c)   = D_r * sum_{m=c}^{r-1} A(r,m) * X(m,c)   for c < r
++    // closure: attn = (I-A)^{-1} by 4x4-blocked forward substitution. Exact: a
++    // 4x4 strictly-lower block has nilpotency index 4, so the diagonal blocks
++    // D(i,i) = I + Aii + Aii^2 + Aii^3 are exact; the off-diagonal blocks follow
++    // D(i,j) = D(i,i) @ (A(i,j) D(j,j) + sum_{j<k<i} A(i,k) D(k,j)) in row passes.
++    // The row passes read A(i,k) from the preserved s_A copy: the in-place writes
++    // of D(i,k) would otherwise clobber them. 16 syncs total (vs 146 before).
+     {
+-        const int r = tid / 16;
+-        const int c = tid % 16;
+-        // diagonal blocks: D_br over block (br,br), in place
+-        for (int br = 0; br < 4; ++br) {
+-            for (int i = 0; i < 16; ++i) {
+-                float v = 0.0f;
+-                if (r == i) {
+-                    v = (c == i) ? 1.0f : 0.0f;
+-                    for (int k = 0; k < i; ++k) {
+-                        v += s_attn[16 * br + i][16 * br + k] * s_attn[16 * br + k][16 * br + c];
+-                    }
++        // level 0: diagonal blocks D(i,i), one 4x4 block per 16 threads
++        {
++            const int b    = tid / 16;               // diagonal block 0..15
++            const int r    = (tid % 16) / 4;
++            const int c    = tid % 4;
++            const int base = 16 * ((tid % 32) / 16); // first lane of this block
++            // row substitution D(rr,:) = e_rr + sum_{k<rr} A(rr,k) D(k,:); rows are
++            // processed in order, D(k,c) broadcast from lane (4k+c), no smem round
++            // trip inside the 4x4 solve
++            float v = 0.0f;
++#pragma unroll
++            for (int rr = 0; rr < 4; ++rr) {
++                const float a = s_attn[4 * b + r][4 * b + rr]; // A(r,rr), strictly lower
++                if (rr == r) {
++                    v += (rr == c) ? 1.0f : 0.0f;
+                 }
+-                __syncthreads();
+-                if (r == i) {
+-                    s_attn[16 * br + i][16 * br + c] = v;
++                const float dk = __shfl_sync(0xffffffff, v, base + 4 * rr + c, 32);
++                if (rr < r) {
++                    v += a * dk;
+                 }
+-                __syncthreads();
+             }
++            s_attn[4 * b + r][4 * b + c] = v;
+         }
+-        // off-diagonal blocks: X(br,bc) = D_br * sum_{m=bc}^{br-1} A(br,m) * X(m,bc)
+-        for (int br = 1; br < 4; ++br) {
+-            for (int bc = 0; bc < br; ++bc) {
+-                float acc = 0.0f;
+-                for (int m = bc; m < br; ++m) {
+-                    for (int k = 0; k < 16; ++k) {
+-                        acc += s_attn[16 * br + r][16 * m + k] * s_attn[16 * m + k][16 * bc + c];
++        __syncthreads();
++
++        // row passes i = 1..15: D(i,j) for j = 0..i-1, one 4x4 block per 16 threads
++        for (int i = 1; i < 16; ++i) {
++            if (tid / 16 < i) {
++                const int blk = tid / 16;            // j
++                const int r   = (tid % 16) / 4;
++                const int c   = tid % 4;
++                // X[l][c] = sum_{k=j}^{i-1} sum_m A(i,k)[l][m] D(k,j)[m][c]
++                float X[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
++                int rowoff[4];
++#pragma unroll
++                for (int l = 0; l < 4; ++l) {
++                    const int row = 4 * i + l;
++                    rowoff[l] = row * (row - 1) / 2; // packed strictly-lower offset
++                }
++                for (int k = blk; k < i; ++k) {
++                    const float dk0 = s_attn[4 * k + 0][4 * blk + c];
++                    const float dk1 = s_attn[4 * k + 1][4 * blk + c];
++                    const float dk2 = s_attn[4 * k + 2][4 * blk + c];
++                    const float dk3 = s_attn[4 * k + 3][4 * blk + c];
++                    const int acol = 4 * k;
++#pragma unroll
++                    for (int l = 0; l < 4; ++l) {
++                        X[l] += s_A[rowoff[l] + acol + 0] * dk0;
++                        X[l] += s_A[rowoff[l] + acol + 1] * dk1;
++                        X[l] += s_A[rowoff[l] + acol + 2] * dk2;
++                        X[l] += s_A[rowoff[l] + acol + 3] * dk3;
+                     }
+                 }
+-                s_acc[r][c] = acc;
+-                __syncthreads();
+-                float x = 0.0f;
+-                for (int k = 0; k < 16; ++k) {
+-                    x += s_attn[16 * br + r][16 * br + k] * s_acc[k][c];
++                // D(i,j)[r][c] = sum_l D(i,i)[r][l] X[l][c]
++                float d = 0.0f;
++#pragma unroll
++                for (int l = 0; l < 4; ++l) {
++                    d += s_attn[4 * i + r][4 * i + l] * X[l];
+                 }
+-                __syncthreads();
+-                s_attn[16 * br + r][16 * bc + c] = x;
+-                __syncthreads();
++                s_attn[4 * i + r][4 * blk + c] = d;
+             }
++            __syncthreads();
+         }
+     }
+ 
+@@ -235,19 +278,43 @@ __global__ void gdn_chunk_prepare(
+                 acck[ii][vv] = 0.0f;
+             }
+         }
+-        for (int j = 0; j < GDN_CHUNK; ++j) {
+-            const bool okj = j < n_real;
+-            const float bj  = okj ? bb[(int64_t) (t0 + j) * sb2] : 0.0f;
+-            const float bpj = okj ? s_bp[j] : 0.0f;
+-            const float * vj = vb + (int64_t) (t0 + j) * sv2 + v0;
+-#pragma unroll
+-            for (int ii = 0; ii < 4; ++ii) {
+-                const float a = s_attn[t0t + ii][j];
+-#pragma unroll
+-                for (int vv = 0; vv < 8; ++vv) {
+-                    const float vval = okj ? vj[vv] : 0.0f;
+-                    accv[ii][vv] += a * (bj * vval);
+-                    acck[ii][vv] += a * (bpj * s_k[j][v0 + vv]);
++        // v[j][v0..v0+7] is 8-consecutive floats per row; load it as 2 float4
++        // when the row stride and base pointer are 16-B aligned (the model's v
++        // layout is [V][T][H] so sv2 = V*H), else fall back to scalars
++        if (((sv2 & 3) == 0) && (((uintptr_t) vb) & 15) == 0) {
++            for (int j = 0; j < GDN_CHUNK; ++j) {
++                const bool okj = j < n_real;
++                const float bj  = okj ? bb[(int64_t) (t0 + j) * sb2] : 0.0f;
++                const float bpj = okj ? s_bp[j] : 0.0f;
++                const float * vj = vb + (int64_t) (t0 + j) * sv2 + v0;
++                const float4 v4a = okj ? *reinterpret_cast<const float4 *>(vj)     : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++                const float4 v4b = okj ? *reinterpret_cast<const float4 *>(vj + 4) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++                const float vval[8] = { v4a.x, v4a.y, v4a.z, v4a.w, v4b.x, v4b.y, v4b.z, v4b.w };
++#pragma unroll
++                for (int ii = 0; ii < 4; ++ii) {
++                    const float a = s_attn[t0t + ii][j];
++#pragma unroll
++                    for (int vv = 0; vv < 8; ++vv) {
++                        accv[ii][vv] += a * (bj * vval[vv]);
++                        acck[ii][vv] += a * (bpj * s_k[j][v0 + vv]);
++                    }
++                }
++            }
++        } else {
++            for (int j = 0; j < GDN_CHUNK; ++j) {
++                const bool okj = j < n_real;
++                const float bj  = okj ? bb[(int64_t) (t0 + j) * sb2] : 0.0f;
++                const float bpj = okj ? s_bp[j] : 0.0f;
++                const float * vj = vb + (int64_t) (t0 + j) * sv2 + v0;
++#pragma unroll
++                for (int ii = 0; ii < 4; ++ii) {
++                    const float a = s_attn[t0t + ii][j];
++#pragma unroll
++                    for (int vv = 0; vv < 8; ++vv) {
++                        const float vval = okj ? vj[vv] : 0.0f;
++                        accv[ii][vv] += a * (bj * vval);
++                        acck[ii][vv] += a * (bpj * s_k[j][v0 + vv]);
++                    }
+                 }
+             }
+         }
+@@ -277,21 +344,52 @@ __global__ void gdn_chunk_prepare(
+             }
+         }
+         const float * qr0 = qb + (int64_t) (t0 + i0) * sq2;
+-        for (int d = 0; d < 128; ++d) {
+-            float qv[4], kv[4];
++        // q rows are sq2-strided, but consecutive along d: 4-wide unroll with
++        // float4 loads when the row stride and base pointer are 16-B aligned
++        if (((sq2 & 3) == 0) && (((uintptr_t) qb) & 15) == 0) {
++            for (int d4 = 0; d4 < 32; ++d4) {
++                const int d = 4 * d4;
++                float4 qv4[4];
++                float kv[4][4];
++#pragma unroll
++                for (int ii = 0; ii < 4; ++ii) {
++                    qv4[ii] = (i0 + ii < n_real)
++                        ? *reinterpret_cast<const float4 *>(qr0 + ii * sq2 + d)
++                        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++                }
+ #pragma unroll
+-            for (int ii = 0; ii < 4; ++ii) {
+-                qv[ii] = (i0 + ii < n_real) ? qr0[ii * sq2 + d] : 0.0f;
+-            }
++                for (int jj = 0; jj < 4; ++jj) {
++                    kv[jj][0] = s_k[j0 + jj][d + 0];
++                    kv[jj][1] = s_k[j0 + jj][d + 1];
++                    kv[jj][2] = s_k[j0 + jj][d + 2];
++                    kv[jj][3] = s_k[j0 + jj][d + 3];
++                }
+ #pragma unroll
+-            for (int jj = 0; jj < 4; ++jj) {
+-                kv[jj] = s_k[j0 + jj][d];
++                for (int ii = 0; ii < 4; ++ii) {
++#pragma unroll
++                    for (int jj = 0; jj < 4; ++jj) {
++                        acc[ii][jj] += qv4[ii].x * kv[jj][0] + qv4[ii].y * kv[jj][1]
++                                     + qv4[ii].z * kv[jj][2] + qv4[ii].w * kv[jj][3];
++                    }
++                }
+             }
++        } else {
++            for (int d = 0; d < 128; ++d) {
++                float qv[4], kv[4];
+ #pragma unroll
+-            for (int ii = 0; ii < 4; ++ii) {
++                for (int ii = 0; ii < 4; ++ii) {
++                    qv[ii] = (i0 + ii < n_real) ? qr0[ii * sq2 + d] : 0.0f;
++                }
+ #pragma unroll
+                 for (int jj = 0; jj < 4; ++jj) {
+-                    acc[ii][jj] += qv[ii] * kv[jj];
++                    kv[jj] = s_k[j0 + jj][d];
++                }
++#pragma unroll
++                for (int ii = 0; ii < 4; ++ii) {
++#pragma unroll
++                    for (int jj = 0; jj < 4; ++jj) {
++                        acc[ii][jj] += qv[ii] * kv[jj];
++                    }
+                 }
+             }
+         }
+-- 
+2.55.0
+
