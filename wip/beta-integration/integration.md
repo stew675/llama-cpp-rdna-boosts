@@ -39,7 +39,7 @@ docs sweep and the maintainer's promotion decision.
   * `~/bin/build-llama-rocm-714` (gfx1201, `BUILD_DIR=build-rocm`) **EXIT 0**; `llama-cli`,
     `llama-bench`, `test-backend-ops` present.
 * **Delivered on this branch:** regenerated `patches/` (16), `rdna-boosts-all.patch`, `release.json`
-  (`tip f373450de…`, `tree 24bb0f5acb…`, `release v16-84e76d8a2-r8-integrated`).
+  (`tip f373450de…`, `tree 24bb0f5acb…`, `release v16-84e76d8a2-r8`).
 * **Done since:** the top-level `README.md` now describes the folded state (intro, block table,
   0006/0008/0015 rows, the "The mmb campaign is in the delivery" section replacing the old beta
   addendum, Layout, Releases, Current state).

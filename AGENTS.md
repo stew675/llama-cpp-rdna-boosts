@@ -3,11 +3,10 @@
 This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
-> **`beta-integration` branch (2026-09-25): the 28 `beta/mmb-general` patches are folded into the
-> 16 delivery blocks.**  On that branch `patches/*` alone reproduce the full campaign tree
-> `24bb0f5acb…` (release candidate `v16-84e76d8a2-r8-integrated`); `beta/mmb-general/` is retained
-> only as the historical verification record and the `apply-beta.sh` helper has been removed.  The
-> `main` branch still carries the un-integrated r7 delivery + the separate beta set.  The working
+> **In `main` since 2026-09-25 (release `v16-84e76d8a2-r8`, promoted from `beta-integration`): the
+> 28 `beta/mmb-general` patches are folded into the 16 delivery blocks.**  `patches/*` alone
+> reproduce the full campaign tree `24bb0f5acb…`; `beta/mmb-general/` is retained only as the
+> historical verification record and the `apply-beta.sh` helper has been removed.  The working
 > plan, per-patch mapping and validation record are in `wip/beta-integration/integration.md`.
 
 ## What this repo is
@@ -530,7 +529,7 @@ explicitly requests it.**
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `prompts/` | versioned, hash-stable test prompts for the decode/MTP/coherence gates; each prompt's size + token count + **sha256** is recorded in `prompts/README.md`, and a shipped prompt is **never edited in place** (add a new file).  A reported throughput/acceptance/purity result is only valid against the prompt hash it names |
 | `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live/unpromoted work (currently `wip/nwarps/` — the per-M `nwarps` impurity — plus `wip/bf16-native-prefill/`, `wip/q8-prefill-tuning/`, `wip/build-time-regression/` and the other live trees); completed trees are archived under `archive/work/` (see the WIP rule below) |
-| `beta/` | **historical campaign record** — holds **`beta/mmb-general/`** (the `mmb`/`qsa3`/indexer campaign, promoted 2026-09-21 and consolidated with the `closing-the-gap` campaign 2026-09-25).  It is **no longer applied separately**: the 28 patches are folded into the 16 delivery blocks on the `beta-integration` branch, so `patches/*` alone reproduce the campaign tree `24bb0f5acb…`, and `apply-beta.sh` was removed.  Kept for the campaign's verification record (`BETA-TESTING.md`, the gfx1201/gfx1100 measurement records).  Previously staged campaigns were promoted and archived (`archive/work/block-15-campaign-wins/` = block 15, `archive/work/tensor-fit-fix/` = the r12 `--fit` for `-sm tensor` amendment, and the qwen4exp support = block 14).  See the WIP rule below |
+| `beta/` | **historical campaign record** — holds **`beta/mmb-general/`** (the `mmb`/`qsa3`/indexer campaign, promoted 2026-09-21 and consolidated with the `closing-the-gap` campaign 2026-09-25).  It is **no longer applied separately**: the 28 patches are folded into the 16 delivery blocks (in `main` since release `v16-84e76d8a2-r8`), so `patches/*` alone reproduce the campaign tree `24bb0f5acb…`, and `apply-beta.sh` was removed.  Kept for the campaign's verification record (`BETA-TESTING.md`, the gfx1201/gfx1100 measurement records).  Previously staged campaigns were promoted and archived (`archive/work/block-15-campaign-wins/` = block 15, `archive/work/tensor-fit-fix/` = the r12 `--fit` for `-sm tensor` amendment, and the qwen4exp support = block 14).  See the WIP rule below |
 | `upstream/` | **upstream-PR candidates** — self-contained changes that could be filed against unadulterated `ggml-org/llama.cpp` master, each with a `UPSTREAM-PR-*.md` note + `.patch` (see its README for the double-apply caution and the status table) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
 | `archive/work/` | closed experiments, preserved for future re-evaluation (includes the completed `wip/` trees archived 2026-09-12) |
@@ -880,17 +879,16 @@ full set is ~1136 t/s (**+36 %**), and the first `hc_combine_norm` win was left 
   `archive/work/`; `wip/` now holds the live trees (`nwarps/`, `bf16-native-prefill/`,
   `q8-prefill-tuning/`, `build-time-regression/`, the campaign handoffs, and `beta-integration/`).)
 - **Promotion rule (the sanctioned way out of `wip/`):** a campaign's
-- **`beta-integration` branch (2026-09-25) — the campaign is folded into the delivery.**  The
+- **The campaign is folded into the delivery (`main`, release `v16-84e76d8a2-r8`, 2026-09-25).**  The
   `mmb`/`qsa3`/indexer campaign (formerly `beta/mmb-general/`, 28 patches) was folded into the 16
   delivery blocks: apply `patches/*` alone to `84e76d8a2` and you get the campaign tree
-  `24bb0f5acb…` (release candidate `v16-84e76d8a2-r8-integrated`, canonical tip `f373450de…`).
+  `24bb0f5acb…` (release `v16-84e76d8a2-r8`, canonical tip `f373450de…`).
   `beta/mmb-general/` stays as the historical verification record (`BETA-TESTING.md`, the
   gfx1201/gfx1100 records); `apply-beta.sh` was removed.  The fold's mapping is in
-  `wip/beta-integration/integration.md`.  `main` still carries r7 + the separate beta set until the
-  maintainer promotes the branch.  The **`wip/nwarps/`** tree is the one piece deliberately left
-  behind (default-OFF, breaks `W=1..8` width purity — the open impurity to investigate).  Everything
-  unpromoted stays on a branch and is committed **there, never to `main`**; `main` is only advanced
-  when the maintainer calls a promotion or a rebase.
+  `wip/beta-integration/integration.md`.  The **`wip/nwarps/`** tree is the one piece deliberately
+  left behind (default-OFF, breaks `W=1..8` width purity — the open impurity to investigate).
+  Everything unpromoted stays on a branch and is committed **there, never to `main`**; `main` is only
+  advanced when the maintainer calls a promotion or a rebase.
 - **Promotion rule (the sanctioned way out of `wip/`):** a campaign's
   *validated* wins are collected under `beta/` (for the memory campaign:
   `archive/work/block-15-campaign-wins/`), each win gets an environment kill-switch so

@@ -3,14 +3,14 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**On the `beta-integration` branch (2026-09-25) the 28 `beta/mmb-general` patches are folded into
-these 16 blocks**: applying `patches/*` alone to `84e76d8a2` now reproduces the campaign tree
-**`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (release candidate `v16-84e76d8a2-r8-integrated`,
+**Since release `v16-84e76d8a2-r8` (2026-09-25, in `main`) the 28 `beta/mmb-general` patches are
+folded into these 16 blocks**: applying `patches/*` alone to `84e76d8a2` now reproduces the campaign
+tree **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (release `v16-84e76d8a2-r8`,
 canonical tip `f373450de489dd0fafba5bd285e71844109cd0ec`).  See the dedicated section below.
-`main` still carries the un-integrated r7 set.  `beta/mmb-general/` is now only the historical
-verification record and `scripts/apply-beta.sh` has been removed.
+`beta/mmb-general/` is now only the historical verification record and `scripts/apply-beta.sh` has
+been removed.
 
-**`main` release: `v16-84e76d8a2-r7`** — canonical (rebased) tip
+**Previous release: `v16-84e76d8a2-r7`** — canonical (rebased) tip
 `596a22dbfbde571728e93acf986a02200aaf46ee`, tree
 `7726e514284ea7393bb9097ce305dc5b6dacdb11`.  Strict 16/16 `git am`; clean build.  **r7
 (2026-09-25) fixes a block-14 cross-GPU scheduler race under `-sm tensor`**: the multi-device guard in
@@ -199,7 +199,7 @@ The amendment history below is newest first.  Per-block content lives in the blo
 The former opt-in 28-patch `beta/mmb-general/` set is **absorbed into the delivery blocks** on the
 `beta-integration` branch, so there is no second apply step any more: a fresh `84e76d8a2` + the 16
 patches reproduces the full campaign tree **`24bb0f5acb…`** (canonical tip `f373450de…`, release
-candidate `v16-84e76d8a2-r8-integrated`; strict `git am` 16/16, `scripts/validate-set.sh` PASS,
+candidate `v16-84e76d8a2-r8`; strict `git am` 16/16, `scripts/validate-set.sh` PASS,
 gfx1201 build clean).  Nothing in the campaign was changed - only its packaging.
 
 Fold mapping (the beta patch numbers are `beta/mmb-general/patches/00NN`; the dependency-clean

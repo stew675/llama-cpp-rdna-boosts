@@ -1,11 +1,30 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-25 (r8) — the folded `mmb`/QSA campaign is promoted to `main`
+
+**Promotion.**  `beta-integration` was merged into `main` (merge commit) and cut as release
+**`v16-84e76d8a2-r8`**.  The rename from the branch's working label `…-r8-integrated` to the release
+tag `v16-84e76d8a2-r8` is forced by CI: `.github/workflows/docker-ghcr.yml` requires a tag of the
+form `v16-<base>-r<N>` and refuses anything else, so the annotated tag is `v16-84e76d8a2-r8`.
+`main` now carries the same canonical 16-block chain (tip `f373450de…`, tree `24bb0f5acb…`) the
+branch was validated at; the "integrated" distinction is historical only.
+
+**Gate.**  `scripts/validate-set.sh` reran green on the promoted tree (checksums + strict 16/16
+`git am` + applied tree == `24bb0f5acb…`).  No patch body changed — every artifact sha256 is
+unchanged from the branch, only `release.json.release` and the docs moved.  Docs swept to the
+promoted state (`README.md`, `AGENTS.md`, `BASELINE.md`, `MANIFESTS.md`, `TODO.md`,
+`patches/README.md`): the current-state headers now name `main` / `v16-84e76d8a2-r8` instead of the
+`beta-integration` branch / release candidate.
+
+**Next.**  Pushing `main` and the `v16-84e76d8a2-r8` tag triggers the full ROCm release pipeline
+(GHCR images for ROCm 7.2/7.14/10.0 + the GitHub Release with the packaged patch set).
+
 ## 2026-09-25 (`beta-integration`) — the 28 `beta/mmb-general` patches are folded into the 16 delivery blocks
 
 **Branch** `beta-integration` (cut from `main` at `0699a3d`).  The delivery is now the **16 amended
 patches**: applying them to `84e76d8a2` reproduces the former 28-patch beta campaign tree
 **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** exactly.  Canonical tip
-`f373450de489dd0fafba5bd285e71844109cd0ec`, release candidate `v16-84e76d8a2-r8-integrated`.
+`f373450de489dd0fafba5bd285e71844109cd0ec`, release candidate `v16-84e76d8a2-r8`.
 `main` still carries the un-integrated `v16-84e76d8a2-r7` delivery + the separate beta set.
 
 **Why.**  The beta campaign had served its beta window (gfx1151 re-validation GREEN, gfx1201/gfx1100
@@ -35,7 +54,7 @@ against; the alternative is per-hunk splits with a less clean intermediate histo
   tree, so the campaign's gfx1151/gfx1201/gfx1100 gate records carry over unchanged.
 
 **Artifacts.**  `patches/` (16 regenerated), `rdna-boosts-all.patch`, `release.json`
-(`v16-84e76d8a2-r8-integrated`, tip `f373450de…`, tree `24bb0f5acb…`).  Docs swept: `README.md`,
+(`v16-84e76d8a2-r8`, tip `f373450de…`, tree `24bb0f5acb…`).  Docs swept: `README.md`,
 `AGENTS.md`, `MANIFESTS.md`, `BASELINE.md`, `TODO.md`, `patches/README.md`, and the
 `beta/mmb-general/` banner; `scripts/apply-beta.sh` removed.
 

@@ -14,7 +14,7 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current state on the `beta-integration` branch (2026-09-25) — `v16-84e76d8a2-r8-integrated`:** the
+**Current release on `main` (2026-09-25) — `v16-84e76d8a2-r8`:** the
 28-patch `beta/mmb-general` campaign is **folded into the 16 blocks**, so applying the 16 patches
 alone to `84e76d8a2` reproduces the full campaign tree
 **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (canonical tip `f373450de489dd0fafba5bd285e71844109cd0ec`).
@@ -22,11 +22,10 @@ The `mmb`/prefill-core work is in **block 08**, the catch-all host-buffer/CPU fi
 the `mmb` fusion stand-downs and the MMVQ band in **blocks 13/14**, and `qsa3`/indexer/HC/sparse-MTP
 in **block 15**.  Strict `git am` 16/16, `scripts/validate-set.sh` PASS, gfx1201 build clean.
 `beta/mmb-general/` is kept as the historical verification record and `scripts/apply-beta.sh` has
-been removed.  Full record: `WORKLOG.md` (2026-09-25, the `beta-integration` entry) and
-`wip/beta-integration/integration.md`.  The `main` branch still carries the un-integrated r7 release
-below.
+been removed.  Full record: `WORKLOG.md` (2026-09-25, the `beta-integration`/promotion entries) and
+`wip/beta-integration/integration.md`.
 
-**`main` release (2026-09-25) — `v16-84e76d8a2-r7`:** a block-14 scheduler correctness fix.  The
+**Previous release (2026-09-25) — `v16-84e76d8a2-r7`:** a block-14 scheduler correctness fix.  The
 multi-device no-sync gallocr re-reserve guard in `ggml_backend_sched_alloc_splits` counted scheduler
 backends; under `-sm tensor` upstream's tensor-parallel **Meta device** wraps all GPUs into one
 `GGML_BACKEND_DEVICE_TYPE_META` backend, so the count was 1 and the re-point ran while the previous

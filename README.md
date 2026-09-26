@@ -29,11 +29,10 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 - What changed recently: [`WORKLOG.md`](WORKLOG.md)
 - Current status and validation: [Current state](#current-state)
 
-> **The `mmb`/QSA/indexer campaign fold lives on the `beta-integration` branch (2026-09-25).**  That
-> branch rewrites the 16 delivery patches to absorb the 28 `beta/mmb-general/` patches; the applied
-> tree is `24bb0f5acb…` and the build is clean on gfx1201.  `main` still carries the un-integrated r7
-> delivery plus the separate beta set.  The working plan, per-patch mapping and validation record
-> are in [`wip/beta-integration/integration.md`](wip/beta-integration/integration.md).
+> **The `mmb`/QSA/indexer campaign is folded into the delivery (2026-09-25, release `r8`).**  The 16
+> delivery patches now absorb the 28 `beta/mmb-general/` patches; the applied tree is `24bb0f5acb…`
+> and the build is clean on gfx1201.  The working plan, per-patch mapping and validation record are
+> in [`wip/beta-integration/integration.md`](wip/beta-integration/integration.md).
 
 ## Releases
 
@@ -43,8 +42,8 @@ Frozen deliveries are published as GitHub Releases and tagged in this repo
 block-14 `hc_combine` CPU-reference fix (issue #44) + the beta re-base, `r4` the block-15 RDNA4
 GQA-6 decode/verify flash-attention band (issue #45), `r5` the block-15 f16/bf16 band coverage
 (issue #45 follow-up), `r6` the block-15 bf16 native default flip, `r7` the block-14 Meta-tensor-split
-scheduler race fix, `r8-integrated` the **`beta/mmb-general` fold into the 16 blocks** on the
-`beta-integration` branch, and each later release on the
+scheduler race fix, `r8` the **`beta/mmb-general` fold into the 16 blocks** (the campaign is now
+part of the delivery, no separate beta apply step), and each later release on the
 same base increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
@@ -383,12 +382,11 @@ for per-block verification and `BASELINE.md` for provenance.
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
-- Canonical 16-block chain on the **`beta-integration`** branch: tip
+- Canonical 16-block chain on **`main`**: tip
   **`f373450de489dd0fafba5bd285e71844109cd0ec`**, net tree
-  **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (the folded campaign); release candidate
-  **`v16-84e76d8a2-r8-integrated`**.  The un-integrated `main` release is still
-  **`v16-84e76d8a2-r7`** (tip `596a22db…`, tree `7726e514…`).
-- **The `mmb`/QSA/indexer campaign is folded into the delivery** (2026-09-25, `beta-integration`):
+  **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (the folded campaign); release
+  **`v16-84e76d8a2-r8`**.
+- **The `mmb`/QSA/indexer campaign is folded into the delivery** (2026-09-25, release `r8`):
   the former 28-patch opt-in `beta/mmb-general/` set is now part of the 16 block patches — the
   `mmb` (bf16-WMMA dequant weight GEMM) core, the RDNA4 fragment port / per-arch tuning and the
   GDN/PLE/RMS prefill fusions in **block 08**; the catch-all host-buffer/CPU fixes in **block 06**;
