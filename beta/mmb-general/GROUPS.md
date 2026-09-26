@@ -23,17 +23,18 @@ corresponding subset; the original 38-commit history is still in this repo's git
 core), and the rejected per-M `nwarps` experiment lives in [`../../wip/nwarps/`](../../wip/nwarps/).
 
 ```sh
-# base = the current r6 delivery tree (release.json: base 84e76d8a2, tree 504894e61e17c6616b54871abee9fb23beda38bd)
+# base = the current r7 delivery tree (release.json: base 84e76d8a2, tree 7726e514284ea7393bb9097ce305dc5b6dacdb11)
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 84e76d8a2
-bash <this-repo>/scripts/apply-all.sh .        # -> branch rdna-boosts, tree 504894e6... (r6)
+bash <this-repo>/scripts/apply-all.sh .        # -> branch rdna-boosts, tree 7726e514... (r7)
 git checkout -b mmb-beta
-git am <this-repo>/beta/mmb-general/patches/*.patch   # 28/28, tree 1df5769c...
+git am <this-repo>/beta/mmb-general/patches/*.patch   # 28/28, tree 24bb0f5acb...
 ```
 
-Verified 2026-09-25: strict **`git am` 28/28** from the r6 tree, producing
-**`1df5769ccbf9510c0740fda497b56bde10a28398`** (byte-identical patch bodies to the r5-based set,
-which produced `469082e4…`; the r4-based set produced `70cc895a…`; the r13-based overlay was
+Verified 2026-09-25: strict **`git am` 28/28** from the r7 tree, producing
+**`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (byte-identical patch bodies to the r6-based set
+(`1df5769c…`), which was byte-identical to the r5-based set
+(`469082e4…`); the r4-based set produced `70cc895a…`; the r13-based overlay was
 `468c6496…`; the delivery re-cuts needed no
 conflict resolution -- see `README.md`).  The merge-back of the gfx1100 work and the
 cross-arch verification that the overlay does not disturb gfx1201 are in

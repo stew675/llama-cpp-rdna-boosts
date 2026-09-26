@@ -14,7 +14,17 @@ itself re-based
 2026-09-07 from `465e49b9c`, re-based 2026-09-06 from `9cffdcc80`,
 re-based 2026-09-02 from `0eadefebd`).
 
-**Current release (2026-09-25) — `v16-84e76d8a2-r6`:** a block-15 policy flip.  The bf16 native K/V
+**Current release (2026-09-25) — `v16-84e76d8a2-r7`:** a block-14 scheduler correctness fix.  The
+multi-device no-sync gallocr re-reserve guard in `ggml_backend_sched_alloc_splits` counted scheduler
+backends; under `-sm tensor` upstream's tensor-parallel **Meta device** wraps all GPUs into one
+`GGML_BACKEND_DEVICE_TYPE_META` backend, so the count was 1 and the re-point ran while the previous
+ubatch's per-device kernels were still in flight - an intermittent `quantize_q8_1` memory fault on a
+secondary GPU (3x R9700, qwen4exp MTP).  A Meta backend is now treated as multi-device.  Canonical tip
+`596a22dbfbde571728e93acf986a02200aaf46ee`, tree `7726e514284ea7393bb9097ce305dc5b6dacdb11`.  The
+28-patch beta set is re-cut onto r7 (strict 28/28, tree `24bb0f5acb…`; bodies byte-identical).  Full
+record: `WORKLOG.md` (2026-09-25 r7).
+
+**Previous release (2026-09-25) — `v16-84e76d8a2-r6`:** a block-15 policy flip.  The bf16 native K/V
 arm is now default-ON in auto mode (`ggml_cuda_fattn_kv_native_bf16_enabled()` matches
 q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl; `GGML_CUDA_FA_KV_NATIVE=0` is the single kill-switch, `=1` forces all
 on).  r5 made native bf16 the path to the RDNA4 GQA-6 decode/verify band, so the original opt-in

@@ -1,4 +1,4 @@
-From 35fd60ccf7427a05a3ec8eae7570aa0a22dcbecd Mon Sep 17 00:00:00 2001
+From db623901c6767993f1185d91db5596de638e867c Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Mon, 7 Sep 2026 20:30:06 -0500
 Subject: [PATCH 14/15] rdna-boosts: block 14: qwen4exp support
@@ -148,7 +148,7 @@ back to the full token count.
  ggml/include/ggml.h                    |  153 ++++
  ggml/src/ggml-alloc.c                  |   28 +-
  ggml/src/ggml-backend-meta.cpp         |  129 ++-
- ggml/src/ggml-backend.cpp              |   48 +-
+ ggml/src/ggml-backend.cpp              |   57 +-
  ggml/src/ggml-cpu/ggml-cpu.c           |   37 +
  ggml/src/ggml-cpu/ops.cpp              |  501 +++++++++++
  ggml/src/ggml-cpu/ops.h                |    4 +
@@ -195,7 +195,7 @@ back to the full token count.
  tests/test-backend-ops.cpp             |  110 +++
  tests/test-lazy-reader.cpp             |  264 ++++++
  tests/test-llama-archs.cpp             |    7 +-
- 55 files changed, 7296 insertions(+), 329 deletions(-)
+ 55 files changed, 7305 insertions(+), 329 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cu
  create mode 100644 ggml/src/ggml-cuda/fattn-qsa.cuh
  create mode 100644 ggml/src/ggml-cuda/hc-mix.cu
@@ -755,7 +755,7 @@ index 38eea3acb..106b2b726 100644
  
  bool ggml_backend_is_meta(ggml_backend_t backend) {
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 20bf96501..b207cff6d 100644
+index 20bf96501..4e4c55362 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -958,6 +958,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
@@ -774,7 +774,7 @@ index 20bf96501..b207cff6d 100644
      if (allow) {
          for (int i = 0; i < GGML_MAX_SRC; i++) {
              const struct ggml_tensor * src = tensor->src[i];
-@@ -1624,15 +1633,40 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -1624,15 +1633,49 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
              }
          }
  
@@ -791,11 +791,20 @@ index 20bf96501..b207cff6d 100644
 +        // prefill, reproduced on 3x R9700 gfx1201) - so the multi-device path keeps the full
 +        // synchronization (upstream behavior).  Count the non-CPU (async-capable) devices rather than
 +        // the raw backend count, so a single GPU plus a CPU backend keeps the fast path.
++        // A Meta backend (tensor split) presents as a single META device here, but it wraps
++        // multiple real devices and drives them on separate device streams.  Counting it as one
++        // async device would wrongly allow the no-sync re-point below on a tensor-split scheduler
++        // and race the previous ubatch's per-device kernels (in-kernel spin / memory faults,
++        // reproduced on 3x R9700).  A Meta device is only ever created for >1 device, so treat it
++        // as multi-device.
 +        int n_async_devices = 0;
++        bool multi_device = false;
          for (int i = 0; i < sched->n_backends; i++) {
 -            ggml_backend_synchronize(sched->backends[i]);
 +            const enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(ggml_backend_get_device(sched->backends[i]));
-+            if (dev_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
++            if (dev_type == GGML_BACKEND_DEVICE_TYPE_META) {
++                multi_device = true;
++            } else if (dev_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
 +                n_async_devices++;
 +            }
          }
@@ -804,7 +813,7 @@ index 20bf96501..b207cff6d 100644
 +        // be using.
 +        const bool buffers_grown = ggml_gallocr_reserve_n_probe(
 +                sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
-+        if (buffers_grown || n_async_devices > 1) {
++        if (buffers_grown || n_async_devices > 1 || multi_device) {
 +            // the re-allocation may cause the split inputs to be moved to a different address
 +            // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
 +            for (int i = 0; i < sched->n_backends; i++) {
@@ -821,7 +830,7 @@ index 20bf96501..b207cff6d 100644
          }
          if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
              GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-@@ -2108,6 +2142,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
+@@ -2108,6 +2151,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
  bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
      switch (op) {
          case GGML_OP_FLASH_ATTN_EXT:

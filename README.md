@@ -13,7 +13,7 @@ the whole set or pick the ones you want.  An optional, **opt-in beta set**
 (`beta/mmb-general/`, 28 patches) layers the `mmb` (bf16-WMMA weight GEMM)
 campaign on top — see the [Beta addendum](#beta-addendum-the-mmb-beta-set).
 That set is re-based onto this baseline and its `apply-beta.sh` tree assertion
-is updated (r6 applied tree `1df5769c…`, after r5's `469082e4…`, r4's `70cc895a…` and r3's `0daefe22…`).
+is updated (r7 applied tree `24bb0f5acb…`, after r6's `1df5769c…`, r5's `469082e4…`, r4's `70cc895a…` and r3's `0daefe22…`).
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
@@ -39,10 +39,11 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 
 Frozen deliveries are published as GitHub Releases and tagged in this repo
 (the tag is the release identity: `v16-<fork-point>-r<N>`, e.g.
-**`v16-84e76d8a2-r6`**, where `r1` is the re-base, `r2` the block-10 MoE-VDR arch-scope fix, `r3` the
+**`v16-84e76d8a2-r7`**, where `r1` is the re-base, `r2` the block-10 MoE-VDR arch-scope fix, `r3` the
 block-14 `hc_combine` CPU-reference fix (issue #44) + the beta re-base, `r4` the block-15 RDNA4
 GQA-6 decode/verify flash-attention band (issue #45), `r5` the block-15 f16/bf16 band coverage
-(issue #45 follow-up), `r6` the block-15 bf16 native default flip, and each later release on the
+(issue #45 follow-up), `r6` the block-15 bf16 native default flip, `r7` the block-14 Meta-tensor-split
+scheduler race fix, and each later release on the
 same base increments `N`).  `release.json.release` must equal the tag — CI
 checks it — and only a tag push cuts a release.  Each release carries
 `rdna-boosts-all.patch`, `patches.tar.gz`, `release.json`
@@ -228,7 +229,7 @@ bash <path-to-this-repo>/scripts/apply-beta.sh .
 #   1. if the 16 delivery blocks are not applied yet, runs scripts/apply-all.sh first
 #      (creates branch `rdna-boosts`);
 #   2. applies beta/mmb-general/patches/*.patch (strict 28/28) on a new `mmb-beta` branch.
-#   result: applied tree 1df5769ccbf9510c0740fda497b56bde10a28398
+#   result: applied tree 24bb0f5acb3e866abd4cad8c0de1bad45a20cb47
 ```
 
 `scripts/apply-beta.sh` is **base-aware**: it detects an already-applied delivery (the current
@@ -376,8 +377,9 @@ for per-block verification and `BASELINE.md` for provenance.
 
 - **16-patch set** (block 00 + blocks 01-15) for llama.cpp at the fork point
   **`84e76d8a2`** (upstream master "metal : fix graph capture and handle empty graphs", 2026-09-24 re-base).
-- Canonical 16-block chain: tip **`b3c3051a72df21f600f5ae13b244c8212210ca2e`**, net tree
-  **`504894e61e17c6616b54871abee9fb23beda38bd`**; release **`v16-84e76d8a2-r6`**.
+- Canonical 16-block chain: tip **`596a22dbfbde571728e93acf986a02200aaf46ee`**, net tree
+  **`7726e514284ea7393bb9097ce305dc5b6dacdb11`**; release **`v16-84e76d8a2-r7`** (r7 = the
+  block-14 Meta-tensor-split scheduler race fix; see `WORKLOG.md`).
 - **The RDNA4 GQA-6 decode/verify FA band covers f16 (and, through its native arm, bf16) too
   (block 15, r5, 2026-09-25, issue #45 follow-up, reported by
   [@DanoPTT](https://github.com/DanoPTT)):** the

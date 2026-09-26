@@ -15,9 +15,13 @@ numbering 01-11 against older upstream ranges, `git apply` flow); they
 remain as known-good records for those upstream versions.
 
 > **Current baseline marker:** the current delivery baseline is **`84e76d8a2`** (2026-09-24),
-> the fork point of release **`v16-84e76d8a2-r6`** (canonical tip
-> `b3c3051a72df21f600f5ae13b244c8212210ca2e`, tree
-> `504894e61e17c6616b54871abee9fb23beda38bd`; r6 = the 2026-09-25 block-15 bf16 native default flip,
+> the fork point of release **`v16-84e76d8a2-r7`** (canonical tip
+> `596a22dbfbde571728e93acf986a02200aaf46ee`, tree
+> `7726e514284ea7393bb9097ce305dc5b6dacdb11`; r7 = the 2026-09-25 block-14 Meta-tensor-split scheduler
+> race fix under `-sm tensor` - the multi-device no-sync gallocr re-reserve guard now treats a `META`
+> backend as multi-device, fixing the intermittent `quantize_q8_1` fault on a secondary GPU;
+> 28-patch beta re-cut onto r7, applied tree `24bb0f5acb…`)
+> on top of r6 = the 2026-09-25 block-15 bf16 native default flip,
 > which makes native bf16 the default so a bf16 cache takes the RDNA4 GQA-6 decode/verify band
 > (`GGML_CUDA_FA_KV_NATIVE=0` is the single kill-switch; bf16 kv 16384 verify widths 1.5-2.3x faster,
 > +14 % `draft-mtp n3` at ~30k; 28-patch beta re-cut onto r6, applied tree `1df5769c…`)

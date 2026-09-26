@@ -2,15 +2,24 @@
 
 **Status: BETA (promoted from `wip/mmb-general` on 2026-09-21; consolidated with the `closing-the-gap`
 campaign on 2026-09-25; re-based onto upstream master `84e76d8a2` on 2026-09-24, re-ported on delivery
-r2 (2026-09-25), re-based onto r3 and gfx1100-fixed on 2026-09-25, re-cut onto r4, r5 then r6 on
+r2 (2026-09-25), re-based onto r3 and gfx1100-fixed on 2026-09-25, re-cut onto r4, r5, r6 then r7 on
 2026-09-25).  Not part of the
 delivery.**  This is the beta patch set: **28 patches**, verified `git am` **28/28** from the delivery
-tree, applied tree **`1df5769ccbf9510c0740fda497b56bde10a28398`** on the current r6 delivery tree
-`504894e6…` (`84e76d8a2` base; r5 `de86c5e1…` / `469082e4…`, r4 `5938da09…` / `70cc895a…`,
+tree, applied tree **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** on the current r7 delivery tree
+`7726e514…` (r6 was `1df5769c…` on `504894e6…`; `84e76d8a2` base; r7 delivery tip `596a22dbf…`,
+r5 `de86c5e1…` / `469082e4…`, r4 `5938da09…` / `70cc895a…`,
 r3 `08fe2b77…` / `0daefe22…`, r2 `ea7acf2d…` / `e00275ff…`, r13 `bb7b6d07…` / `468c6496…`).  It is
 staged for the ~4–5 day beta
 window, after which the maintainer decides whether it becomes a delivery block (the `AGENTS.md`
 promotion rule).
+
+> **2026-09-25 (r7) — RE-CUT onto the r7 delivery.**  The delivery moved to `v16-84e76d8a2-r7`
+> (`7726e514…`, the block-14 Meta-tensor-split scheduler race fix) and the 28 patches were re-cut onto
+> it (applied tree `24bb0f5acb…`, **strict 28/28** on a fresh r7 worktree).  The beta set does not
+> touch the `ggml_backend_sched_alloc_splits` region the fix changes (its `ggml-backend.cpp` hunks are
+> at lines ~1043–1078 and ~1462–1463), so **the patch bodies are byte-identical** to the r6-based set —
+> only the `From` lines and `commits.txt` changed.  The measured gfx1201/gfx1100 beta behaviour carries
+> over; the gfx1151 four-gate re-validation on `24bb0f5acb` remains pending.
 
 > **2026-09-25 (r6) — RE-CUT onto the r6 delivery.**  The delivery moved to `v16-84e76d8a2-r6`
 > (`504894e6…`, the block-15 bf16 native default flip) and the 28 patches were re-cut onto it (applied

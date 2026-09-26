@@ -29,8 +29,8 @@ CPU-reference stride fix (issue #44: the CPU reference used `t*ne[1]`/`t*hc` ins
 own `nb[1]`, corrupting every multi-token fused ubatch on a CPU-resident qwen4exp layer; now mirrors
 the CUDA kernel, nt == 1 bit-identical; op-level CPU-vs-HIP oracle 7/8 FAIL pre-fix, 8/8 PASS
 post-fix).  The beta set
-(`beta/mmb-general`, 28 patches) is re-cut onto r6 (tree `1df5769c…`, patch bodies byte-identical to
-the r5-based set); patch 0027 restricts the
+(`beta/mmb-general`, 28 patches) is re-cut onto r7 (tree `24bb0f5acb…`, patch bodies byte-identical to
+the r6/r5-based set); patch 0027 restricts the
 16-wide routed `mul_mat_vec_q_moe` band to RDNA4 because on gfx1100 it failed `MUL_MAT_ID` 23/929 and
 on gfx1151 it is a measured loss.  gfx1100 build + coherence + op oracles + width probes green; the
 gfx1151 beta-window re-validation was GREEN on r2 and must be re-run on r6.  Full record:

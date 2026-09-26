@@ -1,5 +1,41 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-25 (r7) — `v16-84e76d8a2-r7`: the multi-device scheduler race gate learns the Meta tensor-split backend (block 14)
+
+**Release** `v16-84e76d8a2-r7`, base `84e76d8a2` (tree `5112eedbce0548ab9547d883e8aa54e993852e94`),
+tip `596a22dbfbde571728e93acf986a02200aaf46ee`, net tree
+`7726e514284ea7393bb9097ce305dc5b6dacdb11`.  `scripts/validate-set.sh` green on a fresh `84e76d8a2`
+tarball (strict **16/16** `git am`).  Only block 14 changed.
+
+**Reported.**  A long-running 3-GPU `-sm tensor` llama-server (qwen4exp IQ4_XS,
+`--spec-type draft-mtp-adaptive,ngram-mod`, `-ctk/-ctv q8_0`, `--no-kv-unified`,
+`--ctx-checkpoints 64`) died intermittently (~1 in 10) at a task boundary with a **memory fault in
+`quantize_q8_1` on GPU 2**.
+
+**Root cause.**  Block 14's cross-GPU race guard in `ggml_backend_sched_alloc_splits` counts the
+scheduler's non-CPU *backends* to decide whether the no-sync gallocr re-reserve path is safe.  Under
+`-sm tensor` on >1 device, upstream's tensor-parallel **Meta device** (`llama_prepare_model_devices`)
+wraps all GPUs into a single `GGML_BACKEND_DEVICE_TYPE_META` device, so the scheduler holds
+`[Meta, CPU]` and the count is `1` - the guard never fires.  The Meta backend runs each device's
+subgraph asynchronously on a separate stream (`ggml_backend_meta_graph_compute` ->
+`ggml_backend_graph_compute_async`), so the re-reserve re-points tensor addresses while the previous
+ubatch's kernels are still in flight on the other GPUs: the documented cross-GPU race (the same
+`quantize_q8_1` fault the 2026-09-06 gating fix addressed, which predated the Meta device).
+
+**The change (block 14, `ggml/src/ggml-backend.cpp`).**  A Meta backend is treated as multi-device:
+the device-count loop sets `multi_device = true` for a `GGML_BACKEND_DEVICE_TYPE_META` backend, and the
+full-sync path is taken when `buffers_grown || n_async_devices > 1 || multi_device`.  A Meta device is
+only ever created for >1 device, so this restores the multi-GPU synchronization without touching the
+validated single-device / one-GPU+CPU fast path (and `-sm layer`, which uses per-device backends, is
+unchanged).
+
+**Validation.**  `scripts/validate-set.sh` strict 16/16, applied tree == `7726e514…`.  3-GPU
+`-sm tensor` coherence (4B Q8_0) clean; `llama-bench -sm tensor -ctk/-ctv q8_0 -ub 2048` at
+pp512/pp8192/tg128 stable over 3 runs (pp8192 ~10.75k t/s, tg128 ~102 t/s) with no fault or hang.
+The 28-patch `beta/mmb-general` set is re-cut onto r7 (strict 28/28, applied tree `24bb0f5acb…`,
+patch bodies byte-identical - the beta touches `ggml-backend.cpp` only at lines ~1043-1078 and
+~1462-1463, far from the fix).
+
 ## 2026-09-25 (r6) — `v16-84e76d8a2-r6`: bf16 native K/V staging is on by default (block 15)
 
 **Release** `v16-84e76d8a2-r6`, base `84e76d8a2` (tree `5112eedbce0548ab9547d883e8aa54e993852e94`),

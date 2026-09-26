@@ -37,14 +37,15 @@ per-arch table or arch-neutral.  Re-validating confirms that reasoning.
 ```sh
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 84e76d8a2                                   # the fork point
-bash <repo>/scripts/apply-beta.sh . <repo>               # apply-all + 28/28, tree 1df5769c...
-git rev-parse HEAD^{tree}                                # expect 1df5769ccbf9510c0740fda497b56bde10a28398
+bash <repo>/scripts/apply-beta.sh . <repo>               # apply-all + 28/28, tree 24bb0f5acb...
+git rev-parse HEAD^{tree}                                # expect 24bb0f5acb3e866abd4cad8c0de1bad45a20cb47
 ```
 
-Re-cut 2026-09-25 onto the delivery's `v16-84e76d8a2-r6` (delivery tree `504894e6…`, the block-15
-bf16 native default flip), producing `1df5769c…`.  The patch bodies are **byte-identical** to the
-r5-based set (only the `From` lines and `commits.txt` changed), because the beta set does not touch
-the dense `GGML_OP_FLASH_ATTN_EXT` files the delivery changes.  Before that, r5's was `469082e4…`
+Re-cut 2026-09-25 onto the delivery's `v16-84e76d8a2-r7` (delivery tree `7726e514…`, the block-14
+Meta-tensor-split scheduler race fix), producing `24bb0f5acb…`.  The patch bodies are
+**byte-identical** to the r6-based set (only the `From` lines and `commits.txt` changed), because the
+beta set does not touch the `ggml_backend_sched_alloc_splits` region the fix changes.  Before that,
+r6's was `1df5769c…` (delivery tree `504894e6…`, the block-15 bf16 native default flip), r5's was `469082e4…`
 (delivery tree `de86c5e1…`, f16/bf16 on the RDNA4 GQA-6 decode/verify FA band, issue #45), r4's
 `70cc895a…` (delivery tree `5938da09…`), r3's `0daefe22…`, r2's
 `e00275ff…` and r13's `468c6496…`.  Verified strict `git am` **28/28** on a fresh `84e76d8a2` worktree

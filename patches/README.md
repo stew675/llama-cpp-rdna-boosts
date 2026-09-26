@@ -3,9 +3,17 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**Current release: `v16-84e76d8a2-r6`** — canonical (rebased) tip
-`b3c3051a72df21f600f5ae13b244c8212210ca2e`, tree
-`504894e61e17c6616b54871abee9fb23beda38bd`.  Strict 16/16 `git am`; clean build.  **r6
+**Current release: `v16-84e76d8a2-r7`** — canonical (rebased) tip
+`596a22dbfbde571728e93acf986a02200aaf46ee`, tree
+`7726e514284ea7393bb9097ce305dc5b6dacdb11`.  Strict 16/16 `git am`; clean build.  **r7
+(2026-09-25) fixes a block-14 cross-GPU scheduler race under `-sm tensor`**: the multi-device guard in
+`ggml_backend_sched_alloc_splits` counted scheduler backends, but upstream's tensor-parallel **Meta
+device** hides the N GPUs behind one `META` backend, so the count was 1 and the no-sync gallocr
+re-reserve path was taken while the previous ubatch's per-device kernels were still in flight — an
+intermittent `quantize_q8_1` memory fault on a secondary GPU (reported on 3x R9700).  A Meta backend
+is now treated as multi-device.  The 28 `beta/mmb-general` patches are re-cut onto r7 (strict 28/28,
+tree `24bb0f5acb…`, bodies byte-identical).  See `WORKLOG.md` (2026-09-25 r7).
+**r6
 (2026-09-25) flips the bf16 native K/V arm to default ON** (block 15, one line):
 `ggml_cuda_fattn_kv_native_bf16_enabled()` now matches the q8_0/q4_0 policy, so
 `GGML_CUDA_FA_KV_NATIVE` unset enables it and `=0` disables every native arm.  r5 had made the native
