@@ -1,0 +1,246 @@
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 33aed5618..d5a2432b4 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -883,7 +883,7 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
+ 
+ // ---------------------------------------------------------------------------------------------
+ 
+-template <ggml_type type, int J, bool fallback, bool fixup, bool has_gate = false>
++template <ggml_type type, int J, bool fallback, bool fixup, bool has_gate = false, bool pipeline = false>
+ static __device__ __forceinline__ void mul_mat_q_process_tile(
+         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
+         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+@@ -900,9 +900,14 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+     constexpr ggml_cuda_mmq_vec_dot_t    vec_dot    = ggml_cuda_mmq_get_vec_dot<type, J, fallback>();
+     constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback>();
+ 
++    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
++
+     extern __shared__ int data_mul_mat_q[];
+-    int * tile_y = data_mul_mat_q + J;
+-    int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
++    int * tile_y  = data_mul_mat_q + J;
++    constexpr int y_pad = GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
++    int * tile_y2 = tile_y + y_pad;
++    int * tile_x  = tile_y + (pipeline ? 2*y_pad : y_pad);
++    int * tile_x2 = tile_x + I*sram_stride;
+ 
+ #if defined(BLACKWELL_MMA_AVAILABLE)
+     // FP4 tile stores 8 blocks
+@@ -919,6 +924,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+ 
+     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+ 
++    if constexpr (!pipeline) {
+     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+         {
+@@ -953,6 +959,79 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+ 
+         __syncthreads();
+     }
++    } else {
++        // Software pipeline (wip/mmq-pipeline): both y halves are resident, the x tile is
++        // double-buffered.  The current tile's two vec_dot calls are issued back to back and the
++        // next tile's weight load overlaps them, cutting the per-tile barriers from 4 to 2.  The
++        // vec_dot(k00=0) / vec_dot(k00=MMQ_TILE_NE_K) call sequence and the sum[] accumulation
++        // order are unchanged, so the result is bit-identical to the non-pipelined path.
++        int * xbuf[2] = { tile_x, tile_x2 };
++
++        {
++            const int kb0 = kb0_start;
++            load_tiles(x, xbuf[0], offset_x + kb0, tile_x_max_i, stride_row_x);
++            {
++                const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
++#pragma unroll
++                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
++                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
++
++                    tile_y[l] = by0[l];
++                }
++            }
++            {
++                const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
++#pragma unroll
++                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
++                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
++
++                    tile_y2[l] = by0[l];
++                }
++            }
++        }
++
++        __syncthreads();
++
++        int cur = 0;
++        for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
++            const int  kb0_next = kb0 + blocks_per_iter;
++            const bool has_next = kb0_next < kb0_stop;
++
++            if (has_next) {
++                load_tiles(x, xbuf[cur ^ 1], offset_x + kb0_next, tile_x_max_i, stride_row_x);
++            }
++
++            vec_dot(xbuf[cur], tile_y,  sum, 0);
++            vec_dot(xbuf[cur], tile_y2, sum, MMQ_TILE_NE_K);
++
++            __syncthreads();
++
++            if (has_next) {
++                {
++                    const int * by0 = y + ncols_y * (kb0_next * qk / ne_block) * sz;
++#pragma unroll
++                    for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
++                        int l = l0 + threadIdx.y*warp_size + threadIdx.x;
++
++                        tile_y[l] = by0[l];
++                    }
++                }
++                {
++                    const int * by0 = y + ncols_y * ((kb0_next * qk / ne_block) * sz + sz);
++#pragma unroll
++                    for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
++                        int l = l0 + threadIdx.y*warp_size + threadIdx.x;
++
++                        tile_y2[l] = by0[l];
++                    }
++                }
++            }
++
++            __syncthreads();
++
++            cur ^= 1;
++        }
++    }
+ 
+     if constexpr (has_gate) {
+         // fused gate+up: second weight stream, same activations. The gate
+@@ -1037,7 +1116,8 @@ static __global__ void mul_mat_q(
+         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+         const uint3 ntx,
+-        const char * __restrict__ x_gate = nullptr, const ggml_glu_op glu_op = GGML_GLU_OP_COUNT, const float glu_limit = 0.0f) {
++        const char * __restrict__ x_gate = nullptr, const ggml_glu_op glu_op = GGML_GLU_OP_COUNT, const float glu_limit = 0.0f,
++        const bool pipeline = false) {
+ 
+     // Skip unused template specializations for faster compilation:
+     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
+@@ -1131,11 +1211,19 @@ static __global__ void mul_mat_q(
+         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+ 
+         constexpr bool fixup = false;
+-        mul_mat_q_process_tile<type, J, fallback, fixup, has_gate>
+-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+-             stride_row_x, ncols_y, stride_col_dst,
+-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
+-             x_gate, glu_op, glu_limit);
++        if (pipeline) {
++            mul_mat_q_process_tile<type, J, fallback, fixup, has_gate, true>
++                (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
++                 stride_row_x, ncols_y, stride_col_dst,
++                 tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
++                 x_gate, glu_op, glu_limit);
++        } else {
++            mul_mat_q_process_tile<type, J, fallback, fixup, has_gate, false>
++                (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
++                 stride_row_x, ncols_y, stride_col_dst,
++                 tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
++                 x_gate, glu_op, glu_limit);
++        }
+         return;
+     }
+ 
+@@ -1468,11 +1556,32 @@ struct mmq_args {
+     float glu_limit = 0.0f;
+ };
+ 
+-static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
+-    const size_t nbs_ids = config.J*sizeof(int);
+-    const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
+-    const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
+-    return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
++// WIP (wip/mmq-pipeline): software-pipeline the MMQ k-loop. Runtime gate so the default path is
++// untouched; the host and the kernel must agree on the shared-memory layout (see the tile_y/tile_y2
++// /tile_x/tile_x2 pointer arithmetic in mul_mat_q_process_tile).
++static bool mmq_pipeline_enabled() {
++    static const bool enabled = getenv("GGML_CUDA_MMQ_PIPELINE") != nullptr;
++    return enabled;
++}
++
++// The pipelined path needs the MMA sram layout (the dp4a tile_x has no sram_stride) and is left off
++// for the fallback (non-128-row) kernel, the fused gate path and stream-k.
++static bool mmq_pipeline_eligible(const ggml_type type, const bool fallback, const bool has_gate, const int cc) {
++    if (!mmq_pipeline_enabled() || fallback || has_gate) {
++        return false;
++    }
++    return amd_wmma_available(cc) || amd_mfma_available(cc) || turing_mma_available(cc);
++}
++
++static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc, const bool pipeline = false) {
++    const size_t nbs_ids  = config.J*sizeof(int);
++    const size_t nbs_x    = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
++    const size_t nbs_y    = GGML_PAD(config.J * (sizeof(block_q8_1_mmq)), config.nthreads*sizeof(int));
++    if (pipeline) {
++        // [ids][tile_y][tile_y2][tile_x][tile_x2]
++        return nbs_ids + 2*nbs_y + 2*nbs_x;
++    }
++    return nbs_ids + nbs_x + nbs_y;
+ }
+ 
+ // ---- RDNA3.5/RDNA4 routed-compact MoE MMQ (port of halo-box/strix-llama.cpp) ----
+@@ -1663,7 +1772,16 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+     GGML_ASSERT(config.nthreads % warp_size == 0);
+     const int nwarps = config.nthreads / warp_size;
+-    const int nbytes_shared = mmq_get_nbytes_shared(config, cc);
++    // wip/mmq-pipeline: only the plain MMA-layout tiles get the pipelined path; fallback (the
++    // non-128-row kernel is already at the register limit), has_gate, stream-k and the dp4a layout
++    // keep the original loop.
++    const bool pipeline = mmq_pipeline_eligible(type, fallback, has_gate, cc) &&
++        !ggml_cuda_mmq_get_stream_k(type, J, fallback, cc);
++    const int nbytes_shared = mmq_get_nbytes_shared(config, cc, pipeline);
++    if (getenv("GGML_CUDA_MMQ_PIPELINE_DEBUG")) {
++        fprintf(stderr, "[mmq-pipeline] J=%d I=%d nthreads=%d nbytes_shared=%d pipeline=%d\n",
++                J, config.I, config.nthreads, nbytes_shared, int(pipeline));
++    }
+ 
+     const dim3 block_dims(warp_size, nwarps, 1);
+ 
+@@ -1717,7 +1835,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-             ntx_fd, has_gate ? args.x_gate : nullptr, args.glu_op, args.glu_limit);
++             ntx_fd, has_gate ? args.x_gate : nullptr, args.glu_op, args.glu_limit, pipeline);
+         return;
+     }
+ 
+@@ -1803,7 +1921,15 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+         }
+     }
+ 
++    // wip/mmq-pipeline: debug/experiment override to force one J (the RDNA switch above does not
++    // honour GGML_CUDA_MMQ_J_MAX).
++    const char * force_j_env = getenv("GGML_CUDA_MMQ_FORCE_J");
++    const int    force_j     = force_j_env ? atoi(force_j_env) : 0;
++
+     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
++        if (force_j > 0 && J != force_j) {
++            continue;
++        }
+         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+         if (config.type == GGML_TYPE_COUNT) {
+             continue;
+@@ -1832,7 +1958,10 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+             continue;
+         }
+ 
+-        if (mmq_get_nbytes_shared(config, cc) > smpbo) {
++        // wip/mmq-pipeline: when pipelining, only consider J values whose *pipelined* layout fits
++        // (this is what makes the switch pick I=64/J=64 instead of I=128/J=128).
++        const bool pipeline = mmq_pipeline_eligible(type, fallback, has_gate, cc);
++        if (mmq_get_nbytes_shared(config, cc, pipeline) > smpbo) {
+             continue;
+         }
+ 

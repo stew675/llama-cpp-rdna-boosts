@@ -99,7 +99,7 @@ Run both on a dense model, a MoE model and (if it fits) qwen4exp.  The guarantee
 **Cross-build comparison (historical).**  The pre-consolidation beta was MMB-opt-in on r12, and with
 MMB unset it measured bit-identical to r12 on gfx1201 (PPL 9.4293, all five same-seed hashes).  That is
 **not** a gate — and it no longer applies, since the consolidated set defaults MMB on.  See the
-2026-09-22 correction record in `wip/closing-the-gap/closing-the-gap.md`.
+2026-09-22 correction record in `archive/work/closing-the-gap/closing-the-gap.md`.
 
 ### Gate 2 — `GGML_CUDA_MMB=1` must recover the original gfx1151 win
 
@@ -196,7 +196,7 @@ min_t=512`).
 * **New quant types** (`patches/0017`, default ON on non-RDNA4): Q4_0/Q4_1/Q5_0/MXFP4/NVFP4 —
   `MUL_MAT` 48/47/14/46/45, `MUL_MAT_ID` 74/75/3/74/73, PPL parity, pp8192 **+19.5/+22.4/+25.4 %**,
   35B-A3B Q4_1 pp4096 **+63 %**, gpt-oss-20b MXFP4 pp4096 **+5.2 %**.  Detail:
-  `wip/closing-the-gap/2026-09-22-mmb-quant-coverage.md`.
+  `archive/work/closing-the-gap/2026-09-22-mmb-quant-coverage.md`.
 
 **Verdict:** gfx1151 re-validation GREEN.  The only gate the beta window owed is closed.
 

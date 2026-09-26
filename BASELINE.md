@@ -19,7 +19,7 @@ remain as known-good records for those upstream versions.
 > `beta/mmb-general` patches, so the applied tree is r8's campaign tree
 > **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** plus r9's issue-#47 typed-store fix ->
 > **`a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb`** (canonical tip `b48fb3f686fe2681f55aa406a8ed52313ad80875`,
-> release `v16-84e76d8a2-r9`).  See `wip/beta-integration/integration.md` and `WORKLOG.md` (2026-09-26 r9).
+> release `v16-84e76d8a2-r9`).  See `archive/work/beta-integration/integration.md` and `WORKLOG.md` (2026-09-26 r9).
 
 > **Current baseline marker:** the current delivery baseline is **`84e76d8a2`** (2026-09-24),
 > the fork point of release **`v16-84e76d8a2-r7`** (canonical tip
@@ -118,7 +118,7 @@ tip
 `d735d6c11258ae939cfd392511e3f29ac22a7686` (the 2026-09-15 **build-time** block-15 amendment: the tile
 kernel's native-KV type axis is instantiated in the generated instance TUs again instead of implicitly
 in the dispatch TU — a clean `-j16` backend build 538 s -> 330 s, `fattn-tile.cu` 509 s -> < 10 s, no
-runtime change; `wip/build-time-regression/`; release `v16-790cf51aa-r5`).  The previous canonical tip
+runtime change; `archive/work/build-time-regression/`; release `v16-790cf51aa-r5`).  The previous canonical tip
 was `b19c70b341f9ed439bcda2a636fe6e5fa4fa634b`, tree
 `7fab975d9518b29aa7d890c1163f13a6c393c5df` (the 2026-09-15 block-15 amendment — issue #30's second
 round: the mixed-K/V kernel contract, the `get_alloc_size` q4_0 fix, the prefill band split + staging

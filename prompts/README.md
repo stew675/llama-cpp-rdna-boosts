@@ -46,7 +46,7 @@ gate. Its throughput is *maximal* at the floor (`--spec-type draft-mtp-adaptive
 --spec-draft-n-min-adaptive 3 --spec-draft-n-max 3` = 64.3 t/s on the 2-card Q8_0 cell, falling
 monotonically to 50.0 at depth 12), so it is the prompt that punishes a controller which is slow to
 drop after a code phase. Judge an adaptive change on it in addition to the four axes above; recorded
-results are in `wip/adaptive-mtp-ceiling-scaling/bucketed-port/README.md`.
+results are in `archive/work/adaptive-mtp-ceiling-scaling/bucketed-port/README.md`.
 
 ## Usage
 

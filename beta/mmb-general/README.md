@@ -5,7 +5,7 @@
 > delivery blocks, so a fresh `84e76d8a2` + `scripts/apply-all.sh` reproduces the campaign tree
 > **`24bb0f5acb…`** directly and there is **no separate beta apply step** (`apply-beta.sh` was
 > removed).  The apply/BETA instructions below are kept as the record of how the set was validated.
-> See `../../wip/beta-integration/integration.md` and `../../WORKLOG.md` (2026-09-25).
+> See `../../archive/work/beta-integration/integration.md` and `../../WORKLOG.md` (2026-09-25).
 
 **Status: BETA (promoted from `wip/mmb-general` on 2026-09-21; consolidated with the `closing-the-gap`
 campaign on 2026-09-25; re-based onto upstream master `84e76d8a2` on 2026-09-24, re-ported on delivery
@@ -123,9 +123,9 @@ harness in [`tools/`](tools/README.md) — `ab-interleaved.sh` + `lbparse.py`.
 
 The set was **re-built on the r13 delivery** (`bb7b6d07…`) as the single consolidated campaign set:
 r13 + these 28 patches reproduces the combined tree that previously required r13 + the 12 beta
-patches + the 30 `wip/closing-the-gap/patches/` patches.  The applied tree is
+patches + the 30 `archive/work/closing-the-gap/patches/` patches.  The applied tree is
 **`468c64963ae45e72367c73809efa7cc038217e8a`**, verified strict `git am` **28/28** on a fresh r13
-worktree (`wip/closing-the-gap/consolidation.md` is the full record).
+worktree (`archive/work/closing-the-gap/consolidation.md` is the full record).
 
 * Ten closing patches are folded into the core patch whose code they extend — `c0005`/`c0007` →
   `0002`, `c0001`/`c0010` → `0004`, `c0014`/`c0016` → `0005`, `c0008`/`c0017`/`c0018` → `0007`,

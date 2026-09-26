@@ -157,14 +157,14 @@ thread step with a scalar `half` store and re-read `cell_pos` for every query ro
 packed fallback (two cells per step, one `half2` store, `cell_pos` hoisted out of the query-row
 loop).  gfx1100 @98k -3.47 -> **-0.15 %**, gfx1151 @32k -0.53 -> -0.24 %, gfx1201 27B layer @98k
 -5.96 -> -1.62 %, gfx1201 9B @98k +2.57 -> **+3.49 %**, output bit-identical.  See the 2026-09-19
-block-15 amendment section below and `../wip/kq-mask-derived-ab/`.  **r6 (2026-09-18) is the FA instance build-time fix**:
+block-15 amendment section below and `../archive/work/kq-mask-derived-ab/`.  **r6 (2026-09-18) is the FA instance build-time fix**:
 block 06 generates the MMA instances per `(ncols1, ncols2, head size)` and lists the head-512 ones
 first in the backend source order (mirrored for CUDA), block 15 generates the tile instances per
 `(head size, KV type)`, and block 13 declares/defines the fused-gate MMQ cases in the per-type
 instance files (idempotent generator; `mmq.cu` is no longer a monolith).  Clean `ggml-hip -j16`
 **323.4 -> 236.0 s (-27 %)**, identical instantiations and symbols, no runtime change; the fix is the
 build **order** (the six `dkq512` MMA TUs start at t=0 instead of t=80-150 s), not the split alone.
-See the 2026-09-18 (r6) sections below and `../wip/build-time-regression/`.  **r5 (2026-09-18, issue #30) caps RDNA3_0 WMMA FA at head 256**: the
+See the 2026-09-18 (r6) sections below and `../archive/work/build-time-regression/`.  **r5 (2026-09-18, issue #30) caps RDNA3_0 WMMA FA at head 256**: the
 2026-09-14 RDNA prefill tuning had copied RDNA4 #28102's config rows onto gfx1100, turning head 512
 from the 2026-08-28 'neutral' into a 3.5-10 % deep-prefill loss vs the tile kernel (gemma-4-26B-A4B,
 pp2048 @ d98304: f16 791 vs 819 t/s tile, bf16 776 vs 851, q8_0 784 vs 773).  RDNA3_0 now uses the
@@ -186,7 +186,7 @@ See the 2026-09-18 block-01 amendment section below and `../WORKLOG.md` 2026-09-
 unrolled" warnings from the FA kernels' bare `#pragma unroll` hints, amplified by the native-KV
 instantiations — no codegen change), and **block 01** corrects the `common/speculative-adaptive.h`
 comment that claimed an ngram-mod acceptance feed the code deliberately does not do.  See
-`../WORKLOG.md` 2026-09-17 (r2) and `../wip/build-time-regression/README.md`.
+`../WORKLOG.md` 2026-09-17 (r2) and `../archive/work/build-time-regression/README.md`.
 
 The 2026-09-17 re-base resolved three blocks:
 
@@ -215,7 +215,7 @@ candidate `v16-84e76d8a2-r8`; strict `git am` 16/16, `scripts/validate-set.sh` P
 gfx1201 build clean).  Nothing in the campaign was changed - only its packaging.
 
 Fold mapping (the beta patch numbers are `beta/mmb-general/patches/00NN`; the dependency-clean
-split is recorded in `../wip/beta-integration/integration.md`):
+split is recorded in `../archive/work/beta-integration/integration.md`):
 
 | block | folded beta patches |
 |---|---|
@@ -310,7 +310,7 @@ ours to change and this is a fundamental correctness fix that must precede every
 one-token drafts; after, **0 errors** and acceptance 0.287 (per-position 0.679/0.462/0.333…), the
 `draft-mtp-adaptive` path 35.4 t/s with real depth transitions.  The non-shared `Q4_K_M` sidecar is
 unchanged (it never sets `ctx_other`).  See the campaign record
-`wip/closing-the-gap/2026-09-22-mtp-shared-nextn-fix.md`.
+`archive/work/closing-the-gap/2026-09-22-mtp-shared-nextn-fix.md`.
 
 ## 2026-09-21 block-06 amendment (r12): `--fit` supports `-sm tensor` (promoted from `beta/tensor-fit-fix/`)
 
@@ -718,7 +718,7 @@ block 15.
 Block 15's native-KV arm chain (`GGML_CUDA_FATTN_MMA_NATIVE_ARM` x 6 in
 `ggml_cuda_flash_attn_ext_mma_f16_case`) instantiates the whole WMMA kernel once per KV type inside
 every generated MMA instance TU, so an 8-case `fattn-mma-f16-instance-*` file compiled in ~200 s and
-one TU gated the backend build (diagnosed in `../wip/build-time-regression/`, 2026-09-15).  r5 had
+one TU gated the backend build (diagnosed in `../archive/work/build-time-regression/`, 2026-09-15).  r5 had
 already moved the tile type axis into the generated files; r6 does the same for the MMA head axis
 and the tile KV-type axis, then fixes the *order*.
 
@@ -1038,7 +1038,7 @@ compute buffer (measured on the 9B at `-c 98304`, ub 512: **184.02 -> 88.39 MiB*
 Q8_0) found it costing deep prefill: `LLAMA_KQ_MASK_DERIVED=0` recovered +5.7 % (tensor) / +13.2 %
 (layer) at 100k.
 
-A three-arch A/B (`../wip/kq-mask-derived-ab/`, 16 configs, `-r 3`) reproduced it and showed the
+A three-arch A/B (`../archive/work/kq-mask-derived-ab/`, 16 configs, `-r 3`) reproduced it and showed the
 effect is **sign-unstable across arch *and* model config** -- gfx1201 9B wins +2.6 % @98k while the
 gfx1201 27B (gqa 6) 2-GPU layer split loses -6.0 %, gfx1151 -1.9 %, gfx1100 -3.5 %; TG128 is flat
 everywhere (the derived gate is prefill-only: `n_tokens <= 8` keeps the packed mask).  The cost is
@@ -1705,7 +1705,7 @@ resolved by keeping both declaration sets), strict 16/16 `git am`, applied tree 
 
 ## 2026-09-14 block-15 amendment: V4 native staging is the default for the sub-F16 KV quants + the q4_0 native arm (issue #30)
 
-**Why.**  Issue #30's investigation (`wip/issue-30-mtp-decode-regression/`) isolated a delivery-specific
+**Why.**  Issue #30's investigation (`archive/work/issue-30-mtp-decode-regression/`) isolated a delivery-specific
 regression: with a **quantized** K/V cache the decode falls off faster with context depth than stock
 (1 GPU, 27B UD-Q4_K_XL, `tg64`: delivery q8_0 18.92 t/s at d65536 = 66.1 % of its d0 rate vs stock 22.43 =
 80.1 %; q4_0 19.72 = 68.9 % vs stock 21.03 = 75.9 %).  BF16 was clean and ahead of stock's f16 at every
@@ -1734,7 +1734,7 @@ at the default 4 slots; `GGML_CUDA_FA_KV_NATIVE=0` reproduces the OOM.
 `58317e0d64dd01a3622ba90b159ae12d1619c835`; 16-patch set regenerated; `rdna-boosts-all.patch` re-cut;
 `scripts/validate-set.sh` passes (strict 16/16 `git am` on a fresh `790cf51aa` tarball, applied tree ==
 `58317e0d…`).  Release `v16-790cf51aa-r2`.  Record: `WORKLOG.md` 2026-09-14, `GREEDY-PURITY.md` §34,
-`wip/issue-30-mtp-decode-regression/` (and `RECURRENT-SNAPSHOT-BUDGET.md` for the remaining levers).
+`archive/work/issue-30-mtp-decode-regression/` (and `RECURRENT-SNAPSHOT-BUDGET.md` for the remaining levers).
 
 ## 2026-09-15 block-15 amendment (build time): the tile native-KV type axis is instantiated in the generated instance TUs
 
@@ -1765,7 +1765,7 @@ The new critical path is the `fattn-mma-f16` instance set, which this delivery a
 arm chain instantiates the whole WMMA kernel once per KV type inside each instance TU, so the same TU
 went 0.90 -> **7.26 MB** and 6.7 -> **229 s** versus the base.  That half is diagnosed and deliberately
 left as a follow-up (it needs a code-path change with its own A/B) — see `TODO.md` and
-`wip/build-time-regression/`.
+`archive/work/build-time-regression/`.
 
 **Verified zero runtime change.**  `test-backend-ops -o FLASH_ATTN_EXT` **5951/5951 with zero
 failures** (identical to r4); 27B prose text hashes **bit-identical** to the pre-amendment build
@@ -1832,7 +1832,7 @@ same-seed greedy text `native == staging` **identical for all eight KV types on 
 purity `W=1..8` one logits hash per type — all eight types PURE on gfx1151, and on gfx1201 pure except
 the documented pre-existing q4_0 logits-level band edges (`GREEDY-PURITY.md` §36, whose guarantee is now
 stated at the text/acceptance level, with the full per-quant grid).  Evidence:
-`../wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §F-G-H (TODO 21, the q4_0 fixes, the arch gate)
+`../archive/work/issue-30-mtp-decode-regression/MEASUREMENTS.md` §F-G-H (TODO 21, the q4_0 fixes, the arch gate)
 and §I (item 2).
 
 ## 2026-09-12 block-15 promotion: the attention-memory campaign is delivered
@@ -1886,7 +1886,7 @@ are no faster.  The exposure is structural: `cp_async_available()` is
 NVIDIA-only, so the AMD MMA loader is synchronous (`nstages = 0`).  The
 "GQA de-interleave" rationale is retired — the raw native read is ~4 % *faster*
 than the dense staged one.  Details: `TODO.md` item 23 and
-`wip/bf16-native-prefill/README.md` "Step 2 findings".]**
+`archive/work/bf16-native-prefill/README.md` "Step 2 findings".]**
 
 **Re-validation** (2026-09-11 against the then-15-patch delivery; re-cut onto
 the current base and revalidated 2026-09-12).  Reserves reproduce to the last

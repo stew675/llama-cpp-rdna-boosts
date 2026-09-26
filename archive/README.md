@@ -12,6 +12,7 @@ current; history is archived, not deleted).
 | `work/fused-stage-pacing/` | the CLOSED fused-stage + host-side-pacing experiment (sessions 8-9), preserved for re-evaluation after a future ROCm update |
 | `work/block-15-campaign-wins/` | the attention-memory campaign (W1-W4, V3-V5) — its patch was **promoted into the delivery as block 15 on 2026-09-12**; kept as the promotion/gate + beta-tester record |
 | `work/{strix-halo,qwen4exp,kv-quant-purity-followups,arch-independent-memory,sm-tensor-plain-vs-spec,issue-25-mtp-batch-width,issue-30-mtp-decode-regression,items-6-10-wrapup,kv-sign-leak,gdn-rs-rollback,shadow-warnings,block15-dense-arm,tools}/` | the completed `wip/` trees, archived **2026-09-12** (each is the record for a closed item or campaign; the item-4 harness lives under `work/strix-halo/qsa-item4/`) |
+| `work/{beta-integration,bf16-native-prefill,build-time-regression,closing-the-gap,issue-30-mtp-decode-regression,issue-44-hc-combine-oracle,issue-45-band-port,kq-derived-tile,kq-mask-derived-ab,mtp-journey-2026-09-17,prefill-arrangements,q8-prefill-tuning,reasoning-aware-mtp,tiled-gdn,per16-f16-mma,mmq-pipeline}/` | the completed/abandoned `wip/` trees, archived **2026-09-26** (each is a closed campaign or a dormant scoping record; `nwarps/` is deliberately left in `wip/`) |
 | `work/wip-archive/` | the older `wip/archive/` group (hybrid-allreduce, managed-ngrams, qwen35moe-prefill, qwen4exp), preserved with its original grouping |
 
 **2026-09-12 consolidation:** the completed `wip/` trees and the promoted block-15 beta record were
@@ -19,6 +20,19 @@ moved here; `wip/` now holds only the active `wip/iq4nl-prefill/` handoff.  Cros
 repo were rewritten to the new paths (`wip/<x>` → `archive/work/<x>`, `beta/block-15-campaign-wins` →
 `archive/work/block-15-campaign-wins`).  Some git-ignored run logs under `work/strix-halo/kvzero/runs/`
 still carry the old absolute paths because they are verbatim outputs of the runs; they are not tracked.
+
+**2026-09-26 consolidation:** every remaining campaign under `wip/` except `nwarps/` was closed and
+moved here — `per16-f16-mma` and `mmq-pipeline` (both negative/parked kernel experiments),
+`beta-integration`, `bf16-native-prefill` (closed negative), `build-time-regression` (fixed),
+`closing-the-gap` (consolidated into `beta/mmb-general/`), `issue-30-mtp-decode-regression`,
+`issue-44-hc-combine-oracle`, `issue-45-band-port`, `kq-derived-tile`, `kq-mask-derived-ab`,
+`mtp-journey-2026-09-17`, `prefill-arrangements`, `q8-prefill-tuning`, `reasoning-aware-mtp` and
+`tiled-gdn`.  `wip/` now holds **only `nwarps/`** — the per-M `nwarps` impurity, the one item
+deliberately left open.  Cross-references in tracked docs were rewritten (`wip/<x>` →
+`archive/work/<x>`, `wip/adaptive-mtp-ceiling-scaling/` → `archive/work/…`); verbatim profiler logs
+and CSVs under `work/bf16-native-prefill/profiles/` and `work/mtp-journey-2026-09-17/` keep the old
+absolute paths because they are unedited tool output.  `per16-f16-mma` and `mmq-pipeline` lived only
+on wip branches; their content was materialised into `archive/work/` and the branches retired.
 
 If you are working on the CURRENT delivery, you do not need to read these —
 they exist so the historical record is preserved without cluttering

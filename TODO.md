@@ -16,7 +16,7 @@ host-buffer/CPU fixes in **block 06**, the `mmb` fusion stand-downs + MMVQ band 
 and `qsa3`/indexer/HC/sparse-MTP + the r9 MMA-FA typed-store fix in **block 15**.  Strict `git am`
 16/16, `validate-set.sh` PASS, gfx1201 build clean.  `beta/mmb-general/` is now only the historical
 verification record and `apply-beta.sh` was removed.  Plan/record:
-`wip/beta-integration/integration.md`; `WORKLOG.md` 2026-09-26 (r9).
+`archive/work/beta-integration/integration.md`; `WORKLOG.md` 2026-09-26 (r9).
 
 **Previous `main` state (2026-09-25, r6→r7):** the delivery is the **16-patch set** against fork point
 **`84e76d8a2`** (block 00 + blocks 01-15), canonical 16-block tip
@@ -139,7 +139,7 @@ bit-identical to the generic chain, so the fusion selection no longer changes th
 **Active is now item 18 only**; the previous header's `9113cc188` / `0f4f83f9` references
 are superseded by the 2026-09-13 re-base to `790cf51aa` (tip `6303f0489`, tree `311f3acebe82a65b`).
 
-**2026-09-14 (issue #30, wider-configuration campaign).**  Dossier `wip/issue-30-mtp-decode-regression/`
+**2026-09-14 (issue #30, wider-configuration campaign).**  Dossier `archive/work/issue-30-mtp-decode-regression/`
 opened.  The BF16 depth scaling is verified clean (BF16 vs stock's f16, ahead at every depth); the
 quantized-KV depth fall-off is root-caused to the tile kernel's **whole-cache F16 staging pass** and
 fixed by making `V4` native staging the default for sub-F16 quants plus a **new q4_0 native arm** (q8_0
@@ -172,7 +172,7 @@ structural reason is that `cp_async_available()` is NVIDIA-only, so the AMD MMA 
 multi-stage pipelining** (`nstages = 0`) and the conversion sits in the critical path, with the
 kernel already at the 256-VGPR ceiling (no prefetch headroom).  Reaching parity would need AMD loader
 pipelining (its own A/B) or gfx950/CDNA4 packed-bf16 hardware — not a loader-only tweak.  Full
-evidence, ISA matrix and the candidate measurements: [`wip/bf16-native-prefill/README.md`](wip/bf16-native-prefill/README.md)
+evidence, ISA matrix and the candidate measurements: [`archive/work/bf16-native-prefill/README.md`](archive/work/bf16-native-prefill/README.md)
 ("Step 2 findings") and its `HANDOVER.md` §0; the V5 plan:
 `archive/work/arch-independent-memory/BF16-NATIVE-KV-PLAN.md`.  Fix candidates A (dense-layout gate),
 B (reorder the loader) and C (head-major cache) are all **retired** — the read pattern is not the
@@ -194,7 +194,7 @@ decode/verify *tuning* issue, not a purity bug.  **Maintainer hypothesis (issue 
 controller's climb/drop cost table (`common/speculative-adaptive.h`) was tuned for mainline (low)
 acceptance; the delivery's drafting improvements made it over-climb, so the table needs retuning.
 
-- Dossier + repro: [`wip/adaptive-mtp-ceiling-scaling/`](wip/adaptive-mtp-ceiling-scaling/)
+- Dossier + repro: [`archive/work/adaptive-mtp-ceiling-scaling/`](archive/work/adaptive-mtp-ceiling-scaling/)
   (`README.md` = finding/data, `HANDOVER.md` = the turnkey brief for the next session, `repro.sh` =
   the sweep).
 - Fix shape: **the tuned bucketed controller** (`archive/work/adaptive-mtp-ceiling-scaling/bucketed-port/`
@@ -222,7 +222,7 @@ controller designs are dominated (sliding-mean 0.980, target-rate 1.048, vs the 
 the dense 16-prompt corpus).  The base constants are therefore the best multi-cell default.  The one
 real defect was a **stale record pointer** (the 2026-09-13 four-axis record used the *table*), now
 corrected.  Cap guidance: single card ~9, multi-GPU 6-7.  Full data:
-`wip/mtp-journey-2026-09-17/SUMMARY.md`.
+`archive/work/mtp-journey-2026-09-17/SUMMARY.md`.
   Fallback if a shape regresses: the reporter's cap (7 when `n_gpu > 1` or the dominant weight is Q8_0).
 - **DONE 2026-09-21 (docs only).**  The `ceiling 12` caveat is now in
   [benchmarks/mtp-adaptive-methodology.md](benchmarks/mtp-adaptive-methodology.md) (a blockquote after the
@@ -262,7 +262,7 @@ arches; greedy text `native == staging` **IDENTICAL for all eight KV types** on 
 staged -> default): gfx1201 q4_1 23.14->**25.44**, q5_0 22.16->**24.56**, q5_1 22.23->**25.00**,
 iq4_nl 22.92->**24.94** (+9-13 %) with prefill unchanged; gfx1151 (9B) 19.24->**23.65**, 18.63->**23.48**,
 18.58->**23.54**, 19.10->**23.31** (**+22-27 %**) for a 0.6-1.1 % prefill cost.  Record:
-`wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §I; diff
+`archive/work/issue-30-mtp-decode-regression/MEASUREMENTS.md` §I; diff
 `patches/2026-09-15-item2-native-arms-all-quants.diff`.
 
 - **Context.**  The quantized-KV decode depth fall-off was the whole-cache F16 staging the tile kernel
@@ -373,7 +373,7 @@ enablement there and runs host-only/CPU.
   the force-inlined native loaders is what makes them fast.  The loaders stay force-inlined and the
   build-speed answer is **ccache** (the script's wiped rebuild went 282 -> 4.2 s; the script enables
   it when `ccache` is on PATH).  Evidence, the TU-timing tool and the reproduction recipe:
-  `wip/build-time-regression/`; the r6 records are in `patches/README.md` and `WORKLOG.md`
+  `archive/work/build-time-regression/`; the r6 records are in `patches/README.md` and `WORKLOG.md`
   (2026-09-18 (r6) and (build process)).
 - **`rdna-boosts-all.patch` hygiene (raised 2026-09-15).**  The single-file net patch is a documented
   delivery artifact (1.35 MiB) that is regenerated on every release, so each revision adds ~1.3 MiB of
@@ -421,9 +421,9 @@ enablement there and runs host-only/CPU.
   chasing: the fix would add work to the single-token decode for an unmeasurable reward, and it is the
   same recurring 0.5-9 % retrofit class as §19.  **Revisit only on an `argmax` change**; re-run the
   8-type x 5-length grid (~20 min) whenever a single-token-tuned kernel changes.  Detail:
-  `GREEDY-PURITY.md` §36 + `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §J.
+  `GREEDY-PURITY.md` §36 + `archive/work/issue-30-mtp-decode-regression/MEASUREMENTS.md` §J.
 - **Issue #30 wider-configuration umbrella — every action resolved (closed 2026-09-14; block-04 + block-15
-  amendments, r3 + r4).**  Dossier `wip/issue-30-mtp-decode-regression/`.  What it cost: the arm-P
+  amendments, r3 + r4).**  Dossier `archive/work/issue-30-mtp-decode-regression/`.  What it cost: the arm-P
   reconciliation (the q8_0-KV depth fall-off, fixed by making block 15's V4 native staging the default for
   sub-F16 quants and adding the missing q4_0 arm); the adaptive-MTP `-c 196608` ceiling-12 load failure
   (the ~744 MiB F16 scratch the same policy removes); the deep-prefill regression (block 04: the head-256

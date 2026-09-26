@@ -9,7 +9,7 @@ anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 > block 15 to restore the typed non-swizzled MMA FA K/V store (issue #47), net tree `a3dc4bbb…`.**
 > `beta/mmb-general/` is retained only as the
 > historical verification record and the `apply-beta.sh` helper has been removed.  The working
-> plan, per-patch mapping and validation record are in `wip/beta-integration/integration.md`.
+> plan, per-patch mapping and validation record are in `archive/work/beta-integration/integration.md`.
 
 ## What this repo is
 
@@ -253,7 +253,7 @@ re-based 2026-09-06 from `9cffdcc80`, re-based 2026-09-02 from `0eadefebd`).
   `tg64@32768`/`pp8192` within 0.12 %.  The remaining critical path is the `fattn-mma-f16` instance set,
   which this delivery also grew (its native-KV arm chain instantiates the whole WMMA kernel per type in
   every instance TU: 0.90 -> 7.26 MB, 6.7 -> 229 s) — diagnosed, left as a follow-up.  See
-  `patches/README.md` (the two 2026-09-15 block-15 amendment sections), `wip/build-time-regression/` and
+  `patches/README.md` (the two 2026-09-15 block-15 amendment sections), `archive/work/build-time-regression/` and
   `TODO.md`.  **Amended 2026-09-15 (issue #30's second
   round, release `v16-790cf51aa-r4`)** with four things: (1) the **mixed-K/V kernel contract** — the tile
   kernel is instantiated with ONE `type_KV` for both operands while `launch_fattn` chose its native read
@@ -534,11 +534,11 @@ explicitly requests it.**
 | `rdna-boosts-all.patch` | the entire 16-patch net as ONE patch (fork point only) |
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `prompts/` | versioned, hash-stable test prompts for the decode/MTP/coherence gates; each prompt's size + token count + **sha256** is recorded in `prompts/README.md`, and a shipped prompt is **never edited in place** (add a new file).  A reported throughput/acceptance/purity result is only valid against the prompt hash it names |
-| `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live/unpromoted work (currently `wip/nwarps/` — the per-M `nwarps` impurity — plus `wip/bf16-native-prefill/`, `wip/q8-prefill-tuning/`, `wip/build-time-regression/` and the other live trees); completed trees are archived under `archive/work/` (see the WIP rule below) |
+| `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live/unpromoted work: **as of the 2026-09-26 consolidation it contains a single tree, `wip/nwarps/`** — the per-M `nwarps` impurity, the one piece deliberately left open (default-OFF, breaks `W=1..8` width purity).  Every other campaign (including `per16-f16-mma` and `mmq-pipeline`) is closed and archived under `archive/work/` (see the WIP rule below) |
 | `beta/` | **historical campaign record** — holds **`beta/mmb-general/`** (the `mmb`/`qsa3`/indexer campaign, promoted 2026-09-21 and consolidated with the `closing-the-gap` campaign 2026-09-25).  It is **no longer applied separately**: the 28 patches are folded into the 16 delivery blocks (in `main` since release `v16-84e76d8a2-r8`), so `patches/*` alone reproduce the campaign tree `24bb0f5acb…`, and `apply-beta.sh` was removed.  Kept for the campaign's verification record (`BETA-TESTING.md`, the gfx1201/gfx1100 measurement records).  Previously staged campaigns were promoted and archived (`archive/work/block-15-campaign-wins/` = block 15, `archive/work/tensor-fit-fix/` = the r12 `--fit` for `-sm tensor` amendment, and the qwen4exp support = block 14).  See the WIP rule below |
 | `upstream/` | **upstream-PR candidates** — self-contained changes that could be filed against unadulterated `ggml-org/llama.cpp` master, each with a `UPSTREAM-PR-*.md` note + `.patch` (see its README for the double-apply caution and the status table) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
-| `archive/work/` | closed experiments, preserved for future re-evaluation (includes the completed `wip/` trees archived 2026-09-12) |
+| `archive/work/` | closed experiments, preserved for future re-evaluation (includes the completed `wip/` trees archived 2026-09-12 and the 16-tree 2026-09-26 consolidation) |
 | `baseline/*` branches, `block/*` tags | **historical** pre-block-12 checkpoints — do not use for the current delivery |
 | `.github/workflows/validate.yml` | per-push/PR delivery validation (runs `scripts/validate-set.sh`; no build) |
 | `.github/workflows/docker-ghcr.yml` | **tag-driven** release pipeline (`v*` tag → ROCm images to GHCR + a GitHub Release with the packaged patch set; manual dispatch and weekly schedule also build).  Fork point is read from `release.json`; see `CONTAINERS.md` |
@@ -692,7 +692,7 @@ full set is ~1136 t/s (**+36 %**), and the first `hc_combine_norm` win was left 
   *remaining* critical path and is already **6.7 -> 229 s per instance TU** (object 0.90 -> 7.26 MB,
   because each instance file carries one WMMA kernel copy per type) — it needs a code-path change
   (finer generated-file granularity, or a runtime KV-type dispatch in the loader) with its own A/B, so
-  it is parked in `TODO.md` with the measurements in `wip/build-time-regression/`.  Quick check with
+  it is parked in `TODO.md` with the measurements in `archive/work/build-time-regression/`.  Quick check with
   `nm -C <obj> | grep -c <case symbol>`: the dispatch TU must show **`U`** for every type and the
   instance TUs must show `T`/`W`.
 - **The set applies whitespace-clean**: `apply-all.sh` prints no git
@@ -881,9 +881,14 @@ full set is ~1136 t/s (**+36 %**), and the first `hc_combine_norm` win was left 
   llama.cpp checkout, never fold their content into `patches/`, and never
   present their results as delivery claims, **unless the user explicitly
   asks you to work with a specific item**. They are kept for future
-  re-evaluation only.  (2026-09-12: the completed `wip/` trees were moved to
-  `archive/work/`; `wip/` now holds the live trees (`nwarps/`, `bf16-native-prefill/`,
-  `q8-prefill-tuning/`, `build-time-regression/`, the campaign handoffs, and `beta-integration/`).)
+  re-evaluation only.  (2026-09-12: the first batch of completed `wip/` trees was moved to
+  `archive/work/`.  **2026-09-26: a second consolidation moved every remaining campaign except
+  `nwarps/` — `per16-f16-mma`, `mmq-pipeline`, `beta-integration`, `bf16-native-prefill`,
+  `build-time-regression`, `closing-the-gap`, `issue-30-mtp-decode-regression`,
+  `issue-44-hc-combine-oracle`, `issue-45-band-port`, `kq-derived-tile`, `kq-mask-derived-ab`,
+  `mtp-journey-2026-09-17`, `prefill-arrangements`, `q8-prefill-tuning`, `reasoning-aware-mtp` and
+  `tiled-gdn` — into `archive/work/`, so `wip/` now holds only `nwarps/`; the `per16-f16-mma` and
+  `mmq-pipeline` wip branches were retired after their content was archived.)
 - **Promotion rule (the sanctioned way out of `wip/`):** a campaign's
 - **The campaign is folded into the delivery (`main`, release `v16-84e76d8a2-r8`, 2026-09-25).**  The
   `mmb`/`qsa3`/indexer campaign (formerly `beta/mmb-general/`, 28 patches) was folded into the 16
@@ -892,7 +897,7 @@ full set is ~1136 t/s (**+36 %**), and the first `hc_combine_norm` win was left 
   amends block 15** with the issue-#47 typed non-swizzled K/V store fix, net tree `a3dc4bbb…`.
   `beta/mmb-general/` stays as the historical verification record (`BETA-TESTING.md`, the
   gfx1201/gfx1100 records); `apply-beta.sh` was removed.  The fold's mapping is in
-  `wip/beta-integration/integration.md`.  The **`wip/nwarps/`** tree is the one piece deliberately
+  `archive/work/beta-integration/integration.md`.  The **`wip/nwarps/`** tree is the one piece deliberately
   left behind (default-OFF, breaks `W=1..8` width purity — the open impurity to investigate).
   Everything unpromoted stays on a branch and is committed **there, never to `main`**; `main` is only
   advanced when the maintainer calls a promotion or a rebase.
@@ -967,7 +972,7 @@ full set is ~1136 t/s (**+36 %**), and the first `hc_combine_norm` win was left 
   gfx1201 9B @98k +2.57 -> **+3.49 %**, output bit-identical.  V3's memory win is `n_ubatch x n_ctx x
   2` (184.02 -> 88.39 MiB device + 112.02 -> 16.40 MiB host at `-c 98304`/ub 512), not the ~800 MiB
   the campaign note implies (that needs ub ~2048).  A/B matrix, raw CSVs and harness:
-  `wip/kq-mask-derived-ab/`; block-15 amendment section in `patches/README.md`.
+  `archive/work/kq-mask-derived-ab/`; block-15 amendment section in `patches/README.md`.
   **Follow-up 2026-09-19 (r9, supersedes r8)**: the derived mask now works on the **tile** kernel too,
   so the head-cap case that r8 merely explained is *fixed*.  A head above the per-arch WMMA cap (or
   `GGML_CUDA_FA_WMMA_256=0`) no longer loses V3, and on the tile path it is a deep-prefill *win*
@@ -1128,7 +1133,7 @@ answer to "the build is slow" — do **not** outline the FA loader: option (b)
 was measured 2026-09-18 (runtime KV-type dispatch made it *worse*; a
 `__noinline__` loader cut the clean build 236 -> 136 s but cost a universal
 ~1.5-2.5 % prefill, because the outlined call sites degrade the kernel's
-register allocation), see `patches/README.md` / `wip/build-time-regression/`.
+register allocation), see `patches/README.md` / `archive/work/build-time-regression/`.
 
 ## What NOT to do
 

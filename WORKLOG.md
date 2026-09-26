@@ -1,5 +1,27 @@
 # WORKLOG — dated delivery records
 
+## 2026-09-26 (repo hygiene) — `wip/` consolidation: every campaign except `nwarps/` archived
+
+**Not a delivery change** — no patch, no `release.json` hash, no runtime behaviour touched.  Every
+campaign tree under `wip/` except **`nwarps/`** (the per-M `nwarps` width-purity impurity, the one
+item deliberately left open) was closed and moved to `archive/work/`:
+
+* the two 2026-09-26 kernel campaigns — **`per16-f16-mma`** (parked: the per-16→F16 route's ceiling is
+the int8 MMQ, not hipBLAS) and **`mmq-pipeline`** (closed **negative**: the MMQ software pipeline is
+15-18 % slower at equal geometry, and the `I=64` geometry it needs is ~21 % slower — the kernel is
+per-element-epilogue/`ldmatrix` bound, not global-load/barrier bound);
+* the previously-completed trees — `beta-integration`, `bf16-native-prefill` (closed negative),
+  `build-time-regression` (fixed), `closing-the-gap` (consolidated into `beta/mmb-general/`),
+  `issue-30-mtp-decode-regression`, `issue-44-hc-combine-oracle`, `issue-45-band-port`,
+  `kq-derived-tile`, `kq-mask-derived-ab`, `mtp-journey-2026-09-17`;
+* the dormant scoping records — `prefill-arrangements`, `q8-prefill-tuning`, `reasoning-aware-mtp`,
+  `tiled-gdn`.
+
+`per16-f16-mma` and `mmq-pipeline` existed only on `wip/*` branches; their content was materialised
+into `archive/work/` and the branches retired.  Cross-references in tracked docs were rewritten
+(`wip/<x>` → `archive/work/<x>`); verbatim profiler logs/CSVs under the moved trees keep the old
+absolute paths.  `wip/` now contains a single tree (`nwarps/`).  See `archive/README.md`.
+
 ## 2026-09-26 (r9) — block-15 amendment: restore the typed non-swizzled K/V store in the MMA FA loader (issue #47)
 
 **Issue.**  [stew675/llama-cpp-rdna-boosts#47](https://github.com/stew675/llama-cpp-rdna-boosts/issues/47)
@@ -95,7 +117,7 @@ pair-fusion stand-down + 0027 (MMVQ band); block 15 (campaign memory/attention) 
 0004/0005/0008/0011/0013/0016-0024/0026.  The qwen4exp/QSA/HC/indexer group lands in block 15 (not 14)
 because block 15 owns the intervening `qwen4exp.cpp`/`ggml-cuda.cu` code the beta series was authored
 against; the alternative is per-hunk splits with a less clean intermediate history (recorded in
-`wip/beta-integration/integration.md` as the open review question).
+`archive/work/beta-integration/integration.md` as the open review question).
 
 **Validation.**
 - Rebuilt tip tree == `mmb-beta` tree (`24bb0f5acb…`); `git diff` empty.
@@ -308,7 +330,7 @@ emitted EOS as its first generated token.  The reporter's root cause is exact: t
 **The fix.**  The CPU reference now uses each tensor's own `nb[1]` row step, 0 for a broadcast
 `ne[1] == 1`, exactly mirroring the CUDA kernel.  `nt == 1` (decode) is bit-identical.
 
-**Validation (gfx1100).**  A standalone op-level oracle (`wip/issue-44-hc-combine-oracle/hctest.cpp`,
+**Validation (gfx1100).**  A standalone op-level oracle (`archive/work/issue-44-hc-combine-oracle/hctest.cpp`,
 links `ggml`/`ggml-cpu`/`ggml-hip`) builds `GGML_OP_HC_COMBINE` with the real layouts (`block_out`
 contiguous `[n_embd, nt]`, `inject` a view with row stride `n_embd+hc`), runs CPU and HIP, and
 compares both to a host reference: **pre-fix 7 of 8 cases FAIL on CPU (nt = 2/4/7 and the broadcast
@@ -507,7 +529,7 @@ next task, deliberately staged after the base patch set is frozen.
   and one-token drafts; after, **0 errors**, acceptance 0.287 (per-position 0.679/0.462/0.333…), the
   `draft-mtp-adaptive` path 35.4 t/s with real depth transitions.  The non-shared `Q4_K_M` head is
   unchanged (it never sets `ctx_other`).  Campaign record:
-  `wip/closing-the-gap/2026-09-22-mtp-shared-nextn-fix.md`.
+  `archive/work/closing-the-gap/2026-09-22-mtp-shared-nextn-fix.md`.
 * **Regenerated.**  `scripts/make-patches.sh` + `make-release.sh`, `rdna-boosts-all.patch`; the rebuilt
   fork chain is `rdna-boosts-r13` (`8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`).  The WIP campaign's
   `patches/0015` is superseded by this (do not fold it again when rebuilding the campaign on r13).
@@ -515,14 +537,14 @@ next task, deliberately staged after the base patch set is frozen.
 ## 2026-09-22 (WIP/dev, not a delivery change) — session-5 profile + `-lzm` semantics; managed PLE reader gated OFF
 
 **No delivery change.**  Fork `gap-closing` tip **`9904c347d`** (9 gap-closing commits, exported as
-`wip/closing-the-gap/patches/0009`).
+`archive/work/closing-the-gap/patches/0009`).
 
 * **Fresh target-ubatch profile** (qwen4exp IQ4_NL, gfx1151, `-b 8192 -ub 8192 -p 32768`): ours 52994 ms
   vs the reference 46737 ms (+13.4 %).  The remaining gap is **BF16 intermediate traffic** —
   `hc_combine_norm` +1811 ms (its `blk16`/`res16` vs our F32), MoE epilogue +633 ms
   (`MMB_DOWN16`) — plus the non-lossy `mmb_cvt` (+1478 ms), indexer relu-sum (+590 ms) and the dense
   GEMM call-count difference.  Full table + the memory accounting (28 GB PLE residency + 9 GB HC pins)
-  in `wip/closing-the-gap/closing-the-gap.md` (session-5 finding).
+  in `archive/work/closing-the-gap/closing-the-gap.md` (session-5 finding).
 * **`-lzm` semantics redefined** (was: `auto` = upstream auto only, `--lazy-buffer-size` selected a
   managed reader): now `on` = classic mmap lazy, `off` = full preload, `auto` = upstream auto with the
   **managed LRU PLE reader opt-in via `LLAMA_LAZY_BUF_MB=<MiB>`**; the `--lazy-buffer-size` CLI argument
@@ -543,8 +565,8 @@ arch-neutral groups).  It is **not** the purity contract: `GREEDY-PURITY.md` §5
 `beta/mmb-general/README.md` calls the MMB on/off logit change the **"approved prefill re-baseline"**.
 Under the default-on policy `MMB=0` is also no longer "the default minus MMB".
 
-Corrected references: `wip/closing-the-gap/closing-the-gap.md` (START HERE item 1, the session-3
-"gates owed" line, + a new dated correction record), `wip/closing-the-gap/README.md` ("Do first" item
+Corrected references: `archive/work/closing-the-gap/closing-the-gap.md` (START HERE item 1, the session-3
+"gates owed" line, + a new dated correction record), `archive/work/closing-the-gap/README.md` ("Do first" item
 1) and `beta/mmb-general/BETA-TESTING.md` §0 + Gate 1.  Measured for the record (dense 27B Q8, 128-token
 greedy, `prompts/prose-rdna-boosts.txt`, seed 42 / temp 0): r12 = `gap-closing MMB=0` = `2eb597253646`;
 `gap-closing` default = `efad2aa9a83e` (the re-baseline).  Op oracles re-run green on the default
@@ -559,7 +581,7 @@ push (`830770a`, merged).
 patches, branch `mmb-beta`, tree `bca69f23dd…`) and built with `~/bin/build-llama-rocm-714`; clean
 build, no errors.  This is the tree the `BETA-TESTING.md` re-validation runs against.
 
-**New WIP: `wip/closing-the-gap/`.**  The 2026-09-20 `~/closing-the-gap.md` moved there and was
+**New WIP: `archive/work/closing-the-gap/`.**  The 2026-09-20 `~/closing-the-gap.md` moved there and was
 refreshed:  our reference is now the 12-patch `beta/mmb-general` (not the pre-promotion 5-patch gfx1151
 WIP); pwilkin's branch moved `f5daaa3cf` → `b0f31f587` (10 commits — MMB quant coverage 10→23 types +
 Flash-Next F32 PLE fusion; maskless-only-where-qsa3, also a prefill win; sparse QSA decode +
@@ -1216,7 +1238,7 @@ claim was now false, so it was reworded to say only that neither prefill kernel 
 README "VRAM vs prefill" section (rewritten: the tile limitation is gone, the tile-path numbers and
 the no-decode-cost evidence are in, and the stale-`GGML_CUDA_FA_WMMA_256=0` advice survives as a pure
 performance note), `patches/README.md` (header + this amendment section), `MANIFESTS.md`'s header
-(which had drifted at r4), `AGENTS.md`, and the WIP records under `wip/kq-derived-tile/`.
+(which had drifted at r4), `AGENTS.md`, and the WIP records under `archive/work/kq-derived-tile/`.
 
 ## 2026-09-19 (r8) — `v16-ebbb18522-r8`: the V3 derived-mask disable now explains itself
 
@@ -1258,7 +1280,7 @@ Release r8: tip `63e6aa1ff`, tree `bee36f6f9`; only block 15 changed; strict 16/
 
 Issue #30's second report (@a-n-t-0, 2x RX 7900 XTX / gfx1100, 27B Q8_0, f16 KV) found
 `LLAMA_KQ_MASK_DERIVED=0` recovering **+5.7 % (tensor) / +13.2 % (layer)** deep prefill at 100k.  A
-three-arch A/B (`wip/kq-mask-derived-ab/`, 16 configs, `-r 3`, gfx1201 + gfx1151 + gfx1100)
+three-arch A/B (`archive/work/kq-mask-derived-ab/`, 16 configs, `-r 3`, gfx1201 + gfx1151 + gfx1100)
 reproduced it and showed the effect is **sign-unstable across arch *and* model config**, not an arch
 gate:
 
@@ -1296,7 +1318,7 @@ same, so no purity gate moves.  The reported V3 memory win is `n_ubatch x n_ctx 
 the campaign's ~800 MiB figure needs ub ~2048).
 
 Release r7: tip `f56689f17`, tree `9d236e9a2`; strict 16/16 `git am`, `validate-set.sh` green.  Work
-dossier (matrix, raw CSVs, harness, the patch): `wip/kq-mask-derived-ab/`; block-15 amendment section
+dossier (matrix, raw CSVs, harness, the patch): `archive/work/kq-mask-derived-ab/`; block-15 amendment section
 in `patches/README.md`.
 
 ## 2026-09-18 (build process) — FFI build cost: option (b) rejected, ccache adopted
@@ -1327,7 +1349,7 @@ costs a recompile of unchanged sources: first build 282.3 s, wiped rebuild of th
 **4.2 s** (657/657 compile steps hit).  ccache replays the compiler's own objects, so the cached
 build is identical code — `test-backend-ops -o FLASH_ATTN_EXT` 4/4 and `llama-bench` within noise
 (pp2048 d0 7548 vs 7489, tg128 d16384 89.51 vs 89.47).  A `fattn-*.cuh` edit still invalidates the
-FA group.  See `wip/build-time-regression/README.md` and the README/AGENTS build notes.
+FA group.  See `archive/work/build-time-regression/README.md` and the README/AGENTS build notes.
 
 ## 2026-09-18 (r6) — `v16-ebbb18522-r6`: the FA instance build-time fix (blocks 06/13/15)
 
@@ -1344,7 +1366,7 @@ split: 96 added / 12 deleted `fattn-tile*.cu`).  Strict 16/16 `git am` re-verifi
 **Why.**  The delivery's own FA instantiations had become the build's critical path: block 15's
 native-KV arm chain in `ggml_cuda_flash_attn_ext_mma_f16_case` instantiates the whole WMMA kernel
 once per KV type **inside every generated MMA instance TU**, so each 8-case `fattn-mma*` file was
-~200 s and one TU gated the backend build (`wip/build-time-regression/`).  The r5 tile-macro fix had
+~200 s and one TU gated the backend build (`archive/work/build-time-regression/`).  The r5 tile-macro fix had
 already moved the tile type axis into the generated files; this release does the same for the MMA
 head axis and the tile KV-type axis, and puts the heaviest instances **first** in the backend source
 order.
@@ -1572,7 +1594,7 @@ What was actually wrong: `benchmarks/README.md` and `benchmarks/mtp-adaptive-met
 0.60232) -- which is why the delivery appeared to underperform its own documented numbers.  Both
 pointers now name `2026-09-15-adaptive-mtp-tuning.md` as the current controller record and mark the
 2026-09-13 record as the table arm.  Full corpus, sweeps and report:
-`wip/mtp-journey-2026-09-17/` (WIP, not part of the delivery).
+`archive/work/mtp-journey-2026-09-17/` (WIP, not part of the delivery).
 
 The top-level `README.md` gained a **Recommended configuration** section naming the `ngram-mod` +
 adaptive-MTP combo (`--spec-ngram-mod-n-match 45 --spec-draft-n-max 9 --spec-draft-n-start 9`) as the
@@ -1596,7 +1618,7 @@ plus a CI fix:
   already failed, so there is no codegen change -- verified on the worst TU
   (`fattn-mma-f16-instance-ncols1_8-ncols2_4.cu`: **1692 -> 0** warnings), and the rebuilt tree is
   clean apart from upstream's pre-existing `-Wunused-private-field`.  Details and the measurements:
-  `wip/build-time-regression/README.md`.
+  `archive/work/build-time-regression/README.md`.
 * **Block 01 — the adaptive-controller comment no longer contradicts the code.**
   `common/speculative-adaptive.h` documented an ngram-mod acceptance feed ("a strong run by another
   speculator ... climbs the depth one step per round") that `common_speculative_impl_draft_mtp::accept`
@@ -1772,7 +1794,7 @@ check aborts.  The `ce` init does that.
 tarball at `d1d3c3396`, applied tree == `release.json.tree`); the amended tree builds clean; the
 `hybrid` default and the `ce` (decode-unchanged, greedy-identical, MTP-pure) behaviour re-measured on
 the delivered tree.  Detail, the design of the follow-on overlap work, and the raw measurements:
-`wip/q8-prefill-tuning/` (HANDOVER.md, OVERLAP-DESIGN.md).
+`archive/work/q8-prefill-tuning/` (HANDOVER.md, OVERLAP-DESIGN.md).
 
 ## 2026-09-15 (release process) — release versioning standardized and enforced
 
@@ -2077,7 +2099,7 @@ loops whose bounds are runtime values (dominantly the K/V staging loop at `421:1
 count found").  Those pragmas are upstream's and identical at the base; only the *count* is amplified by
 our extra instantiations.  Warnings, not errors.
 
-**Docs.**  `wip/build-time-regression/` (README + tools + the raw logs/timings),
+**Docs.**  `archive/work/build-time-regression/` (README + tools + the raw logs/timings),
 `patches/README.md` (the two 2026-09-15 block-15 amendment sections), `AGENTS.md` (the new
 "FA instantiation discipline" critical fact + the block-15 bullet + the canonical tip/tree),
 `README.md`, `MANIFESTS.md`, `BASELINE.md`, `TODO.md` (the MMA follow-up).
@@ -2141,7 +2163,7 @@ unchanged** and the top-2 margin at 2.2+ (bf16 delta 0.014, q4_1 delta 0.064), a
 
 **Docs.**  `../AGENTS.md` (the KV-purity critical-facts bullet), `GREEDY-PURITY.md` §36, `TODO.md`
 (items 2 and 21 -> Closed), `patches/README.md` (the 2026-09-15 block-15 amendment section),
-`wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §F-H + §I.
+`archive/work/issue-30-mtp-decode-regression/MEASUREMENTS.md` §F-H + §I.
 
 **Also 2026-09-15 — the `W=1` vs `W>=2` logits edge: investigated, documented, WON'T FIX.**  §36 had
 described a residual `n_q = 1` vs `n_q >= 2` difference and attributed it to the `n_q = 1` launch running
@@ -2204,7 +2226,7 @@ regression** — screen with the slope fit at pp8-48K and always measure 1 GPU t
 
 ## 2026-09-14 — block-15 amendment: V4 native staging is the default for sub-F16 KV quants + the q4_0 native arm (issue #30)
 
-**Why.**  Issue #30's reconciliation (`wip/issue-30-mtp-decode-regression/`) isolated a real
+**Why.**  Issue #30's reconciliation (`archive/work/issue-30-mtp-decode-regression/`) isolated a real
 delivery-specific regression: with a **quantized** K/V cache the delivery's decode falls off faster with
 context depth than stock.  Measured on 1 GPU (27B UD-Q4_K_XL, `tg64`, `-fa auto`): the delivery q8_0
 retained 66.1 % of its d0 rate at d65536 vs stock's 80.1 % (18.92 vs 22.43 t/s), q4_0 68.9 % vs 75.9 %
@@ -2240,7 +2262,7 @@ staging scratch was exactly the 260 MiB the MTP draft context was short.  With t
 config loads at the default `n_slots = 4` and generates (34.76 t/s, acceptance 0.3404);
 `GGML_CUDA_FA_KV_NATIVE=0` reproduces the failure.  The deeper recurrent-state snapshot budget and its
 levers (including an opt-in f32 -> bf16 snapshot trade to be measured) are filed in
-`wip/issue-30-mtp-decode-regression/RECURRENT-SNAPSHOT-BUDGET.md`.
+`archive/work/issue-30-mtp-decode-regression/RECURRENT-SNAPSHOT-BUDGET.md`.
 
 **Action E (#28867 head-256 WMMA threshold) — investigated, no delivery change.**  The reporter's ~20 %
 regression is upstream-master-specific: the delivery's `Q->ne[1] > 8` guard already keeps the whole

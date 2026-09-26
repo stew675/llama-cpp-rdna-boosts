@@ -35,7 +35,7 @@ the `mmb` fusion stand-downs and the MMVQ band in **blocks 13/14**, and `qsa3`/i
 in **block 15**.  Strict `git am` 16/16, `scripts/validate-set.sh` PASS, gfx1201 build clean.
 `beta/mmb-general/` is kept as the historical verification record and `scripts/apply-beta.sh` has
 been removed.  Full record: `WORKLOG.md` (2026-09-25, the `beta-integration`/promotion entries) and
-`wip/beta-integration/integration.md`.
+`archive/work/beta-integration/integration.md`.
 
 **Previous release (2026-09-25) — `v16-84e76d8a2-r7`:** a block-14 scheduler correctness fix.  The
 multi-device no-sync gallocr re-reserve guard in `ggml_backend_sched_alloc_splits` counted scheduler
@@ -214,7 +214,7 @@ carry 8 cases each and the dispatch only externs: **538 s -> 330 s**, `fattn-til
 s**, with byte-identical kernels (FA test 5951/5951; 27B text hashes unchanged; per-type perf within
 0.12 %).  The remaining critical path is the `fattn-mma-f16` instance set, which the same delivery grew
 8x (0.90 -> 7.26 MB, 6.7 -> 229 s per TU) — diagnosed, follow-up in `TODO.md`.
-`wip/build-time-regression/`.  Tip `6f76c1cb1d80c7ecbf176f939a351bc385ff33fc`, tree
+`archive/work/build-time-regression/`.  Tip `6f76c1cb1d80c7ecbf176f939a351bc385ff33fc`, tree
 `d735d6c11258ae939cfd392511e3f29ac22a7686`.
 
 **Block-15 amendment (2026-09-15, issue #30 second round) — r4:**
@@ -229,13 +229,13 @@ arena + the RDNA3_5 arch gate (TODO 21: gfx1201 q8_0 `pp150000` 691/1077/1199 on
 `native == staging` identical for all eight KV types on both.  Canonical tip
 **`b19c70b341f9ed439bcda2a636fe6e5fa4fa634b`**, tree **`7fab975d9518b29aa7d890c1163f13a6c393c5df`**,
 strict 16/16, applied tree == recorded.  Record:
-`wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §F-H + §I, `WORKLOG.md` 2026-09-15,
+`archive/work/issue-30-mtp-decode-regression/MEASUREMENTS.md` §F-H + §I, `WORKLOG.md` 2026-09-15,
 `patches/README.md` (the 2026-09-15 block-15 amendment), `GREEDY-PURITY.md` §36.
 **Block-04 amendment (2026-09-14 (later), issue #30):** the RDNA prefill regression is fixed — the
 head-256 `ncols=64` WMMA config is now arch-aware (RDNA3_5 keeps the gfx1151 halo row, RDNA4/RDNA3_0 take
 upstream #28102's row) and `ncols2` is split-aware via the new `ggml_set_fa_tensor_parallel` frontend
 hint.  `pp150000` f16 vs stock: +2.4 % (1 card) / +6.9 % (2-card tensor) / +9.6 % (3-card tensor); 4B
-q4_0 `W=1..8` pure.  Release `v16-790cf51aa-r3`; record `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md`
+q4_0 `W=1..8` pure.  Release `v16-790cf51aa-r3`; record `archive/work/issue-30-mtp-decode-regression/MEASUREMENTS.md`
 §D + `WORKLOG.md` 2026-09-14 (later) + `GREEDY-PURITY.md` §35.
 **Block-15 amendment (2026-09-14, issue #30):** `GGML_CUDA_FA_KV_NATIVE` is now a three-state policy
 (**unset = auto**: native q8_0/q4_0 on, bf16 off; `=1` force all on; `=0` force the F16-staging path) and
@@ -243,7 +243,7 @@ q4_0 gained a native arm, closing the quantized-KV decode-depth fall-off (q8_0 `
 **23.29**, q4_0 19.72 -> **22.82**, ~1.2-1.3 % prefill, bit-identical + `W=1..8`-pure) and fixing the
 `--spec-draft-n-max 12 -c 196608 q8_0` adaptive-MTP load failure (the ~744 MiB F16 staging scratch was
 the 260 MiB the draft context was short).  Release `v16-790cf51aa-r2`; record
-`wip/issue-30-mtp-decode-regression/` + `WORKLOG.md` 2026-09-14 + `GREEDY-PURITY.md` §34.
+`archive/work/issue-30-mtp-decode-regression/` + `WORKLOG.md` 2026-09-14 + `GREEDY-PURITY.md` §34.
 **Current regeneration (2026-09-15, the block-15 amendment for issue #30's second round)**: canonical
 16-block tip **`b19c70b341f9ed439bcda2a636fe6e5fa4fa634b`** (net tree
 **`7fab975d9518b29aa7d890c1163f13a6c393c5df`**), clean-apply strict 16/16 with 0 whitespace warnings and

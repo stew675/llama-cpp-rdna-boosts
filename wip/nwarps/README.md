@@ -5,7 +5,7 @@ of the `mmb-general` beta set on 2026-09-21 so that the beta set could ship with
 default-OFF, cannot be enabled as it stands, and costs build time on every architecture.
 
 Everything needed to pick this up is here.  The originating record is
-[`beta/mmb-general/gfx1100-s9-nwarps-results.md`](../beta/mmb-general/gfx1100-s9-nwarps-results.md)
+[`beta/mmb-general/gfx1100-s9-nwarps-results.md`](../../beta/mmb-general/gfx1100-s9-nwarps-results.md)
 (the gfx1100 session that found it, on a single RX 7900 XTX).
 
 ## 1. The finding

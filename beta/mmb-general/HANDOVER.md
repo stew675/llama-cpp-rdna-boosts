@@ -3,7 +3,7 @@
 > **INTEGRATED 2026-09-25 — folded into the delivery; this directory is the historical verification
 > record.**  The campaign is no longer a separate beta set: on the `beta-integration` branch the 28
 > patches are absorbed into the 16 delivery blocks and `apply-beta.sh` was removed.  The handoff
-> instructions below are historical.  See `../../wip/beta-integration/integration.md` and
+> instructions below are historical.  See `../../archive/work/beta-integration/integration.md` and
 > `../../WORKLOG.md` (2026-09-25).
 
 **Date:** 2026-09-20 (sessions 1-18).  **Status:** ACTIVE WIP, not part of the delivery, and the
@@ -43,7 +43,7 @@ sections after it are the dated history (newest first).  `README.md` is the runn
 > folded into `patches/` (28 patches: the 12 core + 16 appended, ten closing patches folded into the
 > core), and the whole set was re-based on the **r13** delivery tree (`bb7b6d07…`).  The apply recipe
 > is r13 + strict `git am patches/*.patch` → tree **`468c6496…`**; see `README.md` and
-> `wip/closing-the-gap/consolidation.md`.  The r12-era branch/base details below are historical.
+> `archive/work/closing-the-gap/consolidation.md`.  The r12-era branch/base details below are historical.
 
 ---
 
@@ -1849,7 +1849,7 @@ simulated Q8_0 per-32-block scale epilogue on each:
 
 **gfx1151's int8 and bf16 tensor cores run at the same rate**, and the Q8_0 epilogue then makes the
 int8 path *worse* than the bf16 path.  The 174 T-MAC/s / "FP8 == INT8" figures in §9 and
-`wip/q8-prefill-tuning` are **gfx1201** measurements; they do not transfer to Strix Halo.  The whole
+`archive/work/q8-prefill-tuning` are **gfx1201** measurements; they do not transfer to Strix Halo.  The whole
 "Q8_0 -> int8 IU8 WMMA, avoid the dequant staging" idea is **a net loss on the target arch** — the
 current dequant-to-bf16 path is the correct design.  (27.6 T-MAC/s = 55.2 TFLOPS, matching the
 handover's ~59 TFLOPS bf16 roof; the tool reports 20 CUs.)
@@ -1909,7 +1909,7 @@ bf16 for the tensor core), and the GLU pays it twice (gate + up).
    real kernel and real weights; no shadow plumbing is needed to test the idea.  Same for
    `Qwen3.6-35B-A3B-Q4_K_M` vs `UD-Q5_K_M` for WTYPE 3 vs 6/8.
 4. **The microbenchmark builtin matters.**  gfx11's int8 WMMA takes `v4i` operands and has no
-   `_gfx12` suffix; the gfx12 tool in `wip/q8-prefill-tuning/tools/` will not compile for gfx1151.
+   `_gfx12` suffix; the gfx12 tool in `archive/work/q8-prefill-tuning/tools/` will not compile for gfx1151.
 
 ### Consequence for the next work
 
@@ -2632,7 +2632,7 @@ by construction.  Document the re-baseline with a new same-seed hash.
    `ggml/src/ggml-cuda/fattn-qsa.cu`.  Decide whether to add the buffers as extra op `src[]` or to
    build them inside the op's launcher (the latter avoids graph/allocator changes but re-packs per
    call).  The handover for the parked port (`archive/work/wip-archive/iq4nl-prefill/`) and
-   `wip/prefill-arrangements/README.md` both scope this.
+   `archive/work/prefill-arrangements/README.md` both scope this.
 2. **Descriptor.**  Port `qsa3_rows_kernel` + `qsa3_merge_kernel`: merge `G = 4` consecutive queries'
    top-k lists into a sorted, deduplicated, block-aligned array of block ids + a 16-bit per-query
    membership mask + count (his `ublk`/`umask`/`ucount`).
@@ -2664,7 +2664,7 @@ kernel occupancy-bound.
   `hc_* M=320/10240`, `ffn_*_shexp M=640 K=2560`.
 * The tile heuristic is optimal; the kernel is **occupancy/LDS-bound**, not tiling-bound.
 * `v_wmma_i32_16x16x16_iu8` measured ~171-175 T-MAC/s on gfx1201 (see
-  `wip/q8-prefill-tuning/README.md`); the same doc notes the mainline MMQ Q8_0 kernel reaches only
+  `archive/work/q8-prefill-tuning/README.md`); the same doc notes the mainline MMQ Q8_0 kernel reaches only
   31-34 % of the int8-WMMA ceiling and its k-loop has no double-buffering.
 
 **Steps:** quantize the activations to int8 (Q8_1-style scales) — note this is a numerics change too,

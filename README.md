@@ -32,7 +32,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 > **The `mmb`/QSA/indexer campaign is folded into the delivery (2026-09-25, release `r8`).**  The 16
 > delivery patches now absorb the 28 `beta/mmb-general/` patches; the applied tree is `24bb0f5acb…`
 > and the build is clean on gfx1201.  The working plan, per-patch mapping and validation record are
-> in [`wip/beta-integration/integration.md`](wip/beta-integration/integration.md).
+> in [`archive/work/beta-integration/integration.md`](archive/work/beta-integration/integration.md).
 
 ## Releases
 
@@ -239,7 +239,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # 16/16 strict, tree a3dc4bbb�
 ```
 
 The per-patch fold mapping and validation record are in
-[`wip/beta-integration/integration.md`](wip/beta-integration/integration.md).  Much of the MMB
+[`archive/work/beta-integration/integration.md`](archive/work/beta-integration/integration.md).  Much of the MMB
 kernel work is heavily adapted from **[pwilkin](https://github.com/pwilkin)**'s
 [`strix-halo` fork](https://github.com/pwilkin/llama.cpp/commits/strix-halo/), with thanks.
 
@@ -282,8 +282,8 @@ Guidance:
   `--spec-type draft-mtp-adaptive`.
 
 Full derivation (the 4×4 corpus, all four cells, and the rejected controller alternatives):
-**[`wip/mtp-journey-2026-09-17/SUMMARY.md`](wip/mtp-journey-2026-09-17/SUMMARY.md)** (narrative in its
-[`README.md`](wip/mtp-journey-2026-09-17/README.md)); the dated controller records are in
+**[`archive/work/mtp-journey-2026-09-17/SUMMARY.md`](archive/work/mtp-journey-2026-09-17/SUMMARY.md)** (narrative in its
+[`README.md`](archive/work/mtp-journey-2026-09-17/README.md)); the dated controller records are in
 [`benchmarks/`](benchmarks/README.md), newest `2026-09-15-adaptive-mtp-tuning.md`.
 
 ## VRAM vs prefill — the derived KQ mask (`LLAMA_KQ_MASK_DERIVED`)
@@ -360,7 +360,7 @@ QSA path's own derived visibility** (`GGML_QSA_DERIVED_VIS`, the code's "-800 Mi
 independent of this knob; `LLAMA_KQ_MASK_DERIVED` only serves that model's dense shortcut
 (`n_kv <= 2051`), where the mask is tiny.
 
-Full matrix, raw CSVs and the A/B harness: [`wip/kq-mask-derived-ab/`](wip/kq-mask-derived-ab/); the
+Full matrix, raw CSVs and the A/B harness: [`archive/work/kq-mask-derived-ab/`](archive/work/kq-mask-derived-ab/); the
 2026-09-19 block-15 (r7) amendment in [`patches/README.md`](patches/README.md).
 
 ## When upstream master moves
@@ -403,7 +403,7 @@ for per-block verification and `BASELINE.md` for provenance.
   (with block 14's pair stand-down and block 13's GLU stand-down).  Strict `git am` 16/16
   reproduces the full campaign tree `24bb0f5acb…` and the gfx1201 build is clean.
   `beta/mmb-general/` is kept as the historical verification record and the `apply-beta.sh` helper
-  has been removed.  See [`wip/beta-integration/integration.md`](wip/beta-integration/integration.md).
+  has been removed.  See [`archive/work/beta-integration/integration.md`](archive/work/beta-integration/integration.md).
 - **The RDNA4 GQA-6 decode/verify FA band covers f16 (and, through its native arm, bf16) too
   (block 15, r5, 2026-09-25, issue #45 follow-up, reported by
   [@DanoPTT](https://github.com/DanoPTT)):** the

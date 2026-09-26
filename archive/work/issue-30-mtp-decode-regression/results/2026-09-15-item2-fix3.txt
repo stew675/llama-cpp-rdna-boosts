@@ -1,0 +1,50 @@
+# TRIMMED 2026-09-15 by archive/work/issue-30-mtp-decode-regression/tools/trim-backend-ops-log.py
+#   original: 27353 lines / 2.95 MiB raw test-backend-ops output
+#   kept: header, coverage, failure signatures, totals  (7865 cases)
+
+## header
+ggml_cuda_init: found 1 ROCm devices (Total VRAM: 32624 MiB):
+  Device 0: AMD Radeon AI PRO R9700, gfx1201 (0x1201), VMM: no, Wave Size: 32, VRAM: 32624 MiB
+Testing 2 devices
+Backend 1/2: ROCm0
+  Device description: AMD Radeon AI PRO R9700 (gfx1201)
+  Device memory: 32624 MB (32548 MB free)
+
+## coverage (cases per K/V type pair)
+   2755  type_K=f16     type_V=f16
+   2704  type_K=bf16    type_V=bf16
+    365  type_K=q8_0    type_V=q8_0
+    348  type_K=q4_0    type_V=q4_0
+    336  type_K=f32     type_V=f32
+    336  type_K=iq4_nl  type_V=iq4_nl
+    336  type_K=q4_1    type_V=q4_1
+    336  type_K=q5_0    type_V=q5_0
+    336  type_K=q5_1    type_V=q5_1
+      1  type_K=f16     type_V=f32
+      1  type_K=f16     type_V=q4_0
+      1  type_K=q1_0    type_V=f16
+      1  type_K=q1_0    type_V=q1_0
+      1  type_K=q1_0    type_V=q4_0
+      1  type_K=q2_0    type_V=f16
+      1  type_K=q2_0    type_V=q2_0
+      1  type_K=q2_0    type_V=q4_0
+      1  type_K=q4_0    type_V=f16
+      1  type_K=q4_0    type_V=q1_0
+      1  type_K=q4_0    type_V=q2_0
+      1  type_K=q4_0    type_V=q8_0
+      1  type_K=q8_0    type_V=q4_0
+
+## failures
+    193x  ERR  hsk=64  type_K=q5_0 type_V=q5_0
+         e.g. FLASH_ATTN_EXT(hsk=64,hsv=64,nh=4,nr23=[1,1],kv=113,nb=1,mask=1,sinks=1,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_K=q5_0,type_V=q5_0,permute=[0,1,2,3],kv_view=1,v_is_view_of_k=0,n_kv_max=0derived=0): FAIL
+    191x  ERR  hsk=64  type_K=q5_1 type_V=q5_1
+         e.g. FLASH_ATTN_EXT(hsk=64,hsv=64,nh=4,nr23=[1,1],kv=113,nb=1,mask=1,sinks=1,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_K=q5_1,type_V=q5_1,permute=[0,1,2,3],kv_view=1,v_is_view_of_k=0,n_kv_max=0derived=0): FAIL
+    104x  ERR  hsk=72  type_K=q5_0 type_V=q5_0
+         e.g. FLASH_ATTN_EXT(hsk=72,hsv=72,nh=4,nr23=[1,1],kv=113,nb=1,mask=1,sinks=1,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_K=q5_0,type_V=q5_0,permute=[0,1,2,3],kv_view=1,v_is_view_of_k=0,n_kv_max=0derived=0): FAIL
+     96x  ERR  hsk=72  type_K=q5_1 type_V=q5_1
+         e.g. FLASH_ATTN_EXT(hsk=72,hsv=72,nh=4,nr23=[1,1],kv=113,nb=1,mask=1,sinks=1,max_bias=0.000000,logit_softcap=0.000000,prec=f32,type_K=q5_1,type_V=q5_1,permute=[0,1,2,3],kv_view=1,v_is_view_of_k=0,n_kv_max=0derived=0): FAIL
+
+## totals
+  5327/5951 tests passed
+  Running FA vec slice tests (env LLAMA_TEST_FA_VEC_DISABLE=1 to skip)
+  1/2 backends passed

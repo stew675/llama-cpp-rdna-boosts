@@ -1251,7 +1251,7 @@ path, so its MMA-scratch arm (V5) stays opt-in.  `GGML_CUDA_FA_KV_NATIVE` is a t
 may be elsewhere in the same graph (here the staging scratch), not in the buffer named by the OOM.
 Measure the *total* budget, not the failing allocation.
 * The remaining headroom lever and the opt-in f32 -> bf16 snapshot trade (a purity trade to be *measured*,
-not assumed) are filed in `wip/issue-30-mtp-decode-regression/RECURRENT-SNAPSHOT-BUDGET.md`.
+not assumed) are filed in `archive/work/issue-30-mtp-decode-regression/RECURRENT-SNAPSHOT-BUDGET.md`.
 
 ## 35. A prefill kernel config must be arch- and split-keyed (2026-09-14, issue #30, block-04 amendment)
 
@@ -1281,7 +1281,7 @@ RDNA arch and *every* split mode.  Both were wrong as globals:
   per-cell cost).  Screen a prefill change with the `t = a + b*n` slope fit at pp8-48K and **always
   measure one card as well**.
 
-Results and the full matrix: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §D; `WORKLOG.md`
+Results and the full matrix: `archive/work/issue-30-mtp-decode-regression/MEASUREMENTS.md` §D; `WORKLOG.md`
 2026-09-14 (later); `patches/README.md` (2026-09-14 block-04 section).
 
 ## 36. §14's `W=1..8` purity is a *measured* claim, not a guarantee — relax it for the coarse quants (2026-09-14, issue #30)
@@ -1316,7 +1316,7 @@ from the F16 tile to the native tile, so their pre-2026-09-15 entries (a q4_1 ed
 superseded, not contradicted.
 
 **What is *not* the cause (verified 2026-09-15).**  A temporary launcher dump (`GGML_CUDA_FA_DEBUG2`,
-snippet in `wip/issue-30-mtp-decode-regression/tools/fattn-launch-dump.patch`) shows the decode calls at
+snippet in `archive/work/issue-30-mtp-decode-regression/tools/fattn-launch-dump.patch`) shows the decode calls at
 every width in the band have **identical** reduction structure — 4B, bf16, `P=200`, cache padded to 256:
 
 | | `n_q=1` | `n_q=2` | `n_q=4` |
@@ -1378,7 +1378,7 @@ and recurring with every new single-token-tuned kernel.  The **trigger to revisi
 * Consequence, the same one §19 already states for `n_max > 7`: once the cache is coarse, `plain` and
   `draft-mtp` may disagree on a near-tie.
 
-Evidence: `wip/issue-30-mtp-decode-regression/MEASUREMENTS.md` §G; the 2026-09-15 per-quant grid and the
+Evidence: `archive/work/issue-30-mtp-decode-regression/MEASUREMENTS.md` §G; the 2026-09-15 per-quant grid and the
 item-2 arms are §I (`results/2026-09-15-purity-native-arms-{a,b,c,d}.txt` -
 gfx1201, `results/2026-09-15-item2-purity-halo.txt` - gfx1151, where **all eight types are pure at
 P=256**).
