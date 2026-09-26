@@ -1,9 +1,54 @@
 # `beta-integration` — fold the 28 `beta/mmb-general` patches into the 16 delivery blocks
 
 **Branch:** `beta-integration` (this repo; cut from `main` at `0699a3d`, 2026-09-25).
-**Status:** IN PROGRESS — planning complete, execution not yet started.
+**Status:** **FOLD EXECUTED** (2026-09-25) — the 16 amended patches are regenerated on this branch and
+validated at the tree level; build clean; see the Executed record below.  Remaining: the review/
+docs sweep and the maintainer's promotion decision.
 **Owner:** current session; this file is the running work-task list and the hand-off record.
 **Not part of the delivery until the maintainer signs off** (the `AGENTS.md` promotion rule).
+
+---
+
+## 0. Executed record (2026-09-25)
+
+**Result: `84e76d8a2` + the 16 amended `patches/*.patch` reproduces the beta tree exactly.**
+
+* **Rebuild worktree:** `~/llama-integration`, branch `beta-integration`, tip
+  `f373450de489dd0fafba5bd285e71844109cd0ec`, tree
+  **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** == the 28-patch beta reference tree.
+* **Method:** fresh linear rebuild from `84e76d8a2`; each delivery block cherry-picked and the
+  mapped beta patches cherry-picked into it (`-n`), conflicts resolved to the net final content.
+* **Mapping actually used** (differs from the v1 plan in §4 — see the deviation note):
+  * **block 06 (catch-all):** 0025 (host-buffer input layer), 0028 (CPU tiny split).
+  * **block 08 (prefill/MMB):** 0001 (MMB core), 0003 (F32/tiny-M + width probe), 0006, 0007,
+    0008 (per-arch defaults), 0009, 0010, 0012, 0014 (conv1d fusions), 0015 (norm rows).
+  * **block 13:** the deferred half of 0001 (MMB stand-down of the swiglu->mmq fusion).
+  * **block 14:** the deferred half of 0001 (MMB stand-down of the pair fusion) and 0027
+    (MMVQ routed band).
+  * **block 15 (campaign memory/attention):** 0002 (qsa3), 0003 (qwen4exp always-QSA flip), 0004
+    (HC16 producers), 0005 (indexer top-k), 0008 (HC16/beneficial defaults), 0011, 0013, 0016-0024,
+    0026 — **because block 15 modifies the same `qwen4exp.cpp`/`ggml-cuda.cu` regions the beta
+    series was authored against**, so folding them earlier would require forward references.  This
+    is the main deviation from the v1 plan (which aimed most of these at block 14).
+* **Verification:**
+  * `git diff <rebuilt tip> mmb-beta` **empty** (index tree == `24bb0f5acb…`).
+  * Fresh worktree at `84e76d8a2` + strict `git am` of the 16 regenerated patches -> tree
+    `24bb0f5acb…` (**STRICT-AM-TREE-OK**, 16/16).
+  * `scripts/validate-set.sh` **PASS** (checksums + strict apply on a fresh codeload tarball +
+    tree/count match).
+  * `~/bin/build-llama-rocm-714` (gfx1201, `BUILD_DIR=build-rocm`) **EXIT 0**; `llama-cli`,
+    `llama-bench`, `test-backend-ops` present.
+* **Delivered on this branch:** regenerated `patches/` (16), `rdna-boosts-all.patch`, `release.json`
+  (`tip f373450de…`, `tree 24bb0f5acb…`, `release v16-84e76d8a2-r8-integrated`).
+* **Not yet done:** the runtime gates (§6.3-6.6) were not re-run individually because the tree is
+  byte-identical to the already-validated beta tree (same code -> same result); the docs sweep (§5);
+  the maintainer's promotion decision.
+
+> **Open design question for review:** the qwen4exp/HC/QSA/indexer group landed in **block 15**,
+> not block 14, because block 15 owns the intervening code.  If the maintainer prefers them under
+> block 14, the fold must instead *split* each patch's block-15-context hunks — more churn for a
+> less clean intermediate history.  The current split (MMB/prefill -> 08, catch-all -> 06,
+> qwen4exp campaign -> 15) is the dependency-clean one.
 
 ---
 
@@ -265,7 +310,13 @@ Since the tree is provably identical, gates 3–6 are a sanity re-confirmation, 
 
 ## 9. Progress log (newest first)
 
+- **2026-09-25 (execution)** — the fold was executed in `~/llama-integration` (branch
+  `beta-integration`, tip `f373450de…`) and the 16 amended patches were produced.  Mapping used:
+  block 06 <- 0025/0028; block 08 <- 0001/0003/0006-0010/0012/0014/0015; block 13 <- half of 0001;
+  block 14 <- half of 0001 + 0027; block 15 <- 0002/0003-qwen4exp/0004/0005/0008/0011/0013/
+  0016-0024/0026.  Final tree == `24bb0f5acb…` (beta reference), strict `git am` 16/16,
+  `validate-set.sh` PASS, build EXIT 0.  See §0 for the full record.
 - **2026-09-25** — branch `beta-integration` cut from `main` (`0699a3d`); this plan written.
   Reference state recorded (§2): base `84e76d8a2` / tree `5112eedb…`, delivery r7 tree
   `7726e514…`, beta tip tree `24bb0f5acb…`, fork branches `rdna-boosts` / `mmb-beta`.  Mapping v1
-  drafted (§4).  Execution not yet started.
+  drafted (§4).
