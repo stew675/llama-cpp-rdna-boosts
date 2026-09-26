@@ -11,7 +11,7 @@
   `src/vt/rocm/rocm_paged_attn.hip` as the prefill-attention reference.
 * The precision confound: the 27B FP8 checkpoint is HF safetensors; llama.cpp has no FP8 type.
 * **The path: `origin/cllm`** — a complete FP8 E4M3 port, measured +16-17 % prefill over Q8_0 on a 4B
-  gfx1201. Working tree at `~/cllm` (tip `7c17faffc`, not built). `~/aiter` holds the AITER tree.
+  gfx1201. Working tree at `~/cllm` (same fork, second clone, 1 unpushed commit past `origin/cllm`, not built). `~/aiter` holds the AITER tree.
 
 ## Next actions (in order)
 

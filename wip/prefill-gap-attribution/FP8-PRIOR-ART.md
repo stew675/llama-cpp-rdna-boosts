@@ -10,12 +10,29 @@ in `patches/`. Treat it as WIP prior art (WIP rule applies).
 | tree | path | state |
 |---|---|---|
 | FP8 llama.cpp branch | `origin/cllm` @ `~/llama.cpp` (`git@github.com:stew675/llama.cpp.git`) | tip `535d3bcb1` (2026-08-06); merge-base with `rdna-boosts` = `6ea215d17` (2026-08-05) |
-| FP8 working tree | `~/cllm` | tip `7c17faffc` (a few commits past `origin/cllm`); **not built** (`build-xcframework.sh` only) |
+| FP8 working tree | `~/cllm` | **same fork, second clone**, branch `cllm`, tip `7c17faffc` = `origin/cllm` **+ 1 unpushed commit**; **not built** (`build-xcframework.sh` only) |
 | AITER inspection tree | `~/aiter` | `22beb1caa` |
 | 4B fp8 model | `/llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf` (4.5 GB, L9 single-copy) + `-2copy` + `preserved` | present |
 | 27B fp8 source | `/llm/models/Qwen3.8/27B/FP8/` (safetensors, e4m3, dynamic act) | present, **not yet converted to GGUF** |
 
-`~/cllm` is the fast path (working tree, all the docs). It just needs building and re-basing.
+### `~/cllm` and the `cllm` branch are the same thing
+
+Both are the `cllm` branch of the fork `stew675/llama.cpp`.  `~/cllm` is an independent **clone** of
+that fork (not a worktree of `~/llama.cpp`, and not a different project), checked out on `cllm`; both
+clones fetch `origin/cllm` = `535d3bcb1`.  The only difference is one **local, unpushed** commit:
+
+```
+7c17faffc convert : fp8 output.weight for untied lm_head + fix qwen35 tensor split
+  PERF_HANDOVER.md  +31 | conversion/base.py  +28/-10 | ggml/src/ggml-backend-meta.cpp  +8
+```
+
+It is **not** in `~/llama.cpp` (which carries only the remote-tracking ref), so a re-base driven from
+`origin/cllm` would silently drop it.  **Use `~/cllm` as the source of truth**; push `7c17faffc`
+before relying on the server ref.  `~/cllm`'s local `master` is stale at `6ea215d17`, which is exactly
+the FP8 merge-base — so `cllm` sits on a 2026-08-05 master.
+
+`~/cllm` is the fast path (working tree, all the docs, the extra commit). It just needs building and
+re-basing.
 
 ## 1. Phase status (from `LEVERS.md` / `PERF_HANDOVER.md` on `origin/cllm`)
 
