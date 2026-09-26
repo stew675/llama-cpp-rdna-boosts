@@ -67,7 +67,7 @@ MoE band OFF**; RDNA3_0 is still open (`gfx1100-closing.md`).
 | GPU | **Strix Halo, Radeon 8060S (gfx1151, RDNA3_5)**, 123 GiB unified |
 | ROCm | `/opt/rocm-7.14-gfx1151` (runtime `LD_LIBRARY_PATH`) |
 | Build | `cd ~/llama.cpp && BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-rocm-714` (ccache); fast loop `cmake --build build-rocm --target llama-cli llama-bench llama-batched-bench test-backend-ops -j 16` |
-| Typical fork branch | `gap-closing-hostbuf-integrated` = r13 + `beta/mmb-general` + `0001..0014`/`0016..0028`.  **The final wrap-up tree is the full closing set — `0001..0014`/`0016..0030` (29 patches) — which adds `0029` (default-on) and `0030` (opt-in); see §8.** |
+| Typical fork branch | `gap-closing-hostbuf-integrated` = r13 + `archive/work/mmb-general` + `0001..0014`/`0016..0028`.  **The final wrap-up tree is the full closing set — `0001..0014`/`0016..0030` (29 patches) — which adds `0029` (default-on) and `0030` (opt-in); see §8.** |
 | **Every command** | `export HIP_VISIBLE_DEVICES=0` (single device) |
 | Headline model | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` + MTP sidecar `/llm/models/Qwen3.8/Flash-Next/Q4_K_XL/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf` |
 | Other models | 35B-A3B UD-Q3_K_M / Q4_K_M, 27B UD-Q4_K_M / UD-Q4_K_XL / UD-IQ3_S / Q8_0, gemma-4-12B, gemma-4-26B-A4B, NanBeige BF16 |

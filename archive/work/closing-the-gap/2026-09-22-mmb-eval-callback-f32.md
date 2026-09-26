@@ -96,6 +96,6 @@ is true and the F32-skip path is exactly as before.
 ## Files
 
 `ggml/src/ggml-backend-impl.h`, `ggml/src/ggml-backend.cpp`, `ggml/src/ggml-cuda/ggml-cuda.cu`.
-Patch: [`patches/0019`](patches/).  This is a **correctness** fix and belongs in the `beta/mmb-general`
+Patch: [`patches/0019`](patches/).  This is a **correctness** fix and belongs in the `archive/work/mmb-general`
 HC16 feature when that is cut into a delivery block; it is staged here as a gap-closing patch because
 the campaign branch is r13 + beta + gap-closing.

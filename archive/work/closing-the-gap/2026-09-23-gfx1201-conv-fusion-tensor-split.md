@@ -5,7 +5,7 @@
 divergence is **not root-caused**; the fusion is simply kept off multi-device graphs until it is.
 
 **Box:** 3× Radeon AI PRO R9700 (gfx1201), Ryzen 9 9950X3D2, ROCm `/opt/rocm-7.14.1-gfx102X`.
-**Tree:** delivery r13 (`bb7b6d07…`) + `beta/mmb-general` (`79136a15…`) + the 25 closing patches
+**Tree:** delivery r13 (`bb7b6d07…`) + `archive/work/mmb-general` (`79136a15…`) + the 25 closing patches
 (integrated tree `1f09fd97…`; after this fix `1be654fa…`).
 
 ---

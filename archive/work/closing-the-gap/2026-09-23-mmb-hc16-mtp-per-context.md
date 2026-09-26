@@ -89,8 +89,8 @@ the fix keeps the HC16 win and does not tax decode.
 ## Notes / follow-ups
 
 * Like `patches/0019` (the eval-callback fix), this is an HC16 **correctness** fix and belongs in the
-  `beta/mmb-general` HC16 feature when it is cut into a delivery block; it is staged here as a
-  gap-closing patch because the campaign branch is `r13 + beta/mmb-general + gap-closing`.
+  `archive/work/mmb-general` HC16 feature when it is cut into a delivery block; it is staged here as a
+  gap-closing patch because the campaign branch is `r13 + archive/work/mmb-general + gap-closing`.
 * The `full_graph` consumer scan is required for correctness even single-context: every graph here is
   **2-split** (a tiny CPU split for the token embedding + the ROCm split), and the activation cache is
   cleared between the split computes.

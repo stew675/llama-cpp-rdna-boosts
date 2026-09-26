@@ -10,7 +10,7 @@ regenerated).
 > **Base:** the campaign sits on **delivery r13** (16-block tree
 > `bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`, r13+beta `79136a15cac1920c0dd334b4c119a9cb42f9143b`).
 > `gap-closing` was rebased onto `main` (r13) on 2026-09-24, so a fresh `scripts/apply-all.sh` +
-> `beta/mmb-general` + the closing patches (skipping `0015`) reproduces the branch tip tree
+> `archive/work/mmb-general` + the closing patches (skipping `0015`) reproduces the branch tip tree
 > `fa9cf6d1e654333d458ade3655c4a0d540225827` exactly (28/28 `git am`, verified).  `0029` touches only
 > `ggml/src/ggml-cpu/ggml-cpu.cpp`, so it is independent of the delivery base.
 

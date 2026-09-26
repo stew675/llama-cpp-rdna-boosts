@@ -1,4 +1,4 @@
-# `beta/mmb-general` — BETA-TESTING.md (the gfx1151 final re-validation)
+# `archive/work/mmb-general` — BETA-TESTING.md (the gfx1151 final re-validation)
 
 > **INTEGRATED 2026-09-25 — folded into the delivery; this directory is the historical verification
 > record.**  The 28 patches are now part of the 16 delivery blocks on the `beta-integration` branch
@@ -173,7 +173,7 @@ gate name, not "it was slower".
 
 ## 5. gfx1151 re-validation — 2026-09-22 (session 8, r13 campaign)
 
-Run on the **r13 + `beta/mmb-general` + gap-closing `0001..0014`/`0016`/`0017`** campaign (fork
+Run on the **r13 + `archive/work/mmb-general` + gap-closing `0001..0014`/`0016`/`0017`** campaign (fork
 `gap-closing-r13`) — the tree the 28-patch set now reproduces exactly (the consolidation is
 tree-identical), so a green here is a green for the set.
 Box: gfx1151, ROCm 7.14, `MMB_CFG cc=0x1001151` (RDNA3_5 row: `dense_geom=0 routed=1 f32split=1

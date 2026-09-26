@@ -33,7 +33,7 @@ git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 84e76d8a2
 bash <this-repo>/scripts/apply-all.sh .        # -> branch rdna-boosts, tree 7726e514... (r7)
 git checkout -b mmb-beta
-git am <this-repo>/beta/mmb-general/patches/*.patch   # 28/28, tree 24bb0f5acb...
+git am <this-repo>/archive/work/mmb-general/patches/*.patch   # 28/28, tree 24bb0f5acb...
 ```
 
 Verified 2026-09-25: strict **`git am` 28/28** from the r7 tree, producing

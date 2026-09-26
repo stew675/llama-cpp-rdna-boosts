@@ -1,4 +1,4 @@
-# `beta/mmb-general` — the `mmb` (bf16-WMMA dequant weight GEMM) campaign, in beta
+# `archive/work/mmb-general` — the `mmb` (bf16-WMMA dequant weight GEMM) campaign, in beta
 
 > **INTEGRATED 2026-09-25 — folded into the delivery; this directory is the historical verification
 > record.**  On the `beta-integration` branch the 28 patches in `patches/` are absorbed into the 16
@@ -148,7 +148,7 @@ worktree (`archive/work/closing-the-gap/consolidation.md` is the full record).
 ## Campaign record (as written while in `wip/`)
 
 The sections below are the original `wip/mmb-general` running record, kept verbatim; the
-`wip/mmb-general/...` paths they cite are now `beta/mmb-general/...`.
+`wip/mmb-general/...` paths they cite are now `archive/work/mmb-general/...`.
 
 ## Why
 

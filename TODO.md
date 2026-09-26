@@ -7,14 +7,14 @@ live in `AGENTS.md`, `patches/README.md`, `MANIFESTS.md`, `WORKLOG.md`, `GREEDY-
 `wip/*` and `benchmarks/`.
 
 **Current state (release `v16-84e76d8a2-r9`, 2026-09-26):** the delivery is the **16-patch set**
-against fork point **`84e76d8a2`**, now with the **28 `beta/mmb-general` patches folded into the
+against fork point **`84e76d8a2`**, now with the **28 `archive/work/mmb-general` patches folded into the
 blocks** — applying the 16 patches alone reproduces the full campaign tree
 **`24bb0f5acb…`** plus r9's issue-#47 typed-store fix, canonical tip
 `b48fb3f686fe2681f55aa406a8ed52313ad80875`, net tree
 **`a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb`**, release **`v16-84e76d8a2-r9`**: `mmb`/prefill core in **block 08**, the catch-all
 host-buffer/CPU fixes in **block 06**, the `mmb` fusion stand-downs + MMVQ band in **blocks 13/14**,
 and `qsa3`/indexer/HC/sparse-MTP + the r9 MMA-FA typed-store fix in **block 15**.  Strict `git am`
-16/16, `validate-set.sh` PASS, gfx1201 build clean.  `beta/mmb-general/` is now only the historical
+16/16, `validate-set.sh` PASS, gfx1201 build clean.  `archive/work/mmb-general/` is now only the historical
 verification record and `apply-beta.sh` was removed.  Plan/record:
 `archive/work/beta-integration/integration.md`; `WORKLOG.md` 2026-09-26 (r9).
 
@@ -41,7 +41,7 @@ CPU-reference stride fix (issue #44: the CPU reference used `t*ne[1]`/`t*hc` ins
 own `nb[1]`, corrupting every multi-token fused ubatch on a CPU-resident qwen4exp layer; now mirrors
 the CUDA kernel, nt == 1 bit-identical; op-level CPU-vs-HIP oracle 7/8 FAIL pre-fix, 8/8 PASS
 post-fix).  The beta set
-(`beta/mmb-general`, 28 patches) is re-cut onto r7 (tree `24bb0f5acb…`, patch bodies byte-identical to
+(`archive/work/mmb-general`, 28 patches) is re-cut onto r7 (tree `24bb0f5acb…`, patch bodies byte-identical to
 the r6/r5-based set); patch 0027 restricts the
 16-wide routed `mul_mat_vec_q_moe` band to RDNA4 because on gfx1100 it failed `MUL_MAT_ID` 23/929 and
 on gfx1151 it is a measured loss.  gfx1100 build + coherence + op oracles + width probes green; the

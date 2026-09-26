@@ -21,7 +21,7 @@ draft itself is pure with `GGML_CUDA_MMB_HC16=0`, and would be promotable once t
 > acceptance 0.85035 unchanged.  `LLAMA_MTP_SPARSE=0` is now the opt-out; the decode/verify arm stays
 > opt-in (`LLAMA_MTP_SPARSE_DECODE=1`) and the depth gate stays `LLAMA_MTP_SPARSE_MIN_KV=32768`.
 Fork `~/llama.cpp` branch `gap-closing-r13`
-(r13 + `beta/mmb-general` + gap-closing `0001..0014`/`0016`/`0017`/`0018`/`0019`), commit
+(r13 + `archive/work/mmb-general` + gap-closing `0001..0014`/`0016`/`0017`/`0018`/`0019`), commit
 **`1bb1d794e`** (the draft) + **`94a1aa38e`** (the derived-indexer default fix, below).
 Patches: [`patches/0020-mtp-sparse-draft.patch`](patches/0020-mtp-sparse-draft.patch) and
 [`patches/0021-qsa-indexer-cache-default-on.patch`](patches/0021-qsa-indexer-cache-default-on.patch) -

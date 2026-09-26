@@ -27,13 +27,13 @@ reporter's 27B UD-Q4_K_XL q8_0 pp4096 @ d40000 872.6 -> 911.3 t/s (+4.4 %), `hsk
 +2-7 %.  Full record: `WORKLOG.md` (2026-09-26 r9) and `patches/README.md` (2026-09-26 block-15 r9).
 
 **Previous release (2026-09-25) — `v16-84e76d8a2-r8`:** the
-28-patch `beta/mmb-general` campaign is **folded into the 16 blocks**, so applying the 16 patches
+28-patch `archive/work/mmb-general` campaign is **folded into the 16 blocks**, so applying the 16 patches
 alone to `84e76d8a2` reproduces the full campaign tree
 **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (canonical tip `f373450de489dd0fafba5bd285e71844109cd0ec`).
 The `mmb`/prefill-core work is in **block 08**, the catch-all host-buffer/CPU fixes in **block 06**,
 the `mmb` fusion stand-downs and the MMVQ band in **blocks 13/14**, and `qsa3`/indexer/HC/sparse-MTP
 in **block 15**.  Strict `git am` 16/16, `scripts/validate-set.sh` PASS, gfx1201 build clean.
-`beta/mmb-general/` is kept as the historical verification record and `scripts/apply-beta.sh` has
+`archive/work/mmb-general/` is kept as the historical verification record and `scripts/apply-beta.sh` has
 been removed.  Full record: `WORKLOG.md` (2026-09-25, the `beta-integration`/promotion entries) and
 `archive/work/beta-integration/integration.md`.
 

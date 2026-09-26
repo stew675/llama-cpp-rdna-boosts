@@ -1,11 +1,11 @@
-# `closing-the-gap` → `beta/mmb-general` patch consolidation — plan
+# `closing-the-gap` → `archive/work/mmb-general` patch consolidation — plan
 
 **Status:** **EXECUTED 2026-09-25** — see the "Executed record" below.  Created 2026-09-25.
 **Branches:** delivery repo `gap-consolidation` (this file + the regenerated beta patches); fork
 `~/llama.cpp` `gap-consolidation` (disposable mechanical branch, currently parked at `rdna-boosts-r13`).
 
-**Purpose:** make `beta/mmb-general/patches/` the **single consolidated patch set**.  After this work,
-applying `beta/mmb-general/patches/*.patch` to a fresh `rdna-boosts-r13` must reproduce the *final
+**Purpose:** make `archive/work/mmb-general/patches/` the **single consolidated patch set**.  After this work,
+applying `archive/work/mmb-general/patches/*.patch` to a fresh `rdna-boosts-r13` must reproduce the *final
 combined* tree that today requires r13 + the 12 beta patches + the 30 `archive/work/closing-the-gap/patches/`
 patches.  The closing patches then remain only as the historical/research record.
 
@@ -17,7 +17,7 @@ patches.  The closing patches then remain only as the historical/research record
 ## Executed record (2026-09-25)
 
 **Result: the beta set is now the 28-patch consolidated set; r13 + `git am
-beta/mmb-general/patches/*.patch` reproduces T_final.**
+archive/work/mmb-general/patches/*.patch` reproduces T_final.**
 
 * **Fork branch:** `~/llama.cpp` `gap-consolidation` @ `c2b46c814` (28 commits on `rdna-boosts-r13`),
   tree **`468c64963ae45e72367c73809efa7cc038217e8a`** = T_final.  Reference tags `ref-beta`
@@ -44,7 +44,7 @@ beta/mmb-general/patches/*.patch` reproduces T_final.**
   * Gates (bit-identical tree): width probe `PASS` (row-0 `268e0673300b7a33`); `FLASH_ATTN_QSA` /
     `GATED_DELTA_NET` oracles OK; `plain == draft-mtp n3` byte-identical (`434 chars
     sha=984263fb8e0f`).
-* **Delivered:** `beta/mmb-general/patches/` (28), `mmb-general.patch`, `commits.txt`, and the
+* **Delivered:** `archive/work/mmb-general/patches/` (28), `mmb-general.patch`, `commits.txt`, and the
   README / BETA-TESTING / GROUPS / combined-set-verification / HANDOVER updates.
   `archive/work/closing-the-gap/patches/` is kept as history.
 * **Deliberate deviation from §2:** the plan's fold targets assumed pure code ownership; the blame
@@ -59,12 +59,12 @@ beta/mmb-general/patches/*.patch` reproduces T_final.**
 
 1. `~/llama.cpp` `gap-consolidation` carries a rebuilt series of **N consolidated beta commits** whose
    tip tree is **`468c64963ae45e72367c73809efa7cc038217e8a`** (T_final).
-2. A **fresh** `rdna-boosts-r13` + `git am beta/mmb-general/patches/*.patch` (strict, no 3-way)
+2. A **fresh** `rdna-boosts-r13` + `git am archive/work/mmb-general/patches/*.patch` (strict, no 3-way)
    reproduces T_final exactly, with the right commit count.
 3. The consolidated set **builds clean** (gfx1151 `~/bin/build-llama-rocm-714`, 0 errors) and passes
    the standard gates (coherence, width probe, op oracles, MTP acceptance; the P1–P3 A/Bs are
    optional re-confirmation).
-4. `beta/mmb-general/{commits.txt,README.md,BETA-TESTING.md,combined-set-verification.md,HANDOVER.md}`
+4. `archive/work/mmb-general/{commits.txt,README.md,BETA-TESTING.md,combined-set-verification.md,HANDOVER.md}`
    and `mmb-general.patch` are regenerated/updated; `archive/work/closing-the-gap/README.md` marks the
    consolidation.
 5. `archive/work/closing-the-gap/patches/` is kept as history (marked superseded/consolidated), **not** deleted.
@@ -227,7 +227,7 @@ without changing it.
 **Final gates:**
 1. `git rev-parse HEAD^{tree}` == `468c64963ae45e72367c73809efa7cc038217e8a`.
 2. Re-export the series (`git format-patch --start-number 1 rdna-boosts-r13..gap-consolidation`), copy
-   to `beta/mmb-general/patches/`, then **fresh-apply** a clean r13 clone with strict `git am` (no
+   to `archive/work/mmb-general/patches/`, then **fresh-apply** a clean r13 clone with strict `git am` (no
    `-3`) and re-assert the tree + commit count.
 3. Build clean (gfx1151) and run: same-seed coherence; `test-logits-width-probe` PASS; op oracles
    (`FLASH_ATTN_QSA` 26/26, `GATED_DELTA_NET` 46/46); MTP acceptance gate
@@ -241,13 +241,13 @@ without changing it.
 
 ## 5. Deliverables / repo updates
 
-* `beta/mmb-general/patches/` — the regenerated consolidated series (replace the current 12 files).
-* `beta/mmb-general/mmb-general.patch` — regenerate (`git diff rdna-boosts-r13..gap-consolidation`).
-* `beta/mmb-general/commits.txt` — regenerate from the new series.
-* `beta/mmb-general/README.md` — rewrite "What is in the beta set" + the per-patch table.
-* `beta/mmb-general/BETA-TESTING.md`, `combined-set-verification.md`, `HANDOVER.md` — add a
+* `archive/work/mmb-general/patches/` — the regenerated consolidated series (replace the current 12 files).
+* `archive/work/mmb-general/mmb-general.patch` — regenerate (`git diff rdna-boosts-r13..gap-consolidation`).
+* `archive/work/mmb-general/commits.txt` — regenerate from the new series.
+* `archive/work/mmb-general/README.md` — rewrite "What is in the beta set" + the per-patch table.
+* `archive/work/mmb-general/BETA-TESTING.md`, `combined-set-verification.md`, `HANDOVER.md` — add a
   consolidation section (the new apply command is simply r13 + `git am beta/...`).
-* `archive/work/closing-the-gap/README.md` — mark the patches as consolidated into `beta/mmb-general` (keep
+* `archive/work/closing-the-gap/README.md` — mark the patches as consolidated into `archive/work/mmb-general` (keep
   `patches/` as history; do not delete).
 * This file — append a dated "executed" section with the checkpoint log and the final hashes.
 * Commit on `gap-consolidation` and push only if the maintainer asks (per `AGENTS.md` pushing policy).
@@ -285,7 +285,7 @@ without changing it.
 4. [ ] Append the NEW closings (net-fold `0024/0025/0030`, `0020/0026`, `0028/0031`); checkpoint after each.
 5. [ ] `git range-diff ref-combined gap-consolidation` — every closings's content accounted for.
 6. [ ] Assert tip tree == T_final.
-7. [ ] Export the new series to `beta/mmb-general/patches/` (replace the 12).
+7. [ ] Export the new series to `archive/work/mmb-general/patches/` (replace the 12).
 8. [ ] Fresh strict `git am` on a clean r13 → tree == T_final.
 9. [ ] Build clean; run the gates (§4 final).
 10. [ ] Regenerate `commits.txt` + `mmb-general.patch`; update the beta + closing READMEs and this file.

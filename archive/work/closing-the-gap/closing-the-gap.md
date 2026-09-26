@@ -9,7 +9,7 @@ appendices, the MTP qualification).  This file is what a fresh session reads fir
 **Model:** `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf`
 + MTP sidecar `/llm/models/Qwen3.8/Flash-Next/Q4_K_XL/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf`.
 **Fork:** `~/llama.cpp`, branch **`gap-closing-hostbuf-integrated`**, tip **`df67fd133`**
-= delivery r13 + the 12 `beta/mmb-general` patches + gap-closing `0001..0014`/`0016..0027`
+= delivery r13 + the 12 `archive/work/mmb-general` patches + gap-closing `0001..0014`/`0016..0027`
 (`0023` = the MMB HC16 per-context fix; `0024` = the input-layer GPU offload stopgap;
 `0025` = the host-buffer input layer that **supersedes `0024`**; `0026` = the sparse MTP draft
 **default ON**).  The `0024` tip `73a391aba` on branch `gap-closing-r13` is the pre-`0025` baseline
@@ -124,18 +124,18 @@ The old debug aids — `LLAMA_BUF_SEL_DEBUG=1`, `LLAMA_SCHED_BUF_DEBUG=1`, and t
    record: [`2026-09-23-mtp-sparse-default-on.md`](2026-09-23-mtp-sparse-default-on.md).
 3. **gfx1100 / gfx1201 validation** of the session-8+10 additions: the new MMB quant types
    (Q4_0/Q4_1/Q5_0/MXFP4/NVFP4 + the IQ2 family), `QSA_SCORE_WMMA`, the derived-indexer default
-   (`patches/0021`) and the 32K decode crossover (`patches/0022`).  `beta/mmb-general/gfx1201-s14-gates.md`
+   (`patches/0021`) and the 32K decode crossover (`patches/0022`).  `archive/work/mmb-general/gfx1201-s14-gates.md`
    is the checklist (3-GPU `-sm tensor`, q8_0 KV, `-b/-ub 2048`); gfx1100 notes in
-   `beta/mmb-general/gfx1100-porting.md`.  The dequant code is arch-neutral and gfx1201 keeps its
+   `archive/work/mmb-general/gfx1100-porting.md`.  The dequant code is arch-neutral and gfx1201 keeps its
    per-type dense policy, so this is apply-and-gate, not a port.  Re-check the crossover claim on
    gfx1201 (it stays dense-always there) and the pool default on both.  **Hand-off briefs for the two
    target machines:** [`gfx1201-closing.md`](gfx1201-closing.md) and
-   [`gfx1100-closing.md`](gfx1100-closing.md) — each has the full apply order (r13 + `beta/mmb-general`
+   [`gfx1100-closing.md`](gfx1100-closing.md) — each has the full apply order (r13 + `archive/work/mmb-general`
    + `archive/work/closing-the-gap`), the per-patch arch-sensitive inventory, the gate commands, the expected
-   `MMB_CFG` row and the port candidates.  Extend `beta/mmb-general/gfx1201-s14-gates.md` /
+   `MMB_CFG` row and the port candidates.  Extend `archive/work/mmb-general/gfx1201-s14-gates.md` /
    `gfx1100-porting.md` with the session results.
    **gfx1201 status (2026-09-23): DONE.**  The full stack applies **25/25** on RDNA4 with no
-   apply-time port (the RDNA4 **qsa3**/**mmb** WMMA kernel ports are in the `beta/mmb-general`
+   apply-time port (the RDNA4 **qsa3**/**mmb** WMMA kernel ports are in the `archive/work/mmb-general`
    prerequisite, not the closing set); oracles, width purity, `plain == draft-mtp` at 8K/40K/128K, MTP acceptance (0.81388),
    the rule-5 batched gate and PPL parity are all green; closing adds **+1.0…+4.4 %** prefill over
    r13+beta at depth.  One correctness fix was folded into `patches/0004` (the GDN/PLE conv1d

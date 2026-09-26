@@ -1,4 +1,4 @@
-# `beta-integration` — fold the 28 `beta/mmb-general` patches into the 16 delivery blocks
+# `beta-integration` — fold the 28 `archive/work/mmb-general` patches into the 16 delivery blocks
 
 **Branch:** `beta-integration` (this repo; cut from `main` at `0699a3d`, 2026-09-25).
 **Status:** **FOLD EXECUTED** (2026-09-25) — the 16 amended patches are regenerated on this branch and
@@ -60,7 +60,7 @@ docs sweep and the maintainer's promotion decision.
 
 ## 1. Objective
 
-Fold every one of the **28 `beta/mmb-general/patches/*`** into the appropriate patch of the
+Fold every one of the **28 `archive/work/mmb-general/patches/*`** into the appropriate patch of the
 **16-patch delivery set** (`patches/0000-…` … `patches/0015-…`), so that the delivery *becomes* the
 beta: a fresh `84e76d8a2` + the amended 16 patches must reproduce the current beta tree
 **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** exactly, with each block patch a coherent
@@ -78,7 +78,7 @@ The beta set stays put as the historical/verification record; the deliverable is
 4. The final tree passes the beta-window gates (see §6): width purity, op oracles, MTP acceptance,
    same-seed coherence; plus the delivery's own `FLASH_ATTN_EXT` / `GATED_DELTA_NET` / `MUL_MAT_ID`.
 5. `release.json` (`tip`, `tree`, per-patch sha256), `rdna-boosts-all.patch`, `patches/README.md`,
-   `README.md`, `WORKLOG.md`, `MANIFESTS.md` are updated; `beta/mmb-general/` is marked integrated.
+   `README.md`, `WORKLOG.md`, `MANIFESTS.md` are updated; `archive/work/mmb-general/` is marked integrated.
 
 **Explicitly out of scope:** re-tuning the campaign, changing defaults, editing the beta patch
 bodies, deleting `beta/`.  The net tree must not change by one byte.
@@ -226,7 +226,7 @@ Work through the blocks in numeric order.  Keep every commit; checkpoint the tre
 - [ ] **validate** — fresh `apply-all.sh` + `validate-set.sh`.
 - [ ] **build + gates** — §6.
 - [ ] **docs** — update `patches/README.md`, top-level `README.md`, `WORKLOG.md`, `MANIFESTS.md`,
-      `release.json`, `rdna-boosts-all.patch`; mark `beta/mmb-general/` integrated.
+      `release.json`, `rdna-boosts-all.patch`; mark `archive/work/mmb-general/` integrated.
 - [ ] **commit** the record to `beta-integration` in this repo.
 
 Status is tracked per patch in §7.
@@ -307,8 +307,8 @@ Since the tree is provably identical, gates 3–6 are a sanity re-confirmation, 
   but the CUDA half cannot be replayed there.  Expect a split; record the deviation.
 - **Subject rewording.**  Amended block subjects should describe the combined feature without
   pretending the beta work is original delivery work; keep the beta provenance in the commit body
-  (e.g. "folds beta 0001/0003/… of `beta/mmb-general`").
-- **Docs freshness.**  After the fold, `beta/mmb-general/*.md` describes a set that is no longer
+  (e.g. "folds beta 0001/0003/… of `archive/work/mmb-general`").
+- **Docs freshness.**  After the fold, `archive/work/mmb-general/*.md` describes a set that is no longer
   applied separately; mark it integrated rather than deleting it (see the repo's WIP/promotion
   rules).
 

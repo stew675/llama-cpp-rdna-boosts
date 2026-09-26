@@ -15,11 +15,11 @@ reporter's 27B UD-Q4_K_XL q8_0 pp4096 @ d40000 872.6 -> 911.3 t/s (+4.4 %), f16 
 `FLASH_ATTN_EXT` prefill shapes +2-7 %, decode flat, width probe and the plain/`n3`/`n7` text gate
 byte-identical.  See `WORKLOG.md` (2026-09-26 r9).
 
-**Since release `v16-84e76d8a2-r8` (2026-09-25, in `main`) the 28 `beta/mmb-general` patches are
+**Since release `v16-84e76d8a2-r8` (2026-09-25, in `main`) the 28 `archive/work/mmb-general` patches are
 folded into these 16 blocks**: applying `patches/*` alone to `84e76d8a2` now reproduces the campaign
 tree **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (release `v16-84e76d8a2-r8`,
 canonical tip `f373450de489dd0fafba5bd285e71844109cd0ec`).  See the dedicated section below.
-`beta/mmb-general/` is now only the historical verification record and `scripts/apply-beta.sh` has
+`archive/work/mmb-general/` is now only the historical verification record and `scripts/apply-beta.sh` has
 been removed.
 
 **Previous release: `v16-84e76d8a2-r7`** — canonical (rebased) tip
@@ -30,7 +30,7 @@ been removed.
 device** hides the N GPUs behind one `META` backend, so the count was 1 and the no-sync gallocr
 re-reserve path was taken while the previous ubatch's per-device kernels were still in flight — an
 intermittent `quantize_q8_1` memory fault on a secondary GPU (reported on 3x R9700).  A Meta backend
-is now treated as multi-device.  The 28 `beta/mmb-general` patches are re-cut onto r7 (strict 28/28,
+is now treated as multi-device.  The 28 `archive/work/mmb-general` patches are re-cut onto r7 (strict 28/28,
 tree `24bb0f5acb…`, bodies byte-identical).  See `WORKLOG.md` (2026-09-25 r7).
 **r6
 (2026-09-25) flips the bf16 native K/V arm to default ON** (block 15, one line):
@@ -40,7 +40,7 @@ arm the path to the RDNA4 GQA-6 decode/verify band, removing the original opt-in
 equivalent decode win"); the maintainer weighted the incoming beta prefill boosts against its small
 prefill cost and defaulted it on.  bf16 kv 16384 `n_q` 1/3/5/8: band 145/164/264/285 vs staged tile
 104/276/428/655 µs; 27B `draft-mtp` n3 at ~30k 49.3 -> 56.1 t/s, prefill flat; FLASH_ATTN_EXT
-6340/6340 and bf16 `none == draft-mtp` byte-identical.  The 28 `beta/mmb-general` patches are re-cut
+6340/6340 and bf16 `none == draft-mtp` byte-identical.  The 28 `archive/work/mmb-general` patches are re-cut
 onto r6 (strict 28/28, tree `1df5769c…`, bodies byte-identical).  See `WORKLOG.md` (2026-09-25 r6).
 **r5
 (2026-09-25) is a block-15 amendment (issue #45 follow-up, @DanoPTT)**: f16 (and, through its opt-in
@@ -54,7 +54,7 @@ chosen per K/V element size: native-quantized keeps `ncols1 = 4` / `P = nsm`, th
 the `P`-partials fixup dominates).  f16 kv 102400, `n_q` 1 678 -> 744, 3 1802 -> 848, 4 2230 -> 811,
 8 3979 -> 1249 µs; 27B `draft-mtp` n3 at ~30k 48.9 -> 55.4 t/s (+13 %), plain decode -2.5..-4.2 %.
 `test-backend-ops -o FLASH_ATTN_EXT` 6340/6340 and f16/q8_0 `none == draft-mtp` byte-identical.  The
-28 `beta/mmb-general` patches are re-cut onto r5 (strict 28/28, applied tree `469082e4…`; bodies
+28 `archive/work/mmb-general` patches are re-cut onto r5 (strict 28/28, applied tree `469082e4…`; bodies
 byte-identical, only `From` lines changed).  See `WORKLOG.md` (2026-09-25 r5).
 **r4
 (2026-09-25) is a block-15 amendment (issue #45)**: the RDNA4 GQA-6 decode/verify flash-attention
@@ -73,7 +73,7 @@ reference used `t*ne[1]`/`t*hc` row strides instead of the tensors' own `nb[1]`,
 fused ubatch read the wrong rows and a CPU-resident qwen4exp layer emitted EOS as its first token
 (nt == 1 was accidentally correct); the reference now mirrors the CUDA kernel and is bit-identical at
 nt == 1.  Op-level CPU-vs-HIP oracle: 7/8 multi-token cases FAIL pre-fix, 8/8 PASS post-fix.  The
-28-patch `beta/mmb-general` set is re-based onto r3 (applied tree `0daefe22…`) and patch 0027 now
+28-patch `archive/work/mmb-general` set is re-based onto r3 (applied tree `0daefe22…`) and patch 0027 now
 restricts the 16-wide routed `mul_mat_vec_q_moe` band to RDNA4 (gfx1100 failed `MUL_MAT_ID` 23/929;
 gfx1151 it is a measured loss).  See `WORKLOG.md` (2026-09-25 r3).  **r2
 (2026-09-25) is a block-10 amendment**: the wide-VDR `mul_mat_vec_q_moe` entry points
@@ -206,15 +206,15 @@ The 2026-09-17 re-base resolved three blocks:
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
 
-## 2026-09-25 (`beta-integration`): the `beta/mmb-general` campaign is folded into the 16 blocks
+## 2026-09-25 (`beta-integration`): the `archive/work/mmb-general` campaign is folded into the 16 blocks
 
-The former opt-in 28-patch `beta/mmb-general/` set is **absorbed into the delivery blocks** on the
+The former opt-in 28-patch `archive/work/mmb-general/` set is **absorbed into the delivery blocks** on the
 `beta-integration` branch, so there is no second apply step any more: a fresh `84e76d8a2` + the 16
 patches reproduces the full campaign tree **`24bb0f5acb…`** (canonical tip `f373450de…`, release
 candidate `v16-84e76d8a2-r8`; strict `git am` 16/16, `scripts/validate-set.sh` PASS,
 gfx1201 build clean).  Nothing in the campaign was changed - only its packaging.
 
-Fold mapping (the beta patch numbers are `beta/mmb-general/patches/00NN`; the dependency-clean
+Fold mapping (the beta patch numbers are `archive/work/mmb-general/patches/00NN`; the dependency-clean
 split is recorded in `../archive/work/beta-integration/integration.md`):
 
 | block | folded beta patches |
@@ -468,7 +468,7 @@ boosts being integrated soon outweigh the small prefill cost.
 1 GPU: 56.1 t/s vs 49.3 t/s, prefill flat (1026.7/1024.4 vs 1021.2/1021.5 t/s).
 
 **Gates.**  `test-backend-ops -o FLASH_ATTN_EXT` **6340/6340 on ROCm0**; bf16 `--spec-type none ==
-draft-mtp` byte-identical at ~5k (`904d905c8c29`) and ~30k (`d515c9f933ea`).  The 28 `beta/mmb-general`
+draft-mtp` byte-identical at ~5k (`904d905c8c29`) and ~30k (`d515c9f933ea`).  The 28 `archive/work/mmb-general`
 patches are re-cut onto r6 (strict 28/28, applied tree `1df5769c…`; bodies byte-identical to the
 r5-based set).
 

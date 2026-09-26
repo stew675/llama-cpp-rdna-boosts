@@ -5,7 +5,7 @@ of the `mmb-general` beta set on 2026-09-21 so that the beta set could ship with
 default-OFF, cannot be enabled as it stands, and costs build time on every architecture.
 
 Everything needed to pick this up is here.  The originating record is
-[`beta/mmb-general/gfx1100-s9-nwarps-results.md`](../../beta/mmb-general/gfx1100-s9-nwarps-results.md)
+[`archive/work/mmb-general/gfx1100-s9-nwarps-results.md`](../../archive/work/mmb-general/gfx1100-s9-nwarps-results.md)
 (the gfx1100 session that found it, on a single RX 7900 XTX).
 
 ## 1. The finding
@@ -62,7 +62,7 @@ the new `nwarps` values.  The prior art to read first:
 * `GREEDY-PURITY.md` §19 (the decode/verify band-uniformity contract) and §25 (the pinned fusion
   ops that must keep plain `calc_nwarps` — their `calc_nwarps(GGML_TYPE_Q8_0, 1, ...)` is a
   single-token reduction-order *anchor*).
-* `beta/mmb-general/README.md` and `patches/README.md` for the 2026-09-12 (16)/(17)/(18) mmvq
+* `archive/work/mmb-general/README.md` and `patches/README.md` for the 2026-09-12 (16)/(17)/(18) mmvq
   band-uniformity rounds, which is the exact shape of work this needs.
 
 ## 4. The investigation plan
@@ -104,7 +104,7 @@ gfx1201, 2026-09-21.
 ```sh
 # apply the beta set, then this patch
 cd ~/llama.cpp
-git am <repo>/beta/mmb-general/patches/*.patch          # 12/12
+git am <repo>/archive/work/mmb-general/patches/*.patch          # 12/12
 git apply <repo>/wip/nwarps/patches/per-M-nwarps-rdna3-0.patch
 
 # width purity per threshold (the blocker)

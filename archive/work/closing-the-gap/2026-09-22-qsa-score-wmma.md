@@ -1,7 +1,7 @@
 # Phase-1 item 15 (follow-up) — QSA prefill scorer fusion (`QSA_SCORE_WMMA`), ported 2026-09-22
 
 **Status:** ported and validated, **default ON**, small depth win (`patches/0016`).  Fork `~/llama.cpp`
-branch `gap-closing-r13` (r13 + `beta/mmb-general` + gap-closing `0001..0014`), commit `ef6985a39`.
+branch `gap-closing-r13` (r13 + `archive/work/mmb-general` + gap-closing `0001..0014`), commit `ef6985a39`.
 Patch: [`patches/0016-…`](patches/).
 
 ## What it is

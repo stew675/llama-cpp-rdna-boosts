@@ -43,5 +43,5 @@ predicate, so this one edit enables the band consistently), then the r4 op-level
 gates. A negative result is a valid deliverable.
 
 **If either port wins**, fold it into block 15 as a per-arch amendment exactly like r4, then re-base
-`beta/mmb-general` the same way (it should again be a pure SHA/offset re-cut, since the beta set does
+`archive/work/mmb-general` the same way (it should again be a pure SHA/offset re-cut, since the beta set does
 not touch the dense `GGML_OP_FLASH_ATTN_EXT` files).

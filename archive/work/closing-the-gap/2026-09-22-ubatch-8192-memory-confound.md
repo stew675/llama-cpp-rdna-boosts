@@ -59,7 +59,7 @@ Re-audited the campaign's rejections on 2026-09-22:
   remainder is a lossy BF16 change; not a small-delta timing call.
 * **`_b256`'s own "it is slower anyway"** and any other rejection whose *only* evidence is a sub-2 %
   `-ub 8192` delta should be **re-checked at `-ub 4096`** before it is treated as final.  The known
-  candidates are the MMB restructure micro-A/Bs in `beta/mmb-general/README.md` ("+0.6 % = nothing"
+  candidates are the MMB restructure micro-A/Bs in `archive/work/mmb-general/README.md` ("+0.6 % = nothing"
   LDS `iq3s_grid`, the `nwarps` envelope, the `<8,TT>` -> `<4,TT>` +0.5 %) — but those were mostly
   isolated-kernel measurements with their own harness, not end-to-end `-ub 8192` benches, so they are
   lower risk.  No item that **shipped** is affected: a shipped win's sign was positive under the

@@ -4,10 +4,10 @@ This guide is for humans AND LLM coding agents. Read it before changing
 anything in `~/llama-cpp-rdna-boosts/` (or acting on its behalf).
 
 > **In `main` since 2026-09-25 (release `v16-84e76d8a2-r8`, promoted from `beta-integration`): the
-> 28 `beta/mmb-general` patches are folded into the 16 delivery blocks.**  `patches/*` alone
+> 28 `archive/work/mmb-general` patches are folded into the 16 delivery blocks.**  `patches/*` alone
 > reproduce the full campaign tree `24bb0f5acb…`; **`v16-84e76d8a2-r9` (2026-09-26) then amends
 > block 15 to restore the typed non-swizzled MMA FA K/V store (issue #47), net tree `a3dc4bbb…`.**
-> `beta/mmb-general/` is retained only as the
+> `archive/work/mmb-general/` is retained only as the
 > historical verification record and the `apply-beta.sh` helper has been removed.  The working
 > plan, per-patch mapping and validation record are in `archive/work/beta-integration/integration.md`.
 
@@ -38,7 +38,7 @@ MoE `draft-mtp n3` 0.73967 -> 0.76484 and 87.5 -> 89.6 t/s), gfx1151-validated, 
 with `t*ne[1]` and `inject` with `t*hc` instead of the tensors' own `nb[1]` row strides, so every
 multi-token ubatch in the fused band read the wrong rows and a CPU-resident qwen4exp layer emitted
 EOS as the first token; the CPU reference now mirrors the CUDA kernel's stride semantics and is
-bit-identical at nt == 1) plus the 28-patch `beta/mmb-general` re-base onto r3, r4 then r5 (r5 applied tree
+bit-identical at nt == 1) plus the 28-patch `archive/work/mmb-general` re-base onto r3, r4 then r5 (r5 applied tree
 `469082e4…`, r4 `70cc895a…`, r3 `0daefe22…`) and its gfx1100 routed-band fix (patch 0027: the 16-wide `mul_mat_vec_q_moe` band is now
 RDNA4-only, because on RDNA3_0 it failed `MUL_MAT_ID` 23/929 and on RDNA3_5 it is a measured loss) -
 see `WORKLOG.md` 2026-09-25 (r3)).  The previous baseline was
@@ -288,14 +288,14 @@ before any regeneration):** the **canonical** 16-block
 chain for the current base `84e76d8a2` is the folded-campaign rebuild of the delivery set
 (tip `b48fb3f686fe2681f55aa406a8ed52313ad80875`, net tree
   `a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb` = r9, the 2026-09-26 block-15 issue-#47 typed-store fix,
-  on top of r8, the 2026-09-25 `beta/mmb-general` fold into the 16 blocks (tip `f373450de…`, tree
+  on top of r8, the 2026-09-25 `archive/work/mmb-general` fold into the 16 blocks (tip `f373450de…`, tree
   `24bb0f5acb…`) and r7's block-14 Meta-tensor-split scheduler race fix (tip `596a22db…`, tree
   `7726e514…`),
 on top of r6, the 2026-09-25 block-15 bf16 native default flip,
 on top of r5's f16/bf16 coverage of the
 RDNA4 GQA-6 decode/verify FA band (issue #45 follow-up), on top of r4's 2026-09-25 block-15 RDNA4
 GQA-6 decode/verify FA band (issue #45), on top of r3's 2026-09-25 block-14 `hc_combine` CPU-reference
-  fix (issue #44) plus the 28-patch `beta/mmb-general` re-base and its gfx1100 routed-band fix, on
+  fix (issue #44) plus the 28-patch `archive/work/mmb-general` re-base and its gfx1100 routed-band fix, on
   top of r2's 2026-09-25 block-10 MoE-VDR arch-scope fix and r1's 2026-09-24 re-base onto upstream
   master `84e76d8a2` - 149 upstream commits, blocks 10/14/15 resolved manually; see `WORKLOG.md`).  The
   previous base `ebbb18522` (tip `8491bf2bff8eb3a56e5120c3c9c17533a94ea6bf`, net tree
@@ -535,10 +535,9 @@ explicitly requests it.**
 | `benchmarks/` | dated benchy/v1/v2 records + methodology + graphs; **`mtp-adaptive-methodology.md` = the adaptive-MTP baseline gate** (run before shipping any decode/fusion change) |
 | `prompts/` | versioned, hash-stable test prompts for the decode/MTP/coherence gates; each prompt's size + token count + **sha256** is recorded in `prompts/README.md`, and a shipped prompt is **never edited in place** (add a new file).  A reported throughput/acceptance/purity result is only valid against the prompt hash it names |
 | `wip/` | **ACTIVE** exploration docs, tuning tools, session handoffs — **NOT part of the delivery**.  Holds only live/unpromoted work: **as of the 2026-09-26 consolidation it contains a single tree, `wip/nwarps/`** — the per-M `nwarps` impurity, the one piece deliberately left open (default-OFF, breaks `W=1..8` width purity).  Every other campaign (including `per16-f16-mma` and `mmq-pipeline`) is closed and archived under `archive/work/` (see the WIP rule below) |
-| `beta/` | **historical campaign record** — holds **`beta/mmb-general/`** (the `mmb`/`qsa3`/indexer campaign, promoted 2026-09-21 and consolidated with the `closing-the-gap` campaign 2026-09-25).  It is **no longer applied separately**: the 28 patches are folded into the 16 delivery blocks (in `main` since release `v16-84e76d8a2-r8`), so `patches/*` alone reproduce the campaign tree `24bb0f5acb…`, and `apply-beta.sh` was removed.  Kept for the campaign's verification record (`BETA-TESTING.md`, the gfx1201/gfx1100 measurement records).  Previously staged campaigns were promoted and archived (`archive/work/block-15-campaign-wins/` = block 15, `archive/work/tensor-fit-fix/` = the r12 `--fit` for `-sm tensor` amendment, and the qwen4exp support = block 14).  See the WIP rule below |
 | `upstream/` | **upstream-PR candidates** — self-contained changes that could be filed against unadulterated `ggml-org/llama.cpp` master, each with a `UPSTREAM-PR-*.md` note + `.patch` (see its README for the double-apply caution and the status table) |
 | `archive/docs/` | moved-out historical records (validation history, baseline history) — reference only |
-| `archive/work/` | closed experiments, preserved for future re-evaluation (includes the completed `wip/` trees archived 2026-09-12 and the 16-tree 2026-09-26 consolidation) |
+| `archive/work/` | closed experiments, preserved for future re-evaluation (the completed `wip/` trees archived 2026-09-12 and the 16-tree 2026-09-26 consolidation, plus **`archive/work/mmb-general/`** — the former top-level `beta/` record of the `mmb`/`qsa3`/indexer campaign, moved here 2026-09-26 because it is no longer applied separately; `apply-beta.sh` was removed and `patches/*` alone reproduce the campaign tree `24bb0f5acb…`) |
 | `baseline/*` branches, `block/*` tags | **historical** pre-block-12 checkpoints — do not use for the current delivery |
 | `.github/workflows/validate.yml` | per-push/PR delivery validation (runs `scripts/validate-set.sh`; no build) |
 | `.github/workflows/docker-ghcr.yml` | **tag-driven** release pipeline (`v*` tag → ROCm images to GHCR + a GitHub Release with the packaged patch set; manual dispatch and weekly schedule also build).  Fork point is read from `release.json`; see `CONTAINERS.md` |
@@ -891,19 +890,20 @@ full set is ~1136 t/s (**+36 %**), and the first `hc_combine_norm` win was left 
   `mmq-pipeline` wip branches were retired after their content was archived.)
 - **Promotion rule (the sanctioned way out of `wip/`):** a campaign's
 - **The campaign is folded into the delivery (`main`, release `v16-84e76d8a2-r8`, 2026-09-25).**  The
-  `mmb`/`qsa3`/indexer campaign (formerly `beta/mmb-general/`, 28 patches) was folded into the 16
+  `mmb`/`qsa3`/indexer campaign (formerly `archive/work/mmb-general/`, 28 patches) was folded into the 16
   delivery blocks: apply `patches/*` alone to `84e76d8a2` and you get the campaign tree
   `24bb0f5acb…` (release `v16-84e76d8a2-r8`, canonical tip `f373450de…`).  **r9 (2026-09-26) then
   amends block 15** with the issue-#47 typed non-swizzled K/V store fix, net tree `a3dc4bbb…`.
-  `beta/mmb-general/` stays as the historical verification record (`BETA-TESTING.md`, the
+  `archive/work/mmb-general/` stays as the historical verification record (`BETA-TESTING.md`, the
   gfx1201/gfx1100 records); `apply-beta.sh` was removed.  The fold's mapping is in
   `archive/work/beta-integration/integration.md`.  The **`wip/nwarps/`** tree is the one piece deliberately
   left behind (default-OFF, breaks `W=1..8` width purity — the open impurity to investigate).
   Everything unpromoted stays on a branch and is committed **there, never to `main`**; `main` is only
   advanced when the maintainer calls a promotion or a rebase.
 - **Promotion rule (the sanctioned way out of `wip/`):** a campaign's
-  *validated* wins are collected under `beta/` (for the memory campaign:
-  `archive/work/block-15-campaign-wins/`), each win gets an environment kill-switch so
+  *validated* wins were collected under the (now-archived) `beta/` staging area — since 2026-09-26
+  `archive/work/` (the mmb campaign's record is `archive/work/mmb-general/`; for the memory campaign:
+  `archive/work/block-15-campaign-wins/`) — each win gets an environment kill-switch so
   it can be A/B tested and bisected, the **combination** is re-validated (the
   individual validations do not carry over), and only then is a new delivery
   block cut — for this campaign **Block 0015** — with the maintainer's

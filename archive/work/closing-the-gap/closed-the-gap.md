@@ -8,7 +8,7 @@ body, the appendices and the MTP qualification.
 **Box:** `halo` — Strix Halo, Radeon 8060S (gfx1151, RDNA3_5), ROCm 7.14 (`/opt/rocm-7.14-gfx1151`),
 123 GiB unified.
 **Current campaign build:** fork `~/llama.cpp` branch `gap-closing-r13`, tip **`d8334f929`**, tree
-`fa185bbb…` = delivery r13 + 12 `beta/mmb-general` patches + gap-closing `0001..0014`/`0016..0022`.
+`fa185bbb…` = delivery r13 + 12 `archive/work/mmb-general` patches + gap-closing `0001..0014`/`0016..0022`.
 
 ---
 
@@ -168,7 +168,7 @@ This is an **upstream bug (#23398)** now **delivered in the delivery set as bloc
 `patches/0015` is superseded (do not apply it on a campaign rebuilt on r13).
 
 **Session 8 (2026-09-22) did the rebuild + BOTH focus items.**  The campaign is rebuilt on **r13**
-(fork branch `gap-closing-r13`, tip `abf3bff76` = r13 + 12 `beta/mmb-general` patches + gap-closing
+(fork branch `gap-closing-r13`, tip `abf3bff76` = r13 + 12 `archive/work/mmb-general` patches + gap-closing
 `0001..0014` + `0016`/`0017`, dropping the superseded `0015`), built clean.
 
 * **`QSA_SCORE_WMMA` DONE, default ON** (`patches/0016`): the reference's AMD RDNA3_5 4-head/128-dim
@@ -197,7 +197,7 @@ This is an **upstream bug (#23398)** now **delivered in the delivery set as bloc
 validation of the session-8 additions, and the parked items (Phase 3 adaptive ceiling sweep,
 `-ub 16384` PLE reader) are unchanged.  The Phase-2 correctness bug (BF16-MMB eval-callback F32
 elision) is **DONE** — [`2026-09-22-mmb-eval-callback-f32.md`](2026-09-22-mmb-eval-callback-f32.md),
-`patches/0019`.  **The owed `beta/mmb-general`
+`patches/0019`.  **The owed `archive/work/mmb-general`
 BETA-TESTING gate suite is now GREEN on gfx1151** (session 8, on this r13+beta+gap-closing campaign):
 Gate 4 MTP on qwen4exp prose `-n 3000` — **draft acceptance 0.85541** (pos 0.938/0.853/0.776),
 **56.5 t/s vs plain 31.7 t/s** (>= plain); op oracles **LIGHTNING_INDEXER 225/225**,
@@ -225,7 +225,7 @@ The shared-NextN MTP fix now lives in **delivery block 00, release `v16-ebbb1852
 `bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`).  Rebuild this campaign against r13 and **drop
 `archive/work/closing-the-gap/patches/0015`** (block 00 already carries that fix; applying 0015 on r13 would
 conflict).  `patches/0001..0014` should apply unchanged — none touch `common/speculative.cpp`.  Then
-run the full `beta/mmb-general` BETA-TESTING gate suite once — still owed since session 5: Gate 4 (MTP
+run the full `archive/work/mmb-general` BETA-TESTING gate suite once — still owed since session 5: Gate 4 (MTP
 acceptance) + the op oracles.  Purity is an **intra-build** contract (`GREEDY-PURITY.md`):
 `test-logits-width-probe` PASS (worst maxdiff 0) on f16/bf16/q8_0, `plain == draft-mtp` greedy text,
 acceptance > ~0.45 at pos 1, coherence.  The MTP gate can now use the shared-NextN sidecar (fixed).
@@ -267,7 +267,7 @@ score work ("low-single-digit % prefill"); full flag table in
 
 #### Historical: Focus 2 — MMB quant coverage — DONE in session 8
 
-`ggml_cuda_mmb_supported_mm/_mmid/_glu` (`mmb.cu`, `beta/mmb-general/patches/0001`) currently accept
+`ggml_cuda_mmb_supported_mm/_mmid/_glu` (`mmb.cu`, `archive/work/mmb-general/patches/0001`) currently accept
 **IQ4_NL, Q8_0, Q4_K, Q5_1, IQ3_S, Q5_K, Q6_K, IQ4_XS, Q3_K, IQ3_XXS** (IQ3_XXS routed-only and
 default-off).  The completeness gap is the five types above.
 
@@ -292,7 +292,7 @@ models.  Record PPL + pp2048/pp8192 (`-ub 2048` bf16 KV) per type in the beta RE
 
 #### After session 8 — deferred housekeeping + tuning
 
-* Full `beta/mmb-general` BETA-TESTING suite (Gate 4 MTP acceptance + op oracles) if not already done
+* Full `archive/work/mmb-general` BETA-TESTING suite (Gate 4 MTP acceptance + op oracles) if not already done
   with the r13 rebuild.
 * **Phase 2:** sparse QSA decode + incremental indexer state (`d67d58836`, +11–20 %; a hold/repay item
   since our plain decode is already ahead).
@@ -464,8 +464,8 @@ smaller footprint.  Source kept, gated OFF; item 13.
 > **Superseded (end of session 8): this is the session-5-era list, kept for its gate rationale.  The
 > live handoff is the START HERE / NEXT SESSION block at the top of this file.**
 
-1. **Run the full `beta/mmb-general` BETA-TESTING gate suite on the current default build**
-   ([`../../beta/mmb-general/BETA-TESTING.md`](../../beta/mmb-general/BETA-TESTING.md)).  **Purity is an
+1. **Run the full `archive/work/mmb-general` BETA-TESTING gate suite on the current default build**
+   ([`../../archive/work/mmb-general/BETA-TESTING.md`](../../archive/work/mmb-general/BETA-TESTING.md)).  **Purity is an
    intra-build contract** (`GREEDY-PURITY.md`): the decode/verify band `W=1..8` must take one reduction
    path (`plain == draft-mtp` greedy text, byte-identical), `test-logits-width-probe` must print
    `width_purity=PASS (worst maxdiff 0)`, and the output must be coherent.  **Cross-build bit-identity
@@ -506,7 +506,7 @@ side effect.  It was a bisection aid, not the purity doctrine.
 **The contract is intra-build** (`GREEDY-PURITY.md` §5: *"Bit-identical to stock is a reproducibility
 requirement, not a correctness requirement"*; §6: the verify batch and the one-at-a-time decode must
 take the **same** association order **within a build**).  Different builds are expected to produce
-different greedy text: `beta/mmb-general/README.md` calls the MMB on/off difference the **"approved
+different greedy text: `archive/work/mmb-general/README.md` calls the MMB on/off difference the **"approved
 prefill re-baseline"** and its own width-probe table shows row-0 hashes differing above
 `MMB_MIN_T=512` while `width_purity` stays PASS.
 
@@ -528,7 +528,7 @@ draft-mtp` greedy text within the build, the MTP acceptance gate, coherence, and
 W=1 decode logits are unchanged from r12"), never as a blanket equality gate.
 
 References corrected in the same change: this file's START HERE and session-3 record, `README.md`'s
-"Do first" item 1, and `beta/mmb-general/BETA-TESTING.md` §0/Gate 1.  See the 2026-09-22 `WORKLOG.md`
+"Do first" item 1, and `archive/work/mmb-general/BETA-TESTING.md` §0/Gate 1.  See the 2026-09-22 `WORKLOG.md`
 entry.
 
 ### Rebuild / run (copy-paste)
@@ -626,7 +626,7 @@ Both are recall-speed (Phase-1) items; the audit record has the full flag table 
 
 | what | where / value |
 |---|---|
-| fork `~/llama.cpp` | branch **`gap-closing-r13`** @ **`575c4c091`** (`git rev-parse HEAD^{tree}` = `dadc99000db4472056be920d3f73e3308eef3f3a`) = r13 + the 12 `beta/mmb-general` patches + gap-closing `0001..0014`/`0016`/`0017`/`0018`/`0019` (**`0015` dropped** — it is in delivery r13 block 00) |
+| fork `~/llama.cpp` | branch **`gap-closing-r13`** @ **`575c4c091`** (`git rev-parse HEAD^{tree}` = `dadc99000db4472056be920d3f73e3308eef3f3a`) = r13 + the 12 `archive/work/mmb-general` patches + gap-closing `0001..0014`/`0016`/`0017`/`0018`/`0019` (**`0015` dropped** — it is in delivery r13 block 00) |
 | fork build | `~/llama.cpp/build-rocm` (gfx1151, ROCm 7.14), full feature set **default** |
 | this repo | branch `gap-closing`, `archive/work/closing-the-gap/patches/0001..0014` + `0016..0019` |
 | the other solution | `~/pwilkin-llama-cpp` @ `b0f31f587`, `build-rocm` |
@@ -635,7 +635,7 @@ Both are recall-speed (Phase-1) items; the audit record has the full flag table 
 | MTP sidecar | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (the shared-NextN head — **loads now** that r13 block 00 carries the fix; acceptance 0.855) |
 
 Rebuild the campaign from scratch (the verified flow): `git checkout rdna-boosts-r13 && git checkout -b
-gap-closing-r13 && git am <repo>/beta/mmb-general/patches/*.patch && git am
+gap-closing-r13 && git am <repo>/archive/work/mmb-general/patches/*.patch && git am
 <repo>/archive/work/closing-the-gap/patches/00{01..14}-*.patch <repo>/archive/work/closing-the-gap/patches/0016-*.patch
 <repo>/archive/work/closing-the-gap/patches/0017-*.patch <repo>/archive/work/closing-the-gap/patches/0018-*.patch
 <repo>/archive/work/closing-the-gap/patches/0019-*.patch` (skip `0015`).  Build: `cd ~/llama.cpp && ~/bin/build-llama-rocm-714`.  Runtime:
@@ -829,7 +829,7 @@ remaining `token_embd.weight` 644 MiB).  Findings:
 |---|---|
 | this repo, `main` | `== origin/main == 830770a` (clean) |
 | this repo, `gap-closing` | **the WIP branch; all session-2 work is committed here** (`b8aeaa1`, `c1c0b33`) |
-| fork `~/llama.cpp` | branch **`gap-closing`** @ **`94694a38e`** (local; based on `mmb-beta` = r12 + the 12 `beta/mmb-general` patches + the three gap-closing WIP commits) |
+| fork `~/llama.cpp` | branch **`gap-closing`** @ **`94694a38e`** (local; based on `mmb-beta` = r12 + the 12 `archive/work/mmb-general` patches + the three gap-closing WIP commits) |
 | fork build | `~/llama.cpp/build-rocm` (gfx1151, ROCm 7.14), built 2026-09-21; full feature set **default** (incl. `hc_gate_mix`) |
 | pre-port WIP (reference) | `~/llama-wip-mmb` @ `90bf12997` (`wip-mmb-general`), build at `build-rocm` |
 | the other solution | `~/pwilkin-llama-cpp` @ `b0f31f587`, **rebuilt** (`build-rocm`) |
@@ -911,10 +911,10 @@ relu-sum, the MoE bf16 epilogue, the sparse QSA decode + incremental indexer) an
 This section supersedes the stale references in the body. The body's measurements remain valid as
 **dated, gated-tree** evidence, but two references have moved and the plan needs five additions.
 
-### A. Our side: `wip/mmb-general` was promoted to `beta/mmb-general`, 5 → 12 patches
+### A. Our side: `wip/mmb-general` was promoted to `archive/work/mmb-general`, 5 → 12 patches
 
 The body compared a **5-patch, gfx1151-only WIP** at tip `90bf12997` (`~/llama-wip-mmb`). The current
-reference is **`beta/mmb-general`** — **12 patches**, applied tree
+reference is **`archive/work/mmb-general`** — **12 patches**, applied tree
 **`bca69f23dd29acef2d8898c6fd492104e078eef1`**, verified `git am` **12/12** on top of the r12 delivery
 (`~/llama.cpp` HEAD `72176ae8a`, tree `8a80535e…`).
 
@@ -998,7 +998,7 @@ dispatcher and dropped env gating, and the QSA decode/indexer changes add kernel
 ### E. Where the current beta was built and validated
 
 Applied and built on **gfx1151** on 2026-09-21 for the beta re-validation window
-(`beta/mmb-general/BETA-TESTING.md`). Build: `~/bin/build-llama-rocm-714` from the `mmb-beta` branch of
+(`archive/work/mmb-general/BETA-TESTING.md`). Build: `~/bin/build-llama-rocm-714` from the `mmb-beta` branch of
 `~/llama.cpp` (r12 + 12 patches, tree `bca69f23dd…`). The gfx1151 numbers in the body were measured on
 the pre-beta WIP; the beta re-run is what confirms they still hold.
 
@@ -1466,7 +1466,7 @@ Two findings, and one correction to the premise:
 
 ### 12.1 Structural standing
 
-| | the other solution (`b0f31f587`) | ours (r12 + `beta/mmb-general`) |
+| | the other solution (`b0f31f587`) | ours (r12 + `archive/work/mmb-general`) |
 |---|---|---|
 | spec type | upstream **`draft-mtp` only** | `draft-mtp` **and** `draft-mtp-adaptive` |
 | depth | **fixed** `--spec-draft-n-max` (default 3), capped at `n_mtp_layers` when chaining heads | adaptive controller picks the depth each round; `--spec-draft-n-start`, `n_min_adaptive`, clamp at 15 |

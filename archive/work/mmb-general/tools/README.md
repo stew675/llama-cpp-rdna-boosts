@@ -1,4 +1,4 @@
-# `beta/mmb-general/tools/` — the measurement instruments
+# `archive/work/mmb-general/tools/` — the measurement instruments
 
 Two kinds of thing live here: **hardware probes** (written during the campaign) and the **A/B
 harness** (added 2026-09-21, because it had been re-derived from scratch once too often).

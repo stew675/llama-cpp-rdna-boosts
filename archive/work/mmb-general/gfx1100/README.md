@@ -1,12 +1,12 @@
 # gfx1100 patch overlay — **FOLDED INTO THE BETA SET (2026-09-21)**
 
-> **This overlay no longer exists as a separate step.**  At the `beta/mmb-general` promotion the two
+> **This overlay no longer exists as a separate step.**  At the `archive/work/mmb-general` promotion the two
 > shippable overlay patches were folded into the beta set: they are now `patches/0011` (qsa3 on
 > RDNA3_0) and `0012` (F32 split off on RDNA3_0) of the single 12-patch set.  The third — the
 > experimental per-M `nwarps` rule — was moved out to [`../../../wip/nwarps/`](../../../wip/nwarps/)
 > because it is default-OFF and breaks `W=1..8` width purity.
 >
-> Apply the beta set in one step: `git am <repo>/beta/mmb-general/patches/*.patch` (**12/12**, tree
+> Apply the beta set in one step: `git am <repo>/archive/work/mmb-general/patches/*.patch` (**12/12**, tree
 > `bca69f23dd29acef2d8898c6fd492104e078eef1`).  The text below is the historical overlay record, kept
 > because it explains the provenance, the rebase history and the file-ownership reasoning.
 

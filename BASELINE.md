@@ -16,7 +16,7 @@ remain as known-good records for those upstream versions.
 
 > **In `main` since 2026-09-25 (release `v16-84e76d8a2-r8`; current `v16-84e76d8a2-r9`, 2026-09-26):**
 > the fork point is unchanged at **`84e76d8a2`**, but the 16 patches now absorb the 28
-> `beta/mmb-general` patches, so the applied tree is r8's campaign tree
+> `archive/work/mmb-general` patches, so the applied tree is r8's campaign tree
 > **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** plus r9's issue-#47 typed-store fix ->
 > **`a3dc4bbb680bf9dd8bcb5949ec833dec2a892aeb`** (canonical tip `b48fb3f686fe2681f55aa406a8ed52313ad80875`,
 > release `v16-84e76d8a2-r9`).  See `archive/work/beta-integration/integration.md` and `WORKLOG.md` (2026-09-26 r9).
@@ -44,7 +44,7 @@ remain as known-good records for those upstream versions.
 > on top of r3 = the 2026-09-25 block-14 `hc_combine`
 > CPU-reference fix (issue #44: the CPU reference used `t*ne[1]`/`t*hc` row strides instead of the
 > tensors' own `nb[1]`, corrupting every multi-token fused ubatch on a CPU-resident qwen4exp layer -
-> now mirrors the CUDA kernel, bit-identical at nt == 1) plus the 28-patch `beta/mmb-general` re-base
+> now mirrors the CUDA kernel, bit-identical at nt == 1) plus the 28-patch `archive/work/mmb-general` re-base
 > onto r3 (applied tree `0daefe22…`) and its gfx1100 routed-band fix (the 16-wide `mul_mat_vec_q_moe`
 > band is now RDNA4-only - it failed `MUL_MAT_ID` 23/929 on RDNA3_0 and is a measured loss on
 > RDNA3_5).  On top of r2 = the 2026-09-25 block-10 amendment that scopes the wide-VDR MoE expert

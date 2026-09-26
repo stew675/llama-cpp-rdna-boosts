@@ -8,7 +8,7 @@ tuned four-axis table. Runs the 2026-09-21 `archive/work/closing-the-gap` invest
 | | |
 |---|---|
 | box | `halo` — Strix Halo, Radeon 8060S (gfx1151, RDNA3_5), ROCm 7.14 (`/opt/rocm-7.14-gfx1151`) |
-| ours | `~/llama.cpp` branch `mmb-beta` = r12 + 12 `beta/mmb-general` patches, tree `bca69f23dd…`, built 2026-09-21 (`90f081550`) |
+| ours | `~/llama.cpp` branch `mmb-beta` = r12 + 12 `archive/work/mmb-general` patches, tree `bca69f23dd…`, built 2026-09-21 (`90f081550`) |
 | the other solution | `~/pwilkin-llama-cpp` @ `b0f31f587`, **rebuilt** 2026-09-21 (the `git pull` had not been rebuilt; the old binary was `f5daaa3cf`) |
 | model | `/llm/models/Qwen3.8/Flash-Next/IQ4_NL/Qwen3.8-Flash-Next-IQ4_NL-PROJFIX-00001-of-00009.gguf` (93 GiB, qwen4exp) |
 | MTP head | `/llm/models/Qwen3.8/Flash-Next/Q4_K_XL/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf` — **see the trap below** |

@@ -49,7 +49,7 @@ and full history are in `gfx1201-closed.md`.
 
 ## 0.5 Next session — the run plan (start here)
 
-**State.**  `~/llama.cpp` branch `closing-gfx1201` = delivery r13 + `beta/mmb-general` + closing
+**State.**  `~/llama.cpp` branch `closing-gfx1201` = delivery r13 + `archive/work/mmb-general` + closing
 `0001..0014`/`0016..0030`, tip tree **`99b429a60d441f814c84737cfa57803bc15a2f6d`** (29 patches);
 campaign repo `gap-closing` @ `4be503f`.
 
@@ -442,7 +442,7 @@ and `TODO.md`.
 ### 3.2 Apply the full stack (29-patch closing set)
 
 The delivery repo is `~/llama-cpp-rdna-boosts`.  The current `~/llama.cpp` checkout is branch
-`closing-gfx1201` = delivery r13 + `beta/mmb-general` + closing `0001..0014`/`0016..0030` (tip tree
+`closing-gfx1201` = delivery r13 + `archive/work/mmb-general` + closing `0001..0014`/`0016..0030` (tip tree
 **`99b429a60d441f814c84737cfa57803bc15a2f6d`**).  A fresh apply:
 
 ```sh
@@ -452,7 +452,7 @@ git fetch --all
 git checkout ebbb18522
 git checkout -b closing-gfx1201
 bash "$WORK"/scripts/apply-all.sh .                      # delivery r13 (16 blocks)  -> tree bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12
-git am "$WORK"/beta/mmb-general/patches/*.patch          # 12 beta patches          -> tree 79136a15cac1920c0dd334b4c119a9cb42f9143b
+git am "$WORK"/archive/work/mmb-general/patches/*.patch          # 12 beta patches          -> tree 79136a15cac1920c0dd334b4c119a9cb42f9143b
 for p in "$WORK"/archive/work/closing-the-gap/patches/0*.patch; do
   git am "$p"
 done

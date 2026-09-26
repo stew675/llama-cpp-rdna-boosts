@@ -293,7 +293,7 @@ Run on gfx1151, qwen4exp IQ4_NL + the `Q4_K_XL/…Q4_K_M` sidecar:
    the pre-change text where the contract requires it.
 
 A/B/reference commands: `closing-the-gap.md` "Reproduce (copy-paste)" and the session-8 gate suite in
-`beta/mmb-general/BETA-TESTING.md`.
+`archive/work/mmb-general/BETA-TESTING.md`.
 
 ---
 

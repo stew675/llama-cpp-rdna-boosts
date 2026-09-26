@@ -1,7 +1,7 @@
 # gfx1100 — closing-the-gap validation & porting brief
 
 **Audience:** the agent working on the **single RX 7900 XTX (gfx1100, RDNA3_0)** box, 24 GiB VRAM.
-**Goal:** apply the full delivery + `beta/mmb-general` + `archive/work/closing-the-gap` stack, **validate
+**Goal:** apply the full delivery + `archive/work/mmb-general` + `archive/work/closing-the-gap` stack, **validate
 every arch-sensitive piece that fits in 24 GiB**, and **port / explicitly park** the rest.
 
 **Companion file:** [`gfx1201-closing.md`](gfx1201-closing.md) (3× R9700, 184 GiB — the box that can
@@ -12,8 +12,8 @@ That is expected and is what the companion gfx1201 session is for.  Do **not** m
 mark them "not end-to-end testable on this box; arch gates verified; trust gfx1151/gfx1201".
 **Source of truth for what each patch is:** [`closing-the-gap.md`](closing-the-gap.md),
 [`README.md`](README.md) and the dated `2026-09-*` records in this directory.
-**Prior gfx1100 work:** `beta/mmb-general/gfx1100-porting.md` + the `gfx1100-s*-results.md` records.
-Read those first — this box already validated the `beta/mmb-general` set (S1-S10).
+**Prior gfx1100 work:** `archive/work/mmb-general/gfx1100-porting.md` + the `gfx1100-s*-results.md` records.
+Read those first — this box already validated the `archive/work/mmb-general` set (S1-S10).
 **Delivery policy:** `AGENTS.md` (default-on policy, purity rules, **never push the `~/llama.cpp`
 fork**).  Push the delivery repo only if the maintainer asks.
 
@@ -22,7 +22,7 @@ fork**).  Push the delivery repo only if the maintainer asks.
 ## 0. The one-paragraph summary
 
 The campaign is 25 patches (`archive/work/closing-the-gap/patches/0001..0014`, `0016..0026`) on top of the
-**r13 delivery (16 blocks)** + the **12 `beta/mmb-general` patches**.  It was developed and tuned on
+**r13 delivery (16 blocks)** + the **12 `archive/work/mmb-general` patches**.  It was developed and tuned on
 **gfx1151 (RDNA3_5)**.  gfx1100 **shares the gfx11 WMMA builtin** with gfx1151, so it needs none of
 the gfx12 fragment work — but several things are **hard-gated to RDNA3_5** and the **MMB default now
 flips ON** (`0002`), which is the biggest gfx1100 change in the campaign.  Your job:
@@ -57,7 +57,7 @@ flips ON** (`0002`), which is the biggest gfx1100 change in the campaign.  Your 
 ## 2. Apply the full stack
 
 > **Apply-order trap (read this first).**  The delivery repo's **`main`** branch carries the **r13**
-> delivery + the 12 `beta/mmb-general` patches.  The **`gap-closing`** branch carries the 25
+> delivery + the 12 `archive/work/mmb-general` patches.  The **`gap-closing`** branch carries the 25
 > `archive/work/closing-the-gap` patches **but its `release.json` is stale at r13's predecessor (`r12`)**.
 > Apply the delivery from **`main`**, then the closing patches from **`gap-closing`**.  Do not run
 > `scripts/apply-all.sh` from a `gap-closing` checkout — it would apply the r12 delivery.
@@ -75,8 +75,8 @@ git checkout -b closing-gfx1100
 bash "$WORK"/scripts/apply-all.sh .          # main's r13 release.json; 16/16 git am
 git rev-parse HEAD^{tree}                    # expect bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12
 
-# --- 2. beta/mmb-general (12) ------------------------------------------------------------
-git am "$WORK"/beta/mmb-general/patches/*.patch
+# --- 2. archive/work/mmb-general (12) ------------------------------------------------------------
+git am "$WORK"/archive/work/mmb-general/patches/*.patch
 git rev-parse HEAD^{tree}                    # expect 79136a15cac1920c0dd334b4c119a9cb42f9143b
 
 # --- 3. archive/work/closing-the-gap (0015 removed; it is r13 block 00) ----------------------------
@@ -158,7 +158,7 @@ model fits).  Do **not** mark them broken; verify what is verifiable:
 | `0022` gfx1151 decode crossover 64K→32K | `qwen4exp.cpp` | **gfx1151-only** (`qsa_arch_gfx() == 0x1151`); on gfx1100 `1<<62` (dense-always) and qwen4exp cannot run → confirm inert / N/A |
 | `0026` sparse MTP draft prefill default ON | `qwen4exp.cpp` + `llama-model.cpp` | compiles; qwen4exp only |
 
-### 4c. The `beta/mmb-general` rows you are validating against
+### 4c. The `archive/work/mmb-general` rows you are validating against
 
 The 12 beta patches carry the RDNA3_0 row.  Confirm the resolved config (§6.5) and that the
 RDNA4/RDNA3_5 rows did not leak.  Prior record: `gfx1100-s10-rebase-results.md` (13/13, tree

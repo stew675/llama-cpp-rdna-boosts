@@ -79,7 +79,7 @@ the blast radius.
 * **Prefill:** qwen4exp `pp2048` 2475.1 ± 8.2 t/s (default-build 2448-2467) — neutral/slightly better.
 * **CPU-only:** the `-ngl 0` path returns the CPU from `get_layer_buft_list()` and is unchanged by
   construction.
-* **Fresh apply:** r13 + `beta/mmb-general` + closing `0001..0014`/`0016..0030` (skip `0015`)
+* **Fresh apply:** r13 + `archive/work/mmb-general` + closing `0001..0014`/`0016..0030` (skip `0015`)
   reproduces tree `99b429a60d441f814c84737cfa57803bc15a2f6d` (29/29 `git am`).
 
 ## 4. Verdict / what to keep

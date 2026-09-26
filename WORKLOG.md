@@ -11,7 +11,7 @@ the int8 MMQ, not hipBLAS) and **`mmq-pipeline`** (closed **negative**: the MMQ 
 15-18 % slower at equal geometry, and the `I=64` geometry it needs is ~21 % slower — the kernel is
 per-element-epilogue/`ldmatrix` bound, not global-load/barrier bound);
 * the previously-completed trees — `beta-integration`, `bf16-native-prefill` (closed negative),
-  `build-time-regression` (fixed), `closing-the-gap` (consolidated into `beta/mmb-general/`),
+  `build-time-regression` (fixed), `closing-the-gap` (consolidated into `archive/work/mmb-general/`),
   `issue-30-mtp-decode-regression`, `issue-44-hc-combine-oracle`, `issue-45-band-port`,
   `kq-derived-tile`, `kq-mask-derived-ab`, `mtp-journey-2026-09-17`;
 * the dormant scoping records — `prefill-arrangements`, `q8-prefill-tuning`, `reasoning-aware-mtp`,
@@ -20,7 +20,13 @@ per-element-epilogue/`ldmatrix` bound, not global-load/barrier bound);
 `per16-f16-mma` and `mmq-pipeline` existed only on `wip/*` branches; their content was materialised
 into `archive/work/` and the branches retired.  Cross-references in tracked docs were rewritten
 (`wip/<x>` → `archive/work/<x>`); verbatim profiler logs/CSVs under the moved trees keep the old
-absolute paths.  `wip/` now contains a single tree (`nwarps/`).  See `archive/README.md`.
+absolute paths.  `wip/` now contains a single tree (`nwarps/`).
+
+The same consolidation also moved the top-level **`beta/mmb-general/` record to
+`archive/work/mmb-general/`** (the mmb/qsa3/indexer campaign has been folded into the 16 delivery
+blocks since `v16-84e76d8a2-r8` and is no longer applied separately — `apply-beta.sh` was already
+removed), so `main` no longer carries a `beta/` directory.  The redundant `beta-integration` branch
+(fully contained in `main`) was retired.  See `archive/README.md`.
 
 ## 2026-09-26 (r9) — block-15 amendment: restore the typed non-swizzled K/V store in the MMA FA loader (issue #47)
 
@@ -93,7 +99,7 @@ promoted state (`README.md`, `AGENTS.md`, `BASELINE.md`, `MANIFESTS.md`, `TODO.m
 **Next.**  Pushing `main` and the `v16-84e76d8a2-r8` tag triggers the full ROCm release pipeline
 (GHCR images for ROCm 7.2/7.14/10.0 + the GitHub Release with the packaged patch set).
 
-## 2026-09-25 (`beta-integration`) — the 28 `beta/mmb-general` patches are folded into the 16 delivery blocks
+## 2026-09-25 (`beta-integration`) — the 28 `archive/work/mmb-general` patches are folded into the 16 delivery blocks
 
 **Branch** `beta-integration` (cut from `main` at `0699a3d`).  The delivery is now the **16 amended
 patches**: applying them to `84e76d8a2` reproduces the former 28-patch beta campaign tree
@@ -130,11 +136,11 @@ against; the alternative is per-hunk splits with a less clean intermediate histo
 **Artifacts.**  `patches/` (16 regenerated), `rdna-boosts-all.patch`, `release.json`
 (`v16-84e76d8a2-r8`, tip `f373450de…`, tree `24bb0f5acb…`).  Docs swept: `README.md`,
 `AGENTS.md`, `MANIFESTS.md`, `BASELINE.md`, `TODO.md`, `patches/README.md`, and the
-`beta/mmb-general/` banner; `scripts/apply-beta.sh` removed.
+`archive/work/mmb-general/` banner; `scripts/apply-beta.sh` removed.
 
 **Defaults.**  The folded campaign was default-ON in the beta set, so the folded delivery is too
 (`GGML_CUDA_MMB` defaults to 1 and `=0` disables, etc.).  The env kill-switches are unchanged -
-see `beta/mmb-general/BETA-TESTING.md` §0/§3.
+see `archive/work/mmb-general/BETA-TESTING.md` §0/§3.
 
 ---
 
@@ -170,7 +176,7 @@ unchanged).
 **Validation.**  `scripts/validate-set.sh` strict 16/16, applied tree == `7726e514…`.  3-GPU
 `-sm tensor` coherence (4B Q8_0) clean; `llama-bench -sm tensor -ctk/-ctv q8_0 -ub 2048` at
 pp512/pp8192/tg128 stable over 3 runs (pp8192 ~10.75k t/s, tg128 ~102 t/s) with no fault or hang.
-The 28-patch `beta/mmb-general` set is re-cut onto r7 (strict 28/28, applied tree `24bb0f5acb…`,
+The 28-patch `archive/work/mmb-general` set is re-cut onto r7 (strict 28/28, applied tree `24bb0f5acb…`,
 patch bodies byte-identical - the beta touches `ggml-backend.cpp` only at lines ~1043-1078 and
 ~1462-1463, far from the fix).
 
@@ -202,7 +208,7 @@ tile) 104/276/428/655 -- the default is 1.5-2.3x faster at every verify width, a
 **Purity.**  `test-backend-ops -o FLASH_ATTN_EXT` **6340/6340 on ROCm0**; bf16 `--spec-type none ==
 draft-mtp` byte-identical at ~5k (`904d905c8c29`) and ~30k (`d515c9f933ea`).
 
-**Beta re-base.**  The 28 `beta/mmb-general` patches were re-cut onto r6 (strict **28/28** on a fresh
+**Beta re-base.**  The 28 `archive/work/mmb-general` patches were re-cut onto r6 (strict **28/28** on a fresh
 delivery, applied tree **`1df5769c…`**, previously `469082e4…` on r5).  The patch bodies are
 byte-identical to the r5-based set - only the `From <sha>` lines and `commits.txt` changed.
 
@@ -258,7 +264,7 @@ green on the final build); f16 `--spec-type none == draft-mtp` byte-identical at
 and ~30k (`32f533498f84`), q8_0 identical at ~5k (`50ca5b987f85`).  The quantized band is unregressed
 (op level within noise: q8_0 kv 16384 147/148/222/227 -> 150/152/227/232 us).
 
-**Beta re-base.**  The 28 `beta/mmb-general` patches were re-cut onto r5 (strict **28/28** on a fresh
+**Beta re-base.**  The 28 `archive/work/mmb-general` patches were re-cut onto r5 (strict **28/28** on a fresh
 delivery, applied tree **`469082e4…`**, previously `70cc895a…`).  The patch bodies are byte-identical to
 the r4-based set - only their `From <sha>` lines and `commits.txt` changed - so the measured
 gfx1201/gfx1100 beta behaviour carries over; `scripts/apply-beta.sh`'s recorded tree is updated.  The
@@ -340,7 +346,7 @@ smoke clean.  No qwen4exp model is present on the gfx1100 box (the large Flash-N
 24 GB card), so the end-to-end model path was not runnable; the op oracle covers the exact defective
 arithmetic.
 
-**Beta re-base + gfx1100 routed-band fix.**  The 28 `beta/mmb-general` patches were re-based onto r3
+**Beta re-base + gfx1100 routed-band fix.**  The 28 `archive/work/mmb-general` patches were re-based onto r3
 (`git am` strict **28/28** on a fresh delivery, applied tree **`0daefe22…`**, previously `e00275ff…`).
 The first gfx1100 beta-window run found a real regression in patch 0027: the extended 16-wide routed
 `mul_mat_vec_q_moe` band (`MMVQ_MOE_MAX_BATCH_SIZE`) was enabled on RDNA3_0 (the `0031` arch floor
@@ -360,7 +366,7 @@ canonical block-15 tip `6d420c5257c822d1606f9a5982297524198fd021`, net tree
 `ea7acf2d3e18b0da01e00a3fcce0d770c430fa98`.  `scripts/validate-set.sh` green on a fresh `84e76d8a2`
 tarball (strict **16/16** `git am`).
 
-**The bug.**  The 2026-09-25 beta-window re-validation (`beta/mmb-general/BETA-TESTING.md` §8)
+**The bug.**  The 2026-09-25 beta-window re-validation (`archive/work/mmb-general/BETA-TESTING.md` §8)
 measured the base-16 MoE `draft-mtp n3` acceptance at 0.73967 vs upstream's 0.78844 and attributed it
 to a MoE reduction-order "accepted trade".  That was premature.  The cause was concrete: in block 10,
 `VDR_Q4_K/Q5_K/Q6_K_Q8_1_MMVQ_MOE` were unconditional (4/4/2) while **only the Q8_0** MoE VDR carried
@@ -381,13 +387,13 @@ upstream) and decode **87.5 -> 89.1 t/s**; dense 27B / qwen4exp unchanged; MoE `
 onto the fixed base (`git rebase --onto`, no conflicts; applied tree **`e00275ff…`**) and re-validated -
 Gate 1 (dense/MoE/qwen4exp `none == draft-mtp n3` + `width_purity=PASS`), Gate 2 (dense +29/+25/+22 %,
 MoE +26/+24/+19 %), Gate 3 (all oracles incl. `MUL_MAT_ID` 929/929), Gate 4 (dense 0.82188, MoE
-0.75225, qwen4exp 0.82151, shared 0.82356).  Full record: `beta/mmb-general/BETA-TESTING.md` §9.
+0.75225, qwen4exp 0.82151, shared 0.82356).  Full record: `archive/work/mmb-general/BETA-TESTING.md` §9.
 
 ## 2026-09-25 — full gfx1151 beta-window re-validation + the `0027` `MUL_MAT_ID` fix + the MoE MTP gap root-caused
 
-**Scope.** The `beta/mmb-general` 28-patch set re-based on `84e76d8a2` (tree `7f339b10`, delivery
+**Scope.** The `archive/work/mmb-general` 28-patch set re-based on `84e76d8a2` (tree `7f339b10`, delivery
 `v16-84e76d8a2-r1`) was run through the **full four-gate gfx1151 beta-window re-validation**
-(`beta/mmb-general/BETA-TESTING.md` §8) and the MoE-vs-upstream MTP acceptance gap was investigated.
+(`archive/work/mmb-general/BETA-TESTING.md` §8) and the MoE-vs-upstream MTP acceptance gap was investigated.
 No delivery/beta behaviour changed.
 
 **`MUL_MAT_ID` abort (fixed in beta patch `0027`).**  The full oracle aborted on
@@ -428,7 +434,7 @@ matmul/reduction-order policy** (block-10 k-quant + block-13 band-uniform `nwarp
 compile-time — the width-purity invariant).  It is the documented numerics trade (`GREEDY-PURITY.md`
 §19/§25): ~4 % acceptance / ~3 % MTP throughput for +48–62 % MoE prefill and ~+4 % decode, with
 acceptance well above the bar and MTP ≥ plain everywhere.  Full tables and the arm matrix:
-`beta/mmb-general/BETA-TESTING.md` §8.
+`archive/work/mmb-general/BETA-TESTING.md` §8.
 
 
 ## 2026-09-24 (r1) — `v16-84e76d8a2-r1`: the 16-block set re-based onto upstream master `84e76d8a2`
@@ -501,7 +507,7 @@ patches.)
 
 ### Beta set status
 
-The `beta/mmb-general/` set (28 patches) is **not** re-based here and still targets the old r13 tree
+The `archive/work/mmb-general/` set (28 patches) is **not** re-based here and still targets the old r13 tree
 (`bb7b6d07…` / `468c6496…`); do not `apply-beta.sh` on this baseline until it is re-cut.  That is the
 next task, deliberately staged after the base patch set is frozen.
 
@@ -562,27 +568,27 @@ next task, deliberately staged after the base patch set is frozen.
 bisection check (while `GGML_CUDA_MMB` was `getenv ? atoi : 0`, "MMB unset" was literally r12 + the
 arch-neutral groups).  It is **not** the purity contract: `GREEDY-PURITY.md` §5/§6 guarantee
 *intra-build* agreement (the W=1..8 decode/verify band, `plain == draft-mtp`, the width probe), and
-`beta/mmb-general/README.md` calls the MMB on/off logit change the **"approved prefill re-baseline"**.
+`archive/work/mmb-general/README.md` calls the MMB on/off logit change the **"approved prefill re-baseline"**.
 Under the default-on policy `MMB=0` is also no longer "the default minus MMB".
 
 Corrected references: `archive/work/closing-the-gap/closing-the-gap.md` (START HERE item 1, the session-3
 "gates owed" line, + a new dated correction record), `archive/work/closing-the-gap/README.md` ("Do first" item
-1) and `beta/mmb-general/BETA-TESTING.md` §0 + Gate 1.  Measured for the record (dense 27B Q8, 128-token
+1) and `archive/work/mmb-general/BETA-TESTING.md` §0 + Gate 1.  Measured for the record (dense 27B Q8, 128-token
 greedy, `prompts/prose-rdna-boosts.txt`, seed 42 / temp 0): r12 = `gap-closing MMB=0` = `2eb597253646`;
 `gap-closing` default = `efad2aa9a83e` (the re-baseline).  Op oracles re-run green on the default
 gfx1151 build: `GATED_DELTA_NET`, `INDEXER_TOPK`, `FLASH_ATTN_QSA`, `FLASH_ATTN_EXT` 5955 OK / 0 FAIL.
 
-## 2026-09-21 (WIP, not a delivery change) — `beta/mmb-general` built on gfx1151; closing-the-gap plan + MTP qualification
+## 2026-09-21 (WIP, not a delivery change) — `archive/work/mmb-general` built on gfx1151; closing-the-gap plan + MTP qualification
 
 **No delivery change.**  Session on the gfx1151 box (`halo`), after the gfx1201 agent's housekeeping
 push (`830770a`, merged).
 
-**Beta on gfx1151.**  The 12 `beta/mmb-general` patches were applied to `~/llama.cpp` (r12 +
+**Beta on gfx1151.**  The 12 `archive/work/mmb-general` patches were applied to `~/llama.cpp` (r12 +
 patches, branch `mmb-beta`, tree `bca69f23dd…`) and built with `~/bin/build-llama-rocm-714`; clean
 build, no errors.  This is the tree the `BETA-TESTING.md` re-validation runs against.
 
 **New WIP: `archive/work/closing-the-gap/`.**  The 2026-09-20 `~/closing-the-gap.md` moved there and was
-refreshed:  our reference is now the 12-patch `beta/mmb-general` (not the pre-promotion 5-patch gfx1151
+refreshed:  our reference is now the 12-patch `archive/work/mmb-general` (not the pre-promotion 5-patch gfx1151
 WIP); pwilkin's branch moved `f5daaa3cf` → `b0f31f587` (10 commits — MMB quant coverage 10→23 types +
 Flash-Next F32 PLE fusion; maskless-only-where-qsa3, also a prefill win; sparse QSA decode +
 incremental indexer state, +11–20 % MTP decode; three cheap correctness fixes; and his tuned defaults
@@ -606,10 +612,10 @@ tuning + correctness.  §13 of the closing-the-gap doc is regrouped into those t
 **No delivery change.**  State of play after the promotion, recorded so the next session does not have
 to reconstruct it:
 
-**The `beta/mmb-general` set is waiting on the gfx1151 box** for its final re-validation
-(`beta/mmb-general/BETA-TESTING.md`).  The campaign was developed and tuned on gfx1151, then ported to
+**The `archive/work/mmb-general` set is waiting on the gfx1151 box** for its final re-validation
+(`archive/work/mmb-general/BETA-TESTING.md`).  The campaign was developed and tuned on gfx1151, then ported to
 gfx1201 and gfx1100; that combination has never been re-run on gfx1151.  The branch to take over is
-**`beta/mmb-general`** (pushed; also `main` @ `3f2eaf8`), 12 patches, applied tree
+**`archive/work/mmb-general`** (pushed; also `main` @ `3f2eaf8`), 12 patches, applied tree
 `bca69f23dd29acef2d8898c6fd492104e078eef1`.
 
 **The next campaign starts on the gfx1151 machine**, and will then be ported to this box.  The
@@ -627,11 +633,11 @@ port:
 | the same, decomposed: arch-neutral groups (G5/G4/G3a) + qsa3 | +14.4-16.3 % |
 
 So a +10-20 % qwen4exp claim on gfx1151 should land as roughly **+10-20 % on top of 2897/2713/2557**
-here, and the acceptance/width/PPL gates are the ones that protect it (`beta/mmb-general/BETA-TESTING.md`
+here, and the acceptance/width/PPL gates are the ones that protect it (`archive/work/mmb-general/BETA-TESTING.md`
 §2, and `gfx1201-s14-gates.md` for the full B1-B9 runbook).
 
 **Instrumentation preserved rather than re-derived.**  The campaign's A/B harness had been rebuilt from
-scratch several times and lives in `/tmp` each time; it is now in **`beta/mmb-general/tools/`**:
+scratch several times and lives in `/tmp` each time; it is now in **`archive/work/mmb-general/tools/`**:
 `ab-interleaved.sh` (interleaved delivery-vs-WIP benchmark with a per-test mean and the delivery's own
 spread) and `lbparse.py` (llama-bench **and** `test-backend-ops` output).  The parser deliberately
 encodes the two traps that cost time this campaign — llama-bench's `tg128 @ d16384` test naming, and
@@ -641,10 +647,10 @@ returns a stable `5953/5954 OK, 0 FAIL` from a merged *or* separated capture).  
 against the real logs before being committed; the tools README states the depth/verdict rule
 (prefer pp32768+, the shallow end is clock-ramped, never run two benches at once).
 
-## 2026-09-21 (WIP, not a delivery change) — `wip/mmb-general` promoted to `beta/mmb-general`
+## 2026-09-21 (WIP, not a delivery change) — `wip/mmb-general` promoted to `archive/work/mmb-general`
 
 **No delivery change.**  The `mmb-general` campaign left `wip/` and entered its beta window: the
-directory moved to **`beta/mmb-general/`** on `main`, and the one patch that could not ship was
+directory moved to **`archive/work/mmb-general/`** on `main`, and the one patch that could not ship was
 extracted to a new **`wip/nwarps/`** tree.
 
 **The beta set is 12 patches**, `git am` **12/12** from the r12 fork point, applied tree
@@ -655,7 +661,7 @@ extracted to a new **`wip/nwarps/`** tree.
   per-arch policy table).  These were the 10 canonical patches.
 * `0011`-`0012` — the gfx1100 (RDNA3_0) deltas, **folded in** at promotion: enable `qsa3` on RDNA3_0
   (0021's predicate widening) and default the F32 split tile off there.  The overlay directory
-  `beta/mmb-general/gfx1100/` is kept for provenance and now says so.
+  `archive/work/mmb-general/gfx1100/` is kept for provenance and now says so.
 
 **`wip/nwarps/` is the extraction.**  The gfx1100 per-M `nwarps` patch was the third overlay patch; it
 was **removed from the set** and is now `wip/nwarps/patches/per-M-nwarps-rdna3-0.patch` with a
@@ -676,7 +682,7 @@ self-contained README.  Two reasons:
 **The gfx1151 re-validation is the next step.**  The campaign was developed and tuned on gfx1151, then
 ported to gfx1201 and gfx1100; the **combination has never been re-run on gfx1151** — the individual
 "gfx1151 unchanged" claims were made one step at a time (mostly by comparing device assembly), never
-once end-to-end on the final set.  `beta/mmb-general/BETA-TESTING.md` is the checklist: (1) MMB **off**
+once end-to-end on the final set.  `archive/work/mmb-general/BETA-TESTING.md` is the checklist: (1) MMB **off**
 must be byte-identical to r12 (**retracted 2026-09-22** — that was the opt-in-era bisection aid, not the
 purity contract; `GREEDY-PURITY.md` §5/§6 make the guarantee *intra-build*), with `test-logits-width-probe` PASS; (2) `GGML_CUDA_MMB=1` must still
 recover the original **+32…+48 %** gfx1151 prefill win (the risk the per-arch table introduced);
@@ -690,7 +696,7 @@ matrix" claim from the S14 record was corrected — it is **5954 OK / 0 FAIL and
 and the apparent movement was a `2>&1` stream-interleaving parse trap.
 
 **Docs:** `AGENTS.md` (the `wip/`+`beta/` layout rows and the WIP-branch bullet, since `beta/` is no
-longer empty), `beta/mmb-general/README.md` (beta header + what is in the set), the new
+longer empty), `archive/work/mmb-general/README.md` (beta header + what is in the set), the new
 `BETA-TESTING.md`, `wip/nwarps/README.md`, `combined-set-verification.md` (postscript), `GROUPS.md`
 (apply order = 12 patches; the 0013 decision resolved), and the `gfx1100/README.md` fold note.
 

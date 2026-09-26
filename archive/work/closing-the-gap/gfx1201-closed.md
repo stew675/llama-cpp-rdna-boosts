@@ -25,7 +25,7 @@ fork**).
 # (historical) gfx1201 — closing-the-gap validation & porting brief
 
 **Audience:** the agent working on the **3× Radeon AI PRO R9700 (gfx1201, RDNA4)** box.
-**Goal:** apply the full delivery + `beta/mmb-general` + `archive/work/closing-the-gap` stack, then
+**Goal:** apply the full delivery + `archive/work/mmb-general` + `archive/work/closing-the-gap` stack, then
 **validate every arch-sensitive piece on RDNA4** and **port** anything that is RDNA3_5-only or
 gfx1151-tuned.  It can run (almost) every model the gfx1151 campaign used, so this box is the
 primary cross-arch validation for the campaign.
@@ -45,11 +45,11 @@ fork**).  Push the delivery repo only if the maintainer asks.
 > The paragraph below describes the campaign as it stood when the work was being validated.
 
 The campaign is 27 patches (`archive/work/closing-the-gap/patches/0001..0014`, `0016..0028`) on top of the
-**r13 delivery (16 blocks)** + the **12 `beta/mmb-general` patches**.  It was developed and tuned
+**r13 delivery (16 blocks)** + the **12 `archive/work/mmb-general` patches**.  It was developed and tuned
 on **gfx1151 (RDNA3_5)**, and a few pieces are explicitly **RDNA3_5-only or gfx1151-tuned**.  Your
 job is to prove that on **gfx1201 (RDNA4)** the tree is *correct and not a regression*, and to
 **port or explicitly document** every arch-scoped piece.  The gfx1201 win expectation is the
-`mmb-general` port's own record (`beta/mmb-general/gfx1201-porting.md`, S14: **+22 % whole-WIP vs
+`mmb-general` port's own record (`archive/work/mmb-general/gfx1201-porting.md`, S14: **+22 % whole-WIP vs
 the delivery at depth** on qwen4exp IQ4_XS); the closing campaign is expected to *add* to that, not
 to lose it.
 
@@ -99,7 +99,7 @@ slightly different directory on this host.)
 > kept only as history.
 
 > **Apply-order trap (read this first).**  The delivery repo's **`main`** branch carries the **r13**
-> delivery + the 12 `beta/mmb-general` patches.  The **`gap-closing`** branch carries the 25
+> delivery + the 12 `archive/work/mmb-general` patches.  The **`gap-closing`** branch carries the 25
 > `archive/work/closing-the-gap` patches **but its `release.json` is stale at r13's predecessor (`r12`)**.
 > Apply the delivery from **`main`**, then the closing patches from **`gap-closing`**.  Do not run
 > `scripts/apply-all.sh` from a `gap-closing` checkout — it would apply the r12 delivery.
@@ -117,8 +117,8 @@ git checkout -b closing-gfx1201
 bash "$WORK"/scripts/apply-all.sh .          # main's r13 release.json; 16/16 git am
 git rev-parse HEAD^{tree}                    # expect bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12
 
-# --- 2. beta/mmb-general (12) ------------------------------------------------------------
-git am "$WORK"/beta/mmb-general/patches/*.patch
+# --- 2. archive/work/mmb-general (12) ------------------------------------------------------------
+git am "$WORK"/archive/work/mmb-general/patches/*.patch
 git rev-parse HEAD^{tree}                    # expect 79136a15cac1920c0dd334b4c119a9cb42f9143b
 
 # --- 3. archive/work/closing-the-gap (25; SKIP 0015 which r13 block 00 supersedes) -----------------
@@ -156,7 +156,7 @@ BUILD_DIR=build-rocm EXTRA_CMAKE_FLAGS="-DCMAKE_HIP_FLAGS=" ~/bin/build-llama-ro
 #   test-backend-ops test-logits-width-probe llama-batched-bench llama-imatrix -j 16
 ```
 Build **both** trees (campaign + r13+beta baseline).  gfx1201 shares the gfx12 fragment shim that
-`beta/mmb-general` already ported, so all closing kernels should compile unchanged — the risk is
+`archive/work/mmb-general` already ported, so all closing kernels should compile unchanged — the risk is
 **instantiation**, not new porting.
 
 ---
@@ -198,7 +198,7 @@ branch or a gfx1151-tuned constant; "neutral" = no arch branch (verify only).
 
 ### 4b. Prerequisites that are already arch-scoped (do not re-port, but re-gate)
 
-The 12 `beta/mmb-general` patches carry the RDNA4 rows you are validating against.  Confirm the
+The 12 `archive/work/mmb-general` patches carry the RDNA4 rows you are validating against.  Confirm the
 **resolved config** matches (`§6.4`), and that the gfx1100/gfx1151 rows did not leak into RDNA4.
 
 * `mmb_arch_defaults(cc)` RDNA4 row: `dense_geom=1`, `routed=0`, `f32split=1`, `gatemix=0`.
@@ -235,7 +235,7 @@ worktree and record, on this box:
 * the S14 reference hashes (below) — a smoke check that your box reproduces the campaign's RDNA4
   environment.
 
-S14 gfx1201 reference hashes (from `beta/mmb-general/gfx1201-s14-gates.md`, **r12+beta** tree —
+S14 gfx1201 reference hashes (from `archive/work/mmb-general/gfx1201-s14-gates.md`, **r12+beta** tree —
 treat as smoke, not byte-gates for the r13+closing tree):
 
 | model / command | hash |
@@ -650,9 +650,9 @@ markings under `-sm tensor` (infrastructure, low priority).
 
 **Integration — done; the r13+beta prerequisites carry the RDNA4 kernel ports.**  The brief's §2 order was followed exactly:
 delivery r13 from `main` (16 blocks, applied tree `bb7b6d07b05ad8e23ab6e770172e7f597cfb3c12`), then
-the 12 `beta/mmb-general` patches (`79136a15cac1920c0dd334b4c119a9cb42f9143b`), then the 25 closing
+the 12 `archive/work/mmb-general` patches (`79136a15cac1920c0dd334b4c119a9cb42f9143b`), then the 25 closing
 patches skipping `0015` (`1f09fd97d916ca080f7f65cdc422a3d6c425baa7`).  The closing set applied
-**25/25 clean** on gfx1201 — the gfx12 shim is already in `beta/mmb-general`, so nothing needed
+**25/25 clean** on gfx1201 — the gfx12 shim is already in `archive/work/mmb-general`, so nothing needed
 porting to make it build.  Baselines kept: `~/llama-baseline` (r13+beta, tree `79136a15…`),
 campaign `~/llama.cpp` branch `closing-gfx1201`.
 
@@ -705,7 +705,7 @@ follow-up.)*
 
 #### 2026-09-23 — gate results
 
-All on branch `closing-gfx1201` = delivery r13 + `beta/mmb-general` + the 25 closing patches
+All on branch `closing-gfx1201` = delivery r13 + `archive/work/mmb-general` + the 25 closing patches
 (post-fix tree `1be654fa71167e470ffcce70456bef7a23e6de25`), unless noted.  `MMB` default (on), 1 GPU
 unless a split is stated.  Builds: campaign `~/llama.cpp/build-rocm`, baseline
 `~/llama-baseline/build-rocm`.
@@ -751,7 +751,7 @@ to <0.5 %):
 | pp65536 | 2546.1 | 2625.7 | **+3.1 %** |
 | pp98304 | 2408.0 | 2433.0 | **+1.0 %** |
 
-The baseline *already* carries the `beta/mmb-general` +22 %-at-depth port, so this is what the
+The baseline *already* carries the `archive/work/mmb-general` +22 %-at-depth port, so this is what the
 closing set adds on top.  The `0004` conv-fusion gate (this session) removes the PLE fusion from
 this multi-GPU run; forcing it on (`GGML_CUDA_CONV_FUSION_MULTI=1`) should recover a little more
 prefill at the cost of the purity bug — re-measure when the root cause is fixed.
@@ -782,9 +782,9 @@ and width purity is untouched.  A RDNA4 WMMA port remains a candidate (§8).
 The campaign runs on RDNA4 because **two layers** of RDNA4 work are present, and only one of them
 is in the 25 closing patches:
 
-1. **`beta/mmb-general` — the big WMMA ports (12 patches, a prerequisite).**  This is where the
+1. **`archive/work/mmb-general` — the big WMMA ports (12 patches, a prerequisite).**  This is where the
    substantial new kernel work for RDNA4 lives, done in the beta's own gfx1201 sessions
-   ([`gfx1201-porting.md`](../../beta/mmb-general/gfx1201-porting.md) S4–S13):
+   ([`gfx1201-porting.md`](../../archive/work/mmb-general/gfx1201-porting.md) S4–S13):
    * **qsa3** (packed-block sparse-attention WMMA): the gfx12 fragment shim + the first oracle the
      kernel ever had on any arch, `FLASH_ATTN_QSA` 26/26, **+7.6/+11.5/+10.4 % prefill** (S4);
    * **mmb** (general-purpose bf16-WMMA dequant GEMM): the gfx12 bf16 fragment shim, the gfx11 asm

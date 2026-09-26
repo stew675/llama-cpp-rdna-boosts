@@ -10,10 +10,10 @@ It ships as **16 patches** (block 00 + blocks 01-15) for a clean llama.cpp
 checkout at the fork point **`84e76d8a2`** (upstream master, 2026-09-24
 re-base).  Each block is a self-contained `git am` commit, so you can apply
 the whole set or pick the ones you want.  The **`mmb` (bf16-WMMA weight GEMM) / QSA / indexer
-campaign**, formerly the 28-patch opt-in `beta/mmb-general/` set, is now **folded into the delivery
+campaign**, formerly the 28-patch opt-in `archive/work/mmb-general/` set, is now **folded into the delivery
 blocks** — the `mmb` core into block 08, the catch-all host-buffer/CPU fixes into block 06, and the
 qwen4exp/QSA/HC/indexer work into block 15 — so the **16 patches alone reproduce the full campaign
-tree `24bb0f5acb…`**.  `beta/mmb-general/` is retained only as the historical verification record;
+tree `24bb0f5acb…`**.  `archive/work/mmb-general/` is retained only as the historical verification record;
 see [The `mmb` campaign is in the delivery](#the-mmb-campaign-is-in-the-delivery).  (This is the
 state on the **`beta-integration`** branch; `main` still carries r7 + the separate beta set.)
 
@@ -30,7 +30,7 @@ bash <path-to-this-repo>/scripts/apply-all.sh .   # creates branch rdna-boosts
 - Current status and validation: [Current state](#current-state)
 
 > **The `mmb`/QSA/indexer campaign is folded into the delivery (2026-09-25, release `r8`).**  The 16
-> delivery patches now absorb the 28 `beta/mmb-general/` patches; the applied tree is `24bb0f5acb…`
+> delivery patches now absorb the 28 `archive/work/mmb-general/` patches; the applied tree is `24bb0f5acb…`
 > and the build is clean on gfx1201.  The working plan, per-patch mapping and validation record are
 > in [`archive/work/beta-integration/integration.md`](archive/work/beta-integration/integration.md).
 
@@ -42,7 +42,7 @@ Frozen deliveries are published as GitHub Releases and tagged in this repo
 block-14 `hc_combine` CPU-reference fix (issue #44) + the beta re-base, `r4` the block-15 RDNA4
 GQA-6 decode/verify flash-attention band (issue #45), `r5` the block-15 f16/bf16 band coverage
 (issue #45 follow-up), `r6` the block-15 bf16 native default flip, `r7` the block-14 Meta-tensor-split
-scheduler race fix, `r8` the **`beta/mmb-general` fold into the 16 blocks** (the campaign is now
+scheduler race fix, `r8` the **`archive/work/mmb-general` fold into the 16 blocks** (the campaign is now
 part of the delivery, no separate beta apply step), `r9` the block-15 typed non-swizzled K/V store
 fix for the MMA FA prefill loader (issue #47), and each later release on the
 same base increments `N`).  `release.json.release` must equal the tag — CI
@@ -113,8 +113,7 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 ├── benchmarks/            # benchy methodology + v1/v2 results + graphs (dated records)
 ├── prompts/               # versioned, hash-stable test prompts (sha256-recorded; never edited in place)
 ├── wiki/                  # source for the GitHub wiki (Home, MTP & Adaptive MTP, Quick Reference); see wiki/README.md
-├── wip/                   # ACTIVE exploration docs / handoffs (currently: iq4nl-prefill/)
-├── beta/                  # historical verification record (beta/mmb-general/, now folded into patches/)
+├── wip/                   # ACTIVE exploration docs / handoffs (currently only: nwarps/)
 ├── upstream/              # upstream-PR candidates (UPSTREAM-PR-*.md + .patch) + their index
 └── archive/               # the rest: archive/work/ (closed experiments + the archived wip/ trees) + archive/docs/ (history)
 ```
@@ -136,14 +135,14 @@ MoE MMQ gate now covers RDNA4 + RDNA3_5 + RDNA3_0 (gfx1151 validated
 | `0005` | CPU bit-identical decode/verify batches |
 | `0006` | host-buffer revert for discrete GPUs — now the delivery's **catch-all** block for mixed backend/scheduler/CPU fixes (the FA instance build-time work, `--fit` under `-sm tensor`, the host-buffer input layer and the tiny-CPU-split single-thread fix) |
 | `0007` | meta device-wrapper skip |
-| `0008` | fused-core prefill kernels + GPU bit-identical results (needs blocks 03+04; amended 2026-09-07 with the mul_mat+add through-view shape guard, PR #15). **Now folds the `mmb` (bf16-WMMA dequant weight GEMM) core, the RDNA4 fragment port / per-arch tuning, and the GDN/PLE conv1d + narrow-row RMS-norm prefill fusions** (absorbed from the former `beta/mmb-general` campaign). |
+| `0008` | fused-core prefill kernels + GPU bit-identical results (needs blocks 03+04; amended 2026-09-07 with the mul_mat+add through-view shape guard, PR #15). **Now folds the `mmb` (bf16-WMMA dequant weight GEMM) core, the RDNA4 fragment port / per-arch tuning, and the GDN/PLE conv1d + narrow-row RMS-norm prefill fusions** (absorbed from the former `archive/work/mmb-general` campaign). |
 | `0009` | meta-buffer compute-container headroom |
 | `0010` | k-quant-boosts: Q4_K/Q5_K/Q6_K/Q8_0 mmvq VDR (+ q8_1 quantize-cache fusions; adds a dedicated RDNA3.5 mmvq table) |
 | `0011` | skip CUDA graphs for multi-token PRE-FILL (decode keeps graph replay) |
 | `0012` | **hybrid HIP all-reduce** — custom internal AR for the small-tensor decode path, per-size hybrid dispatch vs RCCL, RDNA4-only gate (bounded in-kernel spin since 2026-08-30 fix round; builds without RCCL) |
 | `0013` | **fused MoE gate+up+GLU MMQ + mmvq short-K item-split** — prefill fused expert MMQ (RDNA4 + RDNA3_5 + RDNA3_0, Q3_K/Q4_K/Q5_K/Q8_0/Q6_K, env opt-out `GGML_CUDA_DISABLE_MOE_MMQ_FUSION`) + decode item-split (rpb 2/4/8) merged with the upstream has_fusion mmvq path |
 | `0014` | **qwen4exp / Qwen3.8-Flash-Next support** — QSA sparse FA (default) + fused indexer top-k, HC_MIX/HC_COMBINE fused decode ops, managed lazy reader, MTP draft-head, WS4 hyperconn prefill fusions, QSA decode campaign + per-arch dense/QSA decode policy (promoted from `beta/qwen4exp`; see `patches/README.md` block-14 notes). The masked-V/freed-cell fixes it once carried now live in blocks 00 (Vulkan) and 03 (HIP). |
-| `0015` | **attention-memory wins (block 15)** — promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`: **V3** derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default), **V4** native q8_0 + **V5** native bf16 K/V in the FA kernels (both behind `GGML_CUDA_FA_KV_NATIVE`, opt-in default 0), **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived QSA per-block bias + visibility (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), **W3** keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), **W4** ggml-alloc unused-view release (no gate; A/B revert in `archive/work/block-15-campaign-wins/ab/`).  ~3.4 GiB/GPU + ~1.2 GiB host saved on qwen4exp, ~800 MiB/GPU + ~800 MiB host on dense models, at ~1.3 % prefill / ~0.3 % decode. **Now also folds the qwen4exp/QSA/HC/indexer campaign** (`qsa3` packed-block WMMA attention, fused indexer top-k + prefill score fusions, HC16 native-BF16 producers, `hc_gate_mix`, sparse MTP-draft attention, the sparse-QSA/derived-indexer defaults, and the host-buffer/CPU/meta fixes) — the former `beta/mmb-general` work. |
+| `0015` | **attention-memory wins (block 15)** — promoted 2026-09-12 from `archive/work/block-15-campaign-wins/`: **V3** derived kq mask (`LLAMA_KQ_MASK_DERIVED`, on by default), **V4** native q8_0 + **V5** native bf16 K/V in the FA kernels (both behind `GGML_CUDA_FA_KV_NATIVE`, opt-in default 0), **W1** QSA score-chain memory (`GGML_QSA_SCORE_MEM`), **W2** derived QSA per-block bias + visibility (`GGML_QSA_DERIVED_BIAS`/`GGML_QSA_DERIVED_VIS`), **W3** keys-only QSA indexer cache (`LLAMA_QSA_KEYS_ONLY`), **W4** ggml-alloc unused-view release (no gate; A/B revert in `archive/work/block-15-campaign-wins/ab/`).  ~3.4 GiB/GPU + ~1.2 GiB host saved on qwen4exp, ~800 MiB/GPU + ~800 MiB host on dense models, at ~1.3 % prefill / ~0.3 % decode. **Now also folds the qwen4exp/QSA/HC/indexer campaign** (`qsa3` packed-block WMMA attention, fused indexer top-k + prefill score fusions, HC16 native-BF16 producers, `hc_gate_mix`, sparse MTP-draft attention, the sparse-QSA/derived-indexer defaults, and the host-buffer/CPU/meta fixes) — the former `archive/work/mmb-general` work. |
 
 > **Block 15 (attention-memory wins) is part of the delivery since
 > 2026-09-12** (`patches/0015`, promoted from
@@ -216,7 +215,7 @@ git add -A && git commit -m "rdna-boosts: block 15: campaign memory wins"
 ### The `mmb` campaign is in the delivery
 
 On the **`beta-integration`** branch the `mmb` (bf16-WMMA dequant weight GEMM) / QSA / indexer
-campaign — the former 28-patch `beta/mmb-general/` set — is **folded directly into the 16 delivery
+campaign — the former 28-patch `archive/work/mmb-general/` set — is **folded directly into the 16 delivery
 blocks**, so the normal workflow above is all there is to apply.  There is **no separate beta layer
 any more**:
 
@@ -243,7 +242,7 @@ The per-patch fold mapping and validation record are in
 kernel work is heavily adapted from **[pwilkin](https://github.com/pwilkin)**'s
 [`strix-halo` fork](https://github.com/pwilkin/llama.cpp/commits/strix-halo/), with thanks.
 
-> **Historical record only.**  [`beta/mmb-general/`](beta/mmb-general/) (the 28 patch files, the
+> **Historical record only.**  [`archive/work/mmb-general/`](archive/work/mmb-general/) (the 28 patch files, the
 > `mmb-general.patch`, `BETA-TESTING.md`, the gfx1201/gfx1100 records) is kept as the campaign's
 > verification record; its patches are **no longer applied separately** and the `apply-beta.sh`
 > helper has been **removed** (the delivery itself now contains the campaign).  Its gfx1151
@@ -396,13 +395,13 @@ for per-block verification and `BASELINE.md` for provenance.
   UD-Q4_K_XL q8_0 pp4096 @ d40000 (872.6 -> 911.3 t/s; reporter 885.5 -> 922.0 = +4.1 %), decode flat,
   output byte-identical.  See `patches/README.md` (2026-09-26 block-15 r9) and `WORKLOG.md`.
 - **The `mmb`/QSA/indexer campaign is folded into the delivery** (2026-09-25, release `r8`):
-  the former 28-patch opt-in `beta/mmb-general/` set is now part of the 16 block patches — the
+  the former 28-patch opt-in `archive/work/mmb-general/` set is now part of the 16 block patches — the
   `mmb` (bf16-WMMA dequant weight GEMM) core, the RDNA4 fragment port / per-arch tuning and the
   GDN/PLE/RMS prefill fusions in **block 08**; the catch-all host-buffer/CPU fixes in **block 06**;
   `qsa3`, the fused indexer, HC16, `hc_gate_mix`, sparse MTP-draft and the MMVQ band in **block 15**
   (with block 14's pair stand-down and block 13's GLU stand-down).  Strict `git am` 16/16
   reproduces the full campaign tree `24bb0f5acb…` and the gfx1201 build is clean.
-  `beta/mmb-general/` is kept as the historical verification record and the `apply-beta.sh` helper
+  `archive/work/mmb-general/` is kept as the historical verification record and the `apply-beta.sh` helper
   has been removed.  See [`archive/work/beta-integration/integration.md`](archive/work/beta-integration/integration.md).
 - **The RDNA4 GQA-6 decode/verify FA band covers f16 (and, through its native arm, bf16) too
   (block 15, r5, 2026-09-25, issue #45 follow-up, reported by
@@ -439,7 +438,7 @@ for per-block verification and `BASELINE.md` for provenance.
   `mtp-…-shared-Q8_0.gguf` sidecar) died every draft round on the M-RoPE `X < Y` check because the
   MTP driver inferred KV sharing from `ctx_other` alone.  `is_mem_shared` is now gated on the
   `gemma4-assistant` arch; it is an upstream bug (`04eb4c446`, #23398) folded into the block-00 base.
-- **`--fit` works under `-sm tensor`** (block 6, r12, promoted from `beta/tensor-fit-fix/`): upstream
+- **`--fit` works under `-sm tensor`** (block 6, r12, promoted from the former `beta/tensor-fit-fix/`, now `archive/work/tensor-fit-fix/`): upstream
   threw `not implemented for SPLIT_MODE_TENSOR` and swallowed it, so the default-**on** `--fit` was a
   silent no-op under tensor split.  The Meta device's accessors are now exposed and `common/fit.cpp`
   has a dedicated tensor path (per-device targets from `--fit-target`, a proportional split or an
@@ -513,7 +512,7 @@ following users for the assistance in finding issues and offering solutions!
 - https://github.com/briansp2020  (block-13 moe_weighted_reduction float4 remainder fix + block-14 MUL_MAT_ID pair-fusion layout gate, issues #19 and #18)
 - https://github.com/eoprede
 - https://github.com/overdoingism  (issue #45: the RDNA4 head-256 GQA-6 decode/verify flash-attention band, reported with the diagnosis, op-level data, the round-robin KV split idea and a working opt-in patch; the r4 block-15 band is built on that submission)
-- https://github.com/pwilkin  (the `strix-halo` fork at https://github.com/pwilkin/llama.cpp/commits/strix-halo/, heavily adapted for the MMB bf16-WMMA dequant-weight GEMM work, now folded into the delivery — formerly `beta/mmb-general/`)
+- https://github.com/pwilkin  (the `strix-halo` fork at https://github.com/pwilkin/llama.cpp/commits/strix-halo/, heavily adapted for the MMB bf16-WMMA dequant-weight GEMM work, now folded into the delivery — formerly `archive/work/mmb-general/`)
 - https://github.com/tungel
 - https://github.com/DanoPTT  (block-08 mul_mat+add through-view shape guard, PR #15; and issue #45 follow-up: the f16 verify-width diagnosis / the f16 + bf16 band coverage folded into block 15 in r5/r6, measured on their R9700)
 
