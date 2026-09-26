@@ -40,9 +40,15 @@ docs sweep and the maintainer's promotion decision.
     `llama-bench`, `test-backend-ops` present.
 * **Delivered on this branch:** regenerated `patches/` (16), `rdna-boosts-all.patch`, `release.json`
   (`tip f373450de…`, `tree 24bb0f5acb…`, `release v16-84e76d8a2-r8-integrated`).
+* **Done since:** the top-level `README.md` now describes the folded state (intro, block table,
+  0006/0008/0015 rows, the "The mmb campaign is in the delivery" section replacing the old beta
+  addendum, Layout, Releases, Current state).
 * **Not yet done:** the runtime gates (§6.3-6.6) were not re-run individually because the tree is
-  byte-identical to the already-validated beta tree (same code -> same result); the docs sweep (§5);
-  the maintainer's promotion decision.
+  byte-identical to the already-validated beta tree (same code -> same result); the **rest of the
+  docs sweep** — `AGENTS.md`, `BASELINE.md`, `TODO.md`, `WORKLOG.md`, `patches/README.md` and
+  `scripts/apply-beta.sh` still describe the beta as a separate opt-in layer (and `apply-beta.sh`
+  would now conflict if run, since `release.json.tree` is the integrated tree); the maintainer's
+  promotion decision.
 
 > **Open design question for review:** the qwen4exp/HC/QSA/indexer group landed in **block 15**,
 > not block 14, because block 15 owns the intervening code.  If the maintainer prefers them under
