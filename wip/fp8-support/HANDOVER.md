@@ -2,7 +2,8 @@
 
 **Branch:** `wip/fp8-support` (delivery repo).  **Not delivery work.**  **Encouraged to start cold.**
 
-Read order: this file → `README.md` → `MEASUREMENTS.md` → `PLAN.md` → the `reference/` docs.
+Read order: this file → `README.md` → `MEASUREMENTS.md` → `PLAN.md` → `ROCmFPX-ASSESSMENT.md` → the
+`reference/` docs.
 
 ## State at handover (2026-09-26)
 
@@ -13,6 +14,8 @@ Read order: this file → `README.md` → `MEASUREMENTS.md` → `PLAN.md` → th
   — but it sits on a **2026-08-05 master**, ~7 weeks behind the current delivery base.
 * `~/cllm` (the live clone, tip `7c17faffc`) and `~/aiter` (the AITER inspection tree) are both still
   on disk.  `~/llama.cpp` has only the remote-tracking `origin/cllm` = `535d3bcb1`.
+* `~/ROCmFPX` (Ciru's AMD low-bit fork) assessed in `ROCmFPX-ASSESSMENT.md`: no fp8 kernels, but it
+  confirms the native-WMMA constraint and offers the DualView / ActiveFPX prefill ideas to cross-check.
 
 ## The one-paragraph summary
 

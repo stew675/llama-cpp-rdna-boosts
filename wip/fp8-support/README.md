@@ -30,6 +30,7 @@ answer: **native FP8 E4M3 + the delivery's MMB/GEMM work + AITER's gfx1201 fp8 t
 | `reference/` | raw copies of the branch's campaign docs (LEVERS, PERF_HANDOVER, AITER_FINDINGS, HANDOVER, implementation-plan, handoff, GDN_DEBUG_HANDOVER, vllm-vs-llamacpp-performance) |
 | `MEASUREMENTS.md` | the frozen FP8-vs-Q8_0 scoreboard + AITER reference |
 | `PLAN.md` | the phased checklist — **follow this** |
+| `ROCmFPX-ASSESSMENT.md` | assessment of `ciru-ai/ROCmFPX` — no fp8 kernels, but the RDNA4 MMQ-vs-hipBLAS constraint + the DualView / ActiveFPX prefill ideas |
 | `HANDOVER.md` | cold-start brief + next-session prompt |
 
 **Provenance.** Branch `cllm` of the fork `stew675/llama.cpp`; base `6ea215d17` (2026-08-05, the
@@ -60,6 +61,10 @@ The three additive pieces, in order of confidence:
    improvements the cllm branch predates (7 weeks).
 3. **AITER-level fp8 GEMM efficiency** — the cllm kernel is at 77-98 TFLOP/s where AITER's Triton
    reaches 121-137; lifting AITER's gfx1201 tiles/GROUP_M/kpack is the remaining headroom.
+
+**Design constraint (`ROCmFPX-ASSESSMENT.md`):** the win must come from a **native fp8 WMMA GEMM**, not
+a dequant-to-bf16 + hipBLAS pipeline — upstream already measured that on RDNA4 MMQ beats
+"dequantization + hipBLAS" (`ggml-cuda/mmq.cu:608`, PR #18537).
 
 ## 5. Non-goals
 

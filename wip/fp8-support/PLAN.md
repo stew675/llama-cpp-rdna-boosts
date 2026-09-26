@@ -54,6 +54,8 @@ work largely **already landed** as delivery block 02 and the current `mmul`/`mmq
 
 - [ ] transcribe the relevant `aiter/ops/triton/configs/gemm/gfx1201-GEMM-A8W8_BLOCKSCALE*.json`
       tiles / `GROUP_SIZE_M` / `kpack` / `M_LEQ_x` selection into `mul_mat_fp8_wmma`
+- [ ] cross-check our Qwen3.8-27B prefill fusions against ActiveFPX PromptForge's (fused gate/up,
+      SwiGLU-to-down packing, merged QKV/Z) before writing any new fusion work — `ROCmFPX-ASSESSMENT.md` §4
 - [ ] A/B each change with rocprof kernel times (not `llama-bench`); **do not** adopt `bpreshuffle`
 - [ ] **gate 4: `mul_mat_fp8_wmma` ≥ 110 TFLOP/s effective** on the large 27B shapes (AITER 121-137)
 
@@ -82,6 +84,9 @@ work largely **already landed** as delivery block 02 and the current `mmul`/`mmq
 5. **The delivery's MMB work may already overlap.**  If block 08/13's `mmb` fused-bf16 path is close
    to the fp8 WMMA efficiency, the marginal FP8 win is smaller than hoped; measure, do not assume.
 6. **Don't bench on an occupied GPU** — llama-bench silently CPU-offloads (see `MEASUREMENTS.md`).
+7. **"Dequantize to bf16 + hipBLAS" is a trap.**  Upstream already measured that on **RDNA4 MMQ beats
+   dequantization + hipBLAS** (`ggml-cuda/mmq.cu:608`, PR #18537).  The fp8 win must be a **native
+   fp8 WMMA GEMM** (`mul_mat_fp8_wmma`), not a dequant pipeline.  See `ROCmFPX-ASSESSMENT.md` §2.
 
 ## Reference commands
 
