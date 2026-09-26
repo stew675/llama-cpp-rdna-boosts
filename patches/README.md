@@ -3,7 +3,14 @@
 16 patches (block 00 structural fixes + blocks 01-15) against upstream master **`84e76d8a2`**
 (re-based 2026-09-24 from `ebbb18522`).
 
-**Current release: `v16-84e76d8a2-r7`** — canonical (rebased) tip
+**Since release `v16-84e76d8a2-r8` (2026-09-25, in `main`) the 28 `beta/mmb-general` patches are
+folded into these 16 blocks**: applying `patches/*` alone to `84e76d8a2` now reproduces the campaign
+tree **`24bb0f5acb3e866abd4cad8c0de1bad45a20cb47`** (release `v16-84e76d8a2-r8`,
+canonical tip `f373450de489dd0fafba5bd285e71844109cd0ec`).  See the dedicated section below.
+`beta/mmb-general/` is now only the historical verification record and `scripts/apply-beta.sh` has
+been removed.
+
+**Previous release: `v16-84e76d8a2-r7`** — canonical (rebased) tip
 `596a22dbfbde571728e93acf986a02200aaf46ee`, tree
 `7726e514284ea7393bb9097ce305dc5b6dacdb11`.  Strict 16/16 `git am`; clean build.  **r7
 (2026-09-25) fixes a block-14 cross-GPU scheduler race under `-sm tensor`**: the multi-device guard in
@@ -186,6 +193,31 @@ The 2026-09-17 re-base resolved three blocks:
 
 The amendment history below is newest first.  Per-block content lives in the block notes
 (`## Block NN notes`); the dated `## YYYY-MM-DD …` sections are the amendment records.
+
+## 2026-09-25 (`beta-integration`): the `beta/mmb-general` campaign is folded into the 16 blocks
+
+The former opt-in 28-patch `beta/mmb-general/` set is **absorbed into the delivery blocks** on the
+`beta-integration` branch, so there is no second apply step any more: a fresh `84e76d8a2` + the 16
+patches reproduces the full campaign tree **`24bb0f5acb…`** (canonical tip `f373450de…`, release
+candidate `v16-84e76d8a2-r8`; strict `git am` 16/16, `scripts/validate-set.sh` PASS,
+gfx1201 build clean).  Nothing in the campaign was changed - only its packaging.
+
+Fold mapping (the beta patch numbers are `beta/mmb-general/patches/00NN`; the dependency-clean
+split is recorded in `../wip/beta-integration/integration.md`):
+
+| block | folded beta patches |
+|---|---|
+| 06 (catch-all) | 0025 host-buffer input layer, 0028 tiny-CPU-split single-thread |
+| 08 (prefill/MMB) | 0001 `mmb` core, 0003 F32/tiny-M + width probe, 0006 RDNA4 fragment port, 0007 dense tile geometry + quant coverage, 0008 per-arch defaults, 0009 routed policy, 0010 F32 policy split, 0012 gfx1100 F32 split, 0014 GDN/PLE conv1d fusions, 0015 narrow-row RMS norm |
+| 13 | 0001 (deferred) MMB stand-down of the swiglu->mmq fusion |
+| 14 | 0001 (deferred) MMB stand-down of the pair fusion, 0027 MMVQ routed band W=16 |
+| 15 (attention/campaign) | 0002 `qsa3`, 0003 (deferred) qwen4exp always-QSA flip, 0004 HC16 producers, 0005 fused indexer top-k, 0008 (deferred) HC16/beneficial defaults, 0011 `qsa3` on RDNA3_0, 0013 `hc_gate_mix`, 0016 `-lzm auto` + managed PLE gate, 0017 HC BF16 streams, 0018 `out_xn` BF16, 0019 indexer relu+head-sum, 0020 F32 activations on eval callback, 0021 sparse MTP-draft attention, 0022 derived indexer cache ON, 0023 QSA gfx1151 crossover, 0024 HC16 per-backend state, 0026 meta child `graph_optimize` markings |
+
+The qwen4exp/QSA/HC/indexer group lands in block 15 rather than block 14 because block 15 owns the
+intervening `qwen4exp.cpp`/`ggml-cuda.cu` code the beta series was authored against.  Runtime gates
+were not re-run individually: the applied tree is **byte-identical** to the already-validated beta
+tree, so the campaign's gfx1151/gfx1201/gfx1100 gate records carry over unchanged.  Full record:
+`../WORKLOG.md` (2026-09-25, the `beta-integration` entry).
 
 ## 2026-09-24 re-base (r1): onto upstream master `84e76d8a2`
 

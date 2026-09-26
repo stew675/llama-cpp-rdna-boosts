@@ -1,5 +1,12 @@
 # `beta/mmb-general` — the `mmb` (bf16-WMMA dequant weight GEMM) campaign, in beta
 
+> **INTEGRATED 2026-09-25 — folded into the delivery; this directory is the historical verification
+> record.**  On the `beta-integration` branch the 28 patches in `patches/` are absorbed into the 16
+> delivery blocks, so a fresh `84e76d8a2` + `scripts/apply-all.sh` reproduces the campaign tree
+> **`24bb0f5acb…`** directly and there is **no separate beta apply step** (`apply-beta.sh` was
+> removed).  The apply/BETA instructions below are kept as the record of how the set was validated.
+> See `../../wip/beta-integration/integration.md` and `../../WORKLOG.md` (2026-09-25).
+
 **Status: BETA (promoted from `wip/mmb-general` on 2026-09-21; consolidated with the `closing-the-gap`
 campaign on 2026-09-25; re-based onto upstream master `84e76d8a2` on 2026-09-24, re-ported on delivery
 r2 (2026-09-25), re-based onto r3 and gfx1100-fixed on 2026-09-25, re-cut onto r4, r5, r6 then r7 on

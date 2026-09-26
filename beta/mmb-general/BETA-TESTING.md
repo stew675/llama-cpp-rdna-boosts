@@ -1,5 +1,11 @@
 # `beta/mmb-general` — BETA-TESTING.md (the gfx1151 final re-validation)
 
+> **INTEGRATED 2026-09-25 — folded into the delivery; this directory is the historical verification
+> record.**  The 28 patches are now part of the 16 delivery blocks on the `beta-integration` branch
+> (apply `scripts/apply-all.sh` only; `apply-beta.sh` was removed), and the `release.json` tree is
+> the campaign tree `24bb0f5acb…`.  The `git am` recipe in §1 is historical; the gates below remain
+> the campaign's validation record.  See `../../WORKLOG.md` (2026-09-25).
+
 **For the maintainer's Strix Halo (gfx1151, RDNA3_5) box.**  Everything here is written so the whole
 validation is a copy-paste run: apply, build, run the four gates, compare against the numbers below.
 

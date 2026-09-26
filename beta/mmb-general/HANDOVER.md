@@ -1,5 +1,11 @@
 # HANDOVER — general-purpose `mmb` (bf16/i8-WMMA dequant weight GEMM) + QSA/Q8_0 next steps
 
+> **INTEGRATED 2026-09-25 — folded into the delivery; this directory is the historical verification
+> record.**  The campaign is no longer a separate beta set: on the `beta-integration` branch the 28
+> patches are absorbed into the 16 delivery blocks and `apply-beta.sh` was removed.  The handoff
+> instructions below are historical.  See `../../wip/beta-integration/integration.md` and
+> `../../WORKLOG.md` (2026-09-25).
+
 **Date:** 2026-09-20 (sessions 1-18).  **Status:** ACTIVE WIP, not part of the delivery, and the
 code is **not** pushed to any llama.cpp fork.  This document is the self-contained entry point for
 the next session; the "FOR THE NEXT SESSION" brief below is the whole handoff, and the UPDATE

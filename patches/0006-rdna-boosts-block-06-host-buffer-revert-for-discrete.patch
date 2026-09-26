@@ -1,4 +1,4 @@
-From 7a1b640ba3109640b0f925b73984ead00e2c73f2 Mon Sep 17 00:00:00 2001
+From bce4adf926813fa827a21172533a0708e8f2bbeb Mon Sep 17 00:00:00 2001
 From: Stew Forster <stew675@gmail.com>
 Date: Sat, 29 Aug 2026 08:14:24 -0500
 Subject: [PATCH 06/15] rdna-boosts: block 06: host-buffer revert for discrete
@@ -21,13 +21,17 @@ per (ncols1, ncols2, head size) instead of per (ncols1, ncols2), and the head-51
 listed first in the backend source order so they are not the tail of the build.  Build-time only:
 identical explicit instantiations, identical symbols.  Also mirrors the ordering in the CUDA
 backend's CMakeLists.txt.
+Folds beta/mmb-general: 0025 (host-buffer input layer + opt-in device input placement), 0028
+(CPU: run tiny split graphs on the calling thread).
 ---
  common/fit.cpp                                | 208 +++++++++++++++++-
  docs/multi-gpu.md                             |   4 +-
  ggml/include/ggml-backend.h                   |   9 +
  ggml/src/ggml-backend-meta.cpp                |   8 +-
+ ggml/src/ggml-backend.cpp                     |  27 +++
+ ggml/src/ggml-cpu/ggml-cpu.cpp                |  51 ++++-
  ggml/src/ggml-cuda/CMakeLists.txt             |   6 +
- ggml/src/ggml-cuda/ggml-cuda.cu               |   6 +
+ ggml/src/ggml-cuda/ggml-cuda.cu               |  17 ++
  ...stance-ncols1_1-ncols2_16-dkq192-dv128.cu} |   1 -
  ...nstance-ncols1_1-ncols2_16-dkq576-dv512.cu |   5 +
  ...stance-ncols1_1-ncols2_32-dkq320-dv256.cu} |   1 -
@@ -172,7 +176,9 @@ backend's CMakeLists.txt.
  ...attn-mma-f16-instance-ncols1_8-ncols2_8.cu |  12 -
  .../template-instances/generate_cu_files.py   |  46 ++--
  ggml/src/ggml-hip/CMakeLists.txt              |   6 +
- 150 files changed, 869 insertions(+), 214 deletions(-)
+ src/llama-model-loader.cpp                    |   5 +-
+ src/llama-model.cpp                           |  18 +-
+ 154 files changed, 976 insertions(+), 219 deletions(-)
  rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_16.cu => fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq192-dv128.cu} (79%)
  create mode 100644 ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq576-dv512.cu
  rename ggml/src/ggml-cuda/template-instances/{fattn-mma-f16-instance-ncols1_1-ncols2_32.cu => fattn-mma-f16-instance-ncols1_1-ncols2_32-dkq320-dv256.cu} (79%)
@@ -618,6 +624,123 @@ index 7c1c0b864..302d4bd16 100644
      GGML_ASSERT(ggml_backend_dev_is_meta(meta_dev));
      const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
      GGML_ASSERT(index < meta_dev_ctx->simple_devs.size());
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 20bf96501..00c17b8d4 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1034,6 +1034,18 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
+     }
+ }
+ 
++// the graph input a tensor ultimately refers to, following view chains, or NULL if it is not (a
++// view of) a graph input.  The recurrent-state copy, for one, is only ever read through views.
++static struct ggml_tensor * ggml_backend_sched_graph_input(struct ggml_tensor * t) {
++    while (t != NULL) {
++        if (t->flags & GGML_TENSOR_FLAG_INPUT) {
++            return t;
++        }
++        t = t->view_src;
++    }
++    return NULL;
++}
++
+ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
+     ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+     ggml_backend_buffer_type_t buft = NULL;
+@@ -1052,6 +1064,21 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
+         }
+     }
+ 
++    if (buft != NULL && ggml_backend_buft_is_host(buft) && sched->n_copies <= 1 &&
++            ggml_backend_sched_graph_input(t) != NULL) {
++        // A graph input that lives in host memory is written by the host thread.  On a device
++        // that accepts host buffers (an APU with info.devices[].integrated set), the scheduler
++        // would otherwise let the compute backend read it in place: the next ubatch's
++        // set_inputs then races the in-flight compute and a torn value can turn an index into an
++        // out-of-bounds store (k_set_rows MEMORY_APERTURE_VIOLATION on gfx1151, and the #15034
++        // corrupted output before that).  Force the split-input copy so the device reads a
++        // stream-ordered device buffer.  Weights are unaffected: they are never
++        // GGML_TENSOR_FLAG_INPUT, so zero-copy host weights (the input embeddings) keep working.
++        // The view chain is resolved because an input can be reached only through a view - the
++        // recurrent-state copy, for one, is.
++        return false;
++    }
++
+     return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
+ }
+ 
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 1df0f2bb9..1372f175e 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -7,6 +7,7 @@
+ #include "amx/amx.h"
+ 
+ #include <cctype>
++#include <cstdlib>
+ #include <string>
+ #include <vector>
+ 
+@@ -167,10 +168,58 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
+     GGML_UNUSED(backend);
+ }
+ 
++// Choose the number of threads for a CPU graph compute.
++//
++// A very small CPU graph - typically the input/PLE embedding GET_ROWS (and a handful of
++// state copies) that the scheduler peels off the front of a GPU graph - gains nothing
++// from an OpenMP fork, and paying for it once per graph is actively harmful at the graph
++// rates speculative decoding reaches: every parallel region re-arms the runtime's active
++// wait (KMP_BLOCKTIME), so the idle workers spin instead of sleeping and a spec-decode
++// workload (n_max + 1 back-to-back graphs per token) pins every core for the whole run.
++// Run such graphs inline on the calling thread instead; a real (prefill-sized) gather or
++// any larger graph keeps the configured thread count.  Disable the heuristic with
++// GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1 for A/B and bisection.
++static int ggml_backend_cpu_graph_n_threads(const struct ggml_cgraph * cgraph, int n_threads) {
++    if (n_threads <= 1) {
++        return n_threads;
++    }
++
++    static const bool disabled = getenv("GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD") != nullptr;
++    if (disabled) {
++        return n_threads;
++    }
++
++    // bounds chosen so an ordinary model graph (CPU-only inference, or a large prefill
++    // gather on a CPU split) never qualifies; the split graphs this targets are 1-7 nodes
++    // of a few hundred KiB each
++    constexpr int    max_nodes = 32;
++    constexpr size_t max_bytes = 16ull*1024*1024;
++
++    if (cgraph->n_nodes > max_nodes) {
++        return n_threads;
++    }
++
++    size_t total_bytes = 0;
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        const struct ggml_tensor * node = cgraph->nodes[i];
++        if (ggml_is_view(node)) {
++            continue;
++        }
++        total_bytes += ggml_nbytes(node);
++        if (total_bytes > max_bytes) {
++            return n_threads;
++        }
++    }
++
++    return 1;
++}
++
+ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+ 
+-    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
++    const int n_threads = ggml_backend_cpu_graph_n_threads(cgraph, cpu_ctx->n_threads);
++
++    struct ggml_cplan cplan = ggml_graph_plan(cgraph, n_threads, cpu_ctx->threadpool);
+ 
+     if (cpu_ctx->work_size < cplan.work_size) {
+         delete[] cpu_ctx->work_data;
 diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
 index 2254090cb..9fd309bbb 100644
 --- a/ggml/src/ggml-cuda/CMakeLists.txt
@@ -639,10 +762,10 @@ index 2254090cb..9fd309bbb 100644
      file(GLOB   SRCS "template-instances/mmq*.cu")
      list(APPEND GGML_SOURCES_CUDA ${SRCS})
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 62631e987..1d6d763f5 100644
+index 62631e987..0f3c1ad58 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -306,6 +306,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
+@@ -306,7 +306,24 @@ static ggml_cuda_device_info ggml_cuda_init() {
  
          info.default_tensor_split[id] = total_vram;
          total_vram += device_vram;
@@ -650,11 +773,23 @@ index 62631e987..1d6d763f5 100644
 +        // host-buffer path (zero-copy UMA weights) it enables on APUs corrupts full-model
 +        // results under async execution on this box (PPL 5.9243 -> 8.51+ without
 +        // HIP_LAUNCH_BLOCKING).  Upstream reverted #24233 in #28604 (2026-09-08), making
-+        // forced-integrated-false the upstream default again; this marker guards against
-+        // re-landing prop.integrated without re-testing that box.
++        // forced-integrated-false the upstream default again.
++        //
++        // Re-tested 2026-09-23 (closing-the-gap host-buffer investigation): the corruption was
++        // the scheduler reading a host-resident graph input in place; see the host-input guard
++        // in ggml_backend_sched_buffer_supported().  With that guard the real flag is stable on
++        // this box, and it is what lets an APU gather the input embeddings on the GPU (no CPU
++        // backend dispatch) while the embedding weights stay in zero-copy host memory.
++        // GGML_FORCE_NO_INTEGRATED=1 restores the previous default for A/B and bisection.
++#if defined(GGML_USE_HIP)
++        static const bool force_no_integrated = getenv("GGML_FORCE_NO_INTEGRATED") != nullptr;
++        info.devices[id].integrated = force_no_integrated ? false : prop.integrated;
++#else
          info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
++#endif
          info.devices[id].nsm        = prop.multiProcessorCount;
          info.devices[id].smpb       = prop.sharedMemPerBlock;
+         info.devices[id].warp_size  = prop.warpSize;
 diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16-dkq192-dv128.cu
 similarity index 79%
 rename from ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16.cu
@@ -2399,6 +2534,51 @@ index a6a6b7271..f3ef92ef3 100644
  list(APPEND GGML_SOURCES_ROCM ${SRCS})
  file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
  list(APPEND GGML_SOURCES_ROCM ${SRCS})
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 43c396f15..90de63fba 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1216,7 +1216,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         const buft_list_t * buft_list;
+         switch (info.layer) {
+             case LLM_TENSOR_LAYER_INPUT:
+-                buft_list = buft_list_input;
++                // the per-layer token embedding is a huge table that the model gathers on the host
++                // (qwen4exp/gemma build_inp_ple), so it must stay host-resident even when the rest
++                // of the input layer is offloaded with LLAMA_DEVICE_INPUT=1; give it the CPU list.
++                buft_list = tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD ? buft_list_cpu : buft_list_input;
+                 break;
+             case LLM_TENSOR_LAYER_OUTPUT:
+                 buft_list = buft_list_output;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index a394c2e6e..65d0ec65d 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1532,9 +1532,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         return {dev, &pimpl->gpu_buft_list.at(dev)};
+     };
+ 
+-    // assign the input layer
+-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
+-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
++    // assign the input layer.  Default: the upstream host placement.  On a discrete multi-GPU box
++    // the input embedding then lives in host memory and the scheduler peels a CPU split off every
++    // graph; the 0029 single-thread heuristic keeps that split from spinning the OpenMP pool, and
++    // on gfx1201 it measures faster than the alternatives (see the OP-1 structural record).
++    // LLAMA_DEVICE_INPUT=1 places the input layer on the output layer's device instead, so the
++    // token-embedding GET_ROWS runs inside the GPU graph (on a tensor-split build, on the Meta
++    // device) and there is no CPU split at all.  It is opt-in because the Meta-split GPU gather is
++    // ~2.6% slower for MTP than the single-threaded CPU gather; the huge per-layer token embedding
++    // stays host-resident either way (see create_tensor).
++    static const bool dev_input_on = getenv("LLAMA_DEVICE_INPUT") != nullptr;
++    if (dev_input_on) {
++        pimpl->dev_input = get_layer_buft_list(n_layer_all);
++    } else {
++        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
++    }
+ 
+     // assign the repeating layers to the devices according to the splits
+     pimpl->dev_layer.resize(n_layer_all);
 -- 
 2.55.0
 
