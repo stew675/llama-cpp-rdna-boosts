@@ -1,9 +1,17 @@
 # wip/fp8-support — native FP8 E4M3 for llama.cpp (RDNA4)
 
-**Status: RE-BASED and BUILDING (2026-09-26).**  Branch `wip/fp8-support`.  The cllm FP8 work now sits
-on the current `rdna-boosts` (r9) tree as **13 commits** (`patches-rebased/`, branch `fp8-rebase` in
-`~/llama-fp8`), builds clean on gfx1201, and is fully **RDNA4-gated**.  **PLAN.md Phase 2 is done** —
-see `REBASE-2026-09-26.md`.  Next: reproduce the 4B number, then convert+measure the **27B**.
+**Status: PARKED (2026-09-26).**  Branch `wip/fp8-support`.  Re-based and building — the cllm FP8 work
+sits on the current `rdna-boosts` (r9) as **13 commits** (`patches-rebased/`, branch `fp8-rebase` in
+`~/llama-fp8`, tip `bc01a921e`, tree `f1e49b6f8`), clean on gfx1201 and fully **RDNA4-gated** — but
+**gate 2 FAILED**: the fp8 4B is **0.69x Q8_0** where cllm had **1.16x**, because the delivery's
+MMB/GEMM work made Q8_0 **+32 %** while the fp8 WMMA path did not follow.  Parked here — the main
+16-patch work takes priority.
+
+**Records:** `REBASE-2026-09-26.md` (what was dropped/resolved), `RESULTS-2026-09-26-rebase-gate.md`
+(the failing gate + profile).  **Resume** via `PLAN.md` next-actions: (1) A/B `mul_mat_fp8_wmma`
+re-based vs `~/cllm`; (2) fix the per-call `fp8_repack_weights` (7.3 %); (3) re-run the 4B gate;
+(4) only then convert + measure the 27B.  `patches/` = the original 23-commit cllm series
+(provenance); `patches-rebased/` = the delivered 13-commit rebase.
 
 **NOT delivery work** — nothing here is in `patches/`, `apply-all.sh` ignores `wip/`, and the fork
 stays scratch until the promotion path is followed.
